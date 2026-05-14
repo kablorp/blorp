@@ -55,6 +55,7 @@ let print_type_params = function
 let comments : Fmt_comment.t ref = ref (Fmt_comment.create [])
 
 type block_item = BlockComment of Lexer.collected_comment | BlockExpr of expr
+type ufcs_step = { step_name : string; step_args : expr list; step_line : int }
 
 let loc_end_line loc = max loc.line loc.end_line
 
@@ -449,7 +450,7 @@ let print_builtin_body = function
 let force_flat = ref false
 
 let rec print_expr e =
-  let doc = print_expr_desc e.expr_desc in
+  let doc = print_expr_node e in
   let trail = trailing_comment e.expr_loc.line in
   doc ^^ trail
 
@@ -583,31 +584,56 @@ and print_block_call_args func_e args =
   ^^ indent (hardline ^^ hardlines arg_docs)
   ^^ hardline ^^ text ")"
 
-and print_ufcs_chain func_e args =
+and print_ufcs_chain call_expr func_e args =
   let rec collect receiver steps =
     match receiver.expr_desc with
     | ECall ({ expr_desc = EFieldAccess (inner, method_name); _ }, method_args)
       ->
-        collect inner ((method_name, method_args) :: steps)
+        collect inner
+          ({
+             step_name = method_name;
+             step_args = method_args;
+             step_line = loc_end_line receiver.expr_loc;
+           }
+          :: steps)
     | _ -> (receiver, steps)
   in
   match func_e.expr_desc with
   | EFieldAccess (receiver, method_name) ->
-      let receiver, steps = collect receiver [ (method_name, args) ] in
+      let receiver, steps =
+        collect receiver
+          [
+            {
+              step_name = method_name;
+              step_args = args;
+              step_line = loc_end_line call_expr.expr_loc;
+            };
+          ]
+      in
       if List.length steps >= 2 && not !force_flat then
-        Some
-          (print_expr receiver
-          ^^ indent
-               (concat
-                  (List.map
-                     (fun (step_name, step_args) ->
-                       hardline ^^ text "." ^^ text step_name
-                       ^^ print_chain_call_args step_args)
-                     steps)))
+        let print_step step =
+          let leading =
+            Fmt_comment.take_leading !comments ~before_line:step.step_line
+          in
+          let leading_doc =
+            concat
+              (List.map
+                 (fun (c : Lexer.collected_comment) ->
+                   hardline ^^ text (Fmt_comment.normalize_comment c.cc_text))
+                 leading)
+          in
+          leading_doc ^^ hardline ^^ text "." ^^ text step.step_name
+          ^^ print_chain_call_args step.step_args
+          ^^ trailing_comment step.step_line
+        in
+        let receiver_doc = print_expr receiver in
+        let steps_doc = concat (List.map print_step steps) in
+        Some (receiver_doc ^^ indent steps_doc)
       else None
   | _ -> None
 
-and print_expr_desc = function
+and print_expr_node expr =
+  match expr.expr_desc with
   | EIdent s -> text s
   | ELiteral lit -> print_literal lit
   | ELoopView view ->
@@ -683,11 +709,11 @@ and print_expr_desc = function
       in
       inner_doc ^^ text " as " ^^ print_type_expr ty
   | ECall (func_e, []) -> (
-      match print_ufcs_chain func_e [] with
+      match print_ufcs_chain expr func_e [] with
       | Some doc -> doc
       | None -> print_expr func_e ^^ text "()")
   | ECall (func_e, args) -> (
-      match print_ufcs_chain func_e args with
+      match print_ufcs_chain expr func_e args with
       | Some doc -> doc
       | None ->
           (* Check for trailing multiline lambda arg *)
@@ -813,8 +839,7 @@ and print_expr_desc = function
       | Some else_e -> (
           match else_e.expr_desc with
           | EIf _ ->
-              if_doc ^^ hardline ^^ text "else "
-              ^^ print_expr_desc else_e.expr_desc
+              if_doc ^^ hardline ^^ text "else " ^^ print_expr_node else_e
           | _ ->
               if_doc ^^ hardline ^^ text "else" ^^ text ":"
               ^^ indent (hardline ^^ print_block_body else_e)))
