@@ -7,6 +7,8 @@ boundaries make hidden behavior harder and program intent clearer.
 
 > Blorp is in early-preview. It is not ready for production usage.
 
+
+
 ## Hello, world!
 
 ```blorp
@@ -16,8 +18,11 @@ func main(args: List[String]) -> Void:
 Blorp's syntax is inspired by Python. `main` signifies the entry point
 to a program.
 
+
+
 ## At a Glance
-The core shape of Blorp leverages pure functions, explicit data states, pattern matching, and IO at the program boundary.
+Blorp leverages pure functions, explicit data states, pattern matching, and method call syntax
+for straightforward local reasoning.
 
 
 ```blorp
@@ -28,9 +33,7 @@ union Score:
 
 -- Pure functions are encoded in the type system
 pure func grade(scores: List[Int]) -> Score:
-    -- Any function can be called with method syntax by its first argument:
-    -- scores.length() is the same as length(scores)
-    average: Int = total(scores) / scores.length()
+    average = total(scores) / scores.length()
     if average >= 70:
         Passing(average)
     else:
@@ -38,7 +41,7 @@ pure func grade(scores: List[Int]) -> Score:
 
 -- Pure functions can use local mutation.
 pure func total(scores: List[Int]) -> Int:
-    var sum: Int = 0
+    var sum = 0
     for score in scores:
         sum += score
     sum
@@ -56,6 +59,8 @@ func main(args: List[String]) -> Void:
     scores = [82, 71, 90]
     
     scores
+        -- method-call syntax is available for a function's first argument:
+        -- scores.grade is the same as grade(scores)
         .grade()
         .describe_score()
         .print()
