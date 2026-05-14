@@ -133,16 +133,16 @@ This provides several advantages:
 - Optimization passes can be more aggressive because pure code has fewer
   observable ordering constraints.
 
-For AI-generated code, purity turns a broad trust problem into a smaller review
-problem. Large parts of codebases can be made statically unable to do
-I/O, mutate global state, or exfiltrate data. As such, some aspects of debugging 
-and code review can be confined to narrow code paths where effects are allowed.
+For AI-generated code, purity shrinks the scope of potential defects. Large parts of 
+codebases can be made statically unable to perform I/O, mutate global state, or 
+exfiltrate data. As such, some aspects of debugging and code review can be confined
+to narrow code paths where effects are allowed.
 
 
 ## Runtime Safety Model
 
 Blorp is designed so ordinary language operations are safe by construction,
-instead of relying on unchecked runtime failures:
+instead of allowing unchecked runtime failures:
 - no null values or unchecked exceptions
 - absence and fallibility are represented with `Option[T]`, `Result[T, E]`, `match`, and `try:` 
 - no shared mutable state
