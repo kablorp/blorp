@@ -1,0 +1,272 @@
+import:
+	list: range
+	system: getenv, now_microseconds
+
+
+-- Dedicated List.parallel benchmark.
+--
+-- Run it under different pool sizes, for example:
+-- BLORP_THREADS=1 ./blorp run --no-format benchmarks/blorp/list_parallel.brp
+-- BLORP_THREADS=auto is represented by leaving BLORP_THREADS unset.
+--
+-- Output is intentionally one machine-parseable BENCH line per case.
+-- Fields: operation, work, selectivity, size, threads, elapsed_us, checksum.
+pure func checksum_list(xs: List[Int]) -> Int:
+	var checksum: Int = xs.length()
+	for x in xs:
+		checksum = (checksum * 131 + x) % 1000000007
+	checksum
+
+
+pure func heavy_work(seed: Int) -> Int:
+	var acc: Int = seed + 17
+	for i in 0..96:
+		acc = (acc * 1664525 + 1013904223 + seed + i * 97) % 1000003
+	acc
+
+
+pure func cheap_map_value(x: Int) -> Int:
+	(x * 3 + 1) % 1000003
+
+
+pure func keep_by_selectivity(value: Int, selectivity: Int) -> Bool:
+	if selectivity <= 0:
+		False
+	else if selectivity >= 100:
+		True
+	else:
+		value % 100 < selectivity
+
+
+pure func map_cheap(data: List[Int]) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.map(pure func(x: Int): cheap_map_value(x))
+	)
+
+
+pure func map_heavy(data: List[Int]) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.map(pure func(x: Int): heavy_work(x))
+	)
+
+
+pure func filter_cheap(data: List[Int], selectivity: Int) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter(pure func(x: Int): keep_by_selectivity(x, selectivity))
+	)
+
+
+pure func filter_heavy(data: List[Int], selectivity: Int) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter(pure func(x: Int):
+			keep_by_selectivity(heavy_work(x), selectivity)
+		)
+	)
+
+
+pure func filter_map_cheap(data: List[Int], selectivity: Int) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[Int]:
+			value: Int = cheap_map_value(x)
+			if keep_by_selectivity(x, selectivity):
+				Some(value)
+			else:
+				None
+		)
+	)
+
+
+pure func filter_map_heavy(data: List[Int], selectivity: Int) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[Int]:
+			value: Int = heavy_work(x)
+			if keep_by_selectivity(value, selectivity):
+				Some(value)
+			else:
+				None
+		)
+	)
+
+
+pure func map_map_cheap(data: List[Int]) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.map(pure func(x: Int): cheap_map_value(x)).map(pure func(x: Int): cheap_map_value(x))
+	)
+
+
+pure func map_map_heavy(data: List[Int]) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.map(pure func(x: Int): heavy_work(x)).map(pure func(x: Int): heavy_work(x))
+	)
+
+
+pure func filter_then_map_pipeline_cheap(data: List[Int], selectivity: Int) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter(
+			pure func(
+				x: Int,
+			): keep_by_selectivity(x, selectivity),
+		).map(
+			pure func(x: Int): cheap_map_value(x),
+		)
+	)
+
+
+pure func filter_then_map_pipeline_heavy(data: List[Int], selectivity: Int) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter(pure func(x: Int):
+			keep_by_selectivity(heavy_work(x), selectivity)
+		).map(pure func(x: Int): heavy_work(x))
+	)
+
+
+pure func filter_map_map_pipeline_cheap(data: List[Int], selectivity: Int) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[Int]:
+			value: Int = cheap_map_value(x)
+			if keep_by_selectivity(x, selectivity):
+				Some(value)
+			else:
+				None
+		).map(pure func(x: Int): cheap_map_value(x))
+	)
+
+
+pure func filter_map_map_pipeline_heavy(data: List[Int], selectivity: Int) -> List[Int]:
+	data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[Int]:
+			value: Int = heavy_work(x)
+			if keep_by_selectivity(value, selectivity):
+				Some(value)
+			else:
+				None
+		).map(pure func(x: Int): heavy_work(x))
+	)
+
+
+func emit_bench(
+	operation: String,
+	work: String,
+	selectivity: Int,
+	size: Int,
+	threads: String,
+	elapsed: Int,
+	checksum: Int,
+) -> Void:
+	print(
+		"BENCH operation=" + operation + " work=" + work + " selectivity=" + selectivity.to_string() + " size=" + size.to_string() + " threads=" + threads + " elapsed_us=" + elapsed.to_string() + " checksum=" + checksum.to_string(),
+	)
+
+
+func run_case(
+	operation: String,
+	work: String,
+	selectivity: Int,
+	threads: String,
+	data: List[Int],
+	body: pure (List[Int]) -> List[Int],
+) -> Void:
+	start: Int = now_microseconds()
+	result: List[Int] = body(data)
+	elapsed: Int = now_microseconds() - start
+	emit_bench(operation, work, selectivity, data.length(), threads, elapsed, checksum_list(result))
+
+
+func run_selectivity_cases(threads: String, data: List[Int], selectivity: Int) -> Void:
+	run_case("filter", "cheap", selectivity, threads, data, pure func(xs: List[Int]):
+		filter_cheap(xs, selectivity)
+	)
+	run_case("filter", "heavy", selectivity, threads, data, pure func(xs: List[Int]):
+		filter_heavy(xs, selectivity)
+	)
+	run_case("filter_map", "cheap", selectivity, threads, data, pure func(xs: List[Int]):
+		filter_map_cheap(xs, selectivity)
+	)
+	run_case("filter_map", "heavy", selectivity, threads, data, pure func(xs: List[Int]):
+		filter_map_heavy(xs, selectivity)
+	)
+	run_case("filter_then_map", "cheap", selectivity, threads, data, pure func(xs: List[Int]):
+		filter_then_map_pipeline_cheap(xs, selectivity)
+	)
+	run_case("filter_then_map", "heavy", selectivity, threads, data, pure func(xs: List[Int]):
+		filter_then_map_pipeline_heavy(xs, selectivity)
+	)
+	run_case(
+		"filter_map_map",
+		"cheap",
+		selectivity,
+		threads,
+		data,
+		pure func(xs: List[Int]): filter_map_map_pipeline_cheap(xs, selectivity),
+	)
+	run_case(
+		"filter_map_map",
+		"heavy",
+		selectivity,
+		threads,
+		data,
+		pure func(xs: List[Int]): filter_map_map_pipeline_heavy(xs, selectivity),
+	)
+
+
+func run_size(threads: String, size: Int) -> Void:
+	data: List[Int] = range(0, size)
+	run_case("map", "cheap", -1, threads, data, pure func(xs: List[Int]): map_cheap(xs))
+	run_case("map", "heavy", -1, threads, data, pure func(xs: List[Int]): map_heavy(xs))
+	run_case("map_map", "cheap", -1, threads, data, pure func(xs: List[Int]): map_map_cheap(xs))
+	run_case("map_map", "heavy", -1, threads, data, pure func(xs: List[Int]): map_map_heavy(xs))
+	for selectivity in [0, 10, 50, 90, 100]:
+		run_selectivity_cases(threads, data, selectivity)
+
+
+func warm_with_narrow_concurrent() -> Int:
+	concurrent(max_threads: 2):
+		a = heavy_work(10000)
+		b = heavy_work(20000)
+	match (a, b):
+		(Ok(x), Ok(y)): x + y
+		_: 0
+
+
+func run_pool_width_guard(threads: String) -> Void:
+	_ = warm_with_narrow_concurrent()
+	data: List[Int] = range(0, 120000)
+	run_case(
+		"pool_width_guard_after_concurrent_2",
+		"heavy",
+		-1,
+		threads,
+		data,
+		pure func(xs: List[Int]): map_heavy(xs),
+	)
+
+
+pure func benchmark_sizes(mode: String) -> List[Int]:
+	if mode == "smoke":
+		[0, 1, 63, 64, 127, 1000]
+	else:
+		[0, 1, 63, 64, 127, 1000, 120000, 1000000]
+
+
+func thread_label() -> String:
+	match getenv("BLORP_THREADS"):
+		Some(value): value
+		None: "auto"
+
+
+func mode_from_args(args: List[String]) -> String:
+	var mode: String = "full"
+	for arg in args:
+		if arg == "smoke" or arg == "full" or arg == "guard":
+			mode = arg
+	mode
+
+
+func main(args: List[String]) -> Int:
+	threads: String = thread_label()
+	mode: String = mode_from_args(args)
+	run_pool_width_guard(threads)
+	if mode != "guard":
+		for size in benchmark_sizes(mode):
+			run_size(threads, size)
+	0

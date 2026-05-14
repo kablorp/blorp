@@ -1,0 +1,223 @@
+-- Channel timeout regression tests
+-- Tests for:
+-- 1. recv_timeout that expires, followed by send (stale fiber in wait queue)
+-- 2. send_timeout that expires, followed by recv (stale fiber in wait queue)
+-- 3. recv_timeout that succeeds (data arrives before timeout)
+-- 4. Multiple recv_timeouts on same channel (stress the wait queue cleanup)
+import:
+	test: TestSuite
+	time: now
+
+
+-- recv_timeout returns None when no data arrives
+func test_recv_timeout_expires() -> Bool:
+	ch: Channel[Int] = channel(1)
+	opt: Option[Int] = recv_timeout(ch, 10)
+	match opt:
+		Some(_): False
+		None: True
+
+
+-- recv_timeout returns Some when data is already buffered
+func test_recv_timeout_data_ready() -> Bool:
+	ch: Channel[Int] = channel(1)
+	_ = send(ch, 42)
+	opt: Option[Int] = recv_timeout(ch, 100)
+	match opt:
+		Some(v): v == 42
+		None: False
+
+
+-- send_timeout returns false when channel stays full (use String to avoid boxing issue)
+func test_send_timeout_expires() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, "a")
+	result: Bool = send_timeout(ch, "b", 10)
+	not result
+
+
+-- send_timeout returns true when space is available
+func test_send_timeout_space_ready() -> Bool:
+	ch: Channel[String] = channel(1)
+	result: Bool = send_timeout(ch, "hello", 100)
+	result
+
+
+-- REGRESSION: recv_timeout fiber must be removed from wait queue on timeout.
+-- Without the fix, the stale fiber pointer in recv_waiters causes UAF when
+-- a subsequent send tries to dequeue and wake it.
+func recv_timeout_task(ch: Channel[Int]) -> Bool:
+	opt: Option[Int] = recv_timeout(ch, 20)
+	match opt:
+		Some(_): False
+		None: True
+
+
+func delayed_send_task(ch: Channel[Int]) -> Bool:
+	sleep(50)
+	_ = send(ch, 99)
+	opt: Option[Int] = recv(ch)
+	match opt:
+		Some(v): v == 99
+		None: False
+
+
+func test_recv_timeout_then_send() -> Bool:
+	ch: Channel[Int] = channel(1)
+	concurrent:
+		timed_out = recv_timeout_task(ch)
+		sent_ok = delayed_send_task(ch)
+	timed_out_ok: Bool = match timed_out:
+		Ok(v): v
+		Err(_): False
+	sent_ok_result: Bool = match sent_ok:
+		Ok(v): v
+		Err(_): False
+	timed_out_ok and sent_ok_result
+
+
+-- REGRESSION: send_timeout fiber must be removed from wait queue on timeout.
+-- Without the fix, the stale fiber pointer in send_waiters causes UAF when
+-- a subsequent recv tries to dequeue and wake it.
+func send_timeout_task(ch: Channel[String]) -> Bool:
+	result: Bool = send_timeout(ch, "overflow", 20)
+	not result
+
+
+func delayed_recv_task(ch: Channel[String]) -> Bool:
+	sleep(50)
+	opt: Option[String] = recv(ch)
+	match opt:
+		Some(v): v == "first"
+		None: False
+
+
+func test_send_timeout_then_recv() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, "first")
+	concurrent:
+		timed_out = send_timeout_task(ch)
+		recvd = delayed_recv_task(ch)
+	timed_out_ok: Bool = match timed_out:
+		Ok(v): v
+		Err(_): False
+	recvd_ok: Bool = match recvd:
+		Ok(v): v
+		Err(_): False
+	timed_out_ok and recvd_ok
+
+
+-- Stress: multiple recv_timeouts on the same channel, all expire,
+-- then send values. Tests that all stale fibers are properly cleaned up.
+func timeout_recv_task(ch: Channel[Int]) -> Bool:
+	opt: Option[Int] = recv_timeout(ch, 10)
+	match opt:
+		None: True
+		Some(_): False
+
+
+func delayed_multi_send_task(ch: Channel[Int]) -> Bool:
+	sleep(50)
+	_ = send(ch, 10)
+	_ = send(ch, 20)
+	_ = send(ch, 30)
+	close(ch)
+	True
+
+
+func test_multiple_recv_timeouts_then_send() -> Bool:
+	ch: Channel[Int] = channel(5)
+	concurrent:
+		t1 = timeout_recv_task(ch)
+		t2 = timeout_recv_task(ch)
+		t3 = timeout_recv_task(ch)
+		sender = delayed_multi_send_task(ch)
+	var ok: Bool = True
+	match t1:
+		Ok(v): ok = ok and v
+		Err(_): ok = False
+	match t2:
+		Ok(v): ok = ok and v
+		Err(_): ok = False
+	match t3:
+		Ok(v): ok = ok and v
+		Err(_): ok = False
+	match sender:
+		Ok(v): ok = ok and v
+		Err(_): ok = False
+	ok
+
+
+func delayed_send_int(ch: Channel[Int]) -> Bool:
+	sleep(10)
+	send(ch, 123)
+
+
+func recv_int_with_long_timeout(ch: Channel[Int]) -> Bool:
+	opt: Option[Int] = recv_timeout(ch, 200)
+	match opt:
+		Some(v): v == 123
+		None: False
+
+
+-- REGRESSION: expired recv_timeout fibers must not leave a stale channel
+-- wait-queue tail. If the stale tail remains, the next recv_timeout is not
+-- reachable from the channel head and a sender cannot wake it; it only resumes
+-- when its own timer fires.
+func test_recv_queue_reusable_after_timeouts() -> Bool:
+	ch: Channel[Int] = channel(5)
+	concurrent:
+		t1 = timeout_recv_task(ch)
+		t2 = timeout_recv_task(ch)
+		t3 = timeout_recv_task(ch)
+	var expired_ok: Bool = True
+	match t1:
+		Ok(v): expired_ok = expired_ok and v
+		Err(_): expired_ok = False
+	match t2:
+		Ok(v): expired_ok = expired_ok and v
+		Err(_): expired_ok = False
+	match t3:
+		Ok(v): expired_ok = expired_ok and v
+		Err(_): expired_ok = False
+	if not expired_ok:
+		False
+	else:
+		start: Int = now()
+		concurrent:
+			received = recv_int_with_long_timeout(ch)
+			sent = delayed_send_int(ch)
+		elapsed_ms: Int = (now() - start) / 1000
+		received_ok: Bool = match received:
+			Ok(v): v
+			Err(_): False
+		sent_ok: Bool = match sent:
+			Ok(v): v
+			Err(_): False
+		received_ok and sent_ok and elapsed_ms < 100
+
+
+-- Channel close then recv_timeout returns None
+func test_close_then_recv_timeout() -> Bool:
+	ch: Channel[Int] = channel(1)
+	close(ch)
+	opt: Option[Int] = recv_timeout(ch, 10)
+	match opt:
+		None: True
+		Some(_): False
+
+
+tests: TestSuite = {
+	description = "Concurrency: channel timeouts",
+	tests = [
+		("recv_timeout expires", test_recv_timeout_expires),
+		("recv_timeout data ready", test_recv_timeout_data_ready),
+		("send_timeout expires", test_send_timeout_expires),
+		("send_timeout space ready", test_send_timeout_space_ready),
+		("recv_timeout then send (UAF regression)", test_recv_timeout_then_send),
+		("send_timeout then recv (UAF regression)", test_send_timeout_then_recv),
+		("multiple recv_timeouts then send (stress)", test_multiple_recv_timeouts_then_send),
+		("recv queue reusable after timeouts", test_recv_queue_reusable_after_timeouts),
+		("channel close then recv_timeout", test_close_then_recv_timeout),
+	],
+}

@@ -1,0 +1,157 @@
+#!/bin/bash
+set -euo pipefail
+
+IMAGE_NAME="blorp-test"
+PLATFORM="linux/amd64"
+MODE="volume"
+BUILD_ONLY=0
+SHELL_MODE=0
+REBUILD=0
+TEST_ARGS=()
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/docker-test [options] [-- blorp-test-args...]
+
+Run blorp tests in a Docker container matching the CI environment (Ubuntu 24.04 x86_64).
+
+Options:
+  --clean         Copy source into image (CI-like, hermetic)
+  --build-only    Build base image, don't run tests
+  --shell         Interactive bash shell in container
+  --rebuild       Force rebuild base image (no cache)
+  --platform P    Docker platform (default: linux/amd64)
+  -h, --help      Show help
+
+Examples:
+  scripts/docker-test                           # Full suite, volume mount
+  scripts/docker-test --clean                   # CI-like hermetic build
+  scripts/docker-test --shell                   # Debug interactively
+  scripts/docker-test -- tests/test_blorp/types/   # Specific tests only
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --clean)
+            MODE="clean"
+            shift
+            ;;
+        --build-only)
+            BUILD_ONLY=1
+            shift
+            ;;
+        --shell)
+            SHELL_MODE=1
+            shift
+            ;;
+        --rebuild)
+            REBUILD=1
+            shift
+            ;;
+        --platform)
+            PLATFORM="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            TEST_ARGS=("$@")
+            break
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+cd "$(dirname "$0")/.."
+
+build_base_image() {
+    local cache_flag=""
+    if [ "$REBUILD" -eq 1 ]; then
+        cache_flag="--no-cache"
+    fi
+    echo "Building base image '$IMAGE_NAME'..."
+    docker build \
+        --platform "$PLATFORM" \
+        $cache_flag \
+        -t "$IMAGE_NAME" \
+        -f scripts/docker/Dockerfile \
+        .
+    echo "Base image built."
+}
+
+# Always ensure the base image exists
+if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1 || [ "$REBUILD" -eq 1 ]; then
+    build_base_image
+fi
+
+if [ "$BUILD_ONLY" -eq 1 ]; then
+    build_base_image
+    exit 0
+fi
+
+if [ "$SHELL_MODE" -eq 1 ]; then
+    echo "Starting interactive shell (platform: $PLATFORM)..."
+    docker run --rm -it \
+        --platform "$PLATFORM" \
+        -v "$(pwd):/blorp" \
+        "$IMAGE_NAME" \
+        bash -c 'eval $(opam env) && exec bash'
+    exit 0
+fi
+
+if [ "$MODE" = "clean" ]; then
+    CLEAN_IMAGE="${IMAGE_NAME}-clean-$$"
+    CLEAN_DOCKERFILE=$(mktemp)
+    trap "rm -f '$CLEAN_DOCKERFILE'; docker rmi '$CLEAN_IMAGE' 2>/dev/null || true" EXIT
+
+    cat > "$CLEAN_DOCKERFILE" <<DEOF
+FROM $IMAGE_NAME
+COPY --chown=blorp:blorp . /blorp
+RUN bash -c 'eval \$(opam env) && make'
+DEOF
+
+    echo "Building hermetic image (platform: $PLATFORM)..."
+    docker build \
+        --platform "$PLATFORM" \
+        -t "$CLEAN_IMAGE" \
+        -f "$CLEAN_DOCKERFILE" \
+        .
+
+    echo "Running tests (hermetic)..."
+    if [ ${#TEST_ARGS[@]} -gt 0 ]; then
+        docker run --rm \
+            --platform "$PLATFORM" \
+            "$CLEAN_IMAGE" \
+            bash -c "eval \$(opam env) && ./blorp test ${TEST_ARGS[*]}"
+    else
+        docker run --rm \
+            --platform "$PLATFORM" \
+            "$CLEAN_IMAGE" \
+            bash -c 'eval $(opam env) && bash scripts/run_tests.sh'
+    fi
+else
+    echo "Running tests (volume mount, platform: $PLATFORM)..."
+    if [ ${#TEST_ARGS[@]} -gt 0 ]; then
+        docker run --rm \
+            --platform "$PLATFORM" \
+            -e BLORP_VOLUME_MODE=1 \
+            -v "$(pwd):/blorp:ro" \
+            "$IMAGE_NAME" \
+            bash -c "eval \$(opam env) && bash /blorp/scripts/docker/test.sh ${TEST_ARGS[*]}"
+    else
+        docker run --rm \
+            --platform "$PLATFORM" \
+            -e BLORP_VOLUME_MODE=1 \
+            -v "$(pwd):/blorp:ro" \
+            "$IMAGE_NAME" \
+            bash /blorp/scripts/docker/test.sh
+    fi
+fi

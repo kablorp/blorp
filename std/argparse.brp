@@ -1,0 +1,760 @@
+import:
+	dict: dict
+
+
+-- Argparse - Declarative CLI argument parser
+--
+-- Provides a combinator-style argument parser for CLI programs.
+-- Parse function is pure - returns a ParseOutcome union instead of
+-- printing directly, so the caller controls I/O.
+--
+-- Supports:
+-- - Long options (--output FILE, --output=FILE)
+-- - Short options (-o FILE)
+-- - Boolean flags (--verbose, -v)
+-- - Combined short flags (-vf)
+-- - Positional arguments
+-- - Rest args after bare "--"
+-- - Auto --help/-h and --version
+-- - Required args, defaults, typed values
+--
+-- Typical use: import the module as `argparse as Args`.
+-- ============================================================================
+-- Types
+-- ============================================================================
+private union ArgKind:
+	Flag
+	Opt
+	Positional
+
+
+private union ValueType:
+	StringType
+	IntType
+	FloatType
+	BoolType
+
+
+record Param {
+	name: String,
+	kind: ArgKind,
+	long: String,
+	short: String,
+	help: String,
+	required: Bool,
+	default_value: String,
+	value_type: ValueType,
+	metavar: String,
+}
+
+
+union Value:
+	StringVal(String)
+	IntVal(Int)
+	FloatVal(Float)
+	BoolVal(Bool)
+
+
+record Args {values: Dict[String, Value], positional: List[String], rest: List[String]}
+
+
+record Cli {name: String, version: String, description: String, params: List[Param]}
+
+
+union ParseError:
+	UnknownArg(String)
+	MissingValue(String)
+	MissingRequired(String)
+	InvalidValue(String, String)
+	DuplicateArg(String)
+
+
+union ParseOutcome:
+	Parsed(Args)
+	HelpRequested(String)
+	VersionRequested(String)
+	ParseFailed(ParseError)
+
+
+-- Backward-compatible type aliases (deprecated)
+type alias ArgParser = Cli
+
+type alias ArgSpec = Param
+
+type alias ArgValue = Value
+
+type alias ParsedArgs = Args
+
+
+-- ============================================================================
+-- Builders
+-- ============================================================================
+private pure func make_param(
+	name: String,
+	kind: ArgKind,
+	long: String,
+	short: String,
+	help: String,
+	req: Bool,
+	vtype: ValueType,
+	metavar: String,
+) -> Param:
+	{
+		name = name,
+		kind = kind,
+		long = long,
+		short = short,
+		help = help,
+		required = req,
+		default_value = "",
+		value_type = vtype,
+		metavar = metavar,
+	}
+
+
+---
+Create a boolean flag (e.g. --verbose, -v).
+
+doctests:
+    :: Flag has correct name
+    spec: Param = flag("verbose", "--verbose", "-v", "Enable verbose output")
+    spec.name == "verbose"
+---
+pure func flag(
+	name: String,
+	long: String,
+	short: String,
+	help: String,
+) -> Param:
+	make_param(name, Flag, long, short, help, False, BoolType, "")
+
+
+---
+Create a named argument that takes a string value (e.g. --output FILE).
+
+doctests:
+    :: Arg has correct name
+    spec: Param = arg("output", "--output", "-o", "Output file", "FILE")
+    spec.name == "output"
+---
+pure func arg(
+	name: String,
+	long: String,
+	short: String,
+	help: String,
+	metavar: String,
+) -> Param:
+	make_param(name, Opt, long, short, help, False, StringType, metavar)
+
+
+---
+Create a named argument that takes an integer value.
+---
+pure func arg_int(
+	name: String,
+	long: String,
+	short: String,
+	help: String,
+	metavar: String,
+) -> Param:
+	make_param(name, Opt, long, short, help, False, IntType, metavar)
+
+
+---
+Create a named argument that takes a float value.
+---
+pure func arg_float(
+	name: String,
+	long: String,
+	short: String,
+	help: String,
+	metavar: String,
+) -> Param:
+	make_param(name, Opt, long, short, help, False, FloatType, metavar)
+
+
+---
+Create a positional argument.
+
+doctests:
+    :: Positional is required by default
+    spec: Param = positional("input", "Input file")
+    spec.required == True
+---
+pure func positional(name: String, help: String) -> Param:
+	make_param(name, Positional, "", "", help, True, StringType, "")
+
+
+-- Backward-compatible aliases (deprecated)
+pure func option(
+	name: String,
+	long: String,
+	short: String,
+	help: String,
+	metavar: String,
+) -> Param:
+	arg(name, long, short, help, metavar)
+
+
+pure func option_int(
+	name: String,
+	long: String,
+	short: String,
+	help: String,
+	metavar: String,
+) -> Param:
+	arg_int(name, long, short, help, metavar)
+
+
+pure func option_float(
+	name: String,
+	long: String,
+	short: String,
+	help: String,
+	metavar: String,
+) -> Param:
+	arg_float(name, long, short, help, metavar)
+
+
+---
+Set a default value for a param.
+---
+pure func with_default(spec: Param, default_val: String) -> Param:
+	{ spec | default_value = default_val, required = False }
+
+
+---
+Make an arg spec required.
+---
+pure func required(spec: Param) -> Param:
+	{ spec | required = True }
+
+
+-- Backward-compatible alias (deprecated)
+pure func make_required(spec: Param) -> Param:
+	required(spec)
+
+
+-- ============================================================================
+-- Typed Extractors
+-- ============================================================================
+---
+Get a string value from parsed args by name.
+---
+pure func get_string(result: Args, name: String) -> Option[String]:
+	match result.values.get(name):
+		Some(val):
+			match val:
+				StringVal(s): Some(s)
+				_: None
+		None: None
+
+
+---
+Get an int value from parsed args by name.
+---
+pure func get_int(result: Args, name: String) -> Option[Int]:
+	match result.values.get(name):
+		Some(val):
+			match val:
+				IntVal(n): Some(n)
+				_: None
+		None: None
+
+
+---
+Get a float value from parsed args by name.
+---
+pure func get_float(result: Args, name: String) -> Option[Float]:
+	match result.values.get(name):
+		Some(val):
+			match val:
+				FloatVal(f): Some(f)
+				_: None
+		None: None
+
+
+---
+Get a boolean flag value. Returns False if absent.
+---
+pure func get_flag(result: Args, name: String) -> Bool:
+	match result.values.get(name):
+		Some(val):
+			match val:
+				BoolVal(b): b
+				_: False
+		None: False
+
+
+---
+Get a string value or return a default.
+---
+pure func get_string_or(result: Args, name: String, default: String) -> String:
+	match get_string(result, name):
+		Some(s): s
+		None: default
+
+
+---
+Get an int value or return a default.
+---
+pure func get_int_or(result: Args, name: String, default: Int) -> Int:
+	match get_int(result, name):
+		Some(n): n
+		None: default
+
+
+---
+Get a float value or return a default.
+---
+pure func get_float_or(result: Args, name: String, default: Float) -> Float:
+	match get_float(result, name):
+		Some(f): f
+		None: default
+
+
+---
+Format a ParseError as a human-readable string.
+---
+pure func format_error(err: ParseError) -> String:
+	match err:
+		UnknownArg(arg): "unknown argument: ${arg}"
+		MissingValue(arg): "missing value for: ${arg}"
+		MissingRequired(name): "missing required argument: ${name}"
+		InvalidValue(name, raw): "invalid value for ${name}: ${raw}"
+		DuplicateArg(name): "duplicate argument: ${name}"
+
+
+implements Stringable for ParseError:
+	pure func to_string(err: ParseError) -> String:
+		format_error(err)
+
+
+-- ============================================================================
+-- Help Text Generation
+-- ============================================================================
+private pure func pad_right(s: String, width: Int) -> String:
+	len: Int = s.length()
+	if len >= width:
+		s
+	else:
+		s + " ".repeat(width - len)
+
+
+private pure func help_header(parser: Cli) -> String:
+	if parser.version.length() > 0:
+		"${parser.name} v${parser.version} - ${parser.description}"
+	else:
+		"${parser.name} - ${parser.description}"
+
+
+private pure func help_usage_line(parser: Cli) -> String:
+	var usage: String = "Usage: ${parser.name} [OPTIONS]"
+	for s in parser.params:
+		match s.kind:
+			Positional: usage += " <${s.name}>"
+			_: void
+	usage
+
+
+private pure func format_option_line(spec: Param) -> String:
+	var left: String = if spec.short.length() > 0:
+		"  ${spec.short}, ${spec.long}"
+	else:
+		"      ${spec.long}"
+	match spec.kind:
+		Opt:
+			if spec.metavar.length() > 0:
+				left += " ${spec.metavar}"
+			else:
+				left += " VALUE"
+		_: void
+	var desc: String = spec.help
+	if spec.default_value.length() > 0:
+		desc = "${desc} [default: ${spec.default_value}]"
+	left.pad_right(28) + desc
+
+
+private pure func format_pos_line(name: String, help: String) -> String:
+	"  <${name}>".pad_right(28) + help
+
+
+private pure func generate_help(parser: Cli) -> String:
+	var lines: List[String] = [help_header(parser), "", help_usage_line(parser), ""]
+
+	-- Check for positional args
+	var has_positional: Bool = False
+	for s in parser.params:
+		match s.kind:
+			Positional: has_positional = True
+			_: void
+
+	-- Positional arguments section
+	if has_positional:
+		lines = lines.append("Arguments:")
+		for s in parser.params:
+			match s.kind:
+				Positional: lines = lines.append(format_pos_line(s.name, s.help))
+				_: void
+		lines = lines.append("")
+
+	-- Options section
+	lines = lines.append("Options:")
+	for s in parser.params:
+		match s.kind:
+			Positional: void
+			_: lines = lines.append(format_option_line(s))
+	lines = lines.append("  -h, --help".pad_right(28) + "Show this help message")
+	lines = lines.append("      --version".pad_right(28) + "Show version")
+	lines.join("\n")
+
+
+-- ============================================================================
+-- Value Parsing
+-- ============================================================================
+private pure func parse_value(raw: String, vtype: ValueType) -> Option[Value]:
+	match vtype:
+		StringType: Some(StringVal(raw))
+		IntType:
+			match raw.parse_int():
+				Some(n): Some(IntVal(n))
+				None: None
+		FloatType:
+			match raw.parse_float():
+				Some(f): Some(FloatVal(f))
+				None: None
+		BoolType:
+			if raw == "true":
+				Some(BoolVal(True))
+			else if raw == "false":
+				Some(BoolVal(False))
+			else:
+				None
+
+
+-- ============================================================================
+-- Internal: Lookup index (maps --key / -k to its Param)
+-- ============================================================================
+private pure func build_index(specs: List[Param]) -> Dict[String, Param]:
+	var result: Dict[String, Param] = dict()
+	for s in specs:
+		if s.long.length() > 0:
+			result = result.set(s.long, s)
+		if s.short.length() > 0:
+			result = result.set(s.short, s)
+	result
+
+
+-- ============================================================================
+-- Internal: Default application and validation
+-- ============================================================================
+private pure func apply_defaults(
+	values: Dict[String, Value],
+	specs: List[Param],
+) -> Dict[String, Value]:
+	var result: Dict[String, Value] = values
+	for s in specs:
+		if not result.contains(s.name) and s.default_value.length() > 0:
+			match parse_value(s.default_value, s.value_type):
+				Some(parsed): result = result.set(s.name, parsed)
+				None: void
+	result
+
+
+private pure func check_required(
+	values: Dict[String, Value],
+	specs: List[Param],
+) -> Option[ParseError]:
+	var missing: Option[ParseError] = None
+	for s in specs:
+		if missing.is_none() and s.required and not values.contains(s.name):
+			missing = Some(MissingRequired(s.name))
+	missing
+
+
+private pure func short_matches(spec: Param, ch: Char) -> Bool:
+	match spec.short.get(1):
+		Some(short_ch): short_ch == ch
+		None: False
+
+
+private pure func find_short_index(specs: List[Param], ch: Char) -> Option[Int]:
+	var found: Option[Int] = None
+	var idx: Int = 0
+	for s in specs:
+		if found.is_none() and short_matches(s, ch):
+			found = Some(idx)
+		idx += 1
+	found
+
+
+private pure func short_key_for(ch: Char) -> String:
+	"-" + ch.to_string()
+
+
+-- ============================================================================
+-- Core Parse Function
+-- ============================================================================
+private pure func resolve_param_value(
+	param: Param,
+	raw: String,
+) -> Result[(String, Value), ParseError]:
+	match param.value_type:
+		IntType:
+			try:
+				raw_for_error: String = raw.substring(0, raw.length())
+				parsed ?= parse_value(
+					raw,
+					param.value_type,
+				).ok_or(InvalidValue(param.name, raw_for_error))
+				(param.name, parsed)
+		FloatType:
+			try:
+				raw_for_error: String = raw.substring(0, raw.length())
+				parsed ?= parse_value(
+					raw,
+					param.value_type,
+				).ok_or(InvalidValue(param.name, raw_for_error))
+				(param.name, parsed)
+		_:
+			try:
+				raw_for_value: String = raw.substring(0, raw.length())
+				raw_for_error: String = raw.substring(0, raw.length())
+				parsed ?= parse_value(
+					raw_for_value,
+					param.value_type,
+				).ok_or(InvalidValue(param.name, raw_for_error))
+				(param.name, parsed)
+
+
+-- Resolve a key to its param, parse a raw value, return (name, parsed_value).
+private pure func resolve_value(
+	lookup: Dict[String, Param],
+	key: String,
+	raw: String,
+) -> Result[(String, Value), ParseError]:
+	try:
+		param ?= lookup
+			.get(key)
+			.ok_or(UnknownArg(key))
+		resolved ?= resolve_param_value(param, raw)
+		resolved
+
+
+---
+Parse command line arguments according to an Cli spec.
+Pure function - returns a ParseOutcome without performing any I/O.
+Skips args[0] (program name).
+---
+pure func parse(parser: Cli, args: List[String]) -> ParseOutcome:
+	-- Pre-build lookup (maps --key / -k to Param)
+	lookup: Dict[String, Param] = build_index(parser.params)
+
+	-- Positional spec names
+	var pos_names: List[String] = []
+	for s in parser.params:
+		match s.kind:
+			Positional: pos_names = pos_names.append(s.name)
+			_: void
+
+	-- Parse state
+	var values: Dict[String, Value] = dict()
+	var positional_args: List[String] = []
+	var rest_args: List[String] = []
+	var past_separator: Bool = False
+	var pos_index: Int = 0
+	var error: Option[ParseError] = None
+	var help_requested: Bool = False
+	var version_requested: Bool = False
+
+	-- Skip program name at index 0, iterate from index 1
+	var idx: Int = 1
+	var num_args: Int = args.length()
+	while idx < num_args:
+		match args.get(idx):
+			Some(arg):
+				if past_separator:
+					rest_args = rest_args.append(arg)
+					idx += 1
+				else if arg == "--":
+					past_separator = True
+					idx += 1
+				else if arg == "--help" or arg == "-h":
+					help_requested = True
+					idx = num_args
+				else if arg == "--version":
+					version_requested = True
+					idx = num_args
+				else if arg.starts_with("--"):
+					match arg.index_of("="):
+						Some(eq_pos):
+							-- --key=value form
+							key: String = arg.substring(0, eq_pos)
+							raw_val: String = arg.substring(eq_pos + 1, arg.length() - eq_pos - 1)
+							match resolve_value(lookup, key, raw_val):
+								Ok((sname, parsed)): values = values.set(sname, parsed)
+								Err(e): error = Some(e)
+							idx += 1
+						None:
+							-- --key form (flag or option consuming next arg)
+							match lookup.get(arg):
+								Some(param):
+									match param.kind:
+										Flag:
+											values = values.set(param.name, BoolVal(True))
+											idx += 1
+										Opt:
+											if idx + 1 < num_args:
+												match args.get(idx + 1):
+													Some(next_arg):
+														match resolve_value(lookup, arg, next_arg):
+															Ok((sn, parsed)): values = values.set(
+																sn,
+																parsed,
+															)
+															Err(e): error = Some(e)
+													None: error = Some(MissingValue(arg))
+												idx += 2
+											else:
+												error = Some(MissingValue(arg))
+												idx += 1
+										Positional: idx += 1
+								None:
+									error = Some(UnknownArg(arg))
+									idx += 1
+				else if arg.starts_with("-") and arg.length() > 1:
+					match arg.get(1):
+						Some(first_short):
+							-- Short option
+							match find_short_index(parser.params, first_short):
+								Some(param_idx):
+									match parser.params.get(param_idx):
+										Some(param):
+											match param.kind:
+												Flag:
+													-- Combined flags: -vf
+													var fi: Int = 1
+													var flag_ok: Bool = True
+													while fi < arg.length() and flag_ok:
+														match arg.get(fi):
+															Some(flag_ch):
+																match find_short_index(
+																	parser.params,
+																	flag_ch,
+																):
+																	Some(fp_idx):
+																		match parser.params.get(
+																			fp_idx,
+																		):
+																			Some(fp):
+																				match fp.kind:
+																					Flag: values = values.set(
+																						fp.name,
+																						BoolVal(
+																							True,
+																						),
+																					)
+																					_:
+																						flag_ok = False
+																						error = Some(
+																							MissingValue(
+																								short_key_for(
+																									flag_ch,
+																								),
+																							),
+																						)
+																			None:
+																				flag_ok = False
+																				error = Some(
+																					UnknownArg(
+																						short_key_for(
+																							flag_ch,
+																						),
+																					),
+																				)
+																	None:
+																		flag_ok = False
+																		error = Some(
+																			UnknownArg(
+																				short_key_for(
+																					flag_ch,
+																				),
+																			),
+																		)
+															None: flag_ok = False
+														fi += 1
+													idx += 1
+												Opt:
+													if arg.length() > 2:
+														-- Attached value: -oFILE
+														attached_val: String = arg.substring(
+															2,
+															arg.length() - 2,
+														)
+														match resolve_param_value(
+															param,
+															attached_val,
+														):
+															Ok((sn, parsed)): values = values.set(
+																sn,
+																parsed,
+															)
+															Err(e): error = Some(e)
+														idx += 1
+													else if idx + 1 < num_args:
+														match args.get(idx + 1):
+															Some(next_arg):
+																match resolve_param_value(
+																	param,
+																	next_arg,
+																):
+																	Ok((sn, parsed)): values = values.set(
+																		sn,
+																		parsed,
+																	)
+																	Err(e): error = Some(e)
+															None: error = Some(
+																MissingValue(
+																	short_key_for(first_short),
+																),
+															)
+														idx += 2
+													else:
+														error = Some(
+															MissingValue(
+																short_key_for(first_short),
+															),
+														)
+														idx += 1
+												Positional: idx += 1
+										None:
+											error = Some(UnknownArg(short_key_for(first_short)))
+											idx += 1
+								None:
+									error = Some(UnknownArg(short_key_for(first_short)))
+									idx += 1
+						None: idx += 1
+				else:
+					-- Positional argument
+					positional_args = positional_args.append(arg)
+					match pos_names.get(pos_index):
+						Some(pname): values = values.set(pname, StringVal(arg))
+						None: void
+					pos_index += 1
+					idx += 1
+			None: idx += 1
+
+	-- Post-processing: apply defaults, validate required
+	if help_requested:
+		HelpRequested(generate_help(parser))
+	else if version_requested:
+		VersionRequested("${parser.name} ${parser.version}")
+	else:
+		match error:
+			Some(e): ParseFailed(e)
+			None:
+				values = apply_defaults(values, parser.params)
+				match check_required(values, parser.params):
+					Some(e): ParseFailed(e)
+					None:
+						Parsed({values = values, positional = positional_args, rest = rest_args})

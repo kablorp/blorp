@@ -1,0 +1,74 @@
+-- Runtime tests for inference scenarios that will benefit from proper
+-- HM zonking. Each test exercises late-binding type resolution where
+-- a generic function's type parameters are constrained by calls AFTER
+-- the initial allocation.
+--
+-- These tests pass typechecking at HEAD because the typechecker is
+-- lenient about unresolved type params (they get "stuck" but don't
+-- error). They're guards for the upcoming TyMeta + zonking refactor:
+-- after that change, the same behavior must still work.
+import:
+	cache as C
+	option: Option(Some, None)
+	test: TestSuite
+
+
+-- Scenario 1: cache late-binding.
+-- var c = C.cache(10) initially has Cache[?K, ?V]. C.put constrains K,V
+-- to String. After inference, c and all transitive calls must see
+-- concrete types — otherwise monomorphization can't specialize.
+func test_cache_late_binding() -> Bool:
+	var c = C.cache(10)
+	c = C.put(c, "a", "one")
+	c = C.put(c, "b", "two")
+	match C.get(c, "b"):
+		Some(v): v == "two"
+		None: False
+
+
+-- Scenario 3: nested generic with type param flowing through a match arm.
+union Container[T]:
+	Value(T)
+	Empty
+
+
+pure func container_map[A, B](c: Container[A], f: pure (A) -> B) -> Container[B]:
+	match c:
+		Value(v): Value(f(v))
+		Empty: Empty
+
+
+func test_container_map() -> Bool:
+	c: Container[Int] = Value(42)
+	result: Container[String] = container_map(c, pure func(x: Int): "ok")
+	match result:
+		Value(s): s == "ok"
+		Empty: False
+
+
+-- Scenario 4: trait method dispatched on first-arg concrete type.
+trait Describable2:
+	pure func describe(value: Self) -> String
+
+
+record Animal {name: String, legs: Int}
+
+
+implements Describable2 for Animal:
+	pure func describe(value: Animal) -> String:
+		"${value.name} has ${value.legs} legs"
+
+
+func test_trait_dispatch() -> Bool:
+	a: Animal = {name = "cat", legs = 4}
+	describe(a) == "cat has 4 legs"
+
+
+tests: TestSuite = {
+	description = "Inference zonking regression guards",
+	tests = [
+		("cache late-binding", test_cache_late_binding),
+		("generic container map", test_container_map),
+		("trait dispatch on concrete", test_trait_dispatch),
+	],
+}

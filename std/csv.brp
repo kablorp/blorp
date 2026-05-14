@@ -1,0 +1,572 @@
+import:
+	dict: from_list
+	string: from_char, string
+
+
+-- CSV Parser and Formatter
+-- RFC 4180 compliant: quoted fields, embedded commas/newlines, escaped quotes
+-- ============================================================================
+-- Types
+-- ============================================================================
+record CsvConfig {delimiter: Char, quote_char: Char}
+
+
+record CsvError {line: Int, column: Int, message: String}
+
+
+-- ============================================================================
+-- Config Constructors
+-- ============================================================================
+pure func default_config() -> CsvConfig:
+	{delimiter = ',', quote_char = '\"'}
+
+
+pure func tsv_config() -> CsvConfig:
+	{delimiter = '\t', quote_char = '\"'}
+
+
+-- ============================================================================
+-- Internal: Field Parsing
+-- ============================================================================
+private pure func parse_quoted_field(input: String, pos: Int, config: CsvConfig) -> (String, Int):
+	var i: Int = pos + 1
+	var result: String = string(16)
+	var done: Bool = False
+	while not done:
+		match input.get(i):
+			Some(c):
+				if c == config.quote_char:
+					match input.get(i + 1):
+						Some(next):
+							if next == config.quote_char:
+								result = result.append_char(config.quote_char)
+								i += 2
+							else:
+								done = True
+								i += 1
+						None:
+							done = True
+							i += 1
+				else:
+					result = result.append_char(c)
+					i += 1
+			None:
+				done = True
+	(result, i)
+
+
+private pure func parse_unquoted_field(input: String, pos: Int, config: CsvConfig) -> (String, Int):
+	var i: Int = pos
+	var result: String = string(16)
+	var done: Bool = False
+	while not done:
+		match input.get(i):
+			Some(c):
+				if c == config.delimiter or c == '\n' or c == '\r':
+					done = True
+				else:
+					result = result.append_char(c)
+					i += 1
+			None:
+				done = True
+	(result, i)
+
+
+private pure func parse_field(input: String, pos: Int, config: CsvConfig) -> (String, Int):
+	match input.get(pos):
+		Some(c):
+			if c == config.quote_char:
+				parse_quoted_field(input, pos, config)
+			else:
+				parse_unquoted_field(input, pos, config)
+		None:
+			("", pos)
+
+
+-- ============================================================================
+-- Internal: Row and Document Parsing
+-- ============================================================================
+private pure func parse_row(input: String, pos: Int, config: CsvConfig) -> (List[String], Int):
+	var fields: List[String] = []
+	var i: Int = pos
+	var done: Bool = False
+	while not done:
+		field_result: (String, Int) = parse_field(input, i, config)
+		fields = fields.append(field_result.0)
+		i = field_result.1
+		if i >= input.length():
+			done = True
+		else:
+			match input.get(i):
+				Some(c):
+					if c == config.delimiter:
+						i += 1
+					else:
+						done = True
+				None:
+					done = True
+	(fields, i)
+
+
+private pure func skip_newline(input: String, pos: Int) -> Int:
+	match input.get(pos):
+		Some(c):
+			if c == '\r':
+				match input.get(pos + 1):
+					Some(n):
+						if n == '\n':
+							pos + 2
+						else:
+							pos + 1
+					None:
+						pos + 1
+			else if c == '\n':
+				pos + 1
+			else:
+				pos
+		None:
+			pos
+
+
+private pure func parse_rows(input: String, config: CsvConfig) -> List[List[String]]:
+	var rows: List[List[String]] = []
+	var i: Int = 0
+	while i < input.length():
+		row_result: (List[String], Int) = parse_row(input, i, config)
+		rows = rows.append(row_result.0)
+		i = row_result.1
+		i = skip_newline(input, i)
+	rows
+
+
+-- ============================================================================
+-- Internal: Formatting Helpers
+-- ============================================================================
+private pure func needs_quoting(field: String, config: CsvConfig) -> Bool:
+	var i: Int = 0
+	var found: Bool = False
+	var done: Bool = False
+	while not done:
+		match field.get(i):
+			Some(c):
+				if c == config.delimiter or c == config.quote_char or c == '\n' or c == '\r':
+					found = True
+					done = True
+				else:
+					i += 1
+			None:
+				done = True
+	found
+
+
+private pure func quote_field(field: String, config: CsvConfig) -> String:
+	q: String = from_char(config.quote_char)
+	escaped: String = field.replace(q, q + q)
+	q + escaped + q
+
+
+private pure func format_field(field: String, config: CsvConfig) -> String:
+	if needs_quoting(field, config):
+		quote_field(field, config)
+	else:
+		field
+
+
+private pure func format_row(row: List[String], config: CsvConfig) -> String:
+	var parts: List[String] = []
+	var i: Int = 0
+	len: Int = row.length()
+	while i < len:
+		match row.get(i):
+			Some(field):
+				parts = parts.append(format_field(field, config))
+			None: void
+		i += 1
+	parts.join(from_char(config.delimiter))
+
+
+-- ============================================================================
+-- Core API
+-- ============================================================================
+pure func parse_csv(input: String) -> List[List[String]]:
+	parse_rows(input, default_config())
+
+
+pure func format_csv(rows: List[List[String]]) -> String:
+	config: CsvConfig = default_config()
+	var formatted: List[String] = []
+	var i: Int = 0
+	len: Int = rows.length()
+	while i < len:
+		match rows.get(i):
+			Some(row):
+				formatted = formatted.append(format_row(row, config))
+			None: void
+		i += 1
+	formatted.join("\r\n")
+
+
+-- ============================================================================
+-- Config API
+-- ============================================================================
+pure func parse_csv_with_config(input: String, config: CsvConfig) -> List[List[String]]:
+	parse_rows(input, config)
+
+
+pure func format_csv_with_config(rows: List[List[String]], config: CsvConfig) -> String:
+	var formatted: List[String] = []
+	var i: Int = 0
+	len: Int = rows.length()
+	while i < len:
+		match rows.get(i):
+			Some(row):
+				formatted = formatted.append(format_row(row, config))
+			None: void
+		i += 1
+	formatted.join("\r\n")
+
+
+pure func format_csv_row(row: List[String]) -> String:
+	format_row(row, default_config())
+
+
+-- ============================================================================
+-- Strict Parsing API
+-- ============================================================================
+private pure func try_parse_quoted_field(
+	input: String,
+	pos: Int,
+	line: Int,
+	col: Int,
+	config: CsvConfig,
+) -> Result[(String, Int), CsvError]:
+	var i: Int = pos + 1
+	var result: String = string(16)
+	var done: Bool = False
+	var err: Option[CsvError] = None
+	while not done:
+		match input.get(i):
+			Some(c):
+				if c == config.quote_char:
+					match input.get(i + 1):
+						Some(next):
+							if next == config.quote_char:
+								result = result.append_char(config.quote_char)
+								i += 2
+							else:
+								done = True
+								i += 1
+						None:
+							done = True
+							i += 1
+				else:
+					result = result.append_char(c)
+					i += 1
+			None:
+				done = True
+				err = Some({line = line, column = col, message = "unterminated quoted field"})
+	match err:
+		Some(e): Err(e)
+		None: Ok((result, i))
+
+
+private pure func try_parse_field(
+	input: String,
+	pos: Int,
+	line: Int,
+	col: Int,
+	config: CsvConfig,
+) -> Result[(String, Int), CsvError]:
+	match input.get(pos):
+		Some(c):
+			if c == config.quote_char:
+				try_parse_quoted_field(input, pos, line, col, config)
+			else:
+				field_result: (String, Int) = parse_unquoted_field(input, pos, config)
+				Ok(field_result)
+		None:
+			Ok(("", pos))
+
+
+private pure func try_parse_row(
+	input: String,
+	pos: Int,
+	line: Int,
+	config: CsvConfig,
+) -> Result[(List[String], Int), CsvError]:
+	var fields: List[String] = []
+	var i: Int = pos
+	var col: Int = 1
+	var done: Bool = False
+	var error: Option[CsvError] = None
+	while not done:
+		match try_parse_field(input, i, line, col, config):
+			Ok(field_result):
+				fields = fields.append(field_result.0)
+				col += field_result.1 - i
+				i = field_result.1
+				if i >= input.length():
+					done = True
+				else:
+					match input.get(i):
+						Some(c):
+							if c == config.delimiter:
+								i += 1
+								col += 1
+							else:
+								done = True
+						None:
+							done = True
+			Err(e):
+				done = True
+				error = Some(e)
+	match error:
+		Some(e): Err(e)
+		None: Ok((fields, i))
+
+
+private pure func try_parse_rows(
+	input: String,
+	config: CsvConfig,
+) -> Result[List[List[String]], CsvError]:
+	var rows: List[List[String]] = []
+	var i: Int = 0
+	var line: Int = 1
+	var error: Option[CsvError] = None
+	var has_error: Bool = False
+	while i < input.length() and not has_error:
+		match try_parse_row(input, i, line, config):
+			Ok(row_result):
+				rows = rows.append(row_result.0)
+				i = row_result.1
+				i = skip_newline(input, i)
+				line += 1
+			Err(e):
+				error = Some(e)
+				has_error = True
+	match error:
+		Some(e): Err(e)
+		None: Ok(rows)
+
+
+pure func try_parse_csv(input: String) -> Result[List[List[String]], CsvError]:
+	try_parse_rows(input, default_config())
+
+
+pure func try_parse_csv_with_config(
+	input: String,
+	config: CsvConfig,
+) -> Result[List[List[String]], CsvError]:
+	try_parse_rows(input, config)
+
+
+-- ============================================================================
+-- Header-Aware API
+-- ============================================================================
+pure func parse_csv_with_headers(input: String) -> List[Dict[String, String]]:
+	rows: List[List[String]] = parse_csv(input)
+	match rows.get(0):
+		None: []
+		Some(headers):
+			var result: List[Dict[String, String]] = []
+			var i: Int = 1
+			len: Int = rows.length()
+			while i < len:
+				match rows.get(i):
+					Some(row):
+						pairs: List[(String, String)] = headers.zip(row)
+						result = result.append(pairs.from_list())
+					None: void
+				i += 1
+			result
+
+
+-- ============================================================================
+-- Error Formatting
+-- ============================================================================
+pure func format_error(err: CsvError) -> String:
+	"line " + err.line.to_string() + ", column " + err.column.to_string() + ": " + err.message
+
+
+-- CSV Typed Decoder
+--
+-- Composable column decoders for extracting typed records from CSV data.
+-- Mirrors the pattern from codec: define a Decoder[T], then run it with
+-- from_string.
+--
+-- Usage:
+-- decoder = map3(make_record, col_string(0), col_int(1), col_float(2))
+-- result = from_string(decoder, csv_input)
+-- ============================================================================
+-- Types
+-- ============================================================================
+record CsvDecodeError {row: Int, column: Int, message: String}
+
+
+type alias Decoder[T] = pure (List[String]) -> Result[T, CsvDecodeError]
+
+
+-- ============================================================================
+-- Column Extractors
+-- ============================================================================
+---
+Extract a string from column `idx`.
+---
+pure func col_string(idx: Int) -> Decoder[String]:
+	pure func(row: List[String]) -> Result[String, CsvDecodeError]:
+		match row.get(idx):
+			Some(s): Ok(s)
+			None: Err({row = 0, column = idx, message = "missing column"})
+
+
+---
+Extract an integer from column `idx`. Fails if the value is not a valid integer.
+---
+pure func col_int(idx: Int) -> Decoder[Int]:
+	pure func(row: List[String]) -> Result[Int, CsvDecodeError]:
+		match row.get(idx):
+			Some(s):
+				match s.parse_int():
+					Some(n): Ok(n)
+					None: Err({row = 0, column = idx, message = "expected integer"})
+			None: Err({row = 0, column = idx, message = "missing column"})
+
+
+---
+Extract a float from column `idx`. Fails if the value is not a valid number.
+---
+pure func col_float(idx: Int) -> Decoder[Float]:
+	pure func(row: List[String]) -> Result[Float, CsvDecodeError]:
+		match row.get(idx):
+			Some(s):
+				match s.parse_float():
+					Some(f): Ok(f)
+					None: Err({row = 0, column = idx, message = "expected number"})
+			None: Err({row = 0, column = idx, message = "missing column"})
+
+
+-- ============================================================================
+-- Combiners
+-- ============================================================================
+---
+Combine two column decoders into a single record decoder.
+---
+pure func map2[A, B, R](f: pure (A, B) -> R, d1: Decoder[A], d2: Decoder[B]) -> Decoder[R]:
+	pure func(row: List[String]) -> Result[R, CsvDecodeError]:
+		try:
+			a ?= d1(row)
+			b ?= d2(row)
+			f(a, b)
+
+
+---
+Combine three column decoders into a single record decoder.
+---
+pure func map3[A, B, C, R](
+	f: pure (A, B, C) -> R,
+	d1: Decoder[A],
+	d2: Decoder[B],
+	d3: Decoder[C],
+) -> Decoder[R]:
+	pure func(row: List[String]) -> Result[R, CsvDecodeError]:
+		try:
+			a ?= d1(row)
+			b ?= d2(row)
+			c ?= d3(row)
+			f(a, b, c)
+
+
+---
+Combine four column decoders into a single record decoder.
+---
+pure func map4[A, B, C, D, R](
+	f: pure (A, B, C, D) -> R,
+	d1: Decoder[A],
+	d2: Decoder[B],
+	d3: Decoder[C],
+	d4: Decoder[D],
+) -> Decoder[R]:
+	pure func(row: List[String]) -> Result[R, CsvDecodeError]:
+		try:
+			a ?= d1(row)
+			b ?= d2(row)
+			c ?= d3(row)
+			d ?= d4(row)
+			f(a, b, c, d)
+
+
+-- ============================================================================
+-- Pipeline
+-- ============================================================================
+---
+Parse a CSV string with a header row, decode each data row using the decoder.
+The first row is skipped (treated as headers).
+---
+pure func from_string[T](decoder: Decoder[T], input: String) -> Result[List[T], CsvDecodeError]:
+	rows: List[List[String]] = parse_csv(input)
+	decode_rows(decoder, rows, 1)
+
+
+---
+Parse a CSV string without a header row, decode all rows.
+---
+pure func from_string_no_header[T](
+	decoder: Decoder[T],
+	input: String,
+) -> Result[List[T], CsvDecodeError]:
+	rows: List[List[String]] = parse_csv(input)
+	decode_rows(decoder, rows, 0)
+
+
+---
+Apply decoder to a single row, tagging the error with the row number.
+---
+private pure func decode_one_row[T](
+	decoder: Decoder[T],
+	row: List[String],
+	row_num: Int,
+) -> Result[T, CsvDecodeError]:
+	match decoder(row):
+		Ok(val):
+			ok_result: Result[T, CsvDecodeError] = Ok(val)
+			ok_result
+		Err(e): Err({row = row_num, column = e.column, message = e.message})
+
+
+---
+Decode rows starting from index `start`.
+---
+private pure func decode_rows[T](
+	decoder: Decoder[T],
+	rows: List[List[String]],
+	start: Int,
+) -> Result[List[T], CsvDecodeError]:
+	var result: List[T] = []
+	var i: Int = start
+	var err: Option[CsvDecodeError] = None
+	var has_error: Bool = False
+	while i < rows.length() and not has_error:
+		match rows.get(i):
+			Some(row):
+				match decode_one_row(decoder, row, i + 1):
+					Ok(val): result = result.append(val)
+					Err(e):
+						err = Some(e)
+						has_error = True
+			None: void
+		i += 1
+	var final_result: Result[List[T], CsvDecodeError] = Ok(result)
+	match err:
+		Some(e): final_result = Err(e)
+		None: void
+	final_result
+
+
+-- ============================================================================
+-- Error Formatting
+-- ============================================================================
+---
+Format a CsvDecodeError as a plain text string.
+---
+pure func format_decode_error(err: CsvDecodeError) -> String:
+	"row " + err.row.to_string() + ", column " + err.column.to_string() + ": " + err.message

@@ -1,0 +1,74 @@
+-- Regression: value structs (`struct Foo { ... }`, not `record Foo`) are
+-- stack-allocated and have no blorp_Object header. Codegen must not
+-- emit `blorp_retain((blorp_Object*)v)` or `blorp_release(...)` for
+-- captures, list elements, or tuple fields holding such values.
+--
+-- Pre-fix: closure-capture of a value struct emitted
+-- ((void**)__cl->env)[0] = (void*)blorp_retain((blorp_Object*)v);
+-- which fails C compile with "operand of type 'Vec2' where arithmetic
+-- or pointer type is required" (you can't cast a struct value to a
+-- pointer without taking its address first).
+import:
+	test: TestSuite
+
+
+struct Pt {x: Float, y: Float}
+
+
+pure func make_pt(x: Float, y: Float) -> Pt:
+	{x = x, y = y}
+
+
+-- Closure capture of a value struct.
+func test_capture_value_struct() -> Bool:
+	p: Pt = make_pt(3.0, 4.0)
+	dist_sq: pure () -> Float = func(): p.x * p.x + p.y * p.y
+	dist_sq() == 25.0
+
+
+-- Returning a value struct from a closure.
+func test_return_value_struct() -> Bool:
+	a: Pt = make_pt(1.0, 2.0)
+	b: Pt = make_pt(3.0, 4.0)
+	add: pure () -> Pt = func():
+		{x = a.x + b.x, y = a.y + b.y}
+	r: Pt = add()
+	r.x == 4.0 and r.y == 6.0
+
+
+-- Wildcard `_` in a tuple destructure must NOT be lowered to a real
+-- binding. Pre-fix, `(a, _) = ...` emitted `let _ = field in ...`
+-- whose scope-exit cleanup tried to call `blorp_release(_)` and
+-- failed C compile with "use of undeclared identifier '_'". The
+-- with-body variant of `lower_tuple_destruct` already skipped `_`;
+-- the regular version did not. Both must skip.
+func test_wildcard_destruct() -> Bool:
+	(a, _) = (100, "ignore")
+	(_, b) = (99, "keep")
+	a == 100 and b == "keep"
+
+
+-- All-wildcard destructure: no bindings emitted, base case reached
+-- with empty body chain.
+func test_all_wildcard_destruct() -> Bool:
+	(_, _) = (42, "nothing")
+	True
+
+
+-- 3-arity with middle wildcard: catches off-by-one in the index
+-- increment so b/c don't bind to the wrong tuple element.
+func test_arity3_middle_wildcard() -> Bool:
+	(a, _, c) = (1, "skip", 99)
+	a == 1 and c == 99
+
+
+tests: TestSuite = {
+	description = "value struct codegen — no spurious retain/release",
+	tests = [
+		("capture value struct", test_capture_value_struct),
+		("return value struct from closure", test_return_value_struct),
+		("wildcard tuple destructure", test_wildcard_destruct),
+		("all-wildcard tuple destructure", test_all_wildcard_destruct),
+		("arity-3 middle wildcard", test_arity3_middle_wildcard),
+	],
+}

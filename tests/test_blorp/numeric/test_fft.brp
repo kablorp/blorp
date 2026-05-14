@@ -1,0 +1,237 @@
+import:
+	dsp: gen_sine
+	fft: bit_reverse, fft, fft_magnitude, fft_phase, fft_power, ifft, spectral_centroid
+	float: abs, approx_eq
+	tensor: get, length
+	test: TestSuite
+
+
+-- ============================================================================
+-- Bit-reversal tests
+-- ============================================================================
+func test_bit_reverse_identity() -> Bool:
+	-- bit_reverse(0, n) == 0 for any n
+	bit_reverse(0, 4) == 0 and bit_reverse(0, 8) == 0 and bit_reverse(0, 16) == 0
+
+
+func test_bit_reverse_known_values() -> Bool:
+	-- n=8: 3 bits, so reverse(1)=4, reverse(2)=2, reverse(3)=6
+	bit_reverse(1, 8) == 4 and bit_reverse(2, 8) == 2 and bit_reverse(3, 8) == 6
+
+
+func test_bit_reverse_involution() -> Bool:
+	-- Applying bit_reverse twice gives back the original
+	var ok: Bool = True
+	var i: Int = 0
+	while i < 8:
+		if bit_reverse(bit_reverse(i, 8), 8) != i:
+			ok = False
+		i += 1
+	ok
+
+
+-- ============================================================================
+-- FFT / IFFT round-trip tests
+-- ============================================================================
+func test_fft_ifft_roundtrip_impulse() -> Bool:
+	-- FFT then IFFT of an impulse [1, 0, 0, 0] should recover the impulse
+	re: Float[#4] = {1.0, 0.0, 0.0, 0.0}
+	im = vector(0.0, 4)
+	freq: (Float[#4], Float[#4]) = fft(re, im)
+	recovered: (Float[#4], Float[#4]) = ifft(freq.0, freq.1)
+	match get(recovered.0, 0):
+		Some(v0):
+			match get(recovered.0, 1):
+				Some(v1):
+					match get(recovered.0, 2):
+						Some(v2):
+							match get(recovered.0, 3):
+								Some(v3): approx_eq(
+									v0,
+									1.0,
+								) and abs(v1) < 0.0001 and abs(v2) < 0.0001 and abs(v3) < 0.0001
+								None: False
+						None: False
+				None: False
+		None: False
+
+
+func test_fft_ifft_roundtrip_sine() -> Bool:
+	-- Generate a sine wave, FFT, IFFT, verify recovery
+	signal: Float[#256] = gen_sine(440.0, 44100.0, 256)
+	im = vector(0.0, 256)
+	freq: (Float[#256], Float[#256]) = fft(signal, im)
+	recovered: (Float[#256], Float[#256]) = ifft(freq.0, freq.1)
+	-- Check that first few samples match
+	var max_err: Float = 0.0
+	for i in 0..length(signal):
+		match get(signal, i):
+			Some(orig):
+				match get(recovered.0, i):
+					Some(rec):
+						err: Float = abs(orig - rec)
+						if err > max_err:
+							max_err = err
+					None: void
+			None: void
+	max_err < 0.0001
+
+
+func test_fft_ifft_roundtrip_dc() -> Bool:
+	-- Constant signal: all 1.0
+	var signal = vector(0.0, 8)
+	for i in 0..length(signal):
+		signal[i] = 1.0
+	im = vector(0.0, 8)
+	freq: (Float[#8], Float[#8]) = fft(signal, im)
+	recovered: (Float[#8], Float[#8]) = ifft(freq.0, freq.1)
+	var max_err: Float = 0.0
+	for i in 0..length(recovered.0):
+		match get(recovered.0, i):
+			Some(v):
+				if abs(v - 1.0) > max_err:
+					max_err = abs(v - 1.0)
+			None: void
+	max_err < 0.0001
+
+
+-- ============================================================================
+-- FFT known-value tests
+-- ============================================================================
+func test_fft_dc_signal() -> Bool:
+	-- FFT of [1,1,1,1] should have all energy at bin 0 (DC)
+	signal: Float[#4] = {1.0, 1.0, 1.0, 1.0}
+	im = vector(0.0, 4)
+	freq: (Float[#4], Float[#4]) = fft(signal, im)
+	-- Bin 0 (DC) should be 4.0 (sum of all samples)
+	match get(freq.0, 0):
+		Some(dc):
+			match get(freq.0, 1):
+				Some(b1):
+					match get(freq.0, 2):
+						Some(b2): approx_eq(dc, 4.0) and abs(b1) < 0.0001 and abs(b2) < 0.0001
+						None: False
+				None: False
+		None: False
+
+
+func test_fft_impulse() -> Bool:
+	-- FFT of [1,0,0,0] should be flat: all bins = 1.0
+	signal: Float[#4] = {1.0, 0.0, 0.0, 0.0}
+	im = vector(0.0, 4)
+	freq: (Float[#4], Float[#4]) = fft(signal, im)
+	mag: Float[#4] = fft_magnitude(freq.0, freq.1)
+	-- All magnitude bins should be 1.0
+	var ok: Bool = True
+	for i in 0..length(mag):
+		match get(mag, i):
+			Some(v):
+				if abs(v - 1.0) > 0.0001:
+					ok = False
+			None: ok = False
+	ok
+
+
+func test_fft_sine_peak() -> Bool:
+	-- A pure sine at bin frequency should show a peak at that bin
+	-- With N=256, bin k corresponds to freq = k * sr / N
+	-- bin 10 = 10 * 256 / 256 = 10.0 Hz (for sr = 256 Hz)
+	sr: Float = 256.0
+	target_bin: Int = 10
+	freq_hz: Float = 10.0
+	signal: Float[#256] = gen_sine(freq_hz, sr, 256)
+	im = vector(0.0, 256)
+	f: (Float[#256], Float[#256]) = fft(signal, im)
+	mag: Float[#256] = fft_magnitude(f.0, f.1)
+	-- Find the peak bin in the first half
+	var max_val: Float = 0.0
+	var max_bin: Int = 0
+	for i in 0..128:
+		match get(mag, i):
+			Some(v):
+				if v > max_val:
+					max_val = v
+					max_bin = i
+			None: void
+	max_bin == target_bin
+
+
+-- ============================================================================
+-- Parseval's theorem: energy in time == energy in frequency
+-- ============================================================================
+func test_parseval_theorem() -> Bool:
+	signal: Float[#128] = gen_sine(440.0, 44100.0, 128)
+	im = vector(0.0, 128)
+	-- Time-domain energy
+	var time_energy: Float = 0.0
+	for i in 0..length(signal):
+		match get(signal, i):
+			Some(v): time_energy += v * v
+			None: void
+	-- Frequency-domain energy (scaled by 1/N)
+	f: (Float[#128], Float[#128]) = fft(signal, im)
+	power: Float[#128] = fft_power(f.0, f.1)
+	var freq_energy: Float = 0.0
+	for i in 0..length(power):
+		match get(power, i):
+			Some(v): freq_energy += v
+			None: void
+	freq_energy /= 128.0
+	-- Should be approximately equal
+	abs(time_energy - freq_energy) < 0.01
+
+
+-- ============================================================================
+-- Spectral analysis tests
+-- ============================================================================
+func test_magnitude_dc() -> Bool:
+	-- DC signal: all magnitude at bin 0
+	f: (Float[#4], Float[#4]) = fft({1.0, 1.0, 1.0, 1.0}, vector(0.0, 4))
+	mag: Float[#4] = fft_magnitude(f.0, f.1)
+	match get(mag, 0):
+		Some(v): approx_eq(v, 4.0)
+		None: False
+
+
+func test_phase_real_signal() -> Bool:
+	-- DC signal phase at bin 0 should be 0
+	f: (Float[#4], Float[#4]) = fft({1.0, 1.0, 1.0, 1.0}, vector(0.0, 4))
+	phase: Float[#4] = fft_phase(f.0, f.1)
+	match get(phase, 0):
+		Some(v): abs(v) < 0.0001
+		None: False
+
+
+func test_spectral_centroid_dc() -> Bool:
+	-- Pure DC signal: centroid should be 0 Hz
+	f: (Float[#4], Float[#4]) = fft({1.0, 1.0, 1.0, 1.0}, vector(0.0, 4))
+	c: Float = spectral_centroid(f.0, f.1, 44100.0)
+	c < 1.0
+
+
+-- ============================================================================
+-- Test suite
+-- ============================================================================
+tests: TestSuite = {
+	description = "FFT",
+	tests = [
+		("bit_reverse identity", test_bit_reverse_identity),
+		("bit_reverse known values", test_bit_reverse_known_values),
+		("bit_reverse involution", test_bit_reverse_involution),
+		("FFT/IFFT roundtrip impulse", test_fft_ifft_roundtrip_impulse),
+		("FFT/IFFT roundtrip sine", test_fft_ifft_roundtrip_sine),
+		("FFT/IFFT roundtrip DC", test_fft_ifft_roundtrip_dc),
+		("FFT DC signal", test_fft_dc_signal),
+		("FFT impulse flat spectrum", test_fft_impulse),
+		("FFT sine peak at correct bin", test_fft_sine_peak),
+		("Parseval's theorem", test_parseval_theorem),
+		("magnitude DC", test_magnitude_dc),
+		("phase real signal", test_phase_real_signal),
+		("spectral centroid DC", test_spectral_centroid_dc),
+	],
+}
+-- Bit-reversal
+-- FFT/IFFT round-trip
+-- Known values
+-- Parseval
+-- Spectral analysis

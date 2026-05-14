@@ -1,0 +1,124 @@
+import:
+	float: sqrt
+	tensor: get, set_index
+	test: TestSuite
+	vector: map_indexed_parallel
+
+
+record TreeData {mx: Float[#500], my: Float[#500], mz: Float[#500], tm: Float[#500], nc: Int}
+
+
+pure func tget(v: Float[#Ds...], i: Int) -> Float:
+	match get(v, i):
+		Some(val): val
+		None: 0.0
+
+
+pure func compute_gravity(
+	tree: TreeData,
+	px: Float[#Ds...],
+	py: Float[#Ds...],
+	pz: Float[#Ds...],
+	idx: Int,
+) -> (Float, Float, Float):
+	ipx: Float = tget(px, idx)
+	ipy: Float = tget(py, idx)
+	ipz: Float = tget(pz, idx)
+	var gx: Float = 0.0
+	var gy: Float = 0.0
+	var gz: Float = 0.0
+	var j: Int = 0
+	while j < tree.nc:
+		tmj: Float = tget(tree.tm, j)
+		if tmj > 0.001:
+			dx: Float = tget(tree.mx, j) - ipx
+			dy: Float = tget(tree.my, j) - ipy
+			dz: Float = tget(tree.mz, j) - ipz
+			dist_sq: Float = dx * dx + dy * dy + dz * dz + 1.0
+			inv_dist: Float = 1.0 / sqrt(dist_sq)
+			force: Float = tmj / dist_sq
+			gx += dx * inv_dist * force
+			gy += dy * inv_dist * force
+			gz += dz * inv_dist * force
+		j += 1
+	(gx, gy, gz)
+
+
+-- Simulate 600 frames of parallel gravity computation (10 seconds at 60fps)
+func test_sustained_parallel() -> Bool:
+	var mx = vector(0.0, 500)
+	var my = vector(0.0, 500)
+	var mz = vector(0.0, 500)
+	var tm = vector(0.0, 500)
+	var px = vector(0.0, 500)
+	var py = vector(0.0, 500)
+	var pz = vector(0.0, 500)
+	var vx_v = vector(0.0, 500)
+	var vy_v = vector(0.0, 500)
+	var vz_v = vector(0.0, 500)
+	var alive = vector(0.0, 500)
+	for i in 0..500:
+		match mx.set_index(i, to_float(i) * 0.5):
+			Some(v): mx = v
+			None: void
+		match my.set_index(i, to_float(i) * 0.3):
+			Some(v): my = v
+			None: void
+		match mz.set_index(i, to_float(i) * 0.1):
+			Some(v): mz = v
+			None: void
+		match tm.set_index(i, 1.0):
+			Some(v): tm = v
+			None: void
+		match px.set_index(i, to_float(i) * 0.5):
+			Some(v): px = v
+			None: void
+		match py.set_index(i, to_float(i) * 0.3):
+			Some(v): py = v
+			None: void
+		match pz.set_index(i, to_float(i) * 0.1):
+			Some(v): pz = v
+			None: void
+		match alive.set_index(i, 1.0):
+			Some(v): alive = v
+			None: void
+	var frame: Int = 0
+	while frame < 600:
+		tree: TreeData = {mx = mx, my = my, mz = mz, tm = tm, nc = 10}
+		snap_px: Float[#500] = px
+		snap_py: Float[#500] = py
+		snap_pz: Float[#500] = pz
+		compute: pure (Int, Float) -> (Float, Float, Float) = pure func(i: Int, a_val: Float):
+			if a_val > 0.5:
+				compute_gravity(tree, snap_px, snap_py, snap_pz, i)
+			else:
+				(0.0, 0.0, 0.0)
+		grav_acc = map_indexed_parallel(alive, compute)
+		for i in 0..500:
+			match get(grav_acc, i):
+				Some(g):
+					match vx_v.set_index(i, tget(vx_v, i) + g.0 * 0.016):
+						Some(v): vx_v = v
+						None: void
+					match vy_v.set_index(i, tget(vy_v, i) + g.1 * 0.016):
+						Some(v): vy_v = v
+						None: void
+					match vz_v.set_index(i, tget(vz_v, i) + g.2 * 0.016):
+						Some(v): vz_v = v
+						None: void
+				None: void
+		px += vx_v * 0.016
+		py += vy_v * 0.016
+		pz += vz_v * 0.016
+		frame += 1
+	-- After 600 frames of gravity simulation, positions must have changed
+	-- from their initial values and remain finite
+	p0: Float = tget(px, 0)
+	p1: Float = tget(py, 1)
+	p0 != 0.0 and p1 != 0.0 and p0 == p0 and p1 == p1
+
+
+tests: TestSuite = {
+	description = "Sustained parallel map (600 frames)",
+	tests = [("sustained parallel 600 frames", test_sustained_parallel)],
+}

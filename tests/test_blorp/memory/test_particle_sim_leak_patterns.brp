@@ -1,0 +1,367 @@
+import:
+	dict as D
+	float: floor
+	list as L
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	option: Option(Some)
+	tensor: get_or, indices, set_index
+	test: TestSuite
+	vector: map_indexed_parallel
+
+
+struct ProbeNode {
+	bx: Float,
+	by: Float,
+	bz: Float,
+	hw: Float,
+	mx: Float,
+	my: Float,
+	mz: Float,
+	mass: Float,
+	pid: Int,
+	children: Int,
+}
+
+
+struct ProbeDrawItem {idx: Int, depth: Float}
+
+
+struct ProbeAccel {x: Float, y: Float, z: Float}
+
+
+EMPTY_PROBE_NODE: ProbeNode = {
+	bx = 0.0,
+	by = 0.0,
+	bz = 0.0,
+	hw = 0.0,
+	mx = 0.0,
+	my = 0.0,
+	mz = 0.0,
+	mass = 0.0,
+	pid = 0,
+	children = 0,
+}
+
+
+pure func probe_collision_cell_size(max_radius: Float) -> Float:
+	scaled: Float = max_radius * 1.25
+	base: Float = if scaled < 2.0:
+		2.0
+	else:
+		scaled
+	base + 0.1
+
+
+pure func probe_collision_search_span(radius: Float, max_radius: Float, inv_cell: Float) -> Int:
+	raw_span: Int = to_int(floor((radius + max_radius) * inv_cell)) + 1
+	if raw_span < 1:
+		1
+	else:
+		raw_span
+
+
+pure func probe_spheres_aabb_overlap(dx: Float, dy: Float, dz: Float, radius_sum: Float) -> Bool:
+	dx < radius_sum and dx > 0.0 - radius_sum and dy < radius_sum and dy > 0.0 - radius_sum and dz < radius_sum and dz > 0.0 - radius_sum
+
+
+pure func probe_tree_get(tree: ProbeNode[#512], idx: Int) -> ProbeNode:
+	get_or(tree, idx % 512, EMPTY_PROBE_NODE)
+
+
+pure func probe_gravity_callback(
+	tree: ProbeNode[#512],
+	particle_idx: Int,
+	alive_value: Float,
+) -> (Float, Float, Float):
+	if alive_value > 0.5:
+		var stack = vector(0, 64)
+		stack[0] = 0
+		var sp: Int = 1
+		var steps: Int = 0
+		var total: Float = 0.0
+		while sp > 0 and steps < 8:
+			sp -= 1
+			node_idx: Int = get_or(stack, sp, 0)
+			node: ProbeNode = probe_tree_get(tree, node_idx + particle_idx)
+			total += node.mass
+			if sp < 8 and steps < 7:
+				match set_index(stack, sp, node_idx + 1):
+					Some(next_stack): stack = next_stack
+					None: void
+				sp += 1
+			steps += 1
+		(total, total + 1.0, total + 2.0)
+	else:
+		(0.0, 0.0, 0.0)
+
+
+func build_probe_tree(seed: Int) -> (ProbeNode[#512], Int):
+	var tree: ProbeNode[#512] = vector(EMPTY_PROBE_NODE, 512)
+	var i: Int = 0
+	while i < 512:
+		child_start: Int = if i < 64:
+			i + 1
+		else:
+			0
+		node: ProbeNode = { EMPTY_PROBE_NODE | bx = to_float(i),
+		by = to_float(seed),
+		bz = to_float(i + seed),
+		hw = 1.0,
+		mx = to_float(i % 17),
+		my = to_float(i % 31),
+		mz = to_float(i % 43),
+		mass = to_float(i % 5 + 1),
+		pid = i + 1,
+		children = child_start, }
+		match set_index(tree, i, node):
+			Some(next): tree = next
+			None: void
+		i += 1
+	(tree, 512)
+
+
+func build_large_collision_grid(n: #N, buckets: Int) -> (Dict[Int, Int], Int[#N]):
+	var grid: Dict[Int, Int] = D.with_capacity(n)
+	var next: Int[#N] = vector(-1, n)
+	for i in indices(next):
+		key: Int = i % buckets
+		prev_head: Int = D.get_or(grid, key, -1)
+		next[i] = prev_head
+		grid = D.set(grid, key, i)
+	(grid, next)
+
+
+func build_names(n: Int) -> Dict[Int, String]:
+	var names: Dict[Int, String] = D.dict()
+	var i: Int = 0
+	while i < n:
+		names = D.set(names, i, "Body-${to_string(i)}")
+		i += 1
+	names
+
+
+func render_hud_line(names: Dict[Int, String], id: Int, mass: Float) -> String:
+	name: String = D.get_or(names, id, "?")
+	"  ${name}  m:${to_string(to_int(mass))}"
+
+
+func test_parallel_callback_local_stack_vector_stays_bounded() -> Bool:
+	reset_mem_stats()
+	tree_result: (ProbeNode[#512], Int) = build_probe_tree(0)
+	tree: ProbeNode[#512] = tree_result.0
+	alive: Float[#256] = vector(1.0, 256)
+	var acc: (Float, Float, Float)[#256] = vector((0.0, 0.0, 0.0), 256)
+	var frame: Int = 0
+	var total: Float = 0.0
+	while frame < 40:
+		compute: pure (Int, Float) -> (Float, Float, Float) = pure func(i: Int, value: Float):
+			probe_gravity_callback(tree, i, value)
+		acc = map_indexed_parallel(alive, compute)
+		sample: (Float, Float, Float) = get_or(acc, frame % 256, (0.0, 0.0, 0.0))
+		total += sample.0
+		frame += 1
+	stats: MemStats = get_mem_stats()
+	total > 0.0 and stats.current_objects < 1200 and stats.bytes_allocated < 1500000
+
+
+func test_parallel_value_struct_result_vector_stays_bounded() -> Bool:
+	reset_mem_stats()
+	alive: Float[#256] = vector(1.0, 256)
+	zero: ProbeAccel = {x = 0.0, y = 0.0, z = 0.0}
+	var acc: ProbeAccel[#256] = vector(zero, 256)
+	var frame: Int = 0
+	var total: Float = 0.0
+	while frame < 100:
+		compute: pure (Int, Float) -> ProbeAccel = pure func(i: Int, value: Float):
+			{x = value + to_float(i), y = value * 2.0, z = value * 3.0}
+		acc = map_indexed_parallel(alive, compute)
+		sample: ProbeAccel = get_or(acc, frame % 256, zero)
+		total += sample.x
+		frame += 1
+	stats: MemStats = get_mem_stats()
+	total > 0.0 and stats.current_objects < 900 and stats.bytes_allocated < 1800000
+
+
+func test_octree_like_value_struct_vector_return_stays_bounded() -> Bool:
+	reset_mem_stats()
+	var tree: ProbeNode[#512] = vector(EMPTY_PROBE_NODE, 512)
+	var total: Int = 0
+	var frame: Int = 0
+	while frame < 80:
+		result: (ProbeNode[#512], Int) = build_probe_tree(frame)
+		tree = result.0
+		total += result.1
+		frame += 1
+	stats: MemStats = get_mem_stats()
+	total == 40960 and get_or(
+		tree,
+		17,
+		EMPTY_PROBE_NODE,
+	).pid == 18 and stats.current_objects < 700 and stats.bytes_allocated < 500000
+
+
+func test_large_collision_grid_churn_stays_bounded() -> Bool:
+	reset_mem_stats()
+	var grid: Dict[Int, Int] = D.dict()
+	var next: Int[#2048] = vector(-1, 2048)
+	var frame: Int = 0
+	while frame < 60:
+		result: (Dict[Int, Int], Int[#2048]) = build_large_collision_grid(2048, 128)
+		grid = result.0
+		next = result.1
+		frame += 1
+	var di: Int = D.get_or(grid, 0, -1)
+	var bucket_len: Int = 0
+	while di >= 0:
+		bucket_len += 1
+		di = get_or(next, di, -1)
+	stats: MemStats = get_mem_stats()
+	bucket_len == 16 and stats.current_objects < 1000 and stats.bytes_allocated < 1500000
+
+
+func test_adaptive_collision_cell_span_covers_large_candidates() -> Bool:
+	max_r: Float = 10.0
+	cell_size: Float = probe_collision_cell_size(max_r)
+	inv_cell: Float = 1.0 / cell_size
+	small_span: Int = probe_collision_search_span(1.0, max_r, inv_cell)
+	large_span: Int = probe_collision_search_span(max_r, max_r, inv_cell)
+	cell_size < 20.1 and small_span >= 1 and large_span >= 2
+
+
+func test_adaptive_collision_cell_size_avoids_tiny_buckets() -> Bool:
+	cell_size: Float = probe_collision_cell_size(1.0)
+	inv_cell: Float = 1.0 / cell_size
+	span: Int = probe_collision_search_span(1.0, 1.0, inv_cell)
+	cell_size > 2.09 and cell_size < 2.11 and span == 1
+
+
+func test_collision_aabb_prefilter_rejects_axis_separated_pair() -> Bool:
+	probe_spheres_aabb_overlap(
+		4.0,
+		0.0,
+		0.0,
+		5.0,
+	) and not probe_spheres_aabb_overlap(
+		6.0,
+		0.0,
+		0.0,
+		5.0,
+	) and not probe_spheres_aabb_overlap(0.0, -6.0, 0.0, 5.0)
+
+
+func test_persistent_dict_cow_assignment_stays_bounded() -> Bool:
+	reset_mem_stats()
+	var stability: Dict[Int, Int] = D.dict()
+	var frame: Int = 0
+	while frame < 200:
+		var next_stability: Dict[Int, Int] = stability
+		var i: Int = 0
+		while i < 64:
+			prev: Int = D.get_or(stability, i, 0)
+			next_stability = D.set(next_stability, i, prev + 1)
+			i += 1
+		stability = next_stability
+		frame += 1
+	stats: MemStats = get_mem_stats()
+	D.get_or(
+		stability,
+		0,
+		0,
+	) == 200 and stats.current_objects < 120 and stats.bytes_allocated < 300000
+
+
+func test_hud_list_string_churn_stays_bounded() -> Bool:
+	reset_mem_stats()
+	names: Dict[Int, String] = build_names(64)
+	var hud_body_ids: List[Int] = []
+	var hud_group_ids: List[Int] = []
+	var frame: Int = 0
+	var total: Int = 0
+	while frame < 100:
+		var draw_list: List[(Int, Float)] = []
+		var top_bodies: List[(Int, Float)] = []
+		var i: Int = 0
+		while i < 256:
+			depth: Float = to_float(256 - i)
+			draw_list = L.append(draw_list, (i, depth))
+			top_bodies = L.append(top_bodies, (i, to_float(i % 97)))
+			i += 1
+		draw_list = L.sort_by(draw_list, func(item: (Int, Float)): -item.1)
+		top_bodies = L.sort_by(top_bodies, func(item: (Int, Float)): 0.0 - item.1)
+		hud_body_ids = []
+		var count: Int = 0
+		for body in top_bodies:
+			if count < 5:
+				hud_body_ids = L.append(hud_body_ids, body.0)
+				line: String = render_hud_line(names, body.0 % 64, body.1)
+				total += line.length()
+				count += 1
+		hud_group_ids = []
+		var group_count: Int = 0
+		for body_id in hud_body_ids:
+			if group_count < 5:
+				hud_group_ids = L.append(hud_group_ids, body_id)
+				total += render_hud_line(names, body_id % 64, to_float(group_count)).length()
+				group_count += 1
+		total += draw_list.length()
+		frame += 1
+	stats: MemStats = get_mem_stats()
+	total > 0 and hud_group_ids.length() == 5 and stats.current_objects < 800 and stats.bytes_allocated < 1200000
+
+
+func test_value_struct_list_append_sort_stays_bounded() -> Bool:
+	reset_mem_stats()
+	var frame: Int = 0
+	var total: Int = 0
+	while frame < 100:
+		var draw_list: List[ProbeDrawItem] = L.list(256)
+		var i: Int = 0
+		while i < 256:
+			draw_list = L.append(draw_list, {idx = i, depth = to_float(256 - i)})
+			i += 1
+		draw_list = L.sort_by(draw_list, func(item: ProbeDrawItem): 0.0 - item.depth)
+		total += draw_list.length()
+		frame += 1
+	stats: MemStats = get_mem_stats()
+	total == 25600 and stats.current_objects < 1200 and stats.bytes_allocated < 2000000
+
+
+tests: TestSuite = {
+	description = "Particle Sim Leak Patterns",
+	tests = [
+		(
+			"parallel callback local stack vector stays bounded",
+			test_parallel_callback_local_stack_vector_stays_bounded,
+		),
+		(
+			"parallel value struct result vector stays bounded",
+			test_parallel_value_struct_result_vector_stays_bounded,
+		),
+		(
+			"octree-like value struct vector return stays bounded",
+			test_octree_like_value_struct_vector_return_stays_bounded,
+		),
+		("large collision grid churn stays bounded", test_large_collision_grid_churn_stays_bounded),
+		(
+			"adaptive collision cell span covers large candidates",
+			test_adaptive_collision_cell_span_covers_large_candidates,
+		),
+		(
+			"adaptive collision cell size avoids tiny buckets",
+			test_adaptive_collision_cell_size_avoids_tiny_buckets,
+		),
+		(
+			"collision AABB prefilter rejects axis separated pair",
+			test_collision_aabb_prefilter_rejects_axis_separated_pair,
+		),
+		(
+			"persistent dict COW assignment stays bounded",
+			test_persistent_dict_cow_assignment_stays_bounded,
+		),
+		("HUD list/string churn stays bounded", test_hud_list_string_churn_stays_bounded),
+		(
+			"value struct list append/sort stays bounded",
+			test_value_struct_list_append_sort_stays_bounded,
+		),
+	],
+}

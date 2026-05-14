@@ -1,0 +1,560 @@
+import:
+	list: join
+	traits: one, zero
+
+
+-- Dict - Ordered dictionary with COW optimization
+--
+-- Dict[K, V] is an insertion-ordered key-value mapping with O(1) average
+type Dict[K, V] = builtin
+
+
+-- lookup, insert, and remove. Uses open addressing with h2 fingerprints,
+-- ARC (Automatic Reference Counting), and COW (Copy-on-Write) optimization.
+-- All operations are semantically immutable — mutations return new dicts.
+--
+-- Iteration order is insertion order. Removing a key preserves the relative
+-- order of remaining keys. New keys are appended at the end.
+--
+-- Supports direct iteration:
+-- for k in dict:           -- iterate keys (zero allocation)
+-- for (k, v) in dict:     -- iterate key-value pairs (zero allocation)
+-- dict.keys()              -- List[K] in insertion order
+-- dict.values()            -- List[V] in insertion order
+-- dict.entries()           -- List[(K, V)] in insertion order
+--
+-- Supported key types: Int, String, Bool, Char, Float (hash/equality provided by runtime)
+-- ============================================================================
+-- Core Builtins
+-- ============================================================================
+---
+Create an empty Dict.
+
+doctests:
+    :: Empty dict is empty
+    d: Dict[String, Int] = dict()
+    d.is_empty() == True
+---
+pure func dict[K, V]() -> Dict[K, V]:
+	builtin
+
+
+---
+Create an empty Dict with capacity reserved for approximately `capacity` entries.
+
+The dict starts with length 0; `capacity` is a hint to avoid rehashing when
+the expected number of inserted entries is known in advance.
+
+doctests:
+    :: Empty dict with capacity is empty
+    d: Dict[String, Int] = with_capacity(100)
+    d.is_empty() == True
+
+    :: Inserting into dict with capacity
+    d: Dict[String, Int] = with_capacity(8).set("x", 10)
+    d.get_or("x", 0) == 10
+---
+pure func with_capacity[K, V](capacity: Int) -> Dict[K, V]:
+	builtin
+
+
+---
+Look up a value by key.
+
+doctests:
+    :: Get existing key
+    d: Dict[String, Int] = dict().set("a", 42)
+    match d.get("a"):
+        Some(v): v == 42
+        None: False
+---
+pure func get[K, V](self: Dict[K, V], key: K) -> Option[V]:
+	builtin
+
+
+---
+Insert or update a key-value pair, returns new dict.
+
+doctests:
+    :: Set and check key
+    d: Dict[String, Int] = dict().set("x", 10)
+    d.contains("x") == True
+---
+pure func set[K, V](self: Dict[K, V], key: K, value: V) -> Dict[K, V]:
+	builtin
+
+
+---
+Remove a key from the dict, returns new dict.
+No-op if key not present.
+
+doctests:
+    :: Remove existing key
+    d: Dict[String, Int] = dict().set("a", 1)
+    d2: Dict[String, Int] = d.remove("a")
+    d2.contains("a") == False
+---
+pure func remove[K, V](self: Dict[K, V], key: K) -> Dict[K, V]:
+	builtin
+
+
+---
+Check if a key exists in the dict.
+
+doctests:
+    :: Contains existing key
+    d: Dict[String, Int] = dict().set("a", 1)
+    d.contains("a") == True
+
+    :: Does not contain missing key
+    d: Dict[String, Int] = dict()
+    d.contains("x") == False
+---
+pure func contains[K, V](self: Dict[K, V], key: K) -> Bool:
+	builtin
+
+
+-- Internal length for trait implementation.
+private pure func length[K, V](self: Dict[K, V]) -> Int:
+	builtin
+
+
+---
+Get all keys as a list.
+
+doctests:
+    :: Get keys
+    d: Dict[String, Int] = dict().set("a", 1)
+    d.keys().length() == 1
+---
+pure func keys[K, V](self: Dict[K, V]) -> List[K]:
+	builtin
+
+
+---
+Get all values as a list.
+
+doctests:
+    :: Get values
+    d: Dict[String, Int] = dict().set("a", 42)
+    d.values().length() == 1
+---
+pure func values[K, V](self: Dict[K, V]) -> List[V]:
+	builtin
+
+
+---
+Get all entries as list of (key, value) tuples.
+
+doctests:
+    :: Get entries
+    d: Dict[String, Int] = dict().set("a", 1)
+    d.entries().length() == 1
+---
+pure func entries[K, V](self: Dict[K, V]) -> List[(K, V)]:
+	builtin
+
+
+-- ============================================================================
+-- Construction
+-- ============================================================================
+---
+Create a Dict from a list of key-value pairs.
+Later pairs overwrite earlier ones for duplicate keys.
+
+doctests:
+    :: Create from list of pairs
+    d: Dict[Int, String] = from_list([(1, "a"), (2, "b")])
+    d.contains(1) == True
+---
+pure func from_list[K, V](pairs: List[(K, V)]) -> Dict[K, V]:
+	var result: Dict[K, V] = dict()
+	for pair in pairs:
+		result = result.set(pair.0, pair.1)
+	result
+
+
+-- ============================================================================
+-- Extended Operations
+-- ============================================================================
+---
+Look up a value, returning default if not found.
+
+doctests:
+    :: Get existing returns value
+    d: Dict[String, Int] = dict().set("a", 42)
+    d.get_or("a", 0) == 42
+
+    :: Get missing returns default
+    d: Dict[String, Int] = dict()
+    d.get_or("missing", 0) == 0
+---
+pure func get_or[K, V](self: Dict[K, V], key: K, default: V) -> V:
+	builtin
+
+
+-- Look up a value, computing default lazily if not found
+func get_or_else[K, V](self: Dict[K, V], key: K, default_fn: () -> V) -> V:
+	match self.get(key):
+		Some(v): v
+		None: default_fn()
+
+
+---
+Check if the dict is empty.
+
+doctests:
+    :: Empty dict is empty
+    d: Dict[String, Int] = dict()
+    d.is_empty() == True
+
+    :: Non-empty dict is not empty
+    d: Dict[String, Int] = dict().set("a", 1)
+    d.is_empty() == False
+---
+pure func is_empty[K, V](self: Dict[K, V]) -> Bool:
+	self.length() == 0
+
+
+-- ============================================================================
+-- Update Operations
+-- ============================================================================
+---
+Update a value at a key, inserting default if key doesn't exist.
+---
+func update[K, V](
+	self: Dict[K, V],
+	key: K,
+	default: V,
+	f: (V) -> V,
+) -> Dict[K, V]:
+	match self.get(key):
+		Some(v): self.set(key, f(v))
+		None: self.set(key, f(default))
+
+
+---
+Update with explicit handling of present/absent cases.
+---
+func update_with[K, V](self: Dict[K, V], key: K, f: (Option[V]) -> V) -> Dict[K, V]:
+	val: V = f(self.get(key))
+	self.set(key, val)
+
+
+---
+Increment an addable value by its `one()` element.
+
+doctests:
+    :: Increment missing key starts at 1
+    d: Dict[String, Int] = dict()
+    d2: Dict[String, Int] = d.increment("count")
+    d2.get_or("count", 0) == 1
+---
+pure func increment[K, V:Addable+HasOne+HasZero](self: Dict[K, V], key: K) -> Dict[K, V]:
+	step: V = one()
+	current: V = self.get_or(key, zero())
+	next: V = current + step
+	self.set(key, next)
+
+
+-- ============================================================================
+-- Bulk Operations
+-- ============================================================================
+---
+Merge two dicts, later dict's values overwrite on conflict.
+
+doctests:
+    :: Merge two dicts
+    a: Dict[String, Int] = dict().set("x", 1)
+    b: Dict[String, Int] = dict().set("y", 2)
+    merged: Dict[String, Int] = a.merge(b)
+    merged.contains("x") == True
+---
+pure func merge[K, V](a: Dict[K, V], b: Dict[K, V]) -> Dict[K, V]:
+	var result: Dict[K, V] = a
+	entries_b: List[(K, V)] = b.entries()
+	for pair in entries_b:
+		result = result.set(pair.0, pair.1)
+	result
+
+
+---
+Merge with custom conflict resolution.
+---
+func merge_with[K, V](a: Dict[K, V], b: Dict[K, V], combine: (V, V) -> V) -> Dict[K, V]:
+	var result: Dict[K, V] = a
+	entries_b: List[(K, V)] = b.entries()
+	for pair in entries_b:
+		result = match result.get(pair.0):
+			Some(existing): result.set(pair.0, combine(existing, pair.1))
+			None: result.set(pair.0, pair.1)
+	result
+
+
+-- ============================================================================
+-- Sorting (returns new dict with reordered entries)
+-- ============================================================================
+---
+Sort dict entries by key in ascending order. Returns a new dict
+whose iteration order follows the sorted key order.
+
+doctests:
+    :: Sort by key
+    d: Dict[String, Int] = dict().set("c", 3).set("a", 1).set("b", 2)
+    sd: Dict[String, Int] = d.sort_by_key()
+    ks: List[String] = sd.keys()
+    match ks.get(0):
+        Some(k): k == "a"
+        None: False
+---
+func sort_by_key[K:Orderable, V](self: Dict[K, V]) -> Dict[K, V]:
+	sorted_entries: List[(K, V)] = self
+		.entries()
+		.sort_by(func(pair: (K, V)): pair.0)
+	sorted_entries.from_list()
+
+
+---
+Sort dict entries by value in ascending order. Returns a new dict
+whose iteration order follows the sorted value order.
+
+doctests:
+    :: Sort by value
+    d: Dict[String, Int] = dict().set("c", 1).set("a", 3).set("b", 2)
+    sd: Dict[String, Int] = d.sort_by_value()
+    ks: List[String] = sd.keys()
+    match ks.get(0):
+        Some(k): k == "c"
+        None: False
+---
+func sort_by_value[K, V:Orderable](self: Dict[K, V]) -> Dict[K, V]:
+	sorted_entries: List[(K, V)] = self
+		.entries()
+		.sort_by(func(pair: (K, V)): pair.1)
+	sorted_entries.from_list()
+
+
+---
+Sort dict entries by a custom key function. Returns a new dict
+whose iteration order follows the sorted order.
+---
+func sort_entries_by[K, V, S:Orderable](self: Dict[K, V], key_fn: (K, V) -> S) -> Dict[K, V]:
+	sorted_entries: List[(K, V)] = self
+		.entries()
+		.sort_by(func(pair: (K, V)): key_fn(pair.0, pair.1))
+	sorted_entries.from_list()
+
+
+---
+Reverse the iteration order of a dict.
+
+doctests:
+    :: Reverse order
+    d: Dict[String, Int] = from_list([
+       ("a", 1),
+       ("b", 2),
+       ("c", 3)
+    ])
+    rd: Dict[String, Int] = d.reverse()
+    ks: List[String] = rd.keys()
+    match ks.get(0):
+        Some(k): k == "c"
+        None: False
+---
+pure func reverse[K, V](self: Dict[K, V]) -> Dict[K, V]:
+	all_entries: List[(K, V)] = self.entries()
+	reversed: List[(K, V)] = all_entries.reverse()
+	var result: Dict[K, V] = dict()
+	for pair in reversed:
+		result = result.set(pair.0, pair.1)
+	result
+
+
+---
+Filter entries by predicate.
+---
+pure func filter[K, V](self: Dict[K, V], pred: pure (K, V) -> Bool) -> Dict[K, V]:
+	var result: Dict[K, V] = dict()
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		if pred(pair.0, pair.1):
+			result = result.set(pair.0, pair.1)
+	result
+---
+Filter entries by predicate (impure version).
+---
+func filter[K, V](self: Dict[K, V], pred: (K, V) -> Bool) -> Dict[K, V]:
+	var result: Dict[K, V] = dict()
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		if pred(pair.0, pair.1):
+			result = result.set(pair.0, pair.1)
+	result
+
+
+---
+Transform all values.
+---
+pure func map_values[K, V, W](self: Dict[K, V], f: pure (V) -> W) -> Dict[K, W]:
+	var result: Dict[K, W] = dict()
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		result = result.set(pair.0, f(pair.1))
+	result
+---
+Transform all values (impure version).
+---
+func map_values[K, V, W](self: Dict[K, V], f: (V) -> W) -> Dict[K, W]:
+	var result: Dict[K, W] = dict()
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		result = result.set(pair.0, f(pair.1))
+	result
+
+
+---
+Transform all keys (may cause collisions - last wins).
+---
+pure func map_keys[K, J, V](self: Dict[K, V], f: pure (K) -> J) -> Dict[J, V]:
+	var result: Dict[J, V] = dict()
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		result = result.set(f(pair.0), pair.1)
+	result
+---
+Transform all keys (impure version).
+---
+func map_keys[K, J, V](self: Dict[K, V], f: (K) -> J) -> Dict[J, V]:
+	var result: Dict[J, V] = dict()
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		result = result.set(f(pair.0), pair.1)
+	result
+
+
+-- ============================================================================
+-- Aggregation
+-- ============================================================================
+---
+Fold over all entries.
+---
+pure func fold[K, V, Acc](self: Dict[K, V], init: Acc, f: pure (Acc, K, V) -> Acc) -> Acc:
+	var acc: Acc = init
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		acc = f(acc, pair.0, pair.1)
+	acc
+---
+Fold over all entries (impure version).
+---
+func fold[K, V, Acc](self: Dict[K, V], init: Acc, f: (Acc, K, V) -> Acc) -> Acc:
+	var acc: Acc = init
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		acc = f(acc, pair.0, pair.1)
+	acc
+
+
+-- ============================================================================
+-- Data Engineering Essentials
+-- ============================================================================
+---
+Group items by a key function.
+Returns a dict from keys to lists of items with that key.
+---
+func group_by[T, K](items: List[T], key_fn: (T) -> K) -> Dict[K, List[T]]:
+	var result: Dict[K, List[T]] = dict()
+	for item in items:
+		k: K = key_fn(item)
+		result = match result.get(k):
+			Some(existing): result.set(k, existing.append(item))
+			None: result.set(k, [item])
+	result
+
+
+---
+Count occurrences by a key function.
+Like Python's collections.Counter.
+---
+func count_by[T, K](items: List[T], key_fn: (T) -> K) -> Dict[K, Int]:
+	var result: Dict[K, Int] = dict()
+	for item in items:
+		k: K = key_fn(item)
+		current: Int = result.get_or(k, 0)
+		result = result.set(k, current + 1)
+	result
+
+
+---
+General aggregation by key.
+Combines grouping and reducing in one pass.
+---
+func aggregate_by[T, K, V](
+	items: List[T],
+	key_fn: (T) -> K,
+	init: V,
+	combine: (V, T) -> V,
+) -> Dict[K, V]:
+	var result: Dict[K, V] = dict()
+	for item in items:
+		k: K = key_fn(item)
+		result = match result.get(k):
+			Some(existing): result.set(k, combine(existing, item))
+			None: result.set(k, combine(init, item))
+	result
+
+
+---
+Check if a dict contains a given value.
+Iterates all values; O(n) time.
+
+doctests:
+    :: Value exists
+    d: Dict[String, Int] = dict().set("a", 42)
+    d.contains_value(42) == True
+
+    :: Value does not exist
+    d: Dict[String, Int] = dict().set("a", 42)
+    d.contains_value(99) == False
+
+    :: Empty dict
+    d: Dict[String, Int] = dict()
+    d.contains_value(1) == False
+---
+pure func contains_value[K, V:Equatable](self: Dict[K, V], val: V) -> Bool:
+	all_values: List[V] = self.values()
+	var found: Bool = False
+	for v in all_values:
+		if v == val:
+			found = True
+			break
+	found
+
+
+-- ============================================================================
+-- Trait Implementations
+-- ============================================================================
+-- Implement HasLength trait for Dict
+implements HasLength for Dict[K, V]:
+	pure func length[K, V](self: Dict[K, V]) -> Int:
+		builtin
+
+
+-- String conversion
+implements Stringable for Dict[K:Stringable, V:Stringable]:
+	pure func to_string[K:Stringable, V:Stringable](self: Dict[K, V]) -> String:
+		-- Build a readable representation using while loop
+		if self.is_empty():
+			"{}"
+		else:
+			to_string_impl(self)
+
+
+-- Helper for to_string (avoids multi-statement match arm)
+private pure func to_string_impl[K:Stringable, V:Stringable](self: Dict[K, V]) -> String:
+	var parts: List[String] = []
+	all_entries: List[(K, V)] = self.entries()
+	for pair in all_entries:
+		part: String = pair.0.to_string() + ": " + pair.1.to_string()
+		parts = parts.append(part)
+	"{" + parts.join(", ") + "}"

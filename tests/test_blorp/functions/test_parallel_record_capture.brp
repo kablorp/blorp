@@ -1,0 +1,116 @@
+import:
+	float: sqrt
+	tensor: get, set_index
+	test: TestSuite
+	vector: map_indexed_parallel
+
+
+record SimData {ax: Float[#1000], ay: Float[#1000], az: Float[#1000], bx: Float[#1000], count: Int}
+
+
+pure func sget(v: Float[#1000], i: Int) -> Float:
+	match get(v, i):
+		Some(val): val
+		None: 0.0
+
+
+-- Simulates the octree_gravity pattern: captures a record, does math with local mutation
+pure func compute_force(data: SimData, idx: Int) -> (Float, Float, Float):
+	var fx: Float = 0.0
+	var fy: Float = 0.0
+	var fz: Float = 0.0
+	var j: Int = 0
+	while j < 10:
+		dx: Float = sget(data.ax, idx) - to_float(j)
+		dy: Float = sget(data.ay, idx) - to_float(j) * 0.5
+		dz: Float = sget(data.az, idx) + to_float(j) * 0.3
+		dist: Float = sqrt(dx * dx + dy * dy + dz * dz) + 0.001
+		fx += dx / dist
+		fy += dy / dist
+		fz += dz / dist
+		j += 1
+	(fx, fy, fz)
+
+
+-- Test: parallel map with record capture, enough elements for multi-threaded dispatch
+func test_parallel_record_large() -> Bool:
+	var ax = vector(0.0, 1000)
+	var ay = vector(0.0, 1000)
+	var az = vector(0.0, 1000)
+	var bx = vector(0.0, 1000)
+	for i in 0..1000:
+		match ax.set_index(i, to_float(i) * 0.1):
+			Some(v): ax = v
+			None: void
+		match ay.set_index(i, to_float(i) * 0.2):
+			Some(v): ay = v
+			None: void
+		match az.set_index(i, to_float(i) * 0.3):
+			Some(v): az = v
+			None: void
+		match bx.set_index(i, to_float(i)):
+			Some(v): bx = v
+			None: void
+	data: SimData = {ax = ax, ay = ay, az = az, bx = bx, count = 1000}
+	var alive = vector(0.0, 1000)
+	for i in 0..1000:
+		match alive.set_index(i, 1.0):
+			Some(v): alive = v
+			None: void
+	result: (Float, Float, Float)[#1000] = map_indexed_parallel(alive, pure func(
+		i: Int,
+		a_val: Float,
+	):
+		if a_val > 0.5:
+			compute_force(data, i)
+		else:
+			(0.0, 0.0, 0.0)
+	)
+	-- Verify a few results
+	match get(result, 500):
+		Some(g):
+			g.0 != 0.0
+		None: False
+
+
+-- Stress test: run it multiple times
+func test_parallel_record_stress() -> Bool:
+	var ax = vector(0.0, 1000)
+	for i in 0..1000:
+		match ax.set_index(i, to_float(i)):
+			Some(v): ax = v
+			None: void
+	data: SimData = {ax = ax, ay = ax, az = ax, bx = ax, count = 1000}
+	var alive = vector(0.0, 1000)
+	for i in 0..1000:
+		match alive.set_index(i, 1.0):
+			Some(v): alive = v
+			None: void
+	var ok: Bool = True
+	var iter: Int = 0
+	while iter < 20:
+		result: (Float, Float, Float)[#1000] = map_indexed_parallel(alive, pure func(
+			i: Int,
+			a_val: Float,
+		):
+			if a_val > 0.5:
+				compute_force(data, i)
+			else:
+				(0.0, 0.0, 0.0)
+		)
+		match get(result, 100):
+			Some(g):
+				if g.0 == 0.0:
+					ok = False
+			None: ok = False
+		iter += 1
+	ok
+
+
+tests: TestSuite = {
+	description = "Parallel map with record capture stress",
+	tests = [
+		("parallel record large", test_parallel_record_large),
+		("parallel record stress", test_parallel_record_stress),
+	],
+}

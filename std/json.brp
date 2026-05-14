@@ -1,0 +1,833 @@
+import:
+	float: is_finite
+	parser: ParseResult(Failure, Success)
+	set: set
+	string: from_char, is_digit, string as make_string
+
+
+-- JSON Parser
+-- Built around an indexed scanner. `parse` adapts the scanner to ParseResult
+-- for callers that need remaining-input behavior.
+-- JsonValue.to_string emits valid JSON for all JsonValue values. Since JSON
+-- has no NaN or infinity literals, non-finite JsonNumber values serialize as
+-- null.
+-- JSON Value type
+union JsonValue:
+	JsonNull
+	JsonBool(Bool)
+	JsonNumber(Float)
+	JsonString(String)
+	JsonVector(List[JsonValue])
+	JsonObject(List[(String, JsonValue)])
+
+
+record JsonError {line: Int, column: Int, message: String}
+
+
+pure func format_error(err: JsonError) -> String:
+	"line " + err.line.to_string() + ", column " + err.column.to_string() + ": " + err.message
+
+
+private pure func is_nonzero_digit(c: Char) -> Bool:
+	c >= '1' and c <= '9'
+
+
+private pure func is_exp_marker(c: Char) -> Bool:
+	c == 'e' or c == 'E'
+
+
+private pure func is_sign(c: Char) -> Bool:
+	c == '+' or c == '-'
+
+
+private pure func is_hex_digit(c: Char) -> Bool:
+	c >= '0' and c <= '9' or c >= 'a' and c <= 'f' or c >= 'A' and c <= 'F'
+
+
+private pure func hex_value(c: Char) -> Int:
+	if c >= '0' and c <= '9':
+		to_int(c) - to_int('0')
+	else if c >= 'a' and c <= 'f':
+		10 + to_int(c) - to_int('a')
+	else if c >= 'A' and c <= 'F':
+		10 + to_int(c) - to_int('A')
+	else:
+		0
+
+
+private pure func hex_digit_char(n: Int) -> Char:
+	if n < 10:
+		to_char(to_int('0') + n)
+	else:
+		to_char(to_int('A') + n - 10)
+
+
+private pure func parse_hex4_at(input: String, start: Int) -> Option[Int]:
+	if start + 4 > input.length():
+		None
+	else:
+		var value: Int = 0
+		var i: Int = 0
+		var ok: Bool = True
+		while i < 4 and ok:
+			match input.get(start + i):
+				Some(c):
+					if is_hex_digit(c):
+						value = value * 16 + hex_value(c)
+						i += 1
+					else:
+						ok = False
+				None:
+					ok = False
+		if ok:
+			Some(value)
+		else:
+			None
+
+
+private pure func is_high_surrogate(code: Int) -> Bool:
+	code >= 55296 and code <= 56319
+
+
+private pure func is_low_surrogate(code: Int) -> Bool:
+	code >= 56320 and code <= 57343
+
+
+private pure func has_unicode_escape_at(input: String, start: Int) -> Bool:
+	match input.get(start):
+		Some(bs):
+			match input.get(start + 1):
+				Some(u): bs == '\\' and u == 'u'
+				None: False
+		None: False
+
+
+private pure func append_unicode_escape(result: String, code: Int) -> String:
+	var out: String = result
+	out = out.append_char('\\')
+	out = out.append_char('u')
+	out = out.append_char(hex_digit_char(code / 4096 % 16))
+	out = out.append_char(hex_digit_char(code / 256 % 16))
+	out = out.append_char(hex_digit_char(code / 16 % 16))
+	out = out.append_char(hex_digit_char(code % 16))
+	out
+
+
+private pure func suffix_at(input: String, start: Int) -> String:
+	len: Int = input.length()
+	if start <= 0:
+		input
+	else if start >= len:
+		""
+	else:
+		input.substring(start, len - start)
+
+
+-- ============================================================================
+-- Indexed strict JSON parser
+-- ============================================================================
+private struct JsonScanner {pos: Int, line: Int, column: Int}
+
+
+private record JsonScanFailure {error: JsonError, pos: Int}
+
+
+private pure func json_scanner() -> JsonScanner:
+	{pos = 0, line = 1, column = 1}
+
+
+private pure func scanner_at_end(input: String, s: JsonScanner) -> Bool:
+	s.pos >= input.length()
+
+
+private pure func scanner_peek(input: String, s: JsonScanner) -> Option[Char]:
+	input.get(s.pos)
+
+
+private pure func scanner_advance(input: String, s: JsonScanner) -> JsonScanner:
+	match scanner_peek(input, s):
+		Some('\n'): {pos = s.pos + 1, line = s.line + 1, column = 1}
+		Some(_): {pos = s.pos + 1, line = s.line, column = s.column + 1}
+		None: s
+
+
+private pure func scanner_advance_same_line(s: JsonScanner, count: Int) -> JsonScanner:
+	if count <= 0:
+		s
+	else:
+		{pos = s.pos + count, line = s.line, column = s.column + count}
+
+
+private pure func scanner_advance_same_line_to(s: JsonScanner, target: Int) -> JsonScanner:
+	scanner_advance_same_line(s, target - s.pos)
+
+
+private pure func scanner_error(s: JsonScanner, message: String) -> JsonScanFailure:
+	{error = {line = s.line, column = s.column, message = message}, pos = s.pos}
+
+
+private pure func scanner_skip_whitespace(input: String, s: JsonScanner) -> JsonScanner:
+	var st: JsonScanner = s
+	var done: Bool = False
+	while not done:
+		match scanner_peek(input, st):
+			Some(c):
+				if c == ' ' or c == '\n' or c == '\r' or c == '\t':
+					st = scanner_advance(input, st)
+				else:
+					done = True
+			None:
+				done = True
+	st
+
+
+private pure func scanner_starts_at(input: String, s: JsonScanner, prefix: String) -> Bool:
+	plen: Int = prefix.length()
+	if s.pos + plen > input.length():
+		False
+	else:
+		var matches: Bool = True
+		var i: Int = 0
+		while i < plen and matches:
+			match input.get(s.pos + i):
+				Some(actual):
+					match prefix.get(i):
+						Some(expected):
+							if actual != expected:
+								matches = False
+						None:
+							matches = False
+				None:
+					matches = False
+			i += 1
+		matches
+
+
+private pure func scanner_literal(
+	input: String,
+	s: JsonScanner,
+	text: String,
+	value: JsonValue,
+) -> Result[(JsonValue, JsonScanner), JsonScanFailure]:
+	if scanner_starts_at(input, s, text):
+		Ok((value, scanner_advance_same_line(s, text.length())))
+	else:
+		Err(scanner_error(s, "expected JSON value"))
+
+
+private pure func scanner_parse_string(
+	input: String,
+	s: JsonScanner,
+) -> Result[(String, JsonScanner), JsonScanFailure]:
+	q: Char = '\"'
+	bs: Char = '\\'
+	match scanner_peek(input, s):
+		Some(c):
+			if c != q:
+				Err(scanner_error(s, "expected string"))
+			else:
+				var result: String = make_string(16)
+				var st: JsonScanner = scanner_advance(input, s)
+				var done: Bool = False
+				var has_error: Bool = False
+				var error: JsonScanFailure = scanner_error(s, "unterminated string")
+				while not done and not has_error:
+					match scanner_peek(input, st):
+						None:
+							has_error = True
+							error = scanner_error(st, "unterminated string")
+						Some(ch):
+							if ch == q:
+								done = True
+								st = scanner_advance(input, st)
+							else if ch == bs:
+								escape_start: JsonScanner = st
+								next_state: JsonScanner = scanner_advance(input, st)
+								match scanner_peek(input, next_state):
+									None:
+										has_error = True
+										error = scanner_error(
+											escape_start,
+											"unterminated escape sequence",
+										)
+									Some(next):
+										match next:
+											'\"':
+												result = result.append_char(q)
+												st = scanner_advance_same_line(st, 2)
+											'\\':
+												result = result.append_char(bs)
+												st = scanner_advance_same_line(st, 2)
+											'/':
+												result = result.append_char('/')
+												st = scanner_advance_same_line(st, 2)
+											'b':
+												result = result.append_char(to_char(8))
+												st = scanner_advance_same_line(st, 2)
+											'f':
+												result = result.append_char(to_char(12))
+												st = scanner_advance_same_line(st, 2)
+											'n':
+												result = result.append_char('\n')
+												st = scanner_advance_same_line(st, 2)
+											't':
+												result = result.append_char('\t')
+												st = scanner_advance_same_line(st, 2)
+											'r':
+												result = result.append_char('\r')
+												st = scanner_advance_same_line(st, 2)
+											'u':
+												match parse_hex4_at(input, st.pos + 2):
+													Some(code):
+														if is_high_surrogate(code):
+															if has_unicode_escape_at(
+																input,
+																st.pos + 6,
+															):
+																match parse_hex4_at(
+																	input,
+																	st.pos + 8,
+																):
+																	Some(low):
+																		if is_low_surrogate(low):
+																			full: Int = 65536 + (code - 55296) * 1024 + (low - 56320)
+																			result = result.append_char(
+																				to_char(full),
+																			)
+																			st = scanner_advance_same_line(
+																				st,
+																				12,
+																			)
+																		else:
+																			has_error = True
+																			error = scanner_error(
+																				escape_start,
+																				"invalid unicode surrogate pair",
+																			)
+																	None:
+																		has_error = True
+																		error = scanner_error(
+																			escape_start,
+																			"invalid unicode escape",
+																		)
+															else:
+																has_error = True
+																error = scanner_error(
+																	escape_start,
+																	"unpaired unicode high surrogate",
+																)
+														else if is_low_surrogate(code):
+															has_error = True
+															error = scanner_error(
+																escape_start,
+																"unpaired unicode low surrogate",
+															)
+														else:
+															result = result.append_char(
+																to_char(code),
+															)
+															st = scanner_advance_same_line(st, 6)
+													None:
+														has_error = True
+														error = scanner_error(
+															escape_start,
+															"invalid unicode escape",
+														)
+											_:
+												has_error = True
+												error = scanner_error(
+													escape_start,
+													"invalid string escape",
+												)
+							else if to_int(ch) < 32:
+								has_error = True
+								error = scanner_error(st, "unescaped control character in string")
+							else:
+								result = result.append_char(ch)
+								st = scanner_advance(input, st)
+				if has_error:
+					Err(error)
+				else:
+					Ok((result, st))
+		None:
+			Err(scanner_error(s, "expected string"))
+
+
+private pure func scanner_parse_number(
+	input: String,
+	s: JsonScanner,
+) -> Result[(JsonValue, JsonScanner), JsonScanFailure]:
+	len: Int = input.length()
+	var i: Int = s.pos
+	var ok: Bool = True
+	var message: String = "invalid number"
+	var error_index: Int = i
+	match input.get(i):
+		Some(c):
+			if c == '-':
+				i += 1
+		None:
+			ok = False
+			error_index = i
+	if ok:
+		match input.get(i):
+			Some(c):
+				if c == '0':
+					i += 1
+					match input.get(i):
+						Some(next):
+							if is_digit(next):
+								ok = False
+								message = "invalid number: leading zero"
+								error_index = i
+						None: void
+				else if is_nonzero_digit(c):
+					i += 1
+					var scanning_int: Bool = True
+					while scanning_int:
+						match input.get(i):
+							Some(next):
+								if is_digit(next):
+									i += 1
+								else:
+									scanning_int = False
+							None:
+								scanning_int = False
+				else:
+					ok = False
+					message = "invalid number: expected digit"
+					error_index = i
+			None:
+				ok = False
+				message = "invalid number: expected digit"
+				error_index = i
+	if ok:
+		match input.get(i):
+			Some(c):
+				if c == '.':
+					i += 1
+					match input.get(i):
+						Some(first_frac):
+							if is_digit(first_frac):
+								i += 1
+								var scanning_frac: Bool = True
+								while scanning_frac:
+									match input.get(i):
+										Some(next):
+											if is_digit(next):
+												i += 1
+											else:
+												scanning_frac = False
+										None:
+											scanning_frac = False
+							else:
+								ok = False
+								message = "invalid number: expected digit after decimal point"
+								error_index = i
+						None:
+							ok = False
+							message = "invalid number: expected digit after decimal point"
+							error_index = i
+			None: void
+	if ok:
+		match input.get(i):
+			Some(c):
+				if is_exp_marker(c):
+					i += 1
+					match input.get(i):
+						Some(sign):
+							if is_sign(sign):
+								i += 1
+						None: void
+					match input.get(i):
+						Some(first_exp):
+							if is_digit(first_exp):
+								i += 1
+								var scanning_exp: Bool = True
+								while scanning_exp:
+									match input.get(i):
+										Some(next):
+											if is_digit(next):
+												i += 1
+											else:
+												scanning_exp = False
+										None:
+											scanning_exp = False
+							else:
+								ok = False
+								message = "invalid number: expected exponent digit"
+								error_index = i
+						None:
+							ok = False
+							message = "invalid number: expected exponent digit"
+							error_index = i
+			None: void
+	if ok and i > s.pos:
+		num_str: String = input.substring(s.pos, i - s.pos)
+		Ok((JsonNumber(to_float(num_str)), scanner_advance_same_line_to(s, i)))
+	else:
+		Err(scanner_error(scanner_advance_same_line_to(s, error_index), message))
+
+
+private pure func scanner_parse_value(
+	input: String,
+	s: JsonScanner,
+) -> Result[(JsonValue, JsonScanner), JsonScanFailure]:
+	st: JsonScanner = scanner_skip_whitespace(input, s)
+	match scanner_peek(input, st):
+		Some('n'): scanner_literal(input, st, "null", JsonNull)
+		Some('t'): scanner_literal(input, st, "true", JsonBool(True))
+		Some('f'): scanner_literal(input, st, "false", JsonBool(False))
+		Some('-'): scanner_parse_number(input, st)
+		Some(c):
+			if is_digit(c):
+				scanner_parse_number(input, st)
+			else if c == '\"':
+				match scanner_parse_string(input, st):
+					Ok((value, rest)): Ok((JsonString(value), rest))
+					Err(e): Err(e)
+			else if c == '[':
+				scanner_parse_array(input, st)
+			else if c == '{':
+				scanner_parse_object(input, st)
+			else:
+				Err(scanner_error(st, "expected JSON value"))
+		None:
+			Err(scanner_error(st, "expected JSON value"))
+
+
+private pure func scanner_parse_array(
+	input: String,
+	s: JsonScanner,
+) -> Result[(JsonValue, JsonScanner), JsonScanFailure]:
+	var st: JsonScanner = scanner_advance(input, s)
+	var items: List[JsonValue] = []
+	var done: Bool = False
+	var has_error: Bool = False
+	var error: JsonScanFailure = scanner_error(s, "")
+	st = scanner_skip_whitespace(input, st)
+	match scanner_peek(input, st):
+		Some(']'):
+			done = True
+			st = scanner_advance(input, st)
+		_: void
+	while not done and not has_error:
+		match scanner_parse_value(input, st):
+			Ok((value, rest)):
+				items = items.append(value)
+				st = scanner_skip_whitespace(input, rest)
+				match scanner_peek(input, st):
+					Some(','):
+						st = scanner_advance(input, st)
+					Some(']'):
+						done = True
+						st = scanner_advance(input, st)
+					Some(_):
+						has_error = True
+						error = scanner_error(st, "expected ',' or ']' in array")
+					None:
+						has_error = True
+						error = scanner_error(st, "unterminated array")
+			Err(e):
+				has_error = True
+				error = e
+	if has_error:
+		Err(error)
+	else:
+		Ok((JsonVector(items), st))
+
+
+private pure func scanner_parse_object(
+	input: String,
+	s: JsonScanner,
+) -> Result[(JsonValue, JsonScanner), JsonScanFailure]:
+	var st: JsonScanner = scanner_advance(input, s)
+	var pairs: List[(String, JsonValue)] = []
+	var seen: Set[String] = set()
+	var done: Bool = False
+	var has_error: Bool = False
+	var error: JsonScanFailure = scanner_error(s, "")
+	st = scanner_skip_whitespace(input, st)
+	match scanner_peek(input, st):
+		Some('}'):
+			done = True
+			st = scanner_advance(input, st)
+		_: void
+	while not done and not has_error:
+		st = scanner_skip_whitespace(input, st)
+		key_start: JsonScanner = st
+		match scanner_peek(input, st):
+			Some('\"'):
+				match scanner_parse_string(input, st):
+					Ok((key, after_key)):
+						if seen.contains(key):
+							has_error = True
+							error = scanner_error(key_start, "duplicate object key")
+						else:
+							seen = seen.add(key)
+							st = scanner_skip_whitespace(input, after_key)
+							match scanner_peek(input, st):
+								Some(':'):
+									st = scanner_advance(input, st)
+									match scanner_parse_value(input, st):
+										Ok((value, after_value)):
+											pairs = pairs.append((key, value))
+											st = scanner_skip_whitespace(input, after_value)
+											match scanner_peek(input, st):
+												Some(','):
+													st = scanner_advance(input, st)
+												Some('}'):
+													done = True
+													st = scanner_advance(input, st)
+												Some(_):
+													has_error = True
+													error = scanner_error(
+														st,
+														"expected ',' or '}' in object",
+													)
+												None:
+													has_error = True
+													error = scanner_error(st, "unterminated object")
+										Err(e):
+											has_error = True
+											error = e
+								Some(_):
+									has_error = True
+									error = scanner_error(st, "expected ':' after object key")
+								None:
+									has_error = True
+									error = scanner_error(st, "unterminated object")
+					Err(e):
+						has_error = True
+						error = e
+			Some(_):
+				has_error = True
+				error = scanner_error(st, "expected string key")
+			None:
+				has_error = True
+				error = scanner_error(st, "unterminated object")
+	if has_error:
+		Err(error)
+	else:
+		Ok((JsonObject(pairs), st))
+
+
+---
+Parse one JSON value and return the remaining input.
+This is a compatibility entry point for code that composes parsers. It uses the
+same scanner as `parse_json`, but it does not require the scanner to consume the
+full input.
+
+doctests:
+    :: Parse preserves trailing input
+    match parse("true false"):
+        Success(JsonBool(True), rest): rest == " false"
+        _: False
+---
+pure func parse(input: String) -> ParseResult[JsonValue]:
+	match scanner_parse_value(input, json_scanner()):
+		Ok((value, rest)): Success(value, suffix_at(input, rest.pos))
+		Err(failure): Failure(failure.error.format_error(), suffix_at(input, failure.pos))
+
+
+---
+Parse a JSON string into a JsonValue, returning Result instead of ParseResult.
+Requires the full input to be one JSON value, apart from trailing whitespace.
+Errors include line and column context in the returned string. Use
+`parse_json_detailed` when callers need structured error fields.
+Use `parse` if you need remaining-input behavior.
+
+doctests:
+    :: Parse valid JSON
+    match "{\"x\": 1}".parse_json():
+        Ok(_): True
+        Err(_): False
+    :: Invalid JSON returns Err
+    match "not json".parse_json():
+        Ok(_): False
+        Err(_): True
+---
+pure func parse_json(input: String) -> Result[JsonValue, String]:
+	match parse_json_detailed(input):
+		Ok(value): Ok(value)
+		Err(err): Err(err.format_error())
+
+
+---
+Parse a JSON string into a JsonValue with structured error details.
+Requires the full input to be one JSON value, apart from trailing whitespace.
+Use `parse_json` if you only need a formatted string error.
+
+doctests:
+    :: Structured line and column error
+    match parse_json_detailed("true\nfalse"):
+        Ok(_): False
+        Err(e): e.line == 2 and e.column == 1
+---
+pure func parse_json_detailed(input: String) -> Result[JsonValue, JsonError]:
+	match scanner_parse_value(input, json_scanner()):
+		Ok((value, rest)):
+			trailing: JsonScanner = scanner_skip_whitespace(input, rest)
+			if scanner_at_end(input, trailing):
+				Ok(value)
+			else:
+				Err(scanner_error(trailing, "unexpected trailing input").error)
+		Err(e): Err(e.error)
+
+
+-- ============================================================================
+-- JSON Value Accessors
+-- ============================================================================
+pure func is_null(value: JsonValue) -> Bool:
+	match value:
+		JsonNull: True
+		_: False
+
+
+pure func as_bool(value: JsonValue) -> Option[Bool]:
+	match value:
+		JsonBool(b): Some(b)
+		_: None
+
+
+pure func as_number(value: JsonValue) -> Option[Float]:
+	match value:
+		JsonNumber(n): Some(n)
+		_: None
+
+
+pure func as_string(value: JsonValue) -> Option[String]:
+	match value:
+		JsonString(s): Some(s)
+		_: None
+
+
+pure func as_array(value: JsonValue) -> Option[List[JsonValue]]:
+	match value:
+		JsonVector(arr): Some(arr)
+		_: None
+
+
+pure func as_object(value: JsonValue) -> Option[List[(String, JsonValue)]]:
+	match value:
+		JsonObject(obj): Some(obj)
+		_: None
+
+
+pure func get_field(value: JsonValue, key: String) -> Option[JsonValue]:
+	match value:
+		JsonObject(pairs):
+			var result: Option[JsonValue] = None
+			var i: Int = 0
+			var found: Bool = False
+			while i < pairs.length() and not found:
+				match pairs.get(i):
+					Some(pair):
+						if pair.0 == key:
+							result = Some(pair.1)
+							found = True
+					None: void
+				i += 1
+			result
+		_: None
+
+
+-- ============================================================================
+-- JSON Serialization
+-- ============================================================================
+private pure func quote_char() -> String:
+	from_char('\"')
+
+
+implements Stringable for JsonValue:
+	pure func to_string(value: JsonValue) -> String:
+		q: String = quote_char()
+		match value:
+			JsonNull: "null"
+			JsonBool(b):
+				if b:
+					"true"
+				else:
+					"false"
+			JsonNumber(n):
+				if is_finite(n):
+					n.to_string()
+				else:
+					"null"
+			JsonString(s): q + escape(s) + q
+			JsonVector(arr):
+				var result: String = "["
+				var first: Bool = True
+				var i: Int = 0
+				while i < arr.length():
+					elem_opt: Option[JsonValue] = arr.get(i)
+					match elem_opt:
+						Some(elem):
+							if first:
+								first = False
+							else:
+								result = result.append_char(',')
+							result = result.append_str(elem.to_string())
+						None: void
+					i += 1
+				result + "]"
+			JsonObject(pairs):
+				var result: String = from_char('{')
+				var first: Bool = True
+				var i: Int = 0
+				while i < pairs.length():
+					pair_opt: Option[(String, JsonValue)] = pairs.get(i)
+					match pair_opt:
+						Some(pair):
+							if first:
+								first = False
+							else:
+								result = result.append_char(',')
+							result = result.append_char('\"')
+							result = result.append_str(escape(pair.0))
+							result = result.append_char('\"')
+							result = result.append_char(':')
+							result = result.append_str(pair.1.to_string())
+						None: void
+					i += 1
+				result + from_char('}')
+
+
+private pure func escape(s: String) -> String:
+	var result: String = make_string(16)
+	var i: Int = 0
+	while i < s.length():
+		match s.get(i):
+			Some(c):
+				code: Int = to_int(c)
+				match code:
+					34:
+						result = result.append_char('\\')
+						result = result.append_char('\"')
+					92:
+						result = result.append_char('\\')
+						result = result.append_char('\\')
+					10:
+						result = result.append_char('\\')
+						result = result.append_char('n')
+					13:
+						result = result.append_char('\\')
+						result = result.append_char('r')
+					9:
+						result = result.append_char('\\')
+						result = result.append_char('t')
+					8:
+						result = result.append_char('\\')
+						result = result.append_char('b')
+					12:
+						result = result.append_char('\\')
+						result = result.append_char('f')
+					_:
+						if code < 32:
+							result = append_unicode_escape(result, code)
+						else:
+							result = result.append_char(c)
+			None: void
+		i += 1
+	result
+-- is_digit imported from parser (which re-exports from string)

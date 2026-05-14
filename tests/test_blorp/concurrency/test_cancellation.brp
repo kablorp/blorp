@@ -1,0 +1,152 @@
+-- Task cancellation tests
+-- Tests cooperative cancellation: when a task is cancelled (via timeout or
+-- explicit cancel), its blocking operations (sleep, recv, send) return early.
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	system: file_exists, now_microseconds, remove_file, write_file
+	test: TestSuite
+
+
+-- A task with a long sleep should be cancelled quickly by timeout,
+-- not wait the full sleep duration.
+func very_slow_task() -> Int:
+	sleep(10000)
+	42
+
+
+func delayed_write_after_timeout() -> Int:
+	sleep(80)
+	_ = write_file("/tmp/blorp_timeout_cancel_probe.txt", "late")
+	7
+
+
+func cancelled_task_with_managed_locals() -> Int:
+	prefix: String = "cancel-" + 1.to_string()
+	values: List[String] = [
+		prefix + "-a",
+		prefix + "-b",
+		prefix + "-c",
+		prefix + "-d",
+		prefix + "-e",
+		prefix + "-f",
+		prefix + "-g",
+		prefix + "-h",
+	]
+	sleep(10000)
+	values.length()
+
+
+func test_timeout_cancels_quickly() -> Bool:
+	start: Int = now_microseconds()
+	concurrent(timeout: 30):
+		a = very_slow_task()
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	timed_out: Bool = match a:
+		Ok(_): False
+		Err(_): True
+
+	-- Should complete in ~30ms (timeout), NOT 10000ms (sleep)
+	timed_out and elapsed_ms < 200
+
+
+-- A task blocked on recv should be freed by timeout
+func recv_task(ch: Channel[Int]) -> Int:
+	opt: Option[Int] = recv(ch)
+	match opt:
+		Some(v): v
+		None: -1
+
+
+func test_recv_cancelled_by_timeout() -> Bool:
+	ch: Channel[Int] = channel(1)
+	start: Int = now_microseconds()
+	concurrent(timeout: 30):
+		a = recv_task(ch)
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	timed_out: Bool = match a:
+		Ok(_): False
+		Err(_): True
+	timed_out and elapsed_ms < 200
+
+
+-- Fast task + slow task: fast completes normally, slow times out
+func fast_task() -> Int:
+	42
+
+
+func test_fast_and_slow() -> Bool:
+	concurrent(timeout: 50):
+		fast = fast_task()
+		slow = very_slow_task()
+	fast_ok: Bool = match fast:
+		Ok(v): v == 42
+		Err(_): False
+	slow_timed_out: Bool = match slow:
+		Ok(_): False
+		Err(_): True
+	fast_ok and slow_timed_out
+
+
+func test_timeout_cancels_late_side_effect() -> Bool:
+	_ = remove_file("/tmp/blorp_timeout_cancel_probe.txt")
+	concurrent(timeout: 10):
+		a = delayed_write_after_timeout()
+	timed_out: Bool = match a:
+		Ok(_): False
+		Err(_): True
+	sleep(120)
+	no_late_write: Bool = not file_exists("/tmp/blorp_timeout_cancel_probe.txt")
+	_ = remove_file("/tmp/blorp_timeout_cancel_probe.txt")
+	timed_out and no_late_write
+
+
+func test_timeout_releases_cancelled_locals() -> Bool:
+	reset_mem_stats()
+	concurrent(timeout: 10):
+		a = cancelled_task_with_managed_locals()
+	timed_out: Bool = match a:
+		Ok(_): False
+		Err(_): True
+	stats: MemStats = get_mem_stats()
+	timed_out and stats.current_objects < 12
+
+
+-- Timeout 0 should immediately cancel all tasks
+func test_zero_timeout() -> Bool:
+	start: Int = now_microseconds()
+	concurrent(timeout: 0):
+		a = very_slow_task()
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	timed_out: Bool = match a:
+		Ok(_): False
+		Err(_): True
+	timed_out and elapsed_ms < 200
+
+
+-- Cancelled variant is matchable in ConcurrencyError
+func test_cancelled_variant_exists() -> Bool:
+	-- Verify the Cancelled constructor exists and is matchable
+	-- (This tests the type system, not runtime cancellation)
+	concurrent(timeout: 1):
+		a = very_slow_task()
+	match a:
+		Ok(_): False
+		Err(e):
+			match e:
+				Timeout: True
+				TaskFailed(_): False
+				Cancelled: False
+
+
+tests: TestSuite = {
+	description = "Concurrency: cancellation",
+	tests = [
+		("timeout cancels quickly", test_timeout_cancels_quickly),
+		("recv cancelled by timeout", test_recv_cancelled_by_timeout),
+		("fast and slow tasks", test_fast_and_slow),
+		("timeout cancels late side effect", test_timeout_cancels_late_side_effect),
+		("timeout releases cancelled locals", test_timeout_releases_cancelled_locals),
+		("zero timeout", test_zero_timeout),
+		("cancelled variant exists", test_cancelled_variant_exists),
+	],
+}

@@ -1,0 +1,1241 @@
+-- Validation — Error-accumulating validation with recursive error types
+--
+-- Errors form a tree: leaf nodes describe what went wrong (type mismatch,
+-- predicate failure), branch nodes describe where (field name, list index).
+-- Path is computed at render time by walking the tree, not stored redundantly.
+--
+-- Simple validation:
+-- result = validate("", [non_empty, min_len(3)])
+-- -- Err(GroupErrs("", [PredicateErr("non_empty", "must not be empty"),
+-- --                     PredicateErr("min_len", "must be at least 3 characters")]))
+--
+-- Record validation:
+-- pure func validate_user(u: User) -> Result[User, Invalid]:
+-- collect(u, [
+-- validate_field("name", u.name, [non_empty, min_len(3)]),
+-- validate_field("age", u.age, [positive])
+-- ])
+--
+-- Nested validation (list of records):
+-- pure func validate_users(users: List[User]) -> Result[List[User], Invalid]:
+-- validate_list(users, validate_user)
+import:
+	codec: Value(VBool, VFloat, VInt, VList, VNull, VRecord, VString)
+
+
+-- ============================================================================
+-- Generic Validation Types
+-- ============================================================================
+---
+A check validates a value that has already been decoded or constructed.
+It returns None on success and Some(error) on failure so many checks can be
+accumulated before returning.
+---
+type alias Check[A, E] = pure (A) -> Option[E]
+
+---
+A validator transforms an input value into a concrete success type or returns
+a structured error. Validators can decode, coerce, construct records, and run
+domain checks.
+---
+type alias Validator[Input, Success, Error] = pure (Input) -> Result[Success, Error]
+
+
+-- ============================================================================
+-- Error Types
+-- ============================================================================
+---
+Recursive validation error tree.
+
+Leaf variants describe what went wrong:
+- TypeErr: expected one type, got another
+- PredicateErr: a validation predicate failed
+- MissingKey: a required key/field is absent
+- ExtraKeys: unexpected keys were present
+- CoercionErr: type coercion failed
+
+Branch variants describe where (structurally) it went wrong:
+- KeyErrs: errors keyed by field/dict key name
+- IndexErrs: errors keyed by list index
+- UnionErrs: none of N alternatives matched
+- GroupErrs: named group of errors (e.g., all errors for one field)
+---
+union Invalid:
+	TypeErr(String, String)
+	PredicateErr(String, String)
+	MissingKey(String)
+	ExtraKeys(List[String])
+	CoercionErr(String, String)
+	KeyErrs(List[(String, Invalid)])
+	IndexErrs(List[(Int, Invalid)])
+	UnionErrs(List[Invalid])
+	GroupErrs(String, List[Invalid])
+
+
+---
+The default check shape used by this module.
+---
+type alias InvalidCheck[A] = Check[A, Invalid]
+
+---
+The default validator shape for deserialized codec.Value inputs.
+---
+type alias ValueValidator[T] = Validator[Value, T, Invalid]
+
+
+-- ============================================================================
+-- Constructing Errors
+-- ============================================================================
+---
+Create a type error: expected one type, got another.
+
+doctests:
+    :: Type error matches expected fields
+    match type_err("String", "Int"):
+        TypeErr(e, g): e == "String" and g == "Int"
+        _: False
+---
+pure func type_err(expected: String, got: String) -> Invalid:
+	TypeErr(expected, got)
+
+
+---
+Create a predicate error with a code and message.
+
+doctests:
+    :: Predicate error with code and message
+    match predicate_err("non_empty", "must not be empty"):
+        PredicateErr(c, m): c == "non_empty" and m == "must not be empty"
+        _: False
+---
+pure func predicate_err(code: String, message: String) -> Invalid:
+	PredicateErr(code, message)
+
+
+---
+Create a missing key error.
+
+doctests:
+    :: Missing key error
+    match missing_key("email"):
+        MissingKey(k): k == "email"
+        _: False
+---
+pure func missing_key(key: String) -> Invalid:
+	MissingKey(key)
+
+
+---
+Wrap an error under a field/key name.
+
+doctests:
+    :: Wraps error under key
+    match at_key("name", PredicateErr("non_empty", "required")):
+        KeyErrs(_): True
+        _: False
+---
+pure func at_key(key: String, err: Invalid) -> Invalid:
+	KeyErrs([(key, err)])
+
+
+---
+Wrap an error under a list index.
+
+doctests:
+    :: Wraps error under index
+    match at_index(3, TypeErr("Int", "String")):
+        IndexErrs(_): True
+        _: False
+---
+pure func at_index(idx: Int, err: Invalid) -> Invalid:
+	IndexErrs([(idx, err)])
+
+
+---
+Group multiple errors under a field name.
+---
+pure func group(field: String, errors: List[Invalid]) -> Invalid:
+	GroupErrs(field, errors)
+
+
+-- ============================================================================
+-- Core Validation
+-- ============================================================================
+---
+Run all checks against a value, accumulating errors.
+Returns Ok(value) if all pass, Err(Invalid) with all failures otherwise.
+
+doctests:
+    :: Valid value passes
+    match validate(5, [positive]):
+        Ok(v): v == 5
+        Err(_): False
+---
+pure func validate[T](value: T, checks: List[InvalidCheck[T]]) -> Result[T, Invalid]:
+	var errors: List[Invalid] = []
+	for c in checks:
+		match c(value):
+			Some(e): errors = errors.append(e)
+			None: void
+	if errors.length() == 0:
+		ok_result: Result[T, Invalid] = Ok(value)
+		ok_result
+	else if errors.length() == 1:
+		match errors.get(0):
+			Some(e): Err(e)
+			None: Err(GroupErrs("", errors))
+	else:
+		Err(GroupErrs("", errors))
+
+
+---
+Validate a named field, wrapping errors under that field name.
+Returns None if all checks pass, Some(Invalid) if any fail.
+Use with `collect` for record validation.
+---
+pure func validate_field[T](
+	field_name: String,
+	value: T,
+	checks: List[InvalidCheck[T]],
+) -> Option[Invalid]:
+	var errors: List[Invalid] = []
+	for c in checks:
+		match c(value):
+			Some(e): errors = errors.append(e)
+			None: void
+	if errors.length() == 0:
+		opt: Option[Invalid] = None
+		opt
+	else if errors.length() == 1:
+		match errors.get(0):
+			Some(e): Some(GroupErrs(field_name, [e]))
+			None: Some(GroupErrs(field_name, errors))
+	else:
+		Some(GroupErrs(field_name, errors))
+
+
+---
+Collect field validation results into a final Result.
+Pass the valid value and a list of field validations (from validate_field).
+
+Example:
+    record Point {x: Int, y: Int}
+    p: Point = {x = 5, y = -1}
+    collect(p, [validate_field("x", p.x, [positive]), validate_field("y", p.y, [positive])])
+    -- Returns Err(KeyErrs(...)) because y is negative
+---
+pure func collect[T](value: T, field_results: List[Option[Invalid]]) -> Result[T, Invalid]:
+	var errors: List[(String, Invalid)] = []
+	for fr in field_results:
+		match fr:
+			Some(e):
+				-- Extract field name from GroupErrs for structured KeyErrs.
+				-- Unwrap single-child GroupErrs to avoid doubled paths in format:
+				-- validate_field wraps as GroupErrs("name", [child]), and KeyErrs
+				-- already carries the key, so we use the child directly.
+				match e:
+					GroupErrs(name, children):
+						if children.length() == 1:
+							match children.get(0):
+								Some(child): errors = errors.append((name, child))
+								None: errors = errors.append((name, e))
+						else:
+							errors = errors.append((name, GroupErrs("", children)))
+					_: errors = errors.append(("", e))
+			None: void
+
+	-- Multiple children: keep GroupErrs but clear its name
+	-- to avoid path duplication (KeyErrs carries the name)
+	if errors.length() == 0:
+		ok_result: Result[T, Invalid] = Ok(value)
+		ok_result
+	else:
+		Err(KeyErrs(errors))
+
+
+---
+Validate a nested sub-record, wrapping errors under a field name.
+Use with `collect` to compose nested record validators.
+
+Example:
+    pure func validate_inner(i: Inner) -> Result[Inner, Invalid]:
+        collect(i, [validate_field("x", i.x, [positive])])
+    pure func validate_outer(o: Outer) -> Result[Outer, Invalid]:
+        collect(o, [
+            validate_field("name", o.name, [non_empty]),
+            validate_nested("inner", o.inner, validate_inner)
+        ])
+---
+pure func validate_nested[T](
+	field_name: String,
+	value: T,
+	validator: Validator[T, T, Invalid],
+) -> Option[Invalid]:
+	match validator(value):
+		Ok(_):
+			opt: Option[Invalid] = None
+			opt
+		Err(e): Some(GroupErrs(field_name, [e]))
+
+
+---
+Validate each element of a list, returning per-index errors.
+The validator function should return Result[T, Invalid] for each element.
+---
+pure func validate_list[T](
+	items: List[T],
+	validator: Validator[T, T, Invalid],
+) -> Result[List[T], Invalid]:
+	var errors: List[(Int, Invalid)] = []
+	var results: List[T] = []
+	var i: Int = 0
+	for item in items:
+		match validator(item):
+			Ok(v): results = results.append(v)
+			Err(e):
+				errors = errors.append((i, e))
+				results = results.append(item)
+		i += 1
+	var final_result: Result[List[T], Invalid] = Ok(results)
+	if errors.length() > 0:
+		final_result = Err(IndexErrs(errors))
+	final_result
+
+
+---
+Bridge a Result[T, String] into validation.
+On Err, wraps the error string as a CoercionErr. On Ok, runs checks.
+---
+pure func and_validate[T](
+	input_result: Result[T, String],
+	checks: List[InvalidCheck[T]],
+) -> Result[T, Invalid]:
+	match input_result:
+		Err(e):
+			err_result: Result[T, Invalid] = Err(CoercionErr("String", e))
+			err_result
+		Ok(val): validate(val, checks)
+
+
+-- ============================================================================
+-- Validator Combinators
+-- ============================================================================
+---
+Transform a validator's successful output.
+---
+pure func map_validator[I, A, B, E](
+	validator: Validator[I, A, E],
+	transform: pure (A) -> B,
+) -> Validator[I, B, E]:
+	pure func(input: I) -> Result[B, E]:
+		match validator(input):
+			Ok(value): Ok(transform(value))
+			Err(err): Err(err)
+
+
+---
+Chain a validator into another fallible validation step.
+---
+pure func and_then_validator[I, A, B, E](
+	validator: Validator[I, A, E],
+	next: pure (A) -> Result[B, E],
+) -> Validator[I, B, E]:
+	pure func(input: I) -> Result[B, E]:
+		match validator(input):
+			Ok(value): next(value)
+			Err(err): Err(err)
+
+
+---
+Try the first validator; if it fails, try the second.
+The second error is returned when both validators fail.
+---
+pure func or_else_validator[I, A, E](
+	first: Validator[I, A, E],
+	second: Validator[I, A, E],
+) -> Validator[I, A, E]:
+	pure func(input: I) -> Result[A, E]:
+		match first(input):
+			Ok(value): Ok(value)
+			Err(_): second(input)
+
+
+---
+Try validators in order, returning the first success.
+If all validators fail, returns UnionErrs with every alternative error.
+---
+pure func one_of_validator[I, A](
+	validators: List[Validator[I, A, Invalid]],
+) -> Validator[I, A, Invalid]:
+	pure func(input: I) -> Result[A, Invalid]:
+		var errors: List[Invalid] = []
+		var success: Option[A] = None
+		for validator in validators:
+			match success:
+				Some(_): void
+				None:
+					match validator(input):
+						Ok(value): success = Some(value)
+						Err(err): errors = errors.append(err)
+		match success:
+			Some(value): Ok(value)
+			None: Err(UnionErrs(errors))
+
+
+---
+A validator that always succeeds with the given value.
+---
+pure func succeed_validator[I, A, E](value: A) -> Validator[I, A, E]:
+	pure func(_: I) -> Result[A, E]: Ok(value)
+
+
+---
+A validator that always fails with the given error.
+---
+pure func fail_validator[I, A, E](err: E) -> Validator[I, A, E]:
+	pure func(_: I) -> Result[A, E]: Err(err)
+
+
+-- ============================================================================
+-- Value Validators
+-- ============================================================================
+---
+Return a human-readable type name for a codec.Value variant.
+---
+private pure func value_type_name(value: Value) -> String:
+	match value:
+		VNull: "Null"
+		VBool(_): "Bool"
+		VInt(_): "Int"
+		VFloat(_): "Float"
+		VString(_): "String"
+		VList(_): "List"
+		VRecord(_): "Record"
+
+
+---
+Flatten a field validator error into a key error list.
+---
+private pure func append_key_error(
+	errors: List[(String, Invalid)],
+	err: Invalid,
+) -> List[(String, Invalid)]:
+	match err:
+		KeyErrs(pairs):
+			var result: List[(String, Invalid)] = errors
+			for pair in pairs:
+				result = result.append(pair)
+			result
+		_: errors.append(("", err))
+
+
+---
+Validate a codec.Value as a String, then run string checks.
+---
+pure func string_validator(checks: List[InvalidCheck[String]]) -> ValueValidator[String]:
+	pure func(input: Value) -> Result[String, Invalid]:
+		match input:
+			VString(s): validate(s, checks)
+			_: Err(TypeErr("String", value_type_name(input)))
+
+
+---
+Validate a codec.Value as an Int, then run integer checks.
+---
+pure func int_validator(checks: List[InvalidCheck[Int]]) -> ValueValidator[Int]:
+	pure func(input: Value) -> Result[Int, Invalid]:
+		match input:
+			VInt(n): validate(n, checks)
+			_: Err(TypeErr("Int", value_type_name(input)))
+
+
+---
+Validate a codec.Value as a Float, then run float checks.
+VInt is accepted using the same numeric coercion as codec.as_float.
+---
+pure func float_validator(checks: List[InvalidCheck[Float]]) -> ValueValidator[Float]:
+	pure func(input: Value) -> Result[Float, Invalid]:
+		match input:
+			VFloat(f): validate(f, checks)
+			VInt(n): validate(to_float(n), checks)
+			_: Err(TypeErr("Float", value_type_name(input)))
+
+
+---
+Validate a codec.Value as a Float without accepting VInt.
+Use float_validator when numeric VInt-to-Float coercion is desired.
+---
+pure func strict_float_validator(checks: List[InvalidCheck[Float]]) -> ValueValidator[Float]:
+	pure func(input: Value) -> Result[Float, Invalid]:
+		match input:
+			VFloat(f): validate(f, checks)
+			_: Err(TypeErr("Float", value_type_name(input)))
+
+
+---
+Validate a codec.Value as a Bool, then run boolean checks.
+---
+pure func bool_validator(checks: List[InvalidCheck[Bool]]) -> ValueValidator[Bool]:
+	pure func(input: Value) -> Result[Bool, Invalid]:
+		match input:
+			VBool(b): validate(b, checks)
+			_: Err(TypeErr("Bool", value_type_name(input)))
+
+
+---
+Validate any codec.Value, then run checks against the raw Value.
+---
+pure func value_validator(checks: List[InvalidCheck[Value]]) -> ValueValidator[Value]:
+	pure func(input: Value) -> Result[Value, Invalid]:
+		validate(input, checks)
+
+
+---
+Validate a codec.Value as VNull.
+Returns True on success, matching codec.d_null.
+---
+pure func null_validator() -> ValueValidator[Bool]:
+	pure func(input: Value) -> Result[Bool, Invalid]:
+		match input:
+			VNull: Ok(True)
+			_: Err(TypeErr("Null", value_type_name(input)))
+
+
+---
+Validate a required field from a VRecord.
+The child validator error is wrapped under the requested field name.
+---
+pure func field[T](name: String, validator: ValueValidator[T]) -> ValueValidator[T]:
+	pure func(input: Value) -> Result[T, Invalid]:
+		match input:
+			VRecord(_):
+				match input.get_field(name):
+					Some(field_value):
+						match validator(field_value):
+							Ok(value): Ok(value)
+							Err(err): Err(KeyErrs([(name, err)]))
+					None: Err(KeyErrs([(name, MissingKey(name))]))
+			_: Err(KeyErrs([(name, TypeErr("Record", value_type_name(input)))]))
+
+
+---
+Validate an optional field from a VRecord.
+Missing fields and VNull become None; present values are validated as Some.
+---
+pure func optional_field[T](
+	name: String,
+	validator: ValueValidator[T],
+) -> ValueValidator[Option[T]]:
+	pure func(input: Value) -> Result[Option[T], Invalid]:
+		match input:
+			VRecord(_):
+				match input.get_field(name):
+					Some(field_value):
+						match field_value:
+							VNull: Ok(None)
+							_:
+								match validator(field_value):
+									Ok(value): Ok(Some(value))
+									Err(err): Err(KeyErrs([(name, err)]))
+					None: Ok(None)
+			_: Err(KeyErrs([(name, TypeErr("Record", value_type_name(input)))]))
+
+
+---
+Validate every element of a VList, accumulating per-index failures.
+---
+pure func list_of[T](item_validator: ValueValidator[T]) -> ValueValidator[List[T]]:
+	pure func(input: Value) -> Result[List[T], Invalid]:
+		match input:
+			VList(items):
+				var errors: List[(Int, Invalid)] = []
+				var results: List[T] = []
+				var i: Int = 0
+				for item in items:
+					match item_validator(item):
+						Ok(value): results = results.append(value)
+						Err(err): errors = errors.append((i, err))
+					i += 1
+				if errors.length() == 0:
+					Ok(results)
+				else:
+					Err(IndexErrs(errors))
+			_: Err(TypeErr("List", value_type_name(input)))
+
+
+---
+Compose two field validators into a concrete record value.
+Errors from field validators are accumulated into one KeyErrs value.
+---
+pure func object2[A, B, Out](
+	first: ValueValidator[A],
+	second: ValueValidator[B],
+	build: pure (A, B) -> Out,
+) -> ValueValidator[Out]:
+	pure func(input: Value) -> Result[Out, Invalid]:
+		match input:
+			VRecord(_):
+				var errors: List[(String, Invalid)] = []
+				var first_value: Option[A] = None
+				var second_value: Option[B] = None
+				match first(input):
+					Ok(value): first_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				match second(input):
+					Ok(value): second_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				if errors.length() > 0:
+					Err(KeyErrs(errors))
+				else:
+					match first_value:
+						Some(a):
+							match second_value:
+								Some(b): Ok(build(a, b))
+								None: Err(KeyErrs(errors))
+						None: Err(KeyErrs(errors))
+			_: Err(TypeErr("Record", value_type_name(input)))
+
+
+---
+Compose three field validators into a concrete record value.
+Errors from field validators are accumulated into one KeyErrs value.
+---
+pure func object3[A, B, C, Out](
+	first: ValueValidator[A],
+	second: ValueValidator[B],
+	third: ValueValidator[C],
+	build: pure (A, B, C) -> Out,
+) -> ValueValidator[Out]:
+	pure func(input: Value) -> Result[Out, Invalid]:
+		match input:
+			VRecord(_):
+				var errors: List[(String, Invalid)] = []
+				var first_value: Option[A] = None
+				var second_value: Option[B] = None
+				var third_value: Option[C] = None
+				match first(input):
+					Ok(value): first_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				match second(input):
+					Ok(value): second_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				match third(input):
+					Ok(value): third_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				if errors.length() > 0:
+					Err(KeyErrs(errors))
+				else:
+					match first_value:
+						Some(a):
+							match second_value:
+								Some(b):
+									match third_value:
+										Some(c): Ok(build(a, b, c))
+										None: Err(KeyErrs(errors))
+								None: Err(KeyErrs(errors))
+						None: Err(KeyErrs(errors))
+			_: Err(TypeErr("Record", value_type_name(input)))
+
+
+---
+Compose four field validators into a concrete record value.
+Errors from field validators are accumulated into one KeyErrs value.
+---
+pure func object4[A, B, C, D, Out](
+	first: ValueValidator[A],
+	second: ValueValidator[B],
+	third: ValueValidator[C],
+	fourth: ValueValidator[D],
+	build: pure (A, B, C, D) -> Out,
+) -> ValueValidator[Out]:
+	pure func(input: Value) -> Result[Out, Invalid]:
+		match input:
+			VRecord(_):
+				var errors: List[(String, Invalid)] = []
+				var first_value: Option[A] = None
+				var second_value: Option[B] = None
+				var third_value: Option[C] = None
+				var fourth_value: Option[D] = None
+				match first(input):
+					Ok(value): first_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				match second(input):
+					Ok(value): second_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				match third(input):
+					Ok(value): third_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				match fourth(input):
+					Ok(value): fourth_value = Some(value)
+					Err(err): errors = append_key_error(errors, err)
+				if errors.length() > 0:
+					Err(KeyErrs(errors))
+				else:
+					match first_value:
+						Some(a):
+							match second_value:
+								Some(b):
+									match third_value:
+										Some(c):
+											match fourth_value:
+												Some(d): Ok(build(a, b, c, d))
+												None: Err(KeyErrs(errors))
+										None: Err(KeyErrs(errors))
+								None: Err(KeyErrs(errors))
+						None: Err(KeyErrs(errors))
+			_: Err(TypeErr("Record", value_type_name(input)))
+
+
+---
+Compose five field validators into a concrete record value.
+Errors from field validators are accumulated into one KeyErrs value.
+---
+pure func object5[T1, T2, T3, T4, T5, Out](
+	first: ValueValidator[T1],
+	second: ValueValidator[T2],
+	third: ValueValidator[T3],
+	fourth: ValueValidator[T4],
+	fifth: ValueValidator[T5],
+	build: pure (T1, T2, T3, T4, T5) -> Out,
+) -> ValueValidator[Out]:
+	pure func(input: Value) -> Result[Out, Invalid]:
+		match input:
+			VRecord(_):
+				var errors: List[(String, Invalid)] = []
+				var first_value: Option[T1] = None
+				var second_value: Option[T2] = None
+				var third_value: Option[T3] = None
+				var fourth_value: Option[T4] = None
+				var fifth_value: Option[T5] = None
+				match first(input):
+					Ok(a_value): first_value = Some(a_value)
+					Err(err): errors = append_key_error(errors, err)
+				match second(input):
+					Ok(b_value): second_value = Some(b_value)
+					Err(err): errors = append_key_error(errors, err)
+				match third(input):
+					Ok(c_value): third_value = Some(c_value)
+					Err(err): errors = append_key_error(errors, err)
+				match fourth(input):
+					Ok(d_value): fourth_value = Some(d_value)
+					Err(err): errors = append_key_error(errors, err)
+				match fifth(input):
+					Ok(e_value): fifth_value = Some(e_value)
+					Err(err): errors = append_key_error(errors, err)
+				if errors.length() > 0:
+					Err(KeyErrs(errors))
+				else:
+					match first_value:
+						Some(a):
+							match second_value:
+								Some(b):
+									match third_value:
+										Some(c):
+											match fourth_value:
+												Some(d):
+													match fifth_value:
+														Some(e): Ok(build(a, b, c, d, e))
+														None: Err(KeyErrs(errors))
+												None: Err(KeyErrs(errors))
+										None: Err(KeyErrs(errors))
+								None: Err(KeyErrs(errors))
+						None: Err(KeyErrs(errors))
+			_: Err(TypeErr("Record", value_type_name(input)))
+
+
+---
+Compose six field validators into a concrete record value.
+Errors from field validators are accumulated into one KeyErrs value.
+---
+pure func object6[T1, T2, T3, T4, T5, T6, Out](
+	first: ValueValidator[T1],
+	second: ValueValidator[T2],
+	third: ValueValidator[T3],
+	fourth: ValueValidator[T4],
+	fifth: ValueValidator[T5],
+	sixth: ValueValidator[T6],
+	build: pure (T1, T2, T3, T4, T5, T6) -> Out,
+) -> ValueValidator[Out]:
+	pure func(input: Value) -> Result[Out, Invalid]:
+		match input:
+			VRecord(_):
+				var errors: List[(String, Invalid)] = []
+				var first_value: Option[T1] = None
+				var second_value: Option[T2] = None
+				var third_value: Option[T3] = None
+				var fourth_value: Option[T4] = None
+				var fifth_value: Option[T5] = None
+				var sixth_value: Option[T6] = None
+				match first(input):
+					Ok(a_value): first_value = Some(a_value)
+					Err(err): errors = append_key_error(errors, err)
+				match second(input):
+					Ok(b_value): second_value = Some(b_value)
+					Err(err): errors = append_key_error(errors, err)
+				match third(input):
+					Ok(c_value): third_value = Some(c_value)
+					Err(err): errors = append_key_error(errors, err)
+				match fourth(input):
+					Ok(d_value): fourth_value = Some(d_value)
+					Err(err): errors = append_key_error(errors, err)
+				match fifth(input):
+					Ok(e_value): fifth_value = Some(e_value)
+					Err(err): errors = append_key_error(errors, err)
+				match sixth(input):
+					Ok(f_value): sixth_value = Some(f_value)
+					Err(err): errors = append_key_error(errors, err)
+				if errors.length() > 0:
+					Err(KeyErrs(errors))
+				else:
+					match first_value:
+						Some(a):
+							match second_value:
+								Some(b):
+									match third_value:
+										Some(c):
+											match fourth_value:
+												Some(d):
+													match fifth_value:
+														Some(e):
+															match sixth_value:
+																Some(f): Ok(build(a, b, c, d, e, f))
+																None: Err(KeyErrs(errors))
+														None: Err(KeyErrs(errors))
+												None: Err(KeyErrs(errors))
+										None: Err(KeyErrs(errors))
+								None: Err(KeyErrs(errors))
+						None: Err(KeyErrs(errors))
+			_: Err(TypeErr("Record", value_type_name(input)))
+
+
+---
+Compose seven field validators into a concrete record value.
+Errors from field validators are accumulated into one KeyErrs value.
+---
+pure func object7[T1, T2, T3, T4, T5, T6, T7, Out](
+	first: ValueValidator[T1],
+	second: ValueValidator[T2],
+	third: ValueValidator[T3],
+	fourth: ValueValidator[T4],
+	fifth: ValueValidator[T5],
+	sixth: ValueValidator[T6],
+	seventh: ValueValidator[T7],
+	build: pure (T1, T2, T3, T4, T5, T6, T7) -> Out,
+) -> ValueValidator[Out]:
+	pure func(input: Value) -> Result[Out, Invalid]:
+		match input:
+			VRecord(_):
+				var errors: List[(String, Invalid)] = []
+				var first_value: Option[T1] = None
+				var second_value: Option[T2] = None
+				var third_value: Option[T3] = None
+				var fourth_value: Option[T4] = None
+				var fifth_value: Option[T5] = None
+				var sixth_value: Option[T6] = None
+				var seventh_value: Option[T7] = None
+				match first(input):
+					Ok(a_value): first_value = Some(a_value)
+					Err(err): errors = append_key_error(errors, err)
+				match second(input):
+					Ok(b_value): second_value = Some(b_value)
+					Err(err): errors = append_key_error(errors, err)
+				match third(input):
+					Ok(c_value): third_value = Some(c_value)
+					Err(err): errors = append_key_error(errors, err)
+				match fourth(input):
+					Ok(d_value): fourth_value = Some(d_value)
+					Err(err): errors = append_key_error(errors, err)
+				match fifth(input):
+					Ok(e_value): fifth_value = Some(e_value)
+					Err(err): errors = append_key_error(errors, err)
+				match sixth(input):
+					Ok(f_value): sixth_value = Some(f_value)
+					Err(err): errors = append_key_error(errors, err)
+				match seventh(input):
+					Ok(g_value): seventh_value = Some(g_value)
+					Err(err): errors = append_key_error(errors, err)
+				if errors.length() > 0:
+					Err(KeyErrs(errors))
+				else:
+					match first_value:
+						Some(a):
+							match second_value:
+								Some(b):
+									match third_value:
+										Some(c):
+											match fourth_value:
+												Some(d):
+													match fifth_value:
+														Some(e):
+															match sixth_value:
+																Some(f):
+																	match seventh_value:
+																		Some(g): Ok(
+																			build(
+																				a,
+																				b,
+																				c,
+																				d,
+																				e,
+																				f,
+																				g,
+																			),
+																		)
+																		None: Err(KeyErrs(errors))
+																None: Err(KeyErrs(errors))
+														None: Err(KeyErrs(errors))
+												None: Err(KeyErrs(errors))
+										None: Err(KeyErrs(errors))
+								None: Err(KeyErrs(errors))
+						None: Err(KeyErrs(errors))
+			_: Err(TypeErr("Record", value_type_name(input)))
+
+
+---
+Compose eight field validators into a concrete record value.
+Errors from field validators are accumulated into one KeyErrs value.
+---
+pure func object8[T1, T2, T3, T4, T5, T6, T7, T8, Out](
+	first: ValueValidator[T1],
+	second: ValueValidator[T2],
+	third: ValueValidator[T3],
+	fourth: ValueValidator[T4],
+	fifth: ValueValidator[T5],
+	sixth: ValueValidator[T6],
+	seventh: ValueValidator[T7],
+	eighth: ValueValidator[T8],
+	build: pure (T1, T2, T3, T4, T5, T6, T7, T8) -> Out,
+) -> ValueValidator[Out]:
+	pure func(input: Value) -> Result[Out, Invalid]:
+		match input:
+			VRecord(_):
+				var errors: List[(String, Invalid)] = []
+				var first_value: Option[T1] = None
+				var second_value: Option[T2] = None
+				var third_value: Option[T3] = None
+				var fourth_value: Option[T4] = None
+				var fifth_value: Option[T5] = None
+				var sixth_value: Option[T6] = None
+				var seventh_value: Option[T7] = None
+				var eighth_value: Option[T8] = None
+				match first(input):
+					Ok(a_value): first_value = Some(a_value)
+					Err(err): errors = append_key_error(errors, err)
+				match second(input):
+					Ok(b_value): second_value = Some(b_value)
+					Err(err): errors = append_key_error(errors, err)
+				match third(input):
+					Ok(c_value): third_value = Some(c_value)
+					Err(err): errors = append_key_error(errors, err)
+				match fourth(input):
+					Ok(d_value): fourth_value = Some(d_value)
+					Err(err): errors = append_key_error(errors, err)
+				match fifth(input):
+					Ok(e_value): fifth_value = Some(e_value)
+					Err(err): errors = append_key_error(errors, err)
+				match sixth(input):
+					Ok(f_value): sixth_value = Some(f_value)
+					Err(err): errors = append_key_error(errors, err)
+				match seventh(input):
+					Ok(g_value): seventh_value = Some(g_value)
+					Err(err): errors = append_key_error(errors, err)
+				match eighth(input):
+					Ok(h_value): eighth_value = Some(h_value)
+					Err(err): errors = append_key_error(errors, err)
+				if errors.length() > 0:
+					Err(KeyErrs(errors))
+				else:
+					match first_value:
+						Some(a):
+							match second_value:
+								Some(b):
+									match third_value:
+										Some(c):
+											match fourth_value:
+												Some(d):
+													match fifth_value:
+														Some(e):
+															match sixth_value:
+																Some(f):
+																	match seventh_value:
+																		Some(g):
+																			match eighth_value:
+																				Some(h): Ok(
+																					build(
+																						a,
+																						b,
+																						c,
+																						d,
+																						e,
+																						f,
+																						g,
+																						h,
+																					),
+																				)
+																				None: Err(
+																					KeyErrs(
+																						errors,
+																					),
+																				)
+																		None: Err(KeyErrs(errors))
+																None: Err(KeyErrs(errors))
+														None: Err(KeyErrs(errors))
+												None: Err(KeyErrs(errors))
+										None: Err(KeyErrs(errors))
+								None: Err(KeyErrs(errors))
+						None: Err(KeyErrs(errors))
+			_: Err(TypeErr("Record", value_type_name(input)))
+
+
+-- ============================================================================
+-- String Checks
+-- ============================================================================
+---
+Check that a string is non-empty.
+
+doctests:
+    :: Empty string fails
+    match non_empty(""):
+        Some(_): True
+        None: False
+
+    :: Non-empty string passes
+    match non_empty("hello"):
+        Some(_): False
+        None: True
+---
+pure func non_empty(s: String) -> Option[Invalid]:
+	if s.length() == 0:
+		Some(PredicateErr("non_empty", "must not be empty"))
+	else:
+		opt: Option[Invalid] = None
+		opt
+
+
+---
+Check that a string has at least `n` characters.
+---
+pure func min_len(n: Int) -> InvalidCheck[String]:
+	pure func(s: String) -> Option[Invalid]:
+		if s.length() < n:
+			Some(PredicateErr("min_len", "must be at least " + n.to_string() + " characters"))
+		else:
+			opt: Option[Invalid] = None
+			opt
+
+
+---
+Check that a string has at most `n` characters.
+---
+pure func max_len(n: Int) -> InvalidCheck[String]:
+	pure func(s: String) -> Option[Invalid]:
+		if s.length() > n:
+			Some(PredicateErr("max_len", "must be at most " + n.to_string() + " characters"))
+		else:
+			opt: Option[Invalid] = None
+			opt
+
+
+---
+Check that a string matches one of the allowed values.
+---
+pure func one_of_str(allowed: List[String]) -> InvalidCheck[String]:
+	pure func(s: String) -> Option[Invalid]:
+		var found: Int = 0
+		for a in allowed:
+			if a == s:
+				found = 1
+		if found == 1:
+			opt: Option[Invalid] = None
+			opt
+		else:
+			Some(PredicateErr("one_of", "must be one of the allowed values"))
+
+
+-- ============================================================================
+-- Numeric Checks
+-- ============================================================================
+---
+Check that an integer is positive (> 0).
+
+doctests:
+    :: Positive value passes
+    match positive(5):
+        Some(_): False
+        None: True
+
+    :: Negative value fails
+    match positive(-1):
+        Some(_): True
+        None: False
+---
+pure func positive(x: Int) -> Option[Invalid]:
+	if x <= 0:
+		Some(PredicateErr("positive", "must be positive"))
+	else:
+		opt: Option[Invalid] = None
+		opt
+
+
+---
+Check that an integer is non-negative (>= 0).
+---
+pure func non_negative(x: Int) -> Option[Invalid]:
+	if x < 0:
+		Some(PredicateErr("non_negative", "must not be negative"))
+	else:
+		opt: Option[Invalid] = None
+		opt
+
+
+---
+Check that an integer is at least `n`.
+---
+pure func min_val(n: Int) -> InvalidCheck[Int]:
+	pure func(x: Int) -> Option[Invalid]:
+		if x < n:
+			Some(PredicateErr("min_val", "must be at least " + n.to_string()))
+		else:
+			opt: Option[Invalid] = None
+			opt
+
+
+---
+Check that an integer is at most `n`.
+---
+pure func max_val(n: Int) -> InvalidCheck[Int]:
+	pure func(x: Int) -> Option[Invalid]:
+		if x > n:
+			Some(PredicateErr("max_val", "must be at most " + n.to_string()))
+		else:
+			opt: Option[Invalid] = None
+			opt
+
+
+---
+Check that an integer is within [lo, hi] inclusive.
+---
+pure func in_range(lo: Int, hi: Int) -> InvalidCheck[Int]:
+	pure func(x: Int) -> Option[Invalid]:
+		if x < lo or x > hi:
+			Some(
+				PredicateErr(
+					"in_range",
+					"must be between " + lo.to_string() + " and " + hi.to_string(),
+				),
+			)
+		else:
+			opt: Option[Invalid] = None
+			opt
+
+
+-- ============================================================================
+-- Composition
+-- ============================================================================
+---
+Build a check from a predicate function.
+Returns None when pred returns true, PredicateErr otherwise.
+---
+pure func check[T](code: String, message: String, pred: pure (T) -> Bool) -> InvalidCheck[T]:
+	pure func(value: T) -> Option[Invalid]:
+		if pred(value):
+			opt: Option[Invalid] = None
+			opt
+		else:
+			Some(PredicateErr(code, message))
+
+
+-- ============================================================================
+-- Error Formatting
+-- ============================================================================
+---
+Format an Invalid error tree as a human-readable string.
+Path is computed by walking the tree structure.
+
+doctests:
+    :: Simple predicate error
+    format_error(PredicateErr("non_empty", "must not be empty")) == "must not be empty"
+
+    :: Nested error includes path
+    format_error(GroupErrs("name", [PredicateErr("min_len", "must be at least 3 characters")])) == "name: must be at least 3 characters"
+---
+pure func format_error(err: Invalid) -> String:
+	format_at(err, "")
+
+
+private pure func format_at(err: Invalid, path: String) -> String:
+	match err:
+		TypeErr(expected, got):
+			with_path(path, "expected " + expected + ", got " + got)
+		PredicateErr(code, message):
+			with_path(path, message)
+		MissingKey(key):
+			with_path(path, "missing required key: " + key)
+		ExtraKeys(keys):
+			var s: String = ""
+			var i: Int = 0
+			for k in keys:
+				if i > 0:
+					s = s + ", " + k
+				else:
+					s = k
+				i += 1
+			with_path(path, "unexpected keys: " + s)
+		CoercionErr(from_type, to_type):
+			with_path(path, "cannot convert " + from_type + " to " + to_type)
+		KeyErrs(key_pairs):
+			var key_parts: List[String] = []
+			for kp in key_pairs:
+				k: String = kp.0
+				kerr: Invalid = kp.1
+				kpath: String = join_path(path, k)
+				key_parts = key_parts.append(format_at(kerr, kpath))
+			join_lines(key_parts)
+		IndexErrs(idx_pairs):
+			var idx_parts: List[String] = []
+			for ip in idx_pairs:
+				idx: Int = ip.0
+				ierr: Invalid = ip.1
+				ipath: String = join_path(path, "[" + idx.to_string() + "]")
+				idx_parts = idx_parts.append(format_at(ierr, ipath))
+			join_lines(idx_parts)
+		UnionErrs(alts):
+			alt_count: Int = alts.length()
+			count: String = alt_count.to_string()
+			with_path(path, "none of " + count + " alternatives matched")
+		GroupErrs(name, children):
+			gpath: String = join_path(path, name)
+			var gparts: List[String] = []
+			for ch in children:
+				gparts = gparts.append(format_at(ch, gpath))
+			join_lines(gparts)
+
+
+private pure func with_path(path: String, message: String) -> String:
+	if path.length() == 0:
+		message
+	else:
+		path + ": " + message
+
+
+private pure func join_path(parent: String, child: String) -> String:
+	if parent.length() == 0:
+		child
+	else if child.length() == 0:
+		parent
+	else if child.starts_with("["):
+		parent + child
+	else:
+		parent + "." + child
+
+
+private pure func join_lines(parts: List[String]) -> String:
+	var result: String = ""
+	var i: Int = 0
+	for p in parts:
+		if i > 0:
+			result = result + "\n" + p
+		else:
+			result = p
+		i += 1
+	result

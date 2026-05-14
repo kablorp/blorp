@@ -1,0 +1,422 @@
+#!/bin/bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+clean_build=1
+run_quality=1
+run_sanitize=1
+run_docker="auto"
+docker_clean=0
+docker_platform="linux/amd64"
+check_examples=1
+run_examples=1
+run_preview_smoke=1
+run_security=1
+dry_run=0
+test_timeout="${BLORP_TEST_TIMEOUT:-30}"
+example_timeout=10
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/full-gate [options]
+
+Run the local pre-merge validation gate. This composes the existing build,
+quality, test, example, sanitizer, Docker, and lightweight security checks.
+
+Defaults:
+  - clean build
+  - make quality-full
+  - scripts/run_tests.sh
+  - focused preview CLI/runtime smoke
+  - check all examples/
+  - run curated fast examples
+  - make test-asan
+  - run Docker gate if Docker is available
+  - run lightweight secret-pattern scan
+
+Options:
+  --quick              Skip clean build, sanitizer, Docker, and example runs.
+  --no-clean           Do not run make clean before make.
+  --no-quality         Skip make quality-full.
+  --no-sanitize        Skip make test-asan.
+  --no-docker          Skip Docker validation.
+  --require-docker     Fail if Docker is unavailable.
+  --docker-clean       Use scripts/docker-test --clean.
+  --docker-platform P  Docker platform (default: linux/amd64).
+  --no-examples-check  Skip ./blorp check examples/.
+  --no-examples-run    Skip running curated examples.
+  --no-preview-smoke   Skip focused preview CLI/runtime smoke.
+  --no-security        Skip lightweight security scan.
+  --timeout N          Runtime test timeout in seconds (default: BLORP_TEST_TIMEOUT or 30).
+  --example-timeout N  Example run timeout in seconds (default: 10).
+  --dry-run            Print commands without running them.
+  -h, --help           Show this help.
+
+Examples:
+  scripts/full-gate
+  scripts/full-gate --quick
+  scripts/full-gate --no-docker --no-sanitize
+  scripts/full-gate --require-docker --docker-clean
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --quick)
+            clean_build=0
+            run_sanitize=0
+            run_docker=0
+            run_examples=0
+            run_preview_smoke=0
+            shift
+            ;;
+        --no-clean)
+            clean_build=0
+            shift
+            ;;
+        --no-quality)
+            run_quality=0
+            shift
+            ;;
+        --no-sanitize)
+            run_sanitize=0
+            shift
+            ;;
+        --no-docker)
+            run_docker=0
+            shift
+            ;;
+        --require-docker)
+            run_docker="require"
+            shift
+            ;;
+        --docker-clean)
+            docker_clean=1
+            shift
+            ;;
+        --docker-platform)
+            docker_platform="$2"
+            shift 2
+            ;;
+        --no-examples-check)
+            check_examples=0
+            shift
+            ;;
+        --no-examples-run)
+            run_examples=0
+            shift
+            ;;
+        --no-preview-smoke)
+            run_preview_smoke=0
+            shift
+            ;;
+        --no-security)
+            run_security=0
+            shift
+            ;;
+        --timeout)
+            test_timeout="$2"
+            shift 2
+            ;;
+        --example-timeout)
+            example_timeout="$2"
+            shift 2
+            ;;
+        --dry-run)
+            dry_run=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+step_count=0
+gate_start=$(date +%s)
+
+print_header() {
+    step_count=$((step_count + 1))
+    echo ""
+    echo "[$step_count] $1"
+    echo "----------------------------------------"
+}
+
+elapsed_since() {
+    local started="$1"
+    local now
+    now=$(date +%s)
+    echo "$((now - started))s"
+}
+
+quote_cmd() {
+    local part
+    for part in "$@"; do
+        printf "%q " "$part"
+    done
+}
+
+run_cmd() {
+    printf '+ '
+    quote_cmd "$@"
+    echo ""
+    if [ "$dry_run" -eq 1 ]; then
+        return 0
+    fi
+    "$@"
+}
+
+run_step_fn() {
+    local name="$1"
+    shift
+    local started
+    print_header "$name"
+    started=$(date +%s)
+    "$@"
+    echo "Completed in $(elapsed_since "$started")."
+}
+
+fail_if_unmerged() {
+    local unmerged
+    unmerged=$(git diff --name-only --diff-filter=U)
+    if [ -n "$unmerged" ]; then
+        echo "Unmerged files remain:" >&2
+        echo "$unmerged" >&2
+        return 1
+    fi
+}
+
+run_clean_build() {
+    if [ "$clean_build" -eq 1 ]; then
+        run_cmd make clean
+    fi
+    run_cmd make
+}
+
+run_quality_gate() {
+    if [ "$run_quality" -eq 0 ]; then
+        echo "Skipping quality gate."
+        return 0
+    fi
+    run_cmd make quality-full
+}
+
+run_test_suites() {
+    run_cmd env "BLORP_TEST_TIMEOUT=$test_timeout" scripts/run_tests.sh
+}
+
+run_preview_repl_smoke() {
+    local output_file="$1"
+    printf '+ printf %q | ./blorp repl > %q\n' ':quit\n' "$output_file"
+    if [ "$dry_run" -eq 1 ]; then
+        return 0
+    fi
+    printf ':quit\n' | ./blorp repl > "$output_file"
+}
+
+run_preview_lsp_smoke() {
+    local output_file="$1"
+    printf '+ ./blorp lsp < /dev/null > %q\n' "$output_file"
+    if [ "$dry_run" -eq 1 ]; then
+        return 0
+    fi
+    ./blorp lsp < /dev/null > "$output_file"
+}
+
+run_preview_smoke_gate() {
+    local tmpdir smoke tmpc repl_out lsp_out
+    if [ "$run_preview_smoke" -eq 0 ]; then
+        echo "Skipping preview smoke."
+        return 0
+    fi
+
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-preview.XXXXXX")
+    smoke="$tmpdir/preview.brp"
+    tmpc="$tmpdir/preview.c"
+    repl_out="$tmpdir/repl.out"
+    lsp_out="$tmpdir/lsp.out"
+
+    cat > "$smoke" <<'BRP'
+func main(args: List[String]) -> Int:
+	println("preview smoke")
+	0
+BRP
+
+    run_cmd ./blorp check --no-format "$smoke"
+    run_cmd ./blorp compile --no-format -o "$tmpc" "$smoke"
+    run_cmd ./blorp run --timeout 5 --no-format "$smoke"
+    run_cmd ./blorp test --no-cache --timeout 5 tests/test_blorp/types/test_bool.brp
+    run_cmd ./blorp test --leak-check --suite --timeout 5 \
+        tests/test_blorp/memory/leak_check_baselines/empty_main.brp
+
+    if [ "$run_sanitize" -eq 1 ]; then
+        run_cmd ./blorp test --sanitize --timeout 5 tests/test_blorp/types/test_bool.brp
+    else
+        echo "Skipping preview sanitizer smoke."
+    fi
+
+    run_preview_repl_smoke "$repl_out"
+    run_preview_lsp_smoke "$lsp_out"
+    rm -rf "$tmpdir"
+}
+
+run_example_checks() {
+    if [ "$check_examples" -eq 0 ]; then
+        echo "Skipping example checks."
+        return 0
+    fi
+    run_cmd ./blorp check --no-format examples/
+}
+
+run_example_smokes() {
+    local example
+    if [ "$run_examples" -eq 0 ]; then
+        echo "Skipping example runs."
+        return 0
+    fi
+
+    for example in \
+        examples/hello.brp \
+        examples/welcome.brp \
+        examples/vector_bounds.brp \
+        examples/matrix_bounds.brp \
+        examples/tensor_bounds.brp \
+        examples/square_roots.brp \
+        examples/debug.brp
+    do
+        run_cmd ./blorp run --timeout "$example_timeout" --no-format "$example"
+    done
+}
+
+run_sanitizer_gate() {
+    if [ "$run_sanitize" -eq 0 ]; then
+        echo "Skipping sanitizer gate."
+        return 0
+    fi
+    run_cmd make test-asan
+}
+
+run_docker_gate() {
+    local args
+    if [ "$run_docker" = "0" ]; then
+        echo "Skipping Docker gate."
+        return 0
+    fi
+
+    args=(scripts/docker-test --platform "$docker_platform")
+    if [ "$docker_clean" -eq 1 ]; then
+        args+=(--clean)
+    fi
+
+    if [ "$dry_run" -eq 1 ]; then
+        run_cmd "${args[@]}"
+        return 0
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        if [ "$run_docker" = "require" ]; then
+            echo "Docker is required but was not found in PATH." >&2
+            return 1
+        fi
+        echo "Docker not found; skipping Docker gate. Use --require-docker to make this a hard failure."
+        return 0
+    fi
+
+    if ! docker info >/dev/null 2>&1; then
+        if [ "$run_docker" = "require" ]; then
+            echo "Docker is required but the Docker daemon is unavailable." >&2
+            return 1
+        fi
+        echo "Docker daemon unavailable; skipping Docker gate. Use --require-docker to make this a hard failure."
+        return 0
+    fi
+
+    run_cmd "${args[@]}"
+}
+
+run_security_scan() {
+    local matches
+    local status
+    local secret_patterns
+    local grep_args
+    if [ "$run_security" -eq 0 ]; then
+        echo "Skipping security scan."
+        return 0
+    fi
+
+    secret_patterns='AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{36,255}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|sk_live_[A-Za-z0-9]{20,}|-----BEGIN ((RSA|DSA|EC|OPENSSH|PGP) )?PRIVATE KEY-----'
+    grep_args=(
+        git grep -nI -E "$secret_patterns" --
+        .
+        ':(exclude)compiler/_build'
+        ':(exclude)_build'
+        ':(exclude).git'
+    )
+
+    if [ "$dry_run" -eq 1 ]; then
+        run_cmd "${grep_args[@]}"
+        return 0
+    fi
+
+    set +e
+    matches=$("${grep_args[@]}" 2>&1)
+    status=$?
+    set -e
+
+    if [ "$status" -gt 1 ]; then
+        echo "Security scan failed:" >&2
+        echo "$matches" >&2
+        return "$status"
+    fi
+
+    if [ "$status" -eq 1 ]; then
+        matches=""
+    fi
+
+    if [ -n "$matches" ]; then
+        echo "Potential secret material found:" >&2
+        echo "$matches" >&2
+        return 1
+    fi
+
+    echo "No high-confidence secret patterns found."
+}
+
+run_drift_checks() {
+    run_cmd git diff --check
+    run_cmd git diff --check --cached
+    run_cmd make hygiene-check
+
+    if [ "$dry_run" -eq 1 ]; then
+        run_cmd git diff --quiet -- compiler/lib/embedded_std.ml
+        return 0
+    fi
+
+    if ! git diff --quiet -- compiler/lib/embedded_std.ml; then
+        echo "compiler/lib/embedded_std.ml changed after make; embedded std is stale." >&2
+        echo "Run make and include the generated update if std/ changed." >&2
+        return 1
+    fi
+}
+
+run_step_fn "Preflight" fail_if_unmerged
+run_step_fn "Build" run_clean_build
+run_step_fn "Quality" run_quality_gate
+run_step_fn "Tests" run_test_suites
+run_step_fn "Preview smoke" run_preview_smoke_gate
+run_step_fn "Example checks" run_example_checks
+run_step_fn "Example smoke runs" run_example_smokes
+run_step_fn "Sanitizers" run_sanitizer_gate
+run_step_fn "Docker" run_docker_gate
+run_step_fn "Security scan" run_security_scan
+run_step_fn "Drift and hygiene" run_drift_checks
+
+echo ""
+echo "Full gate passed in $(elapsed_since "$gate_start")."

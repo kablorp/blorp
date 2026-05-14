@@ -1,0 +1,179 @@
+-- Codec Bridge — Convert format-specific values to universal codec.Value
+--
+-- Bridges between JSON, TOML, CSV and the codec serialization framework.
+-- Import this module to use codec.Decoder[T] with parsed JSON/TOML/CSV data.
+--
+-- Typical use: import the conversion functions you need from `codec_bridge`.
+import:
+	codec: Value(VBool, VFloat, VInt, VList, VNull, VRecord, VString)
+	json: JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector)
+	toml: TomlValue(TomlArray, TomlBool, TomlFloat, TomlInt, TomlString, TomlTable)
+
+
+-- ============================================================================
+-- JSON -> Value
+-- ============================================================================
+---
+Convert a JsonValue to a universal codec Value.
+
+doctests:
+    :: Null converts
+    match JsonNull.json_to_value():
+        VNull: True
+        _: False
+
+    :: String converts
+    match JsonString("hi").json_to_value():
+        VString(s): s == "hi"
+        _: False
+---
+pure func json_to_value(json: JsonValue) -> Value:
+	match json:
+		JsonNull: VNull
+		JsonBool(b): VBool(b)
+		JsonNumber(n): VFloat(n)
+		JsonString(s): VString(s)
+		JsonVector(items):
+			var result: List[Value] = []
+			var i: Int = 0
+			while i < items.length():
+				match items.get(i):
+					Some(item): result = result.append(item.json_to_value())
+					None: void
+				i += 1
+			VList(result)
+		JsonObject(pairs):
+			var result: List[(String, Value)] = []
+			var i: Int = 0
+			while i < pairs.length():
+				match pairs.get(i):
+					Some(pair): result = result.append((pair.0, pair.1.json_to_value()))
+					None: void
+				i += 1
+			VRecord(result)
+
+
+-- ============================================================================
+-- TOML -> Value
+-- ============================================================================
+---
+Convert a TomlValue to a universal codec Value.
+
+doctests:
+    :: Int converts
+    match TomlInt(42).toml_to_value():
+        VInt(n): n == 42
+        _: False
+
+    :: String converts
+    match TomlString("hi").toml_to_value():
+        VString(s): s == "hi"
+        _: False
+---
+pure func toml_to_value(toml: TomlValue) -> Value:
+	match toml:
+		TomlString(s): VString(s)
+		TomlInt(n): VInt(n)
+		TomlFloat(f): VFloat(f)
+		TomlBool(b): VBool(b)
+		TomlArray(items):
+			var result: List[Value] = []
+			var i: Int = 0
+			while i < items.length():
+				match items.get(i):
+					Some(item): result = result.append(item.toml_to_value())
+					None: void
+				i += 1
+			VList(result)
+		TomlTable(dict):
+			pairs: List[(String, TomlValue)] = dict.entries()
+			var result: List[(String, Value)] = []
+			var i: Int = 0
+			while i < pairs.length():
+				match pairs.get(i):
+					Some(pair): result = result.append((pair.0, pair.1.toml_to_value()))
+					None: void
+				i += 1
+			VRecord(result)
+
+
+-- ============================================================================
+-- CSV -> Value
+-- ============================================================================
+---
+Convert a CSV row to a universal codec Value using headers as field names.
+All values become VString — use codec decoders (d_int, d_float) for type coercion.
+
+doctests:
+    :: Row converts
+    v: Value = csv_row_to_value(["name", "age"], ["Alice", "30"])
+    match v:
+        VRecord(pairs): pairs.length() == 2
+        _: False
+---
+pure func csv_row_to_value(headers: List[String], row: List[String]) -> Value:
+	var pairs: List[(String, Value)] = []
+	var i: Int = 0
+	while i < headers.length():
+		match (headers.get(i), row.get(i)):
+			(Some(h), Some(v)): pairs = pairs.append((h, VString(v)))
+			_: void
+		i += 1
+	VRecord(pairs)
+
+
+-- ============================================================================
+-- Value -> JSON
+-- ============================================================================
+---
+Convert a universal codec Value to a JsonValue. Inverse of [json_to_value].
+
+VInt is widened to JsonNumber(Float) because JsonValue only carries one
+numeric variant; large integers may lose precision. All other variants
+round-trip losslessly.
+
+Use this when you need JSON output from a codec Value. JsonValue's Stringable
+implementation handles common escapes; codec's own value_to_string is a debug
+format.
+
+doctests:
+    :: Null round-trips
+    match VNull.value_to_json():
+        JsonNull: True
+        _: False
+
+    :: String round-trips
+    match VString("hi").value_to_json():
+        JsonString(s): s == "hi"
+        _: False
+
+    :: Int widens to Number
+    match VInt(42).value_to_json():
+        JsonNumber(n): n > 41.9 and n < 42.1
+        _: False
+---
+pure func value_to_json(v: Value) -> JsonValue:
+	match v:
+		VNull: JsonNull
+		VBool(b): JsonBool(b)
+		VInt(n): JsonNumber(to_float(n))
+		VFloat(f): JsonNumber(f)
+		VString(s): JsonString(s)
+		VList(items):
+			var result: List[JsonValue] = []
+			var i: Int = 0
+			while i < items.length():
+				match items.get(i):
+					Some(item): result = result.append(item.value_to_json())
+					None: void
+				i += 1
+			JsonVector(result)
+		VRecord(pairs):
+			var result: List[(String, JsonValue)] = []
+			var i: Int = 0
+			while i < pairs.length():
+				match pairs.get(i):
+					Some(pair): result = result.append((pair.0, pair.1.value_to_json()))
+					None: void
+				i += 1
+			JsonObject(result)

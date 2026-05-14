@@ -1,0 +1,117 @@
+-- Test for race conditions in the particle_sim pattern:
+-- shared vectors read by parallel map while main thread mutates between frames.
+import:
+	list as L
+	test: TestSuite
+	vector: map_indexed_parallel
+
+
+N: Int = 3000
+
+
+pure func compute_accel(i: Int, alive_val: Float) -> (Float, Float, Float):
+	if alive_val > 0.5:
+		x: Float = to_float(i) * 0.01
+		dist_sq: Float = x * x + 0.01
+		f: Float = 1.0 / dist_sq
+		(x * f, x * f * 0.5, 0.0)
+	else:
+		(0.0, 0.0, 0.0)
+
+
+-- Full particle_sim loop pattern at N=3000
+func test_full_sim_pattern_3000() -> Bool:
+	var px: Float[#3000] = vector(0.0, N)
+	var py: Float[#3000] = vector(0.0, N)
+	var vx: Float[#3000] = vector(0.0, N)
+	var vy: Float[#3000] = vector(0.0, N)
+	var alive: Float[#3000] = vector(1.0, N)
+	for i in 0..length(px):
+		px[i] = to_float(i) * 0.5
+		py[i] = to_float(i) * 0.3
+		vx[i] = to_float(i % 10) * 0.01
+		vy[i] = to_float(i % 7) * 0.01
+	var errors: Int = 0
+	var frame: Int = 0
+	while frame < 100:
+		-- 1. Parallel gravity computation (reads alive, computes tuples)
+		grav: (Float, Float, Float)[#3000] = map_indexed_parallel(alive, compute_accel)
+
+		-- 2. Apply gravity results back to velocity vectors
+		for j in 0..length(grav):
+			t: (Float, Float, Float) = grav[j]
+			vx[j] = vx[j] + t.0 * 0.016
+			vy[j] = vy[j] + t.1 * 0.016
+
+		-- 3. Update positions (vector arithmetic creates temp vectors)
+		px += vx * 0.016
+		py += vy * 0.016
+
+		-- 4. Compute speeds (map + vector arithmetic)
+		speed_sq: Float[#3000] = vx * vx + vy * vy
+
+		-- 5. Build draw list (append tuples to list, then sort)
+		var draw_list: List[(Int, Float)] = []
+		for dli in 0..length(alive):
+			if alive[dli] > 0.5:
+				depth: Float = px[dli] + 500.0
+				if depth > 1.0:
+					draw_list = L.append(draw_list, (dli, depth))
+		draw_list = L.sort_by(draw_list, func(item: (Int, Float)): -item.1)
+
+		-- 6. Iterate draw list (like rendering)
+		for item in draw_list:
+			idx: Int = item.0
+			_ = item.1
+
+			-- Access velocity/position by index
+			_ = to_float(idx)
+
+		-- 7. String formatting (simulates HUD)
+		label: String = "Frame: " + frame.to_string() + " objects: " + N.to_string()
+		_ = label.length()
+		frame += 1
+
+	-- Verify no NaN corruption
+	for i in 0..length(px):
+		if px[i] != px[i] or py[i] != py[i]:
+			errors += 1
+	print("errors: " + errors.to_string())
+	errors == 0
+
+
+-- Repeat the same pattern many times to expose intermittent races
+func test_repeated_sim_pattern() -> Bool:
+	var px: Float[#1000] = vector(0.0, 1000)
+	var vx: Float[#1000] = vector(0.1, 1000)
+	var alive: Float[#1000] = vector(1.0, 1000)
+	for i in 0..length(px):
+		px[i] = to_float(i) * 0.5
+	var errors: Int = 0
+	var frame: Int = 0
+	while frame < 1000:
+		grav: (Float, Float, Float)[#1000] = map_indexed_parallel(alive, compute_accel)
+		for j in 0..length(grav):
+			t: (Float, Float, Float) = grav[j]
+			vx[j] = vx[j] + t.0 * 0.016
+		px += vx * 0.016
+		var draw_list: List[(Int, Float)] = []
+		for dli in 0..100:
+			draw_list = L.append(draw_list, (dli, px[dli]))
+		draw_list = L.sort_by(draw_list, func(item: (Int, Float)): -item.1)
+		for item in draw_list:
+			_ = item.0
+		frame += 1
+	for i in 0..length(px):
+		if px[i] != px[i]:
+			errors += 1
+	errors == 0
+
+
+tests: TestSuite = {
+	description = "Parallel Race Conditions",
+	tests = [
+		("full sim pattern 3000", test_full_sim_pattern_3000),
+		("repeated sim pattern", test_repeated_sim_pattern),
+	],
+}

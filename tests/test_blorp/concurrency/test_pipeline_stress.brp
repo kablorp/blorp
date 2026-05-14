@@ -1,0 +1,166 @@
+-- Integration test: concurrent pipeline stress test.
+-- Tests ARC, channels, COW, fibers, backpressure, and graceful shutdown.
+-- Uses cascading channel closes instead of sleeps for deterministic shutdown.
+import:
+	dict as D
+	list as L
+	string: parse_int, split
+	test: TestSuite
+
+
+-- ============================================================================
+-- Types
+-- ============================================================================
+record Event {source: String, kind: String, value: Int}
+
+
+record Stats {total_events: Int, by_source: Dict[String, Int], sum_values: Int}
+
+
+pure func empty_stats() -> Stats:
+	{total_events = 0, by_source = D.dict(), sum_values = 0}
+
+
+pure func add_event(stats: Stats, event: Event) -> Stats:
+	new_src: Dict[String, Int] = D.set(
+		stats.by_source,
+		event.source,
+		D.get_or(stats.by_source, event.source, 0) + 1,
+	)
+	{
+		total_events = stats.total_events + 1,
+		by_source = new_src,
+		sum_values = stats.sum_values + event.value,
+	}
+
+
+-- Simple PRNG
+pure func prng(seed: Int) -> Int:
+	(seed * 1103515245 + 12345) / 65536 % 32768
+
+
+-- ============================================================================
+-- Pipeline stages
+-- ============================================================================
+-- Generator: sends "source|kind|value" strings, then signals done
+func generator(
+	id: Int,
+	out: Channel[String],
+	count: Int,
+	done: Channel[Int],
+) -> Void:
+	source: String = "gen_" + id.to_string()
+	var seed: Int = id * 97 + 31
+	var i: Int = 0
+	while i < count:
+		seed = prng(seed)
+		val: Int = seed % 1000
+		msg: String = source + "|click|" + val.to_string()
+		_ = send(out, msg)
+		i += 1
+	_ = send(done, 1)
+
+
+-- Parser: reads strings, parses to Events, then closes output channel
+func parser(input: Channel[String], out: Channel[Event]) -> Void:
+	for msg in input:
+		parts: List[String] = msg.split("|")
+		if L.length(parts) >= 3:
+			src: String = match L.get(parts, 0):
+				Some(s): s
+				None: ""
+			kind: String = match L.get(parts, 1):
+				Some(s): s
+				None: ""
+			val_str: String = match L.get(parts, 2):
+				Some(s): s
+				None: "0"
+			val: Int = match parse_int(val_str):
+				Some(n): n
+				None: 0
+			_ = send(out, {source = src, kind = kind, value = val})
+	close(out)
+
+
+-- Aggregator: reads events, builds stats, sends final stats, then closes output
+func aggregator(input: Channel[Event], out: Channel[Stats]) -> Void:
+	var stats: Stats = empty_stats()
+	for event in input:
+		stats = add_event(stats, event)
+	_ = send(out, stats)
+	close(out)
+
+
+-- ============================================================================
+-- Pipeline helper
+-- ============================================================================
+-- Run a complete pipeline and return the aggregated stats.
+-- Deterministic shutdown via cascading closes (no sleeps):
+-- generators finish → main closes raw_ch → parser drains & closes event_ch
+-- → aggregator drains & closes stats_ch → main receives stats
+func run_pipeline(num_generators: Int, events_per_gen: Int, ch_capacity: Int) -> Option[Stats]:
+	raw_ch: Channel[String] = channel(ch_capacity)
+	event_ch: Channel[Event] = channel(ch_capacity)
+	stats_ch: Channel[Stats] = channel(1)
+	done_ch: Channel[Int] = channel(num_generators)
+	detach aggregator(event_ch, stats_ch)
+	detach parser(raw_ch, event_ch)
+	var gi: Int = 0
+	while gi < num_generators:
+		detach generator(gi, raw_ch, events_per_gen, done_ch)
+		gi += 1
+
+	-- Wait for all generators to complete (blocking recv, no sleep)
+	var done_count: Int = 0
+	while done_count < num_generators:
+		match recv(done_ch):
+			Some(_): done_count += 1
+			None: void
+	close(raw_ch)
+
+	-- Cascade: parser → event_ch close → aggregator → stats_ch close
+	recv(stats_ch)
+
+
+-- ============================================================================
+-- Tests
+-- ============================================================================
+-- Full pipeline: 4 generators x 200 events → parser → aggregator
+func test_pipeline_correctness() -> Bool:
+	match run_pipeline(4, 200, 64):
+		Some(stats): stats.total_events == 800
+		None: False
+
+
+-- Backpressure: tiny channels (capacity 2) still deliver all events
+func test_backpressure() -> Bool:
+	match run_pipeline(2, 100, 2):
+		Some(stats): stats.total_events == 200
+		None: False
+
+
+-- COW Dict under concurrent updates: 8 generators → 8 distinct source keys
+func test_dict_cow_stress() -> Bool:
+	match run_pipeline(8, 100, 32):
+		Some(stats):
+			D.length(stats.by_source) == 8 and stats.total_events == 800
+		None: False
+
+
+-- Verify pure helper functions work correctly
+pure func test_add_event_pure() -> Bool:
+	s: Stats = empty_stats()
+	e: Event = {source = "test", kind = "click", value = 42}
+	s2: Stats = add_event(s, e)
+	s2.total_events == 1 and s2.sum_values == 42
+
+
+tests: TestSuite = {
+	description = "Pipeline Stress",
+	tests = [
+		("pipeline correctness", test_pipeline_correctness),
+		("backpressure", test_backpressure),
+		("dict cow stress", test_dict_cow_stress),
+		("add_event pure", test_add_event_pure),
+	],
+}

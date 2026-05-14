@@ -1,0 +1,834 @@
+-- YAML — Parser and encoder for a practical YAML subset
+--
+-- Parses YAML directly into codec.Value (no intermediate type).
+-- Supports: plain/quoted scalars, block/flow sequences and mappings, comments, and YAML
+-- 1.2-style bool/null/int/float/string classification.
+-- Block sequence items may place nested values on the following indented line.
+-- Does not support: anchors/aliases, tags, directives, multi-document streams,
+-- block scalar indicators, unknown double-quoted escape sequences.
+-- encode emits the supported subset; parse(encode(v)) round-trips supported
+-- codec.Value shapes.
+--
+-- Typical use: import `parse` and `encode` from `yaml`.
+-- match parse("name: Alice\nage: 30"):
+-- Ok(v): ...   -- v is a codec.Value (VRecord)
+-- Err(e): ...  -- e is a YamlError
+import:
+	codec: Value(VBool, VFloat, VInt, VList, VNull, VRecord, VString)
+	string: string
+
+
+-- ============================================================================
+-- Error Type
+-- ============================================================================
+record YamlError {line: Int, column: Int, message: String}
+
+
+pure func format_error(err: YamlError) -> String:
+	"line " + err.line.to_string() + ", col " + err.column.to_string() + ": " + err.message
+
+
+-- ============================================================================
+-- Parser State
+-- ============================================================================
+private record PS {input: String, pos: Int, line: Int, col: Int}
+
+
+private pure func make_ps(input: String) -> PS:
+	{input = input, pos = 0, line = 1, col = 1}
+
+
+private pure func peek(s: PS) -> Option[Char]:
+	s.input.get(s.pos)
+
+
+private pure func peek_at(s: PS, offset: Int) -> Option[Char]:
+	s.input.get(s.pos + offset)
+
+
+private pure func at_end(s: PS) -> Bool:
+	s.pos >= s.input.length()
+
+
+private pure func starts_at(s: PS, prefix: String) -> Bool:
+	plen: Int = prefix.length()
+	if s.pos + plen > s.input.length():
+		False
+	else:
+		s.input.substring(s.pos, plen) == prefix
+
+
+private pure func advance(s: PS) -> PS:
+	match peek(s):
+		Some('\n'): {input = s.input, pos = s.pos + 1, line = s.line + 1, col = 1}
+		Some(_): {input = s.input, pos = s.pos + 1, line = s.line, col = s.col + 1}
+		None: s
+
+
+private pure func err(s: PS, msg: String) -> YamlError:
+	{line = s.line, column = s.col, message = msg}
+
+
+-- ============================================================================
+-- Character Helpers
+-- ============================================================================
+private pure func is_ws(c: Char) -> Bool:
+	c == ' ' or c == '\t'
+
+
+private pure func is_newline(c: Char) -> Bool:
+	c == '\n' or c == '\r'
+
+
+private pure func is_flow_indicator(c: Char) -> Bool:
+	c == ',' or c == '[' or c == ']' or c == '{' or c == '}'
+
+
+-- ============================================================================
+-- Whitespace and Comments
+-- ============================================================================
+private pure func skip_spaces(s: PS) -> PS:
+	var st: PS = s
+	var done: Bool = False
+	while not done:
+		match peek(st):
+			Some(c):
+				if is_ws(c):
+					st = advance(st)
+				else:
+					done = True
+			None: done = True
+	st
+
+
+private pure func skip_comment(s: PS) -> PS:
+	match peek(s):
+		Some('#'):
+			var st: PS = s
+			var done: Bool = False
+			while not done:
+				match peek(st):
+					Some(c):
+						if is_newline(c):
+							done = True
+						else:
+							st = advance(st)
+					None: done = True
+			st
+		_: s
+
+
+private pure func skip_blanks(s: PS) -> PS:
+	var st: PS = skip_spaces(s)
+	st = skip_comment(st)
+	st
+
+
+private pure func skip_blank_lines(s: PS) -> PS:
+	var st: PS = s
+	var done: Bool = False
+	while not done:
+		st = skip_spaces(st)
+		match peek(st):
+			Some('#'):
+				st = skip_comment(st)
+				match peek(st):
+					Some(c):
+						if is_newline(c):
+							st = advance(st)
+						else:
+							done = True
+					None: done = True
+			Some('\n'):
+				st = advance(st)
+			Some('\r'):
+				st = advance(st)
+			_: done = True
+	st
+
+
+-- ============================================================================
+-- Scalar Classification
+-- ============================================================================
+private pure func classify_scalar(s: String) -> Value:
+	trimmed: String = s.trim()
+	if trimmed == "null" or trimmed == "~" or trimmed == "":
+		VNull
+	else if trimmed == "true" or trimmed == "True" or trimmed == "TRUE":
+		VBool(True)
+	else if trimmed == "false" or trimmed == "False" or trimmed == "FALSE":
+		VBool(False)
+	else:
+		match trimmed.parse_int():
+			Some(n): VInt(n)
+			None:
+				match trimmed.parse_float():
+					Some(f): VFloat(f)
+					None: VString(trimmed)
+
+
+-- ============================================================================
+-- String Parsing
+-- ============================================================================
+private pure func parse_double_quoted(s: PS) -> Result[(Value, PS), YamlError]:
+	-- Skip opening "
+	var st: PS = advance(s)
+	var buf: String = string(32)
+	var done: Bool = False
+	var has_error: Bool = False
+	var error_msg: String = ""
+	var error_state: PS = s
+	while not done and not has_error:
+		match peek(st):
+			Some('\"'):
+				done = True
+				st = advance(st)
+			Some('\\'):
+				st = advance(st)
+				match peek(st):
+					Some('n'): buf = buf.append_char('\n')
+					Some('t'): buf = buf.append_char('\t')
+					Some('\\'): buf = buf.append_char('\\')
+					Some('\"'): buf = buf.append_char('\"')
+					Some('/'): buf = buf.append_char('/')
+					Some(c2):
+						has_error = True
+						error_msg = "invalid escape sequence"
+						error_state = st
+					None:
+						has_error = True
+						error_msg = "unexpected end in escape"
+						error_state = st
+				st = advance(st)
+			Some(c):
+				buf = buf.append_char(c)
+				st = advance(st)
+			None:
+				has_error = True
+				error_msg = "unterminated double-quoted string"
+				error_state = st
+	if has_error:
+		Err(err(error_state, error_msg))
+	else:
+		Ok((VString(buf), st))
+
+
+private pure func parse_single_quoted(s: PS) -> Result[(Value, PS), YamlError]:
+	-- Skip opening '
+	var st: PS = advance(s)
+	var buf: String = string(32)
+	var done: Bool = False
+	var has_error: Bool = False
+	while not done and not has_error:
+		match peek(st):
+			Some('\''):
+				-- Check for escaped ''
+				match peek_at(st, 1):
+					Some('\''):
+						buf = buf.append_char('\'')
+						st = advance(advance(st))
+					_:
+						done = True
+						st = advance(st)
+			Some(c):
+				buf = buf.append_char(c)
+				st = advance(st)
+			None:
+				has_error = True
+	if has_error:
+		Err(err(s, "unterminated single-quoted string"))
+	else:
+		Ok((VString(buf), st))
+
+
+-- ============================================================================
+-- Plain Scalar (unquoted)
+-- ============================================================================
+private pure func parse_plain_scalar(s: PS, in_flow: Bool) -> (String, PS):
+	var st: PS = s
+	var buf: String = string(32)
+	var done: Bool = False
+	while not done:
+		match peek(st):
+			Some(c):
+				if is_newline(c):
+					done = True
+				else if c == '#':
+					match peek_at(st, -1):
+						Some(prev):
+							-- Comment: only if preceded by space
+							if is_ws(prev):
+								done = True
+							else:
+								buf = buf.append_char(c)
+								st = advance(st)
+						None:
+							done = True
+				else if c == ':':
+					match peek_at(st, 1):
+						Some(next):
+							-- Colon followed by space or end = mapping separator
+							if is_ws(
+								next,
+							) or is_newline(next) or in_flow and is_flow_indicator(next):
+								done = True
+							else:
+								buf = buf.append_char(c)
+								st = advance(st)
+						None:
+							done = True
+				else if in_flow and is_flow_indicator(c):
+					done = True
+				else:
+					buf = buf.append_char(c)
+					st = advance(st)
+			None: done = True
+	(buf.trim(), st)
+
+
+-- ============================================================================
+-- Flow Collections
+-- ============================================================================
+private pure func parse_flow_sequence(s: PS) -> Result[(Value, PS), YamlError]:
+	-- Skip [
+	var st: PS = advance(s)
+	var items: List[Value] = []
+	var done: Bool = False
+	var has_error: Bool = False
+	var error_result: YamlError = err(s, "")
+	st = skip_blank_lines(st)
+
+	-- Check for empty sequence
+	match peek(st):
+		Some(']'):
+			done = True
+			st = advance(st)
+		_: void
+	while not done and not has_error:
+		st = skip_blank_lines(st)
+		match parse_flow_value(st):
+			Ok((val, st2)):
+				items = items.append(val)
+				st = skip_blank_lines(st2)
+				match peek(st):
+					Some(','):
+						st = advance(st)
+					Some(']'):
+						done = True
+						st = advance(st)
+					Some(_):
+						has_error = True
+						error_result = err(st, "expected ',' or ']' in flow sequence")
+					None:
+						has_error = True
+						error_result = err(st, "unterminated flow sequence")
+			Err(e):
+				has_error = True
+				error_result = e
+	if has_error:
+		Err(error_result)
+	else:
+		Ok((VList(items), st))
+
+
+private pure func parse_flow_mapping(s: PS) -> Result[(Value, PS), YamlError]:
+	-- Skip {
+	var st: PS = advance(s)
+	var pairs: List[(String, Value)] = []
+	var done: Bool = False
+	var has_error: Bool = False
+	var error_result: YamlError = err(s, "")
+	st = skip_blank_lines(st)
+
+	-- Check for empty mapping
+	match peek(st):
+		Some('}'):
+			done = True
+			st = advance(st)
+		_: void
+	while not done and not has_error:
+		st = skip_blank_lines(st)
+
+		-- Parse key
+		key_result: (String, PS) = parse_plain_scalar(st, True)
+		key: String = key_result.0
+		st = key_result.1
+		if key.length() == 0:
+			has_error = True
+			error_result = err(st, "expected key in flow mapping")
+		else:
+			st = skip_spaces(st)
+
+			-- Expect colon
+			match peek(st):
+				Some(':'):
+					st = advance(st)
+					st = skip_spaces(st)
+					match parse_flow_value(st):
+						Ok((val, st2)):
+							pairs = pairs.append((key, val))
+							st = skip_blank_lines(st2)
+							match peek(st):
+								Some(','):
+									st = advance(st)
+								Some('}'):
+									done = True
+									st = advance(st)
+								Some(_):
+									has_error = True
+									error_result = err(st, "expected ',' or '}' in flow mapping")
+								None:
+									has_error = True
+									error_result = err(st, "unterminated flow mapping")
+						Err(e):
+							has_error = True
+							error_result = e
+				_:
+					has_error = True
+					error_result = err(st, "expected ':' after key in flow mapping")
+	if has_error:
+		Err(error_result)
+	else:
+		Ok((VRecord(pairs), st))
+
+
+private pure func parse_flow_value(s: PS) -> Result[(Value, PS), YamlError]:
+	st: PS = skip_spaces(s)
+	match peek(st):
+		Some('\"'): parse_double_quoted(st)
+		Some('\''): parse_single_quoted(st)
+		Some('['): parse_flow_sequence(st)
+		Some('{'): parse_flow_mapping(st)
+		Some('&'): Err(err(st, "anchors are not supported"))
+		Some('*'): Err(err(st, "aliases are not supported"))
+		Some('!'): Err(err(st, "tags are not supported"))
+		Some('%'): Err(err(st, "directives are not supported"))
+		Some('|') | Some('>'): Err(err(st, "block scalars are not supported"))
+		Some(']') | Some('}') | Some(',') | Some(':'): Err(err(st, "expected flow value"))
+		Some(_):
+			result: (String, PS) = parse_plain_scalar(st, True)
+			if result.0.length() == 0:
+				Err(err(st, "expected value"))
+			else:
+				Ok((classify_scalar(result.0), result.1))
+		None: Err(err(st, "unexpected end of input"))
+
+
+-- ============================================================================
+-- Block Collections
+-- ============================================================================
+private pure func parse_sequence_line_child(s: PS, indent: Int) -> Result[(Value, PS), YamlError]:
+	st: PS = skip_blank_lines(s)
+	if at_end(st):
+		Ok((VNull, st))
+	else:
+		child_indent: Int = st.col - 1
+		if child_indent > indent:
+			parse_value(st, child_indent)
+		else:
+			Ok((VNull, st))
+
+
+private pure func parse_block_sequence(s: PS, indent: Int) -> Result[(Value, PS), YamlError]:
+	var items: List[Value] = []
+	var st: PS = s
+	var done: Bool = False
+	var has_error: Bool = False
+	var error_result: YamlError = err(s, "")
+	while not done and not has_error:
+		st = skip_blank_lines(st)
+		if at_end(st):
+			done = True
+		else if st.col - 1 < indent:
+			done = True
+		else if st.col - 1 == indent:
+			match peek(st):
+				Some('-'):
+					match peek_at(st, 1):
+						Some(c):
+							if is_ws(c):
+								st = advance(advance(st))
+								st = skip_spaces(st)
+								item_result: Result[(Value, PS), YamlError] = match peek(st):
+									Some('\n') | Some('\r'): parse_sequence_line_child(st, indent)
+									None: Ok((VNull, st))
+									_: parse_value(st, indent + 2)
+								match item_result:
+									Ok((val, st2)):
+										items = items.append(val)
+										st = st2
+									Err(e):
+										has_error = True
+										error_result = e
+							else if is_newline(c):
+								st = advance(st)
+								match parse_sequence_line_child(st, indent):
+									Ok((val, st2)):
+										items = items.append(val)
+										st = st2
+									Err(e):
+										has_error = True
+										error_result = e
+							else:
+								done = True
+						None:
+							-- Bare dash at end: null item
+							st = advance(st)
+							items = items.append(VNull)
+				_: done = True
+		else:
+			done = True
+	if has_error:
+		Err(error_result)
+	else:
+		Ok((VList(items), st))
+
+
+private pure func parse_block_mapping(s: PS, indent: Int) -> Result[(Value, PS), YamlError]:
+	var pairs: List[(String, Value)] = []
+	var st: PS = s
+	var done: Bool = False
+	var has_error: Bool = False
+	var error_result: YamlError = err(s, "")
+	while not done and not has_error:
+		st = skip_blank_lines(st)
+		if at_end(st):
+			done = True
+		else if st.col - 1 < indent:
+			done = True
+		else if st.col - 1 == indent:
+			-- Try to parse key: value
+			key_result: (String, PS) = parse_plain_scalar(st, False)
+			key: String = key_result.0
+			var st2: PS = key_result.1
+			if key.length() == 0:
+				has_error = True
+				error_result = err(st, "expected key in mapping")
+			else:
+				st2 = skip_spaces(st2)
+				match peek(st2):
+					Some(':'):
+						st2 = advance(st2)
+						st2 = skip_spaces(st2)
+						match peek(st2):
+							Some('\n') | Some('\r') | None:
+								-- Value is on next line (block value)
+								st2 = skip_blank_lines(st2)
+								if at_end(st2):
+									pairs = pairs.append((key, VNull))
+									st = st2
+								else:
+									child_indent: Int = st2.col - 1
+									if child_indent > indent:
+										match parse_value(st2, child_indent):
+											Ok((val, st3)):
+												pairs = pairs.append((key, val))
+												st = st3
+											Err(e):
+												has_error = True
+												error_result = e
+									else:
+										pairs = pairs.append((key, VNull))
+										st = st2
+							Some('#'):
+								-- Comment after colon, value is on next line
+								st2 = skip_comment(st2)
+								st2 = skip_blank_lines(st2)
+								if at_end(st2):
+									pairs = pairs.append((key, VNull))
+									st = st2
+								else:
+									child_indent: Int = st2.col - 1
+									if child_indent > indent:
+										match parse_value(st2, child_indent):
+											Ok((val, st3)):
+												pairs = pairs.append((key, val))
+												st = st3
+											Err(e):
+												has_error = True
+												error_result = e
+									else:
+										pairs = pairs.append((key, VNull))
+										st = st2
+							_:
+								-- Inline value
+								match parse_value(st2, st2.col - 1):
+									Ok((val, st3)):
+										pairs = pairs.append((key, val))
+										st = st3
+									Err(e):
+										has_error = True
+										error_result = e
+					_:
+						done = True
+		else:
+			done = True
+	if has_error:
+		Err(error_result)
+	else:
+		Ok((VRecord(pairs), st))
+
+
+-- ============================================================================
+-- Top-Level Value Parser
+-- ============================================================================
+private pure func parse_value(s: PS, indent: Int) -> Result[(Value, PS), YamlError]:
+	match peek(s):
+		Some('\"'): parse_double_quoted(s)
+		Some('\''): parse_single_quoted(s)
+		Some('['): parse_flow_sequence(s)
+		Some('{'): parse_flow_mapping(s)
+		Some('&'): Err(err(s, "anchors are not supported"))
+		Some('*'): Err(err(s, "aliases are not supported"))
+		Some('!'): Err(err(s, "tags are not supported"))
+		Some('%'): Err(err(s, "directives are not supported"))
+		Some('|') | Some('>'): Err(err(s, "block scalars are not supported"))
+		Some('-'):
+			match peek_at(s, 1):
+				Some(c):
+					if is_ws(c) or is_newline(c):
+						parse_block_sequence(s, s.col - 1)
+					else:
+						-- Could be negative number or plain scalar
+						result: (String, PS) = parse_plain_scalar(s, False)
+						Ok((classify_scalar(result.0), result.1))
+				None:
+					Ok((VNull, advance(s)))
+		Some(_):
+			-- Could be a mapping key or a plain scalar
+			-- Peek ahead for colon
+			result: (String, PS) = parse_plain_scalar(s, False)
+			st: PS = skip_spaces(result.1)
+			match peek(st):
+				Some(':'):
+					-- It's a mapping — re-parse from original position
+					parse_block_mapping(s, indent)
+				_:
+					Ok((classify_scalar(result.0), result.1))
+		None: Err(err(s, "unexpected end of input"))
+
+
+-- ============================================================================
+-- Public API
+-- ============================================================================
+---
+Parse a YAML string into a codec Value.
+
+Supports block and flow scalars, sequences, and mappings.
+Scalars are automatically classified as null, bool, int, float, or string.
+
+doctests:
+    :: Parse simple mapping
+    match parse("name: Alice"):
+        Ok(v):
+            match v:
+                VRecord(pairs):
+                    match pairs.get(0):
+                        Some(pair): pair.0 == "name"
+                        None: False
+                _: False
+        Err(_): False
+
+    :: Parse integer
+    match parse("42"):
+        Ok(VInt(n)): n == 42
+        _: False
+
+    :: Parse boolean
+    match parse("true"):
+        Ok(VBool(b)): b == True
+        _: False
+
+    :: Parse null
+    match parse("null"):
+        Ok(VNull): True
+        _: False
+---
+pure func parse(input: String) -> Result[Value, YamlError]:
+	var st: PS = make_ps(input)
+
+	-- Skip optional document start marker
+	if input.length() >= 3:
+		if input.starts_with("---"):
+			st = advance(advance(advance(st)))
+			match peek(st):
+				Some('\n'): st = advance(st)
+				Some('\r'): st = advance(st)
+				Some(' '): st = skip_spaces(st)
+				_: void
+	st = skip_blank_lines(st)
+	if at_end(st):
+		Ok(VNull)
+	else:
+		match parse_value(st, 0):
+			Ok((val, st2)):
+				rest: PS = skip_blank_lines(st2)
+				if at_end(rest):
+					Ok(val)
+				else if starts_at(rest, "---") or starts_at(rest, "..."):
+					Err(err(rest, "multi-document streams are not supported"))
+				else:
+					Err(err(rest, "unexpected trailing input"))
+			Err(e): Err(e)
+
+
+-- ============================================================================
+-- Encoder
+-- ============================================================================
+---
+Encode a codec Value as a YAML string.
+
+doctests:
+    :: Encode null
+    encode(VNull) == "null"
+
+    :: Encode int
+    encode(VInt(42)) == "42"
+
+    :: Encode string
+    encode(VString("hello")) == "hello"
+---
+pure func encode(v: Value) -> String:
+	encode_impl(v, 0, False)
+
+
+private pure func encode_impl(v: Value, indent: Int, in_collection: Bool) -> String:
+	match v:
+		VNull: "null"
+		VBool(b):
+			if b:
+				"true"
+			else:
+				"false"
+		VInt(n): n.to_string()
+		VFloat(f): f.to_string()
+		VString(s): encode_string(s)
+		VList(items): encode_list(items, indent)
+		VRecord(pairs): encode_record(pairs, indent, in_collection)
+
+
+private pure func encode_string(s: String) -> String:
+	-- Check if quoting is needed
+	var needs_quote: Bool = False
+	if s.length() == 0:
+		needs_quote = True
+	else:
+		trimmed: String = s.trim()
+		if trimmed == "null" or trimmed == "Null" or trimmed == "NULL":
+			needs_quote = True
+		else if trimmed == "true" or trimmed == "True" or trimmed == "TRUE":
+			needs_quote = True
+		else if trimmed == "false" or trimmed == "False" or trimmed == "FALSE":
+			needs_quote = True
+		else if trimmed == "yes" or trimmed == "Yes" or trimmed == "YES":
+			needs_quote = True
+		else if trimmed == "no" or trimmed == "No" or trimmed == "NO":
+			needs_quote = True
+		else if trimmed == "on" or trimmed == "On" or trimmed == "ON":
+			needs_quote = True
+		else if trimmed == "off" or trimmed == "Off" or trimmed == "OFF":
+			needs_quote = True
+		else if trimmed == "~":
+			needs_quote = True
+		else:
+			-- Check for special chars
+			var i: Int = 0
+			while i < s.length() and not needs_quote:
+				match s.get(i):
+					Some(c):
+						if c == ':' or c == '#' or c == '[' or c == ']' or c == '{' or c == '}' or c == ',' or c == '\n' or c == '\"' or c == '\'':
+							needs_quote = True
+					None: void
+				i += 1
+
+			-- Check if it looks like a number
+			if not needs_quote:
+				match trimmed.parse_int():
+					Some(_): needs_quote = True
+					None:
+						match trimmed.parse_float():
+							Some(_): needs_quote = True
+							None: void
+	if needs_quote:
+		var buf: String = string(s.length() + 4)
+		buf = buf.append_char('\"')
+		var i: Int = 0
+		while i < s.length():
+			match s.get(i):
+				Some('\n'): buf = buf.append_str("\\n")
+				Some('\t'): buf = buf.append_str("\\t")
+				Some('\\'): buf = buf.append_str("\\\\")
+				Some('\"'): buf = buf.append_str("\\\"")
+				Some(c): buf = buf.append_char(c)
+				None: void
+			i += 1
+		buf.append_char('\"')
+	else:
+		s
+
+
+private pure func make_indent(n: Int) -> String:
+	var buf: String = string(n)
+	var i: Int = 0
+	while i < n:
+		buf = buf.append_char(' ')
+		i += 1
+	buf
+
+
+private pure func encode_list(items: List[Value], indent: Int) -> String:
+	if items.length() == 0:
+		"[]"
+	else:
+		var buf: String = string(64)
+		prefix: String = make_indent(indent)
+		var i: Int = 0
+		while i < items.length():
+			if i > 0:
+				buf = buf.append_char('\n')
+			buf = buf.append_str(prefix)
+			match items.get(i):
+				Some(item):
+					match item:
+						VRecord(_) | VList(_):
+							buf = buf.append_str("-")
+							buf = buf.append_char('\n')
+							buf = buf.append_str(encode_impl(item, indent + 2, True))
+						_:
+							buf = buf.append_str("- ")
+							buf = buf.append_str(encode_impl(item, indent + 2, False))
+				None: void
+			i += 1
+		buf
+
+
+private pure func encode_record(
+	pairs: List[(String, Value)],
+	indent: Int,
+	in_collection: Bool,
+) -> String:
+	if pairs.length() == 0:
+		"{}"
+	else:
+		var buf: String = string(64)
+		prefix: String = make_indent(indent)
+		var i: Int = 0
+		while i < pairs.length():
+			match pairs.get(i):
+				Some(pair):
+					if i > 0 or in_collection or indent > 0:
+						if i > 0:
+							buf = buf.append_char('\n')
+						buf = buf.append_str(prefix)
+					buf = buf.append_str(encode_string(pair.0))
+					buf = buf.append_str(":")
+					match pair.1:
+						VRecord(_) | VList(_):
+							buf = buf.append_char('\n')
+							buf = buf.append_str(encode_impl(pair.1, indent + 2, False))
+						_:
+							buf = buf.append_char(' ')
+							buf = buf.append_str(encode_impl(pair.1, indent, False))
+				None: void
+			i += 1
+		buf

@@ -1,0 +1,175 @@
+-- Stress tests for list parallel pipelines.
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+func range_list(n: Int) -> List[Int]:
+	var result: List[Int] = []
+	var i: Int = 1
+	while i <= n:
+		result = result.append(i)
+		i += 1
+	result
+
+
+pure func pair_list(n: Int) -> List[(Int, Int)]:
+	var result: List[(Int, Int)] = []
+	var i: Int = 1
+	while i <= n:
+		result = result.append((i, i * 10))
+		i += 1
+	result
+
+
+func test_map_medium() -> Bool:
+	nums: List[Int] = range_list(100)
+	result: List[Int] = nums.parallel(
+		pure func(chunk: ParallelList[Int]): chunk.map(pure func(x: Int): x * 2),
+	)
+	result.length() == 100
+
+
+func test_filter_medium() -> Bool:
+	nums: List[Int] = range_list(100)
+	evens: List[Int] = nums.parallel(
+		pure func(chunk: ParallelList[Int]): chunk.filter(pure func(x: Int): x % 2 == 0),
+	)
+	evens.length() == 50
+
+
+func test_filter_extremes_preserve_order() -> Bool:
+	nums: List[Int] = range_list(130)
+	none: List[Int] = nums.parallel(
+		pure func(chunk: ParallelList[Int]): chunk.filter(pure func(x: Int): x < 0),
+	)
+	all: List[Int] = nums.parallel(
+		pure func(chunk: ParallelList[Int]): chunk.filter(pure func(x: Int): x > 0),
+	)
+	evens: List[Int] = nums.parallel(
+		pure func(chunk: ParallelList[Int]): chunk.filter(pure func(x: Int): x % 2 == 0),
+	)
+	none_ok: Bool = none.length() == 0
+	all_ok: Bool = all.length() == 130 and all.get_or(0, 0) == 1 and all.get_or(129, 0) == 130
+	evens_ok: Bool = evens.length() == 65 and evens.get_or(0, 0) == 2 and evens.get_or(64, 0) == 130
+	none_ok and all_ok and evens_ok
+
+
+func test_filter_map_medium() -> Bool:
+	nums: List[Int] = range_list(100)
+	thirds: List[Int] = nums.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[Int]:
+			if x % 3 == 0:
+				Some(x * 2)
+			else:
+				None
+		)
+	)
+	thirds.length() == 33 and thirds.get_or(0, 0) == 6 and thirds.get_or(32, 0) == 198
+
+
+func test_captures_in_parallel() -> Bool:
+	multiplier: Int = 5
+	nums: List[Int] = [1, 2, 3, 4]
+	result: List[Int] = nums.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.map(pure func(x: Int): x * multiplier)
+	)
+	total: Int = result.fold_left(0, pure func(acc: Int, x: Int): acc + x)
+	total == 50
+
+
+func test_empty_list() -> Bool:
+	empty: List[Int] = []
+	mapped: List[Int] = empty.parallel(
+		pure func(chunk: ParallelList[Int]): chunk.map(pure func(x: Int): x * 2),
+	)
+	filtered: List[Int] = empty.parallel(
+		pure func(chunk: ParallelList[Int]): chunk.filter(pure func(x: Int): x > 0),
+	)
+	filter_mapped: List[Int] = empty.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[Int]: Some(x))
+	)
+	mapped.length() == 0 and filtered.length() == 0 and filter_mapped.length() == 0
+
+
+pure func managed_map_once(nums: List[Int]) -> Int:
+	result: List[(Int, Int)] = nums.parallel(
+		pure func(chunk: ParallelList[Int]): chunk.map(pure func(x: Int): (x, x)),
+	)
+	result.length()
+
+
+pure func managed_filter_map_once(nums: List[Int]) -> Int:
+	result: List[(Int, Int)] = nums.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[(Int, Int)]:
+			if x % 2 == 0:
+				Some((x, x))
+			else:
+				None
+		)
+	)
+	result.length()
+
+
+pure func managed_filter_once(n: Int) -> Int:
+	pairs: List[(Int, Int)] = pair_list(n)
+	result: List[(Int, Int)] = pairs.parallel(
+		pure func(
+			chunk: ParallelList[(Int, Int)],
+		): chunk.filter(pure func(p: (Int, Int)): p.0 % 2 == 0),
+	)
+	result.length()
+
+
+func test_map_parallel_managed_result_no_leak() -> Bool:
+	nums: List[Int] = range_list(128)
+	reset_mem_stats()
+	var i: Int = 0
+	var total: Int = 0
+	while i < 30:
+		total += managed_map_once(nums)
+		i += 1
+	stats: MemStats = get_mem_stats()
+	total == 3840 and stats.current_objects <= 5
+
+
+func test_filter_map_parallel_managed_result_no_leak() -> Bool:
+	nums: List[Int] = range_list(128)
+	reset_mem_stats()
+	var i: Int = 0
+	var total: Int = 0
+	while i < 30:
+		total += managed_filter_map_once(nums)
+		i += 1
+	stats: MemStats = get_mem_stats()
+	total == 1920 and stats.current_objects <= 5
+
+
+func test_filter_parallel_managed_result_no_leak() -> Bool:
+	reset_mem_stats()
+	var i: Int = 0
+	var total: Int = 0
+	while i < 30:
+		total += managed_filter_once(128)
+		i += 1
+	stats: MemStats = get_mem_stats()
+	total == 1920 and stats.current_objects <= 5
+
+
+tests: TestSuite = {
+	description = "Parallel List Stress Tests",
+	tests = [
+		("map medium list", test_map_medium),
+		("filter medium list", test_filter_medium),
+		("filter extremes preserve order", test_filter_extremes_preserve_order),
+		("filter_map medium list", test_filter_map_medium),
+		("captures in parallel", test_captures_in_parallel),
+		("empty list handling", test_empty_list),
+		("parallel map managed result no leak", test_map_parallel_managed_result_no_leak),
+		("parallel filter managed result no leak", test_filter_parallel_managed_result_no_leak),
+		(
+			"parallel filter_map managed result no leak",
+			test_filter_map_parallel_managed_result_no_leak,
+		),
+	],
+}

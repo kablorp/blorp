@@ -1,0 +1,176 @@
+-- Test inline struct storage in vectors.
+-- Structs with all-primitive fields should be stored contiguously
+-- in the vector data array, not heap-boxed per element.
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	tensor: get_or, set_index
+	test: TestSuite
+
+
+struct Point {x: Int, y: Int}
+
+
+struct Particle {x: Float, y: Float, vx: Float, vy: Float, mass: Float}
+
+
+-- ============================================================================
+-- Basic: create, read, write
+-- ============================================================================
+func test_create_and_read() -> Bool:
+	v: Point[#3] = {{x = 1, y = 2}, {x = 3, y = 4}, {x = 5, y = 6}}
+	p: Point = v.get_or(1, {x = 0, y = 0})
+	p.x == 3 and p.y == 4
+
+
+func test_get_or_default() -> Bool:
+	v: Point[#3] = {{x = 1, y = 2}, {x = 3, y = 4}, {x = 5, y = 6}}
+	p: Point = v.get_or(99, {x = -1, y = -1})
+	p.x == -1 and p.y == -1
+
+
+func test_set_index() -> Bool:
+	var v: Point[#3] = {{x = 1, y = 2}, {x = 3, y = 4}, {x = 5, y = 6}}
+	match v.set_index(1, {x = 99, y = 100}):
+		Some(new_v): v = new_v
+		None: void
+	p: Point = v.get_or(1, {x = 0, y = 0})
+	p.x == 99 and p.y == 100
+
+
+-- ============================================================================
+-- COW: alias then mutate — original unchanged
+-- ============================================================================
+func test_cow_value_semantics() -> Bool:
+	var v: Point[#3] = {{x = 1, y = 2}, {x = 3, y = 4}, {x = 5, y = 6}}
+	copy: Point[#3] = v
+	match v.set_index(0, {x = 99, y = 99}):
+		Some(new_v): v = new_v
+		None: void
+	-- v changed, copy unchanged
+	v_p: Point = v.get_or(0, {x = 0, y = 0})
+	c_p: Point = copy.get_or(0, {x = 0, y = 0})
+	v_p.x == 99 and c_p.x == 1
+
+
+-- ============================================================================
+-- Fill vector with uniform value
+-- ============================================================================
+func test_fill_vector() -> Bool:
+	v: Point[#100] = vector({x = 42, y = 7}, 100)
+	p0: Point = v.get_or(0, {x = 0, y = 0})
+	p50: Point = v.get_or(50, {x = 0, y = 0})
+	p99: Point = v.get_or(99, {x = 0, y = 0})
+	p0.x == 42 and p50.y == 7 and p99.x == 42
+
+
+-- ============================================================================
+-- Larger struct (5 fields)
+-- ============================================================================
+func test_larger_struct() -> Bool:
+	empty: Particle = {x = 0.0, y = 0.0, vx = 0.0, vy = 0.0, mass = 0.0}
+	var particles: Particle[#4] = vector(empty, 4)
+	match particles.set_index(2, {x = 1.5, y = 2.5, vx = 0.1, vy = 0.2, mass = 10.0}):
+		Some(p): particles = p
+		None: void
+	r: Particle = particles.get_or(2, empty)
+	r.x == 1.5 and r.mass == 10.0
+
+
+-- ============================================================================
+-- For loop with length
+-- ============================================================================
+func test_for_loop_access() -> Bool:
+	v: Point[#5] = {
+		{x = 10, y = 20},
+		{x = 30, y = 40},
+		{x = 50, y = 60},
+		{x = 70, y = 80},
+		{x = 90, y = 100},
+	}
+	var sum_x: Int = 0
+	for i in 0..length(v):
+		p: Point = v.get_or(i, {x = 0, y = 0})
+		sum_x += p.x
+	sum_x == 250
+
+
+-- Regression: direct for-in over inline-storage struct tensors must load by value.
+func test_for_in_struct_vector() -> Bool:
+	v: Point[#3] = {{x = 1, y = 10}, {x = 2, y = 20}, {x = 3, y = 30}}
+	var sum: Int = 0
+	for p in v:
+		sum += p.x + p.y
+	sum == 66
+
+
+-- Regression: for-in over vector(struct, n) exercises inline struct storage.
+func test_for_in_filled_struct_vector() -> Bool:
+	v: Point[#4] = vector({x = 7, y = 8}, 4)
+	var sum: Int = 0
+	for p in v:
+		sum += p.x + p.y
+	sum == 60
+
+
+func test_struct_matrix_literal_read() -> Bool:
+	m: Point[#2, #2] = {
+		{{x = 1, y = 2}, {x = 3, y = 4}},
+		{{x = 5, y = 6}, {x = 7, y = 8}},
+	}
+	p: Point = m[1, 0]
+	p.x == 5 and p.y == 6
+
+
+func test_filled_struct_matrix_read() -> Bool:
+	m: Point[#2, #3] = matrix({x = 4, y = 9}, 2, 3)
+	p: Point = m[1, 2]
+	p.x == 4 and p.y == 9
+
+
+tests: TestSuite = {
+	description = "Struct Vector (inline storage)",
+	tests = [
+		("create and read", test_create_and_read),
+		("get_or default", test_get_or_default),
+		("set_index", test_set_index),
+		("COW value semantics", test_cow_value_semantics),
+		("fill vector", test_fill_vector),
+		("larger struct", test_larger_struct),
+		("for loop access", test_for_loop_access),
+		("for-in struct vector", test_for_in_struct_vector),
+		("for-in filled struct vector", test_for_in_filled_struct_vector),
+		("struct matrix literal read", test_struct_matrix_literal_read),
+		("filled struct matrix read", test_filled_struct_matrix_read),
+		("direct subscript read", test_direct_subscript_read),
+		("set_index no leak", test_set_index_no_leak),
+	],
+}
+
+
+-- Regression: direct subscript v[i] on inline-storage struct vector
+func test_direct_subscript_read() -> Bool:
+	v: Point[#3] = vector({x = 1, y = 2}, 3)
+	var ok: Bool = True
+	for i in 0..length(v):
+		p: Point = v[i]
+		if p.x != 1 or p.y != 2:
+			ok = False
+	ok
+
+
+-- Regression: set_index on inline struct vectors must not leak the boxed value
+func test_set_index_no_leak() -> Bool:
+	reset_mem_stats()
+	var v: Point[#100] = vector({x = 0, y = 0}, 100)
+	var i: Int = 0
+	while i < 1000:
+		match v.set_index(i % 100, {x = i, y = i * 2}):
+			Some(t): v = t
+			None: void
+		i += 1
+	stats: MemStats = get_mem_stats()
+	-- With the leak fix: current_objects should be small (vector + a few temps)
+	-- Without fix: 1000+ leaked boxed structs
+	-- In test suite context, other objects may be alive from prior tests.
+	-- The key invariant: 1000 set_index calls should NOT leave 1000+ leaked boxes.
+	stats.current_objects < 50

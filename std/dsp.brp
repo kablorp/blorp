@@ -1,0 +1,1027 @@
+import:
+	float: abs, clamp, cos, exp, floor, log, log10, pi, pow, round, sign_float, sin, sqrt, tanh
+	random: random_float
+	tensor: get, length
+
+
+-- Signal - DSP and audio signal processing
+--
+-- Window functions, biquad filters, signal generation and analysis,
+-- dB conversion, convolution, and music utilities.
+--
+-- Uses Float[#N] for compile-time-sized signal buffers (contiguous, SIMD-friendly).
+-- Types
+struct BiquadCoeffs {b0: Float, b1: Float, b2: Float, a1: Float, a2: Float}
+
+
+record BiquadState {x1: Float, x2: Float, y1: Float, y2: Float}
+
+
+---
+Zero-initialized biquad state. Convenience for starting a new filter chain.
+
+doctests:
+    :: Zero state fields
+    s: BiquadState = biquad_zero_state()
+    s.x1 == 0.0
+---
+pure func biquad_zero_state() -> BiquadState:
+	{x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0}
+
+
+-- Window functions
+---
+Generate a Hann window of size #N.
+---
+pure func hann_window(size: #N) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, size)
+	nf: Float = to_float(result.length())
+	for i in 0..result.length():
+		t: Float = to_float(i)
+		result[i] = 0.5 * (1.0 - cos(2.0 * pi() * t / (nf - 1.0)))
+	result
+
+
+---
+Generate a Hamming window of size #N.
+---
+pure func hamming_window(size: #N) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, size)
+	nf: Float = to_float(result.length())
+	for i in 0..result.length():
+		t: Float = to_float(i)
+		result[i] = 0.54 - 0.46 * cos(2.0 * pi() * t / (nf - 1.0))
+	result
+
+
+---
+Generate a Blackman window of size #N.
+---
+pure func blackman_window(size: #N) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, size)
+	nf: Float = to_float(result.length())
+	for i in 0..result.length():
+		t: Float = to_float(i)
+		result[i] = 0.42 - 0.5 * cos(
+			2.0 * pi() * t / (nf - 1.0),
+		) + 0.08 * cos(4.0 * pi() * t / (nf - 1.0))
+	result
+
+
+-- Biquad filter design (Audio EQ Cookbook formulas)
+---
+Design a biquad lowpass filter.
+
+doctests:
+    :: Lowpass coefficients are positive
+    c: BiquadCoeffs = biquad_lowpass(44100.0, 1000.0, 0.707)
+    c.b0 > 0.0
+---
+pure func biquad_lowpass(sample_rate: Float, freq: Float, q: Float) -> BiquadCoeffs:
+	w0: Float = 2.0 * pi() * freq / sample_rate
+	alpha: Float = sin(w0) / (2.0 * q)
+	cos_w0: Float = cos(w0)
+	b0: Float = (1.0 - cos_w0) / 2.0
+	b1: Float = 1.0 - cos_w0
+	b2: Float = (1.0 - cos_w0) / 2.0
+	a0: Float = 1.0 + alpha
+	a1: Float = -2.0 * cos_w0
+	a2: Float = 1.0 - alpha
+	{b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0}
+
+
+---
+Design a biquad highpass filter.
+
+doctests:
+    :: Highpass coefficients are positive
+    c: BiquadCoeffs = biquad_highpass(44100.0, 1000.0, 0.707)
+    c.b0 > 0.0
+---
+pure func biquad_highpass(sample_rate: Float, freq: Float, q: Float) -> BiquadCoeffs:
+	w0: Float = 2.0 * pi() * freq / sample_rate
+	alpha: Float = sin(w0) / (2.0 * q)
+	cos_w0: Float = cos(w0)
+	b0: Float = (1.0 + cos_w0) / 2.0
+	b1: Float = -(1.0 + cos_w0)
+	b2: Float = (1.0 + cos_w0) / 2.0
+	a0: Float = 1.0 + alpha
+	a1: Float = -2.0 * cos_w0
+	a2: Float = 1.0 - alpha
+	{b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0}
+
+
+---
+Design a biquad bandpass filter.
+
+doctests:
+    :: Bandpass coefficients are positive
+    c: BiquadCoeffs = biquad_bandpass(44100.0, 1000.0, 1.0)
+    c.b0 > 0.0
+---
+pure func biquad_bandpass(sample_rate: Float, freq: Float, q: Float) -> BiquadCoeffs:
+	w0: Float = 2.0 * pi() * freq / sample_rate
+	alpha: Float = sin(w0) / (2.0 * q)
+	cos_w0: Float = cos(w0)
+	b0: Float = alpha
+	b1: Float = 0.0
+	b2: Float = -alpha
+	a0: Float = 1.0 + alpha
+	a1: Float = -2.0 * cos_w0
+	a2: Float = 1.0 - alpha
+	{b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0}
+
+
+---
+Design a biquad notch (band-reject) filter.
+
+doctests:
+    :: Notch coefficients are positive
+    c: BiquadCoeffs = biquad_notch(44100.0, 1000.0, 1.0)
+    c.b0 > 0.0
+---
+pure func biquad_notch(sample_rate: Float, freq: Float, q: Float) -> BiquadCoeffs:
+	w0: Float = 2.0 * pi() * freq / sample_rate
+	alpha: Float = sin(w0) / (2.0 * q)
+	cos_w0: Float = cos(w0)
+	b0: Float = 1.0
+	b1: Float = -2.0 * cos_w0
+	b2: Float = 1.0
+	a0: Float = 1.0 + alpha
+	a1: Float = -2.0 * cos_w0
+	a2: Float = 1.0 - alpha
+	{b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0}
+
+
+---
+Design a biquad low shelf filter.
+
+doctests:
+    :: Low shelf coefficients are positive
+    c: BiquadCoeffs = biquad_lowshelf(44100.0, 200.0, 6.0)
+    c.b0 > 0.0
+---
+pure func biquad_lowshelf(sample_rate: Float, freq: Float, gain_db: Float) -> BiquadCoeffs:
+	w0: Float = 2.0 * pi() * freq / sample_rate
+	a_val: Float = pow(10.0, gain_db / 40.0)
+	alpha: Float = sin(w0) / 2.0 * sqrt(2.0)
+	cos_w0: Float = cos(w0)
+	sq: Float = sqrt(a_val)
+	b0: Float = a_val * (a_val + 1.0 - (a_val - 1.0) * cos_w0 + 2.0 * sq * alpha)
+	b1: Float = 2.0 * a_val * (a_val - 1.0 - (a_val + 1.0) * cos_w0)
+	b2: Float = a_val * (a_val + 1.0 - (a_val - 1.0) * cos_w0 - 2.0 * sq * alpha)
+	a0: Float = a_val + 1.0 + (a_val - 1.0) * cos_w0 + 2.0 * sq * alpha
+	a1: Float = -2.0 * (a_val - 1.0 + (a_val + 1.0) * cos_w0)
+	a2: Float = a_val + 1.0 + (a_val - 1.0) * cos_w0 - 2.0 * sq * alpha
+	{b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0}
+
+
+---
+Design a biquad high shelf filter.
+
+doctests:
+    :: High shelf coefficients are positive
+    c: BiquadCoeffs = biquad_highshelf(44100.0, 8000.0, 6.0)
+    c.b0 > 0.0
+---
+pure func biquad_highshelf(sample_rate: Float, freq: Float, gain_db: Float) -> BiquadCoeffs:
+	w0: Float = 2.0 * pi() * freq / sample_rate
+	a_val: Float = pow(10.0, gain_db / 40.0)
+	alpha: Float = sin(w0) / 2.0 * sqrt(2.0)
+	cos_w0: Float = cos(w0)
+	sq: Float = sqrt(a_val)
+	b0: Float = a_val * (a_val + 1.0 + (a_val - 1.0) * cos_w0 + 2.0 * sq * alpha)
+	b1: Float = -2.0 * a_val * (a_val - 1.0 + (a_val + 1.0) * cos_w0)
+	b2: Float = a_val * (a_val + 1.0 + (a_val - 1.0) * cos_w0 - 2.0 * sq * alpha)
+	a0: Float = a_val + 1.0 - (a_val - 1.0) * cos_w0 + 2.0 * sq * alpha
+	a1: Float = 2.0 * (a_val - 1.0 - (a_val + 1.0) * cos_w0)
+	a2: Float = a_val + 1.0 - (a_val - 1.0) * cos_w0 - 2.0 * sq * alpha
+	{b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0}
+
+
+---
+Design a biquad peaking (parametric) EQ filter.
+Boosts or cuts a band centered at freq with the given Q and gain in dB.
+
+doctests:
+    :: Peaking EQ coefficients are valid
+    c: BiquadCoeffs = biquad_peak(44100.0, 1000.0, 1.0, 6.0)
+    c.b0 > 0.0
+---
+pure func biquad_peak(
+	sample_rate: Float,
+	freq: Float,
+	q: Float,
+	gain_db: Float,
+) -> BiquadCoeffs:
+	w0: Float = 2.0 * pi() * freq / sample_rate
+	a_val: Float = pow(10.0, gain_db / 40.0)
+	alpha: Float = sin(w0) / (2.0 * q)
+	cos_w0: Float = cos(w0)
+	b0: Float = 1.0 + alpha * a_val
+	b1: Float = -2.0 * cos_w0
+	b2: Float = 1.0 - alpha * a_val
+	a0: Float = 1.0 + alpha / a_val
+	a1: Float = -2.0 * cos_w0
+	a2: Float = 1.0 - alpha / a_val
+	{b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0}
+
+
+---
+Design a biquad allpass filter. Passes all frequencies at unity gain but
+shifts phase. Used in crossover networks and phaser effects.
+
+doctests:
+    :: Allpass coefficients are valid
+    c: BiquadCoeffs = biquad_allpass(44100.0, 1000.0, 0.707)
+    c.b0 > 0.0
+---
+pure func biquad_allpass(sample_rate: Float, freq: Float, q: Float) -> BiquadCoeffs:
+	w0: Float = 2.0 * pi() * freq / sample_rate
+	alpha: Float = sin(w0) / (2.0 * q)
+	cos_w0: Float = cos(w0)
+	b0: Float = 1.0 - alpha
+	b1: Float = -2.0 * cos_w0
+	b2: Float = 1.0 + alpha
+	a0: Float = 1.0 + alpha
+	a1: Float = -2.0 * cos_w0
+	a2: Float = 1.0 - alpha
+	{b0 = b0 / a0, b1 = b1 / a0, b2 = b2 / a0, a1 = a1 / a0, a2 = a2 / a0}
+
+
+-- Filter application
+---
+Apply biquad filter to a single sample. Returns (output, new_state).
+Uses Direct Form I: y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+
+doctests:
+    :: Apply filter to impulse
+    c: BiquadCoeffs = biquad_lowpass(44100.0, 1000.0, 0.707)
+    s: BiquadState = { x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0 }
+    r: (Float, BiquadState) = apply_biquad(c, s, 1.0)
+    r.0 >= 0.0
+---
+pure func apply_biquad(
+	coeffs: BiquadCoeffs,
+	state: BiquadState,
+	sample: Float,
+) -> (Float, BiquadState):
+	out: Float = coeffs.b0 * sample + coeffs.b1 * state.x1 + coeffs.b2 * state.x2 - coeffs.a1 * state.y1 - coeffs.a2 * state.y2
+	new_state: BiquadState = {x1 = sample, x2 = state.x1, y1 = out, y2 = state.y1}
+	(out, new_state)
+
+
+---
+Apply biquad filter to an entire buffer.
+
+doctests:
+    :: Filter preserves length
+    c: BiquadCoeffs = biquad_lowpass(44100.0, 1000.0, 0.707)
+    signal: Float[#4] = {0.0, 0.0, 0.0, 0.0}
+    apply_biquad_buffer(c, signal).length() == 4
+---
+pure func apply_biquad_buffer[#N](coeffs: BiquadCoeffs, signal: Float[#N]) -> Float[#N]:
+	var state: BiquadState = {x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0}
+	var result: Float[#N] = vector(0.0, signal.length())
+	for i in 0..result.length():
+		match signal.get(i):
+			Some(x):
+				out: Float = coeffs.b0 * x + coeffs.b1 * state.x1 + coeffs.b2 * state.x2 - coeffs.a1 * state.y1 - coeffs.a2 * state.y2
+				state = {x1 = x, x2 = state.x1, y1 = out, y2 = state.y1}
+				result[i] = out
+			None: void
+	result
+
+
+---
+Apply biquad filter to a buffer with state carry. Returns (output, final_state)
+so filters work correctly across buffer boundaries without clicks.
+
+doctests:
+    :: Stateful filter preserves length
+    c: BiquadCoeffs = biquad_lowpass(44100.0, 1000.0, 0.707)
+    s: BiquadState = { x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0 }
+    r: (Float[#4], BiquadState) = apply_biquad_stateful(c, s, {0.0, 0.0, 0.0, 0.0})
+    r.0.length() == 4
+---
+pure func apply_biquad_stateful[#N](
+	coeffs: BiquadCoeffs,
+	state: BiquadState,
+	signal: Float[#N],
+) -> (Float[#N], BiquadState):
+	var st: BiquadState = state
+	var result: Float[#N] = vector(0.0, signal.length())
+	for i in 0..result.length():
+		x: Float = signal[i]
+		out: Float = coeffs.b0 * x + coeffs.b1 * st.x1 + coeffs.b2 * st.x2 - coeffs.a1 * st.y1 - coeffs.a2 * st.y2
+		st = {x1 = x, x2 = st.x1, y1 = out, y2 = st.y1}
+		result[i] = out
+	(result, st)
+
+
+-- Signal generation
+---
+Generate a sine wave.
+
+---
+pure func gen_sine(freq: Float, sample_rate: Float, size: #N) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, size)
+	for i in 0..result.length():
+		t: Float = to_float(i) / sample_rate
+		result[i] = sin(2.0 * pi() * freq * t)
+	result
+
+
+---
+Generate a square wave (values are +1.0 or -1.0).
+
+---
+pure func gen_square(freq: Float, sample_rate: Float, size: #N) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, size)
+	for i in 0..result.length():
+		t: Float = to_float(i) / sample_rate
+		phase: Float = t * freq - floor(t * freq)
+		if phase < 0.5:
+			result[i] = 1.0
+		else:
+			result[i] = -1.0
+	result
+
+
+---
+Generate a sawtooth wave (ramps from -1.0 to +1.0).
+
+---
+pure func gen_saw(freq: Float, sample_rate: Float, size: #N) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, size)
+	for i in 0..result.length():
+		t: Float = to_float(i) / sample_rate
+		phase: Float = t * freq - floor(t * freq)
+		result[i] = 2.0 * phase - 1.0
+	result
+
+
+---
+Generate white noise (random values in -1.0 to +1.0). Impure.
+
+---
+func gen_noise(size: #N) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, size)
+	for i in 0..result.length():
+		result[i] = random_float() * 2.0 - 1.0
+	result
+
+
+-- Signal analysis
+---
+Envelope follower with asymmetric attack/release. Returns the amplitude
+envelope of the signal — useful for sag, compression, auto-wah.
+attack_ms: how fast the envelope rises (1-10ms typical).
+release_ms: how fast it falls (50-200ms typical).
+---
+pure func envelope[#N](
+	signal: Float[#N],
+	attack_ms: Float,
+	release_ms: Float,
+	sample_rate: Float,
+) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, signal.length())
+	attack_coeff: Float = exp(-1.0 / (attack_ms * sample_rate / 1000.0))
+	release_coeff: Float = exp(-1.0 / (release_ms * sample_rate / 1000.0))
+	var env: Float = 0.0
+	for i in 0..result.length():
+		match signal.get(i):
+			Some(v):
+				level: Float = abs(v)
+				if level > env:
+					env = attack_coeff * env + (1.0 - attack_coeff) * level
+				else:
+					env = release_coeff * env + (1.0 - release_coeff) * level
+				result[i] = env
+			None: void
+	result
+
+
+---
+Root mean square of a signal.
+
+doctests:
+    :: RMS of alternating signal
+    rms({1.0, -1.0, 1.0, -1.0}).approx_eq(1.0)
+---
+pure func rms(signal: Float[#_]) -> Float:
+	if signal.length() == 0:
+		0.0
+	else:
+		var sum_sq: Float = 0.0
+		for i in 0..signal.length():
+			v: Float = signal[i]
+			sum_sq += v * v
+		sqrt(sum_sq / to_float(signal.length()))
+
+
+---
+Peak absolute value of a signal.
+
+doctests:
+    :: Peak of mixed signal
+    peak({0.5, -0.8, 0.3}).approx_eq(0.8)
+---
+pure func peak(signal: Float[#_]) -> Float:
+	var max_val: Float = 0.0
+	for i in 0..signal.length():
+		v: Float = signal[i]
+		var av: Float = v
+		if av < 0.0:
+			av = -av
+		if av > max_val:
+			max_val = av
+	max_val
+
+
+---
+Energy of a signal (sum of squares).
+
+doctests:
+    :: Energy of {1,2,3}
+    energy({1.0, 2.0, 3.0}).approx_eq(14.0)
+---
+pure func energy(signal: Float[#_]) -> Float:
+	var total: Float = 0.0
+	for i in 0..signal.length():
+		v: Float = signal[i]
+		total += v * v
+	total
+
+
+---
+Count zero crossings in a signal.
+
+doctests:
+    :: Alternating signal has 3 crossings
+    zero_crossings({1.0, -1.0, 1.0, -1.0}) == 3
+---
+pure func zero_crossings(signal: Float[#_]) -> Int:
+	if signal.length() < 2:
+		0
+	else:
+		var count: Int = 0
+		var prev: Float = match signal.get(0):
+			Some(v): v
+			None: 0.0
+		for i in 1..signal.length():
+			match signal.get(i):
+				Some(curr):
+					if prev > 0.0 and curr < 0.0 or prev < 0.0 and curr > 0.0:
+						count += 1
+					prev = curr
+				None: void
+		count
+
+
+---
+Autocorrelation of a signal. Returns a vector of length #N with
+the autocorrelation at each lag from 0 to N-1.
+---
+pure func autocorrelate[#N](signal: Float[#N]) -> Float[#N]:
+	n: Int = signal.length()
+	var result: Float[#N] = vector(0.0, signal.length())
+	for lag in 0..result.length():
+		var sum_val: Float = 0.0
+		upper: Int = n - lag
+		for i in 0..upper:
+			idx2: Int = i + lag
+			match signal.get(i):
+				Some(si):
+					match signal.get(idx2):
+						Some(si2):
+							sum_val += si * si2
+						None: void
+				None: void
+		result[lag] = sum_val
+	result
+
+
+-- dB conversion
+---
+Convert amplitude to decibels: 20 * log10(amplitude).
+
+doctests:
+    :: Unity amplitude is 0 dB
+    to_db(1.0).approx_eq(0.0)
+---
+pure func to_db(amplitude: Float) -> Float:
+	if amplitude <= 0.0:
+		-120.0
+	else:
+		20.0 * log10(amplitude)
+
+
+---
+Convert decibels to amplitude: 10^(db/20).
+
+doctests:
+    :: 0 dB is unity amplitude
+    from_db(0.0).approx_eq(1.0)
+---
+pure func from_db(db: Float) -> Float:
+	pow(10.0, db / 20.0)
+
+
+-- Convolution
+---
+Convolve a signal with a kernel. Returns a vector of length #S + #K - 1.
+---
+pure func convolve[#S, #K](signal: Float[#S], kernel: Float[#K]) -> Float[#S + #K - #1]:
+	sn: Int = signal.length()
+	kn: Int = kernel.length()
+	var result: Float[#S + #K - #1] = vector(0.0, sn + kn - 1)
+	for i in 0..result.length():
+		var sum_val: Float = 0.0
+		for j in 0..kn:
+			si: Int = i - j
+			if si >= 0 and si < sn:
+				match signal.get(si):
+					Some(sv):
+						match kernel.get(j):
+							Some(kv): sum_val += sv * kv
+							None: void
+					None: void
+		result[i] = sum_val
+	result
+
+
+---
+Cross-correlate a signal with a kernel. Returns a vector of length #S + #K - 1.
+Equivalent to convolving with the time-reversed kernel.
+---
+pure func correlate[#S, #K](signal: Float[#S], kernel: Float[#K]) -> Float[#S + #K - #1]:
+	kn: Int = kernel.length()
+	var rev_kernel: Float[#K] = vector(0.0, kn)
+	for i in 0..rev_kernel.length():
+		idx: Int = kn - 1 - i
+		match kernel.get(idx):
+			Some(v): rev_kernel[i] = v
+			None: void
+	convolve(signal, rev_kernel)
+
+
+-- Synthesis primitives
+-- ADSR envelope stages
+-- 0 = idle, 1 = attack, 2 = decay, 3 = sustain, 4 = release
+struct AdsrState {level: Float, stage: Int, time: Float}
+
+
+---
+Advance an ADSR envelope by one sample. Returns (envelope_level, new_state).
+
+The gate parameter controls note on/off: true = held, false = released.
+Attack, decay, and release are times in seconds. Sustain is a level (0.0-1.0).
+---
+pure func adsr_tick(
+	state: AdsrState,
+	gate: Bool,
+	attack: Float,
+	decay: Float,
+	sustain: Float,
+	release: Float,
+	sample_rate: Float,
+) -> (Float, AdsrState):
+	dt: Float = 1.0 / sample_rate
+	var lvl: Float = state.level
+	var stg: Int = state.stage
+	var t: Float = state.time
+	if gate and stg == 0:
+		-- Note on: start attack
+		stg = 1
+		t = 0.0
+	if gate and stg == 4:
+		-- Re-trigger during release
+		stg = 1
+		t = 0.0
+	if not gate and (stg >= 1 and stg <= 3):
+		-- Note off: start release
+		stg = 4
+		t = 0.0
+	if stg == 1:
+		-- Attack
+		if attack > 0.0:
+			lvl = t / attack
+		else:
+			lvl = 1.0
+		if lvl >= 1.0:
+			lvl = 1.0
+			stg = 2
+			t = 0.0
+	else if stg == 2:
+		-- Decay
+		if decay > 0.0:
+			lvl = 1.0 - (1.0 - sustain) * (t / decay)
+		else:
+			lvl = sustain
+		if lvl <= sustain:
+			lvl = sustain
+			stg = 3
+	else if stg == 3:
+		lvl = sustain
+	else if stg == 4:
+		-- Sustain (held at sustain level)
+		-- Release
+		start_lvl: Float = state.level
+		if release > 0.0:
+			lvl = start_lvl * (1.0 - t / release)
+		else:
+			lvl = 0.0
+		if lvl <= 0.0:
+			lvl = 0.0
+			stg = 0
+	new_state: AdsrState = {level = lvl, stage = stg, time = t + dt}
+	(lvl, new_state)
+
+
+---
+Per-sample oscillator with state threading. Returns (sample, new_phase).
+
+Waveform types: 0 = sine, 1 = square, 2 = sawtooth.
+Phase is maintained across calls for continuous output.
+---
+pure func osc_tick(
+	phase: Float,
+	freq: Float,
+	sample_rate: Float,
+	waveform: Int,
+) -> (Float, Float):
+	p: Float = phase - floor(phase)
+	var sample: Float = 0.0
+	if waveform == 0:
+		sample = sin(2.0 * pi() * p)
+	else if waveform == 1:
+		if p < 0.5:
+			sample = 0.8
+		else:
+			sample = -0.8
+	else if waveform == 2:
+		sample = (2.0 * p - 1.0) * 0.8
+	raw: Float = phase + freq / sample_rate
+	(sample, raw - floor(raw))
+
+
+---
+Soft clip a signal using tanh waveshaping. Drive controls the amount of
+saturation (1.0 = gentle warmth, 5.0+ = heavy distortion).
+
+doctests:
+    :: Zero in, zero out
+    soft_clip(0.0, 5.0).approx_eq(0.0)
+    :: Bounded output
+    soft_clip(0.5, 2.0) < 1.0
+---
+pure func soft_clip(sample: Float, drive: Float) -> Float:
+	tanh(sample * drive)
+
+
+---
+Hard clip a signal at a threshold. Gain is applied before clipping.
+
+doctests:
+    :: Zero in, zero out
+    hard_clip(0.0, 10.0, 0.8).approx_eq(0.0)
+    :: Output bounded by threshold
+    hard_clip(1.0, 10.0, 0.8).approx_eq(0.8)
+    :: Symmetric
+    hard_clip(-1.0, 10.0, 0.8).approx_eq(-0.8)
+---
+pure func hard_clip(sample: Float, gain: Float, threshold: Float) -> Float:
+	clamp(sample * gain, -threshold, threshold)
+
+
+---
+Asymmetric tube saturation. Positive peaks are compressed more than negative,
+introducing even harmonics like a real tube amp. Asymmetry controls the
+difference between positive and negative clipping (0.0 = symmetric, 1.0 = max).
+
+doctests:
+    :: Zero in, zero out
+    tube_saturate(0.0, 5.0, 0.5, 0.0).approx_eq(0.0)
+    :: Bounded output
+    tube_saturate(0.5, 2.0, 0.5, 0.0) < 1.0
+---
+pure func tube_saturate(
+	sample: Float,
+	drive: Float,
+	asymmetry: Float,
+	bias: Float,
+) -> Float:
+	biased: Float = sample + bias
+	driven: Float = biased * drive
+	if driven >= 0.0:
+		tanh(driven)
+	else:
+		tanh(driven * (1.0 - asymmetry * 0.5))
+
+
+---
+Fuzz distortion using exponential/diode clipping curve. Produces sharper
+harmonics than tanh — models germanium/silicon diode clipping (Fuzz Face, Big Muff).
+
+doctests:
+    :: Zero in, zero out
+    fuzz_clip(0.0, 5.0).approx_eq(0.0)
+    :: Bounded output
+    fuzz_clip(0.3, 2.0) < 1.0
+    :: Symmetric
+    fuzz_clip(0.5, 3.0).approx_eq(-fuzz_clip(-0.5, 3.0))
+---
+pure func fuzz_clip(sample: Float, drive: Float) -> Float:
+	x: Float = sample * drive
+	sign_float(x) * (1.0 - exp(-abs(x)))
+
+
+---
+Overdrive using cubic soft clipping. Gentler than tanh — models the
+"tube screamer" character with a smooth polynomial curve.
+
+doctests:
+    :: Zero in, zero out
+    overdrive_cubic(0.0, 5.0).approx_eq(0.0)
+    :: Within bounds
+    abs(overdrive_cubic(1.0, 5.0)) < 1.0
+---
+pure func overdrive_cubic(sample: Float, drive: Float) -> Float:
+	x: Float = clamp(sample * drive, -1.0, 1.0)
+	x - x * x * x / 3.0
+
+
+---
+Tube warmth — adds the even/odd harmonic color of a vacuum tube without
+modeling any circuit. This is the simplest way to get "tube sound":
+a 2nd harmonic (warm asymmetry) and a 3rd harmonic (body) mixed into
+the dry signal.
+
+amount: 0.0 = bypass, 0.05 = subtle warmth, 0.15 = obvious color, 0.3 = driven.
+
+doctests:
+    :: Zero in, zero out
+    tube_warmth(0.0, 0.1).approx_eq(0.0)
+    :: Small signal mostly passes through
+    abs(tube_warmth(0.1, 0.1) - 0.1) < 0.01
+    :: Output is asymmetric (even harmonics shift DC)
+    tube_warmth(0.5, 0.2) != -tube_warmth(-0.5, 0.2)
+---
+pure func tube_warmth(sample: Float, amount: Float) -> Float:
+	h2: Float = sample * sample
+	h3: Float = sample * sample * sample
+	tanh(sample + amount * h2 + amount * 0.3 * h3)
+
+
+-- Music utilities
+---
+Convert MIDI note number to frequency (Hz). A4 (note 69) = 440 Hz.
+
+doctests:
+    :: A4 is 440 Hz
+    midi_to_freq(69).approx_eq(440.0)
+---
+pure func midi_to_freq(note: Int) -> Float:
+	diff: Int = note - 69
+	diff_f: Float = to_float(diff)
+	440.0 * pow(2.0, diff_f / 12.0)
+
+
+---
+Convert frequency (Hz) to nearest MIDI note number.
+
+doctests:
+    :: 440 Hz is A4 (note 69)
+    freq_to_midi(440.0) == 69
+---
+pure func freq_to_midi(freq: Float) -> Int:
+	to_int(round(12.0 * log(freq / 440.0) / log(2.0) + 69.0))
+
+
+---
+Convert MIDI note number to note name string.
+
+doctests:
+    :: Middle C is C4
+    note_name(60) == "C4"
+---
+pure func note_name(midi: Int) -> String:
+	octave: Int = midi / 12 - 1
+	note_idx: Int = midi % 12
+	name: String = match note_idx:
+		0: "C"
+		1: "C#"
+		2: "D"
+		3: "D#"
+		4: "E"
+		5: "F"
+		6: "F#"
+		7: "G"
+		8: "G#"
+		9: "A"
+		10: "A#"
+		11: "B"
+		_: "?"
+	name + octave.to_string()
+
+
+-- MIDI reference notes
+MIDI_C4: Int = 60
+
+MIDI_A4: Int = 69
+
+-- Scale interval patterns (semitones between successive notes)
+SCALE_MAJOR: List[Int] = [2, 2, 1, 2, 2, 2, 1]
+
+SCALE_MINOR: List[Int] = [2, 1, 2, 2, 1, 2, 2]
+
+SCALE_HARMONIC_MINOR: List[Int] = [2, 1, 2, 2, 1, 3, 1]
+
+SCALE_MELODIC_MINOR: List[Int] = [2, 1, 2, 2, 2, 2, 1]
+
+SCALE_PENTATONIC_MAJOR: List[Int] = [2, 2, 3, 2, 3]
+
+SCALE_PENTATONIC_MINOR: List[Int] = [3, 2, 2, 3, 2]
+
+SCALE_BLUES: List[Int] = [3, 2, 1, 1, 3, 2]
+
+SCALE_DORIAN: List[Int] = [2, 1, 2, 2, 2, 1, 2]
+
+SCALE_MIXOLYDIAN: List[Int] = [2, 2, 1, 2, 2, 1, 2]
+
+SCALE_LYDIAN: List[Int] = [2, 2, 2, 1, 2, 2, 1]
+
+SCALE_PHRYGIAN: List[Int] = [1, 2, 2, 2, 1, 2, 2]
+
+SCALE_LOCRIAN: List[Int] = [1, 2, 2, 1, 2, 2, 2]
+
+SCALE_CHROMATIC: List[Int] = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+
+SCALE_WHOLE_TONE: List[Int] = [2, 2, 2, 2, 2, 2]
+
+-- Chord interval patterns (semitone offsets from root)
+CHORD_MAJOR: List[Int] = [0, 4, 7]
+
+CHORD_MINOR: List[Int] = [0, 3, 7]
+
+CHORD_DIM: List[Int] = [0, 3, 6]
+
+CHORD_AUG: List[Int] = [0, 4, 8]
+
+CHORD_DOM7: List[Int] = [0, 4, 7, 10]
+
+CHORD_MAJ7: List[Int] = [0, 4, 7, 11]
+
+CHORD_MIN7: List[Int] = [0, 3, 7, 10]
+
+CHORD_DIM7: List[Int] = [0, 3, 6, 9]
+
+
+---
+Equal temperament frequency ratio for a given number of semitones.
+
+doctests:
+    :: Octave is 2x frequency
+    interval_ratio(12).approx_eq(2.0)
+    :: Perfect fifth
+    interval_ratio(7).approx_eq(1.4983070769)
+---
+pure func interval_ratio(semitones: Int) -> Float:
+	pow(2.0, to_float(semitones) / 12.0)
+
+
+---
+Build a scale as MIDI note numbers from a root note and interval pattern.
+
+doctests:
+    :: C major scale
+    build_scale(60, [2, 2, 1, 2, 2, 2, 1]) == [60, 62, 64, 65, 67, 69, 71, 72]
+---
+pure func build_scale(root: Int, pattern: List[Int]) -> List[Int]:
+	var notes: List[Int] = [root]
+	var current: Int = root
+	for interval in pattern:
+		current += interval
+		notes = notes.append(current)
+	notes
+
+
+---
+Convert chord intervals to frequencies at a given root MIDI note.
+
+doctests:
+    :: A4 major chord has 3 notes
+    chord_to_freqs(69, [0, 4, 7]).length() == 3
+---
+pure func chord_to_freqs(root: Int, intervals: List[Int]) -> List[Float]:
+	var freqs: List[Float] = []
+	for offset in intervals:
+		freqs = freqs.append(midi_to_freq(root + offset))
+	freqs
+
+
+---
+Transpose a list of MIDI notes by a number of semitones.
+
+doctests:
+    :: Transpose up an octave
+    transpose_notes([60, 64, 67], 12) == [72, 76, 79]
+---
+pure func transpose_notes(notes: List[Int], semitones: Int) -> List[Int]:
+	var result: List[Int] = []
+	for n in notes:
+		result = result.append(n + semitones)
+	result
+
+
+---
+Convert beats per minute to samples per beat.
+
+doctests:
+    :: 120 BPM at 44100 Hz
+    bpm_to_samples(120.0, 44100.0) == 22050
+---
+pure func bpm_to_samples(bpm: Float, sample_rate: Float) -> Int:
+	to_int(sample_rate * 60.0 / bpm)
+
+
+---
+Duration of a note in samples given beats, BPM, and sample rate.
+
+doctests:
+    :: Quarter note at 120 BPM, 44100 Hz
+    note_duration(1.0, 120.0, 44100.0) == 22050
+---
+pure func note_duration(beats: Float, bpm: Float, sample_rate: Float) -> Int:
+	to_int(beats * sample_rate * 60.0 / bpm)
+
+
+---
+Difference in cents between two frequencies.
+
+doctests:
+    :: Octave is 1200 cents
+    cents_between(220.0, 440.0).approx_eq(1200.0)
+---
+pure func cents_between(freq_a: Float, freq_b: Float) -> Float:
+	1200.0 * log(freq_b / freq_a) / log(2.0)
+
+
+-- Utility
+---
+Mix two signals with a ratio (0.0 = all a, 1.0 = all b).
+Both signals must have the same compile-time size.
+
+doctests:
+    :: Mix preserves length
+    mix({1.0, 1.0}, {0.0, 0.0}, 0.5).length() == 2
+---
+pure func mix[#N](a: Float[#N], b: Float[#N], ratio: Float) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, a.length())
+	for i in 0..result.length():
+		match a.get(i):
+			Some(av):
+				match b.get(i):
+					Some(bv): result[i] = av * (1.0 - ratio) + bv * ratio
+					None: void
+			None: void
+	result
+
+
+---
+Scale (amplify/attenuate) a signal by a gain factor.
+
+doctests:
+    :: Scale preserves length
+    scale_signal({1.0, 2.0, 3.0}, 0.5).length() == 3
+---
+pure func scale_signal[#N](signal: Float[#N], gain: Float) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, signal.length())
+	for i in 0..result.length():
+		match signal.get(i):
+			Some(v): result[i] = v * gain
+			None: void
+	result
+
+
+---
+Apply a window to a signal (element-wise multiplication).
+Both signal and window must have the same compile-time size.
+
+doctests:
+    :: Windowed signal length
+    s: Float[4] = {1.0, 1.0, 1.0, 1.0}
+    w: Float[4] = {0.5, 1.0, 1.0, 0.5}
+    apply_window(s, w).length() == 4
+---
+pure func apply_window[#N](signal: Float[#N], window: Float[#N]) -> Float[#N]:
+	var result: Float[#N] = vector(0.0, signal.length())
+	for i in 0..result.length():
+		match signal.get(i):
+			Some(sv):
+				match window.get(i):
+					Some(wv): result[i] = sv * wv
+					None: void
+			None: void
+	result

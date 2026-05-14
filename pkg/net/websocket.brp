@@ -1,0 +1,593 @@
+import:
+	bytes as B
+	crypto_random: crypto_random_bytes
+	hash: sha1
+	net/tcp as TCP
+	net/url as U: Url, effective_port, is_https
+	pkg/net/tls as TLS
+
+
+-- WebSocket - RFC 6455 WebSocket client
+--
+-- Provides WebSocket client connections over TCP (ws://) and TLS (wss://).
+-- Supports text and binary frames, ping/pong, and close handshake.
+--
+-- Usage:
+-- import:
+-- pkg/net/websocket as WS
+-- result { Result(Ok, Err) }
+--
+-- match WS.connect("ws://echo.websocket.org"):
+-- Ok(ws):
+-- _ = WS.send(ws, "hello")
+-- match WS.recv(ws):
+-- Ok(msg):
+-- match msg:
+-- WS.Text(s): print(s)
+-- WS.Binary(b): print("binary")
+-- _: pass
+-- Err(e): print(e)
+-- WS.close(ws)
+-- Err(e): print(e)
+-- ============================================================================
+-- Types
+-- ============================================================================
+-- Transport: either a TCP fd or a TLS connection
+union Transport:
+	WsTcp(Int)
+	WsTls(Ptr)
+
+
+-- WebSocket connection handle
+record WebSocket {transport: Transport}
+
+
+-- Message received from the WebSocket
+union Message:
+	Text(String)
+	Binary(Bytes)
+	Close(Int, String)
+	Ping(Bytes)
+	Pong(Bytes)
+
+
+-- ============================================================================
+-- Byte Access Helper
+-- ============================================================================
+-- Get a byte value (0-255) from Bytes at index, returns 0 for out-of-bounds
+pure func byte_at(b: Bytes, i: Int) -> Int:
+	match B.get(b, i):
+		Some(v): v
+		None: 0
+
+
+-- ============================================================================
+-- Constants
+-- ============================================================================
+private pure func ws_guid() -> String:
+	"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+private pure func opcode_text() -> Int:
+	1
+
+
+private pure func opcode_binary() -> Int:
+	2
+
+
+private pure func opcode_close() -> Int:
+	8
+
+
+private pure func opcode_ping() -> Int:
+	9
+
+
+private pure func opcode_pong() -> Int:
+	10
+
+
+-- ============================================================================
+-- Connection
+-- ============================================================================
+---
+Connect to a WebSocket server. Supports ws:// and wss:// URLs.
+Performs the HTTP upgrade handshake and returns a connected WebSocket.
+---
+func connect(url: String) -> Result[WebSocket, String]:
+	match U.parse(url):
+		Err(e): Err(e)
+		Ok(parsed):
+			-- Normalize scheme
+			use_tls: Bool = parsed.scheme == "wss" or parsed.scheme == "https"
+			port: Int = get_ws_port(parsed, use_tls)
+			host: String = parsed.host.substring(0, parsed.host.length())
+			if use_tls:
+				connect_tls(host, port, parsed)
+			else:
+				connect_tcp(host, port, parsed)
+
+
+-- Get port, defaulting to 443 for wss, 80 for ws
+private pure func get_ws_port(url: Url, use_tls: Bool) -> Int:
+	match url.port:
+		Some(p): p
+		None:
+			if use_tls:
+				443
+			else:
+				80
+
+
+-- Connect via TCP
+private func connect_tcp(host: String, port: Int, url: Url) -> Result[WebSocket, String]:
+	match TCP.connect(host, port):
+		Err(e): Err("TCP connect failed: " + e)
+		Ok(fd):
+			-- Generate key and build handshake
+			key: String = generate_key()
+			request: Bytes = build_handshake(host, port, url, key)
+			match TCP.write(fd, request):
+				Err(e):
+					TCP.close(fd)
+					Err("handshake write failed: " + e)
+				Ok(_):
+					match read_handshake_tcp(fd):
+						Err(e):
+							TCP.close(fd)
+							Err(e)
+						Ok(response):
+							match verify_handshake(response, key):
+								Err(e):
+									TCP.close(fd)
+									Err(e)
+								Ok(_):
+									Ok({transport = WsTcp(fd)})
+
+
+-- Connect via TLS
+private func connect_tls(host: String, port: Int, url: Url) -> Result[WebSocket, String]:
+	match TLS.connect(host, port):
+		Err(e): Err("TLS connect failed: " + e)
+		Ok(conn):
+			key: String = generate_key()
+			request: Bytes = build_handshake(host, port, url, key)
+			match TLS.write(conn, request):
+				Err(e):
+					TLS.close(conn)
+					Err("handshake write failed: " + e)
+				Ok(_):
+					match read_handshake_tls(conn):
+						Err(e):
+							TLS.close(conn)
+							Err(e)
+						Ok(response):
+							match verify_handshake(response, key):
+								Err(e):
+									TLS.close(conn)
+									Err(e)
+								Ok(_):
+									Ok({transport = WsTls(conn)})
+
+
+-- ============================================================================
+-- Send
+-- ============================================================================
+---
+Send a text message over the WebSocket.
+---
+func send(ws: WebSocket, msg: String) -> Result[Bool, String]:
+	data: Bytes = msg.to_bytes()
+	send_frame(ws, opcode_text(), data)
+
+
+---
+Send a binary message over the WebSocket.
+---
+func send_binary(ws: WebSocket, data: Bytes) -> Result[Bool, String]:
+	send_frame(ws, opcode_binary(), data)
+
+
+---
+Send a ping frame.
+---
+func send_ping(ws: WebSocket) -> Result[Bool, String]:
+	send_frame(ws, opcode_ping(), B.bytes(0))
+
+
+-- Send a frame with given opcode and payload
+private func send_frame(ws: WebSocket, opcode: Int, payload: Bytes) -> Result[Bool, String]:
+	frame: Bytes = encode_frame(opcode, payload)
+	var result: Result[Bool, String] = Ok(True)
+	match ws.transport:
+		WsTcp(fd):
+			match TCP.write(fd, frame):
+				Ok(_): void
+				Err(e): result = Err(e)
+		WsTls(conn):
+			match TLS.write(conn, frame):
+				Ok(_): void
+				Err(e): result = Err(e)
+	result
+
+
+-- ============================================================================
+-- Receive
+-- ============================================================================
+---
+Receive a message from the WebSocket. Blocks until a message is available.
+Automatically responds to ping frames with pong.
+Returns Close message when the server closes the connection.
+---
+func recv(ws: WebSocket) -> Result[Message, String]:
+	recv_loop(ws)
+
+
+-- Read frames until we get a complete message
+private func recv_loop(ws: WebSocket) -> Result[Message, String]:
+	match read_frame(ws):
+		Err(e): Err(e)
+		Ok(frame_data):
+			opcode: Int = frame_data.0
+			payload: Bytes = frame_data.1
+			if opcode == opcode_text():
+				Ok(Text(B.to_string(payload)))
+			else if opcode == opcode_binary():
+				Ok(Binary(payload))
+			else if opcode == opcode_close():
+				code: Int = if B.length(payload) >= 2:
+					read_u16_be(payload, 0)
+				else:
+					1005
+				reason: String = if B.length(payload) > 2:
+					B.to_string(B.slice(payload, 2, B.length(payload) - 2))
+				else:
+					""
+				-- Send close response
+				_ = send_frame(ws, opcode_close(), payload)
+				Ok(Close(code, reason))
+			else if opcode == opcode_ping():
+				-- Auto-respond with pong
+				_ = send_frame(ws, opcode_pong(), payload)
+				recv_loop(ws)
+			else if opcode == opcode_pong():
+				Ok(Pong(payload))
+			else:
+				Err("unknown opcode: " + opcode.to_string())
+
+
+-- Read a single frame from the transport
+private func read_frame(ws: WebSocket) -> Result[(Int, Bytes), String]:
+	-- Read first 2 bytes
+	match read_exact(ws, 2):
+		Err(e): Err("frame header: " + e)
+		Ok(header):
+			b0: Int = byte_at(header, 0)
+			b1: Int = byte_at(header, 1)
+			opcode: Int = b0 % 16
+			masked: Bool = b1 >= 128
+			len7: Int = if masked:
+				b1 - 128
+			else:
+				b1
+			-- Determine payload length
+			match read_payload_length(ws, len7):
+				Err(e): Err(e)
+				Ok(payload_len):
+					-- Read mask key if present
+					match read_mask_key(ws, masked):
+						Err(e): Err(e)
+						Ok(mask_key):
+							-- Read payload
+							if payload_len == 0:
+								Ok((opcode, B.bytes(0)))
+							else:
+								match read_exact(ws, payload_len):
+									Err(e): Err("payload: " + e)
+									Ok(payload):
+										-- Unmask if needed
+										final_payload: Bytes = if masked:
+											apply_mask(payload, mask_key)
+										else:
+											payload
+										Ok((opcode, final_payload))
+
+
+-- Read extended payload length if needed
+private func read_payload_length(ws: WebSocket, len7: Int) -> Result[Int, String]:
+	if len7 < 126:
+		Ok(len7)
+	else if len7 == 126:
+		match read_exact(ws, 2):
+			Err(e): Err("length16: " + e)
+			Ok(buf):
+				payload_len: Int = read_u16_be(buf, 0)
+				if payload_len > 16777216:
+					Err("frame exceeds maximum size (16 MB)")
+				else:
+					Ok(payload_len)
+	else:
+		match read_exact(ws, 8):
+			Err(e): Err("length64: " + e)
+			Ok(buf):
+				-- len7 == 127: 64-bit length
+				payload_len: Int = read_u64_be(buf, 0)
+				if payload_len > 16777216:
+					Err("frame exceeds maximum size (16 MB)")
+				else:
+					Ok(payload_len)
+
+
+-- Read mask key if frame is masked
+private func read_mask_key(ws: WebSocket, masked: Bool) -> Result[Bytes, String]:
+	if masked:
+		read_exact(ws, 4)
+	else:
+		Ok(B.bytes(0))
+
+
+-- ============================================================================
+-- Close
+-- ============================================================================
+---
+Close the WebSocket connection. Sends a close frame and closes the transport.
+---
+func close(ws: WebSocket) -> Void:
+	-- Send close frame (best effort)
+	_ = send_frame(ws, opcode_close(), B.bytes(0))
+	match ws.transport:
+		WsTcp(fd): TCP.close(fd)
+		WsTls(conn): TLS.close(conn)
+
+
+-- ============================================================================
+-- Frame Encoding
+-- ============================================================================
+-- Encode a WebSocket frame (client frames are always masked)
+-- Not [pure]: calls [crypto_random_bytes] for the mask key per RFC 6455.
+func encode_frame(opcode: Int, payload: Bytes) -> Bytes:
+	payload_len: Int = B.length(payload)
+	-- Calculate header size
+	header_size: Int = 2 + 4 -- base header + mask key
+	header_size2: Int = if payload_len >= 65536:
+		header_size + 8
+	else if payload_len >= 126:
+		header_size + 2
+	else:
+		header_size
+	-- Build frame
+	var frame: Bytes = B.bytes(header_size2 + payload_len)
+	-- First byte: FIN + opcode
+	frame = B.set_index(frame, 0, 128 + opcode)
+	-- Second byte: MASK bit + length
+	var offset: Int = 2
+	if payload_len < 126:
+		frame = B.set_index(frame, 1, 128 + payload_len)
+	else if payload_len < 65536:
+		frame = B.set_index(frame, 1, 128 + 126)
+		frame = B.set_index(frame, 2, payload_len / 256)
+		frame = B.set_index(frame, 3, payload_len % 256)
+		offset = 4
+	else:
+		frame = B.set_index(frame, 1, 128 + 127)
+		frame = write_u64_be(frame, 2, payload_len)
+		offset = 10
+	-- Generate mask key
+	mask: Bytes = crypto_random_bytes(4)
+	frame = B.blit(frame, offset, mask, 0, 4)
+	-- Mask and write payload
+	var i: Int = 0
+	while i < payload_len:
+		pb: Int = byte_at(payload, i)
+		mb: Int = byte_at(mask, i % 4)
+		-- XOR using bitwise: xor(a,b) = (a + b) - 2 * (a AND b)
+		-- But blorp doesn't have bitwise XOR... use the fact that for bytes:
+		-- We can compute XOR via lookup or arithmetic
+		xored: Int = bitwise_xor_byte(pb, mb)
+		frame = B.set_index(frame, offset + 4 + i, xored)
+		i += 1
+	frame
+
+
+-- Apply mask to payload bytes
+pure func apply_mask(data: Bytes, mask: Bytes) -> Bytes:
+	if B.length(mask) < 4:
+		data
+	else:
+		len: Int = B.length(data)
+		var result: Bytes = B.bytes(len)
+		var i: Int = 0
+		while i < len:
+			db: Int = byte_at(data, i)
+			mb: Int = byte_at(mask, i % 4)
+			result = B.set_index(result, i, bitwise_xor_byte(db, mb))
+			i += 1
+		result
+
+
+-- Bitwise XOR for single bytes (0-255)
+-- Since blorp doesn't have bitwise operators, compute via bit decomposition
+pure func bitwise_xor_byte(a: Int, b: Int) -> Int:
+	var result: Int = 0
+	var va: Int = a % 256
+	var vb: Int = b % 256
+	var bit: Int = 1
+	var i: Int = 0
+	while i < 8:
+		da: Int = va / bit % 2
+		db: Int = vb / bit % 2
+		-- XOR: 1 if different, 0 if same
+		if da != db:
+			result += bit
+		bit *= 2
+		i += 1
+	result
+
+
+-- ============================================================================
+-- Transport I/O Helpers
+-- ============================================================================
+-- Read exactly n bytes from transport
+private func read_exact(ws: WebSocket, n: Int) -> Result[Bytes, String]:
+	if n == 0:
+		Ok(B.bytes(0))
+	else:
+		var buf: Bytes = B.bytes(0)
+		var remaining: Int = n
+		var err: String = ""
+		var failed: Bool = False
+		while remaining > 0 and not failed:
+			match read_transport(ws, remaining):
+				Ok(chunk):
+					if B.length(chunk) == 0:
+						err = "connection closed"
+						failed = True
+					else:
+						buf = B.append(buf, chunk)
+						remaining -= B.length(chunk)
+				Err(e):
+					err = e
+					failed = True
+		if failed:
+			Err(err)
+		else:
+			Ok(buf)
+
+
+-- Read from transport (TCP or TLS)
+private func read_transport(ws: WebSocket, max_bytes: Int) -> Result[Bytes, String]:
+	var result: Result[Bytes, String] = Err("no transport")
+	match ws.transport:
+		WsTcp(fd):
+			result = TCP.read(fd, max_bytes)
+		WsTls(conn):
+			result = TLS.read(conn, max_bytes)
+	result
+
+
+-- ============================================================================
+-- Handshake
+-- ============================================================================
+-- Generate a random WebSocket key (16 bytes base64-encoded)
+private func generate_key() -> String:
+	raw: Bytes = crypto_random_bytes(16)
+	B.to_string(raw).base64_encode()
+
+
+-- Build the HTTP upgrade request
+private pure func build_handshake(host: String, port: Int, url: Url, key: String) -> Bytes:
+	var path: String = "/"
+	if url.path.length() > 0:
+		path = url.path.substring(0, url.path.length())
+	var query_part: String = ""
+	if url.query.length() > 0:
+		query_part = "?" + url.query
+	var s: String = "GET " + path + query_part + " HTTP/1.1\r\n"
+	s = s + "Host: " + host + "\r\n"
+	s += "Upgrade: websocket\r\n"
+	s += "Connection: Upgrade\r\n"
+	s = s + "Sec-WebSocket-Key: " + key + "\r\n"
+	s += "Sec-WebSocket-Version: 13\r\n"
+	s += "\r\n"
+	s.to_bytes()
+
+
+-- Compute the expected accept value for a given key
+private pure func compute_accept(key: String) -> String:
+	combined: String = key + ws_guid()
+	hex: String = sha1(combined)
+	match B.from_hex(hex):
+		Some(raw): B.to_string(raw).base64_encode()
+		None: ""
+
+
+-- Read handshake response from TCP
+private func read_handshake_tcp(fd: Int) -> Result[String, String]:
+	var buf: Bytes = B.bytes(0)
+	var done: Bool = False
+	while not done:
+		match TCP.read(fd, 4096):
+			Ok(chunk):
+				if B.length(chunk) == 0:
+					done = True
+				else:
+					buf = B.append(buf, chunk)
+					-- Check for end of headers
+					if B.to_string(buf).contains("\r\n\r\n"):
+						done = True
+			Err(_):
+				done = True
+	if B.length(buf) == 0:
+		Err("empty handshake response")
+	else:
+		Ok(B.to_string(buf))
+
+
+-- Read handshake response from TLS
+private func read_handshake_tls(conn: Ptr) -> Result[String, String]:
+	var buf: Bytes = B.bytes(0)
+	var done: Bool = False
+	while not done:
+		match TLS.read(conn, 4096):
+			Ok(chunk):
+				if B.length(chunk) == 0:
+					done = True
+				else:
+					buf = B.append(buf, chunk)
+					if B.to_string(buf).contains("\r\n\r\n"):
+						done = True
+			Err(_):
+				done = True
+	if B.length(buf) == 0:
+		Err("empty handshake response")
+	else:
+		Ok(B.to_string(buf))
+
+
+-- Verify the server's handshake response
+private pure func verify_handshake(response: String, key: String) -> Result[Bool, String]:
+	-- Check for "101" status
+	if not response.contains("101"):
+		trunc_len: Int = if response.length() < 100:
+			response.length()
+		else:
+			100
+		Err("server rejected upgrade: " + response.substring(0, trunc_len))
+	else:
+		-- Find Sec-WebSocket-Accept header
+		expected: String = compute_accept(key)
+		if response.contains(expected):
+			Ok(True)
+		else:
+			Err("invalid Sec-WebSocket-Accept")
+
+
+-- ============================================================================
+-- Binary Helpers
+-- ============================================================================
+-- Read big-endian u16 from bytes at offset
+pure func read_u16_be(b: Bytes, offset: Int) -> Int:
+	byte_at(b, offset) * 256 + byte_at(b, offset + 1)
+
+
+-- Read big-endian u64 from bytes at offset
+pure func read_u64_be(b: Bytes, offset: Int) -> Int:
+	var result: Int = 0
+	var i: Int = 0
+	while i < 8:
+		result = result * 256 + byte_at(b, offset + i)
+		i += 1
+	result
+
+
+-- Write big-endian u64 to bytes at offset
+private pure func write_u64_be(b: Bytes, offset: Int, value: Int) -> Bytes:
+	var result: Bytes = b
+	var v: Int = value
+	var i: Int = 7
+	while i >= 0:
+		result = B.set_index(result, offset + i, v % 256)
+		v /= 256
+		i -= 1
+	result

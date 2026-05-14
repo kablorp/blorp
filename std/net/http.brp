@@ -1,0 +1,286 @@
+import:
+	bytes: bytes
+
+
+-- HTTP - Pure HTTP/1.1 request/response parsing and formatting
+--
+-- All functions are pure — no I/O. Operates on Bytes buffers for
+-- integration with TCP networking.
+--
+-- Supports:
+-- - Parsing HTTP/1.1 requests (GET, POST, etc.)
+-- - Formatting HTTP/1.1 responses
+-- - Query string parsing
+-- - Header lookup
+-- ============================================================================
+-- Types
+-- ============================================================================
+record Header {name: String, value: String}
+
+
+record Request {
+	method: String,
+	path: String,
+	query: String,
+	version: String,
+	headers: List[Header],
+	body: Bytes,
+}
+
+
+record Response {status_code: Int, status_text: String, headers: List[Header], body: Bytes}
+
+
+-- ============================================================================
+-- Request Parsing
+-- ============================================================================
+---
+Parse an HTTP request from raw bytes.
+Returns Err if the request is malformed.
+---
+pure func parse_request(raw: Bytes) -> Result[Request, String]:
+	raw_str: String = raw.to_string()
+
+	-- Find header/body separator
+	sep_idx: Int = raw_str.raw_index_of("\r\n\r\n")
+	if sep_idx == -1:
+		Err("malformed request: missing header terminator")
+	else:
+		header_section: String = raw_str.substring(0, sep_idx)
+		body_start: Int = sep_idx + 4
+		body_bytes: Bytes = if body_start < raw.length():
+			raw.slice(body_start, raw.length() - body_start)
+		else:
+			bytes(0)
+		header_lines: List[String] = header_section.split("\r\n")
+		if header_lines.length() == 0:
+			Err("malformed request: empty headers")
+		else:
+			match header_lines.get(0):
+				Some(request_line):
+					parse_request_inner(request_line, header_lines, body_bytes)
+				None:
+					Err("malformed request: no request line")
+
+
+-- Helper to parse the request line and remaining headers
+private pure func parse_request_inner(
+	request_line: String,
+	header_lines: List[String],
+	body_bytes: Bytes,
+) -> Result[Request, String]:
+	parts: List[String] = request_line.split(" ")
+	match parts:
+		[method, full_path, version, ...rest]:
+			(path, query) = split_path_query(full_path)
+			headers: List[Header] = parse_headers(header_lines, 1)
+			Ok(
+				{
+					method = method,
+					path = path,
+					query = query,
+					version = version,
+					headers = headers,
+					body = body_bytes,
+				},
+			)
+		_:
+			Err("malformed request line: " + request_line)
+
+
+-- Split a path into (path, query_string)
+private pure func split_path_query(full_path: String) -> (String, String):
+	qidx: Int = full_path.raw_index_of("?")
+	if qidx == -1:
+		empty_q: String = full_path.substring(0, 0)
+		result: (String, String) = (full_path, empty_q)
+		result
+	else:
+		path_part: String = full_path.substring(0, qidx)
+		query_part: String = full_path.substring(qidx + 1, full_path.length() - qidx - 1)
+		result: (String, String) = (path_part, query_part)
+		result
+
+
+-- Parse header lines starting from a given index
+private pure func parse_headers(lines: List[String], start: Int) -> List[Header]:
+	var result: List[Header] = []
+	for i in start..lines.length():
+		match lines.get(i):
+			Some(line):
+				colon_idx: Int = line.raw_index_of(": ")
+				if colon_idx > 0:
+					name: String = line.substring(0, colon_idx)
+					value: String = line.substring(colon_idx + 2, line.length() - colon_idx - 2)
+					result = result.append({name = name, value = value})
+			None: void
+	result
+
+
+-- ============================================================================
+-- Query String Parsing
+-- ============================================================================
+---
+Parse a URL query string into key-value pairs.
+Example: "foo=bar&baz=qux" -> [("foo", "bar"), ("baz", "qux")]
+---
+pure func parse_query_string(query: String) -> List[(String, String)]:
+	if query.length() == 0:
+		[]
+	else:
+		parts: List[String] = query.split("&")
+		var result: List[(String, String)] = []
+		for i in 0..parts.length():
+			match parts.get(i):
+				Some(part):
+					eq_idx: Int = part.raw_index_of("=")
+					if eq_idx > 0:
+						key: String = part.substring(0, eq_idx)
+						val: String = part.substring(eq_idx + 1, part.length() - eq_idx - 1)
+						result = result.append((key, val))
+					else:
+						empty_v: String = part.substring(0, 0)
+						result = result.append((part, empty_v))
+				None: void
+		result
+
+
+-- ============================================================================
+-- Response Formatting
+-- ============================================================================
+---
+Format an HTTP response into bytes ready to send over TCP.
+---
+pure func format_response(resp: Response) -> Bytes:
+	var s: String = "HTTP/1.1 " + resp.status_code.to_string() + " " + resp.status_text + "\r\n"
+
+	-- Add Content-Length header if body is non-empty
+	body_len: Int = resp.body.length()
+	has_content_length: Bool = header_exists(resp.headers, "Content-Length")
+	if body_len > 0 and not has_content_length:
+		s = s + "Content-Length: " + body_len.to_string() + "\r\n"
+
+	-- Add Connection: close unless user specified otherwise
+	if not header_exists(resp.headers, "Connection"):
+		s += "Connection: close\r\n"
+
+	-- Add user headers
+	s = format_headers_into(s, resp.headers, 0)
+	s += "\r\n"
+
+	-- Combine header bytes + body bytes
+	header_bytes: Bytes = s.to_bytes()
+	if body_len > 0:
+		header_bytes.append(resp.body)
+	else:
+		header_bytes
+
+
+-- Format headers into a string (recursive to avoid type erasure in match)
+private pure func format_headers_into(s: String, headers: List[Header], i: Int) -> String:
+	if i >= headers.length():
+		s
+	else:
+		match headers.get(i):
+			Some(h):
+				hdr: Header = h
+				format_headers_into(s + hdr.name + ": " + hdr.value + "\r\n", headers, i + 1)
+			None: s
+
+
+-- Check if a header name exists
+private pure func header_exists(headers: List[Header], name: String) -> Bool:
+	header_exists_at(headers, name, 0)
+
+
+private pure func header_exists_at(headers: List[Header], name: String, i: Int) -> Bool:
+	if i >= headers.length():
+		False
+	else:
+		match headers.get(i):
+			Some(h):
+				hdr: Header = h
+				if hdr.name.equal_ignore_case(name):
+					True
+				else:
+					header_exists_at(headers, name, i + 1)
+			None: False
+
+
+-- ============================================================================
+-- Status Codes
+-- ============================================================================
+---
+Get the standard status text for an HTTP status code.
+---
+pure func status_text(code: Int) -> String:
+	match code:
+		200: "OK"
+		201: "Created"
+		204: "No Content"
+		301: "Moved Permanently"
+		302: "Found"
+		304: "Not Modified"
+		400: "Bad Request"
+		401: "Unauthorized"
+		403: "Forbidden"
+		404: "Not Found"
+		405: "Method Not Allowed"
+		408: "Request Timeout"
+		500: "Internal Server Error"
+		502: "Bad Gateway"
+		503: "Service Unavailable"
+		_: "Unknown"
+
+
+-- ============================================================================
+-- Convenience Constructors
+-- ============================================================================
+---
+Create a 200 OK response with a text body.
+---
+pure func ok_text(body: String) -> Response:
+	body_bytes: Bytes = body.to_bytes()
+	{
+		status_code = 200,
+		status_text = "OK",
+		headers = [{name = "Content-Type", value = "text/plain"}],
+		body = body_bytes,
+	}
+
+
+---
+Create an error response with a status code and message.
+---
+pure func error_response(code: Int, msg: String) -> Response:
+	body_bytes: Bytes = msg.to_bytes()
+	{
+		status_code = code,
+		status_text = status_text(code),
+		headers = [{name = "Content-Type", value = "text/plain"}],
+		body = body_bytes,
+	}
+
+
+-- ============================================================================
+-- Header Utilities
+-- ============================================================================
+---
+Look up a header value by name (case-insensitive).
+---
+pure func get_header(headers: List[Header], name: String) -> Option[String]:
+	get_header_at(headers, name, 0)
+
+
+private pure func get_header_at(headers: List[Header], name: String, i: Int) -> Option[String]:
+	if i >= headers.length():
+		None
+	else:
+		match headers.get(i):
+			Some(h):
+				hdr: Header = h
+				if hdr.name.equal_ignore_case(name):
+					Some(hdr.value)
+				else:
+					get_header_at(headers, name, i + 1)
+			None: None

@@ -1,0 +1,741 @@
+-- XML - Simple XML element parser
+--
+-- Parses XML into a tree of XmlNode values.
+-- Supports elements, attributes, text content, and self-closing tags.
+-- Supports the five predefined XML entities only.
+-- Does not support: namespaces, CDATA, processing instructions, DTD.
+-- Unsupported declarations, nested comments, and malformed input return Err.
+--
+-- Usage:
+-- match parse("<root><item id=\"1\">hello</item></root>"):
+-- Ok(node): get_text(node)
+-- Err(e): ""
+-- ============================================================================
+-- Types
+-- ============================================================================
+union XmlNode:
+	XmlElement(String, List[(String, String)], List[XmlNode])
+	XmlText(String)
+
+
+record XmlError {line: Int, column: Int, message: String}
+
+
+pure func format_error(err: XmlError) -> String:
+	"line " + err.line.to_string() + ", column " + err.column.to_string() + ": " + err.message
+
+
+-- ============================================================================
+-- Public API
+-- ============================================================================
+---
+Parse an XML string into an XmlNode tree.
+Parse errors include line and column context in the returned string. Use
+`parse_detailed` when callers need structured error fields.
+
+doctests:
+    :: Simple element
+    match parse("<root>hello</root>"):
+        Ok(n): True
+        Err(_): False
+---
+pure func parse(input: String) -> Result[XmlNode, String]:
+	match parse_detailed(input):
+		Ok(node): Ok(node)
+		Err(err): Err(err.format_error())
+
+
+---
+Parse an XML string into an XmlNode tree with structured parser error details.
+Use `parse` if you only need a formatted string error.
+
+doctests:
+    :: Structured parse error
+    match parse_detailed("<root>\n  <item></root>"):
+        Ok(_): False
+        Err(e): e.line == 2 and e.column == 9
+---
+pure func parse_detailed(input: String) -> Result[XmlNode, XmlError]:
+	trimmed: String = input.trim()
+	if trimmed.length() == 0:
+		Err(parse_error(trimmed, 0, "empty input"))
+	else if trimmed.substring(0, 1) != "<":
+		Err(parse_error(trimmed, 0, "expected '<'"))
+	else:
+		match parse_node(trimmed, 0):
+			Ok(result):
+				trailing_pos: Int = skip_ws_pos(trimmed, result.1)
+				remaining: String = trimmed
+					.substring(trailing_pos, trimmed.length() - trailing_pos)
+					.trim()
+				if not is_element(result.0):
+					Err(parse_error(trimmed, 0, "malformed XML"))
+				else if remaining.length() > 0:
+					Err(parse_error(trimmed, trailing_pos, "unexpected trailing input"))
+				else:
+					Ok(result.0)
+			Err(err): Err(err)
+
+
+---
+Get the tag name of an element node.
+---
+pure func get_tag(node: XmlNode) -> Option[String]:
+	var result: Option[String] = None
+	match node:
+		XmlElement(tag, _, _):
+			result = Some(tag)
+		XmlText(_):
+			result = None
+	result
+
+
+---
+Get attribute value by name.
+---
+pure func get_attr(node: XmlNode, name: String) -> Option[String]:
+	var result: Option[String] = None
+	match node:
+		XmlElement(_, attrs, _):
+			result = find_attr(attrs, name)
+		XmlText(_):
+			result = None
+	result
+
+
+---
+Get the text content of a node (first text child only for elements).
+---
+pure func get_text(node: XmlNode) -> String:
+	var result: String = ""
+	match node:
+		XmlElement(_, _, kids):
+			result = first_text(kids)
+		XmlText(t):
+			result = t
+	result
+
+
+---
+Get child elements by tag name.
+---
+pure func find(node: XmlNode, tag: String) -> List[XmlNode]:
+	var result: List[XmlNode] = []
+	match node:
+		XmlElement(_, _, kids):
+			result = filter_by_tag(kids, tag)
+		XmlText(_):
+			result = []
+	result
+
+
+---
+Get all child elements.
+---
+pure func children(node: XmlNode) -> List[XmlNode]:
+	var result: List[XmlNode] = []
+	match node:
+		XmlElement(_, _, kids):
+			result = kids
+		XmlText(_):
+			result = []
+	result
+
+
+-- ============================================================================
+-- Internal parsing
+-- ============================================================================
+private pure func line_column_at(s: String, pos: Int) -> (Int, Int):
+	var target: Int = pos
+	if target < 0:
+		target = 0
+	else if target > s.length():
+		target = s.length()
+	var line: Int = 1
+	var column: Int = 1
+	var i: Int = 0
+	while i < target:
+		match s.get(i):
+			Some('\n'):
+				line += 1
+				column = 1
+			Some(_):
+				column += 1
+			None: void
+		i += 1
+	(line, column)
+
+
+private pure func parse_error(s: String, pos: Int, message: String) -> XmlError:
+	position: (Int, Int) = line_column_at(s, pos)
+	{line = position.0, column = position.1, message = message}
+
+
+private pure func leading_ws_count(s: String) -> Int:
+	var i: Int = 0
+	var done: Bool = False
+	while i < s.length() and not done:
+		match s.get(i):
+			Some(c):
+				if c == ' ' or c == '\t' or c == '\n' or c == '\r':
+					i += 1
+				else:
+					done = True
+			None:
+				done = True
+	i
+
+
+private pure func skip_ws_pos(s: String, pos: Int) -> Int:
+	var i: Int = pos
+	var done: Bool = False
+	while i < s.length() and not done:
+		match s.get(i):
+			Some(c):
+				if c == ' ' or c == '\t' or c == '\n' or c == '\r':
+					i += 1
+				else:
+					done = True
+			None:
+				done = True
+	i
+
+
+private pure func parse_node(s: String, pos: Int) -> Result[(XmlNode, Int), XmlError]:
+	if pos >= s.length():
+		Err(parse_error(s, pos, "unexpected end of input"))
+	else:
+		match s.get(pos):
+			Some('<'): parse_element(s, pos)
+			Some(_): parse_text_node(s, pos)
+			None: Err(parse_error(s, pos, "unexpected end of input"))
+
+
+private pure func parse_text_node(s: String, pos: Int) -> Result[(XmlNode, Int), XmlError]:
+	-- Find end of text (next < or end of string)
+	var i: Int = pos
+	var done: Bool = False
+	while i < s.length() and not done:
+		match s.get(i):
+			Some('<'): done = True
+			Some(_): i += 1
+			None: done = True
+	text: String = s.substring(pos, i - pos)
+	match unescape_xml_at(s, text, pos):
+		Ok(unescaped): Ok((XmlText(unescaped), i))
+		Err(msg): Err(msg)
+
+
+private pure func parse_element(s: String, pos: Int) -> Result[(XmlNode, Int), XmlError]:
+	-- pos is at '<'
+	-- Find closing '>'
+	close: Int = find_char(s, pos + 1, '>')
+	if close < 0:
+		Err(parse_error(s, pos, "unterminated tag"))
+	else:
+		tag_content: String = s
+			.substring(pos + 1, close - pos - 1)
+			.trim()
+		if tag_content.length() == 0:
+			Err(parse_error(s, pos, "empty tag"))
+		else if starts_at(tag_content, 0, "/"):
+			Err(parse_error(s, pos, "unexpected closing tag"))
+		else if starts_at(tag_content, 0, "?"):
+			Err(parse_error(s, pos, "processing instructions are not supported"))
+		else if starts_at(tag_content, 0, "!"):
+			Err(parse_error(s, pos, "DTD and CDATA declarations are not supported"))
+		else if tag_content.ends_with("/"):
+			inner: String = tag_content
+				.substring(0, tag_content.length() - 1)
+				.trim()
+			match parse_tag_attrs(s, inner, pos + 1):
+				Ok(tag_and_attrs):
+					Ok((XmlElement(tag_and_attrs.0, tag_and_attrs.1, []), close + 1))
+				Err(msg): Err(msg)
+		else:
+			match parse_tag_attrs(s, tag_content, pos + 1):
+				Ok(tag_and_attrs):
+					-- Opening tag
+					tag_name: String = tag_and_attrs.0
+					match parse_children(s, close + 1, tag_name):
+						Ok(children_result):
+							Ok(
+								(
+									XmlElement(tag_name, tag_and_attrs.1, children_result.0),
+									children_result.1,
+								),
+							)
+						Err(msg): Err(msg)
+				Err(msg): Err(msg)
+
+
+private pure func parse_children(
+	s: String,
+	pos: Int,
+	parent_tag: String,
+) -> Result[(List[XmlNode], Int), XmlError]:
+	var kids: List[XmlNode] = []
+	var i: Int = pos
+	var done: Bool = False
+	var ok: Bool = True
+	var error: XmlError = {line = 1, column = 1, message = ""}
+	while i < s.length() and not done and ok:
+		-- Check for closing tag
+		if starts_at(s, i, "</"):
+			-- Find end of closing tag
+			close: Int = find_char(s, i + 2, '>')
+			if close < 0:
+				ok = False
+				error = parse_error(s, i, "unterminated closing tag")
+			else:
+				end_tag: String = s
+					.substring(i + 2, close - i - 2)
+					.trim()
+				if end_tag == parent_tag:
+					i = close + 1
+					done = True
+				else:
+					ok = False
+					error = parse_error(
+						s,
+						i,
+						"mismatched closing tag: expected " + parent_tag + ", found " + end_tag,
+					)
+		else if char_at(s, i, '<'):
+			if starts_at(s, i, "<!--"):
+				-- Skip comments
+				comment_end: Int = find_str(s, i + 4, "-->")
+				if comment_end >= 0:
+					nested_comment: Int = find_str(s, i + 4, "<!--")
+					dash_pair: Int = find_str(s, i + 4, "--")
+					if nested_comment >= 0 and nested_comment < comment_end:
+						ok = False
+						error = parse_error(s, nested_comment, "nested comments are not supported")
+					else if dash_pair >= 0 and dash_pair < comment_end:
+						ok = False
+						error = parse_error(s, dash_pair, "invalid comment content")
+					else:
+						i = comment_end + 3
+				else:
+					ok = False
+					error = parse_error(s, i, "unterminated comment")
+			else if starts_at(s, i, "<![CDATA["):
+				ok = False
+				error = parse_error(s, i, "CDATA is not supported")
+			else if starts_at(s, i, "<?"):
+				ok = False
+				error = parse_error(s, i, "processing instructions are not supported")
+			else if starts_at(s, i, "<!"):
+				ok = False
+				error = parse_error(s, i, "DTD declarations are not supported")
+			else:
+				match parse_element(s, i):
+					Ok(child):
+						kids = kids.append(child.0)
+						i = child.1
+					Err(msg):
+						ok = False
+						error = msg
+		else:
+			match parse_text_node(s, i):
+				Ok(child):
+					-- Text node
+					-- Only add non-empty text
+					text_val: String = get_text_val(child.0)
+					if text_val
+						.trim()
+						.length() > 0:
+						kids = kids.append(child.0)
+					i = child.1
+				Err(msg):
+					ok = False
+					error = msg
+	if not ok:
+		Err(error)
+	else if not done:
+		Err(parse_error(s, s.length(), "missing closing tag: " + parent_tag))
+	else:
+		Ok((kids, i))
+
+
+private pure func parse_tag_attrs(
+	full: String,
+	s: String,
+	base_pos: Int,
+) -> Result[(String, List[(String, String)]), XmlError]:
+	-- Split tag name from attributes
+	content: String = s.trim()
+	content_base: Int = base_pos + leading_ws_count(s)
+	if content.length() == 0:
+		Err(parse_error(full, base_pos, "empty tag"))
+	else:
+		space_pos: Int = find_space(content)
+		tag: String = if space_pos < 0:
+			content
+		else:
+			content.substring(0, space_pos)
+		if not is_xml_name(tag):
+			Err(parse_error(full, content_base, "invalid tag name"))
+		else if space_pos < 0:
+			Ok((tag, []))
+		else:
+			raw_attr_str: String = content.substring(
+				space_pos + 1,
+				content.length() - space_pos - 1,
+			)
+			attr_base: Int = content_base + space_pos + 1 + leading_ws_count(raw_attr_str)
+			attr_str: String = raw_attr_str.trim()
+			match parse_attrs(full, attr_str, attr_base):
+				Ok(attrs): Ok((tag, attrs))
+				Err(msg): Err(msg)
+
+
+private pure func parse_attrs(
+	full: String,
+	s: String,
+	base_pos: Int,
+) -> Result[List[(String, String)], XmlError]:
+	var result: List[(String, String)] = []
+	var remaining: String = s.trim()
+	var remaining_pos: Int = base_pos + leading_ws_count(s)
+	var done: Bool = False
+	var ok: Bool = True
+	var error: XmlError = {line = 1, column = 1, message = ""}
+	while remaining.length() > 0 and not done and ok:
+		-- Find = sign
+		eq_pos: Int = remaining.raw_index_of("=")
+		if eq_pos <= 0:
+			ok = False
+			error = parse_error(full, remaining_pos, "expected attribute assignment")
+		else:
+			attr_name: String = remaining
+				.substring(0, eq_pos)
+				.trim()
+			raw_after_eq: String = remaining.substring(eq_pos + 1, remaining.length() - eq_pos - 1)
+			after_eq_pos: Int = remaining_pos + eq_pos + 1 + leading_ws_count(raw_after_eq)
+			after_eq: String = raw_after_eq.trim()
+			if not is_xml_name(attr_name):
+				ok = False
+				error = parse_error(full, remaining_pos, "invalid attribute name")
+			else if attr_exists(result, attr_name):
+				ok = False
+				error = parse_error(full, remaining_pos, "duplicate attribute: " + attr_name)
+			else if after_eq.length() == 0:
+				ok = False
+				error = parse_error(full, after_eq_pos, "missing attribute value")
+			else:
+				match after_eq.get(0):
+					Some(quote):
+						if quote == '\"' or quote == '\'':
+							close_quote: Int = find_char(after_eq, 1, quote)
+							if close_quote < 0:
+								ok = False
+								error = parse_error(
+									full,
+									after_eq_pos,
+									"unterminated attribute value",
+								)
+							else:
+								attr_val: String = after_eq.substring(1, close_quote - 1)
+								match unescape_xml_at(full, attr_val, after_eq_pos + 1):
+									Ok(unescaped):
+										result = append_attr(result, (attr_name, unescaped))
+										raw_remaining: String = after_eq.substring(
+											close_quote + 1,
+											after_eq.length() - close_quote - 1,
+										)
+										remaining_pos = after_eq_pos + close_quote + 1 + leading_ws_count(
+											raw_remaining,
+										)
+										remaining = raw_remaining.trim()
+									Err(msg):
+										ok = False
+										error = msg
+						else:
+							ok = False
+							error = parse_error(
+								full,
+								after_eq_pos,
+								"attribute values must be quoted",
+							)
+					None:
+						ok = False
+						error = parse_error(full, after_eq_pos, "missing attribute value")
+	if ok:
+		Ok(result)
+	else:
+		Err(error)
+
+
+private pure func attr_exists(attrs: List[(String, String)], name: String) -> Bool:
+	var found: Bool = False
+	var remaining: List[(String, String)] = attrs
+	var done: Bool = False
+	while not done and not found:
+		match remaining:
+			[]:
+				done = True
+			[pair, ...rest]:
+				if pair.0 == name:
+					found = True
+				else:
+					remaining = rest
+			_:
+				done = True
+	found
+
+
+private pure func is_xml_name_start(c: Char) -> Bool:
+	c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c == '_'
+
+
+private pure func is_xml_name_char(c: Char) -> Bool:
+	is_xml_name_start(c) or c >= '0' and c <= '9' or c == '-' or c == '.'
+
+
+private pure func is_xml_name(name: String) -> Bool:
+	if name.length() == 0:
+		False
+	else if name.contains(":"):
+		False
+	else:
+		var ok: Bool = True
+		var i: Int = 0
+		while i < name.length() and ok:
+			match name.get(i):
+				Some(ch):
+					if i == 0:
+						ok = is_xml_name_start(ch)
+					else:
+						ok = is_xml_name_char(ch)
+				None:
+					ok = False
+			i += 1
+		ok
+
+
+private pure func char_at(s: String, pos: Int, ch: Char) -> Bool:
+	match s.get(pos):
+		Some(actual): actual == ch
+		None: False
+
+
+private pure func starts_at(s: String, pos: Int, prefix: String) -> Bool:
+	plen: Int = prefix.length()
+	if pos < 0 or pos + plen > s.length():
+		False
+	else:
+		var ok: Bool = True
+		var i: Int = 0
+		while i < plen and ok:
+			match (s.get(pos + i), prefix.get(i)):
+				(Some(actual), Some(expected)):
+					if actual != expected:
+						ok = False
+				_:
+					ok = False
+			i += 1
+		ok
+
+
+private pure func append_attr(
+	list: List[(String, String)],
+	attr: (String, String),
+) -> List[(String, String)]:
+	list.append(attr)
+
+
+-- ============================================================================
+-- Helpers
+-- ============================================================================
+private pure func find_char(s: String, start: Int, ch: Char) -> Int:
+	var i: Int = start
+	var found: Int = -1
+	var done: Bool = False
+	while i < s.length() and not done:
+		match s.get(i):
+			Some(actual):
+				if actual == ch:
+					found = i
+					done = True
+			None:
+				done = True
+		i += 1
+	found
+
+
+private pure func find_str(s: String, start: Int, target: String) -> Int:
+	tlen: Int = target.length()
+	var i: Int = start
+	var found: Int = -1
+	var done: Bool = False
+	while i + tlen <= s.length() and not done:
+		if starts_at(s, i, target):
+			found = i
+			done = True
+		i += 1
+	found
+
+
+private pure func find_space(s: String) -> Int:
+	var i: Int = 0
+	var found: Int = -1
+	var done: Bool = False
+	while i < s.length() and not done:
+		match s.get(i):
+			Some(c):
+				if c == ' ' or c == '\t' or c == '\n':
+					found = i
+					done = True
+			None:
+				done = True
+		i += 1
+	found
+
+
+private pure func find_attr(attrs: List[(String, String)], name: String) -> Option[String]:
+	var result: Option[String] = None
+	var remaining: List[(String, String)] = attrs
+	var done: Bool = False
+	while not done:
+		match remaining:
+			[]:
+				done = True
+			[pair, ...rest]:
+				if pair.0 == name:
+					result = Some(pair.1)
+					done = True
+				else:
+					remaining = rest
+			_:
+				done = True
+	result
+
+
+private pure func first_text(nodes: List[XmlNode]) -> String:
+	var result: String = ""
+	var remaining: List[XmlNode] = nodes
+	var done: Bool = False
+	while not done:
+		match remaining:
+			[]:
+				done = True
+			[node, ...rest]:
+				txt: String = get_text_val(node)
+				if txt.length() > 0:
+					result = txt
+					done = True
+				else:
+					remaining = rest
+			_:
+				done = True
+	result
+
+
+private pure func is_element_with_tag(node: XmlNode, target: String) -> Bool:
+	var result: Bool = False
+	match node:
+		XmlElement(tag, _, _):
+			result = tag == target
+		XmlText(_):
+			result = False
+	result
+
+
+private pure func filter_by_tag(nodes: List[XmlNode], target: String) -> List[XmlNode]:
+	var result: List[XmlNode] = []
+	var remaining: List[XmlNode] = nodes
+	var done: Bool = False
+	while not done:
+		match remaining:
+			[]:
+				done = True
+			[node, ...rest]:
+				if is_element_with_tag(node, target):
+					result = result.append(node)
+				remaining = rest
+			_:
+				done = True
+	result
+
+
+private pure func is_element(node: XmlNode) -> Bool:
+	var result: Bool = False
+	match node:
+		XmlElement(_, _, _):
+			result = True
+		XmlText(_):
+			result = False
+	result
+
+
+private pure func get_text_val(node: XmlNode) -> String:
+	var result: String = ""
+	match node:
+		XmlText(t):
+			result = t
+		XmlElement(_, _, _):
+			result = ""
+	result
+
+
+private pure func unescape_xml_at(
+	full: String,
+	s: String,
+	base_pos: Int,
+) -> Result[String, XmlError]:
+	-- Fast path: no entities to unescape
+	amp_pos: Int = find_char(s, 0, '&')
+	if amp_pos < 0:
+		Ok(s)
+	else:
+		unescape_iter_at(full, s, base_pos, amp_pos)
+
+
+private pure func unescape_iter_at(
+	full: String,
+	s: String,
+	base_pos: Int,
+	first_amp: Int,
+) -> Result[String, XmlError]:
+	-- Copy prefix before first &, then process entities
+	var result: String = s.substring(0, first_amp)
+	var i: Int = first_amp
+	slen: Int = s.length()
+	var ok: Bool = True
+	var error: XmlError = {line = 1, column = 1, message = ""}
+	while i < slen and ok:
+		if char_at(s, i, '&'):
+			if i + 3 < slen and starts_at(s, i, "&lt;"):
+				result += "<"
+				i += 4
+			else if i + 3 < slen and starts_at(s, i, "&gt;"):
+				result += ">"
+				i += 4
+			else if i + 4 < slen and starts_at(s, i, "&amp;"):
+				result += "&"
+				i += 5
+			else if i + 5 < slen and starts_at(s, i, "&quot;"):
+				result += "\""
+				i += 6
+			else if i + 5 < slen and starts_at(s, i, "&apos;"):
+				result += "'"
+				i += 6
+			else:
+				ok = False
+				error = parse_error(full, base_pos + i, "unknown XML entity")
+		else:
+			-- Scan ahead to next & or end, extract chunk
+			var j: Int = i + 1
+			var done: Bool = False
+			while j < slen and not done:
+				if char_at(s, j, '&'):
+					done = True
+				else:
+					j += 1
+			result += s.substring(i, j - i)
+			i = j
+	if ok:
+		Ok(result)
+	else:
+		Err(error)

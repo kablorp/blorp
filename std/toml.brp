@@ -1,0 +1,937 @@
+import:
+	dict: dict
+	set: set
+	string: from_char
+
+
+-- TOML - TOML parser and accessor
+--
+-- Parses a strict subset of TOML v1.0 (key-value pairs, tables, arrays, inline
+-- tables). Unsupported syntax returns Err instead of being guessed as strings.
+-- Values are represented as TomlValue union type.
+--
+-- Supported types: String, Int, Float, Bool, Array, Table
+-- Supported syntax: basic strings, literal strings, integers, floats,
+-- booleans, arrays, inline tables, [table] headers, comments
+-- Rejected TOML v1 syntax: dates/times, multi-line strings, numeric separators,
+-- non-finite floats, quoted keys, unicode escapes, repeated table headers
+-- ============================================================================
+-- Types
+-- ============================================================================
+union TomlValue:
+	TomlString(String)
+	TomlInt(Int)
+	TomlFloat(Float)
+	TomlBool(Bool)
+	TomlArray(List[TomlValue])
+	TomlTable(Dict[String, TomlValue])
+
+
+record TomlError {line: Int, column: Int, message: String}
+
+
+pure func format_parse_error(err: TomlError) -> String:
+	"line " + err.line.to_string() + ", column " + err.column.to_string() + ": " + err.message
+
+
+-- ============================================================================
+-- Public API
+-- ============================================================================
+---
+Parse a TOML string into a TomlValue.
+Table sections are flattened: [server] host = "x" becomes key "server.host".
+Parse errors include line and column context in the returned string. Use
+`parse_detailed` when callers need structured error fields.
+
+doctests:
+    :: Simple key-value
+    match parse("key = \"value\""):
+        Ok(tv): True
+        Err(_): False
+---
+pure func parse(input: String) -> Result[TomlValue, String]:
+	match parse_detailed(input):
+		Ok(value): Ok(value)
+		Err(err): Err(err.format_parse_error())
+
+
+---
+Parse a TOML string into a TomlValue with structured parser error details.
+Table sections are flattened: [server] host = "x" becomes key "server.host".
+Use `parse` if you only need a formatted string error.
+
+doctests:
+    :: Structured parse error
+    match parse_detailed("ok = 1\nname = Alice"):
+        Ok(_): False
+        Err(e): e.line == 2 and e.column == 8
+---
+pure func parse_detailed(input: String) -> Result[TomlValue, TomlError]:
+	lines: List[String] = input.split("\n")
+	match parse_all_lines(lines):
+		Ok(result): Ok(TomlTable(result))
+		Err(err): Err(err)
+
+
+---
+Get a string value by key.
+
+doctests:
+    :: Get string
+    match parse("name = \"Alice\""):
+        Ok(t): get_string(t, "name") == Some("Alice")
+        Err(_): False
+---
+pure func get_string(toml: TomlValue, key: String) -> Option[String]:
+	val: Option[TomlValue] = lookup(toml, key)
+	extract_string(val)
+
+
+---
+Get an integer value by key.
+---
+pure func get_int(toml: TomlValue, key: String) -> Option[Int]:
+	val: Option[TomlValue] = lookup(toml, key)
+	extract_int(val)
+
+
+---
+Get a float value by key.
+---
+pure func get_float(toml: TomlValue, key: String) -> Option[Float]:
+	val: Option[TomlValue] = lookup(toml, key)
+	extract_float(val)
+
+
+---
+Get a boolean value by key.
+---
+pure func get_bool(toml: TomlValue, key: String) -> Option[Bool]:
+	val: Option[TomlValue] = lookup(toml, key)
+	extract_bool(val)
+
+
+---
+Get a value by key from a TOML table.
+---
+pure func lookup(toml: TomlValue, key: String) -> Option[TomlValue]:
+	var result: Option[TomlValue] = None
+	match toml:
+		TomlTable(dict):
+			result = dict.get(key)
+		_:
+			result = None
+	result
+
+
+---
+Get a value by dot-separated path.
+For tables, looks up "section.key" as a flat key.
+---
+pure func lookup_path(toml: TomlValue, path: String) -> Option[TomlValue]:
+	-- First try direct lookup of the dotted key
+	lookup(toml, path)
+
+
+-- ============================================================================
+-- Extractors (avoid nested match in module functions)
+-- ============================================================================
+private pure func extract_string(val: Option[TomlValue]) -> Option[String]:
+	var result: Option[String] = None
+	match val:
+		Some(v):
+			match v:
+				TomlString(s):
+					result = Some(s)
+				_:
+					result = None
+		None:
+			result = None
+	result
+
+
+private pure func extract_int(val: Option[TomlValue]) -> Option[Int]:
+	var result: Option[Int] = None
+	match val:
+		Some(v):
+			match v:
+				TomlInt(n):
+					result = Some(n)
+				_:
+					result = None
+		None:
+			result = None
+	result
+
+
+private pure func extract_float(val: Option[TomlValue]) -> Option[Float]:
+	var result: Option[Float] = None
+	match val:
+		Some(v):
+			match v:
+				TomlFloat(f):
+					result = Some(f)
+				_:
+					result = None
+		None:
+			result = None
+	result
+
+
+private pure func extract_bool(val: Option[TomlValue]) -> Option[Bool]:
+	var result: Option[Bool] = None
+	match val:
+		Some(v):
+			match v:
+				TomlBool(b):
+					result = Some(b)
+				_:
+					result = None
+		None:
+			result = None
+	result
+
+
+-- ============================================================================
+-- Internal parsing
+-- ============================================================================
+private pure func is_alpha_char(c: Char) -> Bool:
+	c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z'
+
+
+private pure func is_key_char(c: Char) -> Bool:
+	is_alpha_char(c) or c >= '0' and c <= '9' or c == '_' or c == '-' or c == '.'
+
+
+private pure func is_valid_key_path(key: String) -> Bool:
+	if key.length() == 0:
+		False
+	else:
+		var ok: Bool = True
+		var prev_dot: Bool = True
+		var i: Int = 0
+		while i < key.length() and ok:
+			match key.get(i):
+				Some(c):
+					if not is_key_char(c):
+						ok = False
+					else if c == '.':
+						if prev_dot:
+							ok = False
+						prev_dot = True
+					else:
+						prev_dot = False
+				None:
+					ok = False
+			i += 1
+		ok and not prev_dot
+
+
+private pure func line_error(line: Int, column: Int, message: String) -> TomlError:
+	{line = line, column = column, message = message}
+
+
+private pure func value_column(line: String, eq_pos: Int) -> Int:
+	var i: Int = eq_pos + 1
+	var done: Bool = False
+	while i < line.length() and not done:
+		ch: String = line.substring(i, 1)
+		if ch == " " or ch == "\t":
+			i += 1
+		else:
+			done = True
+	i + 1
+
+
+private pure func parse_all_lines(
+	lines: List[String],
+) -> Result[Dict[String, TomlValue], TomlError]:
+	var result: Dict[String, TomlValue] = dict()
+	var defined_sections: Set[String] = set()
+	var section: String = ""
+	var remaining: List[String] = lines
+	var done: Bool = False
+	var ok: Bool = True
+	var error: TomlError = {line = 1, column = 1, message = ""}
+	var line_number: Int = 1
+	while not done:
+		match remaining:
+			[]:
+				done = True
+			[line, ...rest]:
+				trimmed: String = strip_inline_comment(line.trim()).trim()
+				if trimmed.length() == 0:
+					remaining = rest
+					line_number += 1
+				else if has_prefix(trimmed, "#"):
+					remaining = rest
+					line_number += 1
+				else if has_prefix(trimmed, "[["):
+					ok = False
+					error = line_error(line_number, 1, "array tables are not supported")
+					done = True
+				else if has_prefix(trimmed, "["):
+					match parse_table_name(trimmed):
+						Ok(name):
+							if defined_sections.contains(name):
+								ok = False
+								error = line_error(line_number, 1, "duplicate table: " + name)
+								done = True
+							else:
+								defined_sections = defined_sections.add(name)
+								section = name
+								remaining = rest
+								line_number += 1
+						Err(msg):
+							ok = False
+							error = line_error(line_number, 1, msg)
+							done = True
+				else:
+					eq_pos: Int = find_eq(trimmed)
+					if eq_pos <= 0:
+						ok = False
+						error = line_error(line_number, 1, "expected key = value")
+						done = True
+					else:
+						key: String = trimmed
+							.substring(0, eq_pos)
+							.trim()
+						if not is_valid_key_path(key):
+							ok = False
+							error = line_error(line_number, 1, "invalid key")
+							done = True
+						else:
+							val_str: String = trimmed
+								.substring(eq_pos + 1, trimmed.length() - eq_pos - 1)
+								.trim()
+							full_key: String = if section.length() == 0:
+								key
+							else:
+								section + "." + key
+							if result.contains(full_key):
+								ok = False
+								error = line_error(line_number, 1, "duplicate key: " + full_key)
+								done = True
+							else:
+								match parse_value(val_str):
+									Ok(value):
+										result = result.set(full_key, value)
+										remaining = rest
+										line_number += 1
+									Err(msg):
+										ok = False
+										error = line_error(
+											line_number,
+											value_column(
+												trimmed,
+												eq_pos,
+											),
+											msg,
+										)
+										done = True
+			_:
+				done = True
+	if ok:
+		Ok(result)
+	else:
+		Err(error)
+
+
+private pure func parse_table_name(line: String) -> Result[String, String]:
+	close: Int = line.raw_index_of("]")
+	if close < 0:
+		Err("unterminated table header")
+	else if close != line.length() - 1:
+		Err("unexpected text after table header")
+	else:
+		name: String = line
+			.substring(1, close - 1)
+			.trim()
+		if name.length() == 0:
+			Err("empty table name")
+		else if is_valid_key_path(name):
+			Ok(name)
+		else:
+			Err("invalid table name")
+
+
+private pure func parse_value(s: String) -> Result[TomlValue, String]:
+	if s.length() == 0:
+		Err("missing value")
+	else:
+		first: String = s.substring(0, 1)
+		if first == "\"":
+			if has_prefix(s, "\"\"\""):
+				Err("multi-line basic strings are not supported")
+			else:
+				match parse_basic_str(s):
+					Ok(v): Ok(TomlString(v))
+					Err(msg): Err(msg)
+		else if first == "'":
+			if has_prefix(s, "'''"):
+				Err("multi-line literal strings are not supported")
+			else:
+				match parse_literal_str(s):
+					Ok(v): Ok(TomlString(v))
+					Err(msg): Err(msg)
+		else if first == "[":
+			match parse_array_val(s):
+				Ok(v): Ok(TomlArray(v))
+				Err(msg): Err(msg)
+		else if first == "{":
+			match parse_inline_tbl(s):
+				Ok(v): Ok(TomlTable(v))
+				Err(msg): Err(msg)
+		else if s == "true":
+			Ok(TomlBool(True))
+		else if s == "false":
+			Ok(TomlBool(False))
+		else:
+			parse_num(s)
+
+
+private pure func parse_basic_str(s: String) -> Result[String, String]:
+	if s.length() < 2 or s.substring(s.length() - 1, 1) != "\"":
+		Err("unterminated basic string")
+	else:
+		inner: String = s.substring(1, s.length() - 2)
+		unescape(inner)
+
+
+private pure func parse_literal_str(s: String) -> Result[String, String]:
+	if s.length() < 2 or s.substring(s.length() - 1, 1) != "'":
+		Err("unterminated literal string")
+	else:
+		Ok(s.substring(1, s.length() - 2))
+
+
+private pure func unescape(s: String) -> Result[String, String]:
+	var acc: String = ""
+	var i: Int = 0
+	var ok: Bool = True
+	var error: String = ""
+	while i < s.length() and ok:
+		ch: String = s.substring(i, 1)
+		if ch == "\\":
+			if i + 1 >= s.length():
+				ok = False
+				error = "unterminated escape sequence"
+			else:
+				next: String = s.substring(i + 1, 1)
+				if next == "b":
+					acc += from_char(to_char(8))
+					i += 2
+				else if next == "t":
+					acc += "\t"
+					i += 2
+				else if next == "n":
+					acc += "\n"
+					i += 2
+				else if next == "f":
+					acc += from_char(to_char(12))
+					i += 2
+				else if next == "r":
+					acc += "\r"
+					i += 2
+				else if next == "\"":
+					acc += "\""
+					i += 2
+				else if next == "\\":
+					acc += "\\"
+					i += 2
+				else:
+					ok = False
+					error = "invalid string escape"
+		else:
+			acc += ch
+			i += 1
+	if ok:
+		Ok(acc)
+	else:
+		Err(error)
+
+
+private pure func parse_num(s: String) -> Result[TomlValue, String]:
+	if s.contains("_"):
+		Err("numeric separators are not supported")
+	else if s == "inf" or s == "+inf" or s == "-inf" or s == "nan" or s == "+nan" or s == "-nan":
+		Err("non-finite floats are not supported")
+	else if s.contains(".") or s.contains("e") or s.contains("E"):
+		match s.parse_float():
+			Some(f): Ok(TomlFloat(f))
+			None: Err("invalid value")
+	else:
+		match s.parse_int():
+			Some(n): Ok(TomlInt(n))
+			None: Err("invalid value")
+
+
+private pure func parse_array_val(s: String) -> Result[List[TomlValue], String]:
+	if s.length() < 2 or s.substring(s.length() - 1, 1) != "]":
+		Err("unterminated array")
+	else:
+		inner: String = s
+			.substring(1, s.length() - 2)
+			.trim()
+		if inner.length() == 0:
+			Ok([])
+		else if inner.substring(inner.length() - 1, 1) == ",":
+			Err("trailing comma in array")
+		else:
+			split_and_parse(inner)
+
+
+private pure func split_and_parse(s: String) -> Result[List[TomlValue], String]:
+	match split_top_level(s):
+		Ok(elements): parse_string_list(elements)
+		Err(msg): Err(msg)
+
+
+private pure func parse_string_list(strs: List[String]) -> Result[List[TomlValue], String]:
+	var result: List[TomlValue] = []
+	var remaining: List[String] = strs
+	var done: Bool = False
+	var ok: Bool = True
+	var error: String = ""
+	while not done:
+		match remaining:
+			[]:
+				done = True
+			[elem, ...rest]:
+				trimmed: String = elem.trim()
+				if trimmed.length() == 0:
+					ok = False
+					error = "empty array element"
+					done = True
+				else:
+					match parse_value(trimmed):
+						Ok(value):
+							result = result.append(value)
+							remaining = rest
+						Err(msg):
+							ok = False
+							error = msg
+							done = True
+			_:
+				done = True
+	if ok:
+		Ok(result)
+	else:
+		Err(error)
+
+
+private pure func split_top_level(s: String) -> Result[List[String], String]:
+	var result: List[String] = []
+	var current: String = ""
+	var depth: Int = 0
+	var in_str: Bool = False
+	var in_lit: Bool = False
+	var escaped: Bool = False
+	var i: Int = 0
+	var ok: Bool = True
+	var error: String = ""
+	while i < s.length() and ok:
+		ch: String = s.substring(i, 1)
+		if in_str:
+			current += ch
+			if escaped:
+				escaped = False
+			else if ch == "\\":
+				escaped = True
+			else if ch == "\"":
+				in_str = False
+		else if in_lit:
+			current += ch
+			if ch == "'":
+				in_lit = False
+		else if ch == "\"":
+			current += ch
+			in_str = True
+		else if ch == "'":
+			current += ch
+			in_lit = True
+		else if ch == "[" or ch == "{":
+			depth += 1
+			current += ch
+		else if ch == "]" or ch == "}":
+			if depth == 0:
+				ok = False
+				error = "unmatched delimiter"
+			else:
+				depth -= 1
+				current += ch
+		else if ch == "," and depth == 0:
+			result = result.append(current)
+			current = ""
+		else:
+			current += ch
+		i += 1
+	if ok and in_str:
+		ok = False
+		error = "unterminated string"
+	if ok and in_lit:
+		ok = False
+		error = "unterminated literal string"
+	if ok and depth != 0:
+		ok = False
+		error = "unmatched delimiter"
+	if ok:
+		result = result.append(current)
+		Ok(result)
+	else:
+		Err(error)
+
+
+private pure func parse_inline_tbl(s: String) -> Result[Dict[String, TomlValue], String]:
+	if s.length() < 2 or s.substring(s.length() - 1, 1) != "}":
+		Err("unterminated inline table")
+	else:
+		inner: String = s
+			.substring(1, s.length() - 2)
+			.trim()
+		if inner.length() == 0:
+			Ok(dict())
+		else if inner.substring(inner.length() - 1, 1) == ",":
+			Err("trailing comma in inline table")
+		else:
+			parse_pairs(inner)
+
+
+private pure func parse_pairs(s: String) -> Result[Dict[String, TomlValue], String]:
+	var result: Dict[String, TomlValue] = dict()
+	var pairs: List[String] = []
+	var done: Bool = False
+	var ok: Bool = True
+	var error: String = ""
+	match split_top_level(s):
+		Ok(items):
+			pairs = items
+		Err(msg):
+			ok = False
+			error = msg
+			done = True
+	var remaining: List[String] = pairs
+	while not done:
+		match remaining:
+			[]:
+				done = True
+			[pair_str, ...rest]:
+				trimmed: String = pair_str.trim()
+				eq_pos: Int = find_eq(trimmed)
+				if eq_pos <= 0:
+					ok = False
+					error = "expected key = value in inline table"
+					done = True
+				else:
+					key: String = trimmed
+						.substring(0, eq_pos)
+						.trim()
+					if not is_valid_key_path(key):
+						ok = False
+						error = "invalid inline table key"
+						done = True
+					else if result.contains(key):
+						ok = False
+						error = "duplicate inline table key: " + key
+						done = True
+					else:
+						val_str: String = trimmed
+							.substring(eq_pos + 1, trimmed.length() - eq_pos - 1)
+							.trim()
+						match parse_value(val_str):
+							Ok(value):
+								result = result.set(key, value)
+								remaining = rest
+							Err(msg):
+								ok = False
+								error = msg
+								done = True
+			_:
+				done = True
+	if ok:
+		Ok(result)
+	else:
+		Err(error)
+
+
+-- ============================================================================
+-- Helpers
+-- ============================================================================
+private pure func find_eq(s: String) -> Int:
+	var i: Int = 0
+	var in_str: Bool = False
+	var found: Int = -1
+	var done: Bool = False
+	while i < s.length() and not done:
+		ch: String = s.substring(i, 1)
+		if ch == "\"":
+			in_str = not in_str
+		else if ch == "=" and not in_str:
+			found = i
+			done = True
+		i += 1
+	found
+
+
+private pure func find_top_comma(s: String) -> Int:
+	var i: Int = 0
+	var depth: Int = 0
+	var in_str: Bool = False
+	var found: Int = -1
+	var done: Bool = False
+	while i < s.length() and not done:
+		ch: String = s.substring(i, 1)
+		if in_str:
+			if ch == "\"":
+				in_str = False
+		else if ch == "\"":
+			in_str = True
+		else if ch == "[" or ch == "{":
+			depth += 1
+		else if ch == "]" or ch == "}":
+			depth -= 1
+		else if ch == "," and depth == 0:
+			found = i
+			done = True
+		i += 1
+	found
+
+
+private pure func has_prefix(s: String, prefix: String) -> Bool:
+	plen: Int = prefix.length()
+	if s.length() < plen:
+		False
+	else:
+		s.substring(0, plen) == prefix
+
+
+-- Strip inline comments: "value # comment" -> "value"
+-- Respects quoted strings (# inside quotes is not a comment)
+private pure func strip_inline_comment(s: String) -> String:
+	var i: Int = 0
+	var in_str: Bool = False
+	var in_lit: Bool = False
+	var found: Int = -1
+	var done: Bool = False
+	while i < s.length() and not done:
+		ch: String = s.substring(i, 1)
+		if in_str:
+			if ch == "\"":
+				in_str = False
+		else if in_lit:
+			if ch == "'":
+				in_lit = False
+		else if ch == "\"":
+			in_str = True
+		else if ch == "'":
+			in_lit = True
+		else if ch == "#":
+			found = i
+			done = True
+		i += 1
+	if found > 0:
+		s
+			.substring(0, found)
+			.trim()
+	else:
+		s
+
+
+-- TOML Typed Decoder
+--
+-- Composable field decoders for extracting typed records from TOML data.
+-- Mirrors the pattern from codec: define a Decoder[T], then run it with
+-- from_string.
+--
+-- Usage:
+-- decoder = map2(make_config, field("host", string), field("port", int))
+-- result = from_string(decoder, toml_input)
+-- ============================================================================
+-- Types
+-- ============================================================================
+record TomlDecodeError {path: String, message: String}
+
+
+type alias Decoder[T] = pure (TomlValue) -> Result[T, TomlDecodeError]
+
+
+-- ============================================================================
+-- Primitive Decoders
+-- ============================================================================
+---
+Decode a TOML string value by key.
+---
+pure func string_decoder(key: String, toml: TomlValue) -> Result[String, TomlDecodeError]:
+	match get_string(toml, key):
+		Some(s): Ok(s)
+		None: Err({path = key, message = "missing or not a string"})
+
+
+---
+Decode a TOML integer value by key.
+---
+pure func int_decoder(key: String, toml: TomlValue) -> Result[Int, TomlDecodeError]:
+	match get_int(toml, key):
+		Some(n): Ok(n)
+		None: Err({path = key, message = "missing or not an integer"})
+
+
+---
+Decode a TOML float value by key.
+---
+pure func float_decoder(key: String, toml: TomlValue) -> Result[Float, TomlDecodeError]:
+	match get_float(toml, key):
+		Some(f): Ok(f)
+		None: Err({path = key, message = "missing or not a float"})
+
+
+---
+Decode a TOML boolean value by key.
+---
+pure func bool_decoder(key: String, toml: TomlValue) -> Result[Bool, TomlDecodeError]:
+	match get_bool(toml, key):
+		Some(b): Ok(b)
+		None: Err({path = key, message = "missing or not a boolean"})
+
+
+-- ============================================================================
+-- Primitive Decoder Values (for use with field/optional)
+-- ============================================================================
+---
+String primitive decoder — extracts a string from a TomlValue.
+---
+pure func string(toml: TomlValue) -> Result[String, TomlDecodeError]:
+	match toml:
+		TomlString(s): Ok(s)
+		_: Err({path = "", message = "expected string"})
+
+
+---
+Integer primitive decoder — extracts an int from a TomlValue.
+---
+pure func int(toml: TomlValue) -> Result[Int, TomlDecodeError]:
+	match toml:
+		TomlInt(n): Ok(n)
+		_: Err({path = "", message = "expected integer"})
+
+
+---
+Float primitive decoder — extracts a float from a TomlValue.
+---
+pure func float(toml: TomlValue) -> Result[Float, TomlDecodeError]:
+	match toml:
+		TomlFloat(f): Ok(f)
+		_: Err({path = "", message = "expected float"})
+
+
+---
+Boolean primitive decoder — extracts a bool from a TomlValue.
+---
+pure func bool(toml: TomlValue) -> Result[Bool, TomlDecodeError]:
+	match toml:
+		TomlBool(b): Ok(b)
+		_: Err({path = "", message = "expected boolean"})
+
+
+-- ============================================================================
+-- Field Decoders
+-- ============================================================================
+---
+Decode a required field by key, using a primitive decoder.
+---
+pure func required[T](key: String, decoder: Decoder[T]) -> Decoder[T]:
+	pure func(toml: TomlValue) -> Result[T, TomlDecodeError]:
+		match lookup(toml, key):
+			Some(val):
+				match decoder(val):
+					Ok(v): Ok(v)
+					Err(e): Err({path = key, message = e.message})
+			None: Err({path = key, message = "missing field"})
+
+
+---
+Decode an optional field by key. Returns None if the key is missing.
+---
+pure func optional[T](key: String, decoder: Decoder[T]) -> Decoder[Option[T]]:
+	pure func(toml: TomlValue) -> Result[Option[T], TomlDecodeError]:
+		match lookup(toml, key):
+			Some(val):
+				match decoder(val):
+					Ok(v): Ok(Some(v))
+					Err(e): Err({path = key, message = e.message})
+			None: Ok(None)
+
+
+-- ============================================================================
+-- Combiners
+-- ============================================================================
+---
+Combine two field decoders into a single record decoder.
+---
+pure func map2[A, B, R](f: pure (A, B) -> R, d1: Decoder[A], d2: Decoder[B]) -> Decoder[R]:
+	pure func(toml: TomlValue) -> Result[R, TomlDecodeError]:
+		try:
+			a ?= d1(toml)
+			b ?= d2(toml)
+			f(a, b)
+
+
+---
+Combine three field decoders into a single record decoder.
+---
+pure func map3[A, B, C, R](
+	f: pure (A, B, C) -> R,
+	d1: Decoder[A],
+	d2: Decoder[B],
+	d3: Decoder[C],
+) -> Decoder[R]:
+	pure func(toml: TomlValue) -> Result[R, TomlDecodeError]:
+		try:
+			a ?= d1(toml)
+			b ?= d2(toml)
+			c ?= d3(toml)
+			f(a, b, c)
+
+
+---
+Combine four field decoders into a single record decoder.
+---
+pure func map4[A, B, C, D, R](
+	f: pure (A, B, C, D) -> R,
+	d1: Decoder[A],
+	d2: Decoder[B],
+	d3: Decoder[C],
+	d4: Decoder[D],
+) -> Decoder[R]:
+	pure func(toml: TomlValue) -> Result[R, TomlDecodeError]:
+		try:
+			a ?= d1(toml)
+			b ?= d2(toml)
+			c ?= d3(toml)
+			d ?= d4(toml)
+			f(a, b, c, d)
+
+
+-- ============================================================================
+-- Pipeline
+-- ============================================================================
+---
+Parse a TOML string and decode it using the decoder.
+---
+pure func from_string[T](decoder: Decoder[T], input: String) -> Result[T, String]:
+	match parse(input):
+		Ok(toml):
+			match decoder(toml):
+				Ok(val): Ok(val)
+				Err(e): Err(e.format_error())
+		Err(e): Err(e)
+
+
+-- ============================================================================
+-- Error Formatting
+-- ============================================================================
+---
+Format a TomlDecodeError as a plain text string.
+---
+pure func format_error(err: TomlDecodeError) -> String:
+	err.path + ": " + err.message

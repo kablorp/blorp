@@ -1,0 +1,336 @@
+import:
+	bytes as B
+	net/tcp as TCP
+	pkg/net/tls as TLS
+
+
+-- SMTP Client - Send emails via SMTP/STARTTLS
+--
+-- Supports SMTP with optional STARTTLS upgrade and AUTH PLAIN authentication.
+-- Built on top of TCP and TLS modules.
+--
+-- Usage:
+-- import:
+-- pkg/net/smtp as SMTP
+-- result { Result(Ok, Err) }
+--
+-- config: SMTP.Config = {
+-- host = "smtp.gmail.com",
+-- port = 587,
+-- username = "user@gmail.com",
+-- password = "app-password",
+-- use_tls = True
+-- }
+-- match SMTP.send_email(config, "to@example.com", "Subject", "Body text"):
+-- Ok(_): print("sent!")
+-- Err(e): print("error: " + e)
+-- ============================================================================
+-- Types
+-- ============================================================================
+---
+SMTP server configuration.
+---
+record Config {host: String, port: Int, username: String, password: String, use_tls: Bool}
+
+
+-- Internal: connection state (TCP or upgraded to TLS)
+private union SmtpConn:
+	SmtpTcp(Int)
+	SmtpTls(Ptr)
+
+
+-- ============================================================================
+-- Public API
+-- ============================================================================
+---
+Send a plain text email.
+Connects to the SMTP server, authenticates if credentials are provided,
+and sends the email. Supports STARTTLS for port 587.
+---
+func send_email(config: Config, to: String, subject: String, body: String) -> Result[Bool, String]:
+	send_email_full(config, to, subject, body, "text/plain")
+
+
+---
+Send an HTML email.
+---
+func send_html_email(
+	config: Config,
+	to: String,
+	subject: String,
+	html_body: String,
+) -> Result[Bool, String]:
+	send_email_full(config, to, subject, html_body, "text/html")
+
+
+-- ============================================================================
+-- Internal Implementation
+-- ============================================================================
+private func send_email_full(
+	config: Config,
+	to: String,
+	subject: String,
+	body: String,
+	content_type: String,
+) -> Result[Bool, String]:
+	-- Connect via TCP
+	match TCP.connect(config.host, config.port):
+		Err(e): Err("SMTP connect failed: " + e)
+		Ok(fd):
+			-- Set timeout
+			_ = TCP.set_timeout(fd, 10000)
+			-- Read server greeting
+			match read_smtp_response(SmtpTcp(fd)):
+				Err(e):
+					TCP.close(fd)
+					Err("greeting: " + e)
+				Ok(greeting):
+					if not greeting.starts_with("220"):
+						TCP.close(fd)
+						Err("bad greeting: " + greeting)
+					else:
+						do_smtp_session(config, fd, to, subject, body, content_type)
+
+
+private func do_smtp_session(
+	config: Config,
+	fd: Int,
+	to: String,
+	subject: String,
+	body: String,
+	content_type: String,
+) -> Result[Bool, String]:
+	-- Send EHLO
+	match smtp_command(SmtpTcp(fd), "EHLO blorp\r\n", "250"):
+		Err(e):
+			TCP.close(fd)
+			Err("EHLO: " + e)
+		Ok(ehlo_response):
+			-- Check if we need STARTTLS
+			if config.use_tls and ehlo_response.contains("STARTTLS"):
+				do_starttls_session(config, fd, to, subject, body, content_type)
+			else:
+				do_auth_and_send(SmtpTcp(fd), config, to, subject, body, content_type, fd)
+
+
+-- Continue on plain TCP
+private func do_starttls_session(
+	config: Config,
+	fd: Int,
+	to: String,
+	subject: String,
+	body: String,
+	content_type: String,
+) -> Result[Bool, String]:
+	-- Send STARTTLS command
+	match smtp_command(SmtpTcp(fd), "STARTTLS\r\n", "220"):
+		Err(e):
+			TCP.close(fd)
+			Err("STARTTLS: " + e)
+		Ok(_):
+			-- Upgrade to TLS
+			match TLS.connect(config.host, config.port):
+				Err(e):
+					TCP.close(fd)
+					Err("TLS upgrade: " + e)
+				Ok(tls_conn):
+					-- Re-send EHLO over TLS
+					match smtp_command(SmtpTls(tls_conn), "EHLO blorp\r\n", "250"):
+						Err(e):
+							TLS.close(tls_conn)
+							Err("EHLO (TLS): " + e)
+						Ok(_):
+							do_auth_and_send(
+								SmtpTls(tls_conn),
+								config,
+								to,
+								subject,
+								body,
+								content_type,
+								fd,
+							)
+
+
+private func do_auth_and_send(
+	conn: SmtpConn,
+	config: Config,
+	to: String,
+	subject: String,
+	body: String,
+	content_type: String,
+	orig_fd: Int,
+) -> Result[Bool, String]:
+	-- Authenticate if credentials provided
+	var auth_ok: Bool = True
+	var auth_err: String = ""
+	if config.username.length() > 0:
+		match smtp_auth_plain(conn, config.username, config.password):
+			Err(e):
+				auth_ok = False
+				auth_err = e
+			Ok(_): void
+	if not auth_ok:
+		close_conn(conn, orig_fd)
+		Err("AUTH: " + auth_err)
+	else:
+		match smtp_command(conn, "MAIL FROM:<" + config.username + ">\r\n", "250"):
+			Err(e):
+				-- Send MAIL FROM
+				close_conn(conn, orig_fd)
+				Err("MAIL FROM: " + e)
+			Ok(_):
+				-- Send RCPT TO
+				match smtp_command(conn, "RCPT TO:<" + to + ">\r\n", "250"):
+					Err(e):
+						close_conn(conn, orig_fd)
+						Err("RCPT TO: " + e)
+					Ok(_):
+						-- Send DATA
+						match smtp_command(conn, "DATA\r\n", "354"):
+							Err(e):
+								close_conn(conn, orig_fd)
+								Err("DATA: " + e)
+							Ok(_):
+								-- Send email content
+								msg: String = build_message(
+									config.username,
+									to,
+									subject,
+									body,
+									content_type,
+								)
+								match smtp_command(conn, msg, "250"):
+									Err(e):
+										close_conn(conn, orig_fd)
+										Err("message: " + e)
+									Ok(_):
+										-- QUIT
+										_ = send_data(conn, "QUIT\r\n")
+										close_conn(conn, orig_fd)
+										Ok(True)
+
+
+-- ============================================================================
+-- SMTP Protocol Helpers
+-- ============================================================================
+-- Send AUTH PLAIN (base64-encoded \0username\0password)
+private func smtp_auth_plain(
+	conn: SmtpConn,
+	username: String,
+	password: String,
+) -> Result[Bool, String]:
+	-- AUTH PLAIN format: base64(\0username\0password)
+	-- Build the auth string with null bytes using Bytes
+	var auth_bytes: Bytes = B.bytes(1 + username.length() + 1 + password.length())
+	auth_bytes = B.set_index(auth_bytes, 0, 0)
+	auth_bytes = B.blit(auth_bytes, 1, username.to_bytes(), 0, username.length())
+	auth_bytes = B.set_index(auth_bytes, 1 + username.length(), 0)
+	auth_bytes = B.blit(
+		auth_bytes,
+		2 + username.length(),
+		password.to_bytes(),
+		0,
+		password.length(),
+	)
+	encoded: String = B.to_string(auth_bytes).base64_encode()
+	match smtp_command(conn, "AUTH PLAIN " + encoded + "\r\n", "235"):
+		Ok(_): Ok(True)
+		Err(e): Err(e)
+
+
+-- Send a command and expect a response starting with prefix
+private func smtp_command(
+	conn: SmtpConn,
+	cmd: String,
+	expect_prefix: String,
+) -> Result[String, String]:
+	match send_data(conn, cmd):
+		Err(e): Err(e)
+		Ok(_):
+			match read_smtp_response(conn):
+				Err(e): Err(e)
+				Ok(response):
+					if response.starts_with(expect_prefix):
+						Ok(response)
+					else:
+						Err("expected " + expect_prefix + ", got: " + response)
+
+
+-- Read an SMTP response (may be multiline)
+private func read_smtp_response(conn: SmtpConn) -> Result[String, String]:
+	var buf: Bytes = B.bytes(0)
+	var done: Bool = False
+	var err: String = ""
+	var failed: Bool = False
+	while not done and not failed:
+		match read_data(conn, 4096):
+			Ok(chunk):
+				if B.length(chunk) == 0:
+					done = True
+				else:
+					buf = B.append(buf, chunk)
+					-- Check if response is complete (ends with \r\n and not a continuation)
+					s: String = B.to_string(buf)
+					if s.contains("\r\n"):
+						done = True
+			Err(e):
+				err = e
+				failed = True
+	if failed:
+		Err(err)
+	else:
+		Ok(B.to_string(buf))
+
+
+-- Build MIME message
+pure func build_message(
+	from: String,
+	to: String,
+	subject: String,
+	body: String,
+	content_type: String,
+) -> String:
+	var msg: String = "From: " + from + "\r\n"
+	msg = msg + "To: " + to + "\r\n"
+	msg = msg + "Subject: " + subject + "\r\n"
+	msg += "MIME-Version: 1.0\r\n"
+	msg = msg + "Content-Type: " + content_type + "; charset=utf-8\r\n"
+	msg += "\r\n"
+	msg = msg + body + "\r\n"
+	msg += ".\r\n"
+	msg
+
+
+-- ============================================================================
+-- Transport Helpers
+-- ============================================================================
+private func send_data(conn: SmtpConn, data: String) -> Result[Bool, String]:
+	var result: Result[Bool, String] = Ok(True)
+	match conn:
+		SmtpTcp(fd):
+			match TCP.write(fd, data.to_bytes()):
+				Ok(_): void
+				Err(e): result = Err(e)
+		SmtpTls(tls):
+			match TLS.write(tls, data.to_bytes()):
+				Ok(_): void
+				Err(e): result = Err(e)
+	result
+
+
+private func read_data(conn: SmtpConn, max_bytes: Int) -> Result[Bytes, String]:
+	var result: Result[Bytes, String] = Err("no transport")
+	match conn:
+		SmtpTcp(fd):
+			result = TCP.read(fd, max_bytes)
+		SmtpTls(tls):
+			result = TLS.read(tls, max_bytes)
+	result
+
+
+private func close_conn(conn: SmtpConn, orig_fd: Int) -> Void:
+	match conn:
+		SmtpTcp(fd): TCP.close(fd)
+		SmtpTls(tls):
+			TLS.close(tls)
+			TCP.close(orig_fd)

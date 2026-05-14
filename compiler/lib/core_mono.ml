@@ -1,0 +1,2001 @@
+(** Monomorphization pass for Core IR.
+
+    Scans calls to generic functions, computes type substitutions,
+    generates specialized copies with concrete types, and rewrites
+    call sites to mangled names. Runs before C emission.
+
+    {1 Algorithm}
+
+    1. Collect generic function bodies from the program.
+    2. Walk all expressions to find calls to generic functions.
+    3. For each call: unify param types vs arg types → substitution.
+    4. Mangle name, enqueue if new, drain worklist to fixpoint.
+    5. Rewrite call sites to use mangled names.
+    6. Append specialized functions to the program. *)
+
+open Core
+
+(* ============================================================================
+   Type substitution
+   ============================================================================ *)
+
+let type_param_name = Env.type_param_name
+let type_param_decl_names = Ast.type_param_names
+
+type subst_value =
+  | SubstType of Ast.type_expr
+  | SubstDimPack of Ast.type_expr list
+
+type mono_subst = (string * subst_value) list
+
+let rec erase_value_refinements_for_mono (ty : Ast.type_expr) : Ast.type_expr =
+  if Types.Dim.is_value_dim ty then Ast.TyNamed ("Int", [])
+  else
+    match ty with
+    | Ast.TyArray (elem, dims) ->
+        (* Array dimensions are type-level evidence and must remain concrete;
+           only the value element type erases refinements for C mono. *)
+        Ast.TyArray (erase_value_refinements_for_mono elem, dims)
+    | Ast.TyNamed ((("Tensor" | "Vector" | "Matrix") as name), elem :: dims) ->
+        Ast.TyNamed (name, erase_value_refinements_for_mono elem :: dims)
+    | Ast.TyNamed (name, args) ->
+        Ast.TyNamed (name, List.map erase_value_refinements_for_mono args)
+    | Ast.TyTuple elems ->
+        Ast.TyTuple (List.map erase_value_refinements_for_mono elems)
+    | Ast.TyFunc f ->
+        Ast.TyFunc
+          {
+            f with
+            params = List.map erase_value_refinements_for_mono f.params;
+            return = erase_value_refinements_for_mono f.return;
+          }
+    | Ast.TyRange _ -> Ast.TyNamed ("Int", [])
+    | Ast.TyDimOp _ | Ast.TyConstInt _ -> Ast.TyNamed ("Int", [])
+    | _ -> ty
+
+let mono_subst_binding (name : string) (ty : Ast.type_expr) :
+    string * subst_value =
+  let name = type_param_name name in
+  let ty =
+    if Types.Dim.is_var_name name then ty
+    else erase_value_refinements_for_mono ty
+  in
+  (name, SubstType ty)
+
+let rec has_dim_evidence_for_mono (ty : Ast.type_expr) : bool =
+  match ty with
+  | Ast.TyConstInt _ | Ast.TyDimOp _ -> true
+  | Ast.TyVar name | Ast.TyNamed (name, []) -> Types.Dim.is_var_name name
+  | Ast.TyTuple dims -> List.for_all has_dim_evidence_for_mono dims
+  | _ -> false
+
+let mono_subst_binding_opt (name : string) (ty : Ast.type_expr) :
+    (string * subst_value) option =
+  let name = type_param_name name in
+  let ty = Codegen_types.normalize_type ty in
+  let is_identity_binding =
+    match ty with
+    | Ast.TyVar ty_name | Ast.TyNamed (ty_name, []) ->
+        type_param_name ty_name = name
+    | _ -> false
+  in
+  if is_identity_binding then None
+  else if Types.Dim.is_var_name name && not (has_dim_evidence_for_mono ty) then
+    None
+  else Some (mono_subst_binding name ty)
+
+let mono_dim_pack_binding_opt (name : string) (dims : Ast.type_expr list) :
+    (string * subst_value) option =
+  let name = type_param_name name in
+  if name = "#_" || not (Types.Dim.is_var_name name) then None
+  else
+    let dims = List.map Codegen_types.normalize_type dims in
+    if List.for_all has_dim_evidence_for_mono dims then
+      Some (name, SubstDimPack dims)
+    else None
+
+let rec collect_subst ~(reg : Codegen_types.registry)
+    (type_params : Ast.type_param_decl list) (param_ty : Ast.type_expr)
+    (arg_ty : Ast.type_expr) (acc : mono_subst) : mono_subst =
+  let type_param_names = type_param_decl_names type_params in
+  (* Expand type aliases on both sides before matching. Otherwise a param
+     signature using an alias (e.g. [Decoder[T] = pure (Value) -> Result[T,_]])
+     can't be unified against a concrete call-site arg whose type already
+     resolves through the alias. *)
+  let param_ty =
+    Codegen_types.normalize_type (Codegen_types.expand_alias ~reg param_ty)
+  in
+  let arg_ty =
+    Codegen_types.normalize_type (Codegen_types.expand_alias ~reg arg_ty)
+  in
+  match (param_ty, arg_ty) with
+  | Ast.TyVar name, _ when List.mem (type_param_name name) type_param_names -> (
+      match mono_subst_binding_opt name arg_ty with
+      | Some binding -> binding :: acc
+      | None -> acc)
+  | Ast.TyBoundVar param, _ when List.mem param.param_name type_param_names -> (
+      match mono_subst_binding_opt param.param_name arg_ty with
+      | Some binding -> binding :: acc
+      | None -> acc)
+  | Ast.TyNamed (name, []), _
+    when List.mem (type_param_name name) type_param_names -> (
+      match mono_subst_binding_opt name arg_ty with
+      | Some binding -> binding :: acc
+      | None -> acc)
+  | Ast.TyNamed (pn, p_args), Ast.TyNamed (an, a_args)
+    when pn = an && not (List.mem pn type_param_names) ->
+      (* Walk positional args, consuming the arg tail at a trailing
+         [TyVarDims] to mirror [Types.go_args]. Without the [TyVarDims]
+         consumption, a param like [T[#_...]] against an arg
+         [Int[#2, #3]] fails length-match and leaves [T]
+         unsubstituted — the call site stays generic, the prefixed
+         name never gets monomorphized, and emission produces a call
+         to an undeclared [std_<mod>__<name>] symbol. *)
+      let rec walk_args a p_args a_args =
+        match (p_args, a_args) with
+        | [], _ -> a
+        | [ Ast.TyVarDims name ], rest ->
+            if List.mem (type_param_name name) type_param_names then
+              match mono_dim_pack_binding_opt name rest with
+              | Some binding -> binding :: a
+              | None -> a
+            else a
+        | p :: prest, ar :: arest ->
+            walk_args (collect_subst ~reg type_params p ar a) prest arest
+        | _ :: _, [] -> a
+      in
+      walk_args acc p_args a_args
+  | Ast.TyArray (p_elem, p_dims), Ast.TyArray (a_elem, a_dims) ->
+      let rec walk_args a p_args a_args =
+        match (p_args, a_args) with
+        | [], _ -> a
+        | [ Ast.TyVarDims name ], rest ->
+            if List.mem (type_param_name name) type_param_names then
+              match mono_dim_pack_binding_opt name rest with
+              | Some binding -> binding :: a
+              | None -> a
+            else a
+        | p :: prest, ar :: arest ->
+            walk_args (collect_subst ~reg type_params p ar a) prest arest
+        | _ :: _, [] -> a
+      in
+      walk_args acc (p_elem :: p_dims) (a_elem :: a_dims)
+  | Ast.TyTuple ps, Ast.TyTuple ars -> (
+      try
+        List.fold_left2
+          (fun a p r -> collect_subst ~reg type_params p r a)
+          acc ps ars
+      with Invalid_argument _ -> acc)
+  | Ast.TyFunc pf, Ast.TyFunc af ->
+      let acc =
+        try
+          List.fold_left2
+            (fun a p r -> collect_subst ~reg type_params p r a)
+            acc pf.params af.params
+        with Invalid_argument _ -> acc
+      in
+      collect_subst ~reg type_params pf.return af.return acc
+  | _ -> acc
+
+(** Check if a substitution is concrete — all mapped types are fully resolved.
+    A substitution like [("T", TyNamed("T",[]))] maps a type param to itself,
+    which means the call site still has generic types. Skip these. *)
+let is_concrete_subst (subst : mono_subst) : bool =
+  let rec has_tyvars ty =
+    match ty with
+    | Ast.TyVar _ -> true
+    | Ast.TyBoundVar _ -> true
+    | Ast.TyMeta _ -> true
+    | Ast.TyVarDims _ -> true
+    (* Single uppercase letter TyNamed with no args looks like a type
+       variable (T, V, K, etc.) — reject as non-concrete. Without this,
+       T=V (one type param substituted with another) passes the check
+       and produces mono'd functions with unresolved types. *)
+    | Ast.TyNamed (n, []) when Types.is_type_param_name n -> true
+    | Ast.TyNamed (_, args) -> List.exists has_tyvars args
+    | Ast.TyArray (elem, dims) -> has_tyvars elem || List.exists has_tyvars dims
+    | Ast.TyTuple ts -> List.exists has_tyvars ts
+    | Ast.TyFunc f -> List.exists has_tyvars f.params || has_tyvars f.return
+    | Ast.TyRange t -> has_tyvars t
+    | _ -> false
+  in
+  List.for_all
+    (fun (name, value) ->
+      match value with
+      | SubstType (Ast.TyNamed (n, [])) when n = name -> false
+      | SubstType ty -> not (has_tyvars ty)
+      | SubstDimPack dims -> List.for_all (fun ty -> not (has_tyvars ty)) dims)
+    subst
+
+let rec has_rigid_type_vars (ty : Ast.type_expr) : bool =
+  match ty with
+  | Ast.TyVar _ -> true
+  | Ast.TyBoundVar _ -> true
+  | Ast.TyVarDims _ -> true
+  | Ast.TyNamed (name, []) when Types.is_type_param_name name -> true
+  | Ast.TyNamed (_, args) -> List.exists has_rigid_type_vars args
+  | Ast.TyArray (elem, dims) ->
+      has_rigid_type_vars elem || List.exists has_rigid_type_vars dims
+  | Ast.TyTuple ts -> List.exists has_rigid_type_vars ts
+  | Ast.TyFunc f ->
+      List.exists has_rigid_type_vars f.params || has_rigid_type_vars f.return
+  | Ast.TyRange t -> has_rigid_type_vars t
+  | Ast.TyDimOp (_, a, b) -> has_rigid_type_vars a || has_rigid_type_vars b
+  | _ -> false
+
+let is_refinable_meta_type (ty : Ast.type_expr) : bool =
+  Codegen_types.has_type_vars ty && not (has_rigid_type_vars ty)
+
+let normalize_subst_value = function
+  | SubstType ty -> SubstType (Codegen_types.normalize_type ty)
+  | SubstDimPack dims ->
+      SubstDimPack (List.map Codegen_types.normalize_type dims)
+
+let subst_values_equal a b =
+  match (a, b) with
+  | SubstType a, SubstType b -> Types.types_equal a b
+  | SubstDimPack a, SubstDimPack b ->
+      List.length a = List.length b && List.for_all2 Types.types_equal a b
+  | _ -> false
+
+let dedup_subst_consistent (raw : mono_subst) : mono_subst option =
+  let groups = Hashtbl.create 8 in
+  let ok = ref true in
+  List.iter
+    (fun (name, value) ->
+      let normalized =
+        match value with
+        | SubstType ty -> mono_subst_binding_opt name ty
+        | SubstDimPack dims -> mono_dim_pack_binding_opt name dims
+      in
+      match normalized with
+      | None -> ()
+      | Some (name, value) -> (
+          let value = normalize_subst_value value in
+          match Hashtbl.find_opt groups name with
+          | None -> Hashtbl.replace groups name value
+          | Some existing -> (
+              if subst_values_equal existing value then ()
+              else
+                match (existing, value) with
+                | SubstType existing, SubstType ty -> (
+                    let existing_closed =
+                      not (Codegen_types.has_type_vars existing)
+                    in
+                    let ty_closed = not (Codegen_types.has_type_vars ty) in
+                    let existing_meta = is_refinable_meta_type existing in
+                    let ty_meta = is_refinable_meta_type ty in
+                    (* Rigid outer type vars are not refinable here: keep the
+                       substitution open so a later outer specialization can retry. *)
+                    match
+                      (existing_closed, ty_closed, existing_meta, ty_meta)
+                    with
+                    | true, true, _, _ -> ok := false
+                    | _, false, _, false ->
+                        Hashtbl.replace groups name (SubstType ty)
+                    | false, _, false, _ -> ()
+                    | false, true, true, _ ->
+                        Hashtbl.replace groups name (SubstType ty)
+                    | true, false, _, true -> ()
+                    | false, false, true, true -> ())
+                | _ -> ok := false)))
+    raw;
+  if not !ok then None
+  else
+    Some
+      (Hashtbl.fold (fun k v acc -> (k, v) :: acc) groups []
+      |> List.sort (fun (a, _) (b, _) -> String.compare a b))
+
+let rec apply_subst (subst : mono_subst) (ty : Ast.type_expr) : Ast.type_expr =
+  let lookup name =
+    match List.assoc_opt name subst with
+    | Some t -> Some t
+    | None -> List.assoc_opt (type_param_name name) subst
+  in
+  let lookup_type name =
+    match lookup name with Some (SubstType t) -> Some t | _ -> None
+  in
+  let apply_args args =
+    List.concat_map
+      (fun arg ->
+        match arg with
+        | Ast.TyVarDims name -> (
+            match lookup name with
+            | Some (SubstDimPack dims) -> List.map (apply_subst subst) dims
+            | Some (SubstType ty) -> [ apply_subst subst ty ]
+            | None -> [ arg ])
+        | _ -> [ apply_subst subst arg ])
+      args
+  in
+  match ty with
+  | Ast.TyVar name -> ( match lookup_type name with Some t -> t | None -> ty)
+  | Ast.TyBoundVar param -> (
+      match lookup_type param.param_name with Some t -> t | None -> ty)
+  | Ast.TyNamed (name, []) -> (
+      match lookup_type name with Some t -> t | None -> ty)
+  | Ast.TyNamed (name, args) -> Ast.TyNamed (name, apply_args args)
+  | Ast.TyArray (elem, dims) ->
+      Types.ty_array (apply_subst subst elem) (apply_args dims)
+  | Ast.TyTuple ts -> Ast.TyTuple (List.map (apply_subst subst) ts)
+  | Ast.TyFunc f ->
+      Ast.TyFunc
+        {
+          f with
+          params = List.map (apply_subst subst) f.params;
+          return = apply_subst subst f.return;
+        }
+  | Ast.TyRange t -> Ast.TyRange (apply_subst subst t)
+  | Ast.TyDimOp (op, a, b) ->
+      Ast.TyDimOp (op, apply_subst subst a, apply_subst subst b)
+  | _ -> ty
+
+(* ============================================================================
+   Name mangling
+   ============================================================================ *)
+
+let rec encode_type (ty : Ast.type_expr) : string option =
+  match Codegen_types.normalize_type ty with
+  | Ast.TyNamed (n, []) -> Some n
+  | Ast.TyNamed (n, args) ->
+      let enc = List.filter_map encode_type args in
+      if List.length enc = List.length args then
+        Some (String.concat "_" (n :: enc))
+      else None
+  | Ast.TyArray (elem, dims) -> (
+      let enc_dims = List.filter_map encode_type dims in
+      match encode_type elem with
+      | Some enc_elem when List.length enc_dims = List.length dims ->
+          Some ("Array_" ^ String.concat "_" (enc_elem :: enc_dims))
+      | _ -> None)
+  | Ast.TyTuple ts ->
+      let enc = List.filter_map encode_type ts in
+      if List.length enc = List.length ts then
+        Some ("Tuple_" ^ String.concat "_" enc)
+      else None
+  | Ast.TyFunc { params; return; is_pure } -> (
+      let enc_p = List.filter_map encode_type params in
+      match encode_type return with
+      | Some enc_r when List.length enc_p = List.length params ->
+          Some
+            (Printf.sprintf "%sFn_%s_%s"
+               (if is_pure then "P" else "")
+               (String.concat "_" enc_p) enc_r)
+      | _ -> None)
+  | Ast.TyConstInt n -> Some (string_of_int n)
+  | Ast.TyDimOp (op, a, b) -> (
+      (* Fold [TyDimOp] with concrete integer operands into a single
+         [TyConstInt] so specializations like [Float[#N * #4]]
+         with a concrete outer [#N] mangle to one integer instead of
+         failing encoding. [Types.Dim.reduce] is the canonical solver;
+         if it returns a [TyConstInt] we emit it, otherwise fall
+         through to a compound encoding so unresolved dim vars still
+         produce distinct mangled names.
+
+         A4-era lesson: before this fix, compound dim types produced
+         [None] here → [try_enqueue] returned [None] → scan_and_rewrite
+         left the call unrewritten → post-mono [check_unrewritten_generic_calls]
+         raised on the last call found bottom-up in the body. *)
+      match Types.Dim.normalize ty with
+      | Ast.TyConstInt n -> Some (string_of_int n)
+      | _ -> (
+          match (encode_type a, encode_type b) with
+          | Some ea, Some eb ->
+              let op_str =
+                match op with
+                | Ast.DimAdd -> "Add"
+                | Ast.DimSub -> "Sub"
+                | Ast.DimMul -> "Mul"
+                | Ast.DimDiv -> "Div"
+              in
+              Some (Printf.sprintf "DimOp%s_%s_%s" op_str ea eb)
+          | _ -> None))
+  | _ -> None
+
+let encode_subst_value = function
+  | SubstType ty -> encode_type ty
+  | SubstDimPack [] -> Some "Dims0"
+  | SubstDimPack dims ->
+      let enc = List.filter_map encode_type dims in
+      if List.length enc = List.length dims then
+        Some ("Dims_" ^ String.concat "_" enc)
+      else None
+
+let mangle_name (func_name : string) (subst : mono_subst) : string option =
+  let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) subst in
+  let encoded =
+    List.filter_map (fun (_, value) -> encode_subst_value value) sorted
+  in
+  if List.length encoded = List.length sorted then
+    Some (func_name ^ "__mono_" ^ String.concat "_" encoded)
+  else None
+
+(* ============================================================================
+   Core tree type substitution
+   ============================================================================ *)
+
+let subst_core_types (subst : mono_subst) (e : core) : core =
+  let st = apply_subst subst in
+  transform_bottom_up
+    (fun node ->
+      let node = { node with ty = st node.ty } in
+      match node.desc with
+      | CLet (b, body) ->
+          { node with desc = CLet ({ b with bind_ty = st b.bind_ty }, body) }
+      | CBorrowLet (b, body) ->
+          {
+            node with
+            desc = CBorrowLet ({ b with borrow_ty = st b.borrow_ty }, body);
+          }
+      | CDup (v, ty, body) -> { node with desc = CDup (v, st ty, body) }
+      | CDrop (v, ty, body) -> { node with desc = CDrop (v, st ty, body) }
+      | CLambda lam ->
+          {
+            node with
+            desc =
+              CLambda
+                {
+                  lam with
+                  lam_params = List.map (fun (v, t) -> (v, st t)) lam.lam_params;
+                  lam_return_ty = st lam.lam_return_ty;
+                };
+          }
+      | CTryBind (k, v, ty, rhs) ->
+          { node with desc = CTryBind (k, v, st ty, rhs) }
+      | CFor (binder, iter, body) ->
+          {
+            node with
+            desc = CFor ({ binder with loop_ty = st binder.loop_ty }, iter, body);
+          }
+      | CUnbox (x, ty) -> { node with desc = CUnbox (x, st ty) }
+      | CBox (x, ty) -> { node with desc = CBox (x, st ty) }
+      | CCast (x, ty) -> { node with desc = CCast (x, st ty) }
+      | _ -> node)
+    e
+
+let specialize_func (original : core_func) (mangled : string)
+    (subst : mono_subst) : core_func =
+  let st = apply_subst subst in
+  let body =
+    match original.cf_body with
+    | None -> None
+    | Some b ->
+        let substituted = subst_core_types subst b in
+        let renamed =
+          transform_bottom_up
+            (fun node ->
+              match node.desc with
+              | CVar v when v.vname = original.cf_name ->
+                  (* Recursive self-reference inside a generic body: rewrite
+                 to the specialized name AND clear [vdef_id]. Keeping the
+                 original's [vdef_id] would mangle the recursive call site
+                 to the generic's C symbol (which is never emitted). *)
+                  { node with desc = CVar (Core.Var.named mangled) }
+              | CCall (kind, callee, args) -> (
+                  match callee.desc with
+                  | CVar v when v.vname = original.cf_name ->
+                      {
+                        node with
+                        desc =
+                          CCall
+                            ( kind,
+                              {
+                                callee with
+                                desc = CVar (Core.Var.named mangled);
+                              },
+                              args );
+                      }
+                  | _ -> node)
+              | _ -> node)
+            substituted
+        in
+        Some renamed
+  in
+  {
+    original with
+    cf_name = mangled;
+    cf_type_params = [];
+    cf_params =
+      List.map
+        (fun (p : core_param) -> { p with cp_ty = st p.cp_ty })
+        original.cf_params;
+    cf_return_ty = st original.cf_return_ty;
+    cf_body = body;
+    cf_def_id = Session.mint_def_id (Session.current ());
+  }
+
+(* ============================================================================
+   Main algorithm
+   ============================================================================ *)
+
+let sanitize_module_name = Codegen_names.sanitize_module_name
+
+let concretize_node_type (expected : Ast.type_expr) (node : core) : core =
+  if
+    (not (Codegen_types.has_type_vars expected))
+    && Codegen_types.has_type_vars node.ty
+  then { node with ty = expected }
+  else node
+
+let concretize_call_args_for_specialization (gf : core_func)
+    (subst : mono_subst) (args : core list) : core list =
+  let st = apply_subst subst in
+  try
+    List.map2
+      (fun (p : core_param) arg -> concretize_node_type (st p.cp_ty) arg)
+      gf.cf_params args
+  with Invalid_argument _ -> args
+
+let concretize_call_for_specialization (gf : core_func) (subst : mono_subst)
+    (node : core) (kind : call_kind) (callee : core) (args : core list)
+    (mangled : string) : core =
+  let st = apply_subst subst in
+  let args' = concretize_call_args_for_specialization gf subst args in
+  let node' = concretize_node_type (st gf.cf_return_ty) node in
+  {
+    node' with
+    desc =
+      CCall (kind, { callee with desc = CVar (Core.Var.named mangled) }, args');
+  }
+
+let binop_method : Ast.binop -> string option = function
+  | Ast.Add -> Some "add"
+  | Ast.Sub -> Some "subtract"
+  | Ast.Mul -> Some "multiply"
+  | Ast.Div -> Some "divide"
+  | Ast.Mod -> Some "remainder"
+  | Ast.Eq -> Some "equals"
+  | Ast.Ne -> Some "not_equals"
+  | Ast.Lt -> Some "less_than"
+  | Ast.Gt -> Some "greater_than"
+  | Ast.Le -> Some "less_than_or_equal"
+  | Ast.Ge -> Some "greater_than_or_equal"
+
+let unop_method : Ast.unop -> string option = function
+  | Ast.Neg -> Some "negate"
+  | Ast.Not -> None
+
+let impl_generation_key (trait_name : string) (for_type : Ast.type_expr) :
+    string option =
+  match Codegen_types.type_key_for_impl for_type with
+  | Some key -> Some (trait_name ^ ":" ^ key)
+  | None -> None
+
+let specialize_impl_method (subst : mono_subst) (m : core_func) : core_func =
+  let st = apply_subst subst in
+  let body = Option.map (subst_core_types subst) m.cf_body in
+  {
+    m with
+    cf_type_params = [];
+    cf_params =
+      List.map
+        (fun (p : core_param) -> { p with cp_ty = st p.cp_ty })
+        m.cf_params;
+    cf_return_ty = st m.cf_return_ty;
+    cf_body = body;
+    cf_def_id = Session.mint_def_id (Session.current ());
+  }
+
+let specialize_impl (original : core_impl) (subst : mono_subst) : core_impl =
+  {
+    original with
+    ci_for_type = apply_subst subst original.ci_for_type;
+    ci_methods = List.map (specialize_impl_method subst) original.ci_methods;
+  }
+
+type mono_state = {
+  generic_bodies : (string, core_func) Hashtbl.t;
+  generic_impls_by_method : (string, core_impl list) Hashtbl.t;
+  generic_impls_by_trait : (string, core_impl list) Hashtbl.t;
+  generated : (string, unit) Hashtbl.t;
+  generated_impls : (string, unit) Hashtbl.t;
+  mutable worklist : (string * mono_subst) list;
+  mutable impl_worklist : (core_impl * mono_subst) list;
+  mutable specialized : core_decl list;
+  mutable specialized_impls : core_decl list;
+  import_aliases : (string, string * string) Hashtbl.t;
+  module_imports : (string, (string, string * string) Hashtbl.t) Hashtbl.t;
+  mutable option_fusion_counter : int;
+  mutable current_module_path : string;
+  reg : Codegen_types.registry;
+      (** Per-compilation registry. [collect_subst] consults [reg.type_aliases]
+        via [expand_alias] so alias-wrapped types unify against their
+        expanded forms at call sites. *)
+}
+
+let create_state ~reg ~import_aliases ?(module_imports = Hashtbl.create 0) () =
+  {
+    generic_bodies = Hashtbl.create 16;
+    generic_impls_by_method = Hashtbl.create 16;
+    generic_impls_by_trait = Hashtbl.create 16;
+    generated = Hashtbl.create 64;
+    generated_impls = Hashtbl.create 64;
+    worklist = [];
+    impl_worklist = [];
+    specialized = [];
+    specialized_impls = [];
+    import_aliases;
+    module_imports;
+    option_fusion_counter = 0;
+    current_module_path = "";
+    reg;
+  }
+
+let concrete_subst_for_call (state : mono_state) ~(func_name : string)
+    (gf : core_func) (node : core) (args : core list) : mono_subst option =
+  let type_params = gf.cf_type_params in
+  let raw_subst =
+    try
+      Some
+        (List.fold_left2
+           (fun acc (p : core_param) arg ->
+             collect_subst ~reg:state.reg type_params p.cp_ty arg.ty acc)
+           [] gf.cf_params args)
+    with Invalid_argument _ -> None
+  in
+  match raw_subst with
+  | None -> None
+  | Some raw_subst -> (
+      let raw_subst =
+        collect_subst ~reg:state.reg type_params gf.cf_return_ty node.ty
+          raw_subst
+      in
+      match dedup_subst_consistent raw_subst with
+      | None ->
+          Core_error.errorf (Core_error.Stage Core_stage.Mono) node.loc
+            ~hint:
+              "all appearances of the same generic type parameter must resolve \
+               to the same concrete type; add an overload or change the \
+               function signature if mixed types are intended"
+            "Conflicting type arguments for generic function '%s'" func_name
+      | Some subst when subst <> [] && is_concrete_subst subst -> Some subst
+      | Some _ -> None)
+
+let starts_with s prefix =
+  let slen = String.length s in
+  let plen = String.length prefix in
+  slen >= plen && String.sub s 0 plen = prefix
+
+let ends_with s suffix =
+  let slen = String.length s in
+  let suffix_len = String.length suffix in
+  slen >= suffix_len && String.sub s (slen - suffix_len) suffix_len = suffix
+
+let module_qualified_name (module_path : string) (source_name : string) =
+  let prefix = sanitize_module_name module_path ^ "__" in
+  if starts_with source_name prefix then source_name else prefix ^ source_name
+
+let post_mono_synthesis_name (f : core_func) : string =
+  let source_name =
+    match f.cf_module with
+    | None -> f.cf_name
+    | Some module_path ->
+        let prefix = sanitize_module_name module_path ^ "__" in
+        if starts_with f.cf_name prefix then
+          String.sub f.cf_name (String.length prefix)
+            (String.length f.cf_name - String.length prefix)
+        else f.cf_name
+  in
+  let pure_suffix = "__pure" in
+  if ends_with source_name pure_suffix then
+    String.sub source_name 0
+      (String.length source_name - String.length pure_suffix)
+  else source_name
+
+let next_option_fusion_temp (state : mono_state) (label : string) : string =
+  state.option_fusion_counter <- state.option_fusion_counter + 1;
+  Printf.sprintf "__blorp_option_fusion_%s_%d" label state.option_fusion_counter
+
+let option_payload_type (state : mono_state) (ty : Ast.type_expr) :
+    Ast.type_expr option =
+  match
+    ty
+    |> Codegen_types.expand_alias ~reg:state.reg
+    |> Codegen_types.normalize_type
+  with
+  | Ast.TyNamed ("Option", [ payload_ty ]) -> Some payload_ty
+  | _ -> None
+
+let core_bool (loc : Ast.loc) (value : bool) : core =
+  { desc = CLit (Ast.LitBool value); ty = Ast.TyNamed ("Bool", []); loc }
+
+let core_var (loc : Ast.loc) (name : string) (ty : Ast.type_expr) : core =
+  { desc = CVar (Var.named name); ty; loc }
+
+let core_let (loc : Ast.loc) (name : string) (ty : Ast.type_expr) (rhs : core)
+    (body : core) : core =
+  {
+    desc =
+      CLet
+        ( {
+            bind_var = Var.named name;
+            bind_mut = false;
+            bind_ty = ty;
+            bind_rhs = rhs;
+          },
+          body );
+    ty = body.ty;
+    loc;
+  }
+
+type option_fusion_target =
+  | OptionIsSome
+  | OptionIsNone
+  | OptionGetOr
+  | OptionGetOrElse
+
+let option_fusion_target ~(module_path : string option) ~(source_name : string)
+    : option_fusion_target option =
+  match (module_path, source_name) with
+  | Some "std/option", "is_some" -> Some OptionIsSome
+  | Some "std/option", "is_none" -> Some OptionIsNone
+  | Some "std/option", "get_or" -> Some OptionGetOr
+  | Some "std/option", "get_or_else" -> Some OptionGetOrElse
+  | _ -> None
+
+let option_presence_match (node : core) (opt : core) ~(some_value : bool)
+    ~(none_value : bool) : core =
+  {
+    node with
+    desc =
+      CMatchArms
+        ( opt,
+          [
+            ( Ast.PatConstructor ("Some", [ Ast.PatWildcard ]),
+              core_bool node.loc some_value );
+            (Ast.PatConstructor ("None", []), core_bool node.loc none_value);
+          ] );
+  }
+
+let try_fuse_option_call (state : mono_state) ~(module_path : string option)
+    ~(source_name : string) (gf : core_func) (subst : mono_subst) (node : core)
+    (args : core list) : core option =
+  match option_fusion_target ~module_path ~source_name with
+  | None -> None
+  | Some target -> (
+      let st = apply_subst subst in
+      let args = concretize_call_args_for_specialization gf subst args in
+      let node = concretize_node_type (st gf.cf_return_ty) node in
+      match (target, args) with
+      | OptionIsSome, [ opt ] when option_payload_type state opt.ty <> None ->
+          Some
+            (option_presence_match node opt ~some_value:true ~none_value:false)
+      | OptionIsNone, [ opt ] when option_payload_type state opt.ty <> None ->
+          Some
+            (option_presence_match node opt ~some_value:false ~none_value:true)
+      | OptionGetOr, [ opt; default_value ]
+        when option_payload_type state opt.ty <> None ->
+          let opt_name = next_option_fusion_temp state "opt" in
+          let default_name = next_option_fusion_temp state "default" in
+          let value_name = next_option_fusion_temp state "value" in
+          let opt_var = core_var node.loc opt_name opt.ty in
+          let default_var = core_var node.loc default_name node.ty in
+          let match_expr =
+            {
+              node with
+              desc =
+                CMatchArms
+                  ( opt_var,
+                    [
+                      ( Ast.PatConstructor ("Some", [ Ast.PatVar value_name ]),
+                        core_var node.loc value_name node.ty );
+                      (Ast.PatConstructor ("None", []), default_var);
+                    ] );
+            }
+          in
+          Some
+            (core_let node.loc opt_name opt.ty opt
+               (core_let node.loc default_name node.ty default_value match_expr))
+      | OptionGetOrElse, [ opt; default_fn ]
+        when option_payload_type state opt.ty <> None ->
+          let opt_name = next_option_fusion_temp state "opt" in
+          let default_fn_name = next_option_fusion_temp state "default_fn" in
+          let value_name = next_option_fusion_temp state "value" in
+          let opt_var = core_var node.loc opt_name opt.ty in
+          let default_fn_var =
+            core_var node.loc default_fn_name default_fn.ty
+          in
+          let default_call =
+            { node with desc = CCall (CKUnknown, default_fn_var, []) }
+          in
+          let match_expr =
+            {
+              node with
+              desc =
+                CMatchArms
+                  ( opt_var,
+                    [
+                      ( Ast.PatConstructor ("Some", [ Ast.PatVar value_name ]),
+                        core_var node.loc value_name node.ty );
+                      (Ast.PatConstructor ("None", []), default_call);
+                    ] );
+            }
+          in
+          Some
+            (core_let node.loc opt_name opt.ty opt
+               (core_let node.loc default_fn_name default_fn.ty default_fn
+                  match_expr))
+      | _ -> None)
+
+let collect_generic_bodies (state : mono_state) (prog : core_program) : unit =
+  let remember_generic_body (f : core_func) =
+    match f.cf_module with
+    | None -> Hashtbl.replace state.generic_bodies f.cf_name f
+    | Some module_path ->
+        (* Module-owned generic functions are not visible by their bare source
+           names outside that module. Indexing [std/set.add] globally as
+           ["add"] makes unrelated local functions look like unresolved generic
+           calls during the post-mono safety check. Store explicit module-owned
+           identities only; current-module bare calls and UFCS/imported calls
+           resolve through these qualified keys below. *)
+        let source_name = post_mono_synthesis_name f in
+        let prefixed_source = module_qualified_name module_path source_name in
+        let prefixed_func = module_qualified_name module_path f.cf_name in
+        Hashtbl.replace state.generic_bodies prefixed_source f;
+        if prefixed_func <> f.cf_name && prefixed_func <> prefixed_source then
+          Hashtbl.replace state.generic_bodies prefixed_func f
+  in
+  let add_generic_impl (i : core_impl) =
+    let by_trait =
+      match Hashtbl.find_opt state.generic_impls_by_trait i.ci_trait with
+      | Some xs -> xs
+      | None -> []
+    in
+    Hashtbl.replace state.generic_impls_by_trait i.ci_trait (i :: by_trait);
+    List.iter
+      (fun (m : core_func) ->
+        if m.cf_body <> None then begin
+          let existing =
+            match Hashtbl.find_opt state.generic_impls_by_method m.cf_name with
+            | Some xs -> xs
+            | None -> []
+          in
+          Hashtbl.replace state.generic_impls_by_method m.cf_name (i :: existing)
+        end)
+      i.ci_methods
+  in
+  let remember_concrete_impl (i : core_impl) =
+    match impl_generation_key i.ci_trait i.ci_for_type with
+    | Some key -> Hashtbl.replace state.generated_impls key ()
+    | None -> ()
+  in
+  let rec walk = function
+    | { cd_desc = CDFunc f; _ } :: rest ->
+        if
+          f.cf_type_params <> []
+          && (f.cf_body <> None
+             || is_builtin_kind f.cf_kind
+                && Core_intrinsics.has_post_mono_synthesis
+                     (post_mono_synthesis_name f))
+        then remember_generic_body f;
+        walk rest
+    | { cd_desc = CDImpl i; _ } :: rest ->
+        if Codegen_types.has_type_vars i.ci_for_type then add_generic_impl i
+        else remember_concrete_impl i;
+        walk rest
+    | { cd_desc = CDPrivate inner; _ } :: rest ->
+        walk [ inner ];
+        walk rest
+    | _ :: rest -> walk rest
+    | [] -> ()
+  in
+  walk prog
+
+let try_enqueue (state : mono_state) (func_name : string) (subst : mono_subst) :
+    string option =
+  match mangle_name func_name subst with
+  | None -> None
+  | Some mangled ->
+      if not (Hashtbl.mem state.generated mangled) then begin
+        Hashtbl.replace state.generated mangled ();
+        state.worklist <- (func_name, subst) :: state.worklist
+      end;
+      Some mangled
+
+let method_with_body (method_name : string) (i : core_impl) : core_func option =
+  List.find_opt
+    (fun (m : core_func) -> m.cf_name = method_name && m.cf_body <> None)
+    i.ci_methods
+
+let first_body_method (i : core_impl) : core_func option =
+  List.find_opt (fun (m : core_func) -> m.cf_body <> None) i.ci_methods
+
+let rec try_enqueue_impl_for_trait (state : mono_state) (trait_name : string)
+    (receiver_ty : Ast.type_expr) : bool =
+  let candidates =
+    match Hashtbl.find_opt state.generic_impls_by_trait trait_name with
+    | Some xs -> xs
+    | None -> []
+  in
+  List.exists (try_enqueue_impl_candidate state receiver_ty None) candidates
+
+and try_enqueue_impl_for_method (state : mono_state) (method_name : string)
+    (receiver_ty : Ast.type_expr) : bool =
+  let candidates =
+    match Hashtbl.find_opt state.generic_impls_by_method method_name with
+    | Some xs -> xs
+    | None -> []
+  in
+  List.exists
+    (try_enqueue_impl_candidate state receiver_ty (Some method_name))
+    candidates
+
+and try_enqueue_impl_candidate (state : mono_state)
+    (receiver_ty : Ast.type_expr) (method_name : string option) (i : core_impl)
+    : bool =
+  let method_for_params =
+    match method_name with
+    | Some name -> method_with_body name i
+    | None -> first_body_method i
+  in
+  match method_for_params with
+  | None -> false
+  | Some method_def -> (
+      let raw_subst =
+        collect_subst ~reg:state.reg method_def.cf_type_params i.ci_for_type
+          receiver_ty []
+      in
+      match dedup_subst_consistent raw_subst with
+      | None -> false
+      | Some subst -> (
+          let concrete_for_type = apply_subst subst i.ci_for_type in
+          if
+            subst = []
+            || (not (is_concrete_subst subst))
+            || Codegen_types.has_type_vars concrete_for_type
+          then false
+          else
+            match impl_generation_key i.ci_trait concrete_for_type with
+            | None -> false
+            | Some key ->
+                if not (Hashtbl.mem state.generated_impls key) then begin
+                  Hashtbl.replace state.generated_impls key ();
+                  state.impl_worklist <- (i, subst) :: state.impl_worklist;
+                  enqueue_impl_bounds state subst method_def.cf_type_params
+                end;
+                true))
+
+and enqueue_impl_bounds (state : mono_state) (subst : mono_subst)
+    (type_params : Ast.type_param_decl list) : unit =
+  List.iter
+    (fun (param : Ast.type_param_decl) ->
+      match List.assoc_opt param.param_name subst with
+      | None -> ()
+      | Some (SubstDimPack _) -> ()
+      | Some (SubstType concrete_ty) ->
+          List.iter
+            (fun trait_ref ->
+              ignore
+                (try_enqueue_impl_for_trait state
+                   (Generic_params.trait_ref_name trait_ref)
+                   concrete_ty))
+            param.param_bounds)
+    type_params
+
+let enqueue_trait_call_dependencies (state : mono_state) (method_name : string)
+    (args : core list) : unit =
+  match args with
+  | first :: _ -> (
+      ignore (try_enqueue_impl_for_method state method_name first.ty);
+      match (method_name, Codegen_types.normalize_type first.ty) with
+      | "to_string", Ast.TyNamed ("List", [ elem_ty ]) ->
+          ignore (try_enqueue_impl_for_trait state "Stringable" elem_ty)
+      | _ -> ())
+  | [] -> ()
+
+(** Look up the module path for a qualified alias, checking both the main
+    program's imports and the current module's imports. *)
+let lookup_alias_module (state : mono_state) (alias_name : string) :
+    string option =
+  match Hashtbl.find_opt state.import_aliases alias_name with
+  | Some (mp, "") -> Some mp
+  | _ ->
+      if state.current_module_path <> "" then
+        match
+          Hashtbl.find_opt state.module_imports state.current_module_path
+        with
+        | Some mod_aliases -> (
+            match Hashtbl.find_opt mod_aliases alias_name with
+            | Some (mp, _) -> Some mp
+            | None -> None)
+        | None -> None
+      else None
+
+type generic_hit = {
+  gh_name : string;
+  gh_func : core_func;
+  gh_module_path : string option;
+  gh_source_name : string;
+}
+
+let lookup_generic_module_func (state : mono_state) (mod_path : string)
+    (orig_name : string) : generic_hit option =
+  let prefixed = module_qualified_name mod_path orig_name in
+  let try_lookup_module_owned ?(allow_unowned_prefixed = false) name =
+    match Hashtbl.find_opt state.generic_bodies name with
+    | Some gf
+      when gf.cf_module = Some mod_path
+           || (allow_unowned_prefixed && gf.cf_module = None) ->
+        Some
+          {
+            gh_name = name;
+            gh_func = gf;
+            gh_module_path = Some mod_path;
+            gh_source_name = orig_name;
+          }
+    | _ -> None
+  in
+  match try_lookup_module_owned ~allow_unowned_prefixed:true prefixed with
+  | Some _ as found -> found
+  | None -> (
+      let prefixed_pure = prefixed ^ "__pure" in
+      match
+        try_lookup_module_owned ~allow_unowned_prefixed:true prefixed_pure
+      with
+      | Some _ as found -> found
+      | None -> (
+          match try_lookup_module_owned orig_name with
+          | Some _ as found -> found
+          | None -> try_lookup_module_owned (orig_name ^ "__pure")))
+
+let qualified_call_resolves_without_mono (mod_path : string) (field : string)
+    (args : core list) : bool =
+  Codegen_builtins.lookup mod_path field <> None
+  ||
+  match args with
+  | receiver :: _ ->
+      Core_intrinsic_registry.lookup_ir_backed_std_function ~mod_path
+        ~func_name:field ~arity:(List.length args) ~receiver_ty:receiver.ty
+      <> None
+  | [] -> false
+
+module StringSet = Set.Make (String)
+
+let scope_add_var (scope : StringSet.t) (v : var) : StringSet.t =
+  StringSet.add v.vname scope
+
+let scope_add_vars (scope : StringSet.t) (vars : var list) : StringSet.t =
+  List.fold_left scope_add_var scope vars
+
+let scope_add_pattern (scope : StringSet.t) (pat : Ast.pattern) : StringSet.t =
+  List.fold_left
+    (fun acc name -> StringSet.add name acc)
+    scope
+    (Ast.collect_pattern_vars pat)
+
+(** Scan and rewrite: walk a Core tree, find calls to generic functions,
+    enqueue monomorphization requests, and rewrite each call site inline
+    to the mangled name. Returns the rewritten tree. *)
+let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
+    (e : core) : core =
+  let rec rewrite_ctree scope tree =
+    match tree with
+    | CTLeaf { ct_bindings; ct_body } ->
+        let body_scope =
+          List.fold_left
+            (fun acc (v, _) -> scope_add_var acc v)
+            scope ct_bindings
+        in
+        CTLeaf { ct_bindings; ct_body = rewrite body_scope ct_body }
+    | CTFail -> CTFail
+    | CTSwitchTag sw ->
+        CTSwitchTag
+          {
+            sw with
+            cts_cases =
+              List.map
+                (fun (name, sub) -> (name, rewrite_ctree scope sub))
+                sw.cts_cases;
+            cts_default = Option.map (rewrite_ctree scope) sw.cts_default;
+          }
+    | CTSwitchLit sw ->
+        CTSwitchLit
+          {
+            sw with
+            ctl_cases =
+              List.map
+                (fun (lit, sub) -> (lit, rewrite_ctree scope sub))
+                sw.ctl_cases;
+            ctl_default = rewrite_ctree scope sw.ctl_default;
+          }
+    | CTSwitchLen sw ->
+        CTSwitchLen
+          {
+            sw with
+            ctl_len_cases =
+              List.map
+                (fun (n, sub) -> (n, rewrite_ctree scope sub))
+                sw.ctl_len_cases;
+            ctl_len_geq =
+              Option.map
+                (fun (n, sub) -> (n, rewrite_ctree scope sub))
+                sw.ctl_len_geq;
+            ctl_len_default =
+              Option.map (rewrite_ctree scope) sw.ctl_len_default;
+          }
+  and rewrite_call scope node kind callee args =
+    (match (kind, args) with
+    | CKBuiltin "blorp_to_string", [ arg ] ->
+        enqueue_trait_call_dependencies state "to_string" [ arg ]
+    | _ -> ());
+    (match callee.desc with
+    | CVar v when not (StringSet.mem v.vname scope) ->
+        enqueue_trait_call_dependencies state v.vname args
+    | _ -> ());
+    match callee.desc with
+    | CField (obj, field)
+      when match obj.desc with
+           | CVar v -> not (StringSet.mem v.vname scope)
+           | _ -> false -> (
+        (* Qualified module call: `C.cache(args)`. If the alias is a known
+                module, try to specialize the resolved generic function. *)
+        let alias_name = match obj.desc with CVar v -> v.vname | _ -> "" in
+        match lookup_alias_module state alias_name with
+        | Some mod_path -> (
+            if qualified_call_resolves_without_mono mod_path field args then
+              node
+            else
+              match lookup_generic_module_func state mod_path field with
+              | Some hit -> (
+                  match
+                    concrete_subst_for_call state ~func_name:hit.gh_name
+                      hit.gh_func node args
+                  with
+                  | Some subst -> (
+                      match
+                        try_fuse_option_call state
+                          ~module_path:hit.gh_module_path
+                          ~source_name:hit.gh_source_name hit.gh_func subst node
+                          args
+                      with
+                      | Some fused -> fused
+                      | None -> (
+                          match try_enqueue state hit.gh_name subst with
+                          | Some mangled ->
+                              concretize_call_for_specialization hit.gh_func
+                                subst node kind callee args mangled
+                          | None -> node))
+                  | None -> node)
+              | None -> node)
+        | None -> node)
+    | CVar v when not (StringSet.mem v.vname scope) -> (
+        let try_lookup_prefixed_for_mono mod_path orig_name =
+          if qualified_call_resolves_without_mono mod_path orig_name args then
+            None
+          else lookup_generic_module_func state mod_path orig_name
+        in
+        let try_lookup_bare name =
+          let visible hit_name gf =
+            match (gf.cf_module, state.current_module_path) with
+            | None, "" ->
+                Some
+                  {
+                    gh_name = hit_name;
+                    gh_func = gf;
+                    gh_module_path = None;
+                    gh_source_name = post_mono_synthesis_name gf;
+                  }
+            | Some owner, current when owner = current ->
+                Some
+                  {
+                    gh_name = hit_name;
+                    gh_func = gf;
+                    gh_module_path = Some owner;
+                    gh_source_name = post_mono_synthesis_name gf;
+                  }
+            | _ -> None
+          in
+          match Hashtbl.find_opt state.generic_bodies name with
+          | Some gf -> visible name gf
+          | None when state.current_module_path <> "" -> (
+              let qualified =
+                module_qualified_name state.current_module_path name
+              in
+              match Hashtbl.find_opt state.generic_bodies qualified with
+              | Some gf -> visible qualified gf
+              | None -> None)
+          | None -> None
+        in
+        let try_lookup_import_alias aliases name =
+          match Hashtbl.find_opt aliases name with
+          | Some (mod_path, orig_name) when orig_name <> "" -> (
+              match try_lookup_prefixed_for_mono mod_path orig_name with
+              | Some hit -> `Generic hit
+              | None -> `Concrete)
+          | _ -> `Missing
+        in
+        let resolve_name name =
+          (* UFCS-mangled names are already explicit method targets:
+                  __ufcs_std$option__get_or -> std_option__get_or.
+                  Resolve those before considering any bare same-name generic. *)
+          match Codegen_names.parse_ufcs_name name with
+          | Some (mod_path, orig_name) -> (
+              match try_lookup_prefixed_for_mono mod_path orig_name with
+              | Some _ as hit -> hit
+              | None -> try_lookup_bare name)
+          | None -> (
+              let import_hit =
+                (* Current module imports are authoritative inside that
+                        module. Main-program imports must not leak into std
+                        module bodies, because they can shadow module-local
+                        calls such as dict.contains -> dict.get. *)
+                if state.current_module_path <> "" then
+                  match
+                    Hashtbl.find_opt state.module_imports
+                      state.current_module_path
+                  with
+                  | Some mod_aliases -> try_lookup_import_alias mod_aliases name
+                  | None -> `Missing
+                else try_lookup_import_alias state.import_aliases name
+              in
+              match import_hit with
+              | `Generic hit -> Some hit
+              | `Concrete -> None
+              | `Missing -> (
+                  match
+                    if state.current_module_path <> "" then
+                      try_lookup_prefixed_for_mono state.current_module_path
+                        name
+                    else None
+                  with
+                  | Some _ as hit -> hit
+                  | None -> try_lookup_bare name))
+        in
+        match resolve_name v.vname with
+        | Some hit -> (
+            match
+              concrete_subst_for_call state ~func_name:hit.gh_name hit.gh_func
+                node args
+            with
+            | Some subst -> (
+                match
+                  try_fuse_option_call state ~module_path:hit.gh_module_path
+                    ~source_name:hit.gh_source_name hit.gh_func subst node args
+                with
+                | Some fused -> fused
+                | None -> (
+                    match try_enqueue state hit.gh_name subst with
+                    | Some mangled ->
+                        (* Use [Var.named mangled] to CLEAR [vdef_id].
+                                The original [v] may carry a [vdef_id] from a
+                                UFCS [#<ol_def_id>] suffix (core_lower.ml parse);
+                                the specialized target is a different function
+                                with its own [cf_def_id] that [Core_resolve]'s
+                                [collect_env] will populate later. Keeping the
+                                old id would mangle the call site to the
+                                wrong C symbol. *)
+                        concretize_call_for_specialization hit.gh_func subst
+                          node kind callee args mangled
+                    | None -> node))
+            | None -> node)
+        | None -> node)
+    | _ -> node
+  and rewrite_try_items scope items =
+    let rec loop scope acc = function
+      | [] -> List.rev acc
+      | item :: rest ->
+          let item' = rewrite scope item in
+          let scope' =
+            match item.desc with
+            | CTryBind (_, v, _, _) -> scope_add_var scope v
+            | _ -> scope
+          in
+          loop scope' (item' :: acc) rest
+    in
+    loop scope [] items
+  and rewrite scope e =
+    let rewrite_box_op b = { b with box_value = rewrite scope b.box_value } in
+    let rewrite_boxed_storage v =
+      { v with bsv_box = rewrite_box_op v.bsv_box }
+    in
+    let rewrite_record_field = function
+      | RecordRawField (name, value) ->
+          RecordRawField (name, rewrite scope value)
+      | RecordErasedField (name, value) ->
+          RecordErasedField (name, rewrite_boxed_storage value)
+    in
+    let desc =
+      match e.desc with
+      | CLit _ | CVar _ | CVoid | CBreak | CContinue -> e.desc
+      | CTuple xs -> CTuple (List.map (rewrite scope) xs)
+      | CList lit ->
+          CList { lit with ll_elems = List.map (rewrite scope) lit.ll_elems }
+      | CListAlloc alloc ->
+          CListAlloc
+            { alloc with la_capacity = rewrite scope alloc.la_capacity }
+      | CListGet get ->
+          CListGet
+            {
+              get with
+              lg_list = rewrite scope get.lg_list;
+              lg_index = rewrite scope get.lg_index;
+            }
+      | CStringByteRead r ->
+          CStringByteRead
+            {
+              r with
+              sbr_source = rewrite scope r.sbr_source;
+              sbr_index = rewrite scope r.sbr_index;
+            }
+      | CStringByteWrite w ->
+          CStringByteWrite
+            {
+              w with
+              sbw_target = rewrite scope w.sbw_target;
+              sbw_index = rewrite scope w.sbw_index;
+              sbw_byte = rewrite scope w.sbw_byte;
+            }
+      | CStringByteCopy c ->
+          CStringByteCopy
+            {
+              c with
+              sbc_dst = rewrite scope c.sbc_dst;
+              sbc_dst_pos = rewrite scope c.sbc_dst_pos;
+              sbc_src = rewrite scope c.sbc_src;
+              sbc_src_pos = rewrite scope c.sbc_src_pos;
+              sbc_len = rewrite scope c.sbc_len;
+            }
+      | CStringSetLen s ->
+          CStringSetLen
+            {
+              s with
+              ssl_target = rewrite scope s.ssl_target;
+              ssl_len = rewrite scope s.ssl_len;
+            }
+      | CTupleConstruct tc ->
+          CTupleConstruct
+            { tc with tc_elems = List.map rewrite_boxed_storage tc.tc_elems }
+      | CListConstruct lc ->
+          CListConstruct
+            { lc with lc_elems = List.map rewrite_boxed_storage lc.lc_elems }
+      | CVector xs -> CVector (List.map (rewrite scope) xs)
+      | CTensorLiteral tl ->
+          let payload =
+            match tl.tl_payload with
+            | TensorRawElements (scalar, elems) ->
+                TensorRawElements (scalar, List.map (rewrite scope) elems)
+            | TensorWordElements elems ->
+                TensorWordElements (List.map (rewrite scope) elems)
+            | TensorPackedElements (width, elems) ->
+                TensorPackedElements (width, List.map (rewrite scope) elems)
+            | TensorInlineStructElements (c_ty, elems) ->
+                TensorInlineStructElements (c_ty, List.map (rewrite scope) elems)
+            | TensorBoxedElements elems ->
+                TensorBoxedElements (List.map rewrite_boxed_storage elems)
+          in
+          CTensorLiteral { tl with tl_payload = payload }
+      | CDict kvs ->
+          CDict
+            (List.map (fun (k, v) -> (rewrite scope k, rewrite scope v)) kvs)
+      | CDictConstruct dc ->
+          CDictConstruct
+            {
+              dc with
+              dc_entries =
+                List.map
+                  (fun (k, v) ->
+                    (rewrite_boxed_storage k, rewrite_boxed_storage v))
+                  dc.dc_entries;
+            }
+      | CSetAlloc _ -> e.desc
+      | CRecord fs ->
+          CRecord
+            (List.map (fun (name, value) -> (name, rewrite scope value)) fs)
+      | CRecordConstruct rc ->
+          CRecordConstruct
+            { rc with rc_fields = List.map rewrite_record_field rc.rc_fields }
+      | CRecordUpdate (base, fs) ->
+          CRecordUpdate
+            ( rewrite scope base,
+              List.map (fun (name, value) -> (name, rewrite scope value)) fs )
+      | CRange (a, b) -> CRange (rewrite scope a, rewrite scope b)
+      | CLambda lam ->
+          let lam_scope =
+            List.fold_left
+              (fun acc (v, _) -> scope_add_var acc v)
+              scope lam.lam_params
+          in
+          CLambda { lam with lam_body = rewrite lam_scope lam.lam_body }
+      | CClosureCreate _ -> e.desc
+      | CBin (op, lhs, rhs) -> CBin (op, rewrite scope lhs, rewrite scope rhs)
+      | CUn (op, operand) -> CUn (op, rewrite scope operand)
+      | CLog (op, lhs, rhs) -> CLog (op, rewrite scope lhs, rewrite scope rhs)
+      | CCall (kind, callee, args) ->
+          let callee' = rewrite scope callee in
+          let args' = List.map (rewrite scope) args in
+          CCall (kind, callee', args')
+      | CTensorRawRead r ->
+          CTensorRawRead { r with trr_index = rewrite scope r.trr_index }
+      | CTensorRawWrite w ->
+          CTensorRawWrite
+            {
+              w with
+              trw_index = rewrite scope w.trw_index;
+              trw_value = rewrite scope w.trw_value;
+            }
+      | CField (obj, field) -> CField (rewrite scope obj, field)
+      | CStringInterp (parts, is_triple) ->
+          CStringInterp
+            ( List.map
+                (function
+                  | IPLit _ as lit -> lit
+                  | IPExpr expr -> IPExpr (rewrite scope expr))
+                parts,
+              is_triple )
+      | CLet (binding, body) ->
+          let rhs' = rewrite scope binding.bind_rhs in
+          let body' = rewrite (scope_add_var scope binding.bind_var) body in
+          CLet ({ binding with bind_rhs = rhs' }, body')
+      | CBorrowLet (binding, body) ->
+          let rhs' = rewrite scope binding.borrow_rhs in
+          let body' = rewrite (scope_add_var scope binding.borrow_var) body in
+          CBorrowLet ({ binding with borrow_rhs = rhs' }, body')
+      | CTensorRawViewLet (binding, body) ->
+          let source' = rewrite scope binding.trv_source in
+          let body' = rewrite (scope_add_var scope binding.trv_var) body in
+          CTensorRawViewLet ({ binding with trv_source = source' }, body')
+      | CSeq (a, b) -> CSeq (rewrite scope a, rewrite scope b)
+      | CDebugBlock body -> CDebugBlock (rewrite scope body)
+      | CIf (cond, then_, else_) ->
+          CIf (rewrite scope cond, rewrite scope then_, rewrite scope else_)
+      | CMatchArms (scrut, arms) ->
+          CMatchArms
+            ( rewrite scope scrut,
+              List.map
+                (fun (pat, body) ->
+                  (pat, rewrite (scope_add_pattern scope pat) body))
+                arms )
+      | CMatch (scrut, tree) ->
+          CMatch (rewrite scope scrut, rewrite_ctree scope tree)
+      | CWhile (cond, body) -> CWhile (rewrite scope cond, rewrite scope body)
+      | CFor (binder, iter, body) ->
+          CFor
+            ( binder,
+              rewrite scope iter,
+              rewrite (scope_add_var scope binder.loop_var) body )
+      | CAssign (v, rhs) -> CAssign (v, rewrite scope rhs)
+      | CTailrecLoop loop ->
+          let loop' =
+            match loop with
+            | TailrecUnmanagedLoop l ->
+                TailrecUnmanagedLoop
+                  { l with tul_body = rewrite scope l.tul_body }
+            | TailrecListSpreadLoop l ->
+                TailrecListSpreadLoop
+                  { l with tls_body = rewrite scope l.tls_body }
+          in
+          CTailrecLoop loop'
+      | CTailrecRecur recur ->
+          let recur' =
+            match recur with
+            | TailrecRecur r ->
+                TailrecRecur { tr_args = List.map (rewrite scope) r.tr_args }
+            | TailrecListSpreadRecur r ->
+                TailrecListSpreadRecur
+                  {
+                    r with
+                    tr_rebinds =
+                      List.map
+                        (fun (i, arg) -> (i, rewrite scope arg))
+                        r.tr_rebinds;
+                  }
+          in
+          CTailrecRecur recur'
+      | CTry items -> CTry (rewrite_try_items scope items)
+      | CTryBind (kind, v, ty, rhs) -> CTryBind (kind, v, ty, rewrite scope rhs)
+      | CDup (v, ty, body) -> CDup (v, ty, rewrite scope body)
+      | CDrop (v, ty, body) -> CDrop (v, ty, rewrite scope body)
+      | CConcurrent cb ->
+          let body_scope =
+            List.fold_left
+              (fun acc b -> scope_add_var acc b.cb_var)
+              scope cb.conc_bindings
+          in
+          CConcurrent
+            {
+              cb with
+              conc_bindings =
+                List.map
+                  (fun b -> { b with cb_rhs = rewrite scope b.cb_rhs })
+                  cb.conc_bindings;
+              conc_body = rewrite body_scope cb.conc_body;
+              conc_timeout = Option.map (rewrite scope) cb.conc_timeout;
+            }
+      | CConcurrentFor cf ->
+          CConcurrentFor
+            {
+              cf with
+              cf_iter = rewrite scope cf.cf_iter;
+              cf_body = rewrite (scope_add_var scope cf.cf_var) cf.cf_body;
+              cf_timeout = Option.map (rewrite scope) cf.cf_timeout;
+            }
+      | CDetach d ->
+          CDetach { d with detach_body = rewrite scope d.detach_body }
+      | CCast (expr, ty) -> CCast (rewrite scope expr, ty)
+      | CUnbox (expr, ty) -> CUnbox (rewrite scope expr, ty)
+      | CUnboxTyped u ->
+          CUnboxTyped { u with unbox_value = rewrite scope u.unbox_value }
+      | CBox (expr, ty) -> CBox (rewrite scope expr, ty)
+      | CBoxTyped b -> CBoxTyped (rewrite_box_op b)
+      | CUnionConstruct uc ->
+          CUnionConstruct
+            { uc with uc_args = List.map rewrite_boxed_storage uc.uc_args }
+      | CListHandoff h ->
+          let body_scope =
+            scope_add_vars scope
+              [ h.lh_source_var; h.lh_result_var; h.lh_len_var; h.lh_out_var ]
+          in
+          CListHandoff
+            {
+              h with
+              lh_source = rewrite scope h.lh_source;
+              lh_capacity = rewrite scope h.lh_capacity;
+              lh_body = rewrite body_scope h.lh_body;
+            }
+    in
+    let node = { e with desc } in
+    match node.desc with
+    | CCall (kind, callee, args) -> rewrite_call scope node kind callee args
+    | CBin (op, lhs, _rhs) ->
+        (match binop_method op with
+        | Some method_name ->
+            ignore (try_enqueue_impl_for_method state method_name lhs.ty)
+        | None -> ());
+        node
+    | CUn (op, operand) ->
+        (match unop_method op with
+        | Some method_name ->
+            ignore (try_enqueue_impl_for_method state method_name operand.ty)
+        | None -> ());
+        node
+    | _ -> node
+  in
+  rewrite initial_scope e
+
+let rewrite_func (state : mono_state) (f : core_func) : core_func =
+  match f.cf_body with
+  | None -> f
+  | Some body ->
+      let prev = state.current_module_path in
+      state.current_module_path <- Option.value f.cf_module ~default:"";
+      let initial_scope =
+        List.map (fun (p : core_param) -> p.cp_name) f.cf_params
+        |> scope_add_vars StringSet.empty
+      in
+      let result =
+        { f with cf_body = Some (scan_and_rewrite ~initial_scope state body) }
+      in
+      state.current_module_path <- prev;
+      result
+
+let rewrite_var (state : mono_state) (v : core_var) : core_var =
+  let prev = state.current_module_path in
+  state.current_module_path <- Option.value v.cv_module ~default:"";
+  let result = { v with cv_init = scan_and_rewrite state v.cv_init } in
+  state.current_module_path <- prev;
+  result
+
+let rewrite_impl (state : mono_state) (i : core_impl) : core_impl =
+  { i with ci_methods = List.map (rewrite_func state) i.ci_methods }
+
+let rec rewrite_decl (state : mono_state) (d : core_decl) : core_decl =
+  let desc' =
+    match d.cd_desc with
+    | CDFunc f -> CDFunc (rewrite_func state f)
+    | CDVar v -> CDVar (rewrite_var state v)
+    | CDImpl i -> CDImpl (rewrite_impl state i)
+    | CDPrivate inner -> CDPrivate (rewrite_decl state inner)
+    | other -> other
+  in
+  { d with cd_desc = desc' }
+
+let drain_worklist (state : mono_state) (loc : Ast.loc) : unit =
+  let rec loop () =
+    match (state.worklist, state.impl_worklist) with
+    | [], [] -> ()
+    | func_batch, impl_batch ->
+        state.worklist <- [];
+        state.impl_worklist <- [];
+        List.iter
+          (fun (func_name, subst) ->
+            match Hashtbl.find_opt state.generic_bodies func_name with
+            | None -> ()
+            | Some gf -> (
+                match mangle_name func_name subst with
+                | None -> ()
+                | Some mangled ->
+                    let specialized = specialize_func gf mangled subst in
+                    let rewritten = rewrite_func state specialized in
+                    state.specialized <-
+                      {
+                        cd_desc = CDFunc rewritten;
+                        cd_loc = loc;
+                        cd_doc = None;
+                      }
+                      :: state.specialized))
+          func_batch;
+        List.iter
+          (fun (impl_def, subst) ->
+            let specialized = specialize_impl impl_def subst in
+            let rewritten = rewrite_impl state specialized in
+            state.specialized_impls <-
+              { cd_desc = CDImpl rewritten; cd_loc = loc; cd_doc = None }
+              :: state.specialized_impls)
+          impl_batch;
+        loop ()
+  in
+  loop ()
+
+(** Phase 2.7 Cluster 2: after mono completes, look for call sites in
+    monomorphic function bodies that still reference a generic
+    user-defined function body that would be dropped by emit
+    ([cf_type_params <> []]). Such calls cause dangling C symbols at
+    link time; we surface them here as a [Core_error] pointing at the
+    call site so the user gets a blorp-level "cannot infer type
+    argument" diagnostic instead of a pile of C errors.
+
+    Scope:
+    - Only flag calls in functions with [cf_type_params = []] (inside
+      a generic body, non-concrete calls are expected — they'll be
+      rewritten when the outer function is specialized).
+    - Only flag when the callee resolves to a function with a body AND
+      generic params — that's the case [emit_func] skips.
+    - Skip builtins / foreign / closure-bodies — those don't need
+      mono and won't dangle at emit. *)
+let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
+    unit =
+  let report_err name loc =
+    let msg =
+      Printf.sprintf
+        "Cannot infer type argument for call to generic function '%s'" name
+    in
+    let hint =
+      "add a type annotation that pins the type arguments — e.g. [x: SomeType \
+       = Foo(...)] on the binding or a return-type annotation on the enclosing \
+       function"
+    in
+    raise
+      (Core_error.Core_error
+         {
+           phase = Core_error.Stage Core_stage.Mono;
+           msg;
+           loc;
+           hint = Some hint;
+         })
+  in
+  (* A qualified call [M.foo] that has a [Codegen_builtins.lookup]
+     entry will be rewritten to [CKBuiltin c_name] by [Core_resolve].
+     Migrated structural std APIs resolve directly to [CKIntrinsic].
+     Neither path reaches emit as a call to the user-facing generic body,
+     so skip them even when type arguments are unresolved. *)
+  let resolves_without_mono alias_name field args =
+    match lookup_alias_module state alias_name with
+    | Some mod_path -> qualified_call_resolves_without_mono mod_path field args
+    | None -> false
+  in
+  (* A bare call [foo(...)] can still have an explicit non-mono target:
+     prelude builtins, selective imports whose module function has a
+     runtime/IR-backed entry, or a stdlib module calling its own such
+     function. Skip those so this check only reports calls that would
+     genuinely dangle as unmaterialized generic user functions. *)
+  let bare_resolves_without_mono ~mod_path name args =
+    Codegen_builtins.lookup "" name <> None
+    || mod_path <> ""
+       && qualified_call_resolves_without_mono mod_path name args
+    ||
+    match
+      if mod_path = "" then Hashtbl.find_opt state.import_aliases name
+      else
+        match Hashtbl.find_opt state.module_imports mod_path with
+        | Some mod_aliases -> Hashtbl.find_opt mod_aliases name
+        | None -> None
+    with
+    | Some (mp, orig_name) when orig_name <> "" ->
+        qualified_call_resolves_without_mono mp orig_name args
+    | _ -> false
+  in
+  (* Resolve a bare name the way [scan_and_rewrite] would: first try
+     the enclosing module's imports, then the module's own prefixed generic,
+     then the main program's imports. *)
+  let resolve_bare_to_prefixed ~mod_path name =
+    let from_module_imports () =
+      match Hashtbl.find_opt state.module_imports mod_path with
+      | Some mod_aliases -> (
+          match Hashtbl.find_opt mod_aliases name with
+          | Some (mp, orig_name) when orig_name <> "" ->
+              Some (module_qualified_name mp orig_name)
+          | _ -> None)
+      | None -> None
+    in
+    let from_current_module () =
+      if mod_path = "" then None
+      else
+        let prefixed = module_qualified_name mod_path name in
+        if Hashtbl.mem state.generic_bodies prefixed then Some prefixed
+        else None
+    in
+    let from_main_imports () =
+      match Hashtbl.find_opt state.import_aliases name with
+      | Some (mp, orig_name) when orig_name <> "" ->
+          Some (module_qualified_name mp orig_name)
+      | _ -> None
+    in
+    match from_module_imports () with
+    | Some _ as hit -> hit
+    | None -> (
+        match from_current_module () with
+        | Some _ as hit -> hit
+        | None -> from_main_imports ())
+  in
+  let scan_body ~mod_path ~initial_scope (body : core) =
+    let check_call scope node callee args =
+      let target =
+        match callee.desc with
+        | CVar v when not (StringSet.mem v.vname scope) -> (
+            if bare_resolves_without_mono ~mod_path v.vname args then None
+            else
+              match resolve_bare_to_prefixed ~mod_path v.vname with
+              | Some prefixed -> Some prefixed
+              | None when mod_path <> "" ->
+                  Some (module_qualified_name mod_path v.vname)
+              | None -> Some v.vname)
+        | CField (obj, field) -> (
+            match obj.desc with
+            | CVar v
+              when (not (StringSet.mem v.vname scope))
+                   && not (resolves_without_mono v.vname field args) -> (
+                match lookup_alias_module state v.vname with
+                | Some mp -> Some (module_qualified_name mp field)
+                | None -> None)
+            | _ -> None)
+        | _ -> None
+      in
+      match target with
+      | Some n when Hashtbl.mem state.generic_bodies n -> report_err n node.loc
+      | _ -> ()
+    in
+    let rec scan_ctree scope = function
+      | CTLeaf { ct_bindings; ct_body } ->
+          let body_scope =
+            List.fold_left
+              (fun acc (v, _) -> scope_add_var acc v)
+              scope ct_bindings
+          in
+          scan_expr body_scope ct_body
+      | CTFail -> ()
+      | CTSwitchTag sw ->
+          List.iter (fun (_, sub) -> scan_ctree scope sub) sw.cts_cases;
+          Option.iter (scan_ctree scope) sw.cts_default
+      | CTSwitchLit sw ->
+          List.iter (fun (_, sub) -> scan_ctree scope sub) sw.ctl_cases;
+          scan_ctree scope sw.ctl_default
+      | CTSwitchLen sw ->
+          List.iter (fun (_, sub) -> scan_ctree scope sub) sw.ctl_len_cases;
+          Option.iter (fun (_, sub) -> scan_ctree scope sub) sw.ctl_len_geq;
+          Option.iter (scan_ctree scope) sw.ctl_len_default
+    and scan_try_items scope = function
+      | [] -> ()
+      | item :: rest ->
+          scan_expr scope item;
+          let scope' =
+            match item.desc with
+            | CTryBind (_, v, _, _) -> scope_add_var scope v
+            | _ -> scope
+          in
+          scan_try_items scope' rest
+    and scan_expr scope e =
+      let scan_boxed_storage scope value =
+        scan_expr scope value.bsv_box.box_value
+      in
+      match e.desc with
+      | CLit _ | CVar _ | CVoid | CBreak | CContinue | CClosureCreate _ -> ()
+      | CTuple xs | CVector xs -> List.iter (scan_expr scope) xs
+      | CTupleConstruct tc -> List.iter (scan_boxed_storage scope) tc.tc_elems
+      | CList lit -> List.iter (scan_expr scope) lit.ll_elems
+      | CListConstruct lc -> List.iter (scan_boxed_storage scope) lc.lc_elems
+      | CListAlloc alloc -> scan_expr scope alloc.la_capacity
+      | CListGet get ->
+          scan_expr scope get.lg_list;
+          scan_expr scope get.lg_index
+      | CStringByteRead r ->
+          scan_expr scope r.sbr_source;
+          scan_expr scope r.sbr_index
+      | CStringByteWrite w ->
+          scan_expr scope w.sbw_target;
+          scan_expr scope w.sbw_index;
+          scan_expr scope w.sbw_byte
+      | CStringByteCopy c ->
+          scan_expr scope c.sbc_dst;
+          scan_expr scope c.sbc_dst_pos;
+          scan_expr scope c.sbc_src;
+          scan_expr scope c.sbc_src_pos;
+          scan_expr scope c.sbc_len
+      | CStringSetLen s ->
+          scan_expr scope s.ssl_target;
+          scan_expr scope s.ssl_len
+      | CTensorLiteral tl -> (
+          match tl.tl_payload with
+          | TensorRawElements (_, elems) -> List.iter (scan_expr scope) elems
+          | TensorWordElements elems -> List.iter (scan_expr scope) elems
+          | TensorPackedElements (_, elems) -> List.iter (scan_expr scope) elems
+          | TensorInlineStructElements (_, elems) ->
+              List.iter (scan_expr scope) elems
+          | TensorBoxedElements elems ->
+              List.iter (scan_boxed_storage scope) elems)
+      | CDict kvs ->
+          List.iter
+            (fun (k, v) ->
+              scan_expr scope k;
+              scan_expr scope v)
+            kvs
+      | CDictConstruct dc ->
+          List.iter
+            (fun (k, v) ->
+              scan_boxed_storage scope k;
+              scan_boxed_storage scope v)
+            dc.dc_entries
+      | CSetAlloc _ -> ()
+      | CRecord fs -> List.iter (fun (_, value) -> scan_expr scope value) fs
+      | CRecordConstruct rc ->
+          List.iter
+            (function
+              | RecordRawField (_, value) -> scan_expr scope value
+              | RecordErasedField (_, value) -> scan_boxed_storage scope value)
+            rc.rc_fields
+      | CUnionConstruct uc -> List.iter (scan_boxed_storage scope) uc.uc_args
+      | CRecordUpdate (base, fs) ->
+          scan_expr scope base;
+          List.iter (fun (_, value) -> scan_expr scope value) fs
+      | CRange (a, b) | CBin (_, a, b) | CLog (_, a, b) | CSeq (a, b) ->
+          scan_expr scope a;
+          scan_expr scope b
+      | CLambda lam ->
+          let lam_scope =
+            List.fold_left
+              (fun acc (v, _) -> scope_add_var acc v)
+              scope lam.lam_params
+          in
+          scan_expr lam_scope lam.lam_body
+      | CUn (_, operand) -> scan_expr scope operand
+      | CCall (_, callee, args) ->
+          scan_expr scope callee;
+          List.iter (scan_expr scope) args;
+          check_call scope e callee args
+      | CTensorRawRead r -> scan_expr scope r.trr_index
+      | CTensorRawWrite w ->
+          scan_expr scope w.trw_index;
+          scan_expr scope w.trw_value
+      | CField (obj, _) -> scan_expr scope obj
+      | CStringInterp (parts, _) ->
+          List.iter
+            (function IPLit _ -> () | IPExpr expr -> scan_expr scope expr)
+            parts
+      | CLet (binding, body) ->
+          scan_expr scope binding.bind_rhs;
+          scan_expr (scope_add_var scope binding.bind_var) body
+      | CBorrowLet (binding, body) ->
+          scan_expr scope binding.borrow_rhs;
+          scan_expr (scope_add_var scope binding.borrow_var) body
+      | CTensorRawViewLet (binding, body) ->
+          scan_expr scope binding.trv_source;
+          scan_expr (scope_add_var scope binding.trv_var) body
+      | CDebugBlock body -> scan_expr scope body
+      | CIf (cond, then_, else_) ->
+          scan_expr scope cond;
+          scan_expr scope then_;
+          scan_expr scope else_
+      | CMatchArms (scrut, arms) ->
+          scan_expr scope scrut;
+          List.iter
+            (fun (pat, arm_body) ->
+              scan_expr (scope_add_pattern scope pat) arm_body)
+            arms
+      | CMatch (scrut, tree) ->
+          scan_expr scope scrut;
+          scan_ctree scope tree
+      | CWhile (cond, loop_body) ->
+          scan_expr scope cond;
+          scan_expr scope loop_body
+      | CFor (binder, iter, loop_body) ->
+          scan_expr scope iter;
+          scan_expr (scope_add_var scope binder.loop_var) loop_body
+      | CAssign (_, rhs) -> scan_expr scope rhs
+      | CTailrecLoop (TailrecUnmanagedLoop l) -> scan_expr scope l.tul_body
+      | CTailrecLoop (TailrecListSpreadLoop l) -> scan_expr scope l.tls_body
+      | CTailrecRecur (TailrecRecur r) -> List.iter (scan_expr scope) r.tr_args
+      | CTailrecRecur (TailrecListSpreadRecur r) ->
+          List.iter (fun (_, arg) -> scan_expr scope arg) r.tr_rebinds
+      | CTry items -> scan_try_items scope items
+      | CTryBind (_, _, _, rhs) -> scan_expr scope rhs
+      | CDup (_, _, body) | CDrop (_, _, body) -> scan_expr scope body
+      | CConcurrent cb ->
+          List.iter (fun b -> scan_expr scope b.cb_rhs) cb.conc_bindings;
+          Option.iter (scan_expr scope) cb.conc_timeout;
+          let body_scope =
+            List.fold_left
+              (fun acc b -> scope_add_var acc b.cb_var)
+              scope cb.conc_bindings
+          in
+          scan_expr body_scope cb.conc_body
+      | CConcurrentFor cf ->
+          scan_expr scope cf.cf_iter;
+          Option.iter (scan_expr scope) cf.cf_timeout;
+          scan_expr (scope_add_var scope cf.cf_var) cf.cf_body
+      | CDetach d -> scan_expr scope d.detach_body
+      | CCast (expr, _) | CUnbox (expr, _) | CBox (expr, _) ->
+          scan_expr scope expr
+      | CUnboxTyped u -> scan_expr scope u.unbox_value
+      | CBoxTyped b -> scan_expr scope b.box_value
+      | CListHandoff h ->
+          scan_expr scope h.lh_source;
+          scan_expr scope h.lh_capacity;
+          let body_scope =
+            scope_add_vars scope
+              [ h.lh_source_var; h.lh_result_var; h.lh_len_var; h.lh_out_var ]
+          in
+          scan_expr body_scope h.lh_body
+    in
+    scan_expr initial_scope body
+  in
+  let rec walk_decl d =
+    match d.cd_desc with
+    | CDFunc f when f.cf_type_params = [] && is_builtin_kind f.cf_kind = false
+      -> (
+        let mod_path = Option.value f.cf_module ~default:"" in
+        let initial_scope =
+          List.map (fun (p : core_param) -> p.cp_name) f.cf_params
+          |> scope_add_vars StringSet.empty
+        in
+        match f.cf_body with
+        | Some b -> scan_body ~mod_path ~initial_scope b
+        | None -> ())
+    | CDVar v ->
+        scan_body
+          ~mod_path:(Option.value v.cv_module ~default:"")
+          ~initial_scope:StringSet.empty v.cv_init
+    | CDImpl i ->
+        List.iter
+          (fun (f : core_func) ->
+            if f.cf_type_params = [] && is_builtin_kind f.cf_kind = false then
+              let mod_path = Option.value f.cf_module ~default:"" in
+              let initial_scope =
+                List.map (fun (p : core_param) -> p.cp_name) f.cf_params
+                |> scope_add_vars StringSet.empty
+              in
+              match f.cf_body with
+              | Some b -> scan_body ~mod_path ~initial_scope b
+              | None -> ())
+          i.ci_methods
+    | CDPrivate inner -> walk_decl inner
+    | _ -> ()
+  in
+  List.iter walk_decl prog
+
+(** Monomorphize a Core program.
+
+    Scans all declarations, rewrites call sites inline to mangled
+    names, drains the worklist to fixpoint (specialized bodies are
+    also scanned and rewritten), and appends specialized functions.
+
+    [reg] is the per-compilation registry — passed to [collect_subst] so
+    type-alias-wrapped parameter signatures unify against concrete call
+    sites. Defaults to an empty registry for callers that don't use aliases
+    (pure unit tests). *)
+let monomorphize_program ?(reg = Codegen_types.create_registry ())
+    ?(import_aliases = Hashtbl.create 0) ?(module_imports = Hashtbl.create 0)
+    (prog : core_program) : core_program =
+  let state = create_state ~reg ~import_aliases ~module_imports () in
+  let loc = Ast.dummy_loc in
+  collect_generic_bodies state prog;
+  if
+    Hashtbl.length state.generic_bodies = 0
+    && Hashtbl.length state.generic_impls_by_method = 0
+  then prog
+  else begin
+    let prog = List.map (rewrite_decl state) prog in
+    drain_worklist state loc;
+    let final =
+      prog @ List.rev state.specialized @ List.rev state.specialized_impls
+    in
+    check_unrewritten_generic_calls state final;
+    final
+  end

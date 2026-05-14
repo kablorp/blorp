@@ -1,0 +1,107 @@
+-- Stress test for map_indexed_parallel to find race conditions.
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	test: TestSuite
+	vector: map_indexed_parallel
+
+
+pure func gravity_like(i: Int, val: Float) -> (Float, Float, Float):
+	dx: Float = to_float(i) * 0.01 - 5.0
+	dy: Float = val * 0.5 - 2.5
+	dist_sq: Float = dx * dx + dy * dy + 0.01
+	force: Float = 1.0 / dist_sq
+	(dx * force, dy * force, (dx + dy) * force * 0.1)
+
+
+-- Heavy parallel map stress: 3000 elements, 500 iterations
+func test_parallel_map_stress_3000() -> Bool:
+	var v: Float[#3000] = vector(1.0, 3000)
+	for i in 0..length(v):
+		v[i] = to_float(i) * 0.1
+	var errors: Int = 0
+	var frame: Int = 0
+	while frame < 500:
+		result: (Float, Float, Float)[#3000] = map_indexed_parallel(v, gravity_like)
+		for j in 0..length(result):
+			t: (Float, Float, Float) = result[j]
+			if t.0 != t.0 or t.1 != t.1 or t.2 != t.2:
+				errors += 1
+		frame += 1
+	errors == 0
+
+
+-- Parallel map with mutation between calls
+func test_parallel_map_with_mutation() -> Bool:
+	var v: Float[#2000] = vector(1.0, 2000)
+	for i in 0..length(v):
+		v[i] = to_float(i) * 0.1
+	var errors: Int = 0
+	var frame: Int = 0
+	while frame < 200:
+		result: (Float, Float, Float)[#2000] = map_indexed_parallel(v, gravity_like)
+		for j in 0..length(result):
+			t: (Float, Float, Float) = result[j]
+			v[j] = v[j] + t.0 * 0.016
+		frame += 1
+	for i in 0..length(v):
+		val: Float = v[i]
+		if val != val:
+			errors += 1
+	errors == 0
+
+
+-- Rapid fire: many small parallel maps
+func test_rapid_parallel_maps() -> Bool:
+	var v: Float[#500] = vector(1.0, 500)
+	var errors: Int = 0
+	var i: Int = 0
+	while i < 2000:
+		result: (Float, Float, Float)[#500] = map_indexed_parallel(v, gravity_like)
+		first: (Float, Float, Float) = result[0]
+		last: (Float, Float, Float) = result[499]
+		if first.0 != first.0 or last.2 != last.2:
+			errors += 1
+		i += 1
+	errors == 0
+
+
+-- Memory stability under parallel load
+func test_parallel_map_no_leak() -> Bool:
+	var v: Float[#1000] = vector(1.0, 1000)
+	for w in 0..5:
+		r: (Float, Float, Float)[#1000] = map_indexed_parallel(v, gravity_like)
+		_ = r.length()
+	reset_mem_stats()
+	var frame: Int = 0
+	while frame < 200:
+		result: (Float, Float, Float)[#1000] = map_indexed_parallel(v, gravity_like)
+		for j in 0..length(result):
+			t: (Float, Float, Float) = result[j]
+			_ = t.0
+		frame += 1
+	s: MemStats = get_mem_stats()
+	s.current_objects <= 10
+
+
+func test_parallel_map_discard_result_no_leak() -> Bool:
+	var v: Float[#1000] = vector(1.0, 1000)
+	reset_mem_stats()
+	var frame: Int = 0
+	while frame < 50:
+		result: (Float, Float, Float)[#1000] = map_indexed_parallel(v, gravity_like)
+		_ = result.length()
+		frame += 1
+	s: MemStats = get_mem_stats()
+	s.current_objects <= 10
+
+
+tests: TestSuite = {
+	description = "Parallel Map Stress",
+	tests = [
+		("3000 elements stress", test_parallel_map_stress_3000),
+		("parallel map with mutation", test_parallel_map_with_mutation),
+		("rapid parallel maps", test_rapid_parallel_maps),
+		("parallel map no leak", test_parallel_map_no_leak),
+		("parallel map discard result no leak", test_parallel_map_discard_result_no_leak),
+	],
+}

@@ -1,0 +1,86 @@
+-- Test that struct vectors use inline storage (not per-element heap boxing).
+-- A vector of 1000 structs should require ~1 allocation (the vector itself),
+-- NOT 1000+ allocations (one box per element).
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	tensor: get_or, set_index
+	test: TestSuite
+
+
+struct Pt {x: Int, y: Int}
+
+
+func test_literal_no_per_element_alloc() -> Bool:
+	reset_mem_stats()
+	v: Pt[#8] = {
+		{x = 0, y = 0},
+		{x = 1, y = 2},
+		{x = 2, y = 4},
+		{x = 3, y = 6},
+		{x = 4, y = 8},
+		{x = 5, y = 10},
+		{x = 6, y = 12},
+		{x = 7, y = 14},
+	}
+	p: Pt = v.get_or(7, {x = -1, y = -1})
+	stats: MemStats = get_mem_stats()
+	p.x == 7 and p.y == 14 and stats.total_allocations < 5
+
+
+func test_fill_no_per_element_alloc() -> Bool:
+	reset_mem_stats()
+	v: Pt[#1000] = vector({x = 0, y = 0}, 1000)
+	-- Read one to prevent optimization
+	p: Pt = v.get_or(500, {x = -1, y = -1})
+	_ = p.x
+	stats: MemStats = get_mem_stats()
+	-- With inline storage: ~2-5 allocations (vector + maybe a few temps)
+	-- With boxing: 1000+ allocations (one per element)
+	stats.total_allocations < 20
+
+
+func test_matrix_literal_no_per_element_alloc() -> Bool:
+	reset_mem_stats()
+	m: Pt[#2, #2] = {
+		{{x = 1, y = 2}, {x = 3, y = 4}},
+		{{x = 5, y = 6}, {x = 7, y = 8}},
+	}
+	p: Pt = m[1, 1]
+	stats: MemStats = get_mem_stats()
+	p.x == 7 and p.y == 8 and stats.total_allocations < 5
+
+
+func test_matrix_fill_no_per_element_alloc() -> Bool:
+	reset_mem_stats()
+	m: Pt[#10, #10] = matrix({x = 3, y = 4}, 10, 10)
+	p: Pt = m[9, 9]
+	stats: MemStats = get_mem_stats()
+	p.x == 3 and p.y == 4 and stats.total_allocations < 5
+
+
+func test_set_index_no_extra_alloc() -> Bool:
+	reset_mem_stats()
+	var v: Pt[#100] = vector({x = 0, y = 0}, 100)
+	-- Write 10 elements
+	var i: Int = 0
+	while i < 10:
+		match v.set_index(i, {x = i, y = i * 2}):
+			Some(new_v): v = new_v
+			None: void
+		i += 1
+	stats: MemStats = get_mem_stats()
+	-- With inline storage: ~12-20 allocations (vector + COW copies + Option wrappers)
+	-- With boxing: 100+ (initial fill) + 10+ (new boxes for sets)
+	stats.total_allocations < 50
+
+
+tests: TestSuite = {
+	description = "Struct Vector Memory",
+	tests = [
+		("literal: no per-element alloc", test_literal_no_per_element_alloc),
+		("fill: no per-element alloc", test_fill_no_per_element_alloc),
+		("matrix literal: no per-element alloc", test_matrix_literal_no_per_element_alloc),
+		("matrix fill: no per-element alloc", test_matrix_fill_no_per_element_alloc),
+		("set: no extra alloc", test_set_index_no_extra_alloc),
+	],
+}

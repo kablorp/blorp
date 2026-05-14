@@ -1,0 +1,712 @@
+-- Codec — Universal serialization framework
+--
+-- Provides a format-agnostic Value type and composable decoder/encoder
+-- combinators. Write one Decoder[T] for your type and use it with
+-- JSON, TOML, YAML, or CSV — each format just converts to/from Value.
+--
+-- Encoding:  implement the Encodable trait (to_value)
+-- Decoding:  compose a Decoder[T] from combinators (field, d_string, map3, etc.)
+import:
+	string: string
+
+
+-- ============================================================================
+-- Value Type
+-- ============================================================================
+---
+Universal intermediate representation for serialized data.
+All formats (JSON, TOML, YAML, CSV) convert to/from Value.
+
+doctests:
+    :: VInt holds integer
+    match VInt(42):
+        VInt(n): n == 42
+        _: False
+
+    :: VString holds string
+    match VString("hello"):
+        VString(s): s == "hello"
+        _: False
+---
+union Value:
+	VNull
+	VBool(Bool)
+	VInt(Int)
+	VFloat(Float)
+	VString(String)
+	VList(List[Value])
+	VRecord(List[(String, Value)])
+
+
+-- ============================================================================
+-- Value Accessors
+-- ============================================================================
+---
+Extract a String from a Value, or None if not VString.
+---
+pure func as_string(v: Value) -> Option[String]:
+	match v:
+		VString(s): Some(s)
+		_: None
+
+
+---
+Extract an Int from a Value, or None if not VInt.
+---
+pure func as_int(v: Value) -> Option[Int]:
+	match v:
+		VInt(n): Some(n)
+		_: None
+
+
+---
+Extract a Float from a Value. Coerces VInt to Float. None otherwise.
+---
+pure func as_float(v: Value) -> Option[Float]:
+	match v:
+		VFloat(f): Some(f)
+		VInt(n): Some(to_float(n))
+		_: None
+
+
+---
+Extract a Bool from a Value, or None if not VBool.
+---
+pure func as_bool(v: Value) -> Option[Bool]:
+	match v:
+		VBool(b): Some(b)
+		_: None
+
+
+---
+Extract a List from a Value, or None if not VList.
+---
+pure func as_list(v: Value) -> Option[List[Value]]:
+	match v:
+		VList(items): Some(items)
+		_: None
+
+
+---
+Extract a record (list of key-value pairs) from a Value, or None if not VRecord.
+---
+pure func as_record(v: Value) -> Option[List[(String, Value)]]:
+	match v:
+		VRecord(pairs): Some(pairs)
+		_: None
+
+
+---
+Check if a Value is VNull.
+---
+pure func is_null(v: Value) -> Bool:
+	match v:
+		VNull: True
+		_: False
+
+
+---
+Look up a field in a VRecord by key.
+
+doctests:
+    :: Field lookup
+    v: Value = VRecord([("name", VString("Alice"))])
+    match v.get_field("name"):
+        Some(VString(s)): s == "Alice"
+        _: False
+
+    :: Missing field
+    v2: Value = VRecord([("x", VInt(1))])
+    match v2.get_field("y"):
+        None: True
+        _: False
+---
+pure func get_field(v: Value, key: String) -> Option[Value]:
+	match v:
+		VRecord(pairs):
+			var i: Int = 0
+			var found: Option[Value] = None
+			var done: Bool = False
+			while i < pairs.length() and not done:
+				match pairs.get(i):
+					Some(pair):
+						if pair.0 == key:
+							found = Some(pair.1)
+							done = True
+					None: void
+				i += 1
+			found
+		_: None
+
+
+-- ============================================================================
+-- Encode Trait
+-- ============================================================================
+---
+Trait for types that can be serialized to a Value.
+Implement this for your records to enable multi-format encoding.
+---
+trait Encodable:
+	pure func to_value(self: Self) -> Value
+
+
+implements Encodable for Int:
+	pure func to_value(val: Int) -> Value:
+		VInt(val)
+
+
+implements Encodable for Float:
+	pure func to_value(val: Float) -> Value:
+		VFloat(val)
+
+
+implements Encodable for String:
+	pure func to_value(val: String) -> Value:
+		VString(val)
+
+
+implements Encodable for Bool:
+	pure func to_value(val: Bool) -> Value:
+		VBool(val)
+
+
+-- ============================================================================
+-- Decode Error
+-- ============================================================================
+---
+Error from decoding, with a path trace showing where the error occurred.
+
+doctests:
+    :: Error with empty path
+    e: DecodeError = {path = [], message = "bad"}
+    e.format_error() == "bad"
+
+    :: Error with path
+    e2: DecodeError = {path = ["user", "name"], message = "expected string"}
+    e2.format_error() == "at user.name: expected string"
+---
+record DecodeError {path: List[String], message: String}
+
+
+---
+Format a DecodeError as a human-readable string.
+---
+pure func format_error(err: DecodeError) -> String:
+	if err.path.length() == 0:
+		err.message
+	else:
+		path_str: String = err.path.join_path()
+		"at " + path_str + ": " + err.message
+
+
+private pure func join_path(parts: List[String]) -> String:
+	var result: String = ""
+	var i: Int = 0
+	while i < parts.length():
+		match parts.get(i):
+			Some(part):
+				if i > 0:
+					result = result + "." + part
+				else:
+					result = part
+			None: void
+		i += 1
+	result
+
+
+private pure func prepend_path(field_name: String, err: DecodeError) -> DecodeError:
+	new_path: List[String] = [field_name].concat(err.path)
+	{path = new_path, message = err.message}
+
+
+private pure func make_error(msg: String) -> DecodeError:
+	{path = [], message = msg}
+
+
+-- ============================================================================
+-- Decoder Type
+-- ============================================================================
+---
+A decoder is a pure function from Value to Result.
+Compose decoders with field(), map2(), etc.
+---
+type alias Decoder[T] = pure (Value) -> Result[T, DecodeError]
+
+
+---
+Run a decoder on a Value.
+---
+pure func decode[T](decoder: Decoder[T], value: Value) -> Result[T, DecodeError]:
+	decoder(value)
+
+
+-- ============================================================================
+-- Primitive Decoders
+-- ============================================================================
+---
+Decode a string. Accepts VString only.
+
+doctests:
+    :: Decode string
+    match d_string(VString("hi")):
+        Ok(s): s == "hi"
+        _: False
+
+    :: Reject int
+    match d_string(VInt(1)):
+        Err(_): True
+        _: False
+---
+pure func d_string(v: Value) -> Result[String, DecodeError]:
+	match v:
+		VString(s): Ok(s)
+		_: Err(make_error("expected string"))
+
+
+---
+Decode an integer. Accepts VInt, coerces VFloat (truncates) and VString (parses).
+
+doctests:
+    :: Decode VInt
+    match d_int(VInt(42)):
+        Ok(n): n == 42
+        _: False
+
+    :: Coerce VFloat
+    match d_int(VFloat(3.9)):
+        Ok(n): n == 3
+        _: False
+
+    :: Coerce VString
+    match d_int(VString("99")):
+        Ok(n): n == 99
+        _: False
+
+    :: Reject bad string
+    match d_int(VString("abc")):
+        Err(_): True
+        _: False
+---
+pure func d_int(v: Value) -> Result[Int, DecodeError]:
+	match v:
+		VInt(n): Ok(n)
+		VFloat(f): Ok(to_int(f))
+		VString(s):
+			match s.parse_int():
+				Some(n): Ok(n)
+				None: Err(make_error("expected integer, got: " + s))
+		_: Err(make_error("expected integer"))
+
+
+---
+Decode a float. Accepts VFloat, coerces VInt and VString.
+
+doctests:
+    :: Decode VFloat
+    match d_float(VFloat(3.14)):
+        Ok(f): f > 3.13 and f < 3.15
+        _: False
+
+    :: Coerce VInt
+    match d_float(VInt(5)):
+        Ok(f): f > 4.99 and f < 5.01
+        _: False
+---
+pure func d_float(v: Value) -> Result[Float, DecodeError]:
+	match v:
+		VFloat(f): Ok(f)
+		VInt(n): Ok(to_float(n))
+		VString(s):
+			match s.parse_float():
+				Some(f): Ok(f)
+				None: Err(make_error("expected number, got: " + s))
+		_: Err(make_error("expected number"))
+
+
+---
+Decode a boolean. Accepts VBool only.
+
+doctests:
+    :: Decode true
+    match d_bool(VBool(True)):
+        Ok(b): b == True
+        _: False
+---
+pure func d_bool(v: Value) -> Result[Bool, DecodeError]:
+	match v:
+		VBool(b): Ok(b)
+		_: Err(make_error("expected boolean"))
+
+
+---
+Decode a null value. Accepts VNull only.
+---
+pure func d_null(v: Value) -> Result[Bool, DecodeError]:
+	match v:
+		VNull: Ok(True)
+		_: Err(make_error("expected null"))
+
+
+-- ============================================================================
+-- Combinators
+-- ============================================================================
+---
+Decode a required field from a VRecord.
+---
+pure func field[T](name: String, decoder: Decoder[T]) -> Decoder[T]:
+	pure func(v: Value):
+		match v.get_field(name):
+			Some(field_value):
+				match decoder(field_value):
+					Ok(val): Ok(val)
+					Err(e): Err(prepend_path(name, e))
+			None: Err(make_error("missing field: " + name))
+
+
+---
+Decode an optional field. Returns None if missing or null.
+---
+pure func optional[T](name: String, decoder: Decoder[T]) -> Decoder[Option[T]]:
+	pure func(v: Value):
+		match v.get_field(name):
+			Some(field_value):
+				match field_value:
+					VNull: Ok(None)
+					_:
+						match decoder(field_value):
+							Ok(val): Ok(Some(val))
+							Err(e): Err(prepend_path(name, e))
+			None: Ok(None)
+
+
+-- ============================================================================
+-- Direct field accessors (convenience: decode a single field right now
+-- instead of building a Decoder[T] and running it later).
+-- ============================================================================
+---
+Decode a required integer field from a VRecord. Shortcut for
+`decode(field(name, d_int), obj)`.
+
+doctests:
+    :: Read Int field
+    v: Value = VRecord([("age", VInt(42))])
+    match field_int(v, "age"):
+        Ok(n): n == 42
+        _: False
+
+    :: Missing field errors
+    v: Value = VRecord([])
+    match field_int(v, "age"):
+        Err(_): True
+        _: False
+---
+pure func field_int(obj: Value, name: String) -> Result[Int, DecodeError]:
+	field(name, d_int)(obj)
+
+
+---
+Decode a required float field from a VRecord.
+---
+pure func field_float(obj: Value, name: String) -> Result[Float, DecodeError]:
+	field(name, d_float)(obj)
+
+
+---
+Decode a required string field from a VRecord.
+---
+pure func field_string(obj: Value, name: String) -> Result[String, DecodeError]:
+	field(name, d_string)(obj)
+
+
+---
+Decode a required boolean field from a VRecord.
+---
+pure func field_bool(obj: Value, name: String) -> Result[Bool, DecodeError]:
+	field(name, d_bool)(obj)
+
+
+---
+Decode a required list-of-T field from a VRecord. The `item` argument picks
+the element type — pass `d_int`, `d_string`, etc. At call sites in modules
+where the `Decoder` alias isn't in scope, passing a `d_*` decoder requires
+importing `Decoder` alongside (Triage Cluster 8 — type-alias unification).
+---
+pure func field_list[T](obj: Value, name: String, item: Decoder[T]) -> Result[List[T], DecodeError]:
+	field(name, d_list(item))(obj)
+
+
+---
+Decode a list of values using an item decoder.
+---
+pure func d_list[T](item_decoder: Decoder[T]) -> Decoder[List[T]]:
+	pure func(v: Value):
+		match v.as_list():
+			Some(items):
+				var result: List[T] = []
+				var i: Int = 0
+				var err: Option[DecodeError] = None
+				var has_error: Bool = False
+				while i < items.length() and not has_error:
+					match items.get(i):
+						Some(elem):
+							match item_decoder(elem):
+								Ok(val): result = result.append(val)
+								Err(e):
+									err = Some(prepend_path("[" + i.to_string() + "]", e))
+									has_error = True
+						None: void
+					i += 1
+				match err:
+					Some(e): Err(e)
+					None: Ok(result)
+			None: Err(make_error("expected list"))
+
+
+---
+Decode a nested field path like ["user", "address", "city"].
+---
+pure func at[T](path: List[String], decoder: Decoder[T]) -> Decoder[T]:
+	if path.length() == 0:
+		decoder
+	else:
+		match path.get(0):
+			Some(first):
+				var rest: List[String] = []
+				var i: Int = 1
+				while i < path.length():
+					match path.get(i):
+						Some(p): rest = rest.append(p)
+						None: void
+					i += 1
+				field(first, at(rest, decoder))
+			None: decoder
+
+
+---
+Decode an element at a specific index in a VList.
+---
+pure func index[T](idx: Int, decoder: Decoder[T]) -> Decoder[T]:
+	pure func(v: Value):
+		match v.as_list():
+			Some(items):
+				match items.get(idx):
+					Some(elem):
+						match decoder(elem):
+							Ok(val): Ok(val)
+							Err(e): Err(prepend_path("[" + idx.to_string() + "]", e))
+					None: Err(make_error("index out of bounds: " + idx.to_string()))
+			None: Err(make_error("expected list"))
+
+
+---
+Decode a nullable value. VNull becomes None, anything else is decoded as Some.
+---
+pure func d_nullable[T](decoder: Decoder[T]) -> Decoder[Option[T]]:
+	pure func(v: Value):
+		match v:
+			VNull: Ok(None)
+			_:
+				try:
+					val ?= decoder(v)
+					Some(val)
+
+
+---
+Transform a decoder's output with a function.
+---
+pure func d_map[A, B](decoder: Decoder[A], f: pure (A) -> B) -> Decoder[B]:
+	pure func(v: Value):
+		try:
+			val ?= decoder(v)
+			f(val)
+
+
+---
+A decoder that always succeeds with a given value, ignoring the input.
+---
+pure func d_succeed[T](value: T) -> Decoder[T]:
+	pure func(_: Value) -> Result[T, DecodeError]: Ok(value)
+
+
+---
+A decoder that always fails with a given message.
+---
+pure func d_fail[T](message: String) -> Decoder[T]:
+	pure func(_: Value): Err(make_error(message))
+
+
+---
+Try the first decoder; if it fails, try the second.
+---
+pure func d_or_else[T](first: Decoder[T], second: Decoder[T]) -> Decoder[T]:
+	pure func(v: Value):
+		match first(v):
+			Ok(val): Ok(val)
+			Err(_): second(v)
+
+
+---
+Return a default value if the decoder fails.
+---
+pure func d_with_default[T](decoder: Decoder[T], default_value: T) -> Decoder[T]:
+	pure func(v: Value) -> Result[T, DecodeError]:
+		match decoder(v):
+			Ok(val): Ok(val)
+			Err(_): Ok(default_value)
+
+
+---
+Lazy decoder for recursive structures.
+---
+pure func d_lazy[T](thunk: pure () -> Decoder[T]) -> Decoder[T]:
+	pure func(v: Value):
+		thunk()(v)
+
+
+-- ============================================================================
+-- Map Combinators
+-- ============================================================================
+---
+Combine two decoders with a function.
+---
+pure func map2[A, B, R](f: pure (A, B) -> R, d1: Decoder[A], d2: Decoder[B]) -> Decoder[R]:
+	pure func(v: Value):
+		try:
+			a ?= d1(v)
+			b ?= d2(v)
+			f(a, b)
+
+
+---
+Combine three decoders with a function.
+---
+pure func map3[A, B, C, R](
+	f: pure (A, B, C) -> R,
+	d1: Decoder[A],
+	d2: Decoder[B],
+	d3: Decoder[C],
+) -> Decoder[R]:
+	pure func(v: Value):
+		try:
+			a ?= d1(v)
+			b ?= d2(v)
+			c ?= d3(v)
+			f(a, b, c)
+
+
+---
+Combine four decoders with a function.
+---
+pure func map4[A, B, C, D, R](
+	f: pure (A, B, C, D) -> R,
+	d1: Decoder[A],
+	d2: Decoder[B],
+	d3: Decoder[C],
+	d4: Decoder[D],
+) -> Decoder[R]:
+	pure func(v: Value):
+		try:
+			a ?= d1(v)
+			b ?= d2(v)
+			c ?= d3(v)
+			d ?= d4(v)
+			f(a, b, c, d)
+
+
+---
+Combine five decoders with a function.
+---
+pure func map5[A, B, C, D, E, R](
+	f: pure (A, B, C, D, E) -> R,
+	d1: Decoder[A],
+	d2: Decoder[B],
+	d3: Decoder[C],
+	d4: Decoder[D],
+	d5: Decoder[E],
+) -> Decoder[R]:
+	pure func(v: Value):
+		try:
+			a ?= d1(v)
+			b ?= d2(v)
+			c ?= d3(v)
+			d ?= d4(v)
+			e ?= d5(v)
+			f(a, b, c, d, e)
+
+
+---
+Combine six decoders with a function.
+---
+pure func map6[A, B, C, D, E, F, R](
+	func_: pure (A, B, C, D, E, F) -> R,
+	d1: Decoder[A],
+	d2: Decoder[B],
+	d3: Decoder[C],
+	d4: Decoder[D],
+	d5: Decoder[E],
+	d6: Decoder[F],
+) -> Decoder[R]:
+	pure func(v: Value):
+		try:
+			a ?= d1(v)
+			b ?= d2(v)
+			c ?= d3(v)
+			d ?= d4(v)
+			e ?= d5(v)
+			f ?= d6(v)
+			func_(a, b, c, d, e, f)
+
+
+-- ============================================================================
+-- Value Serialization (debug format)
+-- ============================================================================
+---
+Serialize a Value to a debug string representation.
+
+doctests:
+    :: Null
+    VNull.value_to_string() == "null"
+
+    :: Int
+    VInt(42).value_to_string() == "42"
+
+    :: String
+    VString("hi").value_to_string() == "\"hi\""
+---
+pure func value_to_string(v: Value) -> String:
+	match v:
+		VNull: "null"
+		VBool(b):
+			if b:
+				"true"
+			else:
+				"false"
+		VInt(n): n.to_string()
+		VFloat(f): f.to_string()
+		VString(s): "\"" + s + "\""
+		VList(items):
+			var buf: String = string(64)
+			buf = buf.append_str("[")
+			var i: Int = 0
+			while i < items.length():
+				if i > 0:
+					buf = buf.append_str(", ")
+				match items.get(i):
+					Some(item): buf = buf.append_str(item.value_to_string())
+					None: void
+				i += 1
+			buf.append_str("]")
+		VRecord(pairs):
+			var buf: String = string(64)
+			buf = buf.append_str("{")
+			var i: Int = 0
+			while i < pairs.length():
+				if i > 0:
+					buf = buf.append_str(", ")
+				match pairs.get(i):
+					Some(pair):
+						buf = buf.append_str("\"" + pair.0 + "\": ")
+						buf = buf.append_str(pair.1.value_to_string())
+					None: void
+				i += 1
+			buf.append_str("}")

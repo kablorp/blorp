@@ -1,0 +1,753 @@
+(** Tests for [Session.t] — state isolation across sessions.
+
+    These tests are the load-bearing guarantee for Phase 2.1: multiple
+    [Session.create ()] calls produce mutually-independent state. If
+    any of these fail, the session refactor has drifted and downstream
+    features (multi-buffer LSP, parallel test compilation) will
+    silently share state across what should be isolated boundaries. *)
+
+open Blorp
+
+(* ============================================================================
+   Meta-env isolation
+   ============================================================================ *)
+
+let test_fresh_meta_counters_independent () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  let _ = Types.fresh_meta ~sess:s1 () in
+  let _ = Types.fresh_meta ~sess:s1 () in
+  (* s1 has bumped its counter twice; s2's counter should still be 0. *)
+  Alcotest.(check int) "s1 counter advanced" 2 s1.fresh_meta_counter;
+  Alcotest.(check int) "s2 counter untouched" 0 s2.fresh_meta_counter
+
+let test_meta_env_isolated () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  let m1 = Types.fresh_meta ~sess:s1 ~origin:"T" () in
+  match m1 with
+  | TyMeta n ->
+      Types.bind_meta ~sess:s1 n Types.ty_int;
+      Alcotest.(check bool)
+        "s1 meta looks up" true
+        (Types.lookup_meta ~sess:s1 n = Some Types.ty_int);
+      Alcotest.(check bool)
+        "s2 meta is empty" true
+        (Types.lookup_meta ~sess:s2 n = None)
+  | _ -> Alcotest.fail "fresh_meta didn't return TyMeta"
+
+let test_reset_meta_clears_only_that_session () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  let _ = Types.fresh_meta ~sess:s1 () in
+  let _ = Types.fresh_meta ~sess:s2 () in
+  Session.reset_meta s1;
+  Alcotest.(check int) "s1 reset" 0 s1.fresh_meta_counter;
+  Alcotest.(check int) "s2 untouched by s1 reset" 1 s2.fresh_meta_counter
+
+(* ============================================================================
+   Module-cache isolation
+   ============================================================================ *)
+
+let test_module_cache_independent () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  (* Manually insert into s1's module cache. s2's cache must not see it. *)
+  let m : Session.loaded_module =
+    {
+      name = "fake/mod";
+      path = "<test>";
+      origin = Session.User_module;
+      decls = [];
+      exports = [];
+      typed_decls = None;
+      typed_import_bindings = None;
+    }
+  in
+  Hashtbl.add s1.module_cache "fake/mod" m;
+  Alcotest.(check bool)
+    "s1 finds module" true
+    (Modules.find_cached ~sess:s1 "fake/mod" <> None);
+  Alcotest.(check bool)
+    "s2 does not find module" true
+    (Modules.find_cached ~sess:s2 "fake/mod" = None)
+
+let test_load_errors_independent () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  let err : Ast.compiler_error =
+    {
+      message = "fake";
+      loc = Ast.dummy_loc;
+      phase = Ast.ModuleLoad;
+      kind = Ast.OtherError;
+      notes = [];
+      help = None;
+    }
+  in
+  s1.load_errors <- [ err ];
+  Alcotest.(check int)
+    "s1 has one error" 1
+    (List.length (Modules.get_load_errors ~sess:s1 ()));
+  Alcotest.(check int)
+    "s2 has no errors" 0
+    (List.length (Modules.get_load_errors ~sess:s2 ()))
+
+let test_module_origin_policy_helpers () =
+  let pkg = Session.package_origin "sqlite" in
+  Alcotest.(check bool)
+    "std allows builtin" true
+    (Session.module_origin_allows_builtin Session.Stdlib_module);
+  Alcotest.(check bool)
+    "user rejects builtin" false
+    (Session.module_origin_allows_builtin Session.User_module);
+  Alcotest.(check bool)
+    "pkg rejects builtin" false
+    (Session.module_origin_allows_builtin pkg);
+  Alcotest.(check bool)
+    "std rejects foreign" false
+    (Session.module_origin_allows_foreign Session.Stdlib_module);
+  Alcotest.(check bool)
+    "user allows foreign" true
+    (Session.module_origin_allows_foreign Session.User_module);
+  Alcotest.(check bool)
+    "pkg allows foreign" true
+    (Session.module_origin_allows_foreign pkg);
+  Alcotest.(check string)
+    "pkg label" "package 'sqlite'"
+    (Session.module_origin_label pkg)
+
+let test_search_paths_independent () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  Modules.add_search_path ~sess:s1 "/fake/path/s1";
+  Alcotest.(check bool)
+    "s1 contains path" true
+    (List.mem "/fake/path/s1" s1.search_paths);
+  Alcotest.(check bool)
+    "s2 does not contain s1's path" false
+    (List.mem "/fake/path/s1" s2.search_paths)
+
+(* ============================================================================
+   Ambient current session
+   ============================================================================ *)
+
+let test_with_current_restores_previous () =
+  let outer = Session.current () in
+  let inner = Session.create () in
+  Session.with_current inner (fun () ->
+      Alcotest.(check bool)
+        "inner is current during scope" true
+        (Session.current () == inner));
+  Alcotest.(check bool)
+    "previous restored after scope" true
+    (Session.current () == outer)
+
+let test_with_current_restores_on_exception () =
+  let outer = Session.current () in
+  let inner = Session.create () in
+  (try Session.with_current inner (fun () -> raise Exit) with Exit -> ());
+  Alcotest.(check bool)
+    "previous restored even on exception" true
+    (Session.current () == outer)
+
+let test_fresh_meta_uses_ambient () =
+  (* When no ~sess is passed, fresh_meta uses the ambient current session. *)
+  let s = Session.create () in
+  Session.with_current s (fun () ->
+      let _ = Types.fresh_meta () in
+      ());
+  Alcotest.(check int) "ambient session's counter bumped" 1 s.fresh_meta_counter
+
+(* ============================================================================
+   assert_in_scope — debug guard for "no with_current frame is active"
+   ============================================================================
+
+   Per Phase 2.1's deferred follow-up: catch latent aliasing when per-buffer
+   LSP sessions come online. When a caller forgets to wrap its work in
+   [with_current], every nested [Session.current ()] call returns the
+   process-wide default session — silently sharing state across what should
+   be isolated boundaries. [assert_in_scope] gives that mistake a loud
+   failure mode in tests / debug builds. *)
+
+let test_assert_in_scope_raises_outside_frame () =
+  Alcotest.check_raises "raises outside with_current"
+    (Failure "Session.assert_in_scope: no with_current frame active") (fun () ->
+      Session.assert_in_scope ())
+
+let test_assert_in_scope_ok_inside_frame () =
+  let s = Session.create () in
+  Session.with_current s (fun () ->
+      Session.assert_in_scope ();
+      (* must not raise *)
+      Alcotest.(check pass) "in scope" () ())
+
+let test_assert_in_scope_nested_frames () =
+  let outer = Session.create () in
+  let inner = Session.create () in
+  Session.with_current outer (fun () ->
+      Session.assert_in_scope ();
+      Session.with_current inner (fun () -> Session.assert_in_scope ());
+      Session.assert_in_scope () (* still in outer frame *));
+  (* Exited both frames; should raise again *)
+  Alcotest.check_raises "raises after all frames exit"
+    (Failure "Session.assert_in_scope: no with_current frame active") (fun () ->
+      Session.assert_in_scope ())
+
+(* ============================================================================
+   Pipeline-level isolation
+   ============================================================================
+
+   These tests pin the contract that [Pipeline.compile] runs in its own
+   session — the caller's ambient state must be unchanged after the call,
+   and a second compile must not inherit state from the first. This
+   contract is the user-visible payoff of Phase 2.1: today the implicit
+   ambient session is shared across all compiles in a process, leaking
+   [module_cache] / [prelude_modules_loaded] / [load_errors] across what
+   ought to be independent compilations. *)
+
+let trivial_source = "func main(args: List[String]):\n    print(\"hi\")\n"
+
+let bad_import_source =
+  "import:\n\
+  \    nonexistent_module_xyz: foo\n\
+   func main(args: List[String]):\n\
+  \    print(\"x\")\n"
+
+let test_compile_isolates_caller_module_cache () =
+  Test_helpers.with_isolated_env (fun () ->
+      let outer = Session.current () in
+      let starting_cache_size = Hashtbl.length outer.module_cache in
+      let starting_prelude = outer.prelude_modules_loaded in
+      let _ =
+        Pipeline.compile ~filename:"isolation_a.brp" ~source:trivial_source ()
+      in
+      Alcotest.(check int)
+        "caller module_cache unchanged after Pipeline.compile"
+        starting_cache_size
+        (Hashtbl.length outer.module_cache);
+      Alcotest.(check bool)
+        "caller prelude_modules_loaded unchanged" starting_prelude
+        outer.prelude_modules_loaded)
+
+let mentions s needle =
+  let nl = String.length needle in
+  let sl = String.length s in
+  let rec find i =
+    if i + nl > sl then false
+    else if String.sub s i nl = needle then true
+    else find (i + 1)
+  in
+  nl <= sl && find 0
+
+let test_compile_does_not_inherit_prior_load_errors () =
+  Test_helpers.with_isolated_env (fun () ->
+      (* First compile has a bad import so it populates load_errors. *)
+      let _ =
+        Pipeline.compile ~filename:"isolation_bad.brp" ~source:bad_import_source
+          ()
+      in
+      (* Second compile is clean. Its errors (if any) must not mention the
+       prior compile's nonexistent_module_xyz. *)
+      match
+        Pipeline.compile ~filename:"isolation_good.brp" ~source:trivial_source
+          ()
+      with
+      | Ok _ -> Alcotest.(check pass) "clean second compile" () ()
+      | Error errs ->
+          let stale =
+            List.exists
+              (fun (e : Ast.compiler_error) ->
+                mentions e.message "nonexistent_module_xyz")
+              errs
+          in
+          Alcotest.(check bool)
+            "no stale load errors from prior compile" false stale)
+
+let with_temp_dir prefix f =
+  let dir = Filename.temp_file prefix "" in
+  Sys.remove dir;
+  Unix.mkdir dir 0o700;
+  let rec remove_tree path =
+    if Sys.file_exists path then
+      if Sys.is_directory path then begin
+        Array.iter
+          (fun name -> remove_tree (Filename.concat path name))
+          (Sys.readdir path);
+        Unix.rmdir path
+      end
+      else Sys.remove path
+  in
+  Fun.protect
+    ~finally:(fun () -> try remove_tree dir with _ -> ())
+    (fun () -> f dir)
+
+let write_file path contents =
+  let oc = open_out path in
+  Fun.protect
+    ~finally:(fun () -> close_out oc)
+    (fun () -> output_string oc contents)
+
+let assert_std_override sess ~expected =
+  Alcotest.(check bool)
+    "std override active" true sess.Session.std_override_active;
+  Alcotest.(check (option string))
+    "std override dir" (Some expected) sess.std_override_dir;
+  Alcotest.(check (option string))
+    "std source dir" (Some expected)
+    (Modules.std_source_dir ~sess ())
+
+let test_blorp_toml_std_path_sets_override () =
+  with_temp_dir "blorp_config_std" (fun dir ->
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[std] # standard library override\n\
+         path = \"custom_std\" # relative to blorp.toml\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess (Filename.concat dir "src");
+      assert_std_override sess ~expected:(Filename.concat dir "custom_std"))
+
+let test_blorp_toml_does_not_replace_existing_override () =
+  with_temp_dir "blorp_config_cli" (fun dir ->
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[std]\npath = \"from_config\"\n";
+      let cli_std = Filename.concat dir "from_cli" in
+      let sess = Session.create () in
+      Modules.set_std_override ~sess cli_std;
+      Modules.init_module_paths ~sess dir;
+      assert_std_override sess ~expected:cli_std)
+
+let test_std_dir_is_not_guessed_without_explicit_config () =
+  with_temp_dir "blorp_no_implicit_std" (fun dir ->
+      Unix.mkdir (Filename.concat dir "std") 0o700;
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess dir;
+      Alcotest.(check bool)
+        "std override inactive" false sess.std_override_active;
+      Alcotest.(check (option string))
+        "no std source dir" None
+        (Modules.std_source_dir ~sess ());
+      match Modules.load_module ~sess "std/option" dir with
+      | Some m ->
+          Alcotest.(check bool)
+            "embedded std module" true
+            (m.origin = Session.Stdlib_module);
+          Alcotest.(check string) "embedded path" "<embedded:std/option>" m.path
+      | None -> Alcotest.fail "expected embedded std/option to load")
+
+let test_source_origin_uses_configured_std_root () =
+  with_temp_dir "blorp_source_origin" (fun dir ->
+      let sess = Session.create () in
+      Modules.set_std_override ~sess dir;
+      let std_file = Filename.concat dir "list.brp" in
+      let user_file = Filename.concat (Filename.dirname dir) "user.brp" in
+      write_file std_file "";
+      Alcotest.(check bool)
+        "std root file is std origin" true
+        (Modules.module_origin_for_source_file ~sess std_file
+        = Session.Stdlib_module);
+      Alcotest.(check bool)
+        "outside file is user origin" true
+        (Modules.module_origin_for_source_file ~sess user_file
+        = Session.User_module))
+
+let package_name_of_origin = function
+  | Session.Package_module id -> Some (Session.package_id_name id)
+  | Session.Stdlib_module | Session.User_module -> None
+
+let test_pkg_root_discovered_from_base_dir () =
+  with_temp_dir "blorp_pkg_root" (fun dir ->
+      let pkg_root = Filename.concat dir "pkg" in
+      let src_dir = Filename.concat dir "src" in
+      Unix.mkdir pkg_root 0o700;
+      Unix.mkdir src_dir 0o700;
+      write_file
+        (Filename.concat pkg_root "local_math.brp")
+        "pure func double(x: Int) -> Int:\n    x * 2\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess src_dir;
+      let expected_root = Unix.realpath pkg_root in
+      Alcotest.(check bool)
+        "package root discovered" true
+        (List.mem expected_root (Modules.package_roots ~sess ())))
+
+let test_pkg_import_resolves_with_package_origin () =
+  with_temp_dir "blorp_pkg_import" (fun dir ->
+      let pkg_root = Filename.concat dir "pkg" in
+      let src_dir = Filename.concat dir "src" in
+      Unix.mkdir pkg_root 0o700;
+      Unix.mkdir src_dir 0o700;
+      let pkg_file = Filename.concat pkg_root "local_math.brp" in
+      write_file pkg_file "pure func double(x: Int) -> Int:\n    x * 2\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess src_dir;
+      match Modules.load_module ~sess "pkg/local_math" src_dir with
+      | None -> Alcotest.fail "expected pkg/local_math to resolve"
+      | Some m ->
+          Alcotest.(check string)
+            "package module path" (Unix.realpath pkg_file) m.path;
+          Alcotest.(check (option string))
+            "package origin id" (Some "local_math")
+            (package_name_of_origin m.origin))
+
+let test_pkg_nested_import_uses_top_level_package_id () =
+  with_temp_dir "blorp_pkg_nested" (fun dir ->
+      let pkg_root = Filename.concat dir "pkg" in
+      let src_dir = Filename.concat dir "src" in
+      let sqlite_dir = Filename.concat pkg_root "sqlite" in
+      Unix.mkdir pkg_root 0o700;
+      Unix.mkdir src_dir 0o700;
+      Unix.mkdir sqlite_dir 0o700;
+      write_file
+        (Filename.concat sqlite_dir "client.brp")
+        "pure func version() -> Int:\n    1\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess src_dir;
+      match Modules.load_module ~sess "pkg/sqlite/client" src_dir with
+      | None -> Alcotest.fail "expected pkg/sqlite/client to resolve"
+      | Some m ->
+          Alcotest.(check (option string))
+            "package origin id" (Some "sqlite")
+            (package_name_of_origin m.origin))
+
+let test_bare_import_does_not_resolve_package_root () =
+  with_temp_dir "blorp_pkg_bare" (fun dir ->
+      let pkg_root = Filename.concat dir "pkg" in
+      let src_dir = Filename.concat dir "src" in
+      Unix.mkdir pkg_root 0o700;
+      Unix.mkdir src_dir 0o700;
+      write_file
+        (Filename.concat pkg_root "local_math.brp")
+        "pure func double(x: Int) -> Int:\n    x * 2\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess src_dir;
+      match Modules.load_module ~sess "local_math" src_dir with
+      | None -> Alcotest.(check pass) "bare package miss" () ()
+      | Some _ ->
+          Alcotest.fail "bare import unexpectedly resolved from a package root")
+
+let test_typecheck_module_only_reports_dependency_errors () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_dep_typecheck" (fun dir ->
+          let helper_path = Filename.concat dir "helper.brp" in
+          write_file helper_path
+            "func working() -> Int:\n\
+            \    42\n\n\
+             func broken() -> Int:\n\
+            \    missing_dependency_name + 1\n";
+          let main_path = Filename.concat dir "main.brp" in
+          let source =
+            "import:\n\
+            \    ./helper: working\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    working()\n"
+          in
+          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          | Error errors ->
+              let found =
+                List.exists
+                  (fun (e : Ast.compiler_error) ->
+                    mentions e.message
+                      "Undefined identifier: missing_dependency_name")
+                  errors
+              in
+              Alcotest.(check bool) "dependency error surfaced" true found
+          | Ok _ ->
+              Alcotest.fail
+                "expected dependency type error from imported helper"))
+
+let test_typecheck_module_only_reports_target_errors () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_target_typecheck" (fun dir ->
+          let main_path = Filename.concat dir "main.brp" in
+          let source =
+            "func main(args: List[String]) -> Int:\n\
+            \    missing_target_name + 1\n"
+          in
+          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          | Error errors ->
+              let found =
+                List.exists
+                  (fun (e : Ast.compiler_error) ->
+                    mentions e.message
+                      "Undefined identifier: missing_target_name")
+                  errors
+              in
+              Alcotest.(check bool) "target error surfaced" true found
+          | Ok _ ->
+              Alcotest.fail
+                "expected target type error from analysis-only typecheck"))
+
+(* ============================================================================
+   Trait registry (Phase: uniform trait inheritance, Step 2)
+   ============================================================================
+
+   The session-scoped trait registry is what makes the supertrait graph
+   globally visible once a module is loaded, regardless of whether the
+   current file imports it. These tests guard four invariants:
+
+   1. Public trait decls land in the registry when their module loads.
+   2. Lookup returns the original AST + owning [loaded_module].
+   3. Private traits stay module-scoped (never registered).
+   4. Sessions are independent — a registration in one never leaks. *)
+
+let mk_trait_decl ?(supertraits = []) name : Ast.decl =
+  let trait : Ast.trait_decl =
+    {
+      trait_name = name;
+      trait_type_params = [];
+      trait_supertraits = supertraits;
+      trait_methods = [];
+    }
+  in
+  { decl_desc = Ast.DTrait trait; decl_loc = Ast.dummy_loc; decl_doc = None }
+
+let mk_private_trait_decl name : Ast.decl =
+  let inner = mk_trait_decl name in
+  { decl_desc = Ast.DPrivate inner; decl_loc = Ast.dummy_loc; decl_doc = None }
+
+let mk_loaded_module ~name ~decls : Session.loaded_module =
+  {
+    name;
+    path = "<test>";
+    origin = Session.User_module;
+    decls;
+    exports = [];
+    typed_decls = None;
+    typed_import_bindings = None;
+  }
+
+let mk_record_decl name : Ast.decl =
+  let record : Ast.record_decl =
+    {
+      record_name = name;
+      record_type_params = [];
+      record_fields = [];
+      record_is_value = false;
+      record_is_builtin = false;
+    }
+  in
+  { decl_desc = Ast.DRecord record; decl_loc = Ast.dummy_loc; decl_doc = None }
+
+let test_modules_reset_clears_type_index () =
+  let s = Session.create () in
+  let m =
+    mk_loaded_module ~name:"test/types" ~decls:[ mk_record_decl "Widget" ]
+  in
+  Session.register_module_types s m;
+  Alcotest.(check (option string))
+    "registered type home" (Some "test/types")
+    (Session.find_type_home s "Widget");
+  Modules.reset ~sess:s ();
+  Alcotest.(check (option string))
+    "type home cleared" None
+    (Session.find_type_home s "Widget")
+
+(* ============================================================================
+   DefId minting + UFCS def_id table
+   ============================================================================ *)
+
+let test_def_id_counter_independent_across_sessions () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  let _ = Session.mint_def_id s1 in
+  let _ = Session.mint_def_id s1 in
+  let _ = Session.mint_def_id s1 in
+  Alcotest.(check int) "s1 counter advanced" 3 s1.def_id_counter;
+  Alcotest.(check int) "s2 counter untouched" 0 s2.def_id_counter
+
+let test_mint_def_id_monotonic () =
+  let s = Session.create () in
+  let a = Session.mint_def_id s in
+  let b = Session.mint_def_id s in
+  let c = Session.mint_def_id s in
+  Alcotest.(check bool) "strictly increasing" true (a < b && b < c);
+  Alcotest.(check bool) "distinct" true (a <> b && b <> c && a <> c)
+
+let test_trait_registration_populates_index () =
+  let s = Session.create () in
+  let m = mk_loaded_module ~name:"test/mymod" ~decls:[ mk_trait_decl "Foo" ] in
+  Hashtbl.add s.module_cache m.name m;
+  Session.register_module_traits s m;
+  Alcotest.(check (option string))
+    "Foo → test/mymod" (Some "test/mymod")
+    (Hashtbl.find_opt s.trait_index "Foo")
+
+let test_trait_lookup_returns_decl () =
+  let s = Session.create () in
+  let trait_decl = mk_trait_decl "Bar" ~supertraits:[ "Baseline" ] in
+  let m = mk_loaded_module ~name:"test/x" ~decls:[ trait_decl ] in
+  Hashtbl.add s.module_cache m.name m;
+  Session.register_module_traits s m;
+  match Session.find_trait_decl s "Bar" with
+  | None -> Alcotest.fail "expected trait decl"
+  | Some (td, owner) ->
+      Alcotest.(check string) "trait name" "Bar" td.trait_name;
+      Alcotest.(check (list string))
+        "supertraits" [ "Baseline" ] td.trait_supertraits;
+      Alcotest.(check string) "owning module" "test/x" owner.name
+
+let test_private_traits_are_not_registered () =
+  let s = Session.create () in
+  let m =
+    mk_loaded_module ~name:"test/secret"
+      ~decls:[ mk_private_trait_decl "Hidden" ]
+  in
+  Hashtbl.add s.module_cache m.name m;
+  Session.register_module_traits s m;
+  Alcotest.(check (option string))
+    "Hidden not in index" None
+    (Hashtbl.find_opt s.trait_index "Hidden");
+  Alcotest.(check bool)
+    "lookup returns None" true
+    (Session.find_trait_decl s "Hidden" = None)
+
+let test_trait_registry_isolated_across_sessions () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  let m = mk_loaded_module ~name:"test/one" ~decls:[ mk_trait_decl "Solo" ] in
+  Hashtbl.add s1.module_cache m.name m;
+  Session.register_module_traits s1 m;
+  Alcotest.(check bool)
+    "s1 has Solo" true
+    (Session.find_trait_decl s1 "Solo" <> None);
+  Alcotest.(check bool)
+    "s2 does NOT have Solo" true
+    (Session.find_trait_decl s2 "Solo" = None)
+
+let test_trait_lookup_misses_return_none () =
+  let s = Session.create () in
+  Alcotest.(check bool)
+    "unknown trait" true
+    (Session.find_trait_decl s "Nonexistent" = None)
+
+let test_same_module_re_registration_is_idempotent () =
+  (* Loading the same module twice (e.g. via multiple import chains)
+     must not flag a conflict. The trait_index points at the module
+     name, and re-registering with the same name is a no-op. *)
+  let s = Session.create () in
+  let m = mk_loaded_module ~name:"solo/mod" ~decls:[ mk_trait_decl "Twice" ] in
+  Hashtbl.add s.module_cache m.name m;
+  Session.register_module_traits s m;
+  Session.register_module_traits s m;
+  Alcotest.(check int)
+    "no load errors on re-registration" 0
+    (List.length s.load_errors);
+  Alcotest.(check bool)
+    "trait still findable" true
+    (Session.find_trait_decl s "Twice" <> None)
+
+let test_cross_module_conflict_surfaces_error () =
+  (* Two different modules declare [trait Clash] → conflict error
+     written to session.load_errors. The first registration wins; the
+     second is ignored (stale index replace would mask the issue on
+     later lookups). *)
+  let s = Session.create () in
+  let m1 = mk_loaded_module ~name:"mod/a" ~decls:[ mk_trait_decl "Clash" ] in
+  let m2 = mk_loaded_module ~name:"mod/b" ~decls:[ mk_trait_decl "Clash" ] in
+  Hashtbl.add s.module_cache m1.name m1;
+  Hashtbl.add s.module_cache m2.name m2;
+  Session.register_module_traits s m1;
+  Session.register_module_traits s m2;
+  Alcotest.(check int) "one conflict error" 1 (List.length s.load_errors);
+  (* Index still points at the first registration, so downstream
+     lookups don't silently pick up the second module's version. *)
+  match Session.find_trait_decl s "Clash" with
+  | Some (_, owner) ->
+      Alcotest.(check string) "first registration wins" "mod/a" owner.name
+  | None -> Alcotest.fail "expected find to still succeed"
+
+(* ============================================================================
+   Suite
+   ============================================================================ *)
+
+let suite =
+  [
+    ( "meta_isolation",
+      [
+        Alcotest.test_case "fresh_meta_counters" `Quick
+          test_fresh_meta_counters_independent;
+        Alcotest.test_case "meta_env" `Quick test_meta_env_isolated;
+        Alcotest.test_case "reset_meta" `Quick
+          test_reset_meta_clears_only_that_session;
+      ] );
+    ( "modules_isolation",
+      [
+        Alcotest.test_case "module_cache" `Quick test_module_cache_independent;
+        Alcotest.test_case "load_errors" `Quick test_load_errors_independent;
+        Alcotest.test_case "module origin policy" `Quick
+          test_module_origin_policy_helpers;
+        Alcotest.test_case "search_paths" `Quick test_search_paths_independent;
+        Alcotest.test_case "reset clears type index" `Quick
+          test_modules_reset_clears_type_index;
+        Alcotest.test_case "blorp.toml std path" `Quick
+          test_blorp_toml_std_path_sets_override;
+        Alcotest.test_case "existing std override wins" `Quick
+          test_blorp_toml_does_not_replace_existing_override;
+        Alcotest.test_case "std dir not guessed without config" `Quick
+          test_std_dir_is_not_guessed_without_explicit_config;
+        Alcotest.test_case "source origin uses configured std root" `Quick
+          test_source_origin_uses_configured_std_root;
+        Alcotest.test_case "pkg root discovered from base dir" `Quick
+          test_pkg_root_discovered_from_base_dir;
+        Alcotest.test_case "pkg import resolves with package origin" `Quick
+          test_pkg_import_resolves_with_package_origin;
+        Alcotest.test_case "pkg nested import uses top-level package id" `Quick
+          test_pkg_nested_import_uses_top_level_package_id;
+        Alcotest.test_case "bare import skips package roots" `Quick
+          test_bare_import_does_not_resolve_package_root;
+      ] );
+    ( "ambient",
+      [
+        Alcotest.test_case "with_current_restores" `Quick
+          test_with_current_restores_previous;
+        Alcotest.test_case "with_current_exception" `Quick
+          test_with_current_restores_on_exception;
+        Alcotest.test_case "fresh_meta_ambient" `Quick
+          test_fresh_meta_uses_ambient;
+      ] );
+    ( "assert_in_scope",
+      [
+        Alcotest.test_case "raises outside frame" `Quick
+          test_assert_in_scope_raises_outside_frame;
+        Alcotest.test_case "ok inside frame" `Quick
+          test_assert_in_scope_ok_inside_frame;
+        Alcotest.test_case "nested frames" `Quick
+          test_assert_in_scope_nested_frames;
+      ] );
+    ( "pipeline_isolation",
+      [
+        Alcotest.test_case "module_cache untouched" `Quick
+          test_compile_isolates_caller_module_cache;
+        Alcotest.test_case "no stale load_errors" `Quick
+          test_compile_does_not_inherit_prior_load_errors;
+        Alcotest.test_case "analysis dependency errors" `Quick
+          test_typecheck_module_only_reports_dependency_errors;
+        Alcotest.test_case "analysis target errors" `Quick
+          test_typecheck_module_only_reports_target_errors;
+      ] );
+    ( "def_id",
+      [
+        Alcotest.test_case "counter independent" `Quick
+          test_def_id_counter_independent_across_sessions;
+        Alcotest.test_case "mint monotonic" `Quick test_mint_def_id_monotonic;
+      ] );
+    ( "trait_registry",
+      [
+        Alcotest.test_case "populates index" `Quick
+          test_trait_registration_populates_index;
+        Alcotest.test_case "lookup returns decl" `Quick
+          test_trait_lookup_returns_decl;
+        Alcotest.test_case "private traits excluded" `Quick
+          test_private_traits_are_not_registered;
+        Alcotest.test_case "isolated across sessions" `Quick
+          test_trait_registry_isolated_across_sessions;
+        Alcotest.test_case "miss returns None" `Quick
+          test_trait_lookup_misses_return_none;
+        Alcotest.test_case "same module idempotent" `Quick
+          test_same_module_re_registration_is_idempotent;
+        Alcotest.test_case "cross-module conflict" `Quick
+          test_cross_module_conflict_surfaces_error;
+      ] );
+  ]

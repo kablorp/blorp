@@ -1,0 +1,226 @@
+import:
+	codec:
+		Decoder,
+		Value(VString, VRecord, VBool, VInt, VNull, VList, VFloat),
+		d_int,
+		d_string,
+		decode,
+		field,
+		map3,
+		optional,
+	codec_bridge: csv_row_to_value, json_to_value, toml_to_value
+	csv: parse_csv
+	json: JsonValue(JsonNull, JsonBool, JsonNumber, JsonString, JsonVector, JsonObject), parse
+	list: get, length
+	parser: ParseResult, get_value, is_success
+	test: TestSuite
+	toml: parse as parse_toml
+
+
+-- Shared decoder for a Person
+record Person {name: String, age: Int, email: Option[String]}
+
+
+pure func make_person(n: String, a: Int, e: Option[String]) -> Person:
+	{name = n, age = a, email = e}
+
+
+-- ============================================================================
+-- JSON Bridge Tests
+-- ============================================================================
+func test_json_null_bridge() -> Bool:
+	match json_to_value(JsonNull):
+		VNull: True
+		_: False
+
+
+func test_json_bool_bridge() -> Bool:
+	match json_to_value(JsonBool(True)):
+		VBool(b): b == True
+		_: False
+
+
+func test_json_number_bridge() -> Bool:
+	match json_to_value(JsonNumber(3.14)):
+		VFloat(f): f > 3.13 and f < 3.15
+		_: False
+
+
+func test_json_string_bridge() -> Bool:
+	match json_to_value(JsonString("hello")):
+		VString(s): s == "hello"
+		_: False
+
+
+func test_json_array_bridge() -> Bool:
+	match json_to_value(JsonVector([JsonNumber(1.0), JsonNumber(2.0)])):
+		VList(items): items.length() == 2
+		_: False
+
+
+func test_json_object_bridge() -> Bool:
+	match json_to_value(JsonObject([("name", JsonString("Alice"))])):
+		VRecord(pairs): pairs.length() == 1
+		_: False
+
+
+func test_json_parse_and_decode() -> Bool:
+	json_str: String = "{\"name\": \"Bob\", \"age\": 25}"
+	person_dec: Decoder[Person] = map3(
+		make_person,
+		field(
+			"name",
+			d_string,
+		),
+		field(
+			"age",
+			d_int,
+		),
+		optional(
+			"email",
+			d_string,
+		),
+	)
+	pr: ParseResult[JsonValue] = parse(json_str)
+	if is_success(pr):
+		match get_value(pr):
+			Some(json):
+				match decode(person_dec, json_to_value(json)):
+					Ok(p): p.name == "Bob" and p.age == 25
+					Err(_): False
+			None: False
+	else:
+		False
+
+
+-- ============================================================================
+-- TOML Bridge Tests
+-- ============================================================================
+func test_toml_simple_bridge() -> Bool:
+	match parse_toml("name = \"Alice\"\nage = 30"):
+		Ok(tv):
+			v: Value = toml_to_value(tv)
+			match v:
+				VRecord(pairs): pairs.length() == 2
+				_: False
+		Err(_): False
+
+
+func test_toml_decode_person() -> Bool:
+	person_dec: Decoder[Person] = map3(
+		make_person,
+		field(
+			"name",
+			d_string,
+		),
+		field(
+			"age",
+			d_int,
+		),
+		optional(
+			"email",
+			d_string,
+		),
+	)
+	match parse_toml("name = \"Charlie\"\nage = 35"):
+		Ok(tv):
+			match decode(person_dec, toml_to_value(tv)):
+				Ok(p): p.name == "Charlie" and p.age == 35
+				Err(_): False
+		Err(_): False
+
+
+-- ============================================================================
+-- CSV Bridge Tests
+-- ============================================================================
+func test_csv_row_bridge() -> Bool:
+	headers: List[String] = ["name", "age", "email"]
+	row: List[String] = ["Diana", "28", "diana@example.com"]
+	v: Value = csv_row_to_value(headers, row)
+	match v:
+		VRecord(pairs): pairs.length() == 3
+		_: False
+
+
+func test_csv_decode_with_coercion() -> Bool:
+	-- d_int coerces VString via parse_int
+	headers: List[String] = ["name", "age"]
+	row: List[String] = ["Eve", "22"]
+	v: Value = csv_row_to_value(headers, row)
+	match decode(field("age", d_int), v):
+		Ok(n): n == 22
+		Err(_): False
+
+
+func test_csv_full_pipeline() -> Bool:
+	csv_str: String = "name,age\nFrank,40\nGrace,33"
+	rows: List[List[String]] = parse_csv(csv_str)
+	headers: List[String] = ["name", "age"]
+	-- Decode second data row (index 2, since index 0 is header)
+	match get(rows, 2):
+		Some(row):
+			v: Value = csv_row_to_value(headers, row)
+			match decode(field("name", d_string), v):
+				Ok(s): s == "Grace"
+				Err(_): False
+		None: False
+
+
+-- ============================================================================
+-- Cross-Format: Same Decoder, Multiple Formats
+-- ============================================================================
+func test_same_decoder_json_and_toml() -> Bool:
+	person_dec: Decoder[Person] = map3(
+		make_person,
+		field(
+			"name",
+			d_string,
+		),
+		field(
+			"age",
+			d_int,
+		),
+		optional(
+			"email",
+			d_string,
+		),
+	)
+	-- From JSON
+	pr: ParseResult[JsonValue] = parse("{\"name\": \"A\", \"age\": 1}")
+	json_ok: Bool = if is_success(pr):
+		match get_value(pr):
+			Some(json):
+				match decode(person_dec, json_to_value(json)):
+					Ok(p): p.name == "A"
+					Err(_): False
+			None: False
+	else:
+		False
+	-- From TOML
+	toml_ok: Bool = match parse_toml("name = \"B\"\nage = 2"):
+		Ok(tv):
+			match decode(person_dec, toml_to_value(tv)):
+				Ok(p): p.name == "B"
+				Err(_): False
+		Err(_): False
+	json_ok and toml_ok
+
+
+tests: TestSuite = {
+	description = "Codec Bridges",
+	tests = [
+		("json null bridge", test_json_null_bridge),
+		("json bool bridge", test_json_bool_bridge),
+		("json number bridge", test_json_number_bridge),
+		("json string bridge", test_json_string_bridge),
+		("json array bridge", test_json_array_bridge),
+		("json object bridge", test_json_object_bridge),
+		("json parse and decode", test_json_parse_and_decode),
+		("toml simple bridge", test_toml_simple_bridge),
+		("toml decode person", test_toml_decode_person),
+		("csv row bridge", test_csv_row_bridge),
+		("csv decode with coercion", test_csv_decode_with_coercion),
+		("csv full pipeline", test_csv_full_pipeline),
+		("same decoder json and toml", test_same_decoder_json_and_toml),
+	],
+}

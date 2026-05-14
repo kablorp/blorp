@@ -1,0 +1,91 @@
+(** Tensor producer storage contracts.
+
+    This module is the explicit late-Core boundary that describes which opaque
+    tensor/vector runtime builtins produce storage whose runtime representation
+    is known by the compiler.
+
+    Calls still arrive here as [CKBuiltin] C names. That string boundary is
+    transitional and intentionally isolated here so [Core_codegen_prepare] can
+    consume a typed contract instead of carrying ad hoc name lists. *)
+
+type source_arg = SourceArg0 | SourceArg1 | SourceArg2
+type storage_rule = KnownResultLayout | PreservesArgLayout of source_arg
+
+type producer =
+  | KnownResultProducer of string
+  | PreservesArgProducer of string * source_arg
+
+let source_arg_index = function
+  | SourceArg0 -> 0
+  | SourceArg1 -> 1
+  | SourceArg2 -> 2
+
+let fold_storage_rule ~known_result ~preserves_arg = function
+  | KnownResultLayout -> known_result ()
+  | PreservesArgLayout source_arg -> preserves_arg (source_arg_index source_arg)
+
+let storage_rule = function
+  | KnownResultProducer _ -> KnownResultLayout
+  | PreservesArgProducer (_, source_arg) -> PreservesArgLayout source_arg
+
+let producer_debug_name = function
+  | KnownResultProducer name | PreservesArgProducer (name, _) -> name
+
+let producer_of_builtin_name name =
+  match name with
+  | "blorp_vector_new_i64" | "blorp_vector_new_f64" | "blorp_vector_new_f32"
+  | "blorp_vector_new_packed" | "blorp_vector_new_sized"
+  | "blorp_vector_new_fill_i64" | "blorp_vector_new_fill_f64"
+  | "blorp_vector_new_fill_f32" | "blorp_vector_new_fill_packed"
+  | "blorp_vector_new_fill_sized" | "blorp_matrix_new_fill_i64"
+  | "blorp_matrix_new_fill_f64" | "blorp_matrix_new_fill_f32"
+  | "blorp_matrix_new_fill_packed" | "blorp_matrix_new_fill_sized"
+  | "blorp_tensor_new_i64" | "blorp_tensor_new_f64" | "blorp_tensor_new_f32"
+  | "blorp_tensor_new_packed" | "blorp_tensor_new_sized" | "blorp_tensor3_new"
+  | "blorp_tensor4_new" | "blorp_tensor5_new" ->
+      Some (KnownResultProducer name)
+  | "blorp_vector_add_i64" | "blorp_vector_sub_i64" | "blorp_vector_mul_i64"
+  | "blorp_vector_div_i64" | "blorp_vector_mod_i64" | "blorp_vector_add_int"
+  | "blorp_simd_vector_add_f64" | "blorp_simd_vector_sub_f64"
+  | "blorp_simd_vector_mul_f64" | "blorp_simd_vector_div_f64"
+  | "blorp_simd_vector_add_f32" | "blorp_simd_vector_sub_f32"
+  | "blorp_simd_vector_mul_f32" | "blorp_simd_vector_div_f32"
+  | "blorp_vector_scalar_add_i64" | "blorp_vector_scalar_sub_i64"
+  | "blorp_vector_scalar_mul_i64" | "blorp_vector_scalar_div_i64"
+  | "blorp_vector_scalar_mod_i64" | "blorp_vector_scalar_rev_sub_i64"
+  | "blorp_vector_scalar_rev_div_i64" | "blorp_vector_scalar_rev_mod_i64"
+  | "blorp_vector_scalar_add_f64" | "blorp_vector_scalar_sub_f64"
+  | "blorp_vector_scalar_mul_f64" | "blorp_vector_scalar_div_f64"
+  | "blorp_vector_scalar_rev_sub_f64" | "blorp_vector_scalar_rev_div_f64"
+  | "blorp_vector_scalar_add_f32" | "blorp_vector_scalar_sub_f32"
+  | "blorp_vector_scalar_mul_f32" | "blorp_vector_scalar_div_f32"
+  | "blorp_vector_scalar_rev_sub_f32" | "blorp_vector_scalar_rev_div_f32"
+  | "blorp_vector_exp_float32" | "blorp_vector_log_float32"
+  | "blorp_vector_sqrt_float32" | "blorp_vector_cross_float"
+  | "blorp_tensor_matmul_int" | "blorp_tensor_matmul_float"
+  | "blorp_tensor_matmul_float32" | "blorp_tensor_matvec_int"
+  | "blorp_tensor_matvec_float" | "blorp_tensor_matvec_float32"
+  | "blorp_tensor_matvec_t_int" | "blorp_tensor_matvec_t_float"
+  | "blorp_tensor_matvec_t_float32" | "blorp_tensor_outer_int"
+  | "blorp_tensor_outer_float" | "blorp_tensor_outer_float32" ->
+      Some (KnownResultProducer name)
+  | "blorp_assert_shape_nullable" | "blorp_assert_shape"
+  | "blorp_tensor_slice_row" ->
+      Some (PreservesArgProducer (name, SourceArg0))
+  | "blorp_vector_add_float" -> Some (PreservesArgProducer (name, SourceArg0))
+  | "blorp_vector_op" | "blorp_vector_op_cow" ->
+      Some (PreservesArgProducer (name, SourceArg2))
+  | "blorp_vector_scalar_op_int" | "blorp_vector_scalar_op_float"
+  | "blorp_vector_scalar_op_rev_int" | "blorp_vector_scalar_op_rev_float"
+  | "blorp_vector_scalar_op_int_cow" | "blorp_vector_scalar_op_float_cow" ->
+      Some (PreservesArgProducer (name, SourceArg1))
+  | "blorp_vector_exp" | "blorp_vector_log" | "blorp_vector_abs"
+  | "blorp_vector_sqrt" ->
+      Some (PreservesArgProducer (name, SourceArg0))
+  | _ -> None
+
+let of_call_kind = function
+  | Core.CKBuiltin name -> producer_of_builtin_name name
+  | Core.CKUnknown | Core.CKUser _ | Core.CKForeign _ | Core.CKIntrinsic _
+  | Core.CKClosure ->
+      None

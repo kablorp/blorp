@@ -1,0 +1,549 @@
+import:
+	float: abs, approx_eq, asin, atan2, clamp, cos, exp, log, pi, sin, sqrt, tan
+
+
+-- Geo - Geographic coordinate types, distance, and spatial operations
+--
+-- Coord is WGS84 (EPSG:4326) by convention. Longitude first (GeoJSON order).
+-- Distance functions return meters. All functions are pure.
+-- For Cartesian 2D/3D geometry (game physics, collision), see geometry.
+-- ============================================================================
+-- Types
+-- ============================================================================
+-- Geographic coordinate (WGS84). lon: -180..180, lat: -90..90.
+-- Record (not struct) because coordinates must be storable in Lists for polygons/lines.
+record Coord {lon: Float, lat: Float}
+
+
+-- Axis-aligned bounding box in geographic coordinates
+-- Record because it's returned in Option[BBox] from bounds().
+record BBox {min_lon: Float, min_lat: Float, max_lon: Float, max_lat: Float}
+
+
+-- Projected coordinate (Web Mercator). Units are meters from origin.
+struct Projected {x: Float, y: Float}
+
+
+-- A sequence of coordinates forming a line
+record LineString {coords: List[Coord]}
+
+
+-- A polygon with an exterior ring and optional holes.
+-- Rings should be closed (first coord == last coord).
+record Polygon {exterior: List[Coord], holes: List[List[Coord]]}
+
+
+-- A collection of polygons
+record MultiPolygon {polygons: List[Polygon]}
+
+
+-- A collection of points
+record MultiPoint {points: List[Coord]}
+
+
+-- ============================================================================
+-- Constants
+-- ============================================================================
+-- Earth's mean radius in meters (WGS84)
+EARTH_RADIUS_M: Float = 6371008.8
+
+
+-- ============================================================================
+-- Constructors
+-- ============================================================================
+---
+Create a geographic coordinate (WGS84).
+lon is longitude (-180..180), lat is latitude (-90..90).
+
+doctests:
+    :: Create NYC coordinate
+    nyc: Coord = coord(-74.006, 40.7128)
+    nyc.lon < -73.0 and nyc.lat > 40.0
+---
+pure func coord(lon: Float, lat: Float) -> Coord:
+	{lon = lon, lat = lat}
+
+
+---
+Create a bounding box from min/max corners.
+
+doctests:
+    :: Manhattan bbox
+    bb: BBox = bbox(-74.02, 40.70, -73.97, 40.80)
+    bb.min_lon < bb.max_lon and bb.min_lat < bb.max_lat
+---
+pure func bbox(
+	min_lon: Float,
+	min_lat: Float,
+	max_lon: Float,
+	max_lat: Float,
+) -> BBox:
+	{min_lon = min_lon, min_lat = min_lat, max_lon = max_lon, max_lat = max_lat}
+
+
+---
+Create a line string from a list of coordinates.
+
+doctests:
+    :: Simple line
+    ls: LineString = line_string([coord(0.0, 0.0), coord(1.0, 1.0)])
+    ls.coords.length() == 2
+---
+pure func line_string(coords: List[Coord]) -> LineString:
+	{coords = coords}
+
+
+---
+Create a simple polygon (no holes) from a closed ring of coordinates.
+
+doctests:
+    :: Triangle polygon
+    p: Polygon = polygon([coord(0.0, 0.0), coord(1.0, 0.0), coord(0.0, 1.0), coord(0.0, 0.0)])
+    p.exterior.length() == 4
+---
+pure func polygon(exterior: List[Coord]) -> Polygon:
+	{exterior = exterior, holes = []}
+
+
+---
+Create a polygon with holes.
+---
+pure func polygon_with_holes(exterior: List[Coord], holes: List[List[Coord]]) -> Polygon:
+	{exterior = exterior, holes = holes}
+
+
+-- ============================================================================
+-- Distance
+-- ============================================================================
+---
+Haversine distance between two coordinates in meters.
+Accurate to ~0.3% for distances on Earth's surface.
+
+doctests:
+    :: NYC to London is roughly 5570 km
+    nyc: Coord = coord(-74.006, 40.7128)
+    london: Coord = coord(-0.1276, 51.5074)
+    d: Float = haversine(nyc, london)
+    d > 5500000.0 and d < 5600000.0
+---
+pure func haversine(a: Coord, b: Coord) -> Float:
+	to_rad: Float = pi() / 180.0
+	dlat: Float = (b.lat - a.lat) * to_rad
+	dlon: Float = (b.lon - a.lon) * to_rad
+	lat1: Float = a.lat * to_rad
+	lat2: Float = b.lat * to_rad
+	sa: Float = sin(dlat / 2.0)
+	sb: Float = sin(dlon / 2.0)
+	h: Float = clamp(sa * sa + cos(lat1) * cos(lat2) * sb * sb, 0.0, 1.0)
+	2.0 * EARTH_RADIUS_M * asin(sqrt(h))
+
+
+---
+Initial bearing (forward azimuth) from a to b in degrees.
+0 = north, 90 = east, 180 = south, 270 = west.
+
+doctests:
+    :: Due east along equator
+    a: Coord = coord(0.0, 0.0)
+    b: Coord = coord(1.0, 0.0)
+    br: Float = bearing(a, b)
+    br > 89.0 and br < 91.0
+---
+pure func bearing(from: Coord, to: Coord) -> Float:
+	to_rad: Float = pi() / 180.0
+	dlon: Float = (to.lon - from.lon) * to_rad
+	lat1: Float = from.lat * to_rad
+	lat2: Float = to.lat * to_rad
+	x: Float = sin(dlon) * cos(lat2)
+	y: Float = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dlon)
+	deg: Float = atan2(x, y) * 180.0 / pi()
+	if deg < 0.0:
+		deg + 360.0
+	else:
+		deg
+
+
+---
+Destination point given start, bearing (degrees), and distance (meters).
+
+doctests:
+    :: Move 1000km north from equator
+    start: Coord = coord(0.0, 0.0)
+    dest: Coord = destination(start, 0.0, 1000000.0)
+    dest.lat > 8.0 and dest.lat < 10.0
+---
+pure func destination(from: Coord, bearing_deg: Float, distance_m: Float) -> Coord:
+	to_rad: Float = pi() / 180.0
+	to_deg: Float = 180.0 / pi()
+	lat1: Float = from.lat * to_rad
+	lon1: Float = from.lon * to_rad
+	br: Float = bearing_deg * to_rad
+	dr: Float = distance_m / EARTH_RADIUS_M
+	lat2: Float = asin(sin(lat1) * cos(dr) + cos(lat1) * sin(dr) * cos(br))
+	lon2: Float = lon1 + atan2(sin(br) * sin(dr) * cos(lat1), cos(dr) - sin(lat1) * sin(lat2))
+	coord(lon2 * to_deg, lat2 * to_deg)
+
+
+---
+Geographic midpoint on the great circle between two coordinates.
+
+doctests:
+    :: Midpoint of equator segment
+    a: Coord = coord(0.0, 0.0)
+    b: Coord = coord(2.0, 0.0)
+    m: Coord = midpoint(a, b)
+    approx_eq(m.lon, 1.0) and approx_eq(m.lat, 0.0)
+---
+pure func midpoint(a: Coord, b: Coord) -> Coord:
+	to_rad: Float = pi() / 180.0
+	to_deg: Float = 180.0 / pi()
+	lat1: Float = a.lat * to_rad
+	lon1: Float = a.lon * to_rad
+	lat2: Float = b.lat * to_rad
+	dlon: Float = (b.lon - a.lon) * to_rad
+	bx: Float = cos(lat2) * cos(dlon)
+	by: Float = cos(lat2) * sin(dlon)
+	lat3: Float = atan2(sin(lat1) + sin(lat2), sqrt((cos(lat1) + bx) * (cos(lat1) + bx) + by * by))
+	lon3: Float = lon1 + atan2(by, cos(lat1) + bx)
+	coord(lon3 * to_deg, lat3 * to_deg)
+
+
+-- ============================================================================
+-- Spatial predicates
+-- ============================================================================
+---
+Check if a coordinate is inside a bounding box.
+
+doctests:
+    :: Point inside bbox
+    bb: BBox = bbox(-74.1, 40.6, -73.9, 40.8)
+    bbox_contains(bb, coord(-74.0, 40.7))
+---
+pure func bbox_contains(bb: BBox, c: Coord) -> Bool:
+	c.lon >= bb.min_lon and c.lon <= bb.max_lon and c.lat >= bb.min_lat and c.lat <= bb.max_lat
+
+
+---
+Check if two bounding boxes overlap.
+
+doctests:
+    :: Overlapping bboxes
+    a: BBox = bbox(0.0, 0.0, 2.0, 2.0)
+    b: BBox = bbox(1.0, 1.0, 3.0, 3.0)
+    bbox_overlaps(a, b)
+---
+pure func bbox_overlaps(a: BBox, b: BBox) -> Bool:
+	a.min_lon < b.max_lon and a.max_lon > b.min_lon and a.min_lat < b.max_lat and a.max_lat > b.min_lat
+
+
+---
+Point-in-polygon test using ray casting algorithm.
+Handles both exterior ring and holes.
+
+doctests:
+    :: Point inside square polygon
+    sq: Polygon = polygon([coord(0.0, 0.0), coord(10.0, 0.0), coord(10.0, 10.0), coord(0.0, 10.0), coord(0.0, 0.0)])
+    point_in_polygon(coord(5.0, 5.0), sq)
+---
+pure func point_in_polygon(p: Coord, poly: Polygon) -> Bool:
+	-- Check exterior ring
+	in_exterior: Bool = point_in_ring(p, poly.exterior)
+	if not in_exterior:
+		False
+	else:
+		-- Check holes: if inside any hole, outside the polygon
+		var in_hole: Bool = False
+		var i: Int = 0
+		while i < poly.holes.length() and not in_hole:
+			match poly.holes.get(i):
+				Some(hole): in_hole = point_in_ring(p, hole)
+				None: void
+			i += 1
+		not in_hole
+
+
+-- Ray casting for a single ring
+private pure func point_in_ring(p: Coord, ring: List[Coord]) -> Bool:
+	var inside: Bool = False
+	n: Int = ring.length()
+	var i: Int = 0
+	var j: Int = n - 1
+	while i < n:
+		match ring.get(i):
+			Some(ci):
+				match ring.get(j):
+					Some(cj):
+						if ci.lat > p.lat != (cj.lat > p.lat):
+							slope: Float = (cj.lon - ci.lon) * (p.lat - ci.lat) / (cj.lat - ci.lat) + ci.lon
+							if p.lon < slope:
+								inside = not inside
+					None: void
+			None: void
+		j = i
+		i += 1
+	inside
+
+
+-- ============================================================================
+-- Measurement
+-- ============================================================================
+---
+Compute the bounding box of a list of coordinates.
+Returns None if the list is empty.
+
+doctests:
+    :: Bounds of three points
+    cs: List[Coord] = [coord(1.0, 2.0), coord(3.0, 4.0), coord(0.0, 1.0)]
+    match bounds(cs):
+        Some(bb): approx_eq(bb.min_lon, 0.0) and approx_eq(bb.max_lat, 4.0)
+        None: False
+---
+pure func bounds(coords: List[Coord]) -> Option[BBox]:
+	if coords.length() == 0:
+		None
+	else:
+		match coords.get(0):
+			Some(first):
+				var mn_lon: Float = first.lon
+				var mn_lat: Float = first.lat
+				var mx_lon: Float = first.lon
+				var mx_lat: Float = first.lat
+				var i: Int = 1
+				while i < coords.length():
+					match coords.get(i):
+						Some(c):
+							if c.lon < mn_lon:
+								mn_lon = c.lon
+							if c.lat < mn_lat:
+								mn_lat = c.lat
+							if c.lon > mx_lon:
+								mx_lon = c.lon
+							if c.lat > mx_lat:
+								mx_lat = c.lat
+						None: void
+					i += 1
+				Some(bbox(mn_lon, mn_lat, mx_lon, mx_lat))
+			None: None
+
+
+---
+Length of a line string in meters (sum of haversine segments).
+
+doctests:
+    :: Line along equator
+    ls: LineString = line_string([coord(0.0, 0.0), coord(1.0, 0.0)])
+    d: Float = line_length(ls)
+    d > 111000.0 and d < 112000.0
+---
+pure func line_length(ls: LineString) -> Float:
+	var total: Float = 0.0
+	var i: Int = 1
+	while i < ls.coords.length():
+		match ls.coords.get(i - 1):
+			Some(a):
+				match ls.coords.get(i):
+					Some(b):
+						total += haversine(a, b)
+					None: void
+			None: void
+		i += 1
+	total
+
+
+---
+Perimeter of a polygon in meters.
+
+doctests:
+    :: Perimeter of small polygon
+    sq: Polygon = polygon([coord(0.0, 0.0), coord(1.0, 0.0), coord(1.0, 1.0), coord(0.0, 1.0), coord(0.0, 0.0)])
+    p: Float = polygon_perimeter(sq)
+    p > 400000.0
+---
+pure func polygon_perimeter(poly: Polygon) -> Float:
+	line_length(line_string(poly.exterior))
+
+
+---
+Approximate area of a polygon in square meters.
+Uses the spherical excess formula (works for polygons up to ~500km across).
+
+doctests:
+    :: Small rectangle has positive area
+    sq: Polygon = polygon([coord(0.0, 0.0), coord(1.0, 0.0), coord(1.0, 1.0), coord(0.0, 1.0), coord(0.0, 0.0)])
+    polygon_area(sq) > 10000000000.0
+---
+pure func polygon_area(poly: Polygon) -> Float:
+	exterior_area: Float = ring_area(poly.exterior)
+	var hole_area: Float = 0.0
+	var i: Int = 0
+	while i < poly.holes.length():
+		match poly.holes.get(i):
+			Some(hole): hole_area += ring_area(hole)
+			None: void
+		i += 1
+	abs(exterior_area) - abs(hole_area)
+
+
+-- Unsigned area of a ring using the spherical excess formula.
+-- Strips the closing duplicate vertex if the ring is closed (first == last),
+-- since modular-index iteration would double-count contributions near the closure.
+private pure func ring_area(ring: List[Coord]) -> Float:
+	to_rad: Float = pi() / 180.0
+	raw_n: Int = ring.length()
+	if raw_n < 3:
+		0.0
+	else:
+		-- Strip closing duplicate if ring is closed (GeoJSON convention)
+		n: Int = if raw_n > 3:
+			match ring.get(0):
+				Some(first):
+					match ring.get(raw_n - 1):
+						Some(last):
+							if approx_eq(first.lon, last.lon) and approx_eq(first.lat, last.lat):
+								raw_n - 1
+							else:
+								raw_n
+						None: raw_n
+				None: raw_n
+		else:
+			raw_n
+		var total: Float = 0.0
+		var i: Int = 0
+		while i < n:
+			j: Int = (i + 1) % n
+			k: Int = (i + 2) % n
+			match ring.get(i):
+				Some(ci):
+					match ring.get(j):
+						Some(cj):
+							match ring.get(k):
+								Some(ck):
+									total += (ck.lon - ci.lon) * to_rad * sin(cj.lat * to_rad)
+								None: void
+						None: void
+				None: void
+			i += 1
+		abs(total * EARTH_RADIUS_M * EARTH_RADIUS_M / 2.0)
+
+
+---
+Centroid of a polygon (average of exterior ring coordinates).
+Approximation suitable for small polygons.
+
+doctests:
+    :: Centroid of unit square
+    sq: Polygon = polygon([coord(0.0, 0.0), coord(2.0, 0.0), coord(2.0, 2.0), coord(0.0, 2.0), coord(0.0, 0.0)])
+    c: Coord = polygon_centroid(sq)
+    approx_eq(c.lon, 1.0) and approx_eq(c.lat, 1.0)
+---
+pure func polygon_centroid(poly: Polygon) -> Coord:
+	-- Exclude last point if ring is closed (first == last)
+	n: Int = poly.exterior.length()
+	count: Int = if n > 1:
+		match poly.exterior.get(0):
+			Some(first):
+				match poly.exterior.get(n - 1):
+					Some(last):
+						if approx_eq(first.lon, last.lon) and approx_eq(first.lat, last.lat):
+							n - 1
+						else:
+							n
+					None: n
+			None: n
+	else:
+		n
+	if count == 0:
+		coord(0.0, 0.0)
+	else:
+		var sum_lon: Float = 0.0
+		var sum_lat: Float = 0.0
+		var i: Int = 0
+		while i < count:
+			match poly.exterior.get(i):
+				Some(c):
+					sum_lon += c.lon
+					sum_lat += c.lat
+				None: void
+			i += 1
+		coord(sum_lon / to_float(count), sum_lat / to_float(count))
+
+
+-- ============================================================================
+-- Projection
+-- ============================================================================
+---
+Project WGS84 coordinate to Web Mercator (EPSG:3857).
+Returns meters from origin. Valid for lat in (-85.06, 85.06).
+
+doctests:
+    :: Origin maps to zero
+    p: Projected = to_mercator(coord(0.0, 0.0))
+    approx_eq(p.x, 0.0) and approx_eq(p.y, 0.0)
+---
+pure func to_mercator(c: Coord) -> Projected:
+	to_rad: Float = pi() / 180.0
+
+	-- Clamp latitude to valid Mercator range (tan diverges to infinity at poles)
+	lat_clamped: Float = clamp(c.lat, -85.06, 85.06)
+	x: Float = EARTH_RADIUS_M * c.lon * to_rad
+	y: Float = EARTH_RADIUS_M * log(tan(pi() / 4.0 + lat_clamped * to_rad / 2.0))
+	{x = x, y = y}
+
+
+---
+Convert Web Mercator (EPSG:3857) back to WGS84.
+
+doctests:
+    :: Roundtrip through mercator
+    orig: Coord = coord(-74.006, 40.7128)
+    rt: Coord = from_mercator(to_mercator(orig))
+    approx_eq(rt.lon, orig.lon) and approx_eq(rt.lat, orig.lat)
+---
+pure func from_mercator(p: Projected) -> Coord:
+	to_deg: Float = 180.0 / pi()
+	lon: Float = p.x / EARTH_RADIUS_M * to_deg
+	lat: Float = (2.0 * atan2(exp(p.y / EARTH_RADIUS_M), 1.0) - pi() / 2.0) * to_deg
+	coord(lon, lat)
+
+
+-- ============================================================================
+-- Trait implementations
+-- ============================================================================
+implements Stringable for Coord:
+	pure func to_string(c: Coord) -> String:
+		"Coord(" + c.lon.to_string() + ", " + c.lat.to_string() + ")"
+
+
+implements Equatable for Coord:
+	pure func equals(a: Coord, b: Coord) -> Bool:
+		approx_eq(a.lon, b.lon) and approx_eq(a.lat, b.lat)
+
+
+implements Stringable for BBox:
+	pure func to_string(bb: BBox) -> String:
+		"BBox(" + to_string(
+			bb.min_lon,
+		) + ", " + to_string(
+			bb.min_lat,
+		) + ", " + bb.max_lon.to_string() + ", " + bb.max_lat.to_string() + ")"
+
+
+implements Equatable for BBox:
+	pure func equals(a: BBox, b: BBox) -> Bool:
+		approx_eq(
+			a.min_lon,
+			b.min_lon,
+		) and approx_eq(
+			a.min_lat,
+			b.min_lat,
+		) and approx_eq(a.max_lon, b.max_lon) and approx_eq(a.max_lat, b.max_lat)
+
+
+implements Stringable for Projected:
+	pure func to_string(p: Projected) -> String:
+		"Projected(" + p.x.to_string() + ", " + p.y.to_string() + ")"
+
+
+implements Equatable for Projected:
+	pure func equals(a: Projected, b: Projected) -> Bool:
+		approx_eq(a.x, b.x) and approx_eq(a.y, b.y)

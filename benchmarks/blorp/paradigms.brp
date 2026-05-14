@@ -1,0 +1,962 @@
+import:
+	./support/benchmark:
+		BenchmarkFloatResult,
+		BenchmarkResult,
+		bench,
+		bench_float,
+		bench_int,
+		format_duration,
+	dict as D
+	list as L: append, filter, filter_map, fold, get_or, map, range
+	option: Option(Some, None)
+	string: string
+
+
+-- Paradigm Benchmarks
+--
+-- Compares the same problem solved with different styles to verify
+-- that clean, expressive code doesn't carry serious performance penalties.
+--
+-- Categories:
+-- 1. Imperative vs Functional (loops vs map/filter/fold)
+-- 2. Struct vs Record (stack vs heap allocation)
+-- 3. Pattern match vs if-else
+-- 4. @tailrec recursion vs while loop
+-- 5. Pure vs impure
+-- 6. Vector (fixed) vs List (dynamic)
+-- 7. UFCS chaining vs nested calls
+-- 8. Record update vs manual construction
+-- 9. Declarative vs imperative list building
+-- 10. Sequential vs parallel list pipelines
+-- ============================================================================
+-- Helpers
+-- ============================================================================
+func print_comparison(
+	label: String,
+	a_name: String,
+	a_us: Int,
+	b_name: String,
+	b_us: Int,
+) -> Void:
+	ratio: Float = match b_us > 0:
+		True: to_float(a_us) / to_float(b_us)
+		False: 0.0
+	ratio_str: String = match ratio < 0.01:
+		True: "<0.01x"
+		False: to_string(round(ratio * 100.0) / 100.0) + "x"
+	print("  " + label)
+	print("    " + a_name + ": " + format_duration(a_us))
+	print("    " + b_name + ": " + format_duration(b_us))
+	print("    ratio: " + ratio_str)
+	print("")
+
+
+func consume_int(value: Int) -> Void:
+	if value == -123456789:
+		print("unreachable")
+	else:
+		void
+
+
+func consume_list_int(values: List[Int]) -> Void:
+	last_index: Int = length(values) - 1
+	first: Int = get_or(values, 0, 0)
+	last: Int = get_or(values, last_index, 0)
+	consume_int(length(values) + first + last)
+
+
+-- ============================================================================
+-- 1. Imperative vs Functional: Sum of squares of even numbers
+-- ============================================================================
+-- Problem: Given a list of integers, sum the squares of the even ones.
+func sum_sq_even_imperative(data: List[Int]) -> Int:
+	var total: Int = 0
+	for n in data:
+		if n % 2 == 0:
+			total += n * n
+	total
+
+
+func sum_sq_even_functional(data: List[Int]) -> Int:
+	L.fold(
+		L.map(
+			L.filter(
+				data,
+				func(n: Int): n % 2 == 0,
+			),
+			func(n: Int): n * n,
+		),
+		0,
+		func(acc: Int, x: Int): acc + x,
+	)
+
+
+func sum_sq_even_fold_only(data: List[Int]) -> Int:
+	L.fold(data, 0, func(acc: Int, n: Int):
+		match n % 2 == 0:
+			True: acc + n * n
+			False: acc
+	)
+
+
+func bench_sum_sq_even() -> Void:
+	data: List[Int] = range(0, 1000)
+	n: Int = 50000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_sq_even_imperative(data))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_sq_even_functional(data))
+	c: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_sq_even_fold_only(data))
+	print_comparison(
+		"Sum squares of evens (1000 elems)",
+		"imperative (for/if)",
+		a.elapsed_us,
+		"functional (filter/map/fold)",
+		b.elapsed_us,
+	)
+	print_comparison(
+		"Sum squares of evens (1000 elems)",
+		"imperative (for/if)",
+		a.elapsed_us,
+		"single fold",
+		c.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 2. Struct vs Record: Point accumulation
+-- ============================================================================
+-- Problem: Sum up N points by accumulating x and y coordinates.
+struct SPoint {x: Float, y: Float}
+
+
+record RPoint {x: Float, y: Float}
+
+
+func sum_points_struct(n: Int) -> Float:
+	var acc: SPoint = {x = 0.0, y = 0.0}
+	for i in 0..n:
+		f: Float = to_float(i)
+		acc = {x = acc.x + f, y = acc.y + f * 0.5}
+	acc.x + acc.y
+
+
+func sum_points_record(n: Int) -> Float:
+	var acc: RPoint = {x = 0.0, y = 0.0}
+	for i in 0..n:
+		f: Float = to_float(i)
+		acc = {x = acc.x + f, y = acc.y + f * 0.5}
+	acc.x + acc.y
+
+
+func bench_struct_vs_record() -> Void:
+	n: Int = 200000
+	a: BenchmarkFloatResult = bench_float(
+		n,
+		func(iter: Int) -> Float: sum_points_struct(500 + iter % 17),
+	)
+	b: BenchmarkFloatResult = bench_float(
+		n,
+		func(iter: Int) -> Float: sum_points_record(500 + iter % 17),
+	)
+	print_comparison(
+		"Point accumulation (500..516 iters)",
+		"struct (stack)",
+		a.elapsed_us,
+		"record (heap/ARC)",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 3. Pattern match vs if-else: Classification
+-- ============================================================================
+-- Problem: Classify integers into buckets.
+pure func classify_match(n: Int) -> Int:
+	match n % 5:
+		0: 0
+		1: 1
+		2: 2
+		3: 3
+		_: 4
+
+
+pure func classify_if(n: Int) -> Int:
+	r: Int = n % 5
+	if r == 0:
+		0
+	else if r == 1:
+		1
+	else if r == 2:
+		2
+	else if r == 3:
+		3
+	else:
+		4
+
+
+func bench_match_vs_if() -> Void:
+	n: Int = 5000000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: classify_match(iter))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: classify_if(iter))
+	print_comparison(
+		"Integer classify (5 branches)",
+		"match",
+		a.elapsed_us,
+		"if-else chain",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 4. @tailrec vs while loop: Fibonacci
+-- ============================================================================
+-- Problem: Compute fib(N) iteratively.
+@tailrec
+pure func fib_tailrec(n: Int, a: Int, b: Int) -> Int:
+	match n <= 0:
+		True: a
+		False: fib_tailrec(n - 1, b, a + b)
+
+
+pure func fib_while(n: Int) -> Int:
+	var a: Int = 0
+	var b: Int = 1
+	var i: Int = 0
+	while i < n:
+		c: Int = a + b
+		a = b
+		b = c
+		i += 1
+	a
+
+
+func bench_tailrec_vs_while() -> Void:
+	n: Int = 5000000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		size: Int = 20 + iter % 11
+		fib_tailrec(size, 0, 1)
+	)
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		size: Int = 20 + iter % 11
+		fib_while(size)
+	)
+	print_comparison("fib(20..30)", "@tailrec", a.elapsed_us, "while loop", b.elapsed_us)
+
+
+-- ============================================================================
+-- 5. Pure vs impure: Same computation
+-- ============================================================================
+-- Problem: Compute a sum — identical body, only purity annotation differs.
+pure func compute_pure(n: Int) -> Int:
+	var total: Int = 0
+	for i in 0..n:
+		total += i * i
+	total
+
+
+func compute_impure(n: Int) -> Int:
+	var total: Int = 0
+	for i in 0..n:
+		total += i * i
+	total
+
+
+func bench_pure_vs_impure() -> Void:
+	n: Int = 2000000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: compute_pure(400 + iter % 101))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: compute_impure(400 + iter % 101))
+	print_comparison(
+		"Sum of squares 0..400..500",
+		"pure func",
+		a.elapsed_us,
+		"func (impure)",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 6. Vector (fixed) vs List (dynamic): Sum
+-- ============================================================================
+-- Problem: Sum elements of a fixed-size vector vs a dynamic list.
+func sum_vector(v: Int[#256]) -> Int:
+	var total: Int = 0
+	for i in v:
+		total += i
+	total
+
+
+func sum_list(lst: List[Int]) -> Int:
+	var total: Int = 0
+	for n in lst:
+		total += n
+	total
+
+
+func bench_vector_vs_list() -> Void:
+	v: Int[#256] = vector(1, 256)
+	lst: List[Int] = range(0, 256)
+	n: Int = 200000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_vector(v))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_list(lst))
+	print_comparison("Sum 256 elements", "Int[#256]", a.elapsed_us, "List[Int]", b.elapsed_us)
+
+
+-- ============================================================================
+-- 7. UFCS chaining vs nested calls
+-- ============================================================================
+-- Problem: Transform a list with multiple operations.
+-- NOTE: UFCS chaining requires unqualified imports (data.filter(...) not data.L.filter(...))
+-- Both versions call the same functions — just different call syntax
+func transform_nested(data: List[Int]) -> Int:
+	length(L.map(L.filter(data, func(x: Int): x > 50), func(x: Int): x * 2))
+
+
+func transform_map_then_filter(data: List[Int]) -> Int:
+	length(L.filter(L.map(data, func(x: Int): x * 2), func(x: Int): x > 100))
+
+
+func bench_ufcs_vs_nested() -> Void:
+	data: List[Int] = range(0, 500)
+	n: Int = 100000
+
+	-- UFCS is purely syntactic sugar (x.f(args) -> f(x, args)), so it
+	-- compiles to the same code. We test nested vs flat composition instead.
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: transform_map_then_filter(data))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: transform_nested(data))
+	print_comparison(
+		"filter+map+length (500 elems)",
+		"map-then-filter",
+		a.elapsed_us,
+		"filter-then-map",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 8. Record update vs manual construction
+-- ============================================================================
+-- Problem: Update a field on a record repeatedly.
+record Config {width: Int, height: Int, depth: Int, scale: Float}
+
+
+func update_with_syntax(n: Int) -> Config:
+	var c: Config = {width = 100, height = 200, depth = 50, scale = 1.0}
+	for i in 0..n:
+		next_width: Int = c.width + 1
+		next: Config = { c | width = next_width }
+		c = next
+	c
+
+
+func update_manual(n: Int) -> Config:
+	var c: Config = {width = 100, height = 200, depth = 50, scale = 1.0}
+	for i in 0..n:
+		c = {width = c.width + 1, height = c.height, depth = c.depth, scale = c.scale}
+	c
+
+
+func bench_record_update() -> Void:
+	n: Int = 200000
+	a: Int = bench(n, func():
+		_ = update_with_syntax(100)
+	)
+	b: Int = bench(n, func():
+		_ = update_manual(100)
+	)
+	print_comparison(
+		"Record update (100 iters, 4 fields)",
+		"{ r | field = val }",
+		a,
+		"manual reconstruct",
+		b,
+	)
+
+
+-- ============================================================================
+-- 9. Declarative list building vs imperative accumulation
+-- ============================================================================
+-- Problem: Build a list of transformed values.
+func build_declarative(n: Int) -> List[Int]:
+	L.filter(L.map(range(0, n), func(x: Int): x * x), func(x: Int): x % 3 == 0)
+
+
+func build_imperative(n: Int) -> List[Int]:
+	var result: List[Int] = []
+	for i in 0..n:
+		sq: Int = i * i
+		if sq % 3 == 0:
+			result = append(result, sq)
+	result
+
+
+func bench_build_list() -> Void:
+	n: Int = 50000
+	a: Int = bench(n, func():
+		_ = build_declarative(500)
+	)
+	b: Int = bench(n, func():
+		_ = build_imperative(500)
+	)
+	print_comparison(
+		"Build filtered list (500 -> ~167)",
+		"declarative (range/map/filter)",
+		a,
+		"imperative (for/append)",
+		b,
+	)
+
+
+-- ============================================================================
+-- 10. for-in accumulator vs fold
+-- ============================================================================
+-- Problem: Sum a list. Isolates closure call + boxing overhead.
+func sum_for_in(data: List[Int]) -> Int:
+	var total: Int = 0
+	for n in data:
+		total += n
+	total
+
+
+func sum_fold_only(data: List[Int]) -> Int:
+	fold(data, 0, func(acc: Int, n: Int): acc + n)
+
+
+func bench_forin_vs_fold() -> Void:
+	data: List[Int] = range(0, 1000)
+	n: Int = 100000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_for_in(data))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_fold_only(data))
+	print_comparison("Sum 1000 elements", "for-in accumulator", a.elapsed_us, "fold", b.elapsed_us)
+
+
+-- ============================================================================
+-- 11. String interpolation vs concatenation
+-- ============================================================================
+-- Problem: Build a string from parts.
+func build_interp(a: String, b: String, c: String) -> String:
+	"${a} is ${b} and ${c}"
+
+
+func build_concat(a: String, b: String, c: String) -> String:
+	a + " is " + b + " and " + c
+
+
+func bench_interp_vs_concat() -> Void:
+	n: Int = 500000
+	a: Int = bench(n, func():
+		_ = build_interp("hello", "world", "blorp")
+	)
+	b: Int = bench(n, func():
+		_ = build_concat("hello", "world", "blorp")
+	)
+	print_comparison("String build (3 parts)", "interpolation", a, "concatenation (+)", b)
+
+
+-- ============================================================================
+-- 12. String + loop vs capacity-aware append
+-- ============================================================================
+-- Problem: Build a long string piece by piece.
+func build_with_plus(n: Int) -> String:
+	var s: String = ""
+	for i in 0..n:
+		s = s + to_string(i) + ","
+	s
+
+
+func build_with_append(n: Int) -> String:
+	var sb: String = string(n * 4)
+	for i in 0..n:
+		sb = sb.append_str(to_string(i))
+		sb = sb.append_str(",")
+	sb
+
+
+func bench_string_build() -> Void:
+	n: Int = 5000
+	a: Int = bench(n, func():
+		_ = build_with_plus(200)
+	)
+	b: Int = bench(n, func():
+		_ = build_with_append(200)
+	)
+	print_comparison("Build string (200 pieces)", "string + loop", a, "String.append", b)
+
+
+-- ============================================================================
+-- 13. Option chaining vs nested match
+-- ============================================================================
+-- Problem: Chain optional operations.
+pure func safe_divide(a: Int, b: Int) -> Option[Int]:
+	if b == 0:
+		None
+	else:
+		Some(a / b)
+
+
+func option_chain(a: Int, b: Int, c: Int) -> Int:
+	result: Option[Int] = safe_divide(a, b).and_then(func(x: Int): safe_divide(x, c))
+	match result:
+		Some(v): v
+		None: 0
+
+
+func option_match(a: Int, b: Int, c: Int) -> Int:
+	match safe_divide(a, b):
+		Some(x):
+			match safe_divide(x, c):
+				Some(y): y
+				None: 0
+		None: 0
+
+
+func bench_option_chain() -> Void:
+	n: Int = 2000000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: option_chain(100 + iter % 100, 5, 2))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: option_match(100 + iter % 100, 5, 2))
+	print_comparison(
+		"Option chain (2 ops)",
+		"and_then/unwrap_or",
+		a.elapsed_us,
+		"nested match",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 14. Closure capture vs explicit parameter
+-- ============================================================================
+-- Problem: Apply a multiplier to list elements.
+func map_with_capture(data: List[Int], multiplier: Int) -> List[Int]:
+	map(data, func(x: Int): x * multiplier)
+
+
+func apply_mul(x: Int, m: Int) -> Int:
+	x * m
+
+
+func map_with_param(data: List[Int], multiplier: Int) -> List[Int]:
+	var result: List[Int] = []
+	for n in data:
+		result = append(result, apply_mul(n, multiplier))
+	result
+
+
+func bench_capture_vs_param() -> Void:
+	data: List[Int] = range(0, 500)
+	n: Int = 50000
+	a: Int = bench(n, func():
+		_ = map_with_capture(data, 3)
+	)
+	b: Int = bench(n, func():
+		_ = map_with_param(data, 3)
+	)
+	print_comparison("Apply multiplier (500 elems)", "closure capture", a, "explicit param loop", b)
+
+
+-- ============================================================================
+-- 15. Named function vs inline lambda
+-- ============================================================================
+-- Problem: Double every element.
+pure func double(x: Int) -> Int:
+	x * 2
+
+
+func map_named(data: List[Int]) -> List[Int]:
+	map(data, double)
+
+
+func map_lambda(data: List[Int]) -> List[Int]:
+	map(data, func(x: Int): x * 2)
+
+
+func bench_named_vs_lambda() -> Void:
+	data: List[Int] = range(0, 500)
+	n: Int = 50000
+	a: Int = bench(n, func():
+		_ = map_named(data)
+	)
+	b: Int = bench(n, func():
+		_ = map_lambda(data)
+	)
+	print_comparison("map (500 elems)", "named function", a, "inline lambda", b)
+
+
+-- ============================================================================
+-- 16. Tuple return vs record return vs struct return
+-- ============================================================================
+-- Problem: Return two values from a hot function.
+record RPair {a: Int, b: Int}
+
+
+func return_tuple(n: Int) -> (Int, Int):
+	(n * 2, n * 3)
+
+
+func return_record(n: Int) -> RPair:
+	{a = n * 2, b = n * 3}
+
+
+func bench_return_types() -> Void:
+	n: Int = 5000000
+	a: Int = bench(n, func():
+		_ = return_tuple(42)
+	)
+	b: Int = bench(n, func():
+		_ = return_record(42)
+	)
+	print_comparison("Return 2 values", "tuple (Int, Int)", a, "record RPair", b)
+
+
+-- ============================================================================
+-- 17. Dict lookup vs match chain (small key set)
+-- ============================================================================
+-- Problem: Map a string key to a value (5 keys).
+func lookup_dict(d: Dict[String, Int], key: String) -> Int:
+	match D.get(d, key):
+		Some(v): v
+		None: -1
+
+
+func lookup_match(key: String) -> Int:
+	if key == "alpha":
+		1
+	else if key == "beta":
+		2
+	else if key == "gamma":
+		3
+	else if key == "delta":
+		4
+	else if key == "epsilon":
+		5
+	else:
+		-1
+
+
+func bench_dict_vs_match() -> Void:
+	d: Dict[String, Int] = {"alpha" => 1, "beta" => 2, "gamma" => 3, "delta" => 4, "epsilon" => 5}
+	n: Int = 2000000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: lookup_dict(d, "gamma"))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: lookup_match("gamma"))
+	print_comparison(
+		"Lookup (5 keys, mid hit)",
+		"Dict[String, Int]",
+		a.elapsed_us,
+		"if-else chain",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 18. Recursive list processing vs for iteration
+-- ============================================================================
+-- Problem: Sum a list using head/rest pattern matching vs for-in.
+@tailrec
+func sum_recursive(lst: List[Int], acc: Int) -> Int:
+	match lst:
+		[]: acc
+		[x, ...rest]: sum_recursive(rest, acc + x)
+
+
+func sum_forin(lst: List[Int]) -> Int:
+	var total: Int = 0
+	for n in lst:
+		total += n
+	total
+
+
+func bench_recursive_vs_forin() -> Void:
+	data: List[Int] = range(0, 500)
+	n: Int = 100000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_recursive(data, 0))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_forin(data))
+	print_comparison(
+		"Sum list (500 elems)",
+		"recursive [x,...rest]",
+		a.elapsed_us,
+		"for-in loop",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 19. Many small allocations vs one large
+-- ============================================================================
+-- Problem: Process the same total elements in different chunk sizes.
+func process_many_small() -> Int:
+	var total: Int = 0
+	for batch in 0..100:
+		var lst: List[Int] = []
+		for i in 0..10:
+			lst = append(lst, batch * 10 + i)
+		for n in lst:
+			total += n
+	total
+
+
+func process_one_large() -> Int:
+	var lst: List[Int] = range(0, 1000)
+	var total: Int = 0
+	for n in lst:
+		total += n
+	total
+
+
+func bench_many_small_vs_large() -> Void:
+	n: Int = 50000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: process_many_small())
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: process_one_large())
+	print_comparison(
+		"Process 1000 elems",
+		"100 lists of 10",
+		a.elapsed_us,
+		"1 list of 1000",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 20. Indexed access vs for-in iteration
+-- ============================================================================
+-- Problem: Sum a list — indexed get_or vs direct for-in.
+func sum_indexed(data: List[Int]) -> Int:
+	var total: Int = 0
+	for i in 0..length(data):
+		total += get_or(data, i, 0)
+	total
+
+
+func sum_direct(data: List[Int]) -> Int:
+	var total: Int = 0
+	for n in data:
+		total += n
+	total
+
+
+func bench_indexed_vs_forin() -> Void:
+	data: List[Int] = range(0, 1000)
+	n: Int = 100000
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_indexed(data))
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int: sum_direct(data))
+	print_comparison(
+		"Sum 1000 (indexed vs direct)",
+		"for i + get_or",
+		a.elapsed_us,
+		"for n in list",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 21. Concurrent vs sequential (CPU-bound)
+-- ============================================================================
+-- Problem: Two independent computations.
+func work(n: Int) -> Int:
+	var total: Int = 0
+	for i in 0..n:
+		-- Dependent recurrence: keep optimized C from reducing this benchmark
+		-- to a closed-form sum while preserving deterministic CPU-bound work.
+		total = (total * 31 + i * i + i % 17) % 1000003
+	total
+
+
+func work_sequential(size: Int) -> Int:
+	work(size) + work(size + 1)
+
+
+func work_concurrent(size: Int) -> Int:
+	concurrent(max_threads: 2):
+		x = work(size)
+		y = work(size + 1)
+	match (x, y):
+		(Ok(a), Ok(b)): a + b
+		_: 0
+
+
+func bench_concurrent_vs_sequential() -> Void:
+	n: Int = 100
+
+	-- Warm the thread pool before timing steady-state task execution.
+	consume_int(work_concurrent(1000))
+	a: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		size: Int = 50000 + iter % 257
+		work_concurrent(size)
+	)
+	b: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		size: Int = 50000 + iter % 257
+		work_sequential(size)
+	)
+	print_comparison(
+		"Two work(50k..50.2k) calls",
+		"concurrent(2)",
+		a.elapsed_us,
+		"sequential",
+		b.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- 22. Parallel vs sequential list combinators
+-- ============================================================================
+-- Problem: Compare direct list combinators with scoped parallel pipelines.
+-- The callbacks do enough CPU work per element that the benchmark measures
+-- parallel execution instead of just thread-pool and materialization overhead.
+pure func parallel_cpu_work(seed: Int) -> Int:
+	var acc: Int = seed + 17
+	for i in 0..96:
+		acc = (acc * 1664525 + 1013904223 + seed + i * 97) % 1000003
+	acc
+
+
+pure func parallel_keep_work(seed: Int) -> Option[Int]:
+	value: Int = parallel_cpu_work(seed)
+	if value % 3 == 0:
+		Some(value)
+	else:
+		None
+
+
+func parallel_map_sequential(data: List[Int], offset: Int) -> Int:
+	values: List[Int] = map(data, pure func(x: Int): parallel_cpu_work(x + offset))
+	sum_list(values)
+
+
+func parallel_map_pipeline(data: List[Int], offset: Int) -> Int:
+	values: List[Int] = data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.map(pure func(x: Int): parallel_cpu_work(x + offset))
+	)
+	sum_list(values)
+
+
+func parallel_filter_sequential(data: List[Int], offset: Int) -> Int:
+	values: List[Int] = filter(data, pure func(x: Int): parallel_cpu_work(x + offset) % 5 == 0)
+	sum_list(values)
+
+
+func parallel_filter_pipeline(data: List[Int], offset: Int) -> Int:
+	values: List[Int] = data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter(pure func(x: Int): parallel_cpu_work(x + offset) % 5 == 0)
+	)
+	sum_list(values)
+
+
+func parallel_filter_map_sequential(data: List[Int], offset: Int) -> Int:
+	values: List[Int] = filter_map(data, pure func(x: Int) -> Option[Int]:
+		parallel_keep_work(x + offset)
+	)
+	sum_list(values)
+
+
+func parallel_filter_map_pipeline(data: List[Int], offset: Int) -> Int:
+	values: List[Int] = data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[Int]:
+			parallel_keep_work(x + offset)
+		)
+	)
+	sum_list(values)
+
+
+func parallel_chained_sequential(data: List[Int], offset: Int) -> Int:
+	kept: List[Int] = filter_map(data, pure func(x: Int) -> Option[Int]:
+		parallel_keep_work(x + offset)
+	)
+	values: List[Int] = map(kept, pure func(x: Int): parallel_cpu_work(x))
+	sum_list(values)
+
+
+func parallel_chained_pipeline(data: List[Int], offset: Int) -> Int:
+	values: List[Int] = data.parallel(pure func(chunk: ParallelList[Int]):
+		chunk.filter_map(pure func(x: Int) -> Option[Int]:
+			parallel_keep_work(x + offset)
+		).map(pure func(x: Int): parallel_cpu_work(x))
+	)
+	sum_list(values)
+
+
+func bench_parallel_list_combinators() -> Void:
+	data: List[Int] = range(0, 120000)
+	n: Int = 10
+	map_seq: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		parallel_map_sequential(data, iter % 31)
+	)
+	map_par: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		parallel_map_pipeline(data, iter % 31)
+	)
+	print_comparison(
+		"CPU-heavy List.map (120k elems)",
+		"map",
+		map_seq.elapsed_us,
+		"List.parallel + map",
+		map_par.elapsed_us,
+	)
+	filter_seq: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		parallel_filter_sequential(data, iter % 31)
+	)
+	filter_par: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		parallel_filter_pipeline(data, iter % 31)
+	)
+	print_comparison(
+		"CPU-heavy List.filter (120k elems)",
+		"filter",
+		filter_seq.elapsed_us,
+		"List.parallel + filter",
+		filter_par.elapsed_us,
+	)
+	fm_seq: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		parallel_filter_map_sequential(data, iter % 31)
+	)
+	fm_par: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		parallel_filter_map_pipeline(data, iter % 31)
+	)
+	print_comparison(
+		"CPU-heavy List.filter_map (120k elems)",
+		"filter_map",
+		fm_seq.elapsed_us,
+		"List.parallel + filter_map",
+		fm_par.elapsed_us,
+	)
+	pipe_seq: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		parallel_chained_sequential(data, iter % 31)
+	)
+	pipe_par: BenchmarkResult = bench_int(n, func(iter: Int) -> Int:
+		parallel_chained_pipeline(data, iter % 31)
+	)
+	print_comparison(
+		"CPU-heavy filter_map -> map (120k elems)",
+		"filter_map+map",
+		pipe_seq.elapsed_us,
+		"List.parallel + filter_map+map",
+		pipe_par.elapsed_us,
+	)
+
+
+-- ============================================================================
+-- Main
+-- ============================================================================
+func main(args: List[String]):
+	print("blorp Paradigm Benchmarks")
+	print("=========================")
+	print("Comparing programming styles on identical problems.")
+	print("Ratio < 1.0 means first is faster, > 1.0 means second is faster.")
+	print("")
+	bench_sum_sq_even()
+	bench_struct_vs_record()
+	bench_match_vs_if()
+	bench_tailrec_vs_while()
+	bench_pure_vs_impure()
+	bench_vector_vs_list()
+	bench_ufcs_vs_nested()
+	bench_record_update()
+	bench_build_list()
+	bench_forin_vs_fold()
+	bench_interp_vs_concat()
+	bench_string_build()
+	bench_option_chain()
+	bench_capture_vs_param()
+	bench_named_vs_lambda()
+	bench_return_types()
+	bench_dict_vs_match()
+	bench_recursive_vs_forin()
+	bench_many_small_vs_large()
+	bench_indexed_vs_forin()
+	bench_concurrent_vs_sequential()
+	bench_parallel_list_combinators()
+	print("Done.")

@@ -1,0 +1,139 @@
+import:
+	float: sqrt
+	tensor: get_or, set_index
+	vector: map_indexed_parallel
+
+
+-- Portable particle-sim-derived benchmark kernel.
+--
+-- This intentionally contains the general hot shapes we want optimizer work to
+-- improve: parallel indexed vector maps, pure callbacks capturing tensor data,
+-- value-struct result tensors, fixed local scratch vectors, tensor-of-struct
+-- field reads, and safe fallback tensor access.
+struct ParticleBenchNode {
+	bx: Float,
+	by: Float,
+	bz: Float,
+	hw: Float,
+	mx: Float,
+	my: Float,
+	mz: Float,
+	mass: Float,
+	children: Int,
+	pid: Int,
+}
+
+
+struct ParticleBenchAccel {x: Float, y: Float, z: Float}
+
+
+EMPTY_PARTICLE_BENCH_NODE: ParticleBenchNode = {
+	bx = 0.0,
+	by = 0.0,
+	bz = 0.0,
+	hw = 0.0,
+	mx = 0.0,
+	my = 0.0,
+	mz = 0.0,
+	mass = 0.0,
+	children = 0,
+	pid = 0,
+}
+
+ZERO_PARTICLE_BENCH_ACCEL: ParticleBenchAccel = {x = 0.0, y = 0.0, z = 0.0}
+
+
+pure func particle_tree_get(tree: ParticleBenchNode[#512], idx: Int) -> ParticleBenchNode:
+	get_or(tree, idx % 512, EMPTY_PARTICLE_BENCH_NODE)
+
+
+pure func particle_gravity_callback(
+	tree: ParticleBenchNode[#512],
+	particle_idx: Int,
+	alive_value: Float,
+) -> ParticleBenchAccel:
+	if alive_value > 0.5:
+		base_x: Float = to_float(particle_idx % 97) * 0.25
+		base_y: Float = to_float(particle_idx % 89) * 0.2
+		base_z: Float = to_float(particle_idx % 83) * 0.15
+		var stack = vector(0, 64)
+		stack[0] = particle_idx % 512
+		var sp: Int = 1
+		var steps: Int = 0
+		var ax: Float = 0.0
+		var ay: Float = 0.0
+		var az: Float = 0.0
+		while sp > 0 and steps < 24:
+			sp -= 1
+			node_idx: Int = get_or(stack, sp, 0)
+			node: ParticleBenchNode = particle_tree_get(tree, node_idx)
+			dx: Float = node.mx - base_x
+			dy: Float = node.my - base_y
+			dz: Float = node.mz - base_z
+			dist_sq: Float = dx * dx + dy * dy + dz * dz + 1.0
+			inv_dist: Float = 1.0 / sqrt(dist_sq)
+			force: Float = node.mass / dist_sq
+			ax += dx * inv_dist * force
+			ay += dy * inv_dist * force
+			az += dz * inv_dist * force
+			if node.children > 0 and sp < 62 and steps < 23:
+				match set_index(stack, sp, node.children):
+					Some(next_stack):
+						stack = next_stack
+						match set_index(stack, sp + 1, node.children + 1):
+							Some(next_next_stack):
+								stack = next_next_stack
+								sp += 2
+							None: void
+					None: void
+			steps += 1
+		{x = ax, y = ay, z = az}
+	else:
+		ZERO_PARTICLE_BENCH_ACCEL
+
+
+pure func build_particle_tree(seed: Int) -> (ParticleBenchNode[#512], Int):
+	var tree: ParticleBenchNode[#512] = vector(EMPTY_PARTICLE_BENCH_NODE, 512)
+	var i: Int = 0
+	while i < 512:
+		child_start: Int = if i < 96:
+			(i * 5 + seed) % 512
+		else:
+			0
+		node: ParticleBenchNode = {
+			bx = to_float(i % 29),
+			by = to_float((i + seed) % 31),
+			bz = to_float((i * 3 + seed) % 37),
+			hw = 1.0 + to_float(i % 7) * 0.25,
+			mx = to_float((i * 11 + seed) % 101) * 0.2,
+			my = to_float((i * 13 + seed) % 103) * 0.18,
+			mz = to_float((i * 17 + seed) % 107) * 0.16,
+			mass = to_float((i + seed) % 9 + 1),
+			children = child_start,
+			pid = i + 1,
+		}
+		match set_index(tree, i, node):
+			Some(next_tree): tree = next_tree
+			None: void
+		i += 1
+	(tree, 512)
+
+
+pure func run_particle_gravity_kernel[#N](
+	frames: Int,
+	n: #N,
+	tree: ParticleBenchNode[#512],
+	alive: Float[#N],
+) -> Float:
+	var acc: ParticleBenchAccel[#N] = vector(ZERO_PARTICLE_BENCH_ACCEL, n)
+	var checksum: Float = 0.0
+	var frame: Int = 0
+	while frame < frames:
+		frame_snapshot: Int = frame
+		compute: pure (Int, Float) -> ParticleBenchAccel = pure func(i: Int, value: Float):
+			particle_gravity_callback(tree, i + frame_snapshot, value)
+		acc = map_indexed_parallel(alive, compute)
+		sample: ParticleBenchAccel = get_or(acc, frame % n, ZERO_PARTICLE_BENCH_ACCEL)
+		checksum += sample.x + sample.y * 0.5 + sample.z * 0.25
+		frame += 1
+	checksum
