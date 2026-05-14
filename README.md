@@ -60,7 +60,7 @@ func main(args: List[String]) -> Void:
     
     scores
         -- method-call syntax is available for a function's first argument:
-        -- scores.grade is the same as grade(scores)
+        -- scores.grade() is the same as grade(scores)
         .grade()
         .describe_score()
         .print()
