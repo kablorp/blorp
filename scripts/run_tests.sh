@@ -48,6 +48,13 @@ done
 suite_pids=()
 suite_names=()
 suite_tmpdir=""
+dune_tmpdir=""
+
+if [ -z "${DUNE_BUILD_DIR:-}" ]; then
+    mkdir -p compiler/_build
+    dune_tmpdir=$(mktemp -d "$PWD/compiler/_build/isolated.XXXXXX") || exit 1
+    export DUNE_BUILD_DIR="$dune_tmpdir"
+fi
 
 list_child_pids() {
     local parent="$1"
@@ -84,6 +91,14 @@ cleanup_suite_tmpdir() {
     fi
 }
 
+cleanup_tmpdirs() {
+    cleanup_suite_tmpdir
+    if [ -n "$dune_tmpdir" ]; then
+        rm -rf "$dune_tmpdir"
+        dune_tmpdir=""
+    fi
+}
+
 terminate_parallel_suites() {
     local pid
     if [ ${#suite_pids[@]} -gt 0 ]; then
@@ -105,12 +120,12 @@ on_interrupt() {
     echo "Interrupted; terminating test suites..." >&2
     trap - INT TERM EXIT
     terminate_parallel_suites
-    cleanup_suite_tmpdir
+    cleanup_tmpdirs
     exit 130
 }
 
 trap on_interrupt INT TERM
-trap cleanup_suite_tmpdir EXIT
+trap cleanup_tmpdirs EXIT
 
 # Ensure compiler is built. If the rebuild fails, stop here; continuing with a
 # stale ./blorp is worse than not running tests because it can hide strict

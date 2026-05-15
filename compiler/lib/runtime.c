@@ -9750,6 +9750,26 @@ blorp_Result* blorp_tcp_set_reuse_addr(long fd) {
     return blorp_result_ok((void*)0L);
 }
 
+blorp_Result* blorp_tcp_local_port(long fd) {
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname((int)fd, (struct sockaddr*)&addr, &addr_len) < 0) {
+        return tcp_error("tcp local_port");
+    }
+
+    switch (addr.ss_family) {
+        case AF_INET:
+            return blorp_result_ok(
+                (void*)(long)ntohs(((struct sockaddr_in*)&addr)->sin_port));
+        case AF_INET6:
+            return blorp_result_ok(
+                (void*)(long)ntohs(((struct sockaddr_in6*)&addr)->sin6_port));
+        default:
+            return blorp_result_err((void*)blorp_string_literal(
+                "tcp local_port: unsupported address family"));
+    }
+}
+
 blorp_Result* blorp_tcp_set_timeout(long fd, long ms) {
     struct timeval tv;
     tv.tv_sec = ms / 1000;

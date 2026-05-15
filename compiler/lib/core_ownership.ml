@@ -649,6 +649,22 @@ let builtin_contract_table =
       builtins
         [ "blorp_print"; "blorp_puts"; "blorp_println"; "blorp_eprintln" ]
         (bfixed [ Borrow ] ReturnVoid);
+      (* TCP currently uses raw file-descriptor integers. Runtime calls borrow
+         managed arguments such as host strings and byte buffers; owned
+         Result wrappers are returned to the caller. *)
+      builtins [ "blorp_tcp_listen" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_accept" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_connect" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_read" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_write" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_close" ] (bfixed [ Borrow ] ReturnVoid);
+      builtins
+        [ "blorp_tcp_set_reuse_addr"; "blorp_tcp_local_port" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_tcp_set_timeout" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_string_concat" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
         [ "blorp_string_concat_consume" ]

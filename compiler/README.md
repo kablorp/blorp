@@ -22,6 +22,10 @@ cd compiler && dune build
 
 # Run the fast compiler-focused suites
 scripts/run_tests.sh unit compiler
+
+# Build or test in an isolated Dune directory
+make isolated-build
+make isolated-test SUITES="unit compiler"
 ```
 
 ## Directory Structure
@@ -86,6 +90,9 @@ cd compiler && dune build @check
 
 # Run OCaml unit tests
 cd compiler && dune runtest
+
+# From project root, run unit coverage in a unique report directory
+make coverage
 ```
 
 The default runtime is maintained as C source in `compiler/lib/runtime.c` with

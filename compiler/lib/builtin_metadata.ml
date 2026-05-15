@@ -3,7 +3,16 @@
     Keep semantic facts here instead of scattering name sets through compiler
     phases. Unknown names are treated as ordinary user/module functions. *)
 
-type builtin_effect = Impure | Parallel_boundary
+type wait_effect = No_wait | May_park_fiber | May_block_thread
+type cancellation_effect = Not_cancellation_point | Cancellation_point
+
+type impure_call_effect = {
+  wait : wait_effect;
+  cancellation : cancellation_effect;
+}
+
+type call_effect = Pure | Impure of impure_call_effect
+type builtin_effect = Impure_call | Parallel_boundary
 
 type special_inference =
   | Checked_get
@@ -23,6 +32,7 @@ type special_inference =
   | Bitwise
 
 type capability =
+  | Call_effect of call_effect
   | Effect of builtin_effect
   | Special_inference of special_inference
 
@@ -34,117 +44,152 @@ let descriptor name capabilities =
       invalid_arg ("Builtin_metadata.descriptor: " ^ name ^ " has no behavior")
   | _ -> { name; capabilities }
 
-let effects name effects =
-  descriptor name (List.map (fun e -> Effect e) effects)
+let call_effect name call_effect = descriptor name [ Call_effect call_effect ]
+
+let impure_call ~wait ~cancellation name =
+  call_effect name (Impure { wait; cancellation })
+
+let impure_no_wait name =
+  impure_call ~wait:No_wait ~cancellation:Not_cancellation_point name
+
+let impure_may_park name =
+  impure_call ~wait:May_park_fiber ~cancellation:Cancellation_point name
+
+let impure_may_block_thread name =
+  impure_call ~wait:May_block_thread ~cancellation:Not_cancellation_point name
+
+let parallel_boundary name = descriptor name [ Effect Parallel_boundary ]
 
 let special name special_inference =
   descriptor name [ Special_inference special_inference ]
 
-let descriptors =
+let impure_no_wait_names =
   [
-    effects "print" [ Impure ];
-    effects "puts" [ Impure ];
-    effects "println" [ Impure ];
-    effects "eprintln" [ Impure ];
-    effects "read_file" [ Impure ];
-    effects "write_file" [ Impure ];
-    effects "read_bytes" [ Impure ];
-    effects "write_bytes" [ Impure ];
-    effects "file_exists" [ Impure ];
-    effects "list_dir" [ Impure ];
-    effects "is_directory" [ Impure ];
-    effects "exec" [ Impure ];
-    effects "read_line" [ Impure ];
-    effects "read_line_opt" [ Impure ];
-    effects "read_line_or_empty" [ Impure ];
-    effects "read_all" [ Impure ];
-    effects "input" [ Impure ];
-    effects "input_opt" [ Impure ];
-    effects "input_or_empty" [ Impure ];
-    effects "seed_random" [ Impure ];
-    effects "random_int" [ Impure ];
-    effects "random_float" [ Impure ];
-    effects "read_all_lines" [ Impure ];
-    effects "write_lines" [ Impure ];
-    effects "append_file" [ Impure ];
-    effects "for_each_line" [ Impure ];
-    effects "getcwd" [ Impure ];
-    effects "mkdir" [ Impure ];
-    effects "remove_file" [ Impure ];
-    effects "remove_dir" [ Impure ];
-    effects "rename" [ Impure ];
-    effects "exec_output" [ Impure ];
-    effects "now" [ Impure ];
-    effects "now_us" [ Impure ];
-    effects "sleep" [ Impure ];
-    effects "channel" [ Impure ];
-    effects "send" [ Impure ];
-    effects "recv" [ Impure ];
-    effects "try_send" [ Impure ];
-    effects "try_recv" [ Impure ];
-    effects "close" [ Impure ];
-    effects "send_timeout" [ Impure ];
-    effects "recv_timeout" [ Impure ];
-    effects "getenv" [ Impure ];
-    effects "setenv" [ Impure ];
-    effects "init_window" [ Impure ];
-    effects "close_window" [ Impure ];
-    effects "window_should_close" [ Impure ];
-    effects "set_target_fps" [ Impure ];
-    effects "get_fps" [ Impure ];
-    effects "begin_drawing" [ Impure ];
-    effects "end_drawing" [ Impure ];
-    effects "clear_background" [ Impure ];
-    effects "draw_rectangle" [ Impure ];
-    effects "draw_rectangle_rec" [ Impure ];
-    effects "draw_circle" [ Impure ];
-    effects "draw_line" [ Impure ];
-    effects "draw_text" [ Impure ];
-    effects "is_key_pressed" [ Impure ];
-    effects "is_key_down" [ Impure ];
-    effects "get_mouse_x" [ Impure ];
-    effects "get_mouse_y" [ Impure ];
-    effects "is_mouse_button_pressed" [ Impure ];
-    effects "is_mouse_button_down" [ Impure ];
-    effects "get_frame_time" [ Impure ];
-    effects "get_time" [ Impure ];
-    effects "parallel" [ Parallel_boundary ];
-    effects "map_parallel" [ Parallel_boundary ];
-    effects "map_indexed_parallel" [ Parallel_boundary ];
-    effects "fold_parallel" [ Parallel_boundary ];
-    effects "zip_parallel" [ Parallel_boundary ];
-    effects "map_parallel_with" [ Parallel_boundary ];
-    effects "map_indexed_parallel_with" [ Parallel_boundary ];
-    effects "fold_parallel_with" [ Parallel_boundary ];
-    effects "zip_parallel_with" [ Parallel_boundary ];
-    special "checked_get" Checked_get;
-    special "checked_set" Checked_set;
-    special "checked_slice" Checked_slice;
-    special "matrix_checked_get" Matrix_checked_get;
-    special "matrix_checked_set" Matrix_checked_set;
-    special "tensor3_checked_get" (Tensor_checked_get 3);
-    special "tensor4_checked_get" (Tensor_checked_get 4);
-    special "tensor5_checked_get" (Tensor_checked_get 5);
-    special "tensor3_checked_set" (Tensor_checked_set 3);
-    special "tensor4_checked_set" (Tensor_checked_set 4);
-    special "tensor5_checked_set" (Tensor_checked_set 5);
-    special "assert_shape" Assert_shape;
-    special "length" Length_refined;
-    special "vector_length" Length_refined;
-    special "type_name" Type_name;
-    special "is_heap" Is_heap;
-    special "vector" Vector_ctor;
-    special "matrix" Matrix_ctor;
-    special "tensor3" (Tensor_ctor 3);
-    special "tensor4" (Tensor_ctor 4);
-    special "tensor5" (Tensor_ctor 5);
-    special "bit_and" Bitwise;
-    special "bit_or" Bitwise;
-    special "bit_xor" Bitwise;
-    special "bit_not" Bitwise;
-    special "shift_left" Bitwise;
-    special "shift_right" Bitwise;
+    "print";
+    "puts";
+    "println";
+    "eprintln";
+    "seed_random";
+    "random_int";
+    "random_float";
+    "now";
+    "now_us";
+    "channel";
+    "try_send";
+    "try_recv";
+    "close";
+    "getenv";
+    "setenv";
+    "init_window";
+    "close_window";
+    "window_should_close";
+    "set_target_fps";
+    "get_fps";
+    "begin_drawing";
+    "end_drawing";
+    "clear_background";
+    "draw_rectangle";
+    "draw_rectangle_rec";
+    "draw_circle";
+    "draw_line";
+    "draw_text";
+    "is_key_pressed";
+    "is_key_down";
+    "get_mouse_x";
+    "get_mouse_y";
+    "is_mouse_button_pressed";
+    "is_mouse_button_down";
+    "get_frame_time";
+    "get_time";
+    "set_reuse_addr";
+    "local_port";
   ]
+
+let impure_may_park_names =
+  [ "sleep"; "send"; "recv"; "send_timeout"; "recv_timeout" ]
+
+let impure_may_block_thread_names =
+  [
+    "read_file";
+    "write_file";
+    "read_bytes";
+    "write_bytes";
+    "file_exists";
+    "list_dir";
+    "is_directory";
+    "exec";
+    "exec_output";
+    "read_line";
+    "read_line_opt";
+    "read_line_or_empty";
+    "read_all";
+    "input";
+    "input_opt";
+    "input_or_empty";
+    "read_all_lines";
+    "write_lines";
+    "append_file";
+    "for_each_line";
+    "getcwd";
+    "mkdir";
+    "remove_file";
+    "remove_dir";
+    "rename";
+    "listen";
+    "accept";
+    "connect";
+    "read";
+    "write";
+    "set_timeout";
+  ]
+
+let parallel_boundary_names =
+  [
+    "parallel";
+    "map_parallel";
+    "map_indexed_parallel";
+    "fold_parallel";
+    "zip_parallel";
+    "map_parallel_with";
+    "map_indexed_parallel_with";
+    "fold_parallel_with";
+    "zip_parallel_with";
+  ]
+
+let descriptors =
+  List.map impure_no_wait impure_no_wait_names
+  @ List.map impure_may_park impure_may_park_names
+  @ List.map impure_may_block_thread impure_may_block_thread_names
+  @ List.map parallel_boundary parallel_boundary_names
+  @ [
+      special "checked_get" Checked_get;
+      special "checked_set" Checked_set;
+      special "checked_slice" Checked_slice;
+      special "matrix_checked_get" Matrix_checked_get;
+      special "matrix_checked_set" Matrix_checked_set;
+      special "tensor3_checked_get" (Tensor_checked_get 3);
+      special "tensor4_checked_get" (Tensor_checked_get 4);
+      special "tensor5_checked_get" (Tensor_checked_get 5);
+      special "tensor3_checked_set" (Tensor_checked_set 3);
+      special "tensor4_checked_set" (Tensor_checked_set 4);
+      special "tensor5_checked_set" (Tensor_checked_set 5);
+      special "assert_shape" Assert_shape;
+      special "length" Length_refined;
+      special "vector_length" Length_refined;
+      special "type_name" Type_name;
+      special "is_heap" Is_heap;
+      special "vector" Vector_ctor;
+      special "matrix" Matrix_ctor;
+      special "tensor3" (Tensor_ctor 3);
+      special "tensor4" (Tensor_ctor 4);
+      special "tensor5" (Tensor_ctor 5);
+      special "bit_and" Bitwise;
+      special "bit_or" Bitwise;
+      special "bit_xor" Bitwise;
+      special "bit_not" Bitwise;
+      special "shift_left" Bitwise;
+      special "shift_right" Bitwise;
+    ]
 
 module StringMap = Map.Make (String)
 module StringSet = Set.Make (String)
@@ -179,16 +224,32 @@ let registry =
 let find name = StringMap.find_opt name registry
 let is_registered name = Option.is_some (find name)
 
-let has_effect name builtin_effect =
+let call_effect name =
   match find name with
   | Some d ->
-      List.exists
+      List.find_map
         (function
-          | Effect e -> e = builtin_effect | Special_inference _ -> false)
+          | Call_effect call_effect -> Some call_effect
+          | Effect _ | Special_inference _ -> None)
         d.capabilities
-  | None -> false
+  | None -> None
 
-let is_impure name = has_effect name Impure
+let has_effect name builtin_effect =
+  match builtin_effect with
+  | Impure_call -> (
+      match call_effect name with Some (Impure _) -> true | _ -> false)
+  | Parallel_boundary -> (
+      match find name with
+      | Some d ->
+          List.exists
+            (function
+              | Effect Parallel_boundary -> true
+              | Effect Impure_call | Call_effect _ | Special_inference _ ->
+                  false)
+            d.capabilities
+      | None -> false)
+
+let is_impure name = has_effect name Impure_call
 let is_parallel_boundary name = has_effect name Parallel_boundary
 
 let special_inference name =
@@ -197,6 +258,6 @@ let special_inference name =
       List.find_map
         (function
           | Special_inference special_inference -> Some special_inference
-          | Effect _ -> None)
+          | Call_effect _ | Effect _ -> None)
         d.capabilities
   | None -> None

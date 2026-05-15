@@ -78,6 +78,30 @@ let removed_compile_option flag replacement =
   Printf.eprintf "Error: '%s' has been removed; use '%s'.\n" flag replacement;
   exit 1
 
+let write_file_atomic filename contents =
+  let dir = Filename.dirname filename in
+  let base = Filename.basename filename in
+  let mode = try (Unix.stat filename).Unix.st_perm with _ -> 0o644 in
+  let tmp, oc =
+    Filename.open_temp_file ~temp_dir:dir ("." ^ base ^ ".") ".tmp"
+  in
+  let closed = ref false in
+  let close () =
+    if not !closed then begin
+      closed := true;
+      close_out oc
+    end
+  in
+  try
+    output_string oc contents;
+    close ();
+    Unix.chmod tmp mode;
+    Unix.rename tmp filename
+  with exn ->
+    if not !closed then close_out_noerr oc;
+    (try Sys.remove tmp with _ -> ());
+    raise exn
+
 (** Auto-format a .brp file in place before compilation.
     Uses the format cache to skip already-formatted files.
     Does NOT format std library files. *)
@@ -248,9 +272,7 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
               let doc = Fmt_printer.print_program new_program in
               let formatted = Fmt_layout.layout doc in
 
-              let oc = open_out filename in
-              output_string oc formatted;
-              close_out oc;
+              write_file_atomic filename formatted;
 
               iterate (count + 1)
             end
@@ -475,10 +497,7 @@ let compile_file_with_opts opts filename =
               let c_file =
                 match opts.output with Some o -> o | None -> base ^ ".c"
               in
-              let oc = open_out c_file in
-              Fun.protect
-                ~finally:(fun () -> close_out oc)
-                (fun () -> output_string oc c_code);
+              write_file_atomic c_file c_code;
               Printf.printf "Generated %s\n" c_file;
               0
         in

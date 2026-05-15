@@ -200,7 +200,7 @@ compile_blorp() {
     fi
     (
         cd "$PROJECT_DIR"
-        "$BLORP" compile "$bench_src" >/dev/null
+        "$BLORP" compile -o "$bench_c" "$bench_src" >/dev/null
     )
     [ -f "$bench_c" ] || return 1
 

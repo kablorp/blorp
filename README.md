@@ -298,6 +298,15 @@ Useful commands:
 ./blorp repl
 ```
 
+When running multiple local jobs against the same checkout, use the isolated
+targets so Dune state stays per run:
+
+```bash
+make isolated-build
+make isolated-test SUITES="unit compiler"
+make coverage
+```
+
 ## Documentation
 
 | Document | Description |

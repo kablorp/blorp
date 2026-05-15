@@ -148,30 +148,36 @@ run_case() {
     local failed max_line_expect max_actual expect_c_lines expect_not_c_lines
 
     test_name="$(basename "$brp")"
-    c_file="${brp%.brp}.c"
+    c_file=$(mktemp "$RESULT_DIR/${test_name%.brp}.XXXXXX.c") || {
+        echo "FAIL: $test_name (could not create temp C output)"
+        return 0
+    }
     rm -f "$c_file"
 
     # Compile to C
     set +e
-    compile_output=$(run_with_timeout "$BLORP" compile --no-format --no-embed-runtime "$brp")
+    compile_output=$(run_with_timeout "$BLORP" compile --no-format --no-embed-runtime -o "$c_file" "$brp")
     compile_exit=$?
     set -e
     if [ "$compile_exit" -eq 124 ]; then
         echo "FAIL: $test_name (blorp compile timed out after ${TEST_TIMEOUT}s)"
+        rm -f "$c_file"
         return 0
     elif [ "$compile_exit" -ne 0 ]; then
         echo "FAIL: $test_name (blorp compile failed)"
         echo "$compile_output" | head -10 | sed 's/^/  /'
+        rm -f "$c_file"
         return 0
     fi
 
     if [ ! -f "$c_file" ]; then
         echo "FAIL: $test_name (no .c generated)"
+        rm -f "$c_file"
         return 0
     fi
 
     set +e
-    cc_output=$(run_with_timeout cc "${CC_WARNING_FLAGS[@]}" -include "$RUNTIME_DECL" "$c_file")
+    cc_output=$(run_with_timeout cc "${CC_WARNING_FLAGS[@]}" -I "$(dirname "$brp")" -include "$RUNTIME_DECL" "$c_file")
     cc_exit=$?
     set -e
     if [ "$cc_exit" -eq 124 ]; then

@@ -176,27 +176,81 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
   let open Blorp.Builtin_metadata in
   List.iter
     (fun name ->
-      Alcotest.(check bool) (name ^ " is impure") true (has_effect name Impure))
+      Alcotest.(check bool) (name ^ " is impure") true (is_impure name))
     [ "print"; "read_file"; "write_file"; "getenv"; "send_timeout" ];
   List.iter
     (fun name ->
-      Alcotest.(check bool)
-        (name ^ " is not impure") false (has_effect name Impure))
+      Alcotest.(check bool) (name ^ " is not impure") false (is_impure name))
     [ "length"; "to_string"; "map" ];
   List.iter
     (fun name ->
       Alcotest.(check bool)
         (name ^ " is a parallel boundary")
         true
-        (has_effect name Parallel_boundary))
+        (is_parallel_boundary name))
     [ "parallel"; "map_parallel"; "zip_parallel_with" ];
   List.iter
     (fun name ->
       Alcotest.(check bool)
         (name ^ " is not a parallel boundary")
         false
-        (has_effect name Parallel_boundary))
+        (is_parallel_boundary name))
     [ "map"; "print"; "length" ]
+
+let test_builtin_call_effect_metadata_distinguishes_waiting_modes () =
+  let open Blorp.Builtin_metadata in
+  let pp_wait fmt = function
+    | No_wait -> Format.pp_print_string fmt "No_wait"
+    | May_park_fiber -> Format.pp_print_string fmt "May_park_fiber"
+    | May_block_thread -> Format.pp_print_string fmt "May_block_thread"
+  in
+  let pp_cancel fmt = function
+    | Not_cancellation_point ->
+        Format.pp_print_string fmt "Not_cancellation_point"
+    | Cancellation_point -> Format.pp_print_string fmt "Cancellation_point"
+  in
+  let pp_impure fmt { wait; cancellation } =
+    Format.fprintf fmt "{ wait = %a; cancellation = %a }" pp_wait wait pp_cancel
+      cancellation
+  in
+  let pp_call_effect fmt = function
+    | Pure -> Format.pp_print_string fmt "Pure"
+    | Impure impure -> Format.fprintf fmt "Impure %a" pp_impure impure
+  in
+  let call_effect_testable = Alcotest.testable pp_call_effect ( = ) in
+  let impure_no_wait =
+    Some (Impure { wait = No_wait; cancellation = Not_cancellation_point })
+  in
+  let impure_may_park =
+    Some (Impure { wait = May_park_fiber; cancellation = Cancellation_point })
+  in
+  let impure_may_block =
+    Some
+      (Impure { wait = May_block_thread; cancellation = Not_cancellation_point })
+  in
+  Alcotest.(check (option call_effect_testable))
+    "print is impure but does not park" impure_no_wait (call_effect "print");
+  Alcotest.(check (option call_effect_testable))
+    "sleep parks the current fiber" impure_may_park (call_effect "sleep");
+  Alcotest.(check (option call_effect_testable))
+    "recv can park the current fiber" impure_may_park (call_effect "recv");
+  Alcotest.(check (option call_effect_testable))
+    "try_recv is impure but does not park" impure_no_wait
+    (call_effect "try_recv");
+  List.iter
+    (fun name ->
+      Alcotest.(check (option call_effect_testable))
+        (name ^ " is impure but does not park")
+        impure_no_wait (call_effect name))
+    [ "close"; "set_reuse_addr"; "local_port" ];
+  List.iter
+    (fun name ->
+      Alcotest.(check (option call_effect_testable))
+        (name ^ " currently blocks an OS thread")
+        impure_may_block (call_effect name))
+    [ "listen"; "accept"; "connect"; "read"; "write"; "set_timeout" ];
+  Alcotest.(check (option call_effect_testable))
+    "parallel boundary is not a call effect" None (call_effect "parallel")
 
 let test_type_metadata_classifies_typechecker_policy () =
   let open Blorp in
@@ -1094,6 +1148,9 @@ let suite =
           test_exception_list_not_stale;
         Alcotest.test_case "builtin effect metadata classifies typechecker sets"
           `Quick test_builtin_effect_metadata_classifies_typechecker_sets;
+        Alcotest.test_case
+          "builtin call-effect metadata distinguishes waiting modes" `Quick
+          test_builtin_call_effect_metadata_distinguishes_waiting_modes;
         Alcotest.test_case "type metadata classifies typechecker policy" `Quick
           test_type_metadata_classifies_typechecker_policy;
         Alcotest.test_case

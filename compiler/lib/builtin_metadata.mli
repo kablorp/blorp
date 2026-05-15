@@ -1,7 +1,16 @@
 (** Explicit metadata for builtins whose compiler behavior cannot be inferred
     from their source signature alone. *)
 
-type builtin_effect = Impure | Parallel_boundary
+type wait_effect = No_wait | May_park_fiber | May_block_thread
+type cancellation_effect = Not_cancellation_point | Cancellation_point
+
+type impure_call_effect = {
+  wait : wait_effect;
+  cancellation : cancellation_effect;
+}
+
+type call_effect = Pure | Impure of impure_call_effect
+type builtin_effect = Impure_call | Parallel_boundary
 
 type special_inference =
   | Checked_get
@@ -23,6 +32,7 @@ type special_inference =
 val duplicate_names : string list
 val inert_descriptor_names : string list
 val is_registered : string -> bool
+val call_effect : string -> call_effect option
 val has_effect : string -> builtin_effect -> bool
 val is_impure : string -> bool
 val is_parallel_boundary : string -> bool

@@ -382,6 +382,7 @@ let builtin_c_mapping =
         "write";
         "close";
         "set_reuse_addr";
+        "local_port";
         "set_timeout";
       ]
   @

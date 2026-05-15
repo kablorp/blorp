@@ -1316,6 +1316,7 @@ blorp_Result* blorp_tcp_read(long fd, long max_bytes);
 blorp_Result* blorp_tcp_write(long fd, blorp_Bytes* data);
 void blorp_tcp_close(long fd);
 blorp_Result* blorp_tcp_set_reuse_addr(long fd);
+blorp_Result* blorp_tcp_local_port(long fd);
 blorp_Result* blorp_tcp_set_timeout(long fd, long ms);
 
 // Dict
