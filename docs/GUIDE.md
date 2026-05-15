@@ -949,6 +949,28 @@ type alias StringMap[V] = Dict[String, V]
 type alias Row[T, #N] = T[#N]
 ```
 
+Type aliases are transparent: `IntPair` and `(Int, Int)` are the same type.
+
+### New Types
+
+Use `new type` when you want a distinct type with the same runtime
+representation as another type:
+
+```blorp
+new type UserId = String
+
+pure func make_user_id(raw: String) -> UserId:
+	UserId(raw)
+
+pure func user_id_length(id: UserId) -> Int:
+	id.value().length()
+```
+
+`UserId` is not interchangeable with `String` during type checking. Wrap with
+`UserId(raw)` to construct one, and use `id.value()` to recover the underlying
+`String`. After type checking, newtypes erase to their representation type, so
+they do not add a runtime wrapper.
+
 ### Generics
 
 ```blorp
@@ -3287,7 +3309,7 @@ Both extensions provide:
 
 ```
 func       pure       var        union      enum       record     struct     trait
-type       alias      private    import     as         implements
+type       alias      new        private    import     as         implements
 Self       builtin    match      while      for        in         if         else
 and        or         not        True       False      try        void
 break      continue   foreign    concurrent detach     where

@@ -91,6 +91,7 @@ type symbol_kind =
       is_value : bool;
     }
   | AliasSymbol of { type_params : string list; target : type_expr }
+  | NewTypeSymbol of { type_params : string list; target : type_expr }
   | ConstructorSymbol of {
       parent_type : string;
       type_params : string list;
@@ -277,6 +278,9 @@ val is_value_record : env -> string -> bool
 val add_alias : env -> string -> string list -> type_expr -> env
 (** Add a type alias to the environment *)
 
+val add_new_type : env -> string -> string list -> type_expr -> env
+(** Add a nominal newtype to the environment *)
+
 val get_var_type : env -> string -> type_expr option
 (** Get the type of a variable *)
 
@@ -328,6 +332,20 @@ val find_records_with_fields : env -> string list -> string list
 
 val get_alias : env -> string -> (string list * type_expr) option
 (** Get a type alias: (type_params, target) *)
+
+val get_new_type : env -> string -> (string list * type_expr) option
+(** Get a nominal newtype: (type_params, underlying target) *)
+
+val get_new_type_constructor :
+  env -> string -> (string * string list * type_expr) option
+(** Resolve a constructor name to a newtype identity and target. The name may be
+    an imported type-name alias for a canonical newtype. *)
+
+val new_type_underlying : env -> type_expr -> type_expr option
+(** Return the underlying type when the input is a concrete newtype instance. *)
+
+val erase_new_types : env -> type_expr -> type_expr
+(** Erase nominal newtype wrappers from a type after frontend typechecking. *)
 
 val disambiguate_nominal_dim_application : env -> type_expr -> type_expr
 (** Reinterpret parser-produced [Name[#N]] array suffix syntax as nominal type

@@ -1326,6 +1326,26 @@ let default_arg_slot_for_param param_ty arg_ty =
 let default_arg_type_for_param param_ty arg_ty =
   Type_widening.value_type (default_arg_slot_for_param param_ty arg_ty)
 
+let new_type_conversion_hint env ~expected ~actual =
+  let type_params = Env.get_type_params env in
+  match
+    (Env.new_type_underlying env expected, Env.new_type_underlying env actual)
+  with
+  | Some underlying, _ when types_compatible ~type_params underlying actual ->
+      Some
+        (Printf.sprintf "wrap the value with %s(...)"
+           (Types.type_to_string expected))
+  | _, Some underlying when types_compatible ~type_params expected underlying ->
+      Some
+        (Printf.sprintf "use value() to unwrap %s"
+           (Types.type_to_string actual))
+  | _ -> None
+
+let append_new_type_conversion_hint env message ~expected ~actual =
+  match new_type_conversion_hint env ~expected ~actual with
+  | None -> message
+  | Some hint -> message ^ "\n    help: " ^ hint
+
 let common_inferred_type ~type_params left right =
   if types_compatible ~type_params left right then Some left
   else if types_compatible ~type_params right left then Some right
@@ -3783,7 +3803,9 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       | Some { kind = ConstructorSymbol _; _ } ->
           error loc (Printf.sprintf "Cannot assign to constructor '%s'" var)
       | Some { kind = AliasSymbol _; _ } ->
-          error loc (Printf.sprintf "Cannot assign to type alias '%s'" var))
+          error loc (Printf.sprintf "Cannot assign to type alias '%s'" var)
+      | Some { kind = NewTypeSymbol _; _ } ->
+          error loc (Printf.sprintf "Cannot assign to new type '%s'" var))
   (* Variable declaration *)
   | EVarDecl (name, ty_opt, value, is_mutable) -> (
       (* Reject same-scope re-declaration *)
@@ -5768,6 +5790,66 @@ and reject_debug_only_callee ctx callee =
 
 and infer_call ctx expr callee args loc =
   let* () = reject_debug_only_callee ctx callee in
+  let infer_new_type_constructor name =
+    match Env.get_new_type_constructor ctx.env name with
+    | None -> None
+    | Some (resolved_name, type_params, target_ty) ->
+        let result =
+          match args with
+          | [ arg ] ->
+              let* arg_ty, arg' =
+                infer_expected_argument_expr ctx target_ty arg
+              in
+              let target_ty_r =
+                normalize_type ctx ArgumentCompatibility target_ty
+              in
+              let arg_ty_r =
+                normalize_type ctx ArgumentCompatibility
+                  (expr_value_type_or arg' arg_ty)
+              in
+              if types_compatible ~type_params target_ty_r arg_ty_r then
+                let subst = build_subst ~type_params target_ty_r arg_ty_r in
+                let args =
+                  List.map
+                    (fun param -> apply_subst subst (TyVar param))
+                    type_params
+                in
+                let ret_ty = TyNamed (resolved_name, args) in
+                Ok (ret_ty, with_inferred_type arg' ret_ty)
+              else
+                let message =
+                  Printf.sprintf
+                    "Argument type mismatch: in call to '%s', argument 1 \
+                     expected %s, got %s"
+                    name
+                    (type_to_string target_ty_r)
+                    (type_to_string arg_ty_r)
+                in
+                error arg.expr_loc message
+          | _ ->
+              error loc
+                (Printf.sprintf
+                   "new type constructor '%s' expects 1 argument, got %d" name
+                   (List.length args))
+        in
+        Some result
+  in
+  match callee.expr_desc with
+  | EIdent name -> (
+      match infer_new_type_constructor name with
+      | Some result -> result
+      | None -> infer_call_after_new_type ctx expr callee args loc)
+  | EFieldAccess (obj, "value") when args = [] -> (
+      match infer_unconstrained_value_expr ctx obj with
+      | Ok (obj_ty, obj') -> (
+          match Env.new_type_underlying ctx.env obj_ty with
+          | Some underlying ->
+              Ok (underlying, with_inferred_type obj' underlying)
+          | None -> infer_call_after_new_type ctx expr callee args loc)
+      | Error _ -> infer_call_after_new_type ctx expr callee args loc)
+  | _ -> infer_call_after_new_type ctx expr callee args loc
+
+and infer_call_after_new_type ctx expr callee args loc =
   (* Builtin inference dispatch — registry shape (Phase 5.2, 2026-04-21).
      [dispatch_builtin_inference] returns [Some result] when [name] is a
      recognized builtin (and [Env.is_builtin_func] confirms the user hasn't
@@ -6946,22 +7028,30 @@ and infer_call ctx expr callee args loc =
                                 in
                                 match callee_name with
                                 | Some n ->
-                                    error arg.expr_loc
-                                      (Printf.sprintf
-                                         "Argument type mismatch: in call to \
-                                          '%s', argument %d%s expected %s, got \
-                                          %s"
-                                         n arg_pos param_name_hint
-                                         (type_to_string param_ty_r)
-                                         (type_to_string arg_ty_r))
+                                    let message =
+                                      Printf.sprintf
+                                        "Argument type mismatch: in call to \
+                                         '%s', argument %d%s expected %s, got \
+                                         %s"
+                                        n arg_pos param_name_hint
+                                        (type_to_string param_ty_r)
+                                        (type_to_string arg_ty_r)
+                                      |> append_new_type_conversion_hint ctx.env
+                                           ~expected:param_ty_r ~actual:arg_ty_r
+                                    in
+                                    error arg.expr_loc message
                                 | None ->
-                                    error arg.expr_loc
-                                      (Printf.sprintf
-                                         "Argument type mismatch: argument \
-                                          %d%s expected %s, got %s"
-                                         arg_pos param_name_hint
-                                         (type_to_string param_ty_r)
-                                         (type_to_string arg_ty_r)))))
+                                    let message =
+                                      Printf.sprintf
+                                        "Argument type mismatch: argument %d%s \
+                                         expected %s, got %s"
+                                        arg_pos param_name_hint
+                                        (type_to_string param_ty_r)
+                                        (type_to_string arg_ty_r)
+                                      |> append_new_type_conversion_hint ctx.env
+                                           ~expected:param_ty_r ~actual:arg_ty_r
+                                    in
+                                    error arg.expr_loc message)))
                 (Ok ([], initial_subst, 1))
                 args params
             in

@@ -147,7 +147,7 @@ let rec transform_decl (decl : decl) : decl =
                   trait.trait_methods;
             };
       }
-  | DType _ | DRecord _ | DImport _ | DTypeAlias _ -> decl
+  | DType _ | DRecord _ | DImport _ | DTypeAlias _ | DNewType _ -> decl
 
 (** Transform a full program. Must be called {b after}
     [Interp_parser.transform_program] and {b before} [Typecheck]. *)

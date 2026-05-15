@@ -129,7 +129,7 @@ let import_items (program : program) : import_item list =
         in
         List.rev_append alias_items (List.rev_append symbol_items acc)
     | DFunc _ | DType _ | DRecord _ | DVar _ | DTrait _ | DImpl _ | DTypeAlias _
-      ->
+    | DNewType _ ->
         acc
   in
   List.fold_left collect_decl [] program |> List.rev
@@ -163,6 +163,7 @@ let rec collect_top_level_bindings scope decl =
   | DType t -> add_type_binding t.type_name scope
   | DRecord r -> add_type_binding r.record_name scope
   | DTypeAlias a -> add_type_binding a.alias_name scope
+  | DNewType n -> add_type_binding n.new_type_name scope
   | DTrait t -> add_type_binding t.trait_name scope
   | DImport _ | DImpl _ -> scope
 
@@ -471,6 +472,11 @@ let rec scan_decl scope refs decl =
       scan_type
         (add_type_params (Ast.type_param_names a.alias_type_params) scope)
         refs a.alias_target
+  | DNewType n ->
+      let refs = scan_type_param_bounds refs n.new_type_params in
+      scan_type
+        (add_type_params (Ast.type_param_names n.new_type_params) scope)
+        refs n.new_type_target
   | DTrait t ->
       let refs = scan_type_param_bounds refs t.trait_type_params in
       let scope =

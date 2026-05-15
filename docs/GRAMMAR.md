@@ -36,7 +36,7 @@ continues the previous expression instead of starting an indented block.
 func   pure   var   union   enum   record   struct   void
 while  for    in    if      else   and      or       not
 break  continue    match   try    import   as       private
-debug  implements   trait   Self   type   alias
+debug  implements   trait   Self   type   alias    new
 builtin    foreign      concurrent    detach      where
 True   False
 ```
@@ -97,6 +97,7 @@ decl = [ docstring ] ( func_decl
                       | trait_decl
                       | impl_decl
                       | type_alias_decl
+                      | new_type_decl
                       | foreign_func_decl
                       | "private" decl ) ;
 
@@ -212,6 +213,7 @@ field_list = [ field_decl { "," field_decl } [ "," ] ] ;
 field_decl = identifier ":" type_expr ;
 
 type_alias_decl = "type" "alias" IDENT [ type_params ] "=" type_expr ;
+new_type_decl = "new" "type" IDENT [ type_params ] "=" type_expr ;
 ```
 
 ### Import System

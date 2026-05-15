@@ -181,6 +181,7 @@ let describe_decl (d : Ast.decl) =
       Printf.sprintf "impl %s for %s" i.Ast.impl_trait
         (Types.type_to_string i.Ast.impl_for_type)
   | Ast.DTypeAlias a -> Printf.sprintf "type %s" a.Ast.alias_name
+  | Ast.DNewType n -> Printf.sprintf "type %s" n.Ast.new_type_name
   | Ast.DPrivate _ -> "private"
 
 (* ── Module index for slash commands ──────────────────────────────── *)

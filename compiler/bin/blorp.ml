@@ -70,6 +70,7 @@ let decl_to_string d =
       Printf.sprintf "Impl %s for %s" i.Ast.impl_trait
         (type_expr_to_string i.Ast.impl_for_type)
   | Ast.DTypeAlias a -> Printf.sprintf "TypeAlias %s" a.Ast.alias_name
+  | Ast.DNewType n -> Printf.sprintf "NewType %s" n.Ast.new_type_name
 
 let program_to_string prog = String.concat "\n" (List.map decl_to_string prog)
 

@@ -1975,6 +1975,13 @@ and lower_decl_ast (d : Ast.decl) : Core.core_decl =
     | DRecord r -> Core.CDRecord r (* pass-through *)
     | DImport i -> Core.CDImport i (* pass-through *)
     | DTypeAlias a -> Core.CDTypeAlias a (* pass-through *)
+    | DNewType n ->
+        Core.CDTypeAlias
+          {
+            alias_name = n.new_type_name;
+            alias_type_params = n.new_type_params;
+            alias_target = n.new_type_target;
+          }
     | DPrivate inner -> Core.CDPrivate (lower_decl_ast inner)
   in
   { cd_desc = desc; cd_loc = d.decl_loc; cd_doc = d.decl_doc }

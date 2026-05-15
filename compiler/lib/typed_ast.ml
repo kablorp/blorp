@@ -222,6 +222,136 @@ let type_info_proofs (info : type_info) = info.proofs
 let semantic_type (expr : expr) = expr.info.semantic_ty
 let value_type (expr : expr) = expr.info.value_ty
 
+let map_inferred_program_types (map_ty : Ast.type_expr -> Ast.type_expr)
+    (program : Ast.program) : Ast.program =
+  let map_type_params params = params in
+  let rec map_expr expr =
+    let mapped = Ast.expr_map_children map_expr expr in
+    let desc =
+      match mapped.Ast.expr_desc with
+      | Ast.EAscription (inner, ty) -> Ast.EAscription (inner, map_ty ty)
+      | Ast.EVarDecl (name, ty, init, is_mut) ->
+          Ast.EVarDecl (name, Option.map map_ty ty, init, is_mut)
+      | Ast.ETryBind (name, ty, rhs) ->
+          Ast.ETryBind (name, Option.map map_ty ty, rhs)
+      | Ast.EConcurrentBind (name, ty, rhs) ->
+          Ast.EConcurrentBind (name, Option.map map_ty ty, rhs)
+      | Ast.ELoopView view ->
+          Ast.ELoopView
+            {
+              view with
+              Ast.loop_view_elem_type = map_ty view.Ast.loop_view_elem_type;
+            }
+      | Ast.ELambda func -> Ast.ELambda (map_func func)
+      | Ast.EFuncDecl func -> Ast.EFuncDecl (map_func func)
+      | other -> other
+    in
+    let mapped = { mapped with Ast.expr_desc = desc } in
+    match mapped.Ast.expr_type_info with
+    | Some info ->
+        Ast.with_expr_type_info mapped (Ast.map_expr_type_info map_ty info)
+    | None -> mapped
+  and map_func func =
+    {
+      func with
+      Ast.func_type_params = map_type_params func.Ast.func_type_params;
+      Ast.func_params =
+        List.map
+          (fun p ->
+            { p with Ast.param_type = Option.map map_ty p.Ast.param_type })
+          func.Ast.func_params;
+      Ast.func_return_type = Option.map map_ty func.Ast.func_return_type;
+      Ast.func_dim_constraints =
+        List.map
+          (fun (a, b) -> (map_ty a, map_ty b))
+          func.Ast.func_dim_constraints;
+      Ast.func_body = Ast.map_func_body_expr map_expr func.Ast.func_body;
+    }
+  in
+  let map_type_decl t =
+    {
+      t with
+      Ast.type_params = map_type_params t.Ast.type_params;
+      Ast.type_variants =
+        List.map
+          (fun v ->
+            { v with Ast.variant_fields = List.map map_ty v.Ast.variant_fields })
+          t.Ast.type_variants;
+    }
+  in
+  let map_record r =
+    {
+      r with
+      Ast.record_type_params = map_type_params r.Ast.record_type_params;
+      Ast.record_fields =
+        List.map
+          (fun f -> { f with Ast.field_type = map_ty f.Ast.field_type })
+          r.Ast.record_fields;
+    }
+  in
+  let map_trait_method m =
+    {
+      m with
+      Ast.method_params =
+        List.map
+          (fun p ->
+            { p with Ast.param_type = Option.map map_ty p.Ast.param_type })
+          m.Ast.method_params;
+      Ast.method_return_type = Option.map map_ty m.Ast.method_return_type;
+      Ast.method_default_body = Option.map map_expr m.Ast.method_default_body;
+    }
+  in
+  let map_trait t =
+    {
+      t with
+      Ast.trait_type_params = map_type_params t.Ast.trait_type_params;
+      Ast.trait_methods = List.map map_trait_method t.Ast.trait_methods;
+    }
+  in
+  let map_impl i =
+    {
+      i with
+      Ast.impl_for_type = map_ty i.Ast.impl_for_type;
+      Ast.impl_methods = List.map map_func i.Ast.impl_methods;
+    }
+  in
+  let map_var v =
+    {
+      v with
+      Ast.var_type = Option.map map_ty v.Ast.var_type;
+      Ast.var_value = map_expr v.Ast.var_value;
+    }
+  in
+  let rec map_decl decl =
+    let desc =
+      match decl.Ast.decl_desc with
+      | Ast.DFunc func -> Ast.DFunc (map_func func)
+      | Ast.DType t -> Ast.DType (map_type_decl t)
+      | Ast.DRecord r -> Ast.DRecord (map_record r)
+      | Ast.DVar v -> Ast.DVar (map_var v)
+      | Ast.DTrait t -> Ast.DTrait (map_trait t)
+      | Ast.DImpl i -> Ast.DImpl (map_impl i)
+      | Ast.DTypeAlias a ->
+          Ast.DTypeAlias
+            {
+              a with
+              Ast.alias_type_params = map_type_params a.Ast.alias_type_params;
+              Ast.alias_target = map_ty a.Ast.alias_target;
+            }
+      | Ast.DNewType n ->
+          Ast.DNewType
+            {
+              n with
+              Ast.new_type_params = map_type_params n.Ast.new_type_params;
+              Ast.new_type_target = map_ty n.Ast.new_type_target;
+            }
+      | Ast.DPrivate inner -> Ast.DPrivate (map_decl inner)
+      | Ast.DImport _ as other -> other
+    in
+    { decl with Ast.decl_desc = desc }
+  in
+  List.map map_decl program
+
 let rec contains_meta_type (ty : Ast.type_expr) : bool =
   match ty with
   | TyMeta _ -> true
@@ -882,6 +1012,13 @@ let source_type_alias_decl ~loc = function
         "source declaration kind does not match canonical type alias \
          declaration"
 
+let source_new_type_decl ~loc = function
+  | None -> Ok None
+  | Some { Ast.decl_desc = Ast.DNewType new_type; _ } -> Ok (Some new_type)
+  | Some _ ->
+      invalid_info ~loc ~context:"new type source metadata"
+        "source declaration kind does not match canonical new type declaration"
+
 let source_func_decl ~loc = function
   | None -> Ok None
   | Some { Ast.decl_desc = Ast.DFunc func; _ } -> Ok (Some func)
@@ -943,6 +1080,24 @@ let rec of_ast_decl_with_source ?source_decl ast_decl =
           make_type_alias_info ?source_alias ~loc:ast_decl.decl_loc alias
         in
         Ok (TypeAliasDecl { ast_alias = alias; info })
+    | Ast.DNewType new_type ->
+        let* source_new_type =
+          source_new_type_decl ~loc:ast_decl.decl_loc source_decl
+        in
+        let source_target =
+          match source_new_type with
+          | Some source -> source.Ast.new_type_target
+          | None -> new_type.Ast.new_type_target
+        in
+        let* () =
+          ensure_final_type ~loc:ast_decl.decl_loc
+            ~context:"new type source target" source_target
+        in
+        let* () =
+          ensure_final_type ~loc:ast_decl.decl_loc ~context:"new type target"
+            new_type.Ast.new_type_target
+        in
+        Ok NonFunctionDecl
     | Ast.DPrivate inner ->
         let* typed_inner =
           of_ast_decl_with_source

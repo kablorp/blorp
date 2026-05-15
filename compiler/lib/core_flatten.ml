@@ -61,6 +61,7 @@ let exported_type_name (d : Ast.decl) =
     | Ast.DRecord r when not r.record_is_builtin -> Some r.record_name
     | Ast.DType t when not t.type_is_builtin -> Some t.type_name
     | Ast.DTypeAlias a -> Some a.alias_name
+    | Ast.DNewType n -> Some n.new_type_name
     | _ -> None
   in
   extract d

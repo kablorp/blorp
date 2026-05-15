@@ -87,7 +87,8 @@ let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
             | None -> ())
           impl.impl_methods
     | DPrivate d2 -> walk_decl d2
-    | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ -> ()
+    | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ | DNewType _ ->
+        ()
   in
 
   List.iter walk_decl program;
@@ -214,6 +215,7 @@ let find_definition (program : program) ~(name : string) ~(line : int)
           | DRecord rd when rd.record_name = name -> Some d.decl_loc
           | DTrait td when td.trait_name = name -> Some d.decl_loc
           | DTypeAlias ad when ad.alias_name = name -> Some d.decl_loc
+          | DNewType nt when nt.new_type_name = name -> Some d.decl_loc
           | DPrivate inner -> find_in_decls [ inner ]
           | _ -> None
         in

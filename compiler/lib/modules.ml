@@ -331,6 +331,7 @@ let extract_export_names _decl inner_decl =
   | DType t -> [ (t.type_name, inner_decl) ]
   | DRecord r -> [ (r.record_name, inner_decl) ]
   | DTypeAlias a -> [ (a.alias_name, inner_decl) ]
+  | DNewType n -> [ (n.new_type_name, inner_decl) ]
   | DTrait t ->
       (* Export both the trait name and its method names:
          - [traits: Equatable] imports the trait and exposes all of its
