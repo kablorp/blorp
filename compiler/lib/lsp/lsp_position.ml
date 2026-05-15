@@ -324,9 +324,20 @@ let find_definition (program : program) ~(name : string) ~(line : int)
 
 (** Modules whose exports are available as UFCS methods on prelude types
     without an explicit import. Kept in sync with
-    typecheck.ml:load_prelude_ref and Modules.prelude_module_names. *)
+    typecheck.ml:load_prelude_ref. *)
 let prelude_ufcs_modules =
-  [ "option"; "result"; "string"; "list"; "dict"; "set"; "bool" ]
+  [
+    "option";
+    "result";
+    "string";
+    "list";
+    "dict";
+    "set";
+    "bool";
+    "tensor";
+    "vector";
+    "matrix";
+  ]
 
 (** Map an embedded module path like [<embedded:std/option>] to the configured
     filesystem std path. Non-embedded paths and sessions without an explicit

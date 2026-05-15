@@ -1510,11 +1510,21 @@ let ufcs_collision (env : env) (name : string) (entry : overload_entry) :
     match (first_param_of a, first_param_of b) with
     | Some pa, Some pb -> (
         match (head_type_name pa, head_type_name pb) with
-        | Some ha, Some hb -> ha = hb
+        | Some ha, Some hb ->
+            ha = hb
+            && types_bidirectional
+                 ~type_params:
+                   (overload_type_param_names a @ overload_type_param_names b)
+                 pa pb
         | _ ->
             types_compatible
               ~type_params:(overload_type_param_names entry)
               pa pb)
+    | _ -> false
+  in
+  let same_arity a b =
+    match (a.ol_func_type, b.ol_func_type) with
+    | TyFunc fa, TyFunc fb -> List.length fa.params = List.length fb.params
     | _ -> false
   in
   List.find_opt
@@ -1523,7 +1533,7 @@ let ufcs_collision (env : env) (name : string) (entry : overload_entry) :
       && e.ol_module_path <> None
       && entry.ol_module_path <> None
       && e.ol_purity = entry.ol_purity
-      && same_first_param e entry)
+      && same_arity e entry && same_first_param e entry)
     existing
 
 (** Register a method-only function (accessible via UFCS but not bare name).

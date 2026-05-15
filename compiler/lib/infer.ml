@@ -2043,8 +2043,27 @@ let ctx_types_compatible ctx expected actual =
     The declaration/typecheck boundary assigns [loop_producer] metadata to
     std/tensor producers and to the compatibility builtin [enumerate2], so this
     phase no longer reconstructs producer identity from module paths. *)
+let loop_producer_for_resolved_name ctx name =
+  let name_without_def_id =
+    match String.index_opt name '#' with
+    | Some hash_idx -> String.sub name 0 hash_idx
+    | None -> name
+  in
+  match Env.get_func_loop_producer ctx.env name with
+  | Some producer -> Some producer
+  | None -> (
+      match Env.get_func_loop_producer ctx.env name_without_def_id with
+      | Some producer -> Some producer
+      | None -> (
+          match Codegen_names.parse_ufcs_name name_without_def_id with
+          | Some ("std/tensor", "indices") -> Some LoopProducerIndices
+          | Some ("std/tensor", "enumerate") -> Some LoopProducerEnumerate
+          | Some ("std/tensor", "enumerate2") -> Some LoopProducerEnumerate2
+          | Some ("std/tensor", "windows") -> Some LoopProducerWindows
+          | _ -> None))
+
 let is_tensor_loop_call ctx expected name args =
-  Env.get_func_loop_producer ctx.env name = Some expected
+  loop_producer_for_resolved_name ctx name = Some expected
   && List.for_all (fun arg -> Option.is_some (expr_semantic_type_opt arg)) args
 
 let tensor_first_index_type (coll_ty : type_expr) : type_expr option =
@@ -2773,9 +2792,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       (* Detect indices(coll) — first-dimension index loop. *)
       let is_indices, indices_coll_arg, indices_coll_ty =
         match iter'.expr_desc with
-        | ECall ({ expr_desc = EIdent "indices"; _ }, [ coll_arg ])
-          when is_tensor_loop_call ctx LoopProducerIndices "indices"
-                 [ coll_arg ] ->
+        | ECall ({ expr_desc = EIdent name; _ }, [ coll_arg ])
+          when is_tensor_loop_call ctx LoopProducerIndices name [ coll_arg ] ->
             (true, Some coll_arg, expr_proof_semantic_type_opt coll_arg)
         | _ -> (false, None, None)
       in
@@ -2786,18 +2804,18 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
          are: iterate over the collection with (index, element) pairs. *)
       let is_enumerate, enum_coll_arg, enum_coll_ty =
         match iter'.expr_desc with
-        | ECall ({ expr_desc = EIdent "enumerate"; _ }, [ coll_arg ])
-          when is_tensor_loop_call ctx LoopProducerEnumerate "enumerate"
-                 [ coll_arg ] ->
+        | ECall ({ expr_desc = EIdent name; _ }, [ coll_arg ])
+          when is_tensor_loop_call ctx LoopProducerEnumerate name [ coll_arg ]
+          ->
             (true, Some coll_arg, expr_proof_semantic_type_opt coll_arg)
         | _ -> (false, None, None)
       in
       (* Detect enumerate2(m) — 2D iteration yielding (i, j, val) triples *)
       let is_enumerate2, enum2_coll_arg, enum2_coll_ty =
         match iter'.expr_desc with
-        | ECall ({ expr_desc = EIdent "enumerate2"; _ }, [ coll_arg ])
-          when is_tensor_loop_call ctx LoopProducerEnumerate2 "enumerate2"
-                 [ coll_arg ] ->
+        | ECall ({ expr_desc = EIdent name; _ }, [ coll_arg ])
+          when is_tensor_loop_call ctx LoopProducerEnumerate2 name [ coll_arg ]
+          ->
             (true, Some coll_arg, expr_proof_semantic_type_opt coll_arg)
         | _ -> (false, None, None)
       in
@@ -2814,8 +2832,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
          Codegen emits zero-cost pointer arithmetic into the original tensor. *)
       let is_windows, win_coll_arg, win_coll_ty, win_size =
         match iter'.expr_desc with
-        | ECall ({ expr_desc = EIdent "windows"; _ }, [ coll_arg; size_arg ])
-          when is_tensor_loop_call ctx LoopProducerWindows "windows"
+        | ECall ({ expr_desc = EIdent name; _ }, [ coll_arg; size_arg ])
+          when is_tensor_loop_call ctx LoopProducerWindows name
                  [ coll_arg; size_arg ] ->
             let size =
               match size_arg.expr_desc with
@@ -6145,20 +6163,6 @@ and infer_call ctx expr callee args loc =
                               conflicts with the current module's own functions.
                               E.g., list's get becomes __ufcs_std$list__get
                               Uses $ for path separators to avoid ambiguity with _ in names *)
-                                let mod_path =
-                                  match
-                                    (List.hd ufcs_matches).Env.ol_module_path
-                                  with
-                                  | Some p -> p
-                                  | None -> ""
-                                in
-                                let base_mangled =
-                                  "__ufcs_"
-                                  ^ String.map
-                                      (fun c -> if c = '/' then '$' else c)
-                                      mod_path
-                                  ^ "__" ^ method_name
-                                in
                                 (* Phase 2.7 tasks 48/49: when pure/impure overloads
                               exist, try to pick by callback purity — but ONLY
                               when every function-typed arg has a firm purity
@@ -6194,11 +6198,16 @@ and infer_call ctx expr callee args loc =
                                           List.map
                                             (fun a ->
                                               match
-                                                infer_unconstrained_value_expr
-                                                  ctx a
+                                                expr_semantic_type_opt a
                                               with
-                                              | Ok (ty, _) -> Some ty
-                                              | Error _ -> None)
+                                              | Some ty -> Some ty
+                                              | None -> (
+                                                  match
+                                                    infer_unconstrained_value_expr
+                                                      ctx a
+                                                  with
+                                                  | Ok (ty, _) -> Some ty
+                                                  | Error _ -> None))
                                             (receiver_arg :: args)
                                         in
                                         match all_some arg_tys_opt with
@@ -6209,6 +6218,27 @@ and infer_call ctx expr callee args loc =
                                 in
                                 let in_pure_ctx =
                                   ctx.env.current_function_pure
+                                in
+                                let mod_path =
+                                  match selected with
+                                  | Some entry -> (
+                                      match entry.Env.ol_module_path with
+                                      | Some p -> p
+                                      | None -> "")
+                                  | None -> (
+                                      match
+                                        (List.hd ufcs_matches)
+                                          .Env.ol_module_path
+                                      with
+                                      | Some p -> p
+                                      | None -> "")
+                                in
+                                let base_mangled =
+                                  "__ufcs_"
+                                  ^ String.map
+                                      (fun c -> if c = '/' then '$' else c)
+                                      mod_path
+                                  ^ "__" ^ method_name
                                 in
                                 (* A3.3 UFCS handoff: encode the selected
                               overload's [ol_def_id] directly in the

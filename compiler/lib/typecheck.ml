@@ -1920,6 +1920,7 @@ let func_first_param_head (func : func_decl) : string option =
   | p :: _ -> (
       match p.param_type with
       | Some (TyNamed (name, _)) -> Some name
+      | Some (TyArray _) -> Some Types.array_head_name
       | _ -> None)
 
 let unwrap_to_func (d : decl) : func_decl option =
@@ -2572,6 +2573,9 @@ let () =
           ("range", "Range");
           ("dict", "Dict");
           ("set", "Set");
+          ("tensor", Types.array_head_name);
+          ("vector", Types.array_head_name);
+          ("matrix", Types.array_head_name);
         ]
       in
       let env =

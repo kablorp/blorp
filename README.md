@@ -178,15 +178,11 @@ You can still write ordinary loop-shaped code. In `for` position, `indices`
 yields proven-safe indices without materializing an intermediate list:
 
 ```blorp
-import:
-    tensor: indices
-
-
 pure func sum_scores(scores: Int[#3]) -> Int:
-    var total: Int = 0
-    for i in indices(scores):
-        total += scores[i]
-    total
+	var total: Int = 0
+	for i in scores.indices():
+		total += scores[i]
+	total
 ```
 
 
