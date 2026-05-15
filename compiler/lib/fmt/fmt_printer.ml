@@ -433,12 +433,121 @@ let rec expr_has_block e =
   | ERecord fields -> List.exists (fun (_, e) -> expr_has_block e) fields
   | _ -> false
 
+let rec ufcs_chain_step_count func_e =
+  match func_e.expr_desc with
+  | EFieldAccess (receiver, _) -> 1 + ufcs_receiver_step_count receiver
+  | _ -> 0
+
+and ufcs_receiver_step_count receiver =
+  match receiver.expr_desc with
+  | ECall ({ expr_desc = EFieldAccess (inner, _); _ }, _) ->
+      1 + ufcs_receiver_step_count inner
+  | _ -> 0
+
+(** True when the printer will introduce hard line breaks for this expression
+    even though it is not necessarily a block expression in the AST. *)
+let rec expr_has_multiline_layout e =
+  expr_has_block e
+  ||
+  match e.expr_desc with
+  | ECall (func_e, args) ->
+      ufcs_chain_step_count func_e >= 2
+      || expr_has_multiline_layout func_e
+      || List.exists expr_has_multiline_layout args
+  | EFieldAccess (inner, _) | EAscription (inner, _) | EDetach inner ->
+      expr_has_multiline_layout inner
+  | EUnary (_, inner) -> expr_has_multiline_layout inner
+  | EBinary (_, left, right)
+  | ELogical (_, left, right)
+  | ERange (left, right)
+  | ESubscript (left, right) ->
+      expr_has_multiline_layout left || expr_has_multiline_layout right
+  | EIf (cond, then_e, else_opt) -> (
+      expr_has_multiline_layout cond
+      || expr_has_multiline_layout then_e
+      ||
+      match else_opt with
+      | Some else_e -> expr_has_multiline_layout else_e
+      | None -> false)
+  | ETuple elems
+  | EList elems
+  | EVector elems
+  | ETry elems
+  | EDebugBlock elems
+  | EBlock elems ->
+      List.exists expr_has_multiline_layout elems
+  | EMatch (scrutinee, cases) ->
+      expr_has_multiline_layout scrutinee
+      || List.exists
+           (fun case -> expr_has_multiline_layout case.case_body)
+           cases
+  | ERecord fields ->
+      List.exists (fun (_, e) -> expr_has_multiline_layout e) fields
+  | ERecordUpdate (base, fields) ->
+      expr_has_multiline_layout base
+      || List.exists (fun (_, e) -> expr_has_multiline_layout e) fields
+  | ESubscriptMulti (target, indices) ->
+      expr_has_multiline_layout target
+      || List.exists expr_has_multiline_layout indices
+  | ESubscriptAssign (target, indices, value) ->
+      expr_has_multiline_layout target
+      || expr_has_multiline_layout value
+      || List.exists expr_has_multiline_layout indices
+  | EStringInterp (parts, _) ->
+      List.exists
+        (function
+          | InterpExpr e -> expr_has_multiline_layout e | InterpLit _ -> false)
+        parts
+  | EConcurrent (bindings, timeout, _) -> (
+      List.exists expr_has_multiline_layout bindings
+      ||
+      match timeout with
+      | Some timeout -> expr_has_multiline_layout timeout
+      | None -> false)
+  | EConcurrentBind (_, _, value) -> expr_has_multiline_layout value
+  | EConcurrentFor (_, iterable, body, timeout, _) -> (
+      expr_has_multiline_layout iterable
+      || expr_has_multiline_layout body
+      ||
+      match timeout with
+      | Some timeout -> expr_has_multiline_layout timeout
+      | None -> false)
+  | EDict entries ->
+      List.exists
+        (fun (key, value) ->
+          expr_has_multiline_layout key || expr_has_multiline_layout value)
+        entries
+  | ELambda fd -> func_body_has_multiline_layout fd.func_body
+  | EWhile (cond, body) | EFor (_, cond, body) | EForTuple (_, cond, body) ->
+      expr_has_multiline_layout cond || expr_has_multiline_layout body
+  | ELoopView view -> (
+      expr_has_multiline_layout view.loop_view_source
+      ||
+      match view.loop_view_size_arg with
+      | Some size_arg -> expr_has_multiline_layout size_arg
+      | None -> false)
+  | EAssign (_, value)
+  | EVarDecl (_, _, value, _)
+  | ETupleDestruct (_, value)
+  | ETryBind (_, _, value) ->
+      expr_has_multiline_layout value
+  | EFuncDecl fd -> func_body_has_multiline_layout fd.func_body
+  | EIdent _ | ELiteral _ | EVoid | EBreak | EContinue | EBuiltin _
+  | EStringInterpRaw _ ->
+      false
+
+and func_body_has_multiline_layout = function
+  | FuncBodyExpr body -> expr_has_multiline_layout body
+  | FuncBuiltinBody _ | FuncForeign _ | FuncNoBody -> false
+
 (** Check if an expression is a lambda (any kind). *)
 let is_lambda e = match e.expr_desc with ELambda _ -> true | _ -> false
 
 let func_body_has_block = function
   | FuncBodyExpr { expr_desc = EBlock _; _ } -> true
   | FuncBodyExpr _ | FuncBuiltinBody _ | FuncForeign _ | FuncNoBody -> false
+
+let is_list_literal e = match e.expr_desc with EList _ -> true | _ -> false
 
 let print_builtin_body = function
   | BuiltinIntrinsic -> text "builtin"
@@ -457,7 +566,7 @@ let with_force_flat value f =
 let multiline_comma_items items =
   let rec go = function
     | [] -> Nil
-    | [ doc, _ ] -> doc
+    | [ (doc, _) ] -> doc
     | (doc, comma_on_own_line) :: rest ->
         let comma =
           if comma_on_own_line then hardline ^^ text "," else text ","
@@ -472,7 +581,7 @@ let rec print_expr e =
   doc ^^ trail
 
 and print_bracketed open_b close_b elems =
-  let has_multiline = List.exists expr_has_block elems in
+  let has_multiline = List.exists expr_has_multiline_layout elems in
   if has_multiline then
     let item_docs =
       List.map (fun e -> (print_expr e, expr_has_block e)) elems
@@ -487,6 +596,12 @@ and print_bracketed open_b close_b elems =
       (text open_b
       ^^ indent (softline ^^ comma_sep_break (List.map print_expr elems))
       ^^ softline ^^ text close_b)
+
+and print_adjacent_single_list_arg args =
+  match args with
+  | [ arg ] when (not !force_flat) && is_list_literal arg ->
+      Some (text "(" ^^ print_expr arg ^^ text ")")
+  | _ -> None
 
 and vector_rank_expr e =
   match e.expr_desc with EVector elems -> vector_rank_elems elems | _ -> 0
@@ -537,43 +652,47 @@ and print_vector_literal elems =
 and print_chain_call_args args =
   match args with
   | [] -> text "()"
-  | _ ->
-      let has_block_lambda =
-        List.exists
-          (fun a ->
-            match a.expr_desc with
-            | ELambda fd -> func_body_has_block fd.func_body
-            | _ -> false)
-          args
-      in
-      if List.exists expr_has_block args then
-        let render () =
-          let arg_docs =
-            List.map (fun arg -> (print_expr arg, expr_has_block arg)) args
+  | _ -> (
+      match print_adjacent_single_list_arg args with
+      | Some doc -> doc
+      | None ->
+          let has_block_lambda =
+            List.exists
+              (fun a ->
+                match a.expr_desc with
+                | ELambda fd -> func_body_has_block fd.func_body
+                | _ -> false)
+              args
           in
-          text "("
-          ^^ indent (hardline ^^ multiline_comma_items arg_docs)
-          ^^ hardline ^^ text ")"
-        in
-        if has_block_lambda then with_force_flat true render else render ()
-      else
-        group
-          (text "("
-          ^^ indent (softline ^^ comma_sep_break (List.map print_expr args))
-          ^^ softline ^^ text ")")
+          if List.exists expr_has_multiline_layout args then
+            let render () =
+              let arg_docs =
+                List.map (fun arg -> (print_expr arg, expr_has_block arg)) args
+              in
+              text "("
+              ^^ indent (hardline ^^ multiline_comma_items arg_docs)
+              ^^ hardline ^^ text ")"
+            in
+            if has_block_lambda then with_force_flat true render else render ()
+          else
+            group
+              (text "("
+              ^^ indent (softline ^^ comma_sep_break (List.map print_expr args))
+              ^^ softline ^^ text ")"))
 
 and expr_is_non_lambda_block e =
   match e.expr_desc with ELambda _ -> false | _ -> expr_has_block e
 
 and print_block_call_args func_e args =
-  let arg_docs =
-    List.map
-      (fun arg -> (print_expr arg, expr_has_block arg))
-      args
-  in
-  print_expr func_e ^^ text "("
-  ^^ indent (hardline ^^ multiline_comma_items arg_docs)
-  ^^ hardline ^^ text ")"
+  match print_adjacent_single_list_arg args with
+  | Some args_doc -> print_expr func_e ^^ args_doc
+  | None ->
+      let arg_docs =
+        List.map (fun arg -> (print_expr arg, expr_has_block arg)) args
+      in
+      print_expr func_e ^^ text "("
+      ^^ indent (hardline ^^ multiline_comma_items arg_docs)
+      ^^ hardline ^^ text ")"
 
 and print_ufcs_chain call_expr func_e args =
   let rec collect receiver steps =
@@ -715,7 +834,7 @@ and print_expr_node expr =
                 | _ -> false)
               args
           in
-          if List.exists expr_has_block args then
+          if List.exists expr_has_multiline_layout args then
             if has_block_lambda then
               with_force_flat true (fun () -> print_block_call_args func_e args)
             else print_block_call_args func_e args
@@ -724,8 +843,7 @@ and print_expr_node expr =
                for nested-call IfBreak expansion. *)
             let rec print_arg a =
               match a.expr_desc with
-              | ECall
-                  ({ expr_desc = EFieldAccess _ | EIdent _; _ }, inner_args)
+              | ECall ({ expr_desc = EFieldAccess _ | EIdent _; _ }, inner_args)
                 when List.length inner_args >= 2 && not !force_flat ->
                   let flat_doc = print_expr a in
                   let inner_args_doc = List.map print_arg inner_args in
@@ -811,7 +929,7 @@ and print_expr_node expr =
                    cases))
   | EBlock exprs -> print_block_exprs exprs
   | ETuple elems ->
-      if List.exists expr_has_block elems then
+      if List.exists expr_has_multiline_layout elems then
         let item_docs =
           List.map (fun e -> (print_expr e, expr_has_block e)) elems
         in
@@ -826,7 +944,9 @@ and print_expr_node expr =
   | EVector elems -> print_vector_literal elems
   | EList elems -> print_bracketed "[" "]" elems
   | ERecord fields ->
-      let has_multiline = List.exists (fun (_, e) -> expr_has_block e) fields in
+      let has_multiline =
+        List.exists (fun (_, e) -> expr_has_multiline_layout e) fields
+      in
       if has_multiline then
         let field_docs =
           List.map
