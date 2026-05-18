@@ -116,8 +116,7 @@ type expr_desc =
   | ESubscriptAssign of expr * expr list * expr
   | EStringInterp of string_interp_part list * bool
   | EStringInterpRaw of string * bool
-  | ETry of expr list
-  | ETryBind of string * Ast.type_expr option * expr
+  | EQuestionBind of string * Ast.type_expr option * expr
   | EDebugBlock of expr list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr

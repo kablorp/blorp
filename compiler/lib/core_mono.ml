@@ -439,8 +439,6 @@ let subst_core_types (subst : mono_subst) (e : core) : core =
                   lam_return_ty = st lam.lam_return_ty;
                 };
           }
-      | CTryBind (k, v, ty, rhs) ->
-          { node with desc = CTryBind (k, v, st ty, rhs) }
       | CFor (binder, iter, body) ->
           {
             node with
@@ -1269,19 +1267,6 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
             | None -> node)
         | None -> node)
     | _ -> node
-  and rewrite_try_items scope items =
-    let rec loop scope acc = function
-      | [] -> List.rev acc
-      | item :: rest ->
-          let item' = rewrite scope item in
-          let scope' =
-            match item.desc with
-            | CTryBind (_, v, _, _) -> scope_add_var scope v
-            | _ -> scope
-          in
-          loop scope' (item' :: acc) rest
-    in
-    loop scope [] items
   and rewrite scope e =
     let rewrite_box_op b = { b with box_value = rewrite scope b.box_value } in
     let rewrite_boxed_storage v =
@@ -1480,8 +1465,6 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
                   }
           in
           CTailrecRecur recur'
-      | CTry items -> CTry (rewrite_try_items scope items)
-      | CTryBind (kind, v, ty, rhs) -> CTryBind (kind, v, ty, rewrite scope rhs)
       | CDup (v, ty, body) -> CDup (v, ty, rewrite scope body)
       | CDrop (v, ty, body) -> CDrop (v, ty, rewrite scope body)
       | CConcurrent cb ->
@@ -1772,16 +1755,6 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
           List.iter (fun (_, sub) -> scan_ctree scope sub) sw.ctl_len_cases;
           Option.iter (fun (_, sub) -> scan_ctree scope sub) sw.ctl_len_geq;
           Option.iter (scan_ctree scope) sw.ctl_len_default
-    and scan_try_items scope = function
-      | [] -> ()
-      | item :: rest ->
-          scan_expr scope item;
-          let scope' =
-            match item.desc with
-            | CTryBind (_, v, _, _) -> scope_add_var scope v
-            | _ -> scope
-          in
-          scan_try_items scope' rest
     and scan_expr scope e =
       let scan_boxed_storage scope value =
         scan_expr scope value.bsv_box.box_value
@@ -1904,8 +1877,6 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
       | CTailrecRecur (TailrecRecur r) -> List.iter (scan_expr scope) r.tr_args
       | CTailrecRecur (TailrecListSpreadRecur r) ->
           List.iter (fun (_, arg) -> scan_expr scope arg) r.tr_rebinds
-      | CTry items -> scan_try_items scope items
-      | CTryBind (_, _, _, rhs) -> scan_expr scope rhs
       | CDup (_, _, body) | CDrop (_, _, body) -> scan_expr scope body
       | CConcurrent cb ->
           List.iter (fun b -> scan_expr scope b.cb_rhs) cb.conc_bindings;

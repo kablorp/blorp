@@ -261,9 +261,6 @@ and clone_expr state env e =
       { e with desc = CFor ({ binder with loop_var }, iter, body) }
   | CAssign (v, rhs) ->
       { e with desc = CAssign (rename_existing_var env v, clone env rhs) }
-  | CTryBind (kind, v, ty, rhs) ->
-      let v = rename_existing_var env v in
-      { e with desc = CTryBind (kind, v, ty, clone env rhs) }
   | CDup (v, ty, body) ->
       { e with desc = CDup (rename_existing_var env v, ty, clone env body) }
   | CDrop (v, ty, body) ->

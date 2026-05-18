@@ -128,7 +128,7 @@ let free_idents_of (e : expr) : (string * loc) list =
     | EForTuple (vars, iter, body) ->
         go bound iter;
         go (vars @ bound) body
-    | ETryBind (name, _, e1) ->
+    | EQuestionBind (name, _, e1) ->
         go bound e1;
         ignore name
     | EMatch (scrut, cases) ->

@@ -212,9 +212,6 @@ and scan_uses arity analysis aliases expr =
          survives, keep the tuple heap-allocated rather than reasoning about
          pattern binder shadowing here. *)
       mark_escape analysis
-  | CTryBind (_, v, _, rhs) ->
-      scan_uses arity analysis aliases rhs;
-      if is_alias aliases v then mark_shadow analysis
   | CConcurrent cb ->
       List.iter
         (fun b -> scan_uses arity analysis aliases b.cb_rhs)

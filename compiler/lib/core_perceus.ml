@@ -44,9 +44,8 @@
     - {b Function parameter ownership}: direct user-call contracts are inferred
       from bodies, but this is still an internal ABI rather than source-level
       ownership syntax.
-    - {b Loop / try liveness}: [CFor] and borrowed-only [CWhile] bodies are
-      modeled precisely enough to drop owners after the loop; [CTry] remains
-      conservative.
+    - {b Loop liveness}: [CFor] and borrowed-only [CWhile] bodies are modeled
+      precisely enough to drop owners after the loop.
     - {b Drop specialization}: C emission specializes stack Result drops and
       ARC-only source values, but known-shape nested field destructors still
       use runtime destructor dispatch.
@@ -456,8 +455,6 @@ let rec count_uses (name : string) (e : core) : int =
   | CClosureCreate cc ->
       (* Each capture is retained once *)
       if List.exists (fun (n, _) -> n = name) cc.cc_captures then 1 else 0
-  | CTry body -> List.fold_left (fun a c -> a + count_uses name c) 0 body
-  | CTryBind (_, _, _, rhs) -> count_uses name rhs
   | CConcurrent cb ->
       (* Task RHSs: always counted (they evaluate unconditionally).
          Tail body: counted ONLY if [name] isn't shadowed by a concurrent
@@ -826,7 +823,6 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
          scope, so they must not suppress the final scope-exit drop. *)
       no_ownership_uses
   | CAssign (_, rhs) -> summarize_linear_ownership_uses env name rhs
-  | CTryBind (_, _, _, rhs) -> summarize_linear_ownership_uses env name rhs
   | CDup (v, _, body) when v.vname = name ->
       let uses = summarize_linear_ownership_uses env name body in
       {
@@ -951,9 +947,6 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
         | None -> no_ownership_uses
       in
       seq_ownership_uses timeout_uses (seq_ownership_uses iter_uses task_uses)
-  (* Remaining try forms still use the conservative path-use behavior until
-     their success/failure lifetime model is formalized. *)
-  | CTry _ -> ownership_uses_from_legacy_count (count_uses name e)
 
 and summarize_boxed_storage_uses env name value =
   summarize_linear_ownership_uses env name value.bsv_box.box_value
@@ -1293,8 +1286,8 @@ let populate_user_call_contracts (env : type_env) (prog : core_program) : unit =
     as branches for this phase (the body may execute 0+ times). *)
 let rec is_linear (e : core) : bool =
   match e.desc with
-  | CIf _ | CMatchArms _ | CMatch _ | CWhile _ | CFor _ | CTry _ | CTryBind _
-  | CConcurrent _ | CConcurrentFor _ ->
+  | CIf _ | CMatchArms _ | CMatch _ | CWhile _ | CFor _ | CConcurrent _
+  | CConcurrentFor _ ->
       false
   (* Lambda/closure bodies and detached task bodies are evaluated later. At
      this site, only closure construction/spawn happens, so treat them as
@@ -1560,20 +1553,10 @@ let lambda_has_runtime_captures (env : type_env) (lam : lambda) : bool =
               (fun (name, _) -> is_free_name bound name)
               task.tc_captures
         | None -> false)
-    | CTry exprs -> has_try_exprs bound exprs
-    | CTryBind (_, v, _, rhs) ->
-        has_core bound rhs || is_free_name bound v.vname
     | _ ->
         fold_immediate_children
           (fun found child -> found || has_core bound child)
           false e
-  and has_try_exprs bound = function
-    | [] -> false
-    | expr :: rest -> (
-        match expr.desc with
-        | CTryBind (_, v, _, rhs) ->
-            has_core bound rhs || has_try_exprs (SS.add v.vname bound) rest
-        | _ -> has_core bound expr || has_try_exprs bound rest)
   and has_ctree bound = function
     | CTLeaf { ct_bindings; ct_body } ->
         let leaf_bound = List.fold_left add_ctree_binding bound ct_bindings in
@@ -2173,7 +2156,6 @@ let rec expr_contains_var (name : string) (e : core) : bool =
   | CLambda lam ->
       (not (List.exists (fun (v, _) -> v.vname = name) lam.lam_params))
       && expr_contains_var name lam.lam_body
-  | CTryBind (_, _, _, rhs) -> expr_contains_var name rhs
   | CConcurrent cb ->
       let rhs_mentions =
         List.exists
@@ -2299,7 +2281,6 @@ let rec expr_consumes_var_owner (env : type_env) (name : string) (e : core) :
   | CLambda lam ->
       (not (List.exists (fun (v, _) -> v.vname = name) lam.lam_params))
       && expr_consumes_var_owner env name lam.lam_body
-  | CTryBind (_, _, _, rhs) -> expr_consumes_var_owner env name rhs
   | CConcurrent cb ->
       let rhs_consumes =
         List.exists

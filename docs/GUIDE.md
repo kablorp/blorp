@@ -703,9 +703,8 @@ When working with variadic-dimension arrays (`T[#Ds...]`), you can refine them t
 -- assert_shape(array, N) returns Option[T[#N]]
 -- Refines variadic dims to a concrete dimension if the runtime length matches
 func process(data: Float[#Ds...]) -> Option[Float]:
-    try:
-        v ?= assert_shape(data, 4)    -- v: Float[#4]
-        v[0] + v[1] + v[2] + v[3]
+    v ?= assert_shape(data, 4)    -- v: Float[#4]
+    Some(v[0] + v[1] + v[2] + v[3])
 
 -- Works with match too
 func check(t: Int[#Ds...]) -> Bool:
@@ -1418,9 +1417,12 @@ func main(args: List[String]) -> Int:
     0
 ```
 
-### try: Blocks with ?= Bindings
+### ?= Bindings
 
-`try:` blocks with `?=` bindings provide clean error propagation, similar to Rust's `?` operator but scoped to a block:
+`?=` binds the success value from an `Option` or `Result` and returns the
+failure value from the enclosing function. The enclosing function must return
+the same carrier type, and the success path must return `Some(...)` or
+`Ok(...)` explicitly.
 
 ```blorp
 import:
@@ -1437,31 +1439,30 @@ pure func get_other_value() -> Option[Int]:
 
 -- With Result: ?= binds Ok value, short-circuits on Err
 func process_file(path: String) -> Result[Int, String]:
-    try:
-        content ?= read_file(path)           -- If Err, returns Err immediately
-        lines ?= parse_lines(content)        -- If Err, returns Err immediately
-        count: Int = lines.length()
-        count                                -- Auto-wrapped in Ok(count)
+    content ?= read_file(path)           -- If Err, returns Err from process_file
+    lines ?= parse_lines(content)        -- If Err, returns Err from process_file
+    count: Int = lines.length()
+    Ok(count)
 
 -- With Option: ?= binds Some value, short-circuits on None
 func maybe_compute() -> Option[Int]:
-    try:
-        x ?= get_value()                    -- If None, returns None immediately
-        y ?= get_other_value()              -- If None, returns None immediately
-        x + y                               -- Auto-wrapped in Some(x + y)
+    x ?= get_value()                    -- If None, returns None from maybe_compute
+    y ?= get_other_value()              -- If None, returns None from maybe_compute
+    Some(x + y)
 
 -- Type annotations on ?= bindings
 func process() -> Option[Int]:
-    try:
-        x: Int ?= get_value()
-        x * 2
+    x: Int ?= get_value()
+    Some(x * 2)
 ```
 
-Inside a `try:` block:
-- `?=` binds the success value (`Ok(val)` or `Some(val)`) or short-circuits the entire block with the error/None
-- The last expression is the **unwrapped** success value — the compiler auto-wraps it in `Some(...)` or `Ok(...)` to match the function's return type
-- Regular bindings (without `?=`) work normally inside try blocks
-- There is no bare `?` postfix operator — `?=` inside `try:` is the only short-circuit mechanism
+Rules for `?=`:
+
+- `?=` binds `Some(value)` or `Ok(value)` to the name on the left.
+- `None` or `Err(error)` is returned from the enclosing carrier-returning function.
+- Success values are not auto-wrapped; write `Some(value)` or `Ok(value)` explicitly.
+- `?=` is currently rejected inside loop bodies until the compiler has a Perceus-safe early-return node for loop exits.
+- There is no bare postfix `?` operator.
 
 ### debug: Blocks
 
@@ -3292,6 +3293,6 @@ Both extensions provide:
 func       pure       var        union      enum       record     struct     trait
 type       alias      private    import     as         implements
 Self       builtin    match      while      for        in         if         else
-and        or         not        True       False      try        void
+and        or         not        True       False      void
 break      continue   foreign    concurrent detach     where
 ```

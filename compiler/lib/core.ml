@@ -11,7 +11,7 @@
       allows [expr_type = None].
 
     - {b Smaller than AST.} Syntactic sugar ([ERecordUpdate], [EStringInterp],
-      [ETry], [ESubscript*]) is desugared during lowering. Core is the
+      [ESubscript*]) is desugared during lowering. Core is the
       minimum set of nodes the backend needs to emit correct code.
 
     - {b Let-normal sequencing.} Statement sequencing uses [CLet] (for
@@ -479,14 +479,6 @@ let tensor_unboxed_scalar_of_type = function
   | Ast.TyNamed ("Int", []) -> Some TensorInt64Elements
   | _ -> None
 
-(** Classification of a [try:] block's control-flow shape. Committed at
-    lowering time from the enclosing try block's rhs type (Option vs
-    Result). Downstream passes read this directly instead of re-sniffing
-    the ambient type. *)
-type try_kind =
-  | TKOption  (** [try: x ?= foo; ...] where [foo : Option[T]] *)
-  | TKResult  (** [try: x ?= foo; ...] where [foo : Result[T, E]] *)
-
 type core = { desc : desc; ty : Ast.type_expr; loc : Ast.loc }
 (** A Core expression. Every node carries its type and source location. *)
 
@@ -697,17 +689,6 @@ and desc =
   | CTailrecRecur of tailrec_recur
       (** Rebind loop parameters and continue the enclosing [CTailrecLoop].
           Valid only in tail position inside that loop. *)
-  (* === Try blocks (sugar, desugar to nested CMatchArms later) === *)
-  | CTry of core list  (** [try: ...] — last element is result *)
-  | CTryBind of try_kind * var * Ast.type_expr * core
-      (** [name ?= expr] — short-circuits on
-                                         None/Err. The [try_kind] tag records
-                                         whether the enclosing try block
-                                         returns Option or Result, committed
-                                         at lowering time from the [rhs]'s
-                                         type. Desugaring uses this directly
-                                         instead of re-classifying each
-                                         [CTry] block's type. *)
   (* === Explicit reference counting (Phase 2 Perceus) === *)
   | CDup of var * Ast.type_expr * core
       (** [incr_rc(v); body] — bump [v]'s
@@ -1189,8 +1170,6 @@ let rec map_children (f : core -> core) (e : core) : core =
                 }
         in
         CTailrecRecur recur'
-    | CTry body -> CTry (List.map f body)
-    | CTryBind (k, v, t, rhs) -> CTryBind (k, v, t, f rhs)
     | CDup (v, t, body) -> CDup (v, t, f body)
     | CDrop (v, t, body) -> CDrop (v, t, f body)
     | CConcurrent cb ->
@@ -1860,13 +1839,6 @@ let rec pp_to_string (e : core) : string =
           in
           Printf.sprintf "tailrec-recur-list[+%d](%s)" r.tr_cursor_advance
             (String.concat ", " rebinds))
-  | CTry body ->
-      Printf.sprintf "try { %s }"
-        (String.concat "; " (List.map pp_to_string body))
-  | CTryBind (k, v, t, rhs) ->
-      let k_str = match k with TKOption -> "opt" | TKResult -> "res" in
-      Printf.sprintf "%s: %s ?=<%s> %s" (Var.to_string v) (ty_str t) k_str
-        (pp_to_string rhs)
   | CDup (v, _, body) ->
       Printf.sprintf "dup %s; %s" (Var.to_string v) (pp_to_string body)
   | CDrop (v, _, body) ->
@@ -2032,9 +2004,8 @@ let pp_to_string_indented (e : core) : string =
     | CStringSetLen _ | CVector _ | CTensorLiteral _ | CDict _
     | CDictConstruct _ | CSetAlloc _ | CRecord _ | CRecordConstruct _
     | CRecordUpdate _ | CRange _ | CStringInterp _ | CAssign _ | CConcurrent _
-    | CConcurrentFor _ | CDetach _ | CTryBind _ | CCast _ | CUnbox _
-    | CUnboxTyped _ | CBox _ | CBoxTyped _ | CUnionConstruct _ | CTailrecRecur _
-      ->
+    | CConcurrentFor _ | CDetach _ | CCast _ | CUnbox _ | CUnboxTyped _ | CBox _
+    | CBoxTyped _ | CUnionConstruct _ | CTailrecRecur _ ->
         p ^ pp_to_string e
     | CTailrecLoop (TailrecUnmanagedLoop l) ->
         Printf.sprintf "%stailrec-loop[unmanaged] {\n%s\n%s}" p
@@ -2114,7 +2085,7 @@ let pp_to_string_indented (e : core) : string =
         Printf.sprintf "%smatch %s {\n%s\n%s}" p (pp_to_string scrut)
           (pp_ctree_indented (i + 1) tree)
           p
-    (* While / for / try: keep structural — header inline, body indented *)
+    (* While / for keep structural — header inline, body indented *)
     | CWhile (cond, body) ->
         Printf.sprintf "%swhile %s {\n%s\n%s}" p (pp_to_string cond)
           (go (i + 1) body)
@@ -2132,9 +2103,6 @@ let pp_to_string_indented (e : core) : string =
           storage (pp_to_string iter)
           (go (i + 1) body)
           p
-    | CTry body ->
-        let body_strs = List.map (go (i + 1)) body in
-        Printf.sprintf "%stry {\n%s\n%s}" p (String.concat "\n" body_strs) p
     (* Lambda: params on header, body indented *)
     | CLambda lam ->
         let params =
@@ -2483,7 +2451,6 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
               },
               iter,
               body )
-      | CTryBind (kind, v, ty, rhs) -> CTryBind (kind, v, f ty, rhs)
       | CDup (v, ty, body) -> CDup (v, f ty, body)
       | CDrop (v, ty, body) -> CDrop (v, f ty, body)
       | CTailrecLoop loop ->

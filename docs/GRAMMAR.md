@@ -35,7 +35,7 @@ continues the previous expression instead of starting an indented block.
 ```
 func   pure   var   union   enum   record   struct   void
 while  for    in    if      else   and      or       not
-break  continue    match   try    import   as       private
+break  continue    match   import   as       private
 debug  implements   trait   Self   type   alias
 builtin    foreign      concurrent    detach      where
 True   False
@@ -43,6 +43,7 @@ True   False
 
 Declarations are public by default; `private` hides a declaration from
 importers. There is no `export` keyword.
+blocks; it is not valid expression syntax.
 
 ### Operators and Delimiters
 
@@ -174,8 +175,8 @@ stmt = var_decl
      | "for" IDENT "in" expr ":" NEWLINE INDENT stmt_list DEDENT
      | "for" "_" "in" expr ":" NEWLINE INDENT stmt_list DEDENT
      | "for" "(" destruct_ids ")" "in" expr ":" NEWLINE INDENT stmt_list DEDENT
-     | IDENT "?=" expr                          (* try-bind *)
-     | IDENT ":" type_expr "?=" expr            (* typed try-bind *)
+     | IDENT "?=" expr                          (* question-bind *)
+     | IDENT ":" type_expr "?=" expr            (* typed question-bind *)
      | [ "pure" ] "func" name [ type_params ] params [ "->" type_expr ] [ where_clause ] ":" func_body
                                                    (* nested function declaration *)
      | "debug" ":" NEWLINE INDENT stmt_list DEDENT
@@ -400,7 +401,6 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING | TRIPLE_STRING
              | "{" vector_elems "}"                         (* vector literal *)
              | if_expr
              | match_expr
-             | try_expr
              | concurrent_expr
              | detach_expr ;
 
@@ -428,8 +428,6 @@ match_expr = "match" expr ":" NEWLINE INDENT match_cases DEDENT ;
 
 match_cases = match_case { NEWLINE match_case } ;
 match_case  = pattern ":" ( expr | NEWLINE INDENT stmt_list DEDENT ) ;
-
-try_expr = "try" ":" NEWLINE INDENT stmt_list DEDENT ;
 
 debug_block = "debug" ":" NEWLINE INDENT stmt_list DEDENT ;
 

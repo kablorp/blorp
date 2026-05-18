@@ -77,12 +77,11 @@ pure func larger[T: Orderable](a: T, b: T) -> T:
     else:
         b
 
--- try: expressions keep fallible code linear and still return Option/Result.
-pure func first_two_total(scores: List[Int]) -> Option[Int]:
-    try:
-        first ?= scores.get(0)
-        second ?= scores.get(1)
-        first + second
+	-- ?= keeps fallible code linear and returns from the enclosing carrier.
+	pure func first_two_total(scores: List[Int]) -> Option[Int]:
+	    first ?= scores.get(0)
+	    second ?= scores.get(1)
+	    Some(first + second)
 
 -- concurrent: scopes parallel work and joins it before continuing.
 func compare_totals(left: List[Int], right: List[Int]) -> Result[Int, ConcurrencyError]:
@@ -90,10 +89,9 @@ func compare_totals(left: List[Int], right: List[Int]) -> Result[Int, Concurrenc
         left_total = some_io_call(left)
         right_total = another_io_call(right)
 
-    try:
-        a ?= left_total
-        b ?= right_total
-        a - b
+	    a ?= left_total
+	    b ?= right_total
+	    Ok(a - b)
 ```
 
 There's much more in the [Language Guide](docs/GUIDE.md).
@@ -138,7 +136,7 @@ and code review can be confined to narrow code paths where effects are allowed.
 Blorp is designed so ordinary language operations are safe by construction,
 instead of relying on unchecked runtime failures:
 - no null values or unchecked exceptions
-- absence and fallibility are represented with `Option[T]`, `Result[T, E]`, `match`, and `try:` 
+- absence and fallibility are represented with `Option[T]`, `Result[T, E]`, `match`, and `?=`
 - no shared mutable state
 - deterministic ARC/COW memory management
 - structured concurrency joins spawned work before the block exits
@@ -221,7 +219,7 @@ Blorp is not a kitchen-sink language. Some features are omitted to
 keep programs easier to reason about and make compiler output easier to optimize.
 - **No null**: optional values are represented with `Option[T]`.
 - **No exceptions**: fallible operations use `Option[T]`, `Result[T, E]`, and
-`try:`.
+`?=`.
 - **No `Any` type**: values keep concrete static types instead of falling back to
   unchecked dynamic containers.
 - **No classes**: data and functions are fundamentally separate

@@ -461,16 +461,6 @@ let check_no_raw_top_level_function_refs_at (stage : Core_stage.t)
         Option.fold ~none:acc
           ~some:(fun sub -> visit_ctree bound acc sub)
           ctl_len_default
-  and visit_try_body bound acc = function
-    | [] -> acc
-    | e :: rest ->
-        let acc = visit bound acc e in
-        let bound =
-          match e.Core.desc with
-          | Core.CTryBind (_, v, _, _) -> add_bound_var bound v
-          | _ -> bound
-        in
-        visit_try_body bound acc rest
   and visit_tailrec_loop bound acc = function
     | Core.TailrecUnmanagedLoop { tul_params; tul_body; _ } ->
         let bound = List.fold_left add_bound_core_param bound tul_params in
@@ -526,8 +516,6 @@ let check_no_raw_top_level_function_refs_at (stage : Core_stage.t)
         let acc = visit bound acc scrut in
         visit_ctree bound acc tree
     | Core.CTailrecLoop loop -> visit_tailrec_loop bound acc loop
-    | Core.CTry body -> visit_try_body bound acc body
-    | Core.CTryBind (_, _, _, rhs) -> visit bound acc rhs
     | Core.CConcurrent (block : Core.concurrent_block) ->
         let acc =
           List.fold_left
@@ -715,19 +703,16 @@ let check_no_debug_blocks_at (stage : Core_stage.t) (prog : Core.core_program) :
    Post-desugar: no sugar constructors survive
    ============================================================================ *)
 
-(** After [Core_desugar], no sugar constructors should survive. [CTry] and
-    [CTryBind] are lowered before normal Core desugaring, while
-    [CStringInterp] and [CRecordUpdate] are handled by [Core_desugar].
-    A surviving sugar node means a lowering/desugaring path missed a case
-    and emit would otherwise need a phase-violating fallback. *)
+(** After [Core_desugar], no sugar constructors should survive. [CStringInterp]
+    and [CRecordUpdate] are handled by [Core_desugar]. A surviving sugar node
+    means a lowering/desugaring path missed a case and emit would otherwise
+    need a phase-violating fallback. *)
 let check_no_sugar (prog : Core.core_program) : Core_error.t list =
   fold_program
     (fun acc e ->
       let name_opt =
         match e.Core.desc with
         | Core.CStringInterp _ -> Some "CStringInterp"
-        | Core.CTry _ -> Some "CTry"
-        | Core.CTryBind _ -> Some "CTryBind"
         | Core.CRecordUpdate _ -> Some "CRecordUpdate"
         | _ -> None
       in

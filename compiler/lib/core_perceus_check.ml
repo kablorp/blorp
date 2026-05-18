@@ -30,8 +30,8 @@
     - Doesn't model [CAssign] semantics beyond skipping the LHS.
     - Treats every [CVar target] as a consume (matching Perceus's
       "every use consumes" assumption).
-    - Doesn't simulate side effects or [CTry] short-circuits —
-      those fall through conservatively.
+    - Doesn't simulate side effects for concurrency/detach forms; those fall
+      through conservatively.
     - Doesn't validate that the scrutinee type of a match is
       actually a union / that the patterns exhaustive-match — those
       are upstream concerns. *)
@@ -204,7 +204,7 @@ let rec simulate (target : string) (state : state) (e : core) : unit =
                state.rc)
         else state.rc <- state.rc - 1
         end
-  (* ---- Concurrency / try: conservative pass-through ---- *)
+  (* ---- Concurrency / closures: conservative pass-through ---- *)
   | CClosureCreate cc ->
       (* Each capture consumes 1 ref *)
       if List.exists (fun (n, _) -> n = target) cc.cc_captures then
@@ -214,7 +214,7 @@ let rec simulate (target : string) (state : state) (e : core) : unit =
                state.rc)
         else state.rc <- state.rc - 1
         end
-  | CTry _ | CTryBind _ | CConcurrent _ | CConcurrentFor _ | CDetach _ -> ()
+  | CConcurrent _ | CConcurrentFor _ | CDetach _ -> ()
   | CDebugBlock body -> simulate target state body
   | CListHandoff h ->
       (match h.lh_mode with

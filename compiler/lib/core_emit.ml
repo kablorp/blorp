@@ -17,8 +17,8 @@
     ([CConcurrent] / [CConcurrentFor] / [CDetach]), and RC ops
     ([CDup] / [CDrop]).
 
-    Sugar constructors ([CTry] / [CTryBind] / [CStringInterp] /
-    [CRecordUpdate]), the pre-compile match form ([CMatchArms]),
+    Sugar constructors ([CStringInterp] / [CRecordUpdate]), the pre-compile
+    match form ([CMatchArms]),
     and unresolved calls ([CCall (CKUnknown, _, _)]) are eliminated by
     earlier Core passes.
     If they reach emission it is a pipeline-level invariant violation
@@ -2503,7 +2503,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                   | None ->
                       Core_error.errorf Core_error.Emit e.loc
                         ~hint:
-                          "Option/Result try lowering must emit typed union \
+                          "Option/Result ?= lowering must emit typed union \
                            constructors so managed payloads carry a release \
                            mask."
                         "missing typed constructor `%s.%s` during C emission"
@@ -3554,7 +3554,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           "run with --check-invariants to localize the pass that produced this \
            form; Core_debug should have lowered it"
         "debug block survived Core_debug lowering (emit invariant violated)"
-  | CTry _ | CTryBind _ | CStringInterp _ ->
+  | CStringInterp _ ->
       Core_error.errorf Core_error.Emit e.loc
         ~hint:
           "run with --check-invariants to localize the pass that produced this \
@@ -3966,9 +3966,8 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
   | CListAlloc _ | CListGet _ | CVector _ | CTensorLiteral _ | CDict _
   | CDictConstruct _ | CSetAlloc _ | CRecord _ | CRecordConstruct _
   | CRecordUpdate _ | CRange _ | CLambda _ | CClosureCreate _ | CStringInterp _
-  | CTry _ | CTryBind _ | CDebugBlock _ | CCast _ | CUnbox _ | CUnboxTyped _
-  | CBox _ | CBoxTyped _ | CUnionConstruct _ | CListHandoff _ | CTailrecLoop _
-  | CTailrecRecur _ ->
+  | CDebugBlock _ | CCast _ | CUnbox _ | CUnboxTyped _ | CBox _ | CBoxTyped _
+  | CUnionConstruct _ | CListHandoff _ | CTailrecLoop _ | CTailrecRecur _ ->
       emit_indent ctx;
       emit_expr ctx e;
       emitln ctx ";"

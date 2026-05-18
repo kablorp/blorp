@@ -669,61 +669,34 @@ let test_lower_raw_string_interp_raises () =
            (mk_ast (EStringInterpRaw ("hello ${name}", false)) ty_string)))
 
 (* ============================================================================
-   Try blocks — Phase 2.9 (2026-04-21): ETry body is fully desugared at
-   lower time into nested match/let. CTry and CTryBind nodes are not
-   produced by the normal lowering path anymore.
+   Question-bind lowering: direct [?=] statements are fully desugared at lower
+   time into nested let/match continuations.
    ============================================================================ *)
 
-let test_lower_try () =
-  (* [try: Some(42)] → [blorp_option_some(42)] directly via lower_try_body's
-     single-statement [wrap_success] path. *)
-  let last =
-    mk_ast (ECall (ast_var "Some" ty_int, [ ast_int 42 ])) ty_opt_int
+let test_lower_question_bind_statement () =
+  let rhs = ast_var "maybe" ty_opt_int in
+  let bind = mk_ast (EQuestionBind ("x", Some ty_int, rhs)) ty_int in
+  let success =
+    mk_ast (ECall (ast_var "Some" ty_int, [ ast_var "x" ty_int ])) ty_opt_int
   in
-  let ast = mk_ast (ETry [ last ]) ty_opt_int in
-  let c = lower_expr ast in
-  match c.desc with
-  | CCall (CKBuiltin "blorp_option_some", _, _) -> ()
-  | CCall _ -> () (* wrap may vary by lowering of the inner call *)
-  | CTry _ -> Alcotest.fail "CTry should not survive lower (Phase 2.9)"
-  | _ -> Alcotest.fail "expected desugared try body (CCall or similar)"
-
-let test_lower_try_literal_uses_expected_payload_type () =
-  let literal = mk_ast (ELiteral (LitInt 42L)) (TyConstInt 42) in
-  let ast = mk_ast (ETry [ literal ]) ty_opt_int in
-  let c = lower_expr ast in
-  match c.desc with
-  | CCall (CKBuiltin "blorp_option_some", _, [ arg ]) ->
-      Alcotest.(check bool) "payload type" true (arg.ty = ty_int)
-  | _ -> Alcotest.fail "expected try success wrapper"
-
-let test_lower_annotated_try_binding_contextualizes_initializer () =
-  let literal = mk_ast (ELiteral (LitInt 42L)) (TyConstInt 42) in
-  let literal_opt_ty = TyNamed ("Option", [ TyConstInt 42 ]) in
-  let init = mk_ast (ETry [ literal ]) literal_opt_ty in
-  let decl =
-    mk_ast (EVarDecl ("result", Some ty_opt_int, init, false)) ty_void
-  in
-  let block = mk_ast (EBlock [ decl ]) ty_void in
+  let block = mk_ast (EBlock [ bind; success ]) ty_opt_int in
   let c = lower_expr block in
   match c.desc with
-  | CLet ({ bind_ty; bind_rhs; _ }, _) -> (
-      Alcotest.(check bool) "binding type" true (bind_ty = ty_opt_int);
-      Alcotest.(check bool) "initializer type" true (bind_rhs.ty = ty_opt_int);
-      match bind_rhs.desc with
-      | CCall (CKBuiltin "blorp_option_some", _, [ arg ]) ->
-          Alcotest.(check bool) "payload type" true (arg.ty = ty_int)
-      | _ -> Alcotest.fail "expected try success wrapper")
-  | _ -> Alcotest.fail "expected binding"
+  | CLet ({ bind_ty; bind_rhs; _ }, { desc = CMatchArms (_, arms); ty; _ }) ->
+      Alcotest.(check bool) "tmp binding type" true (bind_ty = ty_opt_int);
+      Alcotest.(check bool) "rhs type" true (bind_rhs.ty = ty_opt_int);
+      Alcotest.(check bool) "match result type" true (ty = ty_opt_int);
+      Alcotest.(check int) "arms" 2 (List.length arms)
+  | _ -> Alcotest.fail "expected question-bind let/match lowering"
 
-let test_lower_try_bind () =
-  (* A stray [ETryBind] outside any enclosing [ETry] is a typechecker
-     violation. Phase 2.9's lowering raises a structured error. *)
+let test_lower_question_bind_direct_error () =
+  (* A stray [EQuestionBind] outside [lower_block]'s continuation-aware path is a
+     typechecker violation. Lowering raises a structured error if it leaks. *)
   let rhs = ast_var "opt" ty_opt_int in
-  let ast = mk_ast (ETryBind ("x", Some ty_int, rhs)) ty_int in
+  let ast = mk_ast (EQuestionBind ("x", Some ty_int, rhs)) ty_int in
   try
     let _ = lower_expr ast in
-    Alcotest.fail "expected ETryBind outside ETry to raise"
+    Alcotest.fail "expected EQuestionBind outside block lowering to raise"
   with Blorp.Core_error.Core_error _ -> ()
 
 (* ============================================================================
@@ -1770,12 +1743,10 @@ let suite =
         Alcotest.test_case "string_interp" `Quick test_lower_string_interp;
         Alcotest.test_case "raw_string_interp_raises" `Quick
           test_lower_raw_string_interp_raises;
-        Alcotest.test_case "try" `Quick test_lower_try;
-        Alcotest.test_case "try_literal_payload_type" `Quick
-          test_lower_try_literal_uses_expected_payload_type;
-        Alcotest.test_case "annotated_try_binding_context" `Quick
-          test_lower_annotated_try_binding_contextualizes_initializer;
-        Alcotest.test_case "try_bind" `Quick test_lower_try_bind;
+        Alcotest.test_case "question_bind" `Quick
+          test_lower_question_bind_statement;
+        Alcotest.test_case "question_bind_direct_error" `Quick
+          test_lower_question_bind_direct_error;
       ] );
     ( "concurrency",
       [

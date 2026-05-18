@@ -243,9 +243,9 @@ type t = {
   mutable lower_param_counter : int;
       (** Next [__p_N] id used by [Core_lower] when generating pattern-
       parameter temps for nested patterns in function params. *)
-  mutable lower_try_counter : int;
-      (** Next [__try_N] id used by [Core_lower] when desugaring
-      [try: … x ?= e … ] binds into [CLet]/[CMatchArms] chains. *)
+  mutable lower_question_bind_counter : int;
+      (** Next [__qb_N] id used by [Core_lower] when desugaring direct [?=]
+      binds into [CLet]/[CMatchArms] chains. *)
   mutable desugar_counter : int;
       (** Next fresh-id used by [Core_desugar] for CRecordUpdate
       temporaries and string-interp rewriting. *)
@@ -281,7 +281,7 @@ let create () : t =
     meta_env = Hashtbl.create 64;
     lower_destruct_counter = 0;
     lower_param_counter = 0;
-    lower_try_counter = 0;
+    lower_question_bind_counter = 0;
     desugar_counter = 0;
     ssa_mut_counter = 0;
   }
@@ -293,7 +293,7 @@ let create () : t =
 let reset_core_counters (s : t) : unit =
   s.lower_destruct_counter <- 0;
   s.lower_param_counter <- 0;
-  s.lower_try_counter <- 0;
+  s.lower_question_bind_counter <- 0;
   s.desugar_counter <- 0;
   s.ssa_mut_counter <- 0;
   (* Reset [def_id_counter] too so repeated compiles of the same source yield

@@ -127,8 +127,7 @@ type expr_desc =
   | ESubscriptAssign of expr * expr list * expr
   | EStringInterp of string_interp_part list * bool
   | EStringInterpRaw of string * bool
-  | ETry of expr list
-  | ETryBind of string * Ast.type_expr option * expr
+  | EQuestionBind of string * Ast.type_expr option * expr
   | EDebugBlock of expr list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr
@@ -338,10 +337,10 @@ let rec validate_expr_tree expr =
           ty_opt
       in
       validate_expr_tree init
-  | Ast.ETryBind (_, ty_opt, value) ->
+  | Ast.EQuestionBind (_, ty_opt, value) ->
       let* () =
         ensure_optional_type ~loc:expr.expr_loc
-          ~context:"try binding annotation" ty_opt
+          ~context:"question binding annotation" ty_opt
       in
       validate_expr_tree value
   | Ast.EConcurrentBind (_, ty_opt, value) ->
@@ -740,12 +739,9 @@ let expr_desc (expr : expr) =
       Ok (EStringInterp (parts, is_triple))
   | Ast.EStringInterpRaw (text, is_triple) ->
       Ok (EStringInterpRaw (text, is_triple))
-  | Ast.ETry exprs ->
-      let* exprs = typed_children exprs in
-      Ok (ETry exprs)
-  | Ast.ETryBind (name, ty, value) ->
+  | Ast.EQuestionBind (name, ty, value) ->
       let* value = typed_child value in
-      Ok (ETryBind (name, ty, value))
+      Ok (EQuestionBind (name, ty, value))
   | Ast.EDebugBlock exprs ->
       let* exprs = typed_children exprs in
       Ok (EDebugBlock exprs)

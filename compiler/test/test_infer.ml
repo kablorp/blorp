@@ -357,7 +357,7 @@ func f() -> Int:
             ty_void
       | None -> Alcotest.fail "function f not found")
 
-let test_infer_string_interp_and_try_carry_no_widening_payload () =
+let test_infer_string_interp_and_question_bind_carry_no_widening_payload () =
   with_isolated_env (fun () ->
       let src =
         {|
@@ -374,9 +374,8 @@ func describe(x: Int) -> String:
 
 
 func f() -> Option[Int]:
-    try:
-        x ?= maybe()
-        x + 1
+    x ?= maybe()
+    Some(x + 1)
 |}
       in
       let typed, errors = parse_and_typecheck_module src in
@@ -396,17 +395,16 @@ func f() -> Option[Int]:
       match find_func_body typed "f" with
       | Some body ->
           let option_int = TyNamed ("Option", [ ty_int ]) in
+          assert_keep_payload "question-bind block" option_int body;
           let require label pred expected_ty =
             match find_first_expr pred body with
             | Some expr -> assert_keep_payload label expected_ty expr
             | None -> Alcotest.failf "%s expression not found" label
           in
-          require "try"
-            (function { expr_desc = ETry _; _ } -> true | _ -> false)
-            option_int;
-          require "try bind"
+          require "question bind"
             (function
-              | { expr_desc = ETryBind ("x", _, _); _ } -> true | _ -> false)
+              | { expr_desc = EQuestionBind ("x", _, _); _ } -> true
+              | _ -> false)
             ty_int
       | None -> Alcotest.fail "function f not found")
 
@@ -826,8 +824,9 @@ let suite =
           test_infer_void_carries_no_widening_payload;
         Alcotest.test_case "statement control-flow carries no-widening payload"
           `Quick test_infer_statement_control_flow_carries_no_widening_payload;
-        Alcotest.test_case "string interp and try carry no-widening payload"
-          `Quick test_infer_string_interp_and_try_carry_no_widening_payload;
+        Alcotest.test_case
+          "string interp and question-bind carry no-widening payload" `Quick
+          test_infer_string_interp_and_question_bind_carry_no_widening_payload;
         Alcotest.test_case "concurrent carries no-widening payload" `Quick
           test_infer_concurrent_carries_no_widening_payload;
         Alcotest.test_case "collection literals carry no-widening payload"

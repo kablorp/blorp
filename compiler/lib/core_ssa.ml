@@ -156,10 +156,6 @@ let rec classify_assignment_shape (name : string) (e : core) : assignment_shape
             ~default:No_assign;
         ]
   | CDetach detach -> classify_control_boundary name detach.detach_body
-  | CTry body ->
-      combine_assignment_shapes (List.map (classify_control_boundary name) body)
-  | CTryBind (_, v, _, rhs) ->
-      if v.vname = name then No_assign else classify_control_boundary name rhs
   | _ ->
       Core.fold_immediate_children
         (fun acc child ->

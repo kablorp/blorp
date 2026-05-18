@@ -434,11 +434,11 @@ stmt:
     { let all = d1 :: ds in
       if List.length all > 4 then parse_fail_at $symbolstartpos "Tuples support 2-4 elements";
       make_expr_at $symbolstartpos (EForTuple (all, iter, make_expr (EBlock body))) }
-  (* ?= bindings for try: blocks *)
+  (* ?= bindings propagate Option/Result from the enclosing carrier-returning block. *)
   | name = IDENT QUESTION_EQUALS e = expr
-    { make_expr_at $symbolstartpos (ETryBind (name, None, e)) }
+    { make_expr_at $symbolstartpos (EQuestionBind (name, None, e)) }
   | name = IDENT COLON ty = type_expr QUESTION_EQUALS e = expr
-    { make_expr_at $symbolstartpos (ETryBind (name, Some ty, e)) }
+    { make_expr_at $symbolstartpos (EQuestionBind (name, Some ty, e)) }
   (* Nested function declaration: [pure func name[T](params) -> ret: body]
      appearing inside a block. Produces [EFuncDecl] which the nested-hoist
      pre-infer pass lifts to top level. Same syntax as a top-level func_decl
@@ -1050,10 +1050,15 @@ primary_expr:
   | MATCH expr NEWLINE
     { parse_fail_at $startpos($3) "Expected ':' after match expression" }
   | TRY COLON NEWLINE INDENT stmts = stmt_list DEDENT
-    { make_expr_at $symbolstartpos (ETry stmts) }
-  (* Error: try without colon *)
+    { let _ = stmts in
+      parse_fail_at $symbolstartpos
+        "try: blocks have been removed; use `name ?= expr` directly in a function returning Option or Result." }
+  (* Legacy error: try blocks were removed. Keep this narrow production so
+     existing code gets the same migration guidance even when the colon is
+     missing. *)
   | TRY NEWLINE
-    { parse_fail_at $startpos($2) "Expected ':' after try" }
+    { parse_fail_at $symbolstartpos
+        "try: blocks have been removed; use `name ?= expr` directly in a function returning Option or Result." }
   (* concurrent: block — no timeout *)
   (* concurrent: block — no params *)
   | CONCURRENT COLON NEWLINE INDENT stmts = stmt_list DEDENT

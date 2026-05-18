@@ -9,7 +9,8 @@ type purpose =
   | ArgumentCompatibility
   | UfcsCandidateFiltering
   | CalleeDispatch
-  | TryErrorCompatibility
+  | LambdaExpectedFunction
+  | QuestionBindErrorCompatibility
   | VariadicDimensionExtraction
 
 type context

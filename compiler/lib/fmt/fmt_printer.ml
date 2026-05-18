@@ -104,7 +104,6 @@ let rec expr_source_end_line e =
   | EList exprs
   | EVector exprs
   | ETuple exprs
-  | ETry exprs
   | EDebugBlock exprs ->
       max_exprs base exprs
   | ERecord fields -> max_fields base fields
@@ -120,7 +119,7 @@ let rec expr_source_end_line e =
   | EAssign (_, value)
   | EVarDecl (_, _, value, _)
   | ETupleDestruct (_, value)
-  | ETryBind (_, _, value) ->
+  | EQuestionBind (_, _, value) ->
       max base (expr_source_end_line value)
   | ESubscriptMulti (target, indices) ->
       max_exprs (max base (expr_source_end_line target)) indices
@@ -676,7 +675,7 @@ and print_expr_desc = function
   | EAscription (inner, ty) ->
       let inner_doc =
         match inner.expr_desc with
-        | EAscription _ | EBlock _ | EMatch _ | EIf _ | ETry _ | EDebugBlock _
+        | EAscription _ | EBlock _ | EMatch _ | EIf _ | EDebugBlock _
         | EConcurrent _ | EConcurrentFor _ | EFor _ | EForTuple _ | EWhile _ ->
             parens (print_expr inner)
         | _ -> print_expr inner
@@ -894,14 +893,13 @@ and print_expr_desc = function
                 fields)
         ^^ text " }")
   | EFieldAccess (e, field) ->
-      (* Block-like expressions need parentheses when used as a method receiver,
-         otherwise `(try: ...).method()` becomes `try: ...\n.method()`.
+      (* Block-like expressions need parentheses when used as a method receiver.
          Lower-precedence expressions also need parentheses: dropping them
          changes `(a + b).to_string()` into `a + b.to_string()`. *)
       let e_doc =
         match e.expr_desc with
-        | ETry _ | EDebugBlock _ | EIf _ | EMatch _ | EBlock _ | EFor _
-        | EForTuple _ | EWhile _ | EConcurrent _ ->
+        | EDebugBlock _ | EIf _ | EMatch _ | EBlock _ | EFor _ | EForTuple _
+        | EWhile _ | EConcurrent _ ->
             text "(" ^^ print_expr e ^^ hardline ^^ text ")"
         | EAscription _ | EBinary _ | ELogical _ | ERange _ | EUnary _ ->
             parens (print_expr e)
@@ -996,10 +994,9 @@ and print_expr_desc = function
   | EStringInterpRaw (s, is_triple) ->
       let quote = if is_triple then "\"\"\"" else "\"" in
       text (Printf.sprintf "%s%s%s" quote (blorp_escape_string s) quote)
-  | ETry stmts -> text "try:" ^^ indent (hardline ^^ print_block_exprs stmts)
   | EDebugBlock stmts ->
       text "debug:" ^^ indent (hardline ^^ print_block_exprs stmts)
-  | ETryBind (name, ty_opt, e) ->
+  | EQuestionBind (name, ty_opt, e) ->
       let ty_ann =
         match ty_opt with
         | Some ty -> text ": " ^^ print_type_expr ty

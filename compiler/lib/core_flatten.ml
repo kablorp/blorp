@@ -356,8 +356,6 @@ let prefix_module_names ?(debug = false) (mod_name : string)
     | Core.CFor (binder, iter, body) ->
         Core.CFor
           ({ binder with loop_ty = rewrite_type binder.loop_ty }, iter, body)
-    | Core.CTryBind (kind, v, ty, rhs) ->
-        Core.CTryBind (kind, v, rewrite_type ty, rhs)
     | Core.CDup (v, ty, body) -> Core.CDup (v, rewrite_type ty, body)
     | Core.CDrop (v, ty, body) -> Core.CDrop (v, rewrite_type ty, body)
     | Core.CConcurrent cb ->

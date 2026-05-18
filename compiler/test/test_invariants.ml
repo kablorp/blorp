@@ -244,9 +244,8 @@ let test_debug_check_passes_on_clean_program () =
   Alcotest.(check int) "no violations" 0 (List.length violations)
 
 (* ============================================================================
-   Post-desugar: no sugar nodes (CStringInterp / CTry / CTryBind /
-   CRecordUpdate). The dispatcher also runs this check at Desugar and
-   Perceus as a bookend.
+   Post-desugar: no sugar nodes (CStringInterp / CRecordUpdate). The dispatcher
+   also runs this check at Desugar and Perceus as a bookend.
    ============================================================================ *)
 
 let test_sugar_check_flags_cstringinterp () =
@@ -261,13 +260,6 @@ let test_sugar_check_flags_cstringinterp () =
         "mentions CStringInterp" true
         (Modules.contains v.Core_error.msg "CStringInterp")
   | _ -> Alcotest.fail "unreachable"
-
-let test_sugar_check_flags_ctry () =
-  let body = [ mk (CLit (LitInt 1L)) ty_int ] in
-  let node = mk (CTry body) ty_int in
-  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
-  let violations = Core_invariants.check_no_sugar prog in
-  Alcotest.(check int) "one violation" 1 (List.length violations)
 
 let test_sugar_check_passes_on_clean_program () =
   let body = mk (CLit (LitInt 42L)) ty_int in
@@ -1540,7 +1532,6 @@ let suite =
       [
         Alcotest.test_case "flags CStringInterp" `Quick
           test_sugar_check_flags_cstringinterp;
-        Alcotest.test_case "flags CTry" `Quick test_sugar_check_flags_ctry;
         Alcotest.test_case "clean passes" `Quick
           test_sugar_check_passes_on_clean_program;
       ] );

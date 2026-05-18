@@ -338,22 +338,6 @@ let test_construct_string_interp () =
   | CStringInterp (ps, false) -> Alcotest.(check int) "parts" 3 (List.length ps)
   | _ -> Alcotest.fail "expected CStringInterp"
 
-let test_construct_try () =
-  let e = mk (CTry [ cint 1; cint 2 ]) ty_int in
-  match e.desc with
-  | CTry xs -> Alcotest.(check int) "body len" 2 (List.length xs)
-  | _ -> Alcotest.fail "expected CTry"
-
-let test_construct_try_bind () =
-  let e =
-    mk
-      (CTryBind (TKOption, Var.named "x", ty_int, cvar "opt" ty_opt_int))
-      ty_int
-  in
-  match e.desc with
-  | CTryBind (TKOption, { vname = "x"; _ }, _, _) -> ()
-  | _ -> Alcotest.fail "expected CTryBind"
-
 (* ============================================================================
    CBox: Phase 2.6.3 — carries an explicit source-type annotation so the
    box strategy doesn't depend on the child node's .ty staying correct.
@@ -1120,8 +1104,6 @@ let suite =
         Alcotest.test_case "detach" `Quick test_construct_detach;
         Alcotest.test_case "record_update" `Quick test_construct_record_update;
         Alcotest.test_case "string_interp" `Quick test_construct_string_interp;
-        Alcotest.test_case "try" `Quick test_construct_try;
-        Alcotest.test_case "try_bind" `Quick test_construct_try_bind;
       ] );
     ( "cbox",
       [

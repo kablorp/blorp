@@ -377,17 +377,8 @@ let test_desugar_interp_empty () =
   | CLit (LitString ("", _)) -> ()
   | _ -> Alcotest.fail "empty interp should be empty string"
 
-(* ============================================================================
-   CTry/CTryBind desugaring — REMOVED Phase 2.9 (2026-04-21)
-
-   These tests constructed CTry/CTryBind Core nodes directly and asserted
-   the desugar pass rewrote them into CLet+CMatchArms. The rewrite is now
-   performed at lower time by [Core_lower.lower_try_body], so
-   [Core_desugar.desugar_program] is a pass-through for CTry nodes (which
-   are not produced by the normal path anyway). Coverage moved to
-   integration tests in [tests/test_blorp/types/test_try_block.brp] and
-   the [test_core_lower.ml] "try_blocks" section.
-   ============================================================================ *)
+(* Direct [?=] propagation is lowered before [Core_desugar], so this suite only
+   covers sugar nodes that can still exist in Core. *)
 
 (* ============================================================================
    End-to-end: desugar + emit + cc + run

@@ -600,7 +600,7 @@ rule token = parse
       raise (LexError ("blorp uses 'not' instead of '!'", state.line, state.col))
     }
   | "?" {
-      raise (LexError ("blorp doesn't use '?'. For error propagation, use try: blocks with ?= bindings", state.line, state.col))
+      raise (LexError ("blorp doesn't use postfix '?'. For error propagation, use `name ?= expr` statements in a function returning Option or Result", state.line, state.col))
     }
 
   (* Unknown character *)

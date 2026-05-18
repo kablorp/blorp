@@ -5168,16 +5168,6 @@ let test_emit_invariant_cmatch_expr () =
   expect_core_error_at ~needle:"CMatchArms" ~line:42 (fun () ->
       emit_to_string node)
 
-let test_emit_invariant_ctry () =
-  (* Phase 2.4: CTry/CTryBind/CStringInterp share a consolidated sugar
-     guard; message names the class, not the specific variant. The
-     needle is the full substring so a future message refactor that
-     keeps the same class-level phrase still passes, but an unrelated
-     "sugar"-word message won't. *)
-  let node = { desc = CTry []; ty = ty_void; loc = invariant_loc } in
-  expect_core_error_at ~needle:"sugar node survived desugaring" ~line:42
-    (fun () -> emit_to_string node)
-
 let test_emit_invariant_cstring_interp () =
   let node =
     {
@@ -5319,7 +5309,6 @@ let suite =
       [
         Alcotest.test_case "CMatchArms in expr" `Quick
           test_emit_invariant_cmatch_expr;
-        Alcotest.test_case "CTry" `Quick test_emit_invariant_ctry;
         Alcotest.test_case "CStringInterp" `Quick
           test_emit_invariant_cstring_interp;
         Alcotest.test_case "CMatchArms in stmt" `Quick

@@ -346,8 +346,7 @@ let rec scan_expr scope refs expr =
           | InterpExpr e -> scan_expr scope refs e)
         refs parts
   | EStringInterpRaw _ -> refs
-  | ETry exprs -> scan_try_block scope refs exprs
-  | ETryBind (_name, ty, rhs) ->
+  | EQuestionBind (_name, ty, rhs) ->
       scan_type_opt scope (scan_expr scope refs rhs) ty
   | EDebugBlock exprs | EConcurrent (exprs, None, _) ->
       scan_block scope refs exprs
@@ -374,7 +373,7 @@ and scan_block scope refs exprs =
     | EVarDecl (name, _, _, _) -> add_term_binding name scope
     | ETupleDestruct (names, _) ->
         List.fold_left (fun s n -> add_term_binding n s) scope names
-    | ETryBind (name, _, _) -> add_term_binding name scope
+    | EQuestionBind (name, _, _) -> add_term_binding name scope
     | EConcurrentBind (name, _, _) -> add_term_binding name scope
     | _ -> scope
   in
@@ -386,8 +385,6 @@ and scan_block scope refs exprs =
       (refs, scope) exprs
   in
   refs
-
-and scan_try_block scope refs exprs = scan_block scope refs exprs
 
 and scan_param scope refs param =
   let refs = scan_type_opt scope refs param.param_type in

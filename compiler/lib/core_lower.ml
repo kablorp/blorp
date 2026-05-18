@@ -13,9 +13,8 @@
     - Lowering is {b mechanical}: no optimization, no RC insertion, no
       constant folding. One-to-one translation preserving semantics.
     - Sugar that belongs in Core ([ERecordUpdate], [EStringInterp]) is lowered
-      to explicit Core nodes. Sugar that would complicate later passes
-      ([ETry], [ETryBind]) is desugared here while typed AST context is still
-      available.
+      to explicit Core nodes. Direct [?=] propagation is desugared here while
+      typed AST context is still available.
 
     {1 Block lowering}
 
@@ -54,7 +53,7 @@ module TA = Typed_ast
 (** Fresh-name counters live on [Session.t] (T1.4 — 2026-04-21).
     Rationale: these accumulate per-compilation scratch state. Before
     the migration they were module-level [ref 0] with per-call reset
-    functions that [lower_program] invoked; [try_counter] didn't
+    functions that [lower_program] invoked; the question-bind counter didn't
     reset and silently leaked between compilations in long-lived
     processes (LSP, batch test runner). Moving to [Session] fixes
     the leak and makes the shared-state lifetime explicit. *)
@@ -71,13 +70,12 @@ let fresh_param_name () =
   s.lower_param_counter <- n + 1;
   Printf.sprintf "__p_%d" n
 
-(** [__try_N] matches the naming the legacy desugar path used so
-    post-2.9 Core IR reads the same. *)
-let fresh_try_name () =
+(** Generated temporary for direct [?=] lowering. *)
+let fresh_question_bind_name () =
   let s = Session.current () in
-  let n = s.lower_try_counter in
-  s.lower_try_counter <- n + 1;
-  Printf.sprintf "__try_%d" n
+  let n = s.lower_question_bind_counter in
+  s.lower_question_bind_counter <- n + 1;
+  Printf.sprintf "__qb_%d" n
 
 let fresh_loop_tuple_name () =
   let s = Session.current () in
@@ -574,24 +572,15 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
           "run Interp_parser.transform_program before typechecking and Core \
            lowering so raw interpolation is parsed into EStringInterp parts."
         "EStringInterpRaw reached lowering"
-  (* === Try: desugar to nested match/let at lower time ===
-     Previously [ETry body] lowered to [CTry (List.map lower_child_expr body)] and
-     [core_desugar] rewrote it into match/let form. That path required
-     [splice_continuation] because lowering each stmt in isolation gave each
-     [EVarDecl] an empty [CVoid] continuation, so later
-     siblings that referenced the binding were out of scope. Phase 2.9 moves
-     the full desugaring here: statements are processed in one pass with the
-     rest-of-block threaded into each scope-extender's body. [CTry] /
-     [CTryBind] Core IR nodes are no longer produced (emit's guards for
-     them stay as defense-in-depth). *)
-  | TA.ETry body -> lower_try_body ~try_ty:ty ~loc body
-  | TA.ETryBind _ ->
-      (* A stray [ETryBind] outside a try: block is a typechecker error;
-         if one reaches lowering the typechecker let it through. Raise a
+  | TA.EQuestionBind _ ->
+      (* A stray [EQuestionBind] outside [lower_block]'s continuation-aware path
+         is a typechecker error; if one reaches lowering directly, raise a
          structured error. *)
       Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
-        ~hint:"'name ?= expr' is only valid inside a try: block"
-        "ETryBind reached lowering outside an ETry context"
+        ~hint:
+          "'name ?= expr' must be used as a statement before the expression \
+           that returns Option or Result"
+        "EQuestionBind reached lowering outside a result-producing block"
   | TA.EDebugBlock body ->
       let debug_ty = Ast.TyNamed ("Void", []) in
       let body = lower_block ~loc ~ty:debug_ty body in
@@ -817,6 +806,14 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
               "concurrent bindings (name = expr) must appear inside a \
                concurrent: block"
             "EConcurrentBind reached lowering outside an EConcurrent"
+      | TA.EQuestionBind _ ->
+          if rest = [] then
+            Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc first)
+              ~hint:
+                "the typechecker should reject a final ?= binding before Core \
+                 lowering"
+              "EQuestionBind reached lowering without a success continuation"
+          else lower_question_bind ~block_ty:ty first rest
       | _ when rest = [] ->
           (* Non-binding singleton: just lower as the block's result. *)
           lower_child_expr first
@@ -824,6 +821,118 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
           let first' = lower_child_expr first in
           let rest' = lower_block ~loc:(TA.loc first) ~ty rest in
           mk (CSeq (first', rest')))
+
+(** Lower a direct [?=] block statement.
+
+    This is deliberately continuation-shaped instead of a non-local return:
+    the success arm evaluates the rest of the enclosing block, while the
+    failure arm produces the block's Option/Result value. That preserves the
+    normal expression tree so Perceus can place retains/drops structurally.
+    Inference currently rejects loop bodies because a loop would need a real
+    early-return node plus scope cleanup. *)
+and lower_question_bind ~block_ty (stmt : TA.expr) (rest : TA.expr list) :
+    Core.core =
+  let classify t =
+    match Codegen_types.normalize_type t with
+    | Ast.TyNamed ("Option", _) -> Some `Option
+    | Ast.TyNamed ("Result", _) -> Some `Result
+    | _ -> None
+  in
+  let unwrap_inner rhs_ty =
+    match Codegen_types.normalize_type rhs_ty with
+    | Ast.TyNamed ("Option", [ inner ]) -> inner
+    | Ast.TyNamed ("Result", [ ok; _ ]) -> ok
+    | _ -> rhs_ty
+  in
+  let builtin_call name (args : Core.core list) ret_ty call_loc =
+    let dummy =
+      { Core.desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = call_loc }
+    in
+    {
+      Core.desc = CCall (CKBuiltin name, dummy, args);
+      ty = ret_ty;
+      loc = call_loc;
+    }
+  in
+  match typed_expr_desc stmt with
+  | TA.EQuestionBind (name, ty_ann, rhs) ->
+      let block_kind =
+        match classify block_ty with
+        | Some k -> k
+        | None ->
+            Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc stmt)
+              ~hint:
+                "typechecking should only allow ?= in blocks returning Option \
+                 or Result"
+              "cannot classify ?= block carrier type: %s"
+              (Types.type_to_string block_ty)
+      in
+      let rhs' = lower_child_expr rhs in
+      let node_kind =
+        match classify rhs'.ty with
+        | Some k -> k
+        | None ->
+            Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc rhs)
+              ~hint:
+                "'name ?= expr' requires expr to be Option[T] or Result[T, E]"
+              "cannot classify ?= rhs type: %s"
+              (Types.type_to_string rhs'.ty)
+      in
+      if node_kind <> block_kind then
+        Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc stmt)
+          ~hint:
+            "typechecking should reject mixed Option/Result ?= carriers before \
+             Core lowering"
+          "?= carrier kind changed between inference and lowering";
+      let _ =
+        match ty_ann with
+        | Some t ->
+            require_final_type ~loc:(TA.loc stmt)
+              ~context:"?= binding annotation" t
+        | None -> unwrap_inner rhs'.ty
+      in
+      let tmp_name = fresh_question_bind_name () in
+      let tmp = Core.Var.named tmp_name in
+      let tmp_ref = { Core.desc = CVar tmp; ty = rhs'.ty; loc = TA.loc stmt } in
+      let ctor = match node_kind with `Option -> "Some" | `Result -> "Ok" in
+      let success_body = lower_block ~loc:(TA.loc stmt) ~ty:block_ty rest in
+      let fallback_body =
+        match node_kind with
+        | `Option -> builtin_call "blorp_option_none" [] block_ty (TA.loc stmt)
+        | `Result -> { tmp_ref with Core.desc = CDup (tmp, rhs'.ty, tmp_ref) }
+      in
+      let arms =
+        [
+          (Ast.PatConstructor (ctor, [ Ast.PatVar name ]), success_body);
+          ( (match node_kind with
+            | `Option -> Ast.PatConstructor ("None", [])
+            | `Result -> Ast.PatWildcard),
+            fallback_body );
+        ]
+      in
+      let match_expr =
+        {
+          Core.desc = CMatchArms (tmp_ref, arms);
+          ty = block_ty;
+          loc = TA.loc stmt;
+        }
+      in
+      let binding =
+        {
+          Core.bind_var = tmp;
+          bind_mut = false;
+          bind_ty = rhs'.ty;
+          bind_rhs = rhs';
+        }
+      in
+      {
+        Core.desc = CLet (binding, match_expr);
+        ty = block_ty;
+        loc = TA.loc stmt;
+      }
+  | _ ->
+      Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc stmt)
+        "lower_question_bind called on non-EQuestionBind"
 
 (** Rewrite [for i in indices(coll): body] into an index-based loop.
 
@@ -1304,232 +1413,9 @@ and lower_concurrent_bindings (stmts : TA.expr list) : Core.conc_binding list =
             "non-binding statement reached concurrent lowering")
     stmts
 
-(** Lower a [try:] block body into a fully-desugared match expression.
-
-    Each [?= ] bind becomes a [CLet(tmp, rhs, CMatchArms(tmp, ...))] pair
-    where the [Some(name)] / [Ok(name)] arm evaluates the rest of the try
-    body with [name] in scope, and the wildcard arm returns [tmp] unchanged
-    (propagating the None/Err to the enclosing return).
-
-    Scope-extending statements ([EVarDecl], [ETupleDestruct]) thread the
-    rest of the body into their CLet body, so bindings declared in the try
-    block are visible to later siblings. The last statement is wrapped in
-    [Some(_)] / [Ok(_)] as the success value.
-
-    Replaces the legacy [CTry (List.map lower_child_expr body)] + [core_desugar]
-    path. *)
-and lower_try_body ~try_ty ~loc (stmts : TA.expr list) : Core.core =
-  let classify t =
-    match t with
-    | Ast.TyNamed ("Option", _) -> Some Core.TKOption
-    | Ast.TyNamed ("Result", _) -> Some Core.TKResult
-    | _ -> None
-  in
-  let kind =
-    match classify try_ty with
-    | Some k -> k
-    | None ->
-        Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
-          ~hint:"try: block must produce Option[T] or Result[T, E]"
-          "cannot classify try-block kind: body type is %s"
-          (Types.type_to_string try_ty)
-  in
-  let unwrap_inner rhs_ty =
-    match rhs_ty with
-    | Ast.TyNamed ("Option", [ inner ]) -> inner
-    | Ast.TyNamed ("Result", [ ok; _ ]) -> ok
-    | _ -> rhs_ty
-  in
-  let success_payload_ty kind' =
-    match (kind', Codegen_types.normalize_type try_ty) with
-    | Core.TKOption, Ast.TyNamed ("Option", [ inner ]) -> inner
-    | Core.TKResult, Ast.TyNamed ("Result", [ ok; _ ]) -> ok
-    | _ ->
-        Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
-          ~hint:"try: success wrapping requires a resolved Option/Result type"
-          "cannot determine success payload type for %s"
-          (Types.type_to_string try_ty)
-  in
-  (* Emit a direct [CKBuiltin] call with a dummy callee — mirrors the legacy
-     [core_desugar.builtin_call]. Using [CKUnknown] with a typed [CVar]
-     callee would trip core_resolve's closure fallback because the name
-     isn't in user_funcs/foreign_funcs/constructor_names and the bare-call
-     builtin lookup returns None for these specific helpers. *)
-  let builtin_call name (args : Core.core list) ret_ty call_loc =
-    let dummy =
-      { Core.desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = call_loc }
-    in
-    {
-      Core.desc = CCall (CKBuiltin name, dummy, args);
-      ty = ret_ty;
-      loc = call_loc;
-    }
-  in
-  let wrap_success kind' expr call_loc =
-    let fn =
-      match kind' with
-      | Core.TKOption -> "blorp_option_some"
-      | Core.TKResult -> "blorp_result_ok"
-    in
-    let expr = { expr with Core.ty = success_payload_ty kind' } in
-    builtin_call fn [ expr ] try_ty call_loc
-  in
-  let rec go = function
-    | [] -> (
-        match kind with
-        | Core.TKOption -> builtin_call "blorp_option_none" [] try_ty loc
-        | Core.TKResult ->
-            (* A try-block returning Result can't have an empty body because
-                there's no Err value to synthesize. Typechecker should reject
-                this upstream; raise structurally if it gets through. *)
-            Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
-              ~hint:
-                "try: block returning Result must have at least one statement"
-              "empty try-block body for Result try kind")
-    | [ last ] -> (
-        match typed_expr_desc last with
-        | TA.ETryBind _ -> lower_bind last []
-        | _ -> wrap_success kind (lower_child_expr last) (TA.loc last))
-    | stmt :: rest -> (
-        match typed_expr_desc stmt with
-        | TA.ETryBind _ -> lower_bind stmt rest
-        | TA.EVarDecl (name, ty_ann, init, is_mut) ->
-            let init' = lower_binding_init ty_ann init in
-            let bind_ty =
-              match ty_ann with
-              | Some t ->
-                  require_final_type ~loc:(TA.loc stmt)
-                    ~context:"try local binding annotation" t
-              | None -> init'.ty
-            in
-            let rest_body = go rest in
-            let binding =
-              {
-                Core.bind_var = Core.Var.named name;
-                bind_mut = is_mut;
-                bind_ty;
-                bind_rhs = init';
-              }
-            in
-            {
-              Core.desc = CLet (binding, rest_body);
-              ty = rest_body.ty;
-              loc = TA.loc stmt;
-            }
-        | TA.ETupleDestruct (names, value) ->
-            (* Build the destructure chain with [rest] as its tail. Reuse
-                [lower_tuple_destruct] by passing [rest] but short-circuiting
-                the block dispatcher inside: we call the helper that would
-                run at [lower_block]'s destructure branch. *)
-            let rest_body = go rest in
-            lower_tuple_destruct_with_body ~loc:(TA.loc stmt) names value
-              rest_body
-        | _ ->
-            let first' = lower_child_expr stmt in
-            let rest_body = go rest in
-            {
-              Core.desc = CSeq (first', rest_body);
-              ty = rest_body.ty;
-              loc = TA.loc stmt;
-            })
-  and lower_bind stmt rest =
-    match typed_expr_desc stmt with
-    | TA.ETryBind (name, ty_ann, rhs) ->
-        let rhs' = lower_child_expr rhs in
-        let node_kind =
-          match classify (Codegen_types.normalize_type rhs'.ty) with
-          | Some k -> k
-          | None ->
-              Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc rhs)
-                ~hint:
-                  "'name ?= expr' requires expr to be Option[T] or Result[T, E]"
-                "cannot classify try-bind kind: rhs type is %s"
-                (Types.type_to_string rhs'.ty)
-        in
-        if node_kind <> kind then
-          Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc rhs)
-            ~hint:
-              "use ok_or(...) to convert Option to Result, or return the same \
-               wrapper type from every ?= binding in this try: block"
-            "try-bind kind %s does not match enclosing try: kind %s"
-            (match node_kind with
-            | Core.TKOption -> "Option"
-            | Core.TKResult -> "Result")
-            (match kind with
-            | Core.TKOption -> "Option"
-            | Core.TKResult -> "Result");
-        let bind_ty =
-          match ty_ann with
-          | Some t ->
-              require_final_type ~loc:(TA.loc stmt)
-                ~context:"try binding annotation" t
-          | None -> unwrap_inner (Codegen_types.normalize_type rhs'.ty)
-        in
-        let tmp_name = fresh_try_name () in
-        let tmp = Core.Var.named tmp_name in
-        let tmp_ref =
-          { Core.desc = CVar tmp; ty = rhs'.ty; loc = TA.loc stmt }
-        in
-        let ctor =
-          match node_kind with Core.TKOption -> "Some" | Core.TKResult -> "Ok"
-        in
-        let success_body =
-          match rest with
-          | [] ->
-              wrap_success kind
-                {
-                  Core.desc = CVar (Core.Var.named name);
-                  ty = bind_ty;
-                  loc = TA.loc stmt;
-                }
-                (TA.loc stmt)
-          | _ -> go rest
-        in
-        let fallback_body =
-          match node_kind with
-          | Core.TKOption ->
-              builtin_call "blorp_option_none" [] try_ty (TA.loc stmt)
-          | Core.TKResult ->
-              { tmp_ref with Core.desc = CDup (tmp, rhs'.ty, tmp_ref) }
-        in
-        let arms =
-          [
-            (Ast.PatConstructor (ctor, [ Ast.PatVar name ]), success_body);
-            ( (match node_kind with
-              | Core.TKOption -> Ast.PatConstructor ("None", [])
-              | Core.TKResult -> Ast.PatWildcard),
-              fallback_body );
-          ]
-        in
-        let match_expr =
-          {
-            Core.desc = CMatchArms (tmp_ref, arms);
-            ty = try_ty;
-            loc = TA.loc stmt;
-          }
-        in
-        let binding =
-          {
-            Core.bind_var = tmp;
-            bind_mut = false;
-            bind_ty = rhs'.ty;
-            bind_rhs = rhs';
-          }
-        in
-        {
-          Core.desc = CLet (binding, match_expr);
-          ty = try_ty;
-          loc = TA.loc stmt;
-        }
-    | _ -> failwith "lower_try_body.lower_bind: called on non-ETryBind"
-  in
-  go stmts
-
 (** Tuple-destructure lowering that takes an already-lowered [body]
     (i.e., the rest of an outer block). Mirrors [lower_tuple_destruct]
-    but skips the recursive [lower_block ~loc ~ty rest] call. Used by
-    [lower_try_body] to scope-chain a destructure over the rest of a
-    try block. *)
+    but skips the recursive [lower_block ~loc ~ty rest] call. *)
 and lower_tuple_destruct_with_body ~loc names (value : TA.expr) body =
   let value' = lower_child_expr value in
   (match value'.ty with

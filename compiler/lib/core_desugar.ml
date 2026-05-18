@@ -17,9 +17,7 @@
       other expressions are converted with concrete to-string helpers or
       the [blorp_to_string] sentinel resolved by [Core_specialize].
 
-    Source [try:] is lowered before this pass by [Core_lower]; [CTry] and
-    [CTryBind] are retained only as defensive Core constructors and should
-    not appear on the normal path. *)
+    Direct [?=] propagation is lowered before this pass by [Core_lower]. *)
 
 open Core
 
@@ -216,13 +214,10 @@ let desugar_string_binop (e : core) : core =
   | _ -> e
 
 (* ============================================================================
-   Try/TryBind desugaring — REMOVED in Phase 2.9 (2026-04-21)
+   Legacy try-block desugaring — REMOVED in Phase 2.9 (2026-04-21)
 
-   [ETry] and [ETryBind] are now fully desugared at lower time by
-   [Core_lower.lower_try_body]. Post-lower Core IR never contains [CTry] or
-   [CTryBind] nodes from the normal path. The node constructors stay on
-   [core.desc] for backwards compatibility; defensive emit-time errors in
-   [core_emit] catch any leaks. [splice_continuation] is deleted with the
+   Direct [?=] statements are now fully desugared at lower time by
+   [Core_lower.lower_question_bind]. [splice_continuation] is deleted with the
    rest of this section. *)
 
 (* ============================================================================

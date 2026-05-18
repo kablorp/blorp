@@ -251,9 +251,9 @@ let find_definition (program : program) ~(name : string) ~(line : int)
             | None -> find_local_in_expr c.case_body)
           None cases
     | EWhile (_, body) -> find_local_in_expr body
-    | ETry stmts -> find_local_in_exprs stmts
     | EDebugBlock stmts -> find_local_in_exprs stmts
-    | ETryBind (n, _, _) when n = name && loc_starts_before_cursor e.expr_loc ->
+    | EQuestionBind (n, _, _)
+      when n = name && loc_starts_before_cursor e.expr_loc ->
         Some e.expr_loc
     | EConcurrent (bindings, _, _) -> find_local_in_exprs bindings
     | EConcurrentBind (n, _, _)

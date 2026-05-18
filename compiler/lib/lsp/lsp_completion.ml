@@ -109,7 +109,6 @@ let keywords =
     "False";
     "break";
     "continue";
-    "try";
     "debug";
     "struct";
     "enum";
@@ -389,7 +388,7 @@ let completions_from_local_scope ?(skip = fun _ -> false) (program : program)
           collect_expr iter;
           List.iter (fun name -> add name "loop variable") names;
           collect_expr body
-      | ETryBind (name, source_ty, init) ->
+      | EQuestionBind (name, source_ty, init) ->
           add name (type_detail_opt source_ty);
           collect_expr init
       | EConcurrentBind (name, source_ty, init) ->

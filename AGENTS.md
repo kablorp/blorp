@@ -43,8 +43,8 @@ Pattern matching is the primary control flow mechanism for conditional logic.
 ### Expressiveness
 
 **7. Expressions over statements — everything returns a value.**
-`if`, `match`, `try:` are all expressions. The last expression in a function body is the return
-value. This reduces intermediate variables and makes code compositional.
+`if` and `match` are expressions. The last expression in a function body is the return
+value. `?=` provides explicit Option/Result propagation without exceptions.
 
 **8. UFCS for composition — any function is a method.**
 `x.f(args)` desugars to `f(x, args)`. Enables left-to-right method chaining without OOP.
@@ -548,12 +548,11 @@ import:
     option: Option(Some, None)
     dict as D
 
--- try: blocks with ?= bindings
+-- ?= bindings propagate Option/Result failure from the enclosing function
 func process() -> Option[Int]:
-    try:
-        x ?= get_value()
-        y ?= get_other()
-        x + y
+    x ?= get_value()
+    y ?= get_other()
+    Some(x + y)
 
 -- Concurrency (structured)
 concurrent:

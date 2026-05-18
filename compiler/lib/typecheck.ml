@@ -4083,10 +4083,11 @@ let rec second_pass (state : check_state) (decls : program) :
                         impl.impl_methods
                     in
                     (* Substitute [TySelf] throughout source annotations in an
-                 expression subtree: the [ty] slot of [EVarDecl]/[ETryBind]/
-                 [EConcurrentBind], and param/return types of nested
-                 [ELambda]s. The synthesized method body is re-inferred below,
-                 so typed payloads are produced by the normal inference path. *)
+                 expression subtree: the [ty] slot of
+                 [EVarDecl]/[EQuestionBind]/[EConcurrentBind], and param/return
+                 types of nested [ELambda]s. The synthesized method body is
+                 re-inferred below, so typed payloads are produced by the
+                 normal inference path. *)
                     let subst = resolve_self impl.impl_for_type in
                     let rec subst_body (e : expr) : expr =
                       let desc' =
@@ -4097,8 +4098,9 @@ let rec second_pass (state : check_state) (decls : program) :
                                 Option.map subst ty,
                                 subst_body init,
                                 is_mut )
-                        | ETryBind (name, ty, e1) ->
-                            ETryBind (name, Option.map subst ty, subst_body e1)
+                        | EQuestionBind (name, ty, e1) ->
+                            EQuestionBind
+                              (name, Option.map subst ty, subst_body e1)
                         | EConcurrentBind (name, ty, e1) ->
                             EConcurrentBind
                               (name, Option.map subst ty, subst_body e1)

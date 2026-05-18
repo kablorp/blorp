@@ -68,8 +68,7 @@ let expr_label (expr : Ast.expr) =
   | ESubscriptAssign _ -> "subscript_assign"
   | EStringInterp _ -> "string_interp"
   | EStringInterpRaw _ -> "string_interp_raw"
-  | ETry _ -> "try"
-  | ETryBind (name, _, _) -> "try_bind " ^ name
+  | EQuestionBind (name, _, _) -> "question_bind " ^ name
   | EDebugBlock _ -> "debug_block"
   | EConcurrent _ -> "concurrent"
   | EConcurrentBind (name, _, _) -> "concurrent_bind " ^ name
@@ -93,7 +92,7 @@ let expr_children_from_desc = function
   | EAscription (expr, _)
   | EFieldAccess (expr, _)
   | EAssign (_, expr)
-  | ETryBind (_, _, expr)
+  | EQuestionBind (_, _, expr)
   | EConcurrentBind (_, _, expr)
   | EDetach expr ->
       [ expr ]
@@ -120,7 +119,6 @@ let expr_children_from_desc = function
   | ETuple exprs
   | EVector exprs
   | EList exprs
-  | ETry exprs
   | EDebugBlock exprs
   | EConcurrent (exprs, None, _) ->
       exprs

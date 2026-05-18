@@ -693,19 +693,6 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
     in
     go bound tree
   in
-  let resolve_try_body bound body =
-    let rec go bound acc = function
-      | [] -> List.rev acc
-      | ({ desc = CTryBind (kind, v, ty, rhs); _ } as item) :: rest ->
-          let rhs' = resolve_with bound rhs in
-          let item' = { item with desc = CTryBind (kind, v, ty, rhs') } in
-          go (bind_var bound v) (item' :: acc) rest
-      | item :: rest ->
-          let item' = resolve_with bound item in
-          go bound (item' :: acc) rest
-    in
-    go bound [] body
-  in
   match e.desc with
   | CCall (CKUnknown, callee, args) ->
       let callee' = resolve_same callee in
@@ -784,7 +771,6 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
       { e with desc = CMatchArms (scrut', arms') }
   | CMatch (scrut, tree) ->
       { e with desc = CMatch (resolve_same scrut, resolve_ctree bound tree) }
-  | CTry body -> { e with desc = CTry (resolve_try_body bound body) }
   | CConcurrent block ->
       let conc_bindings =
         List.map

@@ -626,7 +626,7 @@ let return_annotation_inference ty =
   | [] -> ReturnAnnotationGuidesInference ty
   | _ -> (
       match ty with
-      | TyNamed (_, _) | TyTuple _ | TyArray _ ->
+      | TyNamed (_, _) | TyTuple _ | TyArray _ | TyFunc _ ->
           ReturnAnnotationGuidesInference ty
       | _ -> ReturnAnnotationDoesNotGuideInference)
 
@@ -799,7 +799,7 @@ let annotate_inferred_expr expr ty =
 
 (** Validate a ?= type annotation against the unwrapped inner type,
     bind the variable, and return the updated context and typed stmt. *)
-let validate_try_bind ctx stmt name ty_ann inner_ty rhs' =
+let validate_question_bind ctx stmt name ty_ann inner_ty rhs' =
   let* () =
     match ty_ann with
     | Some ann_ty ->
@@ -817,7 +817,7 @@ let validate_try_bind ctx stmt name ty_ann inner_ty rhs' =
   let ctx' = { ctx with env = env' } in
   let stmt' =
     annotate_inferred_expr
-      { stmt with expr_desc = ETryBind (name, ty_ann, rhs') }
+      { stmt with expr_desc = EQuestionBind (name, ty_ann, rhs') }
       inner_ty
   in
   Ok (ctx', stmt')
@@ -1555,11 +1555,11 @@ let check_binop (ctx : infer_ctx) (op : binop) (left_ty : type_expr)
                     | TyNamed ("Option", _), _ | _, TyNamed ("Option", _) ->
                         Some
                           "Option values must be unwrapped first — use match, \
-                           .get_or(default), or try: with ?="
+                           .get_or(default), or a `name ?= expr` statement"
                     | TyNamed ("Result", _), _ | _, TyNamed ("Result", _) ->
                         Some
                           "Result values must be unwrapped first — use match, \
-                           .get_or(default), or try: with ?="
+                           .get_or(default), or a `name ?= expr` statement"
                     | _ -> None)
                 | _ -> help
               in
@@ -2058,12 +2058,6 @@ let ctx_types_compatible ctx expected actual =
         expected actual
   | rigid_vars -> types_compatible_rigid ~rigid_vars expected actual
 
-let same_try_error_type ctx a b =
-  let canonical ty =
-    normalize_type ctx TryErrorCompatibility (Types.zonk_type ty)
-  in
-  types_equal (canonical a) (canonical b)
-
 (** Tensor loop-view classification must be tied to a resolved tensor producer,
     not just the source spelling. Local or third-party functions named
     [enumerate]/[enumerate2]/[windows] must keep normal function-call semantics.
@@ -2208,7 +2202,8 @@ let check_callee_trait_bounds ?callee_bound_params callee_name subst env loc =
 
    Called at the end of each function-body inference. After this walk every
    [expr_type] and [expr_type_info] annotation (plus type annotations embedded
-   in [EVarDecl], [ETryBind], [EConcurrentBind], [ELambda] params/return)
+   in [EVarDecl], [EQuestionBind], [EConcurrentBind], [ELambda]
+   params/return)
    contains no leftover [TyMeta]. Any meta that's still unbound gets reported
    via [collect_unbound_metas] as a location'd "cannot infer" error. *)
 
@@ -2280,9 +2275,8 @@ and zonk_expr_desc = function
               | InterpExpr x -> InterpExpr (zonk_expr x))
             parts,
           triple )
-  | ETry xs -> ETry (List.map zonk_expr xs)
-  | ETryBind (n, ty, v) ->
-      ETryBind (n, Option.map Types.zonk_type ty, zonk_expr v)
+  | EQuestionBind (n, ty, v) ->
+      EQuestionBind (n, Option.map Types.zonk_type ty, zonk_expr v)
   | EDebugBlock xs -> EDebugBlock (List.map zonk_expr xs)
   | EConcurrent (xs, t, m) ->
       EConcurrent (List.map zonk_expr xs, Option.map zonk_expr t, m)
@@ -4060,151 +4054,16 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         | None -> Ok ()
       in
       infer_nd_checked_set ctx expr coll indices value loc
-  (* try: block — short-circuit for Option/Result *)
-  | ETry stmts ->
-      if stmts = [] then error loc "try: block cannot be empty"
-      else begin
-        let expected_try_yield ctx try_context =
-          match (expected_type_opt ctx, try_context) with
-          | Some (TyNamed ("Option", [ payload_ty ])), (None | Some `Option) ->
-              Some payload_ty
-          | ( Some (TyNamed ("Result", [ payload_ty; expected_err_ty ])),
-              Some (`Result actual_err_ty) )
-            when ctx_types_compatible ctx expected_err_ty actual_err_ty ->
-              Some payload_ty
-          | _ -> None
-        in
-        (* Push a new scope for the try block *)
-        let inner_ctx = { ctx with env = Env.push_scope ctx.env } in
-        (* Infer each statement, threading environment through *)
-        let rec infer_try_stmts ctx acc try_context stmts =
-          match stmts with
-          | [] -> error loc "try: block cannot be empty"
-          | [ last ] -> (
-              (* Last expression is the yield — infer it normally *)
-              match last.expr_desc with
-              | ETryBind _ ->
-                  error last.expr_loc
-                    "Last expression in try: block cannot be a ?= binding — it \
-                     must be a value to yield"
-              | _ ->
-                  let* yield_ty, last' =
-                    match expected_try_yield ctx try_context with
-                    | Some payload_ty ->
-                        infer_expected_value_expr ctx payload_ty last
-                    | None -> infer_unconstrained_value_expr ctx last
-                  in
-                  (* Check for accidental double-wrapping — only reject explicit Some()/Ok() calls *)
-                  let is_explicit_wrap =
-                    match last.expr_desc with
-                    | ECall ({ expr_desc = EIdent "Some"; _ }, _) -> Some "Some"
-                    | ECall ({ expr_desc = EIdent "Ok"; _ }, _) -> Some "Ok"
-                    | _ -> None
-                  in
-                  let* () =
-                    match (is_explicit_wrap, try_context) with
-                    | Some "Some", (Some `Option | None) ->
-                        error last.expr_loc
-                          "try: block automatically wraps the result in \
-                           Some(...) — return the bare value instead"
-                    | Some "Ok", Some (`Result _) ->
-                        error last.expr_loc
-                          "try: block automatically wraps the result in \
-                           Ok(...) — return the bare value instead"
-                    | _ -> Ok ()
-                  in
-                  let result_ty =
-                    match try_context with
-                    | Some `Option -> TyNamed ("Option", [ yield_ty ])
-                    | Some (`Result err_ty) ->
-                        TyNamed ("Result", [ yield_ty; err_ty ])
-                    | None ->
-                        (* No ?= bindings — default to Option *)
-                        TyNamed ("Option", [ yield_ty ])
-                  in
-                  Ok
-                    ( result_ty,
-                      with_inferred_type
-                        { expr with expr_desc = ETry (List.rev (last' :: acc)) }
-                        result_ty ))
-          | stmt :: rest -> (
-              match stmt.expr_desc with
-              | ETryBind (name, ty_ann, rhs) -> (
-                  let* rhs_ty, rhs' = infer_unconstrained_value_expr ctx rhs in
-                  (* ?= works on Option and Result only *)
-                  match rhs_ty with
-                  | TyNamed ("Option", [ inner_ty ]) -> (
-                      match try_context with
-                      | Some (`Result _) ->
-                          error stmt.expr_loc
-                            "Cannot mix Option and Result ?= bindings in the \
-                             same try: block"
-                      | _ ->
-                          let* ctx', stmt' =
-                            validate_try_bind ctx stmt name ty_ann inner_ty rhs'
-                          in
-                          infer_try_stmts ctx' (stmt' :: acc) (Some `Option)
-                            rest)
-                  | TyNamed ("Result", [ inner_ty; err_ty ]) -> (
-                      match try_context with
-                      | Some `Option ->
-                          error stmt.expr_loc
-                            "Cannot mix Option and Result ?= bindings in the \
-                             same try: block"
-                      | Some (`Result prev_err_ty) ->
-                          if not (same_try_error_type ctx prev_err_ty err_ty)
-                          then
-                            error stmt.expr_loc
-                              (Printf.sprintf
-                                 "Incompatible error types in try: block: `%s` \
-                                  vs `%s`"
-                                 (type_to_string prev_err_ty)
-                                 (type_to_string err_ty))
-                          else begin
-                            let* ctx', stmt' =
-                              validate_try_bind ctx stmt name ty_ann inner_ty
-                                rhs'
-                            in
-                            infer_try_stmts ctx' (stmt' :: acc)
-                              (Some (`Result err_ty))
-                              rest
-                          end
-                      | None ->
-                          let* ctx', stmt' =
-                            validate_try_bind ctx stmt name ty_ann inner_ty rhs'
-                          in
-                          infer_try_stmts ctx' (stmt' :: acc)
-                            (Some (`Result err_ty))
-                            rest)
-                  | _ ->
-                      error stmt.expr_loc
-                        (Printf.sprintf
-                           "Cannot use `?=` on type `%s` — only Option and \
-                            Result support ?= bindings"
-                           (type_to_string rhs_ty)))
-              | _ ->
-                  (* Regular statement — infer normally and thread context *)
-                  let* _, stmt' = infer_statement_expr ctx stmt in
-                  let ctx' =
-                    match stmt'.expr_desc with
-                    | EVarDecl (name, Some var_ty, value, is_mutable) ->
-                        {
-                          ctx with
-                          env =
-                            Env.add_var ctx.env name var_ty
-                              ?source_type:(inferred_binding_source_type value)
-                              ~mutability:
-                                (if is_mutable then Mutable else Immutable)
-                              ();
-                        }
-                    | _ -> ctx
-                  in
-                  infer_try_stmts ctx' (stmt' :: acc) try_context rest)
-        in
-        infer_try_stmts inner_ctx [] None stmts
-      end
-  (* ?= binding outside try: block *)
-  | ETryBind _ -> error loc "?= binding can only be used inside a try: block"
+  (* Direct ?= bindings are block statements. [infer_block] needs the
+     following statements as the success continuation, so a bare ?= expression
+     is structurally incomplete here. *)
+  | EQuestionBind _ ->
+      error_with ~notes:[]
+        ~help:
+          (Some
+             "write `name ?= expr` as a statement before the expression that \
+              returns Option or Result")
+        loc "?= binding must be used as a statement in a result-producing block"
   | EDebugBlock stmts ->
       let inner_ctx =
         {
@@ -7768,15 +7627,88 @@ and bind_pattern ctx scrutinee_ty pattern loc : infer_ctx infer_result =
           (* Use the first pattern's bindings *)
           Ok first_ctx)
 
+(** Infer a direct [?=] statement against the enclosing block's result
+    carrier. This deliberately does not model non-local control flow; lowering
+    threads the rest of the block as the success continuation and emits the
+    failure branch as the block result. Loop bodies are rejected until Core has
+    an explicit early-return node with Perceus-aware scope cleanup. *)
+and infer_question_bind_statement ctx stmt name ty_ann rhs =
+  if ctx.in_loop then
+    error_with ~notes:[]
+      ~help:
+        (Some
+           "move the ?= before the loop, use match inside the loop, or wait \
+            for explicit early-return support in loop bodies")
+      stmt.expr_loc "?= cannot be used inside loops yet"
+  else
+    let* rhs_ty, rhs' = infer_unconstrained_value_expr ctx rhs in
+    match (expected_type_opt ctx, rhs_ty) with
+    | Some (TyNamed ("Option", [ _ ])), TyNamed ("Option", [ inner_ty ]) ->
+        validate_question_bind ctx stmt name ty_ann inner_ty rhs'
+    | Some (TyNamed ("Option", _)), TyNamed ("Result", [ _inner_ty; _err_ty ])
+      ->
+        error stmt.expr_loc
+          "Cannot use Result ?= in a block returning Option. Convert the \
+           Result to Option or return Result from the enclosing function"
+    | ( Some (TyNamed ("Result", [ _ok_ty; expected_err_ty ])),
+        TyNamed ("Result", [ inner_ty; actual_err_ty ]) ) ->
+        if ctx_types_compatible ctx expected_err_ty actual_err_ty then
+          validate_question_bind ctx stmt name ty_ann inner_ty rhs'
+        else
+          error stmt.expr_loc
+            (Printf.sprintf
+               "Incompatible error type for ?=: enclosing block returns \
+                Result[..., %s], but expression returns Result[..., %s]"
+               (type_to_string expected_err_ty)
+               (type_to_string actual_err_ty))
+    | Some (TyNamed ("Result", _)), TyNamed ("Option", [ _inner_ty ]) ->
+        error stmt.expr_loc
+          "Cannot use Option ?= in a block returning Result. Convert the \
+           Option to Result with ok_or(...) or return Option from the \
+           enclosing function"
+    | Some carrier_ty, (TyNamed ("Option", _) | TyNamed ("Result", _)) ->
+        error stmt.expr_loc
+          (Printf.sprintf
+             "?= requires the enclosing block to return the same carrier as \
+              the expression; enclosing block returns %s"
+             (type_to_string carrier_ty))
+    | _, TyNamed ("Option", _) | _, TyNamed ("Result", _) ->
+        error_with ~notes:[]
+          ~help:
+            (Some
+               "give the enclosing function an explicit Option or Result \
+                return type, or use match for local control flow")
+          stmt.expr_loc
+          "?= requires an enclosing block returning Option[T] or Result[T, E]"
+    | _, _ ->
+        error stmt.expr_loc
+          (Printf.sprintf
+             "Cannot use `?=` on type `%s` — only Option and Result support ?= \
+              bindings"
+             (type_to_string rhs_ty))
+
 (** Infer the type of a block expression *)
 and infer_block ctx expr exprs _loc =
   if exprs = [] then Ok (ty_void, with_inferred_type expr ty_void)
   else begin
     let rec infer_block_exprs ctx acc = function
       | [] -> error expr.expr_loc "Internal error: empty block during inference"
+      | [ ({ expr_desc = EQuestionBind _; _ } as last) ] ->
+          error_with ~notes:[]
+            ~help:
+              (Some
+                 "add a final expression, such as Some(value), Ok(value), or \
+                  another expression returning the enclosing Result")
+            last.expr_loc "?= binding must be followed by a result expression"
       | [ last ] ->
           let* last_ty, last' = infer_expr ctx last in
           Ok (last_ty, List.rev (last' :: acc))
+      | ({ expr_desc = EQuestionBind (name, ty_ann, rhs); _ } as stmt) :: rest
+        ->
+          let* ctx', stmt' =
+            infer_question_bind_statement ctx stmt name ty_ann rhs
+          in
+          infer_block_exprs ctx' (stmt' :: acc) rest
       | stmt :: rest ->
           let stmt_ctx = without_expected ctx in
           let* _, stmt' = infer_statement_expr ctx stmt in
@@ -8209,9 +8141,20 @@ and infer_lambda ctx expr func loc =
   | Some err -> Error err
   | None ->
       (* Check if we have an expected function type for parameter inference *)
-      let param_types =
+      let expected_func_type =
         match expected_type_opt ctx with
-        | Some (TyFunc { params; _ })
+        | Some ty -> (
+            match
+              normalize_type ctx LambdaExpectedFunction (Types.zonk_type ty)
+            with
+            | TyFunc { params; return; is_pure } ->
+                Some (params, return, is_pure)
+            | _ -> None)
+        | None -> None
+      in
+      let param_types =
+        match expected_func_type with
+        | Some (params, _, _)
           when List.length params = List.length func.func_params ->
             List.map Option.some params
         | _ -> List.map (fun _ -> None) func.func_params
@@ -8316,8 +8259,8 @@ and infer_lambda ctx expr func loc =
             | ReturnAnnotationDoesNotGuideInference -> NoExpectedType)
         | None -> (
             (* Fall back to return type from call-site expected function type *)
-            match expected_type_opt ctx with
-            | Some (TyFunc { return; _ }) -> ExpectedType return
+            match expected_func_type with
+            | Some (_, return, _) -> ExpectedType return
             | _ -> NoExpectedType)
       in
 

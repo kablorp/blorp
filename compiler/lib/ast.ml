@@ -222,9 +222,8 @@ and expr_desc =
   | EStringInterp of string_interp_part list * bool
       (** parts * is_triple_quoted *)
   | EStringInterpRaw of string * bool  (** raw_content * is_triple_quoted *)
-  | ETry of expr list  (** try: block — short-circuit for Option/Result *)
-  | ETryBind of string * type_expr option * expr
-      (** name ?= expr — unwrap binding in try block *)
+  | EQuestionBind of string * type_expr option * expr
+      (** name ?= expr — propagate Option/Result from the enclosing block *)
   | EDebugBlock of expr list
       (** debug: block — diagnostics-only statements that return Void *)
   | EConcurrent of expr list * expr option * int option
@@ -543,7 +542,7 @@ let expr_children (e : expr) : expr list =
   | EAscription (e, _)
   | EFieldAccess (e, _)
   | EAssign (_, e)
-  | ETryBind (_, _, e)
+  | EQuestionBind (_, _, e)
   | EConcurrentBind (_, _, e) ->
       [ e ]
   | EBinary (_, l, r)
@@ -566,7 +565,6 @@ let expr_children (e : expr) : expr list =
   | EVector exprs
   | EList exprs
   | ETuple exprs
-  | ETry exprs
   | EDebugBlock exprs
   | EConcurrent (exprs, None, _) ->
       exprs
@@ -608,7 +606,7 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
     | EAscription (e1, ty) -> EAscription (f e1, ty)
     | EFieldAccess (e1, field) -> EFieldAccess (f e1, field)
     | EAssign (name, e1) -> EAssign (name, f e1)
-    | ETryBind (name, ty, e1) -> ETryBind (name, ty, f e1)
+    | EQuestionBind (name, ty, e1) -> EQuestionBind (name, ty, f e1)
     | EConcurrentBind (name, ty, e1) -> EConcurrentBind (name, ty, f e1)
     | EBinary (op, l, r) -> EBinary (op, f l, f r)
     | ELogical (op, l, r) -> ELogical (op, f l, f r)
@@ -634,7 +632,6 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
     | EVector exprs -> EVector (List.map f exprs)
     | EList exprs -> EList (List.map f exprs)
     | ETuple exprs -> ETuple (List.map f exprs)
-    | ETry exprs -> ETry (List.map f exprs)
     | EDebugBlock exprs -> EDebugBlock (List.map f exprs)
     | EConcurrent (exprs, timeout, mt) ->
         EConcurrent (List.map f exprs, Option.map f timeout, mt)
