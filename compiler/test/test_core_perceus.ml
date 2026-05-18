@@ -98,6 +98,25 @@ let rec count_dups_for name e =
     (fun acc child -> acc + count_dups_for name child)
     here e
 
+let intrinsic_runs_under_dup name intrinsic e =
+  let rec go under_dup e =
+    let under_dup =
+      under_dup
+      ||
+      match e.desc with
+      | CDup (v, _, _) when v.vname = name -> true
+      | _ -> false
+    in
+    match e.desc with
+    | CCall (CKIntrinsic actual, _, _) when actual = intrinsic && under_dup ->
+        true
+    | _ ->
+        fold_immediate_children
+          (fun found child -> found || go under_dup child)
+          false e
+  in
+  go false e
+
 let rec has_drop_before_assign_for name e =
   match e.desc with
   | CSeq
@@ -834,6 +853,18 @@ let test_insert_drops_string_runtime_builtin_borrows_arg () =
     "string runtime builtin does not dup arg" 0
     (count_dups_for "s" transformed)
 
+let test_insert_drops_string_conversion_builtin_borrows_arg () =
+  let bind = bind_named "s" ty_string (cstr "3.14") in
+  let body = builtin "blorp_to_float" [ cvar "s" ty_string ] ty_float in
+  let e = mk (CLet (bind, body)) ty_float in
+  let transformed = insert_drops_expr_for_test e in
+  Alcotest.(check int)
+    "string conversion builtin borrows arg" 1
+    (count_drops_for "s" transformed);
+  Alcotest.(check int)
+    "string conversion builtin does not dup arg" 0
+    (count_dups_for "s" transformed)
+
 let test_insert_drops_channel_send_retains_payload_arg () =
   let bind = bind_named "s" ty_string (cstr "payload") in
   let send =
@@ -1012,7 +1043,14 @@ let test_insert_drops_foreign_call_borrows () =
   let body =
     mk
       (CCall
-         ( CKForeign { fc_c_name = "strlen"; fc_arg_passing = ForeignBorrowArgs },
+         ( CKForeign
+             {
+               fc_c_name = "strlen";
+               fc_arg_passing = ForeignBorrowArgs;
+               fc_call_effect =
+                 Blorp.Builtin_metadata.default_foreign_call_effect
+                   ~is_pure:true;
+             },
            cvar "strlen" (func_ty [ ty_string ] ty_int),
            [ cvar "s" ty_string ] ))
       ty_int
@@ -1034,6 +1072,7 @@ let test_insert_drops_foreign_call_borrows () =
                               {
                                 fc_c_name = "strlen";
                                 fc_arg_passing = ForeignBorrowArgs;
+                                _;
                               },
                             _,
                             _ );
@@ -2775,12 +2814,21 @@ let test_mutable_assignment_match_scrutinee_consumes_target_skips_old_release ()
       "COW-consuming match scrutinee released old owner before assignment:\n%s"
       (pp_to_string_indented transformed);
   let drops = count_drops_for "v" transformed in
-  if drops <> 2 then
+  if drops <> 1 then
     Alcotest.failf
-      "COW-consuming match scrutinee should keep one post-assignment balance \
-       drop and one scope-exit drop, got %d:\n\
+      "COW-consuming match scrutinee should keep only the scope-exit drop; \
+       dropping the target immediately after assignment invalidates the \
+       mutable slot, got %d:\n\
        %s"
       drops
+      (pp_to_string_indented transformed);
+  let new_v_dups = count_dups_for "new_v" transformed in
+  if new_v_dups <> 1 then
+    Alcotest.failf
+      "COW-consuming match payload assignment should retain exactly once, got \
+       %d:\n\
+       %s"
+      new_v_dups
       (pp_to_string_indented transformed)
 
 let test_discard_assignment_alias_does_not_retain_owned_result () =
@@ -3362,6 +3410,70 @@ let test_program_drops_borrowed_owned_temporary_user_call_arg () =
             (pp_to_string_indented body))
   | _ -> Alcotest.fail "expected read_len + main"
 
+let test_program_concurrent_for_iter_borrows_collection () =
+  let result_ty =
+    TyNamed ("Result", [ ty_int; TyNamed ("ConcurrencyError", []) ])
+  in
+  let results_ty = TyNamed ("List", [ result_ty ]) in
+  let cf =
+    mk
+      (CConcurrentFor
+         {
+           cf_var = Var.named "i";
+           cf_iter = cvar "xs" ty_list_int;
+           cf_body = cvar "i" ty_int;
+           cf_timeout = None;
+           cf_max_threads = None;
+           cf_task = None;
+         })
+      results_ty
+  in
+  let e =
+    mk
+      (CLet (bind_named "xs" ty_list_int (mk (clist []) ty_list_int), cf))
+      results_ty
+  in
+  let transformed = insert_drops_expr_for_test e in
+  Alcotest.(check int)
+    "concurrent-for borrowed iterator drop" 1
+    (count_drops_for "xs" transformed)
+
+let test_program_concurrent_for_binds_and_drops_owned_iter_temp () =
+  let result_ty =
+    TyNamed ("Result", [ ty_int; TyNamed ("ConcurrencyError", []) ])
+  in
+  let results_ty = TyNamed ("List", [ result_ty ]) in
+  let cf =
+    mk
+      (CConcurrentFor
+         {
+           cf_var = Var.named "i";
+           cf_iter = mk (clist [ cint 1; cint 2 ]) ty_list_int;
+           cf_body = cvar "i" ty_int;
+           cf_timeout = None;
+           cf_max_threads = None;
+           cf_task = None;
+         })
+      results_ty
+  in
+  let transformed = insert_drops_expr_for_test cf in
+  Alcotest.(check int)
+    "concurrent-for owned iterator temp drop" 1
+    (count_drops_for "__borrow_iter_0" transformed);
+  match transformed.desc with
+  | CLet
+      ( {
+          bind_var = { vname = "__borrow_iter_0"; _ };
+          bind_rhs = { desc = CList _; _ };
+          _;
+        },
+        _ ) ->
+      ()
+  | _ ->
+      Alcotest.failf
+        "concurrent-for owned iterator was not bound before use:\n%s"
+        (pp_to_string_indented transformed)
+
 let test_program_drops_retained_owned_temporary_builtin_arg () =
   (* Retain-mode call slots are caller-owned just like borrowed slots: the
      callee may retain for storage, but the caller must still drop an owned
@@ -3658,6 +3770,60 @@ let test_program_borrow_then_cow_param_does_not_dup_before_cow () =
         "borrow-before-cow parameter dup count" 0
         (count_dups_for "self" transformed)
   | _ -> Alcotest.fail "expected transformed grow function"
+
+let test_program_std_list_set_consumes_receiver_despite_noop_branch () =
+  (* std/list.set is an explicit COW receiver-reuse operation. Its
+     out-of-bounds branch returns the receiver unchanged, but that is still a
+     transfer of the receiver owner back to the caller, not evidence that the
+     receiver should be borrowed. If Perceus infers Borrow here, it retains
+     before list_ensure_unique and every hot set() call copies. *)
+  let self = param "self" ty_list_int in
+  let index = param "index" ty_int in
+  let elem = param "elem" ty_int in
+  let cow_branch =
+    intrinsic "list_ensure_unique" [ cvar "self" ty_list_int ] ty_list_int
+  in
+  let body =
+    mk
+      (CIf (cvar "in_bounds" ty_bool, cow_branch, cvar "self" ty_list_int))
+      ty_list_int
+  in
+  let set_func =
+    {
+      (mk_func ~def_id:240 ~params:[ self; index; elem ]
+         "std_list__set__mono_Int" ty_list_int body)
+      with
+      cf_module = Some "std/list";
+    }
+  in
+  let prog = [ { cd_desc = CDFunc set_func; cd_loc = loc; cd_doc = None } ] in
+  let env = Blorp.Core_perceus.build_type_env prog in
+  Blorp.Core_perceus.populate_user_call_contracts env prog;
+  (match
+     Blorp.Core_perceus.contract_for_call env
+       (CKUser ("std_list__set__mono_Int", Some 240))
+       ~arg_count:3 ~return_ty:ty_list_int
+   with
+  | Some
+      {
+        Blorp.Core_ownership.args =
+          [ Blorp.Core_ownership.Consume; _index_mode; _elem_mode ];
+        result = Blorp.Core_ownership.ReturnOwned;
+      } ->
+      ()
+  | Some { Blorp.Core_ownership.args = mode :: _; _ } ->
+      Alcotest.failf "expected consuming std/list.set receiver, got %s"
+        (Blorp.Core_ownership.string_of_arg_mode mode)
+  | Some other ->
+      Alcotest.failf "unexpected std/list.set contract arity: args=%d"
+        (List.length other.Blorp.Core_ownership.args)
+  | None -> Alcotest.fail "missing inferred std/list.set contract");
+  match Blorp.Core_perceus.insert_drops_program prog with
+  | [ { cd_desc = CDFunc { cf_body = Some transformed; _ }; _ } ] ->
+      Alcotest.(check bool)
+        "std/list.set COW boundary should not run under receiver dup" false
+        (intrinsic_runs_under_dup "self" "list_ensure_unique" transformed)
+  | _ -> Alcotest.fail "expected transformed std/list.set function"
 
 let cow_param_before_loop_body cow_intrinsic ty =
   let result_bind =
@@ -4299,6 +4465,84 @@ let test_program_constructor_assignment_retains_mutable_local () =
         "constructor assignment did not retain mutable local payload:\n%s"
         rendered
 
+let test_program_constructor_tail_consumes_mutable_local_drops_original () =
+  let boxed_ctor_ty = func_ty [ ty_string ] ty_boxed_string in
+  let payload_bind =
+    bind_named ~mut:true "payload" ty_string (cstr "payload")
+  in
+  let body =
+    mk
+      (CLet
+         ( payload_bind,
+           mk
+             (CCall
+                ( CKUser ("Boxed", Some 40),
+                  cvar "Boxed" boxed_ctor_ty,
+                  [ cvar "payload" ty_string ] ))
+             ty_boxed_string ))
+      ty_boxed_string
+  in
+  let make_box =
+    mk_func ~def_id:44 ~params:[] "make_box" ty_boxed_string body
+  in
+  let prog =
+    [
+      {
+        cd_desc = CDType (boxed_string_type_decl ());
+        cd_loc = loc;
+        cd_doc = None;
+      };
+      { cd_desc = CDFunc make_box; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let transformed = Blorp.Core_perceus.insert_drops_program prog in
+  match transformed with
+  | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ]
+    when count_dups_for "payload" body > 0 && count_drops_for "payload" body = 1
+    ->
+      ()
+  | _ ->
+      let rendered =
+        match transformed with
+        | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] ->
+            pp_to_string_indented body
+        | _ -> "<unexpected program shape>"
+      in
+      Alcotest.failf
+        "constructor tail consume of mutable local was not balanced:\n%s"
+        rendered
+
+let test_program_list_literal_drops_retained_local_element () =
+  let s_bind = bind_named "s" ty_string (cstr "item") in
+  let list_expr =
+    mk
+      (CList
+         {
+           ll_layout = list_pointer_storage ();
+           ll_elems = [ cvar "s" ty_string ];
+         })
+      ty_list_string
+  in
+  let body = mk (CLet (s_bind, list_expr)) ty_list_string in
+  let make_list =
+    mk_func ~def_id:45 ~params:[] "make_list" ty_list_string body
+  in
+  let prog = [ { cd_desc = CDFunc make_list; cd_loc = loc; cd_doc = None } ] in
+  let transformed = Blorp.Core_perceus.insert_drops_program prog in
+  match transformed with
+  | [ { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ]
+    when count_drops_for "s" body = 1 ->
+      ()
+  | _ ->
+      let rendered =
+        match transformed with
+        | [ { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] ->
+            pp_to_string_indented body
+        | _ -> "<unexpected program shape>"
+      in
+      Alcotest.failf "list literal retained local element was not dropped:\n%s"
+        rendered
+
 (* ============================================================================
    Test suite
    ============================================================================ *)
@@ -4429,6 +4673,8 @@ let suite =
           test_insert_drops_string_eq_borrows_in_nested_branch;
         Alcotest.test_case "string_runtime_builtin_borrows_arg" `Quick
           test_insert_drops_string_runtime_builtin_borrows_arg;
+        Alcotest.test_case "string_conversion_builtin_borrows_arg" `Quick
+          test_insert_drops_string_conversion_builtin_borrows_arg;
         Alcotest.test_case "channel_send_retains_payload_arg" `Quick
           test_insert_drops_channel_send_retains_payload_arg;
         Alcotest.test_case "channel_recv_borrows_channel_arg" `Quick
@@ -4518,6 +4764,10 @@ let suite =
           test_program_loop_var_consuming_user_call_retains_loop_owner;
         Alcotest.test_case "borrowed_temp_user_call_drop" `Quick
           test_program_drops_borrowed_owned_temporary_user_call_arg;
+        Alcotest.test_case "concurrent_for_iter_borrows_collection" `Quick
+          test_program_concurrent_for_iter_borrows_collection;
+        Alcotest.test_case "concurrent_for_owned_iter_temp_drop" `Quick
+          test_program_concurrent_for_binds_and_drops_owned_iter_temp;
         Alcotest.test_case "retained_temp_builtin_call_drop" `Quick
           test_program_drops_retained_owned_temporary_builtin_arg;
         Alcotest.test_case "retained_let_temp_builtin_call_drop" `Quick
@@ -4536,6 +4786,8 @@ let suite =
           test_program_infers_cow_wrapper_consumes_receiver;
         Alcotest.test_case "borrow_then_cow_param_no_dup" `Quick
           test_program_borrow_then_cow_param_does_not_dup_before_cow;
+        Alcotest.test_case "std_list_set_consumes_noop_receiver" `Quick
+          test_program_std_list_set_consumes_receiver_despite_noop_branch;
         Alcotest.test_case "cow_param_before_loop_no_dup" `Quick
           test_program_cow_param_before_loop_does_not_dup_before_cow;
         Alcotest.test_case "field_return_owned_contract" `Quick
@@ -4562,5 +4814,10 @@ let suite =
           test_program_constructor_retains_borrowed_lambda_param;
         Alcotest.test_case "constructor_assignment_retains_mutable_local" `Quick
           test_program_constructor_assignment_retains_mutable_local;
+        Alcotest.test_case "constructor_tail_mutable_local_drops_original"
+          `Quick
+          test_program_constructor_tail_consumes_mutable_local_drops_original;
+        Alcotest.test_case "list_literal_drops_retained_local_element" `Quick
+          test_program_list_literal_drops_retained_local_element;
       ] );
   ]

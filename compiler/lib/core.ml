@@ -538,7 +538,8 @@ and ctree =
 
     - [CKUser name]: call to a user-defined blorp function by source name.
     - [CKForeign info]: call to a foreign C function, including the C
-      symbol and the argument-passing mode selected at the declaration site.
+      symbol, the argument-passing mode selected at the declaration site, and
+      explicit call-effect metadata.
     - [CKBuiltin c_name]: call to a blorp builtin with a resolved C name.
     - [CKIntrinsic name]: a primitive operation defined at the IR level.
       Unlike [CKBuiltin], which maps to a named C function, intrinsics
@@ -562,7 +563,11 @@ and foreign_arg_passing =
       (** Borrowing FFI boundary: pass direct runtime buffers. Used by
         [foreign pure func] and explicit [@no_copy] declarations. *)
 
-and foreign_call = { fc_c_name : string; fc_arg_passing : foreign_arg_passing }
+and foreign_call = {
+  fc_c_name : string;
+  fc_arg_passing : foreign_arg_passing;
+  fc_call_effect : Builtin_metadata.call_effect;
+}
 
 and call_kind =
   | CKUnknown
@@ -2243,6 +2248,7 @@ type cf_kind =
       includes : string list;
       link_flags : (string option * string) list;
       arg_passing : foreign_arg_passing;
+      call_effect : Builtin_metadata.call_effect;
     }
   | CFClosureBody of closure_abi
 

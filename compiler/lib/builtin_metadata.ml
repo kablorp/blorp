@@ -3,7 +3,14 @@
     Keep semantic facts here instead of scattering name sets through compiler
     phases. Unknown names are treated as ordinary user/module functions. *)
 
-type wait_effect = No_wait | May_park_fiber | May_block_thread
+type wait_effect =
+  | No_wait
+  | May_park_fiber
+  | May_block_thread
+  (* Some calls have a blocking setup phase followed by a fiber-aware wait, e.g.
+     TCP connect with inline getaddrinfo and nonblocking socket connect. *)
+  | May_block_thread_and_park_fiber
+
 type cancellation_effect = Not_cancellation_point | Cancellation_point
 
 type impure_call_effect = {
@@ -58,6 +65,14 @@ let impure_may_park name =
 let impure_may_block_thread name =
   impure_call ~wait:May_block_thread ~cancellation:Not_cancellation_point name
 
+let impure_may_block_thread_and_park name =
+  impure_call ~wait:May_block_thread_and_park_fiber
+    ~cancellation:Cancellation_point name
+
+let default_foreign_call_effect ~is_pure =
+  if is_pure then Pure
+  else Impure { wait = May_block_thread; cancellation = Not_cancellation_point }
+
 let parallel_boundary name = descriptor name [ Effect Parallel_boundary ]
 
 let special name special_inference =
@@ -67,19 +82,28 @@ let impure_no_wait_names =
   [
     "print";
     "puts";
-    "println";
-    "eprintln";
+    "err_print";
+    "__print_string";
+    "__puts_string";
+    "__err_print_string";
     "seed_random";
     "random_int";
     "random_float";
     "now";
     "now_us";
+    "now_microseconds";
     "channel";
     "try_send";
     "try_recv";
     "close";
     "getenv";
     "setenv";
+    "reset_mem_stats";
+    "get_scheduler_stats";
+    "reset_scheduler_stats";
+    "signal_on_builtin";
+    "signal_raise_builtin";
+    "signal_received_builtin";
     "init_window";
     "close_window";
     "window_should_close";
@@ -106,7 +130,18 @@ let impure_no_wait_names =
   ]
 
 let impure_may_park_names =
-  [ "sleep"; "send"; "recv"; "send_timeout"; "recv_timeout" ]
+  [
+    "sleep";
+    "send";
+    "recv";
+    "send_timeout";
+    "recv_timeout";
+    "accept";
+    "read";
+    "write";
+  ]
+
+let impure_may_block_thread_and_park_names = [ "connect" ]
 
 let impure_may_block_thread_names =
   [
@@ -130,16 +165,20 @@ let impure_may_block_thread_names =
     "write_lines";
     "append_file";
     "for_each_line";
+    "for_each_chunk";
+    "file_size";
+    "file_modified";
+    "temp_dir";
+    "mkstemp_path";
     "getcwd";
     "mkdir";
     "remove_file";
     "remove_dir";
     "rename";
+    "crypto_random_bytes";
+    "process_run";
+    "process_shell";
     "listen";
-    "accept";
-    "connect";
-    "read";
-    "write";
     "set_timeout";
   ]
 
@@ -159,6 +198,8 @@ let parallel_boundary_names =
 let descriptors =
   List.map impure_no_wait impure_no_wait_names
   @ List.map impure_may_park impure_may_park_names
+  @ List.map impure_may_block_thread_and_park
+      impure_may_block_thread_and_park_names
   @ List.map impure_may_block_thread impure_may_block_thread_names
   @ List.map parallel_boundary parallel_boundary_names
   @ [
@@ -233,6 +274,135 @@ let call_effect name =
           | Effect _ | Special_inference _ -> None)
         d.capabilities
   | None -> None
+
+let channel_stack_option_suffixes =
+  [
+    "int";
+    "int8";
+    "int16";
+    "int32";
+    "int64";
+    "uint8";
+    "uint16";
+    "uint32";
+    "uint64";
+    "float";
+    "bool";
+    "char";
+    "f32";
+    "f16";
+  ]
+
+let channel_recv_runtime_symbols base =
+  base :: (base ^ "_nullable")
+  :: List.map (Printf.sprintf "%s_%s" base) channel_stack_option_suffixes
+
+let runtime_symbols_for source_name runtime_symbols =
+  List.map (fun runtime_symbol -> (runtime_symbol, source_name)) runtime_symbols
+
+let blorp_runtime_symbols source_names =
+  List.map
+    (fun source_name -> ("blorp_" ^ source_name, source_name))
+    source_names
+
+let prefixed_runtime_symbols prefix source_names =
+  List.map (fun source_name -> (prefix ^ source_name, source_name)) source_names
+
+let runtime_symbol_sources =
+  blorp_runtime_symbols
+    [
+      "append_file";
+      "crypto_random_bytes";
+      "exec";
+      "exec_output";
+      "file_exists";
+      "file_modified";
+      "file_size";
+      "for_each_chunk";
+      "for_each_line";
+      "get_scheduler_stats";
+      "getcwd";
+      "getenv";
+      "input";
+      "input_or_empty";
+      "is_directory";
+      "list_dir";
+      "mkdir";
+      "mkstemp_path";
+      "process_run";
+      "process_shell";
+      "random_float";
+      "random_int";
+      "read_all_lines";
+      "read_bytes";
+      "read_file";
+      "read_line";
+      "read_line_or_empty";
+      "remove_dir";
+      "remove_file";
+      "rename";
+      "reset_mem_stats";
+      "reset_scheduler_stats";
+      "seed_random";
+      "setenv";
+      "sleep";
+      "temp_dir";
+      "write_bytes";
+      "write_file";
+    ]
+  @ prefixed_runtime_symbols "blorp_tcp_"
+      [ "accept"; "connect"; "listen"; "read"; "set_reuse_addr"; "write" ]
+  @ [
+      ("blorp_tcp_close_listener", "close");
+      ("blorp_tcp_close_stream", "close");
+      ("blorp_tcp_local_port_listener", "local_port");
+      ("blorp_tcp_local_port_stream", "local_port");
+      ("blorp_tcp_set_timeout_listener", "set_timeout");
+      ("blorp_tcp_set_timeout_stream", "set_timeout");
+    ]
+  @ [
+      ("blorp_channel_new", "channel");
+      ("blorp_channel_send", "send");
+      ("blorp_channel_send_timeout", "send_timeout");
+      ("blorp_channel_try_send", "try_send");
+      ("blorp_channel_close", "close");
+      ("blorp_err_print", "__err_print_string");
+      ("blorp_now_us", "now_microseconds");
+      ("blorp_print", "__print_string");
+      ("blorp_puts", "__puts_string");
+      ("blorp_signal_on", "signal_on_builtin");
+      ("blorp_signal_raise", "signal_raise_builtin");
+      ("blorp_signal_received", "signal_received_builtin");
+      ("blorp_time_now", "now");
+    ]
+  @ runtime_symbols_for "recv"
+      (channel_recv_runtime_symbols "blorp_channel_recv")
+  @ runtime_symbols_for "try_recv"
+      (channel_recv_runtime_symbols "blorp_channel_try_recv")
+  @ runtime_symbols_for "recv_timeout"
+      (channel_recv_runtime_symbols "blorp_channel_recv_timeout")
+
+let runtime_symbol_registry =
+  List.fold_left
+    (fun acc (runtime_symbol, source_name) ->
+      match call_effect source_name with
+      | Some call_eff -> StringMap.add runtime_symbol call_eff acc
+      | None -> acc)
+    StringMap.empty runtime_symbol_sources
+
+let call_effect_for_runtime_symbol runtime_symbol =
+  StringMap.find_opt runtime_symbol runtime_symbol_registry
+
+let call_effect_may_park_fiber = function
+  | Impure { wait = May_park_fiber; _ }
+  | Impure { wait = May_block_thread_and_park_fiber; _ } ->
+      true
+  | Pure | Impure _ -> false
+
+let runtime_symbol_may_park_fiber runtime_symbol =
+  match call_effect_for_runtime_symbol runtime_symbol with
+  | Some call_effect -> call_effect_may_park_fiber call_effect
+  | None -> false
 
 let has_effect name builtin_effect =
   match builtin_effect with

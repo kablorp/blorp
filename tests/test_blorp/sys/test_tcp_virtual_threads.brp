@@ -1,0 +1,210 @@
+-- Multi-worker TCP parking regressions. Keep these in a separate file so the
+-- runtime pool starts with the worker count these cases are trying to exercise.
+import:
+	bytes as B
+	instrumentation: SchedulerStats, get_scheduler_stats, reset_scheduler_stats
+	net/tcp as Tcp
+	string: contains
+	test: TestSuite
+
+
+pure func is_socket_permission_error(err: String) -> Bool:
+	err.contains("Operation not permitted") or err.contains("Permission denied")
+
+
+func fanout_client_read_one(port: Int) -> Int:
+	match Tcp.connect("127.0.0.1", port):
+		Ok(stream):
+			match Tcp.read(stream, 1):
+				Ok(data):
+					n: Int = data.length()
+					Tcp.close(stream)
+					n
+				Err(_):
+					Tcp.close(stream)
+					-1
+		Err(_): -1
+
+
+func fanout_clients_read(port: Int) -> Int:
+	concurrent(max_threads: 4):
+		c1 = fanout_client_read_one(port)
+		c2 = fanout_client_read_one(port)
+		c3 = fanout_client_read_one(port)
+		c4 = fanout_client_read_one(port)
+		c5 = fanout_client_read_one(port)
+		c6 = fanout_client_read_one(port)
+		c7 = fanout_client_read_one(port)
+		c8 = fanout_client_read_one(port)
+	var total: Int = 0
+	match c1:
+		Ok(n): total += n
+		Err(_): total -= 1000000
+	match c2:
+		Ok(n): total += n
+		Err(_): total -= 1000000
+	match c3:
+		Ok(n): total += n
+		Err(_): total -= 1000000
+	match c4:
+		Ok(n): total += n
+		Err(_): total -= 1000000
+	match c5:
+		Ok(n): total += n
+		Err(_): total -= 1000000
+	match c6:
+		Ok(n): total += n
+		Err(_): total -= 1000000
+	match c7:
+		Ok(n): total += n
+		Err(_): total -= 1000000
+	match c8:
+		Ok(n): total += n
+		Err(_): total -= 1000000
+	total
+
+
+func fanout_accept_then_write(listener: TcpListener, count: Int) -> Int:
+	var peers: List[TcpStream] = []
+	var accepted: Int = 0
+	while accepted < count:
+		match Tcp.accept(listener):
+			Ok(peer):
+				peers = peers.append(peer)
+				accepted += 1
+			Err(_): accepted = count
+	sleep(10)
+	for peer in peers:
+		_ = Tcp.write(peer, "x".to_bytes())
+		Tcp.close(peer)
+	accepted
+
+
+func write_filled_bytes(stream: TcpStream, size: Int, value: Int) -> Bool:
+	payload: Bytes = B
+		.bytes(size)
+		.fill(value)
+	match Tcp.write(stream, payload):
+		Ok(written): written == size
+		Err(_): False
+
+
+func read_exact_count(stream: TcpStream, expected: Int) -> Bool:
+	var total: Int = 0
+	var ok: Bool = True
+	while total < expected and ok:
+		match Tcp.read(stream, 65536):
+			Ok(data):
+				chunk_len: Int = data.length()
+				if chunk_len == 0:
+					ok = False
+				else:
+					total += chunk_len
+			Err(_): ok = False
+	ok and total == expected
+
+
+func delayed_reply_then_read_all(peer: TcpStream, expected: Int) -> Bool:
+	sleep(25)
+	reply: Bytes = B
+		.bytes(1)
+		.fill(114)
+	reply_ok: Bool = match Tcp.write(peer, reply):
+		Ok(n): n == 1
+		Err(_): False
+	read_ok: Bool = read_exact_count(peer, expected)
+	reply_ok and read_ok
+
+
+func read_one_reply(client: TcpStream) -> Bool:
+	match Tcp.read(client, 1):
+		Ok(data): data.get(0) == Some(114)
+		Err(_): False
+
+
+func client_duplex_large_write_and_read(client: TcpStream, size: Int) -> Bool:
+	match Tcp.set_timeout(client, 2000):
+		Ok(_):
+			concurrent(max_threads: 2, timeout: 3000):
+				wrote = write_filled_bytes(client, size, 81)
+				read_reply = read_one_reply(client)
+			wrote_ok: Bool = match wrote:
+				Ok(result): result
+				Err(_): False
+			read_ok: Bool = match read_reply:
+				Ok(result): result
+				Err(_): False
+			wrote_ok and read_ok
+		Err(_): False
+
+
+func test_nested_tcp_read_fanout() -> Bool:
+	match Tcp.listen("127.0.0.1", 0, 32):
+		Ok(listener):
+			match Tcp.local_port(listener):
+				Ok(port):
+					concurrent(max_threads: 4, timeout: 5000):
+						server = fanout_accept_then_write(listener, 8)
+						clients = fanout_clients_read(port)
+					server_ok: Bool = match server:
+						Ok(n): n == 8
+						Err(_): False
+					clients_ok: Bool = match clients:
+						Ok(n): n == 8
+						Err(_): False
+					Tcp.close(listener)
+					server_ok and clients_ok
+				Err(_):
+					Tcp.close(listener)
+					False
+		Err(e): is_socket_permission_error(e)
+
+
+func test_same_stream_read_write_waiters_coexist() -> Bool:
+	size: Int = 8388608
+	match Tcp.listen("127.0.0.1", 0, 1):
+		Ok(listener):
+			match Tcp.local_port(listener):
+				Ok(port):
+					match Tcp.connect("127.0.0.1", port):
+						Ok(client):
+							match Tcp.accept(listener):
+								Ok(peer):
+									reset_scheduler_stats()
+									concurrent(max_threads: 3, timeout: 5000):
+										client_ok = client_duplex_large_write_and_read(client, size)
+										server_ok = delayed_reply_then_read_all(peer, size)
+									client_result: Bool = match client_ok:
+										Ok(result): result
+										Err(_): False
+									server_result: Bool = match server_ok:
+										Ok(result): result
+										Err(_): False
+									stats: SchedulerStats = get_scheduler_stats()
+									Tcp.close(peer)
+									Tcp.close(client)
+									Tcp.close(listener)
+									client_result and server_result and stats.fiber_parks >= 2 and stats.reactor_waiter_wakes >= 2
+								Err(_):
+									Tcp.close(client)
+									Tcp.close(listener)
+									False
+						Err(_):
+							Tcp.close(listener)
+							False
+				Err(_):
+					Tcp.close(listener)
+					False
+		Err(e): is_socket_permission_error(e)
+
+
+tests: TestSuite = {
+	description = "TCP Virtual Thread Tests",
+	tests = [
+		("nested TCP read fanout is stable across workers", test_nested_tcp_read_fanout),
+		(
+			"same-stream read/write waiters can coexist",
+			test_same_stream_read_write_waiters_coexist,
+		),
+	],
+}

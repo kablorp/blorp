@@ -647,23 +647,29 @@ let builtin_contract_table =
         (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
       (* String concatenation variants. *)
       builtins
-        [ "blorp_print"; "blorp_puts"; "blorp_println"; "blorp_eprintln" ]
+        [ "blorp_print"; "blorp_puts"; "blorp_err_print" ]
         (bfixed [ Borrow ] ReturnVoid);
-      (* TCP currently uses raw file-descriptor integers. Runtime calls borrow
-         managed arguments such as host strings and byte buffers; owned
-         Result wrappers are returned to the caller. *)
+      (* TCP handles are managed wrapper objects. Runtime calls borrow the
+         handles and managed arguments; owned Result wrappers are returned to
+         the caller. *)
       builtins [ "blorp_tcp_listen" ]
         (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_tcp_accept" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_tcp_connect" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_tcp_read" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_tcp_write" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_tcp_close" ] (bfixed [ Borrow ] ReturnVoid);
       builtins
-        [ "blorp_tcp_set_reuse_addr"; "blorp_tcp_local_port" ]
+        [ "blorp_tcp_close_listener"; "blorp_tcp_close_stream" ]
+        (bfixed [ Borrow ] ReturnVoid);
+      builtins
+        [
+          "blorp_tcp_set_reuse_addr";
+          "blorp_tcp_local_port_listener";
+          "blorp_tcp_local_port_stream";
+        ]
         (bfixed [ Borrow ] ReturnOwned);
       builtins
-        [ "blorp_tcp_set_timeout" ]
+        [ "blorp_tcp_set_timeout_listener"; "blorp_tcp_set_timeout_stream" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_string_concat" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
@@ -703,6 +709,16 @@ let builtin_contract_table =
       builtins [ "blorp_string_lcs" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
         [ "blorp_parse_int"; "blorp_parse_float"; "blorp_codepoint_length" ]
+        (bfixed [ Borrow ] ReturnPrimitive);
+      builtins
+        [
+          "blorp_to_int";
+          "blorp_to_float";
+          "blorp_to_bool";
+          "blorp_to_char";
+          "blorp_to_float32";
+          "blorp_to_float16";
+        ]
         (bfixed [ Borrow ] ReturnPrimitive);
       builtins [ "blorp_string_get_opt" ]
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);

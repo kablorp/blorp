@@ -21,6 +21,8 @@ let foreign_func ?(passing = ForeignDefaultArgs []) name params =
           includes = [];
           link_flags = [];
           arg_passing = passing;
+          call_effect =
+            Blorp.Builtin_metadata.default_foreign_call_effect ~is_pure:false;
         };
     cf_def_id = 0;
   }

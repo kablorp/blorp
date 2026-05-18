@@ -1795,12 +1795,16 @@ and lower_func_with_return_ty ?typed_body ~(return_ty : Ast.type_expr)
           if f.func_is_pure || f.func_no_copy then Core.ForeignBorrowArgs
           else Core.ForeignDefaultArgs []
         in
+        let call_effect =
+          Builtin_metadata.default_foreign_call_effect ~is_pure:f.func_is_pure
+        in
         CFForeign
           {
             c_name = foreign_name;
             includes = foreign_includes;
             link_flags = foreign_link_flags;
             arg_passing;
+            call_effect;
           }
     | FuncBodyExpr _ | FuncBuiltinBody _ | FuncNoBody ->
         let has_no_body = body = None in

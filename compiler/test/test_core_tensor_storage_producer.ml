@@ -56,7 +56,13 @@ let test_only_builtin_calls_can_be_tensor_producers () =
     (Option.is_none
        (P.of_call_kind
           (CKForeign
-             { fc_c_name = "c_tensor"; fc_arg_passing = ForeignBorrowArgs })));
+             {
+               fc_c_name = "c_tensor";
+               fc_arg_passing = ForeignBorrowArgs;
+               fc_call_effect =
+                 Blorp.Builtin_metadata.default_foreign_call_effect
+                   ~is_pure:true;
+             })));
   Alcotest.(check bool)
     "intrinsic call" true
     (Option.is_none (P.of_call_kind (CKIntrinsic "tensor_alloc")))

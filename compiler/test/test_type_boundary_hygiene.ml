@@ -484,6 +484,7 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
     [
       "compiler/lib/core_codegen_prepare.ml";
       "compiler/lib/core_emit_util.ml";
+      "compiler/lib/core_perceus.ml";
       "compiler/lib/core_reuse.ml";
       "compiler/lib/core_specialize.ml";
     ]

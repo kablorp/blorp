@@ -974,7 +974,7 @@ let test_levenshtein () =
 
 let test_find_similar () =
   let env = add_var (empty ()) "print" ty_string () in
-  let env = add_var env "println" ty_string () in
+  let env = add_var env "format_line" ty_string () in
   let env = add_var env "format" ty_string () in
   (* "pritn" is close to "print" *)
   (match find_similar "pritn" env with

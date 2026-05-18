@@ -14,7 +14,8 @@
     foreign, and constructor names, then rewrites every [CKUnknown] call
     to the most precise call kind it can prove:
 
-    - Foreign functions become [CKForeign { fc_c_name; fc_arg_passing }].
+    - Foreign functions become [CKForeign { fc_c_name; fc_arg_passing;
+      fc_call_effect }].
     - User functions, constructors, impl methods, and imported source
       functions become [CKUser (name, def_id)] when a def-id is known.
     - Runtime-backed builtins become [CKBuiltin c_name] through the
@@ -52,7 +53,7 @@ type env = {
       [Core_specialize] can apply type/layout-specific rewrites instead of
       being mistaken for first-class closures.
     - [foreign_funcs]: foreign function names → their user-specified
-      [c_name] and argument-passing mode (bypass — no mangling).
+      [c_name], argument-passing mode, and call effect (bypass — no mangling).
     - [constructor_names]: set of in-scope constructor names. Used for
       the [is_union_constructor] classification in [Core_emit]. *)
 
@@ -91,15 +92,23 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
     match d.cd_desc with
     | CDFunc f when f.cf_body <> None -> (
         match f.cf_kind with
-        | CFForeign { c_name; arg_passing; _ } ->
+        | CFForeign { c_name; arg_passing; call_effect; _ } ->
             Hashtbl.replace env.foreign_funcs f.cf_name
-              { fc_c_name = c_name; fc_arg_passing = arg_passing }
+              {
+                fc_c_name = c_name;
+                fc_arg_passing = arg_passing;
+                fc_call_effect = call_effect;
+              }
         | _ -> Hashtbl.replace env.user_funcs f.cf_name f.cf_def_id)
     | CDFunc f -> (
         match f.cf_kind with
-        | CFForeign { c_name; arg_passing; _ } ->
+        | CFForeign { c_name; arg_passing; call_effect; _ } ->
             Hashtbl.replace env.foreign_funcs f.cf_name
-              { fc_c_name = c_name; fc_arg_passing = arg_passing }
+              {
+                fc_c_name = c_name;
+                fc_arg_passing = arg_passing;
+                fc_call_effect = call_effect;
+              }
         | CFBuiltin -> remember_bodyless_builtin f
         | _ -> ())
     | CDImpl i ->

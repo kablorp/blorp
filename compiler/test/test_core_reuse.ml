@@ -20,6 +20,23 @@ let void () = mk ty_void CVoid
 let int n = mk ty_int (CLit (LitInt (Int64.of_int n)))
 let var name ty = mk ty (CVar (Var.named name))
 let intrinsic name args ty = mk ty (CCall (CKIntrinsic name, void (), args))
+let builtin name args ty = mk ty (CCall (CKBuiltin name, void (), args))
+
+let may_park_foreign_effect =
+  Blorp.Builtin_metadata.Impure
+    { wait = May_park_fiber; cancellation = Cancellation_point }
+
+let foreign ?(call_effect = may_park_foreign_effect) name args ty =
+  mk ty
+    (CCall
+       ( CKForeign
+           {
+             fc_c_name = name;
+             fc_arg_passing = ForeignBorrowArgs;
+             fc_call_effect = call_effect;
+           },
+         void (),
+         args ))
 
 let lett name rhs body =
   mk body.ty
@@ -229,6 +246,50 @@ let test_marks_later_allocation_after_safe_statement () =
     "candidate"
     [ ("xs", "ys", "list") ]
     (candidate_names (Blorp.Core_reuse.analyze_expr body))
+
+let test_rejects_later_allocation_after_parking_call () =
+  let list_ty = ty_list ty_int in
+  let body =
+    drop "xs" list_ty
+      (seq
+         (builtin "blorp_sleep" [ int 1 ] ty_void)
+         (lett "ys" (list_alloc ()) (var "ys" list_ty)))
+  in
+  let analysis =
+    Blorp.Core_reuse.analyze_drop_block (Var.named "xs") list_ty
+      (match body.desc with
+      | CDrop (_, _, body) -> body
+      | _ -> failwith "expected drop")
+  in
+  Alcotest.(check (list string))
+    "block facts"
+    [ "interference:call barrier" ]
+    (block_fact_tags analysis.facts);
+  Alcotest.(check int)
+    "candidate count" 0
+    (List.length (Blorp.Core_reuse.analyze_expr body))
+
+let test_rejects_later_allocation_after_parking_foreign_call () =
+  let list_ty = ty_list ty_int in
+  let body =
+    drop "xs" list_ty
+      (seq
+         (foreign "c_wait_for_io" [ int 1 ] ty_void)
+         (lett "ys" (list_alloc ()) (var "ys" list_ty)))
+  in
+  let analysis =
+    Blorp.Core_reuse.analyze_drop_block (Var.named "xs") list_ty
+      (match body.desc with
+      | CDrop (_, _, body) -> body
+      | _ -> failwith "expected drop")
+  in
+  Alcotest.(check (list string))
+    "block facts"
+    [ "interference:call barrier" ]
+    (block_fact_tags analysis.facts);
+  Alcotest.(check int)
+    "candidate count" 0
+    (List.length (Blorp.Core_reuse.analyze_expr body))
 
 let test_rejects_collection_family_mismatch () =
   let list_ty = ty_list ty_int in
@@ -521,6 +582,58 @@ let test_rewrite_program_reuses_after_safe_statement () =
   | _ ->
       Alcotest.fail
         "expected safe statement followed by rewritten list_reuse_alloc"
+
+let test_rewrite_program_keeps_drop_before_parking_call () =
+  let list_ty = ty_list ty_int in
+  let body =
+    drop "xs" list_ty
+      (seq
+         (builtin "blorp_sleep" [ int 1 ] ty_void)
+         (lett "ys" (list_alloc ()) (var "ys" list_ty)))
+  in
+  let fn =
+    {
+      cf_name = "reuse_after_sleep";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [];
+      cf_return_ty = list_ty;
+      cf_body = Some body;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 1;
+    }
+  in
+  let prog = [ { cd_desc = CDFunc fn; cd_loc = dummy_loc; cd_doc = None } ] in
+  Alcotest.(check bool)
+    "program unchanged" true
+    (Blorp.Core_reuse.rewrite_program prog = prog)
+
+let test_rewrite_program_keeps_drop_before_parking_foreign_call () =
+  let list_ty = ty_list ty_int in
+  let body =
+    drop "xs" list_ty
+      (seq
+         (foreign "c_wait_for_io" [ int 1 ] ty_void)
+         (lett "ys" (list_alloc ()) (var "ys" list_ty)))
+  in
+  let fn =
+    {
+      cf_name = "reuse_after_foreign_wait";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [];
+      cf_return_ty = list_ty;
+      cf_body = Some body;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 1;
+    }
+  in
+  let prog = [ { cd_desc = CDFunc fn; cd_loc = dummy_loc; cd_doc = None } ] in
+  Alcotest.(check bool)
+    "program unchanged" true
+    (Blorp.Core_reuse.rewrite_program prog = prog)
 
 let test_rewrite_program_reuses_same_layout_list_allocation () =
   let source_ty = ty_list ty_int in
@@ -856,6 +969,10 @@ let suite =
           test_marks_later_allocation_after_safe_binding;
         Alcotest.test_case "later_allocation_after_safe_statement" `Quick
           test_marks_later_allocation_after_safe_statement;
+        Alcotest.test_case "rejects_later_allocation_after_parking_call" `Quick
+          test_rejects_later_allocation_after_parking_call;
+        Alcotest.test_case "rejects_later_allocation_after_parking_foreign_call"
+          `Quick test_rejects_later_allocation_after_parking_foreign_call;
         Alcotest.test_case "rejects_collection_family_mismatch" `Quick
           test_rejects_collection_family_mismatch;
         Alcotest.test_case "rejects_incompatible_allocation_before_candidate"
@@ -881,6 +998,11 @@ let suite =
           test_rewrite_program_reuses_dead_dict_allocation;
         Alcotest.test_case "rewrite_program_reuses_after_safe_statement" `Quick
           test_rewrite_program_reuses_after_safe_statement;
+        Alcotest.test_case "rewrite_program_keeps_drop_before_parking_call"
+          `Quick test_rewrite_program_keeps_drop_before_parking_call;
+        Alcotest.test_case
+          "rewrite_program_keeps_drop_before_parking_foreign_call" `Quick
+          test_rewrite_program_keeps_drop_before_parking_foreign_call;
         Alcotest.test_case "rewrite_program_reuses_same_layout_list_allocation"
           `Quick test_rewrite_program_reuses_same_layout_list_allocation;
         Alcotest.test_case

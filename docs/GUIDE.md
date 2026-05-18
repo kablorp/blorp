@@ -32,7 +32,7 @@ make
 ./blorp run hello.brp
 
 # Pass CLI arguments
-./blorp run program.brp -- arg1 arg2 arg3
+./blorp run program.brp arg1 arg2 arg3
 
 # Type check only (no codegen)
 ./blorp check program.brp
@@ -2272,7 +2272,7 @@ This table lists the main public modules. The source of truth is the `std/` and
 
 | Module | Import Pattern | Description |
 |--------|----------------|-------------|
-| `std/prelude` | Auto-imported | Core visible types plus `print` / `puts` / `println` |
+| `std/prelude` | Auto-imported | Core visible types plus `print` / `puts` |
 | `option`, `result` | Prelude types | `Option[T]`, `Result[T, E]`, constructors, and UFCS methods |
 | `list`, `dict`, `set`, `string`, `bytes` | Prelude types | Core collections/text/binary types and UFCS methods |
 | `int`, `float`, `bool`, `char` | Prelude types | Primitive type declarations and helpers |
@@ -2300,18 +2300,25 @@ This table lists the main public modules. The source of truth is the `std/` and
 Benchmark harness helpers live under `benchmarks/blorp/support/benchmark.brp`
 and are not part of the standard library.
 
+Networking preview note: `std/net/tcp` socket waits for numeric hosts are
+fiber-aware, so `accept`, `read`, `write`, and the socket-connect wait can park
+the current fiber instead of pinning an OS worker. Hostname resolution still
+uses the system resolver and may block an OS worker during `listen(host, ...)`
+or the DNS phase of `connect(host, ...)`. Use numeric hosts such as
+`"127.0.0.1"` or `""` for bind-any when virtual-thread compatibility matters.
+
 ### Prelude and Always-Available Names
 
 `std/prelude.brp` imports a deliberately small surface into every module:
 `Bool`, `Bytes`, `Char`, `Dict`, `Float`, `Float16`, `Float32`, `Int`, `List`,
 `Option(Some, None)`, `Result(Ok, Err)`, `Set`, `String`, plus `print`, `puts`,
-`println`, `eprintln`, `read_line`, and `input`.
+`err_print`, `read_line`, and `input`.
 
 There are three practical buckets of names available without an explicit import:
 
 1. **Prelude imports** — the types and constructors listed above, plus
-   console I/O helpers. `print` / `println` write a trailing newline; `puts`
-   writes without adding one; `eprintln` writes to stderr. `read_line` and
+   console I/O helpers. `print` writes a trailing newline; `puts`
+   writes without adding one; `err_print` writes to stderr. `read_line` and
    `input` return `None` at EOF. On interactive terminals, Ctrl-D produces
    `None` for that read without making later reads immediately return EOF.
 2. **UFCS methods on prelude types** — `xs.map(f)`, `s.split(",")`,
@@ -3049,7 +3056,7 @@ tests/
 | `./blorp compile <file>` | Compile .brp to generated C |
 | `./blorp compile --ast <file>` | Print AST |
 | `./blorp run <file>` | Compile and run |
-| `./blorp run <file> -- args...` | Run with CLI arguments |
+| `./blorp run <file> args...` | Run with CLI arguments |
 | `./blorp test <path>` | Run test file or directory |
 | `./blorp test --doc <path>` | Run only doctests |
 | `./blorp test --suite <path>` | Run only TestSuite tests |
@@ -3281,6 +3288,10 @@ today.
   declarations rely on the foreign code honoring its contract.
 - `pkg/...` imports are explicit package/native boundaries. Bare imports
   resolve local modules or `std`, not packages.
+- `std/net/tcp` is fiber-aware for numeric-host socket waits, but hostname DNS
+  resolution still uses the blocking system resolver during `listen` and before
+  socket `connect`. Use numeric hosts or `""` bind-any hosts when OS-worker
+  pinning is unacceptable.
 - Parser/format modules such as JSON, TOML, YAML, XML, validation, and parser
   utilities use ordinary `Result` values, but their detailed error payloads are
   still module-specific rather than one shared diagnostics type.

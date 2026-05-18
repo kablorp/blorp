@@ -58,7 +58,7 @@ let test_capture_timeout_does_not_wait_for_inherited_pipe () =
 let test_capture_timeout_sends_sigterm_before_sigkill () =
   let code, output =
     Blorp.Test_runner.run_process_capture_timeout ~timeout:(Some 1) "/bin/sh"
-      [ "-c"; "trap 'echo TERM; exit 0' TERM; while true; do sleep 1; done" ]
+      [ "-c"; "trap 'printf \"TERM\\n\"; exit 0' TERM; while true; do :; done" ]
   in
   Alcotest.(check int) "timeout exit code" 124 code;
   let saw_term_line =
@@ -151,8 +151,8 @@ let test_inherited_timeout_sends_sigterm_before_sigkill () =
         Blorp.Test_runner.run_process_timeout ~timeout:(Some 1) "/bin/sh"
           [
             "-c";
-            "trap 'echo TERM > \"$1\"; exit 0' TERM; while true; do sleep 1; \
-             done";
+            "trap 'printf \"TERM\\n\" > \"$1\"; exit 0' TERM; while true; do \
+             :; done";
             "sh";
             marker_file;
           ]

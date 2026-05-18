@@ -636,7 +636,7 @@ let rec all_some = function
       match all_some rest with Some xs -> Some (x :: xs) | None -> None)
   | None :: _ -> None
 
-(** Well-known names from other languages with targeted suggestions. *)
+(** Well-known or retired names with targeted suggestions. *)
 let foreign_name_hints =
   [
     ( "return",
@@ -651,6 +651,8 @@ let foreign_name_hints =
     ("nil", "blorp doesn't have nil. Use Option[T] with Some(value) or None");
     ("range", "blorp uses '..' for ranges: for i in 0..5:");
     ("len", "Use 'length(collection)' in blorp");
+    ("println", "Use 'print(value)' in blorp");
+    ("eprintln", "Use 'err_print(value)' in blorp");
     ( "to_upper",
       "'to_upper' was renamed to 'upper'; import it with `import: string: \
        upper` and call `upper(value)` or `value.upper()`" );

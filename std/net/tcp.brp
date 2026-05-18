@@ -1,28 +1,90 @@
 -- TCP Networking - Socket primitives for TCP connections
 --
 -- All functions are impure (I/O). Returns Result[T, String] for error handling.
--- Uses Int for file descriptors and Bytes for data buffers.
+-- Uses opaque TCP handles and Bytes for data buffers. Numeric-address socket
+-- operations are fiber-aware; hostname resolution still uses blocking DNS.
+-- Use numeric hosts such as "127.0.0.1" or "" bind-any hosts when OS-worker
+-- pinning during DNS resolution is unacceptable.
+type TcpListener = builtin
+
+
+type TcpStream = builtin
+
+
+trait TcpClosable:
+	func close(handle: Self) -> Void
+
+
+trait TcpLocalPort:
+	func local_port(handle: Self) -> Result[Int, String]
+
+
+-- Set the default runtime operation timeout for a TCP handle.
+-- This is a virtual-thread deadline used by accept/read/write waits on an
+-- existing handle, not a kernel socket timeout. Negative timeouts are rejected.
+trait TcpTimeout:
+	func set_timeout(handle: Self, ms: Int) -> Result[Int, String]
+
+
+implements TcpClosable for TcpListener:
+	func close(listener: TcpListener) -> Void:
+		builtin("blorp_tcp_close_listener")
+
+
+implements TcpClosable for TcpStream:
+	func close(stream: TcpStream) -> Void:
+		builtin("blorp_tcp_close_stream")
+
+
+implements TcpLocalPort for TcpListener:
+	func local_port(listener: TcpListener) -> Result[Int, String]:
+		builtin("blorp_tcp_local_port_listener")
+
+
+implements TcpLocalPort for TcpStream:
+	func local_port(stream: TcpStream) -> Result[Int, String]:
+		builtin("blorp_tcp_local_port_stream")
+
+
+implements TcpTimeout for TcpListener:
+	func set_timeout(listener: TcpListener, ms: Int) -> Result[Int, String]:
+		builtin("blorp_tcp_set_timeout_listener")
+
+
+implements TcpTimeout for TcpStream:
+	func set_timeout(stream: TcpStream, ms: Int) -> Result[Int, String]:
+		builtin("blorp_tcp_set_timeout_stream")
+
+
 ---
 Create a TCP server socket, bind to host:port, and start listening.
-Returns the server socket fd on success.
+Returns a listener handle on success.
+Numeric hosts avoid DNS. Hostnames may block an OS thread during resolution.
+Use "" to bind to the platform's passive any-host address without DNS.
+Hosts longer than 255 bytes are rejected instead of truncated.
+Negative backlog values and backlog values larger than the C runtime can
+represent are rejected before calling the OS.
 ---
-func listen(host: String, port: Int, backlog: Int) -> Result[Int, String]:
+func listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, String]:
 	builtin
 
 
 ---
 Accept an incoming connection on a listening socket.
-Returns the client socket fd on success.
+Returns a stream handle on success.
 ---
-func accept(server_fd: Int) -> Result[Int, String]:
+func accept(listener: TcpListener) -> Result[TcpStream, String]:
 	builtin
 
 
 ---
 Connect to a remote TCP server at host:port.
-Returns the socket fd on success.
+Returns a stream handle on success.
+Numeric hosts avoid DNS and the socket connect parks fibers while waiting.
+Hostnames may block an OS thread during resolution before the socket connect.
+Hosts longer than 255 bytes are rejected instead of truncated.
 ---
-func connect(host: String, port: Int) -> Result[Int, String]:
+func connect(host: String, port: Int) -> Result[TcpStream, String]:
 	builtin
 
 
@@ -30,43 +92,30 @@ func connect(host: String, port: Int) -> Result[Int, String]:
 Read up to max_bytes from a socket.
 Returns the data actually read (may be less than max_bytes).
 Returns empty Bytes on connection close.
+Reading zero bytes returns empty Bytes after validating the stream.
+Negative max_bytes values are rejected. Single read requests larger than 64 MiB
+are also rejected; loop over smaller reads for larger payloads.
 ---
-func read(fd: Int, max_bytes: Int) -> Result[Bytes, String]:
+func read(stream: TcpStream, max_bytes: Int) -> Result[Bytes, String]:
 	builtin
 
 
 ---
 Write all bytes in data to a socket.
 Returns the number of bytes written on success.
+If cancellation, timeout, or an OS error happens after a partial send, the
+function returns an error and the peer may still have received the bytes already
+sent. Use protocol-level framing or acknowledgements when partial delivery must
+be recovered precisely.
+Peer-close write failures are reported as Result errors instead of terminating
+the process with SIGPIPE.
 ---
-func write(fd: Int, data: Bytes) -> Result[Int, String]:
+func write(stream: TcpStream, data: Bytes) -> Result[Int, String]:
 	builtin
 
 
 ---
-Close a socket. Always succeeds (ignores errors).
+Set SO_REUSEADDR on a listener.
 ---
-func close(fd: Int) -> Void:
-	builtin
-
-
----
-Set SO_REUSEADDR on a socket.
----
-func set_reuse_addr(fd: Int) -> Result[Int, String]:
-	builtin
-
-
----
-Return the local port assigned to a listening or connected socket.
-Useful after binding a listener to port 0 in tests or dynamic services.
----
-func local_port(fd: Int) -> Result[Int, String]:
-	builtin
-
-
----
-Set send/receive timeout in milliseconds.
----
-func set_timeout(fd: Int, ms: Int) -> Result[Int, String]:
+func set_reuse_addr(listener: TcpListener) -> Result[Int, String]:
 	builtin

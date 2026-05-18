@@ -1055,6 +1055,8 @@ let test_cf_kind_foreign_carries_c_name () =
         includes = [ "stdio.h" ];
         link_flags = [ (None, "-lm") ];
         arg_passing = ForeignDefaultArgs [];
+        call_effect =
+          Blorp.Builtin_metadata.default_foreign_call_effect ~is_pure:false;
       }
   in
   let f = mk_kind_func ~name:"printf" ~kind:k in
@@ -1064,13 +1066,17 @@ let test_cf_kind_foreign_carries_c_name () =
     (Blorp.Modules.contains out "[foreign=c_printf]");
   (* Structural: the stored record survived construction *)
   match f.cf_kind with
-  | CFForeign { c_name; includes; link_flags; arg_passing } ->
+  | CFForeign { c_name; includes; link_flags; arg_passing; call_effect } ->
       Alcotest.(check string) "c_name" "c_printf" c_name;
       Alcotest.(check (list string)) "includes" [ "stdio.h" ] includes;
       Alcotest.(check int) "link flags count" 1 (List.length link_flags);
       Alcotest.(check bool)
         "arg passing" true
-        (arg_passing = ForeignDefaultArgs [])
+        (arg_passing = ForeignDefaultArgs []);
+      Alcotest.(check bool)
+        "foreign default effect" true
+        (call_effect
+        = Blorp.Builtin_metadata.default_foreign_call_effect ~is_pure:false)
   | _ -> Alcotest.fail "expected CFForeign"
 
 let test_cf_kind_closure_body_tag () =

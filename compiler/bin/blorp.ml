@@ -4,7 +4,7 @@
       blorp compile program.brp          # Compile to C and binary
       blorp check program.brp            # Type check only
       blorp compile --ast program.brp    # Show AST only
-      blorp run program.brp              # Compile and run
+      blorp run program.brp arg1 arg2    # Compile and run with arguments
       blorp run --profile program.brp    # Run with profiling
       blorp check src/                   # Type check all .brp files in directory
       blorp test tests/test.brp          # Run a single test
@@ -586,8 +586,12 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
             1
           end
           else begin
-            let result =
+            let run_child () =
               Test_runner.run_process_timeout ~timeout bin_file user_args
+            in
+            let result =
+              if sanitize then Test_runner.with_sanitizer_runtime_env run_child
+              else run_child ()
             in
             if result = 124 then begin
               let secs = match timeout with Some s -> s | None -> 0 in
@@ -1050,7 +1054,11 @@ let () =
                 List.rev files,
                 List.rev user_args )
           | "--help" :: _ | "-h" :: _ ->
-              print_endline "Usage: blorp run [options] <file.brp> [-- args...]";
+              print_endline "Usage: blorp run [options] <file.brp> [args...]";
+              print_endline "";
+              print_endline
+                "Arguments after <file.brp> are passed to the program. Put \
+                 blorp run options before the file.";
               print_endline "";
               print_endline "Options:";
               print_endline "  --profile      Run with profiling";
@@ -1063,6 +1071,17 @@ let () =
               print_endline "  --threads N    Set max thread pool size";
               print_endline "  --std-dir <d>  Use std library from directory";
               exit 0
+          | "--" :: file :: rest when files = [] ->
+              ( profile,
+                debug,
+                sanitize,
+                leak_check,
+                no_format,
+                timeout,
+                threads,
+                std_dir,
+                [ file ],
+                rest )
           | "--" :: rest ->
               ( profile,
                 debug,
@@ -1109,8 +1128,19 @@ let () =
                   prerr_endline "Error: --threads requires an integer";
                   exit 1)
           | file :: rest ->
-              parse_run_args rest profile debug sanitize leak_check no_format
-                timeout threads std_dir (file :: files) user_args
+              let user_args =
+                match rest with "--" :: args -> args | args -> args
+              in
+              ( profile,
+                debug,
+                sanitize,
+                leak_check,
+                no_format,
+                timeout,
+                threads,
+                std_dir,
+                [ file ],
+                user_args )
         in
         let ( profile,
               debug,

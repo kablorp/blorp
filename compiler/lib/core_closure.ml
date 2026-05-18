@@ -926,9 +926,14 @@ let scan_names (prog : core_program) :
         Hashtbl.replace function_refs f.cf_name (FunctionRefBuiltin c_name)
     | None -> ()
   in
-  let register_foreign_func (f : core_func) c_name arg_passing =
+  let register_foreign_func (f : core_func) c_name arg_passing call_effect =
     Hashtbl.replace function_refs f.cf_name
-      (FunctionRefForeign { fc_c_name = c_name; fc_arg_passing = arg_passing })
+      (FunctionRefForeign
+         {
+           fc_c_name = c_name;
+           fc_arg_passing = arg_passing;
+           fc_call_effect = call_effect;
+         })
   in
   (* Builtin constructors *)
   List.iter
@@ -955,8 +960,8 @@ let scan_names (prog : core_program) :
         | CDFunc f when f.cf_body <> None -> register_user_func f
         | CDFunc f -> (
             match f.cf_kind with
-            | CFForeign { c_name; arg_passing; _ } ->
-                register_foreign_func f c_name arg_passing
+            | CFForeign { c_name; arg_passing; call_effect; _ } ->
+                register_foreign_func f c_name arg_passing call_effect
             | CFBuiltin -> register_builtin_func f
             | CFUser | CFClosureBody _ -> ())
         | CDImpl i ->

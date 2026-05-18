@@ -361,6 +361,8 @@ let run_process_capture_timeout ~timeout prog args =
       in
       (exit_code, Buffer.contents output)
 
+let with_sanitizer_runtime_env f = f ()
+
 (** Run a program directly with timeout, inheriting stdin/stdout/stderr.
     Returns exit code (124 = timed out). For interactive use (blorp run). *)
 let run_process_timeout ~timeout prog args =
@@ -1863,8 +1865,12 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
               in
               make_result ~error_detail:detail false
             else begin
-              let result, output =
+              let run_child () =
                 run_process_capture_timeout ~timeout bin_file []
+              in
+              let result, output =
+                if sanitize then with_sanitizer_runtime_env run_child
+                else run_child ()
               in
               if result = 0 then make_result ~output true
               else if result = 99 then
@@ -2088,13 +2094,16 @@ let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
         in
         Error detail
 
-let run_suite_selector_case ~timeout ~bin_file ~file ~index =
+let run_suite_selector_case ~timeout ~sanitize ~bin_file ~file ~index =
   let start_time = get_time () in
   let make_result ?(output = "") ?(error_detail = "") passed =
     { file; passed; duration = get_time () -. start_time; output; error_detail }
   in
-  let result, output =
+  let run_child () =
     run_process_capture_timeout ~timeout bin_file [ string_of_int index ]
+  in
+  let result, output =
+    if sanitize then with_sanitizer_runtime_env run_child else run_child ()
   in
   if result = 0 then make_result ~output true
   else if result = 99 then
@@ -2301,7 +2310,8 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
           match Hashtbl.find_opt harness_index file with
           | Some index ->
               let result =
-                run_suite_selector_case ~timeout ~bin_file ~file ~index
+                run_suite_selector_case ~timeout ~sanitize ~bin_file ~file
+                  ~index
               in
               run_and_record [ result ]
           | None ->

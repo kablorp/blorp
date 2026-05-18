@@ -158,6 +158,7 @@ $RUN_OUTPUT"
 }
 
 valid_prog="$TMPDIR_CLI/valid.brp"
+args_prog="$TMPDIR_CLI/args.brp"
 invalid_prog="$TMPDIR_CLI/invalid.brp"
 failing_test="$TMPDIR_CLI/failing_test.brp"
 compiled_c="$TMPDIR_CLI/valid.c"
@@ -169,6 +170,12 @@ mkdir -p "$check_dir_ok/nested" "$check_dir_bad/nested"
 cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
 	print("cli ok")
+	0
+BRP
+
+cat > "$args_prog" <<'BRP'
+func main(args: List[String]) -> Int:
+	print(args.join("|"))
 	0
 BRP
 
@@ -233,6 +240,8 @@ expect_output_contains "compile profile removed" 1 "use 'blorp compile --time-ph
 expect_output_contains "compile core emit removed" 1 "use 'blorp compile <file.brp>'" "$BLORP_BIN" compile --core-emit "$valid_prog"
 
 expect_exit "run success" 0 "$BLORP_BIN" run --no-format --timeout 5 "$valid_prog"
+expect_output_contains "run passes args without separator" 0 "alpha|--beta|gamma" "$BLORP_BIN" run --no-format --timeout 5 "$args_prog" alpha --beta gamma
+expect_output_contains "run still accepts arg separator" 0 "one|two" "$BLORP_BIN" run --no-format --timeout 5 "$args_prog" -- one two
 expect_exit "run type failure" 1 "$BLORP_BIN" run --no-format --timeout 5 "$invalid_prog"
 expect_exit "run bad timeout" 1 "$BLORP_BIN" run --timeout not-an-int "$valid_prog"
 

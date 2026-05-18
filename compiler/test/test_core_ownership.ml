@@ -133,10 +133,13 @@ let test_tcp_runtime_builtins_borrow_arguments () =
   check "blorp_tcp_connect" [ Borrow; Borrow ] ReturnOwned;
   check "blorp_tcp_read" [ Borrow; Borrow ] ReturnOwned;
   check "blorp_tcp_write" [ Borrow; Borrow ] ReturnOwned;
-  check "blorp_tcp_close" [ Borrow ] ReturnVoid;
+  check "blorp_tcp_close_listener" [ Borrow ] ReturnVoid;
+  check "blorp_tcp_close_stream" [ Borrow ] ReturnVoid;
   check "blorp_tcp_set_reuse_addr" [ Borrow ] ReturnOwned;
-  check "blorp_tcp_local_port" [ Borrow ] ReturnOwned;
-  check "blorp_tcp_set_timeout" [ Borrow; Borrow ] ReturnOwned
+  check "blorp_tcp_local_port_listener" [ Borrow ] ReturnOwned;
+  check "blorp_tcp_local_port_stream" [ Borrow ] ReturnOwned;
+  check "blorp_tcp_set_timeout_listener" [ Borrow; Borrow ] ReturnOwned;
+  check "blorp_tcp_set_timeout_stream" [ Borrow; Borrow ] ReturnOwned
 
 let test_fixed_constructors_allocate_owned_fixed () =
   let expected = { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned } in

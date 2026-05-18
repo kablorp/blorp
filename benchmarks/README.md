@@ -74,6 +74,7 @@ included in `bench.sh all`.
 | `paradigms` | Functional dispatch, list destructuring, pattern matching, and coroutine-style control flow | blorp |
 | `particle_gravity` | Particle-sim-derived parallel indexed gravity kernel | blorp |
 | `virtual_threads` | Fiber spawn, join, park, and wake scaling | blorp |
+| `tcp_virtual_threads` | Loopback TCP accept/connect, connect storms, idle connections, and slow parked readers under virtual threads | blorp |
 
 ## Standalone Diagnostic Benchmarks
 
@@ -82,9 +83,9 @@ not use `bench.sh` because it emits one parseable row per operation, size,
 thread setting, and selectivity case:
 
 ```bash
-BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/list_parallel.brp -- smoke
-BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/list_parallel.brp -- full
-./blorp run --no-format benchmarks/blorp/list_parallel.brp -- guard
+BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/list_parallel.brp smoke
+BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/list_parallel.brp full
+./blorp run --no-format benchmarks/blorp/list_parallel.brp guard
 ```
 
 Leave `BLORP_THREADS` unset to measure the runtime default. The `smoke` mode

@@ -1,0 +1,70 @@
+import:
+	bytes as B
+	net/tcp as Tcp
+	pkg/net/http_client as HTTP
+	string: contains
+	test: TestSuite
+
+
+pure func is_socket_permission_error(err: String) -> Bool:
+	err.contains("Operation not permitted") or err.contains("Permission denied")
+
+
+func serve_http_once(listener: TcpListener) -> Bool:
+	match Tcp.accept(listener):
+		Ok(peer):
+			match Tcp.read(peer, 4096):
+				Ok(request_bytes):
+					request_text: String = B.to_string(request_bytes)
+					response: Bytes = "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\nX-Test: pkg-http\r\n\r\nhello client".to_bytes()
+					match Tcp.write(peer, response):
+						Ok(_):
+							Tcp.close(peer)
+							request_text.contains(
+								"GET /hello?x=1 HTTP/1.1",
+							) and request_text.contains("Host: 127.0.0.1")
+						Err(_):
+							Tcp.close(peer)
+							False
+				Err(_):
+					Tcp.close(peer)
+					False
+		Err(_): False
+
+
+func http_client_get(port: Int) -> Bool:
+	url: String = "http://127.0.0.1:" + port.to_string() + "/hello?x=1"
+	match HTTP.http_get(url):
+		Ok(resp):
+			resp.status_code == 200 and B.to_string(resp.body) == "hello client"
+		Err(e):
+			print("HTTP client error: " + e)
+			False
+
+
+func test_http_client_loopback_get() -> Bool:
+	match Tcp.listen("127.0.0.1", 0, 1):
+		Ok(listener):
+			match Tcp.local_port(listener):
+				Ok(port):
+					concurrent(max_threads: 1, timeout: 1000):
+						served = serve_http_once(listener)
+						client = http_client_get(port)
+					Tcp.close(listener)
+					served_ok: Bool = match served:
+						Ok(result): result
+						Err(_): False
+					client_ok: Bool = match client:
+						Ok(result): result
+						Err(_): False
+					served_ok and client_ok
+				Err(_):
+					Tcp.close(listener)
+					False
+		Err(e): is_socket_permission_error(e)
+
+
+tests: TestSuite = {
+	description = "pkg/net/http_client runtime tests",
+	tests = [("loopback GET over std TCP", test_http_client_loopback_get)],
+}

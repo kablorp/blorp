@@ -57,6 +57,10 @@ val run_process_capture_timeout :
 (** Run a program directly with timeout, capturing stdout+stderr.
     Returns exit code 124 on timeout. *)
 
+val with_sanitizer_runtime_env : (unit -> 'a) -> 'a
+(** Run [f] with generated-program ASan defaults that avoid false stack-scope
+    reports from fiber stack switching while preserving heap/bounds checks. *)
+
 val with_run_artifacts : (unit -> 'a) -> 'a
 (** Run [f] with a process-local mutable artifact root.
     Nested calls reuse the current root. The root is deleted on normal exit. *)
