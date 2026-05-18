@@ -121,7 +121,7 @@ let concurrent_max_threads_or_error loc n =
 (* Tokens *)
 %token FUNC PURE VAR UNION ENUM RECORD STRUCT VOID_KW FOREIGN DETACH WHERE
 %token WHILE FOR IN IF ELSE AND OR NOT BREAK CONTINUE
-%token IMPLEMENTS TRAIT SELF_TYPE TYPE ALIAS NEW BUILTIN
+%token IMPLEMENTS TRAIT SELF_TYPE TYPE ALIAS BUILTIN
 %token IMPORT AS PRIVATE MATCH
 %token TRUE FALSE
 %token <string> IDENT
@@ -193,7 +193,6 @@ name:
   | AND { "and" }
   | OR { "or" }
   | NOT { "not" }
-  | NEW { "new" }
   | TYPE { "type" }
   | MATCH { "match" }
   | IF { "if" }
@@ -208,11 +207,6 @@ name:
 identifier:
   | n = IDENT { n }
   | DEBUG { "debug" }
-  | NEW { "new" }
-
-param_identifier:
-  | n = IDENT { n }
-  | NEW { "new" }
 
 (* Optional docstring preceding a declaration *)
 docstring:
@@ -242,8 +236,6 @@ decl:
     { make_decl_doc_at $symbolstartpos doc (DImpl d) }
   | doc = docstring d = type_alias_decl
     { make_decl_doc_at $symbolstartpos doc (DTypeAlias d) }
-  | doc = docstring d = new_type_decl
-    { make_decl_doc_at $symbolstartpos doc (DNewType d) }
   (* Docstring-prefixed single-line foreign funcs need an explicit route.
      The no-doc form is handled by [decl_list] via [foreign_dispatch], which
      avoids an empty-docstring ambiguity on top-level FOREIGN. *)
@@ -340,8 +332,6 @@ private_inner_decl:
     { make_decl_doc_at $symbolstartpos doc (DImpl d) }
   | doc = docstring d = type_alias_decl
     { make_decl_doc_at $symbolstartpos doc (DTypeAlias d) }
-  | doc = docstring d = new_type_decl
-    { make_decl_doc_at $symbolstartpos doc (DNewType d) }
   | doc = docstring FOREIGN FUNC fn_name = name
     params = params ARROW ret = type_expr c = foreign_c_name_opt
     { make_foreign_decl_at $symbolstartpos doc ~is_pure:false ~fn_name
@@ -375,9 +365,9 @@ params:
   | LPAREN ps = trailing_list(COMMA, param) RPAREN { ps }
 
 param:
-  | name = param_identifier COLON ty = type_expr
+  | name = IDENT COLON ty = type_expr
     { { param_name = Some name; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
-  | name = param_identifier
+  | name = IDENT
     { { param_name = Some name; param_pattern = None; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
   | UNDERSCORE
     { { param_name = None; param_pattern = Some PatWildcard; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
@@ -806,10 +796,6 @@ type_alias_decl:
   | TYPE ALIAS name = IDENT type_params = type_params_opt EQUALS ty = type_expr
     { { alias_name = name; alias_type_params = type_params; alias_target = ty } }
 
-new_type_decl:
-  | NEW TYPE name = IDENT type_params = type_params_opt EQUALS ty = type_expr
-    { { new_type_name = name; new_type_params = type_params; new_type_target = ty } }
-
 (* Type expressions *)
 type_expr:
   | d = type_dim_atom { d }
@@ -1029,7 +1015,6 @@ primary_expr:
   | FALSE { make_expr_span $symbolstartpos $endpos (ELiteral (LitBool false)) }
   | name = IDENT { make_expr_span $symbolstartpos $endpos (EIdent name) }
   | DEBUG { make_expr_span $symbolstartpos $endpos (EIdent "debug") }
-  | NEW { make_expr_span $symbolstartpos $endpos (EIdent "new") }
   | UNDERSCORE { make_expr_at $symbolstartpos EVoid }
   | VOID_KW { make_expr_at $symbolstartpos EVoid }
   | BREAK { make_expr_at $symbolstartpos EBreak }
@@ -1230,9 +1215,9 @@ lambda_expr:
 	          ~ret ~body:(FuncBodyExpr body) ~annots:[])) }
 
 lambda_param:
-  | name = param_identifier COLON ty = type_expr
+  | name = IDENT COLON ty = type_expr
     { { param_name = Some name; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
-  | name = param_identifier
+  | name = IDENT
     { { param_name = Some name; param_pattern = None; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
   (* Underscore as discard parameter *)
   | UNDERSCORE COLON ty = type_expr

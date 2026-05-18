@@ -898,9 +898,46 @@ let rec convert_decl (state : state) (d : core_decl) : core_decl =
   in
   { d with cd_desc = desc' }
 
+(** Scan program for constructor and global function names.
+    Needed to filter free variables (constructors and globals
+    are not captures). *)
+let starts_with s prefix =
+  let slen = String.length s in
+  let plen = String.length prefix in
+  slen >= plen && String.sub s 0 plen = prefix
+
+let ends_with s suffix =
+  let slen = String.length s in
+  let suffix_len = String.length suffix in
+  slen >= suffix_len && String.sub s (slen - suffix_len) suffix_len = suffix
+
+let strip_mono_suffix name =
+  let marker = "__mono_" in
+  let marker_len = String.length marker in
+  let rec find i =
+    if i + marker_len > String.length name then name
+    else if String.sub name i marker_len = marker then String.sub name 0 i
+    else find (i + 1)
+  in
+  find 0
+
 let source_name_for_builtin_lookup (f : core_func) : string =
-  Codegen_names.source_name_for_generated_function ?module_path:f.cf_module
-    f.cf_name
+  let source_name = strip_mono_suffix f.cf_name in
+  let source_name =
+    match f.cf_module with
+    | None -> source_name
+    | Some module_path ->
+        let prefix = Codegen_names.sanitize_module_name module_path ^ "__" in
+        if starts_with source_name prefix then
+          String.sub source_name (String.length prefix)
+            (String.length source_name - String.length prefix)
+        else source_name
+  in
+  let pure_suffix = "__pure" in
+  if ends_with source_name pure_suffix then
+    String.sub source_name 0
+      (String.length source_name - String.length pure_suffix)
+  else source_name
 
 let builtin_c_name_for_func (f : core_func) : string option =
   let source_name = source_name_for_builtin_lookup f in
@@ -910,9 +947,6 @@ let builtin_c_name_for_func (f : core_func) : string option =
   | None ->
       if module_path = "" then None else Codegen_builtins.lookup "" source_name
 
-(** Scan program for constructor and global function names.
-    Needed to filter free variables (constructors and globals
-    are not captures). *)
 let scan_names (prog : core_program) :
     (string, unit) Hashtbl.t * (string, function_ref_target) Hashtbl.t =
   let ctors = Hashtbl.create 32 in
@@ -926,14 +960,9 @@ let scan_names (prog : core_program) :
         Hashtbl.replace function_refs f.cf_name (FunctionRefBuiltin c_name)
     | None -> ()
   in
-  let register_foreign_func (f : core_func) c_name arg_passing call_effect =
+  let register_foreign_func (f : core_func) c_name arg_passing =
     Hashtbl.replace function_refs f.cf_name
-      (FunctionRefForeign
-         {
-           fc_c_name = c_name;
-           fc_arg_passing = arg_passing;
-           fc_call_effect = call_effect;
-         })
+      (FunctionRefForeign { fc_c_name = c_name; fc_arg_passing = arg_passing })
   in
   (* Builtin constructors *)
   List.iter
@@ -960,8 +989,8 @@ let scan_names (prog : core_program) :
         | CDFunc f when f.cf_body <> None -> register_user_func f
         | CDFunc f -> (
             match f.cf_kind with
-            | CFForeign { c_name; arg_passing; call_effect; _ } ->
-                register_foreign_func f c_name arg_passing call_effect
+            | CFForeign { c_name; arg_passing; _ } ->
+                register_foreign_func f c_name arg_passing
             | CFBuiltin -> register_builtin_func f
             | CFUser | CFClosureBody _ -> ())
         | CDImpl i ->

@@ -2535,7 +2535,6 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                       {
                         fc_c_name;
                         fc_arg_passing = ForeignDefaultArgs policies;
-                        _;
                       } ->
                       if List.length policies <> List.length args then
                         Core_error.errorf Core_error.Emit e.loc
@@ -2748,19 +2747,9 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                             emit_owned_unbox
                               (Printf.sprintf "blorp_unbox_uint128(%s)" tmp_r)
                         | BoxStruct c_ty ->
-                            if
-                              Core_layout_type.is_stack_result_type ~reg:ctx.reg
-                                e.ty
-                            then
-                              emit ctx
-                                (Printf.sprintf
-                                   "; blorp_stack_result_from_boxed_value(%s); \
-                                    })"
-                                   tmp_r)
-                            else
-                              emit_owned_unbox
-                                (Printf.sprintf "blorp_unbox_struct(%s, %s)"
-                                   tmp_r c_ty)
+                            emit_owned_unbox
+                              (Printf.sprintf "blorp_unbox_struct(%s, %s)" tmp_r
+                                 c_ty)
                         | BoxPrim ->
                             emit ctx
                               (Printf.sprintf "; (%s)(long)%s; })" ret_c_ty
@@ -4043,12 +4032,6 @@ and emit_boxed (ctx : Core_emit_context.t) (e : core) : unit =
       emit ctx "(void*)(long)(";
       emit_expr ctx e;
       emit ctx ")"
-  | BoxStruct type_name
-    when Core_layout_type.is_stack_result_type ~reg:ctx.reg e.ty ->
-      let tmp = Printf.sprintf "__box_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ %s %s = " type_name tmp);
-      emit_expr ctx e;
-      emit ctx (Printf.sprintf "; blorp_box_stack_result(%s); })" tmp)
   | BoxStruct type_name ->
       let tmp = Printf.sprintf "__box_%d" (fresh_temp ctx) in
       emit ctx (Printf.sprintf "({ %s %s = " type_name tmp);
@@ -6332,6 +6315,9 @@ and emit_conc_closure (ctx : Core_emit_context.t) (lambda_name : string)
     RC classification of what the task stores. *)
 and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
     : unit =
+  (match block.conc_max_threads with
+  | Some n -> emit_line ctx (Printf.sprintf "blorp_thread_pool_init(%d);" n)
+  | None -> ());
   let batch_tmp = Printf.sprintf "__conc_batch_%d" (fresh_temp ctx) in
   emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_tmp);
   emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_tmp);
@@ -6473,6 +6459,9 @@ and emit_concurrent_for_collecting ~(collect : bool) (ctx : Core_emit_context.t)
      orderings before [data[]], so reading [->data[0]] through the wrong
      pointer type returns padding instead of element 0. Update the cast and
      add a tensor-aware path at the same time. *)
+  (match cf.cf_max_threads with
+  | Some n -> emit_line ctx (Printf.sprintf "blorp_thread_pool_init(%d);" n)
+  | None -> ());
   let id = fresh_temp ctx in
   let list_c = Printf.sprintf "__conc_list_%d" id in
   let len_c = Printf.sprintf "__conc_len_%d" id in

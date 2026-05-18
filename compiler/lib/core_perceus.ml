@@ -50,8 +50,8 @@
     - {b Drop specialization}: C emission specializes stack Result drops and
       ARC-only source values, but known-shape nested field destructors still
       use runtime destructor dispatch.
-    - {b Reuse selection}: Perceus only inserts ownership operations; the
-      downstream [Core_reuse] pass matches compatible drops and allocations.
+    - {b Reuse analysis / FBIP}: drops are not yet matched with compatible
+      allocations to drive allocation reuse.
     - {b COW strategy selection}: runtime COW remains the safety guard; the
       compiler does not yet choose between borrow, consume/reuse, view, and
       allocate strategies for high-level operations such as list combinators. *)
@@ -196,25 +196,6 @@ let is_managed_type (env : type_env) (ty : Ast.type_expr) : bool =
   Core_layout_type.source_value_layout_of_metadata
     ~phase:(Core_error.Stage Core_stage.Perceus) (type_layout_metadata env) ty
   |> Core_layout_type.source_value_requires_release
-
-let boxed_storage_requires_release (env : type_env) (ty : Ast.type_expr)
-    (loc : Ast.loc) : bool =
-  Core_layout_type.boxed_storage_requires_release_or_error
-    ~phase:(Core_error.Stage Core_stage.Perceus) ~reg:env.type_registry ty loc
-
-let boxed_expr_transfers_ownership (env : type_env) (expr : core) : bool =
-  match expr.desc with
-  | CBox (_, source_ty) -> boxed_storage_requires_release env source_ty expr.loc
-  | CBoxTyped b -> boxed_storage_requires_release env b.box_source_ty expr.loc
-  | CVar _ | CField _ | CUnbox _ | CUnboxTyped _ | CLit (Ast.LitString _) -> (
-      match
-        Core_layout_type.box_kind_of_type
-          ~phase:(Core_error.Stage Core_stage.Perceus) ~reg:env.type_registry
-          expr.ty expr.loc
-      with
-      | BoxStruct _ -> true
-      | _ -> false)
-  | _ -> boxed_storage_requires_release env expr.ty expr.loc
 
 let result_mode_for_type (env : type_env) (ty : Ast.type_expr) :
     Core_ownership.result_mode =
@@ -691,7 +672,7 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
         (List.map (summarize_boxed_storage_uses env name) tc.tc_elems)
   | CList lit ->
       aggregate_ownership_uses
-        (List.map (summarize_boxed_expr_storage_uses env name) lit.ll_elems)
+        (List.map (summarize_linear_ownership_uses env name) lit.ll_elems)
   | CListConstruct lc ->
       aggregate_ownership_uses
         (List.map (summarize_boxed_storage_uses env name) lc.lc_elems)
@@ -959,7 +940,7 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
       in
       seq_ownership_uses timeout_uses (seq_ownership_uses task_uses body_uses)
   | CConcurrentFor cf ->
-      let iter_uses = summarize_linear_borrow env name cf.cf_iter in
+      let iter_uses = summarize_linear_ownership_uses env name cf.cf_iter in
       let task_uses =
         if cf.cf_var.vname = name then no_ownership_uses
         else task_capture_ownership_use name cf.cf_body
@@ -974,21 +955,8 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
      their success/failure lifetime model is formalized. *)
   | CTry _ -> ownership_uses_from_legacy_count (count_uses name e)
 
-and summarize_boxed_expr_storage_uses env name (expr : core) =
-  let value_expr =
-    match expr.desc with
-    | CBox (inner, _) -> inner
-    | CBoxTyped b -> b.box_value
-    | _ -> expr
-  in
-  if boxed_expr_transfers_ownership env expr then
-    summarize_linear_ownership_uses env name value_expr
-  else summarize_linear_borrow env name value_expr
-
 and summarize_boxed_storage_uses env name value =
-  if value.bsv_transfers_ownership then
-    summarize_linear_ownership_uses env name value.bsv_box.box_value
-  else summarize_linear_borrow env name value.bsv_box.box_value
+  summarize_linear_ownership_uses env name value.bsv_box.box_value
 
 and summarize_ctree_ownership_uses (env : type_env) (name : string)
     (tree : ctree) : ownership_uses =
@@ -1253,326 +1221,6 @@ let install_user_contract (env : type_env) (f : core_func)
   Hashtbl.replace env.user_call_contracts_by_name f.cf_name contract;
   Hashtbl.replace env.user_call_contracts_by_id f.cf_def_id contract
 
-let rec expr_contains_unbound_var (name : string) (e : core) : bool =
-  match e.desc with
-  | CVar v -> v.vname = name
-  | CLet (b, body) ->
-      expr_contains_unbound_var name b.bind_rhs
-      || (b.bind_var.vname <> name && expr_contains_unbound_var name body)
-  | CBorrowLet (b, body) ->
-      expr_contains_unbound_var name b.borrow_rhs
-      || (b.borrow_var.vname <> name && expr_contains_unbound_var name body)
-  | CLambda lam ->
-      (not (List.exists (fun (v, _) -> v.vname = name) lam.lam_params))
-      && expr_contains_unbound_var name lam.lam_body
-  | CMatchArms (scrut, arms) ->
-      expr_contains_unbound_var name scrut
-      || List.exists
-           (fun (pat, body) ->
-             (not (pattern_binds name pat))
-             && expr_contains_unbound_var name body)
-           arms
-  | CMatch (scrut, tree) ->
-      expr_contains_unbound_var name scrut
-      || ctree_contains_unbound_var name tree
-  | CFor (binder, iter, body) ->
-      expr_contains_unbound_var name iter
-      || (binder.loop_var.vname <> name && expr_contains_unbound_var name body)
-  | CConcurrent cb ->
-      let rhs_contains =
-        List.exists
-          (fun (b : conc_binding) -> expr_contains_unbound_var name b.cb_rhs)
-          cb.conc_bindings
-      in
-      let shadowed =
-        List.exists
-          (fun (b : conc_binding) -> b.cb_var.vname = name)
-          cb.conc_bindings
-      in
-      rhs_contains
-      || ((not shadowed) && expr_contains_unbound_var name cb.conc_body)
-      || Option.fold ~none:false
-           ~some:(expr_contains_unbound_var name)
-           cb.conc_timeout
-  | CConcurrentFor cf ->
-      expr_contains_unbound_var name cf.cf_iter
-      || (cf.cf_var.vname <> name && expr_contains_unbound_var name cf.cf_body)
-      || Option.fold ~none:false
-           ~some:(expr_contains_unbound_var name)
-           cf.cf_timeout
-  | _ ->
-      fold_immediate_children
-        (fun found child -> found || expr_contains_unbound_var name child)
-        false e
-
-and ctree_contains_unbound_var (name : string) (tree : ctree) : bool =
-  match tree with
-  | CTLeaf { ct_bindings; ct_body } ->
-      (not (List.exists (fun (v, _) -> v.vname = name) ct_bindings))
-      && expr_contains_unbound_var name ct_body
-  | CTFail -> false
-  | CTSwitchTag { cts_cases; cts_default; _ } ->
-      List.exists
-        (fun (_, sub) -> ctree_contains_unbound_var name sub)
-        cts_cases
-      || Option.fold ~none:false
-           ~some:(ctree_contains_unbound_var name)
-           cts_default
-  | CTSwitchLit { ctl_cases; ctl_default; _ } ->
-      List.exists
-        (fun (_, sub) -> ctree_contains_unbound_var name sub)
-        ctl_cases
-      || ctree_contains_unbound_var name ctl_default
-  | CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
-      List.exists
-        (fun (_, sub) -> ctree_contains_unbound_var name sub)
-        ctl_len_cases
-      || Option.fold ~none:false
-           ~some:(fun (_, sub) -> ctree_contains_unbound_var name sub)
-           ctl_len_geq
-      || Option.fold ~none:false
-           ~some:(ctree_contains_unbound_var name)
-           ctl_len_default
-
-let rec expr_consumes_param_owner_on_some_path (env : type_env) (name : string)
-    (e : core) : bool =
-  let rec consuming_arg arg =
-    match arg.desc with
-    | CVar v -> v.vname = name
-    | CUnbox (inner, _) | CCast (inner, _) | CBox (inner, _) ->
-        consuming_arg inner
-    | _ -> expr_consumes_param_owner_on_some_path env name arg
-  in
-  match e.desc with
-  | CVar _ | CLit _ | CVoid | CBreak | CContinue | CClosureCreate _ -> false
-  | CCall (kind, fn, args) ->
-      let fn_consumes =
-        match kind with
-        | CKClosure -> expr_consumes_param_owner_on_some_path env name fn
-        | _ -> false
-      in
-      let arg_consumes =
-        match
-          contract_for_call env kind ~arg_count:(List.length args)
-            ~return_ty:e.ty
-        with
-        | Some { Core_ownership.args = modes; _ }
-          when List.length modes = List.length args ->
-            List.exists2
-              (fun mode arg ->
-                if Core_ownership.arg_consumes_caller mode then
-                  consuming_arg arg
-                else expr_consumes_param_owner_on_some_path env name arg)
-              modes args
-        | _ -> List.exists (expr_contains_unbound_var name) args
-      in
-      fn_consumes || arg_consumes
-  | CLet (b, body) ->
-      expr_consumes_param_owner_on_some_path env name b.bind_rhs
-      || b.bind_var.vname <> name
-         && expr_consumes_param_owner_on_some_path env name body
-  | CBorrowLet (b, body) ->
-      expr_consumes_param_owner_on_some_path env name b.borrow_rhs
-      || b.borrow_var.vname <> name
-         && expr_consumes_param_owner_on_some_path env name body
-  | CSeq (head, tail) ->
-      expr_consumes_param_owner_on_some_path env name head
-      || expr_consumes_param_owner_on_some_path env name tail
-  | CIf (cond, then_e, else_e) ->
-      expr_consumes_param_owner_on_some_path env name cond
-      || expr_consumes_param_owner_on_some_path env name then_e
-      || expr_consumes_param_owner_on_some_path env name else_e
-  | CMatchArms (scrut, arms) ->
-      expr_consumes_param_owner_on_some_path env name scrut
-      || List.exists
-           (fun (pat, body) ->
-             (not (pattern_binds name pat))
-             && expr_consumes_param_owner_on_some_path env name body)
-           arms
-  | CMatch (scrut, tree) ->
-      expr_consumes_param_owner_on_some_path env name scrut
-      || ctree_consumes_param_owner_on_some_path env name tree
-  | CFor (binder, iter, body) ->
-      expr_consumes_param_owner_on_some_path env name iter
-      || binder.loop_var.vname <> name
-         && expr_consumes_param_owner_on_some_path env name body
-  | CLambda lam ->
-      (not (List.exists (fun (v, _) -> v.vname = name) lam.lam_params))
-      && expr_consumes_param_owner_on_some_path env name lam.lam_body
-  | CTryBind (_, _, _, rhs) ->
-      expr_consumes_param_owner_on_some_path env name rhs
-  | CConcurrent cb ->
-      let rhs_consumes =
-        List.exists
-          (fun (b : conc_binding) ->
-            expr_consumes_param_owner_on_some_path env name b.cb_rhs)
-          cb.conc_bindings
-      in
-      let shadowed =
-        List.exists
-          (fun (b : conc_binding) -> b.cb_var.vname = name)
-          cb.conc_bindings
-      in
-      rhs_consumes
-      || (not shadowed)
-         && expr_consumes_param_owner_on_some_path env name cb.conc_body
-      || Option.fold ~none:false
-           ~some:(expr_consumes_param_owner_on_some_path env name)
-           cb.conc_timeout
-  | CConcurrentFor cf ->
-      expr_consumes_param_owner_on_some_path env name cf.cf_iter
-      || cf.cf_var.vname <> name
-         && expr_consumes_param_owner_on_some_path env name cf.cf_body
-      || Option.fold ~none:false
-           ~some:(expr_consumes_param_owner_on_some_path env name)
-           cf.cf_timeout
-  | _ ->
-      fold_immediate_children
-        (fun found child ->
-          found || expr_consumes_param_owner_on_some_path env name child)
-        false e
-
-and ctree_consumes_param_owner_on_some_path (env : type_env) (name : string)
-    (tree : ctree) : bool =
-  match tree with
-  | CTLeaf { ct_bindings; ct_body } ->
-      (not (List.exists (fun (v, _) -> v.vname = name) ct_bindings))
-      && expr_consumes_param_owner_on_some_path env name ct_body
-  | CTFail -> false
-  | CTSwitchTag { cts_cases; cts_default; _ } ->
-      List.exists
-        (fun (_, sub) -> ctree_consumes_param_owner_on_some_path env name sub)
-        cts_cases
-      || Option.fold ~none:false
-           ~some:(ctree_consumes_param_owner_on_some_path env name)
-           cts_default
-  | CTSwitchLit { ctl_cases; ctl_default; _ } ->
-      List.exists
-        (fun (_, sub) -> ctree_consumes_param_owner_on_some_path env name sub)
-        ctl_cases
-      || ctree_consumes_param_owner_on_some_path env name ctl_default
-  | CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
-      List.exists
-        (fun (_, sub) -> ctree_consumes_param_owner_on_some_path env name sub)
-        ctl_len_cases
-      || Option.fold ~none:false
-           ~some:(fun (_, sub) ->
-             ctree_consumes_param_owner_on_some_path env name sub)
-           ctl_len_geq
-      || Option.fold ~none:false
-           ~some:(ctree_consumes_param_owner_on_some_path env name)
-           ctl_len_default
-
-let rec expr_finally_consumes_param_owner (env : type_env) (name : string)
-    (e : core) : bool =
-  let touches e =
-    expr_contains_unbound_var name e
-    || expr_consumes_param_owner_on_some_path env name e
-  in
-  match e.desc with
-  | CLet (b, body) ->
-      if b.bind_var.vname = name then false
-      else if touches body then expr_finally_consumes_param_owner env name body
-      else expr_finally_consumes_param_owner env name b.bind_rhs
-  | CBorrowLet (b, body) ->
-      if b.borrow_var.vname = name then false
-      else if touches body then expr_finally_consumes_param_owner env name body
-      else expr_finally_consumes_param_owner env name b.borrow_rhs
-  | CSeq (head, tail) ->
-      if touches tail then expr_finally_consumes_param_owner env name tail
-      else expr_finally_consumes_param_owner env name head
-  | CIf (cond, then_e, else_e) ->
-      let then_touches = touches then_e in
-      let else_touches = touches else_e in
-      if then_touches || else_touches then
-        then_touches && else_touches
-        && expr_finally_consumes_param_owner env name then_e
-        && expr_finally_consumes_param_owner env name else_e
-      else expr_consumes_param_owner_on_some_path env name cond
-  | CMatchArms (scrut, arms) ->
-      let arm_states =
-        List.map
-          (fun (pat, body) ->
-            if pattern_binds name pat then Some false
-            else if touches body then
-              Some (expr_finally_consumes_param_owner env name body)
-            else None)
-          arms
-      in
-      if List.exists Option.is_some arm_states then
-        List.for_all (function Some true -> true | _ -> false) arm_states
-      else expr_consumes_param_owner_on_some_path env name scrut
-  | CMatch (scrut, tree) ->
-      let leaf_states = ctree_finally_consumes_param_owner env name tree in
-      if List.exists Option.is_some leaf_states then
-        List.for_all (function Some true -> true | _ -> false) leaf_states
-      else expr_consumes_param_owner_on_some_path env name scrut
-  | _ -> expr_consumes_param_owner_on_some_path env name e
-
-and ctree_finally_consumes_param_owner (env : type_env) (name : string)
-    (tree : ctree) : bool option list =
-  let touches e =
-    expr_contains_unbound_var name e
-    || expr_consumes_param_owner_on_some_path env name e
-  in
-  match tree with
-  | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> v.vname = name) ct_bindings then
-        [ Some false ]
-      else if touches ct_body then
-        [ Some (expr_finally_consumes_param_owner env name ct_body) ]
-      else [ None ]
-  | CTFail -> [ None ]
-  | CTSwitchTag { cts_cases; cts_default; _ } ->
-      let states =
-        List.concat_map
-          (fun (_, sub) -> ctree_finally_consumes_param_owner env name sub)
-          cts_cases
-      in
-      states
-      @ Option.fold ~none:[ None ]
-          ~some:(ctree_finally_consumes_param_owner env name)
-          cts_default
-  | CTSwitchLit { ctl_cases; ctl_default; _ } ->
-      List.concat_map
-        (fun (_, sub) -> ctree_finally_consumes_param_owner env name sub)
-        ctl_cases
-      @ ctree_finally_consumes_param_owner env name ctl_default
-  | CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
-      let states =
-        List.concat_map
-          (fun (_, sub) -> ctree_finally_consumes_param_owner env name sub)
-          ctl_len_cases
-      in
-      let states =
-        states
-        @ Option.fold ~none:[]
-            ~some:(fun (_, sub) ->
-              ctree_finally_consumes_param_owner env name sub)
-            ctl_len_geq
-      in
-      states
-      @ Option.fold ~none:[ None ]
-          ~some:(ctree_finally_consumes_param_owner env name)
-          ctl_len_default
-
-let declared_collection_receiver_mode (f : core_func) :
-    Core_ownership.arg_mode option =
-  match f.cf_module with
-  | None -> None
-  | Some module_path -> (
-      let func_name =
-        Codegen_names.source_name_for_generated_function
-          ?module_path:f.cf_module f.cf_name
-      in
-      match Core_ownership.collection_strategy ~module_path ~func_name with
-      | Some { Core_ownership.receiver = Core_ownership.CowConsumeReceiver; _ }
-        ->
-          Some Core_ownership.Consume
-      | Some { receiver = Core_ownership.BorrowReceiver; _ } ->
-          Some Core_ownership.Borrow
-      | None -> None)
-
 let infer_user_contract (env : type_env) (f : core_func) :
     Core_ownership.call_contract =
   let env = with_type_params env f.cf_type_params in
@@ -1590,21 +1238,13 @@ let infer_user_contract (env : type_env) (f : core_func) :
             else no_ownership_uses)
           f.cf_params
       in
-      let receiver_mode = declared_collection_receiver_mode f in
       let arg_modes =
-        List.mapi
-          (fun i (p, uses) ->
+        List.map2
+          (fun (p : core_param) uses ->
             if not (is_managed_type env p.cp_ty) then Core_ownership.Borrow
-            else
-              match receiver_mode with
-              | Some mode when i = 0 -> mode
-              | _
-                when uses.consumed_refs > 0
-                     && expr_finally_consumes_param_owner env p.cp_name.vname
-                          body ->
-                  Core_ownership.Consume
-              | _ -> Core_ownership.Borrow)
-          (List.combine f.cf_params param_uses)
+            else if uses.consumed_refs > 0 then Core_ownership.Consume
+            else Core_ownership.Borrow)
+          f.cf_params param_uses
       in
       let result =
         match result_mode_for_type env f.cf_return_ty with
@@ -1745,81 +1385,6 @@ let result_starts_with_dup_of (name : string) (body : core) : bool =
   | CSeq ({ desc = CDup (v, _, _); _ }, _) -> v.vname = name
   | _ -> false
 
-let rec expr_contains_var (name : string) (e : core) : bool =
-  match e.desc with
-  | CVar v -> v.vname = name
-  | CLet (b, body) ->
-      expr_contains_var name b.bind_rhs
-      || (b.bind_var.vname <> name && expr_contains_var name body)
-  | CBorrowLet (b, body) ->
-      expr_contains_var name b.borrow_rhs
-      || (b.borrow_var.vname <> name && expr_contains_var name body)
-  | CMatchArms (scrut, arms) ->
-      expr_contains_var name scrut
-      || List.exists
-           (fun (pat, body) ->
-             (not (pattern_binds name pat)) && expr_contains_var name body)
-           arms
-  | CMatch (scrut, tree) ->
-      expr_contains_var name scrut || ctree_contains_var name tree
-  | CFor (binder, iter, body) ->
-      expr_contains_var name iter
-      || (binder.loop_var.vname <> name && expr_contains_var name body)
-  | CLambda lam ->
-      (not (List.exists (fun (v, _) -> v.vname = name) lam.lam_params))
-      && expr_contains_var name lam.lam_body
-  | CTryBind (_, _, _, rhs) -> expr_contains_var name rhs
-  | CConcurrent cb ->
-      let rhs_mentions =
-        List.exists
-          (fun (b : conc_binding) -> expr_contains_var name b.cb_rhs)
-          cb.conc_bindings
-      in
-      let shadowed =
-        List.exists
-          (fun (b : conc_binding) -> b.cb_var.vname = name)
-          cb.conc_bindings
-      in
-      rhs_mentions
-      || ((not shadowed) && expr_contains_var name cb.conc_body)
-      || Option.fold ~none:false ~some:(expr_contains_var name) cb.conc_timeout
-  | CConcurrentFor cf ->
-      expr_contains_var name cf.cf_iter
-      || (cf.cf_var.vname <> name && expr_contains_var name cf.cf_body)
-      || Option.fold ~none:false ~some:(expr_contains_var name) cf.cf_timeout
-  | _ ->
-      fold_immediate_children
-        (fun found child -> found || expr_contains_var name child)
-        false e
-
-and ctree_contains_var (name : string) (tree : ctree) : bool =
-  match tree with
-  | CTLeaf { ct_bindings; ct_body } ->
-      (not (List.exists (fun (v, _) -> v.vname = name) ct_bindings))
-      && expr_contains_var name ct_body
-  | CTFail -> false
-  | CTSwitchTag { cts_cases; cts_default; _ } ->
-      List.exists (fun (_, sub) -> ctree_contains_var name sub) cts_cases
-      || Option.fold ~none:false ~some:(ctree_contains_var name) cts_default
-  | CTSwitchLit { ctl_cases; ctl_default; _ } ->
-      List.exists (fun (_, sub) -> ctree_contains_var name sub) ctl_cases
-      || ctree_contains_var name ctl_default
-  | CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
-      List.exists (fun (_, sub) -> ctree_contains_var name sub) ctl_len_cases
-      || Option.fold ~none:false
-           ~some:(fun (_, sub) -> ctree_contains_var name sub)
-           ctl_len_geq
-      || Option.fold ~none:false ~some:(ctree_contains_var name) ctl_len_default
-
-let rec assignment_retains_alias_result (name : string) (body : core) : bool =
-  match body.desc with
-  | CAssign (_, rhs) -> result_starts_with_dup_of name rhs
-  | CSeq (head, tail) ->
-      is_void_type body.ty
-      && assignment_retains_alias_result name head
-      && not (expr_contains_var name tail)
-  | _ -> false
-
 (** A binding initialized from a borrowed managed value creates a second
     logical owner. Retain before the binding body can mutate either alias,
     otherwise COW sees a false "unique" refcount and mutates shared data.
@@ -1854,10 +1419,7 @@ let retain_alias_source (env : type_env) (b : binding) (body : core) : core =
   | Some (AliasVar source) ->
       { body with desc = CDup (source, b.bind_ty, body) }
   | Some AliasBinding ->
-      if
-        result_starts_with_dup_of b.bind_var.vname body
-        || assignment_retains_alias_result b.bind_var.vname body
-      then body
+      if result_starts_with_dup_of b.bind_var.vname body then body
       else { body with desc = CDup (b.bind_var, b.bind_ty, body) }
   | None -> body
 
@@ -2078,17 +1640,17 @@ let is_owned_temporary_expr (env : type_env) (e : core) : bool =
 let borrowed_mode_needs_owned_temp_binding mode =
   Core_ownership.arg_preserves_caller mode
 
-(** If an owned temporary flows into a borrowed use slot, the caller still owns
-    that temporary after the use. Bind it to a synthetic [let] so the normal
-    Perceus let-balancing path can insert the post-use drop:
+(** If an owned temporary flows into a borrowed call slot, the caller still
+    owns that temporary after the call. Bind it to a synthetic [let] so the
+    normal Perceus let-balancing path can insert the post-call drop:
 
       read(make_list())  ==>  let __borrow_arg_N = make_list() in read(__borrow_arg_N)
 
-    This applies to borrowed arguments, to the callee object for closure calls,
-    and to [concurrent for] iterators. Direct variables and field projections
-    are aliases of existing owners, so they must stay under the binding that
-    already owns their lifetime. *)
-let bind_borrowed_owned_temporaries (env : type_env) (e : core) : core =
+    This applies to borrowed arguments and to the callee object for closure
+    calls. Direct variables and field projections are aliases of existing
+    owners, so they must stay under the binding that already owns their
+    lifetime. *)
+let bind_borrowed_owned_temporary_args (env : type_env) (e : core) : core =
   let counter = ref 0 in
   let next_tmp prefix =
     let n = !counter in
@@ -2148,13 +1710,6 @@ let bind_borrowed_owned_temporaries (env : type_env) (e : core) : core =
             let call = { node with desc = CCall (kind, fn', args') } in
             bind_all !bindings call
         | _ -> node)
-    | CConcurrentFor cf when is_owned_temporary_expr env cf.cf_iter ->
-        let tmp = next_tmp "iter" in
-        let iter_ref = { cf.cf_iter with desc = CVar tmp } in
-        let cf' = { cf with cf_iter = iter_ref } in
-        bind_all
-          [ (tmp, cf.cf_iter.ty, cf.cf_iter) ]
-          { node with desc = CConcurrentFor cf' }
     | _ -> node
   in
   transform_bottom_up rewrite_call e
@@ -2555,14 +2110,11 @@ let retain_then_return_var (loc : Ast.loc) (v : var) (ty : Ast.type_expr) : core
   { desc = CSeq (retain, tmp_ref); ty; loc }
 
 let retain_owned_result_expr (e : core) : core =
-  match e.desc with
-  | CVar v -> retain_then_return_var e.loc v e.ty
-  | _ ->
-      let tmp = Var.named "__owned_result" in
-      let bind =
-        { bind_var = tmp; bind_mut = false; bind_ty = e.ty; bind_rhs = e }
-      in
-      { e with desc = CLet (bind, retain_then_return_var e.loc tmp e.ty) }
+  let tmp = Var.named "__owned_result" in
+  let bind =
+    { bind_var = tmp; bind_mut = false; bind_ty = e.ty; bind_rhs = e }
+  in
+  { e with desc = CLet (bind, retain_then_return_var e.loc tmp e.ty) }
 
 let assignment_rhs_is_alias (env : type_env) (rhs : core) : bool =
   let rec result_aliases local_aliases expr =
@@ -2597,6 +2149,72 @@ let retain_assignment_alias_rhs (env : type_env) (e : core) : core =
     when is_managed_type env rhs.ty && assignment_rhs_is_alias env rhs ->
       { e with desc = CAssign (v, retain_owned_result_expr rhs) }
   | _ -> e
+
+let rec expr_contains_var (name : string) (e : core) : bool =
+  match e.desc with
+  | CVar v -> v.vname = name
+  | CLet (b, body) ->
+      expr_contains_var name b.bind_rhs
+      || (b.bind_var.vname <> name && expr_contains_var name body)
+  | CBorrowLet (b, body) ->
+      expr_contains_var name b.borrow_rhs
+      || (b.borrow_var.vname <> name && expr_contains_var name body)
+  | CMatchArms (scrut, arms) ->
+      expr_contains_var name scrut
+      || List.exists
+           (fun (pat, body) ->
+             (not (pattern_binds name pat)) && expr_contains_var name body)
+           arms
+  | CMatch (scrut, tree) ->
+      expr_contains_var name scrut || ctree_contains_var name tree
+  | CFor (binder, iter, body) ->
+      expr_contains_var name iter
+      || (binder.loop_var.vname <> name && expr_contains_var name body)
+  | CLambda lam ->
+      (not (List.exists (fun (v, _) -> v.vname = name) lam.lam_params))
+      && expr_contains_var name lam.lam_body
+  | CTryBind (_, _, _, rhs) -> expr_contains_var name rhs
+  | CConcurrent cb ->
+      let rhs_mentions =
+        List.exists
+          (fun (b : conc_binding) -> expr_contains_var name b.cb_rhs)
+          cb.conc_bindings
+      in
+      let shadowed =
+        List.exists
+          (fun (b : conc_binding) -> b.cb_var.vname = name)
+          cb.conc_bindings
+      in
+      rhs_mentions
+      || ((not shadowed) && expr_contains_var name cb.conc_body)
+      || Option.fold ~none:false ~some:(expr_contains_var name) cb.conc_timeout
+  | CConcurrentFor cf ->
+      expr_contains_var name cf.cf_iter
+      || (cf.cf_var.vname <> name && expr_contains_var name cf.cf_body)
+      || Option.fold ~none:false ~some:(expr_contains_var name) cf.cf_timeout
+  | _ ->
+      fold_immediate_children
+        (fun found child -> found || expr_contains_var name child)
+        false e
+
+and ctree_contains_var (name : string) (tree : ctree) : bool =
+  match tree with
+  | CTLeaf { ct_bindings; ct_body } ->
+      (not (List.exists (fun (v, _) -> v.vname = name) ct_bindings))
+      && expr_contains_var name ct_body
+  | CTFail -> false
+  | CTSwitchTag { cts_cases; cts_default; _ } ->
+      List.exists (fun (_, sub) -> ctree_contains_var name sub) cts_cases
+      || Option.fold ~none:false ~some:(ctree_contains_var name) cts_default
+  | CTSwitchLit { ctl_cases; ctl_default; _ } ->
+      List.exists (fun (_, sub) -> ctree_contains_var name sub) ctl_cases
+      || ctree_contains_var name ctl_default
+  | CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
+      List.exists (fun (_, sub) -> ctree_contains_var name sub) ctl_len_cases
+      || Option.fold ~none:false
+           ~some:(fun (_, sub) -> ctree_contains_var name sub)
+           ctl_len_geq
+      || Option.fold ~none:false ~some:(ctree_contains_var name) ctl_len_default
 
 let rec expr_consumes_var_owner (env : type_env) (name : string) (e : core) :
     bool =
@@ -3024,11 +2642,24 @@ let release_reassigned_mutable_var (env : type_env)
     | CAssign (v, rhs) when v.vname = target.vname ->
         let rhs = rewrite ~skip_old_release:false ~borrowed_aliases rhs in
         if skip_old_release || expr_consumes_var_owner env target.vname rhs then
-          (* The old target owner has already been consumed, or the RHS consumes
-             it while producing the new value. If RHS alias normalization added
-             a retain, that retained ref is the mutable slot's new owner; the
-             alias source/scrutinee teardown balances its own owner separately. *)
-          { e with desc = CAssign (v, rhs) }
+          let assign = { e with desc = CAssign (v, rhs) } in
+          (* If a prior COW-consuming expression already consumed the old
+             alias owner, do not release it again. Alias RHS normalization may
+             add an extra retain to survive match-scrutinee teardown; balance
+             that retain after the assignment. *)
+          if skip_old_release && assignment_rhs_is_alias env rhs then
+            {
+              e with
+              desc =
+                CSeq
+                  ( assign,
+                    {
+                      desc = CDrop (v, target_ty, void_at e.loc);
+                      ty = Ast.TyNamed ("Void", []);
+                      loc = e.loc;
+                    } );
+            }
+          else assign
         else
           let tmp = next_tmp () in
           let tmp_ref = { rhs with desc = CVar tmp } in
@@ -3753,9 +3384,7 @@ let rec retain_borrowed_result_vars_in_expr (env : type_env)
   | CAssign (v, rhs) ->
       {
         e with
-        desc =
-          CAssign
-            (v, retain_borrowed_result_vars_in_assignment_rhs env borrowed rhs);
+        desc = CAssign (v, retain_borrowed_result_vars_in_expr env borrowed rhs);
       }
   | CDup (v, ty, body) ->
       let body_borrowed = borrowed_remove v.vname borrowed in
@@ -3799,56 +3428,6 @@ let rec retain_borrowed_result_vars_in_expr (env : type_env)
             };
       }
   | _ -> e
-
-and retain_borrowed_result_vars_in_assignment_rhs (env : type_env)
-    (borrowed : string list) (rhs : core) : core =
-  match rhs.desc with
-  | CVar v when borrowed_contains v.vname borrowed && is_managed_type env rhs.ty
-    ->
-      rhs
-  | (CField _ | CCall _ | CUnbox _ | CCast _)
-    when is_managed_type env rhs.ty
-         && expr_result_aliases_borrowed env borrowed rhs ->
-      rhs
-  | CIf (cond, then_e, else_e) ->
-      {
-        rhs with
-        desc =
-          CIf
-            ( cond,
-              retain_borrowed_result_vars_in_assignment_rhs env borrowed then_e,
-              retain_borrowed_result_vars_in_assignment_rhs env borrowed else_e
-            );
-      }
-  | CSeq (head, tail) ->
-      {
-        rhs with
-        desc =
-          CSeq
-            ( head,
-              retain_borrowed_result_vars_in_assignment_rhs env borrowed tail );
-      }
-  | CDup (v, ty, body) ->
-      let body_borrowed = borrowed_remove v.vname borrowed in
-      {
-        rhs with
-        desc =
-          CDup
-            ( v,
-              ty,
-              retain_borrowed_result_vars_in_assignment_rhs env body_borrowed
-                body );
-      }
-  | CDrop (v, ty, body) ->
-      {
-        rhs with
-        desc =
-          CDrop
-            ( v,
-              ty,
-              retain_borrowed_result_vars_in_assignment_rhs env borrowed body );
-      }
-  | _ -> retain_borrowed_result_vars_in_expr env borrowed rhs
 
 and retain_borrowed_result_vars_in_ctree (env : type_env)
     (borrowed : string list) (tree : ctree) : ctree =
@@ -4731,12 +4310,7 @@ let transform_let (env : type_env) (e : core) : core =
             expr_tail_aliases_var b.bind_var.vname body
           in
           let final_owner_consumed =
-            (* After protected consuming calls, [CDup] supplies the callee's
-               ref and the mutable slot still owns its original ref. Treat a
-               final consume as a true move only when the ownership summary says
-               the transformed body still consumes the slot's owner. *)
-            uses.consumed_refs > 0
-            && expr_final_consumes_var_owner env b.bind_var.vname body
+            expr_final_consumes_var_owner env b.bind_var.vname body
           in
           let body =
             if
@@ -4821,20 +4395,21 @@ let transform_let (env : type_env) (e : core) : core =
       transformed
   | _ -> e
 
-let balance_owned_binding_body (env : type_env) (v : var) (ty : Ast.type_expr)
-    (body : core) : core =
-  let void_rhs = { desc = CVoid; ty; loc = body.loc } in
+let balance_consumed_param_body (env : type_env) (p : core_param) (body : core)
+    : core =
+  let void_rhs = { desc = CVoid; ty = p.cp_ty; loc = body.loc } in
   let fake_binding =
-    { bind_var = v; bind_mut = false; bind_ty = ty; bind_rhs = void_rhs }
+    {
+      bind_var = p.cp_name;
+      bind_mut = false;
+      bind_ty = p.cp_ty;
+      bind_rhs = void_rhs;
+    }
   in
   let wrapped = { body with desc = CLet (fake_binding, body) } in
   match transform_let env wrapped with
   | { desc = CLet (_, balanced_body); _ } -> balanced_body
   | balanced -> balanced
-
-let balance_consumed_param_body (env : type_env) (p : core_param) (body : core)
-    : core =
-  balance_owned_binding_body env p.cp_name p.cp_ty body
 
 let balance_consumed_params_body (env : type_env) (f : core_func) (body : core)
     : core =
@@ -4866,7 +4441,7 @@ let retain_alias_sources_expr (env : type_env) (e : core) : core =
     lookup. Uses [transform_bottom_up] so nested lets are processed
     inside-out — each inner let is transformed before its surrounding
     let sees it. Runs two transforms:
-    1. [transform_let]: immutable binding dup/drop.
+    1. [transform_let]: immutable binding dup/drop (Phase 2.1 original).
 
     [Core_ssa] has already converted no-assignment and straight-line
     mutable locals into immutable lets. Mutable bindings that survive
@@ -4888,7 +4463,7 @@ let insert_drops_expr_with_env (env : type_env) (e : core) : core =
   e
   |> normalize_lambda_result_aliases env
   |> protect_consuming_field_args env
-  |> bind_borrowed_owned_temporaries env
+  |> bind_borrowed_owned_temporary_args env
   |> transform_bottom_up combined
   |> retain_alias_sources_expr env
 

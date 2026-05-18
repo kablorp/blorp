@@ -123,24 +123,6 @@ let test_channel_new_allocates_owned_channel () =
     { args = [ Borrow ]; result = ReturnOwned }
     (builtin_contract "blorp_channel_new" 1)
 
-let test_tcp_runtime_builtins_borrow_arguments () =
-  let check name args result =
-    check_contract name { args; result }
-      (builtin_contract name (List.length args))
-  in
-  check "blorp_tcp_listen" [ Borrow; Borrow; Borrow ] ReturnOwned;
-  check "blorp_tcp_accept" [ Borrow ] ReturnOwned;
-  check "blorp_tcp_connect" [ Borrow; Borrow ] ReturnOwned;
-  check "blorp_tcp_read" [ Borrow; Borrow ] ReturnOwned;
-  check "blorp_tcp_write" [ Borrow; Borrow ] ReturnOwned;
-  check "blorp_tcp_close_listener" [ Borrow ] ReturnVoid;
-  check "blorp_tcp_close_stream" [ Borrow ] ReturnVoid;
-  check "blorp_tcp_set_reuse_addr" [ Borrow ] ReturnOwned;
-  check "blorp_tcp_local_port_listener" [ Borrow ] ReturnOwned;
-  check "blorp_tcp_local_port_stream" [ Borrow ] ReturnOwned;
-  check "blorp_tcp_set_timeout_listener" [ Borrow; Borrow ] ReturnOwned;
-  check "blorp_tcp_set_timeout_stream" [ Borrow; Borrow ] ReturnOwned
-
 let test_fixed_constructors_allocate_owned_fixed () =
   let expected = { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned } in
   check_contract "blorp_fixed_new" expected
@@ -847,8 +829,6 @@ let suite =
           test_list_new_allocates_owned_list;
         Alcotest.test_case "channel_new_allocates_owned_channel" `Quick
           test_channel_new_allocates_owned_channel;
-        Alcotest.test_case "tcp_runtime_builtins_borrow_arguments" `Quick
-          test_tcp_runtime_builtins_borrow_arguments;
         Alcotest.test_case "fixed_constructors_allocate_owned_fixed" `Quick
           test_fixed_constructors_allocate_owned_fixed;
         Alcotest.test_case "custom_dict_set_constructors_borrow_callbacks"

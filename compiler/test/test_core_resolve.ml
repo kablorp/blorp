@@ -53,9 +53,6 @@ let program_with_func ?(foreign_name = None) name params ret_ty body =
                 includes = [];
                 link_flags = [];
                 arg_passing = ForeignDefaultArgs [];
-                call_effect =
-                  Blorp.Builtin_metadata.default_foreign_call_effect
-                    ~is_pure:false;
               }
         | None -> CFUser);
       cf_def_id = 0;
@@ -249,8 +246,6 @@ let test_resolve_foreign_call () =
             includes = [];
             link_flags = [];
             arg_passing = ForeignDefaultArgs [];
-            call_effect =
-              Blorp.Builtin_metadata.default_foreign_call_effect ~is_pure:true;
           };
       cf_def_id = 0;
     }
@@ -287,12 +282,7 @@ let test_resolve_foreign_call () =
   in
   match f_resolved.desc with
   | CCall
-      ( CKForeign
-          {
-            fc_c_name = "abs";
-            fc_arg_passing = ForeignDefaultArgs [];
-            fc_call_effect = Blorp.Builtin_metadata.Pure;
-          },
+      ( CKForeign { fc_c_name = "abs"; fc_arg_passing = ForeignDefaultArgs [] },
         _,
         _ ) ->
       ()
@@ -1008,8 +998,6 @@ let test_resolve_recurses_into_children () =
             includes = [];
             link_flags = [];
             arg_passing = ForeignDefaultArgs [];
-            call_effect =
-              Blorp.Builtin_metadata.default_foreign_call_effect ~is_pure:false;
           };
       cf_def_id = 0;
     }
@@ -1052,17 +1040,9 @@ let test_resolve_recurses_into_children () =
   match main_body.desc with
   | CCall
       ( CKForeign
-          {
-            fc_c_name = "c_print";
-            fc_arg_passing = ForeignDefaultArgs [];
-            fc_call_effect;
-          },
+          { fc_c_name = "c_print"; fc_arg_passing = ForeignDefaultArgs [] },
         _,
         [ inner_arg ] ) -> (
-      Alcotest.(check bool)
-        "foreign call effect" true
-        (fc_call_effect
-        = Blorp.Builtin_metadata.default_foreign_call_effect ~is_pure:false);
       (* Inner inc call should be CKUser "inc" *)
       match inner_arg.desc with
       | CCall (CKUser ("inc", _), _, _) -> ()

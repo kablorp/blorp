@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test: per-type leak report
 #
-# Verifies that --leak-check produces type-aware leak reports.
+# Verifies that BLORP_LEAK_CHECK produces type-aware leak reports.
 
 BLORP=./blorp
 FIXTURE=tests/fixtures/leak_string_deliberate.brp
@@ -13,7 +13,7 @@ echo ""
 
 # Test 1: Deliberate leak detected
 echo -n "Test 1: deliberate leak is detected... "
-output=$($BLORP run --leak-check "$FIXTURE" 2>&1 || true)
+output=$(BLORP_LEAK_CHECK=1 $BLORP run "$FIXTURE" 2>&1 || true)
 if echo "$output" | grep -q "leaked"; then
     echo "PASS"
     PASS=$((PASS + 1))
@@ -41,6 +41,18 @@ if echo "$output" | grep -qE "Leaked by type:"; then
     PASS=$((PASS + 1))
 else
     echo "FAIL (no per-type counts)"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 4: Verbose mode shows per-object details (NEW FEATURE)
+echo -n "Test 4: verbose mode shows individual leaked objects... "
+verbose_output=$(BLORP_LEAK_CHECK=verbose $BLORP run "$FIXTURE" 2>&1 || true)
+if echo "$verbose_output" | grep -qE "Leaked object|leaked:.*String|  #[0-9]"; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL (no per-object details in verbose mode)"
+    echo "  Got: $(echo "$verbose_output" | grep -i leak)"
     FAIL=$((FAIL + 1))
 fi
 

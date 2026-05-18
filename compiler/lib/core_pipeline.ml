@@ -12,17 +12,16 @@
     8. [Core_resolve] — tag CCall by callee kind
     9. [Core_std_inline] — expand compiler-owned std wrappers at call sites
     10. [Core_tailrec] — make tail-recursive self-loops explicit
-    11. [Core_string_pipeline] + [Core_collection_pipeline] +
-       [Core_tensor_fusion] + [Core_tuple_sroa] — fuse compatible string/list
-       pipelines and tensor update expressions; scalar-replace non-escaping
-       local tuples and narrow tuple-return call sites
+    11. [Core_collection_pipeline] + [Core_tensor_fusion] +
+       [Core_tuple_sroa] — fuse compatible list pipelines and tensor update
+       expressions; scalar-replace non-escaping local tuples and narrow
+       tuple-return call sites
     12. [Core_specialize] + function-ref adaptation — type-dispatch builtins
        to CCast / concrete names; make eta adapters visible to Perceus
     13. [Core_perceus] — insert CDup/CDrop for reference counting
     14. [Core_reuse] — analyze post-Perceus reuse candidates
     15. [Core_closure] — hoist lambdas and create closure values
-    16. [Core_codegen_prepare] — make final representation/layout facts explicit
-    17. [Core_emit_c] — Core IR → C string via the default backend
+    16. [Core_emit_c] — Core IR → C string via the default backend
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -269,7 +268,7 @@ let compile_typed_with_modules ?(main_import_bindings = [])
                     m.name msg)
             (Typed_ast.program_decls typed_program)
         in
-        Core_flatten.prefix_module_names m.name core_decls)
+        Core_flatten.prefix_module_names ~debug m.name core_decls)
       modules
   in
   let main_core =
@@ -334,14 +333,12 @@ let compile_typed_with_modules ?(main_import_bindings = [])
     | Core.CDPrivate inner -> foreign_metadata inner
     | _ -> ([], [])
   in
-  let rev_link_flags, rev_include_dirs =
+  let link_flags, include_dirs =
     List.fold_left
       (fun (all_flags, all_dirs) d ->
         let flags, dirs = foreign_metadata d in
-        (List.rev_append flags all_flags, List.rev_append dirs all_dirs))
+        (all_flags @ flags, all_dirs @ dirs))
       ([], []) full
   in
-  let link_flags = List.rev rev_link_flags in
-  let include_dirs = List.rev rev_include_dirs in
   let include_dirs = List.sort_uniq String.compare include_dirs in
   (output, link_flags, include_dirs)

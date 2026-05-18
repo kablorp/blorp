@@ -262,7 +262,7 @@ let rec transform_decl (decl : decl) : decl =
             };
       }
   (* No expressions to transform *)
-  | DType _ | DRecord _ | DImport _ | DTypeAlias _ | DNewType _ -> decl
+  | DType _ | DRecord _ | DImport _ | DTypeAlias _ -> decl
 
 (** Transform a program, converting all EStringInterpRaw to EStringInterp.
     Must be called after parsing but before type checking. *)

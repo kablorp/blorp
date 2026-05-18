@@ -25,47 +25,6 @@ let mod_tcp = "std/net/tcp"
 let sanitize_module_name name =
   String.map (function '/' -> '_' | '.' -> '_' | c -> c) name
 
-let starts_with s prefix =
-  let slen = String.length s in
-  let plen = String.length prefix in
-  slen >= plen && String.sub s 0 plen = prefix
-
-let ends_with s suffix =
-  let slen = String.length s in
-  let suffix_len = String.length suffix in
-  slen >= suffix_len && String.sub s (slen - suffix_len) suffix_len = suffix
-
-let strip_mono_suffix name =
-  let marker = "__mono_" in
-  let marker_len = String.length marker in
-  let rec find i =
-    if i + marker_len > String.length name then name
-    else if String.sub name i marker_len = marker then String.sub name 0 i
-    else find (i + 1)
-  in
-  find 0
-
-(** Recover the source-level function name from a generated Core function name.
-    This strips a monomorphization suffix, the owning module prefix when present,
-    and the stdlib pure-overload suffix. *)
-let source_name_for_generated_function ?module_path name =
-  let source_name = strip_mono_suffix name in
-  let source_name =
-    match module_path with
-    | None -> source_name
-    | Some module_path ->
-        let prefix = sanitize_module_name module_path ^ "__" in
-        if starts_with source_name prefix then
-          String.sub source_name (String.length prefix)
-            (String.length source_name - String.length prefix)
-        else source_name
-  in
-  let pure_suffix = "__pure" in
-  if ends_with source_name pure_suffix then
-    String.sub source_name 0
-      (String.length source_name - String.length pure_suffix)
-  else source_name
-
 (** Sanitize an arbitrary source name for use inside a C identifier.
     Maps every character that isn't [A-Za-z0-9_] to underscore. Used by
     [mangle_by_def_id] so names containing [/], [.], [$], [#], [:],

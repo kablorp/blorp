@@ -257,11 +257,20 @@ BRP
 ./blorp compile --no-format -o "$tmpc" "$smoke"
 ./blorp run --timeout 5 --no-format "$smoke"
 ./blorp test --no-cache --timeout 5 tests/test_blorp/types/test_bool.brp
+./blorp test --warmup-only
 ./blorp test --leak-check --suite --timeout 5 \
   tests/test_blorp/memory/leak_check_baselines/empty_main.brp
 ./blorp test --sanitize --timeout 5 tests/test_blorp/types/test_bool.brp
 printf ':quit\n' | ./blorp repl >/tmp/blorp-repl-smoke.out
 ./blorp lsp </dev/null >/tmp/blorp-lsp-smoke.out
+```
+
+Environment smoke for preview builds:
+
+```bash
+env BLORP_TIMEOUT=5 ./blorp test tests/test_blorp/types/test_bool.brp
+env BLORP_STD=std BLORP_NO_FORMAT=1 ./blorp check tests/test_blorp/types/test_bool.brp
+env BLORP_SANITIZE=1 ./blorp test --timeout 5 tests/test_blorp/types/test_bool.brp
 ```
 
 Default generated-C compile/test paths suppress noisy generated-code warnings.
@@ -274,9 +283,10 @@ comparisons with extra defensive parentheses are benign. `-Wunsequenced` and
 `-Wincompatible-pointer-types` warnings are not accepted in the preview warning
 sweep; regressions for those classes live in the codegen audit suite.
 
-The OCaml unit suite includes a regression proving the content-addressed
-precompiled runtime cache reuses an existing verified `runtime.o` instead of
-recompiling C on a second lookup.
+`./blorp test --warmup-only` must succeed before parallel gates. The OCaml unit
+suite includes a regression proving the content-addressed precompiled runtime
+cache reuses an existing verified `runtime.o` instead of recompiling C on a
+second lookup.
 
 ## CLI Usage
 

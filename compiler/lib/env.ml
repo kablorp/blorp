@@ -88,7 +88,6 @@ type symbol_kind =
       is_value : bool;
     }
   | AliasSymbol of { type_params : string list; target : type_expr }
-  | NewTypeSymbol of { type_params : string list; target : type_expr }
   | ConstructorSymbol of {
       parent_type : string; (* The union type this constructor belongs to *)
       type_params : string list; (* Inherited from parent *)
@@ -239,7 +238,6 @@ let symbol_kind_label (sym : symbol) : string =
   | TypeSymbol _ -> "type"
   | RecordSymbol _ -> "record"
   | AliasSymbol _ -> "type alias"
-  | NewTypeSymbol _ -> "new type"
   | ConstructorSymbol _ -> "constructor"
 
 (* ============================================================================
@@ -343,11 +341,6 @@ let is_value_record (env : env) (name : string) : bool =
 let add_alias (env : env) (name : string) (type_params : string list)
     (target : type_expr) : env =
   add_symbol env { name; kind = AliasSymbol { type_params; target } }
-
-(** Add a nominal newtype to the environment. *)
-let add_new_type (env : env) (name : string) (type_params : string list)
-    (target : type_expr) : env =
-  add_symbol env { name; kind = NewTypeSymbol { type_params; target } }
 
 (* ============================================================================
    Symbol lookup helpers
@@ -500,13 +493,6 @@ let get_alias (env : env) (name : string) : (string list * type_expr) option =
       Some (type_params, target)
   | _ -> None
 
-let get_new_type (env : env) (name : string) : (string list * type_expr) option
-    =
-  match lookup env name with
-  | Some { kind = NewTypeSymbol { type_params; target }; _ } ->
-      Some (type_params, target)
-  | _ -> None
-
 let rec disambiguate_nominal_dim_application (env : env) (ty : type_expr) :
     type_expr =
   let nominal_dim_params name =
@@ -519,10 +505,7 @@ let rec disambiguate_nominal_dim_application (env : env) (ty : type_expr) :
           | None -> (
               match get_alias env name with
               | Some (ps, _) -> Some ps
-              | None -> (
-                  match get_new_type env name with
-                  | Some (ps, _) -> Some ps
-                  | None -> None)))
+              | None -> None))
     in
     match params with
     | Some ps when ps <> [] && List.for_all Types.Dim.is_var_name ps -> Some ps
@@ -580,14 +563,12 @@ let resolve_alias (env : env) (ty : type_expr) : type_expr =
           (* cycle detected — stop recursing *)
         else
           match get_alias env name with
-          | Some (type_params, target)
-            when List.length type_params = List.length args ->
+          | Some (type_params, target) ->
               (* Direct substitution (no chaining) to avoid loops from swapped params *)
               let bindings =
                 List.map2 (fun param arg -> (param, arg)) type_params args
               in
               resolve ~visited:(name :: visited) (direct_subst bindings target)
-          | Some _ -> TyNamed (name, args)
           | None -> TyNamed (name, args))
     | TyFunc f ->
         TyFunc
@@ -606,62 +587,6 @@ let resolve_alias (env : env) (ty : type_expr) : type_expr =
     | _ -> ty
   in
   resolve ~visited:[] ty
-
-let get_new_type_constructor (env : env) (name : string) :
-    (string * string list * type_expr) option =
-  match get_new_type env name with
-  | Some (type_params, target) -> Some (name, type_params, target)
-  | None -> (
-      match get_alias env name with
-      | Some (alias_params, TyNamed (target_name, target_args))
-        when List.length alias_params = List.length target_args -> (
-          match get_new_type env target_name with
-          | Some (type_params, target) ->
-              let bindings =
-                List.map2
-                  (fun param arg -> (param, arg))
-                  type_params target_args
-              in
-              Some (target_name, type_params, direct_subst bindings target)
-          | None -> None)
-      | _ -> None)
-
-let new_type_underlying (env : env) (ty : type_expr) : type_expr option =
-  match resolve_alias env ty with
-  | TyNamed (name, args) -> (
-      match get_new_type env name with
-      | Some (type_params, target)
-        when List.length type_params = List.length args ->
-          let bindings =
-            List.map2 (fun param arg -> (param, arg)) type_params args
-          in
-          Some (direct_subst bindings target)
-      | _ -> None)
-  | _ -> None
-
-let erase_new_types (env : env) (ty : type_expr) : type_expr =
-  let rec erase ty =
-    match ty with
-    | TyNamed (name, args) -> (
-        let args = List.map erase args in
-        match get_new_type env name with
-        | Some (type_params, target)
-          when List.length type_params = List.length args ->
-            let bindings =
-              List.map2 (fun param arg -> (param, arg)) type_params args
-            in
-            erase (direct_subst bindings target)
-        | _ -> TyNamed (name, args))
-    | TyFunc f ->
-        TyFunc
-          { f with params = List.map erase f.params; return = erase f.return }
-    | TyArray (elem, dims) -> TyArray (erase elem, List.map erase dims)
-    | TyTuple elems -> TyTuple (List.map erase elems)
-    | TyRange inner -> TyRange (erase inner)
-    | TyDimOp (op, a, b) -> TyDimOp (op, erase a, erase b)
-    | _ -> ty
-  in
-  erase ty
 
 let function_type_purity (env : env) (ty : type_expr) : purity option =
   match resolve_alias env ty with
@@ -1252,7 +1177,6 @@ let rec type_implements_trait (env : env) (ty : type_expr) (trait_name : string)
     get_record env name <> None
     || get_type_decl env name <> None
     || get_alias env name <> None
-    || get_new_type env name <> None
   in
   let bound_match =
     match ty with
@@ -1586,21 +1510,11 @@ let ufcs_collision (env : env) (name : string) (entry : overload_entry) :
     match (first_param_of a, first_param_of b) with
     | Some pa, Some pb -> (
         match (head_type_name pa, head_type_name pb) with
-        | Some ha, Some hb ->
-            ha = hb
-            && types_bidirectional
-                 ~type_params:
-                   (overload_type_param_names a @ overload_type_param_names b)
-                 pa pb
+        | Some ha, Some hb -> ha = hb
         | _ ->
             types_compatible
               ~type_params:(overload_type_param_names entry)
               pa pb)
-    | _ -> false
-  in
-  let same_arity a b =
-    match (a.ol_func_type, b.ol_func_type) with
-    | TyFunc fa, TyFunc fb -> List.length fa.params = List.length fb.params
     | _ -> false
   in
   List.find_opt
@@ -1609,7 +1523,7 @@ let ufcs_collision (env : env) (name : string) (entry : overload_entry) :
       && e.ol_module_path <> None
       && entry.ol_module_path <> None
       && e.ol_purity = entry.ol_purity
-      && same_arity e entry && same_first_param e entry)
+      && same_first_param e entry)
     existing
 
 (** Register a method-only function (accessible via UFCS but not bare name).
@@ -1706,9 +1620,8 @@ let levenshtein s1 s2 =
     prev.(len2)
 
 (** Collect all value-position identifier names visible in the environment.
-    Excludes TypeSymbol, RecordSymbol, AliasSymbol, and NewTypeSymbol since
-    those are not valid in value position (where "Undefined identifier" errors
-    occur). *)
+    Excludes TypeSymbol, RecordSymbol, and AliasSymbol since those are not
+    valid in value position (where "Undefined identifier" errors occur). *)
 let all_value_identifiers (env : env) : string list =
   let names = Hashtbl.create 64 in
   List.iter
@@ -1716,8 +1629,7 @@ let all_value_identifiers (env : env) : string list =
       List.iter
         (fun (sym : symbol) ->
           match sym.kind with
-          | TypeSymbol _ | RecordSymbol _ | AliasSymbol _ | NewTypeSymbol _ ->
-              ()
+          | TypeSymbol _ | RecordSymbol _ | AliasSymbol _ -> ()
           | VarSymbol _ | FuncSymbol _ | ConstructorSymbol _ ->
               if not (Hashtbl.mem names sym.name) then
                 Hashtbl.add names sym.name true)

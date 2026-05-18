@@ -1327,13 +1327,6 @@ let with_builtins (env : env) : env =
                     variant_loc = dummy_loc;
                     variant_def_id = None;
                   };
-                  {
-                    variant_name = "Cancelled";
-                    variant_fields = [];
-                    variant_tag = 2;
-                    variant_loc = dummy_loc;
-                    variant_def_id = None;
-                  };
                 ];
             };
       }
@@ -1363,20 +1356,6 @@ let with_builtins (env : env) : env =
               type_params = [];
               field_types = [ ty_string ];
               tag = 1;
-            };
-      }
-  in
-  let env =
-    add_symbol env
-      {
-        name = "Cancelled";
-        kind =
-          ConstructorSymbol
-            {
-              parent_type = "ConcurrencyError";
-              type_params = [];
-              field_types = [];
-              tag = 2;
             };
       }
   in

@@ -1,4 +1,4 @@
-(** Trait-method and operator-overload resolution pass.
+(** Trait-method resolution pass (Phase 3.1).
 
     Walks a [core_program] post-monomorphization and rewrites [CCall]
     callees whose bare name is a trait method to the matching impl's
@@ -8,15 +8,15 @@
 
     {1 Why a dedicated pass}
 
-    Earlier versions had [Core_resolve.resolve_call_kind]'s step 7b scan
+    Before Phase 3.1, [Core_resolve.resolve_call_kind]'s step 7b scanned
     [env.user_funcs] for any key whose suffix matched [_<method>_<type>]
     and used the longest-match. That logic worked for the happy path but
     conflated three concerns (name mangling, impl lookup, diagnostic
     generation) inside the resolver's dispatch chain, produced no
     structured error when a trait method was called without an impl in
-    scope, and had no home for operator-overload rewrites to slot into.
-    Extracting this pass gives those rewrites a principled home and lets
-    [Core_resolve] shrink back to pure name-lookup.
+    scope, and had no home for Phase 3.2's operator-overload rewrites to
+    slot into. Extracting this pass gives those rewrites a principled
+    home and lets [Core_resolve] shrink back to pure name-lookup.
 
     {1 Algorithm}
 
@@ -35,7 +35,7 @@
     4. Leave non-matching calls alone; [Core_resolve] handles every other
        dispatch kind (foreign / user / builtin / constructor / UFCS / …).
 
-    {1 Operator overloading}
+    {1 Operator overloading (Phase 3.2)}
 
     Same pass also rewrites [CBin] / [CUn] nodes whose operand type
     has a matching impl of the operator's trait. The mapping:
@@ -83,11 +83,14 @@
     trait, implemented it for [Dog], and then called the method on
     [Sheep] without writing a [Sheep] impl.
 
-    {1 What this pass deliberately does NOT do}
+    {1 What this pass deliberately does NOT do (yet)}
 
     - Stdlib prelude-shadow dispatch (e.g., [to_string] on [Int] →
       [blorp_to_string]). Those remain in [Core_specialize]'s hardcoded
-      type-dispatch tables. *)
+      type-dispatch tables.
+    - Operator overloading. Phase 3.2 will lower [CBin (Add, a, b)] on
+      non-primitive operand types into [CCall (Addable.add, …)] which
+      this pass then resolves — but the lowering itself isn't here. *)
 
 open Core
 

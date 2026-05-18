@@ -5,7 +5,7 @@
 #   scripts/run_tests.sh                    # Run all tests
 #   scripts/run_tests.sh unit               # OCaml unit tests only
 #   scripts/run_tests.sh compiler           # Compiler tests plus codegen audit
-#   scripts/run_tests.sh runtime            # C runtime smoke + runtime .brp tests
+#   scripts/run_tests.sh runtime            # Runtime .brp tests (language features)
 #   scripts/run_tests.sh leak               # Focused --leak-check ownership baselines
 #   scripts/run_tests.sh doctest            # Doctests only (std/ library)
 #   scripts/run_tests.sh cli                # Public CLI smoke and exit-code checks
@@ -48,13 +48,6 @@ done
 suite_pids=()
 suite_names=()
 suite_tmpdir=""
-dune_tmpdir=""
-
-if [ -z "${DUNE_BUILD_DIR:-}" ]; then
-    mkdir -p compiler/_build
-    dune_tmpdir=$(mktemp -d "$PWD/compiler/_build/isolated.XXXXXX") || exit 1
-    export DUNE_BUILD_DIR="$dune_tmpdir"
-fi
 
 list_child_pids() {
     local parent="$1"
@@ -91,14 +84,6 @@ cleanup_suite_tmpdir() {
     fi
 }
 
-cleanup_tmpdirs() {
-    cleanup_suite_tmpdir
-    if [ -n "$dune_tmpdir" ]; then
-        rm -rf "$dune_tmpdir"
-        dune_tmpdir=""
-    fi
-}
-
 terminate_parallel_suites() {
     local pid
     if [ ${#suite_pids[@]} -gt 0 ]; then
@@ -120,12 +105,12 @@ on_interrupt() {
     echo "Interrupted; terminating test suites..." >&2
     trap - INT TERM EXIT
     terminate_parallel_suites
-    cleanup_tmpdirs
+    cleanup_suite_tmpdir
     exit 130
 }
 
 trap on_interrupt INT TERM
-trap cleanup_tmpdirs EXIT
+trap cleanup_suite_tmpdir EXIT
 
 # Ensure compiler is built. If the rebuild fails, stop here; continuing with a
 # stale ./blorp is worse than not running tests because it can hide strict
@@ -221,7 +206,7 @@ parse_blorp_output() {
         eval "${key}_failed=1"
         eval "${key}_tests=1"
         local fails
-        fails=$(echo "$output" | grep -E '^(FAIL:|Combined test compile failed|error:|\(C compilation failed\))' | head -1)
+        fails=$(echo "$output" | grep -E '^(Combined test compile failed|error:|\(C compilation failed\))' | head -1)
         [ -n "$fails" ] || fails="$key suite exited before reporting Results"
         eval "${key}_failures=\$fails"
         return
@@ -359,14 +344,12 @@ run_compiler() {
 }
 
 run_runtime() {
-    echo "═══ Runtime Tests (C smoke + .brp) ═══"
+    echo "═══ Runtime Tests (.brp) ═══"
     echo ""
     local output exit_code output_file
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_runtime.XXXXXX") || exit 1
-    {
-        scripts/runtime_c_smoke.sh && ./blorp test --timeout "$test_timeout" "${runtime_roots[@]}"
-    } 2>&1 | tee "$output_file"
-    exit_code=${PIPESTATUS[0]}
+    capture_stream "$output_file" ./blorp test --timeout "$test_timeout" "${runtime_roots[@]}"
+    exit_code=$?
     output=$(cat "$output_file")
     rm -f "$output_file"
     echo ""
@@ -419,21 +402,145 @@ run_cli() {
 # ─── Run suites ─────────────────────────────────────────────────────
 
 any_failed=false
+parallel_suites=("${suites[@]}")
 
-# Keep suite execution serial. The individual compiler/runtime runners already
-# parallelize internally where they can do so safely; overlapping top-level
-# suites makes failures harder to attribute and can starve short CLI/runtime
-# timeout checks under load.
-for suite in "${suites[@]}"; do
-    case "$suite" in
-        unit)     run_unit     || any_failed=true ;;
-        compiler) run_compiler || any_failed=true ;;
-        runtime)  run_runtime  || any_failed=true ;;
-        leak)     run_leak     || any_failed=true ;;
-        doctest)  run_doctest  || any_failed=true ;;
-        cli)      run_cli      || any_failed=true ;;
-    esac
-done
+# Dune-backed work must stay serial. The initial make preflight above already
+# runs before any suite work; keep OCaml unit tests out of the parallel worker
+# block as well so this script never starts dune from a background suite.
+if [ ${#suites[@]} -gt 1 ]; then
+    non_dune_suites=()
+    for suite in "${suites[@]}"; do
+        case "$suite" in
+            unit)
+                run_unit || any_failed=true
+                ;;
+            *)
+                non_dune_suites+=("$suite")
+                ;;
+        esac
+    done
+    parallel_suites=("${non_dune_suites[@]}")
+fi
+
+# When running multiple non-Dune suites, run them in parallel for speed.
+# Each suite's output is streamed immediately and also captured for summary parsing.
+if [ ${#parallel_suites[@]} -eq 0 ]; then
+    :
+elif [ ${#parallel_suites[@]} -le 1 ]; then
+    # Single suite: run directly; suite runners stream and self-capture.
+    for suite in "${parallel_suites[@]}"; do
+        case "$suite" in
+            unit)     run_unit     || any_failed=true ;;
+            compiler) run_compiler || any_failed=true ;;
+            runtime)  run_runtime  || any_failed=true ;;
+            leak)     run_leak     || any_failed=true ;;
+            doctest)  run_doctest  || any_failed=true ;;
+            cli)      run_cli      || any_failed=true ;;
+        esac
+    done
+else
+    # Multiple non-Dune suites: run in parallel, collect results
+    # Pre-warm the precompiled runtime cache to prevent race conditions
+    # between parallel suite runners that both call precompile_runtime()
+    if ! ./blorp test --warmup-only 2>/dev/null; then
+        echo "Warning: runtime cache warmup failed — parallel tests may have cache misses" >&2
+    fi
+    suite_tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_suites.XXXXXX")
+
+    for suite in "${parallel_suites[@]}"; do
+        outfile="$suite_tmpdir/${suite}_output"
+        case "$suite" in
+            unit)
+                {
+                    echo "═══ Unit Tests (OCaml) ═══"
+                    echo ""
+                } > "$outfile"
+                if $coverage; then
+                    make coverage >> "$outfile" 2>&1 &
+                else
+                    (cd compiler && exec dune runtest --force) >> "$outfile" 2>&1 &
+                fi
+                ;;
+            compiler)
+                {
+                    echo "═══ Compiler Tests (should_pass/should_fail + codegen audit) ═══"
+                    echo ""
+                } > "$outfile"
+                tests/test_compiler/run_compiler_tests.sh >> "$outfile" 2>&1 &
+                ;;
+            runtime)
+                {
+                    echo "═══ Runtime Tests (.brp) ═══"
+                    echo ""
+                } > "$outfile"
+                ./blorp test --timeout "$test_timeout" "${runtime_roots[@]}" >> "$outfile" 2>&1 &
+                ;;
+            leak)
+                {
+                    echo "═══ Leak-Check Baselines (.brp) ═══"
+                    echo ""
+                } > "$outfile"
+                ./blorp test --leak-check --suite --timeout "$test_timeout" tests/test_blorp/memory/leak_check_baselines/ >> "$outfile" 2>&1 &
+                ;;
+            doctest)
+                {
+                    echo "═══ Doctests (std/) ═══"
+                    echo ""
+                } > "$outfile"
+                ./blorp test --doc --timeout "$test_timeout" std/ >> "$outfile" 2>&1 &
+                ;;
+            cli)
+                {
+                    echo "═══ CLI Smoke / Exit Codes ═══"
+                    echo ""
+                } > "$outfile"
+                env BLORP_CLI_TEST_TIMEOUT="${BLORP_CLI_TEST_TIMEOUT:-$test_timeout}" tests/test_cli.sh >> "$outfile" 2>&1 &
+                ;;
+        esac
+        suite_pids+=($!)
+        suite_names+=("$suite")
+        echo "RUN suite: $suite (pid $!)"
+    done
+
+    # Wait for all suites to complete
+    for i in "${!suite_pids[@]}"; do
+        pid="${suite_pids[$i]}"
+        suite="${suite_names[$i]}"
+        if wait "$pid" 2>/dev/null; then
+            echo 0 > "$suite_tmpdir/${suite}_exit"
+        else
+            echo $? > "$suite_tmpdir/${suite}_exit"
+        fi
+    done
+    suite_pids=()
+    suite_names=()
+
+    # Parse captured results in suite order.
+    for suite in "${parallel_suites[@]}"; do
+        outfile="$suite_tmpdir/${suite}_output"
+        exitfile="$suite_tmpdir/${suite}_exit"
+        local_exit=1
+        [ -f "$exitfile" ] && local_exit=$(cat "$exitfile")
+
+        if [ -f "$outfile" ]; then
+            echo ""
+            cat "$outfile"
+        fi
+
+        # Re-parse output to extract counts (parsers set global vars)
+        local_output=""
+        [ -f "$outfile" ] && local_output=$(cat "$outfile")
+        case "$suite" in
+            unit)     parse_unit "$local_output"; [ "$local_exit" != "0" ] && unit_status="FAIL" ;;
+            compiler) parse_compiler "$local_output" ;;
+            runtime)  parse_blorp_output "$local_output" "runtime" ;;
+            leak)     parse_blorp_output "$local_output" "leak" ;;
+            doctest)  parse_blorp_output "$local_output" "doctest" ;;
+            cli)      parse_cli "$local_output" ;;
+        esac
+        [ "$local_exit" != "0" ] && any_failed=true
+    done
+fi
 
 # ─── Summary ────────────────────────────────────────────────────────
 

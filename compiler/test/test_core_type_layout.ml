@@ -49,10 +49,6 @@ let test_builtin_layout_is_single_source_of_truth () =
   in
   check_builtin "String"
     { ownership = Managed; retain = ArcRetain; release = ArcRelease };
-  check_builtin "TcpStream"
-    { ownership = Managed; retain = ArcRetain; release = ArcRelease };
-  check_builtin "TcpListener"
-    { ownership = Managed; retain = ArcRetain; release = ArcRelease };
   check_builtin "Ptr"
     {
       ownership = Unmanaged;

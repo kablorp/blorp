@@ -165,12 +165,6 @@ let rec decl_to_symbol (d : decl) : json option =
       Some
         (document_symbol ~name:ad.alias_name ~kind:kind_class ~range
            ~selection_range:sel ())
-  | DNewType nt ->
-      let range = loc_to_range d.decl_loc in
-      let sel = selection_range d.decl_loc (String.length nt.new_type_name) in
-      Some
-        (document_symbol ~name:nt.new_type_name ~kind:kind_class ~range
-           ~selection_range:sel ())
   | DImport _ -> None
   | DPrivate inner -> decl_to_symbol inner
 

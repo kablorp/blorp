@@ -162,12 +162,13 @@ type t = {
       — they stay module-scoped. See [register_module_traits]. *)
   mutable std_override_dir : string option;
   mutable std_override_active : bool;
-      (** When set (via [--std-dir] or [blorp.toml]), the embedded std library
-      is bypassed and filesystem resolution is used. *)
+      (** When set (via [--std-dir], [BLORP_STD], or [blorp.toml]), the
+      embedded std library is bypassed and filesystem resolution is used. *)
   mutable std_source_dir : string option;
-      (** Explicit filesystem [std/] directory selected by [--std-dir] or
-      [blorp.toml]. [None] means std imports use the embedded library; tools
-      that need source files should not guess a filesystem std path. *)
+      (** Explicit filesystem [std/] directory selected by [--std-dir],
+      [BLORP_STD], or [blorp.toml]. [None] means std imports use the embedded
+      library; tools that need source files should not guess a filesystem std
+      path. *)
   mutable load_errors : compiler_error list;
       (** Errors accumulated during module loading. Surfaced to the CLI. *)
   mutable prelude_modules_loaded : bool;

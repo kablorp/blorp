@@ -185,7 +185,9 @@ let with_run_artifacts f =
       Fun.protect
         ~finally:(fun () ->
           current_run_artifacts := None;
-          remove_tree artifacts.root)
+          if Sys.getenv_opt "BLORP_KEEP_ARTIFACTS" <> Some "1" then
+            remove_tree artifacts.root
+          else Printf.eprintf "Keeping blorp artifacts in %s\n%!" artifacts.root)
         f
 
 let run_artifact_path ~kind ~prefix ~suffix =
@@ -360,8 +362,6 @@ let run_process_capture_timeout ~timeout prog args =
           match !status with Some st -> exit_code_of_status st | None -> 124
       in
       (exit_code, Buffer.contents output)
-
-let with_sanitizer_runtime_env f = f ()
 
 (** Run a program directly with timeout, inheriting stdin/stdout/stderr.
     Returns exit code (124 = timed out). For interactive use (blorp run). *)
@@ -622,7 +622,7 @@ let compiler_hash =
         cached := Some h;
         h
 
-let runtime_cache_key ~sanitize ~leak_check ~opt =
+let runtime_cache_key ~sanitize ~opt =
   Digest.to_hex
     (Digest.string
        (String.concat "\000"
@@ -632,7 +632,6 @@ let runtime_cache_key ~sanitize ~leak_check ~opt =
             compiler_hash ();
             opt;
             string_of_bool sanitize;
-            string_of_bool leak_check;
             Sys.os_type;
             Lazy.force cc_identity;
             String.concat " " sanitize_cc_args;
@@ -669,8 +668,8 @@ let runtime_cache_verified ~key dir =
     with _ -> false
 
 (** Compile runtime artifacts to the given paths (no caching logic here) *)
-let compile_runtime_artifacts ?(sanitize = false) ?(leak_check = false)
-    ?(opt = "O0") obj_path h_path =
+let compile_runtime_artifacts ?(sanitize = false) ?(opt = "O0") obj_path
+    _pch_path h_path =
   let runtime_c =
     run_artifact_path ~kind:"runtime-src" ~prefix:"runtime" ~suffix:".c"
   in
@@ -694,7 +693,6 @@ let compile_runtime_artifacts ?(sanitize = false) ?(leak_check = false)
           runtime_c;
           "-lpthread";
         ]
-        @ (if leak_check then [ "-DBLORP_RUNTIME_LEAK_CHECK_STRICT=1" ] else [])
         @ if sanitize then sanitize_cc_args else []
       in
       let result, _output = run_process_capture "cc" cc_args in
@@ -710,9 +708,8 @@ let compile_runtime_artifacts ?(sanitize = false) ?(leak_check = false)
       end
       else None)
 
-let precompile_runtime ?(sanitize = false) ?(leak_check = false) ?(opt = "O0")
-    () =
-  let key = runtime_cache_key ~sanitize ~leak_check ~opt in
+let precompile_runtime ?(sanitize = false) ?(opt = "O0") () =
+  let key = runtime_cache_key ~sanitize ~opt in
   let dir = cache_object_dir ~kind:"runtime" key in
   let obj_path = runtime_obj_path dir in
   let h_path = runtime_header_path dir in
@@ -730,7 +727,9 @@ let precompile_runtime ?(sanitize = false) ?(leak_check = false) ?(opt = "O0")
       let stage_obj = runtime_obj_path stage_dir in
       let stage_h = runtime_header_path stage_dir in
       match
-        compile_runtime_artifacts ~sanitize ~leak_check ~opt stage_obj stage_h
+        compile_runtime_artifacts ~sanitize ~opt stage_obj
+          (Filename.concat stage_dir "runtime.h.pch")
+          stage_h
       with
       | None ->
           remove_tree stage_dir;
@@ -1777,6 +1776,13 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
       generate_test_wrapper ~leak_check raw
     else raw
   in
+  (match Sys.getenv_opt "BLORP_DUMP_WRAPPED" with
+  | Some path ->
+      let oc = open_out path in
+      output_string oc source;
+      close_out oc
+  | None -> ());
+
   let source_dir =
     Option.value module_base_dir ~default:(extract_directory filename)
   in
@@ -1820,6 +1826,12 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
       (* Unreachable: test_runner never supplies ~on_stage. *)
       assert false
   | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
+      (match Sys.getenv_opt "BLORP_DUMP_C" with
+      | Some path ->
+          let oc = open_out path in
+          output_string oc c_code;
+          close_out oc
+      | None -> ());
       let compilation_dir = run_compilation_dir () in
       let bin_file = Filename.concat compilation_dir "program.bin" in
 
@@ -1840,8 +1852,6 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
             in
             let cc_args =
               [ "-O0"; "-fwrapv"; "-pipe" ]
-              @ (if leak_check then [ "-DBLORP_RUNTIME_LEAK_CHECK_STRICT=1" ]
-                 else [])
               @ (if sanitize then [] else [ "-w" ])
               @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
               @ header_args @ runtime_obj_args @ [ "-lm"; "-lpthread" ]
@@ -1865,12 +1875,8 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
               in
               make_result ~error_detail:detail false
             else begin
-              let run_child () =
-                run_process_capture_timeout ~timeout bin_file []
-              in
               let result, output =
-                if sanitize then with_sanitizer_runtime_env run_child
-                else run_child ()
+                run_process_capture_timeout ~timeout bin_file []
               in
               if result = 0 then make_result ~output true
               else if result = 99 then
@@ -2035,7 +2041,7 @@ let print_test_start ?worker file =
   | None -> Printf.eprintf "RUN: %s\n%!" file
 
 let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
-    ~leak_check ~link_flags () =
+    ~link_flags () =
   let raylib_flags =
     if has_raylib_import () then raylib_linker_flags () else ""
   in
@@ -2048,7 +2054,6 @@ let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
     match precompiled with Some p -> [ p.runtime_obj ] | None -> []
   in
   [ "-O0"; "-fwrapv"; "-pipe" ]
-  @ (if leak_check then [ "-DBLORP_RUNTIME_LEAK_CHECK_STRICT=1" ] else [])
   @ (if sanitize then [] else [ "-w" ])
   @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
   @ header_args @ runtime_obj_args @ [ "-lm"; "-lpthread" ]
@@ -2062,6 +2067,12 @@ let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
 let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
     ?precompiled ?(leak_check = false) files =
   let source = generate_suite_selector_harness ~leak_check files in
+  (match Sys.getenv_opt "BLORP_DUMP_WRAPPED" with
+  | Some path ->
+      let oc = open_out path in
+      output_string oc source;
+      close_out oc
+  | None -> ());
   Modules.full_reset ();
   Lexer.reset_state ();
   let cwd = Sys.getcwd () in
@@ -2076,11 +2087,17 @@ let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
       Error (format_pipeline_errors ~file:"<suite-selector-harness>" errors)
   | Ok (Pipeline.Stopped_at _) -> assert false
   | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
+      (match Sys.getenv_opt "BLORP_DUMP_C" with
+      | Some path ->
+          let oc = open_out path in
+          output_string oc c_code;
+          close_out oc
+      | None -> ());
       let compilation_dir = run_compilation_dir () in
       let bin_file = Filename.concat compilation_dir "program.bin" in
       let cc_args =
-        cc_args_for_test_binary ?precompiled ~include_dirs ~sanitize ~leak_check
-          ~link_flags ()
+        cc_args_for_test_binary ?precompiled ~include_dirs ~sanitize ~link_flags
+          ()
       in
       let cc_result, cc_output = compile_c_from_stdin c_code bin_file cc_args in
       if cc_result = 0 then Ok bin_file
@@ -2094,16 +2111,13 @@ let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
         in
         Error detail
 
-let run_suite_selector_case ~timeout ~sanitize ~bin_file ~file ~index =
+let run_suite_selector_case ~timeout ~bin_file ~file ~index =
   let start_time = get_time () in
   let make_result ?(output = "") ?(error_detail = "") passed =
     { file; passed; duration = get_time () -. start_time; output; error_detail }
   in
-  let run_child () =
-    run_process_capture_timeout ~timeout bin_file [ string_of_int index ]
-  in
   let result, output =
-    if sanitize then with_sanitizer_runtime_env run_child else run_child ()
+    run_process_capture_timeout ~timeout bin_file [ string_of_int index ]
   in
   if result = 0 then make_result ~output true
   else if result = 99 then
@@ -2310,8 +2324,7 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
           match Hashtbl.find_opt harness_index file with
           | Some index ->
               let result =
-                run_suite_selector_case ~timeout ~sanitize ~bin_file ~file
-                  ~index
+                run_suite_selector_case ~timeout ~bin_file ~file ~index
               in
               run_and_record [ result ]
           | None ->
@@ -2496,8 +2509,10 @@ let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
   with_run_artifacts (fun () ->
       (* Warn if std/ sources are newer than the compiler binary *)
       check_stale_std ();
+      (* Set leak check env var at top level — inherited by forked workers *)
+      if leak_check then Unix.putenv "BLORP_LEAK_CHECK" "strict";
       (* Disable test result caching if --no-cache or if leak_check/sanitize
-         (these change behavior without changing source files) *)
+       (these change behavior without changing source files) *)
       test_cache_enabled := cache && (not sanitize) && not leak_check;
       let effective_jobs =
         if sanitize then begin
@@ -2511,7 +2526,7 @@ let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
         else if jobs > 0 then jobs
         else detect_num_cores ()
       in
-      let precompiled = precompile_runtime ~sanitize ~leak_check ~opt:"O0" () in
+      let precompiled = precompile_runtime ~sanitize ~opt:"O0" () in
       match
         try_run_suite_selector_tests ~profile ~debug ~sanitize ?precompiled
           ~leak_check ~mode ~timeout files

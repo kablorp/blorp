@@ -45,8 +45,8 @@ check "run auto-formats file" \
 
 # --- Test 3: --no-format skips formatting ---
 cp "$TMPDIR/messy_orig.brp" "$TMPDIR/messy.brp"
-$BLORP check --no-format "$TMPDIR/messy.brp" 2>/dev/null || true
-check "--no-format skips formatting" \
+BLORP_NO_FORMAT=1 $BLORP check "$TMPDIR/messy.brp" 2>/dev/null || true
+check "BLORP_NO_FORMAT=1 skips formatting" \
   'diff -q "$TMPDIR/messy_orig.brp" "$TMPDIR/messy.brp" > /dev/null 2>&1'
 
 # --- Test 4: blorp test auto-formats the file ---

@@ -32,7 +32,7 @@ make
 ./blorp run hello.brp
 
 # Pass CLI arguments
-./blorp run program.brp arg1 arg2 arg3
+./blorp run program.brp -- arg1 arg2 arg3
 
 # Type check only (no codegen)
 ./blorp check program.brp
@@ -948,28 +948,6 @@ type alias IntPair = (Int, Int)
 type alias StringMap[V] = Dict[String, V]
 type alias Row[T, #N] = T[#N]
 ```
-
-Type aliases are transparent: `IntPair` and `(Int, Int)` are the same type.
-
-### New Types
-
-Use `new type` when you want a distinct type with the same runtime
-representation as another type:
-
-```blorp
-new type UserId = String
-
-pure func make_user_id(raw: String) -> UserId:
-	UserId(raw)
-
-pure func user_id_length(id: UserId) -> Int:
-	id.value().length()
-```
-
-`UserId` is not interchangeable with `String` during type checking. Wrap with
-`UserId(raw)` to construct one, and use `id.value()` to recover the underlying
-`String`. After type checking, newtypes erase to their representation type, so
-they do not add a runtime wrapper.
 
 ### Generics
 
@@ -2008,7 +1986,7 @@ func compute_b() -> Int: 2
 func pool_example() -> Int:
     n: Int = max_threads()
 
--- Limit this concurrent block's active child work
+    -- Set max threads via concurrent block parameter
     concurrent(max_threads: 8):
         a = compute_a()
         b = compute_b()
@@ -2018,11 +1996,7 @@ func pool_example() -> Int:
 -- ./blorp run program.brp --threads 4
 ```
 
-The thread pool is lazily initialized on first concurrent operation. Its carrier
-thread count comes from the CLI `--threads` flag, `BLORP_THREADS`, or the host
-CPU count. The `max_threads` parameter must be a positive integer literal. It
-limits the active child work for that `concurrent` block; it does not resize the
-process-wide pool or cap later `List.parallel` operations.
+The thread pool is lazily initialized on first concurrent operation. The `max_threads` parameter must be a positive integer literal. It sets the pool size for the first concurrent block encountered; subsequent blocks reuse the existing pool.
 
 ### Virtual Threads (Fibers)
 
@@ -2272,7 +2246,7 @@ This table lists the main public modules. The source of truth is the `std/` and
 
 | Module | Import Pattern | Description |
 |--------|----------------|-------------|
-| `std/prelude` | Auto-imported | Core visible types plus `print` / `puts` |
+| `std/prelude` | Auto-imported | Core visible types plus `print` / `puts` / `println` |
 | `option`, `result` | Prelude types | `Option[T]`, `Result[T, E]`, constructors, and UFCS methods |
 | `list`, `dict`, `set`, `string`, `bytes` | Prelude types | Core collections/text/binary types and UFCS methods |
 | `int`, `float`, `bool`, `char` | Prelude types | Primitive type declarations and helpers |
@@ -2300,25 +2274,18 @@ This table lists the main public modules. The source of truth is the `std/` and
 Benchmark harness helpers live under `benchmarks/blorp/support/benchmark.brp`
 and are not part of the standard library.
 
-Networking preview note: `std/net/tcp` socket waits for numeric hosts are
-fiber-aware, so `accept`, `read`, `write`, and the socket-connect wait can park
-the current fiber instead of pinning an OS worker. Hostname resolution still
-uses the system resolver and may block an OS worker during `listen(host, ...)`
-or the DNS phase of `connect(host, ...)`. Use numeric hosts such as
-`"127.0.0.1"` or `""` for bind-any when virtual-thread compatibility matters.
-
 ### Prelude and Always-Available Names
 
 `std/prelude.brp` imports a deliberately small surface into every module:
 `Bool`, `Bytes`, `Char`, `Dict`, `Float`, `Float16`, `Float32`, `Int`, `List`,
 `Option(Some, None)`, `Result(Ok, Err)`, `Set`, `String`, plus `print`, `puts`,
-`err_print`, `read_line`, and `input`.
+`println`, `eprintln`, `read_line`, and `input`.
 
 There are three practical buckets of names available without an explicit import:
 
 1. **Prelude imports** — the types and constructors listed above, plus
-   console I/O helpers. `print` writes a trailing newline; `puts`
-   writes without adding one; `err_print` writes to stderr. `read_line` and
+   console I/O helpers. `print` / `println` write a trailing newline; `puts`
+   writes without adding one; `eprintln` writes to stderr. `read_line` and
    `input` return `None` at EOF. On interactive terminals, Ctrl-D produces
    `None` for that read without making later reads immediately return EOF.
 2. **UFCS methods on prelude types** — `xs.map(f)`, `s.split(",")`,
@@ -3056,7 +3023,7 @@ tests/
 | `./blorp compile <file>` | Compile .brp to generated C |
 | `./blorp compile --ast <file>` | Print AST |
 | `./blorp run <file>` | Compile and run |
-| `./blorp run <file> args...` | Run with CLI arguments |
+| `./blorp run <file> -- args...` | Run with CLI arguments |
 | `./blorp test <path>` | Run test file or directory |
 | `./blorp test --doc <path>` | Run only doctests |
 | `./blorp test --suite <path>` | Run only TestSuite tests |
@@ -3101,7 +3068,14 @@ tests/
 
 | Variable | Description |
 |----------|-------------|
-| `BLORP_THREADS=N` | Override generated-program worker threads |
+| `BLORP_STD=path` | Use a filesystem standard library directory; overrides `blorp.toml`, and is overridden by `--std-dir` |
+| `BLORP_LEAK_CHECK=1` | Enable leak reporting on exit |
+| `BLORP_TIMEOUT=N` | Default timeout in seconds (CLI flag overrides) |
+| `BLORP_FIBER_STACK_SIZE=N` | Fiber stack size in bytes (default 57344 / 56KB) |
+| `BLORP_FIBER_STACK_CACHE_BYTES=N` | Maximum bytes of dead fiber coroutine/stack regions to cache for reuse (default 134217728; `0` disables) |
+| `BLORP_FIBER_OBJECT_CACHE_COUNT=N` | Maximum dead fiber handle objects to cache for reuse (default 4096; `0` disables) |
+| `BLORP_SANITIZE=1` | Enable sanitizers (CLI flag overrides) |
+| `BLORP_NO_FORMAT=1` | Skip auto-formatting before command execution |
 
 ### Project Configuration
 
@@ -3112,13 +3086,13 @@ tests/
 path = "std"
 ```
 
-Standard library selection precedence is: `--std-dir`, `blorp.toml`, then the embedded standard library. Filesystem `std/` directories are not guessed; use `blorp.toml` for project-local std source.
+Standard library selection precedence is: `--std-dir`, `BLORP_STD`, `blorp.toml`, then the embedded standard library. Filesystem `std/` directories are not guessed; use `blorp.toml` for project-local std source.
 
 ### Memory Debugging
 
 ```bash
 # Run with leak checking
-./blorp run --leak-check program.brp
+BLORP_LEAK_CHECK=1 ./blorp run program.brp
 
 # Run the focused compiler/runtime leak baselines
 scripts/run_tests.sh leak
@@ -3288,10 +3262,6 @@ today.
   declarations rely on the foreign code honoring its contract.
 - `pkg/...` imports are explicit package/native boundaries. Bare imports
   resolve local modules or `std`, not packages.
-- `std/net/tcp` is fiber-aware for numeric-host socket waits, but hostname DNS
-  resolution still uses the blocking system resolver during `listen` and before
-  socket `connect`. Use numeric hosts or `""` bind-any hosts when OS-worker
-  pinning is unacceptable.
 - Parser/format modules such as JSON, TOML, YAML, XML, validation, and parser
   utilities use ordinary `Result` values, but their detailed error payloads are
   still module-specific rather than one shared diagnostics type.
@@ -3320,7 +3290,7 @@ Both extensions provide:
 
 ```
 func       pure       var        union      enum       record     struct     trait
-type       alias      new        private    import     as         implements
+type       alias      private    import     as         implements
 Self       builtin    match      while      for        in         if         else
 and        or         not        True       False      try        void
 break      continue   foreign    concurrent detach     where

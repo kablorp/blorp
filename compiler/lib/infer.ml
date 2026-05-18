@@ -636,7 +636,7 @@ let rec all_some = function
       match all_some rest with Some xs -> Some (x :: xs) | None -> None)
   | None :: _ -> None
 
-(** Well-known or retired names with targeted suggestions. *)
+(** Well-known names from other languages with targeted suggestions. *)
 let foreign_name_hints =
   [
     ( "return",
@@ -651,8 +651,6 @@ let foreign_name_hints =
     ("nil", "blorp doesn't have nil. Use Option[T] with Some(value) or None");
     ("range", "blorp uses '..' for ranges: for i in 0..5:");
     ("len", "Use 'length(collection)' in blorp");
-    ("println", "Use 'print(value)' in blorp");
-    ("eprintln", "Use 'err_print(value)' in blorp");
     ( "to_upper",
       "'to_upper' was renamed to 'upper'; import it with `import: string: \
        upper` and call `upper(value)` or `value.upper()`" );
@@ -870,6 +868,20 @@ let check_no_redeclaration (env : env) (name : string) (loc : loc) :
                      (Env.symbol_kind_label sym)
                      name))
         | _ -> Ok ())
+
+(** Collect record/union/type-alias names declared by a module. Used when a
+    public signature crosses a module boundary: bare local names in that
+    signature must become canonical owner-qualified frontend type identities. *)
+let module_local_type_names_from_decls (decls : Ast.program) : string list =
+  let rec collect acc decl =
+    match decl.decl_desc with
+    | DPrivate inner -> collect acc inner
+    | DRecord r -> r.record_name :: acc
+    | DType t -> t.type_name :: acc
+    | DTypeAlias a -> a.alias_name :: acc
+    | _ -> acc
+  in
+  List.fold_left collect [] decls |> List.sort_uniq String.compare
 
 (** Look up a function's type from a specific module.
     Prefers [typed_decls] (post-typecheck) over [exports] (parsed decls)
@@ -1327,26 +1339,6 @@ let default_arg_slot_for_param param_ty arg_ty =
 
 let default_arg_type_for_param param_ty arg_ty =
   Type_widening.value_type (default_arg_slot_for_param param_ty arg_ty)
-
-let new_type_conversion_hint env ~expected ~actual =
-  let type_params = Env.get_type_params env in
-  match
-    (Env.new_type_underlying env expected, Env.new_type_underlying env actual)
-  with
-  | Some underlying, _ when types_compatible ~type_params underlying actual ->
-      Some
-        (Printf.sprintf "wrap the value with %s(...)"
-           (Types.type_to_string expected))
-  | _, Some underlying when types_compatible ~type_params expected underlying ->
-      Some
-        (Printf.sprintf "use value() to unwrap %s"
-           (Types.type_to_string actual))
-  | _ -> None
-
-let append_new_type_conversion_hint env message ~expected ~actual =
-  match new_type_conversion_hint env ~expected ~actual with
-  | None -> message
-  | Some hint -> message ^ "\n    help: " ^ hint
 
 let common_inferred_type ~type_params left right =
   if types_compatible ~type_params left right then Some left
@@ -2065,27 +2057,8 @@ let ctx_types_compatible ctx expected actual =
     The declaration/typecheck boundary assigns [loop_producer] metadata to
     std/tensor producers and to the compatibility builtin [enumerate2], so this
     phase no longer reconstructs producer identity from module paths. *)
-let loop_producer_for_resolved_name ctx name =
-  let name_without_def_id =
-    match String.index_opt name '#' with
-    | Some hash_idx -> String.sub name 0 hash_idx
-    | None -> name
-  in
-  match Env.get_func_loop_producer ctx.env name with
-  | Some producer -> Some producer
-  | None -> (
-      match Env.get_func_loop_producer ctx.env name_without_def_id with
-      | Some producer -> Some producer
-      | None -> (
-          match Codegen_names.parse_ufcs_name name_without_def_id with
-          | Some ("std/tensor", "indices") -> Some LoopProducerIndices
-          | Some ("std/tensor", "enumerate") -> Some LoopProducerEnumerate
-          | Some ("std/tensor", "enumerate2") -> Some LoopProducerEnumerate2
-          | Some ("std/tensor", "windows") -> Some LoopProducerWindows
-          | _ -> None))
-
 let is_tensor_loop_call ctx expected name args =
-  loop_producer_for_resolved_name ctx name = Some expected
+  Env.get_func_loop_producer ctx.env name = Some expected
   && List.for_all (fun arg -> Option.is_some (expr_semantic_type_opt arg)) args
 
 let tensor_first_index_type (coll_ty : type_expr) : type_expr option =
@@ -2814,8 +2787,9 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       (* Detect indices(coll) — first-dimension index loop. *)
       let is_indices, indices_coll_arg, indices_coll_ty =
         match iter'.expr_desc with
-        | ECall ({ expr_desc = EIdent name; _ }, [ coll_arg ])
-          when is_tensor_loop_call ctx LoopProducerIndices name [ coll_arg ] ->
+        | ECall ({ expr_desc = EIdent "indices"; _ }, [ coll_arg ])
+          when is_tensor_loop_call ctx LoopProducerIndices "indices"
+                 [ coll_arg ] ->
             (true, Some coll_arg, expr_proof_semantic_type_opt coll_arg)
         | _ -> (false, None, None)
       in
@@ -2826,18 +2800,18 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
          are: iterate over the collection with (index, element) pairs. *)
       let is_enumerate, enum_coll_arg, enum_coll_ty =
         match iter'.expr_desc with
-        | ECall ({ expr_desc = EIdent name; _ }, [ coll_arg ])
-          when is_tensor_loop_call ctx LoopProducerEnumerate name [ coll_arg ]
-          ->
+        | ECall ({ expr_desc = EIdent "enumerate"; _ }, [ coll_arg ])
+          when is_tensor_loop_call ctx LoopProducerEnumerate "enumerate"
+                 [ coll_arg ] ->
             (true, Some coll_arg, expr_proof_semantic_type_opt coll_arg)
         | _ -> (false, None, None)
       in
       (* Detect enumerate2(m) — 2D iteration yielding (i, j, val) triples *)
       let is_enumerate2, enum2_coll_arg, enum2_coll_ty =
         match iter'.expr_desc with
-        | ECall ({ expr_desc = EIdent name; _ }, [ coll_arg ])
-          when is_tensor_loop_call ctx LoopProducerEnumerate2 name [ coll_arg ]
-          ->
+        | ECall ({ expr_desc = EIdent "enumerate2"; _ }, [ coll_arg ])
+          when is_tensor_loop_call ctx LoopProducerEnumerate2 "enumerate2"
+                 [ coll_arg ] ->
             (true, Some coll_arg, expr_proof_semantic_type_opt coll_arg)
         | _ -> (false, None, None)
       in
@@ -2854,8 +2828,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
          Codegen emits zero-cost pointer arithmetic into the original tensor. *)
       let is_windows, win_coll_arg, win_coll_ty, win_size =
         match iter'.expr_desc with
-        | ECall ({ expr_desc = EIdent name; _ }, [ coll_arg; size_arg ])
-          when is_tensor_loop_call ctx LoopProducerWindows name
+        | ECall ({ expr_desc = EIdent "windows"; _ }, [ coll_arg; size_arg ])
+          when is_tensor_loop_call ctx LoopProducerWindows "windows"
                  [ coll_arg; size_arg ] ->
             let size =
               match size_arg.expr_desc with
@@ -3805,9 +3779,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       | Some { kind = ConstructorSymbol _; _ } ->
           error loc (Printf.sprintf "Cannot assign to constructor '%s'" var)
       | Some { kind = AliasSymbol _; _ } ->
-          error loc (Printf.sprintf "Cannot assign to type alias '%s'" var)
-      | Some { kind = NewTypeSymbol _; _ } ->
-          error loc (Printf.sprintf "Cannot assign to new type '%s'" var))
+          error loc (Printf.sprintf "Cannot assign to type alias '%s'" var))
   (* Variable declaration *)
   | EVarDecl (name, ty_opt, value, is_mutable) -> (
       (* Reject same-scope re-declaration *)
@@ -5792,66 +5764,6 @@ and reject_debug_only_callee ctx callee =
 
 and infer_call ctx expr callee args loc =
   let* () = reject_debug_only_callee ctx callee in
-  let infer_new_type_constructor name =
-    match Env.get_new_type_constructor ctx.env name with
-    | None -> None
-    | Some (resolved_name, type_params, target_ty) ->
-        let result =
-          match args with
-          | [ arg ] ->
-              let* arg_ty, arg' =
-                infer_expected_argument_expr ctx target_ty arg
-              in
-              let target_ty_r =
-                normalize_type ctx ArgumentCompatibility target_ty
-              in
-              let arg_ty_r =
-                normalize_type ctx ArgumentCompatibility
-                  (expr_value_type_or arg' arg_ty)
-              in
-              if types_compatible ~type_params target_ty_r arg_ty_r then
-                let subst = build_subst ~type_params target_ty_r arg_ty_r in
-                let args =
-                  List.map
-                    (fun param -> apply_subst subst (TyVar param))
-                    type_params
-                in
-                let ret_ty = TyNamed (resolved_name, args) in
-                Ok (ret_ty, with_inferred_type arg' ret_ty)
-              else
-                let message =
-                  Printf.sprintf
-                    "Argument type mismatch: in call to '%s', argument 1 \
-                     expected %s, got %s"
-                    name
-                    (type_to_string target_ty_r)
-                    (type_to_string arg_ty_r)
-                in
-                error arg.expr_loc message
-          | _ ->
-              error loc
-                (Printf.sprintf
-                   "new type constructor '%s' expects 1 argument, got %d" name
-                   (List.length args))
-        in
-        Some result
-  in
-  match callee.expr_desc with
-  | EIdent name -> (
-      match infer_new_type_constructor name with
-      | Some result -> result
-      | None -> infer_call_after_new_type ctx expr callee args loc)
-  | EFieldAccess (obj, "value") when args = [] -> (
-      match infer_unconstrained_value_expr ctx obj with
-      | Ok (obj_ty, obj') -> (
-          match Env.new_type_underlying ctx.env obj_ty with
-          | Some underlying ->
-              Ok (underlying, with_inferred_type obj' underlying)
-          | None -> infer_call_after_new_type ctx expr callee args loc)
-      | Error _ -> infer_call_after_new_type ctx expr callee args loc)
-  | _ -> infer_call_after_new_type ctx expr callee args loc
-
-and infer_call_after_new_type ctx expr callee args loc =
   (* Builtin inference dispatch — registry shape (Phase 5.2, 2026-04-21).
      [dispatch_builtin_inference] returns [Some result] when [name] is a
      recognized builtin (and [Env.is_builtin_func] confirms the user hasn't
@@ -6247,6 +6159,20 @@ and infer_call_after_new_type ctx expr callee args loc =
                               conflicts with the current module's own functions.
                               E.g., list's get becomes __ufcs_std$list__get
                               Uses $ for path separators to avoid ambiguity with _ in names *)
+                                let mod_path =
+                                  match
+                                    (List.hd ufcs_matches).Env.ol_module_path
+                                  with
+                                  | Some p -> p
+                                  | None -> ""
+                                in
+                                let base_mangled =
+                                  "__ufcs_"
+                                  ^ String.map
+                                      (fun c -> if c = '/' then '$' else c)
+                                      mod_path
+                                  ^ "__" ^ method_name
+                                in
                                 (* Phase 2.7 tasks 48/49: when pure/impure overloads
                               exist, try to pick by callback purity — but ONLY
                               when every function-typed arg has a firm purity
@@ -6282,16 +6208,11 @@ and infer_call_after_new_type ctx expr callee args loc =
                                           List.map
                                             (fun a ->
                                               match
-                                                expr_semantic_type_opt a
+                                                infer_unconstrained_value_expr
+                                                  ctx a
                                               with
-                                              | Some ty -> Some ty
-                                              | None -> (
-                                                  match
-                                                    infer_unconstrained_value_expr
-                                                      ctx a
-                                                  with
-                                                  | Ok (ty, _) -> Some ty
-                                                  | Error _ -> None))
+                                              | Ok (ty, _) -> Some ty
+                                              | Error _ -> None)
                                             (receiver_arg :: args)
                                         in
                                         match all_some arg_tys_opt with
@@ -6302,27 +6223,6 @@ and infer_call_after_new_type ctx expr callee args loc =
                                 in
                                 let in_pure_ctx =
                                   ctx.env.current_function_pure
-                                in
-                                let mod_path =
-                                  match selected with
-                                  | Some entry -> (
-                                      match entry.Env.ol_module_path with
-                                      | Some p -> p
-                                      | None -> "")
-                                  | None -> (
-                                      match
-                                        (List.hd ufcs_matches)
-                                          .Env.ol_module_path
-                                      with
-                                      | Some p -> p
-                                      | None -> "")
-                                in
-                                let base_mangled =
-                                  "__ufcs_"
-                                  ^ String.map
-                                      (fun c -> if c = '/' then '$' else c)
-                                      mod_path
-                                  ^ "__" ^ method_name
                                 in
                                 (* A3.3 UFCS handoff: encode the selected
                               overload's [ol_def_id] directly in the
@@ -7030,30 +6930,22 @@ and infer_call_after_new_type ctx expr callee args loc =
                                 in
                                 match callee_name with
                                 | Some n ->
-                                    let message =
-                                      Printf.sprintf
-                                        "Argument type mismatch: in call to \
-                                         '%s', argument %d%s expected %s, got \
-                                         %s"
-                                        n arg_pos param_name_hint
-                                        (type_to_string param_ty_r)
-                                        (type_to_string arg_ty_r)
-                                      |> append_new_type_conversion_hint ctx.env
-                                           ~expected:param_ty_r ~actual:arg_ty_r
-                                    in
-                                    error arg.expr_loc message
+                                    error arg.expr_loc
+                                      (Printf.sprintf
+                                         "Argument type mismatch: in call to \
+                                          '%s', argument %d%s expected %s, got \
+                                          %s"
+                                         n arg_pos param_name_hint
+                                         (type_to_string param_ty_r)
+                                         (type_to_string arg_ty_r))
                                 | None ->
-                                    let message =
-                                      Printf.sprintf
-                                        "Argument type mismatch: argument %d%s \
-                                         expected %s, got %s"
-                                        arg_pos param_name_hint
-                                        (type_to_string param_ty_r)
-                                        (type_to_string arg_ty_r)
-                                      |> append_new_type_conversion_hint ctx.env
-                                           ~expected:param_ty_r ~actual:arg_ty_r
-                                    in
-                                    error arg.expr_loc message)))
+                                    error arg.expr_loc
+                                      (Printf.sprintf
+                                         "Argument type mismatch: argument \
+                                          %d%s expected %s, got %s"
+                                         arg_pos param_name_hint
+                                         (type_to_string param_ty_r)
+                                         (type_to_string arg_ty_r)))))
                 (Ok ([], initial_subst, 1))
                 args params
             in

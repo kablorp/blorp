@@ -96,11 +96,6 @@ let hover_info_for_expr (env : Env.env) (e : expr) : string option =
           Some
             (Printf.sprintf "```blorp\nalias %s%s = %s\n```" name params_str
                (Types.type_to_string target))
-      | Some { kind = Env.NewTypeSymbol { type_params; target }; _ } ->
-          let params_str = Lsp_protocol.format_type_params type_params in
-          Some
-            (Printf.sprintf "```blorp\nnew type %s%s = %s\n```" name params_str
-               (Types.type_to_string target))
       | None -> None)
   | EFieldAccess (_, field_name) -> (
       match expr_type_view e with

@@ -145,7 +145,10 @@ let fresh_temp ctx =
 (* ============================================================================
    Literal emission
 
-   This is the sole literal-emission implementation for the Core C backend.
+   Originally a deliberate copy of the legacy [Codegen_emit.gen_literal]
+   kept in sync during the Core-emit migration. The legacy codegen was
+   deleted in the 2026-04-14 cutover (see memory/legacy_codegen_cutover.md),
+   so this is now the sole definition.
    ============================================================================ *)
 
 (** Escape a string for C string literals. Use fixed-width octal for
@@ -198,7 +201,9 @@ let emit_string_literal ctx s =
   in
   emit ctx (binding.sl_helper ^ "()")
 
-(** Emit a blorp literal as a C expression. *)
+(** Emit a blorp literal as a C expression. Byte-identical to the
+    legacy [Codegen_emit.gen_literal] — duplicated here to keep
+    Core_emit self-contained. *)
 let gen_literal ctx = function
   | Ast.LitInt n -> emit ctx (Printf.sprintf "%LdL" n)
   | Ast.LitInt128 digits ->

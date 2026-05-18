@@ -25,9 +25,10 @@ val frontend_phase_to_string : frontend_phase -> string
 
 (** Outcome of [compile]. [Compiled] is the normal path; [Stopped_at]
     means a caller-supplied [on_stage] callback short-circuited the
-    pipeline via [Core_pipeline.Stopped_after]. The tagged variant keeps
-    callers on an explicit outcome path instead of requiring exception
-    handling at the library boundary. *)
+    pipeline via [Core_pipeline.Stopped_after]. Previously [compile]
+    re-raised the exception; Phase 0.5.2 converts it to a tagged
+    variant at the library boundary so callers pattern-match the
+    full outcome space instead of handling an out-of-band exception. *)
 type compile_outcome = Compiled of compile_result | Stopped_at of Core_stage.t
 
 val typecheck_only :

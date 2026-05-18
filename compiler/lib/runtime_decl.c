@@ -114,17 +114,6 @@
         #define BLORP_SIMD_MUL_I32X4(a, b)  blorp_simd_mul_i32x4_sse2(a, b)
     #endif
 
-    #define BLORP_SIMD_SET_F32X4(a, b, c, d) _mm_set_ps(d, c, b, a)
-    #define BLORP_SIMD_SET_F64X2(a, b)       _mm_set_pd(b, a)
-    #define BLORP_SIMD_SET_I32X4(a, b, c, d) _mm_set_epi32(d, c, b, a)
-
-    #define BLORP_SIMD_ZERO_F32X4()         _mm_setzero_ps()
-    #define BLORP_SIMD_ZERO_F64X2()         _mm_setzero_pd()
-    #define BLORP_SIMD_ZERO_I32X4()         _mm_setzero_si128()
-
-    #define BLORP_SIMD_CMPEQ_F32X4(a, b)    _mm_cmpeq_ps(a, b)
-    #define BLORP_SIMD_CMPEQ_F64X2(a, b)    _mm_cmpeq_pd(a, b)
-
     #if defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
         #define BLORP_SIMD_BLEND_F32X4(a, b, mask) _mm_blendv_ps(a, b, mask)
         #define BLORP_SIMD_BLEND_F64X2(a, b, mask) _mm_blendv_pd(a, b, mask)
@@ -162,29 +151,6 @@
     #define BLORP_SIMD_SUB_I32X4(a, b)      vsubq_s32(a, b)
     #define BLORP_SIMD_MUL_I32X4(a, b)      vmulq_s32(a, b)
 
-    static inline float32x4_t blorp_simd_set_f32x4(float a, float b, float c, float d) {
-        float data[4] = {a, b, c, d};
-        return vld1q_f32(data);
-    }
-    #define BLORP_SIMD_SET_F32X4(a, b, c, d) blorp_simd_set_f32x4(a, b, c, d)
-    static inline float64x2_t blorp_simd_set_f64x2(double a, double b) {
-        double data[2] = {a, b};
-        return vld1q_f64(data);
-    }
-    #define BLORP_SIMD_SET_F64X2(a, b)       blorp_simd_set_f64x2(a, b)
-    static inline int32x4_t blorp_simd_set_i32x4(int32_t a, int32_t b, int32_t c, int32_t d) {
-        int32_t data[4] = {a, b, c, d};
-        return vld1q_s32(data);
-    }
-    #define BLORP_SIMD_SET_I32X4(a, b, c, d) blorp_simd_set_i32x4(a, b, c, d)
-
-    #define BLORP_SIMD_ZERO_F32X4()         vdupq_n_f32(0.0f)
-    #define BLORP_SIMD_ZERO_F64X2()         vdupq_n_f64(0.0)
-    #define BLORP_SIMD_ZERO_I32X4()         vdupq_n_s32(0)
-
-    #define BLORP_SIMD_CMPEQ_F32X4(a, b)    vceqq_f32(a, b)
-    #define BLORP_SIMD_CMPEQ_F64X2(a, b)    vceqq_f64(a, b)
-
     #define BLORP_SIMD_BLEND_F32X4(a, b, mask) vbslq_f32(mask, b, a)
     #define BLORP_SIMD_BLEND_F64X2(a, b, mask) vbslq_f64(mask, b, a)
 
@@ -211,11 +177,6 @@
     #define BLORP_SIMD_MUL_F32X4(a, b)      blorp_simd_mul_f32x4_scalar(a, b)
     #define BLORP_SIMD_DIV_F32X4(a, b)      blorp_simd_div_f32x4_scalar(a, b)
 
-    static inline blorp_simd_f32x4 blorp_simd_set_f32x4_scalar(float a, float b, float c, float d) {
-        blorp_simd_f32x4 r; r.v[0] = a; r.v[1] = b; r.v[2] = c; r.v[3] = d; return r;
-    }
-    #define BLORP_SIMD_SET_F32X4(a, b, c, d) blorp_simd_set_f32x4_scalar(a, b, c, d)
-    #define BLORP_SIMD_ZERO_F32X4()         blorp_simd_set_f32x4_scalar(0, 0, 0, 0)
 #endif
 
 // ============================================================================
@@ -252,10 +213,6 @@ typedef struct {
     long run_queue_pops;
     long timer_inserts;
     long timer_expirations;
-    long reactor_control_wakes;
-    long reactor_poll_wakes;
-    long reactor_ready_events;
-    long reactor_waiter_wakes;
     long stack_allocations;
     long stack_reuses;
     long work_steals;
@@ -265,9 +222,6 @@ typedef struct {
     long runnable_count;
     long timers_pending;
 } blorp_SchedulerStats;
-
-typedef struct blorp_TcpListener blorp_TcpListener;
-typedef struct blorp_TcpStream blorp_TcpStream;
 
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_Vector;
 #define BLORP_VECTOR_STORAGE_POINTER 0
@@ -513,36 +467,6 @@ static inline void* blorp_simd_alloc(size_t size) {
     #endif
 }
 
-#if !defined(BLORP_SIMD_NONE)
-static inline blorp_simd_f32x4 blorp_simd_safe_div_f32x4(blorp_simd_f32x4 a, blorp_simd_f32x4 b) {
-    #if defined(BLORP_SIMD_SSE2) || defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
-        __m128 zero = _mm_setzero_ps();
-        __m128 mask = _mm_cmpeq_ps(b, zero);
-        __m128 result = _mm_div_ps(a, b);
-        return BLORP_SIMD_BLEND_F32X4(result, zero, mask);
-    #elif defined(BLORP_SIMD_NEON)
-        float32x4_t zero = vdupq_n_f32(0.0f);
-        uint32x4_t mask = vceqq_f32(b, zero);
-        float32x4_t result = vdivq_f32(a, b);
-        return vbslq_f32(mask, zero, result);
-    #endif
-}
-
-static inline blorp_simd_f64x2 blorp_simd_safe_div_f64x2(blorp_simd_f64x2 a, blorp_simd_f64x2 b) {
-    #if defined(BLORP_SIMD_SSE2) || defined(BLORP_SIMD_SSE4) || defined(BLORP_SIMD_AVX) || defined(BLORP_SIMD_AVX2)
-        __m128d zero = _mm_setzero_pd();
-        __m128d mask = _mm_cmpeq_pd(b, zero);
-        __m128d result = _mm_div_pd(a, b);
-        return BLORP_SIMD_BLEND_F64X2(result, zero, mask);
-    #elif defined(BLORP_SIMD_NEON)
-        float64x2_t zero = vdupq_n_f64(0.0);
-        uint64x2_t mask = vceqq_f64(b, zero);
-        float64x2_t result = vdivq_f64(a, b);
-        return vbslq_f64(mask, zero, result);
-    #endif
-}
-#endif
-
 static inline void* blorp_box_float(double f) {
     union { double d; void* p; } u;
     u.d = f;
@@ -627,12 +551,6 @@ static inline void* blorp_call2(blorp_Closure* closure, void* arg1, void* arg2) 
     typedef void* (*fn2_t)(void*, void*, void*);
     fn2_t f = (fn2_t)closure->func;
     return f(closure->env, arg1, arg2);
-}
-
-static inline void* blorp_call0(blorp_Closure* closure) {
-    typedef void* (*fn0_t)(void*);
-    fn0_t f = (fn0_t)closure->func;
-    return f(closure->env);
 }
 
 // ============================================================================
@@ -755,17 +673,6 @@ static inline void* blorp_box_stack_result(blorp_StackResult value) {
     return boxed;
 }
 
-static inline blorp_StackResult blorp_stack_result_from_boxed_value(void* boxed) {
-    if (!boxed) {
-        return (blorp_StackResult){ .tag = 1, .release_mask = 0UL, .data.Err.field0 = NULL };
-    }
-    blorp_StackResult out =
-        *(blorp_StackResult*)((char*)boxed + sizeof(blorp_Object));
-    blorp_stack_result_retain(out);
-    blorp_release(boxed);
-    return out;
-}
-
 static inline blorp_StackResult blorp_stack_result_from_boxed(blorp_Result* res) {
     if (!res) {
         return (blorp_StackResult){ .tag = BLORP_TAG_ERR, .release_mask = 0UL, .data.Err.field0 = NULL };
@@ -886,7 +793,8 @@ char* blorp_json_strip_array(const char* json, const char* field_name);
 // I/O
 void blorp_print(blorp_String* s);
 void blorp_puts(blorp_String* s);
-void blorp_err_print(blorp_String* s);
+void blorp_println(blorp_String* s);
+void blorp_eprintln(blorp_String* s);
 blorp_String* blorp_read_all(void);
 blorp_String* blorp_read_line(void);
 blorp_String* blorp_read_line_opt(void);
@@ -1327,24 +1235,13 @@ blorp_String* blorp_base64_decode_nullable(const blorp_String* s);
 
 // TCP Networking
 blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog);
-blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener);
+blorp_Result* blorp_tcp_accept(long server_fd);
 blorp_Result* blorp_tcp_connect(blorp_String* host, long port);
-blorp_Result* blorp_tcp_read(blorp_TcpStream* stream, long max_bytes);
-blorp_Result* blorp_tcp_write(blorp_TcpStream* stream, blorp_Bytes* data);
-void blorp_tcp_close_listener(blorp_TcpListener* listener);
-void blorp_tcp_close_stream(blorp_TcpStream* stream);
-blorp_Result* blorp_tcp_set_reuse_addr(blorp_TcpListener* listener);
-blorp_Result* blorp_tcp_local_port_listener(blorp_TcpListener* listener);
-blorp_Result* blorp_tcp_local_port_stream(blorp_TcpStream* stream);
-blorp_Result* blorp_tcp_set_timeout_listener(blorp_TcpListener* listener, long ms);
-blorp_Result* blorp_tcp_set_timeout_stream(blorp_TcpStream* stream, long ms);
-blorp_TcpListener* blorp_tcp_listener_from_fd(long fd);
-blorp_TcpStream* blorp_tcp_stream_from_fd(long fd);
-long blorp_tcp_listener_fd(blorp_TcpListener* listener);
-long blorp_tcp_stream_fd(blorp_TcpStream* stream);
-int blorp_io_reactor_start(void);
-void blorp_io_reactor_shutdown(void);
-int blorp_io_reactor_smoke_test(void);
+blorp_Result* blorp_tcp_read(long fd, long max_bytes);
+blorp_Result* blorp_tcp_write(long fd, blorp_Bytes* data);
+void blorp_tcp_close(long fd);
+blorp_Result* blorp_tcp_set_reuse_addr(long fd);
+blorp_Result* blorp_tcp_set_timeout(long fd, long ms);
 
 // Dict
 blorp_Dict* blorp_dict_new(void);

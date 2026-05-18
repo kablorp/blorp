@@ -73,11 +73,14 @@ let completion_item ~label ~kind ~detail ~sort_text : json =
     ]
 
 (* LSP CompletionItemKind constants *)
+let _kind_text = 1
 let kind_method = 2
 let kind_function = 3
 let kind_constructor = 4
+let _kind_field = 5
 let kind_variable = 6
 let kind_class = 7
+let _kind_interface = 8
 let kind_keyword = 14
 let kind_struct = 22
 
@@ -204,13 +207,6 @@ let completions_from_env ?(skip = fun _ -> false) (env : Env.env)
                     (completion_item ~label:sym.name ~kind:kind_class
                        ~detail:
                          (Printf.sprintf "alias %s = %s" sym.name
-                            (Types.type_to_string target))
-                       ~sort_text:("2_" ^ sym.name))
-              | Env.NewTypeSymbol { target; _ } ->
-                  Some
-                    (completion_item ~label:sym.name ~kind:kind_class
-                       ~detail:
-                         (Printf.sprintf "new type %s = %s" sym.name
                             (Types.type_to_string target))
                        ~sort_text:("2_" ^ sym.name))
             in
@@ -520,10 +516,6 @@ let completions_from_module (module_path : string) (prefix : string) : json list
               item name kind_class
                 (Printf.sprintf "alias %s = %s" name
                    (Types.type_to_string ad.alias_target))
-          | DNewType nt ->
-              item name kind_class
-                (Printf.sprintf "new type %s = %s" name
-                   (Types.type_to_string nt.new_type_target))
           | DImpl _ -> item name kind_method (Printf.sprintf "impl %s" name)
           | DImport _ | DPrivate _ -> item name kind_variable name)
         m.exports

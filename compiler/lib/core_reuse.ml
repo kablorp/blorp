@@ -34,7 +34,6 @@ type interference_reason =
   | IncompatibleAllocation
   | DroppedOwnerUsedAfterAllocation
   | NonLinearControlFlow
-  | CallBarrier
 
 type block_fact =
   | SafeBinding of var
@@ -71,7 +70,6 @@ let interference_reason_to_string = function
   | IncompatibleAllocation -> "incompatible allocation"
   | DroppedOwnerUsedAfterAllocation -> "dropped owner used after allocation"
   | NonLinearControlFlow -> "nonlinear control flow"
-  | CallBarrier -> "call barrier"
 
 let collection_family_of_type = function
   | Ast.TyNamed ("List", _) -> Some List
@@ -148,20 +146,6 @@ let owner_touched (target : var) (e : core) : bool =
       | CVar v -> Var.equal v target
       | CDup (v, _, _) | CDrop (v, _, _) -> Var.equal v target
       | CAssign (v, _) -> Var.equal v target
-      | _ -> false)
-    e
-
-let call_kind_is_reuse_barrier = function
-  | CKBuiltin name -> Builtin_metadata.runtime_symbol_may_park_fiber name
-  | CKForeign { fc_call_effect; _ } ->
-      Builtin_metadata.call_effect_may_park_fiber fc_call_effect
-  | CKUser _ | CKClosure | CKUnknown | CKIntrinsic _ -> false
-
-let contains_reuse_barrier_call e =
-  exists_tree
-    (fun node ->
-      match node.desc with
-      | CCall (kind, _, _) -> call_kind_is_reuse_barrier kind
       | _ -> false)
     e
 
@@ -253,10 +237,6 @@ let analyze_drop_block_with_env env dropped_var dropped_ty body =
           finish
             (Interference (ReadsDroppedOwner, binding.bind_rhs.loc) :: facts)
             None
-        else if contains_reuse_barrier_call binding.bind_rhs then
-          finish
-            (Interference (CallBarrier, binding.bind_rhs.loc) :: facts)
-            None
         else
           match allocation_site_of_expr binding.bind_rhs with
           | Some allocation when compatible allocation ->
@@ -284,16 +264,10 @@ let analyze_drop_block_with_env env dropped_var dropped_ty body =
           finish
             (Interference (ReadsDroppedOwner, binding.borrow_rhs.loc) :: facts)
             None
-        else if contains_reuse_barrier_call binding.borrow_rhs then
-          finish
-            (Interference (CallBarrier, binding.borrow_rhs.loc) :: facts)
-            None
         else scan facts rest
     | CSeq (head, rest) -> (
         if owner_touched dropped_var head then
           finish (Interference (ReadsDroppedOwner, head.loc) :: facts) None
-        else if contains_reuse_barrier_call head then
-          finish (Interference (CallBarrier, head.loc) :: facts) None
         else
           match allocation_site_of_expr head with
           | Some allocation ->
@@ -425,66 +399,61 @@ and consume_handoff_in_linear_expr env dropped_var dropped_ty expr =
   let rec scan expr =
     match expr.desc with
     | CLet (binding, rest) -> (
-        if contains_reuse_barrier_call binding.bind_rhs then None
-        else
-          match
-            consume_handoff_rhs env dropped_var dropped_ty binding.bind_rhs
-          with
-          | Some bind_rhs ->
-              if owner_touched dropped_var rest then
-                match scan rest with
-                | Some rest' ->
+        match
+          consume_handoff_rhs env dropped_var dropped_ty binding.bind_rhs
+        with
+        | Some bind_rhs ->
+            if owner_touched dropped_var rest then
+              match scan rest with
+              | Some rest' ->
+                  Some
+                    {
+                      expr with
+                      desc =
+                        CLet
+                          ( {
+                              binding with
+                              bind_rhs = rewrite_expr env binding.bind_rhs;
+                            },
+                            rest' );
+                    }
+              | None -> None
+            else
+              Some
+                {
+                  expr with
+                  desc = CLet ({ binding with bind_rhs }, rewrite_expr env rest);
+                }
+        | None -> (
+            if owner_touched dropped_var binding.bind_rhs then
+              if owner_touched dropped_var rest then None
+              else
+                match scan binding.bind_rhs with
+                | Some bind_rhs ->
                     Some
                       {
                         expr with
                         desc =
-                          CLet
-                            ( {
-                                binding with
-                                bind_rhs = rewrite_expr env binding.bind_rhs;
-                              },
-                              rest' );
+                          CLet ({ binding with bind_rhs }, rewrite_expr env rest);
                       }
                 | None -> None
-              else
-                Some
-                  {
-                    expr with
-                    desc =
-                      CLet ({ binding with bind_rhs }, rewrite_expr env rest);
-                  }
-          | None -> (
-              if owner_touched dropped_var binding.bind_rhs then
-                if owner_touched dropped_var rest then None
-                else
-                  match scan binding.bind_rhs with
-                  | Some bind_rhs ->
-                      Some
-                        {
-                          expr with
-                          desc =
-                            CLet
-                              ({ binding with bind_rhs }, rewrite_expr env rest);
-                        }
-                  | None -> None
-              else
-                match scan rest with
-                | Some rest' ->
-                    Some
-                      {
-                        expr with
-                        desc =
-                          CLet
-                            ( {
-                                binding with
-                                bind_rhs = rewrite_expr env binding.bind_rhs;
-                              },
-                              rest' );
-                      }
-                | None -> None))
+            else
+              match scan rest with
+              | Some rest' ->
+                  Some
+                    {
+                      expr with
+                      desc =
+                        CLet
+                          ( {
+                              binding with
+                              bind_rhs = rewrite_expr env binding.bind_rhs;
+                            },
+                            rest' );
+                    }
+              | None -> None))
     | CBorrowLet (binding, rest) -> (
         if owner_touched dropped_var binding.borrow_rhs then None
-        else if contains_reuse_barrier_call binding.borrow_rhs then None
         else
           match scan rest with
           | Some rest' ->
@@ -502,7 +471,6 @@ and consume_handoff_in_linear_expr env dropped_var dropped_ty expr =
           | None -> None)
     | CSeq (head, rest) -> (
         if owner_touched dropped_var head then None
-        else if contains_reuse_barrier_call head then None
         else
           match scan rest with
           | Some rest' ->
@@ -518,7 +486,6 @@ and rewrite_drop_body env dropped_var dropped_ty body =
     match expr.desc with
     | CLet (binding, rest) -> (
         if owner_touched dropped_var binding.bind_rhs then None
-        else if contains_reuse_barrier_call binding.bind_rhs then None
         else
           match allocation_site_of_expr binding.bind_rhs with
           | Some allocation when compatible allocation -> (
@@ -553,7 +520,6 @@ and rewrite_drop_body env dropped_var dropped_ty body =
               | None -> None))
     | CBorrowLet (binding, rest) -> (
         if owner_touched dropped_var binding.borrow_rhs then None
-        else if contains_reuse_barrier_call binding.borrow_rhs then None
         else
           match scan rest with
           | Some rest' ->
@@ -571,7 +537,6 @@ and rewrite_drop_body env dropped_var dropped_ty body =
           | None -> None)
     | CSeq (head, rest) -> (
         if owner_touched dropped_var head then None
-        else if contains_reuse_barrier_call head then None
         else
           match allocation_site_of_expr head with
           | Some _ -> None

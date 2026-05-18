@@ -558,8 +558,6 @@ let type_to_c ~(reg : registry) ty =
               | "Task" -> "blorp_Task*"
               | "Channel" -> "blorp_Channel*"
               | "Stream" -> "blorp_Stream*"
-              | "TcpListener" -> "blorp_TcpListener*"
-              | "TcpStream" -> "blorp_TcpStream*"
               | "Ptr" -> "void*"
               | "ConcurrencyError" -> "blorp_ConcurrencyError*"
               | _ when List.mem name Types.all_int_type_names ->
@@ -585,8 +583,6 @@ let type_to_c ~(reg : registry) ty =
               | "Task" -> "blorp_Task*"
               | "Channel" -> "blorp_Channel*"
               | "Stream" -> "blorp_Stream*"
-              | "TcpListener" -> "blorp_TcpListener*"
-              | "TcpStream" -> "blorp_TcpStream*"
               | _ -> name ^ "*" (* Generic types are pointers *))
           | TyArray _ -> "blorp_Vector*"
           | TyFunc _ -> "blorp_Closure*"

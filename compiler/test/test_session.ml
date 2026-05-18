@@ -288,6 +288,16 @@ let write_file path contents =
     ~finally:(fun () -> close_out oc)
     (fun () -> output_string oc contents)
 
+let with_env name value f =
+  let old = Sys.getenv_opt name in
+  Unix.putenv name value;
+  Fun.protect
+    ~finally:(fun () ->
+      match old with
+      | Some v -> Unix.putenv name v
+      | None -> Unix.putenv name "")
+    f
+
 let assert_std_override sess ~expected =
   Alcotest.(check bool)
     "std override active" true sess.Session.std_override_active;
@@ -303,38 +313,53 @@ let test_blorp_toml_std_path_sets_override () =
         (Filename.concat dir "blorp.toml")
         "[std] # standard library override\n\
          path = \"custom_std\" # relative to blorp.toml\n";
-      let sess = Session.create () in
-      Modules.init_module_paths ~sess (Filename.concat dir "src");
-      assert_std_override sess ~expected:(Filename.concat dir "custom_std"))
+      with_env "BLORP_STD" "" (fun () ->
+          let sess = Session.create () in
+          Modules.init_module_paths ~sess (Filename.concat dir "src");
+          assert_std_override sess ~expected:(Filename.concat dir "custom_std")))
+
+let test_blorp_toml_is_lower_priority_than_env () =
+  with_temp_dir "blorp_config_env" (fun dir ->
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[std]\npath = \"from_config\"\n";
+      let env_std = Filename.concat dir "from_env" in
+      with_env "BLORP_STD" env_std (fun () ->
+          let sess = Session.create () in
+          Modules.init_module_paths ~sess dir;
+          assert_std_override sess ~expected:env_std))
 
 let test_blorp_toml_does_not_replace_existing_override () =
   with_temp_dir "blorp_config_cli" (fun dir ->
       write_file
         (Filename.concat dir "blorp.toml")
         "[std]\npath = \"from_config\"\n";
-      let cli_std = Filename.concat dir "from_cli" in
-      let sess = Session.create () in
-      Modules.set_std_override ~sess cli_std;
-      Modules.init_module_paths ~sess dir;
-      assert_std_override sess ~expected:cli_std)
+      with_env "BLORP_STD" (Filename.concat dir "from_env") (fun () ->
+          let cli_std = Filename.concat dir "from_cli" in
+          let sess = Session.create () in
+          Modules.set_std_override ~sess cli_std;
+          Modules.init_module_paths ~sess dir;
+          assert_std_override sess ~expected:cli_std))
 
 let test_std_dir_is_not_guessed_without_explicit_config () =
   with_temp_dir "blorp_no_implicit_std" (fun dir ->
       Unix.mkdir (Filename.concat dir "std") 0o700;
-      let sess = Session.create () in
-      Modules.init_module_paths ~sess dir;
-      Alcotest.(check bool)
-        "std override inactive" false sess.std_override_active;
-      Alcotest.(check (option string))
-        "no std source dir" None
-        (Modules.std_source_dir ~sess ());
-      match Modules.load_module ~sess "std/option" dir with
-      | Some m ->
+      with_env "BLORP_STD" "" (fun () ->
+          let sess = Session.create () in
+          Modules.init_module_paths ~sess dir;
           Alcotest.(check bool)
-            "embedded std module" true
-            (m.origin = Session.Stdlib_module);
-          Alcotest.(check string) "embedded path" "<embedded:std/option>" m.path
-      | None -> Alcotest.fail "expected embedded std/option to load")
+            "std override inactive" false sess.std_override_active;
+          Alcotest.(check (option string))
+            "no std source dir" None
+            (Modules.std_source_dir ~sess ());
+          match Modules.load_module ~sess "std/option" dir with
+          | Some m ->
+              Alcotest.(check bool)
+                "embedded std module" true
+                (m.origin = Session.Stdlib_module);
+              Alcotest.(check string)
+                "embedded path" "<embedded:std/option>" m.path
+          | None -> Alcotest.fail "expected embedded std/option to load"))
 
 let test_source_origin_uses_configured_std_root () =
   with_temp_dir "blorp_source_origin" (fun dir ->
@@ -683,6 +708,8 @@ let suite =
           test_modules_reset_clears_type_index;
         Alcotest.test_case "blorp.toml std path" `Quick
           test_blorp_toml_std_path_sets_override;
+        Alcotest.test_case "BLORP_STD overrides blorp.toml" `Quick
+          test_blorp_toml_is_lower_priority_than_env;
         Alcotest.test_case "existing std override wins" `Quick
           test_blorp_toml_does_not_replace_existing_override;
         Alcotest.test_case "std dir not guessed without config" `Quick

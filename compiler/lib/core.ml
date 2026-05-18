@@ -190,6 +190,12 @@ let storage_policy_release = function
   | StoragePolicyOwnedErasedBox -> StorageArcRelease
   | StoragePolicyUnknown reason -> StorageUnknownRelease reason
 
+let storage_policy_hash = function
+  | StoragePolicyUnmanagedBits -> StorageHashBits
+  | StoragePolicyManagedPointer -> StorageHashPointer
+  | StoragePolicyOwnedErasedBox -> StorageHashPointer
+  | StoragePolicyUnknown reason -> StorageUnknownHash reason
+
 let storage_policy_equality = function
   | StoragePolicyUnmanagedBits -> StorageEqualityBits
   | StoragePolicyManagedPointer -> StorageEqualityPointer
@@ -309,6 +315,10 @@ let tensor_raw_scalar_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits)
   tensor_storage_layout ?elem_ty ~value_layout:(TensorValueRawScalar scalar)
     ~policy (TensorRawScalarStorage scalar)
 
+let tensor_word_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits) () =
+  tensor_storage_layout ?elem_ty ~value_layout:TensorValueWordSlot ~policy
+    TensorWordStorage
+
 let tensor_packed_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits) width
     =
   tensor_storage_layout ?elem_ty ~value_layout:(TensorValuePackedBits width)
@@ -343,6 +353,8 @@ type tensor_storage_provenance =
       tsp_layout : tensor_storage_layout;
     }
 
+let tensor_storage_unknown reason = TensorStorageUnknown reason
+
 let tensor_storage_known_producer layout =
   TensorStorageProven
     { tsp_kind = TensorStorageKnownProducer; tsp_layout = layout }
@@ -350,6 +362,14 @@ let tensor_storage_known_producer layout =
 let tensor_storage_preserved_producer layout =
   TensorStorageProven
     { tsp_kind = TensorStoragePreservedProducer; tsp_layout = layout }
+
+let tensor_storage_validated_boundary layout =
+  TensorStorageProven
+    { tsp_kind = TensorStorageValidatedBoundary; tsp_layout = layout }
+
+let tensor_storage_proven_layout = function
+  | TensorStorageProven { tsp_layout; _ } -> Some tsp_layout
+  | TensorStorageUnknown _ -> None
 
 type loop_range_direction = RangeMayRunBackward | RangeForwardOnly
 
@@ -538,8 +558,7 @@ and ctree =
 
     - [CKUser name]: call to a user-defined blorp function by source name.
     - [CKForeign info]: call to a foreign C function, including the C
-      symbol, the argument-passing mode selected at the declaration site, and
-      explicit call-effect metadata.
+      symbol and the argument-passing mode selected at the declaration site.
     - [CKBuiltin c_name]: call to a blorp builtin with a resolved C name.
     - [CKIntrinsic name]: a primitive operation defined at the IR level.
       Unlike [CKBuiltin], which maps to a named C function, intrinsics
@@ -563,11 +582,7 @@ and foreign_arg_passing =
       (** Borrowing FFI boundary: pass direct runtime buffers. Used by
         [foreign pure func] and explicit [@no_copy] declarations. *)
 
-and foreign_call = {
-  fc_c_name : string;
-  fc_arg_passing : foreign_arg_passing;
-  fc_call_effect : Builtin_metadata.call_effect;
-}
+and foreign_call = { fc_c_name : string; fc_arg_passing : foreign_arg_passing }
 
 and call_kind =
   | CKUnknown
@@ -2248,7 +2263,6 @@ type cf_kind =
       includes : string list;
       link_flags : (string option * string) list;
       arg_passing : foreign_arg_passing;
-      call_effect : Builtin_metadata.call_effect;
     }
   | CFClosureBody of closure_abi
 

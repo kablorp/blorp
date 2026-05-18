@@ -87,8 +87,7 @@ let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
             | None -> ())
           impl.impl_methods
     | DPrivate d2 -> walk_decl d2
-    | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ | DNewType _ ->
-        ()
+    | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ -> ()
   in
 
   List.iter walk_decl program;
@@ -215,7 +214,6 @@ let find_definition (program : program) ~(name : string) ~(line : int)
           | DRecord rd when rd.record_name = name -> Some d.decl_loc
           | DTrait td when td.trait_name = name -> Some d.decl_loc
           | DTypeAlias ad when ad.alias_name = name -> Some d.decl_loc
-          | DNewType nt when nt.new_type_name = name -> Some d.decl_loc
           | DPrivate inner -> find_in_decls [ inner ]
           | _ -> None
         in
@@ -326,20 +324,9 @@ let find_definition (program : program) ~(name : string) ~(line : int)
 
 (** Modules whose exports are available as UFCS methods on prelude types
     without an explicit import. Kept in sync with
-    typecheck.ml:load_prelude_ref. *)
+    typecheck.ml:load_prelude_ref and Modules.prelude_module_names. *)
 let prelude_ufcs_modules =
-  [
-    "option";
-    "result";
-    "string";
-    "list";
-    "dict";
-    "set";
-    "bool";
-    "tensor";
-    "vector";
-    "matrix";
-  ]
+  [ "option"; "result"; "string"; "list"; "dict"; "set"; "bool" ]
 
 (** Map an embedded module path like [<embedded:std/option>] to the configured
     filesystem std path. Non-embedded paths and sessions without an explicit

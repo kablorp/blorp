@@ -76,7 +76,7 @@
 ## System & I/O
 | Module | Description |
 |--------|-------------|
-| `io` | Console I/O (print, err_print, read_line, input, EOF-aware helpers) |
+| `io` | Console I/O (print, eprintln, read_line, input, EOF-aware helpers) |
 | `system` | File I/O, directory ops, exec |
 | `process` | Safe process spawning with output capture |
 | `path` | File path manipulation (pure string operations) |
@@ -104,15 +104,10 @@
 ## Networking (`net/`)
 | Module | Description |
 |--------|-------------|
-| `net/tcp` | TCP sockets; numeric-host waits are fiber-aware, hostname DNS may block |
+| `net/tcp` | TCP sockets (listen, accept, connect, send, recv) |
 | `net/http` | Pure HTTP/1.1 request/response parsing |
 | `net/url` | URL parsing |
 | `net/mime` | MIME type detection |
-
-`net/tcp` preview boundary: numeric hosts such as `"127.0.0.1"` and `""`
-bind-any avoid DNS and use fiber-aware socket waits. Hostname resolution still
-uses the system resolver and may block an OS worker during `listen` or before
-socket `connect`.
 
 ## Spatial & Physics
 | Module | Description |

@@ -17,9 +17,46 @@
 
 open Core
 
+(** Strip the [__mono_*] suffix from a mangled function name.
+    [sum__mono_Float_3] -> [sum]
+    [sum] -> [sum] (unchanged if no mono suffix) *)
+let base_name (mangled : string) : string =
+  let marker = "__mono_" in
+  let marker_len = String.length marker in
+  let rec find i =
+    if i + marker_len > String.length mangled then mangled
+    else if String.sub mangled i marker_len = marker then String.sub mangled 0 i
+    else find (i + 1)
+  in
+  find 0
+
+let starts_with s prefix =
+  let slen = String.length s in
+  let plen = String.length prefix in
+  slen >= plen && String.sub s 0 plen = prefix
+
+let ends_with s suffix =
+  let slen = String.length s in
+  let suffix_len = String.length suffix in
+  slen >= suffix_len && String.sub s (slen - suffix_len) suffix_len = suffix
+
 let source_name_for_synthesis (f : core_func) : string =
-  Codegen_names.source_name_for_generated_function ?module_path:f.cf_module
-    f.cf_name
+  let source_name = base_name f.cf_name in
+  let source_name =
+    match f.cf_module with
+    | None -> source_name
+    | Some module_path ->
+        let prefix = Codegen_names.sanitize_module_name module_path ^ "__" in
+        if starts_with source_name prefix then
+          String.sub source_name (String.length prefix)
+            (String.length source_name - String.length prefix)
+        else source_name
+  in
+  let pure_suffix = "__pure" in
+  if ends_with source_name pure_suffix then
+    String.sub source_name 0
+      (String.length source_name - String.length pure_suffix)
+  else source_name
 
 (** Attempt to synthesize a body for a monomorphized builtin.
     Returns the function unchanged if synthesis fails or is

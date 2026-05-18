@@ -41,7 +41,7 @@ trap "rm -rf $TEMP_DIR" EXIT
 
 # Ordered benchmark list (determines display order)
 ALL_BENCHMARKS="numeric_loop fib string array_sum array_ops dict_ops list_ops set_ops options simd nbody binary_trees fannkuch spectral_norm mandelbrot knucleotide reverse_complement"
-EXTRA_BENCHMARKS="numeric_vector paradigms particle_gravity virtual_threads tcp_virtual_threads"
+EXTRA_BENCHMARKS="numeric_vector paradigms particle_gravity virtual_threads"
 SPEEDUP_SUPPRESSED_BENCHMARKS=""
 
 die() { echo "error: $1" >&2; exit 1; }
@@ -200,7 +200,7 @@ compile_blorp() {
     fi
     (
         cd "$PROJECT_DIR"
-        "$BLORP" compile -o "$bench_c" "$bench_src" >/dev/null
+        "$BLORP" compile "$bench_src" >/dev/null
     )
     [ -f "$bench_c" ] || return 1
 

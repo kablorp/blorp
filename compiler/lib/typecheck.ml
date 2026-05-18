@@ -262,6 +262,20 @@ let record_type_home ?(imported = false) (state : check_state) ~(name : string)
 let lookup_type_home (state : check_state) (name : string) : string option =
   Hashtbl.find_opt state.type_home name
 
+(** Collect record/union/type-alias names declared by a module. Imported
+    signatures and impls need owner-qualified type identity; otherwise two
+    modules that each declare [record Widget] collapse to one bare [Widget]. *)
+let module_local_type_names_from_decls (decls : Ast.program) : string list =
+  let rec collect acc decl =
+    match decl.decl_desc with
+    | DPrivate inner -> collect acc inner
+    | DRecord r -> r.record_name :: acc
+    | DType t -> t.type_name :: acc
+    | DTypeAlias a -> a.alias_name :: acc
+    | _ -> acc
+  in
+  List.fold_left collect [] decls |> List.sort_uniq String.compare
+
 let qualify_imported_type_expr ~(module_path : string option) ty =
   match module_path with
   | None -> ty
@@ -284,30 +298,9 @@ let env_has_type_name env name =
   || Env.get_type_decl env name <> None
   || Env.get_record env name <> None
   || Env.get_alias env name <> None
-  || Env.get_new_type env name <> None
 
 let state_has_type_name state name =
   Hashtbl.mem state.known_type_names name || env_has_type_name state.env name
-
-let new_type_conversion_hint env ~expected ~actual =
-  let type_params = Env.get_type_params env in
-  match
-    (Env.new_type_underlying env expected, Env.new_type_underlying env actual)
-  with
-  | Some underlying, _ when types_compatible ~type_params underlying actual ->
-      Some
-        (Printf.sprintf "wrap the value with %s(...)"
-           (Types.type_to_string expected))
-  | _, Some underlying when types_compatible ~type_params expected underlying ->
-      Some
-        (Printf.sprintf "use value() to unwrap %s"
-           (Types.type_to_string actual))
-  | _ -> None
-
-let append_new_type_conversion_hint env message ~expected ~actual =
-  match new_type_conversion_hint env ~expected ~actual with
-  | None -> message
-  | Some hint -> message ^ "\n    help: " ^ hint
 
 let canonical_type_lookup_name env name =
   match Env.get_type_decl env name with
@@ -1023,46 +1016,6 @@ let process_type_alias ?(loc = dummy_loc) (state : check_state)
         decl.alias_target;
   }
 
-(** Process a nominal newtype declaration.
-
-    Newtypes are intentionally not registered as aliases: they remain nominal
-    through frontend checking and are erased at the inferred-AST compatibility
-    boundary before Core lowering. *)
-let process_new_type ?(loc = dummy_loc) (state : check_state)
-    (decl : new_type_decl) : check_state =
-  let state = validate_type_params state loc decl.new_type_params in
-  let target = canonical_type_alias_target state decl.new_type_target in
-  let target_mentions_self =
-    let found = ref false in
-    ignore
-      (Types.map_type_expr
-         (function
-           | TyNamed (name, _) when name = decl.new_type_name ->
-               found := true;
-               None
-           | _ -> None)
-         target);
-    !found
-  in
-  let state =
-    if target_mentions_self then
-      add_error state
-        (error_with ~notes:[] loc
-           ~help:
-             (Some
-                "A newtype must wrap an existing representation type, not \
-                 itself.")
-           (Printf.sprintf "new type '%s' cannot wrap itself" decl.new_type_name))
-    else state
-  in
-  {
-    state with
-    env =
-      add_new_type state.env decl.new_type_name
-        (Ast.type_param_names decl.new_type_params)
-        target;
-  }
-
 let validate_default_foreign_arg_safety loc (state : check_state)
     (sig_ : checked_func_signature) (func : func_decl) : check_state =
   if sig_.cfs_origin <> Foreign || func.func_is_pure || func.func_no_copy then
@@ -1339,34 +1292,6 @@ let process_imported_type_alias_decl ?alias ~(module_path : string option) state
       add_imported_type_alias ~module_path state ~alias ~original_name
         ~type_params:(Ast.type_param_names decl.alias_type_params)
 
-let process_imported_new_type_decl ?alias ~(module_path : string option) state
-    (decl : new_type_decl) (loc : loc) : check_state =
-  match module_path with
-  | None ->
-      let decl =
-        match alias with
-        | None -> decl
-        | Some alias -> { decl with new_type_name = alias }
-      in
-      process_new_type ~loc state decl
-  | Some _ ->
-      let original_name = decl.new_type_name in
-      let canonical_name =
-        canonical_imported_type_name ~module_path original_name
-      in
-      let canonical_decl =
-        {
-          decl with
-          new_type_name = canonical_name;
-          new_type_target =
-            qualify_imported_type_expr ~module_path decl.new_type_target;
-        }
-      in
-      let state = process_new_type ~loc state canonical_decl in
-      let alias = Option.value alias ~default:original_name in
-      add_imported_type_alias ~module_path state ~alias ~original_name
-        ~type_params:(Ast.type_param_names decl.new_type_params)
-
 (** Process an imported declaration to add it to the environment *)
 let rec process_imported_decl ~(module_path : string option) state decl =
   match decl.decl_desc with
@@ -1377,9 +1302,6 @@ let rec process_imported_decl ~(module_path : string option) state decl =
       process_imported_record_decl ~module_path state record_decl decl.decl_loc
   | DTypeAlias alias_decl ->
       process_imported_type_alias_decl ~module_path state alias_decl
-        decl.decl_loc
-  | DNewType new_type_decl ->
-      process_imported_new_type_decl ~module_path state new_type_decl
         decl.decl_loc
   | DFunc func_decl ->
       process_func_signature ?module_path ~loc:decl.decl_loc state func_decl
@@ -1406,9 +1328,6 @@ and process_imported_decl_as ~(module_path : string option) state decl alias =
         decl.decl_loc
   | DTypeAlias alias_decl ->
       process_imported_type_alias_decl ~alias ~module_path state alias_decl
-        decl.decl_loc
-  | DNewType new_type_decl ->
-      process_imported_new_type_decl ~alias ~module_path state new_type_decl
         decl.decl_loc
   | DVar var_decl ->
       let renamed = { var_decl with var_name = Some alias } in
@@ -2015,7 +1934,6 @@ let func_first_param_head (func : func_decl) : string option =
   | p :: _ -> (
       match p.param_type with
       | Some (TyNamed (name, _)) -> Some name
-      | Some (TyArray _) -> Some Types.array_head_name
       | _ -> None)
 
 let unwrap_to_func (d : decl) : func_decl option =
@@ -2251,7 +2169,6 @@ let process_import (state : check_state) (loc : loc) (decl : import_decl) :
                               | Ast.DRecord rd -> rd.Ast.record_name = name
                               | Ast.DTrait t -> t.Ast.trait_name = name
                               | Ast.DTypeAlias a -> a.Ast.alias_name = name
-                              | Ast.DNewType n -> n.Ast.new_type_name = name
                               | Ast.DPrivate inner -> check inner
                               | _ -> false
                             in
@@ -2503,9 +2420,6 @@ let rec first_pass (state : check_state) (decls : program) : check_state =
     | DTypeAlias a ->
         Hashtbl.replace state.known_type_names a.alias_name ();
         remember_top_level a.alias_name "type"
-    | DNewType n ->
-        Hashtbl.replace state.known_type_names n.new_type_name ();
-        remember_top_level n.new_type_name "type"
     | DFunc f ->
         Option.iter (fun name -> remember_top_level name "function") f.func_name
     | DVar v ->
@@ -2523,8 +2437,6 @@ let rec first_pass (state : check_state) (decls : program) : check_state =
           process_record_decl state record_decl decl.decl_loc
       | DTypeAlias alias_decl ->
           process_type_alias ~loc:decl.decl_loc state alias_decl
-      | DNewType new_type_decl ->
-          process_new_type ~loc:decl.decl_loc state new_type_decl
       | DFunc func_decl ->
           (* Keep std portable: native FFI belongs in explicit package/user
              modules, while std uses compiler/runtime builtins. *)
@@ -2674,9 +2586,6 @@ let () =
           ("range", "Range");
           ("dict", "Dict");
           ("set", "Set");
-          ("tensor", Types.array_head_name);
-          ("vector", Types.array_head_name);
-          ("matrix", Types.array_head_name);
         ]
       in
       let env =
@@ -4000,15 +3909,13 @@ let rec second_pass (state : check_state) (decls : program) :
                         in
                         ( add_error state
                             (error_at loc
-                               (append_new_type_conversion_hint state.env
-                                  (Printf.sprintf
-                                     "Type mismatch in variable%s\n\
-                                     \    expected: %s\n\
-                                     \       found: %s"
-                                     name_str
-                                     (type_to_string declared_ty)
-                                     (type_to_string actual_ty))
-                                  ~expected:declared_ty ~actual:actual_ty)),
+                               (Printf.sprintf
+                                  "Type mismatch in variable%s\n\
+                                  \    expected: %s\n\
+                                  \       found: %s"
+                                  name_str
+                                  (type_to_string declared_ty)
+                                  (type_to_string actual_ty))),
                           Some typed_val )
                   | Error err -> (add_error state err, None))
               | None -> (
@@ -4412,20 +4319,10 @@ let rec second_pass (state : check_state) (decls : program) :
             ( state,
               { decl with decl_desc = DTypeAlias { a with alias_target } }
               :: acc )
-        | DNewType n ->
-            let new_type_target =
-              canonical_type_alias_target state n.new_type_target
-            in
-            ( state,
-              { decl with decl_desc = DNewType { n with new_type_target } }
-              :: acc )
         | _ -> (state, decl :: acc))
       (state, []) decls
   in
   (state, List.rev rev_decls)
-
-let erase_new_types_in_program (env : env) (program : program) : program =
-  Typed_ast.map_inferred_program_types (Env.erase_new_types env) program
 
 (* ============================================================================
    Main Entry Point
@@ -4466,7 +4363,6 @@ let prepend_prelude_imports ?(current_module = "") (program : program) : program
                    acc t.Ast.type_variants
           | Ast.DRecord r -> r.Ast.record_name :: acc
           | Ast.DTypeAlias a -> a.Ast.alias_name :: acc
-          | Ast.DNewType n -> n.Ast.new_type_name :: acc
           | Ast.DFunc f -> (
               match f.Ast.func_name with
               | Some name -> name :: acc
@@ -4612,9 +4508,10 @@ let prepend_prelude_imports ?(current_module = "") (program : program) : program
 let typecheck_with_state_and_source ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (program : program) :
     check_state * program * program =
-  (* Subscript-read desugar runs at the typecheck entry rather than inside
-     [Modules.parse_source], so the formatter can still see the user's raw
-     [x[i]] syntax. *)
+  (* Phase 2.3: subscript-read desugar runs at the typecheck entry
+     rather than inside [Modules.parse_source], so the formatter
+     (which also parses) can still see the user's raw [x[i]]
+     syntax. *)
   let program = Subscript_desugar.transform_program program in
   (* Auto-prelude: prepend [std/prelude.brp]'s [import:] statements to
      the main program so names like [print], [read_file] resolve without
@@ -4627,8 +4524,18 @@ let typecheck_with_state_and_source ?module_origin ?(module_name = "")
     first_pass (init_state ?module_origin ~allow_debug_only_calls ()) program
   in
   let state, typed_program = second_pass state program in
-  let typed_program = erase_new_types_in_program state.env typed_program in
   (state, source_program, typed_program)
+
+(** Typecheck a main program and keep the final [check_state] so callers can
+    reuse resolved import metadata downstream. *)
+let typecheck_with_state ?module_origin ?(module_name = "")
+    ?(allow_debug_only_calls = false) (program : program) :
+    check_state * program =
+  let state, _source_program, typed_program =
+    typecheck_with_state_and_source ?module_origin ~module_name
+      ~allow_debug_only_calls program
+  in
+  (state, typed_program)
 
 let typed_ast_error_to_compiler_error (err : Typed_ast.error) : compiler_error =
   let loc, message =
@@ -4767,7 +4674,6 @@ let check_private_type_leakage (state : check_state) (decls : program) :
             | DRecord r -> Some r.record_name
             | DType t -> Some t.type_name
             | DTypeAlias a -> Some a.alias_name
-            | DNewType n -> Some n.new_type_name
             | _ -> None)
         | _ -> None)
       decls
@@ -4840,8 +4746,7 @@ let check_private_type_leakage (state : check_state) (decls : program) :
 let typecheck_module_with_state_and_source ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (env : env) (decls : program) :
     check_state * program * program =
-  (* Keep module sources on the same subscript-read desugar boundary as the
-     main typecheck path. *)
+  (* See Phase 2.3 note in [typecheck_with_env]. *)
   let decls = Subscript_desugar.transform_program decls in
   (* Auto-prelude: inject [std/prelude.brp]'s imports into this module's
      decls too, so stdlib code (e.g., [std/memory.brp]) can use [print]

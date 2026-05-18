@@ -160,13 +160,6 @@ val of_ast_program : Ast.program -> (program, error) result
 val of_ast_program_with_sources :
   source_program:Ast.program -> Ast.program -> (program, error) result
 
-val map_inferred_program_types :
-  (Ast.type_expr -> Ast.type_expr) -> Ast.program -> Ast.program
-(** Compatibility boundary for whole-program type payload rewrites that must run
-    after inference but before [Typed_ast] validation. This is intentionally
-    narrow: callers provide only a type mapper, while this module owns the
-    traversal over transitional AST type metadata. *)
-
 val ast : expr -> Ast.expr
 val expr_desc : expr -> (expr_desc, error) result
 val func_ast : func_decl -> Ast.func_decl

@@ -177,10 +177,9 @@ C string
   After prefixing, no downstream pass needs module awareness.
 - **Explicit erased-storage boundaries** — generic runtime slots use `void*`,
   but the choice of how a typed value crosses that boundary is centralized in
-  `core_layout_type.ml` with ownership classification from `core_type_layout.ml`.
-  `Core_codegen_prepare` rewrites final Core to explicit `CBoxTyped` /
-  `CUnboxTyped` nodes before emission, and final invariants reject unresolved
-  fallback boxing.
+  `core_erased_storage_layout.ml`. `Core_codegen_prepare` rewrites final Core to
+  explicit `CBoxTyped` / `CUnboxTyped` nodes before emission, and final
+  invariants reject unresolved fallback boxing.
 
 The emitter contract follows from those principles: backend-specific emission
 must consume explicit Core nodes and metadata rather than recovering layout,
@@ -214,7 +213,7 @@ boxing, or ownership behavior from source spelling.
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
 | `core_codegen_prepare.ml` | Final Core preparation: explicit constructors, box/unbox, and release/layout facts |
-| `core_layout_type.ml` | Late-Core layout metadata, including typed values crossing erased `void*` storage |
+| `core_erased_storage_layout.ml` | Late-Core classification for typed values crossing erased `void*` storage |
 | `core_erasure_inventory.ml` | Observational inventory of typed values crossing erased storage boundaries |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
@@ -297,10 +296,11 @@ compiler/
 │   ├── core_closure.ml    # Closure conversion / lambda hoisting
 │   ├── core_codegen_prepare.ml # Final Core representation preparation
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
-│   ├── core_layout_type.ml  # Layout metadata and erased-storage decisions
+│   ├── core_erased_storage_layout.ml # Typed values crossing erased storage
 │   ├── core_option_layout.ml # Option representation selection
 │   ├── core_result_layout.ml # Result representation selection
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
+│   ├── core_layout_type.ml  # Shared layout metadata types
 │   ├── core_perceus_check.ml # RC balance simulator (testing)
 │   ├── core_emit.ml       # Core IR → C emission
 │   ├── core_emit_c.ml     # Default C backend wrapper

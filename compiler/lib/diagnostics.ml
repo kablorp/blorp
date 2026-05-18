@@ -264,6 +264,10 @@ let format_warning ~file (w : compiler_error) =
 let format_errors ~file errors =
   errors |> List.map (format_error ~file) |> String.concat "\n"
 
+(** Render a list of non-fatal compiler warnings. *)
+let format_warnings ~file warnings =
+  warnings |> List.map (format_warning ~file) |> String.concat "\n"
+
 (** Legacy format_diagnostic — used by blorp.ml for direct formatting *)
 let format_diagnostic ~file ~loc ~severity ~message =
   render_diagnostic

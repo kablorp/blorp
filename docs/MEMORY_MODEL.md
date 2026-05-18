@@ -390,7 +390,7 @@ typedef struct {
 
 Exact allocation sizes, memory-stats epochs, leak-report type tags, and
 live-object links are cold metadata. They are kept in a side table only when
-memory stats or `--leak-check` are active, not in every object header.
+memory stats or `BLORP_LEAK_CHECK` are active, not in every object header.
 Destructor functions are stored once in a runtime registry; each object stores
 only a compact destructor id.
 

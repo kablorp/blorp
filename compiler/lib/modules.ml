@@ -172,7 +172,7 @@ let add_search_path ?sess path =
     s.search_paths <- path :: s.search_paths
 
 (** Override the embedded std library with a filesystem directory.
-    Higher priority than blorp.toml. *)
+    Higher priority than BLORP_STD env var and blorp.toml. *)
 let set_std_override ?sess dir =
   let s = sess_of ?sess () in
   s.std_override_dir <- Some dir;
@@ -331,7 +331,6 @@ let extract_export_names _decl inner_decl =
   | DType t -> [ (t.type_name, inner_decl) ]
   | DRecord r -> [ (r.record_name, inner_decl) ]
   | DTypeAlias a -> [ (a.alias_name, inner_decl) ]
-  | DNewType n -> [ (n.new_type_name, inner_decl) ]
   | DTrait t ->
       (* Export both the trait name and its method names:
          - [traits: Equatable] imports the trait and exposes all of its
@@ -621,8 +620,9 @@ and load_module_inner ~(sess : Session.t) module_name base_dir =
                             "Could not find module '%s'\n\
                             \  = note: the standard library override is set to \
                              '%s' but '%s.brp' was not found\n\
-                            \  = help: Check --std-dir or blorp.toml; remove \
-                             the override to use the embedded standard library"
+                            \  = help: Check --std-dir, BLORP_STD, or \
+                             blorp.toml; remove the override to use the \
+                             embedded standard library"
                             module_name dir
                             (strip_prefix "std/" module_name)
                         else
@@ -884,8 +884,9 @@ let blorp_config_std_path_from base_dir =
           else Some dir)
 
 (** Initialize module paths for a given base directory.
-    Filesystem std is used only when configured explicitly through [--std-dir]
-    or [blorp.toml]. Otherwise std imports use the embedded standard library. *)
+    Filesystem std is used only when configured explicitly through
+    [--std-dir], [BLORP_STD], or [blorp.toml]. Otherwise std imports use
+    the embedded standard library. *)
 let init_module_paths ?sess base_dir =
   let sess = sess_of ?sess () in
   let cwd = Sys.getcwd () in
@@ -893,11 +894,14 @@ let init_module_paths ?sess base_dir =
     if Filename.is_relative base_dir then Filename.concat cwd base_dir
     else base_dir
   in
-  (* Precedence: --std-dir, blorp.toml, then embedded std. *)
+  (* Precedence: --std-dir, BLORP_STD, blorp.toml, then embedded std. *)
   (if not sess.std_override_active then
-     match blorp_config_std_path_from abs_base_dir with
-     | Some dir -> set_std_override ~sess dir
-     | None -> ());
+     match Sys.getenv_opt "BLORP_STD" with
+     | Some dir when dir <> "" -> set_std_override ~sess dir
+     | _ -> (
+         match blorp_config_std_path_from abs_base_dir with
+         | Some dir -> set_std_override ~sess dir
+         | None -> ()));
   let cwd_pkg = Filename.concat cwd "pkg" in
   if is_directory cwd_pkg then add_package_root ~sess cwd_pkg;
   Option.iter (add_package_root ~sess) (find_pkg_root_from abs_base_dir 0);
@@ -909,8 +913,7 @@ let init_module_paths ?sess base_dir =
     error on failure. *)
 let parse_source ?sess ?filename source =
   let _ = sess_of ?sess () in
-  (* The lexer still owns process-local state, so parsing remains serialized
-     around an explicit reset at the source boundary. *)
+  (* Acknowledge ambient; lexer state still module-level in Phase 2.1a *)
   Lexer.reset_state ();
   let lexbuf = Lexing.from_string source in
   Option.iter (set_lexbuf_filename lexbuf) filename;

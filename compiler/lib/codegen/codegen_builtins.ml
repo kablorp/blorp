@@ -374,7 +374,16 @@ let builtin_c_mapping =
   @ blorp_prefixed N.mod_bytes [ "encode_utf8"; "decode_utf8" ]
   (* TCP builtins -- no prelude aliases *)
   @ prefixed_group N.mod_tcp "blorp_tcp_"
-      [ "listen"; "accept"; "connect"; "read"; "write"; "set_reuse_addr" ]
+      [
+        "listen";
+        "accept";
+        "connect";
+        "read";
+        "write";
+        "close";
+        "set_reuse_addr";
+        "set_timeout";
+      ]
   @
   (* StringSlice builtins — all moved to IR intrinsics *)
   (* Concurrency builtins *)

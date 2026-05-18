@@ -55,7 +55,6 @@ let print_type_params = function
 let comments : Fmt_comment.t ref = ref (Fmt_comment.create [])
 
 type block_item = BlockComment of Lexer.collected_comment | BlockExpr of expr
-type ufcs_step = { step_name : string; step_args : expr list; step_line : int }
 
 let loc_end_line loc = max loc.line loc.end_line
 
@@ -433,113 +432,6 @@ let rec expr_has_block e =
   | ERecord fields -> List.exists (fun (_, e) -> expr_has_block e) fields
   | _ -> false
 
-let rec ufcs_chain_step_count func_e =
-  match func_e.expr_desc with
-  | EFieldAccess (receiver, _) -> 1 + ufcs_receiver_step_count receiver
-  | _ -> 0
-
-and ufcs_receiver_step_count receiver =
-  match receiver.expr_desc with
-  | ECall ({ expr_desc = EFieldAccess (inner, _); _ }, _) ->
-      1 + ufcs_receiver_step_count inner
-  | _ -> 0
-
-(** True when the printer will introduce hard line breaks for this expression
-    even though it is not necessarily a block expression in the AST. *)
-let rec expr_has_multiline_layout e =
-  expr_has_block e
-  ||
-  match e.expr_desc with
-  | ECall (func_e, args) ->
-      ufcs_chain_step_count func_e >= 2
-      || expr_has_multiline_layout func_e
-      || List.exists expr_has_multiline_layout args
-  | EFieldAccess (inner, _) | EAscription (inner, _) | EDetach inner ->
-      expr_has_multiline_layout inner
-  | EUnary (_, inner) -> expr_has_multiline_layout inner
-  | EBinary (_, left, right)
-  | ELogical (_, left, right)
-  | ERange (left, right)
-  | ESubscript (left, right) ->
-      expr_has_multiline_layout left || expr_has_multiline_layout right
-  | EIf (cond, then_e, else_opt) -> (
-      expr_has_multiline_layout cond
-      || expr_has_multiline_layout then_e
-      ||
-      match else_opt with
-      | Some else_e -> expr_has_multiline_layout else_e
-      | None -> false)
-  | ETuple elems
-  | EList elems
-  | EVector elems
-  | ETry elems
-  | EDebugBlock elems
-  | EBlock elems ->
-      List.exists expr_has_multiline_layout elems
-  | EMatch (scrutinee, cases) ->
-      expr_has_multiline_layout scrutinee
-      || List.exists
-           (fun case -> expr_has_multiline_layout case.case_body)
-           cases
-  | ERecord fields ->
-      List.exists (fun (_, e) -> expr_has_multiline_layout e) fields
-  | ERecordUpdate (base, fields) ->
-      expr_has_multiline_layout base
-      || List.exists (fun (_, e) -> expr_has_multiline_layout e) fields
-  | ESubscriptMulti (target, indices) ->
-      expr_has_multiline_layout target
-      || List.exists expr_has_multiline_layout indices
-  | ESubscriptAssign (target, indices, value) ->
-      expr_has_multiline_layout target
-      || expr_has_multiline_layout value
-      || List.exists expr_has_multiline_layout indices
-  | EStringInterp (parts, _) ->
-      List.exists
-        (function
-          | InterpExpr e -> expr_has_multiline_layout e | InterpLit _ -> false)
-        parts
-  | EConcurrent (bindings, timeout, _) -> (
-      List.exists expr_has_multiline_layout bindings
-      ||
-      match timeout with
-      | Some timeout -> expr_has_multiline_layout timeout
-      | None -> false)
-  | EConcurrentBind (_, _, value) -> expr_has_multiline_layout value
-  | EConcurrentFor (_, iterable, body, timeout, _) -> (
-      expr_has_multiline_layout iterable
-      || expr_has_multiline_layout body
-      ||
-      match timeout with
-      | Some timeout -> expr_has_multiline_layout timeout
-      | None -> false)
-  | EDict entries ->
-      List.exists
-        (fun (key, value) ->
-          expr_has_multiline_layout key || expr_has_multiline_layout value)
-        entries
-  | ELambda fd -> func_body_has_multiline_layout fd.func_body
-  | EWhile (cond, body) | EFor (_, cond, body) | EForTuple (_, cond, body) ->
-      expr_has_multiline_layout cond || expr_has_multiline_layout body
-  | ELoopView view -> (
-      expr_has_multiline_layout view.loop_view_source
-      ||
-      match view.loop_view_size_arg with
-      | Some size_arg -> expr_has_multiline_layout size_arg
-      | None -> false)
-  | EAssign (_, value)
-  | EVarDecl (_, _, value, _)
-  | ETupleDestruct (_, value)
-  | ETryBind (_, _, value) ->
-      expr_has_multiline_layout value
-  | EFuncDecl fd -> func_body_has_multiline_layout fd.func_body
-  | EIdent _ | ELiteral _ | EVoid | EBreak | EContinue | EBuiltin _
-  | EStringInterpRaw _ ->
-      false
-
-and func_body_has_multiline_layout = function
-  | FuncBodyExpr body -> expr_has_multiline_layout body
-  | FuncBuiltinBody _ | FuncForeign _ | FuncNoBody -> false
-
 (** Check if an expression is a lambda (any kind). *)
 let is_lambda e = match e.expr_desc with ELambda _ -> true | _ -> false
 
@@ -556,36 +448,23 @@ let print_builtin_body = function
     multiline expressions inside lambda bodies that are function arguments. *)
 let force_flat = ref false
 
-let with_force_flat value f =
-  let prev = !force_flat in
-  force_flat := value;
-  Fun.protect ~finally:(fun () -> force_flat := prev) f
-
-let multiline_comma_items items =
-  let rec go = function
-    | [] -> Nil
-    | [ (doc, _) ] -> doc
-    | (doc, comma_on_own_line) :: rest ->
-        let comma =
-          if comma_on_own_line then hardline ^^ text "," else text ","
-        in
-        doc ^^ comma ^^ hardline ^^ go rest
-  in
-  go items
-
 let rec print_expr e =
-  let doc = print_expr_node e in
+  let doc = print_expr_desc e.expr_desc in
   let trail = trailing_comment e.expr_loc.line in
   doc ^^ trail
 
 and print_bracketed open_b close_b elems =
-  let has_multiline = List.exists expr_has_multiline_layout elems in
+  let has_multiline = List.exists expr_has_block elems in
   if has_multiline then
-    let item_docs =
-      List.map (fun e -> (print_expr e, expr_has_block e)) elems
-    in
     text open_b
-    ^^ indent (hardline ^^ multiline_comma_items item_docs)
+    ^^ indent
+         (hardline
+         ^^ concat
+              (List.mapi
+                 (fun i e ->
+                   let sep = if i > 0 then text "," ^^ hardline else Nil in
+                   sep ^^ print_expr e)
+                 elems))
     ^^ hardline ^^ text close_b
   else if !force_flat then
     text open_b ^^ comma_sep (List.map print_expr elems) ^^ text close_b
@@ -594,32 +473,6 @@ and print_bracketed open_b close_b elems =
       (text open_b
       ^^ indent (softline ^^ comma_sep_break (List.map print_expr elems))
       ^^ softline ^^ text close_b)
-
-and print_dict_entry (key, value) =
-  print_expr key ^^ text " => " ^^ print_expr value
-
-and print_multiline_dict entries =
-  let entry_docs =
-    List.map (fun entry -> (print_dict_entry entry, false)) entries
-  in
-  text "{"
-  ^^ indent (hardline ^^ multiline_comma_items entry_docs)
-  ^^ hardline ^^ text "}"
-
-and print_single_entry_dict_arg entry =
-  let flat = text "{" ^^ print_dict_entry entry ^^ text "}" in
-  group (IfBreak (print_multiline_dict [ entry ], flat))
-
-and print_adjacent_single_collection_arg args =
-  match args with
-  | [ ({ expr_desc = EList _; _ } as arg) ] when not !force_flat ->
-      Some (text "(" ^^ print_expr arg ^^ text ")")
-  | [ { expr_desc = EDict [ entry ]; _ } ] when not !force_flat ->
-      Some (text "(" ^^ print_single_entry_dict_arg entry ^^ text ")")
-  | [ { expr_desc = EDict entries; _ } ] when (not !force_flat) && entries <> []
-    ->
-      Some (text "(" ^^ print_multiline_dict entries ^^ text ")")
-  | _ -> None
 
 and vector_rank_expr e =
   match e.expr_desc with EVector elems -> vector_rank_elems elems | _ -> 0
@@ -670,98 +523,91 @@ and print_vector_literal elems =
 and print_chain_call_args args =
   match args with
   | [] -> text "()"
-  | _ -> (
-      match print_adjacent_single_collection_arg args with
-      | Some doc -> doc
-      | None ->
-          let has_block_lambda =
-            List.exists
-              (fun a ->
-                match a.expr_desc with
-                | ELambda fd -> func_body_has_block fd.func_body
-                | _ -> false)
-              args
-          in
-          if List.exists expr_has_multiline_layout args then
-            let render () =
-              let arg_docs =
-                List.map (fun arg -> (print_expr arg, expr_has_block arg)) args
-              in
-              text "("
-              ^^ indent (hardline ^^ multiline_comma_items arg_docs)
-              ^^ hardline ^^ text ")"
-            in
-            if has_block_lambda then with_force_flat true render else render ()
-          else
-            group
-              (text "("
-              ^^ indent (softline ^^ comma_sep_break (List.map print_expr args))
-              ^^ softline ^^ text ")"))
+  | _ ->
+      let has_trailing_block_lambda =
+        match List.rev args with
+        | { expr_desc = ELambda fd; _ } :: _ -> func_body_has_block fd.func_body
+        | _ -> false
+      in
+      if has_trailing_block_lambda then (
+        let prev = !force_flat in
+        force_flat := true;
+        let rev = List.rev args in
+        let last = List.hd rev in
+        let leading = List.rev (List.tl rev) in
+        let leading_part =
+          match leading with
+          | [] -> Nil
+          | _ -> comma_sep (List.map print_expr leading) ^^ text ", "
+        in
+        let doc =
+          text "(" ^^ leading_part ^^ print_expr last ^^ hardline ^^ text ")"
+        in
+        force_flat := prev;
+        doc)
+      else if List.exists expr_is_non_lambda_block args then
+        let last_idx = List.length args - 1 in
+        let arg_docs =
+          List.mapi
+            (fun i arg ->
+              let arg_doc = print_expr arg in
+              if i = last_idx then arg_doc
+              else if expr_has_block arg then arg_doc ^^ hardline ^^ text ","
+              else arg_doc ^^ text ",")
+            args
+        in
+        text "("
+        ^^ indent (hardline ^^ hardlines arg_docs)
+        ^^ hardline ^^ text ")"
+      else
+        group
+          (text "("
+          ^^ indent (softline ^^ comma_sep_break (List.map print_expr args))
+          ^^ softline ^^ text ")")
 
 and expr_is_non_lambda_block e =
   match e.expr_desc with ELambda _ -> false | _ -> expr_has_block e
 
 and print_block_call_args func_e args =
-  match print_adjacent_single_collection_arg args with
-  | Some args_doc -> print_expr func_e ^^ args_doc
-  | None ->
-      let arg_docs =
-        List.map (fun arg -> (print_expr arg, expr_has_block arg)) args
-      in
-      print_expr func_e ^^ text "("
-      ^^ indent (hardline ^^ multiline_comma_items arg_docs)
-      ^^ hardline ^^ text ")"
+  let last_idx = List.length args - 1 in
+  let arg_docs =
+    List.mapi
+      (fun i arg ->
+        let arg_doc = print_expr arg in
+        if i = last_idx then arg_doc
+        else if expr_has_block arg then arg_doc ^^ hardline ^^ text ","
+        else arg_doc ^^ text ",")
+      args
+  in
+  print_expr func_e ^^ text "("
+  ^^ indent (hardline ^^ hardlines arg_docs)
+  ^^ hardline ^^ text ")"
 
-and print_ufcs_chain call_expr func_e args =
+and print_ufcs_chain func_e args =
   let rec collect receiver steps =
     match receiver.expr_desc with
     | ECall ({ expr_desc = EFieldAccess (inner, method_name); _ }, method_args)
       ->
-        collect inner
-          ({
-             step_name = method_name;
-             step_args = method_args;
-             step_line = loc_end_line receiver.expr_loc;
-           }
-          :: steps)
+        collect inner ((method_name, method_args) :: steps)
     | _ -> (receiver, steps)
   in
   match func_e.expr_desc with
   | EFieldAccess (receiver, method_name) ->
-      let receiver, steps =
-        collect receiver
-          [
-            {
-              step_name = method_name;
-              step_args = args;
-              step_line = loc_end_line call_expr.expr_loc;
-            };
-          ]
-      in
+      let receiver, steps = collect receiver [ (method_name, args) ] in
       if List.length steps >= 2 && not !force_flat then
-        let print_step step =
-          let leading =
-            Fmt_comment.take_leading !comments ~before_line:step.step_line
-          in
-          let leading_doc =
-            concat
-              (List.map
-                 (fun (c : Lexer.collected_comment) ->
-                   hardline ^^ text (Fmt_comment.normalize_comment c.cc_text))
-                 leading)
-          in
-          leading_doc ^^ hardline ^^ text "." ^^ text step.step_name
-          ^^ print_chain_call_args step.step_args
-          ^^ trailing_comment step.step_line
-        in
-        let receiver_doc = print_expr receiver in
-        let steps_doc = concat (List.map print_step steps) in
-        Some (receiver_doc ^^ indent steps_doc)
+        Some
+          (print_expr receiver
+          ^^ indent
+               (concat
+                  (List.map
+                     (fun (step_name, step_args) ->
+                       hardline ^^ text "." ^^ text step_name
+                       ^^ print_chain_call_args step_args)
+                     steps)))
       else None
   | _ -> None
 
-and print_expr_node expr =
-  match expr.expr_desc with
+and print_expr_desc = function
   | EIdent s -> text s
   | ELiteral lit -> print_literal lit
   | ELoopView view ->
@@ -837,92 +683,126 @@ and print_expr_node expr =
       in
       inner_doc ^^ text " as " ^^ print_type_expr ty
   | ECall (func_e, []) -> (
-      match print_ufcs_chain expr func_e [] with
+      match print_ufcs_chain func_e [] with
       | Some doc -> doc
       | None -> print_expr func_e ^^ text "()")
   | ECall (func_e, args) -> (
-      match print_ufcs_chain expr func_e args with
+      match print_ufcs_chain func_e args with
       | Some doc -> doc
-      | None -> (
-          match print_adjacent_single_collection_arg args with
-          | Some adjacent_args -> print_expr func_e ^^ adjacent_args
-          | None ->
-              let has_block_lambda =
-                List.exists
-                  (fun a ->
-                    match a.expr_desc with
-                    | ELambda fd -> func_body_has_block fd.func_body
-                    | _ -> false)
-                  args
-              in
-              if List.exists expr_has_multiline_layout args then
-                if has_block_lambda then
-                  with_force_flat true (fun () ->
-                      print_block_call_args func_e args)
-                else print_block_call_args func_e args
-              else if List.exists is_lambda args then
-                (* Inline lambdas: use normal group-based breaking. Apply print_arg
-               for nested-call IfBreak expansion. *)
-                let rec print_arg a =
+      | None ->
+          (* Check for trailing multiline lambda arg *)
+          let has_trailing_block_lambda =
+            match List.rev args with
+            | { expr_desc = ELambda fd; _ } :: _ ->
+                func_body_has_block fd.func_body
+            | _ -> false
+          in
+          if has_trailing_block_lambda then (
+            let prev = !force_flat in
+            force_flat := true;
+            let rev = List.rev args in
+            let last = List.hd rev in
+            let leading = List.rev (List.tl rev) in
+            let leading_part =
+              match leading with
+              | [] -> Nil
+              | _ -> comma_sep (List.map print_expr leading) ^^ text ", "
+            in
+            let doc =
+              print_expr func_e ^^ text "(" ^^ leading_part ^^ print_expr last
+              ^^ hardline ^^ text ")"
+            in
+            force_flat := prev;
+            doc)
+          else if List.exists is_lambda args then
+            (* Lambda args with block bodies need special handling — put trailing
+           args on separate lines. Inline lambdas use normal group-based breaking
+           since the parser handles multiline expressions inside parens correctly. *)
+            let has_block_lambda =
+              List.exists
+                (fun a ->
                   match a.expr_desc with
-                  | ECall
-                      ({ expr_desc = EFieldAccess _ | EIdent _; _ }, inner_args)
-                    when List.length inner_args >= 2 && not !force_flat ->
-                      let flat_doc = print_expr a in
-                      let inner_args_doc = List.map print_arg inner_args in
-                      let callee_doc =
-                        print_expr
-                          (match a.expr_desc with ECall (f, _) -> f | _ -> a)
-                      in
-                      let broken_doc =
-                        callee_doc ^^ text "("
-                        ^^ indent (hardline ^^ comma_sep_break inner_args_doc)
-                        ^^ hardline ^^ text ")"
-                      in
-                      IfBreak (broken_doc, flat_doc)
-                  | _ -> print_expr a
-                in
-                group
-                  (print_expr func_e ^^ text "("
-                  ^^ indent
-                       (softline ^^ comma_sep_break (List.map print_arg args))
-                  ^^ softline ^^ text ")")
-              else if !force_flat then
+                  | ELambda fd -> func_body_has_block fd.func_body
+                  | _ -> false)
+                args
+            in
+            if has_block_lambda then begin
+              let prev = !force_flat in
+              force_flat := true;
+              let arg_docs = List.map print_expr args in
+              let doc =
                 print_expr func_e ^^ text "("
-                ^^ comma_sep (List.map print_expr args)
+                ^^ concat
+                     (List.mapi
+                        (fun i d ->
+                          if i > 0 then hardline ^^ text ", " ^^ d else d)
+                        arg_docs)
                 ^^ text ")"
-              else if List.exists expr_is_non_lambda_block args then
-                print_block_call_args func_e args
-              else
-                (* For arguments that are multi-arg calls, provide two layouts via
+              in
+              force_flat := prev;
+              doc
+            end
+            else
+              (* Inline lambdas: use normal group-based breaking.
+             Apply print_arg for nested-call IfBreak expansion. *)
+              let rec print_arg a =
+                match a.expr_desc with
+                | ECall
+                    ({ expr_desc = EFieldAccess _ | EIdent _; _ }, inner_args)
+                  when List.length inner_args >= 2 && not !force_flat ->
+                    let flat_doc = print_expr a in
+                    let inner_args_doc = List.map print_arg inner_args in
+                    let callee_doc =
+                      print_expr
+                        (match a.expr_desc with ECall (f, _) -> f | _ -> a)
+                    in
+                    let broken_doc =
+                      callee_doc ^^ text "("
+                      ^^ indent (hardline ^^ comma_sep_break inner_args_doc)
+                      ^^ hardline ^^ text ")"
+                    in
+                    IfBreak (broken_doc, flat_doc)
+                | _ -> print_expr a
+              in
+              group
+                (print_expr func_e ^^ text "("
+                ^^ indent (softline ^^ comma_sep_break (List.map print_arg args))
+                ^^ softline ^^ text ")")
+          else if !force_flat then
+            print_expr func_e ^^ text "("
+            ^^ comma_sep (List.map print_expr args)
+            ^^ text ")"
+          else if List.exists expr_is_non_lambda_block args then
+            print_block_call_args func_e args
+          else
+            (* For arguments that are multi-arg calls, provide two layouts via
            IfBreak: expanded (when parent breaks) and flat (when parent fits).
            This gives tree-like expansion at every nesting depth. *)
-                let rec print_arg a =
-                  match a.expr_desc with
-                  | ECall
-                      ({ expr_desc = EFieldAccess _ | EIdent _; _ }, inner_args)
-                    when List.length inner_args >= 2 ->
-                      let flat_doc = print_expr a in
-                      (* Recursively apply print_arg to inner args for cascading breaks *)
-                      let inner_args_doc = List.map print_arg inner_args in
-                      let callee_doc =
-                        print_expr
-                          (match a.expr_desc with ECall (f, _) -> f | _ -> a)
-                      in
-                      let broken_doc =
-                        callee_doc ^^ text "("
-                        ^^ indent (hardline ^^ comma_sep_break inner_args_doc)
-                        ^^ hardline ^^ text ")"
-                      in
-                      IfBreak (broken_doc, flat_doc)
-                  | _ -> print_expr a
-                in
-                let args_doc = List.map print_arg args in
-                print_expr func_e
-                ^^ group
-                     (text "("
-                     ^^ indent (softline ^^ comma_sep_break args_doc)
-                     ^^ softline ^^ text ")")))
+            let rec print_arg a =
+              match a.expr_desc with
+              | ECall ({ expr_desc = EFieldAccess _ | EIdent _; _ }, inner_args)
+                when List.length inner_args >= 2 ->
+                  let flat_doc = print_expr a in
+                  (* Recursively apply print_arg to inner args for cascading breaks *)
+                  let inner_args_doc = List.map print_arg inner_args in
+                  let callee_doc =
+                    print_expr
+                      (match a.expr_desc with ECall (f, _) -> f | _ -> a)
+                  in
+                  let broken_doc =
+                    callee_doc ^^ text "("
+                    ^^ indent (hardline ^^ comma_sep_break inner_args_doc)
+                    ^^ hardline ^^ text ")"
+                  in
+                  IfBreak (broken_doc, flat_doc)
+              | _ -> print_expr a
+            in
+            let args_doc = List.map print_arg args in
+            print_expr func_e
+            ^^ group
+                 (text "("
+                 ^^ indent (softline ^^ comma_sep_break args_doc)
+                 ^^ softline ^^ text ")"))
   | EIf (cond, then_e, else_opt) -> (
       let if_doc =
         text "if " ^^ print_expr cond ^^ text ":"
@@ -933,7 +813,8 @@ and print_expr_node expr =
       | Some else_e -> (
           match else_e.expr_desc with
           | EIf _ ->
-              if_doc ^^ hardline ^^ text "else " ^^ print_expr_node else_e
+              if_doc ^^ hardline ^^ text "else "
+              ^^ print_expr_desc else_e.expr_desc
           | _ ->
               if_doc ^^ hardline ^^ text "else" ^^ text ":"
               ^^ indent (hardline ^^ print_block_body else_e)))
@@ -954,13 +835,25 @@ and print_expr_node expr =
                    cases))
   | EBlock exprs -> print_block_exprs exprs
   | ETuple elems ->
-      if List.exists expr_has_multiline_layout elems then
-        let item_docs =
-          List.map (fun e -> (print_expr e, expr_has_block e)) elems
+      (* Check if the last element is a multiline lambda (block body) *)
+      let has_trailing_block_lambda =
+        match List.rev elems with
+        | { expr_desc = ELambda fd; _ } :: _ -> func_body_has_block fd.func_body
+        | _ -> false
+      in
+      if has_trailing_block_lambda then
+        (* Special "hugging" layout: print everything up to the last elem
+           on the first line, then the multiline lambda, then ) on its own line *)
+        let rev = List.rev elems in
+        let last = List.hd rev in
+        let leading = List.rev (List.tl rev) in
+        let leading_docs = List.map print_expr leading in
+        let leading_part =
+          match leading_docs with
+          | [] -> Nil
+          | _ -> comma_sep leading_docs ^^ text ", "
         in
-        text "("
-        ^^ indent (hardline ^^ multiline_comma_items item_docs)
-        ^^ hardline ^^ text ")"
+        text "(" ^^ leading_part ^^ print_expr last ^^ hardline ^^ text ")"
       else
         group
           (text "("
@@ -969,18 +862,17 @@ and print_expr_node expr =
   | EVector elems -> print_vector_literal elems
   | EList elems -> print_bracketed "[" "]" elems
   | ERecord fields ->
-      let has_multiline =
-        List.exists (fun (_, e) -> expr_has_multiline_layout e) fields
-      in
+      let has_multiline = List.exists (fun (_, e) -> expr_has_block e) fields in
       if has_multiline then
-        let field_docs =
-          List.map
-            (fun (name, e) ->
-              (text name ^^ text " = " ^^ print_expr e, expr_has_block e))
-            fields
-        in
         text "{"
-        ^^ indent (hardline ^^ multiline_comma_items field_docs)
+        ^^ indent
+             (hardline
+             ^^ concat
+                  (List.mapi
+                     (fun i (name, e) ->
+                       let sep = if i > 0 then text "," ^^ hardline else Nil in
+                       sep ^^ text name ^^ text " = " ^^ print_expr e)
+                     fields))
         ^^ hardline ^^ text "}"
       else
         group
@@ -1695,13 +1587,6 @@ let print_type_alias ?(is_private = false) ta =
   ^^ text " = "
   ^^ print_type_expr ta.alias_target
 
-let print_new_type ?(is_private = false) nt =
-  let export = if is_private then text "private " else Nil in
-  let type_params = print_type_params nt.new_type_params in
-  export ^^ text "new type " ^^ text nt.new_type_name ^^ type_params
-  ^^ text " = "
-  ^^ print_type_expr nt.new_type_target
-
 (** Print a single declaration (non-import) *)
 let rec print_decl_desc ?(is_private = false) = function
   | DFunc fd -> print_func_decl ~is_private fd
@@ -1713,7 +1598,6 @@ let rec print_decl_desc ?(is_private = false) = function
   | DTrait td -> print_trait_decl ~is_private td
   | DImpl id -> print_impl_decl ~is_private id
   | DTypeAlias ta -> print_type_alias ~is_private ta
-  | DNewType nt -> print_new_type ~is_private nt
 
 and print_decl_inner ?(is_private = false) d =
   let doc_doc =
@@ -1951,8 +1835,8 @@ let print_program (program : program) =
   (* Classify whether a declaration is "small" (constants, aliases, exports of same) *)
   let is_small_decl d =
     match d.decl_desc with
-    | DVar _ | DTypeAlias _ | DNewType _ -> true
-    | DPrivate { decl_desc = DVar _ | DTypeAlias _ | DNewType _; _ } -> true
+    | DVar _ | DTypeAlias _ -> true
+    | DPrivate { decl_desc = DVar _ | DTypeAlias _; _ } -> true
     | _ -> false
   in
   let func_name_of_decl d =

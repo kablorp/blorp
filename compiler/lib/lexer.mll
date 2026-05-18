@@ -102,7 +102,6 @@ let () =
     ("Self", Parser.SELF_TYPE);
     ("type", Parser.TYPE);
     ("alias", Parser.ALIAS);
-    ("new", Parser.NEW);
     ("builtin", Parser.BUILTIN);
     ("import", Parser.IMPORT);
     ("as", Parser.AS);
@@ -993,7 +992,7 @@ let token_to_string = function
   | Parser.BREAK -> "break" | Parser.CONTINUE -> "continue"
   | Parser.IMPLEMENTS -> "implements" | Parser.TRAIT -> "trait"
   | Parser.SELF_TYPE -> "Self"
-  | Parser.TYPE -> "type" | Parser.ALIAS -> "alias" | Parser.NEW -> "new" | Parser.BUILTIN -> "builtin"
+  | Parser.TYPE -> "type" | Parser.ALIAS -> "alias" | Parser.BUILTIN -> "builtin"
   | Parser.IMPORT -> "import" | Parser.AS -> "as"
   | Parser.PRIVATE -> "private" | Parser.MATCH -> "match"
   | Parser.TRUE -> "True" | Parser.FALSE -> "False"

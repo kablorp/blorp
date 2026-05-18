@@ -42,30 +42,6 @@ let mark_cached_formatted source =
     close_out oc
   with _ -> ()
 
-let write_file_atomic filename contents =
-  let dir = Filename.dirname filename in
-  let base = Filename.basename filename in
-  let mode = try (Unix.stat filename).Unix.st_perm with _ -> 0o644 in
-  let tmp, oc =
-    Filename.open_temp_file ~temp_dir:dir ("." ^ base ^ ".") ".tmp"
-  in
-  let closed = ref false in
-  let close () =
-    if not !closed then begin
-      closed := true;
-      close_out oc
-    end
-  in
-  try
-    output_string oc contents;
-    close ();
-    Unix.chmod tmp mode;
-    Unix.rename tmp filename
-  with exn ->
-    if not !closed then close_out_noerr oc;
-    (try Sys.remove tmp with _ -> ());
-    raise exn
-
 (* ===== Formatter ===== *)
 
 (** Format a source string. Returns the formatted source or an error. *)
@@ -156,7 +132,10 @@ let format_file ?(use_cache = false) ~check filename =
           end
           else if check then Ok false
           else begin
-            write_file_atomic filename formatted;
+            let oc = open_out filename in
+            Fun.protect
+              ~finally:(fun () -> close_out oc)
+              (fun () -> output_string oc formatted);
             (* Cache the formatted output *)
             mark_cached_formatted formatted;
             Ok true

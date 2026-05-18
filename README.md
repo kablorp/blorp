@@ -7,8 +7,6 @@ boundaries make hidden behavior harder and program intent clearer.
 
 > Blorp is in early-preview. It is not ready for production usage.
 
-
-
 ## Hello, world!
 
 ```blorp
@@ -18,11 +16,8 @@ func main(args: List[String]) -> Void:
 Blorp's syntax is inspired by Python. `main` signifies the entry point
 to a program.
 
-
-
 ## At a Glance
-Blorp leverages pure functions, explicit data states, pattern matching, and method call syntax
-for straightforward local reasoning.
+The core shape of Blorp leverages pure functions, explicit data states, pattern matching, and IO at the program boundary.
 
 
 ```blorp
@@ -33,7 +28,9 @@ union Score:
 
 -- Pure functions are encoded in the type system
 pure func grade(scores: List[Int]) -> Score:
-    average = total(scores) / scores.length()
+    -- Any function can be called with method syntax by its first argument:
+    -- scores.length() is the same as length(scores)
+    average: Int = total(scores) / scores.length()
     if average >= 70:
         Passing(average)
     else:
@@ -41,7 +38,7 @@ pure func grade(scores: List[Int]) -> Score:
 
 -- Pure functions can use local mutation.
 pure func total(scores: List[Int]) -> Int:
-    var sum = 0
+    var sum: Int = 0
     for score in scores:
         sum += score
     sum
@@ -59,8 +56,6 @@ func main(args: List[String]) -> Void:
     scores = [82, 71, 90]
     
     scores
-        -- method-call syntax is available for a function's first argument:
-        -- scores.grade() is the same as grade(scores)
         .grade()
         .describe_score()
         .print()
@@ -84,11 +79,10 @@ pure func larger[T: Orderable](a: T, b: T) -> T:
 
 -- try: expressions keep fallible code linear and still return Option/Result.
 pure func first_two_total(scores: List[Int]) -> Option[Int]:
-    x: Option[Int] = try:
+    try:
         first ?= scores.get(0)
         second ?= scores.get(1)
-        first + second   
-    x
+        first + second
 
 -- concurrent: scopes parallel work and joins it before continuing.
 func compare_totals(left: List[Int], right: List[Int]) -> Result[Int, ConcurrencyError]:
@@ -133,16 +127,16 @@ This provides several advantages:
 - Optimization passes can be more aggressive because pure code has fewer
   observable ordering constraints.
 
-For AI-generated code, purity shrinks the scope of potential defects. Large parts of 
-codebases can be made statically unable to perform I/O, mutate global state, or 
-exfiltrate data. As such, some aspects of debugging and code review can be confined
-to narrow code paths where effects are allowed.
+For AI-generated code, purity turns a broad trust problem into a smaller review
+problem. Large parts of codebases can be made statically unable to do
+I/O, mutate global state, or exfiltrate data. As such, some aspects of debugging 
+and code review can be confined to narrow code paths where effects are allowed.
 
 
 ## Runtime Safety Model
 
 Blorp is designed so ordinary language operations are safe by construction,
-instead of allowing unchecked runtime failures:
+instead of relying on unchecked runtime failures:
 - no null values or unchecked exceptions
 - absence and fallibility are represented with `Option[T]`, `Result[T, E]`, `match`, and `try:` 
 - no shared mutable state
@@ -174,25 +168,15 @@ grid: Float[#2, #2] = {
 cell: Float = grid[1, 0]
 ```
 
-You can still write ordinary loop-shaped code. In `for` position, `indices`
-yields proven-safe indices without materializing an intermediate list:
-
-```blorp
-pure func sum_scores(scores: Int[#3]) -> Int:
-	var total: Int = 0
-	for i in scores.indices():
-		total += scores[i]
-	total
-```
-
 
 ## Performance
 
 Blorp compiles to C, so idiomatic Blorp code is intended to keep predictable
 native performance while preserving stronger safety and tooling guarantees.
 
-The benchmark suite lives under `benchmarks/`. These are the results of a recent run on 
-an M4 Macbook Air with Apple Clang 21, Go 1.26.3 and Python 3.14.4: 
+The benchmark suite lives under `benchmarks/`. Benchmark numbers are
+environment-sensitive and should be treated as a recent local snapshot rather
+than a production guarantee.
 
 | Benchmark | Blorp | C | Go | Python | vs C | vs Go | vs Python |
 |-----------|-------|---|----|--------|------|-------|-----------|
@@ -296,15 +280,6 @@ Useful commands:
 ./blorp test tests/test_blorp/
 ./blorp format file.brp
 ./blorp repl
-```
-
-When running multiple local jobs against the same checkout, use the isolated
-targets so Dune state stays per run:
-
-```bash
-make isolated-build
-make isolated-test SUITES="unit compiler"
-make coverage
 ```
 
 ## Documentation

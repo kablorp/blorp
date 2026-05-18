@@ -61,7 +61,6 @@ let exported_type_name (d : Ast.decl) =
     | Ast.DRecord r when not r.record_is_builtin -> Some r.record_name
     | Ast.DType t when not t.type_is_builtin -> Some t.type_name
     | Ast.DTypeAlias a -> Some a.alias_name
-    | Ast.DNewType n -> Some n.new_type_name
     | _ -> None
   in
   extract d
@@ -137,6 +136,11 @@ let rewrite_main_imported_type_names (program : Ast.program)
   in
   Core.map_types_in_program rewrite_type prog
 
+let should_log_dedup_debug () =
+  match Sys.getenv_opt "BLORP_CORE_DEDUP_DEBUG" with
+  | Some "1" | Some "true" | Some "TRUE" -> true
+  | _ -> false
+
 (** Prefix all function, variable, and module-local type names in a module's Core declarations
     with the sanitized module name, and rewrite intra-module references
     to match. After this, the IR has a flat namespace with globally
@@ -147,8 +151,9 @@ let rewrite_main_imported_type_names (program : Ast.program)
     module). Std primitive/prelude ABI type names stay stable; all other
     std-local type declarations are flattened like user module types to avoid
     same-name layout collisions. *)
-let prefix_module_names (mod_name : string) (decls : Core.core_program) :
-    Core.core_program =
+let prefix_module_names ?(debug = false) (mod_name : string)
+    (decls : Core.core_program) : Core.core_program =
+  let log_dedup_debug = debug && should_log_dedup_debug () in
   let prefix = sanitize_module_name mod_name in
   let defined = Hashtbl.create 32 in
   let local_type_names = Hashtbl.create 16 in
@@ -559,10 +564,20 @@ let prefix_module_names (mod_name : string) (decls : Core.core_program) :
     (fun d ->
       match d.Core.cd_desc with
       | Core.CDFunc f ->
-          if Hashtbl.mem seen f.cf_name then None
+          if Hashtbl.mem seen f.cf_name then begin
+            if log_dedup_debug then
+              Printf.eprintf "[core] dedup: dropping duplicate function %s\n%!"
+                f.cf_name;
+            None
+          end
           else if f.cf_body = None && Hashtbl.mem name_has_body f.cf_name then begin
             (* A bodied variant exists later in the list; drop this
-               forward-decl so the bodied one is kept when we reach it. *)
+             forward-decl so the bodied one is kept when we reach it. *)
+            if log_dedup_debug then
+              Printf.eprintf
+                "[core] dedup: dropping forward-decl %s (bodied variant exists)\n\
+                 %!"
+                f.cf_name;
             None
           end
           else (

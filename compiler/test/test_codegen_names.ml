@@ -54,22 +54,6 @@ let test_sanitize_c_ident_passthrough () =
 let test_sanitize_c_ident_empty () =
   Alcotest.(check string) "empty string" "" (sanitize_c_ident "")
 
-let test_source_name_strips_module_mono_and_pure () =
-  Alcotest.(check string)
-    "module mono pure" "map"
-    (source_name_for_generated_function ~module_path:"std/list"
-       "std_list__map__pure__mono_Int_String")
-
-let test_source_name_leaves_unprefixed_name () =
-  Alcotest.(check string)
-    "unprefixed" "helper"
-    (source_name_for_generated_function ~module_path:"std/list" "helper")
-
-let test_source_name_without_module () =
-  Alcotest.(check string)
-    "no module" "identity"
-    (source_name_for_generated_function "identity__mono_Int")
-
 let suite =
   [
     ( "mangle_by_def_id",
@@ -90,14 +74,5 @@ let suite =
         Alcotest.test_case "valid passthrough" `Quick
           test_sanitize_c_ident_passthrough;
         Alcotest.test_case "empty" `Quick test_sanitize_c_ident_empty;
-      ] );
-    ( "source_name_for_generated_function",
-      [
-        Alcotest.test_case "strips module mono and pure" `Quick
-          test_source_name_strips_module_mono_and_pure;
-        Alcotest.test_case "leaves unprefixed name" `Quick
-          test_source_name_leaves_unprefixed_name;
-        Alcotest.test_case "without module" `Quick
-          test_source_name_without_module;
       ] );
   ]

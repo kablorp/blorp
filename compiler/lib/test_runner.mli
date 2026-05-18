@@ -57,13 +57,10 @@ val run_process_capture_timeout :
 (** Run a program directly with timeout, capturing stdout+stderr.
     Returns exit code 124 on timeout. *)
 
-val with_sanitizer_runtime_env : (unit -> 'a) -> 'a
-(** Run [f] with generated-program ASan defaults that avoid false stack-scope
-    reports from fiber stack switching while preserving heap/bounds checks. *)
-
 val with_run_artifacts : (unit -> 'a) -> 'a
 (** Run [f] with a process-local mutable artifact root.
-    Nested calls reuse the current root. The root is deleted on normal exit. *)
+    Nested calls reuse the current root. The root is deleted on normal exit
+    unless BLORP_KEEP_ARTIFACTS=1 is set. *)
 
 val current_run_artifact_root : unit -> string
 (** Current run artifact root, creating one if needed. Exposed for tests and
@@ -169,14 +166,9 @@ type precompiled = {
 (** Precompiled artifacts for fast compilation *)
 
 val precompile_runtime :
-  ?sanitize:bool ->
-  ?leak_check:bool ->
-  ?opt:string ->
-  unit ->
-  precompiled option
+  ?sanitize:bool -> ?opt:string -> unit -> precompiled option
 (** Precompile runtime.o and header to a persistent content-addressed cache.
     Returns cached artifacts only after verifying their manifest hashes.
-    @param leak_check Compile runtime leak tracking into the cached object.
     @param opt Optimization level string (default "O0", use "O2" for release) *)
 
 val compile_c_from_stdin : string -> string -> string list -> int * string

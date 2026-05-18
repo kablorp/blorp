@@ -2,9 +2,9 @@
 
     Usage:
       blorp compile program.brp          # Compile to C and binary
-      blorp check program.brp            # Type check only
+      blorp compile --no-emit program.brp # Type check only
       blorp compile --ast program.brp    # Show AST only
-      blorp run program.brp arg1 arg2    # Compile and run with arguments
+      blorp run program.brp              # Compile and run
       blorp run --profile program.brp    # Run with profiling
       blorp check src/                   # Type check all .brp files in directory
       blorp test tests/test.brp          # Run a single test
@@ -70,37 +70,26 @@ let decl_to_string d =
       Printf.sprintf "Impl %s for %s" i.Ast.impl_trait
         (type_expr_to_string i.Ast.impl_for_type)
   | Ast.DTypeAlias a -> Printf.sprintf "TypeAlias %s" a.Ast.alias_name
-  | Ast.DNewType n -> Printf.sprintf "NewType %s" n.Ast.new_type_name
 
 let program_to_string prog = String.concat "\n" (List.map decl_to_string prog)
 
-let removed_compile_option flag replacement =
-  Printf.eprintf "Error: '%s' has been removed; use '%s'.\n" flag replacement;
-  exit 1
+(** Resolve timeout: CLI flag overrides env var *)
+let resolve_timeout cli_timeout =
+  match cli_timeout with
+  | Some _ -> cli_timeout
+  | None -> (
+      match Sys.getenv_opt "BLORP_TIMEOUT" with
+      | Some s -> int_of_string_opt s
+      | None -> None)
 
-let write_file_atomic filename contents =
-  let dir = Filename.dirname filename in
-  let base = Filename.basename filename in
-  let mode = try (Unix.stat filename).Unix.st_perm with _ -> 0o644 in
-  let tmp, oc =
-    Filename.open_temp_file ~temp_dir:dir ("." ^ base ^ ".") ".tmp"
-  in
-  let closed = ref false in
-  let close () =
-    if not !closed then begin
-      closed := true;
-      close_out oc
-    end
-  in
-  try
-    output_string oc contents;
-    close ();
-    Unix.chmod tmp mode;
-    Unix.rename tmp filename
-  with exn ->
-    if not !closed then close_out_noerr oc;
-    (try Sys.remove tmp with _ -> ());
-    raise exn
+let resolve_sanitize cli_sanitize =
+  cli_sanitize || Sys.getenv_opt "BLORP_SANITIZE" = Some "1"
+
+let resolve_leak_check cli_leak_check =
+  cli_leak_check || Sys.getenv_opt "BLORP_LEAK_CHECK" = Some "1"
+
+let resolve_no_format cli_no_format =
+  cli_no_format || Sys.getenv_opt "BLORP_NO_FORMAT" = Some "1"
 
 (** Auto-format a .brp file in place before compilation.
     Uses the format cache to skip already-formatted files.
@@ -272,7 +261,9 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
               let doc = Fmt_printer.print_program new_program in
               let formatted = Fmt_layout.layout doc in
 
-              write_file_atomic filename formatted;
+              let oc = open_out filename in
+              output_string oc formatted;
+              close_out oc;
 
               iterate (count + 1)
             end
@@ -282,6 +273,7 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
   iterate 0
 
 type compile_opts = {
+  no_emit : bool;
   ast_only : bool;
       (** Legacy --ast: prints AST and exits (no typecheck, no emit) *)
   dump_ast : bool;  (** --dump-ast: prints AST and continues compiling *)
@@ -296,12 +288,13 @@ type compile_opts = {
   stop_after : Blorp.Core_stage.t option;  (** --stop-after=STAGE *)
   dump_file : string option;  (** --dump-core-file=PATH; stderr if None *)
   time_phases : bool;  (** --time-phases (per-phase timing) *)
-  check_invariants : bool;  (** --check-invariants *)
+  check_invariants : bool;  (** --check-invariants (Phase 2.2) *)
 }
 (** Options for the [compile] subcommand. *)
 
 let default_compile_opts =
   {
+    no_emit = false;
     ast_only = false;
     dump_ast = false;
     dump_typed_ast = false;
@@ -340,7 +333,7 @@ let obs_none =
     cleanup = (fun () -> ());
   }
 
-(** Best-effort short git SHA for dump provenance. Returns
+(** Best-effort short git SHA for dump provenance (Phase 0.5.6). Returns
     the output of [git rev-parse --short HEAD] if the repo is accessible,
     else ["unknown"]. Never raises — provenance is nice-to-have. *)
 let dump_git_sha () =
@@ -355,9 +348,10 @@ let dump_git_sha () =
 (** Build a composite stage callback that may dump, stop, and/or profile.
     Returns [obs_none] if no observability options are active (so the
     pipeline skips the hook overhead entirely). [source_file] is the
-    path compiled, used only for the dump header. The returned [cleanup]
-    must be called on every exit path; callers typically wrap their compile
-    invocation in [Fun.protect ~finally:obs.cleanup]. *)
+    path compiled, used only for the dump header (Phase 0.5.6). The
+    returned [cleanup] must be called on every exit path; callers
+    typically wrap their compile invocation in
+    [Fun.protect ~finally:obs.cleanup]. *)
 let build_on_stage ?source_file opts : obs =
   let profiler =
     if opts.time_phases then Some (Blorp.Core_profile.create ()) else None
@@ -448,61 +442,68 @@ let check_file_with_opts opts filename =
           0
 
 let compile_file_with_opts opts filename =
-  if not opts.no_format then auto_format_user_file filename;
-  if opts.ast_only then
-    begin match parse_file filename with
-    | Error msg ->
-        prerr_endline msg;
-        1
-    | Ok (program, _) ->
-        print_endline (program_to_string program);
-        0
-    end
-  else
-    let source = read_file filename in
-    init_module_paths (extract_directory filename);
-    (* --dump-ast prints the parsed AST before any further work, then
-       continues with the rest of the pipeline. Unlike --ast (which stops
-       after parse), it's non-destructive and composes with --dump-core,
-       --time-phases, etc. *)
-    if opts.dump_ast then
+  if opts.no_emit then check_file_with_opts opts filename
+  else begin
+    if not opts.no_format then auto_format_user_file filename;
+    if opts.ast_only then
       begin match parse_file filename with
-      | Error msg -> prerr_endline msg
-      | Ok (program, _) -> print_endline (program_to_string program)
-      end;
-    let obs = build_on_stage ~source_file:filename opts in
-    let print_profile () =
-      match obs.profiler with
-      | Some p -> prerr_string (Blorp.Core_profile.format p)
-      | None -> ()
-    in
-    Fun.protect ~finally:obs.cleanup (fun () ->
-        let result =
-          match
-            Pipeline.compile ~debug:opts.debug ?on_stage:obs.callback
-              ~check_invariants:opts.check_invariants
-              ~embed_runtime:opts.embed_runtime
-              ?on_frontend_phase:obs.frontend_callback ~filename ~source ()
-          with
-          | Error errors ->
-              prerr_endline (format_pipeline_errors ~file:filename errors);
-              1
-          | Ok (Pipeline.Stopped_at s) ->
-              Printf.eprintf "stopped after %s\n" (Blorp.Core_stage.to_string s);
-              0
-          | Ok (Pipeline.Compiled { typed_program; c_code; _ }) ->
-              if opts.dump_typed_ast then
-                print_endline (Typed_ast_debug.format_program typed_program);
-              let base = Filename.remove_extension filename in
-              let c_file =
-                match opts.output with Some o -> o | None -> base ^ ".c"
-              in
-              write_file_atomic c_file c_code;
-              Printf.printf "Generated %s\n" c_file;
-              0
-        in
-        print_profile ();
-        result)
+      | Error msg ->
+          prerr_endline msg;
+          1
+      | Ok (program, _) ->
+          print_endline (program_to_string program);
+          0
+      end
+    else
+      let source = read_file filename in
+      init_module_paths (extract_directory filename);
+      (* --dump-ast prints the parsed AST before any further work, then
+         continues with the rest of the pipeline. Unlike --ast (which stops
+         after parse), it's non-destructive and composes with --dump-core,
+         --time-phases, etc. *)
+      if opts.dump_ast then
+        begin match parse_file filename with
+        | Error msg -> prerr_endline msg
+        | Ok (program, _) -> print_endline (program_to_string program)
+        end;
+      let obs = build_on_stage ~source_file:filename opts in
+      let print_profile () =
+        match obs.profiler with
+        | Some p -> prerr_string (Blorp.Core_profile.format p)
+        | None -> ()
+      in
+      Fun.protect ~finally:obs.cleanup (fun () ->
+          let result =
+            match
+              Pipeline.compile ~debug:opts.debug ?on_stage:obs.callback
+                ~check_invariants:opts.check_invariants
+                ~embed_runtime:opts.embed_runtime
+                ?on_frontend_phase:obs.frontend_callback ~filename ~source ()
+            with
+            | Error errors ->
+                prerr_endline (format_pipeline_errors ~file:filename errors);
+                1
+            | Ok (Pipeline.Stopped_at s) ->
+                Printf.eprintf "stopped after %s\n"
+                  (Blorp.Core_stage.to_string s);
+                0
+            | Ok (Pipeline.Compiled { typed_program; c_code; _ }) ->
+                if opts.dump_typed_ast then
+                  print_endline (Typed_ast_debug.format_program typed_program);
+                let base = Filename.remove_extension filename in
+                let c_file =
+                  match opts.output with Some o -> o | None -> base ^ ".c"
+                in
+                let oc = open_out c_file in
+                Fun.protect
+                  ~finally:(fun () -> close_out oc)
+                  (fun () -> output_string oc c_code);
+                Printf.printf "Generated %s\n" c_file;
+                0
+          in
+          print_profile ();
+          result)
+  end
 
 (** Compile and run a blorp file *)
 let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
@@ -513,9 +514,7 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
       let source = read_file filename in
       init_module_paths (extract_directory filename);
       let opt = if sanitize then "O0" else "O2" in
-      let precompiled =
-        Test_runner.precompile_runtime ~sanitize ~leak_check ~opt ()
-      in
+      let precompiled = Test_runner.precompile_runtime ~sanitize ~opt () in
       let embed_runtime = precompiled = None in
       match
         Pipeline.compile ~profile ~debug ~embed_runtime ~filename ~source ()
@@ -543,8 +542,6 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
           in
           let cc_args =
             [ "-" ^ opt; "-fwrapv"; "-pipe" ]
-            @ (if leak_check then [ "-DBLORP_RUNTIME_LEAK_CHECK_STRICT=1" ]
-               else [])
             @ (if Lazy.force Test_runner.cc_is_clang && Sys.os_type = "Unix"
                then [ "-Wl,-stack_size,0x1000000" ]
                else [])
@@ -586,12 +583,9 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
             1
           end
           else begin
-            let run_child () =
-              Test_runner.run_process_timeout ~timeout bin_file user_args
-            in
+            if leak_check then Unix.putenv "BLORP_LEAK_CHECK" "strict";
             let result =
-              if sanitize then Test_runner.with_sanitizer_runtime_env run_child
-              else run_child ()
+              Test_runner.run_process_timeout ~timeout bin_file user_args
             in
             if result = 124 then begin
               let secs = match timeout with Some s -> s | None -> 0 in
@@ -631,7 +625,14 @@ let usage () =
   print_endline "";
   print_endline "Environment:";
   print_endline
-    "  BLORP_THREADS=N      Override generated-program worker threads"
+    "  BLORP_STD=<path>      Use std directory (--std-dir overrides; beats \
+     blorp.toml)";
+  print_endline "  BLORP_TIMEOUT=N       Default timeout (CLI flag overrides)";
+  print_endline "  BLORP_SANITIZE=1      Enable sanitizers (CLI flag overrides)";
+  print_endline
+    "  BLORP_LEAK_CHECK=1    Enable leak reporting (CLI flag overrides)";
+  print_endline
+    "  BLORP_NO_FORMAT=1     Skip auto-formatting (CLI flag overrides)"
 
 type repl_cli_action =
   | ReplHelp
@@ -829,9 +830,9 @@ let () =
               parse_check_args rest opts (Some dir) files
           | file :: rest -> parse_check_args rest opts std_dir (file :: files)
         in
-        let opts, std_dir, files =
-          parse_check_args rest default_compile_opts None []
-        in
+        let base_opts = { default_compile_opts with no_emit = true } in
+        let opts, std_dir, files = parse_check_args rest base_opts None [] in
+        let opts = { opts with no_format = resolve_no_format opts.no_format } in
         (match std_dir with
         | Some dir -> Modules.set_std_override dir
         | None -> ());
@@ -918,12 +919,16 @@ let () =
                 "  --std-dir <d>             Use std library from directory";
               print_endline "  -o <file>                 Output C file path";
               exit 0
-          | "--no-emit" :: _ ->
-              removed_compile_option "blorp compile --no-emit"
-                "blorp check <file.brp>"
-          | "--check" :: _ ->
-              removed_compile_option "blorp compile --check"
-                "blorp check <file.brp>"
+          | "--no-emit" :: rest ->
+              prerr_endline
+                "Warning: 'blorp compile --no-emit' is deprecated, use 'blorp \
+                 check <file.brp>'";
+              parse_compile_args rest { opts with no_emit = true } std_dir files
+          | "--check" :: rest ->
+              prerr_endline
+                "Warning: 'blorp compile --check' is deprecated, use 'blorp \
+                 check <file.brp>'";
+              parse_compile_args rest { opts with no_emit = true } std_dir files
           | "--ast" :: rest ->
               parse_compile_args rest
                 { opts with ast_only = true }
@@ -992,9 +997,14 @@ let () =
               parse_compile_args rest
                 { opts with check_invariants = true }
                 std_dir files
-          | "--profile" :: _ ->
-              removed_compile_option "blorp compile --profile"
-                "blorp compile --time-phases <file.brp>"
+          | "--profile" :: rest ->
+              prerr_endline
+                "Warning: --profile on 'compile' is deprecated — use \
+                 --time-phases. ('blorp run --profile' is unchanged and times \
+                 the generated program.)";
+              parse_compile_args rest
+                { opts with time_phases = true }
+                std_dir files
           | "--debug" :: rest ->
               parse_compile_args rest { opts with debug = true } std_dir files
           | "--no-format" :: rest ->
@@ -1005,9 +1015,11 @@ let () =
               parse_compile_args rest
                 { opts with embed_runtime = false }
                 std_dir files
-          | "--core-emit" :: _ ->
-              removed_compile_option "blorp compile --core-emit"
-                "blorp compile <file.brp>"
+          | "--core-emit" :: rest ->
+              prerr_endline
+                "Warning: --core-emit is deprecated (core-emit is the only \
+                 pipeline)";
+              parse_compile_args rest opts std_dir files
           | "--std-dir" :: dir :: rest ->
               parse_compile_args rest opts (Some dir) files
           | "-o" :: o :: rest ->
@@ -1027,6 +1039,7 @@ let () =
           | Some s, [] -> { opts with dump_core_after = [ s ] }
           | _ -> opts
         in
+        let opts = { opts with no_format = resolve_no_format opts.no_format } in
         (match std_dir with
         | Some dir -> Modules.set_std_override dir
         | None -> ());
@@ -1054,11 +1067,7 @@ let () =
                 List.rev files,
                 List.rev user_args )
           | "--help" :: _ | "-h" :: _ ->
-              print_endline "Usage: blorp run [options] <file.brp> [args...]";
-              print_endline "";
-              print_endline
-                "Arguments after <file.brp> are passed to the program. Put \
-                 blorp run options before the file.";
+              print_endline "Usage: blorp run [options] <file.brp> [-- args...]";
               print_endline "";
               print_endline "Options:";
               print_endline "  --profile      Run with profiling";
@@ -1071,17 +1080,6 @@ let () =
               print_endline "  --threads N    Set max thread pool size";
               print_endline "  --std-dir <d>  Use std library from directory";
               exit 0
-          | "--" :: file :: rest when files = [] ->
-              ( profile,
-                debug,
-                sanitize,
-                leak_check,
-                no_format,
-                timeout,
-                threads,
-                std_dir,
-                [ file ],
-                rest )
           | "--" :: rest ->
               ( profile,
                 debug,
@@ -1128,19 +1126,8 @@ let () =
                   prerr_endline "Error: --threads requires an integer";
                   exit 1)
           | file :: rest ->
-              let user_args =
-                match rest with "--" :: args -> args | args -> args
-              in
-              ( profile,
-                debug,
-                sanitize,
-                leak_check,
-                no_format,
-                timeout,
-                threads,
-                std_dir,
-                [ file ],
-                user_args )
+              parse_run_args rest profile debug sanitize leak_check no_format
+                timeout threads std_dir (file :: files) user_args
         in
         let ( profile,
               debug,
@@ -1154,10 +1141,10 @@ let () =
               user_args ) =
           parse_run_args rest false false false false false None None None [] []
         in
-        let timeout = cli_timeout in
-        let sanitize = cli_sanitize in
-        let leak_check = cli_leak_check in
-        let no_format = cli_no_format in
+        let timeout = resolve_timeout cli_timeout in
+        let sanitize = resolve_sanitize cli_sanitize in
+        let leak_check = resolve_leak_check cli_leak_check in
+        let no_format = resolve_no_format cli_no_format in
         (match std_dir with
         | Some dir -> Modules.set_std_override dir
         | None -> ());
@@ -1228,6 +1215,16 @@ let () =
           | "--no-format" :: rest ->
               parse_test_args rest profile debug sanitize leak_check true
                 timeout jobs mode cache std_dir paths
+          | "--batch" :: _ ->
+              prerr_endline
+                "Error: --batch has been removed; blorp test now chooses the \
+                 fast test path automatically.";
+              exit 1
+          | "--warmup-only" :: _ ->
+              (* Pre-warm the precompiled runtime cache, then exit *)
+              Test_runner.with_run_artifacts (fun () ->
+                  ignore (Test_runner.precompile_runtime ()));
+              exit 0
           | "--doc" :: rest ->
               parse_test_args rest profile debug sanitize leak_check no_format
                 timeout jobs Test_runner.DocOnly cache std_dir paths
@@ -1275,13 +1272,13 @@ let () =
             Test_runner.TestAll true None []
         in
         let timeout =
-          match cli_timeout with
+          match resolve_timeout cli_timeout with
           | Some _ as timeout -> timeout
           | None -> Some 30
         in
-        let sanitize = cli_sanitize in
-        let leak_check = cli_leak_check in
-        let no_format = cli_no_format in
+        let sanitize = resolve_sanitize cli_sanitize in
+        let leak_check = resolve_leak_check cli_leak_check in
+        let no_format = resolve_no_format cli_no_format in
         (* Auto-format test files before running *)
         if not no_format then
           List.iter

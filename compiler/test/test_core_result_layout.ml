@@ -65,11 +65,7 @@ let test_managed_and_wide_payloads_use_managed_stack_layout () =
   expect_known "Result[UInt128, Int]" L.StackManaged
     (L.classify meta (result (ty "UInt128" []) (ty "Int" [])));
   expect_known "Result[Vec2, Int]" L.StackManaged
-    (L.classify meta (result (ty "Vec2" []) (ty "Int" [])));
-  expect_known "Result[TcpListener, String]" L.StackManaged
-    (L.classify meta (result (ty "TcpListener" []) (ty "String" [])));
-  expect_known "Result[TcpStream, String]" L.StackManaged
-    (L.classify meta (result (ty "TcpStream" []) (ty "String" [])))
+    (L.classify meta (result (ty "Vec2" []) (ty "Int" [])))
 
 let test_release_free_float_payloads_use_erased_stack_layout () =
   let meta = meta () in

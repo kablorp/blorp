@@ -224,7 +224,6 @@ let decl_label decl =
   | Ast.DTrait t -> "trait " ^ t.trait_name
   | Ast.DImpl i -> "impl " ^ i.impl_trait
   | Ast.DTypeAlias a -> "type_alias " ^ a.alias_name
-  | Ast.DNewType n -> "new_type " ^ n.new_type_name
   | Ast.DPrivate _ | Ast.DFunc _ | Ast.DVar _ -> "decl"
 
 let rec format_decl depth decl =

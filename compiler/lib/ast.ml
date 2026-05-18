@@ -439,14 +439,6 @@ type type_alias_decl = {
 }
 (** Type alias declaration *)
 
-type new_type_decl = {
-  new_type_name : string;
-  new_type_params : type_param_decl list;
-  new_type_target : type_expr;
-}
-(** Nominal newtype declaration. Newtypes are distinct during frontend
-    typechecking and erase to [new_type_target] before Core lowering. *)
-
 (** Top-level declarations *)
 type decl_desc =
   | DFunc of func_decl
@@ -458,27 +450,11 @@ type decl_desc =
   | DTrait of trait_decl
   | DImpl of impl_decl
   | DTypeAlias of type_alias_decl
-  | DNewType of new_type_decl
 
 and decl = { decl_desc : decl_desc; decl_loc : loc; decl_doc : string option }
 
 type program = decl list
 (** A program is a list of declarations *)
-
-(** Collect record, union, and type-alias names declared directly by a module.
-    Public signatures and cross-module checks use this to qualify bare
-    module-local type identities before they leave their declaring module. *)
-let module_local_type_names_from_decls (decls : program) : string list =
-  let rec collect acc decl =
-    match decl.decl_desc with
-    | DPrivate inner -> collect acc inner
-    | DRecord r -> r.record_name :: acc
-    | DType t -> t.type_name :: acc
-    | DTypeAlias a -> a.alias_name :: acc
-    | DNewType n -> n.new_type_name :: acc
-    | _ -> acc
-  in
-  List.fold_left collect [] decls |> List.sort_uniq String.compare
 
 (** Compatibility constructor for transitional typed AST payloads.
 

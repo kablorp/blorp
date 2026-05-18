@@ -1147,18 +1147,6 @@ let lower_foreign_arg_passing func =
   | CDFunc { cf_kind = CFForeign { arg_passing; _ }; _ } -> arg_passing
   | _ -> Alcotest.fail "expected lowered CFForeign"
 
-let lower_foreign_call_effect func =
-  let cd = lower_decl (mk_decl (DFunc func)) in
-  match cd.cd_desc with
-  | CDFunc { cf_kind = CFForeign { call_effect; _ }; _ } -> call_effect
-  | _ -> Alcotest.fail "expected lowered CFForeign"
-
-let is_impure_may_block_thread = function
-  | Blorp.Builtin_metadata.Impure
-      { wait = May_block_thread; cancellation = Not_cancellation_point } ->
-      true
-  | _ -> false
-
 let test_lower_foreign_pure_borrows_args () =
   let func =
     {
@@ -1177,10 +1165,7 @@ let test_lower_foreign_pure_borrows_args () =
   in
   Alcotest.(check bool)
     "pure foreign borrows args" true
-    (lower_foreign_arg_passing func = ForeignBorrowArgs);
-  Alcotest.(check bool)
-    "pure foreign has pure call effect" true
-    (lower_foreign_call_effect func = Blorp.Builtin_metadata.Pure)
+    (lower_foreign_arg_passing func = ForeignBorrowArgs)
 
 let test_lower_foreign_no_copy_borrows_args () =
   let func =
@@ -1198,10 +1183,7 @@ let test_lower_foreign_no_copy_borrows_args () =
   in
   Alcotest.(check bool)
     "no_copy foreign borrows args" true
-    (lower_foreign_arg_passing func = ForeignBorrowArgs);
-  Alcotest.(check bool)
-    "impure no_copy foreign may block thread" true
-    (is_impure_may_block_thread (lower_foreign_call_effect func))
+    (lower_foreign_arg_passing func = ForeignBorrowArgs)
 
 let test_lower_func_with_pattern_param () =
   (* func add_pair((a, b): (Int, Int)) -> Int: a + b *)

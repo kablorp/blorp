@@ -15,10 +15,9 @@
     (COW → new tensor) and must not trigger the "can't assign to
     immutable variable" error. Moving the write rewrite would require
     either a separate builtin name for assignment or a per-call flag
-    — neither is worth the churn without an explicit write-subscript AST
-    representation.
+    — neither was judged worth the churn in Phase 2.3's audit.
 
-    {1 Why this pass exists}
+    {1 Why this pass exists (Phase 2.3)}
 
     Previously this rewrite lived in [infer.ml:1965-2000]. That
     violated Stage 7 of the compiler pipeline: syntactic desugaring
@@ -147,7 +146,7 @@ let rec transform_decl (decl : decl) : decl =
                   trait.trait_methods;
             };
       }
-  | DType _ | DRecord _ | DImport _ | DTypeAlias _ | DNewType _ -> decl
+  | DType _ | DRecord _ | DImport _ | DTypeAlias _ -> decl
 
 (** Transform a full program. Must be called {b after}
     [Interp_parser.transform_program] and {b before} [Typecheck]. *)

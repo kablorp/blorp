@@ -216,6 +216,16 @@ let desugar_string_binop (e : core) : core =
   | _ -> e
 
 (* ============================================================================
+   Try/TryBind desugaring — REMOVED in Phase 2.9 (2026-04-21)
+
+   [ETry] and [ETryBind] are now fully desugared at lower time by
+   [Core_lower.lower_try_body]. Post-lower Core IR never contains [CTry] or
+   [CTryBind] nodes from the normal path. The node constructors stay on
+   [core.desc] for backwards compatibility; defensive emit-time errors in
+   [core_emit] catch any leaks. [splice_continuation] is deleted with the
+   rest of this section. *)
+
+(* ============================================================================
    Expression-level desugaring driver
    ============================================================================ *)
 
@@ -260,6 +270,8 @@ let desugar_program (prog : core_program) : core_program =
   let field_map = build_field_map prog in
   List.map (desugar_decl field_map) prog
 
-(* Mutable-variable SSA-like renaming lives in [core_ssa.ml]. It is kept
-   separate from sugar elimination because it has different invariants,
-   tests, and downstream ownership effects. *)
+(* The mutable-variable SSA-like renaming pass that used to live here
+   moved to [core_ssa.ml] in Phase 5.4. It's structurally independent
+   from sugar elimination — different entry point, different tests,
+   different downstream consumers — so the split clarifies the
+   pass-by-pass story without changing any behavior. *)

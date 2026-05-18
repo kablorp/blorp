@@ -2,7 +2,7 @@
 
     Handles module loading, path resolution, and caching.
 
-    {1 Session threading}
+    {1 Session threading (Phase 2.1)}
 
     All stateful functions take an optional [?sess] argument. When
     omitted, they use the ambient current session ([Session.current ()]).
@@ -60,7 +60,8 @@ val package_roots : ?sess:Session.t -> unit -> string list
 
 val set_std_override : ?sess:Session.t -> string -> unit
 (** Override the embedded std library with a filesystem directory.
-    Used by [--std-dir] CLI flag. Takes priority over [blorp.toml]. *)
+    Used by [--std-dir] CLI flag. Takes priority over [BLORP_STD]
+    and [blorp.toml]. *)
 
 val load_module : ?sess:Session.t -> string -> string -> loaded_module option
 (** Load a module by name, resolving from base directory.
@@ -115,8 +116,9 @@ val extract_directory : string -> string
 val init_module_paths : ?sess:Session.t -> string -> unit
 (** Initialize module search paths for a given base directory.
     Sets up CWD, explicit std overrides, and local [pkg/] package roots.
-    Standard library override precedence is [--std-dir], [blorp.toml], then
-    embedded std; filesystem [std/] directories are not guessed. *)
+    Standard library override precedence is [--std-dir], [BLORP_STD],
+    [blorp.toml], then embedded std; filesystem [std/] directories are not
+    guessed. *)
 
 val std_source_dir : ?sess:Session.t -> unit -> string option
 (** Filesystem std source directory established by {!init_module_paths} or

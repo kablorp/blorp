@@ -32,7 +32,8 @@
        - Record the rewrite [nested.func_name → m] in a substitution
          scope that covers the remainder of the current block.
        - Recursively process [nested.func_body] so nested-inside-nested
-         declarations are hoisted too.
+         also hoists (currently deferred — see [hoist_body]'s early-return
+         when scanning children).
        - Replace the [EFuncDecl] node in place with [EVoid] (no-op; keeps
          block structure so downstream passes don't see a gap).
     2. Rewrite every [EIdent name] in the remainder of the block where
@@ -41,8 +42,12 @@
     3. Emit the collected nested functions as additional top-level
        [DFunc]s alongside the original parent.
 
-    {1 Non-goals}
+    {1 Non-goals (v1)}
 
+    - Nested inside nested. A nested function's body may itself contain
+      [EFuncDecl]s; those are left as-is (and will fail later with
+      "EFuncDecl survived" if hit). Handled in a follow-up by making the
+      hoist pass recursive.
     - Mutual recursion between two nested functions declared in the same
       block. Works if declared in order (later defs see earlier via
       substitution scope), but not if [f1] forward-references [f2]. *)

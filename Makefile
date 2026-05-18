@@ -1,36 +1,26 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build isolated-build isolated-test clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
+.PHONY: all build clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
-DUNE_BUILD_DIR ?= _build
-DUNE_BUILD_FLAG := --build-dir=$(DUNE_BUILD_DIR)
-DUNE_BUILD_ROOT := $(if $(filter /%,$(DUNE_BUILD_DIR)),$(DUNE_BUILD_DIR),compiler/$(DUNE_BUILD_DIR))
-BLORP_BUILD_EXE := $(DUNE_BUILD_ROOT)/default/bin/blorp.exe
-COVERAGE_ROOT ?= $(CURDIR)/compiler/_coverage
 
 # Default target: build and install blorp to project root
 # Only copy if binary actually changed (preserves mtime for test cache)
 all: build
-	@if ! cmp -s "$(BLORP_BUILD_EXE)" ./blorp 2>/dev/null; then \
-		tmp=$$(mktemp "./.blorp.XXXXXX") || exit 1; \
-		rm -f "$$tmp"; \
-		cp "$(BLORP_BUILD_EXE)" "$$tmp"; \
-		chmod +x "$$tmp"; \
-		codesign -s - "$$tmp" 2>/dev/null || true; \
-		mv -f "$$tmp" ./blorp; \
+	@if ! cmp -s compiler/_build/default/bin/blorp.exe ./blorp 2>/dev/null; then \
+		rm -f ./blorp; \
+		cp compiler/_build/default/bin/blorp.exe ./blorp; \
+		codesign -s - ./blorp 2>/dev/null || true; \
 	fi
 
 # Generate embedded std library from std/**/*.brp
 compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
-	@tmp=$$(mktemp "$@.XXXXXX") || exit 1; \
-	trap 'rm -f "$$tmp"' EXIT; \
-	ocaml compiler/tools/gen_embed_std.ml std > "$$tmp" && mv "$$tmp" "$@"
+	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp && mv $@.tmp $@
 
 # Build the OCaml compiler
 build: compiler/lib/embedded_std.ml
-	cd compiler && dune build $(DUNE_BUILD_FLAG)
+	cd compiler && dune build
 
 # Run all runtime tests (language features + standard library)
 test: all
@@ -40,24 +30,12 @@ test: all
 smoke: all
 	scripts/run_tests.sh unit compiler
 
-# Compile in a disposable Dune build directory without publishing ./blorp.
-isolated-build:
-	@mkdir -p "$(CURDIR)/compiler/_build"; \
-	tmp=$$(mktemp -d "$(CURDIR)/compiler/_build/isolated.XXXXXX") || exit 1; \
-	trap 'rm -rf "$$tmp"' EXIT; \
-	$(MAKE) DUNE_BUILD_DIR="$$tmp" build
-
-# Run suites with scripts/run_tests.sh's per-run Dune build directory.
-# Pass SUITES="unit compiler" to narrow the default full run.
-isolated-test:
-	scripts/run_tests.sh $(SUITES)
-
 # Run OCaml unit tests
 unit-test:
-	cd compiler && dune runtest $(DUNE_BUILD_FLAG)
+	cd compiler && dune runtest
 
 ocaml-check:
-	cd compiler && dune build @check $(DUNE_BUILD_FLAG)
+	cd compiler && dune build @check
 
 quality:
 	$(MAKE) ocaml-check
@@ -96,20 +74,17 @@ fmt-check:
 		echo "ocamlformat is required for fmt-check. Install it with opam for the project's OCaml switch before enabling dune fmt in CI."; \
 		exit 127; \
 	}
-	cd compiler && dune fmt $(DUNE_BUILD_FLAG) --preview --display=quiet
+	cd compiler && dune fmt --preview --display=quiet
 
 # Run unit tests with coverage report
 coverage:
-	@set -e; \
-	mkdir -p "$(COVERAGE_ROOT)"; \
-	coverage_dir=$$(mktemp -d "$(COVERAGE_ROOT)/run.XXXXXX") || exit 1; \
-	report_dir="$$coverage_dir/html"; \
-	mkdir -p "$$report_dir"; \
-	cd compiler && dune build $(DUNE_BUILD_FLAG) --instrument-with bisect_ppx --force test/run_tests.exe; \
-	cd compiler && BISECT_FILE="$$coverage_dir/bisect" "$(DUNE_BUILD_DIR)/default/test/run_tests.exe"; \
-	cd compiler && bisect-ppx-report summary --coverage-path "$$coverage_dir"; \
-	cd compiler && bisect-ppx-report html -o "$$report_dir" --coverage-path "$$coverage_dir"; \
-	echo "Coverage report: $$report_dir/index.html"
+	rm -rf compiler/_coverage
+	mkdir -p compiler/_coverage
+	cd compiler && dune build --instrument-with bisect_ppx --force test/run_tests.exe
+	cd compiler && BISECT_FILE=$(CURDIR)/compiler/_coverage/bisect ./_build/default/test/run_tests.exe
+	cd compiler && bisect-ppx-report summary --coverage-path $(CURDIR)/compiler/_coverage
+	cd compiler && bisect-ppx-report html --coverage-path $(CURDIR)/compiler/_coverage
+	@echo "Coverage report: compiler/_coverage/index.html"
 
 c-static-analysis:
 	@command -v clang >/dev/null 2>&1 || { \
@@ -139,5 +114,5 @@ docker-shell:
 
 # Clean build artifacts
 clean:
-	cd compiler && dune clean $(DUNE_BUILD_FLAG)
+	cd compiler && dune clean
 	rm -f ./blorp compiler/lib/embedded_std.ml

@@ -133,19 +133,6 @@ let test_formatter_keeps_consecutive_block_comments_together () =
   in
   check_string "formatted source" expected (format_ok source)
 
-let test_formatter_preserves_method_chain_comments () =
-  let source =
-    "func id_scores(scores: List[Int]) -> List[Int]:\n" ^ "\tscores\n\n\n"
-    ^ "func main(args: List[String]) -> Int:\n"
-    ^ "\tscores: List[Int] = [1, 2, 3]\n" ^ "\tscores\n"
-    ^ "\t\t-- method-call syntax is available for a function's first argument:\n"
-    ^ "\t\t-- scores.id_scores is the same as id_scores(scores)\n"
-    ^ "\t\t.id_scores()\n"
-    ^ "\t\t-- comments between chained calls stay with the next call\n"
-    ^ "\t\t.length()\n"
-  in
-  check_string "formatted source" source (format_ok source)
-
 let test_foreign_function_forms_preserve_flags () =
   let source =
     "foreign(include: \"math.h\", link_macos: \"-lm\"):\n"
@@ -232,8 +219,6 @@ let suite =
           test_formatter_preserves_single_block_blank_line;
         Alcotest.test_case "consecutive block comments stay grouped" `Quick
           test_formatter_keeps_consecutive_block_comments_together;
-        Alcotest.test_case "method chain comments stay in place" `Quick
-          test_formatter_preserves_method_chain_comments;
       ] );
     ( "foreign",
       [

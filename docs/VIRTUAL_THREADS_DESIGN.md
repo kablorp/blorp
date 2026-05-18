@@ -230,8 +230,9 @@ order:
    Add fiber object and stack pooling. Preserve one-live-owner stack semantics
    and add sanitizer/debug poisoning for reused stacks.
 
-   Initial implementation: dead fiber handles and dead guarded coroutine/stack
-   regions are cached behind fixed runtime limits. The cache owns only dead
+   Initial implementation: dead fiber handles are cached behind
+   `BLORP_FIBER_OBJECT_CACHE_COUNT`, and dead guarded coroutine/stack regions
+   are cached behind `BLORP_FIBER_STACK_CACHE_BYTES`. The cache owns only dead
    fibers/stacks; a live fiber still has exclusive stack ownership.
 
    Hardening target: replace lifecycle-relevant coupled fields such as

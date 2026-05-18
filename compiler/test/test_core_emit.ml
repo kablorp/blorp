@@ -3354,8 +3354,6 @@ let test_emit_foreign_func_skipped () =
             includes = [];
             link_flags = [];
             arg_passing = ForeignDefaultArgs [];
-            call_effect =
-              Blorp.Builtin_metadata.default_foreign_call_effect ~is_pure:false;
           };
       cf_def_id = 0;
     }

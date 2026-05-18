@@ -26,9 +26,42 @@ type target = {
   body : core;
 }
 
+let starts_with s prefix =
+  let slen = String.length s in
+  let plen = String.length prefix in
+  slen >= plen && String.sub s 0 plen = prefix
+
+let ends_with s suffix =
+  let slen = String.length s in
+  let suffix_len = String.length suffix in
+  slen >= suffix_len && String.sub s (slen - suffix_len) suffix_len = suffix
+
+let strip_mono_suffix name =
+  let marker = "__mono_" in
+  let marker_len = String.length marker in
+  let rec find i =
+    if i + marker_len > String.length name then name
+    else if String.sub name i marker_len = marker then String.sub name 0 i
+    else find (i + 1)
+  in
+  find 0
+
 let source_name (f : core_func) =
-  Codegen_names.source_name_for_generated_function ?module_path:f.cf_module
-    f.cf_name
+  let name = strip_mono_suffix f.cf_name in
+  let name =
+    match f.cf_module with
+    | None -> name
+    | Some module_path ->
+        let prefix = Codegen_names.sanitize_module_name module_path ^ "__" in
+        if starts_with name prefix then
+          String.sub name (String.length prefix)
+            (String.length name - String.length prefix)
+        else name
+  in
+  let pure_suffix = "__pure" in
+  if ends_with name pure_suffix then
+    String.sub name 0 (String.length name - String.length pure_suffix)
+  else name
 
 let readonly_arg_bindings params =
   List.map (fun _ -> Borrow_existing_var) params
@@ -55,8 +88,7 @@ let std_tensor_arg_bindings source_name params =
 
 let compiler_owned_module = function
   | Some module_path ->
-      Codegen_names.starts_with module_path "std/"
-      || Codegen_names.starts_with module_path "pkg/"
+      starts_with module_path "std/" || starts_with module_path "pkg/"
   | None -> false
 
 let collect_targets (prog : core_program) : (int, target) Hashtbl.t =
