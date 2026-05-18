@@ -985,6 +985,8 @@ let test_public_abi_types_have_std_anchors () =
       "Stream";
       "String";
       "StringSlice";
+      "TcpListener";
+      "TcpStream";
       "UInt8";
       "UInt16";
       "UInt32";

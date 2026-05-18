@@ -49,6 +49,10 @@ let test_builtin_layout_is_single_source_of_truth () =
   in
   check_builtin "String"
     { ownership = Managed; retain = ArcRetain; release = ArcRelease };
+  check_builtin "TcpStream"
+    { ownership = Managed; retain = ArcRetain; release = ArcRelease };
+  check_builtin "TcpListener"
+    { ownership = Managed; retain = ArcRetain; release = ArcRelease };
   check_builtin "Ptr"
     {
       ownership = Unmanaged;
@@ -68,7 +72,11 @@ let test_builtin_managed_type_has_arc_release () =
     }
   in
   expect_known_layout "String layout" expected
-    (Blorp.Core_type_layout.classify (meta ()) (ty "String" []))
+    (Blorp.Core_type_layout.classify (meta ()) (ty "String" []));
+  expect_known_layout "TcpStream layout" expected
+    (Blorp.Core_type_layout.classify (meta ()) (ty "TcpStream" []));
+  expect_known_layout "TcpListener layout" expected
+    (Blorp.Core_type_layout.classify (meta ()) (ty "TcpListener" []))
 
 let test_builtin_unmanaged_type_needs_no_release () =
   let expected =

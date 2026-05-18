@@ -1059,6 +1059,11 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
             | Some td -> Typed_ast.program_ast td
             | None -> m.decls
           in
+          let local_type_names = module_local_type_names_from_decls decls in
+          let qualify ty =
+            Types.qualify_module_local_types ~module_path:m.name
+              local_type_names ty
+          in
           let try_impl d =
             match d.decl_desc with
             | DPrivate _ -> None (* private impls don't export *)
@@ -1070,7 +1075,9 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
                     signatures carry type vars that need fresh metas per
                     call site, which this simple lookup can't provide
                     correctly. *)
-                match Codegen_types.type_name_for_impl impl.impl_for_type with
+                match
+                  Codegen_types.type_name_for_impl (qualify impl.impl_for_type)
+                with
                 | Some impl_type_name when impl_type_name = arg_type_name ->
                     (* Find the named method on this impl. *)
                     List.find_map
@@ -1093,6 +1100,7 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
                                 return;
                                 is_pure = f.func_is_pure;
                               }
+                            |> qualify
                           in
                           let mangled =
                             Printf.sprintf "%s_%s_%s" impl.impl_trait

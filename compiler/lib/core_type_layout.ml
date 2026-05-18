@@ -70,7 +70,7 @@ let builtin_layout = function
   | "String" | "Bytes" | "Fixed" | "StringSlice" | "MemStats" | "SchedulerStats"
   | "List" | "ParallelList" | "Dict" | "Set" | "Tensor" | "Vector" | "Matrix"
   | "Builder" | "Slice" | "Option" | "Result" | "Task" | "Channel" | "Stream"
-  | "ConcurrencyError" ->
+  | "TcpListener" | "TcpStream" | "ConcurrencyError" ->
       Some managed_layout
   | "Int" | "Bool" | "Char" | "Float" | "Float32" | "Float16" | "Int128"
   | "UInt128" | "Void" | "Ptr" | "Module" ->

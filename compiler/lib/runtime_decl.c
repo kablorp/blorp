@@ -213,6 +213,10 @@ typedef struct {
     long run_queue_pops;
     long timer_inserts;
     long timer_expirations;
+    long reactor_control_wakes;
+    long reactor_poll_wakes;
+    long reactor_ready_events;
+    long reactor_waiter_wakes;
     long stack_allocations;
     long stack_reuses;
     long work_steals;
@@ -222,6 +226,9 @@ typedef struct {
     long runnable_count;
     long timers_pending;
 } blorp_SchedulerStats;
+
+typedef struct blorp_TcpListener blorp_TcpListener;
+typedef struct blorp_TcpStream blorp_TcpStream;
 
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_Vector;
 #define BLORP_VECTOR_STORAGE_POINTER 0
@@ -1235,13 +1242,24 @@ blorp_String* blorp_base64_decode_nullable(const blorp_String* s);
 
 // TCP Networking
 blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog);
-blorp_Result* blorp_tcp_accept(long server_fd);
+blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener);
 blorp_Result* blorp_tcp_connect(blorp_String* host, long port);
-blorp_Result* blorp_tcp_read(long fd, long max_bytes);
-blorp_Result* blorp_tcp_write(long fd, blorp_Bytes* data);
-void blorp_tcp_close(long fd);
-blorp_Result* blorp_tcp_set_reuse_addr(long fd);
-blorp_Result* blorp_tcp_set_timeout(long fd, long ms);
+blorp_Result* blorp_tcp_read(blorp_TcpStream* stream, long max_bytes);
+blorp_Result* blorp_tcp_write(blorp_TcpStream* stream, blorp_Bytes* data);
+void blorp_tcp_close_listener(blorp_TcpListener* listener);
+void blorp_tcp_close_stream(blorp_TcpStream* stream);
+blorp_Result* blorp_tcp_set_reuse_addr(blorp_TcpListener* listener);
+blorp_Result* blorp_tcp_local_port_listener(blorp_TcpListener* listener);
+blorp_Result* blorp_tcp_local_port_stream(blorp_TcpStream* stream);
+blorp_Result* blorp_tcp_set_timeout_listener(blorp_TcpListener* listener, long ms);
+blorp_Result* blorp_tcp_set_timeout_stream(blorp_TcpStream* stream, long ms);
+blorp_TcpListener* blorp_tcp_listener_from_fd(long fd);
+blorp_TcpStream* blorp_tcp_stream_from_fd(long fd);
+long blorp_tcp_listener_fd(blorp_TcpListener* listener);
+long blorp_tcp_stream_fd(blorp_TcpStream* stream);
+int blorp_io_reactor_start(void);
+void blorp_io_reactor_shutdown(void);
+int blorp_io_reactor_smoke_test(void);
 
 // Dict
 blorp_Dict* blorp_dict_new(void);

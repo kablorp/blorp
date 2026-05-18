@@ -649,6 +649,25 @@ let builtin_contract_table =
       builtins
         [ "blorp_print"; "blorp_puts"; "blorp_println"; "blorp_eprintln" ]
         (bfixed [ Borrow ] ReturnVoid);
+      builtins [ "blorp_tcp_listen" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_accept" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_connect" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_read" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_write" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_tcp_close_listener"; "blorp_tcp_close_stream" ]
+        (bfixed [ Borrow ] ReturnVoid);
+      builtins
+        [
+          "blorp_tcp_set_reuse_addr";
+          "blorp_tcp_local_port_listener";
+          "blorp_tcp_local_port_stream";
+        ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_tcp_set_timeout_listener"; "blorp_tcp_set_timeout_stream" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_string_concat" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
         [ "blorp_string_concat_consume" ]

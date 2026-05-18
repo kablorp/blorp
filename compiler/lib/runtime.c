@@ -25,9 +25,18 @@
 #include <signal.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <poll.h>
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
+
+#if defined(MSG_NOSIGNAL)
+#define BLORP_TCP_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define BLORP_TCP_SEND_FLAGS 0
+#endif
+
+#define BLORP_TCP_MAX_READ_BYTES (64L * 1024L * 1024L)
 
 // ============================================================================
 // SIMD Platform Detection and Abstractions
@@ -287,6 +296,10 @@ typedef struct {
     long run_queue_pops;
     long timer_inserts;
     long timer_expirations;
+    long reactor_control_wakes;
+    long reactor_poll_wakes;
+    long reactor_ready_events;
+    long reactor_waiter_wakes;
     long stack_allocations;
     long stack_reuses;
     long work_steals;
@@ -296,6 +309,173 @@ typedef struct {
     long runnable_count;
     long timers_pending;
 } blorp_SchedulerStats;
+
+typedef enum {
+    BLORP_TCP_HANDLE_LISTENER = 1,
+    BLORP_TCP_HANDLE_STREAM = 2
+} blorp_TcpHandleKind;
+
+typedef enum {
+    BLORP_TCP_STATE_OPEN = 1,
+    BLORP_TCP_STATE_CLOSING = 2,
+    BLORP_TCP_STATE_CLOSED = 3
+} blorp_TcpState;
+
+typedef enum {
+    BLORP_IO_WAIT_NONE = 0,
+    BLORP_IO_WAIT_ACCEPT = 1,
+    BLORP_IO_WAIT_CONNECT = 2,
+    BLORP_IO_WAIT_READ = 3,
+    BLORP_IO_WAIT_WRITE = 4
+} blorp_IoWaitKind;
+
+typedef enum {
+    BLORP_IO_WAKE_NONE = 0,
+    BLORP_IO_WAKE_READY = 1,
+    BLORP_IO_WAKE_TIMEOUT = 2,
+    BLORP_IO_WAKE_CANCELLED = 3,
+    BLORP_IO_WAKE_CLOSED = 4
+} blorp_IoWakeReason;
+
+typedef struct blorp_IoWaiter {
+    _Atomic long refcount;
+    blorp_IoWaitKind kind;
+    blorp_IoWakeReason wake_reason;
+    struct blorp_Fiber* fiber;
+    uint64_t generation;
+    uint64_t deadline_ns;
+    long deadline_index;
+    bool cancelled;
+    bool installed;
+    bool deadline_queued;
+    struct blorp_TcpInner* owner;
+    struct blorp_TcpInner* deadline_owner;
+    struct blorp_IoWaiter* next;
+} blorp_IoWaiter;
+
+typedef struct {
+    blorp_IoWaiter* head;
+    blorp_IoWaiter* tail;
+} blorp_IoWaiterList;
+
+typedef struct {
+    blorp_IoWaiter** items;
+    size_t len;
+    size_t cap;
+    pthread_mutex_t lock;
+} blorp_IoDeadlineQueue;
+
+typedef struct {
+    blorp_IoWaiter* waiter;
+    struct blorp_TcpInner* owner;
+} blorp_IoDeadlineEntry;
+
+typedef struct blorp_TcpInner {
+    _Atomic long refcount;
+    int fd;
+    uint64_t generation;
+    blorp_TcpHandleKind kind;
+    blorp_TcpState state;
+    long default_timeout_ms;
+    pthread_mutex_t mutex;
+    blorp_IoWaiter* accept_waiter;
+    blorp_IoWaiter* connect_waiter;
+    blorp_IoWaiter* read_waiter;
+    blorp_IoWaiter* write_waiter;
+    bool write_active;
+} blorp_TcpInner;
+
+struct blorp_TcpListener {
+    blorp_Object header;
+    blorp_TcpInner* inner;
+};
+typedef struct blorp_TcpListener blorp_TcpListener;
+
+struct blorp_TcpStream {
+    blorp_Object header;
+    blorp_TcpInner* inner;
+};
+typedef struct blorp_TcpStream blorp_TcpStream;
+
+static _Atomic uint64_t blorp_tcp_next_generation = 1;
+static void blorp_tcp_suppress_sigpipe(int fd);
+static int blorp_io_reactor_set_nonblocking(int fd);
+static int blorp_runtime_set_cloexec(int fd);
+static int blorp_runtime_socket_cloexec(int domain, int type, int protocol);
+static int blorp_runtime_accept_cloexec(
+    int fd,
+    struct sockaddr* addr,
+    socklen_t* addr_len
+);
+static int blorp_runtime_pipe_cloexec_nonblock(int fds[2]);
+
+typedef enum {
+    BLORP_IO_BACKEND_KQUEUE = 1,
+    BLORP_IO_BACKEND_EPOLL = 2,
+    BLORP_IO_BACKEND_POLL = 3
+} blorp_IoBackendKind;
+
+typedef enum {
+    BLORP_IO_INTEREST_READ = 1,
+    BLORP_IO_INTEREST_WRITE = 2
+} blorp_IoInterest;
+
+typedef struct blorp_IoRegistration {
+    int fd;
+    uint64_t generation;
+    int interests;
+    int ready_events;
+    blorp_TcpInner* inner;
+    struct blorp_IoRegistration* next;
+} blorp_IoRegistration;
+
+typedef struct blorp_IoReactor {
+    pthread_mutex_t mutex;
+    pthread_cond_t ready_cond;
+    pthread_t thread;
+    _Atomic bool started;
+    bool thread_started;
+    bool shutdown;
+    int control_read_fd;
+    int control_write_fd;
+    blorp_IoBackendKind backend;
+    blorp_IoRegistration* registrations;
+} blorp_IoReactor;
+
+typedef struct {
+    int fd;
+    uint64_t generation;
+    int interests;
+} blorp_IoRegistrationSnapshot;
+
+static blorp_IoReactor __blorp_io_reactor = {
+    .started = false,
+    .thread_started = false,
+    .shutdown = false,
+    .control_read_fd = -1,
+    .control_write_fd = -1,
+    .backend = BLORP_IO_BACKEND_POLL,
+    .registrations = NULL
+};
+static pthread_once_t __blorp_io_reactor_once = PTHREAD_ONCE_INIT;
+static int __blorp_io_reactor_init_error = 0;
+
+static bool blorp_io_reactor_is_started(void) {
+    return atomic_load_explicit(
+        &__blorp_io_reactor.started, memory_order_acquire);
+}
+
+static void blorp_io_reactor_set_started(bool started) {
+    atomic_store_explicit(
+        &__blorp_io_reactor.started, started, memory_order_release);
+}
+
+static blorp_IoDeadlineQueue __blorp_io_deadline_queue = {
+    .items = NULL,
+    .len = 0,
+    .cap = 0,
+};
+static pthread_once_t __blorp_io_deadline_queue_once = PTHREAD_ONCE_INIT;
 
 // Thread-safe global counters (atomic for concurrent alloc/release).
 // Note: ++/-- on _Atomic long is atomic per C11 (equivalent to atomic_fetch_add/sub).
@@ -319,6 +499,10 @@ static struct {
     _Atomic long run_queue_pops;
     _Atomic long timer_inserts;
     _Atomic long timer_expirations;
+    _Atomic long reactor_control_wakes;
+    _Atomic long reactor_poll_wakes;
+    _Atomic long reactor_ready_events;
+    _Atomic long reactor_waiter_wakes;
     _Atomic long stack_allocations;
     _Atomic long stack_reuses;
     _Atomic long work_steals;
@@ -2000,6 +2184,1217 @@ void blorp_set_type_tag(void* obj, const char* tag) {
 // Macro for tagging after allocation — less invasive than changing every call site.
 // Usage: BLORP_TAG(ptr, "String")
 #define BLORP_TAG(ptr, tag) blorp_set_type_tag((void*)(ptr), (tag))
+
+static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters);
+static void blorp_io_deadline_queue_insert(
+    blorp_IoWaiter* waiter,
+    blorp_TcpInner* owner
+);
+static void blorp_io_deadline_queue_remove(blorp_IoWaiter* waiter);
+static long blorp_io_deadline_queue_count(void);
+static uint64_t blorp_io_deadline_queue_drain(void);
+static void blorp_io_deadline_queue_clear(void);
+static int blorp_io_reactor_unregister_inner(int fd, uint64_t generation);
+static inline int __blorp_is_cancelled(void);
+static int __blorp_cancel_current_task_if_requested(void);
+static int blorp_io_reactor_wait_ready(
+    int fd,
+    uint64_t generation,
+    int interest,
+    long timeout_ms
+);
+static int blorp_io_reactor_take_ready(
+    int fd,
+    uint64_t generation,
+    int interests
+);
+
+typedef void (*blorp_CancelCleanupFn)(void*);
+
+typedef struct blorp_CancelCleanupFrame {
+    struct blorp_CancelCleanupFrame* prev;
+    const void* slot;
+    void* value;
+    blorp_CancelCleanupFn release_value;
+    bool active;
+} blorp_CancelCleanupFrame;
+
+void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
+                                    const void* slot, void* value,
+                                    blorp_CancelCleanupFn release_value);
+void __blorp_task_cleanup_pop_slot_slow(const void* slot);
+
+static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
+    blorp_TcpInner* inner,
+    blorp_IoWaitKind kind,
+    int fd,
+    uint64_t generation,
+    int interest,
+    long timeout_ms
+);
+
+static void blorp_io_waiter_init(
+    blorp_IoWaiter* waiter,
+    blorp_IoWaitKind kind,
+    struct blorp_Fiber* fiber,
+    uint64_t generation,
+    uint64_t deadline_ns
+) {
+    if (!waiter) return;
+    atomic_init(&waiter->refcount, 1);
+    waiter->kind = kind;
+    waiter->wake_reason = BLORP_IO_WAKE_NONE;
+    waiter->fiber = fiber;
+    waiter->generation = generation;
+    waiter->deadline_ns = deadline_ns;
+    waiter->deadline_index = -1;
+    waiter->cancelled = false;
+    waiter->installed = false;
+    waiter->deadline_queued = false;
+    waiter->owner = NULL;
+    waiter->deadline_owner = NULL;
+    waiter->next = NULL;
+}
+
+static blorp_IoWaiter* blorp_io_waiter_new(
+    blorp_IoWaitKind kind,
+    struct blorp_Fiber* fiber,
+    uint64_t generation,
+    uint64_t deadline_ns
+) {
+    blorp_IoWaiter* waiter =
+        (blorp_IoWaiter*)blorp_malloc_checked(sizeof(blorp_IoWaiter));
+    blorp_io_waiter_init(waiter, kind, fiber, generation, deadline_ns);
+    return waiter;
+}
+
+static void blorp_io_waiter_retain(blorp_IoWaiter* waiter) {
+    if (!waiter) return;
+    atomic_fetch_add_explicit(&waiter->refcount, 1, memory_order_relaxed);
+}
+
+static void blorp_io_waiter_release(blorp_IoWaiter* waiter) {
+    if (!waiter) return;
+    long old_refcount =
+        atomic_fetch_sub_explicit(&waiter->refcount, 1, memory_order_acq_rel);
+    if (old_refcount > 1) return;
+    if (waiter->installed || waiter->deadline_queued || waiter->deadline_owner) {
+        fprintf(stderr, "blorp: IO waiter released while still owned (bug)\n");
+        abort();
+    }
+    free(waiter);
+}
+
+static blorp_IoWaiterList blorp_io_waiter_list_empty(void) {
+    return (blorp_IoWaiterList){ .head = NULL, .tail = NULL };
+}
+
+static void blorp_io_waiter_list_push(
+    blorp_IoWaiterList* list,
+    blorp_IoWaiter* waiter
+) {
+    if (!list || !waiter) return;
+    waiter->next = NULL;
+    if (list->tail) {
+        list->tail->next = waiter;
+    } else {
+        list->head = waiter;
+    }
+    list->tail = waiter;
+}
+
+static void blorp_io_waiter_list_append(
+    blorp_IoWaiterList* list,
+    blorp_IoWaiterList* extra
+) {
+    if (!list || !extra || !extra->head) return;
+    if (list->tail) {
+        list->tail->next = extra->head;
+    } else {
+        list->head = extra->head;
+    }
+    list->tail = extra->tail;
+    extra->head = NULL;
+    extra->tail = NULL;
+}
+
+static long blorp_io_waiter_list_count(const blorp_IoWaiterList* list) {
+    long count = 0;
+    if (!list) return 0;
+    for (blorp_IoWaiter* waiter = list->head; waiter; waiter = waiter->next) {
+        count++;
+    }
+    return count;
+}
+
+static blorp_IoWaiter** blorp_tcp_inner_waiter_slot(
+    blorp_TcpInner* inner,
+    blorp_IoWaitKind kind
+) {
+    if (!inner) return NULL;
+    switch (kind) {
+        case BLORP_IO_WAIT_ACCEPT:
+            return inner->kind == BLORP_TCP_HANDLE_LISTENER ? &inner->accept_waiter
+                                                            : NULL;
+        case BLORP_IO_WAIT_CONNECT:
+            return inner->kind == BLORP_TCP_HANDLE_STREAM ? &inner->connect_waiter
+                                                          : NULL;
+        case BLORP_IO_WAIT_READ:
+            return inner->kind == BLORP_TCP_HANDLE_STREAM ? &inner->read_waiter
+                                                          : NULL;
+        case BLORP_IO_WAIT_WRITE:
+            return inner->kind == BLORP_TCP_HANDLE_STREAM ? &inner->write_waiter
+                                                          : NULL;
+        case BLORP_IO_WAIT_NONE:
+        default:
+            return NULL;
+    }
+}
+
+static int blorp_tcp_inner_install_waiter(
+    blorp_TcpInner* inner,
+    blorp_IoWaiter* waiter
+) {
+    if (!inner || !waiter || waiter->installed ||
+        waiter->wake_reason != BLORP_IO_WAKE_NONE) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&inner->mutex);
+    blorp_IoWaiter** slot = blorp_tcp_inner_waiter_slot(inner, waiter->kind);
+    if (!slot || *slot || inner->state != BLORP_TCP_STATE_OPEN || inner->fd < 0 ||
+        waiter->generation != inner->generation) {
+        pthread_mutex_unlock(&inner->mutex);
+        return -1;
+    }
+    *slot = waiter;
+    waiter->installed = true;
+    waiter->owner = inner;
+    waiter->next = NULL;
+    pthread_mutex_unlock(&inner->mutex);
+    return 0;
+}
+
+static int blorp_tcp_inner_remove_waiter(
+    blorp_TcpInner* inner,
+    blorp_IoWaiter* waiter
+) {
+    if (!inner || !waiter) return 0;
+    pthread_mutex_lock(&inner->mutex);
+    blorp_IoWaiter** slot = blorp_tcp_inner_waiter_slot(inner, waiter->kind);
+    if (!slot || *slot != waiter) {
+        pthread_mutex_unlock(&inner->mutex);
+        return 0;
+    }
+    *slot = NULL;
+    waiter->installed = false;
+    waiter->owner = NULL;
+    waiter->next = NULL;
+    pthread_mutex_unlock(&inner->mutex);
+    blorp_io_deadline_queue_remove(waiter);
+    return 1;
+}
+
+static void blorp_tcp_inner_extract_waiter_slot_locked(
+    blorp_IoWaiter** slot,
+    blorp_IoWakeReason reason,
+    blorp_IoWaiterList* waiters
+);
+
+static blorp_IoWaiterList blorp_tcp_inner_extract_waiter(
+    blorp_TcpInner* inner,
+    blorp_IoWaitKind kind,
+    uint64_t generation,
+    blorp_IoWakeReason reason
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (!inner || reason == BLORP_IO_WAKE_NONE) return waiters;
+    pthread_mutex_lock(&inner->mutex);
+    blorp_IoWaiter** slot = blorp_tcp_inner_waiter_slot(inner, kind);
+    if (slot && *slot && inner->generation == generation &&
+        (*slot)->generation == generation) {
+        blorp_tcp_inner_extract_waiter_slot_locked(slot, reason, &waiters);
+    }
+    pthread_mutex_unlock(&inner->mutex);
+    return waiters;
+}
+
+static int blorp_tcp_inner_cancel_waiter(
+    blorp_TcpInner* inner,
+    blorp_IoWaiter* waiter
+) {
+    if (!inner || !waiter) return 0;
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    pthread_mutex_lock(&inner->mutex);
+    blorp_IoWaiter** slot = blorp_tcp_inner_waiter_slot(inner, waiter->kind);
+    if (slot && *slot == waiter) {
+        blorp_tcp_inner_extract_waiter_slot_locked(
+            slot, BLORP_IO_WAKE_CANCELLED, &waiters);
+    }
+    pthread_mutex_unlock(&inner->mutex);
+    int cancelled = waiters.head != NULL;
+    blorp_io_waiter_wake_all(&waiters);
+    return cancelled;
+}
+
+static void blorp_tcp_inner_extract_waiter_slot_locked(
+    blorp_IoWaiter** slot,
+    blorp_IoWakeReason reason,
+    blorp_IoWaiterList* waiters
+) {
+    if (!slot || !*slot) return;
+    blorp_IoWaiter* waiter = *slot;
+    *slot = NULL;
+    waiter->installed = false;
+    waiter->owner = NULL;
+    waiter->wake_reason = reason;
+    if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
+    blorp_io_deadline_queue_remove(waiter);
+    blorp_io_waiter_list_push(waiters, waiter);
+}
+
+static blorp_IoWaiterList blorp_tcp_inner_extract_waiters_locked(
+    blorp_TcpInner* inner,
+    blorp_IoWakeReason reason
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (!inner) return waiters;
+    blorp_tcp_inner_extract_waiter_slot_locked(
+        &inner->accept_waiter, reason, &waiters);
+    blorp_tcp_inner_extract_waiter_slot_locked(
+        &inner->connect_waiter, reason, &waiters);
+    blorp_tcp_inner_extract_waiter_slot_locked(
+        &inner->read_waiter, reason, &waiters);
+    blorp_tcp_inner_extract_waiter_slot_locked(
+        &inner->write_waiter, reason, &waiters);
+    return waiters;
+}
+
+static blorp_IoWaiterList blorp_tcp_inner_close_and_extract_waiters(
+    blorp_TcpInner* inner,
+    blorp_IoWakeReason reason,
+    int* closed_fd_out,
+    uint64_t* closed_generation_out
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (closed_fd_out) *closed_fd_out = -1;
+    if (closed_generation_out) *closed_generation_out = 0;
+    if (!inner) return waiters;
+    pthread_mutex_lock(&inner->mutex);
+    if (inner->state != BLORP_TCP_STATE_CLOSED) {
+        inner->state = BLORP_TCP_STATE_CLOSED;
+        if (inner->fd >= 0) {
+            if (closed_fd_out) *closed_fd_out = inner->fd;
+            if (closed_generation_out) *closed_generation_out = inner->generation;
+            close(inner->fd);
+            inner->fd = -1;
+        }
+    }
+    waiters = blorp_tcp_inner_extract_waiters_locked(inner, reason);
+    pthread_mutex_unlock(&inner->mutex);
+    return waiters;
+}
+
+static blorp_TcpInner* blorp_tcp_inner_new(blorp_TcpHandleKind kind, int fd) {
+    blorp_TcpInner* inner = (blorp_TcpInner*)calloc(1, sizeof(blorp_TcpInner));
+    if (!inner) {
+        fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n",
+                sizeof(blorp_TcpInner));
+        exit(1);
+    }
+    atomic_init(&inner->refcount, 1);
+    inner->fd = fd;
+    inner->generation =
+        atomic_fetch_add_explicit(&blorp_tcp_next_generation, 1, memory_order_relaxed);
+    inner->kind = kind;
+    inner->state = BLORP_TCP_STATE_OPEN;
+    inner->default_timeout_ms = -1;
+    if (pthread_mutex_init(&inner->mutex, NULL) != 0) {
+        close(inner->fd);
+        free(inner);
+        fprintf(stderr, "blorp: failed to initialize TCP handle mutex\n");
+        exit(1);
+    }
+    return inner;
+}
+
+static void blorp_tcp_inner_retain(blorp_TcpInner* inner) {
+    if (inner) {
+        atomic_fetch_add_explicit(&inner->refcount, 1, memory_order_relaxed);
+    }
+}
+
+static void blorp_tcp_inner_release(blorp_TcpInner* inner) {
+    if (!inner) return;
+    long old_refcount =
+        atomic_fetch_sub_explicit(&inner->refcount, 1, memory_order_acq_rel);
+    if (old_refcount > 1) return;
+
+    blorp_IoWaiterList waiters =
+        blorp_tcp_inner_close_and_extract_waiters(
+            inner, BLORP_IO_WAKE_CLOSED, NULL, NULL);
+    if (waiters.head) {
+        fprintf(stderr, "blorp: TCP handle destroyed with waiting fiber (bug)\n");
+    }
+    blorp_io_waiter_wake_all(&waiters);
+    pthread_mutex_destroy(&inner->mutex);
+    free(inner);
+}
+
+static long blorp_tcp_inner_fd(blorp_TcpInner* inner) {
+    if (!inner) return -1;
+    pthread_mutex_lock(&inner->mutex);
+    long fd = inner->fd;
+    pthread_mutex_unlock(&inner->mutex);
+    return fd;
+}
+
+static int blorp_tcp_inner_begin_op(blorp_TcpInner* inner, long* fd_out) {
+    if (!inner || !fd_out) return -1;
+    pthread_mutex_lock(&inner->mutex);
+    if (inner->state != BLORP_TCP_STATE_OPEN || inner->fd < 0) {
+        pthread_mutex_unlock(&inner->mutex);
+        return -1;
+    }
+    *fd_out = inner->fd;
+    return 0;
+}
+
+static void blorp_tcp_inner_end_op(blorp_TcpInner* inner) {
+    if (inner) pthread_mutex_unlock(&inner->mutex);
+}
+
+static int blorp_tcp_inner_begin_write_op(blorp_TcpInner* inner) {
+    if (!inner) return -1;
+    pthread_mutex_lock(&inner->mutex);
+    if (inner->state != BLORP_TCP_STATE_OPEN || inner->fd < 0) {
+        pthread_mutex_unlock(&inner->mutex);
+        return -1;
+    }
+    if (inner->write_active) {
+        pthread_mutex_unlock(&inner->mutex);
+        return -2;
+    }
+    inner->write_active = true;
+    blorp_tcp_inner_retain(inner);
+    pthread_mutex_unlock(&inner->mutex);
+    return 0;
+}
+
+static void blorp_tcp_inner_end_write_op(blorp_TcpInner* inner) {
+    if (!inner) return;
+    pthread_mutex_lock(&inner->mutex);
+    inner->write_active = false;
+    pthread_mutex_unlock(&inner->mutex);
+    blorp_tcp_inner_release(inner);
+}
+
+static void blorp_tcp_inner_close(blorp_TcpInner* inner) {
+    if (!inner) return;
+    int closed_fd = -1;
+    uint64_t closed_generation = 0;
+    blorp_IoWaiterList waiters =
+        blorp_tcp_inner_close_and_extract_waiters(
+            inner, BLORP_IO_WAKE_CLOSED, &closed_fd, &closed_generation);
+    if (closed_fd >= 0 && blorp_io_reactor_is_started()) {
+        (void)blorp_io_reactor_unregister_inner(closed_fd, closed_generation);
+    }
+    blorp_io_waiter_wake_all(&waiters);
+}
+
+static void blorp_tcp_listener_destructor(void* obj) {
+    blorp_TcpListener* listener = (blorp_TcpListener*)obj;
+    blorp_tcp_inner_release(listener->inner);
+    listener->inner = NULL;
+}
+
+static void blorp_tcp_stream_destructor(void* obj) {
+    blorp_TcpStream* stream = (blorp_TcpStream*)obj;
+    blorp_tcp_inner_release(stream->inner);
+    stream->inner = NULL;
+}
+
+static bool blorp_tcp_fd_arg_is_valid(long fd) {
+    return fd >= 0 && fd <= INT_MAX;
+}
+
+static bool blorp_tcp_fd_is_stream_socket(int raw_fd) {
+    int socket_type = 0;
+    socklen_t socket_type_len = sizeof(socket_type);
+    return getsockopt(
+               raw_fd, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_len) == 0 &&
+           socket_type == SOCK_STREAM;
+}
+
+static bool blorp_tcp_fd_is_listening_stream_socket(int raw_fd) {
+    if (!blorp_tcp_fd_is_stream_socket(raw_fd)) return false;
+#if defined(SO_ACCEPTCONN)
+    int accept_conn = 0;
+    socklen_t accept_conn_len = sizeof(accept_conn);
+    if (getsockopt(
+            raw_fd, SOL_SOCKET, SO_ACCEPTCONN, &accept_conn,
+            &accept_conn_len) != 0) {
+        return errno == ENOPROTOOPT || errno == EINVAL;
+    }
+    return accept_conn != 0;
+#else
+    return true;
+#endif
+}
+
+static bool blorp_tcp_fd_arg_to_open_socket_fd(
+    long fd,
+    int* raw_fd_out,
+    bool require_listener
+) {
+    if (!raw_fd_out || !blorp_tcp_fd_arg_is_valid(fd)) return false;
+    int raw_fd = (int)fd;
+    if (blorp_runtime_set_cloexec(raw_fd) != 0) return false;
+    if (require_listener) {
+        if (!blorp_tcp_fd_is_listening_stream_socket(raw_fd)) return false;
+    } else if (!blorp_tcp_fd_is_stream_socket(raw_fd)) {
+        return false;
+    }
+    if (blorp_io_reactor_set_nonblocking(raw_fd) != 0) return false;
+    *raw_fd_out = raw_fd;
+    return true;
+}
+
+static blorp_TcpListener* blorp_tcp_listener_from_open_fd(int raw_fd) {
+    blorp_TcpInner* inner =
+        blorp_tcp_inner_new(BLORP_TCP_HANDLE_LISTENER, raw_fd);
+    blorp_TcpListener* listener =
+        (blorp_TcpListener*)blorp_alloc(sizeof(blorp_TcpListener));
+    BLORP_TAG(listener, "TcpListener");
+    BLORP_SET_DESTRUCTOR(listener, blorp_tcp_listener_destructor);
+    listener->inner = inner;
+    return listener;
+}
+
+static blorp_TcpStream* blorp_tcp_stream_from_open_fd(int raw_fd) {
+    blorp_tcp_suppress_sigpipe(raw_fd);
+    blorp_TcpInner* inner =
+        blorp_tcp_inner_new(BLORP_TCP_HANDLE_STREAM, raw_fd);
+    blorp_TcpStream* stream = (blorp_TcpStream*)blorp_alloc(sizeof(blorp_TcpStream));
+    BLORP_TAG(stream, "TcpStream");
+    BLORP_SET_DESTRUCTOR(stream, blorp_tcp_stream_destructor);
+    stream->inner = inner;
+    return stream;
+}
+
+blorp_TcpListener* blorp_tcp_listener_from_fd(long fd) {
+    int raw_fd;
+    if (!blorp_tcp_fd_arg_to_open_socket_fd(fd, &raw_fd, true)) return NULL;
+    return blorp_tcp_listener_from_open_fd(raw_fd);
+}
+
+blorp_TcpStream* blorp_tcp_stream_from_fd(long fd) {
+    int raw_fd;
+    if (!blorp_tcp_fd_arg_to_open_socket_fd(fd, &raw_fd, false)) return NULL;
+    return blorp_tcp_stream_from_open_fd(raw_fd);
+}
+
+long blorp_tcp_listener_fd(blorp_TcpListener* listener) {
+    return listener ? blorp_tcp_inner_fd(listener->inner) : -1;
+}
+
+long blorp_tcp_stream_fd(blorp_TcpStream* stream) {
+    return stream ? blorp_tcp_inner_fd(stream->inner) : -1;
+}
+
+static int blorp_io_reactor_set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
+    return 0;
+}
+
+static int blorp_runtime_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags < 0) return -1;
+    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) return -1;
+    return 0;
+}
+
+static int blorp_runtime_socket_cloexec(int domain, int type, int protocol) {
+#if defined(SOCK_CLOEXEC)
+    int fd = socket(domain, type | SOCK_CLOEXEC, protocol);
+    if (fd >= 0) return fd;
+    if (errno != EINVAL) return -1;
+#endif
+    int fd = socket(domain, type, protocol);
+    if (fd < 0) return -1;
+    if (blorp_runtime_set_cloexec(fd) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+static int blorp_runtime_accept_cloexec(
+    int fd,
+    struct sockaddr* addr,
+    socklen_t* addr_len
+) {
+#if defined(__linux__) && defined(SOCK_CLOEXEC)
+    int client_fd = accept4(fd, addr, addr_len, SOCK_CLOEXEC);
+    if (client_fd >= 0) return client_fd;
+    if (errno != ENOSYS && errno != EINVAL) return -1;
+#endif
+    int client_fd = accept(fd, addr, addr_len);
+    if (client_fd < 0) return -1;
+    if (blorp_runtime_set_cloexec(client_fd) != 0) {
+        int saved_errno = errno;
+        close(client_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return client_fd;
+}
+
+static int blorp_runtime_pipe_cloexec_nonblock(int fds[2]) {
+    if (!fds) {
+        errno = EINVAL;
+        return -1;
+    }
+#if defined(__linux__) && defined(O_CLOEXEC) && defined(O_NONBLOCK)
+    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) == 0) return 0;
+    if (errno != ENOSYS && errno != EINVAL) return -1;
+#endif
+    fds[0] = -1;
+    fds[1] = -1;
+    if (pipe(fds) != 0) return -1;
+    if (blorp_runtime_set_cloexec(fds[0]) != 0 ||
+        blorp_runtime_set_cloexec(fds[1]) != 0 ||
+        blorp_io_reactor_set_nonblocking(fds[0]) != 0 ||
+        blorp_io_reactor_set_nonblocking(fds[1]) != 0) {
+        int saved_errno = errno;
+        close(fds[0]);
+        close(fds[1]);
+        fds[0] = -1;
+        fds[1] = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static void blorp_io_reactor_wake_control(void) {
+    if (__blorp_io_reactor.control_write_fd < 0) return;
+    unsigned char byte = 1;
+    while (write(__blorp_io_reactor.control_write_fd, &byte, 1) < 0) {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        return;
+    }
+    __blorp_scheduler_stat_inc(&global_scheduler_stats.reactor_control_wakes);
+}
+
+static void blorp_io_reactor_drain_control(void) {
+    if (__blorp_io_reactor.control_read_fd < 0) return;
+    unsigned char buf[64];
+    while (read(__blorp_io_reactor.control_read_fd, buf, sizeof(buf)) > 0) {
+    }
+}
+
+static blorp_IoBackendKind blorp_io_reactor_active_backend(void) {
+    // Phase 2 starts with the portable level-triggered poll loop. Native
+    // kqueue/epoll backends should not be reported active until their loops
+    // are implemented and tested.
+    return BLORP_IO_BACKEND_POLL;
+}
+
+static blorp_IoRegistration* blorp_io_reactor_find_locked(
+    int fd,
+    uint64_t generation
+) {
+    blorp_IoRegistration* reg = __blorp_io_reactor.registrations;
+    while (reg) {
+        if (reg->fd == fd && reg->generation == generation) return reg;
+        reg = reg->next;
+    }
+    return NULL;
+}
+
+static size_t blorp_io_reactor_registration_count_locked(void) {
+    size_t count = 0;
+    for (blorp_IoRegistration* reg = __blorp_io_reactor.registrations; reg;
+         reg = reg->next) {
+        count++;
+    }
+    return count;
+}
+
+static blorp_IoRegistrationSnapshot* blorp_io_reactor_snapshot_locked(
+    size_t* out_count
+) {
+    size_t count = blorp_io_reactor_registration_count_locked();
+    *out_count = count;
+    if (count == 0) return NULL;
+    blorp_IoRegistrationSnapshot* snapshots =
+        (blorp_IoRegistrationSnapshot*)blorp_malloc_checked(
+            count * sizeof(blorp_IoRegistrationSnapshot));
+    size_t i = 0;
+    for (blorp_IoRegistration* reg = __blorp_io_reactor.registrations; reg;
+         reg = reg->next) {
+        snapshots[i].fd = reg->fd;
+        snapshots[i].generation = reg->generation;
+        snapshots[i].interests = reg->interests;
+        i++;
+    }
+    return snapshots;
+}
+
+static short blorp_io_reactor_poll_events(int interests) {
+    short events = 0;
+    if (interests & BLORP_IO_INTEREST_READ) events |= POLLIN;
+    if (interests & BLORP_IO_INTEREST_WRITE) events |= POLLOUT;
+    return events;
+}
+
+static int blorp_io_reactor_ready_events(short revents) {
+    int ready = 0;
+    if (revents & (POLLIN | POLLHUP | POLLERR)) ready |= BLORP_IO_INTEREST_READ;
+    if (revents & (POLLOUT | POLLHUP | POLLERR)) ready |= BLORP_IO_INTEREST_WRITE;
+    return ready;
+}
+
+static void blorp_io_reactor_mark_ready(
+    int fd,
+    uint64_t generation,
+    int ready_events
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    blorp_IoRegistration* reg =
+        blorp_io_reactor_find_locked(fd, generation);
+    if (reg) {
+        int current_ready = ready_events & reg->interests;
+        if (current_ready != 0) {
+            reg->ready_events |= current_ready;
+            long ready_count = 0;
+            if (current_ready & BLORP_IO_INTEREST_READ) ready_count++;
+            if (current_ready & BLORP_IO_INTEREST_WRITE) ready_count++;
+            __blorp_scheduler_stat_add(
+                &global_scheduler_stats.reactor_ready_events, ready_count);
+            // Registrations model one pending operation, not a permanent
+            // subscription. Suppress repeated level-triggered notifications
+            // until the operation retries and explicitly re-registers.
+            reg->interests &= ~current_ready;
+            if (reg->inner) {
+                if (current_ready & BLORP_IO_INTEREST_READ) {
+                    blorp_IoWaiterList read_waiters =
+                        reg->inner->kind == BLORP_TCP_HANDLE_LISTENER
+                            ? blorp_tcp_inner_extract_waiter(
+                                  reg->inner, BLORP_IO_WAIT_ACCEPT,
+                                  generation, BLORP_IO_WAKE_READY)
+                            : blorp_tcp_inner_extract_waiter(
+                                  reg->inner, BLORP_IO_WAIT_READ,
+                                  generation, BLORP_IO_WAKE_READY);
+                    blorp_io_waiter_list_append(&waiters, &read_waiters);
+                }
+                if (current_ready & BLORP_IO_INTEREST_WRITE) {
+                    blorp_IoWaiterList connect_waiters =
+                        blorp_tcp_inner_extract_waiter(
+                            reg->inner, BLORP_IO_WAIT_CONNECT,
+                            generation, BLORP_IO_WAKE_READY);
+                    blorp_IoWaiterList write_waiters =
+                        blorp_tcp_inner_extract_waiter(
+                            reg->inner, BLORP_IO_WAIT_WRITE,
+                            generation, BLORP_IO_WAKE_READY);
+                    blorp_io_waiter_list_append(&waiters, &connect_waiters);
+                    blorp_io_waiter_list_append(&waiters, &write_waiters);
+                }
+            }
+            pthread_cond_broadcast(&__blorp_io_reactor.ready_cond);
+        }
+    }
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    __blorp_scheduler_stat_add(
+        &global_scheduler_stats.reactor_waiter_wakes,
+        blorp_io_waiter_list_count(&waiters));
+    blorp_io_waiter_wake_all(&waiters);
+}
+
+static void* blorp_io_reactor_thread(void* arg) {
+    (void)arg;
+    while (true) {
+        pthread_mutex_lock(&__blorp_io_reactor.mutex);
+        if (__blorp_io_reactor.shutdown) {
+            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+            return NULL;
+        }
+        size_t reg_count = 0;
+        blorp_IoRegistrationSnapshot* snapshots =
+            blorp_io_reactor_snapshot_locked(&reg_count);
+        pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+
+        size_t poll_count = reg_count + 1;
+        struct pollfd* fds =
+            (struct pollfd*)blorp_malloc_checked(poll_count * sizeof(struct pollfd));
+        fds[0].fd = __blorp_io_reactor.control_read_fd;
+        fds[0].events = POLLIN;
+        fds[0].revents = 0;
+        for (size_t i = 0; i < reg_count; i++) {
+            fds[i + 1].fd = snapshots[i].fd;
+            fds[i + 1].events =
+                blorp_io_reactor_poll_events(snapshots[i].interests);
+            fds[i + 1].revents = 0;
+        }
+
+        int rc;
+        do {
+            rc = poll(fds, (nfds_t)poll_count, -1);
+        } while (rc < 0 && errno == EINTR);
+
+        if (rc > 0) {
+            __blorp_scheduler_stat_inc(&global_scheduler_stats.reactor_poll_wakes);
+            if (fds[0].revents & POLLIN) {
+                blorp_io_reactor_drain_control();
+            }
+            for (size_t i = 0; i < reg_count; i++) {
+                short revents = fds[i + 1].revents;
+                int ready = blorp_io_reactor_ready_events(revents);
+                if (ready != 0) {
+                    blorp_io_reactor_mark_ready(
+                        snapshots[i].fd, snapshots[i].generation, ready);
+                }
+            }
+        }
+
+        free(fds);
+        free(snapshots);
+    }
+}
+
+void blorp_io_reactor_shutdown(void) {
+    if (!blorp_io_reactor_is_started()) return;
+
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    bool had_thread = __blorp_io_reactor.thread_started;
+    __blorp_io_reactor.shutdown = true;
+    pthread_cond_broadcast(&__blorp_io_reactor.ready_cond);
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    blorp_io_reactor_wake_control();
+
+    if (had_thread) {
+        pthread_join(__blorp_io_reactor.thread, NULL);
+    }
+
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    blorp_IoRegistration* reg = __blorp_io_reactor.registrations;
+    __blorp_io_reactor.registrations = NULL;
+    while (reg) {
+        blorp_IoRegistration* next = reg->next;
+        if (reg->inner) blorp_tcp_inner_release(reg->inner);
+        free(reg);
+        reg = next;
+    }
+    if (__blorp_io_reactor.control_read_fd >= 0) {
+        close(__blorp_io_reactor.control_read_fd);
+        __blorp_io_reactor.control_read_fd = -1;
+    }
+    if (__blorp_io_reactor.control_write_fd >= 0) {
+        close(__blorp_io_reactor.control_write_fd);
+        __blorp_io_reactor.control_write_fd = -1;
+    }
+    __blorp_io_reactor.thread_started = false;
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+}
+
+static void blorp_io_reactor_init_once(void) {
+    __blorp_io_reactor.backend = blorp_io_reactor_active_backend();
+    __blorp_io_reactor.control_read_fd = -1;
+    __blorp_io_reactor.control_write_fd = -1;
+    int pthread_rc = pthread_mutex_init(&__blorp_io_reactor.mutex, NULL);
+    if (pthread_rc != 0) {
+        __blorp_io_reactor_init_error = pthread_rc;
+        return;
+    }
+    pthread_rc = pthread_cond_init(&__blorp_io_reactor.ready_cond, NULL);
+    if (pthread_rc != 0) {
+        __blorp_io_reactor_init_error = pthread_rc;
+        pthread_mutex_destroy(&__blorp_io_reactor.mutex);
+        return;
+    }
+    int control_fds[2];
+    if (blorp_runtime_pipe_cloexec_nonblock(control_fds) != 0) {
+        __blorp_io_reactor_init_error = errno;
+        pthread_cond_destroy(&__blorp_io_reactor.ready_cond);
+        pthread_mutex_destroy(&__blorp_io_reactor.mutex);
+        return;
+    }
+    __blorp_io_reactor.control_read_fd = control_fds[0];
+    __blorp_io_reactor.control_write_fd = control_fds[1];
+    blorp_io_reactor_set_started(true);
+    pthread_rc =
+        pthread_create(
+            &__blorp_io_reactor.thread, NULL, blorp_io_reactor_thread, NULL);
+    if (pthread_rc != 0) {
+        __blorp_io_reactor_init_error = pthread_rc;
+        blorp_io_reactor_set_started(false);
+        close(control_fds[0]);
+        close(control_fds[1]);
+        pthread_cond_destroy(&__blorp_io_reactor.ready_cond);
+        pthread_mutex_destroy(&__blorp_io_reactor.mutex);
+        __blorp_io_reactor.control_read_fd = -1;
+        __blorp_io_reactor.control_write_fd = -1;
+        return;
+    }
+    __blorp_io_reactor.thread_started = true;
+    atexit(blorp_io_reactor_shutdown);
+}
+
+int blorp_io_reactor_start(void) {
+    pthread_once(&__blorp_io_reactor_once, blorp_io_reactor_init_once);
+    return __blorp_io_reactor_init_error == 0 ? 0 : -1;
+}
+
+static int blorp_io_reactor_register_inner(
+    blorp_TcpInner* inner,
+    int fd,
+    uint64_t generation,
+    int interests
+) {
+    if (!inner || fd < 0 || interests == 0) return -1;
+    if (blorp_io_reactor_start() != 0) return -1;
+
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    pthread_mutex_lock(&inner->mutex);
+    if (inner->state != BLORP_TCP_STATE_OPEN || inner->fd != fd ||
+        inner->generation != generation) {
+        pthread_mutex_unlock(&inner->mutex);
+        pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+        return -1;
+    }
+    blorp_IoRegistration* existing =
+        blorp_io_reactor_find_locked(fd, generation);
+    if (existing) {
+        existing->interests |= interests;
+        existing->ready_events &= existing->interests;
+        pthread_mutex_unlock(&inner->mutex);
+        pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+        blorp_io_reactor_wake_control();
+        return 0;
+    }
+
+    blorp_IoRegistration* reg =
+        (blorp_IoRegistration*)blorp_malloc_checked(sizeof(blorp_IoRegistration));
+    reg->fd = fd;
+    reg->generation = generation;
+    reg->interests = interests;
+    reg->ready_events = 0;
+    reg->inner = inner;
+    blorp_tcp_inner_retain(inner);
+    reg->next = __blorp_io_reactor.registrations;
+    __blorp_io_reactor.registrations = reg;
+    pthread_mutex_unlock(&inner->mutex);
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    blorp_io_reactor_wake_control();
+    return 0;
+}
+
+static int blorp_io_reactor_register_fd_for_smoke(
+    int fd,
+    uint64_t generation,
+    int interests
+) {
+    if (fd < 0 || interests == 0) return -1;
+    if (blorp_io_reactor_start() != 0) return -1;
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    blorp_IoRegistration* existing =
+        blorp_io_reactor_find_locked(fd, generation);
+    if (existing) {
+        existing->interests |= interests;
+        existing->ready_events &= existing->interests;
+        pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+        blorp_io_reactor_wake_control();
+        return 0;
+    }
+    blorp_IoRegistration* reg =
+        (blorp_IoRegistration*)blorp_malloc_checked(sizeof(blorp_IoRegistration));
+    reg->fd = fd;
+    reg->generation = generation;
+    reg->interests = interests;
+    reg->ready_events = 0;
+    reg->inner = NULL;
+    reg->next = __blorp_io_reactor.registrations;
+    __blorp_io_reactor.registrations = reg;
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    blorp_io_reactor_wake_control();
+    return 0;
+}
+
+static int blorp_io_reactor_update_interest(
+    int fd,
+    uint64_t generation,
+    int interests
+) {
+    if (fd < 0) return -1;
+    if (blorp_io_reactor_start() != 0) return -1;
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    blorp_IoRegistration* reg =
+        blorp_io_reactor_find_locked(fd, generation);
+    if (!reg) {
+        pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+        return -1;
+    }
+    reg->interests = interests;
+    reg->ready_events &= interests;
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    blorp_io_reactor_wake_control();
+    return 0;
+}
+
+static int blorp_io_reactor_unregister_inner(int fd, uint64_t generation) {
+    if (fd < 0) return -1;
+    if (blorp_io_reactor_start() != 0) return -1;
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    blorp_IoRegistration** link = &__blorp_io_reactor.registrations;
+    while (*link) {
+        blorp_IoRegistration* reg = *link;
+        if (reg->fd == fd && reg->generation == generation) {
+            *link = reg->next;
+            if (reg->inner) blorp_tcp_inner_release(reg->inner);
+            free(reg);
+            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+            blorp_io_reactor_wake_control();
+            return 0;
+        }
+        link = &reg->next;
+    }
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    return -1;
+}
+
+static int blorp_io_reactor_release_interest(
+    int fd,
+    uint64_t generation,
+    int interests
+) {
+    if (fd < 0 || interests == 0) return -1;
+    if (blorp_io_reactor_start() != 0) return -1;
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    blorp_IoRegistration** link = &__blorp_io_reactor.registrations;
+    while (*link) {
+        blorp_IoRegistration* reg = *link;
+        if (reg->fd == fd && reg->generation == generation) {
+            reg->interests &= ~interests;
+            reg->ready_events &= reg->interests;
+            bool remove = reg->interests == 0;
+            if (remove) {
+                *link = reg->next;
+                if (reg->inner) blorp_tcp_inner_release(reg->inner);
+                free(reg);
+            }
+            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+            blorp_io_reactor_wake_control();
+            return 0;
+        }
+        link = &reg->next;
+    }
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    return -1;
+}
+
+typedef struct {
+    int fd;
+    uint64_t generation;
+    int interests;
+    bool registered;
+} blorp_IoRegistrationCleanup;
+
+static void blorp_io_registration_cleanup_unregister(void* value) {
+    blorp_IoRegistrationCleanup* cleanup =
+        (blorp_IoRegistrationCleanup*)value;
+    if (!cleanup || !cleanup->registered) return;
+    cleanup->registered = false;
+    (void)blorp_io_reactor_release_interest(
+        cleanup->fd, cleanup->generation, cleanup->interests);
+}
+
+typedef struct {
+    blorp_TcpInner* inner;
+    bool active;
+} blorp_TcpWriteOpCleanup;
+
+static void blorp_tcp_write_op_cleanup_end(void* value) {
+    blorp_TcpWriteOpCleanup* cleanup =
+        (blorp_TcpWriteOpCleanup*)value;
+    if (!cleanup || !cleanup->active) return;
+    cleanup->active = false;
+    blorp_tcp_inner_end_write_op(cleanup->inner);
+}
+
+typedef struct {
+    blorp_TcpStream* stream;
+    bool active;
+} blorp_TcpProvisionalStreamCleanup;
+
+static void blorp_tcp_provisional_stream_cleanup_release(void* value) {
+    blorp_TcpProvisionalStreamCleanup* cleanup =
+        (blorp_TcpProvisionalStreamCleanup*)value;
+    if (!cleanup || !cleanup->active || !cleanup->stream) return;
+    cleanup->active = false;
+    blorp_release((void*)cleanup->stream);
+}
+
+static int blorp_tcp_inner_wait_for_reactor(
+    blorp_TcpInner* inner,
+    blorp_IoWaitKind wait_kind,
+    int interest,
+    int fd,
+    uint64_t generation,
+    long timeout_ms,
+    blorp_IoWakeReason* reason_out
+) {
+    if (!reason_out) return -1;
+    *reason_out = BLORP_IO_WAKE_NONE;
+    if (!inner) return -1;
+    blorp_tcp_inner_retain(inner);
+    if (blorp_io_reactor_register_inner(inner, fd, generation, interest) != 0) {
+        blorp_tcp_inner_release(inner);
+        return -1;
+    }
+
+    blorp_IoRegistrationCleanup registration_cleanup = {
+        .fd = fd,
+        .generation = generation,
+        .interests = interest,
+        .registered = true
+    };
+    blorp_CancelCleanupFrame cleanup_frame;
+    __blorp_task_cleanup_push_slow(
+        &cleanup_frame,
+        &registration_cleanup,
+        &registration_cleanup,
+        blorp_io_registration_cleanup_unregister);
+
+    blorp_IoWakeReason reason =
+        blorp_tcp_inner_park_current_fiber(
+            inner, wait_kind, fd, generation, interest, timeout_ms);
+    if (reason == BLORP_IO_WAKE_NONE) {
+        int ready =
+            blorp_io_reactor_wait_ready(fd, generation, interest, timeout_ms);
+        reason = ready > 0 ? BLORP_IO_WAKE_READY
+            : ready == 0 ? BLORP_IO_WAKE_TIMEOUT
+                         : BLORP_IO_WAKE_CLOSED;
+    }
+
+    blorp_io_registration_cleanup_unregister(&registration_cleanup);
+    __blorp_task_cleanup_pop_slot_slow(&registration_cleanup);
+    *reason_out = reason;
+    blorp_tcp_inner_release(inner);
+    return 0;
+}
+
+static void blorp_io_reactor_deadline_from_now(
+    long timeout_ms,
+    struct timespec* out
+) {
+    clock_gettime(CLOCK_REALTIME, out);
+    out->tv_sec += timeout_ms / 1000;
+    out->tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (out->tv_nsec >= 1000000000L) {
+        out->tv_sec++;
+        out->tv_nsec -= 1000000000L;
+    }
+}
+
+static int blorp_io_reactor_wait_ready(
+    int fd,
+    uint64_t generation,
+    int interests,
+    long timeout_ms
+) {
+    if (fd < 0 || interests == 0) return -1;
+    if (blorp_io_reactor_start() != 0) return -1;
+    struct timespec deadline;
+    bool has_deadline = timeout_ms >= 0;
+    if (has_deadline) blorp_io_reactor_deadline_from_now(timeout_ms, &deadline);
+
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    while (!__blorp_io_reactor.shutdown) {
+        blorp_IoRegistration* reg =
+            blorp_io_reactor_find_locked(fd, generation);
+        if (!reg) {
+            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+            return -1;
+        }
+        int ready = reg->ready_events & interests;
+        if (ready != 0) {
+            reg->ready_events &= ~ready;
+            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+            return ready;
+        }
+        int wait_rc = has_deadline
+            ? pthread_cond_timedwait(
+                  &__blorp_io_reactor.ready_cond,
+                  &__blorp_io_reactor.mutex,
+                  &deadline)
+            : pthread_cond_wait(
+                  &__blorp_io_reactor.ready_cond,
+                  &__blorp_io_reactor.mutex);
+        if (wait_rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    return -1;
+}
+
+static int blorp_io_reactor_take_ready(
+    int fd,
+    uint64_t generation,
+    int interests
+) {
+    if (fd < 0 || interests == 0) return -1;
+    if (blorp_io_reactor_start() != 0) return -1;
+    pthread_mutex_lock(&__blorp_io_reactor.mutex);
+    blorp_IoRegistration* reg =
+        blorp_io_reactor_find_locked(fd, generation);
+    if (!reg) {
+        pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+        return -1;
+    }
+    int ready = reg->ready_events & interests;
+    if (ready != 0) reg->ready_events &= ~ready;
+    pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+    return ready;
+}
+
+int blorp_io_reactor_smoke_test(void) {
+    int fds[2];
+    if (blorp_runtime_pipe_cloexec_nonblock(fds) != 0) return 10;
+    uint64_t generation = 1;
+    int result = 0;
+    if (blorp_io_reactor_register_fd_for_smoke(
+            fds[0], generation, BLORP_IO_INTEREST_READ) != 0) {
+        result = 11;
+        goto cleanup;
+    }
+    const unsigned char byte = 42;
+    if (write(fds[1], &byte, 1) != 1) {
+        result = 12;
+        goto cleanup_registered;
+    }
+    int ready = blorp_io_reactor_wait_ready(
+        fds[0], generation, BLORP_IO_INTEREST_READ, 5000);
+    if ((ready & BLORP_IO_INTEREST_READ) == 0) {
+        result = 13;
+    }
+
+cleanup_registered:
+    blorp_io_reactor_update_interest(fds[0], generation, 0);
+    blorp_io_reactor_unregister_inner(fds[0], generation);
+cleanup:
+    close(fds[0]);
+    close(fds[1]);
+    return result;
+}
 
 // Sentinel refcount for immortal singleton objects (nullary constructors like None)
 #define BLORP_IMMORTAL_REFCOUNT LONG_MAX
@@ -9593,23 +10988,129 @@ blorp_String* blorp_base64_decode(const blorp_String* s) {
 // ============================================================================
 
 static blorp_Result* tcp_error(const char* prefix) {
+    int errnum = errno;
     char buf[256];
-    snprintf(buf, sizeof(buf), "%s: %s", prefix, strerror(errno));
+    snprintf(buf, sizeof(buf), "%s: %s", prefix, strerror(errnum));
     blorp_Result* res = blorp_result_err((void*)blorp_string_from_buf(buf, strlen(buf)));
     res->release_mask = 1UL;
     return res;
 }
 
-blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog) {
-    if (!host || port < 0 || port > 65535) {
-        return blorp_result_err((void*)blorp_string_literal("tcp listen: invalid host or port"));
+static blorp_Result* tcp_error_errno(const char* prefix, int errnum) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s: %s", prefix, strerror(errnum));
+    blorp_Result* res = blorp_result_err((void*)blorp_string_from_buf(buf, strlen(buf)));
+    res->release_mask = 1UL;
+    return res;
+}
+
+static blorp_Result* tcp_handle_error(const char* message) {
+    return blorp_result_err((void*)blorp_string_literal(message));
+}
+
+static blorp_Result* tcp_owned_ok(void* value) {
+    if (!value) return tcp_handle_error("tcp: invalid handle");
+    blorp_Result* res = blorp_result_ok(value);
+    res->release_mask = 1UL;
+    return res;
+}
+
+static bool blorp_tcp_read_size_is_valid(long max_bytes) {
+    return max_bytes >= 0 && max_bytes <= BLORP_TCP_MAX_READ_BYTES;
+}
+
+static bool blorp_tcp_write_buffer_is_valid(const blorp_Bytes* data) {
+    return data && data->len >= 0 && data->capacity >= 0 &&
+           data->len <= data->capacity;
+}
+
+static bool blorp_tcp_host_is_numeric(const char* host, int family) {
+    if (!host || host[0] == '\0') return false;
+
+    struct in_addr addr4;
+    if ((family == AF_INET || family == AF_UNSPEC) &&
+        inet_pton(AF_INET, host, &addr4) == 1) {
+        return true;
     }
 
-    // Null-terminate host for getaddrinfo
+    struct in6_addr addr6;
+    if ((family == AF_INET6 || family == AF_UNSPEC) &&
+        inet_pton(AF_INET6, host, &addr6) == 1) {
+        return true;
+    }
+
+    return false;
+}
+
+static blorp_Result* blorp_tcp_copy_host(
+    const char* op,
+    blorp_String* host,
+    char* host_buf,
+    size_t host_buf_len
+) {
+    if (!host || !host_buf || host_buf_len == 0) {
+        return blorp_result_err((void*)blorp_string_literal("tcp: invalid host"));
+    }
+    if (host->len < 0 || host->capacity < 0 || host->len > host->capacity) {
+        char err_buf[128];
+        snprintf(err_buf, sizeof(err_buf), "%s: invalid host", op);
+        blorp_Result* err_res =
+            blorp_result_err((void*)blorp_string_from_buf(err_buf, strlen(err_buf)));
+        err_res->release_mask = 1UL;
+        return err_res;
+    }
+    if ((size_t)host->len >= host_buf_len) {
+        char err_buf[128];
+        snprintf(err_buf, sizeof(err_buf), "%s: host too long", op);
+        blorp_Result* err_res =
+            blorp_result_err((void*)blorp_string_from_buf(err_buf, strlen(err_buf)));
+        err_res->release_mask = 1UL;
+        return err_res;
+    }
+    memcpy(host_buf, host->data, (size_t)host->len);
+    host_buf[host->len] = '\0';
+    return NULL;
+}
+
+static int blorp_tcp_getaddrinfo(
+    const char* host,
+    const char* port,
+    struct addrinfo* hints,
+    struct addrinfo** res
+) {
+    const char* lookup_host = host;
+    if (host && host[0] == '\0' && hints && (hints->ai_flags & AI_PASSIVE)) {
+        lookup_host = NULL;
+    }
+
+    struct addrinfo numeric_hints;
+    if (lookup_host &&
+        blorp_tcp_host_is_numeric(lookup_host, hints ? hints->ai_family : AF_UNSPEC)) {
+        numeric_hints = hints ? *hints : (struct addrinfo){0};
+        hints = &numeric_hints;
+        hints->ai_flags |= AI_NUMERICHOST;
+    }
+    return getaddrinfo(lookup_host, port, hints, res);
+}
+
+static void blorp_tcp_suppress_sigpipe(int fd) {
+#if defined(SO_NOSIGPIPE)
+    int opt = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#else
+    (void)fd;
+#endif
+}
+
+blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog) {
+    if (!host || port < 0 || port > 65535 || backlog < 0 || backlog > INT_MAX) {
+        return blorp_result_err((void*)blorp_string_literal("tcp listen: invalid host, port, or backlog"));
+    }
+
     char host_buf[256];
-    long hlen = host->len < 255 ? host->len : 255;
-    memcpy(host_buf, host->data, hlen);
-    host_buf[hlen] = '\0';
+    blorp_Result* host_err =
+        blorp_tcp_copy_host("tcp listen", host, host_buf, sizeof(host_buf));
+    if (host_err) return host_err;
 
     char port_buf[8];
     snprintf(port_buf, sizeof(port_buf), "%ld", port);
@@ -9620,7 +11121,7 @@ blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog) {
     hints.ai_flags = AI_PASSIVE;
 
     struct addrinfo* res;
-    int rc = getaddrinfo(host_buf, port_buf, &hints, &res);
+    int rc = blorp_tcp_getaddrinfo(host_buf, port_buf, &hints, &res);
     if (rc != 0) {
         char err_buf[256];
         snprintf(err_buf, sizeof(err_buf), "tcp listen: getaddrinfo: %s", gai_strerror(rc));
@@ -9629,7 +11130,8 @@ blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog) {
         return err_res;
     }
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int fd =
+        blorp_runtime_socket_cloexec(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) {
         freeaddrinfo(res);
         return tcp_error("tcp listen: socket");
@@ -9650,17 +11152,68 @@ blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog) {
         return tcp_error("tcp listen: listen");
     }
 
-    return blorp_result_ok((void*)(long)fd);
+    if (blorp_io_reactor_set_nonblocking(fd) < 0) {
+        close(fd);
+        return tcp_error("tcp listen: nonblocking");
+    }
+
+    return tcp_owned_ok((void*)blorp_tcp_listener_from_open_fd(fd));
 }
 
-blorp_Result* blorp_tcp_accept(long server_fd) {
-    struct sockaddr_in addr;
-    socklen_t addr_len = sizeof(addr);
-    int client_fd = accept((int)server_fd, (struct sockaddr*)&addr, &addr_len);
-    if (client_fd < 0) {
-        return tcp_error("tcp accept");
+blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener) {
+    blorp_TcpInner* inner = listener ? listener->inner : NULL;
+    while (true) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            return tcp_handle_error("tcp accept: cancelled");
+        }
+
+        long server_fd = -1;
+        if (blorp_tcp_inner_begin_op(inner, &server_fd) < 0) {
+            return tcp_handle_error("tcp accept: closed listener");
+        }
+        uint64_t generation = inner->generation;
+        long timeout_ms = inner->default_timeout_ms;
+
+        struct sockaddr_in addr;
+        socklen_t addr_len = sizeof(addr);
+        int client_fd = blorp_runtime_accept_cloexec(
+            (int)server_fd, (struct sockaddr*)&addr, &addr_len);
+        if (client_fd >= 0) {
+            blorp_tcp_inner_end_op(inner);
+            return tcp_owned_ok((void*)blorp_tcp_stream_from_open_fd(client_fd));
+        }
+
+        int errnum = errno;
+        blorp_tcp_inner_end_op(inner);
+        if (errnum == EAGAIN || errnum == EWOULDBLOCK) {
+            blorp_IoWakeReason reason;
+            if (blorp_tcp_inner_wait_for_reactor(
+                    inner,
+                    BLORP_IO_WAIT_ACCEPT,
+                    BLORP_IO_INTEREST_READ,
+                    (int)server_fd,
+                    generation,
+                    timeout_ms,
+                    &reason) != 0) {
+                return tcp_handle_error("tcp accept: reactor unavailable");
+            }
+
+            switch (reason) {
+                case BLORP_IO_WAKE_READY:
+                    continue;
+                case BLORP_IO_WAKE_TIMEOUT:
+                    return tcp_handle_error("tcp accept: timed out");
+                case BLORP_IO_WAKE_CANCELLED:
+                    (void)__blorp_cancel_current_task_if_requested();
+                    return tcp_handle_error("tcp accept: cancelled");
+                case BLORP_IO_WAKE_CLOSED:
+                case BLORP_IO_WAKE_NONE:
+                default:
+                    return tcp_handle_error("tcp accept: closed listener");
+            }
+        }
+        return tcp_error_errno("tcp accept", errnum);
     }
-    return blorp_result_ok((void*)(long)client_fd);
 }
 
 blorp_Result* blorp_tcp_connect(blorp_String* host, long port) {
@@ -9669,9 +11222,9 @@ blorp_Result* blorp_tcp_connect(blorp_String* host, long port) {
     }
 
     char host_buf[256];
-    long hlen = host->len < 255 ? host->len : 255;
-    memcpy(host_buf, host->data, hlen);
-    host_buf[hlen] = '\0';
+    blorp_Result* host_err =
+        blorp_tcp_copy_host("tcp connect", host, host_buf, sizeof(host_buf));
+    if (host_err) return host_err;
 
     char port_buf[8];
     snprintf(port_buf, sizeof(port_buf), "%ld", port);
@@ -9681,7 +11234,7 @@ blorp_Result* blorp_tcp_connect(blorp_String* host, long port) {
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo* res;
-    int rc = getaddrinfo(host_buf, port_buf, &hints, &res);
+    int rc = blorp_tcp_getaddrinfo(host_buf, port_buf, &hints, &res);
     if (rc != 0) {
         char err_buf[256];
         snprintf(err_buf, sizeof(err_buf), "tcp connect: getaddrinfo: %s", gai_strerror(rc));
@@ -9690,74 +11243,431 @@ blorp_Result* blorp_tcp_connect(blorp_String* host, long port) {
         return err_res;
     }
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    int fd =
+        blorp_runtime_socket_cloexec(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) {
         freeaddrinfo(res);
         return tcp_error("tcp connect: socket");
     }
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+    if (blorp_io_reactor_set_nonblocking(fd) < 0) {
         freeaddrinfo(res);
         close(fd);
-        return tcp_error("tcp connect");
+        return tcp_error("tcp connect: nonblocking");
     }
+
+    blorp_TcpStream* stream = blorp_tcp_stream_from_open_fd(fd);
+    blorp_TcpInner* inner = stream->inner;
+    blorp_TcpProvisionalStreamCleanup stream_cleanup = {
+        .stream = stream,
+        .active = true
+    };
+    blorp_CancelCleanupFrame cleanup_frame;
+    __blorp_task_cleanup_push_slow(
+        &cleanup_frame,
+        &stream_cleanup,
+        &stream_cleanup,
+        blorp_tcp_provisional_stream_cleanup_release);
+
+    int connect_rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    int connect_err = connect_rc == 0 ? 0 : errno;
     freeaddrinfo(res);
 
-    return blorp_result_ok((void*)(long)fd);
-}
-
-blorp_Result* blorp_tcp_read(long fd, long max_bytes) {
-    if (max_bytes <= 0) max_bytes = 4096;
-    blorp_Bytes* buf = blorp_bytes_new(max_bytes);
-    ssize_t n = recv((int)fd, buf->data, max_bytes, 0);
-    if (n < 0) {
-        blorp_release((void*)buf);
-        return tcp_error("tcp read");
+    if (connect_rc != 0 && connect_err != EINPROGRESS) {
+        blorp_Result* err = tcp_error_errno("tcp connect", connect_err);
+        blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+        __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+        return err;
     }
-    buf->len = n;
-    blorp_Result* res = blorp_result_ok((void*)buf);
-    res->release_mask = 1UL;
-    return res;
+
+    while (connect_rc != 0) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            blorp_Result* err = tcp_handle_error("tcp connect: cancelled");
+            blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+            __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+            return err;
+        }
+
+        long active_fd = -1;
+        if (blorp_tcp_inner_begin_op(inner, &active_fd) < 0) {
+            blorp_Result* err = tcp_handle_error("tcp connect: closed stream");
+            blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+            __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+            return err;
+        }
+        uint64_t generation = inner->generation;
+        long timeout_ms = inner->default_timeout_ms;
+        blorp_tcp_inner_end_op(inner);
+
+        blorp_IoWakeReason reason;
+        if (blorp_tcp_inner_wait_for_reactor(
+                inner,
+                BLORP_IO_WAIT_CONNECT,
+                BLORP_IO_INTEREST_WRITE,
+                (int)active_fd,
+                generation,
+                timeout_ms,
+                &reason) != 0) {
+            blorp_Result* err =
+                tcp_handle_error("tcp connect: reactor unavailable");
+            blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+            __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+            return err;
+        }
+
+        switch (reason) {
+            case BLORP_IO_WAKE_READY: {
+                int so_error = 0;
+                socklen_t so_error_len = sizeof(so_error);
+                if (getsockopt(
+                        (int)active_fd,
+                        SOL_SOCKET,
+                        SO_ERROR,
+                        &so_error,
+                        &so_error_len) < 0) {
+                    blorp_Result* err = tcp_error("tcp connect: so_error");
+                    blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+                    __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+                    return err;
+                }
+                if (so_error == 0) {
+                    connect_rc = 0;
+                    break;
+                }
+                if (so_error == EINPROGRESS || so_error == EALREADY) {
+                    continue;
+                }
+                blorp_Result* err = tcp_error_errno("tcp connect", so_error);
+                blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+                __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+                return err;
+            }
+            case BLORP_IO_WAKE_TIMEOUT: {
+                blorp_Result* err = tcp_handle_error("tcp connect: timed out");
+                blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+                __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+                return err;
+            }
+            case BLORP_IO_WAKE_CANCELLED: {
+                (void)__blorp_cancel_current_task_if_requested();
+                blorp_Result* err = tcp_handle_error("tcp connect: cancelled");
+                blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+                __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+                return err;
+            }
+            case BLORP_IO_WAKE_CLOSED:
+            case BLORP_IO_WAKE_NONE:
+            default: {
+                blorp_Result* err = tcp_handle_error("tcp connect: closed stream");
+                blorp_tcp_provisional_stream_cleanup_release(&stream_cleanup);
+                __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+                return err;
+            }
+        }
+    }
+
+    stream_cleanup.active = false;
+    __blorp_task_cleanup_pop_slot_slow(&stream_cleanup);
+    return tcp_owned_ok((void*)stream);
 }
 
-blorp_Result* blorp_tcp_write(long fd, blorp_Bytes* data) {
-    if (!data || data->len == 0) {
+blorp_Result* blorp_tcp_read(blorp_TcpStream* stream, long max_bytes) {
+    blorp_TcpInner* inner = stream ? stream->inner : NULL;
+    if (!blorp_tcp_read_size_is_valid(max_bytes)) {
+        return tcp_handle_error("tcp read: invalid max_bytes");
+    }
+    if (max_bytes == 0) {
+        long fd = -1;
+        if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+            return tcp_handle_error("tcp read: closed stream");
+        }
+        blorp_tcp_inner_end_op(inner);
+        blorp_Bytes* empty = blorp_bytes_new(0);
+        blorp_Result* res = blorp_result_ok((void*)empty);
+        res->release_mask = 1UL;
+        return res;
+    }
+
+    while (true) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            return tcp_handle_error("tcp read: cancelled");
+        }
+
+        long fd = -1;
+        if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+            return tcp_handle_error("tcp read: closed stream");
+        }
+        uint64_t generation = inner->generation;
+        long timeout_ms = inner->default_timeout_ms;
+
+        if (blorp_io_reactor_set_nonblocking((int)fd) < 0) {
+            blorp_tcp_inner_end_op(inner);
+            return tcp_error("tcp read: nonblocking");
+        }
+
+        blorp_Bytes* buf = blorp_bytes_new(max_bytes);
+        ssize_t n = recv((int)fd, buf->data, max_bytes, 0);
+        if (n >= 0) {
+            blorp_tcp_inner_end_op(inner);
+            buf->len = n;
+            blorp_Result* res = blorp_result_ok((void*)buf);
+            res->release_mask = 1UL;
+            return res;
+        }
+
+        int errnum = errno;
+        blorp_tcp_inner_end_op(inner);
+        blorp_release((void*)buf);
+
+        if (errnum == EINTR) continue;
+        if (errnum == EAGAIN || errnum == EWOULDBLOCK) {
+            blorp_IoWakeReason reason;
+            if (blorp_tcp_inner_wait_for_reactor(
+                    inner,
+                    BLORP_IO_WAIT_READ,
+                    BLORP_IO_INTEREST_READ,
+                    (int)fd,
+                    generation,
+                    timeout_ms,
+                    &reason) != 0) {
+                return tcp_handle_error("tcp read: reactor unavailable");
+            }
+
+            switch (reason) {
+                case BLORP_IO_WAKE_READY:
+                    continue;
+                case BLORP_IO_WAKE_TIMEOUT:
+                    return tcp_handle_error("tcp read: timed out");
+                case BLORP_IO_WAKE_CANCELLED:
+                    (void)__blorp_cancel_current_task_if_requested();
+                    return tcp_handle_error("tcp read: cancelled");
+                case BLORP_IO_WAKE_CLOSED:
+                case BLORP_IO_WAKE_NONE:
+                default:
+                    return tcp_handle_error("tcp read: closed stream");
+            }
+        }
+        return tcp_error_errno("tcp read", errnum);
+    }
+}
+
+blorp_Result* blorp_tcp_write(blorp_TcpStream* stream, blorp_Bytes* data) {
+    blorp_TcpInner* inner = stream ? stream->inner : NULL;
+    if (!blorp_tcp_write_buffer_is_valid(data)) {
+        return tcp_handle_error("tcp write: invalid data");
+    }
+    if (data->len == 0) {
+        long fd = -1;
+        if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+            return tcp_handle_error("tcp write: closed stream");
+        }
+        blorp_tcp_inner_end_op(inner);
         return blorp_result_ok((void*)0L);
     }
+
+    int begin_write = blorp_tcp_inner_begin_write_op(inner);
+    if (begin_write == -2) {
+        return tcp_handle_error("tcp write: write already in progress");
+    }
+    if (begin_write != 0) {
+        return tcp_handle_error("tcp write: closed stream");
+    }
+
+    blorp_TcpWriteOpCleanup write_cleanup = {
+        .inner = inner,
+        .active = true
+    };
+    blorp_CancelCleanupFrame cleanup_frame;
+    __blorp_task_cleanup_push_slow(
+        &cleanup_frame,
+        &write_cleanup,
+        &write_cleanup,
+        blorp_tcp_write_op_cleanup_end);
+
+    blorp_Result* result = NULL;
     long total = 0;
     while (total < data->len) {
-        ssize_t n = send((int)fd, data->data + total, data->len - total, 0);
-        if (n < 0) {
-            return tcp_error("tcp write");
+        if (__blorp_cancel_current_task_if_requested()) {
+            result = tcp_handle_error("tcp write: cancelled");
+            goto finish;
         }
-        total += n;
+
+        long fd = -1;
+        if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+            result = tcp_handle_error("tcp write: closed stream");
+            goto finish;
+        }
+        uint64_t generation = inner->generation;
+        long timeout_ms = inner->default_timeout_ms;
+
+        if (blorp_io_reactor_set_nonblocking((int)fd) < 0) {
+            blorp_tcp_inner_end_op(inner);
+            result = tcp_error("tcp write: nonblocking");
+            goto finish;
+        }
+
+        ssize_t n = send(
+            (int)fd,
+            data->data + total,
+            data->len - total,
+            BLORP_TCP_SEND_FLAGS);
+        if (n > 0) {
+            total += n;
+            blorp_tcp_inner_end_op(inner);
+            continue;
+        }
+        if (n == 0) {
+            blorp_tcp_inner_end_op(inner);
+            result = tcp_handle_error("tcp write: closed stream");
+            goto finish;
+        }
+
+        int errnum = errno;
+        blorp_tcp_inner_end_op(inner);
+        if (errnum == EINTR) continue;
+        if (errnum == EAGAIN || errnum == EWOULDBLOCK) {
+            blorp_IoWakeReason reason;
+            if (blorp_tcp_inner_wait_for_reactor(
+                    inner,
+                    BLORP_IO_WAIT_WRITE,
+                    BLORP_IO_INTEREST_WRITE,
+                    (int)fd,
+                    generation,
+                    timeout_ms,
+                    &reason) != 0) {
+                result = tcp_handle_error("tcp write: reactor unavailable");
+                goto finish;
+            }
+
+            switch (reason) {
+                case BLORP_IO_WAKE_READY:
+                    continue;
+                case BLORP_IO_WAKE_TIMEOUT:
+                    result = tcp_handle_error("tcp write: timed out");
+                    goto finish;
+                case BLORP_IO_WAKE_CANCELLED:
+                    (void)__blorp_cancel_current_task_if_requested();
+                    result = tcp_handle_error("tcp write: cancelled");
+                    goto finish;
+                case BLORP_IO_WAKE_CLOSED:
+                case BLORP_IO_WAKE_NONE:
+                default:
+                    result = tcp_handle_error("tcp write: closed stream");
+                    goto finish;
+            }
+        }
+        result = tcp_error_errno("tcp write", errnum);
+        goto finish;
     }
-    return blorp_result_ok((void*)total);
+
+    result = blorp_result_ok((void*)total);
+
+finish:
+    blorp_tcp_write_op_cleanup_end(&write_cleanup);
+    __blorp_task_cleanup_pop_slot_slow(&write_cleanup);
+    return result;
 }
 
-void blorp_tcp_close(long fd) {
-    close((int)fd);
+void blorp_tcp_close_listener(blorp_TcpListener* listener) {
+    if (listener) blorp_tcp_inner_close(listener->inner);
 }
 
-blorp_Result* blorp_tcp_set_reuse_addr(long fd) {
+void blorp_tcp_close_stream(blorp_TcpStream* stream) {
+    if (stream) blorp_tcp_inner_close(stream->inner);
+}
+
+blorp_Result* blorp_tcp_set_reuse_addr(blorp_TcpListener* listener) {
+    blorp_TcpInner* inner = listener ? listener->inner : NULL;
+    long fd = -1;
+    if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+        return tcp_handle_error("tcp set_reuse_addr: closed listener");
+    }
     int opt = 1;
     if (setsockopt((int)fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        return tcp_error("tcp set_reuse_addr");
+        int errnum = errno;
+        blorp_tcp_inner_end_op(inner);
+        return tcp_error_errno("tcp set_reuse_addr", errnum);
     }
+    blorp_tcp_inner_end_op(inner);
     return blorp_result_ok((void*)0L);
 }
 
-blorp_Result* blorp_tcp_set_timeout(long fd, long ms) {
-    struct timeval tv;
-    tv.tv_sec = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
-    if (setsockopt((int)fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-        return tcp_error("tcp set_timeout: recv");
+static blorp_Result* blorp_tcp_local_port_fd(long fd) {
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname((int)fd, (struct sockaddr*)&addr, &addr_len) < 0) {
+        return tcp_error("tcp local_port");
     }
-    if (setsockopt((int)fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
-        return tcp_error("tcp set_timeout: send");
+
+    switch (addr.ss_family) {
+        case AF_INET:
+            return blorp_result_ok(
+                (void*)(long)ntohs(((struct sockaddr_in*)&addr)->sin_port));
+        case AF_INET6:
+            return blorp_result_ok(
+                (void*)(long)ntohs(((struct sockaddr_in6*)&addr)->sin6_port));
+        default:
+            return blorp_result_err((void*)blorp_string_literal(
+                "tcp local_port: unsupported address family"));
     }
+}
+
+blorp_Result* blorp_tcp_local_port_listener(blorp_TcpListener* listener) {
+    blorp_TcpInner* inner = listener ? listener->inner : NULL;
+    long fd = -1;
+    if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+        return tcp_handle_error("tcp local_port: closed listener");
+    }
+    blorp_Result* result = blorp_tcp_local_port_fd(fd);
+    blorp_tcp_inner_end_op(inner);
+    return result;
+}
+
+blorp_Result* blorp_tcp_local_port_stream(blorp_TcpStream* stream) {
+    blorp_TcpInner* inner = stream ? stream->inner : NULL;
+    long fd = -1;
+    if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+        return tcp_handle_error("tcp local_port: closed stream");
+    }
+    blorp_Result* result = blorp_tcp_local_port_fd(fd);
+    blorp_tcp_inner_end_op(inner);
+    return result;
+}
+
+static bool blorp_tcp_timeout_ms_is_valid(long ms) {
+    return ms >= 0 && (uint64_t)ms <= UINT64_MAX / 1000000ULL;
+}
+
+static blorp_Result* blorp_tcp_set_timeout_inner(
+    blorp_TcpInner* inner,
+    long ms,
+    const char* closed_message
+) {
+    if (!blorp_tcp_timeout_ms_is_valid(ms)) {
+        return tcp_handle_error("tcp set_timeout: invalid timeout");
+    }
+    if (!inner) {
+        return tcp_handle_error(closed_message);
+    }
+
+    pthread_mutex_lock(&inner->mutex);
+    if (inner->state != BLORP_TCP_STATE_OPEN || inner->fd < 0) {
+        pthread_mutex_unlock(&inner->mutex);
+        return tcp_handle_error(closed_message);
+    }
+    inner->default_timeout_ms = ms;
+    pthread_mutex_unlock(&inner->mutex);
     return blorp_result_ok((void*)0L);
+}
+
+blorp_Result* blorp_tcp_set_timeout_listener(blorp_TcpListener* listener, long ms) {
+    return blorp_tcp_set_timeout_inner(
+        listener ? listener->inner : NULL, ms, "tcp set_timeout: closed listener");
+}
+
+blorp_Result* blorp_tcp_set_timeout_stream(blorp_TcpStream* stream, long ms) {
+    return blorp_tcp_set_timeout_inner(
+        stream ? stream->inner : NULL, ms, "tcp set_timeout: closed stream");
 }
 
 // ============================================================================
@@ -11416,6 +13326,11 @@ static void* __blorp_worker(void* arg) {
         uint64_t next_expiry = 0;
         if (__fibers_initialized) {
             next_expiry = blorp_timer_queue_drain();
+            uint64_t next_io_expiry = blorp_io_deadline_queue_drain();
+            if (next_io_expiry > 0 &&
+                (next_expiry == 0 || next_io_expiry < next_expiry)) {
+                next_expiry = next_io_expiry;
+            }
         }
 
         // Phase 2: Try to pop a fiber from the run queue
@@ -11696,6 +13611,7 @@ void blorp_thread_pool_shutdown(void) {
             blorp_fiber_object_recycle(tf);
         }
         free(timer_items);
+        blorp_io_deadline_queue_clear();
         if (__blorp_pool->fiber_queues) {
             for (long i = 0; i < __blorp_pool->num_threads; i++) {
                 blorp_FiberRunQueue* queue = &__blorp_pool->fiber_queues[i];
@@ -12114,6 +14030,364 @@ static void blorp_fiber_park(void) {
     // Resumed here after wakeup
 }
 
+static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters) {
+    if (!waiters) return;
+    blorp_IoWaiter* waiter = waiters->head;
+    waiters->head = NULL;
+    waiters->tail = NULL;
+    while (waiter) {
+        blorp_IoWaiter* next = waiter->next;
+        waiter->next = NULL;
+        if (waiter->fiber) blorp_fiber_schedule(waiter->fiber);
+        waiter = next;
+    }
+}
+
+static void blorp_io_deadline_queue_init_once(void) {
+    pthread_mutex_init(&__blorp_io_deadline_queue.lock, NULL);
+}
+
+static void blorp_io_deadline_queue_ensure_init(void) {
+    pthread_once(
+        &__blorp_io_deadline_queue_once, blorp_io_deadline_queue_init_once);
+}
+
+static uint64_t blorp_monotonic_now_ns(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static void blorp_io_deadline_heap_swap(size_t a, size_t b) {
+    blorp_IoWaiter* tmp = __blorp_io_deadline_queue.items[a];
+    __blorp_io_deadline_queue.items[a] = __blorp_io_deadline_queue.items[b];
+    __blorp_io_deadline_queue.items[b] = tmp;
+    __blorp_io_deadline_queue.items[a]->deadline_index = (long)a;
+    __blorp_io_deadline_queue.items[b]->deadline_index = (long)b;
+}
+
+static void blorp_io_deadline_heap_sift_up(size_t idx) {
+    while (idx > 0) {
+        size_t parent = (idx - 1) / 2;
+        if (__blorp_io_deadline_queue.items[parent]->deadline_ns <=
+            __blorp_io_deadline_queue.items[idx]->deadline_ns) {
+            break;
+        }
+        blorp_io_deadline_heap_swap(parent, idx);
+        idx = parent;
+    }
+}
+
+static void blorp_io_deadline_heap_sift_down(size_t idx) {
+    while (true) {
+        size_t left = idx * 2 + 1;
+        size_t right = left + 1;
+        size_t smallest = idx;
+        if (left < __blorp_io_deadline_queue.len &&
+            __blorp_io_deadline_queue.items[left]->deadline_ns <
+                __blorp_io_deadline_queue.items[smallest]->deadline_ns) {
+            smallest = left;
+        }
+        if (right < __blorp_io_deadline_queue.len &&
+            __blorp_io_deadline_queue.items[right]->deadline_ns <
+                __blorp_io_deadline_queue.items[smallest]->deadline_ns) {
+            smallest = right;
+        }
+        if (smallest == idx) break;
+        blorp_io_deadline_heap_swap(idx, smallest);
+        idx = smallest;
+    }
+}
+
+static void blorp_io_deadline_heap_reserve(size_t needed) {
+    if (__blorp_io_deadline_queue.cap >= needed) return;
+    size_t new_cap =
+        __blorp_io_deadline_queue.cap ? __blorp_io_deadline_queue.cap * 2 : 64;
+    while (new_cap < needed) new_cap *= 2;
+    if (new_cap > SIZE_MAX / sizeof(blorp_IoWaiter*)) {
+        fprintf(stderr, "blorp: IO deadline queue capacity overflow\n");
+        exit(1);
+    }
+    blorp_IoWaiter** new_items =
+        (blorp_IoWaiter**)realloc(
+            __blorp_io_deadline_queue.items,
+            new_cap * sizeof(blorp_IoWaiter*));
+    if (!new_items) {
+        fprintf(stderr, "blorp: out of memory (IO deadline queue %zu entries)\n",
+                new_cap);
+        exit(1);
+    }
+    __blorp_io_deadline_queue.items = new_items;
+    __blorp_io_deadline_queue.cap = new_cap;
+}
+
+static blorp_IoDeadlineEntry blorp_io_deadline_entry_empty(void) {
+    return (blorp_IoDeadlineEntry){ .waiter = NULL, .owner = NULL };
+}
+
+static void blorp_io_deadline_entry_release(blorp_IoDeadlineEntry* entry) {
+    if (!entry) return;
+    if (entry->owner) blorp_tcp_inner_release(entry->owner);
+    if (entry->waiter) blorp_io_waiter_release(entry->waiter);
+    entry->owner = NULL;
+    entry->waiter = NULL;
+}
+
+static blorp_IoDeadlineEntry blorp_io_deadline_heap_remove_at_locked(size_t idx) {
+    if (idx >= __blorp_io_deadline_queue.len) {
+        return blorp_io_deadline_entry_empty();
+    }
+    blorp_IoWaiter* removed = __blorp_io_deadline_queue.items[idx];
+    blorp_IoDeadlineEntry removed_entry = {
+        .waiter = removed,
+        .owner = removed->deadline_owner
+    };
+    removed->deadline_index = -1;
+    removed->deadline_queued = false;
+    removed->deadline_owner = NULL;
+    __blorp_io_deadline_queue.len--;
+    if (idx == __blorp_io_deadline_queue.len) return removed_entry;
+    __blorp_io_deadline_queue.items[idx] =
+        __blorp_io_deadline_queue.items[__blorp_io_deadline_queue.len];
+    __blorp_io_deadline_queue.items[idx]->deadline_index = (long)idx;
+    blorp_io_deadline_heap_sift_down(idx);
+    blorp_io_deadline_heap_sift_up(idx);
+    return removed_entry;
+}
+
+static blorp_IoDeadlineEntry blorp_io_deadline_heap_pop_min_locked(void) {
+    if (__blorp_io_deadline_queue.len == 0) {
+        return blorp_io_deadline_entry_empty();
+    }
+    return blorp_io_deadline_heap_remove_at_locked(0);
+}
+
+static void blorp_io_deadline_queue_insert(
+    blorp_IoWaiter* waiter,
+    blorp_TcpInner* owner
+) {
+    if (!waiter || waiter->deadline_ns == 0) return;
+    blorp_io_deadline_queue_ensure_init();
+    blorp_IoDeadlineEntry stale = blorp_io_deadline_entry_empty();
+    pthread_mutex_lock(&__blorp_io_deadline_queue.lock);
+    if (waiter->deadline_queued) {
+        size_t idx = (size_t)waiter->deadline_index;
+        if (idx < __blorp_io_deadline_queue.len &&
+            __blorp_io_deadline_queue.items[idx] == waiter) {
+            stale = blorp_io_deadline_heap_remove_at_locked(idx);
+        } else {
+            for (size_t i = 0; i < __blorp_io_deadline_queue.len; i++) {
+                if (__blorp_io_deadline_queue.items[i] == waiter) {
+                    stale = blorp_io_deadline_heap_remove_at_locked(i);
+                    break;
+                }
+            }
+            if (!stale.waiter) {
+                pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+                fprintf(stderr, "blorp: corrupted IO deadline queue entry (bug)\n");
+                abort();
+            }
+        }
+    }
+    blorp_io_deadline_heap_reserve(__blorp_io_deadline_queue.len + 1);
+    size_t idx = __blorp_io_deadline_queue.len++;
+    __blorp_io_deadline_queue.items[idx] = waiter;
+    blorp_io_waiter_retain(waiter);
+    if (owner) blorp_tcp_inner_retain(owner);
+    waiter->deadline_index = (long)idx;
+    waiter->deadline_queued = true;
+    waiter->deadline_owner = owner;
+    blorp_io_deadline_heap_sift_up(idx);
+    bool changes_next_expiry = waiter->deadline_index == 0;
+    pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+    blorp_io_deadline_entry_release(&stale);
+    if (__blorp_pool && changes_next_expiry) {
+        pthread_mutex_lock(&__blorp_pool->queue_lock);
+        pthread_cond_signal(&__blorp_pool->queue_cond);
+        pthread_mutex_unlock(&__blorp_pool->queue_lock);
+    }
+}
+
+static void blorp_io_deadline_queue_remove(blorp_IoWaiter* waiter) {
+    if (!waiter) return;
+    blorp_io_deadline_queue_ensure_init();
+    blorp_IoDeadlineEntry removed = blorp_io_deadline_entry_empty();
+    pthread_mutex_lock(&__blorp_io_deadline_queue.lock);
+    if (waiter->deadline_queued) {
+        size_t idx = (size_t)waiter->deadline_index;
+        if (idx < __blorp_io_deadline_queue.len &&
+            __blorp_io_deadline_queue.items[idx] == waiter) {
+            removed = blorp_io_deadline_heap_remove_at_locked(idx);
+        } else {
+            for (size_t i = 0; i < __blorp_io_deadline_queue.len; i++) {
+                if (__blorp_io_deadline_queue.items[i] == waiter) {
+                    removed = blorp_io_deadline_heap_remove_at_locked(i);
+                    break;
+                }
+            }
+            if (!removed.waiter) {
+                pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+                fprintf(stderr, "blorp: corrupted IO deadline queue entry (bug)\n");
+                abort();
+            }
+        }
+    }
+    pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+    blorp_io_deadline_entry_release(&removed);
+}
+
+static long blorp_io_deadline_queue_count(void) {
+    blorp_io_deadline_queue_ensure_init();
+    pthread_mutex_lock(&__blorp_io_deadline_queue.lock);
+    long count = (long)__blorp_io_deadline_queue.len;
+    pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+    return count;
+}
+
+static uint64_t blorp_io_deadline_queue_drain(void) {
+    blorp_io_deadline_queue_ensure_init();
+    uint64_t now_ns = blorp_monotonic_now_ns();
+
+    while (true) {
+        pthread_mutex_lock(&__blorp_io_deadline_queue.lock);
+        if (__blorp_io_deadline_queue.len == 0) {
+            pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+            return 0;
+        }
+        blorp_IoWaiter* waiter = __blorp_io_deadline_queue.items[0];
+        if (waiter->deadline_ns > now_ns) {
+            uint64_t next_deadline = waiter->deadline_ns;
+            pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+            return next_deadline;
+        }
+        blorp_IoDeadlineEntry expired = blorp_io_deadline_heap_pop_min_locked();
+        pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+
+        if (expired.waiter && expired.owner) {
+            blorp_IoWaiterList timed_out = blorp_tcp_inner_extract_waiter(
+                expired.owner, expired.waiter->kind, expired.waiter->generation,
+                BLORP_IO_WAKE_TIMEOUT);
+            blorp_io_waiter_wake_all(&timed_out);
+        }
+        blorp_io_deadline_entry_release(&expired);
+    }
+}
+
+static void blorp_io_deadline_queue_clear(void) {
+    blorp_io_deadline_queue_ensure_init();
+    blorp_IoDeadlineEntry* removed = NULL;
+    size_t removed_count = 0;
+    pthread_mutex_lock(&__blorp_io_deadline_queue.lock);
+    if (__blorp_io_deadline_queue.len > 0) {
+        removed_count = __blorp_io_deadline_queue.len;
+        removed = (blorp_IoDeadlineEntry*)calloc(
+            removed_count, sizeof(blorp_IoDeadlineEntry));
+        if (!removed) {
+            pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+            fprintf(stderr, "blorp: out of memory clearing IO deadline queue\n");
+            exit(1);
+        }
+    }
+    for (size_t i = 0; i < __blorp_io_deadline_queue.len; i++) {
+        blorp_IoWaiter* waiter = __blorp_io_deadline_queue.items[i];
+        if (!waiter) continue;
+        removed[i].waiter = waiter;
+        removed[i].owner = waiter->deadline_owner;
+        waiter->deadline_queued = false;
+        waiter->deadline_index = -1;
+        waiter->deadline_owner = NULL;
+    }
+    free(__blorp_io_deadline_queue.items);
+    __blorp_io_deadline_queue.items = NULL;
+    __blorp_io_deadline_queue.len = 0;
+    __blorp_io_deadline_queue.cap = 0;
+    pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
+    for (size_t i = 0; i < removed_count; i++) {
+        blorp_io_deadline_entry_release(&removed[i]);
+    }
+    free(removed);
+}
+
+static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
+    blorp_TcpInner* inner,
+    blorp_IoWaitKind kind,
+    int fd,
+    uint64_t generation,
+    int interest,
+    long timeout_ms
+) {
+    if (__blorp_cancel_current_task_if_requested()) {
+        return BLORP_IO_WAKE_CANCELLED;
+    }
+
+    blorp_Fiber* self = __blorp_current_fiber;
+    if (!inner || !self) return BLORP_IO_WAKE_NONE;
+
+    pthread_mutex_lock(&inner->mutex);
+    bool open = inner->state == BLORP_TCP_STATE_OPEN && inner->fd == fd &&
+        inner->generation == generation;
+    pthread_mutex_unlock(&inner->mutex);
+    if (!open) return BLORP_IO_WAKE_CLOSED;
+
+    uint64_t deadline_ns = 0;
+    if (timeout_ms >= 0) {
+        uint64_t now_ns = blorp_monotonic_now_ns();
+        uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
+        deadline_ns =
+            timeout_ns > UINT64_MAX - now_ns ? UINT64_MAX : now_ns + timeout_ns;
+    }
+
+    blorp_IoWaiter* waiter =
+        blorp_io_waiter_new(kind, self, generation, deadline_ns);
+    blorp_IoWakeReason result = BLORP_IO_WAKE_NONE;
+
+    __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
+    if (blorp_tcp_inner_install_waiter(inner, waiter) != 0) {
+        __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+        blorp_io_waiter_release(waiter);
+        return BLORP_IO_WAKE_CLOSED;
+    }
+
+    // Readiness can arrive after reactor registration but before this waiter
+    // is installed. Take that pending readiness before yielding so one-shot
+    // readiness suppression cannot lose a wake.
+    if (blorp_io_reactor_take_ready(fd, generation, interest) > 0) {
+        (void)blorp_tcp_inner_remove_waiter(inner, waiter);
+        __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+        blorp_io_waiter_release(waiter);
+        return BLORP_IO_WAKE_READY;
+    }
+
+    if (deadline_ns != 0) blorp_io_deadline_queue_insert(waiter, inner);
+
+    blorp_fiber_park();
+
+    if (deadline_ns != 0) blorp_io_deadline_queue_remove(waiter);
+
+    if (__blorp_is_cancelled()) {
+        if (waiter->installed) {
+            (void)blorp_tcp_inner_cancel_waiter(inner, waiter);
+        }
+        (void)__blorp_cancel_current_task_if_requested();
+        blorp_io_waiter_release(waiter);
+        return BLORP_IO_WAKE_CANCELLED;
+    }
+
+    if (waiter->wake_reason == BLORP_IO_WAKE_NONE && deadline_ns != 0) {
+        blorp_IoWaiterList timed_out = blorp_tcp_inner_extract_waiter(
+            inner, kind, generation, BLORP_IO_WAKE_TIMEOUT);
+        blorp_io_waiter_wake_all(&timed_out);
+    }
+
+    if (waiter->wake_reason == BLORP_IO_WAKE_NONE) {
+        (void)blorp_tcp_inner_remove_waiter(inner, waiter);
+    }
+
+    result = waiter->wake_reason;
+    blorp_io_waiter_release(waiter);
+    return result;
+}
+
 static void blorp_timer_heap_swap(size_t a, size_t b) {
     blorp_Fiber* tmp = __fiber_timer_queue.items[a];
     __fiber_timer_queue.items[a] = __fiber_timer_queue.items[b];
@@ -12336,16 +14610,6 @@ static void blorp_fiber_destroy_list(blorp_Fiber* fibers) {
         fibers = next;
     }
 }
-
-typedef void (*blorp_CancelCleanupFn)(void*);
-
-typedef struct blorp_CancelCleanupFrame {
-    struct blorp_CancelCleanupFrame* prev;
-    const void* slot;
-    void* value;
-    blorp_CancelCleanupFn release_value;
-    bool active;
-} blorp_CancelCleanupFrame;
 
 // Task handle (ARC-managed)
 typedef struct blorp_Task_s {
@@ -17223,6 +19487,18 @@ blorp_SchedulerStats* blorp_get_scheduler_stats(void) {
     stats->timer_expirations =
         atomic_load_explicit(&global_scheduler_stats.timer_expirations,
             memory_order_relaxed);
+    stats->reactor_control_wakes =
+        atomic_load_explicit(&global_scheduler_stats.reactor_control_wakes,
+            memory_order_relaxed);
+    stats->reactor_poll_wakes =
+        atomic_load_explicit(&global_scheduler_stats.reactor_poll_wakes,
+            memory_order_relaxed);
+    stats->reactor_ready_events =
+        atomic_load_explicit(&global_scheduler_stats.reactor_ready_events,
+            memory_order_relaxed);
+    stats->reactor_waiter_wakes =
+        atomic_load_explicit(&global_scheduler_stats.reactor_waiter_wakes,
+            memory_order_relaxed);
     stats->stack_allocations =
         atomic_load_explicit(&global_scheduler_stats.stack_allocations,
             memory_order_relaxed);
@@ -17277,6 +19553,14 @@ void blorp_reset_scheduler_stats(void) {
     atomic_store_explicit(&global_scheduler_stats.timer_inserts, 0,
         memory_order_relaxed);
     atomic_store_explicit(&global_scheduler_stats.timer_expirations, 0,
+        memory_order_relaxed);
+    atomic_store_explicit(&global_scheduler_stats.reactor_control_wakes, 0,
+        memory_order_relaxed);
+    atomic_store_explicit(&global_scheduler_stats.reactor_poll_wakes, 0,
+        memory_order_relaxed);
+    atomic_store_explicit(&global_scheduler_stats.reactor_ready_events, 0,
+        memory_order_relaxed);
+    atomic_store_explicit(&global_scheduler_stats.reactor_waiter_wakes, 0,
         memory_order_relaxed);
     atomic_store_explicit(&global_scheduler_stats.stack_allocations, 0,
         memory_order_relaxed);
