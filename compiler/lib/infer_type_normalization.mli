@@ -9,6 +9,7 @@ type purpose =
   | ArgumentCompatibility
   | UfcsCandidateFiltering
   | CalleeDispatch
+  | TryErrorCompatibility
   | VariadicDimensionExtraction
 
 type context

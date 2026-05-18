@@ -2050,6 +2050,12 @@ let ctx_types_compatible ctx expected actual =
         expected actual
   | rigid_vars -> types_compatible_rigid ~rigid_vars expected actual
 
+let same_try_error_type ctx a b =
+  let canonical ty =
+    normalize_type ctx TryErrorCompatibility (Types.zonk_type ty)
+  in
+  types_equal (canonical a) (canonical b)
+
 (** Tensor loop-view classification must be tied to a resolved tensor producer,
     not just the source spelling. Local or third-party functions named
     [enumerate]/[enumerate2]/[windows] must keep normal function-call semantics.
@@ -4138,11 +4144,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                             "Cannot mix Option and Result ?= bindings in the \
                              same try: block"
                       | Some (`Result prev_err_ty) ->
-                          let type_params = Env.get_type_params ctx.env in
-                          if
-                            not
-                              (types_bidirectional ~type_params prev_err_ty
-                                 err_ty)
+                          if not (same_try_error_type ctx prev_err_ty err_ty)
                           then
                             error stmt.expr_loc
                               (Printf.sprintf
