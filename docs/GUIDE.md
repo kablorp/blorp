@@ -1464,6 +1464,13 @@ Rules for `?=`:
 - `?=` is currently rejected inside loop bodies until the compiler has a Perceus-safe early-return node for loop exits.
 - There is no bare postfix `?` operator.
 
+### `with` Resource Scopes
+
+`with name = acquire():` and `with name ?= acquire():` are reserved for scoped
+resources with deterministic cleanup. The parser accepts the syntax and the AST
+represents plain and fallible acquisition separately, but typechecking rejects
+`with` until resource-scope checking and cleanup lowering are implemented.
+
 ### debug: Blocks
 
 Use `debug:` blocks for diagnostic code that should stay visibly separate

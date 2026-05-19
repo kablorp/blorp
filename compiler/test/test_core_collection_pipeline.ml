@@ -26,6 +26,17 @@ let cfloat n = mk ty_float (CLit (LitFloat n))
 let void = mk ty_void CVoid
 let callback name params return = cvar name (ty_func params return)
 
+let resource_scope name ty acquire body cleanup =
+  mk body.ty
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty;
+         rs_acquire = acquire;
+         rs_body = body;
+         rs_cleanup = cleanup;
+       })
+
 let impure_callback name params return =
   cvar name (ty_impure_func params return)
 
@@ -524,6 +535,33 @@ let test_lowers_bare_fold_with_borrowed_source () =
   Alcotest.(check int)
     "fused loop does not use checked source loads" 0
     (count_intrinsic "list_get" fused)
+
+let test_no_capture_callback_respects_resource_scope_binding () =
+  let callback_ty = ty_func [ ty_int ] ty_int in
+  let scoped =
+    resource_scope "resource" ty_int (cint 0) (cvar "resource" ty_int) void
+  in
+  let callback =
+    mk callback_ty
+      (CLambda
+         {
+           lam_params = [ (Var.named "value", ty_int) ];
+           lam_body = scoped;
+           lam_return_ty = ty_int;
+           lam_is_pure = true;
+         })
+  in
+  let lowered = P.callback_call ~loc callback [ cint 1 ] ty_int in
+  match lowered.desc with
+  | CLet (_, { desc = CResourceScope { rs_body = { desc = CVar v; _ }; _ }; _ })
+    ->
+      Alcotest.(check string)
+        "resource body reads scoped binding" "resource" v.vname
+  | CCall (CKClosure, _, _) ->
+      Alcotest.fail "resource-scope binding was mistaken for a capture"
+  | _ ->
+      Alcotest.failf "unexpected callback lowering:\n%s"
+        (Blorp.Core.pp_to_string lowered)
 
 let test_lowers_filter_map_fold_with_borrowed_source () =
   let fused = P.fuse_expr (filter_map_fold_expr ()) in
@@ -1348,6 +1386,8 @@ let suite =
           test_lowers_filter_map_fold_without_intermediate_hofs;
         Alcotest.test_case "bare_fold_borrows_source" `Quick
           test_lowers_bare_fold_with_borrowed_source;
+        Alcotest.test_case "no_capture_callback_resource_scope_binding" `Quick
+          test_no_capture_callback_respects_resource_scope_binding;
         Alcotest.test_case "filter_map_fold_borrows_source" `Quick
           test_lowers_filter_map_fold_with_borrowed_source;
         Alcotest.test_case "filter_map_length_no_materialized_list" `Quick

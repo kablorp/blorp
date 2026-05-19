@@ -138,6 +138,11 @@ let rec expr_source_end_line e =
   | EConcurrent (bindings, timeout, _) ->
       max_optional_expr (max_exprs base bindings) timeout
   | EConcurrentBind (_, _, value) -> max base (expr_source_end_line value)
+  | EWith (binding, body) ->
+      max base
+        (max
+           (expr_source_end_line binding.with_value)
+           (expr_source_end_line body))
   | EConcurrentFor (_, iterable, body, timeout, _) ->
       max_optional_expr
         (max base
@@ -417,7 +422,7 @@ let should_force_signature_params ~head ~params ~ret ~where_clause =
 (** Check if an expression contains block-producing constructs that force multiline *)
 let rec expr_has_block e =
   match e.expr_desc with
-  | EBlock _ | EMatch _ | EDebugBlock _ -> true
+  | EBlock _ | EMatch _ | EDebugBlock _ | EWith _ -> true
   | ELambda fd -> (
       match func_body_expr_opt fd.func_body with
       | Some { expr_desc = EBlock _; _ } -> true
@@ -675,7 +680,7 @@ and print_expr_desc = function
   | EAscription (inner, ty) ->
       let inner_doc =
         match inner.expr_desc with
-        | EAscription _ | EBlock _ | EMatch _ | EIf _ | EDebugBlock _
+        | EAscription _ | EBlock _ | EMatch _ | EIf _ | EWith _ | EDebugBlock _
         | EConcurrent _ | EConcurrentFor _ | EFor _ | EForTuple _ | EWhile _ ->
             parens (print_expr inner)
         | _ -> print_expr inner
@@ -898,8 +903,8 @@ and print_expr_desc = function
          changes `(a + b).to_string()` into `a + b.to_string()`. *)
       let e_doc =
         match e.expr_desc with
-        | EDebugBlock _ | EIf _ | EMatch _ | EBlock _ | EFor _ | EForTuple _
-        | EWhile _ | EConcurrent _ ->
+        | EWith _ | EDebugBlock _ | EIf _ | EMatch _ | EBlock _ | EFor _
+        | EForTuple _ | EWhile _ | EConcurrent _ ->
             text "(" ^^ print_expr e ^^ hardline ^^ text ")"
         | EAscription _ | EBinary _ | ELogical _ | ERange _ | EUnary _ ->
             parens (print_expr e)
@@ -1003,6 +1008,19 @@ and print_expr_desc = function
         | None -> Nil
       in
       text name ^^ ty_ann ^^ text " ?= " ^^ print_expr e
+  | EWith (binding, body) ->
+      let ty_ann =
+        match binding.with_type with
+        | Some ty -> text ": " ^^ print_type_expr ty
+        | None -> Nil
+      in
+      let op =
+        match binding.with_kind with WithPlain -> " = " | WithTry -> " ?= "
+      in
+      text "with " ^^ text binding.with_name ^^ ty_ann ^^ text op
+      ^^ print_expr binding.with_value
+      ^^ text ":"
+      ^^ indent (hardline ^^ print_block_body body)
   | EConcurrent (bindings, timeout, max_threads) ->
       let params =
         match (timeout, max_threads) with

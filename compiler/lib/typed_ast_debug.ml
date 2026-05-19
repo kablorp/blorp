@@ -69,6 +69,7 @@ let expr_label (expr : Ast.expr) =
   | EStringInterp _ -> "string_interp"
   | EStringInterpRaw _ -> "string_interp_raw"
   | EQuestionBind (name, _, _) -> "question_bind " ^ name
+  | EWith (binding, _) -> "with " ^ binding.with_name
   | EDebugBlock _ -> "debug_block"
   | EConcurrent _ -> "concurrent"
   | EConcurrentBind (name, _, _) -> "concurrent_bind " ^ name
@@ -96,6 +97,7 @@ let expr_children_from_desc = function
   | EConcurrentBind (_, _, expr)
   | EDetach expr ->
       [ expr ]
+  | EWith (binding, body) -> [ binding.with_value; body ]
   | EBinary (_, left, right)
   | ELogical (_, left, right)
   | EWhile (left, right)

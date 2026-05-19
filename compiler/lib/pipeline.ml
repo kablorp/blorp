@@ -431,8 +431,7 @@ let typecheck_only ~filename ~source ?(debug = false) () =
   | Ok typed_program -> Ok (Typed_ast.program_ast typed_program)
   | Error _ as e -> e
 
-(** Parse and type-check a module, returning the final state and typed program.
-        Used for analysis tools like 'purify'. *)
+(** Parse and type-check a module, returning the final state and typed program. *)
 let typecheck_module_only_typed ~filename ~source =
   with_fresh_session filename (fun () ->
       match parse_and_load_modules ~filename source with

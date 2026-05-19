@@ -474,6 +474,12 @@ and var_occurs_free_in_body (name : string) bound (body : core) : bool =
           [ h.lh_source_var; h.lh_result_var; h.lh_len_var; h.lh_out_var ]
       in
       var_occurs_free_in_body name body_bound h.lh_body
+  | CResourceScope scope ->
+      var_occurs_free_in_body name bound scope.rs_acquire
+      ||
+      let scope_bound = add_bound_var bound scope.rs_var in
+      var_occurs_free_in_body name scope_bound scope.rs_body
+      || var_occurs_free_in_body name scope_bound scope.rs_cleanup
   | CMatchArms (scrut, arms) ->
       var_occurs_free_in_body name bound scrut
       || List.exists

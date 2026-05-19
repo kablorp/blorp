@@ -22,6 +22,8 @@
     - [check_no_desugarable_mutation] — ENABLED (post-desugar)
     - [check_no_cmatcharms] — ENABLED (post-match, bookended at Perceus and Final)
     - [check_no_codegen_unprepared_forms] — ENABLED (Final)
+    - [check_resource_scope_contracts_at] — ENABLED (Perceus and Final)
+    - [check_no_unemitted_resource_scopes_at] — ENABLED (Final)
     - [check_void_boxed_builtin_args_explicit] — ENABLED (Final)
     - [check_no_raw_top_level_function_refs] — ENABLED (Final)
     - [check_concurrent_semantics_at] — ENABLED (Final)
@@ -265,6 +267,74 @@ let invariant_types_equal ~(reg : Codegen_types.registry) a b =
   Types.types_equal
     (invariant_normalize_type ~reg a)
     (invariant_normalize_type ~reg b)
+
+let check_resource_scope_contracts_at (stage : Core_stage.t)
+    (prog : Core.core_program) : Core_error.t list =
+  let reg = registry_for_program prog in
+  let ty_void = Ast.TyNamed ("Void", []) in
+  fold_program
+    (fun acc e ->
+      match e.Core.desc with
+      | Core.CResourceScope s ->
+          let acc =
+            if invariant_types_equal ~reg s.rs_acquire.ty s.rs_ty then acc
+            else
+              violation_at stage s.rs_acquire.loc
+                ~hint:
+                  "Lowering should commit the resource capability type once on \
+                   CResourceScope.rs_ty, and the acquisition expression must \
+                   produce that exact type."
+                (Printf.sprintf
+                   "resource acquire type `%s` does not match binding type `%s`"
+                   (Types.type_to_string s.rs_acquire.ty)
+                   (Types.type_to_string s.rs_ty))
+              :: acc
+          in
+          let acc =
+            if invariant_types_equal ~reg e.Core.ty s.rs_body.ty then acc
+            else
+              violation_at stage s.rs_body.loc
+                ~hint:
+                  "A CResourceScope returns the value of its body. Keep \
+                   cleanup as a separate Void action instead of mixing it into \
+                   the result expression."
+                (Printf.sprintf
+                   "resource body type `%s` does not match scope result type \
+                    `%s`"
+                   (Types.type_to_string s.rs_body.ty)
+                   (Types.type_to_string e.Core.ty))
+              :: acc
+          in
+          if invariant_types_equal ~reg s.rs_cleanup.ty ty_void then acc
+          else
+            violation_at stage s.rs_cleanup.loc
+              ~hint:
+                "Resource cleanup is a side-effecting finalizer and must \
+                 return Void. The scope result comes only from the body."
+              (Printf.sprintf "resource cleanup type `%s` should be Void"
+                 (Types.type_to_string s.rs_cleanup.ty))
+            :: acc
+      | _ -> acc)
+    [] prog
+  |> List.rev
+
+let check_no_unemitted_resource_scopes_at (stage : Core_stage.t)
+    (prog : Core.core_program) : Core_error.t list =
+  fold_program
+    (fun acc e ->
+      match e.Core.desc with
+      | Core.CResourceScope _ ->
+          violation_at stage e.loc
+            ~hint:
+              "CResourceScope is the explicit cleanup-scope IR. Keep it out of \
+               final Core until the backend can emit exactly-once cleanup on \
+               normal and nonlocal exits."
+            "CResourceScope reached final Core before cleanup emission is \
+             implemented"
+          :: acc
+      | _ -> acc)
+    [] prog
+  |> List.rev
 
 let nth_opt xs n =
   let rec go i = function
@@ -1537,6 +1607,7 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       check_no_sugar prog @ check_no_cmatcharms prog
       @ check_raw_tensor_views_at stage prog (* bookend *)
       @ check_call_ownership_contracts_at stage prog
+      @ check_resource_scope_contracts_at stage prog
   | Core_stage.Closure -> check_no_preclosure_forms prog
   | Core_stage.Final ->
       check_no_debug_blocks_at stage prog
@@ -1552,6 +1623,8 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_no_raw_string_byte_intrinsics_at stage prog
       @ check_tensor_literal_layouts_at stage prog
       @ check_tensor_loop_storage_provenance_at stage prog
+      @ check_resource_scope_contracts_at stage prog
+      @ check_no_unemitted_resource_scopes_at stage prog
       @ check_concurrent_semantics_at stage prog
   (* No invariants drafted for these stages yet: *)
   | Core_stage.Lower | Core_stage.Synth | Core_stage.TraitResolve

@@ -259,6 +259,16 @@ and clone_expr state env e =
       let loop_var, body_env = rename_binder state env binder.loop_var in
       let body = clone body_env body in
       { e with desc = CFor ({ binder with loop_var }, iter, body) }
+  | CResourceScope scope ->
+      let rs_acquire = clone env scope.rs_acquire in
+      let rs_var, body_env = rename_binder state env scope.rs_var in
+      let rs_body = clone body_env scope.rs_body in
+      let rs_cleanup = clone body_env scope.rs_cleanup in
+      {
+        e with
+        desc =
+          CResourceScope { scope with rs_var; rs_acquire; rs_body; rs_cleanup };
+      }
   | CAssign (v, rhs) ->
       { e with desc = CAssign (rename_existing_var env v, clone env rhs) }
   | CDup (v, ty, body) ->

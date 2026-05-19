@@ -746,6 +746,20 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
         e with
         desc = CTensorRawViewLet ({ binding with trv_source = source' }, body');
       }
+  | CResourceScope s ->
+      let acquire' = resolve_same s.rs_acquire in
+      let scope_bound = bind_var bound s.rs_var in
+      {
+        e with
+        desc =
+          CResourceScope
+            {
+              s with
+              rs_acquire = acquire';
+              rs_body = resolve_with scope_bound s.rs_body;
+              rs_cleanup = resolve_with scope_bound s.rs_cleanup;
+            };
+      }
   | CLambda lam ->
       let lam_bound =
         List.fold_left (fun acc (v, _) -> bind_var acc v) bound lam.lam_params

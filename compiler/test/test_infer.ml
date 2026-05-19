@@ -146,10 +146,8 @@ let parse_and_typecheck source =
   let program = Blorp.Interp_parser.transform_program program in
   Blorp.Typecheck.typecheck program
 
-let parse_and_typecheck_module source =
-  match
-    Blorp.Pipeline.typecheck_module_only ~filename:"test_input.brp" ~source
-  with
+let parse_and_typecheck_module ?(filename = "test_input.brp") source =
+  match Blorp.Pipeline.typecheck_module_only ~filename ~source with
   | Ok (state, typed_program) ->
       (typed_program, List.rev state.Blorp.Typecheck.errors)
   | Error errors -> ([], errors)
@@ -218,6 +216,112 @@ let require_call_payload ?expected_callee_ty typed func_name callee_name
       | None -> Alcotest.failf "%s call not found" callee_name)
   | None -> Alcotest.failf "function %s not found" func_name
 
+let require_resolved_call typed func_name callee_name =
+  match find_func_body typed func_name with
+  | Some body -> (
+      match
+        find_first_expr
+          (function
+            | { expr_desc = ECall ({ expr_desc = EIdent name; _ }, _); _ }
+              when name = callee_name ->
+                true
+            | _ -> false)
+          body
+      with
+      | Some call -> (
+          match call.expr_type_info with
+          | Some { resolved_call = Some resolved; _ } -> resolved
+          | Some _ ->
+              Alcotest.failf "%s call has no resolved-call metadata" callee_name
+          | None -> Alcotest.failf "%s call has no type info" callee_name)
+      | None -> Alcotest.failf "%s call not found" callee_name)
+  | None -> Alcotest.failf "function %s not found" func_name
+
+let require_resolved_call_matching typed func_name label pred =
+  let describe_origin = function
+    | CallableLocal -> "local"
+    | CallableImported path -> "imported:" ^ path
+    | CallableBuiltin -> "builtin"
+    | CallableForeign -> "foreign"
+    | CallableConstructor name -> "constructor:" ^ name
+    | CallableImplMethod -> "impl-method"
+  in
+  let describe_target = function
+    | CallDirect { source_name; origin; _ } ->
+        Printf.sprintf "direct:%s:%s" source_name (describe_origin origin)
+    | CallTraitMethod { trait_name; method_name; _ } ->
+        Printf.sprintf "trait:%s.%s" trait_name method_name
+    | CallClosure _ -> "closure"
+  in
+  let describe_syntax = function
+    | CallBare -> "bare"
+    | CallMethod -> "method"
+    | CallQualified path -> "qualified:" ^ path
+    | CallClosureSyntax -> "closure"
+    | CallTraitDispatch -> "trait-dispatch"
+    | CallMethodOnlyUfcs -> "method-only-ufcs"
+  in
+  let rec collect_resolved acc expr =
+    let acc =
+      match expr.expr_type_info with
+      | Some { resolved_call = Some resolved; _ } ->
+          Printf.sprintf "%s/%s"
+            (describe_syntax resolved.call_syntax)
+            (describe_target resolved.call_target)
+          :: acc
+      | _ -> acc
+    in
+    List.fold_left collect_resolved acc (expr_children expr)
+  in
+  match find_func_body typed func_name with
+  | Some body -> (
+      match
+        find_first_expr
+          (fun expr ->
+            match expr.expr_type_info with
+            | Some { resolved_call = Some resolved; _ } -> pred resolved
+            | _ -> false)
+          body
+      with
+      | Some { expr_type_info = Some { resolved_call = Some resolved; _ }; _ }
+        ->
+          resolved
+      | Some _ ->
+          Alcotest.failf "%s expression lost resolved-call metadata" label
+      | None ->
+          let available =
+            collect_resolved [] body |> List.rev |> String.concat ", "
+          in
+          Alcotest.failf "%s resolved call not found; available: [%s]" label
+            available)
+  | None -> Alcotest.failf "function %s not found" func_name
+
+let require_direct_resolved_call ?expected_origin ?(expected_pure = true) typed
+    func_name callee_name =
+  let call = require_resolved_call typed func_name callee_name in
+  Alcotest.(check bool)
+    (callee_name ^ " bare call syntax")
+    true
+    (call.call_syntax = CallBare);
+  match call.call_target with
+  | CallDirect { callable_id; source_name; call_pure; origin } ->
+      check_string (callee_name ^ " target name") callee_name source_name;
+      Alcotest.(check bool)
+        (callee_name ^ " call purity")
+        expected_pure call_pure;
+      Alcotest.(check bool)
+        (callee_name ^ " callable id minted")
+        true (callable_id >= 0);
+      Option.iter
+        (fun expected ->
+          Alcotest.(check bool)
+            (callee_name ^ " origin") true (origin = expected))
+        expected_origin;
+      call
+  | CallTraitMethod _ ->
+      Alcotest.failf "%s resolved as trait dispatch" callee_name
+  | CallClosure _ -> Alcotest.failf "%s resolved as closure call" callee_name
+
 let test_infer_integer_literal () =
   with_isolated_env (fun () ->
       let src = {|
@@ -232,6 +336,205 @@ func f() -> Int:
           | Some ty -> check_true "body is Int" (types_equal ty ty_int)
           | None -> Alcotest.fail "body expr_type is None")
       | None -> Alcotest.fail "function f not found")
+
+let test_call_metadata_for_direct_local_call () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+func id(x: Int) -> Int:
+    x
+
+func use() -> Int:
+    id(1)
+|}
+      in
+      let typed, errors = parse_and_typecheck src in
+      check_int "no type errors" 0 (List.length errors);
+      let call = require_resolved_call typed "use" "id" in
+      Alcotest.(check bool) "bare call syntax" true (call.call_syntax = CallBare);
+      check_true "instantiated param"
+        (match call.instantiated_params with
+        | [ ty ] -> types_equal ty ty_int
+        | _ -> false);
+      check_true "instantiated return"
+        (types_equal call.instantiated_return ty_int);
+      match call.call_target with
+      | CallDirect { callable_id; source_name; call_pure; origin } ->
+          Alcotest.(check string) "target name" "id" source_name;
+          Alcotest.(check bool) "default function is impure" false call_pure;
+          Alcotest.(check bool) "local origin" true (origin = CallableLocal);
+          Alcotest.(check bool) "callable id minted" true (callable_id >= 0)
+      | CallTraitMethod _ | CallClosure _ ->
+          Alcotest.fail "expected direct callable metadata")
+
+let test_call_metadata_for_closure_call () =
+  with_isolated_env (fun () ->
+      let src = {|
+func use(f: pure (Int) -> Int) -> Int:
+    f(1)
+|} in
+      let typed, errors = parse_and_typecheck src in
+      check_int "no type errors" 0 (List.length errors);
+      let call = require_resolved_call typed "use" "f" in
+      Alcotest.(check bool)
+        "closure call syntax" true
+        (call.call_syntax = CallClosureSyntax);
+      check_true "instantiated param"
+        (match call.instantiated_params with
+        | [ ty ] -> types_equal ty ty_int
+        | _ -> false);
+      check_true "instantiated return"
+        (types_equal call.instantiated_return ty_int);
+      match call.call_target with
+      | CallClosure { call_pure } ->
+          Alcotest.(check bool) "closure purity" true call_pure
+      | CallDirect _ | CallTraitMethod _ ->
+          Alcotest.fail "expected closure-call metadata")
+
+let test_call_metadata_for_constructor_call () =
+  with_isolated_env (fun () ->
+      let src = {|
+func make(x: Int) -> Option[Int]:
+    Some(x)
+|} in
+      let typed, errors = parse_and_typecheck src in
+      check_int "no type errors" 0 (List.length errors);
+      let call =
+        require_direct_resolved_call
+          ~expected_origin:(CallableConstructor "Option") typed "make" "Some"
+      in
+      check_true "instantiated constructor param"
+        (match call.instantiated_params with
+        | [ ty ] -> types_equal ty ty_int
+        | _ -> false);
+      check_true "instantiated constructor return"
+        (types_equal call.instantiated_return (TyNamed ("Option", [ ty_int ]))))
+
+let test_call_metadata_for_trait_dispatch () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+trait Weighted:
+    pure func weight(self: Self) -> Int
+
+
+func use[T: Weighted](x: T) -> Int:
+    weight(x)
+|}
+      in
+      let typed, errors = parse_and_typecheck src in
+      check_int "no type errors" 0 (List.length errors);
+      let call = require_resolved_call typed "use" "weight" in
+      Alcotest.(check bool)
+        "trait dispatch syntax" true
+        (call.call_syntax = CallTraitDispatch);
+      check_true "instantiated trait param"
+        (match call.instantiated_params with
+        | [ TyNamed ("T", []) ] | [ TyVar "T" ] -> true
+        | _ -> false);
+      check_true "instantiated trait return"
+        (types_equal call.instantiated_return ty_int);
+      match call.call_target with
+      | CallTraitMethod { trait_name; method_name; call_pure; callable_id } ->
+          check_string "trait name" "Weighted" trait_name;
+          check_string "method name" "weight" method_name;
+          Alcotest.(check (option int))
+            "deferred trait has no concrete callable id" None callable_id;
+          Alcotest.(check bool) "trait method purity" true call_pure
+      | CallDirect _ | CallClosure _ ->
+          Alcotest.fail "expected deferred trait dispatch metadata")
+
+let test_call_metadata_for_module_qualified_function () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+import:
+    list as L
+
+
+pure func use(xs: List[Int]) -> List[Int]:
+    L.reverse(xs)
+|}
+      in
+      let typed, errors = parse_and_typecheck_module src in
+      if errors <> [] then
+        Alcotest.failf "expected no type errors, got %d:\n%s"
+          (List.length errors)
+          (String.concat "\n" (List.map (fun e -> "  - " ^ e.message) errors));
+      let call =
+        require_resolved_call_matching typed "use" "module-qualified function"
+          (fun call ->
+            match call.call_target with
+            | CallDirect { source_name = "reverse"; origin; _ } ->
+                origin = CallableImported "std/list"
+            | _ -> false)
+      in
+      Alcotest.(check bool)
+        "qualified call syntax" true
+        (call.call_syntax = CallQualified "std/list");
+      check_true "instantiated qualified param"
+        (match call.instantiated_params with
+        | [ TyNamed ("List", [ ty ]) ] -> types_equal ty ty_int
+        | _ -> false);
+      check_true "instantiated qualified return"
+        (types_equal call.instantiated_return (TyNamed ("List", [ ty_int ])));
+      match call.call_target with
+      | CallDirect { callable_id; source_name; call_pure; origin } ->
+          check_string "target name" "reverse" source_name;
+          Alcotest.(check bool) "qualified function purity" true call_pure;
+          Alcotest.(check bool) "callable id minted" true (callable_id >= 0);
+          Alcotest.(check bool)
+            "qualified function origin" true
+            (origin = CallableImported "std/list")
+      | CallTraitMethod _ | CallClosure _ ->
+          Alcotest.fail "expected direct function metadata")
+
+let test_call_metadata_for_module_qualified_impl_method () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+import:
+    bool as B
+
+
+pure func use() -> String:
+    B.to_string(True)
+|}
+      in
+      let typed, errors = parse_and_typecheck_module src in
+      if errors <> [] then
+        Alcotest.failf "expected no type errors, got %d:\n%s"
+          (List.length errors)
+          (String.concat "\n" (List.map (fun e -> "  - " ^ e.message) errors));
+      let call =
+        require_resolved_call_matching typed "use"
+          "module-qualified impl method" (fun call ->
+            match call.call_target with
+            | CallTraitMethod
+                { trait_name = "Stringable"; method_name = "to_string"; _ } ->
+                true
+            | _ -> false)
+      in
+      Alcotest.(check bool)
+        "qualified call syntax" true
+        (match call.call_syntax with CallQualified _ -> true | _ -> false);
+      check_true "instantiated impl param"
+        (match call.instantiated_params with
+        | [ TyNamed ("Bool", []) ] -> true
+        | _ -> false);
+      check_true "instantiated impl return"
+        (types_equal call.instantiated_return ty_string);
+      match call.call_target with
+      | CallTraitMethod { trait_name; method_name; call_pure; callable_id } ->
+          check_string "trait name" "Stringable" trait_name;
+          check_string "method name" "to_string" method_name;
+          (match callable_id with
+          | Some id ->
+              Alcotest.(check bool) "impl callable id minted" true (id >= 0)
+          | None -> Alcotest.fail "expected concrete impl callable id");
+          Alcotest.(check bool) "impl method purity" true call_pure
+      | CallDirect _ | CallClosure _ ->
+          Alcotest.fail "expected trait-method metadata")
 
 let test_infer_integer_literal_carries_no_widening_payload () =
   with_isolated_env (fun () ->
@@ -536,7 +839,10 @@ func f() -> Int:
       let typed, errors = parse_and_typecheck src in
       check_int "no type errors" 0 (List.length errors);
       require_call_payload typed "f" "bit_and" ty_int
-        ~expected_callee_ty:(ty_func [ ty_int; ty_int ] ty_int ~pure:true))
+        ~expected_callee_ty:(ty_func [ ty_int; ty_int ] ty_int ~pure:true);
+      ignore
+        (require_direct_resolved_call ~expected_origin:CallableBuiltin typed "f"
+           "bit_and"))
 
 let test_infer_reflection_calls_carry_no_widening_payload () =
   with_isolated_env (fun () ->
@@ -556,7 +862,9 @@ func inspect[T](x: T):
       let typed, errors = parse_and_typecheck_module src in
       check_int "no type errors" 0 (List.length errors);
       require_call_payload typed "inspect" "type_name" ty_string;
-      require_call_payload typed "inspect" "is_heap" ty_bool)
+      ignore (require_direct_resolved_call typed "inspect" "type_name");
+      require_call_payload typed "inspect" "is_heap" ty_bool;
+      ignore (require_direct_resolved_call typed "inspect" "is_heap"))
 
 let test_infer_checked_tensor_calls_carry_no_widening_payload () =
   with_isolated_env (fun () ->
@@ -582,13 +890,20 @@ func checked_nodes(vdyn: Int[#Ds...]) -> Bool:
       let typed, errors = parse_and_typecheck_module src in
       check_int "no type errors" 0 (List.length errors);
       require_call_payload typed "checked_nodes" "checked_get" ty_int;
+      ignore (require_direct_resolved_call typed "checked_nodes" "checked_get");
       require_call_payload typed "checked_nodes" "checked_set"
         (ty_array ty_int [ TyConstInt 5 ]);
+      ignore (require_direct_resolved_call typed "checked_nodes" "checked_set");
       require_call_payload typed "checked_nodes" "checked_slice"
         (ty_array ty_int [ TyConstInt 2 ]);
+      ignore
+        (require_direct_resolved_call typed "checked_nodes" "checked_slice");
       require_call_payload typed "checked_nodes" "matrix_checked_get" ty_int;
+      ignore
+        (require_direct_resolved_call typed "checked_nodes" "matrix_checked_get");
       require_call_payload typed "checked_nodes" "assert_shape"
-        (TyNamed ("Option", [ ty_array ty_int [ TyConstInt 5 ] ])))
+        (TyNamed ("Option", [ ty_array ty_int [ TyConstInt 5 ] ]));
+      ignore (require_direct_resolved_call typed "checked_nodes" "assert_shape"))
 
 let test_infer_tensor_producer_calls_carry_no_widening_payload () =
   with_isolated_env (fun () ->
@@ -605,12 +920,16 @@ func tensor_producers(v: Float[#4]) -> Bool:
       let typed, errors = parse_and_typecheck_module src in
       check_int "no type errors" 0 (List.length errors);
       require_call_payload typed "tensor_producers" "length" (TyConstInt 4);
+      ignore (require_direct_resolved_call typed "tensor_producers" "length");
       require_call_payload typed "tensor_producers" "vector"
         (ty_array ty_float [ TyConstInt 4 ]);
+      ignore (require_direct_resolved_call typed "tensor_producers" "vector");
       require_call_payload typed "tensor_producers" "matrix"
         (ty_array ty_int [ TyConstInt 2; TyConstInt 3 ]);
+      ignore (require_direct_resolved_call typed "tensor_producers" "matrix");
       require_call_payload typed "tensor_producers" "tensor3"
-        (ty_array ty_int [ TyConstInt 2; TyConstInt 3; TyConstInt 4 ]))
+        (ty_array ty_int [ TyConstInt 2; TyConstInt 3; TyConstInt 4 ]);
+      ignore (require_direct_resolved_call typed "tensor_producers" "tensor3"))
 
 let test_infer_generic_call_concrete () =
   (* func id[T](x: T) -> T: x ; id(42) must type to Int (no lingering TyVar). *)
@@ -814,6 +1133,18 @@ let suite =
       [
         Alcotest.test_case "integer literal body" `Quick
           test_infer_integer_literal;
+        Alcotest.test_case "direct local call records target" `Quick
+          test_call_metadata_for_direct_local_call;
+        Alcotest.test_case "closure call records target" `Quick
+          test_call_metadata_for_closure_call;
+        Alcotest.test_case "constructor call records target" `Quick
+          test_call_metadata_for_constructor_call;
+        Alcotest.test_case "trait dispatch records target" `Quick
+          test_call_metadata_for_trait_dispatch;
+        Alcotest.test_case "module-qualified function records target" `Quick
+          test_call_metadata_for_module_qualified_function;
+        Alcotest.test_case "module-qualified impl method records target" `Quick
+          test_call_metadata_for_module_qualified_impl_method;
         Alcotest.test_case "integer literal carries no-widening payload" `Quick
           test_infer_integer_literal_carries_no_widening_payload;
         Alcotest.test_case "identifier carries no-widening payload" `Quick

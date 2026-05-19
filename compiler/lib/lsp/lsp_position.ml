@@ -255,6 +255,10 @@ let find_definition (program : program) ~(name : string) ~(line : int)
     | EQuestionBind (n, _, _)
       when n = name && loc_starts_before_cursor e.expr_loc ->
         Some e.expr_loc
+    | EWith (binding, body) ->
+        if binding.with_name = name && loc_starts_before_cursor e.expr_loc then
+          Some e.expr_loc
+        else find_local_in_expr body
     | EConcurrent (bindings, _, _) -> find_local_in_exprs bindings
     | EConcurrentBind (n, _, _)
       when n = name && loc_starts_before_cursor e.expr_loc ->

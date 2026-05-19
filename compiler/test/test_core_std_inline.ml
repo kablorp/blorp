@@ -22,6 +22,17 @@ let user_call ?(def_id = None) name args ty =
 let bin op a b = mk ty_int (CBin (op, a, b))
 let seq a b = mk b.ty (CSeq (a, b))
 
+let resource_scope name ty acquire body cleanup =
+  mk body.ty
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty;
+         rs_acquire = acquire;
+         rs_body = body;
+         rs_cleanup = cleanup;
+       })
+
 let lett name rhs body =
   mk body.ty
     (CLet
@@ -283,6 +294,66 @@ let test_inlines_append_with_substituted_variable_receiver () =
        (fun name -> String.starts_with ~prefix:"__std_inline_self" name)
        (borrow_c_names body))
 
+let test_clones_resource_scope_binding_hygienically () =
+  let target_body =
+    resource_scope "default" ty_int (var "default" ty_int)
+      (var "default" ty_int) (var "default" ty_int)
+  in
+  let call =
+    user_call ~def_id:(Some 10) "std_list__get_or__mono_Int"
+      [ var "xs" (ty_list ty_int); int 0; int 99 ]
+      ty_int
+  in
+  let body =
+    rewritten_body
+      [
+        decl_func (target_get_or ~body:target_body ()); decl_func (caller call);
+      ]
+  in
+  match body.desc with
+  | CBorrowLet
+      ( _,
+        {
+          desc =
+            CLet
+              ( _,
+                {
+                  desc =
+                    CLet
+                      ( default_binding,
+                        {
+                          desc =
+                            CResourceScope
+                              {
+                                rs_var;
+                                rs_acquire = { desc = CVar acquire; _ };
+                                rs_body = { desc = CVar body_var; _ };
+                                rs_cleanup = { desc = CVar cleanup_var; _ };
+                                _;
+                              };
+                          _;
+                        } );
+                  _;
+                } );
+          _;
+        } ) ->
+      Alcotest.(check bool) "scope binder is fresh" true (rs_var.vuniq <> 0);
+      Alcotest.(check bool)
+        "acquire reads cloned argument binding" true
+        (Var.equal acquire default_binding.bind_var);
+      Alcotest.(check bool)
+        "body reads scoped binding" true
+        (Var.equal body_var rs_var);
+      Alcotest.(check bool)
+        "cleanup reads scoped binding" true
+        (Var.equal cleanup_var rs_var);
+      Alcotest.(check bool)
+        "body does not read argument binding" false
+        (Var.equal body_var default_binding.bind_var)
+  | _ ->
+      Alcotest.failf "unexpected inlined shape:\n%s"
+        (Blorp.Core.pp_to_string body)
+
 let test_pipeline_expands_real_std_list_calls () =
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
@@ -355,6 +426,8 @@ let suite =
           test_does_not_inline_inside_std_list_module;
         Alcotest.test_case "inlines_append_with_substituted_variable_receiver"
           `Quick test_inlines_append_with_substituted_variable_receiver;
+        Alcotest.test_case "clones_resource_scope_binding_hygienically" `Quick
+          test_clones_resource_scope_binding_hygienically;
         Alcotest.test_case "pipeline_expands_real_std_list_calls" `Quick
           test_pipeline_expands_real_std_list_calls;
       ] );

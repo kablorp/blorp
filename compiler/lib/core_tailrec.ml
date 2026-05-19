@@ -152,11 +152,19 @@ let nth_opt xs n =
   if n < 0 then None else go 0 xs
 
 let rec core_uses_var (target : var) (e : core) : bool =
-  let here = match e.desc with CVar v -> Var.equal v target | _ -> false in
-  here
-  || Core.fold_immediate_children
-       (fun found child -> found || core_uses_var target child)
-       false e
+  match e.desc with
+  | CVar v -> Var.equal v target
+  | CResourceScope scope ->
+      core_uses_var target scope.rs_acquire
+      ||
+      if Var.equal scope.rs_var target then false
+      else
+        core_uses_var target scope.rs_body
+        || core_uses_var target scope.rs_cleanup
+  | _ ->
+      Core.fold_immediate_children
+        (fun found child -> found || core_uses_var target child)
+        false e
 
 let list_self_call_spread_binding (f : core_func) (list_index : int)
     (bindings : (var * accessor) list) (e : core) :

@@ -13,6 +13,7 @@ let ty_float = TyNamed ("Float", [])
 let ty_float32 = TyNamed ("Float32", [])
 let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
+let ty_test_resource = TyNamed ("TestResource", [])
 let ty_list_int = TyNamed ("List", [ ty_int ])
 let ty_dict_string_int = TyNamed ("Dict", [ ty_string; ty_int ])
 let ty_set_string = TyNamed ("Set", [ ty_string ])
@@ -1051,6 +1052,79 @@ let test_proven_tensor_storage_read_drops_layout_guard () =
       Alcotest.fail
         "proven compiler-owned f64 tensor storage should drop layout guard"
 
+let test_resource_scope_binding_clears_tensor_storage_provenance () =
+  let values = Var.named "values" in
+  let inner_values_ref = mk (CVar values) ty_tensor_float_4 in
+  let scoped =
+    mk
+      (CResourceScope
+         {
+           rs_var = values;
+           rs_ty = ty_test_resource;
+           rs_acquire = mk (CVar (Var.named "open_resource")) ty_test_resource;
+           rs_body = guarded_f64_tensor_read inner_values_ref (cint 0);
+           rs_cleanup = cvoid;
+         })
+      ty_float
+  in
+  let expr =
+    mk
+      (CLet
+         ( {
+             bind_var = values;
+             bind_mut = false;
+             bind_ty = ty_tensor_float_4;
+             bind_rhs =
+               mk
+                 (CVector [ cfloat 1.0; cfloat 2.0; cfloat 3.0; cfloat 4.0 ])
+                 ty_tensor_float_4;
+           },
+           scoped ))
+      ty_float
+  in
+  match (prepare expr).desc with
+  | CLet
+      ( _,
+        {
+          desc =
+            CResourceScope
+              {
+                rs_body =
+                  {
+                    desc =
+                      CIf
+                        ( {
+                            desc =
+                              CCall (CKIntrinsic "tensor_is_f64_storage", _, _);
+                            _;
+                          },
+                          {
+                            desc =
+                              CCall
+                                ( CKIntrinsic "tensor_get_f64_raw_unchecked",
+                                  _,
+                                  _ );
+                            _;
+                          },
+                          {
+                            desc = CCall (CKIntrinsic "tensor_get_f64", _, _);
+                            _;
+                          } );
+                    _;
+                  };
+                _;
+              };
+          _;
+        } ) ->
+      ()
+  | CLet (_, { desc = CResourceScope { rs_body; _ }; _ }) ->
+      Alcotest.failf
+        "resource scope body incorrectly used outer storage proof: %s"
+        (Blorp.Core.pp_to_string rs_body)
+  | _ ->
+      Alcotest.fail
+        "expected prepared let containing resource scope with guarded body"
+
 let test_unproven_tensor_storage_read_keeps_layout_guard () =
   let values = Var.named "values" in
   let values_ref = mk (CVar values) ty_tensor_float_4 in
@@ -1338,6 +1412,8 @@ let suite =
           test_string_byte_intrinsics_become_proof_nodes;
         Alcotest.test_case "proven_tensor_read_drops_layout_guard" `Quick
           test_proven_tensor_storage_read_drops_layout_guard;
+        Alcotest.test_case "resource_scope_clears_tensor_storage_provenance"
+          `Quick test_resource_scope_binding_clears_tensor_storage_provenance;
         Alcotest.test_case "unproven_tensor_read_keeps_layout_guard" `Quick
           test_unproven_tensor_storage_read_keeps_layout_guard;
         Alcotest.test_case "proven_tensor_raw_view_guard_drops_fallback" `Quick

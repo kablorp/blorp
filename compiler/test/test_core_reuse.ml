@@ -12,6 +12,7 @@ let ty_uint64 = TyNamed ("UInt64", [])
 let ty_ptr = TyNamed ("Ptr", [])
 let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
+let ty_test_resource = TyNamed ("TestResource", [])
 let ty_list elem = TyNamed ("List", [ elem ])
 let ty_set elem = TyNamed ("Set", [ elem ])
 let ty_dict key value = TyNamed ("Dict", [ key; value ])
@@ -77,6 +78,17 @@ let list_handoff ?(mode = BorrowFresh) ?result_ty source =
          lh_out_var = Var.named "__hout";
          lh_body = void ();
          lh_write_order = ForwardCompacting;
+       })
+
+let resource_scope ?(name = "r") body_ty body =
+  mk body_ty
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty_test_resource;
+         rs_acquire = var "open_resource" ty_test_resource;
+         rs_body = body;
+         rs_cleanup = void ();
        })
 
 let contains_sub output sub =
@@ -229,6 +241,27 @@ let test_marks_later_allocation_after_safe_statement () =
     "candidate"
     [ ("xs", "ys", "list") ]
     (candidate_names (Blorp.Core_reuse.analyze_expr body))
+
+let test_resource_scope_blocks_later_allocation_candidate () =
+  let list_ty = ty_list ty_int in
+  let scoped = resource_scope ty_void (void ()) in
+  let body =
+    drop "xs" list_ty
+      (seq scoped (lett "ys" (list_alloc ()) (var "ys" list_ty)))
+  in
+  let analysis =
+    Blorp.Core_reuse.analyze_drop_block (Var.named "xs") list_ty
+      (match body.desc with
+      | CDrop (_, _, body) -> body
+      | _ -> failwith "expected drop")
+  in
+  Alcotest.(check (list string))
+    "block facts"
+    [ "interference:nonlinear control flow" ]
+    (block_fact_tags analysis.facts);
+  Alcotest.(check int)
+    "candidate count" 0
+    (List.length (Blorp.Core_reuse.analyze_expr body))
 
 let test_rejects_collection_family_mismatch () =
   let list_ty = ty_list ty_int in
@@ -521,6 +554,31 @@ let test_rewrite_program_reuses_after_safe_statement () =
   | _ ->
       Alcotest.fail
         "expected safe statement followed by rewritten list_reuse_alloc"
+
+let test_rewrite_program_does_not_reuse_across_resource_scope () =
+  let list_ty = ty_list ty_int in
+  let scoped = resource_scope ty_void (void ()) in
+  let body =
+    drop "xs" list_ty
+      (seq scoped (lett "ys" (list_alloc ()) (var "ys" list_ty)))
+  in
+  let fn =
+    {
+      cf_name = "main";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [];
+      cf_return_ty = list_ty;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 1;
+    }
+  in
+  let prog = [ { cd_desc = CDFunc fn; cd_loc = dummy_loc; cd_doc = None } ] in
+  Alcotest.(check bool)
+    "program unchanged" true
+    (Blorp.Core_reuse.rewrite_program prog = prog)
 
 let test_rewrite_program_reuses_same_layout_list_allocation () =
   let source_ty = ty_list ty_int in
@@ -856,6 +914,8 @@ let suite =
           test_marks_later_allocation_after_safe_binding;
         Alcotest.test_case "later_allocation_after_safe_statement" `Quick
           test_marks_later_allocation_after_safe_statement;
+        Alcotest.test_case "resource_scope_blocks_later_allocation_candidate"
+          `Quick test_resource_scope_blocks_later_allocation_candidate;
         Alcotest.test_case "rejects_collection_family_mismatch" `Quick
           test_rejects_collection_family_mismatch;
         Alcotest.test_case "rejects_incompatible_allocation_before_candidate"
@@ -881,6 +941,9 @@ let suite =
           test_rewrite_program_reuses_dead_dict_allocation;
         Alcotest.test_case "rewrite_program_reuses_after_safe_statement" `Quick
           test_rewrite_program_reuses_after_safe_statement;
+        Alcotest.test_case
+          "rewrite_program_does_not_reuse_across_resource_scope" `Quick
+          test_rewrite_program_does_not_reuse_across_resource_scope;
         Alcotest.test_case "rewrite_program_reuses_same_layout_list_allocation"
           `Quick test_rewrite_program_reuses_same_layout_list_allocation;
         Alcotest.test_case

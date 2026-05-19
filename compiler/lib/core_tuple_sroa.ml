@@ -45,6 +45,63 @@ let field_index_in_bounds arity name =
   match int_field_index name with Some i when i < arity -> Some i | _ -> None
 
 let is_alias aliases v = List.exists (Var.equal v) aliases
+let option_exists f = function Some value -> f value | None -> false
+
+let rec ctree_mentions_alias aliases tree =
+  match tree with
+  | CTLeaf { ct_bindings; ct_body } ->
+      if List.exists (fun (v, _) -> is_alias aliases v) ct_bindings then false
+      else expr_mentions_alias aliases ct_body
+  | CTFail -> false
+  | CTSwitchTag { cts_cases; cts_default; _ } ->
+      List.exists (fun (_, sub) -> ctree_mentions_alias aliases sub) cts_cases
+      || option_exists (ctree_mentions_alias aliases) cts_default
+  | CTSwitchLit { ctl_cases; ctl_default; _ } ->
+      List.exists (fun (_, sub) -> ctree_mentions_alias aliases sub) ctl_cases
+      || ctree_mentions_alias aliases ctl_default
+  | CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
+      List.exists
+        (fun (_, sub) -> ctree_mentions_alias aliases sub)
+        ctl_len_cases
+      || option_exists
+           (fun (_, sub) -> ctree_mentions_alias aliases sub)
+           ctl_len_geq
+      || option_exists (ctree_mentions_alias aliases) ctl_len_default
+
+and expr_mentions_alias aliases expr =
+  match expr.desc with
+  | (CVar v | CField ({ desc = CVar v; _ }, _)) when is_alias aliases v -> true
+  | CLet (binding, body) -> (
+      expr_mentions_alias aliases binding.bind_rhs
+      ||
+      match binding.bind_rhs.desc with
+      | CVar v when (not binding.bind_mut) && is_alias aliases v ->
+          expr_mentions_alias (binding.bind_var :: aliases) body
+      | _ ->
+          (not (is_alias aliases binding.bind_var))
+          && expr_mentions_alias aliases body)
+  | CBorrowLet (binding, body) ->
+      expr_mentions_alias aliases binding.borrow_rhs
+      || (not (is_alias aliases binding.borrow_var))
+         && expr_mentions_alias aliases body
+  | CLambda lam ->
+      (not (List.exists (fun (v, _) -> is_alias aliases v) lam.lam_params))
+      && expr_mentions_alias aliases lam.lam_body
+  | CFor (binder, iter, body) ->
+      expr_mentions_alias aliases iter
+      || (not (is_alias aliases binder.loop_var))
+         && expr_mentions_alias aliases body
+  | CResourceScope scope ->
+      expr_mentions_alias aliases scope.rs_acquire
+      || (not (is_alias aliases scope.rs_var))
+         && (expr_mentions_alias aliases scope.rs_body
+            || expr_mentions_alias aliases scope.rs_cleanup)
+  | CMatch (scrut, tree) ->
+      expr_mentions_alias aliases scrut || ctree_mentions_alias aliases tree
+  | _ ->
+      fold_immediate_children
+        (fun found child -> found || expr_mentions_alias aliases child)
+        false expr
 
 let direct_tuple_field_index arity = function
   | AccTupleField (AccRoot, index) when index >= 0 && index < arity ->
@@ -189,6 +246,14 @@ and scan_uses arity analysis aliases expr =
       scan_uses arity analysis aliases binding.borrow_rhs;
       if is_alias aliases binding.borrow_var then mark_shadow analysis
       else scan_uses arity analysis aliases body
+  | CResourceScope scope ->
+      if
+        expr_mentions_alias aliases scope.rs_acquire
+        || (not (is_alias aliases scope.rs_var))
+           && (expr_mentions_alias aliases scope.rs_body
+              || expr_mentions_alias aliases scope.rs_cleanup)
+      then mark_escape analysis;
+      if is_alias aliases scope.rs_var then mark_shadow analysis
   | CLambda lam ->
       if List.exists (fun (v, _) -> is_alias aliases v) lam.lam_params then
         mark_shadow analysis
@@ -574,6 +639,25 @@ let replace_field_uses root_var elem_vars elems expr =
         }
     | CFor (binder, iter, body) ->
         { expr with desc = CFor (binder, go aliases iter, go aliases body) }
+    | CResourceScope scope ->
+        let acquire = go aliases scope.rs_acquire in
+        if is_alias aliases scope.rs_var then
+          {
+            expr with
+            desc = CResourceScope { scope with rs_acquire = acquire };
+          }
+        else
+          {
+            expr with
+            desc =
+              CResourceScope
+                {
+                  scope with
+                  rs_acquire = acquire;
+                  rs_body = go aliases scope.rs_body;
+                  rs_cleanup = go aliases scope.rs_cleanup;
+                };
+          }
     | CConcurrent cb ->
         {
           expr with

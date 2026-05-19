@@ -24,6 +24,7 @@ let error_with ?(kind = OtherError) ~notes ~help loc message : compiler_error =
 type call_ref = Purity_analysis.call_ref = {
   called_name : string;
   call_loc : loc;
+  called_id : int option;
 }
 [@@deriving show]
 (** A reference to a function call found during AST traversal *)
@@ -40,6 +41,11 @@ type imported_name_binding = {
     keyed by the post-alias local name: [import: a: parse as read] and
     [import: b: parse as read] are the same local declaration and must be
     rejected before later env insertion can accidentally pick a winner. *)
+
+type func_callable_key = string * int * int * int * int * string option
+
+let func_callable_key ~name (loc : loc) : func_callable_key =
+  (name, loc.line, loc.column, loc.end_line, loc.end_column, loc.loc_file)
 
 type check_state = {
   env : env;
@@ -96,6 +102,10 @@ type check_state = {
       are shared across [Pipeline.check_modules] iterations on
       purpose (cross-module trait dispatch); [type_home] is the one
       piece that must not share. *)
+  func_callable_ids : (func_callable_key, int) Hashtbl.t;
+      (** Callable ids minted for named source functions in this compilation
+      unit. Keyed by declaration name and source declaration location so typed
+      AST construction can preserve identity without re-resolving by name. *)
 }
 (** Check result - collects multiple errors *)
 
@@ -117,6 +127,13 @@ type checked_func_signature = {
     effective type params, purity, origin, and module ownership. Later phases should
     consume this shape instead of re-deriving parallel fields from [func_decl]. *)
 
+let record_func_callable_id (state : check_state) ~name ~loc =
+  let callable_id = Session.mint_def_id (Session.current ()) in
+  Hashtbl.replace state.func_callable_ids
+    (func_callable_key ~name loc)
+    callable_id;
+  callable_id
+
 let loop_producer_of_registered_func ~(module_path : string option)
     ~(origin : func_origin) (name : string) : loop_producer option =
   match (origin, module_path, name) with
@@ -129,6 +146,9 @@ let loop_producer_of_registered_func ~(module_path : string option)
 
 let get_state_env state = state.env
 let get_state_module_aliases state = state.module_aliases
+
+let get_state_func_callable_id state ~name ~loc =
+  Hashtbl.find_opt state.func_callable_ids (func_callable_key ~name loc)
 
 let ctx_of_state state =
   make_ctx ~module_aliases:state.module_aliases
@@ -478,10 +498,12 @@ let checked_func_signature_of_imported_func ~(env : env) ~(module_path : string)
           cfs_debug_only = func.func_debug_only;
         }
 
-let overload_entry_of_checked_signature (sig_ : checked_func_signature) :
-    overload_entry =
+let overload_entry_of_checked_signature ?callable_id
+    (sig_ : checked_func_signature) : overload_entry =
   {
-    ol_def_id = Session.mint_def_id (Session.current ());
+    ol_def_id =
+      Option.value callable_id
+        ~default:(Session.mint_def_id (Session.current ()));
     ol_func_type = sig_.cfs_func_type;
     ol_type_params = sig_.cfs_effective_type_params;
     ol_param_names = sig_.cfs_param_names;
@@ -526,6 +548,7 @@ let init_state ?module_origin ?(allow_debug_only_calls = false) () =
     known_type_names = Hashtbl.create 16;
     top_level_names = Hashtbl.create 32;
     type_home = Hashtbl.create 32;
+    func_callable_ids = Hashtbl.create 32;
   }
 
 (** Add an error to the state *)
@@ -1072,6 +1095,9 @@ let process_func_signature ?(module_path : string option) ?(loc = dummy_loc)
   match checked_func_signature_of_func ?module_path state func with
   | None -> state (* Lambda, not a top-level function *)
   | Some sig_ ->
+      let callable_id =
+        record_func_callable_id state ~name:sig_.cfs_name ~loc
+      in
       (* Foreign functions cannot RETURN refinement types (TyRange, LiteralString)
          because the compiler cannot verify that C code respects the invariants.
          Receiving them as parameters is fine — they erase to plain C types. *)
@@ -1140,7 +1166,7 @@ let process_func_signature ?(module_path : string option) ?(loc = dummy_loc)
         if is_polymorphic_builtin_import then
           state.env (* keep the builtin in scope *)
         else
-          add_func state.env sig_.cfs_name sig_.cfs_func_type
+          add_func state.env sig_.cfs_name sig_.cfs_func_type ~callable_id
             ~type_params:sig_.cfs_effective_type_params
             ~param_names:sig_.cfs_param_names ~purity:sig_.cfs_purity
             ~origin:sig_.cfs_origin ?module_path
@@ -1153,7 +1179,7 @@ let process_func_signature ?(module_path : string option) ?(loc = dummy_loc)
         match module_path with
         | Some _ ->
             add_overload env sig_.cfs_name
-              (overload_entry_of_checked_signature sig_)
+              (overload_entry_of_checked_signature ~callable_id sig_)
         | None -> env
       in
       { state with env }
@@ -2361,6 +2387,9 @@ let process_import (state : check_state) (loc : loc) (decl : import_decl) :
                                         ConstructorSymbol
                                           {
                                             parent_type = type_lookup_name;
+                                            constructor_id =
+                                              Session.mint_def_id
+                                                (Session.current ());
                                             type_params =
                                               (match
                                                  get_type_decl state.env
@@ -2609,6 +2638,7 @@ let () =
                     known_type_names = Hashtbl.create 4;
                     top_level_names = Hashtbl.create 4;
                     type_home = Hashtbl.create 4;
+                    func_callable_ids = Hashtbl.create 4;
                   }
                 in
                 let state =
@@ -2648,6 +2678,7 @@ let () =
               known_type_names = Hashtbl.create 4;
               top_level_names = Hashtbl.create 4;
               type_home = Hashtbl.create 4;
+              func_callable_ids = Hashtbl.create 4;
             }
           in
           let state =
@@ -3176,7 +3207,7 @@ let check_nested_parallelism (state : check_state) (callee_name : string)
               | Some body ->
                   let nested_calls = collect_parallel_calls body in
                   List.fold_left
-                    (fun s' { called_name; call_loc } ->
+                    (fun s' { called_name; call_loc; _ } ->
                       add_error s'
                         (error_at call_loc
                            (Printf.sprintf
@@ -3281,7 +3312,7 @@ let validate_debug_usage (state : check_state) (body : expr) : check_state =
       collect_impure_calls ~strict:true state.env state.module_aliases expr
     in
     List.fold_left
-      (fun acc { called_name; call_loc } ->
+      (fun acc { called_name; call_loc; _ } ->
         add_error acc
           (error_with ~notes:[] ~help:(Some debug_help) call_loc
              (Printf.sprintf "debug: blocks cannot call impure function '%s'"
@@ -3323,7 +3354,7 @@ let rec has_concurrency (expr : expr) : bool =
 (** Report impure calls as errors for a pure function/lambda *)
 let report_impure_calls state ~func_name ~help_msg impure_calls =
   List.fold_left
-    (fun s { called_name; call_loc } ->
+    (fun s { called_name; call_loc; _ } ->
       let note =
         if is_impure_builtin called_name then
           Printf.sprintf "'%s' is impure because it performs I/O" called_name
@@ -3997,6 +4028,10 @@ let rec second_pass (state : check_state) (decls : program) :
                 let state, typed_methods =
                   List.fold_left
                     (fun (s, meths) func ->
+                      Option.iter
+                        (fun name ->
+                          ignore (record_func_callable_id s ~name ~loc))
+                        func.func_name;
                       let s =
                         validate_type_params s loc func.func_type_params
                       in
@@ -4101,6 +4136,14 @@ let rec second_pass (state : check_state) (decls : program) :
                         | EQuestionBind (name, ty, e1) ->
                             EQuestionBind
                               (name, Option.map subst ty, subst_body e1)
+                        | EWith (binding, body) ->
+                            EWith
+                              ( {
+                                  binding with
+                                  with_type = Option.map subst binding.with_type;
+                                  with_value = subst_body binding.with_value;
+                                },
+                                subst_body body )
                         | EConcurrentBind (name, ty, e1) ->
                             EConcurrentBind
                               (name, Option.map subst ty, subst_body e1)
@@ -4228,6 +4271,9 @@ let rec second_pass (state : check_state) (decls : program) :
             let state, typed_methods =
               List.fold_left
                 (fun (s, meths) func ->
+                  Option.iter
+                    (fun name -> ignore (record_func_callable_id s ~name ~loc))
+                    func.func_name;
                   let s = validate_type_params s loc func.func_type_params in
                   let func =
                     {
@@ -4583,13 +4629,20 @@ let typed_ast_error_to_compiler_error (err : Typed_ast.error) : compiler_error =
          produce a finalized typed AST.";
   }
 
-let require_typed_program_for_typecheck ?source_program (program : program) :
-    (Typed_ast.program, compiler_error list) result =
+let require_typed_program_for_typecheck ?source_program ?state
+    (program : program) : (Typed_ast.program, compiler_error list) result =
+  let callable_id_of_func =
+    Option.map
+      (fun state ~name ~loc ->
+        Hashtbl.find_opt state.func_callable_ids (func_callable_key ~name loc))
+      state
+  in
   let typed_result =
     match source_program with
     | Some source_program ->
-        Typed_ast.of_ast_program_with_sources ~source_program program
-    | None -> Typed_ast.of_ast_program program
+        Typed_ast.of_ast_program_with_sources ?callable_id_of_func
+          ~source_program program
+    | None -> Typed_ast.of_ast_program ?callable_id_of_func program
   in
   match typed_result with
   | Ok typed -> Ok typed
@@ -4605,7 +4658,7 @@ let typecheck_with_state_typed ?module_origin ?(module_name = "")
   match List.rev state.errors with
   | _ :: _ as errors -> Error errors
   | [] ->
-      require_typed_program_for_typecheck ~source_program typed_program
+      require_typed_program_for_typecheck ~source_program ~state typed_program
       |> Result.map (fun typed -> (state, typed))
 
 let typecheck_typed ?module_origin ?(module_name = "")
@@ -4629,7 +4682,7 @@ let typecheck_with_env_typed ?module_origin ?(module_name = "")
   | _ :: _ as errors -> Error (errors, state.env)
   | [] -> (
       match
-        require_typed_program_for_typecheck ~source_program typed_program
+        require_typed_program_for_typecheck ~source_program ~state typed_program
       with
       | Ok typed -> Ok (typed, state.env)
       | Error errors -> Error (errors, state.env))
@@ -4789,7 +4842,7 @@ let typecheck_module_with_state_typed ?module_origin ?(module_name = "")
   | _ :: _ as errors -> Error (state, errors)
   | [] -> (
       match
-        require_typed_program_for_typecheck ~source_program:source_decls
+        require_typed_program_for_typecheck ~source_program:source_decls ~state
           typed_decls
       with
       | Ok typed -> Ok (state, typed)

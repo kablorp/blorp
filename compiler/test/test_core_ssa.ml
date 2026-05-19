@@ -23,6 +23,18 @@ let cvoid = mk CVoid ty_void
 let assign name rhs = mk (CAssign (Var.named name, rhs)) ty_void
 let seq a b = mk (CSeq (a, b)) b.ty
 
+let resource_scope name ty acquire body cleanup =
+  mk
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty;
+         rs_acquire = acquire;
+         rs_body = body;
+         rs_cleanup = cleanup;
+       })
+    body.ty
+
 let bind ?(mut = false) name ty rhs =
   { bind_var = Var.named name; bind_mut = mut; bind_ty = ty; bind_rhs = rhs }
 
@@ -199,6 +211,63 @@ let test_for_binder_shadowing_preserves_body () =
   | other ->
       Alcotest.failf "unexpected shape:\n%s" (Blorp.Core.pp_to_string other)
 
+let test_resource_scope_shadowing_preserves_body_and_cleanup () =
+  let scope =
+    resource_scope "x" ty_int (cvar "x" ty_int) (cvar "x" ty_int)
+      (cvar "x" ty_int)
+  in
+  let body = seq (assign "x" (cint 2)) scope in
+  let input = let_ ~mut:true "x" ty_int (cint 1) body in
+  match desugar input with
+  | {
+   desc =
+     CLet
+       ( _,
+         {
+           desc =
+             CLet
+               ( _,
+                 {
+                   desc =
+                     CResourceScope
+                       { rs_acquire; rs_body; rs_cleanup; rs_var; _ };
+                   _;
+                 } );
+           _;
+         } );
+   _;
+  } ->
+      Alcotest.(check string) "scope binding unchanged" "x" rs_var.vname;
+      Alcotest.(check string)
+        "acquisition sees outer current version" "x__v1" (var_name rs_acquire);
+      Alcotest.(check string)
+        "body remains scoped binding" "x" (var_name rs_body);
+      Alcotest.(check string)
+        "cleanup remains scoped binding" "x" (var_name rs_cleanup)
+  | other ->
+      Alcotest.failf "unexpected shape:\n%s" (Blorp.Core.pp_to_string other)
+
+let test_resource_scope_shadowed_assignment_does_not_version_outer () =
+  let scope =
+    resource_scope "x" ty_int (cint 0)
+      (seq (assign "x" (cint 2)) (cvar "x" ty_int))
+      cvoid
+  in
+  let input = let_ ~mut:true "x" ty_int (cint 1) scope in
+  match desugar input with
+  | { desc = CLet (b, { desc = CResourceScope { rs_body; _ }; _ }); _ } -> (
+      Alcotest.(check string) "outer binding unchanged" "x" b.bind_var.vname;
+      Alcotest.(check bool) "outer binding immutable" false b.bind_mut;
+      match rs_body.desc with
+      | CSeq ({ desc = CAssign (target, _); _ }, tail) ->
+          Alcotest.(check string)
+            "assignment targets scoped binding" "x" target.vname;
+          Alcotest.(check string)
+            "tail reads scoped binding" "x" (var_name tail)
+      | _ -> Alcotest.fail "expected resource body sequence")
+  | other ->
+      Alcotest.failf "unexpected shape:\n%s" (Blorp.Core.pp_to_string other)
+
 let test_control_flow_assignment_survives () =
   let branch = mk (CIf (cbool true, assign "x" (cint 2), cvoid)) ty_void in
   let input = let_ ~mut:true "x" ty_int (cint 1) branch in
@@ -241,6 +310,10 @@ let suite =
           test_lambda_param_shadowing_preserves_body;
         Alcotest.test_case "for binder shadowing" `Quick
           test_for_binder_shadowing_preserves_body;
+        Alcotest.test_case "resource scope shadowing" `Quick
+          test_resource_scope_shadowing_preserves_body_and_cleanup;
+        Alcotest.test_case "resource scope shadowed assignment" `Quick
+          test_resource_scope_shadowed_assignment_does_not_version_outer;
         Alcotest.test_case "control-flow assignment survives" `Quick
           test_control_flow_assignment_survives;
       ] );

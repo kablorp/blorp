@@ -348,6 +348,13 @@ let rec scan_expr scope refs expr =
   | EStringInterpRaw _ -> refs
   | EQuestionBind (_name, ty, rhs) ->
       scan_type_opt scope (scan_expr scope refs rhs) ty
+  | EWith (binding, body) ->
+      let refs =
+        scan_type_opt scope
+          (scan_expr scope refs binding.with_value)
+          binding.with_type
+      in
+      scan_expr (add_term_binding binding.with_name scope) refs body
   | EDebugBlock exprs | EConcurrent (exprs, None, _) ->
       scan_block scope refs exprs
   | EConcurrent (exprs, Some timeout, _) ->

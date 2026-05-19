@@ -166,6 +166,12 @@ let rec simulate (target : string) (state : state) (e : core) : unit =
   | CTensorRawViewLet (b, body) ->
       simulate_borrow target state b.trv_source;
       if b.trv_var.vname <> target then simulate target state body
+  | CResourceScope s ->
+      simulate target state s.rs_acquire;
+      if s.rs_var.vname <> target then begin
+        simulate target state s.rs_body;
+        simulate target state s.rs_cleanup
+      end
   (* ---- Branches: run both / all paths from the same starting rc,
          require matching exit rc ---- *)
   | CIf (c, t, el) ->

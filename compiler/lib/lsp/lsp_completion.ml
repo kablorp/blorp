@@ -391,6 +391,10 @@ let completions_from_local_scope ?(skip = fun _ -> false) (program : program)
       | EQuestionBind (name, source_ty, init) ->
           add name (type_detail_opt source_ty);
           collect_expr init
+      | EWith (binding, body) ->
+          collect_expr binding.with_value;
+          add binding.with_name (type_detail_opt binding.with_type);
+          collect_expr body
       | EConcurrentBind (name, source_ty, init) ->
           add name (type_detail_opt source_ty);
           collect_expr init

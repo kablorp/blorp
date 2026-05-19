@@ -68,6 +68,9 @@ let () =
         Test_trait_obligation_architecture.suite
     @ List.map (fun (name, cases) -> ("Infer." ^ name, cases)) Test_infer.suite
     @ List.map
+        (fun (name, cases) -> ("PurityAnalysis." ^ name, cases))
+        Test_purity_analysis.suite
+    @ List.map
         (fun (name, cases) -> ("Pipeline." ^ name, cases))
         Test_pipeline.suite
     @ List.map (fun (name, cases) -> ("Env." ^ name, cases)) Test_env.suite
@@ -121,8 +124,14 @@ let () =
         (fun (name, cases) -> ("CoreMatch." ^ name, cases))
         Test_core_match.suite
     @ List.map
+        (fun (name, cases) -> ("CoreEmitUtil." ^ name, cases))
+        Test_core_emit_util.suite
+    @ List.map
         (fun (name, cases) -> ("CoreTailrec." ^ name, cases))
         Test_core_tailrec.suite
+    @ List.map
+        (fun (name, cases) -> ("CoreTraitResolve." ^ name, cases))
+        Test_core_trait_resolve.suite
     @ List.map
         (fun (name, cases) -> ("CoreIntrinsics." ^ name, cases))
         Test_core_intrinsics.suite

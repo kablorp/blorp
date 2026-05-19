@@ -60,6 +60,7 @@ let apply_array_suffixes base suffixes =
   List.fold_left (fun ty dims -> TyArray (ty, dims)) base suffixes
 
 let stmts_to_expr = function [e] -> e | es -> make_expr (EBlock es)
+let stmts_to_expr_at pos = function [e] -> e | es -> make_expr_at pos (EBlock es)
 
 let func_body_of_expr e =
   let builtin_body_of_opt = function
@@ -140,7 +141,7 @@ let concurrent_max_threads_or_error loc n =
 %token LT GT PERCENT HASH AT ARROW LE GE EQ NE EQUALS
 %token PLUS_EQ MINUS_EQ STAR_EQ SLASH_EQ
 %token QUESTION_EQUALS FATARROW
-%token TRY DEBUG
+%token TRY WITH DEBUG
 %token CONCURRENT
 %token PIPE
 %token INDENT DEDENT NEWLINE
@@ -202,11 +203,13 @@ name:
   | IN { "in" }
   | FOR { "for" }
   | WHILE { "while" }
+  | WITH { "with" }
   | FOREIGN { "foreign" }
 
 identifier:
   | n = IDENT { n }
   | DEBUG { "debug" }
+  | WITH { "with" }
 
 (* Optional docstring preceding a declaration *)
 docstring:
@@ -410,6 +413,20 @@ stmt_list_after_newline:
 destruct_ident:
   | n = IDENT { n }
   | UNDERSCORE { "_" }
+
+with_binding:
+  | name = destruct_ident EQUALS value = expr
+    { { with_name = name; with_type = None;
+        with_value = value; with_kind = WithPlain } }
+  | name = destruct_ident COLON ty = type_expr EQUALS value = expr
+    { { with_name = name; with_type = Some ty;
+        with_value = value; with_kind = WithPlain } }
+  | name = destruct_ident QUESTION_EQUALS value = expr
+    { { with_name = name; with_type = None;
+        with_value = value; with_kind = WithTry } }
+  | name = destruct_ident COLON ty = type_expr QUESTION_EQUALS value = expr
+    { { with_name = name; with_type = Some ty;
+        with_value = value; with_kind = WithTry } }
 
 stmt:
   | d = stmt_var_decl
@@ -1059,6 +1076,13 @@ primary_expr:
   | TRY NEWLINE
     { parse_fail_at $symbolstartpos
         "try: blocks have been removed; use `name ?= expr` directly in a function returning Option or Result." }
+  | WITH with_binding COMMA
+    { parse_fail_at $startpos($3)
+        "Multiple resource bindings in one `with` header are not supported yet. Nested `with` blocks make resource close order explicit." }
+  | WITH binding = with_binding COLON NEWLINE INDENT body = stmt_list DEDENT
+    { make_expr_at $symbolstartpos (EWith (binding, stmts_to_expr_at $startpos(body) body)) }
+  | WITH with_binding NEWLINE
+    { parse_fail_at $startpos($3) "Expected ':' after with binding" }
   (* concurrent: block — no timeout *)
   (* concurrent: block — no params *)
   | CONCURRENT COLON NEWLINE INDENT stmts = stmt_list DEDENT

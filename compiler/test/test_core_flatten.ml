@@ -24,6 +24,19 @@ let record_decl ?(builtin = false) record_name fields =
 let decl desc = { cd_desc = desc; cd_loc = loc; cd_doc = None }
 let mk desc ty = { desc; ty; loc }
 let cvar name ty = { desc = CVar (Var.named name); ty; loc }
+let cvoid = mk CVoid ty_void
+
+let resource_scope name ty acquire body cleanup =
+  mk
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty;
+         rs_acquire = acquire;
+         rs_body = body;
+         rs_cleanup = cleanup;
+       })
+    body.ty
 
 let test_std_non_abi_types_are_module_owned () =
   let vec3_ty = TyNamed ("Vec3", []) in
@@ -193,6 +206,81 @@ let test_local_assignment_target_stays_local () =
       | _ -> Alcotest.fail "expected local assignment body")
   | _ -> Alcotest.fail "unexpected rewritten declaration shape"
 
+let test_resource_scope_binding_stays_local () =
+  let handle_ty = TyNamed ("Handle", []) in
+  let handle_record = record_decl "Handle" [] in
+  let global =
+    {
+      cv_name = Var.named "handle";
+      cv_module = None;
+      cv_ty = handle_ty;
+      cv_init = cvar "make_handle" handle_ty;
+      cv_is_mutable = false;
+      cv_is_const = false;
+      cv_def_id = 4;
+    }
+  in
+  let body =
+    resource_scope "handle" handle_ty (cvar "handle" handle_ty)
+      (cvar "handle" handle_ty) cvoid
+  in
+  let fn =
+    {
+      cf_name = "use_handle";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [];
+      cf_return_ty = handle_ty;
+      cf_body = Some body;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 5;
+    }
+  in
+  let rewritten =
+    Core_flatten.prefix_module_names "tests/example"
+      [ decl (CDRecord handle_record); decl (CDVar global); decl (CDFunc fn) ]
+  in
+  match rewritten with
+  | { cd_desc = CDRecord record'; _ }
+    :: { cd_desc = CDVar global'; _ }
+    :: { cd_desc = CDFunc fn'; _ }
+    :: _ -> (
+      Alcotest.(check string)
+        "record type is module-owned" "tests_example__Handle"
+        record'.record_name;
+      Alcotest.(check string)
+        "global value is module-owned" "tests_example__handle"
+        global'.cv_name.vname;
+      match fn'.cf_body with
+      | Some
+          {
+            desc =
+              CResourceScope
+                {
+                  rs_var;
+                  rs_ty;
+                  rs_acquire = { desc = CVar acquire; _ };
+                  rs_body = { desc = CVar body_var; ty = body_ty; _ };
+                  _;
+                };
+            _;
+          } ->
+          Alcotest.(check string)
+            "scope binding stays local" "handle" rs_var.vname;
+          Alcotest.(check bool)
+            "resource type is module-owned" true
+            (Types.types_equal rs_ty (TyNamed ("tests_example__Handle", [])));
+          Alcotest.(check string)
+            "acquisition reads global" "tests_example__handle" acquire.vname;
+          Alcotest.(check string)
+            "body reads scoped binding" "handle" body_var.vname;
+          Alcotest.(check bool)
+            "body type is module-owned" true
+            (Types.types_equal body_ty (TyNamed ("tests_example__Handle", [])))
+      | _ -> Alcotest.fail "expected resource scope body")
+  | _ -> Alcotest.fail "unexpected rewritten declaration shape"
+
 let suite =
   [
     ( "type_names",
@@ -208,5 +296,7 @@ let suite =
           test_global_assignment_targets_are_module_owned;
         Alcotest.test_case "local assignment target stays local" `Quick
           test_local_assignment_target_stays_local;
+        Alcotest.test_case "resource scope binding stays local" `Quick
+          test_resource_scope_binding_stays_local;
       ] );
   ]

@@ -411,6 +411,79 @@ let test_resolve_local_value_shadows_module_alias_call () =
       Alcotest.fail "local qualified call stayed CKUnknown"
   | _ -> Alcotest.fail "expected qualified closure call"
 
+let test_resolve_resource_scope_binding_shadows_module_alias_call () =
+  (* Resource-scope bindings are local bindings too. They must shadow imported
+     module aliases in the body and cleanup, but not in the acquisition. *)
+  let list_ty = TyNamed ("List", [ ty_int ]) in
+  let list_len_fty =
+    TyFunc { params = [ list_ty ]; return = ty_int; is_pure = true }
+  in
+  let xs = cvar "xs" list_ty in
+  let module_alias = cvar "L" (TyNamed ("Module", [])) in
+  let callee = mk (CField (module_alias, "length")) list_len_fty in
+  let call = mk (CCall (CKUnknown, callee, [ xs ])) ty_int in
+  let runner_ty = TyNamed ("Runner", []) in
+  let scope =
+    mk
+      (CResourceScope
+         {
+           rs_var = Var.named "L";
+           rs_ty = runner_ty;
+           rs_acquire = cvar "make_runner" runner_ty;
+           rs_body = call;
+           rs_cleanup = mk CVoid ty_void;
+         })
+      ty_int
+  in
+  let body_func : core_func =
+    {
+      cf_name = "f";
+      cf_type_params = [];
+      cf_params =
+        [ { cp_name = Var.named "xs"; cp_ty = list_ty; cp_loc = loc } ];
+      cf_module = None;
+      cf_return_ty = ty_int;
+      cf_body = Some scope;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog = [ { cd_desc = CDFunc body_func; cd_loc = loc; cd_doc = None } ] in
+  let import_aliases = Hashtbl.create 4 in
+  Hashtbl.replace import_aliases "L" ("std/list", "");
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  match (get_func_body resolved).desc with
+  | CResourceScope
+      {
+        rs_body =
+          {
+            desc =
+              CCall
+                ( CKClosure,
+                  { desc = CField ({ desc = CVar v; _ }, "length"); _ },
+                  _ );
+            _;
+          };
+        _;
+      } ->
+      Alcotest.(check string) "resource qualifier preserved" "L" v.vname
+  | CResourceScope { rs_body = { desc = CCall (CKBuiltin name, _, _); _ }; _ }
+    ->
+      Alcotest.failf "resource qualifier incorrectly resolved as builtin %s"
+        name
+  | CResourceScope { rs_body = { desc = CCall (CKIntrinsic name, _, _); _ }; _ }
+    ->
+      Alcotest.failf "resource qualifier incorrectly resolved as intrinsic %s"
+        name
+  | CResourceScope { rs_body = { desc = CCall (CKUnknown, _, _); _ }; _ } ->
+      Alcotest.fail "resource qualified call stayed CKUnknown"
+  | CResourceScope _ -> Alcotest.fail "expected resource scope body call"
+  | _ -> Alcotest.fail "expected resource scope"
+
 let test_resolve_qualified_string_length_uses_intrinsic () =
   let ty_str = TyNamed ("String", []) in
   let len_fty =
@@ -1353,6 +1426,8 @@ let suite =
           test_resolve_qualified_module_alias_builtin;
         Alcotest.test_case "local_value_shadows_module_alias_call" `Quick
           test_resolve_local_value_shadows_module_alias_call;
+        Alcotest.test_case "resource_scope_shadows_module_alias_call" `Quick
+          test_resolve_resource_scope_binding_shadows_module_alias_call;
         Alcotest.test_case "qualified_string_length_uses_intrinsic" `Quick
           test_resolve_qualified_string_length_uses_intrinsic;
         Alcotest.test_case "qualified_bytes_length_uses_intrinsic" `Quick

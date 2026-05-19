@@ -583,11 +583,15 @@ let builtin_contract_table =
       builtins
         [ "blorp_stream_from_range" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_stream_repeat" ] (bfixed [ Retain; Borrow ] ReturnOwned);
+      builtins [ "blorp_stream_unfold" ]
+        (bfixed [ Retain; Retain; Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_stream_empty" ] (bfixed [] ReturnOwned);
       builtins [ "blorp_stream_from_lines" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_stream_map" ]
+        (bfixed [ Retain; Retain; Borrow ] ReturnOwned);
       builtins
         [
-          "blorp_stream_map";
           "blorp_stream_filter";
           "blorp_stream_filter_map";
           "blorp_stream_filter_map_int";

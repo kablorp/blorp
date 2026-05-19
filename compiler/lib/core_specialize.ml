@@ -691,6 +691,58 @@ let list_elem_type ~loc ~context ty =
 let list_result_elem_needs_release ~reg ~loc ~context ty =
   boxed_storage_needs_release ~reg ~loc (list_elem_type ~loc ~context ty)
 
+let stream_elem_type ~loc ~context ty =
+  match normalize_type ty with
+  | Ast.TyNamed (name, [ elem ]) when type_name_is "Stream" name ->
+      normalize_type elem
+  | _ ->
+      Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
+        ~hint:
+          "This specialization path is stream-specific. If source typechecking \
+           allowed this call, fix the earlier dispatch instead of choosing a \
+           default element type here."
+        "%s must be Stream, got %s" context (Types.type_to_string ty)
+
+let stream_result_elem_needs_release ~reg ~loc ~context ty =
+  boxed_storage_needs_release ~reg ~loc (stream_elem_type ~loc ~context ty)
+
+type stream_element_layout =
+  | StreamImmediate
+  | StreamBorrowedArc
+  | StreamOwnedArc
+
+let stream_element_layout_code = function
+  | StreamImmediate -> 0
+  | StreamBorrowedArc -> 1
+  | StreamOwnedArc -> 2
+
+let stream_result_owned_layout ~reg ~loc ~context ty =
+  if stream_result_elem_needs_release ~reg ~loc ~context ty then StreamOwnedArc
+  else StreamImmediate
+
+let stream_result_borrowed_layout ~reg ~loc ~context ty =
+  if stream_result_elem_needs_release ~reg ~loc ~context ty then
+    StreamBorrowedArc
+  else StreamImmediate
+
+let stream_state_layout ~reg ~loc ty =
+  if
+    Core_layout_type.source_value_requires_retain_or_error
+      ~phase:(Core_error.Stage Core_stage.Specialize) ~reg ty loc
+  then StreamOwnedArc
+  else StreamImmediate
+
+let stream_layout_needs_pointer_arg = function
+  | StreamImmediate -> false
+  | StreamBorrowedArc | StreamOwnedArc -> true
+
+let stream_runtime_value_arg ~reg ~layout arg =
+  if stream_layout_needs_pointer_arg layout || is_pointer_type ~reg arg.ty then
+    arg
+  else
+    let ptr_ty = Ast.TyNamed ("Ptr", []) in
+    { arg with desc = CCast (arg, ptr_ty); ty = ptr_ty }
+
 let tensor_has_elem ?reg name ty =
   match tensor_parts ?reg ty with
   | None -> false
@@ -1030,6 +1082,10 @@ let rec collect_raw_tensor_views ?reg env blocked views e =
       Option.bind (collect_raw_tensor_views ?reg env blocked views b.borrow_rhs)
         (fun views ->
           collect_raw_tensor_views ?reg env (b.borrow_var :: blocked) views body)
+  | CResourceScope _ ->
+      (* Resource scopes are semantic cleanup boundaries. Do not hoist raw
+         tensor views from acquisition/body/cleanup into an enclosing loop. *)
+      Some views
   | CFor (binder, iter, body) ->
       Option.bind (collect_raw_tensor_views ?reg env blocked views iter)
         (fun views ->
@@ -1111,6 +1167,10 @@ let rec rewrite_raw_tensor_view_body ?reg env blocked views e =
               views body
           in
           { e with desc = CBorrowLet ({ b with borrow_rhs = rhs' }, body') }
+      | CResourceScope _ ->
+          (* Do not rewrite reads inside cleanup scopes to use a raw view that
+             was proven and bound outside the resource lifetime boundary. *)
+          e
       | CFor (binder, iter, body) ->
           let iter' = rewrite iter in
           let body_env = body_env_for_loop env binder iter' in
@@ -1686,6 +1746,21 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       | "blorp_to_string" -> specialize_to_string ~reg e callee arg
       | "blorp_debug_string" -> specialize_debug_string ~reg e callee arg
       | "blorp_hash" -> specialize_hash e callee arg
+      | "blorp_stream_repeat" ->
+          let elem_layout =
+            stream_result_borrowed_layout ~reg ~loc:e.loc
+              ~context:"stream repeat result" e.ty
+          in
+          let elem_layout_code = stream_element_layout_code elem_layout in
+          let arg = stream_runtime_value_arg ~reg ~layout:elem_layout arg in
+          {
+            e with
+            desc =
+              CCall
+                ( CKBuiltin "blorp_stream_repeat",
+                  callee,
+                  [ arg; int_lit e.loc elem_layout_code ] );
+          }
       | "blorp_length" -> (
           let dummy =
             { arg with desc = CVoid; ty = Ast.TyNamed ("Void", []) }
@@ -1916,6 +1991,41 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       | Some builtin_name ->
           { e with desc = CCall (CKBuiltin builtin_name, callee, args) }
       | None -> e)
+  | CCall (CKBuiltin "blorp_stream_unfold", callee, [ seed; func ]) ->
+      let elem_layout =
+        stream_result_owned_layout ~reg ~loc:e.loc
+          ~context:"stream unfold result" e.ty
+      in
+      let state_layout = stream_state_layout ~reg ~loc:e.loc seed.ty in
+      let seed = stream_runtime_value_arg ~reg ~layout:state_layout seed in
+      {
+        e with
+        desc =
+          CCall
+            ( CKBuiltin "blorp_stream_unfold",
+              callee,
+              [
+                seed;
+                func;
+                int_lit e.loc (stream_element_layout_code elem_layout);
+                int_lit e.loc (stream_element_layout_code state_layout);
+              ] );
+      }
+  | CCall (CKBuiltin "blorp_stream_map", callee, args) when List.length args = 2
+    ->
+      let elem_layout =
+        stream_result_owned_layout ~reg ~loc:e.loc ~context:"stream map result"
+          e.ty
+      in
+      let elem_layout_code = stream_element_layout_code elem_layout in
+      {
+        e with
+        desc =
+          CCall
+            ( CKBuiltin "blorp_stream_map",
+              callee,
+              args @ [ int_lit e.loc elem_layout_code ] );
+      }
   | CCall (CKBuiltin ("blorp_stream_filter_map" as base), callee, args) -> (
       match stream_filter_map_builtin_for_option_layout ~reg base e.ty with
       | Some builtin_name ->

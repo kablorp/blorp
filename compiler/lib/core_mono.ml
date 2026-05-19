@@ -1418,6 +1418,16 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
           let source' = rewrite scope binding.trv_source in
           let body' = rewrite (scope_add_var scope binding.trv_var) body in
           CTensorRawViewLet ({ binding with trv_source = source' }, body')
+      | CResourceScope s ->
+          let acquire' = rewrite scope s.rs_acquire in
+          let scoped = scope_add_var scope s.rs_var in
+          CResourceScope
+            {
+              s with
+              rs_acquire = acquire';
+              rs_body = rewrite scoped s.rs_body;
+              rs_cleanup = rewrite scoped s.rs_cleanup;
+            }
       | CSeq (a, b) -> CSeq (rewrite scope a, rewrite scope b)
       | CDebugBlock body -> CDebugBlock (rewrite scope body)
       | CIf (cond, then_, else_) ->
@@ -1851,6 +1861,11 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
       | CTensorRawViewLet (binding, body) ->
           scan_expr scope binding.trv_source;
           scan_expr (scope_add_var scope binding.trv_var) body
+      | CResourceScope s ->
+          scan_expr scope s.rs_acquire;
+          let scoped = scope_add_var scope s.rs_var in
+          scan_expr scoped s.rs_body;
+          scan_expr scoped s.rs_cleanup
       | CDebugBlock body -> scan_expr scope body
       | CIf (cond, then_, else_) ->
           scan_expr scope cond;

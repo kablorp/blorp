@@ -248,7 +248,7 @@ for category in parser typecheck infer; do
     [ -d "$dir/should_fail" ] && for f in "$dir/should_fail"/*.brp; do [ -f "$f" ] && test_files+=("$f"); done
 done
 
-for sub in format/should_pass format/should_fail format/should_error purify/should_purify purify/should_not_purify; do
+for sub in format/should_pass format/should_fail format/should_error purify/should_purify purify/should_not_purify purify/should_rewrite; do
     dir="tests/test_compiler/$sub"
     [ -d "$dir" ] && for f in "$dir"/*.brp; do [ -f "$f" ] && test_files+=("$f"); done
 done
@@ -359,28 +359,87 @@ run_test() {
         fi
 
     elif [ "$grandparent" = "purify" ]; then
-        output=$(run_blorp_capture purify --dry-run "$test")
-        exit_code=$?
-        if [ $exit_code -eq 124 ]; then
-            echo "FAIL ✗ [purify/$parent_dir] $testname"
-            echo "DETAIL   Purify timed out after ${compiler_test_timeout}s"
-            return
-        fi
-        if [ "$parent_dir" = "should_purify" ]; then
-            if [ -n "$output" ]; then
-                echo "PASS ✓ [purify/should_purify] $testname"
-            else
-                echo "FAIL ✗ [purify/should_purify] $testname"
-                echo "DETAIL   Expected: functions to purify"
-                echo "DETAIL   Got: nothing purifiable"
-            fi
-        elif [ "$parent_dir" = "should_not_purify" ]; then
-            if [ -z "$output" ]; then
-                echo "PASS ✓ [purify/should_not_purify] $testname"
-            else
-                echo "FAIL ✗ [purify/should_not_purify] $testname"
-                echo "DETAIL   Expected: nothing purifiable"
+        if [ "$parent_dir" = "should_rewrite" ]; then
+            tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-purify-test.XXXXXX")
+            tmpfile="$tmpdir/$testname"
+            cp "$test" "$tmpfile"
+            output=$(run_blorp_capture purify "$tmpfile")
+            exit_code=$?
+            if [ $exit_code -eq 124 ]; then
+                echo "FAIL ✗ [purify/should_rewrite] $testname"
+                echo "DETAIL   Purify timed out after ${compiler_test_timeout}s"
+                rm -rf "$tmpdir"
+                return
+            elif [ $exit_code -ne 0 ]; then
+                echo "FAIL ✗ [purify/should_rewrite] $testname"
+                echo "DETAIL   Purify failed"
                 echo "$output" | sed 's/^/DETAIL     /'
+                rm -rf "$tmpdir"
+                return
+            fi
+
+            check_output=$(run_blorp_capture check --no-format "$tmpfile")
+            check_exit=$?
+            if [ $check_exit -ne 0 ]; then
+                echo "FAIL ✗ [purify/should_rewrite] $testname"
+                echo "DETAIL   Rewritten file did not typecheck"
+                echo "$check_output" | sed 's/^/DETAIL     /'
+                rm -rf "$tmpdir"
+                return
+            fi
+
+            body=$(grep -v '^-- EXPECT-' "$tmpfile" || true)
+            all_match=true
+            expect_contains=$(grep '^-- EXPECT-CONTAINS:' "$test" | sed 's/^-- EXPECT-CONTAINS: *//' || true)
+            while IFS= read -r expect; do
+                [ -z "$expect" ] && continue
+                if ! echo "$body" | grep -qF -- "$expect"; then
+                    all_match=false
+                    echo "FAIL ✗ [purify/should_rewrite] $testname"
+                    echo "DETAIL   Missing rewritten text: $expect"
+                    break
+                fi
+            done <<< "$expect_contains"
+            if $all_match; then
+                expect_absent=$(grep '^-- EXPECT-NOT-CONTAINS:' "$test" | sed 's/^-- EXPECT-NOT-CONTAINS: *//' || true)
+                while IFS= read -r expect; do
+                    [ -z "$expect" ] && continue
+                    if echo "$body" | grep -qF -- "$expect"; then
+                        all_match=false
+                        echo "FAIL ✗ [purify/should_rewrite] $testname"
+                        echo "DETAIL   Forbidden rewritten text present: $expect"
+                        break
+                    fi
+                done <<< "$expect_absent"
+            fi
+            if $all_match; then
+                echo "PASS ✓ [purify/should_rewrite] $testname"
+            fi
+            rm -rf "$tmpdir"
+        else
+            output=$(run_blorp_capture purify --dry-run "$test")
+            exit_code=$?
+            if [ $exit_code -eq 124 ]; then
+                echo "FAIL ✗ [purify/$parent_dir] $testname"
+                echo "DETAIL   Purify timed out after ${compiler_test_timeout}s"
+                return
+            fi
+            if [ "$parent_dir" = "should_purify" ]; then
+                if [ -n "$output" ]; then
+                    echo "PASS ✓ [purify/should_purify] $testname"
+                else
+                    echo "FAIL ✗ [purify/should_purify] $testname"
+                    echo "DETAIL   Expected: functions to purify"
+                    echo "DETAIL   Got: nothing purifiable"
+                fi
+            elif [ "$parent_dir" = "should_not_purify" ]; then
+                if [ -z "$output" ]; then
+                    echo "PASS ✓ [purify/should_not_purify] $testname"
+                else
+                    echo "FAIL ✗ [purify/should_not_purify] $testname"
+                    echo "DETAIL   Expected: nothing purifiable"
+                    echo "$output" | sed 's/^/DETAIL     /'
+                fi
             fi
         fi
 

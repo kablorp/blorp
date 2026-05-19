@@ -284,6 +284,15 @@ let collect_free_vars (e : core) : (string * Ast.type_expr) list =
           (fun _ a _ -> Some a)
           source
           (StringMap.union (fun _ a _ -> Some a) capacity body)
+    | CResourceScope scope ->
+        let acquire = go bound scope.rs_acquire in
+        let scope_bound = StringSet.add scope.rs_var.vname bound in
+        let body = go scope_bound scope.rs_body in
+        let cleanup = go scope_bound scope.rs_cleanup in
+        StringMap.union
+          (fun _ a _ -> Some a)
+          acquire
+          (StringMap.union (fun _ a _ -> Some a) body cleanup)
     | CConcurrentFor cf ->
         let i = go bound cf.cf_iter in
         let b = go (StringSet.add cf.cf_var.vname bound) cf.cf_body in

@@ -581,6 +581,12 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
           "'name ?= expr' must be used as a statement before the expression \
            that returns Option or Result"
         "EQuestionBind reached lowering outside a result-producing block"
+  | TA.EWith _ ->
+      Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
+        ~hint:
+          "resource scopes must be lowered to explicit cleanup Core before \
+           backend emission"
+        "EWith reached core lowering before resource cleanup lowering"
   | TA.EDebugBlock body ->
       let debug_ty = Ast.TyNamed ("Void", []) in
       let body = lower_block ~loc ~ty:debug_ty body in

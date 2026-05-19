@@ -566,6 +566,99 @@ let test_concurrent_for_gets_task_closure_metadata () =
         | Some _ -> Alcotest.fail "expected converted CConcurrentFor body"
         | None -> Alcotest.fail "missing run body"))
 
+let test_resource_scope_binding_not_captured_by_nested_lambda () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let scope =
+          mk
+            (CResourceScope
+               {
+                 rs_var = Var.named "resource";
+                 rs_ty = ty_int;
+                 rs_acquire = cint 0;
+                 rs_body = cvar "resource" ty_int;
+                 rs_cleanup = mk CVoid ty_void;
+               })
+            ty_int
+        in
+        let lam_ty = fn_ty [] ty_int true in
+        let lam =
+          {
+            lam_params = [];
+            lam_return_ty = ty_int;
+            lam_body = scope;
+            lam_is_pure = true;
+          }
+        in
+        let make =
+          mk_func ~is_pure:true "make" [] lam_ty
+            (Some (mk (CLambda lam) lam_ty))
+            30
+        in
+        let converted = Blorp.Core_closure.convert_program [ decl make ] in
+        let closure_func = require_func "_blorp_clambda_0" converted in
+        match closure_func.cf_kind with
+        | CFClosureBody ca ->
+            Alcotest.(check int)
+              "resource scope binding is not captured" 0
+              (List.length ca.ca_captures)
+        | _ -> Alcotest.fail "expected hoisted closure body"))
+
+let test_resource_scope_binding_shadows_global_function_ref () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let resource_ty = fn_ty [ ty_int ] ty_int true in
+        let resource =
+          mk_func ~is_pure:true "resource"
+            [ ("x", ty_int) ]
+            ty_int
+            (Some (cvar "x" ty_int))
+            31
+        in
+        let acquire =
+          mk
+            (CClosureCreate
+               {
+                 cc_func = "_dummy_resource";
+                 cc_def_id = 999;
+                 cc_captures = [];
+               })
+            resource_ty
+        in
+        let scope =
+          mk
+            (CResourceScope
+               {
+                 rs_var = Var.named "resource";
+                 rs_ty = resource_ty;
+                 rs_acquire = acquire;
+                 rs_body = cvar "resource" resource_ty;
+                 rs_cleanup = mk CVoid ty_void;
+               })
+            resource_ty
+        in
+        let get = mk_func "get" [] resource_ty (Some scope) 32 in
+        let converted =
+          Blorp.Core_closure.convert_program [ decl resource; decl get ]
+        in
+        let get' = require_func "get" converted in
+        match get'.cf_body with
+        | Some
+            { desc = CResourceScope { rs_body = { desc = CVar v; _ }; _ }; _ }
+          ->
+            Alcotest.(check string)
+              "resource binding stayed local" "resource" v.vname
+        | Some
+            {
+              desc =
+                CResourceScope { rs_body = { desc = CClosureCreate _; _ }; _ };
+              _;
+            } ->
+            Alcotest.fail
+              "resource binding was wrapped as a global function ref"
+        | Some _ -> Alcotest.fail "expected resource scope body"
+        | None -> Alcotest.fail "missing get body"))
+
 let test_generic_template_lambdas_are_not_hoisted () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -627,6 +720,10 @@ let suite =
           `Quick test_eta_adapter_does_not_retain_borrowed_managed_arg;
         Alcotest.test_case "eta_adapter_retains_builtin_consumed_managed_args"
           `Quick test_eta_adapter_retains_builtin_consumed_managed_args;
+        Alcotest.test_case "resource_scope_binding_not_captured" `Quick
+          test_resource_scope_binding_not_captured_by_nested_lambda;
+        Alcotest.test_case "resource_scope_shadows_global_function_ref" `Quick
+          test_resource_scope_binding_shadows_global_function_ref;
         Alcotest.test_case "generic_template_lambdas_are_not_hoisted" `Quick
           test_generic_template_lambdas_are_not_hoisted;
       ] );

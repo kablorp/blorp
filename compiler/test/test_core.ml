@@ -19,6 +19,7 @@ let ty_int = TyNamed ("Int", [])
 let ty_bool = TyNamed ("Bool", [])
 let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
+let ty_test_resource = TyNamed ("TestResource", [])
 let ty_list_int = TyNamed ("List", [ ty_int ])
 let ty_opt_int = TyNamed ("Option", [ ty_int ])
 let str_flags = { sf_triple = false; sf_raw = false }
@@ -338,6 +339,24 @@ let test_construct_string_interp () =
   | CStringInterp (ps, false) -> Alcotest.(check int) "parts" 3 (List.length ps)
   | _ -> Alcotest.fail "expected CStringInterp"
 
+let test_construct_resource_scope () =
+  let scope =
+    {
+      rs_var = Var.named "resource";
+      rs_ty = ty_test_resource;
+      rs_acquire = cvar "open_resource" ty_test_resource;
+      rs_body = cint 7;
+      rs_cleanup = cvoid;
+    }
+  in
+  let e = mk (CResourceScope scope) ty_int in
+  match e.desc with
+  | CResourceScope s ->
+      Alcotest.(check string) "var" "resource" s.rs_var.vname;
+      Alcotest.(check bool) "resource type" true (s.rs_ty = ty_test_resource);
+      Alcotest.(check bool) "result follows body" true (e.ty = s.rs_body.ty)
+  | _ -> Alcotest.fail "expected CResourceScope"
+
 (* ============================================================================
    CBox: Phase 2.6.3 — carries an explicit source-type annotation so the
    box strategy doesn't depend on the child node's .ty staying correct.
@@ -487,6 +506,38 @@ let test_map_children_match () =
   in
   (* scrutinee + 2 arm bodies *)
   Alcotest.(check int) "3 children (scrut + 2 arms)" 3 !counter
+
+let test_map_children_resource_scope () =
+  let scope =
+    {
+      rs_var = Var.named "resource";
+      rs_ty = ty_test_resource;
+      rs_acquire = cvar "open_resource" ty_test_resource;
+      rs_body = cint 7;
+      rs_cleanup = cvoid;
+    }
+  in
+  let e = mk (CResourceScope scope) ty_int in
+  let counter = ref 0 in
+  let mapped =
+    map_children
+      (fun c ->
+        incr counter;
+        match c.desc with
+        | CLit (LitInt _) -> { c with desc = CLit (LitInt 99L) }
+        | _ -> c)
+      e
+  in
+  Alcotest.(check int) "3 children (acquire, body, cleanup)" 3 !counter;
+  match mapped.desc with
+  | CResourceScope s ->
+      Alcotest.(check bool)
+        "body rewritten" true
+        (s.rs_body.desc = CLit (LitInt 99L));
+      Alcotest.(check bool)
+        "resource type unchanged" true
+        (s.rs_ty = ty_test_resource)
+  | _ -> Alcotest.fail "expected CResourceScope"
 
 (* ============================================================================
    transform_bottom_up: recursive rewrite primitive for Phase 2 passes
@@ -879,6 +930,26 @@ let test_pp_indented_let_with_if_body () =
     "let + nested if" "let x: Int = 10 in\nif (x > 0) then\n  1\nelse\n  0"
     (pp_to_string_indented e)
 
+let test_pp_resource_scope () =
+  let scope =
+    {
+      rs_var = Var.named "resource";
+      rs_ty = ty_test_resource;
+      rs_acquire = cvar "open_resource" ty_test_resource;
+      rs_body = cint 7;
+      rs_cleanup = cvoid;
+    }
+  in
+  let e = mk (CResourceScope scope) ty_int in
+  Alcotest.(check string)
+    "flat resource scope"
+    "resource resource: TestResource = open_resource in 7 cleanup void"
+    (pp_to_string e);
+  Alcotest.(check string)
+    "indented resource scope"
+    "resource resource: TestResource = open_resource in\n7\ncleanup\n  void"
+    (pp_to_string_indented e)
+
 (* ============================================================================
    Build module: ergonomic construction with type/loc inference
    ============================================================================ *)
@@ -1104,6 +1175,7 @@ let suite =
         Alcotest.test_case "detach" `Quick test_construct_detach;
         Alcotest.test_case "record_update" `Quick test_construct_record_update;
         Alcotest.test_case "string_interp" `Quick test_construct_string_interp;
+        Alcotest.test_case "resource_scope" `Quick test_construct_resource_scope;
       ] );
     ( "cbox",
       [
@@ -1125,6 +1197,8 @@ let suite =
         Alcotest.test_case "let" `Quick test_map_children_let;
         Alcotest.test_case "call" `Quick test_map_children_call;
         Alcotest.test_case "match" `Quick test_map_children_match;
+        Alcotest.test_case "resource_scope" `Quick
+          test_map_children_resource_scope;
       ] );
     ( "transform",
       [
@@ -1193,6 +1267,7 @@ let suite =
         Alcotest.test_case "seq" `Quick test_pp_indented_seq;
         Alcotest.test_case "let_with_if" `Quick
           test_pp_indented_let_with_if_body;
+        Alcotest.test_case "resource_scope" `Quick test_pp_resource_scope;
       ] );
     ( "pp_program",
       [

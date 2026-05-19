@@ -26,6 +26,7 @@ type type_info = private {
   origin : type_origin;
   widening : Type_widening_metadata.decision;
   proofs : Type_proof_metadata.expr_proofs;
+  resolved_call : Ast.resolved_call option;
 }
 
 type func_param_info = private {
@@ -38,6 +39,7 @@ type func_info = private {
   source_return_ty : Ast.type_expr option;
   semantic_return_ty : Ast.type_expr;
   param_infos : func_param_info list;
+  callable_id : int option;
 }
 
 type var_info = private {
@@ -82,6 +84,15 @@ type match_case = {
   case_loc : Ast.loc;
 }
 
+type with_binding_kind = Ast.with_binding_kind = WithPlain | WithTry
+
+type with_binding = {
+  with_name : string;
+  with_type : Ast.type_expr option;
+  with_value : expr;
+  with_kind : with_binding_kind;
+}
+
 type expr_desc =
   | EIdent of string
   | ELiteral of Ast.literal
@@ -117,6 +128,7 @@ type expr_desc =
   | EStringInterp of string_interp_part list * bool
   | EStringInterpRaw of string * bool
   | EQuestionBind of string * Ast.type_expr option * expr
+  | EWith of with_binding * expr
   | EDebugBlock of expr list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr
@@ -144,6 +156,7 @@ val of_ast_expr_with_type_info :
   ?context:string ->
   ?source_ty:Ast.type_expr ->
   ?origin:type_origin ->
+  ?resolved_call:Ast.resolved_call ->
   ?proofs:Type_proof_metadata.expr_proofs ->
   semantic_ty:Ast.type_expr ->
   value_ty:Ast.type_expr ->
@@ -154,10 +167,17 @@ val of_ast_expr_with_type_info :
 val of_ast_func_decl : Ast.func_decl -> (func_decl, error) result
 val of_ast_var_decl : Ast.var_decl -> (var_decl, error) result
 val of_ast_decl : Ast.decl -> (decl, error) result
-val of_ast_program : Ast.program -> (program, error) result
+
+val of_ast_program :
+  ?callable_id_of_func:(name:string -> loc:Ast.loc -> int option) ->
+  Ast.program ->
+  (program, error) result
 
 val of_ast_program_with_sources :
-  source_program:Ast.program -> Ast.program -> (program, error) result
+  ?callable_id_of_func:(name:string -> loc:Ast.loc -> int option) ->
+  source_program:Ast.program ->
+  Ast.program ->
+  (program, error) result
 
 val ast : expr -> Ast.expr
 val expr_desc : expr -> (expr_desc, error) result
@@ -166,6 +186,7 @@ val func_info : func_decl -> func_info
 val func_param_infos : func_decl -> func_param_info list
 val func_body_expr : func_decl -> (expr option, error) result
 val func_semantic_return_type : func_decl -> Ast.type_expr
+val func_callable_id : func_decl -> int option
 val var_ast : var_decl -> Ast.var_decl
 val var_info : var_decl -> var_info
 val var_value_expr : var_decl -> (expr, error) result
@@ -192,5 +213,10 @@ val type_info_value_type : type_info -> Ast.type_expr
 val type_info_origin : type_info -> type_origin
 val type_info_widening : type_info -> Type_widening_metadata.decision
 val type_info_proofs : type_info -> Type_proof_metadata.expr_proofs
+val type_info_resolved_call : type_info -> Ast.resolved_call option
+val expr_resolved_call : expr -> Ast.resolved_call option
+val expr_call_purity : expr -> bool option
+val expr_direct_call_id : expr -> int option
+val expr_concrete_callable_id : expr -> int option
 val semantic_type : expr -> Ast.type_expr
 val value_type : expr -> Ast.type_expr

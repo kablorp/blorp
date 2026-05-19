@@ -10,6 +10,7 @@ let source_alias_info : Ast.expr_type_info =
     origin = ExplicitAnnotation (TyNamed ("UserId", []));
     widening = Keep Types.ty_int;
     proofs = Type_proof_metadata.unproven_expr;
+    resolved_call = None;
   }
 
 let widened_literal_info : Ast.expr_type_info =
@@ -26,6 +27,7 @@ let widened_literal_info : Ast.expr_type_info =
           reason = MutableBinding;
         };
     proofs = Type_proof_metadata.unproven_expr;
+    resolved_call = None;
   }
 
 let test_debug_type_info_uses_shared_wording () =

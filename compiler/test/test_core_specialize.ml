@@ -23,6 +23,19 @@ let ty_list_char = TyNamed ("List", [ TyNamed ("Char", []) ])
 let ty_stream_string = TyNamed ("Stream", [ ty_string ])
 let mk d t = { desc = d; ty = t; loc }
 let cvar n t = mk (CVar (Var.named n)) t
+let cvoid = mk CVoid ty_void
+
+let resource_scope name ty acquire body cleanup =
+  mk
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty;
+         rs_acquire = acquire;
+         rs_body = body;
+         rs_cleanup = cleanup;
+       })
+    body.ty
 
 let enum_variant name tag =
   {
@@ -38,6 +51,9 @@ let tensor elem dims =
 
 let call_builtin name args ret_ty =
   mk (CCall (CKBuiltin name, mk CVoid ty_void, args)) ret_ty
+
+let call_intrinsic name args ret_ty =
+  mk (CCall (CKIntrinsic name, mk CVoid ty_void, args)) ret_ty
 
 let specialize e =
   let ctx = Blorp.Core_emit_context.create () in
@@ -509,6 +525,60 @@ let test_bounds_proven_tensor_read_uses_typed_raw_view () =
         "reads through typed raw tensor view" 1
         (count_tensor_raw_read TensorFloat64Elements body)
 
+let guarded_float64_raw_read source idx =
+  let cond = call_intrinsic "tensor_is_f64_storage" [ source ] ty_bool in
+  let fast =
+    call_intrinsic "tensor_get_f64_raw_unchecked" [ source; idx ] ty_float
+  in
+  let safe = call_builtin "blorp_checked_get" [ source; idx ] ty_float in
+  mk (CIf (cond, fast, safe)) ty_float
+
+let test_raw_tensor_view_collection_respects_resource_scope_binding () =
+  let values_ty = tensor ty_float [ 4 ] in
+  let values = cvar "values" values_ty in
+  let idx = cvar "i" ty_int in
+  let scoped =
+    resource_scope "values" values_ty
+      (cvar "open_values" values_ty)
+      (guarded_float64_raw_read values idx)
+      cvoid
+  in
+  match
+    Blorp.Core_specialize.collect_raw_tensor_views
+      Blorp.Core_specialize.empty_specialize_env [] [] scoped
+  with
+  | Some [] -> ()
+  | Some views ->
+      Alcotest.failf "expected no views, collected %d" (List.length views)
+  | None -> Alcotest.fail "resource scope should not make collection fail"
+
+let test_raw_tensor_view_rewrite_does_not_enter_resource_scope () =
+  let values_ty = tensor ty_float [ 4 ] in
+  let values = cvar "values" values_ty in
+  let idx = cvar "i" ty_int in
+  let scoped =
+    resource_scope "values" values_ty
+      (cvar "open_values" values_ty)
+      (guarded_float64_raw_read values idx)
+      cvoid
+  in
+  let view : Blorp.Core_specialize.raw_tensor_view =
+    {
+      rtv_tensor = Var.named "values";
+      rtv_tensor_ty = values_ty;
+      rtv_ptr = Var.named "__values_raw";
+      rtv_kind = TensorFloat64Elements;
+      rtv_needs_unique = false;
+    }
+  in
+  let rewritten =
+    Blorp.Core_specialize.rewrite_raw_tensor_view_body
+      Blorp.Core_specialize.empty_specialize_env [] [ view ] scoped
+  in
+  Alcotest.(check int)
+    "resource body is not rewritten to raw view" 0
+    (count_tensor_raw_read TensorFloat64Elements rewritten)
+
 let test_float64_checked_set_uses_unboxed_runtime () =
   let v = cvar "v" (tensor ty_float [ 4 ]) in
   let idx = mk (CLit (LitInt 2L)) ty_int in
@@ -658,6 +728,81 @@ let test_stream_filter_map_managed_option_uses_nullable_runtime () =
   in
   expect_builtin "stream filter_map Option[String]"
     "blorp_stream_filter_map_nullable" e
+
+let test_stream_map_managed_result_sets_owned_arc_layout () =
+  let stream = cvar "s" (TyNamed ("Stream", [ ty_int ])) in
+  let func =
+    cvar "f"
+      (TyFunc { params = [ ty_int ]; return = ty_string; is_pure = true })
+  in
+  let e = call_builtin "blorp_stream_map" [ stream; func ] ty_stream_string in
+  expect_builtin_last_int "stream map String result" "blorp_stream_map" 2 e
+
+let test_stream_map_scalar_result_sets_immediate_layout () =
+  let stream = cvar "s" ty_stream_string in
+  let func =
+    cvar "f"
+      (TyFunc { params = [ ty_string ]; return = ty_int; is_pure = true })
+  in
+  let e =
+    call_builtin "blorp_stream_map" [ stream; func ]
+      (TyNamed ("Stream", [ ty_int ]))
+  in
+  expect_builtin_last_int "stream map Int result" "blorp_stream_map" 0 e
+
+let test_stream_repeat_managed_value_sets_borrowed_arc_layout () =
+  let value = cvar "s" ty_string in
+  let e = call_builtin "blorp_stream_repeat" [ value ] ty_stream_string in
+  expect_builtin_last_int "stream repeat String value" "blorp_stream_repeat" 1 e
+
+let test_stream_repeat_scalar_value_sets_immediate_layout () =
+  let value = mk (CLit (LitInt 7L)) ty_int in
+  let e =
+    call_builtin "blorp_stream_repeat" [ value ]
+      (TyNamed ("Stream", [ ty_int ]))
+  in
+  expect_builtin_last_int "stream repeat Int value" "blorp_stream_repeat" 0 e
+
+let expect_stream_unfold_layouts label expected_elem expected_state e =
+  match (specialize e).desc with
+  | CCall (CKBuiltin got_name, _, args) ->
+      Alcotest.(check string) (label ^ " name") "blorp_stream_unfold" got_name;
+      let args = List.rev args in
+      Alcotest.(check int)
+        (label ^ " state layout") expected_state
+        (int_lit (List.hd args));
+      Alcotest.(check int)
+        (label ^ " elem layout") expected_elem
+        (int_lit (List.hd (List.tl args)))
+  | _ -> Alcotest.failf "%s did not specialize to expected builtin" label
+
+let test_stream_unfold_managed_result_scalar_state_layouts () =
+  let seed = mk (CLit (LitInt 0L)) ty_int in
+  let func =
+    cvar "f"
+      (TyFunc
+         {
+           params = [ ty_int ];
+           return = TyNamed ("Option", [ TyTuple [ ty_string; ty_int ] ]);
+           is_pure = true;
+         })
+  in
+  let e = call_builtin "blorp_stream_unfold" [ seed; func ] ty_stream_string in
+  expect_stream_unfold_layouts "stream unfold String/Int" 2 0 e
+
+let test_stream_unfold_managed_state_layout () =
+  let seed = cvar "s" ty_string in
+  let func =
+    cvar "f"
+      (TyFunc
+         {
+           params = [ ty_string ];
+           return = TyNamed ("Option", [ TyTuple [ ty_string; ty_string ] ]);
+           is_pure = true;
+         })
+  in
+  let e = call_builtin "blorp_stream_unfold" [ seed; func ] ty_stream_string in
+  expect_stream_unfold_layouts "stream unfold String/String" 2 2 e
 
 let test_stream_fold_raw_result_keeps_pointer_type () =
   let stream = cvar "s" (TyNamed ("Stream", [ ty_int ])) in
@@ -1005,6 +1150,10 @@ let suite =
           test_float64_matrix_checked_get_uses_unboxed_runtime;
         Alcotest.test_case "bounds_proven_tensor_read_typed_raw_view" `Quick
           test_bounds_proven_tensor_read_uses_typed_raw_view;
+        Alcotest.test_case "raw_tensor_view_resource_scope_collection" `Quick
+          test_raw_tensor_view_collection_respects_resource_scope_binding;
+        Alcotest.test_case "raw_tensor_view_resource_scope_rewrite" `Quick
+          test_raw_tensor_view_rewrite_does_not_enter_resource_scope;
         Alcotest.test_case "float64_checked_set_unboxed" `Quick
           test_float64_checked_set_uses_unboxed_runtime;
         Alcotest.test_case "float64_matrix_checked_set_unboxed" `Quick
@@ -1027,6 +1176,19 @@ let suite =
           test_float32_vector_set_managed_option_uses_nullable_runtime;
         Alcotest.test_case "stream_filter_map_nullable_managed" `Quick
           test_stream_filter_map_managed_option_uses_nullable_runtime;
+        Alcotest.test_case "stream_map_managed_result_sets_owned_arc_layout"
+          `Quick test_stream_map_managed_result_sets_owned_arc_layout;
+        Alcotest.test_case "stream_map_scalar_result_sets_immediate_layout"
+          `Quick test_stream_map_scalar_result_sets_immediate_layout;
+        Alcotest.test_case
+          "stream_repeat_managed_value_sets_borrowed_arc_layout" `Quick
+          test_stream_repeat_managed_value_sets_borrowed_arc_layout;
+        Alcotest.test_case "stream_repeat_scalar_value_sets_immediate_layout"
+          `Quick test_stream_repeat_scalar_value_sets_immediate_layout;
+        Alcotest.test_case "stream_unfold_managed_result_scalar_state_layouts"
+          `Quick test_stream_unfold_managed_result_scalar_state_layouts;
+        Alcotest.test_case "stream_unfold_managed_state_layout" `Quick
+          test_stream_unfold_managed_state_layout;
         Alcotest.test_case "stream_fold_raw_result_keeps_pointer_type" `Quick
           test_stream_fold_raw_result_keeps_pointer_type;
         Alcotest.test_case "runtime_nullable_managed_builtins" `Quick

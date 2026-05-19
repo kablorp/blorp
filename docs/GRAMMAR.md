@@ -401,6 +401,7 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING | TRIPLE_STRING
              | "{" vector_elems "}"                         (* vector literal *)
              | if_expr
              | match_expr
+             | with_expr
              | concurrent_expr
              | detach_expr ;
 
@@ -429,6 +430,9 @@ match_expr = "match" expr ":" NEWLINE INDENT match_cases DEDENT ;
 match_cases = match_case { NEWLINE match_case } ;
 match_case  = pattern ":" ( expr | NEWLINE INDENT stmt_list DEDENT ) ;
 
+with_expr = "with" with_binding ":" NEWLINE INDENT stmt_list DEDENT ;
+with_binding = destruct_id [ ":" type_expr ] ( "=" | "?=" ) expr ;
+
 debug_block = "debug" ":" NEWLINE INDENT stmt_list DEDENT ;
 
 concurrent_expr = "concurrent" [ "(" concurrent_params ")" ] ":" NEWLINE INDENT stmt_list DEDENT
@@ -442,6 +446,10 @@ detach_expr = "detach" unary_expr ;
 
 `debug_block` returns `Void`. Normal builds erase the body after Core lowering;
 `--debug` builds and `blorp test` retain it.
+
+`with_expr` is reserved syntax for scoped resources. It is parsed and
+represented in the AST, but the typechecker rejects it until cleanup lowering
+and resource-scope checking are implemented.
 
 ### Patterns
 

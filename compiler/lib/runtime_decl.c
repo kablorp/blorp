@@ -1419,21 +1419,31 @@ void* blorp_channel_try_recv_nullable(void* c);
 void* blorp_channel_recv_timeout_nullable(void* c, long timeout_ms);
 
 // Stream[T]
+typedef enum blorp_StreamElementLayout {
+    BLORP_STREAM_ELEM_IMMEDIATE = 0,
+    BLORP_STREAM_ELEM_BORROWED_ARC = 1,
+    BLORP_STREAM_ELEM_OWNED_ARC = 2,
+} blorp_StreamElementLayout;
+
 typedef struct blorp_Stream {
     blorp_Object header;
     bool (*pull)(struct blorp_Stream* self, void** out);
     void* state;
     void (*state_cleanup)(struct blorp_Stream* self);
-    bool elem_is_rc;
-    bool elem_is_owned;
+    blorp_StreamElementLayout elem_layout;
 } blorp_Stream;
 blorp_Stream* blorp_stream_from_list(blorp_List* list);
 blorp_Stream* blorp_stream_from_range(long start, long end);
-blorp_Stream* blorp_stream_repeat(void* value);
-blorp_Stream* blorp_stream_unfold(void* seed, blorp_Closure* func);
+blorp_Stream* blorp_stream_repeat(void* value, long elem_layout_code);
+blorp_Stream* blorp_stream_unfold(
+    void* seed,
+    blorp_Closure* func,
+    long elem_layout_code,
+    long state_layout_code
+);
 blorp_Stream* blorp_stream_empty(void);
 blorp_Stream* blorp_stream_from_lines(blorp_String* path);
-blorp_Stream* blorp_stream_map(blorp_Stream* inner, blorp_Closure* func);
+blorp_Stream* blorp_stream_map(blorp_Stream* inner, blorp_Closure* func, long result_elem_layout_code);
 blorp_Stream* blorp_stream_filter(blorp_Stream* inner, blorp_Closure* pred);
 blorp_Stream* blorp_stream_filter_map(blorp_Stream* inner, blorp_Closure* func);
 blorp_Stream* blorp_stream_filter_map_int(blorp_Stream* inner, blorp_Closure* func);
@@ -1483,6 +1493,7 @@ void* blorp_stream_find_nullable(blorp_Stream* stream, blorp_Closure* pred);
 bool blorp_stream_any(blorp_Stream* stream, blorp_Closure* pred);
 bool blorp_stream_all(blorp_Stream* stream, blorp_Closure* pred);
 bool blorp_stream_next_raw(blorp_Stream* stream, void** out);
+void blorp_stream_release_pulled_if_owned(blorp_Stream* stream, void* value);
 
 // Parallel List Ops
 blorp_List* blorp_map_parallel(blorp_List* list, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);

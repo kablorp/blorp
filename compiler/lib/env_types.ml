@@ -20,10 +20,10 @@ type def_id = int
     mangling, and LSP can reference definitions unambiguously even when
     multiple definitions share a name.
 
-    Currently carried on [symbol] records; future phases will extend it
-    to [overload_entry], [impl_instance], and the [call_kind] variants
-    in Core IR so resolution sites can attach the canonical identity
-    they resolved to. *)
+    Currently carried on function symbols, overload entries, traits, and
+    impl instances. Future phases will extend it to resolved call-site
+    metadata so diagnostics, LSP, and codegen can attach the canonical
+    identity they resolved to. *)
 
 (** Function purity. *)
 type purity = Pure | Impure

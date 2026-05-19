@@ -139,14 +139,29 @@ let allocation_site_of_expr (e : core) : allocation_site option =
       | _ -> None)
   | None -> None
 
-let owner_touched (target : var) (e : core) : bool =
+let rec owner_touched (target : var) (e : core) : bool =
+  let here =
+    match e.desc with
+    | CVar v -> Var.equal v target
+    | CDup (v, _, _) | CDrop (v, _, _) -> Var.equal v target
+    | CAssign (v, _) -> Var.equal v target
+    | _ -> false
+  in
+  here
+  ||
+  match e.desc with
+  | CResourceScope s ->
+      owner_touched target s.rs_acquire
+      || (not (Var.equal s.rs_var target))
+         && (owner_touched target s.rs_body || owner_touched target s.rs_cleanup)
+  | _ ->
+      fold_immediate_children
+        (fun touched child -> touched || owner_touched target child)
+        false e
+
+let contains_resource_scope (e : core) : bool =
   exists_tree
-    (fun node ->
-      match node.desc with
-      | CVar v -> Var.equal v target
-      | CDup (v, _, _) | CDrop (v, _, _) -> Var.equal v target
-      | CAssign (v, _) -> Var.equal v target
-      | _ -> false)
+    (fun node -> match node.desc with CResourceScope _ -> true | _ -> false)
     e
 
 let list_layout_of_type env ty loc =
@@ -237,6 +252,10 @@ let analyze_drop_block_with_env env dropped_var dropped_ty body =
           finish
             (Interference (ReadsDroppedOwner, binding.bind_rhs.loc) :: facts)
             None
+        else if contains_resource_scope binding.bind_rhs then
+          finish
+            (Interference (NonLinearControlFlow, binding.bind_rhs.loc) :: facts)
+            None
         else
           match allocation_site_of_expr binding.bind_rhs with
           | Some allocation when compatible allocation ->
@@ -264,10 +283,17 @@ let analyze_drop_block_with_env env dropped_var dropped_ty body =
           finish
             (Interference (ReadsDroppedOwner, binding.borrow_rhs.loc) :: facts)
             None
+        else if contains_resource_scope binding.borrow_rhs then
+          finish
+            (Interference (NonLinearControlFlow, binding.borrow_rhs.loc)
+            :: facts)
+            None
         else scan facts rest
     | CSeq (head, rest) -> (
         if owner_touched dropped_var head then
           finish (Interference (ReadsDroppedOwner, head.loc) :: facts) None
+        else if contains_resource_scope head then
+          finish (Interference (NonLinearControlFlow, head.loc) :: facts) None
         else
           match allocation_site_of_expr head with
           | Some allocation ->
@@ -283,6 +309,8 @@ let analyze_drop_block_with_env env dropped_var dropped_ty body =
                   finish
                     (Interference (NonLinearControlFlow, expr.loc) :: facts)
                     None))
+    | CResourceScope _ ->
+        finish (Interference (NonLinearControlFlow, expr.loc) :: facts) None
     | _ -> finish facts None
   in
   scan [] body
@@ -437,6 +465,7 @@ and consume_handoff_in_linear_expr env dropped_var dropped_ty expr =
                           CLet ({ binding with bind_rhs }, rewrite_expr env rest);
                       }
                 | None -> None
+            else if contains_resource_scope binding.bind_rhs then None
             else
               match scan rest with
               | Some rest' ->
@@ -454,6 +483,7 @@ and consume_handoff_in_linear_expr env dropped_var dropped_ty expr =
               | None -> None))
     | CBorrowLet (binding, rest) -> (
         if owner_touched dropped_var binding.borrow_rhs then None
+        else if contains_resource_scope binding.borrow_rhs then None
         else
           match scan rest with
           | Some rest' ->
@@ -471,11 +501,13 @@ and consume_handoff_in_linear_expr env dropped_var dropped_ty expr =
           | None -> None)
     | CSeq (head, rest) -> (
         if owner_touched dropped_var head then None
+        else if contains_resource_scope head then None
         else
           match scan rest with
           | Some rest' ->
               Some { expr with desc = CSeq (rewrite_expr env head, rest') }
           | None -> None)
+    | CResourceScope _ -> None
     | _ -> None
   in
   scan expr
@@ -486,6 +518,7 @@ and rewrite_drop_body env dropped_var dropped_ty body =
     match expr.desc with
     | CLet (binding, rest) -> (
         if owner_touched dropped_var binding.bind_rhs then None
+        else if contains_resource_scope binding.bind_rhs then None
         else
           match allocation_site_of_expr binding.bind_rhs with
           | Some allocation when compatible allocation -> (
@@ -520,6 +553,7 @@ and rewrite_drop_body env dropped_var dropped_ty body =
               | None -> None))
     | CBorrowLet (binding, rest) -> (
         if owner_touched dropped_var binding.borrow_rhs then None
+        else if contains_resource_scope binding.borrow_rhs then None
         else
           match scan rest with
           | Some rest' ->
@@ -537,6 +571,7 @@ and rewrite_drop_body env dropped_var dropped_ty body =
           | None -> None)
     | CSeq (head, rest) -> (
         if owner_touched dropped_var head then None
+        else if contains_resource_scope head then None
         else
           match allocation_site_of_expr head with
           | Some _ -> None
@@ -545,6 +580,7 @@ and rewrite_drop_body env dropped_var dropped_ty body =
               | Some rest' ->
                   Some { expr with desc = CSeq (rewrite_expr env head, rest') }
               | None -> None))
+    | CResourceScope _ -> None
     | _ -> None
   in
   scan body

@@ -180,6 +180,15 @@ let collect_free_vars_filtered (state : state) (body : core)
         let rhs = go bound b.borrow_rhs in
         let body = go (SS.add b.borrow_var.vname bound) body in
         SM.union (fun _ a _ -> Some a) rhs body
+    | CResourceScope s ->
+        let acquire = go bound s.rs_acquire in
+        let scoped_bound = SS.add s.rs_var.vname bound in
+        let body = go scoped_bound s.rs_body in
+        let cleanup = go scoped_bound s.rs_cleanup in
+        SM.union
+          (fun _ a _ -> Some a)
+          acquire
+          (SM.union (fun _ a _ -> Some a) body cleanup)
     | CCall (kind, callee, args) ->
         let callee_fv =
           match kind with
@@ -482,6 +491,22 @@ and adapt_function_refs_expr (state : state) (bound : StringSet.t) (e : core) :
       let body_bound = add_bound_var bound b.borrow_var in
       let body' = adapt_value body_bound body in
       { e with desc = CBorrowLet ({ b with borrow_rhs = rhs' }, body') }
+  | CResourceScope s ->
+      let acquire' = adapt_value bound s.rs_acquire in
+      let body_bound = add_bound_var bound s.rs_var in
+      let body' = adapt_value body_bound s.rs_body in
+      let cleanup' = adapt_value body_bound s.rs_cleanup in
+      {
+        e with
+        desc =
+          CResourceScope
+            {
+              s with
+              rs_acquire = acquire';
+              rs_body = body';
+              rs_cleanup = cleanup';
+            };
+      }
   | CLambda lam ->
       let body_bound = add_bound_typed_vars bound lam.lam_params in
       {
@@ -764,6 +789,31 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
             (convert_expr state ~wrap_fn_refs ~bound:body_bound body)
         in
         { e with desc = CBorrowLet ({ b with borrow_rhs = rhs' }, body') }
+    | CResourceScope s ->
+        let acquire' =
+          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
+            (convert_expr state ~wrap_fn_refs ~bound s.rs_acquire)
+        in
+        let body_bound = add_bound_var bound s.rs_var in
+        let body' =
+          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
+            (convert_expr state ~wrap_fn_refs ~bound:body_bound s.rs_body)
+        in
+        let cleanup' =
+          maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound:body_bound
+            (convert_expr state ~wrap_fn_refs ~bound:body_bound s.rs_cleanup)
+        in
+        {
+          e with
+          desc =
+            CResourceScope
+              {
+                s with
+                rs_acquire = acquire';
+                rs_body = body';
+                rs_cleanup = cleanup';
+              };
+        }
     | CFor (binder, iter, body) ->
         let iter' =
           maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound

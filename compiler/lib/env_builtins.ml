@@ -250,6 +250,7 @@ let with_builtins (env : env) : env =
           ConstructorSymbol
             {
               parent_type = "Option";
+              constructor_id = Session.mint_def_id (Session.current ());
               type_params = [ "T" ];
               field_types = [ TyVar "T" ];
               tag = 0;
@@ -264,6 +265,7 @@ let with_builtins (env : env) : env =
           ConstructorSymbol
             {
               parent_type = "Option";
+              constructor_id = Session.mint_def_id (Session.current ());
               type_params = [ "T" ];
               field_types = [];
               tag = 1;
@@ -310,6 +312,7 @@ let with_builtins (env : env) : env =
           ConstructorSymbol
             {
               parent_type = "Result";
+              constructor_id = Session.mint_def_id (Session.current ());
               type_params = [ "T"; "E" ];
               field_types = [ TyVar "T" ];
               tag = 0;
@@ -324,6 +327,7 @@ let with_builtins (env : env) : env =
           ConstructorSymbol
             {
               parent_type = "Result";
+              constructor_id = Session.mint_def_id (Session.current ());
               type_params = [ "T"; "E" ];
               field_types = [ TyVar "E" ];
               tag = 1;
@@ -1339,6 +1343,7 @@ let with_builtins (env : env) : env =
           ConstructorSymbol
             {
               parent_type = "ConcurrencyError";
+              constructor_id = Session.mint_def_id (Session.current ());
               type_params = [];
               field_types = [];
               tag = 0;
@@ -1353,6 +1358,7 @@ let with_builtins (env : env) : env =
           ConstructorSymbol
             {
               parent_type = "ConcurrencyError";
+              constructor_id = Session.mint_def_id (Session.current ());
               type_params = [];
               field_types = [ ty_string ];
               tag = 1;

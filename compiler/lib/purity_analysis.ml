@@ -2,7 +2,10 @@
 
 open Ast
 
-type call_ref = { called_name : string; call_loc : loc }
+type call_ref = { called_name : string; call_loc : loc; called_id : int option }
+
+let call_ref ?called_id called_name call_loc =
+  { called_name; call_loc; called_id }
 
 let is_impure_builtin (name : string) : bool = Builtin_metadata.is_impure name
 
@@ -24,22 +27,39 @@ let parallel_function_name (name : string) : string option =
 let rec collect_matching_calls
     ~(match_call : string -> expr -> loc -> expr list -> call_ref list)
     ~(enter_lambda : func_decl -> bool)
-    ?(check_non_ident_callee : (expr -> loc -> call_ref list) option)
+    ?(match_resolved_call :
+       (resolved_call -> expr -> loc -> expr list -> call_ref list option)
+       option) ?(check_non_ident_callee : (expr -> loc -> call_ref list) option)
     (expr : expr) : call_ref list =
   let recurse =
-    collect_matching_calls ~match_call ~enter_lambda ?check_non_ident_callee
+    collect_matching_calls ~match_call ~enter_lambda ?match_resolved_call
+      ?check_non_ident_callee
   in
   match expr.expr_desc with
   | ECall (callee, args) ->
       let callee_matches =
-        match callee.expr_desc with
-        | EIdent name -> match_call name callee expr.expr_loc args
-        | EFieldAccess (_, method_name) ->
-            match_call method_name callee expr.expr_loc args
+        match (expr.expr_type_info, match_resolved_call) with
+        | Some { resolved_call = Some resolved; _ }, Some match_resolved -> (
+            match match_resolved resolved callee expr.expr_loc args with
+            | Some refs -> refs
+            | None -> (
+                match callee.expr_desc with
+                | EIdent name -> match_call name callee expr.expr_loc args
+                | EFieldAccess (_, method_name) ->
+                    match_call method_name callee expr.expr_loc args
+                | _ -> (
+                    match check_non_ident_callee with
+                    | Some check -> check callee expr.expr_loc
+                    | None -> [])))
         | _ -> (
-            match check_non_ident_callee with
-            | Some check -> check callee expr.expr_loc
-            | None -> [])
+            match callee.expr_desc with
+            | EIdent name -> match_call name callee expr.expr_loc args
+            | EFieldAccess (_, method_name) ->
+                match_call method_name callee expr.expr_loc args
+            | _ -> (
+                match check_non_ident_callee with
+                | Some check -> check callee expr.expr_loc
+                | None -> []))
       in
       callee_matches @ List.concat_map recurse (expr_children expr)
   | ELambda func ->
@@ -48,13 +68,12 @@ let rec collect_matching_calls
         | Some body -> recurse body
         | None -> []
       else []
-  | EDetach body ->
-      { called_name = "detach"; call_loc = expr.expr_loc } :: recurse body
+  | EDetach body -> call_ref "detach" expr.expr_loc :: recurse body
   | EConcurrent _ ->
-      { called_name = "concurrent"; call_loc = expr.expr_loc }
+      call_ref "concurrent" expr.expr_loc
       :: List.concat_map recurse (expr_children expr)
   | EConcurrentFor _ ->
-      { called_name = "concurrent for"; call_loc = expr.expr_loc }
+      call_ref "concurrent for" expr.expr_loc
       :: List.concat_map recurse (expr_children expr)
   | _ -> List.concat_map recurse (expr_children expr)
 
@@ -62,7 +81,7 @@ let collect_parallel_calls : expr -> call_ref list =
   collect_matching_calls
     ~match_call:(fun name _callee loc _args ->
       match parallel_function_name name with
-      | Some called_name -> [ { called_name; call_loc = loc } ]
+      | Some called_name -> [ call_ref called_name loc ]
       | None -> [])
     ~enter_lambda:(fun _ -> true)
 
@@ -108,7 +127,7 @@ let impure_func_arg_refs (env : Env.env) (args : expr list) : call_ref list =
             | EIdent name -> name
             | _ -> "<impure callback>"
           in
-          Some { called_name; call_loc = arg.expr_loc }
+          Some (call_ref called_name arg.expr_loc)
       | Some Env.Pure | None -> None)
     args
 
@@ -156,7 +175,60 @@ let callee_type_is_impure (env : Env.env) (callee : expr) : bool =
   | Some Env.Impure -> true
   | Some Env.Pure | None -> false
 
-let collect_impure_calls ?(enter_lambda = fun func -> func.func_is_pure) ~strict
+let pure_function_callback_refs ~strict env args =
+  if strict && has_func_typed_args env args && not (all_func_args_pure env args)
+  then impure_func_arg_refs env args
+  else []
+
+let env_function_purity (env : Env.env) (name : string) : Env.purity option =
+  match Env.lookup env name with
+  | Some { kind = Env.FuncSymbol { purity; _ }; _ } -> Some purity
+  | _ -> None
+
+let call_target_name callee target =
+  match target with
+  | CallDirect { source_name; _ } -> source_call_name source_name
+  | CallTraitMethod { method_name; _ } -> source_call_name method_name
+  | CallClosure _ -> (
+      match callee.expr_desc with
+      | EIdent name -> source_call_name name
+      | EFieldAccess (_, method_name) -> method_name
+      | _ -> "<expression>")
+
+let callable_id_assumed_pure assumed id = List.exists (( = ) id) assumed
+
+let resolved_impure_call_refs ~strict ~assume_pure_callable_ids env callee loc
+    args (resolved : resolved_call) =
+  let target_call_pure target =
+    match target with
+    | CallDirect { callable_id; call_pure; _ } ->
+        callable_id_assumed_pure assume_pure_callable_ids callable_id
+        || call_pure
+    | CallTraitMethod { callable_id = Some callable_id; call_pure; _ } ->
+        callable_id_assumed_pure assume_pure_callable_ids callable_id
+        || call_pure
+    | CallTraitMethod { callable_id = None; call_pure; _ }
+    | CallClosure { call_pure } ->
+        call_pure
+  in
+  match resolved.call_target with
+  | target when not (target_call_pure target) ->
+      let callback_refs =
+        if strict then impure_func_arg_refs env args else []
+      in
+      if callback_refs <> [] then Some callback_refs
+      else
+        let called_id = resolved_call_concrete_callable_id resolved in
+        Some
+          [
+            call_ref ?called_id
+              (call_target_name callee resolved.call_target)
+              loc;
+          ]
+  | _ -> Some (pure_function_callback_refs ~strict env args)
+
+let collect_impure_calls ?(enter_lambda = fun func -> func.func_is_pure)
+    ?(prefer_env_purity = false) ?(assume_pure_callable_ids = []) ~strict
     (env : Env.env) (module_aliases : (string * string) list) :
     expr -> call_ref list =
   collect_matching_calls
@@ -167,9 +239,9 @@ let collect_impure_calls ?(enter_lambda = fun func -> func.func_is_pure) ~strict
         | Some { kind = Env.FuncSymbol { purity = Env.Pure; _ }; _ } -> []
         | Some { kind = Env.VarSymbol { var_type; _ }; _ } -> (
             match Env.function_type_purity env var_type with
-            | Some Env.Impure -> [ { called_name = name; call_loc = loc } ]
+            | Some Env.Impure -> [ call_ref name loc ]
             | Some Env.Pure | None -> [])
-        | _ -> [ { called_name = name; call_loc = loc } ]
+        | _ -> [ call_ref name loc ]
       else if
         strict
         && (not (is_module_qualified_call callee module_aliases))
@@ -178,19 +250,20 @@ let collect_impure_calls ?(enter_lambda = fun func -> func.func_is_pure) ~strict
       then
         if all_func_args_pure env args then []
         else impure_func_arg_refs env args
-      else if callee_type_is_impure env callee then
-        [ { called_name = name; call_loc = loc } ]
+      else if prefer_env_purity then
+        match env_function_purity env name with
+        | Some Env.Pure -> pure_function_callback_refs ~strict env args
+        | Some Env.Impure -> [ call_ref name loc ]
+        | None ->
+            if callee_type_is_impure env callee then [ call_ref name loc ]
+            else []
+      else if callee_type_is_impure env callee then [ call_ref name loc ]
       else
         match Env.lookup env name with
         | Some { kind = Env.FuncSymbol { purity = Env.Impure; _ }; _ } ->
-            [ { called_name = name; call_loc = loc } ]
+            [ call_ref name loc ]
         | Some { kind = Env.FuncSymbol { purity = Env.Pure; _ }; _ } ->
-            if
-              strict
-              && has_func_typed_args env args
-              && not (all_func_args_pure env args)
-            then impure_func_arg_refs env args
-            else []
+            pure_function_callback_refs ~strict env args
         | Some { kind = Env.VarSymbol _; _ } -> []
         | Some { kind = Env.ConstructorSymbol _; _ } -> []
         | _ ->
@@ -207,7 +280,7 @@ let collect_impure_calls ?(enter_lambda = fun func -> func.func_is_pure) ~strict
               else
                 match expr_function_purity env callee with
                 | Some Env.Pure -> []
-                | Some Env.Impure -> [ { called_name = name; call_loc = loc } ]
+                | Some Env.Impure -> [ call_ref name loc ]
                 | _ -> []
             else [])
     ?check_non_ident_callee:
@@ -216,8 +289,11 @@ let collect_impure_calls ?(enter_lambda = fun func -> func.func_is_pure) ~strict
            (fun callee loc ->
              match expr_function_purity env callee with
              | Some Env.Pure -> []
-             | _ -> [ { called_name = "<expression>"; call_loc = loc } ])
+             | _ -> [ call_ref "<expression>" loc ])
        else None)
+    ~match_resolved_call:(fun resolved callee loc args ->
+      resolved_impure_call_refs ~strict ~assume_pure_callable_ids env callee loc
+        args resolved)
     ~enter_lambda
 
 let can_upgrade_lambda_body_to_pure (env : Env.env)

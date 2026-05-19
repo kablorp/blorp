@@ -411,6 +411,20 @@ let prefix_module_names ?(debug = false) (mod_name : string)
         let bound' = SS.add binder.loop_var.vname bound in
         rewrite_expr_node e
           (Core.CFor (binder, iter', rewrite_expr_scoped bound' body))
+    | Core.CResourceScope scope ->
+        let acquire' = rewrite_expr_scoped bound scope.rs_acquire in
+        let bound' = SS.add scope.rs_var.vname bound in
+        let body' = rewrite_expr_scoped bound' scope.rs_body in
+        let cleanup' = rewrite_expr_scoped bound' scope.rs_cleanup in
+        rewrite_expr_node e
+          (Core.CResourceScope
+             {
+               scope with
+               rs_ty = rewrite_type scope.rs_ty;
+               rs_acquire = acquire';
+               rs_body = body';
+               rs_cleanup = cleanup';
+             })
     | Core.CMatchArms (scrut, arms) ->
         let scrut' = rewrite_expr_scoped bound scrut in
         let arms' =

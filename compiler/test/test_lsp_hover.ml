@@ -21,6 +21,7 @@ let typed_ident_with_source name ~source_ty ~semantic_ty =
       origin = ExplicitAnnotation source_ty;
       widening = Keep semantic_ty;
       proofs = Type_proof_metadata.unproven_expr;
+      resolved_call = None;
     }
   in
   {

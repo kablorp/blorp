@@ -17524,14 +17524,19 @@ blorp_Tuple* blorp_tuple_new(long arity, ...) {
 // Stream[T] — Lazy pull-based sequences
 // ============================================================================
 
+typedef enum blorp_StreamElementLayout {
+    BLORP_STREAM_ELEM_IMMEDIATE = 0,
+    BLORP_STREAM_ELEM_BORROWED_ARC = 1,
+    BLORP_STREAM_ELEM_OWNED_ARC = 2,
+} blorp_StreamElementLayout;
+
 // Stream type: wraps a pull function + opaque state
 typedef struct blorp_Stream {
     blorp_Object header;
     bool (*pull)(struct blorp_Stream* self, void** out);
     void* state;
     void (*state_cleanup)(struct blorp_Stream* self);
-    bool elem_is_rc;  // True if elements are refcounted (String, List, etc.)
-    bool elem_is_owned;  // True if pull transfers an owned element.
+    blorp_StreamElementLayout elem_layout;
 } blorp_Stream;
 
 static void blorp_stream_destroy(void* obj) {
@@ -17550,8 +17555,13 @@ typedef struct { blorp_Stream* inner; long skipped; long n; } StreamDropState;
 typedef struct { blorp_Stream* inner; blorp_Closure* pred; bool done; } StreamTakeWhileState;
 typedef struct { blorp_Stream* inner; long idx; } StreamEnumState;
 typedef struct { blorp_Stream* inner; blorp_Closure* func; } StreamFilterMapState;
-typedef struct { void* value; bool is_rc; } StreamRepeatState;
-typedef struct { void* state_val; blorp_Closure* func; bool done; bool state_is_rc; } StreamUnfoldState;
+typedef struct { void* value; blorp_StreamElementLayout elem_layout; } StreamRepeatState;
+typedef struct {
+    void* state_val;
+    blorp_Closure* func;
+    bool done;
+    blorp_StreamElementLayout state_layout;
+} StreamUnfoldState;
 typedef struct { FILE* fp; char* buf; size_t buf_size; } StreamLinesState;
 
 // --- Helper: allocate a stream ---
@@ -17560,14 +17570,56 @@ static blorp_Stream* blorp_stream_new(void) {
     BLORP_SET_DESTRUCTOR(s, blorp_stream_destroy);
     s->state = NULL;
     s->state_cleanup = NULL;
-    s->elem_is_rc = false;
-    s->elem_is_owned = false;
+    s->elem_layout = BLORP_STREAM_ELEM_IMMEDIATE;
     return s;
 }
 
-static inline void blorp_stream_release_pulled_if_owned(blorp_Stream* stream, void* value) {
-    if (stream && stream->elem_is_owned && stream->elem_is_rc && value) {
+static inline blorp_StreamElementLayout blorp_stream_layout_from_code(long code) {
+    switch (code) {
+        case BLORP_STREAM_ELEM_BORROWED_ARC:
+            return BLORP_STREAM_ELEM_BORROWED_ARC;
+        case BLORP_STREAM_ELEM_OWNED_ARC:
+            return BLORP_STREAM_ELEM_OWNED_ARC;
+        case BLORP_STREAM_ELEM_IMMEDIATE:
+        default:
+            return BLORP_STREAM_ELEM_IMMEDIATE;
+    }
+}
+
+static inline bool blorp_stream_layout_is_arc(blorp_StreamElementLayout layout) {
+    return layout == BLORP_STREAM_ELEM_BORROWED_ARC
+        || layout == BLORP_STREAM_ELEM_OWNED_ARC;
+}
+
+static inline bool blorp_stream_layout_is_borrowed_arc(blorp_StreamElementLayout layout) {
+    return layout == BLORP_STREAM_ELEM_BORROWED_ARC;
+}
+
+static inline bool blorp_stream_layout_is_owned_arc(blorp_StreamElementLayout layout) {
+    return layout == BLORP_STREAM_ELEM_OWNED_ARC;
+}
+
+static inline bool blorp_stream_has_arc_elements(blorp_Stream* stream) {
+    return stream && blorp_stream_layout_is_arc(stream->elem_layout);
+}
+
+static inline bool blorp_stream_pulls_owned_arc(blorp_Stream* stream) {
+    return stream && blorp_stream_layout_is_owned_arc(stream->elem_layout);
+}
+
+void blorp_stream_release_pulled_if_owned(blorp_Stream* stream, void* value) {
+    if (blorp_stream_pulls_owned_arc(stream) && value) {
         blorp_release(value);
+    }
+}
+
+#define BLORP_STREAM_CANCEL_CHECK_INTERVAL 1024L
+
+static inline void blorp_stream_cancellation_checkpoint(long* iterations) {
+    if (__builtin_expect(__blorp_current_task == NULL, 1)) return;
+    if (++(*iterations) >= BLORP_STREAM_CANCEL_CHECK_INTERVAL) {
+        *iterations = 0;
+        (void)__blorp_cancel_current_task_if_requested();
     }
 }
 
@@ -17585,7 +17637,9 @@ static void stream_list_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_from_list(blorp_List* list) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = list && list->elem_release != NULL;
+    s->elem_layout = (list && list->elem_release != NULL)
+        ? BLORP_STREAM_ELEM_BORROWED_ARC
+        : BLORP_STREAM_ELEM_IMMEDIATE;
     StreamListState* st = malloc(sizeof(StreamListState));
     st->list = list;
     if (list) blorp_retain((blorp_Object*)list);
@@ -17625,14 +17679,24 @@ static bool stream_repeat_pull(blorp_Stream* self, void** out) {
 }
 static void stream_repeat_cleanup(blorp_Stream* self) {
     StreamRepeatState* st = (StreamRepeatState*)self->state;
-    if (st->is_rc && st->value) blorp_release(st->value);
+    if (blorp_stream_layout_is_arc(st->elem_layout) && st->value) {
+        blorp_release(st->value);
+    }
     free(st);
 }
-blorp_Stream* blorp_stream_repeat(void* value) {
+blorp_Stream* blorp_stream_repeat(void* value, long elem_layout_code) {
     blorp_Stream* s = blorp_stream_new();
     StreamRepeatState* st = malloc(sizeof(StreamRepeatState));
     st->value = value;
-    st->is_rc = false;  // Caller manages RC if needed
+    blorp_StreamElementLayout requested_layout =
+        blorp_stream_layout_from_code(elem_layout_code);
+    st->elem_layout = blorp_stream_layout_is_arc(requested_layout)
+        ? BLORP_STREAM_ELEM_BORROWED_ARC
+        : BLORP_STREAM_ELEM_IMMEDIATE;
+    s->elem_layout = st->elem_layout;
+    if (blorp_stream_layout_is_arc(st->elem_layout) && value) {
+        blorp_retain(value);
+    }
     s->state = st;
     s->pull = stream_repeat_pull;
     s->state_cleanup = stream_repeat_cleanup;
@@ -17643,38 +17707,47 @@ blorp_Stream* blorp_stream_repeat(void* value) {
 static bool stream_unfold_pull(blorp_Stream* self, void** out) {
     StreamUnfoldState* st = (StreamUnfoldState*)self->state;
     if (st->done) return false;
-    // Call f(state) -> Option[(T, S)]
-    blorp_Option* opt = (blorp_Option*)blorp_call1(st->func, st->state_val);
-    if (!opt || opt->tag != BLORP_TAG_SOME) {
-        if (opt) blorp_release(opt);
+    blorp_Tuple* pair = (blorp_Tuple*)blorp_call1(st->func, st->state_val);
+    if (!pair) {
         st->done = true;
         return false;
     }
-    // Extract (value, new_state) from the tuple in Some
-    blorp_Tuple* pair = (blorp_Tuple*)opt->data.Some.field0;
     *out = pair->elem[0];
     void* new_state = pair->elem[1];
-    if (st->state_is_rc && new_state) blorp_retain(new_state);
-    if (st->state_is_rc && st->state_val) blorp_release(st->state_val);
+    void* old_state = st->state_val;
     st->state_val = new_state;
-    opt->release_mask = 0;  // we took ownership of field0
-    blorp_release(opt);
+    if (blorp_stream_layout_is_arc(st->state_layout) && old_state) {
+        blorp_release(old_state);
+    }
+    pair->release_mask = 0;
+    blorp_release(pair);
     return true;
 }
 static void stream_unfold_cleanup(blorp_Stream* self) {
     StreamUnfoldState* st = (StreamUnfoldState*)self->state;
     if (st->func) blorp_release((blorp_Object*)st->func);
-    if (st->state_is_rc && st->state_val) blorp_release(st->state_val);
+    if (blorp_stream_layout_is_arc(st->state_layout) && st->state_val) {
+        blorp_release(st->state_val);
+    }
     free(st);
 }
-blorp_Stream* blorp_stream_unfold(void* seed, blorp_Closure* func) {
+blorp_Stream* blorp_stream_unfold(
+    void* seed,
+    blorp_Closure* func,
+    long elem_layout_code,
+    long state_layout_code
+) {
     blorp_Stream* s = blorp_stream_new();
     StreamUnfoldState* st = malloc(sizeof(StreamUnfoldState));
     st->state_val = seed;
     st->func = func;
     if (func) blorp_retain((blorp_Object*)func);
     st->done = false;
-    st->state_is_rc = false;
+    st->state_layout = blorp_stream_layout_from_code(state_layout_code);
+    s->elem_layout = blorp_stream_layout_from_code(elem_layout_code);
+    if (blorp_stream_layout_is_arc(st->state_layout) && seed) {
+        blorp_retain(seed);
+    }
     s->state = st;
     s->pull = stream_unfold_pull;
     s->state_cleanup = stream_unfold_cleanup;
@@ -17708,9 +17781,9 @@ static void stream_map_cleanup(blorp_Stream* self) {
     if (st->func) blorp_release((blorp_Object*)st->func);
     free(st);
 }
-blorp_Stream* blorp_stream_map(blorp_Stream* inner, blorp_Closure* func) {
+blorp_Stream* blorp_stream_map(blorp_Stream* inner, blorp_Closure* func, long result_elem_layout_code) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = inner->elem_is_rc;
+    s->elem_layout = blorp_stream_layout_from_code(result_elem_layout_code);
     StreamMapState* st = malloc(sizeof(StreamMapState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
@@ -17726,14 +17799,16 @@ blorp_Stream* blorp_stream_map(blorp_Stream* inner, blorp_Closure* func) {
 static bool stream_filter_pull(blorp_Stream* self, void** out) {
     StreamFilterState* st = (StreamFilterState*)self->state;
     void* val;
-    while (st->inner->pull(st->inner, &val)) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!st->inner->pull(st->inner, &val)) return false;
         if ((long)blorp_call1(st->pred, val)) {
             *out = val;
             return true;
         }
         blorp_stream_release_pulled_if_owned(st->inner, val);
     }
-    return false;
 }
 static void stream_filter_cleanup(blorp_Stream* self) {
     StreamFilterState* st = (StreamFilterState*)self->state;
@@ -17743,8 +17818,7 @@ static void stream_filter_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_filter(blorp_Stream* inner, blorp_Closure* pred) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = inner->elem_is_rc;
-    s->elem_is_owned = inner->elem_is_owned;
+    s->elem_layout = inner->elem_layout;
     StreamFilterState* st = malloc(sizeof(StreamFilterState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
@@ -17760,7 +17834,10 @@ blorp_Stream* blorp_stream_filter(blorp_Stream* inner, blorp_Closure* pred) {
 static bool stream_filter_map_pull(blorp_Stream* self, void** out) {
     StreamFilterMapState* st = (StreamFilterMapState*)self->state;
     void* val;
-    while (st->inner->pull(st->inner, &val)) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!st->inner->pull(st->inner, &val)) return false;
         blorp_Option* opt = (blorp_Option*)blorp_call1(st->func, val);
         blorp_stream_release_pulled_if_owned(st->inner, val);
         if (opt && opt->tag == BLORP_TAG_SOME) {
@@ -17771,11 +17848,10 @@ static bool stream_filter_map_pull(blorp_Stream* self, void** out) {
         }
         if (opt) blorp_release(opt);
     }
-    return false;
 }
 blorp_Stream* blorp_stream_filter_map(blorp_Stream* inner, blorp_Closure* func) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = inner->elem_is_rc;
+    s->elem_layout = inner->elem_layout;
     StreamFilterMapState* st = malloc(sizeof(StreamFilterMapState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
@@ -17791,7 +17867,10 @@ blorp_Stream* blorp_stream_filter_map(blorp_Stream* inner, blorp_Closure* func) 
 static bool stream_filter_map_pull_##PUBLIC_SUFFIX(blorp_Stream* self, void** out) { \
     StreamFilterMapState* st = (StreamFilterMapState*)self->state; \
     void* val; \
-    while (st->inner->pull(st->inner, &val)) { \
+    long cancel_check = 0; \
+    while (true) { \
+        blorp_stream_cancellation_checkpoint(&cancel_check); \
+        if (!st->inner->pull(st->inner, &val)) return false; \
         void* opt_box = blorp_call1(st->func, val); \
         blorp_stream_release_pulled_if_owned(st->inner, val); \
         if (!opt_box) continue; \
@@ -17806,8 +17885,7 @@ static bool stream_filter_map_pull_##PUBLIC_SUFFIX(blorp_Stream* self, void** ou
 } \
 blorp_Stream* blorp_stream_filter_map_##PUBLIC_SUFFIX(blorp_Stream* inner, blorp_Closure* func) { \
     blorp_Stream* s = blorp_stream_new(); \
-    s->elem_is_rc = false; \
-    s->elem_is_owned = false; \
+    s->elem_layout = BLORP_STREAM_ELEM_IMMEDIATE; \
     StreamFilterMapState* st = malloc(sizeof(StreamFilterMapState)); \
     st->inner = inner; \
     if (inner) blorp_retain((blorp_Object*)inner); \
@@ -17841,7 +17919,10 @@ BLORP_DEFINE_STREAM_FILTER_MAP_STACK_OPTION(f16, Float16, blorp_box_float16)
 static bool stream_filter_map_pull_nullable(blorp_Stream* self, void** out) {
     StreamFilterMapState* st = (StreamFilterMapState*)self->state;
     void* val;
-    while (st->inner->pull(st->inner, &val)) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!st->inner->pull(st->inner, &val)) return false;
         void* opt = blorp_call1(st->func, val);
         blorp_stream_release_pulled_if_owned(st->inner, val);
         if (opt) {
@@ -17849,12 +17930,10 @@ static bool stream_filter_map_pull_nullable(blorp_Stream* self, void** out) {
             return true;
         }
     }
-    return false;
 }
 blorp_Stream* blorp_stream_filter_map_nullable(blorp_Stream* inner, blorp_Closure* func) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = true;
-    s->elem_is_owned = true;
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
     StreamFilterMapState* st = malloc(sizeof(StreamFilterMapState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
@@ -17880,8 +17959,7 @@ static void stream_take_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_take(blorp_Stream* inner, long n) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = inner->elem_is_rc;
-    s->elem_is_owned = inner->elem_is_owned;
+    s->elem_layout = inner->elem_layout;
     StreamTakeState* st = malloc(sizeof(StreamTakeState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
@@ -17895,7 +17973,9 @@ blorp_Stream* blorp_stream_take(blorp_Stream* inner, long n) {
 // --- drop ---
 static bool stream_drop_pull(blorp_Stream* self, void** out) {
     StreamDropState* st = (StreamDropState*)self->state;
+    long cancel_check = 0;
     while (st->skipped < st->n) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
         void* discard;
         if (!st->inner->pull(st->inner, &discard)) return false;
         blorp_stream_release_pulled_if_owned(st->inner, discard);
@@ -17910,8 +17990,7 @@ static void stream_drop_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_drop(blorp_Stream* inner, long n) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = inner->elem_is_rc;
-    s->elem_is_owned = inner->elem_is_owned;
+    s->elem_layout = inner->elem_layout;
     StreamDropState* st = malloc(sizeof(StreamDropState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
@@ -17945,8 +18024,7 @@ static void stream_take_while_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_take_while(blorp_Stream* inner, blorp_Closure* pred) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = inner->elem_is_rc;
-    s->elem_is_owned = inner->elem_is_owned;
+    s->elem_layout = inner->elem_layout;
     StreamTakeWhileState* st = malloc(sizeof(StreamTakeWhileState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
@@ -17965,8 +18043,10 @@ static bool stream_enum_pull(blorp_Stream* self, void** out) {
     void* val;
     if (!st->inner->pull(st->inner, &val)) return false;
     blorp_Tuple* t = blorp_tuple_new(2, (void*)(long)st->idx, val);
-    if (st->inner->elem_is_rc && val) {
-        if (!st->inner->elem_is_owned) blorp_retain(val);
+    if (blorp_stream_has_arc_elements(st->inner) && val) {
+        if (blorp_stream_layout_is_borrowed_arc(st->inner->elem_layout)) {
+            blorp_retain(val);
+        }
         blorp_tuple_set_rc(t, 2UL);
     }
     st->idx++;
@@ -17980,8 +18060,7 @@ static void stream_enum_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_enumerate(blorp_Stream* inner) {
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = true;
-    s->elem_is_owned = true;
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
     StreamEnumState* st = malloc(sizeof(StreamEnumState));
     st->inner = inner;
     if (inner) blorp_retain((blorp_Object*)inner);
@@ -17996,18 +18075,25 @@ blorp_Stream* blorp_stream_enumerate(blorp_Stream* inner) {
 blorp_List* blorp_stream_collect(blorp_Stream* stream) {
     if (!stream) return blorp_list_new(0);
     blorp_List* result = blorp_list_new(16);
-    if (stream->elem_is_rc) {
+    blorp_CancelCleanupFrame result_cleanup;
+    blorp_task_cleanup_push(&result_cleanup, &result, result, blorp_cleanup_release_arc_value);
+    if (blorp_stream_has_arc_elements(stream)) {
         extern void blorp_elem_release_fn(void*);
         result->elem_release = blorp_elem_release_fn;
     }
     void* val;
-    while (stream->pull(stream, &val)) {
-        if (stream->elem_is_rc && stream->elem_is_owned) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!stream->pull(stream, &val)) break;
+        if (blorp_stream_pulls_owned_arc(stream)) {
             result = blorp_list_append_owned(result, val);
         } else {
             result = blorp_list_append(result, val);
         }
+        result_cleanup.value = result;
     }
+    blorp_task_cleanup_pop_slot(&result);
     return result;
 }
 
@@ -18016,12 +18102,21 @@ void* blorp_stream_fold(blorp_Stream* stream, void* init, blorp_Closure* func, b
     if (!stream || !func) return init;
     void* acc = init;
     void* val;
-    while (stream->pull(stream, &val)) {
+    long cancel_check = 0;
+    blorp_CancelCleanupFrame acc_cleanup;
+    if (acc_is_rc) {
+        blorp_task_cleanup_push(&acc_cleanup, &acc, acc, blorp_cleanup_release_arc_value);
+    }
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!stream->pull(stream, &val)) break;
         void* new_acc = ((void* (*)(void*, void*, void*))(func->func))(func->env, acc, val);
         blorp_stream_release_pulled_if_owned(stream, val);
         if (acc_is_rc && new_acc != acc && acc) blorp_release(acc);
         acc = new_acc;
+        if (acc_is_rc) acc_cleanup.value = acc;
     }
+    if (acc_is_rc) blorp_task_cleanup_pop_slot(&acc);
     return acc;
 }
 
@@ -18030,7 +18125,10 @@ long blorp_stream_count(blorp_Stream* stream) {
     if (!stream) return 0;
     long n = 0;
     void* val;
-    while (stream->pull(stream, &val)) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!stream->pull(stream, &val)) break;
         n++;
         blorp_stream_release_pulled_if_owned(stream, val);
     }
@@ -18041,7 +18139,10 @@ long blorp_stream_count(blorp_Stream* stream) {
 void blorp_stream_for_each(blorp_Stream* stream, blorp_Closure* func) {
     if (!stream || !func) return;
     void* val;
-    while (stream->pull(stream, &val)) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!stream->pull(stream, &val)) break;
         blorp_call1(func, val);
         blorp_stream_release_pulled_if_owned(stream, val);
     }
@@ -18051,7 +18152,10 @@ void blorp_stream_for_each(blorp_Stream* stream, blorp_Closure* func) {
 bool blorp_stream_find_raw(blorp_Stream* stream, blorp_Closure* pred, void** out) {
     if (!stream || !pred) return false;
     void* val;
-    while (stream->pull(stream, &val)) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!stream->pull(stream, &val)) break;
         if ((long)blorp_call1(pred, val)) {
             *out = val;
             return true;
@@ -18064,9 +18168,11 @@ bool blorp_stream_find_raw(blorp_Stream* stream, blorp_Closure* pred, void** out
 blorp_Option* blorp_stream_find(blorp_Stream* stream, blorp_Closure* pred) {
     void* val = NULL;
     if (!blorp_stream_find_raw(stream, pred, &val)) return blorp_option_none();
-    if (stream->elem_is_rc && !stream->elem_is_owned && val) blorp_retain(val);
+    if (stream && blorp_stream_layout_is_borrowed_arc(stream->elem_layout) && val) {
+        blorp_retain(val);
+    }
     blorp_Option* opt = blorp_option_some(val);
-    if (stream->elem_is_rc) opt->release_mask = 1UL;
+    if (blorp_stream_has_arc_elements(stream)) opt->release_mask = 1UL;
     return opt;
 }
 
@@ -18099,7 +18205,9 @@ BLORP_DEFINE_STREAM_FIND_STACK_OPTION(f16, float16, Float16, _Float16, blorp_unb
 void* blorp_stream_find_nullable(blorp_Stream* stream, blorp_Closure* pred) {
     void* val = NULL;
     if (!blorp_stream_find_raw(stream, pred, &val)) return NULL;
-    if (stream->elem_is_rc && !stream->elem_is_owned && val) blorp_retain(val);
+    if (stream && blorp_stream_layout_is_borrowed_arc(stream->elem_layout) && val) {
+        blorp_retain(val);
+    }
     return val;
 }
 
@@ -18107,7 +18215,10 @@ void* blorp_stream_find_nullable(blorp_Stream* stream, blorp_Closure* pred) {
 bool blorp_stream_any(blorp_Stream* stream, blorp_Closure* pred) {
     if (!stream || !pred) return false;
     void* val;
-    while (stream->pull(stream, &val)) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!stream->pull(stream, &val)) break;
         long keep = (long)blorp_call1(pred, val);
         blorp_stream_release_pulled_if_owned(stream, val);
         if (keep) return true;
@@ -18119,7 +18230,10 @@ bool blorp_stream_any(blorp_Stream* stream, blorp_Closure* pred) {
 bool blorp_stream_all(blorp_Stream* stream, blorp_Closure* pred) {
     if (!stream || !pred) return true;
     void* val;
-    while (stream->pull(stream, &val)) {
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        if (!stream->pull(stream, &val)) break;
         long keep = (long)blorp_call1(pred, val);
         blorp_stream_release_pulled_if_owned(stream, val);
         if (!keep) return false;
@@ -18155,14 +18269,14 @@ static void stream_lines_cleanup(blorp_Stream* self) {
 }
 blorp_Stream* blorp_stream_from_lines(blorp_String* path) {
     if (!path) return blorp_stream_empty();
-    char pathbuf[4096];
-    long plen = path->len < 4095 ? path->len : 4095;
-    memcpy(pathbuf, path->data, plen);
-    pathbuf[plen] = '\0';
-    FILE* fp = fopen(pathbuf, "r");
+    char* cpath = (char*)blorp_malloc_checked(path->len + 1);
+    memcpy(cpath, path->data, path->len);
+    cpath[path->len] = '\0';
+    FILE* fp = fopen(cpath, "rb");
+    free(cpath);
     if (!fp) return blorp_stream_empty();
     blorp_Stream* s = blorp_stream_new();
-    s->elem_is_rc = true;  // Stream[String] — strings are RC
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
     StreamLinesState* st = malloc(sizeof(StreamLinesState));
     st->fp = fp;
     st->buf = NULL;

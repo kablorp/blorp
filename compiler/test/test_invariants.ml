@@ -22,6 +22,7 @@ let ty_float = TyNamed ("Float", [])
 let ty_bool = TyNamed ("Bool", [])
 let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
+let ty_test_resource = TyNamed ("TestResource", [])
 let ty_list_int = TyNamed ("List", [ ty_int ])
 let ty_concurrency_error = TyNamed ("ConcurrencyError", [])
 let ty_vector_int_4 = TyNamed ("Vector", [ ty_int; TyConstInt 4 ])
@@ -1351,6 +1352,105 @@ let test_final_critical_invariants_reject_unprepared_codegen_when_disabled () =
         (Blorp.Modules.contains err.Core_error.msg "CBox")
   | () -> Alcotest.fail "expected final unprepared codegen invariant violation"
 
+let resource_scope ?(acquire_ty = ty_test_resource) ?(body_ty = ty_int)
+    ?(cleanup_ty = ty_void) () =
+  let body =
+    if body_ty = ty_bool then mk (CLit (LitBool true)) ty_bool else cint 7
+  in
+  mk
+    (CResourceScope
+       {
+         rs_var = Var.named "resource";
+         rs_ty = ty_test_resource;
+         rs_acquire = mk (CVar (Var.named "open_resource")) acquire_ty;
+         rs_body = body;
+         rs_cleanup =
+           (if cleanup_ty = ty_void then mk CVoid ty_void
+            else mk (CLit (LitInt 0L)) cleanup_ty);
+       })
+    body_ty
+
+let test_resource_scope_contract_accepts_well_formed () =
+  let prog =
+    mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ())) ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "no violations" 0 (List.length violations)
+
+let test_resource_scope_contract_flags_acquire_type_mismatch () =
+  let prog =
+    mk_prog
+      [
+        CDFunc
+          (mk_simple_func ~name:"main"
+             ~body:(resource_scope ~acquire_ty:ty_string ()));
+      ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions acquire type" true
+        (Modules.contains v.Core_error.msg "resource acquire type")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_contract_flags_cleanup_type_mismatch () =
+  let prog =
+    mk_prog
+      [
+        CDFunc
+          (mk_simple_func ~name:"main"
+             ~body:(resource_scope ~cleanup_ty:ty_int ()));
+      ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions cleanup type" true
+        (Modules.contains v.Core_error.msg "resource cleanup type")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_contract_flags_body_result_mismatch () =
+  let node = resource_scope ~body_ty:ty_bool () in
+  let node = { node with ty = ty_int } in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions body type" true
+        (Modules.contains v.Core_error.msg "resource body type")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_final_critical_invariants_reject_resource_scope_when_disabled () =
+  let bad_prog =
+    mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ())) ]
+  in
+  let user_fired = ref false in
+  let user_cb _ _ = user_fired := true in
+  let hook =
+    Core_pipeline.make_stage_hook ~check_invariants:false ~user:user_cb
+  in
+  match hook Core_stage.Final bad_prog with
+  | exception Core_error.Core_error err ->
+      Alcotest.(check bool) "user callback skipped" false !user_fired;
+      Alcotest.(check bool)
+        "msg mentions CResourceScope" true
+        (Blorp.Modules.contains err.Core_error.msg "CResourceScope")
+  | () -> Alcotest.fail "expected final resource-scope invariant violation"
+
 let test_final_rejects_unboxed_void_slot_builtin_arg () =
   let dict = mk (CVar (Var.named "d")) ty_dict_int_int in
   let call =
@@ -1681,6 +1781,16 @@ let suite =
         Alcotest.test_case
           "final critical rejects unprepared codegen when disabled" `Quick
           test_final_critical_invariants_reject_unprepared_codegen_when_disabled;
+        Alcotest.test_case "resource scope contract accepts valid scope" `Quick
+          test_resource_scope_contract_accepts_well_formed;
+        Alcotest.test_case "resource scope flags acquire type mismatch" `Quick
+          test_resource_scope_contract_flags_acquire_type_mismatch;
+        Alcotest.test_case "resource scope flags cleanup type mismatch" `Quick
+          test_resource_scope_contract_flags_cleanup_type_mismatch;
+        Alcotest.test_case "resource scope flags body type mismatch" `Quick
+          test_resource_scope_contract_flags_body_result_mismatch;
+        Alcotest.test_case "final critical rejects resource scope" `Quick
+          test_final_critical_invariants_reject_resource_scope_when_disabled;
         Alcotest.test_case "final rejects unboxed void-slot builtin arg" `Quick
           test_final_rejects_unboxed_void_slot_builtin_arg;
         Alcotest.test_case "final accepts explicit void-slot builtin boxes"

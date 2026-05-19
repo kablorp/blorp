@@ -817,6 +817,20 @@ let rec annotate_tensor_storage_provenance env storage_env expr =
         | None -> Storage_env.remove_var binding.borrow_var storage_env
       in
       { expr with desc = CBorrowLet (binding', annotate body_env body) }
+  | CResourceScope scope ->
+      let acquire = annotate storage_env scope.rs_acquire in
+      let scope_env = Storage_env.remove_var scope.rs_var storage_env in
+      {
+        expr with
+        desc =
+          CResourceScope
+            {
+              scope with
+              rs_acquire = acquire;
+              rs_body = annotate scope_env scope.rs_body;
+              rs_cleanup = annotate scope_env scope.rs_cleanup;
+            };
+      }
   | CFor (binder, iter, body) ->
       let iter' = annotate storage_env iter in
       let loop_source_storage =

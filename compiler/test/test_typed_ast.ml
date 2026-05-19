@@ -134,6 +134,7 @@ let test_expr_prefers_ast_type_info () =
                   reason = MutableBinding;
                 };
             proofs = Blorp.Type_proof_metadata.unproven_expr;
+            resolved_call = None;
           };
     }
   in
@@ -179,6 +180,92 @@ let test_typed_type_info_is_canonical_ast_payload () =
       check_true "value type retained"
         (types_equal typed_info.value_ty ast_info.value_ty)
   | Error _ -> Alcotest.fail "expected typed expression from value slot"
+
+let test_expr_call_metadata_accessors () =
+  let fn_ty = ty_func [] ty_int ~pure:true in
+  let callee = with_type { untyped_expr with expr_desc = EIdent "f" } fn_ty in
+  let call =
+    with_type { untyped_expr with expr_desc = ECall (callee, []) } ty_int
+  in
+  let resolved =
+    {
+      call_syntax = CallBare;
+      call_target =
+        CallDirect
+          {
+            callable_id = 42;
+            source_name = "f";
+            call_pure = true;
+            origin = CallableLocal;
+          };
+      instantiated_params = [];
+      instantiated_return = ty_int;
+    }
+  in
+  let call = Blorp.Ast.with_expr_resolved_call call resolved in
+  Alcotest.(check (option bool))
+    "ast call purity" (Some true)
+    (Option.map Blorp.Ast.resolved_call_purity
+       (Blorp.Ast.expr_resolved_call call));
+  Alcotest.(check (option int))
+    "ast concrete callable id" (Some 42)
+    (Blorp.Ast.expr_concrete_callable_id call);
+  match Blorp.Typed_ast.of_ast_expr call with
+  | Ok typed ->
+      check_true "resolved call retained"
+        (Blorp.Typed_ast.expr_resolved_call typed = Some resolved);
+      Alcotest.(check (option bool))
+        "call purity" (Some true)
+        (Blorp.Typed_ast.expr_call_purity typed);
+      Alcotest.(check (option int))
+        "direct call id" (Some 42)
+        (Blorp.Typed_ast.expr_direct_call_id typed);
+      Alcotest.(check (option int))
+        "concrete callable id" (Some 42)
+        (Blorp.Typed_ast.expr_concrete_callable_id typed)
+  | Error _ -> Alcotest.fail "expected typed call expression"
+
+let test_expr_trait_method_concrete_callable_accessor () =
+  let fn_ty = ty_func [ ty_bool ] ty_string ~pure:true in
+  let callee =
+    with_type { untyped_expr with expr_desc = EIdent "to_string" } fn_ty
+  in
+  let arg =
+    with_type { untyped_expr with expr_desc = ELiteral (LitBool true) } ty_bool
+  in
+  let call =
+    with_type
+      { untyped_expr with expr_desc = ECall (callee, [ arg ]) }
+      ty_string
+  in
+  let resolved =
+    {
+      call_syntax = CallQualified "std/bool";
+      call_target =
+        CallTraitMethod
+          {
+            trait_name = "Stringable";
+            method_name = "to_string";
+            call_pure = true;
+            callable_id = Some 99;
+          };
+      instantiated_params = [ ty_bool ];
+      instantiated_return = ty_string;
+    }
+  in
+  let call = Blorp.Ast.with_expr_resolved_call call resolved in
+  Alcotest.(check (option int))
+    "ast concrete callable id includes impl method" (Some 99)
+    (Blorp.Ast.expr_concrete_callable_id call);
+  match Blorp.Typed_ast.of_ast_expr call with
+  | Ok typed ->
+      Alcotest.(check (option int))
+        "direct-only accessor excludes trait metadata" None
+        (Blorp.Typed_ast.expr_direct_call_id typed);
+      Alcotest.(check (option int))
+        "concrete callable id includes impl method" (Some 99)
+        (Blorp.Typed_ast.expr_concrete_callable_id typed)
+  | Error _ -> Alcotest.fail "expected typed call expression"
 
 let test_expr_desc_returns_typed_children () =
   let left = expr_with_type (TyConstInt 1) in
@@ -299,6 +386,7 @@ let test_ast_with_expr_type_info_sets_consistent_payload () =
         Widen
           { from_ty = TyConstInt 1; to_ty = ty_int; reason = MutableBinding };
       proofs = Blorp.Type_proof_metadata.unproven_expr;
+      resolved_call = None;
     }
   in
   let typed = Blorp.Ast.with_expr_type_info untyped_expr info in
@@ -327,6 +415,7 @@ let test_ast_map_expr_type_payload_maps_all_payload_types () =
         Widen
           { from_ty = TyConstInt 1; to_ty = ty_int; reason = MutableBinding };
       proofs = Blorp.Type_proof_metadata.unproven_expr;
+      resolved_call = None;
     }
   in
   let typed = Blorp.Ast.with_expr_type_info untyped_expr info in
@@ -432,6 +521,7 @@ let test_var_decl_preserves_inferred_binding_type () =
         origin = Inferred;
         widening = Blorp.Type_widening.decision slot;
         proofs = Blorp.Type_proof_metadata.unproven_expr;
+        resolved_call = None;
       }
   in
   let var =
@@ -582,6 +672,10 @@ let suite =
           test_expr_prefers_ast_type_info;
         Alcotest.test_case "type info is canonical AST payload" `Quick
           test_typed_type_info_is_canonical_ast_payload;
+        Alcotest.test_case "call metadata accessors" `Quick
+          test_expr_call_metadata_accessors;
+        Alcotest.test_case "trait method concrete callable accessor" `Quick
+          test_expr_trait_method_concrete_callable_accessor;
         Alcotest.test_case "expr view returns typed children" `Quick
           test_expr_desc_returns_typed_children;
         Alcotest.test_case "rejects missing type" `Quick

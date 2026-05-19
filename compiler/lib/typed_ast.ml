@@ -12,6 +12,7 @@ type type_info = {
   origin : type_origin;
   widening : Type_widening_metadata.decision;
   proofs : Type_proof_metadata.expr_proofs;
+  resolved_call : Ast.resolved_call option;
 }
 
 type func_param_info = {
@@ -24,6 +25,7 @@ type func_info = {
   source_return_ty : Ast.type_expr option;
   semantic_return_ty : Ast.type_expr;
   param_infos : func_param_info list;
+  callable_id : int option;
 }
 
 type var_info = {
@@ -93,6 +95,15 @@ type match_case = {
   case_loc : Ast.loc;
 }
 
+type with_binding_kind = Ast.with_binding_kind = WithPlain | WithTry
+
+type with_binding = {
+  with_name : string;
+  with_type : Ast.type_expr option;
+  with_value : expr;
+  with_kind : with_binding_kind;
+}
+
 type expr_desc =
   | EIdent of string
   | ELiteral of Ast.literal
@@ -128,6 +139,7 @@ type expr_desc =
   | EStringInterp of string_interp_part list * bool
   | EStringInterpRaw of string * bool
   | EQuestionBind of string * Ast.type_expr option * expr
+  | EWith of with_binding * expr
   | EDebugBlock of expr list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr
@@ -154,6 +166,7 @@ let func_ast (func : func_decl) = func.ast_func
 let func_info (func : func_decl) = func.info
 let func_param_infos (func : func_decl) = func.info.param_infos
 let func_semantic_return_type (func : func_decl) = func.info.semantic_return_ty
+let func_callable_id (func : func_decl) = func.info.callable_id
 let var_ast (var : var_decl) = var.ast_var
 let var_info (var : var_decl) = var.info
 let var_binding_type (var : var_decl) = var.info.binding_ty
@@ -200,6 +213,7 @@ let type_info_to_ast (info : type_info) : Ast.expr_type_info =
     origin = info.origin;
     widening = info.widening;
     proofs = info.proofs;
+    resolved_call = info.resolved_call;
   }
 
 let type_info_of_ast (info : Ast.expr_type_info) : type_info =
@@ -210,6 +224,7 @@ let type_info_of_ast (info : Ast.expr_type_info) : type_info =
     origin = info.origin;
     widening = info.widening;
     proofs = info.proofs;
+    resolved_call = info.resolved_call;
   }
 
 let type_info_source_type (info : type_info) = info.source_ty
@@ -218,6 +233,18 @@ let type_info_value_type (info : type_info) = info.value_ty
 let type_info_origin (info : type_info) = info.origin
 let type_info_widening (info : type_info) = info.widening
 let type_info_proofs (info : type_info) = info.proofs
+let type_info_resolved_call (info : type_info) = info.resolved_call
+let expr_resolved_call (expr : expr) = expr.info.resolved_call
+
+let expr_call_purity (expr : expr) =
+  Option.map Ast.resolved_call_purity expr.info.resolved_call
+
+let expr_direct_call_id (expr : expr) =
+  Option.bind expr.info.resolved_call Ast.resolved_call_direct_callable_id
+
+let expr_concrete_callable_id (expr : expr) =
+  Option.bind expr.info.resolved_call Ast.resolved_call_concrete_callable_id
+
 let semantic_type (expr : expr) = expr.info.semantic_ty
 let value_type (expr : expr) = expr.info.value_ty
 
@@ -300,10 +327,20 @@ let validate_type_info ~loc ~context (info : type_info) =
   let* () = validate_type_origin ~loc ~context info.origin in
   validate_widening_decision ~loc ~context info
 
-let make_type_info ?source_ty ?(origin = Inferred)
+let make_type_info ?source_ty ?(origin = Inferred) ?resolved_call
     ?(proofs = Type_proof_metadata.unproven_expr) ~loc ~context ~semantic_ty
     ~value_ty ~widening () =
-  let info = { source_ty; semantic_ty; value_ty; origin; widening; proofs } in
+  let info =
+    {
+      source_ty;
+      semantic_ty;
+      value_ty;
+      origin;
+      widening;
+      proofs;
+      resolved_call;
+    }
+  in
   let* () = validate_type_info ~loc ~context info in
   Ok info
 
@@ -343,6 +380,13 @@ let rec validate_expr_tree expr =
           ~context:"question binding annotation" ty_opt
       in
       validate_expr_tree value
+  | Ast.EWith (binding, body) ->
+      let* () =
+        ensure_optional_type ~loc:expr.expr_loc
+          ~context:"with binding annotation" binding.with_type
+      in
+      let* () = validate_expr_tree binding.with_value in
+      validate_expr_tree body
   | Ast.EConcurrentBind (_, ty_opt, value) ->
       let* () =
         ensure_optional_type ~loc:expr.expr_loc
@@ -460,7 +504,7 @@ and make_func_param_infos ?source_func ~loc ast_func =
   | Some source ->
       with_source [] source.Ast.func_params ast_func.Ast.func_params
 
-and make_func_info ?source_func ast_func =
+and make_func_info ?source_func ?callable_id ast_func =
   let* semantic_return_ty = func_decl_semantic_return_type ast_func in
   let* param_infos =
     make_func_param_infos ?source_func ~loc:(func_decl_loc ast_func) ast_func
@@ -470,9 +514,9 @@ and make_func_info ?source_func ast_func =
     | Some source -> source.Ast.func_return_type
     | None -> ast_func.Ast.func_return_type
   in
-  Ok { source_return_ty; semantic_return_ty; param_infos }
+  Ok { source_return_ty; semantic_return_ty; param_infos; callable_id }
 
-and of_ast_func_decl_with_source ?source_func ast_func =
+and of_ast_func_decl_with_source ?source_func ?callable_id ast_func =
   let missing_context =
     match ast_func.func_name with None -> "lambda param" | Some _ -> "param"
   in
@@ -490,7 +534,7 @@ and of_ast_func_decl_with_source ?source_func ast_func =
   in
   let* () = validate_dim_constraints ast_func.func_dim_constraints in
   let* () = validate_func_body ast_func.func_body in
-  let* info = make_func_info ?source_func ast_func in
+  let* info = make_func_info ?source_func ?callable_id ast_func in
   Ok { ast_func; info }
 
 and of_ast_var_decl_with_source ?source_var (ast_var : Ast.var_decl) =
@@ -742,6 +786,18 @@ let expr_desc (expr : expr) =
   | Ast.EQuestionBind (name, ty, value) ->
       let* value = typed_child value in
       Ok (EQuestionBind (name, ty, value))
+  | Ast.EWith (binding, body) ->
+      let* with_value = typed_child binding.with_value in
+      let* body = typed_child body in
+      Ok
+        (EWith
+           ( {
+               with_name = binding.with_name;
+               with_type = binding.with_type;
+               with_value;
+               with_kind = binding.with_kind;
+             },
+             body ))
   | Ast.EDebugBlock exprs ->
       let* exprs = typed_children exprs in
       Ok (EDebugBlock exprs)
@@ -777,10 +833,10 @@ let expr_desc (expr : expr) =
       Ok (EFuncDecl func)
 
 let of_ast_expr_with_type_info ?(context = "expression type") ?source_ty ?origin
-    ?proofs ~semantic_ty ~value_ty ~widening ast =
+    ?resolved_call ?proofs ~semantic_ty ~value_ty ~widening ast =
   let* info =
-    make_type_info ?source_ty ?origin ?proofs ~loc:ast.Ast.expr_loc ~context
-      ~semantic_ty ~value_ty ~widening ()
+    make_type_info ?source_ty ?origin ?resolved_call ?proofs
+      ~loc:ast.Ast.expr_loc ~context ~semantic_ty ~value_ty ~widening ()
   in
   let ast = Ast.with_expr_type_info ast (type_info_to_ast info) in
   let* () = validate_expr_tree ast in
@@ -892,29 +948,77 @@ let source_var_decl ~loc = function
       invalid_info ~loc ~context:"variable declaration source metadata"
         "source declaration kind does not match canonical variable declaration"
 
+let source_impl_decl ~loc = function
+  | None -> Ok None
+  | Some { Ast.decl_desc = Ast.DImpl impl; _ } -> Ok (Some impl)
+  | Some _ ->
+      invalid_info ~loc ~context:"impl declaration source metadata"
+        "source declaration kind does not match canonical impl declaration"
+
 let source_private_decl = function
   | Some { Ast.decl_desc = Ast.DPrivate inner; _ } -> Some inner
   | _ -> None
 
-let rec of_ast_decl_with_source ?source_decl ast_decl =
+let lookup_func_callable_id ?source_decl ?callable_id_of_func ~name ~loc () =
+  Option.bind callable_id_of_func (fun lookup ->
+      match lookup ~name ~loc with
+      | Some _ as hit -> hit
+      | None -> (
+          match source_decl with
+          | Some source -> lookup ~name ~loc:source.Ast.decl_loc
+          | None -> None))
+
+let rec of_ast_decl_with_source ?source_decl ?callable_id_of_func ast_decl =
   let* decl_info =
     match ast_decl.Ast.decl_desc with
     | Ast.DFunc func ->
         let* source_func =
           source_func_decl ~loc:ast_decl.decl_loc source_decl
         in
-        let* typed_func = of_ast_func_decl_with_source ?source_func func in
+        let callable_id =
+          Option.bind func.func_name (fun name ->
+              lookup_func_callable_id ?source_decl ?callable_id_of_func ~name
+                ~loc:ast_decl.decl_loc ())
+        in
+        let* typed_func =
+          of_ast_func_decl_with_source ?source_func ?callable_id func
+        in
         Ok (FunctionDecl typed_func)
     | Ast.DVar var ->
         let* source_var = source_var_decl ~loc:ast_decl.decl_loc source_decl in
         let* typed_var = of_ast_var_decl_with_source ?source_var var in
         Ok (VarDecl typed_var)
     | Ast.DImpl impl ->
+        let* source_impl =
+          source_impl_decl ~loc:ast_decl.decl_loc source_decl
+        in
         let* () =
           ensure_final_type ~loc:ast_decl.decl_loc ~context:"impl target type"
             impl.impl_for_type
         in
-        let* typed_methods = typed_funcs impl.impl_methods in
+        let source_func_for func =
+          Option.bind source_impl (fun source ->
+              List.find_opt
+                (fun candidate -> candidate.Ast.func_name = func.Ast.func_name)
+                source.Ast.impl_methods)
+        in
+        let typed_method func =
+          let source_func = source_func_for func in
+          let callable_id =
+            Option.bind func.Ast.func_name (fun name ->
+                lookup_func_callable_id ?source_decl ?callable_id_of_func ~name
+                  ~loc:ast_decl.decl_loc ())
+          in
+          of_ast_func_decl_with_source ?source_func ?callable_id func
+        in
+        let rec typed_methods = function
+          | [] -> Ok []
+          | func :: rest ->
+              let* typed_func = typed_method func in
+              let* typed_rest = typed_methods rest in
+              Ok (typed_func :: typed_rest)
+        in
+        let* typed_methods = typed_methods impl.impl_methods in
         Ok (ImplDecl { ast_impl = impl; typed_methods })
     | Ast.DTrait trait ->
         let* () = validate_trait_methods trait.trait_methods in
@@ -943,19 +1047,12 @@ let rec of_ast_decl_with_source ?source_decl ast_decl =
         let* typed_inner =
           of_ast_decl_with_source
             ?source_decl:(source_private_decl source_decl)
-            inner
+            ?callable_id_of_func inner
         in
         Ok (PrivateDecl typed_inner)
     | Ast.DImport _ -> Ok NonFunctionDecl
   in
   Ok { ast_decl; decl_info }
-
-and typed_funcs = function
-  | [] -> Ok []
-  | func :: rest ->
-      let* typed_func = of_ast_func_decl_with_source func in
-      let* typed_rest = typed_funcs rest in
-      Ok (typed_func :: typed_rest)
 
 and validate_trait_methods = function
   | [] -> Ok ()
@@ -979,21 +1076,25 @@ let of_ast_var_decl ast_var = of_ast_var_decl_with_source ast_var
 let of_ast_func_decl ast_func = of_ast_func_decl_with_source ast_func
 let of_ast_decl ast_decl = of_ast_decl_with_source ast_decl
 
-let of_ast_program ast_program =
+let of_ast_program ?callable_id_of_func ast_program =
   let rec validate_decls acc = function
     | [] -> Ok { ast_program; typed_decls = List.rev acc }
     | decl :: rest ->
-        let* typed_decl = of_ast_decl decl in
+        let* typed_decl = of_ast_decl_with_source ?callable_id_of_func decl in
         validate_decls (typed_decl :: acc) rest
   in
   validate_decls [] ast_program
 
-let of_ast_program_with_sources ~source_program ast_program =
+let of_ast_program_with_sources ?callable_id_of_func ~source_program ast_program
+    =
   let rec validate_decls acc source_decls canonical_decls =
     match (source_decls, canonical_decls) with
     | [], [] -> Ok { ast_program; typed_decls = List.rev acc }
     | source_decl :: source_rest, canonical_decl :: canonical_rest ->
-        let* typed_decl = of_ast_decl_with_source ~source_decl canonical_decl in
+        let* typed_decl =
+          of_ast_decl_with_source ~source_decl ?callable_id_of_func
+            canonical_decl
+        in
         validate_decls (typed_decl :: acc) source_rest canonical_rest
     | [], canonical_decl :: _ ->
         invalid_info ~loc:canonical_decl.decl_loc

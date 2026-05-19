@@ -66,6 +66,7 @@ type symbol_kind =
       refinement : Refinement.binding_refinement;
     }
   | FuncSymbol of {
+      callable_id : def_id;
       func_type : type_expr; (* Function type including params and return *)
       type_params : bound_type_param list; (* Generic type parameters *)
       param_names : string option list;
@@ -90,6 +91,7 @@ type symbol_kind =
   | AliasSymbol of { type_params : string list; target : type_expr }
   | ConstructorSymbol of {
       parent_type : string; (* The union type this constructor belongs to *)
+      constructor_id : int; (* Callable identity for constructor calls *)
       type_params : string list; (* Inherited from parent *)
       field_types : type_expr list; (* Types of constructor fields *)
       tag : int;
@@ -267,16 +269,22 @@ let is_for_loop_var (env : env) (name : string) : bool =
   | _ -> false
 
 (** Add a function to the environment *)
-let add_func (env : env) (name : string) (func_type : type_expr)
+let add_func (env : env) (name : string) (func_type : type_expr) ?callable_id
     ?(type_params = []) ?(param_names = []) ?(purity = Impure)
     ?(origin = UserDefined) ?module_path ?(dim_constraints = []) ?loop_producer
     ?(debug_only = false) () : env =
+  let callable_id =
+    match callable_id with
+    | Some id -> id
+    | None -> Session.mint_def_id (Session.current ())
+  in
   add_symbol env
     {
       name;
       kind =
         FuncSymbol
           {
+            callable_id;
             func_type;
             type_params;
             param_names;
@@ -319,6 +327,7 @@ let add_type ?(with_ctors = true) ?(kind = TypeUnion) (env : env)
               ConstructorSymbol
                 {
                   parent_type = name;
+                  constructor_id = Session.mint_def_id (Session.current ());
                   type_params;
                   field_types = v.variant_fields;
                   tag = v.variant_tag;
@@ -394,6 +403,11 @@ let get_func_info (env : env) (name : string) :
       Some (func_type, type_params, purity)
   | _ -> None
 
+let get_func_callable_id (env : env) (name : string) : def_id option =
+  match lookup env name with
+  | Some { kind = FuncSymbol { callable_id; _ }; _ } -> Some callable_id
+  | _ -> None
+
 let get_func_loop_producer (env : env) (name : string) : loop_producer option =
   match lookup env name with
   | Some { kind = FuncSymbol { loop_producer; _ }; _ } -> loop_producer
@@ -449,10 +463,17 @@ let get_constructor (env : env) (name : string) :
   match lookup env name with
   | Some
       {
-        kind = ConstructorSymbol { parent_type; type_params; field_types; tag };
+        kind =
+          ConstructorSymbol { parent_type; type_params; field_types; tag; _ };
         _;
       } ->
       Some (parent_type, type_params, field_types, tag)
+  | _ -> None
+
+let get_constructor_callable_id (env : env) (name : string) : int option =
+  match lookup env name with
+  | Some { kind = ConstructorSymbol { constructor_id; _ }; _ } ->
+      Some constructor_id
   | _ -> None
 
 (** Get a record declaration *)

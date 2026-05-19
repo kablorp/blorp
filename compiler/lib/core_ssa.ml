@@ -68,9 +68,9 @@ let combine_assignment_shapes shapes =
     Assignments under control-flow or expression subtrees are deliberately
     classified as [Control_flow_assign] so this pass leaves them alone.
 
-    The classifier is scope-aware: a [CLet], [CFor] binder, lambda param,
-    match pattern, or decision-tree binding named [name] shadows the outer
-    variable for that body's traversal. *)
+    The classifier is scope-aware: a [CLet], [CFor] binder, resource-scope
+    binding, lambda param, match pattern, or decision-tree binding named [name]
+    shadows the outer variable for that body's traversal. *)
 let rec classify_assignment_shape (name : string) (e : core) : assignment_shape
     =
   match e.desc with
@@ -92,6 +92,16 @@ let rec classify_assignment_shape (name : string) (e : core) : assignment_shape
       if b.borrow_var.vname = name then rhs_shape
       else
         combine_assignment_shape rhs_shape (classify_assignment_shape name body)
+  | CResourceScope scope ->
+      let acquire_shape = classify_assignment_shape name scope.rs_acquire in
+      if scope.rs_var.vname = name then acquire_shape
+      else
+        combine_assignment_shapes
+          [
+            acquire_shape;
+            classify_control_boundary name scope.rs_body;
+            classify_control_boundary name scope.rs_cleanup;
+          ]
   | CFor (binder, iter, body) ->
       combine_assignment_shape
         (classify_control_boundary name iter)
@@ -228,6 +238,28 @@ let rec subst_var (old_name : string) (new_var : var) (e : core) : core =
             ( { b with borrow_rhs = subst_var old_name new_var b.borrow_rhs },
               body );
       }
+  | CResourceScope scope when scope.rs_var.vname = old_name ->
+      {
+        e with
+        desc =
+          CResourceScope
+            {
+              scope with
+              rs_acquire = subst_var old_name new_var scope.rs_acquire;
+            };
+      }
+  | CResourceScope scope ->
+      {
+        e with
+        desc =
+          CResourceScope
+            {
+              scope with
+              rs_acquire = subst_var old_name new_var scope.rs_acquire;
+              rs_body = subst_var old_name new_var scope.rs_body;
+              rs_cleanup = subst_var old_name new_var scope.rs_cleanup;
+            };
+      }
   | CFor (binder, iter, body) when binder.loop_var.vname = old_name ->
       { e with desc = CFor (binder, subst_var old_name new_var iter, body) }
   | CLambda lam
@@ -344,6 +376,28 @@ let rec desugar_mut_body (var_name : string) (current_ver : var)
       let rhs' = subst_var var_name current_ver b.borrow_rhs in
       let body' = desugar_mut_body var_name current_ver ty body in
       { e with desc = CBorrowLet ({ b with borrow_rhs = rhs' }, body') }
+  | CResourceScope scope when scope.rs_var.vname = var_name ->
+      {
+        e with
+        desc =
+          CResourceScope
+            {
+              scope with
+              rs_acquire = subst_var var_name current_ver scope.rs_acquire;
+            };
+      }
+  | CResourceScope scope ->
+      {
+        e with
+        desc =
+          CResourceScope
+            {
+              scope with
+              rs_acquire = subst_var var_name current_ver scope.rs_acquire;
+              rs_body = subst_var var_name current_ver scope.rs_body;
+              rs_cleanup = subst_var var_name current_ver scope.rs_cleanup;
+            };
+      }
   | _ ->
       (* Control flow, terminals, etc.: just substitute references *)
       subst_var var_name current_ver e

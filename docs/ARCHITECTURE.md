@@ -525,6 +525,10 @@ val typecheck_program : Ast.program -> check_result
 - Nested parallelism detection
 - If condition must be Bool
 
+See [CALL_RESOLUTION.md](CALL_RESOLUTION.md) for the current name/call
+resolution behavior and the proposed path toward a single semantic call-target
+model shared by `check`, `compile`, and `purify`.
+
 ---
 
 ## Modules

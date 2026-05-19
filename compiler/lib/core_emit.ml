@@ -3472,6 +3472,14 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
            the module declaring this record is loaded, then run with \
            --check-invariants to confirm"
         "CRecordUpdate survived desugaring (invariant violated)"
+  | CResourceScope _ ->
+      Core_error.errorf Core_error.Emit e.loc
+        ~hint:
+          "CResourceScope is the canonical cleanup-scope IR, but cleanup \
+           emission is not implemented yet. Keep it behind final Core \
+           invariants until the backend can guarantee cleanup on every exit \
+           path."
+        "CResourceScope reached emission before cleanup lowering"
   | CLambda _ ->
       Core_error.errorf Core_error.Emit e.loc
         ~hint:
@@ -3891,6 +3899,13 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
       emit_indent ctx;
       emitln ctx "}"
   | CFor (binder, iter, body) -> emit_for_loop ctx binder iter body
+  | CResourceScope _ ->
+      Core_error.errorf Core_error.Emit e.loc
+        ~hint:
+          "CResourceScope is the canonical cleanup-scope IR, but cleanup \
+           statement emission is not implemented yet. Final Core should reject \
+           it before this point."
+        "CResourceScope reached statement emission before cleanup lowering"
   | CBreak -> emit_line ctx "break;"
   | CContinue -> emit_line ctx "continue;"
   | CAssign (v, rhs) ->
@@ -5013,6 +5028,7 @@ and emit_for_loop (ctx : Core_emit_context.t) (binder : loop_binder)
       | Ast.TyNamed ("String", _) -> emit_for_string ctx binder iter body
       | Ast.TyNamed ("Dict", _) -> emit_for_dict ctx binder iter body
       | Ast.TyNamed ("Channel", _) -> emit_for_channel ctx binder iter body
+      | Ast.TyNamed ("Stream", _) -> emit_for_stream ctx binder iter body
       | Ast.TyNamed ("Range", []) -> emit_for_range_value ctx binder iter body
       | ty when is_tensor_type ctx ty -> emit_for_list ctx binder iter body
       | Ast.TyNamed ("Bytes", _) -> emit_for_list ctx binder iter body
@@ -5024,6 +5040,39 @@ and emit_for_loop (ctx : Core_emit_context.t) (binder : loop_binder)
                find the earlier phase that accepted it"
             "unsupported for-loop iterable reached C emission: %s"
             (Types.type_to_string ty))
+
+and emit_for_stream (ctx : Core_emit_context.t) (binder : loop_binder)
+    (iter : core) (body : core) : unit =
+  let id = fresh_temp ctx in
+  let iter_c = Printf.sprintf "__stream_iter_%d" id in
+  let value_c = Printf.sprintf "__stream_value_%d" id in
+  let var_c = escape_c_ident (Var.to_c_name binder.loop_var) in
+  let elem_ty = binder.loop_ty in
+  let iter_needs_release = boxed_expr_transfers_ownership ctx iter in
+  emit_indent ctx;
+  emit ctx (Printf.sprintf "blorp_Stream* %s = (blorp_Stream*)" iter_c);
+  emit_expr ctx iter;
+  emitln ctx ";";
+  emit_line ctx (Printf.sprintf "void* %s = NULL;" value_c);
+  emit_indent ctx;
+  emit ctx
+    (Printf.sprintf
+       "for (; blorp_stream_next_raw(%s, &%s); \
+        blorp_stream_release_pulled_if_owned(%s, %s), %s = NULL) {"
+       iter_c value_c iter_c value_c value_c);
+  emitln ctx "";
+  ctx.indent <- ctx.indent + 1;
+  emit_unbox_decl ctx var_c value_c elem_ty;
+  emit_stmt ctx body;
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
+  emit_line ctx
+    (Printf.sprintf
+       "if (%s != NULL) blorp_stream_release_pulled_if_owned(%s, %s);" value_c
+       iter_c value_c);
+  if iter_needs_release then
+    emit_line ctx (Printf.sprintf "%s;" (release_value_call ctx iter.ty iter_c))
 
 and emit_for_range_value (ctx : Core_emit_context.t) (binder : loop_binder)
     (iter : core) (body : core) : unit =

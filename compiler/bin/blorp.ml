@@ -13,6 +13,31 @@
 *)
 
 open Blorp
+module StringMap = Map.Make (String)
+module IntSet = Set.Make (Int)
+module IntMap = Map.Make (Int)
+
+type purify_func_key = string * int * int * int * int * string option
+
+module PurifyFuncKey = struct
+  type t = purify_func_key
+
+  let compare = compare
+end
+
+module PurifyFuncKeySet = Set.Make (PurifyFuncKey)
+
+type purify_candidate = {
+  candidate_id : int;
+  candidate_name : string;
+  candidate_key : purify_func_key;
+  candidate_signature : Typecheck.checked_func_signature;
+  candidate_func : Ast.func_decl;
+  candidate_body : Ast.expr;
+}
+
+let purify_func_key ~name (loc : Ast.loc) =
+  (name, loc.line, loc.column, loc.end_line, loc.end_column, loc.loc_file)
 
 let version = Version.version
 let read_file = Modules.read_file
@@ -106,171 +131,292 @@ let auto_format_user_file filename =
   in
   if not is_std then Fmt.auto_format filename
 
-(** Purify a file by automatically marking eligible functions as 'pure'.
-    Repeats up to 5 times to catch newly eligible functions. *)
+(** Purify a file by automatically marking eligible functions as 'pure'. *)
 let purify_file ?(dry_run = false) ?(verbose = false) filename =
-  let total_purified = ref 0 in
-  let rec iterate count =
-    if count >= 5 then begin
-      if not dry_run then
-        Printf.printf "Reached maximum purification iterations (5) for %s.\n"
-          filename;
-      !total_purified
-    end
-    else begin
-      let source = read_file filename in
-      match Pipeline.typecheck_module_only ~filename ~source with
-      | Error errors ->
-          prerr_endline (format_pipeline_errors ~file:filename errors);
-          -1
-      | Ok (state, program) ->
-          let env = Typecheck.get_state_env state in
-          let module_aliases = Typecheck.get_state_module_aliases state in
-          let purifiable = ref [] in
+  let source = read_file filename in
+  match Pipeline.typecheck_module_only_typed ~filename ~source with
+  | Error errors ->
+      prerr_endline (format_pipeline_errors ~file:filename errors);
+      -1
+  | Ok (state, typed_analysis_program) -> (
+      let analysis_program = Typed_ast.program_ast typed_analysis_program in
+      let env = Typecheck.get_state_env state in
+      let module_aliases = Typecheck.get_state_module_aliases state in
 
-          let is_purifiable (func : Ast.func_decl) =
-            if
-              func.Ast.func_is_pure
-              || Ast.func_has_builtin_body func
-              || Ast.func_is_foreign func
-            then false
+      let rec collect_funcs acc (decls : Ast.program) =
+        List.fold_left
+          (fun acc decl ->
+            match decl.Ast.decl_desc with
+            | Ast.DFunc f -> (f, decl.Ast.decl_loc) :: acc
+            | Ast.DPrivate inner -> collect_funcs acc [ inner ]
+            | _ -> acc)
+          acc decls
+      in
+      let funcs = collect_funcs [] analysis_program |> List.rev in
+
+      let with_pure_assumptions candidates env =
+        List.fold_left
+          (fun acc candidate ->
+            let sig_ = candidate.candidate_signature in
+            Env.add_func acc candidate.candidate_name sig_.cfs_func_type
+              ~callable_id:candidate.candidate_id
+              ~type_params:sig_.cfs_effective_type_params
+              ~param_names:sig_.cfs_param_names ~purity:Env.Pure
+              ~origin:sig_.cfs_origin ?module_path:sig_.cfs_module_path
+              ~dim_constraints:sig_.cfs_dim_constraints
+              ?loop_producer:sig_.cfs_loop_producer
+              ~debug_only:sig_.cfs_debug_only ())
+          env candidates
+      in
+
+      let add_func_params env func =
+        List.fold_left
+          (fun acc (p : Ast.param) ->
+            match (p.Ast.param_name, p.Ast.param_type) with
+            | Some name, Some ty -> Env.add_var acc name ty ()
+            | _ -> acc)
+          env func.Ast.func_params
+      in
+
+      let has_global_mutation body func =
+        let is_param name =
+          List.exists
+            (fun (p : Ast.param) -> p.Ast.param_name = Some name)
+            func.Ast.func_params
+        in
+        let rec walk expr =
+          match expr.Ast.expr_desc with
+          | Ast.EAssign (name, _) -> (
+              match Env.lookup env name with
+              | Some { kind = Env.VarSymbol { mutability = Env.Mutable; _ }; _ }
+                when not (is_param name) ->
+                  true
+              | _ -> List.exists walk (Ast.expr_children expr))
+          | _ -> List.exists walk (Ast.expr_children expr)
+        in
+        walk body
+      in
+
+      let has_impure_callback_param func =
+        List.exists
+          (fun (p : Ast.param) ->
+            match p.Ast.param_type with
+            | Some ty -> Env.is_impure_function_type env ty
+            | _ -> false)
+          func.Ast.func_params
+      in
+
+      let name_counts =
+        List.fold_left
+          (fun counts ((func : Ast.func_decl), _) ->
+            match func.Ast.func_name with
+            | Some name ->
+                let count =
+                  match StringMap.find_opt name counts with
+                  | Some count -> count
+                  | None -> 0
+                in
+                StringMap.add name (count + 1) counts
+            | None -> counts)
+          StringMap.empty funcs
+      in
+      let has_unique_name name =
+        match StringMap.find_opt name name_counts with
+        | Some 1 -> true
+        | _ -> false
+      in
+
+      let local_candidates =
+        List.fold_right
+          (fun ((func : Ast.func_decl), loc) acc ->
+            match
+              (func.Ast.func_name, Ast.func_body_expr_opt func.Ast.func_body)
+            with
+            | Some name, Some body
+              when has_unique_name name
+                   && (not func.Ast.func_is_pure)
+                   && (not (Ast.func_has_builtin_body func))
+                   && (not (Ast.func_is_foreign func))
+                   && (not (has_impure_callback_param func))
+                   && (not (has_global_mutation body func))
+                   && not (Typecheck.has_concurrency body) -> (
+                match
+                  ( Typecheck.get_state_func_callable_id state ~name ~loc,
+                    Typecheck.checked_func_signature_of_func state func )
+                with
+                | Some id, Some signature ->
+                    {
+                      candidate_id = id;
+                      candidate_name = name;
+                      candidate_key = purify_func_key ~name loc;
+                      candidate_signature = signature;
+                      candidate_func = func;
+                      candidate_body = body;
+                    }
+                    :: acc
+                | _ -> acc)
+            | _ -> acc)
+          funcs []
+      in
+      let local_candidate_ids =
+        List.fold_left
+          (fun ids candidate -> IntSet.add candidate.candidate_id ids)
+          IntSet.empty local_candidates
+      in
+      let local_candidate_id_list = IntSet.elements local_candidate_ids in
+      let local_candidate_key_by_id =
+        List.fold_left
+          (fun keys candidate ->
+            IntMap.add candidate.candidate_id candidate.candidate_key keys)
+          IntMap.empty local_candidates
+      in
+      let local_candidate_id_by_name =
+        List.fold_left
+          (fun ids candidate ->
+            StringMap.add candidate.candidate_name candidate.candidate_id ids)
+          StringMap.empty local_candidates
+      in
+
+      let collect_local_calls body =
+        Purity_analysis.collect_matching_calls
+          ~match_call:(fun name callee loc _args ->
+            if Purity_analysis.is_module_qualified_call callee module_aliases
+            then []
             else
-              match func.Ast.func_body with
-              | Ast.FuncNoBody | Ast.FuncBuiltinBody _ | Ast.FuncForeign _ ->
-                  false
-              | Ast.FuncBodyExpr body ->
-                  (* Reject functions that take non-pure callback parameters.
-                   Calling a non-pure callback is inherently impure — the function
-                   cannot be pure regardless of its body. *)
-                  let has_impure_callback_param =
-                    List.exists
-                      (fun (p : Ast.param) ->
-                        match p.Ast.param_type with
-                        | Some ty -> Env.is_impure_function_type env ty
-                        | _ -> false)
-                      func.Ast.func_params
-                  in
-                  if has_impure_callback_param then false
-                  else begin
-                    (* To handle recursion, we assume the function itself is pure during body analysis *)
-                    let test_env =
-                      match func.Ast.func_name with
-                      | Some name -> (
-                          match Env.get_func_info env name with
-                          | Some (ty, params, _) ->
-                              Env.add_func env name ty ~type_params:params
-                                ~purity:Env.Pure ()
-                          | None -> env)
-                      | None -> env
-                    in
-                    (* Build env with function params so collect_impure_calls can check them *)
-                    let test_env =
-                      List.fold_left
-                        (fun acc (p : Ast.param) ->
-                          match (p.Ast.param_name, p.Ast.param_type) with
-                          | Some name, Some ty -> Env.add_var acc name ty ()
-                          | _ -> acc)
-                        test_env func.Ast.func_params
-                    in
-                    let impure_calls =
-                      Typecheck.collect_impure_calls ~strict:true test_env
-                        module_aliases body
-                    in
-                    if impure_calls <> [] then
-                      false
-                      (* Reject functions with concurrent:/concurrent for (spawns threads) *)
-                    else if Typecheck.has_concurrency body then false
-                    else true
-                  end
-          in
+              match StringMap.find_opt name local_candidate_id_by_name with
+              | Some id -> [ Purity_analysis.call_ref ~called_id:id name loc ]
+              | None -> [])
+          ~match_resolved_call:(fun resolved _callee loc _args ->
+            match Ast.resolved_call_concrete_callable_id resolved with
+            | Some id when IntSet.mem id local_candidate_ids ->
+                Some [ Purity_analysis.call_ref ~called_id:id "<local>" loc ]
+            | Some _ | None -> Some [])
+          ~enter_lambda:(fun func -> func.Ast.func_is_pure)
+          body
+        |> List.fold_left
+             (fun ids (call : Purity_analysis.call_ref) ->
+               match call.called_id with
+               | Some id -> IntSet.add id ids
+               | None -> ids)
+             IntSet.empty
+      in
 
-          (* Find functions to purify *)
-          let rec find_decls = function
-            | [] -> ()
-            | decl :: rest ->
-                (match decl.Ast.decl_desc with
-                | Ast.DFunc f ->
-                    if is_purifiable f then purifiable := f :: !purifiable
-                | _ -> ());
-                find_decls rest
-          in
-          find_decls program;
+      let dependency_map =
+        List.fold_left
+          (fun deps candidate ->
+            IntMap.add candidate.candidate_id
+              (collect_local_calls candidate.candidate_body)
+              deps)
+          IntMap.empty local_candidates
+      in
 
-          if !purifiable = [] then begin
-            if count = 0 then (
-              if verbose then
-                Printf.printf "No functions to purify in %s.\n" filename)
-            else if not dry_run then
-              if verbose then
-                Printf.printf
-                  "Purification complete after %d iterations for %s.\n" count
-                  filename
-              else
-                Printf.printf "Purified %d function(s) in %s\n" !total_purified
-                  filename;
-            !total_purified
-          end
-          else begin
-            let names =
-              List.filter_map (fun f -> f.Ast.func_name) !purifiable
-            in
-            total_purified := !total_purified + List.length !purifiable;
-            if dry_run then begin
-              Printf.printf
-                "[DRY-RUN] Iteration %d: Functions that could be purified in \
-                 %s: %s\n"
-                (count + 1) filename
-                (String.concat ", " (List.rev names));
-              !total_purified
-              (* Stop after one iteration in dry-run to avoid confusing output *)
-            end
-            else begin
-              if verbose then
-                Printf.printf
-                  "Iteration %d: Purifying %d function(s) in %s: %s\n"
-                  (count + 1) (List.length !purifiable) filename
-                  (String.concat ", " (List.rev names));
+      let has_external_blocker candidate =
+        let test_env = env |> with_pure_assumptions local_candidates in
+        let test_env = add_func_params test_env candidate.candidate_func in
+        Typecheck.collect_impure_calls ~prefer_env_purity:true ~strict:true
+          ~assume_pure_callable_ids:local_candidate_id_list test_env
+          module_aliases candidate.candidate_body
+        <> []
+      in
 
-              (* Apply purification to AST *)
-              let purify_func f =
-                if
-                  List.exists
-                    (fun p -> p.Ast.func_name = f.Ast.func_name)
-                    !purifiable
-                then { f with Ast.func_is_pure = true }
-                else f
+      let externally_viable =
+        List.fold_left
+          (fun acc candidate ->
+            if has_external_blocker candidate then acc
+            else IntSet.add candidate.candidate_id acc)
+          IntSet.empty local_candidates
+      in
+
+      let rec prune_by_dependencies viable =
+        let next =
+          IntSet.filter
+            (fun id ->
+              let deps =
+                match IntMap.find_opt id dependency_map with
+                | Some deps -> deps
+                | None -> IntSet.empty
               in
-              let new_program =
-                List.map
-                  (fun decl ->
-                    match decl.Ast.decl_desc with
-                    | Ast.DFunc f ->
-                        { decl with decl_desc = Ast.DFunc (purify_func f) }
-                    | Ast.DPrivate ({ Ast.decl_desc = Ast.DFunc f; _ } as d) ->
-                        {
-                          decl with
-                          decl_desc =
-                            Ast.DPrivate
-                              { d with decl_desc = Ast.DFunc (purify_func f) };
-                        }
-                    | _ -> decl)
-                  program
-              in
+              IntSet.for_all (fun dep -> IntSet.mem dep viable) deps)
+            viable
+        in
+        if IntSet.equal next viable then viable else prune_by_dependencies next
+      in
+      let purifiable_ids = prune_by_dependencies externally_viable in
+      let purifiable_keys =
+        IntSet.fold
+          (fun id keys ->
+            match IntMap.find_opt id local_candidate_key_by_id with
+            | Some key -> PurifyFuncKeySet.add key keys
+            | None -> keys)
+          purifiable_ids PurifyFuncKeySet.empty
+      in
+      let ordered_names =
+        local_candidates
+        |> List.filter_map (fun candidate ->
+            if IntSet.mem candidate.candidate_id purifiable_ids then
+              Some candidate.candidate_name
+            else None)
+      in
 
-              (* Generate new source using the formatter's printer *)
-              let doc = Fmt_printer.print_program new_program in
-              let formatted = Fmt_layout.layout doc in
-
-              let oc = open_out filename in
-              output_string oc formatted;
-              close_out oc;
-
-              iterate (count + 1)
-            end
+      match ordered_names with
+      | [] ->
+          if verbose then
+            Printf.printf "No functions to purify in %s.\n" filename;
+          0
+      | names -> (
+          if dry_run then begin
+            Printf.printf
+              "[DRY-RUN] Functions that could be purified in %s: %s\n" filename
+              (String.concat ", " names);
+            List.length names
           end
-    end
-  in
-  iterate 0
+          else
+            match Modules.parse_source ~filename source with
+            | Error err ->
+                prerr_endline (format_pipeline_errors ~file:filename [ err ]);
+                -1
+            | Ok source_program -> (
+                let comments = Lexer.get_comments () in
+                let rec purify_decl decl =
+                  match decl.Ast.decl_desc with
+                  | Ast.DFunc f ->
+                      let f =
+                        match f.Ast.func_name with
+                        | Some name
+                          when PurifyFuncKeySet.mem
+                                 (purify_func_key ~name decl.Ast.decl_loc)
+                                 purifiable_keys ->
+                            { f with Ast.func_is_pure = true }
+                        | _ -> f
+                      in
+                      { decl with Ast.decl_desc = Ast.DFunc f }
+                  | Ast.DPrivate inner ->
+                      {
+                        decl with
+                        Ast.decl_desc = Ast.DPrivate (purify_decl inner);
+                      }
+                  | _ -> decl
+                in
+                let new_program = List.map purify_decl source_program in
+                let formatted =
+                  Fmt_printer.with_comment_store comments (fun () ->
+                      let doc = Fmt_printer.print_program new_program in
+                      Fmt_layout.layout doc)
+                in
+                match
+                  Pipeline.typecheck_module_only_typed ~filename
+                    ~source:formatted
+                with
+                | Error errors ->
+                    prerr_endline (format_pipeline_errors ~file:filename errors);
+                    -1
+                | Ok _ ->
+                    let oc = open_out filename in
+                    output_string oc formatted;
+                    close_out oc;
+                    Printf.printf "Purified %d function(s) in %s\n"
+                      (List.length names) filename;
+                    List.length names)))
 
 type compile_opts = {
   no_emit : bool;

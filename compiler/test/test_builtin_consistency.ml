@@ -507,6 +507,60 @@ let test_fiber_intrusive_links_are_role_specific () =
        shared next pointer for run queues, channel waits, object-pool reuse, \
        and timer drain batches."
 
+let test_stream_element_layout_is_explicit () =
+  let runtime_decl =
+    read_first_existing
+      [
+        "compiler/lib/runtime_decl.c";
+        "../lib/runtime_decl.c";
+        "lib/runtime_decl.c";
+      ]
+  in
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  List.iter
+    (fun (label, source) ->
+      Alcotest.(check bool)
+        (label ^ " defines stream element layout enum")
+        true
+        (contains_substring source "typedef enum blorp_StreamElementLayout");
+      Alcotest.(check bool)
+        (label ^ " uses one stream element layout field")
+        true
+        (contains_substring source "blorp_StreamElementLayout elem_layout;");
+      if
+        contains_substring source "bool elem_is_rc;"
+        || contains_substring source "bool elem_is_owned;"
+        || contains_substring source "bool state_is_rc;"
+      then
+        Alcotest.failf
+          "%s should represent stream element/state ownership with explicit \
+           layout enums, not independent elem_is_rc/elem_is_owned/state_is_rc \
+           booleans"
+          label)
+    [ ("runtime", runtime); ("runtime_decl", runtime_decl) ]
+
+let test_stream_from_lines_uses_exact_path_buffer () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  Alcotest.(check bool)
+    "runtime defines stream from_lines" true
+    (contains_substring runtime "blorp_stream_from_lines(blorp_String* path)");
+  Alcotest.(check bool)
+    "from_lines allocates an exact path buffer" true
+    (contains_substring runtime "blorp_malloc_checked(path->len + 1)");
+  if
+    contains_substring runtime "char pathbuf[4096]"
+    || contains_substring runtime "path->len < 4095"
+  then
+    Alcotest.fail
+      "blorp_stream_from_lines must not truncate paths through a fixed-size \
+       stack buffer"
+
 let test_std_source_dir_initialized_from_config () =
   Alcotest.(check bool) "std dir exists" true (Sys.is_directory startup_std_dir);
   Alcotest.(check bool)
@@ -1114,6 +1168,10 @@ let suite =
           test_list_ir_hofs_have_no_runtime_c_abi;
         Alcotest.test_case "fiber intrusive links are role-specific" `Quick
           test_fiber_intrusive_links_are_role_specific;
+        Alcotest.test_case "stream element layout is explicit" `Quick
+          test_stream_element_layout_is_explicit;
+        Alcotest.test_case "stream from_lines uses exact path buffer" `Quick
+          test_stream_from_lines_uses_exact_path_buffer;
         Alcotest.test_case "std source dir initialized from config" `Quick
           test_std_source_dir_initialized_from_config;
         Alcotest.test_case "list join uses IR string_append" `Quick

@@ -410,6 +410,18 @@ let test_compile_nested_ok_some_none () =
 
 let ty_list_int = TyNamed ("List", [ ty_int ])
 
+let resource_scope ?(acquire = cint 0) name ty body =
+  mk
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty;
+         rs_acquire = acquire;
+         rs_body = body;
+         rs_cleanup = mk CVoid ty_void;
+       })
+    body.ty
+
 let test_compile_list_empty_nonempty () =
   (* match xs: [] -> 0 | [x, ...rest] -> x
      Should produce CTSwitchLen with cases for len=0 and len>=1 *)
@@ -533,6 +545,56 @@ let test_compile_list_used_spread () =
           Alcotest.(check bool)
             "has elem binding" true
             (has_elem_binding ct_bindings)
+      | _ -> Alcotest.fail "expected geq case with CTLeaf")
+  | _ -> Alcotest.fail "expected CTSwitchLen"
+
+let test_compile_list_spread_shadowed_by_resource_scope_body () =
+  (* match xs: [x, ...rest] -> with rest = acquire(): rest | [] -> 0
+     The scoped resource binding shadows the spread name in the body, so the
+     spread tail is unused and must not be materialized. *)
+  let body = resource_scope "rest" ty_int (cvar "rest" ty_int) in
+  let arms =
+    [
+      (PatList ([ PatVar "x" ], Some (PatVar "rest")), body);
+      (PatList ([], None), cint 0);
+    ]
+  in
+  let m = mk_match (cvar "xs" ty_list_int) arms ty_int in
+  let compiled = Blorp.Core_match.try_compile_match m in
+  match get_ctree compiled with
+  | CTSwitchLen { ctl_len_geq; _ } -> (
+      match ctl_len_geq with
+      | Some (n, CTLeaf { ct_bindings; _ }) ->
+          Alcotest.(check int) "geq threshold" 1 n;
+          Alcotest.(check bool)
+            "resource-shadowed spread is not materialized" false
+            (has_spread_binding ct_bindings)
+      | _ -> Alcotest.fail "expected geq case with CTLeaf")
+  | _ -> Alcotest.fail "expected CTSwitchLen"
+
+let test_compile_list_spread_used_by_resource_scope_acquire () =
+  (* The acquisition expression is evaluated outside the new resource binding,
+     so a spread read there is still a use of the outer pattern binding. *)
+  let body =
+    resource_scope ~acquire:(cvar "rest" ty_list_int) "rest" ty_list_int
+      (cvar "x" ty_int)
+  in
+  let arms =
+    [
+      (PatList ([ PatVar "x" ], Some (PatVar "rest")), body);
+      (PatList ([], None), cint 0);
+    ]
+  in
+  let m = mk_match (cvar "xs" ty_list_int) arms ty_int in
+  let compiled = Blorp.Core_match.try_compile_match m in
+  match get_ctree compiled with
+  | CTSwitchLen { ctl_len_geq; _ } -> (
+      match ctl_len_geq with
+      | Some (n, CTLeaf { ct_bindings; _ }) ->
+          Alcotest.(check int) "geq threshold" 1 n;
+          Alcotest.(check bool)
+            "acquire still uses outer spread binding" true
+            (has_spread_binding ct_bindings)
       | _ -> Alcotest.fail "expected geq case with CTLeaf")
   | _ -> Alcotest.fail "expected CTSwitchLen"
 
@@ -884,6 +946,10 @@ let suite =
           test_compile_list_unused_spread;
         Alcotest.test_case "used_spread_binding" `Quick
           test_compile_list_used_spread;
+        Alcotest.test_case "resource_scope_shadowed_spread_binding" `Quick
+          test_compile_list_spread_shadowed_by_resource_scope_body;
+        Alcotest.test_case "resource_scope_acquire_uses_outer_spread" `Quick
+          test_compile_list_spread_used_by_resource_scope_acquire;
       ] );
     ( "phase_2_5_gaps",
       [

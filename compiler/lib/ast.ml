@@ -102,6 +102,44 @@ type expr_type_origin =
   | Inferred
   | Synthesized of string
 
+type call_syntax =
+  | CallBare
+  | CallQualified of string
+  | CallMethod
+  | CallMethodOnlyUfcs
+  | CallClosureSyntax
+  | CallTraitDispatch
+
+type callable_origin =
+  | CallableLocal
+  | CallableImported of string
+  | CallableBuiltin
+  | CallableForeign
+  | CallableConstructor of string
+  | CallableImplMethod
+
+type resolved_call_target =
+  | CallDirect of {
+      callable_id : int;
+      source_name : string;
+      call_pure : bool;
+      origin : callable_origin;
+    }
+  | CallTraitMethod of {
+      trait_name : string;
+      method_name : string;
+      call_pure : bool;
+      callable_id : int option;
+    }
+  | CallClosure of { call_pure : bool }
+
+type resolved_call = {
+  call_syntax : call_syntax;
+  call_target : resolved_call_target;
+  instantiated_params : type_expr list;
+  instantiated_return : type_expr;
+}
+
 type expr_type_info = {
   source_ty : type_expr option;
   semantic_ty : type_expr;
@@ -109,6 +147,7 @@ type expr_type_info = {
   origin : expr_type_origin;
   widening : type_widening_decision;
   proofs : Type_proof_metadata.expr_proofs;
+  resolved_call : resolved_call option;
 }
 
 (** Unary operators *)
@@ -224,6 +263,10 @@ and expr_desc =
   | EStringInterpRaw of string * bool  (** raw_content * is_triple_quoted *)
   | EQuestionBind of string * type_expr option * expr
       (** name ?= expr — propagate Option/Result from the enclosing block *)
+  | EWith of with_binding * expr
+      (** with name = expr: body / with name ?= expr: body — scoped resource
+          syntax. The parser represents it explicitly before resource cleanup
+          semantics are implemented. *)
   | EDebugBlock of expr list
       (** debug: block — diagnostics-only statements that return Void *)
   | EConcurrent of expr list * expr option * int option
@@ -252,6 +295,15 @@ and expr_desc =
       mangled name, and call sites in the parent body are rewritten to
       reference the hoisted name. No pass after hoisting should see this
       constructor. *)
+
+and with_binding_kind = WithPlain | WithTry
+
+and with_binding = {
+  with_name : string;
+  with_type : type_expr option;
+  with_value : expr;
+  with_kind : with_binding_kind;
+}
 
 and loop_view_kind =
   | LoopIndices
@@ -469,6 +521,7 @@ let expr_type_info_from_type ty : expr_type_info =
     origin = Inferred;
     widening = Keep ty;
     proofs = Type_proof_metadata.unproven_expr;
+    resolved_call = None;
   }
 
 let untyped_expr ~loc desc =
@@ -480,8 +533,41 @@ let untyped_expr ~loc desc =
     expr_rc = None;
   }
 
+let with_untyped_expr_desc expr desc =
+  { expr with expr_desc = desc; expr_type = None; expr_type_info = None }
+
 let with_expr_type_info expr info =
   { expr with expr_type = Some info.semantic_ty; expr_type_info = Some info }
+
+let with_expr_resolved_call expr resolved_call =
+  match expr.expr_type_info with
+  | Some info ->
+      with_expr_type_info expr { info with resolved_call = Some resolved_call }
+  | None -> expr
+
+let resolved_call_purity call =
+  match call.call_target with
+  | CallDirect { call_pure; _ }
+  | CallTraitMethod { call_pure; _ }
+  | CallClosure { call_pure } ->
+      call_pure
+
+let resolved_call_direct_callable_id call =
+  match call.call_target with
+  | CallDirect { callable_id; _ } -> Some callable_id
+  | CallTraitMethod _ | CallClosure _ -> None
+
+let resolved_call_concrete_callable_id call =
+  match call.call_target with
+  | CallDirect { callable_id; _ } -> Some callable_id
+  | CallTraitMethod { callable_id; _ } -> callable_id
+  | CallClosure _ -> None
+
+let expr_resolved_call expr =
+  Option.bind expr.expr_type_info (fun info -> info.resolved_call)
+
+let expr_concrete_callable_id expr =
+  Option.bind (expr_resolved_call expr) resolved_call_concrete_callable_id
 
 let map_expr_type_origin f = function
   | ExplicitAnnotation ty -> ExplicitAnnotation (f ty)
@@ -493,6 +579,13 @@ let map_type_widening_decision f = function
   | Widen { from_ty; to_ty; reason } ->
       Widen { from_ty = f from_ty; to_ty = f to_ty; reason }
 
+let map_resolved_call f call =
+  {
+    call with
+    instantiated_params = List.map f call.instantiated_params;
+    instantiated_return = f call.instantiated_return;
+  }
+
 let map_expr_type_info f info =
   {
     source_ty = Option.map f info.source_ty;
@@ -501,6 +594,7 @@ let map_expr_type_info f info =
     origin = map_expr_type_origin f info.origin;
     widening = map_type_widening_decision f info.widening;
     proofs = info.proofs;
+    resolved_call = Option.map (map_resolved_call f) info.resolved_call;
   }
 
 let map_expr_type_payload f expr =
@@ -569,6 +663,7 @@ let expr_children (e : expr) : expr list =
   | EConcurrent (exprs, None, _) ->
       exprs
   | EConcurrent (exprs, Some timeout, _) -> exprs @ [ timeout ]
+  | EWith (binding, body) -> [ binding.with_value; body ]
   | ERecord fields -> List.map snd fields
   | ERecordUpdate (base, fields) -> base :: List.map snd fields
   | ELambda func -> (
@@ -635,6 +730,8 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
     | EDebugBlock exprs -> EDebugBlock (List.map f exprs)
     | EConcurrent (exprs, timeout, mt) ->
         EConcurrent (List.map f exprs, Option.map f timeout, mt)
+    | EWith (binding, body) ->
+        EWith ({ binding with with_value = f binding.with_value }, f body)
     | ERecord fields ->
         ERecord (List.map (fun (name, e1) -> (name, f e1)) fields)
     | ERecordUpdate (base, fields) ->

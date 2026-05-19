@@ -129,6 +129,52 @@ func main(args: List[String]) -> Int:
           | Error errors ->
               Alcotest.(check bool) "has typecheck errors" true (errors <> [])))
 
+let test_state_callable_ids_are_loc_keyed_for_overloads () =
+  Test_helpers.with_isolated_env (fun () ->
+      let sess = Blorp.Session.current () in
+      Blorp.Modules.init_module_paths ~sess (Sys.getcwd ());
+      let src =
+        {|
+func same(x: Int) -> Int:
+    x
+
+pure func same(x: String) -> String:
+    x
+|}
+      in
+      match
+        Blorp.Modules.parse_source ~filename:"callable_overloads.brp" src
+      with
+      | Error err -> Alcotest.failf "parse failed: %s" err.message
+      | Ok program -> (
+          let same_locs =
+            List.filter_map
+              (fun (decl : Blorp.Ast.decl) ->
+                match decl.decl_desc with
+                | DFunc { func_name = Some "same"; _ } -> Some decl.decl_loc
+                | _ -> None)
+              program
+          in
+          match Blorp.Typecheck.typecheck_with_state_typed program with
+          | Error errors ->
+              Alcotest.failf "expected typed program, got: %s"
+                (Test_helpers.format_errors errors)
+          | Ok (state, _) -> (
+              match
+                List.map
+                  (fun loc ->
+                    Blorp.Typecheck.get_state_func_callable_id state
+                      ~name:"same" ~loc)
+                  same_locs
+              with
+              | [ Some first_id; Some second_id ] ->
+                  Alcotest.(check bool)
+                    "same-name declaration ids differ" true
+                    (first_id <> second_id)
+              | _ ->
+                  Alcotest.fail
+                    "expected callable ids for both same-name declarations")))
+
 let expect_typed_program ~filename src =
   Test_helpers.with_isolated_env (fun () ->
       let sess = Blorp.Session.current () in
@@ -1962,6 +2008,8 @@ let suite =
           test_typecheck_typed_returns_valid_program;
         Alcotest.test_case "returns errors without program" `Quick
           test_typecheck_typed_returns_errors_without_program;
+        Alcotest.test_case "callable ids are keyed by declaration location"
+          `Quick test_state_callable_ids_are_loc_keyed_for_overloads;
         Alcotest.test_case "value helper rejects missing metadata" `Quick
           test_typecheck_value_type_helper_rejects_missing_metadata;
         Alcotest.test_case "top-level mutable var uses value type" `Quick

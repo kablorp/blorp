@@ -56,8 +56,8 @@ val typecheck_module_only :
   source:string ->
   (Typecheck.check_state * Ast.program, Ast.compiler_error list) result
 (** Parse and type-check a module, returning the final state and AST
-    compatibility view. Used for analysis tools like 'purify'. Prefer
-    [typecheck_module_only_typed] for new compiler callers. *)
+    compatibility view. Prefer [typecheck_module_only_typed] for new
+    compiler callers and source-analysis tools. *)
 
 val typecheck_module_only_typed :
   filename:string ->

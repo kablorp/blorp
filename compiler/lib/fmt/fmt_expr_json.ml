@@ -823,7 +823,7 @@ let rec expr_to_json expr =
                  field "parts" (array part_jsons);
                ])
       | None -> None)
-  | Ast.ELoopView _ | Ast.EStringInterpRaw _ -> None
+  | Ast.ELoopView _ | Ast.EStringInterpRaw _ | Ast.EWith _ -> None
 
 and block_payload exprs =
   let block_expr_trailing expr rest =

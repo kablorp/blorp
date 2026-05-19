@@ -1222,6 +1222,7 @@ let test_lower_typed_global_var_uses_binding_type () =
         origin = Inferred;
         widening = Blorp.Type_widening.decision slot;
         proofs = Blorp.Type_proof_metadata.unproven_expr;
+        resolved_call = None;
       }
   in
   let vdecl =

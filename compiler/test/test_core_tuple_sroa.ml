@@ -8,12 +8,14 @@ let loc = dummy_loc
 let ty_int = TyNamed ("Int", [])
 let ty_bool = TyNamed ("Bool", [])
 let ty_string = TyNamed ("String", [])
+let ty_void = TyNamed ("Void", [])
 let ty_pair = TyTuple [ ty_int; ty_int ]
 let ty_string_pair = TyTuple [ ty_string; ty_int ]
 let mk ty desc = { desc; ty; loc }
 let cvar name ty = mk ty (CVar (Var.named name))
 let cint n = mk ty_int (CLit (LitInt (Int64.of_int n)))
 let cbool b = mk ty_bool (CLit (LitBool b))
+let cvoid = mk ty_void CVoid
 let param name ty = { cp_name = Var.named name; cp_ty = ty; cp_loc = loc }
 let fn_ty params return = TyFunc { params; return; is_pure = true }
 
@@ -21,6 +23,17 @@ let cstring s =
   mk ty_string (CLit (LitString (s, { sf_triple = false; sf_raw = false })))
 
 let field obj name ty = mk ty (CField (obj, name))
+
+let resource_scope name ty acquire body cleanup =
+  mk body.ty
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty;
+         rs_acquire = acquire;
+         rs_body = body;
+         rs_cleanup = cleanup;
+       })
 
 let tuple_let ?(mut = false) name tuple_ty elems body =
   mk body.ty
@@ -208,6 +221,36 @@ let test_branch_local_alias_does_not_leak_to_sibling_branch () =
   Alcotest.(check bool)
     "sibling branch keeps unrelated same-name field" true
     (contains_field_of "branch_alias" rewritten)
+
+let test_resource_scope_shadowed_tuple_alias_is_not_rewritten () =
+  let pair = cvar "pair" ty_pair in
+  let scoped =
+    resource_scope "pair" ty_pair (cvar "open_pair" ty_pair)
+      (field pair "0" ty_int) cvoid
+  in
+  let expr = tuple_let "pair" ty_pair [ cint 1; cint 2 ] scoped in
+  let rewritten = Sroa.rewrite_expr expr in
+  let rec find_scope expr =
+    match expr.desc with
+    | CResourceScope scope -> Some scope
+    | _ ->
+        let found = ref None in
+        ignore
+          (map_children
+             (fun child ->
+               if Option.is_none !found then found := find_scope child;
+               child)
+             expr);
+        !found
+  in
+  match find_scope rewritten with
+  | Some { rs_body = { desc = CField ({ desc = CVar v; _ }, "0"); _ }; _ } ->
+      Alcotest.(check string)
+        "resource body still reads scoped tuple" "pair" v.vname
+  | Some { rs_body; _ } ->
+      Alcotest.failf "resource body was rewritten:\n%s"
+        (Blorp.Core.pp_to_string rs_body)
+  | None -> Alcotest.fail "expected resource scope"
 
 let test_local_if_tuple_binding_scalar_replaced () =
   let pair = cvar "pair" ty_pair in
@@ -956,6 +999,8 @@ let suite =
           test_managed_field_scalar_replaced_as_local_binding;
         Alcotest.test_case "branch_alias_scope" `Quick
           test_branch_local_alias_does_not_leak_to_sibling_branch;
+        Alcotest.test_case "resource_scope_shadowed_tuple_alias" `Quick
+          test_resource_scope_shadowed_tuple_alias_is_not_rewritten;
         Alcotest.test_case "removed_tuple_binding_guard" `Quick
           test_removed_tuple_binding_guard_rejects_leftover_root_reference;
         Alcotest.test_case "local_if_tuple_binding" `Quick

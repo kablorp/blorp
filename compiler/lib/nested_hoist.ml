@@ -122,6 +122,9 @@ let free_idents_of (e : expr) : (string * loc) list =
                   walk_stmts b rest)
         in
         walk_stmts bound stmts
+    | EWith (binding, body) ->
+        go bound binding.with_value;
+        go (binding.with_name :: bound) body
     | EFor (var, iter, body) ->
         go bound iter;
         go (var :: bound) body

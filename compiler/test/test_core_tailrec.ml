@@ -7,12 +7,25 @@ module T = Blorp.Core_tailrec
 let loc = dummy_loc
 let ty_int = TyNamed ("Int", [])
 let ty_bool = TyNamed ("Bool", [])
+let ty_void = TyNamed ("Void", [])
 let ty_list elem = TyNamed ("List", [ elem ])
 let ty_func params return = TyFunc { params; return; is_pure = true }
 let mk ty desc = { desc; ty; loc }
 let cvar name ty = mk ty (CVar (Var.named name))
 let cint n = mk ty_int (CLit (LitInt (Int64.of_int n)))
+let cvoid = mk ty_void CVoid
 let param name ty = { cp_name = Var.named name; cp_ty = ty; cp_loc = loc }
+
+let resource_scope name ty acquire body cleanup =
+  mk body.ty
+    (CResourceScope
+       {
+         rs_var = Var.named name;
+         rs_ty = ty;
+         rs_acquire = acquire;
+         rs_body = body;
+         rs_cleanup = cleanup;
+       })
 
 let call_self ~def_id name args ty =
   let fn = cvar name (ty_func (List.map (fun arg -> arg.ty) args) ty) in
@@ -296,6 +309,68 @@ let test_list_spread_loop_recognizes_alias_param () =
       Alcotest.failf "expected aliased list-spread tailrec loop, got %s"
         (Blorp.Core.pp_to_string body)
 
+let test_list_spread_ignores_resource_scope_shadowed_spread_var () =
+  let def_id = 31 in
+  let list_int = ty_list ty_int in
+  let list_param = param "lst" list_int in
+  let acc_param = param "acc" ty_int in
+  let scrut = cvar "lst" list_int in
+  let rest = Var.named "rest" in
+  let x = Var.named "x" in
+  let scoped_arg =
+    resource_scope "rest" ty_int (cint 0) (mk ty_int (CVar rest)) cvoid
+  in
+  let recur =
+    call_self ~def_id "sum_recursive"
+      [ mk list_int (CVar rest); scoped_arg ]
+      ty_int
+  in
+  let tree =
+    CTSwitchLen
+      {
+        ctl_len_scrut = AccRoot;
+        ctl_len_cases =
+          [ (0, CTLeaf { ct_bindings = []; ct_body = cvar "acc" ty_int }) ];
+        ctl_len_geq =
+          Some
+            ( 1,
+              CTLeaf
+                {
+                  ct_bindings =
+                    [
+                      (x, AccListElem (AccRoot, 0));
+                      (rest, AccListSpread (AccRoot, 1));
+                    ];
+                  ct_body = recur;
+                } );
+        ctl_len_default = None;
+      }
+  in
+  let body = mk ty_int (CMatch (scrut, tree)) in
+  let body =
+    lowered_func_body
+      [
+        decl (func ~name:"sum_recursive" ~def_id [ list_param; acc_param ] body);
+      ]
+  in
+  match body.desc with
+  | CTailrecLoop
+      (TailrecListSpreadLoop
+         { tls_body = { desc = CMatch (_, rewritten_tree); _ }; _ }) -> (
+      match rewritten_tree with
+      | CTSwitchLen { ctl_len_geq = Some (_, CTLeaf { ct_body; _ }); _ } -> (
+          match ct_body.desc with
+          | CTailrecRecur (TailrecListSpreadRecur { tr_rebinds; _ }) ->
+              Alcotest.(check int)
+                "non-list arg is still rebound" 1 (List.length tr_rebinds)
+          | _ ->
+              Alcotest.failf "expected list-spread recur, got %s"
+                (Blorp.Core.pp_to_string ct_body))
+      | _ -> Alcotest.fail "expected rewritten spread branch")
+  | _ ->
+      Alcotest.failf "expected resource-shadowed list-spread loop, got %s"
+        (Blorp.Core.pp_to_string body)
+
 let suite =
   [
     ( "lowering",
@@ -308,5 +383,7 @@ let suite =
           test_list_spread_loop_preserves_prefix_binding;
         Alcotest.test_case "list spread alias param" `Quick
           test_list_spread_loop_recognizes_alias_param;
+        Alcotest.test_case "list spread resource shadow" `Quick
+          test_list_spread_ignores_resource_scope_shadowed_spread_var;
       ] );
   ]

@@ -413,6 +413,12 @@ let rec count_uses (name : string) (e : core) : int =
         if b.trv_var.vname = name then 0 else count_uses name body
       in
       source_count + body_count
+  | CResourceScope s ->
+      let scoped_count =
+        if s.rs_var.vname = name then 0
+        else count_uses name s.rs_body + count_uses name s.rs_cleanup
+      in
+      count_uses name s.rs_acquire + scoped_count
   | CIf (c, t, el) ->
       (* Only ONE branch runs — take max, not sum. *)
       count_uses name c + max (count_uses name t) (count_uses name el)
@@ -803,6 +809,18 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
         else summarize_linear_ownership_uses env name body
       in
       seq_ownership_uses source_uses body_uses
+  | CResourceScope s ->
+      let acquire_uses =
+        summarize_linear_ownership_uses env name s.rs_acquire
+      in
+      let scoped_uses =
+        if s.rs_var.vname = name then no_ownership_uses
+        else
+          seq_ownership_uses
+            (summarize_linear_ownership_uses env name s.rs_body)
+            (summarize_linear_ownership_uses env name s.rs_cleanup)
+      in
+      seq_ownership_uses acquire_uses scoped_uses
   | CLambda lam ->
       if List.exists (fun (v, _) -> v.vname = name) lam.lam_params then
         no_ownership_uses

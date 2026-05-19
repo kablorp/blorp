@@ -194,6 +194,39 @@ let test_foreign_function_forms_preserve_flags () =
       | _ -> Alcotest.fail "expected foreign function implementation")
   | _ -> Alcotest.fail "expected foreign declarations in source order"
 
+let test_with_multistatement_body_keeps_body_location () =
+  let source =
+    "func main(args: List[String]) -> Int:\n" ^ "\twith handle = acquire():\n"
+    ^ "\t\tuse(handle)\n" ^ "\t\thandle\n"
+  in
+  let program = parse_ok source in
+  match program with
+  | [ { Blorp.Ast.decl_desc = Blorp.Ast.DFunc f; _ } ] -> (
+      match f.Blorp.Ast.func_body with
+      | Blorp.Ast.FuncBodyExpr
+          {
+            expr_desc =
+              Blorp.Ast.EBlock
+                [
+                  {
+                    expr_desc =
+                      Blorp.Ast.EWith
+                        ( binding,
+                          {
+                            expr_desc = Blorp.Ast.EBlock _;
+                            expr_loc = body_loc;
+                            _;
+                          } );
+                    _;
+                  };
+                ];
+            _;
+          } ->
+          check_int "acquisition line" 2 binding.with_value.expr_loc.line;
+          check_int "body line" 3 body_loc.line
+      | _ -> Alcotest.fail "expected with expression body")
+  | _ -> Alcotest.fail "expected one function declaration"
+
 let suite =
   [
     ( "program",
@@ -239,5 +272,10 @@ let suite =
       [
         Alcotest.test_case "foreign function forms preserve flags" `Quick
           test_foreign_function_forms_preserve_flags;
+      ] );
+    ( "with",
+      [
+        Alcotest.test_case "multi-statement body keeps body location" `Quick
+          test_with_multistatement_body_keeps_body_location;
       ] );
   ]

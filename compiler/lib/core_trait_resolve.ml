@@ -93,6 +93,7 @@
       this pass then resolves — but the lowering itself isn't here. *)
 
 open Core
+module StringSet = Set.Make (String)
 
 type impl_key = string * string (* (method_name, type_name) *)
 
@@ -513,8 +514,27 @@ let try_rewrite_operator (reg : registry) (e : core) (method_name : string)
     operator overloading). Primitives have no [CDImpl], so the lookup
     misses and the node stays as-is for the fast path. *)
 let rec resolve_expr (reg : registry) (module_path : string option)
-    (in_func : string option) (e : core) : core =
-  let e = map_children (resolve_expr reg module_path in_func) e in
+    (in_func : string option) (shadowed_locals : StringSet.t) (e : core) : core
+    =
+  let e =
+    match e.desc with
+    | CResourceScope s ->
+        let rs_acquire =
+          resolve_expr reg module_path in_func shadowed_locals s.rs_acquire
+        in
+        let shadowed_locals' = StringSet.add s.rs_var.vname shadowed_locals in
+        let rs_body =
+          resolve_expr reg module_path in_func shadowed_locals' s.rs_body
+        in
+        let rs_cleanup =
+          resolve_expr reg module_path in_func shadowed_locals' s.rs_cleanup
+        in
+        {
+          e with
+          desc = CResourceScope { s with rs_acquire; rs_body; rs_cleanup };
+        }
+    | _ -> map_children (resolve_expr reg module_path in_func shadowed_locals) e
+  in
   match e.desc with
   | CCall (CKBuiltin "blorp_to_string", callee, [ arg ]) -> (
       match type_name_of_ty arg.ty with
@@ -532,107 +552,116 @@ let rec resolve_expr (reg : registry) (module_path : string option)
   | CCall (CKUnknown, callee, args) -> (
       match callee.desc with
       | CVar v -> (
-          let try_static_self_dispatch () =
-            match args with
-            | [] -> (
+          if StringSet.mem v.vname shadowed_locals then e
+          else
+            let try_static_self_dispatch () =
+              match args with
+              | [] -> (
+                  if
+                    is_direct_imported_function reg module_path callee v.vname
+                      args
+                    || is_local_direct_function reg module_path v.vname args
+                  then e
+                  else
+                    match static_self_return_type_name reg v.vname e.ty with
+                    | Some type_name -> (
+                        match
+                          Hashtbl.find_opt reg.impls (v.vname, type_name)
+                        with
+                        | Some mangled ->
+                            let callee' =
+                              { callee with desc = CVar (Var.named mangled) }
+                            in
+                            { e with desc = CCall (CKUnknown, callee', args) }
+                        | None ->
+                            let has_other_impls =
+                              match
+                                Hashtbl.find_opt reg.impls_by_method v.vname
+                              with
+                              | Some (_ :: _) -> true
+                              | _ -> false
+                            in
+                            if
+                              has_other_impls
+                              && Codegen_builtins.lookup "" v.vname = None
+                            then error_no_impl reg e.loc v.vname type_name
+                            else e)
+                    | None -> e)
+              | _ -> e
+            in
+            match first_arg_type_name args with
+            | Some type_name -> (
                 if
                   is_direct_imported_function reg module_path callee v.vname
                     args
-                  || is_local_direct_function reg module_path v.vname args
                 then e
                 else
-                  match static_self_return_type_name reg v.vname e.ty with
-                  | Some type_name -> (
-                      match Hashtbl.find_opt reg.impls (v.vname, type_name) with
-                      | Some mangled ->
+                  (* Surgical shadow guard: a top-level [CDFunc] with the
+                     same bare name shadows this call only if its
+                     first-param type-head matches the call's first-arg
+                     type-head. Lets calls on types the shadow doesn't
+                     cover (e.g. tuple-typed args when the shadow is
+                     [to_string(JsonValue)]) route through the impl
+                     registry uniformly. *)
+                  let shadowed_here =
+                    match Hashtbl.find_opt reg.shadowed_names v.vname with
+                    | Some heads -> (
+                        List.mem type_name heads
+                        ||
+                        match first_arg_type_head args with
+                        | Some head -> List.mem head heads
+                        | None -> false)
+                    | None -> false
+                  in
+                  if shadowed_here then e
+                  else
+                    match Hashtbl.find_opt reg.impls (v.vname, type_name) with
+                    | Some mangled ->
+                        (* Self-recursion guard: the stdlib pattern
+                            [implements Stringable for Int:
+                              pure func to_string(val: Int): val.to_string()]
+                          delegates to [Core_specialize]'s [blorp_to_string]
+                          dispatch and would infinitely recurse if rewritten.
+                          But this only applies to types with a specialize
+                          fallback — non-primitive impls (JsonValue, user
+                          records, tuples) genuinely recurse and need the
+                          rewrite to produce a direct self-call.
+                          [has_operator_fast_path] identifies the types
+                          whose trait methods have hardcoded C dispatches. *)
+                        let is_primitive_fallback =
+                          match (List.hd args).ty with
+                          | t when has_operator_fast_path t -> true
+                          | _ -> false
+                        in
+                        if Some mangled = in_func && is_primitive_fallback then
+                          e
+                        else
                           let callee' =
                             { callee with desc = CVar (Var.named mangled) }
                           in
                           { e with desc = CCall (CKUnknown, callee', args) }
-                      | None ->
-                          let has_other_impls =
-                            match
-                              Hashtbl.find_opt reg.impls_by_method v.vname
-                            with
-                            | Some (_ :: _) -> true
-                            | _ -> false
-                          in
-                          if
-                            has_other_impls
-                            && Codegen_builtins.lookup "" v.vname = None
-                          then error_no_impl reg e.loc v.vname type_name
-                          else e)
-                  | None -> e)
-            | _ -> e
-          in
-          match first_arg_type_name args with
-          | Some type_name -> (
-              if is_direct_imported_function reg module_path callee v.vname args
-              then e
-              else
-                (* Surgical shadow guard: a top-level [CDFunc] with the
-                   same bare name shadows this call only if its
-                   first-param type-head matches the call's first-arg
-                   type-head. Lets calls on types the shadow doesn't
-                   cover (e.g. tuple-typed args when the shadow is
-                   [to_string(JsonValue)]) route through the impl
-                   registry uniformly. *)
-                let shadowed_here =
-                  match Hashtbl.find_opt reg.shadowed_names v.vname with
-                  | Some heads -> (
-                      List.mem type_name heads
-                      ||
-                      match first_arg_type_head args with
-                      | Some head -> List.mem head heads
-                      | None -> false)
-                  | None -> false
-                in
-                if shadowed_here then e
-                else
-                  match Hashtbl.find_opt reg.impls (v.vname, type_name) with
-                  | Some mangled ->
-                      (* Self-recursion guard: the stdlib pattern
-                          [implements Stringable for Int:
-                            pure func to_string(val: Int): val.to_string()]
-                        delegates to [Core_specialize]'s [blorp_to_string]
-                        dispatch and would infinitely recurse if rewritten.
-                        But this only applies to types with a specialize
-                        fallback — non-primitive impls (JsonValue, user
-                        records, tuples) genuinely recurse and need the
-                        rewrite to produce a direct self-call.
-                        [has_operator_fast_path] identifies the types
-                        whose trait methods have hardcoded C dispatches. *)
-                      let is_primitive_fallback =
-                        match (List.hd args).ty with
-                        | t when has_operator_fast_path t -> true
-                        | _ -> false
-                      in
-                      if Some mangled = in_func && is_primitive_fallback then e
-                      else
-                        let callee' =
-                          { callee with desc = CVar (Var.named mangled) }
+                    | None ->
+                        (* Fire only when [impls_by_method[v.vname]] is
+                          non-empty — see the module-level "Diagnostics"
+                          section for why. *)
+                        let has_other_impls =
+                          match
+                            Hashtbl.find_opt reg.impls_by_method v.vname
+                          with
+                          | Some (_ :: _) -> true
+                          | _ -> false
                         in
-                        { e with desc = CCall (CKUnknown, callee', args) }
-                  | None ->
-                      (* Fire only when [impls_by_method[v.vname]] is
-                        non-empty — see the module-level "Diagnostics"
-                        section for why. *)
-                      let has_other_impls =
-                        match Hashtbl.find_opt reg.impls_by_method v.vname with
-                        | Some (_ :: _) -> true
-                        | _ -> false
-                      in
-                      if
-                        has_other_impls
-                        && Hashtbl.mem reg.trait_methods v.vname
-                        && Codegen_builtins.lookup "" v.vname = None
-                        && not
-                             (match args with
-                             | first :: _ -> has_operator_fast_path first.ty
-                             | [] -> false)
-                      then error_no_impl reg e.loc v.vname type_name
-                      else e)
-          | None -> try_static_self_dispatch ())
+                        if
+                          has_other_impls
+                          && Hashtbl.mem reg.trait_methods v.vname
+                          && Codegen_builtins.lookup "" v.vname = None
+                          && not
+                               (match args with
+                               | first :: _ -> has_operator_fast_path first.ty
+                               | [] -> false)
+                        then error_no_impl reg e.loc v.vname type_name
+                        else e)
+            | None -> try_static_self_dispatch ())
       | _ -> e)
   | CBin (op, l, r) -> (
       match binop_method op with
@@ -656,7 +685,9 @@ let resolve_func (reg : registry) (f : core_func) : core_func =
   | Some body ->
       {
         f with
-        cf_body = Some (resolve_expr reg f.cf_module (Some f.cf_name) body);
+        cf_body =
+          Some
+            (resolve_expr reg f.cf_module (Some f.cf_name) StringSet.empty body);
       }
 
 (** Resolve an impl's methods. Each impl method's body is rewritten with
@@ -672,7 +703,9 @@ let resolve_impl_method (reg : registry) (trait_name : string)
       let mangled = Printf.sprintf "%s_%s_%s" trait_name f.cf_name type_name in
       {
         f with
-        cf_body = Some (resolve_expr reg f.cf_module (Some mangled) body);
+        cf_body =
+          Some
+            (resolve_expr reg f.cf_module (Some mangled) StringSet.empty body);
       }
 
 let rec resolve_decl (reg : registry) (d : core_decl) : core_decl =
@@ -680,7 +713,12 @@ let rec resolve_decl (reg : registry) (d : core_decl) : core_decl =
     match d.cd_desc with
     | CDFunc f -> CDFunc (resolve_func reg f)
     | CDVar v ->
-        CDVar { v with cv_init = resolve_expr reg v.cv_module None v.cv_init }
+        CDVar
+          {
+            v with
+            cv_init =
+              resolve_expr reg v.cv_module None StringSet.empty v.cv_init;
+          }
     | CDImpl i -> (
         match Codegen_types.type_key_for_impl i.ci_for_type with
         | Some type_name ->

@@ -264,6 +264,12 @@ and expr_has_runtime_free_var bound e =
   | CBorrowLet (b, body) ->
       expr_has_runtime_free_var bound b.borrow_rhs
       || expr_has_runtime_free_var (add_var bound b.borrow_var) body
+  | CResourceScope scope ->
+      expr_has_runtime_free_var bound scope.rs_acquire
+      ||
+      let body_bound = add_var bound scope.rs_var in
+      expr_has_runtime_free_var body_bound scope.rs_body
+      || expr_has_runtime_free_var body_bound scope.rs_cleanup
   | CFor (binder, iter, body) ->
       expr_has_runtime_free_var bound iter
       || expr_has_runtime_free_var (add_var bound binder.loop_var) body

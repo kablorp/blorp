@@ -660,6 +660,11 @@ and desc =
           carry the same closed scalar layout kind. The fast path that creates
           this node must guard storage layout and COW uniqueness before the
           view is bound. *)
+  | CResourceScope of resource_scope
+      (** Explicit deterministic cleanup scope. [rs_acquire] is evaluated once
+          and bound to [rs_var] while [rs_body] runs; [rs_cleanup] then runs
+          before the scope returns [rs_body]'s value. Cleanup is semantic
+          resource finalization, distinct from ARC release/drop. *)
   | CSeq of core * core  (** [e1; e2] — both evaluated, result is [e2] *)
   | CDebugBlock of core
       (** [debug: ...] — source instrumentation block. [Core_debug] lowers it
@@ -784,6 +789,16 @@ and tensor_raw_view_binding = {
   trv_var : var;
   trv_kind : tensor_unboxed_scalar;
   trv_source : core;
+}
+
+and resource_scope = {
+  rs_var : var;
+      (** Compiler-visible resource binding. User wildcard bindings should
+          still lower to a hidden variable so cleanup has a stable target. *)
+  rs_ty : Ast.type_expr;  (** Static resource capability type. *)
+  rs_acquire : core;  (** Expression that produces the scoped resource. *)
+  rs_body : core;  (** Scope body. The enclosing node returns this value. *)
+  rs_cleanup : core;  (** Cleanup action. Must have type [Void]. *)
 }
 
 and tensor_raw_read = {
@@ -1139,6 +1154,14 @@ let rec map_children (f : core -> core) (e : core) : core =
         CBorrowLet ({ b with borrow_rhs = f b.borrow_rhs }, f body)
     | CTensorRawViewLet (b, body) ->
         CTensorRawViewLet ({ b with trv_source = f b.trv_source }, f body)
+    | CResourceScope scope ->
+        CResourceScope
+          {
+            scope with
+            rs_acquire = f scope.rs_acquire;
+            rs_body = f scope.rs_body;
+            rs_cleanup = f scope.rs_cleanup;
+          }
     | CSeq (a, b) -> CSeq (f a, f b)
     | CDebugBlock body -> CDebugBlock (f body)
     | CIf (c, t, el) -> CIf (f c, f t, f el)
@@ -1781,6 +1804,12 @@ let rec pp_to_string (e : core) : string =
         (tensor_unboxed_scalar_str b.trv_kind)
         (pp_to_string b.trv_source)
         (pp_to_string body)
+  | CResourceScope s ->
+      Printf.sprintf "resource %s: %s = %s in %s cleanup %s"
+        (Var.to_string s.rs_var) (ty_str s.rs_ty)
+        (pp_to_string s.rs_acquire)
+        (pp_to_string s.rs_body)
+        (pp_to_string s.rs_cleanup)
   | CSeq (a, b) -> Printf.sprintf "%s; %s" (pp_to_string a) (pp_to_string b)
   | CDebugBlock body -> Printf.sprintf "debug { %s }" (pp_to_string body)
   | CIf (c, t, el) ->
@@ -2057,6 +2086,12 @@ let pp_to_string_indented (e : core) : string =
           (tensor_unboxed_scalar_str b.trv_kind)
           (pp_to_string b.trv_source)
           (go i body)
+    | CResourceScope s ->
+        Printf.sprintf "%sresource %s: %s = %s in\n%s\n%scleanup\n%s" p
+          (Var.to_string s.rs_var) (ty_str s.rs_ty)
+          (pp_to_string s.rs_acquire)
+          (go i s.rs_body) p
+          (go (i + 1) s.rs_cleanup)
     (* Seq: both on separate lines *)
     | CSeq (a, b) -> Printf.sprintf "%s\n%s" (go i a) (go i b)
     | CDebugBlock body ->
@@ -2440,6 +2475,7 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
       | CLet (b, body) -> CLet ({ b with bind_ty = f b.bind_ty }, body)
       | CBorrowLet (b, body) ->
           CBorrowLet ({ b with borrow_ty = f b.borrow_ty }, body)
+      | CResourceScope s -> CResourceScope { s with rs_ty = f s.rs_ty }
       | CFor (binder, iter, body) ->
           CFor
             ( {
