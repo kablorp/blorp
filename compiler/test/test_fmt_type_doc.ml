@@ -1,6 +1,6 @@
 (** Unit tests for type-expression formatting.
 
-    These mirror [tests/test_blorp/tools/test_fmt_type_doc.brp] so the OCaml
+    These mirror [tests/test_blorp/tools/test_type_documents.brp] so the OCaml
     formatter printer and the Blorp type-doc printer stay pinned to the same
     visible syntax while this formatter slice is ported. *)
 

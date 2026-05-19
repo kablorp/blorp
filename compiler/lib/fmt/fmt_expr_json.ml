@@ -204,6 +204,18 @@ let rec type_expr_to_json = function
   | Ast.TyMeta id ->
       obj [ field "tag" (string "Meta"); field "id" (string_of_int id) ]
 
+let dim_constraint_to_json (left, right) =
+  obj
+    [
+      field "left" (type_expr_to_json left);
+      field "right" (type_expr_to_json right);
+    ]
+
+let dim_constraints_field constraints =
+  match constraints with
+  | [] -> []
+  | _ -> [ field "where" (array (List.map dim_constraint_to_json constraints)) ]
+
 let literal_to_json = function
   | Ast.LitInt value ->
       obj
@@ -603,7 +615,9 @@ let rec expr_to_json expr =
                @ optional_field "type" (Option.map type_expr_to_json ty_opt)))
       | None -> None)
   | Ast.EBlock exprs -> (
-      match block_payload exprs with
+      match
+        block_payload ~through_line:(Printer.expr_source_end_line expr) exprs
+      with
       | Some (expr_jsons, item_jsons, has_comment) ->
           Some
             (obj
@@ -642,12 +656,22 @@ let rec expr_to_json expr =
       let case_to_json case =
         match expr_to_json case.Ast.case_body with
         | Some body_json ->
+            let trailing =
+              Fmt_comment.take_trailing !comments
+                ~on_line:case.Ast.case_body.expr_loc.line
+            in
             Some
               (obj
-                 [
-                   field "pattern" (pattern_to_json case.Ast.case_pattern);
-                   field "body" body_json;
-                 ])
+                 ([
+                    field "pattern" (pattern_to_json case.Ast.case_pattern);
+                    field "body" body_json;
+                  ]
+                 @ optional_field "trailing"
+                     (Option.map
+                        (fun comment ->
+                          string
+                            (Fmt_comment.normalize_comment comment.Lexer.cc_text))
+                        trailing)))
         | None -> None
       in
       match (expr_to_json scrutinee, option_map_all case_to_json cases) with
@@ -711,7 +735,7 @@ let rec expr_to_json expr =
                     ]
                    @ optional_field "return"
                        (Option.map type_expr_to_json func.Ast.func_return_type)
-                   ))
+                   @ dim_constraints_field func.Ast.func_dim_constraints))
           | None -> None)
       | Ast.FuncBuiltinBody _ | Ast.FuncForeign _ | Ast.FuncNoBody -> None)
   | Ast.EFuncDecl func -> (
@@ -738,18 +762,23 @@ let rec expr_to_json expr =
                     ]
                    @ optional_field "return"
                        (Option.map type_expr_to_json func.Ast.func_return_type)
-                   ))
+                   @ dim_constraints_field func.Ast.func_dim_constraints))
           | None -> None)
       | Ast.FuncBuiltinBody _ | Ast.FuncForeign _ | Ast.FuncNoBody -> None)
   | Ast.EDebugBlock exprs -> (
-      match option_map_all expr_to_json exprs with
-      | Some expr_jsons ->
+      match
+        block_payload ~through_line:(Printer.expr_source_end_line expr) exprs
+      with
+      | Some (expr_jsons, item_jsons, has_comment) ->
           Some
             (obj
-               [
-                 field "tag" (string "DebugBlock");
-                 field "exprs" (array expr_jsons);
-               ])
+               ([
+                  field "tag" (string "DebugBlock");
+                  field "exprs" (array expr_jsons);
+                ]
+               @
+               if has_comment then [ field "items" (array item_jsons) ]
+               else block_blank_before_field exprs))
       | None -> None)
   | Ast.EConcurrent (bindings, timeout, max_threads) -> (
       match
@@ -801,6 +830,21 @@ let rec expr_to_json expr =
                @ optional_field "timeout" timeout_json
                @ optional_int_field "max_threads" max_threads))
       | _ -> None)
+  | Ast.EWith (binding, body) -> (
+      match (expr_to_json binding.with_value, expr_to_json body) with
+      | Some value_json, Some body_json ->
+          Some
+            (obj
+               ([
+                  field "tag" (string "With");
+                  field "name" (string binding.with_name);
+                  field "try" (bool (binding.with_kind = Ast.WithTry));
+                  field "value" value_json;
+                  field "body" body_json;
+                ]
+               @ optional_field "type"
+                   (Option.map type_expr_to_json binding.with_type)))
+      | _ -> None)
   | Ast.EStringInterp (parts, is_triple) -> (
       let part_to_json = function
         | Ast.InterpLit text ->
@@ -823,9 +867,9 @@ let rec expr_to_json expr =
                  field "parts" (array part_jsons);
                ])
       | None -> None)
-  | Ast.ELoopView _ | Ast.EStringInterpRaw _ | Ast.EWith _ -> None
+  | Ast.ELoopView _ | Ast.EStringInterpRaw _ -> None
 
-and block_payload exprs =
+and block_payload ?through_line exprs =
   let block_expr_trailing expr rest =
     match
       Fmt_comment.take_trailing !comments
@@ -837,7 +881,12 @@ and block_payload exprs =
         | next :: _ ->
             Fmt_comment.take_trailing_before !comments
               ~before_line:next.Ast.expr_loc.line
-        | [] -> Fmt_comment.take_next_trailing !comments)
+        | [] -> (
+            match through_line with
+            | Some line ->
+                Fmt_comment.take_trailing_before !comments
+                  ~before_line:(line + 1)
+            | None -> Fmt_comment.take_next_trailing !comments))
   in
   let rec loop previous rendered expr_jsons has_comment = function
     | [] -> Some (List.rev expr_jsons, List.rev rendered, has_comment)

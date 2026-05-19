@@ -125,14 +125,15 @@ let post_process s =
         else collapse (line :: acc) 0 rest
   in
   let lines = collapse [] 0 lines in
-  (* Remove trailing blank lines, then add exactly one trailing newline *)
+  (* Remove trailing blank lines, then add one trailing newline for nonempty output. *)
   let rec drop_trailing_blanks = function
     | [] -> []
-    | [ "" ] -> []
-    | x :: rest -> x :: drop_trailing_blanks rest
+    | line :: rest ->
+        let rest = drop_trailing_blanks rest in
+        if rest = [] && line = "" then [] else line :: rest
   in
   let lines = drop_trailing_blanks lines in
-  String.concat "\n" lines ^ "\n"
+  match lines with [] -> "" | _ -> String.concat "\n" lines ^ "\n"
 
 (** Full pipeline: render + post-process *)
 let layout ?(width = line_width) doc = post_process (render ~width doc)

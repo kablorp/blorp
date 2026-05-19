@@ -1,0 +1,372 @@
+-- Formatter document IR and layout engine.
+--
+-- This intentionally mirrors compiler/lib/fmt/{fmt_doc,fmt_layout}.ml so the
+-- compiler can keep parsing/AST printing in OCaml while Blorp dogfoods the
+-- layout phase.
+union Doc:
+	Nil
+	Text(String)
+	Hardline
+	Softline
+	SoftlineSpace
+	Indent(Int, Doc)
+	Group(Doc)
+	Concat(Doc, Doc)
+	IfBreak(Doc, Doc)
+	LineSuffix(String)
+
+
+union LayoutMode:
+	FlatMode
+	BreakMode
+
+
+record Command {indent: Int, mode: LayoutMode, document: Doc}
+
+
+record RenderState {output: String, column: Int, suffixes: List[String]}
+
+
+LINE_WIDTH: Int = 100
+
+
+pure func command(indent: Int, mode: LayoutMode, document: Doc) -> Command:
+	{indent = indent, mode = mode, document = document}
+
+
+pure func render_state(output: String, column: Int, suffixes: List[String]) -> RenderState:
+	{output = output, column = column, suffixes = suffixes}
+
+
+pure func text(source: String) -> Doc:
+	if source == "":
+		Nil
+	else:
+		Text(source)
+
+
+pure func nil() -> Doc:
+	Nil
+
+
+pure func hardline() -> Doc:
+	Hardline
+
+
+pure func softline() -> Doc:
+	Softline
+
+
+pure func softline_space() -> Doc:
+	SoftlineSpace
+
+
+pure func nest(width: Int, document: Doc) -> Doc:
+	Indent(width, document)
+
+
+pure func if_break(broken_document: Doc, flat_document: Doc) -> Doc:
+	IfBreak(broken_document, flat_document)
+
+
+pure func cat(a: Doc, b: Doc) -> Doc:
+	match a:
+		Nil: b
+		_:
+			match b:
+				Nil: a
+				_: Concat(a, b)
+
+
+pure func concat_documents(documents: List[Doc]) -> Doc:
+	var result: Doc = Nil
+	for document in documents:
+		result = result.cat(document)
+	result
+
+
+pure func indent(document: Doc) -> Doc:
+	4.nest(document)
+
+
+pure func group(document: Doc) -> Doc:
+	Group(document)
+
+
+pure func line_suffix(source: String) -> Doc:
+	LineSuffix(source)
+
+
+pure func intersperse(separator: Doc, documents: List[Doc]) -> Doc:
+	match documents:
+		[]: Nil
+		[x]: x
+		[x, ...rest]: x
+			.cat(separator)
+			.cat(separator.intersperse(rest))
+
+
+pure func comma_sep(documents: List[Doc]) -> Doc:
+	text(", ").intersperse(documents)
+
+
+pure func comma_sep_break(documents: List[Doc]) -> Doc:
+	match documents:
+		[]: Nil
+		[x]: x.cat(text(",").if_break(Nil))
+		[x, ...rest]: x
+			.cat(text(","))
+			.cat(SoftlineSpace.cat(rest.comma_sep_break()))
+
+
+pure func hardlines(documents: List[Doc]) -> Doc:
+	Hardline.intersperse(documents)
+
+
+pure func blank_lines(count: Int, documents: List[Doc]) -> Doc:
+	var separator: Doc = Nil
+	for _ in 0..count + 1:
+		separator = separator.cat(Hardline)
+	separator.intersperse(documents)
+
+
+pure func surround(left: String, right: String, document: Doc) -> Doc:
+	left
+		.text()
+		.cat(document.cat(right.text()))
+
+
+pure func parens(document: Doc) -> Doc:
+	surround("(", ")", document)
+
+
+pure func push1(command_value: Command, rest: List[Command]) -> List[Command]:
+	[command_value].concat(rest)
+
+
+pure func push2(first: Command, second: Command, rest: List[Command]) -> List[Command]:
+	[first, second].concat(rest)
+
+
+pure func fits(remaining: Int, work: List[Command]) -> Bool:
+	if remaining < 0:
+		False
+	else:
+		match work:
+			[]: True
+			[command_value, ...rest]:
+				match command_value.document:
+					Nil: remaining.fits(rest)
+					Text(source): (remaining - source.length()).fits(rest)
+					Hardline: True
+					Softline: remaining.fits(
+						command(command_value.indent, FlatMode, Nil).push1(rest),
+					)
+					SoftlineSpace:
+						match command_value.mode:
+							FlatMode: (remaining - 1).fits(rest)
+							BreakMode: True
+					Indent(extra, inner):
+						remaining.fits(
+							command(
+								command_value.indent + extra,
+								command_value.mode,
+								inner,
+							).push1(rest),
+						)
+					Group(inner): remaining.fits(
+						command(command_value.indent, FlatMode, inner).push1(rest),
+					)
+					Concat(a, b):
+						remaining.fits(
+							command(command_value.indent, command_value.mode, a).push2(
+								command(
+									command_value.indent,
+									command_value.mode,
+									b,
+								),
+								rest,
+							),
+						)
+					IfBreak(broken_document, flat_document):
+						match command_value.mode:
+							FlatMode:
+								remaining.fits(
+									command(
+										command_value.indent,
+										FlatMode,
+										flat_document,
+									).push1(rest),
+								)
+							BreakMode:
+								remaining.fits(
+									command(
+										command_value.indent,
+										BreakMode,
+										broken_document,
+									).push1(rest),
+								)
+					LineSuffix(_): remaining.fits(rest)
+
+
+pure func flush_line_suffixes(state: RenderState) -> RenderState:
+	if state.suffixes.length() == 0:
+		state
+	else:
+		render_state(state.output + state.suffixes.join(""), state.column, [])
+
+
+pure func emit_newline(state: RenderState, indent_width: Int) -> RenderState:
+	flushed: RenderState = state.flush_line_suffixes()
+	tabs: Int = indent_width / 4
+	prefix: String = if tabs > 0:
+		"\t".repeat(tabs)
+	else:
+		""
+	render_state(flushed.output + "\n" + prefix, indent_width, [])
+
+
+pure func enqueue_line_suffix(state: RenderState, suffix: String) -> RenderState:
+	render_state(state.output, state.column, state.suffixes.append(" " + suffix))
+
+
+pure func render_loop(width: Int, state: RenderState, work: List[Command]) -> RenderState:
+	match work:
+		[]: state.flush_line_suffixes()
+		[command_value, ...rest]:
+			match command_value.document:
+				Nil: width.render_loop(state, rest)
+				Text(source): width.render_loop(
+					render_state(
+						state.output + source,
+						state.column + source.length(),
+						state.suffixes,
+					),
+					rest,
+				)
+				Hardline: width.render_loop(state.emit_newline(command_value.indent), rest)
+				Softline:
+					match command_value.mode:
+						FlatMode: width.render_loop(state, rest)
+						BreakMode: width.render_loop(state.emit_newline(command_value.indent), rest)
+				SoftlineSpace:
+					match command_value.mode:
+						FlatMode: width.render_loop(
+							render_state(
+								state.output + " ",
+								state.column + 1,
+								state.suffixes,
+							),
+							rest,
+						)
+						BreakMode: width.render_loop(state.emit_newline(command_value.indent), rest)
+				Indent(extra, inner):
+					width.render_loop(
+						state,
+						command(
+							command_value.indent + extra,
+							command_value.mode,
+							inner,
+						).push1(rest),
+					)
+				Group(inner):
+					flat_command: Command = command(command_value.indent, FlatMode, inner)
+					if (width - state.column).fits(flat_command.push1(rest)):
+						width.render_loop(state, flat_command.push1(rest))
+					else:
+						width.render_loop(
+							state,
+							command(command_value.indent, BreakMode, inner).push1(rest),
+						)
+				Concat(a, b):
+					width.render_loop(
+						state,
+						command(command_value.indent, command_value.mode, a).push2(
+							command(
+								command_value.indent,
+								command_value.mode,
+								b,
+							),
+							rest,
+						),
+					)
+				IfBreak(broken_document, flat_document):
+					match command_value.mode:
+						FlatMode:
+							width.render_loop(
+								state,
+								command(command_value.indent, FlatMode, flat_document).push1(rest),
+							)
+						BreakMode:
+							width.render_loop(
+								state,
+								command(
+									command_value.indent,
+									BreakMode,
+									broken_document,
+								).push1(rest),
+							)
+				LineSuffix(source):
+					width.render_loop(state.enqueue_line_suffix(source), rest)
+
+
+pure func render(width: Int, document: Doc) -> String:
+	rendered: RenderState = width.render_loop(
+		render_state(
+			"",
+			0,
+			[],
+		),
+		[command(0, BreakMode, document)],
+	)
+	rendered.output
+
+
+pure func collapse_blank_lines(
+	lines: List[String],
+	blank_count: Int,
+	acc: List[String],
+) -> List[String]:
+	match lines:
+		[]: acc.reverse()
+		[line, ...rest]:
+			if line == "":
+				if blank_count < 2:
+					rest.collapse_blank_lines(blank_count + 1, [line].concat(acc))
+				else:
+					rest.collapse_blank_lines(blank_count, acc)
+			else:
+				rest.collapse_blank_lines(0, [line].concat(acc))
+
+
+pure func drop_trailing_blanks(lines: List[String]) -> List[String]:
+	match lines:
+		[]: []
+		[line, ...rest]:
+			tail: List[String] = rest.drop_trailing_blanks()
+			if tail.length() == 0 and line == "":
+				[]
+			else:
+				[line].concat(tail)
+
+
+pure func post_process(source: String) -> String:
+	var trimmed: List[String] = []
+	for line in source.split("\n"):
+		trimmed = trimmed.append(line.trim_right())
+	collapsed: List[String] = trimmed.collapse_blank_lines(0, [])
+	body: List[String] = collapsed.drop_trailing_blanks()
+	if body.length() == 0:
+		""
+	else:
+		body.join("\n") + "\n"
+
+
+pure func layout(width: Int, document: Doc) -> String:
+	width
+		.render(document)
+		.post_process()
+
+
+pure func layout_default(document: Doc) -> String:
+	LINE_WIDTH.layout(document)

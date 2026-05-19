@@ -1,0 +1,2441 @@
+import:
+	./document_layout:
+		Doc,
+		cat,
+		comma_sep,
+		comma_sep_break,
+		concat_documents,
+		group,
+		hardline,
+		hardlines,
+		indent,
+		layout,
+		line_suffix,
+		parens,
+		softline,
+		text,
+	./json_fields: array_field, bool_field, field, int_field, string_field
+	./type_documents:
+		TypeConstraint,
+		TypeExpression,
+		type_constraint_array_field_or_empty,
+		type_constraint_documents,
+		type_document,
+		type_expression_contains_function,
+		type_expression_from_json,
+	json: JsonValue, as_bool, as_string, get_field, parse_json
+
+
+record StringFlags {raw: Bool, triple: Bool}
+
+
+union Literal:
+	IntLiteral(String)
+	Int128Literal(String)
+	FloatLiteral(String)
+	StringLiteral(String, StringFlags)
+	BoolLiteral(Bool)
+	CharLiteral(Int)
+
+
+union UnaryOp:
+	NegOp
+	NotOp
+
+
+union BinaryOp:
+	AddOp
+	SubOp
+	MulOp
+	DivOp
+	ModOp
+	LtOp
+	GtOp
+	LeOp
+	GeOp
+	EqOp
+	NeOp
+
+
+union LogicalOp:
+	AndOp
+	OrOp
+
+
+union Pattern:
+	WildcardPattern
+	VarPattern(String)
+	ConstructorPattern(String, List[Pattern])
+	LiteralPattern(Literal)
+	TuplePattern(List[Pattern])
+	QualifiedPattern(String, String, List[Pattern])
+	ListPattern(List[Pattern])
+	ListSpreadPattern(List[Pattern], Pattern)
+	OrPattern(List[Pattern])
+
+
+union FunctionParameter:
+	NameParam(String)
+	TypedNameParam(String, TypeExpression)
+	PatternParam(Pattern)
+	TypedPatternParam(Pattern, TypeExpression)
+
+
+union StringInterpolationPart:
+	StringInterpolationTextPart(String)
+	StringInterpolationExpressionPart(Expression)
+
+
+union BlockItem:
+	BlockCommentItem(Bool, String)
+	BlockExpressionItem(Bool, Expression, Option[String])
+
+
+union MatchCase:
+	MatchCaseData(Pattern, Expression, Option[String])
+
+
+union Expression:
+	IdentifierExpression(String)
+	LiteralExpression(Literal)
+	VoidExpression
+	BreakExpression
+	ContinueExpression
+	BuiltinExpression
+	BuiltinRuntimeExpression(String)
+	FieldAccessExpression(Expression, String)
+	CallExpression(Expression, List[Expression])
+	UnaryExpression(UnaryOp, Expression)
+	BinaryExpression(BinaryOp, Expression, Expression)
+	LogicalExpression(LogicalOp, Expression, Expression)
+	TupleExpression(List[Expression])
+	ListExpression(List[Expression])
+	VectorExpression(List[Expression])
+	RecordExpression(List[(String, Expression)])
+	RecordUpdateExpression(Expression, List[(String, Expression)])
+	AscriptionExpression(Expression, TypeExpression)
+	RangeExpression(Expression, Expression)
+	SubscriptExpression(Expression, Expression)
+	MultiSubscriptExpression(Expression, List[Expression])
+	DictionaryExpression(List[(Expression, Expression)])
+	AssignmentExpression(String, Expression)
+	VariableDeclarationExpression(String, Bool, Expression)
+	TypedVariableDeclarationExpression(String, Bool, TypeExpression, Expression)
+	TupleDestructureExpression(List[String], Expression)
+	SubscriptAssignmentExpression(Expression, List[Expression], Expression)
+	QuestionBindExpression(String, Expression)
+	TypedQuestionBindExpression(String, TypeExpression, Expression)
+	BlockExpression(List[Expression])
+	SpacedBlockExpression(List[(Bool, Expression)])
+	ItemBlockExpression(List[BlockItem])
+	IfExpression(Expression, Expression)
+	IfElseExpression(Expression, Expression, Expression)
+	MatchExpression(Expression, List[MatchCase])
+	WhileExpression(Expression, Expression)
+	ForExpression(String, Expression, Expression)
+	TupleForExpression(List[String], Expression, Expression)
+	LambdaExpression(Bool, List[FunctionParameter], Expression)
+	TypedLambdaExpression(Bool, List[FunctionParameter], TypeExpression, Expression)
+	FunctionDeclarationExpression(String, Bool, List[String], List[FunctionParameter], List[TypeConstraint], Expression)
+	TypedFunctionDeclarationExpression(String, Bool, List[String], List[FunctionParameter], TypeExpression, List[TypeConstraint], Expression)
+	StringInterpolationExpression(List[StringInterpolationPart], Bool)
+	DebugBlockExpression(Expression)
+	ConcurrentExpression(List[Expression], Option[Expression], Option[Int])
+	ConcurrentBindExpression(String, Option[TypeExpression], Expression)
+	DetachExpression(Expression)
+	ConcurrentForExpression(String, Expression, Expression, Option[Expression], Option[Int])
+	WithExpression(String, Option[TypeExpression], Bool, Expression, Expression)
+
+
+record UfcsStep {name: String, args: List[Expression]}
+
+
+record UfcsChain {receiver: Expression, steps: List[UfcsStep]}
+
+
+private pure func hex_digit(n: Int) -> String:
+	if n < 10:
+		to_char(to_int('0') + n).to_string()
+	else:
+		to_char(to_int('A') + n - 10).to_string()
+
+
+private pure func hex_upper(n: Int) -> String:
+	if n == 0:
+		"0"
+	else:
+		var value: Int = n
+		var output: String = ""
+		while value > 0:
+			digit: Int = value % 16
+			output = digit.hex_digit() + output
+			value /= 16
+		output
+
+
+private pure func unicode_escape(code: Int) -> String:
+	"\\u{" + code.hex_upper() + "}"
+
+
+private pure func escape_char_code(code: Int, escape_single_quote: Bool) -> String:
+	if code == 10:
+		"\\n"
+	else if code == 9:
+		"\\t"
+	else if code == 13:
+		"\\r"
+	else if code == 92:
+		"\\\\"
+	else if code == 34:
+		"\\\""
+	else if code == 39 and escape_single_quote:
+		"\\'"
+	else if code == 0:
+		"\\0"
+	else if code >= 32 and code < 127:
+		to_char(code).to_string()
+	else:
+		code.unicode_escape()
+
+
+pure func escape_string_value(s: String) -> String:
+	var output: String = ""
+	var i: Int = 0
+	while i < s.length():
+		match s.get(i):
+			Some(c):
+				code: Int = c.to_int()
+				if code >= 128:
+					output += s.substring(i, 1)
+				else:
+					output += escape_char_code(code, False)
+			None: void
+		i += 1
+	output
+
+
+private pure func escape_triple_string_value(s: String) -> String:
+	var output: String = ""
+	var i: Int = 0
+	while i < s.length():
+		match s.get(i):
+			Some(c):
+				code: Int = c.to_int()
+				if code >= 128:
+					output += s.substring(i, 1)
+				else if code == 92:
+					output += "\\\\"
+				else if code == 9:
+					output += "\\t"
+				else if code == 13:
+					output += "\\r"
+				else if code == 0:
+					output += "\\0"
+				else:
+					output += c.to_string()
+			None: void
+		i += 1
+	output
+
+
+private pure func unary_op_from_json(value: String) -> Result[UnaryOp, String]:
+	match value:
+		"Neg": Ok(NegOp)
+		"Not": Ok(NotOp)
+		_: Err("unknown unary operator: " + value)
+
+
+private pure func binary_op_from_json(value: String) -> Result[BinaryOp, String]:
+	match value:
+		"Add": Ok(AddOp)
+		"Sub": Ok(SubOp)
+		"Mul": Ok(MulOp)
+		"Div": Ok(DivOp)
+		"Mod": Ok(ModOp)
+		"Lt": Ok(LtOp)
+		"Gt": Ok(GtOp)
+		"Le": Ok(LeOp)
+		"Ge": Ok(GeOp)
+		"Eq": Ok(EqOp)
+		"Ne": Ok(NeOp)
+		_: Err("unknown binary operator: " + value)
+
+
+private pure func logical_op_from_json(value: String) -> Result[LogicalOp, String]:
+	match value:
+		"And": Ok(AndOp)
+		"Or": Ok(OrOp)
+		_: Err("unknown logical operator: " + value)
+
+
+private pure func unary_text(op: UnaryOp) -> String:
+	match op:
+		NegOp: "-"
+		NotOp: "not "
+
+
+private pure func binary_text(op: BinaryOp) -> String:
+	match op:
+		AddOp: "+"
+		SubOp: "-"
+		MulOp: "*"
+		DivOp: "/"
+		ModOp: "%"
+		LtOp: "<"
+		GtOp: ">"
+		LeOp: "<="
+		GeOp: ">="
+		EqOp: "=="
+		NeOp: "!="
+
+
+private pure func logical_text(op: LogicalOp) -> String:
+	match op:
+		AndOp: "and"
+		OrOp: "or"
+
+
+private pure func binary_prec(op: BinaryOp) -> Int:
+	match op:
+		MulOp: 7
+		DivOp: 7
+		ModOp: 7
+		AddOp: 6
+		SubOp: 6
+		_: 4
+
+
+private pure func logical_prec(op: LogicalOp) -> Int:
+	match op:
+		AndOp: 2
+		OrOp: 1
+
+
+private pure func expression_precedence(expr: Expression) -> Int:
+	match expr:
+		AscriptionExpression(_, _): 0
+		BinaryExpression(op, _, _): op.binary_prec()
+		LogicalExpression(op, _, _): op.logical_prec()
+		_: 100
+
+
+private pure func logical_left_ends_with_block(expr: Expression) -> Bool:
+	match expr:
+		MatchExpression(_, _): True
+		IfExpression(_, _): True
+		IfElseExpression(_, _, _): True
+		LogicalExpression(_, _, right): right.logical_left_ends_with_block()
+		_: False
+
+
+private pure func needs_field_receiver_parens(expr: Expression) -> Bool:
+	match expr:
+		AscriptionExpression(_, _): True
+		BlockExpression(_): True
+		SpacedBlockExpression(_): True
+		ItemBlockExpression(_): True
+		BinaryExpression(_, _, _): True
+		ConcurrentExpression(_, _, _): True
+		ConcurrentForExpression(_, _, _, _, _): True
+		DebugBlockExpression(_): True
+		ForExpression(_, _, _): True
+		TupleForExpression(_, _, _): True
+		IfExpression(_, _): True
+		IfElseExpression(_, _, _): True
+		LogicalExpression(_, _, _): True
+		MatchExpression(_, _): True
+		RangeExpression(_, _): True
+		UnaryExpression(_, _): True
+		WithExpression(_, _, _, _, _): True
+		WhileExpression(_, _): True
+		_: False
+
+
+private pure func string_flags_from_json(value: JsonValue) -> Result[StringFlags, String]:
+	raw ?= value.bool_field("raw")
+	triple ?= value.bool_field("triple")
+	Ok({raw = raw, triple = triple})
+
+
+pure func literal_from_json(value: JsonValue) -> Result[Literal, String]:
+	tag ?= value.string_field("tag")
+	match tag:
+		"Int":
+			raw ?= value.string_field("value")
+			Ok(IntLiteral(raw))
+		"Int128":
+			raw ?= value.string_field("value")
+			Ok(Int128Literal(raw))
+		"Float":
+			raw ?= value.string_field("value")
+			Ok(FloatLiteral(raw))
+		"String":
+			text_value ?= value.string_field("text")
+			flags ?= value.string_flags_from_json()
+			Ok(StringLiteral(text_value, flags))
+		"Bool":
+			bool_value ?= value.bool_field("value")
+			Ok(BoolLiteral(bool_value))
+		"Char":
+			code ?= value.int_field("value")
+			Ok(CharLiteral(code))
+		_: Err("unknown literal JSON tag: " + tag)
+
+
+private pure func literal_field(value: JsonValue, key: String) -> Result[Literal, String]:
+	child ?= value.field(key)
+	child.literal_from_json()
+
+
+private pure func pattern_field(value: JsonValue, key: String) -> Result[Pattern, String]:
+	child ?= value.field(key)
+	child.pattern_from_json()
+
+
+private pure func expression_field(value: JsonValue, key: String) -> Result[Expression, String]:
+	child ?= value.field(key)
+	child.expression_from_json()
+
+
+private pure func type_expression_field(
+	value: JsonValue,
+	key: String,
+) -> Result[TypeExpression, String]:
+	child ?= value.field(key)
+	child.type_expression_from_json()
+
+
+private pure func optional_type_expression_field(
+	value: JsonValue,
+	key: String,
+) -> Result[Option[TypeExpression], String]:
+	match value.get_field(key):
+		None: Ok(None)
+		Some(child):
+			type_expression ?= child.type_expression_from_json()
+			Ok(Some(type_expression))
+
+
+private pure func optional_expression_field(
+	value: JsonValue,
+	key: String,
+) -> Result[Option[Expression], String]:
+	match value.get_field(key):
+		None: Ok(None)
+		Some(child):
+			expr_value ?= child.expression_from_json()
+			Ok(Some(expr_value))
+
+
+private pure func optional_int_field(value: JsonValue, key: String) -> Result[Option[Int], String]:
+	match value.get_field(key):
+		None: Ok(None)
+		Some(_):
+			int_value ?= value.int_field(key)
+			Ok(Some(int_value))
+
+
+private pure func optional_string_field(
+	value: JsonValue,
+	key: String,
+) -> Result[Option[String], String]:
+	match value.get_field(key):
+		None: Ok(None)
+		Some(child):
+			match child.as_string():
+				Some(text_value): Ok(Some(text_value))
+				None: Err("expected formatter JSON field '" + key + "' to be a string")
+
+
+private pure func bool_array_field(value: JsonValue, key: String) -> Result[List[Bool], String]:
+	items ?= value.array_field(key)
+	var result: List[Bool] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.as_bool():
+					Some(bool_value): result = result.append(bool_value)
+					None: error = Some(
+						"expected formatter JSON field '" + key + "' to be an array of booleans",
+					)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func optional_bool_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[Option[List[Bool]], String]:
+	match value.get_field(key):
+		None: Ok(None)
+		Some(_):
+			items ?= value.bool_array_field(key)
+			Ok(Some(items))
+
+
+private pure func string_array_field(value: JsonValue, key: String) -> Result[List[String], String]:
+	items ?= value.array_field(key)
+	var result: List[String] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.as_string():
+					Some(s): result = result.append(s)
+					None: error = Some(
+						"expected formatter JSON field '" + key + "' to be an array of strings",
+					)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func pattern_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[Pattern], String]:
+	items ?= value.array_field(key)
+	var result: List[Pattern] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.pattern_from_json():
+					Ok(pattern): result = result.append(pattern)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func function_parameter_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[FunctionParameter], String]:
+	items ?= value.array_field(key)
+	var result: List[FunctionParameter] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.function_parameter_from_json():
+					Ok(param): result = result.append(param)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func string_interpolation_part_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[StringInterpolationPart], String]:
+	items ?= value.array_field(key)
+	var result: List[StringInterpolationPart] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.string_interpolation_part_from_json():
+					Ok(part): result = result.append(part)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func expression_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[Expression], String]:
+	items ?= value.array_field(key)
+	var result: List[Expression] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.expression_from_json():
+					Ok(expr): result = result.append(expr)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func block_items_from_flags(
+	exprs: List[Expression],
+	flags: List[Bool],
+) -> List[(Bool, Expression)]:
+	var result: List[(Bool, Expression)] = []
+	var index: Int = 0
+	for expr in exprs:
+		blank_before: Bool = match flags.get(index):
+			Some(flag): flag
+			None: False
+		result = result.append((blank_before, expr))
+		index += 1
+	result
+
+
+private pure func block_item_from_json(value: JsonValue) -> Result[BlockItem, String]:
+	tag ?= value.string_field("tag")
+	blank_before ?= value.bool_field("blank_before")
+	match tag:
+		"Comment":
+			text_value ?= value.string_field("text")
+			Ok(BlockCommentItem(blank_before, text_value))
+		"Expr":
+			expr_value ?= value.expression_field("expr")
+			trailing ?= value.optional_string_field("trailing")
+			Ok(BlockExpressionItem(blank_before, expr_value, trailing))
+		"Expression":
+			expr_value ?= value.expression_field("expr")
+			trailing ?= value.optional_string_field("trailing")
+			Ok(BlockExpressionItem(blank_before, expr_value, trailing))
+		_: Err("unknown block item JSON tag: " + tag)
+
+
+private pure func block_item_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[BlockItem], String]:
+	items ?= value.array_field(key)
+	var result: List[BlockItem] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.block_item_from_json():
+					Ok(block_item): result = result.append(block_item)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func record_expression_field_from_json(
+	value: JsonValue,
+) -> Result[(String, Expression), String]:
+	name ?= value.string_field("name")
+	expr ?= value.expression_field("value")
+	Ok((name, expr))
+
+
+private pure func record_expression_fields(
+	value: JsonValue,
+	key: String,
+) -> Result[List[(String, Expression)], String]:
+	items ?= value.array_field(key)
+	var result: List[(String, Expression)] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.record_expression_field_from_json():
+					Ok(field_value): result = result.append(field_value)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func dictionary_entry_from_json(
+	value: JsonValue,
+) -> Result[(Expression, Expression), String]:
+	key ?= value.expression_field("key")
+	entry_value ?= value.expression_field("value")
+	Ok((key, entry_value))
+
+
+private pure func dictionary_entries(
+	value: JsonValue,
+	key: String,
+) -> Result[List[(Expression, Expression)], String]:
+	items ?= value.array_field(key)
+	var result: List[(Expression, Expression)] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.dictionary_entry_from_json():
+					Ok(entry): result = result.append(entry)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+pure func pattern_from_json(value: JsonValue) -> Result[Pattern, String]:
+	tag ?= value.string_field("tag")
+	match tag:
+		"Wildcard": Ok(WildcardPattern)
+		"Var":
+			name ?= value.string_field("name")
+			Ok(VarPattern(name))
+		"Constructor":
+			name ?= value.string_field("name")
+			args ?= value.pattern_array_field("args")
+			Ok(ConstructorPattern(name, args))
+		"Literal":
+			lit ?= value.literal_field("literal")
+			Ok(LiteralPattern(lit))
+		"Tuple":
+			elems ?= value.pattern_array_field("elems")
+			Ok(TuplePattern(elems))
+		"Qualified":
+			module_name ?= value.string_field("module")
+			name ?= value.string_field("name")
+			args ?= value.pattern_array_field("args")
+			Ok(QualifiedPattern(module_name, name, args))
+		"List":
+			elems ?= value.pattern_array_field("elems")
+			match value.get_field("spread"):
+				None: Ok(ListPattern(elems))
+				Some(spread_value):
+					spread ?= spread_value.pattern_from_json()
+					Ok(ListSpreadPattern(elems, spread))
+		"Or":
+			elems ?= value.pattern_array_field("patterns")
+			Ok(OrPattern(elems))
+		_: Err("unknown pattern JSON tag: " + tag)
+
+
+pure func function_parameter_from_json(value: JsonValue) -> Result[FunctionParameter, String]:
+	tag ?= value.string_field("tag")
+	match tag:
+		"Name":
+			name ?= value.string_field("name")
+			Ok(NameParam(name))
+		"TypedName":
+			name ?= value.string_field("name")
+			type_expression ?= value.type_expression_field("type")
+			Ok(TypedNameParam(name, type_expression))
+		"Pattern":
+			pattern ?= value.pattern_field("pattern")
+			Ok(PatternParam(pattern))
+		"TypedPattern":
+			pattern ?= value.pattern_field("pattern")
+			type_expression ?= value.type_expression_field("type")
+			Ok(TypedPatternParam(pattern, type_expression))
+		_: Err("unknown function parameter JSON tag: " + tag)
+
+
+pure func string_interpolation_part_from_json(
+	value: JsonValue,
+) -> Result[StringInterpolationPart, String]:
+	tag ?= value.string_field("tag")
+	match tag:
+		"Text":
+			text_value ?= value.string_field("text")
+			Ok(StringInterpolationTextPart(text_value))
+		"Expr":
+			expr_value ?= value.expression_field("expr")
+			Ok(StringInterpolationExpressionPart(expr_value))
+		_: Err("unknown string interpolation part JSON tag: " + tag)
+
+
+private pure func match_case_from_json(value: JsonValue) -> Result[MatchCase, String]:
+	pattern ?= value.pattern_field("pattern")
+	body ?= value.expression_field("body")
+	trailing ?= value.optional_string_field("trailing")
+	Ok(MatchCaseData(pattern, body, trailing))
+
+
+private pure func match_cases(value: JsonValue, key: String) -> Result[List[MatchCase], String]:
+	items ?= value.array_field(key)
+	var result: List[MatchCase] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.match_case_from_json():
+					Ok(case_value): result = result.append(case_value)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
+	tag ?= value.string_field("tag")
+	match tag:
+		"Ident":
+			name ?= value.string_field("name")
+			Ok(IdentifierExpression(name))
+		"Literal":
+			lit ?= value.literal_field("literal")
+			Ok(LiteralExpression(lit))
+		"Void": Ok(VoidExpression)
+		"Break": Ok(BreakExpression)
+		"Continue": Ok(ContinueExpression)
+		"Builtin": Ok(BuiltinExpression)
+		"BuiltinRuntime":
+			name ?= value.string_field("name")
+			Ok(BuiltinRuntimeExpression(name))
+		"FieldAccess":
+			receiver ?= value.expression_field("receiver")
+			field_name ?= value.string_field("field")
+			Ok(FieldAccessExpression(receiver, field_name))
+		"Call":
+			callee ?= value.expression_field("callee")
+			args ?= value.expression_array_field("args")
+			Ok(CallExpression(callee, args))
+		"Unary":
+			raw_op ?= value.string_field("op")
+			op ?= raw_op.unary_op_from_json()
+			inner ?= value.expression_field("expr")
+			Ok(UnaryExpression(op, inner))
+		"Binary":
+			raw_op ?= value.string_field("op")
+			op ?= raw_op.binary_op_from_json()
+			left ?= value.expression_field("left")
+			right ?= value.expression_field("right")
+			Ok(BinaryExpression(op, left, right))
+		"Logical":
+			raw_op ?= value.string_field("op")
+			op ?= raw_op.logical_op_from_json()
+			left ?= value.expression_field("left")
+			right ?= value.expression_field("right")
+			Ok(LogicalExpression(op, left, right))
+		"Tuple":
+			elems ?= value.expression_array_field("elems")
+			Ok(TupleExpression(elems))
+		"List":
+			elems ?= value.expression_array_field("elems")
+			Ok(ListExpression(elems))
+		"Vector":
+			elems ?= value.expression_array_field("elems")
+			Ok(VectorExpression(elems))
+		"Record":
+			fields ?= value.record_expression_fields("fields")
+			Ok(RecordExpression(fields))
+		"RecordUpdate":
+			base ?= value.expression_field("base")
+			fields ?= value.record_expression_fields("fields")
+			Ok(RecordUpdateExpression(base, fields))
+		"Ascription":
+			inner ?= value.expression_field("expr")
+			type_expression ?= value.type_expression_field("type")
+			Ok(AscriptionExpression(inner, type_expression))
+		"Range":
+			left ?= value.expression_field("left")
+			right ?= value.expression_field("right")
+			Ok(RangeExpression(left, right))
+		"Subscript":
+			target ?= value.expression_field("target")
+			index ?= value.expression_field("index")
+			Ok(SubscriptExpression(target, index))
+		"SubscriptMulti":
+			target ?= value.expression_field("target")
+			indices ?= value.expression_array_field("indices")
+			Ok(MultiSubscriptExpression(target, indices))
+		"Dict":
+			entries ?= value.dictionary_entries("entries")
+			Ok(DictionaryExpression(entries))
+		"Assign":
+			name ?= value.string_field("name")
+			expr ?= value.expression_field("value")
+			Ok(AssignmentExpression(name, expr))
+		"VarDecl":
+			name ?= value.string_field("name")
+			is_mutable ?= value.bool_field("mutable")
+			expr ?= value.expression_field("value")
+			type_expression ?= value.optional_type_expression_field("type")
+			match type_expression:
+				Some(type_expr): Ok(
+					TypedVariableDeclarationExpression(
+						name,
+						is_mutable,
+						type_expr,
+						expr,
+					),
+				)
+				None: Ok(VariableDeclarationExpression(name, is_mutable, expr))
+		"TupleDestruct":
+			names ?= value.string_array_field("names")
+			expr ?= value.expression_field("value")
+			Ok(TupleDestructureExpression(names, expr))
+		"SubscriptAssign":
+			target ?= value.expression_field("target")
+			indices ?= value.expression_array_field("indices")
+			expr ?= value.expression_field("value")
+			Ok(SubscriptAssignmentExpression(target, indices, expr))
+		"QuestionBind":
+			name ?= value.string_field("name")
+			expr ?= value.expression_field("expr")
+			type_expression ?= value.optional_type_expression_field("type")
+			match type_expression:
+				Some(type_expr): Ok(TypedQuestionBindExpression(name, type_expr, expr))
+				None: Ok(QuestionBindExpression(name, expr))
+		"Block":
+			exprs ?= value.expression_array_field("exprs")
+			match value.get_field("items"):
+				Some(_):
+					items ?= value.block_item_array_field("items")
+					Ok(ItemBlockExpression(items))
+				None:
+					blank_before ?= value.optional_bool_array_field("blank_before")
+					match blank_before:
+						Some(flags): Ok(SpacedBlockExpression(exprs.block_items_from_flags(flags)))
+						None: Ok(BlockExpression(exprs))
+		"If":
+			cond ?= value.expression_field("cond")
+			then_expr ?= value.expression_field("then")
+			match value.get_field("else"):
+				None: Ok(IfExpression(cond, then_expr))
+				Some(else_value):
+					else_expr ?= else_value.expression_from_json()
+					Ok(IfElseExpression(cond, then_expr, else_expr))
+		"Match":
+			scrutinee ?= value.expression_field("scrutinee")
+			cases ?= value.match_cases("cases")
+			Ok(MatchExpression(scrutinee, cases))
+		"While":
+			cond ?= value.expression_field("cond")
+			body ?= value.expression_field("body")
+			Ok(WhileExpression(cond, body))
+		"For":
+			name ?= value.string_field("name")
+			iter ?= value.expression_field("iter")
+			body ?= value.expression_field("body")
+			Ok(ForExpression(name, iter, body))
+		"ForTuple":
+			names ?= value.string_array_field("names")
+			iter ?= value.expression_field("iter")
+			body ?= value.expression_field("body")
+			Ok(TupleForExpression(names, iter, body))
+		"With":
+			name ?= value.string_field("name")
+			type_expression ?= value.optional_type_expression_field("type")
+			is_try ?= value.bool_field("try")
+			expr ?= value.expression_field("value")
+			body ?= value.expression_field("body")
+			Ok(WithExpression(name, type_expression, is_try, expr, body))
+		"Lambda":
+			is_pure ?= value.bool_field("pure")
+			params ?= value.function_parameter_array_field("params")
+			body ?= value.expression_field("body")
+			return_type ?= value.optional_type_expression_field("return")
+			match return_type:
+				Some(return_type): Ok(TypedLambdaExpression(is_pure, params, return_type, body))
+				None: Ok(LambdaExpression(is_pure, params, body))
+		"FuncDecl":
+			name ?= value.string_field("name")
+			is_pure ?= value.bool_field("pure")
+			type_params ?= value.string_array_field("type_params")
+			params ?= value.function_parameter_array_field("params")
+			body ?= value.expression_field("body")
+			return_type ?= value.optional_type_expression_field("return")
+			where_constraints ?= value.type_constraint_array_field_or_empty("where")
+			match return_type:
+				Some(return_type): Ok(
+					TypedFunctionDeclarationExpression(
+						name,
+						is_pure,
+						type_params,
+						params,
+						return_type,
+						where_constraints,
+						body,
+					),
+				)
+				None: Ok(
+					FunctionDeclarationExpression(
+						name,
+						is_pure,
+						type_params,
+						params,
+						where_constraints,
+						body,
+					),
+				)
+		"StringInterp":
+			parts ?= value.string_interpolation_part_array_field("parts")
+			is_triple ?= value.bool_field("triple")
+			Ok(StringInterpolationExpression(parts, is_triple))
+		"DebugBlock":
+			exprs ?= value.expression_array_field("exprs")
+			match value.get_field("items"):
+				Some(_):
+					items ?= value.block_item_array_field("items")
+					Ok(DebugBlockExpression(ItemBlockExpression(items)))
+				None:
+					blank_before ?= value.optional_bool_array_field("blank_before")
+					body: Expression = match blank_before:
+						Some(flags): SpacedBlockExpression(exprs.block_items_from_flags(flags))
+						None: BlockExpression(exprs)
+					Ok(DebugBlockExpression(body))
+		"Concurrent":
+			bindings ?= value.expression_array_field("bindings")
+			timeout ?= value.optional_expression_field("timeout")
+			max_threads ?= value.optional_int_field("max_threads")
+			Ok(ConcurrentExpression(bindings, timeout, max_threads))
+		"ConcurrentBind":
+			name ?= value.string_field("name")
+			type_expression ?= value.optional_type_expression_field("type")
+			body ?= value.expression_field("value")
+			Ok(ConcurrentBindExpression(name, type_expression, body))
+		"Detach":
+			body ?= value.expression_field("body")
+			Ok(DetachExpression(body))
+		"ConcurrentFor":
+			var_name ?= value.string_field("var")
+			iter ?= value.expression_field("iter")
+			body ?= value.expression_field("body")
+			timeout ?= value.optional_expression_field("timeout")
+			max_threads ?= value.optional_int_field("max_threads")
+			Ok(ConcurrentForExpression(var_name, iter, body, timeout, max_threads))
+		_: Err("unknown expression JSON tag: " + tag)
+
+
+pure func expression_from_json_string(input: String) -> Result[Expression, String]:
+	value ?= input.parse_json()
+	value.expression_from_json()
+
+
+private pure func literal_document(lit: Literal) -> Doc:
+	match lit:
+		IntLiteral(raw): raw.text()
+		Int128Literal(raw): raw.text()
+		FloatLiteral(raw): raw.text()
+		StringLiteral(value, flags):
+			if flags.raw:
+				("r\"" + value + "\"").text()
+			else if flags.triple:
+				("\"\"\"" + value.escape_triple_string_value() + "\"\"\"").text()
+			else:
+				("\"" + value.escape_string_value() + "\"").text()
+		BoolLiteral(value):
+			if value:
+				"True".text()
+			else:
+				"False".text()
+		CharLiteral(code):
+			if code < 128:
+				("'" + escape_char_code(code, True) + "'").text()
+			else:
+				("'" + code.unicode_escape() + "'").text()
+
+
+pure func pattern_document(pattern: Pattern) -> Doc:
+	match pattern:
+		WildcardPattern: "_".text()
+		VarPattern(name): name.text()
+		ConstructorPattern(name, args):
+			if args.length() == 0:
+				(name + "()").text()
+			else:
+				name
+					.text()
+					.cat("(".text())
+					.cat(args
+							.pattern_document_list()
+							.comma_sep())
+					.cat(")".text())
+		LiteralPattern(lit): lit.literal_document()
+		TuplePattern(elems):
+			"("
+				.text()
+				.cat(elems
+						.pattern_document_list()
+						.comma_sep())
+				.cat(")".text())
+		QualifiedPattern(module_name, name, args):
+			prefix: Doc = module_name
+				.text()
+				.cat(".".text())
+				.cat(name.text())
+			if args.length() == 0:
+				prefix
+			else:
+				prefix
+					.cat("(".text())
+					.cat(args
+							.pattern_document_list()
+							.comma_sep())
+					.cat(")".text())
+		ListPattern(elems):
+			"["
+				.text()
+				.cat(elems
+						.pattern_document_list()
+						.comma_sep())
+				.cat("]".text())
+		ListSpreadPattern(elems, spread):
+			documents: List[Doc] = elems
+				.pattern_document_list()
+				.append("..."
+						.text()
+						.cat(spread.pattern_document()))
+			"["
+				.text()
+				.cat(documents.comma_sep())
+				.cat("]".text())
+		OrPattern(elems): " | "
+			.text()
+			.intersperse(elems.pattern_document_list())
+
+
+private pure func pattern_document_list(patterns: List[Pattern]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for pattern in patterns:
+		documents = documents.append(pattern.pattern_document())
+	documents
+
+
+private pure func expression_document_list(exprs: List[Expression]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for expr in exprs:
+		documents = documents.append(expr.expression_document())
+	documents
+
+
+private pure func is_breakable_call_callee(expr: Expression) -> Bool:
+	match expr:
+		IdentifierExpression(_): True
+		FieldAccessExpression(_, _): True
+		_: False
+
+
+private pure func call_argument_document(expr: Expression) -> Doc:
+	match expr:
+		CallExpression(callee, args):
+			if args.length() >= 2 and callee.is_breakable_call_callee():
+				flat_document: Doc = expr.expression_document()
+				broken_document: Doc = callee
+					.expression_document()
+					.cat("(".text())
+					.cat(hardline()
+							.cat(args
+									.call_argument_documents()
+									.comma_sep_break())
+							.indent())
+					.cat(hardline())
+					.cat(")".text())
+				broken_document.if_break(flat_document)
+			else:
+				expr.expression_document()
+		_: expr.expression_document()
+
+
+private pure func call_argument_documents(exprs: List[Expression]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for expr in exprs:
+		documents = documents.append(expr.call_argument_document())
+	documents
+
+
+private pure func expression_is_block_lambda(expr: Expression) -> Bool:
+	match expr:
+		LambdaExpression(_, _, body): body.is_block_expression()
+		TypedLambdaExpression(_, _, _, body): body.is_block_expression()
+		_: False
+
+
+private pure func expression_is_inline_lambda(expr: Expression) -> Bool:
+	match expr:
+		LambdaExpression(_, _, body): not body.is_block_expression()
+		TypedLambdaExpression(_, _, _, body): not body.is_block_expression()
+		_: False
+
+
+private pure func expression_list_has_trailing_block_lambda(exprs: List[Expression]) -> Bool:
+	match exprs.get(exprs.length() - 1):
+		Some(last): last.expression_is_block_lambda()
+		None: False
+
+
+private pure func expression_list_has_block_lambda(exprs: List[Expression]) -> Bool:
+	var has_lambda: Bool = False
+	for expr in exprs:
+		if expr.expression_is_block_lambda():
+			has_lambda = True
+	has_lambda
+
+
+private pure func expression_list_has_inline_lambda(exprs: List[Expression]) -> Bool:
+	var has_lambda: Bool = False
+	for expr in exprs:
+		if expr.expression_is_inline_lambda():
+			has_lambda = True
+	has_lambda
+
+
+private pure func trailing_block_lambda_call_arguments_document(args: List[Expression]) -> Doc:
+	last_idx: Int = args.length() - 1
+	var index: Int = 0
+	var leading_documents: List[Doc] = []
+	var last_document: Doc = "".text()
+	for arg in args:
+		if index == last_idx:
+			last_document = arg.expression_document()
+		else:
+			leading_documents = leading_documents.append(arg.expression_document())
+		index += 1
+	var leading_part: Doc = "".text()
+	if leading_documents.length() != 0:
+		leading_part = leading_documents
+			.comma_sep()
+			.cat(", ".text())
+	open_document: Doc = "(".text()
+	open_document
+		.cat(leading_part)
+		.cat(last_document)
+		.cat(hardline())
+		.cat(")".text())
+
+
+private pure func block_lambda_call_arguments_document(args: List[Expression]) -> Doc:
+	var result: Doc = "(".text()
+	var index: Int = 0
+	for arg in args:
+		if index == 0:
+			result = result.cat(arg.expression_document())
+		else:
+			result = result
+				.cat(hardline())
+				.cat(", ".text())
+				.cat(arg.expression_document())
+		index += 1
+	result.cat(")".text())
+
+
+private pure func expression_list_has_block(exprs: List[Expression]) -> Bool:
+	var has_block: Bool = False
+	for expr in exprs:
+		if expr.expression_has_block():
+			has_block = True
+	has_block
+
+
+private pure func expression_pair_list_has_block(items: List[(String, Expression)]) -> Bool:
+	var has_block: Bool = False
+	for item in items:
+		if item.1.expression_has_block():
+			has_block = True
+	has_block
+
+
+private pure func expression_has_block(expr: Expression) -> Bool:
+	match expr:
+		BlockExpression(_): True
+		SpacedBlockExpression(_): True
+		ItemBlockExpression(_): True
+		MatchExpression(_, _): True
+		WithExpression(_, _, _, _, _): True
+		DebugBlockExpression(_): True
+		LambdaExpression(_, _, body): body.is_block_expression()
+		TypedLambdaExpression(_, _, _, body): body.is_block_expression()
+		IfElseExpression(_, then_expr, else_expr):
+			then_expr.expression_has_block() or else_expr.expression_has_block()
+		CallExpression(_, args): args.expression_list_has_block()
+		AscriptionExpression(inner, _): inner.expression_has_block()
+		TupleExpression(elems): elems.expression_list_has_block()
+		ListExpression(elems): elems.expression_list_has_block()
+		VectorExpression(elems): elems.expression_list_has_block()
+		RecordExpression(fields): fields.expression_pair_list_has_block()
+		RecordUpdateExpression(_, fields): fields.expression_pair_list_has_block()
+		_: False
+
+
+private pure func expression_is_non_lambda_block(expr: Expression) -> Bool:
+	match expr:
+		LambdaExpression(_, _, _): False
+		TypedLambdaExpression(_, _, _, _): False
+		_: expr.expression_has_block()
+
+
+private pure func expression_list_has_non_lambda_block(exprs: List[Expression]) -> Bool:
+	var has_block: Bool = False
+	for expr in exprs:
+		if expr.expression_is_non_lambda_block():
+			has_block = True
+	has_block
+
+
+private pure func block_call_argument_documents(args: List[Expression]) -> List[Doc]:
+	last_idx: Int = args.length() - 1
+	var index: Int = 0
+	var documents: List[Doc] = []
+	for arg in args:
+		arg_document: Doc = arg.expression_document()
+		if index == last_idx:
+			documents = documents.append(arg_document)
+		else if arg.expression_has_block():
+			documents = documents.append(arg_document
+					.cat(hardline())
+					.cat(",".text()))
+		else:
+			documents = documents.append(arg_document.cat(",".text()))
+		index += 1
+	documents
+
+
+private pure func block_call_arguments_document(args: List[Expression]) -> Doc:
+	"("
+		.text()
+		.cat(hardline()
+				.cat(args
+						.block_call_argument_documents()
+						.hardlines())
+				.indent())
+		.cat(hardline())
+		.cat(")".text())
+
+
+private pure func vector_rank_expression(expr: Expression) -> Int:
+	match expr:
+		VectorExpression(elems): elems.vector_rank_elems()
+		_: 0
+
+
+private pure func vector_rank_elems(elems: List[Expression]) -> Int:
+	if elems.length() == 0:
+		1
+	else:
+		child_rank: Int = match elems.get(0):
+			Some(first): first.vector_rank_expression()
+			None: 0
+		if child_rank > 0:
+			var same_rank: Bool = True
+			for elem in elems:
+				if elem.vector_rank_expression() != child_rank:
+					same_rank = False
+			if same_rank:
+				child_rank + 1
+			else:
+				1
+		else:
+			1
+
+
+private pure func vector_row_document(elems: List[Expression]) -> Doc:
+	"{"
+		.text()
+		.cat(softline()
+				.cat(elems
+						.expression_document_list()
+						.comma_sep_break())
+				.indent())
+		.cat(softline())
+		.cat("}".text())
+		.group()
+
+
+private pure func shaped_vector_item_document(expr: Expression) -> Doc:
+	match expr:
+		VectorExpression(elems):
+			if elems.vector_rank_elems() >= 2:
+				elems.shaped_vector_document()
+			else:
+				elems.vector_row_document()
+		_: expr.expression_document()
+
+
+private pure func shaped_vector_item_documents(elems: List[Expression]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for elem in elems:
+		documents = documents.append(elem
+				.shaped_vector_item_document()
+				.cat(",".text()))
+	documents
+
+
+private pure func shaped_vector_document(elems: List[Expression]) -> Doc:
+	"{"
+		.text()
+		.cat(hardline()
+				.cat(elems
+						.shaped_vector_item_documents()
+						.hardlines())
+				.indent())
+		.cat(hardline())
+		.cat("}".text())
+
+
+private pure func vector_literal_document(elems: List[Expression]) -> Doc:
+	if elems.vector_rank_elems() >= 2 and not elems.expression_list_has_block():
+		elems.shaped_vector_document()
+	else:
+		bracketed_expression_document("{", "}", elems)
+
+
+private pure func bracketed_expression_document(
+	open_text: String,
+	close_text: String,
+	exprs: List[Expression],
+) -> Doc:
+	if exprs.expression_list_has_block():
+		open_text
+			.text()
+			.cat(hardline()
+					.cat(exprs
+							.expression_document_list()
+							.comma_hardline_documents())
+					.indent())
+			.cat(hardline())
+			.cat(close_text.text())
+	else:
+		open_text
+			.text()
+			.cat(softline()
+					.cat(exprs
+							.expression_document_list()
+							.comma_sep_break())
+					.indent())
+			.cat(softline())
+			.cat(close_text.text())
+			.group()
+
+
+private pure func comma_hardline_documents(documents: List[Doc]) -> Doc:
+	match documents:
+		[]: Nil
+		[x]: x
+		[x, ...rest]: x
+			.cat(",".text())
+			.cat(hardline())
+			.cat(rest.comma_hardline_documents())
+
+
+private pure func tuple_expression_document(elems: List[Expression]) -> Doc:
+	if elems.expression_list_has_trailing_block_lambda():
+		last_index: Int = elems.length() - 1
+		var index: Int = 0
+		var leading_documents: List[Doc] = []
+		var last_document: Doc = "".text()
+		for elem in elems:
+			if index == last_index:
+				last_document = elem.expression_document()
+			else:
+				leading_documents = leading_documents.append(elem.expression_document())
+			index += 1
+		var leading_part: Doc = "".text()
+		if leading_documents.length() != 0:
+			leading_part = leading_documents
+				.comma_sep()
+				.cat(", ".text())
+		open_document: Doc = "(".text()
+		open_document
+			.cat(leading_part)
+			.cat(last_document)
+			.cat(hardline())
+			.cat(")".text())
+	else:
+		bracketed_expression_document("(", ")", elems)
+
+
+private pure func call_arguments_document(args: List[Expression]) -> Doc:
+	if args.length() == 0:
+		"()".text()
+	else if args.expression_list_has_trailing_block_lambda():
+		args.trailing_block_lambda_call_arguments_document()
+	else if args.expression_list_has_block_lambda():
+		args.block_lambda_call_arguments_document()
+	else if args.expression_list_has_non_lambda_block():
+		args.block_call_arguments_document()
+	else:
+		"("
+			.text()
+			.cat(softline()
+					.cat(args
+							.call_argument_documents()
+							.comma_sep_break())
+					.indent())
+			.cat(softline())
+			.cat(")".text())
+			.group()
+
+
+private pure func collect_ufcs_chain(receiver: Expression, steps: List[UfcsStep]) -> UfcsChain:
+	match receiver:
+		CallExpression(FieldAccessExpression(inner, method_name), method_args):
+			inner.collect_ufcs_chain([{name = method_name, args = method_args}].concat(steps))
+		_: {receiver = receiver, steps = steps}
+
+
+private pure func ufcs_steps_document(steps: List[UfcsStep]) -> Doc:
+	var result: Doc = "".text()
+	for step in steps:
+		result = result
+			.cat(hardline())
+			.cat(".".text())
+			.cat(step.name.text())
+			.cat(step.args.call_arguments_document())
+	result
+
+
+private pure func ufcs_chain_document(callee: Expression, args: List[Expression]) -> Option[Doc]:
+	match callee:
+		FieldAccessExpression(receiver, method_name):
+			chain: UfcsChain = receiver.collect_ufcs_chain([{name = method_name, args = args}])
+			if chain.steps.length() >= 2:
+				Some(chain.receiver
+						.expression_document()
+						.cat(chain.steps
+								.ufcs_steps_document()
+								.indent()))
+			else:
+				None
+		_: None
+
+
+private pure func inline_lambda_call_document(callee: Expression, args: List[Expression]) -> Doc:
+	callee
+		.expression_document()
+		.cat("(".text())
+		.cat(softline()
+				.cat(args
+						.call_argument_documents()
+						.comma_sep_break())
+				.indent())
+		.cat(softline())
+		.cat(")".text())
+		.group()
+
+
+private pure func record_field_document(field_value: (String, Expression)) -> Doc:
+	field_value.0
+		.text()
+		.cat(" = ".text())
+		.cat(field_value.1.expression_document())
+
+
+private pure func record_field_documents(fields: List[(String, Expression)]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for field_value in fields:
+		documents = documents.append(field_value.record_field_document())
+	documents
+
+
+private pure func record_expression_document(fields: List[(String, Expression)]) -> Doc:
+	if fields.expression_pair_list_has_block():
+		"{"
+			.text()
+			.cat(hardline()
+					.cat(fields
+							.record_field_documents()
+							.comma_hardline_documents())
+					.indent())
+			.cat(hardline())
+			.cat("}".text())
+	else:
+		"{"
+			.text()
+			.cat(softline()
+					.cat(fields
+							.record_field_documents()
+							.comma_sep_break())
+					.indent())
+			.cat(softline())
+			.cat("}".text())
+			.group()
+
+
+private pure func dictionary_entry_document(entry: (Expression, Expression)) -> Doc:
+	entry.0
+		.expression_document()
+		.cat(" => ".text())
+		.cat(entry.1.expression_document())
+
+
+private pure func dictionary_entry_documents(entries: List[(Expression, Expression)]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for entry in entries:
+		documents = documents.append(entry.dictionary_entry_document())
+	documents
+
+
+private pure func string_documents(items: List[String]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for item in items:
+		documents = documents.append(item.text())
+	documents
+
+
+private pure func is_compound_assign_op(op: BinaryOp) -> Bool:
+	match op:
+		AddOp: True
+		SubOp: True
+		MulOp: True
+		DivOp: True
+		_: False
+
+
+private pure func compound_assign_text(op: BinaryOp) -> String:
+	match op:
+		AddOp: "+="
+		SubOp: "-="
+		MulOp: "*="
+		DivOp: "/="
+		_: "="
+
+
+private pure func assign_document(name: String, value: Expression) -> Doc:
+	match value:
+		BinaryExpression(op, IdentifierExpression(left_name), rhs):
+			if left_name == name and op.is_compound_assign_op():
+				name
+					.text()
+					.cat(" ".text())
+					.cat(op
+							.compound_assign_text()
+							.text())
+					.cat(" ".text())
+					.cat(rhs.expression_document())
+			else:
+				name
+					.text()
+					.cat(" = ".text())
+					.cat(value.expression_document())
+		_:
+			name
+				.text()
+				.cat(" = ".text())
+				.cat(value.expression_document())
+
+
+private pure func variable_declaration_document(
+	name: String,
+	is_mutable: Bool,
+	type_expression: Option[TypeExpression],
+	value: Expression,
+) -> Doc:
+	prefix: Doc = if is_mutable:
+		"var ".text()
+	else:
+		"".text()
+	type_document_part: Doc = match type_expression:
+		Some(type_expr): ": "
+			.text()
+			.cat(type_expr.type_document())
+		None: "".text()
+	prefix
+		.cat(name.text())
+		.cat(type_document_part)
+		.cat(" = ".text())
+		.cat(value.expression_document())
+
+
+private pure func question_bind_document(
+	name: String,
+	type_expression: Option[TypeExpression],
+	value: Expression,
+) -> Doc:
+	type_document_part: Doc = match type_expression:
+		Some(type_expr): ": "
+			.text()
+			.cat(type_expr.type_document())
+		None: "".text()
+	name
+		.text()
+		.cat(type_document_part)
+		.cat(" ?= ".text())
+		.cat(value.expression_document())
+
+
+private pure func block_expressions_document(exprs: List[Expression]) -> Doc:
+	exprs
+		.expression_document_list()
+		.hardlines()
+
+
+pure func is_block_expression(expr: Expression) -> Bool:
+	match expr:
+		BlockExpression(_): True
+		SpacedBlockExpression(_): True
+		ItemBlockExpression(_): True
+		_: False
+
+
+private pure func spaced_block_expressions_document(items: List[(Bool, Expression)]) -> Doc:
+	var result: Doc = "".text()
+	var first: Bool = True
+	for item in items:
+		item_document: Doc = item.1.expression_document()
+		if first:
+			result = item_document
+			first = False
+		else:
+			separator: Doc = if item.0:
+				hardline().cat(hardline())
+			else:
+				hardline()
+			result = result
+				.cat(separator)
+				.cat(item_document)
+	result
+
+
+private pure func block_separator(blank_before: Bool) -> Doc:
+	if blank_before:
+		hardline().cat(hardline())
+	else:
+		hardline()
+
+
+private pure func trailing_text_document(trailing: Option[String]) -> Doc:
+	match trailing:
+		Some(text_value): text_value.line_suffix()
+		None: "".text()
+
+
+private pure func block_item_document(item: BlockItem) -> Doc:
+	match item:
+		BlockCommentItem(_, text_value): text_value.text()
+		BlockExpressionItem(_, expr, trailing):
+			expr
+				.expression_document()
+				.cat(trailing.trailing_text_document())
+
+
+private pure func block_item_blank_before(item: BlockItem) -> Bool:
+	match item:
+		BlockCommentItem(blank_before, _): blank_before
+		BlockExpressionItem(blank_before, _, _): blank_before
+
+
+private pure func block_items_document(items: List[BlockItem]) -> Doc:
+	var result: Doc = "".text()
+	var first: Bool = True
+	for item in items:
+		item_document: Doc = item.block_item_document()
+		if first:
+			result = item_document
+			first = False
+		else:
+			result = result
+				.cat(item
+						.block_item_blank_before()
+						.block_separator())
+				.cat(item_document)
+	result
+
+
+pure func block_body_document(expr: Expression) -> Doc:
+	match expr:
+		BlockExpression(exprs): exprs.block_expressions_document()
+		SpacedBlockExpression(items): items.spaced_block_expressions_document()
+		ItemBlockExpression(items): items.block_items_document()
+		_: expr.expression_document()
+
+
+private pure func match_case_document(case_value: MatchCase) -> Doc:
+	match case_value:
+		MatchCaseData(pattern, body, trailing):
+			head: Doc = pattern
+				.pattern_document()
+				.cat(":".text())
+			match body:
+				BlockExpression(_):
+					head.cat(hardline()
+							.cat(body.block_body_document())
+							.indent())
+				SpacedBlockExpression(_):
+					head.cat(hardline()
+							.cat(body.block_body_document())
+							.indent())
+				ItemBlockExpression(_):
+					head.cat(hardline()
+							.cat(body.block_body_document())
+							.indent())
+				_: head
+					.cat(" ".text())
+					.cat(body.expression_document())
+					.cat(trailing.trailing_text_document())
+
+
+private pure func match_case_documents(cases: List[MatchCase]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for case_value in cases:
+		documents = documents.append(case_value.match_case_document())
+	documents
+
+
+pure func function_parameter_document(param: FunctionParameter) -> Doc:
+	match param:
+		NameParam(name): name.text()
+		TypedNameParam(name, type_expression):
+			name
+				.text()
+				.cat(": ".text())
+				.cat(type_expression.type_document())
+		PatternParam(pattern): pattern.pattern_document()
+		TypedPatternParam(pattern, type_expression):
+			pattern
+				.pattern_document()
+				.cat(": ".text())
+				.cat(type_expression.type_document())
+
+
+pure func function_parameter_documents(params: List[FunctionParameter]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for param in params:
+		documents = documents.append(param.function_parameter_document())
+	documents
+
+
+private pure func function_parameter_documents_with_commas(
+	params: List[FunctionParameter],
+) -> List[Doc]:
+	var documents: List[Doc] = []
+	for param in params:
+		documents = documents.append(param
+				.function_parameter_document()
+				.cat(",".text()))
+	documents
+
+
+private pure func function_parameter_flat_length(param: FunctionParameter) -> Int:
+	1000
+		.layout(param.function_parameter_document())
+		.trim_right()
+		.length()
+
+
+private pure func function_parameter_contains_function_type(param: FunctionParameter) -> Bool:
+	match param:
+		TypedNameParam(_, type_expression): type_expression.type_expression_contains_function()
+		TypedPatternParam(_, type_expression): type_expression.type_expression_contains_function()
+		_: False
+
+
+private pure func function_parameters_contain_function_type(
+	params: List[FunctionParameter],
+) -> Bool:
+	var contains: Bool = False
+	for param in params:
+		if param.function_parameter_contains_function_type():
+			contains = True
+	contains
+
+
+private pure func should_force_multiline_parameters(params: List[FunctionParameter]) -> Bool:
+	if params.length() > 1 and params.function_parameters_contain_function_type():
+		True
+	else if params.length() <= 3:
+		False
+	else:
+		var should_force: Bool = False
+		for param in params:
+			if param.function_parameter_flat_length() > 12:
+				should_force = True
+		should_force
+
+
+private pure func multiline_function_parameters_document(params: List[FunctionParameter]) -> Doc:
+	match params:
+		[]: "()".text()
+		_:
+			"("
+				.text()
+				.cat(hardline()
+						.cat(params
+								.function_parameter_documents_with_commas()
+								.hardlines())
+						.indent())
+				.cat(hardline())
+				.cat(")".text())
+
+
+private pure func grouped_function_parameters_document(params: List[FunctionParameter]) -> Doc:
+	"("
+		.text()
+		.cat(softline()
+				.cat(params
+						.function_parameter_documents()
+						.comma_sep_break())
+				.indent())
+		.cat(softline())
+		.cat(")".text())
+		.group()
+
+
+pure func function_parameters_document(params: List[FunctionParameter]) -> Doc:
+	if params.should_force_multiline_parameters():
+		params.multiline_function_parameters_document()
+	else:
+		params.grouped_function_parameters_document()
+
+
+private pure func type_params_document(params: List[String]) -> Doc:
+	if params.length() == 0:
+		"".text()
+	else:
+		"["
+			.text()
+			.cat(params
+					.string_documents()
+					.comma_sep())
+			.cat("]".text())
+
+
+private pure func return_type_document(return_type: Option[TypeExpression]) -> Doc:
+	match return_type:
+		Some(type_expression): " -> "
+			.text()
+			.cat(type_expression.type_document())
+		None: "".text()
+
+
+private pure func where_constraints_document(constraints: List[TypeConstraint]) -> Doc:
+	if constraints.length() == 0:
+		"".text()
+	else:
+		" where "
+			.text()
+			.cat(constraints
+					.type_constraint_documents()
+					.comma_sep())
+
+
+private pure func lambda_document(
+	is_pure: Bool,
+	params: List[FunctionParameter],
+	return_type: Option[TypeExpression],
+	body: Expression,
+) -> Doc:
+	prefix: Doc = if is_pure:
+		"pure ".text()
+	else:
+		"".text()
+	head: Doc = prefix
+		.cat("func".text())
+		.cat(params.function_parameters_document())
+		.cat(return_type.return_type_document())
+	match body:
+		BlockExpression(_):
+			head
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_document())
+						.indent())
+		SpacedBlockExpression(_):
+			head
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_document())
+						.indent())
+		ItemBlockExpression(_):
+			head
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_document())
+						.indent())
+		_:
+			head
+				.cat(": ".text())
+				.cat(body.expression_document())
+
+
+private pure func function_declaration_document(
+	name: String,
+	is_pure: Bool,
+	type_params: List[String],
+	params: List[FunctionParameter],
+	return_type: Option[TypeExpression],
+	where_constraints: List[TypeConstraint],
+	body: Expression,
+) -> Doc:
+	prefix: Doc = if is_pure:
+		"pure ".text()
+	else:
+		"".text()
+	prefix
+		.cat("func ".text())
+		.cat(name.text())
+		.cat(type_params.type_params_document())
+		.cat(params.function_parameters_document())
+		.cat(return_type.return_type_document())
+		.cat(where_constraints.where_constraints_document())
+		.cat(":".text())
+		.cat(hardline()
+				.cat(body.block_body_document())
+				.indent())
+
+
+private pure func concurrent_params_document(
+	timeout: Option[Expression],
+	max_threads: Option[Int],
+) -> Doc:
+	match max_threads:
+		Some(thread_count):
+			match timeout:
+				Some(timeout_expr):
+					"(max_threads: "
+						.text()
+						.cat(thread_count
+								.to_string()
+								.text())
+						.cat(", timeout: ".text())
+						.cat(timeout_expr.expression_document())
+						.cat(")".text())
+				None:
+					("(max_threads: " + thread_count.to_string() + ")").text()
+		None:
+			match timeout:
+				Some(timeout_expr):
+					"(timeout: "
+						.text()
+						.cat(timeout_expr.expression_document())
+						.cat(")".text())
+				None: "".text()
+
+
+private pure func concurrent_bind_document(
+	name: String,
+	type_expression: Option[TypeExpression],
+	value: Expression,
+) -> Doc:
+	ty_document: Doc = match type_expression:
+		Some(type_expr):
+			": "
+				.text()
+				.cat(type_expr.type_document())
+		None: "".text()
+	name
+		.text()
+		.cat(ty_document)
+		.cat(" = ".text())
+		.cat(value.expression_document())
+
+
+private pure func with_type_suffix_document(type_expression: Option[TypeExpression]) -> Doc:
+	match type_expression:
+		Some(type_expr):
+			": "
+				.text()
+				.cat(type_expr.type_document())
+		None: "".text()
+
+
+private pure func with_operator_document(is_try: Bool) -> Doc:
+	if is_try:
+		" ?= ".text()
+	else:
+		" = ".text()
+
+
+private pure func with_expression_document(
+	name: String,
+	type_expression: Option[TypeExpression],
+	is_try: Bool,
+	value: Expression,
+	body: Expression,
+) -> Doc:
+	"with "
+		.text()
+		.cat(name.text())
+		.cat(type_expression.with_type_suffix_document())
+		.cat(is_try.with_operator_document())
+		.cat(value.expression_document())
+		.cat(":".text())
+		.cat(hardline()
+				.cat(body.block_body_document())
+				.indent())
+
+
+private pure func string_interpolation_part_document(
+	part: StringInterpolationPart,
+	is_triple: Bool,
+) -> Doc:
+	match part:
+		StringInterpolationTextPart(value):
+			escaped: String = if is_triple:
+				value.escape_triple_string_value()
+			else:
+				value.escape_string_value()
+			escaped.text()
+		StringInterpolationExpressionPart(value):
+			"$"
+				.text()
+				.cat("{".text())
+				.cat(value.expression_document())
+				.cat("}".text())
+
+
+private pure func string_interpolation_part_documents(
+	parts: List[StringInterpolationPart],
+	is_triple: Bool,
+) -> List[Doc]:
+	var documents: List[Doc] = []
+	for part in parts:
+		documents = documents.append(part.string_interpolation_part_document(is_triple))
+	documents
+
+
+private pure func string_interpolation_document(
+	parts: List[StringInterpolationPart],
+	is_triple: Bool,
+) -> Doc:
+	quote: String = if is_triple:
+		"\"\"\""
+	else:
+		"\""
+	quote
+		.text()
+		.cat(parts
+				.string_interpolation_part_documents(is_triple)
+				.concat_documents())
+		.cat(quote.text())
+
+
+pure func expression_document(expr: Expression) -> Doc:
+	match expr:
+		IdentifierExpression(name): name.text()
+		LiteralExpression(lit): lit.literal_document()
+		VoidExpression: "void".text()
+		BreakExpression: "break".text()
+		ContinueExpression: "continue".text()
+		BuiltinExpression: "builtin".text()
+		BuiltinRuntimeExpression(name): ("builtin(\"" + name.escape_string_value() + "\")").text()
+		FieldAccessExpression(receiver, field_name):
+			receiver_document: Doc = if receiver.needs_field_receiver_parens():
+				receiver
+					.expression_document()
+					.parens()
+			else:
+				receiver.expression_document()
+			receiver_document
+				.cat(".".text())
+				.cat(field_name.text())
+		CallExpression(callee, args):
+			match callee.ufcs_chain_document(args):
+				Some(chain_document): chain_document
+				None:
+					if args.expression_list_has_inline_lambda():
+						callee.inline_lambda_call_document(args)
+					else:
+						callee
+							.expression_document()
+							.cat(args.call_arguments_document())
+		UnaryExpression(op, inner):
+			inner_document: Doc = match inner:
+				BinaryExpression(_, _, _): inner
+					.expression_document()
+					.parens()
+				LogicalExpression(_, _, _): inner
+					.expression_document()
+					.parens()
+				UnaryExpression(NegOp, _):
+					if op == NegOp:
+						inner
+							.expression_document()
+							.parens()
+					else:
+						inner.expression_document()
+				LiteralExpression(IntLiteral(raw)):
+					if op == NegOp and raw.starts_with("-"):
+						inner
+							.expression_document()
+							.parens()
+					else:
+						inner.expression_document()
+				LiteralExpression(FloatLiteral(raw)):
+					if op == NegOp and raw.starts_with("-"):
+						inner
+							.expression_document()
+							.parens()
+					else:
+						inner.expression_document()
+				_: inner.expression_document()
+			op
+				.unary_text()
+				.text()
+				.cat(inner_document)
+		BinaryExpression(op, left, right):
+			prec: Int = op.binary_prec()
+			left_document: Doc = if left.expression_precedence() < prec:
+				left
+					.expression_document()
+					.parens()
+			else:
+				left.expression_document()
+			right_document: Doc = if right.expression_precedence() <= prec:
+				right
+					.expression_document()
+					.parens()
+			else:
+				right.expression_document()
+			left_document
+				.cat(" ".text())
+				.cat(op
+						.binary_text()
+						.text())
+				.cat(" ".text())
+				.cat(right_document)
+		LogicalExpression(op, left, right):
+			prec: Int = op.logical_prec()
+			left_document: Doc = if left.expression_precedence() < prec:
+				left
+					.expression_document()
+					.parens()
+			else:
+				left.expression_document()
+			right_document: Doc = if right.expression_precedence() <= prec:
+				right
+					.expression_document()
+					.parens()
+			else:
+				right.expression_document()
+			separator: Doc = if left.logical_left_ends_with_block():
+				hardline()
+			else:
+				" ".text()
+			left_document
+				.cat(separator)
+				.cat(op
+						.logical_text()
+						.text())
+				.cat(" ".text())
+				.cat(right_document)
+		TupleExpression(elems): elems.tuple_expression_document()
+		ListExpression(elems): bracketed_expression_document("[", "]", elems)
+		VectorExpression(elems): elems.vector_literal_document()
+		RecordExpression(fields): fields.record_expression_document()
+		RecordUpdateExpression(base, fields):
+			"{ "
+				.text()
+				.cat(base.expression_document())
+				.cat(" | ".text())
+				.cat(fields
+						.record_field_documents()
+						.comma_sep_break())
+				.cat(" }".text())
+				.group()
+		AscriptionExpression(inner, type_expression):
+			inner_document: Doc = match inner:
+				AscriptionExpression(_, _): inner
+					.expression_document()
+					.parens()
+				_: inner.expression_document()
+			inner_document
+				.cat(" as ".text())
+				.cat(type_expression.type_document())
+		RangeExpression(left, right):
+			left
+				.expression_document()
+				.cat("..".text())
+				.cat(right.expression_document())
+		SubscriptExpression(target, index):
+			target
+				.expression_document()
+				.cat("[".text())
+				.cat(index.expression_document())
+				.cat("]".text())
+		MultiSubscriptExpression(target, indices):
+			target
+				.expression_document()
+				.cat("[".text())
+				.cat(indices
+						.expression_document_list()
+						.comma_sep())
+				.cat("]".text())
+		DictionaryExpression(entries):
+			"{"
+				.text()
+				.cat(entries
+						.dictionary_entry_documents()
+						.comma_sep())
+				.cat("}".text())
+		AssignmentExpression(name, value): assign_document(name, value)
+		VariableDeclarationExpression(name, is_mutable, value): variable_declaration_document(
+			name,
+			is_mutable,
+			None,
+			value,
+		)
+		TypedVariableDeclarationExpression(name, is_mutable, type_expression, value): variable_declaration_document(
+			name,
+			is_mutable,
+			Some(type_expression),
+			value,
+		)
+		TupleDestructureExpression(names, value):
+			"("
+				.text()
+				.cat(names
+						.string_documents()
+						.comma_sep())
+				.cat(") = ".text())
+				.cat(value.expression_document())
+		SubscriptAssignmentExpression(target, indices, value):
+			target
+				.expression_document()
+				.cat("[".text())
+				.cat(indices
+						.expression_document_list()
+						.comma_sep())
+				.cat("] = ".text())
+				.cat(value.expression_document())
+		QuestionBindExpression(name, value): question_bind_document(name, None, value)
+		TypedQuestionBindExpression(name, type_expression, value): question_bind_document(
+			name,
+			Some(type_expression),
+			value,
+		)
+		BlockExpression(exprs): exprs.block_expressions_document()
+		SpacedBlockExpression(items): items.spaced_block_expressions_document()
+		ItemBlockExpression(items): items.block_items_document()
+		IfExpression(cond, then_expr):
+			"if "
+				.text()
+				.cat(cond.expression_document())
+				.cat(":".text())
+				.cat(hardline()
+						.cat(then_expr.block_body_document())
+						.indent())
+		IfElseExpression(cond, then_expr, else_expr):
+			if_document: Doc = "if "
+				.text()
+				.cat(cond.expression_document())
+				.cat(":".text())
+				.cat(hardline()
+						.cat(then_expr.block_body_document())
+						.indent())
+			match else_expr:
+				IfExpression(_, _):
+					if_document
+						.cat(hardline())
+						.cat("else ".text())
+						.cat(else_expr.expression_document())
+				IfElseExpression(_, _, _):
+					if_document
+						.cat(hardline())
+						.cat("else ".text())
+						.cat(else_expr.expression_document())
+				_:
+					if_document
+						.cat(hardline())
+						.cat("else:".text())
+						.cat(hardline()
+								.cat(else_expr.block_body_document())
+								.indent())
+		MatchExpression(scrutinee, cases):
+			"match "
+				.text()
+				.cat(scrutinee.expression_document())
+				.cat(":".text())
+				.cat(hardline()
+						.cat(cases
+								.match_case_documents()
+								.hardlines())
+						.indent())
+		WhileExpression(cond, body):
+			"while "
+				.text()
+				.cat(cond.expression_document())
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_document())
+						.indent())
+		ForExpression(name, iter, body):
+			"for "
+				.text()
+				.cat(name.text())
+				.cat(" in ".text())
+				.cat(iter.expression_document())
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_document())
+						.indent())
+		TupleForExpression(names, iter, body):
+			"for ("
+				.text()
+				.cat(names
+						.string_documents()
+						.comma_sep())
+				.cat(") in ".text())
+				.cat(iter.expression_document())
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_document())
+						.indent())
+		WithExpression(name, type_expression, is_try, value, body): with_expression_document(
+			name,
+			type_expression,
+			is_try,
+			value,
+			body,
+		)
+		LambdaExpression(is_pure, params, body): lambda_document(is_pure, params, None, body)
+		TypedLambdaExpression(is_pure, params, return_type, body): lambda_document(
+			is_pure,
+			params,
+			Some(return_type),
+			body,
+		)
+		FunctionDeclarationExpression(name, is_pure, type_params, params, where_constraints, body): function_declaration_document(
+			name,
+			is_pure,
+			type_params,
+			params,
+			None,
+			where_constraints,
+			body,
+		)
+		TypedFunctionDeclarationExpression(name, is_pure, type_params, params, return_type, where_constraints, body): function_declaration_document(
+			name,
+			is_pure,
+			type_params,
+			params,
+			Some(return_type),
+			where_constraints,
+			body,
+		)
+		StringInterpolationExpression(parts, is_triple): string_interpolation_document(
+			parts,
+			is_triple,
+		)
+		DebugBlockExpression(body):
+			"debug:"
+				.text()
+				.cat(hardline()
+						.cat(body.block_body_document())
+						.indent())
+		ConcurrentExpression(bindings, timeout, max_threads):
+			"concurrent"
+				.text()
+				.cat(concurrent_params_document(timeout, max_threads))
+				.cat(":".text())
+				.cat(hardline()
+						.cat(bindings.block_expressions_document())
+						.indent())
+		ConcurrentBindExpression(name, type_expression, value): concurrent_bind_document(
+			name,
+			type_expression,
+			value,
+		)
+		DetachExpression(body):
+			"detach "
+				.text()
+				.cat(body.expression_document())
+		ConcurrentForExpression(var_name, iter, body, timeout, max_threads):
+			"concurrent"
+				.text()
+				.cat(concurrent_params_document(timeout, max_threads))
+				.cat(" for ".text())
+				.cat(var_name.text())
+				.cat(" in ".text())
+				.cat(iter.expression_document())
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_document())
+						.indent())
+
+
+pure func render_expression_json(width: Int, input: String) -> Result[String, String]:
+	expr ?= input.expression_from_json_string()
+	Ok(width.layout(expr.expression_document()))

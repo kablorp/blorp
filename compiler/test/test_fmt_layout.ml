@@ -1,28 +1,15 @@
 (** Unit tests for the OCaml formatter layout engine.
 
-    These intentionally mirror [tests/test_blorp/tools/test_fmt_layout.brp] so
+    These intentionally mirror [tests/test_blorp/tools/test_document_layout.brp] so
     the OCaml and Blorp layout implementations stay pinned to the same visible
     behavior while the formatter is split across phases. *)
 
 module Doc = Blorp.Fmt_doc
 module DocJson = Blorp.Fmt_doc_json
-module Fmt = Blorp.Fmt
 module Layout = Blorp.Fmt_layout
 
 let ( ^^ ) = Doc.( ^^ )
 let check_string msg = Alcotest.(check string) msg
-let check_bool msg = Alcotest.(check bool) msg
-
-let contains_string haystack needle =
-  let haystack_len = String.length haystack in
-  let needle_len = String.length needle in
-  if needle_len = 0 then true
-  else
-    let rec loop i =
-      i + needle_len <= haystack_len
-      && (String.sub haystack i needle_len = needle || loop (i + 1))
-    in
-    loop 0
 
 let call_doc =
   Doc.group
@@ -61,8 +48,12 @@ let test_line_suffix_flushes_before_newline () =
   check_string "line suffix" "x -- comment\ny\n" (Layout.layout ~width:100 doc)
 
 let test_post_process_trims_and_collapses_blank_lines () =
-  check_string "post process" "a\n\n\nb\n\n"
+  check_string "post process" "a\n\n\nb\n"
     (Layout.post_process "a  \n\n\n\nb\t\n\n")
+
+let test_empty_document_stays_empty () =
+  check_string "empty layout" "" (Layout.layout ~width:100 Doc.Nil);
+  check_string "blank post process" "" (Layout.post_process "\n\n")
 
 let test_doc_json_serializes_layout_boundary () =
   let doc =
@@ -78,16 +69,6 @@ let test_doc_json_escapes_utf8_as_codepoints () =
     "{\"tag\":\"Text\",\"text\":\"dash \\u2014 grin \\ud83d\\ude00\"}"
     (DocJson.to_json (Doc.text text))
 
-let test_format_doc_json_string_exposes_formatter_doc () =
-  let source =
-    "func main(args: List[String]) -> Int:\n\tprint(\"hi\")\n\t0\n"
-  in
-  match Fmt.format_doc_json_string source with
-  | Error msg -> Alcotest.fail msg
-  | Ok json ->
-      check_bool "has doc tags" true (contains_string json "\"tag\":");
-      check_bool "has source text" true (contains_string json "\"func")
-
 let suite =
   [
     ( "layout",
@@ -102,11 +83,11 @@ let suite =
           test_line_suffix_flushes_before_newline;
         Alcotest.test_case "post process trims and collapses blank lines" `Quick
           test_post_process_trims_and_collapses_blank_lines;
+        Alcotest.test_case "empty document stays empty" `Quick
+          test_empty_document_stays_empty;
         Alcotest.test_case "Doc JSON serializes layout boundary" `Quick
           test_doc_json_serializes_layout_boundary;
         Alcotest.test_case "Doc JSON escapes UTF-8 as codepoints" `Quick
           test_doc_json_escapes_utf8_as_codepoints;
-        Alcotest.test_case "format_doc_json_string exposes formatter Doc" `Quick
-          test_format_doc_json_string_exposes_formatter_doc;
       ] );
   ]

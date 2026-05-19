@@ -57,6 +57,18 @@ let import_to_json imp =
 let type_params_to_json params =
   string_array (List.map Ast.type_param_to_parser_string params)
 
+let dim_constraint_to_json (left, right) =
+  obj
+    [
+      field "left" (Fmt_expr_json.type_expr_to_json left);
+      field "right" (Fmt_expr_json.type_expr_to_json right);
+    ]
+
+let dim_constraints_field constraints =
+  match constraints with
+  | [] -> []
+  | _ -> [ field "where" (array (List.map dim_constraint_to_json constraints)) ]
+
 let variant_to_json variant =
   obj
     [
@@ -188,7 +200,8 @@ let func_to_json ~is_private func =
            @ body_fields
            @ optional_field "return"
                (Option.map Fmt_expr_json.type_expr_to_json
-                  func.Ast.func_return_type)))
+                  func.Ast.func_return_type)
+           @ dim_constraints_field func.Ast.func_dim_constraints))
 
 let trait_method_to_json method_decl =
   match
@@ -255,7 +268,8 @@ let impl_method_to_json func =
            @ body_fields
            @ optional_field "return"
                (Option.map Fmt_expr_json.type_expr_to_json
-                  func.Ast.func_return_type)))
+                  func.Ast.func_return_type)
+           @ dim_constraints_field func.Ast.func_dim_constraints))
 
 let impl_to_json ~is_private impl_decl =
   match
@@ -349,52 +363,77 @@ and decl_desc_source_end_line = function
         0 impl_decl.Ast.impl_methods
   | Ast.DImport _ | Ast.DType _ | Ast.DRecord _ | Ast.DTypeAlias _ -> 0
 
-let located_decl_to_json decl decl_json =
+let capped_decl_source_end_line ?next_decl decl =
+  let end_line = decl_source_end_line decl in
+  let capped =
+    match next_decl with
+    | Some next -> min end_line (next.Ast.decl_loc.line - 1)
+    | None -> end_line
+  in
+  max decl.Ast.decl_loc.line capped
+
+let located_decl_to_json ?next_decl decl decl_json =
   obj
     [
       field "line" (string_of_int decl.Ast.decl_loc.line);
       field "column" (string_of_int decl.Ast.decl_loc.column);
-      field "end_line" (string_of_int (decl_source_end_line decl));
+      field "end_line"
+        (string_of_int (capped_decl_source_end_line ?next_decl decl));
       field "decl" decl_json;
     ]
 
-let decl_body_comments comments decl =
+let decl_body_comments comments decl end_line =
   let start_line = decl.Ast.decl_loc.line in
-  let end_line = decl_source_end_line decl in
   List.filter
     (fun comment ->
       comment.Lexer.cc_line > start_line && comment.Lexer.cc_line <= end_line)
     comments
 
-let program_supported ~comments:_ program = program <> []
-
 let program_to_json ~comments program =
-  if not (program_supported ~comments program) then None
-  else
-    Option.map array
-      (Fmt_expr_json.option_map_all
-         (fun decl ->
-           Fmt_expr_json.with_comments (decl_body_comments comments decl)
-             (fun () ->
-               Option.map (located_decl_to_json decl) (decl_to_json decl)))
-         program)
+  let rec loop acc = function
+    | [] -> Some (array (List.rev acc))
+    | decl :: rest -> (
+        let next_decl = match rest with next :: _ -> Some next | [] -> None in
+        let end_line = capped_decl_source_end_line ?next_decl decl in
+        match
+          Fmt_expr_json.with_comments
+            (decl_body_comments comments decl end_line) (fun () ->
+              Option.map
+                (located_decl_to_json ?next_decl decl)
+                (decl_to_json decl))
+        with
+        | Some decl_json -> loop (decl_json :: acc) rest
+        | None -> None)
+  in
+  loop [] program
 
 let program_expected_layout ~comments program =
   Printer.comments := Fmt_comment.create comments;
   Layout.layout (Printer.print_program program)
 
-let program_case_json ~comments program =
+let program_json_fields ~comments program =
   Option.map
     (fun program_json ->
-      obj
-        [
-          field "line" "0";
-          field "column" "0";
-          field "expected" (string (program_expected_layout ~comments program));
-          field "comments" (array (List.map comment_to_json comments));
-          field "program" program_json;
-        ])
+      [
+        field "comments" (array (List.map comment_to_json comments));
+        field "program" program_json;
+      ])
     (program_to_json ~comments program)
+
+let program_json ~comments program =
+  Option.map obj (program_json_fields ~comments program)
+
+let program_case_json ~comments program =
+  Option.map
+    (fun fields ->
+      obj
+        ([
+           field "line" "0";
+           field "column" "0";
+           field "expected" (string (program_expected_layout ~comments program));
+         ]
+        @ fields))
+    (program_json_fields ~comments program)
 
 let collect_decl_cases program =
   let rec loop acc = function

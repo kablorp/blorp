@@ -1,6 +1,6 @@
 (** Unit tests for declaration-formatting parity JSON.
 
-    These mirror [tests/test_blorp/tools/test_fmt_decl_doc.brp] so the OCaml
+    These mirror [tests/test_blorp/tools/test_declaration_documents.brp] so the OCaml
     formatter printer and the Blorp declaration-doc printer stay pinned to the
     same visible syntax while declaration formatting is ported in slices. *)
 

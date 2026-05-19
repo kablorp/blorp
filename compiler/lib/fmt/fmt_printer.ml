@@ -79,11 +79,12 @@ let rec expr_source_end_line e =
   | EFieldAccess (inner, _)
   | EDetach inner ->
       max base (expr_source_end_line inner)
-  | EBinary (_, left, right)
-  | ELogical (_, left, right)
-  | ERange (left, right)
-  | ESubscript (left, right) ->
+  | EBinary (_, left, right) | ERange (left, right) | ESubscript (left, right)
+    ->
       max base (max (expr_source_end_line left) (expr_source_end_line right))
+  | ELogical (_, left, right) ->
+      max e.expr_loc.line
+        (max (expr_source_end_line left) (expr_source_end_line right))
   | ECall (callee, args) ->
       max_exprs (max base (expr_source_end_line callee)) args
   | EIf (cond, then_expr, else_expr) ->
@@ -533,9 +534,7 @@ and print_chain_call_args args =
         | { expr_desc = ELambda fd; _ } :: _ -> func_body_has_block fd.func_body
         | _ -> false
       in
-      if has_trailing_block_lambda then (
-        let prev = !force_flat in
-        force_flat := true;
+      if has_trailing_block_lambda then
         let rev = List.rev args in
         let last = List.hd rev in
         let leading = List.rev (List.tl rev) in
@@ -547,8 +546,7 @@ and print_chain_call_args args =
         let doc =
           text "(" ^^ leading_part ^^ print_expr last ^^ hardline ^^ text ")"
         in
-        force_flat := prev;
-        doc)
+        doc
       else if List.exists expr_is_non_lambda_block args then
         let last_idx = List.length args - 1 in
         let arg_docs =
@@ -701,9 +699,7 @@ and print_expr_desc = function
                 func_body_has_block fd.func_body
             | _ -> false
           in
-          if has_trailing_block_lambda then (
-            let prev = !force_flat in
-            force_flat := true;
+          if has_trailing_block_lambda then
             let rev = List.rev args in
             let last = List.hd rev in
             let leading = List.rev (List.tl rev) in
@@ -716,8 +712,7 @@ and print_expr_desc = function
               print_expr func_e ^^ text "(" ^^ leading_part ^^ print_expr last
               ^^ hardline ^^ text ")"
             in
-            force_flat := prev;
-            doc)
+            doc
           else if List.exists is_lambda args then
             (* Lambda args with block bodies need special handling — put trailing
            args on separate lines. Inline lambdas use normal group-based breaking
