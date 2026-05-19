@@ -3,7 +3,15 @@
     Fully opinionated, zero-configuration formatter for .brp source files. *)
 
 val format_string : string -> (string, string) result
-(** Format a source string. Returns the formatted source. *)
+(** Format a source string through the Blorp renderer. Returns the formatted
+    source. *)
+
+val format_program_with_comments :
+  comments:Lexer.collected_comment list ->
+  Ast.program ->
+  (string, string) result
+(** Format an already-mutated AST through the Blorp renderer using comments
+    collected from the original source. *)
 
 val format_expr_cases_json_lines_string : string -> (string, string) result
 (** Parse a source string and return expression-formatting parity cases as

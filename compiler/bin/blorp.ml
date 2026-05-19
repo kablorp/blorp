@@ -398,25 +398,28 @@ let purify_file ?(dry_run = false) ?(verbose = false) filename =
                   | _ -> decl
                 in
                 let new_program = List.map purify_decl source_program in
-                let formatted =
-                  Fmt_printer.with_comment_store comments (fun () ->
-                      let doc = Fmt_printer.print_program new_program in
-                      Fmt_layout.layout doc)
-                in
                 match
-                  Pipeline.typecheck_module_only_typed ~filename
-                    ~source:formatted
+                  Fmt.format_program_with_comments ~comments new_program
                 with
-                | Error errors ->
-                    prerr_endline (format_pipeline_errors ~file:filename errors);
+                | Error msg ->
+                    prerr_endline msg;
                     -1
-                | Ok _ ->
-                    let oc = open_out filename in
-                    output_string oc formatted;
-                    close_out oc;
-                    Printf.printf "Purified %d function(s) in %s\n"
-                      (List.length names) filename;
-                    List.length names)))
+                | Ok formatted -> (
+                    match
+                      Pipeline.typecheck_module_only_typed ~filename
+                        ~source:formatted
+                    with
+                    | Error errors ->
+                        prerr_endline
+                          (format_pipeline_errors ~file:filename errors);
+                        -1
+                    | Ok _ ->
+                        let oc = open_out filename in
+                        output_string oc formatted;
+                        close_out oc;
+                        Printf.printf "Purified %d function(s) in %s\n"
+                          (List.length names) filename;
+                        List.length names))))
 
 type compile_opts = {
   no_emit : bool;

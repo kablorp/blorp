@@ -1,6 +1,7 @@
-(** Blorp code formatter — orchestrates the formatting pipeline.
+(** Blorp code formatter orchestration.
 
-    Pipeline: source -> lex (collect comments) -> parse -> AST-to-doc -> layout -> post-process *)
+    OCaml owns parsing/comment collection and emits formatter JSON. The Blorp
+    formatter tool owns source rendering. *)
 
 (* ===== Format cache ===== *)
 
@@ -44,44 +45,25 @@ let mark_cached_formatted source =
 
 (* ===== Formatter ===== *)
 
-let doc_for_source source =
-  match Modules.parse_source ~hoist_nested:false source with
-  | Error { message; loc; _ } ->
-      Error
-        (Printf.sprintf "%s at line %d, column %d" message loc.Ast.line
-           loc.Ast.column)
-  | Ok program -> (
-      try
-        let collected_comments = Lexer.get_comments () in
-        (* Set up comment store for the printer *)
-        Fmt_printer.comments := Fmt_comment.create collected_comments;
-        (* Convert AST to document IR *)
-        let doc = Fmt_printer.print_program program in
-        Ok doc
-      with
-      | Failure msg -> Error (Printf.sprintf "Formatter error: %s" msg)
-      | Invalid_argument msg -> Error (Printf.sprintf "Formatter error: %s" msg)
-      | Not_found -> Error "Formatter error: internal lookup failed")
-
-(** Format a source string. Returns the formatted source or an error. *)
-let format_string source =
-  match doc_for_source source with
-  | Error msg -> Error msg
-  | Ok doc ->
-      (* Layout and post-process *)
-      Ok (Fmt_layout.layout doc)
-
 let parse_error_message { Ast.message; loc; _ } =
   Printf.sprintf "%s at line %d, column %d" message loc.Ast.line loc.Ast.column
+
+let with_formatter_errors f =
+  try f () with
+  | Failure msg -> Error (Printf.sprintf "Formatter error: %s" msg)
+  | Invalid_argument msg -> Error (Printf.sprintf "Formatter error: %s" msg)
+  | Not_found -> Error "Formatter error: internal lookup failed"
 
 let with_parsed_source source f =
   match Modules.parse_source ~hoist_nested:false source with
   | Error err -> Error (parse_error_message err)
-  | Ok program -> (
-      try f program with
-      | Failure msg -> Error (Printf.sprintf "Formatter error: %s" msg)
-      | Invalid_argument msg -> Error (Printf.sprintf "Formatter error: %s" msg)
-      | Not_found -> Error "Formatter error: internal lookup failed")
+  | Ok program -> with_formatter_errors (fun () -> f program)
+
+let program_json_for_program ~comments program =
+  with_formatter_errors (fun () ->
+      match Fmt_decl_json.program_json ~comments program with
+      | Some json -> Ok json
+      | None -> Error "Formatter error: program contains unsupported syntax")
 
 let format_expr_cases_json_lines_string source =
   with_parsed_source source (fun program ->
@@ -95,9 +77,7 @@ let format_decl_cases_json_lines_string source =
 let format_program_json_string source =
   with_parsed_source source (fun program ->
       let collected_comments = Lexer.get_comments () in
-      match Fmt_decl_json.program_json ~comments:collected_comments program with
-      | Some json -> Ok json
-      | None -> Error "Formatter error: program contains unsupported syntax")
+      program_json_for_program ~comments:collected_comments program)
 
 let format_program_json_file filename =
   try
@@ -183,22 +163,29 @@ let with_temp_dir prefix f =
   Fun.protect ~finally:(fun () -> cleanup_temp_dir marker) (fun () -> f marker)
 
 let sleep_seconds seconds = ignore (Unix.select [] [] [] seconds)
+let formatter_tool_name = "tools/formatter/formatter.brp"
+
+let absolute_dir dir =
+  if Filename.is_relative dir then Filename.concat (Sys.getcwd ()) dir else dir
+
+let rec find_formatter_tool_from dir =
+  let candidate = Filename.concat dir formatter_tool_name in
+  if Sys.file_exists candidate then Some candidate
+  else
+    let parent = Filename.dirname dir in
+    if parent = dir then None else find_formatter_tool_from parent
 
 let formatter_tool_path () =
-  let cwd_path =
-    Filename.concat (Sys.getcwd ()) "tools/formatter/formatter.brp"
+  let search_roots =
+    [ Sys.getcwd (); Filename.dirname Sys.executable_name ]
+    |> List.map absolute_dir
   in
-  if Sys.file_exists cwd_path then Ok cwd_path
-  else
-    let exe_dir = Filename.dirname Sys.executable_name in
-    let exe_relative =
-      Filename.concat exe_dir "tools/formatter/formatter.brp"
-    in
-    if Sys.file_exists exe_relative then Ok exe_relative
-    else
+  match List.find_map find_formatter_tool_from search_roots with
+  | Some path -> Ok path
+  | None ->
       Error
         (Printf.sprintf "Formatter error: Blorp formatter tool not found at %s"
-           cwd_path)
+           (Filename.concat (Sys.getcwd ()) formatter_tool_name))
 
 let formatter_source_files formatter_tool =
   let dir = Filename.dirname formatter_tool in
@@ -294,34 +281,36 @@ let formatter_cc_args include_dirs precompiled link_flags =
       link_flags
 
 let compile_formatter_binary formatter_tool bin_path =
-  let temp_bin = Printf.sprintf "%s.%d.tmp" bin_path (Unix.getpid ()) in
-  remove_file_noerr temp_bin;
-  Fun.protect
-    ~finally:(fun () -> remove_file_noerr temp_bin)
-    (fun () ->
-      let source = Modules.read_file formatter_tool in
-      let precompiled = Test_runner.precompile_runtime ~opt:"O2" () in
-      let embed_runtime = Option.is_none precompiled in
-      match
-        Pipeline.compile ~embed_runtime ~filename:formatter_tool ~source ()
-      with
-      | Error errors ->
-          Error (Diagnostics.format_errors ~file:formatter_tool errors)
-      | Ok (Pipeline.Stopped_at _) ->
-          Error "Formatter error: formatter compilation stopped unexpectedly"
-      | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
-          let cc_result, cc_output =
-            Test_runner.compile_c_from_stdin c_code temp_bin
-              (formatter_cc_args include_dirs precompiled link_flags)
-          in
-          if cc_result <> 0 then
-            Error
-              ("Formatter error: failed to compile Blorp formatter\n"
-             ^ String.trim cc_output)
-          else begin
-            Sys.rename temp_bin bin_path;
-            Ok bin_path
-          end)
+  Test_runner.with_run_artifacts (fun () ->
+      let temp_bin = Printf.sprintf "%s.%d.tmp" bin_path (Unix.getpid ()) in
+      remove_file_noerr temp_bin;
+      Fun.protect
+        ~finally:(fun () -> remove_file_noerr temp_bin)
+        (fun () ->
+          let source = Modules.read_file formatter_tool in
+          let precompiled = Test_runner.precompile_runtime ~opt:"O2" () in
+          let embed_runtime = Option.is_none precompiled in
+          match
+            Pipeline.compile ~embed_runtime ~filename:formatter_tool ~source ()
+          with
+          | Error errors ->
+              Error (Diagnostics.format_errors ~file:formatter_tool errors)
+          | Ok (Pipeline.Stopped_at _) ->
+              Error
+                "Formatter error: formatter compilation stopped unexpectedly"
+          | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
+              let cc_result, cc_output =
+                Test_runner.compile_c_from_stdin c_code temp_bin
+                  (formatter_cc_args include_dirs precompiled link_flags)
+              in
+              if cc_result <> 0 then
+                Error
+                  ("Formatter error: failed to compile Blorp formatter\n"
+                 ^ String.trim cc_output)
+              else begin
+                Sys.rename temp_bin bin_path;
+                Ok bin_path
+              end))
 
 let wait_for_formatter_binary bin_path =
   let rec loop attempts =
@@ -399,15 +388,36 @@ let program_batch_args pending_files =
        (fun pending -> [ pending.json_file; pending.output_file ])
        pending_files
 
-let render_pending_files temp_dir formatter_tool pending_files =
+let run_formatter_tool temp_dir formatter_tool args =
   let stdout_path = Filename.concat temp_dir "formatter.stdout" in
   let stderr_path = Filename.concat temp_dir "formatter.stderr" in
   match formatter_binary_path formatter_tool with
   | Error msg -> Error msg
   | Ok formatter_binary ->
-      run_process_capture_files formatter_binary
-        (program_batch_args pending_files)
-        stdout_path stderr_path
+      run_process_capture_files formatter_binary args stdout_path stderr_path
+
+let render_pending_files temp_dir formatter_tool pending_files =
+  run_formatter_tool temp_dir formatter_tool (program_batch_args pending_files)
+
+let render_program_json_with_blorp_renderer json =
+  match formatter_tool_path () with
+  | Error msg -> Error msg
+  | Ok formatter_tool ->
+      with_temp_dir "blorp-format-source-" (fun temp_dir ->
+          let json_file = Filename.concat temp_dir "program.json" in
+          write_file json_file json;
+          run_formatter_tool temp_dir formatter_tool [ "program"; json_file ])
+
+(** Format a source string. Returns the formatted source or an error. *)
+let format_string source =
+  match format_program_json_string source with
+  | Error msg -> Error msg
+  | Ok json -> render_program_json_with_blorp_renderer json
+
+let format_program_with_comments ~comments program =
+  match program_json_for_program ~comments program with
+  | Error msg -> Error msg
+  | Ok json -> render_program_json_with_blorp_renderer json
 
 let finish_render_file ~mode pending =
   try
@@ -456,31 +466,15 @@ let format_files_with_blorp_renderer ~mode files =
               | Error msg -> Error msg
               | Ok _ -> finish_render_files ~mode pending_files))
 
-(** Format a file. *)
-let format_file ?(use_cache = false) filename =
-  try
-    let source = Modules.read_file filename in
-    (* Check cache first — skip formatting if source is known-formatted *)
-    if use_cache && is_cached_formatted source then Ok true
-    else
-      match format_string source with
-      | Error msg -> Error msg
-      | Ok formatted ->
-          if source = formatted then begin
-            (* Already formatted — cache it *)
-            mark_cached_formatted source;
-            Ok true
-          end
-          else begin
-            write_file filename formatted;
-            (* Cache the formatted output *)
-            mark_cached_formatted formatted;
-            Ok true
-          end
-  with Sys_error msg -> Error (Printf.sprintf "File error: %s" msg)
-
 (** Auto-format a file in place, silently skipping on any error.
     Uses the format cache to avoid re-formatting unchanged files.
     Intended for automatic formatting before compile/run/test. *)
 let auto_format filename =
-  try ignore (format_file ~use_cache:true filename) with _ -> ()
+  try
+    let source = Modules.read_file filename in
+    if not (is_cached_formatted source) then
+      match format_files_with_blorp_renderer ~mode:Write [ filename ] with
+      | Error _ -> ()
+      | Ok _ -> (
+          try mark_cached_formatted (Modules.read_file filename) with _ -> ())
+  with _ -> ()

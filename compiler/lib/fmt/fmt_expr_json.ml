@@ -1,9 +1,9 @@
-(** JSON serialization for expression-formatting parity cases.
+(** JSON serialization for formatter expressions.
 
-    This is a temporary dogfooding boundary while the formatter printer moves
-    from OCaml to Blorp in slices. OCaml still owns parsing and the reference
-    expression printer; Blorp consumes this supported expression subset and
-    must render the same layout. *)
+    OCaml still owns parsing and JSON projection. The Blorp formatter consumes
+    this representation and owns rendering. Some helpers still mirror legacy
+    printer details so parity tests can keep the bridge honest while the OCaml
+    printer remains available for lower-level tests. *)
 
 module Layout = Fmt_layout
 module Printer = Fmt_printer
