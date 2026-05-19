@@ -107,7 +107,10 @@ let format_decl_cases_json_lines_string source =
         (Printf.sprintf "%s at line %d, column %d" message loc.Ast.line
            loc.Ast.column)
   | Ok program -> (
-      try Ok (Fmt_decl_json.cases_json_lines program) with
+      try
+        let collected_comments = Lexer.get_comments () in
+        Ok (Fmt_decl_json.cases_json_lines ~comments:collected_comments program)
+      with
       | Failure msg -> Error (Printf.sprintf "Formatter error: %s" msg)
       | Invalid_argument msg -> Error (Printf.sprintf "Formatter error: %s" msg)
       | Not_found -> Error "Formatter error: internal lookup failed")

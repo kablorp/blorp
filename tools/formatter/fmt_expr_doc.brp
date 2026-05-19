@@ -11,11 +11,12 @@ import:
 		hardlines,
 		indent,
 		layout,
+		line_suffix,
 		parens,
 		softline,
 		text,
-	./fmt_type_doc: TypeExpr, type_doc, type_expr_from_json
-	json: JsonValue, as_string, get_field, parse_json
+	./fmt_type_doc: TypeExpr, type_doc, type_expr_contains_func, type_expr_from_json
+	json: JsonValue, as_bool, as_string, get_field, parse_json
 
 
 record StringFlags {raw: Bool, triple: Bool}
@@ -78,6 +79,11 @@ union StringInterpPart:
 	StringExprPart(Expr)
 
 
+union BlockItem:
+	BlockCommentItem(Bool, String)
+	BlockExprItem(Bool, Expr, Option[String])
+
+
 union Expr:
 	IdentExpr(String)
 	LiteralExpr(Literal)
@@ -109,6 +115,8 @@ union Expr:
 	QuestionBindExpr(String, Expr)
 	TypedQuestionBindExpr(String, TypeExpr, Expr)
 	BlockExpr(List[Expr])
+	SpacedBlockExpr(List[(Bool, Expr)])
+	ItemBlockExpr(List[BlockItem])
 	IfExpr(Expr, Expr)
 	IfElseExpr(Expr, Expr, Expr)
 	MatchExpr(Expr, List[(Pattern, Expr)])
@@ -125,6 +133,12 @@ union Expr:
 	ConcurrentBindExpr(String, Option[TypeExpr], Expr)
 	DetachExpr(Expr)
 	ConcurrentForExpr(String, Expr, Expr, Option[Expr], Option[Int])
+
+
+record UfcsStep {name: String, args: List[Expr]}
+
+
+record UfcsChain {receiver: Expr, steps: List[UfcsStep]}
 
 
 private pure func hex_digit(n: Int) -> String:
@@ -174,25 +188,41 @@ private pure func escape_char_code(code: Int, escape_single_quote: Bool) -> Stri
 
 pure func escape_string_value(s: String) -> String:
 	var out: String = ""
-	for c in s:
-		out += escape_char_code(c.to_int(), False)
+	var i: Int = 0
+	while i < s.length():
+		match s.get(i):
+			Some(c):
+				code: Int = c.to_int()
+				if code >= 128:
+					out += s.substring(i, 1)
+				else:
+					out += escape_char_code(code, False)
+			None: void
+		i += 1
 	out
 
 
 private pure func escape_triple_string_value(s: String) -> String:
 	var out: String = ""
-	for c in s:
-		code: Int = c.to_int()
-		if code == 92:
-			out += "\\\\"
-		else if code == 9:
-			out += "\\t"
-		else if code == 13:
-			out += "\\r"
-		else if code == 0:
-			out += "\\0"
-		else:
-			out += c.to_string()
+	var i: Int = 0
+	while i < s.length():
+		match s.get(i):
+			Some(c):
+				code: Int = c.to_int()
+				if code >= 128:
+					out += s.substring(i, 1)
+				else if code == 92:
+					out += "\\\\"
+				else if code == 9:
+					out += "\\t"
+				else if code == 13:
+					out += "\\r"
+				else if code == 0:
+					out += "\\0"
+				else:
+					out += c.to_string()
+			None: void
+		i += 1
 	out
 
 
@@ -281,6 +311,8 @@ private pure func needs_field_receiver_parens(expr: Expr) -> Bool:
 	match expr:
 		AscriptionExpr(_, _): True
 		BlockExpr(_): True
+		SpacedBlockExpr(_): True
+		ItemBlockExpr(_): True
 		BinaryExpr(_, _, _): True
 		ConcurrentExpr(_, _, _): True
 		ConcurrentForExpr(_, _, _, _, _): True
@@ -378,6 +410,47 @@ private pure func optional_int_field(value: JsonValue, key: String) -> Result[Op
 			Ok(Some(int_value))
 
 
+private pure func optional_string_field(
+	value: JsonValue,
+	key: String,
+) -> Result[Option[String], String]:
+	match value.get_field(key):
+		None: Ok(None)
+		Some(child):
+			match child.as_string():
+				Some(text_value): Ok(Some(text_value))
+				None: Err("expected formatter JSON field '" + key + "' to be a string")
+
+
+private pure func bool_array_field(value: JsonValue, key: String) -> Result[List[Bool], String]:
+	items ?= value.array_field(key)
+	var result: List[Bool] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.as_bool():
+					Some(bool_value): result = result.append(bool_value)
+					None: error = Some(
+						"expected formatter JSON field '" + key + "' to be an array of booleans",
+					)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func optional_bool_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[Option[List[Bool]], String]:
+	match value.get_field(key):
+		None: Ok(None)
+		Some(_):
+			items ?= value.bool_array_field(key)
+			Ok(Some(items))
+
+
 private pure func string_array_field(value: JsonValue, key: String) -> Result[List[String], String]:
 	items ?= value.array_field(key)
 	var result: List[String] = []
@@ -463,6 +536,54 @@ private pure func expr_array_field(value: JsonValue, key: String) -> Result[List
 			None:
 				match item.expr_from_json():
 					Ok(expr): result = result.append(expr)
+					Err(msg): error = Some(msg)
+	match error:
+		Some(msg): Err(msg)
+		None: Ok(result)
+
+
+private pure func block_items_from_flags(
+	exprs: List[Expr],
+	flags: List[Bool],
+) -> List[(Bool, Expr)]:
+	var result: List[(Bool, Expr)] = []
+	var index: Int = 0
+	for expr in exprs:
+		blank_before: Bool = match flags.get(index):
+			Some(flag): flag
+			None: False
+		result = result.append((blank_before, expr))
+		index += 1
+	result
+
+
+private pure func block_item_from_json(value: JsonValue) -> Result[BlockItem, String]:
+	tag ?= value.string_field("tag")
+	blank_before ?= value.bool_field("blank_before")
+	match tag:
+		"Comment":
+			text_value ?= value.string_field("text")
+			Ok(BlockCommentItem(blank_before, text_value))
+		"Expr":
+			expr_value ?= value.expr_field("expr")
+			trailing ?= value.optional_string_field("trailing")
+			Ok(BlockExprItem(blank_before, expr_value, trailing))
+		_: Err("unknown block item JSON tag: " + tag)
+
+
+private pure func block_item_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[BlockItem], String]:
+	items ?= value.array_field(key)
+	var result: List[BlockItem] = []
+	var error: Option[String] = None
+	for item in items:
+		match error:
+			Some(_): void
+			None:
+				match item.block_item_from_json():
+					Ok(block_item): result = result.append(block_item)
 					Err(msg): error = Some(msg)
 	match error:
 		Some(msg): Err(msg)
@@ -714,7 +835,15 @@ pure func expr_from_json(value: JsonValue) -> Result[Expr, String]:
 				None: Ok(QuestionBindExpr(name, expr))
 		"Block":
 			exprs ?= value.expr_array_field("exprs")
-			Ok(BlockExpr(exprs))
+			match value.get_field("items"):
+				Some(_):
+					items ?= value.block_item_array_field("items")
+					Ok(ItemBlockExpr(items))
+				None:
+					blank_before ?= value.optional_bool_array_field("blank_before")
+					match blank_before:
+						Some(flags): Ok(SpacedBlockExpr(exprs.block_items_from_flags(flags)))
+						None: Ok(BlockExpr(exprs))
 		"If":
 			cond ?= value.expr_field("cond")
 			then_expr ?= value.expr_field("then")
@@ -900,6 +1029,237 @@ private pure func expr_doc_list(exprs: List[Expr]) -> List[Doc]:
 	docs
 
 
+private pure func is_breakable_call_callee(expr: Expr) -> Bool:
+	match expr:
+		IdentExpr(_): True
+		FieldAccessExpr(_, _): True
+		_: False
+
+
+private pure func call_arg_doc(expr: Expr) -> Doc:
+	match expr:
+		CallExpr(callee, args):
+			if args.length() >= 2 and callee.is_breakable_call_callee():
+				flat_doc: Doc = expr.expr_doc()
+				broken_doc: Doc = callee
+					.expr_doc()
+					.cat("(".text())
+					.cat(hardline()
+							.cat(args
+									.call_arg_docs()
+									.comma_sep_break())
+							.indent())
+					.cat(hardline())
+					.cat(")".text())
+				broken_doc.if_break(flat_doc)
+			else:
+				expr.expr_doc()
+		_: expr.expr_doc()
+
+
+private pure func call_arg_docs(exprs: List[Expr]) -> List[Doc]:
+	var docs: List[Doc] = []
+	for expr in exprs:
+		docs = docs.append(expr.call_arg_doc())
+	docs
+
+
+private pure func expr_is_block_lambda(expr: Expr) -> Bool:
+	match expr:
+		LambdaExpr(_, _, body): body.is_block_expr()
+		TypedLambdaExpr(_, _, _, body): body.is_block_expr()
+		_: False
+
+
+private pure func expr_list_has_trailing_block_lambda(exprs: List[Expr]) -> Bool:
+	match exprs.get(exprs.length() - 1):
+		Some(last): last.expr_is_block_lambda()
+		None: False
+
+
+private pure func trailing_block_lambda_call_args_doc(args: List[Expr]) -> Doc:
+	last_idx: Int = args.length() - 1
+	var index: Int = 0
+	var leading_docs: List[Doc] = []
+	var last_doc: Doc = "".text()
+	for arg in args:
+		if index == last_idx:
+			last_doc = arg.expr_doc()
+		else:
+			leading_docs = leading_docs.append(arg.expr_doc())
+		index += 1
+	var leading_part: Doc = "".text()
+	if leading_docs.length() != 0:
+		leading_part = leading_docs
+			.comma_sep()
+			.cat(", ".text())
+	open_doc: Doc = "(".text()
+	open_doc
+		.cat(leading_part)
+		.cat(last_doc)
+		.cat(hardline())
+		.cat(")".text())
+
+
+private pure func expr_list_has_block(exprs: List[Expr]) -> Bool:
+	var has_block: Bool = False
+	for expr in exprs:
+		if expr.expr_has_block():
+			has_block = True
+	has_block
+
+
+private pure func expr_pair_list_has_block(items: List[(String, Expr)]) -> Bool:
+	var has_block: Bool = False
+	for item in items:
+		if item.1.expr_has_block():
+			has_block = True
+	has_block
+
+
+private pure func expr_has_block(expr: Expr) -> Bool:
+	match expr:
+		BlockExpr(_): True
+		SpacedBlockExpr(_): True
+		ItemBlockExpr(_): True
+		MatchExpr(_, _): True
+		DebugBlockExpr(_): True
+		LambdaExpr(_, _, body): body.is_block_expr()
+		TypedLambdaExpr(_, _, _, body): body.is_block_expr()
+		IfElseExpr(_, then_expr, else_expr):
+			then_expr.expr_has_block() or else_expr.expr_has_block()
+		CallExpr(_, args): args.expr_list_has_block()
+		AscriptionExpr(inner, _): inner.expr_has_block()
+		TupleExpr(elems): elems.expr_list_has_block()
+		ListExpr(elems): elems.expr_list_has_block()
+		VectorExpr(elems): elems.expr_list_has_block()
+		RecordExpr(fields): fields.expr_pair_list_has_block()
+		RecordUpdateExpr(_, fields): fields.expr_pair_list_has_block()
+		_: False
+
+
+private pure func expr_is_non_lambda_block(expr: Expr) -> Bool:
+	match expr:
+		LambdaExpr(_, _, _): False
+		TypedLambdaExpr(_, _, _, _): False
+		_: expr.expr_has_block()
+
+
+private pure func expr_list_has_non_lambda_block(exprs: List[Expr]) -> Bool:
+	var has_block: Bool = False
+	for expr in exprs:
+		if expr.expr_is_non_lambda_block():
+			has_block = True
+	has_block
+
+
+private pure func block_call_arg_docs(args: List[Expr]) -> List[Doc]:
+	last_idx: Int = args.length() - 1
+	var index: Int = 0
+	var docs: List[Doc] = []
+	for arg in args:
+		arg_doc: Doc = arg.expr_doc()
+		if index == last_idx:
+			docs = docs.append(arg_doc)
+		else if arg.expr_has_block():
+			docs = docs.append(arg_doc
+					.cat(hardline())
+					.cat(",".text()))
+		else:
+			docs = docs.append(arg_doc.cat(",".text()))
+		index += 1
+	docs
+
+
+private pure func block_call_args_doc(args: List[Expr]) -> Doc:
+	"("
+		.text()
+		.cat(hardline()
+				.cat(args
+						.block_call_arg_docs()
+						.hardlines())
+				.indent())
+		.cat(hardline())
+		.cat(")".text())
+
+
+private pure func vector_rank_expr(expr: Expr) -> Int:
+	match expr:
+		VectorExpr(elems): elems.vector_rank_elems()
+		_: 0
+
+
+private pure func vector_rank_elems(elems: List[Expr]) -> Int:
+	if elems.length() == 0:
+		1
+	else:
+		child_rank: Int = match elems.get(0):
+			Some(first): first.vector_rank_expr()
+			None: 0
+		if child_rank > 0:
+			var same_rank: Bool = True
+			for elem in elems:
+				if elem.vector_rank_expr() != child_rank:
+					same_rank = False
+			if same_rank:
+				child_rank + 1
+			else:
+				1
+		else:
+			1
+
+
+private pure func vector_row_doc(elems: List[Expr]) -> Doc:
+	"{"
+		.text()
+		.cat(softline()
+				.cat(elems
+						.expr_doc_list()
+						.comma_sep_break())
+				.indent())
+		.cat(softline())
+		.cat("}".text())
+		.group()
+
+
+private pure func shaped_vector_item_doc(expr: Expr) -> Doc:
+	match expr:
+		VectorExpr(elems):
+			if elems.vector_rank_elems() >= 2:
+				elems.shaped_vector_doc()
+			else:
+				elems.vector_row_doc()
+		_: expr.expr_doc()
+
+
+private pure func shaped_vector_item_docs(elems: List[Expr]) -> List[Doc]:
+	var docs: List[Doc] = []
+	for elem in elems:
+		docs = docs.append(elem
+				.shaped_vector_item_doc()
+				.cat(",".text()))
+	docs
+
+
+private pure func shaped_vector_doc(elems: List[Expr]) -> Doc:
+	"{"
+		.text()
+		.cat(hardline()
+				.cat(elems
+						.shaped_vector_item_docs()
+						.hardlines())
+				.indent())
+		.cat(hardline())
+		.cat("}".text())
+
+
+private pure func vector_literal_doc(elems: List[Expr]) -> Doc:
+	if elems.vector_rank_elems() >= 2 and not elems.expr_list_has_block():
+		elems.shaped_vector_doc()
+	else:
+		bracketed_expr_doc("{", "}", elems)
+
+
 private pure func bracketed_expr_doc(
 	open_text: String,
 	close_text: String,
@@ -915,6 +1275,59 @@ private pure func bracketed_expr_doc(
 		.cat(softline())
 		.cat(close_text.text())
 		.group()
+
+
+private pure func call_args_doc(args: List[Expr]) -> Doc:
+	if args.length() == 0:
+		"()".text()
+	else if args.expr_list_has_trailing_block_lambda():
+		args.trailing_block_lambda_call_args_doc()
+	else if args.expr_list_has_non_lambda_block():
+		args.block_call_args_doc()
+	else:
+		"("
+			.text()
+			.cat(softline()
+					.cat(args
+							.call_arg_docs()
+							.comma_sep_break())
+					.indent())
+			.cat(softline())
+			.cat(")".text())
+			.group()
+
+
+private pure func collect_ufcs_chain(receiver: Expr, steps: List[UfcsStep]) -> UfcsChain:
+	match receiver:
+		CallExpr(FieldAccessExpr(inner, method_name), method_args):
+			inner.collect_ufcs_chain([{name = method_name, args = method_args}].concat(steps))
+		_: {receiver = receiver, steps = steps}
+
+
+private pure func ufcs_steps_doc(steps: List[UfcsStep]) -> Doc:
+	var result: Doc = "".text()
+	for step in steps:
+		result = result
+			.cat(hardline())
+			.cat(".".text())
+			.cat(step.name.text())
+			.cat(step.args.call_args_doc())
+	result
+
+
+private pure func ufcs_chain_doc(callee: Expr, args: List[Expr]) -> Option[Doc]:
+	match callee:
+		FieldAccessExpr(receiver, method_name):
+			chain: UfcsChain = receiver.collect_ufcs_chain([{name = method_name, args = args}])
+			if chain.steps.length() >= 2:
+				Some(chain.receiver
+						.expr_doc()
+						.cat(chain.steps
+								.ufcs_steps_doc()
+								.indent()))
+			else:
+				None
+		_: None
 
 
 private pure func record_field_doc(field_value: (String, Expr)) -> Doc:
@@ -1038,12 +1451,80 @@ private pure func block_exprs_doc(exprs: List[Expr]) -> Doc:
 pure func is_block_expr(expr: Expr) -> Bool:
 	match expr:
 		BlockExpr(_): True
+		SpacedBlockExpr(_): True
+		ItemBlockExpr(_): True
 		_: False
+
+
+private pure func spaced_block_exprs_doc(items: List[(Bool, Expr)]) -> Doc:
+	var result: Doc = "".text()
+	var first: Bool = True
+	for item in items:
+		item_doc: Doc = item.1.expr_doc()
+		if first:
+			result = item_doc
+			first = False
+		else:
+			separator: Doc = if item.0:
+				hardline().cat(hardline())
+			else:
+				hardline()
+			result = result
+				.cat(separator)
+				.cat(item_doc)
+	result
+
+
+private pure func block_separator(blank_before: Bool) -> Doc:
+	if blank_before:
+		hardline().cat(hardline())
+	else:
+		hardline()
+
+
+private pure func trailing_text_doc(trailing: Option[String]) -> Doc:
+	match trailing:
+		Some(text_value): text_value.line_suffix()
+		None: "".text()
+
+
+private pure func block_item_doc(item: BlockItem) -> Doc:
+	match item:
+		BlockCommentItem(_, text_value): text_value.text()
+		BlockExprItem(_, expr, trailing):
+			expr
+				.expr_doc()
+				.cat(trailing.trailing_text_doc())
+
+
+private pure func block_item_blank_before(item: BlockItem) -> Bool:
+	match item:
+		BlockCommentItem(blank_before, _): blank_before
+		BlockExprItem(blank_before, _, _): blank_before
+
+
+private pure func block_items_doc(items: List[BlockItem]) -> Doc:
+	var result: Doc = "".text()
+	var first: Bool = True
+	for item in items:
+		item_doc: Doc = item.block_item_doc()
+		if first:
+			result = item_doc
+			first = False
+		else:
+			result = result
+				.cat(item
+						.block_item_blank_before()
+						.block_separator())
+				.cat(item_doc)
+	result
 
 
 pure func block_body_doc(expr: Expr) -> Doc:
 	match expr:
 		BlockExpr(exprs): exprs.block_exprs_doc()
+		SpacedBlockExpr(items): items.spaced_block_exprs_doc()
+		ItemBlockExpr(items): items.block_items_doc()
 		_: expr.expr_doc()
 
 
@@ -1053,6 +1534,14 @@ private pure func match_case_doc(case_value: (Pattern, Expr)) -> Doc:
 		.cat(":".text())
 	match case_value.1:
 		BlockExpr(_):
+			head.cat(hardline()
+					.cat(case_value.1.block_body_doc())
+					.indent())
+		SpacedBlockExpr(_):
+			head.cat(hardline()
+					.cat(case_value.1.block_body_doc())
+					.indent())
+		ItemBlockExpr(_):
 			head.cat(hardline()
 					.cat(case_value.1.block_body_doc())
 					.indent())
@@ -1091,13 +1580,83 @@ pure func func_param_docs(params: List[FuncParam]) -> List[Doc]:
 	docs
 
 
-pure func func_params_doc(params: List[FuncParam]) -> Doc:
+private pure func func_param_docs_with_commas(params: List[FuncParam]) -> List[Doc]:
+	var docs: List[Doc] = []
+	for param in params:
+		docs = docs.append(param
+				.func_param_doc()
+				.cat(",".text()))
+	docs
+
+
+private pure func func_param_flat_length(param: FuncParam) -> Int:
+	1000
+		.layout(param.func_param_doc())
+		.trim_right()
+		.length()
+
+
+private pure func func_param_contains_function_type(param: FuncParam) -> Bool:
+	match param:
+		TypedNameParam(_, ty): ty.type_expr_contains_func()
+		TypedPatternParam(_, ty): ty.type_expr_contains_func()
+		_: False
+
+
+private pure func func_params_contain_function_type(params: List[FuncParam]) -> Bool:
+	var contains: Bool = False
+	for param in params:
+		if param.func_param_contains_function_type():
+			contains = True
+	contains
+
+
+private pure func should_force_multiline_params(params: List[FuncParam]) -> Bool:
+	if params.length() > 1 and params.func_params_contain_function_type():
+		True
+	else if params.length() <= 3:
+		False
+	else:
+		var should_force: Bool = False
+		for param in params:
+			if param.func_param_flat_length() > 12:
+				should_force = True
+		should_force
+
+
+private pure func multiline_func_params_doc(params: List[FuncParam]) -> Doc:
+	match params:
+		[]: "()".text()
+		_:
+			"("
+				.text()
+				.cat(hardline()
+						.cat(params
+								.func_param_docs_with_commas()
+								.hardlines())
+						.indent())
+				.cat(hardline())
+				.cat(")".text())
+
+
+private pure func grouped_func_params_doc(params: List[FuncParam]) -> Doc:
 	"("
 		.text()
-		.cat(params
-				.func_param_docs()
-				.comma_sep())
+		.cat(softline()
+				.cat(params
+						.func_param_docs()
+						.comma_sep_break())
+				.indent())
+		.cat(softline())
 		.cat(")".text())
+		.group()
+
+
+pure func func_params_doc(params: List[FuncParam]) -> Doc:
+	if params.should_force_multiline_params():
+		params.multiline_func_params_doc()
+	else:
+		params.grouped_func_params_doc()
 
 
 private pure func type_params_doc(params: List[String]) -> Doc:
@@ -1136,6 +1695,18 @@ private pure func lambda_doc(
 		.cat(ret.return_doc())
 	match body:
 		BlockExpr(_):
+			head
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_doc())
+						.indent())
+		SpacedBlockExpr(_):
+			head
+				.cat(":".text())
+				.cat(hardline()
+						.cat(body.block_body_doc())
+						.indent())
+		ItemBlockExpr(_):
 			head
 				.cat(":".text())
 				.cat(hardline()
@@ -1269,23 +1840,11 @@ pure func expr_doc(expr: Expr) -> Doc:
 				.cat(".".text())
 				.cat(field_name.text())
 		CallExpr(callee, args):
-			if args.length() == 0:
-				callee
+			match callee.ufcs_chain_doc(args):
+				Some(chain_doc): chain_doc
+				None: callee
 					.expr_doc()
-					.cat("()".text())
-			else:
-				callee
-					.expr_doc()
-					.cat("("
-							.text()
-							.cat(softline()
-									.cat(args
-											.expr_doc_list()
-											.comma_sep_break())
-									.indent())
-							.cat(softline())
-							.cat(")".text())
-							.group())
+					.cat(args.call_args_doc())
 		UnaryExpr(op, inner):
 			inner_doc: Doc = match inner:
 				BinaryExpr(_, _, _): inner
@@ -1364,7 +1923,7 @@ pure func expr_doc(expr: Expr) -> Doc:
 				.cat(right_doc)
 		TupleExpr(elems): bracketed_expr_doc("(", ")", elems)
 		ListExpr(elems): bracketed_expr_doc("[", "]", elems)
-		VectorExpr(elems): bracketed_expr_doc("{", "}", elems)
+		VectorExpr(elems): elems.vector_literal_doc()
 		RecordExpr(fields):
 			"{"
 				.text()
@@ -1449,6 +2008,8 @@ pure func expr_doc(expr: Expr) -> Doc:
 		QuestionBindExpr(name, value): question_bind_doc(name, None, value)
 		TypedQuestionBindExpr(name, ty, value): question_bind_doc(name, Some(ty), value)
 		BlockExpr(exprs): exprs.block_exprs_doc()
+		SpacedBlockExpr(items): items.spaced_block_exprs_doc()
+		ItemBlockExpr(items): items.block_items_doc()
 		IfExpr(cond, then_expr):
 			"if "
 				.text()

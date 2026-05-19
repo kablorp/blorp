@@ -36,6 +36,99 @@ let optional_int_field name = function
   | None -> []
   | Some value -> [ field name (string_of_int value) ]
 
+let comments = ref (Fmt_comment.create [])
+
+let with_comments scoped_comments f =
+  let previous = !comments in
+  comments := Fmt_comment.create scoped_comments;
+  Fun.protect ~finally:(fun () -> comments := previous) f
+
+let block_blank_before exprs =
+  let rec loop prev_end acc = function
+    | [] -> List.rev acc
+    | expr :: rest ->
+        let blank_before =
+          match prev_end with
+          | None -> false
+          | Some line -> expr.Ast.expr_loc.line - line > 1
+        in
+        loop
+          (Some (Printer.expr_source_end_line expr))
+          (blank_before :: acc) rest
+  in
+  loop None [] exprs
+
+let block_blank_before_field exprs =
+  let blanks = block_blank_before exprs in
+  if List.exists Fun.id blanks then
+    [ field "blank_before" (array (List.map bool blanks)) ]
+  else []
+
+type block_json_item =
+  | BlockJsonComment of Lexer.collected_comment
+  | BlockJsonExpr of Ast.expr * string * Lexer.collected_comment option
+
+let block_item_start_line = function
+  | BlockJsonComment comment -> comment.Lexer.cc_line
+  | BlockJsonExpr (expr, _, _) -> expr.Ast.expr_loc.line
+
+let block_item_end_line = function
+  | BlockJsonComment comment -> comment.Lexer.cc_line
+  | BlockJsonExpr (expr, _, _) -> Printer.expr_source_end_line expr
+
+let block_item_needs_blank previous item =
+  match item with
+  | BlockJsonComment comment -> (
+      match previous with
+      | BlockJsonComment prev_comment
+        when comment.Lexer.cc_line = prev_comment.Lexer.cc_line + 1 ->
+          false
+      | _ -> true)
+  | BlockJsonExpr _ ->
+      block_item_start_line item - block_item_end_line previous > 1
+
+let block_comment_item_to_json ~blank_before comment =
+  obj
+    [
+      field "tag" (string "Comment");
+      field "blank_before" (bool blank_before);
+      field "text"
+        (string (Fmt_comment.normalize_comment comment.Lexer.cc_text));
+    ]
+
+let block_expr_item_to_json ~blank_before expr_json trailing =
+  obj
+    ([
+       field "tag" (string "Expr");
+       field "blank_before" (bool blank_before);
+       field "expr" expr_json;
+     ]
+    @ optional_field "trailing"
+        (Option.map
+           (fun comment ->
+             string (Fmt_comment.normalize_comment comment.Lexer.cc_text))
+           trailing))
+
+let block_item_to_json ~blank_before = function
+  | BlockJsonComment comment -> block_comment_item_to_json ~blank_before comment
+  | BlockJsonExpr (_, expr_json, trailing) ->
+      block_expr_item_to_json ~blank_before expr_json trailing
+
+let append_block_item (previous, rendered, has_comment) item =
+  let blank_before =
+    match previous with
+    | None -> false
+    | Some prev -> block_item_needs_blank prev item
+  in
+  let has_comment =
+    has_comment
+    ||
+    match item with
+    | BlockJsonComment _ -> true
+    | BlockJsonExpr (_, _, trailing) -> Option.is_some trailing
+  in
+  (Some item, block_item_to_json ~blank_before item :: rendered, has_comment)
+
 let float_literal_source f =
   (* Blorp lexer requires decimal notation, so mirror [Fmt_printer.print_literal]. *)
   let rec try_precision n =
@@ -510,13 +603,16 @@ let rec expr_to_json expr =
                @ optional_field "type" (Option.map type_expr_to_json ty_opt)))
       | None -> None)
   | Ast.EBlock exprs -> (
-      match option_map_all expr_to_json exprs with
-      | Some expr_jsons ->
+      match block_payload exprs with
+      | Some (expr_jsons, item_jsons, has_comment) ->
           Some
             (obj
-               [
-                 field "tag" (string "Block"); field "exprs" (array expr_jsons);
-               ])
+               ([
+                  field "tag" (string "Block"); field "exprs" (array expr_jsons);
+                ]
+               @
+               if has_comment then [ field "items" (array item_jsons) ]
+               else block_blank_before_field exprs))
       | None -> None)
   | Ast.EIf (cond, then_expr, else_opt) -> (
       match
@@ -728,6 +824,43 @@ let rec expr_to_json expr =
                ])
       | None -> None)
   | Ast.ELoopView _ | Ast.EStringInterpRaw _ -> None
+
+and block_payload exprs =
+  let block_expr_trailing expr rest =
+    match
+      Fmt_comment.take_trailing !comments
+        ~on_line:(Printer.expr_source_end_line expr)
+    with
+    | Some _ as trailing -> trailing
+    | None -> (
+        match rest with
+        | next :: _ ->
+            Fmt_comment.take_trailing_before !comments
+              ~before_line:next.Ast.expr_loc.line
+        | [] -> Fmt_comment.take_next_trailing !comments)
+  in
+  let rec loop previous rendered expr_jsons has_comment = function
+    | [] -> Some (List.rev expr_jsons, List.rev rendered, has_comment)
+    | expr :: rest -> (
+        let leading =
+          Fmt_comment.take_leading !comments ~before_line:expr.Ast.expr_loc.line
+        in
+        let previous, rendered, has_comment =
+          List.fold_left append_block_item
+            (previous, rendered, has_comment)
+            (List.map (fun comment -> BlockJsonComment comment) leading)
+        in
+        match expr_to_json expr with
+        | None -> None
+        | Some expr_json ->
+            let trailing = block_expr_trailing expr rest in
+            let item = BlockJsonExpr (expr, expr_json, trailing) in
+            let previous, rendered, has_comment =
+              append_block_item (previous, rendered, has_comment) item
+            in
+            loop previous rendered (expr_json :: expr_jsons) has_comment rest)
+  in
+  loop None [] [] false exprs
 
 let expected_layout expr =
   Printer.comments := Fmt_comment.create [];

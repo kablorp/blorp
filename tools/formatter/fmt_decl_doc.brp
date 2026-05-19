@@ -12,7 +12,7 @@ import:
 		is_block_expr,
 		pattern_doc,
 		pattern_from_json,
-	./fmt_json: array_field, bool_field, field, string_field
+	./fmt_json: array_field, bool_field, field, int_field, string_field
 	./fmt_layout:
 		Doc,
 		blank_lines,
@@ -25,6 +25,7 @@ import:
 		indent,
 		intersperse,
 		layout,
+		line_suffix,
 		softline,
 		softline_space,
 		text,
@@ -57,6 +58,19 @@ record TraitMethod {
 }
 
 
+record ForeignLinkFlag {platform: Option[String], value: String}
+
+
+record ForeignMetadata {includes: List[String], link_flags: List[ForeignLinkFlag]}
+
+
+union FuncBody:
+	ExprFuncBody(Expr)
+	BuiltinFuncBody(Option[String])
+	ForeignFuncBody(String, ForeignMetadata)
+	NoFuncBody
+
+
 record ImplMethod {
 	name: String,
 	is_pure: Bool,
@@ -66,15 +80,8 @@ record ImplMethod {
 	type_params: List[String],
 	params: List[FuncParam],
 	ret: Option[TypeExpr],
-	body: Expr,
+	body: FuncBody,
 }
-
-
-union FuncBody:
-	ExprFuncBody(Expr)
-	BuiltinFuncBody(Option[String])
-	ForeignFuncBody(String)
-	NoFuncBody
 
 
 union Decl:
@@ -89,12 +96,50 @@ union Decl:
 	ImplDecl(Bool, String, TypeExpr, List[ImplMethod])
 
 
+record FormatterComment {text_value: String, line: Int, column: Int, trailing: Bool}
+
+
+record LocatedDecl {line: Int, column: Int, end_line: Int, decl: Decl}
+
+
+record Program {decls: List[LocatedDecl], comments: List[FormatterComment]}
+
+
+record LocatedImport {line: Int, column: Int, item: ImportItem}
+
+
 union ProgramBodyItem:
-	BodyDecl(Decl)
-	BodyForeignBlock(List[Decl])
+	BodyDecl(LocatedDecl)
+	BodyImportBlock(List[LocatedImport])
+	BodyForeignBlock(List[LocatedDecl])
 
 
-record ProgramParts {imports: List[ImportItem], body: List[Decl]}
+record ProgramParts {imports: List[LocatedImport], body: List[LocatedDecl]}
+
+
+record ImportWithComments {
+	item: ImportItem,
+	leading: List[FormatterComment],
+	trailing: Option[FormatterComment],
+}
+
+
+record ImportCommentCollect {
+	items: List[ImportWithComments],
+	remaining_comments: List[FormatterComment],
+}
+
+
+record ImportBlockRender {doc: Doc, remaining_comments: List[FormatterComment]}
+
+
+record CommentTake {taken: List[FormatterComment], remaining: List[FormatterComment]}
+
+
+record TrailingCommentTake {comment: Option[FormatterComment], remaining: List[FormatterComment]}
+
+
+record RenderedDoc {doc: Doc, remaining_comments: List[FormatterComment]}
 
 
 private pure func optional_string_field(
@@ -136,6 +181,14 @@ private pure func optional_string_array_field(
 		Some(_):
 			items ?= value.string_array_field(key)
 			Ok(Some(items))
+
+
+private pure func optional_int_field(value: JsonValue, key: String) -> Result[Option[Int], String]:
+	match value.get_field(key):
+		None: Ok(None)
+		Some(_):
+			int_value ?= value.int_field(key)
+			Ok(Some(int_value))
 
 
 private pure func type_expr_field(value: JsonValue, key: String) -> Result[TypeExpr, String]:
@@ -255,6 +308,73 @@ private pure func import_item_from_json(value: JsonValue) -> Result[ImportItem, 
 	Ok({module_name = module_name, alias_name = alias_name, symbols = symbols})
 
 
+private pure func formatter_comment_from_json(value: JsonValue) -> Result[FormatterComment, String]:
+	text_value ?= value.string_field("text")
+	line ?= value.int_field("line")
+	column ?= value.int_field("column")
+	trailing ?= value.bool_field("trailing")
+	Ok({text_value = text_value, line = line, column = column, trailing = trailing})
+
+
+private pure func formatter_comments_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[FormatterComment], String]:
+	match value.get_field(key):
+		None: Ok([])
+		Some(_):
+			items ?= value.array_field(key)
+			var result: List[FormatterComment] = []
+			var error: Option[String] = None
+			for item in items:
+				match error:
+					Some(_): void
+					None:
+						match item.formatter_comment_from_json():
+							Ok(comment): result = result.append(comment)
+							Err(msg): error = Some(msg)
+			match error:
+				Some(msg): Err(msg)
+				None: Ok(result)
+
+
+private pure func string_array_field_or_empty(
+	value: JsonValue,
+	key: String,
+) -> Result[List[String], String]:
+	match value.get_field(key):
+		None: Ok([])
+		Some(_): value.string_array_field(key)
+
+
+private pure func foreign_link_flag_from_json(value: JsonValue) -> Result[ForeignLinkFlag, String]:
+	platform ?= value.optional_string_field("platform")
+	flag_value ?= value.string_field("value")
+	Ok({platform = platform, value = flag_value})
+
+
+private pure func foreign_link_flags_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[ForeignLinkFlag], String]:
+	match value.get_field(key):
+		None: Ok([])
+		Some(_):
+			items ?= value.array_field(key)
+			var result: List[ForeignLinkFlag] = []
+			var error: Option[String] = None
+			for item in items:
+				match error:
+					Some(_): void
+					None:
+						match item.foreign_link_flag_from_json():
+							Ok(flag): result = result.append(flag)
+							Err(msg): error = Some(msg)
+			match error:
+				Some(msg): Err(msg)
+				None: Ok(result)
+
+
 private pure func type_variant_from_json(value: JsonValue) -> Result[TypeVariant, String]:
 	name ?= value.string_field("name")
 	fields ?= value.type_expr_array_field("fields")
@@ -342,7 +462,7 @@ private pure func impl_method_from_json(value: JsonValue) -> Result[ImplMethod, 
 	type_params ?= value.string_array_field("type_params")
 	params ?= value.func_param_array_field("params")
 	ret ?= value.optional_type_expr_field("return")
-	body ?= value.expr_field("body")
+	body ?= value.func_body_from_json()
 	Ok(
 		{
 			name = name,
@@ -390,7 +510,14 @@ private pure func func_body_from_json(value: JsonValue) -> Result[FuncBody, Stri
 					Ok(BuiltinFuncBody(name))
 				"foreign":
 					foreign_name ?= value.string_field("foreign_name")
-					Ok(ForeignFuncBody(foreign_name))
+					includes ?= value.string_array_field_or_empty("foreign_includes")
+					link_flags ?= value.foreign_link_flags_field("foreign_link_flags")
+					Ok(
+						ForeignFuncBody(
+							foreign_name,
+							{includes = includes, link_flags = link_flags},
+						),
+					)
 				"none": Ok(NoFuncBody)
 				_: Err("unknown function body JSON kind: " + kind)
 
@@ -681,6 +808,240 @@ private pure func docstring_doc(doc: String) -> Doc:
 		.cat(hardline())
 
 
+private pure func normalize_comment_text(raw: String) -> String:
+	if raw.starts_with("--"):
+		rest: String = raw
+			.substring(2, raw.length() - 2)
+			.trim()
+		if rest == "":
+			"--"
+		else:
+			"-- " + rest
+	else:
+		raw
+
+
+private pure func comment_doc(comment: FormatterComment) -> Doc:
+	comment.text_value
+		.normalize_comment_text()
+		.text()
+
+
+private pure func comments_doc(comments: List[FormatterComment]) -> Doc:
+	var result: Doc = "".text()
+	for comment in comments:
+		result = result
+			.cat(comment.comment_doc())
+			.cat(hardline())
+	result
+
+
+private pure func copy_formatter_comments(
+	comments: List[FormatterComment],
+) -> List[FormatterComment]:
+	comments.take(comments.length())
+
+
+private pure func append_remaining_comments(doc: Doc, comments: List[FormatterComment]) -> Doc:
+	if comments.length() == 0:
+		doc
+	else:
+		doc
+			.cat(hardline())
+			.cat(comments.comments_doc())
+
+
+private pure func trailing_comment_doc(comment: Option[FormatterComment]) -> Doc:
+	match comment:
+		Some(value): value.text_value
+			.normalize_comment_text()
+			.line_suffix()
+		None: "".text()
+
+
+private pure func take_leading_comments(
+	comments: List[FormatterComment],
+	before_line: Int,
+) -> CommentTake:
+	var taken: List[FormatterComment] = []
+	var remaining: List[FormatterComment] = []
+	var taking: Bool = True
+	for comment in comments:
+		if taking and comment.line < before_line:
+			taken = taken.append(comment)
+		else:
+			taking = False
+			remaining = remaining.append(comment)
+	{taken = taken, remaining = remaining}
+
+
+private pure func take_trailing_comment(
+	comments: List[FormatterComment],
+	on_line: Int,
+) -> TrailingCommentTake:
+	match comments:
+		[]: {comment = None, remaining = []}
+		[first, ...rest]:
+			if first.line == on_line and first.trailing:
+				{comment = Some(first), remaining = rest}
+			else:
+				{comment = None, remaining = comments}
+
+
+private pure func drain_comments_through(
+	comments: List[FormatterComment],
+	through_line: Int,
+) -> CommentTake:
+	var taken: List[FormatterComment] = []
+	var remaining: List[FormatterComment] = []
+	var taking: Bool = True
+	for comment in comments:
+		if taking and comment.line <= through_line:
+			taken = taken.append(comment)
+		else:
+			taking = False
+			remaining = remaining.append(comment)
+	{taken = taken, remaining = remaining}
+
+
+private pure func import_with_comments_dedup_key(item: ImportWithComments) -> String:
+	item.item.import_item_dedup_key()
+
+
+private pure func dedup_imports_with_comments(
+	items: List[ImportWithComments],
+) -> List[ImportWithComments]:
+	var result: List[ImportWithComments] = []
+	var seen: List[String] = []
+	for item in items:
+		key: String = item.import_with_comments_dedup_key()
+		if not seen.contains(key):
+			seen = seen.append(key)
+			result = result.append(item)
+	result
+
+
+private pure func is_std_import_with_comments(item: ImportWithComments) -> Bool:
+	item.item.is_std_import_item()
+
+
+private pure func sorted_imports_with_comments(
+	items: List[ImportWithComments],
+) -> List[ImportWithComments]:
+	var std_imports: List[ImportWithComments] = []
+	var project_imports: List[ImportWithComments] = []
+	for item in items.dedup_imports_with_comments():
+		if item.is_std_import_with_comments():
+			std_imports = std_imports.append(item)
+		else:
+			project_imports = project_imports.append(item)
+	var result: List[ImportWithComments] = []
+	for item in std_imports.sort_by(
+		func(import_item: ImportWithComments): import_item.item.module_name,
+	):
+		result = result.append(item)
+	for item in project_imports.sort_by(
+		func(import_item: ImportWithComments): import_item.item.module_name,
+	):
+		result = result.append(item)
+	result
+
+
+private pure func import_with_comments_doc(item: ImportWithComments) -> Doc:
+	item.leading
+		.comments_doc()
+		.cat(item.item.import_item_doc())
+		.cat(item.trailing.trailing_comment_doc())
+
+
+private pure func import_with_comments_docs(items: List[ImportWithComments]) -> List[Doc]:
+	var docs: List[Doc] = []
+	for item in items:
+		docs = docs.append(item.import_with_comments_doc())
+	docs
+
+
+private pure func import_block_body_doc(items: List[ImportWithComments]) -> Doc:
+	var std_imports: List[ImportWithComments] = []
+	var project_imports: List[ImportWithComments] = []
+	for item in items.sorted_imports_with_comments():
+		if item.is_std_import_with_comments():
+			std_imports = std_imports.append(item)
+		else:
+			project_imports = project_imports.append(item)
+	std_doc: Doc = std_imports
+		.import_with_comments_docs()
+		.hardlines()
+	project_doc: Doc = project_imports
+		.import_with_comments_docs()
+		.hardlines()
+	if std_imports.length() == 0:
+		project_doc
+	else if project_imports.length() == 0:
+		std_doc
+	else:
+		std_doc
+			.cat(hardline())
+			.cat(project_doc)
+
+
+private pure func import_block_with_comments_doc(
+	items: List[ImportWithComments],
+	suffix: Doc,
+) -> Doc:
+	if items.length() == 0:
+		"".text()
+	else:
+		"import:"
+			.text()
+			.cat(hardline()
+					.cat(items.import_block_body_doc())
+					.indent())
+			.cat(suffix)
+
+
+private pure func located_imports_last_line(imports: List[LocatedImport]) -> Int:
+	var line: Int = 0
+	for import_item in imports:
+		if import_item.line > line:
+			line = import_item.line
+	line
+
+
+private pure func collect_import_comments(
+	imports: List[LocatedImport],
+	comments: List[FormatterComment],
+) -> ImportCommentCollect:
+	var items: List[ImportWithComments] = []
+	var remaining_comments: List[FormatterComment] = comments
+	for import_item in imports:
+		leading: CommentTake = remaining_comments.take_leading_comments(import_item.line)
+		trailing: TrailingCommentTake = leading.remaining.take_trailing_comment(import_item.line)
+		items = items.append(
+			{item = import_item.item, leading = leading.taken, trailing = trailing.comment},
+		)
+		remaining_comments = trailing.remaining.copy_formatter_comments()
+	{items = items, remaining_comments = remaining_comments}
+
+
+private pure func render_import_block(
+	imports: List[LocatedImport],
+	comments: List[FormatterComment],
+) -> ImportBlockRender:
+	collected: ImportCommentCollect = imports.collect_import_comments(comments)
+	drained: CommentTake = collected.remaining_comments.drain_comments_through(
+		imports.located_imports_last_line(),
+	)
+	suffix: Doc = if drained.taken.length() == 0:
+		"".text()
+	else:
+		hardline().cat(drained.taken.comments_doc())
+	{
+		doc = collected.items.import_block_with_comments_doc(suffix),
+		remaining_comments = drained.remaining.copy_formatter_comments(),
+	}
+
+
 private pure func target_doc(name: Option[String], pattern: Option[Pattern]) -> Doc:
 	match name:
 		Some(var_name): var_name.text()
@@ -731,7 +1092,7 @@ private pure func annotation_doc(name: String, enabled: Bool, is_private: Bool) 
 
 private pure func is_foreign_func_body(body: FuncBody) -> Bool:
 	match body:
-		ForeignFuncBody(_): True
+		ForeignFuncBody(_, _): True
 		_: False
 
 
@@ -755,7 +1116,7 @@ private pure func func_body_suffix_doc(name: String, body: FuncBody) -> Doc:
 				.cat(hardline()
 						.cat(c_name.builtin_body_doc())
 						.indent())
-		ForeignFuncBody(foreign_name):
+		ForeignFuncBody(foreign_name, _):
 			if foreign_name == name:
 				"".text()
 			else:
@@ -1005,7 +1366,7 @@ private pure func impl_method_doc(method: ImplMethod) -> Doc:
 		method.type_params,
 		method.params,
 		method.ret,
-		ExprFuncBody(method.body),
+		method.body,
 	)
 
 
@@ -1112,13 +1473,6 @@ private pure func is_small_decl(decl: Decl) -> Bool:
 		_: False
 
 
-private pure func is_foreign_program_decl(decl: Decl) -> Bool:
-	match decl:
-		DocDecl(_, inner): inner.is_foreign_program_decl()
-		FuncDecl(is_private, _, _, _, _, _, _, _, _, body): not is_private and body.is_foreign_func_body()
-		_: False
-
-
 private pure func foreign_block_func_doc(decl: Decl) -> Doc:
 	match decl:
 		DocDecl(doc, inner): doc
@@ -1149,26 +1503,170 @@ private pure func foreign_block_func_doc(decl: Decl) -> Doc:
 		_: decl.decl_doc()
 
 
-private pure func foreign_block_func_docs(decls: List[Decl]) -> List[Doc]:
-	var docs: List[Doc] = []
-	for decl in decls:
-		docs = docs.append(decl.foreign_block_func_doc())
-	docs
+private pure func foreign_link_flag_key(flag: ForeignLinkFlag) -> String:
+	match flag.platform:
+		None: "link"
+		Some("linux"): "link_linux"
+		Some("macos"): "link_macos"
+		Some(platform): "link_" + platform
 
 
-private pure func foreign_block_doc(decls: List[Decl]) -> Doc:
-	"foreign:"
-		.text()
-		.cat(hardline()
-				.cat(decls
-						.foreign_block_func_docs()
-						.hardlines())
-				.indent())
+private pure func foreign_link_flag_arg(flag: ForeignLinkFlag) -> String:
+	flag.foreign_link_flag_key() + ": \"" + flag.value.escape_string_value() + "\""
+
+
+private pure func foreign_block_header_doc(metadata: ForeignMetadata) -> Doc:
+	var args: List[String] = []
+	for include in metadata.includes:
+		args = args.append("include: \"" + include.escape_string_value() + "\"")
+	for flag in metadata.link_flags:
+		args = args.append(flag.foreign_link_flag_arg())
+	if args.length() == 0:
+		"foreign:".text()
+	else:
+		("foreign(" + args.join(", ") + "):").text()
+
+
+private pure func option_string_equal(left: Option[String], right: Option[String]) -> Bool:
+	match left:
+		None:
+			match right:
+				None: True
+				Some(_): False
+		Some(left_value):
+			match right:
+				Some(right_value): left_value == right_value
+				None: False
+
+
+private pure func string_lists_equal(left: List[String], right: List[String]) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var same: Bool = True
+		var index: Int = 0
+		for left_value in left:
+			match right.get(index):
+				Some(right_value):
+					if left_value != right_value:
+						same = False
+				None: same = False
+			index += 1
+		same
+
+
+private pure func foreign_link_flag_equal(left: ForeignLinkFlag, right: ForeignLinkFlag) -> Bool:
+	left.platform.option_string_equal(right.platform) and left.value == right.value
+
+
+private pure func foreign_link_flags_equal(
+	left: List[ForeignLinkFlag],
+	right: List[ForeignLinkFlag],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var same: Bool = True
+		var index: Int = 0
+		for left_value in left:
+			match right.get(index):
+				Some(right_value):
+					if not left_value.foreign_link_flag_equal(right_value):
+						same = False
+				None: same = False
+			index += 1
+		same
+
+
+private pure func foreign_metadata_equal(left: ForeignMetadata, right: ForeignMetadata) -> Bool:
+	left.includes.string_lists_equal(
+		right.includes,
+	) and left.link_flags.foreign_link_flags_equal(right.link_flags)
+
+
+private pure func decl_foreign_metadata(decl: Decl) -> Option[ForeignMetadata]:
+	match decl:
+		DocDecl(_, inner): inner.decl_foreign_metadata()
+		FuncDecl(is_private, _, _, _, _, _, _, _, _, body):
+			if is_private:
+				None
+			else:
+				match body:
+					ForeignFuncBody(_, metadata): Some(metadata)
+					_: None
+		_: None
+
+
+private pure func located_decl_foreign_metadata(located: LocatedDecl) -> Option[ForeignMetadata]:
+	located.decl.decl_foreign_metadata()
+
+
+private pure func located_decl_has_same_foreign_metadata(
+	located: LocatedDecl,
+	metadata: ForeignMetadata,
+) -> Bool:
+	match located.located_decl_foreign_metadata():
+		Some(other): other.foreign_metadata_equal(metadata)
+		None: False
+
+
+private pure func foreign_block_metadata(decls: List[LocatedDecl]) -> ForeignMetadata:
+	match decls.get(0):
+		Some(first):
+			match first.located_decl_foreign_metadata():
+				Some(metadata): metadata
+				None: {includes = [], link_flags = []}
+		None: {includes = [], link_flags = []}
+
+
+private pure func render_foreign_block_func(
+	located: LocatedDecl,
+	comments: List[FormatterComment],
+	skip_leading: Bool,
+) -> RenderedDoc:
+	leading: CommentTake = if skip_leading:
+		{taken = [], remaining = comments}
+	else:
+		comments.take_leading_comments(located.line)
+	trailing: TrailingCommentTake = leading.remaining.take_trailing_comment(located.line)
+	{doc = leading.taken
+			.comments_doc()
+			.cat(located.decl.foreign_block_func_doc())
+			.cat(
+				trailing.comment.trailing_comment_doc(),
+			), remaining_comments = trailing.remaining.copy_formatter_comments()}
+
+
+private pure func render_foreign_block(
+	decls: List[LocatedDecl],
+	comments: List[FormatterComment],
+) -> RenderedDoc:
+	var body_doc: Doc = "".text()
+	var has_body_doc: Bool = False
+	var remaining_comments: List[FormatterComment] = comments
+	var is_first: Bool = True
+	for located in decls:
+		rendered: RenderedDoc = located.render_foreign_block_func(remaining_comments, is_first)
+		if has_body_doc:
+			body_doc = body_doc
+				.cat(hardline())
+				.cat(rendered.doc)
+		else:
+			body_doc = rendered.doc
+			has_body_doc = True
+		remaining_comments = rendered.remaining_comments.copy_formatter_comments()
+		is_first = False
+	{doc = decls
+			.foreign_block_metadata()
+			.foreign_block_header_doc()
+			.cat(hardline()
+					.cat(body_doc)
+					.indent()), remaining_comments = remaining_comments}
 
 
 private pure func flush_foreign_body_item(
 	items: List[ProgramBodyItem],
-	foreign_group: List[Decl],
+	foreign_group: List[LocatedDecl],
 ) -> List[ProgramBodyItem]:
 	if foreign_group.length() == 0:
 		items
@@ -1176,34 +1674,71 @@ private pure func flush_foreign_body_item(
 		items.append(BodyForeignBlock(foreign_group))
 
 
-private pure func program_body_items(decls: List[Decl]) -> List[ProgramBodyItem]:
+private pure func flush_import_body_item(
+	items: List[ProgramBodyItem],
+	import_group: List[LocatedImport],
+) -> List[ProgramBodyItem]:
+	if import_group.length() == 0:
+		items
+	else:
+		items.append(BodyImportBlock(import_group))
+
+
+private pure func located_decl_import(located: LocatedDecl) -> Option[LocatedImport]:
+	match located.decl:
+		ImportDecl(item): Some({line = located.line, column = located.column, item = item})
+		_: None
+
+
+private pure func program_body_items(decls: List[LocatedDecl]) -> List[ProgramBodyItem]:
 	var items: List[ProgramBodyItem] = []
-	var foreign_group: List[Decl] = []
-	for decl in decls:
-		if decl.is_foreign_program_decl():
-			foreign_group = foreign_group.append(decl)
-		else:
-			items = items.flush_foreign_body_item(foreign_group)
-			foreign_group = []
-			items = items.append(BodyDecl(decl))
-	items.flush_foreign_body_item(foreign_group)
-
-
-private pure func program_body_item_doc(item: ProgramBodyItem) -> Doc:
-	match item:
-		BodyDecl(decl): decl.decl_doc()
-		BodyForeignBlock(decls): decls.foreign_block_doc()
+	var import_group: List[LocatedImport] = []
+	var foreign_group: List[LocatedDecl] = []
+	var foreign_metadata: Option[ForeignMetadata] = None
+	for located in decls:
+		match located.located_decl_import():
+			Some(import_item):
+				items = items.flush_foreign_body_item(foreign_group)
+				foreign_group = []
+				foreign_metadata = None
+				import_group = import_group.append(import_item)
+			None:
+				items = items.flush_import_body_item(import_group)
+				import_group = []
+				match located.located_decl_foreign_metadata():
+					Some(metadata):
+						match foreign_metadata:
+							Some(current):
+								if current.foreign_metadata_equal(metadata):
+									foreign_group = foreign_group.append(located)
+								else:
+									items = items.flush_foreign_body_item(foreign_group)
+									foreign_group = [located]
+									foreign_metadata = Some(metadata)
+							None:
+								foreign_group = [located]
+								foreign_metadata = Some(metadata)
+					None:
+						items = items.flush_foreign_body_item(foreign_group)
+						foreign_group = []
+						foreign_metadata = None
+						items = items.append(BodyDecl(located))
+	items
+		.flush_import_body_item(import_group)
+		.flush_foreign_body_item(foreign_group)
 
 
 private pure func program_body_item_func_name(item: ProgramBodyItem) -> Option[String]:
 	match item:
-		BodyDecl(decl): decl.decl_func_name()
+		BodyDecl(located): located.decl.decl_func_name()
+		BodyImportBlock(_): None
 		BodyForeignBlock(_): None
 
 
 private pure func is_small_program_body_item(item: ProgramBodyItem) -> Bool:
 	match item:
-		BodyDecl(decl): decl.is_small_decl()
+		BodyDecl(located): located.decl.is_small_decl()
+		BodyImportBlock(_): False
 		BodyForeignBlock(_): False
 
 
@@ -1230,69 +1765,149 @@ private pure func program_body_item_separator(left: ProgramBodyItem, right: Prog
 			.cat(hardline())
 
 
-private pure func split_leading_imports(decls: List[Decl]) -> ProgramParts:
-	var imports: List[ImportItem] = []
-	var body: List[Decl] = []
+private pure func render_program_body_item(
+	item: ProgramBodyItem,
+	comments: List[FormatterComment],
+) -> RenderedDoc:
+	match item:
+		BodyDecl(located):
+			leading: CommentTake = comments.take_leading_comments(located.line)
+			trailing: TrailingCommentTake = leading.remaining.take_trailing_comment(located.line)
+			drained: CommentTake = trailing.remaining.drain_comments_through(located.end_line)
+			{doc = leading.taken
+					.comments_doc()
+					.cat(located.decl.decl_doc())
+					.cat(
+						trailing.comment.trailing_comment_doc(),
+					), remaining_comments = drained.remaining.copy_formatter_comments()}
+		BodyImportBlock(imports):
+			rendered: ImportBlockRender = imports.render_import_block(comments)
+			{
+				doc = rendered.doc,
+				remaining_comments = rendered.remaining_comments.copy_formatter_comments(),
+			}
+		BodyForeignBlock(decls):
+			first_line: Int = match decls.get(0):
+				Some(first): first.line
+				None: 0
+			leading: CommentTake = comments.take_leading_comments(first_line)
+			rendered: RenderedDoc = decls.render_foreign_block(
+				leading.remaining.copy_formatter_comments(),
+			)
+			{doc = leading.taken
+					.comments_doc()
+					.cat(
+						rendered.doc,
+					), remaining_comments = rendered.remaining_comments.copy_formatter_comments()}
+
+
+private pure func split_leading_imports(decls: List[LocatedDecl]) -> ProgramParts:
+	var imports: List[LocatedImport] = []
+	var body: List[LocatedDecl] = []
 	var in_body: Bool = False
-	for decl in decls:
+	for located in decls:
 		if in_body:
-			body = body.append(decl)
+			body = body.append(located)
 		else:
-			match decl:
-				ImportDecl(item): imports = imports.append(item)
+			match located.decl:
+				ImportDecl(item): imports = imports.append(
+					{line = located.line, column = located.column, item = item},
+				)
 				_:
 					in_body = True
-					body = body.append(decl)
+					body = body.append(located)
 	{imports = imports, body = body}
 
 
-private pure func program_body_doc(decls: List[Decl]) -> Doc:
+private pure func program_body_doc(
+	decls: List[LocatedDecl],
+	comments: List[FormatterComment],
+) -> Doc:
 	items: List[ProgramBodyItem] = decls.program_body_items()
 	var result: Doc = "".text()
 	var previous: Option[ProgramBodyItem] = None
+	var remaining_comments: List[FormatterComment] = comments
 	for item in items:
+		rendered: RenderedDoc = item.render_program_body_item(remaining_comments)
 		match previous:
-			None: result = item.program_body_item_doc()
+			None: result = rendered.doc
 			Some(prev): result = result
 				.cat(prev.program_body_item_separator(item))
-				.cat(item.program_body_item_doc())
+				.cat(rendered.doc)
+		remaining_comments = rendered.remaining_comments.copy_formatter_comments()
 		previous = Some(item)
-	result
+	result.append_remaining_comments(remaining_comments)
 
 
-pure func program_doc(decls: List[Decl]) -> Doc:
-	parts: ProgramParts = decls.split_leading_imports()
-	import_doc: Doc = parts.imports.import_items_doc()
-	body_doc: Doc = parts.body.program_body_doc()
+private pure func program_first_decl_line(decls: List[LocatedDecl]) -> Int:
+	match decls.get(0):
+		Some(first): first.line
+		None: 2147483647
+
+
+pure func program_doc(program: Program) -> Doc:
+	parts: ProgramParts = program.decls.split_leading_imports()
 	if parts.imports.length() == 0:
-		body_doc
-	else if parts.body.length() == 0:
-		import_doc
+		parts.body.program_body_doc(program.comments)
 	else:
-		import_doc
-			.cat(hardline())
-			.cat(hardline())
-			.cat(hardline())
-			.cat(body_doc)
+		header_comments: CommentTake = program.comments.take_leading_comments(
+			program.decls.program_first_decl_line(),
+		)
+		import_render: ImportBlockRender = parts.imports.render_import_block(
+			header_comments.remaining.copy_formatter_comments(),
+		)
+		import_doc: Doc = header_comments.taken
+			.comments_doc()
+			.cat(import_render.doc)
+		body_doc: Doc = parts.body.program_body_doc(
+			import_render.remaining_comments.copy_formatter_comments(),
+		)
+		if parts.body.length() == 0:
+			import_doc.append_remaining_comments(
+				import_render.remaining_comments.copy_formatter_comments(),
+			)
+		else:
+			import_doc
+				.cat(hardline())
+				.cat(hardline())
+				.cat(hardline())
+				.cat(body_doc)
 
 
-pure func program_from_json(value: JsonValue) -> Result[List[Decl], String]:
+private pure func located_decl_from_json(value: JsonValue) -> Result[LocatedDecl, String]:
+	match value.get_field("decl"):
+		Some(decl_value):
+			line ?= value.int_field("line")
+			column ?= value.int_field("column")
+			end_line ?= value.optional_int_field("end_line")
+			decl ?= decl_value.decl_from_json()
+			resolved_end: Int = match end_line:
+				Some(value): value
+				None: line
+			Ok({line = line, column = column, end_line = resolved_end, decl = decl})
+		None:
+			decl ?= value.decl_from_json()
+			Ok({line = 0, column = 0, end_line = 0, decl = decl})
+
+
+pure func program_from_json(value: JsonValue) -> Result[Program, String]:
 	items ?= value.array_field("program")
-	var result: List[Decl] = []
+	comments ?= value.formatter_comments_field("comments")
+	var result: List[LocatedDecl] = []
 	var error: Option[String] = None
 	for item in items:
 		match error:
 			Some(_): void
 			None:
-				match item.decl_from_json():
+				match item.located_decl_from_json():
 					Ok(decl): result = result.append(decl)
 					Err(msg): error = Some(msg)
 	match error:
 		Some(msg): Err(msg)
-		None: Ok(result)
+		None: Ok({decls = result, comments = comments})
 
 
-pure func program_from_json_string(input: String) -> Result[List[Decl], String]:
+pure func program_from_json_string(input: String) -> Result[Program, String]:
 	value ?= input.parse_json()
 	value.program_from_json()
 
