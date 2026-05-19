@@ -737,9 +737,16 @@ let () =
             repl_usage ();
             exit 1)
     | "format" :: rest ->
-        let rec parse_format_args args check diff files =
+        let rec parse_format_args args check diff emit_doc_json emit_expr_json
+            emit_decl_json files =
           match args with
-          | [] -> (check, diff, List.rev files)
+          | [] ->
+              ( check,
+                diff,
+                emit_doc_json,
+                emit_expr_json,
+                emit_decl_json,
+                List.rev files )
           | "--help" :: _ | "-h" :: _ ->
               print_endline "Usage: blorp format [options] <file.brp|dir>";
               print_endline "";
@@ -749,21 +756,101 @@ let () =
               print_endline
                 "  --diff         Show diff for unformatted files (with \
                  --check)";
+              print_endline
+                "  --emit-doc-json  Print formatter Doc JSON for one file \
+                 (internal)";
+              print_endline
+                "  --emit-expr-json Print formatter expression parity JSONL \
+                 for one file (internal)";
+              print_endline
+                "  --emit-decl-json Print formatter declaration parity JSONL \
+                 for one file (internal)";
               print_endline "";
               print_endline
                 "Accepts files or directories (recursively finds .brp files).";
               exit 0
-          | "--check" :: rest -> parse_format_args rest true diff files
-          | "--diff" :: rest -> parse_format_args rest check true files
-          | file :: rest -> parse_format_args rest check diff (file :: files)
+          | "--check" :: rest ->
+              parse_format_args rest true diff emit_doc_json emit_expr_json
+                emit_decl_json files
+          | "--diff" :: rest ->
+              parse_format_args rest check true emit_doc_json emit_expr_json
+                emit_decl_json files
+          | "--emit-doc-json" :: rest ->
+              parse_format_args rest check diff true emit_expr_json
+                emit_decl_json files
+          | "--emit-expr-json" :: rest ->
+              parse_format_args rest check diff emit_doc_json true
+                emit_decl_json files
+          | "--emit-decl-json" :: rest ->
+              parse_format_args rest check diff emit_doc_json emit_expr_json
+                true files
+          | file :: rest ->
+              parse_format_args rest check diff emit_doc_json emit_expr_json
+                emit_decl_json (file :: files)
         in
-        let check, diff, paths = parse_format_args rest false false [] in
+        let check, diff, emit_doc_json, emit_expr_json, emit_decl_json, paths =
+          parse_format_args rest false false false false false []
+        in
         if paths = [] then begin
           Printf.eprintf
             "Error: no files specified. Usage: blorp format [--check] \
              <file.brp|dir>\n";
           exit 1
         end;
+        let emit_count =
+          (if emit_doc_json then 1 else 0)
+          + (if emit_expr_json then 1 else 0)
+          + if emit_decl_json then 1 else 0
+        in
+        if emit_count > 1 then begin
+          Printf.eprintf "Error: formatter JSON emit flags cannot be combined\n";
+          exit 1
+        end;
+        if emit_doc_json then
+          begin match paths with
+          | [ filename ] -> (
+              match Fmt.format_doc_json_file filename with
+              | Ok json ->
+                  print_endline json;
+                  exit 0
+              | Error msg ->
+                  Printf.eprintf "%s: %s\n" filename msg;
+                  exit 1)
+          | _ ->
+              Printf.eprintf
+                "Error: --emit-doc-json accepts exactly one .brp file\n";
+              exit 1
+          end;
+        if emit_expr_json then
+          begin match paths with
+          | [ filename ] -> (
+              match Fmt.format_expr_cases_json_lines_file filename with
+              | Ok jsonl ->
+                  print_endline jsonl;
+                  exit 0
+              | Error msg ->
+                  Printf.eprintf "%s: %s\n" filename msg;
+                  exit 1)
+          | _ ->
+              Printf.eprintf
+                "Error: --emit-expr-json accepts exactly one .brp file\n";
+              exit 1
+          end;
+        if emit_decl_json then
+          begin match paths with
+          | [ filename ] -> (
+              match Fmt.format_decl_cases_json_lines_file filename with
+              | Ok jsonl ->
+                  print_endline jsonl;
+                  exit 0
+              | Error msg ->
+                  Printf.eprintf "%s: %s\n" filename msg;
+                  exit 1)
+          | _ ->
+              Printf.eprintf
+                "Error: --emit-decl-json accepts exactly one .brp file\n";
+              exit 1
+          end;
         let files = List.map collect_brp_files paths |> List.flatten in
         if files = [] then begin
           Printf.eprintf "Error: no .brp files found\n";

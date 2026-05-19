@@ -128,11 +128,14 @@ val std_source_dir : ?sess:Session.t -> unit -> string option
 val parse_source :
   ?sess:Session.t ->
   ?filename:string ->
+  ?hoist_nested:bool ->
   string ->
   (Ast.program, Ast.compiler_error) result
 (** Parse source text into an AST program.
-    Resets lexer state, runs the parser + interpolation transform.
-    Returns structured error on parse failure. *)
+    Resets lexer state, runs the parser + interpolation transform, and hoists
+    nested function declarations by default. Formatters and source-preserving
+    tools can pass [~hoist_nested:false] to retain parser-level [EFuncDecl]
+    nodes. Returns structured error on parse failure. *)
 
 val collect_private_names : Ast.program -> (string * Ast.decl) list
 (** Collect names of private declarations from a program. *)

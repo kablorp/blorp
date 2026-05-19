@@ -911,7 +911,7 @@ let init_module_paths ?sess base_dir =
     Resets lexer state, runs the parser, and applies string interpolation
     transform. Catches all known parse exceptions and returns a structured
     error on failure. *)
-let parse_source ?sess ?filename source =
+let parse_source ?sess ?filename ?(hoist_nested = true) source =
   let _ = sess_of ?sess () in
   (* Acknowledge ambient; lexer state still module-level in Phase 2.1a *)
   Lexer.reset_state ();
@@ -920,17 +920,17 @@ let parse_source ?sess ?filename source =
   try
     let program = Parser.program Lexer.next_token lexbuf in
     let program = Interp_parser.transform_program program in
-    (* Hoist nested [func] declarations out of function bodies into
-       top-level [DFunc]s. See [nested_hoist.ml] — after this pass no
-       [EFuncDecl] survives and downstream passes treat the hoisted
-       functions like any other top-level function. The pass can raise
-       [Capture_error] when a nested function references a parent-scope
-       binding; surface it as a structured [compiler_error] here rather
-       than propagating the OCaml exception. *)
-    match
-      try Ok (Nested_hoist.hoist_program program)
-      with Nested_hoist.Capture_error err -> Error err
-    with
+    (* Compiler callers hoist nested [func] declarations out of function
+       bodies into top-level [DFunc]s. Formatters and source-inspection tools
+       can opt out so they preserve parser-level [EFuncDecl] nodes. See
+       [nested_hoist.ml] for the compiler lowering behavior. *)
+    let hoisted =
+      if hoist_nested then
+        try Ok (Nested_hoist.hoist_program program)
+        with Nested_hoist.Capture_error err -> Error err
+      else Ok program
+    in
+    match hoisted with
     | Ok program ->
         (* See note in [load_module_once] — subscript desugaring is
             applied by the typecheck pipeline, not here. *)

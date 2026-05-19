@@ -5,6 +5,33 @@
 val format_string : string -> (string, string) result
 (** Format a source string. Returns the formatted source. *)
 
+val format_doc_json_string : string -> (string, string) result
+(** Parse a source string and return serialized formatter Doc JSON.
+    This is an internal dogfooding boundary for the Blorp layout tool. *)
+
+val format_doc_json_file : string -> (string, string) result
+(** Parse a source file and return serialized formatter Doc JSON. *)
+
+val format_expr_cases_json_lines_string : string -> (string, string) result
+(** Parse a source string and return expression-formatting parity cases as
+    newline-delimited JSON.
+
+    This is an internal dogfooding boundary for the Blorp expression formatter
+    port. *)
+
+val format_expr_cases_json_lines_file : string -> (string, string) result
+(** Parse a source file and return expression-formatting parity JSONL. *)
+
+val format_decl_cases_json_lines_string : string -> (string, string) result
+(** Parse a source string and return declaration-formatting parity cases as
+    newline-delimited JSON.
+
+    This is an internal dogfooding boundary for the Blorp declaration formatter
+    port. *)
+
+val format_decl_cases_json_lines_file : string -> (string, string) result
+(** Parse a source file and return declaration-formatting parity JSONL. *)
+
 val format_file :
   ?use_cache:bool -> check:bool -> string -> (bool, string) result
 (** Format a file. If [check] is true, returns [Ok true] if the file is

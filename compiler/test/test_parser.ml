@@ -133,6 +133,19 @@ let test_formatter_keeps_consecutive_block_comments_together () =
   in
   check_string "formatted source" expected (format_ok source)
 
+let test_formatter_preserves_nested_function_declarations () =
+  let source =
+    "func main(args: List[String]) -> Int:\n"
+    ^ "\tpure func helper[T](x: Int) -> Int:\n" ^ "\t\tx + 1\n"
+    ^ "\thelper(1)\n"
+  in
+  let expected =
+    "func main(args: List[String]) -> Int:\n"
+    ^ "\tpure func helper[T](x: Int) -> Int:\n" ^ "\t\tx + 1\n"
+    ^ "\thelper(1)\n"
+  in
+  check_string "formatted source" expected (format_ok source)
+
 let test_foreign_function_forms_preserve_flags () =
   let source =
     "foreign(include: \"math.h\", link_macos: \"-lm\"):\n"
@@ -219,6 +232,8 @@ let suite =
           test_formatter_preserves_single_block_blank_line;
         Alcotest.test_case "consecutive block comments stay grouped" `Quick
           test_formatter_keeps_consecutive_block_comments_together;
+        Alcotest.test_case "nested function declarations stay nested" `Quick
+          test_formatter_preserves_nested_function_declarations;
       ] );
     ( "foreign",
       [

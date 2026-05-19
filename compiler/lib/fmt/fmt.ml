@@ -44,9 +44,8 @@ let mark_cached_formatted source =
 
 (* ===== Formatter ===== *)
 
-(** Format a source string. Returns the formatted source or an error. *)
-let format_string source =
-  match Modules.parse_source source with
+let doc_for_source source =
+  match Modules.parse_source ~hoist_nested:false source with
   | Error { message; loc; _ } ->
       Error
         (Printf.sprintf "%s at line %d, column %d" message loc.Ast.line
@@ -58,13 +57,66 @@ let format_string source =
         Fmt_printer.comments := Fmt_comment.create collected_comments;
         (* Convert AST to document IR *)
         let doc = Fmt_printer.print_program program in
-        (* Layout and post-process *)
-        let result = Fmt_layout.layout doc in
-        Ok result
+        Ok doc
       with
       | Failure msg -> Error (Printf.sprintf "Formatter error: %s" msg)
       | Invalid_argument msg -> Error (Printf.sprintf "Formatter error: %s" msg)
       | Not_found -> Error "Formatter error: internal lookup failed")
+
+(** Format a source string. Returns the formatted source or an error. *)
+let format_string source =
+  match doc_for_source source with
+  | Error msg -> Error msg
+  | Ok doc ->
+      (* Layout and post-process *)
+      Ok (Fmt_layout.layout doc)
+
+let format_doc_json_string source =
+  match doc_for_source source with
+  | Error msg -> Error msg
+  | Ok doc -> Ok (Fmt_doc_json.to_json doc)
+
+let format_doc_json_file filename =
+  try
+    let source = Modules.read_file filename in
+    format_doc_json_string source
+  with Sys_error msg -> Error (Printf.sprintf "File error: %s" msg)
+
+let format_expr_cases_json_lines_string source =
+  match Modules.parse_source ~hoist_nested:false source with
+  | Error { message; loc; _ } ->
+      Error
+        (Printf.sprintf "%s at line %d, column %d" message loc.Ast.line
+           loc.Ast.column)
+  | Ok program -> (
+      try Ok (Fmt_expr_json.cases_json_lines program) with
+      | Failure msg -> Error (Printf.sprintf "Formatter error: %s" msg)
+      | Invalid_argument msg -> Error (Printf.sprintf "Formatter error: %s" msg)
+      | Not_found -> Error "Formatter error: internal lookup failed")
+
+let format_expr_cases_json_lines_file filename =
+  try
+    let source = Modules.read_file filename in
+    format_expr_cases_json_lines_string source
+  with Sys_error msg -> Error (Printf.sprintf "File error: %s" msg)
+
+let format_decl_cases_json_lines_string source =
+  match Modules.parse_source ~hoist_nested:false source with
+  | Error { message; loc; _ } ->
+      Error
+        (Printf.sprintf "%s at line %d, column %d" message loc.Ast.line
+           loc.Ast.column)
+  | Ok program -> (
+      try Ok (Fmt_decl_json.cases_json_lines program) with
+      | Failure msg -> Error (Printf.sprintf "Formatter error: %s" msg)
+      | Invalid_argument msg -> Error (Printf.sprintf "Formatter error: %s" msg)
+      | Not_found -> Error "Formatter error: internal lookup failed")
+
+let format_decl_cases_json_lines_file filename =
+  try
+    let source = Modules.read_file filename in
+    format_decl_cases_json_lines_string source
+  with Sys_error msg -> Error (Printf.sprintf "File error: %s" msg)
 
 (** Compute a simple line-level diff between two strings.
     Shows the first few changed lines. Since the formatter only rearranges/restylings

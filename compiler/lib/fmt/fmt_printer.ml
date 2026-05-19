@@ -1034,11 +1034,11 @@ and print_expr_desc = function
       let params =
         match (timeout, max_threads) with
         | None, None -> Nil
-        | Some t, None -> text "(timeout: " ^^ print_expr t ^^ text ") "
-        | None, Some n -> text (Printf.sprintf "(max_threads: %d) " n)
+        | Some t, None -> text "(timeout: " ^^ print_expr t ^^ text ")"
+        | None, Some n -> text (Printf.sprintf "(max_threads: %d)" n)
         | Some t, Some n ->
             text (Printf.sprintf "(max_threads: %d, timeout: " n)
-            ^^ print_expr t ^^ text ") "
+            ^^ print_expr t ^^ text ")"
       in
       text "concurrent" ^^ params ^^ text " for " ^^ text var ^^ text " in "
       ^^ print_expr iter ^^ text ":"
