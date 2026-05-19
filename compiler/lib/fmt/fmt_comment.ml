@@ -41,6 +41,25 @@ let take_trailing t ~on_line =
       Some c
   | _ -> None
 
+(** Take the next trailing comment if it appears before the next item line.
+    This is used for block expression items whose parser location may point at
+    the enclosing form rather than the physical expression line. *)
+let take_trailing_before t ~before_line =
+  match t.remaining with
+  | c :: rest when c.cc_trailing && c.cc_line < before_line ->
+      t.remaining <- rest;
+      Some c
+  | _ -> None
+
+(** Take the next trailing comment regardless of line. Used at the end of a
+    scoped block after all child expressions have been rendered. *)
+let take_next_trailing t =
+  match t.remaining with
+  | c :: rest when c.cc_trailing ->
+      t.remaining <- rest;
+      Some c
+  | _ -> None
+
 (** Drain all comments (leading and trailing) with line <= through_line.
     Returns them as a list. Used to consume comments in a section that is
     being reformatted (e.g. the import block). *)

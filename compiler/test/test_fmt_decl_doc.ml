@@ -228,6 +228,37 @@ let test_trait_impl_decl_json () =
         (string_contains impl_json {|{"tag":"Impl","private":false|})
   | _ -> Alcotest.fail "expected trait and impl declarations to serialize"
 
+let test_non_expression_impl_method_decl_json () =
+  let impl_decl =
+    {
+      Ast.impl_trait = "Stringable";
+      impl_for_type = ty_named "Char" [];
+      impl_methods =
+        [
+          func_with_body ~is_pure:true ~return_type:(ty_named "String" [])
+            "to_string"
+            [ typed_param "val" (ty_named "Char" []) ]
+            (Ast.FuncBuiltinBody
+               (Ast.BuiltinRuntime "blorp_from_char", Ast.dummy_loc));
+        ];
+    }
+  in
+  let d = decl (Ast.DImpl impl_decl) in
+  match DeclJson.decl_to_json d with
+  | None -> Alcotest.fail "expected builtin impl method to serialize"
+  | Some decl_json ->
+      Alcotest.(check bool)
+        "includes builtin method body kind" true
+        (string_contains decl_json {|"body_kind":"builtin"|});
+      Alcotest.(check bool)
+        "includes builtin method name" true
+        (string_contains decl_json {|"builtin_name":"blorp_from_char"|});
+      Alcotest.(check bool)
+        "case keeps expected layout" true
+        (string_contains
+           (DeclJson.case_json d decl_json)
+           {|"expected":"implements Stringable for Char:\n\tpure func to_string(val: Char) -> String:\n\t\tbuiltin(\"blorp_from_char\")\n"|})
+
 let test_non_expression_func_decl_json () =
   let builtin_func =
     func_with_body ~return_type:(ty_named "Int" []) "read_clock" []
@@ -310,13 +341,13 @@ let test_doctest_docstring_decl_json_keeps_body_case () =
   | None -> Alcotest.fail "expected declaration body to serialize"
   | Some decl_json ->
       Alcotest.(check bool)
-        "does not wrap parser-formatted doctests yet" false
+        "wraps doctest docstring" true
         (string_contains decl_json {|{"tag":"Doc"|});
       let case_json = DeclJson.case_json d decl_json in
       Alcotest.(check bool)
-        "expected layout keeps declaration body only" true
+        "expected layout includes doctest docstring" true
         (string_contains case_json
-           {|"expected":"func example() -> Int:\n\t1\n"|})
+           {|"expected":"---\nExamples\n\ndoctests:\n    :: works\n    1\n---\nfunc example() -> Int:\n\t1\n"|})
 
 let test_program_decl_json () =
   let source =
@@ -392,6 +423,189 @@ let test_program_decl_json_with_duplicate_imports () =
         (string_contains jsonl
            {|"expected":"import:\n\tdict as D\n\tlist: append, get\n\n\nvar total: Int = 0\n"|})
 
+let test_program_decl_json_with_body_imports () =
+  let source =
+    String.concat "\n"
+      [
+        "type alias Pair[A, B] = (A, B)";
+        "";
+        "import:";
+        "    list: get, append";
+        "    dict as D";
+        "";
+        "var total: Int = 0";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes program case" true
+        (string_contains jsonl {|"program":[|});
+      Alcotest.(check bool)
+        "program expected keeps body import block" true
+        (string_contains jsonl
+           {|"expected":"type alias Pair[A, B] = (A, B)\n\n\nimport:\n\tdict as D\n\tlist: append, get\n\n\nvar total: Int = 0\n"|})
+
+let test_decl_json_preserves_block_blank_lines () =
+  let source =
+    String.concat "\n"
+      [
+        "func grouped() -> Int:";
+        "    a: Int = 1";
+        "";
+        "    b: Int = 2";
+        "    a + b";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes block blank metadata" true
+        (string_contains jsonl {|"blank_before":[false,true,false]|});
+      Alcotest.(check bool)
+        "expected layout keeps block blank line" true
+        (string_contains jsonl
+           {|"expected":"func grouped() -> Int:\n\ta: Int = 1\n\n\tb: Int = 2\n\ta + b\n"|})
+
+let test_program_decl_json_with_body_comments () =
+  let source =
+    String.concat "\n"
+      [
+        "func grouped() -> Int:";
+        "    a: Int = 1";
+        "";
+        "    -- keep this with the block";
+        "    b: Int = 2";
+        "    a + b";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes block item metadata" true
+        (string_contains jsonl {|"items":[|});
+      Alcotest.(check bool)
+        "includes body comment item" true
+        (string_contains jsonl {|"text":"-- keep this with the block"|});
+      Alcotest.(check bool)
+        "program expected keeps body comment" true
+        (string_contains jsonl
+           {|"expected":"func grouped() -> Int:\n\ta: Int = 1\n\n\t-- keep this with the block\n\tb: Int = 2\n\ta + b\n"|})
+
+let test_program_decl_json_with_body_trailing_comments () =
+  let source =
+    String.concat "\n"
+      [
+        "func grouped() -> Int:";
+        "    a: Int = 1 -- first";
+        "    b: Int = 2 -- second";
+        "    a + b -- result";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes trailing block item metadata" true
+        (string_contains jsonl {|"trailing":"-- first"|});
+      Alcotest.(check bool)
+        "program expected keeps body trailing comments" true
+        (string_contains jsonl
+           {|"expected":"func grouped() -> Int:\n\ta: Int = 1 -- first\n\tb: Int = 2 -- second\n\ta + b -- result\n"|})
+
+let test_program_decl_json_with_comments () =
+  let source =
+    String.concat "\n"
+      [
+        "-- file header";
+        "var total: Int = 0 -- count";
+        "-- alias comment";
+        "type alias Count = Int";
+        "-- eof";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes program case" true
+        (string_contains jsonl {|"program":[|});
+      Alcotest.(check bool)
+        "includes comments" true
+        (string_contains jsonl {|"comments":[|});
+      Alcotest.(check bool)
+        "program expected keeps comments" true
+        (string_contains jsonl
+           {|"expected":"-- file header\nvar total: Int = 0 -- count\n\n-- alias comment\ntype alias Count = Int\n-- eof\n"|})
+
+let test_program_decl_json_with_doctest_docstring () =
+  let source =
+    String.concat "\n"
+      [
+        "---";
+        "Example docs.";
+        "";
+        "doctests:";
+        "    :: unformatted list";
+        "    xs: List[Int]=[1,2]";
+        "    xs.length()==2";
+        "---";
+        "func documented() -> Int:";
+        "    1";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes program case" true
+        (string_contains jsonl {|"program":[|});
+      Alcotest.(check bool)
+        "JSON doc body is normalized" true
+        (string_contains jsonl {|xs: List[Int] = [1, 2]\n    xs.length() == 2|});
+      Alcotest.(check bool)
+        "program expected keeps normalized doctest" true
+        (string_contains jsonl
+           {|"expected":"---\nExample docs.\n\ndoctests:\n    :: unformatted list\n    xs: List[Int] = [1, 2]\n    xs.length() == 2\n---\nfunc documented() -> Int:\n\t1\n"|})
+
+let test_program_decl_json_with_import_comments () =
+  let source =
+    String.concat "\n"
+      [
+        "-- file header";
+        "import:";
+        "    -- dict import";
+        "    dict as D -- dict trailing";
+        "    -- list import";
+        "    list: get, append";
+        "-- body comment";
+        "var total: Int = 0";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes program case" true
+        (string_contains jsonl {|"program":[|});
+      Alcotest.(check bool)
+        "includes comments" true
+        (string_contains jsonl {|"comments":[|});
+      Alcotest.(check bool)
+        "program expected keeps import comments" true
+        (string_contains jsonl
+           {|"expected":"-- file header\n-- dict import\nimport:\n\tdict as D -- dict trailing\n\t-- list import\n\tlist: append, get\n\n\n-- body comment\nvar total: Int = 0\n"|})
+
 let test_program_decl_json_with_foreign_block () =
   let source =
     String.concat "\n"
@@ -413,6 +627,36 @@ let test_program_decl_json_with_foreign_block () =
         "program expected groups foreign functions" true
         (string_contains jsonl
            {|"expected":"foreign:\n\tfunc floor(x: Float) -> Float = \"c_floor\"\n\n\nfunc read_clock() -> Int:\n\tbuiltin(\"blorp_read_clock\")\n"|})
+
+let test_program_decl_json_with_foreign_comments () =
+  let source =
+    String.concat "\n"
+      [
+        "-- file header";
+        "-- foreign block comment";
+        "foreign(include: \"math.h\", link: \"-lm\"):";
+        "    -- floor comment";
+        "    func floor(x: Float) -> Float = \"c_floor\" -- floor trailing";
+        "    -- ceil comment";
+        "    func ceil(x: Float) -> Float = \"c_ceil\"";
+        "-- body comment";
+        "var total: Int = 0";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes program case" true
+        (string_contains jsonl {|"program":[|});
+      Alcotest.(check bool)
+        "includes foreign includes" true
+        (string_contains jsonl {|"foreign_includes":["math.h"]|});
+      Alcotest.(check bool)
+        "program expected keeps foreign comments" true
+        (string_contains jsonl
+           {|"expected":"-- file header\n-- foreign block comment\n-- floor comment\nforeign(include: \"math.h\", link: \"-lm\"):\n\tfunc floor(x: Float) -> Float = \"c_floor\" -- floor trailing\n\t-- ceil comment\n\tfunc ceil(x: Float) -> Float = \"c_ceil\"\n\n\n-- body comment\nvar total: Int = 0\n"|})
 
 let test_func_decl_json_case_uses_ocaml_expected_layout () =
   let fd =
@@ -470,6 +714,10 @@ let test_decl_json_lines_from_source () =
         "implements Incrementable for Counter:";
         "    func increment(self: Counter) -> Counter:";
         "        self";
+        "";
+        "implements Stringable for Char:";
+        "    pure func to_string(val: Char) -> String:";
+        "        builtin(\"blorp_from_char\")";
         "";
         "var total: Int = 0";
         "";
@@ -530,6 +778,9 @@ let test_decl_json_lines_from_source () =
         "includes builtin function case" true
         (string_contains jsonl {|"body_kind":"builtin"|});
       Alcotest.(check bool)
+        "includes builtin impl method case" true
+        (string_contains jsonl {|"builtin_name":"blorp_from_char"|});
+      Alcotest.(check bool)
         "includes docstring case" true
         (string_contains jsonl {|"tag":"Doc","doc":"Read the clock."|})
 
@@ -544,6 +795,8 @@ let suite =
           test_type_record_alias_decl_json;
         Alcotest.test_case "trait and impl declaration JSON" `Quick
           test_trait_impl_decl_json;
+        Alcotest.test_case "non-expression impl method declaration JSON" `Quick
+          test_non_expression_impl_method_decl_json;
         Alcotest.test_case "non-expression function declaration JSON" `Quick
           test_non_expression_func_decl_json;
         Alcotest.test_case "docstring declaration JSON" `Quick
@@ -556,8 +809,25 @@ let suite =
           test_program_decl_json_with_imports;
         Alcotest.test_case "program declaration JSON with duplicate imports"
           `Quick test_program_decl_json_with_duplicate_imports;
+        Alcotest.test_case "program declaration JSON with body imports" `Quick
+          test_program_decl_json_with_body_imports;
+        Alcotest.test_case "declaration JSON preserves block blank lines" `Quick
+          test_decl_json_preserves_block_blank_lines;
+        Alcotest.test_case "program declaration JSON with body comments" `Quick
+          test_program_decl_json_with_body_comments;
+        Alcotest.test_case
+          "program declaration JSON with body trailing comments" `Quick
+          test_program_decl_json_with_body_trailing_comments;
+        Alcotest.test_case "program declaration JSON with comments" `Quick
+          test_program_decl_json_with_comments;
+        Alcotest.test_case "program declaration JSON with doctest docstring"
+          `Quick test_program_decl_json_with_doctest_docstring;
+        Alcotest.test_case "program declaration JSON with import comments"
+          `Quick test_program_decl_json_with_import_comments;
         Alcotest.test_case "program declaration JSON with foreign block" `Quick
           test_program_decl_json_with_foreign_block;
+        Alcotest.test_case "program declaration JSON with foreign comments"
+          `Quick test_program_decl_json_with_foreign_comments;
         Alcotest.test_case "declaration JSON case uses OCaml expected layout"
           `Quick test_func_decl_json_case_uses_ocaml_expected_layout;
         Alcotest.test_case "declaration JSONL emits source cases" `Quick

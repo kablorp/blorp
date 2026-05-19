@@ -17,17 +17,17 @@ let array = Fmt_expr_json.array
 let optional_field = Fmt_expr_json.optional_field
 let string_array values = array (List.map string values)
 
-let docstring_supported doc =
-  let lines = String.split_on_char '\n' doc in
-  not (List.exists (fun line -> String.trim line = "doctests:") lines)
+let normalize_docstring doc =
+  String.concat "\n"
+    (Printer.format_docstring_doctests (String.split_on_char '\n' doc))
 
 let with_supported_doc decl decl_json =
   match decl.Ast.decl_doc with
-  | Some doc when docstring_supported doc ->
+  | Some doc ->
       obj
         [
           field "tag" (string "Doc");
-          field "doc" (string doc);
+          field "doc" (string (normalize_docstring doc));
           field "decl" decl_json;
         ]
   | _ -> decl_json
@@ -136,6 +136,11 @@ let builtin_body_fields = function
         field "body_kind" (string "builtin"); field "builtin_name" (string name);
       ]
 
+let foreign_link_flag_to_json (platform, value) =
+  obj
+    ([ field "value" (string value) ]
+    @ optional_field "platform" (Option.map string platform))
+
 let func_body_fields = function
   | Ast.FuncBodyExpr body -> (
       match Fmt_expr_json.expr_to_json body with
@@ -147,6 +152,11 @@ let func_body_fields = function
         [
           field "body_kind" (string "foreign");
           field "foreign_name" (string foreign.Ast.foreign_name);
+          field "foreign_includes" (string_array foreign.Ast.foreign_includes);
+          field "foreign_link_flags"
+            (array
+               (List.map foreign_link_flag_to_json
+                  foreign.Ast.foreign_link_flags));
         ]
   | Ast.FuncNoBody -> Some [ field "body_kind" (string "none") ]
 
@@ -222,34 +232,30 @@ let trait_to_json ~is_private trait_decl =
            ])
 
 let impl_method_to_json func =
-  match func.Ast.func_body with
-  | Ast.FuncBodyExpr body -> (
-      match Fmt_expr_json.expr_to_json body with
-      | None -> None
-      | Some body_json ->
-          let name =
-            match func.Ast.func_name with Some name -> name | None -> ""
-          in
-          Some
-            (obj
-               ([
-                  field "name" (string name);
-                  field "pure" (bool func.Ast.func_is_pure);
-                  field "tailrec" (bool func.Ast.func_is_tailrec);
-                  field "debug_only" (bool func.Ast.func_debug_only);
-                  field "no_copy" (bool func.Ast.func_no_copy);
-                  field "type_params"
-                    (type_params_to_json func.Ast.func_type_params);
-                  field "params"
-                    (array
-                       (List.map Fmt_expr_json.param_to_json
-                          func.Ast.func_params));
-                  field "body" body_json;
-                ]
-               @ optional_field "return"
-                   (Option.map Fmt_expr_json.type_expr_to_json
-                      func.Ast.func_return_type))))
-  | Ast.FuncBuiltinBody _ | Ast.FuncForeign _ | Ast.FuncNoBody -> None
+  match func_body_fields func.Ast.func_body with
+  | None -> None
+  | Some body_fields ->
+      let name =
+        match func.Ast.func_name with Some name -> name | None -> ""
+      in
+      Some
+        (obj
+           ([
+              field "name" (string name);
+              field "pure" (bool func.Ast.func_is_pure);
+              field "tailrec" (bool func.Ast.func_is_tailrec);
+              field "debug_only" (bool func.Ast.func_debug_only);
+              field "no_copy" (bool func.Ast.func_no_copy);
+              field "type_params"
+                (type_params_to_json func.Ast.func_type_params);
+              field "params"
+                (array
+                   (List.map Fmt_expr_json.param_to_json func.Ast.func_params));
+            ]
+           @ body_fields
+           @ optional_field "return"
+               (Option.map Fmt_expr_json.type_expr_to_json
+                  func.Ast.func_return_type)))
 
 let impl_to_json ~is_private impl_decl =
   match
@@ -294,7 +300,7 @@ let rec expected_doc ?(is_private = false) decl =
   | _ ->
       let doc_doc =
         match decl.Ast.decl_doc with
-        | Some doc when docstring_supported doc -> Printer.print_docstring doc
+        | Some doc -> Printer.print_docstring doc
         | _ -> Doc.Nil
       in
       let decl_doc = Printer.print_decl_desc ~is_private decl.Ast.decl_desc in
@@ -313,75 +319,82 @@ let case_json decl decl_json =
       field "decl" decl_json;
     ]
 
-let rec decl_has_import decl =
-  match decl.Ast.decl_desc with
-  | Ast.DImport _ -> true
-  | Ast.DPrivate inner -> decl_has_import inner
-  | _ -> false
+let comment_to_json (comment : Lexer.collected_comment) =
+  obj
+    [
+      field "text" (string comment.Lexer.cc_text);
+      field "line" (string_of_int comment.Lexer.cc_line);
+      field "column" (string_of_int comment.Lexer.cc_col);
+      field "trailing" (bool comment.Lexer.cc_trailing);
+    ]
 
-let imports_are_leading_only program =
-  let rec loop seen_body = function
-    | [] -> true
-    | decl :: rest ->
-        if decl_has_import decl then (not seen_body) && loop seen_body rest
-        else loop true rest
-  in
-  loop false program
+let rec decl_source_end_line decl =
+  let loc_end = max decl.Ast.decl_loc.line decl.Ast.decl_loc.end_line in
+  max loc_end (decl_desc_source_end_line decl.Ast.decl_desc)
 
-let func_has_unsupported_program_foreign func =
-  match func.Ast.func_body with
-  | Ast.FuncForeign foreign
-    when foreign.Ast.foreign_includes = []
-         && foreign.Ast.foreign_link_flags = [] ->
-      false
-  | Ast.FuncForeign _ -> true
-  | _ -> false
-
-let rec decl_has_unsupported_program_foreign decl =
-  match decl.Ast.decl_desc with
-  | Ast.DFunc func -> func_has_unsupported_program_foreign func
-  | Ast.DPrivate inner -> decl_has_unsupported_program_foreign inner
+and decl_desc_source_end_line = function
+  | Ast.DFunc func -> Printer.func_source_end_line func
+  | Ast.DVar var -> Printer.expr_source_end_line var.Ast.var_value
+  | Ast.DPrivate inner -> decl_source_end_line inner
+  | Ast.DTrait trait_decl ->
+      List.fold_left
+        (fun acc method_decl ->
+          match method_decl.Ast.method_default_body with
+          | None -> acc
+          | Some body -> max acc (Printer.expr_source_end_line body))
+        0 trait_decl.Ast.trait_methods
   | Ast.DImpl impl_decl ->
-      List.exists func_has_unsupported_program_foreign
-        impl_decl.Ast.impl_methods
-  | _ -> false
+      List.fold_left
+        (fun acc func -> max acc (Printer.func_source_end_line func))
+        0 impl_decl.Ast.impl_methods
+  | Ast.DImport _ | Ast.DType _ | Ast.DRecord _ | Ast.DTypeAlias _ -> 0
 
-let doc_supported = function
-  | None -> true
-  | Some doc -> docstring_supported doc
+let located_decl_to_json decl decl_json =
+  obj
+    [
+      field "line" (string_of_int decl.Ast.decl_loc.line);
+      field "column" (string_of_int decl.Ast.decl_loc.column);
+      field "end_line" (string_of_int (decl_source_end_line decl));
+      field "decl" decl_json;
+    ]
 
-let rec decl_docstrings_supported decl =
-  doc_supported decl.Ast.decl_doc
-  &&
-  match decl.Ast.decl_desc with
-  | Ast.DPrivate inner -> decl_docstrings_supported inner
-  | _ -> true
+let decl_body_comments comments decl =
+  let start_line = decl.Ast.decl_loc.line in
+  let end_line = decl_source_end_line decl in
+  List.filter
+    (fun comment ->
+      comment.Lexer.cc_line > start_line && comment.Lexer.cc_line <= end_line)
+    comments
 
-let program_supported program =
-  program <> []
-  && imports_are_leading_only program
-  && (not (List.exists decl_has_unsupported_program_foreign program))
-  && List.for_all decl_docstrings_supported program
+let program_supported ~comments:_ program = program <> []
 
-let program_to_json program =
-  if not (program_supported program) then None
-  else Option.map array (Fmt_expr_json.option_map_all decl_to_json program)
+let program_to_json ~comments program =
+  if not (program_supported ~comments program) then None
+  else
+    Option.map array
+      (Fmt_expr_json.option_map_all
+         (fun decl ->
+           Fmt_expr_json.with_comments (decl_body_comments comments decl)
+             (fun () ->
+               Option.map (located_decl_to_json decl) (decl_to_json decl)))
+         program)
 
-let program_expected_layout program =
-  Printer.comments := Fmt_comment.create [];
+let program_expected_layout ~comments program =
+  Printer.comments := Fmt_comment.create comments;
   Layout.layout (Printer.print_program program)
 
-let program_case_json program =
+let program_case_json ~comments program =
   Option.map
     (fun program_json ->
       obj
         [
           field "line" "0";
           field "column" "0";
-          field "expected" (string (program_expected_layout program));
+          field "expected" (string (program_expected_layout ~comments program));
+          field "comments" (array (List.map comment_to_json comments));
           field "program" program_json;
         ])
-    (program_to_json program)
+    (program_to_json ~comments program)
 
 let collect_decl_cases program =
   let rec loop acc = function
@@ -393,10 +406,10 @@ let collect_decl_cases program =
   in
   loop [] program
 
-let cases_json_lines program =
+let cases_json_lines ?(comments = []) program =
   let decl_cases = collect_decl_cases program in
   let cases =
-    match program_case_json program with
+    match program_case_json ~comments program with
     | Some program_case -> decl_cases @ [ program_case ]
     | None -> decl_cases
   in
