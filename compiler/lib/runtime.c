@@ -30,6 +30,15 @@
 #include <sys/random.h>
 #endif
 
+#if defined(__has_feature)
+  #if __has_feature(address_sanitizer)
+    #define BLORP_ASAN 1
+  #endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) && !defined(BLORP_ASAN)
+  #define BLORP_ASAN 1
+#endif
+
 #if defined(MSG_NOSIGNAL)
 #define BLORP_TCP_SEND_FLAGS MSG_NOSIGNAL
 #else
@@ -2115,15 +2124,6 @@ void* blorp_alloc(size_t size) {
     // Try pool for small objects.
     // Pool is disabled under ASan — ASan tracks malloc/free precisely and the pool's
     // memory reuse bypasses that tracking, causing false heap-buffer-overflow reports.
-#if defined(__has_feature)
-  #if __has_feature(address_sanitizer)
-    #define BLORP_ASAN 1
-  #endif
-#endif
-#if defined(__SANITIZE_ADDRESS__)
-  #define BLORP_ASAN 1
-#endif
-
 // Pool disabled under ASan
 #if !defined(BLORP_ASAN)
     if (cls >= 0 && blorp_pool_free[cls] != NULL) {
@@ -13075,7 +13075,14 @@ static size_t __fiber_object_pool_count = 0;
 static size_t __fiber_object_pool_limit = 0;
 static pthread_once_t __fiber_object_pool_limit_once = PTHREAD_ONCE_INIT;
 
-#define BLORP_DEFAULT_FIBER_STACK_SIZE (56 * 1024)
+// Fiber code may cross into libc/pthread interceptors (notably first-use TCP
+// reactor startup). Keep the default large enough that sanitizer and platform
+// frames hit normal control flow instead of the guard page.
+#if defined(BLORP_ASAN)
+#define BLORP_DEFAULT_FIBER_STACK_SIZE (256 * 1024)
+#else
+#define BLORP_DEFAULT_FIBER_STACK_SIZE (128 * 1024)
+#endif
 static size_t __blorp_fiber_stack_size = BLORP_DEFAULT_FIBER_STACK_SIZE;
 
 // ============================================================================
