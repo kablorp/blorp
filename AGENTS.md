@@ -119,6 +119,23 @@ When choosing implementation strategies:
 
 How we work on blorp. These apply to every change — features, bug fixes, refactors.
 
+### Naming
+
+Names are part of the design. Files, modules, functions, datatypes, variants, fields, variables,
+compiler passes, helper utilities, tests, and documentation examples should use names that are
+meaningful, clear, and proportional to their scope.
+
+- Prefer names that explain the concept or invariant, not the implementation accident.
+- Avoid cryptic abbreviations, single-letter names, and overloaded shorthand unless the convention
+  is universal in the local context (`i` for a short loop index, `T` for a type parameter).
+- Avoid names that are so long they hide the structure of the code. If a name needs a sentence,
+  the concept may need a smaller helper, a clearer type, or a comment.
+- Match existing naming style in the surrounding subsystem unless the existing style is clearly
+  misleading; if you introduce a new convention, document it near the boundary where it matters.
+- Tests should name the behavior or regression they protect, not just the API they call.
+- Internal compiler names should expose phase and ownership of responsibility when that prevents
+  confusion, for example distinguishing parser, typed AST, Core, specialization, and emission data.
+
 ### Before you write code
 
 **1. One change per change.** Fix the bug, add the feature, or refactor — not all three.
