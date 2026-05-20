@@ -1868,10 +1868,12 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
     Given a record type name and its concrete type args, returns a list of
     (field_name, resolved_field_type) pairs, or None if type is not a record.
 
-    Tries the local env first, then searches loaded modules' declarations
-    so that record types encountered via union-variant pattern matching
-    (e.g., [GeoLineString(ls)] → [ls: LineString]) can have their fields
-    accessed without an explicit import of the record type. *)
+    Tries the local env first, then resolves legacy bare cross-module payload
+    types only through the session type index when the home module is unique.
+    That lets record types encountered via union-variant pattern matching
+    (e.g., [GeoLineString(ls)] -> [ls: LineString]) have their fields accessed
+    without an explicit import of the record type, while duplicate public names
+    fail deterministically instead of depending on module-cache order. *)
 let resolve_record_field_types env type_name type_args =
   let resolve_with ?(qualify = fun ty -> ty) (type_params, field_list) =
     let subst =
@@ -1887,39 +1889,38 @@ let resolve_record_field_types env type_name type_args =
            (field.field_name, qualify field.field_type |> apply_subst subst))
          field_list)
   in
+  let resolve_module_record (m : Modules.loaded_module) local_type_name =
+    let decls =
+      match m.typed_decls with
+      | Some td -> Typed_ast.program_ast td
+      | None -> m.decls
+    in
+    let local_type_names = module_local_type_names_from_decls decls in
+    let qualify ty =
+      Types.qualify_module_local_types ~module_path:m.name local_type_names ty
+    in
+    let record_decl =
+      List.find_map
+        (fun d ->
+          let rec extract d =
+            match d.Ast.decl_desc with
+            | Ast.DPrivate inner -> extract inner
+            | Ast.DRecord r when r.Ast.record_name = local_type_name ->
+                Some (Ast.type_param_names r.record_type_params, r.record_fields)
+            | _ -> None
+          in
+          extract d)
+        decls
+    in
+    Option.bind record_decl (fun r -> resolve_with ~qualify r)
+  in
   let from_canonical =
     match Types.split_canonical_module_type_name type_name with
     | None -> None
     | Some (module_path, local_type_name) -> (
         match Modules.find_cached module_path with
         | None -> None
-        | Some m ->
-            let decls =
-              match m.typed_decls with
-              | Some td -> Typed_ast.program_ast td
-              | None -> m.decls
-            in
-            let local_type_names = module_local_type_names_from_decls decls in
-            let qualify ty =
-              Types.qualify_module_local_types ~module_path:m.name
-                local_type_names ty
-            in
-            let record_decl =
-              List.find_map
-                (fun d ->
-                  let rec extract d =
-                    match d.Ast.decl_desc with
-                    | Ast.DPrivate inner -> extract inner
-                    | Ast.DRecord r when r.Ast.record_name = local_type_name ->
-                        Some
-                          ( Ast.type_param_names r.record_type_params,
-                            r.record_fields )
-                    | _ -> None
-                  in
-                  extract d)
-                decls
-            in
-            Option.bind record_decl (fun r -> resolve_with ~qualify r))
+        | Some m -> resolve_module_record m local_type_name)
   in
   match from_canonical with
   | Some _ as hit -> hit
@@ -1927,35 +1928,40 @@ let resolve_record_field_types env type_name type_args =
       match get_record env type_name with
       | Some r -> resolve_with r
       | None -> (
-          (* Cross-module fallback: search loaded modules for the record.
-         This handles the case where a record type is referenced
-         indirectly (e.g., as a union variant's payload type) without
-         being explicitly imported. *)
-          let from_module =
-            List.find_map
-              (fun (m : Modules.loaded_module) ->
-                (* Prefer typed_decls for post-typecheck accuracy *)
-                let decls =
-                  match m.typed_decls with
-                  | Some td -> Typed_ast.program_ast td
-                  | None -> m.decls
-                in
-                List.find_map
-                  (fun d ->
-                    let rec extract d =
-                      match d.Ast.decl_desc with
-                      | Ast.DPrivate inner -> extract inner
-                      | Ast.DRecord r when r.Ast.record_name = type_name ->
-                          Some
-                            ( Ast.type_param_names r.record_type_params,
-                              r.record_fields )
-                      | _ -> None
-                    in
-                    extract d)
-                  decls)
-              (Modules.get_all_modules ())
-          in
-          match from_module with Some r -> resolve_with r | None -> None))
+          (* Cross-module fallback for legacy bare type payloads. Resolve only
+             through the session type index when it has exactly one home; if
+             multiple loaded modules declare [type_name], treating one as the
+             winner would make field lookup depend on module-cache order. *)
+          match Session.find_type_homes (Session.current ()) type_name with
+          | [ module_path ] -> (
+              match Modules.find_cached module_path with
+              | Some m -> resolve_module_record m type_name
+              | None -> None)
+          | [] | _ :: _ :: _ -> None))
+
+let ambiguous_bare_record_type_homes type_name =
+  match Types.split_canonical_module_type_name type_name with
+  | Some _ -> None
+  | None -> (
+      match Session.find_type_homes (Session.current ()) type_name with
+      | _ :: _ :: _ as homes -> Some homes
+      | [] | [ _ ] -> None)
+
+let ambiguous_record_type_error loc type_name operation =
+  match ambiguous_bare_record_type_homes type_name with
+  | None -> None
+  | Some homes ->
+      Some
+        (error_with ~notes:[]
+           ~help:
+             (Some
+                "Import the intended record type with an alias, or qualify the \
+                 type before accessing its fields.")
+           loc
+           (Printf.sprintf
+              "Ambiguous record type '%s' is declared in %s. %s cannot choose \
+               a record by bare name."
+              type_name (String.concat ", " homes) operation))
 
 let is_empty_record_collection_type = function
   | TyNamed (("Tensor" | "Vector" | "Matrix" | "Dict" | "Set"), _) -> true
@@ -2968,7 +2974,7 @@ let resolved_target_from_callee ctx callee_name callee_ty =
       | TyFunc { is_pure; _ } -> Some (CallClosure { call_pure = is_pure })
       | _ -> None)
 
-let resolved_call_metadata ctx ~source_callee ~resolved_callee
+let resolved_call_metadata ?call_syntax_hint ctx ~source_callee ~resolved_callee
     ~resolved_overload ~resolved_trait ~resolved_target_hint ~callee_ty
     ~instantiated_params ~instantiated_return =
   let callee_name = get_callee_name resolved_callee in
@@ -2989,7 +2995,10 @@ let resolved_call_metadata ctx ~source_callee ~resolved_callee
   Option.map
     (fun call_target ->
       {
-        call_syntax = call_syntax_of_source_callee ctx source_callee call_target;
+        call_syntax =
+          Option.value call_syntax_hint
+            ~default:
+              (call_syntax_of_source_callee ctx source_callee call_target);
         call_target;
         instantiated_params;
         instantiated_return;
@@ -6987,7 +6996,8 @@ and infer_call ctx expr callee args loc =
              callee,
              args,
              resolved_trait_hint,
-             resolved_target_hint ) =
+             resolved_target_hint,
+             resolved_syntax_hint ) =
         match callee.expr_desc with
         | EFieldAccess (obj, method_name) -> (
             let alias_name =
@@ -7034,6 +7044,7 @@ and infer_call ctx expr callee args loc =
                                   args',
                                   resolved_trait_of_module_impl_method
                                     method_info,
+                                  None,
                                   None )
                           | None -> None)
                       | Error _ -> None)
@@ -7060,7 +7071,14 @@ and infer_call ctx expr callee args loc =
                           module_func
                       in
                       Some
-                        (Ok (callee_ty, callee', ident, args, None, target_hint))
+                        (Ok
+                           ( callee_ty,
+                             callee',
+                             ident,
+                             args,
+                             None,
+                             target_hint,
+                             None ))
                   | None -> None)
             in
             match impl_first with
@@ -7070,14 +7088,16 @@ and infer_call ctx expr callee args loc =
                   ident,
                   args',
                   resolved_trait_hint,
-                  resolved_target_hint ) ->
+                  resolved_target_hint,
+                  resolved_syntax_hint ) ->
                 Ok
                   ( callee_ty,
                     callee',
                     ident,
                     args',
                     resolved_trait_hint,
-                    resolved_target_hint )
+                    resolved_target_hint,
+                    resolved_syntax_hint )
             | None -> (
                 match module_func_first with
                 | Some result -> result
@@ -7122,6 +7142,7 @@ and infer_call ctx expr callee args loc =
                                     ident,
                                     args,
                                     None,
+                                    None,
                                     None )
                             | Error _ ->
                                 error_with ~notes:[] ~help loc
@@ -7136,7 +7157,14 @@ and infer_call ctx expr callee args loc =
                     | None -> (
                         match infer_unconstrained_value_expr ctx callee with
                         | Ok (callee_ty, callee') ->
-                            Ok (callee_ty, callee', callee, args, None, None)
+                            Ok
+                              ( callee_ty,
+                                callee',
+                                callee,
+                                args,
+                                None,
+                                None,
+                                None )
                         | Error original_err -> (
                             match infer_unconstrained_value_expr ctx obj with
                             | Error _ -> Error original_err
@@ -7154,6 +7182,7 @@ and infer_call ctx expr callee args loc =
                                   with
                                   | Ok (callee_ty, callee') ->
                                       (* Check if the resolved function can actually
+
                                  accept the receiver as its first argument. If
                                  not, try UFCS-only methods. *)
                                       let first_param_matches =
@@ -7245,6 +7274,7 @@ and infer_call ctx expr callee args loc =
                                                callee',
                                                ident,
                                                receiver_arg :: args,
+                                               None,
                                                None,
                                                None ))
                                       else None
@@ -7432,13 +7462,20 @@ and infer_call ctx expr callee args loc =
                                             ident2
                                         with
                                         | Ok (callee_ty, callee') ->
+                                            let target_hint =
+                                              Option.map
+                                                (resolved_target_from_overload
+                                                   method_name)
+                                                selected
+                                            in
                                             Ok
                                               ( callee_ty,
                                                 callee',
                                                 ident2,
                                                 receiver_arg :: args,
                                                 None,
-                                                None )
+                                                target_hint,
+                                                Some CallMethodOnlyUfcs )
                                         | Error e -> Error e)
                                     | [] ->
                                         (* No UFCS method either — give helpful error *)
@@ -7490,7 +7527,7 @@ and infer_call ctx expr callee args loc =
             let* callee_ty, callee' =
               infer_unconstrained_value_expr ctx callee
             in
-            Ok (callee_ty, callee', callee, args, None, None)
+            Ok (callee_ty, callee', callee, args, None, None, None)
       in
       (* Overload resolution: when multiple signatures exist for a name,
      use the argument types to select the correct one. Phase 2.7 tasks
@@ -8451,10 +8488,10 @@ and infer_call ctx expr callee args loc =
                     instantiated_return
                 in
                 match
-                  resolved_call_metadata ctx ~source_callee
-                    ~resolved_callee:callee ~resolved_overload ~resolved_trait
-                    ~resolved_target_hint ~callee_ty ~instantiated_params
-                    ~instantiated_return
+                  resolved_call_metadata ?call_syntax_hint:resolved_syntax_hint
+                    ctx ~source_callee ~resolved_callee:callee
+                    ~resolved_overload ~resolved_trait ~resolved_target_hint
+                    ~callee_ty ~instantiated_params ~instantiated_return
                 with
                 | Some call -> Ast.with_expr_resolved_call call_expr call
                 | None -> call_expr )
@@ -9359,7 +9396,11 @@ and infer_record_update ctx expr base fields loc =
             ( base_ty,
               with_inferred_desc expr (ERecordUpdate (base', fields')) base_ty
             )
-      | None -> error loc (Printf.sprintf "Type %s is not a record" type_name))
+      | None -> (
+          match ambiguous_record_type_error loc type_name "Record update" with
+          | Some err -> err
+          | None ->
+              error loc (Printf.sprintf "Type %s is not a record" type_name)))
   | _ ->
       error loc
         (Printf.sprintf "Record update requires a record type, got %s"
@@ -9450,12 +9491,19 @@ and infer_field_access ctx expr obj field loc =
                     (Printf.sprintf
                        "Record %s has no field '%s'. Valid fields: %s" type_name
                        field valid))
-          | None ->
-              error loc
-                (Printf.sprintf
-                   "Cannot access field on type %s. Field access is supported \
-                    on record fields and tuple indices (e.g., .0, .1)"
-                   (type_to_string obj_ty)))
+          | None -> (
+              match
+                ambiguous_record_type_error loc type_name
+                  (Printf.sprintf "Field access '.%s'" field)
+              with
+              | Some err -> err
+              | None ->
+                  error loc
+                    (Printf.sprintf
+                       "Cannot access field on type %s. Field access is \
+                        supported on record fields and tuple indices (e.g., \
+                        .0, .1)"
+                       (type_to_string obj_ty))))
       | _ ->
           error loc
             (Printf.sprintf

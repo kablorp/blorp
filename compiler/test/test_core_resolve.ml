@@ -140,6 +140,60 @@ let test_collect_user_func () =
     "not foreign" true
     (not (Hashtbl.mem env.foreign_funcs "inc"))
 
+let test_collect_user_func_indexes_name_by_def_id () =
+  let func : core_func =
+    {
+      cf_name = "apply__pure";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [ { cp_name = Var.named "x"; cp_ty = ty_int; cp_loc = loc } ];
+      cf_return_ty = ty_int;
+      cf_body = Some (cint 42);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 42;
+    }
+  in
+  let prog = [ { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None } ] in
+  let env =
+    Blorp.Core_resolve.collect_env ~import_aliases:(Hashtbl.create 0)
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  Alcotest.(check (option string))
+    "name by def id" (Some "apply__pure")
+    (Hashtbl.find_opt env.user_func_names_by_id 42)
+
+let test_collect_duplicate_def_id_marks_id_ambiguous () =
+  let make_func name : core_func =
+    {
+      cf_name = name;
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [ { cp_name = Var.named "x"; cp_ty = ty_int; cp_loc = loc } ];
+      cf_return_ty = ty_int;
+      cf_body = Some (cint 42);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc (make_func "inc"); cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc (make_func "main"); cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let env =
+    Blorp.Core_resolve.collect_env ~import_aliases:(Hashtbl.create 0)
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  Alcotest.(check (option string))
+    "ambiguous id removed from reverse index" None
+    (Hashtbl.find_opt env.user_func_names_by_id 0);
+  Alcotest.(check bool)
+    "duplicate id tracked as ambiguous" true
+    (Hashtbl.mem env.ambiguous_user_func_ids 0)
+
 let test_collect_foreign_func () =
   let prog =
     program_with_func ~foreign_name:(Some "c_printf") "printf"
@@ -226,6 +280,63 @@ let test_resolve_user_call () =
         | CKIntrinsic n -> "CKIntrinsic " ^ n
         | CKClosure -> "CKClosure")
   | _ -> Alcotest.fail "expected CCall at root"
+
+let test_resolve_user_call_prefers_carried_def_id_name () =
+  let pure_func : core_func =
+    {
+      cf_name = "apply__pure";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [ { cp_name = Var.named "x"; cp_ty = ty_int; cp_loc = loc } ];
+      cf_return_ty = ty_int;
+      cf_body = Some (cint 42);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 42;
+    }
+  in
+  let call_ty =
+    TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
+  in
+  let selected =
+    mk
+      (CVar { (Var.named "apply") with vdef_id = Some pure_func.cf_def_id })
+      call_ty
+  in
+  let call = mk (CCall (CKUnknown, selected, [ cint 1 ])) ty_int in
+  let main_f : core_func =
+    {
+      cf_name = "main";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [];
+      cf_return_ty = ty_int;
+      cf_body = Some call;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc pure_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc main_f; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases:(Hashtbl.create 0)
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  let main_resolved =
+    match resolved with
+    | [ _; { cd_desc = CDFunc { cf_body = Some b; _ }; _ } ] -> b
+    | _ -> Alcotest.fail "expected selected call in main"
+  in
+  match main_resolved.desc with
+  | CCall (CKUser (name, def_id), _, _) ->
+      Alcotest.(check string) "canonical selected name" "apply__pure" name;
+      Alcotest.(check (option int)) "selected def id" (Some 42) def_id
+  | _ -> Alcotest.fail "expected CKUser selected by carried def id"
 
 let test_resolve_foreign_call () =
   (* foreign func c_abs(x: Int) -> Int = "abs"
@@ -359,6 +470,65 @@ let test_resolve_qualified_module_alias_builtin () =
       ~module_imports:(Hashtbl.create 0) prog
   in
   expect_intrinsic_call "L.length" "list_len" (get_func_body resolved)
+
+let test_resolve_qualified_call_prefers_carried_def_id_name () =
+  let reverse_func : core_func =
+    {
+      cf_name = "std_list__reverse__pure";
+      cf_type_params = [];
+      cf_module = Some "std/list";
+      cf_params = [ { cp_name = Var.named "xs"; cp_ty = ty_int; cp_loc = loc } ];
+      cf_return_ty = ty_int;
+      cf_body = Some (cint 42);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 77;
+    }
+  in
+  let call_ty =
+    TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
+  in
+  let module_alias =
+    mk
+      (CVar { (Var.named "L") with vdef_id = Some reverse_func.cf_def_id })
+      (TyNamed ("Module", []))
+  in
+  let callee = mk (CField (module_alias, "reverse")) call_ty in
+  let call = mk (CCall (CKUnknown, callee, [ cint 1 ])) ty_int in
+  let main_f : core_func =
+    {
+      cf_name = "main";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [];
+      cf_return_ty = ty_int;
+      cf_body = Some call;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc reverse_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc main_f; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases:(Hashtbl.create 0)
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  let main_resolved =
+    match resolved with
+    | [ _; { cd_desc = CDFunc { cf_body = Some b; _ }; _ } ] -> b
+    | _ -> Alcotest.fail "expected selected qualified call in main"
+  in
+  match main_resolved.desc with
+  | CCall (CKUser (name, def_id), _, _) ->
+      Alcotest.(check string)
+        "canonical qualified selected name" "std_list__reverse__pure" name;
+      Alcotest.(check (option int)) "selected def id" (Some 77) def_id
+  | _ -> Alcotest.fail "expected qualified CKUser selected by carried def id"
 
 let test_resolve_local_value_shadows_module_alias_call () =
   (* If a local value has the same spelling as an imported module alias,
@@ -1414,16 +1584,24 @@ let suite =
       [
         Alcotest.test_case "empty" `Quick test_collect_empty;
         Alcotest.test_case "user_func" `Quick test_collect_user_func;
+        Alcotest.test_case "user_func_name_by_def_id" `Quick
+          test_collect_user_func_indexes_name_by_def_id;
+        Alcotest.test_case "duplicate_def_id_marks_id_ambiguous" `Quick
+          test_collect_duplicate_def_id_marks_id_ambiguous;
         Alcotest.test_case "foreign_func" `Quick test_collect_foreign_func;
       ] );
     ( "resolve",
       [
         Alcotest.test_case "user_call" `Quick test_resolve_user_call;
+        Alcotest.test_case "user_call_prefers_carried_def_id_name" `Quick
+          test_resolve_user_call_prefers_carried_def_id_name;
         Alcotest.test_case "foreign_call" `Quick test_resolve_foreign_call;
         Alcotest.test_case "imported_unresolved_stays_unknown" `Quick
           test_resolve_imported_unresolved_stays_unknown;
         Alcotest.test_case "qualified_module_alias_builtin" `Quick
           test_resolve_qualified_module_alias_builtin;
+        Alcotest.test_case "qualified_call_prefers_carried_def_id_name" `Quick
+          test_resolve_qualified_call_prefers_carried_def_id_name;
         Alcotest.test_case "local_value_shadows_module_alias_call" `Quick
           test_resolve_local_value_shadows_module_alias_call;
         Alcotest.test_case "resource_scope_shadows_module_alias_call" `Quick

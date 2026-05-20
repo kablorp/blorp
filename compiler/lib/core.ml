@@ -53,15 +53,15 @@ type var = {
   vname : string;
   vuniq : int;
   vdef_id : int option;
-      (** A3.3 UFCS handoff: when a [CVar] refers to a function whose
-      identity was pinned at infer time (via
-      [Session.ufcs_def_ids]), this carries that [def_id] so the
-      [Core_resolve] ladder can promote [CKUser] with [Some id]
-      instead of [None]. [None] for all other vars — parameters,
-      locals, unknown callees. The field is populated in
-      [Core_lower] when lowering [EIdent n] where [n] starts with
-      [__ufcs_]. Typed as [int option] so [core.ml] stays
-      independent of [env_types]. *)
+      (** Callable identity carried across the typed-AST-to-Core boundary.
+      During the UFCS migration this may come from either the legacy
+      [__ufcs_...#<id>] callee suffix or the parent typed call's
+      [resolved_call] metadata. Qualified module calls temporarily carry this
+      id on the module-alias [CVar] inside [CField] so lowering preserves the
+      qualified-call shape needed by mono and intrinsic dispatch. Later Core
+      phases use it as a selected [def_id] hint when promoting user calls,
+      without making Core depend on [env_types]. [None] for parameters,
+      locals, closures, and genuinely unresolved callees. *)
 }
 (** Variable: a source-level name plus a uniqueness tag.
 

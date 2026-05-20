@@ -569,6 +569,19 @@ let test_modules_reset_clears_type_index () =
     "type home cleared" None
     (Session.find_type_home s "Widget")
 
+let test_type_index_preserves_ambiguous_homes () =
+  let s = Session.create () in
+  let a = mk_loaded_module ~name:"test/a" ~decls:[ mk_record_decl "Widget" ] in
+  let b = mk_loaded_module ~name:"test/b" ~decls:[ mk_record_decl "Widget" ] in
+  Session.register_module_types s a;
+  Session.register_module_types s b;
+  Alcotest.(check (option string))
+    "ambiguous type has no single home" None
+    (Session.find_type_home s "Widget");
+  Alcotest.(check (list string))
+    "ambiguous type homes" [ "test/a"; "test/b" ]
+    (Session.find_type_homes s "Widget")
+
 let test_modules_reset_clears_resource_cleanup_index () =
   let s = Session.create () in
   Session.register_resource_cleanup s ~type_name:"Widget"
@@ -732,6 +745,8 @@ let suite =
         Alcotest.test_case "search_paths" `Quick test_search_paths_independent;
         Alcotest.test_case "reset clears type index" `Quick
           test_modules_reset_clears_type_index;
+        Alcotest.test_case "ambiguous type homes" `Quick
+          test_type_index_preserves_ambiguous_homes;
         Alcotest.test_case "reset clears resource cleanup index" `Quick
           test_modules_reset_clears_resource_cleanup_index;
         Alcotest.test_case "resource cleanup registry isolated" `Quick

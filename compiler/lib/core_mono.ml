@@ -582,6 +582,8 @@ let specialize_impl (original : core_impl) (subst : mono_subst) : core_impl =
 
 type mono_state = {
   generic_bodies : (string, core_func) Hashtbl.t;
+  generic_bodies_by_id : (int, core_func) Hashtbl.t;
+  ambiguous_generic_body_ids : (int, unit) Hashtbl.t;
   generic_impls_by_method : (string, core_impl list) Hashtbl.t;
   generic_impls_by_trait : (string, core_impl list) Hashtbl.t;
   generated : (string, unit) Hashtbl.t;
@@ -603,6 +605,8 @@ type mono_state = {
 let create_state ~reg ~import_aliases ?(module_imports = Hashtbl.create 0) () =
   {
     generic_bodies = Hashtbl.create 16;
+    generic_bodies_by_id = Hashtbl.create 16;
+    ambiguous_generic_body_ids = Hashtbl.create 8;
     generic_impls_by_method = Hashtbl.create 16;
     generic_impls_by_trait = Hashtbl.create 16;
     generated = Hashtbl.create 64;
@@ -617,6 +621,17 @@ let create_state ~reg ~import_aliases ?(module_imports = Hashtbl.create 0) () =
     current_module_path = "";
     reg;
   }
+
+let register_generic_body_id (state : mono_state) (f : core_func) : unit =
+  let id = f.cf_def_id in
+  if Hashtbl.mem state.ambiguous_generic_body_ids id then ()
+  else
+    match Hashtbl.find_opt state.generic_bodies_by_id id with
+    | None -> Hashtbl.replace state.generic_bodies_by_id id f
+    | Some existing when existing.cf_name = f.cf_name -> ()
+    | Some _ ->
+        Hashtbl.remove state.generic_bodies_by_id id;
+        Hashtbl.replace state.ambiguous_generic_body_ids id ()
 
 let concrete_subst_for_call (state : mono_state) ~(func_name : string)
     (gf : core_func) (node : core) (args : core list) : mono_subst option =
@@ -678,6 +693,11 @@ let post_mono_synthesis_name (f : core_func) : string =
     String.sub source_name 0
       (String.length source_name - String.length pure_suffix)
   else source_name
+
+let generic_body_lookup_name (f : core_func) : string =
+  match f.cf_module with
+  | None -> f.cf_name
+  | Some module_path -> module_qualified_name module_path f.cf_name
 
 let next_option_fusion_temp (state : mono_state) (label : string) : string =
   state.option_fusion_counter <- state.option_fusion_counter + 1;
@@ -816,6 +836,7 @@ let try_fuse_option_call (state : mono_state) ~(module_path : string option)
 
 let collect_generic_bodies (state : mono_state) (prog : core_program) : unit =
   let remember_generic_body (f : core_func) =
+    register_generic_body_id state f;
     match f.cf_module with
     | None -> Hashtbl.replace state.generic_bodies f.cf_name f
     | Some module_path ->
@@ -1005,6 +1026,24 @@ type generic_hit = {
   gh_source_name : string;
 }
 
+let generic_hit_of_func (f : core_func) : generic_hit =
+  {
+    gh_name = generic_body_lookup_name f;
+    gh_func = f;
+    gh_module_path = f.cf_module;
+    gh_source_name = post_mono_synthesis_name f;
+  }
+
+let lookup_generic_by_def_id (state : mono_state) (def_id : int option) :
+    generic_hit option =
+  match def_id with
+  | None -> None
+  | Some id ->
+      if Hashtbl.mem state.ambiguous_generic_body_ids id then None
+      else
+        Option.map generic_hit_of_func
+          (Hashtbl.find_opt state.generic_bodies_by_id id)
+
 let lookup_generic_module_func (state : mono_state) (mod_path : string)
     (orig_name : string) : generic_hit option =
   let prefixed = module_qualified_name mod_path orig_name in
@@ -1129,31 +1168,44 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
         let alias_name = match obj.desc with CVar v -> v.vname | _ -> "" in
         match lookup_alias_module state alias_name with
         | Some mod_path -> (
-            if qualified_call_resolves_without_mono mod_path field args then
-              node
-            else
-              match lookup_generic_module_func state mod_path field with
-              | Some hit -> (
-                  match
-                    concrete_subst_for_call state ~func_name:hit.gh_name
-                      hit.gh_func node args
-                  with
-                  | Some subst -> (
-                      match
-                        try_fuse_option_call state
-                          ~module_path:hit.gh_module_path
-                          ~source_name:hit.gh_source_name hit.gh_func subst node
-                          args
-                      with
-                      | Some fused -> fused
-                      | None -> (
-                          match try_enqueue state hit.gh_name subst with
-                          | Some mangled ->
-                              concretize_call_for_specialization hit.gh_func
-                                subst node kind callee args mangled
-                          | None -> node))
-                  | None -> node)
-              | None -> node)
+            let selected_by_id =
+              match obj.desc with
+              | CVar v -> (
+                  match lookup_generic_by_def_id state v.vdef_id with
+                  | Some hit when hit.gh_module_path = Some mod_path -> Some hit
+                  | _ -> None)
+              | _ -> None
+            in
+            let fallback_hit () =
+              if qualified_call_resolves_without_mono mod_path field args then
+                None
+              else lookup_generic_module_func state mod_path field
+            in
+            match
+              match selected_by_id with
+              | Some _ as hit -> hit
+              | None -> fallback_hit ()
+            with
+            | Some hit -> (
+                match
+                  concrete_subst_for_call state ~func_name:hit.gh_name
+                    hit.gh_func node args
+                with
+                | Some subst -> (
+                    match
+                      try_fuse_option_call state ~module_path:hit.gh_module_path
+                        ~source_name:hit.gh_source_name hit.gh_func subst node
+                        args
+                    with
+                    | Some fused -> fused
+                    | None -> (
+                        match try_enqueue state hit.gh_name subst with
+                        | Some mangled ->
+                            concretize_call_for_specialization hit.gh_func subst
+                              node kind callee args mangled
+                        | None -> node))
+                | None -> node)
+            | None -> node)
         | None -> node)
     | CVar v when not (StringSet.mem v.vname scope) -> (
         let try_lookup_prefixed_for_mono mod_path orig_name =
@@ -1202,41 +1254,45 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
           | _ -> `Missing
         in
         let resolve_name name =
-          (* UFCS-mangled names are already explicit method targets:
+          match lookup_generic_by_def_id state v.vdef_id with
+          | Some hit -> Some hit
+          | None -> (
+              (* UFCS-mangled names are already explicit method targets:
                   __ufcs_std$option__get_or -> std_option__get_or.
                   Resolve those before considering any bare same-name generic. *)
-          match Codegen_names.parse_ufcs_name name with
-          | Some (mod_path, orig_name) -> (
-              match try_lookup_prefixed_for_mono mod_path orig_name with
-              | Some _ as hit -> hit
-              | None -> try_lookup_bare name)
-          | None -> (
-              let import_hit =
-                (* Current module imports are authoritative inside that
+              match Codegen_names.parse_ufcs_name name with
+              | Some (mod_path, orig_name) -> (
+                  match try_lookup_prefixed_for_mono mod_path orig_name with
+                  | Some _ as hit -> hit
+                  | None -> try_lookup_bare name)
+              | None -> (
+                  let import_hit =
+                    (* Current module imports are authoritative inside that
                         module. Main-program imports must not leak into std
                         module bodies, because they can shadow module-local
                         calls such as dict.contains -> dict.get. *)
-                if state.current_module_path <> "" then
-                  match
-                    Hashtbl.find_opt state.module_imports
-                      state.current_module_path
-                  with
-                  | Some mod_aliases -> try_lookup_import_alias mod_aliases name
-                  | None -> `Missing
-                else try_lookup_import_alias state.import_aliases name
-              in
-              match import_hit with
-              | `Generic hit -> Some hit
-              | `Concrete -> None
-              | `Missing -> (
-                  match
                     if state.current_module_path <> "" then
-                      try_lookup_prefixed_for_mono state.current_module_path
-                        name
-                    else None
-                  with
-                  | Some _ as hit -> hit
-                  | None -> try_lookup_bare name))
+                      match
+                        Hashtbl.find_opt state.module_imports
+                          state.current_module_path
+                      with
+                      | Some mod_aliases ->
+                          try_lookup_import_alias mod_aliases name
+                      | None -> `Missing
+                    else try_lookup_import_alias state.import_aliases name
+                  in
+                  match import_hit with
+                  | `Generic hit -> Some hit
+                  | `Concrete -> None
+                  | `Missing -> (
+                      match
+                        if state.current_module_path <> "" then
+                          try_lookup_prefixed_for_mono state.current_module_path
+                            name
+                        else None
+                      with
+                      | Some _ as hit -> hit
+                      | None -> try_lookup_bare name)))
         in
         match resolve_name v.vname with
         | Some hit -> (

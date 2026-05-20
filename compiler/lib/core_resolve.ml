@@ -31,6 +31,8 @@ open Core
 
 type env = {
   user_funcs : (string, int) Hashtbl.t;
+  user_func_names_by_id : (int, string) Hashtbl.t;
+  ambiguous_user_func_ids : (int, unit) Hashtbl.t;
   user_value_types : (string, Ast.type_expr) Hashtbl.t;
   foreign_funcs : (string, foreign_call) Hashtbl.t;
   builtin_funcs : (string, string) Hashtbl.t;
@@ -46,6 +48,15 @@ type env = {
       [CKUser (name, Some def_id)] so [Core_emit] can mangle the C
       symbol via [Codegen_names.mangle_by_def_id] without reaching
       back through [env].
+    - [user_func_names_by_id]: reverse index for call sites that carry a
+      selected [vdef_id] from typed call metadata. This lets resolution recover
+      the canonical post-flatten function name instead of mangling an old source
+      spelling such as [map] with the selected id for [map__pure].
+    - [ambiguous_user_func_ids]: duplicate def-ids seen while building the
+      reverse index. Production def-ids should be unique, but tests and legacy
+      hand-built Core may use repeated [0]. When that happens, the resolver
+      ignores id lookup and falls back to the callee name instead of choosing a
+      load-order-dependent target.
     - [builtin_funcs]: bodyless std builtin function names → runtime C
       builtin name. This includes monomorphized builtin declarations such as
       [std_vector__map__mono_3_Int_Int], which must remain [CKBuiltin] so
@@ -55,6 +66,28 @@ type env = {
       [c_name] and argument-passing mode (bypass — no mangling).
     - [constructor_names]: set of in-scope constructor names. Used for
       the [is_union_constructor] classification in [Core_emit]. *)
+
+let register_user_func (env : env) (name : string) (def_id : int) : unit =
+  Hashtbl.replace env.user_funcs name def_id;
+  match Hashtbl.find_opt env.user_func_names_by_id def_id with
+  | None ->
+      if not (Hashtbl.mem env.ambiguous_user_func_ids def_id) then
+        Hashtbl.replace env.user_func_names_by_id def_id name
+  | Some existing when existing = name -> ()
+  | Some _ ->
+      Hashtbl.remove env.user_func_names_by_id def_id;
+      Hashtbl.replace env.ambiguous_user_func_ids def_id ()
+
+let user_call_kind_by_def_id (env : env) (def_id : int option) :
+    call_kind option =
+  match def_id with
+  | None -> None
+  | Some id ->
+      if Hashtbl.mem env.ambiguous_user_func_ids id then None
+      else
+        Option.map
+          (fun name -> CKUser (name, Some id))
+          (Hashtbl.find_opt env.user_func_names_by_id id)
 
 let starts_with s prefix =
   let slen = String.length s in
@@ -99,6 +132,8 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
   let env =
     {
       user_funcs = Hashtbl.create 64;
+      user_func_names_by_id = Hashtbl.create 64;
+      ambiguous_user_func_ids = Hashtbl.create 8;
       user_value_types = Hashtbl.create 32;
       foreign_funcs = Hashtbl.create 16;
       builtin_funcs = Hashtbl.create 32;
@@ -128,7 +163,7 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
         | CFForeign { c_name; arg_passing; _ } ->
             Hashtbl.replace env.foreign_funcs f.cf_name
               { fc_c_name = c_name; fc_arg_passing = arg_passing }
-        | _ -> Hashtbl.replace env.user_funcs f.cf_name f.cf_def_id)
+        | _ -> register_user_func env f.cf_name f.cf_def_id)
     | CDFunc f -> (
         match f.cf_kind with
         | CFForeign { c_name; arg_passing; _ } ->
@@ -161,7 +196,7 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
               let mangled =
                 Printf.sprintf "%s_%s_%s" i.ci_trait m.cf_name type_name
               in
-              Hashtbl.replace env.user_funcs mangled m.cf_def_id)
+              register_user_func env mangled m.cf_def_id)
             i.ci_methods
         end
     | CDType t ->
@@ -179,7 +214,7 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
           (fun (v : Ast.variant) ->
             (match v.variant_def_id with
             | Some id when v.variant_fields <> [] ->
-                Hashtbl.replace env.user_funcs v.variant_name id
+                register_user_func env v.variant_name id
             | _ -> ());
             Hashtbl.replace env.constructor_names v.variant_name ())
           t.type_variants
@@ -187,7 +222,7 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
         (* Global vars (module constants like [PI], [E]) need to be in the
            symbol table so [rewrite_imported_var] can redirect bare-name
            references (`PI`) to the prefixed form (`std_math__PI`). *)
-        Hashtbl.replace env.user_funcs v.cv_name.vname v.cv_def_id;
+        register_user_func env v.cv_name.vname v.cv_def_id;
         Hashtbl.replace env.user_value_types v.cv_name.vname v.cv_ty
     | CDPrivate inner -> visit_decl inner
     | _ -> ()
@@ -411,6 +446,24 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
       let alias_is_local =
         match obj.desc with CVar v -> var_is_bound bound v | _ -> false
       in
+      let carried_target =
+        match obj.desc with
+        | CVar v -> user_call_kind_by_def_id env v.vdef_id
+        | _ -> None
+      in
+      let alias_module_path =
+        resolve_qualified_call_module_path env module_path alias_name
+      in
+      let intrinsic_result =
+        match (alias_module_path, args) with
+        | Some mp, receiver :: _ ->
+            Option.map
+              (fun intrinsic -> CKIntrinsic intrinsic)
+              (Core_intrinsic_registry.lookup_ir_backed_std_function
+                 ~mod_path:mp ~func_name:field ~arity:(List.length args)
+                 ~receiver_ty:receiver.ty)
+        | _ -> None
+      in
       if alias_is_local then
         match callee.ty with Ast.TyFunc _ -> CKClosure | _ -> CKUnknown
       else if Hashtbl.mem env.constructor_names field then
@@ -419,16 +472,27 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
            nullary constructors have no user function so None. *)
         CKUser (field, Hashtbl.find_opt env.user_funcs field)
       else
-        match
-          try_resolve_qualified_call env module_path alias_name field args
-        with
+        match intrinsic_result with
         | Some kind -> kind
         | None -> (
-            (* Not a module alias — e.g. tuple field `test_pair.1`. Fall back
-                to closure dispatch on the callee's function type. *)
-            match callee.ty with
-            | Ast.TyFunc _ -> CKClosure
-            | _ -> CKUnknown))
+            match carried_target with
+            | Some kind -> kind
+            | None -> (
+                match alias_module_path with
+                | Some mp -> (
+                    match try_resolve_module_func_call env mp field args with
+                    | Some kind -> kind
+                    | None -> (
+                        match callee.ty with
+                        | Ast.TyFunc _ -> CKClosure
+                        | _ -> CKUnknown))
+                | None -> (
+                    (* Not a module alias — e.g. tuple field `test_pair.1`.
+                       Fall back to closure dispatch on the callee's function
+                       type. *)
+                    match callee.ty with
+                    | Ast.TyFunc _ -> CKClosure
+                    | _ -> CKUnknown))))
   | CVar v -> (
       let name = v.vname in
       if var_is_bound bound v then
@@ -451,105 +515,107 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
             with
             | Some c_name -> CKBuiltin c_name
             | None -> (
-                (* 2. User-defined. Prefer the var's [vdef_id] when present
-         (A3.3 UFCS handoff), else read the def_id that [collect_env]
-         stored alongside the name (A4.2). Either way [CKUser]
-         receives a [Some id] so [Core_emit] can mangle via
-         [mangle_by_def_id]. *)
-                match Hashtbl.find_opt env.user_funcs name with
-                | Some id ->
-                    let chosen =
-                      match v.vdef_id with Some _ as d -> d | None -> Some id
-                    in
-                    CKUser (name, chosen)
+                (* 2. User-defined. Prefer a carried [vdef_id] from typed call
+         metadata when present; it recovers the canonical post-flatten name
+         for pure overloads and imported selections. Otherwise use the
+         name-indexed [collect_env] table. *)
+                match user_call_kind_by_def_id env v.vdef_id with
+                | Some kind -> kind
                 | None -> (
-                    (* 3. UFCS *)
-                    match Codegen_names.parse_ufcs_name name with
-                    | Some (mp, fn) -> (
-                        match try_resolve_module_func_call env mp fn args with
-                        | Some kind -> kind
-                        | None -> CKUnknown)
+                    match Hashtbl.find_opt env.user_funcs name with
+                    | Some id -> CKUser (name, Some id)
                     | None -> (
-                        (* 4. Builtins *)
-                        let builtin =
-                          if module_path <> "" then
-                            Codegen_builtins.lookup module_path name
-                          else None
-                        in
-                        let builtin =
-                          match builtin with
-                          | Some _ -> builtin
-                          | None -> Codegen_builtins.lookup "" name
-                        in
-                        match builtin with
-                        | Some c_name -> CKBuiltin c_name
+                        (* 3. UFCS *)
+                        match Codegen_names.parse_ufcs_name name with
+                        | Some (mp, fn) -> (
+                            match
+                              try_resolve_module_func_call env mp fn args
+                            with
+                            | Some kind -> kind
+                            | None -> CKUnknown)
                         | None -> (
-                            if
-                              (* 5. Constructors. Read the def_id from [user_funcs] when the
+                            (* 4. Builtins *)
+                            let builtin =
+                              if module_path <> "" then
+                                Codegen_builtins.lookup module_path name
+                              else None
+                            in
+                            let builtin =
+                              match builtin with
+                              | Some _ -> builtin
+                              | None -> Codegen_builtins.lookup "" name
+                            in
+                            match builtin with
+                            | Some c_name -> CKBuiltin c_name
+                            | None -> (
+                                if
+                                  (* 5. Constructors. Read the def_id from [user_funcs] when the
          constructor has a user C function (variant with fields);
          nullary / runtime-bypassed variants have no entry and stay [None]. *)
-                              Hashtbl.mem env.constructor_names name
-                            then
-                              CKUser (name, Hashtbl.find_opt env.user_funcs name)
-                            else
-                              (* 6. Import aliases. Pick the import table by [module_path]:
+                                  Hashtbl.mem env.constructor_names name
+                                then
+                                  CKUser
+                                    (name, Hashtbl.find_opt env.user_funcs name)
+                                else
+                                  (* 6. Import aliases. Pick the import table by [module_path]:
          when resolving a module body, consult that module's own
          selective imports only — the main program's imports must not
          leak across module boundaries and silently rebind parameters
          that happen to match a name imported in main. *)
-                              let alias =
-                                if module_path = "" then
-                                  Hashtbl.find_opt env.import_aliases name
-                                else
-                                  match
-                                    Hashtbl.find_opt env.module_imports
-                                      module_path
-                                  with
-                                  | None -> None
-                                  | Some mod_aliases ->
-                                      Hashtbl.find_opt mod_aliases name
-                              in
-                              let alias_result =
-                                match alias with
-                                | Some (mp, orig_name) when orig_name <> "" ->
-                                    try_resolve_module_func_call env mp
-                                      orig_name args
-                                | _ -> None
-                              in
-                              match alias_result with
-                              | Some kind -> kind
-                              | None -> (
-                                  (* 7. UFCS by first-arg type *)
-                                  let ufcs_result =
-                                    match args with
-                                    | first_arg :: _ ->
-                                        let paths =
-                                          type_to_module_paths first_arg.ty
-                                        in
-                                        let rec try_paths = function
-                                          | [] -> None
-                                          | mp :: rest -> (
-                                              match
-                                                try_resolve_module_func_call env
-                                                  mp name args
-                                              with
-                                              | Some kind -> Some kind
-                                              | None -> try_paths rest)
-                                        in
-                                        try_paths paths
-                                    | [] -> None
+                                  let alias =
+                                    if module_path = "" then
+                                      Hashtbl.find_opt env.import_aliases name
+                                    else
+                                      match
+                                        Hashtbl.find_opt env.module_imports
+                                          module_path
+                                      with
+                                      | None -> None
+                                      | Some mod_aliases ->
+                                          Hashtbl.find_opt mod_aliases name
                                   in
-                                  match ufcs_result with
+                                  let alias_result =
+                                    match alias with
+                                    | Some (mp, orig_name) when orig_name <> ""
+                                      ->
+                                        try_resolve_module_func_call env mp
+                                          orig_name args
+                                    | _ -> None
+                                  in
+                                  match alias_result with
                                   | Some kind -> kind
                                   | None -> (
-                                      (* Trait-method dispatch used to live here as a suffix-scan of
+                                      (* 7. UFCS by first-arg type *)
+                                      let ufcs_result =
+                                        match args with
+                                        | first_arg :: _ ->
+                                            let paths =
+                                              type_to_module_paths first_arg.ty
+                                            in
+                                            let rec try_paths = function
+                                              | [] -> None
+                                              | mp :: rest -> (
+                                                  match
+                                                    try_resolve_module_func_call
+                                                      env mp name args
+                                                  with
+                                                  | Some kind -> Some kind
+                                                  | None -> try_paths rest)
+                                            in
+                                            try_paths paths
+                                        | [] -> None
+                                      in
+                                      match ufcs_result with
+                                      | Some kind -> kind
+                                      | None -> (
+                                          (* Trait-method dispatch used to live here as a suffix-scan of
          [env.user_funcs] for [_<method>_<type>] — a single step that
          conflated impl lookup with name mangling. It's been moved into
          the [Core_trait_resolve] pass (Phase 3.1), which runs between
          [Core_mono] and this resolver. By the time we get here, trait
          calls have already been rewritten to their mangled form and
          flow through the normal [user_funcs] lookup above. *)
-                                      (* 8. Bare [CVar v] with [TyFunc] type that didn't resolve above.
+                                          (* 8. Bare [CVar v] with [TyFunc] type that didn't resolve above.
          Two distinct shapes hide here:
 
          (a) A type-dispatched stdlib builtin like [sum]/[product] —
@@ -562,32 +628,33 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
 
          We distinguish by whether the name appears in an import table:
          an imported name can't also be a local binding, so it's (a). *)
-                                      let is_imported =
-                                        Hashtbl.mem env.import_aliases name
-                                        || module_path <> ""
-                                           &&
-                                           match
-                                             Hashtbl.find_opt env.module_imports
-                                               module_path
-                                           with
-                                           | Some mod_aliases ->
-                                               Hashtbl.mem mod_aliases name
-                                           | None -> false
-                                      in
-                                      let is_bitwise_op =
-                                        match name with
-                                        | "bit_and" | "bit_or" | "bit_xor"
-                                        | "bit_not" | "shift_left"
-                                        | "shift_right" ->
-                                            true
-                                        | _ -> false
-                                      in
-                                      if is_imported || is_bitwise_op then
-                                        CKUnknown
-                                      else
-                                        match callee.ty with
-                                        | Ast.TyFunc _ -> CKClosure
-                                        | _ -> CKUnknown))))))))
+                                          let is_imported =
+                                            Hashtbl.mem env.import_aliases name
+                                            || module_path <> ""
+                                               &&
+                                               match
+                                                 Hashtbl.find_opt
+                                                   env.module_imports
+                                                   module_path
+                                               with
+                                               | Some mod_aliases ->
+                                                   Hashtbl.mem mod_aliases name
+                                               | None -> false
+                                          in
+                                          let is_bitwise_op =
+                                            match name with
+                                            | "bit_and" | "bit_or" | "bit_xor"
+                                            | "bit_not" | "shift_left"
+                                            | "shift_right" ->
+                                                true
+                                            | _ -> false
+                                          in
+                                          if is_imported || is_bitwise_op then
+                                            CKUnknown
+                                          else
+                                            match callee.ty with
+                                            | Ast.TyFunc _ -> CKClosure
+                                            | _ -> CKUnknown)))))))))
   | _ -> ( match callee.ty with Ast.TyFunc _ -> CKClosure | _ -> CKUnknown)
 
 (** Rewrite a bare [CVar] that refers to a globally-imported value (e.g.

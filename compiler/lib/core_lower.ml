@@ -256,6 +256,76 @@ let typed_ident_expr ~(loc : Ast.loc) (name : string) (ty : type_expr) : TA.expr
     (Ast.untyped_expr ~loc (EIdent name))
     ty
 
+let direct_call_core_def_id (call : resolved_call) : int option =
+  match call.call_target with
+  | CallDirect
+      {
+        callable_id;
+        origin =
+          ( CallableLocal | CallableImported _ | CallableConstructor _
+          | CallableImplMethod );
+        _;
+      } ->
+      Some callable_id
+  | CallDirect { origin = CallableBuiltin | CallableForeign; _ } -> None
+  | CallTraitMethod { callable_id = Some callable_id; _ } -> Some callable_id
+  | CallTraitMethod { callable_id = None; _ } | CallClosure _ -> None
+
+let attach_resolved_call_def_id ~(call : TA.expr) (callee_core : Core.core) :
+    Core.core =
+  match (TA.expr_resolved_call call, callee_core.desc) with
+  | Some resolved, CVar v -> (
+      match direct_call_core_def_id resolved with
+      | None -> callee_core
+      | Some callable_id -> (
+          match v.vdef_id with
+          | Some existing when existing <> callable_id ->
+              Core_error.errorf (Core_error.Stage Core_stage.Lower)
+                (TA.loc call)
+                ~hint:
+                  "Inference attached conflicting callable identities to one \
+                   call. Keep the typed resolved_call metadata as the \
+                   authority and fix the stale encoded callee name."
+                "conflicting callable ids for lowered call '%s': callee \
+                 carried %d but resolved_call carried %d"
+                v.vname existing callable_id
+          | Some _ -> callee_core
+          | None ->
+              {
+                callee_core with
+                desc = CVar { v with vdef_id = Some callable_id };
+              }))
+  | ( Some ({ call_syntax = CallQualified _; _ } as resolved),
+      CField (({ desc = CVar v; ty; _ } as obj), field) )
+    when Types.types_equal ty (TyNamed ("Module", [])) -> (
+      match direct_call_core_def_id resolved with
+      | None -> callee_core
+      | Some callable_id -> (
+          match v.vdef_id with
+          | Some existing when existing <> callable_id ->
+              Core_error.errorf (Core_error.Stage Core_stage.Lower)
+                (TA.loc call)
+                ~hint:
+                  "Inference attached conflicting callable identities to one \
+                   qualified call. Keep the typed resolved_call metadata as \
+                   the authority and fix the stale module-alias metadata."
+                "conflicting callable ids for lowered qualified call '.%s': \
+                 module alias carried %d but resolved_call carried %d"
+                field existing callable_id
+          | Some _ -> callee_core
+          | None ->
+              {
+                callee_core with
+                desc =
+                  CField
+                    ( {
+                        obj with
+                        desc = CVar { v with vdef_id = Some callable_id };
+                      },
+                      field );
+              }))
+  | _ -> callee_core
+
 let is_module_sentinel_type (ty : type_expr) : bool =
   Types.types_equal ty ty_module
 
@@ -420,13 +490,12 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
       match try_elementwise_lift ty callee args with
       | Some core -> core
       | None ->
+          let callee_core =
+            attach_resolved_call_def_id ~call:typed (lower_child_expr callee)
+          in
           (* Always emit [CKUnknown] from lowering — a dedicated resolver
               pass ([Core_resolve]) promotes known callees post-lowering. *)
-          mk
-            (CCall
-               ( CKUnknown,
-                 lower_child_expr callee,
-                 List.map lower_child_expr args )))
+          mk (CCall (CKUnknown, callee_core, List.map lower_child_expr args)))
   | TA.EFieldAccess (obj, name) ->
       (* Module alias (`M.func`): inference represents `M` with the explicit
          [TyNamed "Module"] sentinel. Lowering accepts that typed sentinel but

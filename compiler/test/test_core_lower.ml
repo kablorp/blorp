@@ -1754,6 +1754,98 @@ let test_core_lower_ufcs_no_suffix () =
             Alcotest.(check (option int)) "no vdef_id" None v.vdef_id
         | _ -> Alcotest.fail "expected CVar"))
 
+(** Phase 6 bridge: a typed call's [resolved_call] metadata is the source-level
+    authority for callable identity. Lowering should carry that identity into
+    the Core callee even when the callee name itself has no UFCS suffix. *)
+let test_core_lower_call_uses_resolved_call_def_id () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let callee_ty =
+          TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
+        in
+        let callee = mk_ast (Blorp.Ast.EIdent "inc") callee_ty in
+        let resolved_call =
+          {
+            call_syntax = CallBare;
+            call_target =
+              CallDirect
+                {
+                  callable_id = 321;
+                  source_name = "inc";
+                  call_pure = true;
+                  origin = CallableLocal;
+                };
+            instantiated_params = [ ty_int ];
+            instantiated_return = ty_int;
+          }
+        in
+        let call =
+          Blorp.Ast.with_expr_resolved_call
+            (mk_ast (Blorp.Ast.ECall (callee, [ ast_int 1 ])) ty_int)
+            resolved_call
+        in
+        let core = lower_expr call in
+        match core.desc with
+        | CCall (CKUnknown, { desc = CVar v; _ }, _) ->
+            Alcotest.(check string) "callee name" "inc" v.vname;
+            Alcotest.(check (option int))
+              "vdef_id from resolved_call" (Some 321) v.vdef_id
+        | _ -> Alcotest.fail "expected CCall with CVar callee"))
+
+(** Phase 6 bridge: qualified calls must keep the module-field shape for
+    monomorphization and intrinsic dispatch, but still carry the selected
+    callable id for later Core resolution. *)
+let test_core_lower_qualified_call_marks_module_alias_with_def_id () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let module_ty = TyNamed ("Module", []) in
+        let callee_ty =
+          TyFunc
+            { params = [ ty_list_int ]; return = ty_list_int; is_pure = true }
+        in
+        let alias = ast_var "L" module_ty in
+        let callee =
+          mk_ast (Blorp.Ast.EFieldAccess (alias, "reverse")) callee_ty
+        in
+        let xs = ast_var "xs" ty_list_int in
+        let resolved_call =
+          {
+            call_syntax = CallQualified "std/list";
+            call_target =
+              CallDirect
+                {
+                  callable_id = 654;
+                  source_name = "reverse";
+                  call_pure = true;
+                  origin = CallableImported "std/list";
+                };
+            instantiated_params = [ ty_list_int ];
+            instantiated_return = ty_list_int;
+          }
+        in
+        let call =
+          Blorp.Ast.with_expr_resolved_call
+            (mk_ast (Blorp.Ast.ECall (callee, [ xs ])) ty_list_int)
+            resolved_call
+        in
+        let core = lower_expr call in
+        match core.desc with
+        | CCall
+            ( CKUnknown,
+              {
+                desc =
+                  CField
+                    ( { desc = CVar { vname = "L"; vdef_id = Some 654; _ }; _ },
+                      "reverse" );
+                _;
+              },
+              _ ) ->
+            ()
+        | _ ->
+            Alcotest.fail
+              "expected qualified call to preserve CField and carry vdef_id on \
+               module alias"))
+
 (** A3.3: non-UFCS idents lower to CVar with vdef_id = None. *)
 let test_core_lower_non_ufcs_ident_has_no_def_id () =
   Blorp.Session.(
@@ -2084,6 +2176,10 @@ let suite =
           test_core_lower_parses_ufcs_def_id_suffix;
         Alcotest.test_case "core_lower ufcs no suffix" `Quick
           test_core_lower_ufcs_no_suffix;
+        Alcotest.test_case "core_lower call uses resolved_call def_id" `Quick
+          test_core_lower_call_uses_resolved_call_def_id;
+        Alcotest.test_case "core_lower qualified call carries def_id" `Quick
+          test_core_lower_qualified_call_marks_module_alias_with_def_id;
         Alcotest.test_case "non-ufcs ident has no vdef_id" `Quick
           test_core_lower_non_ufcs_ident_has_no_def_id;
       ] );

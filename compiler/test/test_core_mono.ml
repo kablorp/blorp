@@ -27,6 +27,9 @@ let cstr s =
 
 let cvar n t = mk (CVar (Var.named n)) t
 
+let cvar_with_def_id n id t =
+  mk (CVar { (Var.named n) with vdef_id = Some id }) t
+
 let clist elems =
   CList { ll_layout = list_pointer_storage (); ll_elems = elems }
 
@@ -40,7 +43,7 @@ let contains_substring s needle =
   nl <= sl && find 0
 
 let mk_func ?(type_params = []) ?(type_param_decls = []) ?(module_path = None)
-    name params return_ty body : core_func =
+    ?(def_id = 0) name params return_ty body : core_func =
   {
     cf_name = name;
     cf_type_params = type_param_decls @ tparams type_params;
@@ -53,7 +56,7 @@ let mk_func ?(type_params = []) ?(type_param_decls = []) ?(module_path = None)
     cf_body = Some body;
     cf_is_pure = true;
     cf_kind = CFUser;
-    cf_def_id = 0;
+    cf_def_id = def_id;
   }
 
 let mk_decl f = { cd_desc = CDFunc f; cd_loc = loc; cd_doc = None }
@@ -664,6 +667,89 @@ let test_mono_ufcs_mangled_callee () =
   Alcotest.(check bool)
     "has Char/String specialization" true
     (List.mem "std_option__ok_or__mono_String_Char" names)
+
+let test_mono_bare_call_prefers_carried_def_id_generic () =
+  let impure_primary =
+    mk_func ~def_id:701 ~type_params:[ "T" ] "apply"
+      [ ("x", TyVar "T") ]
+      (TyVar "T") (cvar "x" (TyVar "T"))
+  in
+  let pure_selected =
+    mk_func ~def_id:702 ~type_params:[ "T" ] "apply__pure"
+      [ ("x", TyVar "T") ]
+      (TyVar "T") (cvar "x" (TyVar "T"))
+  in
+  let call_ty =
+    TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
+  in
+  let main_body =
+    mk
+      (CCall
+         ( CKUnknown,
+           cvar_with_def_id "apply" 702 call_ty,
+           [ cvar "value" ty_int ] ))
+      ty_int
+  in
+  let main_fn = mk_func "main" [ ("value", ty_int) ] ty_int main_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [ mk_decl impure_primary; mk_decl pure_selected; mk_decl main_fn ]
+  in
+  let main_decl =
+    List.find
+      (function { cd_desc = CDFunc f; _ } -> f.cf_name = "main" | _ -> false)
+      result
+  in
+  match main_decl.cd_desc with
+  | CDFunc
+      { cf_body = Some { desc = CCall (_, { desc = CVar v; _ }, _); _ }; _ } ->
+      Alcotest.(check string)
+        "selected generic target follows carried id" "apply__pure__mono_Int"
+        v.vname
+  | _ -> Alcotest.fail "expected rewritten main call"
+
+let test_mono_qualified_call_prefers_carried_def_id_generic () =
+  let list_t = TyNamed ("List", [ TyVar "T" ]) in
+  let list_int = TyNamed ("List", [ ty_int ]) in
+  let impure_primary =
+    mk_func ~def_id:711 ~type_params:[ "T" ] ~module_path:(Some "std/list")
+      "std_list__reverse"
+      [ ("self", list_t) ]
+      list_t (cvar "self" list_t)
+  in
+  let pure_selected =
+    mk_func ~def_id:712 ~type_params:[ "T" ] ~module_path:(Some "std/list")
+      "std_list__reverse__pure"
+      [ ("self", list_t) ]
+      list_t (cvar "self" list_t)
+  in
+  let call_ty =
+    TyFunc { params = [ list_int ]; return = list_int; is_pure = true }
+  in
+  let module_alias = cvar_with_def_id "L" 712 (TyNamed ("Module", [])) in
+  let callee = mk (CField (module_alias, "reverse")) call_ty in
+  let main_body =
+    mk (CCall (CKUnknown, callee, [ cvar "items" list_int ])) list_int
+  in
+  let main_fn = mk_func "main" [ ("items", list_int) ] list_int main_body in
+  let import_aliases = Hashtbl.create 1 in
+  Hashtbl.replace import_aliases "L" ("std/list", "");
+  let result =
+    Blorp.Core_mono.monomorphize_program ~import_aliases
+      [ mk_decl impure_primary; mk_decl pure_selected; mk_decl main_fn ]
+  in
+  let main_decl =
+    List.find
+      (function { cd_desc = CDFunc f; _ } -> f.cf_name = "main" | _ -> false)
+      result
+  in
+  match main_decl.cd_desc with
+  | CDFunc
+      { cf_body = Some { desc = CCall (_, { desc = CVar v; _ }, _); _ }; _ } ->
+      Alcotest.(check string)
+        "qualified selected generic target follows carried id"
+        "std_list__reverse__pure__mono_Int" v.vname
+  | _ -> Alcotest.fail "expected rewritten main call"
 
 let test_mono_fuses_option_get_or_call () =
   let option_t = TyNamed ("Option", [ TyVar "T" ]) in
@@ -1697,6 +1783,10 @@ let suite =
         Alcotest.test_case "e2e_pipeline" `Quick test_mono_e2e_pipeline;
         Alcotest.test_case "ufcs_mangled_callee" `Quick
           test_mono_ufcs_mangled_callee;
+        Alcotest.test_case "bare call prefers carried def id generic" `Quick
+          test_mono_bare_call_prefers_carried_def_id_generic;
+        Alcotest.test_case "qualified call prefers carried def id generic"
+          `Quick test_mono_qualified_call_prefers_carried_def_id_generic;
         Alcotest.test_case "option_get_or_call_fused" `Quick
           test_mono_fuses_option_get_or_call;
         Alcotest.test_case "option_get_or_else_call_fused" `Quick

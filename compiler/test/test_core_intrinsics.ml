@@ -5,6 +5,7 @@ open Blorp.Core
 
 let ty_int = TyNamed ("Int", [])
 let ty_bool = TyNamed ("Bool", [])
+let ty_char = TyNamed ("Char", [])
 let ty_float = TyNamed ("Float", [])
 let ty_string = TyNamed ("String", [])
 let ty_named_t = TyNamed ("T", [])
@@ -88,6 +89,16 @@ let count_builtin_call name body =
     (fun acc node ->
       match node.desc with
       | CCall (CKBuiltin got, _, _) when got = name -> acc + 1
+      | _ -> acc)
+    0 body
+
+let count_builtin_call_with_arg_count name arg_count body =
+  fold_tree
+    (fun acc node ->
+      match node.desc with
+      | CCall (CKBuiltin got, _, args)
+        when got = name && List.length args = arg_count ->
+          acc + 1
       | _ -> acc)
     0 body
 
@@ -245,27 +256,98 @@ let synth_list_body func_name params return_ty =
   Blorp.Core_intrinsics.synthesize_body ~func_name ~module_path:"std/list"
     ~params ~return_ty
 
-let expect_no_list_synthesis func_name params return_ty =
-  match synth_list_body func_name params return_ty with
+let expect_no_synthesis ~module_path func_name params return_ty =
+  match
+    Blorp.Core_intrinsics.synthesize_body ~func_name ~module_path ~params
+      ~return_ty
+  with
   | None -> ()
   | Some _ ->
-      Alcotest.failf "List.%s should not synthesize for malformed arity"
-        func_name
+      Alcotest.failf "%s.%s should not synthesize for malformed signature"
+        module_path func_name
   | exception exn ->
-      Alcotest.failf "List.%s should return None, not raise %s" func_name
-        (Printexc.to_string exn)
+      Alcotest.failf "%s.%s should return None, not raise %s" module_path
+        func_name (Printexc.to_string exn)
 
-let test_list_synthesis_rejects_malformed_arities () =
+let expect_no_list_synthesis func_name params return_ty =
+  expect_no_synthesis ~module_path:"std/list" func_name params return_ty
+
+let expect_builtin_synthesis ?arg_count ~module_path func_name params return_ty
+    c_name =
+  match
+    Blorp.Core_intrinsics.synthesize_body ~func_name ~module_path ~params
+      ~return_ty
+  with
+  | None ->
+      Alcotest.failf "%s.%s should synthesize from its spec entry" module_path
+        func_name
+  | Some body -> (
+      Alcotest.(check int)
+        (Printf.sprintf "%s.%s forwards to %s" module_path func_name c_name)
+        1
+        (count_builtin_call c_name body);
+      match arg_count with
+      | None -> ()
+      | Some expected ->
+          Alcotest.(check int)
+            (Printf.sprintf "%s.%s forwards %d args" module_path func_name
+               expected)
+            1
+            (count_builtin_call_with_arg_count c_name expected body))
+
+let test_list_synthesis_rejects_malformed_signatures () =
   let list_int = ty_list ty_int in
+  let stream_int = TyNamed ("Stream", [ ty_int ]) in
   let f_int_to_int = ty_func [ ty_int ] ty_int in
+  let pred_int = ty_func [ ty_int ] ty_bool in
   expect_no_list_synthesis "length"
     [ param "items" list_int; param "extra" ty_int ]
     ty_int;
+  expect_no_list_synthesis "length" [ param "s" ty_string ] ty_int;
   expect_no_list_synthesis "append" [ param "items" list_int ] list_int;
+  expect_no_list_synthesis "append"
+    [ param "items" list_int; param "elem" ty_string ]
+    list_int;
+  expect_no_list_synthesis "get_or"
+    [ param "items" list_int; param "idx" ty_int; param "default" ty_string ]
+    ty_int;
   expect_no_list_synthesis "get_or"
     [ param "items" list_int; param "idx" ty_int ]
     ty_int;
   expect_no_list_synthesis "map" [ param "items" list_int ] list_int;
+  expect_no_list_synthesis "map"
+    [ param "items" list_int; param "f" ty_int ]
+    list_int;
+  expect_no_list_synthesis "map"
+    [ param "items" (ty_set ty_int); param "f" f_int_to_int ]
+    (ty_set ty_int);
+  expect_no_list_synthesis "take"
+    [ param "items" list_int; param "n" ty_string ]
+    list_int;
+  expect_no_list_synthesis "concat"
+    [ param "items" list_int; param "other" ty_string ]
+    list_int;
+  expect_no_list_synthesis "concat"
+    [ param "items" list_int; param "other" (ty_list ty_string) ]
+    list_int;
+  expect_no_list_synthesis "find"
+    [ param "items" stream_int; param "pred" pred_int ]
+    (ty_option ty_int);
+  expect_no_list_synthesis "find"
+    [ param "items" list_int; param "pred" ty_bool ]
+    (ty_option ty_int);
+  expect_no_list_synthesis "zip_with"
+    [ param "left" list_int; param "right" list_int; param "f" ty_int ]
+    list_int;
+  expect_no_list_synthesis "binary_search"
+    [ param "items" list_int; param "target" ty_string ]
+    (ty_option ty_int);
+  expect_no_list_synthesis "range"
+    [ param "start" ty_string; param "stop" ty_int ]
+    list_int;
+  expect_no_list_synthesis "string_append"
+    [ param "items" list_int; param "other" ty_string ]
+    ty_string;
   expect_no_list_synthesis "fold"
     [
       param "items" list_int;
@@ -274,6 +356,673 @@ let test_list_synthesis_rejects_malformed_arities () =
       param "extra" ty_int;
     ]
     ty_int
+
+let test_std_synthesis_rejects_malformed_signatures () =
+  let bytes_ty = TyNamed ("Bytes", []) in
+  let fixed_ty = TyNamed ("Fixed", []) in
+  let slice_ty = TyNamed ("StringSlice", []) in
+  let stream_int = TyNamed ("Stream", [ ty_int ]) in
+  let vector_int = ty_vector ty_int 4 in
+  let matrix_int = TyArray (ty_int, [ TyConstInt 2; TyConstInt 2 ]) in
+  expect_no_synthesis ~module_path:"std/string" "substring"
+    [ param "s" ty_string; param "start" ty_int ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "reverse"
+    [ param "s" ty_string; param "extra" ty_int ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "reverse"
+    [ param "items" (ty_list ty_int) ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "string_with_capacity" []
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "string"
+    [ param "s" ty_string ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "append_char"
+    [ param "s" ty_string; param "c" ty_string ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "length"
+    [ param "items" (ty_list ty_int) ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/string" "substring"
+    [ param "s" ty_string; param "start" ty_string; param "len" ty_int ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "count"
+    [
+      param "items" (ty_list ty_int); param "pred" (ty_func [ ty_int ] ty_bool);
+    ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/string" "replace"
+    [ param "s" ty_string; param "old" ty_string; param "new" ty_int ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "pad_left"
+    [ param "s" ty_string; param "width" ty_int; param "fill" ty_string ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "append_str"
+    [ param "items" (ty_list ty_int); param "suffix" ty_string ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "split"
+    [ param "s" ty_string ]
+    (ty_list ty_string);
+  expect_no_synthesis ~module_path:"std/bytes" "bytes" [] bytes_ty;
+  expect_no_synthesis ~module_path:"std/bytes" "length"
+    [ param "b" bytes_ty; param "extra" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/bytes" "length"
+    [ param "s" ty_string ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/bytes" "get"
+    [ param "b" bytes_ty ]
+    (ty_option ty_int);
+  expect_no_synthesis ~module_path:"std/bytes" "to_string"
+    [ param "s" ty_string ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/bytes" "from_hex"
+    [ param "b" bytes_ty ]
+    (ty_option bytes_ty);
+  expect_no_synthesis ~module_path:"std/bytes" "encode_utf8"
+    [ param "chars" (ty_list ty_int); param "extra" ty_int ]
+    bytes_ty;
+  expect_no_synthesis ~module_path:"std/bytes" "append"
+    [ param "items" (ty_list ty_int); param "value" ty_int ]
+    (ty_list ty_int);
+  expect_no_synthesis ~module_path:"std/bytes" "append"
+    [ param "a" bytes_ty; param "b" ty_string ]
+    bytes_ty;
+  expect_no_synthesis ~module_path:"std/bytes" "blit"
+    [
+      param "dst" bytes_ty;
+      param "dst_offset" ty_int;
+      param "src" bytes_ty;
+      param "src_offset" ty_int;
+    ]
+    bytes_ty;
+  expect_no_synthesis ~module_path:"std/bytes" "blit"
+    [
+      param "dst" bytes_ty;
+      param "dst_offset" ty_int;
+      param "src" ty_string;
+      param "src_offset" ty_int;
+      param "len" ty_int;
+    ]
+    bytes_ty;
+  expect_no_synthesis ~module_path:"std/bytes" "index_of"
+    [ param "s" ty_string; param "value" ty_int; param "start" ty_int ]
+    (ty_option ty_int);
+  expect_no_synthesis ~module_path:"std/set" "length"
+    [ param "items" (ty_set ty_int); param "extra" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/set" "contains"
+    [ param "items" (ty_set ty_int) ]
+    ty_bool;
+  expect_no_synthesis ~module_path:"std/set" "contains"
+    [ param "items" (ty_set ty_int); param "elem" ty_string ]
+    ty_bool;
+  expect_no_synthesis ~module_path:"std/set" "add"
+    [ param "items" (ty_set ty_int); param "elem" ty_string ]
+    (ty_set ty_int);
+  expect_no_synthesis ~module_path:"std/set" "map"
+    [ param "items" (ty_list ty_int); param "f" (ty_func [ ty_int ] ty_int) ]
+    (ty_list ty_int);
+  expect_no_synthesis ~module_path:"std/set" "map"
+    [ param "items" (ty_set ty_int); param "f" ty_int ]
+    (ty_set ty_int);
+  expect_no_synthesis ~module_path:"std/set" "combine"
+    [ param "items" (ty_set ty_int); param "other" (ty_list ty_int) ]
+    (ty_set ty_int);
+  expect_no_synthesis ~module_path:"std/set" "combine"
+    [ param "items" (ty_set ty_int); param "other" (ty_set ty_string) ]
+    (ty_set ty_int);
+  expect_no_synthesis ~module_path:"std/set" "fold"
+    [ param "items" (ty_set ty_int); param "init" ty_int; param "f" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/set" "to_list"
+    [ param "items" (ty_set ty_int); param "extra" ty_int ]
+    (ty_list ty_int);
+  expect_no_synthesis ~module_path:"std/dict" "length"
+    [ param "items" (ty_list ty_int) ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/dict" "contains"
+    [ param "items" (ty_dict ty_string ty_int) ]
+    ty_bool;
+  expect_no_synthesis ~module_path:"std/dict" "contains"
+    [ param "items" (ty_dict ty_string ty_int); param "key" ty_int ]
+    ty_bool;
+  expect_no_synthesis ~module_path:"std/dict" "get_or"
+    [ param "items" (ty_dict ty_string ty_int); param "key" ty_string ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/dict" "get_or"
+    [
+      param "items" (ty_dict ty_string ty_int);
+      param "key" ty_string;
+      param "default" ty_string;
+    ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/dict" "set"
+    [ param "items" (ty_list ty_int); param "idx" ty_int; param "value" ty_int ]
+    (ty_list ty_int);
+  expect_no_synthesis ~module_path:"std/dict" "set"
+    [
+      param "items" (ty_dict ty_string ty_int);
+      param "key" ty_string;
+      param "value" ty_string;
+    ]
+    (ty_dict ty_string ty_int);
+  expect_no_synthesis ~module_path:"std/dict" "entries"
+    [ param "items" (ty_dict ty_string ty_int); param "extra" ty_int ]
+    (ty_list (TyTuple [ ty_string; ty_int ]));
+  expect_no_synthesis ~module_path:"std/fixed" "get_scale"
+    [ param "f" fixed_ty; param "extra" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/fixed" "get_precision"
+    [ param "s" ty_string ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/fixed" "to_int"
+    [ param "f" fixed_ty; param "extra" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/fixed" "neg"
+    [ param "f" fixed_ty ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/fixed" "round_to"
+    [ param "f" fixed_ty ]
+    fixed_ty;
+  expect_no_synthesis ~module_path:"std/fixed" "fixed"
+    [ param "value" ty_int; param "scale" ty_int ]
+    fixed_ty;
+  expect_no_synthesis ~module_path:"std/fixed" "to_string"
+    [ param "s" ty_string ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/slice" "from_string"
+    [ param "s" ty_string; param "extra" ty_int ]
+    slice_ty;
+  expect_no_synthesis ~module_path:"std/slice" "length"
+    [ param "slice" slice_ty ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/slice" "substring"
+    [ param "slice" slice_ty; param "start" ty_int ]
+    slice_ty;
+  expect_no_synthesis ~module_path:"std/slice" "starts_with"
+    [ param "slice" slice_ty; param "prefix" slice_ty ]
+    ty_bool;
+  expect_no_synthesis ~module_path:"std/slice" "get"
+    [ param "slice" slice_ty; param "index" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/slice" "get"
+    [ param "s" ty_string; param "index" ty_int ]
+    (ty_option ty_char);
+  expect_no_synthesis ~module_path:"std/math" "fma"
+    [ param "a" ty_float; param "b" ty_float ]
+    ty_float;
+  expect_no_synthesis ~module_path:"std/math" "fma"
+    [ param "a" ty_int; param "b" ty_float; param "c" ty_float ]
+    ty_float;
+  expect_no_synthesis ~module_path:"std/math" "sin"
+    [ param "x" ty_float ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/math" "pow"
+    [ param "base" ty_float; param "exponent" ty_string ]
+    ty_float;
+  expect_no_synthesis ~module_path:"std/math" "is_nan"
+    [ param "x" ty_float ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/math" "infinity"
+    [ param "extra" ty_int ]
+    ty_float;
+  expect_no_synthesis ~module_path:"std/time" "from_parts"
+    [
+      param "year" ty_int;
+      param "month" ty_int;
+      param "day" ty_int;
+      param "hour" ty_int;
+      param "minute" ty_int;
+      param "second" ty_int;
+      param "extra" ty_int;
+    ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/time" "from_parts"
+    [
+      param "year" ty_int;
+      param "month" ty_string;
+      param "day" ty_int;
+      param "hour" ty_int;
+      param "minute" ty_int;
+      param "second" ty_int;
+    ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/time" "format_time"
+    [ param "us" ty_int; param "fmt" ty_int ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/time" "to_year"
+    [ param "us" ty_string ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/system" "now_microseconds"
+    [ param "extra" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/system" "now_microseconds" [] ty_string;
+  expect_no_synthesis ~module_path:"std/stream" "from_range"
+    [ param "start" ty_int; param "stop" ty_string ]
+    stream_int;
+  expect_no_synthesis ~module_path:"std/stream" "map"
+    [ param "items" (ty_list ty_int); param "f" (ty_func [ ty_int ] ty_int) ]
+    (ty_list ty_int);
+  expect_no_synthesis ~module_path:"std/stream" "map"
+    [ param "items" stream_int; param "f" ty_int ]
+    stream_int;
+  expect_no_synthesis ~module_path:"std/stream" "take"
+    [ param "items" stream_int; param "n" ty_string ]
+    stream_int;
+  expect_no_synthesis ~module_path:"std/stream" "fold"
+    [ param "items" stream_int; param "init" ty_int; param "f" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/stream" "unfold"
+    [ param "state" ty_int; param "next" ty_int ]
+    stream_int;
+  expect_no_synthesis ~module_path:"std/stream" "empty"
+    [ param "extra" ty_int ]
+    stream_int;
+  expect_no_synthesis ~module_path:"std/tensor" "length"
+    [ param "items" (ty_list ty_int) ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/tensor" "checked_get"
+    [ param "items" (ty_list ty_int); param "idx" ty_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/vector" "sum"
+    [ param "items" (ty_list ty_int) ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/vector" "dot"
+    [ param "a" vector_int ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/vector" "dot"
+    [ param "a" vector_int; param "b" (ty_list ty_int) ]
+    ty_int;
+  expect_no_synthesis ~module_path:"std/matrix" "matmul"
+    [ param "a" (ty_list ty_int); param "b" matrix_int ]
+    matrix_int;
+  expect_no_synthesis ~module_path:"std/matrix" "matmul"
+    [ param "a" matrix_int; param "b" (ty_list ty_int) ]
+    matrix_int;
+  expect_no_synthesis ~module_path:"std/hash" "sha256"
+    [ param "b" bytes_ty ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/hash" "sha256_bytes"
+    [ param "s" ty_string ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/hash" "hmac_sha256"
+    [ param "key" ty_string; param "msg" bytes_ty ]
+    ty_string
+
+let test_hash_wrappers_synthesize_from_specs () =
+  let bytes_ty = TyNamed ("Bytes", []) in
+  [
+    ("hash", [ param "s" ty_string ], ty_int, "blorp_hash");
+    ("hash_bytes", [ param "b" bytes_ty ], ty_int, "blorp_hash_bytes");
+    ("sha256", [ param "s" ty_string ], ty_string, "blorp_sha256");
+    ( "hmac_sha256",
+      [ param "key" ty_string; param "msg" ty_string ],
+      ty_string,
+      "blorp_hmac_sha256" );
+  ]
+  |> List.iter (fun (func_name, params, return_ty, c_name) ->
+      expect_builtin_synthesis ~module_path:"std/hash" func_name params
+        return_ty c_name)
+
+let test_time_and_system_wrappers_synthesize_from_specs () =
+  let time_cases =
+    [
+      ("now", [], ty_int, "blorp_time_now");
+      ("to_year", [ param "us" ty_int ], ty_int, "blorp_time_to_year");
+      ( "from_parts",
+        [
+          param "year" ty_int;
+          param "month" ty_int;
+          param "day" ty_int;
+          param "hour" ty_int;
+          param "minute" ty_int;
+          param "second" ty_int;
+        ],
+        ty_int,
+        "blorp_time_from_parts" );
+      ( "format_time",
+        [ param "us" ty_int; param "fmt" ty_string ],
+        ty_string,
+        "blorp_time_format" );
+      ( "parse_time",
+        [ param "input" ty_string; param "fmt" ty_string ],
+        ty_option ty_int,
+        "blorp_time_parse" );
+      ( "from_iso",
+        [ param "input" ty_string ],
+        ty_option ty_int,
+        "blorp_time_from_iso" );
+    ]
+  in
+  List.iter
+    (fun (func_name, params, return_ty, c_name) ->
+      expect_builtin_synthesis ~module_path:"std/time" func_name params
+        return_ty c_name)
+    time_cases;
+  expect_builtin_synthesis ~module_path:"std/system" "now_microseconds" []
+    ty_int "blorp_now_us"
+
+let test_bytes_c_wrappers_synthesize_from_specs () =
+  let bytes_ty = TyNamed ("Bytes", []) in
+  [
+    ("to_string", [ param "bytes" bytes_ty ], ty_string, "blorp_bytes_to_string");
+    ( "from_hex",
+      [ param "hex" ty_string ],
+      ty_option bytes_ty,
+      "blorp_bytes_from_hex" );
+    ( "encode_utf8",
+      [ param "chars" (ty_list ty_int) ],
+      bytes_ty,
+      "blorp_encode_utf8" );
+    ( "decode_utf8",
+      [ param "bytes" bytes_ty ],
+      ty_option (ty_list ty_int),
+      "blorp_decode_utf8" );
+  ]
+  |> List.iter (fun (func_name, params, return_ty, c_name) ->
+      expect_builtin_synthesis ~module_path:"std/bytes" func_name params
+        return_ty c_name)
+
+let test_fixed_c_wrappers_synthesize_from_specs () =
+  let fixed_ty = TyNamed ("Fixed", []) in
+  [
+    ( "fixed",
+      [ param "value" ty_float; param "scale" ty_int ],
+      fixed_ty,
+      "blorp_fixed_new",
+      3 );
+    ( "with_precision",
+      [ param "value" ty_float; param "scale" ty_int; param "precision" ty_int ],
+      fixed_ty,
+      "blorp_fixed_new",
+      3 );
+    ( "from_int",
+      [ param "value" ty_int; param "scale" ty_int ],
+      fixed_ty,
+      "blorp_fixed_from_int",
+      3 );
+    ( "to_string",
+      [ param "value" fixed_ty ],
+      ty_string,
+      "blorp_fixed_to_string",
+      1 );
+    ("to_float", [ param "value" fixed_ty ], ty_float, "blorp_fixed_to_float", 1);
+  ]
+  |> List.iter (fun (func_name, params, return_ty, c_name, arg_count) ->
+      expect_builtin_synthesis ~arg_count ~module_path:"std/fixed" func_name
+        params return_ty c_name)
+
+let test_tensor_c_wrappers_synthesize_from_specs () =
+  let vector_int = ty_vector ty_int 4 in
+  let matrix_int = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
+  let tensor3_int =
+    TyArray (ty_int, [ TyConstInt 2; TyConstInt 3; TyConstInt 4 ])
+  in
+  let tensor4_int =
+    TyArray (ty_int, [ TyConstInt 2; TyConstInt 3; TyConstInt 4; TyConstInt 5 ])
+  in
+  let tensor5_int =
+    TyArray
+      ( ty_int,
+        [ TyConstInt 2; TyConstInt 3; TyConstInt 4; TyConstInt 5; TyConstInt 6 ]
+      )
+  in
+  let cases =
+    [
+      ( "vector",
+        [ param "value" ty_int; param "size" ty_int ],
+        vector_int,
+        "blorp_vector_new_fill",
+        2 );
+      ( "matrix",
+        [ param "value" ty_int; param "rows" ty_int; param "cols" ty_int ],
+        matrix_int,
+        "blorp_matrix_new_fill",
+        3 );
+      ( "tensor3",
+        [
+          param "value" ty_int;
+          param "x" ty_int;
+          param "y" ty_int;
+          param "z" ty_int;
+        ],
+        tensor3_int,
+        "blorp_tensor3_new",
+        4 );
+      ( "tensor4",
+        [
+          param "value" ty_int;
+          param "d1" ty_int;
+          param "d2" ty_int;
+          param "d3" ty_int;
+          param "d4" ty_int;
+        ],
+        tensor4_int,
+        "blorp_tensor4_new",
+        5 );
+      ( "tensor5",
+        [
+          param "value" ty_int;
+          param "d1" ty_int;
+          param "d2" ty_int;
+          param "d3" ty_int;
+          param "d4" ty_int;
+          param "d5" ty_int;
+        ],
+        tensor5_int,
+        "blorp_tensor5_new",
+        6 );
+      ( "checked_get",
+        [ param "items" vector_int; param "idx" ty_int ],
+        ty_int,
+        "blorp_checked_get",
+        2 );
+      ( "checked_set",
+        [ param "items" vector_int; param "idx" ty_int; param "value" ty_int ],
+        vector_int,
+        "blorp_checked_set",
+        3 );
+      ( "checked_slice",
+        [
+          param "items" vector_int; param "start" ty_int; param "end_idx" ty_int;
+        ],
+        vector_int,
+        "blorp_checked_slice",
+        3 );
+      ( "matrix_checked_get",
+        [ param "items" matrix_int; param "row" ty_int; param "col" ty_int ],
+        ty_int,
+        "blorp_matrix_checked_get",
+        3 );
+      ( "matrix_checked_set",
+        [
+          param "items" matrix_int;
+          param "row" ty_int;
+          param "col" ty_int;
+          param "value" ty_int;
+        ],
+        matrix_int,
+        "blorp_matrix_checked_set",
+        4 );
+      ( "tensor3_checked_get",
+        [
+          param "items" tensor3_int;
+          param "i" ty_int;
+          param "j" ty_int;
+          param "k" ty_int;
+        ],
+        ty_int,
+        "blorp_tensor3_checked_get",
+        4 );
+      ( "tensor3_checked_set",
+        [
+          param "items" tensor3_int;
+          param "i" ty_int;
+          param "j" ty_int;
+          param "k" ty_int;
+          param "value" ty_int;
+        ],
+        tensor3_int,
+        "blorp_tensor3_checked_set",
+        5 );
+      ( "tensor4_checked_get",
+        [
+          param "items" tensor4_int;
+          param "i" ty_int;
+          param "j" ty_int;
+          param "k" ty_int;
+          param "l" ty_int;
+        ],
+        ty_int,
+        "blorp_tensor4_checked_get",
+        5 );
+      ( "tensor4_checked_set",
+        [
+          param "items" tensor4_int;
+          param "i" ty_int;
+          param "j" ty_int;
+          param "k" ty_int;
+          param "l" ty_int;
+          param "value" ty_int;
+        ],
+        tensor4_int,
+        "blorp_tensor4_checked_set",
+        6 );
+      ( "tensor5_checked_get",
+        [
+          param "items" tensor5_int;
+          param "i" ty_int;
+          param "j" ty_int;
+          param "k" ty_int;
+          param "l" ty_int;
+          param "m" ty_int;
+        ],
+        ty_int,
+        "blorp_tensor5_checked_get",
+        6 );
+      ( "tensor5_checked_set",
+        [
+          param "items" tensor5_int;
+          param "i" ty_int;
+          param "j" ty_int;
+          param "k" ty_int;
+          param "l" ty_int;
+          param "m" ty_int;
+          param "value" ty_int;
+        ],
+        tensor5_int,
+        "blorp_tensor5_checked_set",
+        7 );
+      ( "tensor_peel",
+        [ param "items" matrix_int; param "row" ty_int ],
+        vector_int,
+        "blorp_tensor_peel",
+        2 );
+    ]
+  in
+  cases
+  |> List.iter (fun (func_name, params, return_ty, c_name, arg_count) ->
+      expect_builtin_synthesis ~arg_count ~module_path:"std/tensor" func_name
+        params return_ty c_name)
+
+let test_matrix_c_wrappers_synthesize_from_specs () =
+  let left_matrix = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
+  let right_matrix = TyArray (ty_int, [ TyConstInt 3; TyConstInt 4 ]) in
+  let matmul_result = TyArray (ty_int, [ TyConstInt 2; TyConstInt 4 ]) in
+  let transposed = TyArray (ty_int, [ TyConstInt 3; TyConstInt 2 ]) in
+  let vector2 = ty_vector ty_int 2 in
+  let vector3 = ty_vector ty_int 3 in
+  let outer_result = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
+  [
+    ( "matmul",
+      [ param "a" left_matrix; param "b" right_matrix ],
+      matmul_result,
+      "blorp_tensor_matmul",
+      2 );
+    ( "transpose",
+      [ param "m" left_matrix ],
+      transposed,
+      "blorp_tensor_transpose",
+      1 );
+    ( "matvec",
+      [ param "m" left_matrix; param "v" vector3 ],
+      vector2,
+      "blorp_tensor_matvec",
+      2 );
+    ( "matvec_t",
+      [ param "m" left_matrix; param "v" vector2 ],
+      vector3,
+      "blorp_tensor_matvec_t",
+      2 );
+    ( "outer",
+      [ param "a" vector2; param "b" vector3 ],
+      outer_result,
+      "blorp_tensor_outer",
+      2 );
+  ]
+  |> List.iter (fun (func_name, params, return_ty, c_name, arg_count) ->
+      expect_builtin_synthesis ~arg_count ~module_path:"std/matrix" func_name
+        params return_ty c_name)
+
+let test_stream_wrappers_synthesize_from_specs () =
+  let stream_int = TyNamed ("Stream", [ ty_int ]) in
+  let stream_cases =
+    [
+      ( "from_list",
+        [ param "items" (ty_list ty_int) ],
+        stream_int,
+        "blorp_stream_from_list" );
+      ( "from_range",
+        [ param "start" ty_int; param "stop" ty_int ],
+        stream_int,
+        "blorp_stream_from_range" );
+      ("repeat", [ param "value" ty_int ], stream_int, "blorp_stream_repeat");
+      ( "unfold",
+        [ param "state" ty_int; param "next" (ty_func [ ty_int ] stream_int) ],
+        stream_int,
+        "blorp_stream_unfold" );
+      ("empty", [], stream_int, "blorp_stream_empty");
+      ( "from_lines",
+        [ param "text" ty_string ],
+        stream_int,
+        "blorp_stream_from_lines" );
+      ( "map",
+        [ param "items" stream_int; param "f" (ty_func [ ty_int ] ty_int) ],
+        stream_int,
+        "blorp_stream_map" );
+      ( "take",
+        [ param "items" stream_int; param "n" ty_int ],
+        stream_int,
+        "blorp_stream_take" );
+      ( "collect",
+        [ param "items" stream_int ],
+        ty_list ty_int,
+        "blorp_stream_collect" );
+      ( "fold",
+        [
+          param "items" stream_int;
+          param "init" ty_int;
+          param "f" (ty_func [ ty_int; ty_int ] ty_int);
+        ],
+        ty_int,
+        "blorp_stream_fold" );
+      ( "for_each",
+        [ param "items" stream_int; param "f" (ty_func [ ty_int ] ty_void) ],
+        ty_void,
+        "blorp_stream_for_each" );
+      ( "find",
+        [ param "items" stream_int; param "pred" (ty_func [ ty_int ] ty_bool) ],
+        ty_option ty_int,
+        "blorp_stream_find" );
+    ]
+  in
+  List.iter
+    (fun (func_name, params, return_ty, c_name) ->
+      expect_builtin_synthesis ~module_path:"std/stream" func_name params
+        return_ty c_name)
+    stream_cases
 
 let assert_list_strategy_shape func_name params return_ty =
   let strategy =
@@ -2836,8 +3585,24 @@ let suite =
   [
     ( "synthesis",
       [
-        Alcotest.test_case "list_synthesis_rejects_malformed_arities" `Quick
-          test_list_synthesis_rejects_malformed_arities;
+        Alcotest.test_case "list_synthesis_rejects_malformed_signatures" `Quick
+          test_list_synthesis_rejects_malformed_signatures;
+        Alcotest.test_case "std_synthesis_rejects_malformed_signatures" `Quick
+          test_std_synthesis_rejects_malformed_signatures;
+        Alcotest.test_case "hash_wrappers_synthesize_from_specs" `Quick
+          test_hash_wrappers_synthesize_from_specs;
+        Alcotest.test_case "time_and_system_wrappers_synthesize_from_specs"
+          `Quick test_time_and_system_wrappers_synthesize_from_specs;
+        Alcotest.test_case "bytes_c_wrappers_synthesize_from_specs" `Quick
+          test_bytes_c_wrappers_synthesize_from_specs;
+        Alcotest.test_case "fixed_c_wrappers_synthesize_from_specs" `Quick
+          test_fixed_c_wrappers_synthesize_from_specs;
+        Alcotest.test_case "tensor_c_wrappers_synthesize_from_specs" `Quick
+          test_tensor_c_wrappers_synthesize_from_specs;
+        Alcotest.test_case "matrix_c_wrappers_synthesize_from_specs" `Quick
+          test_matrix_c_wrappers_synthesize_from_specs;
+        Alcotest.test_case "stream_wrappers_synthesize_from_specs" `Quick
+          test_stream_wrappers_synthesize_from_specs;
         Alcotest.test_case "list_strategy_contract_matches_synthesized_ir"
           `Quick test_list_strategy_contract_matches_synthesized_ir;
         Alcotest.test_case "list_synthesized_ir_does_not_own_borrowed_aliases"

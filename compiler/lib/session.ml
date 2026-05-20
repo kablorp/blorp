@@ -120,6 +120,8 @@ type loaded_module = {
   mutable typed_import_bindings : import_binding list option;
 }
 
+type type_home = UniqueTypeHome of string | AmbiguousTypeHome of string list
+
 (* ============================================================================
    Session record
    ============================================================================ *)
@@ -140,16 +142,19 @@ type t = {
       fast reload. Session-scoped by design — sharing across sessions
       would require a separate process-level cache keyed by source
       hash; not worth it today. *)
-  type_index : (string, string) Hashtbl.t;
-      (** Type name → canonical name of the module that declared it.
+  type_index : (string, type_home) Hashtbl.t;
+      (** Type name → canonical module name(s) that declared it.
       Populated by [register_module_types] whenever a module is loaded;
       keys both unions/enums ([DType]) and records ([DRecord]). Read
       by [Env.format_constructor_ref] (Track B) so a constructor's
       home module can be rendered in diagnostics: "Some (from
-      std/option)". Builtins registered without a module source
-      (Option/Result/ConcurrencyError from [env_builtins]) stay
-      unregistered here and render bare — matches the trait-index
-      pattern. *)
+      std/option)" when the home is unique. Duplicate public type
+      names are preserved as [AmbiguousTypeHome] instead of silently
+      replacing the previous module; callers that need one owner must
+      treat ambiguity as a miss or report it. Builtins registered
+      without a module source (Option/Result/ConcurrencyError from
+      [env_builtins]) stay unregistered here and render bare — matches
+      the trait-index pattern. *)
   resource_cleanup_index : (string, resource_cleanup) Hashtbl.t;
       (** Canonical resource type name → compiler-owned cleanup metadata.
 
@@ -413,34 +418,61 @@ let find_trait_decl (sess : t) (name : string) :
               | _ -> None)
             m.decls)
 
+(** Register one public type home without losing ambiguity. Re-registration by
+    the same module is idempotent; registration by a different module upgrades
+    the entry to an ambiguous home set. *)
+let register_type_home (sess : t) ~(type_name : string) ~(module_name : string)
+    : unit =
+  let add_home homes =
+    if List.mem module_name homes then homes
+    else List.sort_uniq String.compare (module_name :: homes)
+  in
+  match Hashtbl.find_opt sess.type_index type_name with
+  | None ->
+      Hashtbl.replace sess.type_index type_name (UniqueTypeHome module_name)
+  | Some (UniqueTypeHome prior) ->
+      if prior = module_name then ()
+      else
+        Hashtbl.replace sess.type_index type_name
+          (AmbiguousTypeHome
+             (List.sort_uniq String.compare [ prior; module_name ]))
+  | Some (AmbiguousTypeHome homes) ->
+      Hashtbl.replace sess.type_index type_name
+        (AmbiguousTypeHome (add_home homes))
+
 (** Walk a loaded module and register every declared type (union, enum,
     record) into [sess.type_index] with the module as its home. Private
     types ([DPrivate (DType _)] or [DPrivate (DRecord _)]) are NOT
     registered — they're module-scoped and can't be referenced from
     other modules, so they shouldn't appear in cross-module diagnostics.
-    Re-registration is idempotent when the module matches; a
-    conflicting module would indicate a name collision we don't try to
-    flag here (typecheck's import layer handles that). *)
+    Duplicate public type names are retained as ambiguity, not silently
+    overwritten. *)
 let register_module_types (sess : t) (m : loaded_module) : unit =
   List.iter
     (fun (d : decl) ->
       match d.decl_desc with
-      | DType td -> (
-          match Hashtbl.find_opt sess.type_index td.type_name with
-          | Some prior when prior = m.name -> () (* idempotent re-register *)
-          | _ -> Hashtbl.replace sess.type_index td.type_name m.name)
-      | DRecord rd -> (
-          match Hashtbl.find_opt sess.type_index rd.record_name with
-          | Some prior when prior = m.name -> ()
-          | _ -> Hashtbl.replace sess.type_index rd.record_name m.name)
+      | DType td ->
+          register_type_home sess ~type_name:td.type_name ~module_name:m.name
+      | DRecord rd ->
+          register_type_home sess ~type_name:rd.record_name ~module_name:m.name
       | _ -> ())
     m.decls
 
+(** Look up every registered home module for a type. An empty list means the
+    type is unregistered; one item means the home is unique; multiple items mean
+    the bare type name is ambiguous across loaded modules. *)
+let find_type_homes (sess : t) (name : string) : string list =
+  match Hashtbl.find_opt sess.type_index name with
+  | None -> []
+  | Some (UniqueTypeHome path) -> [ path ]
+  | Some (AmbiguousTypeHome paths) -> paths
+
 (** Look up a type's home module in the session's [type_index].
     Returns [None] for builtins / unregistered names — callers should
-    render bare in that case. *)
+    render bare in that case. Also returns [None] when multiple loaded modules
+    declare the same public type name, because there is no single home. *)
 let find_type_home (sess : t) (name : string) : string option =
-  Hashtbl.find_opt sess.type_index name
+  match find_type_homes sess name with [ path ] -> Some path | _ -> None
 
 (** Register cleanup metadata for a resource type. [type_name] should be the
     canonical name visible to typed Core lowering: local names for the module

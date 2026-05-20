@@ -116,6 +116,1073 @@ let bin op a b ty : core = mk ty (CBin (op, a, b))
 (** Get param as a var reference. *)
 let param (p : core_param) : core = vr p.cp_name.vname p.cp_ty
 
+exception Malformed_intrinsic_params
+
+type std_body_receiver =
+  | NoReceiver
+  | AnyReceiver
+  | FirstParamNamed of string
+  | FirstParamTensor
+
+type std_body_return =
+  | AnyReturn
+  | ReturnNamed of string
+  | ReturnOptionOfNamed of string
+  | ReturnTensor
+
+(** Parameter shapes are deliberately shallow unless the constructor says
+    otherwise. [ParamNamed "List"] checks only the nominal type head, while the
+    relation shapes check container element/key/value equality against the
+    first parameter. *)
+type std_body_param_shape =
+  | AnyParam
+  | ParamNamed of string
+  | ParamOneOfNamed of string list
+  | ParamFunc
+  | ParamTensor
+  | ParamSameAsFirstListElement
+  | ParamListWithSameElementAsFirst
+  | ParamSameAsFirstSetElement
+  | ParamSetWithSameElementAsFirst
+  | ParamSameAsFirstDictKey
+  | ParamSameAsFirstDictValue
+
+type std_body_synthesis =
+  | BuiltinWrapper of string
+  | BuiltinWrapperWithTrailingInt of { c_name : string; value : int }
+
+type std_body_spec = {
+  spec_module_path : string;
+  spec_func_name : string;
+  spec_arity : int;
+  spec_receiver : std_body_receiver;
+  spec_return : std_body_return;
+  spec_param_shapes : std_body_param_shape list option;
+  spec_synthesis : std_body_synthesis option;
+}
+
+type std_body_checked_params = { checked_params : core_param array }
+
+(** During the migration, not every legacy synthesis arm has a spec entry.
+    [LegacyUncheckedParams] means no table entry exists for the module/name yet,
+    so old branch guards still own that signature. [SpecCheckedParams] means the
+    table accepted module path, function name, arity, receiver, return, and any
+    declared parameter-shape constraints before synthesis runs; it carries the
+    accepting spec so entries can own synthesis directly. *)
+type std_body_signature_check =
+  | LegacyUncheckedParams of std_body_checked_params
+  | SpecCheckedParams of std_body_spec * std_body_checked_params
+
+let std_body_spec ?(return_shape = AnyReturn) ?param_shapes ?synthesis
+    module_path func_name arity receiver =
+  {
+    spec_module_path = module_path;
+    spec_func_name = func_name;
+    spec_arity = arity;
+    spec_receiver = receiver;
+    spec_return = return_shape;
+    spec_param_shapes = param_shapes;
+    spec_synthesis = synthesis;
+  }
+
+let make_std_body_checked_params params =
+  { checked_params = Array.of_list params }
+
+let std_body_checked_param checked index =
+  if index < 0 || index >= Array.length checked.checked_params then
+    raise Malformed_intrinsic_params
+  else checked.checked_params.(index)
+
+let type_is_named name = function
+  | Ast.TyNamed (got, _) -> got = name
+  | _ -> false
+
+let type_is_option_of_named name = function
+  | Ast.TyNamed ("Option", [ inner ]) -> type_is_named name inner
+  | _ -> false
+
+let list_element_type = function
+  | Ast.TyNamed ("List", [ elem_ty ]) -> Some elem_ty
+  | _ -> None
+
+let set_element_type = function
+  | Ast.TyNamed ("Set", [ elem_ty ]) -> Some elem_ty
+  | _ -> None
+
+let dict_key_value_types = function
+  | Ast.TyNamed ("Dict", [ key_ty; value_ty ]) -> Some (key_ty, value_ty)
+  | _ -> None
+
+let first_param_type params =
+  match params with first :: _ -> Some first.cp_ty | [] -> None
+
+let type_matches_expected expected actual = Types.types_equal expected actual
+
+let param_same_as_first_list_element params param =
+  match Option.bind (first_param_type params) list_element_type with
+  | Some elem_ty -> type_matches_expected elem_ty param.cp_ty
+  | None -> false
+
+let param_list_with_same_element_as_first params param =
+  match
+    ( Option.bind (first_param_type params) list_element_type,
+      list_element_type param.cp_ty )
+  with
+  | Some first_elem_ty, Some param_elem_ty ->
+      type_matches_expected first_elem_ty param_elem_ty
+  | _ -> false
+
+let param_same_as_first_set_element params param =
+  match Option.bind (first_param_type params) set_element_type with
+  | Some elem_ty -> type_matches_expected elem_ty param.cp_ty
+  | None -> false
+
+let param_set_with_same_element_as_first params param =
+  match
+    ( Option.bind (first_param_type params) set_element_type,
+      set_element_type param.cp_ty )
+  with
+  | Some first_elem_ty, Some param_elem_ty ->
+      type_matches_expected first_elem_ty param_elem_ty
+  | _ -> false
+
+let param_same_as_first_dict_key params param =
+  match Option.bind (first_param_type params) dict_key_value_types with
+  | Some (key_ty, _) -> type_matches_expected key_ty param.cp_ty
+  | None -> false
+
+let param_same_as_first_dict_value params param =
+  match Option.bind (first_param_type params) dict_key_value_types with
+  | Some (_, value_ty) -> type_matches_expected value_ty param.cp_ty
+  | None -> false
+
+let std_body_spec_arity_matches spec params =
+  List.length params = spec.spec_arity
+
+let std_body_spec_receiver_matches ~is_tensor_type spec params =
+  match (spec.spec_receiver, params) with
+  | NoReceiver, [] -> true
+  | NoReceiver, _ :: _ -> false
+  | AnyReceiver, _ -> true
+  | FirstParamNamed name, first :: _ -> type_is_named name first.cp_ty
+  | FirstParamNamed _, [] -> false
+  | FirstParamTensor, first :: _ -> is_tensor_type first.cp_ty
+  | FirstParamTensor, [] -> false
+
+let std_body_spec_return_matches ~is_tensor_type spec return_ty =
+  match spec.spec_return with
+  | AnyReturn -> true
+  | ReturnNamed name -> type_is_named name return_ty
+  | ReturnOptionOfNamed name -> type_is_option_of_named name return_ty
+  | ReturnTensor -> is_tensor_type return_ty
+
+let std_body_param_shape_matches ~is_tensor_type ~params shape param =
+  match shape with
+  | AnyParam -> true
+  | ParamNamed name -> type_is_named name param.cp_ty
+  | ParamOneOfNamed names ->
+      List.exists (fun name -> type_is_named name param.cp_ty) names
+  | ParamFunc -> ( match param.cp_ty with Ast.TyFunc _ -> true | _ -> false)
+  | ParamTensor -> is_tensor_type param.cp_ty
+  | ParamSameAsFirstListElement -> param_same_as_first_list_element params param
+  | ParamListWithSameElementAsFirst ->
+      param_list_with_same_element_as_first params param
+  | ParamSameAsFirstSetElement -> param_same_as_first_set_element params param
+  | ParamSetWithSameElementAsFirst ->
+      param_set_with_same_element_as_first params param
+  | ParamSameAsFirstDictKey -> param_same_as_first_dict_key params param
+  | ParamSameAsFirstDictValue -> param_same_as_first_dict_value params param
+
+let std_body_spec_params_match ~is_tensor_type spec params =
+  match spec.spec_param_shapes with
+  | None -> true
+  | Some shapes ->
+      List.length shapes = List.length params
+      && List.for_all2
+           (fun shape param ->
+             std_body_param_shape_matches ~is_tensor_type ~params shape param)
+           shapes params
+
+let std_body_spec_matches ~is_tensor_type spec params return_ty =
+  std_body_spec_arity_matches spec params
+  && std_body_spec_receiver_matches ~is_tensor_type spec params
+  && std_body_spec_return_matches ~is_tensor_type spec return_ty
+  && std_body_spec_params_match ~is_tensor_type spec params
+
+let std_body_specs =
+  let spec = std_body_spec in
+  let list_spec ?return_shape ?param_shapes func_name arity =
+    spec ?return_shape ?param_shapes "std/list" func_name arity
+      (FirstParamNamed "List")
+  in
+  let string_spec ?return_shape ?param_shapes func_name arity =
+    spec ?return_shape ?param_shapes "std/string" func_name arity
+      (FirstParamNamed "String")
+  in
+  let bytes_spec ?return_shape ?param_shapes func_name arity =
+    spec ?return_shape ?param_shapes "std/bytes" func_name arity
+      (FirstParamNamed "Bytes")
+  in
+  let set_spec ?return_shape ?param_shapes func_name arity =
+    spec ?return_shape ?param_shapes "std/set" func_name arity
+      (FirstParamNamed "Set")
+  in
+  let dict_spec ?return_shape ?param_shapes func_name arity =
+    spec ?return_shape ?param_shapes "std/dict" func_name arity
+      (FirstParamNamed "Dict")
+  in
+  let bytes_builtin_spec ?return_shape ?param_shapes ~c_name func_name arity
+      receiver =
+    spec ?return_shape ?param_shapes ~synthesis:(BuiltinWrapper c_name)
+      "std/bytes" func_name arity receiver
+  in
+  let fixed_builtin_spec ?return_shape ?param_shapes ~c_name func_name arity
+      receiver =
+    spec ?return_shape ?param_shapes ~synthesis:(BuiltinWrapper c_name)
+      "std/fixed" func_name arity receiver
+  in
+  let fixed_default_precision_spec ?return_shape ?param_shapes ~c_name func_name
+      arity receiver =
+    spec ?return_shape ?param_shapes
+      ~synthesis:(BuiltinWrapperWithTrailingInt { c_name; value = 18 })
+      "std/fixed" func_name arity receiver
+  in
+  let time_spec ?return_shape ?param_shapes ~c_name func_name arity receiver =
+    spec ?return_shape ?param_shapes ~synthesis:(BuiltinWrapper c_name)
+      "std/time" func_name arity receiver
+  in
+  let stream_spec ?return_shape ?param_shapes ~c_name func_name arity receiver =
+    spec ?return_shape ?param_shapes ~synthesis:(BuiltinWrapper c_name)
+      "std/stream" func_name arity receiver
+  in
+  let tensor_builtin_spec ?return_shape ?param_shapes ~c_name func_name arity
+      receiver =
+    spec ?return_shape ?param_shapes ~synthesis:(BuiltinWrapper c_name)
+      "std/tensor" func_name arity receiver
+  in
+  let matrix_builtin_spec ?return_shape ?param_shapes ~c_name func_name arity
+      receiver =
+    spec ?return_shape ?param_shapes ~synthesis:(BuiltinWrapper c_name)
+      "std/matrix" func_name arity receiver
+  in
+  let hash_spec ?return_shape ?param_shapes func_name arity receiver =
+    spec ?return_shape ?param_shapes
+      ~synthesis:(BuiltinWrapper ("blorp_" ^ func_name))
+      "std/hash" func_name arity receiver
+  in
+  let math_float_type_names = [ "Float"; "Float32"; "Float16" ] in
+  let repeated_param_shape shape arity = List.init arity (fun _ -> shape) in
+  let math_same_float_specs func_names arity =
+    List.concat_map
+      (fun func_name ->
+        List.map
+          (fun float_name ->
+            spec ~return_shape:(ReturnNamed float_name)
+              ~param_shapes:(repeated_param_shape (ParamNamed float_name) arity)
+              "std/math" func_name arity (FirstParamNamed float_name))
+          math_float_type_names)
+      func_names
+  in
+  let math_float_class_specs =
+    List.concat_map
+      (fun func_name ->
+        List.map
+          (fun float_name ->
+            spec ~return_shape:(ReturnNamed "Bool")
+              ~param_shapes:[ ParamNamed float_name ] "std/math" func_name 1
+              (FirstParamNamed float_name))
+          math_float_type_names)
+      [ "is_nan"; "is_inf"; "is_finite" ]
+  in
+  let math_constant_specs =
+    [
+      spec ~return_shape:(ReturnNamed "Float") "std/math" "infinity" 0
+        NoReceiver;
+      spec ~return_shape:(ReturnNamed "Float") "std/math" "neg_infinity" 0
+        NoReceiver;
+      spec ~return_shape:(ReturnNamed "Float") "std/math" "nan_value" 0
+        NoReceiver;
+    ]
+  in
+  let math_unary_specs =
+    math_same_float_specs
+      [
+        "sin";
+        "cos";
+        "tan";
+        "asin";
+        "acos";
+        "atan";
+        "sinh";
+        "cosh";
+        "tanh";
+        "asinh";
+        "acosh";
+        "atanh";
+        "exp";
+        "exp2";
+        "expm1";
+        "log";
+        "log2";
+        "log10";
+        "log1p";
+        "sqrt";
+        "cbrt";
+        "floor";
+        "ceil";
+        "trunc";
+      ]
+      1
+  in
+  let math_binary_specs =
+    math_same_float_specs [ "pow"; "atan2"; "hypot"; "fmod"; "copysign" ] 2
+  in
+  let math_ternary_specs = math_same_float_specs [ "fma" ] 3 in
+  let list_specs =
+    [
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "parallel" 2;
+      list_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "List" ] "length" 1;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamSameAsFirstListElement ]
+        "append" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamSameAsFirstListElement ]
+        "__unsafe_list_append" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:
+          [ ParamNamed "List"; ParamNamed "Int"; ParamSameAsFirstListElement ]
+        "__unsafe_list_set_index" 3;
+      list_spec
+        ~param_shapes:
+          [ ParamNamed "List"; ParamNamed "Int"; ParamSameAsFirstListElement ]
+        "get_or" 3;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:
+          [ ParamNamed "List"; ParamNamed "Int"; ParamSameAsFirstListElement ]
+        "set" 3;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int"; ParamNamed "Int" ]
+        "__unsafe_list_swap" 3;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int" ]
+        "__unsafe_list_remove" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:
+          [ ParamNamed "List"; ParamNamed "Int"; ParamSameAsFirstListElement ]
+        "__unsafe_list_insert" 3;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List" ] "__unsafe_list_tail" 1;
+      list_spec
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int" ]
+        "__unsafe_list_get" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List" ] "reverse" 1;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List" ] "__unsafe_list_reverse" 1;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamListWithSameElementAsFirst ]
+        "concat" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int" ]
+        "take" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int" ]
+        "drop" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List" ] "flatten" 1;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "map" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "map_indexed" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "filter" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "take_while" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "drop_while" 2;
+      list_spec ~param_shapes:[ ParamNamed "List"; ParamFunc ] "partition" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "flat_map" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "filter_map" 2;
+      list_spec
+        ~param_shapes:[ ParamNamed "List"; AnyParam; ParamFunc ]
+        "fold_left" 3;
+      list_spec
+        ~param_shapes:[ ParamNamed "List"; AnyParam; ParamFunc ]
+        "fold" 3;
+      list_spec
+        ~param_shapes:[ ParamNamed "List"; AnyParam; ParamFunc ]
+        "fold_right" 3;
+      list_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "all" 2;
+      list_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "any" 2;
+      list_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "count" 2;
+      list_spec ~return_shape:(ReturnNamed "Void")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "for_each" 2;
+      list_spec ~return_shape:(ReturnNamed "Option")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "find_index" 2;
+      list_spec ~return_shape:(ReturnNamed "Option")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "find" 2;
+      list_spec ~return_shape:(ReturnNamed "Option")
+        ~param_shapes:[ ParamNamed "List"; ParamSameAsFirstListElement ]
+        "binary_search" 2;
+      list_spec ~return_shape:(ReturnNamed "Option")
+        ~param_shapes:
+          [ ParamNamed "List"; ParamSameAsFirstListElement; ParamFunc ]
+        "binary_search_by" 3;
+      list_spec ~return_shape:(ReturnNamed "Option")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "min_by" 2;
+      list_spec ~return_shape:(ReturnNamed "Option")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "max_by" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List" ] "sort" 1;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "sort_by" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamFunc ]
+        "sort_desc_by" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; AnyParam; ParamFunc ]
+        "scan" 3;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List" ] "enumerate" 1;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "List" ]
+        "zip" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "List"; ParamFunc ]
+        "zip_with" 3;
+      list_spec ~param_shapes:[ ParamNamed "List" ] "unzip" 1;
+      spec ~return_shape:(ReturnNamed "List") "std/list" "repeat" 2
+        ~param_shapes:[ AnyParam; ParamNamed "Int" ]
+        AnyReceiver;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamSameAsFirstListElement ]
+        "intersperse" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int" ]
+        "windows" 2;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int" ]
+        "chunks" 2;
+      spec ~return_shape:(ReturnNamed "List") "std/list" "range" 2
+        ~param_shapes:[ ParamNamed "Int"; ParamNamed "Int" ]
+        (FirstParamNamed "Int");
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List" ] "unique" 1;
+      spec ~return_shape:(ReturnNamed "String") "std/list" "string_append" 2
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        (FirstParamNamed "String");
+    ]
+  in
+  let string_specs =
+    [
+      spec ~return_shape:(ReturnNamed "String") "std/string" "string" 1
+        ~param_shapes:[ ParamNamed "Int" ] (FirstParamNamed "Int");
+      spec ~return_shape:(ReturnNamed "String") "std/string"
+        "string_with_capacity" 1 ~param_shapes:[ ParamNamed "Int" ]
+        (FirstParamNamed "Int");
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "Int" ]
+        "reserve" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "Char" ]
+        "append_char" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "Char" ]
+        "string_append_char" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "append_str" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "string_append" 2;
+      string_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "String" ] "length" 1;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:
+          [ ParamNamed "String"; ParamNamed "Int"; ParamNamed "Int" ]
+        "substring" 3;
+      string_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "starts_with" 2;
+      string_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "ends_with" 2;
+      string_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "contains" 2;
+      string_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "raw_index_of" 2;
+      string_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "count" 2;
+      string_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "split" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "trim" 1;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:
+          [ ParamNamed "String"; ParamNamed "String"; ParamNamed "String" ]
+        "replace" 3;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "capitalize" 1;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "title_case" 1;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "Int" ]
+        "repeat" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "Int" ]
+        "drop_left" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "Int" ]
+        "take_left" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "Int" ]
+        "take_right" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "Int" ]
+        "drop_right" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "trim_left" 1;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "trim_right" 1;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "reverse" 1;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:
+          [ ParamNamed "String"; ParamNamed "Int"; ParamNamed "Char" ]
+        "pad_left" 3;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:
+          [ ParamNamed "String"; ParamNamed "Int"; ParamNamed "Char" ]
+        "pad_right" 3;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:
+          [ ParamNamed "String"; ParamNamed "Int"; ParamNamed "Char" ]
+        "center" 3;
+      string_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "raw_last_index_of" 2;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "trim_chars" 2;
+      string_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "String" ] "is_numeric" 1;
+      string_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "String" ] "is_ascii" 1;
+      string_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "String" ] "is_blank" 1;
+      string_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "String" ] "is_lower" 1;
+      string_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "String" ] "is_upper" 1;
+      string_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "longest_common_prefix" 2;
+      string_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "hamming_distance_raw" 2;
+    ]
+  in
+  let bytes_specs =
+    [
+      spec ~return_shape:(ReturnNamed "Bytes")
+        ~param_shapes:[ ParamNamed "Int" ] "std/bytes" "bytes" 1
+        (FirstParamNamed "Int");
+      bytes_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "Bytes" ] "length" 1;
+      bytes_spec ~return_shape:(ReturnOptionOfNamed "Int")
+        ~param_shapes:[ ParamNamed "Bytes"; ParamNamed "Int" ]
+        "get" 2;
+      bytes_spec ~return_shape:(ReturnNamed "Bytes")
+        ~param_shapes:[ ParamNamed "Bytes"; ParamNamed "Int"; ParamNamed "Int" ]
+        "set_index" 3;
+      bytes_spec ~return_shape:(ReturnNamed "Bytes")
+        ~param_shapes:[ ParamNamed "Bytes"; ParamNamed "Int"; ParamNamed "Int" ]
+        "slice" 3;
+      bytes_spec ~return_shape:(ReturnNamed "Bytes")
+        ~param_shapes:[ ParamNamed "Bytes"; ParamNamed "Bytes" ]
+        "append" 2;
+      bytes_spec ~return_shape:(ReturnNamed "Bytes")
+        ~param_shapes:[ ParamNamed "Bytes"; ParamNamed "Int" ]
+        "fill" 2;
+      bytes_spec ~return_shape:(ReturnOptionOfNamed "Int")
+        ~param_shapes:[ ParamNamed "Bytes"; ParamNamed "Int"; ParamNamed "Int" ]
+        "index_of" 3;
+      bytes_spec ~return_shape:(ReturnNamed "Bytes")
+        ~param_shapes:
+          [
+            ParamNamed "Bytes";
+            ParamNamed "Int";
+            ParamNamed "Bytes";
+            ParamNamed "Int";
+            ParamNamed "Int";
+          ]
+        "blit" 5;
+      bytes_builtin_spec ~return_shape:(ReturnNamed "String")
+        ~c_name:"blorp_bytes_to_string" ~param_shapes:[ ParamNamed "Bytes" ]
+        "to_string" 1 (FirstParamNamed "Bytes");
+      bytes_builtin_spec ~return_shape:(ReturnOptionOfNamed "Bytes")
+        ~c_name:"blorp_bytes_from_hex" ~param_shapes:[ ParamNamed "String" ]
+        "from_hex" 1 (FirstParamNamed "String");
+      bytes_builtin_spec ~return_shape:(ReturnNamed "Bytes")
+        ~c_name:"blorp_encode_utf8" ~param_shapes:[ ParamNamed "List" ]
+        "encode_utf8" 1 (FirstParamNamed "List");
+      bytes_builtin_spec ~return_shape:(ReturnOptionOfNamed "List")
+        ~c_name:"blorp_decode_utf8" ~param_shapes:[ ParamNamed "Bytes" ]
+        "decode_utf8" 1 (FirstParamNamed "Bytes");
+    ]
+  in
+  let set_specs =
+    [
+      set_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "Set" ] "length" 1;
+      set_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "Set"; ParamSameAsFirstSetElement ]
+        "contains" 2;
+      set_spec ~return_shape:(ReturnNamed "Set")
+        ~param_shapes:[ ParamNamed "Set"; ParamSameAsFirstSetElement ]
+        "add" 2;
+      set_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "Set"; ParamSetWithSameElementAsFirst ]
+        "is_subset" 2;
+      set_spec ~return_shape:(ReturnNamed "Set")
+        ~param_shapes:[ ParamNamed "Set"; ParamSetWithSameElementAsFirst ]
+        "difference" 2;
+      set_spec ~return_shape:(ReturnNamed "Set")
+        ~param_shapes:[ ParamNamed "Set"; ParamSetWithSameElementAsFirst ]
+        "intersect" 2;
+      set_spec ~return_shape:(ReturnNamed "Set")
+        ~param_shapes:[ ParamNamed "Set"; ParamSetWithSameElementAsFirst ]
+        "combine" 2;
+      set_spec ~return_shape:(ReturnNamed "Set")
+        ~param_shapes:[ ParamNamed "Set"; ParamFunc ]
+        "map" 2;
+      set_spec ~return_shape:(ReturnNamed "Set")
+        ~param_shapes:[ ParamNamed "Set"; ParamFunc ]
+        "filter" 2;
+      set_spec ~param_shapes:[ ParamNamed "Set"; AnyParam; ParamFunc ] "fold" 3;
+      set_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "Set" ] "to_list" 1;
+    ]
+  in
+  let dict_specs =
+    [
+      dict_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "Dict" ] "length" 1;
+      dict_spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "Dict"; ParamSameAsFirstDictKey ]
+        "contains" 2;
+      dict_spec
+        ~param_shapes:
+          [
+            ParamNamed "Dict";
+            ParamSameAsFirstDictKey;
+            ParamSameAsFirstDictValue;
+          ]
+        "get_or" 3;
+      dict_spec ~return_shape:(ReturnNamed "Dict")
+        ~param_shapes:
+          [
+            ParamNamed "Dict";
+            ParamSameAsFirstDictKey;
+            ParamSameAsFirstDictValue;
+          ]
+        "set" 3;
+      dict_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "Dict" ] "keys" 1;
+      dict_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "Dict" ] "values" 1;
+      dict_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "Dict" ] "entries" 1;
+    ]
+  in
+  let fixed_specs =
+    [
+      fixed_default_precision_spec ~return_shape:(ReturnNamed "Fixed")
+        ~c_name:"blorp_fixed_new"
+        ~param_shapes:[ ParamNamed "Float"; ParamNamed "Int" ]
+        "fixed" 2 (FirstParamNamed "Float");
+      fixed_builtin_spec ~return_shape:(ReturnNamed "Fixed")
+        ~c_name:"blorp_fixed_new"
+        ~param_shapes:[ ParamNamed "Float"; ParamNamed "Int"; ParamNamed "Int" ]
+        "with_precision" 3 (FirstParamNamed "Float");
+      fixed_default_precision_spec ~return_shape:(ReturnNamed "Fixed")
+        ~c_name:"blorp_fixed_from_int"
+        ~param_shapes:[ ParamNamed "Int"; ParamNamed "Int" ]
+        "from_int" 2 (FirstParamNamed "Int");
+      spec ~return_shape:(ReturnNamed "Fixed")
+        ~param_shapes:[ ParamNamed "Fixed" ] "std/fixed" "neg" 1
+        (FirstParamNamed "Fixed");
+      spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "Fixed" ] "std/fixed" "get_scale" 1
+        (FirstParamNamed "Fixed");
+      spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "Fixed" ] "std/fixed" "get_precision" 1
+        (FirstParamNamed "Fixed");
+      spec ~return_shape:(ReturnNamed "Fixed")
+        ~param_shapes:[ ParamNamed "Fixed"; ParamNamed "Int" ]
+        "std/fixed" "round_to" 2 (FirstParamNamed "Fixed");
+      fixed_builtin_spec ~return_shape:(ReturnNamed "String")
+        ~c_name:"blorp_fixed_to_string" ~param_shapes:[ ParamNamed "Fixed" ]
+        "to_string" 1 (FirstParamNamed "Fixed");
+      spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "Fixed" ] "std/fixed" "to_int" 1
+        (FirstParamNamed "Fixed");
+      fixed_builtin_spec ~return_shape:(ReturnNamed "Float")
+        ~c_name:"blorp_fixed_to_float" ~param_shapes:[ ParamNamed "Fixed" ]
+        "to_float" 1 (FirstParamNamed "Fixed");
+    ]
+  in
+  let slice_specs =
+    [
+      spec ~return_shape:(ReturnNamed "StringSlice")
+        ~param_shapes:[ ParamNamed "String" ] "std/slice" "from_string" 1
+        (FirstParamNamed "String");
+      spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "StringSlice" ]
+        "std/slice" "length" 1 (FirstParamNamed "StringSlice");
+      spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "StringSlice" ]
+        "std/slice" "to_string" 1 (FirstParamNamed "StringSlice");
+      spec ~return_shape:(ReturnNamed "StringSlice")
+        ~param_shapes:
+          [ ParamNamed "StringSlice"; ParamNamed "Int"; ParamNamed "Int" ]
+        "std/slice" "substring" 3 (FirstParamNamed "StringSlice");
+      spec ~return_shape:(ReturnNamed "Bool")
+        ~param_shapes:[ ParamNamed "StringSlice"; ParamNamed "String" ]
+        "std/slice" "starts_with" 2 (FirstParamNamed "StringSlice");
+      spec ~return_shape:(ReturnOptionOfNamed "Char")
+        ~param_shapes:[ ParamNamed "StringSlice"; ParamNamed "Int" ]
+        "std/slice" "get" 2 (FirstParamNamed "StringSlice");
+    ]
+  in
+  let time_specs =
+    let int_part_specs =
+      List.map
+        (fun func_name ->
+          time_spec ~return_shape:(ReturnNamed "Int")
+            ~param_shapes:[ ParamNamed "Int" ]
+            ~c_name:("blorp_time_" ^ func_name)
+            func_name 1 (FirstParamNamed "Int"))
+        [
+          "to_year";
+          "to_month";
+          "to_day";
+          "to_hour";
+          "to_minute";
+          "to_second";
+          "to_weekday";
+        ]
+    in
+    [
+      time_spec ~return_shape:(ReturnNamed "Int") ~c_name:"blorp_time_now" "now"
+        0 NoReceiver;
+      time_spec ~return_shape:(ReturnNamed "Int")
+        ~c_name:"blorp_time_from_parts" "from_parts" 6
+        ~param_shapes:
+          [
+            ParamNamed "Int";
+            ParamNamed "Int";
+            ParamNamed "Int";
+            ParamNamed "Int";
+            ParamNamed "Int";
+            ParamNamed "Int";
+          ]
+        (FirstParamNamed "Int");
+      time_spec ~return_shape:(ReturnNamed "String") ~c_name:"blorp_time_format"
+        "format_time" 2
+        ~param_shapes:[ ParamNamed "Int"; ParamNamed "String" ]
+        (FirstParamNamed "Int");
+      time_spec ~return_shape:(ReturnOptionOfNamed "Int")
+        ~c_name:"blorp_time_parse" "parse_time" 2
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        (FirstParamNamed "String");
+      time_spec ~return_shape:(ReturnOptionOfNamed "Int")
+        ~c_name:"blorp_time_from_iso" "from_iso" 1
+        ~param_shapes:[ ParamNamed "String" ] (FirstParamNamed "String");
+    ]
+    @ int_part_specs
+  in
+  let system_specs =
+    [
+      spec ~return_shape:(ReturnNamed "Int")
+        ~synthesis:(BuiltinWrapper "blorp_now_us") "std/system"
+        "now_microseconds" 0 NoReceiver;
+    ]
+  in
+  let stream_specs =
+    let stream_builtin ?return_shape ?param_shapes func_name arity receiver =
+      stream_spec ?return_shape ?param_shapes
+        ~c_name:("blorp_stream_" ^ func_name)
+        func_name arity receiver
+    in
+    [
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "from_list" 1
+        ~param_shapes:[ ParamNamed "List" ] (FirstParamNamed "List");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "from_range" 2
+        ~param_shapes:[ ParamNamed "Int"; ParamNamed "Int" ]
+        (FirstParamNamed "Int");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "repeat" 1
+        ~param_shapes:[ AnyParam ] AnyReceiver;
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "unfold" 2
+        ~param_shapes:[ AnyParam; ParamFunc ] AnyReceiver;
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "empty" 0 NoReceiver;
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "from_lines" 1
+        ~param_shapes:[ ParamNamed "String" ] (FirstParamNamed "String");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "map" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "filter" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "filter_map" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "take" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamNamed "Int" ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "drop" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamNamed "Int" ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "take_while" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Stream") "enumerate" 1
+        ~param_shapes:[ ParamNamed "Stream" ] (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "List") "collect" 1
+        ~param_shapes:[ ParamNamed "Stream" ] (FirstParamNamed "Stream");
+      stream_builtin
+        ~param_shapes:[ ParamNamed "Stream"; AnyParam; ParamFunc ]
+        "fold" 3 (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Int") "count" 1
+        ~param_shapes:[ ParamNamed "Stream" ] (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Void") "for_each" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Option") "find" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Bool") "any" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
+        (FirstParamNamed "Stream");
+      stream_builtin ~return_shape:(ReturnNamed "Bool") "all" 2
+        ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
+        (FirstParamNamed "Stream");
+    ]
+  in
+  let tensor_specs =
+    [
+      tensor_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_vector_new_fill" ~param_shapes:[ AnyParam; AnyParam ]
+        "vector" 2 AnyReceiver;
+      tensor_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_matrix_new_fill"
+        ~param_shapes:[ AnyParam; AnyParam; AnyParam ]
+        "matrix" 3 AnyReceiver;
+      tensor_builtin_spec ~return_shape:ReturnTensor ~c_name:"blorp_tensor3_new"
+        ~param_shapes:[ AnyParam; AnyParam; AnyParam; AnyParam ]
+        "tensor3" 4 AnyReceiver;
+      tensor_builtin_spec ~return_shape:ReturnTensor ~c_name:"blorp_tensor4_new"
+        ~param_shapes:[ AnyParam; AnyParam; AnyParam; AnyParam; AnyParam ]
+        "tensor4" 5 AnyReceiver;
+      tensor_builtin_spec ~return_shape:ReturnTensor ~c_name:"blorp_tensor5_new"
+        ~param_shapes:
+          [ AnyParam; AnyParam; AnyParam; AnyParam; AnyParam; AnyParam ]
+        "tensor5" 6 AnyReceiver;
+      tensor_builtin_spec ~c_name:"blorp_checked_get"
+        ~param_shapes:[ ParamTensor; AnyParam ] "checked_get" 2 FirstParamTensor;
+      tensor_builtin_spec ~return_shape:ReturnTensor ~c_name:"blorp_checked_set"
+        "checked_set" 3
+        ~param_shapes:[ ParamTensor; AnyParam; AnyParam ]
+        FirstParamTensor;
+      tensor_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_checked_slice" "checked_slice" 3
+        ~param_shapes:[ ParamTensor; AnyParam; AnyParam ]
+        FirstParamTensor;
+      tensor_builtin_spec ~c_name:"blorp_matrix_checked_get"
+        ~param_shapes:[ ParamTensor; AnyParam; AnyParam ]
+        "matrix_checked_get" 3 FirstParamTensor;
+      tensor_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_matrix_checked_set" "matrix_checked_set" 4
+        ~param_shapes:[ ParamTensor; AnyParam; AnyParam; AnyParam ]
+        FirstParamTensor;
+      tensor_builtin_spec ~c_name:"blorp_tensor3_checked_get"
+        ~param_shapes:[ ParamTensor; AnyParam; AnyParam; AnyParam ]
+        "tensor3_checked_get" 4 FirstParamTensor;
+      tensor_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_tensor3_checked_set" "tensor3_checked_set" 5
+        ~param_shapes:[ ParamTensor; AnyParam; AnyParam; AnyParam; AnyParam ]
+        FirstParamTensor;
+      tensor_builtin_spec ~c_name:"blorp_tensor4_checked_get"
+        ~param_shapes:[ ParamTensor; AnyParam; AnyParam; AnyParam; AnyParam ]
+        "tensor4_checked_get" 5 FirstParamTensor;
+      tensor_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_tensor4_checked_set" "tensor4_checked_set" 6
+        ~param_shapes:
+          [ ParamTensor; AnyParam; AnyParam; AnyParam; AnyParam; AnyParam ]
+        FirstParamTensor;
+      tensor_builtin_spec ~c_name:"blorp_tensor5_checked_get"
+        ~param_shapes:
+          [ ParamTensor; AnyParam; AnyParam; AnyParam; AnyParam; AnyParam ]
+        "tensor5_checked_get" 6 FirstParamTensor;
+      tensor_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_tensor5_checked_set" "tensor5_checked_set" 7
+        ~param_shapes:
+          [
+            ParamTensor;
+            AnyParam;
+            AnyParam;
+            AnyParam;
+            AnyParam;
+            AnyParam;
+            AnyParam;
+          ]
+        FirstParamTensor;
+      tensor_builtin_spec ~c_name:"blorp_tensor_peel"
+        ~param_shapes:[ ParamTensor; AnyParam ] "tensor_peel" 2 FirstParamTensor;
+      spec ~return_shape:(ReturnNamed "Int") "std/tensor" "length" 1
+        ~param_shapes:[ ParamTensor ] FirstParamTensor;
+    ]
+  in
+  let vector_specs =
+    [
+      spec ~return_shape:(ReturnNamed "Int") "std/vector" "length" 1
+        ~param_shapes:[ ParamTensor ] FirstParamTensor;
+      spec ~param_shapes:[ ParamTensor ] "std/vector" "sum" 1 FirstParamTensor;
+      spec ~param_shapes:[ ParamTensor ] "std/vector" "product" 1
+        FirstParamTensor;
+      spec ~param_shapes:[ ParamTensor ] "std/vector" "max" 1 FirstParamTensor;
+      spec ~param_shapes:[ ParamTensor ] "std/vector" "min" 1 FirstParamTensor;
+      spec ~return_shape:(ReturnNamed "Float") "std/vector" "mean" 1
+        ~param_shapes:[ ParamTensor ] FirstParamTensor;
+      spec ~param_shapes:[ ParamTensor ] "std/vector" "argmax" 1
+        FirstParamTensor;
+      spec ~param_shapes:[ ParamTensor ] "std/vector" "argmin" 1
+        FirstParamTensor;
+      spec ~return_shape:ReturnTensor ~param_shapes:[ ParamTensor ] "std/vector"
+        "cumsum" 1 FirstParamTensor;
+      spec
+        ~param_shapes:[ ParamTensor; ParamTensor ]
+        "std/vector" "dot" 2 FirstParamTensor;
+      spec ~return_shape:ReturnTensor ~param_shapes:[ ParamTensor; AnyParam ]
+        "std/vector" "scale" 2 FirstParamTensor;
+    ]
+  in
+  let matrix_specs =
+    [
+      matrix_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_tensor_matmul"
+        ~param_shapes:[ ParamTensor; ParamTensor ]
+        "matmul" 2 FirstParamTensor;
+      matrix_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_tensor_transpose" "transpose" 1
+        ~param_shapes:[ ParamTensor ] FirstParamTensor;
+      matrix_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_tensor_matvec"
+        ~param_shapes:[ ParamTensor; ParamTensor ]
+        "matvec" 2 FirstParamTensor;
+      matrix_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_tensor_matvec_t"
+        ~param_shapes:[ ParamTensor; ParamTensor ]
+        "matvec_t" 2 FirstParamTensor;
+      matrix_builtin_spec ~return_shape:ReturnTensor
+        ~c_name:"blorp_tensor_outer"
+        ~param_shapes:[ ParamTensor; ParamTensor ]
+        "outer" 2 FirstParamTensor;
+    ]
+  in
+  let hash_specs =
+    [
+      hash_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "String" ] "hash" 1
+        (FirstParamNamed "String");
+      hash_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "Bytes" ] "hash_bytes" 1
+        (FirstParamNamed "Bytes");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "sha256" 1
+        (FirstParamNamed "String");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "md5" 1 (FirstParamNamed "String");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "sha1" 1
+        (FirstParamNamed "String");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String" ] "sha512" 1
+        (FirstParamNamed "String");
+      hash_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "String" ] "crc32" 1
+        (FirstParamNamed "String");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "Bytes" ] "sha256_bytes" 1
+        (FirstParamNamed "Bytes");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "Bytes" ] "md5_bytes" 1
+        (FirstParamNamed "Bytes");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "Bytes" ] "sha1_bytes" 1
+        (FirstParamNamed "Bytes");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "Bytes" ] "sha512_bytes" 1
+        (FirstParamNamed "Bytes");
+      hash_spec ~return_shape:(ReturnNamed "Int")
+        ~param_shapes:[ ParamNamed "Bytes" ] "crc32_bytes" 1
+        (FirstParamNamed "Bytes");
+      hash_spec ~return_shape:(ReturnNamed "String")
+        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
+        "hmac_sha256" 2 (FirstParamNamed "String");
+    ]
+  in
+  list_specs @ string_specs @ bytes_specs @ set_specs @ dict_specs @ fixed_specs
+  @ slice_specs @ time_specs @ system_specs @ stream_specs @ tensor_specs
+  @ vector_specs @ matrix_specs @ hash_specs @ math_constant_specs
+  @ math_unary_specs @ math_binary_specs @ math_ternary_specs
+  @ math_float_class_specs
+
+let std_body_specs_for ~module_path ~func_name =
+  List.filter
+    (fun spec ->
+      spec.spec_module_path = module_path && spec.spec_func_name = func_name)
+    std_body_specs
+
+let std_body_signature_check ~is_tensor_type ~module_path ~func_name ~params
+    ~return_ty =
+  match std_body_specs_for ~module_path ~func_name with
+  | [] -> Some (LegacyUncheckedParams (make_std_body_checked_params params))
+  | specs ->
+      specs
+      |> List.find_opt (fun spec ->
+          std_body_spec_matches ~is_tensor_type spec params return_ty)
+      |> Option.map (fun _spec ->
+          SpecCheckedParams (_spec, make_std_body_checked_params params))
+
 (** Boolean types and literals. *)
 let ty_bool = B.ty_bool
 
@@ -384,6 +1451,14 @@ let builtin_call c_name args return_ty =
 let builtin_wrapper c_name params return_ty =
   let args = List.map param params in
   Some (builtin_call c_name args return_ty)
+
+let synthesize_std_body_from_spec spec params return_ty =
+  match spec.spec_synthesis with
+  | Some (BuiltinWrapper c_name) -> builtin_wrapper c_name params return_ty
+  | Some (BuiltinWrapperWithTrailingInt { c_name; value }) ->
+      let args = List.map param params @ [ lit_int value ] in
+      Some (builtin_call c_name args return_ty)
+  | None -> None
 
 let pointer_argument_as_ptr layout value source_ty =
   match (layout : Core_layout_type.pointer_argument_layout) with
@@ -4595,8 +5670,10 @@ let dict_set ?reg dict_ty self key value =
    Dispatch
    ================================================================ *)
 
-let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
-    ~(params : core_param list) ~(return_ty : Ast.type_expr) : core option =
+let synthesize_body_impl_unsafe reg ~(func_name : string)
+    ~(module_path : string) ~(params : core_param list)
+    ~(checked_params : std_body_checked_params) ~(return_ty : Ast.type_expr) :
+    core option =
   let func_name = source_func_name ~module_path func_name in
   let is_tensor_type ty = Core_tensor_type.is_type ~reg:(tensor_reg reg) ty in
   let is_concrete_tensor ty = is_concrete_tensor ?reg ty in
@@ -4655,6 +5732,15 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
   let return_is_string () =
     match return_ty with Ast.TyNamed ("String", _) -> true | _ -> false
   in
+  let arity n = List.length params = n in
+  let with_params1 f = match params with [ p0 ] -> f p0 | _ -> None in
+  let with_params2 f = match params with [ p0; p1 ] -> f p0 p1 | _ -> None in
+  let with_params3 f =
+    match params with [ p0; p1; p2 ] -> f p0 p1 p2 | _ -> None
+  in
+  let with_params5 f =
+    match params with [ p0; p1; p2; p3; p4 ] -> f p0 p1 p2 p3 p4 | _ -> None
+  in
   let single_int_param () =
     match params with
     | [ { cp_ty = Ast.TyNamed ("Int", _); _ } ] -> true
@@ -4692,6 +5778,7 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
     | [ ({ cp_ty = Ast.TyNamed ("String", _); _ } as p0) ] -> Some (f p0)
     | _ -> None
   in
+  let param_at index = std_body_checked_param checked_params index in
   match func_name with
   | "parallel" when first_is_list () && return_is_list () ->
       with_list2 (fun self_p body_p ->
@@ -4866,8 +5953,8 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
       with_list1 (fun self_p ->
           list_unzip self_p.cp_ty return_ty (param self_p))
   | "repeat" when return_is_list () && List.length params = 2 ->
-      let elem_p = List.nth params 0 in
-      let n_p = List.nth params 1 in
+      let elem_p = param_at 0 in
+      let n_p = param_at 1 in
       Some (list_repeat return_ty (param elem_p) (param n_p))
   | "intersperse"
     when first_is_list () && return_is_list () && List.length params = 2 ->
@@ -4884,20 +5971,20 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
   | "range"
     when return_ty = Ast.TyNamed ("List", [ ty_int ]) && List.length params = 2
     ->
-      let start_p = List.nth params 0 in
-      let stop_p = List.nth params 1 in
+      let start_p = param_at 0 in
+      let stop_p = param_at 1 in
       Some (list_range return_ty (param start_p) (param stop_p))
   | "unique" when first_is_list () && return_is_list () ->
       with_list1 (fun self_p -> list_unique self_p.cp_ty (param self_p))
   (* ---- String operations ---- *)
-  | "substring" when first_is_string () ->
+  | "substring" when first_is_string () && arity 3 ->
       (* substring(self, start, len):
          Clamp start/len to valid range, alloc new string, copy bytes.
          Matches C semantics: negative start → 0, negative len → 0,
          start+len beyond end → clamp to end. *)
-      let self_p = List.nth params 0 in
-      let start_p = List.nth params 1 in
-      let len_p = List.nth params 2 in
+      let self_p = param_at 0 in
+      let start_p = param_at 1 in
+      let len_p = param_at 2 in
       let s = param self_p in
       let start = param start_p in
       let req_len = param len_p in
@@ -4955,11 +6042,11 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                              [ vr "__result" ty_string; vr "__len" ty_int ]
                              ty_void)
                           (vr "__result" ty_string)))))))
-  | "contains" when first_is_string () ->
+  | "contains" when first_is_string () && arity 2 ->
       (* contains(self, needle): check if needle appears anywhere in self.
          Uses starts_with-style byte comparison at each offset. *)
-      let self_p = List.nth params 0 in
-      let needle_p = List.nth params 1 in
+      let self_p = param_at 0 in
+      let needle_p = param_at 1 in
       let s = param self_p in
       let needle = param needle_p in
       let i = vr "__i" ty_int in
@@ -5057,10 +6144,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                                          (mk ty_void CBreak),
                                                        void )))) )))
                                   (vr "__found" ty_bool)) )) )))))
-  | "raw_index_of" when first_is_string () ->
+  | "raw_index_of" when first_is_string () && arity 2 ->
       (* raw_index_of(self, needle) -> Int: return byte offset or -1 *)
-      let self_p = List.nth params 0 in
-      let needle_p = List.nth params 1 in
+      let self_p = param_at 0 in
+      let needle_p = param_at 1 in
       let s = param self_p in
       let needle = param needle_p in
       let i = vr "__i" ty_int in
@@ -5150,10 +6237,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                                          (mk ty_void CBreak),
                                                        void )))) )))
                                   (vr "__pos" ty_int)) )) )))))
-  | "count" when first_is_string () ->
+  | "count" when first_is_string () && arity 2 ->
       (* count(self, needle) -> Int: count non-overlapping occurrences *)
-      let self_p = List.nth params 0 in
-      let needle_p = List.nth params 1 in
+      let self_p = param_at 0 in
+      let needle_p = param_at 1 in
       let s = param self_p in
       let needle = param needle_p in
       Some
@@ -5257,10 +6344,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                               (vr "__cnt" ty_int))) )))))
   (* ---- Tier 2a: String mutation building blocks ---- *)
   (* from_char stays CKBuiltin — needs UTF-8 multi-byte encoding *)
-  | "pad_left" when first_is_string () ->
-      let s = param (List.nth params 0) in
-      let width = param (List.nth params 1) in
-      let fill = param (List.nth params 2) in
+  | "pad_left" when first_is_string () && arity 3 ->
+      let s = param (param_at 0) in
+      let width = param (param_at 1) in
+      let fill = param (param_at 2) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5304,10 +6391,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                     [ vr "__r" ty_string; width ]
                                     ty_void)
                                  (vr "__r" ty_string))))) ))))
-  | "pad_right" when first_is_string () ->
-      let s = param (List.nth params 0) in
-      let width = param (List.nth params 1) in
-      let fill = param (List.nth params 2) in
+  | "pad_right" when first_is_string () && arity 3 ->
+      let s = param (param_at 0) in
+      let width = param (param_at 1) in
+      let fill = param (param_at 2) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5348,10 +6435,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                  [ vr "__r" ty_string; width ]
                                  ty_void)
                               (vr "__r" ty_string)))) ))))
-  | "center" when first_is_string () ->
-      let s = param (List.nth params 0) in
-      let width = param (List.nth params 1) in
-      let fill = param (List.nth params 2) in
+  | "center" when first_is_string () && arity 3 ->
+      let s = param (param_at 0) in
+      let width = param (param_at 1) in
+      let fill = param (param_at 2) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5420,9 +6507,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                           [ vr "__r" ty_string; width ]
                                           ty_void)
                                        (vr "__r" ty_string))))))) ))))
-  | "raw_last_index_of" when first_is_string () ->
-      let s = param (List.nth params 0) in
-      let needle = param (List.nth params 1) in
+  | "raw_last_index_of" when first_is_string () && arity 2 ->
+      let s = param (param_at 0) in
+      let needle = param (param_at 1) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5528,9 +6615,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                                             (mk ty_void CBreak),
                                                           void ))))) )))
                                   (vr "__pos" ty_int)) )) )))))
-  | "trim_chars" when first_is_string () ->
-      let s = param (List.nth params 0) in
-      let chars = param (List.nth params 1) in
+  | "trim_chars" when first_is_string () && arity 2 ->
+      let s = param (param_at 0) in
+      let chars = param (param_at 1) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5679,10 +6766,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                          ]
                                          ty_void)
                                       (vr "__r" ty_string)))))))))))
-  | "repeat" when first_is_string () ->
+  | "repeat" when first_is_string () && arity 2 ->
       (* repeat(self, n): alloc n*len, copy self n times *)
-      let s = param (List.nth params 0) in
-      let n = param (List.nth params 1) in
+      let s = param (param_at 0) in
+      let n = param (param_at 1) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5726,9 +6813,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                  [ vr "__r" ty_string; vr "__total" ty_int ]
                                  ty_void)
                               (vr "__r" ty_string)))) ))))
-  | "reverse" when first_is_string () ->
+  | "reverse" when first_is_string () && arity 1 ->
       (* reverse(self): alloc same-length, copy bytes in reverse *)
-      let s = param (List.nth params 0) in
+      let s = param (param_at 0) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5765,10 +6852,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                               [ vr "__r" ty_string; vr "__slen" ty_int ]
                               ty_void)
                            (vr "__r" ty_string))) ))))
-  | "drop_left" when first_is_string () ->
+  | "drop_left" when first_is_string () && arity 2 ->
       (* drop_left(self, n) = substring(self, n, len - n) *)
-      let s = param (List.nth params 0) in
-      let n = param (List.nth params 1) in
+      let s = param (param_at 0) in
+      let n = param (param_at 1) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5809,10 +6896,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                              [ vr "__r" ty_string; vr "__len" ty_int ]
                              ty_void)
                           (vr "__r" ty_string)))))))
-  | "take_left" when first_is_string () ->
+  | "take_left" when first_is_string () && arity 2 ->
       (* take_left(self, n) = substring(self, 0, n) *)
-      let s = param (List.nth params 0) in
-      let n = param (List.nth params 1) in
+      let s = param (param_at 0) in
+      let n = param (param_at 1) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5847,10 +6934,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                           [ vr "__r" ty_string; vr "__len" ty_int ]
                           ty_void)
                        (vr "__r" ty_string))))))
-  | "take_right" when first_is_string () ->
+  | "take_right" when first_is_string () && arity 2 ->
       (* take_right(self, n) = substring(self, len - n, n) *)
-      let s = param (List.nth params 0) in
-      let n = param (List.nth params 1) in
+      let s = param (param_at 0) in
+      let n = param (param_at 1) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5891,10 +6978,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                              [ vr "__r" ty_string; vr "__n" ty_int ]
                              ty_void)
                           (vr "__r" ty_string)))))))
-  | "drop_right" when first_is_string () ->
+  | "drop_right" when first_is_string () && arity 2 ->
       (* drop_right(self, n) = take_left(self, len - n) *)
-      let s = param (List.nth params 0) in
-      let n = param (List.nth params 1) in
+      let s = param (param_at 0) in
+      let n = param (param_at 1) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -5930,9 +7017,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                           ty_void)
                        (vr "__r" ty_string))))))
   (* ---- Tier 2b: Trimming ---- *)
-  | "trim_left" when first_is_string () ->
+  | "trim_left" when first_is_string () && arity 1 ->
       (* Find first non-whitespace byte, substring from there *)
-      let s = param (List.nth params 0) in
+      let s = param (param_at 0) in
       (* is_ws defined as top-level helper *)
       Some
         (lett "__slen"
@@ -5985,8 +7072,8 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                 [ vr "__r" ty_string; vr "__len" ty_int ]
                                 ty_void)
                              (vr "__r" ty_string))))))))
-  | "trim_right" when first_is_string () ->
-      let s = param (List.nth params 0) in
+  | "trim_right" when first_is_string () && arity 1 ->
+      let s = param (param_at 0) in
       (* is_ws defined as top-level helper *)
       Some
         (lett "__slen"
@@ -6034,9 +7121,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                              [ vr "__r" ty_string; vr "__end" ty_int ]
                              ty_void)
                           (vr "__r" ty_string)))))))
-  | "trim" when first_is_string () ->
+  | "trim" when first_is_string () && arity 1 ->
       (* trim = trim_left + trim_right: find start and end, then substring *)
-      let s = param (List.nth params 0) in
+      let s = param (param_at 0) in
       (* is_ws defined as top-level helper *)
       Some
         (lett "__slen"
@@ -6114,9 +7201,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                       ty_void)
                                    (vr "__r" ty_string))))))))))
   (* ---- Tier 2c: Case conversion ---- *)
-  | "capitalize" when first_is_string () ->
+  | "capitalize" when first_is_string () && arity 1 ->
       (* Uppercase first letter found (at any position), lowercase all subsequent letters *)
-      let s = param (List.nth params 0) in
+      let s = param (param_at 0) in
       let byte = vr "__byte" ty_int in
       let is_upper b =
         mk ty_bool
@@ -6238,9 +7325,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                               [ vr "__r" ty_string; vr "__slen" ty_int ]
                               ty_void)
                            (vr "__r" ty_string))) ))))
-  | "title_case" when first_is_string () ->
+  | "title_case" when first_is_string () && arity 1 ->
       (* Uppercase first letter of each word, lowercase rest *)
-      let s = param (List.nth params 0) in
+      let s = param (param_at 0) in
       let byte = vr "__byte" ty_int in
       let is_upper b =
         mk ty_bool
@@ -6351,9 +7438,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                        [ vr "__r" ty_string; vr "__slen" ty_int ]
                        ty_void)
                     (vr "__r" ty_string)))))
-  | "longest_common_prefix" when first_is_string () ->
-      let a = param (List.nth params 0) in
-      let b = param (List.nth params 1) in
+  | "longest_common_prefix" when first_is_string () && arity 2 ->
+      let a = param (param_at 0) in
+      let b = param (param_at 1) in
       Some
         (lett "__alen"
            (intr "string_len" [ a ] ty_int)
@@ -6411,9 +7498,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                    [ vr "__r" ty_string; vr "__plen" ty_int ]
                                    ty_void)
                                 (vr "__r" ty_string)))))))))
-  | "hamming_distance_raw" when first_is_string () ->
-      let a = param (List.nth params 0) in
-      let b = param (List.nth params 1) in
+  | "hamming_distance_raw" when first_is_string () && arity 2 ->
+      let a = param (param_at 0) in
+      let b = param (param_at 1) in
       Some
         (lett "__len_a"
            (intr "string_len" [ a ] ty_int)
@@ -6447,49 +7534,49 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                       void )) )))
                        (vr "__diff" ty_int)))
                  ty_int)))
-  | "is_numeric" when first_is_string () ->
-      Some (string_is_numeric (param (List.nth params 0)))
-  | "is_ascii" when first_is_string () ->
-      Some (string_is_ascii (param (List.nth params 0)))
-  | "is_blank" when first_is_string () ->
-      Some (string_is_blank (param (List.nth params 0)))
-  | "is_lower" when first_is_string () ->
-      Some (string_is_lower (param (List.nth params 0)))
-  | "is_upper" when first_is_string () ->
-      Some (string_is_upper (param (List.nth params 0)))
-  | "starts_with" when first_is_string () ->
-      let self_p = List.nth params 0 in
-      let prefix_p = List.nth params 1 in
+  | "is_numeric" when first_is_string () && arity 1 ->
+      Some (string_is_numeric (param (param_at 0)))
+  | "is_ascii" when first_is_string () && arity 1 ->
+      Some (string_is_ascii (param (param_at 0)))
+  | "is_blank" when first_is_string () && arity 1 ->
+      Some (string_is_blank (param (param_at 0)))
+  | "is_lower" when first_is_string () && arity 1 ->
+      Some (string_is_lower (param (param_at 0)))
+  | "is_upper" when first_is_string () && arity 1 ->
+      Some (string_is_upper (param (param_at 0)))
+  | "starts_with" when first_is_string () && arity 2 ->
+      let self_p = param_at 0 in
+      let prefix_p = param_at 1 in
       Some (string_starts_with (param self_p) (param prefix_p))
-  | "ends_with" when first_is_string () ->
-      let self_p = List.nth params 0 in
-      let suffix_p = List.nth params 1 in
+  | "ends_with" when first_is_string () && arity 2 ->
+      let self_p = param_at 0 in
+      let suffix_p = param_at 1 in
       Some (string_ends_with (param self_p) (param suffix_p))
-  | "replace" when first_is_string () ->
-      let self_p = List.nth params 0 in
-      let old_p = List.nth params 1 in
-      let new_p = List.nth params 2 in
+  | "replace" when first_is_string () && arity 3 ->
+      let self_p = param_at 0 in
+      let old_p = param_at 1 in
+      let new_p = param_at 2 in
       Some (string_replace (param self_p) (param old_p) (param new_p))
-  | "split" when first_is_string () ->
-      let self_p = List.nth params 0 in
-      let delim_p = List.nth params 1 in
+  | "split" when first_is_string () && arity 2 ->
+      let self_p = param_at 0 in
+      let delim_p = param_at 1 in
       Some (string_split return_ty (param self_p) (param delim_p))
   (* ---- Builder operations ---- *)
   | "string" when return_is_string () && single_int_param () ->
-      let cap = param (List.nth params 0) in
+      let cap = param (param_at 0) in
       Some (intr "string_alloc" [ cap ] ty_string)
-  | "string_with_capacity" ->
-      let cap = param (List.nth params 0) in
+  | "string_with_capacity" when arity 1 ->
+      let cap = param (param_at 0) in
       Some (intr "string_alloc" [ cap ] ty_string)
-  | "reserve" when first_is_string () ->
-      let s = param (List.nth params 0) in
-      let cap = param (List.nth params 1) in
+  | "reserve" when first_is_string () && arity 2 ->
+      let s = param (param_at 0) in
+      let cap = param (param_at 1) in
       Some (intr "string_ensure_capacity" [ s; cap ] ty_string)
-  | ("append_char" | "string_append_char") when first_is_string () ->
+  | ("append_char" | "string_append_char") when first_is_string () && arity 2 ->
       (* UTF-8 encode the codepoint in IR, then use the same COW/capacity
          primitive that string_append uses for owned string mutation. *)
-      let s = param (List.nth params 0) in
-      let c = param (List.nth params 1) in
+      let s = param (param_at 0) in
+      let c = param (param_at 1) in
       let set_byte offset byte =
         intr "string_set_byte"
           [
@@ -6582,10 +7669,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                              [ vr "__r" ty_string; vr "__newlen" ty_int ]
                              ty_void)
                           (vr "__r" ty_string)))))))
-  | ("append_str" | "string_append") when first_is_string () ->
+  | ("append_str" | "string_append") when first_is_string () && arity 2 ->
       (* ensure_capacity(s, s.len + other.len) + copy other bytes + set_len *)
-      let s = param (List.nth params 0) in
-      let other = param (List.nth params 1) in
+      let s = param (param_at 0) in
+      let other = param (param_at 1) in
       Some
         (lett "__slen"
            (intr "string_len" [ s ] ty_int)
@@ -6626,495 +7713,496 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
   (* ---- Bytes operations ---- *)
   | "bytes"
     when match return_ty with Ast.TyNamed ("Bytes", _) -> true | _ -> false ->
-      (* bytes(size): alloc + zero-fill + set_len *)
-      let size = param (List.nth params 0) in
-      let ty_bytes = Ast.TyNamed ("Bytes", []) in
-      Some
-        (lett "__size"
-           (mk ty_int
-              (CIf (bin Ast.Lt size (lit_int 0) ty_bool, lit_int 0, size)))
-           (lett "__r"
-              (intr "bytes_alloc" [ vr "__size" ty_int ] ty_bytes)
-              (seq
-                 (mk ty_void
-                    (CFor
-                       ( loop "__i" ty_int,
-                         mk ty_int (CRange (lit_int 0, vr "__size" ty_int)),
-                         intr "bytes_set"
-                           [ vr "__r" ty_bytes; vr "__i" ty_int; lit_int 0 ]
-                           ty_void )))
-                 (seq
-                    (intr "bytes_set_len"
-                       [ vr "__r" ty_bytes; vr "__size" ty_int ]
-                       ty_void)
-                    (vr "__r" ty_bytes)))))
+      with_params1 (fun size_p ->
+          (* bytes(size): alloc + zero-fill + set_len *)
+          let size = param size_p in
+          let ty_bytes = Ast.TyNamed ("Bytes", []) in
+          Some
+            (lett "__size"
+               (mk ty_int
+                  (CIf (bin Ast.Lt size (lit_int 0) ty_bool, lit_int 0, size)))
+               (lett "__r"
+                  (intr "bytes_alloc" [ vr "__size" ty_int ] ty_bytes)
+                  (seq
+                     (mk ty_void
+                        (CFor
+                           ( loop "__i" ty_int,
+                             mk ty_int (CRange (lit_int 0, vr "__size" ty_int)),
+                             intr "bytes_set"
+                               [ vr "__r" ty_bytes; vr "__i" ty_int; lit_int 0 ]
+                               ty_void )))
+                     (seq
+                        (intr "bytes_set_len"
+                           [ vr "__r" ty_bytes; vr "__size" ty_int ]
+                           ty_void)
+                        (vr "__r" ty_bytes))))))
   | "length" when first_is_bytes () ->
-      let b = param (List.nth params 0) in
-      Some (intr "bytes_len" [ b ] return_ty)
+      with_params1 (fun b_p ->
+          let b = param b_p in
+          Some (intr "bytes_len" [ b ] return_ty))
   | "get" when first_is_bytes () ->
-      (* bounds check + bytes_get wrapped in Option *)
-      let b = param (List.nth params 0) in
-      let idx = param (List.nth params 1) in
-      let ty_bytes = Ast.TyNamed ("Bytes", []) in
-      ignore ty_bytes;
-      Some
-        (mk return_ty
-           (CIf
-              ( mk ty_bool
-                  (CLog
-                     ( Ast.Or,
-                       bin Ast.Lt idx (lit_int 0) ty_bool,
-                       bin Ast.Ge idx (intr "bytes_len" [ b ] ty_int) ty_bool )),
-                (* OOB → None. Use CKBuiltin to construct None *)
-                mk return_ty (CCall (CKBuiltin "blorp_option_none", void, [])),
-                (* In bounds → Some(bytes_get(b, idx)) *)
-                mk return_ty
-                  (CCall
-                     ( CKBuiltin "blorp_option_some",
-                       void,
-                       [
-                         mk ty_ptr
-                           (CBox (intr "bytes_get" [ b; idx ] ty_int, ty_int));
-                       ] )) )))
+      with_params2 (fun b_p idx_p ->
+          (* bounds check + bytes_get wrapped in Option *)
+          let b = param b_p in
+          let idx = param idx_p in
+          let ty_bytes = Ast.TyNamed ("Bytes", []) in
+          ignore ty_bytes;
+          Some
+            (mk return_ty
+               (CIf
+                  ( mk ty_bool
+                      (CLog
+                         ( Ast.Or,
+                           bin Ast.Lt idx (lit_int 0) ty_bool,
+                           bin Ast.Ge idx
+                             (intr "bytes_len" [ b ] ty_int)
+                             ty_bool )),
+                    (* OOB → None. Use CKBuiltin to construct None *)
+                    mk return_ty
+                      (CCall (CKBuiltin "blorp_option_none", void, [])),
+                    (* In bounds → Some(bytes_get(b, idx)) *)
+                    mk return_ty
+                      (CCall
+                         ( CKBuiltin "blorp_option_some",
+                           void,
+                           [
+                             mk ty_ptr
+                               (CBox (intr "bytes_get" [ b; idx ] ty_int, ty_int));
+                           ] )) ))))
   | "set_index" when first_is_bytes () ->
-      (* COW + bounds check + clamp value to 0..255 + bytes_set *)
-      let b = param (List.nth params 0) in
-      let idx = param (List.nth params 1) in
-      let val_ = param (List.nth params 2) in
-      let ty_bytes = Ast.TyNamed ("Bytes", []) in
-      Some
-        (mk ty_bytes
-           (CIf
-              ( mk ty_bool
-                  (CLog
-                     ( Ast.Or,
-                       bin Ast.Lt idx (lit_int 0) ty_bool,
-                       bin Ast.Ge idx (intr "bytes_len" [ b ] ty_int) ty_bool )),
-                b,
-                (* OOB → return unchanged *)
-                lett "__cval"
+      with_params3 (fun b_p idx_p val_p ->
+          (* COW + bounds check + clamp value to 0..255 + bytes_set *)
+          let b = param b_p in
+          let idx = param idx_p in
+          let val_ = param val_p in
+          let ty_bytes = Ast.TyNamed ("Bytes", []) in
+          Some
+            (mk ty_bytes
+               (CIf
+                  ( mk ty_bool
+                      (CLog
+                         ( Ast.Or,
+                           bin Ast.Lt idx (lit_int 0) ty_bool,
+                           bin Ast.Ge idx
+                             (intr "bytes_len" [ b ] ty_int)
+                             ty_bool )),
+                    b,
+                    (* OOB → return unchanged *)
+                    lett "__cval"
+                      (mk ty_int
+                         (CIf
+                            ( bin Ast.Lt val_ (lit_int 0) ty_bool,
+                              lit_int 0,
+                              mk ty_int
+                                (CIf
+                                   ( bin Ast.Gt val_ (lit_int 255) ty_bool,
+                                     lit_int 255,
+                                     val_ )) )))
+                      (lett "__r"
+                         (intr "bytes_cow" [ b ] ty_bytes)
+                         (seq
+                            (intr "bytes_set"
+                               [ vr "__r" ty_bytes; idx; vr "__cval" ty_int ]
+                               ty_void)
+                            (vr "__r" ty_bytes))) ))))
+  | "slice" when first_is_bytes () ->
+      with_params3 (fun b_p start_p req_len_p ->
+          let b = param b_p in
+          let start = param start_p in
+          let req_len = param req_len_p in
+          let ty_bytes = Ast.TyNamed ("Bytes", []) in
+          Some
+            (lett "__blen"
+               (intr "bytes_len" [ b ] ty_int)
+               (lett "__start"
                   (mk ty_int
                      (CIf
-                        ( bin Ast.Lt val_ (lit_int 0) ty_bool,
+                        ( bin Ast.Lt start (lit_int 0) ty_bool,
                           lit_int 0,
                           mk ty_int
                             (CIf
-                               ( bin Ast.Gt val_ (lit_int 255) ty_bool,
-                                 lit_int 255,
-                                 val_ )) )))
-                  (lett "__r"
-                     (intr "bytes_cow" [ b ] ty_bytes)
-                     (seq
-                        (intr "bytes_set"
-                           [ vr "__r" ty_bytes; idx; vr "__cval" ty_int ]
-                           ty_void)
-                        (vr "__r" ty_bytes))) )))
-  | "slice" when first_is_bytes () ->
-      let b = param (List.nth params 0) in
-      let start = param (List.nth params 1) in
-      let req_len = param (List.nth params 2) in
-      let ty_bytes = Ast.TyNamed ("Bytes", []) in
-      Some
-        (lett "__blen"
-           (intr "bytes_len" [ b ] ty_int)
-           (lett "__start"
-              (mk ty_int
-                 (CIf
-                    ( bin Ast.Lt start (lit_int 0) ty_bool,
-                      lit_int 0,
-                      mk ty_int
+                               ( bin Ast.Gt start (vr "__blen" ty_int) ty_bool,
+                                 vr "__blen" ty_int,
+                                 start )) )))
+                  (lett "__len"
+                     (mk ty_int
                         (CIf
-                           ( bin Ast.Gt start (vr "__blen" ty_int) ty_bool,
-                             vr "__blen" ty_int,
-                             start )) )))
-              (lett "__len"
-                 (mk ty_int
-                    (CIf
-                       ( bin Ast.Le req_len (lit_int 0) ty_bool,
-                         lit_int 0,
-                         mk ty_int
-                           (CIf
-                              ( bin Ast.Gt
-                                  (bin Ast.Add (vr "__start" ty_int) req_len
-                                     ty_int)
-                                  (vr "__blen" ty_int) ty_bool,
-                                bin Ast.Sub (vr "__blen" ty_int)
-                                  (vr "__start" ty_int) ty_int,
-                                req_len )) )))
-                 (lett "__r"
-                    (intr "bytes_alloc" [ vr "__len" ty_int ] ty_bytes)
-                    (seq
-                       (mk ty_void
-                          (CFor
-                             ( loop "__i" ty_int,
-                               mk ty_int (CRange (lit_int 0, vr "__len" ty_int)),
-                               intr "bytes_set"
-                                 [
-                                   vr "__r" ty_bytes;
-                                   vr "__i" ty_int;
-                                   intr "bytes_get"
+                           ( bin Ast.Le req_len (lit_int 0) ty_bool,
+                             lit_int 0,
+                             mk ty_int
+                               (CIf
+                                  ( bin Ast.Gt
+                                      (bin Ast.Add (vr "__start" ty_int) req_len
+                                         ty_int)
+                                      (vr "__blen" ty_int) ty_bool,
+                                    bin Ast.Sub (vr "__blen" ty_int)
+                                      (vr "__start" ty_int) ty_int,
+                                    req_len )) )))
+                     (lett "__r"
+                        (intr "bytes_alloc" [ vr "__len" ty_int ] ty_bytes)
+                        (seq
+                           (mk ty_void
+                              (CFor
+                                 ( loop "__i" ty_int,
+                                   mk ty_int
+                                     (CRange (lit_int 0, vr "__len" ty_int)),
+                                   intr "bytes_set"
                                      [
-                                       b;
-                                       bin Ast.Add (vr "__start" ty_int)
-                                         (vr "__i" ty_int) ty_int;
+                                       vr "__r" ty_bytes;
+                                       vr "__i" ty_int;
+                                       intr "bytes_get"
+                                         [
+                                           b;
+                                           bin Ast.Add (vr "__start" ty_int)
+                                             (vr "__i" ty_int) ty_int;
+                                         ]
+                                         ty_int;
                                      ]
-                                     ty_int;
-                                 ]
-                                 ty_void )))
-                       (seq
-                          (intr "bytes_set_len"
-                             [ vr "__r" ty_bytes; vr "__len" ty_int ]
-                             ty_void)
-                          (vr "__r" ty_bytes)))))))
+                                     ty_void )))
+                           (seq
+                              (intr "bytes_set_len"
+                                 [ vr "__r" ty_bytes; vr "__len" ty_int ]
+                                 ty_void)
+                              (vr "__r" ty_bytes))))))))
   | "append" when first_is_bytes () ->
-      let a = param (List.nth params 0) in
-      let b = param (List.nth params 1) in
-      let ty_bytes = Ast.TyNamed ("Bytes", []) in
-      Some
-        (lett "__alen"
-           (intr "bytes_len" [ a ] ty_int)
-           (lett "__blen"
-              (intr "bytes_len" [ b ] ty_int)
-              (lett "__total"
-                 (bin Ast.Add (vr "__alen" ty_int) (vr "__blen" ty_int) ty_int)
-                 (lett "__r"
-                    (intr "bytes_alloc" [ vr "__total" ty_int ] ty_bytes)
-                    (seq
-                       (mk ty_void
-                          (CFor
-                             ( loop "__i" ty_int,
-                               mk ty_int
-                                 (CRange (lit_int 0, vr "__alen" ty_int)),
-                               intr "bytes_set"
-                                 [
-                                   vr "__r" ty_bytes;
-                                   vr "__i" ty_int;
-                                   intr "bytes_get"
-                                     [ a; vr "__i" ty_int ]
-                                     ty_int;
-                                 ]
-                                 ty_void )))
-                       (seq
-                          (mk ty_void
-                             (CFor
-                                ( loop "__i" ty_int,
-                                  mk ty_int
-                                    (CRange (lit_int 0, vr "__blen" ty_int)),
-                                  intr "bytes_set"
-                                    [
-                                      vr "__r" ty_bytes;
-                                      bin Ast.Add (vr "__alen" ty_int)
-                                        (vr "__i" ty_int) ty_int;
-                                      intr "bytes_get"
-                                        [ b; vr "__i" ty_int ]
-                                        ty_int;
-                                    ]
-                                    ty_void )))
-                          (seq
-                             (intr "bytes_set_len"
-                                [ vr "__r" ty_bytes; vr "__total" ty_int ]
-                                ty_void)
-                             (vr "__r" ty_bytes))))))))
+      with_params2 (fun a_p b_p ->
+          let a = param a_p in
+          let b = param b_p in
+          let ty_bytes = Ast.TyNamed ("Bytes", []) in
+          Some
+            (lett "__alen"
+               (intr "bytes_len" [ a ] ty_int)
+               (lett "__blen"
+                  (intr "bytes_len" [ b ] ty_int)
+                  (lett "__total"
+                     (bin Ast.Add (vr "__alen" ty_int) (vr "__blen" ty_int)
+                        ty_int)
+                     (lett "__r"
+                        (intr "bytes_alloc" [ vr "__total" ty_int ] ty_bytes)
+                        (seq
+                           (mk ty_void
+                              (CFor
+                                 ( loop "__i" ty_int,
+                                   mk ty_int
+                                     (CRange (lit_int 0, vr "__alen" ty_int)),
+                                   intr "bytes_set"
+                                     [
+                                       vr "__r" ty_bytes;
+                                       vr "__i" ty_int;
+                                       intr "bytes_get"
+                                         [ a; vr "__i" ty_int ]
+                                         ty_int;
+                                     ]
+                                     ty_void )))
+                           (seq
+                              (mk ty_void
+                                 (CFor
+                                    ( loop "__i" ty_int,
+                                      mk ty_int
+                                        (CRange (lit_int 0, vr "__blen" ty_int)),
+                                      intr "bytes_set"
+                                        [
+                                          vr "__r" ty_bytes;
+                                          bin Ast.Add (vr "__alen" ty_int)
+                                            (vr "__i" ty_int) ty_int;
+                                          intr "bytes_get"
+                                            [ b; vr "__i" ty_int ]
+                                            ty_int;
+                                        ]
+                                        ty_void )))
+                              (seq
+                                 (intr "bytes_set_len"
+                                    [ vr "__r" ty_bytes; vr "__total" ty_int ]
+                                    ty_void)
+                                 (vr "__r" ty_bytes)))))))))
   | "fill" when first_is_bytes () ->
-      let b = param (List.nth params 0) in
-      let val_ = param (List.nth params 1) in
-      let ty_bytes = Ast.TyNamed ("Bytes", []) in
-      Some
-        (lett "__r"
-           (intr "bytes_cow" [ b ] ty_bytes)
-           (lett "__len"
-              (intr "bytes_len" [ vr "__r" ty_bytes ] ty_int)
-              (seq
-                 (mk ty_void
-                    (CFor
-                       ( loop "__i" ty_int,
-                         mk ty_int (CRange (lit_int 0, vr "__len" ty_int)),
-                         intr "bytes_set"
-                           [ vr "__r" ty_bytes; vr "__i" ty_int; val_ ]
-                           ty_void )))
-                 (vr "__r" ty_bytes))))
+      with_params2 (fun b_p val_p ->
+          let b = param b_p in
+          let val_ = param val_p in
+          let ty_bytes = Ast.TyNamed ("Bytes", []) in
+          Some
+            (lett "__r"
+               (intr "bytes_cow" [ b ] ty_bytes)
+               (lett "__len"
+                  (intr "bytes_len" [ vr "__r" ty_bytes ] ty_int)
+                  (seq
+                     (mk ty_void
+                        (CFor
+                           ( loop "__i" ty_int,
+                             mk ty_int (CRange (lit_int 0, vr "__len" ty_int)),
+                             intr "bytes_set"
+                               [ vr "__r" ty_bytes; vr "__i" ty_int; val_ ]
+                               ty_void )))
+                     (vr "__r" ty_bytes)))))
   | "index_of" when first_is_bytes () ->
-      let b = param (List.nth params 0) in
-      let val_ = param (List.nth params 1) in
-      let start = param (List.nth params 2) in
-      Some
-        (lett "__blen"
-           (intr "bytes_len" [ b ] ty_int)
-           (lett "__start"
-              (mk ty_int
-                 (CIf
-                    ( bin Ast.Lt start (lit_int 0) ty_bool,
-                      lit_int 0,
-                      mk ty_int
-                        (CIf
-                           ( bin Ast.Gt start (vr "__blen" ty_int) ty_bool,
-                             vr "__blen" ty_int,
-                             start )) )))
-              (lettm "__pos"
-                 (mk ty_int (CLit (Ast.LitInt (-1L))))
-                 (seq
-                    (mk ty_void
-                       (CFor
-                          ( forward_loop "__i",
-                            mk ty_int
-                              (CRange (vr "__start" ty_int, vr "__blen" ty_int)),
-                            mk ty_void
-                              (CIf
-                                 ( bin Ast.Eq
-                                     (intr "bytes_get"
-                                        [ b; vr "__i" ty_int ]
-                                        ty_int)
-                                     val_ ty_bool,
-                                   seq
-                                     (mk ty_void
-                                        (CAssign
-                                           (Var.named "__pos", vr "__i" ty_int)))
-                                     (mk ty_void CBreak),
-                                   void )) )))
-                    (* Wrap in Option *)
-                    (mk return_ty
-                       (CIf
-                          ( bin Ast.Ge (vr "__pos" ty_int) (lit_int 0) ty_bool,
-                            mk return_ty
-                              (CCall
-                                 ( CKBuiltin "blorp_option_some",
-                                   void,
-                                   [
-                                     mk ty_ptr
-                                       (CBox (vr "__pos" ty_int, ty_int));
-                                   ] )),
-                            mk return_ty
-                              (CCall (CKBuiltin "blorp_option_none", void, []))
-                          )))))))
+      with_params3 (fun b_p val_p start_p ->
+          let b = param b_p in
+          let val_ = param val_p in
+          let start = param start_p in
+          Some
+            (lett "__blen"
+               (intr "bytes_len" [ b ] ty_int)
+               (lett "__start"
+                  (mk ty_int
+                     (CIf
+                        ( bin Ast.Lt start (lit_int 0) ty_bool,
+                          lit_int 0,
+                          mk ty_int
+                            (CIf
+                               ( bin Ast.Gt start (vr "__blen" ty_int) ty_bool,
+                                 vr "__blen" ty_int,
+                                 start )) )))
+                  (lettm "__pos"
+                     (mk ty_int (CLit (Ast.LitInt (-1L))))
+                     (seq
+                        (mk ty_void
+                           (CFor
+                              ( forward_loop "__i",
+                                mk ty_int
+                                  (CRange
+                                     (vr "__start" ty_int, vr "__blen" ty_int)),
+                                mk ty_void
+                                  (CIf
+                                     ( bin Ast.Eq
+                                         (intr "bytes_get"
+                                            [ b; vr "__i" ty_int ]
+                                            ty_int)
+                                         val_ ty_bool,
+                                       seq
+                                         (mk ty_void
+                                            (CAssign
+                                               ( Var.named "__pos",
+                                                 vr "__i" ty_int )))
+                                         (mk ty_void CBreak),
+                                       void )) )))
+                        (* Wrap in Option *)
+                        (mk return_ty
+                           (CIf
+                              ( bin Ast.Ge (vr "__pos" ty_int) (lit_int 0)
+                                  ty_bool,
+                                mk return_ty
+                                  (CCall
+                                     ( CKBuiltin "blorp_option_some",
+                                       void,
+                                       [
+                                         mk ty_ptr
+                                           (CBox (vr "__pos" ty_int, ty_int));
+                                       ] )),
+                                mk return_ty
+                                  (CCall
+                                     (CKBuiltin "blorp_option_none", void, []))
+                              ))))))))
   | "blit" when first_is_bytes () ->
-      (* COW + bounds-clamped copy from src to dst *)
-      let dst = param (List.nth params 0) in
-      let dst_off = param (List.nth params 1) in
-      let src = param (List.nth params 2) in
-      let src_off = param (List.nth params 3) in
-      let len = param (List.nth params 4) in
-      let ty_bytes = Ast.TyNamed ("Bytes", []) in
-      (* Clamp offsets into their buffers so availabilities are never negative.
+      with_params5 (fun dst_p dst_off_p src_p src_off_p len_p ->
+          (* COW + bounds-clamped copy from src to dst *)
+          let dst = param dst_p in
+          let dst_off = param dst_off_p in
+          let src = param src_p in
+          let src_off = param src_off_p in
+          let len = param len_p in
+          let ty_bytes = Ast.TyNamed ("Bytes", []) in
+          (* Clamp offsets into their buffers so availabilities are never negative.
          Internal copy loops must not inherit source-level backward range
          semantics when the requested copy length clamps to zero. *)
-      let clamp_to_len value len =
-        mk ty_int
-          (CIf
-             ( bin Ast.Lt value (lit_int 0) ty_bool,
-               lit_int 0,
-               mk ty_int (CIf (bin Ast.Gt value len ty_bool, len, value)) ))
-      in
-      let min_int a b = mk ty_int (CIf (bin Ast.Lt a b ty_bool, a, b)) in
-      let requested =
-        mk ty_int (CIf (bin Ast.Le len (lit_int 0) ty_bool, lit_int 0, len))
-      in
-      let copy_loop =
-        mk ty_void
-          (CFor
-             ( forward_loop "__i",
-               mk ty_int (CRange (lit_int 0, vr "__clen" ty_int)),
-               intr "bytes_set"
-                 [
-                   vr "__r" ty_bytes;
-                   bin Ast.Add (vr "__do" ty_int) (vr "__i" ty_int) ty_int;
-                   intr "bytes_get"
+          let clamp_to_len value len =
+            mk ty_int
+              (CIf
+                 ( bin Ast.Lt value (lit_int 0) ty_bool,
+                   lit_int 0,
+                   mk ty_int (CIf (bin Ast.Gt value len ty_bool, len, value)) ))
+          in
+          let min_int a b = mk ty_int (CIf (bin Ast.Lt a b ty_bool, a, b)) in
+          let requested =
+            mk ty_int (CIf (bin Ast.Le len (lit_int 0) ty_bool, lit_int 0, len))
+          in
+          let copy_loop =
+            mk ty_void
+              (CFor
+                 ( forward_loop "__i",
+                   mk ty_int (CRange (lit_int 0, vr "__clen" ty_int)),
+                   intr "bytes_set"
                      [
-                       src;
-                       bin Ast.Add (vr "__so" ty_int) (vr "__i" ty_int) ty_int;
+                       vr "__r" ty_bytes;
+                       bin Ast.Add (vr "__do" ty_int) (vr "__i" ty_int) ty_int;
+                       intr "bytes_get"
+                         [
+                           src;
+                           bin Ast.Add (vr "__so" ty_int) (vr "__i" ty_int)
+                             ty_int;
+                         ]
+                         ty_int;
                      ]
-                     ty_int;
-                 ]
-                 ty_void ))
-      in
-      let body =
-        lett "__src_len"
-          (intr "bytes_len" [ src ] ty_int)
-          (lett "__dst_len"
-             (intr "bytes_len" [ vr "__r" ty_bytes ] ty_int)
-             (lett "__do"
-                (clamp_to_len dst_off (vr "__dst_len" ty_int))
-                (lett "__so"
-                   (clamp_to_len src_off (vr "__src_len" ty_int))
-                   (lett "__src_avail"
-                      (bin Ast.Sub (vr "__src_len" ty_int) (vr "__so" ty_int)
-                         ty_int)
-                      (lett "__dst_avail"
-                         (bin Ast.Sub (vr "__dst_len" ty_int) (vr "__do" ty_int)
-                            ty_int)
-                         (lett "__requested" requested
-                            (lett "__clen"
-                               (min_int (vr "__requested" ty_int)
-                                  (min_int (vr "__src_avail" ty_int)
-                                     (vr "__dst_avail" ty_int)))
-                               (seq copy_loop (vr "__r" ty_bytes)))))))))
-      in
-      Some (lett "__r" (intr "bytes_cow" [ dst ] ty_bytes) body)
+                     ty_void ))
+          in
+          let body =
+            lett "__src_len"
+              (intr "bytes_len" [ src ] ty_int)
+              (lett "__dst_len"
+                 (intr "bytes_len" [ vr "__r" ty_bytes ] ty_int)
+                 (lett "__do"
+                    (clamp_to_len dst_off (vr "__dst_len" ty_int))
+                    (lett "__so"
+                       (clamp_to_len src_off (vr "__src_len" ty_int))
+                       (lett "__src_avail"
+                          (bin Ast.Sub (vr "__src_len" ty_int)
+                             (vr "__so" ty_int) ty_int)
+                          (lett "__dst_avail"
+                             (bin Ast.Sub (vr "__dst_len" ty_int)
+                                (vr "__do" ty_int) ty_int)
+                             (lett "__requested" requested
+                                (lett "__clen"
+                                   (min_int (vr "__requested" ty_int)
+                                      (min_int (vr "__src_avail" ty_int)
+                                         (vr "__dst_avail" ty_int)))
+                                   (seq copy_loop (vr "__r" ty_bytes)))))))))
+          in
+          Some (lett "__r" (intr "bytes_cow" [ dst ] ty_bytes) body))
   (* ---- Set operations ---- *)
   | "length" when first_is_set () ->
-      let p = List.hd params in
-      Some (intr "set_len" [ param p ] return_ty)
+      with_params1 (fun p -> Some (intr "set_len" [ param p ] return_ty))
   | "contains" when first_is_set () ->
-      let self_p = List.nth params 0 in
-      let elem_p = List.nth params 1 in
-      if
-        Codegen_types.has_type_vars self_p.cp_ty
-        || Codegen_types.has_type_vars elem_p.cp_ty
-      then None
-      else Some (set_contains ?reg self_p.cp_ty (param self_p) (param elem_p))
+      with_params2 (fun self_p elem_p ->
+          if
+            Codegen_types.has_type_vars self_p.cp_ty
+            || Codegen_types.has_type_vars elem_p.cp_ty
+          then None
+          else
+            Some (set_contains ?reg self_p.cp_ty (param self_p) (param elem_p)))
   | "add" when first_is_set () ->
-      let self_p = List.nth params 0 in
-      let elem_p = List.nth params 1 in
-      if
-        Codegen_types.has_type_vars self_p.cp_ty
-        || Codegen_types.has_type_vars elem_p.cp_ty
-      then None
-      else Some (set_add ?reg self_p.cp_ty (param self_p) (param elem_p))
+      with_params2 (fun self_p elem_p ->
+          if
+            Codegen_types.has_type_vars self_p.cp_ty
+            || Codegen_types.has_type_vars elem_p.cp_ty
+          then None
+          else Some (set_add ?reg self_p.cp_ty (param self_p) (param elem_p)))
   | "is_subset" when first_is_set () ->
-      let a_p = List.nth params 0 in
-      let b_p = List.nth params 1 in
-      if has_type_vars_params [ a_p; b_p ] then None
-      else Some (set_is_subset ?reg (param a_p) (param b_p))
+      with_params2 (fun a_p b_p ->
+          if has_type_vars_params [ a_p; b_p ] then None
+          else Some (set_is_subset ?reg (param a_p) (param b_p)))
   | "difference" when first_is_set () ->
-      let a_p = List.nth params 0 in
-      let b_p = List.nth params 1 in
-      if
-        has_type_vars_params [ a_p; b_p ]
-        || Codegen_types.has_type_vars return_ty
-      then None
-      else Some (set_difference ?reg return_ty (param a_p) (param b_p))
+      with_params2 (fun a_p b_p ->
+          if
+            has_type_vars_params [ a_p; b_p ]
+            || Codegen_types.has_type_vars return_ty
+          then None
+          else Some (set_difference ?reg return_ty (param a_p) (param b_p)))
   | "intersect" when first_is_set () ->
-      let a_p = List.nth params 0 in
-      let b_p = List.nth params 1 in
-      if
-        has_type_vars_params [ a_p; b_p ]
-        || Codegen_types.has_type_vars return_ty
-      then None
-      else Some (set_intersect ?reg return_ty (param a_p) (param b_p))
+      with_params2 (fun a_p b_p ->
+          if
+            has_type_vars_params [ a_p; b_p ]
+            || Codegen_types.has_type_vars return_ty
+          then None
+          else Some (set_intersect ?reg return_ty (param a_p) (param b_p)))
   | "combine" when first_is_set () ->
-      let a_p = List.nth params 0 in
-      let b_p = List.nth params 1 in
-      if
-        has_type_vars_params [ a_p; b_p ]
-        || Codegen_types.has_type_vars return_ty
-      then None
-      else Some (set_combine ?reg return_ty (param a_p) (param b_p))
+      with_params2 (fun a_p b_p ->
+          if
+            has_type_vars_params [ a_p; b_p ]
+            || Codegen_types.has_type_vars return_ty
+          then None
+          else Some (set_combine ?reg return_ty (param a_p) (param b_p)))
   | "map" when first_is_set () ->
-      let self_p = List.nth params 0 in
-      let f_p = List.nth params 1 in
-      if
-        has_type_vars_params [ self_p; f_p ]
-        || Codegen_types.has_type_vars return_ty
-      then None
-      else Some (set_map ?reg self_p.cp_ty return_ty (param self_p) (param f_p))
+      with_params2 (fun self_p f_p ->
+          if
+            has_type_vars_params [ self_p; f_p ]
+            || Codegen_types.has_type_vars return_ty
+          then None
+          else
+            Some
+              (set_map ?reg self_p.cp_ty return_ty (param self_p) (param f_p)))
   | "filter" when first_is_set () ->
-      let self_p = List.nth params 0 in
-      let pred_p = List.nth params 1 in
-      if
-        has_type_vars_params [ self_p; pred_p ]
-        || Codegen_types.has_type_vars return_ty
-      then None
-      else Some (set_filter ?reg self_p.cp_ty (param self_p) (param pred_p))
+      with_params2 (fun self_p pred_p ->
+          if
+            has_type_vars_params [ self_p; pred_p ]
+            || Codegen_types.has_type_vars return_ty
+          then None
+          else Some (set_filter ?reg self_p.cp_ty (param self_p) (param pred_p)))
   | "fold" when first_is_set () ->
-      let self_p = List.nth params 0 in
-      let init_p = List.nth params 1 in
-      let f_p = List.nth params 2 in
-      Some
-        (set_fold ?reg self_p.cp_ty return_ty (param self_p) (param init_p)
-           (param f_p))
+      with_params3 (fun self_p init_p f_p ->
+          Some
+            (set_fold ?reg self_p.cp_ty return_ty (param self_p) (param init_p)
+               (param f_p)))
   | "to_list" when first_is_set () ->
-      let self_p = List.nth params 0 in
-      Some (set_to_list self_p.cp_ty return_ty (param self_p))
+      with_params1 (fun self_p ->
+          Some (set_to_list self_p.cp_ty return_ty (param self_p)))
   | "length" when first_is_dict () ->
       with_dict1 (fun p -> intr "dict_len" [ param p ] return_ty)
   | "contains" when first_is_dict () ->
-      let self_p = List.nth params 0 in
-      let key_p = List.nth params 1 in
-      if
-        Codegen_types.has_type_vars self_p.cp_ty
-        || Codegen_types.has_type_vars key_p.cp_ty
-      then None
-      else Some (dict_contains ?reg self_p.cp_ty (param self_p) (param key_p))
+      with_params2 (fun self_p key_p ->
+          if
+            Codegen_types.has_type_vars self_p.cp_ty
+            || Codegen_types.has_type_vars key_p.cp_ty
+          then None
+          else
+            Some (dict_contains ?reg self_p.cp_ty (param self_p) (param key_p)))
   | "get_or" when first_is_dict () ->
-      let self_p = List.nth params 0 in
-      let key_p = List.nth params 1 in
-      let default_p = List.nth params 2 in
-      if
-        Codegen_types.has_type_vars self_p.cp_ty
-        || Codegen_types.has_type_vars key_p.cp_ty
-        || Codegen_types.has_type_vars default_p.cp_ty
-      then None
-      else
-        Some
-          (dict_get_or ?reg self_p.cp_ty (param self_p) (param key_p)
-             (param default_p))
+      with_params3 (fun self_p key_p default_p ->
+          if
+            Codegen_types.has_type_vars self_p.cp_ty
+            || Codegen_types.has_type_vars key_p.cp_ty
+            || Codegen_types.has_type_vars default_p.cp_ty
+          then None
+          else
+            Some
+              (dict_get_or ?reg self_p.cp_ty (param self_p) (param key_p)
+                 (param default_p)))
   | "set" when first_is_dict () ->
-      let self_p = List.nth params 0 in
-      let key_p = List.nth params 1 in
-      let value_p = List.nth params 2 in
-      if
-        Codegen_types.has_type_vars self_p.cp_ty
-        || Codegen_types.has_type_vars key_p.cp_ty
-        || Codegen_types.has_type_vars value_p.cp_ty
-      then None
-      else
-        Some
-          (dict_set ?reg self_p.cp_ty (param self_p) (param key_p)
-             (param value_p))
+      with_params3 (fun self_p key_p value_p ->
+          if
+            Codegen_types.has_type_vars self_p.cp_ty
+            || Codegen_types.has_type_vars key_p.cp_ty
+            || Codegen_types.has_type_vars value_p.cp_ty
+          then None
+          else
+            Some
+              (dict_set ?reg self_p.cp_ty (param self_p) (param key_p)
+                 (param value_p)))
   (* ---- Fixed operations ---- *)
   | "get_scale"
     when match params with
-         | { cp_ty = Ast.TyNamed ("Fixed", _); _ } :: _ -> true
+         | [ { cp_ty = Ast.TyNamed ("Fixed", _); _ } ] -> true
          | _ -> false ->
-      Some (fixed_get_scale (param (List.hd params)))
+      with_params1 (fun p -> Some (fixed_get_scale (param p)))
   | "get_precision"
     when match params with
-         | { cp_ty = Ast.TyNamed ("Fixed", _); _ } :: _ -> true
+         | [ { cp_ty = Ast.TyNamed ("Fixed", _); _ } ] -> true
          | _ -> false ->
-      Some (fixed_get_precision (param (List.hd params)))
+      with_params1 (fun p -> Some (fixed_get_precision (param p)))
   | "to_int"
     when match params with
-         | { cp_ty = Ast.TyNamed ("Fixed", _); _ } :: _ -> true
+         | [ { cp_ty = Ast.TyNamed ("Fixed", _); _ } ] -> true
          | _ -> false ->
-      Some (fixed_to_int (param (List.hd params)))
+      with_params1 (fun p -> Some (fixed_to_int (param p)))
   | "neg"
     when match params with
-         | { cp_ty = Ast.TyNamed ("Fixed", _); _ } :: _ -> true
+         | [ { cp_ty = Ast.TyNamed ("Fixed", _); _ } ] -> true
          | _ -> false ->
-      Some (fixed_neg (param (List.hd params)))
+      with_params1 (fun p -> Some (fixed_neg (param p)))
   | "round_to"
     when match params with
-         | { cp_ty = Ast.TyNamed ("Fixed", _); _ } :: _ -> true
+         | { cp_ty = Ast.TyNamed ("Fixed", _); _ } :: [ _ ] -> true
          | _ -> false ->
-      let f_p = List.nth params 0 in
-      let s_p = List.nth params 1 in
-      Some (fixed_round_to (param f_p) (param s_p))
+      with_params2 (fun f_p s_p ->
+          Some (fixed_round_to (param f_p) (param s_p)))
   (* ---- Slice operations ---- *)
   | "from_string"
     when (match params with
-           | { cp_ty = Ast.TyNamed ("String", _); _ } :: _ -> true
+           | [ { cp_ty = Ast.TyNamed ("String", _); _ } ] -> true
            | _ -> false)
          && return_ty = Ast.TyNamed ("StringSlice", []) ->
-      let p = List.hd params in
-      Some (slice_from_string (param p))
+      with_params1 (fun p -> Some (slice_from_string (param p)))
   | "length" when first_is_slice () ->
-      let p = List.hd params in
-      Some (slice_length (param p))
+      with_params1 (fun p -> Some (slice_length (param p)))
   | "to_string" when first_is_slice () ->
-      let p = List.hd params in
-      Some (slice_to_string (param p))
+      with_params1 (fun p -> Some (slice_to_string (param p)))
   | "substring" when first_is_slice () ->
-      let slice_p = List.nth params 0 in
-      let start_p = List.nth params 1 in
-      let len_p = List.nth params 2 in
-      Some (slice_substring (param slice_p) (param start_p) (param len_p))
+      with_params3 (fun slice_p start_p len_p ->
+          Some (slice_substring (param slice_p) (param start_p) (param len_p)))
   | "starts_with" when first_is_slice () ->
-      let slice_p = List.nth params 0 in
-      let prefix_p = List.nth params 1 in
-      Some (slice_starts_with (param slice_p) (param prefix_p))
+      with_params2 (fun slice_p prefix_p ->
+          Some (slice_starts_with (param slice_p) (param prefix_p)))
   | "get" when first_is_slice () ->
-      let slice_p = List.nth params 0 in
-      let idx_p = List.nth params 1 in
-      Some (slice_get (param slice_p) (param idx_p))
+      with_params2 (fun slice_p idx_p ->
+          Some (slice_get (param slice_p) (param idx_p)))
   | "keys" when first_is_dict () ->
       with_dict1 (fun self_p -> dict_keys return_ty (param self_p))
   | "values" when first_is_dict () ->
@@ -7142,7 +8230,7 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
            ->
              true
          | _ -> false ->
-      let p = List.hd params in
+      let p = param_at 0 in
       let ty_float = Ast.TyNamed ("Float", []) in
       let is_f64 =
         match p.cp_ty with Ast.TyNamed ("Float", _) -> true | _ -> false
@@ -7157,11 +8245,11 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
   | ("pow" | "atan2" | "hypot" | "fmod" | "copysign")
     when List.length params = 2
          &&
-         match (List.nth params 0).cp_ty with
+         match (param_at 0).cp_ty with
          | Ast.TyNamed (("Float" | "Float32" | "Float16"), _) -> true
          | _ -> false ->
-      let p0 = List.nth params 0 in
-      let p1 = List.nth params 1 in
+      let p0 = param_at 0 in
+      let p1 = param_at 1 in
       let ty_float = Ast.TyNamed ("Float", []) in
       let is_f64 =
         match p0.cp_ty with Ast.TyNamed ("Float", _) -> true | _ -> false
@@ -7175,9 +8263,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
         Some (mk return_ty (CCast (result, return_ty)))
   (* Ternary math: fma *)
   | "fma" when List.length params = 3 ->
-      let a = param (List.nth params 0) in
-      let b = param (List.nth params 1) in
-      let c = param (List.nth params 2) in
+      let a = param (param_at 0) in
+      let b = param (param_at 1) in
+      let c = param (param_at 2) in
       Some (intr "math_fma" [ a; b; c ] return_ty)
   (* Float constants *)
   | "infinity" when params = [] && return_ty = Ast.TyNamed ("Float", []) ->
@@ -7193,21 +8281,21 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
            ->
              true
          | _ -> false ->
-      Some (intr "math_is_nan" [ param (List.hd params) ] return_ty)
+      Some (intr "math_is_nan" [ param (param_at 0) ] return_ty)
   | "is_inf"
     when match params with
          | [ { cp_ty = Ast.TyNamed (("Float" | "Float32" | "Float16"), _); _ } ]
            ->
              true
          | _ -> false ->
-      Some (intr "math_is_inf" [ param (List.hd params) ] return_ty)
+      Some (intr "math_is_inf" [ param (param_at 0) ] return_ty)
   | "is_finite"
     when match params with
          | [ { cp_ty = Ast.TyNamed (("Float" | "Float32" | "Float16"), _); _ } ]
            ->
              true
          | _ -> false ->
-      Some (intr "math_is_finite" [ param (List.hd params) ] return_ty)
+      Some (intr "math_is_finite" [ param (param_at 0) ] return_ty)
   (* ==== CKBuiltin wrappers ====
      These functions are genuinely C-specific (OS calls, math, crypto, etc.)
      but wrapped as IR bodies so they can be called from IR compositions.
@@ -7230,229 +8318,41 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
      codepoint_reverse, levenshtein, longest_common_substring with
      [builtin("blorp_*")] bodies. *)
 
-  (* ---- Bytes (remaining C-specific) ---- *)
-  | "to_string" when first_is_bytes () ->
-      builtin_wrapper "blorp_bytes_to_string" params return_ty
-  | "from_hex"
-    when first_is_string ()
-         && return_ty = Ast.TyNamed ("Option", [ Ast.TyNamed ("Bytes", []) ]) ->
-      builtin_wrapper "blorp_bytes_from_hex" params return_ty
-  | "encode_utf8"
-    when match params with
-         | { cp_ty = Ast.TyNamed ("List", _); _ } :: _ -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_encode_utf8" params return_ty
-  | "decode_utf8" when first_is_bytes () ->
-      builtin_wrapper "blorp_decode_utf8" params return_ty
   (* Legacy builder C wrappers removed. string_append_char is synthesized above
      so UTF-8 encoding and COW flow through Core IR. *)
-  (* ---- Fixed (remaining C-specific) ---- *)
-  | "fixed"
-    when match params with
-         | { cp_ty = Ast.TyNamed ("Float", _); _ } :: _ -> true
-         | _ -> false ->
-      (* fixed(value, scale) -> blorp_fixed_new(value, scale, 18) *)
-      let args = List.map param params @ [ lit_int 18 ] in
-      let dummy = mk ty_void CVoid in
-      Some (mk return_ty (CCall (CKBuiltin "blorp_fixed_new", dummy, args)))
-  | "with_precision"
-    when List.length params = 3 && return_ty = Ast.TyNamed ("Fixed", []) ->
-      builtin_wrapper "blorp_fixed_new" params return_ty
-  | "from_int"
-    when (match params with
-           | { cp_ty = Ast.TyNamed ("Int", _); _ } :: _ -> true
-           | _ -> false)
-         && return_ty = Ast.TyNamed ("Fixed", []) ->
-      (* from_int(value, scale) -> blorp_fixed_from_int(value, scale, 18) *)
-      let args = List.map param params @ [ lit_int 18 ] in
-      let dummy = mk ty_void CVoid in
-      Some
-        (mk return_ty (CCall (CKBuiltin "blorp_fixed_from_int", dummy, args)))
-  | "to_string"
-    when match params with
-         | { cp_ty = Ast.TyNamed ("Fixed", _); _ } :: _ -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_fixed_to_string" params return_ty
-  | "to_float"
-    when match params with
-         | { cp_ty = Ast.TyNamed ("Fixed", _); _ } :: _ -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_fixed_to_float" params return_ty
-  (* ---- System arm removed 2026-04-24: std/system.brp bodies migrated to
-         [builtin("blorp_*")]. All 22 system functions now declare their
-         runtime binding explicitly in stdlib. *)
-  | "now_microseconds" when params = [] ->
-      builtin_wrapper "blorp_now_us" params return_ty
-  (* ---- Hash ---- *)
-  | "hash" | "hash_bytes" | "sha256" | "md5" | "sha1" | "sha512" | "crc32"
-  | "sha256_bytes" | "md5_bytes" | "sha1_bytes" | "sha512_bytes" | "crc32_bytes"
-  | "hmac_sha256"
-    when List.length params >= 1
-         &&
-         match (List.hd params).cp_ty with
-         | Ast.TyNamed ("String", _) | Ast.TyNamed ("Bytes", _) -> true
-         | _ -> false ->
-      builtin_wrapper ("blorp_" ^ func_name) params return_ty
-  (* ---- Time ---- *)
-  | "now" when params = [] && return_ty = Ast.TyNamed ("Int", []) ->
-      builtin_wrapper "blorp_time_now" params return_ty
-  | "to_year" | "to_month" | "to_day" | "to_hour" | "to_minute" | "to_second"
-  | "to_weekday"
-    when List.length params = 1 ->
-      builtin_wrapper ("blorp_time_" ^ func_name) params return_ty
-  | "from_parts" when List.length params >= 6 ->
-      builtin_wrapper "blorp_time_from_parts" params return_ty
-  | "format_time" when List.length params = 2 ->
-      builtin_wrapper "blorp_time_format" params return_ty
-  | "parse_time" when List.length params = 2 ->
-      builtin_wrapper "blorp_time_parse" params return_ty
-  | "from_iso" when List.length params = 1 ->
-      builtin_wrapper "blorp_time_from_iso" params return_ty
-  (* ---- Stream ---- *)
-  | "from_list"
-    when List.length params = 1
-         &&
-         match return_ty with
-         | Ast.TyNamed ("Stream", _) -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_stream_from_list" params return_ty
-  | "from_range"
-    when List.length params = 2
-         &&
-         match return_ty with
-         | Ast.TyNamed ("Stream", _) -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_stream_from_range" params return_ty
-  | "repeat"
-    when List.length params = 1
-         &&
-         match return_ty with
-         | Ast.TyNamed ("Stream", _) -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_stream_repeat" params return_ty
-  | "unfold"
-    when List.length params = 2
-         &&
-         match return_ty with
-         | Ast.TyNamed ("Stream", _) -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_stream_unfold" params return_ty
-  | "empty"
-    when params = []
-         &&
-         match return_ty with
-         | Ast.TyNamed ("Stream", _) -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_stream_empty" params return_ty
-  | "from_lines"
-    when List.length params = 1
-         &&
-         match return_ty with
-         | Ast.TyNamed ("Stream", _) -> true
-         | _ -> false ->
-      builtin_wrapper "blorp_stream_from_lines" params return_ty
-  | "map" | "filter" | "filter_map" | "take" | "drop" | "take_while"
-  | "enumerate"
-    when match params with
-         | { cp_ty = Ast.TyNamed ("Stream", _); _ } :: _ -> true
-         | _ -> false ->
-      builtin_wrapper ("blorp_stream_" ^ func_name) params return_ty
-  | ("collect" | "fold" | "count" | "for_each" | "find" | "any" | "all")
-    when match params with
-         | { cp_ty = Ast.TyNamed ("Stream", _); _ } :: _ -> true
-         | _ -> false ->
-      builtin_wrapper ("blorp_stream_" ^ func_name) params return_ty
-  (* ---- Tensor/Vector constructors ---- *)
-  | "vector" when List.length params = 2 && is_tensor_type return_ty ->
-      builtin_wrapper "blorp_vector_new_fill" params return_ty
-  | "matrix" when List.length params = 3 && is_tensor_type return_ty ->
-      builtin_wrapper "blorp_matrix_new_fill" params return_ty
-  | "tensor3" when List.length params = 4 ->
-      builtin_wrapper "blorp_tensor3_new" params return_ty
-  | "tensor4" when List.length params = 5 ->
-      builtin_wrapper "blorp_tensor4_new" params return_ty
-  | "tensor5" when List.length params = 6 ->
-      builtin_wrapper "blorp_tensor5_new" params return_ty
-  (* ---- Tensor access ---- *)
-  | "checked_get"
-    when (match params with
-           | { cp_ty; _ } :: _ -> is_tensor_type cp_ty
-           | _ -> false)
-         && List.length params = 2 ->
-      builtin_wrapper "blorp_checked_get" params return_ty
-  | "checked_set"
-    when (match params with
-           | { cp_ty; _ } :: _ -> is_tensor_type cp_ty
-           | _ -> false)
-         && List.length params = 3 ->
-      builtin_wrapper "blorp_checked_set" params return_ty
-  | "checked_slice"
-    when (match params with
-           | { cp_ty; _ } :: _ -> is_tensor_type cp_ty
-           | _ -> false)
-         && List.length params = 3 ->
-      builtin_wrapper "blorp_checked_slice" params return_ty
-  | "matrix_checked_get" when List.length params = 3 ->
-      builtin_wrapper "blorp_matrix_checked_get" params return_ty
-  | "matrix_checked_set" when List.length params = 4 ->
-      builtin_wrapper "blorp_matrix_checked_set" params return_ty
-  | "tensor3_checked_get" when List.length params = 4 ->
-      builtin_wrapper "blorp_tensor3_checked_get" params return_ty
-  | "tensor3_checked_set" when List.length params = 5 ->
-      builtin_wrapper "blorp_tensor3_checked_set" params return_ty
-  | "tensor4_checked_get" when List.length params = 5 ->
-      builtin_wrapper "blorp_tensor4_checked_get" params return_ty
-  | "tensor4_checked_set" when List.length params = 6 ->
-      builtin_wrapper "blorp_tensor4_checked_set" params return_ty
-  | "tensor5_checked_get" when List.length params = 6 ->
-      builtin_wrapper "blorp_tensor5_checked_get" params return_ty
-  | "tensor5_checked_set" when List.length params = 7 ->
-      builtin_wrapper "blorp_tensor5_checked_set" params return_ty
-  | "tensor_peel" when List.length params = 2 ->
-      builtin_wrapper "blorp_tensor_peel" params return_ty
   (* ---- Tensor/Vector operations ---- *)
   | "length"
     when match params with
          | { cp_ty; _ } :: _ when is_tensor_type cp_ty -> true
          | _ -> false ->
-      let p = List.hd params in
+      let p = param_at 0 in
       Some (intr "tensor_len" [ param p ] return_ty)
-  | "matmul" when List.length params = 2 ->
-      builtin_wrapper "blorp_tensor_matmul" params return_ty
-  | "transpose" when List.length params = 1 && is_tensor_type return_ty ->
-      builtin_wrapper "blorp_tensor_transpose" params return_ty
-  | "matvec" when List.length params = 2 ->
-      builtin_wrapper "blorp_tensor_matvec" params return_ty
-  | "matvec_t" when List.length params = 2 ->
-      builtin_wrapper "blorp_tensor_matvec_t" params return_ty
-  | "outer" when List.length params = 2 ->
-      builtin_wrapper "blorp_tensor_outer" params return_ty
   (* ---- Tensor reductions (require concrete element type) ---- *)
   (* These return None when the element type is generic (pre-mono).
      After monomorphization, core_synth re-attempts synthesis with
      concrete types, and is_concrete_tensor returns true. *)
-  | "sum"
-    when List.length params = 1 && is_concrete_tensor (List.hd params).cp_ty ->
-      let p = List.hd params in
+  | "sum" when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty
+    ->
+      let p = param_at 0 in
       let info = tensor_elem_info p.cp_ty in
       Some
         (tensor_reduce ~op:Ast.Add ~init:info.zero_lit (param p) p.cp_ty
            return_ty)
   | "product"
-    when List.length params = 1 && is_concrete_tensor (List.hd params).cp_ty ->
-      let p = List.hd params in
+    when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty ->
+      let p = param_at 0 in
       let info = tensor_elem_info p.cp_ty in
       Some
         (tensor_reduce ~op:Ast.Mul ~init:info.one_lit (param p) p.cp_ty
            return_ty)
-  | "dot"
-    when List.length params = 2 && is_concrete_tensor (List.hd params).cp_ty ->
-      let pa = List.hd params in
-      let pb = List.nth params 1 in
+  | "dot" when List.length params = 2 && is_concrete_tensor (param_at 0).cp_ty
+    ->
+      let pa = param_at 0 in
+      let pb = param_at 1 in
       Some (tensor_dot (param pa) (param pb) pa.cp_ty return_ty)
-  | "max"
-    when List.length params = 1 && is_concrete_tensor (List.hd params).cp_ty ->
-      let p = List.hd params in
+  | "max" when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty
+    ->
+      let p = param_at 0 in
       let info = tensor_elem_info p.cp_ty in
       (* max: init = data[0] (or 0 if empty), loop from 1..n with conditional *)
       Some
@@ -7481,9 +8381,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                  void ty_void) )))
                     (vr "__acc" return_ty)))
               return_ty))
-  | "min"
-    when List.length params = 1 && is_concrete_tensor (List.hd params).cp_ty ->
-      let p = List.hd params in
+  | "min" when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty
+    ->
+      let p = param_at 0 in
       let info = tensor_elem_info p.cp_ty in
       Some
         (lett "__n"
@@ -7511,9 +8411,9 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                  void ty_void) )))
                     (vr "__acc" return_ty)))
               return_ty))
-  | "mean"
-    when List.length params = 1 && is_concrete_tensor (List.hd params).cp_ty ->
-      let p = List.hd params in
+  | "mean" when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty
+    ->
+      let p = param_at 0 in
       (* mean = sum / length, always returns Float *)
       let read_to_float value =
         if
@@ -7539,8 +8439,8 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                     return_ty))
               return_ty))
   | "argmax"
-    when List.length params = 1 && is_concrete_tensor (List.hd params).cp_ty ->
-      let p = List.hd params in
+    when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty ->
+      let p = param_at 0 in
       let info = tensor_elem_info p.cp_ty in
       let elem_ty = info.elem_ty in
       Some
@@ -7577,8 +8477,8 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                        (vr "__best_idx" ty_int))))
               ty_int))
   | "argmin"
-    when List.length params = 1 && is_concrete_tensor (List.hd params).cp_ty ->
-      let p = List.hd params in
+    when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty ->
+      let p = param_at 0 in
       let info = tensor_elem_info p.cp_ty in
       let elem_ty = info.elem_ty in
       Some
@@ -7615,8 +8515,8 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                        (vr "__best_idx" ty_int))))
               ty_int))
   | "cumsum"
-    when List.length params = 1 && is_concrete_tensor (List.hd params).cp_ty ->
-      let p = List.hd params in
+    when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty ->
+      let p = param_at 0 in
       let info = tensor_elem_info p.cp_ty in
       let set_intr = tensor_set_intrinsic_of_get info.get_intr in
       let elem_ty = info.elem_ty in
@@ -7648,10 +8548,10 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
                                  ]
                                  ty_void) )))
                     (vr "__result" return_ty)))))
-  | "scale"
-    when List.length params = 2 && is_concrete_tensor (List.hd params).cp_ty ->
-      let pv = List.hd params in
-      let ps = List.nth params 1 in
+  | "scale" when List.length params = 2 && is_concrete_tensor (param_at 0).cp_ty
+    ->
+      let pv = param_at 0 in
+      let ps = param_at 1 in
       let info = tensor_elem_info pv.cp_ty in
       let set_intr = tensor_set_intrinsic_of_get info.get_intr in
       let elem_ty = info.elem_ty in
@@ -7683,9 +8583,31 @@ let synthesize_body_impl reg ~(func_name : string) ~(module_path : string)
          | p :: _ ->
              Option.is_some (unsupported_concrete_numeric_tensor p.cp_ty)
          | [] -> false ->
-      unsupported_numeric_tensor_error func_name (List.hd params)
+      unsupported_numeric_tensor_error func_name (param_at 0)
   (* Other vector operations still use core_specialize dispatch. *)
   | _ -> None
+
+let synthesize_body_impl reg ~func_name ~module_path ~params ~return_ty =
+  let source_name = source_func_name ~module_path func_name in
+  let is_tensor_type ty = Core_tensor_type.is_type ~reg:(tensor_reg reg) ty in
+  match
+    std_body_signature_check ~is_tensor_type ~module_path ~func_name:source_name
+      ~params ~return_ty
+  with
+  | None -> None
+  | Some (SpecCheckedParams (spec, checked_params)) -> (
+      match synthesize_std_body_from_spec spec params return_ty with
+      | Some body -> Some body
+      | None -> (
+          try
+            synthesize_body_impl_unsafe reg ~func_name ~module_path ~params
+              ~checked_params ~return_ty
+          with Malformed_intrinsic_params -> None))
+  | Some (LegacyUncheckedParams checked_params) -> (
+      try
+        synthesize_body_impl_unsafe reg ~func_name ~module_path ~params
+          ~checked_params ~return_ty
+      with Malformed_intrinsic_params -> None)
 
 let synthesize_body = synthesize_body_impl None
 

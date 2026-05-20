@@ -164,6 +164,11 @@ let format_errors errors =
   String.concat "\n"
     (List.map (fun (e : compiler_error) -> "  - " ^ e.message) errors)
 
+let check_no_type_errors errors =
+  if errors <> [] then
+    Alcotest.failf "expected no type errors, got %d:\n%s" (List.length errors)
+      (format_errors errors)
+
 (** Find the body of a top-level function by name. *)
 let find_func_body (prog : program) (name : string) : expr option =
   List.find_map
@@ -379,6 +384,45 @@ func use() -> Int:
       | CallTraitMethod _ | CallClosure _ ->
           Alcotest.fail "expected direct callable metadata")
 
+let test_call_metadata_for_local_method_syntax () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+pure func add_to(self: Int, amount: Int) -> Int:
+    self + amount
+
+pure func use(x: Int) -> Int:
+    x.add_to(2)
+|}
+      in
+      let typed, errors = parse_and_typecheck src in
+      check_int "no type errors" 0 (List.length errors);
+      let call =
+        require_resolved_call_matching typed "use" "local method syntax"
+          (fun call ->
+            match call.call_target with
+            | CallDirect { source_name = "add_to"; origin = CallableLocal; _ }
+              ->
+                true
+            | _ -> false)
+      in
+      Alcotest.(check bool)
+        "method call syntax" true
+        (call.call_syntax = CallMethod);
+      check_true "instantiated receiver"
+        (match call.instantiated_params with
+        | [ self_ty; amount_ty ] ->
+            types_equal self_ty ty_int && types_equal amount_ty ty_int
+        | _ -> false);
+      check_true "instantiated return"
+        (types_equal call.instantiated_return ty_int);
+      match call.call_target with
+      | CallDirect { callable_id; call_pure; _ } ->
+          Alcotest.(check bool) "local method purity" true call_pure;
+          Alcotest.(check bool) "callable id minted" true (callable_id >= 0)
+      | CallTraitMethod _ | CallClosure _ ->
+          Alcotest.fail "expected direct method metadata")
+
 let test_call_metadata_for_closure_call () =
   with_isolated_env (fun () ->
       let src = {|
@@ -500,6 +544,121 @@ pure func use(xs: List[Int]) -> List[Int]:
             (origin = CallableImported "std/list")
       | CallTraitMethod _ | CallClosure _ ->
           Alcotest.fail "expected direct function metadata")
+
+let test_call_metadata_for_imported_function_method_syntax () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+import:
+    list: reverse
+
+
+pure func use(xs: List[Int]) -> List[Int]:
+    xs.reverse()
+|}
+      in
+      let typed, errors = parse_and_typecheck_module src in
+      check_no_type_errors errors;
+      let call =
+        require_resolved_call_matching typed "use"
+          "imported function method syntax" (fun call ->
+            match call.call_target with
+            | CallDirect { source_name = "reverse"; origin; _ } ->
+                origin = CallableImported "std/list"
+            | _ -> false)
+      in
+      Alcotest.(check bool)
+        "method call syntax" true
+        (call.call_syntax = CallMethod);
+      check_true "instantiated receiver"
+        (match call.instantiated_params with
+        | [ TyNamed ("List", [ ty ]) ] -> types_equal ty ty_int
+        | _ -> false);
+      check_true "instantiated return"
+        (types_equal call.instantiated_return (TyNamed ("List", [ ty_int ])));
+      match call.call_target with
+      | CallDirect { callable_id; call_pure; _ } ->
+          Alcotest.(check bool) "imported method purity" true call_pure;
+          Alcotest.(check bool) "callable id minted" true (callable_id >= 0)
+      | CallTraitMethod _ | CallClosure _ ->
+          Alcotest.fail "expected imported direct method metadata")
+
+let test_call_metadata_for_prelude_method_only_ufcs () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+pure func use(xs: List[Int]) -> List[Int]:
+    xs.map(pure func(x: Int): x + 1)
+|}
+      in
+      let typed, errors = parse_and_typecheck_module src in
+      check_no_type_errors errors;
+      let call =
+        require_resolved_call_matching typed "use" "prelude method-only UFCS"
+          (fun call ->
+            match call.call_target with
+            | CallDirect { origin; call_pure = true; _ } ->
+                origin = CallableImported "std/list"
+            | _ -> false)
+      in
+      Alcotest.(check bool)
+        "method-only UFCS syntax" true
+        (call.call_syntax = CallMethodOnlyUfcs);
+      check_true "instantiated receiver"
+        (match call.instantiated_params with
+        | [
+         TyNamed ("List", [ item_ty ]);
+         TyFunc { params = [ lambda_param ]; return; is_pure = true };
+        ] ->
+            types_equal item_ty ty_int
+            && types_equal lambda_param ty_int
+            && types_equal return ty_int
+        | _ -> false);
+      check_true "instantiated return"
+        (types_equal call.instantiated_return (TyNamed ("List", [ ty_int ])));
+      match call.call_target with
+      | CallDirect { callable_id; _ } ->
+          Alcotest.(check bool) "callable id minted" true (callable_id >= 0)
+      | CallTraitMethod _ | CallClosure _ ->
+          Alcotest.fail "expected method-only direct metadata")
+
+let test_call_metadata_for_imported_type_method_only_ufcs () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+import:
+    option: Option(Some, None)
+
+
+pure func use(opt: Option[Int]) -> Int:
+    opt.get_or(0)
+|}
+      in
+      let typed, errors = parse_and_typecheck_module src in
+      check_no_type_errors errors;
+      let call =
+        require_resolved_call_matching typed "use"
+          "imported type method-only UFCS" (fun call ->
+            match call.call_target with
+            | CallDirect { origin; call_pure = true; _ } ->
+                origin = CallableImported "std/option"
+            | _ -> false)
+      in
+      Alcotest.(check bool)
+        "method-only UFCS syntax" true
+        (call.call_syntax = CallMethodOnlyUfcs);
+      check_true "instantiated receiver"
+        (match call.instantiated_params with
+        | [ TyNamed ("Option", [ item_ty ]); default_ty ] ->
+            types_equal item_ty ty_int && types_equal default_ty ty_int
+        | _ -> false);
+      check_true "instantiated return"
+        (types_equal call.instantiated_return ty_int);
+      match call.call_target with
+      | CallDirect { callable_id; _ } ->
+          Alcotest.(check bool) "callable id minted" true (callable_id >= 0)
+      | CallTraitMethod _ | CallClosure _ ->
+          Alcotest.fail "expected method-only direct metadata")
 
 let test_call_metadata_for_module_qualified_impl_method () =
   with_isolated_env (fun () ->
@@ -841,6 +1000,71 @@ func choose(flag: Bool, p: Point) -> Int:
             (function { expr_desc = EMatch _; _ } -> true | _ -> false)
             ty_int
       | None -> Alcotest.fail "function choose not found")
+
+let test_ambiguous_bare_record_field_reports_modules () =
+  with_isolated_env (fun () ->
+      let field name field_type =
+        { field_name = name; field_type; field_loc = dummy_loc }
+      in
+      let record_decl name fields =
+        {
+          decl_desc =
+            DRecord
+              {
+                record_name = name;
+                record_type_params = [];
+                record_fields = fields;
+                record_is_value = false;
+                record_is_builtin = false;
+              };
+          decl_loc = dummy_loc;
+          decl_doc = None;
+        }
+      in
+      let loaded_module name decls : Blorp.Session.loaded_module =
+        {
+          name;
+          path = "<test>";
+          origin = Blorp.Session.User_module;
+          decls;
+          exports = [];
+          typed_decls = None;
+          typed_import_bindings = None;
+        }
+      in
+      let sess = Blorp.Session.current () in
+      Blorp.Session.register_module_types sess
+        (loaded_module "./a" [ record_decl "Config" [ field "a" ty_int ] ]);
+      Blorp.Session.register_module_types sess
+        (loaded_module "./b" [ record_decl "Config" [ field "b" ty_int ] ]);
+      let env =
+        Blorp.Env.add_var (Blorp.Env.empty ()) "config"
+          (TyNamed ("Config", []))
+          ()
+      in
+      let expr desc =
+        {
+          expr_desc = desc;
+          expr_loc = dummy_loc;
+          expr_type = None;
+          expr_type_info = None;
+          expr_rc = None;
+        }
+      in
+      let access = expr (EFieldAccess (expr (EIdent "config"), "a")) in
+      let ctx = Blorp.Infer.make_ctx env in
+      match Blorp.Infer.infer_expr ctx access with
+      | Ok _ ->
+          Alcotest.fail
+            "ambiguous bare record field access should not pick a loaded module"
+      | Error err ->
+          check_true "reports ambiguous record type"
+            (Test_helpers.contains_substring err.message
+               "Ambiguous record type 'Config'");
+          check_true "names first module"
+            (Test_helpers.contains_substring err.message "./a");
+          check_true "names second module"
+            (Test_helpers.contains_substring err.message "./b"))
 
 let test_infer_bitwise_call_carries_no_widening_payload () =
   with_isolated_env (fun () ->
@@ -2484,6 +2708,8 @@ let suite =
           test_infer_integer_literal;
         Alcotest.test_case "direct local call records target" `Quick
           test_call_metadata_for_direct_local_call;
+        Alcotest.test_case "local method syntax records target" `Quick
+          test_call_metadata_for_local_method_syntax;
         Alcotest.test_case "closure call records target" `Quick
           test_call_metadata_for_closure_call;
         Alcotest.test_case "constructor call records target" `Quick
@@ -2492,6 +2718,12 @@ let suite =
           test_call_metadata_for_trait_dispatch;
         Alcotest.test_case "module-qualified function records target" `Quick
           test_call_metadata_for_module_qualified_function;
+        Alcotest.test_case "imported function method records target" `Quick
+          test_call_metadata_for_imported_function_method_syntax;
+        Alcotest.test_case "prelude method-only UFCS records target" `Quick
+          test_call_metadata_for_prelude_method_only_ufcs;
+        Alcotest.test_case "imported type method-only UFCS records target"
+          `Quick test_call_metadata_for_imported_type_method_only_ufcs;
         Alcotest.test_case "module-qualified impl method records target" `Quick
           test_call_metadata_for_module_qualified_impl_method;
         Alcotest.test_case "integer literal carries no-widening payload" `Quick
@@ -2513,6 +2745,8 @@ let suite =
           `Quick test_infer_collection_literals_carry_no_widening_payload;
         Alcotest.test_case "access and branch nodes carry no-widening payload"
           `Quick test_infer_access_and_branch_nodes_carry_no_widening_payload;
+        Alcotest.test_case "ambiguous bare record field reports modules" `Quick
+          test_ambiguous_bare_record_field_reports_modules;
         Alcotest.test_case "bitwise call carries no-widening payload" `Quick
           test_infer_bitwise_call_carries_no_widening_payload;
         Alcotest.test_case "reflection calls carry no-widening payload" `Quick
