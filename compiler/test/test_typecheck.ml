@@ -1653,6 +1653,7 @@ let typed_param name ty : Blorp.Ast.param =
     param_name = Some name;
     param_pattern = None;
     param_type = Some ty;
+    param_passing = ParamByValue;
     param_loc = loc;
   }
 
@@ -1669,6 +1670,7 @@ let test_checked_func_signature_carries_normalized_boundary () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in

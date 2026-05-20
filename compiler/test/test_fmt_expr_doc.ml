@@ -42,6 +42,7 @@ let typed_param name ty =
     Ast.param_name = Some name;
     param_pattern = None;
     param_type = Some ty;
+    param_passing = Ast.ParamByValue;
     param_loc = Ast.dummy_loc;
   }
 
@@ -59,6 +60,7 @@ let func ?name ?(type_params = []) ?return_type ?(is_pure = false) params body =
     func_is_tailrec = false;
     func_no_copy = false;
     func_debug_only = false;
+    func_resource_result_ordinary = false;
     func_dim_constraints = [];
   }
 

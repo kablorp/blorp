@@ -551,6 +551,7 @@ let test_mono_e2e_pipeline () =
       param_name = Some "x";
       param_pattern = None;
       param_type = Some (TyVar "T");
+      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -566,6 +567,7 @@ let test_mono_e2e_pipeline () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -588,6 +590,7 @@ let test_mono_e2e_pipeline () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in

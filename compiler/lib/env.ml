@@ -14,8 +14,17 @@ open Types
 (** Explicit mutability for variable bindings *)
 type var_mutability = Immutable | Mutable
 
-(** Origin of a variable binding — used for context-specific error messages *)
-type var_origin = LetBinding | FuncParam | ForLoopVar | MatchBinding | Other
+(** Origin of a variable binding — used for context-specific error messages and
+    phase-local capability checks. *)
+type var_origin =
+  | LetBinding
+  | FuncParam
+  | BorrowedResourceParam
+  | ForLoopVar
+  | MatchBinding
+  | ScopedResource
+  | ScopedResourceDerived
+  | Other
 
 (** Re-exports from [Env_types] so consumers that reference [Env.purity],
     [Env.func_origin], [Env.overload_entry], [Env.impl_instance] continue
@@ -25,6 +34,14 @@ type purity = Env_types.purity = Pure | Impure
 
 type func_origin = Env_types.func_origin = UserDefined | Builtin | Foreign
 type def_id = Env_types.def_id
+
+type resource_result_policy = Env_types.resource_result_policy =
+  | ResourceResultDependent
+  | ResourceResultOrdinary
+
+type resource_arg_policy = Env_types.resource_arg_policy =
+  | RejectResourceArgs
+  | AllowResourceArgs of resource_result_policy
 
 type loop_producer = Env_types.loop_producer =
   | LoopProducerIndices
@@ -41,7 +58,7 @@ type bound_type_param = Env_types.bound_type_param = {
 }
 (** Type parameter with optional trait bounds *)
 
-type type_kind = TypeUnion | TypeEnum | TypeBuiltin
+type type_kind = TypeUnion | TypeEnum | TypeBuiltin | TypeResource
 
 type overload_entry = Env_types.overload_entry = {
   ol_def_id : def_id;
@@ -50,6 +67,7 @@ type overload_entry = Env_types.overload_entry = {
   ol_param_names : string option list;
   ol_purity : purity;
   ol_origin : func_origin;
+  ol_resource_args : resource_arg_policy;
   ol_module_path : string option;
   ol_dim_constraints : (type_expr * type_expr) list;
   ol_loop_producer : loop_producer option;
@@ -73,6 +91,7 @@ type symbol_kind =
           (* Parameter names aligned with typed parameters *)
       purity : purity;
       origin : func_origin;
+      resource_args : resource_arg_policy;
       module_path : string option;
       dim_constraints : (type_expr * type_expr) list;
       loop_producer : loop_producer option;
@@ -259,7 +278,10 @@ let add_var (env : env) (name : string) (var_type : type_expr) ?source_type
 (** Check if a variable is a function parameter *)
 let is_func_param (env : env) (name : string) : bool =
   match lookup env name with
-  | Some { kind = VarSymbol { origin = FuncParam; _ }; _ } -> true
+  | Some
+      { kind = VarSymbol { origin = FuncParam | BorrowedResourceParam; _ }; _ }
+    ->
+      true
   | _ -> false
 
 (** Check if a variable is a for-loop variable *)
@@ -268,11 +290,47 @@ let is_for_loop_var (env : env) (name : string) : bool =
   | Some { kind = VarSymbol { origin = ForLoopVar; _ }; _ } -> true
   | _ -> false
 
+let is_scoped_resource_var (env : env) (name : string) : bool =
+  match lookup env name with
+  | Some
+      {
+        kind = VarSymbol { origin = ScopedResource | BorrowedResourceParam; _ };
+        _;
+      } ->
+      true
+  | _ -> false
+
+let is_scoped_resource_derived_var (env : env) (name : string) : bool =
+  match lookup env name with
+  | Some { kind = VarSymbol { origin = ScopedResourceDerived; _ }; _ } -> true
+  | _ -> false
+
+let is_scoped_resource_related_var (env : env) (name : string) : bool =
+  match lookup env name with
+  | Some
+      {
+        kind =
+          VarSymbol
+            {
+              origin =
+                ScopedResource | BorrowedResourceParam | ScopedResourceDerived;
+              _;
+            };
+        _;
+      } ->
+      true
+  | _ -> false
+
 (** Add a function to the environment *)
 let add_func (env : env) (name : string) (func_type : type_expr) ?callable_id
     ?(type_params = []) ?(param_names = []) ?(purity = Impure)
-    ?(origin = UserDefined) ?module_path ?(dim_constraints = []) ?loop_producer
-    ?(debug_only = false) () : env =
+    ?(origin = UserDefined) ?resource_args ?module_path ?(dim_constraints = [])
+    ?loop_producer ?(debug_only = false) () : env =
+  let resource_args =
+    match resource_args with
+    | Some policy -> policy
+    | None -> RejectResourceArgs
+  in
   let callable_id =
     match callable_id with
     | Some id -> id
@@ -290,6 +348,7 @@ let add_func (env : env) (name : string) (func_type : type_expr) ?callable_id
             param_names;
             purity;
             origin;
+            resource_args;
             module_path;
             dim_constraints;
             loop_producer;
@@ -1364,6 +1423,15 @@ let get_overloads (env : env) (name : string) : overload_entry list =
   match Hashtbl.find_opt env.overloads name with
   | Some entries -> entries
   | None -> []
+
+let find_overload_by_def_id (env : env) (def_id : def_id) :
+    overload_entry option =
+  Hashtbl.fold
+    (fun _ entries found ->
+      match found with
+      | Some _ -> found
+      | None -> List.find_opt (fun entry -> entry.ol_def_id = def_id) entries)
+    env.overloads None
 
 (** Extract the head type name from a type expression (e.g., "List" from List[Int]). *)
 let head_type_name (ty : type_expr) : string option =

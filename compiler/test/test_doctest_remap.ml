@@ -123,6 +123,7 @@ let mk_func_decl ~name ~doc ~decl_line : Ast.decl =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in

@@ -105,6 +105,8 @@ let test_default_managed_arg_rejected_before_codegen () =
       type_variants = [ variant ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let func = foreign_func "take_message" [ param "m" (ty "Message" []) ] in

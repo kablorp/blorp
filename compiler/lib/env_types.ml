@@ -32,6 +32,19 @@ type purity = Pure | Impure
     builtin, or a foreign (C FFI) function. *)
 type func_origin = UserDefined | Builtin | Foreign
 
+(** Whether a resource-borrowing operation returns ordinary data or a value
+    whose lifetime remains tied to the borrowed resource. *)
+type resource_result_policy = ResourceResultDependent | ResourceResultOrdinary
+
+(** Whether a function may receive scoped resource values directly.
+    Ordinary source functions reject resource arguments because parameters copy
+    values. Compiler-owned operations must explicitly opt into borrowing
+    resource capabilities for the duration of the call and state whether their
+    result remains resource-dependent. *)
+type resource_arg_policy =
+  | RejectResourceArgs
+  | AllowResourceArgs of resource_result_policy
+
 (** Compiler-known loop producer identity. This is declaration metadata, not a
     source-visible type: later phases use it to distinguish genuine loop-view
     producers from unrelated local functions with the same spelling. *)
@@ -57,6 +70,7 @@ type overload_entry = {
   ol_param_names : string option list;
   ol_purity : purity;
   ol_origin : func_origin;
+  ol_resource_args : resource_arg_policy;
   ol_module_path : string option;  (** Which module this overload came from *)
   ol_dim_constraints : (type_expr * type_expr) list;
   ol_loop_producer : loop_producer option;

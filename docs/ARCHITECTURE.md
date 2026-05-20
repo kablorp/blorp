@@ -148,6 +148,11 @@ Typed AST
 +--------------+
     |
     v
++---------------+
+| Core_resource |  Rewrite resource-scope break/continue exits to explicit
++---------------+  cleanup-exit Core (core_resource.ml)
+    |
+    v
 +----------------------+
 | Core_codegen_prepare |  Make final storage/layout decisions explicit:
 +----------------------+  typed box/unbox, constructors, release policy
@@ -212,6 +217,7 @@ boxing, or ownership behavior from source spelling.
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
+| `core_resource.ml` | Explicit resource cleanup exits for nonlocal loop control |
 | `core_codegen_prepare.ml` | Final Core preparation: explicit constructors, box/unbox, and release/layout facts |
 | `core_erased_storage_layout.ml` | Late-Core classification for typed values crossing erased `void*` storage |
 | `core_erasure_inventory.ml` | Observational inventory of typed values crossing erased storage boundaries |

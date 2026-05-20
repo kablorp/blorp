@@ -96,7 +96,7 @@ let metadata_for_env (env : Env.env) =
     | None -> (
         match Env.get_type_kind env name with
         | Some TypeUnion -> true
-        | Some TypeEnum | Some TypeBuiltin | None -> false)
+        | Some TypeEnum | Some TypeBuiltin | Some TypeResource | None -> false)
   in
   Core_type_layout.metadata ~is_managed_name ~is_value_record_name ~is_enum_name
     ~lookup_alias:(Env.get_alias env) ()

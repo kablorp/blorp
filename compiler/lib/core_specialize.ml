@@ -157,6 +157,8 @@ let void_boxed_arg_positions =
     (* init *)
     ("blorp_stream_fold", [ 1 ]);
     (* init *)
+    ("blorp_fallible_stream_fold_file_raw", [ 1 ]);
+    (* init *)
     (* -- Channel ---------------------------------------------------------- *)
     ("blorp_channel_send", [ 1 ]);
     (* value *)
@@ -1354,6 +1356,36 @@ let stream_filter_map_builtin_for_option_layout ~reg base ty =
         ~primitive:(Printf.sprintf "%s_%s" base)
         ~nullable:(base ^ "_nullable")
   | _ -> None
+
+let fallible_stream_find_builtin_for_result_option_layout ~reg ~loc base ty =
+  match Core_layout_type.canonical_type ~reg ty with
+  | Ast.TyNamed ("Result", [ Ast.TyNamed ("Option", [ elem ]); _ ]) -> (
+      match Core_layout_type.option_payload_runtime_abi ~reg elem with
+      | Core_layout_type.OptionPayloadPrimitiveStack suffix ->
+          base ^ "_" ^ suffix
+      | Core_layout_type.OptionPayloadNullableManaged -> base ^ "_nullable"
+      | Core_layout_type.OptionPayloadBoxedUnion ->
+          Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
+            ~hint:
+              "Use a concrete nullable-managed or primitive-stack Option \
+               payload for fallible stream find_result, or add a boxed Option \
+               ABI before enabling this payload."
+            "fallible stream find_result cannot return boxed-union Option \
+             payloads yet"
+      | Core_layout_type.OptionPayloadNoSpecialization ->
+          Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
+            ~hint:
+              "Add a runtime specialization for this Option payload layout \
+               before using it as find_result's result payload."
+            "fallible stream find_result has no Option payload ABI for %s"
+            (Types.type_to_string elem))
+  | _ ->
+      Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
+        ~hint:
+          "find_result must return Result[Option[T], E] after type inference \
+           and monomorphization"
+        "fallible stream find_result has unexpected return type %s"
+        (Types.type_to_string ty)
 
 let list_filter_map_parallel_builtin_for_option_layout ~reg base ty =
   match Core_layout_type.canonical_type ~reg ty with
@@ -2712,6 +2744,33 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       in
       if is_pointer_type ~reg e.ty then { e with desc = CCast (raw, e.ty) }
       else { e with desc = CUnbox (raw, e.ty) }
+  | CCall (CKBuiltin ("blorp_fallible_stream_fold_file_raw" as c), callee, args)
+    ->
+      let mk_int n =
+        {
+          desc = CLit (Ast.LitInt (Int64.of_int n));
+          ty = Ast.TyNamed ("Int", []);
+          loc = e.loc;
+        }
+      in
+      let acc_needs_release =
+        match args with
+        | _ :: init :: _ ->
+            if boxed_storage_needs_release ~reg ~loc:e.loc init.ty then 1 else 0
+        | _ -> 0
+      in
+      let args, _ = box_void_args_for_builtin ~reg c args in
+      {
+        e with
+        desc = CCall (CKBuiltin c, callee, args @ [ mk_int acc_needs_release ]);
+      }
+  | CCall (CKBuiltin ("blorp_fallible_stream_find_file_raw" as c), callee, args)
+    ->
+      let c =
+        fallible_stream_find_builtin_for_result_option_layout ~reg ~loc:e.loc c
+          e.ty
+      in
+      { e with desc = CCall (CKBuiltin c, callee, args) }
   (* tensor_peel: emitted by infer for multi-dim [checked_get] where the
      result is a sub-tensor. Rewrite to blorp_tensor_slice_row with
      row_size / result_first_dim extracted from the collection's

@@ -282,6 +282,8 @@ let test_union_constructor_becomes_explicit_construct () =
         ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog =
@@ -371,6 +373,8 @@ let test_tail_expected_type_reclassifies_wrapped_result_constructor () =
         ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog =
@@ -457,6 +461,8 @@ let test_nullary_option_constructor_becomes_explicit_construct () =
         ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog =
@@ -530,6 +536,8 @@ let test_nullary_option_alias_constructor_becomes_explicit_construct () =
         ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog =
@@ -602,6 +610,8 @@ let test_builtin_option_none_becomes_explicit_construct () =
         ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog =
@@ -679,6 +689,8 @@ let test_let_option_none_uses_binding_type_for_prepare () =
         ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog =
@@ -763,6 +775,8 @@ let test_qualified_option_none_becomes_explicit_construct () =
         ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog =

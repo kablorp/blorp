@@ -202,6 +202,7 @@ let global_abi_type_names =
     "Task";
     "Channel";
     "Stream";
+    "FallibleStream";
     "TcpListener";
     "TcpStream";
     "ConcurrencyError";

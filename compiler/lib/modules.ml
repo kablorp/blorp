@@ -796,6 +796,7 @@ let reset ?sess () =
   Hashtbl.clear sess.module_cache;
   Hashtbl.clear sess.type_index;
   Hashtbl.clear sess.trait_index;
+  Hashtbl.clear sess.resource_cleanup_index;
   sess.load_errors <- [];
   sess.prelude_modules_loaded <- false
 

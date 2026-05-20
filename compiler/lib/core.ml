@@ -665,6 +665,11 @@ and desc =
           and bound to [rs_var] while [rs_body] runs; [rs_cleanup] then runs
           before the scope returns [rs_body]'s value. Cleanup is semantic
           resource finalization, distinct from ARC release/drop. *)
+  | CResourceCleanupExit of resource_cleanup_exit
+      (** Explicit cleanup edge before nonlocal loop control leaves one or
+          more active resource scopes. Produced by [Core_resource] after the
+          normal Core passes know which [break]/[continue] nodes are not
+          captured by an inner loop. *)
   | CSeq of core * core  (** [e1; e2] — both evaluated, result is [e2] *)
   | CDebugBlock of core
       (** [debug: ...] — source instrumentation block. [Core_debug] lowers it
@@ -799,6 +804,15 @@ and resource_scope = {
   rs_acquire : core;  (** Expression that produces the scoped resource. *)
   rs_body : core;  (** Scope body. The enclosing node returns this value. *)
   rs_cleanup : core;  (** Cleanup action. Must have type [Void]. *)
+}
+
+and resource_exit_kind = ResourceBreak | ResourceContinue
+
+and resource_cleanup_exit = {
+  rce_cleanups : core list;
+      (** Cleanup actions to run before the exit. Stored innermost-first so
+          nested resources close in reverse acquisition order. *)
+  rce_exit : resource_exit_kind;
 }
 
 and tensor_raw_read = {
@@ -1162,6 +1176,9 @@ let rec map_children (f : core -> core) (e : core) : core =
             rs_body = f scope.rs_body;
             rs_cleanup = f scope.rs_cleanup;
           }
+    | CResourceCleanupExit exit ->
+        CResourceCleanupExit
+          { exit with rce_cleanups = List.map f exit.rce_cleanups }
     | CSeq (a, b) -> CSeq (f a, f b)
     | CDebugBlock body -> CDebugBlock (f body)
     | CIf (c, t, el) -> CIf (f c, f t, f el)
@@ -1810,6 +1827,14 @@ let rec pp_to_string (e : core) : string =
         (pp_to_string s.rs_acquire)
         (pp_to_string s.rs_body)
         (pp_to_string s.rs_cleanup)
+  | CResourceCleanupExit exit ->
+      let exit_s =
+        match exit.rce_exit with
+        | ResourceBreak -> "break"
+        | ResourceContinue -> "continue"
+      in
+      Printf.sprintf "resource-cleanup-exit[%s] %s" exit_s
+        (String.concat "; " (List.map pp_to_string exit.rce_cleanups))
   | CSeq (a, b) -> Printf.sprintf "%s; %s" (pp_to_string a) (pp_to_string b)
   | CDebugBlock body -> Printf.sprintf "debug { %s }" (pp_to_string body)
   | CIf (c, t, el) ->
@@ -2034,7 +2059,8 @@ let pp_to_string_indented (e : core) : string =
     | CDictConstruct _ | CSetAlloc _ | CRecord _ | CRecordConstruct _
     | CRecordUpdate _ | CRange _ | CStringInterp _ | CAssign _ | CConcurrent _
     | CConcurrentFor _ | CDetach _ | CCast _ | CUnbox _ | CUnboxTyped _ | CBox _
-    | CBoxTyped _ | CUnionConstruct _ | CTailrecRecur _ ->
+    | CBoxTyped _ | CUnionConstruct _ | CResourceCleanupExit _ | CTailrecRecur _
+      ->
         p ^ pp_to_string e
     | CTailrecLoop (TailrecUnmanagedLoop l) ->
         Printf.sprintf "%stailrec-loop[unmanaged] {\n%s\n%s}" p

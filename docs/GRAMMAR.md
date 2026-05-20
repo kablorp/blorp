@@ -36,7 +36,7 @@ continues the previous expression instead of starting an indented block.
 func   pure   var   union   enum   record   struct   void
 while  for    in    if      else   and      or       not
 break  continue    match   import   as       private
-debug  implements   trait   Self   type   alias
+debug  resource     borrow       implements   trait   Self   type   alias
 builtin    foreign      concurrent    detach      where
 True   False
 ```
@@ -158,13 +158,19 @@ Inference section of GUIDE.md for details.
 params = "(" [ param { "," param } [ "," ] ] ")" ;
 
 param = IDENT ":" type_expr                     (* named with type *)
+      | IDENT ":" "borrow" type_expr            (* borrowed resource parameter *)
       | IDENT                                   (* named, type inferred *)
       | "_"                                     (* discard *)
       | "_" ":" type_expr                       (* discard with type *)
+      | "_" ":" "borrow" type_expr              (* discarded borrowed resource *)
       | tuple_param [ ":" type_expr ] ;         (* 2-4 element tuple destructure *)
 
 tuple_param = "(" IDENT "," IDENT [ "," IDENT [ "," IDENT ] ] [ "," ] ")" ;
 ```
+
+`borrow` parameters are only valid on source functions with bodies. They must
+name a direct `resource type`, and the function body must return ordinary data,
+not a resource or a value derived from the borrowed resource.
 
 ### Statements
 
@@ -197,7 +203,9 @@ var_decl = "var" IDENT [ ":" type_expr ] "=" expr    (* mutable *)
 
 ```ebnf
 type_decl = "union" IDENT [ type_params ] ":" NEWLINE INDENT variant_list DEDENT
-          | "type" IDENT [ type_params ] "=" "builtin" ;  (* std-only *)
+          | "type" IDENT [ type_params ] "=" "builtin"   (* std-only *)
+          | "resource" "type" IDENT [ type_params ] "=" "builtin"
+              [ "(" STRING ")" ] ;  (* std-only; optional cleanup builtin *)
 
 enum_decl = "enum" IDENT ":" NEWLINE INDENT variant_list DEDENT ;
 
@@ -447,9 +455,10 @@ detach_expr = "detach" unary_expr ;
 `debug_block` returns `Void`. Normal builds erase the body after Core lowering;
 `--debug` builds and `blorp test` retain it.
 
-`with_expr` is reserved syntax for scoped resources. It is parsed and
-represented in the AST, but the typechecker rejects it until cleanup lowering
-and resource-scope checking are implemented.
+`with_expr` is active syntax for scoped resources. The acquired value must have
+a `resource type`; the `?=` form unwraps an `Option`/`Result` resource carrier
+and propagates failure from the enclosing carrier-returning function. Cleanup is
+driven by the resource type's compiler-owned cleanup metadata.
 
 ### Patterns
 
@@ -495,6 +504,7 @@ lambda_body = or_expr | NEWLINE INDENT stmt_list DEDENT ;
 `func` and `pure func` are the canonical lambda spellings used in public
 examples. The parser currently accepts bare `pure (...)` as a compatibility
 spelling for pure lambdas; new code should prefer `pure func(...)`.
+Lambdas do not accept `borrow` parameters.
 
 ### Names
 

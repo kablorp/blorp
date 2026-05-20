@@ -310,6 +310,10 @@ let rec count_uses (name : string) (e : core) : int =
   match e.desc with
   | CVar v when v.vname = name -> 1
   | CLit _ | CVar _ | CVoid | CBreak | CContinue -> 0
+  | CResourceCleanupExit exit ->
+      List.fold_left
+        (fun acc cleanup -> acc + count_uses name cleanup)
+        0 exit.rce_cleanups
   | CBin (_, l, r) | CLog (_, l, r) | CRange (l, r) | CSeq (l, r) ->
       count_uses name l + count_uses name r
   | CUn (_, x) | CCast (x, _) | CUnbox (x, _) | CBox (x, _) -> count_uses name x
@@ -647,6 +651,12 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
   match e.desc with
   | CVar v when v.vname = name -> consume_ownership_use
   | CLit _ | CVar _ | CVoid | CBreak | CContinue -> no_ownership_uses
+  | CResourceCleanupExit exit ->
+      List.fold_left
+        (fun acc cleanup ->
+          seq_ownership_uses acc
+            (summarize_linear_ownership_uses env name cleanup))
+        no_ownership_uses exit.rce_cleanups
   | CBin (_, l, r) | CLog (_, l, r) | CRange (l, r) | CSeq (l, r) ->
       seq_ownership_uses
         (summarize_linear_ownership_uses env name l)

@@ -558,8 +558,18 @@ let type_to_c ~(reg : registry) ty =
               | "Task" -> "blorp_Task*"
               | "Channel" -> "blorp_Channel*"
               | "Stream" -> "blorp_Stream*"
+              | "FallibleStream" | "std/stream::FallibleStream"
+              | "std_stream__FallibleStream" ->
+                  "blorp_FallibleStream*"
               | "TcpListener" -> "blorp_TcpListener*"
               | "TcpStream" -> "blorp_TcpStream*"
+              | "FileReader" | "std/file::FileReader" | "std_file__FileReader"
+                ->
+                  "blorp_FileReader*"
+              | "FileWriter" | "std/file::FileWriter" | "std_file__FileWriter"
+                ->
+                  "blorp_FileWriter*"
+              | "File" | "std/file::File" | "std_file__File" -> "blorp_File*"
               | "Ptr" -> "void*"
               | "ConcurrencyError" -> "blorp_ConcurrencyError*"
               | _ when List.mem name Types.all_int_type_names ->
@@ -585,8 +595,18 @@ let type_to_c ~(reg : registry) ty =
               | "Task" -> "blorp_Task*"
               | "Channel" -> "blorp_Channel*"
               | "Stream" -> "blorp_Stream*"
+              | "FallibleStream" | "std/stream::FallibleStream"
+              | "std_stream__FallibleStream" ->
+                  "blorp_FallibleStream*"
               | "TcpListener" -> "blorp_TcpListener*"
               | "TcpStream" -> "blorp_TcpStream*"
+              | "FileReader" | "std/file::FileReader" | "std_file__FileReader"
+                ->
+                  "blorp_FileReader*"
+              | "FileWriter" | "std/file::FileWriter" | "std_file__FileWriter"
+                ->
+                  "blorp_FileWriter*"
+              | "File" | "std/file::File" | "std_file__File" -> "blorp_File*"
               | _ -> name ^ "*" (* Generic types are pointers *))
           | TyArray _ -> "blorp_Vector*"
           | TyFunc _ -> "blorp_Closure*"

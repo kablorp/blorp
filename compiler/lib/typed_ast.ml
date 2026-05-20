@@ -1024,7 +1024,7 @@ let rec of_ast_decl_with_source ?source_decl ?callable_id_of_func ast_decl =
         let* () = validate_trait_methods trait.trait_methods in
         Ok NonFunctionDecl
     | Ast.DType type_decl ->
-        let* () = validate_variants type_decl.type_variants in
+        let* () = validate_type_decl ast_decl.decl_loc type_decl in
         Ok NonFunctionDecl
     | Ast.DRecord record_decl ->
         let* source_record =
@@ -1059,6 +1059,17 @@ and validate_trait_methods = function
   | method_ :: rest ->
       let* () = validate_trait_method method_ in
       validate_trait_methods rest
+
+and validate_type_decl loc (type_decl : Ast.type_decl) =
+  let* () = validate_variants type_decl.type_variants in
+  match type_decl.type_resource_cleanup with
+  | Some _ when not type_decl.type_is_resource ->
+      invalid_info ~loc ~context:"type declaration metadata"
+        "cleanup metadata is only valid on resource types"
+  | Some _ when not type_decl.type_is_builtin ->
+      invalid_info ~loc ~context:"type declaration metadata"
+        "resource cleanup metadata requires a builtin resource type"
+  | Some _ | None -> Ok ()
 
 and validate_variants = function
   | [] -> Ok ()

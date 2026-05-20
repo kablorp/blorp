@@ -216,6 +216,8 @@ let format_type_alias depth alias =
 
 let decl_label decl =
   match (Typed_ast.decl_ast decl).decl_desc with
+  | Ast.DType t when t.type_is_resource -> "resource type " ^ t.type_name
+  | Ast.DType t when t.type_is_builtin -> "type " ^ t.type_name
   | Ast.DType t -> "union " ^ t.type_name
   | Ast.DRecord r ->
       if r.record_is_value then "struct " ^ r.record_name

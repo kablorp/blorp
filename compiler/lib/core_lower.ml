@@ -77,6 +77,12 @@ let fresh_question_bind_name () =
   s.lower_question_bind_counter <- n + 1;
   Printf.sprintf "__qb_%d" n
 
+let fresh_resource_name () =
+  let s = Session.current () in
+  let n = s.lower_resource_counter in
+  s.lower_resource_counter <- n + 1;
+  Printf.sprintf "__resource_%d" n
+
 let fresh_loop_tuple_name () =
   let s = Session.current () in
   let n = s.lower_destruct_counter in
@@ -87,6 +93,76 @@ let fresh_loop_tuple_name () =
     by tuple-destructure lowering to skip the binding entirely so
     scope-exit cleanup doesn't try to [blorp_release(_)]. *)
 let is_wildcard_name (name : string) : bool = name = "_"
+
+type carrier_kind = CarrierOption | CarrierResult
+
+let carrier_kind_of_type ty =
+  match Codegen_types.normalize_type ty with
+  | Ast.TyNamed ("Option", [ _ ]) -> Some CarrierOption
+  | Ast.TyNamed ("Result", [ _; _ ]) -> Some CarrierResult
+  | _ -> None
+
+let require_carrier_kind ~loc ~hint ~what ty =
+  match carrier_kind_of_type ty with
+  | Some kind -> kind
+  | None ->
+      Core_error.errorf (Core_error.Stage Core_stage.Lower) loc ~hint
+        "cannot classify %s carrier type: %s" what (Types.type_to_string ty)
+
+let carrier_success_type_of_type ty =
+  match Codegen_types.normalize_type ty with
+  | Ast.TyNamed ("Option", [ inner ]) -> Some inner
+  | Ast.TyNamed ("Result", [ ok; _ ]) -> Some ok
+  | _ -> None
+
+let require_carrier_success_type ~loc ~hint ~what ty =
+  match carrier_success_type_of_type ty with
+  | Some success_ty -> success_ty
+  | None ->
+      Core_error.errorf (Core_error.Stage Core_stage.Lower) loc ~hint
+        "cannot classify %s carrier payload type: %s" what
+        (Types.type_to_string ty)
+
+let carrier_success_ctor = function
+  | CarrierOption -> "Some"
+  | CarrierResult -> "Ok"
+
+let carrier_failure_type_of_type ty =
+  match Codegen_types.normalize_type ty with
+  | Ast.TyNamed ("Result", [ _; err ]) -> Some err
+  | _ -> None
+
+let require_carrier_failure_type ~loc ~hint ~what ty =
+  match carrier_failure_type_of_type ty with
+  | Some err_ty -> err_ty
+  | None ->
+      Core_error.errorf (Core_error.Stage Core_stage.Lower) loc ~hint
+        "cannot classify %s carrier error type: %s" what
+        (Types.type_to_string ty)
+
+let carrier_failure_pattern kind failure_name =
+  match kind with
+  | CarrierOption -> Ast.PatConstructor ("None", [])
+  | CarrierResult -> Ast.PatConstructor ("Err", [ Ast.PatVar failure_name ])
+
+let builtin_call ~loc name args ret_ty =
+  let dummy = { Core.desc = CVoid; ty = Ast.TyNamed ("Void", []); loc } in
+  { Core.desc = CCall (CKBuiltin name, dummy, args); ty = ret_ty; loc }
+
+let carrier_failure_expr ~loc ~kind ~carrier_ty ~failure_name ~failure_ty =
+  match kind with
+  | CarrierOption -> builtin_call ~loc "blorp_option_none" [] carrier_ty
+  | CarrierResult ->
+      let err_ref =
+        { Core.desc = CVar (Core.Var.named failure_name); ty = failure_ty; loc }
+      in
+      builtin_call ~loc "blorp_result_err" [ err_ref ] carrier_ty
+
+let resource_cleanup_metadata ty =
+  match Codegen_types.normalize_type ty |> Types.head_resolve with
+  | Ast.TyNamed (name, _) ->
+      Session.find_resource_cleanup (Session.current ()) name
+  | _ -> None
 
 (* ============================================================================
    Type resolution
@@ -581,12 +657,7 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
           "'name ?= expr' must be used as a statement before the expression \
            that returns Option or Result"
         "EQuestionBind reached lowering outside a result-producing block"
-  | TA.EWith _ ->
-      Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
-        ~hint:
-          "resource scopes must be lowered to explicit cleanup Core before \
-           backend emission"
-        "EWith reached core lowering before resource cleanup lowering"
+  | TA.EWith (binding, body) -> lower_with ~loc ~ty binding body
   | TA.EDebugBlock body ->
       let debug_ty = Ast.TyNamed ("Void", []) in
       let body = lower_block ~loc ~ty:debug_ty body in
@@ -838,51 +909,20 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
     early-return node plus scope cleanup. *)
 and lower_question_bind ~block_ty (stmt : TA.expr) (rest : TA.expr list) :
     Core.core =
-  let classify t =
-    match Codegen_types.normalize_type t with
-    | Ast.TyNamed ("Option", _) -> Some `Option
-    | Ast.TyNamed ("Result", _) -> Some `Result
-    | _ -> None
-  in
-  let unwrap_inner rhs_ty =
-    match Codegen_types.normalize_type rhs_ty with
-    | Ast.TyNamed ("Option", [ inner ]) -> inner
-    | Ast.TyNamed ("Result", [ ok; _ ]) -> ok
-    | _ -> rhs_ty
-  in
-  let builtin_call name (args : Core.core list) ret_ty call_loc =
-    let dummy =
-      { Core.desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = call_loc }
-    in
-    {
-      Core.desc = CCall (CKBuiltin name, dummy, args);
-      ty = ret_ty;
-      loc = call_loc;
-    }
-  in
   match typed_expr_desc stmt with
   | TA.EQuestionBind (name, ty_ann, rhs) ->
       let block_kind =
-        match classify block_ty with
-        | Some k -> k
-        | None ->
-            Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc stmt)
-              ~hint:
-                "typechecking should only allow ?= in blocks returning Option \
-                 or Result"
-              "cannot classify ?= block carrier type: %s"
-              (Types.type_to_string block_ty)
+        require_carrier_kind ~loc:(TA.loc stmt)
+          ~hint:
+            "typechecking should only allow ?= in blocks returning Option or \
+             Result"
+          ~what:"?= block" block_ty
       in
       let rhs' = lower_child_expr rhs in
       let node_kind =
-        match classify rhs'.ty with
-        | Some k -> k
-        | None ->
-            Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc rhs)
-              ~hint:
-                "'name ?= expr' requires expr to be Option[T] or Result[T, E]"
-              "cannot classify ?= rhs type: %s"
-              (Types.type_to_string rhs'.ty)
+        require_carrier_kind ~loc:(TA.loc rhs)
+          ~hint:"'name ?= expr' requires expr to be Option[T] or Result[T, E]"
+          ~what:"?= rhs" rhs'.ty
       in
       if node_kind <> block_kind then
         Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc stmt)
@@ -895,25 +935,36 @@ and lower_question_bind ~block_ty (stmt : TA.expr) (rest : TA.expr list) :
         | Some t ->
             require_final_type ~loc:(TA.loc stmt)
               ~context:"?= binding annotation" t
-        | None -> unwrap_inner rhs'.ty
+        | None ->
+            require_carrier_success_type ~loc:(TA.loc rhs)
+              ~hint:
+                "'name ?= expr' requires expr to be Option[T] or Result[T, E]"
+              ~what:"?= rhs" rhs'.ty
       in
       let tmp_name = fresh_question_bind_name () in
       let tmp = Core.Var.named tmp_name in
       let tmp_ref = { Core.desc = CVar tmp; ty = rhs'.ty; loc = TA.loc stmt } in
-      let ctor = match node_kind with `Option -> "Some" | `Result -> "Ok" in
       let success_body = lower_block ~loc:(TA.loc stmt) ~ty:block_ty rest in
-      let fallback_body =
+      let failure_name = fresh_question_bind_name () in
+      let failure_ty =
         match node_kind with
-        | `Option -> builtin_call "blorp_option_none" [] block_ty (TA.loc stmt)
-        | `Result -> { tmp_ref with Core.desc = CDup (tmp, rhs'.ty, tmp_ref) }
+        | CarrierOption -> Ast.TyNamed ("Void", [])
+        | CarrierResult ->
+            require_carrier_failure_type ~loc:(TA.loc rhs)
+              ~hint:
+                "'name ?= expr' requires expr to be Option[T] or Result[T, E]"
+              ~what:"?= rhs" rhs'.ty
+      in
+      let fallback_body =
+        carrier_failure_expr ~loc:(TA.loc stmt) ~kind:node_kind
+          ~carrier_ty:block_ty ~failure_name ~failure_ty
       in
       let arms =
         [
-          (Ast.PatConstructor (ctor, [ Ast.PatVar name ]), success_body);
-          ( (match node_kind with
-            | `Option -> Ast.PatConstructor ("None", [])
-            | `Result -> Ast.PatWildcard),
-            fallback_body );
+          ( Ast.PatConstructor
+              (carrier_success_ctor node_kind, [ Ast.PatVar name ]),
+            success_body );
+          (carrier_failure_pattern node_kind failure_name, fallback_body);
         ]
       in
       let match_expr =
@@ -939,6 +990,166 @@ and lower_question_bind ~block_ty (stmt : TA.expr) (rest : TA.expr list) :
   | _ ->
       Core_error.errorf (Core_error.Stage Core_stage.Lower) (TA.loc stmt)
         "lower_question_bind called on non-EQuestionBind"
+
+and lower_with ~(loc : Ast.loc) ~(ty : Ast.type_expr)
+    (binding : TA.with_binding) (body : TA.expr) : Core.core =
+  let void_ty = Ast.TyNamed ("Void", []) in
+  let resource_ty =
+    match binding.with_type with
+    | Some t ->
+        require_final_type
+          ~loc:(TA.loc binding.with_value)
+          ~context:"with resource binding annotation" t
+    | None -> (
+        match binding.with_kind with
+        | WithPlain -> TA.semantic_type binding.with_value
+        | WithTry ->
+            let value_ty = TA.semantic_type binding.with_value in
+            let _ =
+              require_carrier_kind
+                ~loc:(TA.loc binding.with_value)
+                ~hint:
+                  "typechecking should only allow with ?= on Option or Result \
+                   acquisitions"
+                ~what:"with ?= acquisition" value_ty
+            in
+            require_carrier_success_type
+              ~loc:(TA.loc binding.with_value)
+              ~hint:
+                "typechecking should only allow with ?= on Option or Result \
+                 acquisitions"
+              ~what:"with ?= acquisition" value_ty)
+  in
+  let scoped_name =
+    if is_wildcard_name binding.with_name then fresh_resource_name ()
+    else binding.with_name
+  in
+  let scoped_var = Core.Var.named scoped_name in
+  let cleanup_for var cleanup_loc =
+    let resource_ref =
+      { Core.desc = CVar var; ty = resource_ty; loc = cleanup_loc }
+    in
+    let callee_ty =
+      Ast.TyFunc { params = [ resource_ty ]; return = void_ty; is_pure = false }
+    in
+    match resource_cleanup_metadata resource_ty with
+    | Some (ResourceCleanupBuiltin c_name) ->
+        {
+          Core.desc =
+            CCall
+              ( CKBuiltin c_name,
+                { Core.desc = CVoid; ty = void_ty; loc = cleanup_loc },
+                [ resource_ref ] );
+          ty = void_ty;
+          loc = cleanup_loc;
+        }
+    | None ->
+        let callee =
+          {
+            Core.desc = CVar (Core.Var.named "close");
+            ty = callee_ty;
+            loc = cleanup_loc;
+          }
+        in
+        {
+          Core.desc = CCall (CKUnknown, callee, [ resource_ref ]);
+          ty = void_ty;
+          loc = cleanup_loc;
+        }
+  in
+  let resource_scope acquire =
+    let body' = lower_child_expr body in
+    {
+      Core.desc =
+        CResourceScope
+          {
+            rs_var = scoped_var;
+            rs_ty = resource_ty;
+            rs_acquire = acquire;
+            rs_body = body';
+            rs_cleanup = cleanup_for scoped_var loc;
+          };
+      ty;
+      loc;
+    }
+  in
+  match binding.with_kind with
+  | WithPlain ->
+      let acquire = lower_child_expr binding.with_value in
+      resource_scope acquire
+  | WithTry ->
+      let rhs = lower_child_expr binding.with_value in
+      let node_kind =
+        require_carrier_kind
+          ~loc:(TA.loc binding.with_value)
+          ~hint:
+            "typechecking should only allow with ?= on Option or Result \
+             acquisitions"
+          ~what:"with ?= acquisition" rhs.ty
+      in
+      let block_kind =
+        require_carrier_kind ~loc
+          ~hint:
+            "typechecking should only allow with ?= in blocks returning Option \
+             or Result"
+          ~what:"with ?= result" ty
+      in
+      if node_kind <> block_kind then
+        Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
+          ~hint:
+            "typechecking should reject mixed Option/Result with ?= carriers \
+             before Core lowering"
+          "with ?= carrier kind changed between inference and lowering";
+      let tmp_name = fresh_question_bind_name () in
+      let tmp = Core.Var.named tmp_name in
+      let tmp_ref = { Core.desc = CVar tmp; ty = rhs.ty; loc } in
+      let payload_name = fresh_resource_name () in
+      let payload =
+        {
+          Core.desc = CVar (Core.Var.named payload_name);
+          ty = resource_ty;
+          loc;
+        }
+      in
+      let success_body = resource_scope payload in
+      let failure_name = fresh_question_bind_name () in
+      let failure_ty =
+        match node_kind with
+        | CarrierOption -> Ast.TyNamed ("Void", [])
+        | CarrierResult ->
+            require_carrier_failure_type
+              ~loc:(TA.loc binding.with_value)
+              ~hint:
+                "typechecking should only allow with ?= on Option or Result \
+                 acquisitions"
+              ~what:"with ?= acquisition" rhs.ty
+      in
+      let fallback_body =
+        carrier_failure_expr ~loc ~kind:node_kind ~carrier_ty:ty ~failure_name
+          ~failure_ty
+      in
+      let arms =
+        [
+          ( Ast.PatConstructor
+              (carrier_success_ctor node_kind, [ Ast.PatVar payload_name ]),
+            success_body );
+          (carrier_failure_pattern node_kind failure_name, fallback_body);
+        ]
+      in
+      let match_expr = { Core.desc = CMatchArms (tmp_ref, arms); ty; loc } in
+      {
+        Core.desc =
+          CLet
+            ( {
+                bind_var = tmp;
+                bind_mut = false;
+                bind_ty = rhs.ty;
+                bind_rhs = rhs;
+              },
+              match_expr );
+        ty;
+        loc;
+      }
 
 (** Rewrite [for i in indices(coll): body] into an index-based loop.
 

@@ -188,7 +188,8 @@ let test_type_kind_preserved () =
     empty () |> fun env ->
     add_type env "Message" [] [] ~kind:TypeUnion |> fun env ->
     add_type env "Color" [] [] ~kind:TypeEnum |> fun env ->
-    add_type env "Int" [] [] ~kind:TypeBuiltin
+    add_type env "Int" [] [] ~kind:TypeBuiltin |> fun env ->
+    add_type env "FileReader" [] [] ~kind:TypeResource
   in
   Alcotest.(check bool)
     "union kind" true
@@ -198,7 +199,10 @@ let test_type_kind_preserved () =
     (get_type_kind env "Color" = Some TypeEnum);
   Alcotest.(check bool)
     "builtin kind" true
-    (get_type_kind env "Int" = Some TypeBuiltin)
+    (get_type_kind env "Int" = Some TypeBuiltin);
+  Alcotest.(check bool)
+    "resource kind" true
+    (get_type_kind env "FileReader" = Some TypeResource)
 
 (* ============================================================================
    Records
@@ -1030,6 +1034,7 @@ let test_loop_producer_metadata () =
       ol_param_names = [ None ];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_module_path = Some "test/mod";
       ol_dim_constraints = [];
       ol_loop_producer = Some LoopProducerWindows;
@@ -1040,6 +1045,24 @@ let test_loop_producer_metadata () =
   match get_overloads env "windows" with
   | [ { ol_loop_producer = Some LoopProducerWindows; _ } ] -> ()
   | _ -> Alcotest.fail "expected windows overload loop-producer metadata"
+
+let test_builtin_resource_args_require_explicit_opt_in () =
+  let func_ty = ty_func [ TyVar "T" ] (TyVar "T") in
+  let env = add_func (empty ()) "builtin_identity" func_ty ~origin:Builtin () in
+  (match lookup env "builtin_identity" with
+  | Some { kind = FuncSymbol { resource_args; _ }; _ } ->
+      check_true "builtin defaults reject resource args"
+        (resource_args = RejectResourceArgs)
+  | _ -> Alcotest.fail "expected builtin_identity function");
+  let env =
+    add_func env "borrow_resource" func_ty ~origin:Builtin
+      ~resource_args:(AllowResourceArgs ResourceResultDependent) ()
+  in
+  match lookup env "borrow_resource" with
+  | Some { kind = FuncSymbol { resource_args; _ }; _ } ->
+      check_true "explicit builtin opt-in allows resource args"
+        (resource_args = AllowResourceArgs ResourceResultDependent)
+  | _ -> Alcotest.fail "expected borrow_resource function"
 
 (* ============================================================================
    direct_subst
@@ -1080,6 +1103,7 @@ let test_ufcs_method_add_and_lookup () =
       ol_param_names = [ Some "self"; Some "pred" ];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/list";
       ol_loop_producer = None;
@@ -1124,6 +1148,7 @@ let test_ufcs_method_multiple_types () =
       ol_param_names = [];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/list";
       ol_loop_producer = None;
@@ -1149,6 +1174,7 @@ let test_ufcs_method_multiple_types () =
       ol_param_names = [];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/set";
       ol_loop_producer = None;
@@ -1234,6 +1260,7 @@ let test_format_overload_ref_with_module () =
       ol_param_names = [ None ];
       ol_purity = Pure;
       ol_origin = Builtin;
+      ol_resource_args = RejectResourceArgs;
       ol_module_path = Some "std/list";
       ol_dim_constraints = [];
       ol_loop_producer = None;
@@ -1255,6 +1282,7 @@ let test_format_overload_ref_bare () =
       ol_param_names = [ None ];
       ol_purity = Pure;
       ol_origin = Builtin;
+      ol_resource_args = RejectResourceArgs;
       ol_module_path = None;
       ol_dim_constraints = [];
       ol_loop_producer = None;
@@ -1276,6 +1304,7 @@ let test_format_overload_candidates_multi () =
       ol_param_names = [ None ];
       ol_purity = Pure;
       ol_origin = Builtin;
+      ol_resource_args = RejectResourceArgs;
       ol_module_path = mod_path;
       ol_dim_constraints = [];
       ol_loop_producer = None;
@@ -1333,6 +1362,7 @@ let test_overload_entry_carries_def_id () =
       ol_param_names = [ None ];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_module_path = Some "test/mod";
       ol_dim_constraints = [];
       ol_loop_producer = None;
@@ -1471,6 +1501,7 @@ let make_ufcs_entry ~module_path ~first_param_type ~purity =
     ol_param_names = [ None ];
     ol_purity = purity;
     ol_origin = UserDefined;
+    ol_resource_args = RejectResourceArgs;
     ol_module_path = Some module_path;
     ol_dim_constraints = [];
     ol_loop_producer = None;
@@ -1571,6 +1602,7 @@ let test_ufcs_method_pure_impure_overloads () =
       ol_param_names = [];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/list";
       ol_loop_producer = None;
@@ -1600,6 +1632,7 @@ let test_ufcs_method_pure_impure_overloads () =
       ol_param_names = [];
       ol_purity = Impure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/list";
       ol_loop_producer = None;
@@ -1643,6 +1676,7 @@ let pure_impure_pair_overloads =
       ol_param_names = [];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/list";
       ol_loop_producer = None;
@@ -1672,6 +1706,7 @@ let pure_impure_pair_overloads =
       ol_param_names = [];
       ol_purity = Impure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/list_impure";
       ol_loop_producer = None;
@@ -1743,6 +1778,7 @@ let test_select_rejects_same_head_incompatible_args () =
       ol_param_names = [ Some "data" ];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/stats";
       ol_loop_producer = None;
@@ -1759,6 +1795,7 @@ let test_select_rejects_same_head_incompatible_args () =
       ol_param_names = [ Some "self"; Some "needle" ];
       ol_purity = Pure;
       ol_origin = UserDefined;
+      ol_resource_args = RejectResourceArgs;
       ol_dim_constraints = [];
       ol_module_path = Some "std/string";
       ol_loop_producer = None;
@@ -1833,6 +1870,7 @@ let make_test_overload ~first_param_type =
     ol_param_names = [ None ];
     ol_purity = Pure;
     ol_origin = UserDefined;
+    ol_resource_args = RejectResourceArgs;
     ol_module_path = Some "test/mod";
     ol_dim_constraints = [];
     ol_loop_producer = None;
@@ -1958,6 +1996,8 @@ let suite =
         Alcotest.test_case "builtin detection" `Quick test_is_builtin_func;
         Alcotest.test_case "loop producer metadata" `Quick
           test_loop_producer_metadata;
+        Alcotest.test_case "builtin resource args opt in" `Quick
+          test_builtin_resource_args_require_explicit_opt_in;
       ] );
     ( "function context",
       [ Alcotest.test_case "enter function" `Quick test_enter_function ] );

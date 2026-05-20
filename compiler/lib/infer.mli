@@ -36,6 +36,15 @@ val infer_expr_with_return_annotation :
     generic functions; otherwise the body is inferred without ambient expected
     context and the caller performs the final return-type compatibility check. *)
 
+val type_contains_resource : infer_ctx -> type_expr -> bool
+(** True when the type is or contains a resource type in the current
+    environment. *)
+
+val type_contains_one_shot_stream : Env.env -> type_expr -> bool
+(** True when the type is or contains a Stream/FallibleStream cursor in the
+    current environment. Function values returning streams are producer values,
+    not stream cursor state, and are not considered containing streams. *)
+
 val inferred_binding_type : is_mutable:bool -> type_expr -> type_expr
 (** Convert an inferred initializer type into the binding type stored for an
     unannotated declaration. Mutable bindings widen singleton integer

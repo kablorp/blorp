@@ -23,6 +23,8 @@ let ty_bool = TyNamed ("Bool", [])
 let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
 let ty_test_resource = TyNamed ("TestResource", [])
+let ty_resource_holder = TyNamed ("ResourceHolder", [])
+let ty_resource_box = TyNamed ("ResourceBox", [])
 let ty_list_int = TyNamed ("List", [ ty_int ])
 let ty_concurrency_error = TyNamed ("ConcurrencyError", [])
 let ty_vector_int_4 = TyNamed ("Vector", [ ty_int; TyConstInt 4 ])
@@ -54,16 +56,71 @@ let mk_prog decls : core_program =
 let ty_result ok_ty = TyNamed ("Result", [ ok_ty; ty_concurrency_error ])
 let ty_list elem_ty = TyNamed ("List", [ elem_ty ])
 
-let task_closure ?(name = "_blorp_task_test") ?(def_id = 9000) return_ty =
+let task_closure ?(name = "_blorp_task_test") ?(def_id = 9000) ?(captures = [])
+    return_ty =
   {
     tc_func = name;
     tc_def_id = def_id;
-    tc_captures = [];
+    tc_captures = captures;
     tc_return_ty = return_ty;
   }
 
 let type_alias_decl name target =
   { alias_name = name; alias_type_params = []; alias_target = target }
+
+let resource_type_decl =
+  {
+    type_name = "TestResource";
+    type_params = [];
+    type_variants = [];
+    type_is_enum = false;
+    type_is_builtin = true;
+    type_is_resource = true;
+    type_resource_cleanup = None;
+  }
+
+let resource_holder_record_decl =
+  {
+    record_name = "ResourceHolder";
+    record_type_params = [];
+    record_fields =
+      [
+        {
+          field_name = "handle";
+          field_type = ty_test_resource;
+          field_loc = loc;
+        };
+      ];
+    record_is_value = false;
+    record_is_builtin = false;
+  }
+
+let resource_box_type_decl =
+  {
+    type_name = "ResourceBox";
+    type_params = [];
+    type_variants =
+      [
+        {
+          variant_name = "Box";
+          variant_fields = [ ty_test_resource ];
+          variant_tag = 0;
+          variant_loc = loc;
+          variant_def_id = None;
+        };
+        {
+          variant_name = "Empty";
+          variant_fields = [];
+          variant_tag = 1;
+          variant_loc = loc;
+          variant_def_id = None;
+        };
+      ];
+    type_is_enum = false;
+    type_is_builtin = false;
+    type_is_resource = false;
+    type_resource_cleanup = None;
+  }
 
 let var_with_def_id name id = { (Var.named name) with vdef_id = Some id }
 
@@ -992,6 +1049,76 @@ let test_dispatcher_closure_fires () =
   let violations = Core_invariants.run_for_stage Core_stage.Closure prog in
   Alcotest.(check bool) "closure fires check" true (List.length violations >= 1)
 
+let test_resource_capture_metadata_flags_closure_create () =
+  let closure =
+    mk
+      (CClosureCreate
+         {
+           cc_func = "_blorp_closure_test";
+           cc_def_id = 42;
+           cc_captures = [ ("resource", ty_test_resource) ];
+         })
+      ty_fn_int_int
+  in
+  let prog =
+    mk_prog
+      [
+        CDType resource_type_decl;
+        CDFunc (mk_simple_func ~name:"main" ~body:closure);
+      ]
+  in
+  let violations =
+    Core_invariants.check_no_resource_capture_metadata_at Core_stage.Final prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions resource capture" true
+        (Modules.contains v.Core_error.msg "resource capture")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_capture_metadata_flags_task_capture () =
+  let rhs = cint 1 in
+  let task = task_closure ~captures:[ ("resource", ty_test_resource) ] rhs.ty in
+  let binding =
+    {
+      cb_var = Var.named "answer";
+      cb_ty = ty_result rhs.ty;
+      cb_rhs = rhs;
+      cb_task = Some task;
+    }
+  in
+  let body = mk CVoid ty_void in
+  let node =
+    mk
+      (CConcurrent
+         {
+           conc_bindings = [ binding ];
+           conc_body = body;
+           conc_timeout = None;
+           conc_max_threads = None;
+         })
+      body.ty
+  in
+  let prog =
+    mk_prog
+      [
+        CDType resource_type_decl;
+        CDFunc (mk_simple_func ~name:"main" ~body:node);
+      ]
+  in
+  let violations =
+    Core_invariants.check_no_resource_capture_metadata_at Core_stage.Final prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions resource capture" true
+        (Modules.contains v.Core_error.msg "resource capture")
+  | _ -> Alcotest.fail "unreachable"
+
 (* ============================================================================
    Final Core: concurrency semantic contracts are explicit
    ============================================================================ *)
@@ -1352,23 +1479,37 @@ let test_final_critical_invariants_reject_unprepared_codegen_when_disabled () =
         (Blorp.Modules.contains err.Core_error.msg "CBox")
   | () -> Alcotest.fail "expected final unprepared codegen invariant violation"
 
-let resource_scope ?(acquire_ty = ty_test_resource) ?(body_ty = ty_int)
-    ?(cleanup_ty = ty_void) () =
-  let body =
-    if body_ty = ty_bool then mk (CLit (LitBool true)) ty_bool else cint 7
+let resource_cleanup_call ?(call_kind = CKUser ("close", None))
+    ?(resource_var = Var.named "resource") ?(resource_ty = ty_test_resource) ()
+    =
+  let close_ty =
+    TyFunc { params = [ resource_ty ]; return = ty_void; is_pure = false }
   in
+  let close = mk (CVar (Var.named "close")) close_ty in
+  let arg = mk (CVar resource_var) resource_ty in
+  mk_call call_kind close [ arg ] ty_void
+
+let resource_scope ?(acquire_ty = ty_test_resource) ?(body_ty = ty_int) ?body
+    ?cleanup () =
+  let body =
+    match body with
+    | Some body -> body
+    | None ->
+        if body_ty = ty_bool then mk (CLit (LitBool true)) ty_bool else cint 7
+  in
+  let resource_var = Var.named "resource" in
   mk
     (CResourceScope
        {
-         rs_var = Var.named "resource";
+         rs_var = resource_var;
          rs_ty = ty_test_resource;
          rs_acquire = mk (CVar (Var.named "open_resource")) acquire_ty;
          rs_body = body;
          rs_cleanup =
-           (if cleanup_ty = ty_void then mk CVoid ty_void
-            else mk (CLit (LitInt 0L)) cleanup_ty);
+           Option.value cleanup
+             ~default:(resource_cleanup_call ~resource_var ());
        })
-    body_ty
+    body.ty
 
 let test_resource_scope_contract_accepts_well_formed () =
   let prog =
@@ -1400,12 +1541,31 @@ let test_resource_scope_contract_flags_acquire_type_mismatch () =
   | _ -> Alcotest.fail "unreachable"
 
 let test_resource_scope_contract_flags_cleanup_type_mismatch () =
+  let cleanup = mk (CLit (LitInt 0L)) ty_int in
+  let prog =
+    mk_prog
+      [
+        CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ~cleanup ()));
+      ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | v :: _ ->
+      Alcotest.(check bool)
+        "mentions cleanup type" true
+        (Modules.contains v.Core_error.msg "resource cleanup type")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_contract_flags_cleanup_not_direct_call () =
   let prog =
     mk_prog
       [
         CDFunc
           (mk_simple_func ~name:"main"
-             ~body:(resource_scope ~cleanup_ty:ty_int ()));
+             ~body:(resource_scope ~cleanup:(mk CVoid ty_void) ()));
       ]
   in
   let violations =
@@ -1415,8 +1575,30 @@ let test_resource_scope_contract_flags_cleanup_type_mismatch () =
   match violations with
   | [ v ] ->
       Alcotest.(check bool)
-        "mentions cleanup type" true
-        (Modules.contains v.Core_error.msg "resource cleanup type")
+        "mentions cleanup call" true
+        (Modules.contains v.Core_error.msg
+           "resource cleanup must be a direct call")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_contract_flags_cleanup_wrong_arg () =
+  let cleanup =
+    resource_cleanup_call ~resource_var:(Var.named "other_resource") ()
+  in
+  let prog =
+    mk_prog
+      [
+        CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ~cleanup ()));
+      ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions cleanup argument" true
+        (Modules.contains v.Core_error.msg "resource cleanup argument")
   | _ -> Alcotest.fail "unreachable"
 
 let test_resource_scope_contract_flags_body_result_mismatch () =
@@ -1434,8 +1616,83 @@ let test_resource_scope_contract_flags_body_result_mismatch () =
         (Modules.contains v.Core_error.msg "resource body type")
   | _ -> Alcotest.fail "unreachable"
 
-let test_final_critical_invariants_reject_resource_scope_when_disabled () =
-  let bad_prog =
+let test_resource_scope_contract_flags_resource_escape_result () =
+  let resource_var = Var.named "resource" in
+  let body = mk (CVar resource_var) ty_test_resource in
+  let node =
+    mk
+      (CResourceScope
+         {
+           rs_var = resource_var;
+           rs_ty = ty_test_resource;
+           rs_acquire = mk (CVar (Var.named "open_resource")) ty_test_resource;
+           rs_body = body;
+           rs_cleanup = resource_cleanup_call ~resource_var ();
+         })
+      ty_test_resource
+  in
+  let prog =
+    mk_prog
+      [
+        CDType resource_type_decl;
+        CDFunc (mk_simple_func ~name:"main" ~body:node);
+      ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions resource result" true
+        (Modules.contains v.Core_error.msg "resource scope body")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_contract_flags_record_resource_result () =
+  let body = mk (CVar (Var.named "holder")) ty_resource_holder in
+  let prog =
+    mk_prog
+      [
+        CDType resource_type_decl;
+        CDRecord resource_holder_record_decl;
+        CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ~body ()));
+      ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions resource result" true
+        (Modules.contains v.Core_error.msg "resource scope body")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_contract_flags_union_resource_result () =
+  let body = mk (CVar (Var.named "box")) ty_resource_box in
+  let prog =
+    mk_prog
+      [
+        CDType resource_type_decl;
+        CDType resource_box_type_decl;
+        CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ~body ()));
+      ]
+  in
+  let violations =
+    Core_invariants.check_resource_scope_contracts_at Core_stage.Lower prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions resource result" true
+        (Modules.contains v.Core_error.msg "resource scope body")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_final_critical_invariants_allow_resource_scope_when_disabled () =
+  let prog =
     mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:(resource_scope ())) ]
   in
   let user_fired = ref false in
@@ -1443,13 +1700,127 @@ let test_final_critical_invariants_reject_resource_scope_when_disabled () =
   let hook =
     Core_pipeline.make_stage_hook ~check_invariants:false ~user:user_cb
   in
-  match hook Core_stage.Final bad_prog with
-  | exception Core_error.Core_error err ->
-      Alcotest.(check bool) "user callback skipped" false !user_fired;
+  hook Core_stage.Final prog;
+  Alcotest.(check bool) "user callback fired" true !user_fired
+
+let test_resource_scope_final_rejects_nonlocal_break_body () =
+  let prog =
+    mk_prog
+      [
+        CDFunc
+          (mk_simple_func ~name:"main"
+             ~body:(resource_scope ~body:(mk CBreak ty_void) ()));
+      ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
       Alcotest.(check bool)
-        "msg mentions CResourceScope" true
-        (Blorp.Modules.contains err.Core_error.msg "CResourceScope")
-  | () -> Alcotest.fail "expected final resource-scope invariant violation"
+        "mentions nonlocal control flow" true
+        (Modules.contains v.Core_error.msg
+           "resource scope body contains nonlocal control flow")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_final_rejects_nonlocal_continue_body () =
+  let prog =
+    mk_prog
+      [
+        CDFunc
+          (mk_simple_func ~name:"main"
+             ~body:(resource_scope ~body:(mk CContinue ty_void) ()));
+      ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions nonlocal control flow" true
+        (Modules.contains v.Core_error.msg
+           "resource scope body contains nonlocal control flow")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_final_allows_rewritten_nonlocal_break () =
+  let cleanup_exit =
+    mk
+      (CResourceCleanupExit
+         {
+           rce_cleanups =
+             [ resource_cleanup_call ~resource_var:(Var.named "resource") () ];
+           rce_exit = ResourceBreak;
+         })
+      ty_void
+  in
+  let prog =
+    mk_prog
+      [
+        CDFunc
+          (mk_simple_func ~name:"main"
+             ~body:(resource_scope ~body:cleanup_exit ()));
+      ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "no violations" 0 (List.length violations)
+
+let test_resource_cleanup_exit_final_rejects_empty_cleanup_stack () =
+  let cleanup_exit =
+    mk
+      (CResourceCleanupExit { rce_cleanups = []; rce_exit = ResourceBreak })
+      ty_void
+  in
+  let prog =
+    mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:cleanup_exit) ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions cleanup actions" true
+        (Modules.contains v.Core_error.msg "no cleanup actions")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_cleanup_exit_final_rejects_nonvoid_cleanup () =
+  let cleanup_exit =
+    mk
+      (CResourceCleanupExit
+         {
+           rce_cleanups = [ mk (CLit (LitInt 0L)) ty_int ];
+           rce_exit = ResourceBreak;
+         })
+      ty_void
+  in
+  let prog =
+    mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:cleanup_exit) ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions non-Void cleanup" true
+        (Modules.contains v.Core_error.msg "non-Void cleanup action")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_scope_final_allows_loop_local_break_continue () =
+  let loop_body =
+    mk
+      (CWhile
+         ( mk (CLit (LitBool true)) ty_bool,
+           mk (CSeq (mk CContinue ty_void, mk CBreak ty_void)) ty_void ))
+      ty_void
+  in
+  let prog =
+    mk_prog
+      [
+        CDFunc
+          (mk_simple_func ~name:"main"
+             ~body:(resource_scope ~body:loop_body ()));
+      ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "no violations" 0 (List.length violations)
 
 let test_final_rejects_unboxed_void_slot_builtin_arg () =
   let dict = mk (CVar (Var.named "d")) ty_dict_int_int in
@@ -1741,6 +2112,10 @@ let suite =
           test_closure_check_flags_raw_clambda;
         Alcotest.test_case "flags missing detach task metadata" `Quick
           test_closure_check_flags_missing_detach_task;
+        Alcotest.test_case "flags resource closure capture metadata" `Quick
+          test_resource_capture_metadata_flags_closure_create;
+        Alcotest.test_case "flags resource task capture metadata" `Quick
+          test_resource_capture_metadata_flags_task_capture;
       ] );
     ( "concurrency_semantics",
       [
@@ -1787,10 +2162,32 @@ let suite =
           test_resource_scope_contract_flags_acquire_type_mismatch;
         Alcotest.test_case "resource scope flags cleanup type mismatch" `Quick
           test_resource_scope_contract_flags_cleanup_type_mismatch;
+        Alcotest.test_case "resource scope flags cleanup non-call" `Quick
+          test_resource_scope_contract_flags_cleanup_not_direct_call;
+        Alcotest.test_case "resource scope flags cleanup wrong arg" `Quick
+          test_resource_scope_contract_flags_cleanup_wrong_arg;
         Alcotest.test_case "resource scope flags body type mismatch" `Quick
           test_resource_scope_contract_flags_body_result_mismatch;
-        Alcotest.test_case "final critical rejects resource scope" `Quick
-          test_final_critical_invariants_reject_resource_scope_when_disabled;
+        Alcotest.test_case "resource scope flags body resource result" `Quick
+          test_resource_scope_contract_flags_resource_escape_result;
+        Alcotest.test_case "resource scope flags record resource result" `Quick
+          test_resource_scope_contract_flags_record_resource_result;
+        Alcotest.test_case "resource scope flags union resource result" `Quick
+          test_resource_scope_contract_flags_union_resource_result;
+        Alcotest.test_case "final critical allows resource scope" `Quick
+          test_final_critical_invariants_allow_resource_scope_when_disabled;
+        Alcotest.test_case "resource scope rejects nonlocal break" `Quick
+          test_resource_scope_final_rejects_nonlocal_break_body;
+        Alcotest.test_case "resource scope rejects nonlocal continue" `Quick
+          test_resource_scope_final_rejects_nonlocal_continue_body;
+        Alcotest.test_case "resource scope allows rewritten nonlocal break"
+          `Quick test_resource_scope_final_allows_rewritten_nonlocal_break;
+        Alcotest.test_case "resource cleanup exit rejects empty cleanup stack"
+          `Quick test_resource_cleanup_exit_final_rejects_empty_cleanup_stack;
+        Alcotest.test_case "resource cleanup exit rejects non-Void cleanup"
+          `Quick test_resource_cleanup_exit_final_rejects_nonvoid_cleanup;
+        Alcotest.test_case "resource scope allows loop-local break/continue"
+          `Quick test_resource_scope_final_allows_loop_local_break_continue;
         Alcotest.test_case "final rejects unboxed void-slot builtin arg" `Quick
           test_final_rejects_unboxed_void_slot_builtin_arg;
         Alcotest.test_case "final accepts explicit void-slot builtin boxes"

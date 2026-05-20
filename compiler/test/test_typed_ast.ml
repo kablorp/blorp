@@ -42,6 +42,7 @@ let param ?(ty = Some ty_int) name =
     param_name = Some name;
     param_pattern = None;
     param_type = ty;
+    param_passing = ParamByValue;
     param_loc = dummy_loc;
   }
 
@@ -57,7 +58,20 @@ let func_decl ?(params = [ param "x" ]) ?(return_ty = Some ty_int)
     func_is_tailrec = false;
     func_no_copy = false;
     func_debug_only = false;
+    func_resource_result_ordinary = false;
     func_dim_constraints = [];
+  }
+
+let type_decl ?(is_builtin = true) ?(is_resource = true) ?resource_cleanup name
+    =
+  {
+    type_name = name;
+    type_params = [];
+    type_variants = [];
+    type_is_enum = false;
+    type_is_builtin = is_builtin;
+    type_is_resource = is_resource;
+    type_resource_cleanup = resource_cleanup;
   }
 
 let decl desc = { decl_desc = desc; decl_loc = dummy_loc; decl_doc = None }
@@ -591,6 +605,19 @@ let test_decl_rejects_meta_global_annotation () =
   | Ok _ -> Alcotest.fail "expected unfinalized global annotation"
   | Error _ -> Alcotest.fail "expected unfinalized type"
 
+let test_decl_rejects_cleanup_metadata_on_non_resource_type () =
+  let t =
+    type_decl ~is_resource:false
+      ~resource_cleanup:(ResourceCleanupBuiltin "close_widget") "Widget"
+  in
+  match Blorp.Typed_ast.of_ast_decl (decl (DType t)) with
+  | Error (Blorp.Typed_ast.InvalidTypeInfo { message; _ }) ->
+      Alcotest.(check string)
+        "message retained" "cleanup metadata is only valid on resource types"
+        message
+  | Ok _ -> Alcotest.fail "expected invalid type metadata"
+  | Error _ -> Alcotest.fail "expected invalid type metadata"
+
 let test_expr_rejects_meta_loop_view_element_type () =
   let source = expr_with_type (TyArray (ty_int, [ TyConstInt 4 ])) in
   let loop_view =
@@ -713,6 +740,8 @@ let suite =
           test_impl_decl_exposes_typed_methods;
         Alcotest.test_case "rejects meta global annotation" `Quick
           test_decl_rejects_meta_global_annotation;
+        Alcotest.test_case "rejects resource cleanup on non-resource type"
+          `Quick test_decl_rejects_cleanup_metadata_on_non_resource_type;
         Alcotest.test_case "rejects meta loop view element type" `Quick
           test_expr_rejects_meta_loop_view_element_type;
       ] );

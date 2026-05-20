@@ -23,15 +23,18 @@
     - [check_no_cmatcharms] — ENABLED (post-match, bookended at Perceus and Final)
     - [check_no_codegen_unprepared_forms] — ENABLED (Final)
     - [check_resource_scope_contracts_at] — ENABLED (Perceus and Final)
-    - [check_no_unemitted_resource_scopes_at] — ENABLED (Final)
+    - [check_resource_scope_nonlocal_exits_at] — ENABLED (Final)
+    - [check_resource_cleanup_exits_at] — ENABLED (Final)
     - [check_void_boxed_builtin_args_explicit] — ENABLED (Final)
     - [check_no_raw_top_level_function_refs] — ENABLED (Final)
+    - [check_no_resource_capture_metadata_at] — ENABLED (Closure and Final)
     - [check_concurrent_semantics_at] — ENABLED (Final)
 
     Add new checks only after verifying no false positives across [std/]
     and [tests/]. *)
 
 module StringSet = Set.Make (String)
+module StringMap = Map.Make (String)
 module IntSet = Set.Make (Int)
 
 (** Walk every expression in a [core_program]. Visits:
@@ -260,6 +263,24 @@ let registry_for_program (prog : Core.core_program) : Codegen_types.registry =
   Core_flatten.register_types reg prog;
   reg
 
+(** Resource-safety invariants only need alias expansion. Avoid the full codegen
+    layout registry here so malformed resource-containing aggregates produce
+    invariant violations instead of raising while destructor layouts are being
+    classified. *)
+let alias_registry_for_program (prog : Core.core_program) :
+    Codegen_types.registry =
+  let reg = Codegen_types.create_registry () in
+  let rec register_decl d =
+    match d.Core.cd_desc with
+    | Core.CDTypeAlias a ->
+        Hashtbl.replace reg.type_aliases a.alias_name
+          (Ast.type_param_names a.alias_type_params, a.alias_target)
+    | Core.CDPrivate inner -> register_decl inner
+    | _ -> ()
+  in
+  List.iter register_decl prog;
+  reg
+
 let invariant_normalize_type ~(reg : Codegen_types.registry) ty =
   Codegen_types.expand_alias ~reg ty |> Codegen_types.normalize_type
 
@@ -268,10 +289,136 @@ let invariant_types_equal ~(reg : Codegen_types.registry) a b =
     (invariant_normalize_type ~reg a)
     (invariant_normalize_type ~reg b)
 
+let declared_resource_type_names_for_program (prog : Core.core_program) =
+  let rec add_decl acc (d : Core.core_decl) =
+    match d.cd_desc with
+    | Core.CDType t when t.type_is_resource -> StringSet.add t.type_name acc
+    | Core.CDPrivate inner -> add_decl acc inner
+    | _ -> acc
+  in
+  List.fold_left add_decl StringSet.empty prog
+
+let resource_type_names_for_scope ~reg resource_names scope_ty =
+  match invariant_normalize_type ~reg scope_ty |> Types.head_resolve with
+  | Ast.TyNamed (name, _) -> StringSet.add name resource_names
+  | _ -> resource_names
+
+let resource_type_names_for_program ~reg (prog : Core.core_program) =
+  fold_program
+    (fun acc e ->
+      match e.Core.desc with
+      | Core.CResourceScope s -> resource_type_names_for_scope ~reg acc s.rs_ty
+      | _ -> acc)
+    (declared_resource_type_names_for_program prog)
+    prog
+
+let aggregate_components_for_program (prog : Core.core_program) =
+  let add name type_params component_types acc =
+    StringMap.add name (Ast.type_param_names type_params, component_types) acc
+  in
+  let rec add_decl acc d =
+    match d.Core.cd_desc with
+    | Core.CDRecord r ->
+        add r.record_name r.record_type_params
+          (List.map (fun f -> f.Ast.field_type) r.record_fields)
+          acc
+    | Core.CDType t ->
+        add t.type_name t.type_params
+          (List.concat_map (fun v -> v.Ast.variant_fields) t.type_variants)
+          acc
+    | Core.CDPrivate inner -> add_decl acc inner
+    | _ -> acc
+  in
+  List.fold_left add_decl StringMap.empty prog
+
+let type_contains_resource_named ~reg ~resource_names ~aggregate_components ty =
+  let apply_named_subst type_params args tys =
+    let subst =
+      if List.length type_params = List.length args then
+        List.map2
+          (fun var_name concrete_type -> { Types.var_name; concrete_type })
+          type_params args
+      else []
+    in
+    List.map (Types.apply_subst subst) tys
+  in
+  let component_types name args =
+    match StringMap.find_opt name aggregate_components with
+    | Some (type_params, tys) -> apply_named_subst type_params args tys
+    | None -> []
+  in
+  let rec go visited ty =
+    let ty = invariant_normalize_type ~reg ty |> Types.head_resolve in
+    match ty with
+    | Ast.TyNamed (name, args) ->
+        StringSet.mem name resource_names
+        || List.exists (go visited) args
+        ||
+        if StringSet.mem name visited then false
+        else
+          component_types name args
+          |> List.exists (go (StringSet.add name visited))
+    | Ast.TyArray (elem, dims) ->
+        go visited elem || List.exists (go visited) dims
+    | Ast.TyFunc { params; return; _ } ->
+        List.exists (go visited) params || go visited return
+    | Ast.TyTuple elems -> List.exists (go visited) elems
+    | Ast.TyRange inner -> go visited inner
+    | Ast.TyDimOp (_, left, right) -> go visited left || go visited right
+    | Ast.TyBoundVar _ | Ast.TyConstInt _ | Ast.TyMeta _ | Ast.TySelf
+    | Ast.TyVar _ | Ast.TyVarDims _ ->
+        false
+  in
+  go StringSet.empty ty
+
 let check_resource_scope_contracts_at (stage : Core_stage.t)
     (prog : Core.core_program) : Core_error.t list =
-  let reg = registry_for_program prog in
+  let reg = alias_registry_for_program prog in
   let ty_void = Ast.TyNamed ("Void", []) in
+  let program_resource_names = resource_type_names_for_program ~reg prog in
+  let aggregate_components = aggregate_components_for_program prog in
+  let check_cleanup_shape s acc =
+    if not (invariant_types_equal ~reg s.Core.rs_cleanup.ty ty_void) then acc
+    else
+      match s.rs_cleanup.desc with
+      | Core.CCall (_, _, [ { Core.desc = Core.CVar arg_var; ty = arg_ty; _ } ])
+        ->
+          if
+            Core.Var.equal arg_var s.rs_var
+            && invariant_types_equal ~reg arg_ty s.rs_ty
+          then acc
+          else
+            violation_at stage s.rs_cleanup.loc
+              ~hint:
+                "A resource cleanup edge must finalize the scoped resource \
+                 bound by this CResourceScope, not an outer or unrelated \
+                 value."
+              (Printf.sprintf
+                 "resource cleanup argument `%s: %s` should be scoped resource \
+                  `%s: %s`"
+                 (Core.Var.to_string arg_var)
+                 (Types.type_to_string arg_ty)
+                 (Core.Var.to_string s.rs_var)
+                 (Types.type_to_string s.rs_ty))
+            :: acc
+      | Core.CCall (_, _, args) ->
+          violation_at stage s.rs_cleanup.loc
+            ~hint:
+              "Keep resource cleanup as one finalizer call whose only argument \
+               is the scoped resource binding."
+            (Printf.sprintf
+               "resource cleanup call should take exactly one scoped resource \
+                argument, got %d"
+               (List.length args))
+          :: acc
+      | _ ->
+          violation_at stage s.rs_cleanup.loc
+            ~hint:
+              "Keep cleanup as an explicit finalizer call so later cleanup \
+               lowering has exactly one operation to emit."
+            "resource cleanup must be a direct call on the scoped resource"
+          :: acc
+  in
   fold_program
     (fun acc e ->
       match e.Core.desc with
@@ -305,33 +452,153 @@ let check_resource_scope_contracts_at (stage : Core_stage.t)
                    (Types.type_to_string e.Core.ty))
               :: acc
           in
-          if invariant_types_equal ~reg s.rs_cleanup.ty ty_void then acc
-          else
-            violation_at stage s.rs_cleanup.loc
-              ~hint:
-                "Resource cleanup is a side-effecting finalizer and must \
-                 return Void. The scope result comes only from the body."
-              (Printf.sprintf "resource cleanup type `%s` should be Void"
-                 (Types.type_to_string s.rs_cleanup.ty))
-            :: acc
+          let acc =
+            let resource_names =
+              resource_type_names_for_scope ~reg program_resource_names s.rs_ty
+            in
+            if
+              type_contains_resource_named ~reg ~resource_names
+                ~aggregate_components s.rs_body.ty
+            then
+              violation_at stage s.rs_body.loc
+                ~hint:
+                  "A resource scope may use the scoped capability internally, \
+                   but its result must be ordinary data. Return data read from \
+                   the resource, not the resource or a value containing it."
+                (Printf.sprintf
+                   "resource scope body type `%s` must not contain a resource \
+                    type"
+                   (Types.type_to_string s.rs_body.ty))
+              :: acc
+            else acc
+          in
+          let acc =
+            if invariant_types_equal ~reg s.rs_cleanup.ty ty_void then acc
+            else
+              violation_at stage s.rs_cleanup.loc
+                ~hint:
+                  "Resource cleanup is a side-effecting finalizer and must \
+                   return Void. The scope result comes only from the body."
+                (Printf.sprintf "resource cleanup type `%s` should be Void"
+                   (Types.type_to_string s.rs_cleanup.ty))
+              :: acc
+          in
+          check_cleanup_shape s acc
       | _ -> acc)
     [] prog
   |> List.rev
 
-let check_no_unemitted_resource_scopes_at (stage : Core_stage.t)
+let rec resource_scope_body_contains_nonlocal_exit (body : Core.core) : bool =
+  let any_child e =
+    Core.fold_immediate_children
+      (fun found child ->
+        found || resource_scope_body_contains_nonlocal_exit child)
+      false e
+  in
+  match body.Core.desc with
+  | Core.CBreak | Core.CContinue -> true
+  | Core.CResourceCleanupExit _ -> false
+  | Core.CWhile (cond, _) -> resource_scope_body_contains_nonlocal_exit cond
+  | Core.CFor (_, iter, _) -> resource_scope_body_contains_nonlocal_exit iter
+  | Core.CTailrecLoop _ -> false
+  | Core.CMatch (scrutinee, tree) ->
+      resource_scope_body_contains_nonlocal_exit scrutinee
+      || resource_scope_ctree_contains_nonlocal_exit tree
+  | Core.CMatchArms (scrutinee, arms) ->
+      resource_scope_body_contains_nonlocal_exit scrutinee
+      || List.exists
+           (fun (_, arm_body) ->
+             resource_scope_body_contains_nonlocal_exit arm_body)
+           arms
+  | _ -> any_child body
+
+and resource_scope_ctree_contains_nonlocal_exit (tree : Core.ctree) : bool =
+  match tree with
+  | Core.CTLeaf { ct_body; _ } ->
+      resource_scope_body_contains_nonlocal_exit ct_body
+  | Core.CTFail -> false
+  | Core.CTSwitchTag { cts_cases; cts_default; _ } ->
+      List.exists
+        (fun (_, subtree) ->
+          resource_scope_ctree_contains_nonlocal_exit subtree)
+        cts_cases
+      || Option.fold ~none:false
+           ~some:resource_scope_ctree_contains_nonlocal_exit cts_default
+  | Core.CTSwitchLit { ctl_cases; ctl_default; _ } ->
+      List.exists
+        (fun (_, subtree) ->
+          resource_scope_ctree_contains_nonlocal_exit subtree)
+        ctl_cases
+      || resource_scope_ctree_contains_nonlocal_exit ctl_default
+  | Core.CTSwitchLen { ctl_len_cases; ctl_len_geq; ctl_len_default; _ } ->
+      List.exists
+        (fun (_, subtree) ->
+          resource_scope_ctree_contains_nonlocal_exit subtree)
+        ctl_len_cases
+      || (match ctl_len_geq with
+        | Some (_, subtree) ->
+            resource_scope_ctree_contains_nonlocal_exit subtree
+        | None -> false)
+      || Option.fold ~none:false
+           ~some:resource_scope_ctree_contains_nonlocal_exit ctl_len_default
+
+let check_resource_scope_nonlocal_exits_at (stage : Core_stage.t)
     (prog : Core.core_program) : Core_error.t list =
   fold_program
     (fun acc e ->
       match e.Core.desc with
-      | Core.CResourceScope _ ->
+      | Core.CResourceScope s
+        when resource_scope_body_contains_nonlocal_exit s.rs_body ->
           violation_at stage e.loc
             ~hint:
-              "CResourceScope is the explicit cleanup-scope IR. Keep it out of \
-               final Core until the backend can emit exactly-once cleanup on \
-               normal and nonlocal exits."
-            "CResourceScope reached final Core before cleanup emission is \
-             implemented"
+              "Normal resource-scope completion is emitted directly. Break and \
+               continue need explicit cleanup-edge rewriting before they can \
+               be allowed through a resource scope."
+            "resource scope body contains nonlocal control flow before cleanup \
+             rewriting"
           :: acc
+      | _ -> acc)
+    [] prog
+  |> List.rev
+
+let check_resource_cleanup_exits_at (stage : Core_stage.t)
+    (prog : Core.core_program) : Core_error.t list =
+  let ty_void = Ast.TyNamed ("Void", []) in
+  fold_program
+    (fun acc e ->
+      match e.Core.desc with
+      | Core.CResourceCleanupExit exit ->
+          let acc =
+            if exit.rce_cleanups = [] then
+              violation_at stage e.loc
+                ~hint:
+                  "Only resource exits that leave at least one active resource \
+                   scope need cleanup-edge rewriting."
+                "resource cleanup exit has no cleanup actions"
+              :: acc
+            else acc
+          in
+          let acc =
+            if not (Types.types_equal e.ty ty_void) then
+              violation_at stage e.loc
+                ~hint:
+                  "A cleanup exit is statement-like control flow and must not \
+                   produce a value."
+                "resource cleanup exit should have type Void"
+              :: acc
+            else acc
+          in
+          List.fold_left
+            (fun acc cleanup ->
+              if Types.types_equal cleanup.Core.ty ty_void then acc
+              else
+                violation_at stage cleanup.loc
+                  ~hint:
+                    "Cleanup actions must be explicit Void-returning finalizer \
+                     calls."
+                  "resource cleanup exit contains non-Void cleanup action"
+                :: acc)
+            acc exit.rce_cleanups
       | _ -> acc)
     [] prog
   |> List.rev
@@ -926,6 +1193,75 @@ let check_no_preclosure_forms (prog : Core.core_program) : Core_error.t list =
               v :: acc)
       | _ -> acc)
     [] prog
+  |> List.rev
+
+let check_no_resource_capture_metadata_at (stage : Core_stage.t)
+    (prog : Core.core_program) : Core_error.t list =
+  let reg = alias_registry_for_program prog in
+  let resource_names = resource_type_names_for_program ~reg prog in
+  let aggregate_components = aggregate_components_for_program prog in
+  let resource_capture_violation loc ~context name ty =
+    violation_at stage loc
+      ~hint:
+        "Core_closure must not encode scoped resources in closure or task \
+         capture metadata. Keep resource use inside its with scope, or capture \
+         ordinary data read from the resource instead."
+      (Printf.sprintf "resource capture `%s: %s` reached %s metadata" name
+         (Types.type_to_string ty) context)
+  in
+  let check_captures loc ~context captures acc =
+    List.fold_left
+      (fun acc (name, ty) ->
+        if
+          type_contains_resource_named ~reg ~resource_names
+            ~aggregate_components ty
+        then resource_capture_violation loc ~context name ty :: acc
+        else acc)
+      acc captures
+  in
+  let check_task loc ~context task_opt acc =
+    match task_opt with
+    | Some task -> check_captures loc ~context task.Core.tc_captures acc
+    | None -> acc
+  in
+  let check_func acc (f : Core.core_func) =
+    match f.cf_kind with
+    | Core.CFClosureBody abi ->
+        let loc =
+          match f.cf_body with Some body -> body.loc | None -> Ast.dummy_loc
+        in
+        check_captures loc ~context:"closure ABI" abi.ca_captures acc
+    | Core.CFUser | Core.CFBuiltin | Core.CFForeign _ -> acc
+  in
+  let rec visit_decl acc (d : Core.core_decl) =
+    match d.cd_desc with
+    | Core.CDFunc f -> check_func acc f
+    | Core.CDImpl i -> List.fold_left check_func acc i.ci_methods
+    | Core.CDPrivate inner -> visit_decl acc inner
+    | Core.CDType _ | Core.CDRecord _ | Core.CDImport _ | Core.CDTypeAlias _
+    | Core.CDVar _ | Core.CDTrait _ ->
+        acc
+  in
+  let acc = List.fold_left visit_decl [] prog in
+  fold_program
+    (fun acc e ->
+      match e.Core.desc with
+      | Core.CClosureCreate cc ->
+          check_captures e.loc ~context:"closure creation" cc.cc_captures acc
+      | Core.CConcurrent block ->
+          List.fold_left
+            (fun acc (b : Core.conc_binding) ->
+              check_task b.cb_rhs.loc ~context:"concurrent binding task"
+                b.cb_task acc)
+            acc block.conc_bindings
+      | Core.CConcurrentFor cf ->
+          check_task cf.cf_body.loc ~context:"concurrent-for task" cf.cf_task
+            acc
+      | Core.CDetach detach ->
+          check_task detach.detach_body.loc ~context:"detach task"
+            detach.detach_task acc
+      | _ -> acc)
+    acc prog
   |> List.rev
 
 (* ============================================================================
@@ -1608,7 +1944,9 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_raw_tensor_views_at stage prog (* bookend *)
       @ check_call_ownership_contracts_at stage prog
       @ check_resource_scope_contracts_at stage prog
-  | Core_stage.Closure -> check_no_preclosure_forms prog
+  | Core_stage.Closure ->
+      check_no_preclosure_forms prog
+      @ check_no_resource_capture_metadata_at stage prog
   | Core_stage.Final ->
       check_no_debug_blocks_at stage prog
       @ check_no_sugar prog @ check_no_cmatcharms prog
@@ -1618,13 +1956,15 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_void_boxed_builtin_args_explicit_at stage prog
       @ check_no_raw_top_level_function_refs_at stage prog
       @ check_no_preclosure_forms prog
+      @ check_no_resource_capture_metadata_at stage prog
       @ check_raw_tensor_views_at stage prog
       @ check_no_unguarded_raw_tensor_gets_at stage prog
       @ check_no_raw_string_byte_intrinsics_at stage prog
       @ check_tensor_literal_layouts_at stage prog
       @ check_tensor_loop_storage_provenance_at stage prog
       @ check_resource_scope_contracts_at stage prog
-      @ check_no_unemitted_resource_scopes_at stage prog
+      @ check_resource_scope_nonlocal_exits_at stage prog
+      @ check_resource_cleanup_exits_at stage prog
       @ check_concurrent_semantics_at stage prog
   (* No invariants drafted for these stages yet: *)
   | Core_stage.Lower | Core_stage.Synth | Core_stage.TraitResolve

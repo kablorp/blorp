@@ -323,6 +323,8 @@ let test_managed_union () =
         ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog = [ { cd_desc = CDType type_decl; cd_loc = loc; cd_doc = None } ] in
@@ -350,6 +352,8 @@ let test_user_union_destructor_policy_registered () =
       type_variants = [ variant "Value" fields ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let decl t = { cd_desc = CDType t; cd_loc = loc; cd_doc = None } in
@@ -398,6 +402,8 @@ let test_not_managed_enum () =
         ];
       type_is_enum = true;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let prog = [ { cd_desc = CDType type_decl; cd_loc = loc; cd_doc = None } ] in
@@ -3993,6 +3999,8 @@ let boxed_string_type_decl () : type_decl =
       ];
     type_is_enum = false;
     type_is_builtin = false;
+    type_is_resource = false;
+    type_resource_cleanup = None;
   }
 
 let ty_boxed_string = TyNamed ("BoxedString", [])

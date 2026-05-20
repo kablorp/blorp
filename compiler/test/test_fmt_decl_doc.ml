@@ -38,6 +38,7 @@ let typed_param name ty =
     Ast.param_name = Some name;
     param_pattern = None;
     param_type = Some ty;
+    param_passing = Ast.ParamByValue;
     param_loc = Ast.dummy_loc;
   }
 
@@ -77,6 +78,7 @@ let func ?(type_params = []) ?return_type ?(is_pure = false)
     func_is_tailrec = is_tailrec;
     func_no_copy = false;
     func_debug_only = false;
+    func_resource_result_ordinary = false;
     func_dim_constraints = [];
   }
 
@@ -93,6 +95,7 @@ let func_with_body ?(type_params = []) ?return_type ?(is_pure = false)
     func_is_tailrec = is_tailrec;
     func_no_copy = no_copy;
     func_debug_only = debug_only;
+    func_resource_result_ordinary = false;
     func_dim_constraints = [];
   }
 
@@ -150,6 +153,8 @@ let test_type_record_alias_decl_json () =
       type_variants = [ variant "Some" [ ty_named "T" [] ]; variant "None" [] ];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let record_decl =

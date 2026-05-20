@@ -12,6 +12,7 @@ type purpose =
   | CalleeDispatch
   | LambdaExpectedFunction
   | QuestionBindErrorCompatibility
+  | ResourceBinding
   | VariadicDimensionExtraction
 
 type context = { env : Env.env }

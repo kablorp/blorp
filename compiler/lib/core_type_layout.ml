@@ -70,8 +70,14 @@ let builtin_layout = function
   | "String" | "Bytes" | "Fixed" | "StringSlice" | "MemStats" | "SchedulerStats"
   | "List" | "ParallelList" | "Dict" | "Set" | "Tensor" | "Vector" | "Matrix"
   | "Builder" | "Slice" | "Option" | "Result" | "Task" | "Channel" | "Stream"
-  | "TcpListener" | "TcpStream" | "ConcurrencyError" ->
+  | "FallibleStream" | "std/stream::FallibleStream"
+  | "std_stream__FallibleStream" | "TcpListener" | "TcpStream"
+  | "ConcurrencyError" ->
       Some managed_layout
+  | "FileReader" | "FileWriter" | "File" | "std/file::FileReader"
+  | "std/file::FileWriter" | "std/file::File" | "std_file__FileReader"
+  | "std_file__FileWriter" | "std_file__File" ->
+      Some unmanaged_layout
   | "Int" | "Bool" | "Char" | "Float" | "Float32" | "Float16" | "Int128"
   | "UInt128" | "Void" | "Ptr" | "Module" ->
       Some unmanaged_layout

@@ -50,6 +50,8 @@ let union name fields =
       ];
     type_is_enum = false;
     type_is_builtin = false;
+    type_is_resource = false;
+    type_resource_cleanup = None;
   }
 
 let tensor_raw_storage expected = function

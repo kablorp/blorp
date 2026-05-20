@@ -53,7 +53,17 @@ let test_builtin_layout_is_single_source_of_truth () =
     { ownership = Managed; retain = ArcRetain; release = ArcRelease };
   check_builtin "TcpListener"
     { ownership = Managed; retain = ArcRetain; release = ArcRelease };
+  check_builtin "FallibleStream"
+    { ownership = Managed; retain = ArcRetain; release = ArcRelease };
+  check_builtin "std/stream::FallibleStream"
+    { ownership = Managed; retain = ArcRetain; release = ArcRelease };
   check_builtin "Ptr"
+    {
+      ownership = Unmanaged;
+      retain = NoRetainNeeded;
+      release = NoReleaseNeeded;
+    };
+  check_builtin "std/file::FileReader"
     {
       ownership = Unmanaged;
       retain = NoRetainNeeded;
@@ -87,7 +97,9 @@ let test_builtin_unmanaged_type_needs_no_release () =
     }
   in
   expect_known_layout "Int layout" expected
-    (Blorp.Core_type_layout.classify (meta ()) (ty "Int" []))
+    (Blorp.Core_type_layout.classify (meta ()) (ty "Int" []));
+  expect_known_layout "FileReader layout" expected
+    (Blorp.Core_type_layout.classify (meta ()) (ty "std/file::FileReader" []))
 
 let test_debug_heap_classification_uses_layout_metadata () =
   let meta =

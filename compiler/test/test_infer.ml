@@ -146,11 +146,23 @@ let parse_and_typecheck source =
   let program = Blorp.Interp_parser.transform_program program in
   Blorp.Typecheck.typecheck program
 
+let parse_and_typecheck_std_with_env source =
+  Blorp.Lexer.reset_state ();
+  let lexbuf = Lexing.from_string source in
+  let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
+  let program = Blorp.Interp_parser.transform_program program in
+  Blorp.Typecheck.typecheck_with_env ~module_origin:Blorp.Session.Stdlib_module
+    program
+
 let parse_and_typecheck_module ?(filename = "test_input.brp") source =
   match Blorp.Pipeline.typecheck_module_only ~filename ~source with
   | Ok (state, typed_program) ->
       (typed_program, List.rev state.Blorp.Typecheck.errors)
   | Error errors -> ([], errors)
+
+let format_errors errors =
+  String.concat "\n"
+    (List.map (fun (e : compiler_error) -> "  - " ^ e.message) errors)
 
 (** Find the body of a top-level function by name. *)
 let find_func_body (prog : program) (name : string) : expr option =
@@ -1105,6 +1117,1343 @@ func sum_matrix(m: Int[#2, #3]) -> Int:
             | _ -> "other")
       | None -> Alcotest.fail "for-loop iterator not found")
 
+let test_resource_type_registers_explicit_kind () =
+  with_isolated_env (fun () ->
+      let _typed, errors, env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+|}
+      in
+      check_int "no errors" 0 (List.length errors);
+      check_true "resource kind"
+        (Blorp.Env.get_type_kind env "TestResource"
+        = Some Blorp.Env.TypeResource))
+
+let test_resource_rejects_record_field_declaration () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Holder {handle: TestResource}
+|}
+      in
+      check_true "resource record field declaration error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "Record 'Holder' field 'handle' cannot contain a resource type")
+           errors))
+
+let test_resource_rejects_union_payload_declaration () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+union HandleBox:
+	Box(TestResource)
+	Empty
+|}
+      in
+      check_true "resource union payload declaration error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "Union variant 'Box' cannot contain a resource type")
+           errors))
+
+let test_with_resource_typechecks_body_and_binding () =
+  with_isolated_env (fun () ->
+      let typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		0
+|}
+      in
+      if errors <> [] then
+        Alcotest.failf "expected no errors, got:\n%s" (format_errors errors);
+      match find_func_body typed "main" with
+      | Some
+          {
+            expr_desc =
+              EBlock
+                [
+                  {
+                    expr_desc =
+                      EWith
+                        ( {
+                            with_name = "handle";
+                            with_type = Some binding_ty;
+                            _;
+                          },
+                          body );
+                    _;
+                  };
+                ];
+            _;
+          } ->
+          check_true "binding type is resource"
+            (types_equal binding_ty (TyNamed ("TestResource", [])));
+          check_true "body type is Int"
+            (match body.expr_type with
+            | Some ty -> types_equal ty ty_int
+            | None -> false)
+      | Some other ->
+          Alcotest.failf "expected main body with EWith, got %s"
+            (match other.expr_desc with
+            | EBlock _ -> "other block"
+            | _ -> "other")
+      | None -> Alcotest.fail "expected main function")
+
+let test_with_resource_rejects_direct_resource_escape () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> TestResource:
+	with handle = open_resource():
+		handle
+|}
+      in
+      check_true "resource escape error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource values cannot escape a with block")
+           errors))
+
+let test_with_resource_rejects_direct_resource_escape_after_statement () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func leak_handle() -> TestResource:
+	with handle = open_resource():
+		marker = 1
+		handle
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "direct resource escape error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource values cannot escape a with block")
+           errors);
+      check_false "not reported as derived escape"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot escape a with block")
+           errors))
+
+let test_with_try_resource_typechecks_carrier_body () =
+  with_isolated_env (fun () ->
+      let typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> Option[TestResource]:
+	builtin
+
+func maybe_count() -> Option[Int]:
+	with handle ?= open_resource():
+		Some(1)
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      if errors <> [] then
+        Alcotest.failf "expected no errors, got:\n%s" (format_errors errors);
+      match find_func_body typed "maybe_count" with
+      | Some
+          {
+            expr_desc =
+              EBlock
+                [
+                  {
+                    expr_desc =
+                      EWith
+                        ( {
+                            with_name = "handle";
+                            with_type = Some binding_ty;
+                            with_kind = WithTry;
+                            _;
+                          },
+                          body );
+                    _;
+                  };
+                ];
+            _;
+          } ->
+          check_true "binding type is resource"
+            (types_equal binding_ty (TyNamed ("TestResource", [])));
+          check_true "body type is Option[Int]"
+            (match body.expr_type with
+            | Some ty -> types_equal ty (TyNamed ("Option", [ ty_int ]))
+            | None -> false)
+      | Some _ -> Alcotest.fail "expected maybe_count body with fallible EWith"
+      | None -> Alcotest.fail "expected maybe_count function")
+
+let test_with_resource_rejects_ordinary_local_copy () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		copy = handle
+		0
+|}
+      in
+      check_true "ordinary resource binding error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource value 'copy' cannot be bound to an ordinary variable")
+           errors))
+
+let test_with_resource_rejects_tuple_destructure_copy () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_pair() -> (TestResource, Int):
+	builtin
+
+func main(args: List[String]) -> Int:
+	(copy, n) = open_pair()
+	0
+|}
+      in
+      check_true "tuple resource binding error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource value cannot be bound to an ordinary variable")
+           errors))
+
+let test_with_resource_rejects_tuple_literal_storage () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		(handle, 1)
+		0
+|}
+      in
+      check_true "tuple literal resource storage error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource values cannot be stored in tuple literals")
+           errors))
+
+let test_with_resource_rejects_derived_tuple_literal_storage () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		(cursor, 1)
+		0
+|}
+      in
+      check_true "tuple literal derived storage error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot be stored in tuple \
+                literals")
+           errors))
+
+let test_with_resource_rejects_closure_capture () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func apply(f: () -> Int) -> Int:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		apply(func() -> Int:
+			handle
+			1
+		)
+|}
+      in
+      check_true "closure scoped resource capture error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "Closure cannot capture scoped resource")
+           errors))
+
+let test_with_resource_rejects_detach_capture () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		detach handle
+		0
+|}
+      in
+      check_true "detach scoped resource capture error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "detach cannot capture scoped resource")
+           errors))
+
+let test_with_resource_rejects_ordinary_call_arg_copy () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func consume(handle: TestResource) -> Int:
+	1
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		consume(handle)
+|}
+      in
+      check_true "ordinary call resource arg error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource value cannot be passed to ordinary call \
+                'consume'")
+           errors))
+
+let test_with_resource_rejects_derived_ordinary_call_arg_copy () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func consume(cursor: Cursor) -> Int:
+	1
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		consume(cursor)
+		0
+|}
+      in
+      check_true "derived ordinary call arg error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived value cannot be passed to ordinary \
+                call 'consume'")
+           errors))
+
+let test_with_resource_rejects_inline_derived_ordinary_call_arg_copy () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func consume(cursor: Cursor) -> Int:
+	1
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		consume(cursor_from(handle))
+		0
+|}
+      in
+      check_true "inline derived ordinary call arg error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived value cannot be passed to ordinary \
+                call 'consume'")
+           errors))
+
+let test_resource_ordinary_result_can_escape_with_block () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+@resource_result_ordinary
+func read_count(handle: TestResource) -> Int:
+	builtin
+
+func read_count_scoped() -> Option[Int]:
+	with handle = open_resource():
+		count = read_count(handle)
+		Some(count)
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      if errors <> [] then
+        Alcotest.failf "expected no errors, got:\n%s" (format_errors errors))
+
+let test_resource_ordinary_inline_result_can_enter_ordinary_call () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+@resource_result_ordinary
+func read_count(handle: TestResource) -> Int:
+	builtin
+
+func read_count_scoped() -> Option[Int]:
+	with handle = open_resource():
+		Some(read_count(handle))
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      if errors <> [] then
+        Alcotest.failf "expected no errors, got:\n%s" (format_errors errors))
+
+let test_resource_ordinary_ufcs_result_can_enter_ordinary_call () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+@resource_result_ordinary
+func read_count(handle: TestResource) -> Int:
+	builtin
+
+func read_count_scoped() -> Option[Int]:
+	with handle = open_resource():
+		Some(handle.read_count())
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      if errors <> [] then
+        Alcotest.failf "expected no errors, got:\n%s" (format_errors errors))
+
+let test_resource_dependent_result_still_cannot_escape_with_block () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func leak_cursor() -> Cursor:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		cursor
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "dependent result still rejected"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot escape a with block")
+           errors))
+
+let test_resource_dependent_single_expr_result_cannot_escape_with_block () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func leak_cursor() -> Cursor:
+	with handle = open_resource():
+		cursor_from(handle)
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "dependent single-expression result rejected"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot escape a with block")
+           errors))
+
+let test_resource_result_ordinary_requires_builtin_body () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+@resource_result_ordinary
+func ordinary_source(value: Int) -> Int:
+	value
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "ordinary result annotation rejected on source function"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "@resource_result_ordinary can only be used on builtin resource \
+                operation declarations")
+           errors))
+
+let test_resource_result_ordinary_requires_resource_parameter () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+@resource_result_ordinary
+func ordinary_builtin(value: Int) -> Int:
+	builtin
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "ordinary result annotation requires resource parameter"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "@resource_result_ordinary requires a builtin operation with a \
+                direct resource parameter")
+           errors))
+
+let test_resource_result_ordinary_allows_forward_resource_parameter () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+@resource_result_ordinary
+func read_count(handle: TestResource) -> Int:
+	builtin
+
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      if errors <> [] then
+        Alcotest.failf "expected no errors, got:\n%s" (format_errors errors))
+
+let test_resource_result_ordinary_rejects_resource_container_parameter () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+@resource_result_ordinary
+func read_count(handle: Option[TestResource]) -> Int:
+	builtin
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "ordinary result annotation requires direct resource parameter"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "@resource_result_ordinary requires a builtin operation with a \
+                direct resource parameter")
+           errors))
+
+let test_resource_result_ordinary_rejects_resource_return () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+@resource_result_ordinary
+func bad(handle: TestResource) -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "ordinary result annotation rejects resource return"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "@resource_result_ordinary cannot be used on a builtin that \
+                returns a resource-dependent value")
+           errors))
+
+let test_resource_result_ordinary_rejects_stream_carrier_return () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+type FallibleStream[T, E] = builtin
+
+@resource_result_ordinary
+func bad(handle: TestResource) -> Result[FallibleStream[Int, Int], Int]:
+	builtin
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "ordinary result annotation rejects stream carrier return"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "@resource_result_ordinary cannot be used on a builtin that \
+                returns a resource-dependent value")
+           errors))
+
+let test_resource_result_ordinary_rejects_aliased_stream_carrier_return () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+type FallibleStream[T, E] = builtin
+type alias BadStream = FallibleStream[Int, Int]
+
+@resource_result_ordinary
+func bad(handle: TestResource) -> Result[BadStream, Int]:
+	builtin
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "ordinary result annotation rejects aliased stream carrier"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "@resource_result_ordinary cannot be used on a builtin that \
+                returns a resource-dependent value")
+           errors))
+
+let test_resource_rejects_unscoped_resource_operation_arg () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	cursor = cursor_from(open_resource())
+	0
+|}
+      in
+      check_true "unscoped resource operation arg error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource argument to compiler-owned resource operation must be \
+                a scoped with binding")
+           errors))
+
+let test_with_resource_rejects_constructor_payload_copy () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		Some(handle)
+		0
+|}
+      in
+      check_true "constructor resource payload error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource value cannot be passed to ordinary call 'Some'")
+           errors))
+
+let test_with_resource_rejects_derived_constructor_payload_copy () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		Some(cursor)
+		0
+|}
+      in
+      check_true "derived constructor payload error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived value cannot be passed to ordinary \
+                call 'Some'")
+           errors))
+
+let test_with_resource_rejects_derived_local_escape () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func leak_cursor() -> Cursor:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		cursor
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "derived local escape error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot escape a with block")
+           errors))
+
+let test_with_resource_rejects_derived_mutable_assignment () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func leak_cursor() -> Cursor:
+	var cursor: Cursor = {id = 0}
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		0
+	cursor
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "derived mutable assignment error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived value cannot be assigned to mutable \
+                variable")
+           errors))
+
+let test_with_resource_rejects_derived_detach_capture () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		detach cursor
+		0
+|}
+      in
+      check_true "derived detach capture error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "detach cannot capture scoped resource-derived value")
+           errors))
+
+let test_with_resource_rejects_concurrent_capture () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		concurrent:
+			value = handle
+		0
+|}
+      in
+      check_true "concurrent scoped resource capture error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "concurrent task cannot capture scoped resource")
+           errors))
+
+let test_with_resource_rejects_derived_concurrent_capture () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		concurrent:
+			value = cursor
+		0
+|}
+      in
+      check_true "concurrent scoped resource-derived capture error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "concurrent task cannot capture scoped resource-derived value")
+           errors))
+
+let test_with_resource_rejects_concurrent_for_capture () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	nums = [1, 2]
+	with handle = open_resource():
+		results = concurrent for n in nums:
+			handle
+		0
+|}
+      in
+      check_true "concurrent for scoped resource capture error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "concurrent task cannot capture scoped resource")
+           errors))
+
+let test_resource_rejects_concurrent_resource_result () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	concurrent:
+		value = open_resource()
+	0
+|}
+      in
+      check_true "concurrent resource result error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "concurrent task result cannot contain resource values")
+           errors))
+
+let test_with_resource_rejects_derived_closure_capture () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func apply(f: () -> Int) -> Int:
+	1
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		apply(func() -> Int:
+			cursor.id
+		)
+		0
+|}
+      in
+      check_true "derived closure capture error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "Closure cannot capture scoped resource-derived value")
+           errors))
+
+let test_with_resource_rejects_list_literal_storage () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		[handle]
+		0
+|}
+      in
+      check_true "list literal resource storage error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource values cannot be stored in list literals")
+           errors))
+
+let test_with_resource_rejects_derived_list_literal_storage () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		[cursor]
+		0
+|}
+      in
+      check_true "list literal derived storage error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot be stored in list \
+                literals")
+           errors))
+
+let test_with_resource_rejects_record_literal_storage () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Holder {handle: TestResource}
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		{handle = handle}
+		0
+|}
+      in
+      check_true "record literal resource storage error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource values cannot be stored in record fields")
+           errors))
+
+let test_with_resource_rejects_derived_record_literal_storage () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+record Holder {cursor: Cursor}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		holder: Holder = {cursor = cursor}
+		0
+|}
+      in
+      check_true "record literal derived storage error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot be stored in record \
+                fields")
+           errors))
+
+let test_with_resource_rejects_derived_record_update_storage () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+record Holder {cursor: Cursor}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	base: Holder = {cursor = {id = 0}}
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		{base | cursor = cursor}
+		0
+|}
+      in
+      check_true "record update derived storage error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot be stored in record \
+                fields")
+           errors))
+
+let test_with_resource_rejects_derived_record_update_base_storage () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Cursor {id: Int}
+
+func open_resource() -> TestResource:
+	builtin
+
+func cursor_from(handle: TestResource) -> Cursor:
+	builtin
+
+func main(args: List[String]) -> Int:
+	with handle = open_resource():
+		cursor = cursor_from(handle)
+		{cursor | id = 1}
+		0
+|}
+      in
+      check_true "record update derived base storage error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "scoped resource-derived values cannot be stored in record \
+                updates")
+           errors))
+
+let test_resource_rejects_global_binding () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+global_handle = open_resource()
+
+func main(args: List[String]) -> Int:
+	0
+|}
+      in
+      check_true "global resource binding error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource value 'global_handle' cannot be bound to a global")
+           errors))
+
+let test_resource_rejects_record_containing_resource_local_binding () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+record Holder {handle: TestResource}
+
+func open_holder() -> Holder:
+	builtin
+
+func main(args: List[String]) -> Int:
+	holder = open_holder()
+	0
+|}
+      in
+      check_true "resource-containing record binding error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource value 'holder' cannot be bound to an ordinary variable")
+           errors))
+
+let test_resource_rejects_union_containing_resource_local_binding () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+union HandleBox:
+	Box(TestResource)
+	Empty
+
+func open_box() -> HandleBox:
+	builtin
+
+func main(args: List[String]) -> Int:
+	box = open_box()
+	0
+|}
+      in
+      check_true "resource-containing union binding error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource value 'box' cannot be bound to an ordinary variable")
+           errors))
+
+let test_resource_rejects_discarded_resource_value () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func open_resource() -> TestResource:
+	builtin
+
+func main(args: List[String]) -> Int:
+	open_resource()
+	0
+|}
+      in
+      check_true "discarded resource value error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource-containing value cannot be discarded")
+           errors))
+
+let test_resource_rejects_explicitly_discarded_fallible_resource_value () =
+  with_isolated_env (fun () ->
+      let _typed, errors, _env =
+        parse_and_typecheck_std_with_env
+          {|
+resource type TestResource = builtin
+
+func maybe_open_resource() -> Option[TestResource]:
+	builtin
+
+func main(args: List[String]) -> Int:
+	_ = maybe_open_resource()
+	0
+|}
+      in
+      check_true "explicitly discarded fallible resource value error"
+        (List.exists
+           (fun (err : compiler_error) ->
+             Blorp.Modules.contains err.message
+               "resource-containing value cannot be discarded")
+           errors))
+
 (* ============================================================================
    Test suite
    ============================================================================ *)
@@ -1182,5 +2531,118 @@ let suite =
           test_zonk_does_not_synthesize_missing_type_info;
         Alcotest.test_case "tensor enumerate2 loop view" `Quick
           test_infer_tensor_enumerate2_for_loop_rewrites_to_loop_view;
+        Alcotest.test_case "resource type registers explicit kind" `Quick
+          test_resource_type_registers_explicit_kind;
+        Alcotest.test_case "resource rejects record field declaration" `Quick
+          test_resource_rejects_record_field_declaration;
+        Alcotest.test_case "resource rejects union payload declaration" `Quick
+          test_resource_rejects_union_payload_declaration;
+        Alcotest.test_case "resource with typechecks binding" `Quick
+          test_with_resource_typechecks_body_and_binding;
+        Alcotest.test_case "resource with rejects direct escape" `Quick
+          test_with_resource_rejects_direct_resource_escape;
+        Alcotest.test_case "resource with rejects direct escape after statement"
+          `Quick
+          test_with_resource_rejects_direct_resource_escape_after_statement;
+        Alcotest.test_case "resource with try typechecks carrier" `Quick
+          test_with_try_resource_typechecks_carrier_body;
+        Alcotest.test_case "resource with rejects ordinary local copy" `Quick
+          test_with_resource_rejects_ordinary_local_copy;
+        Alcotest.test_case "resource with rejects tuple destructure copy" `Quick
+          test_with_resource_rejects_tuple_destructure_copy;
+        Alcotest.test_case "resource with rejects tuple literal storage" `Quick
+          test_with_resource_rejects_tuple_literal_storage;
+        Alcotest.test_case "resource with rejects derived tuple literal storage"
+          `Quick test_with_resource_rejects_derived_tuple_literal_storage;
+        Alcotest.test_case "resource with rejects closure capture" `Quick
+          test_with_resource_rejects_closure_capture;
+        Alcotest.test_case "resource with rejects detach capture" `Quick
+          test_with_resource_rejects_detach_capture;
+        Alcotest.test_case "resource with rejects ordinary call arg" `Quick
+          test_with_resource_rejects_ordinary_call_arg_copy;
+        Alcotest.test_case "resource with rejects derived ordinary call arg"
+          `Quick test_with_resource_rejects_derived_ordinary_call_arg_copy;
+        Alcotest.test_case
+          "resource with rejects inline derived ordinary call arg" `Quick
+          test_with_resource_rejects_inline_derived_ordinary_call_arg_copy;
+        Alcotest.test_case "resource ordinary result can escape block" `Quick
+          test_resource_ordinary_result_can_escape_with_block;
+        Alcotest.test_case "resource ordinary inline result enters call" `Quick
+          test_resource_ordinary_inline_result_can_enter_ordinary_call;
+        Alcotest.test_case "resource ordinary UFCS result enters call" `Quick
+          test_resource_ordinary_ufcs_result_can_enter_ordinary_call;
+        Alcotest.test_case "resource dependent result still cannot escape"
+          `Quick test_resource_dependent_result_still_cannot_escape_with_block;
+        Alcotest.test_case "resource single expr dependent result cannot escape"
+          `Quick
+          test_resource_dependent_single_expr_result_cannot_escape_with_block;
+        Alcotest.test_case "resource ordinary result annotation boundary" `Quick
+          test_resource_result_ordinary_requires_builtin_body;
+        Alcotest.test_case
+          "resource ordinary result annotation requires resource param" `Quick
+          test_resource_result_ordinary_requires_resource_parameter;
+        Alcotest.test_case
+          "resource ordinary result annotation allows forward resource param"
+          `Quick test_resource_result_ordinary_allows_forward_resource_parameter;
+        Alcotest.test_case
+          "resource ordinary result annotation rejects resource container param"
+          `Quick
+          test_resource_result_ordinary_rejects_resource_container_parameter;
+        Alcotest.test_case
+          "resource ordinary result annotation rejects resource return" `Quick
+          test_resource_result_ordinary_rejects_resource_return;
+        Alcotest.test_case
+          "resource ordinary result annotation rejects stream carrier return"
+          `Quick test_resource_result_ordinary_rejects_stream_carrier_return;
+        Alcotest.test_case
+          "resource ordinary result annotation rejects aliased stream carrier"
+          `Quick
+          test_resource_result_ordinary_rejects_aliased_stream_carrier_return;
+        Alcotest.test_case "resource rejects unscoped operation arg" `Quick
+          test_resource_rejects_unscoped_resource_operation_arg;
+        Alcotest.test_case "resource with rejects constructor payload" `Quick
+          test_with_resource_rejects_constructor_payload_copy;
+        Alcotest.test_case "resource with rejects derived constructor payload"
+          `Quick test_with_resource_rejects_derived_constructor_payload_copy;
+        Alcotest.test_case "resource with rejects derived escape" `Quick
+          test_with_resource_rejects_derived_local_escape;
+        Alcotest.test_case "resource with rejects derived mutable assignment"
+          `Quick test_with_resource_rejects_derived_mutable_assignment;
+        Alcotest.test_case "resource with rejects derived detach capture" `Quick
+          test_with_resource_rejects_derived_detach_capture;
+        Alcotest.test_case "resource with rejects concurrent capture" `Quick
+          test_with_resource_rejects_concurrent_capture;
+        Alcotest.test_case "resource with rejects derived concurrent capture"
+          `Quick test_with_resource_rejects_derived_concurrent_capture;
+        Alcotest.test_case "resource with rejects concurrent for capture" `Quick
+          test_with_resource_rejects_concurrent_for_capture;
+        Alcotest.test_case "resource rejects concurrent resource result" `Quick
+          test_resource_rejects_concurrent_resource_result;
+        Alcotest.test_case "resource with rejects derived closure capture"
+          `Quick test_with_resource_rejects_derived_closure_capture;
+        Alcotest.test_case "resource with rejects list literal storage" `Quick
+          test_with_resource_rejects_list_literal_storage;
+        Alcotest.test_case "resource with rejects derived list literal storage"
+          `Quick test_with_resource_rejects_derived_list_literal_storage;
+        Alcotest.test_case "resource with rejects record literal storage" `Quick
+          test_with_resource_rejects_record_literal_storage;
+        Alcotest.test_case
+          "resource with rejects derived record literal storage" `Quick
+          test_with_resource_rejects_derived_record_literal_storage;
+        Alcotest.test_case "resource with rejects derived record update storage"
+          `Quick test_with_resource_rejects_derived_record_update_storage;
+        Alcotest.test_case
+          "resource with rejects derived record update base storage" `Quick
+          test_with_resource_rejects_derived_record_update_base_storage;
+        Alcotest.test_case "resource rejects global binding" `Quick
+          test_resource_rejects_global_binding;
+        Alcotest.test_case "resource rejects resource-containing record binding"
+          `Quick test_resource_rejects_record_containing_resource_local_binding;
+        Alcotest.test_case "resource rejects resource-containing union binding"
+          `Quick test_resource_rejects_union_containing_resource_local_binding;
+        Alcotest.test_case "resource rejects discarded resource value" `Quick
+          test_resource_rejects_discarded_resource_value;
+        Alcotest.test_case "resource rejects discarded fallible value" `Quick
+          test_resource_rejects_explicitly_discarded_fallible_resource_value;
       ] );
   ]

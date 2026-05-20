@@ -31,6 +31,7 @@ let ty_dict_string_string = TyNamed ("Dict", [ ty_string; ty_string ])
 let ty_opt_string = TyNamed ("Option", [ ty_string ])
 let ty_result_int_bool = TyNamed ("Result", [ ty_int; ty_bool ])
 let ty_result_int_string = TyNamed ("Result", [ ty_int; ty_string ])
+let ty_test_resource = TyNamed ("TestResource", [])
 
 let ty_result_opt_string_string =
   TyNamed ("Result", [ ty_opt_string; ty_string ])
@@ -327,6 +328,102 @@ let test_emit_let_nested () =
 let test_emit_seq () =
   let e = mk (CSeq (cint 1, cint 2)) ty_int in
   Alcotest.(check string) "seq" "({ 1L; 2L; })" (emit_to_string e)
+
+(* ============================================================================
+   Resource scope
+   ============================================================================ *)
+
+let resource_cleanup_call resource_var =
+  let close_ty =
+    TyFunc { params = [ ty_test_resource ]; return = ty_void; is_pure = false }
+  in
+  mk
+    (CCall
+       ( CKUser ("close", None),
+         cvar "close" close_ty,
+         [ mk (CVar resource_var) ty_test_resource ] ))
+    ty_void
+
+let resource_scope body =
+  let resource_var = Var.named "resource" in
+  mk
+    (CResourceScope
+       {
+         rs_var = resource_var;
+         rs_ty = ty_test_resource;
+         rs_acquire = cvar "open_resource" ty_test_resource;
+         rs_body = body;
+         rs_cleanup = resource_cleanup_call resource_var;
+       })
+    body.ty
+
+let test_emit_resource_scope_expr_normal_completion () =
+  let e = resource_scope (cint 7) in
+  Alcotest.(check string)
+    "resource expr"
+    "({ TestResource* resource = open_resource; blorp_CancelCleanupFrame \
+     __blorp_cleanup_resource; \
+     blorp_task_cleanup_push(&__blorp_cleanup_resource, &resource, \
+     (void*)resource, (blorp_CancelCleanupFn)_blorp_close); long \
+     __resource_result_0 = 7L; blorp_task_cleanup_pop_slot(&resource); \
+     _blorp_close(resource); __resource_result_0; })"
+    (emit_to_string e)
+
+let test_emit_resource_scope_stmt_normal_completion () =
+  let e = resource_scope (cint 7) in
+  Alcotest.(check string)
+    "resource stmt"
+    "{\n\
+    \    TestResource* resource = open_resource;\n\
+    \    blorp_CancelCleanupFrame __blorp_cleanup_resource; \
+     blorp_task_cleanup_push(&__blorp_cleanup_resource, &resource, \
+     (void*)resource, (blorp_CancelCleanupFn)_blorp_close);\n\
+    \    7L;\n\
+    \    blorp_task_cleanup_pop_slot(&resource);\n\
+    \    _blorp_close(resource);\n\
+     }\n"
+    (emit_stmt_to_string e)
+
+let test_emit_resource_scope_stmt_loop_local_break_cleanup_after_loop () =
+  let loop_body =
+    mk
+      (CWhile
+         ( cbool true,
+           mk (CSeq (mk CContinue ty_void, mk CBreak ty_void)) ty_void ))
+      ty_void
+  in
+  let e = resource_scope loop_body in
+  Alcotest.(check string)
+    "resource stmt loop-local break"
+    "{\n\
+    \    TestResource* resource = open_resource;\n\
+    \    blorp_CancelCleanupFrame __blorp_cleanup_resource; \
+     blorp_task_cleanup_push(&__blorp_cleanup_resource, &resource, \
+     (void*)resource, (blorp_CancelCleanupFn)_blorp_close);\n\
+    \    while (true) {\n\
+    \        continue;\n\
+    \        break;\n\
+    \    }\n\
+    \    blorp_task_cleanup_pop_slot(&resource);\n\
+    \    _blorp_close(resource);\n\
+     }\n"
+    (emit_stmt_to_string e)
+
+let test_emit_resource_cleanup_exit_stmt_break () =
+  let resource_var = Var.named "resource" in
+  let e =
+    mk
+      (CResourceCleanupExit
+         {
+           rce_cleanups = [ resource_cleanup_call resource_var ];
+           rce_exit = ResourceBreak;
+         })
+      ty_void
+  in
+  Alcotest.(check string)
+    "resource cleanup break"
+    "blorp_task_cleanup_pop_slot(&resource);\n_blorp_close(resource);\nbreak;\n"
+    (emit_stmt_to_string e)
 
 (* ============================================================================
    Call
@@ -3085,6 +3182,7 @@ let test_core_pipeline_simple () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -3128,6 +3226,7 @@ let test_core_pipeline_profile_flag () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -3381,6 +3480,8 @@ let test_emit_enum_type () =
       type_params = [];
       type_is_enum = true;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
       type_variants =
         [
           {
@@ -3423,6 +3524,8 @@ let test_emit_union_no_rc () =
       type_params = [];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
       type_variants =
         [
           {
@@ -3473,6 +3576,8 @@ let test_emit_union_with_rc () =
       type_params = [];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
       type_variants =
         [
           {
@@ -3522,6 +3627,8 @@ let test_emit_union_with_int128_boxed_payload_has_destructor () =
       type_params = [];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
       type_variants =
         [
           {
@@ -3553,6 +3660,8 @@ let test_emit_union_obeys_registered_arc_only_policy () =
       type_params = [];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
       type_variants =
         [
           {
@@ -3584,6 +3693,8 @@ let test_emit_union_empty_singleton () =
       type_params = [];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
       type_variants =
         [
           {
@@ -3628,6 +3739,8 @@ let test_emit_union_forward_decl () =
       type_params = [];
       type_is_enum = false;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
       type_variants =
         [
           {
@@ -3872,6 +3985,8 @@ let test_emit_enum_type_used_in_function_sig () =
       type_params = [];
       type_is_enum = true;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
       type_variants =
         [
           {
@@ -5369,6 +5484,17 @@ let suite =
         Alcotest.test_case "nested" `Quick test_emit_let_nested;
       ] );
     ("seq", [ Alcotest.test_case "seq" `Quick test_emit_seq ]);
+    ( "resource_scope",
+      [
+        Alcotest.test_case "expr_normal_completion" `Quick
+          test_emit_resource_scope_expr_normal_completion;
+        Alcotest.test_case "stmt_normal_completion" `Quick
+          test_emit_resource_scope_stmt_normal_completion;
+        Alcotest.test_case "stmt_loop_local_break_cleanup_after_loop" `Quick
+          test_emit_resource_scope_stmt_loop_local_break_cleanup_after_loop;
+        Alcotest.test_case "stmt_cleanup_exit_break" `Quick
+          test_emit_resource_cleanup_exit_stmt_break;
+      ] );
     ( "call",
       [
         Alcotest.test_case "no_args" `Quick test_emit_call_no_args;

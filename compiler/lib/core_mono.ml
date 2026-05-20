@@ -1281,6 +1281,12 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
     let desc =
       match e.desc with
       | CLit _ | CVar _ | CVoid | CBreak | CContinue -> e.desc
+      | CResourceCleanupExit exit ->
+          CResourceCleanupExit
+            {
+              exit with
+              rce_cleanups = List.map (rewrite scope) exit.rce_cleanups;
+            }
       | CTuple xs -> CTuple (List.map (rewrite scope) xs)
       | CList lit ->
           CList { lit with ll_elems = List.map (rewrite scope) lit.ll_elems }
@@ -1771,6 +1777,8 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
       in
       match e.desc with
       | CLit _ | CVar _ | CVoid | CBreak | CContinue | CClosureCreate _ -> ()
+      | CResourceCleanupExit exit ->
+          List.iter (scan_expr scope) exit.rce_cleanups
       | CTuple xs | CVector xs -> List.iter (scan_expr scope) xs
       | CTupleConstruct tc -> List.iter (scan_boxed_storage scope) tc.tc_elems
       | CList lit -> List.iter (scan_expr scope) lit.ll_elems

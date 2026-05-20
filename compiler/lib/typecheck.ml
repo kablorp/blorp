@@ -83,6 +83,12 @@ type check_state = {
       above [union T]) still sees [T] as a concrete type, not auto-generalized
       into a free type param. Without this, the guard's [is_existing_type]
       check (which only consults [state.env]) misses forward refs. *)
+  known_resource_type_names : (string, unit) Hashtbl.t;
+      (** Resource type names declared at the top level of this compilation
+      unit, collected by the [first_pass] pre-scan before function signatures
+      are registered. Resource-operation metadata is checked while signatures
+      are registered, so this table keeps [@resource_result_ordinary]
+      validation order-independent for local resource types. *)
   top_level_names : (string, string) Hashtbl.t;
       (** Names declared at the top level of this compilation unit, collected
       before imports are processed. Module aliases share the same user-facing
@@ -118,6 +124,7 @@ type checked_func_signature = {
   cfs_effective_type_params : Ast.type_param_decl list;
   cfs_purity : purity;
   cfs_origin : func_origin;
+  cfs_resource_args : resource_arg_policy;
   cfs_module_path : string option;
   cfs_dim_constraints : (type_expr * type_expr) list;
   cfs_loop_producer : loop_producer option;
@@ -153,6 +160,142 @@ let get_state_func_callable_id state ~name ~loc =
 let ctx_of_state state =
   make_ctx ~module_aliases:state.module_aliases
     ~allow_debug_only_calls:state.allow_debug_only_calls state.env
+
+let type_is_resource_name ~is_resource_name ty =
+  match Types.head_resolve ty with
+  | TyNamed (name, _) -> is_resource_name name
+  | TyVar _ | TyBoundVar _ | TyConstInt _ | TySelf | TyVarDims _ | TyMeta _ ->
+      false
+  | TyTuple _ | TyFunc _ | TyRange _ | TyArray _ | TyDimOp _ -> false
+
+let type_is_known_resource state ty =
+  type_is_resource_name ty ~is_resource_name:(fun name ->
+      Hashtbl.mem state.known_resource_type_names name
+      || Env.get_type_kind state.env name = Some TypeResource)
+
+let type_contains_known_resource state ty =
+  let rec contains_forward_resource ty =
+    type_is_known_resource state ty
+    ||
+    match Types.head_resolve ty with
+    | TyNamed (_, args) -> List.exists contains_forward_resource args
+    | TyTuple elems -> List.exists contains_forward_resource elems
+    | TyFunc { params; return; _ } ->
+        List.exists contains_forward_resource params
+        || contains_forward_resource return
+    | TyRange inner -> contains_forward_resource inner
+    | TyArray (elem, dims) ->
+        contains_forward_resource elem
+        || List.exists contains_forward_resource dims
+    | TyDimOp (_, left, right) ->
+        contains_forward_resource left || contains_forward_resource right
+    | TyVar _ | TyBoundVar _ | TyConstInt _ | TySelf | TyVarDims _ | TyMeta _ ->
+        false
+  in
+  Infer.type_contains_resource (ctx_of_state state) ty
+  || contains_forward_resource ty
+
+let resource_containing_aggregate_error loc message =
+  error_with
+    ~notes:
+      [
+        "Records, structs, and unions are ordinary value-semantic data. \
+         Embedding a resource would make the resource copyable and allow it to \
+         outlive its scoped cleanup.";
+      ]
+    ~help:
+      (Some
+         "Keep resource handles in a `with` binding and store only ordinary \
+          data derived from them.")
+    loc message
+
+let one_shot_stream_containing_aggregate_error loc message =
+  error_with
+    ~notes:
+      [
+        "Records, structs, and unions are ordinary value-semantic data. \
+         Embedding a one-shot stream would make cursor state copyable and hide \
+         mutation behind an ordinary aggregate.";
+      ]
+    ~help:
+      (Some
+         "Keep stream cursors in direct local bindings, store producer \
+          functions if you need to build streams later, or collect ordinary \
+          data before storing it.")
+    loc message
+
+let register_resource_cleanup_metadata (decl : type_decl) : unit =
+  if decl.type_is_resource then
+    Option.iter
+      (Session.register_resource_cleanup (Session.current ())
+         ~type_name:decl.type_name)
+      decl.type_resource_cleanup
+
+let type_is_env_resource env ty =
+  type_is_resource_name ty ~is_resource_name:(fun name ->
+      Env.get_type_kind env name = Some TypeResource)
+
+let param_is_borrowed (param : Ast.param) =
+  match param.param_passing with ParamBorrow -> true | ParamByValue -> false
+
+let func_has_borrowed_param (func : func_decl) =
+  List.exists param_is_borrowed func.func_params
+
+let type_is_scoped_dependency_carrier ty =
+  match Types.head_resolve ty with
+  | TyNamed (name, _) -> (
+      match Types.split_canonical_module_type_name name with
+      | Some (module_path, type_name) ->
+          module_path = "std/stream" && type_name = "FallibleStream"
+      | None -> name = "FallibleStream" || name = "std_stream__FallibleStream")
+  | _ -> false
+
+let type_is_scoped_dependency_carrier_in_env env ty =
+  let norm_ctx = Infer_type_normalization.make_context ~env () in
+  ty
+  |> Infer_type_normalization.canonical norm_ctx
+       Infer_type_normalization.ResourceBinding
+  |> type_is_scoped_dependency_carrier
+
+let type_contains_scoped_dependency_carrier env ty =
+  let norm_ctx = Infer_type_normalization.make_context ~env () in
+  let rec contains ty =
+    let ty =
+      Infer_type_normalization.canonical norm_ctx
+        Infer_type_normalization.ResourceBinding ty
+    in
+    type_is_scoped_dependency_carrier ty
+    ||
+    match Types.head_resolve ty with
+    | TyNamed (_, args) -> List.exists contains args
+    | TyTuple elems -> List.exists contains elems
+    | TyFunc { params; return; _ } ->
+        List.exists contains params || contains return
+    | TyRange inner -> contains inner
+    | TyArray (elem, dims) -> contains elem || List.exists contains dims
+    | TyDimOp (_, left, right) -> contains left || contains right
+    | TyVar _ | TyBoundVar _ | TyConstInt _ | TySelf | TyVarDims _ | TyMeta _ ->
+        false
+  in
+  contains ty
+
+let resource_arg_policy_of_func ~contains_resource_param
+    ~contains_scoped_dependency_param (func : func_decl) : resource_arg_policy =
+  let has_borrowed_resource_param =
+    func_has_borrowed_param func && contains_resource_param
+  in
+  match func.func_body with
+  | FuncBuiltinBody _
+    when contains_resource_param || contains_scoped_dependency_param ->
+      let result_policy =
+        if func.func_resource_result_ordinary then ResourceResultOrdinary
+        else ResourceResultDependent
+      in
+      AllowResourceArgs result_policy
+  | FuncBodyExpr _ when has_borrowed_resource_param ->
+      AllowResourceArgs ResourceResultOrdinary
+  | FuncBuiltinBody _ | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
+      RejectResourceArgs
 
 let rec removed_tensor_type_syntax_message (ty : type_expr) : string option =
   let recurse_list tys = List.find_map removed_tensor_type_syntax_message tys in
@@ -296,20 +439,57 @@ let module_local_type_names_from_decls (decls : Ast.program) : string list =
   in
   List.fold_left collect [] decls |> List.sort_uniq String.compare
 
+type module_resource_type_metadata = {
+  mrt_name : string;
+  mrt_type_params : string list;
+  mrt_cleanup : resource_cleanup option;
+}
+
+let module_resource_types_from_decls (decls : Ast.program) :
+    module_resource_type_metadata list =
+  let rec collect acc decl =
+    match decl.decl_desc with
+    | DPrivate inner -> collect acc inner
+    | DType t when t.type_is_resource ->
+        {
+          mrt_name = t.type_name;
+          mrt_type_params = Ast.type_param_names t.type_params;
+          mrt_cleanup = t.type_resource_cleanup;
+        }
+        :: acc
+    | _ -> acc
+  in
+  List.fold_left collect [] decls |> List.sort_uniq compare
+
+let module_decls_for_type_metadata module_path =
+  match Modules.find_cached module_path with
+  | None -> []
+  | Some m -> (
+      match Modules.get_typed_decls m.name with
+      | Some typed -> Typed_ast.program_ast typed
+      | None -> m.decls)
+
+let type_is_imported_resource_param env ~(module_path : string) ty =
+  let resource_names =
+    module_decls_for_type_metadata module_path
+    |> module_resource_types_from_decls
+    |> List.concat_map (fun metadata ->
+        [
+          metadata.mrt_name;
+          Types.canonical_module_type_name ~module_path metadata.mrt_name;
+        ])
+  in
+  type_is_resource_name ty ~is_resource_name:(fun name ->
+      Env.get_type_kind env name = Some TypeResource
+      || List.mem name resource_names)
+
 let qualify_imported_type_expr ~(module_path : string option) ty =
   match module_path with
   | None -> ty
   | Some module_path ->
       let local_type_names =
-        match Modules.find_cached module_path with
-        | None -> []
-        | Some m ->
-            let decls =
-              match Modules.get_typed_decls m.name with
-              | Some typed -> Typed_ast.program_ast typed
-              | None -> m.decls
-            in
-            module_local_type_names_from_decls decls
+        module_decls_for_type_metadata module_path
+        |> module_local_type_names_from_decls
       in
       Types.qualify_module_local_types ~module_path local_type_names ty
 
@@ -416,6 +596,14 @@ let checked_func_signature_of_func ?(module_path : string option)
           raw_func_type
       in
       let origin = if func_is_foreign func then Foreign else UserDefined in
+      let is_resource_param =
+        match module_path with
+        | Some module_path ->
+            fun ty ->
+              type_is_known_resource state ty
+              || type_is_imported_resource_param state.env ~module_path ty
+        | None -> type_is_known_resource state
+      in
       Some
         {
           cfs_name = name;
@@ -426,6 +614,14 @@ let checked_func_signature_of_func ?(module_path : string option)
           cfs_effective_type_params = effective_type_params;
           cfs_purity = (if func.func_is_pure then Pure else Impure);
           cfs_origin = origin;
+          cfs_resource_args =
+            resource_arg_policy_of_func func
+              ~contains_resource_param:
+                (List.exists is_resource_param param_types)
+              ~contains_scoped_dependency_param:
+                (List.exists
+                   (type_is_scoped_dependency_carrier_in_env state.env)
+                   param_types);
           cfs_module_path = module_path;
           cfs_dim_constraints = func.func_dim_constraints;
           cfs_loop_producer =
@@ -490,6 +686,16 @@ let checked_func_signature_of_imported_func ~(env : env) ~(module_path : string)
           cfs_effective_type_params = effective_type_params;
           cfs_purity = (if func.func_is_pure then Pure else Impure);
           cfs_origin = origin;
+          cfs_resource_args =
+            resource_arg_policy_of_func func
+              ~contains_resource_param:
+                (List.exists
+                   (type_is_imported_resource_param env ~module_path)
+                   param_types)
+              ~contains_scoped_dependency_param:
+                (List.exists
+                   (type_is_scoped_dependency_carrier_in_env env)
+                   param_types);
           cfs_module_path = Some module_path;
           cfs_dim_constraints = func.func_dim_constraints;
           cfs_loop_producer =
@@ -509,6 +715,7 @@ let overload_entry_of_checked_signature ?callable_id
     ol_param_names = sig_.cfs_param_names;
     ol_purity = sig_.cfs_purity;
     ol_origin = sig_.cfs_origin;
+    ol_resource_args = sig_.cfs_resource_args;
     ol_module_path = sig_.cfs_module_path;
     ol_dim_constraints = sig_.cfs_dim_constraints;
     ol_loop_producer = sig_.cfs_loop_producer;
@@ -546,6 +753,7 @@ let init_state ?module_origin ?(allow_debug_only_calls = false) () =
     allow_debug_only_calls;
     private_impls = [];
     known_type_names = Hashtbl.create 16;
+    known_resource_type_names = Hashtbl.create 16;
     top_level_names = Hashtbl.create 32;
     type_home = Hashtbl.create 32;
     func_callable_ids = Hashtbl.create 32;
@@ -772,14 +980,18 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
     end
     else state
   in
-  (* [type Name = builtin] is reserved for stdlib declarations. In user
-     code the declaration would pass typechecking but the type has no
-     representation — codegen skips emission, so the first use produces
-     an opaque C-compile error. Reject up front. *)
+  (* [type Name = builtin] and [resource type Name = builtin] are reserved for
+     stdlib declarations. In user code the declaration would pass typechecking
+     but the type has no representation — codegen skips emission, so the first
+     use produces an opaque C-compile error. Reject up front. *)
   let state =
     if
       decl.type_is_builtin && (not (state_allows_builtin state)) && not imported
     then
+      let syntax =
+        if decl.type_is_resource then "resource type " ^ decl.type_name
+        else "type " ^ decl.type_name
+      in
       add_error state
         (error_with ~notes:[]
            ~help:
@@ -789,9 +1001,35 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
                  [Ptr] field")
            dummy_loc
            (Printf.sprintf
-              "'type %s = builtin' can only be used in the standard library"
-              decl.type_name))
+              "'%s = builtin' can only be used in the standard library" syntax))
     else state
+  in
+  let state =
+    if decl.type_is_builtin || decl.type_is_resource then state
+    else
+      List.fold_left
+        (fun state (v : variant) ->
+          List.fold_left
+            (fun state field_ty ->
+              let state =
+                if type_contains_known_resource state field_ty then
+                  add_error state
+                    (resource_containing_aggregate_error v.variant_loc
+                       (Printf.sprintf
+                          "Union variant '%s' cannot contain a resource type"
+                          v.variant_name))
+                else state
+              in
+              if Infer.type_contains_one_shot_stream state.env field_ty then
+                add_error state
+                  (one_shot_stream_containing_aggregate_error v.variant_loc
+                     (Printf.sprintf
+                        "Union variant '%s' cannot contain a one-shot stream \
+                         type"
+                        v.variant_name))
+              else state)
+            state v.variant_fields)
+        state decl.type_variants
   in
   (* Assign variant tags. [variant_def_id] is NOT minted here: the
      first pass stores variants in the env (where no downstream reader
@@ -805,7 +1043,8 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
     List.mapi (fun i v -> { v with variant_tag = i }) decl.type_variants
   in
   let type_kind =
-    if decl.type_is_builtin then TypeBuiltin
+    if decl.type_is_resource then TypeResource
+    else if decl.type_is_builtin then TypeBuiltin
     else if decl.type_is_enum then TypeEnum
     else TypeUnion
   in
@@ -818,6 +1057,7 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
           variants ~kind:type_kind;
     }
   in
+  register_resource_cleanup_metadata decl;
   (* Register the owning module so the orphan-rule check can find the
      type's home. Stdlib primitives like [type Int = builtin] declared
      in std/int.brp land here via their decl's [loc_file]. *)
@@ -913,6 +1153,28 @@ let process_record_decl ?(imported = false) (state : check_state)
               })
             decl.record_fields;
       }
+    in
+    let state =
+      List.fold_left
+        (fun state (f : field_decl) ->
+          let kind = if decl.record_is_value then "Struct" else "Record" in
+          let state =
+            if type_contains_known_resource state f.field_type then
+              add_error state
+                (resource_containing_aggregate_error f.field_loc
+                   (Printf.sprintf
+                      "%s '%s' field '%s' cannot contain a resource type" kind
+                      decl.record_name f.field_name))
+            else state
+          in
+          if Infer.type_contains_one_shot_stream state.env f.field_type then
+            add_error state
+              (one_shot_stream_containing_aggregate_error f.field_loc
+                 (Printf.sprintf
+                    "%s '%s' field '%s' cannot contain a one-shot stream type"
+                    kind decl.record_name f.field_name))
+          else state)
+        state decl.record_fields
     in
     (* Reject variadic dims in record field types — runtime-sized data should use List[T] *)
     let state =
@@ -1088,6 +1350,211 @@ let validate_default_foreign_arg_safety loc (state : check_state)
     in
     fold 0 sig_.cfs_param_names sig_.cfs_param_types state
 
+let validate_resource_result_annotation loc (state : check_state)
+    (func : func_decl) (sig_ : checked_func_signature) : check_state =
+  if not func.func_resource_result_ordinary then state
+  else if not (func_has_builtin_body func) then
+    add_error state
+      (error_with loc
+         "@resource_result_ordinary can only be used on builtin resource \
+          operation declarations"
+         ~notes:
+           [
+             "The annotation is compiler metadata for operations that borrow a \
+              scoped resource and return ordinary data.";
+           ]
+         ~help:
+           (Some
+              "Remove the annotation from source or foreign functions. Source \
+               functions with `borrow` parameters already return ordinary \
+               values when their bodies type-check."))
+  else if
+    type_contains_known_resource state sig_.cfs_return_type
+    || type_contains_scoped_dependency_carrier state.env sig_.cfs_return_type
+  then
+    add_error state
+      (error_with loc
+         "@resource_result_ordinary cannot be used on a builtin that returns a \
+          resource-dependent value"
+         ~notes:
+           [
+             "The annotation tells scoped-resource analysis that the result no \
+              longer depends on the borrowed resource.";
+             "Returning a resource, stream, cursor, or value that contains one \
+              would erase a scoped lifetime and let that value escape cleanup.";
+           ]
+         ~help:
+           (Some
+              "Remove the annotation from carrier-producing builtins. Only \
+               terminal operations that return ordinary data should use \
+               @resource_result_ordinary."))
+  else
+    match sig_.cfs_resource_args with
+    | AllowResourceArgs _ -> state
+    | RejectResourceArgs ->
+        add_error state
+          (error_with loc
+             "@resource_result_ordinary requires a builtin operation with a \
+              direct resource parameter"
+             ~notes:
+               [
+                 "The annotation describes the result of a compiler-owned \
+                  operation that borrows a scoped resource. Without a resource \
+                  parameter directly in the function signature, there is no \
+                  resource dependency to classify.";
+               ]
+             ~help:
+               (Some
+                  "Remove the annotation, or add it only to builtin operations \
+                   whose parameters directly borrow a resource type."))
+
+let resource_signature_boundary_error loc message =
+  error_with
+    ~notes:
+      [
+        "Ordinary function parameters and return values use value semantics. \
+         Copying a resource would duplicate cleanup ownership.";
+        "A source function may borrow a scoped resource only by declaring an \
+         explicit `borrow` parameter, and the type checker verifies that \
+         nothing resource-dependent escapes the call.";
+      ]
+    ~help:
+      (Some
+         "Keep resources inside a `with` block, or add an explicit builtin \
+          resource operation only when the compiler/runtime owns the cleanup \
+          contract. Source helpers that need a scoped handle should use \
+          `param: borrow ResourceType`.")
+    loc message
+
+let borrowed_resource_param_error loc message =
+  error_with
+    ~notes:
+      [
+        "Borrowed resource parameters do not own cleanup. They can only use \
+         the scoped resource for the duration of the current call.";
+        "The function body must be visible to the type checker so it can \
+         reject returning, storing, or spawning work that depends on the \
+         borrowed resource.";
+      ]
+    ~help:
+      (Some
+         "Use `with handle = ...:` at the call site and declare helpers as \
+          `func helper(handle: borrow ResourceType) -> OrdinaryType:`.")
+    loc message
+
+let validate_resource_signature_boundary loc (state : check_state)
+    (func : func_decl) (sig_ : checked_func_signature) : check_state =
+  let typed_params : Ast.param list =
+    List.filter (fun p -> Option.is_some p.param_type) func.func_params
+  in
+  let param_pairs = List.combine typed_params sig_.cfs_param_types in
+  let state =
+    List.fold_left
+      (fun state ((param : Ast.param), param_ty) ->
+        if param_is_borrowed param then
+          let param_name = Option.value param.param_name ~default:"_" in
+          let state =
+            match func.func_body with
+            | FuncBodyExpr _ -> state
+            | FuncBuiltinBody _ | FuncForeign _ | FuncNoBody ->
+                add_error state
+                  (borrowed_resource_param_error param.param_loc
+                     "borrowed resource parameters require a function body")
+          in
+          if type_is_known_resource state param_ty then state
+          else
+            add_error state
+              (borrowed_resource_param_error param.param_loc
+                 (Printf.sprintf
+                    "borrow parameter '%s' must have a direct resource type"
+                    param_name))
+        else state)
+      state param_pairs
+  in
+  if func_has_builtin_body func then state
+  else
+    let state =
+      List.fold_left
+        (fun state ((param : Ast.param), param_ty) ->
+          if
+            (not (param_is_borrowed param))
+            && type_contains_known_resource state param_ty
+          then
+            let param_name = Option.value param.param_name ~default:"_" in
+            add_error state
+              (resource_signature_boundary_error param.param_loc
+                 (Printf.sprintf
+                    "Function '%s' parameter '%s' cannot contain a resource \
+                     type"
+                    sig_.cfs_name param_name))
+          else state)
+        state param_pairs
+    in
+    if type_contains_known_resource state sig_.cfs_return_type then
+      add_error state
+        (resource_signature_boundary_error loc
+           (Printf.sprintf
+              "Function '%s' return type cannot contain a resource type"
+              sig_.cfs_name))
+    else state
+
+let register_imported_resource_signature_types ~(module_path : string option)
+    (state : check_state) (sig_ : checked_func_signature) : check_state =
+  match module_path with
+  | None -> state
+  | Some module_path ->
+      let resource_params_by_name =
+        module_decls_for_type_metadata module_path
+        |> module_resource_types_from_decls
+        |> List.map (fun metadata ->
+            ( Types.canonical_module_type_name ~module_path metadata.mrt_name,
+              metadata ))
+      in
+      let resource_metadata name =
+        List.assoc_opt name resource_params_by_name
+      in
+      let rec type_names acc ty =
+        match Types.head_resolve ty with
+        | TyNamed (name, args) -> List.fold_left type_names (name :: acc) args
+        | TyTuple elems -> List.fold_left type_names acc elems
+        | TyFunc { params; return; _ } ->
+            List.fold_left type_names (type_names acc return) params
+        | TyRange inner -> type_names acc inner
+        | TyArray (elem, dims) ->
+            List.fold_left type_names (type_names acc elem) dims
+        | TyDimOp (_, left, right) -> type_names (type_names acc left) right
+        | TyVar _ | TyBoundVar _ | TyConstInt _ | TySelf | TyVarDims _
+        | TyMeta _ ->
+            acc
+      in
+      let names =
+        List.fold_left type_names []
+          (sig_.cfs_return_type :: sig_.cfs_param_types)
+        |> List.sort_uniq String.compare
+      in
+      let env =
+        List.fold_left
+          (fun env name ->
+            match resource_metadata name with
+            | None -> env
+            | Some metadata when Env.get_type_kind env name = Some TypeResource
+              ->
+                Option.iter
+                  (Session.register_resource_cleanup (Session.current ())
+                     ~type_name:name)
+                  metadata.mrt_cleanup;
+                env
+            | Some metadata ->
+                Option.iter
+                  (Session.register_resource_cleanup (Session.current ())
+                     ~type_name:name)
+                  metadata.mrt_cleanup;
+                Env.add_type ~with_ctors:false ~kind:TypeResource env name
+                  metadata.mrt_type_params [])
+          state.env names
+      in
+      { state with env }
+
 (** Process a function declaration - first pass (add signature only) *)
 let process_func_signature ?(module_path : string option) ?(loc = dummy_loc)
     (state : check_state) (func : func_decl) : check_state =
@@ -1095,6 +1562,11 @@ let process_func_signature ?(module_path : string option) ?(loc = dummy_loc)
   match checked_func_signature_of_func ?module_path state func with
   | None -> state (* Lambda, not a top-level function *)
   | Some sig_ ->
+      let state =
+        register_imported_resource_signature_types ~module_path state sig_
+      in
+      let state = validate_resource_result_annotation loc state func sig_ in
+      let state = validate_resource_signature_boundary loc state func sig_ in
       let callable_id =
         record_func_callable_id state ~name:sig_.cfs_name ~loc
       in
@@ -1169,8 +1641,8 @@ let process_func_signature ?(module_path : string option) ?(loc = dummy_loc)
           add_func state.env sig_.cfs_name sig_.cfs_func_type ~callable_id
             ~type_params:sig_.cfs_effective_type_params
             ~param_names:sig_.cfs_param_names ~purity:sig_.cfs_purity
-            ~origin:sig_.cfs_origin ?module_path
-            ~dim_constraints:sig_.cfs_dim_constraints
+            ~origin:sig_.cfs_origin ~resource_args:sig_.cfs_resource_args
+            ?module_path ~dim_constraints:sig_.cfs_dim_constraints
             ?loop_producer:sig_.cfs_loop_producer
             ~debug_only:sig_.cfs_debug_only ()
       in
@@ -1236,6 +1708,24 @@ let canonical_imported_type_name ~(module_path : string option) name =
   match module_path with
   | None -> name
   | Some module_path -> Types.canonical_module_type_name ~module_path name
+
+let register_qualified_import_resource_types ~(module_path : string)
+    (state : check_state) exports : check_state =
+  List.fold_left
+    (fun state (_export_name, decl) ->
+      match decl.decl_desc with
+      | DType type_decl when type_decl.type_is_resource ->
+          let canonical_name =
+            canonical_imported_type_name ~module_path:(Some module_path)
+              type_decl.type_name
+          in
+          if Env.get_type_kind state.env canonical_name = Some TypeResource then
+            state
+          else
+            let type_decl = { type_decl with type_name = canonical_name } in
+            process_type_decl ~loc:decl.decl_loc ~imported:true state type_decl
+      | _ -> state)
+    state exports
 
 let process_imported_type_decl ?alias ~(module_path : string option) state
     (decl : type_decl) (loc : loc) : check_state =
@@ -2419,14 +2909,20 @@ let process_import (state : check_state) (loc : loc) (decl : import_decl) :
               | Some a -> a
               | None -> Filename.basename decl.import_module
             in
+            let state =
+              register_qualified_import_resource_types
+                ~module_path:canonical_name state exports
+            in
             register_module_alias state loc ~alias ~canonical_name)
 
 (** First pass: collect all type and function signatures.
 
     Pre-scans all top-level type/record/alias names into [known_type_names]
-    so the auto-generalization guard in [process_func_signature] handles
-    forward references (a function declared before the type it uses must
-    still see that type as concrete, not auto-generalize the name).
+    and resource type names into [known_resource_type_names] so the
+    auto-generalization guard and resource-operation metadata checks in
+    [process_func_signature] handle forward references (a function declared
+    before the type it uses must still see that type as concrete, not
+    auto-generalize the name).
 
     Also pre-scans declaration names into [top_level_names] so module-alias
     namespace checks are independent of declaration order. *)
@@ -2439,6 +2935,8 @@ let rec first_pass (state : check_state) (decls : program) : check_state =
     match d.decl_desc with
     | DType t ->
         Hashtbl.replace state.known_type_names t.type_name ();
+        if t.type_is_resource then
+          Hashtbl.replace state.known_resource_type_names t.type_name ();
         remember_top_level t.type_name "type";
         List.iter
           (fun v -> remember_top_level v.variant_name "constructor")
@@ -2636,6 +3134,7 @@ let () =
                     allow_debug_only_calls = false;
                     private_impls = [];
                     known_type_names = Hashtbl.create 4;
+                    known_resource_type_names = Hashtbl.create 4;
                     top_level_names = Hashtbl.create 4;
                     type_home = Hashtbl.create 4;
                     func_callable_ids = Hashtbl.create 4;
@@ -2676,6 +3175,7 @@ let () =
               allow_debug_only_calls = false;
               private_impls = [];
               known_type_names = Hashtbl.create 4;
+              known_resource_type_names = Hashtbl.create 4;
               top_level_names = Hashtbl.create 4;
               type_home = Hashtbl.create 4;
               func_callable_ids = Hashtbl.create 4;
@@ -3086,9 +3586,14 @@ let setup_function_scope ?(source_func : func_decl option) (state : check_state)
                 |> Type_resolution.source)
               source_ty_opt
           in
+          let origin =
+            match source_param.param_passing with
+            | ParamBorrow -> BorrowedResourceParam
+            | ParamByValue -> FuncParam
+          in
           add_var env name
             (canonical_type_annotation_in_env state env ty)
-            ?source_type ~origin:FuncParam ()
+            ?source_type ~origin ()
       | _ -> env)
     env source_params func.func_params
 
@@ -3999,7 +4504,7 @@ let rec second_pass (state : check_state) (decls : program) :
                     | Ok ty -> (state, Some ty)
                     | Error err -> (add_error state err, None)
                   in
-                  ( state,
+                  let typed_var =
                     {
                       var_decl with
                       var_type =
@@ -4007,7 +4512,43 @@ let rec second_pass (state : check_state) (decls : program) :
                         | Some ty -> Some (canonical_type_annotation state ty)
                         | None -> inferred_ty);
                       var_value = tv;
-                    } )
+                    }
+                  in
+                  let state =
+                    match (typed_var.var_name, inferred_ty) with
+                    | Some name, Some ty
+                      when Infer.type_contains_resource (ctx_of_state state) ty
+                      ->
+                        add_error state
+                          (error_at loc
+                             (Printf.sprintf
+                                "resource value '%s' cannot be bound to a \
+                                 global"
+                                name))
+                    | Some name, Some ty
+                      when Infer.type_contains_one_shot_stream state.env ty ->
+                        add_error state
+                          (error_with loc
+                             (Printf.sprintf
+                                "one-shot stream value '%s' cannot be bound to \
+                                 a global"
+                                name)
+                             ~notes:
+                               [
+                                 "Global bindings are shared program state. A \
+                                  stream cursor has mutable pull state and \
+                                  must stay local to the code that consumes \
+                                  it.";
+                               ]
+                             ~help:
+                               (Some
+                                  "Create the stream inside a function, keep \
+                                   it in a direct local binding while building \
+                                   the pipeline, and consume it with a \
+                                   terminal stream operation."))
+                    | _ -> state
+                  in
+                  (state, typed_var)
               | None -> (state, var_decl)
             in
             (state, { decl with decl_desc = DVar typed_var } :: acc)
@@ -4188,6 +4729,7 @@ let rec second_pass (state : check_state) (decls : program) :
                                     param_name = name;
                                     param_pattern = None;
                                     param_type = Some (subst ty);
+                                    param_passing = ParamByValue;
                                     param_loc = loc;
                                   })
                                 m.tm_params
@@ -4203,6 +4745,7 @@ let rec second_pass (state : check_state) (decls : program) :
                                 func_is_tailrec = false;
                                 func_no_copy = false;
                                 func_debug_only = false;
+                                func_resource_result_ordinary = false;
                                 func_dim_constraints = [];
                               }
                     in

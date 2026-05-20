@@ -569,6 +569,32 @@ let test_modules_reset_clears_type_index () =
     "type home cleared" None
     (Session.find_type_home s "Widget")
 
+let test_modules_reset_clears_resource_cleanup_index () =
+  let s = Session.create () in
+  Session.register_resource_cleanup s ~type_name:"Widget"
+    (Ast.ResourceCleanupBuiltin "close_widget");
+  (match Session.find_resource_cleanup s "Widget" with
+  | Some (Ast.ResourceCleanupBuiltin name) ->
+      Alcotest.(check string) "registered cleanup" "close_widget" name
+  | None -> Alcotest.fail "expected registered cleanup");
+  Modules.reset ~sess:s ();
+  Alcotest.(check bool)
+    "resource cleanup cleared" true
+    (Session.find_resource_cleanup s "Widget" = None)
+
+let test_resource_cleanup_registry_isolated_across_sessions () =
+  let s1 = Session.create () in
+  let s2 = Session.create () in
+  Session.register_resource_cleanup s1 ~type_name:"Widget"
+    (Ast.ResourceCleanupBuiltin "close_widget");
+  (match Session.find_resource_cleanup s1 "Widget" with
+  | Some (Ast.ResourceCleanupBuiltin name) ->
+      Alcotest.(check string) "registered cleanup" "close_widget" name
+  | None -> Alcotest.fail "expected registered cleanup");
+  Alcotest.(check bool)
+    "s2 does not see s1 cleanup" true
+    (Session.find_resource_cleanup s2 "Widget" = None)
+
 (* ============================================================================
    DefId minting + UFCS def_id table
    ============================================================================ *)
@@ -706,6 +732,10 @@ let suite =
         Alcotest.test_case "search_paths" `Quick test_search_paths_independent;
         Alcotest.test_case "reset clears type index" `Quick
           test_modules_reset_clears_type_index;
+        Alcotest.test_case "reset clears resource cleanup index" `Quick
+          test_modules_reset_clears_resource_cleanup_index;
+        Alcotest.test_case "resource cleanup registry isolated" `Quick
+          test_resource_cleanup_registry_isolated_across_sessions;
         Alcotest.test_case "blorp.toml std path" `Quick
           test_blorp_toml_std_path_sets_override;
         Alcotest.test_case "BLORP_STD overrides blorp.toml" `Quick

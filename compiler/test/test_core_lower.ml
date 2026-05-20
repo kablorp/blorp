@@ -24,6 +24,15 @@ let ty_void = TyNamed ("Void", [])
 let ty_range = TyNamed ("Range", [])
 let ty_list_int = TyNamed ("List", [ ty_int ])
 let ty_opt_int = TyNamed ("Option", [ ty_int ])
+let ty_test_resource = TyNamed ("TestResource", [])
+let ty_opt_test_resource = TyNamed ("Option", [ ty_test_resource ])
+let ty_file_reader = TyNamed ("std/file::FileReader", [])
+let ty_io_error = TyNamed ("std/file::IOError", [])
+
+let ty_result_file_reader_error =
+  TyNamed ("Result", [ ty_file_reader; ty_io_error ])
+
+let ty_result_int_error = TyNamed ("Result", [ ty_int; ty_io_error ])
 let str_flags = { sf_triple = false; sf_raw = false }
 
 let with_type expr ty =
@@ -431,6 +440,7 @@ let test_lower_lambda () =
             param_name = Some "x";
             param_pattern = None;
             param_type = Some ty_int;
+            param_passing = ParamByValue;
             param_loc = loc;
           };
         ];
@@ -440,6 +450,7 @@ let test_lower_lambda () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -463,6 +474,7 @@ let test_lower_lambda_missing_param_type_raises () =
             param_name = Some "x";
             param_pattern = None;
             param_type = None;
+            param_passing = ParamByValue;
             param_loc = loc;
           };
         ];
@@ -472,6 +484,7 @@ let test_lower_lambda_missing_param_type_raises () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -493,6 +506,7 @@ let test_lower_lambda_missing_body_raises () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -689,6 +703,43 @@ let test_lower_question_bind_statement () =
       Alcotest.(check int) "arms" 2 (List.length arms)
   | _ -> Alcotest.fail "expected question-bind let/match lowering"
 
+let test_lower_result_question_bind_rebuilds_error_carrier () =
+  let rhs = ast_var "opened" ty_result_file_reader_error in
+  let bind =
+    mk_ast (EQuestionBind ("reader", Some ty_file_reader, rhs)) ty_file_reader
+  in
+  let success =
+    mk_ast (ECall (ast_var "Ok" ty_int, [ ast_int 1 ])) ty_result_int_error
+  in
+  let block = mk_ast (EBlock [ bind; success ]) ty_result_int_error in
+  let c = lower_expr block in
+  match c.desc with
+  | CLet
+      ( _,
+        {
+          desc =
+            CMatchArms
+              ( _,
+                [
+                  (PatConstructor ("Ok", [ PatVar "reader" ]), _);
+                  ( PatConstructor ("Err", [ PatVar err_name ]),
+                    {
+                      desc =
+                        CCall
+                          ( CKBuiltin "blorp_result_err",
+                            _,
+                            [ { desc = CVar err_var; _ } ] );
+                      ty;
+                      _;
+                    } );
+                ] );
+          _;
+        } ) ->
+      Alcotest.(check string) "error var reused" err_name err_var.vname;
+      Alcotest.(check bool)
+        "fallback carrier type" true (ty = ty_result_int_error)
+  | _ -> Alcotest.fail "expected Result ?= to rebuild Err carrier"
+
 let test_lower_question_bind_direct_error () =
   (* A stray [EQuestionBind] outside [lower_block]'s continuation-aware path is a
      typechecker violation. Lowering raises a structured error if it leaks. *)
@@ -698,6 +749,190 @@ let test_lower_question_bind_direct_error () =
     let _ = lower_expr ast in
     Alcotest.fail "expected EQuestionBind outside block lowering to raise"
   with Blorp.Core_error.Core_error _ -> ()
+
+let test_lower_plain_with_to_resource_scope () =
+  let acquire = ast_var "open_resource" ty_test_resource in
+  let binding =
+    {
+      with_name = "handle";
+      with_type = Some ty_test_resource;
+      with_value = acquire;
+      with_kind = WithPlain;
+    }
+  in
+  let ast = mk_ast (EWith (binding, ast_int 7)) ty_int in
+  let c = lower_expr ast in
+  match c.desc with
+  | CResourceScope scope ->
+      Alcotest.(check string) "resource var" "handle" scope.rs_var.vname;
+      Alcotest.(check bool) "resource type" true (scope.rs_ty = ty_test_resource);
+      Alcotest.(check bool)
+        "acquire" true
+        (match scope.rs_acquire.desc with
+        | CVar { vname = "open_resource"; _ } -> true
+        | _ -> false);
+      Alcotest.(check bool)
+        "body" true
+        (match scope.rs_body.desc with CLit (LitInt 7L) -> true | _ -> false);
+      Alcotest.(check bool)
+        "cleanup calls close(handle)" true
+        (match scope.rs_cleanup.desc with
+        | CCall
+            ( CKUnknown,
+              { desc = CVar { vname = "close"; _ }; _ },
+              [ { desc = CVar { vname = "handle"; _ }; _ } ] ) ->
+            true
+        | _ -> false)
+  | _ -> Alcotest.fail "expected CResourceScope"
+
+let test_lower_with_uses_registered_resource_cleanup () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let ty_widget = TyNamed ("WidgetHandle", []) in
+        register_resource_cleanup (current ()) ~type_name:"WidgetHandle"
+          (ResourceCleanupBuiltin "blorp_widget_close");
+        let acquire = ast_var "open_widget" ty_widget in
+        let binding =
+          {
+            with_name = "handle";
+            with_type = Some ty_widget;
+            with_value = acquire;
+            with_kind = WithPlain;
+          }
+        in
+        let ast = mk_ast (EWith (binding, ast_int 7)) ty_int in
+        let c = lower_expr ast in
+        match c.desc with
+        | CResourceScope scope ->
+            Alcotest.(check bool) "resource type" true (scope.rs_ty = ty_widget);
+            Alcotest.(check bool)
+              "cleanup uses registered builtin" true
+              (match scope.rs_cleanup.desc with
+              | CCall
+                  ( CKBuiltin "blorp_widget_close",
+                    _,
+                    [ { desc = CVar { vname = "handle"; _ }; _ } ] ) ->
+                  true
+              | _ -> false)
+        | _ -> Alcotest.fail "expected CResourceScope"))
+
+let test_lower_fallible_with_to_resource_scope_success_arm () =
+  let acquire = ast_var "maybe_resource" ty_opt_test_resource in
+  let binding =
+    {
+      with_name = "handle";
+      with_type = Some ty_test_resource;
+      with_value = acquire;
+      with_kind = WithTry;
+    }
+  in
+  let ast = mk_ast (EWith (binding, ast_var "success" ty_opt_int)) ty_opt_int in
+  let c = lower_expr ast in
+  match c.desc with
+  | CLet
+      ( { bind_ty; bind_rhs; _ },
+        {
+          desc =
+            CMatchArms
+              ( _,
+                [
+                  ( PatConstructor ("Some", [ PatVar payload ]),
+                    { desc = CResourceScope scope; _ } );
+                  (PatConstructor ("None", []), _);
+                ] );
+          _;
+        } ) ->
+      Alcotest.(check bool)
+        "tmp binding type" true
+        (bind_ty = ty_opt_test_resource);
+      Alcotest.(check bool) "rhs type" true (bind_rhs.ty = ty_opt_test_resource);
+      Alcotest.(check string) "resource var" "handle" scope.rs_var.vname;
+      Alcotest.(check bool) "resource type" true (scope.rs_ty = ty_test_resource);
+      Alcotest.(check bool)
+        "resource acquired from payload" true
+        (match scope.rs_acquire.desc with
+        | CVar { vname; _ } -> String.equal vname payload
+        | _ -> false);
+      Alcotest.(check bool)
+        "cleanup calls close(handle)" true
+        (match scope.rs_cleanup.desc with
+        | CCall
+            ( CKUnknown,
+              { desc = CVar { vname = "close"; _ }; _ },
+              [ { desc = CVar { vname = "handle"; _ }; _ } ] ) ->
+            true
+        | _ -> false)
+  | _ -> Alcotest.fail "expected fallible with let/match resource lowering"
+
+let test_lower_fallible_with_body_question_bind_stays_inside_resource_scope () =
+  let acquire = ast_var "maybe_resource" ty_opt_test_resource in
+  let binding =
+    {
+      with_name = "handle";
+      with_type = Some ty_test_resource;
+      with_value = acquire;
+      with_kind = WithTry;
+    }
+  in
+  let question =
+    mk_ast
+      (EQuestionBind ("x", Some ty_int, ast_var "maybe_int" ty_opt_int))
+      ty_int
+  in
+  let some_ty =
+    TyFunc { params = [ ty_int ]; return = ty_opt_int; is_pure = true }
+  in
+  let success =
+    mk_ast (ECall (ast_var "Some" some_ty, [ ast_var "x" ty_int ])) ty_opt_int
+  in
+  let body = ast_block [ question; success ] ty_opt_int in
+  let ast = mk_ast (EWith (binding, body)) ty_opt_int in
+  let c = lower_expr ast in
+  match c.desc with
+  | CLet
+      ( _,
+        {
+          desc =
+            CMatchArms
+              ( _,
+                [
+                  ( PatConstructor ("Some", [ PatVar payload ]),
+                    { desc = CResourceScope scope; _ } );
+                  _;
+                ] );
+          _;
+        } ) ->
+      Alcotest.(check bool)
+        "resource acquired from with ?= payload" true
+        (match scope.rs_acquire.desc with
+        | CVar { vname; _ } -> String.equal vname payload
+        | _ -> false);
+      Alcotest.(check bool)
+        "resource body owns body-level ?= lowering" true
+        (match scope.rs_body.desc with
+        | CLet
+            ( { bind_ty; bind_rhs; _ },
+              {
+                desc =
+                  CMatchArms
+                    ( _,
+                      [
+                        (PatConstructor ("Some", [ PatVar "x" ]), _);
+                        ( PatConstructor ("None", []),
+                          {
+                            desc = CCall (CKBuiltin "blorp_option_none", _, []);
+                            _;
+                          } );
+                      ] );
+                ty;
+                _;
+              } ) ->
+            bind_ty = ty_opt_int && bind_rhs.ty = ty_opt_int && ty = ty_opt_int
+        | _ -> false)
+  | _ ->
+      Alcotest.fail
+        "expected fallible with success arm to own body-level question-bind \
+         lowering"
 
 (* ============================================================================
    Concurrency
@@ -828,6 +1063,7 @@ let test_param_missing_type_raises () =
       param_name = Some "x";
       param_pattern = None;
       param_type = None;
+      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -842,6 +1078,7 @@ let test_param_missing_type_raises () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -857,6 +1094,7 @@ let test_param_meta_type_raises () =
       param_name = Some "x";
       param_pattern = None;
       param_type = Some (TyNamed ("List", [ TyMeta 1 ]));
+      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -871,6 +1109,7 @@ let test_param_meta_type_raises () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -892,6 +1131,7 @@ let test_return_meta_type_raises () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -907,6 +1147,7 @@ let test_param_without_name_or_pattern_raises () =
       param_name = None;
       param_pattern = None;
       param_type = Some ty_int;
+      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -921,6 +1162,7 @@ let test_param_without_name_or_pattern_raises () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -942,6 +1184,7 @@ let test_function_without_name_raises () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -959,6 +1202,7 @@ let test_param_with_name_and_pattern_raises () =
       param_name = Some "x";
       param_pattern = Some (PatVar "y");
       param_type = Some ty_int;
+      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -973,6 +1217,7 @@ let test_param_with_name_and_pattern_raises () =
       func_is_tailrec = false;
       func_no_copy = false;
       func_debug_only = false;
+      func_resource_result_ordinary = false;
       func_dim_constraints = [];
     }
   in
@@ -1050,6 +1295,7 @@ let mk_param_named name ty =
     param_name = Some name;
     param_pattern = None;
     param_type = Some ty;
+    param_passing = ParamByValue;
     param_loc = loc;
   }
 
@@ -1066,6 +1312,7 @@ let mk_func_decl ?(is_pure = false) ?(is_tailrec = false) name params return_ty
     func_is_tailrec = is_tailrec;
     func_no_copy = false;
     func_debug_only = false;
+    func_resource_result_ordinary = false;
     func_dim_constraints = [];
   }
 
@@ -1167,6 +1414,7 @@ let test_lower_func_with_pattern_param () =
       param_name = None;
       param_pattern = Some (PatTuple [ PatVar "a"; PatVar "b" ]);
       param_type = Some tup_ty;
+      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -1296,6 +1544,8 @@ let test_lower_type_passthrough () =
         ];
       type_is_enum = true;
       type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
     }
   in
   let cd = lower_decl (mk_decl (DType tdecl)) in
@@ -1746,8 +1996,18 @@ let suite =
           test_lower_raw_string_interp_raises;
         Alcotest.test_case "question_bind" `Quick
           test_lower_question_bind_statement;
+        Alcotest.test_case "result_question_bind_rebuilds_error_carrier" `Quick
+          test_lower_result_question_bind_rebuilds_error_carrier;
         Alcotest.test_case "question_bind_direct_error" `Quick
           test_lower_question_bind_direct_error;
+        Alcotest.test_case "plain_with_resource_scope" `Quick
+          test_lower_plain_with_to_resource_scope;
+        Alcotest.test_case "registered_resource_cleanup" `Quick
+          test_lower_with_uses_registered_resource_cleanup;
+        Alcotest.test_case "fallible_with_resource_scope" `Quick
+          test_lower_fallible_with_to_resource_scope_success_arm;
+        Alcotest.test_case "fallible_with_body_question_bind_scope" `Quick
+          test_lower_fallible_with_body_question_bind_stays_inside_resource_scope;
       ] );
     ( "concurrency",
       [

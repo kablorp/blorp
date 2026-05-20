@@ -13,8 +13,17 @@ open Ast
 (** Explicit mutability for variable bindings *)
 type var_mutability = Immutable | Mutable
 
-(** Origin of a variable binding — used for context-specific error messages *)
-type var_origin = LetBinding | FuncParam | ForLoopVar | MatchBinding | Other
+(** Origin of a variable binding — used for context-specific error messages and
+    phase-local capability checks. *)
+type var_origin =
+  | LetBinding
+  | FuncParam
+  | BorrowedResourceParam
+  | ForLoopVar
+  | MatchBinding
+  | ScopedResource
+  | ScopedResourceDerived
+  | Other
 
 (** These shared types live in [Env_types] to avoid a circular library
     dependency (Session needs [overload_entry] / [impl_instance] to hold
@@ -24,6 +33,14 @@ type purity = Env_types.purity = Pure | Impure
 
 type func_origin = Env_types.func_origin = UserDefined | Builtin | Foreign
 type def_id = Env_types.def_id
+
+type resource_result_policy = Env_types.resource_result_policy =
+  | ResourceResultDependent
+  | ResourceResultOrdinary
+
+type resource_arg_policy = Env_types.resource_arg_policy =
+  | RejectResourceArgs
+  | AllowResourceArgs of resource_result_policy
 
 type loop_producer = Env_types.loop_producer =
   | LoopProducerIndices
@@ -45,7 +62,7 @@ type bound_type_param = Env_types.bound_type_param = {
 }
 (** Type parameter with optional trait bounds *)
 
-type type_kind = TypeUnion | TypeEnum | TypeBuiltin
+type type_kind = TypeUnion | TypeEnum | TypeBuiltin | TypeResource
 
 type overload_entry = Env_types.overload_entry = {
   ol_def_id : def_id;
@@ -54,6 +71,7 @@ type overload_entry = Env_types.overload_entry = {
   ol_param_names : string option list;
   ol_purity : purity;
   ol_origin : func_origin;
+  ol_resource_args : resource_arg_policy;
   ol_module_path : string option;
   ol_dim_constraints : (type_expr * type_expr) list;
   ol_loop_producer : loop_producer option;
@@ -76,6 +94,7 @@ type symbol_kind =
       param_names : string option list;
       purity : purity;
       origin : func_origin;
+      resource_args : resource_arg_policy;
       module_path : string option;
       dim_constraints : (type_expr * type_expr) list;
       loop_producer : loop_producer option;
@@ -230,6 +249,15 @@ val is_func_param : env -> string -> bool
 val is_for_loop_var : env -> string -> bool
 (** Check if a variable is a for-loop variable *)
 
+val is_scoped_resource_var : env -> string -> bool
+(** Check if a variable is a scoped resource binding. *)
+
+val is_scoped_resource_derived_var : env -> string -> bool
+(** Check if a variable is derived from a scoped resource binding. *)
+
+val is_scoped_resource_related_var : env -> string -> bool
+(** Check if a variable is either a scoped resource or a value derived from one. *)
+
 val add_func :
   env ->
   string ->
@@ -239,6 +267,7 @@ val add_func :
   ?param_names:string option list ->
   ?purity:purity ->
   ?origin:func_origin ->
+  ?resource_args:resource_arg_policy ->
   ?module_path:string ->
   ?dim_constraints:(type_expr * type_expr) list ->
   ?loop_producer:loop_producer ->
@@ -514,6 +543,9 @@ val add_overload : env -> string -> overload_entry -> env
 
 val get_overloads : env -> string -> overload_entry list
 (** Get all overload entries for a function name *)
+
+val find_overload_by_def_id : env -> def_id -> overload_entry option
+(** Find a registered overload by its canonical def id. *)
 
 val resolve_overload : env -> string -> type_expr -> overload_entry option
 (** Resolve an overloaded function name given the first argument's type *)

@@ -1,0 +1,343 @@
+-- Typed file resource API foundation.
+--
+-- This module starts the resource-backed file API with a typed error surface.
+-- Existing whole-file helpers remain in `system` while scoped file handles are
+-- added incrementally on top of `with` resource cleanup.
+import:
+	stream: FallibleStream
+
+
+---
+Opaque handle for read-only file operations.
+---
+resource type FileReader = builtin("blorp_file_close_reader")
+
+
+---
+Opaque handle for write-only file operations.
+---
+resource type FileWriter = builtin("blorp_file_close_writer")
+
+
+---
+Opaque handle for read-write file operations.
+---
+resource type File = builtin("blorp_file_close")
+
+
+---
+Private finalizer trait implemented by scoped file handles.
+
+`with` blocks use compiler-owned cleanup builtins directly. This trait keeps the
+runtime finalizers documented inside the module without exporting a manual
+`close` operation that could conflict with scoped cleanup ownership.
+---
+private trait FileClosable:
+	func close(handle: Self) -> Void
+
+
+implements FileClosable for FileReader:
+	func close(reader: FileReader) -> Void:
+		builtin("blorp_file_close_reader")
+
+
+implements FileClosable for FileWriter:
+	func close(writer: FileWriter) -> Void:
+		builtin("blorp_file_close_writer")
+
+
+implements FileClosable for File:
+	func close(file: File) -> Void:
+		builtin("blorp_file_close")
+
+
+---
+Errors reported by typed file APIs.
+
+Path-specific variants carry the path that was used for the operation. General
+variants carry a human-readable detail string from the runtime or caller.
+---
+union IOError:
+	NotFound(String)
+	PermissionDenied(String)
+	AlreadyExists(String)
+	InvalidInput(String)
+	Interrupted(String)
+	TimedOut(String)
+	Unsupported(String)
+	Other(String)
+
+
+---
+Return a stable, human-readable description of an I/O error.
+
+doctests:
+    :: Missing path
+    message(NotFound("/tmp/missing")) == "not found: /tmp/missing"
+
+    :: Permission denied
+    message(PermissionDenied("/root/secret")) == "permission denied: /root/secret"
+---
+pure func message(err: IOError) -> String:
+	match err:
+		NotFound(path): "not found: " + path
+		PermissionDenied(path): "permission denied: " + path
+		AlreadyExists(path): "already exists: " + path
+		InvalidInput(detail): "invalid input: " + detail
+		Interrupted(detail): "interrupted: " + detail
+		TimedOut(detail): "timed out: " + detail
+		Unsupported(detail): "unsupported: " + detail
+		Other(detail): "io error: " + detail
+
+
+implements Stringable for IOError:
+	pure func to_string(err: IOError) -> String:
+		message(err)
+
+
+---
+Open a file for reading as a scoped resource.
+
+Use with `with reader ?= open_read(path):` so the reader is closed
+automatically when the block exits.
+---
+func open_read(path: String) -> Result[FileReader, IOError]:
+	builtin("blorp_file_open_read_raw")
+
+
+---
+Open a file for writing as a scoped resource.
+
+Creates the file if it is missing and truncates it if it already exists. Use
+with `with writer ?= open_write(path):` so the writer is closed automatically
+when the block exits.
+---
+func open_write(path: String) -> Result[FileWriter, IOError]:
+	builtin("blorp_file_open_write_raw")
+
+
+---
+Open a file for appending as a scoped resource.
+
+Creates the file if it is missing and preserves existing contents. Use with
+`with writer ?= open_append(path):` so the writer is closed automatically when
+the block exits.
+---
+func open_append(path: String) -> Result[FileWriter, IOError]:
+	builtin("blorp_file_open_append_raw")
+
+
+---
+Open an existing file for reading and writing as a scoped resource.
+
+The path must already exist. The file is not truncated. Use with
+`with file ?= open_read_write(path):` so the handle is closed automatically
+when the block exits.
+---
+func open_read_write(path: String) -> Result[File, IOError]:
+	builtin("blorp_file_open_read_write_raw")
+
+
+---
+Read the remaining text from a scoped read handle.
+
+The handle must come directly from a `with` binding. The result is ordinary text
+and may leave the scope; the handle itself is still closed at the end of the
+`with` block.
+---
+@resource_result_ordinary
+func read_text(reader: FileReader) -> Result[String, IOError]:
+	builtin("blorp_file_read_text_reader_raw")
+
+
+---
+Read the remaining bytes from a scoped read handle.
+
+The handle must come directly from a `with` binding. The returned `Bytes` value
+is ordinary data and may leave the scope.
+---
+@resource_result_ordinary
+func read_bytes(reader: FileReader) -> Result[Bytes, IOError]:
+	builtin("blorp_file_read_bytes_reader_raw")
+
+
+---
+Read up to `max_bytes` bytes from a scoped read handle.
+
+Returns an empty `Bytes` value at end of file. Passing a non-positive size
+returns `Err(InvalidInput(...))`.
+---
+@resource_result_ordinary
+func read_chunk(
+	reader: FileReader,
+	max_bytes: Int,
+) -> Result[Bytes, IOError]:
+	builtin("blorp_file_read_chunk_reader_raw")
+
+
+---
+Create a fallible stream of byte chunks from a scoped read handle.
+
+The returned stream borrows the reader and must be consumed inside the `with`
+scope that owns the reader.
+---
+func chunks(reader: FileReader) -> FallibleStream[Bytes, IOError]:
+	builtin("blorp_file_chunks_reader_raw")
+
+
+---
+Create a fallible stream of byte chunks with an explicit chunk size.
+
+The returned stream borrows the reader and must be consumed inside the `with`
+scope that owns the reader. Passing a non-positive chunk size makes terminal
+operations such as `collect_result` return `Err(InvalidInput(...))`.
+---
+func chunks_with_size(reader: FileReader, chunk_size: Int) -> FallibleStream[Bytes, IOError]:
+	builtin("blorp_file_chunks_with_size_reader_raw")
+
+
+---
+Create a fallible stream of text lines from a scoped read handle.
+
+The returned stream borrows the reader and must be consumed inside the `with`
+scope that owns the reader. Lines are returned without trailing `\n` or `\r\n`.
+---
+func lines(reader: FileReader) -> FallibleStream[String, IOError]:
+	builtin("blorp_file_lines_reader_raw")
+
+
+---
+Create a fallible stream of individual bytes from a scoped read handle.
+
+The returned stream borrows the reader and must be consumed inside the `with`
+scope that owns the reader. Reads are internally buffered; consumers see one
+`UInt8` value at a time.
+---
+func bytes(reader: FileReader) -> FallibleStream[UInt8, IOError]:
+	builtin("blorp_file_bytes_reader_raw")
+
+
+---
+Create a fallible stream of sliding byte windows from a scoped read handle.
+
+Each item is an owned `Bytes` value of exactly `size` bytes. If the file is
+shorter than `size`, the stream is empty. Passing a non-positive size makes
+terminal operations such as `collect_result` return `Err(InvalidInput(...))`.
+---
+func windows(reader: FileReader, size: Int) -> FallibleStream[Bytes, IOError]:
+	builtin("blorp_file_windows_reader_raw")
+
+
+---
+Count text lines from the scoped read handle without materializing them.
+
+The count matches file line streaming semantics: an empty file has 0 lines, a
+trailing newline does not add an extra empty line, and a final line without a
+trailing newline is counted.
+---
+@resource_result_ordinary
+func count_lines(reader: FileReader) -> Result[Int, IOError]:
+	builtin("blorp_file_count_lines_reader_raw")
+
+
+---
+Write all text to a scoped write handle.
+
+The handle must come directly from a `with` binding. This writes the full string
+or returns a typed `IOError`.
+---
+@resource_result_ordinary
+func write_text(writer: FileWriter, text: String) -> Result[Void, IOError]:
+	builtin("blorp_file_write_text_writer_raw")
+
+
+---
+Write all bytes to a scoped write handle.
+
+The handle must come directly from a `with` binding. This writes the full buffer
+or returns a typed `IOError`.
+---
+@resource_result_ordinary
+func write_bytes(writer: FileWriter, data: Bytes) -> Result[Void, IOError]:
+	builtin("blorp_file_write_bytes_writer_raw")
+
+
+---
+Write one byte chunk to a scoped write handle.
+
+This performs one runtime write attempt and returns the number of bytes written.
+Use `write_bytes` when all bytes must be written before returning.
+---
+@resource_result_ordinary
+func write_chunk(writer: FileWriter, data: Bytes) -> Result[Int, IOError]:
+	builtin("blorp_file_write_chunk_writer_raw")
+
+
+---
+Read the remaining text from a scoped read-write handle.
+
+The handle must come directly from a `with` binding. Reading starts at the
+handle's current file offset.
+---
+@resource_result_ordinary
+func read_text_rw(file: File) -> Result[String, IOError]:
+	builtin("blorp_file_read_text_file_raw")
+
+
+---
+Read the remaining bytes from a scoped read-write handle.
+
+The handle must come directly from a `with` binding. Reading starts at the
+handle's current file offset.
+---
+@resource_result_ordinary
+func read_bytes_rw(file: File) -> Result[Bytes, IOError]:
+	builtin("blorp_file_read_bytes_file_raw")
+
+
+---
+Read up to `max_bytes` bytes from a scoped read-write handle.
+
+Returns an empty `Bytes` value at end of file. Passing a non-positive size
+returns `Err(InvalidInput(...))`.
+---
+@resource_result_ordinary
+func read_chunk_rw(file: File, max_bytes: Int) -> Result[Bytes, IOError]:
+	builtin("blorp_file_read_chunk_file_raw")
+
+
+---
+Count text lines from a scoped read-write handle without materializing them.
+
+Counting starts at the handle's current file offset.
+---
+@resource_result_ordinary
+func count_lines_rw(file: File) -> Result[Int, IOError]:
+	builtin("blorp_file_count_lines_file_raw")
+
+
+---
+Write all text to a scoped read-write handle at the current file offset.
+---
+@resource_result_ordinary
+func write_text_rw(file: File, text: String) -> Result[Void, IOError]:
+	builtin("blorp_file_write_text_file_raw")
+
+
+---
+Write all bytes to a scoped read-write handle at the current file offset.
+---
+@resource_result_ordinary
+func write_bytes_rw(file: File, data: Bytes) -> Result[Void, IOError]:
+	builtin("blorp_file_write_bytes_file_raw")
+
+
+---
+Write one byte chunk to a scoped read-write handle at the current file offset.
+
+This performs one runtime write attempt and returns the number of bytes written.
+Use `write_bytes_rw` when all bytes must be written before returning.
+---
+@resource_result_ordinary
+func write_chunk_rw(file: File, data: Bytes) -> Result[Int, IOError]:
+	builtin("blorp_file_write_chunk_file_raw")

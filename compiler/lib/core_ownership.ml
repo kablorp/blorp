@@ -672,6 +672,92 @@ let builtin_contract_table =
       builtins
         [ "blorp_tcp_set_timeout_listener"; "blorp_tcp_set_timeout_stream" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_file_open_read_raw";
+          "blorp_file_open_write_raw";
+          "blorp_file_open_append_raw";
+          "blorp_file_open_read_write_raw";
+        ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_file_read_text_reader_raw";
+          "blorp_file_read_bytes_reader_raw";
+          "blorp_file_read_text_file_raw";
+          "blorp_file_read_bytes_file_raw";
+        ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_file_read_chunk_reader_raw"; "blorp_file_read_chunk_file_raw" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_file_chunks_reader_raw" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_file_chunks_with_size_reader_raw" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_file_lines_reader_raw" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_file_bytes_reader_raw" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_file_windows_reader_raw" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_file_count_lines_reader_raw"; "blorp_file_count_lines_file_raw";
+        ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_fallible_stream_collect_file_raw" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_fallible_stream_count_file_raw" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_fallible_stream_find_file_raw_nullable";
+          "blorp_fallible_stream_find_file_raw_int";
+          "blorp_fallible_stream_find_file_raw_int8";
+          "blorp_fallible_stream_find_file_raw_int16";
+          "blorp_fallible_stream_find_file_raw_int32";
+          "blorp_fallible_stream_find_file_raw_int64";
+          "blorp_fallible_stream_find_file_raw_uint8";
+          "blorp_fallible_stream_find_file_raw_uint16";
+          "blorp_fallible_stream_find_file_raw_uint32";
+          "blorp_fallible_stream_find_file_raw_uint64";
+          "blorp_fallible_stream_find_file_raw_float";
+          "blorp_fallible_stream_find_file_raw_bool";
+          "blorp_fallible_stream_find_file_raw_char";
+          "blorp_fallible_stream_find_file_raw_f32";
+          "blorp_fallible_stream_find_file_raw_f16";
+        ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_fallible_stream_any_file_raw";
+          "blorp_fallible_stream_all_file_raw";
+        ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_fallible_stream_fold_file_raw" ]
+        (bfixed [ Borrow; Consume; Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_file_write_text_writer_raw";
+          "blorp_file_write_bytes_writer_raw";
+          "blorp_file_write_chunk_writer_raw";
+          "blorp_file_write_text_file_raw";
+          "blorp_file_write_bytes_file_raw";
+          "blorp_file_write_chunk_file_raw";
+        ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_file_close_reader";
+          "blorp_file_close_writer";
+          "blorp_file_close";
+        ]
+        (bfixed [ Borrow ] ReturnVoid);
       builtins [ "blorp_string_concat" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
         [ "blorp_string_concat_consume" ]

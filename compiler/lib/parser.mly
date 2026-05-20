@@ -85,6 +85,8 @@ let mk_func ~dim_constraints ~is_pure ~name ~tparams ~params ~ret ~body
     func_is_tailrec = List.mem "tailrec" annots;
     func_no_copy = List.mem "no_copy" annots;
     func_debug_only = List.mem "debug_only" annots;
+    func_resource_result_ordinary =
+      List.mem "resource_result_ordinary" annots;
     func_dim_constraints = dim_constraints }
 
 let mk_foreign_func ~is_pure ~fn_name ~params ~ret ~c_name ~annots =
@@ -141,7 +143,7 @@ let concurrent_max_threads_or_error loc n =
 %token LT GT PERCENT HASH AT ARROW LE GE EQ NE EQUALS
 %token PLUS_EQ MINUS_EQ STAR_EQ SLASH_EQ
 %token QUESTION_EQUALS FATARROW
-%token TRY WITH DEBUG
+%token TRY WITH DEBUG RESOURCE BORROW
 %token CONCURRENT
 %token PIPE
 %token INDENT DEDENT NEWLINE
@@ -205,6 +207,7 @@ name:
   | WHILE { "while" }
   | WITH { "with" }
   | FOREIGN { "foreign" }
+  | RESOURCE { "resource" }
 
 identifier:
   | n = IDENT { n }
@@ -369,25 +372,29 @@ params:
 
 param:
   | name = IDENT COLON ty = type_expr
-    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+  | name = IDENT COLON BORROW ty = type_expr
+    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_passing = ParamBorrow; param_loc = loc_of_pos $symbolstartpos } }
   | name = IDENT
-    { { param_name = Some name; param_pattern = None; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some name; param_pattern = None; param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
   | UNDERSCORE
-    { { param_name = None; param_pattern = Some PatWildcard; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = None; param_pattern = Some PatWildcard; param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
   | UNDERSCORE COLON ty = type_expr
-    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+  | UNDERSCORE COLON BORROW ty = type_expr
+    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_passing = ParamBorrow; param_loc = loc_of_pos $symbolstartpos } }
   | LPAREN p1 = IDENT COMMA ps = trailing_nonempty_list(COMMA, IDENT) RPAREN COLON ty = type_expr
     { let all = p1 :: ps in
       if List.length all > 4 then parse_fail_at $symbolstartpos "Tuples support 2-4 elements";
       { param_name = None;
         param_pattern = Some (PatTuple (List.map (fun n -> PatVar n) all));
-        param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
+        param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
   | LPAREN p1 = IDENT COMMA ps = trailing_nonempty_list(COMMA, IDENT) RPAREN
     { let all = p1 :: ps in
       if List.length all > 4 then parse_fail_at $symbolstartpos "Tuples support 2-4 elements";
       { param_name = None;
         param_pattern = Some (PatTuple (List.map (fun n -> PatVar n) all));
-        param_type = None; param_loc = loc_of_pos $symbolstartpos } }
+        param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
 
 func_body:
   | e = expr { func_body_of_expr e }
@@ -487,7 +494,9 @@ type_decl:
         type_params = type_params;
         type_variants = variants;
         type_is_enum = false;
-        type_is_builtin = false } }
+        type_is_builtin = false;
+        type_is_resource = false;
+        type_resource_cleanup = None } }
   (* Primitive type declaration: [type Name = builtin] or [type Name[T] = builtin].
      Declares a type whose representation and operations are provided by the
      compiler. Used in std/ to make primitives like Int, Float, Tensor visible
@@ -497,7 +506,25 @@ type_decl:
         type_params = type_params;
         type_variants = [];
         type_is_enum = false;
-        type_is_builtin = true } }
+        type_is_builtin = true;
+        type_is_resource = false;
+        type_resource_cleanup = None } }
+  | RESOURCE TYPE name = IDENT type_params = type_params_opt EQUALS BUILTIN
+    { { type_name = name;
+        type_params = type_params;
+        type_variants = [];
+        type_is_enum = false;
+        type_is_builtin = true;
+        type_is_resource = true;
+        type_resource_cleanup = None } }
+  | RESOURCE TYPE name = IDENT type_params = type_params_opt EQUALS BUILTIN LPAREN cleanup = STRING RPAREN
+    { { type_name = name;
+        type_params = type_params;
+        type_variants = [];
+        type_is_enum = false;
+        type_is_builtin = true;
+        type_is_resource = true;
+        type_resource_cleanup = Some (ResourceCleanupBuiltin cleanup) } }
 
 (* Enum declaration (integer-valued union, no fields, no type params) *)
 enum_decl:
@@ -507,7 +534,9 @@ enum_decl:
         type_params = [];
         type_variants = variants;
         type_is_enum = true;
-        type_is_builtin = false } }
+        type_is_builtin = false;
+        type_is_resource = false;
+        type_resource_cleanup = None } }
 
 variant_list:
   | v = variant { [v] }
@@ -1245,11 +1274,11 @@ lambda_expr:
 
 lambda_param:
   | name = IDENT COLON ty = type_expr
-    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
   | name = IDENT
-    { { param_name = Some name; param_pattern = None; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some name; param_pattern = None; param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
   (* Underscore as discard parameter *)
   | UNDERSCORE COLON ty = type_expr
-    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
   | UNDERSCORE
-    { { param_name = Some "_"; param_pattern = None; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some "_"; param_pattern = None; param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }

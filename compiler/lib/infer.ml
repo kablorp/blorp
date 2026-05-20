@@ -797,6 +797,657 @@ let annotate_expr_type_info expr info = Ast.with_expr_type_info expr info
 let annotate_inferred_expr expr ty =
   annotate_expr_type_info expr (Ast.expr_type_info_from_type ty)
 
+(** Collect all variable references in an expression.
+    Used for scoped-resource and mutable capture detection. *)
+let rec collect_var_refs (expr : expr) : string list =
+  match expr.expr_desc with
+  | EIdent name -> [ name ]
+  | EAssign (name, init) -> name :: collect_var_refs init
+  | _ -> List.concat_map collect_var_refs (expr_children expr)
+
+let split_resource_def_id_suffix (name : string) : string * int option =
+  match String.rindex_opt name '#' with
+  | None -> (name, None)
+  | Some hash_idx ->
+      let clean = String.sub name 0 hash_idx in
+      let id_str =
+        String.sub name (hash_idx + 1) (String.length name - hash_idx - 1)
+      in
+      (clean, int_of_string_opt id_str)
+
+let resource_result_policy_of_entry (entry : Env.overload_entry) =
+  match entry.ol_resource_args with
+  | AllowResourceArgs policy -> Some policy
+  | RejectResourceArgs -> None
+
+let resource_result_policy_for_callee env callee =
+  match callee.expr_desc with
+  | EIdent name -> (
+      let clean, def_id = split_resource_def_id_suffix name in
+      match def_id with
+      | Some id ->
+          Option.bind
+            (Env.find_overload_by_def_id env id)
+            resource_result_policy_of_entry
+      | None -> (
+          match Env.lookup env clean with
+          | Some { kind = FuncSymbol { resource_args; _ }; _ } -> (
+              match resource_args with
+              | AllowResourceArgs policy -> Some policy
+              | RejectResourceArgs -> None)
+          | _ -> (
+              match Env.get_overloads env clean with
+              | [ entry ] -> resource_result_policy_of_entry entry
+              | _ -> None)))
+  | _ -> None
+
+let rec scoped_resource_dependency_refs env expr =
+  match expr.expr_desc with
+  | EIdent name when Env.is_scoped_resource_related_var env name -> [ name ]
+  | ECall (callee, _args)
+    when resource_result_policy_for_callee env callee
+         = Some ResourceResultOrdinary ->
+      []
+  | _ ->
+      expr |> expr_children
+      |> List.concat_map (scoped_resource_dependency_refs env)
+      |> List.sort_uniq String.compare
+
+let scoped_resource_related_refs env expr =
+  scoped_resource_dependency_refs env expr
+
+let scoped_resource_derived_refs env expr =
+  expr |> collect_var_refs
+  |> List.sort_uniq String.compare
+  |> List.filter (Env.is_scoped_resource_derived_var env)
+
+let is_one_shot_stream_type_name name =
+  match Types.split_canonical_module_type_name name with
+  | Some (module_path, ("Stream" | "FallibleStream")) ->
+      module_path = "std/stream"
+  | _ ->
+      name = "Stream" || name = "FallibleStream"
+      || name = "std_stream__Stream"
+      || name = "std_stream__FallibleStream"
+      || name = "std/stream::Stream"
+      || name = "std/stream::FallibleStream"
+
+let type_contains_one_shot_stream env ty =
+  let apply_named_subst type_params args tys =
+    let subst =
+      if List.length type_params = List.length args then
+        List.map2
+          (fun var_name concrete_type -> { var_name; concrete_type })
+          type_params args
+      else []
+    in
+    List.map (apply_subst subst) tys
+  in
+  let named_component_types name args =
+    let record_fields =
+      match Env.get_record env name with
+      | Some (type_params, fields) ->
+          fields
+          |> List.map (fun field -> field.field_type)
+          |> apply_named_subst type_params args
+      | None -> []
+    in
+    let variant_fields =
+      match Env.get_type_decl env name with
+      | Some (type_params, variants) ->
+          variants
+          |> List.concat_map (fun variant -> variant.variant_fields)
+          |> apply_named_subst type_params args
+      | None -> []
+    in
+    record_fields @ variant_fields
+  in
+  let rec go visited ty =
+    let ty =
+      normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
+    in
+    match ty with
+    | TyNamed (name, args) ->
+        is_one_shot_stream_type_name name
+        || List.exists (go visited) args
+        ||
+        if List.mem name visited then false
+        else
+          named_component_types name args |> List.exists (go (name :: visited))
+    | TyTuple elems -> List.exists (go visited) elems
+    | TyFunc _ ->
+        (* Function values do not themselves contain stream cursor state.
+           Closures that capture a stream are rejected at closure construction. *)
+        false
+    | TyRange inner -> go visited inner
+    | TyArray (elem, dims) -> go visited elem || List.exists (go visited) dims
+    | TyDimOp (_, left, right) -> go visited left || go visited right
+    | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _ ->
+        false
+  in
+  go [] ty
+
+let one_shot_stream_refs env refs =
+  refs
+  |> List.filter (fun name ->
+      match Env.lookup env name with
+      | Some { kind = Env.VarSymbol { var_type; _ }; _ } ->
+          type_contains_one_shot_stream env var_type
+      | Some _ | None -> false)
+
+let one_shot_stream_capture_refs env expr =
+  expr |> collect_var_refs
+  |> List.sort_uniq String.compare
+  |> one_shot_stream_refs env
+
+let expression_derives_from_scoped_resource env expr =
+  scoped_resource_related_refs env expr <> []
+
+let binding_origin_for_value env value =
+  if expression_derives_from_scoped_resource env value then
+    Env.ScopedResourceDerived
+  else Env.LetBinding
+
+let reject_scoped_resource_derived_escape env loc expr =
+  match scoped_resource_related_refs env expr with
+  | [] -> Ok ()
+  | vars ->
+      error_with
+        ~notes:
+          [
+            "Values computed from a scoped resource inherit that resource's \
+             lifetime.";
+          ]
+        ~help:
+          (Some
+             "Return ordinary data computed inside the with block, not a \
+              resource handle, stream, cursor, or value that still depends on \
+              it.")
+        loc
+        (Printf.sprintf
+           "scoped resource-derived values cannot escape a with block: %s"
+           (String.concat ", " vars))
+
+let reject_scoped_resource_derived_assignment env loc target expr =
+  match scoped_resource_related_refs env expr with
+  | [] -> Ok ()
+  | vars ->
+      error_with
+        ~notes:
+          [
+            "Mutable bindings can outlive the resource scope that writes to \
+             them, so storing a value computed from a scoped resource would \
+             make its lifetime ambiguous.";
+          ]
+        ~help:
+          (Some
+             "Keep scoped-resource-derived values in immutable bindings inside \
+              the with block until resource operation result metadata can \
+              distinguish ordinary data from scoped dependent values.")
+        loc
+        (Printf.sprintf
+           "scoped resource-derived value cannot be assigned to mutable \
+            variable '%s': %s"
+           target (String.concat ", " vars))
+
+let reject_scoped_resource_derived_storage env loc container expr =
+  match scoped_resource_related_refs env expr with
+  | [] -> Ok ()
+  | vars ->
+      error_with
+        ~notes:
+          [
+            "Values computed from a scoped resource inherit that resource's \
+             lifetime. Storing one in an ordinary aggregate would hide the \
+             scoped lifetime inside a copyable value.";
+          ]
+        ~help:
+          (Some
+             "Consume dependent streams, cursors, and borrowed values inside \
+              the with block, or store only ordinary data computed from them.")
+        loc
+        (Printf.sprintf
+           "scoped resource-derived values cannot be stored in %s: %s" container
+           (String.concat ", " vars))
+
+let reject_one_shot_stream_storage env loc container ty =
+  if type_contains_one_shot_stream env ty then
+    error_with
+      ~notes:
+        [
+          "Streams are one-shot cursors with mutable pull state. Storing one \
+           in an ordinary aggregate would hide that cursor state inside a \
+           copyable value.";
+        ]
+      ~help:
+        (Some
+           "Keep streams in direct local bindings and consume them with stream \
+            operations, or collect ordinary data before storing it.")
+      loc
+      (Printf.sprintf "one-shot stream values cannot be stored in %s (found %s)"
+         container (type_to_string ty))
+  else Ok ()
+
+let reject_scoped_resource_task_capture env loc expr =
+  let scoped_captures =
+    expr |> collect_var_refs
+    |> List.sort_uniq String.compare
+    |> List.filter (Env.is_scoped_resource_var env)
+  in
+  let derived_captures = scoped_resource_derived_refs env expr in
+  let stream_captures = one_shot_stream_capture_refs env expr in
+  match (scoped_captures, derived_captures, stream_captures) with
+  | [], [], [] -> Ok ()
+  | _ ->
+      let label, vars, notes, help =
+        if scoped_captures <> [] then
+          ( "scoped resource",
+            scoped_captures,
+            [
+              "Concurrent tasks copy their captures into task storage. Scoped \
+               resources need an explicit concurrency-safe borrow contract \
+               before they can cross that boundary.";
+            ],
+            "Use the resource synchronously inside the with block, or derive \
+             ordinary data before starting concurrent work." )
+        else if derived_captures <> [] then
+          ( "scoped resource-derived value",
+            derived_captures,
+            [
+              "Concurrent tasks copy their captures into task storage. Values \
+               derived from scoped resources inherit the resource lifetime and \
+               cannot cross that boundary.";
+            ],
+            "Consume dependent streams, cursors, and borrowed values inside \
+             the with block, or derive ordinary data before starting \
+             concurrent work." )
+        else
+          ( "one-shot stream value",
+            stream_captures,
+            [
+              "Streams are one-shot cursors with mutable pull state. \
+               Concurrent tasks copy captures into task storage, which could \
+               let multiple fibers pull from the same cursor.";
+            ],
+            "Create and consume the stream inside the task, or collect \
+             ordinary data before starting concurrent work." )
+      in
+      error_with ~notes ~help:(Some help) loc
+        (Printf.sprintf "concurrent task cannot capture %s%s: %s" label
+           (if List.length vars > 1 then "s" else "")
+           (String.concat ", " vars))
+
+let resource_type_name ctx ty =
+  match normalize_type ctx ResourceBinding ty |> Types.head_resolve with
+  | TyNamed (name, _) -> Some name
+  | _ -> None
+
+let is_resource_type ctx ty =
+  match resource_type_name ctx ty with
+  | Some name -> Env.get_type_kind ctx.env name = Some TypeResource
+  | None -> false
+
+let type_contains_resource ctx ty =
+  let apply_named_subst type_params args tys =
+    let subst =
+      if List.length type_params = List.length args then
+        List.map2
+          (fun var_name concrete_type -> { var_name; concrete_type })
+          type_params args
+      else []
+    in
+    List.map (apply_subst subst) tys
+  in
+  let named_component_types name args =
+    let record_fields =
+      match Env.get_record ctx.env name with
+      | Some (type_params, fields) ->
+          fields
+          |> List.map (fun field -> field.field_type)
+          |> apply_named_subst type_params args
+      | None -> []
+    in
+    let variant_fields =
+      match Env.get_type_decl ctx.env name with
+      | Some (type_params, variants) ->
+          variants
+          |> List.concat_map (fun variant -> variant.variant_fields)
+          |> apply_named_subst type_params args
+      | None -> []
+    in
+    record_fields @ variant_fields
+  in
+  let rec go visited ty =
+    let ty = normalize_type ctx ResourceBinding ty |> Types.head_resolve in
+    match ty with
+    | TyNamed (name, args) ->
+        is_resource_type ctx ty
+        || List.exists (go visited) args
+        ||
+        if List.mem name visited then false
+        else
+          named_component_types name args |> List.exists (go (name :: visited))
+    | TyTuple elems -> List.exists (go visited) elems
+    | TyFunc { params; return; _ } ->
+        List.exists (go visited) params || go visited return
+    | TyRange inner -> go visited inner
+    | TyArray (elem, dims) -> go visited elem || List.exists (go visited) dims
+    | TyDimOp (_, left, right) -> go visited left || go visited right
+    | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _ ->
+        false
+  in
+  go [] ty
+
+let resource_binding_type_display = function
+  | TyConstInt _ -> "Int"
+  | ty -> type_to_string ty
+
+let require_resource_type ctx loc ty =
+  if is_resource_type ctx ty then Ok ()
+  else
+    error_with
+      ~notes:
+        [
+          "Only values whose type was declared with `resource type` can be \
+           acquired by `with`.";
+        ]
+      ~help:
+        (Some
+           "Use ordinary bindings for normal values, or acquire a \
+            compiler-known resource capability.")
+      loc
+      (Printf.sprintf "with binding requires a resource type, got %s"
+         (resource_binding_type_display ty))
+
+let reject_scoped_resource_escape ctx loc ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "A resource acquired by `with` is a scoped capability. Returning it \
+           would let code use it after the compiler-owned cleanup edge.";
+        ]
+      ~help:
+        (Some
+           "Return ordinary data derived from the resource instead of the \
+            resource handle itself.")
+      loc "scoped resource values cannot escape a with block"
+  else Ok ()
+
+let result_expr_of_body expr =
+  match expr.expr_desc with
+  | EBlock exprs ->
+      let rec last = function
+        | [] -> None
+        | [ x ] -> Some x
+        | _ :: rest -> last rest
+      in
+      last exprs
+  | _ -> Some expr
+
+let reject_with_body_resource_escape ctx loc ty expr =
+  if type_contains_resource ctx ty then reject_scoped_resource_escape ctx loc ty
+  else if types_equal ty ty_void then Ok ()
+  else
+    match result_expr_of_body expr with
+    | Some result_expr ->
+        reject_scoped_resource_derived_escape ctx.env result_expr.expr_loc
+          result_expr
+    | None -> Ok ()
+
+let reject_ordinary_resource_binding ctx loc binding_name ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "Resource values are external capabilities with scoped cleanup, not \
+           ordinary copyable values.";
+        ]
+      ~help:
+        (Some
+           "Acquire the resource with a `with` binding and return ordinary \
+            data derived from it.")
+      loc
+      (Printf.sprintf "resource value%s cannot be bound to an ordinary variable"
+         (match binding_name with
+         | None | Some "_" -> ""
+         | Some n -> " '" ^ n ^ "'"))
+  else Ok ()
+
+let reject_resource_assignment ctx loc target ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "Resource values are external capabilities with scoped cleanup, not \
+           ordinary mutable values.";
+        ]
+      ~help:
+        (Some
+           "Acquire the resource with a `with` binding and keep it inside that \
+            scope.")
+      loc
+      (Printf.sprintf
+         "resource-containing value cannot be assigned to mutable variable '%s'"
+         target)
+  else Ok ()
+
+let reject_concurrent_resource_result ctx loc ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "Concurrent task results are ordinary values stored for the parent \
+           to join. A resource result would leave cleanup ownership outside an \
+           explicit with scope.";
+        ]
+      ~help:
+        (Some
+           "Acquire resources with `with` inside synchronous code, and return \
+            only ordinary data from concurrent tasks.")
+      loc "concurrent task result cannot contain resource values"
+  else Ok ()
+
+let resource_call_allows_resource_arg ctx callee_name resolved_overload =
+  match resolved_overload with
+  | Some entry -> (
+      match entry.Env.ol_resource_args with
+      | AllowResourceArgs _ -> true
+      | RejectResourceArgs -> false)
+  | None -> (
+      match callee_name with
+      | Some name -> (
+          match Env.lookup ctx.env name with
+          | Some
+              {
+                kind = FuncSymbol { resource_args = AllowResourceArgs _; _ };
+                _;
+              } ->
+              true
+          | _ -> false)
+      | None -> false)
+
+let reject_ordinary_resource_call_arg ctx loc callee_name resolved_overload
+    arg_types =
+  if not (List.exists (type_contains_resource ctx) arg_types) then Ok ()
+  else if resource_call_allows_resource_arg ctx callee_name resolved_overload
+  then Ok ()
+  else
+    let callee_hint =
+      match callee_name with Some name -> " '" ^ name ^ "'" | None -> ""
+    in
+    error_with
+      ~notes:
+        [
+          "Ordinary function parameters copy values. Resource values need an \
+           explicit borrow or compiler-owned resource operation.";
+        ]
+      ~help:
+        (Some
+           "Keep resource use inside the with block and pass ordinary data to \
+            user-defined functions.")
+      loc
+      (Printf.sprintf
+         "scoped resource value cannot be passed to ordinary call%s" callee_hint)
+
+let is_direct_scoped_resource_arg env expr =
+  match expr.expr_desc with
+  | EIdent name -> Env.is_scoped_resource_var env name
+  | _ -> false
+
+let reject_unscoped_resource_operation_arg ctx callee_name resolved_overload
+    typed_args =
+  if not (resource_call_allows_resource_arg ctx callee_name resolved_overload)
+  then Ok ()
+  else
+    List.fold_left
+      (fun acc (arg_ty, arg) ->
+        let* () = acc in
+        if
+          type_contains_resource ctx arg_ty
+          && not (is_direct_scoped_resource_arg ctx.env arg)
+        then
+          let callee_hint =
+            match callee_name with
+            | Some name -> Printf.sprintf " in call to '%s'" name
+            | None -> ""
+          in
+          error_with
+            ~notes:
+              [
+                "Compiler-owned resource operations borrow resources; they do \
+                 not acquire or own cleanup for fresh resource-producing \
+                 expressions.";
+              ]
+            ~help:
+              (Some
+                 "Acquire the resource with `with name = ...:` and pass that \
+                  scoped binding to the resource operation.")
+            arg.expr_loc
+            (Printf.sprintf
+               "resource argument to compiler-owned resource operation must be \
+                a scoped with binding%s"
+               callee_hint)
+        else Ok ())
+      (Ok ()) typed_args
+
+let reject_scoped_resource_derived_call_arg ctx loc callee_name
+    resolved_overload args =
+  if resource_call_allows_resource_arg ctx callee_name resolved_overload then
+    Ok ()
+  else
+    let vars =
+      args
+      |> List.concat_map (scoped_resource_related_refs ctx.env)
+      |> List.sort_uniq String.compare
+    in
+    match vars with
+    | [] -> Ok ()
+    | _ ->
+        let callee_hint =
+          match callee_name with Some name -> " '" ^ name ^ "'" | None -> ""
+        in
+        error_with
+          ~notes:
+            [
+              "Ordinary function parameters copy values. Values derived from a \
+               scoped resource need an explicit borrow or resource operation \
+               contract before their lifetime can cross a call boundary.";
+            ]
+          ~help:
+            (Some
+               "Keep dependent streams, cursors, and borrowed values inside \
+                the with block, or pass ordinary data computed from them.")
+          loc
+          (Printf.sprintf
+             "scoped resource-derived value cannot be passed to ordinary call%s"
+             callee_hint)
+
+let collection_kind_user_name = function
+  | Type_widening.ListLiteral -> "list literals"
+  | Type_widening.VectorLiteral -> "tensor/vector literals"
+  | Type_widening.DictLiteral -> "dict literals"
+  | Type_widening.SetLiteral -> "set literals"
+
+let reject_resource_collection_element ctx loc kind ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "Collections are ordinary values with value semantics; storing a \
+           resource in one would copy the external capability.";
+        ]
+      ~help:
+        (Some
+           "Keep the resource as the with binding and store only ordinary data \
+            derived from it.")
+      loc
+      (Printf.sprintf "resource values cannot be stored in %s"
+         (collection_kind_user_name kind))
+  else Ok ()
+
+let reject_resource_tuple_element ctx loc ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "Tuples are ordinary values with value semantics; storing a resource \
+           in one would copy the external capability.";
+        ]
+      ~help:
+        (Some
+           "Keep the resource as the with binding and store only ordinary data \
+            derived from it.")
+      loc "resource values cannot be stored in tuple literals"
+  else Ok ()
+
+let reject_resource_record_field ctx loc _field_name ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "Records are ordinary values with value semantics; storing a \
+           resource in one would copy the external capability.";
+        ]
+      ~help:
+        (Some
+           "Keep the resource as the with binding and store only ordinary data \
+            derived from it.")
+      loc "resource values cannot be stored in record fields"
+  else Ok ()
+
+let reject_discarded_resource_value ctx loc ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "Resource values have compiler-owned cleanup semantics. Discarding \
+           one would create an external capability without a cleanup edge.";
+        ]
+      ~help:
+        (Some
+           "Acquire the resource with `with name = ...:` or `with name ?= \
+            ...:` so cleanup is scoped explicitly.")
+      loc "resource-containing value cannot be discarded"
+  else Ok ()
+
+let validate_with_binding_annotation ctx loc ty_ann inner_ty =
+  match ty_ann with
+  | Some ann_ty ->
+      let type_params = Env.get_type_params ctx.env in
+      if types_compatible ~type_params ann_ty inner_ty then Ok ann_ty
+      else
+        error loc
+          (Printf.sprintf
+             "Type annotation `%s` does not match acquired resource type `%s`"
+             (type_to_string ann_ty) (type_to_string inner_ty))
+  | None -> Ok inner_ty
+
+let with_resource_scope_ctx ctx name binding_ty =
+  let env = push_scope ctx.env in
+  if name = "_" then { ctx with env }
+  else { ctx with env = add_var env name binding_ty ~origin:ScopedResource () }
+
 (** Validate a ?= type annotation against the unwrapped inner type,
     bind the variable, and return the updated context and typed stmt. *)
 let validate_question_bind ctx stmt name ty_ann inner_ty rhs' =
@@ -813,7 +1464,11 @@ let validate_question_bind ctx stmt name ty_ann inner_ty rhs' =
     | None -> Ok ()
   in
   let bind_ty = match ty_ann with Some t -> t | None -> inner_ty in
-  let env' = Env.add_var ctx.env name bind_ty () in
+  let env' =
+    Env.add_var ctx.env name bind_ty
+      ~origin:(binding_origin_for_value ctx.env rhs')
+      ()
+  in
   let ctx' = { ctx with env = env' } in
   let stmt' =
     annotate_inferred_expr
@@ -1102,6 +1757,14 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
             | Some td -> Typed_ast.program_ast td
             | None -> m.decls
           in
+          let private_traits =
+            List.filter_map
+              (fun d ->
+                match d.decl_desc with
+                | DPrivate { decl_desc = DTrait t; _ } -> Some t.trait_name
+                | _ -> None)
+              decls
+          in
           let local_type_names = module_local_type_names_from_decls decls in
           let qualify ty =
             Types.qualify_module_local_types ~module_path:m.name
@@ -1141,6 +1804,10 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
             match Typed_ast.decl_view typed_decl with
             | Typed_ast.DeclPrivate _ -> None
             | Typed_ast.DeclImpl typed_impl
+              when List.mem (Typed_ast.impl_ast typed_impl).impl_trait
+                     private_traits ->
+                None
+            | Typed_ast.DeclImpl typed_impl
               when not
                      (Codegen_types.has_type_vars
                         (Typed_ast.impl_ast typed_impl).impl_for_type) -> (
@@ -1166,6 +1833,7 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
           let try_impl d =
             match d.decl_desc with
             | DPrivate _ -> None (* private impls don't export *)
+            | DImpl impl when List.mem impl.impl_trait private_traits -> None
             | DImpl impl
               when not (Codegen_types.has_type_vars impl.impl_for_type) -> (
                 (* Only non-generic impls. Generic impls (e.g.
@@ -1460,7 +2128,7 @@ let type_layout_metadata_for_env (env : Env.env) =
     | None -> (
         match Env.get_type_kind env name with
         | Some TypeUnion -> true
-        | Some TypeEnum | Some TypeBuiltin | None -> false)
+        | Some TypeEnum | Some TypeBuiltin | Some TypeResource | None -> false)
   in
   Core_type_layout.metadata ~is_managed_name
     ~is_value_record_name:(Env.is_value_record env)
@@ -1837,14 +2505,6 @@ let check_logop (_op : logop) (left_ty : type_expr) (right_ty : type_expr) loc :
    Mutable Capture Detection
    ============================================================================ *)
 
-(** Collect all variable references in an expression.
-    Used for mutable capture detection in closures. *)
-let rec collect_var_refs (expr : expr) : string list =
-  match expr.expr_desc with
-  | EIdent name -> [ name ]
-  | EAssign (name, init) -> name :: collect_var_refs init
-  | _ -> List.concat_map collect_var_refs (expr_children expr)
-
 (** Check if a lambda captures any mutable variables *)
 let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
     compiler_error option =
@@ -1872,15 +2532,73 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
             | _ -> false)
           free_vars
       in
-      match mutable_captures with
-      | [] -> None
-      | vars ->
+      let resource_captures =
+        List.filter (fun name -> Env.is_scoped_resource_var env name) free_vars
+      in
+      let derived_captures =
+        List.filter
+          (fun name -> Env.is_scoped_resource_derived_var env name)
+          free_vars
+      in
+      let stream_captures = one_shot_stream_refs env free_vars in
+      match
+        (resource_captures, derived_captures, stream_captures, mutable_captures)
+      with
+      | [], [], [], [] -> None
+      | [], [], [], vars ->
           Some
             {
               message =
                 Printf.sprintf
                   "Closure cannot capture mutable variable%s: %s. Use explicit \
                    state threading instead."
+                  (if List.length vars > 1 then "s" else "")
+                  (String.concat ", " vars);
+              loc;
+              phase = TypeCheck;
+              kind = OtherError;
+              notes = [];
+              help = None;
+            }
+      | (_ :: _ as vars), _, _, _ ->
+          Some
+            {
+              message =
+                Printf.sprintf
+                  "Closure cannot capture scoped resource%s: %s. Keep resource \
+                   use inside the with block without storing it in a closure."
+                  (if List.length vars > 1 then "s" else "")
+                  (String.concat ", " vars);
+              loc;
+              phase = TypeCheck;
+              kind = OtherError;
+              notes = [];
+              help = None;
+            }
+      | [], (_ :: _ as vars), _, _ ->
+          Some
+            {
+              message =
+                Printf.sprintf
+                  "Closure cannot capture scoped resource-derived value%s: %s. \
+                   Keep dependent streams, cursors, and borrowed values inside \
+                   the with block."
+                  (if List.length vars > 1 then "s" else "")
+                  (String.concat ", " vars);
+              loc;
+              phase = TypeCheck;
+              kind = OtherError;
+              notes = [];
+              help = None;
+            }
+      | [], [], vars, _ ->
+          Some
+            {
+              message =
+                Printf.sprintf
+                  "Closure cannot capture one-shot stream value%s: %s. Create \
+                   and consume the stream inside the closure, or collect \
+                   ordinary data before creating the closure."
                   (if List.length vars > 1 then "s" else "")
                   (String.concat ", " vars);
               loc;
@@ -2819,15 +3537,122 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             ( ty,
               annotate_expected_value_slot ctx (with_inferred_type expr ty) ty
             ))
-  | EWith _ ->
-      error_with
-        ~notes:
-          [ "resource scopes need cleanup lowering before they can typecheck" ]
-        ~help:
-          (Some
-             "Use existing explicit open/close APIs or compatibility helpers \
-              until with cleanup lowering is implemented.")
-        loc "with resource scopes are parsed but not implemented yet"
+  | EWith (binding, body) -> (
+      let ty_ann =
+        binding.with_type
+        |> Option.map (resolve_local_binding_annotation ctx)
+        |> Option.map Type_resolution.canonical
+      in
+      match binding.with_kind with
+      | WithPlain ->
+          let* acquire_ty, acquire' =
+            match ty_ann with
+            | Some ty -> infer_annotated_value_expr ctx ty binding.with_value
+            | None -> infer_unconstrained_value_expr ctx binding.with_value
+          in
+          let* binding_ty =
+            validate_with_binding_annotation ctx binding.with_value.expr_loc
+              ty_ann acquire_ty
+          in
+          let* () =
+            require_resource_type ctx binding.with_value.expr_loc binding_ty
+          in
+          let resource_ctx =
+            with_resource_scope_ctx ctx binding.with_name binding_ty
+          in
+          let* body_ty, body' = infer_expr resource_ctx body in
+          let* () =
+            reject_with_body_resource_escape resource_ctx body.expr_loc body_ty
+              body'
+          in
+          let binding' =
+            { binding with with_type = Some binding_ty; with_value = acquire' }
+          in
+          Ok
+            ( body_ty,
+              with_inferred_type
+                { expr with expr_desc = EWith (binding', body') }
+                body_ty )
+      | WithTry ->
+          let* rhs_ty, rhs' =
+            infer_unconstrained_value_expr ctx binding.with_value
+          in
+          let* inner_ty =
+            match (expected_type_opt ctx, rhs_ty) with
+            | Some (TyNamed ("Option", [ _ ])), TyNamed ("Option", [ inner_ty ])
+              ->
+                Ok inner_ty
+            | ( Some (TyNamed ("Option", _)),
+                TyNamed ("Result", [ _inner_ty; _err_ty ]) ) ->
+                error binding.with_value.expr_loc
+                  "Cannot use Result ?= in a with binding inside a block \
+                   returning Option. Convert the Result to Option or return \
+                   Result from the enclosing function"
+            | ( Some (TyNamed ("Result", [ _ok_ty; expected_err_ty ])),
+                TyNamed ("Result", [ inner_ty; actual_err_ty ]) ) ->
+                if ctx_types_compatible ctx expected_err_ty actual_err_ty then
+                  Ok inner_ty
+                else
+                  error binding.with_value.expr_loc
+                    (Printf.sprintf
+                       "Incompatible error type for with ?=: enclosing block \
+                        returns Result[..., %s], but expression returns \
+                        Result[..., %s]"
+                       (type_to_string expected_err_ty)
+                       (type_to_string actual_err_ty))
+            | Some (TyNamed ("Result", _)), TyNamed ("Option", [ _inner_ty ]) ->
+                error binding.with_value.expr_loc
+                  "Cannot use Option ?= in a with binding inside a block \
+                   returning Result. Convert the Option to Result with \
+                   ok_or(...) or return Option from the enclosing function"
+            | Some carrier_ty, (TyNamed ("Option", _) | TyNamed ("Result", _))
+              ->
+                error binding.with_value.expr_loc
+                  (Printf.sprintf
+                     "with ?= requires the enclosing block to return the same \
+                      carrier as the acquisition expression; enclosing block \
+                      returns %s"
+                     (type_to_string carrier_ty))
+            | _, TyNamed ("Option", _) | _, TyNamed ("Result", _) ->
+                error_with ~notes:[]
+                  ~help:
+                    (Some
+                       "give the enclosing function an explicit Option or \
+                        Result return type, or use match for local control \
+                        flow")
+                  binding.with_value.expr_loc
+                  "with ?= requires an enclosing block returning Option[T] or \
+                   Result[T, E]"
+            | _, _ ->
+                error binding.with_value.expr_loc
+                  (Printf.sprintf
+                     "Cannot use `?=` in a with binding on type `%s` — only \
+                      Option and Result support ?= bindings"
+                     (type_to_string rhs_ty))
+          in
+          let* binding_ty =
+            validate_with_binding_annotation ctx binding.with_value.expr_loc
+              ty_ann inner_ty
+          in
+          let* () =
+            require_resource_type ctx binding.with_value.expr_loc binding_ty
+          in
+          let resource_ctx =
+            with_resource_scope_ctx ctx binding.with_name binding_ty
+          in
+          let* body_ty, body' = infer_expr resource_ctx body in
+          let* () =
+            reject_with_body_resource_escape resource_ctx body.expr_loc body_ty
+              body'
+          in
+          let binding' =
+            { binding with with_type = Some binding_ty; with_value = rhs' }
+          in
+          Ok
+            ( body_ty,
+              with_inferred_type
+                { expr with expr_desc = EWith (binding', body') }
+                body_ty ))
   (* Binary operations *)
   | EBinary (op, left, right) -> (
       let* left_ty, left' = infer_unconstrained_value_expr ctx left in
@@ -3027,6 +3852,15 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             in
             let* () =
               reject_void_value ~context:"tuple element" e.expr_loc e_ty
+            in
+            let* () = reject_resource_tuple_element ctx e.expr_loc e_ty in
+            let* () =
+              reject_one_shot_stream_storage ctx.env e.expr_loc "tuple literals"
+                e_ty
+            in
+            let* () =
+              reject_scoped_resource_derived_storage ctx.env e.expr_loc
+                "tuple literals" e'
             in
             let* () =
               match exp with
@@ -4030,6 +4864,9 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               ~context:(Printf.sprintf "Declaration of '%s'" var)
               loc val_ty
           in
+          let* () =
+            reject_ordinary_resource_binding ctx loc (Some var) val_ty
+          in
           let new_expr =
             with_inferred_type
               {
@@ -4058,6 +4895,10 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             (Printf.sprintf "Cannot assign to immutable variable '%s'" var)
       | Some { kind = VarSymbol { var_type; mutability = Mutable; _ }; _ } ->
           let* val_ty, value' = infer_expected_value_expr ctx var_type value in
+          let* () = reject_resource_assignment ctx loc var val_ty in
+          let* () =
+            reject_scoped_resource_derived_assignment ctx.env loc var value'
+          in
           if ctx_types_compatible ctx var_type val_ty then
             let new_expr =
               with_inferred_type
@@ -4136,6 +4977,11 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         match ty_opt with
         | Some ty -> infer_annotated_value_expr ctx ty value
         | None -> infer_unconstrained_value_expr ctx value
+      in
+      let* () =
+        reject_ordinary_resource_binding ctx loc
+          (if name = "_" then None else Some name)
+          val_ty
       in
       match ty_opt with
       | Some declared_ty ->
@@ -4238,6 +5084,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           (Ok ()) names
       in
       let* val_ty, value' = infer_unconstrained_value_expr ctx value in
+      let* () = reject_ordinary_resource_binding ctx loc None val_ty in
       (* Value must be a tuple type *)
       match val_ty with
       | TyTuple elem_tys when List.length elem_tys = List.length names ->
@@ -4393,6 +5240,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         (* Infer each binding — must be EVarDecl (immutable) *)
         let infer_one_binding ctx stmt name ty_ann body =
           let* body_ty, body' = infer_unconstrained_value_expr ctx body in
+          let* () =
+            reject_scoped_resource_task_capture ctx.env body.expr_loc body'
+          in
+          let* () =
+            reject_concurrent_resource_result ctx body.expr_loc body_ty
+          in
           let result_ty =
             TyNamed ("Result", [ body_ty; TyNamed ("ConcurrencyError", []) ])
           in
@@ -4482,6 +5335,10 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         { ctx with env = Env.add_var ctx.env var elem_ty ~origin:ForLoopVar () }
       in
       let* body_ty, body' = infer_unconstrained_value_expr inner_ctx body in
+      let* () =
+        reject_scoped_resource_task_capture inner_ctx.env body.expr_loc body'
+      in
+      let* () = reject_concurrent_resource_result ctx body.expr_loc body_ty in
       (* Check for assignments to outer mutable variables (data race) *)
       let rec check_outer_assigns (e : expr) =
         match e.expr_desc with
@@ -4518,7 +5375,55 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             result_ty )
   (* detach expr — detach, returns Void *)
   | EDetach body ->
-      let* _body_ty, body' = infer_statement_expr ctx body in
+      let* body_ty, body' = infer_unconstrained_value_expr ctx body in
+      let scoped_captures =
+        body' |> collect_var_refs
+        |> List.sort_uniq String.compare
+        |> List.filter (fun name -> Env.is_scoped_resource_var ctx.env name)
+      in
+      let derived_captures = scoped_resource_derived_refs ctx.env body' in
+      let stream_captures = one_shot_stream_capture_refs ctx.env body' in
+      let* () =
+        match (scoped_captures, derived_captures, stream_captures) with
+        | [], [], [] -> Ok ()
+        | _ ->
+            let label, vars, notes, help =
+              if scoped_captures <> [] then
+                ( "scoped resource",
+                  scoped_captures,
+                  [
+                    "Detached work may outlive the with block that owns \
+                     resource cleanup.";
+                  ],
+                  "Use the resource synchronously inside the with block, or \
+                   derive ordinary data before detaching work." )
+              else if derived_captures <> [] then
+                ( "scoped resource-derived value",
+                  derived_captures,
+                  [
+                    "Detached work may outlive the resource scope that owns \
+                     the value's dependency.";
+                  ],
+                  "Consume dependent streams, cursors, and borrowed values \
+                   inside the with block, or derive ordinary data before \
+                   detaching work." )
+              else
+                ( "one-shot stream value",
+                  stream_captures,
+                  [
+                    "Streams are one-shot cursors with mutable pull state. \
+                     Detached work can outlive the current scope and race with \
+                     later pulls from the same cursor.";
+                  ],
+                  "Create and consume the stream inside the detached work, or \
+                   collect ordinary data before detaching work." )
+            in
+            error_with ~notes ~help:(Some help) loc
+              (Printf.sprintf "detach cannot capture %s%s: %s" label
+                 (if List.length vars > 1 then "s" else "")
+                 (String.concat ", " vars))
+      in
+      let* () = reject_discarded_resource_value ctx body.expr_loc body_ty in
       Ok
         ( ty_void,
           with_inferred_type { expr with expr_desc = EDetach body' } ty_void )
@@ -5002,6 +5907,17 @@ and infer_checked_collection_element ctx kind ~target_ty ~mismatch_label
     | Some context -> reject_void_value ~context expr.expr_loc elem_ty
     | None -> Ok ()
   in
+  let* () = reject_resource_collection_element ctx expr.expr_loc kind elem_ty in
+  let* () =
+    reject_one_shot_stream_storage ctx.env expr.expr_loc
+      (collection_kind_user_name kind)
+      elem_ty
+  in
+  let* () =
+    reject_scoped_resource_derived_storage ctx.env expr.expr_loc
+      (collection_kind_user_name kind)
+      elem'
+  in
   if ctx_types_compatible ctx target_ty elem_ty then Ok (elem_ty, elem')
   else
     error expr.expr_loc
@@ -5035,7 +5951,10 @@ and infer_annotated_value_expr ctx expected_ty expr =
 
 (** Infer a statement-position expression. Its result is discarded, so expected
     type context from the enclosing expression must not leak inward. *)
-and infer_statement_expr ctx expr = infer_unconstrained_value_expr ctx expr
+and infer_statement_expr ctx expr =
+  let* ty, expr' = infer_unconstrained_value_expr ctx expr in
+  let* () = reject_discarded_resource_value ctx expr.expr_loc ty in
+  Ok (ty, expr')
 
 and inferred_binding_source_type value =
   match value.expr_type_info with Some info -> info.source_ty | None -> None
@@ -5051,17 +5970,19 @@ and ctx_after_inferred_expr ctx expr' =
           add_var ctx.env name var_ty
             ?source_type:(inferred_binding_source_type value)
             ~mutability:(if is_mutable then Mutable else Immutable)
+            ~origin:(binding_origin_for_value ctx.env value)
             ();
       }
   | ETupleDestruct (names, value) -> (
       (* Get the tuple type from the value's type *)
       match expr_semantic_type_opt value with
       | Some (TyTuple elem_tys) when List.length elem_tys = List.length names ->
+          let origin = binding_origin_for_value ctx.env value in
           let env' =
             List.fold_left2
               (fun env name ty ->
                 if name <> "_" then
-                  add_var env name ty () |> fun env ->
+                  add_var env name ty ~origin () |> fun env ->
                   env_with_binding_refinement_from_proof env ctx.proof_env name
                 else env)
               ctx.env names elem_tys
@@ -6161,208 +7082,128 @@ and infer_call ctx expr callee args loc =
                 match module_func_first with
                 | Some result -> result
                 | None -> (
-                    match infer_unconstrained_value_expr ctx callee with
-                    | Ok (callee_ty, callee') ->
-                        Ok (callee_ty, callee', callee, args, None, None)
-                    | Error original_err -> (
-                        (* Field access failed. Only try method-call rewrite if obj is a
-                valid value (not a module alias). Module aliases like Dict, O, Str
-                aren't in the value env, so infer_expr on them would fail. *)
-                        match infer_unconstrained_value_expr ctx obj with
-                        | Error _ -> (
-                            (* obj isn't a value — check if it's a module alias (qualified call) *)
-                            let alias_name =
-                              match obj.expr_desc with
-                              | EIdent name -> Some name
-                              | _ -> None
-                            in
-                            let module_path =
-                              match alias_name with
-                              | Some name ->
-                                  List.assoc_opt name ctx.module_aliases
-                              | None -> None
-                            in
-                            match module_path with
-                            | Some mod_path -> (
-                                (* Module alias — look up function type from module's exports *)
+                    match module_path with
+                    | Some mod_path -> (
+                        let ident =
+                          { callee with expr_desc = EIdent method_name }
+                        in
+                        let mod_name =
+                          match alias_name with
+                          | Some n -> n
+                          | None -> "<unknown>"
+                        in
+                        let help =
+                          match Modules.find_cached mod_path with
+                          | Some m -> Modules.suggest_export m method_name
+                          | None -> None
+                        in
+                        (* Module aliases may resolve exported functions,
+                           public impl methods, or legacy qualified
+                           constructors. They must not fall back to an
+                           unrelated bare function, because that bypasses
+                           module visibility and can expose private resource
+                           finalizers through same-named prelude functions. *)
+                        match lookup ctx.env method_name with
+                        | Some { kind = ConstructorSymbol _; _ } -> (
+                            match infer_unconstrained_value_expr ctx ident with
+                            | Ok (callee_ty, _callee') ->
+                                let typed_obj =
+                                  with_inferred_type obj
+                                    (TyNamed ("Module", []))
+                                in
+                                let qualified_callee =
+                                  with_inferred_desc callee
+                                    (EFieldAccess (typed_obj, method_name))
+                                    callee_ty
+                                in
+                                Ok
+                                  ( callee_ty,
+                                    qualified_callee,
+                                    ident,
+                                    args,
+                                    None,
+                                    None )
+                            | Error _ ->
+                                error_with ~notes:[] ~help loc
+                                  (Printf.sprintf
+                                     "Module '%s' has no exported function '%s'"
+                                     mod_name method_name))
+                        | _ ->
+                            error_with ~notes:[] ~help loc
+                              (Printf.sprintf
+                                 "Module '%s' has no exported function '%s'"
+                                 mod_name method_name))
+                    | None -> (
+                        match infer_unconstrained_value_expr ctx callee with
+                        | Ok (callee_ty, callee') ->
+                            Ok (callee_ty, callee', callee, args, None, None)
+                        | Error original_err -> (
+                            match infer_unconstrained_value_expr ctx obj with
+                            | Error _ -> Error original_err
+                            | Ok (_, obj') -> (
+                                (* obj is a value — try method-call rewrite *)
+                                let receiver_arg =
+                                  annotate_method_receiver_expr obj'
+                                in
                                 let ident =
                                   { callee with expr_desc = EIdent method_name }
                                 in
-                                match
-                                  lookup_module_func_resolution mod_path
-                                    method_name
-                                with
-                                | Some module_func ->
-                                    let callee_ty =
-                                      module_func.module_func_type
-                                    in
-                                    let callee' =
-                                      with_inferred_type callee callee_ty
-                                    in
-                                    let target_hint =
-                                      resolved_target_from_module_func mod_path
-                                        method_name module_func
-                                    in
-                                    Ok
-                                      ( callee_ty,
-                                        callee',
-                                        ident,
-                                        args,
-                                        None,
-                                        target_hint )
-                                | None -> (
-                                    (* Not a top-level function. Before erroring, try
-                               resolving against the module's trait impls: if
-                               [M] declares [implements Trait for Foo:] and
-                               [method_name] is one of the impl's methods,
-                               dispatch on the first arg's type. Lets stdlib
-                               migrate top-level functions into proper
-                               [implements] blocks without breaking existing
-                               [M.method(value)] callers. *)
-                                    let impl_result =
-                                      match args with
-                                      | first :: _ -> (
-                                          match
-                                            infer_unconstrained_value_expr ctx
-                                              first
-                                          with
-                                          | Ok (first_ty, first') -> (
-                                              match
-                                                lookup_module_impl_method
-                                                  mod_path method_name first_ty
-                                              with
-                                              | Some method_info ->
-                                                  let mangled =
-                                                    method_info
-                                                      .module_impl_mangled_name
-                                                  in
-                                                  let callee_ty =
-                                                    method_info
-                                                      .module_impl_func_type
-                                                  in
-                                                  let mangled_ident =
-                                                    inferred_ident_expr callee
-                                                      mangled callee_ty
-                                                  in
-                                                  (* Replace args' first with the already-inferred [first'] to
-                                               avoid re-inferring it downstream. *)
-                                                  let args' =
-                                                    first' :: List.tl args
-                                                  in
-                                                  Some
-                                                    (Ok
-                                                       ( callee_ty,
-                                                         mangled_ident,
-                                                         mangled_ident,
-                                                         args',
-                                                         resolved_trait_of_module_impl_method
-                                                           method_info,
-                                                         None ))
-                                              | None -> None)
-                                          | Error _ -> None)
-                                      | [] -> None
-                                    in
-                                    match impl_result with
-                                    | Some r -> r
-                                    | None -> (
-                                        (* Not in exports, no impl — try env as fallback for constructors etc *)
-                                        match
-                                          infer_unconstrained_value_expr ctx
-                                            ident
-                                        with
-                                        | Ok (callee_ty, _callee') ->
-                                            let qualified_callee =
-                                              with_inferred_type callee
-                                                callee_ty
-                                            in
-                                            Ok
-                                              ( callee_ty,
-                                                qualified_callee,
-                                                ident,
-                                                args,
-                                                None,
-                                                None )
-                                        | Error _ ->
-                                            let mod_name =
-                                              match alias_name with
-                                              | Some n -> n
-                                              | None -> "<unknown>"
-                                            in
-                                            let help =
-                                              match
-                                                Modules.find_cached mod_path
-                                              with
-                                              | Some m ->
-                                                  Modules.suggest_export m
-                                                    method_name
-                                              | None -> None
-                                            in
-                                            error_with ~notes:[] ~help loc
-                                              (Printf.sprintf
-                                                 "Module '%s' has no exported \
-                                                  function '%s'"
-                                                 mod_name method_name))))
-                            | None ->
-                                (* Not a module alias — return original error *)
-                                Error original_err)
-                        | Ok (_, obj') -> (
-                            (* obj is a value — try method-call rewrite *)
-                            let receiver_arg =
-                              annotate_method_receiver_expr obj'
-                            in
-                            let ident =
-                              { callee with expr_desc = EIdent method_name }
-                            in
-                            let normal_result =
-                              match
-                                infer_unconstrained_value_expr ctx ident
-                              with
-                              | Ok (callee_ty, callee') ->
-                                  (* Check if the resolved function can actually
+                                let normal_result =
+                                  match
+                                    infer_unconstrained_value_expr ctx ident
+                                  with
+                                  | Ok (callee_ty, callee') ->
+                                      (* Check if the resolved function can actually
                                  accept the receiver as its first argument. If
                                  not, try UFCS-only methods. *)
-                                  let first_param_matches =
-                                    let obj_ty =
-                                      match expr_semantic_type_opt obj' with
-                                      | Some t -> t
-                                      | None -> ty_void
-                                    in
-                                    let builtin_trait_accepts_receiver () =
-                                      match
-                                        ( Env.is_builtin_func ctx.env method_name,
-                                          Env.get_function_trait ctx.env
-                                            method_name )
-                                      with
-                                      | true, Some trait_name ->
-                                          trait_obligation_satisfied ctx.env
-                                            obj_ty trait_name
-                                      | _ -> true
-                                    in
-                                    let normal_function_type_params =
-                                      match
-                                        Env.get_func_info ctx.env method_name
-                                      with
-                                      | Some (_, type_params, _) ->
-                                          Env.bound_type_param_names type_params
-                                      | None -> Env.get_type_params ctx.env
-                                    in
-                                    let receiver_family = function
-                                      | TyNamed (name, _) -> Some name
-                                      | TyArray _ -> Some Types.array_head_name
-                                      | _ -> None
-                                    in
-                                    match callee_ty with
-                                    | TyFunc { params = first_param :: _; _ }
-                                      -> (
-                                        let first_param =
-                                          normalize_type ctx
-                                            UfcsCandidateFiltering first_param
-                                        in
+                                      let first_param_matches =
                                         let obj_ty =
-                                          normalize_type ctx
-                                            UfcsCandidateFiltering obj_ty
+                                          match expr_semantic_type_opt obj' with
+                                          | Some t -> t
+                                          | None -> ty_void
                                         in
-                                        (* Generic builtin trait functions like
+                                        let builtin_trait_accepts_receiver () =
+                                          match
+                                            ( Env.is_builtin_func ctx.env
+                                                method_name,
+                                              Env.get_function_trait ctx.env
+                                                method_name )
+                                          with
+                                          | true, Some trait_name ->
+                                              trait_obligation_satisfied ctx.env
+                                                obj_ty trait_name
+                                          | _ -> true
+                                        in
+                                        let normal_function_type_params =
+                                          match
+                                            Env.get_func_info ctx.env
+                                              method_name
+                                          with
+                                          | Some (_, type_params, _) ->
+                                              Env.bound_type_param_names
+                                                type_params
+                                          | None -> Env.get_type_params ctx.env
+                                        in
+                                        let receiver_family = function
+                                          | TyNamed (name, _) -> Some name
+                                          | TyArray _ ->
+                                              Some Types.array_head_name
+                                          | _ -> None
+                                        in
+                                        match callee_ty with
+                                        | TyFunc
+                                            { params = first_param :: _; _ }
+                                          -> (
+                                            let first_param =
+                                              normalize_type ctx
+                                                UfcsCandidateFiltering
+                                                first_param
+                                            in
+                                            let obj_ty =
+                                              normalize_type ctx
+                                                UfcsCandidateFiltering obj_ty
+                                            in
+                                            (* Generic builtin trait functions like
                                        [length(T)] are only valid method
                                        candidates when the receiver satisfies
                                        the trait.
@@ -6374,77 +7215,79 @@ and infer_call ctx expr callee args loc =
                                        this phase, but cross-family candidates
                                        like tensor get on List should fall
                                        through to UFCS-only methods. *)
-                                        if
-                                          Env.is_builtin_func ctx.env
-                                            method_name
-                                          && Option.is_some
-                                               (Env.get_function_trait ctx.env
-                                                  method_name)
-                                        then builtin_trait_accepts_receiver ()
-                                        else
-                                          match
-                                            ( receiver_family first_param,
-                                              receiver_family obj_ty )
-                                          with
-                                          | Some param_family, Some obj_family
-                                            ->
-                                              param_family = obj_family
-                                          | _ ->
-                                              types_compatible
-                                                ~type_params:
-                                                  normal_function_type_params
-                                                first_param obj_ty)
-                                    | _ -> false
-                                  in
-                                  if first_param_matches then
-                                    Some
-                                      (Ok
-                                         ( callee_ty,
-                                           callee',
-                                           ident,
-                                           receiver_arg :: args,
-                                           None,
-                                           None ))
-                                  else
-                                    None (* Type mismatch — try UFCS methods *)
-                              | Error _ -> None
-                            in
-                            match normal_result with
-                            | Some r -> r
-                            | None -> (
-                                (* Method not in normal scope or type mismatch — check UFCS-only methods
+                                            if
+                                              Env.is_builtin_func ctx.env
+                                                method_name
+                                              && Option.is_some
+                                                   (Env.get_function_trait
+                                                      ctx.env method_name)
+                                            then
+                                              builtin_trait_accepts_receiver ()
+                                            else
+                                              match
+                                                ( receiver_family first_param,
+                                                  receiver_family obj_ty )
+                                              with
+                                              | ( Some param_family,
+                                                  Some obj_family ) ->
+                                                  param_family = obj_family
+                                              | _ ->
+                                                  types_compatible
+                                                    ~type_params:
+                                                      normal_function_type_params
+                                                    first_param obj_ty)
+                                        | _ -> false
+                                      in
+                                      if first_param_matches then
+                                        Some
+                                          (Ok
+                                             ( callee_ty,
+                                               callee',
+                                               ident,
+                                               receiver_arg :: args,
+                                               None,
+                                               None ))
+                                      else None
+                                      (* Type mismatch — try UFCS methods *)
+                                  | Error _ -> None
+                                in
+                                match normal_result with
+                                | Some r -> r
+                                | None -> (
+                                    (* Method not in normal scope or type mismatch — check UFCS-only methods
                           (auto-imported when a type is imported from a module) *)
-                                let obj_ty =
-                                  match expr_semantic_type_opt obj' with
-                                  | Some t -> t
-                                  | None -> ty_void
-                                in
-                                let ufcs_matches =
-                                  Env.lookup_ufcs_methods ctx.env method_name
-                                    obj_ty
-                                in
-                                match ufcs_matches with
-                                | _ :: _ -> (
-                                    (* Found UFCS method(s) — use mangled names to avoid
+                                    let obj_ty =
+                                      match expr_semantic_type_opt obj' with
+                                      | Some t -> t
+                                      | None -> ty_void
+                                    in
+                                    let ufcs_matches =
+                                      Env.lookup_ufcs_methods ctx.env
+                                        method_name obj_ty
+                                    in
+                                    match ufcs_matches with
+                                    | _ :: _ -> (
+                                        (* Found UFCS method(s) — use mangled names to avoid
                               conflicts with the current module's own functions.
                               E.g., list's get becomes __ufcs_std$list__get
                               Uses $ for path separators to avoid ambiguity with _ in names *)
-                                    let mod_path =
-                                      match
-                                        (List.hd ufcs_matches)
-                                          .Env.ol_module_path
-                                      with
-                                      | Some p -> p
-                                      | None -> ""
-                                    in
-                                    let base_mangled =
-                                      "__ufcs_"
-                                      ^ String.map
-                                          (fun c -> if c = '/' then '$' else c)
-                                          mod_path
-                                      ^ "__" ^ method_name
-                                    in
-                                    (* Phase 2.7 tasks 48/49: when pure/impure overloads
+                                        let mod_path =
+                                          match
+                                            (List.hd ufcs_matches)
+                                              .Env.ol_module_path
+                                          with
+                                          | Some p -> p
+                                          | None -> ""
+                                        in
+                                        let base_mangled =
+                                          "__ufcs_"
+                                          ^ String.map
+                                              (fun c ->
+                                                if c = '/' then '$' else c)
+                                              mod_path
+                                          ^ "__" ^ method_name
+                                        in
+                                        (* Phase 2.7 tasks 48/49: when pure/impure overloads
                               exist, try to pick by callback purity — but ONLY
                               when every function-typed arg has a firm purity
                               (i.e. a named [func]/[pure func] reference).
@@ -6457,45 +7300,46 @@ and infer_call ctx expr callee args loc =
                               lambda OR any arg fails standalone inference,
                               fall back to the caller-context preference
                               (pure in pure scope, impure otherwise). *)
-                                    let has_flexible_lambda =
-                                      List.exists
-                                        (fun a ->
-                                          match a.expr_desc with
-                                          | ELambda f when not f.func_is_pure ->
-                                              true
-                                          | _ -> false)
-                                        args
-                                    in
-                                    let selected =
-                                      match
-                                        select_pure_overload_for_flexible_lambdas
-                                          ufcs_matches (receiver_arg :: args)
-                                      with
-                                      | Some entry -> Some entry
-                                      | None -> (
-                                          if has_flexible_lambda then None
-                                          else
-                                            let arg_tys_opt =
-                                              List.map
-                                                (fun a ->
-                                                  match
-                                                    infer_unconstrained_value_expr
-                                                      ctx a
-                                                  with
-                                                  | Ok (ty, _) -> Some ty
-                                                  | Error _ -> None)
-                                                (receiver_arg :: args)
-                                            in
-                                            match all_some arg_tys_opt with
-                                            | Some arg_tys ->
-                                                Env.select_overload_for_args
-                                                  ufcs_matches arg_tys
-                                            | None -> None)
-                                    in
-                                    let in_pure_ctx =
-                                      ctx.env.current_function_pure
-                                    in
-                                    (* A3.3 UFCS handoff: encode the selected
+                                        let has_flexible_lambda =
+                                          List.exists
+                                            (fun a ->
+                                              match a.expr_desc with
+                                              | ELambda f
+                                                when not f.func_is_pure ->
+                                                  true
+                                              | _ -> false)
+                                            args
+                                        in
+                                        let selected =
+                                          match
+                                            select_pure_overload_for_flexible_lambdas
+                                              ufcs_matches (receiver_arg :: args)
+                                          with
+                                          | Some entry -> Some entry
+                                          | None -> (
+                                              if has_flexible_lambda then None
+                                              else
+                                                let arg_tys_opt =
+                                                  List.map
+                                                    (fun a ->
+                                                      match
+                                                        infer_unconstrained_value_expr
+                                                          ctx a
+                                                      with
+                                                      | Ok (ty, _) -> Some ty
+                                                      | Error _ -> None)
+                                                    (receiver_arg :: args)
+                                                in
+                                                match all_some arg_tys_opt with
+                                                | Some arg_tys ->
+                                                    Env.select_overload_for_args
+                                                      ufcs_matches arg_tys
+                                                | None -> None)
+                                        in
+                                        let in_pure_ctx =
+                                          ctx.env.current_function_pure
+                                        in
+                                        (* A3.3 UFCS handoff: encode the selected
                               overload's [ol_def_id] directly in the
                               mangled identifier as a ["#<id>"] suffix.
                               [Core_lower] strips the suffix into
@@ -6510,128 +7354,138 @@ and infer_call ctx expr callee args loc =
                               was keyed on the unsuffixed form and
                               last-write-wins produced wrong-body
                               mangling for pure/impure pairs. *)
-                                    let mangled =
-                                      match selected with
-                                      | Some entry ->
-                                          Printf.sprintf "%s#%d" base_mangled
-                                            entry.Env.ol_def_id
-                                      | None -> base_mangled
-                                    in
-                                    (* When selection is firm, [mangled] already
+                                        let mangled =
+                                          match selected with
+                                          | Some entry ->
+                                              Printf.sprintf "%s#%d"
+                                                base_mangled entry.Env.ol_def_id
+                                          | None -> base_mangled
+                                        in
+                                        (* When selection is firm, [mangled] already
                               includes [entry]'s def_id, so only [entry]
                               belongs under that name in the temp env —
                               registering other overloads there would
                               invite spurious resolution between
                               distinct IDs. *)
-                                    let to_register =
-                                      match selected with
-                                      | Some entry -> [ entry ]
-                                      | None ->
-                                          if in_pure_ctx then
-                                            (* In pure context: put pure overloads last (found first by lookup) *)
-                                            List.sort
-                                              (fun a b ->
-                                                match
-                                                  ( a.Env.ol_purity,
-                                                    b.Env.ol_purity )
-                                                with
-                                                | Env.Pure, Env.Impure -> 1
-                                                | Env.Impure, Env.Pure -> -1
-                                                | _ -> 0)
-                                              ufcs_matches
-                                          else
-                                            (* In impure context: put impure overloads last (found first by lookup) *)
-                                            List.sort
-                                              (fun a b ->
-                                                match
-                                                  ( a.Env.ol_purity,
-                                                    b.Env.ol_purity )
-                                                with
-                                                | Env.Impure, Env.Pure -> 1
-                                                | Env.Pure, Env.Impure -> -1
-                                                | _ -> 0)
-                                              ufcs_matches
-                                    in
-                                    let temp_env =
-                                      List.fold_left
-                                        (fun env e ->
-                                          Env.add_func env mangled
-                                            e.Env.ol_func_type
-                                            ~callable_id:e.Env.ol_def_id
-                                            ~type_params:e.Env.ol_type_params
-                                            ~param_names:e.ol_param_names
-                                            ~purity:e.ol_purity
-                                            ~origin:e.ol_origin
-                                            ?module_path:e.ol_module_path
-                                            ~dim_constraints:
-                                              e.ol_dim_constraints
-                                            ?loop_producer:e.ol_loop_producer
-                                            ~debug_only:e.ol_debug_only ())
-                                        ctx.env to_register
-                                    in
-                                    let temp_ctx =
-                                      { ctx with env = temp_env }
-                                    in
-                                    let ident2 =
-                                      { callee with expr_desc = EIdent mangled }
-                                    in
-                                    match
-                                      infer_expr
-                                        (without_expected temp_ctx)
-                                        ident2
-                                    with
-                                    | Ok (callee_ty, callee') ->
-                                        Ok
-                                          ( callee_ty,
-                                            callee',
-                                            ident2,
-                                            receiver_arg :: args,
-                                            None,
-                                            None )
-                                    | Error e -> Error e)
-                                | [] ->
-                                    (* No UFCS method either — give helpful error *)
-                                    let obj_ty_str =
-                                      match expr_semantic_type_opt obj' with
-                                      | Some ty -> type_to_string ty
-                                      | None -> "this value"
-                                    in
-                                    let ufcs_hint =
-                                      match
-                                        renamed_string_method_hint obj_ty_str
-                                          method_name
-                                      with
-                                      | Some hint -> hint
-                                      | None ->
-                                          if
-                                            Env.has_ufcs_method ctx.env
-                                              method_name
-                                          then
-                                            Printf.sprintf
-                                              "'%s' is available as a method \
-                                               on other types but not %s"
-                                              method_name obj_ty_str
-                                          else
-                                            Printf.sprintf
-                                              "method syntax `value.%s(...)` \
-                                               is shorthand for `%s(value, \
-                                               ...)` — ensure '%s' is imported"
-                                              method_name method_name
-                                              method_name
-                                    in
-                                    error_with
-                                      ~notes:
-                                        [
-                                          Printf.sprintf
-                                            "'%s' is not defined in the \
-                                             current scope"
-                                            method_name;
-                                        ]
-                                      ~help:(Some ufcs_hint) loc
-                                      (Printf.sprintf
-                                         "No function '%s' available for type \
-                                          %s"
-                                         method_name obj_ty_str)))))))
+                                        let to_register =
+                                          match selected with
+                                          | Some entry -> [ entry ]
+                                          | None ->
+                                              if in_pure_ctx then
+                                                (* In pure context: put pure overloads last (found first by lookup) *)
+                                                List.sort
+                                                  (fun a b ->
+                                                    match
+                                                      ( a.Env.ol_purity,
+                                                        b.Env.ol_purity )
+                                                    with
+                                                    | Env.Pure, Env.Impure -> 1
+                                                    | Env.Impure, Env.Pure -> -1
+                                                    | _ -> 0)
+                                                  ufcs_matches
+                                              else
+                                                (* In impure context: put impure overloads last (found first by lookup) *)
+                                                List.sort
+                                                  (fun a b ->
+                                                    match
+                                                      ( a.Env.ol_purity,
+                                                        b.Env.ol_purity )
+                                                    with
+                                                    | Env.Impure, Env.Pure -> 1
+                                                    | Env.Pure, Env.Impure -> -1
+                                                    | _ -> 0)
+                                                  ufcs_matches
+                                        in
+                                        let temp_env =
+                                          List.fold_left
+                                            (fun env e ->
+                                              Env.add_func env mangled
+                                                e.Env.ol_func_type
+                                                ~callable_id:e.Env.ol_def_id
+                                                ~type_params:
+                                                  e.Env.ol_type_params
+                                                ~param_names:e.ol_param_names
+                                                ~purity:e.ol_purity
+                                                ~origin:e.ol_origin
+                                                ~resource_args:
+                                                  e.ol_resource_args
+                                                ?module_path:e.ol_module_path
+                                                ~dim_constraints:
+                                                  e.ol_dim_constraints
+                                                ?loop_producer:
+                                                  e.ol_loop_producer
+                                                ~debug_only:e.ol_debug_only ())
+                                            ctx.env to_register
+                                        in
+                                        let temp_ctx =
+                                          { ctx with env = temp_env }
+                                        in
+                                        let ident2 =
+                                          {
+                                            callee with
+                                            expr_desc = EIdent mangled;
+                                          }
+                                        in
+                                        match
+                                          infer_expr
+                                            (without_expected temp_ctx)
+                                            ident2
+                                        with
+                                        | Ok (callee_ty, callee') ->
+                                            Ok
+                                              ( callee_ty,
+                                                callee',
+                                                ident2,
+                                                receiver_arg :: args,
+                                                None,
+                                                None )
+                                        | Error e -> Error e)
+                                    | [] ->
+                                        (* No UFCS method either — give helpful error *)
+                                        let obj_ty_str =
+                                          match expr_semantic_type_opt obj' with
+                                          | Some ty -> type_to_string ty
+                                          | None -> "this value"
+                                        in
+                                        let ufcs_hint =
+                                          match
+                                            renamed_string_method_hint
+                                              obj_ty_str method_name
+                                          with
+                                          | Some hint -> hint
+                                          | None ->
+                                              if
+                                                Env.has_ufcs_method ctx.env
+                                                  method_name
+                                              then
+                                                Printf.sprintf
+                                                  "'%s' is available as a \
+                                                   method on other types but \
+                                                   not %s"
+                                                  method_name obj_ty_str
+                                              else
+                                                Printf.sprintf
+                                                  "method syntax \
+                                                   `value.%s(...)` is \
+                                                   shorthand for `%s(value, \
+                                                   ...)` — ensure '%s' is \
+                                                   imported"
+                                                  method_name method_name
+                                                  method_name
+                                        in
+                                        error_with
+                                          ~notes:
+                                            [
+                                              Printf.sprintf
+                                                "'%s' is not defined in the \
+                                                 current scope"
+                                                method_name;
+                                            ]
+                                          ~help:(Some ufcs_hint) loc
+                                          (Printf.sprintf
+                                             "No function '%s' available for \
+                                              type %s"
+                                             method_name obj_ty_str))))))))
         | _ ->
             let* callee_ty, callee' =
               infer_unconstrained_value_expr ctx callee
@@ -7246,6 +8100,19 @@ and infer_call ctx expr callee args loc =
             in
             let args' = List.map snd typed_args in
             let arg_types = List.map fst typed_args in
+
+            let* () =
+              reject_ordinary_resource_call_arg ctx loc callee_name
+                resolved_overload arg_types
+            in
+            let* () =
+              reject_unscoped_resource_operation_arg ctx callee_name
+                resolved_overload typed_args
+            in
+            let* () =
+              reject_scoped_resource_derived_call_arg ctx loc callee_name
+                resolved_overload args'
+            in
 
             (* Check trait bounds on type parameter arguments *)
             let* () =
@@ -8136,6 +9003,12 @@ and infer_block ctx expr exprs _loc =
             last.expr_loc "?= binding must be followed by a result expression"
       | [ last ] ->
           let* last_ty, last' = infer_expr ctx last in
+          let* () =
+            if types_equal last_ty ty_void || type_contains_resource ctx last_ty
+            then Ok ()
+            else
+              reject_scoped_resource_derived_escape ctx.env last.expr_loc last'
+          in
           Ok (last_ty, List.rev (last' :: acc))
       | ({ expr_desc = EQuestionBind (name, ty_ann, rhs); _ } as stmt) :: rest
         ->
@@ -8348,61 +9221,66 @@ and infer_record ctx expr fields loc =
 and infer_record_fields ctx field_types fields =
   List.fold_left
     (fun acc (name, value) ->
-      match acc with
-      | Error e -> Error e
-      | Ok results -> (
-          (* Check field exists in record definition *)
-          let* () =
-            match List.assoc_opt name field_types with
-            | None ->
-                let valid = String.concat ", " (List.map fst field_types) in
-                Error
-                  {
-                    loc = value.expr_loc;
-                    message =
-                      Printf.sprintf
-                        "Unknown field '%s' in record literal. Valid fields: %s"
-                        name valid;
-                    phase = TypeCheck;
-                    kind = OtherError;
-                    notes = [];
-                    help = None;
-                  }
-            | Some _ -> Ok ()
-          in
-          (* Look up expected type for this field *)
-          let expected_ty = List.assoc name field_types in
-          match infer_expected_value_expr ctx expected_ty value with
-          | Error e -> Error e
-          | Ok (actual_ty, value') -> (
-              match
-                reject_void_value ~context:"record field value" value.expr_loc
-                  actual_ty
-              with
-              | Error e -> Error e
-              | Ok () -> (
-                  (* Verify type matches expected if we have one *)
-                  let type_mismatch =
-                    if not (ctx_types_compatible ctx expected_ty actual_ty) then
-                      Some (expected_ty, actual_ty)
-                    else None
-                  in
-                  match type_mismatch with
-                  | None -> Ok ((name, value') :: results)
-                  | Some (expected_ty, _actual_ty) ->
-                      Error
-                        {
-                          loc = value.expr_loc;
-                          message =
-                            Printf.sprintf
-                              "Record field '%s': expected %s, got %s" name
-                              (type_to_string expected_ty)
-                              (type_to_string actual_ty);
-                          phase = TypeCheck;
-                          kind = OtherError;
-                          notes = [];
-                          help = None;
-                        }))))
+      let* results = acc in
+      (* Check field exists in record definition *)
+      let* () =
+        match List.assoc_opt name field_types with
+        | None ->
+            let valid = String.concat ", " (List.map fst field_types) in
+            Error
+              {
+                loc = value.expr_loc;
+                message =
+                  Printf.sprintf
+                    "Unknown field '%s' in record literal. Valid fields: %s"
+                    name valid;
+                phase = TypeCheck;
+                kind = OtherError;
+                notes = [];
+                help = None;
+              }
+        | Some _ -> Ok ()
+      in
+      (* Look up expected type for this field *)
+      let expected_ty = List.assoc name field_types in
+      let* actual_ty, value' =
+        infer_expected_value_expr ctx expected_ty value
+      in
+      let* () =
+        reject_void_value ~context:"record field value" value.expr_loc actual_ty
+      in
+      let* () =
+        reject_resource_record_field ctx value.expr_loc name actual_ty
+      in
+      let* () =
+        reject_one_shot_stream_storage ctx.env value.expr_loc "record fields"
+          actual_ty
+      in
+      let* () =
+        reject_scoped_resource_derived_storage ctx.env value.expr_loc
+          "record fields" value'
+      in
+      (* Verify type matches expected if we have one *)
+      let type_mismatch =
+        if not (ctx_types_compatible ctx expected_ty actual_ty) then
+          Some (expected_ty, actual_ty)
+        else None
+      in
+      match type_mismatch with
+      | None -> Ok ((name, value') :: results)
+      | Some (expected_ty, _actual_ty) ->
+          Error
+            {
+              loc = value.expr_loc;
+              message =
+                Printf.sprintf "Record field '%s': expected %s, got %s" name
+                  (type_to_string expected_ty)
+                  (type_to_string actual_ty);
+              phase = TypeCheck;
+              kind = OtherError;
+              notes = [];
+              help = None;
+            })
     (Ok []) fields
   |> Result.map List.rev
 
@@ -8410,6 +9288,14 @@ and infer_record_fields ctx field_types fields =
 and infer_record_update ctx expr base fields loc =
   (* Infer base expression type without expected type context *)
   let* base_ty, base' = infer_unconstrained_value_expr ctx base in
+  let* () =
+    reject_one_shot_stream_storage ctx.env base.expr_loc "record updates"
+      base_ty
+  in
+  let* () =
+    reject_scoped_resource_derived_storage ctx.env base.expr_loc
+      "record updates" base'
+  in
   match base_ty with
   | TyNamed (type_name, type_args) -> (
       match resolve_record_field_types ctx.env type_name type_args with
@@ -8432,31 +9318,40 @@ and infer_record_update ctx expr base fields loc =
           let* fields' =
             List.fold_left
               (fun acc (name, value) ->
-                match acc with
-                | Error e -> Error e
-                | Ok results -> (
-                    let expected_ty = List.assoc name field_types in
-                    match infer_expected_value_expr ctx expected_ty value with
-                    | Error e -> Error e
-                    | Ok (actual_ty, value') ->
-                        if ctx_types_compatible ctx expected_ty actual_ty then
-                          Ok ((name, value') :: results)
-                        else
-                          Error
-                            {
-                              loc = value.expr_loc;
-                              message =
-                                Printf.sprintf
-                                  "Record update field '%s' type mismatch: \
-                                   expected %s, got %s"
-                                  name
-                                  (type_to_string expected_ty)
-                                  (type_to_string actual_ty);
-                              phase = TypeCheck;
-                              kind = OtherError;
-                              notes = [];
-                              help = None;
-                            }))
+                let* results = acc in
+                let expected_ty = List.assoc name field_types in
+                let* actual_ty, value' =
+                  infer_expected_value_expr ctx expected_ty value
+                in
+                let* () =
+                  reject_resource_record_field ctx value.expr_loc name actual_ty
+                in
+                let* () =
+                  reject_one_shot_stream_storage ctx.env value.expr_loc
+                    "record fields" actual_ty
+                in
+                let* () =
+                  reject_scoped_resource_derived_storage ctx.env value.expr_loc
+                    "record fields" value'
+                in
+                if ctx_types_compatible ctx expected_ty actual_ty then
+                  Ok ((name, value') :: results)
+                else
+                  Error
+                    {
+                      loc = value.expr_loc;
+                      message =
+                        Printf.sprintf
+                          "Record update field '%s' type mismatch: expected \
+                           %s, got %s"
+                          name
+                          (type_to_string expected_ty)
+                          (type_to_string actual_ty);
+                      phase = TypeCheck;
+                      kind = OtherError;
+                      notes = [];
+                      help = None;
+                    })
               (Ok []) fields
             |> Result.map List.rev
           in
@@ -8666,11 +9561,15 @@ and infer_lambda ctx expr func loc =
           (fun ctx (param : Ast.param) (ty, source_ty) ->
             match param.param_name with
             | Some name ->
+                let origin =
+                  match param.param_passing with
+                  | ParamBorrow -> Env.BorrowedResourceParam
+                  | ParamByValue -> Env.FuncParam
+                in
                 {
                   ctx with
                   env =
-                    add_var ctx.env name ty ?source_type:source_ty
-                      ~origin:FuncParam ();
+                    add_var ctx.env name ty ?source_type:source_ty ~origin ();
                 }
             | None -> ctx)
           ctx func.func_params param_type_slots

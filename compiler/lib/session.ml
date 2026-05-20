@@ -150,6 +150,13 @@ type t = {
       (Option/Result/ConcurrencyError from [env_builtins]) stay
       unregistered here and render bare — matches the trait-index
       pattern. *)
+  resource_cleanup_index : (string, resource_cleanup) Hashtbl.t;
+      (** Canonical resource type name → compiler-owned cleanup metadata.
+
+      Populated by typechecking [resource type] declarations after import
+      canonicalization. Core lowering consumes this registry when turning
+      [with] scopes into cleanup edges. Keeping this metadata here avoids
+      codegen heuristics based on spelling such as [FileReader]. *)
   trait_index : (string, string) Hashtbl.t;
       (** Trait name → canonical name of the module that declared it.
 
@@ -246,6 +253,9 @@ type t = {
   mutable lower_question_bind_counter : int;
       (** Next [__qb_N] id used by [Core_lower] when desugaring direct [?=]
       binds into [CLet]/[CMatchArms] chains. *)
+  mutable lower_resource_counter : int;
+      (** Next [__resource_N] id used by [Core_lower] for anonymous resource
+      guards and internal payload names in fallible resource acquisition. *)
   mutable desugar_counter : int;
       (** Next fresh-id used by [Core_desugar] for CRecordUpdate
       temporaries and string-interp rewriting. *)
@@ -265,6 +275,7 @@ let create () : t =
     module_cache = Hashtbl.create 16;
     parse_cache = Hashtbl.create 16;
     type_index = Hashtbl.create 32;
+    resource_cleanup_index = Hashtbl.create 16;
     trait_index = Hashtbl.create 32;
     std_override_dir = None;
     std_override_active = false;
@@ -282,6 +293,7 @@ let create () : t =
     lower_destruct_counter = 0;
     lower_param_counter = 0;
     lower_question_bind_counter = 0;
+    lower_resource_counter = 0;
     desugar_counter = 0;
     ssa_mut_counter = 0;
   }
@@ -294,6 +306,7 @@ let reset_core_counters (s : t) : unit =
   s.lower_destruct_counter <- 0;
   s.lower_param_counter <- 0;
   s.lower_question_bind_counter <- 0;
+  s.lower_resource_counter <- 0;
   s.desugar_counter <- 0;
   s.ssa_mut_counter <- 0;
   (* Reset [def_id_counter] too so repeated compiles of the same source yield
@@ -428,6 +441,18 @@ let register_module_types (sess : t) (m : loaded_module) : unit =
     render bare in that case. *)
 let find_type_home (sess : t) (name : string) : string option =
   Hashtbl.find_opt sess.type_index name
+
+(** Register cleanup metadata for a resource type. [type_name] should be the
+    canonical name visible to typed Core lowering: local names for the module
+    being typechecked, and [module::Type] names after import canonicalization. *)
+let register_resource_cleanup (sess : t) ~(type_name : string)
+    (cleanup : resource_cleanup) : unit =
+  Hashtbl.replace sess.resource_cleanup_index type_name cleanup
+
+(** Find compiler-owned cleanup metadata for a resource type. *)
+let find_resource_cleanup (sess : t) (type_name : string) :
+    resource_cleanup option =
+  Hashtbl.find_opt sess.resource_cleanup_index type_name
 
 (* ============================================================================
    Ambient "current session"

@@ -54,6 +54,8 @@ let rec simulate (target : string) (state : state) (e : core) : unit =
   match e.desc with
   (* ---- Leaves / non-references ---- *)
   | CLit _ | CVoid | CBreak | CContinue -> ()
+  | CResourceCleanupExit exit ->
+      List.iter (simulate target state) exit.rce_cleanups
   (* ---- Variable reference: if it's our target, consume one ref ---- *)
   | CVar v ->
       if v.vname = target then

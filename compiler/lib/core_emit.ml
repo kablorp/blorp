@@ -134,6 +134,48 @@ let expr_assigns_var (target : var) (e : core) : bool =
 let cleanup_frame_c_name (v : var) : string =
   "__blorp_cleanup_" ^ escape_c_ident (Var.to_c_name v)
 
+let cancellation_cleanup_pop_slot_stmt (v : var) : string =
+  Printf.sprintf "blorp_task_cleanup_pop_slot(&%s)"
+    (escape_c_ident (Var.to_c_name v))
+
+let cleanup_release_fn_for_call_kind = function
+  | CKUser (name, def_id) ->
+      Some (escape_c_ident (user_call_c_name name def_id))
+  | CKForeign { fc_c_name; _ } -> Some fc_c_name
+  | CKBuiltin c_name -> Some c_name
+  | CKIntrinsic _ | CKClosure | CKUnknown -> None
+
+let resource_cleanup_var_and_release_fn (cleanup : core) : (var * string) option
+    =
+  match cleanup.desc with
+  | CCall (kind, _, [ { desc = CVar resource_var; _ } ]) ->
+      Option.map
+        (fun release_fn -> (resource_var, release_fn))
+        (cleanup_release_fn_for_call_kind kind)
+  | _ -> None
+
+let resource_cancellation_cleanup_push_stmt (scope : resource_scope) : string =
+  match resource_cleanup_var_and_release_fn scope.rs_cleanup with
+  | Some (resource_var, release_fn) when Var.equal resource_var scope.rs_var ->
+      let resource_c = escape_c_ident (Var.to_c_name scope.rs_var) in
+      let frame_c = cleanup_frame_c_name scope.rs_var in
+      Printf.sprintf
+        "blorp_CancelCleanupFrame %s; blorp_task_cleanup_push(&%s, &%s, \
+         (void*)%s, (blorp_CancelCleanupFn)%s);"
+        frame_c frame_c resource_c resource_c release_fn
+  | Some _ | None ->
+      Core_error.errorf Core_error.Emit scope.rs_cleanup.loc
+        ~hint:
+          "Resource cleanup must be a direct finalizer call on the scoped \
+           resource so cancellation can run the same semantic cleanup."
+        "resource cleanup cannot be registered for cancellation"
+
+let resource_cleanup_pop_slot_stmt (cleanup : core) : string option =
+  match resource_cleanup_var_and_release_fn cleanup with
+  | Some (resource_var, _) ->
+      Some (cancellation_cleanup_pop_slot_stmt resource_var)
+  | None -> None
+
 let cancellation_cleanup_tracks_binding (ctx : Core_emit_context.t) (v : var)
     (ty : Ast.type_expr) (body : core) : bool =
   v.vname <> "_"
@@ -152,10 +194,6 @@ let emit_cancellation_cleanup_push (ctx : Core_emit_context.t) (v : var)
       emit_line ctx
         (Printf.sprintf "blorp_task_cleanup_push(&%s, &%s, (void*)%s, %s);"
            frame_c var_c var_c release_fn)
-
-let cancellation_cleanup_pop_slot_stmt (v : var) : string =
-  Printf.sprintf "blorp_task_cleanup_pop_slot(&%s)"
-    (escape_c_ident (Var.to_c_name v))
 
 let emit_generated_stack_option_none_assignment ctx abi result_tmp =
   emit ctx
@@ -2529,6 +2567,438 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                       Core_layout_type.is_stack_result_type ~reg:ctx.reg e.ty
                   | _ -> false
                 in
+                let file_io_error_type_name err_ty =
+                  match normalize_type (expand_alias ~reg:ctx.reg err_ty) with
+                  | Ast.TyNamed (name, [])
+                    when name = "IOError" || name = "std_file__IOError"
+                         ||
+                         match Types.split_canonical_module_type_name name with
+                         | Some (module_path, type_name) ->
+                             module_path = "std/file" && type_name = "IOError"
+                         | None -> false ->
+                      name
+                  | Ast.TyNamed (name, []) ->
+                      Core_error.errorf Core_error.Emit e.loc
+                        ~hint:
+                          "typed file operations currently use the std/file \
+                           IOError bridge; add a separate bridge before using \
+                           another fallible stream error type"
+                        "typed file operation error payload must be IOError, \
+                         got `%s`"
+                        name
+                  | other ->
+                      Core_error.errorf Core_error.Emit e.loc
+                        ~hint:
+                          "typed file operations must return Result[..., \
+                           IOError]"
+                        "typed file operation error payload has unsupported \
+                         type `%s`"
+                        (Types.type_to_string other)
+                in
+                let file_io_error_ctor err_name ctor_name =
+                  match
+                    Hashtbl.find_opt ctx.constructor_c_names_by_type
+                      (err_name, ctor_name)
+                  with
+                  | Some ctor_c -> ctor_c
+                  | None ->
+                      Core_error.errorf Core_error.Emit e.loc
+                        ~hint:
+                          "std/file IOError constructors must be visible to \
+                           the C emitter before typed file operation emission"
+                        "missing typed file error constructor `%s.%s`" err_name
+                        ctor_name
+                in
+                let emit_file_io_error_case state_tmp err_tmp err_name
+                    runtime_tag ctor_name =
+                  emit ctx (Printf.sprintf "case %s: " runtime_tag);
+                  emit ctx
+                    (Printf.sprintf
+                       "%s = %s((void*)%s.detail, %s.detail ? 1UL : 0UL); \
+                        break; "
+                       err_tmp
+                       (file_io_error_ctor err_name ctor_name)
+                       state_tmp state_tmp)
+                in
+                let emit_file_io_error_switch_cases state_tmp err_tmp err_name =
+                  List.iter
+                    (fun (runtime_tag, ctor_name) ->
+                      emit_file_io_error_case state_tmp err_tmp err_name
+                        runtime_tag ctor_name)
+                    [
+                      ("BLORP_FILE_ERROR_NOT_FOUND", "NotFound");
+                      ("BLORP_FILE_ERROR_PERMISSION_DENIED", "PermissionDenied");
+                      ("BLORP_FILE_ERROR_ALREADY_EXISTS", "AlreadyExists");
+                      ("BLORP_FILE_ERROR_INVALID_INPUT", "InvalidInput");
+                      ("BLORP_FILE_ERROR_INTERRUPTED", "Interrupted");
+                      ("BLORP_FILE_ERROR_TIMED_OUT", "TimedOut");
+                      ("BLORP_FILE_ERROR_UNSUPPORTED", "Unsupported");
+                      ("BLORP_FILE_ERROR_OTHER", "Other");
+                    ]
+                in
+                let try_emit_file_open_bridge () =
+                  let file_open_spec = function
+                    | CKBuiltin "blorp_file_open_read_raw" ->
+                        Some
+                          ( "blorp_file_open_read_raw",
+                            "blorp_FileOpenReaderResult",
+                            [
+                              "FileReader";
+                              "std/file::FileReader";
+                              "std_file__FileReader";
+                            ] )
+                    | CKBuiltin "blorp_file_open_write_raw" ->
+                        Some
+                          ( "blorp_file_open_write_raw",
+                            "blorp_FileOpenWriterResult",
+                            [
+                              "FileWriter";
+                              "std/file::FileWriter";
+                              "std_file__FileWriter";
+                            ] )
+                    | CKBuiltin "blorp_file_open_append_raw" ->
+                        Some
+                          ( "blorp_file_open_append_raw",
+                            "blorp_FileOpenWriterResult",
+                            [
+                              "FileWriter";
+                              "std/file::FileWriter";
+                              "std_file__FileWriter";
+                            ] )
+                    | CKBuiltin "blorp_file_open_read_write_raw" ->
+                        Some
+                          ( "blorp_file_open_read_write_raw",
+                            "blorp_FileOpenResult",
+                            [ "File"; "std/file::File"; "std_file__File" ] )
+                    | _ -> None
+                  in
+                  let is_file_resource_ty expected ty =
+                    match normalize_type (expand_alias ~reg:ctx.reg ty) with
+                    | Ast.TyNamed (name, []) -> List.mem name expected
+                    | _ -> false
+                  in
+                  match
+                    ( file_open_spec kind,
+                      args,
+                      normalize_type (expand_alias ~reg:ctx.reg e.ty) )
+                  with
+                  | ( Some (open_c_name, open_result_c, expected_ok_names),
+                      [ path_arg ],
+                      Ast.TyNamed ("Result", [ ok_ty; err_ty ]) )
+                    when is_file_resource_ty expected_ok_names ok_ty ->
+                      if
+                        Core_layout_type.stack_result_c_type ~reg:ctx.reg e.ty
+                        <> None
+                      then
+                        Core_error.errorf Core_error.Emit e.loc
+                          ~hint:
+                            "update the file-open bridge before classifying \
+                             file resources as stack Result payloads"
+                          "typed file open bridge currently emits the boxed \
+                           Result ABI";
+                      let err_name = file_io_error_type_name err_ty in
+                      let result_c = type_to_c ctx e.ty in
+                      let err_c = type_to_c ctx err_ty in
+                      let path_tmp =
+                        Printf.sprintf "__file_path_%d" (fresh_temp ctx)
+                      in
+                      let open_tmp =
+                        Printf.sprintf "__file_open_%d" (fresh_temp ctx)
+                      in
+                      let result_tmp =
+                        Printf.sprintf "__file_result_%d" (fresh_temp ctx)
+                      in
+                      let err_tmp =
+                        Printf.sprintf "__file_error_%d" (fresh_temp ctx)
+                      in
+                      emit ctx
+                        (Printf.sprintf "({ blorp_String* %s = " path_tmp);
+                      emit_expr ctx path_arg;
+                      emit ctx
+                        (Printf.sprintf
+                           "; %s %s = %s(%s); %s %s = NULL; if (%s.error_kind \
+                            == BLORP_FILE_ERROR_NONE) { %s = \
+                            (%s)blorp_result_ok((void*)%s.handle); } else { %s \
+                            %s = NULL; switch (%s.error_kind) { "
+                           open_result_c open_tmp open_c_name path_tmp result_c
+                           result_tmp open_tmp result_tmp result_c open_tmp
+                           err_c err_tmp open_tmp);
+                      emit_file_io_error_switch_cases open_tmp err_tmp err_name;
+                      emit ctx
+                        (Printf.sprintf
+                           "default: %s = %s((void*)%s.detail, %s.detail ? 1UL \
+                            : 0UL); break; } %s = \
+                            (%s)blorp_result_err((void*)%s); \
+                            ((blorp_Result*)%s)->release_mask = 1UL; } %s; })"
+                           err_tmp
+                           (file_io_error_ctor err_name "Other")
+                           open_tmp open_tmp result_tmp result_c err_tmp
+                           result_tmp result_tmp);
+                      true
+                  | _ -> false
+                in
+                let try_emit_file_operation_bridge () =
+                  let file_operation_spec = function
+                    | CKBuiltin "blorp_file_read_text_reader_raw" ->
+                        Some
+                          ( "blorp_file_read_text_reader_raw",
+                            "blorp_FileStringResult",
+                            `String )
+                    | CKBuiltin "blorp_file_read_text_file_raw" ->
+                        Some
+                          ( "blorp_file_read_text_file_raw",
+                            "blorp_FileStringResult",
+                            `String )
+                    | CKBuiltin "blorp_file_read_bytes_reader_raw" ->
+                        Some
+                          ( "blorp_file_read_bytes_reader_raw",
+                            "blorp_FileBytesResult",
+                            `Bytes )
+                    | CKBuiltin "blorp_file_read_bytes_file_raw" ->
+                        Some
+                          ( "blorp_file_read_bytes_file_raw",
+                            "blorp_FileBytesResult",
+                            `Bytes )
+                    | CKBuiltin "blorp_file_read_chunk_reader_raw" ->
+                        Some
+                          ( "blorp_file_read_chunk_reader_raw",
+                            "blorp_FileBytesResult",
+                            `Bytes )
+                    | CKBuiltin "blorp_file_read_chunk_file_raw" ->
+                        Some
+                          ( "blorp_file_read_chunk_file_raw",
+                            "blorp_FileBytesResult",
+                            `Bytes )
+                    | CKBuiltin "blorp_fallible_stream_collect_file_raw" ->
+                        Some
+                          ( "blorp_fallible_stream_collect_file_raw",
+                            "blorp_FileListResult",
+                            `List )
+                    | CKBuiltin "blorp_fallible_stream_fold_file_raw" ->
+                        Some
+                          ( "blorp_fallible_stream_fold_file_raw",
+                            "blorp_FileValueResult",
+                            `Erased )
+                    | CKBuiltin "blorp_fallible_stream_count_file_raw" ->
+                        Some
+                          ( "blorp_fallible_stream_count_file_raw",
+                            "blorp_FileIntResult",
+                            `Int )
+                    | CKBuiltin
+                        (( "blorp_fallible_stream_find_file_raw_nullable"
+                         | "blorp_fallible_stream_find_file_raw_int"
+                         | "blorp_fallible_stream_find_file_raw_int8"
+                         | "blorp_fallible_stream_find_file_raw_int16"
+                         | "blorp_fallible_stream_find_file_raw_int32"
+                         | "blorp_fallible_stream_find_file_raw_int64"
+                         | "blorp_fallible_stream_find_file_raw_uint8"
+                         | "blorp_fallible_stream_find_file_raw_uint16"
+                         | "blorp_fallible_stream_find_file_raw_uint32"
+                         | "blorp_fallible_stream_find_file_raw_uint64"
+                         | "blorp_fallible_stream_find_file_raw_float"
+                         | "blorp_fallible_stream_find_file_raw_bool"
+                         | "blorp_fallible_stream_find_file_raw_char"
+                         | "blorp_fallible_stream_find_file_raw_f32"
+                         | "blorp_fallible_stream_find_file_raw_f16" ) as c_name)
+                      ->
+                        Some (c_name, "blorp_FileValueResult", `Option)
+                    | CKBuiltin "blorp_fallible_stream_any_file_raw" ->
+                        Some
+                          ( "blorp_fallible_stream_any_file_raw",
+                            "blorp_FileBoolResult",
+                            `Bool )
+                    | CKBuiltin "blorp_fallible_stream_all_file_raw" ->
+                        Some
+                          ( "blorp_fallible_stream_all_file_raw",
+                            "blorp_FileBoolResult",
+                            `Bool )
+                    | CKBuiltin "blorp_file_write_text_writer_raw" ->
+                        Some
+                          ( "blorp_file_write_text_writer_raw",
+                            "blorp_FileVoidResult",
+                            `Void )
+                    | CKBuiltin "blorp_file_write_text_file_raw" ->
+                        Some
+                          ( "blorp_file_write_text_file_raw",
+                            "blorp_FileVoidResult",
+                            `Void )
+                    | CKBuiltin "blorp_file_write_bytes_writer_raw" ->
+                        Some
+                          ( "blorp_file_write_bytes_writer_raw",
+                            "blorp_FileVoidResult",
+                            `Void )
+                    | CKBuiltin "blorp_file_write_bytes_file_raw" ->
+                        Some
+                          ( "blorp_file_write_bytes_file_raw",
+                            "blorp_FileVoidResult",
+                            `Void )
+                    | CKBuiltin "blorp_file_write_chunk_writer_raw" ->
+                        Some
+                          ( "blorp_file_write_chunk_writer_raw",
+                            "blorp_FileIntResult",
+                            `Int )
+                    | CKBuiltin "blorp_file_write_chunk_file_raw" ->
+                        Some
+                          ( "blorp_file_write_chunk_file_raw",
+                            "blorp_FileIntResult",
+                            `Int )
+                    | CKBuiltin "blorp_file_count_lines_reader_raw" ->
+                        Some
+                          ( "blorp_file_count_lines_reader_raw",
+                            "blorp_FileIntResult",
+                            `Int )
+                    | CKBuiltin "blorp_file_count_lines_file_raw" ->
+                        Some
+                          ( "blorp_file_count_lines_file_raw",
+                            "blorp_FileIntResult",
+                            `Int )
+                    | _ -> None
+                  in
+                  let ok_payload_matches payload ok_ty =
+                    match
+                      (payload, normalize_type (expand_alias ~reg:ctx.reg ok_ty))
+                    with
+                    | `String, Ast.TyNamed ("String", []) -> true
+                    | `Bytes, Ast.TyNamed ("Bytes", []) -> true
+                    | `List, Ast.TyNamed ("List", _) -> true
+                    | `Int, Ast.TyNamed ("Int", []) -> true
+                    | `Bool, Ast.TyNamed ("Bool", []) -> true
+                    | `Void, Ast.TyNamed ("Void", []) -> true
+                    | `Option, Ast.TyNamed ("Option", [ _ ]) -> true
+                    | `Erased, _ -> true
+                    | _ -> false
+                  in
+                  let ok_payload_release_mask payload ok_ty =
+                    match payload with
+                    | `String | `Bytes | `List -> 1
+                    | `Erased | `Option ->
+                        if boxed_value_needs_release ctx ok_ty e.loc then 1
+                        else 0
+                    | `Int | `Bool | `Void -> 0
+                  in
+                  let emit_ok_payload op_tmp payload =
+                    match payload with
+                    | `String | `Bytes | `List ->
+                        emit ctx (Printf.sprintf "(void*)%s.value" op_tmp)
+                    | `Int | `Bool | `Erased | `Option ->
+                        emit ctx (Printf.sprintf "(void*)%s.value" op_tmp)
+                    | `Void -> emit ctx "NULL"
+                  in
+                  let emit_arg_list args =
+                    List.iteri
+                      (fun i arg ->
+                        if i > 0 then emit ctx ", ";
+                        emit_expr ctx arg)
+                      args
+                  in
+                  let emit_file_operation_args payload ok_ty args =
+                    emit_arg_list args;
+                    match payload with
+                    | `List ->
+                        let layout =
+                          Core_layout_type.list_storage_layout_of_type
+                            ~reg:ctx.reg ok_ty e.loc
+                        in
+                        let storage_mode, elem_size =
+                          list_storage_runtime_args layout
+                        in
+                        emit ctx
+                          (Printf.sprintf ", %s, %s" storage_mode elem_size)
+                    | `String | `Bytes | `Int | `Bool | `Void | `Option
+                    | `Erased ->
+                        ()
+                  in
+                  match
+                    ( file_operation_spec kind,
+                      normalize_type (expand_alias ~reg:ctx.reg e.ty) )
+                  with
+                  | ( Some (op_c_name, op_result_c, payload),
+                      Ast.TyNamed ("Result", [ ok_ty; err_ty ]) )
+                    when ok_payload_matches payload ok_ty ->
+                      let err_name = file_io_error_type_name err_ty in
+                      let result_c = type_to_c ctx e.ty in
+                      let err_c = type_to_c ctx err_ty in
+                      let op_tmp =
+                        Printf.sprintf "__file_op_%d" (fresh_temp ctx)
+                      in
+                      let result_tmp =
+                        Printf.sprintf "__file_result_%d" (fresh_temp ctx)
+                      in
+                      let err_tmp =
+                        Printf.sprintf "__file_error_%d" (fresh_temp ctx)
+                      in
+                      let stack_result =
+                        Core_layout_type.stack_result_c_type ~reg:ctx.reg e.ty
+                        <> None
+                      in
+                      emit ctx
+                        (Printf.sprintf "({ %s %s = %s(" op_result_c op_tmp
+                           op_c_name);
+                      emit_file_operation_args payload ok_ty args;
+                      emit ctx "); ";
+                      if stack_result then (
+                        emit ctx
+                          (Printf.sprintf
+                             "%s %s; if (%s.error_kind == \
+                              BLORP_FILE_ERROR_NONE) { %s = ((%s){ .tag = \
+                              BLORP_TAG_OK, .release_mask = %dUL, \
+                              .data.Ok.field0 = "
+                             result_c result_tmp op_tmp result_tmp result_c
+                             (ok_payload_release_mask payload ok_ty));
+                        emit_ok_payload op_tmp payload;
+                        emit ctx
+                          (Printf.sprintf
+                             " }); } else { %s %s = NULL; switch \
+                              (%s.error_kind) { "
+                             err_c err_tmp op_tmp);
+                        emit_file_io_error_switch_cases op_tmp err_tmp err_name;
+                        emit ctx
+                          (Printf.sprintf
+                             "default: %s = %s((void*)%s.detail, %s.detail ? \
+                              1UL : 0UL); break; } %s = ((%s){ .tag = \
+                              BLORP_TAG_ERR, .release_mask = 1UL, \
+                              .data.Err.field0 = (void*)%s }); } %s; })"
+                             err_tmp
+                             (file_io_error_ctor err_name "Other")
+                             op_tmp op_tmp result_tmp result_c err_tmp
+                             result_tmp))
+                      else (
+                        emit ctx
+                          (Printf.sprintf
+                             "%s %s = NULL; if (%s.error_kind == \
+                              BLORP_FILE_ERROR_NONE) { %s = \
+                              (%s)blorp_result_ok("
+                             result_c result_tmp op_tmp result_tmp result_c);
+                        emit_ok_payload op_tmp payload;
+                        let ok_release_mask =
+                          ok_payload_release_mask payload ok_ty
+                        in
+                        emit ctx
+                          (if ok_release_mask = 1 then
+                             Printf.sprintf
+                               "); ((blorp_Result*)%s)->release_mask = 1UL; } \
+                                else { %s %s = NULL; switch (%s.error_kind) { "
+                               result_tmp err_c err_tmp op_tmp
+                           else
+                             Printf.sprintf
+                               "); } else { %s %s = NULL; switch \
+                                (%s.error_kind) { "
+                               err_c err_tmp op_tmp);
+                        emit_file_io_error_switch_cases op_tmp err_tmp err_name;
+                        emit ctx
+                          (Printf.sprintf
+                             "default: %s = %s((void*)%s.detail, %s.detail ? \
+                              1UL : 0UL); break; } %s = \
+                              (%s)blorp_result_err((void*)%s); \
+                              ((blorp_Result*)%s)->release_mask = 1UL; } %s; \
+                              })"
+                             err_tmp
+                             (file_io_error_ctor err_name "Other")
+                             op_tmp op_tmp result_tmp result_c err_tmp
+                             result_tmp result_tmp));
+                      true
+                  | _ -> false
+                in
                 let try_emit_foreign_copy_call () =
                   match kind with
                   | CKForeign
@@ -2630,7 +3100,9 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                         true
                   | _ -> false
                 in
-                if try_emit_foreign_copy_call () then ()
+                if try_emit_file_open_bridge () then ()
+                else if try_emit_file_operation_bridge () then ()
+                else if try_emit_foreign_copy_call () then ()
                 else begin
                   (match kind with
                   | CKUnknown ->
@@ -3472,14 +3944,40 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
            the module declaring this record is loaded, then run with \
            --check-invariants to confirm"
         "CRecordUpdate survived desugaring (invariant violated)"
-  | CResourceScope _ ->
-      Core_error.errorf Core_error.Emit e.loc
-        ~hint:
-          "CResourceScope is the canonical cleanup-scope IR, but cleanup \
-           emission is not implemented yet. Keep it behind final Core \
-           invariants until the backend can guarantee cleanup on every exit \
-           path."
-        "CResourceScope reached emission before cleanup lowering"
+  | CResourceScope scope ->
+      let resource_ty_c = type_to_c ctx scope.rs_ty in
+      let resource_c = escape_c_ident (Var.to_c_name scope.rs_var) in
+      let cleanup_push = resource_cancellation_cleanup_push_stmt scope in
+      let cleanup_pop = cancellation_cleanup_pop_slot_stmt scope.rs_var in
+      emit ctx "({ ";
+      emit ctx (Printf.sprintf "%s %s = " resource_ty_c resource_c);
+      emit_expr ctx scope.rs_acquire;
+      emit ctx "; ";
+      emit ctx cleanup_push;
+      emit ctx " ";
+      if is_void_ty scope.rs_body.ty then begin
+        emit_expr ctx scope.rs_body;
+        emit ctx "; ";
+        emit ctx cleanup_pop;
+        emit ctx "; ";
+        emit_expr ctx scope.rs_cleanup;
+        emit ctx "; })"
+      end
+      else begin
+        let result_tmp =
+          Printf.sprintf "__resource_result_%d" (fresh_temp ctx)
+        in
+        emit ctx
+          (Printf.sprintf "%s %s = "
+             (type_to_c ctx scope.rs_body.ty)
+             result_tmp);
+        emit_expr ctx scope.rs_body;
+        emit ctx "; ";
+        emit ctx cleanup_pop;
+        emit ctx "; ";
+        emit_expr ctx scope.rs_cleanup;
+        emit ctx (Printf.sprintf "; %s; })" result_tmp)
+      end
   | CLambda _ ->
       Core_error.errorf Core_error.Emit e.loc
         ~hint:
@@ -3541,7 +4039,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
      These constructs don't produce values. If they show up here it's
      because lowering produced a tree we can't render as a C expression.
      Callers that have a statement context should use [emit_stmt]. *)
-  | CWhile _ | CFor _ | CBreak | CContinue | CAssign _ ->
+  | CWhile _ | CFor _ | CBreak | CContinue | CAssign _ | CResourceCleanupExit _
+    ->
       emit ctx "({ ";
       emit_stmt ctx e;
       emit ctx "(void)0; })"
@@ -3899,13 +4398,32 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
       emit_indent ctx;
       emitln ctx "}"
   | CFor (binder, iter, body) -> emit_for_loop ctx binder iter body
-  | CResourceScope _ ->
-      Core_error.errorf Core_error.Emit e.loc
-        ~hint:
-          "CResourceScope is the canonical cleanup-scope IR, but cleanup \
-           statement emission is not implemented yet. Final Core should reject \
-           it before this point."
-        "CResourceScope reached statement emission before cleanup lowering"
+  | CResourceScope scope ->
+      let resource_ty_c = type_to_c ctx scope.rs_ty in
+      let resource_c = escape_c_ident (Var.to_c_name scope.rs_var) in
+      emit_line ctx "{";
+      ctx.indent <- ctx.indent + 1;
+      emit_indent ctx;
+      emit ctx (Printf.sprintf "%s %s = " resource_ty_c resource_c);
+      emit_expr ctx scope.rs_acquire;
+      emitln ctx ";";
+      emit_line ctx (resource_cancellation_cleanup_push_stmt scope);
+      emit_stmt ctx scope.rs_body;
+      emit_line ctx (cancellation_cleanup_pop_slot_stmt scope.rs_var ^ ";");
+      emit_stmt ctx scope.rs_cleanup;
+      ctx.indent <- ctx.indent - 1;
+      emit_line ctx "}"
+  | CResourceCleanupExit exit -> (
+      List.iter
+        (fun cleanup ->
+          (match resource_cleanup_pop_slot_stmt cleanup with
+          | Some pop -> emit_line ctx (pop ^ ";")
+          | None -> ());
+          emit_stmt ctx cleanup)
+        exit.rce_cleanups;
+      match exit.rce_exit with
+      | ResourceBreak -> emit_line ctx "break;"
+      | ResourceContinue -> emit_line ctx "continue;")
   | CBreak -> emit_line ctx "break;"
   | CContinue -> emit_line ctx "continue;"
   | CAssign (v, rhs) ->

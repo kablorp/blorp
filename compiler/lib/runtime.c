@@ -7208,6 +7208,102 @@ blorp_Result* blorp_result_err(void* value) {
 }
 
 // ============================================================================
+// File resource support
+// ============================================================================
+
+typedef struct blorp_FileReader {
+    int fd;
+} blorp_FileReader;
+
+typedef struct blorp_Bytes blorp_Bytes;
+
+typedef struct blorp_FileWriter {
+    int fd;
+} blorp_FileWriter;
+
+typedef struct blorp_File {
+    int fd;
+} blorp_File;
+
+typedef enum {
+    BLORP_FILE_ERROR_NONE = 0,
+    BLORP_FILE_ERROR_NOT_FOUND = 1,
+    BLORP_FILE_ERROR_PERMISSION_DENIED = 2,
+    BLORP_FILE_ERROR_ALREADY_EXISTS = 3,
+    BLORP_FILE_ERROR_INVALID_INPUT = 4,
+    BLORP_FILE_ERROR_INTERRUPTED = 5,
+    BLORP_FILE_ERROR_TIMED_OUT = 6,
+    BLORP_FILE_ERROR_UNSUPPORTED = 7,
+    BLORP_FILE_ERROR_OTHER = 8
+} blorp_FileErrorKind;
+
+typedef struct {
+    blorp_FileReader* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenReaderResult;
+
+typedef struct {
+    blorp_FileWriter* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenWriterResult;
+
+typedef struct {
+    blorp_File* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenResult;
+
+typedef struct {
+    blorp_String* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileStringResult;
+
+typedef struct {
+    blorp_Bytes* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileBytesResult;
+
+typedef struct {
+    void* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileValueResult;
+
+typedef struct {
+    long found;
+    void* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileFindResult;
+
+typedef struct {
+    long value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileIntResult;
+
+typedef struct {
+    long value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileBoolResult;
+
+typedef struct {
+    blorp_List* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileListResult;
+
+typedef struct {
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileVoidResult;
+
+// ============================================================================
 // ConcurrencyError type — used by concurrent: blocks
 // ============================================================================
 
@@ -10667,12 +10763,12 @@ long blorp_length(void* collection) {
 // Bytes (Binary Buffer) Operations
 // ============================================================================
 
-typedef struct {
+struct blorp_Bytes {
     blorp_Object header;
     long len;
     long capacity;
     unsigned char data[];
-} blorp_Bytes;
+};
 
 blorp_Bytes* blorp_bytes_new(long capacity) {
     if (capacity < 0) capacity = 0;
@@ -17526,6 +17622,37 @@ blorp_Tuple* blorp_tuple_new(long arity, ...) {
 // Stream[T] — Lazy pull-based sequences
 // ============================================================================
 
+static blorp_FileListResult blorp_file_list_ok(blorp_List* value);
+static blorp_FileListResult blorp_file_list_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+);
+static blorp_FileValueResult blorp_file_value_ok(void* value);
+static blorp_FileValueResult blorp_file_value_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+);
+static blorp_FileFindResult blorp_file_find_ok(long found, void* value);
+static blorp_FileFindResult blorp_file_find_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+);
+static blorp_FileIntResult blorp_file_int_ok(long value);
+static blorp_FileIntResult blorp_file_int_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+);
+static blorp_FileBoolResult blorp_file_bool_ok(long value);
+static blorp_FileBoolResult blorp_file_bool_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+);
+static blorp_FileErrorKind blorp_file_error_kind_from_errno(int errnum);
+static blorp_String* blorp_file_operation_errno_detail(
+    const char* operation,
+    int errnum
+);
+
 typedef enum blorp_StreamElementLayout {
     BLORP_STREAM_ELEM_IMMEDIATE = 0,
     BLORP_STREAM_ELEM_BORROWED_ARC = 1,
@@ -17541,8 +17668,32 @@ typedef struct blorp_Stream {
     blorp_StreamElementLayout elem_layout;
 } blorp_Stream;
 
+typedef enum blorp_FallibleStreamPullStatus {
+    BLORP_FALLIBLE_STREAM_END = 0,
+    BLORP_FALLIBLE_STREAM_ITEM = 1,
+    BLORP_FALLIBLE_STREAM_ERROR = 2,
+} blorp_FallibleStreamPullStatus;
+
+typedef struct blorp_FallibleStream {
+    blorp_Object header;
+    blorp_FallibleStreamPullStatus (*pull)(
+        struct blorp_FallibleStream* self,
+        void** out,
+        blorp_FileErrorKind* error_kind,
+        blorp_String** error_detail
+    );
+    void* state;
+    void (*state_cleanup)(struct blorp_FallibleStream* self);
+    blorp_StreamElementLayout elem_layout;
+} blorp_FallibleStream;
+
 static void blorp_stream_destroy(void* obj) {
     blorp_Stream* s = (blorp_Stream*)obj;
+    if (s->state_cleanup) s->state_cleanup(s);
+}
+
+static void blorp_fallible_stream_destroy(void* obj) {
+    blorp_FallibleStream* s = (blorp_FallibleStream*)obj;
     if (s->state_cleanup) s->state_cleanup(s);
 }
 
@@ -17565,11 +17716,51 @@ typedef struct {
     blorp_StreamElementLayout state_layout;
 } StreamUnfoldState;
 typedef struct { FILE* fp; char* buf; size_t buf_size; } StreamLinesState;
+typedef struct {
+    int fd;
+    unsigned char* buf;
+    long buf_len;
+    long buf_pos;
+} FallibleFileByteBuffer;
+typedef struct { int fd; long chunk_size; bool done; } FallibleFileChunksState;
+typedef struct {
+    int fd;
+    unsigned char* buf;
+    long buf_len;
+    long buf_pos;
+    char* line;
+    long line_len;
+    long line_cap;
+    bool done;
+} FallibleFileLinesState;
+typedef struct {
+    FallibleFileByteBuffer input;
+    bool done;
+} FallibleFileBytesState;
+typedef struct {
+    FallibleFileByteBuffer input;
+    long window_size;
+    unsigned char* ring;
+    long filled;
+    long start;
+    bool initialized;
+    bool done;
+} FallibleFileWindowsState;
 
 // --- Helper: allocate a stream ---
 static blorp_Stream* blorp_stream_new(void) {
     blorp_Stream* s = (blorp_Stream*)blorp_alloc(sizeof(blorp_Stream));
     BLORP_SET_DESTRUCTOR(s, blorp_stream_destroy);
+    s->state = NULL;
+    s->state_cleanup = NULL;
+    s->elem_layout = BLORP_STREAM_ELEM_IMMEDIATE;
+    return s;
+}
+
+static blorp_FallibleStream* blorp_fallible_stream_new(void) {
+    blorp_FallibleStream* s =
+        (blorp_FallibleStream*)blorp_alloc(sizeof(blorp_FallibleStream));
+    BLORP_SET_DESTRUCTOR(s, blorp_fallible_stream_destroy);
     s->state = NULL;
     s->state_cleanup = NULL;
     s->elem_layout = BLORP_STREAM_ELEM_IMMEDIATE;
@@ -17609,8 +17800,23 @@ static inline bool blorp_stream_pulls_owned_arc(blorp_Stream* stream) {
     return stream && blorp_stream_layout_is_owned_arc(stream->elem_layout);
 }
 
+static inline bool blorp_fallible_stream_pulls_owned_arc(
+    blorp_FallibleStream* stream
+) {
+    return stream && blorp_stream_layout_is_owned_arc(stream->elem_layout);
+}
+
 void blorp_stream_release_pulled_if_owned(blorp_Stream* stream, void* value) {
     if (blorp_stream_pulls_owned_arc(stream) && value) {
+        blorp_release(value);
+    }
+}
+
+static inline void blorp_fallible_stream_release_pulled_if_owned(
+    blorp_FallibleStream* stream,
+    void* value
+) {
+    if (blorp_fallible_stream_pulls_owned_arc(stream) && value) {
         blorp_release(value);
     }
 }
@@ -18099,6 +18305,257 @@ blorp_List* blorp_stream_collect(blorp_Stream* stream) {
     return result;
 }
 
+blorp_FileListResult blorp_fallible_stream_collect_file_raw(
+    blorp_FallibleStream* stream,
+    uint8_t storage_mode,
+    int16_t elem_size
+) {
+    if (!stream) {
+        return blorp_file_list_ok(
+            blorp_list_new_layout(0, storage_mode, elem_size));
+    }
+    blorp_List* result = blorp_list_new_layout(16, storage_mode, elem_size);
+    blorp_CancelCleanupFrame result_cleanup;
+    blorp_task_cleanup_push(&result_cleanup, &result, result,
+        blorp_cleanup_release_arc_value);
+    if (result->storage_mode == BLORP_LIST_STORAGE_POINTER
+        && blorp_stream_layout_is_arc(stream->elem_layout)) {
+        result->elem_release = blorp_elem_release_fn;
+    }
+    void* val;
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamPullStatus status =
+            stream->pull(stream, &val, &error_kind, &error_detail);
+        if (status == BLORP_FALLIBLE_STREAM_END) break;
+        if (status == BLORP_FALLIBLE_STREAM_ERROR) {
+            blorp_task_cleanup_pop_slot(&result);
+            blorp_release(result);
+            return blorp_file_list_error(error_kind, error_detail);
+        }
+        if (blorp_fallible_stream_pulls_owned_arc(stream)) {
+            result = blorp_list_append_owned(result, val);
+        } else {
+            result = blorp_list_append(result, val);
+        }
+        result_cleanup.value = result;
+    }
+    blorp_task_cleanup_pop_slot(&result);
+    return blorp_file_list_ok(result);
+}
+
+blorp_FileValueResult blorp_fallible_stream_fold_file_raw(
+    blorp_FallibleStream* stream,
+    void* init,
+    blorp_Closure* func,
+    bool acc_is_rc
+) {
+    if (!stream || !func) return blorp_file_value_ok(init);
+    void* acc = init;
+    void* val = NULL;
+    long cancel_check = 0;
+    blorp_CancelCleanupFrame acc_cleanup;
+    if (acc_is_rc) {
+        blorp_task_cleanup_push(
+            &acc_cleanup, &acc, acc, blorp_cleanup_release_arc_value);
+    }
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamPullStatus status =
+            stream->pull(stream, &val, &error_kind, &error_detail);
+        if (status == BLORP_FALLIBLE_STREAM_END) break;
+        if (status == BLORP_FALLIBLE_STREAM_ERROR) {
+            if (acc_is_rc) {
+                blorp_task_cleanup_pop_slot(&acc);
+                if (acc) blorp_release(acc);
+            }
+            return blorp_file_value_error(error_kind, error_detail);
+        }
+        void* new_acc =
+            ((void* (*)(void*, void*, void*))(func->func))(func->env, acc, val);
+        blorp_fallible_stream_release_pulled_if_owned(stream, val);
+        if (acc_is_rc && new_acc != acc && acc) blorp_release(acc);
+        acc = new_acc;
+        if (acc_is_rc) acc_cleanup.value = acc;
+    }
+    if (acc_is_rc) blorp_task_cleanup_pop_slot(&acc);
+    return blorp_file_value_ok(acc);
+}
+
+blorp_FileIntResult blorp_fallible_stream_count_file_raw(
+    blorp_FallibleStream* stream
+) {
+    if (!stream) return blorp_file_int_ok(0);
+    long n = 0;
+    void* val = NULL;
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamPullStatus status =
+            stream->pull(stream, &val, &error_kind, &error_detail);
+        if (status == BLORP_FALLIBLE_STREAM_END) break;
+        if (status == BLORP_FALLIBLE_STREAM_ERROR) {
+            return blorp_file_int_error(error_kind, error_detail);
+        }
+        n++;
+        blorp_fallible_stream_release_pulled_if_owned(stream, val);
+    }
+    return blorp_file_int_ok(n);
+}
+
+static blorp_FileFindResult blorp_fallible_stream_find_file_raw_find(
+    blorp_FallibleStream* stream,
+    blorp_Closure* pred,
+    bool retain_borrowed_match
+) {
+    if (!stream || !pred) return blorp_file_find_ok(0, NULL);
+    void* val = NULL;
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamPullStatus status =
+            stream->pull(stream, &val, &error_kind, &error_detail);
+        if (status == BLORP_FALLIBLE_STREAM_END) break;
+        if (status == BLORP_FALLIBLE_STREAM_ERROR) {
+            return blorp_file_find_error(error_kind, error_detail);
+        }
+        long keep = (long)blorp_call1(pred, val);
+        if (keep) {
+            if (retain_borrowed_match
+                && blorp_stream_layout_is_borrowed_arc(stream->elem_layout)
+                && val) {
+                blorp_retain(val);
+            }
+            return blorp_file_find_ok(1, val);
+        }
+        blorp_fallible_stream_release_pulled_if_owned(stream, val);
+    }
+    return blorp_file_find_ok(0, NULL);
+}
+
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_nullable(
+    blorp_FallibleStream* stream,
+    blorp_Closure* pred
+) {
+    blorp_FileFindResult found =
+        blorp_fallible_stream_find_file_raw_find(stream, pred, true);
+    if (found.error_kind != BLORP_FILE_ERROR_NONE) {
+        return blorp_file_value_error(found.error_kind, found.detail);
+    }
+    return blorp_file_value_ok(found.found ? found.value : NULL);
+}
+
+#define BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION( \
+    PUBLIC_SUFFIX, STACK_SUFFIX, NAME, CTYPE, UNBOX) \
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_##PUBLIC_SUFFIX( \
+    blorp_FallibleStream* stream, \
+    blorp_Closure* pred \
+) { \
+    blorp_FileFindResult found = \
+        blorp_fallible_stream_find_file_raw_find(stream, pred, false); \
+    if (found.error_kind != BLORP_FILE_ERROR_NONE) { \
+        return blorp_file_value_error(found.error_kind, found.detail); \
+    } \
+    blorp_StackOption_##NAME opt = found.found \
+        ? blorp_stack_option_##STACK_SUFFIX##_some((CTYPE)UNBOX(found.value)) \
+        : blorp_stack_option_##STACK_SUFFIX##_none(); \
+    if (found.found && blorp_fallible_stream_pulls_owned_arc(stream) \
+        && found.value) { \
+        blorp_release(found.value); \
+    } \
+    return blorp_file_value_ok(blorp_box_struct(&opt, sizeof(opt))); \
+}
+
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    int, int, Int, long, blorp_channel_unbox_long)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    int8, int8, Int8, int8_t, blorp_channel_unbox_int8)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    int16, int16, Int16, int16_t, blorp_channel_unbox_int16)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    int32, int32, Int32, int32_t, blorp_channel_unbox_int32)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    int64, int64, Int64, long, blorp_channel_unbox_long)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    uint8, uint8, UInt8, uint8_t, blorp_channel_unbox_uint8)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    uint16, uint16, UInt16, uint16_t, blorp_channel_unbox_uint16)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    uint32, uint32, UInt32, uint32_t, blorp_channel_unbox_uint32)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    uint64, uint64, UInt64, uint64_t, blorp_channel_unbox_uint64)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    float, float, Float, double, blorp_unbox_float)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    bool, bool, Bool, long, blorp_channel_unbox_bool)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    char, char, Char, int32_t, blorp_channel_unbox_int32)
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    f32, float32, Float32, float, blorp_unbox_float32)
+#ifdef __FLT16_MAX__
+BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
+    f16, float16, Float16, _Float16, blorp_unbox_float16)
+#endif
+
+#undef BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION
+
+blorp_FileBoolResult blorp_fallible_stream_any_file_raw(
+    blorp_FallibleStream* stream,
+    blorp_Closure* pred
+) {
+    if (!stream || !pred) return blorp_file_bool_ok(0);
+    void* val = NULL;
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamPullStatus status =
+            stream->pull(stream, &val, &error_kind, &error_detail);
+        if (status == BLORP_FALLIBLE_STREAM_END) break;
+        if (status == BLORP_FALLIBLE_STREAM_ERROR) {
+            return blorp_file_bool_error(error_kind, error_detail);
+        }
+        long keep = (long)blorp_call1(pred, val);
+        blorp_fallible_stream_release_pulled_if_owned(stream, val);
+        if (keep) return blorp_file_bool_ok(1);
+    }
+    return blorp_file_bool_ok(0);
+}
+
+blorp_FileBoolResult blorp_fallible_stream_all_file_raw(
+    blorp_FallibleStream* stream,
+    blorp_Closure* pred
+) {
+    if (!stream || !pred) return blorp_file_bool_ok(1);
+    void* val = NULL;
+    long cancel_check = 0;
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamPullStatus status =
+            stream->pull(stream, &val, &error_kind, &error_detail);
+        if (status == BLORP_FALLIBLE_STREAM_END) break;
+        if (status == BLORP_FALLIBLE_STREAM_ERROR) {
+            return blorp_file_bool_error(error_kind, error_detail);
+        }
+        long keep = (long)blorp_call1(pred, val);
+        blorp_fallible_stream_release_pulled_if_owned(stream, val);
+        if (!keep) return blorp_file_bool_ok(0);
+    }
+    return blorp_file_bool_ok(1);
+}
+
 // --- Terminal: fold ---
 void* blorp_stream_fold(blorp_Stream* stream, void* init, blorp_Closure* func, bool acc_is_rc) {
     if (!stream || !func) return init;
@@ -18286,6 +18743,448 @@ blorp_Stream* blorp_stream_from_lines(blorp_String* path) {
     s->state = st;
     s->pull = stream_lines_pull;
     s->state_cleanup = stream_lines_cleanup;
+    return s;
+}
+
+#define BLORP_FILE_DEFAULT_CHUNK_SIZE 65536L
+
+typedef enum {
+    FALLIBLE_FILE_BYTE_READ_ITEM,
+    FALLIBLE_FILE_BYTE_READ_EOF,
+    FALLIBLE_FILE_BYTE_READ_ERROR
+} FallibleFileByteReadStatus;
+
+static void fallible_file_byte_buffer_init(
+    FallibleFileByteBuffer* input,
+    int fd
+) {
+    input->fd = fd;
+    input->buf =
+        (unsigned char*)blorp_malloc_checked(BLORP_FILE_DEFAULT_CHUNK_SIZE);
+    input->buf_len = 0;
+    input->buf_pos = 0;
+}
+
+static void fallible_file_byte_buffer_cleanup(
+    FallibleFileByteBuffer* input
+) {
+    if (input) {
+        free(input->buf);
+        input->buf = NULL;
+        input->buf_len = 0;
+        input->buf_pos = 0;
+    }
+}
+
+static FallibleFileByteReadStatus fallible_file_byte_buffer_read(
+    FallibleFileByteBuffer* input,
+    const char* operation,
+    const char* closed_detail,
+    unsigned char* out,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    if (!input || input->fd < 0) {
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal(closed_detail);
+        return FALLIBLE_FILE_BYTE_READ_ERROR;
+    }
+
+    while (true) {
+        if (input->buf_pos < input->buf_len) {
+            *out = input->buf[input->buf_pos++];
+            return FALLIBLE_FILE_BYTE_READ_ITEM;
+        }
+
+        ssize_t n =
+            read(input->fd, input->buf, BLORP_FILE_DEFAULT_CHUNK_SIZE);
+        if (n > 0) {
+            input->buf_len = (long)n;
+            input->buf_pos = 0;
+            continue;
+        }
+        if (n == 0) return FALLIBLE_FILE_BYTE_READ_EOF;
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        *error_kind = blorp_file_error_kind_from_errno(errnum);
+        *error_detail = blorp_file_operation_errno_detail(operation, errnum);
+        return FALLIBLE_FILE_BYTE_READ_ERROR;
+    }
+}
+
+static blorp_FallibleStreamPullStatus fallible_file_chunks_pull(
+    blorp_FallibleStream* self,
+    void** out,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    FallibleFileChunksState* st = (FallibleFileChunksState*)self->state;
+    if (st->done) return BLORP_FALLIBLE_STREAM_END;
+    if (st->fd < 0) {
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal("chunks: closed file handle");
+        st->done = true;
+        return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+    if (st->chunk_size <= 0) {
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal("chunks: chunk_size must be positive");
+        st->done = true;
+        return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+
+    blorp_Bytes* bytes = blorp_bytes_new(st->chunk_size);
+    while (true) {
+        ssize_t n = read(st->fd, bytes->data, (size_t)st->chunk_size);
+        if (n > 0) {
+            bytes->len = (long)n;
+            *out = bytes;
+            return BLORP_FALLIBLE_STREAM_ITEM;
+        }
+        if (n == 0) {
+            st->done = true;
+            blorp_release(bytes);
+            return BLORP_FALLIBLE_STREAM_END;
+        }
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        *error_kind = blorp_file_error_kind_from_errno(errnum);
+        *error_detail = blorp_file_operation_errno_detail("chunks", errnum);
+        st->done = true;
+        blorp_release(bytes);
+        return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+}
+
+static void fallible_file_chunks_cleanup(blorp_FallibleStream* self) {
+    free(self->state);
+}
+
+blorp_FallibleStream* blorp_file_chunks_with_size_reader_raw(
+    const blorp_FileReader* reader,
+    long chunk_size
+) {
+    blorp_FallibleStream* s = blorp_fallible_stream_new();
+    FallibleFileChunksState* st =
+        (FallibleFileChunksState*)blorp_malloc_checked(
+            sizeof(FallibleFileChunksState));
+    st->fd = reader ? reader->fd : -1;
+    st->chunk_size = chunk_size;
+    st->done = false;
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
+    s->state = st;
+    s->pull = fallible_file_chunks_pull;
+    s->state_cleanup = fallible_file_chunks_cleanup;
+    return s;
+}
+
+blorp_FallibleStream* blorp_file_chunks_reader_raw(
+    const blorp_FileReader* reader
+) {
+    return blorp_file_chunks_with_size_reader_raw(
+        reader,
+        BLORP_FILE_DEFAULT_CHUNK_SIZE
+    );
+}
+
+static void fallible_file_lines_append(
+    FallibleFileLinesState* st,
+    const unsigned char* data,
+    long len
+) {
+    if (len <= 0) return;
+    long needed = st->line_len + len;
+    if (needed > st->line_cap) {
+        long next_cap = st->line_cap > 0 ? st->line_cap : 128;
+        while (next_cap < needed) {
+            if (next_cap > LONG_MAX / 2) {
+                next_cap = needed;
+                break;
+            }
+            next_cap *= 2;
+        }
+        char* next = (char*)realloc(st->line, (size_t)next_cap);
+        if (!next) {
+            fprintf(stderr, "blorp: out of memory (realloc %ld bytes)\n",
+                next_cap);
+            exit(1);
+        }
+        st->line = next;
+        st->line_cap = next_cap;
+    }
+    memcpy(st->line + st->line_len, data, (size_t)len);
+    st->line_len += len;
+}
+
+static blorp_String* fallible_file_lines_take_line(
+    FallibleFileLinesState* st
+) {
+    long len = st->line_len;
+    if (len > 0 && st->line[len - 1] == '\r') len--;
+    blorp_String* line =
+        blorp_string_from_buf(len > 0 ? st->line : "", len);
+    st->line_len = 0;
+    return line;
+}
+
+static blorp_FallibleStreamPullStatus fallible_file_lines_pull(
+    blorp_FallibleStream* self,
+    void** out,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    FallibleFileLinesState* st = (FallibleFileLinesState*)self->state;
+    if (st->done) return BLORP_FALLIBLE_STREAM_END;
+    if (st->fd < 0) {
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal("lines: closed file handle");
+        st->done = true;
+        return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+
+    while (true) {
+        if (st->buf_pos >= st->buf_len) {
+            ssize_t n = read(st->fd, st->buf, BLORP_FILE_DEFAULT_CHUNK_SIZE);
+            if (n > 0) {
+                st->buf_len = (long)n;
+                st->buf_pos = 0;
+            } else if (n == 0) {
+                st->done = true;
+                if (st->line_len > 0) {
+                    *out = fallible_file_lines_take_line(st);
+                    return BLORP_FALLIBLE_STREAM_ITEM;
+                }
+                return BLORP_FALLIBLE_STREAM_END;
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                int errnum = errno;
+                *error_kind = blorp_file_error_kind_from_errno(errnum);
+                *error_detail =
+                    blorp_file_operation_errno_detail("lines", errnum);
+                st->done = true;
+                return BLORP_FALLIBLE_STREAM_ERROR;
+            }
+        }
+
+        long start = st->buf_pos;
+        while (st->buf_pos < st->buf_len && st->buf[st->buf_pos] != '\n') {
+            st->buf_pos++;
+        }
+        fallible_file_lines_append(
+            st,
+            st->buf + start,
+            st->buf_pos - start
+        );
+        if (st->buf_pos < st->buf_len && st->buf[st->buf_pos] == '\n') {
+            st->buf_pos++;
+            *out = fallible_file_lines_take_line(st);
+            return BLORP_FALLIBLE_STREAM_ITEM;
+        }
+    }
+}
+
+static void fallible_file_lines_cleanup(blorp_FallibleStream* self) {
+    FallibleFileLinesState* st = (FallibleFileLinesState*)self->state;
+    if (st) {
+        free(st->buf);
+        free(st->line);
+        free(st);
+    }
+}
+
+blorp_FallibleStream* blorp_file_lines_reader_raw(
+    const blorp_FileReader* reader
+) {
+    blorp_FallibleStream* s = blorp_fallible_stream_new();
+    FallibleFileLinesState* st =
+        (FallibleFileLinesState*)blorp_malloc_checked(
+            sizeof(FallibleFileLinesState));
+    st->fd = reader ? reader->fd : -1;
+    st->buf =
+        (unsigned char*)blorp_malloc_checked(BLORP_FILE_DEFAULT_CHUNK_SIZE);
+    st->buf_len = 0;
+    st->buf_pos = 0;
+    st->line = NULL;
+    st->line_len = 0;
+    st->line_cap = 0;
+    st->done = false;
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
+    s->state = st;
+    s->pull = fallible_file_lines_pull;
+    s->state_cleanup = fallible_file_lines_cleanup;
+    return s;
+}
+
+static blorp_FallibleStreamPullStatus fallible_file_bytes_pull(
+    blorp_FallibleStream* self,
+    void** out,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    FallibleFileBytesState* st = (FallibleFileBytesState*)self->state;
+    if (st->done) return BLORP_FALLIBLE_STREAM_END;
+
+    unsigned char byte = 0;
+    FallibleFileByteReadStatus status = fallible_file_byte_buffer_read(
+        &st->input,
+        "bytes",
+        "bytes: closed file handle",
+        &byte,
+        error_kind,
+        error_detail
+    );
+    switch (status) {
+        case FALLIBLE_FILE_BYTE_READ_ITEM:
+            *out = blorp_stream_box_uint8(byte);
+            return BLORP_FALLIBLE_STREAM_ITEM;
+        case FALLIBLE_FILE_BYTE_READ_EOF:
+            st->done = true;
+            return BLORP_FALLIBLE_STREAM_END;
+        case FALLIBLE_FILE_BYTE_READ_ERROR:
+        default:
+            st->done = true;
+            return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+}
+
+static void fallible_file_bytes_cleanup(blorp_FallibleStream* self) {
+    FallibleFileBytesState* st = (FallibleFileBytesState*)self->state;
+    if (st) {
+        fallible_file_byte_buffer_cleanup(&st->input);
+        free(st);
+    }
+}
+
+blorp_FallibleStream* blorp_file_bytes_reader_raw(
+    const blorp_FileReader* reader
+) {
+    blorp_FallibleStream* s = blorp_fallible_stream_new();
+    FallibleFileBytesState* st =
+        (FallibleFileBytesState*)blorp_malloc_checked(
+            sizeof(FallibleFileBytesState));
+    fallible_file_byte_buffer_init(&st->input, reader ? reader->fd : -1);
+    st->done = false;
+    s->elem_layout = BLORP_STREAM_ELEM_IMMEDIATE;
+    s->state = st;
+    s->pull = fallible_file_bytes_pull;
+    s->state_cleanup = fallible_file_bytes_cleanup;
+    return s;
+}
+
+static blorp_Bytes* fallible_file_windows_copy_current(
+    const FallibleFileWindowsState* st
+) {
+    blorp_Bytes* window = blorp_bytes_new(st->window_size);
+    long tail_len = st->window_size - st->start;
+    if (tail_len > 0) {
+        memcpy(window->data, st->ring + st->start, (size_t)tail_len);
+    }
+    if (st->start > 0) {
+        memcpy(
+            window->data + tail_len,
+            st->ring,
+            (size_t)st->start
+        );
+    }
+    return window;
+}
+
+static blorp_FallibleStreamPullStatus fallible_file_windows_pull(
+    blorp_FallibleStream* self,
+    void** out,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    FallibleFileWindowsState* st = (FallibleFileWindowsState*)self->state;
+    if (st->done) return BLORP_FALLIBLE_STREAM_END;
+    if (st->window_size <= 0) {
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal("windows: size must be positive");
+        st->done = true;
+        return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+
+    unsigned char byte = 0;
+    if (!st->initialized) {
+        long cancel_check = 0;
+        while (st->filled < st->window_size) {
+            blorp_stream_cancellation_checkpoint(&cancel_check);
+            FallibleFileByteReadStatus status = fallible_file_byte_buffer_read(
+                &st->input,
+                "windows",
+                "windows: closed file handle",
+                &byte,
+                error_kind,
+                error_detail
+            );
+            if (status == FALLIBLE_FILE_BYTE_READ_ITEM) {
+                st->ring[st->filled++] = byte;
+                continue;
+            }
+            st->done = true;
+            return status == FALLIBLE_FILE_BYTE_READ_EOF
+                ? BLORP_FALLIBLE_STREAM_END
+                : BLORP_FALLIBLE_STREAM_ERROR;
+        }
+        st->initialized = true;
+        st->start = 0;
+    } else {
+        FallibleFileByteReadStatus status = fallible_file_byte_buffer_read(
+            &st->input,
+            "windows",
+            "windows: closed file handle",
+            &byte,
+            error_kind,
+            error_detail
+        );
+        if (status == FALLIBLE_FILE_BYTE_READ_EOF) {
+            st->done = true;
+            return BLORP_FALLIBLE_STREAM_END;
+        }
+        if (status == FALLIBLE_FILE_BYTE_READ_ERROR) {
+            st->done = true;
+            return BLORP_FALLIBLE_STREAM_ERROR;
+        }
+        st->ring[st->start] = byte;
+        st->start = (st->start + 1) % st->window_size;
+    }
+
+    *out = fallible_file_windows_copy_current(st);
+    return BLORP_FALLIBLE_STREAM_ITEM;
+}
+
+static void fallible_file_windows_cleanup(blorp_FallibleStream* self) {
+    FallibleFileWindowsState* st = (FallibleFileWindowsState*)self->state;
+    if (st) {
+        fallible_file_byte_buffer_cleanup(&st->input);
+        free(st->ring);
+        free(st);
+    }
+}
+
+blorp_FallibleStream* blorp_file_windows_reader_raw(
+    const blorp_FileReader* reader,
+    long size
+) {
+    blorp_FallibleStream* s = blorp_fallible_stream_new();
+    FallibleFileWindowsState* st =
+        (FallibleFileWindowsState*)blorp_malloc_checked(
+            sizeof(FallibleFileWindowsState));
+    fallible_file_byte_buffer_init(&st->input, reader ? reader->fd : -1);
+    st->window_size = size;
+    st->ring = size > 0 ? (unsigned char*)blorp_malloc_checked((size_t)size)
+                        : NULL;
+    st->filled = 0;
+    st->start = 0;
+    st->initialized = false;
+    st->done = false;
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
+    s->state = st;
+    s->pull = fallible_file_windows_pull;
+    s->state_cleanup = fallible_file_windows_cleanup;
     return s;
 }
 
@@ -19425,6 +20324,767 @@ bool blorp_file_exists(const blorp_String* path) {
         return true;
     }
     return false;
+}
+
+static blorp_FileErrorKind blorp_file_error_kind_from_errno(int errnum) {
+    switch (errnum) {
+        case ENOENT:
+            return BLORP_FILE_ERROR_NOT_FOUND;
+        case EACCES:
+        case EPERM:
+            return BLORP_FILE_ERROR_PERMISSION_DENIED;
+        case EEXIST:
+            return BLORP_FILE_ERROR_ALREADY_EXISTS;
+        case EINTR:
+            return BLORP_FILE_ERROR_INTERRUPTED;
+#ifdef ETIMEDOUT
+        case ETIMEDOUT:
+            return BLORP_FILE_ERROR_TIMED_OUT;
+#endif
+        case EINVAL:
+            return BLORP_FILE_ERROR_INVALID_INPUT;
+#ifdef ENOTSUP
+        case ENOTSUP:
+            return BLORP_FILE_ERROR_UNSUPPORTED;
+#endif
+#if defined(EOPNOTSUPP) && (!defined(ENOTSUP) || EOPNOTSUPP != ENOTSUP)
+        case EOPNOTSUPP:
+            return BLORP_FILE_ERROR_UNSUPPORTED;
+#endif
+        default:
+            return BLORP_FILE_ERROR_OTHER;
+    }
+}
+
+static blorp_FileOpenReaderResult blorp_file_open_reader_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileOpenReaderResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileOpenWriterResult blorp_file_open_writer_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileOpenWriterResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileOpenResult blorp_file_open_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileOpenResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileStringResult blorp_file_string_ok(blorp_String* value) {
+    return (blorp_FileStringResult){
+        .value = value,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_FileStringResult blorp_file_string_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileStringResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileBytesResult blorp_file_bytes_ok(blorp_Bytes* value) {
+    return (blorp_FileBytesResult){
+        .value = value,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_FileBytesResult blorp_file_bytes_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileBytesResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileListResult blorp_file_list_ok(blorp_List* value) {
+    return (blorp_FileListResult){
+        .value = value,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_FileListResult blorp_file_list_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileListResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileValueResult blorp_file_value_ok(void* value) {
+    return (blorp_FileValueResult){
+        .value = value,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_FileValueResult blorp_file_value_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileValueResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileFindResult blorp_file_find_ok(long found, void* value) {
+    return (blorp_FileFindResult){
+        .found = found ? 1 : 0,
+        .value = value,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_FileFindResult blorp_file_find_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileFindResult){
+        .found = 0,
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileIntResult blorp_file_int_ok(long value) {
+    return (blorp_FileIntResult){
+        .value = value,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_FileIntResult blorp_file_int_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileIntResult){
+        .value = 0,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileBoolResult blorp_file_bool_ok(long value) {
+    return (blorp_FileBoolResult){
+        .value = value ? 1 : 0,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_FileBoolResult blorp_file_bool_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileBoolResult){
+        .value = 0,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileVoidResult blorp_file_void_ok(void) {
+    return (blorp_FileVoidResult){
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_FileVoidResult blorp_file_void_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileVoidResult){ .error_kind = kind, .detail = detail };
+}
+
+static blorp_String* blorp_file_open_errno_detail(
+    const blorp_String* path,
+    blorp_FileErrorKind kind,
+    int errnum
+) {
+    switch (kind) {
+        case BLORP_FILE_ERROR_NOT_FOUND:
+        case BLORP_FILE_ERROR_PERMISSION_DENIED:
+        case BLORP_FILE_ERROR_ALREADY_EXISTS:
+            return (blorp_String*)blorp_retain((void*)path);
+        default: {
+            const char* message = strerror(errnum);
+            return blorp_string_from_buf(message, (long)strlen(message));
+        }
+    }
+}
+
+static blorp_String* blorp_file_operation_errno_detail(
+    const char* operation,
+    int errnum
+) {
+    char buf[256];
+    const char* message = strerror(errnum);
+    snprintf(buf, sizeof(buf), "%s: %s", operation, message);
+    return blorp_string_from_buf(buf, (long)strlen(buf));
+}
+
+static char* blorp_file_copy_path_for_open(
+    const blorp_String* path,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    if (!path) {
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal("null path");
+        return NULL;
+    }
+    if (path->len <= 0) {
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal("empty path");
+        return NULL;
+    }
+    if (memchr(path->data, '\0', (size_t)path->len) != NULL) {
+        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        *error_detail = blorp_string_literal("path contains NUL byte");
+        return NULL;
+    }
+
+    char* cpath = (char*)blorp_malloc_checked((size_t)path->len + 1);
+    memcpy(cpath, path->data, (size_t)path->len);
+    cpath[path->len] = '\0';
+    return cpath;
+}
+
+static int blorp_file_open_fd(
+    const blorp_String* path,
+    int flags,
+    int mode,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    *error_kind = BLORP_FILE_ERROR_NONE;
+    *error_detail = NULL;
+    char* cpath = blorp_file_copy_path_for_open(path, error_kind, error_detail);
+    if (!cpath) return -1;
+
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int fd = open(cpath, flags, mode);
+    if (fd < 0) {
+        int errnum = errno;
+        free(cpath);
+        *error_kind = blorp_file_error_kind_from_errno(errnum);
+        *error_detail =
+            blorp_file_open_errno_detail(path, *error_kind, errnum);
+        return -1;
+    }
+    free(cpath);
+
+#ifndef O_CLOEXEC
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+    return fd;
+}
+
+static blorp_FileStringResult blorp_file_read_text_fd(int fd) {
+    if (fd < 0) {
+        return blorp_file_string_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("read_text: closed file handle"));
+    }
+
+    long cap = 4096;
+    long len = 0;
+    char* buf = (char*)blorp_malloc_checked((size_t)cap);
+
+    while (true) {
+        if (len == cap) {
+            long next_cap = cap > (LONG_MAX / 2) ? LONG_MAX : cap * 2;
+            if (next_cap <= cap) {
+                free(buf);
+                return blorp_file_string_error(BLORP_FILE_ERROR_UNSUPPORTED,
+                    blorp_string_literal("read_text: file too large"));
+            }
+            char* new_buf = (char*)realloc(buf, (size_t)next_cap);
+            if (!new_buf) {
+                free(buf);
+                fprintf(stderr,
+                    "blorp: out of memory (realloc %ld bytes)\n",
+                    next_cap);
+                exit(1);
+            }
+            buf = new_buf;
+            cap = next_cap;
+        }
+
+        ssize_t n = read(fd, buf + len, (size_t)(cap - len));
+        if (n > 0) {
+            len += (long)n;
+            continue;
+        }
+        if (n == 0) break;
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("read_text", errnum);
+        free(buf);
+        return blorp_file_string_error(kind, detail);
+    }
+
+    blorp_String* text = blorp_string_from_buf(buf, len);
+    free(buf);
+    return blorp_file_string_ok(text);
+}
+
+static blorp_FileBytesResult blorp_file_read_bytes_fd(int fd) {
+    if (fd < 0) {
+        return blorp_file_bytes_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("read_bytes: closed file handle"));
+    }
+
+    long cap = 4096;
+    long len = 0;
+    unsigned char* buf = (unsigned char*)blorp_malloc_checked((size_t)cap);
+
+    while (true) {
+        if (len == cap) {
+            long next_cap = cap > (LONG_MAX / 2) ? LONG_MAX : cap * 2;
+            if (next_cap <= cap) {
+                free(buf);
+                return blorp_file_bytes_error(BLORP_FILE_ERROR_UNSUPPORTED,
+                    blorp_string_literal("read_bytes: file too large"));
+            }
+            unsigned char* new_buf =
+                (unsigned char*)realloc(buf, (size_t)next_cap);
+            if (!new_buf) {
+                free(buf);
+                fprintf(stderr,
+                    "blorp: out of memory (realloc %ld bytes)\n",
+                    next_cap);
+                exit(1);
+            }
+            buf = new_buf;
+            cap = next_cap;
+        }
+
+        ssize_t n = read(fd, buf + len, (size_t)(cap - len));
+        if (n > 0) {
+            len += (long)n;
+            continue;
+        }
+        if (n == 0) break;
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("read_bytes", errnum);
+        free(buf);
+        return blorp_file_bytes_error(kind, detail);
+    }
+
+    blorp_Bytes* bytes = blorp_bytes_new(len);
+    if (len > 0) memcpy(bytes->data, buf, (size_t)len);
+    free(buf);
+    return blorp_file_bytes_ok(bytes);
+}
+
+static blorp_FileBytesResult blorp_file_read_chunk_fd(int fd, long max_bytes) {
+    if (fd < 0) {
+        return blorp_file_bytes_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("read_chunk: closed file handle"));
+    }
+    if (max_bytes <= 0) {
+        return blorp_file_bytes_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("read_chunk: max_bytes must be positive"));
+    }
+
+    blorp_Bytes* bytes = blorp_bytes_new(max_bytes);
+    while (true) {
+        ssize_t n = read(fd, bytes->data, (size_t)max_bytes);
+        if (n >= 0) {
+            bytes->len = (long)n;
+            return blorp_file_bytes_ok(bytes);
+        }
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("read_chunk", errnum);
+        blorp_release(bytes);
+        return blorp_file_bytes_error(kind, detail);
+    }
+}
+
+static blorp_FileIntResult blorp_file_count_lines_fd(int fd) {
+    if (fd < 0) {
+        return blorp_file_int_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("count_lines: closed file handle"));
+    }
+
+    unsigned char* buf =
+        (unsigned char*)blorp_malloc_checked(BLORP_FILE_DEFAULT_CHUNK_SIZE);
+    long count = 0;
+    bool saw_any = false;
+    bool last_was_newline = false;
+    long cancel_check = 0;
+
+    while (true) {
+        blorp_stream_cancellation_checkpoint(&cancel_check);
+        ssize_t n = read(fd, buf, BLORP_FILE_DEFAULT_CHUNK_SIZE);
+        if (n > 0) {
+            saw_any = true;
+            for (ssize_t i = 0; i < n; i++) {
+                if (buf[i] == '\n') count++;
+            }
+            last_was_newline = buf[n - 1] == '\n';
+            continue;
+        }
+        if (n == 0) break;
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("count_lines", errnum);
+        free(buf);
+        return blorp_file_int_error(kind, detail);
+    }
+
+    free(buf);
+    if (saw_any && !last_was_newline) count++;
+    return blorp_file_int_ok(count);
+}
+
+static blorp_FileVoidResult blorp_file_write_text_fd(
+    int fd,
+    const blorp_String* text
+) {
+    if (fd < 0) {
+        return blorp_file_void_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("write_text: closed file handle"));
+    }
+    if (!text) {
+        return blorp_file_void_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("write_text: null text"));
+    }
+
+    const char* data = text->data;
+    long remaining = text->len;
+    while (remaining > 0) {
+        size_t chunk =
+            remaining > 1048576L ? (size_t)1048576 : (size_t)remaining;
+        ssize_t n = write(fd, data, chunk);
+        if (n > 0) {
+            data += n;
+            remaining -= (long)n;
+            continue;
+        }
+        if (n == 0) {
+            return blorp_file_void_error(BLORP_FILE_ERROR_UNSUPPORTED,
+                blorp_string_literal("write_text: write returned 0"));
+        }
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("write_text", errnum);
+        return blorp_file_void_error(kind, detail);
+    }
+
+    return blorp_file_void_ok();
+}
+
+static blorp_FileVoidResult blorp_file_write_bytes_fd(
+    int fd,
+    const blorp_Bytes* bytes
+) {
+    if (fd < 0) {
+        return blorp_file_void_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("write_bytes: closed file handle"));
+    }
+    if (!bytes) {
+        return blorp_file_void_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("write_bytes: null bytes"));
+    }
+
+    const unsigned char* data = bytes->data;
+    long remaining = bytes->len;
+    while (remaining > 0) {
+        size_t chunk =
+            remaining > 1048576L ? (size_t)1048576 : (size_t)remaining;
+        ssize_t n = write(fd, data, chunk);
+        if (n > 0) {
+            data += n;
+            remaining -= (long)n;
+            continue;
+        }
+        if (n == 0) {
+            return blorp_file_void_error(BLORP_FILE_ERROR_UNSUPPORTED,
+                blorp_string_literal("write_bytes: write returned 0"));
+        }
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("write_bytes", errnum);
+        return blorp_file_void_error(kind, detail);
+    }
+
+    return blorp_file_void_ok();
+}
+
+static blorp_FileIntResult blorp_file_write_chunk_fd(
+    int fd,
+    const blorp_Bytes* bytes
+) {
+    if (fd < 0) {
+        return blorp_file_int_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("write_chunk: closed file handle"));
+    }
+    if (!bytes || bytes->len <= 0) return blorp_file_int_ok(0);
+
+    while (true) {
+        ssize_t n = write(fd, bytes->data, (size_t)bytes->len);
+        if (n >= 0) return blorp_file_int_ok((long)n);
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("write_chunk", errnum);
+        return blorp_file_int_error(kind, detail);
+    }
+}
+
+blorp_FileOpenReaderResult blorp_file_open_read_raw(const blorp_String* path) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    int fd = blorp_file_open_fd(path, O_RDONLY, 0, &error_kind, &error_detail);
+    if (fd < 0) {
+        return blorp_file_open_reader_error(error_kind, error_detail);
+    }
+    blorp_FileReader* reader =
+        (blorp_FileReader*)blorp_malloc_checked(sizeof(blorp_FileReader));
+    reader->fd = fd;
+    return (blorp_FileOpenReaderResult){
+        .handle = reader,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+blorp_FileOpenWriterResult blorp_file_open_write_raw(const blorp_String* path) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    int fd = blorp_file_open_fd(path, O_WRONLY | O_CREAT | O_TRUNC, 0666,
+        &error_kind, &error_detail);
+    if (fd < 0) {
+        return blorp_file_open_writer_error(error_kind, error_detail);
+    }
+    blorp_FileWriter* writer =
+        (blorp_FileWriter*)blorp_malloc_checked(sizeof(blorp_FileWriter));
+    writer->fd = fd;
+    return (blorp_FileOpenWriterResult){
+        .handle = writer,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+blorp_FileOpenWriterResult blorp_file_open_append_raw(const blorp_String* path) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    int fd = blorp_file_open_fd(path, O_WRONLY | O_CREAT | O_APPEND, 0666,
+        &error_kind, &error_detail);
+    if (fd < 0) {
+        return blorp_file_open_writer_error(error_kind, error_detail);
+    }
+    blorp_FileWriter* writer =
+        (blorp_FileWriter*)blorp_malloc_checked(sizeof(blorp_FileWriter));
+    writer->fd = fd;
+    return (blorp_FileOpenWriterResult){
+        .handle = writer,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+blorp_FileOpenResult blorp_file_open_read_write_raw(const blorp_String* path) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    int fd = blorp_file_open_fd(path, O_RDWR, 0, &error_kind, &error_detail);
+    if (fd < 0) {
+        return blorp_file_open_error(error_kind, error_detail);
+    }
+    blorp_File* file = (blorp_File*)blorp_malloc_checked(sizeof(blorp_File));
+    file->fd = fd;
+    return (blorp_FileOpenResult){
+        .handle = file,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+blorp_FileStringResult blorp_file_read_text_reader_raw(
+    const blorp_FileReader* reader
+) {
+    return blorp_file_read_text_fd(reader ? reader->fd : -1);
+}
+
+blorp_FileBytesResult blorp_file_read_bytes_reader_raw(
+    const blorp_FileReader* reader
+) {
+    return blorp_file_read_bytes_fd(reader ? reader->fd : -1);
+}
+
+blorp_FileBytesResult blorp_file_read_chunk_reader_raw(
+    const blorp_FileReader* reader,
+    long max_bytes
+) {
+    return blorp_file_read_chunk_fd(reader ? reader->fd : -1, max_bytes);
+}
+
+blorp_FileIntResult blorp_file_count_lines_reader_raw(
+    const blorp_FileReader* reader
+) {
+    return blorp_file_count_lines_fd(reader ? reader->fd : -1);
+}
+
+blorp_FileVoidResult blorp_file_write_text_writer_raw(
+    blorp_FileWriter* writer,
+    const blorp_String* text
+) {
+    return blorp_file_write_text_fd(writer ? writer->fd : -1, text);
+}
+
+blorp_FileVoidResult blorp_file_write_bytes_writer_raw(
+    blorp_FileWriter* writer,
+    const blorp_Bytes* bytes
+) {
+    return blorp_file_write_bytes_fd(writer ? writer->fd : -1, bytes);
+}
+
+blorp_FileIntResult blorp_file_write_chunk_writer_raw(
+    blorp_FileWriter* writer,
+    const blorp_Bytes* bytes
+) {
+    return blorp_file_write_chunk_fd(writer ? writer->fd : -1, bytes);
+}
+
+blorp_FileStringResult blorp_file_read_text_file_raw(
+    const blorp_File* file
+) {
+    return blorp_file_read_text_fd(file ? file->fd : -1);
+}
+
+blorp_FileBytesResult blorp_file_read_bytes_file_raw(
+    const blorp_File* file
+) {
+    return blorp_file_read_bytes_fd(file ? file->fd : -1);
+}
+
+blorp_FileBytesResult blorp_file_read_chunk_file_raw(
+    const blorp_File* file,
+    long max_bytes
+) {
+    return blorp_file_read_chunk_fd(file ? file->fd : -1, max_bytes);
+}
+
+blorp_FileIntResult blorp_file_count_lines_file_raw(
+    const blorp_File* file
+) {
+    return blorp_file_count_lines_fd(file ? file->fd : -1);
+}
+
+blorp_FileVoidResult blorp_file_write_text_file_raw(
+    blorp_File* file,
+    const blorp_String* text
+) {
+    return blorp_file_write_text_fd(file ? file->fd : -1, text);
+}
+
+blorp_FileVoidResult blorp_file_write_bytes_file_raw(
+    blorp_File* file,
+    const blorp_Bytes* bytes
+) {
+    return blorp_file_write_bytes_fd(file ? file->fd : -1, bytes);
+}
+
+blorp_FileIntResult blorp_file_write_chunk_file_raw(
+    blorp_File* file,
+    const blorp_Bytes* bytes
+) {
+    return blorp_file_write_chunk_fd(file ? file->fd : -1, bytes);
+}
+
+void blorp_file_close_reader(blorp_FileReader* reader) {
+    if (!reader) return;
+    if (reader->fd >= 0) {
+        close(reader->fd);
+        reader->fd = -1;
+    }
+    free(reader);
+}
+
+void blorp_file_close_writer(blorp_FileWriter* writer) {
+    if (!writer) return;
+    if (writer->fd >= 0) {
+        close(writer->fd);
+        writer->fd = -1;
+    }
+    free(writer);
+}
+
+void blorp_file_close(blorp_File* file) {
+    if (!file) return;
+    if (file->fd >= 0) {
+        close(file->fd);
+        file->fd = -1;
+    }
+    free(file);
 }
 
 // ============================================================================

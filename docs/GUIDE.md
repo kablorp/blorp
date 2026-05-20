@@ -1461,15 +1461,109 @@ Rules for `?=`:
 - `?=` binds `Some(value)` or `Ok(value)` to the name on the left.
 - `None` or `Err(error)` is returned from the enclosing carrier-returning function.
 - Success values are not auto-wrapped; write `Some(value)` or `Ok(value)` explicitly.
-- `?=` is currently rejected inside loop bodies until the compiler has a Perceus-safe early-return node for loop exits.
+- `?=` is rejected inside loop bodies. Use an explicit `match`, local state, and `break`/`continue` when loop control is involved.
 - There is no bare postfix `?` operator.
 
 ### `with` Resource Scopes
 
-`with name = acquire():` and `with name ?= acquire():` are reserved for scoped
-resources with deterministic cleanup. The parser accepts the syntax and the AST
-represents plain and fallible acquisition separately, but typechecking rejects
-`with` until resource-scope checking and cleanup lowering are implemented.
+`with name = acquire():` and `with name ?= acquire():` create scoped resources
+with deterministic cleanup. The acquired value must have a `resource type`.
+The resource binding exists only inside the body, and the compiler rejects
+returning resource-typed values or scoped-derived values through the final
+expression, closure capture, `detach`, `concurrent:`, or `concurrent for`.
+
+```blorp
+import:
+    file: IOError, open_read, read_text
+
+func load_text(path: String) -> Result[String, IOError]:
+    with reader ?= open_read(path):
+        reader.read_text()
+```
+
+Source helpers may borrow a scoped resource for one synchronous call by marking
+the parameter as `borrow`. The parameter type must be a direct resource type,
+and the helper body must be visible to the type checker so it can reject
+resource-dependent returns or captures:
+
+```blorp
+import:
+    file: FileReader, IOError, open_read, read_text
+
+func read_from(reader: borrow FileReader) -> Result[String, IOError]:
+    reader.read_text()
+
+func load_text(path: String) -> Result[String, IOError]:
+    with reader ?= open_read(path):
+        read_from(reader)
+```
+
+Compilation lowers resource scopes to explicit Core cleanup nodes and emits
+cleanup for normal completion, body-level `?=` short-circuit results,
+`break`/`continue`, and cooperative timeout/cancellation paths. Standard-library
+resource declarations may attach compiler cleanup metadata with
+`resource type Name = builtin("c_cleanup_name")`; lowering uses that metadata
+instead of recognizing resource names by convention. The typed `file` module
+currently exposes scoped opens for read, write, append, and read-write handles.
+It also exposes permission-specific
+`reader.read_text()`, `reader.read_bytes()`, `reader.read_chunk(n)`,
+`reader.chunks()`, `reader.chunks_with_size(n)`, `reader.lines()`,
+`reader.bytes()`, `reader.windows(n)`, `reader.count_lines()`,
+`writer.write_text(text)`, `writer.write_bytes(data)`, and
+`writer.write_chunk(data)` operations that borrow the scoped handle and return
+typed `IOError` results. Read-write handles use explicit `*_rw` names, such as
+`file.read_text_rw()`, `file.read_chunk_rw(n)`, `file.count_lines_rw()`,
+`file.write_text_rw(text)`, `file.write_bytes_rw(data)`, and
+`file.write_chunk_rw(data)`, because same-module overloads are not currently
+part of Blorp's call resolution.
+`reader.chunks()`, `reader.chunks_with_size(n)`, and `reader.windows(n)`
+return `FallibleStream[Bytes, IOError]`; `reader.lines()` returns
+`FallibleStream[String, IOError]`; `reader.bytes()` returns
+`FallibleStream[UInt8, IOError]`. Consume them inside the same `with` scope with
+a terminal operation such as `collect_result()`, `fold_result(...)`,
+`count_result()`, `find_result(...)`, `any_result(...)`, or `all_result(...)`.
+A non-positive explicit chunk size or window size is reported as
+`Err(InvalidInput(...))` by the terminal operation. Streams are one-shot cursors,
+so they cannot be bound globally or stored in ordinary aggregates such as
+tuples, lists, dicts, records, structs, or unions. They also cannot be captured
+by closures, `detach`, or concurrent task bodies. Keep a stream in a direct
+local binding while building a pipeline, then consume it with a terminal
+operation. Create and consume a stream inside the task when concurrent work
+needs its own stream.
+`writer.write_chunk(data)` performs one write attempt and returns the number of
+bytes written; use `writer.write_bytes(data)` when all bytes must be written
+before returning.
+
+```blorp
+import:
+    file: IOError, chunks_with_size, open_read
+    stream: collect_result
+
+func load_in_chunks(path: String) -> Result[Int, IOError]:
+    with reader ?= open_read(path):
+        parts ?= reader.chunks_with_size(4096).collect_result()
+        Ok(parts.length())
+```
+
+For line counts, prefer the reader helper when the lines themselves are not
+needed:
+
+```blorp
+import:
+    file: IOError, count_lines, open_read
+
+func line_count(path: String) -> Result[Int, IOError]:
+    with reader ?= open_read(path):
+        reader.count_lines()
+```
+
+General resource-backed APIs are still under development; existing `system` and
+TCP helpers remain compatibility APIs unless their modules declare resource
+types.
+
+`with ?=` follows the same loop restriction as direct `?=`. If acquisition is
+inside loop control flow, use an explicit `match` around the loop or keep the
+resource scope outside the loop body.
 
 ### debug: Blocks
 
@@ -1896,7 +1990,13 @@ func timeout_example() -> Int:
 `ConcurrencyError` is a union type with variants `Timeout`,
 `TaskFailed(String)`, and `Cancelled`.
 
-**Note:** Timeouts are cooperative — they take effect at yield points (sleep, channel send/recv, task join). When a timeout fires, the timed-out task is cancelled and the block waits for it to reach its next cancellation point before continuing, so code after that point does not run. A CPU-bound computation loop will not be interrupted by a timeout. If you need interruptible compute, insert periodic `sleep(0)` calls.
+**Note:** Timeouts are cooperative — they take effect at yield points (sleep,
+channel send/recv, task join). When a timeout fires, the timed-out task is
+cancelled and the block waits for it to reach its next cancellation point before
+continuing, so code after that point does not run. Resources acquired with
+`with` are closed by cancellation cleanup before the task unwinds. A CPU-bound
+computation loop will not be interrupted by a timeout. If you need
+interruptible compute, insert periodic `sleep(0)` calls.
 
 ### Concurrent For
 

@@ -364,6 +364,9 @@ and func_decl = {
   func_no_copy : bool;  (** @no_copy annotation — skip FFI arg copying *)
   func_debug_only : bool;
       (** @debug_only annotation — usable only in debug contexts *)
+  func_resource_result_ordinary : bool;
+      (** @resource_result_ordinary annotation — builtin resource operation
+          returns ordinary data, not a resource-dependent borrowed value. *)
   func_dim_constraints : (type_expr * type_expr) list;
       (** Dimension constraints from [where] clause.
       Each pair [(lhs, rhs)] represents the equality [lhs == rhs].
@@ -372,10 +375,18 @@ and func_decl = {
 }
 (** Function declaration *)
 
+and param_passing =
+  | ParamByValue
+  | ParamBorrow
+      (** Borrowed resource parameter. The function may use the resource during
+          the call but does not own cleanup and must not let resource-dependent
+          values escape. *)
+
 and param = {
   param_name : string option;  (** None for pattern params *)
   param_pattern : pattern option;  (** For tuple destructuring *)
   param_type : type_expr option;
+  param_passing : param_passing;
   param_loc : loc;
 }
 (** Function parameter *)
@@ -396,6 +407,10 @@ type variant = {
 }
 (** Union/ADT variant *)
 
+type resource_cleanup =
+  | ResourceCleanupBuiltin of string
+      (** Compiler/runtime cleanup builtin emitted for scoped resource cleanup. *)
+
 type type_decl = {
   type_name : string;
   type_params : type_param_decl list;
@@ -407,6 +422,16 @@ type type_decl = {
                               representation + operations are compiler-provided.
                               Has no variants; serves as a visible declaration so
                               stdlib can document primitives like Int, Float, etc. *)
+  type_is_resource : bool;
+      (** true for [resource type Name = builtin] — scoped external
+          capabilities that must be acquired through [with] before cleanup
+          lowering can own their close edge. Resource types are also builtin
+          for representation/codegen purposes. *)
+  type_resource_cleanup : resource_cleanup option;
+      (** Optional compiler-owned cleanup metadata for resource types. [None]
+          means cleanup lowers through the normal [close(handle)] resource
+          trait path; [Some (ResourceCleanupBuiltin name)] means lowering owns
+          a direct runtime builtin cleanup edge. *)
 }
 (** Type declaration (union/ADT/enum/builtin primitive) *)
 

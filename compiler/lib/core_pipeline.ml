@@ -21,7 +21,8 @@
     13. [Core_perceus] — insert CDup/CDrop for reference counting
     14. [Core_reuse] — analyze post-Perceus reuse candidates
     15. [Core_closure] — hoist lambdas and create closure values
-    16. [Core_emit_c] — Core IR → C string via the default backend
+    16. [Core_resource] — make resource cleanup before nonlocal loop exits explicit
+    17. [Core_emit_c] — Core IR → C string via the default backend
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -192,6 +193,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
   |> run_stage Core_stage.Reuse (Core_reuse.rewrite_program ~reg)
   |> run_stage Core_stage.Closure
        (Core_closure.convert_program ~wrap_function_refs:false)
+  |> Core_resource.rewrite_nonlocal_exits_program
   |> Core_codegen_prepare.prepare_program ~reg
   |> observe Core_stage.Final
 

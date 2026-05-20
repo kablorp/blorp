@@ -229,6 +229,10 @@ typedef struct {
 
 typedef struct blorp_TcpListener blorp_TcpListener;
 typedef struct blorp_TcpStream blorp_TcpStream;
+typedef struct blorp_FileReader blorp_FileReader;
+typedef struct blorp_FileWriter blorp_FileWriter;
+typedef struct blorp_File blorp_File;
+typedef struct blorp_Bytes blorp_Bytes;
 
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_Vector;
 #define BLORP_VECTOR_STORAGE_POINTER 0
@@ -239,6 +243,79 @@ typedef struct { blorp_Object header; long len; long capacity; void (*elem_relea
 #define BLORP_VECTOR_STORAGE_I64 5
 
 typedef struct { blorp_Object header; long len; long capacity; char data[]; } blorp_String;
+
+typedef enum {
+    BLORP_FILE_ERROR_NONE = 0,
+    BLORP_FILE_ERROR_NOT_FOUND = 1,
+    BLORP_FILE_ERROR_PERMISSION_DENIED = 2,
+    BLORP_FILE_ERROR_ALREADY_EXISTS = 3,
+    BLORP_FILE_ERROR_INVALID_INPUT = 4,
+    BLORP_FILE_ERROR_INTERRUPTED = 5,
+    BLORP_FILE_ERROR_TIMED_OUT = 6,
+    BLORP_FILE_ERROR_UNSUPPORTED = 7,
+    BLORP_FILE_ERROR_OTHER = 8
+} blorp_FileErrorKind;
+
+typedef struct {
+    blorp_FileReader* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenReaderResult;
+
+typedef struct {
+    blorp_FileWriter* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenWriterResult;
+
+typedef struct {
+    blorp_File* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenResult;
+
+typedef struct {
+    blorp_String* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileStringResult;
+
+typedef struct {
+    blorp_Bytes* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileBytesResult;
+
+typedef struct {
+    void* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileValueResult;
+
+typedef struct {
+    long found;
+    void* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileFindResult;
+
+typedef struct {
+    long value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileIntResult;
+
+typedef struct {
+    long value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileBoolResult;
+
+typedef struct {
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileVoidResult;
+
 #define BLORP_LIST_STORAGE_POINTER 0
 #define BLORP_LIST_STORAGE_INLINE 1
 #define BLORP_LIST_CALLBACK_BITS 0
@@ -248,6 +325,12 @@ typedef struct { blorp_Object header; long len; long capacity; char data[]; } bl
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT 2
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT32 3
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_List;
+
+typedef struct {
+    blorp_List* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileListResult;
 
 typedef struct {
     blorp_Object header;
@@ -280,12 +363,12 @@ typedef struct {
     } data;
 } blorp_ConcurrencyError;
 
-typedef struct {
+struct blorp_Bytes {
     blorp_Object header;
     long len;
     long capacity;
     unsigned char data[];
-} blorp_Bytes;
+};
 
 typedef struct { blorp_Object header; long arity; long release_mask; void* elem[]; } blorp_Tuple;
 
@@ -1432,6 +1515,26 @@ typedef struct blorp_Stream {
     void (*state_cleanup)(struct blorp_Stream* self);
     blorp_StreamElementLayout elem_layout;
 } blorp_Stream;
+
+typedef enum blorp_FallibleStreamPullStatus {
+    BLORP_FALLIBLE_STREAM_END = 0,
+    BLORP_FALLIBLE_STREAM_ITEM = 1,
+    BLORP_FALLIBLE_STREAM_ERROR = 2,
+} blorp_FallibleStreamPullStatus;
+
+typedef struct blorp_FallibleStream {
+    blorp_Object header;
+    blorp_FallibleStreamPullStatus (*pull)(
+        struct blorp_FallibleStream* self,
+        void** out,
+        blorp_FileErrorKind* error_kind,
+        blorp_String** error_detail
+    );
+    void* state;
+    void (*state_cleanup)(struct blorp_FallibleStream* self);
+    blorp_StreamElementLayout elem_layout;
+} blorp_FallibleStream;
+
 blorp_Stream* blorp_stream_from_list(blorp_List* list);
 blorp_Stream* blorp_stream_from_range(long start, long end);
 blorp_Stream* blorp_stream_repeat(void* value, long elem_layout_code);
@@ -1443,6 +1546,11 @@ blorp_Stream* blorp_stream_unfold(
 );
 blorp_Stream* blorp_stream_empty(void);
 blorp_Stream* blorp_stream_from_lines(blorp_String* path);
+blorp_FallibleStream* blorp_file_chunks_reader_raw(const blorp_FileReader* reader);
+blorp_FallibleStream* blorp_file_chunks_with_size_reader_raw(const blorp_FileReader* reader, long chunk_size);
+blorp_FallibleStream* blorp_file_lines_reader_raw(const blorp_FileReader* reader);
+blorp_FallibleStream* blorp_file_bytes_reader_raw(const blorp_FileReader* reader);
+blorp_FallibleStream* blorp_file_windows_reader_raw(const blorp_FileReader* reader, long size);
 blorp_Stream* blorp_stream_map(blorp_Stream* inner, blorp_Closure* func, long result_elem_layout_code);
 blorp_Stream* blorp_stream_filter(blorp_Stream* inner, blorp_Closure* pred);
 blorp_Stream* blorp_stream_filter_map(blorp_Stream* inner, blorp_Closure* func);
@@ -1468,6 +1576,28 @@ blorp_Stream* blorp_stream_drop(blorp_Stream* inner, long n);
 blorp_Stream* blorp_stream_take_while(blorp_Stream* inner, blorp_Closure* pred);
 blorp_Stream* blorp_stream_enumerate(blorp_Stream* inner);
 blorp_List* blorp_stream_collect(blorp_Stream* stream);
+blorp_FileListResult blorp_fallible_stream_collect_file_raw(blorp_FallibleStream* stream, uint8_t storage_mode, int16_t elem_size);
+blorp_FileValueResult blorp_fallible_stream_fold_file_raw(blorp_FallibleStream* stream, void* init, blorp_Closure* func, bool acc_is_rc);
+blorp_FileIntResult blorp_fallible_stream_count_file_raw(blorp_FallibleStream* stream);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_nullable(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_int(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_int8(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_int16(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_int32(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_int64(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_uint8(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_uint16(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_uint32(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_uint64(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_float(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_bool(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_char(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_f32(blorp_FallibleStream* stream, blorp_Closure* pred);
+#ifdef __FLT16_MAX__
+blorp_FileValueResult blorp_fallible_stream_find_file_raw_f16(blorp_FallibleStream* stream, blorp_Closure* pred);
+#endif
+blorp_FileBoolResult blorp_fallible_stream_any_file_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FileBoolResult blorp_fallible_stream_all_file_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
 void* blorp_stream_fold(blorp_Stream* stream, void* init, blorp_Closure* func, bool acc_is_rc);
 long blorp_stream_count(blorp_Stream* stream);
 void blorp_stream_for_each(blorp_Stream* stream, blorp_Closure* func);
@@ -1695,6 +1825,27 @@ bool blorp_append_file(const blorp_String* path, const blorp_String* content);
 blorp_Result* blorp_for_each_line(const blorp_String* path, blorp_Closure* callback);
 blorp_Result* blorp_for_each_chunk(const blorp_String* path, long chunk_size, blorp_Closure* callback);
 bool blorp_file_exists(const blorp_String* path);
+blorp_FileOpenReaderResult blorp_file_open_read_raw(const blorp_String* path);
+blorp_FileOpenWriterResult blorp_file_open_write_raw(const blorp_String* path);
+blorp_FileOpenWriterResult blorp_file_open_append_raw(const blorp_String* path);
+blorp_FileOpenResult blorp_file_open_read_write_raw(const blorp_String* path);
+blorp_FileStringResult blorp_file_read_text_reader_raw(const blorp_FileReader* reader);
+blorp_FileBytesResult blorp_file_read_bytes_reader_raw(const blorp_FileReader* reader);
+blorp_FileBytesResult blorp_file_read_chunk_reader_raw(const blorp_FileReader* reader, long max_bytes);
+blorp_FileIntResult blorp_file_count_lines_reader_raw(const blorp_FileReader* reader);
+blorp_FileVoidResult blorp_file_write_text_writer_raw(blorp_FileWriter* writer, const blorp_String* text);
+blorp_FileVoidResult blorp_file_write_bytes_writer_raw(blorp_FileWriter* writer, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_write_chunk_writer_raw(blorp_FileWriter* writer, const blorp_Bytes* bytes);
+blorp_FileStringResult blorp_file_read_text_file_raw(const blorp_File* file);
+blorp_FileBytesResult blorp_file_read_bytes_file_raw(const blorp_File* file);
+blorp_FileBytesResult blorp_file_read_chunk_file_raw(const blorp_File* file, long max_bytes);
+blorp_FileIntResult blorp_file_count_lines_file_raw(const blorp_File* file);
+blorp_FileVoidResult blorp_file_write_text_file_raw(blorp_File* file, const blorp_String* text);
+blorp_FileVoidResult blorp_file_write_bytes_file_raw(blorp_File* file, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_write_chunk_file_raw(blorp_File* file, const blorp_Bytes* bytes);
+void blorp_file_close_reader(blorp_FileReader* reader);
+void blorp_file_close_writer(blorp_FileWriter* writer);
+void blorp_file_close(blorp_File* file);
 bool blorp_is_directory(const blorp_String* path);
 blorp_List* blorp_list_dir(const blorp_String* path);
 long blorp_exec(const blorp_String* command);
