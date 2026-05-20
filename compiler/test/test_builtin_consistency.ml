@@ -507,6 +507,43 @@ let test_fiber_intrusive_links_are_role_specific () =
        shared next pointer for run queues, channel waits, object-pool reuse, \
        and timer drain batches."
 
+let test_cloexec_helpers_declare_fallback_locals_once () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let forbidden =
+    [
+      "int fd = socket(domain, type | SOCK_CLOEXEC, protocol);";
+      "int fd = socket(domain, type, protocol);";
+      "int client_fd = accept4(fd, addr, addr_len, SOCK_CLOEXEC);";
+      "int client_fd = accept(fd, addr, addr_len);";
+    ]
+  in
+  List.iter
+    (fun needle ->
+      Alcotest.(check bool)
+        ("runtime helper has no branch-local redeclaration: " ^ needle)
+        false
+        (contains_substring runtime needle))
+    forbidden;
+  List.iter
+    (fun needle ->
+      Alcotest.(check bool)
+        ("runtime helper assigns shared local: " ^ needle)
+        true
+        (contains_substring runtime needle))
+    [
+      String.concat "\n"
+        [ "int fd;"; "#if defined(SOCK_CLOEXEC)"; "    fd = socket" ];
+      String.concat "\n"
+        [
+          "int client_fd;";
+          "#if defined(__linux__) && defined(SOCK_CLOEXEC)";
+          "    client_fd = accept4";
+        ];
+    ]
+
 let test_stream_element_layout_is_explicit () =
   let runtime_decl =
     read_first_existing
@@ -1168,6 +1205,8 @@ let suite =
           test_list_ir_hofs_have_no_runtime_c_abi;
         Alcotest.test_case "fiber intrusive links are role-specific" `Quick
           test_fiber_intrusive_links_are_role_specific;
+        Alcotest.test_case "cloexec helpers declare fallback locals once" `Quick
+          test_cloexec_helpers_declare_fallback_locals_once;
         Alcotest.test_case "stream element layout is explicit" `Quick
           test_stream_element_layout_is_explicit;
         Alcotest.test_case "stream from_lines uses exact path buffer" `Quick

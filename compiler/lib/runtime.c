@@ -2717,12 +2717,13 @@ static int blorp_runtime_set_cloexec(int fd) {
 }
 
 static int blorp_runtime_socket_cloexec(int domain, int type, int protocol) {
+    int fd;
 #if defined(SOCK_CLOEXEC)
-    int fd = socket(domain, type | SOCK_CLOEXEC, protocol);
+    fd = socket(domain, type | SOCK_CLOEXEC, protocol);
     if (fd >= 0) return fd;
     if (errno != EINVAL) return -1;
 #endif
-    int fd = socket(domain, type, protocol);
+    fd = socket(domain, type, protocol);
     if (fd < 0) return -1;
     if (blorp_runtime_set_cloexec(fd) != 0) {
         int saved_errno = errno;
@@ -2738,12 +2739,13 @@ static int blorp_runtime_accept_cloexec(
     struct sockaddr* addr,
     socklen_t* addr_len
 ) {
+    int client_fd;
 #if defined(__linux__) && defined(SOCK_CLOEXEC)
-    int client_fd = accept4(fd, addr, addr_len, SOCK_CLOEXEC);
+    client_fd = accept4(fd, addr, addr_len, SOCK_CLOEXEC);
     if (client_fd >= 0) return client_fd;
     if (errno != ENOSYS && errno != EINVAL) return -1;
 #endif
-    int client_fd = accept(fd, addr, addr_len);
+    client_fd = accept(fd, addr, addr_len);
     if (client_fd < 0) return -1;
     if (blorp_runtime_set_cloexec(client_fd) != 0) {
         int saved_errno = errno;
