@@ -1,7 +1,14 @@
 import:
 	process: run, shell
 	string: contains, trim
+	system: setenv
 	test: TestSuite
+
+
+func reset_process_limits() -> Bool:
+	ok_timeout: Bool = setenv("BLORP_PROCESS_TIMEOUT_MS", "30000")
+	ok_output: Bool = setenv("BLORP_PROCESS_MAX_OUTPUT_BYTES", "16777216")
+	ok_timeout and ok_output
 
 
 -- run() tests
@@ -31,6 +38,66 @@ func test_run_stderr() -> Bool:
 	match r:
 		Ok(out): out.1.contains("err")
 		Err(_): False
+
+
+func test_run_large_stdout_and_stderr() -> Bool:
+	r: Result[(String, String, Int), String] = run(
+		"sh",
+		["-c", "i=0; while [ $i -lt 4000 ]; do echo out; echo err >&2; i=$((i+1)); done"],
+	)
+	match r:
+		Ok(out): out.2 == 0 and out.0.length() > 12000 and out.1.length() > 12000
+		Err(_): False
+
+
+func test_run_large_stderr() -> Bool:
+	r: Result[(String, String, Int), String] = run(
+		"sh",
+		["-c", "i=0; while [ $i -lt 12000 ]; do echo err >&2; i=$((i+1)); done; echo done"],
+	)
+	match r:
+		Ok(out): out.2 == 0 and trim(out.0) == "done" and out.1.length() > 30000
+		Err(_): False
+
+
+func test_run_rejects_nul_argument() -> Bool:
+	r: Result[(String, String, Int), String] = run("sh", ["-c", "echo before\0after"])
+	match r:
+		Ok(_): False
+		Err(msg): msg.contains("embedded NUL")
+
+
+func test_run_missing_program_returns_err() -> Bool:
+	r: Result[(String, String, Int), String] = run("__blorp_missing_process_program__", [])
+	match r:
+		Ok(_): False
+		Err(_): True
+
+
+func test_run_timeout_returns_err() -> Bool:
+	_ = setenv("BLORP_PROCESS_TIMEOUT_MS", "100")
+	_ = setenv("BLORP_PROCESS_MAX_OUTPUT_BYTES", "16777216")
+	r: Result[(String, String, Int), String] = run(
+		"sh",
+		["-c", "trap '' TERM; while true; do sleep 1; done"],
+	)
+	_ = reset_process_limits()
+	match r:
+		Ok(_): False
+		Err(msg): msg.contains("timed out")
+
+
+func test_run_output_limit_returns_err() -> Bool:
+	_ = setenv("BLORP_PROCESS_TIMEOUT_MS", "5000")
+	_ = setenv("BLORP_PROCESS_MAX_OUTPUT_BYTES", "20000")
+	r: Result[(String, String, Int), String] = run(
+		"sh",
+		["-c", "i=0; while [ $i -lt 50000 ]; do printf x; i=$((i+1)); done"],
+	)
+	_ = reset_process_limits()
+	match r:
+		Ok(_): False
+		Err(msg): msg.contains("output limit")
 
 
 func test_run_empty_program() -> Bool:
@@ -69,6 +136,12 @@ tests: TestSuite = {
 		("run echo args", test_run_echo_args),
 		("run exit code", test_run_exit_code),
 		("run stderr", test_run_stderr),
+		("run large stdout and stderr", test_run_large_stdout_and_stderr),
+		("run large stderr does not deadlock", test_run_large_stderr),
+		("run rejects NUL argument", test_run_rejects_nul_argument),
+		("run missing program returns Err", test_run_missing_program_returns_err),
+		("run timeout returns Err", test_run_timeout_returns_err),
+		("run output limit returns Err", test_run_output_limit_returns_err),
 		("run empty program", test_run_empty_program),
 		("shell echo", test_shell_echo),
 		("shell pipe", test_shell_pipe),

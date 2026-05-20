@@ -712,9 +712,7 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
             @ (if sanitize then Test_runner.sanitize_cc_args else [])
             @ (if raylib_flags = "" then []
                else String.split_on_char ' ' (String.trim raylib_flags))
-            @ List.concat_map
-                (fun s -> String.split_on_char ' ' (String.trim s))
-                link_flags
+            @ Ffi_boundary.link_flags_cc_args link_flags
           in
           let cc_result, cc_output =
             Test_runner.compile_c_from_stdin c_code bin_file cc_args

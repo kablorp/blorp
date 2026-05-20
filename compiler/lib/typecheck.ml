@@ -1350,6 +1350,31 @@ let validate_default_foreign_arg_safety loc (state : check_state)
     in
     fold 0 sig_.cfs_param_names sig_.cfs_param_types state
 
+let validate_foreign_metadata loc (state : check_state)
+    (sig_ : checked_func_signature) (func : func_decl) : check_state =
+  if sig_.cfs_origin <> Foreign then state
+  else
+    match func.func_body with
+    | FuncForeign foreign ->
+        Ffi_boundary.validate_metadata foreign
+        |> List.fold_left
+             (fun state err ->
+               add_error state
+                 (error_with loc
+                    (Ffi_boundary.metadata_validation_error_to_string err)
+                    ~notes:
+                      [
+                        "foreign metadata is emitted near C code, so Blorp \
+                         accepts only narrow, structured forms here.";
+                      ]
+                    ~help:
+                      (Some
+                         "Use a plain C identifier for the target function and \
+                          a source-relative header path such as \
+                          \"sqlite_ffi.h\".")))
+             state
+    | _ -> state
+
 let validate_resource_result_annotation loc (state : check_state)
     (func : func_decl) (sig_ : checked_func_signature) : check_state =
   if not func.func_resource_result_ordinary then state
@@ -1617,6 +1642,7 @@ let process_func_signature ?(module_path : string option) ?(loc = dummy_loc)
           else state
         else state
       in
+      let state = validate_foreign_metadata loc state sig_ func in
       let state = validate_default_foreign_arg_safety loc state sig_ func in
       (* When importing a function that has the same name as a polymorphic builtin,
          don't overwrite the builtin in scope — just add as an overload entry.

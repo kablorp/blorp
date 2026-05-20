@@ -2568,7 +2568,28 @@ let test_emit_global_var_string_literal_deferred () =
     (contains_sub output "GREETING = ");
   Alcotest.(check bool)
     "assignment constructs string literal" true
-    (contains_sub output "blorp_string_literal(\"hello\")")
+    (contains_sub output "blorp_string_literal_len(\"hello\", 5L)")
+
+let test_escape_nul_string_literal_keeps_explicit_length () =
+  let v =
+    {
+      cv_name = Var.named "NUL_TEXT";
+      cv_module = None;
+      cv_ty = ty_string;
+      cv_init =
+        mk
+          (CLit (LitString ("a\000b", { sf_triple = false; sf_raw = false })))
+          ty_string;
+      cv_is_mutable = false;
+      cv_is_const = true;
+      cv_def_id = 0;
+    }
+  in
+  let prog = [ { cd_desc = CDVar v; cd_loc = loc; cd_doc = None } ] in
+  let output = emit_program_to_string prog in
+  Alcotest.(check bool)
+    "literal includes explicit byte length" true
+    (contains_sub output "blorp_string_literal_len(\"a\\000b\", 3L)")
 
 let test_emit_impl_methods () =
   let body =
@@ -5647,6 +5668,8 @@ let suite =
         Alcotest.test_case "string_literal" `Quick test_emit_string_literal;
         Alcotest.test_case "string_escape_unicode" `Quick
           test_escape_unicode_before_hex_digit;
+        Alcotest.test_case "string_literal_nul_length" `Quick
+          test_escape_nul_string_literal_keeps_explicit_length;
       ] );
     ( "match_tree",
       [
