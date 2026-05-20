@@ -1712,6 +1712,63 @@ func main(args: List[String]) -> Int:
         Alcotest.(check int)
           "cf_def_ids unique" (List.length ids) (List.length unique)))
 
+(** Typed lowering must preserve the callable ids minted during typechecking.
+    Inference threads those ids into resolved call metadata; minting fresh Core
+    ids here makes UFCS/generic calls vulnerable to accidental id collisions in
+    large combined programs. *)
+let test_lower_typed_func_preserves_callable_id () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let source =
+          {|
+func inc(x: Int) -> Int:
+    x + 1
+
+func caller() -> Int:
+    inc(41)
+|}
+        in
+        Blorp.Lexer.reset_state ();
+        let lexbuf = Lexing.from_string source in
+        let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
+        let program = Blorp.Interp_parser.transform_program program in
+        let typed =
+          match Blorp.Typecheck.typecheck_with_state_typed program with
+          | Ok (_state, typed) -> typed
+          | Error errors ->
+              Alcotest.fail
+                ("expected no type errors, got:\n"
+                ^ Test_helpers.format_errors errors)
+        in
+        let expected_ids =
+          Blorp.Typed_ast.program_decls typed
+          |> List.filter_map (fun decl ->
+              match Blorp.Typed_ast.decl_func decl with
+              | Some func -> (
+                  match
+                    ( (Blorp.Typed_ast.func_ast func).func_name,
+                      Blorp.Typed_ast.func_callable_id func )
+                  with
+                  | Some name, Some callable_id -> Some (name, callable_id)
+                  | _ -> None)
+              | None -> None)
+        in
+        let cprog = Blorp.Core_lower.lower_typed_program typed in
+        let funcs =
+          List.filter_map
+            (fun d -> match d.cd_desc with CDFunc f -> Some f | _ -> None)
+            cprog
+        in
+        List.iter
+          (fun f ->
+            match List.assoc_opt f.cf_name expected_ids with
+            | Some expected ->
+                Alcotest.(check int)
+                  ("cf_def_id for " ^ f.cf_name)
+                  expected f.cf_def_id
+            | None -> ())
+          funcs))
+
 (** A3.3: Core_lower parses a [#<def_id>] suffix off UFCS mangled
     identifiers and threads the DefId into [Core.var.vdef_id], leaving
     [vname] as the clean (unsuffixed) form.
@@ -2172,6 +2229,8 @@ let suite =
         Alcotest.test_case "real_source" `Quick test_lower_real_source;
         Alcotest.test_case "cf_def_id populated and unique" `Quick
           test_cf_def_id_populated_and_unique;
+        Alcotest.test_case "typed func preserves callable id" `Quick
+          test_lower_typed_func_preserves_callable_id;
         Alcotest.test_case "core_lower parses ufcs def_id suffix" `Quick
           test_core_lower_parses_ufcs_def_id_suffix;
         Alcotest.test_case "core_lower ufcs no suffix" `Quick

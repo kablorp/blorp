@@ -297,37 +297,6 @@ let resource_arg_policy_of_func ~contains_resource_param
   | FuncBuiltinBody _ | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
       RejectResourceArgs
 
-let rec removed_tensor_type_syntax_message (ty : type_expr) : string option =
-  let recurse_list tys = List.find_map removed_tensor_type_syntax_message tys in
-  match ty with
-  | TyNamed ((("Tensor" | "Vector" | "Matrix") as name), elem :: dims) ->
-      let old_form =
-        match name with
-        | "Vector" -> "Vector[T, #N]"
-        | "Matrix" -> "Matrix[T, #M, #N]"
-        | _ -> "Tensor[T, #N]"
-      in
-      let replacement = Types.type_to_string (Types.ty_array elem dims) in
-      Some
-        (Printf.sprintf "%s type syntax has been removed; write %s instead"
-           old_form replacement)
-  | TyNamed (_, args) -> recurse_list args
-  | TyArray (elem, dims) -> (
-      match removed_tensor_type_syntax_message elem with
-      | Some _ as msg -> msg
-      | None -> recurse_list dims)
-  | TyFunc { params; return; _ } -> (
-      match recurse_list params with
-      | Some _ as msg -> msg
-      | None -> removed_tensor_type_syntax_message return)
-  | TyTuple elems -> recurse_list elems
-  | TyRange inner -> removed_tensor_type_syntax_message inner
-  | TyDimOp (_, a, b) -> (
-      match removed_tensor_type_syntax_message a with
-      | Some _ as msg -> msg
-      | None -> removed_tensor_type_syntax_message b)
-  | _ -> None
-
 let type_resolution_context (state : check_state) (env : env) =
   Type_resolution.make_context ~env ~module_aliases:state.module_aliases ()
 
@@ -762,6 +731,60 @@ let init_state ?module_origin ?(allow_debug_only_calls = false) () =
 (** Add an error to the state *)
 let add_error state err = { state with errors = err :: state.errors }
 
+let check_removed_tensor_type_syntax state loc ty =
+  match Types.removed_tensor_type_syntax_message ty with
+  | Some msg -> add_error state (error_at loc msg)
+  | None -> state
+
+let check_removed_tensor_type_syntax_opt state loc = function
+  | Some ty -> check_removed_tensor_type_syntax state loc ty
+  | None -> state
+
+let check_removed_tensor_param_syntax state (param : Ast.param) =
+  check_removed_tensor_type_syntax_opt state param.param_loc param.param_type
+
+let check_removed_tensor_func_syntax state loc (func : func_decl) =
+  let state =
+    List.fold_left check_removed_tensor_param_syntax state func.func_params
+  in
+  check_removed_tensor_type_syntax_opt state loc func.func_return_type
+
+let rec check_removed_tensor_expr_syntax state (expr : Ast.expr) =
+  let state =
+    match expr.expr_desc with
+    | EAscription (_, ty) ->
+        check_removed_tensor_type_syntax state expr.expr_loc ty
+    | EVarDecl (_, ty, _, _)
+    | EQuestionBind (_, ty, _)
+    | EConcurrentBind (_, ty, _) ->
+        check_removed_tensor_type_syntax_opt state expr.expr_loc ty
+    | EWith (binding, _) ->
+        check_removed_tensor_type_syntax_opt state expr.expr_loc
+          binding.with_type
+    | ELambda func | EFuncDecl func ->
+        check_removed_tensor_func_syntax state expr.expr_loc func
+    | _ -> state
+  in
+  List.fold_left check_removed_tensor_expr_syntax state (expr_children expr)
+
+let check_removed_tensor_trait_method_syntax state loc
+    (method_ : Ast.trait_method) =
+  let state =
+    List.fold_left check_removed_tensor_param_syntax state method_.method_params
+  in
+  let state =
+    check_removed_tensor_type_syntax_opt state loc method_.method_return_type
+  in
+  match method_.method_default_body with
+  | Some body -> check_removed_tensor_expr_syntax state body
+  | None -> state
+
+let check_removed_tensor_impl_syntax state loc (impl : impl_decl) =
+  let state = check_removed_tensor_type_syntax state loc impl.impl_for_type in
+  List.fold_left
+    (fun state func -> check_removed_tensor_func_syntax state loc func)
+    state impl.impl_methods
+
 let validate_type_param_name state loc raw =
   let name = Env.type_param_name raw in
   if Types.is_valid_named_type_param raw || Types.is_valid_dim_type_param raw
@@ -941,6 +964,17 @@ let register_imported_name (state : check_state) (loc : loc)
 let process_type_decl ?(loc : loc option) ?(imported = false)
     (state : check_state) (decl : type_decl) : check_state =
   let decl_loc = Option.value loc ~default:dummy_loc in
+  let state =
+    List.fold_left
+      (fun state (v : variant) ->
+        List.fold_left
+          (fun state field_ty ->
+            match Types.removed_tensor_type_syntax_message field_ty with
+            | Some msg -> add_error state (error_at v.variant_loc msg)
+            | None -> state)
+          state v.variant_fields)
+      state decl.type_variants
+  in
   let decl =
     {
       decl with
@@ -1110,6 +1144,14 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
 let process_record_decl ?(imported = false) (state : check_state)
     (decl : record_decl) (loc : loc) : check_state =
   let state = validate_type_params state loc decl.record_type_params in
+  let state =
+    List.fold_left
+      (fun state (f : field_decl) ->
+        match Types.removed_tensor_type_syntax_message f.field_type with
+        | Some msg -> add_error state (error_at f.field_loc msg)
+        | None -> state)
+      state decl.record_fields
+  in
   (* Builtin record declarations: restrict to std/ files, skip field validation.
      Skip the origin check for imported declarations (already validated in source module). *)
   if decl.record_is_builtin then begin
@@ -1287,6 +1329,11 @@ let process_record_decl ?(imported = false) (state : check_state)
 let process_type_alias ?(loc = dummy_loc) (state : check_state)
     (decl : type_alias_decl) : check_state =
   let state = validate_type_params state loc decl.alias_type_params in
+  let state =
+    match Types.removed_tensor_type_syntax_message decl.alias_target with
+    | Some msg -> add_error state (error_at loc msg)
+    | None -> state
+  in
   let decl =
     {
       decl with
@@ -3069,6 +3116,12 @@ let rec first_pass (state : check_state) (decls : program) : check_state =
           let state =
             List.fold_left
               (fun state meth ->
+                check_removed_tensor_trait_method_syntax state trait_loc meth)
+              state trait.trait_methods
+          in
+          let state =
+            List.fold_left
+              (fun state meth ->
                 List.fold_left
                   (fun s p ->
                     match p.param_type with
@@ -4382,7 +4435,7 @@ let rec second_pass (state : check_state) (decls : program) :
               @ Env.get_type_params state.env
             in
             let validate_annotation st ty =
-              match removed_tensor_type_syntax_message ty with
+              match Types.removed_tensor_type_syntax_message ty with
               | Some msg -> add_error st (error_at loc msg)
               | None -> (
                   match Types.validate_tensor_dims func_tp ty with
@@ -4434,7 +4487,7 @@ let rec second_pass (state : check_state) (decls : program) :
             let state =
               match var_decl.var_type with
               | Some ty -> (
-                  match removed_tensor_type_syntax_message ty with
+                  match Types.removed_tensor_type_syntax_message ty with
                   | Some msg -> add_error state (error_at loc msg)
                   | None -> (
                       match
@@ -4586,6 +4639,7 @@ let rec second_pass (state : check_state) (decls : program) :
                 would emit duplicate C symbols), but don't register in the
                 shared [impl_index] — private impls are module-internal
                 and must not satisfy trait bounds for cross-module callers. *)
+                let state = check_removed_tensor_impl_syntax state loc impl in
                 let state = validate_impl_inline_type_params state loc impl in
                 let state = validate_impl state impl loc in
                 let inst = make_impl_instance ~loc ~env:state.env impl in
@@ -4641,6 +4695,7 @@ let rec second_pass (state : check_state) (decls : program) :
                 in
                 (state, typed_decl :: acc))
         | DImpl impl ->
+            let state = check_removed_tensor_impl_syntax state loc impl in
             let state = validate_impl_inline_type_params state loc impl in
             let state = validate_impl state impl loc in
             (* Orphan rule (Phase 3.4): the impl must live in the trait's

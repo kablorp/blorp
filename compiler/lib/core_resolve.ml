@@ -33,6 +33,7 @@ type env = {
   user_funcs : (string, int) Hashtbl.t;
   user_func_names_by_id : (int, string) Hashtbl.t;
   ambiguous_user_func_ids : (int, unit) Hashtbl.t;
+  module_funcs : (string * string, string * int) Hashtbl.t;
   user_value_types : (string, Ast.type_expr) Hashtbl.t;
   foreign_funcs : (string, foreign_call) Hashtbl.t;
   builtin_funcs : (string, string) Hashtbl.t;
@@ -52,23 +53,26 @@ type env = {
       selected [vdef_id] from typed call metadata. This lets resolution recover
       the canonical post-flatten function name instead of mangling an old source
       spelling such as [map] with the selected id for [map__pure].
+    - [module_funcs]: module path + source function name → actual emitted
+      Core function name and [cf_def_id]. This keeps module-owned wrappers that
+      intentionally remain unprefixed, such as [std/fixed.fixed], addressable
+      through qualified calls without leaking their bare names globally.
     - [ambiguous_user_func_ids]: duplicate def-ids seen while building the
       reverse index. Production def-ids should be unique, but tests and legacy
       hand-built Core may use repeated [0]. When that happens, the resolver
       ignores id lookup and falls back to the callee name instead of choosing a
       load-order-dependent target.
-    - [builtin_funcs]: bodyless std builtin function names → runtime C
-      builtin name. This includes monomorphized builtin declarations such as
-      [std_vector__map__mono_3_Int_Int], which must remain [CKBuiltin] so
+    - [builtin_funcs]: std builtin wrapper names → runtime C builtin name.
+      This includes monomorphized declarations such as
+      [std_stream__map__mono_Int_String], which must remain [CKBuiltin] so
       [Core_specialize] can apply type/layout-specific rewrites instead of
-      being mistaken for first-class closures.
+      being mistaken for user functions or first-class closures.
     - [foreign_funcs]: foreign function names → their user-specified
       [c_name] and argument-passing mode (bypass — no mangling).
     - [constructor_names]: set of in-scope constructor names. Used for
       the [is_union_constructor] classification in [Core_emit]. *)
 
-let register_user_func (env : env) (name : string) (def_id : int) : unit =
-  Hashtbl.replace env.user_funcs name def_id;
+let remember_user_func_id (env : env) (name : string) (def_id : int) : unit =
   match Hashtbl.find_opt env.user_func_names_by_id def_id with
   | None ->
       if not (Hashtbl.mem env.ambiguous_user_func_ids def_id) then
@@ -77,6 +81,16 @@ let register_user_func (env : env) (name : string) (def_id : int) : unit =
   | Some _ ->
       Hashtbl.remove env.user_func_names_by_id def_id;
       Hashtbl.replace env.ambiguous_user_func_ids def_id ()
+
+let register_user_func (env : env) (name : string) (def_id : int) : unit =
+  Hashtbl.replace env.user_funcs name def_id;
+  remember_user_func_id env name def_id
+
+let register_module_func (env : env) ~(module_path : string)
+    ~(source_name : string) ~(actual_name : string) ~(def_id : int) : unit =
+  Hashtbl.replace env.module_funcs (module_path, source_name)
+    (actual_name, def_id);
+  remember_user_func_id env actual_name def_id
 
 let user_call_kind_by_def_id (env : env) (def_id : int option) :
     call_kind option =
@@ -109,6 +123,8 @@ let strip_mono_suffix name =
   in
   find 0
 
+let has_mono_suffix name = strip_mono_suffix name <> name
+
 let source_name_for_builtin_lookup (f : core_func) : string =
   let source_name = strip_mono_suffix f.cf_name in
   let source_name =
@@ -134,6 +150,7 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
       user_funcs = Hashtbl.create 64;
       user_func_names_by_id = Hashtbl.create 64;
       ambiguous_user_func_ids = Hashtbl.create 8;
+      module_funcs = Hashtbl.create 64;
       user_value_types = Hashtbl.create 32;
       foreign_funcs = Hashtbl.create 16;
       builtin_funcs = Hashtbl.create 32;
@@ -142,19 +159,21 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
       module_imports;
     }
   in
-  let remember_bodyless_builtin (f : core_func) =
+  let remember_std_builtin (f : core_func) =
     match f.cf_module with
-    | None -> ()
+    | None -> false
     | Some module_path -> (
         let source_name = source_name_for_builtin_lookup f in
         (* Only generated/prefixed names are globally addressable here.
            Bare bodyless declarations such as [get] can exist in
            multiple std modules (list/vector) and must resolve through the
            call site's import table or first-argument type instead. *)
-        if f.cf_name <> source_name then
-          match Codegen_builtins.lookup module_path source_name with
-          | Some c_name -> Hashtbl.replace env.builtin_funcs f.cf_name c_name
-          | None -> ())
+        match Codegen_builtins.lookup module_path source_name with
+        | Some c_name ->
+            if f.cf_name <> source_name then
+              Hashtbl.replace env.builtin_funcs f.cf_name c_name;
+            true
+        | None -> false)
   in
   let rec visit_decl (d : core_decl) =
     match d.cd_desc with
@@ -163,13 +182,23 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
         | CFForeign { c_name; arg_passing; _ } ->
             Hashtbl.replace env.foreign_funcs f.cf_name
               { fc_c_name = c_name; fc_arg_passing = arg_passing }
-        | _ -> register_user_func env f.cf_name f.cf_def_id)
+        | CFBuiltin when remember_std_builtin f -> ()
+        | _ when has_mono_suffix f.cf_name && remember_std_builtin f -> ()
+        | _ -> (
+            match f.cf_module with
+            | Some module_path ->
+                let source_name = source_name_for_builtin_lookup f in
+                register_module_func env ~module_path ~source_name
+                  ~actual_name:f.cf_name ~def_id:f.cf_def_id;
+                if f.cf_name <> source_name then
+                  register_user_func env f.cf_name f.cf_def_id
+            | None -> register_user_func env f.cf_name f.cf_def_id))
     | CDFunc f -> (
         match f.cf_kind with
         | CFForeign { c_name; arg_passing; _ } ->
             Hashtbl.replace env.foreign_funcs f.cf_name
               { fc_c_name = c_name; fc_arg_passing = arg_passing }
-        | CFBuiltin -> remember_bodyless_builtin f
+        | CFBuiltin -> ignore (remember_std_builtin f)
         | _ -> ())
     | CDImpl i ->
         (* Register impl methods with their mangled names (Trait_method_Type)
@@ -238,44 +267,47 @@ let try_resolve_module_func (env : env) mod_path func_name : call_kind option =
   match Codegen_builtins.lookup mod_path func_name with
   | Some c_name -> Some (CKBuiltin c_name)
   | None -> (
-      let prefixed = sanitize_module_name mod_path ^ "__" ^ func_name in
-      match Hashtbl.find_opt env.user_funcs prefixed with
-      | Some id -> Some (CKUser (prefixed, Some id))
+      match Hashtbl.find_opt env.module_funcs (mod_path, func_name) with
+      | Some (actual_name, id) -> Some (CKUser (actual_name, Some id))
       | None -> (
-          (* Try __pure variant (pure/impure overloads get distinct names) *)
-          let prefixed_pure = prefixed ^ "__pure" in
-          match Hashtbl.find_opt env.user_funcs prefixed_pure with
-          | Some id -> Some (CKUser (prefixed_pure, Some id))
+          let prefixed = sanitize_module_name mod_path ^ "__" ^ func_name in
+          match Hashtbl.find_opt env.user_funcs prefixed with
+          | Some id -> Some (CKUser (prefixed, Some id))
           | None -> (
-              (* Trait impl methods: look for Trait_method_Type pattern.
+              (* Try __pure variant (pure/impure overloads get distinct names) *)
+              let prefixed_pure = prefixed ^ "__pure" in
+              match Hashtbl.find_opt env.user_funcs prefixed_pure with
+              | Some id -> Some (CKUser (prefixed_pure, Some id))
+              | None -> (
+                  (* Trait impl methods: look for Trait_method_Type pattern.
              E.g., zero from std/int → HasZero_zero_Int *)
-              let suffix =
-                Printf.sprintf "_%s_%s" func_name
-                  (match mod_path with
-                  | "std/int" -> "Int"
-                  | "std/float" -> "Float"
-                  | "std/bool" -> "Bool"
-                  | "std/char" -> "Char"
-                  | "std/string" -> "String"
-                  | _ -> "")
-              in
-              if suffix = Printf.sprintf "_%s_" func_name then None
-              else
-                let matches =
-                  Hashtbl.fold
-                    (fun k id acc ->
-                      if
-                        String.length k > String.length suffix
-                        &&
-                        let s = String.length k - String.length suffix in
-                        String.sub k s (String.length suffix) = suffix
-                      then (k, id) :: acc
-                      else acc)
-                    env.user_funcs []
-                in
-                match matches with
-                | [ (mangled, id) ] -> Some (CKUser (mangled, Some id))
-                | _ -> None)))
+                  let suffix =
+                    Printf.sprintf "_%s_%s" func_name
+                      (match mod_path with
+                      | "std/int" -> "Int"
+                      | "std/float" -> "Float"
+                      | "std/bool" -> "Bool"
+                      | "std/char" -> "Char"
+                      | "std/string" -> "String"
+                      | _ -> "")
+                  in
+                  if suffix = Printf.sprintf "_%s_" func_name then None
+                  else
+                    let matches =
+                      Hashtbl.fold
+                        (fun k id acc ->
+                          if
+                            String.length k > String.length suffix
+                            &&
+                            let s = String.length k - String.length suffix in
+                            String.sub k s (String.length suffix) = suffix
+                          then (k, id) :: acc
+                          else acc)
+                        env.user_funcs []
+                    in
+                    match matches with
+                    | [ (mangled, id) ] -> Some (CKUser (mangled, Some id))
+                    | _ -> None))))
 
 (* Resolve a single call expression's call_kind.
 

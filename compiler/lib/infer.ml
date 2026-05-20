@@ -552,6 +552,15 @@ let canonicalize_inferred_type_for_ast ctx ty =
   let resolution_ctx = type_resolution_context ctx in
   Type_resolution.annotation_canonical resolution_ctx ty
 
+let reject_removed_tensor_type_syntax loc ty =
+  match Types.removed_tensor_type_syntax_message ty with
+  | Some msg -> error loc msg
+  | None -> Ok ()
+
+let reject_removed_tensor_type_syntax_opt loc = function
+  | Some ty -> reject_removed_tensor_type_syntax loc ty
+  | None -> Ok ()
+
 let normalize_type_with_env env purpose ty =
   let normalization_ctx = Infer_type_normalization.make_context ~env () in
   Infer_type_normalization.canonical normalization_ctx purpose ty
@@ -3547,6 +3556,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               annotate_expected_value_slot ctx (with_inferred_type expr ty) ty
             ))
   | EWith (binding, body) -> (
+      let* () = reject_removed_tensor_type_syntax_opt loc binding.with_type in
       let ty_ann =
         binding.with_type
         |> Option.map (resolve_local_binding_annotation ctx)
@@ -3795,6 +3805,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       | Error e -> Error e)
   (* Type ascription *)
   | EAscription (inner, parsed_source_ty) ->
+      let* () = reject_removed_tensor_type_syntax loc parsed_source_ty in
       let resolved_ascription = resolve_value_ascription ctx parsed_source_ty in
       let source_ty = Type_resolution.source resolved_ascription in
       let ascribed_ty = Type_resolution.canonical resolved_ascription in
@@ -4936,6 +4947,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
   | EVarDecl (name, ty_opt, value, is_mutable) -> (
       (* Reject same-scope re-declaration *)
       let* () = check_no_redeclaration ctx.env name loc in
+      let* () = reject_removed_tensor_type_syntax_opt loc ty_opt in
       (* Resolve aliases (e.g., Vector -> Tensor) on declared type while
          retaining source spelling for typed metadata and tooling. *)
       let resolved_ty_opt =
@@ -5248,6 +5260,9 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         in
         (* Infer each binding — must be EVarDecl (immutable) *)
         let infer_one_binding ctx stmt name ty_ann body =
+          let* () =
+            reject_removed_tensor_type_syntax_opt stmt.expr_loc ty_ann
+          in
           let* body_ty, body' = infer_unconstrained_value_expr ctx body in
           let* () =
             reject_scoped_resource_task_capture ctx.env body.expr_loc body'
@@ -6564,6 +6579,43 @@ and infer_matrix_checked_set ctx expr args loc =
    Extracted from infer_call to reduce its size. Each handles compile-time
    dimension validation for typed tensor construction. *)
 
+and static_dim_from_expr ~semantic_type_of expr =
+  let dim_from_type = function
+    | TyConstInt _ as dim -> Some dim
+    | TyVar name as dim when Types.Dim.is_var_name name -> Some dim
+    | TyNamed (name, []) when Types.Dim.is_var_name name -> Some (TyVar name)
+    | TyDimOp _ as dim -> Some (Types.Dim.normalize dim)
+    | _ -> None
+  in
+  let semantic_dim expr = Option.bind (semantic_type_of expr) dim_from_type in
+  match expr.expr_desc with
+  | ELiteral (LitInt n) -> Some (TyConstInt (Int64.to_int n))
+  | EBinary (op, left, right) -> (
+      let dim_op =
+        match op with
+        | Add -> Some DimAdd
+        | Sub -> Some DimSub
+        | Mul -> Some DimMul
+        | Div -> Some DimDiv
+        | _ -> None
+      in
+      match
+        ( dim_op,
+          static_dim_from_expr ~semantic_type_of left,
+          static_dim_from_expr ~semantic_type_of right )
+      with
+      | Some op, Some left_dim, Some right_dim ->
+          Some (Types.Dim.normalize (TyDimOp (op, left_dim, right_dim)))
+      | _ -> semantic_dim expr)
+  | ECall ({ expr_desc = EIdent ("length" | "vector_length"); _ }, [ arg ]) -> (
+      match semantic_type_of arg with
+      | Some ty -> (
+          match Types.array_parts ty with
+          | Some (_, dim :: _) -> dim_from_type dim
+          | _ -> semantic_dim expr)
+      | None -> semantic_dim expr)
+  | _ -> semantic_dim expr
+
 and infer_vector_ctor ctx expr callee args loc =
   let elem_ctx =
     match expected_type_opt ctx with
@@ -6575,73 +6627,20 @@ and infer_vector_ctor ctx expr callee args loc =
   in
   let* val_ty, val' = infer_expr elem_ctx (List.nth args 0) in
   let* _, size' = infer_unconstrained_value_expr ctx (List.nth args 1) in
-  match size'.expr_desc with
-  | ELiteral (LitInt n) ->
-      let result_ty = Types.ty_array val_ty [ TyConstInt (Int64.to_int n) ] in
+  match
+    static_dim_from_expr ~semantic_type_of:expr_proof_semantic_type_opt size'
+  with
+  | Some dim ->
+      let result_ty = Types.ty_array val_ty [ dim ] in
       let callee' =
         with_inferred_type callee
           (ty_func [ val_ty; ty_int ] result_ty ~pure:true)
       in
       Ok (result_ty, inferred_call_expr expr callee' [ val'; size' ] result_ty)
-  | _ -> (
-      let dim_from_size =
-        match expr_proof_semantic_type_opt size' with
-        | Some (TyConstInt n) -> Some (TyConstInt n)
-        | Some (TyVar name) when Types.Dim.is_var_name name -> Some (TyVar name)
-        | _ ->
-            let extract_dim_from_length_call e =
-              match e.expr_desc with
-              | ECall
-                  ( { expr_desc = EIdent ("length" | "vector_length"); _ },
-                    [ arg ] ) -> (
-                  match expr_proof_semantic_type_opt arg with
-                  | Some ty -> (
-                      match Types.array_parts ty with
-                      | Some (_, dim :: _) -> (
-                          match dim with
-                          | TyConstInt _ | TyVar _ -> Some dim
-                          | _ -> None)
-                      | _ -> None)
-                  | _ -> None)
-              | _ -> None
-            in
-            extract_dim_from_length_call size'
-      in
-      match dim_from_size with
-      | Some dim ->
-          let result_ty = Types.ty_array val_ty [ dim ] in
-          let callee' =
-            with_inferred_type callee
-              (ty_func [ val_ty; ty_int ] result_ty ~pure:true)
-          in
-          Ok
-            ( result_ty,
-              inferred_call_expr expr callee' [ val'; size' ] result_ty )
-      | None -> (
-          (* Fallback: allowed if expected type provides concrete dims.
-              Supports patterns like:  N: Int = 200
-                                       var v: Float[#200] = vector(0.0, N)
-              The type annotation provides the dimension guarantee. *)
-          match expected_type_opt ctx with
-          | Some expected_ty
-            when match Types.array_parts expected_ty with
-                 | Some (_, dims) ->
-                     dims <> []
-                     && List.for_all
-                          (function TyVarDims _ -> false | _ -> true)
-                          dims
-                 | None -> false ->
-              let callee' =
-                with_inferred_type callee
-                  (ty_func [ val_ty; ty_int ] expected_ty ~pure:true)
-              in
-              Ok
-                ( expected_ty,
-                  inferred_call_expr expr callee' [ val'; size' ] expected_ty )
-          | _ ->
-              error loc
-                "vector() requires a compile-time constant size (use a literal \
-                 or a #N dim parameter)"))
+  | None ->
+      error loc
+        "vector() size must be a compile-time dimension (use a literal, a #N \
+         parameter, length(tensor), or dimension arithmetic over those forms)"
 
 (** matrix(value, rows, cols): 2D constructor. Dims must be compile-time constants. *)
 and infer_matrix_ctor ctx expr callee args loc =
@@ -6656,39 +6655,23 @@ and infer_matrix_ctor ctx expr callee args loc =
   let* val_ty, val' = infer_expr elem_ctx (List.nth args 0) in
   let* _, d1' = infer_unconstrained_value_expr ctx (List.nth args 1) in
   let* _, d2' = infer_unconstrained_value_expr ctx (List.nth args 2) in
-  match (d1'.expr_desc, d2'.expr_desc) with
-  | ELiteral (LitInt r), ELiteral (LitInt c) ->
-      let result_ty =
-        Types.ty_array val_ty
-          [ TyConstInt (Int64.to_int r); TyConstInt (Int64.to_int c) ]
-      in
+  match
+    ( static_dim_from_expr ~semantic_type_of:expr_proof_semantic_type_opt d1',
+      static_dim_from_expr ~semantic_type_of:expr_proof_semantic_type_opt d2' )
+  with
+  | Some rows_dim, Some cols_dim ->
+      let result_ty = Types.ty_array val_ty [ rows_dim; cols_dim ] in
       let param_tys = [ val_ty; ty_int; ty_int ] in
       let callee' =
         with_inferred_type callee (ty_func param_tys result_ty ~pure:true)
       in
       Ok
         (result_ty, inferred_call_expr expr callee' [ val'; d1'; d2' ] result_ty)
-  | _ -> (
-      match expected_type_opt ctx with
-      | Some expected_ty
-        when match Types.array_parts expected_ty with
-             | Some (_, dims) ->
-                 List.length dims = 2
-                 && List.for_all
-                      (function TyVarDims _ -> false | _ -> true)
-                      dims
-             | None -> false ->
-          let param_tys = [ val_ty; ty_int; ty_int ] in
-          let callee' =
-            with_inferred_type callee (ty_func param_tys expected_ty ~pure:true)
-          in
-          Ok
-            ( expected_ty,
-              inferred_call_expr expr callee' [ val'; d1'; d2' ] expected_ty )
-      | _ ->
-          error loc
-            "matrix() requires compile-time constant dimensions (use literals \
-             or #N dim parameters)")
+  | _ ->
+      error loc
+        "matrix() row and column sizes must be compile-time dimensions (use \
+         literals, #N parameters, length(tensor), or dimension arithmetic over \
+         those forms)"
 
 (** tensor3/4/5(value, dim...): N-dimensional constructors with compile-time dims. *)
 and infer_tensorN_ctor ctx expr callee name args loc =
@@ -8979,6 +8962,7 @@ and infer_question_bind_statement ctx stmt name ty_ann rhs =
             for explicit early-return support in loop bodies")
       stmt.expr_loc "?= cannot be used inside loops yet"
   else
+    let* () = reject_removed_tensor_type_syntax_opt stmt.expr_loc ty_ann in
     let* rhs_ty, rhs' = infer_unconstrained_value_expr ctx rhs in
     match (expected_type_opt ctx, rhs_ty) with
     | Some (TyNamed ("Option", [ _ ])), TyNamed ("Option", [ inner_ty ]) ->
@@ -9517,6 +9501,17 @@ and infer_lambda ctx expr func loc =
   match check_no_mutable_captures ctx.env func loc with
   | Some err -> Error err
   | None ->
+      let* () =
+        List.fold_left
+          (fun acc (param : Ast.param) ->
+            let* () = acc in
+            reject_removed_tensor_type_syntax_opt param.param_loc
+              param.param_type)
+          (Ok ()) func.func_params
+      in
+      let* () =
+        reject_removed_tensor_type_syntax_opt loc func.func_return_type
+      in
       (* Check if we have an expected function type for parameter inference *)
       let expected_func_type =
         match expected_type_opt ctx with

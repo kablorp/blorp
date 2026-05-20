@@ -1898,8 +1898,8 @@ and wrap_body_with_pattern_params (body : Core.core)
     return type appropriate for its phase boundary. Raw compatibility lowering
     uses the source annotation/default rule; typed lowering uses
     [Typed_ast.func_semantic_return_type]. *)
-and lower_func_with_return_ty ?typed_body ~(return_ty : Ast.type_expr)
-    (f : Ast.func_decl) : Core.core_func =
+and lower_func_with_return_ty ?typed_body ?callable_id
+    ~(return_ty : Ast.type_expr) (f : Ast.func_decl) : Core.core_func =
   let name =
     match f.func_name with
     | Some n -> n
@@ -1983,6 +1983,11 @@ and lower_func_with_return_ty ?typed_body ~(return_ty : Ast.type_expr)
         in
         if source_is_builtin && has_no_body then CFBuiltin else CFUser
   in
+  let cf_def_id =
+    match callable_id with
+    | Some id -> id
+    | None -> Session.mint_def_id (Session.current ())
+  in
   {
     cf_name = name;
     cf_module = None;
@@ -1993,7 +1998,7 @@ and lower_func_with_return_ty ?typed_body ~(return_ty : Ast.type_expr)
     cf_body = body;
     cf_is_pure = f.func_is_pure;
     cf_kind = kind;
-    cf_def_id = Session.mint_def_id (Session.current ());
+    cf_def_id;
   }
 
 (** Lower a raw AST function declaration. This is the compatibility path used
@@ -2023,7 +2028,8 @@ and lower_typed_func (typed : Typed_ast.func_decl) : Core.core_func =
     | Ok typed_body -> typed_body
     | Error err -> typed_ast_error err
   in
-  lower_func_with_return_ty ?typed_body ~return_ty f
+  let callable_id = Typed_ast.func_callable_id typed in
+  lower_func_with_return_ty ?typed_body ?callable_id ~return_ty f
 
 (** Lower a global variable declaration. *)
 and lower_var (v : Ast.var_decl) : Core.core_var =

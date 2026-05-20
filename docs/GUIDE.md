@@ -573,9 +573,16 @@ pure func swap(a: T[#As...], b: T[#Bs...]) -> (T[#Bs...], T[#As...]):
 pure func matrix[T, #N, #M](value: T, rows: #N, cols: #M) -> T[#N, #M]:
     builtin
 
+-- Constructors require static dimension evidence from their size arguments.
+-- A literal, #N parameter, length(array), or arithmetic over those forms works.
+pure func zeros_like[#N](src: Float[#N]) -> Float[#N]:
+    n: #N = src.length()
+    vector(0.0, n)
+
 -- IMPORTANT: variadic dims are NOT for runtime-sized data. Array dimensions
--- must always be known at compile time. For dynamically-sized collections
--- (sizes from config files, user input, etc.), use List[T] instead.
+-- must always be known at compile time. A type annotation like Float[#5]
+-- does not make vector(0.0, some_runtime_int) safe. For dynamically-sized
+-- collections (sizes from config files, user input, etc.), use List[T] instead.
 
 -- Wildcard dims (#_ and #_...): "don't care about this dimension."
 -- Use them in parameter positions when the function doesn't need to know

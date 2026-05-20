@@ -52,6 +52,9 @@ let tensor elem dims =
 let call_builtin name args ret_ty =
   mk (CCall (CKBuiltin name, mk CVoid ty_void, args)) ret_ty
 
+let call_unknown name args ret_ty =
+  mk (CCall (CKUnknown, cvar name ty_void, args)) ret_ty
+
 let call_intrinsic name args ret_ty =
   mk (CCall (CKIntrinsic name, mk CVoid ty_void, args)) ret_ty
 
@@ -334,6 +337,27 @@ let test_outer_float_specializes_with_dims () =
     call_builtin "blorp_tensor_outer" [ a; b ] (tensor ty_float [ 2; 3 ])
   in
   expect_builtin_with_dims "outer float" "blorp_tensor_outer_float" [ 2; 3 ] e
+
+let test_unknown_matvec_specializes_with_dims () =
+  let w = cvar "w" (tensor ty_int [ 2; 2 ]) in
+  let x = cvar "x" (tensor ty_int [ 2 ]) in
+  let e = call_unknown "matvec" [ w; x ] (tensor ty_int [ 2 ]) in
+  expect_builtin_with_dims "unknown matvec int" "blorp_tensor_matvec_int"
+    [ 2; 2 ] e
+
+let test_unknown_matvec_t_specializes_with_dims () =
+  let w = cvar "w" (tensor ty_float32 [ 2; 2 ]) in
+  let x = cvar "x" (tensor ty_float32 [ 2 ]) in
+  let e = call_unknown "matvec_t" [ w; x ] (tensor ty_float32 [ 2 ]) in
+  expect_builtin_with_dims "unknown matvec_t float32"
+    "blorp_tensor_matvec_t_float32" [ 2; 2 ] e
+
+let test_unknown_outer_specializes_with_dims () =
+  let a = cvar "a" (tensor ty_float32 [ 2 ]) in
+  let b = cvar "b" (tensor ty_float32 [ 3 ]) in
+  let e = call_unknown "outer" [ a; b ] (tensor ty_float32 [ 2; 3 ]) in
+  expect_builtin_with_dims "unknown outer float32" "blorp_tensor_outer_float32"
+    [ 2; 3 ] e
 
 let test_float32_vector_fill_uses_packed_runtime () =
   let value = mk (CLit (LitFloat 0.0)) ty_float32 in
@@ -1119,6 +1143,12 @@ let suite =
           test_outer_int_specializes_with_dims;
         Alcotest.test_case "outer_float" `Quick
           test_outer_float_specializes_with_dims;
+        Alcotest.test_case "unknown_matvec_int" `Quick
+          test_unknown_matvec_specializes_with_dims;
+        Alcotest.test_case "unknown_matvec_t_float32" `Quick
+          test_unknown_matvec_t_specializes_with_dims;
+        Alcotest.test_case "unknown_outer_float32" `Quick
+          test_unknown_outer_specializes_with_dims;
       ] );
     ( "float32_tensor_specialization",
       [

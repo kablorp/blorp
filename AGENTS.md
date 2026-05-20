@@ -640,7 +640,8 @@ See `docs/GUIDE.md` for full purity documentation.
 
 ### Tensor Work
 
-- `Tensor` is the builtin runtime container. `Vector[T, #N]` and `Matrix[T, #M, #N]` are aliases over it.
+- `Tensor` is the builtin runtime container. Source code writes fixed-shape tensors with postfix dimensions:
+  `T[#N]` for vectors and `T[#M, #N]` for matrices.
 - Storage is flat row-major. Single-index subscript peels one dimension, so `m[i]` on a matrix yields a row tensor while `m[i, j]` yields a scalar.
 - `#Ds...` means "caller-supplied concrete dimensions", not runtime-sized data. Use `List[T]` for data whose size is only known at runtime.
 - `assert_shape` is a narrow runtime refinement. It checks `length(t) == N` for the first dimension and refines the type on success; it does not reshape or copy data.

@@ -3168,16 +3168,21 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
             let dummy =
               { desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = e.loc }
             in
-            match func_name with
+            match (func_name, args) with
+            | Some "matvec", [ matrix; vector ] ->
+                specialize_matvec ~reg e matrix vector
+            | Some "matvec_t", [ matrix; vector ] ->
+                specialize_matvec_t ~reg e matrix vector
+            | Some "outer", [ a; b ] -> specialize_outer ~reg e a b
             (* sum, product, dot, max, min, mean, argmax, argmin, cumsum — post-mono synthesis *)
-            | Some name
+            | Some name, _
               when Option.is_some (tensor_elementwise_builtin_name name elem_ty)
               ->
                 let builtin_name =
                   Option.get (tensor_elementwise_builtin_name name elem_ty)
                 in
                 { e with desc = CCall (CKBuiltin builtin_name, dummy, args) }
-            | Some "scale" ->
+            | Some "scale", _ ->
                 let scale_name =
                   match elem_ty with
                   | Ast.TyNamed ("Float", _) -> "blorp_vector_scale_float"

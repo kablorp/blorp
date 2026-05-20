@@ -968,6 +968,240 @@ let test_resolve_prefixed_runtime_builtin_beats_std_signature () =
       expect_builtin_call "std_stream__from_list" "blorp_stream_from_list" body
   | _ -> Alcotest.fail "expected std signature plus function"
 
+let test_resolve_synthesized_monomorphic_runtime_builtin_stays_builtin () =
+  (* Core_synth gives monomorphized runtime-backed std wrappers a body before
+     this pass. Even if they no longer carry CFBuiltin by then, they must still
+     resolve as CKBuiltin so emission can call the runtime helper directly with
+     layout metadata instead of routing through a user wrapper. *)
+  let ty_string = TyNamed ("String", []) in
+  let stream_int = TyNamed ("Stream", [ ty_int ]) in
+  let stream_string = TyNamed ("Stream", [ ty_string ]) in
+  let callback_ty =
+    TyFunc { params = [ ty_int ]; return = ty_string; is_pure = true }
+  in
+  let map_ty =
+    TyFunc
+      {
+        params = [ stream_int; callback_ty ];
+        return = stream_string;
+        is_pure = false;
+      }
+  in
+  let synthesized_map : core_func =
+    {
+      cf_name = "std_stream__map__mono_Int_String";
+      cf_type_params = [];
+      cf_module = Some "std/stream";
+      cf_params = [];
+      cf_return_ty = stream_string;
+      cf_body = Some (cvar "dummy" stream_string);
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 404;
+    }
+  in
+  let call =
+    mk_call "std_stream__map__mono_Int_String" map_ty
+      [ cvar "s" stream_int; cvar "f" callback_ty ]
+      stream_string
+  in
+  let body_func : core_func =
+    {
+      cf_name = "f";
+      cf_type_params = [];
+      cf_params = [];
+      cf_module = None;
+      cf_return_ty = stream_string;
+      cf_body = Some call;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc synthesized_map; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc body_func; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved = Blorp.Core_resolve.resolve_program prog in
+  match resolved with
+  | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] ->
+      expect_builtin_call "std_stream__map__mono_Int_String" "blorp_stream_map"
+        body
+  | _ -> Alcotest.fail "expected synthesized builtin plus function"
+
+let test_runtime_backed_std_function_reference_stays_user_func () =
+  (* Non-monomorphic runtime-backed std functions still need an emitted wrapper:
+     they can be passed as first-class function values, e.g.
+     [words.map(upper)]. *)
+  let ty_string = TyNamed ("String", []) in
+  let upper_ty =
+    TyFunc { params = [ ty_string ]; return = ty_string; is_pure = true }
+  in
+  let upper_func : core_func =
+    {
+      cf_name = "std_string__upper";
+      cf_type_params = [];
+      cf_module = Some "std/string";
+      cf_params = [];
+      cf_return_ty = ty_string;
+      cf_body = Some (cvar "dummy" ty_string);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 405;
+    }
+  in
+  let body_func : core_func =
+    {
+      cf_name = "f";
+      cf_type_params = [];
+      cf_params = [];
+      cf_module = None;
+      cf_return_ty = upper_ty;
+      cf_body = Some (cvar "upper" upper_ty);
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc upper_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc body_func; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let import_aliases = Hashtbl.create 4 in
+  Hashtbl.replace import_aliases "upper" ("std/string", "upper");
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  match resolved with
+  | [ _; { cd_desc = CDFunc { cf_body = Some { desc = CVar v; _ }; _ }; _ } ] ->
+      Alcotest.(check string) "function ref name" "std_string__upper" v.vname;
+      Alcotest.(check (option int)) "function ref def id" (Some 405) v.vdef_id
+  | _ -> Alcotest.fail "expected function body to be an imported CVar"
+
+let test_resolve_qualified_module_alias_unprefixed_module_func () =
+  (* Body-synthesized std builtin wrappers can intentionally remain unprefixed
+     at the Core name level. Qualified calls must still resolve through the
+     module table instead of falling back to closure-field emission like
+     [F->fixed]. *)
+  let ty_float = TyNamed ("Float", []) in
+  let ty_fixed = TyNamed ("Fixed", []) in
+  let fixed_ty =
+    TyFunc { params = [ ty_float; ty_int ]; return = ty_fixed; is_pure = true }
+  in
+  let fixed_func : core_func =
+    {
+      cf_name = "fixed";
+      cf_type_params = [];
+      cf_module = Some "std/fixed";
+      cf_params = [];
+      cf_return_ty = ty_fixed;
+      cf_body = Some (cvar "dummy" ty_fixed);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 101;
+    }
+  in
+  let module_alias = mk (CVar (Var.named "F")) (TyNamed ("Module", [])) in
+  let callee = mk (CField (module_alias, "fixed")) fixed_ty in
+  let call =
+    mk (CCall (CKUnknown, callee, [ cvar "value" ty_float; cint 2 ])) ty_fixed
+  in
+  let main_f : core_func =
+    {
+      cf_name = "main";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [];
+      cf_return_ty = ty_fixed;
+      cf_body = Some call;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc fixed_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc main_f; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let import_aliases = Hashtbl.create 4 in
+  Hashtbl.replace import_aliases "F" ("std/fixed", "");
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  let body =
+    match resolved with
+    | [ _; { cd_desc = CDFunc { cf_body = Some b; _ }; _ } ] -> b
+    | _ -> Alcotest.fail "expected module func plus main"
+  in
+  match body.desc with
+  | CCall (CKUser (name, def_id), _, _) ->
+      Alcotest.(check string) "actual emitted name" "fixed" name;
+      Alcotest.(check (option int)) "module func def id" (Some 101) def_id
+  | CCall (CKClosure, _, _) ->
+      Alcotest.fail "qualified module func resolved as closure"
+  | _ -> Alcotest.fail "expected qualified module func to resolve as CKUser"
+
+let test_module_owned_unprefixed_func_does_not_pollute_bare_name () =
+  (* An unprefixed module-owned wrapper such as std/fixed.to_float must not be
+     registered as a global bare [to_float]; otherwise unrelated module bodies
+     can call the Fixed wrapper with Float16/Int/Float arguments. *)
+  let ty_float = TyNamed ("Float", []) in
+  let ty_float16 = TyNamed ("Float16", []) in
+  let fixed_to_float : core_func =
+    {
+      cf_name = "to_float";
+      cf_type_params = [];
+      cf_module = Some "std/fixed";
+      cf_params = [];
+      cf_return_ty = ty_float;
+      cf_body = Some (cvar "dummy" ty_float);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 202;
+    }
+  in
+  let call_ty =
+    TyFunc { params = [ ty_float16 ]; return = ty_float; is_pure = true }
+  in
+  let body =
+    mk
+      (CCall (CKUnknown, cvar "to_float" call_ty, [ cvar "x" ty_float16 ]))
+      ty_float
+  in
+  let float16_method : core_func =
+    {
+      cf_name = "to_float";
+      cf_type_params = [];
+      cf_module = Some "std/float16";
+      cf_params =
+        [ { cp_name = Var.named "x"; cp_ty = ty_float16; cp_loc = loc } ];
+      cf_return_ty = ty_float;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 203;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc fixed_to_float; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc float16_method; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved = Blorp.Core_resolve.resolve_program prog in
+  match resolved with
+  | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] ->
+      expect_builtin_call "bare to_float" "blorp_to_float" body
+  | _ -> Alcotest.fail "expected two module functions"
+
 let test_resolve_ufcs_by_first_arg_builtin () =
   (* A bare `get(s, i)` is not a prelude builtin. For String it resolves
      through the first-argument UFCS module candidates to std/string.get. *)
@@ -1620,6 +1854,15 @@ let suite =
           test_resolve_selective_import_alias_builtin;
         Alcotest.test_case "prefixed_runtime_builtin_beats_std_signature" `Quick
           test_resolve_prefixed_runtime_builtin_beats_std_signature;
+        Alcotest.test_case "synthesized_mono_runtime_builtin_stays_builtin"
+          `Quick
+          test_resolve_synthesized_monomorphic_runtime_builtin_stays_builtin;
+        Alcotest.test_case "runtime_backed_std_function_ref_stays_user" `Quick
+          test_runtime_backed_std_function_reference_stays_user_func;
+        Alcotest.test_case "qualified_unprefixed_module_func" `Quick
+          test_resolve_qualified_module_alias_unprefixed_module_func;
+        Alcotest.test_case "unprefixed_module_func_not_global" `Quick
+          test_module_owned_unprefixed_func_does_not_pollute_bare_name;
         Alcotest.test_case "ufcs_by_first_arg_builtin" `Quick
           test_resolve_ufcs_by_first_arg_builtin;
         Alcotest.test_case "monomorphized_bodyless_builtin" `Quick

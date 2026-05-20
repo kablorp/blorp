@@ -299,6 +299,37 @@ let array_parts = function
 let is_array_type ty =
   match array_parts ty with Some _ -> true | None -> false
 
+let rec removed_tensor_type_syntax_message (ty : type_expr) : string option =
+  let recurse_list tys = List.find_map removed_tensor_type_syntax_message tys in
+  match ty with
+  | TyNamed ((("Tensor" | "Vector" | "Matrix") as name), elem :: dims) ->
+      let old_form =
+        match name with
+        | "Vector" -> "Vector[T, #N]"
+        | "Matrix" -> "Matrix[T, #M, #N]"
+        | _ -> "Tensor[T, #N]"
+      in
+      let replacement = type_to_string (ty_array elem dims) in
+      Some
+        (Printf.sprintf "%s type syntax has been removed; write %s instead"
+           old_form replacement)
+  | TyNamed (_, args) -> recurse_list args
+  | TyArray (elem, dims) -> (
+      match removed_tensor_type_syntax_message elem with
+      | Some _ as msg -> msg
+      | None -> recurse_list dims)
+  | TyFunc { params; return; _ } -> (
+      match recurse_list params with
+      | Some _ as msg -> msg
+      | None -> removed_tensor_type_syntax_message return)
+  | TyTuple elems -> recurse_list elems
+  | TyRange inner -> removed_tensor_type_syntax_message inner
+  | TyDimOp (_, a, b) -> (
+      match removed_tensor_type_syntax_message a with
+      | Some _ as msg -> msg
+      | None -> removed_tensor_type_syntax_message b)
+  | _ -> None
+
 (** Check if two types are structurally equal *)
 let rec types_equal (t1 : type_expr) (t2 : type_expr) : bool =
   match (t1, t2) with
