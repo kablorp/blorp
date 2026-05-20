@@ -1440,6 +1440,54 @@ let reject_discarded_resource_value ctx loc ty =
       loc "resource-containing value cannot be discarded"
   else Ok ()
 
+let is_pure_call_expr expr =
+  match expr.expr_desc with
+  | ECall (callee, _) -> (
+      match expr.expr_type_info with
+      | Some { resolved_call = Some call; _ } -> Ast.resolved_call_purity call
+      | _ -> (
+          match expr_semantic_type_opt callee with
+          | Some (TyFunc { is_pure; _ }) -> is_pure
+          | _ -> false))
+  | _ -> false
+
+let reject_discarded_pure_call_expr loc =
+  error_with
+    ~notes:
+      [
+        "Pure functions do not mutate existing values; they return a new value.";
+        "Method-call syntax still uses value semantics, so `x.append(y)` does \
+         not change `x`.";
+      ]
+    ~help:
+      (Some
+         "Bind the result, assign it back to a mutable variable, or write `_ = \
+          ...` to discard it explicitly.")
+    loc "pure function call result is discarded"
+
+let rec reject_discarded_pure_call_result expr =
+  if is_pure_call_expr expr then reject_discarded_pure_call_expr expr.expr_loc
+  else
+    match expr.expr_desc with
+    | EBlock exprs ->
+        List.fold_left
+          (fun acc stmt ->
+            let* () = acc in
+            reject_discarded_pure_call_result stmt)
+          (Ok ()) exprs
+    | EIf (_cond, then_branch, else_branch) ->
+        let* () = reject_discarded_pure_call_result then_branch in
+        Option.fold ~none:(Ok ()) ~some:reject_discarded_pure_call_result
+          else_branch
+    | EMatch (_scrutinee, cases) ->
+        List.fold_left
+          (fun acc case ->
+            let* () = acc in
+            reject_discarded_pure_call_result case.case_body)
+          (Ok ()) cases
+    | EWith (_binding, body) -> reject_discarded_pure_call_result body
+    | _ -> Ok ()
+
 let validate_with_binding_annotation ctx loc ty_ann inner_ty =
   match ty_ann with
   | Some ann_ty ->
@@ -4867,7 +4915,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           (* Discard pattern — evaluate but don't bind.
               Clear expected context so it doesn't leak into the value expression
               (e.g., Void from lambda return context polluting generic type params). *)
-          let* _val_ty, value' = infer_statement_expr ctx value in
+          let* val_ty, value' = infer_unconstrained_value_expr ctx value in
+          let* () = reject_discarded_resource_value ctx value.expr_loc val_ty in
           let new_expr =
             with_inferred_type
               { expr with expr_desc = EAssign (var, value') }
@@ -5978,6 +6027,7 @@ and infer_annotated_value_expr ctx expected_ty expr =
 and infer_statement_expr ctx expr =
   let* ty, expr' = infer_unconstrained_value_expr ctx expr in
   let* () = reject_discarded_resource_value ctx expr.expr_loc ty in
+  let* () = reject_discarded_pure_call_result expr' in
   Ok (ty, expr')
 
 and inferred_binding_source_type value =
