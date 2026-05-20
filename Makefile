@@ -1,9 +1,33 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
+.PHONY: all build clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
+SECURITY_RUNTIME_TESTS := \
+	tests/test_blorp/sys/test_process.brp \
+	tests/test_blorp/sys/test_file_io.brp \
+	tests/test_blorp/sys/test_system_fs.brp \
+	tests/test_blorp/sys/test_system_interface.brp \
+	tests/test_blorp/sys/test_env.brp \
+	tests/test_blorp/sys/test_time.brp \
+	tests/test_blorp/sys/test_runtime_safety.brp \
+	tests/test_blorp/sys/test_streaming_io.brp \
+	tests/test_blorp/sys/test_for_each_line.brp \
+	tests/test_blorp/text/test_regex.brp \
+	tests/test_blorp/text/test_string_capacity.brp \
+	tests/test_blorp/text/test_bytes.brp \
+	tests/test_blorp/numeric/test_crypto_random.brp \
+	tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp \
+	tests/test_std/stream/test_stream.brp
+SECURITY_LEAK_TESTS := \
+	tests/test_blorp/sys/test_process.brp \
+	tests/test_blorp/sys/test_file_io.brp \
+	tests/test_blorp/sys/test_streaming_io.brp \
+	tests/test_blorp/sys/test_for_each_line.brp \
+	tests/test_blorp/text/test_regex.brp \
+	tests/test_blorp/sys/test_runtime_safety.brp \
+	tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp
 
 # Default target: build and install blorp to project root
 # Only copy if binary actually changed (preserves mtime for test cache)
@@ -93,7 +117,16 @@ c-static-analysis:
 	}
 	@tmp_plist=$$(mktemp "$${TMPDIR:-/tmp}/blorp-clang-analyze.XXXXXX"); \
 	trap 'rm -f "$$tmp_plist"' EXIT; \
-	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c compiler/lib/runtime_decl.c
+	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c compiler/lib/runtime_decl.c; \
+	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument \
+		-Xclang -analyzer-disable-checker=unix.BlockInCriticalSection \
+		-DMINICORO_IMPL -include compiler/lib/minicoro.h \
+		-o "$$tmp_plist" -x c compiler/lib/runtime.c
+
+security-check: all c-static-analysis
+	BLORP_COMPILER_TEST_TIMEOUT=60 scripts/run_tests.sh compiler
+	./blorp test --no-cache --timeout 20 $(SECURITY_RUNTIME_TESTS)
+	./blorp test --no-cache --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
 
 # Run all tests with AddressSanitizer + UBSan
 test-asan: all

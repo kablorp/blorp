@@ -192,11 +192,11 @@ let emit_string_literal ctx s =
           (Printf.sprintf
              "static blorp_String* %s;\n\
               static blorp_String* %s(void) {\n\
-             \    if (!%s) %s = blorp_string_literal(\"%s\");\n\
+             \    if (!%s) %s = blorp_string_literal_len(\"%s\", %dL);\n\
              \    return %s;\n\
               }\n"
              binding.sl_var binding.sl_helper binding.sl_var binding.sl_var
-             escaped binding.sl_var);
+             escaped (String.length s) binding.sl_var);
         binding
   in
   emit ctx (binding.sl_helper ^ "()")

@@ -55,6 +55,88 @@ let test_explicit_borrow_overrides_default_rejection () =
   expect_policy "borrowed user union" ExplicitBorrow
     (classify_arg ~metadata ~mode:ExplicitBorrowMode (ty "Message" []))
 
+let expect_metadata_ok name errors =
+  Alcotest.(check int) name 0 (List.length errors)
+
+let expect_metadata_error name expected errors =
+  let actual =
+    match errors with
+    | err :: _ -> Blorp.Ffi_boundary.metadata_validation_error_to_string err
+    | [] -> "<no error>"
+  in
+  Alcotest.(check string) name expected actual
+
+let foreign ?(includes = []) ?(links = []) name : foreign_func =
+  {
+    foreign_name = name;
+    foreign_includes = includes;
+    foreign_link_flags = links;
+  }
+
+let test_metadata_accepts_narrow_forms () =
+  let open Blorp.Ffi_boundary in
+  expect_metadata_ok "valid metadata"
+    (validate_metadata
+       (foreign
+          ~includes:[ "sqlite_ffi.h"; "net/tls_ffi.h" ]
+          ~links:
+            [
+              (None, "-lsqlite3");
+              (Some "linux", "-lssl -lcrypto");
+              ( Some "macos",
+                "-I/opt/homebrew/opt/openssl@3/include \
+                 -L/opt/homebrew/opt/openssl@3/lib -framework CoreFoundation" );
+            ]
+          "sqlite_open_v2"))
+
+let test_metadata_rejects_bad_c_name () =
+  let open Blorp.Ffi_boundary in
+  expect_metadata_error "bad C name"
+    "Invalid foreign C function name \"puts;system\": must contain only ASCII \
+     letters, digits, and underscores"
+    (validate_metadata (foreign "puts;system"))
+
+let test_metadata_rejects_bad_include () =
+  let open Blorp.Ffi_boundary in
+  expect_metadata_error "bad include"
+    "Invalid foreign include path \"../native.h\": must not contain empty, \
+     '.', or '..' path segments"
+    (validate_metadata (foreign ~includes:[ "../native.h" ] "native_call"))
+
+let test_metadata_rejects_bad_link_token () =
+  let open Blorp.Ffi_boundary in
+  expect_metadata_error "bad link token"
+    "Invalid foreign link flag \"-Wl,@evil\": unsupported token \"-Wl,@evil\"; \
+     allowed forms are -lNAME, -LDIR, -IDIR, -framework NAME, and -pthread"
+    (validate_metadata (foreign ~links:[ (None, "-Wl,@evil") ] "native_call"))
+
+let test_metadata_rejects_bad_link_character () =
+  let open Blorp.Ffi_boundary in
+  expect_metadata_error "bad link character"
+    "Invalid foreign link flag \"-lssl;touch\": library names may contain only \
+     ASCII letters, digits, '.', '_', '-', and '+'"
+    (validate_metadata (foreign ~links:[ (None, "-lssl;touch") ] "native_call"))
+
+let test_link_flags_cc_args_reuses_validation_split () =
+  let open Blorp.Ffi_boundary in
+  Alcotest.(check (list string))
+    "cc args"
+    [
+      "-I/opt/homebrew/opt/openssl@3/include";
+      "-L/opt/homebrew/opt/openssl@3/lib";
+      "-lssl";
+      "-lcrypto";
+      "-framework";
+      "CoreFoundation";
+    ]
+    (link_flags_cc_args
+       [
+         "-I/opt/homebrew/opt/openssl@3/include \
+          -L/opt/homebrew/opt/openssl@3/lib";
+         "-lssl -lcrypto";
+         "-framework CoreFoundation";
+       ])
+
 let suite =
   [
     ( "classify_arg",
@@ -69,5 +151,20 @@ let suite =
           test_default_managed_rejects;
         Alcotest.test_case "explicit borrow overrides" `Quick
           test_explicit_borrow_overrides_default_rejection;
+      ] );
+    ( "metadata",
+      [
+        Alcotest.test_case "accepts narrow forms" `Quick
+          test_metadata_accepts_narrow_forms;
+        Alcotest.test_case "rejects bad C name" `Quick
+          test_metadata_rejects_bad_c_name;
+        Alcotest.test_case "rejects bad include" `Quick
+          test_metadata_rejects_bad_include;
+        Alcotest.test_case "rejects bad link token" `Quick
+          test_metadata_rejects_bad_link_token;
+        Alcotest.test_case "rejects bad link character" `Quick
+          test_metadata_rejects_bad_link_character;
+        Alcotest.test_case "link args use validated split" `Quick
+          test_link_flags_cc_args_reuses_validation_split;
       ] );
   ]

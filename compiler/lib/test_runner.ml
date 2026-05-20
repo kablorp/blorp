@@ -1858,9 +1858,7 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
               @ (if sanitize then sanitize_cc_args else [])
               @ (if raylib_flags = "" then []
                  else String.split_on_char ' ' (String.trim raylib_flags))
-              @ List.concat_map
-                  (fun s -> String.split_on_char ' ' (String.trim s))
-                  link_flags
+              @ Ffi_boundary.link_flags_cc_args link_flags
             in
             let cc_result, cc_output =
               compile_c_from_stdin c_code bin_file cc_args
@@ -2060,9 +2058,7 @@ let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
   @ (if sanitize then sanitize_cc_args else [])
   @ (if raylib_flags = "" then []
      else String.split_on_char ' ' (String.trim raylib_flags))
-  @ List.concat_map
-      (fun s -> String.split_on_char ' ' (String.trim s))
-      link_flags
+  @ Ffi_boundary.link_flags_cc_args link_flags
 
 let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
     ?precompiled ?(leak_check = false) files =

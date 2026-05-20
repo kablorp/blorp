@@ -862,6 +862,7 @@ long blorp_unsafe_mod_int(long a, long b);
 
 // String Operations
 blorp_String* blorp_string_literal(const char* cstr);
+blorp_String* blorp_string_literal_len(const char* bytes, long len);
 blorp_String* blorp_string_create(const char* cstr);
 blorp_String* blorp_string_concat(const blorp_String* a, const blorp_String* b);
 blorp_String* blorp_string_concat_consume(blorp_String* a, blorp_String* b);

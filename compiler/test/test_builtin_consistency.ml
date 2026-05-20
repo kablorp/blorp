@@ -579,7 +579,7 @@ let test_stream_element_layout_is_explicit () =
           label)
     [ ("runtime", runtime); ("runtime_decl", runtime_decl) ]
 
-let test_stream_from_lines_uses_exact_path_buffer () =
+let test_stream_from_lines_uses_validated_path_buffer () =
   let runtime =
     read_first_existing
       [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
@@ -588,8 +588,17 @@ let test_stream_from_lines_uses_exact_path_buffer () =
     "runtime defines stream from_lines" true
     (contains_substring runtime "blorp_stream_from_lines(blorp_String* path)");
   Alcotest.(check bool)
-    "from_lines allocates an exact path buffer" true
-    (contains_substring runtime "blorp_malloc_checked(path->len + 1)");
+    "from_lines validates and copies paths through the shared C-string helper"
+    true
+    (contains_substring runtime
+       "char* cpath = blorp_cstring_copy_if_valid(path);");
+  Alcotest.(check bool)
+    "shared path helper rejects interior NUL bytes" true
+    (contains_substring runtime
+       "if (!s || blorp_string_contains_nul(s)) return NULL;");
+  Alcotest.(check bool)
+    "shared path helper allocates room for the full path plus terminator" true
+    (contains_substring runtime "blorp_checked_add(len, 1)");
   if
     contains_substring runtime "char pathbuf[4096]"
     || contains_substring runtime "path->len < 4095"
@@ -1209,8 +1218,8 @@ let suite =
           test_cloexec_helpers_declare_fallback_locals_once;
         Alcotest.test_case "stream element layout is explicit" `Quick
           test_stream_element_layout_is_explicit;
-        Alcotest.test_case "stream from_lines uses exact path buffer" `Quick
-          test_stream_from_lines_uses_exact_path_buffer;
+        Alcotest.test_case "stream from_lines uses validated path buffer" `Quick
+          test_stream_from_lines_uses_validated_path_buffer;
         Alcotest.test_case "std source dir initialized from config" `Quick
           test_std_source_dir_initialized_from_config;
         Alcotest.test_case "list join uses IR string_append" `Quick

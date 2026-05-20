@@ -416,6 +416,42 @@ let builtin_contract_table =
       builtins
         [ "__blorp_option_eq_layout" ]
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      (* OS-boundary helpers borrow caller-owned Blorp values. The runtime may
+         copy them into C strings, but it does not take ownership of the source
+         String/List/Bytes objects. *)
+      builtins
+        [ "blorp_read_file"; "blorp_read_bytes" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_write_file"; "blorp_write_bytes" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_read_all_lines"; "blorp_list_dir" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_append_file" ]
+        (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins [ "blorp_for_each_line" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_for_each_chunk" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_file_exists";
+          "blorp_is_directory";
+          "blorp_mkdir";
+          "blorp_remove_file";
+          "blorp_remove_dir";
+        ]
+        (bfixed [ Borrow ] ReturnPrimitive);
+      builtins [ "blorp_rename" ] (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins
+        [ "blorp_file_size"; "blorp_file_modified"; "blorp_mkstemp_path" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_getcwd"; "blorp_temp_dir" ] (bfixed [] ReturnOwned);
+      builtins [ "blorp_process_run" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_process_shell" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_exec" ] (bfixed [ Borrow ] ReturnPrimitive);
+      builtins [ "blorp_exec_output" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_setenv" ] (bfixed [ Borrow; Borrow ] ReturnPrimitive);
       (* List runtime functions that consume/reuse the list owner. *)
       builtins [ "blorp_list_new" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_channel_new" ] (bfixed [ Borrow ] ReturnOwned);
