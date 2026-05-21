@@ -106,6 +106,7 @@ let () =
     ("import", Parser.IMPORT);
     ("as", Parser.AS);
     ("private", Parser.PRIVATE);
+    ("export", Parser.EXPORT);
     ("match", Parser.MATCH);
     ("True", Parser.TRUE);
     ("False", Parser.FALSE);
@@ -997,7 +998,7 @@ let token_to_string = function
   | Parser.SELF_TYPE -> "Self"
   | Parser.TYPE -> "type" | Parser.ALIAS -> "alias" | Parser.BUILTIN -> "builtin"
   | Parser.IMPORT -> "import" | Parser.AS -> "as"
-  | Parser.PRIVATE -> "private" | Parser.MATCH -> "match"
+  | Parser.PRIVATE -> "private" | Parser.EXPORT -> "export" | Parser.MATCH -> "match"
   | Parser.TRUE -> "True" | Parser.FALSE -> "False"
   | Parser.IDENT s -> Printf.sprintf "'%s'" s
   | Parser.INT n -> Int64.to_string n

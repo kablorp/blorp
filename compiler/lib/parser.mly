@@ -49,6 +49,16 @@ let foreign_block_only_error pos =
     "foreign declarations must use a foreign: block; write `foreign:` and \
      indent `func ...` inside it"
 
+let export_not_supported_error pos =
+  parse_fail_at pos
+    "export is not supported; declarations are public by default, so remove \
+     `export`"
+
+let exported_foreign_block_only_error pos =
+  parse_fail_at pos
+    "foreign declarations must use a foreign: block; declarations are public \
+     by default, so omit `export` and write `foreign:`"
+
 let is_dim_type_arg = function
   | TyConstInt _ | TyVarDims _ | TyDimOp _ -> true
   | TyVar name -> String.length name > 0 && name.[0] = '#'
@@ -130,7 +140,7 @@ let concurrent_max_threads_or_error loc n =
 %token FUNC PURE VAR UNION ENUM RECORD STRUCT VOID_KW FOREIGN DETACH WHERE
 %token WHILE FOR IN IF ELSE AND OR NOT BREAK CONTINUE
 %token IMPLEMENTS TRAIT SELF_TYPE TYPE ALIAS BUILTIN
-%token IMPORT AS PRIVATE MATCH
+%token IMPORT AS PRIVATE EXPORT MATCH
 %token TRUE FALSE
 %token <string> IDENT
 %token <int64> INT
@@ -247,6 +257,14 @@ decl:
     { make_decl_doc_at $symbolstartpos doc (DImpl d) }
   | doc = docstring d = type_alias_decl
     { make_decl_doc_at $symbolstartpos doc (DTypeAlias d) }
+  | docstring e = EXPORT FOREIGN FUNC
+    { let _ = e in exported_foreign_block_only_error $startpos(e) }
+  | docstring e = EXPORT FOREIGN PURE FUNC
+    { let _ = e in exported_foreign_block_only_error $startpos(e) }
+  | docstring e = EXPORT PURE FUNC
+    { let _ = e in export_not_supported_error $startpos(e) }
+  | docstring e = EXPORT FUNC
+    { let _ = e in export_not_supported_error $startpos(e) }
   | DOCSTRING FOREIGN FUNC
     { foreign_block_only_error $symbolstartpos }
   | DOCSTRING FOREIGN PURE FUNC
@@ -336,6 +354,14 @@ private_inner_decl:
     { make_decl_doc_at $symbolstartpos doc (DImpl d) }
   | doc = docstring d = type_alias_decl
     { make_decl_doc_at $symbolstartpos doc (DTypeAlias d) }
+  | docstring e = EXPORT FOREIGN FUNC
+    { let _ = e in exported_foreign_block_only_error $startpos(e) }
+  | docstring e = EXPORT FOREIGN PURE FUNC
+    { let _ = e in exported_foreign_block_only_error $startpos(e) }
+  | docstring e = EXPORT PURE FUNC
+    { let _ = e in export_not_supported_error $startpos(e) }
+  | docstring e = EXPORT FUNC
+    { let _ = e in export_not_supported_error $startpos(e) }
   | docstring FOREIGN FUNC
     { foreign_block_only_error $symbolstartpos }
   | docstring FOREIGN PURE FUNC
