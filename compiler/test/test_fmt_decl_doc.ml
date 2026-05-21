@@ -428,6 +428,30 @@ let test_program_decl_json_with_duplicate_imports () =
         (string_contains jsonl
            {|"expected":"import:\n\tdict as D\n\tlist: append, get\n\n\nvar total: Int = 0\n"|})
 
+let test_program_decl_json_preserves_duplicate_import_comments () =
+  let source =
+    String.concat "\n"
+      [
+        "import:";
+        "    dict as D";
+        "    -- duplicate import rationale";
+        "    dict as D";
+        "";
+        "var total: Int = 0";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes program case" true
+        (string_contains jsonl {|"program":[|});
+      Alcotest.(check bool)
+        "program keeps duplicate import comments" true
+        (string_contains jsonl
+           {|"expected":"import:\n\t-- duplicate import rationale\n\tdict as D\n\n\nvar total: Int = 0\n"|})
+
 let test_program_decl_json_keeps_distinct_constructor_imports () =
   let source =
     String.concat "\n"
@@ -842,6 +866,9 @@ let suite =
           test_program_decl_json_with_imports;
         Alcotest.test_case "program declaration JSON with duplicate imports"
           `Quick test_program_decl_json_with_duplicate_imports;
+        Alcotest.test_case
+          "program declaration JSON preserves duplicate import comments" `Quick
+          test_program_decl_json_preserves_duplicate_import_comments;
         Alcotest.test_case
           "program declaration JSON keeps distinct constructor imports" `Quick
           test_program_decl_json_keeps_distinct_constructor_imports;

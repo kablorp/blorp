@@ -1232,17 +1232,35 @@ let import_dedup_key imp =
       |> List.sort String.compare |> String.concat ","
   | None -> ( match imp.import_alias with Some a -> "as:" ^ a | None -> "*")
 
-(** Deduplicate imports by their full import shape. *)
-let dedup_imports imports =
+let append_opt_comment comments = function
+  | None -> comments
+  | Some comment -> comments @ [ comment ]
+
+let merge_import_comments (imp, leading, trailing)
+    (_duplicate_imp, duplicate_leading, duplicate_trailing) =
+  let merged_leading =
+    leading @ duplicate_leading |> fun comments ->
+    append_opt_comment comments duplicate_trailing
+  in
+  (imp, merged_leading, trailing)
+
+(** Deduplicate imports by their full import shape while preserving comments
+    attached to duplicate import lines. Comments from removed duplicates become
+    leading comments on the surviving import instead of being dropped. *)
+let dedup_imports_with_comments imports =
   let seen = Hashtbl.create 16 in
-  List.filter
-    (fun imp ->
+  let order = ref [] in
+  List.iter
+    (fun ((imp, _, _) as item) ->
       let key = import_dedup_key imp in
-      if Hashtbl.mem seen key then false
-      else (
-        Hashtbl.add seen key ();
-        true))
-    imports
+      match Hashtbl.find_opt seen key with
+      | None ->
+          order := key :: !order;
+          Hashtbl.add seen key item
+      | Some existing ->
+          Hashtbl.replace seen key (merge_import_comments existing item))
+    imports;
+  List.filter_map (fun key -> Hashtbl.find_opt seen key) (List.rev !order)
 
 (* ─── Top-Level Declarations ────────────────────────────────────────── *)
 
@@ -1754,20 +1772,7 @@ let print_program (program : program) =
 
   (* Sort and group imports, carrying comments along *)
   let sort_with_comments pairs =
-    let deduped = dedup_imports (List.map (fun (i, _, _) -> i) pairs) in
-    (* After dedup, re-associate: find the pair whose import matches *)
-    let find_pair imp =
-      let key = import_dedup_key imp in
-      List.find_opt (fun (i, _, _) -> import_dedup_key i = key) pairs
-    in
-    let deduped_with_comments =
-      List.filter_map
-        (fun imp ->
-          match find_pair imp with
-          | Some (_, lead, trail) -> Some (imp, lead, trail)
-          | None -> Some (imp, [], None))
-        deduped
-    in
+    let deduped_with_comments = dedup_imports_with_comments pairs in
     let std =
       List.filter (fun (i, _, _) -> is_std_import i) deduped_with_comments
     in

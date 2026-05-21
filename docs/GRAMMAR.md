@@ -43,7 +43,6 @@ True   False
 
 Declarations are public by default; `private` hides a declaration from
 importers. There is no `export` keyword.
-blocks; it is not valid expression syntax.
 
 ### Operators and Delimiters
 
@@ -268,7 +267,8 @@ foreign_dispatch = "(" foreign_args ")" ":" NEWLINE INDENT { foreign_item { NEWL
 foreign_args = foreign_arg { "," foreign_arg } ;
 foreign_arg  = IDENT ":" STRING ;
 
-foreign_item = [ "private" ] { "@" IDENT } [ "pure" ] "func" name params "->" type_expr [ "=" STRING ] ;
+foreign_item = [ "private" ] { annotation_inline } [ "pure" ] "func" name params "->" type_expr [ "=" STRING ] ;
+annotation_inline = "@" IDENT [ "(" INT ")" ] ;
 ```
 
 **Semantic constraints:**

@@ -121,6 +121,23 @@ let make_foreign_decl_at pos doc ~is_pure ~fn_name ~params ~ret ~c_name ~annots 
   make_decl_doc_at pos doc
     (DFunc (mk_foreign_func ~is_pure ~fn_name ~params ~ret ~c_name ~annots))
 
+let apply_foreign_block_metadata ~includes ~link_flags decl =
+  let apply_to_func fd foreign =
+    { fd with
+      func_body =
+        FuncForeign
+          { foreign with
+            foreign_includes = includes @ foreign.foreign_includes;
+            foreign_link_flags = link_flags @ foreign.foreign_link_flags } }
+  in
+  match decl.decl_desc with
+  | DFunc ({ func_body = FuncForeign foreign; _ } as fd) ->
+      { decl with decl_desc = DFunc (apply_to_func fd foreign) }
+  | DPrivate ({ decl_desc = DFunc ({ func_body = FuncForeign foreign; _ } as fd); _ } as inner) ->
+      { decl with
+        decl_desc = DPrivate { inner with decl_desc = DFunc (apply_to_func fd foreign) } }
+  | _ -> decl
+
 (** Parse named parameters for concurrent blocks: max_threads: N, timeout: expr *)
 type concurrent_params = {
   conc_timeout: expr option;
@@ -265,10 +282,23 @@ decl:
     { let _ = e in export_not_supported_error $startpos(e) }
   | docstring e = EXPORT FUNC
     { let _ = e in export_not_supported_error $startpos(e) }
+  | docstring e = EXPORT start = unsupported_export_decl_start
+    { let _ = (e, start) in export_not_supported_error $startpos(e) }
   | DOCSTRING FOREIGN FUNC
     { foreign_block_only_error $symbolstartpos }
   | DOCSTRING FOREIGN PURE FUNC
     { foreign_block_only_error $symbolstartpos }
+
+unsupported_export_decl_start:
+  | TYPE { () }
+  | UNION { () }
+  | ENUM { () }
+  | RECORD { () }
+  | STRUCT { () }
+  | VAR { () }
+  | TRAIT { () }
+  | IMPLEMENTS { () }
+  | IDENT { () }
 
 (* Inline helpers for purity/return-type cross-product *)
 %inline purity_prefix:
@@ -362,6 +392,8 @@ private_inner_decl:
     { let _ = e in export_not_supported_error $startpos(e) }
   | docstring e = EXPORT FUNC
     { let _ = e in export_not_supported_error $startpos(e) }
+  | docstring e = EXPORT start = unsupported_export_decl_start
+    { let _ = (e, start) in export_not_supported_error $startpos(e) }
   | docstring FOREIGN FUNC
     { foreign_block_only_error $symbolstartpos }
   | docstring FOREIGN PURE FUNC
@@ -683,21 +715,7 @@ foreign_dispatch:
         else if k = "link_linux" then Some (Some "linux", v)
         else if k = "link_macos" then Some (Some "macos", v)
         else None) args in
-      List.map (fun decl ->
-        match decl.decl_desc with
-        | DFunc ({ func_body = FuncForeign foreign; _ } as fd) ->
-            { decl with
-              decl_desc =
-                DFunc
-                  { fd with
-                    func_body =
-                      FuncForeign
-                        { foreign with
-                          foreign_includes = includes @ foreign.foreign_includes;
-                          foreign_link_flags =
-                            link_flags @ foreign.foreign_link_flags } } }
-        | _ -> decl
-      ) items }
+      List.map (apply_foreign_block_metadata ~includes ~link_flags) items }
   (* foreign: block (no args) *)
   | COLON NEWLINE INDENT items = foreign_block_items DEDENT
     { items }
@@ -717,28 +735,18 @@ foreign_block_items:
     { item :: rest }
 
 foreign_block_item:
-  (* private func inside foreign block *)
-  | PRIVATE annots = annotations_inline p = purity_prefix FUNC fn_name = name
+  | is_private = foreign_private_opt annots = annotations_inline
+    p = purity_prefix FUNC fn_name = name
     params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { make_decl_at $symbolstartpos
-        (DPrivate
-          (make_foreign_decl_at $symbolstartpos None ~is_pure:p ~fn_name
-             ~params ~ret ~c_name:c ~annots)) }
-  (* pure func inside foreign block *)
-  | PURE FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { make_foreign_decl_at $symbolstartpos None ~is_pure:true ~fn_name
-        ~params ~ret ~c_name:c ~annots:[] }
-  (* @no_copy func inside foreign block *)
-  | AT annot = IDENT FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { make_foreign_decl_at $symbolstartpos None ~is_pure:false ~fn_name
-        ~params ~ret ~c_name:c ~annots:[annot] }
-  (* func inside foreign block *)
-  | FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { make_foreign_decl_at $symbolstartpos None ~is_pure:false ~fn_name
-        ~params ~ret ~c_name:c ~annots:[] }
+    { let decl =
+        make_foreign_decl_at $symbolstartpos None ~is_pure:p ~fn_name
+          ~params ~ret ~c_name:c ~annots
+      in
+      if is_private then make_decl_at $symbolstartpos (DPrivate decl) else decl }
+
+foreign_private_opt:
+  | PRIVATE { true }
+  | { false }
 
 (* ============================================================================
    NEW Trait System - Rust-style
