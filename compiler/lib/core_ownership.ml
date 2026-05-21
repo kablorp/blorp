@@ -367,16 +367,62 @@ type builtin_contract_spec =
 type builtin_contract_entry = {
   builtin_name : string;
   builtin_spec : builtin_contract_spec;
+  builtin_void_boxed_args : int list;
 }
 
 type builtin_ownership_coverage =
   | Covered_by_contract
   | Pre_perceus_sentinel of string
 
-let builtin name builtin_spec = { builtin_name = name; builtin_spec }
+let normalize_positions positions = List.sort_uniq Int.compare positions
 
-let builtins names builtin_spec =
-  List.map (fun name -> builtin name builtin_spec) names
+let builtin_contract_spec_sample_arities = function
+  | Builtin_fixed (args, _) -> [ List.length args ]
+  | Builtin_cases cases ->
+      cases
+      |> List.map (fun (args, _) -> List.length args)
+      |> List.sort_uniq compare
+  | Builtin_variadic { min_arity; _ } -> [ min_arity; min_arity + 3 ]
+
+let builtin_contract_spec_has_arg_position builtin_spec position =
+  position >= 0
+  &&
+  match builtin_spec with
+  | Builtin_variadic _ -> true
+  | _ ->
+      builtin_contract_spec_sample_arities builtin_spec
+      |> List.exists (fun arity -> arity > position)
+
+let validate_void_boxed_args ~name builtin_spec positions =
+  let positions = normalize_positions positions in
+  let negative_positions = List.filter (fun pos -> pos < 0) positions in
+  if negative_positions <> [] then
+    invalid_arg
+      (Printf.sprintf "%s has negative void* ABI arg positions: %s" name
+         (String.concat ", " (List.map string_of_int negative_positions)));
+  (match positions with
+  | [] -> ()
+  | _ ->
+      let max_position = List.fold_left max 0 positions in
+      if not (builtin_contract_spec_has_arg_position builtin_spec max_position)
+      then
+        invalid_arg
+          (Printf.sprintf
+             "%s has void* ABI arg positions through %d, but no ownership \
+              contract arity includes that argument"
+             name max_position));
+  positions
+
+let builtin ?(void_boxed_args = []) name builtin_spec =
+  {
+    builtin_name = name;
+    builtin_spec;
+    builtin_void_boxed_args =
+      validate_void_boxed_args ~name builtin_spec void_boxed_args;
+  }
+
+let builtins ?void_boxed_args names builtin_spec =
+  List.map (fun name -> builtin ?void_boxed_args name builtin_spec) names
 
 let bfixed args result = Builtin_fixed (args, result)
 let bcases cases = Builtin_cases cases
@@ -409,7 +455,7 @@ let builtin_contract_table =
   List.concat
     [
       (* Option/Result wrappers take ownership of their payload when present. *)
-      builtins
+      builtins ~void_boxed_args:[ 0 ]
         [ "blorp_option_some"; "blorp_result_ok"; "blorp_result_err" ]
         (bfixed [ Transfer ] ReturnOwned);
       builtins [ "blorp_option_none" ] (bfixed [] ReturnOwned);
@@ -455,9 +501,9 @@ let builtin_contract_table =
       (* List runtime functions that consume/reuse the list owner. *)
       builtins [ "blorp_list_new" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_channel_new" ] (bfixed [ Borrow ] ReturnOwned);
-      builtins [ "blorp_list_append" ]
+      builtins ~void_boxed_args:[ 1 ] [ "blorp_list_append" ]
         (bfixed [ CowConsume; Retain ] ReturnOwned);
-      builtins
+      builtins ~void_boxed_args:[ 1 ]
         [ "blorp_list_append_owned" ]
         (bfixed [ CowConsume; Transfer ] ReturnOwned);
       builtins
@@ -475,11 +521,15 @@ let builtin_contract_table =
          stored values when the channel element metadata requires ARC; receive
          operations transfer a fresh Option wrapper or stack option result to
          the caller. *)
-      builtins
-        [ "blorp_channel_send"; "blorp_channel_try_send" ]
+      builtins ~void_boxed_args:[ 1 ]
+        [
+          "blorp_channel_send";
+          "blorp_channel_try_send";
+          "blorp_channel_try_send_status";
+        ]
         (bfixed [ Borrow; Retain ] ReturnPrimitive);
-      builtins
-        [ "blorp_channel_send_timeout" ]
+      builtins ~void_boxed_args:[ 1 ]
+        [ "blorp_channel_send_timeout"; "blorp_channel_send_timeout_status" ]
         (bfixed [ Borrow; Retain; Borrow ] ReturnPrimitive);
       builtins
         [
@@ -518,12 +568,12 @@ let builtin_contract_table =
       builtins
         [ "blorp_dict_new_custom" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
+      builtins ~void_boxed_args:[ 1 ]
         [ "blorp_dict_get"; "blorp_dict_get_nullable" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_dict_insert" ]
+      builtins ~void_boxed_args:[ 1; 2 ] [ "blorp_dict_insert" ]
         (bfixed [ CowConsume; Retain; Retain ] ReturnOwned);
-      builtins [ "blorp_dict_remove" ]
+      builtins ~void_boxed_args:[ 1 ] [ "blorp_dict_remove" ]
         (bfixed [ CowConsume; Borrow ] ReturnOwned);
       builtins [ "blorp_dict_entries" ] (bfixed [ Borrow ] ReturnOwned);
       (* Set runtime functions. *)
@@ -532,8 +582,9 @@ let builtin_contract_table =
         (bfixed [] ReturnOwned);
       builtins [ "blorp_set_new_custom" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_set_add" ] (bfixed [ CowConsume; Retain ] ReturnOwned);
-      builtins [ "blorp_set_remove" ]
+      builtins ~void_boxed_args:[ 1 ] [ "blorp_set_add" ]
+        (bfixed [ CowConsume; Retain ] ReturnOwned);
+      builtins ~void_boxed_args:[ 1 ] [ "blorp_set_remove" ]
         (bfixed [ CowConsume; Borrow ] ReturnOwned);
       builtins [ "blorp_map_parallel" ]
         (bcases
@@ -587,7 +638,7 @@ let builtin_contract_table =
              ([ Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
              ([ Borrow; Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
            ]);
-      builtins
+      builtins ~void_boxed_args:[ 1 ]
         [
           "blorp_fold_parallel";
           "blorp_fold_parallel_ordered";
@@ -598,7 +649,7 @@ let builtin_contract_table =
              ([ Borrow; Consume; Borrow ], ReturnOwned);
              ([ Borrow; Consume; Borrow; Borrow ], ReturnOwned);
            ]);
-      builtins
+      builtins ~void_boxed_args:[ 1 ]
         [
           "blorp_fold_parallel_with";
           "blorp_fold_parallel_ordered_with";
@@ -609,7 +660,7 @@ let builtin_contract_table =
              ([ Borrow; Consume; Borrow; Borrow ], ReturnOwned);
              ([ Borrow; Consume; Borrow; Borrow; Borrow ], ReturnOwned);
            ]);
-      builtins [ "blorp_stream_fold" ]
+      builtins ~void_boxed_args:[ 1 ] [ "blorp_stream_fold" ]
         (bfixed [ Borrow; Consume; Borrow; Borrow ] ReturnOwned);
       (* Stream runtime functions. Source/intermediate stream constructors
          retain stored inputs and return a fresh stream owner. Terminal
@@ -774,7 +825,7 @@ let builtin_contract_table =
           "blorp_fallible_stream_all_file_raw";
         ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
+      builtins ~void_boxed_args:[ 1 ]
         [ "blorp_fallible_stream_fold_file_raw" ]
         (bfixed [ Borrow; Consume; Borrow; Borrow ] ReturnOwned);
       builtins
@@ -838,7 +889,7 @@ let builtin_contract_table =
       builtins
         [ "blorp_string_levenshtein" ]
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);
-      builtins
+      builtins ~void_boxed_args:[ 1 ]
         [
           "blorp_dict_get_int";
           "blorp_dict_get_int8";
@@ -913,16 +964,24 @@ let builtin_contract_table =
       builtins
         [ "blorp_matrix_checked_get_f64"; "blorp_matrix_checked_get_f32" ]
         (bfixed [ Borrow; Borrow; Borrow ] ReturnPrimitive);
-      builtins
+      builtins ~void_boxed_args:[ 2 ] [ "blorp_vector_get_or" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnBorrowed);
+      builtins ~void_boxed_args:[ 2 ] [ "blorp_vector_set" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnVoid);
+      builtins ~void_boxed_args:[ 2 ]
         [
           "blorp_vector_set_cow";
           "blorp_vector_set_cow_nullable";
+          "blorp_checked_set";
+          "blorp_vector_set_inplace";
+        ]
+        (bfixed [ CowConsume; Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
           "blorp_vector_set_cow_f32";
           "blorp_vector_set_cow_nullable_f32";
           "blorp_vector_set_cow_i64";
           "blorp_vector_set_cow_nullable_i64";
-          "blorp_checked_set";
-          "blorp_vector_set_inplace";
           "blorp_vector_set_inplace_packed";
           "blorp_vector_set_inplace_f32";
           "blorp_vector_set_inplace_f64";
@@ -930,14 +989,18 @@ let builtin_contract_table =
           "blorp_vector_set_inplace_f16";
         ]
         (bfixed [ CowConsume; Borrow; Borrow ] ReturnOwned);
-      builtins
+      builtins ~void_boxed_args:[ 3 ]
         [
           "blorp_matrix_checked_set";
+          "blorp_matrix_set_opt";
+          "blorp_matrix_set_opt_nullable";
+        ]
+        (bfixed [ CowConsume; Borrow; Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
           "blorp_matrix_checked_set_f64";
           "blorp_matrix_checked_set_f32";
           "blorp_matrix_checked_set_i64";
-          "blorp_matrix_set_opt";
-          "blorp_matrix_set_opt_nullable";
           "blorp_matrix_set_opt_i64";
           "blorp_matrix_set_opt_nullable_i64";
         ]
@@ -955,12 +1018,11 @@ let builtin_contract_table =
         (bfixed
            [ CowConsume; Borrow; Borrow; Borrow; Borrow; Borrow; Borrow ]
            ReturnOwned);
+      builtins ~void_boxed_args:[ 0 ]
+        [ "blorp_vector_new_fill" ]
+        (bfixed [ Retain; Borrow ] ReturnOwned);
       builtins
-        [
-          "blorp_vector_new_fill";
-          "blorp_vector_new_fill_f64";
-          "blorp_vector_new_fill_f32";
-        ]
+        [ "blorp_vector_new_fill_f64"; "blorp_vector_new_fill_f32" ]
         (bfixed [ Retain; Borrow ] ReturnOwned);
       builtins
         [ "blorp_vector_new_fill_i64" ]
@@ -968,12 +1030,11 @@ let builtin_contract_table =
       builtins
         [ "blorp_vector_new_fill_packed" ]
         (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
+      builtins ~void_boxed_args:[ 0 ]
+        [ "blorp_matrix_new_fill" ]
+        (bfixed [ Retain; Borrow; Borrow ] ReturnOwned);
       builtins
-        [
-          "blorp_matrix_new_fill";
-          "blorp_matrix_new_fill_f64";
-          "blorp_matrix_new_fill_f32";
-        ]
+        [ "blorp_matrix_new_fill_f64"; "blorp_matrix_new_fill_f32" ]
         (bfixed [ Retain; Borrow; Borrow ] ReturnOwned);
       builtins
         [ "blorp_matrix_new_fill_i64" ]
@@ -981,11 +1042,11 @@ let builtin_contract_table =
       builtins
         [ "blorp_matrix_new_fill_packed" ]
         (bfixed [ Borrow; Borrow; Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_tensor3_new" ]
+      builtins ~void_boxed_args:[ 0 ] [ "blorp_tensor3_new" ]
         (bfixed [ Retain; Borrow; Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_tensor4_new" ]
+      builtins ~void_boxed_args:[ 0 ] [ "blorp_tensor4_new" ]
         (bfixed [ Retain; Borrow; Borrow; Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_tensor5_new" ]
+      builtins ~void_boxed_args:[ 0 ] [ "blorp_tensor5_new" ]
         (bfixed [ Retain; Borrow; Borrow; Borrow; Borrow; Borrow ] ReturnOwned);
       (* Vector arithmetic allocates fresh results and borrows all inputs. *)
       builtins
@@ -1160,13 +1221,14 @@ let builtin_contract_table =
     ]
 
 let builtin_contract_sample_arities entry =
-  match entry.builtin_spec with
-  | Builtin_fixed (args, _) -> [ List.length args ]
-  | Builtin_cases cases ->
-      cases
-      |> List.map (fun (args, _) -> List.length args)
-      |> List.sort_uniq compare
-  | Builtin_variadic { min_arity; _ } -> [ min_arity; min_arity + 3 ]
+  builtin_contract_spec_sample_arities entry.builtin_spec
+
+let builtin_void_boxed_arg_positions =
+  builtin_contract_table
+  |> List.filter_map (fun entry ->
+      match entry.builtin_void_boxed_args with
+      | [] -> None
+      | positions -> Some (entry.builtin_name, positions))
 
 let contract_of_builtin_spec spec arity =
   match spec with

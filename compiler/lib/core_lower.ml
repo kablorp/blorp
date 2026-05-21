@@ -83,6 +83,28 @@ let fresh_resource_name () =
   s.lower_resource_counter <- n + 1;
   Printf.sprintf "__resource_%d" n
 
+let fresh_task_scope_id () =
+  let s = Session.current () in
+  let n = s.lower_task_scope_counter in
+  s.lower_task_scope_counter <- n + 1;
+  Core.TaskScopeId n
+
+let current_task_scope_id () =
+  let s = Session.current () in
+  Core.TaskScopeId s.lower_current_task_scope_id
+
+let with_current_task_scope scope f =
+  let s = Session.current () in
+  let previous = s.lower_current_task_scope_id in
+  s.lower_current_task_scope_id <- Core.task_scope_id_to_int scope;
+  match f () with
+  | result ->
+      s.lower_current_task_scope_id <- previous;
+      result
+  | exception exn ->
+      s.lower_current_task_scope_id <- previous;
+      raise exn
+
 let fresh_loop_tuple_name () =
   let s = Session.current () in
   let n = s.lower_destruct_counter in
@@ -242,10 +264,11 @@ let ty_int = TyNamed ("Int", [])
 let ty_module = TyNamed ("Module", [])
 
 let typed_expr_with_type ?(context = "synthetic Core lowering expression")
-    (expr : expr) (ty : type_expr) : TA.expr =
+    ?source_ty ?origin ?resolved_call ?proofs (expr : expr) (ty : type_expr) :
+    TA.expr =
   match
-    TA.of_ast_expr_with_type_info ~context ~semantic_ty:ty ~value_ty:ty
-      ~widening:(Keep ty) expr
+    TA.of_ast_expr_with_type_info ~context ?source_ty ?origin ?resolved_call
+      ?proofs ~semantic_ty:ty ~value_ty:ty ~widening:(Keep ty) expr
   with
   | Ok typed -> typed
   | Error err -> typed_ast_error err
@@ -258,16 +281,7 @@ let typed_ident_expr ~(loc : Ast.loc) (name : string) (ty : type_expr) : TA.expr
 
 let direct_call_core_def_id (call : resolved_call) : int option =
   match call.call_target with
-  | CallDirect
-      {
-        callable_id;
-        origin =
-          ( CallableLocal | CallableImported _ | CallableConstructor _
-          | CallableImplMethod );
-        _;
-      } ->
-      Some callable_id
-  | CallDirect { origin = CallableBuiltin | CallableForeign; _ } -> None
+  | CallDirect { callable_id; _ } -> Some callable_id
   | CallTraitMethod { callable_id = Some callable_id; _ } -> Some callable_id
   | CallTraitMethod { callable_id = None; _ } | CallClosure _ -> None
 
@@ -741,15 +755,23 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
          is a type error in the source, but tolerate it by lowering as a
          singleton block. *)
       lower_block ~loc ~ty [ typed ]
-  | TA.EConcurrentFor (var, iter, body, timeout, max_threads) ->
+  | TA.EConcurrentFor (var, iter, body, timeout, width) ->
+      let parent_scope = current_task_scope_id () in
+      let child_scope = fresh_task_scope_id () in
+      let task_scope =
+        Core.concurrent_task_scope ~parent:parent_scope ~child:child_scope
+      in
       mk
         (CConcurrentFor
            {
              cf_var = Core.Var.named var;
              cf_iter = lower_child_expr iter;
-             cf_body = lower_child_expr body;
+             cf_body =
+               with_current_task_scope child_scope (fun () ->
+                   lower_child_expr body);
              cf_timeout = Option.map lower_child_expr timeout;
-             cf_max_threads = max_threads;
+             cf_width = width;
+             cf_task_scope = task_scope;
              cf_task = None;
            })
   | TA.EDetach inner ->
@@ -778,8 +800,12 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
 and lower_child_expr (e : TA.expr) : Core.core = lower_typed_expr_core e
 
 and typed_with_type (init : TA.expr) (expected : Ast.type_expr) : TA.expr =
-  typed_expr_with_type ~context:"annotated binding lowering" (TA.ast init)
-    expected
+  let info = TA.type_info init in
+  typed_expr_with_type ~context:"annotated binding lowering"
+    ?source_ty:(TA.type_info_source_type info)
+    ~origin:(TA.type_info_origin info)
+    ?resolved_call:(TA.expr_resolved_call init)
+    ~proofs:(TA.type_info_proofs info) (TA.ast init) expected
 
 and lower_binding_init (ty_ann : Ast.type_expr option) (init : TA.expr) :
     Core.core =
@@ -1664,7 +1690,15 @@ and lower_concurrent_bindings (stmts : TA.expr list) : Core.conc_binding list =
     (fun stmt ->
       match typed_expr_desc stmt with
       | TA.EConcurrentBind (name, ty_ann, init) ->
-          let init' = lower_child_expr init in
+          let parent_scope = current_task_scope_id () in
+          let child_scope = fresh_task_scope_id () in
+          let task_scope =
+            Core.concurrent_task_scope ~parent:parent_scope ~child:child_scope
+          in
+          let init' =
+            with_current_task_scope child_scope (fun () ->
+                lower_child_expr init)
+          in
           let bind_ty =
             match ty_ann with Some t -> t | None -> type_of_child_expr stmt
             (* Result[T, ConcurrencyError] from infer *)
@@ -1673,6 +1707,7 @@ and lower_concurrent_bindings (stmts : TA.expr list) : Core.conc_binding list =
             Core.cb_var = Core.Var.named name;
             cb_ty = bind_ty;
             cb_rhs = init';
+            cb_task_scope = task_scope;
             cb_task = None;
           }
       | _ ->

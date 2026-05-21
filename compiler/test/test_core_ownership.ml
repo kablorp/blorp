@@ -123,6 +123,14 @@ let test_channel_new_allocates_owned_channel () =
     { args = [ Borrow ]; result = ReturnOwned }
     (builtin_contract "blorp_channel_new" 1)
 
+let test_channel_send_status_retains_payloads () =
+  check_contract "blorp_channel_try_send_status"
+    { args = [ Borrow; Retain ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_channel_try_send_status" 2);
+  check_contract "blorp_channel_send_timeout_status"
+    { args = [ Borrow; Retain; Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_channel_send_timeout_status" 3)
+
 let test_fixed_constructors_allocate_owned_fixed () =
   let expected = { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned } in
   check_contract "blorp_fixed_new" expected
@@ -168,6 +176,16 @@ let test_vector_get_nullable_borrows_vector_and_index () =
   check_contract "blorp_vector_get_nullable"
     { args = [ Borrow; Borrow ]; result = ReturnOwned }
     (builtin_contract "blorp_vector_get_nullable" 2)
+
+let test_vector_get_or_returns_borrowed_value () =
+  check_contract "blorp_vector_get_or"
+    { args = [ Borrow; Borrow; Borrow ]; result = ReturnBorrowed }
+    (builtin_contract "blorp_vector_get_or" 3)
+
+let test_legacy_vector_set_borrows_value () =
+  check_contract "blorp_vector_set"
+    { args = [ Borrow; Borrow; Borrow ]; result = ReturnVoid }
+    (builtin_contract "blorp_vector_set" 3)
 
 let test_matrix_get_nullable_borrows_matrix_and_indices () =
   check_contract "blorp_matrix_get_nullable"
@@ -720,6 +738,33 @@ let test_builtin_contract_table_entries_are_well_formed () =
   in
   List.iter check builtin_contract_table
 
+let test_builtin_contract_table_void_boxed_args_are_supported () =
+  let check entry =
+    let positions = entry.builtin_void_boxed_args in
+    let sorted = List.sort_uniq Int.compare positions in
+    Alcotest.(check (list int))
+      (entry.builtin_name ^ " has normalized void* ABI arg positions")
+      sorted positions;
+    List.iter
+      (fun pos ->
+        if pos < 0 then
+          Alcotest.failf "%s has negative void* ABI arg position %d"
+            entry.builtin_name pos)
+      positions;
+    match positions with
+    | [] -> ()
+    | _ ->
+        let max_position = List.fold_left max 0 positions in
+        let supported =
+          builtin_contract_spec_has_arg_position entry.builtin_spec max_position
+        in
+        Alcotest.(check bool)
+          (Printf.sprintf "%s has a contract arity covering void* ABI arg %d"
+             entry.builtin_name max_position)
+          true supported
+  in
+  List.iter check builtin_contract_table
+
 let test_builtin_contract_table_rejects_unsupported_arities () =
   let check name arity =
     Alcotest.(check bool)
@@ -829,6 +874,8 @@ let suite =
           test_list_new_allocates_owned_list;
         Alcotest.test_case "channel_new_allocates_owned_channel" `Quick
           test_channel_new_allocates_owned_channel;
+        Alcotest.test_case "channel_send_status_retains_payloads" `Quick
+          test_channel_send_status_retains_payloads;
         Alcotest.test_case "fixed_constructors_allocate_owned_fixed" `Quick
           test_fixed_constructors_allocate_owned_fixed;
         Alcotest.test_case "custom_dict_set_constructors_borrow_callbacks"
@@ -843,6 +890,10 @@ let suite =
           test_dict_get_nullable_borrows_dict_and_key;
         Alcotest.test_case "vector_get_nullable_borrows_vector_and_index" `Quick
           test_vector_get_nullable_borrows_vector_and_index;
+        Alcotest.test_case "vector_get_or_returns_borrowed_value" `Quick
+          test_vector_get_or_returns_borrowed_value;
+        Alcotest.test_case "legacy_vector_set_borrows_value" `Quick
+          test_legacy_vector_set_borrows_value;
         Alcotest.test_case "matrix_get_nullable_borrows_matrix_and_indices"
           `Quick test_matrix_get_nullable_borrows_matrix_and_indices;
         Alcotest.test_case "dict_slot_writes_transfer_payloads" `Quick
@@ -905,6 +956,9 @@ let suite =
           `Quick test_builtin_contract_table_has_no_duplicate_names;
         Alcotest.test_case "builtin_contract_table_entries_are_well_formed"
           `Quick test_builtin_contract_table_entries_are_well_formed;
+        Alcotest.test_case
+          "builtin_contract_table_void_boxed_args_are_supported" `Quick
+          test_builtin_contract_table_void_boxed_args_are_supported;
         Alcotest.test_case "builtin_contract_table_rejects_unsupported_arities"
           `Quick test_builtin_contract_table_rejects_unsupported_arities;
         Alcotest.test_case

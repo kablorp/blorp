@@ -37,7 +37,7 @@ func   pure   var   union   enum   record   struct   void
 while  for    in    if      else   and      or       not
 break  continue    match   import   as       private
 debug  resource     borrow       implements   trait   Self   type   alias
-builtin    foreign      concurrent    detach      where
+builtin    foreign      concurrent    concurrently    detach      where
 True   False
 ```
 
@@ -444,10 +444,15 @@ with_binding = destruct_id [ ":" type_expr ] ( "=" | "?=" ) expr ;
 debug_block = "debug" ":" NEWLINE INDENT stmt_list DEDENT ;
 
 concurrent_expr = "concurrent" [ "(" concurrent_params ")" ] ":" NEWLINE INDENT stmt_list DEDENT
-                | "concurrent" [ "(" concurrent_params ")" ] "for" IDENT "in" expr ":" NEWLINE INDENT stmt_list DEDENT ;
+                | "concurrent" [ "(" concurrent_params ")" ] "for" IDENT "in" expr ":" NEWLINE INDENT stmt_list DEDENT
+                | "for" IDENT "in" expr "concurrently" "(" concurrently_params ")" ":" NEWLINE INDENT stmt_list DEDENT ;
 
 concurrent_params = concurrent_param [ "," concurrent_param ] ;
 concurrent_param  = IDENT ":" expr ;
+
+concurrently_params = concurrently_param { "," concurrently_param } ;
+concurrently_param  = "limit" ":" INT
+                    | "timeout" ":" expr ;
 
 detach_expr = "detach" unary_expr ;
 ```

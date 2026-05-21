@@ -317,6 +317,13 @@ let expr_prec e =
   | ELogical (op, _, _) -> logop_prec op
   | _ -> 100
 
+let detach_body_needs_parens e =
+  match e.expr_desc with
+  | EAssign _ | ESubscriptAssign _ | EVarDecl _ | ETupleDestruct _
+  | EQuestionBind _ | EAscription _ | EBinary _ | ELogical _ | ERange _ ->
+      true
+  | _ -> false
+
 (* ─── Patterns ──────────────────────────────────────────────────────── *)
 
 let rec print_pattern = function
@@ -1035,7 +1042,12 @@ and print_expr_desc = function
         | None -> Nil
       in
       text name ^^ ty_ann ^^ text " = " ^^ print_expr e
-  | EDetach body -> text "detach " ^^ print_expr body
+  | EDetach body ->
+      let body_doc =
+        if detach_body_needs_parens body then parens (print_expr body)
+        else print_expr body
+      in
+      text "detach " ^^ body_doc
   | EDict pairs ->
       let pair_docs =
         List.map
@@ -1043,19 +1055,32 @@ and print_expr_desc = function
           pairs
       in
       text "{" ^^ comma_sep pair_docs ^^ text "}"
-  | EConcurrentFor (var, iter, body, timeout, max_threads) ->
-      let params =
-        match (timeout, max_threads) with
-        | None, None -> Nil
-        | Some t, None -> text "(timeout: " ^^ print_expr t ^^ text ")"
-        | None, Some n -> text (Printf.sprintf "(max_threads: %d)" n)
-        | Some t, Some n ->
-            text (Printf.sprintf "(max_threads: %d, timeout: " n)
-            ^^ print_expr t ^^ text ")"
+  | EConcurrentFor (var, iter, body, timeout, width) ->
+      let head =
+        match (timeout, width) with
+        | None, ConcurrentForLimit n ->
+            text "for " ^^ text var ^^ text " in " ^^ print_expr iter
+            ^^ text (Printf.sprintf " concurrently(limit: %d):" n)
+        | Some t, ConcurrentForLimit n ->
+            text "for " ^^ text var ^^ text " in " ^^ print_expr iter
+            ^^ text (Printf.sprintf " concurrently(limit: %d, timeout: " n)
+            ^^ print_expr t ^^ text "):"
+        | None, ConcurrentForDefault ->
+            text "concurrent for " ^^ text var ^^ text " in " ^^ print_expr iter
+            ^^ text ":"
+        | Some t, ConcurrentForDefault ->
+            text "concurrent(timeout: "
+            ^^ print_expr t ^^ text ") for " ^^ text var ^^ text " in "
+            ^^ print_expr iter ^^ text ":"
+        | None, ConcurrentForMaxThreads n ->
+            text (Printf.sprintf "concurrent(max_threads: %d) for " n)
+            ^^ text var ^^ text " in " ^^ print_expr iter ^^ text ":"
+        | Some t, ConcurrentForMaxThreads n ->
+            text (Printf.sprintf "concurrent(max_threads: %d, timeout: " n)
+            ^^ print_expr t ^^ text ") for " ^^ text var ^^ text " in "
+            ^^ print_expr iter ^^ text ":"
       in
-      text "concurrent" ^^ params ^^ text " for " ^^ text var ^^ text " in "
-      ^^ print_expr iter ^^ text ":"
-      ^^ indent (hardline ^^ print_block_body body)
+      head ^^ indent (hardline ^^ print_block_body body)
   | EFuncDecl fd ->
       (* Nested function declaration. Re-builds the signature inline
          because [print_func_decl] is a separate top-level binding; the

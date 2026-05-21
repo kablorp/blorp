@@ -1433,6 +1433,12 @@ let with_builtins (env : env) : env =
       ~origin:Builtin ()
   in
   let env =
+    add_func env "seal"
+      (ty_func [ ty_channel_t ] ty_void)
+      ~type_params:[ generic_param "T" [] ]
+      ~origin:Builtin ()
+  in
+  let env =
     add_func env "close"
       (ty_func [ ty_channel_t ] ty_void)
       ~type_params:[ generic_param "T" [] ]

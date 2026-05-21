@@ -28,6 +28,7 @@ let ty_test_resource = TyNamed ("TestResource", [])
 let ty_opt_test_resource = TyNamed ("Option", [ ty_test_resource ])
 let ty_file_reader = TyNamed ("std/file::FileReader", [])
 let ty_io_error = TyNamed ("std/file::IOError", [])
+let ty_fixed = TyNamed ("Fixed", [])
 
 let ty_result_file_reader_error =
   TyNamed ("Result", [ ty_file_reader; ty_io_error ])
@@ -957,7 +958,25 @@ let test_lower_concurrent () =
       match blk.conc_bindings with
       | [ a; b ] ->
           Alcotest.(check string) "first" "a" a.cb_var.vname;
-          Alcotest.(check string) "second" "b" b.cb_var.vname
+          Alcotest.(check string) "second" "b" b.cb_var.vname;
+          let a_parent =
+            task_scope_id_to_int a.cb_task_scope.task_parent_scope_id
+          in
+          let a_child =
+            task_scope_id_to_int a.cb_task_scope.task_child_scope_id
+          in
+          let b_parent =
+            task_scope_id_to_int b.cb_task_scope.task_parent_scope_id
+          in
+          let b_child =
+            task_scope_id_to_int b.cb_task_scope.task_child_scope_id
+          in
+          Alcotest.(check int) "first parent scope" 0 a_parent;
+          Alcotest.(check int) "second parent scope" 0 b_parent;
+          Alcotest.(check bool) "first child scope" true (a_child > 0);
+          Alcotest.(check bool) "second child scope" true (b_child > 0);
+          Alcotest.(check bool)
+            "task child scopes are distinct" true (a_child <> b_child)
       | _ -> Alcotest.fail "expected two bindings")
   | _ -> Alcotest.fail "expected CConcurrent"
 
@@ -968,10 +987,11 @@ let test_lower_concurrent_rejects_non_bindings () =
     ~msg_contains:"non-binding statement reached concurrent lowering" (fun () ->
       ignore (lower_expr ast))
 
-(** Regression: concurrent bindings lowered as [conc_bindings] triples, not
-    nested CLets in [conc_body]. Later bindings' RHSes still see earlier
-    names because infer registered them in the typecheck env. *)
-let test_lower_concurrent_bind_scoping () =
+(** Regression: concurrent bindings lower as explicit [conc_bindings] triples,
+    not nested CLets in [conc_body]. User source cannot reference sibling
+    concurrent bindings; this lower-level test preserves explicitly supplied
+    typed binding RHSes. *)
+let test_lower_concurrent_preserves_explicit_bindings () =
   let compute_ty = TyFunc { params = []; return = ty_int; is_pure = true } in
   let f_ty = TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true } in
   let compute_a = mk_ast (ECall (ast_var "compute_a" compute_ty, [])) ty_int in
@@ -994,11 +1014,58 @@ let test_lower_concurrent_bind_scoping () =
 let test_lower_concurrent_for () =
   let range = mk_ast (ERange (ast_int 0, ast_int 10)) ty_range in
   let ast =
-    mk_ast (EConcurrentFor ("i", range, ast_void, None, None)) ty_void
+    mk_ast
+      (EConcurrentFor ("i", range, ast_void, None, ConcurrentForDefault))
+      ty_void
   in
   let c = lower_expr ast in
   match c.desc with
-  | CConcurrentFor _ -> ()
+  | CConcurrentFor cf ->
+      let parent_id =
+        task_scope_id_to_int cf.cf_task_scope.task_parent_scope_id
+      in
+      let child_id =
+        task_scope_id_to_int cf.cf_task_scope.task_child_scope_id
+      in
+      Alcotest.(check int) "root parent scope" 0 parent_id;
+      Alcotest.(check bool) "fresh child scope" true (child_id > 0);
+      Alcotest.(check bool)
+        "child scope differs from parent" true (child_id <> parent_id)
+  | _ -> Alcotest.fail "expected CConcurrentFor"
+
+let test_lower_nested_concurrent_for_task_scopes () =
+  let outer_range = mk_ast (ERange (ast_int 0, ast_int 10)) ty_range in
+  let inner_range = mk_ast (ERange (ast_int 0, ast_int 10)) ty_range in
+  let inner =
+    mk_ast
+      (EConcurrentFor ("j", inner_range, ast_void, None, ConcurrentForDefault))
+      ty_void
+  in
+  let outer =
+    mk_ast
+      (EConcurrentFor ("i", outer_range, inner, None, ConcurrentForDefault))
+      ty_void
+  in
+  let c = lower_expr outer in
+  match c.desc with
+  | CConcurrentFor outer_cf -> (
+      let outer_child_id =
+        task_scope_id_to_int outer_cf.cf_task_scope.task_child_scope_id
+      in
+      match outer_cf.cf_body.desc with
+      | CConcurrentFor inner_cf ->
+          let inner_parent_id =
+            task_scope_id_to_int inner_cf.cf_task_scope.task_parent_scope_id
+          in
+          let inner_child_id =
+            task_scope_id_to_int inner_cf.cf_task_scope.task_child_scope_id
+          in
+          Alcotest.(check int)
+            "inner parent is outer child" outer_child_id inner_parent_id;
+          Alcotest.(check bool)
+            "inner child is fresh" true
+            (inner_child_id <> inner_parent_id)
+      | _ -> Alcotest.fail "expected nested CConcurrentFor")
   | _ -> Alcotest.fail "expected CConcurrentFor"
 
 (* ============================================================================
@@ -1903,6 +1970,75 @@ let test_core_lower_qualified_call_carries_selected_call_kind () =
               "expected qualified call to preserve CField and carry selected \
                callable id on call kind"))
 
+(** Annotated local bindings rewrap the initializer with the declared slot type.
+    That must not discard resolved-call metadata, or qualified imported calls
+    lower as closure field dispatch (e.g. [F->fixed]) instead of the selected
+    function. *)
+let test_core_lower_annotated_binding_preserves_resolved_call_def_id () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let module_ty = TyNamed ("Module", []) in
+        let callee_ty =
+          TyFunc { params = [ ty_int ]; return = ty_fixed; is_pure = true }
+        in
+        let alias = ast_var "F" module_ty in
+        let callee = mk_ast (EFieldAccess (alias, "fixed")) callee_ty in
+        let resolved_call =
+          {
+            call_syntax = CallQualified "std/fixed";
+            call_target =
+              CallDirect
+                {
+                  callable_id = 777;
+                  source_name = "fixed";
+                  call_pure = true;
+                  origin = CallableImported "std/fixed";
+                };
+            instantiated_params = [ ty_int ];
+            instantiated_return = ty_fixed;
+          }
+        in
+        let init =
+          Blorp.Ast.with_expr_resolved_call
+            (mk_ast (ECall (callee, [ ast_int 2 ])) ty_fixed)
+            resolved_call
+        in
+        let binding =
+          mk_ast (EVarDecl ("price", Some ty_fixed, init, false)) ty_void
+        in
+        let block = ast_block [ binding; ast_var "price" ty_fixed ] ty_fixed in
+        let core = lower_expr block in
+        match core.desc with
+        | CLet
+            ( {
+                bind_rhs =
+                  {
+                    desc =
+                      CCall
+                        ( CKSelectedDirect 777,
+                          {
+                            desc =
+                              CField
+                                ( {
+                                    desc =
+                                      CVar { vname = "F"; vdef_id = None; _ };
+                                    _;
+                                  },
+                                  "fixed" );
+                            _;
+                          },
+                          _ );
+                    _;
+                  };
+                _;
+              },
+              _ ) ->
+            ()
+        | _ ->
+            Alcotest.fail
+              "expected annotated binding initializer to retain qualified \
+               selected call kind"))
+
 (** A3.3: non-UFCS idents lower to CVar with vdef_id = None. *)
 let test_core_lower_non_ufcs_ident_has_no_def_id () =
   Blorp.Session.(
@@ -2164,9 +2300,11 @@ let suite =
         Alcotest.test_case "concurrent" `Quick test_lower_concurrent;
         Alcotest.test_case "concurrent_rejects_non_bindings" `Quick
           test_lower_concurrent_rejects_non_bindings;
-        Alcotest.test_case "concurrent_bind_scope" `Quick
-          test_lower_concurrent_bind_scoping;
+        Alcotest.test_case "concurrent_preserves_explicit_bindings" `Quick
+          test_lower_concurrent_preserves_explicit_bindings;
         Alcotest.test_case "concurrent_for" `Quick test_lower_concurrent_for;
+        Alcotest.test_case "nested_concurrent_for_task_scopes" `Quick
+          test_lower_nested_concurrent_for_task_scopes;
       ] );
     ( "invariants",
       [
@@ -2239,6 +2377,8 @@ let suite =
           test_core_lower_call_uses_resolved_call_def_id;
         Alcotest.test_case "core_lower qualified call carries selected kind"
           `Quick test_core_lower_qualified_call_carries_selected_call_kind;
+        Alcotest.test_case "annotated binding preserves resolved call" `Quick
+          test_core_lower_annotated_binding_preserves_resolved_call_def_id;
         Alcotest.test_case "non-ufcs ident has no vdef_id" `Quick
           test_core_lower_non_ufcs_ident_has_no_def_id;
       ] );

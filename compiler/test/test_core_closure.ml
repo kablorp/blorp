@@ -18,6 +18,16 @@ let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int
 let cstr s = mk (CLit (LitString (s, str_flags))) ty_string
 let fn_ty params return is_pure = TyFunc { params; return; is_pure }
 
+let task_capture_kind_name = function
+  | TaskCopyCapture -> "copy"
+  | TaskMoveResourceItem -> "move_resource_item"
+  | TaskStructuredTaskBorrow -> "structured_task_borrow"
+
+let task_capture_summary capture =
+  ( capture.task_capture_name,
+    Blorp.Types.type_to_string capture.task_capture_ty,
+    task_capture_kind_name capture.task_capture_kind )
+
 let mk_func ?(is_pure = false) name params return body def_id : core_func =
   {
     cf_name = name;
@@ -442,6 +452,7 @@ let test_concurrent_binding_gets_task_closure_metadata () =
                        cb_var = Var.named "a";
                        cb_ty = result_string_ty;
                        cb_rhs = task_rhs;
+                       cb_task_scope = synthetic_concurrent_task_scope;
                        cb_task = None;
                      };
                    ];
@@ -463,12 +474,10 @@ let test_concurrent_binding_gets_task_closure_metadata () =
                 Alcotest.(check int)
                   "one capture" 1
                   (List.length task.tc_captures);
-                Alcotest.(check (list (pair string string)))
+                Alcotest.(check (list (triple string string string)))
                   "capture metadata"
-                  [ ("s", "String") ]
-                  (List.map
-                     (fun (n, ty) -> (n, Blorp.Types.type_to_string ty))
-                     task.tc_captures);
+                  [ ("s", "String", "copy") ]
+                  (List.map task_capture_summary task.tc_captures);
                 let task_func = require_func "_blorp_task_0" converted in
                 Alcotest.(check bool)
                   "task closure hoisted" true
@@ -497,12 +506,10 @@ let test_detach_gets_task_closure_metadata () =
             Alcotest.(check string)
               "detached task returns void" "Void"
               (Blorp.Types.type_to_string task.tc_return_ty);
-            Alcotest.(check (list (pair string string)))
+            Alcotest.(check (list (triple string string string)))
               "capture metadata"
-              [ ("s", "String") ]
-              (List.map
-                 (fun (n, ty) -> (n, Blorp.Types.type_to_string ty))
-                 task.tc_captures);
+              [ ("s", "String", "copy") ]
+              (List.map task_capture_summary task.tc_captures);
             let task_func = require_func "_blorp_task_0" converted in
             Alcotest.(check bool)
               "task closure hoisted" true
@@ -530,7 +537,8 @@ let test_concurrent_for_gets_task_closure_metadata () =
                  cf_iter = cvar "items" list_string_ty;
                  cf_body = cvar "item" ty_string;
                  cf_timeout = None;
-                 cf_max_threads = None;
+                 cf_width = ConcurrentForDefault;
+                 cf_task_scope = synthetic_concurrent_task_scope;
                  cf_task = None;
                })
             result_list_ty
@@ -549,12 +557,10 @@ let test_concurrent_for_gets_task_closure_metadata () =
             Alcotest.(check string)
               "per-iteration task return" "String"
               (Blorp.Types.type_to_string task.tc_return_ty);
-            Alcotest.(check (list (pair string string)))
+            Alcotest.(check (list (triple string string string)))
               "capture metadata"
-              [ ("item", "String") ]
-              (List.map
-                 (fun (n, ty) -> (n, Blorp.Types.type_to_string ty))
-                 task.tc_captures);
+              [ ("item", "String", "copy") ]
+              (List.map task_capture_summary task.tc_captures);
             let task_func = require_func "_blorp_task_0" converted in
             Alcotest.(check bool)
               "task closure hoisted" true

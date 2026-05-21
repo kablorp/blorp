@@ -1146,15 +1146,18 @@ let stack_result_constructor_abi_of_layout = function
       { src_result_c_type = "blorp_StackResult" }
 
 let box_kind layout =
-  match layout.storage with
-  | Erased ErasedFloat -> Core.BoxFloat
-  | Erased ErasedFloat32 -> Core.BoxFloat32
-  | Erased ErasedFloat16 -> Core.BoxFloat16
-  | Erased ErasedInt128 -> Core.BoxInt128
-  | Erased ErasedUInt128 -> Core.BoxUInt128
-  | Erased ErasedPointer -> Core.BoxPointer
-  | Erased ErasedPrim -> Core.BoxPrim
-  | Erased (ErasedStruct c_ty) -> Core.BoxStruct c_ty
+  match Codegen_types.normalize_type layout.semantic with
+  | Ast.TyNamed ("Void", []) -> Core.BoxVoid
+  | _ -> (
+      match layout.storage with
+      | Erased ErasedFloat -> Core.BoxFloat
+      | Erased ErasedFloat32 -> Core.BoxFloat32
+      | Erased ErasedFloat16 -> Core.BoxFloat16
+      | Erased ErasedInt128 -> Core.BoxInt128
+      | Erased ErasedUInt128 -> Core.BoxUInt128
+      | Erased ErasedPointer -> Core.BoxPointer
+      | Erased ErasedPrim -> Core.BoxPrim
+      | Erased (ErasedStruct c_ty) -> Core.BoxStruct c_ty)
 
 let unbox_kind layout =
   match layout.storage with

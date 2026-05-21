@@ -164,7 +164,8 @@ let collect_task_closure ~reg ~loc (task : Core.task_closure) acc =
     else make_site ~reg ~kind:TaskReturn ~loc task.tc_return_ty :: acc
   in
   List.fold_left
-    (fun acc (name, ty) ->
+    (fun acc capture ->
+      let name, ty = Core.task_capture_binding capture in
       make_site ~reg ~kind:(TaskCapture name) ~loc ty :: acc)
     acc task.tc_captures
 

@@ -39,135 +39,10 @@ let option_equality_builtin_for_type ~reg ~loc option_ty =
            add a layout-owned equality strategy for this payload type."
         "cannot lower Option equality safely: %s" reason
 
-(* Grouped by subsystem. When adding a runtime function that takes void*,
-   add it here so the Core IR carries explicit boxing before final
-   preparation. Final invariants reject unboxed scalar/value args in these
-   positions rather than relying on emitter-side recovery. *)
-
-(** Per-builtin map: for each function name, the {b 0-indexed} arg positions
-    whose declared type is [void*] (and so need their value boxed before
-    the call).  Args not in the list are passed by value (e.g. [long]
-    indices for [blorp_list_set]).
-
-    Used in two phases:
-    1. IR-level ([specialize_expr] below) — wraps the listed args in
-       [CBox] nodes so the IR is self-describing.
-    2. Final invariant ([Core_invariants]) — rejects scalar/value args that
-       still are not explicit [CBoxTyped] after [Core_codegen_prepare].
-
-    Keep these positions in sync with the runtime signatures in
-    [runtime.c] / [runtime_decl.c]. *)
-let void_boxed_arg_positions =
-  [
-    (* -- Option / Result ------------------------------------------------- *)
-    ("blorp_option_some", [ 0 ]);
-    (* value *)
-    ("blorp_result_ok", [ 0 ]);
-    (* value *)
-    ("blorp_result_err", [ 0 ]);
-    (* value *)
-    (* -- List ------------------------------------------------------------- *)
-    ("blorp_list_append", [ 1 ]);
-    (* element *)
-    ("blorp_list_append_owned", [ 1 ]);
-    (* element *)
-    (* -- Vector / Tensor -------------------------------------------------- *)
-    ("blorp_vector_new_fill", [ 0 ]);
-    (* value *)
-    ("blorp_matrix_new_fill", [ 0 ]);
-    (* value *)
-    ("blorp_tensor3_new", [ 0 ]);
-    (* value *)
-    ("blorp_tensor4_new", [ 0 ]);
-    (* value *)
-    ("blorp_tensor5_new", [ 0 ]);
-    (* value *)
-    ("blorp_vector_get_or", [ 2 ]);
-    (* default_val *)
-    ("blorp_vector_set", [ 2 ]);
-    (* value *)
-    ("blorp_checked_set", [ 2 ]);
-    (* value *)
-    ("blorp_vector_set_inplace", [ 2 ]);
-    (* value *)
-    ("blorp_vector_set_cow", [ 2 ]);
-    (* value *)
-    ("blorp_vector_set_cow_nullable", [ 2 ]);
-    (* value *)
-    ("blorp_matrix_checked_set", [ 3 ]);
-    (* val — 4th arg *)
-    ("blorp_matrix_set_opt", [ 3 ]);
-    (* val — 4th arg *)
-    ("blorp_matrix_set_opt_nullable", [ 3 ]);
-    (* val — 4th arg *)
-    (* -- Dict ------------------------------------------------------------- *)
-    ("blorp_dict_get", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_nullable", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_int", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_int8", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_int16", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_int32", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_int64", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_uint8", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_uint16", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_uint32", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_uint64", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_float", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_bool", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_char", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_f32", [ 1 ]);
-    (* key *)
-    ("blorp_dict_get_f16", [ 1 ]);
-    (* key *)
-    ("blorp_dict_insert", [ 1; 2 ]);
-    (* key, value *)
-    ("blorp_dict_remove", [ 1 ]);
-    (* key *)
-    (* -- Set -------------------------------------------------------------- *)
-    ("blorp_set_add", [ 1 ]);
-    (* key *)
-    ("blorp_set_remove", [ 1 ]);
-    (* key *)
-    (* -- Parallel / stream folds ----------------------------------------- *)
-    ("blorp_fold_parallel", [ 1 ]);
-    (* init *)
-    ("blorp_fold_parallel_ordered", [ 1 ]);
-    (* init *)
-    ("blorp_fold_parallel_with", [ 1 ]);
-    (* init *)
-    ("blorp_fold_parallel_ordered_with", [ 1 ]);
-    (* init *)
-    ("blorp_vfold_parallel", [ 1 ]);
-    (* init *)
-    ("blorp_vfold_parallel_with", [ 1 ]);
-    (* init *)
-    ("blorp_stream_fold", [ 1 ]);
-    (* init *)
-    ("blorp_fallible_stream_fold_file_raw", [ 1 ]);
-    (* init *)
-    (* -- Channel ---------------------------------------------------------- *)
-    ("blorp_channel_send", [ 1 ]);
-    (* value *)
-    ("blorp_channel_send_timeout", [ 1 ]);
-    (* value *)
-    ("blorp_channel_try_send", [ 1 ]);
-    (* value *)
-  ]
-
+(* Runtime void* ABI slots live on Core_ownership builtin contract entries so
+   ownership and argument boxing cannot drift independently. Core_specialize
+   consumes the derived map to insert explicit CBox nodes before final Core. *)
+let void_boxed_arg_positions = Core_ownership.builtin_void_boxed_arg_positions
 let is_pointer_type ~reg ty = Core_layout_type.is_pointer_type ~reg ty
 let tensor_type ?reg ty = Core_tensor_type.of_type ~reg:(effective_reg reg) ty
 
@@ -489,7 +364,7 @@ let specialize_to_string ~reg (e : core) callee arg : core =
       builtin ts_fn
   | Ast.TyNamed ("StringSlice", _) -> builtin "Stringable_to_string_StringSlice"
   | Ast.TyNamed ("Url", _) -> builtin "Stringable_to_string_Url"
-  | Ast.TyNamed ("Fixed", _) -> builtin "std_fixed__to_string"
+  | Ast.TyNamed ("Fixed", _) -> builtin "blorp_fixed_to_string"
   | _ ->
       (* No Stringable impl for this type.  The [to_string] sentinel was
          registered in [env_builtins] with a [T: Stringable] bound; if we
@@ -590,7 +465,7 @@ let specialize_debug_string ~reg (e : core) callee arg : core =
       builtin fn
   | Ast.TyNamed ("StringSlice", _) -> builtin "Stringable_to_string_StringSlice"
   | Ast.TyNamed ("Url", _) -> builtin "Stringable_to_string_Url"
-  | Ast.TyNamed ("Fixed", _) -> builtin "std_fixed__to_string"
+  | Ast.TyNamed ("Fixed", _) -> builtin "blorp_fixed_to_string"
   (* Opaque types — no meaningful structural view; emit a placeholder.
      Note: this skips evaluating [arg], which is OK for pure refs
      (the callee was already looked up as a value). If [arg] is a

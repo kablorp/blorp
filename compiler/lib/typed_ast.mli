@@ -132,7 +132,8 @@ type expr_desc =
   | EDebugBlock of expr list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr
-  | EConcurrentFor of string * expr * expr * expr option * int option
+  | EConcurrentFor of
+      string * expr * expr * expr option * Ast.concurrent_for_width
   | EDetach of expr
   | EDict of (expr * expr) list
   | EBuiltin of string option

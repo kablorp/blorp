@@ -16,13 +16,45 @@ union ConcurrencyError:
 	TaskFailed(String)
 
 
+-- Outcome returned by typed channel send-attempt helpers.
+union SendAttempt:
+	SendAccepted
+	SendWouldBlock
+	SendSealed
+	SendTimedOut
+
+
+-- Error returned by typed channel send helpers when a channel has been sealed.
+union ChannelSealed:
+	Sealed
+
+
+private func __try_send_status[T](ch: Channel[T], val: T) -> Int:
+	builtin("blorp_channel_try_send_status")
+
+
+private func __send_timeout_status[T](ch: Channel[T], val: T, ms: Int) -> Int:
+	builtin("blorp_channel_send_timeout_status")
+
+
+private pure func __send_attempt_from_status(status: Int) -> SendAttempt:
+	if status == 0:
+		SendAccepted
+	else if status == 1:
+		SendWouldBlock
+	else if status == 2:
+		SendSealed
+	else:
+		SendTimedOut
+
+
 -- ============================================================================
 -- Channel construction
 -- ============================================================================
 ---
 Create a bounded channel with the given capacity.
 Sending when full blocks until a slot is free; receiving when empty blocks
-until a value arrives or the channel is closed.
+until a value arrives or the channel is sealed.
 ---
 func channel[T](capacity: Int) -> Channel[T]:
 	builtin
@@ -33,15 +65,43 @@ func channel[T](capacity: Int) -> Channel[T]:
 -- ============================================================================
 ---
 Send a value. Blocks if the channel is full. Returns False if the channel
-is closed.
+is sealed.
 ---
 func send[T](ch: Channel[T], val: T) -> Bool:
 	builtin
 
 
 ---
+Send a value, blocking if the channel is full. Returns Ok(void) if the value
+was accepted, or Err(Sealed) if the channel has been sealed.
+
+Use this when backpressure is intentional and the sealed case should remain
+visible in the type.
+
+doctests:
+    :: wait_send accepts a value
+    ch: Channel[Int] = channel(1)
+    match wait_send(ch, 7):
+        Ok(_): recv(ch) == Some(7)
+        Err(_): False
+
+    :: wait_send reports a sealed channel
+    ch: Channel[Int] = channel(1)
+    seal(ch)
+    match wait_send(ch, 7):
+        Ok(_): False
+        Err(Sealed): True
+---
+func wait_send[T](ch: Channel[T], val: T) -> Result[Void, ChannelSealed]:
+	if send(ch, val):
+		Ok(void)
+	else:
+		Err(Sealed)
+
+
+---
 Receive a value. Blocks if the channel is empty. Returns None once the
-channel is closed and drained.
+channel is sealed and drained.
 ---
 func recv[T](ch: Channel[T]) -> Option[T]:
 	builtin
@@ -52,15 +112,38 @@ func recv[T](ch: Channel[T]) -> Option[T]:
 -- ============================================================================
 ---
 Non-blocking send. Returns False immediately if the channel is full or
-closed.
+sealed.
 ---
 func try_send[T](ch: Channel[T], val: T) -> Bool:
 	builtin
 
 
 ---
+Non-blocking send with a typed outcome. Returns SendAccepted when the value was
+accepted, SendWouldBlock when the channel is full, or SendSealed when no more
+sends are accepted.
+
+doctests:
+    :: try_send_attempt accepts when capacity is available
+    ch: Channel[Int] = channel(1)
+    match try_send_attempt(ch, 7):
+        SendAccepted: recv(ch) == Some(7)
+        _: False
+
+    :: try_send_attempt reports a full channel
+    ch: Channel[Int] = channel(1)
+    _ = send(ch, 1)
+    match try_send_attempt(ch, 2):
+        SendWouldBlock: True
+        _: False
+---
+func try_send_attempt[T](ch: Channel[T], val: T) -> SendAttempt:
+	__send_attempt_from_status(__try_send_status(ch, val))
+
+
+---
 Non-blocking receive. Returns None immediately if the channel is empty
-or closed.
+or sealed.
 ---
 func try_recv[T](ch: Channel[T]) -> Option[T]:
 	builtin
@@ -71,7 +154,8 @@ func try_recv[T](ch: Channel[T]) -> Option[T]:
 -- ============================================================================
 ---
 Receive with a timeout in milliseconds. Returns None on timeout or if
-the channel is closed.
+the channel is sealed. A timeout less than or equal to 0 does not wait, but
+still receives a value already available in the channel.
 ---
 func recv_timeout[T](ch: Channel[T], ms: Int) -> Option[T]:
 	builtin
@@ -79,18 +163,52 @@ func recv_timeout[T](ch: Channel[T], ms: Int) -> Option[T]:
 
 ---
 Send with a timeout in milliseconds. Returns False on timeout, full
-channel, or closed channel.
+channel, or sealed channel. A timeout less than or equal to 0 does not wait,
+but still sends if capacity is already available.
 ---
 func send_timeout[T](ch: Channel[T], val: T, ms: Int) -> Bool:
 	builtin
+
+
+---
+Send with a timeout and a typed outcome. Returns SendAccepted when the value
+was accepted, SendTimedOut when capacity did not become available in time, or
+SendSealed when no more sends are accepted. A timeout less than or equal to 0
+does not wait, but still sends if capacity is already available.
+
+doctests:
+    :: send_timeout_attempt accepts when capacity is available
+    ch: Channel[Int] = channel(1)
+    match send_timeout_attempt(ch, 7, 100):
+        SendAccepted: recv(ch) == Some(7)
+        _: False
+
+    :: send_timeout_attempt reports a sealed channel
+    ch: Channel[Int] = channel(1)
+    seal(ch)
+    match send_timeout_attempt(ch, 7, 100):
+        SendSealed: True
+        _: False
+---
+func send_timeout_attempt[T](ch: Channel[T], val: T, ms: Int) -> SendAttempt:
+	__send_attempt_from_status(__send_timeout_status(ch, val, ms))
 
 
 -- ============================================================================
 -- Lifecycle
 -- ============================================================================
 ---
-Close the channel. Further sends fail; values already in flight are still
-deliverable via recv/try_recv. Idempotent.
+Seal the channel. Further sends fail; values already in flight are still
+deliverable via recv/try_recv. Receivers get None once the channel is sealed
+and drained. Idempotent.
+---
+func seal[T](ch: Channel[T]) -> Void:
+	builtin("blorp_channel_close")
+
+
+---
+Compatibility alias for seal. Further sends fail; values already in flight are
+still deliverable via recv/try_recv. Idempotent.
 ---
 func close[T](ch: Channel[T]) -> Void:
 	builtin

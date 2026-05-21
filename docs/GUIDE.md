@@ -1938,7 +1938,7 @@ private func helper(x: Int) -> Int:
 
 ## 9. Concurrency
 
-blorp provides structured concurrency primitives: `concurrent:` blocks for parallel computation with automatic joining, `concurrent for` for dynamic fan-out, `detach` for fire-and-forget tasks, and `Channel[T]` for inter-thread communication.
+blorp provides structured concurrency primitives: `concurrent:` blocks for parallel computation with automatic joining, `for ... concurrently(limit: N)` for dynamic fan-out with explicit width, `detach` for fire-and-forget tasks, and `Channel[T]` for inter-thread communication. The older `concurrent for` spelling is still accepted during the migration window.
 
 ### Concurrent Blocks
 
@@ -2005,7 +2005,7 @@ continuing, so code after that point does not run. Resources acquired with
 computation loop will not be interrupted by a timeout. If you need
 interruptible compute, insert periodic `sleep(0)` calls.
 
-### Concurrent For
+### Concurrent Loops
 
 Fan out work across a list and collect results:
 
@@ -2019,8 +2019,8 @@ func compute_square(n: Int) -> Int:
 func main(args: List[String]) -> Int:
     numbers: List[Int] = range(1, 11)
 
-    -- Each element processed in parallel
-    results: List[Result[Int, ConcurrencyError]] = concurrent for n in numbers:
+    -- Each element is processed concurrently; the explicit limit makes width visible.
+    results: List[Result[Int, ConcurrencyError]] = for n in numbers concurrently(limit: 4):
         compute_square(n)
 
     -- Collect successful results
@@ -2123,12 +2123,15 @@ func process(i: Int) -> Int:
 
 func fiber_example(items: List[Int]) -> List[Result[Int, ConcurrencyError]]:
     -- 50 tasks sleeping concurrently on 4 threads — completes in ~50ms, not 625ms
-    concurrent(max_threads: 4) for i in items:
+    for i in items concurrently(limit: 4):
         sleep(50)
         process(i)
 ```
 
-Fibers are transparent to user code — no API changes needed.
+Fibers are transparent to user code — no API changes needed. During the
+concurrency migration, `limit` uses the existing scheduler-width machinery; the
+roadmap tightens it into a per-loop active-task cap before the old
+`concurrent for` spelling is removed.
 
 ### Pipeline Example
 

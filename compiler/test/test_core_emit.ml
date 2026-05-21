@@ -2817,6 +2817,7 @@ let test_emit_concurrent_block () =
       cb_ty = ty_int;
       cb_rhs =
         mk (CCall (CKUser ("compute_a", None), cvar "compute_a" fty, [])) ty_int;
+      cb_task_scope = synthetic_concurrent_task_scope;
       cb_task = None;
     }
   in
@@ -2826,6 +2827,7 @@ let test_emit_concurrent_block () =
       cb_ty = ty_int;
       cb_rhs =
         mk (CCall (CKUser ("compute_b", None), cvar "compute_b" fty, [])) ty_int;
+      cb_task_scope = synthetic_concurrent_task_scope;
       cb_task = None;
     }
   in
@@ -2885,6 +2887,7 @@ let test_emit_concurrent_program () =
       cb_ty = ty_int;
       cb_rhs =
         mk (CCall (CKUser ("compute", None), cvar "compute" fty, [])) ty_int;
+      cb_task_scope = synthetic_concurrent_task_scope;
       cb_task = None;
     }
   in
@@ -2930,6 +2933,7 @@ let test_emit_concurrent_capture_release_mask () =
       cb_var = Var.named "a";
       cb_ty = result_ty;
       cb_rhs = cvar "s" ty_string;
+      cb_task_scope = synthetic_concurrent_task_scope;
       cb_task = None;
     }
   in
@@ -2980,6 +2984,7 @@ let test_emit_concurrent_stack_result_join_conversion () =
       cb_var = Var.named "r";
       cb_ty = ty_result_int_bool;
       cb_rhs = cint 7;
+      cb_task_scope = synthetic_concurrent_task_scope;
       cb_task = None;
     }
   in
@@ -3034,7 +3039,8 @@ let test_emit_concurrent_for_rc_result_uses_spawn_rc () =
            cf_iter = cvar "items" list_string_ty;
            cf_body = cvar "item" ty_string;
            cf_timeout = None;
-           cf_max_threads = None;
+           cf_width = ConcurrentForDefault;
+           cf_task_scope = synthetic_concurrent_task_scope;
            cf_task = None;
          })
       (TyNamed ("List", [ result_string_ty ]))
@@ -5292,6 +5298,81 @@ let expect_core_error_at ~needle ~line f =
       Alcotest.failf "expected Core_error, got %s" (Printexc.to_string e)
   | _ -> Alcotest.fail "expected Core_error, got normal return"
 
+let unsupported_task_capture_task return_ty =
+  {
+    tc_func = "_blorp_task_bad_capture";
+    tc_def_id = 9001;
+    tc_captures =
+      [
+        {
+          task_capture_name = "resource";
+          task_capture_ty = ty_test_resource;
+          task_capture_kind = TaskMoveResourceItem;
+        };
+      ];
+    tc_return_ty = return_ty;
+  }
+
+let test_emit_rejects_unsupported_task_capture_kind () =
+  let rhs = { desc = CLit (LitInt 1L); ty = ty_int; loc = invariant_loc } in
+  let task = unsupported_task_capture_task rhs.ty in
+  let result_ty =
+    TyNamed ("Result", [ ty_int; TyNamed ("ConcurrencyError", []) ])
+  in
+  let binding =
+    {
+      cb_var = Var.named "answer";
+      cb_ty = result_ty;
+      cb_rhs = rhs;
+      cb_task_scope = synthetic_concurrent_task_scope;
+      cb_task = Some task;
+    }
+  in
+  let block =
+    {
+      desc =
+        CConcurrent
+          {
+            conc_bindings = [ binding ];
+            conc_body = cvoid;
+            conc_timeout = None;
+            conc_max_threads = None;
+          };
+      ty = ty_void;
+      loc = invariant_loc;
+    }
+  in
+  expect_core_error_at ~needle:"unsupported concurrent binding task capture"
+    ~line:42 (fun () -> ignore (emit_stmt_to_string block));
+  let detach =
+    {
+      desc = CDetach { detach_body = rhs; detach_task = Some task };
+      ty = ty_void;
+      loc = invariant_loc;
+    }
+  in
+  expect_core_error_at ~needle:"unsupported detach task capture" ~line:42
+    (fun () -> ignore (emit_stmt_to_string detach));
+  let concurrent_for =
+    {
+      desc =
+        CConcurrentFor
+          {
+            cf_var = Var.named "item";
+            cf_iter = cvar "items" (TyNamed ("List", [ ty_int ]));
+            cf_body = rhs;
+            cf_timeout = None;
+            cf_width = ConcurrentForDefault;
+            cf_task_scope = synthetic_concurrent_task_scope;
+            cf_task = Some task;
+          };
+      ty = TyNamed ("List", [ result_ty ]);
+      loc = invariant_loc;
+    }
+  in
+  expect_core_error_at ~needle:"unsupported concurrent-for task capture"
+    ~line:42 (fun () -> ignore (emit_stmt_to_string concurrent_for))
+
 let test_emit_invariant_cmatch_expr () =
   (* Raw CMatchArms should never reach emit_expr — it should have been
      compiled to decision-tree CMatch by core_match. If we construct
@@ -5420,7 +5501,8 @@ let test_emit_invariant_concurrent_for_requires_list () =
             cf_iter = iter;
             cf_body = cvar "item" ty_string;
             cf_timeout = None;
-            cf_max_threads = None;
+            cf_width = ConcurrentForDefault;
+            cf_task_scope = synthetic_concurrent_task_scope;
             cf_task = Some task;
           };
       ty =
@@ -5455,6 +5537,8 @@ let suite =
           test_emit_invariant_for_unsupported_iterable;
         Alcotest.test_case "for malformed Dict" `Quick
           test_emit_invariant_for_malformed_dict;
+        Alcotest.test_case "unsupported task capture kind" `Quick
+          test_emit_rejects_unsupported_task_capture_kind;
         Alcotest.test_case "concurrent for non-List" `Quick
           test_emit_invariant_concurrent_for_requires_list;
       ] );

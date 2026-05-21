@@ -1579,7 +1579,7 @@ let lambda_has_runtime_captures (env : type_env) (lam : lambda) : bool =
         match d.detach_task with
         | Some task ->
             List.exists
-              (fun (name, _) -> is_free_name bound name)
+              (fun capture -> is_free_name bound capture.task_capture_name)
               task.tc_captures
         | None -> false)
     | _ ->

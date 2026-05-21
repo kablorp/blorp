@@ -201,16 +201,14 @@ type t = {
      within one compile" invariant that prior attempts (Phase 2.1,
      reverted) broke by making the tables per-call fresh.
 
-     [Env.empty ()] reads [Session.current ()] and aliases these
-     hashtables into the env record, so every existing
-     [env.overloads] / [env.impl_index] / [env.ufcs_methods] call
-     site reads/writes the session's tables through the alias with
-     no signature churn. *)
+     [Env.empty ()] reads [Session.current ()] and aliases the impl/UFCS
+     hashtables into the env record. Ordinary function overloads are now
+     env-local lexical state; [overloads] remains here only for older callers
+     that inspect session shape directly. *)
   overloads : (string, Env_types.overload_entry list) Hashtbl.t;
-      (** Overload sets keyed by function name. Written by [Env.add_overload]
-      when a module's imports register paired pure/impure signatures or
-      cross-module function name collisions. Read by [Env.get_overloads]
-      / [Env.resolve_overload] during call-site dispatch. *)
+      (** Legacy session field for overload sets keyed by function name.
+      [Env.empty] does not alias this table; each env owns its overloads so
+      one module's imports cannot affect another module's name resolution. *)
   impl_index : (string, Env_types.impl_instance list) Hashtbl.t;
       (** Impls indexed by trait name. Written by [Env.add_impl]. Read by
       Env's trait-obligation resolver / trait-method dispatch. *)
@@ -261,6 +259,13 @@ type t = {
   mutable lower_resource_counter : int;
       (** Next [__resource_N] id used by [Core_lower] for anonymous resource
       guards and internal payload names in fallible resource acquisition. *)
+  mutable lower_task_scope_counter : int;
+      (** Next child task-scope id used by [Core_lower] when lowering
+      structured task-spawning constructs. Scope id 0 is reserved for the
+      root task. *)
+  mutable lower_current_task_scope_id : int;
+      (** Current lexical task scope while [Core_lower] recursively lowers
+      nested task bodies. The root task scope is id 0. *)
   mutable desugar_counter : int;
       (** Next fresh-id used by [Core_desugar] for CRecordUpdate
       temporaries and string-interp rewriting. *)
@@ -299,6 +304,8 @@ let create () : t =
     lower_param_counter = 0;
     lower_question_bind_counter = 0;
     lower_resource_counter = 0;
+    lower_task_scope_counter = 1;
+    lower_current_task_scope_id = 0;
     desugar_counter = 0;
     ssa_mut_counter = 0;
   }
@@ -312,6 +319,8 @@ let reset_core_counters (s : t) : unit =
   s.lower_param_counter <- 0;
   s.lower_question_bind_counter <- 0;
   s.lower_resource_counter <- 0;
+  s.lower_task_scope_counter <- 1;
+  s.lower_current_task_scope_id <- 0;
   s.desugar_counter <- 0;
   s.ssa_mut_counter <- 0;
   (* Reset [def_id_counter] too so repeated compiles of the same source yield

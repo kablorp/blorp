@@ -112,12 +112,76 @@ type concurrent_params = {
   conc_max_threads: int option;
 }
 
+type concurrently_loop_params = {
+  loop_timeout: expr option;
+  loop_limit: int option;
+}
+
 let concurrent_max_threads_or_error loc n =
   if Int64.compare n 0L <= 0 then
     raise (Parse_error_at (loc, "max_threads must be positive"))
   else if Int64.compare n (Int64.of_int max_int) > 0 then
     raise (Parse_error_at (loc, "max_threads is too large"))
   else Int64.to_int n
+
+let concurrent_loop_limit_or_error loc n =
+  if Int64.compare n 0L <= 0 then
+    raise (Parse_error_at (loc, "concurrently limit must be positive"))
+  else if Int64.compare n (Int64.of_int max_int) > 0 then
+    raise (Parse_error_at (loc, "concurrently limit is too large"))
+  else Int64.to_int n
+
+let concurrent_for_width_of_legacy = function
+  | None -> ConcurrentForDefault
+  | Some n -> ConcurrentForMaxThreads n
+
+let concurrent_for_width_of_limit loc params =
+  match params.loop_limit with
+  | Some n -> ConcurrentForLimit n
+  | None ->
+      raise
+        (Parse_error_at
+           (loc, "`for ... concurrently(...)` requires `limit: N`"))
+
+let apply_concurrently_loop_param params (name, value) =
+  match name with
+  | "limit" ->
+      if params.loop_limit <> None then
+        raise (Parse_error_at (value.expr_loc, "duplicate concurrently limit"))
+      else (
+        match value.expr_desc with
+        | ELiteral (LitInt n) ->
+            {
+              params with
+              loop_limit =
+                Some (concurrent_loop_limit_or_error value.expr_loc n);
+            }
+        | _ ->
+            raise
+              (Parse_error_at
+                 (value.expr_loc, "concurrently limit must be an integer literal"))
+        )
+  | "timeout" ->
+      if params.loop_timeout <> None then
+        raise (Parse_error_at (value.expr_loc, "duplicate timeout parameter"))
+      else { params with loop_timeout = Some value }
+  | "max_threads" ->
+      raise
+        (Parse_error_at
+           (value.expr_loc,
+            "use `limit: N` in `concurrently(...)`; `max_threads` is for legacy `concurrent(...)`"))
+  | "item_timeout" ->
+      raise
+        (Parse_error_at
+           (value.expr_loc,
+            "`item_timeout` is reserved for the concurrency migration but is not implemented yet"))
+  | _ ->
+      raise
+        (Parse_error_at
+           (value.expr_loc,
+            Printf.sprintf
+              "unknown concurrently parameter '%s' (expected 'limit' or 'timeout')"
+              name))
 
 %}
 
@@ -144,7 +208,7 @@ let concurrent_max_threads_or_error loc n =
 %token PLUS_EQ MINUS_EQ STAR_EQ SLASH_EQ
 %token QUESTION_EQUALS FATARROW
 %token TRY WITH DEBUG RESOURCE BORROW
-%token CONCURRENT
+%token CONCURRENT CONCURRENTLY
 %token PIPE
 %token INDENT DEDENT NEWLINE
 %token EOF
@@ -1112,6 +1176,30 @@ primary_expr:
     { make_expr_at $symbolstartpos (EWith (binding, stmts_to_expr_at $startpos(body) body)) }
   | WITH with_binding NEWLINE
     { parse_fail_at $startpos($3) "Expected ':' after with binding" }
+  | FOR name = IDENT IN iter = expr CONCURRENTLY LPAREN params = concurrently_loop_params RPAREN COLON NEWLINE INDENT body = stmt_list DEDENT
+    { make_expr_at $symbolstartpos
+        (EConcurrentFor
+           ( name,
+             iter,
+             stmts_to_expr body,
+             params.loop_timeout,
+             concurrent_for_width_of_limit
+               (loc_of_pos $startpos(params))
+               params )) }
+  | FOR UNDERSCORE IN iter = expr CONCURRENTLY LPAREN params = concurrently_loop_params RPAREN COLON NEWLINE INDENT body = stmt_list DEDENT
+    { make_expr_at $symbolstartpos
+        (EConcurrentFor
+           ( "_",
+             iter,
+             stmts_to_expr body,
+             params.loop_timeout,
+             concurrent_for_width_of_limit
+               (loc_of_pos $startpos(params))
+               params )) }
+  | FOR name = IDENT IN iter = expr CONCURRENTLY COLON NEWLINE INDENT body = stmt_list DEDENT
+    { let _ = (name, iter, body) in
+      parse_fail_at $startpos($6)
+        "`for ... concurrently` requires options; write `for x in xs concurrently(limit: N):`" }
   (* concurrent: block — no timeout *)
   (* concurrent: block — no params *)
   | CONCURRENT COLON NEWLINE INDENT stmts = stmt_list DEDENT
@@ -1121,10 +1209,20 @@ primary_expr:
     { make_expr_at $symbolstartpos (EConcurrent (stmts, params.conc_timeout, params.conc_max_threads)) }
   (* concurrent for — no params *)
   | CONCURRENT FOR name = IDENT IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
-    { make_expr_at $symbolstartpos (EConcurrentFor (name, iter, stmts_to_expr body, None, None)) }
+    { make_expr_at $symbolstartpos (EConcurrentFor (name, iter, stmts_to_expr body, None, ConcurrentForDefault)) }
   (* concurrent(params) for — with named params *)
   | CONCURRENT LPAREN params = concurrent_params RPAREN FOR name = IDENT IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
-    { make_expr_at $symbolstartpos (EConcurrentFor (name, iter, stmts_to_expr body, params.conc_timeout, params.conc_max_threads)) }
+    { make_expr_at $symbolstartpos
+        (EConcurrentFor
+           ( name,
+             iter,
+             stmts_to_expr body,
+             params.conc_timeout,
+             concurrent_for_width_of_legacy params.conc_max_threads )) }
+  | CONCURRENTLY COLON NEWLINE INDENT stmts = stmt_list DEDENT
+    { let _ = stmts in
+      parse_fail_at $symbolstartpos
+        "Use `concurrent:` for fixed concurrent blocks; `concurrently(...)` is only a for-loop modifier." }
   (* detach expr — detach on thread pool *)
   | DETACH body = unary_expr
     { make_expr_at $symbolstartpos (EDetach body) }
@@ -1170,6 +1268,22 @@ concurrent_params:
       in
       let init = { conc_timeout = None; conc_max_threads = None } in
       apply (apply init p1) p2 }
+
+concurrently_loop_param:
+  | name = IDENT COLON value = expr
+    { (name, value) }
+
+concurrently_loop_params:
+  | params = separated_nonempty_list(COMMA, concurrently_loop_param)
+    { let init = { loop_timeout = None; loop_limit = None } in
+      let parsed = List.fold_left apply_concurrently_loop_param init params in
+      match parsed.loop_limit with
+      | Some _ -> parsed
+      | None ->
+          raise
+            (Parse_error_at
+               (loc_of_pos $symbolstartpos,
+                "`for ... concurrently(...)` requires `limit: N`")) }
 
 record_field:
   | name = identifier EQUALS e = expr { (name, e) }

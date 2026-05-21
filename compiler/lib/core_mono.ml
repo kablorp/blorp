@@ -859,12 +859,13 @@ let collect_generic_bodies (state : mono_state) (prog : core_program) : unit =
            calls during the post-mono safety check. Store explicit module-owned
            identities only; current-module bare calls and UFCS/imported calls
            resolve through these qualified keys below. *)
-        let source_name = post_mono_synthesis_name f in
-        let prefixed_source = module_qualified_name module_path source_name in
-        let prefixed_func = module_qualified_name module_path f.cf_name in
-        Hashtbl.replace state.generic_bodies prefixed_source f;
-        if prefixed_func <> f.cf_name && prefixed_func <> prefixed_source then
-          Hashtbl.replace state.generic_bodies prefixed_func f
+        let lookup_name = generic_body_lookup_name f in
+        let synthesis_name =
+          module_qualified_name module_path (post_mono_synthesis_name f)
+        in
+        Hashtbl.replace state.generic_bodies lookup_name f;
+        if synthesis_name <> lookup_name then
+          Hashtbl.replace state.generic_bodies synthesis_name f
   in
   let add_generic_impl (i : core_impl) =
     let by_trait =

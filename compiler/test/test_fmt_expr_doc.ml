@@ -398,10 +398,12 @@ let test_concurrent_for_expr_doc () =
          ("total", expr (Ast.EBinary (Ast.Add, ident "total", ident "item"))))
   in
   let e =
-    expr (Ast.EConcurrentFor ("item", ident "items", body, None, Some 2))
+    expr
+      (Ast.EConcurrentFor
+         ("item", ident "items", body, None, Ast.ConcurrentForLimit 2))
   in
   check_string "concurrent for expression doc"
-    "concurrent(max_threads: 2) for item in items:\n\ttotal += item\n"
+    "for item in items concurrently(limit: 2):\n\ttotal += item\n"
     (layout_expr e)
 
 let test_expr_json_case_uses_ocaml_expected_layout () =
@@ -448,7 +450,7 @@ let test_expr_json_lines_from_source () =
     \    concurrent(max_threads: 2, timeout: 5):\n\
     \        task = compute()\n\
     \    detach send(ch, 1)\n\
-    \    results = concurrent(max_threads: 2) for item in items:\n\
+    \    results = for item in items concurrently(limit: 2):\n\
     \        item\n\
     \    value\n"
   in

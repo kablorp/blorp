@@ -857,6 +857,27 @@ let test_insert_drops_channel_send_retains_payload_arg () =
     "channel send does not dup payload" 0
     (count_dups_for "s" transformed)
 
+let test_insert_drops_channel_send_status_retains_payload_args () =
+  let check name args =
+    let bind = bind_named "s" ty_string (cstr "payload") in
+    let send = builtin name args ty_int in
+    let body = mk (CSeq (send, cint 0)) ty_int in
+    let e = mk (CLet (bind, body)) ty_int in
+    let transformed = insert_drops_expr_for_test e in
+    Alcotest.(check int)
+      (name ^ " retains and caller drops payload")
+      1
+      (count_drops_for "s" transformed);
+    Alcotest.(check int)
+      (name ^ " does not dup payload")
+      0
+      (count_dups_for "s" transformed)
+  in
+  check "blorp_channel_try_send_status"
+    [ cvar "ch" ty_channel_string; cvar "s" ty_string ];
+  check "blorp_channel_send_timeout_status"
+    [ cvar "ch" ty_channel_string; cvar "s" ty_string; cint 10 ]
+
 let test_insert_drops_channel_recv_borrows_channel_arg () =
   let bind =
     bind_named "ch" ty_channel_string
@@ -4593,6 +4614,8 @@ let suite =
           test_insert_drops_string_runtime_builtin_borrows_arg;
         Alcotest.test_case "channel_send_retains_payload_arg" `Quick
           test_insert_drops_channel_send_retains_payload_arg;
+        Alcotest.test_case "channel_send_status_retains_payload_args" `Quick
+          test_insert_drops_channel_send_status_retains_payload_args;
         Alcotest.test_case "channel_recv_borrows_channel_arg" `Quick
           test_insert_drops_channel_recv_borrows_channel_arg;
         Alcotest.test_case "borrowed_cast_arg_drop_after" `Quick

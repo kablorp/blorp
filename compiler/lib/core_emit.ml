@@ -878,25 +878,33 @@ and emit_string_set_len (ctx : Core_emit_context.t) (set_len : string_set_len) :
   emit ctx "; __sl->len = __sn; __sl->data[__sn] = '\\0'; (void)0; })"
 
 and emit_box_op (ctx : Core_emit_context.t) (b : box_op) : unit =
-  let tmp = Printf.sprintf "__box_%d" (fresh_temp ctx) in
-  let c_ty = type_to_c ctx b.box_source_ty in
-  emit ctx (Printf.sprintf "({ %s %s = " c_ty tmp);
-  emit_expr ctx b.box_value;
-  emit ctx "; ";
-  (match b.box_kind with
-  | BoxFloat -> emit ctx (Printf.sprintf "blorp_box_float(%s)" tmp)
-  | BoxFloat32 -> emit ctx (Printf.sprintf "blorp_box_float32(%s)" tmp)
-  | BoxFloat16 -> emit ctx (Printf.sprintf "blorp_box_float16(%s)" tmp)
-  | BoxInt128 -> emit ctx (Printf.sprintf "blorp_box_int128(%s)" tmp)
-  | BoxUInt128 -> emit ctx (Printf.sprintf "blorp_box_uint128(%s)" tmp)
-  | BoxPointer -> emit ctx (Printf.sprintf "(void*)%s" tmp)
-  | BoxPrim -> emit ctx (Printf.sprintf "(void*)(long)(%s)" tmp)
-  | BoxStruct _
-    when Core_layout_type.is_stack_result_type ~reg:ctx.reg b.box_source_ty ->
-      emit ctx (Printf.sprintf "blorp_box_stack_result(%s)" tmp)
-  | BoxStruct _ ->
-      emit ctx (Printf.sprintf "blorp_box_struct(&%s, sizeof(%s))" tmp c_ty));
-  emit ctx "; })"
+  match b.box_kind with
+  | BoxVoid ->
+      emit ctx "({ ";
+      emit_stmt ctx b.box_value;
+      emit ctx "(void*)0; })"
+  | _ ->
+      let tmp = Printf.sprintf "__box_%d" (fresh_temp ctx) in
+      let c_ty = type_to_c ctx b.box_source_ty in
+      emit ctx (Printf.sprintf "({ %s %s = " c_ty tmp);
+      emit_expr ctx b.box_value;
+      emit ctx "; ";
+      (match b.box_kind with
+      | BoxFloat -> emit ctx (Printf.sprintf "blorp_box_float(%s)" tmp)
+      | BoxFloat32 -> emit ctx (Printf.sprintf "blorp_box_float32(%s)" tmp)
+      | BoxFloat16 -> emit ctx (Printf.sprintf "blorp_box_float16(%s)" tmp)
+      | BoxInt128 -> emit ctx (Printf.sprintf "blorp_box_int128(%s)" tmp)
+      | BoxUInt128 -> emit ctx (Printf.sprintf "blorp_box_uint128(%s)" tmp)
+      | BoxPointer -> emit ctx (Printf.sprintf "(void*)%s" tmp)
+      | BoxPrim -> emit ctx (Printf.sprintf "(void*)(long)(%s)" tmp)
+      | BoxStruct _
+        when Core_layout_type.is_stack_result_type ~reg:ctx.reg b.box_source_ty
+        ->
+          emit ctx (Printf.sprintf "blorp_box_stack_result(%s)" tmp)
+      | BoxStruct _ ->
+          emit ctx (Printf.sprintf "blorp_box_struct(&%s, sizeof(%s))" tmp c_ty)
+      | BoxVoid -> assert false);
+      emit ctx "; })"
 
 and emit_boxed_storage (ctx : Core_emit_context.t) (value : boxed_storage_value)
     : unit =
@@ -3156,8 +3164,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                       in
                       let boxed_abi_temp_needs_release = function
                         | BoxInt128 | BoxUInt128 | BoxStruct _ -> true
-                        | BoxFloat | BoxFloat32 | BoxFloat16 | BoxPointer
-                        | BoxPrim ->
+                        | BoxFloat | BoxFloat32 | BoxFloat16 | BoxVoid
+                        | BoxPointer | BoxPrim ->
                             false
                       in
                       let emit_arg_bindings () =
@@ -3230,6 +3238,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                         | BoxPointer ->
                             emit ctx
                               (Printf.sprintf "; (%s)%s; })" ret_c_ty tmp_r)
+                        | BoxVoid -> emit ctx "; (void)0; })"
                       in
                       let is_void = is_void_ty e.ty in
                       let ret_c = if is_void then "void" else "void*" in
@@ -4539,38 +4548,46 @@ and emit_discard_stmt (ctx : Core_emit_context.t) (rhs : core) : unit =
     - Pointer types → pass through unchanged
     - Primitives (Int, Bool, Char, sized ints) cast via [(void* )(long)] *)
 and emit_boxed (ctx : Core_emit_context.t) (e : core) : unit =
-  match classify_for_boxing ctx e.ty e.loc with
-  | BoxFloat ->
-      emit ctx "blorp_box_float(";
-      emit_expr ctx e;
-      emit ctx ")"
-  | BoxFloat32 ->
-      emit ctx "blorp_box_float32(";
-      emit_expr ctx e;
-      emit ctx ")"
-  | BoxFloat16 ->
-      emit ctx "blorp_box_float16(";
-      emit_expr ctx e;
-      emit ctx ")"
-  | BoxInt128 ->
-      emit ctx "blorp_box_int128(";
-      emit_expr ctx e;
-      emit ctx ")"
-  | BoxUInt128 ->
-      emit ctx "blorp_box_uint128(";
-      emit_expr ctx e;
-      emit ctx ")"
-  | BoxPointer -> emit_expr ctx e
-  | BoxPrim ->
-      emit ctx "(void*)(long)(";
-      emit_expr ctx e;
-      emit ctx ")"
-  | BoxStruct type_name ->
-      let tmp = Printf.sprintf "__box_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ %s %s = " type_name tmp);
-      emit_expr ctx e;
-      emit ctx
-        (Printf.sprintf "; blorp_box_struct(&%s, sizeof(%s)); })" tmp type_name)
+  match e.desc with
+  | CBox _ | CBoxTyped _ -> emit_expr ctx e
+  | _ -> (
+      match classify_for_boxing ctx e.ty e.loc with
+      | BoxFloat ->
+          emit ctx "blorp_box_float(";
+          emit_expr ctx e;
+          emit ctx ")"
+      | BoxFloat32 ->
+          emit ctx "blorp_box_float32(";
+          emit_expr ctx e;
+          emit ctx ")"
+      | BoxFloat16 ->
+          emit ctx "blorp_box_float16(";
+          emit_expr ctx e;
+          emit ctx ")"
+      | BoxInt128 ->
+          emit ctx "blorp_box_int128(";
+          emit_expr ctx e;
+          emit ctx ")"
+      | BoxUInt128 ->
+          emit ctx "blorp_box_uint128(";
+          emit_expr ctx e;
+          emit ctx ")"
+      | BoxVoid ->
+          emit ctx "({ ";
+          emit_stmt ctx e;
+          emit ctx "(void*)0; })"
+      | BoxPointer -> emit_expr ctx e
+      | BoxPrim ->
+          emit ctx "(void*)(long)(";
+          emit_expr ctx e;
+          emit ctx ")"
+      | BoxStruct type_name ->
+          let tmp = Printf.sprintf "__box_%d" (fresh_temp ctx) in
+          emit ctx (Printf.sprintf "({ %s %s = " type_name tmp);
+          emit_expr ctx e;
+          emit ctx
+            (Printf.sprintf "; blorp_box_struct(&%s, sizeof(%s)); })" tmp
+               type_name))
 (* ============================================================================
    Decl-level emission (Phase 1.2c)
    ============================================================================
@@ -6870,6 +6887,36 @@ and emit_conc_closure (ctx : Core_emit_context.t) (lambda_name : string)
   end;
   fn_tmp
 
+and task_copy_capture_bindings_for_emit ~loc ~context
+    (captures : task_capture list) : (string * Ast.type_expr) list =
+  List.map
+    (fun capture ->
+      match capture.task_capture_kind with
+      | TaskCopyCapture -> task_capture_binding capture
+      | TaskMoveResourceItem | TaskStructuredTaskBorrow ->
+          Core_error.errorf Core_error.Emit loc
+            ~hint:
+              "Core lowering must not erase task-capture ownership. Resource \
+               item moves and structured task borrows need explicit runtime \
+               lowering before C emission can build a closure ABI."
+            "unsupported %s task capture `%s: %s` reached emit" context
+            capture.task_capture_name
+            (Types.type_to_string capture.task_capture_ty))
+    captures
+
+and emit_concurrent_deadline_init (ctx : Core_emit_context.t) deadline_c
+    timeout_expr : unit =
+  emit_indent ctx;
+  emit ctx (Printf.sprintf "long %s = blorp_concurrent_deadline_us(" deadline_c);
+  emit_expr ctx timeout_expr;
+  emitln ctx ");"
+
+and emit_concurrent_remaining_init (ctx : Core_emit_context.t) remaining_c
+    deadline_c : unit =
+  emit_line ctx
+    (Printf.sprintf "long %s = blorp_concurrent_remaining_ms(%s);" remaining_c
+       deadline_c)
+
 (* --- §10. Concurrency emit ------------------------------------------------ *)
 
 (** Emit a [concurrent:] block in statement context.
@@ -6899,7 +6946,10 @@ and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
                 Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func
                 |> escape_c_ident
               in
-              (task.tc_return_ty, c_name, task.tc_captures)
+              ( task.tc_return_ty,
+                c_name,
+                task_copy_capture_bindings_for_emit ~loc:cb.cb_rhs.loc
+                  ~context:"concurrent binding" task.tc_captures )
           | None ->
               Core_error.errorf Core_error.Emit cb.cb_rhs.loc
                 ~hint:
@@ -6940,17 +6990,13 @@ and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
   let conc_id = fresh_temp ctx in
   if has_timeout then begin
     let deadline = Printf.sprintf "__conc_deadline_%d" conc_id in
-    emit_indent ctx;
-    emit ctx (Printf.sprintf "long %s = blorp_now_us() + (" deadline);
-    (match block.conc_timeout with Some t -> emit_expr ctx t | None -> ());
-    emitln ctx ") * 1000L;";
+    (match block.conc_timeout with
+    | Some timeout -> emit_concurrent_deadline_init ctx deadline timeout
+    | None -> ());
     List.iter
       (fun ((cb : conc_binding), task_tmp) ->
         let rem = Printf.sprintf "__conc_rem_%d" (fresh_temp ctx) in
-        emit_line ctx
-          (Printf.sprintf "long %s = (%s - blorp_now_us()) / 1000L;" rem
-             deadline);
-        emit_line ctx (Printf.sprintf "if (%s < 0) %s = 0;" rem rem);
+        emit_concurrent_remaining_init ctx rem deadline;
         emit_join_binding cb task_tmp rem;
         emit_line ctx
           (Printf.sprintf "blorp_release((blorp_Object*)%s);" task_tmp))
@@ -6976,7 +7022,9 @@ and emit_detach_stmt (ctx : Core_emit_context.t) (detach : detach_expr)
           Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func
           |> escape_c_ident
         in
-        (c_name, task.tc_captures)
+        ( c_name,
+          task_copy_capture_bindings_for_emit ~loc:detach.detach_body.loc
+            ~context:"detach" task.tc_captures )
     | None ->
         Core_error.errorf Core_error.Emit detach.detach_body.loc
           ~hint:
@@ -7000,6 +7048,156 @@ and emit_concurrent_for (ctx : Core_emit_context.t) (cf : concurrent_for) : unit
     =
   ignore (emit_concurrent_for_collecting ~collect:false ctx cf)
 
+and concurrent_for_emit_plan (_ctx : Core_emit_context.t) (cf : concurrent_for)
+    : Ast.type_expr * Ast.type_expr * string * (string * Ast.type_expr) list =
+  let elem_ty =
+    match normalize_type cf.cf_iter.ty with
+    | Ast.TyNamed ("List", [ et ]) -> et
+    | ty ->
+        Core_error.errorf Core_error.Emit cf.cf_iter.loc
+          ~hint:
+            "concurrent for is currently list-only; accept other collection \
+             layouts by adding explicit emitter paths rather than casting them \
+             to blorp_List"
+          "concurrent for requires List[T], got %s" (Types.type_to_string ty)
+  in
+  let task_ret_ty, lambda_name, captures =
+    match cf.cf_task with
+    | Some task ->
+        let c_name =
+          Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func
+          |> escape_c_ident
+        in
+        ( task.tc_return_ty,
+          c_name,
+          task_copy_capture_bindings_for_emit ~loc:cf.cf_body.loc
+            ~context:"concurrent-for" task.tc_captures )
+    | None ->
+        Core_error.errorf Core_error.Emit cf.cf_body.loc
+          ~hint:
+            "Core_closure should attach task metadata to every concurrent-for \
+             body before emission"
+          "concurrent-for reached emit without task closure metadata"
+  in
+  (elem_ty, task_ret_ty, lambda_name, captures)
+
+and emit_concurrent_for_collecting_limited ~(collect : bool)
+    (ctx : Core_emit_context.t) (cf : concurrent_for) (limit : int) : string =
+  emit_line ctx (Printf.sprintf "blorp_thread_pool_init(%d);" limit);
+  let id = fresh_temp ctx in
+  let list_c = Printf.sprintf "__conc_list_%d" id in
+  let len_c = Printf.sprintf "__conc_len_%d" id in
+  let limit_c = Printf.sprintf "__conc_limit_%d" id in
+  let tasks_c = Printf.sprintf "__conc_tasks_%d" id in
+  let start_c = Printf.sprintf "__conc_start_%d" id in
+  let window_end_c = Printf.sprintf "__conc_window_end_%d" id in
+  let idx_c = Printf.sprintf "__conc_i_%d" id in
+  let slot_c = Printf.sprintf "__conc_slot_%d" id in
+  let results_c = Printf.sprintf "__conc_results_%d" id in
+  let batch_c = Printf.sprintf "__conc_batch_%d" id in
+  let var_c = escape_c_ident (Var.to_c_name cf.cf_var) in
+  let elem_ty, task_ret_ty, lambda_name, captures =
+    concurrent_for_emit_plan ctx cf
+  in
+  emit_indent ctx;
+  emit ctx (Printf.sprintf "blorp_List* %s = (blorp_List*)" list_c);
+  emit_expr ctx cf.cf_iter;
+  emitln ctx ";";
+  emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c list_c);
+  emit_line ctx (Printf.sprintf "long %s = %dL;" limit_c limit);
+  emit_line ctx
+    (Printf.sprintf
+       "blorp_Task** %s = blorp_malloc_checked((%s > 0 ? %s : 1) * \
+        sizeof(blorp_Task*));"
+       tasks_c limit_c limit_c);
+  emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_c);
+  if collect then begin
+    emit_line ctx
+      (Printf.sprintf "blorp_List* %s = blorp_list_new(%s);" results_c len_c);
+    emit_line ctx
+      (Printf.sprintf "blorp_list_init_elem_release(%s, blorp_elem_release_fn);"
+         results_c)
+  end;
+  let has_timeout = cf.cf_timeout <> None in
+  let deadline_c = Printf.sprintf "__conc_deadline_%d" (fresh_temp ctx) in
+  if has_timeout then
+    begin match cf.cf_timeout with
+    | Some timeout -> emit_concurrent_deadline_init ctx deadline_c timeout
+    | None -> ()
+    end;
+  let use_rc = type_requires_release ctx task_ret_ty in
+  let spawn_fn =
+    if use_rc then "blorp_task_spawn_owned_rc_in_batch"
+    else "blorp_task_spawn_owned_in_batch"
+  in
+  emit_indent ctx;
+  emitln ctx
+    (Printf.sprintf "for (long %s = 0; %s < %s; %s += %s) {" start_c start_c
+       len_c start_c limit_c);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx
+    (Printf.sprintf "long %s = %s + %s;" window_end_c start_c limit_c);
+  emit_line ctx
+    (Printf.sprintf "if (%s > %s) %s = %s;" window_end_c len_c window_end_c
+       len_c);
+  emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_c);
+  emit_indent ctx;
+  emitln ctx
+    (Printf.sprintf "for (long %s = %s; %s < %s; %s++) {" idx_c start_c idx_c
+       window_end_c idx_c);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx (Printf.sprintf "long %s = %s - %s;" slot_c idx_c start_c);
+  emit_unbox_decl ctx var_c
+    (Printf.sprintf "blorp_list_get(%s, %s)" list_c idx_c)
+    elem_ty;
+  let fn_tmp = emit_conc_closure ctx lambda_name captures in
+  emit_line ctx
+    (Printf.sprintf "%s[%s] = (blorp_Task*)%s(&%s, %s);" tasks_c slot_c spawn_fn
+       batch_c fn_tmp);
+  emit_line ctx
+    (Printf.sprintf "if (((%s + 1) %% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0) {"
+       slot_c);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "}";
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
+  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
+  emit_indent ctx;
+  emitln ctx
+    (Printf.sprintf "for (long %s = %s; %s < %s; %s++) {" idx_c start_c idx_c
+       window_end_c idx_c);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx (Printf.sprintf "long %s = %s - %s;" slot_c idx_c start_c);
+  let join_call =
+    if has_timeout then begin
+      let rem = Printf.sprintf "__cf_rem_%d" (fresh_temp ctx) in
+      emit_concurrent_remaining_init ctx rem deadline_c;
+      Printf.sprintf "blorp_concurrent_join(%s[%s], %s)" tasks_c slot_c rem
+    end
+    else Printf.sprintf "blorp_concurrent_join(%s[%s], -1)" tasks_c slot_c
+  in
+  if collect then
+    emit_line ctx
+      (Printf.sprintf "blorp_list_set_raw(%s, %s, (void*)(%s));" results_c idx_c
+         join_call)
+  else
+    emit_line ctx
+      (Printf.sprintf "blorp_release((blorp_Object*)(%s));" join_call);
+  emit_line ctx
+    (Printf.sprintf "blorp_release((blorp_Object*)%s[%s]);" tasks_c slot_c);
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
+  emit_line ctx (Printf.sprintf "free(%s);" tasks_c);
+  if collect then emit_line ctx (Printf.sprintf "%s->len = %s;" results_c len_c);
+  results_c
+
 (** Emit [concurrent for] and, when [collect] is true, return the C
     identifier holding the collected [blorp_List*] of
     [Result[T, ConcurrencyError]] entries.
@@ -7017,7 +7215,11 @@ and emit_concurrent_for (ctx : Core_emit_context.t) (cf : concurrent_for) : unit
     Result when the list itself goes out of scope. *)
 and emit_concurrent_for_collecting ~(collect : bool) (ctx : Core_emit_context.t)
     (cf : concurrent_for) : string =
-  (* INVARIANT (enforced by [infer.ml:infer_concurrent_for]): [concurrent for]
+  match cf.cf_width with
+  | Ast.ConcurrentForLimit limit ->
+      emit_concurrent_for_collecting_limited ~collect ctx cf limit
+  | Ast.ConcurrentForDefault | Ast.ConcurrentForMaxThreads _ ->
+      (* INVARIANT (enforced by [infer.ml:infer_concurrent_for]): [concurrent for]
      accepts only [List[T]], never [Tensor]/[Vector]/[Matrix]. The cast to
      [blorp_List*] below is safe because of that gate. If the constraint is
      ever relaxed to accept Vector-family types, the list-vs-vector struct
@@ -7026,151 +7228,128 @@ and emit_concurrent_for_collecting ~(collect : bool) (ctx : Core_emit_context.t)
      orderings before [data[]], so reading [->data[0]] through the wrong
      pointer type returns padding instead of element 0. Update the cast and
      add a tensor-aware path at the same time. *)
-  (match cf.cf_max_threads with
-  | Some n -> emit_line ctx (Printf.sprintf "blorp_thread_pool_init(%d);" n)
-  | None -> ());
-  let id = fresh_temp ctx in
-  let list_c = Printf.sprintf "__conc_list_%d" id in
-  let len_c = Printf.sprintf "__conc_len_%d" id in
-  let tasks_c = Printf.sprintf "__conc_tasks_%d" id in
-  let idx_c = Printf.sprintf "__conc_i_%d" id in
-  let results_c = Printf.sprintf "__conc_results_%d" id in
-  let batch_c = Printf.sprintf "__conc_batch_%d" id in
-  let var_c = escape_c_ident (Var.to_c_name cf.cf_var) in
-  let elem_ty =
-    match normalize_type cf.cf_iter.ty with
-    | Ast.TyNamed ("List", [ et ]) -> et
-    | ty ->
-        Core_error.errorf Core_error.Emit cf.cf_iter.loc
-          ~hint:
-            "concurrent for is currently list-only; accept other collection \
-             layouts by adding explicit emitter paths rather than casting them \
-             to blorp_List"
-          "concurrent for requires List[T], got %s" (Types.type_to_string ty)
-  in
-  emit_indent ctx;
-  emit ctx (Printf.sprintf "blorp_List* %s = (blorp_List*)" list_c);
-  emit_expr ctx cf.cf_iter;
-  emitln ctx ";";
-  emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c list_c);
-  emit_line ctx
-    (Printf.sprintf
-       "blorp_Task** %s = blorp_malloc_checked((%s > 0 ? %s : 1) * \
-        sizeof(blorp_Task*));"
-       tasks_c len_c len_c);
-  emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_c);
-  emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_c);
-  (* Result list — preallocated to the iter length so each join can
+      (match Ast.concurrent_for_width_value cf.cf_width with
+      | Some n -> emit_line ctx (Printf.sprintf "blorp_thread_pool_init(%d);" n)
+      | None -> ());
+      let id = fresh_temp ctx in
+      let list_c = Printf.sprintf "__conc_list_%d" id in
+      let len_c = Printf.sprintf "__conc_len_%d" id in
+      let tasks_c = Printf.sprintf "__conc_tasks_%d" id in
+      let idx_c = Printf.sprintf "__conc_i_%d" id in
+      let results_c = Printf.sprintf "__conc_results_%d" id in
+      let batch_c = Printf.sprintf "__conc_batch_%d" id in
+      let var_c = escape_c_ident (Var.to_c_name cf.cf_var) in
+      let elem_ty, task_ret_ty, lambda_name, captures =
+        concurrent_for_emit_plan ctx cf
+      in
+      emit_indent ctx;
+      emit ctx (Printf.sprintf "blorp_List* %s = (blorp_List*)" list_c);
+      emit_expr ctx cf.cf_iter;
+      emitln ctx ";";
+      emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c list_c);
+      emit_line ctx
+        (Printf.sprintf
+           "blorp_Task** %s = blorp_malloc_checked((%s > 0 ? %s : 1) * \
+            sizeof(blorp_Task*));"
+           tasks_c len_c len_c);
+      emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_c);
+      emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_c);
+      (* Result list — preallocated to the iter length so each join can
      write directly into [data[i]] without going through
      [blorp_list_append]'s COW + retain branches. Tagged with
      [blorp_elem_release_fn] so the list's destructor releases each
      [Result*] when the list itself dies. Skipped entirely in
      statement context (no observable list, no point in allocating). *)
-  if collect then begin
-    emit_line ctx
-      (Printf.sprintf "blorp_List* %s = blorp_list_new(%s);" results_c len_c);
-    emit_line ctx
-      (Printf.sprintf "blorp_list_init_elem_release(%s, blorp_elem_release_fn);"
-         results_c)
-  end;
-  (* Spawn phase *)
-  emit_indent ctx;
-  emitln ctx
-    (Printf.sprintf "for (long %s = 0; %s < %s; %s++) {" idx_c idx_c len_c idx_c);
-  ctx.indent <- ctx.indent + 1;
-  emit_unbox_decl ctx var_c
-    (Printf.sprintf "blorp_list_get(%s, %s)" list_c idx_c)
-    elem_ty;
-  (* Register the lambda with the body's real return type, NOT Void.
+      if collect then begin
+        emit_line ctx
+          (Printf.sprintf "blorp_List* %s = blorp_list_new(%s);" results_c len_c);
+        emit_line ctx
+          (Printf.sprintf
+             "blorp_list_init_elem_release(%s, blorp_elem_release_fn);"
+             results_c)
+      end;
+      (* Spawn phase *)
+      emit_indent ctx;
+      emitln ctx
+        (Printf.sprintf "for (long %s = 0; %s < %s; %s++) {" idx_c idx_c len_c
+           idx_c);
+      ctx.indent <- ctx.indent + 1;
+      emit_unbox_decl ctx var_c
+        (Printf.sprintf "blorp_list_get(%s, %s)" list_c idx_c)
+        elem_ty;
+      (* Register the lambda with the body's real return type, NOT Void.
      [emit_lambda_body] discards the body's value when [cl_return_ty]
      is Void; that loses the per-iteration result and the task's join
      returns garbage. The body's type is exactly what [blorp_task_spawn]
      stores and [blorp_concurrent_join] returns wrapped in
      [Result[T, ConcurrencyError]]. *)
-  let task_ret_ty, lambda_name, captures =
-    match cf.cf_task with
-    | Some task ->
-        let c_name =
-          Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func
-          |> escape_c_ident
-        in
-        (task.tc_return_ty, c_name, task.tc_captures)
-    | None ->
-        Core_error.errorf Core_error.Emit cf.cf_body.loc
-          ~hint:
-            "Core_closure should attach task metadata to every concurrent-for \
-             body before emission"
-          "concurrent-for reached emit without task closure metadata"
-  in
-  let fn_tmp = emit_conc_closure ctx lambda_name captures in
-  let use_rc = type_requires_release ctx task_ret_ty in
-  let spawn_fn =
-    if use_rc then "blorp_task_spawn_owned_rc_in_batch"
-    else "blorp_task_spawn_owned_in_batch"
-  in
-  emit_line ctx
-    (Printf.sprintf "%s[%s] = (blorp_Task*)%s(&%s, %s);" tasks_c idx_c spawn_fn
-       batch_c fn_tmp);
-  emit_line ctx
-    (Printf.sprintf "if (((%s + 1) %% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0) {"
-       idx_c);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
-  ctx.indent <- ctx.indent - 1;
-  emit_indent ctx;
-  emitln ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
-  (* Join phase — append each task's [Result*] return value to the
+      let fn_tmp = emit_conc_closure ctx lambda_name captures in
+      let use_rc = type_requires_release ctx task_ret_ty in
+      let spawn_fn =
+        if use_rc then "blorp_task_spawn_owned_rc_in_batch"
+        else "blorp_task_spawn_owned_in_batch"
+      in
+      emit_line ctx
+        (Printf.sprintf "%s[%s] = (blorp_Task*)%s(&%s, %s);" tasks_c idx_c
+           spawn_fn batch_c fn_tmp);
+      emit_line ctx
+        (Printf.sprintf
+           "if (((%s + 1) %% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0) {" idx_c);
+      ctx.indent <- ctx.indent + 1;
+      emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
+      ctx.indent <- ctx.indent - 1;
+      emit_line ctx "}";
+      ctx.indent <- ctx.indent - 1;
+      emit_indent ctx;
+      emitln ctx "}";
+      emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
+      (* Join phase — append each task's [Result*] return value to the
      result list. [blorp_list_append] returns the (possibly COW-copied)
      list; reassign to keep [results_c] pointing at the live one. *)
-  let has_timeout = cf.cf_timeout <> None in
-  let deadline_c = Printf.sprintf "__conc_deadline_%d" (fresh_temp ctx) in
-  if has_timeout then begin
-    emit_indent ctx;
-    emit ctx (Printf.sprintf "long %s = blorp_now_us() + (" deadline_c);
-    (match cf.cf_timeout with Some t -> emit_expr ctx t | None -> ());
-    emitln ctx ") * 1000L;"
-  end;
-  emit_indent ctx;
-  emitln ctx
-    (Printf.sprintf "for (long %s = 0; %s < %s; %s++) {" idx_c idx_c len_c idx_c);
-  ctx.indent <- ctx.indent + 1;
-  let join_call =
-    if has_timeout then begin
-      let rem = Printf.sprintf "__cf_rem_%d" (fresh_temp ctx) in
-      emit_line ctx
-        (Printf.sprintf "long %s = (%s - blorp_now_us()) / 1000L;" rem
-           deadline_c);
-      emit_line ctx (Printf.sprintf "if (%s < 0) %s = 0;" rem rem);
-      Printf.sprintf "blorp_concurrent_join(%s[%s], %s)" tasks_c idx_c rem
-    end
-    else Printf.sprintf "blorp_concurrent_join(%s[%s], -1)" tasks_c idx_c
-  in
-  if collect then begin
-    (* Take ownership directly: [blorp_concurrent_join] returns the
+      let has_timeout = cf.cf_timeout <> None in
+      let deadline_c = Printf.sprintf "__conc_deadline_%d" (fresh_temp ctx) in
+      if has_timeout then
+        begin match cf.cf_timeout with
+        | Some timeout -> emit_concurrent_deadline_init ctx deadline_c timeout
+        | None -> ()
+        end;
+      emit_indent ctx;
+      emitln ctx
+        (Printf.sprintf "for (long %s = 0; %s < %s; %s++) {" idx_c idx_c len_c
+           idx_c);
+      ctx.indent <- ctx.indent + 1;
+      let join_call =
+        if has_timeout then begin
+          let rem = Printf.sprintf "__cf_rem_%d" (fresh_temp ctx) in
+          emit_concurrent_remaining_init ctx rem deadline_c;
+          Printf.sprintf "blorp_concurrent_join(%s[%s], %s)" tasks_c idx_c rem
+        end
+        else Printf.sprintf "blorp_concurrent_join(%s[%s], -1)" tasks_c idx_c
+      in
+      if collect then begin
+        (* Take ownership directly: [blorp_concurrent_join] returns the
        Result with refcount 1, and [blorp_elem_release_fn] (set above)
        will release it when the list dies. No retain needed; no
        [blorp_list_append] indirection — we sized the list to len, so
        raw-storing at index and bumping [len] at the end is sound. *)
-    emit_line ctx
-      (Printf.sprintf "blorp_list_set_raw(%s, %s, (void*)(%s));" results_c idx_c
-         join_call)
-  end
-  else
-    (* Statement context: discard the join result. Release it
+        emit_line ctx
+          (Printf.sprintf "blorp_list_set_raw(%s, %s, (void*)(%s));" results_c
+             idx_c join_call)
+      end
+      else
+        (* Statement context: discard the join result. Release it
        immediately so the per-iteration Result doesn't leak. *)
-    emit_line ctx
-      (Printf.sprintf "blorp_release((blorp_Object*)(%s));" join_call);
-  emit_line ctx
-    (Printf.sprintf "blorp_release((blorp_Object*)%s[%s]);" tasks_c idx_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_indent ctx;
-  emitln ctx "}";
-  emit_line ctx (Printf.sprintf "free(%s);" tasks_c);
-  if collect then emit_line ctx (Printf.sprintf "%s->len = %s;" results_c len_c);
-  results_c
+        emit_line ctx
+          (Printf.sprintf "blorp_release((blorp_Object*)(%s));" join_call);
+      emit_line ctx
+        (Printf.sprintf "blorp_release((blorp_Object*)%s[%s]);" tasks_c idx_c);
+      ctx.indent <- ctx.indent - 1;
+      emit_indent ctx;
+      emitln ctx "}";
+      emit_line ctx (Printf.sprintf "free(%s);" tasks_c);
+      if collect then
+        emit_line ctx (Printf.sprintf "%s->len = %s;" results_c len_c);
+      results_c
 
 (* --- §11. Collection / global init --------------------------------------- *)
 

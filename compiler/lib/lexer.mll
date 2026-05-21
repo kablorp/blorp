@@ -119,6 +119,7 @@ let () =
     ("struct", Parser.STRUCT);
     ("foreign", Parser.FOREIGN);
     ("concurrent", Parser.CONCURRENT);
+    ("concurrently", Parser.CONCURRENTLY);
     ("detach", Parser.DETACH);
     ("where", Parser.WHERE);
   ]
@@ -1029,7 +1030,8 @@ let token_to_string = function
   | Parser.SLASH_EQ -> "/="
   | Parser.QUESTION_EQUALS -> "?="
   | Parser.TRY -> "try" | Parser.WITH -> "with" | Parser.RESOURCE -> "resource" | Parser.BORROW -> "borrow" | Parser.DEBUG -> "debug" | Parser.STRUCT -> "struct" | Parser.FOREIGN -> "foreign"
-  | Parser.CONCURRENT -> "concurrent" | Parser.DETACH -> "detach" | Parser.WHERE -> "where"
+  | Parser.CONCURRENT -> "concurrent" | Parser.CONCURRENTLY -> "concurrently"
+  | Parser.DETACH -> "detach" | Parser.WHERE -> "where"
   | Parser.INDENT -> "indent" | Parser.DEDENT -> "dedent"
   | Parser.NEWLINE -> "newline" | Parser.EOF -> "end of file"
 

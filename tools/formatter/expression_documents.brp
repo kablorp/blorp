@@ -137,8 +137,14 @@ union Expression:
 	ConcurrentExpression(List[Expression], Option[Expression], Option[Int])
 	ConcurrentBindExpression(String, Option[TypeExpression], Expression)
 	DetachExpression(Expression)
-	ConcurrentForExpression(String, Expression, Expression, Option[Expression], Option[Int])
+	ConcurrentForExpression(String, Expression, Expression, Option[Expression], ConcurrentForWidth)
 	WithExpression(String, Option[TypeExpression], Bool, Expression, Expression)
+
+
+union ConcurrentForWidth:
+	ConcurrentForDefault
+	ConcurrentForMaxThreads(Int)
+	ConcurrentForLimit(Int)
 
 
 record UfcsStep {name: String, args: List[Expression]}
@@ -342,6 +348,22 @@ private pure func needs_field_receiver_parens(expr: Expression) -> Bool:
 		UnaryExpression(_, _): True
 		WithExpression(_, _, _, _, _): True
 		WhileExpression(_, _): True
+		_: False
+
+
+private pure func needs_detach_body_parens(expr: Expression) -> Bool:
+	match expr:
+		AssignmentExpression(_, _): True
+		SubscriptAssignmentExpression(_, _, _): True
+		VariableDeclarationExpression(_, _, _): True
+		TypedVariableDeclarationExpression(_, _, _, _): True
+		TupleDestructureExpression(_, _): True
+		QuestionBindExpression(_, _): True
+		TypedQuestionBindExpression(_, _, _): True
+		AscriptionExpression(_, _): True
+		BinaryExpression(_, _, _): True
+		LogicalExpression(_, _, _): True
+		RangeExpression(_, _): True
 		_: False
 
 
@@ -990,7 +1012,9 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 			body ?= value.expression_field("body")
 			timeout ?= value.optional_expression_field("timeout")
 			max_threads ?= value.optional_int_field("max_threads")
-			Ok(ConcurrentForExpression(var_name, iter, body, timeout, max_threads))
+			limit ?= value.optional_int_field("limit")
+			width ?= concurrent_for_width_from_json(max_threads, limit)
+			Ok(ConcurrentForExpression(var_name, iter, body, timeout, width))
 		_: Err("unknown expression JSON tag: " + tag)
 
 
@@ -2060,6 +2084,72 @@ private pure func concurrent_params_document(
 				None: "".text()
 
 
+private pure func concurrent_for_width_from_json(
+	max_threads: Option[Int],
+	limit: Option[Int],
+) -> Result[ConcurrentForWidth, String]:
+	match limit:
+		Some(limit_count):
+			match max_threads:
+				Some(_): Err("ConcurrentFor accepts either limit or max_threads, not both")
+				None: Ok(ConcurrentForLimit(limit_count))
+		None:
+			match max_threads:
+				Some(thread_count): Ok(ConcurrentForMaxThreads(thread_count))
+				None: Ok(ConcurrentForDefault)
+
+
+private pure func concurrently_params_document(timeout: Option[Expression], limit: Int) -> Doc:
+	match timeout:
+		Some(timeout_expr):
+			"(limit: "
+				.text()
+				.cat(limit
+						.to_string()
+						.text())
+				.cat(", timeout: ".text())
+				.cat(timeout_expr.expression_document())
+				.cat(")".text())
+		None:
+			("(limit: " + limit.to_string() + ")").text()
+
+
+private pure func concurrent_for_head_document(
+	var_name: String,
+	iter: Expression,
+	timeout: Option[Expression],
+	width: ConcurrentForWidth,
+) -> Doc:
+	match width:
+		ConcurrentForLimit(limit):
+			"for "
+				.text()
+				.cat(var_name.text())
+				.cat(" in ".text())
+				.cat(iter.expression_document())
+				.cat(" concurrently".text())
+				.cat(concurrently_params_document(timeout, limit))
+				.cat(":".text())
+		ConcurrentForMaxThreads(thread_count):
+			"concurrent"
+				.text()
+				.cat(concurrent_params_document(timeout, Some(thread_count)))
+				.cat(" for ".text())
+				.cat(var_name.text())
+				.cat(" in ".text())
+				.cat(iter.expression_document())
+				.cat(":".text())
+		ConcurrentForDefault:
+			"concurrent"
+				.text()
+				.cat(concurrent_params_document(timeout, None))
+				.cat(" for ".text())
+				.cat(var_name.text())
+				.cat(" in ".text())
+				.cat(iter.expression_document())
+				.cat(":".text())
+
+
 private pure func concurrent_bind_document(
 	name: String,
 	type_expression: Option[TypeExpression],
@@ -2485,21 +2575,15 @@ pure func expression_document(expr: Expression) -> Doc:
 			value,
 		)
 		DetachExpression(body):
-			"detach "
-				.text()
-				.cat(body.expression_document())
-		ConcurrentForExpression(var_name, iter, body, timeout, max_threads):
-			"concurrent"
-				.text()
-				.cat(concurrent_params_document(timeout, max_threads))
-				.cat(" for ".text())
-				.cat(var_name.text())
-				.cat(" in ".text())
-				.cat(iter.expression_document())
-				.cat(":".text())
-				.cat(hardline()
-						.cat(body.block_body_document())
-						.indent())
+			body_document: Doc = if body.needs_detach_body_parens():
+				body.expression_document().parens()
+			else:
+				body.expression_document()
+			"detach ".text().cat(body_document)
+		ConcurrentForExpression(var_name, iter, body, timeout, width):
+			concurrent_for_head_document(var_name, iter, timeout, width).cat(hardline()
+					.cat(body.block_body_document())
+					.indent())
 
 
 pure func render_expression_json(width: Int, input: String) -> Result[String, String]:

@@ -1842,11 +1842,11 @@ let test_is_local_func_distinguishes_imported_and_builtin () =
 (* ============================================================================
    Session-owned env tables — regression tests
 
-   These guard against the class of bug that motivated moving
-   [impl_index] / [overloads] / [ufcs_methods] out of a module-level
-   [Env.empty] binding and into the session: process-global state
-   leaking across independent [Pipeline.compile] calls, producing
-   order-dependent test failures.
+   These guard against the class of bug that motivated moving session-wide
+   env tables out of a module-level [Env.empty] binding and into the session:
+   process-global state leaking across independent [Pipeline.compile] calls,
+   producing order-dependent test failures. Ordinary overload sets are
+   separately tested as env-local lexical state.
    ============================================================================ *)
 
 let make_test_impl trait for_type =
@@ -1905,11 +1905,10 @@ let test_cross_session_overload_isolation () =
       check_true "no overloads in session B"
         (List.length (get_overloads (empty ()) "test_fn") = 0))
 
-(** Within a single session, [typecheck_module]-style additions to
-    one env must be visible to a later env derived from the same
-    session. This preserves the invariant that imports registered by
-    an earlier module's typecheck are seen by a later module's
-    typecheck in the same compile. *)
+(** Within a single session, impl additions to one env must be visible to a
+    later env derived from the same session. This preserves the invariant that
+    public impls registered while typechecking one module are available for
+    trait dispatch in later modules from the same compile. *)
 let test_within_session_impl_visibility () =
   let sess = Blorp.Session.create () in
   Blorp.Session.with_current sess (fun () ->
@@ -1920,7 +1919,10 @@ let test_within_session_impl_visibility () =
       check_true "impl visible in new env from same session"
         (type_implements_trait env_b ty_int "TestTrait"))
 
-let test_within_session_overload_visibility () =
+(** Overload additions are different: they model lexical imports, so a later
+    env in the same session must not inherit them. Otherwise one module's
+    selective import can change another module's call resolution. *)
+let test_within_session_overload_isolation () =
   let sess = Blorp.Session.create () in
   Blorp.Session.with_current sess (fun () ->
       let _env_a =
@@ -1928,8 +1930,8 @@ let test_within_session_overload_visibility () =
           (make_test_overload ~first_param_type:ty_int)
       in
       let env_b = empty () in
-      check_true "overload visible in new env from same session"
-        (List.length (get_overloads env_b "test_fn") = 1))
+      check_true "overload NOT visible in new env from same session"
+        (List.length (get_overloads env_b "test_fn") = 0))
 
 (** [Env_builtins.with_builtins] registers builtin impls ([Integer
     for Int], etc.) into [session.impl_index]. The
@@ -2181,8 +2183,8 @@ let suite =
           test_cross_session_overload_isolation;
         Alcotest.test_case "within-session impl visibility" `Quick
           test_within_session_impl_visibility;
-        Alcotest.test_case "within-session overload visibility" `Quick
-          test_within_session_overload_visibility;
+        Alcotest.test_case "within-session overload isolation" `Quick
+          test_within_session_overload_isolation;
         Alcotest.test_case "Env.empty reads ambient session" `Quick
           test_envempty_reads_ambient_session;
         Alcotest.test_case "with_builtins dedup guard" `Quick

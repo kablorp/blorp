@@ -1223,9 +1223,33 @@ let check_no_resource_capture_metadata_at (stage : Core_stage.t)
         else acc)
       acc captures
   in
+  let unsupported_task_capture_violation loc ~context capture =
+    violation_at stage loc
+      ~hint:
+        "Only ordinary copy captures are currently implemented for child \
+         tasks. Resource item moves and structured task borrows need explicit \
+         lowering before they can reach closure metadata."
+      (Printf.sprintf "unsupported %s capture `%s: %s`" context
+         capture.Core.task_capture_name
+         (Types.type_to_string capture.Core.task_capture_ty))
+  in
+  let check_task_captures loc ~context task acc =
+    let acc =
+      List.fold_left
+        (fun acc capture ->
+          match capture.Core.task_capture_kind with
+          | Core.TaskCopyCapture -> acc
+          | Core.TaskMoveResourceItem | Core.TaskStructuredTaskBorrow ->
+              unsupported_task_capture_violation loc ~context capture :: acc)
+        acc task.Core.tc_captures
+    in
+    check_captures loc ~context
+      (Core.task_capture_bindings task.Core.tc_captures)
+      acc
+  in
   let check_task loc ~context task_opt acc =
     match task_opt with
-    | Some task -> check_captures loc ~context task.Core.tc_captures acc
+    | Some task -> check_task_captures loc ~context task acc
     | None -> acc
   in
   let check_func acc (f : Core.core_func) =
@@ -1313,6 +1337,62 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
         :: acc
     | _ -> acc
   in
+  let check_concurrent_for_width loc width acc =
+    match width with
+    | Ast.ConcurrentForDefault -> acc
+    | Ast.ConcurrentForMaxThreads n when n <= 0 ->
+        violation_at stage loc
+          ~hint:
+            "Parser/typechecking should only construct positive max_threads \
+             limits for legacy concurrent-for forms."
+          (Printf.sprintf "concurrent for max_threads must be positive, got %d"
+             n)
+        :: acc
+    | Ast.ConcurrentForLimit n when n <= 0 ->
+        violation_at stage loc
+          ~hint:
+            "Parser/typechecking should only construct positive limits for \
+             concurrently loop forms."
+          (Printf.sprintf "concurrent for limit must be positive, got %d" n)
+        :: acc
+    | Ast.ConcurrentForMaxThreads _ | Ast.ConcurrentForLimit _ -> acc
+  in
+  let check_concurrent_task_scope loc ~subject
+      (scope : Core.concurrent_task_scope) acc =
+    let parent_id = Core.task_scope_id_to_int scope.Core.task_parent_scope_id in
+    let child_id = Core.task_scope_id_to_int scope.Core.task_child_scope_id in
+    let acc =
+      if parent_id < 0 then
+        violation_at stage loc
+          ~hint:
+            "Core_lower should assign non-negative task scope ids, with 0 \
+             reserved for the root task scope."
+          (Printf.sprintf "%s parent task scope id must be non-negative, got %d"
+             subject parent_id)
+        :: acc
+      else acc
+    in
+    let acc =
+      if child_id <= 0 then
+        violation_at stage loc
+          ~hint:
+            "Core_lower should assign positive child task scope ids. Scope id \
+             0 is reserved for the root task."
+          (Printf.sprintf "%s child task scope id must be positive, got %d"
+             subject child_id)
+        :: acc
+      else acc
+    in
+    if parent_id = child_id then
+      violation_at stage loc
+        ~hint:
+          "A child task scope must be a distinct scope owned by its parent. \
+           Reuse the parent id only for code that remains synchronous."
+        (Printf.sprintf "%s parent and child task scope ids must differ, got %d"
+           subject parent_id)
+      :: acc
+    else acc
+  in
   let check_task_return loc ~subject task_opt expected acc =
     match task_opt with
     | Some task
@@ -1321,6 +1401,26 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
           ~subject:(subject ^ " task return type")
           ~expected ~actual:task.Core.tc_return_ty acc
     | _ -> acc
+  in
+  let check_unique_concurrent_binding_names bindings acc =
+    let rec go seen acc = function
+      | [] -> acc
+      | (b : Core.conc_binding) :: rest ->
+          let name = b.cb_var.vname in
+          if StringSet.mem name seen then
+            let acc =
+              violation_at stage b.cb_rhs.loc
+                ~hint:
+                  "Infer/Core_lower should ensure each concurrent result \
+                   binding has a distinct name before Core reaches emission."
+                (Printf.sprintf
+                   "duplicate concurrent binding `%s` in concurrent block" name)
+              :: acc
+            in
+            go seen acc rest
+          else go (StringSet.add name seen) acc rest
+    in
+    go StringSet.empty acc bindings
   in
   fold_program
     (fun acc e ->
@@ -1331,6 +1431,9 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
             else
               type_mismatch e.loc ~subject:"concurrent block expression type"
                 ~expected:block.conc_body.ty ~actual:e.ty acc
+          in
+          let acc =
+            check_unique_concurrent_binding_names block.conc_bindings acc
           in
           let acc =
             List.fold_left
@@ -1344,7 +1447,9 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
                       ~actual:b.cb_ty acc
                 in
                 check_task_return b.cb_rhs.loc ~subject:"concurrent binding"
-                  b.cb_task b.cb_rhs.ty acc)
+                  b.cb_task b.cb_rhs.ty acc
+                |> check_concurrent_task_scope b.cb_rhs.loc
+                     ~subject:"concurrent binding" b.cb_task_scope)
               acc block.conc_bindings
           in
           let acc =
@@ -1385,7 +1490,9 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
                 check_timeout "concurrent for" timeout.loc timeout acc
             | None -> acc
           in
-          check_max_threads "concurrent for" e.loc cf.cf_max_threads acc
+          let acc = check_concurrent_for_width e.loc cf.cf_width acc in
+          check_concurrent_task_scope e.loc ~subject:"concurrent-for"
+            cf.cf_task_scope acc
       | _ -> acc)
     [] prog
   |> List.rev

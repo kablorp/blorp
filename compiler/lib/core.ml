@@ -441,6 +441,7 @@ type box_kind =
   | BoxFloat16
   | BoxInt128
   | BoxUInt128
+  | BoxVoid
   | BoxPointer
   | BoxPrim
   | BoxStruct of string
@@ -1004,13 +1005,35 @@ and closure_create = {
 and task_closure = {
   tc_func : string;  (** name of hoisted task function *)
   tc_def_id : int;
-  tc_captures : (string * Ast.type_expr) list;
-      (** captured variable names + types *)
+  tc_captures : task_capture list;
+      (** captured variables with task-specific ownership semantics *)
   tc_return_ty : Ast.type_expr;  (** raw task body return type *)
 }
 (** A Core-visible runtime task closure. Produced by [Core_closure] for
     concurrency constructs whose bodies are executed by the task runtime
     rather than called as ordinary first-class functions. *)
+
+and task_capture = {
+  task_capture_name : string;
+  task_capture_ty : Ast.type_expr;
+  task_capture_kind : task_capture_kind;
+}
+
+and task_capture_kind =
+  | TaskCopyCapture  (** Ordinary immutable value captured into a child task. *)
+  | TaskMoveResourceItem
+      (** Reserved for resource-source loops where each item is moved into
+          exactly one child task. *)
+  | TaskStructuredTaskBorrow
+      (** Reserved for structured borrows that are proven not to outlive the
+          child task. *)
+
+and task_scope_id = TaskScopeId of int
+
+and concurrent_task_scope = {
+  task_parent_scope_id : task_scope_id;
+  task_child_scope_id : task_scope_id;
+}
 
 and closure_abi = {
   ca_params : (var * Ast.type_expr) list;  (** original typed parameters *)
@@ -1026,6 +1049,9 @@ and conc_binding = {
   cb_ty : Ast.type_expr;
       (** [Result[T, ConcurrencyError]] — user-visible type *)
   cb_rhs : core;  (** the task body (its [.ty] is [T], the inner return) *)
+  cb_task_scope : concurrent_task_scope;
+      (** Lexical parent/child scope edge for the task that evaluates
+      [cb_rhs]. *)
   cb_task : task_closure option;
       (** Core-visible task closure metadata after [Core_closure]. [None] is
       the pre-closure-conversion form and remains accepted so tests and
@@ -1047,7 +1073,8 @@ and concurrent_for = {
   cf_iter : core;
   cf_body : core;
   cf_timeout : core option;
-  cf_max_threads : int option;
+  cf_width : Ast.concurrent_for_width;
+  cf_task_scope : concurrent_task_scope;
   cf_task : task_closure option;
       (** Core-visible per-iteration task closure metadata after
       [Core_closure]. [None] is the pre-closure-conversion form. *)
@@ -1061,6 +1088,36 @@ and detach_expr = { detach_body : core; detach_task : task_closure option }
 
 (** Build a core node. *)
 let mk ~loc ~ty desc = { desc; ty; loc }
+
+let task_copy_capture (name, ty) =
+  {
+    task_capture_name = name;
+    task_capture_ty = ty;
+    task_capture_kind = TaskCopyCapture;
+  }
+
+let task_copy_captures captures = List.map task_copy_capture captures
+
+let task_capture_binding capture =
+  (capture.task_capture_name, capture.task_capture_ty)
+
+let task_capture_bindings captures = List.map task_capture_binding captures
+let root_task_scope_id = TaskScopeId 0
+let task_scope_id_to_int (TaskScopeId id) = id
+
+let concurrent_task_scope ~parent ~child =
+  let parent_id = task_scope_id_to_int parent in
+  let child_id = task_scope_id_to_int child in
+  if parent_id < 0 then
+    invalid_arg "concurrent task parent scope id must be non-negative";
+  if child_id <= 0 then
+    invalid_arg "concurrent task child scope id must be positive";
+  if parent_id = child_id then
+    invalid_arg "concurrent task parent and child scope ids must differ";
+  { task_parent_scope_id = parent; task_child_scope_id = child }
+
+let synthetic_concurrent_task_scope =
+  concurrent_task_scope ~parent:root_task_scope_id ~child:(TaskScopeId 1)
 
 (* ============================================================================
    Traversal
@@ -1236,7 +1293,8 @@ let rec map_children (f : core -> core) (e : core) : core =
             cf_iter = f cf.cf_iter;
             cf_body = f cf.cf_body;
             cf_timeout = Option.map f cf.cf_timeout;
-            cf_max_threads = cf.cf_max_threads;
+            cf_width = cf.cf_width;
+            cf_task_scope = cf.cf_task_scope;
             cf_task = cf.cf_task;
           }
     | CDetach d -> CDetach { d with detach_body = f d.detach_body }
@@ -1529,6 +1587,7 @@ let box_kind_str = function
   | BoxFloat16 -> "float16"
   | BoxInt128 -> "int128"
   | BoxUInt128 -> "uint128"
+  | BoxVoid -> "void"
   | BoxPointer -> "pointer"
   | BoxPrim -> "prim"
   | BoxStruct name -> Printf.sprintf "struct:%s" name
@@ -2451,10 +2510,13 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
     =
   let rewrite_var_ty (v, ty) = (v, f ty) in
   let rewrite_capture_ty (name, ty) = (name, f ty) in
+  let rewrite_task_capture capture =
+    { capture with task_capture_ty = f capture.task_capture_ty }
+  in
   let rewrite_task_closure (tc : task_closure) =
     {
       tc with
-      tc_captures = List.map rewrite_capture_ty tc.tc_captures;
+      tc_captures = List.map rewrite_task_capture tc.tc_captures;
       tc_return_ty = f tc.tc_return_ty;
     }
   in

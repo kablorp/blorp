@@ -392,6 +392,7 @@ let builtin_c_mapping =
     (("", "try_recv"), "blorp_channel_try_recv");
     (("", "recv_timeout"), "blorp_channel_recv_timeout");
     (("", "send_timeout"), "blorp_channel_send_timeout");
+    (("", "seal"), "blorp_channel_close");
     (("", "close"), "blorp_channel_close");
   ]
 

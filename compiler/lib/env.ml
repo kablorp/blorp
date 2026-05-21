@@ -195,11 +195,15 @@ type env = {
 (** Environment is a stack of scopes *)
 
 (** Empty environment. Reads the ambient [Session.current ()] for the
-    shared [impl_index] / [overloads] / [ufcs_methods] tables — those
-    are session-owned (one set per compile) so registrations made by
-    earlier [typecheck_module] calls within the same compile are
-    visible to later ones, without leaking across independent
-    [Pipeline.compile] invocations in the same OCaml process.
+    shared [impl_index] / [ufcs_methods] tables — those are session-owned
+    (one set per compile) so impl and method registrations made by earlier
+    [typecheck_module] calls within the same compile are visible to later
+    ones, without leaking across independent [Pipeline.compile] invocations
+    in the same OCaml process.
+
+    Ordinary overload sets are lexical/import-scope data, so each env gets a
+    fresh table. Sharing them at session scope lets one module's selective
+    imports influence another module's unrelated name resolution.
 
     Each [Pipeline.compile] runs inside [Session.with_current
     (Session.create ())], which makes the fresh session's tables the
@@ -220,7 +224,7 @@ let empty () : env =
     traits = [];
     impls = [];
     impl_index = sess.impl_index;
-    overloads = sess.overloads;
+    overloads = Hashtbl.create 32;
     ufcs_methods = sess.ufcs_methods;
   }
 

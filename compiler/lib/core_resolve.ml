@@ -59,7 +59,9 @@ type env = {
     - [user_func_names_by_id]: reverse index for call sites that carry a
       selected [vdef_id] from typed call metadata. This lets resolution recover
       the canonical post-flatten function name instead of mangling an old source
-      spelling such as [map] with the selected id for [map__pure].
+      spelling such as [map] with the selected id for [map__pure]. Only callable
+      definitions are indexed here; global values are tracked separately so a
+      value def-id can never become a call target.
     - [module_funcs]: module path + source function name → actual emitted
       Core function name and [cf_def_id]. This keeps module-owned wrappers that
       intentionally remain unprefixed, such as [std/fixed.fixed], addressable
@@ -255,10 +257,10 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
             Hashtbl.replace env.constructor_names v.variant_name ())
           t.type_variants
     | CDVar v ->
-        (* Global vars (module constants like [PI], [E]) need to be in the
-           symbol table so [rewrite_imported_var] can redirect bare-name
-           references (`PI`) to the prefixed form (`std_math__PI`). *)
-        register_user_func env v.cv_name.vname v.cv_def_id;
+        (* Global vars (module constants like [PI], [E]) are values, not
+           callable targets. Keep them out of [user_funcs] and especially the
+           reverse def-id index; otherwise a stale call-site [vdef_id] can turn
+           an unrelated call into a call to a global value. *)
         Hashtbl.replace env.user_value_types v.cv_name.vname v.cv_ty
     | CDPrivate inner -> visit_decl inner
     | _ -> ()
@@ -566,7 +568,10 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
             match
               match Codegen_builtins.lookup_prefixed name with
               | Some _ as hit -> hit
-              | None -> Hashtbl.find_opt env.builtin_funcs name
+              | None -> (
+                  match Hashtbl.find_opt env.builtin_funcs name with
+                  | Some _ as hit -> hit
+                  | None -> Codegen_builtins.lookup "" name)
             with
             | Some c_name -> CKBuiltin c_name
             | None -> (
@@ -735,7 +740,8 @@ let rewrite_imported_var ?(module_path = "") (env : env) (v : Core.var) :
   let try_prefix (mp, orig) =
     let prefixed = sanitize_module_name mp ^ "__" ^ orig in
     if
-      Hashtbl.mem env.user_funcs prefixed
+      Hashtbl.mem env.user_value_types prefixed
+      || Hashtbl.mem env.user_funcs prefixed
       || Hashtbl.mem env.foreign_funcs prefixed
     then Some prefixed
     else None

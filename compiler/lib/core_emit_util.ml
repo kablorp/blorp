@@ -91,6 +91,7 @@ type box_kind = Core.box_kind =
   | BoxFloat16
   | BoxInt128
   | BoxUInt128
+  | BoxVoid
   | BoxPointer
   | BoxPrim
   | BoxStruct of string
@@ -438,6 +439,7 @@ let emit_box_to_void ?(loc = Ast.dummy_loc) (ctx : Core_emit_context.t)
           | BoxInt128 -> emit ctx (Printf.sprintf "blorp_box_int128(%s)" c_expr)
           | BoxUInt128 ->
               emit ctx (Printf.sprintf "blorp_box_uint128(%s)" c_expr)
+          | BoxVoid -> emit ctx "(void*)0"
           | BoxStruct c_ty ->
               emit ctx
                 (Printf.sprintf "blorp_box_struct(&%s, sizeof(%s))" c_expr c_ty)

@@ -104,10 +104,10 @@ type check_state = {
 
       Deliberately not on [env]: two user files that each declare a
       local [record Vec2] need to see THEIR OWN Vec2's home, not the
-      other file's. The [env] Hashtbls (impl_index / overloads / …)
-      are shared across [Pipeline.check_modules] iterations on
-      purpose (cross-module trait dispatch); [type_home] is the one
-      piece that must not share. *)
+      other file's. Session-owned env tables such as [impl_index] and
+      [ufcs_methods] are shared across [Pipeline.check_modules] iterations
+      on purpose for cross-module trait dispatch; lexical tables such as
+      overloads are env-local. *)
   func_callable_ids : (func_callable_key, int) Hashtbl.t;
       (** Callable ids minted for named source functions in this compilation
       unit. Keyed by declaration name and source declaration location so typed

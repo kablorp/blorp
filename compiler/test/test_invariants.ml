@@ -61,7 +61,7 @@ let task_closure ?(name = "_blorp_task_test") ?(def_id = 9000) ?(captures = [])
   {
     tc_func = name;
     tc_def_id = def_id;
-    tc_captures = captures;
+    tc_captures = task_copy_captures captures;
     tc_return_ty = return_ty;
   }
 
@@ -1099,6 +1099,7 @@ let test_resource_capture_metadata_flags_task_capture () =
       cb_var = Var.named "answer";
       cb_ty = ty_result rhs.ty;
       cb_rhs = rhs;
+      cb_task_scope = synthetic_concurrent_task_scope;
       cb_task = Some task;
     }
   in
@@ -1132,6 +1133,56 @@ let test_resource_capture_metadata_flags_task_capture () =
         (Modules.contains v.Core_error.msg "resource capture")
   | _ -> Alcotest.fail "unreachable"
 
+let test_task_capture_metadata_flags_unsupported_kind () =
+  let rhs = cint 1 in
+  let task =
+    {
+      tc_func = "_blorp_task_test";
+      tc_def_id = 9001;
+      tc_captures =
+        [
+          {
+            task_capture_name = "item";
+            task_capture_ty = ty_int;
+            task_capture_kind = TaskMoveResourceItem;
+          };
+        ];
+      tc_return_ty = rhs.ty;
+    }
+  in
+  let binding =
+    {
+      cb_var = Var.named "answer";
+      cb_ty = ty_result rhs.ty;
+      cb_rhs = rhs;
+      cb_task_scope = synthetic_concurrent_task_scope;
+      cb_task = Some task;
+    }
+  in
+  let body = mk CVoid ty_void in
+  let node =
+    mk
+      (CConcurrent
+         {
+           conc_bindings = [ binding ];
+           conc_body = body;
+           conc_timeout = None;
+           conc_max_threads = None;
+         })
+      body.ty
+  in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
+  let violations =
+    Core_invariants.check_no_resource_capture_metadata_at Core_stage.Final prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions unsupported capture" true
+        (Modules.contains v.Core_error.msg "unsupported")
+  | _ -> Alcotest.fail "unreachable"
+
 (* ============================================================================
    Final Core: concurrency semantic contracts are explicit
    ============================================================================ *)
@@ -1143,6 +1194,7 @@ let concurrent_binding ?cb_ty ?task_ty name rhs =
     cb_var = Var.named name;
     cb_ty;
     cb_rhs = rhs;
+    cb_task_scope = synthetic_concurrent_task_scope;
     cb_task = Some (task_closure task_ty);
   }
 
@@ -1159,11 +1211,19 @@ let concurrent_block_expr ?timeout ?max_threads ?(node_ty = ty_void) bindings
     node_ty
 
 let concurrent_for_expr ?iter_ty ?body_ty ?node_ty ?timeout ?max_threads
-    ?task_ty () =
+    ?task_ty ?task_scope () =
   let iter_ty = Option.value iter_ty ~default:(ty_list ty_int) in
   let body_ty = Option.value body_ty ~default:ty_int in
   let node_ty = Option.value node_ty ~default:(ty_list (ty_result body_ty)) in
   let task_ty = Option.value task_ty ~default:body_ty in
+  let width =
+    match max_threads with
+    | Some n -> Ast.ConcurrentForMaxThreads n
+    | None -> Ast.ConcurrentForDefault
+  in
+  let task_scope =
+    Option.value task_scope ~default:Core.synthetic_concurrent_task_scope
+  in
   mk
     (CConcurrentFor
        {
@@ -1171,7 +1231,8 @@ let concurrent_for_expr ?iter_ty ?body_ty ?node_ty ?timeout ?max_threads
          cf_iter = mk (CVar (Var.named "items")) iter_ty;
          cf_body = mk (CVar (Var.named "item")) body_ty;
          cf_timeout = timeout;
-         cf_max_threads = max_threads;
+         cf_width = width;
+         cf_task_scope = task_scope;
          cf_task = Some (task_closure task_ty);
        })
     node_ty
@@ -1210,6 +1271,27 @@ let test_concurrent_semantics_flags_binding_result_mismatch () =
       Alcotest.(check bool)
         "mentions expected Result" true
         (Modules.contains v.Core_error.msg "Result[Int, ConcurrencyError]")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_concurrent_semantics_flags_duplicate_binding_names () =
+  let node =
+    concurrent_block_expr
+      [
+        concurrent_binding "answer" (cint 1);
+        concurrent_binding "answer" (cint 2);
+      ]
+      (mk CVoid ty_void)
+  in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
+  let violations =
+    Core_invariants.check_concurrent_semantics_at Core_stage.Final prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions duplicate concurrent binding" true
+        (Modules.contains v.Core_error.msg "duplicate concurrent binding")
   | _ -> Alcotest.fail "unreachable"
 
 let test_concurrent_semantics_flags_task_return_mismatch () =
@@ -1300,6 +1382,26 @@ let test_concurrent_semantics_flags_concurrent_for_result_shape () =
       Alcotest.(check bool)
         "mentions concurrent-for result" true
         (Modules.contains v.Core_error.msg "concurrent-for result type")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_concurrent_semantics_flags_malformed_task_scope () =
+  let bad_scope =
+    {
+      task_parent_scope_id = TaskScopeId 7;
+      task_child_scope_id = TaskScopeId 7;
+    }
+  in
+  let node = concurrent_for_expr ~task_scope:bad_scope () in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
+  let violations =
+    Core_invariants.check_concurrent_semantics_at Core_stage.Final prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions task scope" true
+        (Modules.contains v.Core_error.msg "task scope ids must differ")
   | _ -> Alcotest.fail "unreachable"
 
 let test_dispatcher_final_runs_concurrent_semantics () =
@@ -2131,6 +2233,8 @@ let suite =
           test_resource_capture_metadata_flags_closure_create;
         Alcotest.test_case "flags resource task capture metadata" `Quick
           test_resource_capture_metadata_flags_task_capture;
+        Alcotest.test_case "flags unsupported task capture metadata" `Quick
+          test_task_capture_metadata_flags_unsupported_kind;
       ] );
     ( "concurrency_semantics",
       [
@@ -2138,6 +2242,8 @@ let suite =
           test_concurrent_semantics_accepts_well_formed_block;
         Alcotest.test_case "flags binding result mismatch" `Quick
           test_concurrent_semantics_flags_binding_result_mismatch;
+        Alcotest.test_case "flags duplicate binding names" `Quick
+          test_concurrent_semantics_flags_duplicate_binding_names;
         Alcotest.test_case "flags task return mismatch" `Quick
           test_concurrent_semantics_flags_task_return_mismatch;
         Alcotest.test_case "flags timeout type" `Quick
@@ -2148,6 +2254,8 @@ let suite =
           test_concurrent_semantics_flags_non_list_concurrent_for;
         Alcotest.test_case "flags concurrent-for result shape" `Quick
           test_concurrent_semantics_flags_concurrent_for_result_shape;
+        Alcotest.test_case "flags malformed task scope" `Quick
+          test_concurrent_semantics_flags_malformed_task_scope;
         Alcotest.test_case "dispatcher runs final check" `Quick
           test_dispatcher_final_runs_concurrent_semantics;
       ] );

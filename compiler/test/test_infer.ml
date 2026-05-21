@@ -129,9 +129,9 @@ let test_subst_tyvar_always_binds () =
    asserts properties of the typed AST. These tests pin down the observable
    outcome of [Infer.build_subst] at actual call sites.
 
-   Isolation: each test runs inside its own [Session.t] so the
-   [impl_index] / [overloads] / [ufcs_methods] tables (which are
-   session-owned, aliased into [Env.empty ()]) are fresh per test.
+   Isolation: each test runs inside its own [Session.t] so the session-owned
+   [impl_index] / [ufcs_methods] tables are fresh per test. Function overload
+   sets are env-local lexical state.
    ============================================================================ *)
 
 (** Run [f] inside a fresh session so env tables are isolated. *)
@@ -544,6 +544,35 @@ pure func use(xs: List[Int]) -> List[Int]:
             (origin = CallableImported "std/list")
       | CallTraitMethod _ | CallClosure _ ->
           Alcotest.fail "expected direct function metadata")
+
+let test_call_metadata_for_annotated_module_qualified_function () =
+  with_isolated_env (fun () ->
+      let src =
+        {|
+import:
+    fixed as F
+
+
+func use() -> Fixed:
+    price: Fixed = F.fixed(2.5, 2)
+    price
+|}
+      in
+      let typed, errors = parse_and_typecheck_module src in
+      check_no_type_errors errors;
+      let call =
+        require_resolved_call_matching typed "use"
+          "annotated module-qualified function" (fun call ->
+            match call.call_target with
+            | CallDirect { source_name = "fixed"; origin; _ } ->
+                origin = CallableImported "std/fixed"
+            | _ -> false)
+      in
+      Alcotest.(check bool)
+        "annotated qualified call syntax" true
+        (call.call_syntax = CallQualified "std/fixed");
+      check_true "annotated qualified return"
+        (types_equal call.instantiated_return (TyNamed ("Fixed", []))))
 
 let test_call_metadata_for_imported_function_method_syntax () =
   with_isolated_env (fun () ->
@@ -2718,6 +2747,8 @@ let suite =
           test_call_metadata_for_trait_dispatch;
         Alcotest.test_case "module-qualified function records target" `Quick
           test_call_metadata_for_module_qualified_function;
+        Alcotest.test_case "annotated module-qualified function records target"
+          `Quick test_call_metadata_for_annotated_module_qualified_function;
         Alcotest.test_case "imported function method records target" `Quick
           test_call_metadata_for_imported_function_method_syntax;
         Alcotest.test_case "prelude method-only UFCS records target" `Quick

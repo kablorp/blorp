@@ -165,6 +165,30 @@ let test_collect_user_func_indexes_name_by_def_id () =
     "name by def id" (Some "apply__pure")
     (Hashtbl.find_opt env.user_func_names_by_id 42)
 
+let test_collect_global_value_does_not_index_name_by_def_id () =
+  let global_var : core_var =
+    {
+      cv_name = Var.named "tests";
+      cv_module = Some "./tests/test_blorp/types/test_if_expr";
+      cv_ty = TyNamed ("TestSuite", []);
+      cv_init = cvar "suite" (TyNamed ("TestSuite", []));
+      cv_is_mutable = false;
+      cv_is_const = false;
+      cv_def_id = 42;
+    }
+  in
+  let prog = [ { cd_desc = CDVar global_var; cd_loc = loc; cd_doc = None } ] in
+  let env =
+    Blorp.Core_resolve.collect_env ~import_aliases:(Hashtbl.create 0)
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  Alcotest.(check (option string))
+    "global value absent from callable reverse index" None
+    (Hashtbl.find_opt env.user_func_names_by_id 42);
+  Alcotest.(check bool)
+    "global value type still tracked" true
+    (Hashtbl.mem env.user_value_types "tests")
+
 let test_collect_duplicate_def_id_marks_id_ambiguous () =
   let make_func name : core_func =
     {
@@ -1527,6 +1551,60 @@ let test_resolve_ufcs_by_first_arg_builtin () =
   expect_builtin_call "String.get UFCS" "blorp_string_get_opt"
     (get_func_body resolved)
 
+let test_resolve_call_ignores_global_value_def_id () =
+  (* Runtime suites combine many modules. A stale or collided call-site def-id
+     must not allow a global test-suite value to become a callable target. *)
+  let ty_str = TyNamed ("String", []) in
+  let ty_char = TyNamed ("Char", []) in
+  let ret_ty = TyNamed ("Option", [ ty_char ]) in
+  let get_fty =
+    TyFunc { params = [ ty_str; ty_int ]; return = ret_ty; is_pure = true }
+  in
+  let global_var : core_var =
+    {
+      cv_name = Var.named "tests";
+      cv_module = Some "./tests/test_blorp/types/test_if_expr";
+      cv_ty = TyNamed ("TestSuite", []);
+      cv_init = cvar "suite" (TyNamed ("TestSuite", []));
+      cv_is_mutable = false;
+      cv_is_const = false;
+      cv_def_id = 42;
+    }
+  in
+  let stale_callee =
+    mk (CVar { (Var.named "get") with vdef_id = Some 42 }) get_fty
+  in
+  let call =
+    mk (CCall (CKUnknown, stale_callee, [ cvar "s" ty_str; cint 0 ])) ret_ty
+  in
+  let body_func : core_func =
+    {
+      cf_name = "f";
+      cf_type_params = [];
+      cf_params = [];
+      cf_module = None;
+      cf_return_ty = ret_ty;
+      cf_body = Some call;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDVar global_var; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc body_func; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved = Blorp.Core_resolve.resolve_program prog in
+  let body =
+    match resolved with
+    | [ _; { cd_desc = CDFunc { cf_body = Some b; _ }; _ } ] -> b
+    | _ -> Alcotest.fail "expected global value plus body function"
+  in
+  expect_builtin_call "stale value def-id does not select global value"
+    "blorp_string_get_opt" body
+
 let test_resolve_monomorphized_bodyless_builtin () =
   (* Post-mono builtins that stay bodyless must still resolve to their
      runtime C builtin. Otherwise [Core_closure] treats the function-typed
@@ -2116,6 +2194,8 @@ let suite =
         Alcotest.test_case "user_func" `Quick test_collect_user_func;
         Alcotest.test_case "user_func_name_by_def_id" `Quick
           test_collect_user_func_indexes_name_by_def_id;
+        Alcotest.test_case "global_value_not_name_by_def_id" `Quick
+          test_collect_global_value_does_not_index_name_by_def_id;
         Alcotest.test_case "duplicate_def_id_marks_id_ambiguous" `Quick
           test_collect_duplicate_def_id_marks_id_ambiguous;
         Alcotest.test_case "foreign_func" `Quick test_collect_foreign_func;
@@ -2177,6 +2257,8 @@ let suite =
           test_module_owned_unprefixed_func_does_not_pollute_bare_name;
         Alcotest.test_case "ufcs_by_first_arg_builtin" `Quick
           test_resolve_ufcs_by_first_arg_builtin;
+        Alcotest.test_case "call_ignores_global_value_def_id" `Quick
+          test_resolve_call_ignores_global_value_def_id;
         Alcotest.test_case "monomorphized_bodyless_builtin" `Quick
           test_resolve_monomorphized_bodyless_builtin;
         Alcotest.test_case "bodyless_builtin_overloads_resolve_by_call_site"

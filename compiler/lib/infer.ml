@@ -819,13 +819,85 @@ let annotate_inferred_expr expr ty =
   annotate_expr_type_info expr
     (expr_type_info_of_slot (Type_widening.keep_slot ty))
 
-(** Collect all variable references in an expression.
-    Used for scoped-resource and mutable capture detection. *)
-let rec collect_var_refs (expr : expr) : string list =
+let add_bound_name name bound =
+  if name = "_" || List.mem name bound then bound else name :: bound
+
+let add_bound_names names bound =
+  List.fold_left (fun acc name -> add_bound_name name acc) bound names
+
+let param_bound_names (param : Ast.param) =
+  let named =
+    match param.param_name with Some name -> [ name ] | None -> []
+  in
+  let patterned =
+    match param.param_pattern with
+    | Some pattern -> Ast.collect_pattern_vars pattern
+    | None -> []
+  in
+  named @ patterned
+
+let func_bound_names (func : func_decl) =
+  List.concat_map param_bound_names func.func_params
+
+let sequence_bound_after_expr bound expr =
   match expr.expr_desc with
-  | EIdent name -> [ name ]
-  | EAssign (name, init) -> name :: collect_var_refs init
-  | _ -> List.concat_map collect_var_refs (expr_children expr)
+  | EVarDecl (name, _, _, _) -> add_bound_name name bound
+  | ETupleDestruct (names, _) -> add_bound_names names bound
+  | EQuestionBind (name, _, _) -> add_bound_name name bound
+  | EFuncDecl { func_name = Some name; _ } -> add_bound_name name bound
+  | EConcurrent (stmts, _, _) ->
+      List.fold_left
+        (fun acc stmt ->
+          match stmt.expr_desc with
+          | EConcurrentBind (name, _, _) -> add_bound_name name acc
+          | _ -> acc)
+        bound stmts
+  | _ -> bound
+
+(** Collect free variable references in an expression, respecting local binders. *)
+let collect_free_var_refs (expr : expr) : string list =
+  let rec go bound expr =
+    match expr.expr_desc with
+    | EIdent name -> if List.mem name bound then [] else [ name ]
+    | EAssign (name, value) ->
+        (if List.mem name bound then [] else [ name ]) @ go bound value
+    | EBlock exprs | EDebugBlock exprs -> go_sequence bound exprs
+    | EFor (name, iter, body) ->
+        go bound iter @ go (add_bound_name name bound) body
+    | EForTuple (names, iter, body) ->
+        go bound iter @ go (add_bound_names names bound) body
+    | EMatch (scrutinee, cases) ->
+        go bound scrutinee
+        @ List.concat_map
+            (fun case ->
+              let case_bound =
+                add_bound_names
+                  (Ast.collect_pattern_vars case.case_pattern)
+                  bound
+              in
+              go case_bound case.case_body)
+            cases
+    | EWith (binding, body) ->
+        go bound binding.with_value
+        @ go (add_bound_name binding.with_name bound) body
+    | ELambda func | EFuncDecl func -> (
+        let bound =
+          add_bound_names
+            (Option.to_list func.func_name @ func_bound_names func)
+            bound
+        in
+        match func_body_expr_opt func.func_body with
+        | Some body -> go bound body
+        | None -> [])
+    | _ -> expr |> expr_children |> List.concat_map (go bound)
+  and go_sequence bound exprs =
+    match exprs with
+    | [] -> []
+    | expr :: rest ->
+        let refs = go bound expr in
+        refs @ go_sequence (sequence_bound_after_expr bound expr) rest
+  in
+  go [] expr |> List.sort_uniq String.compare
 
 let split_resource_def_id_suffix (name : string) : string * int option =
   match String.rindex_opt name '#' with
@@ -877,11 +949,6 @@ let rec scoped_resource_dependency_refs env expr =
 
 let scoped_resource_related_refs env expr =
   scoped_resource_dependency_refs env expr
-
-let scoped_resource_derived_refs env expr =
-  expr |> collect_var_refs
-  |> List.sort_uniq String.compare
-  |> List.filter (Env.is_scoped_resource_derived_var env)
 
 let is_one_shot_stream_type_name name =
   match Types.split_canonical_module_type_name name with
@@ -957,10 +1024,15 @@ let one_shot_stream_refs env refs =
           type_contains_one_shot_stream env var_type
       | Some _ | None -> false)
 
+let mutable_capture_refs env refs =
+  refs
+  |> List.filter (fun name ->
+      match Env.lookup env name with
+      | Some { kind = Env.VarSymbol { mutability = Mutable; _ }; _ } -> true
+      | _ -> false)
+
 let one_shot_stream_capture_refs env expr =
-  expr |> collect_var_refs
-  |> List.sort_uniq String.compare
-  |> one_shot_stream_refs env
+  expr |> collect_free_var_refs |> one_shot_stream_refs env
 
 let expression_derives_from_scoped_resource env expr =
   scoped_resource_related_refs env expr <> []
@@ -1052,11 +1124,13 @@ let reject_one_shot_stream_storage env loc container ty =
 
 let reject_scoped_resource_task_capture env loc expr =
   let scoped_captures =
-    expr |> collect_var_refs
-    |> List.sort_uniq String.compare
+    expr |> collect_free_var_refs
     |> List.filter (Env.is_scoped_resource_var env)
   in
-  let derived_captures = scoped_resource_derived_refs env expr in
+  let derived_captures =
+    expr |> collect_free_var_refs
+    |> List.filter (Env.is_scoped_resource_derived_var env)
+  in
   let stream_captures = one_shot_stream_capture_refs env expr in
   match (scoped_captures, derived_captures, stream_captures) with
   | [], [], [] -> Ok ()
@@ -1269,6 +1343,175 @@ let reject_concurrent_resource_result ctx loc ty =
             only ordinary data from concurrent tasks.")
       loc "concurrent task result cannot contain resource values"
   else Ok ()
+
+let root_assignment_ident (expr : expr) : string option =
+  let rec go e =
+    match e.expr_desc with
+    | EIdent name -> Some name
+    | EFieldAccess (inner, _) -> go inner
+    | _ -> None
+  in
+  go expr
+
+let reject_concurrent_outer_mutation ?(allowed_targets = []) env context body =
+  let is_allowed name = List.mem name allowed_targets in
+  let reject_if_outer_mutable bound loc name =
+    if is_allowed name || List.mem name bound then Ok ()
+    else
+      match Env.lookup env name with
+      | Some { kind = VarSymbol { mutability = Mutable; _ }; _ } ->
+          error loc
+            (Printf.sprintf
+               "Cannot assign to outer variable '%s' inside %s (data race)" name
+               context)
+      | _ -> Ok ()
+  in
+  let rec check bound e =
+    let* () =
+      match e.expr_desc with
+      | EAssign (name, _) -> reject_if_outer_mutable bound e.expr_loc name
+      | ESubscriptAssign (target, _, _) -> (
+          match root_assignment_ident target with
+          | Some name -> reject_if_outer_mutable bound e.expr_loc name
+          | None -> Ok ())
+      | _ -> Ok ()
+    in
+    match e.expr_desc with
+    | EBlock exprs | EDebugBlock exprs -> check_sequence bound exprs
+    | EFor (name, iter, body) ->
+        let* () = check bound iter in
+        check (add_bound_name name bound) body
+    | EForTuple (names, iter, body) ->
+        let* () = check bound iter in
+        check (add_bound_names names bound) body
+    | EMatch (scrutinee, cases) ->
+        let* () = check bound scrutinee in
+        List.fold_left
+          (fun acc case ->
+            let* () = acc in
+            let case_bound =
+              add_bound_names (Ast.collect_pattern_vars case.case_pattern) bound
+            in
+            check case_bound case.case_body)
+          (Ok ()) cases
+    | EWith (binding, body) ->
+        let* () = check bound binding.with_value in
+        check (add_bound_name binding.with_name bound) body
+    | EConcurrent (_, timeout_opt, _) -> (
+        match timeout_opt with
+        | Some timeout -> check bound timeout
+        | None -> Ok ())
+    | EConcurrentFor (_, iter, _, timeout_opt, _) -> (
+        let* () = check bound iter in
+        match timeout_opt with
+        | Some timeout -> check bound timeout
+        | None -> Ok ())
+    | ELambda _ | EFuncDecl _ | EDetach _ -> Ok ()
+    | _ ->
+        List.fold_left
+          (fun acc child ->
+            let* () = acc in
+            check bound child)
+          (Ok ()) (Ast.expr_children e)
+  and check_sequence bound exprs =
+    match exprs with
+    | [] -> Ok ()
+    | expr :: rest ->
+        let* () = check bound expr in
+        check_sequence (sequence_bound_after_expr bound expr) rest
+  in
+  check [] body
+
+let reject_concurrent_mutable_capture env context loc body =
+  match collect_free_var_refs body |> mutable_capture_refs env with
+  | [] -> Ok ()
+  | vars ->
+      error_with
+        ~notes:
+          [
+            "Concurrent work may run after the current scope mutates the \
+             binding.";
+            "Bind an immutable snapshot before starting work when a task needs \
+             the current value.";
+          ]
+        ~help:
+          (Some
+             "Use an immutable binding such as `snapshot = value` outside the \
+              concurrent work, then capture `snapshot`.")
+        loc
+        (Printf.sprintf "%s cannot capture mutable variable%s: %s" context
+           (if List.length vars > 1 then "s" else "")
+           (String.concat ", " vars))
+
+let concurrent_binding_name (expr : expr) : (string * loc) option =
+  match expr.expr_desc with
+  | EVarDecl (name, _, _, false) | EAssign (name, _) ->
+      Some (name, expr.expr_loc)
+  | _ -> None
+
+let reject_duplicate_concurrent_bindings stmts =
+  let rec go seen = function
+    | [] -> Ok ()
+    | stmt :: rest -> (
+        match concurrent_binding_name stmt with
+        | Some (name, loc) when List.mem name seen ->
+            error_with
+              ~notes:
+                [
+                  "Each concurrent result binding is declared once after the \
+                   block joins.";
+                ]
+              ~help:
+                (Some "Use distinct result names inside the concurrent block.")
+              loc
+              (Printf.sprintf "Duplicate concurrent binding '%s'" name)
+        | Some (name, _) -> go (name :: seen) rest
+        | None -> go seen rest)
+  in
+  go [] stmts
+
+let reject_concurrent_sibling_binding_refs env binding_names current_name loc
+    body =
+  let unavailable =
+    body |> collect_free_var_refs
+    |> List.filter (fun name ->
+        List.mem name binding_names && Option.is_none (Env.lookup env name))
+    |> List.sort_uniq String.compare
+  in
+  match unavailable with
+  | [] -> Ok ()
+  | vars ->
+      let quote name = Printf.sprintf "'%s'" name in
+      let msg =
+        match vars with
+        | [ name ] when name = current_name ->
+            Printf.sprintf
+              "concurrent binding '%s' is not available inside its own task"
+              name
+        | [ name ] ->
+            Printf.sprintf
+              "concurrent binding '%s' is not available inside another \
+               concurrent task"
+              name
+        | _ ->
+            Printf.sprintf
+              "concurrent bindings %s are not available inside sibling \
+               concurrent tasks"
+              (vars |> List.map quote |> String.concat ", ")
+      in
+      error_with
+        ~notes:
+          [
+            "Concurrent task results are created only after all child tasks \
+             join.";
+            "Each top-level concurrent task is checked against the parent \
+             scope, not against sibling task results.";
+          ]
+        ~help:
+          (Some
+             "Move dependent work after the concurrent block, or compute the \
+              dependency inside one task.")
+        loc msg
 
 let resource_call_allows_resource_arg ctx callee_name resolved_overload =
   match resolved_overload with
@@ -2575,27 +2818,9 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
   match func_body_expr_opt func.func_body with
   | None -> None
   | Some body -> (
-      (* Get all variable references in the body *)
-      let all_refs = collect_var_refs body in
-      (* Get parameter names (these are locally bound, not captures) *)
-      let param_names =
-        List.filter_map (fun (p : Ast.param) -> p.param_name) func.func_params
-      in
-      (* Free variables are references that aren't parameters *)
-      let free_vars =
-        List.filter (fun name -> not (List.mem name param_names)) all_refs
-      in
-      (* Remove duplicates *)
-      let free_vars = List.sort_uniq String.compare free_vars in
+      let free_vars = collect_free_var_refs body in
       (* Check if any free variable is mutable *)
-      let mutable_captures =
-        List.filter
-          (fun name ->
-            match lookup env name with
-            | Some { kind = VarSymbol { mutability = Mutable; _ }; _ } -> true
-            | _ -> false)
-          free_vars
-      in
+      let mutable_captures = mutable_capture_refs env free_vars in
       let resource_captures =
         List.filter (fun name -> Env.is_scoped_resource_var env name) free_vars
       in
@@ -2972,6 +3197,18 @@ let resolved_target_from_module_func module_path func_name
         })
     info.module_func_callable_id
 
+let resolved_target_from_qualified_callee ctx callee =
+  match callee.expr_desc with
+  | EFieldAccess ({ expr_desc = EIdent alias; _ }, func_name) -> (
+      match List.assoc_opt alias ctx.module_aliases with
+      | Some module_path -> (
+          match lookup_module_func_resolution module_path func_name with
+          | Some info ->
+              resolved_target_from_module_func module_path func_name info
+          | None -> None)
+      | None -> None)
+  | _ -> None
+
 let resolved_target_from_callee ctx callee_name callee_ty =
   match callee_name with
   | Some name -> (
@@ -3046,8 +3283,10 @@ let resolved_call_metadata ?call_syntax_hint ctx ~source_callee ~resolved_callee
           (CallTraitMethod { trait_name; method_name; call_pure; callable_id })
     | None, None, Some name, Some entry ->
         Some (resolved_target_from_overload name entry)
-    | None, None, _, None ->
-        resolved_target_from_callee ctx callee_name callee_ty
+    | None, None, _, None -> (
+        match resolved_target_from_qualified_callee ctx resolved_callee with
+        | Some target -> Some target
+        | None -> resolved_target_from_callee ctx callee_name callee_ty)
     | None, None, None, Some _ -> None
   in
   Option.map
@@ -3352,8 +3591,9 @@ and zonk_expr_desc = function
       EConcurrent (List.map zonk_expr xs, Option.map zonk_expr t, m)
   | EConcurrentBind (n, ty, v) ->
       EConcurrentBind (n, Option.map Types.zonk_type ty, zonk_expr v)
-  | EConcurrentFor (v, it, b, t, m) ->
-      EConcurrentFor (v, zonk_expr it, zonk_expr b, Option.map zonk_expr t, m)
+  | EConcurrentFor (v, it, b, t, width) ->
+      EConcurrentFor
+        (v, zonk_expr it, zonk_expr b, Option.map zonk_expr t, width)
   | EDetach x -> EDetach (zonk_expr x)
   | EDict pairs ->
       EDict (List.map (fun (k, v) -> (zonk_expr k, zonk_expr v)) pairs)
@@ -5242,13 +5482,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       (* Check mutability: subscript assignment requires a mutable variable.
          Recurse through field accesses to find the root variable. *)
       let* () =
-        let rec find_root_var e =
-          match e.expr_desc with
-          | EIdent name -> Some name
-          | EFieldAccess (inner, _) -> find_root_var inner
-          | _ -> None
-        in
-        match find_root_var coll with
+        match root_assignment_ident coll with
         | Some name -> (
             match Env.lookup ctx.env name with
             | Some { kind = VarSymbol { mutability = Immutable; _ }; _ } ->
@@ -5298,6 +5532,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
   | EConcurrent (stmts, timeout_opt, max_threads) ->
       if stmts = [] then error loc "concurrent: block cannot be empty"
       else begin
+        let binding_names =
+          stmts
+          |> List.filter_map (fun stmt ->
+              stmt |> concurrent_binding_name |> Option.map fst)
+        in
+        let* () = reject_duplicate_concurrent_bindings stmts in
         (* Validate timeout is Int if present *)
         let* timeout_opt' =
           match timeout_opt with
@@ -5309,7 +5549,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           | None -> Ok None
         in
         (* Infer each binding — must be EVarDecl (immutable) *)
-        let infer_one_binding ctx stmt name ty_ann body =
+        let infer_one_binding stmt name ty_ann body =
+          let* () = check_no_redeclaration ctx.env name stmt.expr_loc in
+          let* () =
+            reject_concurrent_sibling_binding_refs ctx.env binding_names name
+              body.expr_loc body
+          in
           let* () =
             reject_removed_tensor_type_syntax_opt stmt.expr_loc ty_ann
           in
@@ -5319,6 +5564,13 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           in
           let* () =
             reject_concurrent_resource_result ctx body.expr_loc body_ty
+          in
+          let* () =
+            reject_concurrent_outer_mutation ctx.env "concurrent task" body'
+          in
+          let* () =
+            reject_concurrent_mutable_capture ctx.env "concurrent task"
+              body.expr_loc body'
           in
           let result_ty =
             TyNamed ("Result", [ body_ty; TyNamed ("ConcurrencyError", []) ])
@@ -5337,32 +5589,26 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                        (type_to_string ann_ty) (type_to_string result_ty))
             | None -> Ok ()
           in
-          let env' = Env.add_var ctx.env name result_ty () in
-          let ctx' = { ctx with env = env' } in
           let bind' =
             with_inferred_type
               { stmt with expr_desc = EConcurrentBind (name, ty_ann, body') }
               result_ty
           in
-          Ok (bind', ctx')
+          Ok bind'
         in
-        let rec infer_concurrent_bindings ctx acc = function
+        let rec infer_concurrent_bindings acc = function
           | [] ->
               if acc = [] then error loc "concurrent: block cannot be empty"
-              else Ok (List.rev acc, ctx)
+              else Ok (List.rev acc)
           | stmt :: rest -> (
               match stmt.expr_desc with
               | EVarDecl (name, ty_ann, body, false) ->
-                  let* bind', ctx' =
-                    infer_one_binding ctx stmt name ty_ann body
-                  in
-                  infer_concurrent_bindings ctx' (bind' :: acc) rest
+                  let* bind' = infer_one_binding stmt name ty_ann body in
+                  infer_concurrent_bindings (bind' :: acc) rest
               | EAssign (name, body) ->
                   (* name = expr without type annotation also valid *)
-                  let* bind', ctx' =
-                    infer_one_binding ctx stmt name None body
-                  in
-                  infer_concurrent_bindings ctx' (bind' :: acc) rest
+                  let* bind' = infer_one_binding stmt name None body in
+                  infer_concurrent_bindings (bind' :: acc) rest
               | EVarDecl (_, _, _, true) ->
                   error stmt.expr_loc
                     "concurrent bindings cannot be mutable (var)"
@@ -5371,7 +5617,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                     "concurrent: block must contain only bindings (name = expr)"
               )
         in
-        let* bindings', _ctx' = infer_concurrent_bindings ctx [] stmts in
+        let* bindings' = infer_concurrent_bindings [] stmts in
         (* EConcurrent evaluates to Void; bindings leak to enclosing scope via infer_all *)
         Ok
           ( ty_void,
@@ -5383,7 +5629,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               ty_void )
       end
   (* concurrent for — dynamic fan-out *)
-  | EConcurrentFor (var, iter, body, timeout_opt, max_threads) ->
+  | EConcurrentFor (var, iter, body, timeout_opt, width) ->
       (* Validate timeout is Int if present *)
       let* timeout_opt' =
         match timeout_opt with
@@ -5413,27 +5659,14 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         reject_scoped_resource_task_capture inner_ctx.env body.expr_loc body'
       in
       let* () = reject_concurrent_resource_result ctx body.expr_loc body_ty in
-      (* Check for assignments to outer mutable variables (data race) *)
-      let rec check_outer_assigns (e : expr) =
-        match e.expr_desc with
-        | EAssign (name, _) when name <> var -> (
-            match Env.lookup ctx.env name with
-            | Some { kind = VarSymbol { mutability = Mutable; _ }; _ } ->
-                error e.expr_loc
-                  (Printf.sprintf
-                     "Cannot assign to outer variable '%s' inside concurrent \
-                      for (data race)"
-                     name)
-            | _ -> Ok ())
-        | _ ->
-            List.fold_left
-              (fun acc child ->
-                match acc with
-                | Error e -> Error e
-                | Ok () -> check_outer_assigns child)
-              (Ok ()) (Ast.expr_children e)
+      let* () =
+        reject_concurrent_outer_mutation ~allowed_targets:[ var ] ctx.env
+          "concurrent for" body'
       in
-      let* () = check_outer_assigns body' in
+      let* () =
+        reject_concurrent_mutable_capture inner_ctx.env "concurrent for"
+          body.expr_loc body'
+      in
       let result_elem_ty =
         TyNamed ("Result", [ body_ty; TyNamed ("ConcurrencyError", []) ])
       in
@@ -5443,19 +5676,22 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           with_inferred_type
             {
               expr with
-              expr_desc =
-                EConcurrentFor (var, iter', body', timeout_opt', max_threads);
+              expr_desc = EConcurrentFor (var, iter', body', timeout_opt', width);
             }
             result_ty )
   (* detach expr — detach, returns Void *)
   | EDetach body ->
       let* body_ty, body' = infer_unconstrained_value_expr ctx body in
+      let free_vars = collect_free_var_refs body' in
       let scoped_captures =
-        body' |> collect_var_refs
-        |> List.sort_uniq String.compare
+        free_vars
         |> List.filter (fun name -> Env.is_scoped_resource_var ctx.env name)
       in
-      let derived_captures = scoped_resource_derived_refs ctx.env body' in
+      let derived_captures =
+        free_vars
+        |> List.filter (fun name ->
+            Env.is_scoped_resource_derived_var ctx.env name)
+      in
       let stream_captures = one_shot_stream_capture_refs ctx.env body' in
       let* () =
         match (scoped_captures, derived_captures, stream_captures) with
@@ -5496,6 +5732,10 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               (Printf.sprintf "detach cannot capture %s%s: %s" label
                  (if List.length vars > 1 then "s" else "")
                  (String.concat ", " vars))
+      in
+      let* () = reject_concurrent_outer_mutation ctx.env "detach" body' in
+      let* () =
+        reject_concurrent_mutable_capture ctx.env "detach" body.expr_loc body'
       in
       let* () = reject_discarded_resource_value ctx body.expr_loc body_ty in
       Ok
@@ -8023,6 +8263,23 @@ and infer_call ctx expr callee args loc =
                   (entry, "from expected return type"))
                 initial_subst
             in
+            let callee_is_constructor =
+              match callee_name with
+              | Some name -> (
+                  match Env.lookup ctx.env name with
+                  | Some { kind = ConstructorSymbol _; _ } -> true
+                  | _ -> false)
+              | None -> false
+            in
+            let parameter_accepts_void_payload param_ty =
+              callee_is_constructor
+              &&
+              let param_ty =
+                normalize_type ctx ArgumentCompatibility
+                  (Types.zonk_type param_ty)
+              in
+              types_equal param_ty ty_void
+            in
             (* NOTE: Do NOT pre-apply initial_subst to params here.
            The fold below starts with initial_subst in acc_subst and applies it
            to each param_ty. Pre-applying would cause double-substitution when
@@ -8052,6 +8309,7 @@ and infer_call ctx expr callee args loc =
                           if
                             (* Prevent Void expressions from being passed as arguments *)
                             arg_ty = TyNamed ("Void", [])
+                            && not (parameter_accepts_void_payload param_ty)
                           then
                             error arg.expr_loc
                               "Cannot use Void expression as a function \

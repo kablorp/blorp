@@ -406,7 +406,7 @@ let hoist_task_closure (state : state) ~(loc : Ast.loc) ~(body : core)
   {
     tc_func = name;
     tc_def_id = def_id;
-    tc_captures = captures;
+    tc_captures = task_copy_captures captures;
     tc_return_ty = return_ty;
   }
 

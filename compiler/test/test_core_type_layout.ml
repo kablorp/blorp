@@ -345,7 +345,10 @@ let test_erased_storage_box_kind_is_centralized () =
     (classify (ty "Vec2" []) = Blorp.Core.BoxStruct "Vec2");
   Alcotest.(check bool)
     "managed pointers stay pointers" true
-    (classify (ty "String" []) = Blorp.Core.BoxPointer)
+    (classify (ty "String" []) = Blorp.Core.BoxPointer);
+  Alcotest.(check bool)
+    "Void boxes as an explicit unit payload" true
+    (classify (ty "Void" []) = Blorp.Core.BoxVoid)
 
 let test_erased_storage_rejects_variadic_dimension_pack () =
   let reg = Blorp.Codegen_types.create_registry () in
@@ -423,6 +426,7 @@ let test_layout_type_erased_storage_maps_to_core_boxing () =
     [
       (ty "Float" [], Blorp.Core.BoxFloat, Blorp.Core.UnboxFloat);
       (ty "Int" [], Blorp.Core.BoxPrim, Blorp.Core.UnboxPrim);
+      (ty "Void" [], Blorp.Core.BoxVoid, Blorp.Core.UnboxPointer);
       (ty "String" [], Blorp.Core.BoxPointer, Blorp.Core.UnboxPointer);
       (ty "Vec2" [], Blorp.Core.BoxStruct "Vec2", Blorp.Core.UnboxStruct "Vec2");
     ]

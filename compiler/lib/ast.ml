@@ -207,6 +207,17 @@ type rc_annotation = {
 (** RC annotation computed by pre-codegen pass from type information.
     None on expr means "unknown" — codegen falls back to existing heuristics. *)
 
+type concurrent_for_width =
+  | ConcurrentForDefault
+  | ConcurrentForMaxThreads of int
+      (** Legacy [concurrent(max_threads: N) for ...] spelling. *)
+  | ConcurrentForLimit of int
+      (** Migration spelling [for ... concurrently(limit: N)]. *)
+
+let concurrent_for_width_value = function
+  | ConcurrentForDefault -> None
+  | ConcurrentForMaxThreads n | ConcurrentForLimit n -> Some n
+
 type expr = {
   expr_desc : expr_desc;
   expr_loc : loc;
@@ -273,8 +284,8 @@ and expr_desc =
       (** concurrent: block — bindings, optional timeout_ms expr, optional max_threads *)
   | EConcurrentBind of string * type_expr option * expr
       (** name = expr — concurrent task binding *)
-  | EConcurrentFor of string * expr * expr * expr option * int option
-      (** var, iterable, body, optional timeout, optional max_threads *)
+  | EConcurrentFor of string * expr * expr * expr option * concurrent_for_width
+      (** var, iterable, body, optional timeout, explicit scheduling width *)
   | EDetach of expr  (** detach expr — detach on thread pool *)
   | EDict of (expr * expr) list  (** {"key" => val, ...} — dict literal *)
   | EBuiltin of string option

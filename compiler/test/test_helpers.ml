@@ -18,10 +18,11 @@ let contains_substring haystack needle = Blorp.Modules.contains haystack needle
    Env isolation — run the test inside its own [Session.t]
 
    [Env.empty ()] reads [Session.current ()] for its [impl_index] /
-   [overloads] / [ufcs_methods] tables. Wrapping a test in a fresh
-   session gives it isolated tables; when the session goes out of
-   scope, its state goes with it. Replaces the old snapshot/restore
-   hack that operated on the process-global default session.
+   [ufcs_methods] tables. Function overload sets are env-local lexical
+   state. Wrapping a test in a fresh session gives session-owned tables
+   isolation; when the session goes out of scope, its state goes with it.
+   Replaces the old snapshot/restore hack that operated on the
+   process-global default session.
    ============================================================================ *)
 
 let with_isolated_env (f : unit -> 'a) : 'a =

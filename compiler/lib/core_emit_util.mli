@@ -58,6 +58,7 @@ type box_kind = Core.box_kind =
   | BoxFloat16
   | BoxInt128
   | BoxUInt128
+  | BoxVoid
   | BoxPointer
   | BoxPrim
   | BoxStruct of string

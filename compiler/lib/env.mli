@@ -210,11 +210,14 @@ type env = {
 (** Environment is a stack of scopes *)
 
 val empty : unit -> env
-(** Construct a fresh empty environment. The returned env's [impl_index],
-    [overloads], and [ufcs_methods] fields alias [Session.current ()]'s
-    tables — writes through the env affect the session and are visible
-    to every other env derived from the same session, but isolated from
-    envs derived under a different [Session.with_current] frame. *)
+(** Construct a fresh empty environment. The returned env's [impl_index] and
+    [ufcs_methods] fields alias [Session.current ()]'s tables — writes through
+    those fields affect the session and are visible to every other env derived
+    from the same session, but isolated from envs derived under a different
+    [Session.with_current] frame.
+
+    [overloads] is intentionally fresh per env because function overloads are
+    lexical/import-scope state, not a compile-wide registry. *)
 
 val push_scope : env -> env
 (** Push a new scope *)

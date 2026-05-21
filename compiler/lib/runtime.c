@@ -361,6 +361,8 @@ typedef struct {
     long fiber_resumes;
     long fiber_parks;
     long fiber_schedule_transitions;
+    long channel_send_parks;
+    long channel_recv_parks;
     long runnable_enqueues;
     long run_queue_pops;
     long timer_inserts;
@@ -564,6 +566,8 @@ static struct {
     _Atomic long fiber_resumes;
     _Atomic long fiber_parks;
     _Atomic long fiber_schedule_transitions;
+    _Atomic long channel_send_parks;
+    _Atomic long channel_recv_parks;
     _Atomic long runnable_enqueues;
     _Atomic long run_queue_pops;
     _Atomic long timer_inserts;
@@ -15201,6 +15205,57 @@ void* blorp_task_try_join(void* t) {
 // timeout_ms < 0 means no timeout (wait forever).
 // Returns Ok(result) on success, Err(Timeout) on timeout.
 // Same ownership transfer as task_join.
+static inline uint64_t __blorp_deadline_ns_from_timeout_ms(long timeout_ms) {
+    uint64_t now_ns = blorp_monotonic_now_ns();
+    if (timeout_ms <= 0) return now_ns;
+    uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
+    if (timeout_ns / 1000000ULL != (uint64_t)timeout_ms) return UINT64_MAX;
+    if (UINT64_MAX - now_ns < timeout_ns) return UINT64_MAX;
+    return now_ns + timeout_ns;
+}
+
+static inline struct timespec __blorp_realtime_deadline_from_timeout_ms(long timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    if (timeout_ms <= 0) return deadline;
+
+    long add_sec = timeout_ms / 1000;
+    long add_nsec = (timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_sec > (time_t)(LONG_MAX - add_sec - 1)) {
+        deadline.tv_sec = (time_t)LONG_MAX;
+        deadline.tv_nsec = 999999999L;
+        return deadline;
+    }
+
+    deadline.tv_nsec += add_nsec;
+    deadline.tv_sec += add_sec + deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+    return deadline;
+}
+
+long blorp_concurrent_deadline_us(long timeout_ms) {
+    uint64_t now_us = blorp_monotonic_now_ns() / 1000ULL;
+    uint64_t max_long = (uint64_t)LONG_MAX;
+    if (now_us > max_long) return LONG_MAX;
+    if (timeout_ms <= 0) return (long)now_us;
+
+    uint64_t timeout_us = (uint64_t)timeout_ms * 1000ULL;
+    if (timeout_us / 1000ULL != (uint64_t)timeout_ms) return LONG_MAX;
+    if (max_long - now_us < timeout_us) return LONG_MAX;
+    return (long)(now_us + timeout_us);
+}
+
+long blorp_concurrent_remaining_ms(long deadline_us) {
+    if (deadline_us <= 0) return 0;
+    uint64_t now_us = blorp_monotonic_now_ns() / 1000ULL;
+    uint64_t deadline = (uint64_t)deadline_us;
+    if (deadline <= now_us) return 0;
+
+    uint64_t remaining_us = deadline - now_us;
+    uint64_t remaining_ms = (remaining_us + 999ULL) / 1000ULL;
+    return remaining_ms > (uint64_t)LONG_MAX ? LONG_MAX : (long)remaining_ms;
+}
+
 void* blorp_concurrent_join(void* t, long timeout_ms) {
     if (__blorp_cancel_current_task_if_requested()) {
         return blorp_result_err((void*)blorp_Cancelled);
@@ -15215,10 +15270,7 @@ void* blorp_concurrent_join(void* t, long timeout_ms) {
         task->waiting_fiber = self;
         if (timeout_ms >= 0) {
             // Timed join: also insert into timer queue as a deadline
-            struct timespec now_mono;
-            clock_gettime(CLOCK_MONOTONIC, &now_mono);
-            self->wake_time_ns = (uint64_t)now_mono.tv_sec * 1000000000ULL
-                + (uint64_t)now_mono.tv_nsec + (uint64_t)timeout_ms * 1000000ULL;
+            self->wake_time_ns = __blorp_deadline_ns_from_timeout_ms(timeout_ms);
             blorp_timer_queue_insert(self);
         }
         pthread_mutex_unlock(&task->mutex);
@@ -15246,14 +15298,8 @@ void* blorp_concurrent_join(void* t, long timeout_ms) {
         }
     } else if (!task->completed) {
         if (timeout_ms >= 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += timeout_ms / 1000;
-            ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000L;
-            }
+            struct timespec ts =
+                __blorp_realtime_deadline_from_timeout_ms(timeout_ms);
             int ret = 0;
             while (!task->completed && ret == 0) {
                 ret = pthread_cond_timedwait(&task->done_cond, &task->mutex, &ts);
@@ -15425,6 +15471,46 @@ static void __ch_fiber_remove(blorp_Fiber** head, blorp_Fiber** tail, blorp_Fibe
     }
 }
 
+#define BLORP_CHANNEL_SEND_ACCEPTED 0L
+#define BLORP_CHANNEL_SEND_WOULD_BLOCK 1L
+#define BLORP_CHANNEL_SEND_SEALED 2L
+#define BLORP_CHANNEL_SEND_TIMED_OUT 3L
+
+long blorp_channel_try_send_status(void* c, void* value);
+long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms);
+
+static inline uint64_t __ch_monotonic_deadline_from_timeout_ms(long timeout_ms) {
+    uint64_t now_ns = blorp_monotonic_now_ns();
+    if (timeout_ms <= 0) return now_ns;
+    uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
+    if (timeout_ns / 1000000ULL != (uint64_t)timeout_ms) return UINT64_MAX;
+    if (UINT64_MAX - now_ns < timeout_ns) return UINT64_MAX;
+    return now_ns + timeout_ns;
+}
+
+static inline struct timespec __ch_realtime_deadline_from_timeout_ms(long timeout_ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    if (timeout_ms <= 0) return deadline;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    deadline.tv_sec += timeout_ms / 1000 + deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+    return deadline;
+}
+
+static inline void __ch_store_value_locked(blorp_Channel* ch, void* value) {
+    // Retain refcounted values — caller keeps its reference, channel gets its own
+    if (ch->elem_release && value) blorp_retain(value);
+    ch->buffer[ch->tail] = value;
+    ch->tail = (ch->tail + 1) % ch->capacity;
+    ch->count++;
+}
+
+static inline void __ch_wake_recv_after_send(blorp_Channel* ch, blorp_Fiber** recv_waiter) {
+    *recv_waiter = __ch_fiber_dequeue(&ch->recv_waiters_head, &ch->recv_waiters_tail);
+    pthread_cond_signal(&ch->not_empty);
+}
+
 // send(ch, value) -> Bool  (blocking, false if closed)
 long blorp_channel_send(void* c, void* value) {
     if (__blorp_cancel_current_task_if_requested()) return 0;
@@ -15444,6 +15530,7 @@ long blorp_channel_send(void* c, void* value) {
             // this fiber's stack frame but the fiber is suspended. The waker
             // acquires the mutex, dequeues, releases mutex, then schedules.
             // When this fiber resumes, it continues here and re-locks the mutex.
+            __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_send_parks);
             pthread_mutex_unlock(&ch->mutex);
             blorp_fiber_park();
             pthread_mutex_lock(&ch->mutex);
@@ -15466,14 +15553,10 @@ long blorp_channel_send(void* c, void* value) {
         pthread_mutex_unlock(&ch->mutex);
         return 0; // false
     }
-    // Retain refcounted values — caller keeps its reference, channel gets its own
-    if (ch->elem_release && value) blorp_retain(value);
-    ch->buffer[ch->tail] = value;
-    ch->tail = (ch->tail + 1) % ch->capacity;
-    ch->count++;
+    __ch_store_value_locked(ch, value);
     // Wake one recv waiter (fiber or condvar)
-    blorp_Fiber* recv_waiter = __ch_fiber_dequeue(&ch->recv_waiters_head, &ch->recv_waiters_tail);
-    pthread_cond_signal(&ch->not_empty);
+    blorp_Fiber* recv_waiter = NULL;
+    __ch_wake_recv_after_send(ch, &recv_waiter);
     pthread_mutex_unlock(&ch->mutex);
     if (recv_waiter) blorp_fiber_schedule(recv_waiter);
     return 1; // true
@@ -15491,6 +15574,7 @@ void* blorp_channel_recv(void* c) {
             // Fiber path: set parked BEFORE enqueueing
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_recv_parks);
             pthread_mutex_unlock(&ch->mutex);
             blorp_fiber_park();
             pthread_mutex_lock(&ch->mutex);
@@ -15528,20 +15612,28 @@ void* blorp_channel_recv(void* c) {
 
 // try_send(ch, value) -> Bool  (non-blocking, false if full/closed)
 long blorp_channel_try_send(void* c, void* value) {
+    return blorp_channel_try_send_status(c, value) == BLORP_CHANNEL_SEND_ACCEPTED;
+}
+
+// try_send_attempt runtime hook.
+// Returns 0=accepted, 1=would-block, 2=sealed.
+long blorp_channel_try_send_status(void* c, void* value) {
     blorp_Channel* ch = (blorp_Channel*)c;
     pthread_mutex_lock(&ch->mutex);
-    if (ch->closed || ch->count == ch->capacity) {
+    if (ch->closed) {
         pthread_mutex_unlock(&ch->mutex);
-        return 0;
+        return BLORP_CHANNEL_SEND_SEALED;
     }
-    // Retain refcounted values — caller keeps its reference, channel gets its own
-    if (ch->elem_release && value) blorp_retain(value);
-    ch->buffer[ch->tail] = value;
-    ch->tail = (ch->tail + 1) % ch->capacity;
-    ch->count++;
-    pthread_cond_signal(&ch->not_empty);
+    if (ch->count == ch->capacity) {
+        pthread_mutex_unlock(&ch->mutex);
+        return BLORP_CHANNEL_SEND_WOULD_BLOCK;
+    }
+    __ch_store_value_locked(ch, value);
+    blorp_Fiber* recv_waiter = NULL;
+    __ch_wake_recv_after_send(ch, &recv_waiter);
     pthread_mutex_unlock(&ch->mutex);
-    return 1;
+    if (recv_waiter) blorp_fiber_schedule(recv_waiter);
+    return BLORP_CHANNEL_SEND_ACCEPTED;
 }
 
 // Internal: non-blocking recv without Option allocation.
@@ -15555,8 +15647,10 @@ bool blorp_channel_try_recv_raw(blorp_Channel* ch, void** out) {
     *out = ch->buffer[ch->head];
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
+    blorp_Fiber* send_waiter = __ch_fiber_dequeue(&ch->send_waiters_head, &ch->send_waiters_tail);
     pthread_cond_signal(&ch->not_full);
     pthread_mutex_unlock(&ch->mutex);
+    if (send_waiter) blorp_fiber_schedule(send_waiter);
     return true;
 }
 
@@ -15580,14 +15674,12 @@ bool blorp_channel_recv_timeout_raw(blorp_Channel* ch, long timeout_ms, void** o
     if (ch->count == 0 && !ch->closed) {
         if (self) {
             // Fiber path: park with timer for wakeup on timeout
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            self->wake_time_ns = (uint64_t)now.tv_sec * 1000000000ULL
-                               + (uint64_t)now.tv_nsec
-                               + (uint64_t)timeout_ms * 1000000ULL;
+            self->wake_time_ns =
+                __ch_monotonic_deadline_from_timeout_ms(timeout_ms);
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
             blorp_timer_queue_insert(self);
+            __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_recv_parks);
             pthread_mutex_unlock(&ch->mutex);
             blorp_fiber_park();
             // Woken by either: data arrived (sender dequeued us) or timer expired.
@@ -15603,11 +15695,8 @@ bool blorp_channel_recv_timeout_raw(blorp_Channel* ch, long timeout_ms, void** o
             }
         } else {
             // Thread path: timed condvar wait
-            struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
-            deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
-            deadline.tv_sec += timeout_ms / 1000 + deadline.tv_nsec / 1000000000L;
-            deadline.tv_nsec %= 1000000000L;
+            struct timespec deadline =
+                __ch_realtime_deadline_from_timeout_ms(timeout_ms);
             pthread_cond_timedwait(&ch->not_empty, &ch->mutex, &deadline);
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
@@ -15642,21 +15731,26 @@ void* blorp_channel_recv_timeout(void* c, long timeout_ms) {
 
 // send_timeout(ch, value, ms) -> Bool  (blocking with timeout, false if timeout/closed)
 long blorp_channel_send_timeout(void* c, void* value, long timeout_ms) {
-    if (__blorp_cancel_current_task_if_requested()) return 0;
+    return blorp_channel_send_timeout_status(c, value, timeout_ms)
+        == BLORP_CHANNEL_SEND_ACCEPTED;
+}
+
+// send_timeout_attempt runtime hook.
+// Returns 0=accepted, 2=sealed, 3=timed-out.
+long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms) {
+    if (__blorp_cancel_current_task_if_requested()) return BLORP_CHANNEL_SEND_TIMED_OUT;
     blorp_Channel* ch = (blorp_Channel*)c;
     blorp_Fiber* self = __blorp_current_fiber;
     pthread_mutex_lock(&ch->mutex);
 
     if (ch->count == ch->capacity && !ch->closed) {
         if (self) {
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            self->wake_time_ns = (uint64_t)now.tv_sec * 1000000000ULL
-                               + (uint64_t)now.tv_nsec
-                               + (uint64_t)timeout_ms * 1000000ULL;
+            self->wake_time_ns =
+                __ch_monotonic_deadline_from_timeout_ms(timeout_ms);
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->send_waiters_head, &ch->send_waiters_tail, self);
             blorp_timer_queue_insert(self);
+            __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_send_parks);
             pthread_mutex_unlock(&ch->mutex);
             blorp_fiber_park();
             // Woken by either: space freed (receiver dequeued us) or timer expired.
@@ -15667,35 +15761,33 @@ long blorp_channel_send_timeout(void* c, void* value, long timeout_ms) {
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
-                return 0;
+                return BLORP_CHANNEL_SEND_TIMED_OUT;
             }
         } else {
-            struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
-            deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
-            deadline.tv_sec += timeout_ms / 1000 + deadline.tv_nsec / 1000000000L;
-            deadline.tv_nsec %= 1000000000L;
+            struct timespec deadline =
+                __ch_realtime_deadline_from_timeout_ms(timeout_ms);
             pthread_cond_timedwait(&ch->not_full, &ch->mutex, &deadline);
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
-                return 0;
+                return BLORP_CHANNEL_SEND_TIMED_OUT;
             }
         }
     }
-    if (ch->closed || ch->count == ch->capacity) {
+    if (ch->closed) {
         pthread_mutex_unlock(&ch->mutex);
-        return 0;
+        return BLORP_CHANNEL_SEND_SEALED;
     }
-    if (ch->elem_release && value) blorp_retain(value);
-    ch->buffer[ch->tail] = value;
-    ch->tail = (ch->tail + 1) % ch->capacity;
-    ch->count++;
-    blorp_Fiber* recv_waiter = __ch_fiber_dequeue(&ch->recv_waiters_head, &ch->recv_waiters_tail);
-    pthread_cond_signal(&ch->not_empty);
+    if (ch->count == ch->capacity) {
+        pthread_mutex_unlock(&ch->mutex);
+        return BLORP_CHANNEL_SEND_TIMED_OUT;
+    }
+    __ch_store_value_locked(ch, value);
+    blorp_Fiber* recv_waiter = NULL;
+    __ch_wake_recv_after_send(ch, &recv_waiter);
     pthread_mutex_unlock(&ch->mutex);
     if (recv_waiter) blorp_fiber_schedule(recv_waiter);
-    return 1;
+    return BLORP_CHANNEL_SEND_ACCEPTED;
 }
 
 // close(ch) -> Void  (wake all waiters)
@@ -15736,6 +15828,7 @@ bool blorp_channel_recv_raw(blorp_Channel* ch, void** out) {
         if (self) {
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_recv_parks);
             pthread_mutex_unlock(&ch->mutex);
             blorp_fiber_park();
             pthread_mutex_lock(&ch->mutex);
@@ -21321,6 +21414,12 @@ blorp_SchedulerStats* blorp_get_scheduler_stats(void) {
         atomic_load_explicit(
             &global_scheduler_stats.fiber_schedule_transitions,
             memory_order_relaxed);
+    stats->channel_send_parks =
+        atomic_load_explicit(&global_scheduler_stats.channel_send_parks,
+            memory_order_relaxed);
+    stats->channel_recv_parks =
+        atomic_load_explicit(&global_scheduler_stats.channel_recv_parks,
+            memory_order_relaxed);
     stats->runnable_enqueues =
         atomic_load_explicit(&global_scheduler_stats.runnable_enqueues,
             memory_order_relaxed);
@@ -21392,6 +21491,10 @@ void blorp_reset_scheduler_stats(void) {
         memory_order_relaxed);
     atomic_store_explicit(&global_scheduler_stats.fiber_schedule_transitions,
         0, memory_order_relaxed);
+    atomic_store_explicit(&global_scheduler_stats.channel_send_parks, 0,
+        memory_order_relaxed);
+    atomic_store_explicit(&global_scheduler_stats.channel_recv_parks, 0,
+        memory_order_relaxed);
     atomic_store_explicit(&global_scheduler_stats.runnable_enqueues, 0,
         memory_order_relaxed);
     atomic_store_explicit(&global_scheduler_stats.run_queue_pops, 0,

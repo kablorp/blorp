@@ -501,6 +501,8 @@ let test_channel_runtime_builtins_have_ownership_contracts () =
     ];
   expect_builtin_contract "blorp_channel_send" [ borrow; retain ] ret_prim;
   expect_builtin_contract "blorp_channel_try_send" [ borrow; retain ] ret_prim;
+  expect_builtin_contract "blorp_channel_try_send_status" [ borrow; retain ]
+    ret_prim;
   expect_builtin_contract "blorp_channel_recv_timeout" [ borrow; borrow ]
     ret_owned;
   expect_builtin_contract "blorp_channel_recv_timeout_nullable"
@@ -525,8 +527,51 @@ let test_channel_runtime_builtins_have_ownership_contracts () =
     ];
   expect_builtin_contract "blorp_channel_send_timeout"
     [ borrow; retain; borrow ] ret_prim;
+  expect_builtin_contract "blorp_channel_send_timeout_status"
+    [ borrow; retain; borrow ] ret_prim;
   expect_builtin_contract "blorp_channel_close" [ borrow ]
     Core_ownership.ReturnVoid
+
+let test_void_boxed_runtime_builtins_have_ownership_coverage () =
+  let failures =
+    Core_ownership.builtin_void_boxed_arg_positions
+    |> List.filter_map (fun (name, positions) ->
+        let required_arity =
+          match positions with
+          | [] -> 0
+          | _ -> 1 + List.fold_left max 0 positions
+        in
+        match Core_ownership.builtin_contract_entry name with
+        | None ->
+            Some
+              (Printf.sprintf
+                 "%s has runtime void* ABI slots but no ownership contract" name)
+        | Some entry ->
+            let supported_arity =
+              Core_ownership.builtin_contract_sample_arities entry
+              |> List.exists (fun arity ->
+                  arity >= required_arity
+                  &&
+                  match Core_ownership.builtin_contract name arity with
+                  | Some _ -> true
+                  | None -> false)
+            in
+            if supported_arity then None
+            else
+              Some
+                (Printf.sprintf
+                   "%s has runtime void* ABI slots through arity %d, but its \
+                    ownership contract does not cover that arity"
+                   name required_arity))
+  in
+  Alcotest.(check (list string))
+    "void-boxed runtime builtins have ownership coverage" [] failures
+
+let test_specialize_uses_ownership_void_boxed_manifest () =
+  Alcotest.(check (list (pair string (list int))))
+    "Core_specialize consumes the ownership-owned ABI manifest"
+    Core_ownership.builtin_void_boxed_arg_positions
+    Blorp.Core_specialize.void_boxed_arg_positions
 
 let test_ir_backed_std_functions_registered () =
   let int_ty = Ast.TyNamed ("Int", []) in
@@ -602,6 +647,10 @@ let suite =
           `Quick test_string_runtime_builtins_have_ownership_contracts;
         Alcotest.test_case "channel runtime builtins have ownership contracts"
           `Quick test_channel_runtime_builtins_have_ownership_contracts;
+        Alcotest.test_case "void-boxed runtime builtins have ownership coverage"
+          `Quick test_void_boxed_runtime_builtins_have_ownership_coverage;
+        Alcotest.test_case "specialize uses ownership void-boxed manifest"
+          `Quick test_specialize_uses_ownership_void_boxed_manifest;
         Alcotest.test_case "IR-backed std functions registered" `Quick
           test_ir_backed_std_functions_registered;
       ] );

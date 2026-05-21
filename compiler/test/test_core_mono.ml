@@ -742,6 +742,14 @@ let test_mono_qualified_call_prefers_selected_direct_kind_generic () =
     Blorp.Core_mono.monomorphize_program ~import_aliases
       [ mk_decl impure_primary; mk_decl pure_selected; mk_decl main_fn ]
   in
+  let names =
+    List.filter_map
+      (fun d -> match d.cd_desc with CDFunc f -> Some f.cf_name | _ -> None)
+      result
+  in
+  Alcotest.(check bool)
+    "emits selected module-owned pure overload specialization" true
+    (List.mem "std_list__reverse__pure__mono_Int" names);
   let main_decl =
     List.find
       (function { cd_desc = CDFunc f; _ } -> f.cf_name = "main" | _ -> false)
