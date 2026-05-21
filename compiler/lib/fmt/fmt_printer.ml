@@ -1420,6 +1420,11 @@ let print_func_decl ?(is_private = false) fd =
     if fd.func_no_copy && func_is_foreign fd then text "@no_copy" ^^ tailrec_sep
     else Nil
   in
+  let resource_result_ordinary =
+    if fd.func_resource_result_ordinary then
+      text "@resource_result_ordinary" ^^ tailrec_sep
+    else Nil
+  in
   let export = if is_private then text "private " else Nil in
   let pure = if fd.func_is_pure then text "pure " else Nil in
   let foreign = if func_is_foreign fd then text "foreign " else Nil in
@@ -1440,8 +1445,8 @@ let print_func_decl ?(is_private = false) fd =
         text " where " ^^ comma_sep (List.map print_constraint constraints)
   in
   let head =
-    export ^^ debug_only ^^ tailrec ^^ no_copy ^^ foreign ^^ pure
-    ^^ text "func " ^^ text name ^^ type_params
+    export ^^ debug_only ^^ tailrec ^^ no_copy ^^ resource_result_ordinary
+    ^^ foreign ^^ pure ^^ text "func " ^^ text name ^^ type_params
   in
   let params =
     print_params
@@ -1469,9 +1474,16 @@ let print_type_decl ?(is_private = false) td =
   let export = if is_private then text "private " else Nil in
   let type_params = print_type_params td.type_params in
   if td.type_is_builtin then
-    (* [type Name = builtin] / [type Name[T] = builtin] *)
-    export ^^ text "type " ^^ text td.type_name ^^ type_params
-    ^^ text " = builtin"
+    let keyword = if td.type_is_resource then "resource type " else "type " in
+    let cleanup =
+      match td.type_resource_cleanup with
+      | Some (ResourceCleanupBuiltin name) ->
+          text "(\"" ^^ text name ^^ text "\")"
+      | None -> Nil
+    in
+    (* [type Name = builtin] / [resource type Name = builtin("cleanup")] *)
+    export ^^ text keyword ^^ text td.type_name ^^ type_params
+    ^^ text " = builtin" ^^ cleanup
   else
     let variants =
       List.map

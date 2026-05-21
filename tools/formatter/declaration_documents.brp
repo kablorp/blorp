@@ -86,8 +86,8 @@ union Declaration:
 	DocumentedDeclaration(String, Declaration)
 	ImportDeclaration(ImportItem)
 	VariableDeclaration(Bool, Option[String], Option[Pattern], Bool, Option[TypeExpression], Expression)
-	FunctionDeclaration(Bool, String, Bool, Bool, Bool, Bool, List[String], List[FunctionParameter], Option[TypeExpression], List[TypeConstraint], FunctionBody)
-	TypeDeclaration(Bool, String, List[String], Bool, Bool, List[TypeVariant])
+	FunctionDeclaration(Bool, String, Bool, Bool, Bool, Bool, Bool, List[String], List[FunctionParameter], Option[TypeExpression], List[TypeConstraint], FunctionBody)
+	TypeDeclaration(Bool, String, List[String], Bool, Bool, Bool, Option[String], List[TypeVariant])
 	RecordDeclaration(Bool, String, List[String], Bool, Bool, List[DeclarationField])
 	TypeAliasDeclaration(Bool, String, List[String], TypeExpression)
 	TraitDeclaration(Bool, String, List[String], List[String], List[TraitMethod])
@@ -562,6 +562,7 @@ pure func declaration_from_json(value: JsonValue) -> Result[Declaration, String]
 			is_tailrec ?= value.bool_field("tailrec")
 			is_debug_only ?= value.bool_field("debug_only")
 			no_copy ?= value.bool_field("no_copy")
+			resource_result_ordinary ?= value.bool_field("resource_result_ordinary")
 			type_params ?= value.string_array_field("type_params")
 			params ?= value.function_parameter_array_field("params")
 			return_type ?= value.optional_type_expression_field("return")
@@ -575,6 +576,7 @@ pure func declaration_from_json(value: JsonValue) -> Result[Declaration, String]
 					is_tailrec,
 					is_debug_only,
 					no_copy,
+					resource_result_ordinary,
 					type_params,
 					params,
 					return_type,
@@ -588,8 +590,21 @@ pure func declaration_from_json(value: JsonValue) -> Result[Declaration, String]
 			type_params ?= value.string_array_field("type_params")
 			is_enum ?= value.bool_field("enum")
 			is_builtin ?= value.bool_field("builtin")
+			is_resource ?= value.bool_field("resource")
+			resource_cleanup ?= value.optional_string_field("resource_cleanup_builtin")
 			variants ?= value.type_variant_array_field("variants")
-			Ok(TypeDeclaration(is_private, name, type_params, is_enum, is_builtin, variants))
+			Ok(
+				TypeDeclaration(
+					is_private,
+					name,
+					type_params,
+					is_enum,
+					is_builtin,
+					is_resource,
+					resource_cleanup,
+					variants,
+				),
+			)
 		"Record":
 			is_private ?= value.bool_field("private")
 			name ?= value.string_field("name")
@@ -1163,6 +1178,7 @@ private pure func function_declaration_document(
 	is_tailrec: Bool,
 	is_debug_only: Bool,
 	no_copy: Bool,
+	resource_result_ordinary: Bool,
 	type_params: List[String],
 	params: List[FunctionParameter],
 	return_type: Option[TypeExpression],
@@ -1183,6 +1199,7 @@ private pure func function_declaration_document(
 		.cat(annotation_document("@debug_only", is_debug_only, is_private))
 		.cat(annotation_document("@tailrec", is_tailrec, is_private))
 		.cat(annotation_document("@no_copy", no_copy and foreign_body, is_private))
+		.cat(annotation_document("@resource_result_ordinary", resource_result_ordinary, is_private))
 		.cat(foreign_document)
 		.cat(pure_document)
 		.cat("func ".text())
@@ -1220,15 +1237,28 @@ private pure func type_declaration_document(
 	type_params: List[String],
 	is_enum: Bool,
 	is_builtin: Bool,
+	is_resource: Bool,
+	resource_cleanup: Option[String],
 	variants: List[TypeVariant],
 ) -> Doc:
 	if is_builtin:
+		keyword: String = if is_resource:
+			"resource type "
+		else:
+			"type "
+		cleanup_document: Doc = match resource_cleanup:
+			Some(cleanup): "(\""
+				.text()
+				.cat(cleanup.escape_string_value().text())
+				.cat("\")".text())
+			None: "".text()
 		is_private
 			.private_document()
-			.cat("type ".text())
+			.cat(keyword.text())
 			.cat(name.text())
 			.cat(type_params.type_params_document())
 			.cat(" = builtin".text())
+			.cat(cleanup_document)
 	else:
 		keyword: String = if is_enum:
 			"enum "
@@ -1392,6 +1422,7 @@ private pure func implementation_method_document(method: ImplementationMethod) -
 		method.is_tailrec,
 		method.is_debug_only,
 		method.no_copy,
+		False,
 		method.type_params,
 		method.params,
 		method.return_type,
@@ -1439,25 +1470,28 @@ pure func declaration_document(decl: Declaration) -> Doc:
 			type_expression,
 			value,
 		)
-		FunctionDeclaration(is_private, name, is_pure, is_tailrec, is_debug_only, no_copy, type_params, params, return_type, where_constraints, body): function_declaration_document(
+		FunctionDeclaration(is_private, name, is_pure, is_tailrec, is_debug_only, no_copy, resource_result_ordinary, type_params, params, return_type, where_constraints, body): function_declaration_document(
 			is_private,
 			name,
 			is_pure,
 			is_tailrec,
 			is_debug_only,
 			no_copy,
+			resource_result_ordinary,
 			type_params,
 			params,
 			return_type,
 			where_constraints,
 			body,
 		)
-		TypeDeclaration(is_private, name, type_params, is_enum, is_builtin, variants): type_declaration_document(
+		TypeDeclaration(is_private, name, type_params, is_enum, is_builtin, is_resource, resource_cleanup, variants): type_declaration_document(
 			is_private,
 			name,
 			type_params,
 			is_enum,
 			is_builtin,
+			is_resource,
+			resource_cleanup,
 			variants,
 		)
 		RecordDeclaration(is_private, name, type_params, is_value, is_builtin, fields): record_declaration_document(
@@ -1492,7 +1526,7 @@ pure func declaration_document(decl: Declaration) -> Doc:
 private pure func declaration_function_name(decl: Declaration) -> Option[String]:
 	match decl:
 		DocumentedDeclaration(_, inner): inner.declaration_function_name()
-		FunctionDeclaration(_, name, _, _, _, _, _, _, _, _, _): Some(name)
+		FunctionDeclaration(_, name, _, _, _, _, _, _, _, _, _, _): Some(name)
 		_: None
 
 
@@ -1509,7 +1543,7 @@ private pure func foreign_block_function_document(decl: Declaration) -> Doc:
 		DocumentedDeclaration(doc, inner): doc
 			.docstring_document()
 			.cat(inner.foreign_block_function_document())
-		FunctionDeclaration(_, name, is_pure, _, is_debug_only, no_copy, type_params, params, return_type, where_constraints, body):
+		FunctionDeclaration(_, name, is_pure, _, is_debug_only, no_copy, _, type_params, params, return_type, where_constraints, body):
 			debug_document: Doc = if is_debug_only:
 				"@debug_only ".text()
 			else:
@@ -1619,7 +1653,7 @@ private pure func foreign_metadata_equal(left: ForeignMetadata, right: ForeignMe
 private pure func declaration_foreign_metadata(decl: Declaration) -> Option[ForeignMetadata]:
 	match decl:
 		DocumentedDeclaration(_, inner): inner.declaration_foreign_metadata()
-		FunctionDeclaration(is_private, _, _, _, _, _, _, _, _, _, body):
+		FunctionDeclaration(is_private, _, _, _, _, _, _, _, _, _, _, body):
 			if is_private:
 				None
 			else:

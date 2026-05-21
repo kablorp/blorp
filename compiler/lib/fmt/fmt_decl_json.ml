@@ -78,18 +78,26 @@ let variant_to_json variant =
            (List.map Fmt_expr_json.type_expr_to_json variant.variant_fields));
     ]
 
+let resource_cleanup_to_string = function
+  | Ast.ResourceCleanupBuiltin name -> name
+
 let type_to_json ~is_private type_decl =
   obj
-    [
-      field "tag" (string "Type");
-      field "private" (bool is_private);
-      field "name" (string type_decl.Ast.type_name);
-      field "type_params" (type_params_to_json type_decl.Ast.type_params);
-      field "enum" (bool type_decl.Ast.type_is_enum);
-      field "builtin" (bool type_decl.Ast.type_is_builtin);
-      field "variants"
-        (array (List.map variant_to_json type_decl.Ast.type_variants));
-    ]
+    ([
+       field "tag" (string "Type");
+       field "private" (bool is_private);
+       field "name" (string type_decl.Ast.type_name);
+       field "type_params" (type_params_to_json type_decl.Ast.type_params);
+       field "enum" (bool type_decl.Ast.type_is_enum);
+       field "builtin" (bool type_decl.Ast.type_is_builtin);
+       field "resource" (bool type_decl.Ast.type_is_resource);
+       field "variants"
+         (array (List.map variant_to_json type_decl.Ast.type_variants));
+     ]
+    @ optional_field "resource_cleanup_builtin"
+        (Option.map
+           (fun cleanup -> string (resource_cleanup_to_string cleanup))
+           type_decl.Ast.type_resource_cleanup))
 
 let field_to_json field_decl =
   obj
@@ -189,6 +197,8 @@ let func_to_json ~is_private func =
               field "tailrec" (bool func.Ast.func_is_tailrec);
               field "debug_only" (bool func.Ast.func_debug_only);
               field "no_copy" (bool func.Ast.func_no_copy);
+              field "resource_result_ordinary"
+                (bool func.Ast.func_resource_result_ordinary);
               field "type_params"
                 (string_array
                    (List.map Ast.type_param_to_parser_string
@@ -259,6 +269,8 @@ let impl_method_to_json func =
               field "tailrec" (bool func.Ast.func_is_tailrec);
               field "debug_only" (bool func.Ast.func_debug_only);
               field "no_copy" (bool func.Ast.func_no_copy);
+              field "resource_result_ordinary"
+                (bool func.Ast.func_resource_result_ordinary);
               field "type_params"
                 (type_params_to_json func.Ast.func_type_params);
               field "params"
