@@ -44,6 +44,11 @@ let make_decl_doc_at pos doc desc = { decl_desc = desc; decl_loc = loc_of_pos po
 let parse_fail_at pos msg =
   raise (Parse_error_at (loc_of_pos pos, msg))
 
+let foreign_block_only_error pos =
+  parse_fail_at pos
+    "foreign declarations must use a foreign: block; write `foreign:` and \
+     indent `func ...` inside it"
+
 let is_dim_type_arg = function
   | TyConstInt _ | TyVarDims _ | TyDimOp _ -> true
   | TyVar name -> String.length name > 0 && name.[0] = '#'
@@ -242,17 +247,10 @@ decl:
     { make_decl_doc_at $symbolstartpos doc (DImpl d) }
   | doc = docstring d = type_alias_decl
     { make_decl_doc_at $symbolstartpos doc (DTypeAlias d) }
-  (* Docstring-prefixed single-line foreign funcs need an explicit route.
-     The no-doc form is handled by [decl_list] via [foreign_dispatch], which
-     avoids an empty-docstring ambiguity on top-level FOREIGN. *)
-  | doc = DOCSTRING FOREIGN FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { make_foreign_decl_at $symbolstartpos (Some doc) ~is_pure:false ~fn_name
-        ~params ~ret ~c_name:c ~annots:[] }
-  | doc = DOCSTRING FOREIGN PURE FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { make_foreign_decl_at $symbolstartpos (Some doc) ~is_pure:true ~fn_name
-        ~params ~ret ~c_name:c ~annots:[] }
+  | DOCSTRING FOREIGN FUNC
+    { foreign_block_only_error $symbolstartpos }
+  | DOCSTRING FOREIGN PURE FUNC
+    { foreign_block_only_error $symbolstartpos }
 
 (* Inline helpers for purity/return-type cross-product *)
 %inline purity_prefix:
@@ -338,14 +336,10 @@ private_inner_decl:
     { make_decl_doc_at $symbolstartpos doc (DImpl d) }
   | doc = docstring d = type_alias_decl
     { make_decl_doc_at $symbolstartpos doc (DTypeAlias d) }
-  | doc = docstring FOREIGN FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { make_foreign_decl_at $symbolstartpos doc ~is_pure:false ~fn_name
-        ~params ~ret ~c_name:c ~annots:[] }
-  | doc = docstring FOREIGN PURE FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { make_foreign_decl_at $symbolstartpos doc ~is_pure:true ~fn_name
-        ~params ~ret ~c_name:c ~annots:[] }
+  | docstring FOREIGN FUNC
+    { foreign_block_only_error $symbolstartpos }
+  | docstring FOREIGN PURE FUNC
+    { foreign_block_only_error $symbolstartpos }
 
 type_params_opt:
   | (* empty *) { [] }
@@ -681,16 +675,10 @@ foreign_dispatch:
   (* foreign: block (no args) *)
   | COLON NEWLINE INDENT items = foreign_block_items DEDENT
     { items }
-  (* foreign pure func — pure foreign function (caller asserts C won't mutate) *)
-  | PURE FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { [make_foreign_decl_at $symbolstartpos None ~is_pure:true ~fn_name
-         ~params ~ret ~c_name:c ~annots:[]] }
-  (* foreign func — impure, default COW-copies args *)
-  | FUNC fn_name = name
-    params = params ARROW ret = type_expr c = foreign_c_name_opt
-    { [make_foreign_decl_at $symbolstartpos None ~is_pure:false ~fn_name
-         ~params ~ret ~c_name:c ~annots:[]] }
+  | PURE FUNC
+    { foreign_block_only_error $symbolstartpos }
+  | FUNC
+    { foreign_block_only_error $symbolstartpos }
 
 (* Named argument in foreign(...) block header *)
 foreign_arg:
@@ -703,6 +691,13 @@ foreign_block_items:
     { item :: rest }
 
 foreign_block_item:
+  (* private func inside foreign block *)
+  | PRIVATE annots = annotations_inline p = purity_prefix FUNC fn_name = name
+    params = params ARROW ret = type_expr c = foreign_c_name_opt
+    { make_decl_at $symbolstartpos
+        (DPrivate
+          (make_foreign_decl_at $symbolstartpos None ~is_pure:p ~fn_name
+             ~params ~ret ~c_name:c ~annots)) }
   (* pure func inside foreign block *)
   | PURE FUNC fn_name = name
     params = params ARROW ret = type_expr c = foreign_c_name_opt
@@ -981,14 +976,14 @@ assign_expr:
       | _ -> make_expr_at $symbolstartpos (EAssign ("_", rhs)) (* invalid LHS, caught by typechecker *)
     }
   | name = IDENT op = compound_op e = assign_expr
-    { make_expr_at $symbolstartpos (EAssign (name, make_expr (EBinary (op, make_expr (EIdent name), e)))) }
+    { make_expr_at $symbolstartpos (ECompoundAssign (name, op, e)) }
   | e = ascription_expr { e }
 
 %inline compound_op:
-  | PLUS_EQ { Add }
-  | MINUS_EQ { Sub }
-  | STAR_EQ { Mul }
-  | SLASH_EQ { Div }
+  | PLUS_EQ { AssignAdd }
+  | MINUS_EQ { AssignSub }
+  | STAR_EQ { AssignMul }
+  | SLASH_EQ { AssignDiv }
 
 ascription_expr:
   | e = or_expr AS ty = type_expr

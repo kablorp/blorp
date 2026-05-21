@@ -1335,7 +1335,8 @@ let test_lower_simple_func () =
   | _ -> Alcotest.fail "expected CDFunc"
 
 let test_lower_foreign_func () =
-  (* foreign func printf(fmt: String) = "printf" — no body *)
+  (* foreign:
+       func printf(fmt: String) = "printf" — no body *)
   let func =
     {
       (mk_func_decl "printf" [ mk_param_named "fmt" ty_string ] ty_void None) with

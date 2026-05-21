@@ -57,6 +57,7 @@ let expr_label (expr : Ast.expr) =
   | EForTuple _ -> "for_tuple"
   | ELoopView _ -> "loop_view"
   | EAssign (name, _) -> "assign " ^ name
+  | ECompoundAssign (name, _, _) -> "compound_assign " ^ name
   | EVarDecl (name, _, _, is_mutable) ->
       if is_mutable then "var_decl mutable " ^ name else "var_decl " ^ name
   | ETupleDestruct _ -> "tuple_destruct"
@@ -93,6 +94,7 @@ let expr_children_from_desc = function
   | EAscription (expr, _)
   | EFieldAccess (expr, _)
   | EAssign (_, expr)
+  | ECompoundAssign (_, _, expr)
   | EQuestionBind (_, _, expr)
   | EConcurrentBind (_, _, expr)
   | EDetach expr ->

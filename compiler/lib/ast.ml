@@ -74,6 +74,17 @@ type type_expr =
 (** Binary operators *)
 type binop = Add | Sub | Mul | Div | Mod | Lt | Gt | Le | Ge | Eq | Ne
 
+(** Compound assignment operators preserve source spelling for formatting while
+    typechecking/lowering can still treat them as assignment to a binary
+    expression. *)
+type assign_op = AssignAdd | AssignSub | AssignMul | AssignDiv
+
+let binop_of_assign_op = function
+  | AssignAdd -> Add
+  | AssignSub -> Sub
+  | AssignMul -> Mul
+  | AssignDiv -> Div
+
 (** Explicit type-widening metadata carried during the typed-AST transition. *)
 type type_widening_collection_kind =
   | ListLiteral
@@ -246,6 +257,8 @@ and expr_desc =
         lowering consumes explicit producer metadata instead of re-matching
         source call names. *)
   | EAssign of string * expr  (** var = value (reassignment) *)
+  | ECompoundAssign of string * assign_op * expr
+      (** var += value / -= / *= / /= *)
   | EVarDecl of string * type_expr option * expr * bool
       (** name, type, value, is_mutable *)
   | ETupleDestruct of string list * expr
@@ -286,7 +299,7 @@ and expr_desc =
         [EBuiltin (Some c_name)] — [builtin("c_name")]. Lowering synthesizes
         a [CCall (CKBuiltin c_name, ...)] body that forwards all parameters
         to the named C runtime helper from [FuncBuiltinBody]. Distinct from
-        [foreign func], which is reserved for user-facing FFI. *)
+        [foreign:] blocks, which are reserved for user-facing FFI. *)
   | EFuncDecl of func_decl
       (** Nested function declaration in a block.
       Transient node produced by the parser for [pure func name[T](...)]
@@ -661,6 +674,7 @@ let expr_children (e : expr) : expr list =
   | EAscription (e, _)
   | EFieldAccess (e, _)
   | EAssign (_, e)
+  | ECompoundAssign (_, _, e)
   | EQuestionBind (_, _, e)
   | EConcurrentBind (_, _, e) ->
       [ e ]
@@ -726,6 +740,7 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
     | EAscription (e1, ty) -> EAscription (f e1, ty)
     | EFieldAccess (e1, field) -> EFieldAccess (f e1, field)
     | EAssign (name, e1) -> EAssign (name, f e1)
+    | ECompoundAssign (name, op, e1) -> ECompoundAssign (name, op, f e1)
     | EQuestionBind (name, ty, e1) -> EQuestionBind (name, ty, f e1)
     | EConcurrentBind (name, ty, e1) -> EConcurrentBind (name, ty, f e1)
     | EBinary (op, l, r) -> EBinary (op, f l, f r)

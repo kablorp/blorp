@@ -98,7 +98,6 @@ decl = [ docstring ] ( func_decl
                       | trait_decl
                       | impl_decl
                       | type_alias_decl
-                      | foreign_func_decl
                       | "private" decl ) ;
 
 docstring = DOCSTRING ;
@@ -264,16 +263,12 @@ identifier  = IDENT | "debug" ;
 foreign_block = "foreign" foreign_dispatch ;
 
 foreign_dispatch = "(" foreign_args ")" ":" NEWLINE INDENT { foreign_item { NEWLINE } } DEDENT
-                 | ":" NEWLINE INDENT { foreign_item { NEWLINE } } DEDENT
-                 | [ "pure" ] "func" name params "->" type_expr [ "=" STRING ] ;
+                 | ":" NEWLINE INDENT { foreign_item { NEWLINE } } DEDENT ;
 
 foreign_args = foreign_arg { "," foreign_arg } ;
 foreign_arg  = IDENT ":" STRING ;
 
-foreign_item = [ "pure" ] "func" name params "->" type_expr [ "=" STRING ]
-             | "@" IDENT "func" name params "->" type_expr [ "=" STRING ] ;
-
-foreign_func_decl = "foreign" [ "pure" ] "func" name params "->" type_expr [ "=" STRING ] ;
+foreign_item = [ "private" ] { "@" IDENT } [ "pure" ] "func" name params "->" type_expr [ "=" STRING ] ;
 ```
 
 **Semantic constraints:**

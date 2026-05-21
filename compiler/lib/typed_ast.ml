@@ -128,6 +128,7 @@ type expr_desc =
   | EForTuple of string list * expr * expr
   | ELoopView of loop_view
   | EAssign of string * expr
+  | ECompoundAssign of string * Ast.assign_op * expr
   | EVarDecl of string * Ast.type_expr option * expr * bool
   | ETupleDestruct of string list * expr
   | ERange of expr * expr
@@ -743,6 +744,9 @@ let expr_desc (expr : expr) =
   | Ast.EAssign (name, rhs) ->
       let* rhs = typed_child rhs in
       Ok (EAssign (name, rhs))
+  | Ast.ECompoundAssign (name, op, rhs) ->
+      let* rhs = typed_child rhs in
+      Ok (ECompoundAssign (name, op, rhs))
   | Ast.EVarDecl (name, ty, init, is_mutable) ->
       let* init = typed_child init in
       Ok (EVarDecl (name, ty, init, is_mutable))

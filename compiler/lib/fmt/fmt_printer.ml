@@ -118,6 +118,7 @@ let rec expr_source_end_line e =
         (max base (expr_source_end_line view.loop_view_source))
         view.loop_view_size_arg
   | EAssign (_, value)
+  | ECompoundAssign (_, _, value)
   | EVarDecl (_, _, value, _)
   | ETupleDestruct (_, value)
   | EQuestionBind (_, _, value) ->
@@ -170,7 +171,7 @@ let leading_comments line =
     let docs =
       List.map
         (fun (c : Lexer.collected_comment) ->
-          text (Fmt_comment.normalize_comment c.cc_text) ^^ hardline)
+          text (Fmt_comment.comment_text c.cc_text) ^^ hardline)
         cs
     in
     concat docs
@@ -178,7 +179,7 @@ let leading_comments line =
 (** Emit trailing comment for a node on the given line *)
 let trailing_comment line =
   match Fmt_comment.take_trailing !comments ~on_line:line with
-  | Some c -> line_suffix (Fmt_comment.normalize_comment c.cc_text)
+  | Some c -> line_suffix (Fmt_comment.comment_text c.cc_text)
   | None -> Nil
 
 (** Emit remaining comments at end of file *)
@@ -189,7 +190,7 @@ let remaining_comments () =
     let docs =
       List.map
         (fun (c : Lexer.collected_comment) ->
-          text (Fmt_comment.normalize_comment c.cc_text) ^^ hardline)
+          text (Fmt_comment.comment_text c.cc_text) ^^ hardline)
         cs
     in
     hardline ^^ concat docs
@@ -294,6 +295,12 @@ let binop_str = function
   | Ge -> ">="
   | Eq -> "=="
   | Ne -> "!="
+
+let assign_op_str = function
+  | AssignAdd -> "+="
+  | AssignSub -> "-="
+  | AssignMul -> "*="
+  | AssignDiv -> "/="
 
 let unop_str = function Neg -> "-" | Not -> "not "
 let logop_str = function And -> "and" | Or -> "or"
@@ -923,22 +930,11 @@ and print_expr_desc = function
   | EFor (var, iter, body) ->
       text "for " ^^ text var ^^ text " in " ^^ print_expr iter ^^ text ":"
       ^^ indent (hardline ^^ print_block_body body)
-  | EAssign (var, value) -> (
-      (* Detect desugared compound assignment: x = x OP expr *)
-      match value.expr_desc with
-      | EBinary (op, { expr_desc = EIdent v; _ }, rhs)
-        when v = var
-             && match op with Add | Sub | Mul | Div -> true | _ -> false ->
-          let op_str =
-            match op with
-            | Add -> "+="
-            | Sub -> "-="
-            | Mul -> "*="
-            | Div -> "/="
-            | _ -> "="
-          in
-          text var ^^ text " " ^^ text op_str ^^ text " " ^^ print_expr rhs
-      | _ -> text var ^^ text " = " ^^ print_expr value)
+  | EAssign (var, value) -> text var ^^ text " = " ^^ print_expr value
+  | ECompoundAssign (var, op, value) ->
+      text var ^^ text " "
+      ^^ text (assign_op_str op)
+      ^^ text " " ^^ print_expr value
   | EVarDecl (name, ty_opt, value, is_mut) ->
       let prefix = if is_mut then text "var " else Nil in
       let ty_ann =
@@ -1103,7 +1099,7 @@ and print_block_exprs exprs =
     | BlockExpr e -> expr_source_end_line e
   in
   let doc_of = function
-    | BlockComment c -> text (Fmt_comment.normalize_comment c.cc_text)
+    | BlockComment c -> text (Fmt_comment.comment_text c.cc_text)
     | BlockExpr e -> print_expr e
   in
   let needs_blank prev next =
@@ -1215,28 +1211,33 @@ let print_import_item imp =
 let print_import imp =
   text "import:" ^^ indent (hardline ^^ print_import_item imp)
 
-(** Deduplicate imports by module path *)
+let import_symbol_dedup_key sym =
+  let alias_key =
+    match sym.sym_alias with Some a -> " as " ^ a | None -> ""
+  in
+  let ctor_key =
+    match sym.sym_ctors with
+    | CtorNone -> ""
+    | CtorSome ctors -> "(" ^ String.concat "," ctors ^ ")"
+  in
+  sym.sym_name ^ ctor_key ^ alias_key
+
+let import_dedup_key imp =
+  imp.import_module ^ ":"
+  ^
+  match imp.import_symbols with
+  | Some symbols ->
+      symbols
+      |> List.map import_symbol_dedup_key
+      |> List.sort String.compare |> String.concat ","
+  | None -> ( match imp.import_alias with Some a -> "as:" ^ a | None -> "*")
+
+(** Deduplicate imports by their full import shape. *)
 let dedup_imports imports =
   let seen = Hashtbl.create 16 in
   List.filter
     (fun imp ->
-      let key =
-        imp.import_module ^ ":"
-        ^
-        match imp.import_symbols with
-        | Some s ->
-            let sym_keys =
-              List.map
-                (fun sym ->
-                  match sym.sym_alias with
-                  | Some a -> sym.sym_name ^ " as " ^ a
-                  | None -> sym.sym_name)
-                s
-            in
-            String.concat "," (List.sort String.compare sym_keys)
-        | None -> (
-            match imp.import_alias with Some a -> "as:" ^ a | None -> "*")
-      in
+      let key = import_dedup_key imp in
       if Hashtbl.mem seen key then false
       else (
         Hashtbl.add seen key ();
@@ -1632,8 +1633,9 @@ and print_decl_inner ?(is_private = false) d =
 
 (* ─── Program ───────────────────────────────────────────────────────── *)
 
-(** Print a foreign func without the 'foreign' prefix (used inside foreign blocks) *)
-let print_foreign_block_func fd =
+(** Print a function declaration as an item inside a [foreign:] block. *)
+let print_foreign_block_func ?(is_private = false) fd =
+  let private_doc = if is_private then text "private " else Nil in
   let no_copy = if fd.func_no_copy then text "@no_copy " else Nil in
   let debug_only = if fd.func_debug_only then text "@debug_only " else Nil in
   let pure = if fd.func_is_pure then text "pure " else Nil in
@@ -1646,8 +1648,8 @@ let print_foreign_block_func fd =
     | None -> Nil
   in
   let sig_doc =
-    debug_only ^^ no_copy ^^ pure ^^ text "func " ^^ text name ^^ type_params
-    ^^ params ^^ ret
+    private_doc ^^ debug_only ^^ no_copy ^^ pure ^^ text "func " ^^ text name
+    ^^ type_params ^^ params ^^ ret
   in
   match func_foreign_info fd with
   | Some { foreign_name; _ } when foreign_name <> name ->
@@ -1681,6 +1683,8 @@ let print_foreign_block (includes, link_flags) decls =
         let func_doc =
           match d.decl_desc with
           | DFunc fd -> print_foreign_block_func fd
+          | DPrivate { decl_desc = DFunc fd; _ } ->
+              print_foreign_block_func ~is_private:true fd
           | _ -> print_decl_desc d.decl_desc
         in
         lead ^^ doc_doc ^^ func_doc ^^ trailing_comment d.decl_loc.line)
@@ -1742,7 +1746,7 @@ let print_program (program : program) =
           let docs =
             List.map
               (fun (c : Lexer.collected_comment) ->
-                text (Fmt_comment.normalize_comment c.cc_text) ^^ hardline)
+                text (Fmt_comment.comment_text c.cc_text) ^^ hardline)
               drained
           in
           hardline ^^ concat docs
@@ -1753,7 +1757,8 @@ let print_program (program : program) =
     let deduped = dedup_imports (List.map (fun (i, _, _) -> i) pairs) in
     (* After dedup, re-associate: find the pair whose import matches *)
     let find_pair imp =
-      List.find_opt (fun (i, _, _) -> i.import_module = imp.import_module) pairs
+      let key = import_dedup_key imp in
+      List.find_opt (fun (i, _, _) -> import_dedup_key i = key) pairs
     in
     let deduped_with_comments =
       List.filter_map
@@ -1772,7 +1777,7 @@ let print_program (program : program) =
     let sort_group g =
       List.sort
         (fun (a, _, _) (b, _, _) ->
-          String.compare a.import_module b.import_module)
+          String.compare (import_dedup_key a) (import_dedup_key b))
         g
     in
     (sort_group std, sort_group proj)
@@ -1788,13 +1793,13 @@ let print_program (program : program) =
           concat
             (List.map
                (fun (c : Lexer.collected_comment) ->
-                 text (Fmt_comment.normalize_comment c.cc_text) ^^ hardline)
+                 text (Fmt_comment.comment_text c.cc_text) ^^ hardline)
                cs)
     in
     let trail_doc =
       match trailing with
       | Some (c : Lexer.collected_comment) ->
-          line_suffix (Fmt_comment.normalize_comment c.cc_text)
+          line_suffix (Fmt_comment.comment_text c.cc_text)
       | None -> Nil
     in
     lead_doc ^^ print_import_item imp ^^ trail_doc
@@ -1850,6 +1855,13 @@ let print_program (program : program) =
           when foreign_includes <> [] || foreign_link_flags <> [] ->
             Some (foreign_includes, foreign_link_flags)
         (* All foreign functions use block syntax *)
+        | Some _ -> Some ([], [])
+        | None -> None)
+    | DPrivate { decl_desc = DFunc fd; _ } -> (
+        match func_foreign_info fd with
+        | Some { foreign_includes; foreign_link_flags; _ }
+          when foreign_includes <> [] || foreign_link_flags <> [] ->
+            Some (foreign_includes, foreign_link_flags)
         | Some _ -> Some ([], [])
         | None -> None)
     | _ -> None

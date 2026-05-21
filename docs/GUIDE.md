@@ -3043,9 +3043,9 @@ Run with:
 
 ### Doctests
 
-Functions can have docstrings with embedded tests using `---` fenced blocks. There are two doctest formats:
+Functions can have docstrings with embedded tests using `---` fenced blocks.
 
-**Named tests with `::` (preferred)**
+**Named tests with `::`**
 
 Each test has a descriptive name. The test body is a sequence of statements where the last expression must evaluate to `True`:
 
@@ -3070,25 +3070,7 @@ pure func get[T](self: List[T], index: Int) -> Option[T]:
     builtin
 ```
 
-**Inline tests with `>>>`**
-
-Each `>>>` line is a single expression. The next line is the expected value:
-
-```blorp
----
-Remove prefix from string.
-
-doctests:
-    >>> remove_prefix("hello world", "hello ")
-    "world"
-    >>> remove_prefix("hello", "xyz")
-    "hello"
----
-pure func remove_prefix(s: String, prefix: String) -> String:
-    ...
-```
-
-The `::` format is more flexible — it supports multi-line setup, variable bindings, and pattern matching. Most stdlib modules use the `::` format.
+The `::` format supports multi-line setup, variable bindings, and pattern matching.
 
 Doctests run in a generated test harness. That harness imports the documented
 module and the imports already available to that module, so examples can use the
@@ -3230,7 +3212,7 @@ sched = get_scheduler_stats()
 
 ## 15. Foreign Function Interface (FFI)
 
-blorp compiles to C, so its `foreign func` FFI works with **any language that exports C-compatible symbols** — C, C++, Rust, and more.
+blorp compiles to C, so its `foreign:` FFI works with **any language that exports C-compatible symbols** — C, C++, Rust, and more.
 
 `foreign` declarations are for user modules and explicit `pkg/` modules. The
 standard library cannot declare `foreign` functions or depend on `pkg/`
@@ -3239,13 +3221,14 @@ compiler/runtime `builtin` primitives.
 
 ### C
 
-Call C functions directly with `foreign func`:
+Call C functions directly with `foreign:` blocks:
 
 ```blorp
--- Single function declaration (maps blorp name to C name)
-foreign func c_sqrt(x: Float) -> Float = "sqrt"
+-- A single function still lives inside a foreign block.
+foreign:
+    func c_sqrt(x: Float) -> Float = "sqrt"
 
--- Block syntax groups related functions with shared include/link flags
+-- Blocks group related functions with shared include/link flags.
 foreign(include: "math.h", link: "-lm"):
     func c_sin(x: Float) -> Float = "sin"
     func c_cos(x: Float) -> Float = "cos"
@@ -3273,11 +3256,13 @@ Foreign functions have three modes that control argument safety and purity:
 ```blorp
 -- DEFAULT: impure, copies String and Bytes args before passing to C.
 -- The C function gets its own copy — cannot corrupt blorp-managed data.
-foreign func process(data: String) -> Int = "process_data"
+foreign:
+    func process(data: String) -> Int = "process_data"
 
 -- PURE: callable from pure blorp code. No copy needed (caller asserts
 -- the C function won't mutate arguments or have side effects).
-foreign pure func my_sin(x: Float) -> Float = "sin"
+foreign:
+    pure func my_sin(x: Float) -> Float = "sin"
 
 -- NO COPY: impure, but skips the defensive copy. Use when the C function
 -- treats blorp data as read-only but has other side effects (e.g. logging).
@@ -3287,15 +3272,15 @@ foreign:
 
 | Declaration | Copies args? | Callable from pure? |
 |---|---|---|
-| `foreign func` | Yes (COW) | No |
-| `foreign pure func` | No | Yes |
-| `@no_copy foreign func` | No | No |
+| `func` in a `foreign:` block | Yes (COW) | No |
+| `pure func` in a `foreign:` block | No | Yes |
+| `@no_copy func` in a `foreign:` block | No | No |
 
-**Default (safe):** `foreign func` copies eligible mutable runtime buffers before passing them to C. Today that covers `String` and `Bytes` arguments. The C function receives its own call-local copy that it can read or write without affecting the original blorp data. Copies are automatically released after the call returns, so C code must not retain or return pointers to those argument copies. Other managed arguments such as lists, dicts, sets, tensors, records, unions, and function values are rejected in default mode until they have explicit defensive-copy support. Scalar by-value arguments, including user enums, are allowed. Use `@no_copy` only when the C function borrows the value without mutating or retaining it.
+**Default (safe):** impure functions in a `foreign:` block copy eligible mutable runtime buffers before passing them to C. Today that covers `String` and `Bytes` arguments. The C function receives its own call-local copy that it can read or write without affecting the original blorp data. Copies are automatically released after the call returns, so C code must not retain or return pointers to those argument copies. Other managed arguments such as lists, dicts, sets, tensors, records, unions, and function values are rejected in default mode until they have explicit defensive-copy support. Scalar by-value arguments, including user enums, are allowed. Use `@no_copy` only when the C function borrows the value without mutating or retaining it.
 
-**Pure:** `foreign pure func` asserts that the C function is referentially transparent — no side effects, no mutation. This allows it to be called from `pure func` in blorp. No defensive copy is made since pure functions don't mutate. Use this for math functions, hash functions, and other stateless computations.
+**Pure:** `pure func` inside a `foreign:` block asserts that the C function is referentially transparent — no side effects, no mutation. This allows it to be called from `pure func` in blorp. No defensive copy is made since pure functions don't mutate. Use this for math functions, hash functions, and other stateless computations.
 
-**No-copy:** `@no_copy` on an impure `foreign func` skips the defensive copy for performance. The C function receives direct pointers into blorp-managed memory. Use this only when you're certain the C code treats the data as read-only.
+**No-copy:** `@no_copy` on an impure function inside a `foreign:` block skips the defensive copy for performance. The C function receives direct pointers into blorp-managed memory. Use this only when you're certain the C code treats the data as read-only.
 
 ```blorp
 -- Pure math functions — no copy, callable from pure code
@@ -3372,7 +3357,7 @@ today.
   available under `--debug` and during `blorp test`; normal builds reject
   debug-only calls outside a `debug:` block.
 - There is no source-level breakpoint facility in the preview debug API.
-- `foreign func` is the native trust boundary. String and bytes arguments get
+- `foreign:` is the native trust boundary. String and bytes arguments get
   defensive copies in the default mode, but opaque `Ptr` values and no-copy FFI
   declarations rely on the foreign code honoring its contract.
 - `pkg/...` imports are explicit package/native boundaries. Bare imports

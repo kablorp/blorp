@@ -150,9 +150,9 @@ let test_foreign_function_forms_preserve_flags () =
   let source =
     "foreign(include: \"math.h\", link_macos: \"-lm\"):\n"
     ^ "\tpure func c_cos(x: Float) -> Float = \"cos\"\n"
-    ^ "\t@no_copy func fill(buf: Bytes) -> Void = \"fill\"\n"
-    ^ "foreign func puts(s: String) -> Int = \"puts\"\n"
-    ^ "private foreign pure func c_abs(x: Int) -> Int = \"abs\"\n"
+    ^ "\t@no_copy func fill(buf: Bytes) -> Void = \"fill\"\n" ^ "foreign:\n"
+    ^ "\tfunc puts(s: String) -> Int = \"puts\"\n"
+    ^ "\tprivate pure func c_abs(x: Int) -> Int = \"abs\"\n"
   in
   let program = parse_ok source in
   check_int "declaration count" 4 (List.length program);

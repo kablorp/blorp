@@ -208,7 +208,11 @@ let test_assign_expr_doc () =
       (Ast.EAssign
          ("total", expr (Ast.EBinary (Ast.Add, ident "total", int_lit 5))))
   in
-  check_string "assign expression doc" "total += 5\n" (layout_expr e)
+  check_string "assign expression doc" "total = total + 5\n" (layout_expr e)
+
+let test_compound_assign_expr_doc () =
+  let e = expr (Ast.ECompoundAssign ("total", Ast.AssignAdd, int_lit 5)) in
+  check_string "compound assign expression doc" "total += 5\n" (layout_expr e)
 
 let test_var_decl_expr_doc () =
   let e =
@@ -262,7 +266,7 @@ let test_while_expr_doc () =
                 ("total", expr (Ast.EBinary (Ast.Add, ident "total", int_lit 1))))
          ))
   in
-  check_string "while expression doc" "while keep_going:\n\ttotal += 1\n"
+  check_string "while expression doc" "while keep_going:\n\ttotal = total + 1\n"
     (layout_expr e)
 
 let test_for_expr_doc () =
@@ -277,8 +281,8 @@ let test_for_expr_doc () =
                   expr (Ast.EBinary (Ast.Add, ident "total", ident "item")) ))
          ))
   in
-  check_string "for expression doc" "for item in items:\n\ttotal += item\n"
-    (layout_expr e)
+  check_string "for expression doc"
+    "for item in items:\n\ttotal = total + item\n" (layout_expr e)
 
 let test_for_tuple_expr_doc () =
   let e =
@@ -293,7 +297,7 @@ let test_for_tuple_expr_doc () =
          ))
   in
   check_string "for tuple expression doc"
-    "for (key, value) in entries:\n\ttotal += value\n" (layout_expr e)
+    "for (key, value) in entries:\n\ttotal = total + value\n" (layout_expr e)
 
 let test_match_expr_doc () =
   let e =
@@ -401,7 +405,7 @@ let test_concurrent_for_expr_doc () =
     expr (Ast.EConcurrentFor ("item", ident "items", body, None, Some 2))
   in
   check_string "concurrent for expression doc"
-    "concurrent(max_threads: 2) for item in items:\n\ttotal += item\n"
+    "concurrent(max_threads: 2) for item in items:\n\ttotal = total + item\n"
     (layout_expr e)
 
 let test_expr_json_case_uses_ocaml_expected_layout () =
@@ -473,7 +477,7 @@ let test_expr_json_lines_from_source () =
       Alcotest.(check bool)
         "includes assignment case" true
         (string_contains jsonl
-           {|{"tag":"Assign","name":"count","value":{"tag":"Binary"|});
+           {|{"tag":"Assign","name":"count","op":"Add","value":{"tag":"Literal"|});
       Alcotest.(check bool)
         "includes if case" true
         (string_contains jsonl
@@ -539,6 +543,8 @@ let suite =
         Alcotest.test_case "field range receiver parenthesized" `Quick
           test_field_range_receiver_parenthesized;
         Alcotest.test_case "assign expression doc" `Quick test_assign_expr_doc;
+        Alcotest.test_case "compound assign expression doc" `Quick
+          test_compound_assign_expr_doc;
         Alcotest.test_case "var declaration expression doc" `Quick
           test_var_decl_expr_doc;
         Alcotest.test_case "tuple destructure expression doc" `Quick

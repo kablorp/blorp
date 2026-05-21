@@ -569,10 +569,10 @@ and foreign_arg_passing =
   | ForeignDefaultArgs of foreign_default_arg_policy list
       (** Defensive FFI boundary: each argument carries the checked policy
         selected before call resolution. This is the default for impure
-        [foreign func]. *)
+        functions inside [foreign:] blocks. *)
   | ForeignBorrowArgs
       (** Borrowing FFI boundary: pass direct runtime buffers. Used by
-        [foreign pure func] and explicit [@no_copy] declarations. *)
+        pure foreign functions and explicit [@no_copy] declarations. *)
 
 and foreign_call = { fc_c_name : string; fc_arg_passing : foreign_arg_passing }
 

@@ -327,6 +327,12 @@ let rec scan_expr scope refs expr =
         else add_term name refs
       in
       scan_expr scope refs value
+  | ECompoundAssign (name, _, value) ->
+      let refs =
+        if StringSet.mem name scope.term_bindings then refs
+        else add_term name refs
+      in
+      scan_expr scope refs value
   | EVarDecl (_name, ty, init, _) ->
       scan_type_opt scope (scan_expr scope refs init) ty
   | ETupleDestruct (_names, init) -> scan_expr scope refs init

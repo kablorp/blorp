@@ -92,8 +92,7 @@ let block_comment_item_to_json ~blank_before comment =
     [
       field "tag" (string "Comment");
       field "blank_before" (bool blank_before);
-      field "text"
-        (string (Fmt_comment.normalize_comment comment.Lexer.cc_text));
+      field "text" (string (Fmt_comment.comment_text comment.Lexer.cc_text));
     ]
 
 let block_expr_item_to_json ~blank_before expr_json trailing =
@@ -106,7 +105,7 @@ let block_expr_item_to_json ~blank_before expr_json trailing =
     @ optional_field "trailing"
         (Option.map
            (fun comment ->
-             string (Fmt_comment.normalize_comment comment.Lexer.cc_text))
+             string (Fmt_comment.comment_text comment.Lexer.cc_text))
            trailing))
 
 let block_item_to_json ~blank_before = function
@@ -259,6 +258,7 @@ let binary_op_to_json = function
   | Ast.Eq -> "Eq"
   | Ast.Ne -> "Ne"
 
+let assign_op_to_json op = binary_op_to_json (Ast.binop_of_assign_op op)
 let logical_op_to_json = function Ast.And -> "And" | Ast.Or -> "Or"
 
 let record_field_to_json (name, expr_json) =
@@ -562,6 +562,18 @@ let rec expr_to_json expr =
                  field "value" value_json;
                ])
       | None -> None)
+  | Ast.ECompoundAssign (name, op, value) -> (
+      match expr_to_json value with
+      | Some value_json ->
+          Some
+            (obj
+               [
+                 field "tag" (string "Assign");
+                 field "name" (string name);
+                 field "op" (string (assign_op_to_json op));
+                 field "value" value_json;
+               ])
+      | None -> None)
   | Ast.EVarDecl (name, ty_opt, value, is_mutable) -> (
       match expr_to_json value with
       | Some value_json ->
@@ -670,7 +682,7 @@ let rec expr_to_json expr =
                      (Option.map
                         (fun comment ->
                           string
-                            (Fmt_comment.normalize_comment comment.Lexer.cc_text))
+                            (Fmt_comment.comment_text comment.Lexer.cc_text))
                         trailing)))
         | None -> None
       in

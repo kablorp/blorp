@@ -428,6 +428,32 @@ let test_program_decl_json_with_duplicate_imports () =
         (string_contains jsonl
            {|"expected":"import:\n\tdict as D\n\tlist: append, get\n\n\nvar total: Int = 0\n"|})
 
+let test_program_decl_json_keeps_distinct_constructor_imports () =
+  let source =
+    String.concat "\n"
+      [
+        "import:";
+        "    dict as D";
+        "    -- some constructor";
+        "    option: Option(Some)";
+        "    -- none constructor";
+        "    option: Option(None)";
+        "";
+        "var total: Int = 0";
+        "";
+      ]
+  in
+  match Fmt.format_decl_cases_json_lines_string source with
+  | Error msg -> Alcotest.fail msg
+  | Ok jsonl ->
+      Alcotest.(check bool)
+        "includes program case" true
+        (string_contains jsonl {|"program":[|});
+      Alcotest.(check bool)
+        "program keeps distinct constructor imports and comments" true
+        (string_contains jsonl
+           {|"expected":"import:\n\tdict as D\n\t-- none constructor\n\toption: Option(None)\n\t-- some constructor\n\toption: Option(Some)\n\n\nvar total: Int = 0\n"|})
+
 let test_program_decl_json_with_body_imports () =
   let source =
     String.concat "\n"
@@ -530,7 +556,7 @@ let test_program_decl_json_with_comments () =
     String.concat "\n"
       [
         "-- file header";
-        "var total: Int = 0 -- count";
+        "var total: Int = 0 --count";
         "-- alias comment";
         "type alias Count = Int";
         "-- eof";
@@ -549,7 +575,7 @@ let test_program_decl_json_with_comments () =
       Alcotest.(check bool)
         "program expected keeps comments" true
         (string_contains jsonl
-           {|"expected":"-- file header\nvar total: Int = 0 -- count\n\n-- alias comment\ntype alias Count = Int\n-- eof\n"|})
+           {|"expected":"-- file header\nvar total: Int = 0 --count\n\n-- alias comment\ntype alias Count = Int\n-- eof\n"|})
 
 let test_program_decl_json_with_doctest_docstring () =
   let source =
@@ -589,7 +615,7 @@ let test_program_decl_json_with_import_comments () =
         "-- file header";
         "import:";
         "    -- dict import";
-        "    dict as D -- dict trailing";
+        "    dict as D --dict trailing";
         "    -- list import";
         "    list: get, append";
         "-- body comment";
@@ -609,13 +635,14 @@ let test_program_decl_json_with_import_comments () =
       Alcotest.(check bool)
         "program expected keeps import comments" true
         (string_contains jsonl
-           {|"expected":"-- file header\n-- dict import\nimport:\n\tdict as D -- dict trailing\n\t-- list import\n\tlist: append, get\n\n\n-- body comment\nvar total: Int = 0\n"|})
+           {|"expected":"-- file header\n-- dict import\nimport:\n\tdict as D --dict trailing\n\t-- list import\n\tlist: append, get\n\n\n-- body comment\nvar total: Int = 0\n"|})
 
 let test_program_decl_json_with_foreign_block () =
   let source =
     String.concat "\n"
       [
-        "foreign func floor(x: Float) -> Float = \"c_floor\"";
+        "foreign:";
+        "    func floor(x: Float) -> Float = \"c_floor\"";
         "";
         "func read_clock() -> Int:";
         "    builtin(\"blorp_read_clock\")";
@@ -641,7 +668,7 @@ let test_program_decl_json_with_foreign_comments () =
         "-- foreign block comment";
         "foreign(include: \"math.h\", link: \"-lm\"):";
         "    -- floor comment";
-        "    func floor(x: Float) -> Float = \"c_floor\" -- floor trailing";
+        "    func floor(x: Float) -> Float = \"c_floor\" --floor trailing";
         "    -- ceil comment";
         "    func ceil(x: Float) -> Float = \"c_ceil\"";
         "-- body comment";
@@ -661,7 +688,7 @@ let test_program_decl_json_with_foreign_comments () =
       Alcotest.(check bool)
         "program expected keeps foreign comments" true
         (string_contains jsonl
-           {|"expected":"-- file header\n-- foreign block comment\n-- floor comment\nforeign(include: \"math.h\", link: \"-lm\"):\n\tfunc floor(x: Float) -> Float = \"c_floor\" -- floor trailing\n\t-- ceil comment\n\tfunc ceil(x: Float) -> Float = \"c_ceil\"\n\n\n-- body comment\nvar total: Int = 0\n"|})
+           {|"expected":"-- file header\n-- foreign block comment\n-- floor comment\nforeign(include: \"math.h\", link: \"-lm\"):\n\tfunc floor(x: Float) -> Float = \"c_floor\" --floor trailing\n\t-- ceil comment\n\tfunc ceil(x: Float) -> Float = \"c_ceil\"\n\n\n-- body comment\nvar total: Int = 0\n"|})
 
 let test_func_decl_json_case_uses_ocaml_expected_layout () =
   let fd =
@@ -728,7 +755,8 @@ let test_decl_json_lines_from_source () =
         "";
         "private name = \"blorp\"";
         "";
-        "foreign func floor(x: Float) -> Float = \"c_floor\"";
+        "foreign:";
+        "    func floor(x: Float) -> Float = \"c_floor\"";
         "";
         "---";
         "Read the clock.";
@@ -814,6 +842,9 @@ let suite =
           test_program_decl_json_with_imports;
         Alcotest.test_case "program declaration JSON with duplicate imports"
           `Quick test_program_decl_json_with_duplicate_imports;
+        Alcotest.test_case
+          "program declaration JSON keeps distinct constructor imports" `Quick
+          test_program_decl_json_keeps_distinct_constructor_imports;
         Alcotest.test_case "program declaration JSON with body imports" `Quick
           test_program_decl_json_with_body_imports;
         Alcotest.test_case "declaration JSON preserves block blank lines" `Quick
