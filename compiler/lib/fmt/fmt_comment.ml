@@ -11,14 +11,11 @@ type t = { mutable remaining : collected_comment list }
 (** Create a comment store from collected comments *)
 let create comments = { remaining = comments }
 
-(** Normalize comment text: ensure single space after -- *)
-let normalize_comment text =
-  let len = String.length text in
-  if len >= 2 && text.[0] = '-' && text.[1] = '-' then
-    let rest = String.sub text 2 (len - 2) in
-    let trimmed = String.trim rest in
-    if trimmed = "" then "--" else "-- " ^ trimmed
-  else text
+(** Preserve comment text exactly as the lexer collected it.
+
+    The formatter may move comments to their canonical indentation/line
+    position, but comment prose is user-authored text. *)
+let comment_text text = text
 
 (** Take all leading comments with line < before_line.
     Trailing comments whose line < before_line are also collected — they are

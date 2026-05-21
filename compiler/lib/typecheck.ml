@@ -3073,8 +3073,8 @@ let rec first_pass (state : check_state) (decls : program) : check_state =
                   notes = [];
                   help =
                     Some
-                      "Implement the function body, or use 'foreign func' for \
-                       C interop";
+                      "Implement the function body, or declare it inside a \
+                       'foreign:' block for C interop";
                 }
             else state
           in

@@ -622,6 +622,12 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
   (* === Assignment === *)
   | TA.EAssign (var, rhs) ->
       mk (CAssign (Core.Var.named var, lower_child_expr rhs))
+  | TA.ECompoundAssign _ ->
+      Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
+        ~hint:
+          "Compound assignment should be desugared during type inference \
+           before Core lowering."
+        "compound assignment reached core lowering"
   (* === Block: the interesting case === *)
   | TA.EBlock stmts -> lower_block ~loc ~ty stmts
   (* === Stray EVarDecl / ETupleDestruct outside a block ===

@@ -117,6 +117,7 @@ type expr_desc =
   | EForTuple of string list * expr * expr
   | ELoopView of loop_view
   | EAssign of string * expr
+  | ECompoundAssign of string * Ast.assign_op * expr
   | EVarDecl of string * Ast.type_expr option * expr * bool
   | ETupleDestruct of string list * expr
   | ERange of expr * expr

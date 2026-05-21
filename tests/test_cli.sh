@@ -313,7 +313,8 @@ implements Incrementable for Counter:
 
 private name = "blorp"
 
-foreign func floor(x: Float) -> Float = "c_floor"
+foreign:
+    func floor(x: Float) -> Float = "c_floor"
 
 ---
 Read the clock.

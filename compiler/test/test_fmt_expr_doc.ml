@@ -210,6 +210,10 @@ let test_assign_expr_doc () =
   in
   check_string "assign expression doc" "total += 5\n" (layout_expr e)
 
+let test_compound_assign_expr_doc () =
+  let e = expr (Ast.ECompoundAssign ("total", Ast.AssignAdd, int_lit 5)) in
+  check_string "compound assign expression doc" "total += 5\n" (layout_expr e)
+
 let test_var_decl_expr_doc () =
   let e =
     expr (Ast.EVarDecl ("count", Some (ty_named "Int" []), int_lit 0, true))
@@ -475,7 +479,7 @@ let test_expr_json_lines_from_source () =
       Alcotest.(check bool)
         "includes assignment case" true
         (string_contains jsonl
-           {|{"tag":"Assign","name":"count","value":{"tag":"Binary"|});
+           {|{"tag":"Assign","name":"count","op":"Add","value":{"tag":"Literal"|});
       Alcotest.(check bool)
         "includes if case" true
         (string_contains jsonl
@@ -541,6 +545,8 @@ let suite =
         Alcotest.test_case "field range receiver parenthesized" `Quick
           test_field_range_receiver_parenthesized;
         Alcotest.test_case "assign expression doc" `Quick test_assign_expr_doc;
+        Alcotest.test_case "compound assign expression doc" `Quick
+          test_compound_assign_expr_doc;
         Alcotest.test_case "var declaration expression doc" `Quick
           test_var_decl_expr_doc;
         Alcotest.test_case "tuple destructure expression doc" `Quick

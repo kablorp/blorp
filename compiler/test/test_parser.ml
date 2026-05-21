@@ -151,8 +151,8 @@ let test_foreign_function_forms_preserve_flags () =
     "foreign(include: \"math.h\", link_macos: \"-lm\"):\n"
     ^ "\tpure func c_cos(x: Float) -> Float = \"cos\"\n"
     ^ "\t@no_copy func fill(buf: Bytes) -> Void = \"fill\"\n"
-    ^ "foreign func puts(s: String) -> Int = \"puts\"\n"
-    ^ "private foreign pure func c_abs(x: Int) -> Int = \"abs\"\n"
+    ^ "\tprivate pure func c_abs(x: Int) -> Int = \"abs\"\n" ^ "foreign:\n"
+    ^ "\tfunc puts(s: String) -> Int = \"puts\"\n"
   in
   let program = parse_ok source in
   check_int "declaration count" 4 (List.length program);
@@ -160,12 +160,12 @@ let test_foreign_function_forms_preserve_flags () =
   | [
    { Blorp.Ast.decl_desc = Blorp.Ast.DFunc c_cos; _ };
    { Blorp.Ast.decl_desc = Blorp.Ast.DFunc fill; _ };
-   { Blorp.Ast.decl_desc = Blorp.Ast.DFunc puts; _ };
    {
      Blorp.Ast.decl_desc =
        Blorp.Ast.DPrivate { decl_desc = Blorp.Ast.DFunc c_abs; _ };
      _;
    };
+   { Blorp.Ast.decl_desc = Blorp.Ast.DFunc puts; _ };
   ] -> (
       check_bool "block pure function" true c_cos.func_is_pure;
       (match c_cos.func_body with
@@ -182,15 +182,18 @@ let test_foreign_function_forms_preserve_flags () =
       | Blorp.Ast.FuncForeign { foreign_name; _ } ->
           check_string "no_copy explicit C name" "fill" foreign_name
       | _ -> Alcotest.fail "expected foreign function implementation");
+      check_bool "private foreign pure" true c_abs.func_is_pure;
+      (match c_abs.func_body with
+      | Blorp.Ast.FuncForeign
+          { foreign_name; foreign_includes; foreign_link_flags } ->
+          check_string "private explicit C name" "abs" foreign_name;
+          check_int "private include count" 1 (List.length foreign_includes);
+          check_int "private link flag count" 1 (List.length foreign_link_flags)
+      | _ -> Alcotest.fail "expected foreign function implementation");
       check_bool "single foreign is impure" false puts.func_is_pure;
-      (match puts.func_body with
+      match puts.func_body with
       | Blorp.Ast.FuncForeign { foreign_name; _ } ->
           check_string "single explicit C name" "puts" foreign_name
-      | _ -> Alcotest.fail "expected foreign function implementation");
-      check_bool "private foreign pure" true c_abs.func_is_pure;
-      match c_abs.func_body with
-      | Blorp.Ast.FuncForeign { foreign_name; _ } ->
-          check_string "private explicit C name" "abs" foreign_name
       | _ -> Alcotest.fail "expected foreign function implementation")
   | _ -> Alcotest.fail "expected foreign declarations in source order"
 

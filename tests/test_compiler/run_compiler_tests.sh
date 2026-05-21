@@ -260,6 +260,40 @@ done
 
 total=${#test_files[@]}
 
+prewarm_formatter_renderer() {
+    local warmup_dir warmup_file output exit_code saved_timeout warmup_timeout
+    warmup_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_formatter_warmup.XXXXXX") || exit 1
+    warmup_file="$warmup_dir/warmup.brp"
+
+    printf 'func main(args: List[String]) -> Int:\n\t0\n' > "$warmup_file"
+
+    saved_timeout="$compiler_test_timeout"
+    warmup_timeout="$compiler_test_timeout"
+    if [ "$compiler_test_timeout" -gt 0 ] && [ "$compiler_test_timeout" -lt 120 ]; then
+        compiler_test_timeout=120
+        warmup_timeout=120
+    fi
+
+    output=$(run_blorp_capture format --check "$warmup_file")
+    exit_code=$?
+    compiler_test_timeout="$saved_timeout"
+    rm -rf "$warmup_dir"
+
+    if [ $exit_code -eq 124 ]; then
+        echo "FAIL: formatter renderer warmup timed out after ${warmup_timeout}s" >&2
+        return 1
+    elif [ $exit_code -ne 0 ]; then
+        echo "FAIL: formatter renderer warmup failed" >&2
+        echo "$output" | head -10 | sed 's/^/  /' >&2
+        return 1
+    fi
+}
+
+if ! prewarm_formatter_renderer; then
+    cleanup_result_dir
+    exit 1
+fi
+
 # ─── Test runner (runs a list of tests sequentially) ───────────
 
 run_test() {

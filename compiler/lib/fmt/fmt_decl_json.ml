@@ -322,7 +322,12 @@ let rec decl_to_json ?(is_private = false) decl =
 
 let rec expected_doc ?(is_private = false) decl =
   match decl.Ast.decl_desc with
+  | Ast.DPrivate { decl_desc = Ast.DFunc func; _ } when Ast.func_is_foreign func
+    ->
+      Printer.print_program [ decl ]
   | Ast.DPrivate inner -> expected_doc ~is_private:true inner
+  | Ast.DFunc func when Ast.func_is_foreign func ->
+      Printer.print_program [ decl ]
   | _ ->
       let doc_doc =
         match decl.Ast.decl_doc with

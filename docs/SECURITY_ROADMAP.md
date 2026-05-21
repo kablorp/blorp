@@ -209,7 +209,7 @@ deliberate, visible, and mechanically checked.
 
 ### Work Items
 
-- Keep default `foreign func` defensive-copy behavior for `String` and `Bytes`.
+- Keep default impure `foreign:` defensive-copy behavior for `String` and `Bytes`.
 - Continue rejecting unsupported managed values in default foreign mode.
 - Validate foreign C symbol names before Core lowering.
 - Validate `include:` values before code emission.
@@ -246,8 +246,8 @@ deliberate, visible, and mechanically checked.
 - Compiler `should_fail`: `include:` containing control characters.
 - Compiler `should_fail`: `link:` containing shell metacharacters.
 - Compiler `should_fail`: `link:` containing unsupported raw linker flags.
-- Compiler `should_fail`: default foreign function with `List[T]` argument.
-- Compiler `should_fail`: foreign function returning `LiteralString`.
+- Compiler `should_fail`: default foreign block function with `List[T]` argument.
+- Compiler `should_fail`: foreign block function returning `LiteralString`.
 - Codegen audit: default String argument copies and releases the copy.
 - Codegen audit: default Bytes argument copies and releases the copy.
 - Codegen audit: `@no_copy` String argument borrows direct data.

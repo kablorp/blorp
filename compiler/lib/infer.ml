@@ -3550,6 +3550,7 @@ and zonk_expr_desc = function
           loop_view_elem_type = Types.zonk_type view.loop_view_elem_type;
         }
   | EAssign (v, x) -> EAssign (v, zonk_expr x)
+  | ECompoundAssign (v, op, x) -> ECompoundAssign (v, op, zonk_expr x)
   | EVarDecl (n, ty, v, m) ->
       EVarDecl (n, Option.map Types.zonk_type ty, zonk_expr v, m)
   | ETupleDestruct (ns, v) -> ETupleDestruct (ns, zonk_expr v)
@@ -5147,6 +5148,13 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       else
         let new_expr = with_inferred_type expr ty_void in
         Ok (ty_void, new_expr)
+  | ECompoundAssign (var, op, value) ->
+      let lhs = Ast.with_untyped_expr_desc expr (EIdent var) in
+      let value =
+        Ast.with_untyped_expr_desc expr
+          (EBinary (Ast.binop_of_assign_op op, lhs, value))
+      in
+      infer_expr ctx (Ast.with_untyped_expr_desc expr (EAssign (var, value)))
   (* Assignment - returns Void *)
   | EAssign (var, value) -> (
       let loc = expr.expr_loc in

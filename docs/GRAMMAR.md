@@ -43,7 +43,6 @@ True   False
 
 Declarations are public by default; `private` hides a declaration from
 importers. There is no `export` keyword.
-blocks; it is not valid expression syntax.
 
 ### Operators and Delimiters
 
@@ -98,7 +97,6 @@ decl = [ docstring ] ( func_decl
                       | trait_decl
                       | impl_decl
                       | type_alias_decl
-                      | foreign_func_decl
                       | "private" decl ) ;
 
 docstring = DOCSTRING ;
@@ -264,16 +262,13 @@ identifier  = IDENT | "debug" ;
 foreign_block = "foreign" foreign_dispatch ;
 
 foreign_dispatch = "(" foreign_args ")" ":" NEWLINE INDENT { foreign_item { NEWLINE } } DEDENT
-                 | ":" NEWLINE INDENT { foreign_item { NEWLINE } } DEDENT
-                 | [ "pure" ] "func" name params "->" type_expr [ "=" STRING ] ;
+                 | ":" NEWLINE INDENT { foreign_item { NEWLINE } } DEDENT ;
 
 foreign_args = foreign_arg { "," foreign_arg } ;
 foreign_arg  = IDENT ":" STRING ;
 
-foreign_item = [ "pure" ] "func" name params "->" type_expr [ "=" STRING ]
-             | "@" IDENT "func" name params "->" type_expr [ "=" STRING ] ;
-
-foreign_func_decl = "foreign" [ "pure" ] "func" name params "->" type_expr [ "=" STRING ] ;
+foreign_item = [ "private" ] { annotation_inline } [ "pure" ] "func" name params "->" type_expr [ "=" STRING ] ;
+annotation_inline = "@" IDENT [ "(" INT ")" ] ;
 ```
 
 **Semantic constraints:**

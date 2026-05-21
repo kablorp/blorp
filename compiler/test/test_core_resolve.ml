@@ -659,7 +659,8 @@ let test_resolve_imported_matrix_kernels_to_builtins () =
     cases
 
 let test_resolve_foreign_call () =
-  (* foreign func c_abs(x: Int) -> Int = "abs"
+  (* foreign:
+       func c_abs(x: Int) -> Int = "abs"
      func f() -> Int: c_abs(-5) — call becomes CKForeign "abs" *)
   let abs_func : core_func =
     {
