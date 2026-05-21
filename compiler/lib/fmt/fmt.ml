@@ -149,12 +149,18 @@ let write_file path content =
 
 let remove_file_noerr path = try Sys.remove path with _ -> ()
 
-let cleanup_temp_dir dir =
-  (try
-     Sys.readdir dir
-     |> Array.iter (fun name -> remove_file_noerr (Filename.concat dir name))
-   with _ -> ());
-  try Unix.rmdir dir with _ -> ()
+let rec cleanup_path_noerr path =
+  try
+    match (Unix.lstat path).Unix.st_kind with
+    | Unix.S_DIR ->
+        Sys.readdir path
+        |> Array.iter (fun name ->
+            cleanup_path_noerr (Filename.concat path name));
+        Unix.rmdir path
+    | _ -> Sys.remove path
+  with _ -> ()
+
+let cleanup_temp_dir dir = cleanup_path_noerr dir
 
 let with_temp_dir prefix f =
   let marker = Filename.temp_file prefix ".tmp" in
@@ -164,6 +170,14 @@ let with_temp_dir prefix f =
 
 let sleep_seconds seconds = ignore (Unix.select [] [] [] seconds)
 let formatter_tool_name = "tools/formatter/formatter.brp"
+
+type formatter_source =
+  | EmbeddedSource of {
+      main_path : string;
+      digest : string;
+      files : (string * string) list;
+    }
+  | FilesystemSource of { main_path : string }
 
 let absolute_dir dir =
   if Filename.is_relative dir then Filename.concat (Sys.getcwd ()) dir else dir
@@ -175,17 +189,54 @@ let rec find_formatter_tool_from dir =
     let parent = Filename.dirname dir in
     if parent = dir then None else find_formatter_tool_from parent
 
-let formatter_tool_path () =
+let filesystem_formatter_source () =
   let search_roots =
     [ Sys.getcwd (); Filename.dirname Sys.executable_name ]
     |> List.map absolute_dir
   in
   match List.find_map find_formatter_tool_from search_roots with
-  | Some path -> Ok path
+  | Some path -> Ok (FilesystemSource { main_path = path })
   | None ->
       Error
         (Printf.sprintf "Formatter error: Blorp formatter tool not found at %s"
            (Filename.concat (Sys.getcwd ()) formatter_tool_name))
+
+let embedded_formatter_source () =
+  match Embedded_formatter.files with
+  | [] -> None
+  | files ->
+      Some
+        (EmbeddedSource
+           {
+             main_path = Embedded_formatter.main_path;
+             digest = Embedded_formatter.digest;
+             files;
+           })
+
+let filesystem_std_configured () =
+  Option.is_some (Modules.std_source_dir ())
+  ||
+  match Sys.getenv_opt "BLORP_STD" with
+  | Some dir -> dir <> ""
+  | None -> false
+
+let formatter_source () =
+  let embedded_or_filesystem () =
+    match embedded_formatter_source () with
+    | Some source -> Ok source
+    | None -> filesystem_formatter_source ()
+  in
+  if filesystem_std_configured () then
+    match filesystem_formatter_source () with
+    | Ok source -> Ok source
+    | Error _ -> embedded_or_filesystem ()
+  else embedded_or_filesystem ()
+
+let formatter_source_kind_for_tests () =
+  match formatter_source () with
+  | Ok (EmbeddedSource _) -> Ok "embedded"
+  | Ok (FilesystemSource _) -> Ok "filesystem"
+  | Error _ as err -> err
 
 let formatter_source_files formatter_tool =
   let dir = Filename.dirname formatter_tool in
@@ -193,16 +244,67 @@ let formatter_source_files formatter_tool =
   |> List.filter (fun name -> Filename.check_suffix name ".brp")
   |> List.map (Filename.concat dir)
 
-let formatter_binary_cache_key formatter_tool =
+let formatter_binary_cache_key source =
   let buf = Buffer.create 4096 in
   Buffer.add_string buf (Printf.sprintf "compiler-mtime:%f\n" binary_mtime);
-  formatter_source_files formatter_tool
-  |> List.iter (fun path ->
-      Buffer.add_string buf (Filename.basename path);
+  (match source with
+  | EmbeddedSource { digest; files; _ } ->
+      Buffer.add_string buf "embedded-formatter:";
+      Buffer.add_string buf digest;
       Buffer.add_char buf '\000';
-      Buffer.add_string buf (Modules.read_file path);
-      Buffer.add_char buf '\000');
+      files
+      |> List.iter (fun (path, content) ->
+          Buffer.add_string buf path;
+          Buffer.add_char buf '\000';
+          Buffer.add_string buf content;
+          Buffer.add_char buf '\000')
+  | FilesystemSource { main_path } ->
+      formatter_source_files main_path
+      |> List.iter (fun path ->
+          Buffer.add_string buf (Filename.basename path);
+          Buffer.add_char buf '\000';
+          Buffer.add_string buf (Modules.read_file path);
+          Buffer.add_char buf '\000'));
   Digest.to_hex (Digest.string (Buffer.contents buf))
+
+let ensure_dir path =
+  let rec loop dir =
+    if dir = "" || dir = "." || Sys.file_exists dir then ()
+    else begin
+      loop (Filename.dirname dir);
+      try Unix.mkdir dir 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+    end
+  in
+  loop path
+
+let safe_embedded_relative_path path =
+  Filename.is_relative path
+  && String.split_on_char '/' path
+     |> List.for_all (fun part -> part <> "" && part <> "." && part <> "..")
+
+let materialize_embedded_formatter_sources temp_dir files =
+  files
+  |> List.iter (fun (path, content) ->
+      if not (safe_embedded_relative_path path) then
+        invalid_arg ("unsafe embedded formatter path: " ^ path)
+      else
+        let target = Filename.concat temp_dir path in
+        ensure_dir (Filename.dirname target);
+        write_file target content)
+
+let with_formatter_main_path source f =
+  match source with
+  | FilesystemSource { main_path } -> f main_path
+  | EmbeddedSource { main_path; files; _ } ->
+      with_temp_dir "blorp-embedded-formatter-" (fun temp_dir ->
+          materialize_embedded_formatter_sources temp_dir files;
+          let materialized_main = Filename.concat temp_dir main_path in
+          if Sys.file_exists materialized_main then f materialized_main
+          else
+            Error
+              (Printf.sprintf
+                 "Formatter error: embedded formatter main source missing: %s"
+                 main_path))
 
 let status_message = function
   | Unix.WEXITED code -> Printf.sprintf "exited with status %d" code
@@ -280,71 +382,111 @@ let formatter_cc_args include_dirs precompiled link_flags =
       (fun s -> String.split_on_char ' ' (String.trim s))
       link_flags
 
-let compile_formatter_binary formatter_tool bin_path =
+let compile_formatter_binary formatter_source bin_path =
   Test_runner.with_run_artifacts (fun () ->
       let temp_bin = Printf.sprintf "%s.%d.tmp" bin_path (Unix.getpid ()) in
       remove_file_noerr temp_bin;
       Fun.protect
         ~finally:(fun () -> remove_file_noerr temp_bin)
         (fun () ->
-          let source = Modules.read_file formatter_tool in
-          let precompiled = Test_runner.precompile_runtime ~opt:"O2" () in
-          let embed_runtime = Option.is_none precompiled in
-          match
-            Pipeline.compile ~embed_runtime ~filename:formatter_tool ~source ()
-          with
-          | Error errors ->
-              Error (Diagnostics.format_errors ~file:formatter_tool errors)
-          | Ok (Pipeline.Stopped_at _) ->
-              Error
-                "Formatter error: formatter compilation stopped unexpectedly"
-          | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
-              let cc_result, cc_output =
-                Test_runner.compile_c_from_stdin c_code temp_bin
-                  (formatter_cc_args include_dirs precompiled link_flags)
-              in
-              if cc_result <> 0 then
-                Error
-                  ("Formatter error: failed to compile Blorp formatter\n"
-                 ^ String.trim cc_output)
-              else begin
-                Sys.rename temp_bin bin_path;
-                Ok bin_path
-              end))
+          with_formatter_main_path formatter_source (fun formatter_tool ->
+              let source = Modules.read_file formatter_tool in
+              let precompiled = Test_runner.precompile_runtime ~opt:"O2" () in
+              let embed_runtime = Option.is_none precompiled in
+              match
+                Pipeline.compile ~embed_runtime ~filename:formatter_tool ~source
+                  ()
+              with
+              | Error errors ->
+                  Error (Diagnostics.format_errors ~file:formatter_tool errors)
+              | Ok (Pipeline.Stopped_at _) ->
+                  Error
+                    "Formatter error: formatter compilation stopped \
+                     unexpectedly"
+              | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ })
+                ->
+                  let cc_result, cc_output =
+                    Test_runner.compile_c_from_stdin c_code temp_bin
+                      (formatter_cc_args include_dirs precompiled link_flags)
+                  in
+                  if cc_result <> 0 then
+                    Error
+                      ("Formatter error: failed to compile Blorp formatter\n"
+                     ^ String.trim cc_output)
+                  else begin
+                    Sys.rename temp_bin bin_path;
+                    Ok bin_path
+                  end)))
 
-let wait_for_formatter_binary bin_path =
-  let rec loop attempts =
-    if Sys.file_exists bin_path then Ok bin_path
-    else if attempts <= 0 then
-      Error
-        (Printf.sprintf
-           "Formatter error: timed out waiting for cached formatter binary %s"
-           bin_path)
-    else begin
-      sleep_seconds 0.1;
-      loop (attempts - 1)
-    end
-  in
-  loop 600
+let write_formatter_lock_owner lock_dir =
+  write_file
+    (Filename.concat lock_dir "owner.pid")
+    (Printf.sprintf "%d\n" (Unix.getpid ()))
 
-let formatter_binary_path formatter_tool =
+let read_formatter_lock_owner lock_dir =
+  let path = Filename.concat lock_dir "owner.pid" in
+  try Modules.read_file path |> String.trim |> int_of_string_opt
+  with _ -> None
+
+let process_is_alive pid =
   try
-    let key = formatter_binary_cache_key formatter_tool in
+    Unix.kill pid 0;
+    true
+  with
+  | Unix.Unix_error (Unix.ESRCH, _, _) -> false
+  | Unix.Unix_error (Unix.EPERM, _, _) -> true
+  | _ -> false
+
+let formatter_lock_age_seconds lock_dir =
+  try Unix.gettimeofday () -. (Unix.stat lock_dir).Unix.st_mtime with _ -> 0.0
+
+let formatter_lock_is_stale lock_dir =
+  match read_formatter_lock_owner lock_dir with
+  | Some pid -> not (process_is_alive pid)
+  | None ->
+      (* Old lock directories did not record an owner. Give a just-created lock
+         a small grace period so waiters cannot race the owner file write. *)
+      formatter_lock_age_seconds lock_dir > 1.0
+
+let formatter_lock_is_stale_for_tests = formatter_lock_is_stale
+
+let formatter_lock_timeout_error bin_path =
+  Error
+    (Printf.sprintf
+       "Formatter error: timed out waiting for cached formatter binary %s"
+       bin_path)
+
+let formatter_binary_path source =
+  try
+    let key = formatter_binary_cache_key source in
     let bin_path =
       Filename.concat (fmt_cache_dir ()) (Printf.sprintf "formatter-%s.bin" key)
     in
-    if Sys.file_exists bin_path then Ok bin_path
-    else
-      let lock_dir = bin_path ^ ".lock" in
-      try
-        Unix.mkdir lock_dir 0o700;
-        Fun.protect
-          ~finally:(fun () -> try Unix.rmdir lock_dir with _ -> ())
-          (fun () ->
-            if Sys.file_exists bin_path then Ok bin_path
-            else compile_formatter_binary formatter_tool bin_path)
-      with Unix.Unix_error (Unix.EEXIST, _, _) ->
-        wait_for_formatter_binary bin_path
+    let lock_dir = bin_path ^ ".lock" in
+    let rec acquire attempts =
+      if Sys.file_exists bin_path then Ok bin_path
+      else if attempts <= 0 then formatter_lock_timeout_error bin_path
+      else
+        try
+          Unix.mkdir lock_dir 0o700;
+          Fun.protect
+            ~finally:(fun () -> cleanup_path_noerr lock_dir)
+            (fun () ->
+              write_formatter_lock_owner lock_dir;
+              if Sys.file_exists bin_path then Ok bin_path
+              else compile_formatter_binary source bin_path)
+        with Unix.Unix_error (Unix.EEXIST, _, _) ->
+          if Sys.file_exists bin_path then Ok bin_path
+          else if formatter_lock_is_stale lock_dir then begin
+            cleanup_path_noerr lock_dir;
+            acquire attempts
+          end
+          else begin
+            sleep_seconds 0.1;
+            acquire (attempts - 1)
+          end
+    in
+    acquire 600
   with Sys_error msg -> Error (Printf.sprintf "File error: %s" msg)
 
 type pending_render = {
@@ -388,25 +530,25 @@ let program_batch_args pending_files =
        (fun pending -> [ pending.json_file; pending.output_file ])
        pending_files
 
-let run_formatter_tool temp_dir formatter_tool args =
+let run_formatter_tool temp_dir source args =
   let stdout_path = Filename.concat temp_dir "formatter.stdout" in
   let stderr_path = Filename.concat temp_dir "formatter.stderr" in
-  match formatter_binary_path formatter_tool with
+  match formatter_binary_path source with
   | Error msg -> Error msg
   | Ok formatter_binary ->
       run_process_capture_files formatter_binary args stdout_path stderr_path
 
-let render_pending_files temp_dir formatter_tool pending_files =
-  run_formatter_tool temp_dir formatter_tool (program_batch_args pending_files)
+let render_pending_files temp_dir source pending_files =
+  run_formatter_tool temp_dir source (program_batch_args pending_files)
 
 let render_program_json_with_blorp_renderer json =
-  match formatter_tool_path () with
+  match formatter_source () with
   | Error msg -> Error msg
-  | Ok formatter_tool ->
+  | Ok source ->
       with_temp_dir "blorp-format-source-" (fun temp_dir ->
           let json_file = Filename.concat temp_dir "program.json" in
           write_file json_file json;
-          run_formatter_tool temp_dir formatter_tool [ "program"; json_file ])
+          run_formatter_tool temp_dir source [ "program"; json_file ])
 
 (** Format a source string. Returns the formatted source or an error. *)
 let format_string source =
@@ -453,16 +595,14 @@ let rec finish_render_files ~mode pending_files =
           | Ok results -> Ok (result :: results)))
 
 let format_files_with_blorp_renderer ~mode files =
-  match formatter_tool_path () with
+  match formatter_source () with
   | Error msg -> Error msg
-  | Ok formatter_tool ->
+  | Ok source ->
       with_temp_dir "blorp-format-" (fun temp_dir ->
           match prepare_render_files temp_dir 0 files with
           | Error msg -> Error msg
           | Ok pending_files -> (
-              match
-                render_pending_files temp_dir formatter_tool pending_files
-              with
+              match render_pending_files temp_dir source pending_files with
               | Error msg -> Error msg
               | Ok _ -> finish_render_files ~mode pending_files))
 

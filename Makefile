@@ -3,6 +3,7 @@
 .PHONY: all build clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
+FORMATTER_SOURCES := $(shell find tools/formatter -name '*.brp' 2>/dev/null)
 RUNTIME_TEST_ROOTS := $(wildcard tests/test_blorp tests/test_std tests/test_pkg)
 SECURITY_RUNTIME_TESTS := \
 	tests/test_blorp/sys/test_process.brp \
@@ -42,8 +43,12 @@ all: build
 compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)
 	ocaml compiler/tools/gen_embed_std.ml std > $@.tmp && mv $@.tmp $@
 
+# Generate embedded formatter source from tools/formatter/**/*.brp
+compiler/lib/embedded_formatter.ml: compiler/tools/gen_embed_formatter.ml $(FORMATTER_SOURCES)
+	ocaml compiler/tools/gen_embed_formatter.ml tools/formatter > $@.tmp && mv $@.tmp $@
+
 # Build the OCaml compiler
-build: compiler/lib/embedded_std.ml
+build: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml
 	cd compiler && dune build
 
 # Run all runtime tests (language features + standard library)
@@ -55,7 +60,7 @@ smoke: all
 	scripts/run_tests.sh unit compiler
 
 # Run OCaml unit tests
-unit-test:
+unit-test: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml
 	cd compiler && dune runtest
 
 ocaml-check:
@@ -148,4 +153,4 @@ docker-shell:
 # Clean build artifacts
 clean:
 	cd compiler && dune clean
-	rm -f ./blorp compiler/lib/embedded_std.ml
+	rm -f ./blorp compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml

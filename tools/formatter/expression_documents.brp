@@ -1222,6 +1222,14 @@ private pure func expression_pair_list_has_block(items: List[(String, Expression
 	has_block
 
 
+private pure func expression_is_multistep_ufcs_chain(expr: Expression) -> Bool:
+	match expr:
+		CallExpression(FieldAccessExpression(receiver, method_name), args):
+			chain: UfcsChain = receiver.collect_ufcs_chain([{name = method_name, args = args}])
+			chain.steps.length() >= 2
+		_: False
+
+
 private pure func expression_has_block(expr: Expression) -> Bool:
 	match expr:
 		BlockExpression(_): True
@@ -1234,7 +1242,7 @@ private pure func expression_has_block(expr: Expression) -> Bool:
 		TypedLambdaExpression(_, _, _, body): body.is_block_expression()
 		IfElseExpression(_, then_expr, else_expr):
 			then_expr.expression_has_block() or else_expr.expression_has_block()
-		CallExpression(_, args): args.expression_list_has_block()
+		CallExpression(_, args): expr.expression_is_multistep_ufcs_chain() or args.expression_list_has_block()
 		AscriptionExpression(inner, _): inner.expression_has_block()
 		TupleExpression(elems): elems.expression_list_has_block()
 		ListExpression(elems): elems.expression_list_has_block()
@@ -1287,6 +1295,62 @@ private pure func block_call_arguments_document(args: List[Expression]) -> Doc:
 				.indent())
 		.cat(hardline())
 		.cat(")".text())
+
+
+private pure func delimited_collection_call_arguments_document(
+	open_text: String,
+	close_text: String,
+	items: List[Doc],
+) -> Doc:
+	"("
+		.text()
+		.cat(open_text.text())
+		.cat(hardline()
+				.cat(items.comma_hardline_documents())
+				.indent())
+		.cat(hardline())
+		.cat(close_text.text())
+		.cat(")".text())
+
+
+private pure func dictionary_entries_have_block(entries: List[(Expression, Expression)]) -> Bool:
+	var has_block: Bool = False
+	for entry in entries:
+		if entry.0.expression_has_block() or entry.1.expression_has_block():
+			has_block = True
+	has_block
+
+
+private pure func collection_call_arguments_document(args: List[Expression]) -> Option[Doc]:
+	match args:
+		[ListExpression(elems)]:
+			if elems.length() > 1 or elems.expression_list_has_block():
+				Some(delimited_collection_call_arguments_document(
+					"[",
+					"]",
+					elems.expression_document_list(),
+				))
+			else:
+				None
+		[VectorExpression(elems)]:
+			if elems.length() > 1 or elems.expression_list_has_block():
+				Some(delimited_collection_call_arguments_document(
+					"{",
+					"}",
+					elems.expression_document_list(),
+				))
+			else:
+				None
+		[DictionaryExpression(entries)]:
+			if entries.length() > 1 or entries.dictionary_entries_have_block():
+				Some(delimited_collection_call_arguments_document(
+					"{",
+					"}",
+					entries.dictionary_entry_documents(),
+				))
+			else:
+				None
+		_: None
 
 
 private pure func vector_rank_expression(expr: Expression) -> Int:
@@ -1431,6 +1495,19 @@ private pure func tuple_expression_document(elems: List[Expression]) -> Doc:
 		bracketed_expression_document("(", ")", elems)
 
 
+private pure func grouped_call_arguments_document(args: List[Expression]) -> Doc:
+	"("
+		.text()
+		.cat(softline()
+				.cat(args
+						.call_argument_documents()
+						.comma_sep_break())
+				.indent())
+		.cat(softline())
+		.cat(")".text())
+		.group()
+
+
 private pure func call_arguments_document(args: List[Expression]) -> Doc:
 	if args.length() == 0:
 		"()".text()
@@ -1438,19 +1515,14 @@ private pure func call_arguments_document(args: List[Expression]) -> Doc:
 		args.trailing_block_lambda_call_arguments_document()
 	else if args.expression_list_has_block_lambda():
 		args.block_lambda_call_arguments_document()
-	else if args.expression_list_has_non_lambda_block():
-		args.block_call_arguments_document()
 	else:
-		"("
-			.text()
-			.cat(softline()
-					.cat(args
-							.call_argument_documents()
-							.comma_sep_break())
-					.indent())
-			.cat(softline())
-			.cat(")".text())
-			.group()
+		match args.collection_call_arguments_document():
+			Some(doc): doc
+			None:
+				if args.expression_list_has_non_lambda_block():
+					args.block_call_arguments_document()
+				else:
+					args.grouped_call_arguments_document()
 
 
 private pure func collect_ufcs_chain(receiver: Expression, steps: List[UfcsStep]) -> UfcsChain:

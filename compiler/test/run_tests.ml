@@ -64,6 +64,9 @@ let () =
         (fun (name, cases) -> ("FmtDeclDoc." ^ name, cases))
         Test_fmt_decl_doc.suite
     @ List.map
+        (fun (name, cases) -> ("FmtEmbedding." ^ name, cases))
+        Test_fmt_embedding.suite
+    @ List.map
         (fun (name, cases) -> ("TraitObligationArchitecture." ^ name, cases))
         Test_trait_obligation_architecture.suite
     @ List.map (fun (name, cases) -> ("Infer." ^ name, cases)) Test_infer.suite
