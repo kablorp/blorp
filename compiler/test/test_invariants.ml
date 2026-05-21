@@ -157,11 +157,24 @@ let test_ckunknown_flags_unresolved_call () =
   match violations with
   | [ v ] ->
       Alcotest.(check bool)
-        "mentions mystery call" true
-        (Modules.contains v.Core_error.msg "CKUnknown");
+        "mentions unresolved call" true
+        (Modules.contains v.Core_error.msg "unresolved call target");
       Alcotest.(check bool)
         "phase tag is Specialize" true
         (v.Core_error.phase = Core_error.Stage Core_stage.Specialize)
+  | _ -> Alcotest.fail "unreachable"
+
+let test_ckselected_direct_flags_unresolved_call () =
+  let fn = mk (CVar (Var.named "selected")) ty_int in
+  let call = mk_call (CKSelectedDirect 123) fn [] ty_int in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:call) ] in
+  let violations = Core_invariants.check_no_ckunknown prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions unresolved call" true
+        (Modules.contains v.Core_error.msg "unresolved call target")
   | _ -> Alcotest.fail "unreachable"
 
 let test_ckunknown_walks_into_nested () =
@@ -1362,8 +1375,8 @@ let test_make_stage_hook_raises_on_violation () =
         "phase is Specialize" true
         (err.Core_error.phase = Core_error.Stage Core_stage.Specialize);
       Alcotest.(check bool)
-        "msg mentions CKUnknown" true
-        (Blorp.Modules.contains err.Core_error.msg "CKUnknown")
+        "msg mentions unresolved call" true
+        (Blorp.Modules.contains err.Core_error.msg "unresolved call target")
   | () -> Alcotest.fail "expected Core_error from make_stage_hook"
 
 let test_make_stage_hook_silent_when_disabled () =
@@ -1399,8 +1412,8 @@ let test_final_critical_invariants_raise_when_disabled () =
         "phase is Final" true
         (err.Core_error.phase = Core_error.Stage Core_stage.Final);
       Alcotest.(check bool)
-        "msg mentions CKUnknown" true
-        (Blorp.Modules.contains err.Core_error.msg "CKUnknown")
+        "msg mentions unresolved call" true
+        (Blorp.Modules.contains err.Core_error.msg "unresolved call target")
   | () -> Alcotest.fail "expected final critical invariant violation"
 
 let test_final_critical_invariants_reject_raw_match_when_disabled () =
@@ -1983,6 +1996,8 @@ let suite =
           test_ckunknown_passes_on_valid_program;
         Alcotest.test_case "flags unresolved" `Quick
           test_ckunknown_flags_unresolved_call;
+        Alcotest.test_case "flags selected direct unresolved" `Quick
+          test_ckselected_direct_flags_unresolved_call;
         Alcotest.test_case "walks nested" `Quick
           test_ckunknown_walks_into_nested;
         Alcotest.test_case "flags layoutless list_alloc post-specialize" `Quick

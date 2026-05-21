@@ -475,7 +475,9 @@ let specialize_func (original : core_func) (mangled : string)
                         node with
                         desc =
                           CCall
-                            ( kind,
+                            ( (match kind with
+                              | CKSelectedDirect _ -> CKUnknown
+                              | _ -> kind),
                               {
                                 callee with
                                 desc = CVar (Core.Var.named mangled);
@@ -523,6 +525,14 @@ let concretize_call_args_for_specialization (gf : core_func)
       gf.cf_params args
   with Invalid_argument _ -> args
 
+let selected_def_id_from_call_kind = function
+  | CKSelectedDirect id -> Some id
+  | _ -> None
+
+let clear_selected_direct_call_kind = function
+  | CKSelectedDirect _ -> CKUnknown
+  | kind -> kind
+
 let concretize_call_for_specialization (gf : core_func) (subst : mono_subst)
     (node : core) (kind : call_kind) (callee : core) (args : core list)
     (mangled : string) : core =
@@ -532,7 +542,10 @@ let concretize_call_for_specialization (gf : core_func) (subst : mono_subst)
   {
     node' with
     desc =
-      CCall (kind, { callee with desc = CVar (Core.Var.named mangled) }, args');
+      CCall
+        ( clear_selected_direct_call_kind kind,
+          { callee with desc = CVar (Core.Var.named mangled) },
+          args' );
   }
 
 let binop_method : Ast.binop -> string option = function
@@ -1169,11 +1182,14 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
         match lookup_alias_module state alias_name with
         | Some mod_path -> (
             let selected_by_id =
-              match obj.desc with
-              | CVar v -> (
-                  match lookup_generic_by_def_id state v.vdef_id with
-                  | Some hit when hit.gh_module_path = Some mod_path -> Some hit
-                  | _ -> None)
+              let selected_id =
+                match selected_def_id_from_call_kind kind with
+                | Some _ as id -> id
+                | None -> (
+                    match obj.desc with CVar v -> v.vdef_id | _ -> None)
+              in
+              match lookup_generic_by_def_id state selected_id with
+              | Some hit when hit.gh_module_path = Some mod_path -> Some hit
               | _ -> None
             in
             let fallback_hit () =
@@ -1254,7 +1270,12 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
           | _ -> `Missing
         in
         let resolve_name name =
-          match lookup_generic_by_def_id state v.vdef_id with
+          let selected_id =
+            match selected_def_id_from_call_kind kind with
+            | Some _ as id -> id
+            | None -> v.vdef_id
+          in
+          match lookup_generic_by_def_id state selected_id with
           | Some hit -> Some hit
           | None -> (
               (* UFCS-mangled names are already explicit method targets:

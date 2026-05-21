@@ -57,7 +57,11 @@ and expr_unmanaged_safe ~reg (e : core) : bool =
   node_is_unmanaged ~reg e
   &&
   match e.desc with
-  | CCall ((CKUser _ | CKBuiltin _ | CKForeign _ | CKIntrinsic _), _, args) ->
+  | CCall
+      ( ( CKSelectedDirect _ | CKUser _ | CKBuiltin _ | CKForeign _
+        | CKIntrinsic _ ),
+        _,
+        args ) ->
       List.for_all (expr_unmanaged_safe ~reg) args
   | CMatch (scrut, tree) ->
       expr_unmanaged_safe ~reg scrut && ctree_unmanaged_safe ~reg tree

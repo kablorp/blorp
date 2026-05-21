@@ -74,24 +74,28 @@ let violation_at (stage : Core_stage.t) (loc : Ast.loc) ?hint msg : Core_error.t
    Post-specialize: every [CCall] has a resolved [call_kind]
    ============================================================================ *)
 
-(** After [Core_specialize], no [CCall (CKUnknown, _, _)] may survive.
+(** After [Core_specialize], no unresolved [CCall] target may survive.
     [Core_resolve] is allowed to leave type-dispatched stdlib operations
-    and bitwise pseudo-builtins as [CKUnknown] because [Core_specialize]
-    owns those rewrites. Past that boundary, a [CKUnknown] is either an
-    unresolved call or a later pass fabricating calls without tagging them. *)
+    as [CKUnknown] because [Core_specialize] owns those rewrites. Selected
+    direct calls and compiler-owned intrinsics such as bitwise operators and
+    debug reflection must resolve earlier because typed metadata or the
+    intrinsic registry already identifies the target. Past that boundary,
+    either form is an unresolved call or a later pass fabricating calls without
+    tagging them. *)
 let check_no_ckunknown_at (stage : Core_stage.t) (prog : Core.core_program) :
     Core_error.t list =
   fold_program
     (fun acc e ->
       match e.Core.desc with
-      | Core.CCall (Core.CKUnknown, _, _) ->
+      | Core.CCall ((Core.CKUnknown | Core.CKSelectedDirect _), _, _) ->
           let v =
             violation_at stage e.loc
               ~hint:
                 "Core_resolve may leave specialization-owned calls as \
                  CKUnknown, but Core_specialize must rewrite every one before \
-                 later Core passes or emission."
-              "CCall with CKUnknown reached post-specialize IR"
+                 later Core passes or emission. CKSelectedDirect must be \
+                 resolved to CKUser before specialization."
+              "CCall with unresolved call target reached post-specialize IR"
           in
           v :: acc
       | _ -> acc)
@@ -740,7 +744,7 @@ let raw_top_level_function_ref (index : top_level_function_index)
 
 let direct_call_kind = function
   | Core.CKUser _ | Core.CKForeign _ | Core.CKBuiltin _ | Core.CKIntrinsic _
-  | Core.CKUnknown ->
+  | Core.CKUnknown | Core.CKSelectedDirect _ ->
       true
   | Core.CKClosure -> false
 

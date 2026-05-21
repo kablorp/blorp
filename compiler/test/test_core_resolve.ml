@@ -84,6 +84,7 @@ let expect_builtin_call label expected body =
         | CKBuiltin n -> "CKBuiltin " ^ n
         | CKClosure -> "CKClosure"
         | CKUnknown -> "CKUnknown"
+        | CKSelectedDirect id -> Printf.sprintf "CKSelectedDirect %d" id
       in
       Alcotest.failf "%s resolved as %s, expected CKBuiltin %s" label got
         expected
@@ -108,6 +109,7 @@ let expect_intrinsic_call label expected body =
         | CKBuiltin n -> "CKBuiltin " ^ n
         | CKClosure -> "CKClosure"
         | CKUnknown -> "CKUnknown"
+        | CKSelectedDirect id -> Printf.sprintf "CKSelectedDirect %d" id
       in
       Alcotest.failf "%s resolved as %s, expected CKIntrinsic %s" label got
         expected
@@ -278,7 +280,8 @@ let test_resolve_user_call () =
         | CKForeign { fc_c_name; _ } -> "CKForeign " ^ fc_c_name
         | CKBuiltin n -> "CKBuiltin " ^ n
         | CKIntrinsic n -> "CKIntrinsic " ^ n
-        | CKClosure -> "CKClosure")
+        | CKClosure -> "CKClosure"
+        | CKSelectedDirect id -> Printf.sprintf "CKSelectedDirect %d" id)
   | _ -> Alcotest.fail "expected CCall at root"
 
 let test_resolve_user_call_prefers_carried_def_id_name () =
@@ -337,6 +340,299 @@ let test_resolve_user_call_prefers_carried_def_id_name () =
       Alcotest.(check string) "canonical selected name" "apply__pure" name;
       Alcotest.(check (option int)) "selected def id" (Some 42) def_id
   | _ -> Alcotest.fail "expected CKUser selected by carried def id"
+
+let test_resolve_user_call_prefers_selected_direct_kind () =
+  let pure_func : core_func =
+    {
+      cf_name = "apply__pure";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [ { cp_name = Var.named "x"; cp_ty = ty_int; cp_loc = loc } ];
+      cf_return_ty = ty_int;
+      cf_body = Some (cint 42);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 43;
+    }
+  in
+  let call_ty =
+    TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
+  in
+  let selected = mk (CVar (Var.named "apply")) call_ty in
+  let call =
+    mk
+      (CCall (CKSelectedDirect pure_func.cf_def_id, selected, [ cint 1 ]))
+      ty_int
+  in
+  let main_f : core_func =
+    {
+      cf_name = "main";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [];
+      cf_return_ty = ty_int;
+      cf_body = Some call;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc pure_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc main_f; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases:(Hashtbl.create 0)
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  let main_resolved =
+    match resolved with
+    | [ _; { cd_desc = CDFunc { cf_body = Some b; _ }; _ } ] -> b
+    | _ -> Alcotest.fail "expected selected call in main"
+  in
+  match main_resolved.desc with
+  | CCall (CKUser (name, def_id), _, _) ->
+      Alcotest.(check string) "canonical selected name" "apply__pure" name;
+      Alcotest.(check (option int)) "selected def id" (Some 43) def_id
+  | _ -> Alcotest.fail "expected CKUser selected by call kind def id"
+
+let test_resolve_bitwise_calls_to_intrinsics () =
+  let bitwise_ty =
+    TyFunc { params = [ ty_int; ty_int ]; return = ty_int; is_pure = true }
+  in
+  let bit_not_ty =
+    TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
+  in
+  let cases =
+    [
+      ("bit_and", bitwise_ty, [ cint 1; cint 2 ]);
+      ("bit_or", bitwise_ty, [ cint 1; cint 2 ]);
+      ("bit_xor", bitwise_ty, [ cint 1; cint 2 ]);
+      ("bit_not", bit_not_ty, [ cint 1 ]);
+      ("shift_left", bitwise_ty, [ cint 1; cint 2 ]);
+      ("shift_right", bitwise_ty, [ cint 1; cint 2 ]);
+    ]
+  in
+  List.iter
+    (fun (name, fn_ty, args) ->
+      let body = mk_call name fn_ty args ty_int in
+      let prog = program_with_func "main" [] ty_int (Some body) in
+      let resolved = Blorp.Core_resolve.resolve_program prog in
+      let body = get_func_body resolved in
+      expect_intrinsic_call name name body)
+    cases
+
+let test_resolve_user_bitwise_name_before_intrinsic () =
+  let fn_ty =
+    TyFunc { params = [ ty_int; ty_int ]; return = ty_int; is_pure = true }
+  in
+  let user_func : core_func =
+    {
+      cf_name = "bit_and";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params =
+        [
+          { cp_name = Var.named "left"; cp_ty = ty_int; cp_loc = loc };
+          { cp_name = Var.named "right"; cp_ty = ty_int; cp_loc = loc };
+        ];
+      cf_return_ty = ty_int;
+      cf_body = Some (cint 42);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 91;
+    }
+  in
+  let main_func : core_func =
+    {
+      cf_name = "main";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [];
+      cf_return_ty = ty_int;
+      cf_body = Some (mk_call "bit_and" fn_ty [ cint 1; cint 2 ] ty_int);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 92;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc user_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc main_func; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved = Blorp.Core_resolve.resolve_program prog in
+  let body =
+    match resolved with
+    | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] -> body
+    | _ -> Alcotest.fail "expected user function and main"
+  in
+  match body.desc with
+  | CCall (CKUser (name, Some def_id), _, _) ->
+      Alcotest.(check string) "user function wins" "bit_and" name;
+      Alcotest.(check int) "user def id wins" 91 def_id
+  | CCall (CKIntrinsic name, _, _) ->
+      Alcotest.failf "user bit_and resolved as intrinsic %s" name
+  | _ -> Alcotest.fail "expected bit_and to resolve as a user call"
+
+let test_resolve_debug_reflection_calls_to_intrinsics () =
+  let ty_string = TyNamed ("String", []) in
+  let ty_bool = TyNamed ("Bool", []) in
+  let cases =
+    [
+      ("type_name", ty_string);
+      ("std_debug__type_name", ty_string);
+      ("is_heap", ty_bool);
+      ("std_debug__is_heap", ty_bool);
+    ]
+  in
+  List.iter
+    (fun (name, ret_ty) ->
+      let fn_ty =
+        TyFunc { params = [ ty_int ]; return = ret_ty; is_pure = true }
+      in
+      let body = mk_call name fn_ty [ cint 1 ] ret_ty in
+      let prog = program_with_func "main" [] ret_ty (Some body) in
+      let resolved = Blorp.Core_resolve.resolve_program prog in
+      let expected =
+        match name with
+        | "std_debug__type_name" -> "type_name"
+        | "std_debug__is_heap" -> "is_heap"
+        | _ -> name
+      in
+      expect_intrinsic_call name expected (get_func_body resolved))
+    cases
+
+let test_resolve_imported_debug_reflection_call_to_intrinsic () =
+  let ty_string = TyNamed ("String", []) in
+  let fn_ty =
+    TyFunc { params = [ ty_int ]; return = ty_string; is_pure = true }
+  in
+  let body = mk_call "type_name" fn_ty [ cint 1 ] ty_string in
+  let prog = program_with_func "main" [] ty_string (Some body) in
+  let import_aliases = Hashtbl.create 4 in
+  Hashtbl.replace import_aliases "type_name" ("std/debug", "type_name");
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  expect_intrinsic_call "imported type_name" "type_name"
+    (get_func_body resolved)
+
+let test_resolve_qualified_debug_reflection_call_to_intrinsic () =
+  let ty_bool = TyNamed ("Bool", []) in
+  let fn_ty =
+    TyFunc { params = [ ty_int ]; return = ty_bool; is_pure = true }
+  in
+  let module_alias = cvar "dbg" (TyNamed ("Module", [])) in
+  let callee = mk (CField (module_alias, "is_heap")) fn_ty in
+  let body = mk (CCall (CKUnknown, callee, [ cint 1 ])) ty_bool in
+  let prog = program_with_func "main" [] ty_bool (Some body) in
+  let import_aliases = Hashtbl.create 4 in
+  Hashtbl.replace import_aliases "dbg" ("std/debug", "");
+  let resolved =
+    Blorp.Core_resolve.resolve_program ~import_aliases
+      ~module_imports:(Hashtbl.create 0) prog
+  in
+  expect_intrinsic_call "qualified is_heap" "is_heap" (get_func_body resolved)
+
+let test_resolve_user_debug_reflection_name_before_intrinsic () =
+  let ty_string = TyNamed ("String", []) in
+  let fn_ty =
+    TyFunc { params = [ ty_int ]; return = ty_string; is_pure = true }
+  in
+  let user_func : core_func =
+    {
+      cf_name = "type_name";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [ { cp_name = Var.named "x"; cp_ty = ty_int; cp_loc = loc } ];
+      cf_return_ty = ty_string;
+      cf_body = Some (cstr "custom");
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 93;
+    }
+  in
+  let main_func : core_func =
+    {
+      cf_name = "main";
+      cf_type_params = [];
+      cf_module = None;
+      cf_params = [];
+      cf_return_ty = ty_string;
+      cf_body = Some (mk_call "type_name" fn_ty [ cint 1 ] ty_string);
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 94;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDFunc user_func; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc main_func; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let resolved = Blorp.Core_resolve.resolve_program prog in
+  let body =
+    match resolved with
+    | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] -> body
+    | _ -> Alcotest.fail "expected user function and main"
+  in
+  match body.desc with
+  | CCall (CKUser (name, Some def_id), _, _) ->
+      Alcotest.(check string) "user function wins" "type_name" name;
+      Alcotest.(check int) "user def id wins" 93 def_id
+  | CCall (CKIntrinsic name, _, _) ->
+      Alcotest.failf "user type_name resolved as intrinsic %s" name
+  | _ -> Alcotest.fail "expected type_name to resolve as a user call"
+
+let test_resolve_imported_matrix_kernels_to_builtins () =
+  let tensor elem dims =
+    TyNamed ("Tensor", elem :: List.map (fun n -> TyConstInt n) dims)
+  in
+  let matrix = cvar "m" (tensor ty_int [ 2; 3 ]) in
+  let vector_2 = cvar "v2" (tensor ty_int [ 2 ]) in
+  let vector_3 = cvar "v3" (tensor ty_int [ 3 ]) in
+  let cases =
+    [
+      ( "matvec",
+        "blorp_tensor_matvec",
+        [ matrix; vector_3 ],
+        tensor ty_int [ 2 ] );
+      ( "matvec_t",
+        "blorp_tensor_matvec_t",
+        [ matrix; vector_2 ],
+        tensor ty_int [ 3 ] );
+      ( "outer",
+        "blorp_tensor_outer",
+        [ vector_2; vector_3 ],
+        tensor ty_int [ 2; 3 ] );
+    ]
+  in
+  List.iter
+    (fun (name, expected, args, ret_ty) ->
+      let fn_ty =
+        TyFunc
+          {
+            params = List.map (fun arg -> arg.ty) args;
+            return = ret_ty;
+            is_pure = true;
+          }
+      in
+      let body = mk_call name fn_ty args ret_ty in
+      let prog = program_with_func "main" [] ret_ty (Some body) in
+      let import_aliases = Hashtbl.create 4 in
+      Hashtbl.replace import_aliases name ("std/matrix", name);
+      let resolved =
+        Blorp.Core_resolve.resolve_program ~import_aliases
+          ~module_imports:(Hashtbl.create 0) prog
+      in
+      expect_builtin_call name expected (get_func_body resolved))
+    cases
 
 let test_resolve_foreign_call () =
   (* foreign func c_abs(x: Int) -> Int = "abs"
@@ -488,13 +784,13 @@ let test_resolve_qualified_call_prefers_carried_def_id_name () =
   let call_ty =
     TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true }
   in
-  let module_alias =
-    mk
-      (CVar { (Var.named "L") with vdef_id = Some reverse_func.cf_def_id })
-      (TyNamed ("Module", []))
-  in
+  let module_alias = mk (CVar (Var.named "L")) (TyNamed ("Module", [])) in
   let callee = mk (CField (module_alias, "reverse")) call_ty in
-  let call = mk (CCall (CKUnknown, callee, [ cint 1 ])) ty_int in
+  let call =
+    mk
+      (CCall (CKSelectedDirect reverse_func.cf_def_id, callee, [ cint 1 ]))
+      ty_int
+  in
   let main_f : core_func =
     {
       cf_name = "main";
@@ -1829,6 +2125,22 @@ let suite =
         Alcotest.test_case "user_call" `Quick test_resolve_user_call;
         Alcotest.test_case "user_call_prefers_carried_def_id_name" `Quick
           test_resolve_user_call_prefers_carried_def_id_name;
+        Alcotest.test_case "user_call_prefers_selected_direct_kind" `Quick
+          test_resolve_user_call_prefers_selected_direct_kind;
+        Alcotest.test_case "bitwise_calls_to_intrinsics" `Quick
+          test_resolve_bitwise_calls_to_intrinsics;
+        Alcotest.test_case "user_bitwise_name_before_intrinsic" `Quick
+          test_resolve_user_bitwise_name_before_intrinsic;
+        Alcotest.test_case "debug_reflection_calls_to_intrinsics" `Quick
+          test_resolve_debug_reflection_calls_to_intrinsics;
+        Alcotest.test_case "imported_debug_reflection_call_to_intrinsic" `Quick
+          test_resolve_imported_debug_reflection_call_to_intrinsic;
+        Alcotest.test_case "qualified_debug_reflection_call_to_intrinsic" `Quick
+          test_resolve_qualified_debug_reflection_call_to_intrinsic;
+        Alcotest.test_case "user_debug_reflection_name_before_intrinsic" `Quick
+          test_resolve_user_debug_reflection_name_before_intrinsic;
+        Alcotest.test_case "imported_matrix_kernels_to_builtins" `Quick
+          test_resolve_imported_matrix_kernels_to_builtins;
         Alcotest.test_case "foreign_call" `Quick test_resolve_foreign_call;
         Alcotest.test_case "imported_unresolved_stays_unknown" `Quick
           test_resolve_imported_unresolved_stays_unknown;

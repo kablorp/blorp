@@ -150,6 +150,7 @@ type std_body_param_shape =
 type std_body_synthesis =
   | BuiltinWrapper of string
   | BuiltinWrapperWithTrailingInt of { c_name : string; value : int }
+  | TensorLength
 
 type std_body_spec = {
   spec_module_path : string;
@@ -1067,14 +1068,14 @@ let std_body_specs =
         FirstParamTensor;
       tensor_builtin_spec ~c_name:"blorp_tensor_peel"
         ~param_shapes:[ ParamTensor; AnyParam ] "tensor_peel" 2 FirstParamTensor;
-      spec ~return_shape:(ReturnNamed "Int") "std/tensor" "length" 1
-        ~param_shapes:[ ParamTensor ] FirstParamTensor;
+      spec ~return_shape:(ReturnNamed "Int") ~synthesis:TensorLength
+        "std/tensor" "length" 1 ~param_shapes:[ ParamTensor ] FirstParamTensor;
     ]
   in
   let vector_specs =
     [
-      spec ~return_shape:(ReturnNamed "Int") "std/vector" "length" 1
-        ~param_shapes:[ ParamTensor ] FirstParamTensor;
+      spec ~return_shape:(ReturnNamed "Int") ~synthesis:TensorLength
+        "std/vector" "length" 1 ~param_shapes:[ ParamTensor ] FirstParamTensor;
       spec ~param_shapes:[ ParamTensor ] "std/vector" "sum" 1 FirstParamTensor;
       spec ~param_shapes:[ ParamTensor ] "std/vector" "product" 1
         FirstParamTensor;
@@ -1458,6 +1459,10 @@ let synthesize_std_body_from_spec spec params return_ty =
   | Some (BuiltinWrapperWithTrailingInt { c_name; value }) ->
       let args = List.map param params @ [ lit_int value ] in
       Some (builtin_call c_name args return_ty)
+  | Some TensorLength -> (
+      match params with
+      | [ p ] -> Some (intr "tensor_len" [ param p ] return_ty)
+      | _ -> None)
   | None -> None
 
 let pointer_argument_as_ptr layout value source_ty =
@@ -5675,7 +5680,6 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
     ~(checked_params : std_body_checked_params) ~(return_ty : Ast.type_expr) :
     core option =
   let func_name = source_func_name ~module_path func_name in
-  let is_tensor_type ty = Core_tensor_type.is_type ~reg:(tensor_reg reg) ty in
   let is_concrete_tensor ty = is_concrete_tensor ?reg ty in
   let unsupported_concrete_numeric_tensor ty =
     unsupported_concrete_numeric_tensor ?reg ty
@@ -8321,12 +8325,6 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
   (* Legacy builder C wrappers removed. string_append_char is synthesized above
      so UTF-8 encoding and COW flow through Core IR. *)
   (* ---- Tensor/Vector operations ---- *)
-  | "length"
-    when match params with
-         | { cp_ty; _ } :: _ when is_tensor_type cp_ty -> true
-         | _ -> false ->
-      let p = param_at 0 in
-      Some (intr "tensor_len" [ param p ] return_ty)
   (* ---- Tensor reductions (require concrete element type) ---- *)
   (* These return None when the element type is generic (pre-mono).
      After monomorphization, core_synth re-attempts synthesis with

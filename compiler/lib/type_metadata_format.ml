@@ -102,3 +102,8 @@ let hover_type_view ?fallback_ty (info : Ast.expr_type_info) =
 
 let fallback_hover_type_view ty =
   { primary_type = type_to_string ty; details = [] }
+
+let hover_type_view_for_expr ?fallback_ty (expr : Ast.expr) =
+  match expr.expr_type_info with
+  | Some info -> Some (hover_type_view ?fallback_ty info)
+  | None -> Option.map fallback_hover_type_view fallback_ty

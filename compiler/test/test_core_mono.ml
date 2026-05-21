@@ -668,7 +668,7 @@ let test_mono_ufcs_mangled_callee () =
     "has Char/String specialization" true
     (List.mem "std_option__ok_or__mono_String_Char" names)
 
-let test_mono_bare_call_prefers_carried_def_id_generic () =
+let test_mono_bare_call_prefers_selected_direct_kind_generic () =
   let impure_primary =
     mk_func ~def_id:701 ~type_params:[ "T" ] "apply"
       [ ("x", TyVar "T") ]
@@ -685,9 +685,7 @@ let test_mono_bare_call_prefers_carried_def_id_generic () =
   let main_body =
     mk
       (CCall
-         ( CKUnknown,
-           cvar_with_def_id "apply" 702 call_ty,
-           [ cvar "value" ty_int ] ))
+         (CKSelectedDirect 702, cvar "apply" call_ty, [ cvar "value" ty_int ]))
       ty_int
   in
   let main_fn = mk_func "main" [ ("value", ty_int) ] ty_int main_body in
@@ -702,13 +700,17 @@ let test_mono_bare_call_prefers_carried_def_id_generic () =
   in
   match main_decl.cd_desc with
   | CDFunc
-      { cf_body = Some { desc = CCall (_, { desc = CVar v; _ }, _); _ }; _ } ->
+      { cf_body = Some { desc = CCall (kind, { desc = CVar v; _ }, _); _ }; _ }
+    ->
       Alcotest.(check string)
-        "selected generic target follows carried id" "apply__pure__mono_Int"
-        v.vname
+        "selected generic target follows call kind id" "apply__pure__mono_Int"
+        v.vname;
+      Alcotest.(check bool)
+        "selected kind is cleared after specialization" true
+        (match kind with CKSelectedDirect _ -> false | _ -> true)
   | _ -> Alcotest.fail "expected rewritten main call"
 
-let test_mono_qualified_call_prefers_carried_def_id_generic () =
+let test_mono_qualified_call_prefers_selected_direct_kind_generic () =
   let list_t = TyNamed ("List", [ TyVar "T" ]) in
   let list_int = TyNamed ("List", [ ty_int ]) in
   let impure_primary =
@@ -726,10 +728,12 @@ let test_mono_qualified_call_prefers_carried_def_id_generic () =
   let call_ty =
     TyFunc { params = [ list_int ]; return = list_int; is_pure = true }
   in
-  let module_alias = cvar_with_def_id "L" 712 (TyNamed ("Module", [])) in
+  let module_alias = cvar "L" (TyNamed ("Module", [])) in
   let callee = mk (CField (module_alias, "reverse")) call_ty in
   let main_body =
-    mk (CCall (CKUnknown, callee, [ cvar "items" list_int ])) list_int
+    mk
+      (CCall (CKSelectedDirect 712, callee, [ cvar "items" list_int ]))
+      list_int
   in
   let main_fn = mk_func "main" [ ("items", list_int) ] list_int main_body in
   let import_aliases = Hashtbl.create 1 in
@@ -745,10 +749,14 @@ let test_mono_qualified_call_prefers_carried_def_id_generic () =
   in
   match main_decl.cd_desc with
   | CDFunc
-      { cf_body = Some { desc = CCall (_, { desc = CVar v; _ }, _); _ }; _ } ->
+      { cf_body = Some { desc = CCall (kind, { desc = CVar v; _ }, _); _ }; _ }
+    ->
       Alcotest.(check string)
-        "qualified selected generic target follows carried id"
-        "std_list__reverse__pure__mono_Int" v.vname
+        "qualified selected generic target follows call kind id"
+        "std_list__reverse__pure__mono_Int" v.vname;
+      Alcotest.(check bool)
+        "selected kind is cleared after specialization" true
+        (match kind with CKSelectedDirect _ -> false | _ -> true)
   | _ -> Alcotest.fail "expected rewritten main call"
 
 let test_mono_fuses_option_get_or_call () =
@@ -1783,10 +1791,10 @@ let suite =
         Alcotest.test_case "e2e_pipeline" `Quick test_mono_e2e_pipeline;
         Alcotest.test_case "ufcs_mangled_callee" `Quick
           test_mono_ufcs_mangled_callee;
-        Alcotest.test_case "bare call prefers carried def id generic" `Quick
-          test_mono_bare_call_prefers_carried_def_id_generic;
-        Alcotest.test_case "qualified call prefers carried def id generic"
-          `Quick test_mono_qualified_call_prefers_carried_def_id_generic;
+        Alcotest.test_case "bare call prefers selected direct kind generic"
+          `Quick test_mono_bare_call_prefers_selected_direct_kind_generic;
+        Alcotest.test_case "qualified call prefers selected direct kind generic"
+          `Quick test_mono_qualified_call_prefers_selected_direct_kind_generic;
         Alcotest.test_case "option_get_or_call_fused" `Quick
           test_mono_fuses_option_get_or_call;
         Alcotest.test_case "option_get_or_else_call_fused" `Quick

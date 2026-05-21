@@ -801,10 +801,23 @@ let undefined_ident_error ctx name loc =
   error_with ~kind:(UndefinedIdent name) ~notes:[] ~help loc
     (Printf.sprintf "Undefined identifier: %s" name)
 
+let expr_type_info_of_slot ?source_ty ?(origin = Inferred)
+    ?(proofs = Type_proof_metadata.unproven_expr) slot =
+  {
+    source_ty;
+    semantic_ty = Type_widening.semantic_type slot;
+    value_ty = Type_widening.value_type slot;
+    origin;
+    widening = Type_widening.decision slot;
+    proofs;
+    resolved_call = None;
+  }
+
 let annotate_expr_type_info expr info = Ast.with_expr_type_info expr info
 
 let annotate_inferred_expr expr ty =
-  annotate_expr_type_info expr (Ast.expr_type_info_from_type ty)
+  annotate_expr_type_info expr
+    (expr_type_info_of_slot (Type_widening.keep_slot ty))
 
 (** Collect all variable references in an expression.
     Used for scoped-resource and mutable capture detection. *)
@@ -2091,18 +2104,6 @@ let inferred_binding_slot ~is_mutable ty =
 
 let inferred_binding_type ~is_mutable ty =
   Type_widening.value_type (inferred_binding_slot ~is_mutable ty)
-
-let expr_type_info_of_slot ?source_ty ?(origin = Inferred)
-    ?(proofs = Type_proof_metadata.unproven_expr) slot =
-  {
-    source_ty;
-    semantic_ty = Type_widening.semantic_type slot;
-    value_ty = Type_widening.value_type slot;
-    origin;
-    widening = Type_widening.decision slot;
-    proofs;
-    resolved_call = None;
-  }
 
 let with_value_slot ?source_ty ?origin ?proofs expr slot =
   let info = expr_type_info_of_slot ?source_ty ?origin ?proofs slot in

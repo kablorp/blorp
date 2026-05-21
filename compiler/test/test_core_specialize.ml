@@ -91,6 +91,7 @@ let expect_builtin_with_dims label expected_name expected_dims e =
         | CKBuiltin n -> "CKBuiltin " ^ n
         | CKClosure -> "CKClosure"
         | CKUnknown -> "CKUnknown"
+        | CKSelectedDirect id -> Printf.sprintf "CKSelectedDirect %d" id
       in
       Alcotest.failf "%s resolved as %s" label got
   | _ -> Alcotest.failf "%s did not specialize to a call" label
@@ -114,6 +115,7 @@ let expect_builtin_with_dims_with_reg label reg expected_name expected_dims e =
         | CKBuiltin n -> "CKBuiltin " ^ n
         | CKClosure -> "CKClosure"
         | CKUnknown -> "CKUnknown"
+        | CKSelectedDirect id -> Printf.sprintf "CKSelectedDirect %d" id
       in
       Alcotest.failf "%s resolved as %s" label got
   | _ -> Alcotest.failf "%s did not specialize to a call" label
@@ -217,6 +219,37 @@ let expect_list_alloc_width_with_reg label reg expected_width e =
       in
       Alcotest.(check int) (label ^ " width") expected_width got_width
   | _ -> Alcotest.failf "%s did not specialize to CListAlloc" label
+
+let expect_string_literal label expected e =
+  match (specialize e).desc with
+  | CLit (LitString (got, _)) ->
+      Alcotest.(check string) (label ^ " literal") expected got
+  | _ -> Alcotest.failf "%s did not specialize to a string literal" label
+
+let expect_bool_literal label expected e =
+  match (specialize e).desc with
+  | CLit (LitBool got) ->
+      Alcotest.(check bool) (label ^ " literal") expected got
+  | _ -> Alcotest.failf "%s did not specialize to a bool literal" label
+
+let test_debug_type_name_intrinsic_folds () =
+  let arg = mk (CLit (LitInt 42L)) (TyConstInt 42) in
+  expect_string_literal "type_name" "#42"
+    (call_intrinsic "type_name" [ arg ] ty_string)
+
+let test_debug_is_heap_intrinsic_folds () =
+  expect_bool_literal "is_heap Int" false
+    (call_intrinsic "is_heap" [ mk (CLit (LitInt 1L)) ty_int ] ty_bool);
+  expect_bool_literal "is_heap List" true
+    (call_intrinsic "is_heap" [ cvar "xs" ty_list_int ] ty_bool)
+
+let test_debug_reflection_requires_intrinsic_call_kind () =
+  let arg = mk (CLit (LitInt 42L)) (TyConstInt 42) in
+  match (specialize (call_unknown "type_name" [ arg ] ty_string)).desc with
+  | CCall (CKUnknown, _, _) -> ()
+  | CLit (LitString _) ->
+      Alcotest.fail "unresolved type_name call folded by callee name"
+  | _ -> Alcotest.fail "expected unresolved type_name to remain a call"
 
 let test_list_alloc_intrinsic_specializes_to_layout_node () =
   let cap = mk (CLit (LitInt 4L)) ty_int in
@@ -338,26 +371,15 @@ let test_outer_float_specializes_with_dims () =
   in
   expect_builtin_with_dims "outer float" "blorp_tensor_outer_float" [ 2; 3 ] e
 
-let test_unknown_matvec_specializes_with_dims () =
+let test_unknown_matvec_requires_resolved_builtin () =
   let w = cvar "w" (tensor ty_int [ 2; 2 ]) in
   let x = cvar "x" (tensor ty_int [ 2 ]) in
   let e = call_unknown "matvec" [ w; x ] (tensor ty_int [ 2 ]) in
-  expect_builtin_with_dims "unknown matvec int" "blorp_tensor_matvec_int"
-    [ 2; 2 ] e
-
-let test_unknown_matvec_t_specializes_with_dims () =
-  let w = cvar "w" (tensor ty_float32 [ 2; 2 ]) in
-  let x = cvar "x" (tensor ty_float32 [ 2 ]) in
-  let e = call_unknown "matvec_t" [ w; x ] (tensor ty_float32 [ 2 ]) in
-  expect_builtin_with_dims "unknown matvec_t float32"
-    "blorp_tensor_matvec_t_float32" [ 2; 2 ] e
-
-let test_unknown_outer_specializes_with_dims () =
-  let a = cvar "a" (tensor ty_float32 [ 2 ]) in
-  let b = cvar "b" (tensor ty_float32 [ 3 ]) in
-  let e = call_unknown "outer" [ a; b ] (tensor ty_float32 [ 2; 3 ]) in
-  expect_builtin_with_dims "unknown outer float32" "blorp_tensor_outer_float32"
-    [ 2; 3 ] e
+  match (specialize e).desc with
+  | CCall (CKUnknown, _, _) -> ()
+  | CCall (CKBuiltin name, _, _) ->
+      Alcotest.failf "unresolved matvec specialized to %s by name" name
+  | _ -> Alcotest.fail "expected unresolved matvec to remain a call"
 
 let test_float32_vector_fill_uses_packed_runtime () =
   let value = mk (CLit (LitFloat 0.0)) ty_float32 in
@@ -1119,6 +1141,15 @@ let test_fold_value_record_acc_sets_release_flag () =
 
 let suite =
   [
+    ( "debug_reflection_specialization",
+      [
+        Alcotest.test_case "type_name_intrinsic_folds" `Quick
+          test_debug_type_name_intrinsic_folds;
+        Alcotest.test_case "is_heap_intrinsic_folds" `Quick
+          test_debug_is_heap_intrinsic_folds;
+        Alcotest.test_case "requires_intrinsic_call_kind" `Quick
+          test_debug_reflection_requires_intrinsic_call_kind;
+      ] );
     ( "list_layout_specialization",
       [
         Alcotest.test_case "list_alloc_intrinsic_to_layout_node" `Quick
@@ -1143,12 +1174,8 @@ let suite =
           test_outer_int_specializes_with_dims;
         Alcotest.test_case "outer_float" `Quick
           test_outer_float_specializes_with_dims;
-        Alcotest.test_case "unknown_matvec_int" `Quick
-          test_unknown_matvec_specializes_with_dims;
-        Alcotest.test_case "unknown_matvec_t_float32" `Quick
-          test_unknown_matvec_t_specializes_with_dims;
-        Alcotest.test_case "unknown_outer_float32" `Quick
-          test_unknown_outer_specializes_with_dims;
+        Alcotest.test_case "unknown_matvec_requires_resolved_builtin" `Quick
+          test_unknown_matvec_requires_resolved_builtin;
       ] );
     ( "float32_tensor_specialization",
       [

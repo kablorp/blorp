@@ -54,14 +54,14 @@ type var = {
   vuniq : int;
   vdef_id : int option;
       (** Callable identity carried across the typed-AST-to-Core boundary.
-      During the UFCS migration this may come from either the legacy
-      [__ufcs_...#<id>] callee suffix or the parent typed call's
-      [resolved_call] metadata. Qualified module calls temporarily carry this
-      id on the module-alias [CVar] inside [CField] so lowering preserves the
-      qualified-call shape needed by mono and intrinsic dispatch. Later Core
-      phases use it as a selected [def_id] hint when promoting user calls,
-      without making Core depend on [env_types]. [None] for parameters,
-      locals, closures, and genuinely unresolved callees. *)
+      During the UFCS migration this may come from the legacy
+      [__ufcs_...#<id>] callee suffix or from resolved function references.
+      Call-site identity from typed [resolved_call] metadata is represented on
+      [call_kind] instead, so qualified module aliases do not masquerade as
+      callable values. Later Core phases use this only as a selected [def_id]
+      hint when promoting user calls, without making Core depend on
+      [env_types]. [None] for parameters, locals, closures, and genuinely
+      unresolved callees. *)
 }
 (** Variable: a source-level name plus a uniqueness tag.
 
@@ -578,6 +578,12 @@ and foreign_call = { fc_c_name : string; fc_arg_passing : foreign_arg_passing }
 
 and call_kind =
   | CKUnknown
+  | CKSelectedDirect of int
+      (** A direct source call whose selected [core_func.cf_def_id] came from
+      typed [resolved_call] metadata but whose canonical post-flatten Core
+      name is not available yet. [Core_mono] may use this id for generic body
+      selection; [Core_resolve] must replace it with [CKUser] before
+      specialization/emission. *)
   | CKUser of string * int option
       (** User-defined function call. The [int option] is the callee's
       [core_func.cf_def_id] when the resolver can identify the target,
@@ -1778,6 +1784,7 @@ let rec pp_to_string (e : core) : string =
       let tag =
         match kind with
         | CKUnknown -> ""
+        | CKSelectedDirect id -> Printf.sprintf "<selected:#%d>" id
         | CKUser (n, Some id) -> Printf.sprintf "<user:%s#%d>" n id
         | CKUser (n, None) -> Printf.sprintf "<user:%s>" n
         | CKForeign { fc_c_name; _ } -> Printf.sprintf "<foreign:%s>" fc_c_name

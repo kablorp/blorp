@@ -1,21 +1,23 @@
 (** LSP signature help handler.
 
     Provides function signature information when the user types '(' or ','.
-    Uses a text-level heuristic to find the enclosing function call and
-    active parameter index. *)
+    Parsed documents use AST call spans first. Incomplete documents fall back
+    to a best-effort text scan. *)
 
 open Lsp_json
 
 (* ============================================================================
-   Call site detection — text-level heuristic
+   Call site detection
    ============================================================================ *)
 
-(** Find the enclosing function call at the cursor position.
+(** Text fallback for incomplete documents.
+
+    Finds the enclosing function call at the cursor position.
     Returns (func_name, active_param_index) or None.
     Walks backwards tracking paren nesting to find unmatched '('.
     Skips string literal content. Scans up to 5 previous lines if needed. *)
-let find_enclosing_call (lines : string list) (line : int) (col : int) :
-    (string * int) option =
+let find_enclosing_call_text_fallback (lines : string list) (line : int)
+    (col : int) : (string * int) option =
   (* Collect text from current and up to 5 previous lines *)
   let combined = Buffer.create 256 in
   let start_line = max 0 (line - 5) in
@@ -88,6 +90,163 @@ let find_enclosing_call (lines : string list) (line : int) (col : int) :
     end
   end
 
+let position_compare (line_a, col_a) (line_b, col_b) =
+  match compare line_a line_b with 0 -> compare col_a col_b | c -> c
+
+let loc_start loc = (loc.Ast.line, loc.column)
+let loc_end loc = (loc.Ast.end_line, loc.end_column)
+
+let loc_contains_position loc ~line ~col =
+  position_compare (loc_start loc) (line, col) <= 0
+  && position_compare (line, col) (loc_end loc) <= 0
+
+let position_before_loc ~line ~col loc =
+  position_compare (line, col) (loc_start loc) < 0
+
+let position_after_loc ~line ~col loc =
+  position_compare (loc_end loc) (line, col) < 0
+
+let active_param_from_arg_spans args ~line ~col ~implicit_receiver =
+  let rec loop index = function
+    | [] -> max 0 (index - 1 + implicit_receiver)
+    | arg :: rest ->
+        if position_before_loc ~line ~col arg.Ast.expr_loc then
+          index + implicit_receiver
+        else if
+          loc_contains_position arg.expr_loc ~line ~col
+          || not (position_after_loc ~line ~col arg.expr_loc)
+        then index + implicit_receiver
+        else loop (index + 1) rest
+  in
+  loop 0 args
+
+let module_qualified_name module_aliases qualifier member =
+  match List.assoc_opt qualifier module_aliases with
+  | Some _ -> Some (qualifier ^ "." ^ member, 0)
+  | None -> None
+
+let std_prefixed_path path =
+  if
+    String.starts_with ~prefix:"std/" path
+    || String.starts_with ~prefix:"pkg/" path
+    || String.starts_with ~prefix:"./" path
+    || String.starts_with ~prefix:"../" path
+  then path
+  else "std/" ^ path
+
+let module_paths_match left right =
+  left = right
+  || std_prefixed_path left = right
+  || left = std_prefixed_path right
+
+let module_alias_for_path module_aliases module_path =
+  List.find_map
+    (fun (alias, path) ->
+      if module_paths_match path module_path then Some alias else None)
+    module_aliases
+
+let resolved_call_signature_name module_aliases callee
+    (call : Ast.resolved_call) =
+  let implicit_receiver =
+    match (call.call_syntax, callee.Ast.expr_desc) with
+    | (CallMethod | CallMethodOnlyUfcs), EFieldAccess _ -> 1
+    | (CallMethod | CallMethodOnlyUfcs), _ -> 0
+    | (CallBare | CallQualified _ | CallClosureSyntax | CallTraitDispatch), _ ->
+        0
+  in
+  match (call.call_syntax, callee.Ast.expr_desc, call.call_target) with
+  | ( CallQualified _,
+      EFieldAccess ({ expr_desc = EIdent qualifier; _ }, member),
+      CallDirect _ ) ->
+      Some (qualifier ^ "." ^ member, 0)
+  | CallQualified module_path, _, CallDirect { source_name; _ } -> (
+      match module_alias_for_path module_aliases module_path with
+      | Some qualifier -> Some (qualifier ^ "." ^ source_name, 0)
+      | None -> Some (source_name, 0))
+  | _, _, CallDirect { source_name; _ } -> Some (source_name, implicit_receiver)
+  | _, _, CallTraitMethod { method_name; _ } ->
+      Some (method_name, implicit_receiver)
+  | _, _, CallClosure _ -> None
+
+let callee_signature_name module_aliases callee =
+  match callee.Ast.expr_desc with
+  | EIdent name -> Some (name, 0)
+  | EFieldAccess ({ expr_desc = EIdent qualifier; _ }, member) ->
+      module_qualified_name module_aliases qualifier member
+  | _ -> None
+
+let call_signature_name module_aliases call_expr callee =
+  match Ast.expr_resolved_call call_expr with
+  | Some resolved -> resolved_call_signature_name module_aliases callee resolved
+  | None -> callee_signature_name module_aliases callee
+
+let rec find_enclosing_call_expr module_aliases (expr : Ast.expr) ~line ~col =
+  match expr.Ast.expr_desc with
+  | ECall (callee, args) when loc_contains_position expr.expr_loc ~line ~col
+    -> (
+      match find_enclosing_call_in_children module_aliases expr ~line ~col with
+      | Some _ as found -> found
+      | None -> (
+          match call_signature_name module_aliases expr callee with
+          | Some (name, implicit_receiver) ->
+              Some
+                ( name,
+                  active_param_from_arg_spans args ~line ~col ~implicit_receiver
+                )
+          | None -> None))
+  | _ -> find_enclosing_call_in_children module_aliases expr ~line ~col
+
+and find_enclosing_call_in_children module_aliases expr ~line ~col =
+  expr |> Ast.expr_children
+  |> List.find_map (fun child ->
+      find_enclosing_call_expr module_aliases child ~line ~col)
+
+let find_enclosing_call_parsed (program : Ast.program) module_aliases
+    (position : Lsp_protocol.position) =
+  let line = position.line + 1 in
+  let col = position.character + 1 in
+  program
+  |> List.find_map (fun (decl : Ast.decl) ->
+      match decl.decl_desc with
+      | DFunc func -> (
+          match Ast.func_body_expr_opt func.Ast.func_body with
+          | Some body -> find_enclosing_call_expr module_aliases body ~line ~col
+          | None -> None)
+      | DVar var ->
+          find_enclosing_call_expr module_aliases var.Ast.var_value ~line ~col
+      | DPrivate inner -> (
+          match inner.decl_desc with
+          | DFunc func -> (
+              match Ast.func_body_expr_opt func.Ast.func_body with
+              | Some body ->
+                  find_enclosing_call_expr module_aliases body ~line ~col
+              | None -> None)
+          | DVar var ->
+              find_enclosing_call_expr module_aliases var.Ast.var_value ~line
+                ~col
+          | _ -> None)
+      | DImpl impl ->
+          impl.Ast.impl_methods
+          |> List.find_map (fun func ->
+              match Ast.func_body_expr_opt func.Ast.func_body with
+              | Some body ->
+                  find_enclosing_call_expr module_aliases body ~line ~col
+              | None -> None)
+      | _ -> None)
+
+let find_enclosing_call doc position =
+  match doc.Lsp_state.program with
+  | Some program -> (
+      match find_enclosing_call_parsed program doc.module_aliases position with
+      | Some _ as found -> found
+      | None ->
+          let lines = String.split_on_char '\n' doc.text in
+          find_enclosing_call_text_fallback lines position.line
+            position.character)
+  | None ->
+      let lines = String.split_on_char '\n' doc.text in
+      find_enclosing_call_text_fallback lines position.line position.character
+
 (* ============================================================================
    Signature building
    ============================================================================ *)
@@ -159,7 +318,11 @@ let try_qualified_signature (module_aliases : (string * string) list)
   match List.assoc_opt qualifier module_aliases with
   | None -> None
   | Some path -> (
-      match Modules.find_cached path with
+      match
+        match Modules.find_cached path with
+        | Some _ as found -> found
+        | None -> Modules.find_cached (std_prefixed_path path)
+      with
       | None -> None
       | Some m -> (
           match List.assoc_opt member m.exports with
@@ -241,8 +404,7 @@ let handle_signature_help (state : Lsp_state.state) (params : json) : json =
       | Some doc, Some pos -> (
           match doc.env with
           | Some env -> (
-              let lines = String.split_on_char '\n' doc.text in
-              match find_enclosing_call lines pos.line pos.character with
+              match find_enclosing_call doc pos with
               | Some (name, active_param) ->
                   build_signature ?typed_program:doc.typed_program
                     ~file:(Lsp_protocol.uri_to_path uri)

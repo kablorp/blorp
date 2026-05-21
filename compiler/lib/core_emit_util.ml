@@ -251,7 +251,7 @@ let collect_free_vars (e : core) : (string * Ast.type_expr) list =
             if StringSet.mem n bound then acc else StringMap.add n ty acc)
           StringMap.empty cc.cc_captures
     | CCall (kind, callee, args) -> (
-        (* For resolved calls (anything other than CKUnknown/CKClosure), the
+        (* For direct calls (anything other than CKUnknown/CKClosure), the
            callee is emitted by kind, not by walking [callee]. Skip the callee
            so its CVar doesn't appear as a captured free variable. *)
         let args_frees =
@@ -264,7 +264,9 @@ let collect_free_vars (e : core) : (string * Ast.type_expr) list =
         | CKUnknown | CKClosure ->
             let c = go bound callee in
             StringMap.union (fun _ a _ -> Some a) c args_frees
-        | CKUser _ | CKForeign _ | CKBuiltin _ | CKIntrinsic _ -> args_frees)
+        | CKSelectedDirect _ | CKUser _ | CKForeign _ | CKBuiltin _
+        | CKIntrinsic _ ->
+            args_frees)
     | CFor (binder, iter, body) ->
         let i = go bound iter in
         let b = go (StringSet.add binder.loop_var.vname bound) body in

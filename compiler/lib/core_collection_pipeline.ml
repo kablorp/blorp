@@ -315,7 +315,9 @@ and expr_has_runtime_free_var bound e =
       let callee_has_free =
         match kind with
         | CKUnknown | CKClosure -> expr_has_runtime_free_var bound callee
-        | CKUser _ | CKForeign _ | CKBuiltin _ | CKIntrinsic _ -> false
+        | CKSelectedDirect _ | CKUser _ | CKForeign _ | CKBuiltin _
+        | CKIntrinsic _ ->
+            false
       in
       callee_has_free || List.exists (expr_has_runtime_free_var bound) args
   | _ ->

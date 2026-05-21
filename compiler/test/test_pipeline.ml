@@ -243,6 +243,23 @@ let test_user_file_in_std_named_dir_rejects_builtin () =
                 "user file in an arbitrary std-named directory received stdlib \
                  privileges"))
 
+let test_path_under_dir_rejects_std_prefix_sibling () =
+  with_temp_dir "blorp_path_boundary" (fun dir ->
+      let std_dir = Filename.concat dir "std" in
+      let sibling_dir = Filename.concat dir "std_backup" in
+      Unix.mkdir std_dir 0o700;
+      Unix.mkdir sibling_dir 0o700;
+      let std_file = Filename.concat std_dir "main.brp" in
+      let sibling_file = Filename.concat sibling_dir "main.brp" in
+      write_file std_file "";
+      write_file sibling_file "";
+      Alcotest.(check bool)
+        "std file is under std dir" true
+        (Modules.is_path_under_dir ~dir:std_dir std_file);
+      Alcotest.(check bool)
+        "std prefix sibling is not under std dir" false
+        (Modules.is_path_under_dir ~dir:std_dir sibling_file))
+
 let test_configured_std_source_rejects_foreign () =
   Test_helpers.with_isolated_env (fun () ->
       Modules.init_module_paths (Sys.getcwd ());
@@ -987,6 +1004,8 @@ let suite =
           test_std_prelude_reexport_source_skips_unused_import_error;
         Alcotest.test_case "user file in std-named dir rejects builtin" `Quick
           test_user_file_in_std_named_dir_rejects_builtin;
+        Alcotest.test_case "std path boundary rejects prefix sibling" `Quick
+          test_path_under_dir_rejects_std_prefix_sibling;
         Alcotest.test_case "configured std source rejects foreign" `Quick
           test_configured_std_source_rejects_foreign;
         Alcotest.test_case "configured std source rejects package import" `Quick

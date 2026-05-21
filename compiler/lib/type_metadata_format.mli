@@ -18,4 +18,7 @@ type hover_type_view = private { primary_type : string; details : string list }
 val hover_type_view :
   ?fallback_ty:Ast.type_expr -> Ast.expr_type_info -> hover_type_view
 
+val hover_type_view_for_expr :
+  ?fallback_ty:Ast.type_expr -> Ast.expr -> hover_type_view option
+
 val fallback_hover_type_view : Ast.type_expr -> hover_type_view

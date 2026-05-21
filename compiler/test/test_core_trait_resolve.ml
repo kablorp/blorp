@@ -25,6 +25,17 @@ let call_unknown name args ret_ty =
   in
   mk (CCall (CKUnknown, cvar name fn_ty, args)) ret_ty
 
+let call_selected_direct selected_id name args ret_ty =
+  let fn_ty =
+    TyFunc
+      {
+        params = List.map (fun arg -> arg.ty) args;
+        return = ret_ty;
+        is_pure = true;
+      }
+  in
+  mk (CCall (CKSelectedDirect selected_id, cvar name fn_ty, args)) ret_ty
+
 let func ?(name = "main") ?(params = []) ?(ret = ty_string) body =
   {
     cf_name = name;
@@ -89,6 +100,31 @@ let single_body = function
   | [ _; _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] -> body
   | _ -> Alcotest.fail "expected trait, impl, and one function"
 
+let test_selected_direct_trait_method_rewrites_to_impl () =
+  let value = cvar "value" ty_widget in
+  let body = call_selected_direct 42 "to_string" [ value ] ty_string in
+  let main =
+    decl
+      (CDFunc
+         (func
+            ~params:
+              [
+                { cp_name = Var.named "value"; cp_ty = ty_widget; cp_loc = loc };
+              ]
+            body))
+  in
+  let resolved =
+    P.resolve_program [ widget_stringable_trait; widget_stringable_impl; main ]
+  in
+  match (single_body resolved).desc with
+  | CCall (CKUnknown, { desc = CVar v; _ }, _) ->
+      Alcotest.(check string)
+        "selected direct trait method resolves to impl"
+        "Stringable_to_string_Widget" v.vname
+  | CCall (CKSelectedDirect _, _, _) ->
+      Alcotest.fail "selected direct trait method was not rewritten"
+  | _ -> Alcotest.fail "expected rewritten trait method call"
+
 let test_resource_scope_binding_shadows_trait_method_body_only () =
   let value = cvar "value" ty_widget in
   let acquired = call_unknown "to_string" [ value ] ty_string in
@@ -141,6 +177,11 @@ let test_resource_scope_binding_shadows_trait_method_body_only () =
 
 let suite =
   [
+    ( "selected_direct",
+      [
+        Alcotest.test_case "trait_method_rewrites_to_impl" `Quick
+          test_selected_direct_trait_method_rewrites_to_impl;
+      ] );
     ( "resource_scope",
       [
         Alcotest.test_case "binding_shadows_trait_method_body_only" `Quick

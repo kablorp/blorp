@@ -86,6 +86,6 @@ let producer_of_builtin_name name =
 
 let of_call_kind = function
   | Core.CKBuiltin name -> producer_of_builtin_name name
-  | Core.CKUnknown | Core.CKUser _ | Core.CKForeign _ | Core.CKIntrinsic _
-  | Core.CKClosure ->
+  | Core.CKUnknown | Core.CKSelectedDirect _ | Core.CKUser _ | Core.CKForeign _
+  | Core.CKIntrinsic _ | Core.CKClosure ->
       None

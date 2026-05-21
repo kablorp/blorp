@@ -1214,4 +1214,6 @@ let contract_for_call_kind (kind : Core.call_kind) ~(arg_count : int) =
   match kind with
   | Core.CKIntrinsic name -> intrinsic_contract name arg_count
   | Core.CKBuiltin name -> builtin_contract name arg_count
-  | Core.CKUnknown | Core.CKUser _ | Core.CKForeign _ | Core.CKClosure -> None
+  | Core.CKUnknown | Core.CKSelectedDirect _ | Core.CKUser _ | Core.CKForeign _
+  | Core.CKClosure ->
+      None

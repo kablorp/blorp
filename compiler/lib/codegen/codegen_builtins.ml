@@ -145,6 +145,9 @@ let matrix_builtins =
   [
     ((N.mod_matrix, "matmul"), "blorp_tensor_matmul");
     ((N.mod_matrix, "transpose"), "blorp_tensor_transpose");
+    ((N.mod_matrix, "matvec"), "blorp_tensor_matvec");
+    ((N.mod_matrix, "matvec_t"), "blorp_tensor_matvec_t");
+    ((N.mod_matrix, "outer"), "blorp_tensor_outer");
     (* 2D bounds-checked accessors. The 1D [(std/tensor, "get")] entry binds to
      the 2-arg [blorp_vector_get_opt]; without these matrix-specific entries a
      [get(m, row, col)] call on a [T[#M, #N]] hits [std/tensor]'s 2-arg
@@ -161,9 +164,10 @@ let matrix_builtins =
     ((N.mod_matrix, "matrix_checked_set"), "blorp_matrix_checked_set");
   ]
 
-(* matvec/outer use special codegen dispatch (gen_tensor_matvec/gen_tensor_outer)
-   and are NOT in the builtin name table — "outer" conflicts with common variable names
-   and both need dimension params the regular call path can't provide. *)
+(* Matrix kernels resolve through the module-aware builtin table to placeholder
+   C names. [Core_specialize] then rewrites those placeholders to the
+   element-typed runtime entry and appends static dimensions. Keep them
+   module-scoped here so names like [outer] never resolve as bare builtins. *)
 
 (* String builtins with matching prelude aliases *)
 let string_prelude_builtins =

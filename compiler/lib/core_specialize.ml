@@ -3092,21 +3092,18 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       let boxed_args, changed = box_void_args_for_builtin ~reg c args in
       if changed then { e with desc = CCall (CKBuiltin c, callee, boxed_args) }
       else e
-  (* [type_name] / [is_heap] from [std/debug]: constant-fold per mono
-     copy. Infer defers the fold when the arg type still has type vars
-     (pure func identify[T](x: T): type_name(x)). Post-mono, [arg.ty]
-     is concrete for each specialized copy, so we replace the call
-     with a [CLit] of the now-known type. Must run before the CKUnknown
-     catch-all below, which would otherwise swallow the call. *)
-  | CCall (_, { desc = CVar v; _ }, [ arg ])
-    when v.vname = "type_name" || v.vname = "std_debug__type_name" ->
+  (* [type_name] / [is_heap] from [std/debug]: constant-fold per mono copy.
+     Infer defers the fold when the arg type still has type vars (pure func
+     identify[T](x: T): type_name(x)). Core_resolve tags those deferred calls
+     as explicit debug-reflection intrinsics, and post-mono [arg.ty] is
+     concrete for each specialized copy. *)
+  | CCall (CKIntrinsic "type_name", _, [ arg ]) ->
       let s = Types.type_to_string arg.ty in
       {
         e with
         desc = CLit (Ast.LitString (s, { sf_triple = false; sf_raw = false }));
       }
-  | CCall (_, { desc = CVar v; _ }, [ arg ])
-    when v.vname = "is_heap" || v.vname = "std_debug__is_heap" ->
+  | CCall (CKIntrinsic "is_heap", _, [ arg ]) ->
       let desc =
         match
           Core_type_layout.classify_debug_heap_value
@@ -3127,70 +3124,44 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
               "%s" msg
       in
       { e with desc }
-  | CCall (CKUnknown, callee, args) -> (
+  | CCall (CKUnknown, callee, args) ->
       let func_name =
         match callee.desc with CVar v -> Some v.vname | _ -> None
       in
-      (* Bitwise ops: rewrite to CKIntrinsic for inline C operators *)
-      let bitwise_result =
-        match (func_name, args) with
-        | Some "bit_and", [ a; b ] -> Some ("bit_and", [ a; b ])
-        | Some "bit_or", [ a; b ] -> Some ("bit_or", [ a; b ])
-        | Some "bit_xor", [ a; b ] -> Some ("bit_xor", [ a; b ])
-        | Some "bit_not", [ a ] -> Some ("bit_not", [ a ])
-        | Some "shift_left", [ a; n ] -> Some ("shift_left", [ a; n ])
-        | Some "shift_right", [ a; n ] -> Some ("shift_right", [ a; n ])
-        | _ -> None
+      let first_is_tensor =
+        match args with first :: _ -> is_tensor_type first.ty | [] -> false
       in
-      match bitwise_result with
-      | Some (name, iargs) ->
-          let dummy =
-            { desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = e.loc }
-          in
-          { e with desc = CCall (CKIntrinsic name, dummy, iargs) }
-      | None ->
-          let first_is_tensor =
-            match args with
-            | first :: _ -> is_tensor_type first.ty
-            | [] -> false
-          in
-          if first_is_tensor then
-            let elem_ty =
-              match args with
-              | first :: _ ->
-                  tensor_elem_type ~loc:e.loc
-                    ~context:
-                      "unknown tensor call specialization requires a tensor \
-                       receiver"
-                    first.ty
-              | [] -> Ast.TyNamed ("Int", [])
+      if first_is_tensor then
+        let elem_ty =
+          match args with
+          | first :: _ ->
+              tensor_elem_type ~loc:e.loc
+                ~context:
+                  "unknown tensor call specialization requires a tensor \
+                   receiver"
+                first.ty
+          | [] -> Ast.TyNamed ("Int", [])
+        in
+        let dummy =
+          { desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = e.loc }
+        in
+        match (func_name, args) with
+        (* sum, product, dot, max, min, mean, argmax, argmin, cumsum — post-mono synthesis *)
+        | Some name, _
+          when Option.is_some (tensor_elementwise_builtin_name name elem_ty) ->
+            let builtin_name =
+              Option.get (tensor_elementwise_builtin_name name elem_ty)
             in
-            let dummy =
-              { desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = e.loc }
+            { e with desc = CCall (CKBuiltin builtin_name, dummy, args) }
+        | Some "scale", _ ->
+            let scale_name =
+              match elem_ty with
+              | Ast.TyNamed ("Float", _) -> "blorp_vector_scale_float"
+              | _ -> "blorp_vector_scale_int"
             in
-            match (func_name, args) with
-            | Some "matvec", [ matrix; vector ] ->
-                specialize_matvec ~reg e matrix vector
-            | Some "matvec_t", [ matrix; vector ] ->
-                specialize_matvec_t ~reg e matrix vector
-            | Some "outer", [ a; b ] -> specialize_outer ~reg e a b
-            (* sum, product, dot, max, min, mean, argmax, argmin, cumsum — post-mono synthesis *)
-            | Some name, _
-              when Option.is_some (tensor_elementwise_builtin_name name elem_ty)
-              ->
-                let builtin_name =
-                  Option.get (tensor_elementwise_builtin_name name elem_ty)
-                in
-                { e with desc = CCall (CKBuiltin builtin_name, dummy, args) }
-            | Some "scale", _ ->
-                let scale_name =
-                  match elem_ty with
-                  | Ast.TyNamed ("Float", _) -> "blorp_vector_scale_float"
-                  | _ -> "blorp_vector_scale_int"
-                in
-                { e with desc = CCall (CKBuiltin scale_name, dummy, args) }
-            | _ -> e
-          else e)
+            { e with desc = CCall (CKBuiltin scale_name, dummy, args) }
+        | _ -> e
+      else e
   | _ -> e
 
 (** Specialize a function body. Generic bodies (those with remaining type

@@ -121,13 +121,10 @@ let resolve_no_format cli_no_format =
     Does NOT format std library files. *)
 let auto_format_user_file filename =
   (* Skip std library files *)
-  let abs = try Unix.realpath filename with _ -> filename in
   let is_std =
-    try
-      let std_dir = Unix.realpath (Filename.concat (Sys.getcwd ()) "std") in
-      String.length abs >= String.length std_dir
-      && String.sub abs 0 (String.length std_dir) = std_dir
-    with _ -> false
+    Modules.is_path_under_dir
+      ~dir:(Filename.concat (Sys.getcwd ()) "std")
+      filename
   in
   if not is_std then Fmt.auto_format filename
 

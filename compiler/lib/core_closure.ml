@@ -193,7 +193,9 @@ let collect_free_vars_filtered (state : state) (body : core)
         let callee_fv =
           match kind with
           | CKUnknown | CKClosure -> go bound callee
-          | _ -> SM.empty
+          | CKSelectedDirect _ | CKUser _ | CKForeign _ | CKBuiltin _
+          | CKIntrinsic _ ->
+              SM.empty
         in
         List.fold_left
           (fun acc a -> SM.union (fun _ a _ -> Some a) acc (go bound a))
@@ -477,7 +479,9 @@ and adapt_function_refs_expr (state : state) (bound : StringSet.t) (e : core) :
       let callee' =
         match kind with
         | CKClosure | CKUnknown -> adapt_value bound callee
-        | CKUser _ | CKForeign _ | CKBuiltin _ | CKIntrinsic _ -> callee
+        | CKSelectedDirect _ | CKUser _ | CKForeign _ | CKBuiltin _
+        | CKIntrinsic _ ->
+            callee
       in
       let args' = List.map (adapt_value bound) args in
       { e with desc = CCall (kind, callee', args') }

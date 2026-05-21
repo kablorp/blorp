@@ -620,6 +620,14 @@ let bitwise_intrinsics =
       "Arithmetic right shift. Int * Int -> Int. Emits: (a >> n)";
   ]
 
+let debug_reflection_intrinsics =
+  [
+    mk ~arity:(Fixed 1) ~is_pure:true ~implemented:false "type_name"
+      "Debug reflection. T -> String. Folded by Core_specialize.";
+    mk ~arity:(Fixed 1) ~is_pure:true ~implemented:false "is_heap"
+      "Debug heap-layout reflection. T -> Bool. Folded by Core_specialize.";
+  ]
+
 let arc_intrinsics =
   [
     mk ~arity:(Fixed 1) ~is_pure:false ~implemented:false "rc_retain"
@@ -638,10 +646,40 @@ let arc_intrinsics =
 let all =
   list_intrinsics @ string_intrinsics @ bytes_intrinsics @ dict_intrinsics
   @ set_intrinsics @ slice_intrinsics @ tensor_intrinsics @ fixed_intrinsics
-  @ math_intrinsics @ bitwise_intrinsics @ arc_intrinsics
+  @ math_intrinsics @ bitwise_intrinsics @ debug_reflection_intrinsics
+  @ arc_intrinsics
 
 (** Check if a name is a registered intrinsic (implemented or planned). *)
 let is_known name = List.exists (fun i -> i.name = name) all
+
+let arity_matches expected actual =
+  match expected with Fixed n -> n = actual | Variadic -> true
+
+let lookup_bitwise_intrinsic ~name ~arity =
+  bitwise_intrinsics
+  |> List.find_opt (fun intrinsic ->
+      intrinsic.name = name && arity_matches intrinsic.arity arity)
+  |> Option.map (fun intrinsic -> intrinsic.name)
+
+let lookup_debug_reflection_intrinsic ~mod_path ~name ~arity =
+  let source_name =
+    match mod_path with
+    | Some "std/debug" -> Some name
+    | Some _ -> None
+    | None -> (
+        match name with
+        | "type_name" | "is_heap" -> Some name
+        | "std_debug__type_name" -> Some "type_name"
+        | "std_debug__is_heap" -> Some "is_heap"
+        | _ -> None)
+  in
+  match source_name with
+  | None -> None
+  | Some source_name ->
+      debug_reflection_intrinsics
+      |> List.find_opt (fun intrinsic ->
+          intrinsic.name = source_name && arity_matches intrinsic.arity arity)
+      |> Option.map (fun intrinsic -> intrinsic.name)
 
 (** Std functions that should resolve directly to leaf IR intrinsics.
 

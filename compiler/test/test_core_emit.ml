@@ -5333,7 +5333,7 @@ let test_emit_invariant_ckunknown_call () =
       loc = invariant_loc;
     }
   in
-  expect_core_error_at ~needle:"CKUnknown" ~line:42 (fun () ->
+  expect_core_error_at ~needle:"unresolved call target" ~line:42 (fun () ->
       emit_to_string node)
 
 let test_emit_invariant_tensor_literal_layout_payload_mismatch () =

@@ -15,10 +15,17 @@
     to the most precise call kind it can prove:
 
     - Foreign functions become [CKForeign { fc_c_name; fc_arg_passing }].
+    - Direct calls carrying typed selected-call ids become
+      [CKUser (name, def_id)] once the canonical post-flatten Core name is
+      known.
     - User functions, constructors, impl methods, and imported source
       functions become [CKUser (name, def_id)] when a def-id is known.
     - Runtime-backed builtins become [CKBuiltin c_name] through the
       centralized [Codegen_builtins] registry.
+    - Compiler-owned bitwise operators become [CKIntrinsic name] through the
+      intrinsic registry.
+    - Debug reflection helpers become [CKIntrinsic name] through the intrinsic
+      registry and are folded by [Core_specialize].
     - First-class function calls become [CKClosure].
     - Type-dispatched stdlib operations that a later pass specializes
       stay [CKUnknown].
@@ -404,9 +411,25 @@ let try_resolve_ir_backed_std_function (mod_path : string) (field : string)
 
 let try_resolve_module_func_call (env : env) mod_path func_name
     (args : core list) : call_kind option =
-  match try_resolve_ir_backed_std_function mod_path func_name args with
-  | Some kind -> Some kind
-  | None -> try_resolve_module_func env mod_path func_name
+  match
+    Core_intrinsic_registry.lookup_debug_reflection_intrinsic
+      ~mod_path:(Some mod_path) ~name:func_name ~arity:(List.length args)
+  with
+  | Some intrinsic -> Some (CKIntrinsic intrinsic)
+  | None -> (
+      match try_resolve_ir_backed_std_function mod_path func_name args with
+      | Some kind -> Some kind
+      | None -> try_resolve_module_func env mod_path func_name)
+
+let try_resolve_debug_reflection_intrinsic name args =
+  Core_intrinsic_registry.lookup_debug_reflection_intrinsic ~mod_path:None ~name
+    ~arity:(List.length args)
+  |> Option.map (fun intrinsic -> CKIntrinsic intrinsic)
+
+let try_resolve_bitwise_intrinsic name args =
+  Core_intrinsic_registry.lookup_bitwise_intrinsic ~name
+    ~arity:(List.length args)
+  |> Option.map (fun intrinsic -> CKIntrinsic intrinsic)
 
 (** Try to resolve a qualified module call [M.func(args)] where [M] is a
     module alias. Returns [None] if [M] is not an alias for a known module. *)
@@ -673,20 +696,26 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
                                                    Hashtbl.mem mod_aliases name
                                                | None -> false
                                           in
-                                          let is_bitwise_op =
-                                            match name with
-                                            | "bit_and" | "bit_or" | "bit_xor"
-                                            | "bit_not" | "shift_left"
-                                            | "shift_right" ->
-                                                true
-                                            | _ -> false
+                                          let debug_reflection =
+                                            if is_imported then None
+                                            else
+                                              try_resolve_debug_reflection_intrinsic
+                                                name args
                                           in
-                                          if is_imported || is_bitwise_op then
-                                            CKUnknown
-                                          else
-                                            match callee.ty with
-                                            | Ast.TyFunc _ -> CKClosure
-                                            | _ -> CKUnknown)))))))))
+                                          match debug_reflection with
+                                          | Some kind -> kind
+                                          | None -> (
+                                              match
+                                                try_resolve_bitwise_intrinsic
+                                                  name args
+                                              with
+                                              | Some kind -> kind
+                                              | None -> (
+                                                  if is_imported then CKUnknown
+                                                  else
+                                                    match callee.ty with
+                                                    | Ast.TyFunc _ -> CKClosure
+                                                    | _ -> CKUnknown)))))))))))
   | _ -> ( match callee.ty with Ast.TyFunc _ -> CKClosure | _ -> CKUnknown)
 
 (** Rewrite a bare [CVar] that refers to a globally-imported value (e.g.
@@ -793,6 +822,15 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
     go bound tree
   in
   match e.desc with
+  | CCall (CKSelectedDirect selected_id, callee, args) ->
+      let callee' = resolve_same callee in
+      let args' = List.map resolve_same args in
+      let kind =
+        match user_call_kind_by_def_id env (Some selected_id) with
+        | Some kind -> kind
+        | None -> resolve_call_kind ~module_path ~bound env callee' args'
+      in
+      { e with desc = CCall (kind, callee', args') }
   | CCall (CKUnknown, callee, args) ->
       let callee' = resolve_same callee in
       let args' = List.map resolve_same args in

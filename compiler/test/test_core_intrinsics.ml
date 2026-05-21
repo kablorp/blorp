@@ -927,6 +927,24 @@ let test_tensor_c_wrappers_synthesize_from_specs () =
       expect_builtin_synthesis ~arg_count ~module_path:"std/tensor" func_name
         params return_ty c_name)
 
+let test_tensor_length_synthesizes_from_specs () =
+  let vector_int = ty_vector ty_int 4 in
+  [ ("std/tensor", "length"); ("std/vector", "length") ]
+  |> List.iter (fun (module_path, func_name) ->
+      match
+        Blorp.Core_intrinsics.synthesize_body ~func_name ~module_path
+          ~params:[ param "items" vector_int ]
+          ~return_ty:ty_int
+      with
+      | Some body ->
+          Alcotest.(check int)
+            (module_path ^ "." ^ func_name ^ " emits tensor_len")
+            1
+            (count_intrinsic "tensor_len" body)
+      | None ->
+          Alcotest.failf "%s.%s should synthesize through its spec" module_path
+            func_name)
+
 let test_matrix_c_wrappers_synthesize_from_specs () =
   let left_matrix = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
   let right_matrix = TyArray (ty_int, [ TyConstInt 3; TyConstInt 4 ]) in
@@ -3599,6 +3617,8 @@ let suite =
           test_fixed_c_wrappers_synthesize_from_specs;
         Alcotest.test_case "tensor_c_wrappers_synthesize_from_specs" `Quick
           test_tensor_c_wrappers_synthesize_from_specs;
+        Alcotest.test_case "tensor_length_synthesizes_from_specs" `Quick
+          test_tensor_length_synthesizes_from_specs;
         Alcotest.test_case "matrix_c_wrappers_synthesize_from_specs" `Quick
           test_matrix_c_wrappers_synthesize_from_specs;
         Alcotest.test_case "stream_wrappers_synthesize_from_specs" `Quick

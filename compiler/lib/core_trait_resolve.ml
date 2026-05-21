@@ -549,7 +549,7 @@ let rec resolve_expr (reg : registry) (module_path : string option)
                 { e with desc = CCall (CKUnknown, callee', [ arg ]) }
           | None -> e)
       | None -> e)
-  | CCall (CKUnknown, callee, args) -> (
+  | CCall ((CKUnknown | CKSelectedDirect _), callee, args) -> (
       match callee.desc with
       | CVar v -> (
           if StringSet.mem v.vname shadowed_locals then e

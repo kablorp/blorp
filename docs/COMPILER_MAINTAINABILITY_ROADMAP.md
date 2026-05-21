@@ -150,11 +150,14 @@ Progress:
 - `Core_resolve` now maintains a def-id-to-canonical-name index and prefers
   carried callable ids for selected bare and qualified user calls, while
   treating duplicate Core def-ids as ambiguous instead of order-dependent.
+- Selected direct call identity now has an explicit transitional Core call kind
+  instead of being smuggled through the qualified module-alias `CVar`.
+  Monomorphization can still specialize selected generic calls before
+  resolution, and `Core_resolve` replaces the selected id with the canonical
+  `CKUser` target before later stages.
 
 Remaining:
 
-- Replace the temporary `CField` module-alias `vdef_id` bridge with a richer
-  Core call target once all selected call shapes have typed metadata coverage.
 - Audit parsed-export fallback coverage for qualified functions before making
   Core handoff invariants strict.
 - Delete UFCS string parsing and first-arg UFCS recovery only after the typed
@@ -338,6 +341,9 @@ Progress:
 - Moved tensor constructor/access C wrappers and matrix kernel C wrappers to
   spec-owned synthesis, leaving tensor `length` and vector reductions in the
   hand-built IR path.
+- Moved tensor/vector `length` to spec-owned synthesis as an explicit
+  `TensorLength` action, removing the remaining name-only legacy arm for tensor
+  length while keeping vector reductions in the hand-built IR path.
 - The covered malformed entries now return `None` instead of raising
   `Failure("nth")` or silently accepting ignored extra parameters.
 
@@ -380,6 +386,24 @@ Plan:
   instead of testing `func_name` under `CKUnknown`.
 - Add an invariant that any remaining `CKUnknown` at the specialize boundary is
   one of a deliberately documented set.
+
+Progress:
+
+- Bitwise operators now resolve to `CKIntrinsic` in `Core_resolve` through the
+  intrinsic registry, instead of reaching `Core_specialize` as `CKUnknown`
+  name matches.
+- Added regressions proving bitwise calls resolve to intrinsics while a
+  user-defined `bit_and` still wins by normal user-function resolution.
+- Debug reflection helpers (`type_name` and `is_heap`) now resolve to explicit
+  `CKIntrinsic` calls before specialization. `Core_specialize` folds only those
+  tagged calls, not arbitrary callees with matching source names.
+- Added resolver coverage for bare, imported, module-qualified, and prefixed
+  debug reflection calls, plus specialization coverage proving unresolved
+  reflection-shaped names no longer fold by name.
+- Matrix tensor kernels (`matvec`, `matvec_t`, `outer`) now resolve through the
+  module-aware builtin table to typed placeholder C builtins. `Core_specialize`
+  still appends dimensions and selects the element-specific runtime entry, but
+  no longer recognizes those operations from `CKUnknown` source names.
 
 Acceptance:
 
@@ -435,6 +459,21 @@ Plan:
 - Delete legacy `count_uses` fallback paths once all branch forms consume the
   structured summary.
 
+Progress:
+
+- Removed the alias-return branch fallback from Perceus `CIf`, `CMatchArms`,
+  and compiled `CMatch` balancing. Branches that return aliases now use the
+  existing `ownership_uses.returns_alias` summary directly, so borrowed reads
+  in the same branch no longer inflate refcounts through `count_uses`.
+- Added unit coverage for alias-returning `if`, raw match-arm, and compiled
+  decision-tree branches that borrow the owner before returning a field alias.
+- Freshened pattern bindings that shadow the owner being balanced, including
+  existing RC operators on the shadowed binding, so branch-local drops target
+  the outer owner instead of the match payload.
+- Added nested match/if and pattern-shadowing coverage, including runtime
+  leak/sanitize regressions for shadowed match payloads and nested mixed
+  branches.
+
 Acceptance:
 
 - Branch balancing does not treat every occurrence as consuming unless a named
@@ -463,6 +502,16 @@ Plan:
 - Keep a test inventory that fails when new production callers read legacy
   typed payloads directly.
 
+Progress:
+
+- Removed the remaining production caller of `Ast.expr_type_info_from_type`.
+  Inference now builds structured expression metadata through its value-slot
+  helper, and the source hygiene inventory only allows the compatibility helper
+  at its `Ast` definition boundary.
+- Moved LSP hover expression metadata access behind
+  `Type_metadata_format.hover_type_view_for_expr` and added a hygiene guard so
+  hover does not read the transitional AST typed payload directly.
+
 Acceptance:
 
 - Core lowering cannot receive an expression without structured type metadata.
@@ -490,6 +539,17 @@ Plan:
 - Add LSP tests for nested calls, method syntax, multiline calls, and string
   literals containing punctuation.
 
+Progress:
+
+- Signature help now uses parsed `ECall` spans before falling back to the
+  text scanner, and resolved call metadata supplies the source function name for
+  method syntax while preserving module-qualified lookup names.
+- Added regressions for long multiline calls that exceed the old text fallback
+  window, method syntax active-parameter mapping, module-qualified calls,
+  nested calls, and punctuation inside string arguments.
+- Added a separate regression for the best-effort text fallback on incomplete
+  documents that do not have a parsed AST.
+
 Acceptance:
 
 - Parsed documents use AST span lookup first.
@@ -508,6 +568,12 @@ Plan:
   strict path classification.
 - Add a small unit or CLI test where a user directory has a `std` prefix but is
   not the configured std directory.
+
+Progress:
+
+- Replaced the CLI auto-format std skip's raw prefix check with
+  `Modules.is_path_under_dir`, exposed the strict helper at the module
+  boundary, and added a regression for `std/` versus `std_backup/` paths.
 
 Acceptance:
 

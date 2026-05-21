@@ -37,6 +37,10 @@ val is_std_source_file : ?sess:Session.t -> string -> bool
     embedded std pseudo-path. This is deliberately stricter than substring
     checks: arbitrary user directories named [std] do not become stdlib. *)
 
+val is_path_under_dir : dir:string -> string -> bool
+(** True iff [path] is [dir] or a descendant of [dir], using canonical
+    filesystem paths and directory boundaries rather than string prefixes. *)
+
 val module_origin_for_source_file :
   ?sess:Session.t -> string -> Session.module_origin
 (** Classify a source file for compiler policy when only a path is available.

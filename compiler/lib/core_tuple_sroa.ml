@@ -504,7 +504,9 @@ let build_tuple_return_summaries ~reg prog =
 let tuple_return_summary_for_call summaries = function
   | CKUser (_, Some def_id) -> Hashtbl.find_opt summaries.by_def_id def_id
   | CKUser (_, None) -> None
-  | CKUnknown | CKForeign _ | CKBuiltin _ | CKIntrinsic _ | CKClosure -> None
+  | CKUnknown | CKSelectedDirect _ | CKForeign _ | CKBuiltin _ | CKIntrinsic _
+  | CKClosure ->
+      None
 
 let rec tuple_return_expr_to_core param_vars local_vars = function
   | ReturnParam { param_index; ty; loc } ->

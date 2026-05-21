@@ -6,14 +6,7 @@
 open Ast
 
 let type_to_string = Types.type_to_string
-
-let expr_type_view ?fallback_ty (e : expr) =
-  match e.expr_type_info with
-  | Some info -> Some (Type_metadata_format.hover_type_view ?fallback_ty info)
-  | None -> (
-      match fallback_ty with
-      | Some ty -> Some (Type_metadata_format.fallback_hover_type_view ty)
-      | None -> None)
+let expr_type_view = Type_metadata_format.hover_type_view_for_expr
 
 let hover_code ?(details = []) line =
   let block = Printf.sprintf "```blorp\n%s\n```" line in

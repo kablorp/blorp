@@ -1365,6 +1365,95 @@ let test_if_borrowed_vs_cow_consuming () =
       Alcotest.failf "expected CLet(_, CIf(...)), got:\n%s"
         (pp_to_string_indented transformed)
 
+let pair_back_field () =
+  mk (CField (cvar "pair" ty_pair_lists, "1")) ty_list_int
+
+let pair_back_read_then_alias () =
+  mk
+    (CSeq
+       (intrinsic "list_len" [ pair_back_field () ] ty_int, pair_back_field ()))
+    ty_list_int
+
+let assert_no_legacy_pair_branch_balance label transformed =
+  Alcotest.(check int)
+    (label ^ " pair dup count")
+    0
+    (count_dups_for "pair" transformed);
+  Alcotest.(check int)
+    (label ^ " pair drop count")
+    0
+    (count_drops_for "pair" transformed)
+
+let retained_shadow_value () =
+  mk (CDup (Var.named "value", ty_string, cvar "value" ty_string)) ty_string
+
+let shadow_value_tree () =
+  let shadow_leaf =
+    CTLeaf
+      {
+        ct_bindings =
+          [ (Var.named "value", AccVariantField (AccRoot, "ShadowString", 0)) ];
+        ct_body = retained_shadow_value ();
+      }
+  in
+  let outer_leaf =
+    CTLeaf { ct_bindings = []; ct_body = cvar "value" ty_string }
+  in
+  CTSwitchTag
+    {
+      cts_scrut = AccRoot;
+      cts_cases =
+        [ ("ShadowString", shadow_leaf); ("UseOuterString", outer_leaf) ];
+      cts_default = None;
+    }
+
+let assert_shadowed_value_branch_balanced label transformed =
+  Alcotest.(check int)
+    (label ^ " outer value dup count")
+    0
+    (count_dups_for "value" transformed);
+  Alcotest.(check int)
+    (label ^ " outer value drop count")
+    1
+    (count_drops_for "value" transformed)
+
+let test_if_alias_return_uses_structured_branch_summary () =
+  (* Returning a field alias keeps the owner live through the result. A branch
+     that only borrows the owner before returning that alias must stay on the
+     structured ownership-summary path; the old count-based fallback treated
+     the borrow and alias result as two consuming uses, adding an unnecessary
+     dup and a branch-local drop. *)
+  let bind = bind_named "pair" ty_pair_lists (mk (CTuple []) ty_pair_lists) in
+  let body =
+    mk
+      (CIf (cvar "c" ty_bool, pair_back_read_then_alias (), pair_back_field ()))
+      ty_list_int
+  in
+  let transformed =
+    insert_drops_expr_for_test (mk (CLet (bind, body)) ty_list_int)
+  in
+  assert_no_legacy_pair_branch_balance "if alias return" transformed
+
+let test_nested_branch_alias_return_uses_structured_branch_summary () =
+  let bind = bind_named "pair" ty_pair_lists (mk (CTuple []) ty_pair_lists) in
+  let inner =
+    mk
+      (CMatchArms
+         ( cvar "tag" ty_int,
+           [
+             (PatConstructor ("A", []), pair_back_read_then_alias ());
+             (PatConstructor ("B", []), pair_back_field ());
+           ] ))
+      ty_list_int
+  in
+  let body =
+    mk (CIf (cvar "c" ty_bool, inner, pair_back_read_then_alias ())) ty_list_int
+  in
+  let transformed =
+    insert_drops_expr_for_test (mk (CLet (bind, body)) ty_list_int)
+  in
+  assert_no_legacy_pair_branch_balance "nested branch alias return" transformed
+
 (** Phase 2.4: [let s in match x { A -> 0 | B -> 0 }] — all arms unused.
     Drop inserted before the whole match. *)
 let test_match_all_arms_unused () =
@@ -1415,6 +1504,20 @@ let test_match_asymmetric () =
   | _ ->
       Alcotest.failf "expected CLet(_, CMatchArms):\n%s"
         (pp_to_string_indented transformed)
+
+let test_match_alias_return_uses_structured_branch_summary () =
+  let bind = bind_named "pair" ty_pair_lists (mk (CTuple []) ty_pair_lists) in
+  let arms =
+    [
+      (PatConstructor ("A", []), pair_back_read_then_alias ());
+      (PatConstructor ("B", []), pair_back_field ());
+    ]
+  in
+  let body = mk (CMatchArms (cvar "tag" ty_int, arms)) ty_list_int in
+  let transformed =
+    insert_drops_expr_for_test (mk (CLet (bind, body)) ty_list_int)
+  in
+  assert_no_legacy_pair_branch_balance "match alias return" transformed
 
 (** Phase 2.4: [let s in match x { A -> f(s) | B -> f(s) }] — both arms
     use exactly once. No dup, no excess drop. *)
@@ -1621,6 +1724,57 @@ let test_match_tree_borrowed_leaf_unused_leaf () =
   | _ ->
       Alcotest.failf "expected CLet(_, CMatch(...)), got:\n%s"
         (pp_to_string_indented transformed)
+
+let test_match_tree_alias_return_uses_structured_branch_summary () =
+  let bind = bind_named "pair" ty_pair_lists (mk (CTuple []) ty_pair_lists) in
+  let leaf_a =
+    CTLeaf { ct_bindings = []; ct_body = pair_back_read_then_alias () }
+  in
+  let leaf_b = CTLeaf { ct_bindings = []; ct_body = pair_back_field () } in
+  let tree =
+    CTSwitchTag
+      {
+        cts_scrut = AccRoot;
+        cts_cases = [ ("A", leaf_a); ("B", leaf_b) ];
+        cts_default = None;
+      }
+  in
+  let body = mk (CMatch (cvar "tag" ty_int, tree)) ty_list_int in
+  let transformed =
+    insert_drops_expr_for_test (mk (CLet (bind, body)) ty_list_int)
+  in
+  assert_no_legacy_pair_branch_balance "match tree alias return" transformed
+
+let test_match_tree_shadowed_alias_leaf_freshens_rc_targets () =
+  let bind = bind_named "value" ty_string (cstr "outer") in
+  let body =
+    mk
+      (CMatch
+         ( cvar "choice" (TyNamed ("ShadowStringChoice", [])),
+           shadow_value_tree () ))
+      ty_string
+  in
+  let transformed =
+    insert_drops_expr_for_test (mk (CLet (bind, body)) ty_string)
+  in
+  assert_shadowed_value_branch_balanced "shadowed match leaf" transformed
+
+let test_nested_match_shadowed_alias_leaf_balances_inner_branch () =
+  let bind = bind_named "value" ty_string (cstr "outer") in
+  let inner =
+    mk
+      (CMatch
+         ( cvar "choice" (TyNamed ("ShadowStringChoice", [])),
+           shadow_value_tree () ))
+      ty_string
+  in
+  let body =
+    mk (CIf (cvar "c" ty_bool, inner, cvar "value" ty_string)) ty_string
+  in
+  let transformed =
+    insert_drops_expr_for_test (mk (CLet (bind, body)) ty_string)
+  in
+  assert_shadowed_value_branch_balanced "nested shadowed match leaf" transformed
 
 (** Same aliasing-scrutinee regression after pattern matching has been compiled
     to a decision tree. This is the form that reaches Perceus for real
@@ -4471,9 +4625,15 @@ let suite =
           test_if_borrowed_then_unused_else;
         Alcotest.test_case "if_borrowed_cow" `Quick
           test_if_borrowed_vs_cow_consuming;
+        Alcotest.test_case "if_alias_return_structured_branch" `Quick
+          test_if_alias_return_uses_structured_branch_summary;
+        Alcotest.test_case "nested_branch_alias_return_structured" `Quick
+          test_nested_branch_alias_return_uses_structured_branch_summary;
         Alcotest.test_case "if_asymmetric_multi" `Quick test_if_asymmetric_multi;
         Alcotest.test_case "match_all_unused" `Quick test_match_all_arms_unused;
         Alcotest.test_case "match_asymmetric" `Quick test_match_asymmetric;
+        Alcotest.test_case "match_alias_return_structured_branch" `Quick
+          test_match_alias_return_uses_structured_branch_summary;
         Alcotest.test_case "match_sym_single" `Quick
           test_match_symmetric_single_use;
         Alcotest.test_case "match_borrowed_unused" `Quick
@@ -4485,6 +4645,12 @@ let suite =
         Alcotest.test_case "tree_asymmetric" `Quick test_match_tree_asymmetric;
         Alcotest.test_case "tree_borrowed_unused" `Quick
           test_match_tree_borrowed_leaf_unused_leaf;
+        Alcotest.test_case "tree_alias_return_structured_branch" `Quick
+          test_match_tree_alias_return_uses_structured_branch_summary;
+        Alcotest.test_case "tree_shadowed_alias_leaf_freshens_rc" `Quick
+          test_match_tree_shadowed_alias_leaf_freshens_rc_targets;
+        Alcotest.test_case "nested_tree_shadowed_alias_leaf_balanced" `Quick
+          test_nested_match_shadowed_alias_leaf_balances_inner_branch;
         Alcotest.test_case "tree_aliasing_scrutinee" `Quick
           test_match_tree_aliasing_scrutinee_post_drops_owner;
         Alcotest.test_case "tree_local_scrutinee_post_drop" `Quick

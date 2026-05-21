@@ -54,6 +54,36 @@ let test_hover_type_view_reports_widening_details () =
     [ "value-slot type: Int"; "widening: mutable binding (#1 -> Int)" ]
     view.details
 
+let test_expr_hover_type_view_uses_metadata_before_fallback () =
+  let expr =
+    Ast.with_expr_type_info
+      (Ast.untyped_expr ~loc:Ast.dummy_loc (ELiteral (LitInt 1L)))
+      source_alias_info
+  in
+  match
+    Type_metadata_format.hover_type_view_for_expr ~fallback_ty:Types.ty_string
+      expr
+  with
+  | Some view ->
+      Alcotest.(check string) "metadata primary type" "UserId" view.primary_type;
+      Alcotest.(check (list string))
+        "metadata details" [ "canonical type: Int" ] view.details
+  | None -> Alcotest.fail "expected hover view from expression metadata"
+
+let test_expr_hover_type_view_uses_fallback_without_metadata () =
+  let expr =
+    Ast.untyped_expr ~loc:Ast.dummy_loc
+      (ELiteral (LitString ("value", { sf_triple = false; sf_raw = false })))
+  in
+  match
+    Type_metadata_format.hover_type_view_for_expr ~fallback_ty:Types.ty_string
+      expr
+  with
+  | Some view ->
+      Alcotest.(check string) "fallback primary type" "String" view.primary_type;
+      Alcotest.(check (list string)) "fallback has no details" [] view.details
+  | None -> Alcotest.fail "expected fallback hover view"
+
 let suite =
   [
     ( "format",
@@ -64,5 +94,9 @@ let suite =
           test_hover_type_view_prefers_source_and_reports_canonical;
         Alcotest.test_case "hover widening wording" `Quick
           test_hover_type_view_reports_widening_details;
+        Alcotest.test_case "expr hover metadata before fallback" `Quick
+          test_expr_hover_type_view_uses_metadata_before_fallback;
+        Alcotest.test_case "expr hover fallback" `Quick
+          test_expr_hover_type_view_uses_fallback_without_metadata;
       ] );
   ]

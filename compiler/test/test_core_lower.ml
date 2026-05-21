@@ -1812,8 +1812,8 @@ let test_core_lower_ufcs_no_suffix () =
         | _ -> Alcotest.fail "expected CVar"))
 
 (** Phase 6 bridge: a typed call's [resolved_call] metadata is the source-level
-    authority for callable identity. Lowering should carry that identity into
-    the Core callee even when the callee name itself has no UFCS suffix. *)
+    authority for callable identity. Lowering should carry that identity on the
+    Core call kind even when the callee name itself has no UFCS suffix. *)
 let test_core_lower_call_uses_resolved_call_def_id () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -1843,16 +1843,16 @@ let test_core_lower_call_uses_resolved_call_def_id () =
         in
         let core = lower_expr call in
         match core.desc with
-        | CCall (CKUnknown, { desc = CVar v; _ }, _) ->
+        | CCall (CKSelectedDirect 321, { desc = CVar v; _ }, _) ->
             Alcotest.(check string) "callee name" "inc" v.vname;
             Alcotest.(check (option int))
-              "vdef_id from resolved_call" (Some 321) v.vdef_id
+              "callee vdef_id remains local to callee identity" None v.vdef_id
         | _ -> Alcotest.fail "expected CCall with CVar callee"))
 
 (** Phase 6 bridge: qualified calls must keep the module-field shape for
     monomorphization and intrinsic dispatch, but still carry the selected
-    callable id for later Core resolution. *)
-let test_core_lower_qualified_call_marks_module_alias_with_def_id () =
+    callable id for later Core resolution without mutating the module alias. *)
+let test_core_lower_qualified_call_carries_selected_call_kind () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
         let module_ty = TyNamed ("Module", []) in
@@ -1888,11 +1888,11 @@ let test_core_lower_qualified_call_marks_module_alias_with_def_id () =
         let core = lower_expr call in
         match core.desc with
         | CCall
-            ( CKUnknown,
+            ( CKSelectedDirect 654,
               {
                 desc =
                   CField
-                    ( { desc = CVar { vname = "L"; vdef_id = Some 654; _ }; _ },
+                    ( { desc = CVar { vname = "L"; vdef_id = None; _ }; _ },
                       "reverse" );
                 _;
               },
@@ -1900,8 +1900,8 @@ let test_core_lower_qualified_call_marks_module_alias_with_def_id () =
             ()
         | _ ->
             Alcotest.fail
-              "expected qualified call to preserve CField and carry vdef_id on \
-               module alias"))
+              "expected qualified call to preserve CField and carry selected \
+               callable id on call kind"))
 
 (** A3.3: non-UFCS idents lower to CVar with vdef_id = None. *)
 let test_core_lower_non_ufcs_ident_has_no_def_id () =
@@ -2237,8 +2237,8 @@ let suite =
           test_core_lower_ufcs_no_suffix;
         Alcotest.test_case "core_lower call uses resolved_call def_id" `Quick
           test_core_lower_call_uses_resolved_call_def_id;
-        Alcotest.test_case "core_lower qualified call carries def_id" `Quick
-          test_core_lower_qualified_call_marks_module_alias_with_def_id;
+        Alcotest.test_case "core_lower qualified call carries selected kind"
+          `Quick test_core_lower_qualified_call_carries_selected_call_kind;
         Alcotest.test_case "non-ufcs ident has no vdef_id" `Quick
           test_core_lower_non_ufcs_ident_has_no_def_id;
       ] );

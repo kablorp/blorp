@@ -143,7 +143,7 @@ let cleanup_release_fn_for_call_kind = function
       Some (escape_c_ident (user_call_c_name name def_id))
   | CKForeign { fc_c_name; _ } -> Some fc_c_name
   | CKBuiltin c_name -> Some c_name
-  | CKIntrinsic _ | CKClosure | CKUnknown -> None
+  | CKIntrinsic _ | CKClosure | CKUnknown | CKSelectedDirect _ -> None
 
 let resource_cleanup_var_and_release_fn (cleanup : core) : (var * string) option
     =
@@ -621,7 +621,7 @@ let rec match_scrutinee_needs_release (ctx : Core_emit_context.t) (scrut : core)
           false
       | None -> (
           match kind with
-          | CKUnknown -> false
+          | CKUnknown | CKSelectedDirect _ -> false
           | CKUser _ | CKForeign _ | CKBuiltin _ | CKClosure -> true
           | CKIntrinsic _ -> false))
   | _ -> true
@@ -3105,7 +3105,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 else if try_emit_foreign_copy_call () then ()
                 else begin
                   (match kind with
-                  | CKUnknown ->
+                  | CKUnknown | CKSelectedDirect _ ->
                       let callee_name =
                         match callee.desc with
                         | CVar v -> v.vname
@@ -3117,7 +3117,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                           "Core_specialize must rewrite every CKUnknown left \
                            by Core_resolve. Run with --check-invariants to \
                            catch the leak at the specialize/final boundary."
-                        "CCall with CKUnknown reached C emission for `%s`"
+                        "CCall with unresolved call target reached C emission \
+                         for `%s`"
                         callee_name
                   | CKUser (resolved_name, def_id) ->
                       emit ctx

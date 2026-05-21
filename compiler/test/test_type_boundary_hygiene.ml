@@ -315,6 +315,8 @@ let test_expr_type_compatibility_surface_is_inventoried () =
 
 let test_expr_type_compatibility_helpers_are_inventoried () =
   assert_token_only_in ~allowed_files:[] "Ast.with_expr_type";
+  assert_token_only_in ~allowed_files:[ "compiler/lib/ast.ml" ]
+    "expr_type_info_from_type";
   assert_token_only_in
     ~allowed_files:
       [
@@ -357,6 +359,17 @@ let test_dead_raw_expr_accessors_stay_deleted () =
       if contains_substring ast token then
         Alcotest.failf
           "%s should stay deleted; use typed payload accessors instead." token)
+
+let test_lsp_hover_uses_type_metadata_boundary () =
+  let hover =
+    find_project_file "compiler/lib/lsp/lsp_hover.ml"
+    |> read_file |> strip_comments_and_strings
+  in
+  if contains_token hover ".expr_type_info" then
+    Alcotest.fail
+      "LSP hover should route expression type metadata through \
+       Type_metadata_format.hover_type_view_for_expr instead of reading the \
+       transitional AST payload directly."
 
 let test_explicit_dim_lift_stays_in_named_boundaries () =
   assert_token_only_in
@@ -1067,6 +1080,8 @@ let suite =
           `Quick test_expr_type_compatibility_helpers_are_inventoried;
         Alcotest.test_case "dead raw expr accessors stay deleted" `Quick
           test_dead_raw_expr_accessors_stay_deleted;
+        Alcotest.test_case "LSP hover uses type metadata boundary" `Quick
+          test_lsp_hover_uses_type_metadata_boundary;
         Alcotest.test_case "dim lift stays in named boundaries" `Quick
           test_explicit_dim_lift_stays_in_named_boundaries;
         Alcotest.test_case "late layout fallbacks stay inventoried" `Quick

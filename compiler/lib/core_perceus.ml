@@ -269,7 +269,7 @@ let contract_for_call (env : type_env) (kind : call_kind) ~(arg_count : int)
           Some (borrow_contract_for_signature env ~arg_count ~return_ty)
       | CKClosure ->
           Some (borrow_contract_for_signature env ~arg_count ~return_ty)
-      | CKUnknown | CKBuiltin _ | CKIntrinsic _ -> None)
+      | CKUnknown | CKSelectedDirect _ | CKBuiltin _ | CKIntrinsic _ -> None)
 
 (* ============================================================================
    Use counting
@@ -298,8 +298,9 @@ let rec pattern_binds (name : string) (pat : Ast.pattern) : bool =
     intrinsic / builtin arguments. Linear [CLet] transformation uses
     [summarize_linear_ownership_uses] below for precise borrowed-vs-
     consuming call semantics; branch transforms use that summary directly
-    for supported branch forms and keep this counter only for legacy and
-    alias-returning fallbacks.
+    for supported branch forms and keep this counter only for explicitly
+    conservative paths such as repeated-loop contexts, task-capture
+    detection, and direct [count_uses] unit coverage.
 
     Deliberately hand-rolled (not [fold_tree]): the semantics requires
     taking MAX across [CIf] / [CMatchArms] / [CMatch] branches rather than summing,
@@ -3538,49 +3539,413 @@ let rec normalize_lambda_result_aliases (env : type_env) (e : core) : core =
 let max_required_refs (uses : ownership_uses list) : int =
   List.fold_left (fun acc u -> max acc u.required_refs) 0 uses
 
-let needs_alias_fallback (uses : ownership_uses list) : bool =
-  List.exists (fun u -> u.returns_alias) uses
+(** Match pattern bindings can intentionally shadow an outer owner. Perceus may
+    still need to drop that outer owner inside only the shadowed branch, so the
+    shadow binding must get a fresh Core name before branch-local drops are
+    inserted. *)
+let fresh_shadow_var (v : var) : var =
+  Var.named (Core_ssa.fresh_version ("__perceus_shadow_" ^ v.vname))
+
+let rec rename_shadow_var_refs (old_name : string) (new_var : var) (e : core) :
+    core =
+  match e.desc with
+  | CVar v when v.vname = old_name -> { e with desc = CVar new_var }
+  | CAssign (v, rhs) when v.vname = old_name ->
+      {
+        e with
+        desc = CAssign (new_var, rename_shadow_var_refs old_name new_var rhs);
+      }
+  | CDup (v, ty, body) ->
+      let v' = if v.vname = old_name then new_var else v in
+      {
+        e with
+        desc = CDup (v', ty, rename_shadow_var_refs old_name new_var body);
+      }
+  | CDrop (v, ty, body) ->
+      let v' = if v.vname = old_name then new_var else v in
+      {
+        e with
+        desc = CDrop (v', ty, rename_shadow_var_refs old_name new_var body);
+      }
+  | CLet (b, body) when b.bind_var.vname = old_name ->
+      {
+        e with
+        desc =
+          CLet
+            ( {
+                b with
+                bind_rhs = rename_shadow_var_refs old_name new_var b.bind_rhs;
+              },
+              body );
+      }
+  | CBorrowLet (b, body) when b.borrow_var.vname = old_name ->
+      {
+        e with
+        desc =
+          CBorrowLet
+            ( {
+                b with
+                borrow_rhs =
+                  rename_shadow_var_refs old_name new_var b.borrow_rhs;
+              },
+              body );
+      }
+  | CResourceScope scope when scope.rs_var.vname = old_name ->
+      {
+        e with
+        desc =
+          CResourceScope
+            {
+              scope with
+              rs_acquire =
+                rename_shadow_var_refs old_name new_var scope.rs_acquire;
+            };
+      }
+  | CResourceScope scope ->
+      {
+        e with
+        desc =
+          CResourceScope
+            {
+              scope with
+              rs_acquire =
+                rename_shadow_var_refs old_name new_var scope.rs_acquire;
+              rs_body = rename_shadow_var_refs old_name new_var scope.rs_body;
+              rs_cleanup =
+                rename_shadow_var_refs old_name new_var scope.rs_cleanup;
+            };
+      }
+  | CFor (binder, iter, body) when binder.loop_var.vname = old_name ->
+      {
+        e with
+        desc = CFor (binder, rename_shadow_var_refs old_name new_var iter, body);
+      }
+  | CLambda lam
+    when List.exists (fun (param, _) -> param.vname = old_name) lam.lam_params
+    ->
+      e
+  | CMatchArms (scrut, arms) ->
+      let scrut' = rename_shadow_var_refs old_name new_var scrut in
+      let arms' =
+        List.map
+          (fun (pat, body) ->
+            if pattern_binds old_name pat then (pat, body)
+            else (pat, rename_shadow_var_refs old_name new_var body))
+          arms
+      in
+      { e with desc = CMatchArms (scrut', arms') }
+  | CMatch (scrut, tree) ->
+      {
+        e with
+        desc =
+          CMatch
+            ( rename_shadow_var_refs old_name new_var scrut,
+              rename_shadow_var_refs_ctree old_name new_var tree );
+      }
+  | _ -> Core.map_children (rename_shadow_var_refs old_name new_var) e
+
+and rename_shadow_var_refs_ctree (old_name : string) (new_var : var)
+    (tree : ctree) : ctree =
+  match tree with
+  | CTLeaf { ct_bindings; ct_body } ->
+      if List.exists (fun (v, _) -> v.vname = old_name) ct_bindings then tree
+      else
+        CTLeaf
+          {
+            ct_bindings;
+            ct_body = rename_shadow_var_refs old_name new_var ct_body;
+          }
+  | CTFail -> CTFail
+  | CTSwitchTag { cts_scrut; cts_cases; cts_default } ->
+      CTSwitchTag
+        {
+          cts_scrut;
+          cts_cases =
+            List.map
+              (fun (n, sub) ->
+                (n, rename_shadow_var_refs_ctree old_name new_var sub))
+              cts_cases;
+          cts_default =
+            Option.map
+              (rename_shadow_var_refs_ctree old_name new_var)
+              cts_default;
+        }
+  | CTSwitchLit { ctl_scrut; ctl_cases; ctl_default } ->
+      CTSwitchLit
+        {
+          ctl_scrut;
+          ctl_cases =
+            List.map
+              (fun (lit, sub) ->
+                (lit, rename_shadow_var_refs_ctree old_name new_var sub))
+              ctl_cases;
+          ctl_default =
+            rename_shadow_var_refs_ctree old_name new_var ctl_default;
+        }
+  | CTSwitchLen { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default }
+    ->
+      CTSwitchLen
+        {
+          ctl_len_scrut;
+          ctl_len_cases =
+            List.map
+              (fun (n, sub) ->
+                (n, rename_shadow_var_refs_ctree old_name new_var sub))
+              ctl_len_cases;
+          ctl_len_geq =
+            Option.map
+              (fun (n, sub) ->
+                (n, rename_shadow_var_refs_ctree old_name new_var sub))
+              ctl_len_geq;
+          ctl_len_default =
+            Option.map
+              (rename_shadow_var_refs_ctree old_name new_var)
+              ctl_len_default;
+        }
+
+let rec rename_pattern_binding (old_name : string) (new_name : string)
+    (pat : Ast.pattern) : Ast.pattern =
+  match pat with
+  | Ast.PatVar name when name = old_name -> Ast.PatVar new_name
+  | Ast.PatConstructor (ctor, args) ->
+      Ast.PatConstructor
+        (ctor, List.map (rename_pattern_binding old_name new_name) args)
+  | Ast.PatQualified (module_name, ctor, args) ->
+      Ast.PatQualified
+        ( module_name,
+          ctor,
+          List.map (rename_pattern_binding old_name new_name) args )
+  | Ast.PatTuple args ->
+      Ast.PatTuple (List.map (rename_pattern_binding old_name new_name) args)
+  | Ast.PatOr args ->
+      Ast.PatOr (List.map (rename_pattern_binding old_name new_name) args)
+  | Ast.PatList (args, spread) ->
+      Ast.PatList
+        ( List.map (rename_pattern_binding old_name new_name) args,
+          Option.map (rename_pattern_binding old_name new_name) spread )
+  | _ -> pat
+
+let freshen_match_arm_shadow (v : var) (pat : Ast.pattern) (body : core) :
+    Ast.pattern * core =
+  if not (pattern_binds v.vname pat) then (pat, body)
+  else
+    let shadow = fresh_shadow_var v in
+    let pat' = rename_pattern_binding v.vname shadow.vname pat in
+    let body' = rename_shadow_var_refs v.vname shadow body in
+    (pat', body')
+
+let freshen_match_arm_shadows (v : var) (arms : (Ast.pattern * core) list) :
+    (Ast.pattern * core) list =
+  List.map (fun (pat, body) -> freshen_match_arm_shadow v pat body) arms
+
+let rec freshen_ctree_shadow_bindings (v : var) (tree : ctree) : ctree =
+  match tree with
+  | CTLeaf { ct_bindings; ct_body } ->
+      if not (List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings) then
+        tree
+      else
+        let shadow = fresh_shadow_var v in
+        let ct_bindings' =
+          List.map
+            (fun (bv, acc) ->
+              if bv.vname = v.vname then (shadow, acc) else (bv, acc))
+            ct_bindings
+        in
+        let ct_body' = rename_shadow_var_refs v.vname shadow ct_body in
+        CTLeaf { ct_bindings = ct_bindings'; ct_body = ct_body' }
+  | CTFail -> CTFail
+  | CTSwitchTag { cts_scrut; cts_cases; cts_default } ->
+      CTSwitchTag
+        {
+          cts_scrut;
+          cts_cases =
+            List.map
+              (fun (n, sub) -> (n, freshen_ctree_shadow_bindings v sub))
+              cts_cases;
+          cts_default = Option.map (freshen_ctree_shadow_bindings v) cts_default;
+        }
+  | CTSwitchLit { ctl_scrut; ctl_cases; ctl_default } ->
+      CTSwitchLit
+        {
+          ctl_scrut;
+          ctl_cases =
+            List.map
+              (fun (lit, sub) -> (lit, freshen_ctree_shadow_bindings v sub))
+              ctl_cases;
+          ctl_default = freshen_ctree_shadow_bindings v ctl_default;
+        }
+  | CTSwitchLen { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default }
+    ->
+      CTSwitchLen
+        {
+          ctl_len_scrut;
+          ctl_len_cases =
+            List.map
+              (fun (n, sub) -> (n, freshen_ctree_shadow_bindings v sub))
+              ctl_len_cases;
+          ctl_len_geq =
+            Option.map
+              (fun (n, sub) -> (n, freshen_ctree_shadow_bindings v sub))
+              ctl_len_geq;
+          ctl_len_default =
+            Option.map (freshen_ctree_shadow_bindings v) ctl_len_default;
+        }
 
 (** Balance a single mutually-exclusive branch.
 
     [available_refs] is the number of owned refs live when the branch starts.
     Drop excess refs before the branch so COW sees the lowest safe refcount, then
-    drop borrowed-only leftovers after the branch body has evaluated. *)
-let balance_branch_body (v : var) (ty : Ast.type_expr) ~(available_refs : int)
-    (uses : ownership_uses) (body : core) : core =
+    drop borrowed-only leftovers after the branch body has evaluated. Branches
+    that return an alias into [v] keep the required ref live in the result and
+    therefore skip the post-body drop. *)
+let rec balance_branch_body (env : type_env) (v : var) (ty : Ast.type_expr)
+    ~(available_refs : int) (uses : ownership_uses) (body : core) : core =
   let pre_drops = max 0 (available_refs - uses.required_refs) in
-  let body_with_pre_drops = prepend_drops pre_drops v ty body in
-  if uses.returns_alias then body_with_pre_drops
-  else
-    let post_drops = max 0 (uses.required_refs - uses.consumed_refs) in
-    let body_with_post_drops = drop_after_body post_drops v ty body in
-    prepend_drops pre_drops v ty body_with_post_drops
+  let live_refs = max 0 (available_refs - pre_drops) in
+  match balance_nested_branch_body env v ty ~available_refs:live_refs body with
+  | Some balanced_body -> prepend_drops pre_drops v ty balanced_body
+  | None ->
+      if uses.returns_alias then prepend_drops pre_drops v ty body
+      else
+        let post_drops = max 0 (uses.required_refs - uses.consumed_refs) in
+        let balanced_body = drop_after_body post_drops v ty body in
+        prepend_drops pre_drops v ty balanced_body
 
-(** Legacy branch balancing that treats every occurrence as consuming. This is
-    still used as the conservative fallback when a branch returns an alias into
-    the target, because the result lifetime is not explicit enough to post-drop
-    safely. *)
-let transform_let_if_body_legacy (b : binding) (c : core) (t : core) (el : core)
-    (if_node : core) (outer : core) : core =
-  let v = b.bind_var in
-  let count_c = count_uses v.vname c in
-  let count_t = count_uses v.vname t in
-  let count_e = count_uses v.vname el in
-  let max_branch = max count_t count_e in
-  let total_needed = count_c + max_branch in
-  let ty = b.bind_ty in
-  if total_needed = 0 then
-    let dropped = { if_node with desc = CDrop (v, ty, if_node) } in
-    { outer with desc = CLet (b, dropped) }
-  else
-    let t_excess = max_branch - count_t in
-    let e_excess = max_branch - count_e in
-    let t' = prepend_drops t_excess v ty t in
-    let el' = prepend_drops e_excess v ty el in
-    let new_if = { if_node with desc = CIf (c, t', el') } in
-    let dups_count = total_needed - 1 in
-    let body = prepend_dups dups_count v ty new_if in
-    { outer with desc = CLet (b, body) }
+and balance_nested_branch_body (env : type_env) (v : var) (ty : Ast.type_expr)
+    ~(available_refs : int) (body : core) : core option =
+  match body.desc with
+  | CSeq (head, tail) ->
+      let head_uses = summarize_linear_ownership_uses env v.vname head in
+      let available_after_head =
+        max 0 (available_refs - head_uses.consumed_refs)
+      in
+      Option.map
+        (fun tail' -> { body with desc = CSeq (head, tail') })
+        (balance_nested_branch_body env v ty
+           ~available_refs:available_after_head tail)
+  | CLet (b, inner) when b.bind_var.vname <> v.vname ->
+      let rhs_uses = summarize_linear_ownership_uses env v.vname b.bind_rhs in
+      let available_after_rhs =
+        max 0 (available_refs - rhs_uses.consumed_refs)
+      in
+      Option.map
+        (fun inner' -> { body with desc = CLet (b, inner') })
+        (balance_nested_branch_body env v ty ~available_refs:available_after_rhs
+           inner)
+  | CBorrowLet (b, inner) when b.borrow_var.vname <> v.vname ->
+      let rhs_uses = summarize_linear_ownership_uses env v.vname b.borrow_rhs in
+      let available_after_rhs =
+        max 0 (available_refs - rhs_uses.consumed_refs)
+      in
+      Option.map
+        (fun inner' -> { body with desc = CBorrowLet (b, inner') })
+        (balance_nested_branch_body env v ty ~available_refs:available_after_rhs
+           inner)
+  | CIf (cond, then_e, else_e) ->
+      let cond_uses = summarize_linear_ownership_uses env v.vname cond in
+      let then_uses = summarize_linear_ownership_uses env v.vname then_e in
+      let else_uses = summarize_linear_ownership_uses env v.vname else_e in
+      let available_after_cond =
+        max 0 (available_refs - cond_uses.consumed_refs)
+      in
+      Some
+        {
+          body with
+          desc =
+            CIf
+              ( cond,
+                balance_branch_body env v ty
+                  ~available_refs:available_after_cond then_uses then_e,
+                balance_branch_body env v ty
+                  ~available_refs:available_after_cond else_uses else_e );
+        }
+  | CMatchArms (scrut, arms) ->
+      let arms = freshen_match_arm_shadows v arms in
+      let scrut_uses = summarize_linear_ownership_uses env v.vname scrut in
+      let scrut_aliases_owner = borrow_expr_aliases_target env v.vname scrut in
+      let arm_uses =
+        List.map
+          (fun (pat, arm_body) ->
+            if pattern_binds v.vname pat then no_ownership_uses
+            else summarize_linear_ownership_uses env v.vname arm_body)
+          arms
+      in
+      let arm_uses_for_balance =
+        if scrut_aliases_owner then
+          List.map (seq_ownership_uses borrow_ownership_use) arm_uses
+        else arm_uses
+      in
+      let available_after_scrut =
+        max 0 (available_refs - scrut_uses.consumed_refs)
+      in
+      let arms' =
+        List.map2
+          (fun (pat, arm_body) uses ->
+            ( pat,
+              balance_branch_body env v ty ~available_refs:available_after_scrut
+                uses arm_body ))
+          arms arm_uses_for_balance
+      in
+      Some { body with desc = CMatchArms (scrut, arms') }
+  | CMatch (scrut, tree) ->
+      let tree = freshen_ctree_shadow_bindings v tree in
+      let scrut_uses = summarize_linear_ownership_uses env v.vname scrut in
+      let scrut_aliases_owner = borrow_expr_aliases_target env v.vname scrut in
+      let available_after_scrut =
+        max 0 (available_refs - scrut_uses.consumed_refs)
+      in
+      let rec balance_tree tree =
+        match tree with
+        | CTLeaf { ct_bindings; ct_body } ->
+            let uses =
+              if List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings
+              then no_ownership_uses
+              else summarize_linear_ownership_uses env v.vname ct_body
+            in
+            let uses =
+              if scrut_aliases_owner then
+                seq_ownership_uses borrow_ownership_use uses
+              else uses
+            in
+            CTLeaf
+              {
+                ct_bindings;
+                ct_body =
+                  balance_branch_body env v ty
+                    ~available_refs:available_after_scrut uses ct_body;
+              }
+        | CTFail -> CTFail
+        | CTSwitchTag { cts_scrut; cts_cases; cts_default } ->
+            CTSwitchTag
+              {
+                cts_scrut;
+                cts_cases =
+                  List.map (fun (n, sub) -> (n, balance_tree sub)) cts_cases;
+                cts_default = Option.map balance_tree cts_default;
+              }
+        | CTSwitchLit { ctl_scrut; ctl_cases; ctl_default } ->
+            CTSwitchLit
+              {
+                ctl_scrut;
+                ctl_cases =
+                  List.map (fun (lit, sub) -> (lit, balance_tree sub)) ctl_cases;
+                ctl_default = balance_tree ctl_default;
+              }
+        | CTSwitchLen
+            { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default } ->
+            CTSwitchLen
+              {
+                ctl_len_scrut;
+                ctl_len_cases =
+                  List.map (fun (n, sub) -> (n, balance_tree sub)) ctl_len_cases;
+                ctl_len_geq =
+                  Option.map (fun (n, sub) -> (n, balance_tree sub)) ctl_len_geq;
+                ctl_len_default = Option.map balance_tree ctl_len_default;
+              }
+      in
+      let tree' = balance_tree tree in
+      Some { body with desc = CMatch (scrut, tree') }
+  | _ -> None
 
 (** Transform a [CLet] whose body is [CIf]. Branch-aware version:
 
@@ -3593,52 +3958,26 @@ let transform_let_if_body (env : type_env) (b : binding) (c : core) (t : core)
   let cond_uses = summarize_linear_ownership_uses env v.vname c in
   let t_uses = summarize_linear_ownership_uses env v.vname t in
   let e_uses = summarize_linear_ownership_uses env v.vname el in
-  if needs_alias_fallback [ t_uses; e_uses ] then
-    transform_let_if_body_legacy b c t el if_node outer
-  else
-    let max_branch_required = max_required_refs [ t_uses; e_uses ] in
-    let total_needed =
-      max cond_uses.required_refs (cond_uses.consumed_refs + max_branch_required)
-    in
-    let ty = b.bind_ty in
-    if total_needed = 0 then
-      let dropped = { if_node with desc = CDrop (v, ty, if_node) } in
-      { outer with desc = CLet (b, dropped) }
-    else
-      let dups_count = max 0 (total_needed - 1) in
-      let available_after_cond = 1 + dups_count - cond_uses.consumed_refs in
-      let t' =
-        balance_branch_body v ty ~available_refs:available_after_cond t_uses t
-      in
-      let el' =
-        balance_branch_body v ty ~available_refs:available_after_cond e_uses el
-      in
-      let new_if = { if_node with desc = CIf (c, t', el') } in
-      let body = prepend_dups dups_count v ty new_if in
-      { outer with desc = CLet (b, body) }
-
-let transform_let_match_body_legacy (b : binding) (scrut : core)
-    (arms : (Ast.pattern * core) list) (match_node : core) (outer : core) : core
-    =
-  let v = b.bind_var in
-  let count_scrut = count_uses v.vname scrut in
-  let arm_counts = List.map (fun (_, body) -> count_uses v.vname body) arms in
-  let max_arm = List.fold_left max 0 arm_counts in
-  let total_needed = count_scrut + max_arm in
+  let max_branch_required = max_required_refs [ t_uses; e_uses ] in
+  let total_needed =
+    max cond_uses.required_refs (cond_uses.consumed_refs + max_branch_required)
+  in
   let ty = b.bind_ty in
   if total_needed = 0 then
-    let dropped = { match_node with desc = CDrop (v, ty, match_node) } in
+    let dropped = { if_node with desc = CDrop (v, ty, if_node) } in
     { outer with desc = CLet (b, dropped) }
   else
-    let new_arms =
-      List.map2
-        (fun (pat, body) count ->
-          (pat, prepend_drops (max_arm - count) v ty body))
-        arms arm_counts
+    let dups_count = max 0 (total_needed - 1) in
+    let available_after_cond = 1 + dups_count - cond_uses.consumed_refs in
+    let t' =
+      balance_branch_body env v ty ~available_refs:available_after_cond t_uses t
     in
-    let new_match = { match_node with desc = CMatchArms (scrut, new_arms) } in
-    let dups_count = total_needed - 1 in
-    let body = prepend_dups dups_count v ty new_match in
+    let el' =
+      balance_branch_body env v ty ~available_refs:available_after_cond e_uses
+        el
+    in
+    let new_if = { if_node with desc = CIf (c, t', el') } in
+    let body = prepend_dups dups_count v ty new_if in
     { outer with desc = CLet (b, body) }
 
 (** Transform a [CLet] whose body is [CMatchArms]. Same algorithm as
@@ -3647,6 +3986,8 @@ let transform_let_match_body (env : type_env) (b : binding) (scrut : core)
     (arms : (Ast.pattern * core) list) (match_node : core) (outer : core) : core
     =
   let v = b.bind_var in
+  let arms = freshen_match_arm_shadows v arms in
+  let match_node = { match_node with desc = CMatchArms (scrut, arms) } in
   let scrut_uses = summarize_linear_ownership_uses env v.vname scrut in
   let scrut_aliases_owner = borrow_expr_aliases_target env v.vname scrut in
   let arm_uses =
@@ -3663,13 +4004,10 @@ let transform_let_match_body (env : type_env) (b : binding) (scrut : core)
   in
   if
     scrut_aliases_owner
-    && (not (needs_alias_fallback arm_uses))
-    && List.for_all (fun uses -> uses.consumed_refs = 0) arm_uses
+    && List.for_all
+         (fun uses -> uses.consumed_refs = 0 && not uses.returns_alias)
+         arm_uses
   then { outer with desc = CLet (b, drop_after_body 1 v b.bind_ty match_node) }
-  else if
-    (scrut_uses.returns_alias && not scrut_aliases_owner)
-    || needs_alias_fallback arm_uses
-  then transform_let_match_body_legacy b scrut arms match_node outer
   else
     let max_arm_required =
       max (if scrut_aliases_owner then 1 else 0) (max_required_refs arm_uses)
@@ -3688,69 +4026,13 @@ let transform_let_match_body (env : type_env) (b : binding) (scrut : core)
         List.map2
           (fun (pat, body) uses ->
             ( pat,
-              balance_branch_body v ty ~available_refs:available_after_scrut
+              balance_branch_body env v ty ~available_refs:available_after_scrut
                 uses body ))
           arms arm_uses_for_balance
       in
       let new_match = { match_node with desc = CMatchArms (scrut, new_arms) } in
       let body = prepend_dups dups_count v ty new_match in
       { outer with desc = CLet (b, body) }
-
-(** Walk a [ctree] and prepend [max_leaf - leaf_count] drops to each
-    leaf's body. The [ty] is stamped onto every inserted [CDrop]. *)
-let rec insert_drops_in_ctree (v : var) (ty : Ast.type_expr) (max_leaf : int)
-    (tree : ctree) : ctree =
-  match tree with
-  | CTLeaf { ct_bindings; ct_body } ->
-      (* Respect pattern-binding shadowing: if this leaf binds [v]'s
-         name, the body's references are to the shadow, not the
-         outer — so we treat the leaf as having zero uses of the
-         outer and drop the full [max_leaf] here. *)
-      let count =
-        if List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings then 0
-        else count_uses v.vname ct_body
-      in
-      let excess = max_leaf - count in
-      let new_body = prepend_drops excess v ty ct_body in
-      CTLeaf { ct_bindings; ct_body = new_body }
-  | CTFail -> CTFail
-  | CTSwitchTag { cts_scrut; cts_cases; cts_default } ->
-      CTSwitchTag
-        {
-          cts_scrut;
-          cts_cases =
-            List.map
-              (fun (n, sub) -> (n, insert_drops_in_ctree v ty max_leaf sub))
-              cts_cases;
-          cts_default =
-            Option.map (insert_drops_in_ctree v ty max_leaf) cts_default;
-        }
-  | CTSwitchLit { ctl_scrut; ctl_cases; ctl_default } ->
-      CTSwitchLit
-        {
-          ctl_scrut;
-          ctl_cases =
-            List.map
-              (fun (l, sub) -> (l, insert_drops_in_ctree v ty max_leaf sub))
-              ctl_cases;
-          ctl_default = insert_drops_in_ctree v ty max_leaf ctl_default;
-        }
-  | CTSwitchLen { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default }
-    ->
-      CTSwitchLen
-        {
-          ctl_len_scrut;
-          ctl_len_cases =
-            List.map
-              (fun (n, sub) -> (n, insert_drops_in_ctree v ty max_leaf sub))
-              ctl_len_cases;
-          ctl_len_geq =
-            Option.map
-              (fun (n, sub) -> (n, insert_drops_in_ctree v ty max_leaf sub))
-              ctl_len_geq;
-          ctl_len_default =
-            Option.map (insert_drops_in_ctree v ty max_leaf) ctl_len_default;
-        }
 
 (** Summarize leaf ownership requirements across a compiled decision tree. *)
 let rec collect_ctree_leaf_uses (env : type_env) (v : var) (tree : ctree) :
@@ -3814,7 +4096,7 @@ let rec balance_ctree_leaves (env : type_env) (v : var) (ty : Ast.type_expr)
       CTLeaf
         {
           ct_bindings;
-          ct_body = balance_branch_body v ty ~available_refs uses ct_body;
+          ct_body = balance_branch_body env v ty ~available_refs uses ct_body;
         }
   | CTFail -> CTFail
   | CTSwitchTag { cts_scrut; cts_cases; cts_default } ->
@@ -3877,7 +4159,9 @@ let rec balance_ctree_leaves (env : type_env) (v : var) (ty : Ast.type_expr)
 
 let consuming_user_call_kind = function
   | CKUser _ | CKClosure -> true
-  | CKUnknown | CKForeign _ | CKBuiltin _ | CKIntrinsic _ -> false
+  | CKUnknown | CKSelectedDirect _ | CKForeign _ | CKBuiltin _ | CKIntrinsic _
+    ->
+      false
 
 let consumes_var_once_linearly (env : type_env) (v : var) (e : core) : bool =
   if not (is_linear e) then false
@@ -4144,41 +4428,23 @@ and protect_loop_consumes_in_ctree (env : type_env) (v : var)
             Option.map (protect_loop_consumes_in_ctree env v ty) ctl_len_default;
         }
 
-let transform_let_match_tree_body_legacy (b : binding) (scrut : core)
-    (tree : ctree) (mt_node : core) (outer : core) : core =
-  let v = b.bind_var in
-  let count_scrut = count_uses v.vname scrut in
-  let max_leaf = max_uses_ctree v.vname tree in
-  let total_needed = count_scrut + max_leaf in
-  let ty = b.bind_ty in
-  if total_needed = 0 then
-    let dropped = { mt_node with desc = CDrop (v, ty, mt_node) } in
-    { outer with desc = CLet (b, dropped) }
-  else
-    let new_tree = insert_drops_in_ctree v ty max_leaf tree in
-    let new_mt = { mt_node with desc = CMatch (scrut, new_tree) } in
-    let dups_count = total_needed - 1 in
-    let body = prepend_dups dups_count v ty new_mt in
-    { outer with desc = CLet (b, body) }
-
 (** Transform a [CLet] whose body is [CMatch] (compiled tree). Walks every leaf
-    of the compiled decision tree, using [max_uses_ctree] as the
-    "max path" count and per-leaf excess drops to equalize. *)
+    of the compiled decision tree with branch ownership summaries and balances
+    each mutually-exclusive leaf independently. *)
 let transform_let_match_tree_body (env : type_env) (b : binding) (scrut : core)
     (tree : ctree) (mt_node : core) (outer : core) : core =
   let v = b.bind_var in
+  let tree = freshen_ctree_shadow_bindings v tree in
+  let mt_node = { mt_node with desc = CMatch (scrut, tree) } in
   let scrut_uses = summarize_linear_ownership_uses env v.vname scrut in
   let scrut_aliases_owner = borrow_expr_aliases_target env v.vname scrut in
   let leaf_uses = collect_ctree_leaf_uses env v tree in
   if
     scrut_aliases_owner
-    && (not (needs_alias_fallback leaf_uses))
-    && List.for_all (fun uses -> uses.consumed_refs = 0) leaf_uses
+    && List.for_all
+         (fun uses -> uses.consumed_refs = 0 && not uses.returns_alias)
+         leaf_uses
   then { outer with desc = CLet (b, drop_after_body 1 v b.bind_ty mt_node) }
-  else if
-    (scrut_uses.returns_alias && not scrut_aliases_owner)
-    || needs_alias_fallback leaf_uses
-  then transform_let_match_tree_body_legacy b scrut tree mt_node outer
   else
     let max_leaf_required =
       max (if scrut_aliases_owner then 1 else 0) (max_required_refs leaf_uses)
