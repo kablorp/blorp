@@ -1676,12 +1676,7 @@ blorp_Vector* blorp_vector_zip(blorp_Vector* a, blorp_Vector* b);
 blorp_Vector* blorp_vector_map(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc);
 blorp_Vector* blorp_vmap_parallel(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
 blorp_Vector* blorp_vmap_indexed_parallel(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
-void* blorp_vfold_parallel(blorp_Vector* arr, void* init, blorp_Closure* f, int acc_is_rc);
 blorp_Vector* blorp_vzip_parallel(blorp_Vector* arr_a, blorp_Vector* arr_b, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
-blorp_Vector* blorp_vmap_parallel_with(blorp_Vector* arr, blorp_Closure* f, long threads, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
-blorp_Vector* blorp_vmap_indexed_parallel_with(blorp_Vector* arr, blorp_Closure* f, long threads, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
-void* blorp_vfold_parallel_with(blorp_Vector* arr, void* init, blorp_Closure* f, long threads, int acc_is_rc);
-blorp_Vector* blorp_vzip_parallel_with(blorp_Vector* arr_a, blorp_Vector* arr_b, blorp_Closure* f, long threads, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
 
 // Math Builtins
 long blorp_abs(long x);

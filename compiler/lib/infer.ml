@@ -163,8 +163,12 @@ let trait_obligation_satisfied env ty trait_name =
   | TraitObligationSatisfied -> true
   | TraitObligationUnsatisfied | TraitObligationDeferred -> false
 
-let is_parallel_list_type = function
-  | TyNamed (("ParallelList" | "std/list::ParallelList"), _) -> true
+let is_scoped_parallel_type = function
+  | TyNamed
+      ( ( "ParallelList" | "std/list::ParallelList" | "ParallelVector"
+        | "std/vector::ParallelVector" ),
+        _ ) ->
+      true
   | _ -> false
 
 type proven_collection = Refinement.proven_collection
@@ -2945,6 +2949,12 @@ let rec resolve_subscript_chain_type (env : env) (e : expr) : type_expr option =
 (** Build a substitution from type variable to concrete type.
     ~type_params: explicit list of type parameter names (e.g., ["T"; "Acc"; "T:Stringable"]).
     Only names in this list (after stripping bounds) are treated as substitutable type params. *)
+let is_type_param_identity_binding name ty =
+  match ty with
+  | TyVar other | TyNamed (other, []) ->
+      Env.type_param_name other = Env.type_param_name name
+  | _ -> false
+
 let build_subst ~(type_params : string list) (param_ty : type_expr)
     (arg_ty : type_expr) : subst_map =
   let stripped = Env.type_param_names type_params in
@@ -7089,7 +7099,7 @@ and infer_length_refined ctx expr callee args loc =
   let arg = List.hd args in
   let* arg_ty, arg' = infer_unconstrained_value_expr ctx arg in
   let* () =
-    if is_parallel_list_type arg_ty then
+    if is_scoped_parallel_type arg_ty then
       error loc
         (Printf.sprintf "No function 'length' available for type %s"
            (type_to_string arg_ty))
@@ -8254,6 +8264,10 @@ and infer_call ctx expr callee args loc =
                 when Types.normalize_type_name n1 = Types.normalize_type_name n2
                      && List.length a1 = List.length a2 ->
                   List.iter2 bind_meta_from_expected a1 a2
+              | TyArray (elem1, dims1), TyArray (elem2, dims2)
+                when List.length dims1 = List.length dims2 ->
+                  bind_meta_from_expected elem1 elem2;
+                  List.iter2 bind_meta_from_expected dims1 dims2
               | TyTuple e1, TyTuple e2 when List.length e1 = List.length e2 ->
                   List.iter2 bind_meta_from_expected e1 e2
               | TyFunc f1, TyFunc f2
@@ -8327,10 +8341,17 @@ and infer_call ctx expr callee args loc =
                               normalize_type ctx ArgumentCompatibility param_ty
                             in
                             let arg_value_ty = expr_value_type_or arg' arg_ty in
+                            let raw_arg_ty_r =
+                              normalize_type ctx ArgumentCompatibility
+                                arg_value_ty
+                            in
                             let arg_ty_r =
-                              default_arg_type_for_param param_ty_r
-                                (normalize_type ctx ArgumentCompatibility
-                                   arg_value_ty)
+                              default_arg_type_for_param param_ty_r raw_arg_ty_r
+                            in
+                            let subst_arg_ty_r =
+                              match (param_ty_r, raw_arg_ty_r) with
+                              | TyFunc _, TyFunc _ -> raw_arg_ty_r
+                              | _ -> arg_ty_r
                             in
                             (* LiteralString parameters require the argument to be a string literal *)
                             let is_literal_string_param =
@@ -8396,10 +8417,10 @@ and infer_call ctx expr callee args loc =
                                 (* Build new substitutions from this argument *)
                                 let new_subst =
                                   build_subst ~type_params:callee_type_params
-                                    param_ty_r arg_ty_r
+                                    param_ty_r subst_arg_ty_r
                                 in
                                 Ok
-                                  ( results @ [ (arg_ty_r, arg') ],
+                                  ( results @ [ (subst_arg_ty_r, arg') ],
                                     acc_subst @ new_subst,
                                     arg_pos + 1 )
                               else
@@ -8485,6 +8506,21 @@ and infer_call ctx expr callee args loc =
                          (entry, Printf.sprintf "from argument %d" (i + 1)))
                        entries)
                    (List.combine params_resolved arg_types))
+            in
+            let initial_non_identity_var_names =
+              initial_subst_with_sources
+              |> List.filter_map (fun ((s : subst_entry), _) ->
+                  if is_type_param_identity_binding s.var_name s.concrete_type
+                  then None
+                  else Some s.var_name)
+            in
+            let arg_subst_with_sources =
+              List.filter
+                (fun ((s : subst_entry), _) ->
+                  (not
+                     (is_type_param_identity_binding s.var_name s.concrete_type))
+                  || not (List.mem s.var_name initial_non_identity_var_names))
+                arg_subst_with_sources
             in
             let arg_var_names =
               List.map

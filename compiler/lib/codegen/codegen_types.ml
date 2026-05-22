@@ -548,6 +548,7 @@ let type_to_c ~(reg : registry) ty =
               | "Bool" -> "bool"
               | "String" | "LiteralString" -> "blorp_String*"
               | "ParallelList" -> "blorp_List*"
+              | "ParallelVector" -> "blorp_Vector*"
               | "Bytes" -> "blorp_Bytes*"
               | "Char" -> "int32_t"
               | "Void" -> "void"
@@ -585,7 +586,8 @@ let type_to_c ~(reg : registry) ty =
               | _ -> name ^ "*" (* Assume pointer for custom types *))
           | TyNamed (name, _args) -> (
               match name with
-              | "Tensor" | "Vector" | "Matrix" -> "blorp_Vector*"
+              | "Tensor" | "Vector" | "Matrix" | "ParallelVector" ->
+                  "blorp_Vector*"
               | "List" | "ParallelList" -> "blorp_List*"
               | "Dict" -> "blorp_Dict*"
               | "Set" -> "blorp_Set*"

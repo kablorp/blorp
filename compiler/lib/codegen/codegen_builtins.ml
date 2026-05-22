@@ -84,20 +84,7 @@ let float_const_builtins =
   blorp_prefixed "" [ "infinity"; "neg_infinity"; "nan_value" ]
 
 let parallel_list_builtins = []
-
-let parallel_vector_builtins =
-  prefixed_group N.mod_vector "blorp_v"
-    [
-      "map_parallel";
-      "map_indexed_parallel";
-      "fold_parallel";
-      "zip_parallel";
-      "map_parallel_with";
-      "map_indexed_parallel_with";
-      "fold_parallel_with";
-      "zip_parallel_with";
-    ]
-
+let parallel_vector_builtins = []
 let raylib_module_paths = [ "./raylib"; "../games/raylib"; "./games/raylib" ]
 
 let raylib_builtin_names =

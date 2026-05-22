@@ -189,7 +189,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
         (name ^ " is a parallel boundary")
         true
         (has_effect name Parallel_boundary))
-    [ "parallel"; "map_parallel"; "zip_parallel_with" ];
+    [ "parallel" ];
   List.iter
     (fun name ->
       Alcotest.(check bool)

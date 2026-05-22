@@ -2523,49 +2523,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
         desc = CCall (CKBuiltin c, callee, args @ [ mk_int elem_needs_release ]);
       }
   | CCall (CKBuiltin c, callee, args)
-    when (c = "blorp_vmap_parallel_with"
-         || c = "blorp_vmap_indexed_parallel_with")
-         && List.length args = 3 ->
-      let mk_int n =
-        {
-          desc = CLit (Ast.LitInt (Int64.of_int n));
-          ty = Ast.TyNamed ("Int", []);
-          loc = e.loc;
-        }
-      in
-      let elem_needs_release =
-        if
-          tensor_result_elem_needs_release ~reg ~loc:e.loc
-            ~context:"vector parallel map result must be a tensor" e.ty
-        then 1
-        else 0
-      in
-      {
-        e with
-        desc = CCall (CKBuiltin c, callee, args @ [ mk_int elem_needs_release ]);
-      }
-  | CCall (CKBuiltin c, callee, args)
     when c = "blorp_vzip_parallel" && List.length args = 3 ->
-      let mk_int n =
-        {
-          desc = CLit (Ast.LitInt (Int64.of_int n));
-          ty = Ast.TyNamed ("Int", []);
-          loc = e.loc;
-        }
-      in
-      let elem_needs_release =
-        if
-          tensor_result_elem_needs_release ~reg ~loc:e.loc
-            ~context:"vector zip result must be a tensor" e.ty
-        then 1
-        else 0
-      in
-      {
-        e with
-        desc = CCall (CKBuiltin c, callee, args @ [ mk_int elem_needs_release ]);
-      }
-  | CCall (CKBuiltin c, callee, args)
-    when c = "blorp_vzip_parallel_with" && List.length args = 4 ->
       let mk_int n =
         {
           desc = CLit (Ast.LitInt (Int64.of_int n));
@@ -2592,8 +2550,6 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
          || c = "blorp_fold_parallel_ordered"
          || c = "blorp_fold_parallel_with"
          || c = "blorp_fold_parallel_ordered_with"
-         || c = "blorp_vfold_parallel"
-         || c = "blorp_vfold_parallel_with"
          || c = "blorp_stream_fold" ->
       let mk_int n =
         {

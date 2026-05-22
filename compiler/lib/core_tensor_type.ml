@@ -11,11 +11,21 @@ type t = {
 let normalize_type ~reg ty =
   Codegen_types.expand_alias ~reg ty |> Codegen_types.normalize_type
 
+let type_name_is expected name =
+  match Types.split_canonical_module_type_name name with
+  | Some (_, type_name) -> type_name = expected
+  | None -> name = expected
+
 let of_type ~reg ty =
   let semantic_ty = normalize_type ~reg ty in
   match Types.array_parts semantic_ty with
   | Some (elem_ty, dims) -> Some { semantic_ty; elem_ty; dims }
-  | None -> None
+  | None -> (
+      match semantic_ty with
+      | Ast.TyNamed (name, [ elem_ty; dim ])
+        when type_name_is "ParallelVector" name ->
+          Some { semantic_ty; elem_ty; dims = [ dim ] }
+      | _ -> None)
 
 let of_core ~reg (expr : Core.core) = of_type ~reg expr.ty
 let is_type ~reg ty = Option.is_some (of_type ~reg ty)

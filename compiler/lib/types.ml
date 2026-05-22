@@ -187,6 +187,7 @@ let global_abi_type_names =
     "StringSlice";
     "List";
     "ParallelList";
+    "ParallelVector";
     "Dict";
     "Set";
     "Option";

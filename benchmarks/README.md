@@ -89,6 +89,17 @@ BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/list_parallel.brp -- fu
 Leave `BLORP_THREADS` unset to measure the runtime default. The `smoke` mode
 uses small sizes for harness checks; `full` includes 120k and 1M element cases.
 
+`benchmarks/blorp/vector_parallel.brp` isolates scoped `Vector.parallel`
+pipelines. It covers single `map`, `map.map`, `map_indexed.map`,
+`zip_map.map`, repeated use of a captured same-shape vector, and managed-result
+elements. Each `BENCH` row includes elapsed time, allocation counters, live
+objects, bytes still allocated, and a checksum:
+
+```bash
+BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/vector_parallel.brp -- smoke
+BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/vector_parallel.brp -- full
+```
+
 ## Timing Model
 
 `bench.sh` first compiles all compiled-language binaries for the selected

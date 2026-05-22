@@ -3189,6 +3189,8 @@ let () =
           ("list", "List");
           ("list", "ParallelList");
           ("parallel_list", "ParallelList");
+          ("vector", "ParallelVector");
+          ("parallel_vector", "ParallelVector");
           ("range", "Range");
           ("dict", "Dict");
           ("set", "Set");

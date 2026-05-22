@@ -109,14 +109,6 @@ let descriptors =
     effects "get_frame_time" [ Impure ];
     effects "get_time" [ Impure ];
     effects "parallel" [ Parallel_boundary ];
-    effects "map_parallel" [ Parallel_boundary ];
-    effects "map_indexed_parallel" [ Parallel_boundary ];
-    effects "fold_parallel" [ Parallel_boundary ];
-    effects "zip_parallel" [ Parallel_boundary ];
-    effects "map_parallel_with" [ Parallel_boundary ];
-    effects "map_indexed_parallel_with" [ Parallel_boundary ];
-    effects "fold_parallel_with" [ Parallel_boundary ];
-    effects "zip_parallel_with" [ Parallel_boundary ];
     special "checked_get" Checked_get;
     special "checked_set" Checked_set;
     special "checked_slice" Checked_slice;

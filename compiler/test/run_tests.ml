@@ -142,6 +142,9 @@ let () =
         (fun (name, cases) -> ("CoreCollectionPipeline." ^ name, cases))
         Test_core_collection_pipeline.suite
     @ List.map
+        (fun (name, cases) -> ("CoreParallelVectorPipeline." ^ name, cases))
+        Test_core_parallel_vector_pipeline.suite
+    @ List.map
         (fun (name, cases) -> ("CoreStringPipeline." ^ name, cases))
         Test_core_string_pipeline.suite
     @ List.map

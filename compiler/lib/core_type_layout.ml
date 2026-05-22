@@ -68,9 +68,9 @@ let unmanaged_layout = layout_for_ownership Unmanaged
 
 let builtin_layout = function
   | "String" | "Bytes" | "Fixed" | "StringSlice" | "MemStats" | "SchedulerStats"
-  | "List" | "ParallelList" | "Dict" | "Set" | "Tensor" | "Vector" | "Matrix"
-  | "Builder" | "Slice" | "Option" | "Result" | "Task" | "Channel" | "Stream"
-  | "FallibleStream" | "std/stream::FallibleStream"
+  | "List" | "ParallelList" | "ParallelVector" | "Dict" | "Set" | "Tensor"
+  | "Vector" | "Matrix" | "Builder" | "Slice" | "Option" | "Result" | "Task"
+  | "Channel" | "Stream" | "FallibleStream" | "std/stream::FallibleStream"
   | "std_stream__FallibleStream" | "TcpListener" | "TcpStream"
   | "ConcurrencyError" ->
       Some managed_layout

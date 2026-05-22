@@ -333,7 +333,7 @@ order:
    - lower single-stage map/filter/filter_map to the existing runtime kernels;
    - lower common chains such as `filter_map -> map` to a fused runtime kernel
      only after the explicit representation and tests exist;
-   - keep vector `map_indexed_parallel` and fiber scheduling changes separate
+   - keep scoped vector parallel pipelines and fiber scheduling changes separate
      unless benchmark evidence shows shared runtime machinery should move.
 
    Hardening target: illegal `ParallelList` operations should remain

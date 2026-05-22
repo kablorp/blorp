@@ -17049,7 +17049,6 @@ static void __blorp_vmap_chunk_worker(void* arg) {
 static blorp_Vector* __blorp_vmap_parallel_impl(
     blorp_Vector* arr,
     blorp_Closure* f,
-    long max_threads,
     int indexed,
     int result_elem_is_rc,
     uint8_t result_storage_mode,
@@ -17074,7 +17073,6 @@ static blorp_Vector* __blorp_vmap_parallel_impl(
     // For small vectors or no pool, run sequentially
     pthread_once(&__blorp_pool_once, __blorp_pool_init_default);
     long num_threads = __blorp_pool ? __blorp_pool->num_threads : 1;
-    if (max_threads > 0 && max_threads < num_threads) num_threads = max_threads;
     if (len < BLORP_VPAR_MIN_CHUNK * 2 || num_threads <= 1 || !__blorp_pool) {
         for (long i = 0; i < len; i++) {
             blorp_VectorCallbackArg elem = blorp_vector_callback_arg(arr, i);
@@ -17190,7 +17188,6 @@ blorp_Vector* blorp_vmap_parallel(
         arr,
         f,
         0,
-        0,
         result_elem_is_rc != 0,
         result_storage_mode,
         result_elem_size,
@@ -17208,67 +17205,11 @@ blorp_Vector* blorp_vmap_indexed_parallel(
     return __blorp_vmap_parallel_impl(
         arr,
         f,
-        0,
         1,
         result_elem_is_rc != 0,
         result_storage_mode,
         result_elem_size,
         result_value_encoding);
-}
-
-blorp_Vector* blorp_vmap_parallel_with(
-    blorp_Vector* arr,
-    blorp_Closure* f,
-    long threads,
-    long result_elem_is_rc,
-    uint8_t result_storage_mode,
-    int16_t result_elem_size,
-    uint8_t result_value_encoding
-) {
-    return __blorp_vmap_parallel_impl(
-        arr,
-        f,
-        threads,
-        0,
-        result_elem_is_rc != 0,
-        result_storage_mode,
-        result_elem_size,
-        result_value_encoding);
-}
-
-blorp_Vector* blorp_vmap_indexed_parallel_with(
-    blorp_Vector* arr,
-    blorp_Closure* f,
-    long threads,
-    long result_elem_is_rc,
-    uint8_t result_storage_mode,
-    int16_t result_elem_size,
-    uint8_t result_value_encoding
-) {
-    return __blorp_vmap_parallel_impl(
-        arr,
-        f,
-        threads,
-        1,
-        result_elem_is_rc != 0,
-        result_storage_mode,
-        result_elem_size,
-        result_value_encoding);
-}
-
-// vfold_parallel: inherently sequential (accumulator dependency), runs single-threaded
-void* blorp_vfold_parallel(blorp_Vector* arr, void* init, blorp_Closure* f, int acc_is_rc) {
-    if (!arr || !f) return init;
-
-    void* acc = init;
-    for (long i = 0; i < arr->len; i++) {
-        void* elem = arr->data[i];
-        void* new_acc = blorp_call2(f, acc, elem);
-        if (acc_is_rc && new_acc != acc && acc)
-            blorp_release((blorp_Object*)acc);
-        acc = new_acc;
-    }
-    return acc;
 }
 
 // vzip_parallel: parallel element-wise combine
@@ -17309,7 +17250,6 @@ static blorp_Vector* __blorp_vzip_parallel_impl(
     blorp_Vector* arr_a,
     blorp_Vector* arr_b,
     blorp_Closure* f,
-    long max_threads,
     long result_elem_is_rc,
     uint8_t result_storage_mode,
     int16_t result_elem_size,
@@ -17319,10 +17259,10 @@ static blorp_Vector* __blorp_vzip_parallel_impl(
         return blorp_vector_new_result_layout(
             0,
             result_elem_is_rc != 0,
-            result_storage_mode,
-            result_elem_size);
+        result_storage_mode,
+        result_elem_size);
     }
-    long len = arr_a->len < arr_b->len ? arr_a->len : arr_b->len;
+    long len = arr_a->len;
 
     blorp_Vector* result = blorp_vector_new_result_layout(
         len,
@@ -17332,7 +17272,6 @@ static blorp_Vector* __blorp_vzip_parallel_impl(
 
     pthread_once(&__blorp_pool_once, __blorp_pool_init_default);
     long num_threads = __blorp_pool ? __blorp_pool->num_threads : 1;
-    if (max_threads > 0 && max_threads < num_threads) num_threads = max_threads;
     if (len < BLORP_VPAR_MIN_CHUNK * 2 || num_threads <= 1 || !__blorp_pool) {
         for (long i = 0; i < len; i++) {
             blorp_VectorCallbackArg elem_a = blorp_vector_callback_arg(arr_a, i);
@@ -17431,33 +17370,6 @@ blorp_Vector* blorp_vzip_parallel(
         arr_a,
         arr_b,
         f,
-        0,
-        result_elem_is_rc,
-        result_storage_mode,
-        result_elem_size,
-        result_value_encoding);
-}
-
-void* blorp_vfold_parallel_with(blorp_Vector* arr, void* init, blorp_Closure* f, long threads, int acc_is_rc) {
-    (void)threads;
-    return blorp_vfold_parallel(arr, init, f, acc_is_rc);
-}
-
-blorp_Vector* blorp_vzip_parallel_with(
-    blorp_Vector* arr_a,
-    blorp_Vector* arr_b,
-    blorp_Closure* f,
-    long threads,
-    long result_elem_is_rc,
-    uint8_t result_storage_mode,
-    int16_t result_elem_size,
-    uint8_t result_value_encoding
-) {
-    return __blorp_vzip_parallel_impl(
-        arr_a,
-        arr_b,
-        f,
-        threads,
         result_elem_is_rc,
         result_storage_mode,
         result_elem_size,

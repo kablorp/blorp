@@ -639,22 +639,14 @@ let builtin_contract_table =
              ([ Borrow; Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
            ]);
       builtins ~void_boxed_args:[ 1 ]
-        [
-          "blorp_fold_parallel";
-          "blorp_fold_parallel_ordered";
-          "blorp_vfold_parallel";
-        ]
+        [ "blorp_fold_parallel"; "blorp_fold_parallel_ordered" ]
         (bcases
            [
              ([ Borrow; Consume; Borrow ], ReturnOwned);
              ([ Borrow; Consume; Borrow; Borrow ], ReturnOwned);
            ]);
       builtins ~void_boxed_args:[ 1 ]
-        [
-          "blorp_fold_parallel_with";
-          "blorp_fold_parallel_ordered_with";
-          "blorp_vfold_parallel_with";
-        ]
+        [ "blorp_fold_parallel_with"; "blorp_fold_parallel_ordered_with" ]
         (bcases
            [
              ([ Borrow; Consume; Borrow; Borrow ], ReturnOwned);
@@ -1198,25 +1190,11 @@ let builtin_contract_table =
              ([ Borrow; Borrow ], ReturnOwned);
              ([ Borrow; Borrow; Borrow ], ReturnOwned);
            ]);
-      builtins
-        [ "blorp_vmap_parallel_with"; "blorp_vmap_indexed_parallel_with" ]
-        (bcases
-           [
-             ([ Borrow; Borrow; Borrow ], ReturnOwned);
-             ([ Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
-           ]);
       builtins [ "blorp_vzip_parallel" ]
         (bcases
            [
              ([ Borrow; Borrow; Borrow ], ReturnOwned);
              ([ Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
-           ]);
-      builtins
-        [ "blorp_vzip_parallel_with" ]
-        (bcases
-           [
-             ([ Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
-             ([ Borrow; Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
            ]);
     ]
 

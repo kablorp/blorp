@@ -5700,6 +5700,17 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
     | { cp_ty = Ast.TyNamed ("ParallelList", _); _ } :: _ -> true
     | _ -> false
   in
+  let parallel_vector_view_ty ty =
+    match Codegen_types.normalize_type ty with
+    | Ast.TyArray (elem_ty, [ dim ]) ->
+        Some (Ast.TyNamed ("ParallelVector", [ elem_ty; dim ]))
+    | _ -> None
+  in
+  let first_is_vector () =
+    match params with
+    | { cp_ty; _ } :: _ -> Option.is_some (parallel_vector_view_ty cp_ty)
+    | _ -> false
+  in
   let first_is_string () =
     match params with
     | { cp_ty = Ast.TyNamed ("String", _); _ } :: _ -> true
@@ -5733,6 +5744,11 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
   let return_is_parallel_list () =
     match return_ty with Ast.TyNamed ("ParallelList", _) -> true | _ -> false
   in
+  let return_is_vector () =
+    match Codegen_types.normalize_type return_ty with
+    | Ast.TyArray (_, [ _ ]) -> true
+    | _ -> false
+  in
   let return_is_string () =
     match return_ty with Ast.TyNamed ("String", _) -> true | _ -> false
   in
@@ -5758,6 +5774,13 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
   let with_list2 f =
     match params with
     | ({ cp_ty = Ast.TyNamed ("List", _); _ } as p0) :: [ p1 ] -> Some (f p0 p1)
+    | _ -> None
+  in
+  let with_vector2 f =
+    match params with
+    | ({ cp_ty; _ } as p0) :: [ p1 ]
+      when Option.is_some (parallel_vector_view_ty cp_ty) ->
+        Some (f p0 p1)
     | _ -> None
   in
   let with_parallel_list2 f =
@@ -5791,6 +5814,15 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
             | Ast.TyNamed ("List", [ elem_ty ]) ->
                 Ast.TyNamed ("ParallelList", [ elem_ty ])
             | _ -> self_p.cp_ty
+          in
+          let view = { (param self_p) with ty = view_ty } in
+          closure_call (param body_p) [ view ] return_ty)
+  | "parallel" when first_is_vector () && return_is_vector () ->
+      with_vector2 (fun self_p body_p ->
+          let view_ty =
+            Option.value
+              (parallel_vector_view_ty self_p.cp_ty)
+              ~default:self_p.cp_ty
           in
           let view = { (param self_p) with ty = view_ty } in
           closure_call (param body_p) [ view ] return_ty)

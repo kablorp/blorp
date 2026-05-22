@@ -1,0 +1,195 @@
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	system: getenv, now_microseconds
+	vector: ParallelVector, parallel
+
+
+-- Dedicated Vector.parallel benchmark.
+--
+-- Run it under different pool sizes, for example:
+-- BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/vector_parallel.brp -- smoke
+--
+-- Output is intentionally one machine-parseable BENCH line per case.
+-- Fields: operation, size, threads, elapsed_us, allocations, releases,
+-- live_objects, bytes_allocated, checksum.
+pure func checksum_vector[#N](values: Int[#N]) -> Int:
+	var checksum: Int = values.length()
+	for i in 0..values.length():
+		checksum = (checksum * 131 + values[i]) % 1000000007
+	checksum
+
+
+pure func checksum_nested[#N](values: List[Int][#N]) -> Int:
+	var checksum: Int = values.length()
+	for i in 0..values.length():
+		row: List[Int] = values[i]
+		checksum = (checksum * 131 + row.length()) % 1000000007
+		for value in row:
+			checksum = (checksum * 131 + value) % 1000000007
+	checksum
+
+
+pure func heavy_work(seed: Int) -> Int:
+	var acc: Int = seed + 17
+	for i in 0..96:
+		acc = (acc * 1664525 + 1013904223 + seed + i * 97) % 1000003
+	acc
+
+
+pure func single_map[#N](values: Int[#N], other: Int[#N]) -> Int[#N]:
+	values.parallel(pure func(chunk: ParallelVector[Int, #N]):
+		chunk.map(pure func(x: Int) -> Int: heavy_work(x))
+	)
+
+
+pure func map_map[#N](values: Int[#N], other: Int[#N]) -> Int[#N]:
+	values.parallel(pure func(chunk: ParallelVector[Int, #N]):
+		chunk
+			.map(pure func(x: Int) -> Int: heavy_work(x))
+			.map(pure func(x: Int) -> Int: heavy_work(x + 3))
+	)
+
+
+pure func map_indexed_map[#N](values: Int[#N], other: Int[#N]) -> Int[#N]:
+	values.parallel(pure func(chunk: ParallelVector[Int, #N]):
+		chunk
+			.map_indexed(pure func(i: ..#N, x: Int) -> Int: heavy_work(x + i))
+			.map(pure func(x: Int) -> Int: heavy_work(x + 5))
+	)
+
+
+pure func zip_map_map[#N](values: Int[#N], other: Int[#N]) -> Int[#N]:
+	values.parallel(pure func(chunk: ParallelVector[Int, #N]):
+		chunk
+			.zip_map(other, pure func(a: Int, b: Int) -> Int: heavy_work(a + b))
+			.map(pure func(x: Int) -> Int: heavy_work(x + 7))
+	)
+
+
+pure func captured_vector_reused[#N](values: Int[#N], other: Int[#N]) -> Int[#N]:
+	values.parallel(pure func(chunk: ParallelVector[Int, #N]):
+		chunk
+			.zip_map(other, pure func(a: Int, b: Int) -> Int: heavy_work(a + b))
+			.zip_map(other, pure func(a: Int, b: Int) -> Int: heavy_work(a - b))
+			.map(pure func(x: Int) -> Int: heavy_work(x + 11))
+	)
+
+
+pure func managed_result[#N](values: Int[#N], other: Int[#N]) -> List[Int][#N]:
+	values.parallel(pure func(chunk: ParallelVector[Int, #N]):
+		chunk
+			.zip_map(other, pure func(a: Int, b: Int) -> List[Int]:
+				[heavy_work(a), heavy_work(b), a + b]
+			)
+			.map(pure func(row: List[Int]) -> List[Int]: row.append(row.length()))
+	)
+
+
+func emit_bench(
+	operation: String,
+	size: Int,
+	threads: String,
+	elapsed: Int,
+	stats: MemStats,
+	checksum: Int,
+) -> Void:
+	print(
+		"BENCH operation=" + operation + " size=" + size.to_string() + " threads=" + threads + " elapsed_us=" + elapsed.to_string() + " allocations=" + stats.total_allocations.to_string() + " releases=" + stats.total_releases.to_string() + " live_objects=" + stats.current_objects.to_string() + " bytes_allocated=" + stats.bytes_allocated.to_string() + " checksum=" + checksum.to_string(),
+	)
+
+
+func run_case[#N](
+	operation: String,
+	threads: String,
+	iterations: Int,
+	values: Int[#N],
+	other: Int[#N],
+	body: pure (Int[#N], Int[#N]) -> Int[#N],
+) -> Void:
+	reset_mem_stats()
+	start: Int = now_microseconds()
+	var checksum: Int = 0
+	for i in 0..iterations:
+		checksum += checksum_vector(body(values, other))
+	elapsed: Int = now_microseconds() - start
+	stats: MemStats = get_mem_stats()
+	emit_bench(operation, values.length(), threads, elapsed, stats, checksum)
+
+
+func run_managed_case[#N](
+	threads: String,
+	iterations: Int,
+	values: Int[#N],
+	other: Int[#N],
+) -> Void:
+	reset_mem_stats()
+	start: Int = now_microseconds()
+	var checksum: Int = 0
+	for i in 0..iterations:
+		checksum += checksum_nested(managed_result(values, other))
+	elapsed: Int = now_microseconds() - start
+	stats: MemStats = get_mem_stats()
+	emit_bench("managed_result", values.length(), threads, elapsed, stats, checksum)
+
+
+pure func iterations_for_size(size: Int) -> Int:
+	if size <= 64:
+		1000
+	else if size <= 1000:
+		200
+	else:
+		20
+
+
+func run_size(size: #N, threads: String) -> Void:
+	values: Int[#N] = vector(7, size)
+	other: Int[#N] = vector(11, size)
+	iterations: Int = iterations_for_size(size)
+	run_case("single_map", threads, iterations, values, other, pure func(xs: Int[#N], ys: Int[#N]):
+		single_map(xs, ys)
+	)
+	run_case("map_map", threads, iterations, values, other, pure func(xs: Int[#N], ys: Int[#N]):
+		map_map(xs, ys)
+	)
+	run_case("map_indexed_map", threads, iterations, values, other, pure func(
+		xs: Int[#N],
+		ys: Int[#N],
+	):
+		map_indexed_map(xs, ys)
+	)
+	run_case("zip_map_map", threads, iterations, values, other, pure func(xs: Int[#N], ys: Int[#N]):
+		zip_map_map(xs, ys)
+	)
+	run_case(
+		"captured_vector_reused",
+		threads,
+		iterations,
+		values,
+		other,
+		pure func(xs: Int[#N], ys: Int[#N]): captured_vector_reused(xs, ys),
+	)
+	run_managed_case(threads, iterations, values, other)
+
+
+func thread_label() -> String:
+	match getenv("BLORP_THREADS"):
+		Some(value): value
+		None: "auto"
+
+
+func mode_from_args(args: List[String]) -> String:
+	var mode: String = "full"
+	for arg in args:
+		if arg == "smoke" or arg == "full":
+			mode = arg
+	mode
+
+
+func main(args: List[String]) -> Int:
+	threads: String = thread_label()
+	mode: String = mode_from_args(args)
+	run_size(64, threads)
+	run_size(1000, threads)
+	if mode == "full":
+		run_size(120000, threads)
+	0

@@ -37,6 +37,7 @@ for rows marked **Not comparable** or **Blocked**.
 |-----------|--------|-------|
 | `numeric_vector` | Blorp-only | Listed by `bench.sh --list` via `EXTRA_BENCHMARKS` and excluded from the default `all` suite; useful for Blorp numeric/tensor exploration. |
 | `paradigms` | Blorp-only | Listed by `bench.sh --list` via `EXTRA_BENCHMARKS` and excluded from the default `all` suite; current focus is intra-Blorp paradigm comparison. |
+| `vector_parallel` | Blorp-only | Standalone diagnostic benchmark for scoped `Vector.parallel` pipeline shapes. It emits one parseable row per operation with runtime, allocation counters, live objects, retained bytes, and checksum. It is intentionally excluded from `bench.sh` because it compares intra-Blorp pipeline variants rather than languages. |
 
 ## Audit Rules
 

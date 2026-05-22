@@ -625,6 +625,32 @@ face: Int[#3, #4] = t[0]
 
 Single-index subscript peels one dimension. Multi-index subscript returns an element once you provide one index per dimension.
 
+#### Scoped Vector Parallelism
+
+Fixed-size vectors use `Vector.parallel` for parallel shape-preserving
+pipelines. The callback receives a `ParallelVector[T, #N]` view. That scoped
+view exposes only operations that keep the exact same `#N` shape: `map`,
+`map_indexed`, and `zip_map`.
+
+```blorp
+import:
+    vector: ParallelVector, parallel
+
+
+pure func combine[#N](left: Int[#N], right: Int[#N]) -> Int[#N]:
+    left.parallel(pure func(chunk: ParallelVector[Int, #N]):
+        chunk
+            .zip_map(right, pure func(a: Int, b: Int): a + b)
+            .map_indexed(pure func(i: ..#N, value: Int): value + i)
+            .map(pure func(value: Int): value * 2)
+    )
+```
+
+`ParallelVector` intentionally does not support `filter`, `length`, indexing,
+iteration, or conversion back to a normal vector inside the callback. The
+callback returns a `ParallelVector[U, #N]`; `parallel` materializes the result
+as a normal `U[#N]` vector after the pipeline completes.
+
 #### Dimension Arithmetic
 
 Type-level dimension expressions allow computing output shapes from input shapes:

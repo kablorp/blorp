@@ -338,6 +338,7 @@ let type_to_module_paths (ty : Ast.type_expr) : string list =
   | Ast.TyNamed ("StringSlice", _) -> [ "std/slice" ]
   | Ast.TyNamed ("List", _) -> [ "std/list" ]
   | Ast.TyNamed ("ParallelList", _) -> [ "std/parallel_list"; "std/list" ]
+  | Ast.TyNamed ("ParallelVector", _) -> [ "std/parallel_vector"; "std/vector" ]
   | Ast.TyNamed ("Dict", _) -> [ "std/dict" ]
   | Ast.TyNamed ("Set", _) -> [ "std/set" ]
   | Ast.TyArray (_, dims) -> (
