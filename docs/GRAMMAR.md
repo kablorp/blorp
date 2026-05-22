@@ -120,7 +120,7 @@ dim_constraint = dim_expr "==" dim_expr ;
 stmt_list = stmt { NEWLINE stmt } ;
 ```
 
-Compiler-recognized function annotations include `@tailrec` and
+Compiler-recognized function annotations include `@tail_recursive` and
 `@debug_only`. `@debug_only` is declaration metadata: calls and function
 references to that declaration are valid only inside `debug:` blocks, in
 `--debug` builds, or when compiled by `blorp test`. Normal builds erase

@@ -409,7 +409,7 @@ compiler/            # OCaml compiler implementation
     core_trait_resolve.ml  # Trait-method and overloaded-operator rewrite
     core_resolve.ml   # Core IR call kind resolution
     core_std_inline.ml  # Narrow call-site expansion for compiler-owned std wrappers
-    core_tailrec.ml   # @tailrec self-call lowering
+    core_tailrec.ml   # @tail_recursive self-call lowering
     core_string_pipeline.ml  # Core IR string producer/consumer fusion
     core_collection_pipeline.ml  # Core IR collection pipeline fusion
     core_tensor_fusion.ml  # Core IR tensor update fusion
@@ -580,7 +580,7 @@ ch: Channel[Int] = channel(10)
 _ = send(ch, 42)
 ```
 
-### @tailrec
+### @tail_recursive
 Marks a function for tail call optimization. The compiler verifies all recursive calls are in tail position and transforms them into efficient loops.
 
 ### Struct vs Record

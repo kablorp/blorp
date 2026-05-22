@@ -5,7 +5,7 @@
     - Type checks function bodies
     - Verifies pattern matching exhaustiveness
     - Checks purity constraints
-    - Validates @tailrec annotations
+    - Validates @tail_recursive annotations
 *)
 
 open Ast
@@ -4114,7 +4114,7 @@ let rec collect_recursive_calls (func_name : string) (in_tail : bool)
         (collect_recursive_calls func_name false)
         (expr_children expr)
 
-(** Check @tailrec constraint *)
+(** Check @tail_recursive constraint *)
 let check_tailrec (state : check_state) (func : func_decl) : check_state =
   if not func.func_is_tailrec then state
   else
@@ -4128,9 +4128,9 @@ let check_tailrec (state : check_state) (func : func_decl) : check_state =
             add_error s
               (error_at rec_call_loc
                  (Printf.sprintf
-                    "@tailrec function '%s' has recursive call not in tail \
-                     position. The recursive call's result must be returned \
-                     directly, not used in further computation."
+                    "@tail_recursive function '%s' has recursive call not in \
+                     tail position. The recursive call's result must be \
+                     returned directly, not used in further computation."
                     name)))
           state non_tail_calls
     | _ -> state

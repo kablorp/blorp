@@ -1094,7 +1094,7 @@ and print_expr_desc = function
   | EFuncDecl fd ->
       (* Nested function declaration. Re-builds the signature inline
          because [print_func_decl] is a separate top-level binding; the
-         nested form is a subset (no [private] / [@tailrec] / [foreign] /
+         nested form is a subset (no [private] / [@tail_recursive] / [foreign] /
          [builtin] — those are top-level-only affordances). *)
       let pure = if fd.func_is_pure then text "pure " else Nil in
       let name = match fd.func_name with Some n -> n | None -> "" in
@@ -1463,13 +1463,13 @@ let print_docstring doc =
 (** Print a function declaration (top-level or method).
 
     When [is_private] is set, annotations stay on the same line as the
-    [private] modifier and signature ([private @tailrec pure func ...])
+    [private] modifier and signature ([private @tail_recursive pure func ...])
     — the parser rejects splitting [private] off from its signature
     with a newline, so the formatter must not emit that form. *)
 let print_func_decl ?(is_private = false) fd =
   let tailrec_sep = if is_private then text " " else hardline in
   let tailrec =
-    if fd.func_is_tailrec then text "@tailrec" ^^ tailrec_sep else Nil
+    if fd.func_is_tailrec then text "@tail_recursive" ^^ tailrec_sep else Nil
   in
   let debug_only =
     if fd.func_debug_only then text "@debug_only" ^^ tailrec_sep else Nil

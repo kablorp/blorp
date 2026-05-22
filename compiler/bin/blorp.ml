@@ -64,7 +64,9 @@ let func_to_string depth func =
     match func.Ast.func_name with Some n -> n | None -> "<lambda>"
   in
   let pure_str = if func.Ast.func_is_pure then " [pure]" else "" in
-  let tailrec_str = if func.Ast.func_is_tailrec then " [@tailrec]" else "" in
+  let tailrec_str =
+    if func.Ast.func_is_tailrec then " [@tail_recursive]" else ""
+  in
   let ret_str =
     match func.Ast.func_return_type with
     | Some t -> " -> " ^ type_expr_to_string t

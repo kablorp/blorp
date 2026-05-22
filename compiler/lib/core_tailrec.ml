@@ -1,6 +1,6 @@
 (** Core-level lowering for tail-recursive self-calls.
 
-    The type checker verifies source [@tailrec] annotations before Core. Core
+    The type checker verifies source [@tail_recursive] annotations before Core. Core
     does not retain that source annotation, so this pass lowers supported
     resolved self-tail-call shapes into explicit loop IR. Later ownership/reuse
     passes and non-C backends then see the same loop shape. *)

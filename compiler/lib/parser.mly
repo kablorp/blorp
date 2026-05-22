@@ -92,22 +92,42 @@ let func_body_of_expr e =
 let make_binop_span spos epos op left right =
   make_expr_span spos epos (EBinary (op, left, right))
 
+(** Keep function annotations explicit at the parser boundary so misspelled
+    annotations cannot silently become no-ops. *)
+let validate_function_annotations loc annots =
+  let known =
+    [ "tail_recursive"; "no_copy"; "debug_only"; "resource_result_ordinary" ]
+  in
+  List.iter
+    (fun annot ->
+      if not (List.mem annot known) then
+        raise
+          (Parse_error_at
+             ( loc,
+               Printf.sprintf
+                 "unknown function annotation '@%s' (known annotations: \
+                  @tail_recursive, @debug_only, @no_copy, \
+                  @resource_result_ordinary)"
+                 annot )))
+    annots
+
 (** Create a func_decl record — reduces duplication across parser rules *)
-let mk_func ~dim_constraints ~is_pure ~name ~tparams ~params ~ret ~body
+let mk_func ~loc ~dim_constraints ~is_pure ~name ~tparams ~params ~ret ~body
     ~annots =
+  validate_function_annotations loc annots;
   { func_name = name; func_type_params = tparams; func_params = params;
     func_return_type = ret; func_body = body; func_is_pure = is_pure;
-    func_is_tailrec = List.mem "tailrec" annots;
+    func_is_tailrec = List.mem "tail_recursive" annots;
     func_no_copy = List.mem "no_copy" annots;
     func_debug_only = List.mem "debug_only" annots;
     func_resource_result_ordinary =
       List.mem "resource_result_ordinary" annots;
     func_dim_constraints = dim_constraints }
 
-let mk_foreign_func ~is_pure ~fn_name ~params ~ret ~c_name ~annots =
+let mk_foreign_func ~loc ~is_pure ~fn_name ~params ~ret ~c_name ~annots =
   let c_name = match c_name with Some c -> c | None -> fn_name in
   let fd =
-    mk_func ~dim_constraints:[] ~is_pure ~name:(Some fn_name) ~tparams:[]
+    mk_func ~loc ~dim_constraints:[] ~is_pure ~name:(Some fn_name) ~tparams:[]
       ~params ~ret:(Some ret) ~body:FuncNoBody ~annots
   in
   {
@@ -119,7 +139,9 @@ let mk_foreign_func ~is_pure ~fn_name ~params ~ret ~c_name ~annots =
 
 let make_foreign_decl_at pos doc ~is_pure ~fn_name ~params ~ret ~c_name ~annots =
   make_decl_doc_at pos doc
-    (DFunc (mk_foreign_func ~is_pure ~fn_name ~params ~ret ~c_name ~annots))
+    (DFunc
+       (mk_foreign_func ~loc:(loc_of_pos pos) ~is_pure ~fn_name ~params ~ret
+          ~c_name ~annots))
 
 let apply_foreign_block_metadata ~includes ~link_flags decl =
   let apply_to_func fd foreign =
@@ -390,8 +412,8 @@ unsupported_export_decl_start:
 func_decl:
   | annots = annotations p = purity_prefix FUNC fn_name = name type_params = type_params_opt
     params = params ret = return_type_opt wc = where_clause_opt COLON body = func_body
-    { mk_func ~dim_constraints:wc ~is_pure:p ~name:(Some fn_name) ~tparams:type_params
-        ~params ~ret ~body ~annots }
+    { mk_func ~loc:(loc_of_pos $symbolstartpos) ~dim_constraints:wc ~is_pure:p
+        ~name:(Some fn_name) ~tparams:type_params ~params ~ret ~body ~annots }
   (* The [builtin func Name(...)] / [builtin pure func Name(...)] top-level
      declaration form was removed 2026-04-24. It previously declared a
      function signature with no body for env registration (used only by
@@ -410,7 +432,7 @@ annotations:
 (* Inline annotations: identical to [annotations] but without the
    NEWLINE branches, so the surrounding context can require everything
    to live on the same logical line. Used after [PRIVATE] so that
-   `private @tailrec\npure func ...` is rejected — the visibility
+   `private @tail_recursive\npure func ...` is rejected — the visibility
    modifier must sit with its signature. *)
 annotations_inline:
   | (* empty *) { [] }
@@ -421,8 +443,8 @@ annotations_inline:
 func_decl_inline:
   | annots = annotations_inline p = purity_prefix FUNC fn_name = name type_params = type_params_opt
     params = params ret = return_type_opt wc = where_clause_opt COLON body = func_body
-    { mk_func ~dim_constraints:wc ~is_pure:p ~name:(Some fn_name) ~tparams:type_params
-        ~params ~ret ~body ~annots }
+    { mk_func ~loc:(loc_of_pos $symbolstartpos) ~dim_constraints:wc ~is_pure:p
+        ~name:(Some fn_name) ~tparams:type_params ~params ~ret ~body ~annots }
   (* [builtin func] top-level decl form removed 2026-04-24 — see [func_decl]. *)
 
 (* Decls allowed directly under [PRIVATE] — same set as the top-level
@@ -582,13 +604,14 @@ stmt:
   (* Nested function declaration: [pure func name[T](params) -> ret: body]
      appearing inside a block. Produces [EFuncDecl] which the nested-hoist
      pre-infer pass lifts to top level. Same syntax as a top-level func_decl
-     minus the top-level-only affordances (private, @tailrec, foreign,
+     minus the top-level-only affordances (private, @tail_recursive, foreign,
      builtin) — those would mean something different or nothing at all
      inside a body. *)
   | p = purity_prefix FUNC fn_name = name type_params = type_params_opt
     params = params ret = return_type_opt wc = where_clause_opt COLON body = func_body
-    { let fd = mk_func ~dim_constraints:wc ~is_pure:p ~name:(Some fn_name)
-        ~tparams:type_params ~params ~ret ~body ~annots:[] in
+    { let fd = mk_func ~loc:(loc_of_pos $symbolstartpos) ~dim_constraints:wc
+        ~is_pure:p ~name:(Some fn_name) ~tparams:type_params ~params ~ret ~body
+        ~annots:[] in
       make_expr_at $symbolstartpos (EFuncDecl fd) }
   | DEBUG COLON NEWLINE INDENT stmts = stmt_list DEDENT
     { make_expr_at $symbolstartpos (EDebugBlock stmts) }
@@ -927,8 +950,8 @@ impl_method_list_after_newline:
 impl_method:
   | p = purity_prefix FUNC fn_name = name type_params = type_params_opt
     params = params ret = return_type_opt wc = where_clause_opt COLON body = func_body
-    { mk_func ~dim_constraints:wc ~is_pure:p ~name:(Some fn_name) ~tparams:type_params
-        ~params ~ret ~body ~annots:[] }
+    { mk_func ~loc:(loc_of_pos $symbolstartpos) ~dim_constraints:wc ~is_pure:p
+        ~name:(Some fn_name) ~tparams:type_params ~params ~ret ~body ~annots:[] }
 
 (* Type alias declaration *)
 type_alias_decl:
@@ -1412,8 +1435,9 @@ lambda_expr:
   | p = lambda_purity LPAREN ps = trailing_list(COMMA, lambda_param) RPAREN
 	    ret = return_type_opt COLON body = lambda_body
 	    { make_expr_at $symbolstartpos (ELambda (
-	        mk_func ~dim_constraints:[] ~is_pure:p ~name:None ~tparams:[] ~params:ps
-	          ~ret ~body:(FuncBodyExpr body) ~annots:[])) }
+	        mk_func ~loc:(loc_of_pos $symbolstartpos) ~dim_constraints:[]
+	          ~is_pure:p ~name:None ~tparams:[] ~params:ps ~ret
+	          ~body:(FuncBodyExpr body) ~annots:[])) }
 
 lambda_param:
   | name = IDENT COLON ty = type_expr

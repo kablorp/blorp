@@ -114,7 +114,7 @@ Typed AST
     |
     v
 +--------------+
-| Core_tailrec |  Lower supported @tailrec self-calls into explicit Core loops
+| Core_tailrec |  Lower supported @tail_recursive self-calls into explicit Core loops
 +--------------+  (core_tailrec.ml)
     |
     v
@@ -206,7 +206,7 @@ boxing, or ownership behavior from source spelling.
 | `core_trait_resolve.ml` | Trait-method and overloaded-operator rewrite |
 | `core_resolve.ml` | Call kind resolution (builtins, UFCS, closures) |
 | `core_std_inline.ml` | Narrow call-site expansion for compiler-owned std wrappers |
-| `core_tailrec.ml` | `@tailrec` self-call lowering into explicit Core loops |
+| `core_tailrec.ml` | `@tail_recursive` self-call lowering into explicit Core loops |
 | `core_string_pipeline.ml` | Expression-local string producer/consumer fusion |
 | `core_collection_pipeline.ml` | Expression-local collection pipeline fusion |
 | `core_collection_producer.ml` | Shared producer metadata for fused collection construction |
@@ -286,7 +286,7 @@ compiler/
 │   ├── core_trait_resolve.ml # Trait-method and overloaded-operator rewrite
 │   ├── core_resolve.ml    # Core IR call kind resolution (UFCS, builtins, closures)
 │   ├── core_std_inline.ml # Narrow call-site expansion for compiler-owned std wrappers
-│   ├── core_tailrec.ml    # @tailrec self-call lowering
+│   ├── core_tailrec.ml    # @tail_recursive self-call lowering
 │   ├── core_string_pipeline.ml # Expression-local string fusion
 │   ├── core_collection_pipeline.ml # Expression-local collection fusion
 │   ├── core_collection_producer.ml # Shared collection producer metadata
@@ -527,7 +527,7 @@ val typecheck_program : Ast.program -> check_result
 **Validations**:
 - Purity constraints (pure functions cannot call impure)
 - Pattern match exhaustiveness
-- @tailrec tail position validation
+- @tail_recursive tail position validation
 - Nested parallelism detection
 - If condition must be Bool
 

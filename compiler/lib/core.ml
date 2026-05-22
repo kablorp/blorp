@@ -2416,7 +2416,7 @@ type core_func = {
       [cf_link_flags] / [cf_closure_abi]) became one [cf_kind] variant.
       Impossible states — "foreign AND builtin", "closure body without
       ABI" — are now unrepresentable.
-    - [cf_is_tailrec] was deleted. [@tailrec] is
+    - [cf_is_tailrec] was deleted. [@tail_recursive] is
       validated in [Typecheck]; Core lowers supported resolved self-tail-call
       shapes in [Core_tailrec] without retaining the source annotation.
       [@no_copy] is represented by [CFForeign.arg_passing], so later phases

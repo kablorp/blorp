@@ -91,7 +91,7 @@ func max_val[T: Orderable](a: T, b: T) -> T:
         False: b
 
 -- Tail-recursive optimization
-@tailrec
+@tail_recursive
 func factorial(n: Int, acc: Int) -> Int:
     if n <= 1:
         acc
@@ -102,7 +102,7 @@ func factorial(n: Int, acc: Int) -> Int:
 - `func` declares an impure function (can do I/O, call impure functions)
 - `pure func` declares a pure function (no side effects)
 - Return type follows `->`. Body is indented; last expression is the return value
-- `@tailrec` verifies all recursive calls are in tail position. The Core pipeline lowers unmanaged scalar self-recursion to explicit loops, and lowers common list-consumer patterns like `[x, ...rest]` into cursor loops instead of allocating a tail list on every step
+- `@tail_recursive` verifies all recursive calls are in tail position. The Core pipeline lowers unmanaged scalar self-recursion to explicit loops, and lowers common list-consumer patterns like `[x, ...rest]` into cursor loops instead of allocating a tail list on every step
 - `builtin` as a function body indicates a compiler/runtime-provided implementation; `builtin("c_name")` binds std/runtime wrappers to a named C helper
 
 ### Lambdas (Anonymous Functions)
@@ -3161,7 +3161,7 @@ tests/
 
 | Annotation | Applies to | Description |
 |------------|-----------|-------------|
-| `@tailrec` | Functions | Enable tail call optimization |
+| `@tail_recursive` | Functions | Enable tail call optimization |
 | `@debug_only` | Functions | Restrict calls/references to `debug:` blocks, `--debug` builds, and `blorp test` |
 
 ### Environment Variables
