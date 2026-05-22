@@ -730,7 +730,7 @@ let builtin_contract_table =
         (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
       (* String concatenation variants. *)
       builtins
-        [ "blorp_print"; "blorp_puts"; "blorp_println"; "blorp_eprintln" ]
+        [ "blorp_print"; "blorp_puts"; "blorp_println"; "blorp_print_error" ]
         (bfixed [ Borrow ] ReturnVoid);
       builtins [ "blorp_tcp_listen" ]
         (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);

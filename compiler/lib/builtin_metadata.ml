@@ -45,7 +45,7 @@ let descriptors =
     effects "print" [ Impure ];
     effects "puts" [ Impure ];
     effects "println" [ Impure ];
-    effects "eprintln" [ Impure ];
+    effects "print_error" [ Impure ];
     effects "read_file" [ Impure ];
     effects "write_file" [ Impure ];
     effects "read_bytes" [ Impure ];

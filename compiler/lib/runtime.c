@@ -6608,7 +6608,7 @@ void blorp_println(blorp_String* s) {
     putchar('\n');
 }
 
-void blorp_eprintln(blorp_String* s) {
+void blorp_print_error(blorp_String* s) {
     if (s && s->len > 0) {
         fwrite(s->data, 1, s->len, stderr);
     }

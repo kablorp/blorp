@@ -7152,7 +7152,7 @@ void blorp_println(blorp_String* s) {
     putchar('\n');
 }
 
-void blorp_eprintln(blorp_String* s) {
+void blorp_print_error(blorp_String* s) {
     if (s && s->len > 0) {
         fwrite(s->data, 1, s->len, stderr);
     }
@@ -19661,7 +19661,7 @@ blorp_String* __def_171_std_list__join(blorp_List*, blorp_String*);
 blorp_String* __def_172_std_list__string_append(blorp_String*, blorp_String*);
 void __def_223_std_io____print_string(blorp_String*);
 void __def_225_std_io____puts_string(blorp_String*);
-void __def_228_std_io____eprintln_string(blorp_String*);
+void __def_228_std_io____print_error_string(blorp_String*);
 blorp_String* __def_229_std_io__read_line(void);
 blorp_String* __def_230_std_io__read_line_opt(void);
 blorp_String* __def_231_std_io__read_line_or_empty(void);
@@ -21071,8 +21071,8 @@ void __def_225_std_io____puts_string(blorp_String* s) {
     blorp_puts(s);
 }
 
-void __def_228_std_io____eprintln_string(blorp_String* s) {
-    blorp_eprintln(s);
+void __def_228_std_io____print_error_string(blorp_String* s) {
+    blorp_print_error(s);
 }
 
 blorp_String* __def_229_std_io__read_line(void) {

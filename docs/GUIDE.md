@@ -2423,13 +2423,13 @@ and are not part of the standard library.
 `std/prelude.brp` imports a deliberately small surface into every module:
 `Bool`, `Bytes`, `Char`, `Dict`, `Float`, `Float16`, `Float32`, `Int`, `List`,
 `Option(Some, None)`, `Result(Ok, Err)`, `Set`, `String`, plus `print`, `puts`,
-`println`, `eprintln`, `read_line`, and `input`.
+`println`, `print_error`, `read_line`, and `input`.
 
 There are three practical buckets of names available without an explicit import:
 
 1. **Prelude imports** — the types and constructors listed above, plus
    console I/O helpers. `print` / `println` write a trailing newline; `puts`
-   writes without adding one; `eprintln` writes to stderr. `read_line` and
+   writes without adding one; `print_error` writes to stderr. `read_line` and
    `input` return `None` at EOF. On interactive terminals, Ctrl-D produces
    `None` for that read without making later reads immediately return EOF.
 2. **UFCS methods on prelude types** — `xs.map(f)`, `s.split(",")`,

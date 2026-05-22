@@ -76,7 +76,7 @@
 ## System & I/O
 | Module | Description |
 |--------|-------------|
-| `io` | Console I/O (print, eprintln, read_line, input, EOF-aware helpers) |
+| `io` | Console I/O (print, print_error, read_line, input, EOF-aware helpers) |
 | `file` | Typed file API foundation (`IOError`; resource handle anchors; scoped handles in progress) |
 | `system` | File I/O, directory ops, exec |
 | `process` | Safe process spawning with output capture |
