@@ -133,6 +133,12 @@ Typed AST
                    (core_specialize.ml, core_closure.ml)
     |
     v
++----------+
+| Core_dce |  Prune unreachable concrete functions, impl methods, and
++----------+  non-runtime templates/source-only type declarations before ownership insertion
+             (core_dce.ml)
+    |
+    v
 +--------------+
 | Core_perceus |  Insert CDup/CDrop for reference counting (core_perceus.ml)
 +--------------+  Koka-style precise RC: branch-aware, last-use semantics
@@ -217,6 +223,7 @@ boxing, or ownership behavior from source spelling.
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
+| `core_dce.ml` | Conservative Core declaration dead-code elimination before ownership insertion |
 | `core_resource.ml` | Explicit resource cleanup exits for nonlocal loop control |
 | `core_codegen_prepare.ml` | Final Core preparation: explicit constructors, box/unbox, and release/layout facts |
 | `core_erased_storage_layout.ml` | Late-Core classification for typed values crossing erased `void*` storage |
@@ -656,7 +663,8 @@ Unified CLI with subcommands:
 ./blorp check file.brp           # Type check one file
 ./blorp check src/               # Type check .brp files recursively
 ./blorp compile --ast file.brp   # Print AST
-./blorp run program.brp          # Compile and run
+./blorp run program.brp          # Compile and run quickly (-O0)
+./blorp run --release program.brp # Compile and run optimized (-O2)
 ./blorp test tests/              # Run test suite
 ```
 

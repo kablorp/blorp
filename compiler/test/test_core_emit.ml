@@ -4273,7 +4273,10 @@ pure func show_shape() -> String:
     to_string(Circle)
 
 func main(args: List[String]) -> Int:
-    0
+    if show_shape() == "circle":
+        0
+    else:
+        1
 |}
         in
         Blorp.Lexer.reset_state ();

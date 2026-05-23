@@ -12,6 +12,9 @@ let () =
         (fun (name, cases) -> ("TypedAstDebug." ^ name, cases))
         Test_typed_ast_debug.suite
     @ List.map
+        (fun (name, cases) -> ("CompileProfile." ^ name, cases))
+        Test_compile_profile.suite
+    @ List.map
         (fun (name, cases) -> ("LspHover." ^ name, cases))
         Test_lsp_hover.suite
     @ List.map
@@ -105,6 +108,9 @@ let () =
     @ List.map
         (fun (name, cases) -> ("CoreSpecialize." ^ name, cases))
         Test_core_specialize.suite
+    @ List.map
+        (fun (name, cases) -> ("CoreDce." ^ name, cases))
+        Test_core_dce.suite
     @ List.map
         (fun (name, cases) -> ("CoreCodegenPrepare." ^ name, cases))
         Test_core_codegen_prepare.suite

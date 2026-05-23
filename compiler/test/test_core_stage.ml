@@ -37,6 +37,7 @@ let test_of_string_canonical () =
   check_ok "tailrec" "tailrec";
   check_ok "fusion" "fusion";
   check_ok "specialize" "specialize";
+  check_ok "dce" "dce";
   check_ok "perceus" "perceus";
   check_ok "reuse" "reuse";
   check_ok "closure" "closure";
@@ -114,7 +115,7 @@ let test_of_string_list_empty_element () =
 
 let test_all_covers_every_stage () =
   let all = Core_stage.all in
-  Alcotest.(check int) "stage count" 16 (List.length all);
+  Alcotest.(check int) "stage count" 17 (List.length all);
   (* Round-trip every stage through to_string / of_string *)
   List.iter
     (fun s ->
@@ -145,6 +146,7 @@ let test_order_matches_pipeline () =
       "tailrec";
       "fusion";
       "specialize";
+      "dce";
       "perceus";
       "reuse";
       "closure";

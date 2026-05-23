@@ -3149,6 +3149,7 @@ tests/
 | `./blorp compile <file>` | Compile .brp to generated C |
 | `./blorp compile --ast <file>` | Print AST |
 | `./blorp run <file>` | Compile and run |
+| `./blorp run --release <file>` | Compile and run with optimized generated C |
 | `./blorp run <file> -- args...` | Run with CLI arguments |
 | `./blorp test <path>` | Run test file or directory |
 | `./blorp test --doc <path>` | Run only doctests |
@@ -3170,6 +3171,7 @@ tests/
 | `--time-phases` | compile | Print compiler phase wall-clock timings |
 | `--debug` | compile, run, test, repl | Enable debug mode |
 | `--profile` | run, test | Show timing information |
+| `--release` | run | Compile generated C with `-O2`; default `run` uses `-O0` for fast edit-run cycles |
 | `--threads N` | run | Set max thread pool size |
 | `--timeout N` | run, test | Kill after N seconds (`test` defaults to 30; `0` disables) |
 | `--sanitize` | run, test | Enable AddressSanitizer + UBSan |

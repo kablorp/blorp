@@ -25,6 +25,7 @@ type t =
   | Tailrec
   | Fusion
   | Specialize
+  | Dce
   | Perceus
   | Reuse
   | Closure
@@ -50,6 +51,7 @@ let all =
     Tailrec;
     Fusion;
     Specialize;
+    Dce;
     Perceus;
     Reuse;
     Closure;
@@ -69,6 +71,7 @@ let to_string = function
   | Tailrec -> "tailrec"
   | Fusion -> "fusion"
   | Specialize -> "specialize"
+  | Dce -> "dce"
   | Perceus -> "perceus"
   | Reuse -> "reuse"
   | Closure -> "closure"
@@ -127,6 +130,7 @@ let of_string s =
   | "tailrec" -> Ok Tailrec
   | "fusion" -> Ok Fusion
   | "specialize" -> Ok Specialize
+  | "dce" -> Ok Dce
   | "perceus" -> Ok Perceus
   | "reuse" -> Ok Reuse
   | "closure" -> Ok Closure

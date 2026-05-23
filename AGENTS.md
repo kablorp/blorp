@@ -172,7 +172,7 @@ either work or produce a helpful message.
     core_mono → core_synth → core_match →
     core_trait_resolve → core_resolve → core_std_inline → core_tailrec →
     core_string_pipeline + core_collection_pipeline + core_tensor_fusion + core_tuple_sroa →
-    core_specialize → core_perceus → core_reuse → core_closure → backend emit
+    core_specialize → core_dce → core_perceus → core_reuse → core_closure → backend emit
 
 Don't put type-checking logic in Core IR passes or parsing constraints in
 type-checking. If a check belongs in an earlier phase, move it there. If it must stay in a
@@ -331,6 +331,9 @@ The compiler uses subcommands. Run `./blorp --help` for full usage.
 # Compile and run
 ./blorp run program.brp
 
+# Compile and run with optimized generated C
+./blorp run --release program.brp
+
 # Compile and run with CLI arguments
 ./blorp run program.brp -- arg1 arg2 arg3
 
@@ -415,6 +418,7 @@ compiler/            # OCaml compiler implementation
     core_tensor_fusion.ml  # Core IR tensor update fusion
     core_tuple_sroa.ml  # Core IR non-escaping local tuple scalar replacement
     core_specialize.ml  # Core IR type-dispatch builtins → CCast / concrete names
+    core_dce.ml     # Core IR dead concrete function pruning
     core_perceus.ml   # Core IR Perceus RC insertion
     core_reuse.ml     # Core IR post-Perceus reuse eligibility analysis
     core_closure.ml   # Core IR closure conversion / lambda hoisting

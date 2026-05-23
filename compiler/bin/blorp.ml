@@ -5,6 +5,7 @@
       blorp compile --no-emit program.brp # Type check only
       blorp compile --ast program.brp    # Show AST only
       blorp run program.brp              # Compile and run
+      blorp run --release program.brp    # Compile and run optimized
       blorp run --profile program.brp    # Run with profiling
       blorp check src/                   # Type check all .brp files in directory
       blorp test tests/test.brp          # Run a single test
@@ -655,13 +656,13 @@ let compile_file_with_opts opts filename =
 
 (** Compile and run a blorp file *)
 let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?(leak_check = false) ~timeout ?(no_format = false) ?(user_args = [])
-    filename =
+    ?(leak_check = false) ?(run_mode = Compile_profile.Fast) ~timeout
+    ?(no_format = false) ?(user_args = []) filename =
   Test_runner.with_run_artifacts (fun () ->
       if not no_format then auto_format_user_file filename;
       let source = read_file filename in
       init_module_paths (extract_directory filename);
-      let opt = if sanitize then "O0" else "O2" in
+      let opt = Compile_profile.opt_level_for_run ~sanitize run_mode in
       let precompiled = Test_runner.precompile_runtime ~sanitize ~opt () in
       let embed_runtime = precompiled = None in
       match
@@ -1274,14 +1275,15 @@ let () =
             prerr_endline "Error: Multiple input files not supported";
             exit 1)
     | "run" :: rest -> (
-        let rec parse_run_args args profile debug sanitize leak_check no_format
-            timeout threads std_dir files user_args =
+        let rec parse_run_args args profile debug sanitize leak_check release
+            no_format timeout threads std_dir files user_args =
           match args with
           | [] ->
               ( profile,
                 debug,
                 sanitize,
                 leak_check,
+                release,
                 no_format,
                 timeout,
                 threads,
@@ -1293,6 +1295,7 @@ let () =
               print_endline "";
               print_endline "Options:";
               print_endline "  --profile      Run with profiling";
+              print_endline "  --release      Compile generated C with -O2";
               print_endline "  --debug        Enable debug functions";
               print_endline
                 "  --sanitize     Compile with AddressSanitizer + UBSan";
@@ -1307,6 +1310,7 @@ let () =
                 debug,
                 sanitize,
                 leak_check,
+                release,
                 no_format,
                 timeout,
                 threads,
@@ -1314,27 +1318,30 @@ let () =
                 List.rev files,
                 rest )
           | "--profile" :: rest ->
-              parse_run_args rest true debug sanitize leak_check no_format
-                timeout threads std_dir files user_args
+              parse_run_args rest true debug sanitize leak_check release
+                no_format timeout threads std_dir files user_args
+          | "--release" :: rest ->
+              parse_run_args rest profile debug sanitize leak_check true
+                no_format timeout threads std_dir files user_args
           | "--debug" :: rest ->
-              parse_run_args rest profile true sanitize leak_check no_format
-                timeout threads std_dir files user_args
+              parse_run_args rest profile true sanitize leak_check release
+                no_format timeout threads std_dir files user_args
           | "--sanitize" :: rest ->
-              parse_run_args rest profile debug true leak_check no_format
-                timeout threads std_dir files user_args
+              parse_run_args rest profile debug true leak_check release
+                no_format timeout threads std_dir files user_args
           | "--leak-check" :: rest ->
-              parse_run_args rest profile debug sanitize true no_format timeout
-                threads std_dir files user_args
+              parse_run_args rest profile debug sanitize true release no_format
+                timeout threads std_dir files user_args
           | "--no-format" :: rest ->
-              parse_run_args rest profile debug sanitize leak_check true timeout
-                threads std_dir files user_args
+              parse_run_args rest profile debug sanitize leak_check release true
+                timeout threads std_dir files user_args
           | "--std-dir" :: dir :: rest ->
-              parse_run_args rest profile debug sanitize leak_check no_format
-                timeout threads (Some dir) files user_args
+              parse_run_args rest profile debug sanitize leak_check release
+                no_format timeout threads (Some dir) files user_args
           | "--timeout" :: n :: rest -> (
               match int_of_string_opt n with
               | Some v ->
-                  parse_run_args rest profile debug sanitize leak_check
+                  parse_run_args rest profile debug sanitize leak_check release
                     no_format (Some v) threads std_dir files user_args
               | None ->
                   prerr_endline "Error: --timeout requires an integer";
@@ -1342,31 +1349,36 @@ let () =
           | "--threads" :: n :: rest -> (
               match int_of_string_opt n with
               | Some v ->
-                  parse_run_args rest profile debug sanitize leak_check
+                  parse_run_args rest profile debug sanitize leak_check release
                     no_format timeout (Some v) std_dir files user_args
               | None ->
                   prerr_endline "Error: --threads requires an integer";
                   exit 1)
           | file :: rest ->
-              parse_run_args rest profile debug sanitize leak_check no_format
-                timeout threads std_dir (file :: files) user_args
+              parse_run_args rest profile debug sanitize leak_check release
+                no_format timeout threads std_dir (file :: files) user_args
         in
         let ( profile,
               debug,
               cli_sanitize,
               cli_leak_check,
+              cli_release,
               cli_no_format,
               cli_timeout,
               cli_threads,
               std_dir,
               files,
               user_args ) =
-          parse_run_args rest false false false false false None None None [] []
+          parse_run_args rest false false false false false false None None None
+            [] []
         in
         let timeout = resolve_timeout cli_timeout in
         let sanitize = resolve_sanitize cli_sanitize in
         let leak_check = resolve_leak_check cli_leak_check in
         let no_format = resolve_no_format cli_no_format in
+        let run_mode =
+          if cli_release then Compile_profile.Release else Compile_profile.Fast
+        in
         (match std_dir with
         | Some dir -> Modules.set_std_override dir
         | None -> ());
@@ -1376,7 +1388,7 @@ let () =
         match files with
         | [ file ] ->
             exit
-              (run_file ~profile ~debug ~sanitize ~leak_check ~timeout
+              (run_file ~profile ~debug ~sanitize ~leak_check ~timeout ~run_mode
                  ~no_format ~user_args file)
         | [] ->
             prerr_endline "Error: No input file specified";

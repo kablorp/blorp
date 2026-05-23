@@ -2036,7 +2036,7 @@ let check_tensor_loop_storage_provenance_at (stage : Core_stage.t)
 let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
     Core_error.t list =
   match stage with
-  | Core_stage.Specialize ->
+  | Core_stage.Specialize | Core_stage.Dce ->
       check_no_ckunknown_at stage prog
       @ check_no_layoutless_list_alloc_at stage prog
       @ check_raw_tensor_views_at stage prog

@@ -18,11 +18,14 @@
        tuple-return call sites
     12. [Core_specialize] + function-ref adaptation — type-dispatch builtins
        to CCast / concrete names; make eta adapters visible to Perceus
-    13. [Core_perceus] — insert CDup/CDrop for reference counting
-    14. [Core_reuse] — analyze post-Perceus reuse candidates
-    15. [Core_closure] — hoist lambdas and create closure values
-    16. [Core_resource] — make resource cleanup before nonlocal loop exits explicit
-    17. [Core_emit_c] — Core IR → C string via the default backend
+    13. [Core_dce] — prune unreachable concrete functions, impl methods,
+       non-runtime generic function/impl templates, and source-only type
+       declarations
+    14. [Core_perceus] — insert CDup/CDrop for reference counting
+    15. [Core_reuse] — analyze post-Perceus reuse candidates
+    16. [Core_closure] — hoist lambdas and create closure values
+    17. [Core_resource] — make resource cleanup before nonlocal loop exits explicit
+    18. [Core_emit_c] — Core IR → C string via the default backend
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -68,6 +71,7 @@ let transform_stage_order =
     Core_stage.Tailrec;
     Core_stage.Fusion;
     Core_stage.Specialize;
+    Core_stage.Dce;
     Core_stage.Perceus;
     Core_stage.Reuse;
     Core_stage.Closure;
@@ -190,6 +194,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
       p
       |> Core_specialize.specialize_program ~reg
       |> Core_closure.adapt_function_refs_program)
+  |> run_stage Core_stage.Dce (Core_dce.prune_unreachable_declarations ~reg)
   |> run_stage Core_stage.Perceus Core_perceus.insert_drops_program
   |> run_stage Core_stage.Reuse (Core_reuse.rewrite_program ~reg)
   |> run_stage Core_stage.Closure
