@@ -412,6 +412,23 @@ let completions_from_local_scope ?(skip = fun _ -> false) (program : program)
                 |> List.iter (fun name -> add name "pattern binding");
               collect_expr case.case_body)
             cases
+      | ESelect arms ->
+          List.iter
+            (fun arm ->
+              match arm.select_arm_kind with
+              | SelectRecv { select_bind; select_channel } ->
+                  collect_expr select_channel;
+                  if
+                    loc_starts_before_cursor arm.select_arm_loc ~line ~character
+                  then add select_bind "select binding";
+                  collect_expr arm.select_arm_body
+              | SelectAfter timeout ->
+                  collect_expr timeout;
+                  collect_expr arm.select_arm_body
+              | SelectSealed channel ->
+                  collect_expr channel;
+                  collect_expr arm.select_arm_body)
+            arms
       | ELambda _ | EFuncDecl _ -> ()
       | _ -> List.iter collect_expr (expr_children expr)
   in

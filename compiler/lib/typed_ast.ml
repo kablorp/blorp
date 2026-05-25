@@ -104,6 +104,17 @@ type with_binding = {
   with_kind : with_binding_kind;
 }
 
+type select_arm = {
+  select_arm_kind : select_arm_kind;
+  select_arm_body : expr;
+  select_arm_loc : Ast.loc;
+}
+
+and select_arm_kind =
+  | SelectRecv of { select_bind : string; select_channel : expr }
+  | SelectAfter of expr
+  | SelectSealed of expr
+
 type expr_desc =
   | EIdent of string
   | ELiteral of Ast.literal
@@ -142,6 +153,7 @@ type expr_desc =
   | EQuestionBind of string * Ast.type_expr option * expr
   | EWith of with_binding * expr
   | EDebugBlock of expr list
+  | ESelect of select_arm list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr
   | EConcurrentFor of
@@ -806,6 +818,37 @@ let expr_desc (expr : expr) =
   | Ast.EDebugBlock exprs ->
       let* exprs = typed_children exprs in
       Ok (EDebugBlock exprs)
+  | Ast.ESelect arms ->
+      let convert_arm arm =
+        let* select_arm_kind =
+          match arm.Ast.select_arm_kind with
+          | Ast.SelectRecv { select_bind; select_channel } ->
+              let* select_channel = typed_child select_channel in
+              Ok (SelectRecv { select_bind; select_channel })
+          | Ast.SelectAfter timeout ->
+              let* timeout = typed_child timeout in
+              Ok (SelectAfter timeout)
+          | Ast.SelectSealed channel ->
+              let* channel = typed_child channel in
+              Ok (SelectSealed channel)
+        in
+        let* select_arm_body = typed_child arm.select_arm_body in
+        Ok
+          {
+            select_arm_kind;
+            select_arm_body;
+            select_arm_loc = arm.select_arm_loc;
+          }
+      in
+      let* arms =
+        List.fold_right
+          (fun arm acc ->
+            let* rest = acc in
+            let* arm = convert_arm arm in
+            Ok (arm :: rest))
+          arms (Ok [])
+      in
+      Ok (ESelect arms)
   | Ast.EConcurrent (exprs, timeout, max_threads) ->
       let* exprs = typed_children exprs in
       let* timeout = typed_child_opt timeout in

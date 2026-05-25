@@ -727,6 +727,7 @@ and desc =
   | CConcurrent of concurrent_block  (** [concurrent: { ... }] *)
   | CConcurrentFor of concurrent_for  (** [concurrent for v in iter { ... }] *)
   | CDetach of detach_expr  (** [detach expr] *)
+  | CSelect of select_expr  (** [select: ...] channel/timer wait. *)
   (* === Type operations (inserted by Core_specialize) === *)
   | CCast of core * Ast.type_expr
       (** Numeric type coercion, e.g.
@@ -1068,12 +1069,27 @@ and concurrent_block = {
   conc_max_threads : int option;
 }
 
+and concurrent_for_width =
+  | ConcurrentForLimit of core
+      (** [for ... concurrently(limit: expr)]. The parser currently admits only
+          positive integer literals for source loops, but synthesized Core can
+          carry a typed Int expression for helpers such as [List.concurrent]. *)
+
+and concurrent_for_output =
+  | ConcurrentForCollect
+      (** The loop is a value expression and produces
+          [List[Result[T, ConcurrencyError]]]. *)
+  | ConcurrentForDiscard
+      (** The loop is statement fan-out and produces [Void]. Child task body
+          values are sequenced for effect and discarded before task completion. *)
+
 and concurrent_for = {
   cf_var : var;
   cf_iter : core;
   cf_body : core;
   cf_timeout : core option;
-  cf_width : Ast.concurrent_for_width;
+  cf_width : concurrent_for_width;
+  cf_output : concurrent_for_output;
   cf_task_scope : concurrent_task_scope;
   cf_task : task_closure option;
       (** Core-visible per-iteration task closure metadata after
@@ -1081,6 +1097,23 @@ and concurrent_for = {
 }
 
 and detach_expr = { detach_body : core; detach_task : task_closure option }
+
+and select_arm_kind =
+  | SelectRecv of {
+      select_bind : var;
+      select_elem_ty : Ast.type_expr;
+      select_channel : core;
+    }
+  | SelectSealed of core
+  | SelectAfter of core
+
+and select_arm = {
+  select_arm_kind : select_arm_kind;
+  select_arm_body : core;
+  select_arm_loc : Ast.loc;
+}
+
+and select_expr = { select_arms : select_arm list }
 
 (* ============================================================================
    Smart constructors
@@ -1122,6 +1155,9 @@ let synthetic_concurrent_task_scope =
 (* ============================================================================
    Traversal
    ============================================================================ *)
+
+let map_concurrent_for_width f = function
+  | ConcurrentForLimit limit -> ConcurrentForLimit (f limit)
 
 (** [map_children f e] applies [f] to each immediate child of [e] and
     rebuilds the node. Does not recurse — caller decides when to go deep.
@@ -1293,11 +1329,24 @@ let rec map_children (f : core -> core) (e : core) : core =
             cf_iter = f cf.cf_iter;
             cf_body = f cf.cf_body;
             cf_timeout = Option.map f cf.cf_timeout;
-            cf_width = cf.cf_width;
+            cf_width = map_concurrent_for_width f cf.cf_width;
+            cf_output = cf.cf_output;
             cf_task_scope = cf.cf_task_scope;
             cf_task = cf.cf_task;
           }
     | CDetach d -> CDetach { d with detach_body = f d.detach_body }
+    | CSelect select ->
+        let map_arm arm =
+          let select_arm_kind =
+            match arm.select_arm_kind with
+            | SelectRecv r ->
+                SelectRecv { r with select_channel = f r.select_channel }
+            | SelectSealed channel -> SelectSealed (f channel)
+            | SelectAfter timeout -> SelectAfter (f timeout)
+          in
+          { arm with select_arm_kind; select_arm_body = f arm.select_arm_body }
+        in
+        CSelect { select_arms = List.map map_arm select.select_arms }
     | CCast (x, ty) -> CCast (f x, ty)
     | CUnbox (x, ty) -> CUnbox (f x, ty)
     | CUnboxTyped u -> CUnboxTyped (map_unbox_op u)
@@ -1976,9 +2025,32 @@ let rec pp_to_string (e : core) : string =
         (String.concat "; " bind_strs)
         (pp_to_string blk.conc_body)
   | CConcurrentFor cf ->
-      Printf.sprintf "concurrent for %s in %s { %s }" (Var.to_string cf.cf_var)
-        (pp_to_string cf.cf_iter) (pp_to_string cf.cf_body)
+      let output =
+        match cf.cf_output with
+        | ConcurrentForCollect -> "collect"
+        | ConcurrentForDiscard -> "discard"
+      in
+      Printf.sprintf "concurrent for[%s] %s in %s { %s }" output
+        (Var.to_string cf.cf_var) (pp_to_string cf.cf_iter)
+        (pp_to_string cf.cf_body)
   | CDetach d -> Printf.sprintf "detach %s" (pp_to_string d.detach_body)
+  | CSelect select ->
+      let arm_to_string arm =
+        let head =
+          match arm.select_arm_kind with
+          | SelectRecv r ->
+              Printf.sprintf "%s from %s"
+                (Var.to_string r.select_bind)
+                (pp_to_string r.select_channel)
+          | SelectSealed channel ->
+              Printf.sprintf "sealed %s" (pp_to_string channel)
+          | SelectAfter timeout ->
+              Printf.sprintf "_ after %s" (pp_to_string timeout)
+        in
+        Printf.sprintf "%s { %s }" head (pp_to_string arm.select_arm_body)
+      in
+      Printf.sprintf "select { %s }"
+        (String.concat "; " (List.map arm_to_string select.select_arms))
   | CCast (x, ty) ->
       Printf.sprintf "cast<%s>(%s)" (Types.type_to_string ty) (pp_to_string x)
   | CUnbox (x, ty) ->
@@ -2124,9 +2196,9 @@ let pp_to_string_indented (e : core) : string =
     | CStringSetLen _ | CVector _ | CTensorLiteral _ | CDict _
     | CDictConstruct _ | CSetAlloc _ | CRecord _ | CRecordConstruct _
     | CRecordUpdate _ | CRange _ | CStringInterp _ | CAssign _ | CConcurrent _
-    | CConcurrentFor _ | CDetach _ | CCast _ | CUnbox _ | CUnboxTyped _ | CBox _
-    | CBoxTyped _ | CUnionConstruct _ | CResourceCleanupExit _ | CTailrecRecur _
-      ->
+    | CConcurrentFor _ | CDetach _ | CSelect _ | CCast _ | CUnbox _
+    | CUnboxTyped _ | CBox _ | CBoxTyped _ | CUnionConstruct _
+    | CResourceCleanupExit _ | CTailrecRecur _ ->
         p ^ pp_to_string e
     | CTailrecLoop (TailrecUnmanagedLoop l) ->
         Printf.sprintf "%stailrec-loop[unmanaged] {\n%s\n%s}" p

@@ -36,8 +36,9 @@ continues the previous expression instead of starting an indented block.
 func   pure   var   union   enum   record   struct   void
 while  for    in    if      else   and      or       not
 break  continue    match   import   as       private
-debug  resource     borrow       implements   trait   Self   type   alias
+debug  resource     implements   trait   Self   type   alias
 builtin    foreign      concurrent    concurrently    detach      where
+select     from         after         sealed
 True   False
 ```
 
@@ -156,19 +157,13 @@ Inference section of GUIDE.md for details.
 params = "(" [ param { "," param } [ "," ] ] ")" ;
 
 param = IDENT ":" type_expr                     (* named with type *)
-      | IDENT ":" "borrow" type_expr            (* borrowed resource parameter *)
       | IDENT                                   (* named, type inferred *)
       | "_"                                     (* discard *)
       | "_" ":" type_expr                       (* discard with type *)
-      | "_" ":" "borrow" type_expr              (* discarded borrowed resource *)
       | tuple_param [ ":" type_expr ] ;         (* 2-4 element tuple destructure *)
 
 tuple_param = "(" IDENT "," IDENT [ "," IDENT [ "," IDENT ] ] [ "," ] ")" ;
 ```
-
-`borrow` parameters are only valid on source functions with bodies. They must
-name a direct `resource type`, and the function body must return ordinary data,
-not a resource or a value derived from the borrowed resource.
 
 ### Statements
 
@@ -404,6 +399,7 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING | TRIPLE_STRING
              | "{" vector_elems "}"                         (* vector literal *)
              | if_expr
              | match_expr
+             | select_expr
              | with_expr
              | concurrent_expr
              | detach_expr ;
@@ -433,13 +429,19 @@ match_expr = "match" expr ":" NEWLINE INDENT match_cases DEDENT ;
 match_cases = match_case { NEWLINE match_case } ;
 match_case  = pattern ":" ( expr | NEWLINE INDENT stmt_list DEDENT ) ;
 
+select_expr = "select" ":" NEWLINE INDENT select_arms DEDENT ;
+
+select_arms = select_arm { NEWLINE select_arm } ;
+select_arm  = destruct_id "from" expr ":" NEWLINE INDENT stmt_list DEDENT
+            | "sealed" expr ":" NEWLINE INDENT stmt_list DEDENT
+            | "_" "after" expr ":" NEWLINE INDENT stmt_list DEDENT ;
+
 with_expr = "with" with_binding ":" NEWLINE INDENT stmt_list DEDENT ;
 with_binding = destruct_id [ ":" type_expr ] ( "=" | "?=" ) expr ;
 
 debug_block = "debug" ":" NEWLINE INDENT stmt_list DEDENT ;
 
 concurrent_expr = "concurrent" [ "(" concurrent_params ")" ] ":" NEWLINE INDENT stmt_list DEDENT
-                | "concurrent" [ "(" concurrent_params ")" ] "for" IDENT "in" expr ":" NEWLINE INDENT stmt_list DEDENT
                 | "for" IDENT "in" expr "concurrently" "(" concurrently_params ")" ":" NEWLINE INDENT stmt_list DEDENT ;
 
 concurrent_params = concurrent_param [ "," concurrent_param ] ;
@@ -454,6 +456,12 @@ detach_expr = "detach" unary_expr ;
 
 `debug_block` returns `Void`. Normal builds erase the body after Core lowering;
 `--debug` builds and `blorp test` retain it.
+
+`select_expr` is statement-only and impure. Receive and sealed arms currently
+accept `Channel[T]`; `after` arms accept an integer millisecond timeout or
+`Duration`. A receive arm runs only when it receives a value. A sealed arm runs
+once the channel is sealed and drained. If several arms are ready, runtime scan
+order rotates across `select` calls to avoid permanent starvation.
 
 `with_expr` is active syntax for scoped resources. The acquired value must have
 a `resource type`; the `?=` form unwraps an `Option`/`Result` resource carrier
@@ -504,7 +512,6 @@ lambda_body = or_expr | NEWLINE INDENT stmt_list DEDENT ;
 `func` and `pure func` are the canonical lambda spellings used in public
 examples. The parser currently accepts bare `pure (...)` as a compatibility
 spelling for pure lambdas; new code should prefer `pure func(...)`.
-Lambdas do not accept `borrow` parameters.
 
 ### Names
 
@@ -512,7 +519,8 @@ Certain keywords can be used as identifiers in field/function name position:
 
 ```ebnf
 name = IDENT | "debug" | "and" | "or" | "not" | "type" | "match" | "if" | "else"
-     | "True" | "False" | "in" | "for" | "while" | "foreign" ;
+     | "True" | "False" | "in" | "for" | "while" | "foreign"
+     | "select" | "from" | "after" | "sealed" ;
 ```
 
 ## Operator Precedence (lowest to highest)

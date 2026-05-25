@@ -42,7 +42,6 @@ let param ?(ty = Some ty_int) name =
     param_name = Some name;
     param_pattern = None;
     param_type = ty;
-    param_passing = ParamByValue;
     param_loc = dummy_loc;
   }
 

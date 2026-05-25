@@ -503,9 +503,14 @@ let test_channel_runtime_builtins_have_ownership_contracts () =
   expect_builtin_contract "blorp_channel_try_send" [ borrow; retain ] ret_prim;
   expect_builtin_contract "blorp_channel_try_send_status" [ borrow; retain ]
     ret_prim;
+  expect_builtin_contract "blorp_channel_try_send_attempt" [ borrow; retain ]
+    ret_owned;
+  expect_builtin_contract "blorp_channel_try_recv_attempt" [ borrow ] ret_owned;
   expect_builtin_contract "blorp_channel_recv_timeout" [ borrow; borrow ]
     ret_owned;
   expect_builtin_contract "blorp_channel_recv_timeout_nullable"
+    [ borrow; borrow ] ret_owned;
+  expect_builtin_contract "blorp_channel_recv_timeout_attempt"
     [ borrow; borrow ] ret_owned;
   List.iter
     (fun name -> expect_builtin_contract name [ borrow; borrow ] ret_prim)
@@ -529,6 +534,10 @@ let test_channel_runtime_builtins_have_ownership_contracts () =
     [ borrow; retain; borrow ] ret_prim;
   expect_builtin_contract "blorp_channel_send_timeout_status"
     [ borrow; retain; borrow ] ret_prim;
+  expect_builtin_contract "blorp_channel_send_timeout_attempt"
+    [ borrow; retain; borrow ] ret_owned;
+  expect_builtin_contract "blorp_channel_seal" [ borrow ]
+    Core_ownership.ReturnVoid;
   expect_builtin_contract "blorp_channel_close" [ borrow ]
     Core_ownership.ReturnVoid
 

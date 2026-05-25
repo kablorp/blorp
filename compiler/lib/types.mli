@@ -200,6 +200,10 @@ val is_any_integer_type : type_expr -> bool
     Follows [TyMeta] one hop via the ambient session so pre-zonk
     callers get the right answer without explicit threading. *)
 
+val is_std_duration_type : type_expr -> bool
+(** Check if a type is the std/units Duration type. Follows [TyMeta] one hop
+    via the ambient session, matching the integer predicate behavior above. *)
+
 val is_signed_integer_type : type_expr -> bool
 (** Check if a type is a signed integer type. *)
 

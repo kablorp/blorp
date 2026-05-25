@@ -131,6 +131,24 @@ let test_channel_send_status_retains_payloads () =
     { args = [ Borrow; Retain; Borrow ]; result = ReturnPrimitive }
     (builtin_contract "blorp_channel_send_timeout_status" 3)
 
+let test_channel_send_attempt_retains_payloads () =
+  check_contract "blorp_channel_try_send_attempt"
+    { args = [ Borrow; Retain ]; result = ReturnOwned }
+    (builtin_contract "blorp_channel_try_send_attempt" 2);
+  check_contract "blorp_channel_send_timeout_attempt"
+    { args = [ Borrow; Retain; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_channel_send_timeout_attempt" 3)
+
+let test_channel_try_recv_attempt_borrows_channel () =
+  check_contract "blorp_channel_try_recv_attempt"
+    { args = [ Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_channel_try_recv_attempt" 1)
+
+let test_channel_recv_timeout_attempt_borrows_channel () =
+  check_contract "blorp_channel_recv_timeout_attempt"
+    { args = [ Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_channel_recv_timeout_attempt" 2)
+
 let test_fixed_constructors_allocate_owned_fixed () =
   let expected = { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned } in
   check_contract "blorp_fixed_new" expected
@@ -888,6 +906,12 @@ let suite =
           test_channel_new_allocates_owned_channel;
         Alcotest.test_case "channel_send_status_retains_payloads" `Quick
           test_channel_send_status_retains_payloads;
+        Alcotest.test_case "channel_send_attempt_retains_payloads" `Quick
+          test_channel_send_attempt_retains_payloads;
+        Alcotest.test_case "channel_try_recv_attempt_borrows_channel" `Quick
+          test_channel_try_recv_attempt_borrows_channel;
+        Alcotest.test_case "channel_recv_timeout_attempt_borrows_channel" `Quick
+          test_channel_recv_timeout_attempt_borrows_channel;
         Alcotest.test_case "fixed_constructors_allocate_owned_fixed" `Quick
           test_fixed_constructors_allocate_owned_fixed;
         Alcotest.test_case "custom_dict_set_constructors_borrow_callbacks"

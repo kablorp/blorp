@@ -1,3 +1,7 @@
+import:
+	units: Duration, to_timeout_milliseconds
+
+
 -- Channel - Bounded multi-producer, multi-consumer channels.
 --
 -- Channels are the primary synchronization primitive for [concurrent:]
@@ -9,11 +13,19 @@
 type Channel[T] = builtin
 
 
--- Error returned by [concurrent(timeout: N):] blocks when a timeout fires
--- or a detached task panics. Auto-imported for [concurrent:] scope.
+-- Error returned by concurrent work when a timeout fires, a task fails, or
+-- cancellation interrupts a blocking operation. Auto-imported for
+-- [concurrent:] scope.
 union ConcurrencyError:
 	Timeout
 	TaskFailed(String)
+	Cancelled
+
+
+-- Public name for the result produced by a fixed [concurrent:] task.
+-- This is an alias, so existing Ok/Err matching works directly while the type
+-- still makes the task boundary visible in annotations and documentation.
+type alias TaskResult[T] = Result[T, ConcurrencyError]
 
 
 -- Outcome returned by typed channel send-attempt helpers.
@@ -24,28 +36,20 @@ union SendAttempt:
 	SendTimedOut
 
 
+-- Outcome returned by typed channel receive-attempt helpers. RecvWouldBlock
+-- means no value is currently buffered, RecvSealed means the channel is sealed
+-- and drained, and RecvTimedOut means a timed receive reached its timeout
+-- before observing a value or seal.
+union RecvAttempt[T]:
+	RecvValue(T)
+	RecvWouldBlock
+	RecvSealed
+	RecvTimedOut
+
+
 -- Error returned by typed channel send helpers when a channel has been sealed.
 union ChannelSealed:
 	Sealed
-
-
-private func __try_send_status[T](ch: Channel[T], val: T) -> Int:
-	builtin("blorp_channel_try_send_status")
-
-
-private func __send_timeout_status[T](ch: Channel[T], val: T, ms: Int) -> Int:
-	builtin("blorp_channel_send_timeout_status")
-
-
-private pure func __send_attempt_from_status(status: Int) -> SendAttempt:
-	if status == 0:
-		SendAccepted
-	else if status == 1:
-		SendWouldBlock
-	else if status == 2:
-		SendSealed
-	else:
-		SendTimedOut
 
 
 -- ============================================================================
@@ -54,7 +58,8 @@ private pure func __send_attempt_from_status(status: Int) -> SendAttempt:
 ---
 Create a bounded channel with the given capacity.
 Sending when full blocks until a slot is free; receiving when empty blocks
-until a value arrives or the channel is sealed.
+until a value arrives or the channel is sealed. Capacities less than 1 are
+clamped to 1 so channel construction is infallible.
 ---
 func channel[T](capacity: Int) -> Channel[T]:
 	builtin
@@ -64,8 +69,12 @@ func channel[T](capacity: Int) -> Channel[T]:
 -- Blocking send/recv
 -- ============================================================================
 ---
-Send a value. Blocks if the channel is full. Returns False if the channel
-is sealed.
+Compatibility blocking send. Blocks if the channel is full. Returns False if
+the channel is sealed.
+
+Prefer wait_send when backpressure is intentional and the sealed case should
+remain visible in the type. Prefer try_send_attempt when fullness is a normal
+branch.
 ---
 func send[T](ch: Channel[T], val: T) -> Bool:
 	builtin
@@ -107,6 +116,34 @@ func recv[T](ch: Channel[T]) -> Option[T]:
 	builtin
 
 
+---
+Receive a value, blocking if the channel is empty. Returns Ok(value) when a
+value is available, or Err(Sealed) once the channel is sealed and drained.
+
+Use this when a consumer needs the sealed case in the type instead of an
+Option sentinel.
+
+doctests:
+    :: wait_recv accepts a buffered value
+    ch: Channel[Int] = channel(1)
+    _ = send(ch, 7)
+    match wait_recv(ch):
+        Ok(v): v == 7
+        Err(_): False
+
+    :: wait_recv reports a sealed and drained channel
+    ch: Channel[Int] = channel(1)
+    seal(ch)
+    match wait_recv(ch):
+        Ok(_): False
+        Err(Sealed): True
+---
+func wait_recv[T](ch: Channel[T]) -> Result[T, ChannelSealed]:
+	match recv(ch):
+		Some(value): Ok(value)
+		None: Err(Sealed)
+
+
 -- ============================================================================
 -- Non-blocking variants
 -- ============================================================================
@@ -138,7 +175,7 @@ doctests:
         _: False
 ---
 func try_send_attempt[T](ch: Channel[T], val: T) -> SendAttempt:
-	__send_attempt_from_status(__try_send_status(ch, val))
+	builtin("blorp_channel_try_send_attempt")
 
 
 ---
@@ -149,6 +186,40 @@ func try_recv[T](ch: Channel[T]) -> Option[T]:
 	builtin
 
 
+---
+Non-blocking receive with a typed outcome. Returns RecvValue(value) when a
+value was available, RecvWouldBlock when the channel is currently empty, or
+RecvSealed when the channel is sealed and drained.
+
+The channel may be sealed by another fiber immediately after RecvWouldBlock;
+the result describes one coherent observation of the channel state, not a
+static refinement of the channel handle.
+
+doctests:
+    :: try_recv_attempt accepts a buffered value
+    ch: Channel[Int] = channel(1)
+    _ = send(ch, 7)
+    match try_recv_attempt(ch):
+        RecvValue(v): v == 7
+        _: False
+
+    :: try_recv_attempt reports an empty channel
+    ch: Channel[Int] = channel(1)
+    match try_recv_attempt(ch):
+        RecvWouldBlock: True
+        _: False
+
+    :: try_recv_attempt reports a sealed and drained channel
+    ch: Channel[Int] = channel(1)
+    seal(ch)
+    match try_recv_attempt(ch):
+        RecvSealed: True
+        _: False
+---
+func try_recv_attempt[T](ch: Channel[T]) -> RecvAttempt[T]:
+	builtin("blorp_channel_try_recv_attempt")
+
+
 -- ============================================================================
 -- Timeouts
 -- ============================================================================
@@ -156,9 +227,50 @@ func try_recv[T](ch: Channel[T]) -> Option[T]:
 Receive with a timeout in milliseconds. Returns None on timeout or if
 the channel is sealed. A timeout less than or equal to 0 does not wait, but
 still receives a value already available in the channel.
+
+This is a compatibility API: None intentionally does not distinguish timeout
+from sealed-and-drained. Use wait_recv when a blocking receive needs the sealed
+case in the type, or try_recv_attempt when a non-blocking receive needs a typed
+outcome.
+
+doctests:
+    :: recv_timeout reports sealed and drained as None
+    ch: Channel[Int] = channel(1)
+    seal(ch)
+    match recv_timeout(ch, 1):
+        None: True
+        Some(_): False
 ---
 func recv_timeout[T](ch: Channel[T], ms: Int) -> Option[T]:
 	builtin
+
+
+---
+Receive with a timeout in milliseconds and a typed outcome. Returns
+RecvValue(value) when a value arrives, RecvTimedOut when the timeout expires,
+or RecvSealed once the channel is sealed and drained. A timeout less than or
+equal to 0 does not wait, but still receives a value already available in the
+channel.
+
+Unlike recv_timeout, this observes value, timeout, and sealed state in one
+runtime-backed channel wait.
+
+doctests:
+    :: recv_timeout_attempt reports timeout
+    ch: Channel[Int] = channel(1)
+    match recv_timeout_attempt(ch, 1):
+        RecvTimedOut: True
+        _: False
+
+    :: recv_timeout_attempt reports sealed and drained
+    ch: Channel[Int] = channel(1)
+    seal(ch)
+    match recv_timeout_attempt(ch, 1):
+        RecvSealed: True
+        _: False
+---
+func recv_timeout_attempt[T](ch: Channel[T], ms: Int) -> RecvAttempt[T]:
+	builtin("blorp_channel_recv_timeout_attempt")
 
 
 ---
@@ -168,6 +280,73 @@ but still sends if capacity is already available.
 ---
 func send_timeout[T](ch: Channel[T], val: T, ms: Int) -> Bool:
 	builtin
+
+
+---
+Receive with a typed Duration timeout. Returns None on timeout or if the
+channel is sealed. A timeout less than or equal to zero does not wait, but
+still receives a value already available in the channel. Positive durations
+below one millisecond round up to one millisecond so they remain real waits
+when forwarded to the current millisecond runtime primitive.
+
+Like recv_timeout, this compatibility API does not distinguish timeout from
+sealed-and-drained.
+
+doctests:
+    :: Duration timeout receives a buffered value
+    ch: Channel[Int] = channel(1)
+    _ = send(ch, 7)
+    timeout: Duration = {us = 1}
+    match recv_timeout_for(ch, timeout):
+        Some(v): v == 7
+        None: False
+
+    :: Duration timeout reports sealed and drained as None
+    ch: Channel[Int] = channel(1)
+    seal(ch)
+    timeout: Duration = {us = 1000}
+    match recv_timeout_for(ch, timeout):
+        None: True
+        Some(_): False
+---
+func recv_timeout_for[T](ch: Channel[T], timeout: Duration) -> Option[T]:
+	recv_timeout(ch, to_timeout_milliseconds(timeout))
+
+
+---
+Receive with a typed Duration timeout and typed outcome. Returns
+RecvValue(value) when a value arrives, RecvTimedOut when the timeout expires,
+or RecvSealed once the channel is sealed and drained. A timeout less than or
+equal to zero does not wait, but still receives a value already available in
+the channel. Positive durations below one millisecond round up to one
+millisecond.
+
+doctests:
+    :: Duration recv attempt reports timeout
+    ch: Channel[Int] = channel(1)
+    timeout: Duration = {us = 1}
+    match recv_timeout_attempt_for(ch, timeout):
+        RecvTimedOut: True
+        _: False
+---
+func recv_timeout_attempt_for[T](ch: Channel[T], timeout: Duration) -> RecvAttempt[T]:
+	recv_timeout_attempt(ch, to_timeout_milliseconds(timeout))
+
+
+---
+Send with a typed Duration timeout. Returns False on timeout, full channel, or
+sealed channel. A timeout less than or equal to zero does not wait, but still
+sends if capacity is already available. Positive durations below one
+millisecond round up to one millisecond.
+
+doctests:
+    :: Duration timeout sends when capacity is available
+    ch: Channel[Int] = channel(1)
+    timeout: Duration = {us = 1}
+    send_timeout_for(ch, 7, timeout) and recv(ch) == Some(7)
+---
+func send_timeout_for[T](ch: Channel[T], val: T, timeout: Duration) -> Bool:
+	send_timeout(ch, val, to_timeout_milliseconds(timeout))
 
 
 ---
@@ -191,7 +370,28 @@ doctests:
         _: False
 ---
 func send_timeout_attempt[T](ch: Channel[T], val: T, ms: Int) -> SendAttempt:
-	__send_attempt_from_status(__send_timeout_status(ch, val, ms))
+	builtin("blorp_channel_send_timeout_attempt")
+
+
+---
+Send with a typed Duration timeout and typed outcome. Returns SendAccepted
+when the value was accepted, SendTimedOut when capacity did not become
+available in time, or SendSealed when no more sends are accepted. A timeout
+less than or equal to zero does not wait, but still sends if capacity is
+already available. Positive durations below one millisecond round up to one
+millisecond.
+
+doctests:
+    :: Duration send attempt reports timeout
+    ch: Channel[Int] = channel(1)
+    _ = send(ch, 1)
+    timeout: Duration = {us = 1}
+    match send_timeout_attempt_for(ch, 2, timeout):
+        SendTimedOut: True
+        _: False
+---
+func send_timeout_attempt_for[T](ch: Channel[T], val: T, timeout: Duration) -> SendAttempt:
+	send_timeout_attempt(ch, val, to_timeout_milliseconds(timeout))
 
 
 -- ============================================================================
@@ -203,7 +403,7 @@ deliverable via recv/try_recv. Receivers get None once the channel is sealed
 and drained. Idempotent.
 ---
 func seal[T](ch: Channel[T]) -> Void:
-	builtin("blorp_channel_close")
+	builtin("blorp_channel_seal")
 
 
 ---
@@ -223,6 +423,27 @@ block the underlying OS thread, so the scheduler can run other fibers.
 ---
 func sleep(ms: Int) -> Void:
 	builtin
+
+
+---
+Cooperatively yield the current fiber.
+
+This gives the scheduler a chance to run other ready fibers without installing
+a timer or blocking an OS thread. It is a scheduling hint for tests,
+benchmarks, and explicit cooperative handoff points; it does not guarantee that
+another fiber runs before the current fiber resumes.
+---
+func yield_now() -> Void:
+	builtin
+
+
+---
+Sleep the current fiber for a typed Duration. Positive durations below one
+millisecond round up to one millisecond so they remain real waits when
+forwarded to the current millisecond runtime primitive.
+---
+func sleep_for(timeout: Duration) -> Void:
+	sleep(to_timeout_milliseconds(timeout))
 
 
 ---

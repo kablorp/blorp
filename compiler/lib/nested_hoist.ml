@@ -141,6 +141,20 @@ let free_idents_of (e : expr) : (string * loc) list =
             let pat_vars = collect_pattern_vars c.case_pattern in
             go (pat_vars @ bound) c.case_body)
           cases
+    | ESelect arms ->
+        List.iter
+          (fun arm ->
+            match arm.select_arm_kind with
+            | SelectRecv { select_bind; select_channel } ->
+                go bound select_channel;
+                go (select_bind :: bound) arm.select_arm_body
+            | SelectAfter timeout ->
+                go bound timeout;
+                go bound arm.select_arm_body
+            | SelectSealed channel ->
+                go bound channel;
+                go bound arm.select_arm_body)
+          arms
     | _ -> List.iter (go bound) (expr_children e)
   in
   go [] e;

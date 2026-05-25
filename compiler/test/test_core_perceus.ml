@@ -34,6 +34,7 @@ let ty_dict_int_int = TyNamed ("Dict", [ ty_int; ty_int ])
 let ty_set_string = TyNamed ("Set", [ ty_string ])
 let ty_set_int = TyNamed ("Set", [ ty_int ])
 let ty_set_list_int = TyNamed ("Set", [ ty_list_int ])
+let ty_send_attempt = TyNamed ("SendAttempt", [])
 let ty_opt_int = TyNamed ("Option", [ ty_int ])
 let ty_opt_string = TyNamed ("Option", [ ty_string ])
 let ty_opt_list_int = TyNamed ("Option", [ ty_list_int ])
@@ -858,9 +859,9 @@ let test_insert_drops_channel_send_retains_payload_arg () =
     (count_dups_for "s" transformed)
 
 let test_insert_drops_channel_send_status_retains_payload_args () =
-  let check name args =
+  let check name args result_ty =
     let bind = bind_named "s" ty_string (cstr "payload") in
-    let send = builtin name args ty_int in
+    let send = builtin name args result_ty in
     let body = mk (CSeq (send, cint 0)) ty_int in
     let e = mk (CLet (bind, body)) ty_int in
     let transformed = insert_drops_expr_for_test e in
@@ -874,9 +875,17 @@ let test_insert_drops_channel_send_status_retains_payload_args () =
       (count_dups_for "s" transformed)
   in
   check "blorp_channel_try_send_status"
-    [ cvar "ch" ty_channel_string; cvar "s" ty_string ];
+    [ cvar "ch" ty_channel_string; cvar "s" ty_string ]
+    ty_int;
   check "blorp_channel_send_timeout_status"
     [ cvar "ch" ty_channel_string; cvar "s" ty_string; cint 10 ]
+    ty_int;
+  check "blorp_channel_try_send_attempt"
+    [ cvar "ch" ty_channel_string; cvar "s" ty_string ]
+    ty_send_attempt;
+  check "blorp_channel_send_timeout_attempt"
+    [ cvar "ch" ty_channel_string; cvar "s" ty_string; cint 10 ]
+    ty_send_attempt
 
 let test_insert_drops_channel_recv_borrows_channel_arg () =
   let bind =

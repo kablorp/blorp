@@ -18,7 +18,6 @@ type var_mutability = Immutable | Mutable
 type var_origin =
   | LetBinding
   | FuncParam
-  | BorrowedResourceParam
   | ForLoopVar
   | MatchBinding
   | ScopedResource

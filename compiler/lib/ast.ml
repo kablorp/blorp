@@ -219,15 +219,7 @@ type rc_annotation = {
     None on expr means "unknown" — codegen falls back to existing heuristics. *)
 
 type concurrent_for_width =
-  | ConcurrentForDefault
-  | ConcurrentForMaxThreads of int
-      (** Legacy [concurrent(max_threads: N) for ...] spelling. *)
-  | ConcurrentForLimit of int
-      (** Migration spelling [for ... concurrently(limit: N)]. *)
-
-let concurrent_for_width_value = function
-  | ConcurrentForDefault -> None
-  | ConcurrentForMaxThreads n | ConcurrentForLimit n -> Some n
+  | ConcurrentForLimit of int  (** [for ... concurrently(limit: N)]. *)
 
 type expr = {
   expr_desc : expr_desc;
@@ -293,12 +285,14 @@ and expr_desc =
           semantics are implemented. *)
   | EDebugBlock of expr list
       (** debug: block — diagnostics-only statements that return Void *)
+  | ESelect of select_arm list
+      (** select: block — wait on ordinary channel/timer arms. *)
   | EConcurrent of expr list * expr option * int option
       (** concurrent: block — bindings, optional timeout_ms expr, optional max_threads *)
   | EConcurrentBind of string * type_expr option * expr
       (** name = expr — concurrent task binding *)
   | EConcurrentFor of string * expr * expr * expr option * concurrent_for_width
-      (** var, iterable, body, optional timeout, explicit scheduling width *)
+      (** var, iterable, body, optional timeout, explicit scheduling limit *)
   | EDetach of expr  (** detach expr — detach on thread pool *)
   | EDict of (expr * expr) list  (** {"key" => val, ...} — dict literal *)
   | EBuiltin of string option
@@ -319,6 +313,18 @@ and expr_desc =
       mangled name, and call sites in the parent body are rewritten to
       reference the hoisted name. No pass after hoisting should see this
       constructor. *)
+
+and select_arm = {
+  select_arm_kind : select_arm_kind;
+  select_arm_body : expr;
+  select_arm_loc : loc;
+}
+
+and select_arm_kind =
+  | SelectRecv of { select_bind : string; select_channel : expr }
+      (** value from channel: *)
+  | SelectAfter of expr  (** _ after timeout: *)
+  | SelectSealed of expr  (** sealed channel: *)
 
 and with_binding_kind = WithPlain | WithTry
 
@@ -399,18 +405,10 @@ and func_decl = {
 }
 (** Function declaration *)
 
-and param_passing =
-  | ParamByValue
-  | ParamBorrow
-      (** Borrowed resource parameter. The function may use the resource during
-          the call but does not own cleanup and must not let resource-dependent
-          values escape. *)
-
 and param = {
   param_name : string option;  (** None for pattern params *)
   param_pattern : pattern option;  (** For tuple destructuring *)
   param_type : type_expr option;
-  param_passing : param_passing;
   param_loc : loc;
 }
 (** Function parameter *)
@@ -713,6 +711,15 @@ let expr_children (e : expr) : expr list =
   | EConcurrent (exprs, None, _) ->
       exprs
   | EConcurrent (exprs, Some timeout, _) -> exprs @ [ timeout ]
+  | ESelect arms ->
+      List.concat_map
+        (fun arm ->
+          match arm.select_arm_kind with
+          | SelectRecv { select_channel; _ } ->
+              [ select_channel; arm.select_arm_body ]
+          | SelectAfter timeout -> [ timeout; arm.select_arm_body ]
+          | SelectSealed channel -> [ channel; arm.select_arm_body ])
+        arms
   | EWith (binding, body) -> [ binding.with_value; body ]
   | ERecord fields -> List.map snd fields
   | ERecordUpdate (base, fields) -> base :: List.map snd fields
@@ -779,6 +786,24 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
     | EList exprs -> EList (List.map f exprs)
     | ETuple exprs -> ETuple (List.map f exprs)
     | EDebugBlock exprs -> EDebugBlock (List.map f exprs)
+    | ESelect arms ->
+        ESelect
+          (List.map
+             (fun arm ->
+               let kind =
+                 match arm.select_arm_kind with
+                 | SelectRecv { select_bind; select_channel } ->
+                     SelectRecv
+                       { select_bind; select_channel = f select_channel }
+                 | SelectAfter timeout -> SelectAfter (f timeout)
+                 | SelectSealed channel -> SelectSealed (f channel)
+               in
+               {
+                 arm with
+                 select_arm_kind = kind;
+                 select_arm_body = f arm.select_arm_body;
+               })
+             arms)
     | EConcurrent (exprs, timeout, mt) ->
         EConcurrent (List.map f exprs, Option.map f timeout, mt)
     | EWith (binding, body) ->

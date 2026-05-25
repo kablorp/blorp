@@ -498,6 +498,16 @@ let std_body_specs =
         ~param_shapes:[ ParamNamed "List"; ParamFunc ]
         "map" 2;
       list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int"; ParamFunc ]
+        "map_concurrently" 3;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int"; ParamFunc ]
+        "concurrent" 3;
+      list_spec ~return_shape:(ReturnNamed "List")
+        ~param_shapes:
+          [ ParamNamed "List"; ParamNamed "Int"; ParamNamed "Int"; ParamFunc ]
+        "__concurrent_timeout_ms" 4;
+      list_spec ~return_shape:(ReturnNamed "List")
         ~param_shapes:[ ParamNamed "List"; ParamFunc ]
         "map_indexed" 2;
       list_spec ~return_shape:(ReturnNamed "List")
@@ -1207,6 +1217,15 @@ let not_null expr : core = bin Ast.Ne expr null_ptr ty_bool
 let break_ : core = mk ty_void CBreak
 
 let list_elem_ty = function Ast.TyNamed ("List", [ t ]) -> t | _ -> ty_ptr
+
+let list_task_result_ok_ty = function
+  | Ast.TyNamed
+      ( "List",
+        [
+          Ast.TyNamed ("Result", [ ok_ty; Ast.TyNamed ("ConcurrencyError", []) ]);
+        ] ) ->
+      ok_ty
+  | _ -> ty_ptr
 
 let set_elem_ty ?reg ty =
   match Core_layout_type.set_type ?reg ty with
@@ -2389,6 +2408,32 @@ let list_map self_ty result_ty self f =
                    [ vr "__result" result_ty; vr "__n" ty_int ]
                    ty_void)
                 (vr "__result" result_ty)))))
+
+(** map_concurrently/concurrent(self, limit, f) -> List[Result[U,
+    ConcurrencyError]]
+
+    Build the public helper as Core concurrent-for instead of a separate
+    runtime mapping primitive. This keeps task spawning, result wrapping,
+    cancellation, and timeout join behavior on the same path as source
+    [for ... concurrently(limit:)]. *)
+let list_concurrent_collect ?timeout self_ty result_ty self limit f =
+  let elem_ty = list_elem_ty self_ty in
+  let result_elem_ty = list_task_result_ok_ty result_ty in
+  let item_var = Var.named "__item" in
+  let item = mk elem_ty (CVar item_var) in
+  let body = closure_call f [ item ] result_elem_ty in
+  mk result_ty
+    (CConcurrentFor
+       {
+         cf_var = item_var;
+         cf_iter = self;
+         cf_body = body;
+         cf_timeout = timeout;
+         cf_width = ConcurrentForLimit limit;
+         cf_output = ConcurrentForCollect;
+         cf_task_scope = synthetic_concurrent_task_scope;
+         cf_task = None;
+       })
 
 (** map_indexed(self, f) -> List[U]
 
@@ -5802,16 +5847,22 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
         Some (f p0 p1)
     | _ -> None
   in
-  let with_parallel_list2 f =
-    match params with
-    | ({ cp_ty = Ast.TyNamed ("ParallelList", _); _ } as p0) :: [ p1 ] ->
-        Some (f p0 p1)
-    | _ -> None
-  in
   let with_list3 f =
     match params with
     | ({ cp_ty = Ast.TyNamed ("List", _); _ } as p0) :: [ p1; p2 ] ->
         Some (f p0 p1 p2)
+    | _ -> None
+  in
+  let with_list4 f =
+    match params with
+    | ({ cp_ty = Ast.TyNamed ("List", _); _ } as p0) :: [ p1; p2; p3 ] ->
+        Some (f p0 p1 p2 p3)
+    | _ -> None
+  in
+  let with_parallel_list2 f =
+    match params with
+    | ({ cp_ty = Ast.TyNamed ("ParallelList", _); _ } as p0) :: [ p1 ] ->
+        Some (f p0 p1)
     | _ -> None
   in
   let with_dict1 f =
@@ -5906,6 +5957,15 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
   | "map" when first_is_list () ->
       with_list2 (fun self_p f_p ->
           list_map self_p.cp_ty return_ty (param self_p) (param f_p))
+  | ("map_concurrently" | "concurrent")
+    when first_is_list () && return_is_list () ->
+      with_list3 (fun self_p limit_p f_p ->
+          list_concurrent_collect self_p.cp_ty return_ty (param self_p)
+            (param limit_p) (param f_p))
+  | "__concurrent_timeout_ms" when first_is_list () && return_is_list () ->
+      with_list4 (fun self_p limit_p timeout_p f_p ->
+          list_concurrent_collect ~timeout:(param timeout_p) self_p.cp_ty
+            return_ty (param self_p) (param limit_p) (param f_p))
   | "map_indexed" when first_is_list () ->
       with_list2 (fun self_p f_p ->
           list_map_indexed self_p.cp_ty return_ty (param self_p) (param f_p))

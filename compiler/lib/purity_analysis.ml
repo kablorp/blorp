@@ -73,7 +73,10 @@ let rec collect_matching_calls
       call_ref "concurrent" expr.expr_loc
       :: List.concat_map recurse (expr_children expr)
   | EConcurrentFor _ ->
-      call_ref "concurrent for" expr.expr_loc
+      call_ref "for ... concurrently" expr.expr_loc
+      :: List.concat_map recurse (expr_children expr)
+  | ESelect _ ->
+      call_ref "select" expr.expr_loc
       :: List.concat_map recurse (expr_children expr)
   | _ -> List.concat_map recurse (expr_children expr)
 

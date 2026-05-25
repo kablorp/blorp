@@ -2873,6 +2873,12 @@ let test_emit_concurrent_block () =
     "has concurrent_join" true
     (contains_sub output "blorp_concurrent_join");
   Alcotest.(check bool)
+    "registers task cleanup" true
+    (contains_sub output "blorp_task_cancel_join_release");
+  Alcotest.(check bool)
+    "pops task cleanup before normal release" true
+    (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_task_");
+  Alcotest.(check bool)
     "has task release" true
     (contains_sub output "blorp_release((blorp_Object*)");
   Alcotest.(check bool)
@@ -3039,7 +3045,8 @@ let test_emit_concurrent_for_rc_result_uses_spawn_rc () =
            cf_iter = cvar "items" list_string_ty;
            cf_body = cvar "item" ty_string;
            cf_timeout = None;
-           cf_width = ConcurrentForDefault;
+           cf_width = ConcurrentForLimit (cint 2);
+           cf_output = ConcurrentForCollect;
            cf_task_scope = synthetic_concurrent_task_scope;
            cf_task = None;
          })
@@ -3073,7 +3080,25 @@ let test_emit_concurrent_for_rc_result_uses_spawn_rc () =
     (contains_sub output "% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0");
   Alcotest.(check bool)
     "concurrent for schedules batch before joins" true
-    (contains_sub output "blorp_task_batch_flush(&__conc_batch_")
+    (contains_sub output "blorp_task_batch_flush(&__conc_batch_");
+  Alcotest.(check bool)
+    "concurrent for allocates cleanup frames" true
+    (contains_sub output "blorp_CancelCleanupFrame* __conc_task_cleanups_");
+  Alcotest.(check bool)
+    "concurrent for registers task cleanup" true
+    (contains_sub output "blorp_task_cancel_join_release");
+  Alcotest.(check bool)
+    "concurrent for pops task cleanup" true
+    (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_tasks_");
+  Alcotest.(check bool)
+    "concurrent for protects collected result list on cancellation" true
+    (contains_sub output "blorp_cleanup_release_arc_value)");
+  Alcotest.(check bool)
+    "concurrent for exposes partial result list length for cleanup" true
+    (contains_sub output "->len = __conc_i_");
+  Alcotest.(check bool)
+    "concurrent for transfers collected result list ownership" true
+    (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_results_")
 
 let test_emit_detach () =
   let fty = TyFunc { params = []; return = ty_void; is_pure = false } in
@@ -5365,7 +5390,8 @@ let test_emit_rejects_unsupported_task_capture_kind () =
             cf_iter = cvar "items" (TyNamed ("List", [ ty_int ]));
             cf_body = rhs;
             cf_timeout = None;
-            cf_width = ConcurrentForDefault;
+            cf_width = ConcurrentForLimit (cint 2);
+            cf_output = ConcurrentForCollect;
             cf_task_scope = synthetic_concurrent_task_scope;
             cf_task = Some task;
           };
@@ -5504,7 +5530,8 @@ let test_emit_invariant_concurrent_for_requires_list () =
             cf_iter = iter;
             cf_body = cvar "item" ty_string;
             cf_timeout = None;
-            cf_width = ConcurrentForDefault;
+            cf_width = ConcurrentForLimit (cint 2);
+            cf_output = ConcurrentForCollect;
             cf_task_scope = synthetic_concurrent_task_scope;
             cf_task = Some task;
           };

@@ -25,6 +25,7 @@ val run_tests :
   timeout:int option ->
   ?jobs:int ->
   ?cache:bool ->
+  ?repeat:int ->
   string ->
   int
 (** Run tests: dispatches to sequential or parallel based on job count *)
@@ -42,6 +43,7 @@ val run_tests_paths :
   timeout:int option ->
   ?jobs:int ->
   ?cache:bool ->
+  ?repeat:int ->
   string list ->
   int
 (** Run tests across multiple file/directory roots as one combined file set. *)

@@ -363,6 +363,7 @@ let builtin_c_mapping =
   (* Concurrency builtins *)
   [
     (("", "sleep"), "blorp_sleep");
+    (("", "yield_now"), "blorp_yield_now");
     (("", "max_threads"), "blorp_max_threads");
     (("", "channel"), "blorp_channel_new");
     (("", "send"), "blorp_channel_send");
@@ -371,7 +372,7 @@ let builtin_c_mapping =
     (("", "try_recv"), "blorp_channel_try_recv");
     (("", "recv_timeout"), "blorp_channel_recv_timeout");
     (("", "send_timeout"), "blorp_channel_send_timeout");
-    (("", "seal"), "blorp_channel_close");
+    (("", "seal"), "blorp_channel_seal");
     (("", "close"), "blorp_channel_close");
   ]
 

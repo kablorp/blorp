@@ -1,0 +1,387 @@
+import:
+	channel:
+		RecvAttempt(RecvSealed, RecvTimedOut, RecvValue, RecvWouldBlock),
+		SendAttempt(SendAccepted, SendSealed, SendTimedOut, SendWouldBlock),
+		recv_timeout_attempt,
+		send_timeout_attempt,
+		try_recv_attempt,
+		try_send_attempt,
+		wait_send,
+	dict as D
+	test: TestSuite
+
+
+union ChannelHistoryEvent:
+	HistorySent(Int)
+	HistoryReceived(Int)
+	HistorySendRejected(Int)
+
+
+func send_range(out: Channel[Int], start: Int, count: Int) -> Int:
+	var sent: Int = 0
+	var i: Int = 0
+	while i < count:
+		if send(out, start + i):
+			sent += 1
+		yield_now()
+		i += 1
+	sent
+
+
+func send_three_ranges_and_seal(out: Channel[Int]) -> Int:
+	sent_a: Int = send_range(out, 0, 10)
+	sent_b: Int = send_range(out, 10, 10)
+	sent_c: Int = send_range(out, 20, 10)
+	seal(out)
+	sent_a + sent_b + sent_c
+
+
+func forward_until_sealed(
+	input: Channel[Int],
+	observed: Channel[Int],
+	summaries: Channel[Int],
+) -> Void:
+	var count: Int = 0
+	var done: Bool = False
+	while not done:
+		match recv(input):
+			Some(value):
+				count += 1
+				_ = send(observed, value)
+			None:
+				done = True
+	_ = send(summaries, count)
+
+
+pure func all_values_seen_once(counts: Dict[Int, Int], total: Int) -> Bool:
+	var ok: Bool = D.length(counts) == total
+	var i: Int = 0
+	while i < total:
+		ok = ok and counts.get_or(i, 0) == 1
+		i += 1
+	ok
+
+
+func task_sent_count_is(result: TaskResult[Int], expected: Int) -> Bool:
+	match result:
+		Ok(sent): sent == expected
+		Err(_): False
+
+
+func task_send_attempt_timed_out(result: TaskResult[SendAttempt]) -> Bool:
+	match result:
+		Ok(SendTimedOut): True
+		_: False
+
+
+func task_recv_attempt_timed_out(result: TaskResult[RecvAttempt[Int]]) -> Bool:
+	match result:
+		Ok(RecvTimedOut): True
+		_: False
+
+
+func test_mpmc_values_delivered_exactly_once() -> Bool:
+	values: Channel[Int] = channel(2)
+	observed: Channel[Int] = channel(30)
+	summaries: Channel[Int] = channel(3)
+
+	concurrent(timeout: 2000):
+		producer = send_three_ranges_and_seal(values)
+		consumer_a = forward_until_sealed(values, observed, summaries)
+		consumer_b = forward_until_sealed(values, observed, summaries)
+		consumer_c = forward_until_sealed(values, observed, summaries)
+
+	producers_ok: Bool = task_sent_count_is(producer, 30)
+	var consumers_ok: Bool = match consumer_a:
+		Ok(_): True
+		Err(_): False
+	consumers_ok = consumers_ok and match consumer_b:
+		Ok(_): True
+		Err(_): False
+	consumers_ok = consumers_ok and match consumer_c:
+		Ok(_): True
+		Err(_): False
+
+	first_summary: Option[Int] = recv_timeout(summaries, 500)
+	second_summary: Option[Int] = recv_timeout(summaries, 500)
+	third_summary: Option[Int] = recv_timeout(summaries, 500)
+	var received_summaries: Int = 0
+	var total_forwarded: Int = 0
+	match first_summary:
+		Some(count):
+			received_summaries += 1
+			total_forwarded += count
+		None:
+			void
+	match second_summary:
+		Some(count):
+			received_summaries += 1
+			total_forwarded += count
+		None:
+			void
+	match third_summary:
+		Some(count):
+			received_summaries += 1
+			total_forwarded += count
+		None:
+			void
+	seal(observed)
+	var counts: Dict[Int, Int] = D.dict()
+	var done: Bool = False
+	while not done:
+		match recv(observed):
+			Some(value):
+				counts = counts.set(value, counts.get_or(value, 0) + 1)
+			None:
+				done = True
+
+	var ok: Bool = producers_ok
+	ok = ok and consumers_ok
+	ok = ok and received_summaries == 3
+	ok = ok and total_forwarded == 30
+	ok = ok and all_values_seen_once(counts, 30)
+	ok
+
+
+func history_send_range(
+	out: Channel[Int],
+	history: Channel[ChannelHistoryEvent],
+	start: Int,
+	count: Int,
+) -> Int:
+	var sent: Int = 0
+	var i: Int = 0
+	while i < count:
+		value: Int = start + i
+		if send(out, value):
+			sent += 1
+			_ = send(history, HistorySent(value))
+		else:
+			_ = send(history, HistorySendRejected(value))
+		yield_now()
+		i += 1
+	sent
+
+
+func history_count_until_sealed(
+	input: Channel[Int],
+	history: Channel[ChannelHistoryEvent],
+	summaries: Channel[Int],
+) -> Void:
+	var count: Int = 0
+	var done: Bool = False
+	while not done:
+		match recv(input):
+			Some(value):
+				count += 1
+				_ = send(history, HistoryReceived(value))
+				yield_now()
+			None:
+				done = True
+	_ = send(summaries, count)
+
+
+func collect_history_counts(
+	history: Channel[ChannelHistoryEvent],
+) -> (Dict[Int, Int], Dict[Int, Int], Int):
+	var sent: Dict[Int, Int] = D.dict()
+	var received: Dict[Int, Int] = D.dict()
+	var rejected: Int = 0
+	var done: Bool = False
+	while not done:
+		match recv(history):
+			Some(event):
+				match event:
+					HistorySent(value):
+						sent = sent.set(value, sent.get_or(value, 0) + 1)
+					HistoryReceived(value):
+						received = received.set(value, received.get_or(value, 0) + 1)
+					HistorySendRejected(_):
+						rejected += 1
+			None:
+				done = True
+	(sent, received, rejected)
+
+
+pure func all_history_values_match(
+	sent: Dict[Int, Int],
+	received: Dict[Int, Int],
+	total: Int,
+) -> Bool:
+	var ok: Bool = D.length(sent) == total and D.length(received) == total
+	var i: Int = 0
+	while i < total:
+		ok = ok and sent.get_or(i, 0) == 1
+		ok = ok and received.get_or(i, 0) == 1
+		i += 1
+	ok
+
+
+func test_operation_history_records_valid_mpmc_run() -> Bool:
+	values: Channel[Int] = channel(2)
+	history: Channel[ChannelHistoryEvent] = channel(64)
+	summaries: Channel[Int] = channel(2)
+	detach history_count_until_sealed(values, history, summaries)
+	detach history_count_until_sealed(values, history, summaries)
+
+	concurrent(timeout: 2000):
+		producer_a = history_send_range(values, history, 0, 10)
+		producer_b = history_send_range(values, history, 10, 10)
+
+	var producers_ok: Bool = task_sent_count_is(producer_a, 10)
+	producers_ok = producers_ok and task_sent_count_is(producer_b, 10)
+	seal(values)
+	first_count: Option[Int] = recv_timeout(summaries, 500)
+	second_count: Option[Int] = recv_timeout(summaries, 500)
+	seal(history)
+	counts = collect_history_counts(history)
+	var total_received: Int = -1
+	match first_count:
+		Some(first):
+			match second_count:
+				Some(second):
+					total_received = first + second
+				None:
+					void
+		None:
+			void
+	var ok: Bool = producers_ok
+	ok = ok and total_received == 20
+	ok = ok and counts.2 == 0
+	ok = ok and all_history_values_match(counts.0, counts.1, 20)
+	ok
+
+
+func fill_and_drain_fifo(capacity: Int) -> Bool:
+	ch: Channel[Int] = channel(capacity)
+	var ok: Bool = True
+	var i: Int = 0
+	while i < capacity:
+		ok = ok and send(ch, i)
+		i += 1
+	extra_full: Bool = match try_send_attempt(ch, 999):
+		SendWouldBlock: True
+		_: False
+	var expected: Int = 0
+	while expected < capacity:
+		match recv(ch):
+			Some(value): ok = ok and value == expected
+			None: ok = False
+		expected += 1
+	_ = send(ch, 100)
+	seal(ch)
+	drained_buffered: Bool = match recv(ch):
+		Some(value): value == 100
+		None: False
+	done: Bool = match recv(ch):
+		None: True
+		Some(_): False
+	ok and extra_full and drained_buffered and done
+
+
+func test_small_capacity_fifo_model() -> Bool:
+	fill_and_drain_fifo(1) and fill_and_drain_fifo(2)
+
+
+func test_seal_is_permanent_across_send_apis() -> Bool:
+	ch: Channel[Int] = channel(2)
+	_ = send(ch, 1)
+	_ = send(ch, 2)
+	seal(ch)
+	blocking_send_failed: Bool = not send(ch, 3)
+	wait_send_failed: Bool = match wait_send(ch, 4):
+		Ok(_): False
+		Err(Sealed): True
+	try_send_failed: Bool = match try_send_attempt(ch, 5):
+		SendSealed: True
+		_: False
+	timed_send_failed: Bool = match send_timeout_attempt(ch, 6, 100):
+		SendSealed: True
+		_: False
+	first_ok: Bool = match recv(ch):
+		Some(value): value == 1
+		None: False
+	second_ok: Bool = match recv(ch):
+		Some(value): value == 2
+		None: False
+	done_ok: Bool = match try_recv_attempt(ch):
+		RecvSealed: True
+		_: False
+	send_after_drain_failed: Bool = not send(ch, 7)
+	var ok: Bool = blocking_send_failed
+	ok = ok and wait_send_failed
+	ok = ok and try_send_failed
+	ok = ok and timed_send_failed
+	ok = ok and first_ok
+	ok = ok and second_ok
+	ok = ok and done_ok
+	ok = ok and send_after_drain_failed
+	ok
+
+
+func timed_send_attempt_task(ch: Channel[Int], value: Int) -> SendAttempt:
+	send_timeout_attempt(ch, value, 10)
+
+
+func test_timed_out_senders_do_not_poison_queue() -> Bool:
+	ch: Channel[Int] = channel(1)
+	_ = send(ch, 0)
+	concurrent(timeout: 500):
+		first = timed_send_attempt_task(ch, 1)
+		second = timed_send_attempt_task(ch, 2)
+		third = timed_send_attempt_task(ch, 3)
+	var attempts_timed_out: Bool = task_send_attempt_timed_out(first)
+	attempts_timed_out = attempts_timed_out and task_send_attempt_timed_out(second)
+	attempts_timed_out = attempts_timed_out and task_send_attempt_timed_out(third)
+	original_ok: Bool = match recv(ch):
+		Some(value): value == 0
+		None: False
+	refill_ok: Bool = send(ch, 99)
+	refill_seen: Bool = match recv(ch):
+		Some(value): value == 99
+		None: False
+	attempts_timed_out and original_ok and refill_ok and refill_seen
+
+
+func timed_recv_attempt_task(ch: Channel[Int]) -> RecvAttempt[Int]:
+	recv_timeout_attempt(ch, 10)
+
+
+func test_timed_out_receivers_do_not_poison_queue() -> Bool:
+	ch: Channel[Int] = channel(3)
+	concurrent(timeout: 500):
+		first = timed_recv_attempt_task(ch)
+		second = timed_recv_attempt_task(ch)
+		third = timed_recv_attempt_task(ch)
+	var attempts_timed_out: Bool = task_recv_attempt_timed_out(first)
+	attempts_timed_out = attempts_timed_out and task_recv_attempt_timed_out(second)
+	attempts_timed_out = attempts_timed_out and task_recv_attempt_timed_out(third)
+	_ = send(ch, 10)
+	_ = send(ch, 20)
+	seal(ch)
+	first_value_ok: Bool = match recv_timeout_attempt(ch, 100):
+		RecvValue(value): value == 10
+		_: False
+	second_value_ok: Bool = match recv_timeout_attempt(ch, 100):
+		RecvValue(value): value == 20
+		_: False
+	sealed_ok: Bool = match recv_timeout_attempt(ch, 100):
+		RecvSealed: True
+		_: False
+	attempts_timed_out and first_value_ok and second_value_ok and sealed_ok
+
+
+tests: TestSuite = {
+	description = "Channel property tests",
+	tests = [
+		("MPMC values delivered exactly once", test_mpmc_values_delivered_exactly_once),
+		("operation history records valid MPMC run", test_operation_history_records_valid_mpmc_run),
+		("small capacity FIFO model", test_small_capacity_fifo_model),
+		("seal is permanent across send APIs", test_seal_is_permanent_across_send_apis),
+		("timed out senders do not poison queue", test_timed_out_senders_do_not_poison_queue),
+		(
+			"timed out receivers do not poison queue",
+			test_timed_out_receivers_do_not_poison_queue,
+		),
+	],
+}

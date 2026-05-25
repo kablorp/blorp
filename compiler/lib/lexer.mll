@@ -115,13 +115,16 @@ let () =
     ("try", Parser.TRY);
     ("with", Parser.WITH);
     ("resource", Parser.RESOURCE);
-    ("borrow", Parser.BORROW);
     ("debug", Parser.DEBUG);
     ("struct", Parser.STRUCT);
     ("foreign", Parser.FOREIGN);
     ("concurrent", Parser.CONCURRENT);
     ("concurrently", Parser.CONCURRENTLY);
     ("detach", Parser.DETACH);
+    ("select", Parser.SELECT);
+    ("from", Parser.FROM);
+    ("after", Parser.AFTER);
+    ("sealed", Parser.SEALED);
     ("where", Parser.WHERE);
   ]
 
@@ -1030,8 +1033,10 @@ let token_to_string = function
   | Parser.STAR_EQ -> "*="
   | Parser.SLASH_EQ -> "/="
   | Parser.QUESTION_EQUALS -> "?="
-  | Parser.TRY -> "try" | Parser.WITH -> "with" | Parser.RESOURCE -> "resource" | Parser.BORROW -> "borrow" | Parser.DEBUG -> "debug" | Parser.STRUCT -> "struct" | Parser.FOREIGN -> "foreign"
+  | Parser.TRY -> "try" | Parser.WITH -> "with" | Parser.RESOURCE -> "resource" | Parser.DEBUG -> "debug" | Parser.STRUCT -> "struct" | Parser.FOREIGN -> "foreign"
   | Parser.CONCURRENT -> "concurrent" | Parser.CONCURRENTLY -> "concurrently"
+  | Parser.SELECT -> "select" | Parser.FROM -> "from"
+  | Parser.AFTER -> "after" | Parser.SEALED -> "sealed"
   | Parser.DETACH -> "detach" | Parser.WHERE -> "where"
   | Parser.INDENT -> "indent" | Parser.DEDENT -> "dedent"
   | Parser.NEWLINE -> "newline" | Parser.EOF -> "end of file"

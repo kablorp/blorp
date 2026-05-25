@@ -692,6 +692,53 @@ let rec expr_to_json expr =
                  field "cases" (array case_jsons);
                ])
       | _ -> None)
+  | Ast.ESelect arms -> (
+      let arm_to_json arm =
+        match expr_to_json arm.Ast.select_arm_body with
+        | None -> None
+        | Some body_json -> (
+            match arm.Ast.select_arm_kind with
+            | Ast.SelectRecv { select_bind; select_channel } -> (
+                match expr_to_json select_channel with
+                | Some channel_json ->
+                    Some
+                      (obj
+                         [
+                           field "kind" (string "Recv");
+                           field "name" (string select_bind);
+                           field "channel" channel_json;
+                           field "body" body_json;
+                         ])
+                | None -> None)
+            | Ast.SelectAfter timeout -> (
+                match expr_to_json timeout with
+                | Some timeout_json ->
+                    Some
+                      (obj
+                         [
+                           field "kind" (string "After");
+                           field "timeout" timeout_json;
+                           field "body" body_json;
+                         ])
+                | None -> None)
+            | Ast.SelectSealed channel -> (
+                match expr_to_json channel with
+                | Some channel_json ->
+                    Some
+                      (obj
+                         [
+                           field "kind" (string "Sealed");
+                           field "channel" channel_json;
+                           field "body" body_json;
+                         ])
+                | None -> None))
+      in
+      match option_map_all arm_to_json arms with
+      | Some arm_jsons ->
+          Some
+            (obj
+               [ field "tag" (string "Select"); field "arms" (array arm_jsons) ])
+      | None -> None)
   | Ast.EWhile (cond, body) -> (
       match (expr_to_json cond, expr_to_json body) with
       | Some cond_json, Some body_json ->
@@ -838,9 +885,6 @@ let rec expr_to_json expr =
                @ optional_field "timeout" timeout_json
                @
                match width with
-               | Ast.ConcurrentForDefault -> []
-               | Ast.ConcurrentForMaxThreads n ->
-                   [ field "max_threads" (string_of_int n) ]
                | Ast.ConcurrentForLimit n -> [ field "limit" (string_of_int n) ]
                ))
       | _ -> None)

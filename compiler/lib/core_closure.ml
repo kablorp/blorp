@@ -55,6 +55,7 @@ type state = {
   mutable current_module : string option;
   constructor_names : (string, unit) Hashtbl.t;
   global_function_refs : (string, function_ref_target) Hashtbl.t;
+  global_function_refs_by_def_id : (int, function_ref_target) Hashtbl.t;
   wrap_function_refs : bool;
 }
 
@@ -96,7 +97,12 @@ let function_ref_target_by_name (state : state) (name : string) :
             | None -> None))
 
 let function_ref_target (state : state) (v : var) : function_ref_target option =
-  function_ref_target_by_name state v.vname
+  match v.vdef_id with
+  | Some def_id -> (
+      match Hashtbl.find_opt state.global_function_refs_by_def_id def_id with
+      | Some _ as hit -> hit
+      | None -> function_ref_target_by_name state v.vname)
+  | None -> function_ref_target_by_name state v.vname
 
 (** Collect free variables in a Core expression, filtering out
     constructor names and global function names. Returns a sorted
@@ -250,10 +256,16 @@ let collect_free_vars_filtered (state : state) (body : core)
           | Some timeout -> go bound timeout
           | None -> SM.empty
         in
+        let width_fv =
+          match cf.cf_width with ConcurrentForLimit limit -> go bound limit
+        in
         SM.union
           (fun _ a _ -> Some a)
           iter_fv
-          (SM.union (fun _ a _ -> Some a) body_fv timeout_fv)
+          (SM.union
+             (fun _ a _ -> Some a)
+             body_fv
+             (SM.union (fun _ a _ -> Some a) timeout_fv width_fv))
     | CMatchArms (scrut, arms) ->
         let scrut_fv = go bound scrut in
         List.fold_left
@@ -318,22 +330,17 @@ let wrap_fn_ref_as_closure (state : state) ~(bound : StringSet.t) (arg : core) :
           let callee_node = { desc = CVar v; ty = arg.ty; loc } in
           let call_kind =
             match target with
-            | FunctionRefUser f ->
-                let def_id =
-                  match v.vdef_id with
-                  | Some _ as id -> id
-                  | None -> Some f.cf_def_id
-                in
-                CKUser (v.vname, def_id)
+            | FunctionRefUser f -> CKUser (f.cf_name, Some f.cf_def_id)
             | FunctionRefBuiltin c_name -> CKBuiltin c_name
             | FunctionRefForeign foreign -> CKForeign foreign
           in
           let body =
             {
-              (* A4.2: preserve [v.vdef_id] so the eta adapter's inner call
-           hits the same mangled C symbol as the target function's
-           decl site. [Core_closure] runs AFTER [Core_resolve] so v
-           already carries the resolved def_id. *)
+              (* Use the resolved target name and def-id together. A bare
+                 function reference may keep source spelling like [sqrt] while
+                 [v.vdef_id] points at [std_float__sqrt]; mixing that source
+                 spelling with the selected id would emit an undeclared
+                 def-id-mangled symbol. *)
               desc = CCall (call_kind, callee_node, param_refs);
               ty = return;
               loc;
@@ -587,11 +594,20 @@ and adapt_function_refs_expr (state : state) (bound : StringSet.t) (e : core) :
       let body_bound = add_bound_var bound cf.cf_var in
       let body' = adapt_value body_bound cf.cf_body in
       let timeout' = Option.map (adapt_value bound) cf.cf_timeout in
+      let width' =
+        Core.map_concurrent_for_width (adapt_value bound) cf.cf_width
+      in
       {
         e with
         desc =
           CConcurrentFor
-            { cf with cf_iter = iter'; cf_body = body'; cf_timeout = timeout' };
+            {
+              cf with
+              cf_iter = iter';
+              cf_body = body';
+              cf_timeout = timeout';
+              cf_width = width';
+            };
       }
   | _ -> map_children (adapt_value bound) e
 
@@ -751,6 +767,13 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
                 (convert_expr state ~wrap_fn_refs ~bound timeout))
             cf.cf_timeout
         in
+        let width' =
+          Core.map_concurrent_for_width
+            (fun limit ->
+              maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
+                (convert_expr state ~wrap_fn_refs ~bound limit))
+            cf.cf_width
+        in
         let task' =
           match cf.cf_task with
           | Some task -> Some task
@@ -768,6 +791,7 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
                 cf_iter = iter';
                 cf_body = body';
                 cf_timeout = timeout';
+                cf_width = width';
                 cf_task = task';
               };
         }
@@ -1002,20 +1026,26 @@ let builtin_c_name_for_func (f : core_func) : string option =
       if module_path = "" then None else Codegen_builtins.lookup "" source_name
 
 let scan_names (prog : core_program) :
-    (string, unit) Hashtbl.t * (string, function_ref_target) Hashtbl.t =
+    (string, unit) Hashtbl.t
+    * (string, function_ref_target) Hashtbl.t
+    * (int, function_ref_target) Hashtbl.t =
   let ctors = Hashtbl.create 32 in
   let function_refs = Hashtbl.create 64 in
+  let function_refs_by_def_id = Hashtbl.create 64 in
+  let register_target (f : core_func) target =
+    Hashtbl.replace function_refs f.cf_name target;
+    Hashtbl.replace function_refs_by_def_id f.cf_def_id target
+  in
   let register_user_func (f : core_func) =
-    Hashtbl.replace function_refs f.cf_name (FunctionRefUser f)
+    register_target f (FunctionRefUser f)
   in
   let register_builtin_func (f : core_func) =
     match builtin_c_name_for_func f with
-    | Some c_name ->
-        Hashtbl.replace function_refs f.cf_name (FunctionRefBuiltin c_name)
+    | Some c_name -> register_target f (FunctionRefBuiltin c_name)
     | None -> ()
   in
   let register_foreign_func (f : core_func) c_name arg_passing =
-    Hashtbl.replace function_refs f.cf_name
+    register_target f
       (FunctionRefForeign { fc_c_name = c_name; fc_arg_passing = arg_passing })
   in
   (* Builtin constructors *)
@@ -1054,10 +1084,10 @@ let scan_names (prog : core_program) :
       in
       visit d)
     prog;
-  (ctors, function_refs)
+  (ctors, function_refs, function_refs_by_def_id)
 
 let make_state ?(wrap_function_refs = true) (prog : core_program) : state =
-  let ctors, function_refs = scan_names prog in
+  let ctors, function_refs, function_refs_by_def_id = scan_names prog in
   {
     counter = 0;
     task_counter = 0;
@@ -1065,6 +1095,7 @@ let make_state ?(wrap_function_refs = true) (prog : core_program) : state =
     current_module = None;
     constructor_names = ctors;
     global_function_refs = function_refs;
+    global_function_refs_by_def_id = function_refs_by_def_id;
     wrap_function_refs;
   }
 

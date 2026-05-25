@@ -2501,7 +2501,7 @@ let run_tests_parallel ?(profile = false) ?(debug = false) ?(sanitize = false)
 (** Run tests: dispatches to sequential or parallel *)
 let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0) ?(cache = true)
-    files =
+    ?(repeat = 1) files =
   with_run_artifacts (fun () ->
       (* Warn if std/ sources are newer than the compiler binary *)
       check_stale_std ();
@@ -2509,7 +2509,9 @@ let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
       if leak_check then Unix.putenv "BLORP_LEAK_CHECK" "strict";
       (* Disable test result caching if --no-cache or if leak_check/sanitize
        (these change behavior without changing source files) *)
-      test_cache_enabled := cache && (not sanitize) && not leak_check;
+      let repeat = max 1 repeat in
+      test_cache_enabled :=
+        cache && repeat = 1 && (not sanitize) && not leak_check;
       let effective_jobs =
         if sanitize then begin
           if jobs > 1 then
@@ -2523,29 +2525,38 @@ let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
         else detect_num_cores ()
       in
       let precompiled = precompile_runtime ~sanitize ~opt:"O0" () in
-      match
-        try_run_suite_selector_tests ~profile ~debug ~sanitize ?precompiled
-          ~leak_check ~mode ~timeout files
-      with
-      | Some result -> result
-      | None ->
-          if effective_jobs = 1 then
-            run_tests_sequential ~profile ~debug ~sanitize ?precompiled
-              ~leak_check ~mode ~timeout files
-          else
-            run_tests_parallel ~profile ~debug ~sanitize ?precompiled
-              ~leak_check ~mode ~timeout ~num_workers:effective_jobs files)
+      let run_once iteration =
+        if repeat > 1 then Printf.printf "\nRepeat %d/%d\n%!" iteration repeat;
+        match
+          try_run_suite_selector_tests ~profile ~debug ~sanitize ?precompiled
+            ~leak_check ~mode ~timeout files
+        with
+        | Some result -> result
+        | None ->
+            if effective_jobs = 1 then
+              run_tests_sequential ~profile ~debug ~sanitize ?precompiled
+                ~leak_check ~mode ~timeout files
+            else
+              run_tests_parallel ~profile ~debug ~sanitize ?precompiled
+                ~leak_check ~mode ~timeout ~num_workers:effective_jobs files
+      in
+      let rec loop iteration =
+        let result = run_once iteration in
+        if result <> 0 || iteration >= repeat then result
+        else loop (iteration + 1)
+      in
+      loop 1)
 
 (** Run tests: dispatches to sequential or parallel *)
 let run_tests ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0) ?(cache = true)
-    path =
+    ?(repeat = 1) path =
   run_test_files ~profile ~debug ~sanitize ~leak_check ~mode ~timeout ~jobs
-    ~cache
+    ~cache ~repeat
     (collect_test_files [ path ])
 
 let run_tests_paths ?(profile = false) ?(debug = false) ?(sanitize = false)
     ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0) ?(cache = true)
-    paths =
+    ?(repeat = 1) paths =
   run_test_files ~profile ~debug ~sanitize ~leak_check ~mode ~timeout ~jobs
-    ~cache (collect_test_files paths)
+    ~cache ~repeat (collect_test_files paths)

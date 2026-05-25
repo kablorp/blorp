@@ -1,0 +1,56 @@
+import:
+	system: setenv
+	test: TestSuite
+
+
+func send_timeout_int_task(ch: Channel[Int]) -> Bool:
+	send_timeout(ch, 1, 1000)
+
+
+func steal_send_slot_then_release(ch: Channel[Int]) -> Bool:
+	sleep(25)
+	first_ok: Bool = match recv(ch):
+		Some(v): v == 0
+		None: False
+	steal_ok: Bool = send(ch, 99)
+	sleep(25)
+	second_ok: Bool = match recv(ch):
+		Some(v): v == 99
+		None: False
+	first_ok and steal_ok and second_ok
+
+
+-- REGRESSION: a timed send may wake for capacity and then lose that slot to
+-- another sender before it runs. It must keep waiting until its deadline
+-- instead of reporting timeout immediately.
+func test_send_timeout_rewaits_when_woken_slot_is_stolen() -> Bool:
+	-- The thread pool reads BLORP_THREADS on first use. This test needs one
+	-- worker so the stealing task keeps running after it frees a slot, before
+	-- the woken timed sender can resume.
+	_ = setenv("BLORP_THREADS", "1")
+	ch: Channel[Int] = channel(1)
+	_ = send(ch, 0)
+	concurrent(timeout: 2000):
+		sent = send_timeout_int_task(ch)
+		stole = steal_send_slot_then_release(ch)
+	sent_ok: Bool = match sent:
+		Ok(v): v
+		Err(_): False
+	stole_ok: Bool = match stole:
+		Ok(v): v
+		Err(_): False
+	final_ok: Bool = match recv_timeout(ch, 200):
+		Some(v): v == 1
+		None: False
+	sent_ok and stole_ok and final_ok
+
+
+tests: TestSuite = {
+	description = "Concurrency: channel stolen slot",
+	tests = [
+		(
+			"send_timeout waits again after stolen slot",
+			test_send_timeout_rewaits_when_woken_slot_is_stolen,
+		),
+	],
+}

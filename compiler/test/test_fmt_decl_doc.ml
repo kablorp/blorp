@@ -40,7 +40,6 @@ let typed_param name ty =
     Ast.param_name = Some name;
     param_pattern = None;
     param_type = Some ty;
-    param_passing = Ast.ParamByValue;
     param_loc = Ast.dummy_loc;
   }
 

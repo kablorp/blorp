@@ -203,6 +203,8 @@ typedef struct {
 typedef struct {
     blorp_Object header;
     long tasks_spawned;
+    long tasks_cancelled;
+    long task_timeouts;
     long fibers_created;
     long fibers_reused;
     long fibers_completed;
@@ -224,6 +226,8 @@ typedef struct {
     long work_steals;
     long run_queue_lock_contentions;
     long timer_lock_contentions;
+    long tracked_active_tasks;
+    long tracked_parked_fibers;
     long worker_count;
     long runnable_count;
     long timers_pending;
@@ -441,6 +445,7 @@ typedef struct {
 } blorp_ThreadPool;
 
 typedef struct blorp_Fiber blorp_Fiber;  // forward decl for Task/Channel
+typedef struct blorp_ChannelSelectWaiter blorp_ChannelSelectWaiter;
 typedef struct {
     blorp_Fiber* runnable_head;
     blorp_Fiber* runnable_tail;
@@ -481,12 +486,14 @@ typedef struct {
     pthread_cond_t not_full;
     void** buffer;
     long capacity, count, head, tail;
-    bool closed;
+    bool sealed;
     void (*elem_release)(void*);
     blorp_Fiber* send_waiters_head;
     blorp_Fiber* send_waiters_tail;
     blorp_Fiber* recv_waiters_head;
     blorp_Fiber* recv_waiters_tail;
+    blorp_ChannelSelectWaiter* select_waiters_head;
+    blorp_ChannelSelectWaiter* select_waiters_tail;
 } blorp_Channel;
 
 typedef struct {
@@ -1464,11 +1471,41 @@ void* blorp_task_try_join(void* t);
 void* blorp_concurrent_join(void* t, long timeout_ms);
 long blorp_concurrent_deadline_us(long timeout_ms);
 long blorp_concurrent_remaining_ms(long deadline_us);
+long blorp_concurrent_normalize_limit(long requested);
 void blorp_task_cancel(void* t);
+void blorp_task_cancel_join_release(void* t);
 void blorp_sleep(long ms);
+void blorp_yield_now(void);
 long blorp_max_threads(void);
 
 // Channels
+#define BLORP_CHANNEL_SEND_ACCEPTED 0L
+#define BLORP_CHANNEL_SEND_WOULD_BLOCK 1L
+#define BLORP_CHANNEL_SEND_SEALED 2L
+#define BLORP_CHANNEL_SEND_TIMED_OUT 3L
+
+#define BLORP_CHANNEL_RECV_VALUE 0L
+#define BLORP_CHANNEL_RECV_WOULD_BLOCK 1L
+#define BLORP_CHANNEL_RECV_SEALED 2L
+#define BLORP_CHANNEL_RECV_TIMED_OUT 3L
+
+#define BLORP_SELECT_RECV 0L
+#define BLORP_SELECT_SEALED 1L
+#define BLORP_SELECT_AFTER 2L
+#define BLORP_SELECT_CANCELLED 3L
+
+typedef struct {
+    long kind;
+    blorp_Channel* channel;
+    long timeout_ms;
+} blorp_SelectArm;
+
+typedef struct {
+    long arm_index;
+    long kind;
+    void* value;
+} blorp_SelectResult;
+
 void* blorp_channel_new(long capacity);
 long blorp_channel_send(void* c, void* value);
 void* blorp_channel_recv(void* c);
@@ -1478,10 +1515,14 @@ void* blorp_channel_try_recv(void* c);
 void* blorp_channel_recv_timeout(void* c, long timeout_ms);
 long blorp_channel_send_timeout(void* c, void* value, long timeout_ms);
 long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms);
+void blorp_channel_seal(void* c);
 void blorp_channel_close(void* c);
 bool blorp_channel_recv_raw(blorp_Channel* ch, void** out);
+long blorp_channel_try_recv_status_raw(blorp_Channel* ch, void** out);
 bool blorp_channel_try_recv_raw(blorp_Channel* ch, void** out);
+long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, void** out);
 bool blorp_channel_recv_timeout_raw(blorp_Channel* ch, long timeout_ms, void** out);
+blorp_SelectResult blorp_select_wait(blorp_SelectArm* arms, long arm_count);
 blorp_StackOption_Int blorp_channel_recv_int(void* c);
 blorp_StackOption_Int blorp_channel_try_recv_int(void* c);
 blorp_StackOption_Int blorp_channel_recv_timeout_int(void* c, long timeout_ms);

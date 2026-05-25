@@ -446,6 +446,27 @@ let rec count_uses (name : string) (e : core) : int =
   | CFor (binder, iter, body) ->
       count_uses name iter
       + if binder.loop_var.vname = name then 0 else count_uses name body
+  | CSelect select ->
+      let wait_uses =
+        List.fold_left
+          (fun acc arm ->
+            acc
+            +
+            match arm.select_arm_kind with
+            | SelectRecv r -> count_uses name r.select_channel
+            | SelectSealed channel -> count_uses name channel
+            | SelectAfter timeout -> count_uses name timeout)
+          0 select.select_arms
+      in
+      let branch_uses =
+        List.fold_left
+          (fun acc arm ->
+            match arm.select_arm_kind with
+            | SelectRecv r when r.select_bind.vname = name -> acc
+            | _ -> max acc (count_uses name arm.select_arm_body))
+          0 select.select_arms
+      in
+      wait_uses + branch_uses
   | CAssign (_, rhs) ->
       (* LHS is a write, not a read — don't count the target. The
          assignment itself rebinds the variable; Perceus shouldn't
@@ -932,6 +953,32 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
       if body_uses.consumed_refs > 0 then
         ownership_uses_from_legacy_count (count_uses name e)
       else seq_ownership_uses iter_uses { body_uses with returns_alias = false }
+  | CSelect select ->
+      let wait_uses =
+        aggregate_ownership_uses
+          (List.map
+             (fun arm ->
+               match arm.select_arm_kind with
+               | SelectRecv r ->
+                   summarize_linear_borrow env name r.select_channel
+               | SelectSealed channel ->
+                   summarize_linear_borrow env name channel
+               | SelectAfter timeout ->
+                   summarize_linear_ownership_uses env name timeout)
+             select.select_arms)
+      in
+      let branch_uses =
+        branch_ownership_uses
+          (List.map
+             (fun arm ->
+               match arm.select_arm_kind with
+               | SelectRecv r when r.select_bind.vname = name ->
+                   no_ownership_uses
+               | _ ->
+                   summarize_linear_ownership_uses env name arm.select_arm_body)
+             select.select_arms)
+      in
+      seq_ownership_uses wait_uses branch_uses
   | CWhile (cond, body) ->
       let cond_uses = summarize_linear_ownership_uses env name cond in
       let body_uses = summarize_linear_ownership_uses env name body in
@@ -965,7 +1012,7 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
       in
       seq_ownership_uses timeout_uses (seq_ownership_uses task_uses body_uses)
   | CConcurrentFor cf ->
-      let iter_uses = summarize_linear_ownership_uses env name cf.cf_iter in
+      let iter_uses = summarize_linear_borrow env name cf.cf_iter in
       let task_uses =
         if cf.cf_var.vname = name then no_ownership_uses
         else task_capture_ownership_use name cf.cf_body

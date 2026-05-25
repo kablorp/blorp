@@ -8,7 +8,8 @@ design target, not a claim about the current implementation.
 Blorp should support large numbers of cheap, stackful virtual threads while
 preserving the language's value-semantics model:
 
-- `concurrent:` and `concurrent for` remain the primary user-facing API.
+- `concurrent:`, `for ... concurrently(limit:)`, and `List.concurrent(...)`
+  remain the primary user-facing APIs.
 - A blocked task parks its fiber instead of blocking an OS worker thread.
 - Spawning and running a no-op task is cheap enough that users can choose
   clear structured concurrency without manually batching tiny tasks.
@@ -209,9 +210,10 @@ order:
 
 3. **Core concurrency semantics**
    Document and enforce the Core meaning of `CConcurrent` and `CConcurrentFor`:
-   spawn-all-before-join behavior, result ordering, timeout cancellation,
-   closure capture ownership, `max_threads` initialization, and the exact
-   points where child results become managed values.
+   fixed-block task spawning, bounded dynamic fan-out, result ordering for
+   collected forms, timeout cancellation, closure capture ownership,
+   `limit`/legacy `max_threads` handling, and the exact points where child
+   results become managed values.
 
    Hardening target: extend Core invariants so backend emission can assume
    task closure metadata, ownership, cancellation, and result slots are already
@@ -220,11 +222,12 @@ order:
 
    Initial compiler hardening: final Core invariants now enforce the typed
    result contract for `CConcurrent` and `CConcurrentFor`: task bodies have raw
-   type `T`, joined bindings have `Result[T, ConcurrencyError]`,
-   `concurrent for` expressions have `List[Result[T, ConcurrencyError]]`,
+   type `T`, joined bindings have public type `TaskResult[T]` backed by
+   canonical Core `Result[T, ConcurrencyError]`,
+   collected fan-out expressions have `List[Result[T, ConcurrencyError]]`,
    timeout expressions are `Int`, task closure return metadata matches the task
-   body, `max_threads` is positive when present, and `concurrent for` remains
-   list-only until a representation-aware Core form exists.
+   body, task limits are positive when required by source syntax, and dynamic
+   fan-out remains list-only until a representation-aware Core form exists.
 
 4. **Cheap fiber lifecycle**
    Add fiber object and stack pooling. Preserve one-live-owner stack semantics

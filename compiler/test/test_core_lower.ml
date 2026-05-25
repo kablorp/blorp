@@ -441,7 +441,6 @@ let test_lower_lambda () =
             param_name = Some "x";
             param_pattern = None;
             param_type = Some ty_int;
-            param_passing = ParamByValue;
             param_loc = loc;
           };
         ];
@@ -475,7 +474,6 @@ let test_lower_lambda_missing_param_type_raises () =
             param_name = Some "x";
             param_pattern = None;
             param_type = None;
-            param_passing = ParamByValue;
             param_loc = loc;
           };
         ];
@@ -1015,7 +1013,7 @@ let test_lower_concurrent_for () =
   let range = mk_ast (ERange (ast_int 0, ast_int 10)) ty_range in
   let ast =
     mk_ast
-      (EConcurrentFor ("i", range, ast_void, None, ConcurrentForDefault))
+      (EConcurrentFor ("i", range, ast_void, None, ConcurrentForLimit 2))
       ty_void
   in
   let c = lower_expr ast in
@@ -1027,6 +1025,11 @@ let test_lower_concurrent_for () =
       let child_id =
         task_scope_id_to_int cf.cf_task_scope.task_child_scope_id
       in
+      Alcotest.(check bool)
+        "void concurrent-for discards results" true
+        (match cf.cf_output with
+        | ConcurrentForDiscard -> true
+        | ConcurrentForCollect -> false);
       Alcotest.(check int) "root parent scope" 0 parent_id;
       Alcotest.(check bool) "fresh child scope" true (child_id > 0);
       Alcotest.(check bool)
@@ -1038,22 +1041,32 @@ let test_lower_nested_concurrent_for_task_scopes () =
   let inner_range = mk_ast (ERange (ast_int 0, ast_int 10)) ty_range in
   let inner =
     mk_ast
-      (EConcurrentFor ("j", inner_range, ast_void, None, ConcurrentForDefault))
+      (EConcurrentFor ("j", inner_range, ast_void, None, ConcurrentForLimit 2))
       ty_void
   in
   let outer =
     mk_ast
-      (EConcurrentFor ("i", outer_range, inner, None, ConcurrentForDefault))
+      (EConcurrentFor ("i", outer_range, inner, None, ConcurrentForLimit 2))
       ty_void
   in
   let c = lower_expr outer in
   match c.desc with
   | CConcurrentFor outer_cf -> (
+      Alcotest.(check bool)
+        "outer void concurrent-for discards results" true
+        (match outer_cf.cf_output with
+        | ConcurrentForDiscard -> true
+        | ConcurrentForCollect -> false);
       let outer_child_id =
         task_scope_id_to_int outer_cf.cf_task_scope.task_child_scope_id
       in
       match outer_cf.cf_body.desc with
       | CConcurrentFor inner_cf ->
+          Alcotest.(check bool)
+            "inner void concurrent-for discards results" true
+            (match inner_cf.cf_output with
+            | ConcurrentForDiscard -> true
+            | ConcurrentForCollect -> false);
           let inner_parent_id =
             task_scope_id_to_int inner_cf.cf_task_scope.task_parent_scope_id
           in
@@ -1130,7 +1143,6 @@ let test_param_missing_type_raises () =
       param_name = Some "x";
       param_pattern = None;
       param_type = None;
-      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -1161,7 +1173,6 @@ let test_param_meta_type_raises () =
       param_name = Some "x";
       param_pattern = None;
       param_type = Some (TyNamed ("List", [ TyMeta 1 ]));
-      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -1214,7 +1225,6 @@ let test_param_without_name_or_pattern_raises () =
       param_name = None;
       param_pattern = None;
       param_type = Some ty_int;
-      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -1269,7 +1279,6 @@ let test_param_with_name_and_pattern_raises () =
       param_name = Some "x";
       param_pattern = Some (PatVar "y");
       param_type = Some ty_int;
-      param_passing = ParamByValue;
       param_loc = loc;
     }
   in
@@ -1362,7 +1371,6 @@ let mk_param_named name ty =
     param_name = Some name;
     param_pattern = None;
     param_type = Some ty;
-    param_passing = ParamByValue;
     param_loc = loc;
   }
 
@@ -1482,7 +1490,6 @@ let test_lower_func_with_pattern_param () =
       param_name = None;
       param_pattern = Some (PatTuple [ PatVar "a"; PatVar "b" ]);
       param_type = Some tup_ty;
-      param_passing = ParamByValue;
       param_loc = loc;
     }
   in

@@ -193,7 +193,7 @@ quickly creates nested, memory-heavy result structures. For ordinary
 data-parallel result collection, prefer library helpers:
 
 ```blorp
-results = urls.map_concurrently(limit: 256, fetch)
+results = urls.concurrent(256, fetch)
 ```
 
 ### Nesting
@@ -312,14 +312,26 @@ default.
 Full-channel behavior should be visible in the operation name or return value:
 
 ```blorp
-try_send(ch: Channel[T], value: T) -> SendAttempt
+try_send(ch: Channel[T], value: T) -> Bool
+try_send_attempt(ch: Channel[T], value: T) -> SendAttempt
 wait_send(ch: Channel[T], value: T) -> Result[Void, ChannelSealed]
-send_timeout(ch: Channel[T], value: T, ms: Int) -> SendAttempt
+send_timeout(ch: Channel[T], value: T, ms: Int) -> Bool
+send_timeout_attempt(ch: Channel[T], value: T, ms: Int) -> SendAttempt
 recv(ch: Channel[T]) -> Option[T]
+wait_recv(ch: Channel[T]) -> Result[T, ChannelSealed]
+try_recv_attempt(ch: Channel[T]) -> RecvAttempt[T]
 try_recv(ch: Channel[T]) -> Option[T]
 recv_timeout(ch: Channel[T], ms: Int) -> Option[T]
+recv_timeout_attempt(ch: Channel[T], ms: Int) -> RecvAttempt[T]
 seal(ch: Channel[T]) -> Void
 ```
+
+`recv_timeout` remains a compatibility `Option` API for now. It intentionally
+collapses timeout and sealed-and-drained into `None`.
+`recv_timeout_attempt` is the typed form; it must stay runtime-backed rather
+than being composed from `recv_timeout` plus a separate sealed-and-drained
+check. A std-only wrapper would report two different observations of a channel
+shared with other fibers.
 
 The naming matters. A method named `send` should not secretly park forever when
 the buffer is full. Use `try_send` when fullness is a local branch and
@@ -422,7 +434,7 @@ total = costs.sum()
 or:
 
 ```blorp
-total = items.map_concurrently(limit: 128, func(item): item.cost()).sum()
+total = items.concurrent(128, func(item): item.cost()).sum()
 ```
 
 Future CRDT-style APIs may support explicit concurrent accumulation, but they
@@ -665,7 +677,7 @@ for path in paths concurrently(limit: 128):
 This implies a useful standard combinator:
 
 ```blorp
-Result[R, E].with_resource(func(resource: borrow R) -> T) -> Result[T, E]
+Result[R, E].with_resource(func(resource) -> T) -> Result[T, E]
 ```
 
 Meaning:
@@ -694,7 +706,7 @@ func fetch_all(urls: List[String]) -> List[FetchResult]:
 Higher-level helpers can provide map-like behavior for ordinary values:
 
 ```blorp
-urls.map_concurrently(limit: 256, fetch)
+urls.concurrent(256, fetch)
 ```
 
 Those helpers are library conveniences, not the foundational concurrency
@@ -763,7 +775,7 @@ for path in paths concurrently(limit: 32):
 For ordinary result collection, use helpers before reaching for channels:
 
 ```blorp
-results = paths.map_concurrently(limit: 32, analyze)
+results = paths.concurrent(32, analyze)
 ```
 
 When work becomes a pipeline, introduce an explicitly sized channel:
@@ -843,7 +855,7 @@ Desired properties:
 ### HTTP Handler
 
 ```blorp
-func handle_connection(conn: borrow TcpStream) -> Void:
+for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
 	match conn.read_request():
 		Ok(req):
 			resp = route(req)
@@ -852,7 +864,10 @@ func handle_connection(conn: borrow TcpStream) -> Void:
 			_ = conn.write_all(bad_request().to_bytes())
 ```
 
-The loop owns the connection resource. The handler borrows it synchronously.
+The loop owns each connection resource. Without source-level resource
+parameters, protocol handlers that need the handle stay in the resource-owning
+block; ordinary helper functions receive parsed requests, response bodies, or
+other non-resource data.
 
 ### Database Querying
 
@@ -1028,11 +1043,14 @@ API shape:
 ```blorp
 listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
 connect(host: String, port: Int) -> Result[TcpStream, TcpError]
-connections(listener: borrow TcpListener) -> ResourceSource[TcpStream, TcpError]
-read_chunk(stream: borrow TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
-write_all(stream: borrow TcpStream, data: Bytes) -> Result[Void, TcpError]
-chunks(stream: borrow TcpStream) -> FallibleStream[Bytes, TcpError]
+connections(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]
+read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
+write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]
+chunks(stream: TcpStream) -> FallibleStream[Bytes, TcpError]
 ```
+
+These are compiler-owned resource operations. The surface language does not
+have `borrow` parameter syntax for user-defined functions.
 
 DNS must remain explicit:
 
@@ -1191,7 +1209,8 @@ Goal: know exactly what existing concurrency code depends on.
 Work:
 
 - Catalogue all uses of `concurrent:`, `concurrent for`, `detach`, channels,
-  channel close/seal behavior, timeout helpers, and TCP concurrency examples.
+  channel seal behavior and the legacy close alias, timeout helpers, and TCP
+  concurrency examples.
 - Add snapshot tests for the current behavior before changing it.
 - Identify which tests rely on result collection from `concurrent for`.
 - Identify any code that assumes detached work can outlive resources.
@@ -1228,17 +1247,141 @@ blocked in channel receive, tasks blocked in channel send, stream iteration, and
 late side effects. Runtime regressions also verify that cancelled channel
 senders/receivers leave the channel usable after timeout, which protects the
 waiter-unregistration contract needed by `select` and resource-producing
-iteration. Scheduler instrumentation now exposes channel send/receive park
-counters, so tests and benchmarks can distinguish bounded-channel backpressure
-from timer, scheduler, and reactor waits. Resource cleanup on cancellation and
-nested cancellation ordering still need resource-specific coverage as the
-resource/concurrency integration lands.
+iteration. The same coverage now exercises the typed `wait_recv` and
+`wait_send` wrappers, so their `Result`-shaped API does not hide cancellation
+or leave stale waiters behind. Scheduler instrumentation now exposes channel
+send/receive park counters, so tests and benchmarks can distinguish
+bounded-channel backpressure from timer, scheduler, and reactor waits. Resource
+cleanup on cancellation and nested cancellation ordering still need
+resource-specific coverage as the resource/concurrency integration lands.
+Fixed `concurrent:` child task handles are now registered on the task
+cancellation cleanup stack. If a parent task is cancelled while it is joining a
+nested `concurrent:` block, the child handles are cancelled, waited, discarded,
+and released before the parent unwinds. Runtime coverage exercises a parent
+timeout that cancels a nested block whose grandchild is parked on a channel.
+Dynamic fan-out now uses the same cleanup-stack model for
+`for ... concurrently` task windows: each active task slot is registered until
+its join result is claimed, and the heap task/cleanup arrays are freed if the
+parent task is cancelled mid-window. Runtime coverage exercises a parent
+timeout that cancels a nested limited fan-out whose children are parked on a
+channel. Expression-level fan-out result lists are also registered with the
+cancellation cleanup stack until ownership transfers to the surrounding
+expression, and their visible length advances as each join result is stored so
+partially collected results are released correctly on cancellation. Child-task
+cleanup waits are cancellation-resistant once started, so a second cancellation
+request cannot interrupt the cleanup join and leave descendant tasks running.
+Task join now also preserves the task result's runtime RC bit when boxing
+`Ok(payload)`, so `TaskResult[String]` and
+`List[Result[String, ConcurrencyError]]` release payloads through ordinary
+Result destruction. Cancellation cleanup now also tracks managed locals whose
+normal ownership endpoint is a tail transfer rather than a `CDrop`, so a task
+cancelled between constructing a returned value and reaching the return does
+not leak that value. Strict leak-check coverage exercises successful
+`List.concurrent` string results and timed-out `List.concurrent_with_timeout`
+tasks with managed string locals.
+Scheduler instrumentation also exposes `tasks_cancelled`, counted when a task's
+cooperative cancellation flag is first set, so timeout tests can distinguish
+actual cancellation requests from merely returning a timeout result.
+`task_timeouts` separately counts task joins that observed timeout and requested
+cancellation of unfinished child tasks.
+`tracked_active_tasks` is now exposed as a non-resettable gauge for tasks spawned
+while scheduler stats are enabled, which avoids deriving live work from counters
+that can be reset while tasks are still running. `tracked_parked_fibers` is also
+exposed as a non-resettable gauge for fibers parked while scheduler stats are
+enabled, measured at the central fiber park boundary, so tests can observe work
+blocked at scheduler park points without inferring it from cumulative park
+counters.
+The compiler unit suite now compares the `SchedulerStats` field order in
+`std/instrumentation.brp`, `runtime.c`, and `runtime_decl.c`, so layout drift
+fails at the consistency-test boundary instead of becoming an ABI mismatch.
 
 Migration impact: none visible unless existing timeout behavior is buggy. Fix
 bugs here before exposing new user-facing cancellation syntax.
 
 Stop condition: cancellation is reliable enough that syntax can promise
 "timeout cancels timed-out work."
+
+### Phase 1A: Rock-Solid Concurrency Testability
+
+Goal: move from scenario regression tests to repeatable adversarial concurrency
+validation before making deeper scheduler, channel, `select`, or TCP changes.
+
+The current test suite is broad: it covers fixed `concurrent:` blocks, dynamic
+fan-out, `List.concurrent`, detached work, channel send/receive variants,
+timeouts, channel sealing, scheduler instrumentation, cancellation, and leak
+baselines. That is a strong regression net, but it is still mostly
+scenario-based. Rock-solid concurrency needs tests that can force or explore
+bad interleavings without relying on wall-clock sleeps.
+
+Work:
+
+- Add a test-runner stress-repeat mode so timing-sensitive runtime tests can be
+  run many times in one invocation, with caching disabled for repeated runs.
+- Add deterministic scheduler test hooks: a source-level test helper for
+  cooperative yielding first, then a test-only deterministic scheduler or
+  virtual-clock mode for exact park/wake/deadline interleavings.
+- Add channel model/property tests for small capacities. Random or enumerated
+  operations should exercise `send`, `recv`, `try_send`, `try_recv`,
+  timeout-attempt helpers, `seal`, and cancellation while checking invariants:
+  no duplicated values, no accepted sends after seal, sealed-and-drained is
+  final, and buffered values drain in send order.
+- Add linearizability-style MPMC channel stress tests once operation histories
+  are practical to record. These should verify that observed send/receive
+  results can be serialized into a valid channel history respecting real-time
+  ordering.
+- Add a cancellation-point matrix for every operation that can park: timer
+  sleep, channel send, channel receive, task join, dynamic fan-out joins,
+  reactor waits, blocking-worker waits, and eventually resource cleanup.
+- Add sanitizer and leak-check variants for parked, woken, cancelled,
+  timed-out, sealed, and completed fiber paths.
+- Add performance guardrails for noop task spawn/join, park/wake, channel
+  roundtrip, timeout setup/cancel, and bounded `List.concurrent` fan-out. These
+  should live with benchmarks or an explicit performance gate, not as fragile
+  ordinary correctness assertions.
+- Decide and document scheduler fairness guarantees before testing fairness.
+  If fairness is best-effort, tests should assert no dead tasks or lost wakeups,
+  not strict FIFO scheduling.
+
+Tests:
+
+- Stress-repeat CLI coverage proves repeated tests actually rerun instead of
+  returning a cached success.
+- Deterministic yield tests avoid sleep-based ordering when a cooperative yield
+  is enough to expose the intended interleaving.
+- Channel property tests cover capacity `1` and `2`, seal during load, and
+  mixed producer/consumer fan-out.
+- Cancellation matrix tests assert that timed-out waiters are removed from wait
+  queues and task-local managed values are released.
+- Sanitizer/leak gates run the focused concurrency and channel baselines.
+
+Implementation status: `blorp test --repeat N` now reruns selected runtime tests
+with result caching disabled for that invocation. CLI smoke coverage verifies
+both invalid repeat counts and a side-effecting repeated test, so a cached pass
+cannot masquerade as a stress run. The first repeat run exposed a scheduler-order
+assumption in the existing channel "stolen slot" regression; that case now lives
+in a focused single-worker test file so it still protects timed-send rewaiting
+without racing the global worker pool. `yield_now()` now gives tests,
+benchmarks, and CPU-bound loops an explicit cooperative scheduling point that
+does not install a timer. It uses the runtime's pending-wake path so a yielding
+fiber is re-enqueued only after the current worker returns from `mco_resume`,
+which avoids concurrent resume of the same coroutine. Channel property coverage
+now also includes a small operation-history MPMC run: accepted sends, received
+values, and rejected sends are recorded into a separate channel and validated
+after the run. This is not a full linearizability checker yet, but it
+establishes the source-level pattern needed for one. The older MPMC property
+regression now uses structured concurrency instead of detached consumers, so
+strict leak checking can cover it directly. Channel property tests now cover
+capacity-1 and capacity-2 FIFO behavior, permanent seal behavior across
+blocking/nonblocking/timed send APIs, exact-once MPMC delivery through
+structured consumers, and timed sender/receiver cleanup that leaves the channel
+usable after waiters time out.
+
+Migration impact: none. This phase adds testability, diagnostics, and gates; it
+should not alter source-level concurrency semantics.
+
+Stop condition: a scheduler or channel runtime change can be validated by a
+deterministic test, a stress-repeat command, a leak/sanitizer run, and a
+benchmark guardrail before it is merged.
 
 ### Phase 2: Syntax Split Without Semantic Expansion
 
@@ -1255,8 +1398,9 @@ Work:
 - Emit a migration diagnostic for `concurrent for`:
 
 ```text
-`concurrent for` has moved to `for ... concurrently(limit: N)`.
-Choose an explicit limit so task width and backpressure are visible.
+`concurrent for` has been removed.
+Use `for ... concurrently(limit: N)` for statement fan-out, or
+`items.concurrent(N, func(item): ...)` to collect results.
 ```
 
 Current:
@@ -1276,27 +1420,35 @@ for item in items concurrently(limit: 128):
 Target for result collection:
 
 ```blorp
-results = items.map_concurrently(limit: 128, work)
+results = items.concurrent(128, work)
 ```
 
 Tests:
 
 - Parser accepts `for ... concurrently(limit: N)`.
 - Parser rejects missing `limit` with a clear help message.
+- Parser rejects legacy `max_threads`, duplicate parameters, unknown
+  parameters, and reserved-but-unimplemented `item_timeout` in
+  `for ... concurrently(...)`.
 - Parser rejects `concurrently:` as a block spelling and suggests
   `concurrent:`.
 - Formatter preserves the new loop modifier.
 
-Migration impact: old `concurrent for` can still parse during the warning
-window, but new code should use the target forms. The first implementation
-slice may accept both forms before adding the legacy diagnostic.
+Migration impact: old `concurrent for` now hard-errors with a migration
+diagnostic. Side-effecting code should use `for ... concurrently(limit: N):`;
+value-collecting code should use `List.concurrent(...)` or
+`List.concurrent_with_timeout(...)`.
 
 Implementation status: the parser, AST, typed AST, Core, formatter, and
 expression-document bridge preserve `limit` as distinct from legacy
 `max_threads`. Codegen now treats `for ... concurrently(limit: N)` as a
 per-loop active-task limit by spawning and joining work in windows of at most
-`N` tasks. Legacy `concurrent for` / `max_threads` still uses the older
-scheduler-width path and is intentionally left separate for migration.
+`N` tasks. Legacy `concurrent for` and `concurrent(max_threads: ...) for`
+source syntax now fail at parse time with migration diagnostics.
+Parser coverage now pins the source syntax boundary: `limit` is the loop width
+spelling, `timeout` is accepted for whole-loop deadlines, `max_threads` remains
+legacy block syntax only, and `item_timeout` is reserved until per-item deadline
+semantics are implemented.
 
 Stop condition: users can mechanically migrate syntax without changing program
 semantics yet.
@@ -1352,7 +1504,12 @@ block-local declarations do not get mistaken for captures solely because they
 reuse an outer name. Fixed `concurrent:` tasks, dynamic
 `for ... concurrently` bodies, and `detach` bodies also reject read-captures of
 outer mutable bindings; users must bind an immutable snapshot before starting
-work when a task needs the current value.
+work when a task needs the current value. `CConcurrentFor` now also carries an
+explicit output mode: collect-mode nodes produce
+`List[Result[T, ConcurrencyError]]`, while discard-mode nodes produce `Void`
+and require the child task body to be `Void` in Core. Core invariants enforce
+the mode/type pairing, so later passes no longer need to infer statement versus
+expression fan-out from emission context.
 
 Migration impact: this will reject programs that accidentally relied on shared
 mutable state or resource capture. Diagnostics should explain channels,
@@ -1370,26 +1527,59 @@ Work:
 - Make the loop statement-only and `Void`-typed.
 - Ensure the loop joins before continuing.
 - Enforce no implicit result collection.
-- Add `List.map_concurrently(limit:, func)` for ordinary result collection if
-  it does not already exist with the desired semantics.
+- Add `List.concurrent(limit, func)` for ordinary result collection, keeping
+  `List.map_concurrently(limit, func)` as a compatibility spelling.
 
 Tests:
 
 - Tasks run concurrently and auto-join.
 - Loop body values are discarded only when the body is statement-compatible.
-- `map_concurrently` preserves result order if that is the chosen contract.
+- `List.concurrent` preserves result order.
 - Nested fan-out respects each local `limit`.
 
 Implementation status: ordinary list fan-out with `concurrently(limit: N)` now
 emits bounded windows of active child tasks, so total task allocation is capped
 by the local `limit` instead of the input length. The existing implementation
-still supports expression-level result collection for compatibility; the
-statement-only surface and any `map_concurrently` migration helper remain to be
-designed and implemented deliberately rather than smuggled into codegen.
+still supports expression-level result collection for compatibility. The
+explicit collection helper now exists as
+`List.concurrent(limit, func) -> List[Result[U, ConcurrencyError]]`, matching
+`List.parallel(...)` as a method-shaped list operation.
+`List.concurrent_with_timeout(limit, Duration, func)` now covers the collected
+whole-operation deadline case before diagnostics are added for value-producing
+loop syntax. `List.map_concurrently` remains as a compatibility spelling. The
+compiler-owned list helpers synthesize directly to Core `CConcurrentFor` with a
+typed limit expression, instead of routing through a separate runtime
+algorithm, so they share task batching, task closure conversion, cancellation,
+deadline handling, and Result wrapping with source
+`for ... concurrently(limit: N)`. Source loop syntax still accepts only
+positive integer literal limits; the helper accepts an `Int` value and
+normalizes values less than 1 to serial execution. The user guide now teaches
+`for ... concurrently(limit:)` as statement fan-out, `List.concurrent` as the
+value-collecting form, and `List.concurrent_with_timeout` for collected
+fan-out with deadlines. Value-producing `for ... concurrently(...)` now fails
+in typechecking with a migration diagnostic that points at the list helpers.
+The virtual-thread benchmark and the
+general virtual-thread runtime tests now use `List.concurrent`, and the
+Duration timeout runtime test, bounded-window codegen audit, and binder
+shadowing typecheck case use statement fan-out. The ordinary runtime coverage
+for basic collection and timeout collection has also moved to
+`List.concurrent` / `List.concurrent_with_timeout`.
+TCP benchmarks still have legacy fan-out spelling and are intentionally
+deferred until the TCP/resource design resumes. A `for ... concurrently` loop
+in statement position or `Void` tail position is inferred and lowered as
+discard-mode statement fan-out, so it does not allocate an unobservable result
+list. Direct `?=` in loop bodies now has a stable diagnostic covering both
+ordinary loops and `for ... concurrently(...)` bodies, with help text pointing
+users at an explicit `match` or Option/Result combinators instead of implying
+future implicit loop propagation. User-facing diagnostics for ordinary
+fan-out now use the source spelling `for ... concurrently` for non-list
+iterables, timeout type errors, mutable outer assignments, mutable captures,
+and purity reports; `concurrent for` remains only as the legacy spelling in
+migration diagnostics and Core-internal terminology.
 
 Migration impact: result-collecting `concurrent for` users move to
-`map_concurrently`; side-effecting or channel-producing users move to
-`for ... concurrently`.
+`List.concurrent` or `List.concurrent_with_timeout`; side-effecting or
+channel-producing users move to `for ... concurrently`.
 
 Stop condition: ordinary non-resource concurrent loops work end to end without
 resource or TCP special cases.
@@ -1399,25 +1589,32 @@ resource or TCP special cases.
 Goal: preserve the good part of current `concurrent:` while making failure,
 timeout, and cancellation explicit.
 
-Open ergonomic choice:
+Chosen compatibility contract: `TaskResult[T]` is a public alias for
+`Result[T, ConcurrencyError]`.
 
-Option A: use ordinary `Result[T, ConcurrencyError]`.
+Using the alias keeps existing `Ok`/`Err` matching and generated C unchanged,
+but gives fixed concurrent tasks a named boundary type in annotations,
+diagnostics, and docs.
 
 ```blorp
 concurrent:
-	users = fetch_users()
+	users: TaskResult[List[User]] = fetch_users()
 	orders = fetch_orders()
 
 match users:
 	Ok(value): render_users(value)
-	Err(TimedOut): render_timeout()
+	Err(Timeout): render_timeout()
 	Err(Cancelled): render_cancelled()
+	Err(TaskFailed(message)): log(message)
 ```
 
-Pros: no new type. Cons: nested results are awkward when a task itself returns
-`Result[T, E]`.
+This is intentionally not a new union yet. A task returning `Result[T, E]`
+therefore has type `TaskResult[Result[T, E]]`, preserving the distinction
+between user errors and task-level timeout/cancellation without changing
+source pattern shapes.
 
-Option B: add a dedicated task-result union.
+Deferred alternative: a dedicated task-result union remains possible if nested
+results prove too awkward in real programs.
 
 ```blorp
 concurrent:
@@ -1433,10 +1630,6 @@ match users:
 
 Pros: separates task outcome from user return values. Cons: adds a new concept.
 
-Recommended migration: implement a named `TaskResult[T]` alias or union before
-adding timeout syntax. That gives diagnostics a precise place to point and
-avoids nested `Result` confusion in database and HTTP code.
-
 Tests:
 
 - Bound names are unavailable inside sibling tasks and available after join.
@@ -1447,9 +1640,13 @@ Tests:
 Implementation status: source-level `concurrent:` now rejects duplicate result
 bindings, result bindings that redeclare an existing name in the enclosing
 scope, and references to sibling result bindings from task bodies. Result
-bindings are still ordinary `Result[T, ConcurrencyError]` values after the
-block joins; a dedicated `TaskResult[T]` type remains an open design step before
-new timeout syntax should be added.
+bindings now have the public name `TaskResult[T]`, implemented as a builtin and
+standard-library alias over `Result[T, ConcurrencyError]`. Core still carries
+the canonical `Result[T, ConcurrencyError]` form so codegen and invariants do
+not depend on source alias spelling. The `ConcurrencyError` contract is explicit
+across the runtime, builtin environment, and standard library: `Timeout`,
+`TaskFailed(String)`, and `Cancelled` are all declared variants, so cancellation
+is no longer an implicit runtime-only state.
 
 Migration impact: existing `concurrent:` users may need to match on task
 outcomes instead of assuming raw values.
@@ -1467,12 +1664,17 @@ Work:
 - Add or standardize:
 
 ```blorp
-try_send(ch: Channel[T], value: T) -> SendAttempt
+try_send(ch: Channel[T], value: T) -> Bool
+try_send_attempt(ch: Channel[T], value: T) -> SendAttempt
 wait_send(ch: Channel[T], value: T) -> Result[Void, ChannelSealed]
-send_timeout(ch: Channel[T], value: T, ms: Int) -> SendAttempt
+send_timeout(ch: Channel[T], value: T, ms: Int) -> Bool
+send_timeout_attempt(ch: Channel[T], value: T, ms: Int) -> SendAttempt
 recv(ch: Channel[T]) -> Option[T]
+wait_recv(ch: Channel[T]) -> Result[T, ChannelSealed]
+try_recv_attempt(ch: Channel[T]) -> RecvAttempt[T]
 try_recv(ch: Channel[T]) -> Option[T]
 recv_timeout(ch: Channel[T], ms: Int) -> Option[T]
+recv_timeout_attempt(ch: Channel[T], ms: Int) -> RecvAttempt[T]
 seal(ch: Channel[T]) -> Void
 ```
 
@@ -1531,26 +1733,68 @@ channel waits remove their waiters on timeout, and non-blocking `try_send` /
 `try_recv` now wake opposite-side fiber waiters when they make buffer progress,
 matching blocking send/recv behavior. Runtime tests cover `seal` waking blocked
 receivers and senders, draining buffered values before `None`, and one-way
-idempotent sealing. `wait_send` now returns
-`Result[Void, ChannelSealed]`, with focused doctests and runtime coverage for
-success and sealed-channel cases. Supporting that shape also made `Void`
+idempotent sealing. Channel capacities less than 1 now have explicit test
+coverage for the existing infallible runtime clamp to capacity 1. `wait_send`
+now returns `Result[Void, ChannelSealed]`, and `wait_recv` now returns
+`Result[T, ChannelSealed]`, with focused doctests and runtime coverage for
+success, sealed-channel, blocked-until-capacity, and blocked-then-sealed cases.
+The blocked-then-sealed coverage exists for both senders and receivers, so a
+future `select` implementation can rely on channel sealing waking typed
+waiters in both directions. Supporting the send shape also made `Void`
 constructor payloads explicit in type inference and C layout boxing, so
 `Result[Void, E]` can be constructed without weakening the ordinary
 no-`Void`-arguments rule. `try_send_attempt` and `send_timeout_attempt` now
 return `SendAttempt`, distinguishing accepted sends from full, sealed, and
-timed-out sends without changing existing boolean APIs. `send`, `try_send`,
-and `send_timeout` still return `Bool` as compatibility aliases; changing or
+timed-out sends without changing existing boolean APIs. Generated send-attempt
+lowering constructs the std `SendAttempt` union from named runtime send-status
+constants instead of decoding private integer tags in `std/channel.brp`.
+`try_recv_attempt` now returns `RecvAttempt[T]`, distinguishing received values
+from empty and sealed channels without changing existing
+`try_recv -> Option[T]` behavior. It is now backed by a single runtime
+nonblocking receive-status observation rather than a `try_recv` call followed
+by a separate sealed-state probe, so value, empty, and sealed are coherent
+across fiber boundaries. No source-level channel-state refinement is exposed
+because another fiber may seal the channel immediately after any observation.
+`send`, `try_send`, and
+`send_timeout` still return `Bool` as compatibility aliases; changing or
 removing those aliases remains a later migration step. The status send hooks
-also exposed a duplication hazard between runtime declarations, ownership
-contracts, and Core ABI boxing metadata; Phase 6 now includes hardening tests
-for that contract before adding more waitable channel operations. The first
-hardening slice moved runtime `void*` payload-boxing metadata onto
+and receive-status hooks also exposed a duplication hazard between runtime
+declarations, ownership contracts, and Core ABI boxing metadata; Phase 6 now
+includes hardening tests for that contract before adding more waitable channel
+operations. The first hardening slice moved runtime `void*` payload-boxing metadata onto
 `Core_ownership` builtin contract entries, and `Core_specialize` now consumes
 that derived manifest instead of maintaining a second table. Unit tests enforce
 that runtime ABI boxing and ownership coverage stay connected. Channel timeout
 helpers now also define non-positive timeouts explicitly as immediate polls,
-including on fiber-backed waits, instead of relying on runtime deadline
-arithmetic side effects.
+including on fiber-backed waits, by returning before registering channel
+waiters or timers instead of relying on runtime deadline arithmetic side
+effects. Timed send now mirrors timed receive by looping against a fixed
+deadline until capacity is actually available, the channel is sealed,
+cancellation fires, or the timeout expires; a sender woken for capacity but
+beaten to the slot by another sender keeps waiting instead of misreporting
+timeout. Failed sends for managed payloads now have strict leak-check coverage
+across full-channel, sealed-channel, and cancelled blocked-send outcomes for
+blocking, nonblocking, and timed send APIs. Managed receive paths also have
+strict leak-check coverage for `recv`, `try_recv`, `recv_timeout`, `wait_recv`,
+and typed receive attempts, including sealed-buffered values. The primary
+source-level `seal(ch)` operation
+now lowers through the seal-named `blorp_channel_seal` runtime entry point;
+`blorp_channel_close` remains as a compatibility ABI wrapper for the old
+channel `close` spelling.
+Ordinary channels cannot carry resources: typecheck coverage now rejects
+resource-containing channel aliases, function parameters, return types, and
+local bindings while still allowing direct aliases to resource handle types.
+`recv_timeout` and `recv_timeout_for` remain compatibility `Option` APIs that
+collapse timeout and sealed-and-drained into `None`.
+`recv_timeout_attempt` and `recv_timeout_attempt_for` are now the typed timed
+forms. They distinguish value, timeout, and sealed-and-drained from a single
+runtime-backed channel wait, with generated C constructing the std
+`RecvAttempt[T]` union from the coherent runtime status. This shape is
+deliberately not a std-only wrapper over `recv_timeout` plus a separate
+sealed-state check, because that would create a racy source contract before
+`select`. Generated receive-attempt lowering now compares against the named
+runtime receive-status constants instead of raw numeric tags, keeping the
+runtime/codegen ABI easier to audit as more waitable operations are added.
 
 Migration impact: channel producer code should switch from `close` wording to
 `seal` wording.
@@ -1622,11 +1866,28 @@ Tests:
 Implementation status: existing compatibility timeout forms,
 `concurrent(timeout: N):`, legacy `concurrent(timeout: N) for`, and
 `for ... concurrently(limit: N, timeout: M)` now compute their block/loop
-deadline through shared runtime helpers. The helpers define non-positive
-timeouts as immediate deadlines, round positive remaining times up to avoid
-premature zero-millisecond joins, and saturate very large deadlines instead of
-letting generated C open-code overflow-prone arithmetic. This is deliberately a
-runtime/core hardening step, not new timeout syntax.
+deadline through shared runtime helpers. These forms now accept either raw
+`Int` milliseconds or typed `Duration` values from `std/units.brp`. `Duration`
+is currently represented as microseconds with add/subtract/order operations,
+and Core lowering normalizes it to integer milliseconds before the existing
+Core timeout invariant and C emission boundary. The std-library bridge also
+exists for channel and sleep operations: `sleep_for(Duration)`,
+`recv_timeout_for(Channel[T], Duration)`, `send_timeout_for(Channel[T], T,
+Duration)`, and `send_timeout_attempt_for(Channel[T], T, Duration)`. These
+wrappers preserve the existing millisecond runtime ABI through the shared
+`units.to_timeout_milliseconds(Duration)` helper. That helper rounds positive
+sub-millisecond durations up to one millisecond so a tiny positive duration
+does not collapse into an immediate poll, and returns zero for non-positive
+durations. `Duration` also now exposes constructors for microseconds,
+milliseconds, seconds, minutes, hours, days, and weeks, plus a raw
+`to_microseconds` extractor. The bridge APIs use explicit names because
+same-name impure overloads in one source module are currently rejected by
+typechecking; making `sleep(Duration)` or `recv_timeout(..., Duration)` work
+as overloads should be a deliberate language/typechecker change, not a one-off
+std workaround. The runtime helpers define non-positive timeouts as immediate
+deadlines, round positive remaining times up to avoid premature
+zero-millisecond joins, and saturate very large deadlines instead of letting
+generated C open-code overflow-prone arithmetic.
 
 Migration impact: no existing code should need changes until timeout syntax is
 introduced.
@@ -1644,7 +1905,7 @@ Work:
 - Add resource-aware result helper:
 
 ```blorp
-Result[R, E].with_resource(func(resource: borrow R) -> T) -> Result[T, E]
+Result[R, E].with_resource(func(resource) -> T) -> Result[T, E]
 ```
 
 - Enforce that the callback cannot return the resource or scoped-derived values.
@@ -1740,7 +2001,8 @@ unregistration are correct.
 Work:
 
 - Start with channels and timers only.
-- Specify fairness: round-robin or pseudo-random among ready branches.
+- Specify fairness: rotate the first scanned arm across `select` calls so
+  always-ready branches do not permanently starve later arms.
 - Ensure losing branches unregister their waits.
 - Ensure cancellation unregisters all waits.
 - Keep selected branch execution synchronous in the current task.
@@ -1773,12 +2035,50 @@ select:
 Recommendation: keep the source-like syntax for readability, but implement only
 ordinary waitables first. Resource-producing waits can come later.
 
+Implementation status: ordinary channel/timer `select` is implemented through
+parser, AST, formatter projection, typechecking, Core lowering, C emission, and
+runtime waiter multiplexing:
+
+- `msg from ch:` requires `ch: Channel[T]` and binds `msg: T` in that branch.
+- `sealed ch:` requires `ch: Channel[T]`.
+- `_ after timeout:` accepts raw integer milliseconds or `Duration`.
+- `select:` is statement-only and impure.
+- Core carries an explicit `CSelect` node, keeping branch kind, receive binder,
+  element type, wait expression, and body structured until emission.
+- Runtime `blorp_select_wait` parks the current fiber on all channel arms plus
+  the earliest timer arm, unregisters losing waiters before returning, and
+  rotates scan order across calls for basic fairness.
+- `sealed ch:` becomes ready when the channel is sealed and drained, matching
+  the point where `recv(ch)` returns `None`.
+
+Completed hardening from implementation review:
+
+- A receive operation that drains the last buffered value from an already sealed
+  channel must wake select waiters, because `sealed ch:` becomes ready at that
+  transition even when no new send or seal operation occurs.
+- Generated receive-branch code must register selected managed values with the
+  task cancellation cleanup stack before running the branch body. Otherwise a
+  cancellation point inside the branch can skip the normal post-body release.
+
+Remaining select hardening:
+
+- Non-fiber `select` currently falls back to a short sleep-and-retry loop. Keep
+  this explicit in the roadmap until `main` and other non-fiber contexts either
+  run through the fiber scheduler or have a true condition-variable wait path.
+
 Tests:
 
-- Ready branches do not starve.
-- Losing waits unregister.
-- Timeout and cancellation unregister waiters.
+- Ready branches do not starve in repeated selects.
+- Losing channel waits unregister when a value, timer, or cancellation branch
+  wins.
+- Timer arms wake a parked fiber without occupying an OS thread.
 - `sealed ch:` behaves consistently with `recv(ch) -> None`.
+- Buffered values drain before `sealed ch:` can run.
+- Integer and `Duration` timer arms share the same runtime wait path.
+- A select waiter blocked on `sealed ch:` wakes promptly when another consumer
+  drains the final buffered value from a sealed channel.
+- Leak-check coverage cancels a task after it receives a managed value through
+  `select` and before the selected branch can finish.
 
 Migration impact: event loops can choose `select`; ordinary event-channel loops
 remain valid and recommended by default.
@@ -1821,6 +2121,92 @@ without bridge tasks.
 
 Stop condition: branch-scoped resources are represented explicitly in typed
 AST/Core.
+
+### Phase 11.5: TCP-Adjacent Readiness
+
+Goal: add guardrails around current TCP handle behavior before changing TCP into
+a resource API.
+
+This is deliberately not the full TCP resource migration. The current
+`TcpListener` and `TcpStream` API is still typed ARC handle based, and existing
+code can still pass handles into ordinary functions and detached work. The point
+of this slice is to make the known risky states visible in tests and docs so the
+resource migration starts from a measured baseline rather than a remembered
+failure.
+
+Work:
+
+- Preserve the current typed TCP API while adding regression coverage around the
+  previously reported accepted-stream detach crash shape.
+- Cover both the legacy detached-handler shape and the structured equivalent, so
+  the future migration can reject the detached form without losing a known-good
+  server pattern.
+- Audit ownership and cancellation behavior for `listen`, `accept`, `connect`,
+  `read`, `write`, timeout setup, and close while tasks are parked.
+- Keep the future resource invariant explicit: a detached task must not capture
+  a TCP resource once `TcpStream` becomes a resource.
+- Document any remaining unsoundness that cannot be rejected until TCP is
+  represented as a resource in typed AST/Core.
+
+Current implementation facts:
+
+- `std/net/tcp.brp` exposes opaque builtin `TcpListener` and `TcpStream` handles
+  and `Result[..., String]` errors.
+- Core ownership metadata treats `listen`, `accept`, `connect`, `read`,
+  `local_port`, `set_timeout`, and `set_reuse_addr` results as owned values;
+  close/write/read inputs are borrowed at the call boundary.
+- Numeric socket waits are virtual-thread aware. Hostname resolution is still
+  blocking DNS, and the std docs already tell users to prefer numeric hosts when
+  OS-worker pinning matters.
+- `write` serializes concurrent writes with an explicit `write_active` guard and
+  returns an error for an overlapping write instead of interleaving bytes.
+- Close extracts and wakes parked TCP waiters, so cancellation and close paths
+  should preserve waiter cleanup as an invariant.
+- Overlapping parked TCP waits are now represented as an explicit runtime wake
+  reason and reported as `already in progress` errors for `accept`, `read`,
+  `connect`, and `write` paths instead of being collapsed into misleading
+  `closed` errors.
+
+New finding from the first readiness pass: the current runtime has one parked
+waiter slot per TCP handle and operation kind (`accept`, `connect`, `read`,
+`write`). Multiple sibling tasks trying to park on `accept` for the same
+listener are therefore not a stable migration target. The resource-source design
+should prefer one owned accept loop that fans accepted streams into bounded
+concurrent work. If Blorp ever wants multiple concurrent `accept` waiters on one
+listener, the runtime needs explicit waiter lists or the type system needs to
+reject that shape.
+
+Tests:
+
+- Accepting loopback connections and handing each accepted stream to `detach`
+  should not segfault, leak, or leave clients stuck under modest loopback load.
+- The same echo-style scenario should work through a structured `concurrent:`
+  accept loop without unstructured detached handlers, establishing the immediate
+  compatibility target.
+- A heavier variant with detached accepted streams plus nested concurrent
+  clients exposed an AddressSanitizer failure in a client fiber memory operation
+  during this pass. The committed guardrail keeps the detached-client side
+  sequential so normal, leak-check, and sanitizer gates pass, but the heavier
+  shape remains an audit item before TCP resources are considered done.
+- Closing a listener while `accept` is parked wakes waiters and returns an
+  error.
+- Closing a stream while `read` or `write` is parked wakes waiters and returns
+  an error.
+- Overlapping parked `accept` and `read` waits report `already in progress`, not
+  `closed`, preserving the distinction between a handle lifetime event and an
+  unsupported concurrency shape.
+- A failed overlapping parked `accept` or `read` wait must not unregister the
+  active waiter's reactor interest; the original parked waiter must still wake
+  when a later connection or stream read arrives.
+- Cancellation during parked TCP operations unregisters reactor waiters and does
+  not keep handles alive.
+
+Migration impact: current users get a safer compatibility baseline while the
+language gains enough test evidence to make the later resource migration a
+semantic cleanup rather than a bug hunt.
+
+Stop condition: current typed TCP handles have focused regression coverage and
+the remaining unsafe states are documented as resource-migration blockers.
 
 ### Phase 12: TCP Resource Migration
 
@@ -1914,7 +2300,7 @@ Work:
 - Demote `detach` to an explicit escape hatch.
 - Reject resource capture in detached work.
 - Document detached work as process-lifetime background work.
-- Remove or hard-error old `concurrent for` after a migration window.
+- Keep old `concurrent for` as a hard error with a migration diagnostic.
 - Remove channel `close` alias after the channel `seal` migration window.
 - Update guide, grammar, examples, benchmarks, and doctests.
 
@@ -1944,22 +2330,37 @@ services                       intentionally shared external systems
 The branch is ready to continue, but the next changes should stay narrow. The
 high-leverage sequence is:
 
-1. Close the ordinary fan-out compatibility gap. `for ... concurrently(limit:)`
-   is implemented for `List[T]`, but it still returns the historical
-   `List[Result[T, ConcurrencyError]]`. Do not make it statement-only until
-   `map_concurrently` or an equivalent explicit result-collection helper exists
-   with tests and migration diagnostics.
-2. Choose the fixed-task result contract before adding more timeout syntax.
-   Existing fixed `concurrent:` bindings use `Result[T, ConcurrencyError]`.
-   A dedicated `TaskResult[T]` remains open and should be settled before adding
-   whole-scope deadline syntax or richer cancellation policies.
-3. Keep channels ahead of `select`. Channel waiter unregistration, `seal`, and
-   typed send attempts are now covered well enough to support a future ordinary
-   channel/timer `select`, but do not start resource-producing `select` until
-   resource ownership in branches is explicit in typed AST/Core.
-4. Keep TCP out of the next slice. TCP should wait until ordinary deadlines,
-   resource-aware helpers, resource sources, and ordinary `select` have stable
-   semantics.
+1. Continue migrating ordinary expression-position concurrent fan-out toward
+   `List.concurrent(limit, func)` or
+   `List.concurrent_with_timeout(limit, Duration, func)`. Benchmarks and
+   general runtime tests have moved; focused compatibility, parser, and
+   codegen tests still intentionally cover old expression syntax. TCP
+   benchmarks still contain legacy spelling and should move with the
+   TCP/resource design rather than as part of ordinary concurrency cleanup.
+   Add diagnostics only after examples and docs have moved.
+2. Keep non-syntax Duration APIs as explicit helper names for this workstream
+   (`sleep_for`, `recv_timeout_for`, `send_timeout_for`, etc.). Same-name
+   source overloads such as `sleep(Duration)` should be a separate
+   language/typechecker design because current typechecking rejects same-name
+   impure overloads within one module.
+3. Keep ordinary channel/timer `select` in a hardening phase. The parser,
+   typed AST, Core node, C emitter, runtime wait primitive, formatter, GUIDE,
+   grammar, runtime tests, compiler tests, and generated-C audit coverage now
+   exist. Do not start resource-producing `select` until resource ownership in
+   branches is explicit in typed AST/Core. The remaining ordinary-select design
+   decision is whether non-fiber `select` keeps its polling fallback or gains a
+   true blocking wait path.
+4. Extend operation-history recording toward linearizability-style channel
+   stress tests. The current property tests now record a small MPMC history and
+   cover invariants and small bounded models, but they do not yet prove that
+   arbitrary MPMC histories have a valid serialization.
+5. Continue the TCP-adjacent readiness slice without starting the full resource
+   migration. Current guardrails cover a structured accept loop, the legacy
+   accepted-stream `detach` shape, and explicit `already in progress` errors for
+   overlapping parked waits. Next, finish ownership/cancellation audit notes and
+   decide whether the current one-waiter-per-operation TCP runtime limitation
+   should remain a documented compatibility limit or become a runtime
+   waiter-list refactor.
 
 Each slice should add a failing parser/typecheck/runtime or codegen-audit test
 first, and should update this queue if implementation reveals a simpler or
@@ -1967,9 +2368,8 @@ safer order.
 
 ## Open Questions To Settle Before Implementation
 
-- Should fixed `concurrent:` bindings use a concrete `TaskResult[T]` union, a
-  type alias over `Result[T, ConcurrencyError]`, or a construct-specific failure
-  policy?
+- Should fixed `concurrent:` bindings eventually graduate from the current
+  `TaskResult[T]` alias to a distinct union, or is alias-level naming enough?
 - Should whole-scope timeouts use `with timeout(duration):`, a dedicated
   deadline block, or options on individual concurrency constructs?
 - Should plain `send` exist, or should channel operations always say
@@ -1980,8 +2380,8 @@ safer order.
   local `limit` values?
 - Should CRDT-style concurrent accumulators be a standard-library feature,
   package feature, or language-recognized trait family?
-- Should `select` use `msg from ch` syntax, method-call syntax, or pattern
-  syntax?
+- Should `select` eventually support pattern receive arms beyond the current
+  `msg from ch` binding syntax?
 - Should resource-producing `select` branches be limited to one resource per
   branch?
 - What is the exact source-error policy for `ResourceSource[R, E]` in
@@ -2002,4 +2402,11 @@ Before removing legacy concurrency paths, run:
 - preview examples that cover files, channels, timeouts, nested fan-out,
   `concurrent:`, `for ... concurrently`, and at least one service/pool example;
 - scheduler instrumentation smoke tests showing active, parked, cancelled, and
-  timed-out task counts.
+  timed-out task counts;
+- stress-repeat runs for focused concurrency tests, using no result cache;
+- deterministic scheduler/yield tests for known park/wake and seal/wakeup
+  races;
+- channel model/property tests for small bounded channels;
+- sanitizer and leak-check runs over focused channel/cancellation baselines;
+- benchmark guardrails for task spawn/join, park/wake, channel roundtrip,
+  timeout setup/cancel, and bounded fan-out.

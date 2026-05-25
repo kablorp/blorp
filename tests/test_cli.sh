@@ -178,6 +178,9 @@ valid_prog="$TMPDIR_CLI/valid.brp"
 empty_prog="$TMPDIR_CLI/empty.brp"
 invalid_prog="$TMPDIR_CLI/invalid.brp"
 failing_test="$TMPDIR_CLI/failing_test.brp"
+timeout_test="$TMPDIR_CLI/timeout_test.brp"
+repeat_test="$TMPDIR_CLI/repeat_test.brp"
+repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
 check_dir_ok="$TMPDIR_CLI/check_dir_ok"
 check_dir_bad="$TMPDIR_CLI/check_dir_bad"
@@ -211,6 +214,34 @@ func test_false() -> Bool:
 tests: TestSuite = {
 	description = "CLI failing test",
 	tests = [("false", test_false)]
+}
+BRP
+
+cat > "$timeout_test" <<'BRP'
+import:
+	test: TestSuite
+
+func test_slow() -> Bool:
+	sleep(2000)
+	True
+
+tests: TestSuite = {
+	description = "CLI timeout test",
+	tests = [("slow", test_slow)]
+}
+BRP
+
+cat > "$repeat_test" <<BRP
+import:
+	system: append_file
+	test: TestSuite
+
+func test_records_run() -> Bool:
+	append_file("$repeat_marker", "x\\n")
+
+tests: TestSuite = {
+	description = "CLI repeat test",
+	tests = [("records run", test_records_run)]
 }
 BRP
 
@@ -254,6 +285,22 @@ expect_exit "run bad timeout" 1 "$BLORP_BIN" run --timeout not-an-int "$valid_pr
 expect_exit "test success" 0 "$BLORP_BIN" test --no-cache --no-format --timeout 5 tests/test_blorp/types/test_bool.brp
 expect_exit "test failure" 1 "$BLORP_BIN" test --no-cache --no-format --timeout 5 "$failing_test"
 expect_exit "test bad timeout" 1 "$BLORP_BIN" test --timeout not-an-int tests/test_blorp/types/test_bool.brp
+expect_exit "test bad repeat" 1 "$BLORP_BIN" test --repeat 0 tests/test_blorp/types/test_bool.brp
+rm -f "$repeat_marker"
+expect_exit "test repeat success" 0 "$BLORP_BIN" test --no-format --timeout 5 --repeat 3 "$repeat_test"
+TOTAL=$((TOTAL + 1))
+if [ -f "$repeat_marker" ]; then
+    repeat_count=$(wc -l < "$repeat_marker" | tr -d ' ')
+else
+    repeat_count=0
+fi
+if [ "$repeat_count" = "3" ]; then
+    record_pass "test repeat disables result cache"
+else
+    record_fail "test repeat disables result cache" "expected 3 runs, got $repeat_count"
+fi
+expect_output_contains "test honors BLORP_TEST_TIMEOUT" 1 "timed out after 1s" \
+    env BLORP_TEST_TIMEOUT=1 "$BLORP_BIN" test --no-cache --no-format "$timeout_test"
 
 expect_exit "format check success" 0 "$BLORP_BIN" format --check "$valid_prog"
 expect_exit "format check empty file" 0 "$BLORP_BIN" format --check "$empty_prog"

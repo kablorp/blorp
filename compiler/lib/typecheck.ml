@@ -209,6 +209,21 @@ let resource_containing_aggregate_error loc message =
           data derived from them.")
     loc message
 
+let resource_containing_type_alias_error loc message =
+  error_with
+    ~notes:
+      [
+        "A direct alias to a resource type is allowed as a spelling aid, but \
+         an alias must not hide a resource inside an ordinary value container.";
+        "Ordinary containers have value semantics. Embedding a resource would \
+         make cleanup ownership ambiguous.";
+      ]
+    ~help:
+      (Some
+         "Keep the alias pointed directly at the resource type, or store only \
+          ordinary data in the container.")
+    loc message
+
 let one_shot_stream_containing_aggregate_error loc message =
   error_with
     ~notes:
@@ -234,12 +249,6 @@ let register_resource_cleanup_metadata (decl : type_decl) : unit =
 let type_is_env_resource env ty =
   type_is_resource_name ty ~is_resource_name:(fun name ->
       Env.get_type_kind env name = Some TypeResource)
-
-let param_is_borrowed (param : Ast.param) =
-  match param.param_passing with ParamBorrow -> true | ParamByValue -> false
-
-let func_has_borrowed_param (func : func_decl) =
-  List.exists param_is_borrowed func.func_params
 
 let type_is_scoped_dependency_carrier ty =
   match Types.head_resolve ty with
@@ -281,9 +290,6 @@ let type_contains_scoped_dependency_carrier env ty =
 
 let resource_arg_policy_of_func ~contains_resource_param
     ~contains_scoped_dependency_param (func : func_decl) : resource_arg_policy =
-  let has_borrowed_resource_param =
-    func_has_borrowed_param func && contains_resource_param
-  in
   match func.func_body with
   | FuncBuiltinBody _
     when contains_resource_param || contains_scoped_dependency_param ->
@@ -292,8 +298,6 @@ let resource_arg_policy_of_func ~contains_resource_param
         else ResourceResultDependent
       in
       AllowResourceArgs result_policy
-  | FuncBodyExpr _ when has_borrowed_resource_param ->
-      AllowResourceArgs ResourceResultOrdinary
   | FuncBuiltinBody _ | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
       RejectResourceArgs
 
@@ -1340,6 +1344,17 @@ let process_type_alias ?(loc = dummy_loc) (state : check_state)
       alias_target = canonical_type_alias_target state decl.alias_target;
     }
   in
+  let state =
+    if
+      (not (type_is_known_resource state decl.alias_target))
+      && type_contains_known_resource state decl.alias_target
+    then
+      add_error state
+        (resource_containing_type_alias_error loc
+           (Printf.sprintf "Type alias '%s' cannot contain a resource type"
+              decl.alias_name))
+    else state
+  in
   {
     state with
     env =
@@ -1437,9 +1452,8 @@ let validate_resource_result_annotation loc (state : check_state)
            ]
          ~help:
            (Some
-              "Remove the annotation from source or foreign functions. Source \
-               functions with `borrow` parameters already return ordinary \
-               values when their bodies type-check."))
+              "Remove the annotation from source or foreign functions; it is \
+               reserved for compiler-owned resource operation declarations."))
   else if
     type_contains_known_resource state sig_.cfs_return_type
     || type_contains_scoped_dependency_carrier state.env sig_.cfs_return_type
@@ -1486,32 +1500,15 @@ let resource_signature_boundary_error loc message =
       [
         "Ordinary function parameters and return values use value semantics. \
          Copying a resource would duplicate cleanup ownership.";
-        "A source function may borrow a scoped resource only by declaring an \
-         explicit `borrow` parameter, and the type checker verifies that \
-         nothing resource-dependent escapes the call.";
+        "Source functions cannot accept or return resource values. Resource \
+         handles stay inside `with` scopes and compiler-owned operations may \
+         borrow them for one call.";
       ]
     ~help:
       (Some
          "Keep resources inside a `with` block, or add an explicit builtin \
           resource operation only when the compiler/runtime owns the cleanup \
-          contract. Source helpers that need a scoped handle should use \
-          `param: borrow ResourceType`.")
-    loc message
-
-let borrowed_resource_param_error loc message =
-  error_with
-    ~notes:
-      [
-        "Borrowed resource parameters do not own cleanup. They can only use \
-         the scoped resource for the duration of the current call.";
-        "The function body must be visible to the type checker so it can \
-         reject returning, storing, or spawning work that depends on the \
-         borrowed resource.";
-      ]
-    ~help:
-      (Some
-         "Use `with handle = ...:` at the call site and declare helpers as \
-          `func helper(handle: borrow ResourceType) -> OrdinaryType:`.")
+          contract.")
     loc message
 
 let validate_resource_signature_boundary loc (state : check_state)
@@ -1520,38 +1517,12 @@ let validate_resource_signature_boundary loc (state : check_state)
     List.filter (fun p -> Option.is_some p.param_type) func.func_params
   in
   let param_pairs = List.combine typed_params sig_.cfs_param_types in
-  let state =
-    List.fold_left
-      (fun state ((param : Ast.param), param_ty) ->
-        if param_is_borrowed param then
-          let param_name = Option.value param.param_name ~default:"_" in
-          let state =
-            match func.func_body with
-            | FuncBodyExpr _ -> state
-            | FuncBuiltinBody _ | FuncForeign _ | FuncNoBody ->
-                add_error state
-                  (borrowed_resource_param_error param.param_loc
-                     "borrowed resource parameters require a function body")
-          in
-          if type_is_known_resource state param_ty then state
-          else
-            add_error state
-              (borrowed_resource_param_error param.param_loc
-                 (Printf.sprintf
-                    "borrow parameter '%s' must have a direct resource type"
-                    param_name))
-        else state)
-      state param_pairs
-  in
   if func_has_builtin_body func then state
   else
     let state =
       List.fold_left
         (fun state ((param : Ast.param), param_ty) ->
-          if
-            (not (param_is_borrowed param))
-            && type_contains_known_resource state param_ty
-          then
+          if type_contains_known_resource state param_ty then
             let param_name = Option.value param.param_name ~default:"_" in
             add_error state
               (resource_signature_boundary_error param.param_loc
@@ -3672,14 +3643,9 @@ let setup_function_scope ?(source_func : func_decl option) (state : check_state)
                 |> Type_resolution.source)
               source_ty_opt
           in
-          let origin =
-            match source_param.param_passing with
-            | ParamBorrow -> BorrowedResourceParam
-            | ParamByValue -> FuncParam
-          in
           add_var env name
             (canonical_type_annotation_in_env state env ty)
-            ?source_type ~origin ()
+            ?source_type ~origin:FuncParam ()
       | _ -> env)
     env source_params func.func_params
 
@@ -3938,7 +3904,7 @@ let validate_debug_usage (state : check_state) (body : expr) : check_state =
     Used by the purify command to reject functions with concurrency. *)
 let rec has_concurrency (expr : expr) : bool =
   match expr.expr_desc with
-  | EConcurrent _ | EConcurrentFor _ -> true
+  | EConcurrent _ | EConcurrentFor _ | ESelect _ -> true
   | ELambda _ -> false (* don't recurse into nested lambdas *)
   | _ -> List.exists has_concurrency (expr_children expr)
 
@@ -4817,7 +4783,6 @@ let rec second_pass (state : check_state) (decls : program) :
                                     param_name = name;
                                     param_pattern = None;
                                     param_type = Some (subst ty);
-                                    param_passing = ParamByValue;
                                     param_loc = loc;
                                   })
                                 m.tm_params

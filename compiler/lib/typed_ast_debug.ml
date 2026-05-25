@@ -72,6 +72,7 @@ let expr_label (expr : Ast.expr) =
   | EQuestionBind (name, _, _) -> "question_bind " ^ name
   | EWith (binding, _) -> "with " ^ binding.with_name
   | EDebugBlock _ -> "debug_block"
+  | ESelect _ -> "select"
   | EConcurrent _ -> "concurrent"
   | EConcurrentBind (name, _, _) -> "concurrent_bind " ^ name
   | EConcurrentFor (name, _, _, _, _) -> "concurrent_for " ^ name
@@ -127,6 +128,15 @@ let expr_children_from_desc = function
   | EConcurrent (exprs, None, _) ->
       exprs
   | EConcurrent (exprs, Some timeout, _) -> exprs @ [ timeout ]
+  | ESelect arms ->
+      List.concat_map
+        (fun arm ->
+          match arm.Typed_ast.select_arm_kind with
+          | SelectRecv { select_channel; _ } ->
+              [ select_channel; arm.select_arm_body ]
+          | SelectAfter timeout -> [ timeout; arm.select_arm_body ]
+          | SelectSealed channel -> [ channel; arm.select_arm_body ])
+        arms
   | ERecord fields -> List.map snd fields
   | ERecordUpdate (base, fields) -> base :: List.map snd fields
   | ELambda func | EFuncDecl func -> typed_func_body_children func

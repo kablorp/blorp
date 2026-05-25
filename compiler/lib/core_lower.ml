@@ -83,6 +83,12 @@ let fresh_resource_name () =
   s.lower_resource_counter <- n + 1;
   Printf.sprintf "__resource_%d" n
 
+let fresh_timeout_name label =
+  let s = Session.current () in
+  let n = s.lower_destruct_counter in
+  s.lower_destruct_counter <- n + 1;
+  Printf.sprintf "__timeout_%s_%d" label n
+
 let fresh_task_scope_id () =
   let s = Session.current () in
   let n = s.lower_task_scope_counter in
@@ -422,6 +428,34 @@ let bind_loop_view_fields ~loc
   in
   wrap fields
 
+let lower_duration_timeout_milliseconds (duration : Core.core) : Core.core =
+  let loc = duration.loc in
+  let module B = Core.Build in
+  let duration_name = fresh_timeout_name "duration" in
+  let us_name = fresh_timeout_name "us" in
+  let whole_ms_name = fresh_timeout_name "whole_ms" in
+  let duration_ref = B.var ~loc ~ty:duration.ty duration_name in
+  let us_field = B.field duration_ref "us" ~ty:ty_int in
+  let us_ref = B.var ~loc ~ty:ty_int us_name in
+  let whole_ms_rhs = B.div us_ref (B.lit_int ~loc 1000) in
+  let whole_ms_ref = B.var ~loc ~ty:ty_int whole_ms_name in
+  let rounded_ms =
+    B.if_
+      ~cond:(B.eq (B.modulo us_ref (B.lit_int ~loc 1000)) (B.lit_int ~loc 0))
+      ~then_:whole_ms_ref
+      ~else_:(B.add whole_ms_ref (B.lit_int ~loc 1))
+  in
+  let positive_ms =
+    B.let_ whole_ms_name ~ty:ty_int ~rhs:whole_ms_rhs ~body:rounded_ms
+  in
+  let clamped_ms =
+    B.if_
+      ~cond:(B.le us_ref (B.lit_int ~loc 0))
+      ~then_:(B.lit_int ~loc 0) ~else_:positive_ms
+  in
+  let converted = B.let_ us_name ~ty:ty_int ~rhs:us_field ~body:clamped_ms in
+  B.let_ duration_name ~ty:duration.ty ~rhs:duration ~body:converted
+
 (* ============================================================================
    Lowering
    ============================================================================ *)
@@ -736,6 +770,41 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
       let debug_ty = Ast.TyNamed ("Void", []) in
       let body = lower_block ~loc ~ty:debug_ty body in
       mk (CDebugBlock body)
+  | TA.ESelect arms ->
+      let channel_elem_ty arm_loc channel =
+        match Types.head_resolve (TA.semantic_type channel) with
+        | TyNamed ("Channel", [ elem_ty ]) -> elem_ty
+        | ty ->
+            Core_error.errorf (Core_error.Stage Core_stage.Lower) arm_loc
+              ~hint:
+                "Inference should accept only Channel[T] expressions in select \
+                 receive and sealed arms."
+              "select channel arm reached lowering with non-channel type %s"
+              (Types.type_to_string ty)
+      in
+      let lower_arm (arm : TA.select_arm) =
+        let select_arm_kind =
+          match arm.select_arm_kind with
+          | TA.SelectRecv { select_bind; select_channel } ->
+              Core.SelectRecv
+                {
+                  select_bind = Core.Var.named select_bind;
+                  select_elem_ty =
+                    channel_elem_ty arm.select_arm_loc select_channel;
+                  select_channel = lower_child_expr select_channel;
+                }
+          | TA.SelectAfter timeout ->
+              Core.SelectAfter (lower_timeout_expr timeout)
+          | TA.SelectSealed channel ->
+              Core.SelectSealed (lower_child_expr channel)
+        in
+        {
+          Core.select_arm_kind;
+          select_arm_body = lower_child_expr arm.select_arm_body;
+          select_arm_loc = arm.select_arm_loc;
+        }
+      in
+      mk (CSelect { select_arms = List.map lower_arm arms })
   (* === Concurrency === *)
   | TA.EConcurrent (body, timeout, max_threads) ->
       (* Standalone concurrent expression (no enclosing block to supply a
@@ -753,7 +822,7 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
            {
              conc_bindings = bindings;
              conc_body = void_tail;
-             conc_timeout = Option.map lower_child_expr timeout;
+             conc_timeout = Option.map lower_timeout_expr timeout;
              conc_max_threads = max_threads;
            })
   | TA.EConcurrentBind _ ->
@@ -762,24 +831,12 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
          singleton block. *)
       lower_block ~loc ~ty [ typed ]
   | TA.EConcurrentFor (var, iter, body, timeout, width) ->
-      let parent_scope = current_task_scope_id () in
-      let child_scope = fresh_task_scope_id () in
-      let task_scope =
-        Core.concurrent_task_scope ~parent:parent_scope ~child:child_scope
+      let output =
+        if Types.types_equal ty (TyNamed ("Void", [])) then
+          Core.ConcurrentForDiscard
+        else Core.ConcurrentForCollect
       in
-      mk
-        (CConcurrentFor
-           {
-             cf_var = Core.Var.named var;
-             cf_iter = lower_child_expr iter;
-             cf_body =
-               with_current_task_scope child_scope (fun () ->
-                   lower_child_expr body);
-             cf_timeout = Option.map lower_child_expr timeout;
-             cf_width = width;
-             cf_task_scope = task_scope;
-             cf_task = None;
-           })
+      lower_concurrent_for ~loc ~ty ~output var iter body timeout width
   | TA.EDetach inner ->
       mk (CDetach { detach_body = lower_child_expr inner; detach_task = None })
   (* Subscript forms should never reach core_lower:
@@ -804,6 +861,64 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
         "EFuncDecl survived to core_lower"
 
 and lower_child_expr (e : TA.expr) : Core.core = lower_typed_expr_core e
+
+and lower_timeout_expr (e : TA.expr) : Core.core =
+  let lowered = lower_child_expr e in
+  if Types.types_equal lowered.ty ty_int then lowered
+  else if Types.is_std_duration_type lowered.ty then
+    lower_duration_timeout_milliseconds lowered
+  else
+    Core_error.errorf (Core_error.Stage Core_stage.Lower) lowered.loc
+      ~hint:
+        "Inference should accept only Int milliseconds or std/units.Duration \
+         for structured concurrency timeouts."
+      "invalid concurrency timeout type reached Core lowering: %s"
+      (Types.type_to_string lowered.ty)
+
+and lower_concurrent_for ~loc ~ty ~output var iter body timeout width =
+  let parent_scope = current_task_scope_id () in
+  let child_scope = fresh_task_scope_id () in
+  let task_scope =
+    Core.concurrent_task_scope ~parent:parent_scope ~child:child_scope
+  in
+  let width =
+    match width with
+    | Ast.ConcurrentForLimit n ->
+        Core.ConcurrentForLimit (Core.Build.lit_int ~loc n)
+  in
+  let body_core =
+    with_current_task_scope child_scope (fun () -> lower_child_expr body)
+  in
+  let body_core =
+    match output with
+    | Core.ConcurrentForCollect -> body_core
+    | Core.ConcurrentForDiscard ->
+        let ty_void = TyNamed ("Void", []) in
+        if Types.types_equal body_core.ty ty_void then body_core
+        else
+          {
+            Core.desc =
+              CSeq (body_core, { Core.desc = CVoid; ty = ty_void; loc });
+            ty = ty_void;
+            loc;
+          }
+  in
+  {
+    Core.desc =
+      CConcurrentFor
+        {
+          cf_var = Core.Var.named var;
+          cf_iter = lower_child_expr iter;
+          cf_body = body_core;
+          cf_timeout = Option.map lower_timeout_expr timeout;
+          cf_width = width;
+          cf_output = output;
+          cf_task_scope = task_scope;
+          cf_task = None;
+        };
+    ty;
+    loc;
+  }
 
 and typed_with_type (init : TA.expr) (expected : Ast.type_expr) : TA.expr =
   let info = TA.type_info init in
@@ -956,7 +1071,7 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
                {
                  conc_bindings = bindings;
                  conc_body = tail;
-                 conc_timeout = Option.map lower_child_expr timeout;
+                 conc_timeout = Option.map lower_timeout_expr timeout;
                  conc_max_threads = max_threads;
                })
       | TA.EConcurrentBind _ ->
@@ -977,6 +1092,14 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
                  lowering"
               "EQuestionBind reached lowering without a success continuation"
           else lower_question_bind ~block_ty:ty first rest
+      | TA.EConcurrentFor (var, iter, body, timeout, width) when rest <> [] ->
+          let ty_void = TyNamed ("Void", []) in
+          let first' =
+            lower_concurrent_for ~loc:(TA.loc first) ~ty:ty_void
+              ~output:Core.ConcurrentForDiscard var iter body timeout width
+          in
+          let rest' = lower_block ~loc:(TA.loc first) ~ty rest in
+          mk (CSeq (first', rest'))
       | _ when rest = [] ->
           (* Non-binding singleton: just lower as the block's result. *)
           lower_child_expr first
@@ -1685,17 +1808,17 @@ and lower_for_enumerate2 ~loc ~ty ~destructure_names (var : string)
         (Types.type_to_string m_ty)
 
 (** Lower the inner statements of an [EConcurrent] into the [conc_binding]
-    list carried by the Core IR [CConcurrent] node. Each bind's declared
-    type is [Result[T, ConcurrencyError]] (attached by [infer.ml] as the
-    stmt's [expr_type]); the RHS has type [T] (the task body's return
-    type). Both are preserved: [cb_ty] drives the outer C binding type and
-    downstream pass reasoning; [cb_rhs.ty] drives the spawned lambda's
-    return type. *)
+    list carried by the Core IR [CConcurrent] node. Each binding's Core type is
+    the canonical [Result[T, ConcurrencyError]] attached by [infer.ml] as the
+    statement's [expr_type], even when the source annotation used an alias such
+    as [TaskResult[T]]. The RHS has type [T] (the task body's return type).
+    Keeping [cb_ty] canonical avoids source aliases leaking into C emission or
+    downstream invariant checks. *)
 and lower_concurrent_bindings (stmts : TA.expr list) : Core.conc_binding list =
   List.map
     (fun stmt ->
       match typed_expr_desc stmt with
-      | TA.EConcurrentBind (name, ty_ann, init) ->
+      | TA.EConcurrentBind (name, _ty_ann, init) ->
           let parent_scope = current_task_scope_id () in
           let child_scope = fresh_task_scope_id () in
           let task_scope =
@@ -1705,13 +1828,9 @@ and lower_concurrent_bindings (stmts : TA.expr list) : Core.conc_binding list =
             with_current_task_scope child_scope (fun () ->
                 lower_child_expr init)
           in
-          let bind_ty =
-            match ty_ann with Some t -> t | None -> type_of_child_expr stmt
-            (* Result[T, ConcurrencyError] from infer *)
-          in
           {
             Core.cb_var = Core.Var.named name;
-            cb_ty = bind_ty;
+            cb_ty = type_of_child_expr stmt;
             cb_rhs = init';
             cb_task_scope = task_scope;
             cb_task = None;

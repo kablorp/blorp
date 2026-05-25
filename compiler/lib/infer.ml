@@ -885,6 +885,18 @@ let collect_free_var_refs (expr : expr) : string list =
     | EWith (binding, body) ->
         go bound binding.with_value
         @ go (add_bound_name binding.with_name bound) body
+    | ESelect arms ->
+        List.concat_map
+          (fun arm ->
+            let arm_bound, wait_refs =
+              match arm.select_arm_kind with
+              | SelectRecv { select_bind; select_channel } ->
+                  (add_bound_name select_bind bound, go bound select_channel)
+              | SelectAfter timeout -> (bound, go bound timeout)
+              | SelectSealed channel -> (bound, go bound channel)
+            in
+            wait_refs @ go arm_bound arm.select_arm_body)
+          arms
     | ELambda func | EFuncDecl func -> (
         let bound =
           add_bound_names
@@ -1402,6 +1414,20 @@ let reject_concurrent_outer_mutation ?(allowed_targets = []) env context body =
     | EWith (binding, body) ->
         let* () = check bound binding.with_value in
         check (add_bound_name binding.with_name bound) body
+    | ESelect arms ->
+        List.fold_left
+          (fun acc arm ->
+            let* () = acc in
+            let arm_bound, wait_expr =
+              match arm.select_arm_kind with
+              | SelectRecv { select_bind; select_channel } ->
+                  (add_bound_name select_bind bound, select_channel)
+              | SelectAfter timeout -> (bound, timeout)
+              | SelectSealed channel -> (bound, channel)
+            in
+            let* () = check bound wait_expr in
+            check arm_bound arm.select_arm_body)
+          (Ok ()) arms
     | EConcurrent (_, timeout_opt, _) -> (
         match timeout_opt with
         | Some timeout -> check bound timeout
@@ -3599,6 +3625,24 @@ and zonk_expr_desc = function
           },
           zonk_expr body )
   | EDebugBlock xs -> EDebugBlock (List.map zonk_expr xs)
+  | ESelect arms ->
+      ESelect
+        (List.map
+           (fun arm ->
+             let select_arm_kind =
+               match arm.select_arm_kind with
+               | SelectRecv { select_bind; select_channel } ->
+                   SelectRecv
+                     { select_bind; select_channel = zonk_expr select_channel }
+               | SelectAfter timeout -> SelectAfter (zonk_expr timeout)
+               | SelectSealed channel -> SelectSealed (zonk_expr channel)
+             in
+             {
+               arm with
+               select_arm_kind;
+               select_arm_body = zonk_expr arm.select_arm_body;
+             })
+           arms)
   | EConcurrent (xs, t, m) ->
       EConcurrent (List.map zonk_expr xs, Option.map zonk_expr t, m)
   | EConcurrentBind (n, ty, v) ->
@@ -3673,6 +3717,16 @@ let validate_value_ascription_type loc ty =
 let rec infer_expr (ctx : infer_ctx) (expr : expr) :
     (type_expr * expr) infer_result =
   let loc = expr.expr_loc in
+  let infer_concurrent_timeout construct timeout =
+    let* timeout_ty, timeout' = infer_unconstrained_value_expr ctx timeout in
+    if ctx_types_compatible ctx ty_int timeout_ty then
+      Ok (Some (with_inferred_type timeout' ty_int))
+    else if Types.is_std_duration_type timeout_ty then Ok (Some timeout')
+    else
+      error timeout.expr_loc
+        (Printf.sprintf "%s timeout must be Int milliseconds or Duration"
+           construct)
+  in
   match expr.expr_desc with
   (* Identifier lookup *)
   | EIdent name -> (
@@ -5555,6 +5609,109 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           with_inferred_type
             { expr with expr_desc = EDebugBlock stmts' }
             ty_void )
+  | ESelect arms ->
+      let discard_result =
+        match expected_type_opt ctx with
+        | Some expected when ctx_types_compatible ctx expected ty_void -> true
+        | _ -> false
+      in
+      let* () =
+        if discard_result then Ok ()
+        else
+          error_with ~notes:[]
+            ~help:
+              (Some
+                 "Use select as a statement. Send branch results through a \
+                  channel when another task needs to observe them.")
+            expr.expr_loc "`select:` is statement-only"
+      in
+      if arms = [] then error loc "select: block cannot be empty"
+      else
+        let channel_elem_ty arm_loc channel_ty arm_label =
+          match Types.head_resolve channel_ty with
+          | TyNamed ("Channel", [ elem_ty ]) -> Ok elem_ty
+          | _ ->
+              error arm_loc
+                (Printf.sprintf "select %s arm requires Channel[T], got %s"
+                   arm_label
+                   (type_to_string channel_ty))
+        in
+        let infer_select_arm arm =
+          match arm.select_arm_kind with
+          | SelectRecv { select_bind; select_channel } ->
+              let* channel_ty, select_channel' =
+                infer_unconstrained_value_expr ctx select_channel
+              in
+              let* elem_ty =
+                channel_elem_ty select_channel.expr_loc channel_ty "receive"
+              in
+              let body_env =
+                if select_bind = "_" then Env.push_scope ctx.env
+                else
+                  Env.add_var (Env.push_scope ctx.env) select_bind elem_ty
+                    ~origin:MatchBinding ()
+              in
+              let body_ctx = { (without_expected ctx) with env = body_env } in
+              let* _body_ty, body' =
+                infer_statement_expr body_ctx arm.select_arm_body
+              in
+              Ok
+                {
+                  arm with
+                  select_arm_kind =
+                    SelectRecv { select_bind; select_channel = select_channel' };
+                  select_arm_body = body';
+                }
+          | SelectAfter timeout ->
+              let* timeout_opt' =
+                infer_concurrent_timeout "select after" timeout
+              in
+              let timeout' =
+                match timeout_opt' with Some t -> t | None -> timeout
+              in
+              let body_ctx =
+                { (without_expected ctx) with env = Env.push_scope ctx.env }
+              in
+              let* _body_ty, body' =
+                infer_statement_expr body_ctx arm.select_arm_body
+              in
+              Ok
+                {
+                  arm with
+                  select_arm_kind = SelectAfter timeout';
+                  select_arm_body = body';
+                }
+          | SelectSealed channel ->
+              let* channel_ty, channel' =
+                infer_unconstrained_value_expr ctx channel
+              in
+              let* _elem_ty =
+                channel_elem_ty channel.expr_loc channel_ty "sealed"
+              in
+              let body_ctx =
+                { (without_expected ctx) with env = Env.push_scope ctx.env }
+              in
+              let* _body_ty, body' =
+                infer_statement_expr body_ctx arm.select_arm_body
+              in
+              Ok
+                {
+                  arm with
+                  select_arm_kind = SelectSealed channel';
+                  select_arm_body = body';
+                }
+        in
+        let rec infer_arms acc = function
+          | [] -> Ok (List.rev acc)
+          | arm :: rest ->
+              let* arm' = infer_select_arm arm in
+              infer_arms (arm' :: acc) rest
+        in
+        let* arms' = infer_arms [] arms in
+        Ok
+          ( ty_void,
+            with_inferred_type { expr with expr_desc = ESelect arms' } ty_void
+          )
   (* Concurrent binding outside concurrent: block *)
   | EConcurrentBind _ ->
       error loc "concurrent binding can only be used inside a concurrent: block"
@@ -5568,14 +5725,9 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               stmt |> concurrent_binding_name |> Option.map fst)
         in
         let* () = reject_duplicate_concurrent_bindings stmts in
-        (* Validate timeout is Int if present *)
         let* timeout_opt' =
           match timeout_opt with
-          | Some t ->
-              let* t_ty, t' = infer_expected_value_expr ctx ty_int t in
-              if ctx_types_compatible ctx ty_int t_ty then Ok (Some t')
-              else
-                error t.expr_loc "concurrent timeout must be Int (milliseconds)"
+          | Some t -> infer_concurrent_timeout "concurrent" t
           | None -> Ok None
         in
         (* Infer each binding — must be EVarDecl (immutable) *)
@@ -5610,6 +5762,10 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             match ty_ann with
             | Some ann_ty ->
                 let type_params = Env.get_type_params ctx.env in
+                let ann_ty =
+                  resolve_local_binding_annotation ctx ann_ty
+                  |> Type_resolution.canonical
+                in
                 if types_compatible ~type_params ann_ty result_ty then Ok ()
                 else
                   error stmt.expr_loc
@@ -5658,17 +5814,30 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               }
               ty_void )
       end
-  (* concurrent for — dynamic fan-out *)
+  (* for ... concurrently — dynamic fan-out *)
   | EConcurrentFor (var, iter, body, timeout_opt, width) ->
-      (* Validate timeout is Int if present *)
+      let discard_result =
+        match expected_type_opt ctx with
+        | Some expected when ctx_types_compatible ctx expected ty_void -> true
+        | _ -> false
+      in
+      let* () =
+        if discard_result then Ok ()
+        else
+          error_with ~notes:[]
+            ~help:
+              (Some
+                 "Use `items.concurrent(limit, func(item): ...)` to collect \
+                  one Result per input, or \
+                  `items.concurrent_with_timeout(limit, timeout, func(item): \
+                  ...)` when collected fan-out needs a deadline.")
+            expr.expr_loc
+            "`for ... concurrently(...)` is statement-only and does not \
+             collect results"
+      in
       let* timeout_opt' =
         match timeout_opt with
-        | Some t ->
-            let* t_ty, t' = infer_expected_value_expr ctx ty_int t in
-            if ctx_types_compatible ctx ty_int t_ty then Ok (Some t')
-            else
-              error t.expr_loc
-                "concurrent for timeout must be Int (milliseconds)"
+        | Some t -> infer_concurrent_timeout "`for ... concurrently(...)`" t
         | None -> Ok None
       in
       let* iter_ty, iter' = infer_unconstrained_value_expr ctx iter in
@@ -5677,30 +5846,42 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         | TyNamed ("List", [ t ]) -> Ok t
         | _ ->
             error iter.expr_loc
-              (Printf.sprintf "concurrent for requires a List, got %s"
+              (Printf.sprintf "`for ... concurrently` requires a List, got %s"
                  (type_to_string iter_ty))
       in
       let* elem_ty = elem_ty in
       let inner_ctx =
-        { ctx with env = Env.add_var ctx.env var elem_ty ~origin:ForLoopVar () }
+        {
+          (without_expected ctx) with
+          env = Env.add_var ctx.env var elem_ty ~origin:ForLoopVar ();
+          in_loop = true;
+        }
       in
-      let* body_ty, body' = infer_unconstrained_value_expr inner_ctx body in
+      let* body_ty, body' =
+        if discard_result then infer_statement_expr inner_ctx body
+        else infer_unconstrained_value_expr inner_ctx body
+      in
       let* () =
         reject_scoped_resource_task_capture inner_ctx.env body.expr_loc body'
       in
-      let* () = reject_concurrent_resource_result ctx body.expr_loc body_ty in
+      let task_body_ty = if discard_result then ty_void else body_ty in
+      let* () =
+        reject_concurrent_resource_result ctx body.expr_loc task_body_ty
+      in
       let* () =
         reject_concurrent_outer_mutation ~allowed_targets:[ var ] ctx.env
-          "concurrent for" body'
+          "`for ... concurrently` body" body'
       in
       let* () =
-        reject_concurrent_mutable_capture inner_ctx.env "concurrent for"
-          body.expr_loc body'
+        reject_concurrent_mutable_capture inner_ctx.env
+          "`for ... concurrently` body" body.expr_loc body'
       in
       let result_elem_ty =
-        TyNamed ("Result", [ body_ty; TyNamed ("ConcurrencyError", []) ])
+        TyNamed ("Result", [ task_body_ty; TyNamed ("ConcurrencyError", []) ])
       in
-      let result_ty = TyNamed ("List", [ result_elem_ty ]) in
+      let result_ty =
+        if discard_result then ty_void else TyNamed ("List", [ result_elem_ty ])
+      in
       Ok
         ( result_ty,
           with_inferred_type
@@ -6373,7 +6554,15 @@ and infer_annotated_value_expr ctx expected_ty expr =
 (** Infer a statement-position expression. Its result is discarded, so expected
     type context from the enclosing expression must not leak inward. *)
 and infer_statement_expr ctx expr =
-  let* ty, expr' = infer_unconstrained_value_expr ctx expr in
+  let* ty, expr' =
+    match expr.expr_desc with
+    | EConcurrentFor _ | ESelect _ | EBlock _ -> (
+        match expr.expr_desc with
+        | EBlock exprs ->
+            infer_statement_block (without_expected ctx) expr exprs
+        | _ -> infer_expr (with_expected (without_expected ctx) ty_void) expr)
+    | _ -> infer_unconstrained_value_expr ctx expr
+  in
   let* () = reject_discarded_resource_value ctx expr.expr_loc ty in
   let* () = reject_discarded_pure_call_result expr' in
   Ok (ty, expr')
@@ -9393,16 +9582,17 @@ and bind_pattern ctx scrutinee_ty pattern loc : infer_ctx infer_result =
 (** Infer a direct [?=] statement against the enclosing block's result
     carrier. This deliberately does not model non-local control flow; lowering
     threads the rest of the block as the success continuation and emits the
-    failure branch as the block result. Loop bodies are rejected until Core has
-    an explicit early-return node with Perceus-aware scope cleanup. *)
+    failure branch as the block result. Loop bodies reject [?=] because there is
+    no unambiguous propagation target for per-iteration failure. *)
 and infer_question_bind_statement ctx stmt name ty_ann rhs =
   if ctx.in_loop then
     error_with ~notes:[]
       ~help:
         (Some
-           "move the ?= before the loop, use match inside the loop, or wait \
-            for explicit early-return support in loop bodies")
-      stmt.expr_loc "?= cannot be used inside loops yet"
+           "Move the ?= before the loop, use an explicit match inside the \
+            loop, or use Option/Result combinators when the failure should \
+            stay local to that iteration.")
+      stmt.expr_loc "?= cannot be used inside loop bodies"
   else
     let* () = reject_removed_tensor_type_syntax_opt stmt.expr_loc ty_ann in
     let* rhs_ty, rhs' = infer_unconstrained_value_expr ctx rhs in
@@ -9491,6 +9681,44 @@ and infer_block ctx expr exprs _loc =
       ( last_ty,
         with_inferred_type { expr with expr_desc = EBlock exprs' } last_ty )
   end
+
+(** Infer a block used as a statement. Unlike ordinary block inference, the
+    final expression is also checked in statement position so statement-only
+    forms such as [select:] remain valid as the last expression in loop bodies
+    and other discarded blocks without pushing an expected [Void] type into
+    ordinary value expressions. *)
+and infer_statement_block ctx expr exprs =
+  if exprs = [] then Ok (ty_void, with_inferred_type expr ty_void)
+  else
+    let rec infer_block_exprs ctx acc = function
+      | [] -> error expr.expr_loc "Internal error: empty block during inference"
+      | [ ({ expr_desc = EQuestionBind _; _ } as last) ] ->
+          error_with ~notes:[]
+            ~help:
+              (Some
+                 "add a final expression, such as Some(value), Ok(value), or \
+                  another expression returning the enclosing Result")
+            last.expr_loc "?= binding must be followed by a result expression"
+      | [ last ] ->
+          let* last_ty, last' = infer_statement_expr ctx last in
+          Ok (last_ty, List.rev (last' :: acc))
+      | ({ expr_desc = EQuestionBind (name, ty_ann, rhs); _ } as stmt) :: rest
+        ->
+          let* ctx', stmt' =
+            infer_question_bind_statement ctx stmt name ty_ann rhs
+          in
+          infer_block_exprs ctx' (stmt' :: acc) rest
+      | stmt :: rest ->
+          let stmt_ctx = without_expected ctx in
+          let* _, stmt' = infer_statement_expr ctx stmt in
+          let stmt_ctx' = ctx_after_inferred_expr stmt_ctx stmt' in
+          let ctx' = { ctx with env = stmt_ctx'.env } in
+          infer_block_exprs ctx' (stmt' :: acc) rest
+    in
+    let* last_ty, exprs' = infer_block_exprs ctx [] exprs in
+    Ok
+      ( last_ty,
+        with_inferred_type { expr with expr_desc = EBlock exprs' } last_ty )
 
 (** Infer the type of an array literal *)
 and infer_array ctx expr elements loc =
@@ -10046,15 +10274,11 @@ and infer_lambda ctx expr func loc =
           (fun ctx (param : Ast.param) (ty, source_ty) ->
             match param.param_name with
             | Some name ->
-                let origin =
-                  match param.param_passing with
-                  | ParamBorrow -> Env.BorrowedResourceParam
-                  | ParamByValue -> Env.FuncParam
-                in
                 {
                   ctx with
                   env =
-                    add_var ctx.env name ty ?source_type:source_ty ~origin ();
+                    add_var ctx.env name ty ?source_type:source_ty
+                      ~origin:Env.FuncParam ();
                 }
             | None -> ctx)
           ctx func.func_params param_type_slots

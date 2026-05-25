@@ -42,6 +42,88 @@ func stats_delayed_recv(ch: Channel[Int]) -> Int:
 		None: -1
 
 
+func stats_recv_timeout_poll(ch: Channel[Int]) -> Bool:
+	match recv_timeout(ch, 0):
+		Some(_): False
+		None: True
+
+
+func stats_send_timeout_poll(ch: Channel[Int]) -> Bool:
+	not send_timeout(ch, 2, 0)
+
+
+func stats_slow_cancel_probe() -> Int:
+	sleep(10000)
+	1
+
+
+func stats_nested_blocking_child(started: Channel[Int], release: Channel[Int]) -> Int:
+	_ = send(started, 1)
+	match recv(release):
+		Some(value): value
+		None: -1
+
+
+func stats_nested_parent(started: Channel[Int], release: Channel[Int]) -> Int:
+	concurrent:
+		child = stats_nested_blocking_child(started, release)
+	match child:
+		Ok(value): value
+		Err(_): -1
+
+
+func stats_nested_loop_parent(started: Channel[Int], release: Channel[Int]) -> Int:
+	for _ in [1, 2] concurrently(limit: 2):
+		ignored: Int = stats_nested_blocking_child(started, release)
+		void
+	1
+
+
+func stats_active_task_probe() -> Bool:
+	stats: SchedulerStats = get_scheduler_stats()
+	stats.tracked_active_tasks >= 1
+
+
+func stats_wait_for_parked_fiber() -> Bool:
+	var attempts: Int = 0
+	var found: Bool = False
+	while attempts < 200 and not found:
+		stats: SchedulerStats = get_scheduler_stats()
+		if stats.tracked_parked_fibers >= 1:
+			found = True
+		else:
+			sleep(1)
+		attempts += 1
+	found
+
+
+func stats_release_after_park(ch: Channel[Int]) -> Bool:
+	found: Bool = stats_wait_for_parked_fiber()
+	_ = send(ch, 1)
+	found
+
+
+func stats_reset_gauge_probe(ch: Channel[Int]) -> Bool:
+	found: Bool = stats_wait_for_parked_fiber()
+	reset_scheduler_stats()
+	stats: SchedulerStats = get_scheduler_stats()
+	_ = send(ch, 1)
+	found and stats.tracked_active_tasks >= 1 and stats.tracked_parked_fibers >= 1
+
+
+func stats_wait_for_no_tracked_active_tasks() -> Bool:
+	var attempts: Int = 0
+	var done: Bool = False
+	while attempts < 200 and not done:
+		stats: SchedulerStats = get_scheduler_stats()
+		if stats.tracked_active_tasks == 0:
+			done = True
+		else:
+			sleep(1)
+		attempts += 1
+	done
+
+
 func result_value_or_zero(result: Result[Int, ConcurrencyError]) -> Int:
 	match result:
 		Ok(value): value
@@ -157,10 +239,130 @@ func test_scheduler_stats_count_channel_waits() -> Bool:
 	ok
 
 
+func test_scheduler_stats_non_positive_channel_timeouts_do_not_park() -> Bool:
+	reset_scheduler_stats()
+
+	recv_ch: Channel[Int] = channel(1)
+	send_ch: Channel[Int] = channel(1)
+	_ = send(send_ch, 1)
+
+	concurrent:
+		recv_poll = stats_recv_timeout_poll(recv_ch)
+		send_poll = stats_send_timeout_poll(send_ch)
+
+	stats: SchedulerStats = get_scheduler_stats()
+	recv_ok: Bool = match recv_poll:
+		Ok(value): value
+		Err(_): False
+	send_ok: Bool = match send_poll:
+		Ok(value): value
+		Err(_): False
+	var ok: Bool = recv_ok and send_ok
+	ok = ok and stats.channel_recv_parks == 0
+	ok = ok and stats.channel_send_parks == 0
+	ok = ok and stats.timer_inserts == 0
+	ok
+
+
+func test_scheduler_stats_count_cancelled_tasks() -> Bool:
+	reset_scheduler_stats()
+
+	concurrent(timeout: 10):
+		slow = stats_slow_cancel_probe()
+
+	stats: SchedulerStats = get_scheduler_stats()
+	timed_out: Bool = match slow:
+		Ok(_): False
+		Err(_): True
+	timed_out and stats.tasks_cancelled >= 1 and stats.task_timeouts >= 1
+
+
+func test_scheduler_stats_reports_tracked_active_tasks() -> Bool:
+	reset_scheduler_stats()
+
+	concurrent:
+		probe = stats_active_task_probe()
+
+	match probe:
+		Ok(value): value
+		Err(_): False
+
+
+func test_scheduler_stats_reports_tracked_parked_fibers() -> Bool:
+	reset_scheduler_stats()
+	release: Channel[Int] = channel(1)
+
+	concurrent:
+		sleeper = stats_blocking_recv(release)
+		probe = stats_release_after_park(release)
+
+	probe_ok: Bool = match probe:
+		Ok(value): value
+		Err(_): False
+	sleeper_ok: Bool = match sleeper:
+		Ok(value): value == 1
+		Err(_): False
+	probe_ok and sleeper_ok
+
+
+func test_scheduler_stats_reset_preserves_gauges() -> Bool:
+	reset_scheduler_stats()
+	release: Channel[Int] = channel(1)
+
+	concurrent:
+		sleeper = stats_blocking_recv(release)
+		probe = stats_reset_gauge_probe(release)
+
+	probe_ok: Bool = match probe:
+		Ok(value): value
+		Err(_): False
+	sleeper_ok: Bool = match sleeper:
+		Ok(value): value == 1
+		Err(_): False
+	probe_ok and sleeper_ok
+
+
+func test_scheduler_stats_nested_timeout_cleans_child_tasks() -> Bool:
+	reset_scheduler_stats()
+	started: Channel[Int] = channel(1)
+	release: Channel[Int] = channel(1)
+
+	concurrent(timeout: 10):
+		parent = stats_nested_parent(started, release)
+
+	timed_out: Bool = match parent:
+		Err(_): True
+		_: False
+	child_started: Bool = recv_timeout(started, 20) == Some(1)
+	no_live_children: Bool = stats_wait_for_no_tracked_active_tasks()
+	seal(release)
+	timed_out and child_started and no_live_children
+
+
+func test_scheduler_stats_nested_timeout_cleans_loop_tasks() -> Bool:
+	reset_scheduler_stats()
+	started: Channel[Int] = channel(2)
+	release: Channel[Int] = channel(1)
+
+	concurrent(timeout: 10):
+		parent = stats_nested_loop_parent(started, release)
+
+	timed_out: Bool = match parent:
+		Err(_): True
+		_: False
+	first_started: Bool = recv_timeout(started, 20) == Some(1)
+	second_started: Bool = recv_timeout(started, 20) == Some(1)
+	no_live_children: Bool = stats_wait_for_no_tracked_active_tasks()
+	seal(release)
+	timed_out and first_started and second_started and no_live_children
+
+
 func test_scheduler_stats_reset() -> Bool:
 	reset_scheduler_stats()
 	stats: SchedulerStats = get_scheduler_stats()
 	var ok: Bool = stats.tasks_spawned == 0
+	ok = ok and stats.tasks_cancelled == 0
+	ok = ok and stats.task_timeouts == 0
 	ok = ok and stats.fibers_created == 0
 	ok = ok and stats.fibers_reused == 0
 	ok = ok and stats.fibers_completed == 0
@@ -181,6 +383,19 @@ tests: TestSuite = {
 		("counts fiber lifecycle", test_scheduler_stats_count_fibers),
 		("counts parking and timers", test_scheduler_stats_count_parks_and_timers),
 		("counts channel waits", test_scheduler_stats_count_channel_waits),
+		(
+			"non-positive channel timeouts do not park",
+			test_scheduler_stats_non_positive_channel_timeouts_do_not_park,
+		),
+		("counts cancelled tasks", test_scheduler_stats_count_cancelled_tasks),
+		("reports tracked active tasks", test_scheduler_stats_reports_tracked_active_tasks),
+		("reports tracked parked fibers", test_scheduler_stats_reports_tracked_parked_fibers),
+		("reset preserves gauges", test_scheduler_stats_reset_preserves_gauges),
+		(
+			"nested timeout cleans child tasks",
+			test_scheduler_stats_nested_timeout_cleans_child_tasks,
+		),
+		("nested timeout cleans loop tasks", test_scheduler_stats_nested_timeout_cleans_loop_tasks),
 		("reset clears counters", test_scheduler_stats_reset),
 	],
 }

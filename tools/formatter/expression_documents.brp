@@ -89,6 +89,12 @@ union MatchCase:
 	MatchCaseData(Pattern, Expression, Option[String])
 
 
+union SelectArm:
+	SelectRecvArm(String, Expression, Expression)
+	SelectAfterArm(Expression, Expression)
+	SelectSealedArm(Expression, Expression)
+
+
 union Expression:
 	IdentifierExpression(String)
 	LiteralExpression(Literal)
@@ -126,6 +132,7 @@ union Expression:
 	IfExpression(Expression, Expression)
 	IfElseExpression(Expression, Expression, Expression)
 	MatchExpression(Expression, List[MatchCase])
+	SelectExpression(List[SelectArm])
 	WhileExpression(Expression, Expression)
 	ForExpression(String, Expression, Expression)
 	TupleForExpression(List[String], Expression, Expression)
@@ -143,8 +150,6 @@ union Expression:
 
 
 union ConcurrentForWidth:
-	ConcurrentForDefault
-	ConcurrentForMaxThreads(Int)
 	ConcurrentForLimit(Int)
 
 
@@ -323,6 +328,7 @@ private pure func expression_precedence(expr: Expression) -> Int:
 private pure func logical_left_ends_with_block(expr: Expression) -> Bool:
 	match expr:
 		MatchExpression(_, _): True
+		SelectExpression(_): True
 		IfExpression(_, _): True
 		IfElseExpression(_, _, _): True
 		LogicalExpression(_, _, right): right.logical_left_ends_with_block()
@@ -345,6 +351,7 @@ private pure func needs_field_receiver_parens(expr: Expression) -> Bool:
 		IfElseExpression(_, _, _): True
 		LogicalExpression(_, _, _): True
 		MatchExpression(_, _): True
+		SelectExpression(_): True
 		RangeExpression(_, _): True
 		UnaryExpression(_, _): True
 		WithExpression(_, _, _, _, _): True
@@ -361,6 +368,7 @@ private pure func needs_detach_body_parens(expr: Expression) -> Bool:
 		TupleDestructureExpression(_, _): True
 		QuestionBindExpression(_, _): True
 		TypedQuestionBindExpression(_, _, _): True
+		SelectExpression(_): True
 		AscriptionExpression(_, _): True
 		BinaryExpression(_, _, _): True
 		LogicalExpression(_, _, _): True
@@ -689,6 +697,27 @@ private pure func match_cases(value: JsonValue, key: String) -> Result[List[Matc
 	value.parsed_array_field(key, match_case_from_json)
 
 
+private pure func select_arm_from_json(value: JsonValue) -> Result[SelectArm, String]:
+	kind ?= value.string_field("kind")
+	body ?= value.expression_field("body")
+	match kind:
+		"Recv":
+			name ?= value.string_field("name")
+			channel ?= value.expression_field("channel")
+			Ok(SelectRecvArm(name, channel, body))
+		"After":
+			timeout ?= value.expression_field("timeout")
+			Ok(SelectAfterArm(timeout, body))
+		"Sealed":
+			channel ?= value.expression_field("channel")
+			Ok(SelectSealedArm(channel, body))
+		_: Err("unknown select arm JSON kind: " + kind)
+
+
+private pure func select_arms(value: JsonValue, key: String) -> Result[List[SelectArm], String]:
+	value.parsed_array_field(key, select_arm_from_json)
+
+
 pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 	tag ?= value.string_field("tag")
 	match tag:
@@ -828,6 +857,9 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 			scrutinee ?= value.expression_field("scrutinee")
 			cases ?= value.match_cases("cases")
 			Ok(MatchExpression(scrutinee, cases))
+		"Select":
+			arms ?= value.select_arms("arms")
+			Ok(SelectExpression(arms))
 		"While":
 			cond ?= value.expression_field("cond")
 			body ?= value.expression_field("body")
@@ -921,9 +953,8 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 			iter ?= value.expression_field("iter")
 			body ?= value.expression_field("body")
 			timeout ?= value.optional_expression_field("timeout")
-			max_threads ?= value.optional_int_field("max_threads")
 			limit ?= value.optional_int_field("limit")
-			width ?= concurrent_for_width_from_json(max_threads, limit)
+			width ?= concurrent_for_width_from_json(limit)
 			Ok(ConcurrentForExpression(var_name, iter, body, timeout, width))
 		_: Err("unknown expression JSON tag: " + tag)
 
@@ -1184,6 +1215,7 @@ private pure func expression_has_block(expr: Expression) -> Bool:
 		SpacedBlockExpression(_): True
 		ItemBlockExpression(_): True
 		MatchExpression(_, _): True
+		SelectExpression(_): True
 		WithExpression(_, _, _, _, _): True
 		DebugBlockExpression(_): True
 		LambdaExpression(_, _, body): body.is_block_expression()
@@ -2068,6 +2100,48 @@ private pure func match_case_documents(cases: List[MatchCase]) -> List[Doc]:
 	documents
 
 
+private pure func select_arm_document(arm: SelectArm) -> Doc:
+	match arm:
+		SelectRecvArm(name, channel, body):
+			name
+				.text()
+				.cat(" from ".text())
+				.cat(channel.expression_document())
+				.cat(":".text())
+				.cat(
+					hardline()
+						.cat(body.block_body_document())
+						.indent()
+				)
+		SelectAfterArm(timeout, body):
+			"_ after "
+				.text()
+				.cat(timeout.expression_document())
+				.cat(":".text())
+				.cat(
+					hardline()
+						.cat(body.block_body_document())
+						.indent()
+				)
+		SelectSealedArm(channel, body):
+			"sealed "
+				.text()
+				.cat(channel.expression_document())
+				.cat(":".text())
+				.cat(
+					hardline()
+						.cat(body.block_body_document())
+						.indent()
+				)
+
+
+private pure func select_arm_documents(arms: List[SelectArm]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for arm in arms:
+		documents = documents.append(arm.select_arm_document())
+	documents
+
+
 pure func function_parameter_document(param: FunctionParameter) -> Doc:
 	match param:
 		NameParam(name): name.text()
@@ -2322,19 +2396,10 @@ private pure func concurrent_params_document(
 				None: "".text()
 
 
-private pure func concurrent_for_width_from_json(
-	max_threads: Option[Int],
-	limit: Option[Int],
-) -> Result[ConcurrentForWidth, String]:
+private pure func concurrent_for_width_from_json(limit: Option[Int]) -> Result[ConcurrentForWidth, String]:
 	match limit:
-		Some(limit_count):
-			match max_threads:
-				Some(_): Err("ConcurrentFor accepts either limit or max_threads, not both")
-				None: Ok(ConcurrentForLimit(limit_count))
-		None:
-			match max_threads:
-				Some(thread_count): Ok(ConcurrentForMaxThreads(thread_count))
-				None: Ok(ConcurrentForDefault)
+		Some(limit_count): Ok(ConcurrentForLimit(limit_count))
+		None: Err("ConcurrentFor requires a limit field")
 
 
 private pure func concurrently_params_document(timeout: Option[Expression], limit: Int) -> Doc:
@@ -2369,24 +2434,6 @@ private pure func concurrent_for_head_document(
 				.cat(iter.expression_document())
 				.cat(" concurrently".text())
 				.cat(concurrently_params_document(timeout, limit))
-				.cat(":".text())
-		ConcurrentForMaxThreads(thread_count):
-			"concurrent"
-				.text()
-				.cat(concurrent_params_document(timeout, Some(thread_count)))
-				.cat(" for ".text())
-				.cat(var_name.text())
-				.cat(" in ".text())
-				.cat(iter.expression_document())
-				.cat(":".text())
-		ConcurrentForDefault:
-			"concurrent"
-				.text()
-				.cat(concurrent_params_document(timeout, None))
-				.cat(" for ".text())
-				.cat(var_name.text())
-				.cat(" in ".text())
-				.cat(iter.expression_document())
 				.cat(":".text())
 
 
@@ -2754,6 +2801,18 @@ pure func expression_document(expr: Expression) -> Doc:
 						.cat(
 							cases
 								.match_case_documents()
+								.hardlines()
+						)
+						.indent()
+				)
+		SelectExpression(arms):
+			"select:"
+				.text()
+				.cat(
+					hardline()
+						.cat(
+							arms
+								.select_arm_documents()
 								.hardlines()
 						)
 						.indent()

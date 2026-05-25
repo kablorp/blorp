@@ -250,6 +250,19 @@ let find_definition (program : program) ~(name : string) ~(line : int)
             | Some _ -> acc
             | None -> find_local_in_expr c.case_body)
           None cases
+    | ESelect arms ->
+        List.fold_left
+          (fun acc arm ->
+            match acc with
+            | Some _ -> acc
+            | None -> (
+                match arm.select_arm_kind with
+                | SelectRecv { select_bind; _ }
+                  when select_bind = name
+                       && loc_starts_before_cursor arm.select_arm_loc ->
+                    Some arm.select_arm_loc
+                | _ -> find_local_in_expr arm.select_arm_body))
+          None arms
     | EWhile (_, body) -> find_local_in_expr body
     | EDebugBlock stmts -> find_local_in_exprs stmts
     | EQuestionBind (n, _, _)

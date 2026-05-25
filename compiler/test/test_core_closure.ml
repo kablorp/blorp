@@ -537,7 +537,8 @@ let test_concurrent_for_gets_task_closure_metadata () =
                  cf_iter = cvar "items" list_string_ty;
                  cf_body = cvar "item" ty_string;
                  cf_timeout = None;
-                 cf_width = ConcurrentForDefault;
+                 cf_width = ConcurrentForLimit (cint 2);
+                 cf_output = ConcurrentForCollect;
                  cf_task_scope = synthetic_concurrent_task_scope;
                  cf_task = None;
                })

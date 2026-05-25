@@ -2347,11 +2347,14 @@ resource type TestResource = builtin
 func open_resource() -> TestResource:
 	builtin
 
+func touch_resource(handle: TestResource) -> Void:
+	builtin
+
 func main(args: List[String]) -> Int:
 	nums = [1, 2]
 	with handle = open_resource():
-		results = concurrent for n in nums:
-			handle
+		for n in nums concurrently(limit: 2):
+			touch_resource(handle)
 		0
 |}
       in

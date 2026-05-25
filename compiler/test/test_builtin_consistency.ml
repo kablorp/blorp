@@ -328,6 +328,8 @@ let read_std_file filename =
     Alcotest.failf "Expected std source file at %s (std_source_dir=%s)" path
       startup_std_dir
 
+let split_lines source = String.split_on_char '\n' source
+
 let contains_substring haystack needle =
   let hay_len = String.length haystack in
   let needle_len = String.length needle in
@@ -340,6 +342,10 @@ let contains_substring haystack needle =
 let starts_with s prefix =
   let len = String.length s and prefix_len = String.length prefix in
   len >= prefix_len && String.sub s 0 prefix_len = prefix
+
+let ends_with s suffix =
+  let len = String.length s and suffix_len = String.length suffix in
+  len >= suffix_len && String.sub s (len - suffix_len) suffix_len = suffix
 
 let rec list_files_recursive dir =
   Sys.readdir dir |> Array.to_list
@@ -544,6 +550,60 @@ let test_cloexec_helpers_declare_fallback_locals_once () =
         ];
     ]
 
+let test_channel_status_runtime_abi_is_declared () =
+  let runtime_decl =
+    read_first_existing
+      [
+        "compiler/lib/runtime_decl.c";
+        "../lib/runtime_decl.c";
+        "lib/runtime_decl.c";
+      ]
+  in
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let try_signature =
+    "long blorp_channel_try_recv_status_raw(blorp_Channel* ch, void** out)"
+  in
+  let timeout_signature =
+    "long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long \
+     timeout_ms, void** out)"
+  in
+  Alcotest.(check bool)
+    "runtime_decl exposes nonblocking receive status ABI" true
+    (contains_substring runtime_decl (try_signature ^ ";"));
+  Alcotest.(check bool)
+    "runtime implements nonblocking receive status ABI" true
+    (contains_substring runtime try_signature);
+  Alcotest.(check bool)
+    "runtime_decl exposes timed receive status ABI" true
+    (contains_substring runtime_decl (timeout_signature ^ ";"));
+  Alcotest.(check bool)
+    "runtime implements timed receive status ABI" true
+    (contains_substring runtime timeout_signature);
+  List.iter
+    (fun (name, value) ->
+      let define = Printf.sprintf "#define %s %s" name value in
+      Alcotest.(check bool)
+        ("runtime_decl exposes channel status constant " ^ name)
+        true
+        (contains_substring runtime_decl define);
+      Alcotest.(check bool)
+        ("runtime uses channel status constant " ^ name)
+        true
+        (contains_substring runtime define))
+    [
+      ("BLORP_CHANNEL_SEND_ACCEPTED", "0L");
+      ("BLORP_CHANNEL_SEND_WOULD_BLOCK", "1L");
+      ("BLORP_CHANNEL_SEND_SEALED", "2L");
+      ("BLORP_CHANNEL_SEND_TIMED_OUT", "3L");
+      ("BLORP_CHANNEL_RECV_VALUE", "0L");
+      ("BLORP_CHANNEL_RECV_WOULD_BLOCK", "1L");
+      ("BLORP_CHANNEL_RECV_SEALED", "2L");
+      ("BLORP_CHANNEL_RECV_TIMED_OUT", "3L");
+    ]
+
 let test_stream_element_layout_is_explicit () =
   let runtime_decl =
     read_first_existing
@@ -606,6 +666,91 @@ let test_stream_from_lines_uses_validated_path_buffer () =
     Alcotest.fail
       "blorp_stream_from_lines must not truncate paths through a fixed-size \
        stack buffer"
+
+let parse_std_int_record_field line =
+  match String.split_on_char ':' (String.trim line) with
+  | [ name; ty ] when String.trim ty = "Int," -> Some (String.trim name)
+  | _ -> None
+
+let scheduler_stats_std_fields () =
+  let source = read_std_file "instrumentation.brp" in
+  let rec collect in_record fields = function
+    | [] -> Alcotest.fail "Could not find complete SchedulerStats record in std"
+    | line :: rest ->
+        let trimmed = String.trim line in
+        if trimmed = "record SchedulerStats {" then collect true fields rest
+        else if in_record && trimmed = "}" then List.rev fields
+        else if in_record then
+          let fields =
+            match parse_std_int_record_field line with
+            | Some field -> field :: fields
+            | None -> fields
+          in
+          collect true fields rest
+        else collect false fields rest
+  in
+  collect false [] (split_lines source)
+
+let parse_c_long_struct_field line =
+  let line = String.trim line in
+  if starts_with line "long " && ends_with line ";" then
+    let without_long = String.sub line 5 (String.length line - 5) in
+    Some (String.sub without_long 0 (String.length without_long - 1))
+  else None
+
+let find_index pred items =
+  let rec loop i = function
+    | [] -> None
+    | x :: xs -> if pred x then Some i else loop (i + 1) xs
+  in
+  loop 0 items
+
+let scheduler_stats_c_fields label source =
+  let lines = split_lines source in
+  let end_index =
+    match
+      find_index
+        (fun line -> contains_substring line "} blorp_SchedulerStats;")
+        lines
+    with
+    | Some i -> i
+    | None -> Alcotest.failf "%s has no blorp_SchedulerStats typedef" label
+  in
+  let indexed = List.mapi (fun i line -> (i, line)) lines in
+  let start_index =
+    indexed
+    |> List.filter (fun (i, line) ->
+        i < end_index && String.trim line = "typedef struct {")
+    |> List.rev
+    |> function
+    | (i, _) :: _ -> i
+    | [] -> Alcotest.failf "%s has no SchedulerStats struct start" label
+  in
+  indexed
+  |> List.filter_map (fun (i, line) ->
+      if i > start_index && i < end_index then parse_c_long_struct_field line
+      else None)
+
+let test_scheduler_stats_layout_matches_std_record () =
+  let expected = scheduler_stats_std_fields () in
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let runtime_decl =
+    read_first_existing
+      [
+        "compiler/lib/runtime_decl.c";
+        "../lib/runtime_decl.c";
+        "lib/runtime_decl.c";
+      ]
+  in
+  Alcotest.(check (list string))
+    "runtime SchedulerStats field order" expected
+    (scheduler_stats_c_fields "runtime.c" runtime);
+  Alcotest.(check (list string))
+    "runtime_decl SchedulerStats field order" expected
+    (scheduler_stats_c_fields "runtime_decl.c" runtime_decl)
 
 let test_std_source_dir_initialized_from_config () =
   Alcotest.(check bool) "std dir exists" true (Sys.is_directory startup_std_dir);
@@ -1216,10 +1361,14 @@ let suite =
           test_fiber_intrusive_links_are_role_specific;
         Alcotest.test_case "cloexec helpers declare fallback locals once" `Quick
           test_cloexec_helpers_declare_fallback_locals_once;
+        Alcotest.test_case "channel status ABI is declared" `Quick
+          test_channel_status_runtime_abi_is_declared;
         Alcotest.test_case "stream element layout is explicit" `Quick
           test_stream_element_layout_is_explicit;
         Alcotest.test_case "stream from_lines uses validated path buffer" `Quick
           test_stream_from_lines_uses_validated_path_buffer;
+        Alcotest.test_case "scheduler stats layout matches std record" `Quick
+          test_scheduler_stats_layout_matches_std_record;
         Alcotest.test_case "std source dir initialized from config" `Quick
           test_std_source_dir_initialized_from_config;
         Alcotest.test_case "list join uses IR string_append" `Quick

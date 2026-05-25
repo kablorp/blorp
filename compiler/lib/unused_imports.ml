@@ -289,6 +289,20 @@ let rec scan_expr scope refs expr =
           scan_expr case_scope refs case.case_body)
         (scan_expr scope refs scrutinee)
         cases
+  | ESelect arms ->
+      List.fold_left
+        (fun refs arm ->
+          match arm.select_arm_kind with
+          | SelectRecv { select_bind; select_channel } ->
+              let refs = scan_expr scope refs select_channel in
+              scan_expr
+                (add_term_binding select_bind scope)
+                refs arm.select_arm_body
+          | SelectAfter timeout ->
+              scan_expr scope (scan_expr scope refs timeout) arm.select_arm_body
+          | SelectSealed channel ->
+              scan_expr scope (scan_expr scope refs channel) arm.select_arm_body)
+        refs arms
   | EBlock exprs -> scan_block scope refs exprs
   | ETuple elems | EVector elems | EList elems ->
       List.fold_left (scan_expr scope) refs elems

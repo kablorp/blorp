@@ -458,6 +458,13 @@ let bind_names (bound : Bound_names.t) (names : string list) : Bound_names.t =
 let var_is_bound (bound : Bound_names.t) (v : Core.var) : bool =
   Bound_names.mem v.vname bound
 
+let imported_alias ?(module_path = "") (env : env) name =
+  if module_path = "" then Hashtbl.find_opt env.import_aliases name
+  else
+    match Hashtbl.find_opt env.module_imports module_path with
+    | None -> None
+    | Some mod_aliases -> Hashtbl.find_opt mod_aliases name
+
 (** Try to resolve a qualified module value [M.VALUE] where [M] is a
     module alias. Core lowering represents both module member access and
     ordinary field access as [CField], so this only rewrites aliases that
@@ -758,19 +765,21 @@ let rewrite_imported_var ?(module_path = "") (env : env) (v : Core.var) :
      ones whose arg type doesn't match. Leave the bare name alone so
      [resolve_call_kind]'s builtin step finds the sentinel. *)
   let is_prelude_builtin name = Codegen_builtins.lookup "" name <> None in
-  let alias =
-    if module_path = "" then Hashtbl.find_opt env.import_aliases v.vname
-    else
-      match Hashtbl.find_opt env.module_imports module_path with
-      | None -> None
-      | Some mod_aliases -> Hashtbl.find_opt mod_aliases v.vname
-  in
+  let alias = imported_alias ~module_path env v.vname in
   match alias with
   | Some (mp, orig) when orig <> "" && not (is_prelude_builtin v.vname) -> (
       match try_prefix (mp, orig) with
       | Some prefixed -> { v with vname = prefixed }
       | None -> v)
   | _ -> v
+
+let imported_function_ref_def_id ?(module_path = "") (env : env) name =
+  match imported_alias ~module_path env name with
+  | Some (mp, orig_name) when orig_name <> "" -> (
+      match try_resolve_module_func env mp orig_name with
+      | Some (CKUser (_, Some def_id)) -> Some def_id
+      | _ -> None)
+  | _ -> None
 
 (* Bare value references are rewritten only when they are not shadowed by a
    Core-local binder. Function calls use [resolve_call_kind] with the same
@@ -872,7 +881,10 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
         | None, Ast.TyFunc _ -> (
             match Hashtbl.find_opt env.user_funcs v'.vname with
             | Some id -> { v' with vdef_id = Some id }
-            | None -> v')
+            | None -> (
+                match imported_function_ref_def_id ~module_path env v.vname with
+                | Some id -> { v' with vdef_id = Some id }
+                | None -> v'))
         | _ -> v'
       in
       { e with desc = CVar v' }

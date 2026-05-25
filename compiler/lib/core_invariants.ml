@@ -1298,6 +1298,7 @@ let check_no_resource_capture_metadata_at (stage : Core_stage.t)
 
 let concurrency_error_ty = Ast.TyNamed ("ConcurrencyError", [])
 let int_ty = Ast.TyNamed ("Int", [])
+let ty_void = Ast.TyNamed ("Void", [])
 
 let concurrent_result_ty ok_ty =
   Ast.TyNamed ("Result", [ ok_ty; concurrency_error_ty ])
@@ -1339,23 +1340,11 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
   in
   let check_concurrent_for_width loc width acc =
     match width with
-    | Ast.ConcurrentForDefault -> acc
-    | Ast.ConcurrentForMaxThreads n when n <= 0 ->
-        violation_at stage loc
-          ~hint:
-            "Parser/typechecking should only construct positive max_threads \
-             limits for legacy concurrent-for forms."
-          (Printf.sprintf "concurrent for max_threads must be positive, got %d"
-             n)
-        :: acc
-    | Ast.ConcurrentForLimit n when n <= 0 ->
-        violation_at stage loc
-          ~hint:
-            "Parser/typechecking should only construct positive limits for \
-             concurrently loop forms."
-          (Printf.sprintf "concurrent for limit must be positive, got %d" n)
-        :: acc
-    | Ast.ConcurrentForMaxThreads _ | Ast.ConcurrentForLimit _ -> acc
+    | Core.ConcurrentForLimit limit ->
+        if invariant_types_equal ~reg limit.Core.ty int_ty then acc
+        else
+          type_mismatch loc ~subject:"concurrent for limit type"
+            ~expected:int_ty ~actual:limit.Core.ty acc
   in
   let check_concurrent_task_scope loc ~subject
       (scope : Core.concurrent_task_scope) acc =
@@ -1473,12 +1462,28 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
                      (Types.type_to_string cf.cf_iter.ty))
                 :: acc
           in
-          let expected_result = list_ty (concurrent_result_ty cf.cf_body.ty) in
+          let expected_result =
+            match cf.cf_output with
+            | Core.ConcurrentForCollect ->
+                list_ty (concurrent_result_ty cf.cf_body.ty)
+            | Core.ConcurrentForDiscard -> ty_void
+          in
           let acc =
             if invariant_types_equal ~reg e.ty expected_result then acc
             else
               type_mismatch e.loc ~subject:"concurrent-for result type"
                 ~expected:expected_result ~actual:e.ty acc
+          in
+          let acc =
+            match cf.cf_output with
+            | Core.ConcurrentForCollect -> acc
+            | Core.ConcurrentForDiscard
+              when invariant_types_equal ~reg cf.cf_body.ty ty_void ->
+                acc
+            | Core.ConcurrentForDiscard ->
+                type_mismatch cf.cf_body.loc
+                  ~subject:"discarding concurrent-for body type"
+                  ~expected:ty_void ~actual:cf.cf_body.ty acc
           in
           let acc =
             check_task_return cf.cf_body.loc ~subject:"concurrent-for"

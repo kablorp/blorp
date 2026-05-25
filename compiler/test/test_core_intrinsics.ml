@@ -15,6 +15,8 @@ let ty_list elem = TyNamed ("List", [ elem ])
 let ty_set elem = TyNamed ("Set", [ elem ])
 let ty_dict key value = TyNamed ("Dict", [ key; value ])
 let ty_option elem = TyNamed ("Option", [ elem ])
+let ty_result ok err = TyNamed ("Result", [ ok; err ])
+let ty_concurrency_error = TyNamed ("ConcurrencyError", [])
 let ty_void = TyNamed ("Void", [])
 let ty_func params return = TyFunc { params; return; is_pure = true }
 let ty_vector elem n = TyArray (elem, [ TyConstInt n ])
@@ -1857,6 +1859,104 @@ let test_list_map_synthesizes_presized_loop () =
         "no repeated append capacity growth" 0
         (count_intrinsic "list_ensure_capacity" body)
 
+let test_list_map_concurrently_synthesizes_concurrent_for () =
+  let return_ty = ty_list (ty_result ty_string ty_concurrency_error) in
+  let body =
+    Blorp.Core_intrinsics.synthesize_body ~func_name:"map_concurrently"
+      ~module_path:"std/list"
+      ~params:
+        [
+          param "self" (ty_list ty_int);
+          param "limit" ty_int;
+          param "f" (ty_func [ ty_int ] ty_string);
+        ]
+      ~return_ty
+  in
+  match body with
+  | None -> Alcotest.fail "List.map_concurrently should synthesize Core"
+  | Some { desc = CConcurrentFor cf; ty; _ } -> (
+      Alcotest.(check string)
+        "result type"
+        (Blorp.Types.type_to_string return_ty)
+        (Blorp.Types.type_to_string ty);
+      Alcotest.(check string)
+        "task body return" "String"
+        (Blorp.Types.type_to_string cf.cf_body.ty);
+      Alcotest.(check bool)
+        "map_concurrently collects results" true
+        (match cf.cf_output with
+        | ConcurrentForCollect -> true
+        | ConcurrentForDiscard -> false);
+      match cf.cf_width with
+      | ConcurrentForLimit limit ->
+          Alcotest.(check string)
+            "limit type" "Int"
+            (Blorp.Types.type_to_string limit.ty))
+  | Some _ -> Alcotest.fail "expected synthesized CConcurrentFor"
+
+let test_list_concurrent_synthesizes_concurrent_for () =
+  let return_ty = ty_list (ty_result ty_string ty_concurrency_error) in
+  let body =
+    Blorp.Core_intrinsics.synthesize_body ~func_name:"concurrent"
+      ~module_path:"std/list"
+      ~params:
+        [
+          param "self" (ty_list ty_int);
+          param "limit" ty_int;
+          param "f" (ty_func [ ty_int ] ty_string);
+        ]
+      ~return_ty
+  in
+  match body with
+  | None -> Alcotest.fail "List.concurrent should synthesize Core"
+  | Some { desc = CConcurrentFor cf; ty; _ } -> (
+      Alcotest.(check string)
+        "result type"
+        (Blorp.Types.type_to_string return_ty)
+        (Blorp.Types.type_to_string ty);
+      Alcotest.(check string)
+        "task body return" "String"
+        (Blorp.Types.type_to_string cf.cf_body.ty);
+      Alcotest.(check bool)
+        "concurrent collects results" true
+        (match cf.cf_output with
+        | ConcurrentForCollect -> true
+        | ConcurrentForDiscard -> false);
+      match cf.cf_width with
+      | ConcurrentForLimit limit ->
+          Alcotest.(check string)
+            "limit type" "Int"
+            (Blorp.Types.type_to_string limit.ty))
+  | Some _ -> Alcotest.fail "expected synthesized CConcurrentFor"
+
+let test_list_concurrent_timeout_synthesizes_concurrent_for () =
+  let return_ty = ty_list (ty_result ty_string ty_concurrency_error) in
+  let body =
+    Blorp.Core_intrinsics.synthesize_body ~func_name:"__concurrent_timeout_ms"
+      ~module_path:"std/list"
+      ~params:
+        [
+          param "self" (ty_list ty_int);
+          param "limit" ty_int;
+          param "timeout_ms" ty_int;
+          param "f" (ty_func [ ty_int ] ty_string);
+        ]
+      ~return_ty
+  in
+  match body with
+  | None -> Alcotest.fail "List.concurrent_with_timeout should synthesize Core"
+  | Some { desc = CConcurrentFor cf; _ } -> (
+      Alcotest.(check bool)
+        "timeout attached" true
+        (Option.is_some cf.cf_timeout);
+      match cf.cf_timeout with
+      | Some timeout ->
+          Alcotest.(check string)
+            "timeout type" "Int"
+            (Blorp.Types.type_to_string timeout.ty)
+      | None -> Alcotest.fail "expected timeout expression")
+  | Some _ -> Alcotest.fail "expected synthesized CConcurrentFor"
+
 let test_list_filter_synthesizes_retain_then_transfer_loop () =
   let body =
     Blorp.Core_intrinsics.synthesize_body ~func_name:"filter"
@@ -3671,6 +3771,12 @@ let suite =
           test_tensor_mean_int_reads_int_and_casts_to_float;
         Alcotest.test_case "list_map_synthesizes_presized_loop" `Quick
           test_list_map_synthesizes_presized_loop;
+        Alcotest.test_case "list_map_concurrently_synthesizes_concurrent_for"
+          `Quick test_list_map_concurrently_synthesizes_concurrent_for;
+        Alcotest.test_case "list_concurrent_synthesizes_concurrent_for" `Quick
+          test_list_concurrent_synthesizes_concurrent_for;
+        Alcotest.test_case "list_concurrent_timeout_synthesizes_concurrent_for"
+          `Quick test_list_concurrent_timeout_synthesizes_concurrent_for;
         Alcotest.test_case "list_filter_synthesizes_retain_then_transfer_loop"
           `Quick test_list_filter_synthesizes_retain_then_transfer_loop;
         Alcotest.test_case "list_get_or_synthesizes_option_free_bounds_check"

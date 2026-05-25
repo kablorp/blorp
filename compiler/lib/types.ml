@@ -1173,6 +1173,16 @@ let is_named_type_in names ty =
   | TyNamed (name, []) -> List.mem name names
   | _ -> false
 
+let is_std_duration_type_name name =
+  match split_canonical_module_type_name name with
+  | Some (module_path, "Duration") -> module_path = "std/units"
+  | _ -> name = "Duration" || name = "std_units__Duration"
+
+let is_std_duration_type ty =
+  match head_resolve ty with
+  | TyNamed (name, []) -> is_std_duration_type_name name
+  | _ -> false
+
 (** Check if a type is any integer type (signed or unsigned, any width). *)
 let is_any_integer_type ty = is_named_type_in all_int_type_names ty
 

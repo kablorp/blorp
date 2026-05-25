@@ -1531,6 +1531,26 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
             ( binder,
               rewrite scope iter,
               rewrite (scope_add_var scope binder.loop_var) body )
+      | CSelect select ->
+          let rewrite_arm arm =
+            let arm_kind, body_scope =
+              match arm.select_arm_kind with
+              | SelectRecv r ->
+                  ( SelectRecv
+                      { r with select_channel = rewrite scope r.select_channel },
+                    scope_add_var scope r.select_bind )
+              | SelectSealed channel ->
+                  (SelectSealed (rewrite scope channel), scope)
+              | SelectAfter timeout ->
+                  (SelectAfter (rewrite scope timeout), scope)
+            in
+            {
+              arm with
+              select_arm_kind = arm_kind;
+              select_arm_body = rewrite body_scope arm.select_arm_body;
+            }
+          in
+          CSelect { select_arms = List.map rewrite_arm select.select_arms }
       | CAssign (v, rhs) -> CAssign (v, rewrite scope rhs)
       | CTailrecLoop loop ->
           let loop' =
@@ -1972,6 +1992,23 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
       | CFor (binder, iter, loop_body) ->
           scan_expr scope iter;
           scan_expr (scope_add_var scope binder.loop_var) loop_body
+      | CSelect select ->
+          List.iter
+            (fun arm ->
+              let body_scope =
+                match arm.select_arm_kind with
+                | SelectRecv r ->
+                    scan_expr scope r.select_channel;
+                    scope_add_var scope r.select_bind
+                | SelectSealed channel ->
+                    scan_expr scope channel;
+                    scope
+                | SelectAfter timeout ->
+                    scan_expr scope timeout;
+                    scope
+              in
+              scan_expr body_scope arm.select_arm_body)
+            select.select_arms
       | CAssign (_, rhs) -> scan_expr scope rhs
       | CTailrecLoop (TailrecUnmanagedLoop l) -> scan_expr scope l.tul_body
       | CTailrecLoop (TailrecListSpreadLoop l) -> scan_expr scope l.tls_body

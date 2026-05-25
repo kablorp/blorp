@@ -185,10 +185,6 @@ let concurrent_loop_limit_or_error loc n =
     raise (Parse_error_at (loc, "concurrently limit is too large"))
   else Int64.to_int n
 
-let concurrent_for_width_of_legacy = function
-  | None -> ConcurrentForDefault
-  | Some n -> ConcurrentForMaxThreads n
-
 let concurrent_for_width_of_limit loc params =
   match params.loop_limit with
   | Some n -> ConcurrentForLimit n
@@ -261,8 +257,9 @@ let apply_concurrently_loop_param params (name, value) =
 %token LT GT PERCENT HASH AT ARROW LE GE EQ NE EQUALS
 %token PLUS_EQ MINUS_EQ STAR_EQ SLASH_EQ
 %token QUESTION_EQUALS FATARROW
-%token TRY WITH DEBUG RESOURCE BORROW
+%token TRY WITH DEBUG RESOURCE
 %token CONCURRENT CONCURRENTLY
+%token SELECT FROM AFTER SEALED
 %token PIPE
 %token INDENT DEDENT NEWLINE
 %token EOF
@@ -326,11 +323,27 @@ name:
   | WITH { "with" }
   | FOREIGN { "foreign" }
   | RESOURCE { "resource" }
+  | CONCURRENT { "concurrent" }
+  | SELECT { "select" }
+  | FROM { "from" }
+  | AFTER { "after" }
+  | SEALED { "sealed" }
 
 identifier:
   | n = IDENT { n }
   | DEBUG { "debug" }
   | WITH { "with" }
+  | CONCURRENT { "concurrent" }
+  | SELECT { "select" }
+  | FROM { "from" }
+  | AFTER { "after" }
+  | SEALED { "sealed" }
+
+binding_ident:
+  | n = IDENT { n }
+  | FROM { "from" }
+  | AFTER { "after" }
+  | SEALED { "sealed" }
 
 (* Optional docstring preceding a declaration *)
 docstring:
@@ -509,30 +522,26 @@ params:
   | LPAREN ps = trailing_list(COMMA, param) RPAREN { ps }
 
 param:
-  | name = IDENT COLON ty = type_expr
-    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
-  | name = IDENT COLON BORROW ty = type_expr
-    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_passing = ParamBorrow; param_loc = loc_of_pos $symbolstartpos } }
-  | name = IDENT
-    { { param_name = Some name; param_pattern = None; param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+  | name = binding_ident COLON ty = type_expr
+    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
+  | name = binding_ident
+    { { param_name = Some name; param_pattern = None; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
   | UNDERSCORE
-    { { param_name = None; param_pattern = Some PatWildcard; param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = None; param_pattern = Some PatWildcard; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
   | UNDERSCORE COLON ty = type_expr
-    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
-  | UNDERSCORE COLON BORROW ty = type_expr
-    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_passing = ParamBorrow; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
   | LPAREN p1 = IDENT COMMA ps = trailing_nonempty_list(COMMA, IDENT) RPAREN COLON ty = type_expr
     { let all = p1 :: ps in
       if List.length all > 4 then parse_fail_at $symbolstartpos "Tuples support 2-4 elements";
       { param_name = None;
         param_pattern = Some (PatTuple (List.map (fun n -> PatVar n) all));
-        param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+        param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
   | LPAREN p1 = IDENT COMMA ps = trailing_nonempty_list(COMMA, IDENT) RPAREN
     { let all = p1 :: ps in
       if List.length all > 4 then parse_fail_at $symbolstartpos "Tuples support 2-4 elements";
       { param_name = None;
         param_pattern = Some (PatTuple (List.map (fun n -> PatVar n) all));
-        param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+        param_type = None; param_loc = loc_of_pos $symbolstartpos } }
 
 func_body:
   | e = expr { func_body_of_expr e }
@@ -556,7 +565,13 @@ stmt_list_after_newline:
   | { [] }
 
 destruct_ident:
+  | n = binding_ident { n }
+  | UNDERSCORE { "_" }
+
+select_recv_ident:
   | n = IDENT { n }
+  | AFTER { "after" }
+  | FROM { "from" }
   | UNDERSCORE { "_" }
 
 with_binding:
@@ -584,7 +599,7 @@ stmt:
   (* Error: while without colon *)
   | WHILE expr NEWLINE
     { parse_fail_at $startpos($3) "Expected ':' after while condition" }
-  | FOR name = IDENT IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
+  | FOR name = binding_ident IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
     { make_expr_at $symbolstartpos (EFor (name, iter, make_expr (EBlock body))) }
   (* Error: for without 'in' keyword *)
   | FOR IDENT IDENT
@@ -597,9 +612,9 @@ stmt:
       if List.length all > 4 then parse_fail_at $symbolstartpos "Tuples support 2-4 elements";
       make_expr_at $symbolstartpos (EForTuple (all, iter, make_expr (EBlock body))) }
   (* ?= bindings propagate Option/Result from the enclosing carrier-returning block. *)
-  | name = IDENT QUESTION_EQUALS e = expr
+  | name = binding_ident QUESTION_EQUALS e = expr
     { make_expr_at $symbolstartpos (EQuestionBind (name, None, e)) }
-  | name = IDENT COLON ty = type_expr QUESTION_EQUALS e = expr
+  | name = binding_ident COLON ty = type_expr QUESTION_EQUALS e = expr
     { make_expr_at $symbolstartpos (EQuestionBind (name, Some ty, e)) }
   (* Nested function declaration: [pure func name[T](params) -> ret: body]
      appearing inside a block. Produces [EFuncDecl] which the nested-hoist
@@ -618,10 +633,10 @@ stmt:
   | e = expr { e }
 
 stmt_var_decl:
-  | VAR name = IDENT ty = type_annotation_opt EQUALS e = expr
+  | VAR name = binding_ident ty = type_annotation_opt EQUALS e = expr
     { { var_name = Some name; var_pattern = None;
         var_type = ty; var_value = e; var_is_mutable = true; var_is_const = false } }
-  | name = IDENT COLON ty = type_expr EQUALS e = expr
+  | name = binding_ident COLON ty = type_expr EQUALS e = expr
     { { var_name = Some name; var_pattern = None;
         var_type = Some ty; var_value = e; var_is_mutable = false; var_is_const = false } }
 
@@ -724,10 +739,10 @@ field_decl:
 
 (* Variable declaration *)
 var_decl:
-  | VAR name = IDENT ty = type_annotation_opt EQUALS e = expr
+  | VAR name = binding_ident ty = type_annotation_opt EQUALS e = expr
     { { var_name = Some name; var_pattern = None;
         var_type = ty; var_value = e; var_is_mutable = true; var_is_const = false } }
-  | name = IDENT ty = type_annotation_opt EQUALS e = expr
+  | name = binding_ident ty = type_annotation_opt EQUALS e = expr
     { { var_name = Some name; var_pattern = None;
         var_type = ty; var_value = e; var_is_mutable = false; var_is_const = false } }
 
@@ -1096,7 +1111,7 @@ assign_expr:
       | EFieldAccess _ -> parse_fail_at $symbolstartpos "Field assignment is not supported. Use record update syntax: { record | field = value }"
       | _ -> make_expr_at $symbolstartpos (EAssign ("_", rhs)) (* invalid LHS, caught by typechecker *)
     }
-  | name = IDENT op = compound_op e = assign_expr
+  | name = binding_ident op = compound_op e = assign_expr
     { make_expr_at $symbolstartpos (ECompoundAssign (name, op, e)) }
   | e = ascription_expr { e }
 
@@ -1176,6 +1191,9 @@ primary_expr:
   | TRUE { make_expr_span $symbolstartpos $endpos (ELiteral (LitBool true)) }
   | FALSE { make_expr_span $symbolstartpos $endpos (ELiteral (LitBool false)) }
   | name = IDENT { make_expr_span $symbolstartpos $endpos (EIdent name) }
+  | FROM { make_expr_span $symbolstartpos $endpos (EIdent "from") }
+  | AFTER { make_expr_span $symbolstartpos $endpos (EIdent "after") }
+  | SEALED { make_expr_span $symbolstartpos $endpos (EIdent "sealed") }
   | DEBUG { make_expr_span $symbolstartpos $endpos (EIdent "debug") }
   | UNDERSCORE { make_expr_at $symbolstartpos EVoid }
   | VOID_KW { make_expr_at $symbolstartpos EVoid }
@@ -1211,6 +1229,10 @@ primary_expr:
   (* Error: match without colon *)
   | MATCH expr NEWLINE
     { parse_fail_at $startpos($3) "Expected ':' after match expression" }
+  | SELECT COLON NEWLINE INDENT arms = select_arm_list DEDENT
+    { make_expr_at $symbolstartpos (ESelect arms) }
+  | SELECT NEWLINE
+    { parse_fail_at $symbolstartpos "Expected ':' after select" }
   | TRY COLON NEWLINE INDENT stmts = stmt_list DEDENT
     { let _ = stmts in
       parse_fail_at $symbolstartpos
@@ -1228,7 +1250,7 @@ primary_expr:
     { make_expr_at $symbolstartpos (EWith (binding, stmts_to_expr_at $startpos(body) body)) }
   | WITH with_binding NEWLINE
     { parse_fail_at $startpos($3) "Expected ':' after with binding" }
-  | FOR name = IDENT IN iter = expr CONCURRENTLY LPAREN params = concurrently_loop_params RPAREN COLON NEWLINE INDENT body = stmt_list DEDENT
+  | FOR name = binding_ident IN iter = expr CONCURRENTLY LPAREN params = concurrently_loop_params RPAREN COLON NEWLINE INDENT body = stmt_list DEDENT
     { make_expr_at $symbolstartpos
         (EConcurrentFor
            ( name,
@@ -1248,9 +1270,13 @@ primary_expr:
              concurrent_for_width_of_limit
                (loc_of_pos $startpos(params))
                params )) }
-  | FOR name = IDENT IN iter = expr CONCURRENTLY COLON NEWLINE INDENT body = stmt_list DEDENT
+  | FOR name = binding_ident IN iter = expr CONCURRENTLY COLON NEWLINE INDENT body = stmt_list DEDENT
     { let _ = (name, iter, body) in
       parse_fail_at $startpos($6)
+        "`for ... concurrently` requires options; write `for x in xs concurrently(limit: N):`" }
+  | FOR UNDERSCORE IN iter = expr CONCURRENTLY COLON NEWLINE INDENT body = stmt_list DEDENT
+    { let _ = (iter, body) in
+      parse_fail_at $startpos($5)
         "`for ... concurrently` requires options; write `for x in xs concurrently(limit: N):`" }
   (* concurrent: block — no timeout *)
   (* concurrent: block — no params *)
@@ -1260,17 +1286,15 @@ primary_expr:
   | CONCURRENT LPAREN params = concurrent_params RPAREN COLON NEWLINE INDENT stmts = stmt_list DEDENT
     { make_expr_at $symbolstartpos (EConcurrent (stmts, params.conc_timeout, params.conc_max_threads)) }
   (* concurrent for — no params *)
-  | CONCURRENT FOR name = IDENT IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
-    { make_expr_at $symbolstartpos (EConcurrentFor (name, iter, stmts_to_expr body, None, ConcurrentForDefault)) }
+  | CONCURRENT FOR name = binding_ident IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
+    { let _ = (name, iter, body) in
+      parse_fail_at $symbolstartpos
+        "`concurrent for` has been removed. Use `for n in nums concurrently(limit: N):` for statement fan-out, or `nums.concurrent(N, func(n): ...)` to collect results." }
   (* concurrent(params) for — with named params *)
-  | CONCURRENT LPAREN params = concurrent_params RPAREN FOR name = IDENT IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
-    { make_expr_at $symbolstartpos
-        (EConcurrentFor
-           ( name,
-             iter,
-             stmts_to_expr body,
-             params.conc_timeout,
-             concurrent_for_width_of_legacy params.conc_max_threads )) }
+  | CONCURRENT LPAREN params = concurrent_params RPAREN FOR name = binding_ident IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
+    { let _ = (params, name, iter, body) in
+      parse_fail_at $symbolstartpos
+        "`concurrent(...) for` has been removed. Use `for n in nums concurrently(limit: N, timeout: timeout):` for statement fan-out, or `nums.concurrent_with_timeout(N, timeout, func(n): ...)` to collect results." }
   | CONCURRENTLY COLON NEWLINE INDENT stmts = stmt_list DEDENT
     { let _ = stmts in
       parse_fail_at $symbolstartpos
@@ -1380,6 +1404,35 @@ match_case:
   | pattern ARROW
     { parse_fail_at $startpos($2) "Use ':' not '->' in match arms. Write 'pattern: body'" }
 
+select_arm_list:
+  | newlines arms = select_arm_list_nonempty { arms }
+
+select_arm_list_nonempty:
+  | arm = select_arm rest = select_arm_list_tail { arm :: rest }
+
+select_arm_list_tail:
+  | NEWLINE newlines rest = select_arm_list_after_newline { rest }
+  | arm = select_arm rest = select_arm_list_tail { arm :: rest }
+  | { [] }
+
+select_arm_list_after_newline:
+  | rest = select_arm_list_nonempty { rest }
+  | { [] }
+
+select_arm:
+  | name = select_recv_ident FROM channel = expr COLON NEWLINE INDENT body = stmt_list DEDENT
+    { { select_arm_kind = SelectRecv { select_bind = name; select_channel = channel };
+        select_arm_body = stmts_to_expr_at $startpos(body) body;
+        select_arm_loc = loc_of_pos $symbolstartpos } }
+  | SEALED channel = expr COLON NEWLINE INDENT body = stmt_list DEDENT
+    { { select_arm_kind = SelectSealed channel;
+        select_arm_body = stmts_to_expr_at $startpos(body) body;
+        select_arm_loc = loc_of_pos $symbolstartpos } }
+  | UNDERSCORE AFTER timeout = expr COLON NEWLINE INDENT body = stmt_list DEDENT
+    { { select_arm_kind = SelectAfter timeout;
+        select_arm_body = stmts_to_expr_at $startpos(body) body;
+        select_arm_loc = loc_of_pos $symbolstartpos } }
+
 pattern:
   | p = simple_pattern { p }
   | p1 = simple_pattern PIPE ps = separated_nonempty_list(PIPE, simple_pattern)
@@ -1387,7 +1440,7 @@ pattern:
 
 simple_pattern:
   | UNDERSCORE { PatWildcard }
-  | name = IDENT { PatVar name }
+  | name = binding_ident { PatVar name }
   | n = INT { PatLiteral (LitInt n) }
   | n = BIGINT { PatLiteral (LitInt128 n) }
   | MINUS n = INT { PatLiteral (LitInt (Int64.neg n)) }
@@ -1418,7 +1471,7 @@ simple_pattern:
     { let (elems, spread) = rest in PatList (p :: elems, spread) }
 
 spread_target:
-  | name = IDENT { PatVar name }
+  | name = binding_ident { PatVar name }
   | UNDERSCORE { PatWildcard }
 
 list_pattern_rest:
@@ -1440,12 +1493,12 @@ lambda_expr:
 	          ~body:(FuncBodyExpr body) ~annots:[])) }
 
 lambda_param:
-  | name = IDENT COLON ty = type_expr
-    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
-  | name = IDENT
-    { { param_name = Some name; param_pattern = None; param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+  | name = binding_ident COLON ty = type_expr
+    { { param_name = Some name; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
+  | name = binding_ident
+    { { param_name = Some name; param_pattern = None; param_type = None; param_loc = loc_of_pos $symbolstartpos } }
   (* Underscore as discard parameter *)
   | UNDERSCORE COLON ty = type_expr
-    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some "_"; param_pattern = None; param_type = Some ty; param_loc = loc_of_pos $symbolstartpos } }
   | UNDERSCORE
-    { { param_name = Some "_"; param_pattern = None; param_type = None; param_passing = ParamByValue; param_loc = loc_of_pos $symbolstartpos } }
+    { { param_name = Some "_"; param_pattern = None; param_type = None; param_loc = loc_of_pos $symbolstartpos } }

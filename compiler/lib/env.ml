@@ -19,7 +19,6 @@ type var_mutability = Immutable | Mutable
 type var_origin =
   | LetBinding
   | FuncParam
-  | BorrowedResourceParam
   | ForLoopVar
   | MatchBinding
   | ScopedResource
@@ -282,10 +281,7 @@ let add_var (env : env) (name : string) (var_type : type_expr) ?source_type
 (** Check if a variable is a function parameter *)
 let is_func_param (env : env) (name : string) : bool =
   match lookup env name with
-  | Some
-      { kind = VarSymbol { origin = FuncParam | BorrowedResourceParam; _ }; _ }
-    ->
-      true
+  | Some { kind = VarSymbol { origin = FuncParam; _ }; _ } -> true
   | _ -> false
 
 (** Check if a variable is a for-loop variable *)
@@ -296,12 +292,7 @@ let is_for_loop_var (env : env) (name : string) : bool =
 
 let is_scoped_resource_var (env : env) (name : string) : bool =
   match lookup env name with
-  | Some
-      {
-        kind = VarSymbol { origin = ScopedResource | BorrowedResourceParam; _ };
-        _;
-      } ->
-      true
+  | Some { kind = VarSymbol { origin = ScopedResource; _ }; _ } -> true
   | _ -> false
 
 let is_scoped_resource_derived_var (env : env) (name : string) : bool =
@@ -313,13 +304,7 @@ let is_scoped_resource_related_var (env : env) (name : string) : bool =
   match lookup env name with
   | Some
       {
-        kind =
-          VarSymbol
-            {
-              origin =
-                ScopedResource | BorrowedResourceParam | ScopedResourceDerived;
-              _;
-            };
+        kind = VarSymbol { origin = ScopedResource | ScopedResourceDerived; _ };
         _;
       } ->
       true

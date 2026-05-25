@@ -77,6 +77,7 @@ let descriptors =
     effects "now" [ Impure ];
     effects "now_us" [ Impure ];
     effects "sleep" [ Impure ];
+    effects "yield_now" [ Impure ];
     effects "channel" [ Impure ];
     effects "send" [ Impure ];
     effects "recv" [ Impure ];

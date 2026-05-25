@@ -91,6 +91,18 @@ let rec expr_source_end_line e =
   | EConcurrent (bindings, timeout, _) ->
       max_optional_expr (max_exprs base bindings) timeout
   | EConcurrentBind (_, _, value) -> max base (expr_source_end_line value)
+  | ESelect arms ->
+      List.fold_left
+        (fun acc arm ->
+          let acc =
+            match arm.select_arm_kind with
+            | SelectRecv { select_channel; _ } ->
+                max acc (expr_source_end_line select_channel)
+            | SelectAfter timeout -> max acc (expr_source_end_line timeout)
+            | SelectSealed channel -> max acc (expr_source_end_line channel)
+          in
+          max acc (expr_source_end_line arm.select_arm_body))
+        base arms
   | EWith (binding, body) ->
       max base
         (max

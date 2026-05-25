@@ -93,6 +93,17 @@ type with_binding = {
   with_kind : with_binding_kind;
 }
 
+type select_arm = {
+  select_arm_kind : select_arm_kind;
+  select_arm_body : expr;
+  select_arm_loc : Ast.loc;
+}
+
+and select_arm_kind =
+  | SelectRecv of { select_bind : string; select_channel : expr }
+  | SelectAfter of expr
+  | SelectSealed of expr
+
 type expr_desc =
   | EIdent of string
   | ELiteral of Ast.literal
@@ -131,6 +142,7 @@ type expr_desc =
   | EQuestionBind of string * Ast.type_expr option * expr
   | EWith of with_binding * expr
   | EDebugBlock of expr list
+  | ESelect of select_arm list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr
   | EConcurrentFor of

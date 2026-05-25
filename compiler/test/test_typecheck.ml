@@ -1653,7 +1653,6 @@ let typed_param name ty : Blorp.Ast.param =
     param_name = Some name;
     param_pattern = None;
     param_type = Some ty;
-    param_passing = ParamByValue;
     param_loc = loc;
   }
 
@@ -1909,6 +1908,7 @@ let test_variant_def_ids_builtin_concurrency_error () =
       match Blorp.Env.get_type_decl env "ConcurrencyError" with
       | None -> Alcotest.fail "ConcurrencyError type missing from builtin env"
       | Some (_, variants) ->
+          Alcotest.(check int) "three variants" 3 (List.length variants);
           List.iter
             (fun (v : Blorp.Ast.variant) ->
               Alcotest.(check (option int))
@@ -1916,6 +1916,17 @@ let test_variant_def_ids_builtin_concurrency_error () =
                    v.variant_name)
                 None v.variant_def_id)
             variants)
+
+let test_builtin_task_result_alias () =
+  Test_helpers.with_isolated_env (fun () ->
+      let env = Blorp.Env_builtins.with_builtins (Blorp.Env.empty ()) in
+      match Blorp.Env.get_alias env "TaskResult" with
+      | None -> Alcotest.fail "TaskResult alias missing from builtin env"
+      | Some (params, target) ->
+          Alcotest.(check (list string)) "one type param" [ "T" ] params;
+          Alcotest.(check string)
+            "target" "Result[T, ConcurrencyError]"
+            (Blorp.Types.type_to_string target))
 
 (* Regression: running [with_builtins] multiple times on the same
    env (as pipeline.ml / typecheck.ml do) must not mint fresh DefIds
@@ -2165,6 +2176,8 @@ let suite =
           test_variant_def_ids_builtin_result;
         Alcotest.test_case "builtin ConcurrencyError has None def_id" `Quick
           test_variant_def_ids_builtin_concurrency_error;
+        Alcotest.test_case "builtin TaskResult alias" `Quick
+          test_builtin_task_result_alias;
         Alcotest.test_case "with_builtins idempotent for variants" `Quick
           test_with_builtins_idempotent_for_variants;
       ] );

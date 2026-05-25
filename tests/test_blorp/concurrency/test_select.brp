@@ -1,0 +1,280 @@
+import:
+	system: now_microseconds
+	test: TestSuite
+	units: microseconds
+
+
+func payload(label: String) -> String:
+	label + "-payload"
+
+
+func test_select_receives_buffered_value() -> Bool:
+	ch: Channel[Int] = channel(1)
+	_ = send(ch, 7)
+	var got: Int = 0
+	select:
+		value from ch:
+			got = value
+		_ after 100:
+			got = -1
+	got == 7
+
+
+func test_select_after_when_empty() -> Bool:
+	ch: Channel[Int] = channel(1)
+	start: Int = now_microseconds()
+	var got: Int = 0
+	select:
+		value from ch:
+			got = value
+		_ after 10:
+			got = 1
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	got == 1 and elapsed_ms < 200
+
+
+func test_select_sealed_drained_channel() -> Bool:
+	ch: Channel[Int] = channel(1)
+	seal(ch)
+	var saw_sealed: Bool = False
+	select:
+		value from ch:
+			saw_sealed = value == -1
+		sealed ch:
+			saw_sealed = True
+		_ after 100:
+			saw_sealed = False
+	saw_sealed
+
+
+func test_select_drains_before_sealed() -> Bool:
+	ch: Channel[Int] = channel(1)
+	_ = send(ch, 9)
+	seal(ch)
+	var first: Int = 0
+	var second: Int = 0
+	select:
+		value from ch:
+			first = value
+		sealed ch:
+			first = -1
+		_ after 100:
+			first = -2
+	select:
+		value from ch:
+			second = value
+		sealed ch:
+			second = 1
+		_ after 100:
+			second = -2
+	first == 9 and second == 1
+
+
+func test_select_receives_managed_value() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, payload("hello"))
+	var got: String = ""
+	select:
+		value from ch:
+			got = value
+		_ after 100:
+			got = "timeout"
+	got == "hello-payload"
+
+
+func select_managed_value_then_sleep(ch: Channel[String]) -> Int:
+	var got: Int = 0
+	select:
+		value from ch:
+			sleep(10000)
+			got = value.length()
+		_ after 10000:
+			got = -1
+	got
+
+
+func test_select_managed_receive_cleans_up_on_cancel() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, payload("cancelled-select"))
+	concurrent(timeout: 30):
+		selected = select_managed_value_then_sleep(ch)
+	match selected:
+		Ok(_): False
+		Err(_): True
+
+
+func test_select_duration_after_when_empty() -> Bool:
+	ch: Channel[Int] = channel(1)
+	var got: Int = 0
+	select:
+		value from ch:
+			got = value
+		_ after microseconds(1):
+			got = 1
+	got == 1
+
+
+func test_select_ready_arms_rotate() -> Bool:
+	left: Channel[Int] = channel(12)
+	right: Channel[Int] = channel(12)
+	for i in 0..10:
+		_ = send(left, i)
+		_ = send(right, i)
+	var left_count: Int = 0
+	var right_count: Int = 0
+	for i in 0..10:
+		select:
+			_ from left:
+				left_count += 1
+			_ from right:
+				right_count += 1
+			_ after 100:
+				left_count = -100
+	left_count > 0 and right_count > 0
+
+
+func test_select_branch_closure_captures_value() -> Bool:
+	source: Channel[String] = channel(1)
+	output: Channel[String] = channel(1)
+	_ = send(source, "captured")
+	select:
+		value from source:
+			detach send(output, value)
+		_ after 100:
+			_ = send(output, "timeout")
+	match recv_timeout(output, 100):
+		Some(value): value == "captured"
+		None: False
+
+
+func delayed_send(ch: Channel[Int], value: Int) -> Bool:
+	sleep(10)
+	send(ch, value)
+
+
+func test_select_wakes_for_detached_send() -> Bool:
+	ch: Channel[Int] = channel(1)
+	detach delayed_send(ch, 42)
+	var got: Int = 0
+	select:
+		value from ch:
+			got = value
+		_ after 200:
+			got = -1
+	got == 42
+
+
+func select_timeout_task(ch: Channel[Int]) -> Int:
+	var got: Int = 0
+	select:
+		value from ch:
+			got = value
+		_ after 10:
+			got = -1
+	got
+
+
+func test_select_timeout_removes_waiter() -> Bool:
+	ch: Channel[Int] = channel(1)
+	concurrent(timeout: 200):
+		selected = select_timeout_task(ch)
+	selected_ok: Bool = match selected:
+		Ok(value): value == -1
+		Err(_): False
+	refill_ok: Bool = send(ch, 8)
+	recv_ok: Bool = match recv(ch):
+		Some(value): value == 8
+		None: False
+	selected_ok and refill_ok and recv_ok
+
+
+func select_blocked_task(ch: Channel[Int]) -> Int:
+	var got: Int = 0
+	select:
+		value from ch:
+			got = value
+		_ after 10000:
+			got = -1
+	got
+
+
+func test_select_cancelled_by_timeout() -> Bool:
+	ch: Channel[Int] = channel(1)
+	start: Int = now_microseconds()
+	concurrent(timeout: 30):
+		selected = select_blocked_task(ch)
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	timed_out: Bool = match selected:
+		Ok(_): False
+		Err(_): True
+	refill_ok: Bool = send(ch, 11)
+	recv_ok: Bool = match recv(ch):
+		Some(value): value == 11
+		None: False
+	timed_out and elapsed_ms < 200 and refill_ok and recv_ok
+
+
+func drain_after_select_waiter_ready(ch: Channel[Int], ready: Channel[Int]) -> Int:
+	match recv(ready):
+		Some(_):
+			sleep(30)
+			match recv(ch):
+				Some(value): value
+				None: -1
+		None: -2
+
+
+func wait_for_sealed_after_external_drain(ch: Channel[Int], ready: Channel[Int]) -> Bool:
+	_ = send(ready, 1)
+	var saw_sealed: Bool = False
+	select:
+		sealed ch:
+			saw_sealed = True
+		_ after 300:
+			saw_sealed = False
+	saw_sealed
+
+
+func test_select_sealed_wakes_after_external_drain() -> Bool:
+	ch: Channel[Int] = channel(1)
+	ready: Channel[Int] = channel(1)
+	_ = send(ch, 5)
+	seal(ch)
+	start: Int = now_microseconds()
+	concurrent(timeout: 1000):
+		drained = drain_after_select_waiter_ready(ch, ready)
+		saw_sealed = wait_for_sealed_after_external_drain(ch, ready)
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	drained_ok: Bool = match drained:
+		Ok(value): value == 5
+		Err(_): False
+	saw_ok: Bool = match saw_sealed:
+		Ok(value): value
+		Err(_): False
+	drained_ok and saw_ok and elapsed_ms < 200
+
+
+tests: TestSuite = {
+	description = "select",
+	tests = [
+		("receives buffered value", test_select_receives_buffered_value),
+		("after when empty", test_select_after_when_empty),
+		("sealed drained channel", test_select_sealed_drained_channel),
+		("drains before sealed", test_select_drains_before_sealed),
+		("receives managed value", test_select_receives_managed_value),
+		(
+			"managed receive cleans up on cancel",
+			test_select_managed_receive_cleans_up_on_cancel,
+		),
+		("duration after when empty", test_select_duration_after_when_empty),
+		("ready arms rotate", test_select_ready_arms_rotate),
+		("branch closure captures value", test_select_branch_closure_captures_value),
+		("wakes for detached send", test_select_wakes_for_detached_send),
+		("timeout removes waiter", test_select_timeout_removes_waiter),
+		("cancelled by timeout", test_select_cancelled_by_timeout),
+		(
+			"sealed wakes after external drain",
+			test_select_sealed_wakes_after_external_drain,
+		),
+	],
+}

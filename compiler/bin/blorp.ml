@@ -101,14 +101,20 @@ let decl_to_string d =
 
 let program_to_string prog = String.concat "\n" (List.map decl_to_string prog)
 
-(** Resolve timeout: CLI flag overrides env var *)
-let resolve_timeout cli_timeout =
+(** Resolve timeout: CLI flag overrides env vars, checked in order. *)
+let resolve_timeout_from_env env_names cli_timeout =
   match cli_timeout with
   | Some _ -> cli_timeout
-  | None -> (
-      match Sys.getenv_opt "BLORP_TIMEOUT" with
-      | Some s -> int_of_string_opt s
-      | None -> None)
+  | None ->
+      List.find_map
+        (fun name -> Option.bind (Sys.getenv_opt name) int_of_string_opt)
+        env_names
+
+let resolve_timeout cli_timeout =
+  resolve_timeout_from_env [ "BLORP_TIMEOUT" ] cli_timeout
+
+let resolve_test_timeout cli_timeout =
+  resolve_timeout_from_env [ "BLORP_TEST_TIMEOUT"; "BLORP_TIMEOUT" ] cli_timeout
 
 let resolve_sanitize cli_sanitize =
   cli_sanitize || Sys.getenv_opt "BLORP_SANITIZE" = Some "1"
@@ -775,6 +781,8 @@ let usage () =
     "  BLORP_STD=<path>      Use std directory (--std-dir overrides; beats \
      blorp.toml)";
   print_endline "  BLORP_TIMEOUT=N       Default timeout (CLI flag overrides)";
+  print_endline
+    "  BLORP_TEST_TIMEOUT=N  Default test timeout (test --timeout overrides)";
   print_endline "  BLORP_SANITIZE=1      Enable sanitizers (CLI flag overrides)";
   print_endline
     "  BLORP_LEAK_CHECK=1    Enable leak reporting (CLI flag overrides)";
@@ -1398,7 +1406,7 @@ let () =
             exit 1)
     | "test" :: rest -> (
         let rec parse_test_args args profile debug sanitize leak_check no_format
-            timeout jobs mode cache std_dir paths =
+            timeout jobs repeat mode cache std_dir paths =
           match args with
           | [] ->
               ( profile,
@@ -1408,6 +1416,7 @@ let () =
                 no_format,
                 timeout,
                 jobs,
+                repeat,
                 mode,
                 cache,
                 std_dir,
@@ -1422,8 +1431,11 @@ let () =
               print_endline "  --sanitize     Run with AddressSanitizer + UBSan";
               print_endline "  --leak-check   Report leaked objects on exit";
               print_endline
-                "  --timeout N    Kill each test after N seconds (default: 30, \
-                 0 disables)";
+                "  --timeout N    Kill each test after N seconds (default: \
+                 BLORP_TEST_TIMEOUT, BLORP_TIMEOUT, or 30; 0 disables)";
+              print_endline
+                "  --repeat N     Run selected tests N times; disables result \
+                 caching for this run";
               print_endline "  -j N           Run tests with N parallel workers";
               print_endline "  --doc          Run only doctests";
               print_endline "  --suite        Run only TestSuite tests";
@@ -1433,22 +1445,22 @@ let () =
               exit 0
           | "--profile" :: rest ->
               parse_test_args rest true debug sanitize leak_check no_format
-                timeout jobs mode cache std_dir paths
+                timeout jobs repeat mode cache std_dir paths
           | "--debug" :: rest ->
               parse_test_args rest profile true sanitize leak_check no_format
-                timeout jobs mode cache std_dir paths
+                timeout jobs repeat mode cache std_dir paths
           | "--sanitize" :: rest ->
               parse_test_args rest profile debug true leak_check no_format
-                timeout jobs mode cache std_dir paths
+                timeout jobs repeat mode cache std_dir paths
           | "--leak-check" :: rest ->
               parse_test_args rest profile debug sanitize true no_format timeout
-                jobs mode cache std_dir paths
+                jobs repeat mode cache std_dir paths
           | "--no-cache" :: rest ->
               parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs mode false std_dir paths
+                timeout jobs repeat mode false std_dir paths
           | "--no-format" :: rest ->
               parse_test_args rest profile debug sanitize leak_check true
-                timeout jobs mode cache std_dir paths
+                timeout jobs repeat mode cache std_dir paths
           | "--batch" :: _ ->
               prerr_endline
                 "Error: --batch has been removed; blorp test now chooses the \
@@ -1461,20 +1473,31 @@ let () =
               exit 0
           | "--doc" :: rest ->
               parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs Test_runner.DocOnly cache std_dir paths
+                timeout jobs repeat Test_runner.DocOnly cache std_dir paths
           | "--suite" :: rest ->
               parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs Test_runner.SuiteOnly cache std_dir paths
+                timeout jobs repeat Test_runner.SuiteOnly cache std_dir paths
           | "--std-dir" :: dir :: rest ->
               parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs mode cache (Some dir) paths
+                timeout jobs repeat mode cache (Some dir) paths
           | "--timeout" :: n :: rest -> (
               match int_of_string_opt n with
               | Some v ->
                   parse_test_args rest profile debug sanitize leak_check
-                    no_format (Some v) jobs mode cache std_dir paths
+                    no_format (Some v) jobs repeat mode cache std_dir paths
               | None ->
                   prerr_endline "Error: --timeout requires an integer";
+                  exit 1)
+          | [ "--repeat" ] ->
+              prerr_endline "Error: --repeat requires a value";
+              exit 1
+          | "--repeat" :: n :: rest -> (
+              match int_of_string_opt n with
+              | Some v when v > 0 ->
+                  parse_test_args rest profile debug sanitize leak_check
+                    no_format timeout jobs v mode cache std_dir paths
+              | _ ->
+                  prerr_endline "Error: --repeat requires a positive integer";
                   exit 1)
           | [ "-j" ] ->
               prerr_endline "Error: -j requires a value";
@@ -1483,13 +1506,13 @@ let () =
               match int_of_string_opt n with
               | Some v ->
                   parse_test_args rest profile debug sanitize leak_check
-                    no_format timeout v mode cache std_dir paths
+                    no_format timeout v repeat mode cache std_dir paths
               | None ->
                   prerr_endline "Error: -j requires an integer";
                   exit 1)
           | path :: rest ->
               parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs mode cache std_dir (path :: paths)
+                timeout jobs repeat mode cache std_dir (path :: paths)
         in
         let ( profile,
               debug,
@@ -1498,15 +1521,16 @@ let () =
               cli_no_format,
               cli_timeout,
               jobs,
+              repeat,
               mode,
               cache,
               std_dir,
               paths ) =
-          parse_test_args rest false false false false false None 0
+          parse_test_args rest false false false false false None 0 1
             Test_runner.TestAll true None []
         in
         let timeout =
-          match resolve_timeout cli_timeout with
+          match resolve_test_timeout cli_timeout with
           | Some _ as timeout -> timeout
           | None -> Some 30
         in
@@ -1532,14 +1556,14 @@ let () =
         | [ path ] ->
             exit
               (Test_runner.run_tests ~profile ~debug ~sanitize ~leak_check ~mode
-                 ~timeout ~jobs ~cache path)
+                 ~timeout ~jobs ~cache ~repeat path)
         | [] ->
             prerr_endline "Error: No test path specified";
             exit 1
         | _ ->
             exit
               (Test_runner.run_tests_paths ~profile ~debug ~sanitize ~leak_check
-                 ~mode ~timeout ~jobs ~cache paths))
+                 ~mode ~timeout ~jobs ~cache ~repeat paths))
     | "purify" :: rest -> (
         let rec parse_purify_args args dry_run verbose files =
           match args with

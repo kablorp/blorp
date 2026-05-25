@@ -529,8 +529,14 @@ let builtin_contract_table =
         ]
         (bfixed [ Borrow; Retain ] ReturnPrimitive);
       builtins ~void_boxed_args:[ 1 ]
+        [ "blorp_channel_try_send_attempt" ]
+        (bfixed [ Borrow; Retain ] ReturnOwned);
+      builtins ~void_boxed_args:[ 1 ]
         [ "blorp_channel_send_timeout"; "blorp_channel_send_timeout_status" ]
         (bfixed [ Borrow; Retain; Borrow ] ReturnPrimitive);
+      builtins ~void_boxed_args:[ 1 ]
+        [ "blorp_channel_send_timeout_attempt" ]
+        (bfixed [ Borrow; Retain; Borrow ] ReturnOwned);
       builtins
         [
           "blorp_channel_recv";
@@ -543,13 +549,21 @@ let builtin_contract_table =
         [ "blorp_channel_recv_timeout"; "blorp_channel_recv_timeout_nullable" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
+        [ "blorp_channel_try_recv_attempt" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_channel_recv_timeout_attempt" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
         (channel_recv_stack_option_builtins "blorp_channel_recv"
         @ channel_recv_stack_option_builtins "blorp_channel_try_recv")
         (bfixed [ Borrow ] ReturnPrimitive);
       builtins
         (channel_recv_stack_option_builtins "blorp_channel_recv_timeout")
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);
-      builtins [ "blorp_channel_close" ] (bfixed [ Borrow ] ReturnVoid);
+      builtins
+        [ "blorp_channel_seal"; "blorp_channel_close" ]
+        (bfixed [ Borrow ] ReturnVoid);
       builtins [ "blorp_get_scheduler_stats" ] (bfixed [] ReturnOwned);
       builtins [ "blorp_reset_scheduler_stats" ] (bfixed [] ReturnVoid);
       (* Dict runtime functions. Mutating operations consume the dict owner through

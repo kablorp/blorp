@@ -1626,7 +1626,7 @@ Rules for `?=`:
 - `?=` binds `Some(value)` or `Ok(value)` to the name on the left.
 - `None` or `Err(error)` is returned from the enclosing carrier-returning function.
 - Success values are not auto-wrapped; write `Some(value)` or `Ok(value)` explicitly.
-- `?=` is rejected inside loop bodies. Use an explicit `match`, local state, and `break`/`continue` when loop control is involved.
+- `?=` is rejected inside loop bodies, including `for ... concurrently(...)` bodies. Move the `?=` before the loop, use an explicit `match` in the loop, or use Option/Result combinators when failure should stay local to one iteration.
 - There is no bare postfix `?` operator.
 
 ### `with` Resource Scopes
@@ -1635,7 +1635,8 @@ Rules for `?=`:
 with deterministic cleanup. The acquired value must have a `resource type`.
 The resource binding exists only inside the body, and the compiler rejects
 returning resource-typed values or scoped-derived values through the final
-expression, closure capture, `detach`, `concurrent:`, or `concurrent for`.
+expression, closure capture, `detach`, `concurrent:`, or
+`for ... concurrently(limit:)`.
 
 ```blorp
 import:
@@ -1646,22 +1647,9 @@ func load_text(path: String) -> Result[String, IOError]:
         reader.read_text()
 ```
 
-Source helpers may borrow a scoped resource for one synchronous call by marking
-the parameter as `borrow`. The parameter type must be a direct resource type,
-and the helper body must be visible to the type checker so it can reject
-resource-dependent returns or captures:
-
-```blorp
-import:
-    file: FileReader, IOError, open_read, read_text
-
-func read_from(reader: borrow FileReader) -> Result[String, IOError]:
-    reader.read_text()
-
-func load_text(path: String) -> Result[String, IOError]:
-    with reader ?= open_read(path):
-        read_from(reader)
-```
+Source functions cannot accept resource handles as parameters or return values.
+That keeps resource cleanup ownership out of ordinary value semantics. Keep
+handle use inside the `with` body, and pass ordinary data to helpers.
 
 Compilation lowers resource scopes to explicit Core cleanup nodes and emits
 cleanup for normal completion, body-level `?=` short-circuit results,
@@ -2096,7 +2084,7 @@ private func helper(x: Int) -> Int:
 
 ## 9. Concurrency
 
-blorp provides structured concurrency primitives: `concurrent:` blocks for parallel computation with automatic joining, `for ... concurrently(limit: N)` for dynamic fan-out with explicit width, `detach` for fire-and-forget tasks, and `Channel[T]` for inter-thread communication. The older `concurrent for` spelling is still accepted during the migration window.
+blorp provides structured concurrency primitives: `concurrent:` blocks for parallel computation with automatic joining, `for ... concurrently(limit: N)` for statement fan-out with explicit width, `List.concurrent(...)` for value-collecting fan-out, `detach` for fire-and-forget tasks, and `Channel[T]` for inter-thread communication. The older `concurrent for` spelling has been removed.
 
 ### Concurrent Blocks
 
@@ -2117,7 +2105,7 @@ func main(args: List[String]) -> Int:
         a = expensive_a()
         b = expensive_b()
 
-    -- Each binding is Result[T, ConcurrencyError]
+    -- Each binding is TaskResult[T]
     match a:
         Ok(val): print("a = ${to_string(val)}")
         Err(_): print("a failed")
@@ -2128,7 +2116,7 @@ func main(args: List[String]) -> Int:
     0
 ```
 
-Each binding in a `concurrent:` block spawns a task on the thread pool. The block waits for all tasks to complete before continuing. Each binding's type is `Result[T, ConcurrencyError]` where `T` is the return type of the expression.
+Each binding in a `concurrent:` block spawns a task on the thread pool. The block waits for all tasks to complete before continuing. Each binding's type is `TaskResult[T]`, where `T` is the return type of the expression. `TaskResult[T]` is an alias for `Result[T, ConcurrencyError]`, so match with `Ok(value)` and `Err(error)`.
 
 ### Concurrent Blocks with Timeout
 
@@ -2155,41 +2143,85 @@ func timeout_example() -> Int:
 `ConcurrencyError` is a union type with variants `Timeout`,
 `TaskFailed(String)`, and `Cancelled`.
 
-**Note:** Timeouts are cooperative — they take effect at yield points (sleep,
-channel send/recv, task join). When a timeout fires, the timed-out task is
+Timeouts can also use typed `Duration` values from `units`:
+
+```blorp
+import:
+    units: from_milliseconds
+
+func typed_timeout_example() -> Int:
+    concurrent(timeout: from_milliseconds(500)):
+        result = quick_computation()
+    0
+```
+
+**Note:** Timeouts are cooperative — they take effect at yield points (`sleep`,
+`yield_now`, channel send/recv, task join). When a timeout fires, the timed-out task is
 cancelled and the block waits for it to reach its next cancellation point before
 continuing, so code after that point does not run. Resources acquired with
 `with` are closed by cancellation cleanup before the task unwinds. A CPU-bound
 computation loop will not be interrupted by a timeout. If you need
-interruptible compute, insert periodic `sleep(0)` calls.
+interruptible compute, insert periodic `yield_now()` calls.
 
 ### Concurrent Loops
 
-Fan out work across a list and collect results:
+Fan out side-effecting or producer work across a list. The loop joins before
+execution continues. `for ... concurrently(...)` is statement-only; use
+`List.concurrent(...)` when you need collected results:
 
 ```blorp
 import:
     list: range
 
+func index_page(page: Int) -> Void:
+    print("indexing page ${to_string(page)}")
+
+func main(args: List[String]) -> Int:
+    pages: List[Int] = range(1, 11)
+
+    -- The explicit limit makes task width and backpressure visible.
+    for page in pages concurrently(limit: 4):
+        index_page(page)
+
+    0
+```
+
+Loop-wide timeouts accept either raw integer milliseconds or typed `Duration`
+values:
+
+```blorp
+import:
+    units: from_seconds
+
+func index_with_deadline(pages: List[Int]) -> Void:
+    for page in pages concurrently(limit: 4, timeout: from_seconds(2)):
+        index_page(page)
+```
+
+For ordinary map-style fan-out, use the explicit list helper. It preserves
+input order and returns `List[Result[U, ConcurrencyError]]`:
+
+```blorp
 func compute_square(n: Int) -> Int:
     n * n
 
-func main(args: List[String]) -> Int:
-    numbers: List[Int] = range(1, 11)
-
-    -- Each element is processed concurrently; the explicit limit makes width visible.
-    results: List[Result[Int, ConcurrencyError]] = for n in numbers concurrently(limit: 4):
-        compute_square(n)
-
-    -- Collect successful results
-    var total: Int = 0
-    for r in results:
-        match r:
-            Ok(v): total = total + v
-            Err(_): total = total
-    print("Sum of squares: ${to_string(total)}")
-    0
+func square_all(nums: List[Int]) -> List[Result[Int, ConcurrencyError]]:
+    nums.concurrent(8, func(n: Int): compute_square(n))
 ```
+
+Use `concurrent_with_timeout` when collected fan-out needs a whole-operation
+deadline:
+
+```blorp
+import:
+    units: from_seconds
+
+func square_all_with_deadline(nums: List[Int]) -> List[Result[Int, ConcurrencyError]]:
+    nums.concurrent_with_timeout(8, from_seconds(2), func(n: Int): compute_square(n))
+```
+
+The `limit` argument is the maximum number of active tasks. A computed value
+less than 1 is treated as 1, so the helper remains infallible.
 
 ### detach (Fire-and-Forget)
 
@@ -2199,7 +2231,7 @@ Launch work on the thread pool without waiting for a result. Returns `Void`:
 func detach_example() -> Bool:
     ch: Channel[String] = channel(1)
     -- Fire and forget — no handle, no join
-    detach send(ch, "user logged in")
+    detach wait_send(ch, "user logged in")
     match recv(ch):
         Some(_): True
         None: False
@@ -2213,20 +2245,29 @@ Bounded multi-producer multi-consumer channels:
 
 ```blorp
 func channel_example() -> Bool:
-    -- Create a channel with capacity
+    -- Create a channel with capacity. Values below 1 clamp to 1.
     ch: Channel[Int] = channel(10)
 
-    -- Blocking send/recv
-    sent: Bool = send(ch, 42)          -- Blocks if full
-    val: Option[Int] = recv(ch)        -- Blocks if empty, None if closed
+    -- Blocking send/recv. wait_send exposes the sealed case in the type.
+    sent: Result[Void, ChannelSealed] = wait_send(ch, 42)
+    val: Option[Int] = recv(ch)            -- None once sealed and drained
+
+    typed_ch: Channel[Int] = channel(1)
+    sent_typed: Result[Void, ChannelSealed] = wait_send(typed_ch, 7)
+    received_typed: Result[Int, ChannelSealed] = wait_recv(typed_ch)
 
     -- Non-blocking variants
-    sent2: Bool = try_send(ch, 43)     -- Returns False if full
-    val2: Option[Int] = try_recv(ch)   -- Returns None if empty
+    sent2: Bool = try_send(ch, 43)         -- Returns False if full
+    sent3 = try_send_attempt(ch, 44)       -- Accepted, full, or sealed
+    val2: Option[Int] = try_recv(ch)       -- Returns None if empty
+    attempt = try_recv_attempt(ch)         -- Value, empty, or sealed
+    timed = recv_timeout_attempt(ch, 10)   -- Value, timeout, or sealed
 
-    -- Close channel (unblocks all waiting senders/receivers)
-    close(ch)
-    sent
+    -- Seal channel (unblocks all waiting senders/receivers)
+    seal(ch)
+    match sent:
+        Ok(_): True
+        Err(_): False
 ```
 
 ### For-in Over Channels
@@ -2235,19 +2276,79 @@ Channels support `for-in` loops for consumer patterns:
 
 ```blorp
 func consume(ch: Channel[String]) -> Int:
-    -- Consumer (blocking recv loop, exits when channel is closed)
+    -- Consumer (blocking recv loop, exits once the channel is sealed and drained)
     for msg in ch:
         print(msg)
     0
 ```
 
+### select
+
+Use `select:` when a task needs to wait for whichever of several independent
+events happens first. It is a statement-only concurrency primitive: the
+selected branch runs synchronously in the current task, and execution continues
+after the block.
+
+```blorp
+func wait_for_message_or_timeout(ch: Channel[String]) -> String:
+    var result: String = "timeout"
+    select:
+        msg from ch:
+            result = "message: ${msg}"
+        sealed ch:
+            result = "done"
+        _ after 1000:
+            result = "timeout"
+    result
+```
+
+Receive arms use `name from channel:` and run only when a value is received.
+`sealed channel:` runs when the channel has been sealed and drained. `_ after
+timeout:` waits for an integer millisecond timeout or a typed `Duration`. If
+more than one arm is ready, blorp rotates the first scanned arm across `select`
+calls so a repeated loop does not permanently prefer the first branch.
+
+`select:` is impure and cannot be used as the right-hand side of a binding.
+Use local variables, channels, or function calls inside the selected branch to
+communicate the outcome.
+
 ### sleep
 
 ```blorp
 func pause() -> Int:
-    sleep(1000)  -- Sleep current thread for 1000 milliseconds
+    sleep(1000)  -- Park the current fiber for 1000 milliseconds
     0
 ```
+
+Use `yield_now()` when you want to cooperatively give another ready fiber a
+chance to run without installing a timer. It is a scheduling hint, not an
+ordering guarantee.
+
+Use `sleep_for` when the timeout is a typed `Duration` from `units`:
+
+```blorp
+import:
+    channel: sleep_for
+    units: from_milliseconds
+
+func typed_pause() -> Int:
+    sleep_for(from_milliseconds(1000))
+    0
+```
+
+Duration-aware wrappers use explicit names such as `sleep_for`,
+`recv_timeout_for`, and `send_timeout_for`. Same-name overloads such as
+`sleep(Duration)` are intentionally deferred until source-level overloads for
+ordinary functions have a complete design.
+
+`Duration` values are integer microsecond intervals with arithmetic and
+ordering. Use constructors such as `microseconds`, `from_milliseconds`,
+`from_seconds`, `from_minutes`, `from_hours`, `from_days`, and `from_weeks`.
+Timeout APIs convert them through `to_timeout_milliseconds`, which rounds
+positive sub-millisecond durations up to one millisecond and treats
+non-positive durations as immediate polls. `concurrent(timeout: ...)` and
+`for ... concurrently(limit: ..., timeout: ...)` perform that conversion
+directly when passed a `Duration`.
 
 ### Thread Pool Configuration
 
@@ -2281,15 +2382,16 @@ func process(i: Int) -> Int:
 
 func fiber_example(items: List[Int]) -> List[Result[Int, ConcurrencyError]]:
     -- 50 tasks sleeping concurrently on 4 threads — completes in ~50ms, not 625ms
-    for i in items concurrently(limit: 4):
+    items.concurrent(4, func(i: Int):
         sleep(50)
         process(i)
+    )
 ```
 
 Fibers are transparent to user code — no API changes needed. During the
 concurrency migration, `limit` uses the existing scheduler-width machinery; the
-roadmap tightens it into a per-loop active-task cap before the old
-`concurrent for` spelling is removed.
+roadmap tightens it into a per-loop active-task cap while keeping statement
+fan-out and value collection as separate source forms.
 
 ### Pipeline Example
 
@@ -2297,7 +2399,7 @@ roadmap tightens it into a per-loop active-task cap before the old
 func produce(ch: Channel[Int], start: Int, end: Int) -> Void:
     var i: Int = start
     while i < end:
-        _ = send(ch, i)
+        _ = wait_send(ch, i)
         i = i + 1
 
 func main(args: List[String]) -> Int:
@@ -2308,8 +2410,8 @@ func main(args: List[String]) -> Int:
         p1 = produce(ch, 0, 50)
         p2 = produce(ch, 50, 100)
 
-    -- Producers done, close channel
-    close(ch)
+    -- Producers done, seal channel
+    seal(ch)
 
     -- Consume results
     var sum: Int = 0
@@ -2581,7 +2683,7 @@ Common compiler-registered builtins include:
 | Bitwise | `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shift_left`, `shift_right` |
 | Checked arithmetic | `checked_div`, `checked_mod` |
 | Tensor/array helpers | `vector`, `matrix`, `tensor3`, `tensor4`, `tensor5`, `assert_shape`, `checked_get`, `checked_set`, `checked_slice` |
-| Concurrency/channel | `sleep`, `max_threads`, `Channel`, `channel`, `send`, `recv`, `try_send`, `try_recv`, `send_timeout`, `recv_timeout`, `close`, `ConcurrencyError` |
+| Concurrency/channel | `sleep`, `sleep_for`, `yield_now`, `max_threads`, `Channel`, `channel`, `send`, `wait_send`, `recv`, `wait_recv`, `try_send`, `try_send_attempt`, `try_recv`, `try_recv_attempt`, `send_timeout`, `send_timeout_for`, `send_timeout_attempt`, `send_timeout_attempt_for`, `recv_timeout`, `recv_timeout_for`, `recv_timeout_attempt`, `recv_timeout_attempt_for`, `seal`, `close`, `ConcurrencyError`, `TaskResult`, `ChannelSealed`, `SendAttempt`, `RecvAttempt` |
 
 Most system APIs require explicit imports. Examples:
 
@@ -2805,6 +2907,9 @@ Key functions:
 | `enumerate` | `(list: List[T]) -> List[(Int, T)]` | Add indices |
 | `find` | `(list: List[T], pred: (T) -> Bool) -> Option[T]` | First matching |
 | `sort_by` | `(list: List[T], key: (T) -> K) -> List[T]` | Sort by key (Int, Float, or String) |
+| `concurrent` | `(list: List[T], limit: Int, f: (T) -> U) -> List[Result[U, ConcurrencyError]]` | Concurrent map with explicit fan-out limit |
+| `concurrent_with_timeout` | `(list: List[T], limit: Int, timeout: Duration, f: (T) -> U) -> List[Result[U, ConcurrencyError]]` | Concurrent map with a whole-operation timeout |
+| `map_concurrently` | `(list: List[T], limit: Int, f: (T) -> U) -> List[Result[U, ConcurrencyError]]` | Compatibility spelling for `concurrent` |
 | `parallel` | `(list: List[T], body: pure (ParallelList[T]) -> ParallelList[U]) -> List[U]` | Parallel list pipeline |
 | `unique` | `(list: List[T]) -> List[T]` | Remove duplicates |
 | `windows` | `(list: List[T], size: Int) -> List[List[T]]` | Sliding windows |
@@ -3197,10 +3302,17 @@ Run with:
 ./blorp test tests/test_blorp/                        # All in directory
 ./blorp test --profile tests/test_blorp/functions/    # With timing
 ./blorp test --timeout 0 tests/test_blorp/            # Disable test timeout
+./blorp test --repeat 50 tests/test_blorp/concurrency/ # Stress-repeat tests
 ```
 
 `blorp test` defaults to a 30-second timeout per generated test executable. Use
-`--timeout N` to change it or `--timeout 0` to disable it.
+`--timeout N` to change it or `--timeout 0` to disable it. Without an explicit
+flag, `BLORP_TEST_TIMEOUT` overrides the test default and `BLORP_TIMEOUT`
+serves as the generic fallback.
+
+Use `--repeat N` for stress and flake hunting. Repeated runs disable test result
+caching for that invocation so side effects, scheduling, leak checks, and
+timeouts are exercised on every pass.
 
 ### Doctests
 
@@ -3310,6 +3422,7 @@ tests/
 | `--doc` | test | Run only doctests |
 | `--suite` | test | Run only TestSuite tests |
 | `-j N` | test | Run tests with N parallel workers |
+| `--repeat N` | test | Run selected tests N times with result caching disabled |
 | `--leak-check` | run, test | Report leaked objects on exit |
 | `--no-format` | check, compile, run, test | Skip auto-formatting before command execution |
 | `--no-embed-runtime` | compile | Emit generated C for an externally linked runtime |
@@ -3330,7 +3443,8 @@ tests/
 |----------|-------------|
 | `BLORP_STD=path` | Use a filesystem standard library directory; overrides `blorp.toml`, and is overridden by `--std-dir` |
 | `BLORP_LEAK_CHECK=1` | Enable leak reporting on exit |
-| `BLORP_TIMEOUT=N` | Default timeout in seconds (CLI flag overrides) |
+| `BLORP_TIMEOUT=N` | Default run/test timeout in seconds (CLI flag overrides; `BLORP_TEST_TIMEOUT` wins for tests) |
+| `BLORP_TEST_TIMEOUT=N` | Default `blorp test` timeout in seconds (`--timeout` overrides) |
 | `BLORP_FIBER_STACK_SIZE=N` | Fiber stack size in bytes (default 57344 / 56KB) |
 | `BLORP_FIBER_STACK_CACHE_BYTES=N` | Maximum bytes of dead fiber coroutine/stack regions to cache for reuse (default 134217728; `0` disables) |
 | `BLORP_FIBER_OBJECT_CACHE_COUNT=N` | Maximum dead fiber handle objects to cache for reuse (default 4096; `0` disables) |

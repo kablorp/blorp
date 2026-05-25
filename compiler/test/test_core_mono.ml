@@ -554,7 +554,6 @@ let test_mono_e2e_pipeline () =
       param_name = Some "x";
       param_pattern = None;
       param_type = Some (TyVar "T");
-      param_passing = ParamByValue;
       param_loc = loc;
     }
   in

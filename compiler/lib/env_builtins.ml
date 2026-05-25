@@ -1331,6 +1331,13 @@ let with_builtins (env : env) : env =
                     variant_loc = dummy_loc;
                     variant_def_id = None;
                   };
+                  {
+                    variant_name = "Cancelled";
+                    variant_fields = [];
+                    variant_tag = 2;
+                    variant_loc = dummy_loc;
+                    variant_def_id = None;
+                  };
                 ];
             };
       }
@@ -1365,12 +1372,32 @@ let with_builtins (env : env) : env =
             };
       }
   in
+  let env =
+    add_symbol env
+      {
+        name = "Cancelled";
+        kind =
+          ConstructorSymbol
+            {
+              parent_type = "ConcurrencyError";
+              constructor_id = Session.mint_def_id (Session.current ());
+              type_params = [];
+              field_types = [];
+              tag = 2;
+            };
+      }
+  in
+  let env =
+    add_alias env "TaskResult" [ "T" ]
+      (TyNamed ("Result", [ TyVar "T"; TyNamed ("ConcurrencyError", []) ]))
+  in
 
-  (* Concurrency builtins (sleep, max_threads — concurrent blocks and detach replaced spawn/join) *)
+  (* Concurrency builtins (sleep, yield_now, max_threads — concurrent blocks and detach replaced spawn/join) *)
   let ty_t = TyVar "T" in
   let env =
     add_func env "sleep" (ty_func [ ty_int ] ty_void) ~origin:Builtin ()
   in
+  let env = add_func env "yield_now" (ty_func [] ty_void) ~origin:Builtin () in
   let env =
     add_func env "max_threads" (ty_func [] ty_int) ~purity:Pure ~origin:Builtin
       ()

@@ -193,6 +193,23 @@ let rec simulate (target : string) (state : state) (e : core) : unit =
       simulate target state scrut;
       let leaves = collect_tree_leaves target tree in
       simulate_branches target state leaves
+  | CSelect select ->
+      List.iter
+        (fun arm ->
+          match arm.select_arm_kind with
+          | SelectRecv r -> simulate_borrow target state r.select_channel
+          | SelectSealed channel -> simulate_borrow target state channel
+          | SelectAfter timeout -> simulate target state timeout)
+        select.select_arms;
+      let bodies =
+        List.filter_map
+          (fun arm ->
+            match arm.select_arm_kind with
+            | SelectRecv r when r.select_bind.vname = target -> None
+            | _ -> Some arm.select_arm_body)
+          select.select_arms
+      in
+      simulate_branches target state bodies
   (* ---- Loops: conservatively skip — loops are per-iteration RC
          and don't fit the simple one-variable model well. *)
   | CWhile _ | CFor _ | CTailrecLoop _ -> ()

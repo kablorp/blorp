@@ -239,8 +239,8 @@ Initial rules:
 - A resource can be bound by `with`.
 - Synchronous method calls may borrow the resource for the duration of the call.
 - Stream/cursor values derived from the resource inherit its scope.
-- A scoped resource can be passed only to functions/methods whose parameter is
-  marked as a resource borrow or resource-consuming operation.
+- A scoped resource can be passed only to compiler-owned resource operations.
+  Source functions cannot accept resource parameters.
 - A scoped resource cannot be assigned to a normal variable outside the block.
 - A scoped resource cannot be put in a list, record, dict, set, closure capture,
   or global.
@@ -260,24 +260,10 @@ resource. That borrowing is safe when the call is synchronous and the returned
 value is either ordinary data or is marked as scoped to the borrowed resource.
 
 The compiler should not allow arbitrary user functions to accept resources as
-ordinary copyable parameters. Blorp now has an explicit first step for
-source-defined helpers that borrow a scoped resource for one synchronous call:
-
-```blorp
-func count_open(reader: borrow FileReader) -> Result[Int, IOError]:
-	reader.lines().count()
-```
-
-Current rules are deliberately narrow:
-
-- `borrow` parameters are valid only on source functions with bodies;
-- the parameter type must be a direct `resource type`, not a container that
-  contains a resource;
-- the function is treated as returning ordinary data only after its visible body
-  type-checks;
-- dependent stream/cursor returns from source-defined borrowed helpers are still
-  future work because scope must be represented explicitly in the returned
-  value.
+ordinary copyable parameters. Blorp intentionally has no source-level `borrow`
+parameter syntax. The current rule is simpler: compiler-owned builtin resource
+operations may borrow scoped resources, while source-defined helpers must accept
+ordinary data derived inside the `with` body.
 
 The invariant is:
 
@@ -1001,14 +987,15 @@ stream(self: ChannelReceiver[T]) -> Stream[T]
 Semantics:
 
 - receiving parks the fiber when empty;
-- channel close is normal stream end;
-- `Channel.close` remains an explicit semantic operation, not automatic handle
-  cleanup by default;
+- channel seal is normal stream end;
+- `Channel.seal` remains an explicit semantic operation, not automatic handle
+  cleanup by default; the old channel `close` spelling is only a compatibility
+  alias during migration;
 - a channel stream should not keep the process alive after all producers are
   gone unless the channel itself is still reachable.
 
 Avoid making `Channel[T]` itself a normal `Resource` without a clear distinction
-between dropping one handle and closing the shared channel.
+between dropping one handle and sealing the shared channel.
 
 ## Implementation Roadmap
 
@@ -1187,13 +1174,10 @@ Completed in the current implementation:
   resource binding. This closes the immediate lifetime hole where deferred work
   could retain a resource after the `with` cleanup boundary.
 - The type checker rejects passing a resource value to an ordinary source-level
-  call. Source functions may opt into a checked borrow with `param: borrow
-  ResourceType`; compiler-owned builtin operations continue to use explicit
+  call. Compiler-owned builtin operations continue to use explicit
   resource-operation metadata.
-- The type checker rejects non-builtin function signatures whose by-value
-  parameters or return type contain concrete resources. Borrowed source
-  parameters must name a direct resource type, must have a function body, and
-  cannot make a resource or scoped-derived value escape through the return.
+- The type checker rejects non-builtin function signatures whose parameters or
+  return type contain concrete resources.
 - Collection literal inference rejects resource elements directly, so a
   resource cannot be placed into a list, dict, set, or tensor/vector literal
   even when the literal is immediately discarded rather than assigned.
@@ -1206,6 +1190,10 @@ Completed in the current implementation:
   resource types and type arguments. This closes the hole where a builtin could
   return a named aggregate whose fields or payloads contained a resource and
   have it treated as ordinary copyable data.
+- Type aliases may point directly at a resource type as a spelling aid, but
+  aliases that hide resources inside ordinary containers are rejected. This
+  keeps shapes such as `Channel[FileReader]` or `Option[FileReader]` from
+  becoming named ordinary value types.
 - Type checking now rejects record/struct fields and union payload declarations
   whose types contain resources. Resource-bearing aggregate shapes are rejected
   before they can reach Core layout metadata or generated-code preparation.
@@ -1228,9 +1216,8 @@ Completed in the current implementation:
   `@resource_result_ordinary` marks builtin operations whose result is ordinary
   data that may escape the `with` body when its type contains no resource.
 - The type checker rejects `@resource_result_ordinary` on non-builtin source or
-  foreign functions. Source borrowed-resource helpers do not need the annotation:
-  their visible bodies are checked directly and are registered as returning
-  ordinary data.
+  foreign functions. The annotation remains compiler metadata for builtin
+  resource operations only.
 - The type checker also rejects `@resource_result_ordinary` on builtin
   declarations with no direct resource parameter. Resource-containing container
   parameters do not opt a builtin into resource-operation metadata because the
@@ -1294,9 +1281,8 @@ Tasks:
 - Type inference:
   - audit remaining non-literal producers for diagnostics and regression
     coverage;
-  - extend borrowed-resource parameter metadata from the current ordinary-result
-    source-helper model to an explicit scoped-dependent return contract before
-    source helpers can define cursor or stream producers;
+  - design an explicit resource-helper model before source helpers can accept
+    scoped resources or define cursor/stream producers;
   - apply the explicit operation result metadata to future file/TCP/database
     APIs: chunk reads, counts, and whole-resource reads should be marked
     ordinary when they return plain data, while cursor/stream adapters should
@@ -1635,14 +1621,14 @@ Tasks:
 - Add explicit channel receiver stream APIs.
 - Decide whether a receiver is a scoped value, a normal handle, or just a view.
 - Ensure channel stream terminal loops park fibers via channel recv.
-- Preserve channel close semantics as explicit producer-side signaling.
+- Preserve channel seal semantics as explicit producer-side signaling.
 
 Tests:
 
-- stream over channel exits on close;
+- stream over channel exits on seal;
 - stream over channel parks fibers rather than blocking workers;
 - cancellation removes waiters from channel queues;
-- no leak when a channel stream is dropped before the channel closes.
+- no leak when a channel stream is dropped before the channel seals.
 
 ### Phase 6: Database And Package Connector Guidance
 
@@ -1744,8 +1730,9 @@ These should remain explicit until implementation forces an answer:
 - Should the public module be named `file`, `fs`, or something else?
 - Should `with` eventually support multiple bindings in one header?
 - Should scoped resources support explicit moves in a later affine-value model?
-- Should source-defined helpers ever be able to produce scoped-dependent
-  streams or cursors, and if so should that require explicit return syntax?
+- Should source-defined helpers ever be able to accept scoped resources or
+  produce scoped-dependent streams/cursors, and if so should that require
+  explicit syntax?
 - Should `?=` inside closures remain part of the language? Existing std/tests use
   carrier-returning closures, so any future restriction needs a deliberate
   migration path.
@@ -1773,8 +1760,8 @@ The highest-ROI path is:
    `read_text`/`write_text` names.
 3. Keep hardening `Stream[T]` and `FallibleStream[T, E]` as new producers are
    introduced.
-4. Design explicit scoped-dependent return syntax before source-defined helpers
-   are allowed to produce streams or cursors.
+4. Design explicit resource-helper syntax before source-defined helpers are
+   allowed to accept scoped resources or produce streams/cursors.
 5. Layer scoped cleanup, typed errors, and stream adapters on top of the current
    typed nonblocking TCP handles.
 
