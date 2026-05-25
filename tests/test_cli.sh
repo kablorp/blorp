@@ -6,7 +6,9 @@ set -u
 cd "$(dirname "$0")/.."
 
 BLORP_BIN="${BLORP_BIN:-./blorp}"
-CLI_TIMEOUT="${BLORP_CLI_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-30}}"
+# Cold self-hosted formatter startup may need to compile the embedded Blorp
+# formatter before the format checks can run.
+CLI_TIMEOUT="${BLORP_CLI_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"
 TMPDIR_CLI=$(mktemp -d "${TMPDIR:-/tmp}/blorp_cli.XXXXXX") || exit 1
 PASS=0
 FAIL=0

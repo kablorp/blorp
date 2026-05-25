@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
+.PHONY: all build install warm-formatter clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 FORMATTER_SOURCES := $(shell find tools/formatter -name '*.brp' 2>/dev/null)
@@ -30,14 +30,26 @@ SECURITY_LEAK_TESTS := \
 	tests/test_blorp/sys/test_runtime_safety.brp \
 	tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp
 
-# Default target: build and install blorp to project root
-# Only copy if binary actually changed (preserves mtime for test cache)
-all: build
-	@if ! cmp -s compiler/_build/default/bin/blorp.exe ./blorp 2>/dev/null; then \
+# Default target: build and install blorp to project root, then warm the
+# self-hosted formatter binary cache so the first interactive format is fast.
+all: install warm-formatter
+
+# Only copy when Dune produced a newer binary. The installed root binary may be
+# ad-hoc signed on macOS, so byte-for-byte comparison against the unsigned Dune
+# output would recopy on every make and invalidate mtime-based caches.
+install: build
+	@if [ ! -f ./blorp ] || [ compiler/_build/default/bin/blorp.exe -nt ./blorp ]; then \
 		rm -f ./blorp; \
 		cp compiler/_build/default/bin/blorp.exe ./blorp; \
 		codesign -s - ./blorp 2>/dev/null || true; \
 	fi
+
+warm-formatter: install
+	@tmp_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/blorp-format-warm.XXXXXX"); \
+	trap 'rm -rf "$$tmp_dir"' EXIT; \
+	tmp="$$tmp_dir/warm.brp"; \
+	printf 'func main(args: List[String]) -> Int:\n\t0\n' > "$$tmp"; \
+	./blorp format --check "$$tmp" >/dev/null
 
 # Generate embedded std library from std/**/*.brp
 compiler/lib/embedded_std.ml: compiler/tools/gen_embed_std.ml $(STD_SOURCES)

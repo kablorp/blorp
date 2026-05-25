@@ -55,13 +55,7 @@ let () =
         (fun (name, cases) -> ("Parser." ^ name, cases))
         Test_parser.suite
     @ List.map
-        (fun (name, cases) -> ("FmtLayout." ^ name, cases))
-        Test_fmt_layout.suite
-    @ List.map
-        (fun (name, cases) -> ("FmtTypeDoc." ^ name, cases))
-        Test_fmt_type_doc.suite
-    @ List.map
-        (fun (name, cases) -> ("FmtExprDoc." ^ name, cases))
+        (fun (name, cases) -> ("FmtExprJson." ^ name, cases))
         Test_fmt_expr_doc.suite
     @ List.map
         (fun (name, cases) -> ("FmtDeclDoc." ^ name, cases))

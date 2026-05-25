@@ -1,11 +1,4 @@
-(** JSON serialization for the formatter document IR.
-
-    This is the OCaml side of the temporary formatter dogfooding boundary:
-    OCaml can keep parsing and printing ASTs to [Fmt_doc.doc], while the Blorp
-    layout tool can decode this representation and render the final text. *)
-
-module Doc = Fmt_doc
-open Doc
+(** Small JSON helpers for formatter projections. *)
 
 let add_unicode_escape b code =
   if code <= 0xffff then Buffer.add_string b (Printf.sprintf "\\u%04x" code)
@@ -101,26 +94,3 @@ let escape_string s =
   Buffer.contents b
 
 let string s = Printf.sprintf "\"%s\"" (escape_string s)
-let tag name = Printf.sprintf {|{"tag":%s}|} (string name)
-
-let tag_text name text =
-  Printf.sprintf {|{"tag":%s,"text":%s}|} (string name) (string text)
-
-let rec to_json = function
-  | Nil -> tag "Nil"
-  | Text s -> tag_text "Text" s
-  | Hardline -> tag "Hardline"
-  | Softline -> tag "Softline"
-  | SoftlineSpace -> tag "SoftlineSpace"
-  | Indent (width, doc) ->
-      Printf.sprintf {|{"tag":%s,"width":%d,"doc":%s}|} (string "Indent") width
-        (to_json doc)
-  | Group doc ->
-      Printf.sprintf {|{"tag":%s,"doc":%s}|} (string "Group") (to_json doc)
-  | Concat (left, right) ->
-      Printf.sprintf {|{"tag":%s,"left":%s,"right":%s}|} (string "Concat")
-        (to_json left) (to_json right)
-  | IfBreak (broken_doc, flat_doc) ->
-      Printf.sprintf {|{"tag":%s,"broken":%s,"flat":%s}|} (string "IfBreak")
-        (to_json broken_doc) (to_json flat_doc)
-  | LineSuffix s -> tag_text "LineSuffix" s

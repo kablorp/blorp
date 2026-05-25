@@ -1,8 +1,10 @@
-(** Unit tests for declaration-formatting parity JSON.
+(** Unit tests for declaration-formatting JSON projection.
 
     These mirror [tests/test_blorp/tools/test_declaration_documents.brp] so the OCaml
     formatter printer and the Blorp declaration-doc printer stay pinned to the
-    same visible syntax while declaration formatting is ported in slices. *)
+    same visible syntax while declaration formatting is ported in slices. JSON
+    case fixtures are projection-only; rendered output belongs to the Blorp
+    formatter tests. *)
 
 module Ast = Blorp.Ast
 module DeclJson = Blorp.Fmt_decl_json
@@ -259,10 +261,10 @@ let test_non_expression_impl_method_decl_json () =
         "includes builtin method name" true
         (string_contains decl_json {|"builtin_name":"blorp_from_char"|});
       Alcotest.(check bool)
-        "case keeps expected layout" true
+        "case keeps projection only" true
         (string_contains
            (DeclJson.case_json d decl_json)
-           {|"expected":"implements Stringable for Char:\n\tpure func to_string(val: Char) -> String:\n\t\tbuiltin(\"blorp_from_char\")\n"|})
+           {|"decl":{"tag":"Impl"|})
 
 let test_non_expression_func_decl_json () =
   let builtin_func =
@@ -327,12 +329,7 @@ let test_docstring_decl_json () =
       Alcotest.(check bool)
         "wraps declaration docstring" true
         (string_contains decl_json
-           {|{"tag":"Doc","doc":"Adds two numbers.\nKeeps overflow wrapping.","decl":{"tag":"Func"|});
-      let case_json = DeclJson.case_json d decl_json in
-      Alcotest.(check bool)
-        "expected layout includes docstring" true
-        (string_contains case_json
-           {|"expected":"---\nAdds two numbers.\nKeeps overflow wrapping.\n---\npure func add(x: Int, y: Int) -> Int:\n\tx + y\n"|})
+           {|{"tag":"Doc","doc":{"tag":"Plain","text":"Adds two numbers.\nKeeps overflow wrapping."},"decl":{"tag":"Func"|})
 
 let test_doctest_docstring_decl_json_keeps_body_case () =
   let fd =
@@ -348,11 +345,13 @@ let test_doctest_docstring_decl_json_keeps_body_case () =
       Alcotest.(check bool)
         "wraps doctest docstring" true
         (string_contains decl_json {|{"tag":"Doc"|});
-      let case_json = DeclJson.case_json d decl_json in
       Alcotest.(check bool)
-        "expected layout includes doctest docstring" true
-        (string_contains case_json
-           {|"expected":"---\nExamples\n\ndoctests:\n    :: works\n    1\n---\nfunc example() -> Int:\n\t1\n"|})
+        "keeps doctest docstring in declaration projection" true
+        (string_contains decl_json
+           {|"doc":{"tag":"Doctests","prefix":["Examples",""],"groups":[{"description":"works"|});
+      Alcotest.(check bool)
+        "projects doctest body as expression JSON" true
+        (string_contains decl_json {|"body":{"tag":"Block","exprs":[|})
 
 let test_program_decl_json () =
   let source =
@@ -375,11 +374,7 @@ let test_program_decl_json () =
   | Ok jsonl ->
       Alcotest.(check bool)
         "includes program case" true
-        (string_contains jsonl {|"program":[|});
-      Alcotest.(check bool)
-        "program expected keeps overloads adjacent" true
-        (string_contains jsonl
-           {|"expected":"var total: Int = 0\n\ntype alias Pair[A, B] = (A, B)\n\n\npure func add(x: Int, y: Int) -> Int:\n\tx + y\npure func add(x: Float, y: Float) -> Float:\n\tx + y\n"|})
+        (string_contains jsonl {|"program":[|})
 
 let test_program_decl_json_with_imports () =
   let source =
@@ -398,11 +393,7 @@ let test_program_decl_json_with_imports () =
   | Ok jsonl ->
       Alcotest.(check bool)
         "includes program case" true
-        (string_contains jsonl {|"program":[|});
-      Alcotest.(check bool)
-        "program expected groups leading imports" true
-        (string_contains jsonl
-           {|"expected":"import:\n\tdict as D\n\tlist: append, get\n\n\nvar total: Int = 0\n"|})
+        (string_contains jsonl {|"program":[|})
 
 let test_program_decl_json_with_duplicate_imports () =
   let source =
@@ -422,11 +413,7 @@ let test_program_decl_json_with_duplicate_imports () =
   | Ok jsonl ->
       Alcotest.(check bool)
         "includes program case" true
-        (string_contains jsonl {|"program":[|});
-      Alcotest.(check bool)
-        "program expected deduplicates imports" true
-        (string_contains jsonl
-           {|"expected":"import:\n\tdict as D\n\tlist: append, get\n\n\nvar total: Int = 0\n"|})
+        (string_contains jsonl {|"program":[|})
 
 let test_program_decl_json_preserves_duplicate_import_comments () =
   let source =
@@ -448,9 +435,8 @@ let test_program_decl_json_preserves_duplicate_import_comments () =
         "includes program case" true
         (string_contains jsonl {|"program":[|});
       Alcotest.(check bool)
-        "program keeps duplicate import comments" true
-        (string_contains jsonl
-           {|"expected":"import:\n\t-- duplicate import rationale\n\tdict as D\n\n\nvar total: Int = 0\n"|})
+        "projects duplicate import comments" true
+        (string_contains jsonl {|"text":"-- duplicate import rationale"|})
 
 let test_program_decl_json_keeps_distinct_constructor_imports () =
   let source =
@@ -474,9 +460,11 @@ let test_program_decl_json_keeps_distinct_constructor_imports () =
         "includes program case" true
         (string_contains jsonl {|"program":[|});
       Alcotest.(check bool)
-        "program keeps distinct constructor imports and comments" true
-        (string_contains jsonl
-           {|"expected":"import:\n\tdict as D\n\t-- none constructor\n\toption: Option(None)\n\t-- some constructor\n\toption: Option(Some)\n\n\nvar total: Int = 0\n"|})
+        "projects distinct constructor import comments" true
+        (string_contains jsonl {|"text":"-- some constructor"|});
+      Alcotest.(check bool)
+        "projects distinct constructor imports" true
+        (string_contains jsonl {|"ctors":["Some"]|})
 
 let test_program_decl_json_with_body_imports () =
   let source =
@@ -497,11 +485,7 @@ let test_program_decl_json_with_body_imports () =
   | Ok jsonl ->
       Alcotest.(check bool)
         "includes program case" true
-        (string_contains jsonl {|"program":[|});
-      Alcotest.(check bool)
-        "program expected keeps body import block" true
-        (string_contains jsonl
-           {|"expected":"type alias Pair[A, B] = (A, B)\n\n\nimport:\n\tdict as D\n\tlist: append, get\n\n\nvar total: Int = 0\n"|})
+        (string_contains jsonl {|"program":[|})
 
 let test_decl_json_preserves_block_blank_lines () =
   let source =
@@ -520,11 +504,7 @@ let test_decl_json_preserves_block_blank_lines () =
   | Ok jsonl ->
       Alcotest.(check bool)
         "includes block blank metadata" true
-        (string_contains jsonl {|"blank_before":[false,true,false]|});
-      Alcotest.(check bool)
-        "expected layout keeps block blank line" true
-        (string_contains jsonl
-           {|"expected":"func grouped() -> Int:\n\ta: Int = 1\n\n\tb: Int = 2\n\ta + b\n"|})
+        (string_contains jsonl {|"blank_before":[false,true,false]|})
 
 let test_program_decl_json_with_body_comments () =
   let source =
@@ -547,11 +527,7 @@ let test_program_decl_json_with_body_comments () =
         (string_contains jsonl {|"items":[|});
       Alcotest.(check bool)
         "includes body comment item" true
-        (string_contains jsonl {|"text":"-- keep this with the block"|});
-      Alcotest.(check bool)
-        "program expected keeps body comment" true
-        (string_contains jsonl
-           {|"expected":"func grouped() -> Int:\n\ta: Int = 1\n\n\t-- keep this with the block\n\tb: Int = 2\n\ta + b\n"|})
+        (string_contains jsonl {|"text":"-- keep this with the block"|})
 
 let test_program_decl_json_with_body_trailing_comments () =
   let source =
@@ -569,11 +545,7 @@ let test_program_decl_json_with_body_trailing_comments () =
   | Ok jsonl ->
       Alcotest.(check bool)
         "includes trailing block item metadata" true
-        (string_contains jsonl {|"trailing":"-- first"|});
-      Alcotest.(check bool)
-        "program expected keeps body trailing comments" true
-        (string_contains jsonl
-           {|"expected":"func grouped() -> Int:\n\ta: Int = 1 -- first\n\tb: Int = 2 -- second\n\ta + b -- result\n"|})
+        (string_contains jsonl {|"trailing":"-- first"|})
 
 let test_program_decl_json_with_comments () =
   let source =
@@ -595,11 +567,7 @@ let test_program_decl_json_with_comments () =
         (string_contains jsonl {|"program":[|});
       Alcotest.(check bool)
         "includes comments" true
-        (string_contains jsonl {|"comments":[|});
-      Alcotest.(check bool)
-        "program expected keeps comments" true
-        (string_contains jsonl
-           {|"expected":"-- file header\nvar total: Int = 0 --count\n\n-- alias comment\ntype alias Count = Int\n-- eof\n"|})
+        (string_contains jsonl {|"comments":[|})
 
 let test_program_decl_json_with_doctest_docstring () =
   let source =
@@ -625,12 +593,15 @@ let test_program_decl_json_with_doctest_docstring () =
         "includes program case" true
         (string_contains jsonl {|"program":[|});
       Alcotest.(check bool)
-        "JSON doc body is normalized" true
-        (string_contains jsonl {|xs: List[Int] = [1, 2]\n    xs.length() == 2|});
-      Alcotest.(check bool)
-        "program expected keeps normalized doctest" true
+        "JSON doc body is structured for Blorp rendering" true
         (string_contains jsonl
-           {|"expected":"---\nExample docs.\n\ndoctests:\n    :: unformatted list\n    xs: List[Int] = [1, 2]\n    xs.length() == 2\n---\nfunc documented() -> Int:\n\t1\n"|})
+           {|"doc":{"tag":"Doctests","prefix":["Example docs.",""],"groups":[|});
+      Alcotest.(check bool)
+        "JSON doc body carries expression projection" true
+        (string_contains jsonl {|"body":{"tag":"Block","exprs":[|});
+      Alcotest.(check bool)
+        "program case does not include rendered expected output" false
+        (string_contains jsonl {|"expected"|})
 
 let test_program_decl_json_with_import_comments () =
   let source =
@@ -655,11 +626,7 @@ let test_program_decl_json_with_import_comments () =
         (string_contains jsonl {|"program":[|});
       Alcotest.(check bool)
         "includes comments" true
-        (string_contains jsonl {|"comments":[|});
-      Alcotest.(check bool)
-        "program expected keeps import comments" true
-        (string_contains jsonl
-           {|"expected":"-- file header\n-- dict import\nimport:\n\tdict as D --dict trailing\n\t-- list import\n\tlist: append, get\n\n\n-- body comment\nvar total: Int = 0\n"|})
+        (string_contains jsonl {|"comments":[|})
 
 let test_program_decl_json_with_foreign_block () =
   let source =
@@ -678,11 +645,7 @@ let test_program_decl_json_with_foreign_block () =
   | Ok jsonl ->
       Alcotest.(check bool)
         "includes program case" true
-        (string_contains jsonl {|"program":[|});
-      Alcotest.(check bool)
-        "program expected groups foreign functions" true
-        (string_contains jsonl
-           {|"expected":"foreign:\n\tfunc floor(x: Float) -> Float = \"c_floor\"\n\n\nfunc read_clock() -> Int:\n\tbuiltin(\"blorp_read_clock\")\n"|})
+        (string_contains jsonl {|"program":[|})
 
 let test_program_decl_json_with_foreign_comments () =
   let source =
@@ -708,13 +671,9 @@ let test_program_decl_json_with_foreign_comments () =
         (string_contains jsonl {|"program":[|});
       Alcotest.(check bool)
         "includes foreign includes" true
-        (string_contains jsonl {|"foreign_includes":["math.h"]|});
-      Alcotest.(check bool)
-        "program expected keeps foreign comments" true
-        (string_contains jsonl
-           {|"expected":"-- file header\n-- foreign block comment\n-- floor comment\nforeign(include: \"math.h\", link: \"-lm\"):\n\tfunc floor(x: Float) -> Float = \"c_floor\" --floor trailing\n\t-- ceil comment\n\tfunc ceil(x: Float) -> Float = \"c_ceil\"\n\n\n-- body comment\nvar total: Int = 0\n"|})
+        (string_contains jsonl {|"foreign_includes":["math.h"]|})
 
-let test_func_decl_json_case_uses_ocaml_expected_layout () =
+let test_func_decl_json_case_is_projection_only () =
   let fd =
     func
       ~type_params:[ Ast.make_type_param "T" [] ]
@@ -729,11 +688,10 @@ let test_func_decl_json_case_uses_ocaml_expected_layout () =
   | None -> Alcotest.fail "expected function declaration to serialize"
   | Some decl_json ->
       let case_json = DeclJson.case_json d decl_json in
-      check_string "case includes expected layout"
-        {|{"line":0,"column":0,"expected":"pure func add[T](x: Int, y: Int) -> Int:\n\tx + y\n","decl":|}
+      check_string "case includes declaration projection"
+        {|{"line":0,"column":0,"decl":|}
         (String.sub case_json 0
-           (String.length
-              {|{"line":0,"column":0,"expected":"pure func add[T](x: Int, y: Int) -> Int:\n\tx + y\n","decl":|}))
+           (String.length {|{"line":0,"column":0,"decl":|}))
 
 let test_decl_json_lines_from_source () =
   let source =
@@ -839,7 +797,8 @@ let test_decl_json_lines_from_source () =
         (string_contains jsonl {|"builtin_name":"blorp_from_char"|});
       Alcotest.(check bool)
         "includes docstring case" true
-        (string_contains jsonl {|"tag":"Doc","doc":"Read the clock."|})
+        (string_contains jsonl
+           {|"tag":"Doc","doc":{"tag":"Plain","text":"Read the clock."}|})
 
 let suite =
   [
@@ -891,8 +850,8 @@ let suite =
           test_program_decl_json_with_foreign_block;
         Alcotest.test_case "program declaration JSON with foreign comments"
           `Quick test_program_decl_json_with_foreign_comments;
-        Alcotest.test_case "declaration JSON case uses OCaml expected layout"
-          `Quick test_func_decl_json_case_uses_ocaml_expected_layout;
+        Alcotest.test_case "declaration JSON case is projection only" `Quick
+          test_func_decl_json_case_is_projection_only;
         Alcotest.test_case "declaration JSONL emits source cases" `Quick
           test_decl_json_lines_from_source;
       ] );

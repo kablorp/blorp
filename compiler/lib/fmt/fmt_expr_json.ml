@@ -1,14 +1,12 @@
 (** JSON serialization for formatter expressions.
 
     OCaml still owns parsing and JSON projection. The Blorp formatter consumes
-    this representation and owns rendering. Some helpers still mirror legacy
-    printer details so parity tests can keep the bridge honest while the OCaml
-    printer remains available for lower-level tests. *)
+    this representation and owns rendering. This module must not render source
+    text; it only projects AST and source-position metadata. *)
 
-module Layout = Fmt_layout
-module Printer = Fmt_printer
+module Span = Fmt_source_span
 
-let string = Fmt_doc_json.string
+let string = Fmt_json.string
 let bool b = if b then "true" else "false"
 let field name value = Printf.sprintf "%s:%s" (string name) value
 let obj fields = Printf.sprintf "{%s}" (String.concat "," fields)
@@ -52,9 +50,7 @@ let block_blank_before exprs =
           | None -> false
           | Some line -> expr.Ast.expr_loc.line - line > 1
         in
-        loop
-          (Some (Printer.expr_source_end_line expr))
-          (blank_before :: acc) rest
+        loop (Some (Span.expr_source_end_line expr)) (blank_before :: acc) rest
   in
   loop None [] exprs
 
@@ -74,7 +70,7 @@ let block_item_start_line = function
 
 let block_item_end_line = function
   | BlockJsonComment comment -> comment.Lexer.cc_line
-  | BlockJsonExpr (expr, _, _) -> Printer.expr_source_end_line expr
+  | BlockJsonExpr (expr, _, _) -> Span.expr_source_end_line expr
 
 let block_item_needs_blank previous item =
   match item with
@@ -129,7 +125,7 @@ let append_block_item (previous, rendered, has_comment) item =
   (Some item, block_item_to_json ~blank_before item :: rendered, has_comment)
 
 let float_literal_source f =
-  (* Blorp lexer requires decimal notation, so mirror [Fmt_printer.print_literal]. *)
+  (* Blorp lexer requires decimal notation. *)
   let rec try_precision n =
     if n > 20 then Printf.sprintf "%.20f" f
     else
@@ -628,7 +624,7 @@ let rec expr_to_json expr =
       | None -> None)
   | Ast.EBlock exprs -> (
       match
-        block_payload ~through_line:(Printer.expr_source_end_line expr) exprs
+        block_payload ~through_line:(Span.expr_source_end_line expr) exprs
       with
       | Some (expr_jsons, item_jsons, has_comment) ->
           Some
@@ -779,7 +775,7 @@ let rec expr_to_json expr =
       | Ast.FuncBuiltinBody _ | Ast.FuncForeign _ | Ast.FuncNoBody -> None)
   | Ast.EDebugBlock exprs -> (
       match
-        block_payload ~through_line:(Printer.expr_source_end_line expr) exprs
+        block_payload ~through_line:(Span.expr_source_end_line expr) exprs
       with
       | Some (expr_jsons, item_jsons, has_comment) ->
           Some
@@ -891,7 +887,7 @@ and block_payload ?through_line exprs =
   let block_expr_trailing expr rest =
     match
       Fmt_comment.take_trailing !comments
-        ~on_line:(Printer.expr_source_end_line expr)
+        ~on_line:(Span.expr_source_end_line expr)
     with
     | Some _ as trailing -> trailing
     | None -> (
@@ -929,16 +925,11 @@ and block_payload ?through_line exprs =
   in
   loop None [] [] false exprs
 
-let expected_layout expr =
-  Printer.comments := Fmt_comment.create [];
-  Layout.layout (Printer.print_expr expr)
-
 let case_json expr expr_json =
   obj
     [
       field "line" (string_of_int expr.Ast.expr_loc.line);
       field "column" (string_of_int expr.Ast.expr_loc.column);
-      field "expected" (string (expected_layout expr));
       field "expr" expr_json;
     ]
 

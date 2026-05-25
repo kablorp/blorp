@@ -14,14 +14,14 @@ val format_program_with_comments :
     collected from the original source. *)
 
 val format_expr_cases_json_lines_string : string -> (string, string) result
-(** Parse a source string and return expression-formatting parity cases as
+(** Parse a source string and return expression projection cases as
     newline-delimited JSON.
 
     This is an internal dogfooding boundary for the Blorp expression formatter
     port. *)
 
 val format_decl_cases_json_lines_string : string -> (string, string) result
-(** Parse a source string and return declaration-formatting parity cases as
+(** Parse a source string and return declaration projection cases as
     newline-delimited JSON.
 
     This is an internal dogfooding boundary for the Blorp declaration formatter

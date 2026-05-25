@@ -1,13 +1,10 @@
 (** JSON serialization for formatter declarations.
 
     OCaml still owns parsing, comment collection, and JSON projection. The
-    Blorp formatter consumes this representation and owns rendering. Some
-    helpers still reuse legacy printer utilities for normalization and
-    lower-level parity tests. *)
+    Blorp formatter consumes this representation and owns rendering. This
+    module must not include rendered declaration text in the JSON projection. *)
 
-module Layout = Fmt_layout
-module Printer = Fmt_printer
-module Doc = Fmt_doc
+module Span = Fmt_source_span
 
 let string = Fmt_expr_json.string
 let bool = Fmt_expr_json.bool
@@ -17,17 +14,13 @@ let array = Fmt_expr_json.array
 let optional_field = Fmt_expr_json.optional_field
 let string_array values = array (List.map string values)
 
-let normalize_docstring doc =
-  String.concat "\n"
-    (Printer.format_docstring_doctests (String.split_on_char '\n' doc))
-
 let with_supported_doc decl decl_json =
   match decl.Ast.decl_doc with
   | Some doc ->
       obj
         [
           field "tag" (string "Doc");
-          field "doc" (string (normalize_docstring doc));
+          field "doc" (Fmt_docstring_json.doc_to_json doc);
           field "decl" decl_json;
         ]
   | _ -> decl_json
@@ -320,33 +313,11 @@ let rec decl_to_json ?(is_private = false) decl =
   | Ast.DImpl impl_decl ->
       Option.map (with_supported_doc decl) (impl_to_json ~is_private impl_decl)
 
-let rec expected_doc ?(is_private = false) decl =
-  match decl.Ast.decl_desc with
-  | Ast.DPrivate { decl_desc = Ast.DFunc func; _ } when Ast.func_is_foreign func
-    ->
-      Printer.print_program [ decl ]
-  | Ast.DPrivate inner -> expected_doc ~is_private:true inner
-  | Ast.DFunc func when Ast.func_is_foreign func ->
-      Printer.print_program [ decl ]
-  | _ ->
-      let doc_doc =
-        match decl.Ast.decl_doc with
-        | Some doc -> Printer.print_docstring doc
-        | _ -> Doc.Nil
-      in
-      let decl_doc = Printer.print_decl_desc ~is_private decl.Ast.decl_desc in
-      Doc.(doc_doc ^^ decl_doc)
-
-let expected_layout decl =
-  Printer.comments := Fmt_comment.create [];
-  Layout.layout (expected_doc decl)
-
 let case_json decl decl_json =
   obj
     [
       field "line" (string_of_int decl.Ast.decl_loc.line);
       field "column" (string_of_int decl.Ast.decl_loc.column);
-      field "expected" (string (expected_layout decl));
       field "decl" decl_json;
     ]
 
@@ -364,19 +335,19 @@ let rec decl_source_end_line decl =
   max loc_end (decl_desc_source_end_line decl.Ast.decl_desc)
 
 and decl_desc_source_end_line = function
-  | Ast.DFunc func -> Printer.func_source_end_line func
-  | Ast.DVar var -> Printer.expr_source_end_line var.Ast.var_value
+  | Ast.DFunc func -> Span.func_source_end_line func
+  | Ast.DVar var -> Span.expr_source_end_line var.Ast.var_value
   | Ast.DPrivate inner -> decl_source_end_line inner
   | Ast.DTrait trait_decl ->
       List.fold_left
         (fun acc method_decl ->
           match method_decl.Ast.method_default_body with
           | None -> acc
-          | Some body -> max acc (Printer.expr_source_end_line body))
+          | Some body -> max acc (Span.expr_source_end_line body))
         0 trait_decl.Ast.trait_methods
   | Ast.DImpl impl_decl ->
       List.fold_left
-        (fun acc func -> max acc (Printer.func_source_end_line func))
+        (fun acc func -> max acc (Span.func_source_end_line func))
         0 impl_decl.Ast.impl_methods
   | Ast.DImport _ | Ast.DType _ | Ast.DRecord _ | Ast.DTypeAlias _ -> 0
 
@@ -424,10 +395,6 @@ let program_to_json ~comments program =
   in
   loop [] program
 
-let program_expected_layout ~comments program =
-  Printer.comments := Fmt_comment.create comments;
-  Layout.layout (Printer.print_program program)
-
 let program_json_fields ~comments program =
   Option.map
     (fun program_json ->
@@ -442,14 +409,7 @@ let program_json ~comments program =
 
 let program_case_json ~comments program =
   Option.map
-    (fun fields ->
-      obj
-        ([
-           field "line" "0";
-           field "column" "0";
-           field "expected" (string (program_expected_layout ~comments program));
-         ]
-        @ fields))
+    (fun fields -> obj ([ field "line" "0"; field "column" "0" ] @ fields))
     (program_json_fields ~comments program)
 
 let collect_decl_cases program =
