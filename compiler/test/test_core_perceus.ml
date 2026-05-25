@@ -2552,7 +2552,7 @@ let test_mutable_assignment_borrow_then_cow_consume_does_not_retain_result () =
 let test_readonly_tensor_builtin_drops_borrowed_inputs () =
   let alloc = intrinsic "tensor_alloc" [ cint 4 ] ty_tensor_float in
   let call =
-    builtin "blorp_tensor_matmul_float"
+    builtin "blorp_tensor_matrix_multiply_float"
       [
         cvar "a" ty_tensor_float;
         cvar "b" ty_tensor_float;

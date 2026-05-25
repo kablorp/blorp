@@ -24,7 +24,8 @@ let test_known_result_layout_producers () =
   check_rule "blorp_vector_new_fill_f32" "known-result";
   check_rule "blorp_matrix_new_fill_f64" "known-result";
   check_rule "blorp_tensor_new_packed" "known-result";
-  check_rule "blorp_tensor_matmul_float32" "known-result";
+  check_rule "blorp_tensor_matrix_multiply_float32" "known-result";
+  check_rule "blorp_matrix_zip_map" "known-result";
   check_rule "blorp_simd_vector_add_f64" "known-result"
 
 let test_preserving_producers_name_source_argument () =

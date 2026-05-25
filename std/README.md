@@ -56,7 +56,9 @@
 | `math` | Mathematical constants and cross-type helpers |
 | `tensor` | Generic N-dimensional array operations |
 | `vector` | 1D tensor operations and factories |
-| `matrix` | 2D tensor operations (matmul, transpose) |
+| `parallel_vector` | Scoped combinators for `Vector.parallel()` |
+| `matrix` | 2D tensor operations (matrix_multiply, transpose, shape-preserving HOFs, reductions, row-major vector conversion, square-matrix helpers, cell access, scoped parallel pipelines) |
+| `parallel_matrix` | Scoped combinators for `Matrix.parallel()` |
 | `stats` | Statistical functions (mean, stddev, percentile, regression) |
 | `dsp` | Signal processing (biquad filters, window functions, convolution) |
 | `fft` | Fast Fourier Transform (Cooley-Tukey radix-2) |

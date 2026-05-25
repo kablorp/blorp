@@ -130,23 +130,15 @@ let raylib_builtins =
 
 let matrix_builtins =
   [
-    ((N.mod_matrix, "matmul"), "blorp_tensor_matmul");
+    ((N.mod_matrix, "matrix_multiply"), "blorp_tensor_matrix_multiply");
     ((N.mod_matrix, "transpose"), "blorp_tensor_transpose");
-    ((N.mod_matrix, "matvec"), "blorp_tensor_matvec");
-    ((N.mod_matrix, "matvec_t"), "blorp_tensor_matvec_t");
-    ((N.mod_matrix, "outer"), "blorp_tensor_outer");
-    (* 2D bounds-checked accessors. The 1D [(std/tensor, "get")] entry binds to
-     the 2-arg [blorp_vector_get_opt]; without these matrix-specific entries a
-     [get(m, row, col)] call on a [T[#M, #N]] hits [std/tensor]'s 2-arg
-     signature first and the C compiler rejects the arity. [type_to_module_paths]
-     orders [std/matrix] ahead of [std/tensor] for 2D tensors, so these bindings
-     are picked up before the 1D entries. *)
-    ((N.mod_matrix, "get"), "blorp_matrix_get_opt");
-    ((N.mod_matrix, "set_at"), "blorp_matrix_checked_set");
-    (* Private 2D accessor exported under a name that can't be shadowed by
-     tensor's 1-D `get` in shared typecheck envs. See std/matrix.brp's
-     [_matrix_get]. *)
-    ((N.mod_matrix, "_matrix_get"), "blorp_matrix_get_opt");
+    ( (N.mod_matrix, "matrix_vector_multiply"),
+      "blorp_tensor_matrix_vector_multiply" );
+    ( (N.mod_matrix, "transposed_matrix_vector_multiply"),
+      "blorp_tensor_transposed_matrix_vector_multiply" );
+    ((N.mod_matrix, "outer_multiply"), "blorp_tensor_outer");
+    ((N.mod_matrix, "get_cell"), "blorp_matrix_get_opt");
+    ((N.mod_matrix, "set_cell"), "blorp_matrix_checked_set");
     ((N.mod_matrix, "matrix_checked_get"), "blorp_matrix_checked_get");
     ((N.mod_matrix, "matrix_checked_set"), "blorp_matrix_checked_set");
   ]
@@ -154,7 +146,7 @@ let matrix_builtins =
 (* Matrix kernels resolve through the module-aware builtin table to placeholder
    C names. [Core_specialize] then rewrites those placeholders to the
    element-typed runtime entry and appends static dimensions. Keep them
-   module-scoped here so names like [outer] never resolve as bare builtins. *)
+   module-scoped here so matrix-specific names never resolve as bare builtins. *)
 
 (* String builtins with matching prelude aliases *)
 let string_prelude_builtins =
@@ -331,7 +323,8 @@ let builtin_c_mapping =
       ((N.mod_vector, "vector_sqrt"), "blorp_vector_sqrt");
       ((N.mod_vector, "map"), "blorp_vector_map");
     ]
-  (* Matrix builtins — matvec/outer NOT here, dispatched via gen_tensor_* *)
+  (* Matrix builtins — matrix/vector and outer-multiply kernels dispatch through
+     [Core_specialize]'s tensor-kernel specialization. *)
   @ matrix_builtins
   (* String builtins *)
   @ string_prelude_builtins

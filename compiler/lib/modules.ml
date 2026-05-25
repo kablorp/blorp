@@ -404,14 +404,46 @@ let collect_private_names decls =
     such as [is_upper] for the old string case-conversion functions. *)
 let renamed_std_export_hint (m : loaded_module) (name : string) : string option
     =
-  if (not (is_std_loaded_module m)) || Filename.basename m.name <> "string" then
-    None
+  if not (is_std_loaded_module m) then None
   else
-    match name with
-    | "to_upper" ->
+    match (Filename.basename m.name, name) with
+    | "string", "to_upper" ->
         Some "'to_upper' was renamed to 'upper'; write `import: string: upper`"
-    | "to_lower" ->
+    | "string", "to_lower" ->
         Some "'to_lower' was renamed to 'lower'; write `import: string: lower`"
+    | "matrix", "get" ->
+        Some "'get' was renamed to 'get_cell'; write `import: matrix: get_cell`"
+    | "matrix", "get_or" ->
+        Some
+          "'get_or' was renamed to 'get_cell_or'; write `import: matrix: \
+           get_cell_or`"
+    | "matrix", "set_at" ->
+        Some
+          "'set_at' was renamed to 'set_cell'; write `import: matrix: set_cell`"
+    | "matrix", "matmul" ->
+        Some
+          "'matmul' was renamed to 'matrix_multiply'; write `import: matrix: \
+           matrix_multiply`"
+    | "matrix", "matvec" ->
+        Some
+          "'matvec' was renamed to 'matrix_vector_multiply'; write `import: \
+           matrix: matrix_vector_multiply`"
+    | "matrix", "matvec_t" ->
+        Some
+          "'matvec_t' was renamed to 'transposed_matrix_vector_multiply'; \
+           write `import: matrix: transposed_matrix_vector_multiply`"
+    | "matrix", "outer" ->
+        Some
+          "'outer' was renamed to 'outer_multiply'; write `import: matrix: \
+           outer_multiply`"
+    | "matrix", "outer_product" ->
+        Some
+          "'outer_product' was renamed to 'outer_multiply'; write `import: \
+           matrix: outer_multiply`"
+    | "matrix", "product" ->
+        Some
+          "'product' was renamed to 'cell_product'; write `import: matrix: \
+           cell_product`"
     | _ -> None
 
 (** Suggest a similar export name for typo correction.

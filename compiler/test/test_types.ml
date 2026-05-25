@@ -490,6 +490,20 @@ let test_dim_value_scalars_exclude_variadic_packs () =
   check_true "variadic dim pack does not lift to Int"
     (types_equal (Dim.lift_to_int (TyVarDims "#Ds")) (TyVarDims "#Ds"))
 
+let test_dim_normalization_rejects_symbolic_zero () =
+  let n = TyVar "#N" in
+  let zero = TyDimOp (DimSub, n, n) in
+  check_true "N - N normalizes to zero"
+    (types_equal (Dim.normalize zero) (TyConstInt 0));
+  Alcotest.(check (option int))
+    "zero dim is rejected" (Some 0)
+    (Dim.find_negative (TyArray (ty_int, [ zero ])));
+  let positive = TyDimOp (DimAdd, zero, TyConstInt 1) in
+  check_true "N - N + 1 normalizes to one"
+    (types_equal (Dim.normalize positive) (TyConstInt 1));
+  check_none "positive normalized dim is accepted"
+    (Dim.find_negative (TyArray (ty_int, [ positive ])))
+
 (* ============================================================================
    Module-owned type identities
    ============================================================================ *)
@@ -629,6 +643,8 @@ let suite =
       [
         Alcotest.test_case "scalar dimension refinements exclude variadic packs"
           `Quick test_dim_value_scalars_exclude_variadic_packs;
+        Alcotest.test_case "symbolic zero dimensions are rejected" `Quick
+          test_dim_normalization_rejects_symbolic_zero;
       ] );
     ( "module_type_identity",
       [

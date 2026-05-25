@@ -720,8 +720,11 @@ let vector_callback_result_encoding_arg (layout : tensor_storage_layout) :
 
 let is_vector_parallel_layout_builtin_name (c_name : string) : bool =
   match c_name with
+  | "blorp_matrix_map" | "blorp_matrix_map_indexed" | "blorp_matrix_zip_map"
   | "blorp_vmap_parallel" | "blorp_vmap_indexed_parallel"
-  | "blorp_vzip_parallel" ->
+  | "blorp_vzip_parallel" | "blorp_mmap_parallel"
+  | "blorp_mmap_indexed_parallel" | "blorp_mmap_flat_indexed_parallel"
+  | "blorp_mzip_parallel" | "blorp_mzip_indexed_parallel" ->
       true
   | _ -> false
 

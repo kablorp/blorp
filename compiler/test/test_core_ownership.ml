@@ -331,16 +331,16 @@ let test_tensor_linear_algebra_borrows_inputs () =
   in
   owned_binary_with_dims
     [
-      "blorp_tensor_matmul_int";
-      "blorp_tensor_matmul_float";
-      "blorp_tensor_matmul_float32";
+      "blorp_tensor_matrix_multiply_int";
+      "blorp_tensor_matrix_multiply_float";
+      "blorp_tensor_matrix_multiply_float32";
     ];
   owned_binary
     [
-      "blorp_tensor_matvec_int";
-      "blorp_tensor_matvec_float";
-      "blorp_tensor_matvec_float32";
-      "blorp_tensor_matvec_t_float";
+      "blorp_tensor_matrix_vector_multiply_int";
+      "blorp_tensor_matrix_vector_multiply_float";
+      "blorp_tensor_matrix_vector_multiply_float32";
+      "blorp_tensor_transposed_matrix_vector_multiply_float";
       "blorp_tensor_outer_int";
       "blorp_tensor_outer_float";
       "blorp_tensor_outer_float32";
@@ -421,9 +421,21 @@ let test_to_string_runtime_builtins_borrow_inputs () =
     ]
 
 let test_vmap_parallel_borrows_with_result_ownership_flag () =
+  check_contract "blorp_matrix_map_indexed"
+    { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_matrix_map_indexed" 3);
+  check_contract "blorp_matrix_zip_map"
+    { args = [ Borrow; Borrow; Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_matrix_zip_map" 4);
   check_contract "blorp_vmap_indexed_parallel"
     { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned }
-    (builtin_contract "blorp_vmap_indexed_parallel" 3)
+    (builtin_contract "blorp_vmap_indexed_parallel" 3);
+  check_contract "blorp_mzip_indexed_parallel"
+    { args = [ Borrow; Borrow; Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_mzip_indexed_parallel" 4);
+  check_contract "blorp_mmap_flat_indexed_parallel"
+    { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_mmap_flat_indexed_parallel" 3)
 
 let test_list_parallel_borrows_with_result_ownership_flag () =
   check_contract "blorp_zip_parallel"

@@ -1083,10 +1083,6 @@ let std_body_specs =
       spec ~param_shapes:[ ParamTensor ] "std/vector" "min" 1 FirstParamTensor;
       spec ~return_shape:(ReturnNamed "Float") "std/vector" "mean" 1
         ~param_shapes:[ ParamTensor ] FirstParamTensor;
-      spec ~param_shapes:[ ParamTensor ] "std/vector" "argmax" 1
-        FirstParamTensor;
-      spec ~param_shapes:[ ParamTensor ] "std/vector" "argmin" 1
-        FirstParamTensor;
       spec ~return_shape:ReturnTensor ~param_shapes:[ ParamTensor ] "std/vector"
         "cumsum" 1 FirstParamTensor;
       spec
@@ -1099,24 +1095,24 @@ let std_body_specs =
   let matrix_specs =
     [
       matrix_builtin_spec ~return_shape:ReturnTensor
-        ~c_name:"blorp_tensor_matmul"
+        ~c_name:"blorp_tensor_matrix_multiply"
         ~param_shapes:[ ParamTensor; ParamTensor ]
-        "matmul" 2 FirstParamTensor;
+        "matrix_multiply" 2 FirstParamTensor;
       matrix_builtin_spec ~return_shape:ReturnTensor
         ~c_name:"blorp_tensor_transpose" "transpose" 1
         ~param_shapes:[ ParamTensor ] FirstParamTensor;
       matrix_builtin_spec ~return_shape:ReturnTensor
-        ~c_name:"blorp_tensor_matvec"
+        ~c_name:"blorp_tensor_matrix_vector_multiply"
         ~param_shapes:[ ParamTensor; ParamTensor ]
-        "matvec" 2 FirstParamTensor;
+        "matrix_vector_multiply" 2 FirstParamTensor;
       matrix_builtin_spec ~return_shape:ReturnTensor
-        ~c_name:"blorp_tensor_matvec_t"
+        ~c_name:"blorp_tensor_transposed_matrix_vector_multiply"
         ~param_shapes:[ ParamTensor; ParamTensor ]
-        "matvec_t" 2 FirstParamTensor;
+        "transposed_matrix_vector_multiply" 2 FirstParamTensor;
       matrix_builtin_spec ~return_shape:ReturnTensor
         ~c_name:"blorp_tensor_outer"
         ~param_shapes:[ ParamTensor; ParamTensor ]
-        "outer" 2 FirstParamTensor;
+        "outer_multiply" 2 FirstParamTensor;
     ]
   in
   let hash_specs =
@@ -1242,8 +1238,7 @@ let has_post_mono_synthesis (name : string) : bool =
   | "map" | "filter" | "get_or" | "entries" ->
       true
   | "set" -> true
-  | "sum" | "product" | "dot" | "max" | "min" | "mean" | "argmax" | "argmin"
-  | "cumsum" | "scale" ->
+  | "sum" | "product" | "dot" | "max" | "min" | "mean" | "cumsum" | "scale" ->
       true
   | _ -> false
 
@@ -5706,9 +5701,20 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
         Some (Ast.TyNamed ("ParallelVector", [ elem_ty; dim ]))
     | _ -> None
   in
+  let parallel_matrix_view_ty ty =
+    match Codegen_types.normalize_type ty with
+    | Ast.TyArray (elem_ty, [ rows; cols ]) ->
+        Some (Ast.TyNamed ("ParallelMatrix", [ elem_ty; rows; cols ]))
+    | _ -> None
+  in
   let first_is_vector () =
     match params with
     | { cp_ty; _ } :: _ -> Option.is_some (parallel_vector_view_ty cp_ty)
+    | _ -> false
+  in
+  let first_is_matrix () =
+    match params with
+    | { cp_ty; _ } :: _ -> Option.is_some (parallel_matrix_view_ty cp_ty)
     | _ -> false
   in
   let first_is_string () =
@@ -5749,6 +5755,11 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
     | Ast.TyArray (_, [ _ ]) -> true
     | _ -> false
   in
+  let return_is_matrix () =
+    match Codegen_types.normalize_type return_ty with
+    | Ast.TyArray (_, [ _; _ ]) -> true
+    | _ -> false
+  in
   let return_is_string () =
     match return_ty with Ast.TyNamed ("String", _) -> true | _ -> false
   in
@@ -5780,6 +5791,13 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
     match params with
     | ({ cp_ty; _ } as p0) :: [ p1 ]
       when Option.is_some (parallel_vector_view_ty cp_ty) ->
+        Some (f p0 p1)
+    | _ -> None
+  in
+  let with_matrix2 f =
+    match params with
+    | ({ cp_ty; _ } as p0) :: [ p1 ]
+      when Option.is_some (parallel_matrix_view_ty cp_ty) ->
         Some (f p0 p1)
     | _ -> None
   in
@@ -5822,6 +5840,15 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
           let view_ty =
             Option.value
               (parallel_vector_view_ty self_p.cp_ty)
+              ~default:self_p.cp_ty
+          in
+          let view = { (param self_p) with ty = view_ty } in
+          closure_call (param body_p) [ view ] return_ty)
+  | "parallel" when first_is_matrix () && return_is_matrix () ->
+      with_matrix2 (fun self_p body_p ->
+          let view_ty =
+            Option.value
+              (parallel_matrix_view_ty self_p.cp_ty)
               ~default:self_p.cp_ty
           in
           let view = { (param self_p) with ty = view_ty } in
@@ -8468,82 +8495,6 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
                     (mk return_ty (CCast (vr "__n" ty_int, return_ty)))
                     return_ty))
               return_ty))
-  | "argmax"
-    when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty ->
-      let p = param_at 0 in
-      let info = tensor_elem_info p.cp_ty in
-      let elem_ty = info.elem_ty in
-      Some
-        (lett "__n"
-           (intr "tensor_len" [ param p ] ty_int)
-           (if_
-              (bin Ast.Eq (vr "__n" ty_int) (lit_int 0) ty_bool)
-              (lit_int 0)
-              (lettm "__best_idx" (lit_int 0)
-                 (lettm "__best_val"
-                    (intr info.get_intr [ param p; lit_int 0 ] elem_ty)
-                    (seq
-                       (mk ty_void
-                          (CFor
-                             ( loop "__i" ty_int,
-                               mk ty_int (CRange (lit_int 1, vr "__n" ty_int)),
-                               lett "__val"
-                                 (intr info.get_intr
-                                    [ param p; vr "__i" ty_int ]
-                                    elem_ty)
-                                 (if_
-                                    (bin Ast.Gt (vr "__val" elem_ty)
-                                       (vr "__best_val" elem_ty) ty_bool)
-                                    (seq
-                                       (mk ty_void
-                                          (CAssign
-                                             ( Var.named "__best_val",
-                                               vr "__val" elem_ty )))
-                                       (mk ty_void
-                                          (CAssign
-                                             ( Var.named "__best_idx",
-                                               vr "__i" ty_int ))))
-                                    void ty_void) )))
-                       (vr "__best_idx" ty_int))))
-              ty_int))
-  | "argmin"
-    when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty ->
-      let p = param_at 0 in
-      let info = tensor_elem_info p.cp_ty in
-      let elem_ty = info.elem_ty in
-      Some
-        (lett "__n"
-           (intr "tensor_len" [ param p ] ty_int)
-           (if_
-              (bin Ast.Eq (vr "__n" ty_int) (lit_int 0) ty_bool)
-              (lit_int 0)
-              (lettm "__best_idx" (lit_int 0)
-                 (lettm "__best_val"
-                    (intr info.get_intr [ param p; lit_int 0 ] elem_ty)
-                    (seq
-                       (mk ty_void
-                          (CFor
-                             ( loop "__i" ty_int,
-                               mk ty_int (CRange (lit_int 1, vr "__n" ty_int)),
-                               lett "__val"
-                                 (intr info.get_intr
-                                    [ param p; vr "__i" ty_int ]
-                                    elem_ty)
-                                 (if_
-                                    (bin Ast.Lt (vr "__val" elem_ty)
-                                       (vr "__best_val" elem_ty) ty_bool)
-                                    (seq
-                                       (mk ty_void
-                                          (CAssign
-                                             ( Var.named "__best_val",
-                                               vr "__val" elem_ty )))
-                                       (mk ty_void
-                                          (CAssign
-                                             ( Var.named "__best_idx",
-                                               vr "__i" ty_int ))))
-                                    void ty_void) )))
-                       (vr "__best_idx" ty_int))))
-              ty_int))
   | "cumsum"
     when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty ->
       let p = param_at 0 in
@@ -8607,8 +8558,7 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
                            ]
                            ty_void )))
                  (vr "__result" return_ty))))
-  | "sum" | "product" | "dot" | "max" | "min" | "mean" | "argmax" | "argmin"
-  | "cumsum" | "scale"
+  | ("sum" | "product" | "dot" | "max" | "min" | "mean" | "cumsum" | "scale")
     when match params with
          | p :: _ ->
              Option.is_some (unsupported_concrete_numeric_tensor p.cp_ty)

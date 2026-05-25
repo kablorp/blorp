@@ -1334,33 +1334,37 @@ let tensor_elementwise_builtin_name func_name elem_ty =
   | "abs" | "blorp_vector_abs" -> Some "blorp_vector_abs"
   | _ -> None
 
-let matvec_runtime_name elem_ty =
+let matrix_vector_multiply_runtime_name elem_ty =
   match normalize_type elem_ty with
-  | Ast.TyNamed ("Float", _) -> Some "blorp_tensor_matvec_float"
-  | Ast.TyNamed ("Float32", _) -> Some "blorp_tensor_matvec_float32"
-  | Ast.TyNamed ("Int", _) -> Some "blorp_tensor_matvec_int"
+  | Ast.TyNamed ("Float", _) -> Some "blorp_tensor_matrix_vector_multiply_float"
+  | Ast.TyNamed ("Float32", _) ->
+      Some "blorp_tensor_matrix_vector_multiply_float32"
+  | Ast.TyNamed ("Int", _) -> Some "blorp_tensor_matrix_vector_multiply_int"
   | _ -> None
 
-let matvec_t_runtime_name elem_ty =
+let transposed_matrix_vector_multiply_runtime_name elem_ty =
   match normalize_type elem_ty with
-  | Ast.TyNamed ("Float", _) -> Some "blorp_tensor_matvec_t_float"
-  | Ast.TyNamed ("Float32", _) -> Some "blorp_tensor_matvec_t_float32"
-  | Ast.TyNamed ("Int", _) -> Some "blorp_tensor_matvec_t_int"
+  | Ast.TyNamed ("Float", _) ->
+      Some "blorp_tensor_transposed_matrix_vector_multiply_float"
+  | Ast.TyNamed ("Float32", _) ->
+      Some "blorp_tensor_transposed_matrix_vector_multiply_float32"
+  | Ast.TyNamed ("Int", _) ->
+      Some "blorp_tensor_transposed_matrix_vector_multiply_int"
   | _ -> None
 
-let outer_runtime_name elem_ty =
+let outer_multiply_runtime_name elem_ty =
   match normalize_type elem_ty with
   | Ast.TyNamed ("Float", _) -> Some "blorp_tensor_outer_float"
   | Ast.TyNamed ("Float32", _) -> Some "blorp_tensor_outer_float32"
   | Ast.TyNamed ("Int", _) -> Some "blorp_tensor_outer_int"
   | _ -> None
 
-type matmul_tensor_operands = {
+type matrix_multiply_tensor_operands = {
   mt_elem_ty : Ast.type_expr;
   mt_static_dims : (int * int * int) option;
 }
 
-let matmul_tensor_operands ~reg ~loc left right =
+let matrix_multiply_tensor_operands ~reg ~loc left right =
   match (tensor_type ~reg left.ty, tensor_type ~reg right.ty) with
   | Some left_ty, Some right_ty ->
       let static_dims =
@@ -1377,10 +1381,10 @@ let matmul_tensor_operands ~reg ~loc left right =
   | _ ->
       Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
         ~hint:
-          "matmul specialization requires both operands to carry tensor shape \
-           metadata. If typechecking accepted this, fix dispatch before \
-           specialization."
-        "matmul requires tensor operands, got %s and %s"
+          "matrix_multiply specialization requires both operands to carry \
+           tensor shape metadata. If typechecking accepted this, fix dispatch \
+           before specialization."
+        "matrix_multiply requires tensor operands, got %s and %s"
         (Types.type_to_string left.ty)
         (Types.type_to_string right.ty)
 
@@ -1412,33 +1416,13 @@ let specialize_matrix_vector_call e c_name matrix vector rows cols =
     desc = CCall (CKBuiltin c_name, dummy, [ matrix; vector; rows; cols ]);
   }
 
-let specialize_matvec ~reg e matrix vector =
+let specialize_matrix_vector_multiply ~reg e matrix vector =
   let elem_ty =
     tensor_elem_type ~reg ~loc:e.loc
-      ~context:"matvec requires a tensor matrix argument" matrix.ty
+      ~context:"matrix_vector_multiply requires a tensor matrix argument"
+      matrix.ty
   in
-  match matvec_runtime_name elem_ty with
-  | Some c_name -> (
-      match matrix_static_dims ~reg matrix.ty with
-      | Some (rows, cols) ->
-          specialize_matrix_vector_call e c_name matrix vector
-            (int_lit e.loc rows) (int_lit e.loc cols)
-      | None ->
-          let rows, cols = runtime_matrix_dims e.loc matrix in
-          specialize_matrix_vector_call e c_name matrix vector rows cols)
-  | None ->
-      Core_error.errorf
-        ~hint:"Supported matvec element types are Int, Float, and Float32."
-        (Core_error.Stage Core_stage.Specialize) e.loc
-        "matvec is not implemented for element type `%s`"
-        (Types.type_to_string elem_ty)
-
-let specialize_matvec_t ~reg e matrix vector =
-  let elem_ty =
-    tensor_elem_type ~reg ~loc:e.loc
-      ~context:"matvec_t requires a tensor matrix argument" matrix.ty
-  in
-  match matvec_t_runtime_name elem_ty with
+  match matrix_vector_multiply_runtime_name elem_ty with
   | Some c_name -> (
       match matrix_static_dims ~reg matrix.ty with
       | Some (rows, cols) ->
@@ -1450,18 +1434,44 @@ let specialize_matvec_t ~reg e matrix vector =
   | None ->
       Core_error.errorf
         ~hint:
-          "Use Float matrices for matvec_t until typed inline tensor loops \
-           cover every element type."
+          "Supported matrix_vector_multiply element types are Int, Float, and \
+           Float32."
         (Core_error.Stage Core_stage.Specialize) e.loc
-        "matvec_t is not implemented for element type `%s`"
+        "matrix_vector_multiply is not implemented for element type `%s`"
         (Types.type_to_string elem_ty)
 
-let specialize_outer ~reg e a b =
+let specialize_transposed_matrix_vector_multiply ~reg e matrix vector =
   let elem_ty =
     tensor_elem_type ~reg ~loc:e.loc
-      ~context:"outer requires a tensor left operand" a.ty
+      ~context:
+        "transposed_matrix_vector_multiply requires a tensor matrix argument"
+      matrix.ty
   in
-  match outer_runtime_name elem_ty with
+  match transposed_matrix_vector_multiply_runtime_name elem_ty with
+  | Some c_name -> (
+      match matrix_static_dims ~reg matrix.ty with
+      | Some (rows, cols) ->
+          specialize_matrix_vector_call e c_name matrix vector
+            (int_lit e.loc rows) (int_lit e.loc cols)
+      | None ->
+          let rows, cols = runtime_matrix_dims e.loc matrix in
+          specialize_matrix_vector_call e c_name matrix vector rows cols)
+  | None ->
+      Core_error.errorf
+        ~hint:
+          "Supported transposed_matrix_vector_multiply element types are Int, \
+           Float, and Float32."
+        (Core_error.Stage Core_stage.Specialize) e.loc
+        "transposed_matrix_vector_multiply is not implemented for element type \
+         `%s`"
+        (Types.type_to_string elem_ty)
+
+let specialize_outer_multiply ~reg e a b =
+  let elem_ty =
+    tensor_elem_type ~reg ~loc:e.loc
+      ~context:"outer_multiply requires a tensor left operand" a.ty
+  in
+  match outer_multiply_runtime_name elem_ty with
   | Some c_name ->
       let m =
         match vector_static_dim ~reg a.ty with
@@ -1487,9 +1497,10 @@ let specialize_outer ~reg e a b =
       { e with desc = CCall (CKBuiltin c_name, dummy, [ a; b; m; n ]) }
   | None ->
       Core_error.errorf
-        ~hint:"Supported outer element types are Int, Float, and Float32."
+        ~hint:
+          "Supported outer_multiply element types are Int, Float, and Float32."
         (Core_error.Stage Core_stage.Specialize) e.loc
-        "outer is not implemented for element type `%s`"
+        "outer_multiply is not implemented for element type `%s`"
         (Types.type_to_string elem_ty)
 
 (** Walk a single expression and specialize type-dispatched builtins. *)
@@ -2333,23 +2344,24 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
                   if is_pointer then
                     { e with desc = CCast (raw_call, result_ty) }
                   else { e with desc = CUnbox (raw_call, result_ty) })))
-  (* matmul: type-dispatch + inject dimension args from types.
-     blorp call: matmul(a, b) where a: T[#M,#K], b: T[#K,#N]
-     C call: blorp_tensor_matmul_float(a, b, m, k, n) *)
-  | CCall (CKBuiltin "blorp_tensor_matmul", _callee, [ a; b ]) -> (
-      let operands = matmul_tensor_operands ~reg ~loc:e.loc a b in
+  (* matrix_multiply: type-dispatch + inject dimension args from types.
+     blorp call: matrix_multiply(a, b) where a: T[#M,#K], b: T[#K,#N]
+     C call: blorp_tensor_matrix_multiply_float(a, b, m, k, n) *)
+  | CCall (CKBuiltin "blorp_tensor_matrix_multiply", _callee, [ a; b ]) -> (
+      let operands = matrix_multiply_tensor_operands ~reg ~loc:e.loc a b in
       let elem_ty = operands.mt_elem_ty in
       let c_name =
         match elem_ty with
-        | Ast.TyNamed ("Float", _) -> "blorp_tensor_matmul_float"
-        | Ast.TyNamed ("Float32", _) -> "blorp_tensor_matmul_float32"
-        | Ast.TyNamed ("Int", _) -> "blorp_tensor_matmul_int"
+        | Ast.TyNamed ("Float", _) -> "blorp_tensor_matrix_multiply_float"
+        | Ast.TyNamed ("Float32", _) -> "blorp_tensor_matrix_multiply_float32"
+        | Ast.TyNamed ("Int", _) -> "blorp_tensor_matrix_multiply_int"
         | _ ->
             Core_error.errorf
               ~hint:
-                "Supported matmul element types are Int, Float, and Float32."
+                "Supported matrix_multiply element types are Int, Float, and \
+                 Float32."
               (Core_error.Stage Core_stage.Specialize) e.loc
-              "matmul is not implemented for element type `%s`"
+              "matrix_multiply is not implemented for element type `%s`"
               (Types.type_to_string elem_ty)
       in
       match operands.mt_static_dims with
@@ -2410,12 +2422,18 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
             desc =
               CCall (CKBuiltin c_name, dummy, [ a; b; m_expr; k_expr; n_expr ]);
           })
-  | CCall (CKBuiltin "blorp_tensor_matvec", _callee, [ matrix; vector ]) ->
-      specialize_matvec ~reg e matrix vector
-  | CCall (CKBuiltin "blorp_tensor_matvec_t", _callee, [ matrix; vector ]) ->
-      specialize_matvec_t ~reg e matrix vector
+  | CCall
+      ( CKBuiltin "blorp_tensor_matrix_vector_multiply",
+        _callee,
+        [ matrix; vector ] ) ->
+      specialize_matrix_vector_multiply ~reg e matrix vector
+  | CCall
+      ( CKBuiltin "blorp_tensor_transposed_matrix_vector_multiply",
+        _callee,
+        [ matrix; vector ] ) ->
+      specialize_transposed_matrix_vector_multiply ~reg e matrix vector
   | CCall (CKBuiltin "blorp_tensor_outer", _callee, [ a; b ]) ->
-      specialize_outer ~reg e a b
+      specialize_outer_multiply ~reg e a b
   | CCall (CKBuiltin ("blorp_filter_map_parallel" as base), callee, [ self; f ])
     -> (
       match
@@ -2478,31 +2496,12 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
           CCall
             (CKBuiltin c, callee, args @ [ int_lit e.loc elem_needs_release ]);
       }
-  (* Vector maps/zips return a fresh vector. Specialization appends the
+  (* Vector/matrix maps/zips return a fresh tensor. Specialization appends the
      erased-slot ownership flag; emission appends runtime layout metadata for
-     the parallel variants once the concrete result type is known. *)
+     the matrix and parallel variants once the concrete result type is known. *)
   | CCall (CKBuiltin c, callee, args)
-    when c = "blorp_vector_map" && List.length args = 2 ->
-      let mk_int n =
-        {
-          desc = CLit (Ast.LitInt (Int64.of_int n));
-          ty = Ast.TyNamed ("Int", []);
-          loc = e.loc;
-        }
-      in
-      let elem_needs_release =
-        if
-          tensor_result_elem_needs_release ~reg ~loc:e.loc
-            ~context:"vector map result must be a tensor" e.ty
-        then 1
-        else 0
-      in
-      {
-        e with
-        desc = CCall (CKBuiltin c, callee, args @ [ mk_int elem_needs_release ]);
-      }
-  | CCall (CKBuiltin c, callee, args)
-    when (c = "blorp_vmap_parallel" || c = "blorp_vmap_indexed_parallel")
+    when (c = "blorp_vector_map" || c = "blorp_matrix_map"
+         || c = "blorp_matrix_map_indexed")
          && List.length args = 2 ->
       let mk_int n =
         {
@@ -2514,7 +2513,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       let elem_needs_release =
         if
           tensor_result_elem_needs_release ~reg ~loc:e.loc
-            ~context:"vector parallel map result must be a tensor" e.ty
+            ~context:"tensor map result must be a tensor" e.ty
         then 1
         else 0
       in
@@ -2523,7 +2522,12 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
         desc = CCall (CKBuiltin c, callee, args @ [ mk_int elem_needs_release ]);
       }
   | CCall (CKBuiltin c, callee, args)
-    when c = "blorp_vzip_parallel" && List.length args = 3 ->
+    when (c = "blorp_vmap_parallel"
+         || c = "blorp_vmap_indexed_parallel"
+         || c = "blorp_mmap_parallel"
+         || c = "blorp_mmap_indexed_parallel"
+         || c = "blorp_mmap_flat_indexed_parallel")
+         && List.length args = 2 ->
       let mk_int n =
         {
           desc = CLit (Ast.LitInt (Int64.of_int n));
@@ -2534,7 +2538,30 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       let elem_needs_release =
         if
           tensor_result_elem_needs_release ~reg ~loc:e.loc
-            ~context:"vector zip result must be a tensor" e.ty
+            ~context:"parallel map result must be a tensor" e.ty
+        then 1
+        else 0
+      in
+      {
+        e with
+        desc = CCall (CKBuiltin c, callee, args @ [ mk_int elem_needs_release ]);
+      }
+  | CCall (CKBuiltin c, callee, args)
+    when (c = "blorp_matrix_zip_map" || c = "blorp_vzip_parallel"
+        || c = "blorp_mzip_parallel"
+         || c = "blorp_mzip_indexed_parallel")
+         && List.length args = 3 ->
+      let mk_int n =
+        {
+          desc = CLit (Ast.LitInt (Int64.of_int n));
+          ty = Ast.TyNamed ("Int", []);
+          loc = e.loc;
+        }
+      in
+      let elem_needs_release =
+        if
+          tensor_result_elem_needs_release ~reg ~loc:e.loc
+            ~context:"parallel zip result must be a tensor" e.ty
         then 1
         else 0
       in

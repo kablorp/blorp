@@ -10574,7 +10574,7 @@ blorp_Vector* blorp_tensor_slice_row(blorp_Vector* tensor, long row_index, long 
 
 // Matrix multiplication (Int): C[M,N] = A[M,K] * B[K,N]
 // All tensors use flat row-major storage; m, k, n are dimension params from codegen
-blorp_Vector* blorp_tensor_matmul_int(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
+blorp_Vector* blorp_tensor_matrix_multiply_int(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
     if (!a || !b) return blorp_tensor_new_i64(m, m * n);
     if (m * k > a->capacity || k * n > b->capacity) return blorp_tensor_new_i64(m, m * n);
     blorp_Vector* result = blorp_tensor_new_i64(m, m * n);
@@ -10594,7 +10594,7 @@ blorp_Vector* blorp_tensor_matmul_int(blorp_Vector* a, blorp_Vector* b, long m, 
 }
 
 // Matrix multiplication (Float): C[M,N] = A[M,K] * B[K,N]
-blorp_Vector* blorp_tensor_matmul_float(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
+blorp_Vector* blorp_tensor_matrix_multiply_float(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
     if (!a || !b) return blorp_tensor_new_f64(m, m * n);
     if (m * k > a->capacity || k * n > b->capacity) return blorp_tensor_new_f64(m, m * n);
     blorp_Vector* result = blorp_tensor_new_f64(m, m * n);
@@ -10616,7 +10616,7 @@ blorp_Vector* blorp_tensor_matmul_float(blorp_Vector* a, blorp_Vector* b, long m
 
 // Matrix multiplication (Float32): C[M,N] = A[M,K] * B[K,N]
 // Uses packed float storage (4 bytes per element)
-blorp_Vector* blorp_tensor_matmul_float32(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
+blorp_Vector* blorp_tensor_matrix_multiply_float32(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
     if (!a || !b) return blorp_tensor_new_f32(m, m * n);
     if (m * k > a->capacity || k * n > b->capacity) return blorp_tensor_new_f32(m, m * n);
     blorp_Vector* result = blorp_tensor_new_f32(m, m * n);
@@ -10663,7 +10663,7 @@ blorp_Vector* blorp_tensor_transpose(blorp_Vector* mat, long rows, long cols) {
 }
 
 // Matrix-vector multiply (Float): y[i] = sum_j(W[i*n+j] * x[j])
-blorp_Vector* blorp_tensor_matvec_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_matrix_vector_multiply_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || n > x->capacity) return blorp_vector_new_f64(m);
     blorp_Vector* result = blorp_vector_new_f64(m);
     for (long i = 0; i < m; i++) {
@@ -10679,7 +10679,7 @@ blorp_Vector* blorp_tensor_matvec_float(blorp_Vector* w, blorp_Vector* x, long m
 }
 
 // Matrix-vector multiply (Int)
-blorp_Vector* blorp_tensor_matvec_int(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_matrix_vector_multiply_int(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || n > x->capacity) return blorp_vector_new_i64(m);
     blorp_Vector* result = blorp_vector_new_i64(m);
     for (long i = 0; i < m; i++) {
@@ -10693,7 +10693,7 @@ blorp_Vector* blorp_tensor_matvec_int(blorp_Vector* w, blorp_Vector* x, long m, 
 }
 
 // Matrix-vector multiply (Float32)
-blorp_Vector* blorp_tensor_matvec_float32(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_matrix_vector_multiply_float32(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || n > x->capacity) return blorp_vector_new_f32(m);
     blorp_Vector* result = blorp_vector_new_f32(m);
     for (long i = 0; i < m; i++) {
@@ -10706,9 +10706,9 @@ blorp_Vector* blorp_tensor_matvec_float32(blorp_Vector* w, blorp_Vector* x, long
     return result;
 }
 
-// Transpose-matvec: result[j] = sum_i(W[i,j] * x[i]) = W^T * x
+// Transposed matrix-vector multiply: result[j] = sum_i(W[i,j] * x[i]) = W^T * x
 // W is [m, n], x is [m], result is [n]. Avoids allocating a transposed matrix.
-blorp_Vector* blorp_tensor_matvec_t_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || m > x->capacity) return blorp_vector_new_f64(n);
     blorp_Vector* result = blorp_vector_new_f64(n);
     for (long j = 0; j < n; j++) {
@@ -10723,7 +10723,7 @@ blorp_Vector* blorp_tensor_matvec_t_float(blorp_Vector* w, blorp_Vector* x, long
     return result;
 }
 
-blorp_Vector* blorp_tensor_matvec_t_int(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_int(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || m > x->capacity) return blorp_vector_new_i64(n);
     blorp_Vector* result = blorp_vector_new_i64(n);
     for (long j = 0; j < n; j++) {
@@ -10736,7 +10736,7 @@ blorp_Vector* blorp_tensor_matvec_t_int(blorp_Vector* w, blorp_Vector* x, long m
     return result;
 }
 
-blorp_Vector* blorp_tensor_matvec_t_float32(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float32(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || m > x->capacity) return blorp_vector_new_f32(n);
     blorp_Vector* result = blorp_vector_new_f32(n);
     for (long j = 0; j < n; j++) {
@@ -13119,6 +13119,20 @@ static inline void* blorp_call2(blorp_Closure* closure, void* arg1, void* arg2) 
     typedef void* (*fn2_t)(void*, void*, void*);
     fn2_t f = (fn2_t)closure->func;
     return f(closure->env, arg1, arg2);
+}
+
+// Helper: call a closure with three arguments
+static inline void* blorp_call3(blorp_Closure* closure, void* arg1, void* arg2, void* arg3) {
+    typedef void* (*fn3_t)(void*, void*, void*, void*);
+    fn3_t f = (fn3_t)closure->func;
+    return f(closure->env, arg1, arg2, arg3);
+}
+
+// Helper: call a closure with four arguments
+static inline void* blorp_call4(blorp_Closure* closure, void* arg1, void* arg2, void* arg3, void* arg4) {
+    typedef void* (*fn4_t)(void*, void*, void*, void*, void*);
+    fn4_t f = (fn4_t)closure->func;
+    return f(closure->env, arg1, arg2, arg3, arg4);
 }
 
 // (sort_by functions moved to blorp source — std/list.brp merge sort)
@@ -16894,6 +16908,61 @@ static blorp_Vector* blorp_vector_new_result_layout(
     return result;
 }
 
+static blorp_Vector* blorp_tensor_new_result_layout(
+    long first_dim,
+    long total,
+    int result_elem_is_rc,
+    uint8_t storage_mode,
+    int16_t elem_size
+) {
+    if (first_dim < 0) first_dim = 0;
+    if (total < 0) total = 0;
+    if (first_dim > total) first_dim = total;
+
+    blorp_Vector* result;
+    switch (storage_mode) {
+        case BLORP_VECTOR_STORAGE_F64:
+            result = (blorp_Vector*)blorp_alloc(
+                blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, sizeof(double))));
+            result->elem_size = (int16_t)sizeof(double);
+            result->storage_mode = BLORP_VECTOR_STORAGE_F64;
+            break;
+        case BLORP_VECTOR_STORAGE_F32:
+            result = (blorp_Vector*)blorp_alloc(
+                blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, sizeof(float))));
+            result->elem_size = (int16_t)sizeof(float);
+            result->storage_mode = BLORP_VECTOR_STORAGE_F32;
+            break;
+        case BLORP_VECTOR_STORAGE_I64:
+            result = (blorp_Vector*)blorp_alloc(
+                blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, sizeof(long))));
+            result->elem_size = (int16_t)sizeof(long);
+            result->storage_mode = BLORP_VECTOR_STORAGE_I64;
+            break;
+        case BLORP_VECTOR_STORAGE_INLINE:
+            if (elem_size <= 0) elem_size = (int16_t)sizeof(void*);
+            result = (blorp_Vector*)blorp_alloc(
+                blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, elem_size)));
+            result->elem_size = elem_size;
+            result->storage_mode = BLORP_VECTOR_STORAGE_INLINE;
+            break;
+        default:
+            result = (blorp_Vector*)blorp_alloc(
+                blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, sizeof(void*))));
+            result->elem_size = (int16_t)sizeof(void*);
+            result->storage_mode = BLORP_VECTOR_STORAGE_POINTER;
+            break;
+    }
+
+    result->len = first_dim;
+    result->capacity = total;
+    result->elem_release = NULL;
+    if (result_elem_is_rc && result->storage_mode == BLORP_VECTOR_STORAGE_POINTER) {
+        blorp_vector_init_elem_release(result, blorp_elem_release_fn);
+    }
+    return result;
+}
+
 static void blorp_vector_release_callback_value(uint8_t result_value_encoding, void* value) {
     if (!value) return;
     if (result_value_encoding == BLORP_VECTOR_CALLBACK_BOXED_STRUCT) {
@@ -16973,7 +17042,7 @@ typedef struct {
 
 static blorp_VectorCallbackArg blorp_vector_callback_arg(blorp_Vector* arr, long index) {
     blorp_VectorCallbackArg arg = { NULL, 0 };
-    if (!arr || index < 0 || index >= arr->len) return arg;
+    if (!arr || index < 0 || index >= arr->capacity) return arg;
 
     switch (arr->storage_mode) {
         case BLORP_VECTOR_STORAGE_F64:
@@ -17007,6 +17076,124 @@ static blorp_VectorCallbackArg blorp_vector_callback_arg(blorp_Vector* arr, long
 
 static void blorp_vector_callback_arg_drop(blorp_VectorCallbackArg arg) {
     if (arg.release_after_call && arg.value) blorp_release(arg.value);
+}
+
+// matrix map: apply closure to each cell in row-major order, preserving matrix shape.
+blorp_Vector* blorp_matrix_map(
+    blorp_Vector* arr,
+    blorp_Closure* f,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    if (!arr || !f) {
+        return blorp_tensor_new_result_layout(
+            0,
+            0,
+            result_elem_is_rc != 0,
+            result_storage_mode,
+            result_elem_size);
+    }
+
+    long rows = arr->len;
+    long total = arr->capacity;
+    blorp_Vector* result = blorp_tensor_new_result_layout(
+        rows,
+        total,
+        result_elem_is_rc != 0,
+        result_storage_mode,
+        result_elem_size);
+
+    for (long i = 0; i < total; i++) {
+        blorp_VectorCallbackArg elem = blorp_vector_callback_arg(arr, i);
+        void* mapped = blorp_call1(f, elem.value);
+        blorp_vector_callback_arg_drop(elem);
+        blorp_vector_store_callback_result(result, i, mapped, result_value_encoding);
+    }
+    return result;
+}
+
+// matrix indexed map: apply closure to each cell with row and column indices.
+blorp_Vector* blorp_matrix_map_indexed(
+    blorp_Vector* arr,
+    blorp_Closure* f,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    if (!arr || !f) {
+        return blorp_tensor_new_result_layout(
+            0,
+            0,
+            result_elem_is_rc != 0,
+            result_storage_mode,
+            result_elem_size);
+    }
+
+    long rows = arr->len;
+    long total = arr->capacity;
+    long cols = rows > 0 ? total / rows : 0;
+    blorp_Vector* result = blorp_tensor_new_result_layout(
+        rows,
+        total,
+        result_elem_is_rc != 0,
+        result_storage_mode,
+        result_elem_size);
+
+    for (long i = 0; i < total; i++) {
+        long row = cols > 0 ? i / cols : 0;
+        long col = cols > 0 ? i % cols : 0;
+        blorp_VectorCallbackArg elem = blorp_vector_callback_arg(arr, i);
+        void* mapped = blorp_call3(
+            f,
+            (void*)(intptr_t)row,
+            (void*)(intptr_t)col,
+            elem.value);
+        blorp_vector_callback_arg_drop(elem);
+        blorp_vector_store_callback_result(result, i, mapped, result_value_encoding);
+    }
+    return result;
+}
+
+// matrix zip_map: combine two same-shaped matrices cell-by-cell.
+blorp_Vector* blorp_matrix_zip_map(
+    blorp_Vector* arr_a,
+    blorp_Vector* arr_b,
+    blorp_Closure* f,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    if (!arr_a || !arr_b || !f) {
+        return blorp_tensor_new_result_layout(
+            0,
+            0,
+            result_elem_is_rc != 0,
+            result_storage_mode,
+            result_elem_size);
+    }
+
+    long rows = arr_a->len;
+    long total = arr_a->capacity;
+    blorp_Vector* result = blorp_tensor_new_result_layout(
+        rows,
+        total,
+        result_elem_is_rc != 0,
+        result_storage_mode,
+        result_elem_size);
+
+    for (long i = 0; i < total; i++) {
+        blorp_VectorCallbackArg elem_a = blorp_vector_callback_arg(arr_a, i);
+        blorp_VectorCallbackArg elem_b = blorp_vector_callback_arg(arr_b, i);
+        void* mapped = blorp_call2(f, elem_a.value, elem_b.value);
+        blorp_vector_callback_arg_drop(elem_a);
+        blorp_vector_callback_arg_drop(elem_b);
+        blorp_vector_store_callback_result(result, i, mapped, result_value_encoding);
+    }
+    return result;
 }
 
 // Chunk descriptor for parallel map
@@ -17370,6 +17557,479 @@ blorp_Vector* blorp_vzip_parallel(
         arr_a,
         arr_b,
         f,
+        result_elem_is_rc,
+        result_storage_mode,
+        result_elem_size,
+        result_value_encoding);
+}
+
+// ---------------------------------------------------------------------------
+// Parallel matrix operations — same flat storage, preserving matrix len/capacity
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    blorp_Vector* arr;
+    blorp_Vector* result;
+    blorp_Closure* f;
+    long start;
+    long end;
+    long cols;
+    int indexed;
+    int flat_indexed;
+    uint8_t result_value_encoding;
+    pthread_mutex_t* done_lock;
+    pthread_cond_t* done_cond;
+    long* done_count;
+} blorp_MMapChunk;
+
+static void __blorp_mmap_chunk_worker(void* arg) {
+    blorp_MMapChunk* chunk = (blorp_MMapChunk*)arg;
+    for (long i = chunk->start; i < chunk->end; i++) {
+        blorp_VectorCallbackArg elem = blorp_vector_callback_arg(chunk->arr, i);
+        void* mapped;
+        if (chunk->flat_indexed) {
+            long row = chunk->cols > 0 ? i / chunk->cols : 0;
+            long col = chunk->cols > 0 ? i % chunk->cols : 0;
+            mapped = blorp_call4(
+                chunk->f,
+                (void*)(intptr_t)row,
+                (void*)(intptr_t)col,
+                (void*)(intptr_t)i,
+                elem.value);
+        } else if (chunk->indexed) {
+            long row = chunk->cols > 0 ? i / chunk->cols : 0;
+            long col = chunk->cols > 0 ? i % chunk->cols : 0;
+            mapped = blorp_call3(
+                chunk->f,
+                (void*)(intptr_t)row,
+                (void*)(intptr_t)col,
+                elem.value);
+        } else {
+            mapped = blorp_call1(chunk->f, elem.value);
+        }
+        blorp_vector_callback_arg_drop(elem);
+        blorp_vector_store_callback_result(
+            chunk->result,
+            i,
+            mapped,
+            chunk->result_value_encoding);
+    }
+    pthread_mutex_lock(chunk->done_lock);
+    (*chunk->done_count)++;
+    pthread_cond_signal(chunk->done_cond);
+    pthread_mutex_unlock(chunk->done_lock);
+}
+
+static blorp_Vector* __blorp_mmap_parallel_impl(
+    blorp_Vector* arr,
+    blorp_Closure* f,
+    int indexed,
+    int flat_indexed,
+    int result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    if (!arr || !f) {
+        return blorp_tensor_new_result_layout(
+            0,
+            0,
+            result_elem_is_rc,
+            result_storage_mode,
+            result_elem_size);
+    }
+
+    long rows = arr->len;
+    long total = arr->capacity;
+    long cols = rows > 0 ? total / rows : 0;
+    blorp_Vector* result = blorp_tensor_new_result_layout(
+        rows,
+        total,
+        result_elem_is_rc,
+        result_storage_mode,
+        result_elem_size);
+
+    pthread_once(&__blorp_pool_once, __blorp_pool_init_default);
+    long num_threads = __blorp_pool ? __blorp_pool->num_threads : 1;
+    if (total < BLORP_VPAR_MIN_CHUNK * 2 || num_threads <= 1 || !__blorp_pool) {
+        for (long i = 0; i < total; i++) {
+            blorp_VectorCallbackArg elem = blorp_vector_callback_arg(arr, i);
+            void* mapped;
+            if (flat_indexed) {
+                long row = cols > 0 ? i / cols : 0;
+                long col = cols > 0 ? i % cols : 0;
+                mapped = blorp_call4(
+                    f,
+                    (void*)(intptr_t)row,
+                    (void*)(intptr_t)col,
+                    (void*)(intptr_t)i,
+                    elem.value);
+            } else if (indexed) {
+                long row = cols > 0 ? i / cols : 0;
+                long col = cols > 0 ? i % cols : 0;
+                mapped = blorp_call3(
+                    f,
+                    (void*)(intptr_t)row,
+                    (void*)(intptr_t)col,
+                    elem.value);
+            } else {
+                mapped = blorp_call1(f, elem.value);
+            }
+            blorp_vector_callback_arg_drop(elem);
+            blorp_vector_store_callback_result(
+                result,
+                i,
+                mapped,
+                result_value_encoding);
+        }
+        return result;
+    }
+
+    long num_chunks = num_threads;
+    if (num_chunks > total / BLORP_VPAR_MIN_CHUNK) num_chunks = total / BLORP_VPAR_MIN_CHUNK;
+    if (num_chunks < 2) num_chunks = 2;
+    long chunk_size = total / num_chunks;
+
+    pthread_mutex_t done_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t done_cond = PTHREAD_COND_INITIALIZER;
+    long done_count = 0;
+
+    for (long c = 0; c < num_chunks; c++) blorp_retain(f);
+
+    blorp_MMapChunk stack_chunks[BLORP_PAR_STACK_CHUNKS];
+    blorp_WorkItem stack_items[BLORP_PAR_STACK_CHUNKS - 1];
+    blorp_MMapChunk* chunks = stack_chunks;
+    blorp_WorkItem* items = stack_items;
+    bool heap_scoped_work = num_chunks > BLORP_PAR_STACK_CHUNKS;
+    if (heap_scoped_work) {
+        chunks = (blorp_MMapChunk*)blorp_malloc_checked(num_chunks * sizeof(blorp_MMapChunk));
+        items = (blorp_WorkItem*)blorp_malloc_checked((num_chunks - 1) * sizeof(blorp_WorkItem));
+    }
+
+    for (long c = 1; c < num_chunks; c++) {
+        blorp_MMapChunk* chunk = &chunks[c];
+        chunk->arr = arr;
+        chunk->result = result;
+        chunk->f = f;
+        chunk->start = c * chunk_size;
+        chunk->end = (c == num_chunks - 1) ? total : (c + 1) * chunk_size;
+        chunk->cols = cols;
+        chunk->indexed = indexed;
+        chunk->flat_indexed = flat_indexed;
+        chunk->result_value_encoding = result_value_encoding;
+        chunk->done_lock = &done_lock;
+        chunk->done_cond = &done_cond;
+        chunk->done_count = &done_count;
+        if (!__blorp_pool_submit_scoped(__blorp_mmap_chunk_worker, chunk, &items[c - 1])) {
+            __blorp_mmap_chunk_worker(chunk);
+        }
+    }
+
+    long chunk0_done_count = 0;
+    blorp_MMapChunk chunk0 = {
+        .arr = arr,
+        .result = result,
+        .f = f,
+        .start = 0,
+        .end = chunk_size,
+        .cols = cols,
+        .indexed = indexed,
+        .flat_indexed = flat_indexed,
+        .result_value_encoding = result_value_encoding,
+        .done_lock = &done_lock,
+        .done_cond = &done_cond,
+        .done_count = &chunk0_done_count,
+    };
+    __blorp_mmap_chunk_worker(&chunk0);
+
+    long workers = num_chunks - 1;
+    pthread_mutex_lock(&done_lock);
+    while (done_count < workers) {
+        pthread_cond_wait(&done_cond, &done_lock);
+    }
+    pthread_mutex_unlock(&done_lock);
+    pthread_mutex_destroy(&done_lock);
+    pthread_cond_destroy(&done_cond);
+
+    for (long c = 0; c < num_chunks; c++) blorp_release(f);
+    if (heap_scoped_work) {
+        free(items);
+        free(chunks);
+    }
+    return result;
+}
+
+blorp_Vector* blorp_mmap_parallel(
+    blorp_Vector* arr,
+    blorp_Closure* f,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    return __blorp_mmap_parallel_impl(
+        arr,
+        f,
+        0,
+        0,
+        result_elem_is_rc != 0,
+        result_storage_mode,
+        result_elem_size,
+        result_value_encoding);
+}
+
+blorp_Vector* blorp_mmap_indexed_parallel(
+    blorp_Vector* arr,
+    blorp_Closure* f,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    return __blorp_mmap_parallel_impl(
+        arr,
+        f,
+        1,
+        0,
+        result_elem_is_rc != 0,
+        result_storage_mode,
+        result_elem_size,
+        result_value_encoding);
+}
+
+blorp_Vector* blorp_mmap_flat_indexed_parallel(
+    blorp_Vector* arr,
+    blorp_Closure* f,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    return __blorp_mmap_parallel_impl(
+        arr,
+        f,
+        1,
+        1,
+        result_elem_is_rc != 0,
+        result_storage_mode,
+        result_elem_size,
+        result_value_encoding);
+}
+
+typedef struct {
+    blorp_Vector* arr_a;
+    blorp_Vector* arr_b;
+    blorp_Vector* result;
+    blorp_Closure* f;
+    long start;
+    long end;
+    long cols;
+    int indexed;
+    uint8_t result_value_encoding;
+    pthread_mutex_t* done_lock;
+    pthread_cond_t* done_cond;
+    long* done_count;
+} blorp_MZipChunk;
+
+static void __blorp_mzip_chunk_worker(void* arg) {
+    blorp_MZipChunk* chunk = (blorp_MZipChunk*)arg;
+    for (long i = chunk->start; i < chunk->end; i++) {
+        blorp_VectorCallbackArg elem_a = blorp_vector_callback_arg(chunk->arr_a, i);
+        blorp_VectorCallbackArg elem_b = blorp_vector_callback_arg(chunk->arr_b, i);
+        void* mapped;
+        if (chunk->indexed) {
+            long row = chunk->cols > 0 ? i / chunk->cols : 0;
+            long col = chunk->cols > 0 ? i % chunk->cols : 0;
+            mapped = blorp_call4(
+                chunk->f,
+                (void*)(intptr_t)row,
+                (void*)(intptr_t)col,
+                elem_a.value,
+                elem_b.value);
+        } else {
+            mapped = blorp_call2(chunk->f, elem_a.value, elem_b.value);
+        }
+        blorp_vector_callback_arg_drop(elem_a);
+        blorp_vector_callback_arg_drop(elem_b);
+        blorp_vector_store_callback_result(
+            chunk->result,
+            i,
+            mapped,
+            chunk->result_value_encoding);
+    }
+    pthread_mutex_lock(chunk->done_lock);
+    (*chunk->done_count)++;
+    pthread_cond_signal(chunk->done_cond);
+    pthread_mutex_unlock(chunk->done_lock);
+}
+
+static blorp_Vector* __blorp_mzip_parallel_impl(
+    blorp_Vector* arr_a,
+    blorp_Vector* arr_b,
+    blorp_Closure* f,
+    int indexed,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    if (!arr_a || !arr_b || !f) {
+        return blorp_tensor_new_result_layout(
+            0,
+            0,
+            result_elem_is_rc != 0,
+            result_storage_mode,
+            result_elem_size);
+    }
+
+    long rows = arr_a->len;
+    long total = arr_a->capacity;
+    long cols = rows > 0 ? total / rows : 0;
+    blorp_Vector* result = blorp_tensor_new_result_layout(
+        rows,
+        total,
+        result_elem_is_rc != 0,
+        result_storage_mode,
+        result_elem_size);
+
+    pthread_once(&__blorp_pool_once, __blorp_pool_init_default);
+    long num_threads = __blorp_pool ? __blorp_pool->num_threads : 1;
+    if (total < BLORP_VPAR_MIN_CHUNK * 2 || num_threads <= 1 || !__blorp_pool) {
+        for (long i = 0; i < total; i++) {
+            blorp_VectorCallbackArg elem_a = blorp_vector_callback_arg(arr_a, i);
+            blorp_VectorCallbackArg elem_b = blorp_vector_callback_arg(arr_b, i);
+            void* mapped;
+            if (indexed) {
+                long row = cols > 0 ? i / cols : 0;
+                long col = cols > 0 ? i % cols : 0;
+                mapped = blorp_call4(
+                    f,
+                    (void*)(intptr_t)row,
+                    (void*)(intptr_t)col,
+                    elem_a.value,
+                    elem_b.value);
+            } else {
+                mapped = blorp_call2(f, elem_a.value, elem_b.value);
+            }
+            blorp_vector_callback_arg_drop(elem_a);
+            blorp_vector_callback_arg_drop(elem_b);
+            blorp_vector_store_callback_result(
+                result,
+                i,
+                mapped,
+                result_value_encoding);
+        }
+        return result;
+    }
+
+    long num_chunks = num_threads;
+    if (num_chunks > total / BLORP_VPAR_MIN_CHUNK) num_chunks = total / BLORP_VPAR_MIN_CHUNK;
+    if (num_chunks < 2) num_chunks = 2;
+    long chunk_size = total / num_chunks;
+
+    pthread_mutex_t done_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t done_cond = PTHREAD_COND_INITIALIZER;
+    long done_count = 0;
+
+    for (long c = 0; c < num_chunks; c++) blorp_retain(f);
+
+    blorp_MZipChunk stack_chunks[BLORP_PAR_STACK_CHUNKS];
+    blorp_WorkItem stack_items[BLORP_PAR_STACK_CHUNKS - 1];
+    blorp_MZipChunk* chunks = stack_chunks;
+    blorp_WorkItem* items = stack_items;
+    bool heap_scoped_work = num_chunks > BLORP_PAR_STACK_CHUNKS;
+    if (heap_scoped_work) {
+        chunks = (blorp_MZipChunk*)blorp_malloc_checked(num_chunks * sizeof(blorp_MZipChunk));
+        items = (blorp_WorkItem*)blorp_malloc_checked((num_chunks - 1) * sizeof(blorp_WorkItem));
+    }
+
+    for (long c = 1; c < num_chunks; c++) {
+        blorp_MZipChunk* chunk = &chunks[c];
+        chunk->arr_a = arr_a;
+        chunk->arr_b = arr_b;
+        chunk->result = result;
+        chunk->f = f;
+        chunk->start = c * chunk_size;
+        chunk->end = (c == num_chunks - 1) ? total : (c + 1) * chunk_size;
+        chunk->cols = cols;
+        chunk->indexed = indexed;
+        chunk->result_value_encoding = result_value_encoding;
+        chunk->done_lock = &done_lock;
+        chunk->done_cond = &done_cond;
+        chunk->done_count = &done_count;
+        if (!__blorp_pool_submit_scoped(__blorp_mzip_chunk_worker, chunk, &items[c - 1])) {
+            __blorp_mzip_chunk_worker(chunk);
+        }
+    }
+
+    long chunk0_done_count = 0;
+    blorp_MZipChunk chunk0 = {
+        .arr_a = arr_a,
+        .arr_b = arr_b,
+        .result = result,
+        .f = f,
+        .start = 0,
+        .end = chunk_size,
+        .cols = cols,
+        .indexed = indexed,
+        .result_value_encoding = result_value_encoding,
+        .done_lock = &done_lock,
+        .done_cond = &done_cond,
+        .done_count = &chunk0_done_count,
+    };
+    __blorp_mzip_chunk_worker(&chunk0);
+
+    long workers = num_chunks - 1;
+    pthread_mutex_lock(&done_lock);
+    while (done_count < workers) {
+        pthread_cond_wait(&done_cond, &done_lock);
+    }
+    pthread_mutex_unlock(&done_lock);
+    pthread_mutex_destroy(&done_lock);
+    pthread_cond_destroy(&done_cond);
+
+    for (long c = 0; c < num_chunks; c++) blorp_release(f);
+    if (heap_scoped_work) {
+        free(items);
+        free(chunks);
+    }
+    return result;
+}
+
+blorp_Vector* blorp_mzip_parallel(
+    blorp_Vector* arr_a,
+    blorp_Vector* arr_b,
+    blorp_Closure* f,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    return __blorp_mzip_parallel_impl(
+        arr_a,
+        arr_b,
+        f,
+        0,
+        result_elem_is_rc,
+        result_storage_mode,
+        result_elem_size,
+        result_value_encoding);
+}
+
+blorp_Vector* blorp_mzip_indexed_parallel(
+    blorp_Vector* arr_a,
+    blorp_Vector* arr_b,
+    blorp_Closure* f,
+    long result_elem_is_rc,
+    uint8_t result_storage_mode,
+    int16_t result_elem_size,
+    uint8_t result_value_encoding
+) {
+    return __blorp_mzip_parallel_impl(
+        arr_a,
+        arr_b,
+        f,
+        1,
         result_elem_is_rc,
         result_storage_mode,
         result_elem_size,

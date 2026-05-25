@@ -625,6 +625,112 @@ face: Int[#3, #4] = t[0]
 
 Single-index subscript peels one dimension. Multi-index subscript returns an element once you provide one index per dimension.
 
+#### Vector Operations
+
+Vector reductions take advantage of fixed positive dimensions. `argmax` and
+`argmin` seed from the first element, require only `Orderable`, and return a
+range-refined index, so their result can be used directly where `..#N` is
+required:
+
+```blorp
+import:
+    vector: argmax, argmin
+
+
+values: Int[#4] = {3, 7, 1, 5}
+highest_index: ..#4 = values.argmax()
+lowest_index: ..#4 = values.argmin()
+```
+
+#### Matrix Operations
+
+Matrices use the same tensor arithmetic rules as vectors. `a * b` is
+elementwise multiplication for same-shaped matrices; linear algebra operations
+use explicit names from `std/matrix`.
+
+```blorp
+import:
+    matrix: matrix_multiply, matrix_vector_multiply, outer_multiply, transpose
+
+
+a: Float[#2, #3] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}}
+b: Float[#3, #2] = {{7.0, 8.0}, {9.0, 10.0}, {11.0, 12.0}}
+result: Float[#2, #2] = a.matrix_multiply(b)
+
+weights: Float[#2, #3] = a
+input: Float[#3] = {1.0, 0.5, 0.25}
+output: Float[#2] = weights.matrix_vector_multiply(input)
+outer: Float[#2, #3] = output.outer_multiply(input)
+
+scaled: Float[#2, #3] = a * 2.0       -- scalar broadcast
+same_shape: Float[#2, #3] = a * a     -- elementwise
+flipped: Float[#3, #2] = a.transpose()
+```
+
+The dedicated matrix kernels currently support `Int`, `Float`, and `Float32`
+elements through the `MatrixNumeric` trait. Other element types can still use
+shape-preserving helpers such as `map`, `zip_map`, `min`, `max`, `diagonal`,
+and row/column access when their trait bounds are satisfied.
+
+Shape-preserving matrix transforms use explicit higher-order helpers. `map`,
+`map_indexed`, and `zip_map` return a matrix with the same row and column
+dimensions. `fold`, `sum`, `cell_product`, `mean`, `all`, and `any` consume
+matrix cells in row-major order. Fixed matrix dimensions are positive, so seeded
+operations are infallible:
+`min`, `max`, `argmin`, `argmax`, `to_row_major_vector`, and
+`from_row_major_vector`:
+
+```blorp
+import:
+    matrix: all, argmax, argmin, cell_product, fold, from_row_major_vector, map, map_indexed, max, mean, min, sum, to_row_major_vector, zip_map
+
+
+values: Int[#2, #3] = {{1, 2, 3}, {4, 5, 6}}
+doubled: Int[#2, #3] = values.map(pure func(x: Int): x * 2)
+indexed: Int[#2, #3] = values.map_indexed(pure func(row: ..#2, col: ..#3, x: Int): x + row + col)
+combined: Int[#2, #3] = values.zip_map(doubled, pure func(a: Int, b: Int): a + b)
+folded_total: Int = values.fold(0, pure func(acc: Int, x: Int): acc + x)
+total: Int = values.sum()
+multiplied: Int = values.cell_product()
+highest: Int = values.max()
+highest_cell: (..#2, ..#3) = values.argmax()
+lowest_cell: (..#2, ..#3) = values.argmin()
+average: Float = values.mean()
+all_positive: Bool = values.all(pure func(x: Int): x > 0)
+flat: Int[#6] = values.to_row_major_vector()
+rebuilt: Int[#2, #3] = from_row_major_vector(flat, 2, 3)
+```
+
+Runtime-indexed cell helpers are explicit so they do not blur together with
+first-dimension tensor access. Use row helpers when the index selects a whole
+row. `get_column` returns `None` when the column is out of bounds;
+`get_column_or` accepts a fallback value instead:
+
+```blorp
+import:
+    matrix: column_count, diagonal, get_cell, get_cell_or, get_column, get_column_or, get_row, get_row_or, identity_matrix, row_count, set_cell, set_column, set_diagonal, set_row, trace
+
+
+m: Int[#2, #3] = matrix(0, 2, 3)
+rows: #2 = m.row_count()
+columns: #3 = m.column_count()
+maybe_cell: Option[Int] = m.get_cell(1, 2)
+cell: Int = m.get_cell_or(1, 2, -1)
+maybe_row: Option[Int[#3]] = m.get_row(1)
+row: Int[#3] = m.get_row_or(1, {0, 0, 0})
+maybe_column: Option[Int[#2]] = m.get_column(2)
+column: Int[#2] = m.get_column_or(2, -1)
+updated: Int[#2, #3] = m.set_cell(1, 2, 42)
+with_row: Int[#2, #3] = m.set_row(1, {7, 8, 9})
+with_column: Int[#2, #3] = m.set_column(2, {10, 11})
+
+square: Int[#2, #2] = {{1, 2}, {3, 4}}
+diag: Int[#2] = square.diagonal()
+total: Int = square.trace()
+replaced_diag: Int[#2, #2] = square.set_diagonal({10, 20})
+identity: Int[#2, #2] = identity_matrix(2)
+```
+
 #### Scoped Vector Parallelism
 
 Fixed-size vectors use `Vector.parallel` for parallel shape-preserving
@@ -650,6 +756,31 @@ pure func combine[#N](left: Int[#N], right: Int[#N]) -> Int[#N]:
 iteration, or conversion back to a normal vector inside the callback. The
 callback returns a `ParallelVector[U, #N]`; `parallel` materializes the result
 as a normal `U[#N]` vector after the pipeline completes.
+
+#### Scoped Matrix Parallelism
+
+Fixed-size matrices use the same scoped pattern with row and column dimensions
+preserved. The callback receives a `ParallelMatrix[T, #M, #N]` view and can use
+`map`, `map_indexed`, and `zip_map`.
+
+```blorp
+import:
+    matrix: ParallelMatrix, parallel
+
+
+pure func combine[#M, #N](left: Int[#M, #N], right: Int[#M, #N]) -> Int[#M, #N]:
+    left.parallel(pure func(chunk: ParallelMatrix[Int, #M, #N]):
+        chunk
+            .zip_map(right, pure func(a: Int, b: Int): a + b)
+            .map_indexed(pure func(row: ..#M, col: ..#N, value: Int): value + row + col)
+            .map(pure func(value: Int): value * 2)
+    )
+```
+
+`ParallelMatrix` does not support `filter`, row/column extraction, indexing,
+iteration, transpose, or conversion back to a normal matrix inside the callback.
+The scoped operations preserve the exact `#M, #N` shape, and `parallel`
+materializes a normal `U[#M, #N]` matrix after the pipeline completes.
 
 #### Dimension Arithmetic
 
@@ -1080,7 +1211,8 @@ pure func safe_element[#N](v: Int[#N], i: ..#N) -> Int:
 Range types are part of the compile-time proof system. They let the type checker accept indexing without an extra source-level bounds guard, but some generic cases still lower through checked tensor helpers until later optimization folds them away.
 
 For arbitrary runtime indices where no proof is available, use `get` or
-`get_or` instead of subscript indexing.
+`get_or` for vectors and first-dimension tensor access. Use `get_cell` or
+`get_cell_or` for matrix cells.
 
 ### Function Types
 

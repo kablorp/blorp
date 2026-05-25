@@ -62,12 +62,17 @@ let producer_of_builtin_name name =
   | "blorp_vector_scalar_rev_sub_f32" | "blorp_vector_scalar_rev_div_f32"
   | "blorp_vector_exp_float32" | "blorp_vector_log_float32"
   | "blorp_vector_sqrt_float32" | "blorp_vector_cross_float"
-  | "blorp_tensor_matmul_int" | "blorp_tensor_matmul_float"
-  | "blorp_tensor_matmul_float32" | "blorp_tensor_matvec_int"
-  | "blorp_tensor_matvec_float" | "blorp_tensor_matvec_float32"
-  | "blorp_tensor_matvec_t_int" | "blorp_tensor_matvec_t_float"
-  | "blorp_tensor_matvec_t_float32" | "blorp_tensor_outer_int"
-  | "blorp_tensor_outer_float" | "blorp_tensor_outer_float32" ->
+  | "blorp_tensor_matrix_multiply_int" | "blorp_tensor_matrix_multiply_float"
+  | "blorp_tensor_matrix_multiply_float32"
+  | "blorp_tensor_matrix_vector_multiply_int"
+  | "blorp_tensor_matrix_vector_multiply_float"
+  | "blorp_tensor_matrix_vector_multiply_float32"
+  | "blorp_tensor_transposed_matrix_vector_multiply_int"
+  | "blorp_tensor_transposed_matrix_vector_multiply_float"
+  | "blorp_tensor_transposed_matrix_vector_multiply_float32"
+  | "blorp_tensor_outer_int" | "blorp_tensor_outer_float"
+  | "blorp_tensor_outer_float32" | "blorp_matrix_map"
+  | "blorp_matrix_map_indexed" | "blorp_matrix_zip_map" ->
       Some (KnownResultProducer name)
   | "blorp_assert_shape_nullable" | "blorp_assert_shape"
   | "blorp_tensor_slice_row" ->

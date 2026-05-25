@@ -2823,14 +2823,17 @@ let process_import (state : check_state) (loc : loc) (decl : import_decl) :
                               (Modules.get_all_modules ())
                           in
                           let help =
-                            match other_module with
-                            | Some other_mod ->
-                                Some
-                                  (Printf.sprintf
-                                     "'%s' is not in '%s'. Did you mean: \
-                                      import: %s: %s"
-                                     name decl.import_module other_mod name)
-                            | None -> Modules.suggest_export m name
+                            match Modules.suggest_export m name with
+                            | Some _ as hint -> hint
+                            | None -> (
+                                match other_module with
+                                | Some other_mod ->
+                                    Some
+                                      (Printf.sprintf
+                                         "'%s' is not in '%s'. Did you mean: \
+                                          import: %s: %s"
+                                         name decl.import_module other_mod name)
+                                | None -> None)
                           in
                           add_error state
                             {
@@ -3191,6 +3194,8 @@ let () =
           ("parallel_list", "ParallelList");
           ("vector", "ParallelVector");
           ("parallel_vector", "ParallelVector");
+          ("matrix", "ParallelMatrix");
+          ("parallel_matrix", "ParallelMatrix");
           ("range", "Range");
           ("dict", "Dict");
           ("set", "Set");

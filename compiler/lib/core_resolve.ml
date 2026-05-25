@@ -339,6 +339,7 @@ let type_to_module_paths (ty : Ast.type_expr) : string list =
   | Ast.TyNamed ("List", _) -> [ "std/list" ]
   | Ast.TyNamed ("ParallelList", _) -> [ "std/parallel_list"; "std/list" ]
   | Ast.TyNamed ("ParallelVector", _) -> [ "std/parallel_vector"; "std/vector" ]
+  | Ast.TyNamed ("ParallelMatrix", _) -> [ "std/parallel_matrix"; "std/matrix" ]
   | Ast.TyNamed ("Dict", _) -> [ "std/dict" ]
   | Ast.TyNamed ("Set", _) -> [ "std/set" ]
   | Ast.TyArray (_, dims) -> (
@@ -351,8 +352,8 @@ let type_to_module_paths (ty : Ast.type_expr) : string list =
   | Ast.TyNamed ("Matrix", args) -> (
       (* Legacy internal tensor-family names may still appear while older Core
          paths are being ported. Dispatch by rank so a 2D access like
-         [get(m, row, col)] resolves through
-         [std/matrix] (3-arg signature) before [std/tensor] (1D, 2-arg signature). *)
+         [m.get_cell(row, col)] resolves through [std/matrix] before
+         first-dimension tensor helpers. *)
       let rank = max 0 (List.length args - 1) in
       match rank with
       | 0 | 1 -> [ "std/tensor"; "std/vector"; "std/matrix" ]

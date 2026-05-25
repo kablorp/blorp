@@ -119,7 +119,7 @@ fusion:
 ```ocaml
 |> Core_string_pipeline.fuse_program ~reg
 |> Core_collection_pipeline.fuse_program ~reg
-|> Core_parallel_vector_pipeline.fuse_program ~reg
+|> Core_parallel_tensor_pipeline.fuse_program ~reg
 |> Core_tensor_fusion.fuse_program ~reg
 |> Core_tuple_sroa.rewrite_program ~reg
 ```
@@ -183,7 +183,7 @@ not meaningfully parallel and is no longer public.
 
 ### Phase 3: Pipeline Fusion
 
-Added `Core_parallel_vector_pipeline`, which recognizes straight chains of
+Added `Core_parallel_tensor_pipeline`, which recognizes straight chains of
 `map`, `map_indexed`, and `zip_map` inside a scoped `Vector.parallel` callback.
 
 - Map-only plans lower to one `blorp_vmap_parallel` call.

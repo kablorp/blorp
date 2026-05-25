@@ -1,11 +1,40 @@
+import:
+	tensor: length, matrix, vector
+	traits: one, zero
+
+
+type ParallelMatrix[T, #M, #N] = builtin
+
+
 -- Matrix - 2D array operations
 --
--- This module provides 2D-specific operations: matmul, transpose.
+-- This module provides 2D-specific operations: matrix_multiply, transpose,
+-- square-matrix helpers, row/column counts, row/column access, and cell access.
 -- For generic tensor ops (length, get, set_index), see tensor.
+-- ============================================================================
+-- Scoped Parallel Pipelines
+-- ============================================================================
 ---
-Set element at (row, col), returning unchanged matrix if out of bounds.
+Run a parallel matrix pipeline.
+
+The callback receives a ParallelMatrix[T, #M, #N], which intentionally exposes
+only shape-preserving parallel combinators. The result is materialized back into
+a normal fixed-size matrix when the callback returns.
 ---
-pure func set_at[T, #M, #N](m: T[#M, #N], row: Int, col: Int, val: T) -> T[#M, #N]:
+pure func parallel[T, U, #M, #N](
+	self: T[#M, #N],
+	body: pure (ParallelMatrix[T, #M, #N]) -> ParallelMatrix[U, #M, #N],
+) -> U[#M, #N]:
+	builtin
+
+
+-- ============================================================================
+-- Cell Updates
+-- ============================================================================
+---
+Set cell at (row, col), returning unchanged matrix if out of bounds.
+---
+pure func set_cell[T, #M, #N](m: T[#M, #N], row: Int, col: Int, val: T) -> T[#M, #N]:
 	builtin
 
 
@@ -13,10 +42,10 @@ pure func set_at[T, #M, #N](m: T[#M, #N], row: Int, col: Int, val: T) -> T[#M, #
 -- Matrix Operations (special-case codegen)
 -- ============================================================================
 ---
-Matrix multiplication: C[M,N] = A[M,K] * B[K,N].
+Linear algebra matrix multiplication: C[M,N] = A[M,K] * B[K,N].
 K dimension must match (validated at compile time).
 ---
-pure func matmul[T:Numeric, #M, #K, #N](a: T[#M, #K], b: T[#K, #N]) -> T[#M, #N]:
+pure func matrix_multiply[T:MatrixNumeric, #M, #K, #N](a: T[#M, #K], b: T[#K, #N]) -> T[#M, #N]:
 	builtin
 
 
@@ -31,54 +60,438 @@ pure func transpose[T, #M, #N](m: T[#M, #N]) -> T[#N, #M]:
 Matrix-vector multiply: y[i] = sum_j(W[i,j] * x[j]).
 W is [M, N], x is [N], result is [M].
 ---
-pure func matvec[T:Numeric, #M, #N](w: T[#M, #N], x: T[#N]) -> T[#M]:
+pure func matrix_vector_multiply[T:MatrixNumeric, #M, #N](w: T[#M, #N], x: T[#N]) -> T[#M]:
 	builtin
 
 
 ---
-Outer product: result[i,j] = a[i] * b[j].
+Outer multiply: result[i,j] = a[i] * b[j].
 a is [M], b is [N], result is [M, N].
 ---
-pure func outer[T:Numeric, #M, #N](a: T[#M], b: T[#N]) -> T[#M, #N]:
+pure func outer_multiply[T:MatrixNumeric, #M, #N](a: T[#M], b: T[#N]) -> T[#M, #N]:
 	builtin
 
 
 ---
-Transpose-matvec: y[j] = sum_i(W[i,j] * x[i]) = W^T * x.
+Transposed matrix-vector multiply: y[j] = sum_i(W[i,j] * x[i]) = W^T * x.
 W is [M, N], x is [M], result is [N].
 Computes the transpose multiply without allocating a transposed matrix.
-Useful for backpropagation: dx = matvec_t(w, dy).
+Useful for backpropagation: dx = transposed_matrix_vector_multiply(w, dy).
 ---
-pure func matvec_t[T:Numeric, #M, #N](w: T[#M, #N], x: T[#M]) -> T[#N]:
+pure func transposed_matrix_vector_multiply[T:MatrixNumeric, #M, #N](
+	w: T[#M, #N],
+	x: T[#M],
+) -> T[#N]:
 	builtin
+
+
+-- ============================================================================
+-- Shape
+-- ============================================================================
+---
+Number of rows in a matrix.
+---
+pure func row_count[T, #M, #N](m: T[#M, #N]) -> #M:
+	length(m)
+
+
+---
+Number of columns in a matrix.
+---
+pure func column_count[T, #M, #N](m: T[#M, #N]) -> #N:
+	length(m[0])
+
+
+-- ============================================================================
+-- Higher-Order Functions
+-- ============================================================================
+---
+Map matrix cells in row-major order, preserving the exact matrix shape.
+---
+func map[T, U, #M, #N](
+	self: T[#M, #N],
+	f: (T) -> U,
+) -> U[#M, #N]:
+	builtin("blorp_matrix_map")
+pure func map[T, U, #M, #N](
+	self: T[#M, #N],
+	f: pure (T) -> U,
+) -> U[#M, #N]:
+	builtin("blorp_matrix_map")
+
+
+---
+Map matrix cells with row and column indices, preserving the exact matrix shape.
+---
+func map_indexed[T, U, #M, #N](
+	self: T[#M, #N],
+	f: (..#M, ..#N, T) -> U,
+) -> U[#M, #N]:
+	builtin("blorp_matrix_map_indexed")
+pure func map_indexed[T, U, #M, #N](
+	self: T[#M, #N],
+	f: pure (..#M, ..#N, T) -> U,
+) -> U[#M, #N]:
+	builtin("blorp_matrix_map_indexed")
+
+
+---
+Combine two same-shaped matrices cell-by-cell, preserving the exact shape.
+---
+func zip_map[A, B, C, #M, #N](
+	self: A[#M, #N],
+	other: B[#M, #N],
+	f: (A, B) -> C,
+) -> C[#M, #N]:
+	builtin("blorp_matrix_zip_map")
+pure func zip_map[A, B, C, #M, #N](
+	self: A[#M, #N],
+	other: B[#M, #N],
+	f: pure (A, B) -> C,
+) -> C[#M, #N]:
+	builtin("blorp_matrix_zip_map")
+
+
+---
+Fold matrix cells in row-major order.
+---
+func fold[T, Acc, #M, #N](
+	self: T[#M, #N],
+	init: Acc,
+	f: (Acc, T) -> Acc,
+) -> Acc:
+	var result: Acc = init
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			result = f(result, values[col])
+	result
+pure func fold[T, Acc, #M, #N](
+	self: T[#M, #N],
+	init: Acc,
+	f: pure (Acc, T) -> Acc,
+) -> Acc:
+	var result: Acc = init
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			result = f(result, values[col])
+	result
+
+
+---
+Check whether all matrix cells satisfy a predicate.
+---
+func all[T, #M, #N](
+	self: T[#M, #N],
+	pred: (T) -> Bool,
+) -> Bool:
+	var result: Bool = True
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			if not pred(values[col]):
+				result = False
+				break
+		if not result:
+			break
+	result
+pure func all[T, #M, #N](
+	self: T[#M, #N],
+	pred: pure (T) -> Bool,
+) -> Bool:
+	var result: Bool = True
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			if not pred(values[col]):
+				result = False
+				break
+		if not result:
+			break
+	result
+
+
+---
+Check whether any matrix cell satisfies a predicate.
+---
+func any[T, #M, #N](
+	self: T[#M, #N],
+	pred: (T) -> Bool,
+) -> Bool:
+	var result: Bool = False
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			if pred(values[col]):
+				result = True
+				break
+		if result:
+			break
+	result
+pure func any[T, #M, #N](
+	self: T[#M, #N],
+	pred: pure (T) -> Bool,
+) -> Bool:
+	var result: Bool = False
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			if pred(values[col]):
+				result = True
+				break
+		if result:
+			break
+	result
+
+
+---
+Sum all matrix cells in row-major order.
+---
+pure func sum[T:Addable+HasZero, #M, #N](self: T[#M, #N]) -> T:
+	var result: T = zero()
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			result += values[col]
+	result
+
+
+---
+Product of all matrix cells in row-major order.
+---
+pure func cell_product[T:Multipliable+HasOne, #M, #N](self: T[#M, #N]) -> T:
+	var result: T = one()
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			result *= values[col]
+	result
+
+
+---
+Maximum matrix cell in row-major order.
+---
+pure func max[T:Orderable, #M, #N](self: T[#M, #N]) -> T:
+	var result: T = self[0, 0]
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			value: T = values[col]
+			if value > result:
+				result = value
+	result
+
+
+---
+Minimum matrix cell in row-major order.
+---
+pure func min[T:Orderable, #M, #N](self: T[#M, #N]) -> T:
+	var result: T = self[0, 0]
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			value: T = values[col]
+			if value < result:
+				result = value
+	result
+
+
+---
+Row and column index of the maximum matrix cell. Ties keep the first row-major match.
+---
+pure func argmax[T:Orderable, #M, #N](self: T[#M, #N]) -> (..#M, ..#N):
+	var best_row: ..#M = 0
+	var best_col: ..#N = 0
+	var best_value: T = self[0, 0]
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			value: T = values[col]
+			if value > best_value:
+				best_value = value
+				best_row = row
+				best_col = col
+	(best_row, best_col)
+
+
+---
+Row and column index of the minimum matrix cell. Ties keep the first row-major match.
+---
+pure func argmin[T:Orderable, #M, #N](self: T[#M, #N]) -> (..#M, ..#N):
+	var best_row: ..#M = 0
+	var best_col: ..#N = 0
+	var best_value: T = self[0, 0]
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			value: T = values[col]
+			if value < best_value:
+				best_value = value
+				best_row = row
+				best_col = col
+	(best_row, best_col)
+
+
+---
+Mean of all matrix cells in row-major order.
+---
+pure func mean[T:Addable+HasZero+ToFloat, #M, #N](self: T[#M, #N]) -> Float:
+	var total: T = zero()
+	var count: Int = 0
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			total += values[col]
+			count += 1
+	to_float(total) / to_float(count)
+
+
+-- ============================================================================
+-- Shape Conversion
+-- ============================================================================
+---
+Flatten a matrix into a fixed-size vector in row-major order.
+---
+pure func to_row_major_vector[T, #M, #N](self: T[#M, #N]) -> T[#M * #N]:
+	first_row: T[#N] = self[0]
+	var result: T[#M * #N] = vector(first_row[0], length(self) * length(first_row))
+	for row in 0..length(self):
+		values: T[#N] = self[row]
+		for col in 0..length(values):
+			result[row * length(values) + col] = values[col]
+	result
+
+
+---
+Build a matrix from a row-major fixed-size vector.
+---
+pure func from_row_major_vector[T, #M, #N](values: T[#M * #N], rows: #M, columns: #N) -> T[#M, #N]:
+	first: T = values[0]
+	var result: T[#M, #N] = matrix(first, rows, columns)
+	for row in 0..length(result):
+		for col in 0..columns:
+			result[row, col] = values[row * columns + col]
+	result
+
+
+-- ============================================================================
+-- Square Matrix Helpers
+-- ============================================================================
+---
+Create an identity matrix with `one()` on the main diagonal and `zero()` elsewhere.
+---
+pure func identity_matrix[T:HasOne+HasZero, #N](size: #N) -> T[#N, #N]:
+	var result: T[#N, #N] = matrix(zero(), size, size)
+	for i in 0..length(result):
+		result = set_cell(result, i, i, one())
+	result
+
+
+---
+Extract the main diagonal from a square matrix.
+---
+pure func diagonal[T, #N](m: T[#N, #N]) -> T[#N]:
+	var result: T[#N] = vector(m[0, 0], length(m))
+	for i in 0..length(m):
+		result[i] = m[i, i]
+	result
+
+
+---
+Sum the main diagonal of a square matrix.
+---
+pure func trace[T:Addable+HasZero, #N](m: T[#N, #N]) -> T:
+	var total: T = zero()
+	for i in 0..length(m):
+		total += m[i, i]
+	total
+
+
+---
+Replace the main diagonal of a square matrix.
+---
+pure func set_diagonal[T, #N](m: T[#N, #N], values: T[#N]) -> T[#N, #N]:
+	var result: T[#N, #N] = m
+	for i in 0..length(values):
+		result = set_cell(result, i, i, values[i])
+	result
 
 
 -- ============================================================================
 -- 2D Element Access (runtime bounds-checked)
 -- ============================================================================
 ---
-Get element at (row, col), returning None if out of bounds.
+Get cell at (row, col), returning None if out of bounds.
 ---
-pure func get[T, #M, #N](m: T[#M, #N], row: Int, col: Int) -> Option[T]:
+pure func get_cell[T, #M, #N](m: T[#M, #N], row: Int, col: Int) -> Option[T]:
 	builtin
 
 
 ---
-Get element at (row, col), returning default if out of bounds.
+Get cell at (row, col), returning default if out of bounds.
 ---
-pure func get_or[T, #M, #N](m: T[#M, #N], row: Int, col: Int, default: T) -> T:
-	-- Call the 2D accessor under a private name that can't be shadowed by
-	-- tensor's 2-arg `get` in batch-compile environments where both are in
-	-- scope.
-	match _matrix_get(m, row, col):
+pure func get_cell_or[T, #M, #N](m: T[#M, #N], row: Int, col: Int, default: T) -> T:
+	match get_cell(m, row, col):
 		Some(v): v
 		None: default
 
 
--- Private 2D accessor — same codegen as [get] above, re-exported under a
--- name that doesn't collide with tensor's 1-D 2-arg `get`. Used by
--- [get_or]'s body because calls to bare `get(m, row, col)` can be
--- misresolved to tensor's 2-arg signature when tensor's `get` is also in
--- the typecheck env (see Phase 1.5 test-runner isolation).
-private pure func _matrix_get[T, #M, #N](m: T[#M, #N], row: Int, col: Int) -> Option[T]:
-	builtin
+---
+Get row at index, returning None if out of bounds.
+---
+pure func get_row[T, #M, #N](m: T[#M, #N], row: Int) -> Option[T[#N]]:
+	if row >= 0 and row < length(m):
+		Some(m[row])
+	else:
+		None
+
+
+---
+Get row at index, returning default if out of bounds.
+---
+pure func get_row_or[T, #M, #N](m: T[#M, #N], row: Int, default: T[#N]) -> T[#N]:
+	match get_row(m, row):
+		Some(v): v
+		None: default
+
+
+---
+Get column at index, returning None if out of bounds.
+---
+pure func get_column[T, #M, #N](m: T[#M, #N], col: Int) -> Option[T[#M]]:
+	if col >= 0 and col < column_count(m):
+		first: T = get_cell_or(m, 0, col, m[0, 0])
+		Some(get_column_or(m, col, first))
+	else:
+		None
+
+
+---
+Get column at index, replacing out-of-bounds cells with default.
+---
+pure func get_column_or[T, #M, #N](m: T[#M, #N], col: Int, default: T) -> T[#M]:
+	var result: T[#M] = vector(default, length(m))
+	for row in 0..result.length():
+		result[row] = get_cell_or(m, row, col, default)
+	result
+
+
+---
+Set a whole row, returning the unchanged matrix if the row is out of bounds.
+---
+pure func set_row[T, #M, #N](m: T[#M, #N], row: Int, values: T[#N]) -> T[#M, #N]:
+	var result: T[#M, #N] = m
+	for col in 0..values.length():
+		result = set_cell(result, row, col, values[col])
+	result
+
+
+---
+Set a whole column, returning the unchanged matrix if the column is out of bounds.
+---
+pure func set_column[T, #M, #N](m: T[#M, #N], col: Int, values: T[#M]) -> T[#M, #N]:
+	var result: T[#M, #N] = m
+	for row in 0..values.length():
+		result = set_cell(result, row, col, values[row])
+	result

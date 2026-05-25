@@ -1153,17 +1153,17 @@ let builtin_contract_table =
         (bfixed [ CowConsume; Borrow; Borrow ] ReturnOwned);
       builtins
         [
-          "blorp_tensor_matmul_float";
-          "blorp_tensor_matmul_float32";
-          "blorp_tensor_matmul_int";
+          "blorp_tensor_matrix_multiply_float";
+          "blorp_tensor_matrix_multiply_float32";
+          "blorp_tensor_matrix_multiply_int";
         ]
         (bfixed [ Borrow; Borrow; Borrow; Borrow; Borrow ] ReturnOwned);
       builtins
         [
-          "blorp_tensor_matvec_float";
-          "blorp_tensor_matvec_float32";
-          "blorp_tensor_matvec_int";
-          "blorp_tensor_matvec_t_float";
+          "blorp_tensor_matrix_vector_multiply_float";
+          "blorp_tensor_matrix_vector_multiply_float32";
+          "blorp_tensor_matrix_vector_multiply_int";
+          "blorp_tensor_transposed_matrix_vector_multiply_float";
           "blorp_tensor_outer_float";
           "blorp_tensor_outer_float32";
           "blorp_tensor_outer_int";
@@ -1175,8 +1175,8 @@ let builtin_contract_table =
       builtins
         [ "blorp_tensor_slice_row" ]
         (bfixed [ Borrow; Borrow; Borrow; Borrow ] ReturnOwned);
-      (* Vector/tensor parallel maps borrow their input and callback, returning a
-       fresh result vector. *)
+      (* Vector/matrix maps borrow their input and callback, returning a fresh
+       result tensor. *)
       builtins [ "blorp_vector_map" ]
         (bcases
            [
@@ -1184,13 +1184,39 @@ let builtin_contract_table =
              ([ Borrow; Borrow; Borrow ], ReturnOwned);
            ]);
       builtins
-        [ "blorp_vmap_parallel"; "blorp_vmap_indexed_parallel" ]
+        [ "blorp_matrix_map"; "blorp_matrix_map_indexed" ]
         (bcases
            [
              ([ Borrow; Borrow ], ReturnOwned);
              ([ Borrow; Borrow; Borrow ], ReturnOwned);
            ]);
-      builtins [ "blorp_vzip_parallel" ]
+      builtins [ "blorp_matrix_zip_map" ]
+        (bcases
+           [
+             ([ Borrow; Borrow; Borrow ], ReturnOwned);
+             ([ Borrow; Borrow; Borrow; Borrow ], ReturnOwned);
+           ]);
+      (* Parallel tensor maps use the same ownership shape as sequential matrix
+       maps. *)
+      builtins
+        [
+          "blorp_vmap_parallel";
+          "blorp_vmap_indexed_parallel";
+          "blorp_mmap_parallel";
+          "blorp_mmap_indexed_parallel";
+          "blorp_mmap_flat_indexed_parallel";
+        ]
+        (bcases
+           [
+             ([ Borrow; Borrow ], ReturnOwned);
+             ([ Borrow; Borrow; Borrow ], ReturnOwned);
+           ]);
+      builtins
+        [
+          "blorp_vzip_parallel";
+          "blorp_mzip_parallel";
+          "blorp_mzip_indexed_parallel";
+        ]
         (bcases
            [
              ([ Borrow; Borrow; Borrow ], ReturnOwned);
@@ -1239,8 +1265,9 @@ let builtin_ownership_coverage name =
           Some
             (Pre_perceus_sentinel
                "type-dispatched equality is specialized before Perceus")
-      | "blorp_tensor_matmul" | "blorp_tensor_matvec" | "blorp_tensor_matvec_t"
-      | "blorp_tensor_outer" | "blorp_tensor_peel" ->
+      | "blorp_tensor_matrix_multiply" | "blorp_tensor_matrix_vector_multiply"
+      | "blorp_tensor_transposed_matrix_vector_multiply" | "blorp_tensor_outer"
+      | "blorp_tensor_peel" ->
           Some
             (Pre_perceus_sentinel
                "generic tensor dispatch is specialized before Perceus")

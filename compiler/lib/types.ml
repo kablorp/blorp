@@ -188,6 +188,7 @@ let global_abi_type_names =
     "List";
     "ParallelList";
     "ParallelVector";
+    "ParallelMatrix";
     "Dict";
     "Set";
     "Option";
@@ -577,9 +578,12 @@ let rec normalize_dim (ty : type_expr) : type_expr =
       (* Fully concrete: evaluate *)
       | DimAdd, TyConstInt a, TyConstInt b -> TyConstInt (a + b)
       | DimSub, TyConstInt a, TyConstInt b -> TyConstInt (a - b)
+      | DimSub, x, y when types_equal x y -> TyConstInt 0
       | DimMul, TyConstInt a, TyConstInt b -> TyConstInt (a * b)
+      | DimMul, TyConstInt 0, _ | DimMul, _, TyConstInt 0 -> TyConstInt 0
       | DimDiv, TyConstInt a, TyConstInt b when b > 0 && a mod b = 0 ->
           TyConstInt (a / b)
+      | DimDiv, TyConstInt 0, _ -> TyConstInt 0
       (* Constant folding through nested add/sub: (X + c1) + c2 → X + (c1 + c2) *)
       | DimAdd, TyDimOp (DimAdd, x, TyConstInt c1), TyConstInt c2 ->
           normalize_dim (TyDimOp (DimAdd, x, TyConstInt (c1 + c2)))
@@ -609,7 +613,7 @@ let rec normalize_dim (ty : type_expr) : type_expr =
     Dimensions must be >= 1 (zero-length tensors are not allowed — use List for
     potentially-empty collections). Returns Some (bad_value) if found. *)
 let rec find_negative_dim (ty : type_expr) : int option =
-  match ty with
+  match normalize_dim ty with
   | TyConstInt n when n <= 0 -> Some n
   | TyNamed (_, args) ->
       List.fold_left
@@ -998,76 +1002,86 @@ let validate_array_dims ?sess (type_params : string list) (ty : type_expr) :
         true
     | _ -> false
   in
-  match ty with
-  | TyNamed (name, bad :: _) when scalar_array_element_name name ->
+  match find_negative_dim ty with
+  | Some n ->
       Some
         (Printf.sprintf
-           "Array dimension argument must be a dimension type (#N, #3, \
-            #Ds...), got %s"
-           (type_to_string bad))
-  | TyArray (_, dims) -> (
-      let invalid =
-        List.filter (fun d -> not (is_dim_type ~sess type_params d)) dims
-      in
-      match invalid with
-      | bad :: _ ->
+           "Dimension arithmetic produces non-positive result: %d (dimensions \
+            must be >= 1)"
+           n)
+  | None -> (
+      match ty with
+      | TyNamed (name, bad :: _) when scalar_array_element_name name ->
           Some
             (Printf.sprintf
                "Array dimension argument must be a dimension type (#N, #3, \
                 #Ds...), got %s"
                (type_to_string bad))
-      | [] ->
-          let is_vardims = function TyVarDims _ -> true | _ -> false in
-          if List.length (List.filter is_vardims dims) > 1 then
-            Some
-              "Array type cannot have multiple variadic dims — use a single \
-               #N... as the last dimension"
-          else if
-            List.exists is_vardims dims
-            && not (is_vardims (List.nth dims (List.length dims - 1)))
-          then
-            Some
-              "Array type: variadic dimension (#N...) must be the last \
-               dimension argument"
-          else None)
-  | TyNamed ((("Tensor" | "Vector" | "Matrix") as name), _ :: dims) -> (
-      let invalid =
-        List.filter (fun d -> not (is_dim_type ~sess type_params d)) dims
-      in
-      match invalid with
-      | bad :: _ ->
-          Some
-            (Printf.sprintf
-               "%s dimension argument must be a dimension type (#N, #3, \
-                #Ds...), got %s"
-               name (type_to_string bad))
-      | [] ->
-          let is_vardims = function TyVarDims _ -> true | _ -> false in
-          if (name = "Vector" || name = "Matrix") && List.exists is_vardims dims
-          then
-            Some
-              (Printf.sprintf
-                 "%s does not support variadic dimensions (#N...). Use \
-                  T[#Ds...] instead"
-                 name)
-            (* Variadic dim can only appear once and must be the last dim arg *)
-          else if List.length (List.filter is_vardims dims) > 1 then
-            Some
-              (Printf.sprintf
-                 "%s cannot have multiple variadic dims — use a single #N... \
-                  as the last dimension"
-                 name)
-          else if
-            List.exists is_vardims dims
-            && not (is_vardims (List.nth dims (List.length dims - 1)))
-          then
-            Some
-              (Printf.sprintf
-                 "%s: variadic dimension (#N...) must be the last dimension \
-                  argument"
-                 name)
-          else None)
-  | _ -> None
+      | TyArray (_, dims) -> (
+          let invalid =
+            List.filter (fun d -> not (is_dim_type ~sess type_params d)) dims
+          in
+          match invalid with
+          | bad :: _ ->
+              Some
+                (Printf.sprintf
+                   "Array dimension argument must be a dimension type (#N, #3, \
+                    #Ds...), got %s"
+                   (type_to_string bad))
+          | [] ->
+              let is_vardims = function TyVarDims _ -> true | _ -> false in
+              if List.length (List.filter is_vardims dims) > 1 then
+                Some
+                  "Array type cannot have multiple variadic dims — use a \
+                   single #N... as the last dimension"
+              else if
+                List.exists is_vardims dims
+                && not (is_vardims (List.nth dims (List.length dims - 1)))
+              then
+                Some
+                  "Array type: variadic dimension (#N...) must be the last \
+                   dimension argument"
+              else None)
+      | TyNamed ((("Tensor" | "Vector" | "Matrix") as name), _ :: dims) -> (
+          let invalid =
+            List.filter (fun d -> not (is_dim_type ~sess type_params d)) dims
+          in
+          match invalid with
+          | bad :: _ ->
+              Some
+                (Printf.sprintf
+                   "%s dimension argument must be a dimension type (#N, #3, \
+                    #Ds...), got %s"
+                   name (type_to_string bad))
+          | [] ->
+              let is_vardims = function TyVarDims _ -> true | _ -> false in
+              if
+                (name = "Vector" || name = "Matrix")
+                && List.exists is_vardims dims
+              then
+                Some
+                  (Printf.sprintf
+                     "%s does not support variadic dimensions (#N...). Use \
+                      T[#Ds...] instead"
+                     name)
+                (* Variadic dim can only appear once and must be the last dim arg *)
+              else if List.length (List.filter is_vardims dims) > 1 then
+                Some
+                  (Printf.sprintf
+                     "%s cannot have multiple variadic dims — use a single \
+                      #N... as the last dimension"
+                     name)
+              else if
+                List.exists is_vardims dims
+                && not (is_vardims (List.nth dims (List.length dims - 1)))
+              then
+                Some
+                  (Printf.sprintf
+                     "%s: variadic dimension (#N...) must be the last \
+                      dimension argument"
+                     name)
+              else None)
+      | _ -> None)
 
 let validate_tensor_dims = validate_array_dims
 
@@ -1302,9 +1316,9 @@ module Dim = struct
     | TyNamed (name, []) when is_dim_var name -> true
     | _ -> false
 
-  (** Law 2: find the first negative concrete dim value in [ty], or [None]
-      if all are non-negative. [TyDimOp (DimSub, _, _)] can produce a
-      negative [TyConstInt] after [normalize]; callers validate. *)
+  (** Law 2: find the first non-positive concrete dim value in [ty], or [None]
+      if all are positive. [TyDimOp (DimSub, _, _)] can produce a non-positive
+      [TyConstInt] after [normalize]; callers validate. *)
   let find_negative = find_negative_dim
 
   (** Law 3: lift a dim or refinement to [Int] for value-context operations

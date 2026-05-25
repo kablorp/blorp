@@ -1,15 +1,20 @@
-(** Tests for scoped ParallelVector pipeline recognition and lowering. *)
+(** Tests for scoped ParallelVector/ParallelMatrix pipeline recognition and
+    lowering. *)
 
 open Blorp.Ast
 open Blorp.Core
-module P = Blorp.Core_parallel_vector_pipeline
+module P = Blorp.Core_parallel_tensor_pipeline
 
 let loc = dummy_loc
 let ty_int = TyNamed ("Int", [])
 let ty_void = TyNamed ("Void", [])
+let dim2 = TyConstInt 2
+let dim3 = TyConstInt 3
 let dim4 = TyConstInt 4
 let ty_vec elem = TyArray (elem, [ dim4 ])
 let ty_parallel_vec elem = TyNamed ("ParallelVector", [ elem; dim4 ])
+let ty_mat elem = TyArray (elem, [ dim2; dim3 ])
+let ty_parallel_mat elem = TyNamed ("ParallelMatrix", [ elem; dim2; dim3 ])
 let ty_func params return = TyFunc { params; return; is_pure = true }
 let mk ty desc = { desc; ty; loc }
 let cvar name ty = mk ty (CVar (Var.named name))
@@ -38,6 +43,10 @@ let def_vector_parallel = 1
 let def_parallel_vector_map = 2
 let def_parallel_vector_map_indexed = 3
 let def_parallel_vector_zip_map = 4
+let def_matrix_parallel = 5
+let def_parallel_matrix_map = 6
+let def_parallel_matrix_map_indexed = 7
+let def_parallel_matrix_zip_map = 8
 
 let std_func module_path name def_id =
   {
@@ -63,6 +72,13 @@ let std_decls =
          def_parallel_vector_map_indexed);
     decl_func
       (std_func "std/parallel_vector" "zip_map" def_parallel_vector_zip_map);
+    decl_func (std_func "std/matrix" "parallel" def_matrix_parallel);
+    decl_func (std_func "std/parallel_matrix" "map" def_parallel_matrix_map);
+    decl_func
+      (std_func "std/parallel_matrix" "map_indexed"
+         def_parallel_matrix_map_indexed);
+    decl_func
+      (std_func "std/parallel_matrix" "zip_map" def_parallel_matrix_zip_map);
   ]
 
 let map_call source f =
@@ -77,6 +93,19 @@ let zip_map_call source other f =
 
 let parallel_call source body =
   call_user def_vector_parallel "parallel" [ source; body ] (ty_vec ty_int)
+
+let matrix_map_call source f =
+  call_user def_parallel_matrix_map "map" [ source; f ] source.ty
+
+let matrix_map_indexed_call source f =
+  call_user def_parallel_matrix_map_indexed "map_indexed" [ source; f ]
+    source.ty
+
+let matrix_zip_map_call source other f =
+  call_user def_parallel_matrix_zip_map "zip_map" [ source; other; f ] source.ty
+
+let matrix_parallel_call source body =
+  call_user def_matrix_parallel "parallel" [ source; body ] (ty_mat ty_int)
 
 let app_decl body =
   decl_func
@@ -96,9 +125,17 @@ let chunk = cvar "chunk" (ty_parallel_vec ty_int)
 let source = cvar "values" (ty_vec ty_int)
 let other = cvar "other" (ty_vec ty_int)
 let other2 = cvar "other2" (ty_vec ty_int)
+let matrix_chunk = cvar "mchunk" (ty_parallel_mat ty_int)
+let matrix_source = cvar "matrix_values" (ty_mat ty_int)
+let matrix_other = cvar "matrix_other" (ty_mat ty_int)
+let matrix_other2 = cvar "matrix_other2" (ty_mat ty_int)
 let mapper = callback "mapper" [ ty_int ] ty_int
 let mapper2 = callback "mapper2" [ ty_int ] ty_int
 let indexed_mapper = callback "indexed_mapper" [ TyRange dim4; ty_int ] ty_int
+
+let matrix_indexed_mapper =
+  callback "matrix_indexed_mapper" [ TyRange dim2; TyRange dim3; ty_int ] ty_int
+
 let zipper = callback "zipper" [ ty_int; ty_int ] ty_int
 let zipper2 = callback "zipper2" [ ty_int; ty_int ] ty_int
 
@@ -106,10 +143,16 @@ let parallel_expr body =
   parallel_call source
     (lambda [ ("chunk", ty_parallel_vec ty_int) ] body (ty_parallel_vec ty_int))
 
+let matrix_parallel_expr body =
+  matrix_parallel_call matrix_source
+    (lambda
+       [ ("mchunk", ty_parallel_mat ty_int) ]
+       body (ty_parallel_mat ty_int))
+
 let fuse_expr expr =
   let reg = Blorp.Codegen_types.create_registry () in
-  match P.fuse_program ~reg (std_decls @ [ app_decl expr ]) with
-  | _std1 :: _std2 :: _std3 :: _std4 :: { cd_desc = CDFunc f; _ } :: _ -> (
+  match List.rev (P.fuse_program ~reg (std_decls @ [ app_decl expr ])) with
+  | { cd_desc = CDFunc f; _ } :: _ -> (
       match f.cf_body with
       | Some body -> body
       | None -> Alcotest.fail "expected app function body")
@@ -238,6 +281,91 @@ let test_non_chain_body_is_left_as_vector_parallel_call () =
       Alcotest.failf "expected unfused Vector.parallel call, got %s"
         (Blorp.Core.pp_to_string lowered)
 
+let test_matrix_map_chain_lowers_to_mmap_parallel () =
+  let expr =
+    matrix_parallel_expr
+      (matrix_map_call (matrix_map_call matrix_chunk mapper) mapper2)
+  in
+  let lowered = fuse_expr expr in
+  Alcotest.(check string)
+    "builtin" "blorp_mmap_parallel"
+    (lowered_builtin_name lowered)
+
+let test_matrix_indexed_chain_lowers_to_indexed_mmap_parallel () =
+  let expr =
+    matrix_parallel_expr
+      (matrix_map_indexed_call
+         (matrix_map_call matrix_chunk mapper)
+         matrix_indexed_mapper)
+  in
+  let lowered = fuse_expr expr in
+  Alcotest.(check string)
+    "builtin" "blorp_mmap_indexed_parallel"
+    (lowered_builtin_name lowered);
+  match (lowered_callback lowered).desc with
+  | CLambda lam ->
+      Alcotest.(check int) "callback arity" 3 (List.length lam.lam_params)
+  | _ -> Alcotest.fail "expected lowered callback lambda"
+
+let test_matrix_single_zip_chain_lowers_to_mzip_parallel () =
+  let expr =
+    matrix_parallel_expr
+      (matrix_map_call
+         (matrix_zip_map_call matrix_chunk matrix_other zipper)
+         mapper)
+  in
+  let lowered = fuse_expr expr in
+  Alcotest.(check string)
+    "builtin" "blorp_mzip_parallel"
+    (lowered_builtin_name lowered);
+  match (lowered_callback lowered).desc with
+  | CLambda lam ->
+      Alcotest.(check int) "callback arity" 2 (List.length lam.lam_params);
+      Alcotest.(check bool)
+        "side matrix is not loaded through a synthesized flat index" false
+        (contains_intrinsic "tensor_get_unchecked" lam.lam_body)
+  | _ -> Alcotest.fail "expected lowered callback lambda"
+
+let test_matrix_indexed_zip_chain_lowers_to_indexed_mzip_parallel () =
+  let expr =
+    matrix_parallel_expr
+      (matrix_map_call
+         (matrix_map_indexed_call
+            (matrix_zip_map_call matrix_chunk matrix_other zipper)
+            matrix_indexed_mapper)
+         mapper)
+  in
+  let lowered = fuse_expr expr in
+  Alcotest.(check string)
+    "builtin" "blorp_mzip_indexed_parallel"
+    (lowered_builtin_name lowered);
+  match (lowered_callback lowered).desc with
+  | CLambda lam ->
+      Alcotest.(check int) "callback arity" 4 (List.length lam.lam_params);
+      Alcotest.(check bool)
+        "side matrix is not loaded through a synthesized flat index" false
+        (contains_intrinsic "tensor_get_unchecked" lam.lam_body)
+  | _ -> Alcotest.fail "expected lowered callback lambda"
+
+let test_matrix_distinct_zip_matrices_lower_to_flat_indexed_mmap () =
+  let expr =
+    matrix_parallel_expr
+      (matrix_zip_map_call
+         (matrix_zip_map_call matrix_chunk matrix_other zipper)
+         matrix_other2 zipper2)
+  in
+  let lowered = fuse_expr expr in
+  Alcotest.(check string)
+    "builtin" "blorp_mmap_flat_indexed_parallel"
+    (lowered_builtin_name lowered);
+  match (lowered_callback lowered).desc with
+  | CLambda lam ->
+      Alcotest.(check int) "callback arity" 4 (List.length lam.lam_params);
+      Alcotest.(check bool)
+        "flat-indexed side-matrix load" true
+        (contains_intrinsic "tensor_get_unchecked" lam.lam_body)
+  | _ -> Alcotest.fail "expected lowered callback lambda"
+
 let suite =
   [
     ( "fusion",
@@ -254,5 +382,18 @@ let suite =
           `Quick test_distinct_zip_vectors_fall_back_to_indexed_vmap;
         Alcotest.test_case "non_chain_body_is_left_as_vector_parallel_call"
           `Quick test_non_chain_body_is_left_as_vector_parallel_call;
+        Alcotest.test_case "matrix_map_chain_lowers_to_mmap_parallel" `Quick
+          test_matrix_map_chain_lowers_to_mmap_parallel;
+        Alcotest.test_case
+          "matrix_indexed_chain_lowers_to_indexed_mmap_parallel" `Quick
+          test_matrix_indexed_chain_lowers_to_indexed_mmap_parallel;
+        Alcotest.test_case "matrix_single_zip_chain_lowers_to_mzip_parallel"
+          `Quick test_matrix_single_zip_chain_lowers_to_mzip_parallel;
+        Alcotest.test_case
+          "matrix_indexed_zip_chain_lowers_to_indexed_mzip_parallel" `Quick
+          test_matrix_indexed_zip_chain_lowers_to_indexed_mzip_parallel;
+        Alcotest.test_case
+          "matrix_distinct_zip_matrices_lower_to_flat_indexed_mmap" `Quick
+          test_matrix_distinct_zip_matrices_lower_to_flat_indexed_mmap;
       ] );
   ]

@@ -187,7 +187,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
       p
       |> Core_string_pipeline.fuse_program ~reg
       |> Core_collection_pipeline.fuse_program ~reg
-      |> Core_parallel_vector_pipeline.fuse_program ~reg
+      |> Core_parallel_tensor_pipeline.fuse_program ~reg
       |> Core_tensor_fusion.fuse_program ~reg
       |> Core_tuple_sroa.rewrite_program ~reg)
   |> run_stage Core_stage.Specialize (fun p ->

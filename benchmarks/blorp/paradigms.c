@@ -11080,7 +11080,7 @@ blorp_Vector* blorp_tensor_slice_row(blorp_Vector* tensor, long row_index, long 
 
 // Matrix multiplication (Int): C[M,N] = A[M,K] * B[K,N]
 // All tensors use flat row-major storage; m, k, n are dimension params from codegen
-blorp_Vector* blorp_tensor_matmul_int(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
+blorp_Vector* blorp_tensor_matrix_multiply_int(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
     if (!a || !b) return blorp_tensor_new_i64(m, m * n);
     if (m * k > a->capacity || k * n > b->capacity) return blorp_tensor_new_i64(m, m * n);
     blorp_Vector* result = blorp_tensor_new_i64(m, m * n);
@@ -11100,7 +11100,7 @@ blorp_Vector* blorp_tensor_matmul_int(blorp_Vector* a, blorp_Vector* b, long m, 
 }
 
 // Matrix multiplication (Float): C[M,N] = A[M,K] * B[K,N]
-blorp_Vector* blorp_tensor_matmul_float(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
+blorp_Vector* blorp_tensor_matrix_multiply_float(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
     if (!a || !b) return blorp_tensor_new_f64(m, m * n);
     if (m * k > a->capacity || k * n > b->capacity) return blorp_tensor_new_f64(m, m * n);
     blorp_Vector* result = blorp_tensor_new_f64(m, m * n);
@@ -11122,7 +11122,7 @@ blorp_Vector* blorp_tensor_matmul_float(blorp_Vector* a, blorp_Vector* b, long m
 
 // Matrix multiplication (Float32): C[M,N] = A[M,K] * B[K,N]
 // Uses packed float storage (4 bytes per element)
-blorp_Vector* blorp_tensor_matmul_float32(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
+blorp_Vector* blorp_tensor_matrix_multiply_float32(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
     if (!a || !b) return blorp_tensor_new_f32(m, m * n);
     if (m * k > a->capacity || k * n > b->capacity) return blorp_tensor_new_f32(m, m * n);
     blorp_Vector* result = blorp_tensor_new_f32(m, m * n);
@@ -11169,7 +11169,7 @@ blorp_Vector* blorp_tensor_transpose(blorp_Vector* mat, long rows, long cols) {
 }
 
 // Matrix-vector multiply (Float): y[i] = sum_j(W[i*n+j] * x[j])
-blorp_Vector* blorp_tensor_matvec_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_matrix_vector_multiply_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || n > x->capacity) return blorp_vector_new_f64(m);
     blorp_Vector* result = blorp_vector_new_f64(m);
     for (long i = 0; i < m; i++) {
@@ -11185,7 +11185,7 @@ blorp_Vector* blorp_tensor_matvec_float(blorp_Vector* w, blorp_Vector* x, long m
 }
 
 // Matrix-vector multiply (Int)
-blorp_Vector* blorp_tensor_matvec_int(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_matrix_vector_multiply_int(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || n > x->capacity) return blorp_vector_new_i64(m);
     blorp_Vector* result = blorp_vector_new_i64(m);
     for (long i = 0; i < m; i++) {
@@ -11199,7 +11199,7 @@ blorp_Vector* blorp_tensor_matvec_int(blorp_Vector* w, blorp_Vector* x, long m, 
 }
 
 // Matrix-vector multiply (Float32)
-blorp_Vector* blorp_tensor_matvec_float32(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_matrix_vector_multiply_float32(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || n > x->capacity) return blorp_vector_new_f32(m);
     blorp_Vector* result = blorp_vector_new_f32(m);
     for (long i = 0; i < m; i++) {
@@ -11212,9 +11212,9 @@ blorp_Vector* blorp_tensor_matvec_float32(blorp_Vector* w, blorp_Vector* x, long
     return result;
 }
 
-// Transpose-matvec: result[j] = sum_i(W[i,j] * x[i]) = W^T * x
+// Transposed matrix-vector multiply: result[j] = sum_i(W[i,j] * x[i]) = W^T * x
 // W is [m, n], x is [m], result is [n]. Avoids allocating a transposed matrix.
-blorp_Vector* blorp_tensor_matvec_t_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || m > x->capacity) return blorp_vector_new_f64(n);
     blorp_Vector* result = blorp_vector_new_f64(n);
     for (long j = 0; j < n; j++) {
@@ -11229,7 +11229,7 @@ blorp_Vector* blorp_tensor_matvec_t_float(blorp_Vector* w, blorp_Vector* x, long
     return result;
 }
 
-blorp_Vector* blorp_tensor_matvec_t_int(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_int(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || m > x->capacity) return blorp_vector_new_i64(n);
     blorp_Vector* result = blorp_vector_new_i64(n);
     for (long j = 0; j < n; j++) {
@@ -11242,7 +11242,7 @@ blorp_Vector* blorp_tensor_matvec_t_int(blorp_Vector* w, blorp_Vector* x, long m
     return result;
 }
 
-blorp_Vector* blorp_tensor_matvec_t_float32(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float32(blorp_Vector* w, blorp_Vector* x, long m, long n) {
     if (!w || !x || m * n > w->capacity || m > x->capacity) return blorp_vector_new_f32(n);
     blorp_Vector* result = blorp_vector_new_f32(n);
     for (long j = 0; j < n; j++) {

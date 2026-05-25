@@ -166,7 +166,8 @@ let trait_obligation_satisfied env ty trait_name =
 let is_scoped_parallel_type = function
   | TyNamed
       ( ( "ParallelList" | "std/list::ParallelList" | "ParallelVector"
-        | "std/vector::ParallelVector" ),
+        | "std/vector::ParallelVector" | "ParallelMatrix"
+        | "std/matrix::ParallelMatrix" ),
         _ ) ->
       true
   | _ -> false
@@ -3806,6 +3807,17 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         when n >= 0L && n < Int64.of_int bound ->
           let range_ty = TyRange (TyConstInt bound) in
           Ok (range_ty, with_inferred_type expr range_ty)
+      | LitInt 0L, Some (TyRange (TyVar name)) when Types.Dim.is_var_name name
+        ->
+          let range_ty = TyRange (TyVar name) in
+          Ok (range_ty, with_inferred_type expr range_ty)
+      | LitInt n, Some (TyRange (TyVar name)) when Types.Dim.is_var_name name ->
+          error loc
+            (Printf.sprintf
+               "Literal %Ld cannot be proven to fit generic range ..%s for \
+                every dimension; only 0 is always valid because dimensions are \
+                at least 1"
+               n name)
       | LitInt n, Some (TyConstInt expected_n) when n = Int64.of_int expected_n
         ->
           let n_int = Int64.to_int n in
@@ -5823,6 +5835,10 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
     via bounded loops, enumerate, or control-flow narrowing. *)
 and validate_index ctx loc idx dim coll' =
   let* idx_ty, idx' = infer_expected_value_expr ctx ty_int idx in
+  let normalized_dim ty = Types.Dim.normalize ty in
+  let dims_equal left right =
+    types_equal (normalized_dim left) (normalized_dim right)
+  in
   let subscript_bounds coll_name =
     let dim_bounds =
       match dim with
@@ -5842,6 +5858,78 @@ and validate_index ctx loc idx dim coll' =
         | Some bound -> bound :: dim_bounds
         | None -> dim_bounds)
     | None -> dim_bounds
+  in
+  let subscript_bounds_for_dim dim =
+    match normalized_dim dim with
+    | TyConstInt size -> (
+        match Refinement.constant_dim_bound size with
+        | Some bound -> [ bound ]
+        | None -> [])
+    | TyVar name when Types.Dim.is_var_name name -> (
+        match dimension_bound_opt name with
+        | Some bound -> [ bound ]
+        | None -> [])
+    | _ -> []
+  in
+  let range_type_fits_dim range_upper dim =
+    match (normalized_dim range_upper, normalized_dim dim) with
+    | TyConstInt range_bound, TyConstInt size -> range_bound <= size
+    | TyVar range_var, TyVar dim_var
+      when Types.Dim.is_var_name range_var && String.equal range_var dim_var ->
+        true
+    | _ -> false
+  in
+  let expr_range_type_fits_dim expr dim =
+    match expr_proof_semantic_type_opt expr with
+    | Some (TyRange range_upper) -> range_type_fits_dim range_upper dim
+    | _ -> false
+  in
+  let expr_or_binding_proves_dim expr dim =
+    expr_range_type_fits_dim expr dim
+    ||
+    let bounds = subscript_bounds_for_dim dim in
+    expr_proves_direct_range expr ~bounds
+    ||
+    match expr.expr_desc with
+    | EIdent name -> (
+        env_binding_proves_direct_range ctx.env name ~bounds
+        ||
+        match Env.get_var_type ctx.env name with
+        | Some (TyRange range_upper) -> range_type_fits_dim range_upper dim
+        | _ -> false)
+    | _ -> false
+  in
+  let static_dim_of_expr expr =
+    static_dim_from_expr ~semantic_type_of:expr_proof_semantic_type_opt expr
+  in
+  let product_dim_factor_pairs dim =
+    match normalized_dim dim with
+    | TyDimOp (DimMul, left, right) ->
+        let left = normalized_dim left in
+        let right = normalized_dim right in
+        if dims_equal left right then [ (left, right) ]
+        else [ (left, right); (right, left) ]
+    | _ -> []
+  in
+  let proves_flattened_row_major_index row stride col =
+    match static_dim_of_expr stride with
+    | None -> false
+    | Some stride_dim ->
+        product_dim_factor_pairs dim
+        |> List.exists (fun (row_dim, col_dim) ->
+            dims_equal stride_dim col_dim
+            && expr_or_binding_proves_dim row row_dim
+            && expr_or_binding_proves_dim col col_dim)
+  in
+  let expr_proves_flattened_row_major_index expr =
+    match expr.expr_desc with
+    | EBinary
+        ( Add,
+          ({ expr_desc = EBinary (Mul, row, stride); _ } as _scaled_row),
+          col ) ->
+        proves_flattened_row_major_index row stride col
+        || proves_flattened_row_major_index stride row col
+    | _ -> false
   in
   (* Range-typed values are proven in-bounds: ..#N is safe for dimension >= N *)
   match idx_ty with
@@ -6079,6 +6167,7 @@ and validate_index ctx loc idx dim coll' =
          v[i - k]. Expression proof payloads are authoritative; Env binding
          metadata is the fallback for transitional expression construction
          gaps. *)
+      | _ when expr_proves_flattened_row_major_index idx' -> Ok idx'
       | EBinary
           ( ((Add | Sub) as op),
             ({ expr_desc = EIdent idx_var; _ } as idx_base),

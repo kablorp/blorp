@@ -25,6 +25,9 @@ let of_type ~reg ty =
       | Ast.TyNamed (name, [ elem_ty; dim ])
         when type_name_is "ParallelVector" name ->
           Some { semantic_ty; elem_ty; dims = [ dim ] }
+      | Ast.TyNamed (name, [ elem_ty; rows; cols ])
+        when type_name_is "ParallelMatrix" name ->
+          Some { semantic_ty; elem_ty; dims = [ rows; cols ] }
       | _ -> None)
 
 let of_core ~reg (expr : Core.core) = of_type ~reg expr.ty

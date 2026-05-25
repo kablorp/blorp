@@ -645,6 +645,18 @@ static inline void* blorp_call2(blorp_Closure* closure, void* arg1, void* arg2) 
     return f(closure->env, arg1, arg2);
 }
 
+static inline void* blorp_call3(blorp_Closure* closure, void* arg1, void* arg2, void* arg3) {
+    typedef void* (*fn3_t)(void*, void*, void*, void*);
+    fn3_t f = (fn3_t)closure->func;
+    return f(closure->env, arg1, arg2, arg3);
+}
+
+static inline void* blorp_call4(blorp_Closure* closure, void* arg1, void* arg2, void* arg3, void* arg4) {
+    typedef void* (*fn4_t)(void*, void*, void*, void*, void*);
+    fn4_t f = (fn4_t)closure->func;
+    return f(closure->env, arg1, arg2, arg3, arg4);
+}
+
 // ============================================================================
 // Extern globals (defined in runtime.o)
 // ============================================================================
@@ -1285,16 +1297,16 @@ blorp_String* blorp_list_to_string_cb(blorp_List* list, blorp_String* (*elem_to_
 // (removed blorp_linspace — now IR intrinsic)
 blorp_Vector* blorp_vector_cross_float(blorp_Vector* a, blorp_Vector* b);
 blorp_Vector* blorp_tensor_slice_row(blorp_Vector* tensor, long row_index, long row_size, long result_first_dim);
-blorp_Vector* blorp_tensor_matmul_int(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
-blorp_Vector* blorp_tensor_matmul_float(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
-blorp_Vector* blorp_tensor_matmul_float32(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
+blorp_Vector* blorp_tensor_matrix_multiply_int(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
+blorp_Vector* blorp_tensor_matrix_multiply_float(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
+blorp_Vector* blorp_tensor_matrix_multiply_float32(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
 blorp_Vector* blorp_tensor_transpose(blorp_Vector* mat, long rows, long cols);
-blorp_Vector* blorp_tensor_matvec_int(blorp_Vector* w, blorp_Vector* x, long m, long n);
-blorp_Vector* blorp_tensor_matvec_float(blorp_Vector* w, blorp_Vector* x, long m, long n);
-blorp_Vector* blorp_tensor_matvec_t_float(blorp_Vector* w, blorp_Vector* x, long m, long n);
-blorp_Vector* blorp_tensor_matvec_t_int(blorp_Vector* w, blorp_Vector* x, long m, long n);
-blorp_Vector* blorp_tensor_matvec_t_float32(blorp_Vector* w, blorp_Vector* x, long m, long n);
-blorp_Vector* blorp_tensor_matvec_float32(blorp_Vector* w, blorp_Vector* x, long m, long n);
+blorp_Vector* blorp_tensor_matrix_vector_multiply_int(blorp_Vector* w, blorp_Vector* x, long m, long n);
+blorp_Vector* blorp_tensor_matrix_vector_multiply_float(blorp_Vector* w, blorp_Vector* x, long m, long n);
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float(blorp_Vector* w, blorp_Vector* x, long m, long n);
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_int(blorp_Vector* w, blorp_Vector* x, long m, long n);
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float32(blorp_Vector* w, blorp_Vector* x, long m, long n);
+blorp_Vector* blorp_tensor_matrix_vector_multiply_float32(blorp_Vector* w, blorp_Vector* x, long m, long n);
 blorp_Vector* blorp_tensor_outer_int(blorp_Vector* a, blorp_Vector* b, long m, long n);
 blorp_Vector* blorp_tensor_outer_float(blorp_Vector* a, blorp_Vector* b, long m, long n);
 blorp_Vector* blorp_tensor_outer_float32(blorp_Vector* a, blorp_Vector* b, long m, long n);
@@ -1674,9 +1686,17 @@ blorp_Vector* blorp_vector_zip(blorp_Vector* a, blorp_Vector* b);
 
 // Vector HOFs / Parallel Vector Ops
 blorp_Vector* blorp_vector_map(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc);
+blorp_Vector* blorp_matrix_map(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
+blorp_Vector* blorp_matrix_map_indexed(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
+blorp_Vector* blorp_matrix_zip_map(blorp_Vector* arr_a, blorp_Vector* arr_b, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
 blorp_Vector* blorp_vmap_parallel(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
 blorp_Vector* blorp_vmap_indexed_parallel(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
 blorp_Vector* blorp_vzip_parallel(blorp_Vector* arr_a, blorp_Vector* arr_b, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
+blorp_Vector* blorp_mmap_parallel(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
+blorp_Vector* blorp_mmap_indexed_parallel(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
+blorp_Vector* blorp_mzip_parallel(blorp_Vector* arr_a, blorp_Vector* arr_b, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
+blorp_Vector* blorp_mzip_indexed_parallel(blorp_Vector* arr_a, blorp_Vector* arr_b, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
+blorp_Vector* blorp_mmap_flat_indexed_parallel(blorp_Vector* arr, blorp_Closure* f, long result_elem_is_rc, uint8_t result_storage_mode, int16_t result_elem_size, uint8_t result_value_encoding);
 
 // Math Builtins
 long blorp_abs(long x);

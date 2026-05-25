@@ -100,10 +100,10 @@ let payload_is_stack_erased meta payload_ty =
   | _ -> false
 
 let is_builtin_managed_payload_name = function
-  | "String" | "List" | "ParallelList" | "ParallelVector" | "Dict" | "Set"
-  | "Tensor" | "Vector" | "Matrix" | "Bytes" | "Fixed" | "StringSlice"
-  | "MemStats" | "SchedulerStats" | "Builder" | "Slice" | "Task" | "Channel"
-  | "Stream" | "Option" | "Result" | "TcpListener" | "TcpStream"
+  | "String" | "List" | "ParallelList" | "ParallelVector" | "ParallelMatrix"
+  | "Dict" | "Set" | "Tensor" | "Vector" | "Matrix" | "Bytes" | "Fixed"
+  | "StringSlice" | "MemStats" | "SchedulerStats" | "Builder" | "Slice" | "Task"
+  | "Channel" | "Stream" | "Option" | "Result" | "TcpListener" | "TcpStream"
   | "ConcurrencyError" ->
       true
   | _ -> false

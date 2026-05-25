@@ -333,37 +333,43 @@ let test_generic_function_list_alloc_gets_layout_without_other_rewrites () =
             "generic specialization should only rewrite list allocation layout")
   | _ -> Alcotest.fail "expected one specialized function"
 
-let test_matvec_float_specializes_with_dims () =
+let test_matrix_vector_multiply_float_specializes_with_dims () =
   let w = cvar "w" (tensor ty_float [ 2; 3 ]) in
   let x = cvar "x" (tensor ty_float [ 3 ]) in
-  let e = call_builtin "blorp_tensor_matvec" [ w; x ] (tensor ty_float [ 2 ]) in
-  expect_builtin_with_dims "matvec float" "blorp_tensor_matvec_float" [ 2; 3 ] e
+  let e =
+    call_builtin "blorp_tensor_matrix_vector_multiply" [ w; x ]
+      (tensor ty_float [ 2 ])
+  in
+  expect_builtin_with_dims "matrix_vector_multiply float"
+    "blorp_tensor_matrix_vector_multiply_float" [ 2; 3 ] e
 
-let test_matvec_float32_specializes_with_dims () =
+let test_matrix_vector_multiply_float32_specializes_with_dims () =
   let w = cvar "w" (tensor ty_float32 [ 2; 3 ]) in
   let x = cvar "x" (tensor ty_float32 [ 3 ]) in
   let e =
-    call_builtin "blorp_tensor_matvec" [ w; x ] (tensor ty_float32 [ 2 ])
+    call_builtin "blorp_tensor_matrix_vector_multiply" [ w; x ]
+      (tensor ty_float32 [ 2 ])
   in
-  expect_builtin_with_dims "matvec float32" "blorp_tensor_matvec_float32"
-    [ 2; 3 ] e
+  expect_builtin_with_dims "matrix_vector_multiply float32"
+    "blorp_tensor_matrix_vector_multiply_float32" [ 2; 3 ] e
 
-let test_matvec_t_float_specializes_with_dims () =
+let test_transposed_matrix_vector_multiply_float_specializes_with_dims () =
   let w = cvar "w" (tensor ty_float [ 2; 3 ]) in
   let x = cvar "x" (tensor ty_float [ 2 ]) in
   let e =
-    call_builtin "blorp_tensor_matvec_t" [ w; x ] (tensor ty_float [ 3 ])
+    call_builtin "blorp_tensor_transposed_matrix_vector_multiply" [ w; x ]
+      (tensor ty_float [ 3 ])
   in
-  expect_builtin_with_dims "matvec_t float" "blorp_tensor_matvec_t_float"
-    [ 2; 3 ] e
+  expect_builtin_with_dims "transposed_matrix_vector_multiply float"
+    "blorp_tensor_transposed_matrix_vector_multiply_float" [ 2; 3 ] e
 
-let test_outer_int_specializes_with_dims () =
+let test_outer_multiply_int_specializes_with_dims () =
   let a = cvar "a" (tensor ty_int [ 2 ]) in
   let b = cvar "b" (tensor ty_int [ 3 ]) in
   let e = call_builtin "blorp_tensor_outer" [ a; b ] (tensor ty_int [ 2; 3 ]) in
   expect_builtin_with_dims "outer int" "blorp_tensor_outer_int" [ 2; 3 ] e
 
-let test_outer_float_specializes_with_dims () =
+let test_outer_multiply_float_specializes_with_dims () =
   let a = cvar "a" (tensor ty_float [ 2 ]) in
   let b = cvar "b" (tensor ty_float [ 3 ]) in
   let e =
@@ -371,15 +377,20 @@ let test_outer_float_specializes_with_dims () =
   in
   expect_builtin_with_dims "outer float" "blorp_tensor_outer_float" [ 2; 3 ] e
 
-let test_unknown_matvec_requires_resolved_builtin () =
+let test_unknown_matrix_vector_multiply_requires_resolved_builtin () =
   let w = cvar "w" (tensor ty_int [ 2; 2 ]) in
   let x = cvar "x" (tensor ty_int [ 2 ]) in
-  let e = call_unknown "matvec" [ w; x ] (tensor ty_int [ 2 ]) in
+  let e =
+    call_unknown "matrix_vector_multiply" [ w; x ] (tensor ty_int [ 2 ])
+  in
   match (specialize e).desc with
   | CCall (CKUnknown, _, _) -> ()
   | CCall (CKBuiltin name, _, _) ->
-      Alcotest.failf "unresolved matvec specialized to %s by name" name
-  | _ -> Alcotest.fail "expected unresolved matvec to remain a call"
+      Alcotest.failf
+        "unresolved matrix_vector_multiply specialized to %s by name" name
+  | _ ->
+      Alcotest.fail
+        "expected unresolved matrix_vector_multiply to remain a call"
 
 let test_float32_vector_fill_uses_packed_runtime () =
   let value = mk (CLit (LitFloat 0.0)) ty_float32 in
@@ -413,7 +424,7 @@ let test_alias_vector_length_constant_folds () =
       Alcotest.failf "alias vector length used runtime intrinsic %s" got
   | _ -> Alcotest.fail "alias vector length did not constant-fold"
 
-let test_alias_matvec_static_dims_specializes () =
+let test_alias_matrix_vector_multiply_static_dims_specializes () =
   let reg = Blorp.Codegen_types.create_registry () in
   Hashtbl.replace reg.type_aliases "Meters" ([], ty_float);
   Hashtbl.replace reg.type_aliases "Weights"
@@ -427,12 +438,13 @@ let test_alias_matvec_static_dims_specializes () =
   let w = cvar "w" (TyNamed ("Weights", [])) in
   let x = cvar "x" (TyNamed ("Inputs", [])) in
   let e =
-    call_builtin "blorp_tensor_matvec" [ w; x ] (TyNamed ("Outputs", []))
+    call_builtin "blorp_tensor_matrix_vector_multiply" [ w; x ]
+      (TyNamed ("Outputs", []))
   in
-  expect_builtin_with_dims_with_reg "alias matvec" reg
-    "blorp_tensor_matvec_float" [ 2; 3 ] e
+  expect_builtin_with_dims_with_reg "alias matrix_vector_multiply" reg
+    "blorp_tensor_matrix_vector_multiply_float" [ 2; 3 ] e
 
-let test_alias_matmul_static_dims_specializes () =
+let test_alias_matrix_multiply_static_dims_specializes () =
   let reg = Blorp.Codegen_types.create_registry () in
   Hashtbl.replace reg.type_aliases "Meters" ([], ty_float);
   Hashtbl.replace reg.type_aliases "Left"
@@ -450,10 +462,11 @@ let test_alias_matmul_static_dims_specializes () =
   let a = cvar "a" (TyNamed ("Left", [])) in
   let b = cvar "b" (TyNamed ("Right", [])) in
   let e =
-    call_builtin "blorp_tensor_matmul" [ a; b ] (TyNamed ("Product", []))
+    call_builtin "blorp_tensor_matrix_multiply" [ a; b ]
+      (TyNamed ("Product", []))
   in
-  expect_builtin_with_dims_with_reg "alias matmul" reg
-    "blorp_tensor_matmul_float" [ 2; 3; 4 ] e
+  expect_builtin_with_dims_with_reg "alias matrix_multiply" reg
+    "blorp_tensor_matrix_multiply_float" [ 2; 3; 4 ] e
 
 let test_float64_matrix_fill_uses_unboxed_runtime () =
   let value = mk (CLit (LitFloat 0.0)) ty_float in
@@ -1048,26 +1061,28 @@ let test_vector_norm_non_tensor_raises_core_error () =
     ~msg_contains:"vector_norm requires a tensor argument" (fun () ->
       ignore (specialize e))
 
-let test_matmul_non_tensor_operand_raises_core_error () =
+let test_matrix_multiply_non_tensor_operand_raises_core_error () =
   let a = cvar "a" ty_int in
   let b = cvar "b" (tensor ty_float [ 3; 4 ]) in
   let e =
-    call_builtin "blorp_tensor_matmul" [ a; b ] (tensor ty_float [ 2; 4 ])
+    call_builtin "blorp_tensor_matrix_multiply" [ a; b ]
+      (tensor ty_float [ 2; 4 ])
   in
   Blorp.Core_error.check_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
-    ~msg_contains:"matmul requires tensor operands" (fun () ->
+    ~msg_contains:"matrix_multiply requires tensor operands" (fun () ->
       ignore (specialize e))
 
-let test_matmul_non_tensor_right_operand_raises_core_error () =
+let test_matrix_multiply_non_tensor_right_operand_raises_core_error () =
   let a = cvar "a" (tensor ty_float [ 2; 3 ]) in
   let b = cvar "b" ty_int in
   let e =
-    call_builtin "blorp_tensor_matmul" [ a; b ] (tensor ty_float [ 2; 4 ])
+    call_builtin "blorp_tensor_matrix_multiply" [ a; b ]
+      (tensor ty_float [ 2; 4 ])
   in
   Blorp.Core_error.check_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
-    ~msg_contains:"matmul requires tensor operands" (fun () ->
+    ~msg_contains:"matrix_multiply requires tensor operands" (fun () ->
       ignore (specialize e))
 
 let test_vector_map_non_tensor_result_raises_core_error () =
@@ -1078,7 +1093,7 @@ let test_vector_map_non_tensor_result_raises_core_error () =
   let e = call_builtin "blorp_vector_map" [ v; f ] ty_list_int in
   Blorp.Core_error.check_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
-    ~msg_contains:"vector map result must be a tensor" (fun () ->
+    ~msg_contains:"tensor map result must be a tensor" (fun () ->
       ignore (specialize e))
 
 let test_vector_map_value_record_result_sets_release_flag () =
@@ -1092,6 +1107,33 @@ let test_vector_map_value_record_result_sets_release_flag () =
   let e = call_builtin "blorp_vector_map" [ v; f ] (tensor accel [ 4 ]) in
   expect_builtin_last_int_with_reg "value record vector map" reg
     "blorp_vector_map" 1 e
+
+let test_matrix_map_value_record_result_sets_release_flag () =
+  let reg = Blorp.Codegen_types.create_registry () in
+  Hashtbl.replace reg.value_records "ProbeAccel" ();
+  let accel = TyNamed ("ProbeAccel", []) in
+  let m = cvar "m" (tensor ty_float [ 2; 3 ]) in
+  let f =
+    cvar "f" (TyFunc { params = [ ty_float ]; return = accel; is_pure = true })
+  in
+  let e = call_builtin "blorp_matrix_map" [ m; f ] (tensor accel [ 2; 3 ]) in
+  expect_builtin_last_int_with_reg "value record matrix map" reg
+    "blorp_matrix_map" 1 e
+
+let test_matrix_zip_map_scalar_result_clears_release_flag () =
+  let reg = Blorp.Codegen_types.create_registry () in
+  let a = cvar "a" (tensor ty_float [ 2; 3 ]) in
+  let b = cvar "b" (tensor ty_float [ 2; 3 ]) in
+  let f =
+    cvar "f"
+      (TyFunc
+         { params = [ ty_float; ty_float ]; return = ty_float; is_pure = true })
+  in
+  let e =
+    call_builtin "blorp_matrix_zip_map" [ a; b; f ] (tensor ty_float [ 2; 3 ])
+  in
+  expect_builtin_last_int_with_reg "scalar matrix zip_map" reg
+    "blorp_matrix_zip_map" 0 e
 
 let test_list_parallel_value_record_result_sets_release_flag () =
   let reg = Blorp.Codegen_types.create_registry () in
@@ -1164,18 +1206,19 @@ let suite =
       ] );
     ( "matrix_builtins",
       [
-        Alcotest.test_case "matvec_float" `Quick
-          test_matvec_float_specializes_with_dims;
-        Alcotest.test_case "matvec_float32" `Quick
-          test_matvec_float32_specializes_with_dims;
-        Alcotest.test_case "matvec_t_float" `Quick
-          test_matvec_t_float_specializes_with_dims;
-        Alcotest.test_case "outer_int" `Quick
-          test_outer_int_specializes_with_dims;
-        Alcotest.test_case "outer_float" `Quick
-          test_outer_float_specializes_with_dims;
-        Alcotest.test_case "unknown_matvec_requires_resolved_builtin" `Quick
-          test_unknown_matvec_requires_resolved_builtin;
+        Alcotest.test_case "matrix_vector_multiply_float" `Quick
+          test_matrix_vector_multiply_float_specializes_with_dims;
+        Alcotest.test_case "matrix_vector_multiply_float32" `Quick
+          test_matrix_vector_multiply_float32_specializes_with_dims;
+        Alcotest.test_case "transposed_matrix_vector_multiply_float" `Quick
+          test_transposed_matrix_vector_multiply_float_specializes_with_dims;
+        Alcotest.test_case "outer_multiply_int" `Quick
+          test_outer_multiply_int_specializes_with_dims;
+        Alcotest.test_case "outer_multiply_float" `Quick
+          test_outer_multiply_float_specializes_with_dims;
+        Alcotest.test_case
+          "unknown_matrix_vector_multiply_requires_resolved_builtin" `Quick
+          test_unknown_matrix_vector_multiply_requires_resolved_builtin;
       ] );
     ( "float32_tensor_specialization",
       [
@@ -1185,10 +1228,11 @@ let suite =
           test_float64_vector_fill_uses_unboxed_runtime;
         Alcotest.test_case "alias_vector_length_constant_folds" `Quick
           test_alias_vector_length_constant_folds;
-        Alcotest.test_case "alias_matvec_static_dims_specializes" `Quick
-          test_alias_matvec_static_dims_specializes;
-        Alcotest.test_case "alias_matmul_static_dims_specializes" `Quick
-          test_alias_matmul_static_dims_specializes;
+        Alcotest.test_case
+          "alias_matrix_vector_multiply_static_dims_specializes" `Quick
+          test_alias_matrix_vector_multiply_static_dims_specializes;
+        Alcotest.test_case "alias_matrix_multiply_static_dims_specializes"
+          `Quick test_alias_matrix_multiply_static_dims_specializes;
         Alcotest.test_case "float64_matrix_fill_unboxed" `Quick
           test_float64_matrix_fill_uses_unboxed_runtime;
         Alcotest.test_case "bool_vector_fill_packed" `Quick
@@ -1290,14 +1334,20 @@ let suite =
           `Quick test_tensor_peel_nonconstant_dims_raise_core_error;
         Alcotest.test_case "vector_norm_non_tensor_raises_core_error" `Quick
           test_vector_norm_non_tensor_raises_core_error;
-        Alcotest.test_case "matmul_non_tensor_operand_raises_core_error" `Quick
-          test_matmul_non_tensor_operand_raises_core_error;
-        Alcotest.test_case "matmul_non_tensor_right_operand_raises_core_error"
-          `Quick test_matmul_non_tensor_right_operand_raises_core_error;
+        Alcotest.test_case
+          "matrix_multiply_non_tensor_operand_raises_core_error" `Quick
+          test_matrix_multiply_non_tensor_operand_raises_core_error;
+        Alcotest.test_case
+          "matrix_multiply_non_tensor_right_operand_raises_core_error" `Quick
+          test_matrix_multiply_non_tensor_right_operand_raises_core_error;
         Alcotest.test_case "vector_map_non_tensor_result_raises_core_error"
           `Quick test_vector_map_non_tensor_result_raises_core_error;
         Alcotest.test_case "vector_map_value_record_result_sets_release_flag"
           `Quick test_vector_map_value_record_result_sets_release_flag;
+        Alcotest.test_case "matrix_map_value_record_result_sets_release_flag"
+          `Quick test_matrix_map_value_record_result_sets_release_flag;
+        Alcotest.test_case "matrix_zip_map_scalar_result_clears_release_flag"
+          `Quick test_matrix_zip_map_scalar_result_clears_release_flag;
         Alcotest.test_case "list_parallel_value_record_result_sets_release_flag"
           `Quick test_list_parallel_value_record_result_sets_release_flag;
         Alcotest.test_case "vector_map_scalar_result_clears_release_flag" `Quick

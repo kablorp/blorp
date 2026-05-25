@@ -635,10 +635,10 @@ let test_std_synthesis_rejects_malformed_signatures () =
   expect_no_synthesis ~module_path:"std/vector" "dot"
     [ param "a" vector_int; param "b" (ty_list ty_int) ]
     ty_int;
-  expect_no_synthesis ~module_path:"std/matrix" "matmul"
+  expect_no_synthesis ~module_path:"std/matrix" "matrix_multiply"
     [ param "a" (ty_list ty_int); param "b" matrix_int ]
     matrix_int;
-  expect_no_synthesis ~module_path:"std/matrix" "matmul"
+  expect_no_synthesis ~module_path:"std/matrix" "matrix_multiply"
     [ param "a" matrix_int; param "b" (ty_list ty_int) ]
     matrix_int;
   expect_no_synthesis ~module_path:"std/hash" "sha256"
@@ -948,33 +948,35 @@ let test_tensor_length_synthesizes_from_specs () =
 let test_matrix_c_wrappers_synthesize_from_specs () =
   let left_matrix = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
   let right_matrix = TyArray (ty_int, [ TyConstInt 3; TyConstInt 4 ]) in
-  let matmul_result = TyArray (ty_int, [ TyConstInt 2; TyConstInt 4 ]) in
+  let matrix_multiply_result =
+    TyArray (ty_int, [ TyConstInt 2; TyConstInt 4 ])
+  in
   let transposed = TyArray (ty_int, [ TyConstInt 3; TyConstInt 2 ]) in
   let vector2 = ty_vector ty_int 2 in
   let vector3 = ty_vector ty_int 3 in
   let outer_result = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
   [
-    ( "matmul",
+    ( "matrix_multiply",
       [ param "a" left_matrix; param "b" right_matrix ],
-      matmul_result,
-      "blorp_tensor_matmul",
+      matrix_multiply_result,
+      "blorp_tensor_matrix_multiply",
       2 );
     ( "transpose",
       [ param "m" left_matrix ],
       transposed,
       "blorp_tensor_transpose",
       1 );
-    ( "matvec",
+    ( "matrix_vector_multiply",
       [ param "m" left_matrix; param "v" vector3 ],
       vector2,
-      "blorp_tensor_matvec",
+      "blorp_tensor_matrix_vector_multiply",
       2 );
-    ( "matvec_t",
+    ( "transposed_matrix_vector_multiply",
       [ param "m" left_matrix; param "v" vector2 ],
       vector3,
-      "blorp_tensor_matvec_t",
+      "blorp_tensor_transposed_matrix_vector_multiply",
       2 );
-    ( "outer",
+    ( "outer_multiply",
       [ param "a" vector2; param "b" vector3 ],
       outer_result,
       "blorp_tensor_outer",
