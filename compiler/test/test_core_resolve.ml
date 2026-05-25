@@ -623,15 +623,15 @@ let test_resolve_imported_matrix_kernels_to_builtins () =
   let vector_3 = cvar "v3" (tensor ty_int [ 3 ]) in
   let cases =
     [
-      ( "matrix_vector_multiply",
+      ( "multiply_vector",
         "blorp_tensor_matrix_vector_multiply",
         [ matrix; vector_3 ],
         tensor ty_int [ 2 ] );
-      ( "transposed_matrix_vector_multiply",
+      ( "multiply_transposed_vector",
         "blorp_tensor_transposed_matrix_vector_multiply",
         [ matrix; vector_2 ],
         tensor ty_int [ 3 ] );
-      ( "outer_multiply",
+      ( "outer",
         "blorp_tensor_outer",
         [ vector_2; vector_3 ],
         tensor ty_int [ 2; 3 ] );

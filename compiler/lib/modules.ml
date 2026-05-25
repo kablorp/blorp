@@ -422,28 +422,54 @@ let renamed_std_export_hint (m : loaded_module) (name : string) : string option
           "'set_at' was renamed to 'set_cell'; write `import: matrix: set_cell`"
     | "matrix", "matmul" ->
         Some
-          "'matmul' was renamed to 'matrix_multiply'; write `import: matrix: \
-           matrix_multiply`"
+          "'matmul' was renamed to 'multiply'; write `import: matrix: multiply`"
+    | "matrix", "matrix_multiply" ->
+        Some
+          "'matrix_multiply' was renamed to 'multiply'; write `import: matrix: \
+           multiply`"
     | "matrix", "matvec" ->
         Some
-          "'matvec' was renamed to 'matrix_vector_multiply'; write `import: \
-           matrix: matrix_vector_multiply`"
+          "'matvec' was renamed to 'multiply_vector'; write `import: matrix: \
+           multiply_vector`"
+    | "matrix", "matrix_vector_multiply" ->
+        Some
+          "'matrix_vector_multiply' was renamed to 'multiply_vector'; write \
+           `import: matrix: multiply_vector`"
     | "matrix", "matvec_t" ->
         Some
-          "'matvec_t' was renamed to 'transposed_matrix_vector_multiply'; \
-           write `import: matrix: transposed_matrix_vector_multiply`"
-    | "matrix", "outer" ->
+          "'matvec_t' was renamed to 'multiply_transposed_vector'; write \
+           `import: matrix: multiply_transposed_vector`"
+    | "matrix", "transposed_matrix_vector_multiply" ->
         Some
-          "'outer' was renamed to 'outer_multiply'; write `import: matrix: \
-           outer_multiply`"
+          "'transposed_matrix_vector_multiply' was renamed to \
+           'multiply_transposed_vector'; write `import: matrix: \
+           multiply_transposed_vector`"
     | "matrix", "outer_product" ->
         Some
-          "'outer_product' was renamed to 'outer_multiply'; write `import: \
-           matrix: outer_multiply`"
-    | "matrix", "product" ->
+          "'outer_product' was renamed to 'outer'; write `import: matrix: \
+           outer`"
+    | "matrix", "outer_multiply" ->
         Some
-          "'product' was renamed to 'cell_product'; write `import: matrix: \
-           cell_product`"
+          "'outer_multiply' was renamed to 'outer'; write `import: matrix: \
+           outer`"
+    | "matrix", "cell_product" ->
+        Some
+          "'cell_product' was renamed to 'product'; write `import: matrix: \
+           product`"
+    | "matrix", "identity_matrix" ->
+        Some
+          "'identity_matrix' was renamed to 'identity'; write `import: matrix: \
+           identity`"
+    | "vector", "cumsum" ->
+        Some
+          "'cumsum' was renamed to 'cumulative_sum'; write `import: vector: \
+           cumulative_sum`"
+    | "vector", "vector_exp" ->
+        Some "'vector_exp' was renamed to 'exp'; write `import: vector: exp`"
+    | "vector", "vector_log" ->
+        Some "'vector_log' was renamed to 'log'; write `import: vector: log`"
+    | "vector", "vector_sqrt" ->
+        Some "'vector_sqrt' was renamed to 'sqrt'; write `import: vector: sqrt`"
     | _ -> None
 
 (** Suggest a similar export name for typo correction.

@@ -10635,6 +10635,28 @@ blorp_Vector* blorp_tensor_matrix_multiply_float32(blorp_Vector* a, blorp_Vector
     return result;
 }
 
+#ifdef __FLT16_MAX__
+// Matrix multiplication (Float16): C[M,N] = A[M,K] * B[K,N]
+// Float16 tensors use boxed storage, but accumulation uses float for stability.
+blorp_Vector* blorp_tensor_matrix_multiply_float16(blorp_Vector* a, blorp_Vector* b, long m, long k, long n) {
+    if (!a || !b) return blorp_tensor_new(m, m * n);
+    if (m * k > a->capacity || k * n > b->capacity) return blorp_tensor_new(m, m * n);
+    blorp_Vector* result = blorp_tensor_new(m, m * n);
+    for (long i = 0; i < m; i++) {
+        for (long j = 0; j < n; j++) {
+            float acc = 0.0f;
+            for (long p = 0; p < k; p++) {
+                float av = (float)blorp_vector_read_f16(a, i * k + p);
+                float bv = (float)blorp_vector_read_f16(b, p * n + j);
+                acc += av * bv;
+            }
+            blorp_vector_write_f16(result, i * n + j, (_Float16)acc);
+        }
+    }
+    return result;
+}
+#endif
+
 // Matrix transpose: result[j*rows+i] = src[i*cols+j]
 // Type-generic (operates on void* elements)
 blorp_Vector* blorp_tensor_transpose(blorp_Vector* mat, long rows, long cols) {
@@ -10706,6 +10728,21 @@ blorp_Vector* blorp_tensor_matrix_vector_multiply_float32(blorp_Vector* w, blorp
     return result;
 }
 
+#ifdef __FLT16_MAX__
+blorp_Vector* blorp_tensor_matrix_vector_multiply_float16(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+    if (!w || !x || m * n > w->capacity || n > x->capacity) return blorp_vector_new(m);
+    blorp_Vector* result = blorp_vector_new(m);
+    for (long i = 0; i < m; i++) {
+        float acc = 0.0f;
+        for (long j = 0; j < n; j++) {
+            acc += (float)blorp_vector_read_f16(w, i * n + j) * (float)blorp_vector_read_f16(x, j);
+        }
+        blorp_vector_write_f16(result, i, (_Float16)acc);
+    }
+    return result;
+}
+#endif
+
 // Transposed matrix-vector multiply: result[j] = sum_i(W[i,j] * x[i]) = W^T * x
 // W is [m, n], x is [m], result is [n]. Avoids allocating a transposed matrix.
 blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float(blorp_Vector* w, blorp_Vector* x, long m, long n) {
@@ -10749,6 +10786,21 @@ blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float32(blorp_Vecto
     return result;
 }
 
+#ifdef __FLT16_MAX__
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float16(blorp_Vector* w, blorp_Vector* x, long m, long n) {
+    if (!w || !x || m * n > w->capacity || m > x->capacity) return blorp_vector_new(n);
+    blorp_Vector* result = blorp_vector_new(n);
+    for (long j = 0; j < n; j++) {
+        float acc = 0.0f;
+        for (long i = 0; i < m; i++) {
+            acc += (float)blorp_vector_read_f16(w, i * n + j) * (float)blorp_vector_read_f16(x, i);
+        }
+        blorp_vector_write_f16(result, j, (_Float16)acc);
+    }
+    return result;
+}
+#endif
+
 // Outer product (Float): result[i*n+j] = a[i] * b[j]
 blorp_Vector* blorp_tensor_outer_float(blorp_Vector* a, blorp_Vector* b, long m, long n) {
     if (!a || !b || m > a->capacity || n > b->capacity) return blorp_tensor_new_f64(m, m * n);
@@ -10788,6 +10840,21 @@ blorp_Vector* blorp_tensor_outer_float32(blorp_Vector* a, blorp_Vector* b, long 
     }
     return result;
 }
+
+#ifdef __FLT16_MAX__
+blorp_Vector* blorp_tensor_outer_float16(blorp_Vector* a, blorp_Vector* b, long m, long n) {
+    if (!a || !b || m > a->capacity || n > b->capacity) return blorp_tensor_new(m, m * n);
+    blorp_Vector* result = blorp_tensor_new(m, m * n);
+    for (long i = 0; i < m; i++) {
+        float va = (float)blorp_vector_read_f16(a, i);
+        for (long j = 0; j < n; j++) {
+            float vb = (float)blorp_vector_read_f16(b, j);
+            blorp_vector_write_f16(result, i * n + j, (_Float16)(va * vb));
+        }
+    }
+    return result;
+}
+#endif
 
 // Generic length() function
 long blorp_length(void* collection) {

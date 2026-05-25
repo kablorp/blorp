@@ -1084,7 +1084,7 @@ let std_body_specs =
       spec ~return_shape:(ReturnNamed "Float") "std/vector" "mean" 1
         ~param_shapes:[ ParamTensor ] FirstParamTensor;
       spec ~return_shape:ReturnTensor ~param_shapes:[ ParamTensor ] "std/vector"
-        "cumsum" 1 FirstParamTensor;
+        "cumulative_sum" 1 FirstParamTensor;
       spec
         ~param_shapes:[ ParamTensor; ParamTensor ]
         "std/vector" "dot" 2 FirstParamTensor;
@@ -1097,22 +1097,22 @@ let std_body_specs =
       matrix_builtin_spec ~return_shape:ReturnTensor
         ~c_name:"blorp_tensor_matrix_multiply"
         ~param_shapes:[ ParamTensor; ParamTensor ]
-        "matrix_multiply" 2 FirstParamTensor;
+        "multiply" 2 FirstParamTensor;
       matrix_builtin_spec ~return_shape:ReturnTensor
         ~c_name:"blorp_tensor_transpose" "transpose" 1
         ~param_shapes:[ ParamTensor ] FirstParamTensor;
       matrix_builtin_spec ~return_shape:ReturnTensor
         ~c_name:"blorp_tensor_matrix_vector_multiply"
         ~param_shapes:[ ParamTensor; ParamTensor ]
-        "matrix_vector_multiply" 2 FirstParamTensor;
+        "multiply_vector" 2 FirstParamTensor;
       matrix_builtin_spec ~return_shape:ReturnTensor
         ~c_name:"blorp_tensor_transposed_matrix_vector_multiply"
         ~param_shapes:[ ParamTensor; ParamTensor ]
-        "transposed_matrix_vector_multiply" 2 FirstParamTensor;
+        "multiply_transposed_vector" 2 FirstParamTensor;
       matrix_builtin_spec ~return_shape:ReturnTensor
         ~c_name:"blorp_tensor_outer"
         ~param_shapes:[ ParamTensor; ParamTensor ]
-        "outer_multiply" 2 FirstParamTensor;
+        "outer" 2 FirstParamTensor;
     ]
   in
   let hash_specs =
@@ -1238,7 +1238,8 @@ let has_post_mono_synthesis (name : string) : bool =
   | "map" | "filter" | "get_or" | "entries" ->
       true
   | "set" -> true
-  | "sum" | "product" | "dot" | "max" | "min" | "mean" | "cumsum" | "scale" ->
+  | "sum" | "product" | "dot" | "max" | "min" | "mean" | "cumulative_sum"
+  | "scale" ->
       true
   | _ -> false
 
@@ -8495,7 +8496,7 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
                     (mk return_ty (CCast (vr "__n" ty_int, return_ty)))
                     return_ty))
               return_ty))
-  | "cumsum"
+  | "cumulative_sum"
     when List.length params = 1 && is_concrete_tensor (param_at 0).cp_ty ->
       let p = param_at 0 in
       let info = tensor_elem_info p.cp_ty in
@@ -8558,7 +8559,8 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
                            ]
                            ty_void )))
                  (vr "__result" return_ty))))
-  | ("sum" | "product" | "dot" | "max" | "min" | "mean" | "cumsum" | "scale")
+  | "sum" | "product" | "dot" | "max" | "min" | "mean" | "cumulative_sum"
+  | "scale"
     when match params with
          | p :: _ ->
              Option.is_some (unsupported_concrete_numeric_tensor p.cp_ty)

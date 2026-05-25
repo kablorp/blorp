@@ -1300,6 +1300,9 @@ blorp_Vector* blorp_tensor_slice_row(blorp_Vector* tensor, long row_index, long 
 blorp_Vector* blorp_tensor_matrix_multiply_int(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
 blorp_Vector* blorp_tensor_matrix_multiply_float(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
 blorp_Vector* blorp_tensor_matrix_multiply_float32(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
+#ifdef __FLT16_MAX__
+blorp_Vector* blorp_tensor_matrix_multiply_float16(blorp_Vector* a, blorp_Vector* b, long m, long k, long n);
+#endif
 blorp_Vector* blorp_tensor_transpose(blorp_Vector* mat, long rows, long cols);
 blorp_Vector* blorp_tensor_matrix_vector_multiply_int(blorp_Vector* w, blorp_Vector* x, long m, long n);
 blorp_Vector* blorp_tensor_matrix_vector_multiply_float(blorp_Vector* w, blorp_Vector* x, long m, long n);
@@ -1307,9 +1310,16 @@ blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float(blorp_Vector*
 blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_int(blorp_Vector* w, blorp_Vector* x, long m, long n);
 blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float32(blorp_Vector* w, blorp_Vector* x, long m, long n);
 blorp_Vector* blorp_tensor_matrix_vector_multiply_float32(blorp_Vector* w, blorp_Vector* x, long m, long n);
+#ifdef __FLT16_MAX__
+blorp_Vector* blorp_tensor_matrix_vector_multiply_float16(blorp_Vector* w, blorp_Vector* x, long m, long n);
+blorp_Vector* blorp_tensor_transposed_matrix_vector_multiply_float16(blorp_Vector* w, blorp_Vector* x, long m, long n);
+#endif
 blorp_Vector* blorp_tensor_outer_int(blorp_Vector* a, blorp_Vector* b, long m, long n);
 blorp_Vector* blorp_tensor_outer_float(blorp_Vector* a, blorp_Vector* b, long m, long n);
 blorp_Vector* blorp_tensor_outer_float32(blorp_Vector* a, blorp_Vector* b, long m, long n);
+#ifdef __FLT16_MAX__
+blorp_Vector* blorp_tensor_outer_float16(blorp_Vector* a, blorp_Vector* b, long m, long n);
+#endif
 long blorp_length(void* collection);
 
 // Bytes

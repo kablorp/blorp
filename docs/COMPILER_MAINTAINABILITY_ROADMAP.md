@@ -305,7 +305,7 @@ Progress:
   tensor/vector/matrix wrapper bodies where non-receiver arguments are concrete
   parts of the std signature.
 - Added wrapper collision regressions for bytes append/blit, time
-  `from_parts`/`format_time`, stream range/take, vector dot, matrix matrix_multiply, and
+  `from_parts`/`format_time`, stream range/take, vector dot, matrix multiply, and
   hash HMAC calls with malformed later arguments.
 - Added an explicit function-parameter shape to the synthesized-body spec
   matcher and used it for list, set, and stream callback positions.
@@ -400,8 +400,8 @@ Progress:
 - Added resolver coverage for bare, imported, module-qualified, and prefixed
   debug reflection calls, plus specialization coverage proving unresolved
   reflection-shaped names no longer fold by name.
-- Matrix tensor kernels (`matrix_vector_multiply`,
-  `transposed_matrix_vector_multiply`, `outer_multiply`) now resolve through the
+- Matrix tensor kernels (`multiply_vector`,
+  `multiply_transposed_vector`, `outer`) now resolve through the
   module-aware builtin table to typed placeholder C builtins. `Core_specialize`
   still appends dimensions and selects the element-specific runtime entry, but
   no longer recognizes those operations from `CKUnknown` source names.

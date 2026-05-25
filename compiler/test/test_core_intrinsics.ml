@@ -635,10 +635,10 @@ let test_std_synthesis_rejects_malformed_signatures () =
   expect_no_synthesis ~module_path:"std/vector" "dot"
     [ param "a" vector_int; param "b" (ty_list ty_int) ]
     ty_int;
-  expect_no_synthesis ~module_path:"std/matrix" "matrix_multiply"
+  expect_no_synthesis ~module_path:"std/matrix" "multiply"
     [ param "a" (ty_list ty_int); param "b" matrix_int ]
     matrix_int;
-  expect_no_synthesis ~module_path:"std/matrix" "matrix_multiply"
+  expect_no_synthesis ~module_path:"std/matrix" "multiply"
     [ param "a" matrix_int; param "b" (ty_list ty_int) ]
     matrix_int;
   expect_no_synthesis ~module_path:"std/hash" "sha256"
@@ -956,7 +956,7 @@ let test_matrix_c_wrappers_synthesize_from_specs () =
   let vector3 = ty_vector ty_int 3 in
   let outer_result = TyArray (ty_int, [ TyConstInt 2; TyConstInt 3 ]) in
   [
-    ( "matrix_multiply",
+    ( "multiply",
       [ param "a" left_matrix; param "b" right_matrix ],
       matrix_multiply_result,
       "blorp_tensor_matrix_multiply",
@@ -966,17 +966,17 @@ let test_matrix_c_wrappers_synthesize_from_specs () =
       transposed,
       "blorp_tensor_transpose",
       1 );
-    ( "matrix_vector_multiply",
+    ( "multiply_vector",
       [ param "m" left_matrix; param "v" vector3 ],
       vector2,
       "blorp_tensor_matrix_vector_multiply",
       2 );
-    ( "transposed_matrix_vector_multiply",
+    ( "multiply_transposed_vector",
       [ param "m" left_matrix; param "v" vector2 ],
       vector3,
       "blorp_tensor_transposed_matrix_vector_multiply",
       2 );
-    ( "outer_multiply",
+    ( "outer",
       [ param "a" vector2; param "b" vector3 ],
       outer_result,
       "blorp_tensor_outer",

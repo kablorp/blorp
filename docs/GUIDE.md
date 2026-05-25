@@ -650,31 +650,31 @@ use explicit names from `std/matrix`.
 
 ```blorp
 import:
-    matrix: matrix_multiply, matrix_vector_multiply, outer_multiply, transpose
+    matrix: multiply, multiply_vector, outer, transpose
 
 
 a: Float[#2, #3] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}}
 b: Float[#3, #2] = {{7.0, 8.0}, {9.0, 10.0}, {11.0, 12.0}}
-result: Float[#2, #2] = a.matrix_multiply(b)
+result: Float[#2, #2] = a.multiply(b)
 
 weights: Float[#2, #3] = a
 input: Float[#3] = {1.0, 0.5, 0.25}
-output: Float[#2] = weights.matrix_vector_multiply(input)
-outer: Float[#2, #3] = output.outer_multiply(input)
+output: Float[#2] = weights.multiply_vector(input)
+outer_result: Float[#2, #3] = output.outer(input)
 
 scaled: Float[#2, #3] = a * 2.0       -- scalar broadcast
 same_shape: Float[#2, #3] = a * a     -- elementwise
 flipped: Float[#3, #2] = a.transpose()
 ```
 
-The dedicated matrix kernels currently support `Int`, `Float`, and `Float32`
-elements through the `MatrixNumeric` trait. Other element types can still use
+The dedicated matrix kernels support the standard `Numeric` element types:
+`Int`, `Float`, `Float32`, and `Float16`. Other element types can still use
 shape-preserving helpers such as `map`, `zip_map`, `min`, `max`, `diagonal`,
 and row/column access when their trait bounds are satisfied.
 
 Shape-preserving matrix transforms use explicit higher-order helpers. `map`,
 `map_indexed`, and `zip_map` return a matrix with the same row and column
-dimensions. `fold`, `sum`, `cell_product`, `mean`, `all`, and `any` consume
+dimensions. `fold`, `sum`, `product`, `mean`, `all`, and `any` consume
 matrix cells in row-major order. Fixed matrix dimensions are positive, so seeded
 operations are infallible:
 `min`, `max`, `argmin`, `argmax`, `to_row_major_vector`, and
@@ -682,7 +682,7 @@ operations are infallible:
 
 ```blorp
 import:
-    matrix: all, argmax, argmin, cell_product, fold, from_row_major_vector, map, map_indexed, max, mean, min, sum, to_row_major_vector, zip_map
+    matrix: all, argmax, argmin, product, fold, from_row_major_vector, map, map_indexed, max, mean, min, sum, to_row_major_vector, zip_map
 
 
 values: Int[#2, #3] = {{1, 2, 3}, {4, 5, 6}}
@@ -691,7 +691,7 @@ indexed: Int[#2, #3] = values.map_indexed(pure func(row: ..#2, col: ..#3, x: Int
 combined: Int[#2, #3] = values.zip_map(doubled, pure func(a: Int, b: Int): a + b)
 folded_total: Int = values.fold(0, pure func(acc: Int, x: Int): acc + x)
 total: Int = values.sum()
-multiplied: Int = values.cell_product()
+multiplied: Int = values.product()
 highest: Int = values.max()
 highest_cell: (..#2, ..#3) = values.argmax()
 lowest_cell: (..#2, ..#3) = values.argmin()
@@ -708,7 +708,7 @@ row. `get_column` returns `None` when the column is out of bounds;
 
 ```blorp
 import:
-    matrix: column_count, diagonal, get_cell, get_cell_or, get_column, get_column_or, get_row, get_row_or, identity_matrix, row_count, set_cell, set_column, set_diagonal, set_row, trace
+    matrix: column_count, diagonal, get_cell, get_cell_or, get_column, get_column_or, get_row, get_row_or, identity, row_count, set_cell, set_column, set_diagonal, set_row, trace
 
 
 m: Int[#2, #3] = matrix(0, 2, 3)
@@ -728,7 +728,7 @@ square: Int[#2, #2] = {{1, 2}, {3, 4}}
 diag: Int[#2] = square.diagonal()
 total: Int = square.trace()
 replaced_diag: Int[#2, #2] = square.set_diagonal({10, 20})
-identity: Int[#2, #2] = identity_matrix(2)
+identity: Int[#2, #2] = identity(2)
 ```
 
 #### Scoped Vector Parallelism

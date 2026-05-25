@@ -1313,19 +1313,19 @@ let tensor_elementwise_builtin_name func_name elem_ty =
         | Ast.TyNamed ("Float32", _) -> "blorp_vector_norm_float32"
         | Ast.TyNamed ("Float16", _) -> "blorp_vector_norm_float16"
         | _ -> "blorp_vector_norm")
-  | "sqrt" | "vector_sqrt" | "blorp_vector_sqrt" ->
+  | "sqrt" | "blorp_vector_sqrt" ->
       Some
         (match normalize_type elem_ty with
         | Ast.TyNamed ("Float32", _) -> "blorp_vector_sqrt_float32"
         | Ast.TyNamed ("Float16", _) -> "blorp_vector_sqrt_float16"
         | _ -> "blorp_vector_sqrt")
-  | "exp" | "vector_exp" | "blorp_vector_exp" ->
+  | "exp" | "blorp_vector_exp" ->
       Some
         (match normalize_type elem_ty with
         | Ast.TyNamed ("Float32", _) -> "blorp_vector_exp_float32"
         | Ast.TyNamed ("Float16", _) -> "blorp_vector_exp_float16"
         | _ -> "blorp_vector_exp")
-  | "log" | "vector_log" | "blorp_vector_log" ->
+  | "log" | "blorp_vector_log" ->
       Some
         (match normalize_type elem_ty with
         | Ast.TyNamed ("Float32", _) -> "blorp_vector_log_float32"
@@ -1339,6 +1339,8 @@ let matrix_vector_multiply_runtime_name elem_ty =
   | Ast.TyNamed ("Float", _) -> Some "blorp_tensor_matrix_vector_multiply_float"
   | Ast.TyNamed ("Float32", _) ->
       Some "blorp_tensor_matrix_vector_multiply_float32"
+  | Ast.TyNamed ("Float16", _) ->
+      Some "blorp_tensor_matrix_vector_multiply_float16"
   | Ast.TyNamed ("Int", _) -> Some "blorp_tensor_matrix_vector_multiply_int"
   | _ -> None
 
@@ -1348,6 +1350,8 @@ let transposed_matrix_vector_multiply_runtime_name elem_ty =
       Some "blorp_tensor_transposed_matrix_vector_multiply_float"
   | Ast.TyNamed ("Float32", _) ->
       Some "blorp_tensor_transposed_matrix_vector_multiply_float32"
+  | Ast.TyNamed ("Float16", _) ->
+      Some "blorp_tensor_transposed_matrix_vector_multiply_float16"
   | Ast.TyNamed ("Int", _) ->
       Some "blorp_tensor_transposed_matrix_vector_multiply_int"
   | _ -> None
@@ -1356,6 +1360,7 @@ let outer_multiply_runtime_name elem_ty =
   match normalize_type elem_ty with
   | Ast.TyNamed ("Float", _) -> Some "blorp_tensor_outer_float"
   | Ast.TyNamed ("Float32", _) -> Some "blorp_tensor_outer_float32"
+  | Ast.TyNamed ("Float16", _) -> Some "blorp_tensor_outer_float16"
   | Ast.TyNamed ("Int", _) -> Some "blorp_tensor_outer_int"
   | _ -> None
 
@@ -1381,10 +1386,10 @@ let matrix_multiply_tensor_operands ~reg ~loc left right =
   | _ ->
       Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
         ~hint:
-          "matrix_multiply specialization requires both operands to carry \
-           tensor shape metadata. If typechecking accepted this, fix dispatch \
-           before specialization."
-        "matrix_multiply requires tensor operands, got %s and %s"
+          "multiply specialization requires both operands to carry tensor \
+           shape metadata. If typechecking accepted this, fix dispatch before \
+           specialization."
+        "multiply requires tensor operands, got %s and %s"
         (Types.type_to_string left.ty)
         (Types.type_to_string right.ty)
 
@@ -1419,8 +1424,7 @@ let specialize_matrix_vector_call e c_name matrix vector rows cols =
 let specialize_matrix_vector_multiply ~reg e matrix vector =
   let elem_ty =
     tensor_elem_type ~reg ~loc:e.loc
-      ~context:"matrix_vector_multiply requires a tensor matrix argument"
-      matrix.ty
+      ~context:"multiply_vector requires a tensor matrix argument" matrix.ty
   in
   match matrix_vector_multiply_runtime_name elem_ty with
   | Some c_name -> (
@@ -1434,17 +1438,16 @@ let specialize_matrix_vector_multiply ~reg e matrix vector =
   | None ->
       Core_error.errorf
         ~hint:
-          "Supported matrix_vector_multiply element types are Int, Float, and \
-           Float32."
+          "Supported multiply_vector element types are Int, Float, Float32, \
+           and Float16."
         (Core_error.Stage Core_stage.Specialize) e.loc
-        "matrix_vector_multiply is not implemented for element type `%s`"
+        "multiply_vector is not implemented for element type `%s`"
         (Types.type_to_string elem_ty)
 
 let specialize_transposed_matrix_vector_multiply ~reg e matrix vector =
   let elem_ty =
     tensor_elem_type ~reg ~loc:e.loc
-      ~context:
-        "transposed_matrix_vector_multiply requires a tensor matrix argument"
+      ~context:"multiply_transposed_vector requires a tensor matrix argument"
       matrix.ty
   in
   match transposed_matrix_vector_multiply_runtime_name elem_ty with
@@ -1459,17 +1462,16 @@ let specialize_transposed_matrix_vector_multiply ~reg e matrix vector =
   | None ->
       Core_error.errorf
         ~hint:
-          "Supported transposed_matrix_vector_multiply element types are Int, \
-           Float, and Float32."
+          "Supported multiply_transposed_vector element types are Int, Float, \
+           Float32, and Float16."
         (Core_error.Stage Core_stage.Specialize) e.loc
-        "transposed_matrix_vector_multiply is not implemented for element type \
-         `%s`"
+        "multiply_transposed_vector is not implemented for element type `%s`"
         (Types.type_to_string elem_ty)
 
 let specialize_outer_multiply ~reg e a b =
   let elem_ty =
     tensor_elem_type ~reg ~loc:e.loc
-      ~context:"outer_multiply requires a tensor left operand" a.ty
+      ~context:"outer requires a tensor left operand" a.ty
   in
   match outer_multiply_runtime_name elem_ty with
   | Some c_name ->
@@ -1498,9 +1500,9 @@ let specialize_outer_multiply ~reg e a b =
   | None ->
       Core_error.errorf
         ~hint:
-          "Supported outer_multiply element types are Int, Float, and Float32."
+          "Supported outer element types are Int, Float, Float32, and Float16."
         (Core_error.Stage Core_stage.Specialize) e.loc
-        "outer_multiply is not implemented for element type `%s`"
+        "outer is not implemented for element type `%s`"
         (Types.type_to_string elem_ty)
 
 (** Walk a single expression and specialize type-dispatched builtins. *)
@@ -2344,8 +2346,8 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
                   if is_pointer then
                     { e with desc = CCast (raw_call, result_ty) }
                   else { e with desc = CUnbox (raw_call, result_ty) })))
-  (* matrix_multiply: type-dispatch + inject dimension args from types.
-     blorp call: matrix_multiply(a, b) where a: T[#M,#K], b: T[#K,#N]
+  (* multiply: type-dispatch + inject dimension args from types.
+     blorp call: multiply(a, b) where a: T[#M,#K], b: T[#K,#N]
      C call: blorp_tensor_matrix_multiply_float(a, b, m, k, n) *)
   | CCall (CKBuiltin "blorp_tensor_matrix_multiply", _callee, [ a; b ]) -> (
       let operands = matrix_multiply_tensor_operands ~reg ~loc:e.loc a b in
@@ -2354,14 +2356,15 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
         match elem_ty with
         | Ast.TyNamed ("Float", _) -> "blorp_tensor_matrix_multiply_float"
         | Ast.TyNamed ("Float32", _) -> "blorp_tensor_matrix_multiply_float32"
+        | Ast.TyNamed ("Float16", _) -> "blorp_tensor_matrix_multiply_float16"
         | Ast.TyNamed ("Int", _) -> "blorp_tensor_matrix_multiply_int"
         | _ ->
             Core_error.errorf
               ~hint:
-                "Supported matrix_multiply element types are Int, Float, and \
-                 Float32."
+                "Supported multiply element types are Int, Float, Float32, and \
+                 Float16."
               (Core_error.Stage Core_stage.Specialize) e.loc
-              "matrix_multiply is not implemented for element type `%s`"
+              "multiply is not implemented for element type `%s`"
               (Types.type_to_string elem_ty)
       in
       match operands.mt_static_dims with
@@ -3004,7 +3007,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
           { desc = CVoid; ty = Ast.TyNamed ("Void", []); loc = e.loc }
         in
         match (func_name, args) with
-        (* sum, product, dot, max, min, mean, argmax, argmin, cumsum — post-mono synthesis *)
+        (* sum, product, dot, max, min, mean, argmax, argmin, cumulative_sum — post-mono synthesis *)
         | Some name, _
           when Option.is_some (tensor_elementwise_builtin_name name elem_ty) ->
             let builtin_name =

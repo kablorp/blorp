@@ -340,7 +340,7 @@ let test_matrix_vector_multiply_float_specializes_with_dims () =
     call_builtin "blorp_tensor_matrix_vector_multiply" [ w; x ]
       (tensor ty_float [ 2 ])
   in
-  expect_builtin_with_dims "matrix_vector_multiply float"
+  expect_builtin_with_dims "multiply_vector float"
     "blorp_tensor_matrix_vector_multiply_float" [ 2; 3 ] e
 
 let test_matrix_vector_multiply_float32_specializes_with_dims () =
@@ -350,8 +350,18 @@ let test_matrix_vector_multiply_float32_specializes_with_dims () =
     call_builtin "blorp_tensor_matrix_vector_multiply" [ w; x ]
       (tensor ty_float32 [ 2 ])
   in
-  expect_builtin_with_dims "matrix_vector_multiply float32"
+  expect_builtin_with_dims "multiply_vector float32"
     "blorp_tensor_matrix_vector_multiply_float32" [ 2; 3 ] e
+
+let test_matrix_vector_multiply_float16_specializes_with_dims () =
+  let w = cvar "w" (tensor ty_float16 [ 2; 3 ]) in
+  let x = cvar "x" (tensor ty_float16 [ 3 ]) in
+  let e =
+    call_builtin "blorp_tensor_matrix_vector_multiply" [ w; x ]
+      (tensor ty_float16 [ 2 ])
+  in
+  expect_builtin_with_dims "multiply_vector float16"
+    "blorp_tensor_matrix_vector_multiply_float16" [ 2; 3 ] e
 
 let test_transposed_matrix_vector_multiply_float_specializes_with_dims () =
   let w = cvar "w" (tensor ty_float [ 2; 3 ]) in
@@ -360,8 +370,18 @@ let test_transposed_matrix_vector_multiply_float_specializes_with_dims () =
     call_builtin "blorp_tensor_transposed_matrix_vector_multiply" [ w; x ]
       (tensor ty_float [ 3 ])
   in
-  expect_builtin_with_dims "transposed_matrix_vector_multiply float"
+  expect_builtin_with_dims "multiply_transposed_vector float"
     "blorp_tensor_transposed_matrix_vector_multiply_float" [ 2; 3 ] e
+
+let test_transposed_matrix_vector_multiply_float16_specializes_with_dims () =
+  let w = cvar "w" (tensor ty_float16 [ 2; 3 ]) in
+  let x = cvar "x" (tensor ty_float16 [ 2 ]) in
+  let e =
+    call_builtin "blorp_tensor_transposed_matrix_vector_multiply" [ w; x ]
+      (tensor ty_float16 [ 3 ])
+  in
+  expect_builtin_with_dims "multiply_transposed_vector float16"
+    "blorp_tensor_transposed_matrix_vector_multiply_float16" [ 2; 3 ] e
 
 let test_outer_multiply_int_specializes_with_dims () =
   let a = cvar "a" (tensor ty_int [ 2 ]) in
@@ -377,20 +397,34 @@ let test_outer_multiply_float_specializes_with_dims () =
   in
   expect_builtin_with_dims "outer float" "blorp_tensor_outer_float" [ 2; 3 ] e
 
+let test_outer_multiply_float16_specializes_with_dims () =
+  let a = cvar "a" (tensor ty_float16 [ 2 ]) in
+  let b = cvar "b" (tensor ty_float16 [ 3 ]) in
+  let e =
+    call_builtin "blorp_tensor_outer" [ a; b ] (tensor ty_float16 [ 2; 3 ])
+  in
+  expect_builtin_with_dims "outer float16" "blorp_tensor_outer_float16" [ 2; 3 ]
+    e
+
+let test_matrix_multiply_float16_specializes_with_dims () =
+  let a = cvar "a" (tensor ty_float16 [ 2; 3 ]) in
+  let b = cvar "b" (tensor ty_float16 [ 3; 4 ]) in
+  let e =
+    call_builtin "blorp_tensor_matrix_multiply" [ a; b ]
+      (tensor ty_float16 [ 2; 4 ])
+  in
+  expect_builtin_with_dims "multiply float16"
+    "blorp_tensor_matrix_multiply_float16" [ 2; 3; 4 ] e
+
 let test_unknown_matrix_vector_multiply_requires_resolved_builtin () =
   let w = cvar "w" (tensor ty_int [ 2; 2 ]) in
   let x = cvar "x" (tensor ty_int [ 2 ]) in
-  let e =
-    call_unknown "matrix_vector_multiply" [ w; x ] (tensor ty_int [ 2 ])
-  in
+  let e = call_unknown "multiply_vector" [ w; x ] (tensor ty_int [ 2 ]) in
   match (specialize e).desc with
   | CCall (CKUnknown, _, _) -> ()
   | CCall (CKBuiltin name, _, _) ->
-      Alcotest.failf
-        "unresolved matrix_vector_multiply specialized to %s by name" name
-  | _ ->
-      Alcotest.fail
-        "expected unresolved matrix_vector_multiply to remain a call"
+      Alcotest.failf "unresolved multiply_vector specialized to %s by name" name
+  | _ -> Alcotest.fail "expected unresolved multiply_vector to remain a call"
 
 let test_float32_vector_fill_uses_packed_runtime () =
   let value = mk (CLit (LitFloat 0.0)) ty_float32 in
@@ -441,7 +475,7 @@ let test_alias_matrix_vector_multiply_static_dims_specializes () =
     call_builtin "blorp_tensor_matrix_vector_multiply" [ w; x ]
       (TyNamed ("Outputs", []))
   in
-  expect_builtin_with_dims_with_reg "alias matrix_vector_multiply" reg
+  expect_builtin_with_dims_with_reg "alias multiply_vector" reg
     "blorp_tensor_matrix_vector_multiply_float" [ 2; 3 ] e
 
 let test_alias_matrix_multiply_static_dims_specializes () =
@@ -465,7 +499,7 @@ let test_alias_matrix_multiply_static_dims_specializes () =
     call_builtin "blorp_tensor_matrix_multiply" [ a; b ]
       (TyNamed ("Product", []))
   in
-  expect_builtin_with_dims_with_reg "alias matrix_multiply" reg
+  expect_builtin_with_dims_with_reg "alias multiply" reg
     "blorp_tensor_matrix_multiply_float" [ 2; 3; 4 ] e
 
 let test_float64_matrix_fill_uses_unboxed_runtime () =
@@ -916,7 +950,7 @@ let test_assert_shape_managed_option_uses_nullable_runtime () =
 let test_float32_vector_exp_builtin_specializes () =
   let v = cvar "v" (tensor ty_float32 [ 4 ]) in
   let e = call_builtin "blorp_vector_exp" [ v ] (tensor ty_float32 [ 4 ]) in
-  expect_builtin "float32 vector_exp" "blorp_vector_exp_float32" e
+  expect_builtin "float32 exp" "blorp_vector_exp_float32" e
 
 let test_float32_unary_neg_uses_float32_scalar_runtime () =
   let v = cvar "v" (tensor ty_float32 [ 4 ]) in
@@ -1070,7 +1104,7 @@ let test_matrix_multiply_non_tensor_operand_raises_core_error () =
   in
   Blorp.Core_error.check_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
-    ~msg_contains:"matrix_multiply requires tensor operands" (fun () ->
+    ~msg_contains:"multiply requires tensor operands" (fun () ->
       ignore (specialize e))
 
 let test_matrix_multiply_non_tensor_right_operand_raises_core_error () =
@@ -1082,7 +1116,7 @@ let test_matrix_multiply_non_tensor_right_operand_raises_core_error () =
   in
   Blorp.Core_error.check_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
-    ~msg_contains:"matrix_multiply requires tensor operands" (fun () ->
+    ~msg_contains:"multiply requires tensor operands" (fun () ->
       ignore (specialize e))
 
 let test_vector_map_non_tensor_result_raises_core_error () =
@@ -1210,12 +1244,20 @@ let suite =
           test_matrix_vector_multiply_float_specializes_with_dims;
         Alcotest.test_case "matrix_vector_multiply_float32" `Quick
           test_matrix_vector_multiply_float32_specializes_with_dims;
+        Alcotest.test_case "matrix_vector_multiply_float16" `Quick
+          test_matrix_vector_multiply_float16_specializes_with_dims;
         Alcotest.test_case "transposed_matrix_vector_multiply_float" `Quick
           test_transposed_matrix_vector_multiply_float_specializes_with_dims;
+        Alcotest.test_case "transposed_matrix_vector_multiply_float16" `Quick
+          test_transposed_matrix_vector_multiply_float16_specializes_with_dims;
         Alcotest.test_case "outer_multiply_int" `Quick
           test_outer_multiply_int_specializes_with_dims;
         Alcotest.test_case "outer_multiply_float" `Quick
           test_outer_multiply_float_specializes_with_dims;
+        Alcotest.test_case "outer_multiply_float16" `Quick
+          test_outer_multiply_float16_specializes_with_dims;
+        Alcotest.test_case "matrix_multiply_float16" `Quick
+          test_matrix_multiply_float16_specializes_with_dims;
         Alcotest.test_case
           "unknown_matrix_vector_multiply_requires_resolved_builtin" `Quick
           test_unknown_matrix_vector_multiply_requires_resolved_builtin;

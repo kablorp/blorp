@@ -130,13 +130,12 @@ let raylib_builtins =
 
 let matrix_builtins =
   [
-    ((N.mod_matrix, "matrix_multiply"), "blorp_tensor_matrix_multiply");
+    ((N.mod_matrix, "multiply"), "blorp_tensor_matrix_multiply");
     ((N.mod_matrix, "transpose"), "blorp_tensor_transpose");
-    ( (N.mod_matrix, "matrix_vector_multiply"),
-      "blorp_tensor_matrix_vector_multiply" );
-    ( (N.mod_matrix, "transposed_matrix_vector_multiply"),
+    ((N.mod_matrix, "multiply_vector"), "blorp_tensor_matrix_vector_multiply");
+    ( (N.mod_matrix, "multiply_transposed_vector"),
       "blorp_tensor_transposed_matrix_vector_multiply" );
-    ((N.mod_matrix, "outer_multiply"), "blorp_tensor_outer");
+    ((N.mod_matrix, "outer"), "blorp_tensor_outer");
     ((N.mod_matrix, "get_cell"), "blorp_matrix_get_opt");
     ((N.mod_matrix, "set_cell"), "blorp_matrix_checked_set");
     ((N.mod_matrix, "matrix_checked_get"), "blorp_matrix_checked_get");
@@ -318,9 +317,9 @@ let builtin_c_mapping =
       ((N.mod_vector, "min"), "blorp_vector_min_int");
       ((N.mod_vector, "norm"), "blorp_vector_norm");
       ((N.mod_vector, "cross"), "blorp_vector_cross_float");
-      ((N.mod_vector, "vector_exp"), "blorp_vector_exp");
-      ((N.mod_vector, "vector_log"), "blorp_vector_log");
-      ((N.mod_vector, "vector_sqrt"), "blorp_vector_sqrt");
+      ((N.mod_vector, "exp"), "blorp_vector_exp");
+      ((N.mod_vector, "log"), "blorp_vector_log");
+      ((N.mod_vector, "sqrt"), "blorp_vector_sqrt");
       ((N.mod_vector, "map"), "blorp_vector_map");
     ]
   (* Matrix builtins — matrix/vector and outer-multiply kernels dispatch through

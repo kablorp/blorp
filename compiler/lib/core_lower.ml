@@ -1531,7 +1531,7 @@ and lower_for_windows ~loc ~ty (var : string) (coll : TA.expr)
     Generic-dim matrix (dim2 is [TyVar] or any non-[TyConstInt]) → [<cols>]
     is the runtime expression [capacity(m) / length(m)]: for a 2D tensor with
     flat storage, [capacity = rows × cols] and [length = rows], so
-    [capacity / length = cols]. This mirrors the fallback that matrix_multiply uses
+    [capacity / length = cols]. This mirrors the fallback that multiply uses
     when its dims aren't all literals (`core_specialize.ml:470`). *)
 and lower_for_enumerate2 ~loc ~ty ~destructure_names (var : string)
     (m : TA.expr) (body : TA.expr) : Core.core =
