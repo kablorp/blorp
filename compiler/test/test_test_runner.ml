@@ -551,11 +551,16 @@ let test_suite_selector_harness_dispatches_by_index () =
     (contains_substring source "match get(args, 1):"
     && contains_substring source "match parse_int(selector):");
   Alcotest.(check bool)
+    "dispatches with match instead of expression if chain" true
+    (contains_substring source
+       "func __run_selected(index: Int) -> Bool:\n    match index:"
+    && not (contains_substring source "else if index =="));
+  Alcotest.(check bool)
     "dispatches first suite" true
-    (contains_substring source "run_suite(T0.tests)");
+    (contains_substring source "        0:\n            run_suite(T0.tests)");
   Alcotest.(check bool)
     "has invalid selector fallback" true
-    (contains_substring source "else:\n        False")
+    (contains_substring source "        _:\n            False")
 
 let test_suite_selector_harness_runs_each_suite_separately () =
   with_temp_dir "blorp-suite-selector-" (fun dir ->

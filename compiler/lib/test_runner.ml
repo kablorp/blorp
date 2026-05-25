@@ -1667,14 +1667,14 @@ let generate_suite_selector_harness ?(leak_check = false) test_files =
   emit "";
   emit "";
   emit "func __run_selected(index: Int) -> Bool:";
+  emit "    match index:";
   List.iteri
     (fun i _file ->
-      let prefix = if i = 0 then "if" else "else if" in
-      emit (Printf.sprintf "    %s index == %d:" prefix i);
-      emit (Printf.sprintf "        %s(T%d.tests)" run_fn i))
+      emit (Printf.sprintf "        %d:" i);
+      emit (Printf.sprintf "            %s(T%d.tests)" run_fn i))
     test_files;
-  emit "    else:";
-  emit "        False";
+  emit "        _:";
+  emit "            False";
   emit "";
   emit "";
   emit "func main(args: List[String]) -> Int:";
