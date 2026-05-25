@@ -77,11 +77,11 @@ pure func larger[T: Orderable](a: T, b: T) -> T:
     else:
         b
 
-	-- ?= keeps fallible code linear and returns from the enclosing carrier.
-	pure func first_two_total(scores: List[Int]) -> Option[Int]:
-	    first ?= scores.get(0)
-	    second ?= scores.get(1)
-	    Some(first + second)
+-- ?= keeps fallible code linear and returns from the enclosing carrier.
+pure func first_two_total(scores: List[Int]) -> Option[Int]:
+    first ?= scores.get(0)
+    second ?= scores.get(1)
+    Some(first + second)
 
 -- concurrent: scopes parallel work and joins it before continuing.
 func compare_totals(left: List[Int], right: List[Int]) -> Result[Int, ConcurrencyError]:
