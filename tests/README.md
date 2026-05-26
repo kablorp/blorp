@@ -39,13 +39,14 @@ tests/
 │   ├── functions/         # Closures, generics, monomorphization, HOF
 │   ├── sys/               # CLI args, runtime safety
 │   ├── memory/            # ARC, COW, leak detection tests
-│   ├── memory_trace/      # Memory tracing infrastructure
 │   ├── concurrency/       # Concurrent blocks, channels, fibers
+│   ├── tools/             # Tooling/runtime helper tests
 │   └── simd/              # SIMD tests (skipped by default)
 ├── test_std/              # Runtime tests for std/, mirroring std/ where practical
-│   ├── list/              # Tests for std/list.brp
-│   ├── dict/              # Tests for std/dict.brp
-│   └── set/               # Tests for std/set.brp
+│   ├── list/ dict/ set/   # Core collection tests
+│   ├── cache/ deque/ heap/ sorted_map/ graph/
+│   ├── io/                # I/O module tests
+│   └── stream/            # Stream tests
 ├── test_pkg/              # Optional runtime tests for pkg/, created when pkg tests exist
 ├── test_cli.sh            # CLI smoke and exit-code checks
 ├── stages/                # Golden lexer/parser/typecheck snapshots
@@ -92,7 +93,7 @@ Run with: `./blorp test path/to/test.brp`
 - `should_pass/`: Files must compile without errors (`./blorp check`)
 - `should_fail/`: Files must produce a compile error. Add `-- EXPECT: <substring>` annotations to verify error messages.
 
-The test runner (`run_compiler_tests.sh`) validates both directions automatically.
+The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both directions automatically.
 
 ## Adding Tests
 

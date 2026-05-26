@@ -8,7 +8,7 @@ commitment to change all items immediately.
 
 The current Core pipeline is:
 
-1. `Core_lower` plus boundary annotation
+1. `Core_lower` plus `Core_ffi_boundary` and initial list-layout annotation
 2. `Core_debug`
 3. `Core_desugar` plus `Core_ssa`
 4. `Core_mono` plus list-layout annotation
@@ -19,13 +19,15 @@ The current Core pipeline is:
 9. `Core_std_inline`
 10. `Core_tailrec`
 11. `Core_string_pipeline`, `Core_collection_pipeline`,
-    `Core_tensor_fusion`, `Core_tuple_sroa`
+    `Core_parallel_tensor_pipeline`, `Core_tensor_fusion`, `Core_tuple_sroa`
 12. `Core_specialize` plus function-reference adaptation
-13. `Core_perceus`
-14. `Core_reuse`
-15. `Core_closure`
-16. `Core_codegen_prepare`
-17. `Core_emit_c`
+13. `Core_dce`
+14. `Core_perceus`
+15. `Core_reuse`
+16. `Core_closure`
+17. `Core_resource`
+18. `Core_codegen_prepare`
+19. `Core_emit_c`
 
 `Core_pipeline.run_core_passes` is the source of truth for pass ordering. Keep
 docs, stage names, invariants, and `--dump-core-after` behavior aligned with it.
@@ -56,9 +58,10 @@ Follow-up habit:
    in the number of foreign declarations. The low-risk fix is reverse
    accumulation with `List.rev_append` and one final reverse.
 
-2. The `Fusion` stage is four full-program traversals:
-   `Core_string_pipeline`, `Core_collection_pipeline`, `Core_tensor_fusion`,
-   and `Core_tuple_sroa`. The ordering is meaningful, so do not merge them
+2. The `Fusion` stage is five full-program traversals:
+   `Core_string_pipeline`, `Core_collection_pipeline`,
+   `Core_parallel_tensor_pipeline`, `Core_tensor_fusion`, and
+   `Core_tuple_sroa`. The ordering is meaningful, so do not merge them
    blindly. First split phase timing inside the stage or split the stage enum
    so compile-time profiles can show which traversal matters.
 
@@ -107,9 +110,10 @@ Follow-up habit:
 
 ## Misnamed Objects
 
-1. `Core_stage.Fusion` is too broad. It contains string/list/tensor fusion and
-   tuple scalar replacement. Either split it for profiling/dump granularity or
-   rename it to a broader optimization stage if CLI compatibility is preserved.
+1. `Core_stage.Fusion` is too broad. It contains string/list/scoped tensor
+   pipeline fusion, tensor update fusion, and tuple scalar replacement. Either
+   split it for profiling/dump granularity or rename it to a broader optimization
+   stage if CLI compatibility is preserved.
 
 2. `Core_profile` means compiler phase timing, while generated C `--profile`
    means runtime function profiling. `Core_phase_profile` or

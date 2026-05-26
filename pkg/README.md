@@ -17,7 +17,6 @@ Current native packages:
 
 | Package | Description |
 |---------|-------------|
-| `pkg/audio/neural_amp` | Neural amp modeling helpers with native fast NAM weight parsing |
 | `pkg/compress` | gzip/deflate compression via zlib |
 | `pkg/crypto` | AES-256-CBC + HMAC-SHA256 encryption and PBKDF2 key derivation |
 | `pkg/net/dns` | DNS resolution via system resolver |
@@ -27,4 +26,3 @@ Current native packages:
 | `pkg/net/udp` | UDP sockets |
 | `pkg/net/websocket` | WebSocket client over TCP/TLS |
 | `pkg/sqlite` | SQLite bindings via sqlite3 |
-| `pkg/tui` | Terminal UI runtime via POSIX termios/ioctl |

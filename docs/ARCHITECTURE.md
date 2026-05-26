@@ -28,7 +28,7 @@ Source (.brp)
     |
     v
 +------------+
-| Core IR    |  Lowering → 14 observed transform stages → final preparation
+| Core IR    |  Lowering → 15 observed transform stages → final preparation
 | pipeline   |  → final snapshot → default C backend (see "Core IR Pipeline")
 +------------+
     |
@@ -119,11 +119,12 @@ Typed AST
     |
     v
 +-------------+
-| Core_fusion |  Fuse supported string/collection pipelines and tensor updates;
+| Core_fusion |  Fuse supported string/collection/scoped tensor pipelines and tensor updates;
 +-------------+  scalar-replace non-escaping local tuples and narrow
                  tuple-return call sites
                  (core_string_pipeline.ml, core_collection_pipeline.ml,
-                 core_tensor_fusion.ml, core_tuple_sroa.ml)
+                 core_parallel_tensor_pipeline.ml, core_tensor_fusion.ml,
+                 core_tuple_sroa.ml)
     |
     v
 +-----------------+
@@ -218,6 +219,7 @@ boxing, or ownership behavior from source spelling.
 | `core_collection_producer.ml` | Shared producer metadata for fused collection construction |
 | `core_list_pipeline.ml` | List-specific pipeline rewrite helpers used by collection fusion |
 | `core_list_layout.ml` | Final list storage layout annotations used by specialization and emit |
+| `core_parallel_tensor_pipeline.ml` | Scoped `Vector.parallel` / `Matrix.parallel` pipeline fusion |
 | `core_tensor_fusion.ml` | Tensor update fusion before ownership insertion |
 | `core_tensor_storage_producer.ml` | Tensor storage provenance and raw-write producer helpers |
 | `core_tensor_type.ml` | Tensor type/dimension utilities for Core passes |
@@ -298,15 +300,18 @@ compiler/
 │   ├── core_collection_pipeline.ml # Expression-local collection fusion
 │   ├── core_collection_producer.ml # Shared collection producer metadata
 │   ├── core_list_pipeline.ml # List-specific pipeline rewrite helpers
+│   ├── core_parallel_tensor_pipeline.ml # Scoped vector/matrix pipeline fusion
 │   ├── core_tensor_fusion.ml # Tensor update fusion
 │   ├── core_tensor_storage_producer.ml # Tensor storage producer/provenance helpers
 │   ├── core_tensor_type.ml # Tensor type/dimension utilities
 │   ├── core_tuple_sroa.ml # Local/call-site tuple scalar replacement
 │   ├── core_specialize.ml # Type-dispatch builtins → CCast / concrete names
+│   ├── core_dce.ml       # Dead concrete declaration pruning before ownership
 │   ├── core_perceus.ml    # Core IR Perceus RC insertion
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
 │   ├── core_reuse.ml      # Post-Perceus allocation reuse rewrites
 │   ├── core_closure.ml    # Closure conversion / lambda hoisting
+│   ├── core_resource.ml   # Resource-scope cleanup-exit lowering
 │   ├── core_codegen_prepare.ml # Final Core representation preparation
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
 │   ├── core_erased_storage_layout.ml # Typed values crossing erased storage
@@ -373,9 +378,9 @@ std/                       # Portable standard library (.brp files)
 ├── list.brp, dict.brp, set.brp  # Core collections
 ├── cache.brp, deque.brp, heap.brp, sorted_map.brp, graph.brp  # Extended collections
 ├── parallel_list.brp, rate_limit.brp, property.brp, stream.brp  # Infrastructure helpers
-├── tensor.brp, vector.brp, matrix.brp  # Numeric arrays (compile-time dims)
+├── tensor.brp, vector.brp, matrix.brp, parallel_vector.brp, parallel_matrix.brp  # Numeric arrays
 ├── math.brp, stats.brp, fft.brp, dsp.brp  # Math and signal processing
-├── io.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp, channel.brp  # System
+├── io.brp, file.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp, channel.brp  # System
 ├── path.brp, process.brp, log.brp, term.brp  # OS/terminal
 ├── random.brp, crypto_random.brp, hash.brp  # Random/crypto helpers
 ├── parser.brp, regex.brp  # Text processing
@@ -405,7 +410,9 @@ tests/
 │   ├── memory/            # ARC, leak detection, COW tests
 │   ├── functions/         # Closures, generics, HOF, FFI, tailrec tests
 │   ├── concurrency/       # Concurrent blocks, detach, channels tests
+│   ├── tools/             # Tooling/runtime helper tests
 │   └── simd/              # SIMD tests
+├── test_std/              # Runtime tests for std/ modules
 └── test_compiler/         # Compiler behavior tests
     ├── parser/            # Parser/lexer tests (should_pass/ + should_fail/)
     ├── infer/             # Type inference tests (should_pass/ + should_fail/)

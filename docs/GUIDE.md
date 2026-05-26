@@ -2631,8 +2631,8 @@ This table lists the main public modules. The source of truth is the `std/` and
 | `int8`, `int16`, `int32`, `int128` | `int8: ...` | Signed sized integer modules |
 | `uint8`, `uint16`, `uint32`, `uint64`, `uint128` | `uint8: ...` | Unsigned sized integer modules |
 | `float16`, `float32`, `fixed` | `float32: ...` | Sized floats and fixed-point decimals |
-| `math`, `stats`, `tensor`, `vector`, `matrix` | `math: PI, TAU` | Numeric helpers, statistics, and fixed-size array/tensor APIs |
-| `io`, `system`, `path`, `process`, `time`, `channel` | `system: read_file` | I/O, filesystem, process, path, time, and concurrency channel APIs |
+| `math`, `stats`, `tensor`, `vector`, `matrix`, `parallel_vector`, `parallel_matrix` | `math: PI, TAU` | Numeric helpers, statistics, and fixed-size array/tensor APIs |
+| `io`, `file`, `system`, `path`, `process`, `time`, `channel` | `system: read_file` | I/O, typed file resources, filesystem, process, path, time, and concurrency channel APIs |
 | `debug`, `memory`, `instrumentation`, `log` | `debug: debug_string, type_name` | Diagnostics, memory stats, scheduler stats, timing/barrier helpers, and logging |
 | `argparse`, `validation`, `uuid`, `random`, `crypto_random` | `argparse: ...` | Application utilities |
 | `hash` | `hash: sha256` | Hashing helpers |
@@ -2640,11 +2640,11 @@ This table lists the main public modules. The source of truth is the `std/` and
 | `json`, `toml`, `yaml`, `xml`, `html`, `csv` | `json: JsonValue, parse_json` | Data format parsers/encoders |
 | `codec`, `codec_bridge` | `codec: Value` | Generic serialization and format bridge |
 | `string`, `slice`, `stream` | `string: string, append_char` | String operations/building, slices, streams |
-| `cache`, `deque`, `heap`, `sorted_map`, `graph`, `rate_limit`, `property` | `heap: Heap` | Extended collections and infrastructure |
+| `cache`, `parallel_list`, `deque`, `heap`, `sorted_map`, `graph`, `rate_limit`, `property` | `heap: Heap` | Extended collections and infrastructure |
 | `geometry`, `geographic`, `geojson`, `physics`, `units` | `geometry: Vec2` | Spatial, geographic, physics, and unit helpers |
 | `dsp`, `fft`, `noise` | `dsp: ...` | Signal and procedural numeric helpers |
 | `net/tcp`, `net/http`, `net/url`, `net/mime` | `net/tcp as Tcp` | Portable networking primitives and protocol helpers |
-| `pkg/audio/neural_amp`, `pkg/compress`, `pkg/crypto`, `pkg/sqlite`, `pkg/tui` | `pkg/compress: gzip` | Optional native bindings and native-backed packages |
+| `pkg/compress`, `pkg/crypto`, `pkg/sqlite` | `pkg/compress: gzip` | Optional native bindings and native-backed packages |
 | `pkg/net/dns`, `pkg/net/http_client`, `pkg/net/smtp`, `pkg/net/tls`, `pkg/net/udp`, `pkg/net/websocket` | `pkg/net/dns as DNS` | Native-backed networking packages |
 | `term` | `term: ...` | Terminal helpers |
 | `tuple`, `ptr`, `void`, `traits`, `test` | `test: TestSuite` | Core support modules and test framework |
@@ -3448,6 +3448,7 @@ tests/
 | `BLORP_FIBER_STACK_SIZE=N` | Fiber stack size in bytes (default 57344 / 56KB) |
 | `BLORP_FIBER_STACK_CACHE_BYTES=N` | Maximum bytes of dead fiber coroutine/stack regions to cache for reuse (default 134217728; `0` disables) |
 | `BLORP_FIBER_OBJECT_CACHE_COUNT=N` | Maximum dead fiber handle objects to cache for reuse (default 4096; `0` disables) |
+| `BLORP_THREADS=N` | Runtime worker thread pool size; `./blorp run --threads N` sets this for the launched program |
 | `BLORP_SANITIZE=1` | Enable sanitizers (CLI flag overrides) |
 | `BLORP_NO_FORMAT=1` | Skip auto-formatting before command execution |
 
@@ -3519,10 +3520,11 @@ foreign(include: "stdio.h"):
 
 `include:` paths are resolved relative to the `.brp` file that declares the
 foreign function. This is independent of the shell working directory and works
-the same for `run`, `test`, and imported modules. `link:` is for actual C
-compiler/linker flags such as `-lm`, object files, library search paths, and
-system include paths; you do not need `link: "-I..."` just to find a header next
-to the Blorp source file.
+the same for `run`, `test`, and imported modules. `link:` is for restricted C
+compiler/linker flags: `-lNAME`, `-LDIR`, `-IDIR`, `-framework NAME`, and
+`-pthread`. Raw object/archive filenames and raw linker escapes such as
+`-Wl,...` are rejected. You do not need `link: "-I..."` just to find a header
+next to the Blorp source file.
 
 **Auto-conversions:** `String` arguments automatically convert to `char*`. `String` return values automatically wrap into blorp strings. Fixed-size array arguments automatically expand to `(data_ptr, len)` pairs. All other types must match the C signature exactly.
 
@@ -3585,14 +3587,14 @@ extern "C" {
 ```
 
 ```blorp
--- Declare the C wrapper functions, link the compiled .o and C++ stdlib
-foreign(include: "vec3_ffi.h", link: "vec3.o -lstdc++"):
+-- Declare the C wrapper functions, link a library plus the C++ stdlib.
+foreign(include: "vec3_ffi.h", link: "-Lnative -lvec3_ffi -lstdc++"):
     func vec3_new(x: Float, y: Float, z: Float) -> Ptr
     func vec3_free(v: Ptr) -> Void
     func vec3_dot(a: Ptr, b: Ptr) -> Float
 ```
 
-C++ objects are passed as `Ptr` (opaque `void*`). Memory is managed manually — call the wrapper's free function when done.
+C++ objects are passed as `Ptr` (opaque `void*`). Memory is managed manually — call the wrapper's free function when done. Build wrapper objects into a library that the C compiler can find with `-L... -l...`; raw `.o` filenames are rejected by FFI metadata validation.
 
 ### Rust
 
@@ -3608,8 +3610,8 @@ pub extern "C" fn rust_gcd(mut a: i64, mut b: i64) -> i64 {
 ```
 
 ```blorp
--- Link the Rust static library (.a produced by cargo build --release)
-foreign(include: "blorp_rust_ffi.h", link: "libblorp_rust_ffi.a -liconv -lSystem"):
+-- Link the Rust static library through a library search path.
+foreign(include: "blorp_rust_ffi.h", link: "-Ltarget/release -lblorp_rust_ffi -liconv -lSystem"):
     func rust_gcd(a: Int, b: Int) -> Int
 ```
 
@@ -3620,8 +3622,8 @@ For string interop, Rust must accept `*const c_char` and return `*mut c_char`. b
 | Language | Wrapper Pattern | Link Flags |
 |----------|----------------|------------|
 | C | None needed | `-lm`, `-lpthread`, etc. |
-| C++ | `extern "C"` wrapper functions | `file.o -lstdc++` |
-| Rust | `#[no_mangle] extern "C"` | `libname.a -liconv -lSystem` |
+| C++ | `extern "C"` wrapper functions | `-Lnative -lvec3_ffi -lstdc++` |
+| Rust | `#[no_mangle] extern "C"` | `-Ltarget/release -lname -liconv -lSystem` |
 
 ---
 

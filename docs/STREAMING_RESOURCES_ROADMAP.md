@@ -413,8 +413,8 @@ The current codegen path is the Core pipeline:
 
 ```text
 lower -> debug -> desugar -> mono -> synth -> match -> trait_resolve ->
-resolve -> std_inline -> tailrec -> fusion -> specialize -> perceus ->
-reuse -> closure -> final prepare -> emit C
+resolve -> std_inline -> tailrec -> fusion -> specialize -> dce -> perceus ->
+reuse -> closure -> resource -> codegen_prepare -> emit C
 ```
 
 Resource work must fit that pipeline explicitly:
@@ -435,7 +435,7 @@ Resource work must fit that pipeline explicitly:
     `CResourceScope` as canonical cleanup Core;
   - if `with ?=` is lowered through `Result`/`Option` matching, the successful
     branch must be the only branch that owns the resource cleanup edge.
-- `Core_debug`, `Core_mono`, `Core_synth`, `Core_match`,
+- `Core_debug`, `Core_desugar`, `Core_mono`, `Core_synth`, `Core_match`,
   `Core_trait_resolve`, `Core_resolve`, `Core_std_inline`, `Core_tailrec`, and
   `Core_fusion`:
   - traverse `CResourceScope` like other control-flow nodes;
@@ -448,6 +448,9 @@ Resource work must fit that pipeline explicitly:
     ownership insertion;
   - keep erased-storage/resource ABI facts explicit instead of recovering them
     from names in emit.
+- `Core_dce`:
+  - keep any resource cleanup callee reachable from retained resource scopes;
+  - never infer resource safety from source names while pruning declarations.
 - `Core_perceus`:
   - insert `CDup`/`CDrop` for normal managed values inside the scope;
   - preserve `CResourceScope`;
@@ -1017,7 +1020,7 @@ Completed in the current implementation:
   checkpoints.
 - `Stream[T]` and `FallibleStream[T, E]` are now treated as one-shot cursor
   carriers by inference. The compiler rejects capturing stream values in
-  closures, `detach`, `concurrent:`, and `concurrent for` task bodies, including
+  closures, `detach`, `concurrent:`, and `for ... concurrently` task bodies, including
   aliases or aggregates that contain streams.
 - The compiler rejects storing `Stream`/`FallibleStream` values in ordinary
   aggregate literals and declarations: tuples, lists, dicts, records, structs,
@@ -1054,7 +1057,7 @@ Tests:
   codegen with a clear diagnostic.
 - `from_lines` has source-audit coverage preventing fixed-size path buffers.
 - Timeout/cancellation tests cover a long-running stream terminal.
-- Closure, `detach`, `concurrent:`, and `concurrent for` bodies reject captured
+- Closure, `detach`, `concurrent:`, and `for ... concurrently` bodies reject captured
   `Stream`/`FallibleStream` values while still allowing streams created and
   consumed wholly inside the task.
 - Tuple/list/dict/record/union storage of `Stream`/`FallibleStream` values is
@@ -1237,7 +1240,7 @@ Completed in the current implementation:
   distinguish ordinary data from dependent scoped values, mutable slots are
   treated as possible scope-escape boundaries rather than trying to propagate
   lifetime facts through assignment side effects.
-- `concurrent:` and `concurrent for` task bodies now reject captures of scoped
+- `concurrent:` and `for ... concurrently` task bodies now reject captures of scoped
   resources and scoped-resource-derived values. Concurrent task result types
   also cannot contain resources, so structured task joins cannot create
   ordinary `Result[Resource, ConcurrencyError]` values without an explicit
@@ -1356,7 +1359,7 @@ Tests:
 - unit coverage proving body-level `?=` lowering remains inside the successful
   resource scope for fallible `with ?=`;
 - unit coverage for rejecting scoped-resource captures in `concurrent:` and
-  `concurrent for`, plus resource-containing concurrent task results;
+  `for ... concurrently`, plus resource-containing concurrent task results;
 - runtime test proving close runs on normal body completion;
 - runtime semantics coverage and codegen-audit coverage proving cleanup wraps
   body-level `?=` short-circuit paths for user-facing resource-backed APIs;

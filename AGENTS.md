@@ -168,11 +168,14 @@ either work or produce a helpful message.
 
     lex → parse → interp desugar → module load →
     subscript desugar → infer/typecheck →
-    core_lower → core_debug → core_desugar + core_ssa →
-    core_mono → core_synth → core_match →
+    core_lower + core_ffi_boundary + core_list_layout →
+    core_debug → core_desugar + core_ssa →
+    core_mono + core_list_layout → core_synth → core_match →
     core_trait_resolve → core_resolve → core_std_inline → core_tailrec →
-    core_string_pipeline + core_collection_pipeline + core_tensor_fusion + core_tuple_sroa →
-    core_specialize → core_dce → core_perceus → core_reuse → core_closure → backend emit
+    core_string_pipeline + core_collection_pipeline + core_parallel_tensor_pipeline +
+    core_tensor_fusion + core_tuple_sroa →
+    core_specialize → core_dce → core_perceus → core_reuse → core_closure →
+    core_resource → core_codegen_prepare → backend emit
 
 Don't put type-checking logic in Core IR passes or parsing constraints in
 type-checking. If a check belongs in an earlier phase, move it there. If it must stay in a
@@ -209,14 +212,16 @@ function signatures require updating all call sites in tests/ and examples/ in t
 # Build the compiler (outputs ./blorp in project root)
 make
 
-# Run ALL tests (unit + compiler + runtime + doctest)
+# Run ALL tests (unit + compiler + runtime + leak + doctest + cli)
 scripts/run_tests.sh
 
 # Run specific test suites
 scripts/run_tests.sh unit               # OCaml unit tests (compiler internals)
 scripts/run_tests.sh compiler           # Compiler tests (should_pass/should_fail)
 scripts/run_tests.sh runtime            # Runtime .brp tests
+scripts/run_tests.sh leak               # Focused leak-check baselines
 scripts/run_tests.sh doctest            # Doctests (std/ library)
+scripts/run_tests.sh cli                # CLI smoke and exit-code checks
 scripts/run_tests.sh unit compiler      # Multiple suites
 scripts/run_tests.sh --coverage         # Unit tests with coverage report
 
@@ -245,7 +250,9 @@ make fmt-check
 scripts/run_tests.sh unit
 scripts/run_tests.sh compiler
 scripts/run_tests.sh runtime
+scripts/run_tests.sh leak
 scripts/run_tests.sh doctest
+scripts/run_tests.sh cli
 ```
 
 The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
@@ -403,10 +410,12 @@ compiler/            # OCaml compiler implementation
     minicoro.h        # Coroutine library (M:N fiber scheduling)
     core.ml           # Core IR type definitions and traversal helpers
     core_lower.ml     # Typed AST → Core IR lowering
+    core_ffi_boundary.ml  # Checked FFI argument-boundary policies
     core_debug.ml     # debug: block erasure/retention by build mode
     core_desugar.ml   # Core IR sugar elimination
     core_ssa.ml       # Mutable-local lowering used by core_desugar
     core_mono.ml      # Core IR monomorphization
+    core_list_layout.ml  # List storage layout annotation
     core_synth.ml     # Post-mono body synthesis for concrete builtins
     core_match.ml     # Core IR pattern match → decision tree
     core_trait_resolve.ml  # Trait-method and overloaded-operator rewrite
@@ -415,6 +424,7 @@ compiler/            # OCaml compiler implementation
     core_tailrec.ml   # @tail_recursive self-call lowering
     core_string_pipeline.ml  # Core IR string producer/consumer fusion
     core_collection_pipeline.ml  # Core IR collection pipeline fusion
+    core_parallel_tensor_pipeline.ml  # Scoped vector/matrix pipeline fusion
     core_tensor_fusion.ml  # Core IR tensor update fusion
     core_tuple_sroa.ml  # Core IR non-escaping local tuple scalar replacement
     core_specialize.ml  # Core IR type-dispatch builtins → CCast / concrete names
@@ -422,6 +432,8 @@ compiler/            # OCaml compiler implementation
     core_perceus.ml   # Core IR Perceus RC insertion
     core_reuse.ml     # Core IR post-Perceus reuse eligibility analysis
     core_closure.ml   # Core IR closure conversion / lambda hoisting
+    core_resource.ml  # Resource-scope cleanup-exit lowering
+    core_codegen_prepare.ml  # Final Core representation preparation
     core_emit.ml      # Core IR → C emission
     core_emit_c.ml    # Default C backend wrapper
     core_pipeline.ml  # Core IR pipeline orchestration
@@ -436,10 +448,12 @@ compiler/            # OCaml compiler implementation
       codegen_builtins.ml  # Builtin function registry
     fmt/          # Formatter
       fmt.ml            # Format orchestration
-      fmt_printer.ml    # AST-to-source pretty printer
-      fmt_layout.ml     # Layout engine
       fmt_comment.ml    # Comment preservation
-      fmt_doc.ml        # Docstring formatting
+      fmt_decl_json.ml  # Declaration/program JSON projection
+      fmt_docstring_json.ml  # Docstring JSON projection
+      fmt_expr_json.ml  # Expression/type JSON projection
+      fmt_json.ml       # Shared JSON escaping helpers
+      fmt_source_span.ml  # Formatter source span helpers
     lsp/          # Language Server Protocol
       lsp_server.ml     # LSP main loop
       lsp_completion.ml # Autocomplete
@@ -473,21 +487,20 @@ std/              # Standard library (.brp files)
   string.brp, slice.brp  # String ecosystem
   parser.brp, regex.brp  # Text processing
   math.brp, tensor.brp, vector.brp, matrix.brp, stats.brp, units.brp  # Numeric
+  parallel_vector.brp, parallel_matrix.brp  # Scoped vector/matrix parallel views
   geometry.brp, geographic.brp, geojson.brp, physics.brp  # Spatial
   dsp.brp, fft.brp, noise.brp  # Signal/procedural helpers
   random.brp, crypto_random.brp  # Random
-  io.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp  # System
+  io.brp, file.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp  # System
   path.brp, process.brp, log.brp, term.brp  # OS/terminal
   csv.brp, html.brp, json.brp, toml.brp, xml.brp, yaml.brp  # Format parsers
   argparse.brp, hash.brp, uuid.brp  # Utilities
   codec.brp, codec_bridge.brp, validation.brp  # Encoding/validation
-  cache.brp, rate_limit.brp, property.brp, stream.brp, channel.brp  # Infrastructure
-  audio/          # Portable WAV helpers
+  cache.brp, parallel_list.brp, rate_limit.brp, property.brp, stream.brp, channel.brp  # Infrastructure
   net/            # Portable networking/protocol helpers (tcp, http, url, mime)
 
 pkg/              # Optional native-backed packages and third-party bindings
-  audio/neural_amp.brp  # Neural amp helpers with native NAM parsing
-  compress.brp, crypto.brp, sqlite.brp, tui.brp
+  compress.brp, crypto.brp, sqlite.brp
   net/            # Native DNS, HTTP client, SMTP, TLS, UDP, WebSocket
 
 examples/           # Curated preview examples restored intentionally
@@ -503,7 +516,8 @@ tests/
     functions/    # Closures, generics, HOF tests
     concurrency/  # Concurrent blocks, detach, channels tests
     simd/         # SIMD tests (skipped by default)
-    audio/        # Audio processing tests
+    tools/        # Tooling/runtime helper tests
+  test_std/       # Runtime tests for std modules
   test_compiler/  # Compiler behavior tests
     parser/       # Parser/lexer tests
       should_pass/
@@ -514,8 +528,10 @@ tests/
     typecheck/    # Type checking tests
       should_pass/
       should_fail/
+      pkg/
+      helpers/
     format/       # Formatter tests (should_pass/should_fail/should_error)
-    purify/       # Auto-purify tests (should_purify/should_not_purify)
+    purify/       # Auto-purify tests (should_purify/should_not_purify/should_rewrite)
     codegen_audit/  # Codegen correctness tests
   stages/         # Golden tests (lexer/parser/typecheck/codegen snapshots)
 
@@ -692,12 +708,11 @@ Unit tests for compiler internals live in `compiler/test/`. They use [Alcotest](
 
 **Structure:**
 - `compiler/test/run_tests.ml` — Main runner, aggregates all test suites
-- `compiler/test/test_types.ml` — Tests for `Types` module (unify, subst, equality, etc.)
-- `compiler/test/test_env.ml` — Tests for `Env` module (scoping, lookup, traits, aliases, etc.)
+- `compiler/test/test_*.ml` — Focused suites for compiler internals such as types, environments, Core passes, layout, resources, pipeline behavior, formatter helpers, and LSP behavior
 
 **Running:**
 ```bash
-make unit-test          # Run all OCaml unit tests (~0.01s)
+make unit-test          # Run all OCaml unit tests
 make coverage           # Run with coverage, report in compiler/_coverage/index.html
 ```
 
@@ -725,7 +740,7 @@ make coverage           # Run with coverage, report in compiler/_coverage/index.
 - Bias toward trusting tests
 
 ### ORGANIZATION
-Keep the project organized in a way that is intuitive. Use subdirectories when a group of files forms a coherent subsystem (e.g., `std/audio/`, `std/net/`).
+Keep the project organized in a way that is intuitive. Use subdirectories when a group of files forms a coherent subsystem (e.g., `std/net/`, `pkg/net/`, `tests/test_blorp/tools/`).
 
 **Note**: For quick build verification during iteration, use direct bash commands (`make`) rather than spawning an agent. Reserve agents for tasks requiring analysis.
 
