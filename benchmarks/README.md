@@ -53,6 +53,9 @@ These run when the filter is omitted or set to `all`.
 | `dict_ops` | Hash map build/lookup/remove/iterate | blorp, Go, Python |
 | `list_ops` | List append/sort/filter/fold/reverse/concat | blorp, Go, Python |
 | `set_ops` | Hash set build/contains/union/intersect/diff | blorp, Go, Python |
+| `threaded_cpu_map` | Fixed-width CPU-bound worker partitioning | blorp, C, Go, Python |
+| `channel_pipeline` | Bounded producer/worker/consumer channel pipeline | blorp, C, Go, Python |
+| `sleep_fanout` | Many sleeping tasks/threads spawned and joined together | blorp, C, Go, Python |
 | `options` | `Option` representation and layout costs | blorp |
 | `simd` | SIMD vector operations with checksum output | blorp, C |
 | `nbody` | Struct-of-arrays N-body planetary simulation | blorp, C, Go, Python |
@@ -129,13 +132,22 @@ or runner rather than reintroducing shell timing.
 ## Environment Variables
 
 ```bash
-PYTHON=python3.11  bash benchmarks/bench.sh   # Use specific Python
-GO=go1.22          bash benchmarks/bench.sh   # Use specific Go
-CC=gcc             bash benchmarks/bench.sh   # Use specific C compiler
-BENCH_RUNS=5       bash benchmarks/bench.sh   # Timed runs per language (default: 1)
-BENCH_WARMUPS=1    bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
-BENCH_VERBOSE=1    bash benchmarks/bench.sh   # Print build logs on failures
+PYTHON=python3.11               bash benchmarks/bench.sh   # Use specific Python
+PYTHON_CONCURRENCY=python3.14t  bash benchmarks/bench.sh   # Free-threaded Python for concurrency rows
+GO=go1.22                       bash benchmarks/bench.sh   # Use specific Go
+CC=gcc                          bash benchmarks/bench.sh   # Use specific C compiler
+BENCH_THREADS=4                 bash benchmarks/bench.sh   # Worker/task width for concurrency rows
+BLORP_THREADS=4                 bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
+GOMAXPROCS=4                    bash benchmarks/bench.sh   # Go runtime parallelism for concurrency rows
+BENCH_RUNS=5                    bash benchmarks/bench.sh   # Timed runs per language (default: 1)
+BENCH_WARMUPS=1                 bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
+BENCH_VERBOSE=1                 bash benchmarks/bench.sh   # Print build logs on failures
 ```
+
+Python variants of concurrency benchmarks intentionally use `PYTHON_CONCURRENCY`
+instead of `PYTHON`. That interpreter must be Python 3.14 or newer, built with
+free threading enabled, and the harness runs it with `-X gil=0` before checking
+that the GIL is disabled.
 
 ## Adding a New Benchmark
 
@@ -149,7 +161,9 @@ BENCH_VERBOSE=1    bash benchmarks/bench.sh   # Print build logs on failures
 5. Add `<name>` to `ALL_BENCHMARKS` in `benchmarks/bench.sh`, or to
    `EXTRA_BENCHMARKS` if it should be runnable and listed but excluded from
    the default `all` suite.
-6. Run `BENCH_RUNS=1 BENCH_WARMUPS=0 bash benchmarks/bench.sh <name>` to verify
+6. Add concurrency benchmarks to `CONCURRENCY_BENCHMARKS` when their Python
+   implementation requires the free-threaded interpreter path.
+7. Run `BENCH_RUNS=1 BENCH_WARMUPS=0 bash benchmarks/bench.sh <name>` to verify
    the source builds and reports a `BENCH` line.
 
 ## Performance Notes

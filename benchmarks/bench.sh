@@ -18,12 +18,16 @@
 #   bash benchmarks/bench.sh --list       # List available benchmarks
 #
 # Environment:
-#   PYTHON=python3.11  bash benchmarks/bench.sh   # Use specific Python
-#   GO=go1.22          bash benchmarks/bench.sh   # Use specific Go
-#   CC=gcc             bash benchmarks/bench.sh   # Use specific C compiler
-#   BENCH_RUNS=5       bash benchmarks/bench.sh   # Timed runs per language (default: 1)
-#   BENCH_WARMUPS=1    bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
-#   BENCH_VERBOSE=1    bash benchmarks/bench.sh   # Print build logs on failures
+#   PYTHON=python3.11                  bash benchmarks/bench.sh   # Use specific Python
+#   PYTHON_CONCURRENCY=python3.14t     bash benchmarks/bench.sh   # Free-threaded Python for concurrency rows
+#   GO=go1.22                          bash benchmarks/bench.sh   # Use specific Go
+#   CC=gcc                             bash benchmarks/bench.sh   # Use specific C compiler
+#   BENCH_THREADS=4                    bash benchmarks/bench.sh   # Worker/task width for concurrency rows
+#   BLORP_THREADS=4                    bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
+#   GOMAXPROCS=4                       bash benchmarks/bench.sh   # Go runtime parallelism for concurrency rows
+#   BENCH_RUNS=5                       bash benchmarks/bench.sh   # Timed runs per language (default: 1)
+#   BENCH_WARMUPS=1                    bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
+#   BENCH_VERBOSE=1                    bash benchmarks/bench.sh   # Print build logs on failures
 
 set -e
 
@@ -31,17 +35,23 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BLORP="$PROJECT_DIR/blorp"
 PYTHON="${PYTHON:-python3}"
+PYTHON_CONCURRENCY="${PYTHON_CONCURRENCY:-python3.14t}"
 GO="${GO:-go}"
 CC="${CC:-cc}"
+BENCH_THREADS="${BENCH_THREADS:-4}"
 BENCH_RUNS="${BENCH_RUNS:-1}"
 BENCH_WARMUPS="${BENCH_WARMUPS:-0}"
 BENCH_VERBOSE="${BENCH_VERBOSE:-0}"
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
+export BENCH_THREADS
+BLORP_CONCURRENCY_THREADS="${BLORP_THREADS:-$BENCH_THREADS}"
+GO_CONCURRENCY_THREADS="${GOMAXPROCS:-$BENCH_THREADS}"
 
 # Ordered benchmark list (determines display order)
-ALL_BENCHMARKS="numeric_loop fib string array_sum array_ops dict_ops list_ops set_ops options simd nbody binary_trees fannkuch spectral_norm mandelbrot knucleotide reverse_complement"
+ALL_BENCHMARKS="numeric_loop fib string array_sum array_ops dict_ops list_ops set_ops threaded_cpu_map channel_pipeline sleep_fanout options simd nbody binary_trees fannkuch spectral_norm mandelbrot knucleotide reverse_complement"
 EXTRA_BENCHMARKS="numeric_vector paradigms particle_gravity virtual_threads"
+CONCURRENCY_BENCHMARKS="threaded_cpu_map channel_pipeline sleep_fanout"
 SPEEDUP_SUPPRESSED_BENCHMARKS=""
 
 die() { echo "error: $1" >&2; exit 1; }
@@ -54,6 +64,22 @@ is_speedup_suppressed_benchmark() {
         *" $needle "*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+is_concurrency_benchmark() {
+    local needle="$1"
+    case " $CONCURRENCY_BENCHMARKS " in
+        *" $needle "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+contains_concurrency_benchmark() {
+    local name
+    for name in "$@"; do
+        is_concurrency_benchmark "$name" && return 0
+    done
+    return 1
 }
 
 bench_args_for() {
@@ -205,9 +231,9 @@ compile_blorp() {
     [ -f "$bench_c" ] || return 1
 
     write_c_timer "$timer_c" "$name" "blorp" 1
-    $CC -fwrapv -O3 -march=native -flto -Dmain=bench_main -c "$bench_c" -o "$obj"
-    $CC -fwrapv -O3 -march=native -flto -c "$timer_c" -o "$timer_o"
-    $CC -fwrapv -O3 -march=native -flto -o "$out" "$obj" "$timer_o" -lm -lpthread
+    $CC -fwrapv -O3 -march=native -flto -pthread -Dmain=bench_main -c "$bench_c" -o "$obj"
+    $CC -fwrapv -O3 -march=native -flto -pthread -c "$timer_c" -o "$timer_o"
+    $CC -fwrapv -O3 -march=native -flto -pthread -o "$out" "$obj" "$timer_o" -lm -lpthread
 }
 
 compile_c() {
@@ -222,9 +248,9 @@ compile_c() {
     fi
 
     write_c_timer "$timer_c" "$name" "c" "$call_with_args"
-    $CC -O3 -march=native -flto -Dmain=bench_main -c "$src" -o "$obj"
-    $CC -O3 -march=native -flto -c "$timer_c" -o "$timer_o"
-    $CC -O3 -march=native -flto -o "$out" "$obj" "$timer_o" -lm
+    $CC -O3 -march=native -flto -pthread -Dmain=bench_main -c "$src" -o "$obj"
+    $CC -O3 -march=native -flto -pthread -c "$timer_c" -o "$timer_o"
+    $CC -O3 -march=native -flto -pthread -o "$out" "$obj" "$timer_o" -lm
 }
 
 compile_go() {
@@ -389,6 +415,18 @@ run_built_lang() {
 
     is_built "$lang" "$name" || return 1
     out="$(compiled_out_for "$lang" "$name")"
+    if is_concurrency_benchmark "$name"; then
+        case "$lang" in
+            blorp)
+                run_and_read_seconds env "BLORP_THREADS=$BLORP_CONCURRENCY_THREADS" "$out" "${args[@]}"
+                return
+                ;;
+            go)
+                run_and_read_seconds env "GOMAXPROCS=$GO_CONCURRENCY_THREADS" "$out" "${args[@]}"
+                return
+                ;;
+        esac
+    fi
     run_and_read_seconds "$out" "${args[@]}"
 }
 
@@ -397,9 +435,30 @@ run_python_lang() {
     shift 2
     local args=("$@")
     local runner="$TEMP_DIR/python_bench_runner.py"
+    local py="$PYTHON"
+    local py_args=()
 
     write_python_runner "$runner"
-    run_and_read_seconds "$PYTHON" "$runner" "$name" "$src" "${args[@]}"
+    if is_concurrency_benchmark "$name"; then
+        py="$PYTHON_CONCURRENCY"
+        py_args=(-X gil=0)
+        "$py" "${py_args[@]}" - <<'PY'
+import sys
+import sysconfig
+
+if sys.version_info < (3, 14):
+    raise SystemExit("Python concurrency benchmarks require Python 3.14+")
+
+if str(sysconfig.get_config_var("Py_GIL_DISABLED")) != "1":
+    raise SystemExit("Python concurrency benchmarks require a free-threaded build")
+
+is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
+if callable(is_gil_enabled) and is_gil_enabled():
+    raise SystemExit("Python concurrency benchmarks require the GIL disabled")
+PY
+    fi
+
+    run_and_read_seconds "$py" "${py_args[@]}" "$runner" "$name" "$src" "${args[@]}"
 }
 
 run_one() {
@@ -447,7 +506,9 @@ run_one() {
         printf "  %8s" "-"
     fi
 
-    if has_bench python "$name" && has_cmd "$PYTHON"; then
+    local py_cmd="$PYTHON"
+    is_concurrency_benchmark "$name" && py_cmd="$PYTHON_CONCURRENCY"
+    if has_bench python "$name" && has_cmd "$py_cmd"; then
         src="$(src_for python "$name")"
         if pt=$(run_python_lang "$name" "$src" "${args[@]}" 2>/dev/null); then
             printf "  %9ss" "$pt"
@@ -504,7 +565,6 @@ echo "blorp: $BLORP"
 echo "C:     $($CC --version 2>&1 | head -1)"
 has_cmd "$GO" && echo "Go:    $($GO version 2>&1 | sed 's/go version //')"
 has_cmd "$PYTHON" && echo "Python:$($PYTHON --version 2>&1 | sed 's/^/ /')"
-echo ""
 
 if [ "$FILTER" = "all" ]; then
     RUN_BENCHMARKS="$ALL_BENCHMARKS"
@@ -512,6 +572,14 @@ else
     has_bench blorp "$FILTER" || die "unknown benchmark: $FILTER"
     RUN_BENCHMARKS="$FILTER"
 fi
+
+if contains_concurrency_benchmark $RUN_BENCHMARKS; then
+    has_cmd "$PYTHON_CONCURRENCY" && echo "Python concurrency: $($PYTHON_CONCURRENCY --version 2>&1 | sed 's/^/ /')"
+    echo "BENCH_THREADS: $BENCH_THREADS"
+    echo "BLORP_THREADS: $BLORP_CONCURRENCY_THREADS"
+    echo "GOMAXPROCS:    $GO_CONCURRENCY_THREADS"
+fi
+echo ""
 
 build_compiled_benchmarks "$RUN_BENCHMARKS"
 echo ""

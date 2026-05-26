@@ -1,6 +1,6 @@
 # Benchmark Audit
 
-Last audited: 2026-05-08.
+Last audited: 2026-05-26.
 
 This file tracks whether each public benchmark compares the same work across
 language implementations. A benchmark is apples-to-apples only when variants use
@@ -21,6 +21,9 @@ for rows marked **Not comparable** or **Blocked**.
 | `dict_ops` | blorp, Go, Python | Comparable | Same build, hit lookup, miss lookup, remove, and iteration workloads. No C variant. Harness wrapper times the full benchmark `main` body. |
 | `list_ops` | blorp, Go, Python | Comparable | Same append, stable sort, filter, fold, reverse, and concat workloads. Go uses `slices.SortStableFunc`, matching Blorp's stable list sort and Python's stable `sorted`. The sort checksum consumes sorted values, not only the result length. No C variant. |
 | `set_ops` | blorp, Go, Python | Comparable | Same build, contains-hit, contains-miss, union, intersection, and difference workloads. Union/intersection/difference now consume constructed result sizes in all variants, and exact output checks match. |
+| `threaded_cpu_map` | blorp, C, Go, Python | Comparable | Same `BENCH_THREADS` fixed worker width, same strided item partitioning, same CPU-bound integer kernel, same `BENCH_ITEMS`/`BENCH_ROUNDS` environment controls, and same checksum contract. Python is run through `PYTHON_CONCURRENCY` with Python 3.14+ free threading and `-X gil=0`. |
+| `channel_pipeline` | blorp, C, Go, Python | Comparable | Same single-producer, bounded-queue/channel, fixed worker pool, and main-thread drain contract. All variants process `BENCH_ITEMS` values through the same integer kernel and emit checksum plus processed count. Python uses the free-threaded interpreter path. |
+| `sleep_fanout` | blorp, C, Go, Python | Comparable | Same one task/thread per item, same `BENCH_SLEEP_MS` delay, same join/drain point, and same checksum. Runtime primitives differ by language, but the source-level concurrency contract is intentionally identical. Python uses the free-threaded interpreter path. |
 | `options` | blorp | Blorp-only | Representation benchmark for Blorp option layouts; no cross-language claim. |
 | `simd` | blorp, C | Comparable | Same operation families, element counts, iteration counts, fresh elementwise-result allocation contract, and checksum outputs. The row now prints deterministic checksums while the harness owns timing. |
 | `nbody` | blorp, C, Go, Python | Comparable | Same five-body data, struct-of-arrays layout, offset-momentum step, energy calculation, advance loop, iteration count, and fixed-precision output. Focused output checks match exactly. |
