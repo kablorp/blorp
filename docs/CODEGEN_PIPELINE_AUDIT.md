@@ -65,6 +65,17 @@ Follow-up habit:
    blindly. First split phase timing inside the stage or split the stage enum
    so compile-time profiles can show which traversal matters.
 
+   The scoped vector/matrix parallel cleanup roadmap is complete enough to
+   remove as a standalone roadmap. Remaining parallel-tensor follow-ups should
+   stay measurement-driven:
+   - rerun benchmark measurements on target release hardware before making
+     performance claims;
+   - consider source-storage reuse only after ownership analysis proves the
+     source is uniquely owned, dead after the pipeline, and layout-compatible
+     with the result;
+   - consider multiple `zip_map` fusion only if measurements justify the extra
+     lowering complexity.
+
 3. Runtime-capture and free-variable checks are recomputed in several places:
    `Core_collection_pipeline.lambda_has_no_runtime_captures`,
    `Core_perceus.lambda_has_runtime_captures`, and closure/emitter free-var

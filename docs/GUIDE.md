@@ -701,21 +701,22 @@ flat: Int[#6] = values.to_row_major_vector()
 rebuilt: Int[#2, #3] = from_row_major_vector(flat, 2, 3)
 ```
 
-Runtime-indexed cell helpers are explicit so they do not blur together with
-first-dimension tensor access. Use row helpers when the index selects a whole
-row. `get_column` returns `None` when the column is out of bounds;
-`get_column_or` accepts a fallback value instead:
+Runtime-indexed matrix cell access uses `get`/`get_or` with row and column
+arguments. First-dimension tensor access uses the same names with one index, so
+resolution stays type- and arity-directed. Use row helpers when the index
+selects a whole row. `get_column` returns `None` when the column is out of
+bounds; `get_column_or` accepts a fallback value instead:
 
 ```blorp
 import:
-    matrix: column_count, diagonal, get_cell, get_cell_or, get_column, get_column_or, get_row, get_row_or, identity, row_count, set_cell, set_column, set_diagonal, set_row, trace
+    matrix: column_count, diagonal, get, get_or, get_column, get_column_or, get_row, get_row_or, identity, row_count, set_cell, set_column, set_diagonal, set_row, trace
 
 
 m: Int[#2, #3] = matrix(0, 2, 3)
 rows: #2 = m.row_count()
 columns: #3 = m.column_count()
-maybe_cell: Option[Int] = m.get_cell(1, 2)
-cell: Int = m.get_cell_or(1, 2, -1)
+maybe_cell: Option[Int] = m.get(1, 2)
+cell: Int = m.get_or(1, 2, -1)
 maybe_row: Option[Int[#3]] = m.get_row(1)
 row: Int[#3] = m.get_row_or(1, {0, 0, 0})
 maybe_column: Option[Int[#2]] = m.get_column(2)
@@ -1211,8 +1212,8 @@ pure func safe_element[#N](v: Int[#N], i: ..#N) -> Int:
 Range types are part of the compile-time proof system. They let the type checker accept indexing without an extra source-level bounds guard, but some generic cases still lower through checked tensor helpers until later optimization folds them away.
 
 For arbitrary runtime indices where no proof is available, use `get` or
-`get_or` for vectors and first-dimension tensor access. Use `get_cell` or
-`get_cell_or` for matrix cells.
+`get_or`. Vectors and first-dimension tensor access take one index; matrix
+cell access takes row and column indices.
 
 ### Function Types
 

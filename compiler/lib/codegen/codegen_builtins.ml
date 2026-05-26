@@ -136,7 +136,7 @@ let matrix_builtins =
     ( (N.mod_matrix, "multiply_transposed_vector"),
       "blorp_tensor_transposed_matrix_vector_multiply" );
     ((N.mod_matrix, "outer"), "blorp_tensor_outer");
-    ((N.mod_matrix, "get_cell"), "blorp_matrix_get_opt");
+    ((N.mod_matrix, "get"), "blorp_matrix_get_opt");
     ((N.mod_matrix, "set_cell"), "blorp_matrix_checked_set");
     ((N.mod_matrix, "matrix_checked_get"), "blorp_matrix_checked_get");
     ((N.mod_matrix, "matrix_checked_set"), "blorp_matrix_checked_set");

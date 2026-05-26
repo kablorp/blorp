@@ -242,6 +242,21 @@ if [ "$NJOBS" -gt "${#test_files[@]}" ]; then
     NJOBS="${#test_files[@]}"
 fi
 
+stray_cases=()
+for brp in "$DIR"/*.brp; do
+    [ -f "$brp" ] && stray_cases+=("$brp")
+done
+
+if [ "${#stray_cases[@]}" -gt 0 ]; then
+    echo "FAIL: codegen audit cases must live under should_pass/:"
+    for brp in "${stray_cases[@]}"; do
+        echo "  $(basename "$brp")"
+    done
+    echo ""
+    echo "Results: 0 passed, 1 failed"
+    exit 1
+fi
+
 RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/blorp_codegen_audit_results.XXXXXX") || exit 1
 worker_pids=()
 
