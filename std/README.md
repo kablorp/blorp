@@ -127,6 +127,5 @@
 | `uuid` | UUID v4 generation and validation |
 | `validation` | Error-accumulating data validation |
 
-Native-backed packages such as `pkg/tui`, `pkg/compress`, `pkg/crypto`,
-`pkg/sqlite`, `pkg/audio/neural_amp`, and the `pkg/net/` modules live under
-`pkg/`, not `std/`.
+Native-backed packages such as `pkg/compress`, `pkg/crypto`, `pkg/sqlite`, and
+the `pkg/net/` modules live under `pkg/`, not `std/`.

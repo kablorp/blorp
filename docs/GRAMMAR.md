@@ -240,7 +240,7 @@ module_path = module_part { "/" module_part }
             | { "../" } module_part { "/" module_part } ;
 
 module_part = identifier ;
-identifier  = IDENT | "debug" ;
+identifier  = IDENT | "debug" | "with" | "concurrent" | "select" | "from" | "after" | "sealed" ;
 ```
 
 **Semantic constraints:**
@@ -268,7 +268,7 @@ annotation_inline = "@" IDENT [ "(" INT ")" ] ;
 
 **Semantic constraints:**
 - `include:` names a C header to emit in generated C. Relative header paths are resolved from the `.brp` file that declares the foreign function.
-- `link:`, `link_linux:`, and `link_macos:` carry C compiler/linker flags. They are not needed for headers that live next to the declaring `.brp` file.
+- `link:`, `link_linux:`, and `link_macos:` carry restricted C compiler/linker flags. Accepted tokens are `-lNAME`, `-LDIR`, `-IDIR`, `-framework NAME`, and `-pthread`. Object/archive filenames and raw linker escapes such as `-Wl,...` are rejected. Link flags are not needed for headers that live next to the declaring `.brp` file.
 
 ### Trait System
 
@@ -519,7 +519,8 @@ Certain keywords can be used as identifiers in field/function name position:
 
 ```ebnf
 name = IDENT | "debug" | "and" | "or" | "not" | "type" | "match" | "if" | "else"
-     | "True" | "False" | "in" | "for" | "while" | "foreign"
+     | "True" | "False" | "in" | "for" | "while" | "with" | "foreign"
+     | "resource" | "concurrent"
      | "select" | "from" | "after" | "sealed" ;
 ```
 

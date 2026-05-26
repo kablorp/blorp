@@ -787,6 +787,9 @@ let usage () =
   print_endline
     "  BLORP_LEAK_CHECK=1    Enable leak reporting (CLI flag overrides)";
   print_endline
+    "  BLORP_THREADS=N       Runtime worker thread pool size (run --threads \
+     overrides)";
+  print_endline
     "  BLORP_NO_FORMAT=1     Skip auto-formatting (CLI flag overrides)"
 
 type repl_cli_action =
@@ -1127,13 +1130,13 @@ let () =
                 "  --stop-after=STAGE        Stop after the given stage \
                  (implies no emit)";
               print_endline
-                "                            STAGE: lower, desugar, mono, \
-                 synth, match,";
+                "                            STAGE: lower, debug, desugar, \
+                 mono, synth, match,";
               print_endline
                 "                                   trait_resolve, resolve, \
-                 tailrec, fusion,";
+                 std_inline, tailrec, fusion,";
               print_endline
-                "                                   specialize, perceus, \
+                "                                   specialize, dce, perceus, \
                  reuse, closure, final";
               print_endline
                 "  --time-phases             Print per-phase compiler wall \

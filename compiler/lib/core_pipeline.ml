@@ -12,10 +12,11 @@
     8. [Core_resolve] — tag CCall by callee kind
     9. [Core_std_inline] — expand compiler-owned std wrappers at call sites
     10. [Core_tailrec] — make tail-recursive self-loops explicit
-    11. [Core_collection_pipeline] + [Core_tensor_fusion] +
-       [Core_tuple_sroa] — fuse compatible list pipelines and tensor update
-       expressions; scalar-replace non-escaping local tuples and narrow
-       tuple-return call sites
+    11. [Core_string_pipeline] + [Core_collection_pipeline] +
+       [Core_parallel_tensor_pipeline] + [Core_tensor_fusion] +
+       [Core_tuple_sroa] — fuse compatible string/list/scoped tensor pipelines
+       and tensor update expressions; scalar-replace non-escaping local tuples
+       and narrow tuple-return call sites
     12. [Core_specialize] + function-ref adaptation — type-dispatch builtins
        to CCast / concrete names; make eta adapters visible to Perceus
     13. [Core_dce] — prune unreachable concrete functions, impl methods,
@@ -25,7 +26,8 @@
     15. [Core_reuse] — analyze post-Perceus reuse candidates
     16. [Core_closure] — hoist lambdas and create closure values
     17. [Core_resource] — make resource cleanup before nonlocal loop exits explicit
-    18. [Core_emit_c] — Core IR → C string via the default backend
+    18. [Core_codegen_prepare] — make final representation/layout facts explicit
+    19. [Core_emit_c] — Core IR → C string via the default backend
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)

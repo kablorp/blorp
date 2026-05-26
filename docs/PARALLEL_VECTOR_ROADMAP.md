@@ -1,13 +1,13 @@
-# Parallel Vector Cleanup Roadmap
+# Parallel Vector And Matrix Cleanup Roadmap
 
 Status: implemented through scoped API, legacy API cleanup, Core fusion, runtime
 simplification, and benchmark/codegen audit coverage. Remaining work is
 limited to optional ownership reuse and repeated performance measurements on
 target hardware.
 
-This roadmap tracks the cleanup from direct vector parallel functions toward a
-scoped API that matches `List.parallel` while preserving vector-specific shape
-advantages.
+This roadmap tracks the cleanup from direct vector parallel functions toward
+scoped vector and matrix APIs that match `List.parallel` while preserving fixed
+shape advantages.
 
 ## Goals
 
@@ -130,6 +130,10 @@ Recognition uses `CKUser (_, Some def_id)` where possible for:
 - `std/parallel_vector.map`
 - `std/parallel_vector.map_indexed`
 - `std/parallel_vector.zip_map`
+- `std/matrix.parallel`
+- `std/parallel_matrix.map`
+- `std/parallel_matrix.map_indexed`
+- `std/parallel_matrix.zip_map`
 
 A small source-name fallback exists only for focused unit tests that construct
 Core by hand and bypass normal resolution.
@@ -141,10 +145,14 @@ Core by hand and bypass normal resolution.
 - Added `ParallelVector[T, #N]` in `std/vector.brp`.
 - Added `Vector.parallel`.
 - Added `std/parallel_vector.brp` with `map`, `map_indexed`, and `zip_map`.
+- Added `ParallelMatrix[T, #M, #N]`, `Matrix.parallel`, and
+  `std/parallel_matrix.brp` with the same scoped shape-preserving operations.
 - Registered `ParallelVector` as a managed vector-shaped builtin through type
   layout, result layout, C type mapping, Core tensor shape facts, and UFCS
-  method discovery.
-- Added inference support for expected return binding through `T[#N]` results.
+  method discovery. Registered `ParallelMatrix` through the matching
+  matrix-shaped paths.
+- Added inference support for expected return binding through `T[#N]` and
+  `T[#M, #N]` results.
 - Added tests for successful scoped map, indexed map, and zip-map, plus tests
   proving `filter`, `get`, and `for` are unavailable on the scoped view.
 
@@ -184,7 +192,8 @@ not meaningfully parallel and is no longer public.
 ### Phase 3: Pipeline Fusion
 
 Added `Core_parallel_tensor_pipeline`, which recognizes straight chains of
-`map`, `map_indexed`, and `zip_map` inside a scoped `Vector.parallel` callback.
+`map`, `map_indexed`, and `zip_map` inside scoped `Vector.parallel` and
+`Matrix.parallel` callbacks.
 
 - Map-only plans lower to one `blorp_vmap_parallel` call.
 - Plans that need the element index lower to one `blorp_vmap_indexed_parallel`
@@ -192,6 +201,9 @@ Added `Core_parallel_tensor_pipeline`, which recognizes straight chains of
 - Zip plans that use one same side vector lower to `blorp_vzip_parallel`, which
   passes that side vector explicitly instead of capturing it in the composed
   callback.
+- Matrix plans lower to the matching `blorp_mmap_parallel`,
+  `blorp_mmap_indexed_parallel`, `blorp_mmap_flat_indexed_parallel`,
+  `blorp_mzip_parallel`, or `blorp_mzip_indexed_parallel` runtime helper.
 - Unsupported shapes are left unfused only when ordinary Core lowering remains
   correct.
 
@@ -267,6 +279,9 @@ Generated-C audit shape:
   `blorp_vzip_parallel`.
 - The same audit asserts those scoped zip pipelines do not call
   `blorp_vmap_indexed_parallel` at their call sites.
+- `matrix_parallel_pipeline_fusion.brp` verifies matrix map, indexed-map,
+  same-side zip, indexed zip, and distinct-side zip chains lower to the matching
+  `blorp_m*` parallel helpers without unnecessary indexed-map fallback calls.
 
 ## Remaining Work
 

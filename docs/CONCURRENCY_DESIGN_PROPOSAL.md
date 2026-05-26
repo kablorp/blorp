@@ -8,10 +8,11 @@ practical power: cheap virtual tasks, direct blocking-style code, message
 passing, high-concurrency servers, database work, data-engineering pipelines,
 event loops, and resource-safe I/O.
 
-This proposal intentionally looks past the current `concurrent:`,
-`concurrent for`, and `detach` APIs. It uses the current resource API and
-virtual-thread runtime work as constraints, but not as syntax that must remain
-unchanged forever.
+This proposal was written during the transition away from legacy
+`concurrent for`. Current source syntax is `concurrent:`,
+`for ... concurrently(...)`, `List.concurrent(...)`, and `detach`. Older phase
+notes below may still mention `concurrent for` when describing migration history
+or removed behavior.
 
 ## Goals
 
@@ -131,7 +132,7 @@ Semantics:
   resource and cleanup runs when the task exits.
 - Cancellation closes resources owned by cancelled child tasks.
 
-This replaces the current `concurrent for` mental model. Instead of making
+This replaces the old `concurrent for` mental model. Instead of making
 fan-out produce `List[Result[T, ConcurrencyError]]`, fan-out is a loop modifier.
 The base construct is about running work, not collecting values.
 

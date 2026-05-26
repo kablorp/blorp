@@ -207,23 +207,22 @@ seeding should not silently fall back to predictable state.
 Goal: default FFI should be conservative, and unsafe FFI choices should be
 deliberate, visible, and mechanically checked.
 
-### Work Items
+Current status: default `String`/`Bytes` boundary policy, managed-value
+rejection, C symbol validation, `include:` validation, and restricted `link:`
+validation are implemented in the shared FFI boundary layer. Existing tests cover
+bad C names, bad include strings, traversal includes, shell-like link tokens,
+raw linker escapes, and malformed `-framework` flags. Remaining work is mostly
+diagnostic/documentation polish and additional edge coverage.
 
-- Keep default impure `foreign:` defensive-copy behavior for `String` and `Bytes`.
-- Continue rejecting unsupported managed values in default foreign mode.
-- Validate foreign C symbol names before Core lowering.
-- Validate `include:` values before code emission.
-- Keep `link:` values in a narrow structured subset: `-lNAME`, `-LDIR`,
-  `-IDIR`, `-framework NAME`, and `-pthread`.
-- Reject raw linker/compiler escape hatches such as response files, `-Wl,...`,
-  and `-Xlinker`.
+### Remaining Work Items
+
 - Make `foreign pure` and `@no_copy` diagnostics/docs more explicit about
   borrowed direct runtime memory.
 - Consider an `unsafe` spelling or annotation for direct-borrow native calls.
 - Keep foreign return-type restrictions for refinements like `LiteralString` and
   range types.
-- Add a single validation module for FFI metadata so parser, typecheck, Core,
-  and emit do not drift.
+- Keep the shared FFI metadata validation boundary as parser, typecheck, Core,
+  and emit evolve.
 
 ### Acceptance
 
@@ -236,16 +235,11 @@ deliberate, visible, and mechanically checked.
 - Existing package FFI declarations still compile after validation.
 - Codegen audit proves validated foreign metadata emits in the expected shape.
 
-### Tests To Add
+### Remaining Tests To Add
 
 - Compiler `should_fail`: foreign C name with whitespace.
-- Compiler `should_fail`: foreign C name with semicolon.
 - Compiler `should_fail`: foreign C name with quotes.
-- Compiler `should_fail`: `include:` containing a quote.
-- Compiler `should_fail`: `include:` containing a newline.
 - Compiler `should_fail`: `include:` containing control characters.
-- Compiler `should_fail`: `link:` containing shell metacharacters.
-- Compiler `should_fail`: `link:` containing unsupported raw linker flags.
 - Compiler `should_fail`: default foreign block function with `List[T]` argument.
 - Compiler `should_fail`: foreign block function returning `LiteralString`.
 - Codegen audit: default String argument copies and releases the copy.

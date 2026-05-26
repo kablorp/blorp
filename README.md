@@ -289,7 +289,7 @@ Useful commands:
 | [Memory Model](docs/MEMORY_MODEL.md) | ARC, COW, uniqueness |
 | [Ownership Model](docs/OWNERSHIP_MODEL.md) | Compiler-facing ownership, Perceus, and COW ABI |
 | [Architecture](docs/ARCHITECTURE.md) | Compiler internals |
-| [Backend Independence](docs/BACKEND_INDEPENDENCE.md) | Backend-facing Core IR contract |
+| [Codegen Pipeline Audit](docs/CODEGEN_PIPELINE_AUDIT.md) | Core-to-C pipeline maintainability audit |
 
 ## Contributing
 If you'd like to contribute, the best thing would be to simply try to use the language and file bugs for any issues
