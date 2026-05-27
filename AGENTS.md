@@ -200,9 +200,12 @@ test-runner agents. No exceptions for "trivial" changes — trivial changes have
 update `docs/GUIDE.md` and `docs/GRAMMAR.md` in the same commit. Documentation drift is a bug.
 The formal grammar must stay in sync with the parser.
 
-**11. Don't break existing code without a migration path.** When renaming or removing syntax,
-the old form should produce a helpful error suggesting the new form. Breaking changes to std/
-function signatures require updating all call sites in tests/ and examples/ in the same commit.
+**11. Prefer coherent pre-0.1 behavior over backwards compatibility.** Blorp is pre-0.1.0, so
+do not preserve old syntax, APIs, or compatibility shims merely to avoid breaking users. If the
+new behavior is clearer, safer, or simpler, remove the old form and make the current language
+coherent. Breaking changes still require updating all call sites in std/, tests/, examples/, docs,
+and formatter expectations in the same change. Add migration-style error messages only when they
+meaningfully improve first-time user experience or prevent confusing parser/typechecker failures.
 
 ---
 
