@@ -620,17 +620,17 @@ let test_mono_e2e_pipeline () =
    ============================================================================ *)
 
 (** Regression for the post-cutover bug where UFCS-mangled call names were
-    never enqueued for specialization. Uses [ok_or] so [get_or] can be covered
+    never enqueued for specialization. Uses [to_result] so [get_or] can be covered
     by the option-fusion regression below. *)
 let test_mono_ufcs_mangled_callee () =
-  (* generic body stored under its prefixed name: std_option__ok_or *)
+  (* generic body stored under its prefixed name: std_option__to_result *)
   let gf =
-    mk_func ~type_params:[ "T"; "E" ] "std_option__ok_or"
+    mk_func ~type_params:[ "T"; "E" ] "std_option__to_result"
       [ ("self", TyNamed ("Option", [ TyVar "T" ])); ("error", TyVar "E") ]
       (TyNamed ("Result", [ TyVar "T"; TyVar "E" ]))
       (cvar "err_result" (TyNamed ("Result", [ TyVar "T"; TyVar "E" ])))
   in
-  (* call site uses the UFCS-mangled form: __ufcs_std$option__ok_or *)
+  (* call site uses the UFCS-mangled form: __ufcs_std$option__to_result *)
   let ty_char = TyNamed ("Char", []) in
   let result_ty = TyNamed ("Result", [ ty_char; ty_string ]) in
   let fty =
@@ -645,7 +645,7 @@ let test_mono_ufcs_mangled_callee () =
     mk
       (CCall
          ( CKUnknown,
-           cvar "__ufcs_std$option__ok_or" fty,
+           cvar "__ufcs_std$option__to_result" fty,
            [
              cvar "opt" (TyNamed ("Option", [ ty_char ])); cvar "err" ty_string;
            ] ))
@@ -665,7 +665,7 @@ let test_mono_ufcs_mangled_callee () =
   in
   Alcotest.(check bool)
     "has Char/String specialization" true
-    (List.mem "std_option__ok_or__mono_String_Char" names)
+    (List.mem "std_option__to_result__mono_String_Char" names)
 
 let test_mono_bare_call_prefers_selected_direct_kind_generic () =
   let impure_primary =

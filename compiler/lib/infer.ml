@@ -4409,7 +4409,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                 error binding.with_value.expr_loc
                   "Cannot use Option ?= in a with binding inside a block \
                    returning Result. Convert the Option to Result with \
-                   ok_or(...) or return Option from the enclosing function"
+                   to_result(...) or return Option from the enclosing function"
             | Some carrier_ty, (TyNamed ("Option", _) | TyNamed ("Result", _))
               ->
                 error binding.with_value.expr_loc
@@ -10095,7 +10095,7 @@ and infer_question_bind_statement ctx stmt name ty_ann rhs =
     | Some (TyNamed ("Result", _)), TyNamed ("Option", [ _inner_ty ]) ->
         error stmt.expr_loc
           "Cannot use Option ?= in a block returning Result. Convert the \
-           Option to Result with ok_or(...) or return Option from the \
+           Option to Result with to_result(...) or return Option from the \
            enclosing function"
     | Some carrier_ty, (TyNamed ("Option", _) | TyNamed ("Result", _)) ->
         error stmt.expr_loc
