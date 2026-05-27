@@ -1083,7 +1083,7 @@ static inline void blorp_vector_write_f64(blorp_Vector* v, long index, double va
     memcpy(&v->data[index], &value, sizeof(double));
 }
 
-#ifdef __clang__
+#ifdef __FLT16_MAX__
 static inline _Float16 blorp_vector_read_f16(const blorp_Vector* v, long index) {
     return blorp_unbox_float16(v->data[index]);
 }

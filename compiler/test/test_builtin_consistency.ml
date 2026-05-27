@@ -550,6 +550,30 @@ let test_cloexec_helpers_declare_fallback_locals_once () =
         ];
     ]
 
+let test_float16_vector_read_decl_uses_feature_guard () =
+  let runtime_decl =
+    read_first_existing
+      [
+        "compiler/lib/runtime_decl.c";
+        "../lib/runtime_decl.c";
+        "lib/runtime_decl.c";
+      ]
+  in
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let helper = "static inline _Float16 blorp_vector_read_f16" in
+  Alcotest.(check bool)
+    "runtime_decl exposes Float16 vector reader when _Float16 is supported" true
+    (contains_substring runtime_decl ("#ifdef __FLT16_MAX__\n" ^ helper));
+  Alcotest.(check bool)
+    "runtime_decl Float16 vector reader is not clang-only" false
+    (contains_substring runtime_decl ("#ifdef __clang__\n" ^ helper));
+  Alcotest.(check bool)
+    "runtime Float16 vector reader uses same feature guard" true
+    (contains_substring runtime ("#ifdef __FLT16_MAX__\n" ^ helper))
+
 let test_channel_status_runtime_abi_is_declared () =
   let runtime_decl =
     read_first_existing
@@ -1362,6 +1386,8 @@ let suite =
           test_fiber_intrusive_links_are_role_specific;
         Alcotest.test_case "cloexec helpers declare fallback locals once" `Quick
           test_cloexec_helpers_declare_fallback_locals_once;
+        Alcotest.test_case "Float16 vector reader ABI uses feature guard" `Quick
+          test_float16_vector_read_decl_uses_feature_guard;
         Alcotest.test_case "channel status ABI is declared" `Quick
           test_channel_status_runtime_abi_is_declared;
         Alcotest.test_case "stream element layout is explicit" `Quick
