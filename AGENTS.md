@@ -223,6 +223,7 @@ scripts/run_tests.sh leak               # Focused leak-check baselines
 scripts/run_tests.sh doctest            # Doctests (std/ library)
 scripts/run_tests.sh cli                # CLI smoke and exit-code checks
 scripts/run_tests.sh unit compiler      # Multiple suites
+scripts/run_tests.sh --serial           # Run selected suites one at a time
 scripts/run_tests.sh --coverage         # Unit tests with coverage report
 
 # Run individual test files
