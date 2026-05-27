@@ -1,0 +1,212 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_run:
+    workflows: ['CI']
+    branches: [main]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build binary (${{ matrix.os }})
+    if: ${{ github.event_name == 'push' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Install system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev
+
+      - name: Setup OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '4.14'
+
+      - name: Install dependencies
+        run: opam install ./compiler/blorp.opam --deps-only --with-test -y
+
+      - name: Compute release metadata
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          target=$(scripts/target-triple)
+          short_sha=${SOURCE_SHA:0:12}
+          source_version=$(sed -n 's/^let source_version = "\(.*\)"/\1/p' compiler/lib/version.ml)
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            version="${REF_NAME#v}"
+            if [[ "$version" == *-* ]]; then
+              channel="preview"
+            else
+              channel="release"
+            fi
+          else
+            version="${source_version}-dev.${short_sha}"
+            channel="canary"
+          fi
+
+          {
+            echo "target=$target"
+            echo "source_sha=$SOURCE_SHA"
+            echo "short_sha=$short_sha"
+            echo "version=$version"
+            echo "channel=$channel"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build compiler
+        env:
+          BLORP_BUILD_VERSION: ${{ steps.meta.outputs.version }}
+          BLORP_BUILD_COMMIT: ${{ steps.meta.outputs.source_sha }}
+          BLORP_BUILD_TARGET: ${{ steps.meta.outputs.target }}
+          BLORP_BUILD_CHANNEL: ${{ steps.meta.outputs.channel }}
+          BLORP_BUILD_DIRTY: 'false'
+        run: |
+          make clean
+          opam exec -- make
+          ./blorp --version
+
+      - name: Package binary
+        env:
+          BLORP_RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          BLORP_RELEASE_TARGET: ${{ steps.meta.outputs.target }}
+        run: scripts/package-release dist
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: blorp-${{ steps.meta.outputs.target }}
+          path: dist/*
+
+  publish:
+    name: Publish release
+    needs: build
+    if: ${{ github.event_name == 'push' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: blorp-*
+          merge-multiple: true
+          path: dist
+
+      - name: Compute publish metadata
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          short_sha=${SOURCE_SHA:0:12}
+          source_version=$(sed -n 's/^let source_version = "\(.*\)"/\1/p' compiler/lib/version.ml)
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            version="${REF_NAME#v}"
+            tag="$REF_NAME"
+            title="Blorp ${version}"
+            if [[ "$version" == *-* ]]; then
+              prerelease="true"
+            else
+              prerelease="false"
+            fi
+          else
+            version="${source_version}-dev.${short_sha}"
+            tag="canary"
+            title="Blorp canary ${short_sha}"
+            prerelease="true"
+          fi
+
+          {
+            echo "source_sha=$SOURCE_SHA"
+            echo "short_sha=$short_sha"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "title=$title"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.meta.outputs.tag }}" = "canary" ]; then
+            cat > release-notes.md <<EOF
+          Automated canary build from main.
+
+          Commit: ${{ steps.meta.outputs.source_sha }}
+
+          This release is for dogfooding and early testing. Prefer tagged releases for stable preview downloads.
+          EOF
+          else
+            cat > release-notes.md <<EOF
+          Blorp ${{ steps.meta.outputs.version }}.
+
+          Commit: ${{ steps.meta.outputs.source_sha }}
+          EOF
+          fi
+
+      - name: Publish canary release
+        if: ${{ steps.meta.outputs.tag == 'canary' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release delete canary --yes --cleanup-tag || true
+          git tag -f canary "${{ steps.meta.outputs.source_sha }}"
+          git push -f origin canary
+          gh release create canary dist/* \
+            --prerelease \
+            --latest=false \
+            --title "${{ steps.meta.outputs.title }}" \
+            --notes-file release-notes.md
+
+      - name: Publish tagged release
+        if: ${{ steps.meta.outputs.tag != 'canary' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            release create "${{ steps.meta.outputs.tag }}"
+            dist/*
+            --verify-tag
+            --title "${{ steps.meta.outputs.title }}"
+            --notes-file release-notes.md
+          )
+          if [ "${{ steps.meta.outputs.prerelease }}" = "true" ]; then
+            args+=(--prerelease --latest=false)
+          fi
+          gh "${args[@]}"
