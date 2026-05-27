@@ -580,7 +580,7 @@ Invariants:
 
 Validation:
 
-- `scripts/run_tests.sh compiler`
+- `scripts/test compiler`
 - `make unit-test`
 - Targeted runtime tests for any fixture that reaches Core/codegen.
 

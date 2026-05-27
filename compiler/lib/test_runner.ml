@@ -2278,7 +2278,17 @@ let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
     Printf.printf "\nResults: %d passed, %d failed (%d tests)%s\n" passed failed
       total_individual time_str
   else
-    Printf.printf "\nResults: %d passed, %d failed%s\n" passed failed time_str
+    Printf.printf "\nResults: %d passed, %d failed%s\n" passed failed time_str;
+  match Sys.getenv_opt "BLORP_GATE_RESULT" with
+  | Some gate when String.trim gate <> "" ->
+      let status = if failed = 0 then "PASS" else "FAIL" in
+      let tests =
+        if total_individual > 0 then total_individual else passed + failed
+      in
+      Printf.printf "BLORP_GATE_RESULT gate=%s status=%s passed=%d failed=%d \
+                     tests=%d\n"
+        gate status passed failed tests
+  | _ -> ()
 
 (* ============================================================================
    Test Runners

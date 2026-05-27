@@ -42,8 +42,13 @@ Blorp focuses on:
 
 ```bash
 make
-scripts/run_tests.sh
+scripts/test
 ```
+
+The main test runner is quiet by default and prints a gate summary plus failure
+details. Use `scripts/test --verbose` for pass-by-pass output, or
+`scripts/test --log-dir logs` to keep complete gate logs while preserving
+compact console output.
 
 Useful targeted commands:
 

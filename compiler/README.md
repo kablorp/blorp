@@ -21,7 +21,7 @@ cd compiler && dune build
 ./blorp run myfile.brp
 
 # Run the fast compiler-focused suites
-scripts/run_tests.sh unit compiler
+scripts/test unit compiler
 ```
 
 ## Directory Structure

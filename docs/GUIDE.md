@@ -3527,7 +3527,7 @@ Standard library selection precedence is: `--std-dir`, `BLORP_STD`, `blorp.toml`
 BLORP_LEAK_CHECK=1 ./blorp run program.brp
 
 # Run the focused compiler/runtime leak baselines
-scripts/run_tests.sh leak
+scripts/test leak
 
 # Run with AddressSanitizer
 ./blorp test --sanitize tests/test_blorp/memory/

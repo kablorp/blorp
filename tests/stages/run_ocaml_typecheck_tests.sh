@@ -3,7 +3,7 @@
 # Compares OCaml type checker results against the parser AST golden files
 
 echo "OCaml stage golden tests are retired; type errors in these fixtures are no longer a supported pass condition." >&2
-echo "Use make unit-test and scripts/run_tests.sh compiler for supported typechecker coverage." >&2
+echo "Use make unit-test and scripts/test compiler for supported typechecker coverage." >&2
 exit 1
 
 # Don't exit on error - we want to continue testing

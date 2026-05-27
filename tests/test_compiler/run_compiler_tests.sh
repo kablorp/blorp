@@ -20,6 +20,32 @@
 cd "$(dirname "$0")/../.."
 REPO_ROOT=$(pwd -P)
 
+verbose=false
+self_test_timeout=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --verbose)
+            verbose=true
+            ;;
+        --quiet)
+            verbose=false
+            ;;
+        --self-test-timeout)
+            self_test_timeout=true
+            ;;
+        -h|--help)
+            echo "Usage: tests/test_compiler/run_compiler_tests.sh [--quiet|--verbose] [--self-test-timeout]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            echo "Usage: tests/test_compiler/run_compiler_tests.sh [--quiet|--verbose] [--self-test-timeout]" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
 # Find the compiler binary
 if [ -n "${BLORP_BIN:-}" ]; then
     BLORP_BIN="$BLORP_BIN"
@@ -275,7 +301,7 @@ on_interrupt() {
 trap on_interrupt INT TERM
 trap cleanup_result_dir EXIT
 
-if [ "${1:-}" = "--self-test-timeout" ]; then
+if $self_test_timeout; then
     self_test_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_compiler_timeout.XXXXXX")
     self_test_child_pid="$self_test_dir/child.pid"
     self_test_fake="$self_test_dir/fake-blorp"
@@ -668,7 +694,12 @@ for chunk_id in $(seq 0 $((NJOBS - 1))); do
     [ -f "$result_file" ] || continue
     while IFS= read -r line; do
         case "$line" in
-            PASS\ *)  echo "${line#PASS }"; ((passed++)) ;;
+            PASS\ *)
+                if $verbose; then
+                    echo "${line#PASS }"
+                fi
+                ((passed++))
+                ;;
             FAIL\ *)  echo "${line#FAIL }"; ((failed++)) ;;
             DETAIL\ *) echo "${line#DETAIL }" ;;
         esac
@@ -693,7 +724,9 @@ if [ -x "$codegen_audit" ]; then
     while IFS= read -r line; do
         case "$line" in
             PASS:*)
-                echo "✓ [codegen_audit] ${line#PASS: }"
+                if $verbose; then
+                    echo "✓ [codegen_audit] ${line#PASS: }"
+                fi
                 ((passed++))
                 ((total++))
                 ((codegen_cases++))
@@ -739,9 +772,11 @@ if [ $missing_expect -gt 0 ]; then
     echo "⚠ $missing_expect should_fail test(s) without -- EXPECT: annotations (format tests excluded)"
 fi
 if [ $failed -eq 0 ]; then
+    echo "BLORP_GATE_RESULT gate=compiler status=PASS passed=$passed failed=0 tests=$total"
     echo "✓ All $total compiler tests passed"
     exit 0
 else
+    echo "BLORP_GATE_RESULT gate=compiler status=FAIL passed=$passed failed=$failed tests=$total"
     echo "✗ $passed/$total compiler tests passed ($failed failed)"
     exit 1
 fi

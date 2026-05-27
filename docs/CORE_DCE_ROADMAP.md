@@ -253,8 +253,8 @@ For each phase:
 
 ```bash
 make
-scripts/run_tests.sh compiler
-scripts/run_tests.sh runtime
+scripts/test compiler
+scripts/test runtime
 make fmt-check
 git diff --check
 ```

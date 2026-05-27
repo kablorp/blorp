@@ -3,29 +3,69 @@
 ## Running Tests
 
 ```bash
-# Run all test suites
-scripts/run_tests.sh
+# Run all test gates
+scripts/test
 
-# Run specific suites
-scripts/run_tests.sh unit               # OCaml unit tests (compiler internals)
-scripts/run_tests.sh compiler           # Compiler tests (should_pass/should_fail)
-scripts/run_tests.sh runtime            # Runtime language, std, and pkg tests
-scripts/run_tests.sh leak               # Focused leak-check baselines
-scripts/run_tests.sh doctest            # Doctests (std/ library)
-scripts/run_tests.sh cli                # CLI smoke and exit-code checks
-scripts/run_tests.sh unit compiler      # Multiple suites
-scripts/run_tests.sh --coverage         # Unit tests with coverage report
+# Run specific gates
+scripts/test unit               # OCaml unit tests (compiler internals)
+scripts/test compiler           # Compiler tests (should_pass/should_fail)
+scripts/test runtime            # Runtime language, std, and pkg tests
+scripts/test leak               # Focused leak-check baselines
+scripts/test doctest            # Doctests (std/ library)
+scripts/test cli                # CLI smoke and exit-code checks
+scripts/test unit compiler      # Multiple gates
+scripts/test --coverage         # Unit tests with coverage report
+scripts/test --verbose          # Print pass-by-pass child-runner output
+scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
 # Run individual test files directly
 ./blorp test tests/test_blorp/types/test_struct.brp
-scripts/run_tests.sh runtime
+scripts/test runtime
 ./blorp test --doc std/string.brp
 ```
+
+`scripts/test` is the test entrypoint.
+
+`scripts/test` is quiet by default: successful runs print gate headers
+and the final summary, while failures print the failing cases and a short
+excerpt. Use `--verbose` when debugging runner behavior or when you need the old
+pass-by-pass stream.
+
+`scripts/test` also holds a per-worktree build lock for the duration of the
+gate. This keeps concurrent local invocations from racing on Dune build state,
+coverage artifacts, or the root `./blorp` executable.
+
+Gate runners that are consumed by `scripts/test` should emit one structured
+summary line:
+
+```text
+BLORP_GATE_RESULT gate=<gate> status=<PASS|FAIL> passed=<n> failed=<n> tests=<n>
+```
+
+Human output can change, but this line is the stable contract used by the
+top-level gate summary. `./blorp test` emits the line only when
+`BLORP_GATE_RESULT=<gate>` is set by the parent runner.
+
+## Terminology
+
+- A **gate** is a top-level validation entry such as `unit`, `compiler`,
+  `runtime`, `leak`, `doctest`, or `cli`.
+- A **suite** is an organized group inside a gate, such as
+  `typecheck/should_fail`, `codegen_audit`, or one `.brp` file containing a
+  `tests: TestSuite` value.
+- A **case** is the smallest checked behavior: one compiler fixture, one
+  `TestSuite` entry, or one doctest example.
+
+Prefer these terms in runner output, docs, and new scripts. Avoid using
+"suite" for both the top-level gate and the individual checks inside it.
 
 ## Test Organization
 
 ```
-scripts/run_tests.sh      # Master test runner (all suites)
+scripts/test              # Main local test gate
+scripts/premerge-gate     # Full local pre-merge validation gate
+scripts/docker-gate       # Docker-backed validation gate
+scripts/with-build-lock   # Shared lock wrapper for build/test gates
 compiler/test/               # OCaml unit tests (Alcotest)
   run_tests.ml            # Test runner
   test_types.ml           # Types module tests
@@ -48,9 +88,9 @@ tests/
 │   ├── io/                # I/O module tests
 │   └── stream/            # Stream tests
 ├── test_pkg/              # Optional runtime tests for pkg/, created when pkg tests exist
-├── test_cli.sh            # CLI smoke and exit-code checks used by scripts/run_tests.sh
+├── test_cli.sh            # CLI smoke and exit-code checks used by scripts/test
 ├── test_lsp.sh, test_repl.sh, test_auto_format.sh, test_leak_report.sh
-│                           # Standalone smoke tests, not part of scripts/run_tests.sh
+│                           # Standalone smoke tests, not part of scripts/test
 ├── stages/                # Historical golden fixtures; runners need refresh before use
 └── test_compiler/         # Compiler behavior tests
     ├── parser/            # Parser/lexer tests
@@ -111,5 +151,6 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
    - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
    - CLI behavior → `tests/test_cli.sh`
    - Standard library examples → doctests in `std/`
-2. Always add both `should_pass` and `should_fail` cases for compiler tests
+2. Add positive and negative compiler cases when both sides describe meaningful
+   behavior. Do not add mirrored fixtures just to satisfy ceremony.
 3. Use descriptive file names: `test_feature_name.brp`

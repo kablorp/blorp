@@ -5,7 +5,7 @@
 set -e
 
 echo "Parser golden stage tests are retired; current --dump-ast output no longer matches these fixtures." >&2
-echo "Use scripts/run_tests.sh compiler/runtime for supported parser coverage." >&2
+echo "Use scripts/test compiler/runtime for supported parser coverage." >&2
 exit 1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

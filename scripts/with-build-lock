@@ -1,0 +1,64 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ $# -eq 0 ]; then
+    echo "Usage: scripts/with-build-lock COMMAND [ARG...]" >&2
+    exit 2
+fi
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
+lock_base="${BLORP_BUILD_LOCK_BASE:-${TMPDIR:-/tmp}/blorp-build-locks}"
+mkdir -p "$lock_base"
+
+lock_key=$(printf '%s' "$repo_root" | cksum | awk '{print $1}')
+lock_file="$lock_base/$lock_key.lock"
+
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$lock_file"
+    flock 9
+    exec "$@"
+fi
+
+lock_dir="$lock_file.d"
+owner_file="$lock_dir/owner.pid"
+while ! mkdir "$lock_dir" 2>/dev/null; do
+    if [ -f "$owner_file" ]; then
+        owner_pid=$(cat "$owner_file" 2>/dev/null || true)
+        if [ -n "$owner_pid" ] && ! kill -0 "$owner_pid" 2>/dev/null; then
+            rm -rf "$lock_dir"
+            continue
+        fi
+    fi
+    sleep 0.2
+done
+
+cleanup_lock() {
+    rm -f "$owner_file"
+    rmdir "$lock_dir" 2>/dev/null || true
+}
+
+child_pid=""
+forward_signal() {
+    local signal="$1"
+    local exit_code="$2"
+    if [ -n "$child_pid" ]; then
+        kill -"$signal" "$child_pid" 2>/dev/null || true
+        wait "$child_pid" 2>/dev/null || true
+    fi
+    cleanup_lock
+    exit "$exit_code"
+}
+
+echo "$$" > "$owner_file"
+trap cleanup_lock EXIT
+trap 'forward_signal INT 130' INT
+trap 'forward_signal TERM 143' TERM
+"$@" &
+child_pid=$!
+echo "$child_pid" > "$owner_file"
+
+if wait "$child_pid"; then
+    exit 0
+else
+    exit $?
+fi

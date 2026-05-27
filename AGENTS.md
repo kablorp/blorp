@@ -213,31 +213,35 @@ function signatures require updating all call sites in tests/ and examples/ in t
 make
 
 # Run ALL tests (unit + compiler + runtime + leak + doctest + cli)
-scripts/run_tests.sh
+scripts/test
 
-# Run specific test suites
-scripts/run_tests.sh unit               # OCaml unit tests (compiler internals)
-scripts/run_tests.sh compiler           # Compiler tests (should_pass/should_fail)
-scripts/run_tests.sh runtime            # Runtime .brp tests
-scripts/run_tests.sh leak               # Focused leak-check baselines
-scripts/run_tests.sh doctest            # Doctests (std/ library)
-scripts/run_tests.sh cli                # CLI smoke and exit-code checks
-scripts/run_tests.sh unit compiler      # Multiple suites
-scripts/run_tests.sh --serial           # Run selected suites one at a time
-scripts/run_tests.sh --coverage         # Unit tests with coverage report
+# Run specific test gates
+scripts/test unit               # OCaml unit tests (compiler internals)
+scripts/test compiler           # Compiler tests (should_pass/should_fail)
+scripts/test runtime            # Runtime .brp tests
+scripts/test leak               # Focused leak-check baselines
+scripts/test doctest            # Doctests (std/ library)
+scripts/test cli                # CLI smoke and exit-code checks
+scripts/test unit compiler      # Multiple gates
+scripts/test --serial           # Run selected gates one at a time
+scripts/test --coverage         # Unit tests with coverage report
+scripts/test --verbose          # Print pass-by-pass child-runner output
+scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
 # Run individual test files
 ./blorp test tests/test_blorp/factorial.brp
 
 # Makefile shortcuts
-make test                         # Runtime tests only
+make test                         # Top-level local test gate
+make runtime-test                 # Runtime tests only
 make unit-test                    # Unit tests only
 make coverage                     # Unit tests with coverage
 make fmt-check                    # OCaml formatting check
 make quality                      # OCaml checks + hygiene + C static analysis
 make quality-full                 # quality + ocamlformat check
-make docker-full-gate             # Full gate in Ubuntu Docker (linux/amd64)
-make docker-full-gate-all         # Full gate in Ubuntu Docker (linux/amd64 + linux/arm64)
+make docker-gate                  # Normal test gate in Ubuntu Docker (linux/amd64)
+make docker-premerge-gate         # Premerge gate in Ubuntu Docker (linux/amd64)
+make docker-premerge-gate-all     # Premerge gate in Ubuntu Docker (linux/amd64 + linux/arm64)
 ```
 
 ### Preview Gate
@@ -250,12 +254,12 @@ failure.
 ```bash
 make
 make fmt-check
-scripts/run_tests.sh unit
-scripts/run_tests.sh compiler
-scripts/run_tests.sh runtime
-scripts/run_tests.sh leak
-scripts/run_tests.sh doctest
-scripts/run_tests.sh cli
+scripts/test unit
+scripts/test compiler
+scripts/test runtime
+scripts/test leak
+scripts/test doctest
+scripts/test cli
 ```
 
 The runtime gate uses `BLORP_TEST_TIMEOUT` when set and otherwise runs with a
@@ -308,12 +312,12 @@ benign before preview release.
 For local Linux architecture parity, use Docker:
 
 ```bash
-scripts/docker-test --full-gate --platform linux/amd64
-scripts/docker-test --full-gate --platform linux/arm64
-scripts/docker-test --full-gate --all-platforms
+scripts/docker-gate --premerge-gate --platform linux/amd64
+scripts/docker-gate --premerge-gate --platform linux/arm64
+scripts/docker-gate --premerge-gate --all-platforms
 ```
 
-The Docker full gate runs `scripts/full-gate --no-docker` inside the container
+The Docker premerge gate runs `scripts/premerge-gate --no-docker` inside the container
 to avoid nested Docker. Cross-architecture runs require Docker support for the
 requested platform, for example Docker Desktop or configured QEMU/binfmt.
 

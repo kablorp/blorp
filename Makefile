@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build install warm-formatter clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell docker-full-gate docker-full-gate-all
+.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 FORMATTER_SOURCES := $(shell find tools/formatter -name '*.brp' 2>/dev/null)
@@ -63,13 +63,17 @@ compiler/lib/embedded_formatter.ml: compiler/tools/gen_embed_formatter.ml $(FORM
 build: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml
 	cd compiler && dune build
 
-# Run all runtime tests (language features + standard library)
-test: all
+# Run the top-level local test gate
+test:
+	scripts/test
+
+# Run runtime tests only (language features + standard library)
+runtime-test: all
 	./blorp test $(RUNTIME_TEST_ROOTS)
 
 # Fast local validation path for compiler work
 smoke: all
-	scripts/run_tests.sh unit compiler
+	scripts/test unit compiler
 
 # Run OCaml unit tests
 unit-test: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml
@@ -142,7 +146,7 @@ c-static-analysis:
 		-o "$$tmp_plist" -x c compiler/lib/runtime.c
 
 security-check: all c-static-analysis
-	BLORP_COMPILER_TEST_TIMEOUT=60 scripts/run_tests.sh compiler
+	BLORP_COMPILER_TEST_TIMEOUT=60 scripts/test compiler
 	./blorp test --no-cache --timeout 20 $(SECURITY_RUNTIME_TESTS)
 	./blorp test --no-cache --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
 
@@ -152,22 +156,22 @@ test-asan: all
 
 # Docker targets
 docker-build:
-	scripts/docker-test --build-only
+	scripts/docker-gate --build-only
 
-docker-test:
-	scripts/docker-test
+docker-gate:
+	scripts/docker-gate
 
-docker-test-clean:
-	scripts/docker-test --clean
+docker-gate-clean:
+	scripts/docker-gate --clean
 
 docker-shell:
-	scripts/docker-test --shell
+	scripts/docker-gate --shell
 
-docker-full-gate:
-	scripts/docker-test --full-gate
+docker-premerge-gate:
+	scripts/docker-gate --premerge-gate
 
-docker-full-gate-all:
-	scripts/docker-test --full-gate --all-platforms
+docker-premerge-gate-all:
+	scripts/docker-gate --premerge-gate --all-platforms
 
 # Clean build artifacts
 clean:

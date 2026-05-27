@@ -7,7 +7,7 @@
 set -e
 
 echo "Stage golden generation is retired; current CLI dump formats no longer match tests/stages fixtures." >&2
-echo "Use scripts/run_tests.sh compiler/runtime for supported parser, typecheck, and codegen coverage." >&2
+echo "Use scripts/test compiler/runtime for supported parser, typecheck, and codegen coverage." >&2
 exit 1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

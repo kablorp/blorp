@@ -649,6 +649,11 @@ expect_exit "lsp rejects unknown option" 1 "$BLORP_BIN" lsp --bogus
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed ($TOTAL CLI checks)"
+if [ "$FAIL" -gt 0 ]; then
+    echo "BLORP_GATE_RESULT gate=cli status=FAIL passed=$PASS failed=$FAIL tests=$TOTAL"
+else
+    echo "BLORP_GATE_RESULT gate=cli status=PASS passed=$PASS failed=0 tests=$TOTAL"
+fi
 
 if [ "$FAIL" -gt 0 ]; then
     exit 1

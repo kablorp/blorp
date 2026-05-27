@@ -5,7 +5,7 @@
 set -e
 
 echo "Lexer golden stage tests are retired; --dump-tokens is no longer a supported CLI contract." >&2
-echo "Use scripts/run_tests.sh compiler/runtime for supported lexer/parser coverage." >&2
+echo "Use scripts/test compiler/runtime for supported lexer/parser coverage." >&2
 exit 1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

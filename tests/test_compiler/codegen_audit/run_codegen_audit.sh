@@ -144,44 +144,51 @@ run_with_timeout() {
 
 run_case() {
     local brp="$1"
-    local test_name c_file compile_output compile_exit cc_output cc_exit
+    local test_name test_dir case_dir c_file compile_output compile_exit cc_output cc_exit
     local failed max_line_expect max_actual expect_c_lines expect_not_c_lines
 
     test_name="$(basename "$brp")"
-    c_file="${brp%.brp}.c"
-    rm -f "$c_file"
+    test_dir="$(cd "$(dirname "$brp")" && pwd -P)"
+    case_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_codegen_case.XXXXXX") || {
+        echo "FAIL: $test_name (could not create temp directory)"
+        return 0
+    }
+    c_file="$case_dir/${test_name%.brp}.c"
 
     # Compile to C
     set +e
-    compile_output=$(run_with_timeout "$BLORP" compile --no-format --no-embed-runtime "$brp")
+    compile_output=$(run_with_timeout "$BLORP" compile --no-format --no-embed-runtime -o "$c_file" "$brp")
     compile_exit=$?
     set -e
     if [ "$compile_exit" -eq 124 ]; then
         echo "FAIL: $test_name (blorp compile timed out after ${TEST_TIMEOUT}s)"
+        rm -rf "$case_dir"
         return 0
     elif [ "$compile_exit" -ne 0 ]; then
         echo "FAIL: $test_name (blorp compile failed)"
         echo "$compile_output" | head -10 | sed 's/^/  /'
+        rm -rf "$case_dir"
         return 0
     fi
 
     if [ ! -f "$c_file" ]; then
         echo "FAIL: $test_name (no .c generated)"
+        rm -rf "$case_dir"
         return 0
     fi
 
     set +e
-    cc_output=$(run_with_timeout cc "${CC_WARNING_FLAGS[@]}" -include "$RUNTIME_DECL" "$c_file")
+    cc_output=$(run_with_timeout cc "${CC_WARNING_FLAGS[@]}" -I "$test_dir" -include "$RUNTIME_DECL" "$c_file")
     cc_exit=$?
     set -e
     if [ "$cc_exit" -eq 124 ]; then
         echo "FAIL: $test_name (generated C warning sweep timed out after ${TEST_TIMEOUT}s)"
-        rm -f "$c_file"
+        rm -rf "$case_dir"
         return 0
     elif [ "$cc_exit" -ne 0 ]; then
         echo "FAIL: $test_name (generated C warning sweep failed)"
         echo "$cc_output" | head -20 | sed 's/^/  /'
-        rm -f "$c_file"
+        rm -rf "$case_dir"
         return 0
     fi
 
@@ -218,8 +225,7 @@ run_case() {
         fi
     done <<< "$expect_not_c_lines"
 
-    # Clean up generated C
-    rm -f "$c_file"
+    rm -rf "$case_dir"
 
     if [ "$failed" -eq 0 ]; then
         echo "PASS: $test_name"
