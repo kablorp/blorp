@@ -30,6 +30,19 @@ let widened_literal_info : Ast.expr_type_info =
     resolved_call = None;
   }
 
+let detailed_hover_info : Ast.expr_type_info =
+  {
+    source_ty = Some (TyNamed ("TinyId", []));
+    semantic_ty = TyConstInt 1;
+    value_ty = Types.ty_int;
+    origin = ExplicitAnnotation (TyNamed ("TinyId", []));
+    widening =
+      Widen
+        { from_ty = TyConstInt 1; to_ty = Types.ty_int; reason = ArgumentSlot };
+    proofs = Type_proof_metadata.unproven_expr;
+    resolved_call = None;
+  }
+
 let test_debug_type_info_uses_shared_wording () =
   let rendered =
     Type_metadata_format.format_debug_type_info source_alias_info
@@ -52,6 +65,18 @@ let test_hover_type_view_reports_widening_details () =
   Alcotest.(check (list string))
     "widening detail"
     [ "value-slot type: Int"; "widening: mutable binding (#1 -> Int)" ]
+    view.details
+
+let test_hover_type_view_preserves_detail_order () =
+  let view = Type_metadata_format.hover_type_view detailed_hover_info in
+  Alcotest.(check string) "primary source type" "TinyId" view.primary_type;
+  Alcotest.(check (list string))
+    "detail order"
+    [
+      "canonical type: #1";
+      "value-slot type: Int";
+      "widening: argument slot (#1 -> Int)";
+    ]
     view.details
 
 let test_expr_hover_type_view_uses_metadata_before_fallback () =
@@ -94,6 +119,8 @@ let suite =
           test_hover_type_view_prefers_source_and_reports_canonical;
         Alcotest.test_case "hover widening wording" `Quick
           test_hover_type_view_reports_widening_details;
+        Alcotest.test_case "hover detail order" `Quick
+          test_hover_type_view_preserves_detail_order;
         Alcotest.test_case "expr hover metadata before fallback" `Quick
           test_expr_hover_type_view_uses_metadata_before_fallback;
         Alcotest.test_case "expr hover fallback" `Quick

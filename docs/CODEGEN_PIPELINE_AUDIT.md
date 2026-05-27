@@ -39,6 +39,11 @@ Removed in this pass:
 - `Core_collection_pipeline.add_vars`: unused local helper.
 - `Core_list_layout.layout_of_elem`: unused wrapper around
   `Core_layout_type.list_storage_layout_of_elem`.
+- Broader compiler cleanup removed additional unused Core/codegen helpers:
+  storage-hash policy plumbing, dead tensor storage constructors/accessors,
+  stale DCE wrappers, the retired AST-level `Core_flatten.build_import_tables`,
+  unused invariant/Perceus/resolve wrappers, stack Option/Result predicates, and
+  formatter/LSP/diagnostic/typecheck helper exports with no production callers.
 
 Guardrail added:
 
@@ -64,6 +69,17 @@ Follow-up habit:
    `Core_tuple_sroa`. The ordering is meaningful, so do not merge them
    blindly. First split phase timing inside the stage or split the stage enum
    so compile-time profiles can show which traversal matters.
+
+   The scoped vector/matrix parallel cleanup roadmap is complete enough to
+   remove as a standalone roadmap. Remaining parallel-tensor follow-ups should
+   stay measurement-driven:
+   - rerun benchmark measurements on target release hardware before making
+     performance claims;
+   - consider source-storage reuse only after ownership analysis proves the
+     source is uniquely owned, dead after the pipeline, and layout-compatible
+     with the result;
+   - consider multiple `zip_map` fusion only if measurements justify the extra
+     lowering complexity.
 
 3. Runtime-capture and free-variable checks are recomputed in several places:
    `Core_collection_pipeline.lambda_has_no_runtime_captures`,

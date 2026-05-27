@@ -88,6 +88,48 @@ let test_hover_uses_env_source_type_as_identifier_fallback () =
         (contains_substring hover "user_id: UserId")
   | None -> Alcotest.fail "expected hover text"
 
+let ident name : Ast.expr =
+  {
+    expr_desc = EIdent name;
+    expr_loc = Ast.dummy_loc;
+    expr_type = None;
+    expr_type_info = None;
+    expr_rc = None;
+  }
+
+let test_hover_formats_env_nominal_symbols () =
+  let variant : Ast.variant =
+    {
+      variant_name = "Some";
+      variant_fields = [ Types.ty_int ];
+      variant_tag = 0;
+      variant_loc = Ast.dummy_loc;
+      variant_def_id = None;
+    }
+  in
+  let field : Ast.field_decl =
+    { field_name = "id"; field_type = Types.ty_int; field_loc = Ast.dummy_loc }
+  in
+  let env =
+    Env.empty () |> fun env ->
+    Env.add_type env "Maybe" [ "T" ] [ variant ] |> fun env ->
+    Env.add_record env "User" [] [ field ] () |> fun env ->
+    Env.add_alias env "UserId" [] Types.ty_int
+  in
+  let expect_contains name needle =
+    match Lsp_hover.hover_info_for_expr env (ident name) with
+    | Some hover ->
+        Alcotest.(check bool)
+          (name ^ " hover contains " ^ needle)
+          true
+          (contains_substring hover needle)
+    | None -> Alcotest.failf "expected hover text for %s" name
+  in
+  expect_contains "Maybe" "union Maybe[T]:";
+  expect_contains "Some" "Some(Int)  (from Maybe)";
+  expect_contains "User" "record User {id: Int}";
+  expect_contains "UserId" "alias UserId = Int"
+
 let analyzed_state source =
   Test_helpers.with_isolated_env (fun () ->
       let uri = "file:///tmp/lsp_hover_integration.brp" in
@@ -216,6 +258,27 @@ func consume(user_id: UserId) -> UserId:
     "parameter hover is parameter-specific" false
     (contains_substring param_hover "func consume")
 
+let test_hover_integration_preserves_function_doc_on_typed_declaration () =
+  let state, uri =
+    analyzed_state
+      (String.concat "\n"
+         [
+           "---";
+           "Doubles the input.";
+           "---";
+           "func double(value: Int) -> Int:";
+           "    value * 2";
+           "";
+         ])
+  in
+  let hover = hover_value_at state uri ~line:3 ~character:6 in
+  Alcotest.(check bool)
+    "typed function hover keeps docstring" true
+    (contains_substring hover "Doubles the input.\n\n```blorp");
+  Alcotest.(check bool)
+    "typed function hover keeps signature" true
+    (contains_substring hover "func double(value: Int) -> Int")
+
 let suite =
   [
     ( "format",
@@ -228,11 +291,16 @@ let suite =
           test_hover_ignores_legacy_expr_type_without_structured_metadata;
         Alcotest.test_case "uses env source type as identifier fallback" `Quick
           test_hover_uses_env_source_type_as_identifier_fallback;
+        Alcotest.test_case "formats env nominal symbols" `Quick
+          test_hover_formats_env_nominal_symbols;
         Alcotest.test_case "integration uses analyzed typed metadata" `Quick
           test_hover_integration_uses_analyzed_typed_metadata;
         Alcotest.test_case "integration uses typed declaration metadata" `Quick
           test_hover_integration_uses_typed_declaration_metadata;
         Alcotest.test_case "integration uses typed parameter metadata" `Quick
           test_hover_integration_uses_typed_parameter_metadata;
+        Alcotest.test_case
+          "integration preserves function doc on typed declaration" `Quick
+          test_hover_integration_preserves_function_doc_on_typed_declaration;
       ] );
   ]

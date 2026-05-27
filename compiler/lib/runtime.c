@@ -23400,6 +23400,60 @@ static void __free_argv(char** argv, long count) {
     free(argv);
 }
 
+static bool __process_path_is_executable(const char* path) {
+    return path && path[0] != '\0' && access(path, X_OK) == 0;
+}
+
+static const char* __process_default_path(char* buf, size_t buf_len) {
+#if defined(_CS_PATH)
+    if (buf && buf_len > 0) {
+        size_t len = confstr(_CS_PATH, buf, buf_len);
+        if (len > 0 && len < buf_len) return buf;
+    }
+#else
+    (void)buf;
+    (void)buf_len;
+#endif
+    return "/bin:/usr/bin";
+}
+
+static bool __process_program_is_resolvable(const char* program) {
+    if (!program || program[0] == '\0') return false;
+    if (strchr(program, '/')) return __process_path_is_executable(program);
+
+    char default_path_buf[1024];
+    const char* path = getenv("PATH");
+    if (!path || path[0] == '\0') {
+        path = __process_default_path(default_path_buf, sizeof(default_path_buf));
+    }
+
+    size_t program_len = strlen(program);
+    const char* part = path;
+    while (true) {
+        const char* end = strchr(part, ':');
+        size_t dir_len = end ? (size_t)(end - part) : strlen(part);
+        size_t candidate_len =
+            dir_len == 0
+                ? program_len
+                : blorp_checked_add(blorp_checked_add(dir_len, 1), program_len);
+        char* candidate =
+            (char*)blorp_malloc_checked(blorp_checked_add(candidate_len, 1));
+        if (dir_len == 0) {
+            memcpy(candidate, program, program_len + 1);
+        } else {
+            memcpy(candidate, part, dir_len);
+            candidate[dir_len] = '/';
+            memcpy(candidate + dir_len + 1, program, program_len + 1);
+        }
+        bool found = __process_path_is_executable(candidate);
+        free(candidate);
+        if (found) return true;
+        if (!end) break;
+        part = end + 1;
+    }
+    return false;
+}
+
 static void* __process_error_result(
     blorp_String* out_str,
     blorp_String* err_str,
@@ -23443,6 +23497,11 @@ void* blorp_process_run(const blorp_String* program, const blorp_List* args) {
         argv[i + 1] = a;
     }
     argv[argc + 1] = NULL;
+
+    if (!__process_program_is_resolvable(prog)) {
+        __free_argv(argv, argc + 1);
+        return (void*)blorp_result_err((void*)blorp_string_literal("program not found"));
+    }
 
     // Create pipes for stdout and stderr
     int stdout_pipe[2], stderr_pipe[2];

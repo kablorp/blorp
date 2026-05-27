@@ -411,12 +411,12 @@ let renamed_std_export_hint (m : loaded_module) (name : string) : string option
         Some "'to_upper' was renamed to 'upper'; write `import: string: upper`"
     | "string", "to_lower" ->
         Some "'to_lower' was renamed to 'lower'; write `import: string: lower`"
-    | "matrix", "get" ->
-        Some "'get' was renamed to 'get_cell'; write `import: matrix: get_cell`"
-    | "matrix", "get_or" ->
+    | "matrix", "get_cell" ->
+        Some "'get_cell' was renamed to 'get'; write `import: matrix: get`"
+    | "matrix", "get_cell_or" ->
         Some
-          "'get_or' was renamed to 'get_cell_or'; write `import: matrix: \
-           get_cell_or`"
+          "'get_cell_or' was renamed to 'get_or'; write `import: matrix: \
+           get_or`"
     | "matrix", "set_at" ->
         Some
           "'set_at' was renamed to 'set_cell'; write `import: matrix: set_cell`"

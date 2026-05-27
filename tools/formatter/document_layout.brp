@@ -173,64 +173,74 @@ pure func push2(first: Command, second: Command, rest: List[Command]) -> List[Co
 
 
 pure func fits(remaining: Int, work: List[Command]) -> Bool:
-	if remaining < 0:
-		False
-	else:
-		match work:
-			[]: True
-			[command_value, ...rest]:
-				match command_value.document:
-					Nil: remaining.fits(rest)
-					Text(source): (remaining - source.length()).fits(rest)
-					Hardline: True
-					Softline: remaining.fits(
-						command(command_value.indent, FlatMode, Nil).push1(rest),
-					)
-					SoftlineSpace:
-						match command_value.mode:
-							FlatMode: (remaining - 1).fits(rest)
-							BreakMode: True
-					Indent(extra, inner):
-						remaining.fits(
-							command(
+	var current_remaining: Int = remaining
+	var current_work: List[Command] = work
+	var done: Bool = False
+	var result: Bool = False
+	while not done:
+		if current_remaining < 0:
+			result = False
+			done = True
+		else:
+			match current_work:
+				[]:
+					result = True
+					done = True
+				[command_value, ...rest]:
+					match command_value.document:
+						Nil:
+							current_work = rest
+						Text(source):
+							current_remaining -= source.length()
+							current_work = rest
+						Hardline:
+							result = True
+							done = True
+						Softline:
+							current_work = command(command_value.indent, FlatMode, Nil).push1(rest)
+						SoftlineSpace:
+							match command_value.mode:
+								FlatMode:
+									current_remaining -= 1
+									current_work = rest
+								BreakMode:
+									result = True
+									done = True
+						Indent(extra, inner):
+							current_work = command(
 								command_value.indent + extra,
 								command_value.mode,
 								inner,
-							).push1(rest),
-						)
-					Group(inner): remaining.fits(
-						command(command_value.indent, FlatMode, inner).push1(rest),
-					)
-					Concat(a, b):
-						remaining.fits(
-							command(command_value.indent, command_value.mode, a).push2(
-								command(
-									command_value.indent,
-									command_value.mode,
-									b,
-								),
-								rest,
-							),
-						)
-					IfBreak(broken_document, flat_document):
-						match command_value.mode:
-							FlatMode:
-								remaining.fits(
-									command(
+							).push1(rest)
+						Group(inner):
+							current_work = command(
+								command_value.indent,
+								FlatMode,
+								inner,
+							).push1(rest)
+						Concat(a, b):
+							current_work = command(
+								command_value.indent,
+								command_value.mode,
+								a,
+							).push2(command(command_value.indent, command_value.mode, b), rest)
+						IfBreak(broken_document, flat_document):
+							match command_value.mode:
+								FlatMode:
+									current_work = command(
 										command_value.indent,
 										FlatMode,
 										flat_document,
-									).push1(rest),
-								)
-							BreakMode:
-								remaining.fits(
-									command(
+									).push1(rest)
+								BreakMode:
+									current_work = command(
 										command_value.indent,
 										BreakMode,
 										broken_document,
-									).push1(rest),
-								)
-					LineSuffix(_): remaining.fits(rest)
+									).push1(rest)
+						LineSuffix(_):
+							current_work = rest
+	result
 
 
 pure func flush_line_suffixes(state: RenderState) -> RenderState:
@@ -255,87 +265,92 @@ pure func enqueue_line_suffix(state: RenderState, suffix: String) -> RenderState
 
 
 pure func render_loop(width: Int, state: RenderState, work: List[Command]) -> RenderState:
-	match work:
-		[]: state.flush_line_suffixes()
-		[command_value, ...rest]:
-			match command_value.document:
-				Nil: width.render_loop(state, rest)
-				Text(source): width.render_loop(
-					render_state(
-						state.output + source,
-						state.column + source.length(),
-						state.suffixes,
-					),
-					rest,
-				)
-				Hardline: width.render_loop(state.emit_newline(command_value.indent), rest)
-				Softline:
-					match command_value.mode:
-						FlatMode: width.render_loop(state, rest)
-						BreakMode: width.render_loop(state.emit_newline(command_value.indent), rest)
-				SoftlineSpace:
-					match command_value.mode:
-						FlatMode: width.render_loop(
-							render_state(
-								state.output + " ",
-								state.column + 1,
-								state.suffixes,
-							),
-							rest,
+	var current_state: RenderState = state
+	var current_work: List[Command] = work
+	var done: Bool = False
+	while not done:
+		match current_work:
+			[]:
+				current_state = current_state.flush_line_suffixes()
+				done = True
+			[command_value, ...rest]:
+				match command_value.document:
+					Nil:
+						current_work = rest
+					Text(source):
+						current_state = render_state(
+							current_state.output + source,
+							current_state.column + source.length(),
+							current_state.suffixes,
 						)
-						BreakMode: width.render_loop(state.emit_newline(command_value.indent), rest)
-				Indent(extra, inner):
-					width.render_loop(
-						state,
-						command(
+						current_work = rest
+					Hardline:
+						current_state = current_state.emit_newline(command_value.indent)
+						current_work = rest
+					Softline:
+						match command_value.mode:
+							FlatMode:
+								current_work = rest
+							BreakMode:
+								current_state = current_state.emit_newline(command_value.indent)
+								current_work = rest
+					SoftlineSpace:
+						match command_value.mode:
+							FlatMode:
+								current_state = render_state(
+									current_state.output + " ",
+									current_state.column + 1,
+									current_state.suffixes,
+								)
+								current_work = rest
+							BreakMode:
+								current_state = current_state.emit_newline(command_value.indent)
+								current_work = rest
+					Indent(extra, inner):
+						current_work = command(
 							command_value.indent + extra,
 							command_value.mode,
 							inner,
-						).push1(rest),
-					)
-				Group(inner):
-					flat_command: Command = command(command_value.indent, FlatMode, inner)
-					if (width - state.column).fits(flat_command.push1(rest)):
-						width.render_loop(state, flat_command.push1(rest))
-					else:
-						width.render_loop(
-							state,
-							command(command_value.indent, BreakMode, inner).push1(rest),
-						)
-				Concat(a, b):
-					width.render_loop(
-						state,
-						command(command_value.indent, command_value.mode, a).push2(
-							command(
+						).push1(rest)
+					Group(inner):
+						flat_command: Command = command(command_value.indent, FlatMode, inner)
+						if (width - current_state.column).fits(flat_command.push1(rest)):
+							current_work = flat_command.push1(rest)
+						else:
+							current_work = command(
 								command_value.indent,
-								command_value.mode,
-								b,
-							),
-							rest,
-						),
-					)
-				IfBreak(broken_document, flat_document):
-					match command_value.mode:
-						FlatMode:
-							width.render_loop(
-								state,
-								command(command_value.indent, FlatMode, flat_document).push1(rest),
-							)
-						BreakMode:
-							width.render_loop(
-								state,
-								command(
+								BreakMode,
+								inner,
+							).push1(rest)
+					Concat(a, b):
+						current_work = command(
+							command_value.indent,
+							command_value.mode,
+							a,
+						).push2(command(command_value.indent, command_value.mode, b), rest)
+					IfBreak(broken_document, flat_document):
+						match command_value.mode:
+							FlatMode:
+								current_work = command(
+									command_value.indent,
+									FlatMode,
+									flat_document,
+								).push1(rest)
+							BreakMode:
+								current_work = command(
 									command_value.indent,
 									BreakMode,
 									broken_document,
-								).push1(rest),
-							)
-				LineSuffix(source):
-					width.render_loop(state.enqueue_line_suffix(source), rest)
+								).push1(rest)
+					LineSuffix(source):
+						current_state = current_state.enqueue_line_suffix(source)
+						current_work = rest
+	current_state
 
 
 pure func render(width: Int, document: Doc) -> String:
-	rendered: RenderState = width.render_loop(
+	rendered: RenderState = render_loop(
+		width,
 		render_state(
 			"",
 			0,

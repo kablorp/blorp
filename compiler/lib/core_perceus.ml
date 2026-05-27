@@ -568,10 +568,6 @@ and max_uses_ctree_inner (name : string) (tree : ctree) : int =
       in
       List.fold_left max (max geq_max default_max) case_maxes
 
-(** Public alias — the "max uses across all paths" variant, used
-    by [transform_let_match_tree_body] for the outer dup calculation. *)
-let max_uses_ctree = max_uses_ctree_inner
-
 (* ============================================================================
    Linear ownership-use summary
    ============================================================================ *)

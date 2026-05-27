@@ -16,32 +16,43 @@ let is_ident_char c =
   || (c >= '0' && c <= '9')
   || c = '_'
 
-(** Return the identifier whose span includes [col] on [line] (0-based),
-    or [None] if the cursor is not inside an identifier. Works on the
-    raw document text so it covers positions the AST walk misses:
-    type annotations, pattern constructors, method names after `.`, etc. *)
+let line_at (text : string) ~(line : int) : string option =
+  if line < 0 then None
+  else String.split_on_char '\n' text |> fun lines -> List.nth_opt lines line
+
+let scan_ident_start (line_text : string) (col : int) : int =
+  let rec scan i =
+    if i <= 0 || not (is_ident_char line_text.[i - 1]) then i else scan (i - 1)
+  in
+  scan col
+
+let scan_ident_end (line_text : string) (col : int) : int =
+  let len = String.length line_text in
+  let rec scan i =
+    if i >= len || not (is_ident_char line_text.[i]) then i else scan (i + 1)
+  in
+  scan col
+
+let ident_span_at (line_text : string) ~(col : int) : (int * int) option =
+  let len = String.length line_text in
+  if col < 0 || col > len then None
+  else
+    let cursor = min col len in
+    let start_col = scan_ident_start line_text cursor in
+    let end_col = scan_ident_end line_text cursor in
+    if start_col = end_col then None else Some (start_col, end_col)
+
+(** Return the identifier adjacent to [col] on [line] (0-based), or [None] if
+    the cursor position is not next to an identifier. Works on the raw document
+    text so it covers positions the AST walk misses: type annotations, pattern
+    constructors, method names after `.`, etc. *)
 let word_at (text : string) ~(line : int) ~(col : int) : string option =
-  let lines = String.split_on_char '\n' text in
-  match List.nth_opt lines line with
+  match line_at text ~line with
   | None -> None
-  | Some l ->
-      let len = String.length l in
-      if col < 0 || col > len then None
-      else
-        let start_col =
-          let rec scan i =
-            if i <= 0 || not (is_ident_char l.[i - 1]) then i else scan (i - 1)
-          in
-          scan (min col len)
-        in
-        let end_col =
-          let rec scan i =
-            if i >= len || not (is_ident_char l.[i]) then i else scan (i + 1)
-          in
-          scan (min col len)
-        in
-        if start_col = end_col then None
-        else Some (String.sub l start_col (end_col - start_col))
+  | Some line_text ->
+      ident_span_at line_text ~col
+      |> Option.map (fun (start_col, end_col) ->
+          String.sub line_text start_col (end_col - start_col))
 
 (* ============================================================================
    Expression lookup — find the deepest expression at a cursor position
@@ -102,11 +113,28 @@ let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
 let loc_matches_file ?file (loc : loc) =
   match file with None -> true | Some expected -> loc.loc_file = Some expected
 
+let func_header_line decl_loc (fd : func_decl) =
+  match fd.func_params with
+  | first_param :: _ -> first_param.param_loc.line
+  | [] -> (
+      match func_body_expr_opt fd.func_body with
+      | Some body when body.expr_loc.line > decl_loc.line ->
+          body.expr_loc.line - 1
+      | _ -> decl_loc.line)
+
+let rec decl_starts_on_line (decl : decl) ~target_line =
+  decl.decl_loc.line = target_line
+  ||
+  match decl.decl_desc with
+  | DFunc fd -> func_header_line decl.decl_loc fd = target_line
+  | DPrivate inner -> decl_starts_on_line inner ~target_line
+  | _ -> false
+
 let find_decl_at ?file (program : program) ~(line : int) : decl option =
   let target_line = line + 1 in
   List.find_opt
     (fun (d : decl) ->
-      d.decl_loc.line = target_line && loc_matches_file ?file d.decl_loc)
+      decl_starts_on_line d ~target_line && loc_matches_file ?file d.decl_loc)
     program
 
 (** Find a typed declaration at a given line (0-based). *)
@@ -116,7 +144,7 @@ let find_typed_decl_at ?file (program : Typed_ast.program) ~(line : int) :
   program |> Typed_ast.program_decls
   |> List.find_opt (fun decl ->
       let ast_decl = Typed_ast.decl_ast decl in
-      ast_decl.decl_loc.line = target_line
+      decl_starts_on_line ast_decl ~target_line
       && loc_matches_file ?file ast_decl.decl_loc)
 
 type typed_param_hit = {
@@ -179,6 +207,22 @@ let find_typed_param_at ?file (program : Typed_ast.program) ~(line : int)
 (* ============================================================================
    Definition lookup — for go-to-definition
    ============================================================================ *)
+
+let loc_end_line loc = max loc.line loc.end_line
+
+let rec expr_end_line expr =
+  expr |> expr_children
+  |> List.fold_left
+       (fun max_line child -> max max_line (expr_end_line child))
+       (loc_end_line expr.expr_loc)
+
+let func_body_end_line fd =
+  fd.func_body |> func_body_expr_opt |> Option.map expr_end_line
+
+let function_body_reaches_target_line fd ~target_line =
+  match func_body_end_line fd with
+  | Some body_end_line -> target_line <= body_end_line
+  | None -> false
 
 (** Find the definition location of a name in the program.
     Searches top-level declarations first, then local definitions
@@ -291,7 +335,10 @@ let find_definition (program : program) ~(name : string) ~(line : int)
   (* Find the enclosing function at the cursor line and search its params + body *)
   let find_in_enclosing_func () =
     let check_func_decl (fd : func_decl) (decl_loc : loc) =
-      if decl_loc.line <= target_line then
+      if
+        decl_loc.line <= target_line
+        && function_body_reaches_target_line fd ~target_line
+      then
         let in_params =
           List.find_opt
             (fun (p : Ast.param) -> p.param_name = Some name)
@@ -376,6 +423,15 @@ let resolve_module_source_path ~(base_dir : string) (path : string) : string =
         if Sys.file_exists candidate then candidate else path
   else path
 
+let import_symbol_local_name (s : Ast.import_symbol) : string =
+  Option.value s.sym_alias ~default:s.sym_name
+
+let import_symbol_imports_ctor (local_name : string) (s : Ast.import_symbol) :
+    bool =
+  match s.sym_ctors with
+  | CtorSome ctors -> List.mem local_name ctors
+  | CtorNone -> false
+
 (** Resolve [local_name] against a single import declaration.
     Returns the exported name to look up in the source module, or [None]
     if the import doesn't bring [local_name] into scope.
@@ -388,27 +444,14 @@ let resolve_imported_name (imp : Ast.import_decl) (local_name : string) :
     string option =
   match imp.import_symbols with
   | Some syms -> (
-      let direct_match =
-        List.find_opt
-          (fun (s : Ast.import_symbol) ->
-            let local =
-              match s.sym_alias with Some a -> a | None -> s.sym_name
-            in
-            local = local_name)
-          syms
-      in
-      match direct_match with
+      match
+        List.find_opt (fun s -> import_symbol_local_name s = local_name) syms
+      with
       | Some s -> Some s.sym_name
       | None ->
-          let ctor_match =
-            List.exists
-              (fun (s : Ast.import_symbol) ->
-                match s.sym_ctors with
-                | CtorSome ctors -> List.mem local_name ctors
-                | CtorNone -> false)
-              syms
-          in
-          if ctor_match then Some local_name else None)
+          if List.exists (import_symbol_imports_ctor local_name) syms then
+            Some local_name
+          else None)
   | None ->
       (* Qualified or bare: the name itself doesn't enter scope as a bare
          identifier (only the module alias does). Cmd+Click on a name after
@@ -467,35 +510,27 @@ let find_cross_module_definition (program : Ast.program) ~(name : string) :
   let imports = collect_imports [] program in
   (* 1. Exported symbol via a selective import. *)
   let symbol_match =
-    List.fold_left
-      (fun acc imp ->
-        match acc with
-        | Some _ -> acc
-        | None -> (
-            match resolve_imported_name imp name with
-            | Some original -> try_module imp.import_module original
-            | None -> None))
-      None imports
+    List.find_map
+      (fun imp ->
+        match resolve_imported_name imp name with
+        | Some original -> try_module imp.import_module original
+        | None -> None)
+      imports
   in
   match symbol_match with
   | Some _ as r -> r
   | None -> (
       (* 2. The module itself (path segment or `as` alias). *)
       let module_match =
-        List.fold_left
-          (fun acc imp ->
-            match acc with
-            | Some _ -> acc
-            | None ->
-                if import_names_module imp name then try_module_itself imp
-                else None)
-          None imports
+        List.find_map
+          (fun imp ->
+            if import_names_module imp name then try_module_itself imp else None)
+          imports
       in
       match module_match with
       | Some _ as r -> r
       | None ->
           (* 3. Fall back to prelude UFCS modules — no import required. *)
-          List.fold_left
-            (fun acc mod_name ->
-              match acc with Some _ -> acc | None -> try_module mod_name name)
-            None prelude_ufcs_modules)
+          List.find_map
+            (fun mod_name -> try_module mod_name name)
+            prelude_ufcs_modules)

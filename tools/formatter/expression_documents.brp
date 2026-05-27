@@ -245,6 +245,163 @@ private pure func escape_triple_string_value(s: String) -> String:
 	output
 
 
+private pure func string_literal_wrap_char_limit() -> Int:
+	80
+
+
+private pure func string_literal_wrap_min_search_width() -> Int:
+	48
+
+
+private pure func char_is_safe_plain_string_literal_char(c: Char) -> Bool:
+	code: Int = c.to_int()
+	code >= 32 and code < 127 and code != 34 and code != 36 and code != 92
+
+
+private pure func string_is_safe_to_wrap_as_plain_literal(value: String) -> Bool:
+	var safe: Bool = True
+	var i: Int = 0
+	while i < value.length():
+		match value.get(i):
+			Some(c):
+				if not c.char_is_safe_plain_string_literal_char():
+					safe = False
+			None: safe = False
+		i += 1
+	safe
+
+
+private pure func char_is_string_literal_wrap_boundary(c: Char) -> Bool:
+	code: Int = c.to_int()
+	code == 32 or code == 44 or code == 45 or code == 46 or code == 47 or code == 58 or code == 59
+
+
+private pure func string_literal_wrap_end(value: String, start: Int) -> Int:
+	limit: Int = string_literal_wrap_char_limit()
+	remaining: Int = value.length() - start
+	if remaining <= limit:
+		value.length()
+	else:
+		fallback: Int = start + limit
+		min_end: Int = start + string_literal_wrap_min_search_width()
+		var i: Int = fallback - 1
+		var found: Bool = False
+		var split_at: Int = fallback
+		while i >= min_end and not found:
+			match value.get(i):
+				Some(c):
+					if c.char_is_string_literal_wrap_boundary():
+						split_at = i + 1
+						found = True
+				None: void
+			i -= 1
+		split_at
+
+
+private pure func string_literal_wrap_chunks(value: String) -> List[String]:
+	var chunks: List[String] = []
+	var start: Int = 0
+	while start < value.length():
+		end_idx: Int = value.string_literal_wrap_end(start)
+		chunks = chunks.append(value.substring(start, end_idx - start))
+		start = end_idx
+	chunks
+
+
+private pure func string_literal_can_wrap(value: String) -> Bool:
+	value.length() > string_literal_wrap_char_limit() and value.string_is_safe_to_wrap_as_plain_literal()
+
+
+private pure func plain_string_literal_document(value: String) -> Doc:
+	("\"" + value.escape_string_value() + "\"").text()
+
+
+private pure func wrapped_string_literal_chunk_documents(chunks: List[String]) -> List[Doc]:
+	var documents: List[Doc] = []
+	var index: Int = 0
+	for chunk in chunks:
+		chunk_document: Doc = chunk.plain_string_literal_document()
+		if index == 0:
+			documents = documents.append(chunk_document)
+		else:
+			documents = documents.append(
+				"+ "
+					.text()
+					.cat(chunk_document)
+			)
+		index += 1
+	documents
+
+
+private pure func wrapped_plain_string_literal_chunks_document(chunks: List[String]) -> Doc:
+	"("
+		.text()
+		.cat(
+			hardline()
+				.cat(
+					chunks
+						.wrapped_string_literal_chunk_documents()
+						.hardlines()
+				)
+				.indent()
+		)
+		.cat(hardline())
+		.cat(")".text())
+
+
+private pure func wrapped_plain_string_literal_document(value: String) -> Doc:
+	value
+		.string_literal_wrap_chunks()
+		.wrapped_plain_string_literal_chunks_document()
+
+
+private pure func plain_string_literal_value(expr: Expression) -> Option[String]:
+	match expr:
+		LiteralExpression(StringLiteral(value, flags)):
+			if (
+				flags.raw
+				or flags.triple
+				or not value.string_is_safe_to_wrap_as_plain_literal()
+			):
+				None
+			else:
+				Some(value)
+		_: None
+
+
+private pure func plain_string_concat_chunks(expr: Expression) -> Option[List[String]]:
+	match expr:
+		BinaryExpression(AddOp, left, right):
+			match left.plain_string_concat_chunks():
+				Some(left_chunks):
+					match right.plain_string_concat_chunks():
+						Some(right_chunks): Some(left_chunks.concat(right_chunks))
+						None: None
+				None: None
+		_:
+			match expr.plain_string_literal_value():
+				Some(value): Some([value])
+				None: None
+
+
+private pure func concat_string_chunks(chunks: List[String]) -> String:
+	var result: String = ""
+	for chunk in chunks:
+		result += chunk
+	result
+
+
+private pure func string_concat_wrap_document(expr: Expression) -> Option[Doc]:
+	match expr.plain_string_concat_chunks():
+		Some(chunks):
+			value: String = chunks.concat_string_chunks()
+			if chunks.length() > 1 and value.string_literal_can_wrap():
+				Some(value.wrapped_plain_string_literal_document())
+			else:
+				None
+		None: None
+
+
 private pure func unary_op_from_json(value: String) -> Result[UnaryOp, String]:
 	match value:
 		"Neg": Ok(NegOp)
@@ -975,8 +1132,10 @@ private pure func literal_document(lit: Literal) -> Doc:
 				("r\"" + value + "\"").text()
 			else if flags.triple:
 				("\"\"\"" + value.escape_triple_string_value() + "\"\"\"").text()
+			else if value.string_literal_can_wrap():
+				value.wrapped_plain_string_literal_document()
 			else:
-				("\"" + value.escape_string_value() + "\"").text()
+				value.plain_string_literal_document()
 		BoolLiteral(value):
 			if value:
 				"True".text()
@@ -2763,28 +2922,31 @@ pure func expression_document(expr: Expression) -> Doc:
 				.text()
 				.cat(inner_document)
 		BinaryExpression(op, left, right):
-			prec: Int = op.binary_prec()
-			left_document: Doc = if left.expression_precedence() < prec:
-				left
-					.expression_document()
-					.parens()
-			else:
-				left.expression_document()
-			right_document: Doc = if right.expression_precedence() <= prec:
-				right
-					.expression_document()
-					.parens()
-			else:
-				right.expression_document()
-			left_document
-				.cat(" ".text())
-				.cat(
-					op
-						.binary_text()
-						.text()
-				)
-				.cat(" ".text())
-				.cat(right_document)
+			match expr.string_concat_wrap_document():
+				Some(document): document
+				None:
+					prec: Int = op.binary_prec()
+					left_document: Doc = if left.expression_precedence() < prec:
+						left
+							.expression_document()
+							.parens()
+					else:
+						left.expression_document()
+					right_document: Doc = if right.expression_precedence() <= prec:
+						right
+							.expression_document()
+							.parens()
+					else:
+						right.expression_document()
+					left_document
+						.cat(" ".text())
+						.cat(
+							op
+								.binary_text()
+								.text()
+						)
+						.cat(" ".text())
+						.cat(right_document)
 		LogicalExpression(op, left, right):
 			prec: Int = op.logical_prec()
 			left_document: Doc = if left.expression_precedence() < prec:

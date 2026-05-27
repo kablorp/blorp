@@ -10,48 +10,32 @@ open Lsp_json
    Completion context detection
    ============================================================================ *)
 
+let clamp_cursor text col =
+  let len = String.length text in
+  max 0 (min col len)
+
+let rec identifier_start_before text index =
+  if index < 0 then 0
+  else if Lsp_position.is_ident_char text.[index] then
+    identifier_start_before text (index - 1)
+  else index + 1
+
+let identifier_at_cursor text ~col =
+  let col = clamp_cursor text col in
+  let start = identifier_start_before text (col - 1) in
+  let text = if start < col then String.sub text start (col - start) else "" in
+  (start, text)
+
 (** Extract the prefix being typed and optional dot qualifier.
     Returns (prefix, Some module_alias) for "M.foo" or (prefix, None) for "foo". *)
 let get_completion_context (text : string) (col : int) : string * string option
     =
-  (* Walk backwards from cursor to find the word being typed *)
-  let len = String.length text in
-  let col = min col len in
-  (* Find start of current identifier *)
-  let rec find_start i =
-    if i < 0 then 0
-    else
-      let c = text.[i] in
-      if
-        (c >= 'a' && c <= 'z')
-        || (c >= 'A' && c <= 'Z')
-        || (c >= '0' && c <= '9')
-        || c = '_'
-      then find_start (i - 1)
-      else i + 1
-  in
-  let ident_start = find_start (col - 1) in
-  let prefix =
-    if ident_start < col then String.sub text ident_start (col - ident_start)
-    else ""
-  in
+  let ident_start, prefix = identifier_at_cursor text ~col in
   (* Check for dot before the identifier *)
   if ident_start > 0 && text.[ident_start - 1] = '.' then begin
     let dot_pos = ident_start - 1 in
     let qualifier_end = dot_pos in
-    let rec find_qual_start i =
-      if i < 0 then 0
-      else
-        let c = text.[i] in
-        if
-          (c >= 'a' && c <= 'z')
-          || (c >= 'A' && c <= 'Z')
-          || (c >= '0' && c <= '9')
-          || c = '_'
-        then find_qual_start (i - 1)
-        else i + 1
-    in
-    let qual_start = find_qual_start (qualifier_end - 1) in
+    let qual_start = identifier_start_before text (qualifier_end - 1) in
     if qual_start < qualifier_end then
       let qualifier = String.sub text qual_start (qualifier_end - qual_start) in
       (prefix, Some qualifier)
@@ -73,14 +57,11 @@ let completion_item ~label ~kind ~detail ~sort_text : json =
     ]
 
 (* LSP CompletionItemKind constants *)
-let _kind_text = 1
 let kind_method = 2
 let kind_function = 3
 let kind_constructor = 4
-let _kind_field = 5
 let kind_variable = 6
 let kind_class = 7
-let _kind_interface = 8
 let kind_keyword = 14
 let kind_struct = 22
 
@@ -239,6 +220,23 @@ let typed_func_completion_detail (func : Typed_ast.func_decl) name =
     (String.concat ", " params)
     (Types.type_to_string ret_ty)
 
+let add_typed_function_completion add (func : Typed_ast.func_decl) =
+  match (Typed_ast.func_ast func).func_name with
+  | Some name ->
+      add name kind_function (typed_func_completion_detail func name) "0"
+  | None -> ()
+
+let add_typed_var_completion add (var : Typed_ast.var_decl) =
+  let ast = Typed_ast.var_ast var in
+  match ast.var_name with
+  | Some name ->
+      let info = Typed_ast.var_info var in
+      let display_ty =
+        Option.value info.source_binding_ty ~default:info.binding_ty
+      in
+      add name kind_variable (Types.type_to_string display_ty) "0"
+  | None -> ()
+
 let completions_from_typed_program ?file (program : Typed_ast.program)
     (prefix : string) : json list * (string, unit) Hashtbl.t =
   let items = ref [] in
@@ -262,23 +260,8 @@ let completions_from_typed_program ?file (program : Typed_ast.program)
       let ast_decl = Typed_ast.decl_ast decl in
       if loc_matches_file ast_decl.decl_loc then
         match Typed_ast.decl_view decl with
-        | DeclFunction func -> (
-            match (Typed_ast.func_ast func).func_name with
-            | Some name ->
-                add name kind_function
-                  (typed_func_completion_detail func name)
-                  "0"
-            | None -> ())
-        | DeclVar var -> (
-            let ast = Typed_ast.var_ast var in
-            match ast.var_name with
-            | Some name ->
-                let info = Typed_ast.var_info var in
-                let display_ty =
-                  Option.value info.source_binding_ty ~default:info.binding_ty
-                in
-                add name kind_variable (Types.type_to_string display_ty) "0"
-            | None -> ())
+        | DeclFunction func -> add_typed_function_completion add func
+        | DeclVar var -> add_typed_var_completion add var
         | DeclRecord record ->
             let ast = Typed_ast.record_ast record in
             let params =
@@ -301,24 +284,8 @@ let completions_from_typed_program ?file (program : Typed_ast.program)
               "2"
         | DeclPrivate inner -> (
             match Typed_ast.decl_view inner with
-            | DeclFunction func -> (
-                match (Typed_ast.func_ast func).func_name with
-                | Some name ->
-                    add name kind_function
-                      (typed_func_completion_detail func name)
-                      "0"
-                | None -> ())
-            | DeclVar var -> (
-                let ast = Typed_ast.var_ast var in
-                match ast.var_name with
-                | Some name ->
-                    let info = Typed_ast.var_info var in
-                    let display_ty =
-                      Option.value info.source_binding_ty
-                        ~default:info.binding_ty
-                    in
-                    add name kind_variable (Types.type_to_string display_ty) "0"
-                | None -> ())
+            | DeclFunction func -> add_typed_function_completion add func
+            | DeclVar var -> add_typed_var_completion add var
             | _ -> ())
         | DeclImpl _ | DeclOther -> ());
   (List.rev !items, names)
@@ -327,6 +294,22 @@ let loc_starts_before_cursor loc ~line ~character =
   let loc_line = loc.line - 1 in
   let loc_col = loc.column - 1 in
   loc_line < line || (loc_line = line && loc_col <= character)
+
+let loc_end_line loc = max loc.line loc.end_line - 1
+
+let rec expr_end_line expr =
+  expr |> expr_children
+  |> List.fold_left
+       (fun max_line child -> max max_line (expr_end_line child))
+       (loc_end_line expr.expr_loc)
+
+let func_body_end_line fd =
+  fd.func_body |> func_body_expr_opt |> Option.map expr_end_line
+
+let function_body_reaches_cursor_line fd ~line =
+  match func_body_end_line fd with
+  | Some body_end_line -> line <= body_end_line
+  | None -> false
 
 let type_detail_opt = function
   | Some ty -> Types.type_to_string ty
@@ -432,16 +415,19 @@ let completions_from_local_scope ?(skip = fun _ -> false) (program : program)
       | ELambda _ | EFuncDecl _ -> ()
       | _ -> List.iter collect_expr (expr_children expr)
   in
-  let best_func = ref None in
+  let selected_func = ref None in
   let consider_func decl_loc fd =
-    if loc_starts_before_cursor decl_loc ~line ~character then
-      match !best_func with
+    if
+      loc_starts_before_cursor decl_loc ~line ~character
+      && function_body_reaches_cursor_line fd ~line
+    then
+      match !selected_func with
       | Some (best_loc, _) when best_loc.line > decl_loc.line -> ()
       | Some (best_loc, _)
         when best_loc.line = decl_loc.line && best_loc.column >= decl_loc.column
         ->
           ()
-      | _ -> best_func := Some (decl_loc, fd)
+      | _ -> selected_func := Some (decl_loc, fd)
   in
   List.iter
     (fun decl ->
@@ -453,7 +439,7 @@ let completions_from_local_scope ?(skip = fun _ -> false) (program : program)
           consider_func decl_loc fd
       | _ -> ())
     program;
-  (match !best_func with
+  (match !selected_func with
   | Some (_, fd) ->
       List.iter add_param fd.func_params;
       fd.func_body |> func_body_expr_opt |> Option.iter collect_expr

@@ -22,6 +22,26 @@ let log fmt =
 
 (** Read Content-Length header, return the content length.
     Returns None on EOF. *)
+let strip_trailing_cr line =
+  if String.length line > 0 && line.[String.length line - 1] = '\r' then
+    String.sub line 0 (String.length line - 1)
+  else line
+
+let parse_content_length_header line =
+  match String.index_opt line ':' with
+  | None -> None
+  | Some colon -> (
+      let name =
+        String.sub line 0 colon |> String.trim |> String.lowercase_ascii
+      in
+      if name <> "content-length" then None
+      else
+        let value =
+          String.sub line (colon + 1) (String.length line - colon - 1)
+          |> String.trim
+        in
+        try Some (int_of_string value) with _ -> None)
+
 let read_headers ic =
   let content_length = ref None in
   let rec loop () =
@@ -29,28 +49,14 @@ let read_headers ic =
     match line with
     | None -> None
     | Some line ->
-        (* Strip \r if present *)
-        let line =
-          if String.length line > 0 && line.[String.length line - 1] = '\r' then
-            String.sub line 0 (String.length line - 1)
-          else line
-        in
+        let line = strip_trailing_cr line in
         if line = "" then
           (* Empty line = end of headers *)
           !content_length
         else begin
-          (* Parse Content-Length header *)
-          let prefix = "Content-Length: " in
-          let prefix_len = String.length prefix in
-          if
-            String.length line >= prefix_len
-            && String.sub line 0 prefix_len = prefix
-          then begin
-            let len_str =
-              String.sub line prefix_len (String.length line - prefix_len)
-            in
-            try content_length := Some (int_of_string len_str) with _ -> ()
-          end;
+          (match parse_content_length_header line with
+          | Some len -> content_length := Some len
+          | None -> ());
           loop ()
         end
   in
@@ -70,12 +76,8 @@ let read_message ic =
         let body = Bytes.to_string buf in
         let json = parse body in
         let id = get "id" json in
-        let method_ =
-          match get_string "method" json with Some m -> m | None -> ""
-        in
-        let params =
-          match get "params" json with Some p -> p | None -> Object []
-        in
+        let method_ = Option.value (get_string "method" json) ~default:"" in
+        let params = Option.value (get "params" json) ~default:(Object []) in
         Some { id; method_; params }
       end
 

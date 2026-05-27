@@ -550,6 +550,41 @@ let test_cloexec_helpers_declare_fallback_locals_once () =
         ];
     ]
 
+let test_float16_vector_read_decl_uses_feature_guard () =
+  let runtime_decl =
+    read_first_existing
+      [
+        "compiler/lib/runtime_decl.c";
+        "../lib/runtime_decl.c";
+        "lib/runtime_decl.c";
+      ]
+  in
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let helper = "static inline _Float16 blorp_vector_read_f16" in
+  let scalar_op =
+    "blorp_Vector* blorp_vector_scalar_op_float16(int op, blorp_Vector* v, \
+     _Float16 scalar);"
+  in
+  Alcotest.(check bool)
+    "runtime_decl exposes Float16 vector reader when _Float16 is supported" true
+    (contains_substring runtime_decl ("#ifdef __FLT16_MAX__\n" ^ helper));
+  Alcotest.(check bool)
+    "runtime_decl Float16 vector reader is not clang-only" false
+    (contains_substring runtime_decl ("#ifdef __clang__\n" ^ helper));
+  Alcotest.(check bool)
+    "runtime_decl exposes Float16 scalar vector ops when _Float16 is supported"
+    true
+    (contains_substring runtime_decl ("#ifdef __FLT16_MAX__\n" ^ scalar_op));
+  Alcotest.(check bool)
+    "runtime_decl Float16 scalar vector ops are not clang-only" false
+    (contains_substring runtime_decl ("#ifdef __clang__\n" ^ scalar_op));
+  Alcotest.(check bool)
+    "runtime Float16 vector reader uses same feature guard" true
+    (contains_substring runtime ("#ifdef __FLT16_MAX__\n" ^ helper))
+
 let test_channel_status_runtime_abi_is_declared () =
   let runtime_decl =
     read_first_existing
@@ -669,7 +704,9 @@ let test_stream_from_lines_uses_validated_path_buffer () =
 
 let parse_std_int_record_field line =
   match String.split_on_char ':' (String.trim line) with
-  | [ name; ty ] when String.trim ty = "Int," -> Some (String.trim name)
+  | [ name; ty ] ->
+      let ty = String.trim ty in
+      if ty = "Int" || ty = "Int," then Some (String.trim name) else None
   | _ -> None
 
 let scheduler_stats_std_fields () =
@@ -1361,6 +1398,8 @@ let suite =
           test_fiber_intrusive_links_are_role_specific;
         Alcotest.test_case "cloexec helpers declare fallback locals once" `Quick
           test_cloexec_helpers_declare_fallback_locals_once;
+        Alcotest.test_case "Float16 vector reader ABI uses feature guard" `Quick
+          test_float16_vector_read_decl_uses_feature_guard;
         Alcotest.test_case "channel status ABI is declared" `Quick
           test_channel_status_runtime_abi_is_declared;
         Alcotest.test_case "stream element layout is explicit" `Quick

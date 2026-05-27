@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test auto-formatting on compile/run/test
-# These tests should FAIL until auto-format-on-use is implemented.
+# These tests guard auto-format-on-use behavior for check/run/test.
 
 set -e
 BLORP="./blorp"

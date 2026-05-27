@@ -502,8 +502,6 @@ let stack_option_c_type ~(reg : registry) ty =
           generated_stack_option_c_type_of_payload ~reg payload
       | _ -> None)
 
-let is_stack_option ~(reg : registry) ty = stack_option_c_type ~reg ty <> None
-
 let result_layout_metadata reg =
   Core_result_layout.metadata
     ~is_enum_name:(fun name -> Hashtbl.mem reg.enum_types name)
@@ -524,8 +522,6 @@ let stack_result_c_type ~(reg : registry) ty =
   | Some (Core_result_layout.StackErased | Core_result_layout.StackManaged) ->
       Some "blorp_StackResult"
   | None -> None
-
-let is_stack_result ~(reg : registry) ty = stack_result_c_type ~reg ty <> None
 
 (** Map a blorp type expression to its C representation.
 

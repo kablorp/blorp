@@ -32,7 +32,7 @@
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
 
-(* Module flattening (prefix_module_names, build_import_tables) moved
+(* Module flattening (prefix_module_names, import-table assembly) moved
    to [Core_flatten] in Phase 5.5. Call sites below go through the
    extracted module. *)
 

@@ -166,10 +166,6 @@ let check_no_codegen_unprepared_forms_at (stage : Core_stage.t)
     [] prog
   |> List.rev
 
-let check_no_codegen_unprepared_forms (prog : Core.core_program) :
-    Core_error.t list =
-  check_no_codegen_unprepared_forms_at Core_stage.Final prog
-
 let proof_carrying_string_byte_intrinsics =
   StringSet.of_list
     [

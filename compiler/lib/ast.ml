@@ -664,9 +664,6 @@ let map_func_body_expr f = function
 let func_is_foreign f =
   match f.func_body with FuncForeign _ -> true | _ -> false
 
-let func_foreign_info f =
-  match f.func_body with FuncForeign info -> Some info | _ -> None
-
 let func_has_builtin_body f =
   match f.func_body with FuncBuiltinBody _ -> true | _ -> false
 

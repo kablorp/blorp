@@ -26,29 +26,44 @@ let publish_diagnostics oc (doc : Lsp_state.document) =
   let params = Lsp_state.get_diagnostics_json doc in
   send_notification oc ~method_:"textDocument/publishDiagnostics" ~params
 
+let text_document_version td =
+  match get_int "version" td with Some v -> v | None -> 0
+
+let latest_content_change_text params ~default =
+  match get_list "contentChanges" params with
+  | Some changes -> (
+      match List.rev changes with
+      | last :: _ -> (
+          match get_string "text" last with Some t -> t | None -> default)
+      | [] -> default)
+  | None -> default
+
+let make_document ~uri ~version ~text : Lsp_state.document =
+  {
+    uri;
+    version;
+    text;
+    diagnostics = [];
+    parse_errors = [];
+    program = None;
+    typed_program = None;
+    env = None;
+    module_aliases = [];
+  }
+
+let store_analyzed_document state oc doc =
+  Hashtbl.replace state.Lsp_state.documents doc.Lsp_state.uri doc;
+  Lsp_state.analyze state doc;
+  publish_diagnostics oc doc
+
 (** Handle textDocument/didOpen *)
 let handle_did_open (state : Lsp_state.state) oc params =
   match get "textDocument" params with
   | Some td ->
       let uri = get_uri td in
-      let version = match get_int "version" td with Some v -> v | None -> 0 in
+      let version = text_document_version td in
       let text = match get_string "text" td with Some t -> t | None -> "" in
-      let doc : Lsp_state.document =
-        {
-          uri;
-          version;
-          text;
-          diagnostics = [];
-          parse_errors = [];
-          program = None;
-          typed_program = None;
-          env = None;
-          module_aliases = [];
-        }
-      in
-      Hashtbl.replace state.documents uri doc;
-      Lsp_state.analyze state doc;
-      publish_diagnostics oc doc
+      make_document ~uri ~version ~text |> store_analyzed_document state oc
   | None -> ()
 
 (** Handle textDocument/didChange *)
@@ -56,28 +71,16 @@ let handle_did_change (state : Lsp_state.state) oc params =
   match get "textDocument" params with
   | Some td -> (
       let uri = get_uri td in
-      let version = match get_int "version" td with Some v -> v | None -> 0 in
+      let version = text_document_version td in
       match Lsp_state.find_document state uri with
       | Some doc ->
           (* Full sync: take the last content change *)
-          let text =
-            match get_list "contentChanges" params with
-            | Some changes -> (
-                match List.rev changes with
-                | last :: _ -> (
-                    match get_string "text" last with
-                    | Some t -> t
-                    | None -> doc.text)
-                | [] -> doc.text)
-            | None -> doc.text
-          in
+          let text = latest_content_change_text params ~default:doc.text in
           let doc : Lsp_state.document = { doc with version; text } in
-          Hashtbl.replace state.documents uri doc;
-          Lsp_state.analyze state doc;
-          publish_diagnostics oc doc
+          store_analyzed_document state oc doc
       | None ->
-          (* Document not tracked — open it *)
-          handle_did_open state oc params)
+          let text = latest_content_change_text params ~default:"" in
+          make_document ~uri ~version ~text |> store_analyzed_document state oc)
   | None -> ()
 
 (** Handle textDocument/didSave *)
@@ -92,9 +95,7 @@ let handle_did_save (state : Lsp_state.state) oc params =
           let doc =
             match text with Some t -> { doc with text = t } | None -> doc
           in
-          Hashtbl.replace state.documents uri doc;
-          Lsp_state.analyze state doc;
-          publish_diagnostics oc doc
+          store_analyzed_document state oc doc
       | None -> ())
   | None -> ()
 

@@ -11,12 +11,11 @@
        with [__pure] (pre-Phase-2.7 dedup lived here as reactive
        cleanup; Phase 2.7 replaced it with proactive disambiguation).
 
-    2. [build_import_tables] — walks every module's [DImport]
-       declarations (AST-level, not Core) and produces two lookup
-       tables used by [Core_mono] / [Core_resolve] for cross-module
-       dispatch: an [import_aliases] table for the main program and a
-       per-module [module_imports] table for stdlib modules that
-       import each other.
+    2. [build_import_tables_from_typecheck] — turns typed import
+       bindings into two lookup tables used by [Core_mono] /
+       [Core_resolve] for cross-module dispatch: an [import_aliases]
+       table for the main program and a per-module [module_imports]
+       table for stdlib modules that import each other.
 
     Phase 5.5 (2026-04-21): extracted from [core_pipeline.ml] so the
     pipeline module becomes the thin orchestrator it should be. Pure
@@ -645,96 +644,6 @@ let register_types (reg : Codegen_types.registry) (prog : Core.core_program) :
   in
   List.iter seed prog;
   List.iter refine prog
-
-(** Walk every module's [DImport] declarations and build two lookup
-    tables: the main program's [import_aliases] and each module's
-    [module_imports] sub-table. Both map
-    `local_name → (module_path, original_name)` so [Core_mono] and
-    [Core_resolve] can resolve cross-module dispatch to the correct
-    target after module flattening has rewritten names.
-
-    Qualified module aliases (`import: mod as M`) are stored under
-    the alias name with `original_name = ""` as a sentinel that
-    [Core_resolve] recognizes for [M.func(args)] dispatch. *)
-let build_import_tables (program : Ast.program)
-    (modules : Modules.loaded_module list) :
-    (string, string * string) Hashtbl.t
-    * (string, (string, string * string) Hashtbl.t) Hashtbl.t =
-  let module_imports = Hashtbl.create 32 in
-  List.iter
-    (fun (m : Modules.loaded_module) ->
-      let mod_aliases = Hashtbl.create 16 in
-      let decls =
-        match m.typed_decls with
-        | Some td -> Typed_ast.program_ast td
-        | None -> m.decls
-      in
-      List.iter
-        (fun (d : Ast.decl) ->
-          match d.decl_desc with
-          | Ast.DImport imp -> (
-              let dep_path =
-                match Modules.find_cached imp.import_module with
-                | Some dep -> dep.Modules.name
-                | None -> imp.import_module
-              in
-              (match imp.import_symbols with
-              | Some syms ->
-                  List.iter
-                    (fun (sym : Ast.import_symbol) ->
-                      let local =
-                        match sym.sym_alias with
-                        | Some a -> a
-                        | None -> sym.sym_name
-                      in
-                      Hashtbl.replace mod_aliases local (dep_path, sym.sym_name))
-                    syms
-              | None -> ());
-              (* Qualified module alias (`import: mod as M`) also needs an
-             entry so `M.func(args)` can be resolved as a module call.
-             Stored under the alias name with orig_name = "" (sentinel
-             for qualified). *)
-              match imp.import_alias with
-              | Some a -> Hashtbl.replace mod_aliases a (dep_path, "")
-              | None -> ())
-          | _ -> ())
-        decls;
-      if Hashtbl.length mod_aliases > 0 then
-        Hashtbl.replace module_imports m.name mod_aliases)
-    modules;
-  (* Main program's import aliases (separate table because the main
-     program isn't in [modules] and its imports drive the top-level
-     lookup). *)
-  let import_aliases = Hashtbl.create 32 in
-  List.iter
-    (fun (d : Ast.decl) ->
-      match d.decl_desc with
-      | Ast.DImport imp -> (
-          let mod_path =
-            match Modules.find_cached imp.import_module with
-            | Some m -> m.Modules.name
-            | None -> imp.import_module
-          in
-          (match imp.import_symbols with
-          | Some syms ->
-              List.iter
-                (fun (sym : Ast.import_symbol) ->
-                  let local =
-                    match sym.sym_alias with
-                    | Some a -> a
-                    | None -> sym.sym_name
-                  in
-                  Hashtbl.replace import_aliases local (mod_path, sym.sym_name))
-                syms
-          | None -> ());
-          (* Qualified module alias (`import: mod as M`) also needs an
-           entry so `M.func(args)` resolves as a module call. *)
-          match imp.import_alias with
-          | Some a -> Hashtbl.replace import_aliases a (mod_path, "")
-          | None -> ())
-      | _ -> ())
-    program;
-  (import_aliases, module_imports)
 
 let build_import_tables_from_typecheck
     ~(main_import_bindings : Session.import_binding list)

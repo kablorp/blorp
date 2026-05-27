@@ -219,12 +219,32 @@ func main(args: List[String]) -> Int:
     "signature keeps alias source spelling"
     "func consume(user_id: UserId, fallback: UserId) -> UserId" label
 
+let test_signature_help_prefers_typed_private_source_signature () =
+  let state, uri =
+    analyzed_state
+      {|
+type alias UserId = Int
+
+private func consume(user_id: UserId, fallback: UserId) -> UserId:
+    user_id
+
+func main(args: List[String]) -> Int:
+    consume(1, 2)
+|}
+  in
+  let label = signature_at state uri ~line:7 ~character:15 in
+  Alcotest.(check string)
+    "private signature keeps alias source spelling"
+    "func consume(user_id: UserId, fallback: UserId) -> UserId" label
+
 let suite =
   [
     ( "format",
       [
         Alcotest.test_case "prefers typed source signature" `Quick
           test_signature_help_prefers_typed_source_signature;
+        Alcotest.test_case "prefers typed private source signature" `Quick
+          test_signature_help_prefers_typed_private_source_signature;
         Alcotest.test_case "uses parsed multiline call span" `Quick
           test_signature_help_uses_parsed_multiline_call_span;
         Alcotest.test_case "uses resolved method call metadata" `Quick

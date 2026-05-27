@@ -615,6 +615,37 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
 let test_codegen_pipeline_dead_helpers_stay_deleted () =
   assert_token_only_in ~allowed_files:[] "let add_vars "
 
+let test_compiler_dead_helpers_stay_deleted () =
+  [
+    "let func_foreign_info ";
+    "let is_stack_option ";
+    "let is_stack_result ";
+    "type storage_hash_policy =";
+    "let storage_policy_hash ";
+    "let tensor_word_storage ";
+    "let tensor_storage_unknown ";
+    "let tensor_storage_validated_boundary ";
+    "let tensor_storage_proven_layout ";
+    "let mark_reachable_function ";
+    "let scan_root_expr ";
+    "let build_import_tables (";
+    "let check_no_codegen_unprepared_forms (";
+    "let max_uses_ctree =";
+    "let try_resolve_qualified_call ";
+    "let format_warning ";
+    "let format_warnings ";
+    "let drain_through ";
+    "let take_remaining ";
+    "let _kind_text ";
+    "let _kind_field ";
+    "let _kind_interface ";
+    "let type_is_env_resource ";
+    "let typecheck_with_state ";
+    "let typecheck_module_with_state ";
+    "let typecheck_module ?";
+  ]
+  |> List.iter (assert_token_only_in ~allowed_files:[])
+
 let test_type_param_bound_string_parsing_stays_inventoried () =
   assert_token_only_in ~allowed_files:[] "String.split_on_char ':'";
   assert_token_only_in ~allowed_files:[] "String.split_on_char '+'";
@@ -1088,6 +1119,8 @@ let suite =
           test_late_layout_fallbacks_stay_in_inventoried_callers;
         Alcotest.test_case "codegen pipeline dead helpers stay deleted" `Quick
           test_codegen_pipeline_dead_helpers_stay_deleted;
+        Alcotest.test_case "compiler dead helpers stay deleted" `Quick
+          test_compiler_dead_helpers_stay_deleted;
         Alcotest.test_case "type-param bound parsing stays inventoried" `Quick
           test_type_param_bound_string_parsing_stays_inventoried;
         Alcotest.test_case "AST declaration type params stay structured" `Quick

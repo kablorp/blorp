@@ -95,30 +95,32 @@ let singleton_int_slot reason semantic_ty =
 let dim_operand_slot reason semantic_ty =
   target_slot reason ~semantic_ty ~value_ty:(scalar_int_value_type semantic_ty)
 
+let param_accepts_singleton_argument_widening = function
+  | TyMeta id -> not (Types.Dim.is_var_name (Types.meta_origin_name id))
+  | TySelf -> true
+  | _ -> false
+
+let can_use_concrete_argument_target ~target_ty ~semantic_ty =
+  match (target_ty, semantic_ty) with
+  | TyNamed ("Int", []), TyConstInt _ -> true
+  | _ -> false
+
 let mutable_binding_slot semantic_ty =
   singleton_int_slot MutableBinding semantic_ty
 
 let argument_slot ~param_ty ~arg_ty =
-  match param_ty with
-  | TyMeta id when not (Types.Dim.is_var_name (Types.meta_origin_name id)) ->
-      singleton_int_slot ArgumentSlot arg_ty
-  | TySelf -> singleton_int_slot ArgumentSlot arg_ty
-  | _ -> keep_slot arg_ty
+  if param_accepts_singleton_argument_widening param_ty then
+    singleton_int_slot ArgumentSlot arg_ty
+  else keep_slot arg_ty
 
 let argument_target_slot ~param_ty semantic_ty =
-  let can_use_concrete_target target_ty =
-    match (target_ty, semantic_ty) with
-    | TyNamed ("Int", []), TyConstInt _ -> true
-    | _ -> false
-  in
   match param_ty with
-  | TyMeta id when not (Types.Dim.is_var_name (Types.meta_origin_name id)) ->
+  | ty when param_accepts_singleton_argument_widening ty ->
       singleton_int_slot ArgumentSlot semantic_ty
-  | TySelf -> singleton_int_slot ArgumentSlot semantic_ty
   | ty when Types.collect_type_vars ty <> [] -> keep_slot semantic_ty
   | ty when Types.Dim.is_value_dim ty -> keep_slot semantic_ty
   | TyVarDims _ -> keep_slot semantic_ty
-  | target_ty when can_use_concrete_target target_ty ->
+  | target_ty when can_use_concrete_argument_target ~target_ty ~semantic_ty ->
       target_slot ArgumentSlot ~semantic_ty ~value_ty:target_ty
   | _ -> keep_slot semantic_ty
 

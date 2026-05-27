@@ -1,33 +1,44 @@
 #!/bin/bash
 set -euo pipefail
 
-IMAGE_NAME="blorp-test"
-PLATFORM="linux/amd64"
+BASE_IMAGE_NAME="blorp-test"
+DEFAULT_PLATFORMS=("linux/amd64")
+ALL_PLATFORMS=("linux/amd64" "linux/arm64")
+PLATFORMS=("${DEFAULT_PLATFORMS[@]}")
+PLATFORMS_SET=0
 MODE="volume"
 BUILD_ONLY=0
 SHELL_MODE=0
 REBUILD=0
-TEST_ARGS=()
+FULL_GATE=0
+DRY_RUN=0
+PASS_ARGS=()
 
 usage() {
     cat <<'EOF'
-Usage: scripts/docker-test [options] [-- blorp-test-args...]
+Usage: scripts/docker-test [options] [-- args...]
 
-Run blorp tests in a Docker container matching the CI environment (Ubuntu 24.04 x86_64).
+Run blorp validation in Docker. By default this runs the normal test suite in an
+Ubuntu 24.04 container for linux/amd64. Use --full-gate to run scripts/full-gate
+inside Docker with nested Docker disabled.
 
 Options:
-  --clean         Copy source into image (CI-like, hermetic)
-  --build-only    Build base image, don't run tests
-  --shell         Interactive bash shell in container
-  --rebuild       Force rebuild base image (no cache)
-  --platform P    Docker platform (default: linux/amd64)
-  -h, --help      Show help
+  --clean          Copy source into image (CI-like, hermetic; not valid with --full-gate)
+  --build-only     Build base image(s), don't run tests
+  --shell          Interactive bash shell in container
+  --rebuild        Force rebuild base image(s) (no cache)
+  --full-gate      Run scripts/full-gate --no-docker inside the container
+  --platform P     Docker platform to run (may be repeated; default: linux/amd64)
+  --all-platforms  Run linux/amd64 and linux/arm64
+  --dry-run        Print Docker commands without running them
+  -h, --help       Show help
 
 Examples:
-  scripts/docker-test                           # Full suite, volume mount
-  scripts/docker-test --clean                   # CI-like hermetic build
-  scripts/docker-test --shell                   # Debug interactively
-  scripts/docker-test -- tests/test_blorp/types/   # Specific tests only
+  scripts/docker-test
+  scripts/docker-test --full-gate
+  scripts/docker-test --full-gate --all-platforms
+  scripts/docker-test --platform linux/arm64 -- tests/test_blorp/numeric/test_float16_vector.brp
+  scripts/docker-test --full-gate -- --quick
 EOF
 }
 
@@ -49,9 +60,26 @@ while [ $# -gt 0 ]; do
             REBUILD=1
             shift
             ;;
+        --full-gate)
+            FULL_GATE=1
+            shift
+            ;;
         --platform)
-            PLATFORM="$2"
+            if [ "$PLATFORMS_SET" -eq 0 ]; then
+                PLATFORMS=()
+                PLATFORMS_SET=1
+            fi
+            PLATFORMS+=("$2")
             shift 2
+            ;;
+        --all-platforms)
+            PLATFORMS=("${ALL_PLATFORMS[@]}")
+            PLATFORMS_SET=1
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
             ;;
         -h|--help)
             usage
@@ -59,12 +87,12 @@ while [ $# -gt 0 ]; do
             ;;
         --)
             shift
-            TEST_ARGS=("$@")
+            PASS_ARGS=("$@")
             break
             ;;
         *)
-            echo "Unknown option: $1"
-            usage
+            echo "Unknown option: $1" >&2
+            usage >&2
             exit 1
             ;;
     esac
@@ -72,86 +100,206 @@ done
 
 cd "$(dirname "$0")/.."
 
-build_base_image() {
-    local cache_flag=""
-    if [ "$REBUILD" -eq 1 ]; then
-        cache_flag="--no-cache"
+if [ "$FULL_GATE" -eq 1 ] && [ "$MODE" = "clean" ]; then
+    echo "--full-gate requires volume mode so .git metadata is available for drift and security checks." >&2
+    exit 1
+fi
+
+if [ "$SHELL_MODE" -eq 1 ] && [ "${#PLATFORMS[@]}" -ne 1 ]; then
+    echo "--shell requires exactly one platform." >&2
+    exit 1
+fi
+
+if [ "$DRY_RUN" -eq 0 ]; then
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Docker is not installed or is not in PATH." >&2
+        exit 127
     fi
-    echo "Building base image '$IMAGE_NAME'..."
-    docker build \
-        --platform "$PLATFORM" \
-        $cache_flag \
-        -t "$IMAGE_NAME" \
-        -f scripts/docker/Dockerfile \
-        .
-    echo "Base image built."
+    if ! docker info >/dev/null 2>&1; then
+        echo "Docker is installed, but the Docker daemon is unavailable." >&2
+        echo "Start Docker, then rerun this command." >&2
+        exit 1
+    fi
+fi
+
+platform_image_name() {
+    local platform="$1"
+    local suffix
+    suffix="${platform//\//-}"
+    suffix="${suffix//:/-}"
+    echo "${BASE_IMAGE_NAME}-${suffix}"
 }
 
-# Always ensure the base image exists
-if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1 || [ "$REBUILD" -eq 1 ]; then
-    build_base_image
-fi
+quote_cmd() {
+    local part
+    for part in "$@"; do
+        printf "%q " "$part"
+    done
+}
 
-if [ "$BUILD_ONLY" -eq 1 ]; then
-    build_base_image
-    exit 0
-fi
+run_cmd() {
+    printf '+ '
+    quote_cmd "$@"
+    echo ""
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
+    "$@"
+}
 
-if [ "$SHELL_MODE" -eq 1 ]; then
-    echo "Starting interactive shell (platform: $PLATFORM)..."
-    docker run --rm -it \
-        --platform "$PLATFORM" \
+build_base_image() {
+    local platform="$1"
+    local image
+    image="$(platform_image_name "$platform")"
+    if [ "$REBUILD" -eq 1 ]; then
+        echo "Building base image '$image' for $platform..."
+        run_cmd docker build \
+            --platform "$platform" \
+            --no-cache \
+            -t "$image" \
+            -f scripts/docker/Dockerfile \
+            .
+        echo "Base image ready: $image"
+        return 0
+    fi
+    echo "Building base image '$image' for $platform..."
+    run_cmd docker build \
+        --platform "$platform" \
+        -t "$image" \
+        -f scripts/docker/Dockerfile \
+        .
+    echo "Base image ready: $image"
+}
+
+ensure_base_image() {
+    local platform="$1"
+    local image
+    image="$(platform_image_name "$platform")"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        build_base_image "$platform"
+        return 0
+    fi
+    if ! docker image inspect "$image" >/dev/null 2>&1 || [ "$REBUILD" -eq 1 ]; then
+        build_base_image "$platform"
+    fi
+}
+
+run_shell() {
+    local platform="$1"
+    local image
+    image="$(platform_image_name "$platform")"
+    echo "Starting interactive shell (platform: $platform)..."
+    run_cmd docker run --rm -it \
+        --platform "$platform" \
         -v "$(pwd):/blorp" \
-        "$IMAGE_NAME" \
-        bash -c 'eval $(opam env) && exec bash'
-    exit 0
-fi
+        "$image" \
+        bash -lc 'eval $(opam env) && exec bash'
+}
 
-if [ "$MODE" = "clean" ]; then
-    CLEAN_IMAGE="${IMAGE_NAME}-clean-$$"
-    CLEAN_DOCKERFILE=$(mktemp)
-    trap "rm -f '$CLEAN_DOCKERFILE'; docker rmi '$CLEAN_IMAGE' 2>/dev/null || true" EXIT
+run_clean_tests() (
+    local platform="$1"
+    local image clean_image clean_dockerfile
+    image="$(platform_image_name "$platform")"
+    clean_image="${image}-clean-$$"
+    clean_dockerfile=$(mktemp)
+    trap "rm -f '$clean_dockerfile'; if [ '$DRY_RUN' -eq 0 ]; then docker rmi '$clean_image' 2>/dev/null || true; fi" EXIT
 
-    cat > "$CLEAN_DOCKERFILE" <<DEOF
-FROM $IMAGE_NAME
+    cat > "$clean_dockerfile" <<DEOF
+FROM $image
 COPY --chown=blorp:blorp . /blorp
-RUN bash -c 'eval \$(opam env) && make'
+RUN bash -lc 'eval \$(opam env) && make'
 DEOF
 
-    echo "Building hermetic image (platform: $PLATFORM)..."
-    docker build \
-        --platform "$PLATFORM" \
-        -t "$CLEAN_IMAGE" \
-        -f "$CLEAN_DOCKERFILE" \
+    echo "Building hermetic image (platform: $platform)..."
+    run_cmd docker build \
+        --platform "$platform" \
+        -t "$clean_image" \
+        -f "$clean_dockerfile" \
         .
 
-    echo "Running tests (hermetic)..."
-    if [ ${#TEST_ARGS[@]} -gt 0 ]; then
-        docker run --rm \
-            --platform "$PLATFORM" \
-            "$CLEAN_IMAGE" \
-            bash -c "eval \$(opam env) && ./blorp test ${TEST_ARGS[*]}"
+    echo "Running tests (hermetic, platform: $platform)..."
+    if [ "${#PASS_ARGS[@]}" -gt 0 ]; then
+        run_cmd docker run --rm \
+            --platform "$platform" \
+            "$clean_image" \
+            bash scripts/docker/test.sh "${PASS_ARGS[@]}"
     else
-        docker run --rm \
-            --platform "$PLATFORM" \
-            "$CLEAN_IMAGE" \
-            bash -c 'eval $(opam env) && bash scripts/run_tests.sh'
+        run_cmd docker run --rm \
+            --platform "$platform" \
+            "$clean_image" \
+            bash scripts/docker/test.sh
     fi
-else
-    echo "Running tests (volume mount, platform: $PLATFORM)..."
-    if [ ${#TEST_ARGS[@]} -gt 0 ]; then
-        docker run --rm \
-            --platform "$PLATFORM" \
+)
+
+run_volume_tests() {
+    local platform="$1"
+    local image
+    image="$(platform_image_name "$platform")"
+    echo "Running tests (volume mount, platform: $platform)..."
+    if [ "${#PASS_ARGS[@]}" -gt 0 ]; then
+        run_cmd docker run --rm \
+            --platform "$platform" \
             -e BLORP_VOLUME_MODE=1 \
             -v "$(pwd):/blorp:ro" \
-            "$IMAGE_NAME" \
-            bash -c "eval \$(opam env) && bash /blorp/scripts/docker/test.sh ${TEST_ARGS[*]}"
+            "$image" \
+            bash /blorp/scripts/docker/test.sh "${PASS_ARGS[@]}"
     else
-        docker run --rm \
-            --platform "$PLATFORM" \
+        run_cmd docker run --rm \
+            --platform "$platform" \
             -e BLORP_VOLUME_MODE=1 \
             -v "$(pwd):/blorp:ro" \
-            "$IMAGE_NAME" \
+            "$image" \
             bash /blorp/scripts/docker/test.sh
     fi
-fi
+}
+
+run_volume_full_gate() {
+    local platform="$1"
+    local image
+    image="$(platform_image_name "$platform")"
+    echo "Running full gate (volume mount, platform: $platform)..."
+    if [ "${#PASS_ARGS[@]}" -gt 0 ]; then
+        run_cmd docker run --rm \
+            --platform "$platform" \
+            -e BLORP_VOLUME_MODE=1 \
+            -e BLORP_DOCKER_FULL_GATE=1 \
+            -e "BLORP_TEST_TIMEOUT=${BLORP_TEST_TIMEOUT:-30}" \
+            -v "$(pwd):/blorp:ro" \
+            "$image" \
+            bash /blorp/scripts/docker/test.sh "${PASS_ARGS[@]}"
+    else
+        run_cmd docker run --rm \
+            --platform "$platform" \
+            -e BLORP_VOLUME_MODE=1 \
+            -e BLORP_DOCKER_FULL_GATE=1 \
+            -e "BLORP_TEST_TIMEOUT=${BLORP_TEST_TIMEOUT:-30}" \
+            -v "$(pwd):/blorp:ro" \
+            "$image" \
+            bash /blorp/scripts/docker/test.sh
+    fi
+}
+
+run_for_platform() {
+    local platform="$1"
+    echo ""
+    echo "=== Docker platform: $platform ==="
+    ensure_base_image "$platform"
+
+    if [ "$BUILD_ONLY" -eq 1 ]; then
+        return 0
+    fi
+
+    if [ "$SHELL_MODE" -eq 1 ]; then
+        run_shell "$platform"
+    elif [ "$FULL_GATE" -eq 1 ]; then
+        run_volume_full_gate "$platform"
+    elif [ "$MODE" = "clean" ]; then
+        run_clean_tests "$platform"
+    else
+        run_volume_tests "$platform"
+    fi
+}
+
+for platform in "${PLATFORMS[@]}"; do
+    run_for_platform "$platform"
+done

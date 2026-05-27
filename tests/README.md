@@ -41,15 +41,17 @@ tests/
 │   ├── memory/            # ARC, COW, leak detection tests
 │   ├── concurrency/       # Concurrent blocks, channels, fibers
 │   ├── tools/             # Tooling/runtime helper tests
-│   └── simd/              # SIMD tests (skipped by default)
+│   └── simd/              # SIMD compatibility and runtime tests
 ├── test_std/              # Runtime tests for std/, mirroring std/ where practical
 │   ├── list/ dict/ set/   # Core collection tests
 │   ├── cache/ deque/ heap/ sorted_map/ graph/
 │   ├── io/                # I/O module tests
 │   └── stream/            # Stream tests
 ├── test_pkg/              # Optional runtime tests for pkg/, created when pkg tests exist
-├── test_cli.sh            # CLI smoke and exit-code checks
-├── stages/                # Golden lexer/parser/typecheck snapshots
+├── test_cli.sh            # CLI smoke and exit-code checks used by scripts/run_tests.sh
+├── test_lsp.sh, test_repl.sh, test_auto_format.sh, test_leak_report.sh
+│                           # Standalone smoke tests, not part of scripts/run_tests.sh
+├── stages/                # Historical golden fixtures; runners need refresh before use
 └── test_compiler/         # Compiler behavior tests
     ├── parser/            # Parser/lexer tests
     │   ├── should_pass/   # Valid syntax that must parse
@@ -92,6 +94,7 @@ Run with: `./blorp test path/to/test.brp`
 
 - `should_pass/`: Files must compile without errors (`./blorp check`)
 - `should_fail/`: Files must produce a compile error. Add `-- EXPECT: <diagnostic line>` annotations to verify error messages. `EXPECT` exact-matches a normalized diagnostic line without file paths, line numbers, or source underlines. Use `-- EXPECT-CONTAINS: <substring>` only when a test deliberately needs to match raw output text.
+- Runtime `TestSuite` assertions in compiler-test files are not executed by the compiler-test runner.
 
 The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both directions automatically.
 
@@ -105,6 +108,7 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
    - Language features → `test_blorp/` (appropriate subdirectory)
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`
+   - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
    - CLI behavior → `tests/test_cli.sh`
    - Standard library examples → doctests in `std/`
 2. Always add both `should_pass` and `should_fail` cases for compiler tests

@@ -9,6 +9,46 @@ open Lsp_json
    URI helpers
    ============================================================================ *)
 
+let has_prefix ~prefix s =
+  let prefix_len = String.length prefix in
+  String.length s >= prefix_len && String.sub s 0 prefix_len = prefix
+
+let is_uri_path_char = function
+  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '/' | '-' | '_' | '.' | '~' | ':' ->
+      true
+  | _ -> false
+
+let percent_encode_path path =
+  let buf = Buffer.create (String.length path) in
+  String.iter
+    (fun c ->
+      if is_uri_path_char c then Buffer.add_char buf c
+      else Buffer.add_string buf (Printf.sprintf "%%%02X" (Char.code c)))
+    path;
+  Buffer.contents buf
+
+let percent_decode encoded =
+  let buf = Buffer.create (String.length encoded) in
+  let len = String.length encoded in
+  let i = ref 0 in
+  while !i < len do
+    if encoded.[!i] = '%' && !i + 2 < len then begin
+      let hex = String.sub encoded (!i + 1) 2 in
+      (try
+         let code = int_of_string ("0x" ^ hex) in
+         Buffer.add_char buf (Char.chr code)
+       with _ ->
+         Buffer.add_char buf '%';
+         Buffer.add_string buf hex);
+      i := !i + 3
+    end
+    else begin
+      Buffer.add_char buf encoded.[!i];
+      i := !i + 1
+    end
+  done;
+  Buffer.contents buf
+
 (** Convert a filesystem path to a file:// URI. Absolutizes relative paths
     using the current working directory so IDEs can locate the target file. *)
 let path_to_uri path =
@@ -17,36 +57,23 @@ let path_to_uri path =
       Filename.concat (try Sys.getcwd () with _ -> ".") path
     else path
   in
-  "file://" ^ absolute
+  "file://" ^ percent_encode_path absolute
 
 (** Convert a file:// URI to a filesystem path *)
 let uri_to_path uri =
   let prefix = "file://" in
   let prefix_len = String.length prefix in
-  if String.length uri >= prefix_len && String.sub uri 0 prefix_len = prefix
-  then (
+  if has_prefix ~prefix uri then
     let encoded = String.sub uri prefix_len (String.length uri - prefix_len) in
-    (* Percent-decode *)
-    let buf = Buffer.create (String.length encoded) in
-    let len = String.length encoded in
-    let i = ref 0 in
-    while !i < len do
-      if encoded.[!i] = '%' && !i + 2 < len then begin
-        let hex = String.sub encoded (!i + 1) 2 in
-        (try
-           let code = int_of_string ("0x" ^ hex) in
-           Buffer.add_char buf (Char.chr code)
-         with _ ->
-           Buffer.add_char buf '%';
-           Buffer.add_string buf hex);
-        i := !i + 3
-      end
-      else begin
-        Buffer.add_char buf encoded.[!i];
-        i := !i + 1
-      end
-    done;
-    Buffer.contents buf)
+    let localhost_prefix = "localhost/" in
+    let encoded_path =
+      if has_prefix ~prefix:localhost_prefix encoded then
+        String.sub encoded
+          (String.length "localhost")
+          (String.length encoded - String.length "localhost")
+      else encoded
+    in
+    percent_decode encoded_path
   else uri
 
 (* ============================================================================

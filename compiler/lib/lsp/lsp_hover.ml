@@ -14,6 +14,8 @@ let hover_code ?(details = []) line =
   | [] -> block
   | _ -> block ^ "\n" ^ String.concat "\n" details
 
+let doc_prefix = function Some doc -> doc ^ "\n\n" | None -> ""
+
 let detail_if_different ~label ~source ~semantic =
   if Types.types_equal source semantic then []
   else [ Printf.sprintf "%s: %s" label (type_to_string semantic) ]
@@ -21,74 +23,85 @@ let detail_if_different ~label ~source ~semantic =
 let source_type_or_semantic source semantic =
   match source with Some ty -> ty | None -> semantic
 
+let purity_prefix = function Env.Pure -> "pure " | Env.Impure -> ""
+let mutability_prefix = function Env.Mutable -> "var " | Env.Immutable -> ""
+
+let variant_label (variant : Ast.variant) =
+  let fields = Lsp_protocol.format_field_types variant.variant_fields in
+  "    " ^ variant.variant_name ^ fields
+
+let field_decl_label (field : Ast.field_decl) =
+  field.field_name ^ ": " ^ Types.type_to_string field.field_type
+
+let record_keyword ~is_value = if is_value then "struct" else "record"
+
+let hover_for_func_symbol name expr ~func_type ~purity =
+  match expr_type_view ~fallback_ty:func_type expr with
+  | Some view ->
+      let label =
+        Printf.sprintf "%sfunc %s: %s" (purity_prefix purity) name
+          view.primary_type
+      in
+      Some (hover_code ~details:view.details label)
+  | None -> None
+
+let hover_for_var_symbol name expr ~var_type ~source_type ~mutability =
+  let fallback_ty = Option.value source_type ~default:var_type in
+  match expr_type_view ~fallback_ty expr with
+  | Some view ->
+      let label =
+        Printf.sprintf "%s%s: %s"
+          (mutability_prefix mutability)
+          name view.primary_type
+      in
+      Some (hover_code ~details:view.details label)
+  | None -> None
+
+let hover_for_type_symbol name ~type_params ~variants =
+  let params_str = Lsp_protocol.format_type_params type_params in
+  let variants_str = variants |> List.map variant_label |> String.concat "\n" in
+  Some
+    (Printf.sprintf "```blorp\nunion %s%s:\n%s\n```" name params_str
+       variants_str)
+
+let hover_for_record_symbol name ~type_params ~fields ~is_value =
+  let params_str = Lsp_protocol.format_type_params type_params in
+  let fields_str = fields |> List.map field_decl_label |> String.concat ", " in
+  Some
+    (Printf.sprintf "```blorp\n%s %s%s {%s}\n```" (record_keyword ~is_value)
+       name params_str fields_str)
+
+let hover_for_constructor_symbol name ~parent_type ~field_types =
+  let fields = Lsp_protocol.format_field_types field_types in
+  Some (Printf.sprintf "```blorp\n%s%s  (from %s)\n```" name fields parent_type)
+
+let hover_for_alias_symbol name ~type_params ~target =
+  let params_str = Lsp_protocol.format_type_params type_params in
+  Some
+    (Printf.sprintf "```blorp\nalias %s%s = %s\n```" name params_str
+       (Types.type_to_string target))
+
+let hover_info_for_symbol name expr (symbol : Env.symbol) =
+  match symbol.kind with
+  | Env.FuncSymbol { func_type; purity; _ } ->
+      hover_for_func_symbol name expr ~func_type ~purity
+  | Env.VarSymbol { var_type; source_type; mutability; _ } ->
+      hover_for_var_symbol name expr ~var_type ~source_type ~mutability
+  | Env.TypeSymbol { type_params; variants; _ } ->
+      hover_for_type_symbol name ~type_params ~variants
+  | Env.RecordSymbol { type_params; fields; is_value } ->
+      hover_for_record_symbol name ~type_params ~fields ~is_value
+  | Env.ConstructorSymbol { parent_type; field_types; _ } ->
+      hover_for_constructor_symbol name ~parent_type ~field_types
+  | Env.AliasSymbol { type_params; target } ->
+      hover_for_alias_symbol name ~type_params ~target
+
 (** Get hover info for an expression using the environment *)
 let hover_info_for_expr (env : Env.env) (e : expr) : string option =
   match e.expr_desc with
   | EIdent name -> (
       match Env.lookup env name with
-      | Some { kind = Env.FuncSymbol { func_type; purity; _ }; _ } -> (
-          let pure_str =
-            match purity with Env.Pure -> "pure " | Env.Impure -> ""
-          in
-          match expr_type_view ~fallback_ty:func_type e with
-          | Some view ->
-              Some
-                (hover_code ~details:view.details
-                   (Printf.sprintf "%sfunc %s: %s" pure_str name
-                      view.primary_type))
-          | None -> None)
-      | Some
-          { kind = Env.VarSymbol { var_type; source_type; mutability; _ }; _ }
-        -> (
-          let mut_str =
-            match mutability with Env.Mutable -> "var " | Env.Immutable -> ""
-          in
-          let fallback_ty = Option.value source_type ~default:var_type in
-          match expr_type_view ~fallback_ty e with
-          | Some view ->
-              Some
-                (hover_code ~details:view.details
-                   (Printf.sprintf "%s%s: %s" mut_str name view.primary_type))
-          | None -> None)
-      | Some { kind = Env.TypeSymbol { type_params; variants; _ }; _ } ->
-          let params_str = Lsp_protocol.format_type_params type_params in
-          let variants_str =
-            String.concat "\n"
-              (List.map
-                 (fun (v : Ast.variant) ->
-                   let fields =
-                     Lsp_protocol.format_field_types v.variant_fields
-                   in
-                   "    " ^ v.variant_name ^ fields)
-                 variants)
-          in
-          Some
-            (Printf.sprintf "```blorp\nunion %s%s:\n%s\n```" name params_str
-               variants_str)
-      | Some { kind = Env.RecordSymbol { type_params; fields; is_value }; _ } ->
-          let params_str = Lsp_protocol.format_type_params type_params in
-          let fields_str =
-            String.concat ", "
-              (List.map
-                 (fun (f : Ast.field_decl) ->
-                   f.field_name ^ ": " ^ Types.type_to_string f.field_type)
-                 fields)
-          in
-          let keyword = if is_value then "struct" else "record" in
-          Some
-            (Printf.sprintf "```blorp\n%s %s%s {%s}\n```" keyword name
-               params_str fields_str)
-      | Some { kind = Env.ConstructorSymbol { parent_type; field_types; _ }; _ }
-        ->
-          let fields = Lsp_protocol.format_field_types field_types in
-          Some
-            (Printf.sprintf "```blorp\n%s%s  (from %s)\n```" name fields
-               parent_type)
-      | Some { kind = Env.AliasSymbol { type_params; target }; _ } ->
-          let params_str = Lsp_protocol.format_type_params type_params in
-          Some
-            (Printf.sprintf "```blorp\nalias %s%s = %s\n```" name params_str
-               (Types.type_to_string target))
+      | Some symbol -> hover_info_for_symbol name e symbol
       | None -> None)
   | EFieldAccess (_, field_name) -> (
       match expr_type_view e with
@@ -108,11 +121,10 @@ let hover_info_for_decl (d : decl) : string option =
   | DFunc fd ->
       let name = match fd.func_name with Some n -> n | None -> "<lambda>" in
       let label, _ = Lsp_protocol.format_func_decl fd name in
-      let doc = match d.decl_doc with Some d -> d ^ "\n\n" | None -> "" in
-      Some (Printf.sprintf "%s```blorp\n%s\n```" doc label)
+      Some (doc_prefix d.decl_doc ^ hover_code label)
   | _ -> None
 
-let hover_info_for_typed_func (func : Typed_ast.func_decl) =
+let hover_info_for_typed_func ?doc (func : Typed_ast.func_decl) =
   let ast = Typed_ast.func_ast func in
   let name = match ast.func_name with Some n -> n | None -> "<lambda>" in
   let label, _ = Lsp_protocol.format_func_decl ast name in
@@ -124,7 +136,7 @@ let hover_info_for_typed_func (func : Typed_ast.func_decl) =
           ~semantic:(Typed_ast.func_semantic_return_type func)
     | None -> []
   in
-  Some (hover_code ~details label)
+  Some (doc_prefix doc ^ hover_code ~details label)
 
 let hover_info_for_typed_var (var : Typed_ast.var_decl) =
   let ast = Typed_ast.var_ast var in
@@ -198,7 +210,9 @@ let hover_info_for_typed_param ~(name : string) ~(source_ty : Ast.type_expr)
 (** Get hover info for a typed declaration. *)
 let rec hover_info_for_typed_decl (d : Typed_ast.decl) : string option =
   match Typed_ast.decl_view d with
-  | DeclFunction func -> hover_info_for_typed_func func
+  | DeclFunction func ->
+      let doc = (Typed_ast.decl_ast d).decl_doc in
+      hover_info_for_typed_func ?doc func
   | DeclVar var -> hover_info_for_typed_var var
   | DeclRecord record -> hover_info_for_typed_record record
   | DeclTypeAlias alias -> hover_info_for_typed_type_alias alias

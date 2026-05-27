@@ -469,18 +469,18 @@ and make_func_param_infos ?source_func ~loc ast_func =
     Error
       (InvalidTypeInfo { loc; context = "function source metadata"; message })
   in
+  let make_param_info canonical source_param_ty =
+    let* semantic_param_ty = param_semantic_type canonical in
+    let source_param_ty =
+      match source_param_ty with Some ty -> ty | None -> semantic_param_ty
+    in
+    Ok { param_name = canonical.param_name; source_param_ty; semantic_param_ty }
+  in
   let rec without_source acc (canonical_params : Ast.param list) =
     match canonical_params with
     | [] -> Ok (List.rev acc)
     | canonical :: rest ->
-        let* semantic_param_ty = param_semantic_type canonical in
-        let info =
-          {
-            param_name = canonical.param_name;
-            source_param_ty = semantic_param_ty;
-            semantic_param_ty;
-          }
-        in
+        let* info = make_param_info canonical None in
         without_source (info :: acc) rest
   in
   let rec with_source acc (source_params : Ast.param list)
@@ -491,23 +491,11 @@ and make_func_param_infos ?source_func ~loc ast_func =
         invalid_param_arity
           "source function has fewer parameters than canonical function"
     | source :: source_rest, canonical :: canonical_rest ->
-        let* semantic_param_ty = param_semantic_type canonical in
         let* () =
           ensure_optional_type ~loc:source.param_loc
             ~context:"function parameter source annotation" source.param_type
         in
-        let source_param_ty =
-          match source.param_type with
-          | Some ty -> ty
-          | None -> semantic_param_ty
-        in
-        let info =
-          {
-            param_name = canonical.param_name;
-            source_param_ty;
-            semantic_param_ty;
-          }
-        in
+        let* info = make_param_info canonical source.param_type in
         with_source (info :: acc) source_rest canonical_rest
     | _ :: _, [] ->
         invalid_param_arity

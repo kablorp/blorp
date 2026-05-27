@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build install warm-formatter clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
+.PHONY: all build install warm-formatter clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell docker-full-gate docker-full-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 FORMATTER_SOURCES := $(shell find tools/formatter -name '*.brp' 2>/dev/null)
@@ -133,10 +133,11 @@ c-static-analysis:
 		exit 127; \
 	}
 	@tmp_plist=$$(mktemp "$${TMPDIR:-/tmp}/blorp-clang-analyze.XXXXXX"); \
+	block_checker_args=$$(clang -cc1 -analyzer-checker-help 2>/dev/null | grep -Fq 'unix.BlockInCriticalSection' && printf '%s' '-Xclang -analyzer-disable-checker=unix.BlockInCriticalSection'); \
 	trap 'rm -f "$$tmp_plist"' EXIT; \
-	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c compiler/lib/runtime_decl.c; \
+	clang --analyze -D_GNU_SOURCE -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c compiler/lib/runtime_decl.c; \
 	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument \
-		-Xclang -analyzer-disable-checker=unix.BlockInCriticalSection \
+		-D_GNU_SOURCE $$block_checker_args \
 		-DMINICORO_IMPL -include compiler/lib/minicoro.h \
 		-o "$$tmp_plist" -x c compiler/lib/runtime.c
 
@@ -161,6 +162,12 @@ docker-test-clean:
 
 docker-shell:
 	scripts/docker-test --shell
+
+docker-full-gate:
+	scripts/docker-test --full-gate
+
+docker-full-gate-all:
+	scripts/docker-test --full-gate --all-platforms
 
 # Clean build artifacts
 clean:

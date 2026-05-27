@@ -352,7 +352,7 @@ let type_to_module_paths (ty : Ast.type_expr) : string list =
   | Ast.TyNamed ("Matrix", args) -> (
       (* Legacy internal tensor-family names may still appear while older Core
          paths are being ported. Dispatch by rank so a 2D access like
-         [m.get_cell(row, col)] resolves through [std/matrix] before
+         [m.get(row, col)] resolves through [std/matrix] before
          first-dimension tensor helpers. *)
       let rank = max 0 (List.length args - 1) in
       match rank with
@@ -434,15 +434,6 @@ let try_resolve_bitwise_intrinsic name args =
   Core_intrinsic_registry.lookup_bitwise_intrinsic ~name
     ~arity:(List.length args)
   |> Option.map (fun intrinsic -> CKIntrinsic intrinsic)
-
-(** Try to resolve a qualified module call [M.func(args)] where [M] is a
-    module alias. Returns [None] if [M] is not an alias for a known module. *)
-let try_resolve_qualified_call (env : env) (module_path : string)
-    (alias_name : string) (field : string) (args : core list) : call_kind option
-    =
-  match resolve_qualified_call_module_path env module_path alias_name with
-  | Some mp -> try_resolve_module_func_call env mp field args
-  | None -> None
 
 module Bound_names = Set.Make (String)
 

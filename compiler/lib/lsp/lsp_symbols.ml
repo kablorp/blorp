@@ -25,18 +25,10 @@ let kind_struct = 22
 
 (** Build an LSP range from a blorp loc *)
 let loc_to_range (loc : loc) : json =
-  let start_line = max 0 (loc.line - 1) in
-  let start_col = max 0 (loc.column - 1) in
-  let end_line =
-    if loc.end_line > 0 then max 0 (loc.end_line - 1) else start_line
-  in
-  let end_col = if loc.end_column > 0 then loc.end_column else start_col + 1 in
-  Object
-    [
-      ( "start",
-        Object [ ("line", Int start_line); ("character", Int start_col) ] );
-      ("end", Object [ ("line", Int end_line); ("character", Int end_col) ]);
-    ]
+  Lsp_protocol.loc_to_range loc |> Lsp_protocol.range_to_json
+
+let position_to_json line character =
+  Lsp_protocol.position_to_json { line; character }
 
 (** Build a selection range (just the name) from loc + name length *)
 let selection_range (loc : loc) (name_len : int) : json =
@@ -44,8 +36,8 @@ let selection_range (loc : loc) (name_len : int) : json =
   let col = max 0 (loc.column - 1) in
   Object
     [
-      ("start", Object [ ("line", Int line); ("character", Int col) ]);
-      ("end", Object [ ("line", Int line); ("character", Int (col + name_len)) ]);
+      ("start", position_to_json line col);
+      ("end", position_to_json line (col + name_len));
     ]
 
 (* ============================================================================

@@ -110,8 +110,9 @@ let function_ref_target (state : state) (v : var) : function_ref_target option =
 
     This is the same logic as [Core_emit.collect_free_vars_filtered]
     but operates on [core] directly without emission context. *)
-let collect_free_vars_filtered (state : state) (body : core)
-    (params : (var * Ast.type_expr) list) : (string * Ast.type_expr) list =
+let collect_free_vars_filtered (state : state) ~(capturable : StringSet.t)
+    (body : core) (params : (var * Ast.type_expr) list) :
+    (string * Ast.type_expr) list =
   let module SS = Set.Make (String) in
   let module SM = Map.Make (String) in
   let rec go_ctree bound = function
@@ -165,6 +166,7 @@ let collect_free_vars_filtered (state : state) (body : core)
     match e.desc with
     | CVar v ->
         if SS.mem v.vname bound then SM.empty
+        else if StringSet.mem v.vname capturable then SM.singleton v.vname e.ty
         else if Hashtbl.mem state.constructor_names v.vname then SM.empty
         else if Option.is_some (function_ref_target state v) then SM.empty
         else SM.singleton v.vname e.ty
@@ -385,9 +387,10 @@ let wrap_fn_ref_as_closure (state : state) ~(bound : StringSet.t) (arg : core) :
           })
   | _ -> arg
 
-let hoist_task_closure (state : state) ~(loc : Ast.loc) ~(body : core)
-    ~(return_ty : Ast.type_expr) : task_closure =
-  let captures = collect_free_vars_filtered state body [] in
+let hoist_task_closure (state : state) ~(loc : Ast.loc)
+    ~(capturable : StringSet.t) ~(body : core) ~(return_ty : Ast.type_expr) :
+    task_closure =
+  let captures = collect_free_vars_filtered state ~capturable body [] in
   let id = state.task_counter in
   state.task_counter <- id + 1;
   let name = Printf.sprintf "_blorp_task_%d" id in
@@ -702,8 +705,8 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
                 | Some task -> Some task
                 | None ->
                     Some
-                      (hoist_task_closure state ~loc:b.cb_rhs.loc ~body:rhs'
-                         ~return_ty:rhs'.ty)
+                      (hoist_task_closure state ~loc:b.cb_rhs.loc
+                         ~capturable:bound ~body:rhs' ~return_ty:rhs'.ty)
               in
               { b with cb_rhs = rhs'; cb_task = task' })
             block.conc_bindings
@@ -746,7 +749,7 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
           | None ->
               Some
                 (hoist_task_closure state ~loc:detach.detach_body.loc
-                   ~body:body'
+                   ~capturable:bound ~body:body'
                    ~return_ty:(Ast.TyNamed ("Void", [])))
         in
         { e with desc = CDetach { detach_body = body'; detach_task = task' } }
@@ -780,7 +783,7 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
           | None ->
               Some
                 (hoist_task_closure state ~loc:cf.cf_body.loc ~body:body'
-                   ~return_ty:body'.ty)
+                   ~capturable:body_bound ~return_ty:body'.ty)
         in
         {
           e with
@@ -883,7 +886,8 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
   match e.desc with
   | CLambda lam ->
       let captures =
-        collect_free_vars_filtered state lam.lam_body lam.lam_params
+        collect_free_vars_filtered state ~capturable:bound lam.lam_body
+          lam.lam_params
       in
       let id = state.counter in
       state.counter <- id + 1;
