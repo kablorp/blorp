@@ -1258,7 +1258,7 @@ blorp_Vector* blorp_vector_scalar_op_rev_int(int op, blorp_Vector* v, long scala
 blorp_Vector* blorp_vector_scalar_op_rev_float(int op, blorp_Vector* v, double scalar);
 blorp_Vector* blorp_vector_scalar_op_float32(int op, blorp_Vector* v, float scalar);
 blorp_Vector* blorp_vector_scalar_op_rev_float32(int op, blorp_Vector* v, float scalar);
-#ifdef __clang__
+#ifdef __FLT16_MAX__
 blorp_Vector* blorp_vector_scalar_op_float16(int op, blorp_Vector* v, _Float16 scalar);
 blorp_Vector* blorp_vector_scalar_op_rev_float16(int op, blorp_Vector* v, _Float16 scalar);
 #endif

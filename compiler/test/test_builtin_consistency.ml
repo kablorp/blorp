@@ -564,12 +564,23 @@ let test_float16_vector_read_decl_uses_feature_guard () =
       [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
   in
   let helper = "static inline _Float16 blorp_vector_read_f16" in
+  let scalar_op =
+    "blorp_Vector* blorp_vector_scalar_op_float16(int op, blorp_Vector* v, \
+     _Float16 scalar);"
+  in
   Alcotest.(check bool)
     "runtime_decl exposes Float16 vector reader when _Float16 is supported" true
     (contains_substring runtime_decl ("#ifdef __FLT16_MAX__\n" ^ helper));
   Alcotest.(check bool)
     "runtime_decl Float16 vector reader is not clang-only" false
     (contains_substring runtime_decl ("#ifdef __clang__\n" ^ helper));
+  Alcotest.(check bool)
+    "runtime_decl exposes Float16 scalar vector ops when _Float16 is supported"
+    true
+    (contains_substring runtime_decl ("#ifdef __FLT16_MAX__\n" ^ scalar_op));
+  Alcotest.(check bool)
+    "runtime_decl Float16 scalar vector ops are not clang-only" false
+    (contains_substring runtime_decl ("#ifdef __clang__\n" ^ scalar_op));
   Alcotest.(check bool)
     "runtime Float16 vector reader uses same feature guard" true
     (contains_substring runtime ("#ifdef __FLT16_MAX__\n" ^ helper))

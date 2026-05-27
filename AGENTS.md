@@ -235,6 +235,8 @@ make coverage                     # Unit tests with coverage
 make fmt-check                    # OCaml formatting check
 make quality                      # OCaml checks + hygiene + C static analysis
 make quality-full                 # quality + ocamlformat check
+make docker-full-gate             # Full gate in Ubuntu Docker (linux/amd64)
+make docker-full-gate-all         # Full gate in Ubuntu Docker (linux/amd64 + linux/arm64)
 ```
 
 ### Preview Gate
@@ -301,6 +303,18 @@ Default generated-C compile/test paths suppress noisy generated-code warnings.
 The codegen audit suite performs the preview warning sweep; any warning promoted
 there is a gate failure and must either be fixed or explicitly documented as
 benign before preview release.
+
+For local Linux architecture parity, use Docker:
+
+```bash
+scripts/docker-test --full-gate --platform linux/amd64
+scripts/docker-test --full-gate --platform linux/arm64
+scripts/docker-test --full-gate --all-platforms
+```
+
+The Docker full gate runs `scripts/full-gate --no-docker` inside the container
+to avoid nested Docker. Cross-architecture runs require Docker support for the
+requested platform, for example Docker Desktop or configured QEMU/binfmt.
 
 Current triage: Clang `-Wparentheses-equality` warnings from generated
 comparisons with extra defensive parentheses are benign. `-Wunsequenced` and

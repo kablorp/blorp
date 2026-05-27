@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build install warm-formatter clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell
+.PHONY: all build install warm-formatter clean test smoke test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-test docker-test-clean docker-shell docker-full-gate docker-full-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 FORMATTER_SOURCES := $(shell find tools/formatter -name '*.brp' 2>/dev/null)
@@ -162,6 +162,12 @@ docker-test-clean:
 
 docker-shell:
 	scripts/docker-test --shell
+
+docker-full-gate:
+	scripts/docker-test --full-gate
+
+docker-full-gate-all:
+	scripts/docker-test --full-gate --all-platforms
 
 # Clean build artifacts
 clean:
