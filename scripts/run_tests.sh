@@ -10,6 +10,7 @@
 #   scripts/run_tests.sh doctest            # Doctests only (std/ library)
 #   scripts/run_tests.sh cli                # Public CLI smoke and exit-code checks
 #   scripts/run_tests.sh unit compiler      # Multiple suites
+#   scripts/run_tests.sh --serial           # Run selected suites one at a time
 #   scripts/run_tests.sh --coverage         # Unit tests with coverage report
 
 cd "$(dirname "$0")/.."
@@ -17,13 +18,15 @@ cd "$(dirname "$0")/.."
 # Parse arguments
 suites=()
 coverage=false
+serial=false
 for arg in "$@"; do
     case "$arg" in
         --coverage) coverage=true ;;
+        --serial) serial=true ;;
         unit|compiler|runtime|leak|doctest|cli) suites+=("$arg") ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [unit] [compiler] [runtime] [leak] [doctest] [cli] [--coverage]"
+            echo "Usage: $0 [unit] [compiler] [runtime] [leak] [doctest] [cli] [--serial] [--coverage]"
             exit 1
             ;;
     esac
@@ -422,12 +425,14 @@ if [ ${#suites[@]} -gt 1 ]; then
     parallel_suites=("${non_dune_suites[@]}")
 fi
 
-# When running multiple non-Dune suites, run them in parallel for speed.
+# When running multiple non-Dune suites, run them in parallel for speed unless
+# --serial is set. CI uses serial mode so per-test timeouts are not distorted by
+# concurrent generated-C compiles and other suite-level load.
 # Each suite's output is streamed immediately and also captured for summary parsing.
 if [ ${#parallel_suites[@]} -eq 0 ]; then
     :
-elif [ ${#parallel_suites[@]} -le 1 ]; then
-    # Single suite: run directly; suite runners stream and self-capture.
+elif $serial || [ ${#parallel_suites[@]} -le 1 ]; then
+    # Single-suite and serial mode: run directly; suite runners stream and self-capture.
     for suite in "${parallel_suites[@]}"; do
         case "$suite" in
             unit)     run_unit     || any_failed=true ;;

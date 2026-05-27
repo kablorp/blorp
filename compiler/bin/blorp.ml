@@ -40,7 +40,6 @@ type purify_candidate = {
 let purify_func_key ~name (loc : Ast.loc) =
   (name, loc.line, loc.column, loc.end_line, loc.end_column, loc.loc_file)
 
-let version = Version.version
 let read_file = Modules.read_file
 let extract_directory = Modules.extract_directory
 let init_module_paths = Modules.init_module_paths
@@ -954,7 +953,7 @@ let () =
         usage ();
         exit 0
     | [ "--version" ] | [ "-v" ] ->
-        Printf.printf "blorp %s (OCaml)\n" version;
+        Printf.printf "%s\n" (Version.describe ());
         exit 0
     | "lsp" :: rest -> (
         match parse_lsp_cli_args rest with

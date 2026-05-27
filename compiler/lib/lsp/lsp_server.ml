@@ -18,7 +18,8 @@ let handle_initialize (state : Lsp_state.state) _params =
     [
       ("capabilities", capabilities);
       ( "serverInfo",
-        Object [ ("name", String "blorp"); ("version", String "0.2.0") ] );
+        Object [ ("name", String "blorp"); ("version", String Version.version) ]
+      );
     ]
 
 (** Publish diagnostics for a document *)

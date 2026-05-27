@@ -117,6 +117,28 @@ let read_source_line ~file ~line =
           skip line)
     with _ -> None
 
+let render_message_header addln severity message =
+  let sev_str = severity_text severity in
+  match String.split_on_char '\n' message with
+  | [] -> addln (Printf.sprintf "%s:" sev_str)
+  | [ msg ] -> addln (Printf.sprintf "%s: %s" sev_str msg)
+  | first :: rest ->
+      addln (Printf.sprintf "%s: %s" sev_str first);
+      List.iter (fun line -> addln (Printf.sprintf "    %s" line)) rest
+
+let render_location_arrow addln gutter_pad = function
+  | Some lbl when lbl.label_loc.line > 0 ->
+      addln
+        (Printf.sprintf " %s %s:%d:%d"
+           (cyan (Printf.sprintf "%s-->" gutter_pad))
+           lbl.label_file lbl.label_loc.line lbl.label_loc.column)
+  | Some lbl ->
+      addln
+        (Printf.sprintf " %s %s"
+           (cyan (Printf.sprintf "%s-->" gutter_pad))
+           lbl.label_file)
+  | None -> ()
+
 (** Create a diagnostic from a compiler_error. The label's file comes from
     [err.loc.loc_file] when present (so cross-file references cite the
     right source), falling back to the [~file] parameter (the current
@@ -163,15 +185,7 @@ let render_diagnostic (diag : diagnostic) : string =
     Buffer.add_char buf '\n'
   in
   (* Severity header *)
-  let sev_str = severity_text diag.diag_severity in
-  (* Handle multi-line messages: first line on header, rest indented *)
-  let message_lines = String.split_on_char '\n' diag.diag_message in
-  (match message_lines with
-  | [] -> addln (Printf.sprintf "%s:" sev_str)
-  | [ msg ] -> addln (Printf.sprintf "%s: %s" sev_str msg)
-  | first :: rest ->
-      addln (Printf.sprintf "%s: %s" sev_str first);
-      List.iter (fun line -> addln (Printf.sprintf "    %s" line)) rest);
+  render_message_header addln diag.diag_severity diag.diag_message;
   (* Primary label determines location arrow *)
   let primary = primary_label diag.diag_labels in
   (* Compute gutter width from max line number across all labels *)
@@ -180,18 +194,7 @@ let render_diagnostic (diag : diagnostic) : string =
   let gutter_pad = String.make gutter_width ' ' in
   let gutter_bar = Printf.sprintf " %s %s" gutter_pad (cyan "|") in
   (* Location arrow *)
-  (match primary with
-  | Some lbl when lbl.label_loc.line > 0 ->
-      addln
-        (Printf.sprintf " %s %s:%d:%d"
-           (cyan (Printf.sprintf "%s-->" gutter_pad))
-           lbl.label_file lbl.label_loc.line lbl.label_loc.column)
-  | Some lbl ->
-      addln
-        (Printf.sprintf " %s %s"
-           (cyan (Printf.sprintf "%s-->" gutter_pad))
-           lbl.label_file)
-  | None -> ());
+  render_location_arrow addln gutter_pad primary;
   (* Group labels by line, sort by line number *)
   let labels_by_line = group_labels_by_line diag.diag_labels in
   if labels_by_line <> [] then begin

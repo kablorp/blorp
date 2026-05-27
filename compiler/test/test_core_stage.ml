@@ -174,6 +174,29 @@ let test_version_string_exposed () =
     "version looks like a version" true
     (String.length v >= 3 && String.contains v '.')
 
+let test_version_details_include_release_metadata () =
+  let details = Version.describe () in
+  let contains_substring haystack needle =
+    let haystack_len = String.length haystack in
+    let needle_len = String.length needle in
+    let rec loop idx =
+      if idx + needle_len > haystack_len then false
+      else if String.sub haystack idx needle_len = needle then true
+      else loop (idx + 1)
+    in
+    needle_len = 0 || loop 0
+  in
+  List.iter
+    (fun expected ->
+      Alcotest.(check bool)
+        (Printf.sprintf "version details include %s" expected)
+        true
+        (contains_substring details expected))
+    [ "commit:"; "target:"; "channel:"; "dirty:"; "std:" ];
+  Alcotest.(check bool)
+    "version details start with version" true
+    (String.starts_with ~prefix:("blorp " ^ Version.version) details)
+
 let test_stopped_after_exception () =
   (* Core_pipeline.Stopped_after is used to short-circuit compile_with_modules.
      The test doesn't exercise the pipeline; it just pins the exception
@@ -219,6 +242,9 @@ let suite =
           test_stopped_after_exception;
       ] );
     ( "version",
-      [ Alcotest.test_case "string exposed" `Quick test_version_string_exposed ]
-    );
+      [
+        Alcotest.test_case "string exposed" `Quick test_version_string_exposed;
+        Alcotest.test_case "details include release metadata" `Quick
+          test_version_details_include_release_metadata;
+      ] );
   ]

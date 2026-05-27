@@ -86,11 +86,12 @@ type module_origin =
 
 let package_id_name (Package_id name) = name
 
-let package_origin name =
+let package_id name =
   let name = String.trim name in
   if name = "" then invalid_arg "package origin requires a non-empty package id"
-  else Package_module (Package_id name)
+  else Package_id name
 
+let package_origin name = Package_module (package_id name)
 let module_origin_is_std = function Stdlib_module -> true | _ -> false
 
 let module_origin_is_package = function
