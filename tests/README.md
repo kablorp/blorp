@@ -91,7 +91,7 @@ Run with: `./blorp test path/to/test.brp`
 ### Compiler Tests (should_pass / should_fail)
 
 - `should_pass/`: Files must compile without errors (`./blorp check`)
-- `should_fail/`: Files must produce a compile error. Add `-- EXPECT: <substring>` annotations to verify error messages.
+- `should_fail/`: Files must produce a compile error. Add `-- EXPECT: <diagnostic line>` annotations to verify error messages. `EXPECT` exact-matches a normalized diagnostic line without file paths, line numbers, or source underlines. Use `-- EXPECT-CONTAINS: <substring>` only when a test deliberately needs to match raw output text.
 
 The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both directions automatically.
 

@@ -4,12 +4,14 @@
 # Tests in should_fail/ directories must fail compilation
 #
 # Error message verification:
-#   should_fail tests can include "-- EXPECT: <substring>" annotations to verify
-#   the compiler produces the correct error message, not just a nonzero exit code.
-#   - Case-sensitive fixed-string substring match against full compiler output
-#   - Multiple EXPECT lines require ALL to match (AND)
+#   should_fail tests can include "-- EXPECT: <diagnostic line>" annotations to
+#   verify the compiler produces the correct error message, not just a nonzero
+#   exit code.
+#   - Case-sensitive exact-line match against normalized diagnostic lines
+#   - Use "-- EXPECT-CONTAINS: <substring>" only for deliberate full-output checks
+#   - Multiple EXPECT / EXPECT-CONTAINS lines require ALL to match (AND)
 #   - No EXPECT lines → exit-code-only check (backward compatible)
-#   - Use shortest distinguishing phrase (no line numbers)
+#   - Do not include file paths, line numbers, or source underline output
 #
 # Parallelism: tests are split into N chunks (one per CPU core) and run
 # concurrently in background subshells. Each chunk writes results to a
@@ -142,6 +144,88 @@ run_command_capture() {
 
 run_blorp_capture() {
     run_command_capture "$BLORP_BIN" "$@"
+}
+
+normalized_diagnostic_lines() {
+    local test="$1"
+    awk -v test="$test" '
+        index($0, test ": ") == 1 {
+            print substr($0, length(test) + 3)
+            next
+        }
+        /^error: / || /^warning: / {
+            print
+            next
+        }
+        /^[[:space:]]*(expected|found): / {
+            sub(/^[[:space:]]*/, "")
+            print
+            next
+        }
+        /^[[:space:]]*= help: / {
+            sub(/^[[:space:]]*= /, "")
+            print
+            next
+        }
+        /^[[:space:]]*= note: / {
+            sub(/^[[:space:]]*= /, "")
+            print
+            next
+        }
+    '
+}
+
+check_error_expectations() {
+    local test="$1"
+    local output="$2"
+    local suite="$3"
+    local testname="$4"
+    local mismatch_detail="$5"
+    local diagnostics expect_failed fail_lines line expected
+
+    diagnostics=$(printf '%s\n' "$output" | normalized_diagnostic_lines "$test")
+    expect_failed=0
+    fail_lines=""
+
+    while IFS= read -r line; do
+        expected="${line#*-- EXPECT: }"
+        [ -z "$expected" ] && continue
+        if ! printf '%s\n' "$diagnostics" | grep -Fx -- "$expected" >/dev/null; then
+            if [ $expect_failed -eq 0 ]; then
+                fail_lines="DETAIL   $mismatch_detail"$'\n'
+            fi
+            fail_lines+="DETAIL   Missing exact diagnostic line: \"$expected\""$'\n'
+            expect_failed=1
+        fi
+    done < <(grep '^-- EXPECT: ' "$test" || true)
+
+    while IFS= read -r line; do
+        expected="${line#*-- EXPECT-CONTAINS: }"
+        [ -z "$expected" ] && continue
+        if ! printf '%s\n' "$output" | grep -qF -- "$expected"; then
+            if [ $expect_failed -eq 0 ]; then
+                fail_lines="DETAIL   $mismatch_detail"$'\n'
+            fi
+            fail_lines+="DETAIL   Missing output substring: \"$expected\""$'\n'
+            expect_failed=1
+        fi
+    done < <(grep '^-- EXPECT-CONTAINS: ' "$test" || true)
+
+    if [ $expect_failed -eq 1 ]; then
+        echo "FAIL ✗ [$suite] $testname"
+        printf "%s" "$fail_lines"
+        echo "DETAIL   Normalized diagnostic lines:"
+        if [ -n "$diagnostics" ]; then
+            printf '%s\n' "$diagnostics" | sed 's/^/DETAIL     /'
+        else
+            echo "DETAIL     (none)"
+        fi
+        echo "DETAIL   Actual output:"
+        printf '%s\n' "$output" | head -10 | sed 's/^/DETAIL     /'
+        return 1
+    fi
+
+    return 0
 }
 
 wait_for_tracked_pids() {
@@ -373,20 +457,9 @@ run_test() {
                 echo "DETAIL   Expected: formatter error"
                 echo "DETAIL   Got: format succeeded"
             else
-                # Check EXPECT annotations if present
-                expect_lines=$(grep '^-- EXPECT:' "$test" | sed 's/^-- EXPECT: *//')
-                all_match=true
-                while IFS= read -r expect; do
-                    [ -z "$expect" ] && continue
-                    if ! echo "$output" | grep -qF "$expect"; then
-                        all_match=false
-                        echo "FAIL ✗ [format/should_error] $testname"
-                        echo "DETAIL   Missing expected: $expect"
-                        echo "DETAIL   Got: $output"
-                        break
-                    fi
-                done <<< "$expect_lines"
-                if $all_match; then
+                if check_error_expectations \
+                    "$test" "$output" "format/should_error" "$testname" \
+                    "Formatter rejected, but error message mismatch:"; then
                     echo "PASS ✓ [format/should_error] $testname"
                 fi
             fi
@@ -504,25 +577,9 @@ run_test() {
                 return
             fi
 
-            local expect_failed=0
-            local fail_lines=""
-            while IFS= read -r line; do
-                local expected="${line#*-- EXPECT: }"
-                if ! echo "$output" | grep -qF "$expected"; then
-                    if [ $expect_failed -eq 0 ]; then
-                        fail_lines="DETAIL   Parse failed, but error message mismatch:"$'\n'
-                    fi
-                    fail_lines+="DETAIL   Missing: \"$expected\""$'\n'
-                    expect_failed=1
-                fi
-            done < <(grep '^-- EXPECT: ' "$test")
-
-            if [ $expect_failed -eq 1 ]; then
-                echo "FAIL ✗ [should_fail/parser] $testname"
-                printf "%s" "$fail_lines"
-                echo "DETAIL   Actual output:"
-                echo "$output" | head -5 | sed 's/^/DETAIL     /'
-            else
+            if check_error_expectations \
+                "$test" "$output" "should_fail/parser" "$testname" \
+                "Parse failed, but error message mismatch:"; then
                 echo "PASS ✓ [should_fail/parser] $testname"
             fi
         fi
@@ -556,25 +613,9 @@ run_test() {
             return
         fi
 
-        local expect_failed=0
-        local fail_lines=""
-        while IFS= read -r line; do
-            local expected="${line#*-- EXPECT: }"
-            if ! echo "$output" | grep -qF "$expected"; then
-                if [ $expect_failed -eq 0 ]; then
-                    fail_lines="DETAIL   Compilation failed, but error message mismatch:"$'\n'
-                fi
-                fail_lines+="DETAIL   Missing: \"$expected\""$'\n'
-                expect_failed=1
-            fi
-        done < <(grep '^-- EXPECT: ' "$test")
-
-        if [ $expect_failed -eq 1 ]; then
-            echo "FAIL ✗ [should_fail/$grandparent] $testname"
-            printf "%s" "$fail_lines"
-            echo "DETAIL   Actual output:"
-            echo "$output" | head -5 | sed 's/^/DETAIL     /'
-        else
+        if check_error_expectations \
+            "$test" "$output" "should_fail/$grandparent" "$testname" \
+            "Compilation failed, but error message mismatch:"; then
             echo "PASS ✓ [should_fail/$grandparent] $testname"
         fi
     fi
@@ -687,7 +728,7 @@ fi
 # Check for should_fail tests missing EXPECT annotations
 missing_expect=0
 for f in $(find tests/test_compiler -path "*/should_fail/*.brp" -not -path "*/format/*" -type f); do
-    if ! grep -q "^-- EXPECT:" "$f"; then
+    if ! grep -Eq "^-- EXPECT(:|-CONTAINS:)" "$f"; then
         echo "⚠ Missing EXPECT annotation: $(basename "$f")"
         ((missing_expect++))
     fi
