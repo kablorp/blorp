@@ -666,6 +666,50 @@ let test_resource_scope_binding_shadows_global_function_ref () =
         | Some _ -> Alcotest.fail "expected resource scope body"
         | None -> Alcotest.fail "missing get body"))
 
+let test_lambda_capture_shadows_global_function_ref () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let greeting_ty = fn_ty [] ty_string true in
+        let global_greeting =
+          mk_func ~is_pure:true "greeting" [] ty_string
+            (Some (cstr "global"))
+            33
+        in
+        let lam =
+          {
+            lam_params = [];
+            lam_return_ty = ty_string;
+            lam_body = cvar "greeting" ty_string;
+            lam_is_pure = true;
+          }
+        in
+        let body =
+          mk
+            (CLet
+               ( {
+                   bind_var = Var.named "greeting";
+                   bind_mut = false;
+                   bind_ty = ty_string;
+                   bind_rhs = cstr "local";
+                 },
+                 mk (CLambda lam) greeting_ty ))
+            greeting_ty
+        in
+        let make = mk_func ~is_pure:true "make" [] greeting_ty (Some body) 34 in
+        let converted =
+          Blorp.Core_closure.convert_program [ decl global_greeting; decl make ]
+        in
+        let closure_func = require_func "_blorp_clambda_0" converted in
+        match closure_func.cf_kind with
+        | CFClosureBody ca ->
+            Alcotest.(check (list (pair string string)))
+              "local capture shadows same-named global"
+              [ ("greeting", "String") ]
+              (List.map
+                 (fun (name, ty) -> (name, Blorp.Types.type_to_string ty))
+                 ca.ca_captures)
+        | _ -> Alcotest.fail "expected hoisted closure body"))
+
 let test_generic_template_lambdas_are_not_hoisted () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -731,6 +775,8 @@ let suite =
           test_resource_scope_binding_not_captured_by_nested_lambda;
         Alcotest.test_case "resource_scope_shadows_global_function_ref" `Quick
           test_resource_scope_binding_shadows_global_function_ref;
+        Alcotest.test_case "lambda_capture_shadows_global_function_ref" `Quick
+          test_lambda_capture_shadows_global_function_ref;
         Alcotest.test_case "generic_template_lambdas_are_not_hoisted" `Quick
           test_generic_template_lambdas_are_not_hoisted;
       ] );

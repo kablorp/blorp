@@ -173,64 +173,65 @@ pure func push2(first: Command, second: Command, rest: List[Command]) -> List[Co
 
 
 pure func fits(remaining: Int, work: List[Command]) -> Bool:
-	if remaining < 0:
-		False
-	else:
-		match work:
-			[]: True
-			[command_value, ...rest]:
-				match command_value.document:
-					Nil: remaining.fits(rest)
-					Text(source): (remaining - source.length()).fits(rest)
-					Hardline: True
-					Softline: remaining.fits(
-						command(command_value.indent, FlatMode, Nil).push1(rest),
-					)
-					SoftlineSpace:
-						match command_value.mode:
-							FlatMode: (remaining - 1).fits(rest)
-							BreakMode: True
-					Indent(extra, inner):
-						remaining.fits(
-							command(
+	var remaining_width: Int = remaining
+	var stack: List[Command] = work
+	var result: Bool = True
+	var done: Bool = False
+	while not done:
+		if remaining_width < 0:
+			result = False
+			done = True
+		else:
+			match stack:
+				[]:
+					result = True
+					done = True
+				[command_value, ...rest]:
+					stack = rest
+					match command_value.document:
+						Nil: void
+						Text(source): remaining_width -= source.length()
+						Hardline:
+							result = True
+							done = True
+						Softline:
+							stack = command(command_value.indent, FlatMode, Nil).push1(stack)
+						SoftlineSpace:
+							match command_value.mode:
+								FlatMode: remaining_width -= 1
+								BreakMode:
+									result = True
+									done = True
+						Indent(extra, inner):
+							stack = command(
 								command_value.indent + extra,
 								command_value.mode,
 								inner,
-							).push1(rest),
-						)
-					Group(inner): remaining.fits(
-						command(command_value.indent, FlatMode, inner).push1(rest),
-					)
-					Concat(a, b):
-						remaining.fits(
-							command(command_value.indent, command_value.mode, a).push2(
-								command(
-									command_value.indent,
-									command_value.mode,
-									b,
-								),
-								rest,
-							),
-						)
-					IfBreak(broken_document, flat_document):
-						match command_value.mode:
-							FlatMode:
-								remaining.fits(
-									command(
+							).push1(stack)
+						Group(inner):
+							stack = command(command_value.indent, FlatMode, inner).push1(stack)
+						Concat(a, b):
+							stack = command(
+								command_value.indent,
+								command_value.mode,
+								a,
+							).push2(command(command_value.indent, command_value.mode, b), stack)
+						IfBreak(broken_document, flat_document):
+							match command_value.mode:
+								FlatMode:
+									stack = command(
 										command_value.indent,
 										FlatMode,
 										flat_document,
-									).push1(rest),
-								)
-							BreakMode:
-								remaining.fits(
-									command(
+									).push1(stack)
+								BreakMode:
+									stack = command(
 										command_value.indent,
 										BreakMode,
 										broken_document,
-									).push1(rest),
-								)
-					LineSuffix(_): remaining.fits(rest)
+									).push1(stack)
+						LineSuffix(_): void
+	result
 
 
 pure func flush_line_suffixes(state: RenderState) -> RenderState:
@@ -255,83 +256,76 @@ pure func enqueue_line_suffix(state: RenderState, suffix: String) -> RenderState
 
 
 pure func render_loop(width: Int, state: RenderState, work: List[Command]) -> RenderState:
-	match work:
-		[]: state.flush_line_suffixes()
-		[command_value, ...rest]:
-			match command_value.document:
-				Nil: width.render_loop(state, rest)
-				Text(source): width.render_loop(
-					render_state(
-						state.output + source,
-						state.column + source.length(),
-						state.suffixes,
-					),
-					rest,
-				)
-				Hardline: width.render_loop(state.emit_newline(command_value.indent), rest)
-				Softline:
-					match command_value.mode:
-						FlatMode: width.render_loop(state, rest)
-						BreakMode: width.render_loop(state.emit_newline(command_value.indent), rest)
-				SoftlineSpace:
-					match command_value.mode:
-						FlatMode: width.render_loop(
-							render_state(
-								state.output + " ",
-								state.column + 1,
-								state.suffixes,
-							),
-							rest,
+	var current_state: RenderState = state
+	var stack: List[Command] = work
+	var done: Bool = False
+	while not done:
+		match stack:
+			[]:
+				current_state = current_state.flush_line_suffixes()
+				done = True
+			[command_value, ...rest]:
+				stack = rest
+				match command_value.document:
+					Nil: void
+					Text(source):
+						current_state = render_state(
+							current_state.output + source,
+							current_state.column + source.length(),
+							current_state.suffixes,
 						)
-						BreakMode: width.render_loop(state.emit_newline(command_value.indent), rest)
-				Indent(extra, inner):
-					width.render_loop(
-						state,
-						command(
+					Hardline:
+						current_state = current_state.emit_newline(command_value.indent)
+					Softline:
+						match command_value.mode:
+							FlatMode: void
+							BreakMode:
+								current_state = current_state.emit_newline(command_value.indent)
+					SoftlineSpace:
+						match command_value.mode:
+							FlatMode:
+								current_state = render_state(
+									current_state.output + " ",
+									current_state.column + 1,
+									current_state.suffixes,
+								)
+							BreakMode:
+								current_state = current_state.emit_newline(command_value.indent)
+					Indent(extra, inner):
+						stack = command(
 							command_value.indent + extra,
 							command_value.mode,
 							inner,
-						).push1(rest),
-					)
-				Group(inner):
-					flat_command: Command = command(command_value.indent, FlatMode, inner)
-					if (width - state.column).fits(flat_command.push1(rest)):
-						width.render_loop(state, flat_command.push1(rest))
-					else:
-						width.render_loop(
-							state,
-							command(command_value.indent, BreakMode, inner).push1(rest),
-						)
-				Concat(a, b):
-					width.render_loop(
-						state,
-						command(command_value.indent, command_value.mode, a).push2(
-							command(
-								command_value.indent,
-								command_value.mode,
-								b,
-							),
-							rest,
-						),
-					)
-				IfBreak(broken_document, flat_document):
-					match command_value.mode:
-						FlatMode:
-							width.render_loop(
-								state,
-								command(command_value.indent, FlatMode, flat_document).push1(rest),
-							)
-						BreakMode:
-							width.render_loop(
-								state,
-								command(
+						).push1(stack)
+					Group(inner):
+						flat_command: Command = command(command_value.indent, FlatMode, inner)
+						if (width - current_state.column).fits(flat_command.push1(stack)):
+							stack = flat_command.push1(stack)
+						else:
+							stack = command(command_value.indent, BreakMode, inner).push1(stack)
+					Concat(a, b):
+						stack = command(
+							command_value.indent,
+							command_value.mode,
+							a,
+						).push2(command(command_value.indent, command_value.mode, b), stack)
+					IfBreak(broken_document, flat_document):
+						match command_value.mode:
+							FlatMode:
+								stack = command(
+									command_value.indent,
+									FlatMode,
+									flat_document,
+								).push1(stack)
+							BreakMode:
+								stack = command(
 									command_value.indent,
 									BreakMode,
 									broken_document,
-								).push1(rest),
-							)
-				LineSuffix(source):
-					width.render_loop(state.enqueue_line_suffix(source), rest)
+								).push1(stack)
+					LineSuffix(source):
+						current_state = current_state.enqueue_line_suffix(source)
+	current_state
 
 
 pure func render(width: Int, document: Doc) -> String:
