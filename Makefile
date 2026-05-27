@@ -133,10 +133,11 @@ c-static-analysis:
 		exit 127; \
 	}
 	@tmp_plist=$$(mktemp "$${TMPDIR:-/tmp}/blorp-clang-analyze.XXXXXX"); \
+	block_checker_args=$$(clang -cc1 -analyzer-checker-help 2>/dev/null | grep -Fq 'unix.BlockInCriticalSection' && printf '%s' '-Xclang -analyzer-disable-checker=unix.BlockInCriticalSection'); \
 	trap 'rm -f "$$tmp_plist"' EXIT; \
-	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c compiler/lib/runtime_decl.c; \
+	clang --analyze -D_GNU_SOURCE -Wno-nullability-completeness -Wno-unused-command-line-argument -o "$$tmp_plist" -x c compiler/lib/runtime_decl.c; \
 	clang --analyze -Wno-nullability-completeness -Wno-unused-command-line-argument \
-		-Xclang -analyzer-disable-checker=unix.BlockInCriticalSection \
+		-D_GNU_SOURCE $$block_checker_args \
 		-DMINICORO_IMPL -include compiler/lib/minicoro.h \
 		-o "$$tmp_plist" -x c compiler/lib/runtime.c
 
