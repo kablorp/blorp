@@ -1,14 +1,99 @@
 -- TCP Networking - Socket primitives for TCP connections
 --
--- All functions are impure (I/O). Returns Result[T, String] for error handling.
--- Uses opaque TCP handles and Bytes for data buffers. Numeric-address socket
--- operations are fiber-aware; hostname resolution still uses blocking DNS.
--- Use numeric hosts such as "127.0.0.1" or "" bind-any hosts when OS-worker
--- pinning during DNS resolution is unacceptable.
+-- All functions are impure (I/O). The original handle operations still return
+-- Result[T, String] for compatibility; future-facing checked/read/write helpers
+-- return Result[T, TcpError]. Uses opaque TCP handles and Bytes for data buffers.
+-- Numeric-address socket operations are fiber-aware; hostname resolution still
+-- uses blocking DNS. Use numeric hosts such as "127.0.0.1" or "" bind-any hosts
+-- when OS-worker pinning during DNS resolution is unacceptable.
 type TcpListener = builtin
 
 
 type TcpStream = builtin
+
+
+---
+Typed error surface for TCP APIs.
+
+The current runtime still reports TCP failures as strings. Compatibility
+wrappers convert those runtime details to `Other` until the runtime exposes
+stable error classes directly. The variants are defined now so resource-backed
+TCP can move to typed errors without changing the public error type again.
+---
+union TcpError:
+	InvalidInput(String)
+	TimedOut(String)
+	Closed(String)
+	Busy(String)
+	Dns(String)
+	ConnectionFailed(String)
+	Interrupted(String)
+	Unsupported(String)
+	Other(String)
+
+
+---
+Return a stable, human-readable description of a TCP error.
+
+doctests:
+    :: Invalid input includes detail
+    message(InvalidInput("bad port")) == "invalid input: bad port"
+
+    :: Runtime compatibility errors preserve detail
+    message(Other("tcp read: timed out")) == "tcp error: tcp read: timed out"
+---
+pure func message(err: TcpError) -> String:
+	match err:
+		InvalidInput(detail): "invalid input: " + detail
+		TimedOut(detail): "timed out: " + detail
+		Closed(detail): "closed: " + detail
+		Busy(detail): "busy: " + detail
+		Dns(detail): "dns error: " + detail
+		ConnectionFailed(detail): "connection failed: " + detail
+		Interrupted(detail): "interrupted: " + detail
+		Unsupported(detail): "unsupported: " + detail
+		Other(detail): "tcp error: " + detail
+
+
+implements Stringable for TcpError:
+	pure func to_string(err: TcpError) -> String:
+		message(err)
+
+
+private pure func runtime_error(detail: String) -> TcpError:
+	Other(detail)
+
+
+private pure func valid_host(host: String) -> Bool:
+	host.length() < 256
+
+
+private pure func valid_port(port: Int) -> Bool:
+	port >= 0 and port <= 65535
+
+
+private pure func valid_backlog(backlog: Int) -> Bool:
+	backlog >= 0 and backlog <= 2147483647
+
+
+private pure func valid_read_chunk_size(max_bytes: Int) -> Bool:
+	max_bytes > 0 and max_bytes <= 67108864
+
+
+private pure func valid_timeout_ms(ms: Int) -> Bool:
+	ms >= 0 and ms <= 18446744073709
+
+
+private pure func map_runtime_error[T](result: Result[T, String]) -> Result[T, TcpError]:
+	match result:
+		Ok(value): Ok(value)
+		Err(detail): Err(runtime_error(detail))
+
+
+private pure func map_runtime_void(result: Result[Int, String]) -> Result[Void, TcpError]:
+	match result:
+		Ok(_): Ok(void)
+		Err(detail): Err(runtime_error(detail))
 
 
 trait TcpClosable:
@@ -19,11 +104,20 @@ trait TcpLocalPort:
 	func local_port(handle: Self) -> Result[Int, String]
 
 
+trait TcpLocalPortChecked:
+	func local_port_checked(handle: Self) -> Result[Int, TcpError]
+
+
 -- Set the default runtime operation timeout for a TCP handle.
 -- This is a virtual-thread deadline used by accept/read/write waits on an
 -- existing handle, not a kernel socket timeout. Negative timeouts are rejected.
 trait TcpTimeout:
 	func set_timeout(handle: Self, ms: Int) -> Result[Int, String]
+
+
+-- Set the default runtime operation timeout with typed input errors.
+trait TcpTimeoutChecked:
+	func set_timeout_checked(handle: Self, ms: Int) -> Result[Void, TcpError]
 
 
 implements TcpClosable for TcpListener:
@@ -46,6 +140,16 @@ implements TcpLocalPort for TcpStream:
 		builtin("blorp_tcp_local_port_stream")
 
 
+implements TcpLocalPortChecked for TcpListener:
+	func local_port_checked(listener: TcpListener) -> Result[Int, TcpError]:
+		map_runtime_error(local_port(listener))
+
+
+implements TcpLocalPortChecked for TcpStream:
+	func local_port_checked(stream: TcpStream) -> Result[Int, TcpError]:
+		map_runtime_error(local_port(stream))
+
+
 implements TcpTimeout for TcpListener:
 	func set_timeout(listener: TcpListener, ms: Int) -> Result[Int, String]:
 		builtin("blorp_tcp_set_timeout_listener")
@@ -54,6 +158,22 @@ implements TcpTimeout for TcpListener:
 implements TcpTimeout for TcpStream:
 	func set_timeout(stream: TcpStream, ms: Int) -> Result[Int, String]:
 		builtin("blorp_tcp_set_timeout_stream")
+
+
+implements TcpTimeoutChecked for TcpListener:
+	func set_timeout_checked(listener: TcpListener, ms: Int) -> Result[Void, TcpError]:
+		if not valid_timeout_ms(ms):
+			Err(InvalidInput("timeout must be between 0 and 18446744073709 ms"))
+		else:
+			map_runtime_void(set_timeout(listener, ms))
+
+
+implements TcpTimeoutChecked for TcpStream:
+	func set_timeout_checked(stream: TcpStream, ms: Int) -> Result[Void, TcpError]:
+		if not valid_timeout_ms(ms):
+			Err(InvalidInput("timeout must be between 0 and 18446744073709 ms"))
+		else:
+			map_runtime_void(set_timeout(stream, ms))
 
 
 ---
@@ -70,6 +190,25 @@ func listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, String
 
 
 ---
+Create a TCP server socket with a typed TCP error.
+
+This compatibility bridge rejects invalid host, port, and backlog inputs before
+crossing into the runtime. Other failures are delegated to `listen` and
+preserved as `Err(Other(detail))`. The eventual resource API should move this
+typed error shape onto `listen` itself.
+---
+func listen_checked(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]:
+	if not valid_host(host):
+		Err(InvalidInput("host must be shorter than 256 bytes"))
+	else if not valid_port(port):
+		Err(InvalidInput("port must be between 0 and 65535"))
+	else if not valid_backlog(backlog):
+		Err(InvalidInput("backlog must be between 0 and 2147483647"))
+	else:
+		map_runtime_error(listen(host, port, backlog))
+
+
+---
 Accept an incoming connection on a listening socket.
 Returns a stream handle on success.
 Only one parked accept may be in progress for a listener. Start one accept loop
@@ -78,6 +217,17 @@ error instead of pretending the listener is closed.
 ---
 func accept(listener: TcpListener) -> Result[TcpStream, String]:
 	builtin
+
+
+---
+Accept an incoming connection with a typed TCP error.
+
+This compatibility bridge delegates to `accept` and preserves runtime string
+failures as `Err(Other(detail))`. The eventual resource API should move this
+typed error shape onto `accept` itself.
+---
+func accept_checked(listener: TcpListener) -> Result[TcpStream, TcpError]:
+	map_runtime_error(accept(listener))
 
 
 ---
@@ -92,6 +242,23 @@ func connect(host: String, port: Int) -> Result[TcpStream, String]:
 
 
 ---
+Connect to a remote TCP server with a typed TCP error.
+
+This compatibility bridge rejects invalid host and port inputs before crossing
+into the runtime. Other failures are delegated to `connect` and preserved as
+`Err(Other(detail))`. The eventual resource API should move this typed error
+shape onto `connect` itself.
+---
+func connect_checked(host: String, port: Int) -> Result[TcpStream, TcpError]:
+	if not valid_host(host):
+		Err(InvalidInput("host must be shorter than 256 bytes"))
+	else if not valid_port(port):
+		Err(InvalidInput("port must be between 0 and 65535"))
+	else:
+		map_runtime_error(connect(host, port))
+
+
+---
 Read up to max_bytes from a socket.
 Returns the data actually read (may be less than max_bytes).
 Returns empty Bytes on connection close.
@@ -103,6 +270,21 @@ return an error instead of pretending the stream is closed.
 ---
 func read(stream: TcpStream, max_bytes: Int) -> Result[Bytes, String]:
 	builtin
+
+
+---
+Read up to max_bytes from a socket with a typed TCP error.
+
+This is the future-facing spelling for TCP resources. Passing a non-positive
+size or a size larger than 64 MiB returns `Err(InvalidInput(...))` before
+crossing into the runtime. Other failures are delegated to `read` and preserved
+as `Err(Other(detail))`.
+---
+func read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]:
+	if not valid_read_chunk_size(max_bytes):
+		Err(InvalidInput("max_bytes must be between 1 and 67108864"))
+	else:
+		map_runtime_error(read(stream, max_bytes))
 
 
 ---
@@ -122,7 +304,32 @@ func write(stream: TcpStream, data: Bytes) -> Result[Int, String]:
 
 
 ---
+Write all bytes in data to a socket with a typed TCP error.
+
+Returns `Ok(void)` once every byte has been written. If cancellation, timeout,
+or an OS error happens after a partial send, the function returns an error and
+the peer may still have received bytes already sent.
+---
+func write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]:
+	match write(stream, data):
+		Ok(_): Ok(void)
+		Err(detail): Err(runtime_error(detail))
+
+
+---
 Set SO_REUSEADDR on a listener.
 ---
 func set_reuse_addr(listener: TcpListener) -> Result[Int, String]:
 	builtin
+
+
+---
+Set SO_REUSEADDR on a listener with a typed TCP error.
+
+This compatibility bridge delegates to `set_reuse_addr` and preserves runtime
+string failures as `Err(Other(detail))`. The eventual resource API should move
+this typed error shape onto `set_reuse_addr` itself if the helper remains part
+of the public TCP surface.
+---
+func set_reuse_addr_checked(listener: TcpListener) -> Result[Void, TcpError]:
+	map_runtime_void(set_reuse_addr(listener))

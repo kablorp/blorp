@@ -178,6 +178,12 @@ let type_contains_known_resource state ty =
     type_is_known_resource state ty
     ||
     match Types.head_resolve ty with
+    | TyNamed (_, _) when Infer.type_contains_resource_source state.env ty ->
+        (* ResourceSource[R, E] names a source that can later produce resources;
+           it does not itself store an owned R as ordinary value data. The
+           resource-source-specific checks below reject ordinary storage and
+           source function boundaries. *)
+        false
     | TyNamed (_, args) -> List.exists contains_forward_resource args
     | TyTuple elems -> List.exists contains_forward_resource elems
     | TyFunc { params; return; _ } ->
@@ -239,6 +245,87 @@ let one_shot_stream_containing_aggregate_error loc message =
           data before storing it.")
     loc message
 
+let one_shot_stream_containing_type_alias_error loc message =
+  error_with
+    ~notes:
+      [
+        "A direct alias to a stream type is allowed as a spelling aid, but an \
+         alias must not hide a one-shot stream inside an ordinary value \
+         container.";
+        "Streams carry mutable cursor state. Ordinary containers have value \
+         semantics, which would make that cursor state copyable.";
+      ]
+    ~help:
+      (Some
+         "Keep the alias pointed directly at Stream[T] or FallibleStream[T, \
+          E], or store only ordinary data in the container.")
+    loc message
+
+let one_shot_stream_function_carrier_error loc message =
+  error_with
+    ~notes:
+      [
+        "Function values do not contain stream cursor state, so direct stream \
+         producers like () -> Stream[T] or () -> FallibleStream[T, E] are \
+         ordinary values.";
+        "A function endpoint that hides a stream in a carrier such as \
+         Option[Stream[T]] or Option[FallibleStream[T, E]] would make one-shot \
+         cursor state copyable when the function is called.";
+      ]
+    ~help:
+      (Some
+         "Keep stream-producing function types direct, or return ordinary data \
+          collected from the stream.")
+    loc message
+
+let resource_source_containing_aggregate_error loc message =
+  error_with
+    ~notes:
+      [
+        "Resource sources produce owned resources one at a time. Embedding one \
+         in ordinary value-semantic data would hide source state and resource \
+         transfer ownership inside a copyable value.";
+      ]
+    ~help:
+      (Some
+         "Consume resource sources directly with resource-source iteration, or \
+          store ordinary data derived from the produced resources.")
+    loc message
+
+let resource_source_containing_type_alias_error loc message =
+  error_with
+    ~notes:
+      [
+        "A direct alias to a resource source is allowed as a spelling aid, but \
+         an alias must not hide a resource source inside an ordinary value \
+         container.";
+        "Resource sources are one-shot cursors that produce owned resources. \
+         Ordinary containers have value semantics, which would make source \
+         cursor state copyable.";
+      ]
+    ~help:
+      (Some
+         "Keep the alias pointed directly at ResourceSource[R, E], or store \
+          only ordinary data in the container.")
+    loc message
+
+let resource_source_function_carrier_error loc message =
+  error_with
+    ~notes:
+      [
+        "Function values do not contain resource-source cursor state, so \
+         direct resource-source producers like () -> ResourceSource[R, E] are \
+         ordinary values.";
+        "A function endpoint that hides a resource source in a carrier such as \
+         Option[ResourceSource[R, E]] would make one-shot source state \
+         copyable when the function is called.";
+      ]
+    ~help:
+      (Some
+         "Keep resource-source-producing function types direct, or return \
+          ordinary data produced from the source.")
+    loc message
+
 let register_resource_cleanup_metadata (decl : type_decl) : unit =
   if decl.type_is_resource then
     Option.iter
@@ -251,8 +338,13 @@ let type_is_scoped_dependency_carrier ty =
   | TyNamed (name, _) -> (
       match Types.split_canonical_module_type_name name with
       | Some (module_path, type_name) ->
-          module_path = "std/stream" && type_name = "FallibleStream"
-      | None -> name = "FallibleStream" || name = "std_stream__FallibleStream")
+          module_path = "std/stream"
+          && (type_name = "FallibleStream" || type_name = "ResourceSource")
+      | None ->
+          name = "FallibleStream"
+          || name = "std_stream__FallibleStream"
+          || name = "ResourceSource"
+          || name = "std_stream__ResourceSource")
   | _ -> false
 
 let type_is_scoped_dependency_carrier_in_env env ty =
@@ -1054,11 +1146,40 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
                           v.variant_name))
                 else state
               in
-              if Infer.type_contains_one_shot_stream state.env field_ty then
+              if
+                Infer.type_contains_one_shot_stream_function_carrier state.env
+                  field_ty
+              then
+                add_error state
+                  (one_shot_stream_function_carrier_error v.variant_loc
+                     (Printf.sprintf
+                        "Union variant '%s' cannot contain a one-shot stream \
+                         carrier"
+                        v.variant_name))
+              else if Infer.type_contains_one_shot_stream state.env field_ty
+              then
                 add_error state
                   (one_shot_stream_containing_aggregate_error v.variant_loc
                      (Printf.sprintf
                         "Union variant '%s' cannot contain a one-shot stream \
+                         type"
+                        v.variant_name))
+              else if
+                Infer.type_contains_resource_source_function_carrier state.env
+                  field_ty
+              then
+                add_error state
+                  (resource_source_function_carrier_error v.variant_loc
+                     (Printf.sprintf
+                        "Union variant '%s' cannot contain a resource source \
+                         carrier"
+                        v.variant_name))
+              else if Infer.type_contains_resource_source state.env field_ty
+              then
+                add_error state
+                  (resource_source_containing_aggregate_error v.variant_loc
+                     (Printf.sprintf
+                        "Union variant '%s' cannot contain a resource source \
                          type"
                         v.variant_name))
               else state)
@@ -1209,11 +1330,39 @@ let process_record_decl ?(imported = false) (state : check_state)
                       decl.record_name f.field_name))
             else state
           in
-          if Infer.type_contains_one_shot_stream state.env f.field_type then
+          if
+            Infer.type_contains_one_shot_stream_function_carrier state.env
+              f.field_type
+          then
+            add_error state
+              (one_shot_stream_function_carrier_error f.field_loc
+                 (Printf.sprintf
+                    "%s '%s' field '%s' cannot contain a one-shot stream \
+                     carrier"
+                    kind decl.record_name f.field_name))
+          else if Infer.type_contains_one_shot_stream state.env f.field_type
+          then
             add_error state
               (one_shot_stream_containing_aggregate_error f.field_loc
                  (Printf.sprintf
                     "%s '%s' field '%s' cannot contain a one-shot stream type"
+                    kind decl.record_name f.field_name))
+          else if
+            Infer.type_contains_resource_source_function_carrier state.env
+              f.field_type
+          then
+            add_error state
+              (resource_source_function_carrier_error f.field_loc
+                 (Printf.sprintf
+                    "%s '%s' field '%s' cannot contain a resource source \
+                     carrier"
+                    kind decl.record_name f.field_name))
+          else if Infer.type_contains_resource_source state.env f.field_type
+          then
+            add_error state
+              (resource_source_containing_aggregate_error f.field_loc
+                 (Printf.sprintf
+                    "%s '%s' field '%s' cannot contain a resource source type"
                     kind decl.record_name f.field_name))
           else state)
         state decl.record_fields
@@ -1348,6 +1497,48 @@ let process_type_alias ?(loc = dummy_loc) (state : check_state)
       add_error state
         (resource_containing_type_alias_error loc
            (Printf.sprintf "Type alias '%s' cannot contain a resource type"
+              decl.alias_name))
+    else state
+  in
+  let state =
+    if
+      Infer.type_contains_resource_source_function_carrier state.env
+        decl.alias_target
+    then
+      add_error state
+        (resource_source_function_carrier_error loc
+           (Printf.sprintf
+              "Type alias '%s' cannot contain a resource source carrier"
+              decl.alias_name))
+    else if
+      (not (Infer.type_is_resource_source state.env decl.alias_target))
+      && Infer.type_contains_resource_source state.env decl.alias_target
+    then
+      add_error state
+        (resource_source_containing_type_alias_error loc
+           (Printf.sprintf
+              "Type alias '%s' cannot contain a resource source type"
+              decl.alias_name))
+    else state
+  in
+  let state =
+    if
+      Infer.type_contains_one_shot_stream_function_carrier state.env
+        decl.alias_target
+    then
+      add_error state
+        (one_shot_stream_function_carrier_error loc
+           (Printf.sprintf
+              "Type alias '%s' cannot contain a one-shot stream carrier"
+              decl.alias_name))
+    else if
+      (not (Infer.type_is_one_shot_stream state.env decl.alias_target))
+      && Infer.type_contains_one_shot_stream state.env decl.alias_target
+    then
+      add_error state
+        (one_shot_stream_containing_type_alias_error loc
+           (Printf.sprintf
+              "Type alias '%s' cannot contain a one-shot stream type"
               decl.alias_name))
     else state
   in
@@ -1507,6 +1698,79 @@ let resource_signature_boundary_error loc message =
           contract.")
     loc message
 
+let resource_function_body_result_error loc ~func_name ~body_ty ~declared_return
+    =
+  let declared_note =
+    match declared_return with
+    | Some expected_ty ->
+        Printf.sprintf
+          "The declared return type is %s, but the body produced %s."
+          (type_to_string expected_ty)
+          (type_to_string body_ty)
+    | None ->
+        Printf.sprintf
+          "The function body produced %s, and inferring that as an ordinary \
+           function result would let an acquisition carrier escape."
+          (type_to_string body_ty)
+  in
+  let message =
+    match declared_return with
+    | Some _ ->
+        Printf.sprintf
+          "resource-containing function body cannot satisfy declared return \
+           type in '%s'"
+          func_name
+    | None ->
+        Printf.sprintf
+          "resource-containing function result cannot be inferred without a \
+           cleanup scope in '%s'"
+          func_name
+  in
+  error_with
+    ~notes:
+      [
+        "Resource-containing values need compiler-owned cleanup ownership.";
+        declared_note;
+      ]
+    ~help:
+      (Some
+         "Use `with name ?= expression:` for fallible resource acquisition and \
+          return ordinary data from inside the with block.")
+    loc message
+
+let resource_source_signature_boundary_error loc message =
+  error_with
+    ~notes:
+      [
+        "Ordinary function parameters and return values use value semantics. \
+         Copying a resource source would duplicate source cursor state and \
+         obscure ownership transfer for resources produced later.";
+        "Source functions cannot accept or return resource sources until the \
+         compiler has an explicit resource-source borrow or move model.";
+      ]
+    ~help:
+      (Some
+         "Consume resource sources directly with resource-source iteration, or \
+          pass ordinary data produced inside that iteration.")
+    loc message
+
+let one_shot_stream_signature_boundary_error loc message =
+  error_with
+    ~notes:
+      [
+        "Ordinary function parameters and return values use value semantics. \
+         Hiding a one-shot stream inside an ordinary carrier would make \
+         mutable cursor state copyable.";
+        "Direct stream parameters and direct stream-producing functions remain \
+         allowed, but ordinary carriers such as Option[Stream[T]] or \
+         Option[FallibleStream[T, E]] cannot cross source function boundaries.";
+      ]
+    ~help:
+      (Some
+         "Keep the stream as a direct parameter or direct return value, or \
+          pass ordinary data collected from the stream.")
+    loc message
+
 let validate_resource_signature_boundary loc (state : check_state)
     (func : func_decl) (sig_ : checked_func_signature) : check_state =
   let typed_params : Ast.param list =
@@ -1529,11 +1793,100 @@ let validate_resource_signature_boundary loc (state : check_state)
           else state)
         state param_pairs
     in
+    let state =
+      List.fold_left
+        (fun state ((param : Ast.param), param_ty) ->
+          if
+            Infer.type_contains_resource_source_function_carrier state.env
+              param_ty
+          then
+            let param_name = Option.value param.param_name ~default:"_" in
+            add_error state
+              (resource_source_function_carrier_error param.param_loc
+                 (Printf.sprintf
+                    "Function '%s' parameter '%s' cannot contain a resource \
+                     source carrier"
+                    sig_.cfs_name param_name))
+          else if Infer.type_contains_resource_source state.env param_ty then
+            let param_name = Option.value param.param_name ~default:"_" in
+            add_error state
+              (resource_source_signature_boundary_error param.param_loc
+                 (Printf.sprintf
+                    "Function '%s' parameter '%s' cannot contain a resource \
+                     source type"
+                    sig_.cfs_name param_name))
+          else state)
+        state param_pairs
+    in
+    let state =
+      List.fold_left
+        (fun state ((param : Ast.param), param_ty) ->
+          if
+            Infer.type_contains_one_shot_stream_function_carrier state.env
+              param_ty
+          then
+            let param_name = Option.value param.param_name ~default:"_" in
+            add_error state
+              (one_shot_stream_function_carrier_error param.param_loc
+                 (Printf.sprintf
+                    "Function '%s' parameter '%s' cannot contain a one-shot \
+                     stream carrier"
+                    sig_.cfs_name param_name))
+          else if
+            Infer.type_contains_one_shot_stream state.env param_ty
+            && not (Infer.type_is_one_shot_stream state.env param_ty)
+          then
+            let param_name = Option.value param.param_name ~default:"_" in
+            add_error state
+              (one_shot_stream_signature_boundary_error param.param_loc
+                 (Printf.sprintf
+                    "Function '%s' parameter '%s' cannot contain a one-shot \
+                     stream type"
+                    sig_.cfs_name param_name))
+          else state)
+        state param_pairs
+    in
     if type_contains_known_resource state sig_.cfs_return_type then
       add_error state
         (resource_signature_boundary_error loc
            (Printf.sprintf
               "Function '%s' return type cannot contain a resource type"
+              sig_.cfs_name))
+    else if
+      Infer.type_contains_resource_source_function_carrier state.env
+        sig_.cfs_return_type
+    then
+      add_error state
+        (resource_source_function_carrier_error loc
+           (Printf.sprintf
+              "Function '%s' return type cannot contain a resource source \
+               carrier"
+              sig_.cfs_name))
+    else if Infer.type_contains_resource_source state.env sig_.cfs_return_type
+    then
+      add_error state
+        (resource_source_signature_boundary_error loc
+           (Printf.sprintf
+              "Function '%s' return type cannot contain a resource source type"
+              sig_.cfs_name))
+    else if
+      Infer.type_contains_one_shot_stream_function_carrier state.env
+        sig_.cfs_return_type
+    then
+      add_error state
+        (one_shot_stream_function_carrier_error loc
+           (Printf.sprintf
+              "Function '%s' return type cannot contain a one-shot stream \
+               carrier"
+              sig_.cfs_name))
+    else if
+      Infer.type_contains_one_shot_stream state.env sig_.cfs_return_type
+      && not (Infer.type_is_one_shot_stream state.env sig_.cfs_return_type)
+    then
+      add_error state
+        (one_shot_stream_signature_boundary_error loc
+           (Printf.sprintf
+              "Function '%s' return type cannot contain a one-shot stream type"
               sig_.cfs_name))
     else state
 
@@ -3702,16 +4055,22 @@ let check_function_body (state : check_state) (func : func_decl) (_loc : loc) :
                     (List.nth exprs (List.length exprs - 1)).expr_loc
                 | _ -> typed_body.expr_loc
               in
-              ( add_error state
-                  (error_at body_loc
-                     (Printf.sprintf
-                        "Function '%s' returns wrong type\n\
-                        \    expected: %s  (declared return type)\n\
-                        \       found: %s  (body expression)"
-                        (Option.value func.func_name ~default:"<lambda>")
-                        (type_to_string expected_ty)
-                        (type_to_string body_ty))),
-                FuncBodyExpr typed_body )
+              let func_name = Option.value func.func_name ~default:"<lambda>" in
+              let err =
+                if Infer.type_contains_resource ctx body_ty then
+                  resource_function_body_result_error body_loc ~func_name
+                    ~body_ty ~declared_return:(Some expected_ty)
+                else
+                  error_at body_loc
+                    (Printf.sprintf
+                       "Function '%s' returns wrong type\n\
+                       \    expected: %s  (declared return type)\n\
+                       \       found: %s  (body expression)"
+                       func_name
+                       (type_to_string expected_ty)
+                       (type_to_string body_ty))
+              in
+              (add_error state err, FuncBodyExpr typed_body)
           | None
             when body_ty <> ty_void
                  && body_ty <> TyNamed ("Void", [])
@@ -3723,16 +4082,22 @@ let check_function_body (state : check_state) (func : func_decl) (_loc : loc) :
                     (List.nth exprs (List.length exprs - 1)).expr_loc
                 | _ -> typed_body.expr_loc
               in
-              ( add_error state
-                  (error_at body_loc
-                     (Printf.sprintf
-                        "Function '%s' body has type %s but no return type is \
-                         declared\n\
-                        \    help: add '-> %s' to the function signature, or \
-                         use '-> Void' if discarding the result"
-                        (Option.value func.func_name ~default:"<lambda>")
-                        (type_to_string body_ty) (type_to_string body_ty))),
-                FuncBodyExpr typed_body )
+              let func_name = Option.value func.func_name ~default:"<lambda>" in
+              let err =
+                if Infer.type_contains_resource ctx body_ty then
+                  resource_function_body_result_error body_loc ~func_name
+                    ~body_ty ~declared_return:None
+                else
+                  error_at body_loc
+                    (Printf.sprintf
+                       "Function '%s' body has type %s but no return type is \
+                        declared\n\
+                       \    help: add '-> %s' to the function signature, or \
+                        use '-> Void' if discarding the result"
+                       func_name (type_to_string body_ty)
+                       (type_to_string body_ty))
+              in
+              (add_error state err, FuncBodyExpr typed_body)
           | _ -> (state, FuncBodyExpr typed_body))
       | Error err -> (add_error state err, FuncBodyExpr body))
 
@@ -4132,7 +4497,7 @@ let rec check_matches_in_expr (state : check_state) (expr : expr) : check_state
             with
             | Some err -> add_error state err
             | None -> state)
-        | Error err -> add_error state err
+        | Error err -> if state.errors <> [] then state else add_error state err
       in
       (* Check for unreachable arms: patterns after wildcard or duplicate no-arg constructors *)
       let _seen_wildcard, _seen_ctors, state =
@@ -4574,6 +4939,15 @@ let rec second_pass (state : check_state) (decls : program) :
                                  global"
                                 name))
                     | Some name, Some ty
+                      when Infer.type_contains_one_shot_stream_function_carrier
+                             state.env ty ->
+                        add_error state
+                          (one_shot_stream_function_carrier_error loc
+                             (Printf.sprintf
+                                "function value '%s' cannot accept or return a \
+                                 one-shot stream carrier"
+                                name))
+                    | Some name, Some ty
                       when Infer.type_contains_one_shot_stream state.env ty ->
                         add_error state
                           (error_with loc
@@ -4594,6 +4968,35 @@ let rec second_pass (state : check_state) (decls : program) :
                                    it in a direct local binding while building \
                                    the pipeline, and consume it with a \
                                    terminal stream operation."))
+                    | Some name, Some ty
+                      when Infer.type_contains_resource_source_function_carrier
+                             state.env ty ->
+                        add_error state
+                          (resource_source_function_carrier_error loc
+                             (Printf.sprintf
+                                "function value '%s' cannot accept or return a \
+                                 resource source carrier"
+                                name))
+                    | Some name, Some ty
+                      when Infer.type_contains_resource_source state.env ty ->
+                        add_error state
+                          (error_with loc
+                             (Printf.sprintf
+                                "resource source value '%s' cannot be bound to \
+                                 a global"
+                                name)
+                             ~notes:
+                               [
+                                 "Global bindings are shared program state. A \
+                                  resource source carries one-shot ownership \
+                                  transfer state and must stay local to the \
+                                  code that consumes it.";
+                               ]
+                             ~help:
+                               (Some
+                                  "Create resource sources inside the function \
+                                   that consumes them, or expose a function \
+                                   that creates a fresh source each time."))
                     | _ -> state
                   in
                   (state, typed_var)

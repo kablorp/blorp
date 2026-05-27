@@ -1628,6 +1628,8 @@ Rules for `?=`:
 - `None` or `Err(error)` is returned from the enclosing carrier-returning function.
 - Success values are not auto-wrapped; write `Some(value)` or `Ok(value)` explicitly.
 - `?=` is rejected inside loop bodies, including `for ... concurrently(...)` bodies. Move the `?=` before the loop, use an explicit `match` in the loop, or use Option/Result combinators when failure should stay local to one iteration.
+- Direct `?=` cannot unwrap a resource acquisition such as `open_read(path)`;
+  use `with reader ?= open_read(path):` so cleanup ownership is installed.
 - There is no bare postfix `?` operator.
 
 ### `with` Resource Scopes
@@ -1647,6 +1649,11 @@ func load_text(path: String) -> Result[String, IOError]:
     with reader ?= open_read(path):
         reader.read_text()
 ```
+
+Fallible acquisition results that contain resources, such as
+`Result[FileReader, IOError]`, are not ordinary values. They must be consumed by
+`with name ?= ...:` rather than matched or stored directly, so the compiler can
+install the cleanup edge before exposing the resource handle.
 
 Source functions cannot accept resource handles as parameters or return values.
 That keeps resource cleanup ownership out of ordinary value semantics. Keep
@@ -1679,11 +1686,31 @@ a terminal operation such as `collect_result()`, `fold_result(...)`,
 A non-positive explicit chunk size or window size is reported as
 `Err(InvalidInput(...))` by the terminal operation. Streams are one-shot cursors,
 so they cannot be bound globally or stored in ordinary aggregates such as
-tuples, lists, dicts, records, structs, or unions. They also cannot be captured
-by closures, `detach`, or concurrent task bodies. Keep a stream in a direct
-local binding while building a pipeline, then consume it with a terminal
-operation. Create and consume a stream inside the task when concurrent work
-needs its own stream.
+tuples, lists, dicts, records, structs, or unions, and they cannot be hidden
+inside ordinary carrier type aliases/ascriptions such as
+`type alias MaybeStream = Option[Stream[T]]` or
+`None as Option[Stream[T]]`. Ordinary local bindings such as
+`maybe: Option[Stream[T]] = None` and ordinary function signatures containing
+stream carriers such as `Option[Stream[T]]` are rejected too. Function values
+may directly produce streams, such as `() -> Stream[T]`, but their parameters
+and return values cannot hide streams in ordinary carriers such as
+`() -> Option[Stream[T]]`. Generic records and unions are checked after
+substitution, so wrappers are judged by what their fields or variants actually
+carry. They also cannot be captured by closures, `detach`, or concurrent task
+bodies. Keep a stream in a direct local binding while building a pipeline, then
+consume it with a terminal operation. Create and consume a stream inside the
+task when concurrent work needs its own stream.
+`ResourceSource[R, E]` is the reserved source type for future APIs that produce
+owned resources one at a time, such as TCP listener connections or database
+pool checkouts. It is not usable as an ordinary collection: records, unions,
+type aliases that hide it inside ordinary carriers, ordinary local bindings
+such as `Option[ResourceSource[...]]`, ordinary carrier type ascriptions such
+as `None as Option[ResourceSource[...]]`, globals, and ordinary source function
+parameters or returns cannot contain it. Function values may directly produce
+resource sources, such as `() -> ResourceSource[R, E]`, but their parameters
+and return values cannot hide resource sources in ordinary carriers such as
+`() -> Option[ResourceSource[R, E]]`. The iteration syntax for resource sources
+is still part of the concurrency and resource roadmap.
 `writer.write_chunk(data)` performs one write attempt and returns the number of
 bytes written; use `writer.write_bytes(data)` when all bytes must be written
 before returning.
@@ -1714,6 +1741,35 @@ func line_count(path: String) -> Result[Int, IOError]:
 General resource-backed APIs are still under development; existing `system` and
 TCP helpers remain compatibility APIs unless their modules declare resource
 types.
+
+The portable TCP module is still handle-based, not scoped with `with`, so close
+accepted listeners and streams explicitly. Its original `listen`, `accept`,
+`connect`, `read`, `write`, `local_port`, and `set_timeout` functions keep
+returning `Result[..., String]` for compatibility. New code that wants the
+future typed error shape can use `TcpError` bridge helpers:
+`listen_checked`, `accept_checked`, `connect_checked`,
+`local_port_checked`, `set_timeout_checked`, `set_reuse_addr_checked`,
+`read_chunk`, and `write_all`. These helpers report wrapper-owned invalid
+inputs such as bad ports, backlog values, timeouts, and chunk sizes as
+`InvalidInput`; runtime-originated socket failures are preserved as `Other`
+until TCP becomes a scoped resource API. Numeric hosts such as `"127.0.0.1"`
+are the virtual-thread-friendly path; hostname resolution may still block an OS
+worker before the socket operation can park the current fiber.
+
+```blorp
+import:
+    net/tcp as Tcp
+
+func fetch_once(port: Int) -> Result[Int, Tcp.TcpError]:
+    match Tcp.connect_checked("127.0.0.1", port):
+        Ok(stream):
+            result: Result[Int, Tcp.TcpError] = match stream.read_chunk(4096):
+                Ok(data): Ok(data.length())
+                Err(err): Err(err)
+            Tcp.close(stream)
+            result
+        Err(err): Err(err)
+```
 
 `with ?=` follows the same loop restriction as direct `?=`. If acquisition is
 inside loop control flow, use an explicit `match` around the loop or keep the

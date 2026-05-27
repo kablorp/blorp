@@ -1649,6 +1649,7 @@ blorp_List* blorp_stream_collect(blorp_Stream* stream);
 blorp_FileListResult blorp_fallible_stream_collect_file_raw(blorp_FallibleStream* stream, uint8_t storage_mode, int16_t elem_size);
 blorp_FileValueResult blorp_fallible_stream_fold_file_raw(blorp_FallibleStream* stream, void* init, blorp_Closure* func, bool acc_is_rc);
 blorp_FileIntResult blorp_fallible_stream_count_file_raw(blorp_FallibleStream* stream);
+blorp_FileValueResult blorp_fallible_stream_find_file_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
 blorp_FileValueResult blorp_fallible_stream_find_file_raw_nullable(blorp_FallibleStream* stream, blorp_Closure* pred);
 blorp_FileValueResult blorp_fallible_stream_find_file_raw_int(blorp_FallibleStream* stream, blorp_Closure* pred);
 blorp_FileValueResult blorp_fallible_stream_find_file_raw_int8(blorp_FallibleStream* stream, blorp_Closure* pred);

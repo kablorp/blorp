@@ -148,6 +148,15 @@ Current runtime shape:
   the scheduler's poll-backed I/O reactor instead of pinning OS workers while
   waiting for socket readiness;
 - timeout and cancellation paths wake parked socket waiters;
+- same-stream writes are serialized by an explicit runtime write-ownership
+  state so concurrent writes cannot interleave bytes;
+- parked waiter installation uses explicit runtime outcomes for ok, busy,
+  closed, and invalid states, preserving the distinction between a closed handle
+  and an unsupported overlapping wait shape;
+- one parked waiter per handle and operation kind is the compatibility policy,
+  not an accidental runtime quirk. Use one accept loop to fan streams into
+  workers, and treat one reader plus one writer as the intended same-stream
+  concurrency shape until TCP resources define a broader ownership model;
 - `set_timeout` configures runtime virtual-thread deadlines, not kernel socket
   timeouts;
 - scheduler instrumentation includes `reactor_control_wakes`,
@@ -157,7 +166,11 @@ Remaining limitations:
 
 - hostname resolution still uses `getaddrinfo` and can block an OS worker before
   the nonblocking socket phase begins;
-- errors are still represented as `String`, not a typed `TcpError`;
+- the original TCP entry points still report errors as `String`; typed
+  compatibility bridges exist for acquisition, local-port lookup, timeouts,
+  reuse-address configuration, and read/write, but the simple names have not
+  moved to `TcpError` yet. The bridges type their own precondition failures as
+  `InvalidInput` and preserve runtime-originated string failures as `Other`;
 - typed TCP handles are normal ARC-managed values, not compiler-scoped
   resources yet;
 - TCP does not yet expose `chunks`, `lines`, or other fallible stream adapters;
@@ -884,13 +897,24 @@ Typed handles and nonblocking readiness are already in place at the user level:
 ```blorp
 type TcpListener = builtin
 type TcpStream = builtin
+union TcpError
 
 listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, String]
 accept(self: TcpListener) -> Result[TcpStream, String]
 connect(host: String, port: Int) -> Result[TcpStream, String]
+listen_checked(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
+accept_checked(self: TcpListener) -> Result[TcpStream, TcpError]
+connect_checked(host: String, port: Int) -> Result[TcpStream, TcpError]
+local_port_checked(self: TcpListener) -> Result[Int, TcpError]
+local_port_checked(self: TcpStream) -> Result[Int, TcpError]
+set_timeout_checked(self: TcpListener, ms: Int) -> Result[Void, TcpError]
+set_timeout_checked(self: TcpStream, ms: Int) -> Result[Void, TcpError]
+set_reuse_addr_checked(self: TcpListener) -> Result[Void, TcpError]
 
 read(self: TcpStream, max_bytes: Int) -> Result[Bytes, String]
 write(self: TcpStream, data: Bytes) -> Result[Int, String]
+read_chunk(self: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
+write_all(self: TcpStream, data: Bytes) -> Result[Void, TcpError]
 close(self: TcpListener) -> Void
 close(self: TcpStream) -> Void
 ```
@@ -929,15 +953,77 @@ Runtime status and target:
 - landed: fiber parking for socket readiness in `accept`, numeric `connect`,
   `read`, and `write`;
 - landed: timeout/cancellation wakeups for socket waiters;
-- not landed: typed `TcpError`;
+- landed: `TcpError` plus typed `listen_checked`, `accept_checked`,
+  `connect_checked`, `local_port_checked`, `set_timeout_checked`,
+  `set_reuse_addr_checked`, `read_chunk`, and `write_all` compatibility
+  adapters over the current string-error runtime surface. Wrapper-owned invalid
+  host, port, backlog, timeout, and chunk-size inputs are already surfaced as
+  `InvalidInput`;
+- not landed: simple-name `TcpError` returns for `listen`, `accept`, and
+  `connect`;
 - not landed: compiler-enforced scoped resources and `with` cleanup;
-- not landed: `chunks`, `lines`, and `write_all` adapters;
+- not landed: `chunks` and `lines` adapters;
 - not landed: nonblocking DNS or a bounded DNS worker strategy for hostname
   resolution.
 
 Do not extend the virtual-thread-friendly claim to hostname DNS, file I/O,
 database connectors, or process I/O until those operations park fibers or go
 through a bounded blocking-worker path.
+
+### TCP Resource Migration Staging
+
+A direct declaration change from `type TcpListener` / `type TcpStream` to
+`resource type TcpListener` / `resource type TcpStream` is intentionally not the
+next implementation step. The current resource rules correctly reject ordinary
+source functions that accept or return resource-containing types, storing
+resources in lists/channels/records/unions/options, and capturing resources in
+closures, detached tasks, or concurrent task bodies. Those rules are the right
+long-term shape, but flipping TCP immediately would turn broad existing TCP
+usage into hard errors before the replacement API is available.
+
+Observed migration blockers:
+
+- tests and examples pass `TcpListener` and `TcpStream` through ordinary helper
+  functions;
+- the TCP virtual-thread benchmark stores streams in `List[TcpStream]`;
+- the detached accepted-stream regression intentionally uses
+  `detach handle_client(stream)` while the resource-safe replacement is still
+  pending;
+- optional networking packages wrap or store `TCP.TcpStream` inside ordinary
+  records and unions;
+- the current accept API returns one stream at a time rather than a
+  resource-producing source that can transfer ownership into a concurrent loop.
+
+Staging plan:
+
+1. Keep the current typed-handle compatibility API and typed `TcpError` bridges
+   until all examples and tests have a scoped spelling to migrate to.
+2. Define the resource-source shape first. The `ResourceSource[R, E]` type
+   anchor exists and is rejected at ordinary aggregate/function boundaries,
+   globals, type aliases that hide it in ordinary carriers, ordinary carrier
+   type ascriptions such as `None as Option[ResourceSource[...]]`, and
+   annotated local bindings such as `Option[ResourceSource[...]]`; the
+   compiler also rejects function values whose parameters or return values
+   hide resource-source carriers while preserving direct source producer
+   function types. The remaining work is the iteration contract, including how
+   `connections(listener)` transfers each accepted stream into a
+   `for ... concurrently(limit:)` task and how cancellation closes streams owned
+   by cancelled tasks.
+3. Decide whether ordinary user helpers may ever borrow resources. If not, keep
+   TCP resource helpers as compiler-owned resource operations and teach users to
+   structure helpers around ordinary data or resource-source callbacks.
+4. Migrate internal tests, benchmarks, and package call sites from ordinary
+   helper/storage patterns to scoped listeners, owned connection tasks, and
+   explicit services/pools where sharing is intentional.
+5. Only then promote the simple TCP names to `TcpError` and resource return
+   types. The old typed-handle API should either remain as a clearly named
+   compatibility layer or produce migration diagnostics that point to `with`
+   and `connections(...).concurrently(...)`.
+
+This staging preserves the main safety invariant: once `TcpStream` is a
+resource, shapes such as detached capture, list storage, and arbitrary helper
+passing should be rejected by the same general resource rules that already
+protect file handles. TCP should not need special codegen exceptions.
 
 ## Database Connector Target
 
@@ -1026,6 +1112,34 @@ Completed in the current implementation:
   aggregate literals and declarations: tuples, lists, dicts, records, structs,
   and unions cannot hide one-shot cursor state. Direct local stream bindings and
   pipeline reassignment remain allowed.
+- The compiler rejects ordinary carrier aliases/ascriptions and annotated local
+  carrier bindings such as `Option[Stream[T]]`, while preserving direct
+  `Stream[T]`/`FallibleStream[T, E]` aliases and direct local stream bindings.
+- The compiler rejects ordinary source-function parameters and return types
+  that hide `Stream`/`FallibleStream` inside carriers such as
+  `Option[Stream[T]]`, while preserving direct stream parameters and direct
+  stream-producing functions.
+- The compiler rejects function values whose parameters or return values hide
+  stream carriers, such as `() -> Option[Stream[T]]`, while preserving direct
+  producer functions such as `() -> Stream[T]`. This also applies when those
+  function values appear in type aliases, record fields, or union payloads.
+- Generic record and union wrappers are checked after type-parameter
+  substitution, so direct producer fields such as `() -> Stream[T]` remain
+  ordinary values while hidden carriers such as `() -> Option[Stream[T]]` are
+  rejected when `T` is a stream type. Opaque builtin containers remain
+  conservative and are checked through their type arguments.
+- The same substituted-wrapper rule is covered for `FallibleStream[T, E]`:
+  direct producer fields and phantom generic parameters stay legal, while
+  hidden carriers such as `() -> Option[FallibleStream[T, E]]` are rejected in
+  generic records and unions.
+- Direct `FallibleStream[T, E]` parameters and return types remain legal in the
+  same narrow sense as direct `Stream[T]` parameters and returns, while
+  ordinary storage and carrier shapes such as record fields, list literals,
+  closures, and `Option[FallibleStream[T, E]]` are rejected.
+- The compiler rejects function values whose parameters or return values hide
+  `ResourceSource` carriers, such as
+  `() -> Option[ResourceSource[R, E]]`, while preserving direct producer
+  function types such as `() -> ResourceSource[R, E]`.
 - Global `Stream`/`FallibleStream` bindings are rejected so mutable cursor state
   cannot become shared program state.
 - `from_lines` no longer truncates paths through a fixed-size stack buffer, and
@@ -1062,6 +1176,13 @@ Tests:
   consumed wholly inside the task.
 - Tuple/list/dict/record/union storage of `Stream`/`FallibleStream` values is
   rejected, while direct local stream bindings remain accepted.
+- Ordinary carrier type aliases/ascriptions and local carrier bindings for
+  `Stream`/`FallibleStream` values are rejected.
+- Ordinary function parameters/returns that contain stream carrier values are
+  rejected, while direct stream-producing functions remain accepted.
+- Direct `FallibleStream` parameters/returns are accepted, while
+  `Option[FallibleStream]`, closure capture, record-field, and list-storage
+  cases are rejected.
 - Top-level `Stream`/`FallibleStream` bindings are rejected.
 
 ### Phase 1: Add Resource And Scope Representation
@@ -1204,6 +1325,22 @@ Completed in the current implementation:
   including explicit `_ = ...` discards. This closes the path where a resource
   acquisition result or fallible acquisition carrier could be created without a
   `with` cleanup edge.
+- Direct `?=` inference rejects resource-containing success values. This keeps
+  `reader ?= open_read(path)` from creating an ordinary local resource binding
+  without a cleanup scope; fallible resource acquisition must use `with ?=`.
+- Match scrutinee inference rejects resource-containing values, including
+  fallible acquisition carriers such as `Result[FileReader, IOError]`. This
+  keeps `match open_read(path): ...` from exposing a resource payload before a
+  compiler-owned cleanup edge has been installed by `with ?=`.
+- Function result diagnostics now detect resource-containing inferred or
+  mismatched body results and point to `with ?=` cleanup scopes instead of
+  suggesting an illegal resource-containing return type or reporting only a
+  generic type mismatch.
+- Ordinary local binding and call-argument diagnostics now distinguish direct
+  resource values from function values whose endpoints accept or return
+  resources. This keeps lambdas such as `func(): open_read(path)` from being
+  described as resource handles while still rejecting the copyable function
+  value shape.
 - Constructor calls use ordinary call inference for their payloads, so
   `Some(handle)`-style attempts to wrap a scoped resource are rejected by the
   same resource-argument rule as user-defined calls.
@@ -1345,6 +1482,26 @@ Tests:
   bound as ordinary locals;
 - unit coverage for rejecting discarded resource values and discarded fallible
   resource carriers;
+- infer coverage for rejecting direct `?=` over fallible resource acquisition
+  carriers;
+- parser coverage proving `_ ?= ...` is not a valid direct question-binding
+  form;
+- typecheck coverage for rejecting fallible resource acquisition carriers bound
+  to ordinary locals, both inferred and annotated, and explicit `_ = ...`
+  discards;
+- typecheck coverage for rejecting a `match` over a fallible resource
+  acquisition carrier outside `with ?=`;
+- typecheck coverage for resource-containing inferred and explicit function
+  body results, so return diagnostics explain cleanup ownership instead of
+  suggesting invalid signatures or plain type mismatches;
+- typecheck coverage for local lambdas and ordinary call arguments that would
+  return resource acquisition carriers, proving function-value resource
+  endpoints receive a distinct diagnostic;
+- typecheck coverage for imported resource acquisition and resource-operation
+  functions used as ordinary higher-order values, proving those compiler-owned
+  endpoints cannot be copied outside the `with` model;
+- typecheck coverage for type aliases, records, and unions that try to hide
+  resource-accepting function endpoints in ordinary value-semantic types;
 - unit coverage for rejecting scoped-derived local escapes, closure captures,
   and `detach` captures;
 - unit coverage proving builtin resource operations can mark ordinary-data
@@ -1365,11 +1522,9 @@ Tests:
   body-level `?=` short-circuit paths for user-facing resource-backed APIs;
 - unit coverage proving `break`/`continue` cleanup exits are represented in
   Core and emitted in C with reverse nested-resource close order;
-- source-level runtime `break`/`continue` coverage remains pending because the
-  current user-facing file acquisitions are fallible `with ?=` forms, and
-  `with ?=` is rejected directly inside loop bodies. Core_resource unit tests
-  and codegen audits cover cleanup-exit lowering until Blorp has a plain
-  resource acquisition or a resource-aware loop acquisition shape.
+- source-level runtime coverage proving `break` and `continue` inside a
+  user-facing file-resource body preserve loop semantics and still close the
+  scoped reader;
 - runtime test proving close runs on timeout cancellation;
 - codegen audit proving cancellation cleanup registration and normal pop are
   emitted from explicit resource cleanup metadata;
@@ -1428,6 +1583,8 @@ Completed in the current implementation:
   registered from the resource type declaration, so scoped cleanup does not
   depend on importing a source-level `close` function or matching file-resource
   names in codegen.
+- Runtime fd-count coverage exercises repeated normal-completion cleanup for
+  `FileReader`, `FileWriter`, and read-write `File` handles.
 - Compiler integration coverage proves explicit cleanup metadata remains
   std-only; user modules cannot declare `resource type Name =
   builtin("cleanup")`.
@@ -1443,6 +1600,9 @@ Completed in the current implementation:
 - Runtime coverage proves a body-level `?=` inside a file-resource `with`
   returns the enclosing `Err` correctly, and codegen-audit coverage proves the
   file cleanup still wraps that body short-circuit path.
+- Runtime fd-count coverage now also exercises repeated body-level `?=`
+  short-circuits inside file-resource `with` scopes, proving the generated
+  cleanup path does not leak reader handles.
 - Runtime coverage proves write-mode acquisition semantics for create,
   truncate, append/preserve, and existing-only read-write opens. Codegen-audit
   coverage proves `FileWriter` and `File` cleanup metadata emits the matching
@@ -1509,8 +1669,8 @@ Completed in the current implementation:
   `find_result`, `any_result`, and `all_result`. They stop at the first source
   error, return `Result`, and include cooperative cancellation checkpoints in
   their pull loops. `find_result` uses an explicit
-  `Result[Option[T], E]` bridge ABI for nullable-managed options and primitive
-  stack-option payloads.
+  `Result[Option[T], E]` bridge ABI for nullable-managed options, primitive
+  stack-option payloads, and boxed Option payloads such as nested options.
 - Hardened `collect_result` so the runtime list it returns uses the concrete
   `List[T]` storage layout selected by the compiler. Inline primitive lists
   such as `List[UInt8]` are no longer accidentally produced as pointer-backed
@@ -1552,8 +1712,6 @@ Completed in the current implementation:
 
 Tasks:
 
-- Extend `find_result` beyond nullable-managed and primitive stack-option
-  payloads if boxed-union `Option` payloads become a real source need.
 - Add cancellation/yield checks in future fallible stream producers as they are
   introduced.
 
@@ -1570,6 +1728,9 @@ Tests:
 - `fold_result`, `count_result`, `find_result`, `any_result`, and `all_result`
   cover success, typed source errors, generated-C bridge emission, and callback
   terminals;
+- `find_result` codegen supports nullable-managed, primitive stack-option, and
+  boxed Option payload layouts without falling back to an unsupported generic
+  ABI;
 - mid-read error path closes the handle and returns `Err`;
 - cancellation closes the handle;
 - line counting allocates substantially less than `read_all_lines().length()`.
@@ -1588,16 +1749,21 @@ Completed in the current implementation:
 - `accept`, numeric `connect`, `read`, and `write` can park virtual threads
   while waiting on socket readiness.
 - Timeout and cancellation paths wake parked TCP waiters.
+- Overlapping same-operation waiters report in-progress errors; the
+  one-waiter-per-operation shape is documented as the compatibility policy
+  until the resource model can make any broader shape explicit.
+- `TcpError` exists, with checked compatibility bridges for acquisition,
+  local-port lookup, timeouts, reuse-address configuration, chunk reads, and
+  all-byte writes. Wrapper-owned invalid inputs are surfaced as `InvalidInput`.
 - Typecheck regressions reject raw `Int` values passed to the public TCP API.
 
 Tasks:
 
-- Make `TcpListener` and `TcpStream` compiler-scoped resource types once `with`
-  exists.
-- Replace `String` errors with a typed `TcpError` or an explicit error
-  conversion story compatible with `?=`.
+- Define and implement the TCP resource-source migration shape before changing
+  `TcpListener` and `TcpStream` into compiler-scoped resource types.
+- Promote the simple-name TCP APIs from legacy `String` errors to `TcpError`
+  when the scoped resource API lands.
 - Add stream adapters for chunks and lines.
-- Add `write_all` as a protocol-friendly loop over partial writes.
 - Decide the DNS story:
   - document numeric hosts as the virtual-thread-friendly path;
   - add a bounded DNS worker pool; or
@@ -1757,7 +1923,13 @@ These should remain explicit until implementation forces an answer:
 The highest-ROI path is:
 
 1. Design the typed `open(path, options)` shape so impossible file-mode
-   combinations are unrepresentable.
+   combinations are unrepresentable. Current constraint: one value-level
+   `options` argument cannot select between `FileReader`, `FileWriter`, and
+   `File` return types without one of three broader language moves: same-module
+   overloads, static mode types that participate in return-type selection, or a
+   resource-containing sum type. A resource-containing sum type conflicts with
+   the current "resources do not enter ordinary aggregates" rule, so the next
+   design pass should prefer static modes or overload/trait dispatch.
 2. Decide whether `File` should keep explicit `*_rw` operation names or wait
    for a broader overload/trait-dispatch improvement before exposing shared
    `read_text`/`write_text` names.

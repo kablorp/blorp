@@ -1073,12 +1073,12 @@ mutable socket state.
 
 ### Existing Detached TCP Failure
 
-The current typed-handle TCP API has a concrete failure mode:
-`/Users/keithphilpott/Documents/static-site/repro/tcp-detach-segv` contains a
+A prior report for the current typed-handle TCP API used
+`/Users/keithphilpott/Documents/static-site/repro/tcp-detach-segv` to show a
 server that accepts `TcpStream` values and runs `detach handle_client(stream)`.
-The same handler is stable when called inline, but the detached server can
+The same handler was stable when called inline, but the detached server could
 segfault under concurrent client load. A sanitizer trace from the original
-static-site server points through the detached handler task path.
+static-site server pointed through the detached handler task path.
 
 Treat this as a design constraint, not as a TCP-specific patch target. The
 problem is that `TcpStream` is a mutable external capability represented as an
@@ -1941,10 +1941,24 @@ special syntax.
 
 Goal: represent resource-producing iteration directly.
 
+Current status: `std/stream` now exposes the `ResourceSource[R, E]` type anchor
+and the typechecker rejects embedding it in ordinary records/unions, type
+aliases that hide it inside ordinary carriers, annotated local bindings such as
+`Option[ResourceSource[...]]`, ordinary carrier type ascriptions such as
+`None as Option[ResourceSource[...]]`, ordinary user function
+parameters/returns, and globals. That does not implement iteration yet; it
+makes the ownership category explicit so future TCP/database sources do not
+start as stringly named `Stream` variants.
+
 Work:
 
-- Add explicit `ResourceSource[R, E]`.
+- Add explicit `ResourceSource[R, E]`. Landed as a type anchor.
 - Reject collection and storage of resource sources in ordinary aggregates.
+  Landed for record/union declarations, type aliases, annotated ordinary local
+  bindings, ordinary carrier type ascriptions, function boundaries, globals,
+  list/dict/set/tuple literals, closures, detached tasks, and concurrent task
+  captures. Producer-backed integration tests still need the first real
+  resource-source producer.
 - Support sequential `for` over resource sources.
 - Support concurrent `for ... concurrently` over resource sources by moving
   each resource item into the child task.
@@ -2151,31 +2165,42 @@ Work:
 
 Current implementation facts:
 
-- `std/net/tcp.brp` exposes opaque builtin `TcpListener` and `TcpStream` handles
-  and `Result[..., String]` errors.
+- `std/net/tcp.brp` exposes opaque builtin `TcpListener` and `TcpStream`
+  handles. The original handle operations still use `Result[..., String]` for
+  compatibility, while `TcpError`, `listen_checked`, `accept_checked`,
+  `connect_checked`, `local_port_checked`, `set_timeout_checked`,
+  `set_reuse_addr_checked`, `read_chunk`, and `write_all` now provide typed
+  bridge APIs on top of those handles. The bridge reports wrapper-owned
+  precondition failures as `InvalidInput` and keeps runtime-originated string
+  failures as `Other` until the runtime exposes structured TCP error classes.
 - Core ownership metadata treats `listen`, `accept`, `connect`, `read`,
   `local_port`, `set_timeout`, and `set_reuse_addr` results as owned values;
   close/write/read inputs are borrowed at the call boundary.
 - Numeric socket waits are virtual-thread aware. Hostname resolution is still
   blocking DNS, and the std docs already tell users to prefer numeric hosts when
   OS-worker pinning matters.
-- `write` serializes concurrent writes with an explicit `write_active` guard and
-  returns an error for an overlapping write instead of interleaving bytes.
+- `write` serializes concurrent writes with an explicit write-ownership guard
+  and returns an error for an overlapping write instead of interleaving bytes.
+  That guard is represented in the runtime as a named `TcpWriteState` plus a
+  named begin-write result enum, rather than a raw boolean and magic integer
+  return codes.
 - Close extracts and wakes parked TCP waiters, so cancellation and close paths
   should preserve waiter cleanup as an invariant.
 - Overlapping parked TCP waits are now represented as an explicit runtime wake
   reason and reported as `already in progress` errors for `accept`, `read`,
   `connect`, and `write` paths instead of being collapsed into misleading
-  `closed` errors.
+  `closed` errors. Installing a parked waiter is also represented as a named
+  runtime result (`OK`, `BUSY`, `CLOSED`, `INVALID`) instead of a magic integer,
+  so the single-waiter-slot boundary is explicit at the ownership boundary.
 
-New finding from the first readiness pass: the current runtime has one parked
-waiter slot per TCP handle and operation kind (`accept`, `connect`, `read`,
-`write`). Multiple sibling tasks trying to park on `accept` for the same
-listener are therefore not a stable migration target. The resource-source design
-should prefer one owned accept loop that fans accepted streams into bounded
-concurrent work. If Blorp ever wants multiple concurrent `accept` waiters on one
-listener, the runtime needs explicit waiter lists or the type system needs to
-reject that shape.
+Policy from the readiness pass: the current runtime has one parked waiter slot
+per TCP handle and operation kind (`accept`, `connect`, `read`, `write`).
+Multiple sibling tasks trying to park on `accept` for the same listener are
+therefore not a stable migration target. One owned accept loop should fan
+accepted streams into bounded concurrent work, and one reader plus one writer is
+the intended same-stream concurrency shape. Do not add waiter lists as a local
+runtime tweak unless the resource-level API first defines ownership, ordering,
+and cancellation semantics for multiple same-operation waiters.
 
 Tests:
 
@@ -2201,6 +2226,11 @@ Tests:
   when a later connection or stream read arrives.
 - Cancellation during parked TCP operations unregisters reactor waiters and does
   not keep handles alive.
+- Runtime write ownership has a named state machine. Source-level tests cannot
+  reliably force overlapping writes without depending on platform socket buffer
+  sizes, so write serialization remains covered by the runtime state contract
+  and existing backpressure/timeout/close TCP tests until TCP resources provide
+  a compiler-level transfer model.
 
 Migration impact: current users get a safer compatibility baseline while the
 language gains enough test evidence to make the later resource migration a
@@ -2223,7 +2253,9 @@ resource type TcpListener = builtin("blorp_tcp_close_listener")
 resource type TcpStream = builtin("blorp_tcp_close_stream")
 ```
 
-- Add typed `TcpError`.
+- Promote the existing `TcpError` surface to the full resource API, including
+  `listen`, `accept`, and `connect` returning typed errors instead of legacy
+  strings.
 - Provide `connections(listener) -> ResourceSource[TcpStream, TcpError]`.
 - Keep DNS limitations explicit.
 - Add `split(stream)` only if reader/writer resources can be represented as
@@ -2255,6 +2287,19 @@ a compatibility layer or produce diagnostics pointing to `with` and
 resource-source iteration.
 
 Stop condition: TCP examples are resource-safe without special cases in codegen.
+
+Migration staging note: do not start this phase by simply changing the existing
+`TcpListener` and `TcpStream` declarations to `resource type`. The current
+resource rules intentionally reject ordinary function parameters/returns,
+container storage, closure capture, detached capture, and concurrent task
+capture for resource-containing values. Existing TCP tests, benchmarks, and
+optional networking packages still rely on several of those patterns while TCP
+is handle-based. First land the resource-source ownership shape
+(`connections(listener)` transferring each accepted stream into a structured
+task), migrate call sites away from ordinary stream storage and detached
+accepted-stream handlers, and then flip TCP to resources. The desired endpoint
+is that TCP uses the same general resource restrictions as files, not
+TCP-specific codegen exceptions.
 
 ### Phase 13: Services And Pools
 
@@ -2358,10 +2403,24 @@ high-leverage sequence is:
 5. Continue the TCP-adjacent readiness slice without starting the full resource
    migration. Current guardrails cover a structured accept loop, the legacy
    accepted-stream `detach` shape, and explicit `already in progress` errors for
-   overlapping parked waits. Next, finish ownership/cancellation audit notes and
-   decide whether the current one-waiter-per-operation TCP runtime limitation
-   should remain a documented compatibility limit or become a runtime
-   waiter-list refactor.
+   overlapping parked waits. `TcpError`, `listen_checked`, `accept_checked`,
+   `connect_checked`, `local_port_checked`, `set_timeout_checked`,
+   `set_reuse_addr_checked`, `read_chunk`, and `write_all` have landed as typed
+   compatibility adapters. They type wrapper-owned precondition failures as
+   `InvalidInput` and preserve runtime-originated failures as `Other`; the
+   simple `listen`/`accept`/`connect` names still use legacy string errors until
+   the resource migration. The current one-waiter-per-operation TCP runtime
+   limitation is now a documented compatibility limit rather than an accidental
+   state: future work should revisit it only as part of the resource-level
+   ownership model, not as a standalone waiter-list refactor. The runtime now
+   names both write ownership and waiter-install outcomes, so future work can
+   reason about policy instead of first untangling magic states.
+   The latest migration audit shows that a direct `type` to `resource type`
+   flip would be too broad: current TCP tests, benchmarks, and packages pass
+   handles through ordinary helpers, store streams in ordinary aggregates, and
+   use detached accepted-stream handlers. Keep this as a staged migration:
+   define resource-source ownership first, migrate those call sites to scoped
+   connection ownership, then promote TCP handles to resources.
 
 Each slice should add a failing parser/typecheck/runtime or codegen-audit test
 first, and should update this queue if implementation reveals a simpler or

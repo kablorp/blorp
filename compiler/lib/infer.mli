@@ -45,6 +45,34 @@ val type_contains_one_shot_stream : Env.env -> type_expr -> bool
     current environment. Function values returning streams are producer values,
     not stream cursor state, and are not considered containing streams. *)
 
+val type_contains_one_shot_stream_function_carrier :
+  Env.env -> type_expr -> bool
+(** True when a function type inside this type accepts or returns a one-shot
+    stream hidden in an ordinary carrier, such as [() -> Option[Stream[Int]]].
+    Direct producers such as [() -> Stream[Int]] remain ordinary function
+    values and return [false]. *)
+
+val type_is_one_shot_stream : Env.env -> type_expr -> bool
+(** True when the type is directly a Stream/FallibleStream cursor in the current
+    environment, after alias normalization. *)
+
+val type_contains_resource_source : Env.env -> type_expr -> bool
+(** True when the type is or contains a ResourceSource cursor in the current
+    environment. Function values returning resource sources are producer values,
+    not source cursor state, and are not considered containing sources. *)
+
+val type_contains_resource_source_function_carrier :
+  Env.env -> type_expr -> bool
+(** True when a function type inside this type accepts or returns a
+    ResourceSource hidden in an ordinary carrier, such as
+    [() -> Option[ResourceSource[R, E]]]. Direct producers such as
+    [() -> ResourceSource[R, E]] remain ordinary function values and return
+    [false]. *)
+
+val type_is_resource_source : Env.env -> type_expr -> bool
+(** True when the type is directly a ResourceSource cursor in the current
+    environment, after alias normalization. *)
+
 val inferred_binding_type : is_mutable:bool -> type_expr -> type_expr
 (** Convert an inferred initializer type into the binding type stored for an
     unannotated declaration. Mutable bindings widen singleton integer

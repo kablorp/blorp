@@ -398,6 +398,24 @@ typedef enum {
 } blorp_TcpState;
 
 typedef enum {
+    BLORP_TCP_WRITE_IDLE = 0,
+    BLORP_TCP_WRITE_ACTIVE = 1
+} blorp_TcpWriteState;
+
+typedef enum {
+    BLORP_TCP_BEGIN_WRITE_OK = 0,
+    BLORP_TCP_BEGIN_WRITE_CLOSED = 1,
+    BLORP_TCP_BEGIN_WRITE_BUSY = 2
+} blorp_TcpBeginWriteResult;
+
+typedef enum {
+    BLORP_TCP_INSTALL_WAITER_OK = 0,
+    BLORP_TCP_INSTALL_WAITER_INVALID = 1,
+    BLORP_TCP_INSTALL_WAITER_CLOSED = 2,
+    BLORP_TCP_INSTALL_WAITER_BUSY = 3
+} blorp_TcpInstallWaiterResult;
+
+typedef enum {
     BLORP_IO_WAIT_NONE = 0,
     BLORP_IO_WAIT_ACCEPT = 1,
     BLORP_IO_WAIT_CONNECT = 2,
@@ -459,7 +477,7 @@ typedef struct blorp_TcpInner {
     blorp_IoWaiter* connect_waiter;
     blorp_IoWaiter* read_waiter;
     blorp_IoWaiter* write_waiter;
-    bool write_active;
+    blorp_TcpWriteState write_state;
 } blorp_TcpInner;
 
 struct blorp_TcpListener {
@@ -2425,13 +2443,13 @@ static blorp_IoWaiter** blorp_tcp_inner_waiter_slot(
     }
 }
 
-static int blorp_tcp_inner_install_waiter(
+static blorp_TcpInstallWaiterResult blorp_tcp_inner_install_waiter(
     blorp_TcpInner* inner,
     blorp_IoWaiter* waiter
 ) {
     if (!inner || !waiter || waiter->installed ||
         waiter->wake_reason != BLORP_IO_WAKE_NONE) {
-        return -1;
+        return BLORP_TCP_INSTALL_WAITER_INVALID;
     }
 
     pthread_mutex_lock(&inner->mutex);
@@ -2439,18 +2457,18 @@ static int blorp_tcp_inner_install_waiter(
     if (!slot || inner->state != BLORP_TCP_STATE_OPEN || inner->fd < 0 ||
         waiter->generation != inner->generation) {
         pthread_mutex_unlock(&inner->mutex);
-        return -1;
+        return BLORP_TCP_INSTALL_WAITER_CLOSED;
     }
     if (*slot) {
         pthread_mutex_unlock(&inner->mutex);
-        return -2;
+        return BLORP_TCP_INSTALL_WAITER_BUSY;
     }
     *slot = waiter;
     waiter->installed = true;
     waiter->owner = inner;
     waiter->next = NULL;
     pthread_mutex_unlock(&inner->mutex);
-    return 0;
+    return BLORP_TCP_INSTALL_WAITER_OK;
 }
 
 static int blorp_tcp_inner_remove_waiter(
@@ -2586,6 +2604,7 @@ static blorp_TcpInner* blorp_tcp_inner_new(blorp_TcpHandleKind kind, int fd) {
         atomic_fetch_add_explicit(&blorp_tcp_next_generation, 1, memory_order_relaxed);
     inner->kind = kind;
     inner->state = BLORP_TCP_STATE_OPEN;
+    inner->write_state = BLORP_TCP_WRITE_IDLE;
     inner->default_timeout_ms = -1;
     if (pthread_mutex_init(&inner->mutex, NULL) != 0) {
         close(inner->fd);
@@ -2642,27 +2661,29 @@ static void blorp_tcp_inner_end_op(blorp_TcpInner* inner) {
     if (inner) pthread_mutex_unlock(&inner->mutex);
 }
 
-static int blorp_tcp_inner_begin_write_op(blorp_TcpInner* inner) {
-    if (!inner) return -1;
+static blorp_TcpBeginWriteResult blorp_tcp_inner_begin_write_op(
+    blorp_TcpInner* inner
+) {
+    if (!inner) return BLORP_TCP_BEGIN_WRITE_CLOSED;
     pthread_mutex_lock(&inner->mutex);
     if (inner->state != BLORP_TCP_STATE_OPEN || inner->fd < 0) {
         pthread_mutex_unlock(&inner->mutex);
-        return -1;
+        return BLORP_TCP_BEGIN_WRITE_CLOSED;
     }
-    if (inner->write_active) {
+    if (inner->write_state == BLORP_TCP_WRITE_ACTIVE) {
         pthread_mutex_unlock(&inner->mutex);
-        return -2;
+        return BLORP_TCP_BEGIN_WRITE_BUSY;
     }
-    inner->write_active = true;
+    inner->write_state = BLORP_TCP_WRITE_ACTIVE;
     blorp_tcp_inner_retain(inner);
     pthread_mutex_unlock(&inner->mutex);
-    return 0;
+    return BLORP_TCP_BEGIN_WRITE_OK;
 }
 
 static void blorp_tcp_inner_end_write_op(blorp_TcpInner* inner) {
     if (!inner) return;
     pthread_mutex_lock(&inner->mutex);
-    inner->write_active = false;
+    inner->write_state = BLORP_TCP_WRITE_IDLE;
     pthread_mutex_unlock(&inner->mutex);
     blorp_tcp_inner_release(inner);
 }
@@ -11709,12 +11730,16 @@ blorp_Result* blorp_tcp_write(blorp_TcpStream* stream, blorp_Bytes* data) {
         return blorp_result_ok((void*)0L);
     }
 
-    int begin_write = blorp_tcp_inner_begin_write_op(inner);
-    if (begin_write == -2) {
-        return tcp_handle_error("tcp write: write already in progress");
-    }
-    if (begin_write != 0) {
-        return tcp_handle_error("tcp write: closed stream");
+    blorp_TcpBeginWriteResult begin_write =
+        blorp_tcp_inner_begin_write_op(inner);
+    switch (begin_write) {
+        case BLORP_TCP_BEGIN_WRITE_OK:
+            break;
+        case BLORP_TCP_BEGIN_WRITE_BUSY:
+            return tcp_handle_error("tcp write: write already in progress");
+        case BLORP_TCP_BEGIN_WRITE_CLOSED:
+        default:
+            return tcp_handle_error("tcp write: closed stream");
     }
 
     blorp_TcpWriteOpCleanup write_cleanup = {
@@ -14603,11 +14628,21 @@ static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
     blorp_IoWakeReason result = BLORP_IO_WAKE_NONE;
 
     __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-    int install_result = blorp_tcp_inner_install_waiter(inner, waiter);
-    if (install_result != 0) {
-        __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
-        blorp_io_waiter_release(waiter);
-        return install_result == -2 ? BLORP_IO_WAKE_BUSY : BLORP_IO_WAKE_CLOSED;
+    blorp_TcpInstallWaiterResult install_result =
+        blorp_tcp_inner_install_waiter(inner, waiter);
+    switch (install_result) {
+        case BLORP_TCP_INSTALL_WAITER_OK:
+            break;
+        case BLORP_TCP_INSTALL_WAITER_BUSY:
+            __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+            blorp_io_waiter_release(waiter);
+            return BLORP_IO_WAKE_BUSY;
+        case BLORP_TCP_INSTALL_WAITER_INVALID:
+        case BLORP_TCP_INSTALL_WAITER_CLOSED:
+        default:
+            __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+            blorp_io_waiter_release(waiter);
+            return BLORP_IO_WAKE_CLOSED;
     }
 
     // Readiness can arrive after reactor registration but before this waiter
@@ -19054,6 +19089,12 @@ static inline bool blorp_fallible_stream_pulls_owned_arc(
     return stream && blorp_stream_layout_is_owned_arc(stream->elem_layout);
 }
 
+static inline bool blorp_fallible_stream_has_arc_elements(
+    blorp_FallibleStream* stream
+) {
+    return stream && blorp_stream_layout_is_arc(stream->elem_layout);
+}
+
 void blorp_stream_release_pulled_if_owned(blorp_Stream* stream, void* value) {
     if (blorp_stream_pulls_owned_arc(stream) && value) {
         blorp_release(value);
@@ -19688,6 +19729,25 @@ static blorp_FileFindResult blorp_fallible_stream_find_file_raw_find(
         blorp_fallible_stream_release_pulled_if_owned(stream, val);
     }
     return blorp_file_find_ok(0, NULL);
+}
+
+blorp_FileValueResult blorp_fallible_stream_find_file_raw(
+    blorp_FallibleStream* stream,
+    blorp_Closure* pred
+) {
+    blorp_FileFindResult found =
+        blorp_fallible_stream_find_file_raw_find(stream, pred, true);
+    if (found.error_kind != BLORP_FILE_ERROR_NONE) {
+        return blorp_file_value_error(found.error_kind, found.detail);
+    }
+    if (!found.found) {
+        return blorp_file_value_ok(blorp_option_none());
+    }
+    blorp_Option* opt = blorp_option_some(found.value);
+    if (blorp_fallible_stream_has_arc_elements(stream)) {
+        opt->release_mask = 1UL;
+    }
+    return blorp_file_value_ok(opt);
 }
 
 blorp_FileValueResult blorp_fallible_stream_find_file_raw_nullable(

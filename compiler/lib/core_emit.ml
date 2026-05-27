@@ -3012,7 +3012,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                             "blorp_FileIntResult",
                             `Int )
                     | CKBuiltin
-                        (( "blorp_fallible_stream_find_file_raw_nullable"
+                        (( "blorp_fallible_stream_find_file_raw"
+                         | "blorp_fallible_stream_find_file_raw_nullable"
                          | "blorp_fallible_stream_find_file_raw_int"
                          | "blorp_fallible_stream_find_file_raw_int8"
                          | "blorp_fallible_stream_find_file_raw_int16"

@@ -1239,14 +1239,7 @@ let fallible_stream_find_builtin_for_result_option_layout ~reg ~loc base ty =
       | Core_layout_type.OptionPayloadPrimitiveStack suffix ->
           base ^ "_" ^ suffix
       | Core_layout_type.OptionPayloadNullableManaged -> base ^ "_nullable"
-      | Core_layout_type.OptionPayloadBoxedUnion ->
-          Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
-            ~hint:
-              "Use a concrete nullable-managed or primitive-stack Option \
-               payload for fallible stream find_result, or add a boxed Option \
-               ABI before enabling this payload."
-            "fallible stream find_result cannot return boxed-union Option \
-             payloads yet"
+      | Core_layout_type.OptionPayloadBoxedUnion -> base
       | Core_layout_type.OptionPayloadNoSpecialization ->
           Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
             ~hint:

@@ -978,7 +978,18 @@ let is_one_shot_stream_type_name name =
       || name = "std/stream::Stream"
       || name = "std/stream::FallibleStream"
 
-let type_contains_one_shot_stream env ty =
+let is_resource_source_type_name name =
+  match Types.split_canonical_module_type_name name with
+  | Some (module_path, "ResourceSource") -> module_path = "std/stream"
+  | _ ->
+      name = "ResourceSource"
+      || name = "std_stream__ResourceSource"
+      || name = "std/stream::ResourceSource"
+
+let named_type_components env name args =
+  (* Known source records/unions expose the values they actually store after
+     generic substitution. Opaque builtin containers do not, so callers must
+     inspect their type arguments conservatively. *)
   let apply_named_subst type_params args tys =
     let subst =
       if List.length type_params = List.length args then
@@ -989,37 +1000,46 @@ let type_contains_one_shot_stream env ty =
     in
     List.map (apply_subst subst) tys
   in
-  let named_component_types name args =
-    let record_fields =
-      match Env.get_record env name with
-      | Some (type_params, fields) ->
-          fields
+  let record_fields =
+    match Env.get_record env name with
+    | Some (type_params, fields) ->
+        Some
+          (fields
           |> List.map (fun field -> field.field_type)
-          |> apply_named_subst type_params args
-      | None -> []
-    in
-    let variant_fields =
-      match Env.get_type_decl env name with
-      | Some (type_params, variants) ->
-          variants
-          |> List.concat_map (fun variant -> variant.variant_fields)
-          |> apply_named_subst type_params args
-      | None -> []
-    in
-    record_fields @ variant_fields
+          |> apply_named_subst type_params args)
+    | None -> None
   in
+  let variant_fields =
+    match (Env.get_type_kind env name, Env.get_type_decl env name) with
+    | ( (Some Env.TypeUnion | Some Env.TypeEnum | None),
+        Some (type_params, variants) ) ->
+        Some
+          (variants
+          |> List.concat_map (fun variant -> variant.variant_fields)
+          |> apply_named_subst type_params args)
+    | (Some Env.TypeBuiltin | Some Env.TypeResource), Some _ | _, None -> None
+  in
+  match (record_fields, variant_fields) with
+  | None, None -> None
+  | _ ->
+      Some
+        (Option.value record_fields ~default:[]
+        @ Option.value variant_fields ~default:[])
+
+let type_contains_named_type env is_target ty =
   let rec go visited ty =
     let ty =
       normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
     in
     match ty with
-    | TyNamed (name, args) ->
-        is_one_shot_stream_type_name name
-        || List.exists (go visited) args
+    | TyNamed (name, args) -> (
+        is_target name
         ||
         if List.mem name visited then false
         else
-          named_component_types name args |> List.exists (go (name :: visited))
+          match named_type_components env name args with
+          | Some components -> List.exists (go (name :: visited)) components
+          | None -> List.exists (go visited) args)
     | TyTuple elems -> List.exists (go visited) elems
     | TyFunc _ ->
         (* Function values do not themselves contain stream cursor state.
@@ -1033,12 +1053,87 @@ let type_contains_one_shot_stream env ty =
   in
   go [] ty
 
+let type_contains_one_shot_stream env ty =
+  type_contains_named_type env is_one_shot_stream_type_name ty
+
+let type_contains_resource_source env ty =
+  type_contains_named_type env is_resource_source_type_name ty
+
+let type_is_named_target env is_target ty =
+  match
+    normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
+  with
+  | TyNamed (name, _) -> is_target name
+  | _ -> false
+
+let type_is_one_shot_stream env ty =
+  type_is_named_target env is_one_shot_stream_type_name ty
+
+let type_is_resource_source env ty =
+  type_is_named_target env is_resource_source_type_name ty
+
+let type_contains_named_type_function_carrier env is_target ty =
+  let normalize ty =
+    normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
+  in
+  let endpoint_hides_target_carrier ty =
+    type_contains_named_type env is_target ty
+    && not (type_is_named_target env is_target ty)
+  in
+  let rec contains_function_carrier visited ty =
+    match normalize ty with
+    | TyFunc { params; return; _ } ->
+        List.exists (endpoint_has_forbidden_shape visited) params
+        || endpoint_has_forbidden_shape visited return
+    | TyNamed (name, args) -> (
+        (not (is_target name))
+        &&
+        if List.mem name visited then false
+        else
+          match named_type_components env name args with
+          | Some components ->
+              List.exists
+                (contains_function_carrier (name :: visited))
+                components
+          | None -> List.exists (contains_function_carrier visited) args)
+    | TyTuple elems -> List.exists (contains_function_carrier visited) elems
+    | TyRange inner -> contains_function_carrier visited inner
+    | TyArray (elem, dims) ->
+        contains_function_carrier visited elem
+        || List.exists (contains_function_carrier visited) dims
+    | TyDimOp (_, left, right) ->
+        contains_function_carrier visited left
+        || contains_function_carrier visited right
+    | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _ ->
+        false
+  and endpoint_has_forbidden_shape visited ty =
+    match normalize ty with
+    | TyFunc _ -> contains_function_carrier visited ty
+    | _ ->
+        endpoint_hides_target_carrier ty || contains_function_carrier visited ty
+  in
+  contains_function_carrier [] ty
+
+let type_contains_one_shot_stream_function_carrier env ty =
+  type_contains_named_type_function_carrier env is_one_shot_stream_type_name ty
+
+let type_contains_resource_source_function_carrier env ty =
+  type_contains_named_type_function_carrier env is_resource_source_type_name ty
+
 let one_shot_stream_refs env refs =
   refs
   |> List.filter (fun name ->
       match Env.lookup env name with
       | Some { kind = Env.VarSymbol { var_type; _ }; _ } ->
           type_contains_one_shot_stream env var_type
+      | Some _ | None -> false)
+
+let resource_source_refs env refs =
+  refs
+  |> List.filter (fun name ->
+      match Env.lookup env name with
+      | Some { kind = Env.VarSymbol { var_type; _ }; _ } ->
+          type_contains_resource_source env var_type
       | Some _ | None -> false)
 
 let mutable_capture_refs env refs =
@@ -1050,6 +1145,9 @@ let mutable_capture_refs env refs =
 
 let one_shot_stream_capture_refs env expr =
   expr |> collect_free_var_refs |> one_shot_stream_refs env
+
+let resource_source_capture_refs env expr =
+  expr |> collect_free_var_refs |> resource_source_refs env
 
 let expression_derives_from_scoped_resource env expr =
   scoped_resource_related_refs env expr <> []
@@ -1139,6 +1237,190 @@ let reject_one_shot_stream_storage env loc container ty =
          container (type_to_string ty))
   else Ok ()
 
+let reject_one_shot_stream_ordinary_carrier_type env loc carrier ty =
+  if type_contains_one_shot_stream_function_carrier env ty then
+    error_with
+      ~notes:
+        [
+          "Direct stream producer functions such as () -> Stream[T] or () -> \
+           FallibleStream[T, E] are ordinary values, but functions that accept \
+           or return carriers like Option[Stream[T]] or \
+           Option[FallibleStream[T, E]] would reintroduce copyable stream \
+           cursor state.";
+        ]
+      ~help:
+        (Some
+           "Keep stream-producing function types direct, or return ordinary \
+            data collected from the stream.")
+      loc
+      (Printf.sprintf
+         "function type cannot accept or return a one-shot stream carrier \
+          (found %s)"
+         (type_to_string ty))
+  else if
+    type_contains_one_shot_stream env ty && not (type_is_one_shot_stream env ty)
+  then
+    error_with
+      ~notes:
+        [
+          "Streams are one-shot cursors with mutable pull state. Hiding one \
+           inside an ordinary value container would make that cursor state \
+           copyable.";
+        ]
+      ~help:
+        (Some
+           "Keep streams in direct local bindings and consume them with stream \
+            operations, or collect ordinary data before storing it.")
+      loc
+      (Printf.sprintf
+         "one-shot stream value cannot be stored in an ordinary %s (found %s)"
+         carrier (type_to_string ty))
+  else Ok ()
+
+let reject_one_shot_stream_ordinary_binding env loc binding_name ty =
+  if type_contains_one_shot_stream_function_carrier env ty then
+    error_with
+      ~notes:
+        [
+          "Direct stream producer functions such as () -> Stream[T] or () -> \
+           FallibleStream[T, E] are ordinary values, but functions that accept \
+           or return carriers like Option[Stream[T]] or \
+           Option[FallibleStream[T, E]] would reintroduce copyable stream \
+           cursor state.";
+        ]
+      ~help:
+        (Some
+           "Keep stream-producing function types direct, or return ordinary \
+            data collected from the stream.")
+      loc
+      (Printf.sprintf
+         "function value%s cannot accept or return a one-shot stream carrier"
+         (match binding_name with
+         | None | Some "_" -> ""
+         | Some n -> " '" ^ n ^ "'"))
+  else if
+    type_contains_one_shot_stream env ty && not (type_is_one_shot_stream env ty)
+  then
+    error_with
+      ~notes:
+        [
+          "Streams are one-shot cursors with mutable pull state. Hiding one \
+           inside an ordinary value container would make that cursor state \
+           copyable.";
+        ]
+      ~help:
+        (Some
+           "Keep streams in direct local bindings and consume them with stream \
+            operations, or store ordinary data derived from the stream.")
+      loc
+      (Printf.sprintf
+         "one-shot stream value%s cannot be bound to an ordinary variable"
+         (match binding_name with
+         | None | Some "_" -> ""
+         | Some n -> " '" ^ n ^ "'"))
+  else Ok ()
+
+let reject_resource_source_storage env loc container ty =
+  if type_contains_resource_source env ty then
+    error_with
+      ~notes:
+        [
+          "Resource sources produce owned resources one at a time. Storing one \
+           in an ordinary aggregate would hide source state and resource \
+           transfer ownership inside a copyable value.";
+        ]
+      ~help:
+        (Some
+           "Consume resource sources directly with resource-source iteration, \
+            or store ordinary data derived from the produced resources.")
+      loc
+      (Printf.sprintf "resource source values cannot be stored in %s (found %s)"
+         container (type_to_string ty))
+  else Ok ()
+
+let reject_resource_source_ordinary_carrier_type env loc carrier ty =
+  if type_contains_resource_source_function_carrier env ty then
+    error_with
+      ~notes:
+        [
+          "Direct resource-source producer functions such as () -> \
+           ResourceSource[R, E] are ordinary values, but functions that accept \
+           or return carriers like Option[ResourceSource[R, E]] would \
+           reintroduce copyable source cursor state.";
+        ]
+      ~help:
+        (Some
+           "Keep resource-source-producing function types direct, or return \
+            ordinary data produced from the source.")
+      loc
+      (Printf.sprintf
+         "function type cannot accept or return a resource source carrier \
+          (found %s)"
+         (type_to_string ty))
+  else if
+    type_contains_resource_source env ty && not (type_is_resource_source env ty)
+  then
+    error_with
+      ~notes:
+        [
+          "Resource sources are one-shot cursors that will transfer owned \
+           resources to the consumer. Hiding one inside an ordinary value \
+           container would make that transfer state copyable.";
+        ]
+      ~help:
+        (Some
+           "Keep the source as a direct local binding and consume it with \
+            resource-source iteration, or store ordinary data derived from \
+            produced resources.")
+      loc
+      (Printf.sprintf
+         "resource source value cannot be stored in an ordinary %s (found %s)"
+         carrier (type_to_string ty))
+  else Ok ()
+
+let reject_resource_source_ordinary_binding env loc binding_name ty =
+  if type_contains_resource_source_function_carrier env ty then
+    error_with
+      ~notes:
+        [
+          "Direct resource-source producer functions such as () -> \
+           ResourceSource[R, E] are ordinary values, but functions that accept \
+           or return carriers like Option[ResourceSource[R, E]] would \
+           reintroduce copyable source cursor state.";
+        ]
+      ~help:
+        (Some
+           "Keep resource-source-producing function types direct, or return \
+            ordinary data produced from the source.")
+      loc
+      (Printf.sprintf
+         "function value%s cannot accept or return a resource source carrier"
+         (match binding_name with
+         | None | Some "_" -> ""
+         | Some n -> " '" ^ n ^ "'"))
+  else if
+    type_contains_resource_source env ty && not (type_is_resource_source env ty)
+  then
+    error_with
+      ~notes:
+        [
+          "Resource sources are one-shot cursors that will transfer owned \
+           resources to the consumer. Hiding one inside an ordinary value \
+           container would make that transfer state copyable.";
+        ]
+      ~help:
+        (Some
+           "Keep the source as a direct local binding and consume it with \
+            resource-source iteration, or store ordinary data derived from \
+            produced resources.")
+      loc
+      (Printf.sprintf
+         "resource source value%s cannot be bound to an ordinary variable"
+         (match binding_name with
+         | None | Some "_" -> ""
+         | Some n -> " '" ^ n ^ "'"))
+  else Ok ()
+
 let reject_scoped_resource_task_capture env loc expr =
   let scoped_captures =
     expr |> collect_free_var_refs
@@ -1149,8 +1431,11 @@ let reject_scoped_resource_task_capture env loc expr =
     |> List.filter (Env.is_scoped_resource_derived_var env)
   in
   let stream_captures = one_shot_stream_capture_refs env expr in
-  match (scoped_captures, derived_captures, stream_captures) with
-  | [], [], [] -> Ok ()
+  let source_captures = resource_source_capture_refs env expr in
+  match
+    (scoped_captures, derived_captures, stream_captures, source_captures)
+  with
+  | [], [], [], [] -> Ok ()
   | _ ->
       let label, vars, notes, help =
         if scoped_captures <> [] then
@@ -1174,7 +1459,7 @@ let reject_scoped_resource_task_capture env loc expr =
             "Consume dependent streams, cursors, and borrowed values inside \
              the with block, or derive ordinary data before starting \
              concurrent work." )
-        else
+        else if stream_captures <> [] then
           ( "one-shot stream value",
             stream_captures,
             [
@@ -1184,6 +1469,16 @@ let reject_scoped_resource_task_capture env loc expr =
             ],
             "Create and consume the stream inside the task, or collect \
              ordinary data before starting concurrent work." )
+        else
+          ( "resource source value",
+            source_captures,
+            [
+              "Resource sources produce owned resources. Concurrent tasks need \
+               an explicit move contract before source ownership can cross \
+               task boundaries.";
+            ],
+            "Consume resource sources with resource-source iteration, or start \
+             concurrent work from ordinary values derived from the source." )
       in
       error_with ~notes ~help:(Some help) loc
         (Printf.sprintf "concurrent task cannot capture %s%s: %s" label
@@ -1233,6 +1528,7 @@ let type_contains_resource ctx ty =
   let rec go visited ty =
     let ty = normalize_type ctx ResourceBinding ty |> Types.head_resolve in
     match ty with
+    | TyNamed (name, _) when is_resource_source_type_name name -> false
     | TyNamed (name, args) ->
         is_resource_type ctx ty
         || List.exists (go visited) args
@@ -1243,6 +1539,25 @@ let type_contains_resource ctx ty =
     | TyTuple elems -> List.exists (go visited) elems
     | TyFunc { params; return; _ } ->
         List.exists (go visited) params || go visited return
+    | TyRange inner -> go visited inner
+    | TyArray (elem, dims) -> go visited elem || List.exists (go visited) dims
+    | TyDimOp (_, left, right) -> go visited left || go visited right
+    | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _ ->
+        false
+  in
+  go [] ty
+
+let type_contains_resource_function_endpoint ctx ty =
+  let rec go visited ty =
+    let ty = normalize_type ctx ResourceBinding ty |> Types.head_resolve in
+    match ty with
+    | TyFunc { params; return; _ } ->
+        List.exists (type_contains_resource ctx) params
+        || type_contains_resource ctx return
+    | TyNamed (name, args) ->
+        if List.mem name visited then false
+        else List.exists (go (name :: visited)) args
+    | TyTuple elems -> List.exists (go visited) elems
     | TyRange inner -> go visited inner
     | TyArray (elem, dims) -> go visited elem || List.exists (go visited) dims
     | TyDimOp (_, left, right) -> go visited left || go visited right
@@ -1309,7 +1624,24 @@ let reject_with_body_resource_escape ctx loc ty expr =
     | None -> Ok ()
 
 let reject_ordinary_resource_binding ctx loc binding_name ty =
-  if type_contains_resource ctx ty then
+  if type_contains_resource_function_endpoint ctx ty then
+    error_with
+      ~notes:
+        [
+          "Function values are ordinary copyable values. If a function value \
+           accepted or returned a resource, copying the function would also \
+           copy access to cleanup-owned capabilities.";
+        ]
+      ~help:
+        (Some
+           "Keep resource acquisition and use inside a `with` block, and make \
+            helper functions accept or return ordinary data.")
+      loc
+      (Printf.sprintf "function value%s cannot accept or return resource values"
+         (match binding_name with
+         | None | Some "_" -> ""
+         | Some n -> " '" ^ n ^ "'"))
+  else if type_contains_resource ctx ty then
     error_with
       ~notes:
         [
@@ -1322,6 +1654,26 @@ let reject_ordinary_resource_binding ctx loc binding_name ty =
             data derived from it.")
       loc
       (Printf.sprintf "resource value%s cannot be bound to an ordinary variable"
+         (match binding_name with
+         | None | Some "_" -> ""
+         | Some n -> " '" ^ n ^ "'"))
+  else Ok ()
+
+let reject_question_bind_resource_binding ctx loc binding_name ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "A direct `?=` statement creates an ordinary local binding for the \
+           success value. Resource acquisition needs a cleanup scope before \
+           the handle can be observed.";
+        ]
+      ~help:
+        (Some
+           "Use `with name ?= expression:` for fallible resource acquisition, \
+            then return ordinary data from inside the with block.")
+      loc
+      (Printf.sprintf "resource value%s cannot be bound with direct ?="
          (match binding_name with
          | None | Some "_" -> ""
          | Some n -> " '" ^ n ^ "'"))
@@ -1572,19 +1924,38 @@ let reject_ordinary_resource_call_arg ctx loc callee_name resolved_overload
     let callee_hint =
       match callee_name with Some name -> " '" ^ name ^ "'" | None -> ""
     in
-    error_with
-      ~notes:
-        [
-          "Ordinary function parameters copy values. Resource values need an \
-           explicit borrow or compiler-owned resource operation.";
-        ]
-      ~help:
-        (Some
-           "Keep resource use inside the with block and pass ordinary data to \
-            user-defined functions.")
-      loc
-      (Printf.sprintf
-         "scoped resource value cannot be passed to ordinary call%s" callee_hint)
+    if List.exists (type_contains_resource_function_endpoint ctx) arg_types then
+      error_with
+        ~notes:
+          [
+            "Ordinary function parameters copy values. A function value whose \
+             endpoint accepts or returns resources would copy access to \
+             cleanup-owned capabilities.";
+          ]
+        ~help:
+          (Some
+             "Keep resource acquisition and use inside a `with` block, and \
+              pass ordinary data to user-defined functions.")
+        loc
+        (Printf.sprintf
+           "function value with resource endpoint cannot be passed to ordinary \
+            call%s"
+           callee_hint)
+    else
+      error_with
+        ~notes:
+          [
+            "Ordinary function parameters copy values. Resource values need an \
+             explicit borrow or compiler-owned resource operation.";
+          ]
+        ~help:
+          (Some
+             "Keep resource use inside the with block and pass ordinary data \
+              to user-defined functions.")
+        loc
+        (Printf.sprintf
+           "scoped resource value cannot be passed to ordinary call%s"
+           callee_hint)
 
 let is_direct_scoped_resource_arg env expr =
   match expr.expr_desc with
@@ -1727,6 +2098,23 @@ let reject_discarded_resource_value ctx loc ty =
       loc "resource-containing value cannot be discarded"
   else Ok ()
 
+let reject_resource_match_scrutinee ctx loc ty =
+  if type_contains_resource ctx ty then
+    error_with
+      ~notes:
+        [
+          "Pattern matching consumes the scrutinee as an ordinary value. A \
+           resource acquisition result must instead install a compiler-owned \
+           cleanup edge before its resource payload can be observed.";
+        ]
+      ~help:
+        (Some
+           "Use `with name ?= expression:` for fallible resource acquisition, \
+            or match on ordinary data produced inside the with block.")
+      loc
+      "resource-containing value cannot be matched outside a with acquisition"
+  else Ok ()
+
 let is_pure_call_expr expr =
   match expr.expr_desc with
   | ECall (callee, _) -> (
@@ -1808,6 +2196,18 @@ let validate_question_bind ctx stmt name ty_ann inner_ty rhs' =
     | None -> Ok ()
   in
   let bind_ty = match ty_ann with Some t -> t | None -> inner_ty in
+  let binding_name = if name = "_" then None else Some name in
+  let* () =
+    reject_question_bind_resource_binding ctx stmt.expr_loc binding_name bind_ty
+  in
+  let* () =
+    reject_one_shot_stream_ordinary_binding ctx.env stmt.expr_loc binding_name
+      bind_ty
+  in
+  let* () =
+    reject_resource_source_ordinary_binding ctx.env stmt.expr_loc binding_name
+      bind_ty
+  in
   let env' =
     Env.add_var ctx.env name bind_ty
       ~origin:(binding_origin_for_value ctx.env rhs')
@@ -2861,11 +3261,16 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
           free_vars
       in
       let stream_captures = one_shot_stream_refs env free_vars in
+      let source_captures = resource_source_refs env free_vars in
       match
-        (resource_captures, derived_captures, stream_captures, mutable_captures)
+        ( resource_captures,
+          derived_captures,
+          stream_captures,
+          source_captures,
+          mutable_captures )
       with
-      | [], [], [], [] -> None
-      | [], [], [], vars ->
+      | [], [], [], [], [] -> None
+      | [], [], [], [], vars ->
           Some
             {
               message =
@@ -2880,7 +3285,7 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
               notes = [];
               help = None;
             }
-      | (_ :: _ as vars), _, _, _ ->
+      | (_ :: _ as vars), _, _, _, _ ->
           Some
             {
               message =
@@ -2895,7 +3300,7 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
               notes = [];
               help = None;
             }
-      | [], (_ :: _ as vars), _, _ ->
+      | [], (_ :: _ as vars), _, _, _ ->
           Some
             {
               message =
@@ -2911,7 +3316,7 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
               notes = [];
               help = None;
             }
-      | [], [], vars, _ ->
+      | [], [], (_ :: _ as vars), _, _ ->
           Some
             {
               message =
@@ -2919,6 +3324,21 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
                   "Closure cannot capture one-shot stream value%s: %s. Create \
                    and consume the stream inside the closure, or collect \
                    ordinary data before creating the closure."
+                  (if List.length vars > 1 then "s" else "")
+                  (String.concat ", " vars);
+              loc;
+              phase = TypeCheck;
+              kind = OtherError;
+              notes = [];
+              help = None;
+            }
+      | [], [], [], vars, _ ->
+          Some
+            {
+              message =
+                Printf.sprintf
+                  "Closure cannot capture resource source value%s: %s. Consume \
+                   the source with resource-source iteration instead."
                   (if List.length vars > 1 then "s" else "")
                   (String.concat ", " vars);
               loc;
@@ -4185,6 +4605,14 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         | None -> inferred_ty
       in
       if ctx_types_compatible ctx ascribed_ty value_ty then
+        let* () =
+          reject_one_shot_stream_ordinary_carrier_type ctx.env loc
+            "ascribed type" ascribed_ty
+        in
+        let* () =
+          reject_resource_source_ordinary_carrier_type ctx.env loc
+            "ascribed type" ascribed_ty
+        in
         let ascribed_expr =
           with_inferred_type
             { expr with expr_desc = EAscription (inner', source_ty) }
@@ -4242,6 +4670,10 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             let* () = reject_resource_tuple_element ctx e.expr_loc e_ty in
             let* () =
               reject_one_shot_stream_storage ctx.env e.expr_loc "tuple literals"
+                e_ty
+            in
+            let* () =
+              reject_resource_source_storage ctx.env e.expr_loc "tuple literals"
                 e_ty
             in
             let* () =
@@ -5261,6 +5693,14 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           let* () =
             reject_ordinary_resource_binding ctx loc (Some var) val_ty
           in
+          let* () =
+            reject_one_shot_stream_ordinary_binding ctx.env loc (Some var)
+              val_ty
+          in
+          let* () =
+            reject_resource_source_ordinary_binding ctx.env loc (Some var)
+              val_ty
+          in
           let new_expr =
             with_inferred_type
               {
@@ -5378,6 +5818,16 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           (if name = "_" then None else Some name)
           val_ty
       in
+      let* () =
+        reject_one_shot_stream_ordinary_binding ctx.env loc
+          (if name = "_" then None else Some name)
+          val_ty
+      in
+      let* () =
+        reject_resource_source_ordinary_binding ctx.env loc
+          (if name = "_" then None else Some name)
+          val_ty
+      in
       match ty_opt with
       | Some declared_ty ->
           (* Check that inferred type matches declared type *)
@@ -5480,6 +5930,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       in
       let* val_ty, value' = infer_unconstrained_value_expr ctx value in
       let* () = reject_ordinary_resource_binding ctx loc None val_ty in
+      let* () =
+        reject_one_shot_stream_ordinary_binding ctx.env loc None val_ty
+      in
+      let* () =
+        reject_resource_source_ordinary_binding ctx.env loc None val_ty
+      in
       (* Value must be a tuple type *)
       match val_ty with
       | TyTuple elem_tys when List.length elem_tys = List.length names ->
@@ -5904,9 +6360,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             Env.is_scoped_resource_derived_var ctx.env name)
       in
       let stream_captures = one_shot_stream_capture_refs ctx.env body' in
+      let source_captures = resource_source_capture_refs ctx.env body' in
       let* () =
-        match (scoped_captures, derived_captures, stream_captures) with
-        | [], [], [] -> Ok ()
+        match
+          (scoped_captures, derived_captures, stream_captures, source_captures)
+        with
+        | [], [], [], [] -> Ok ()
         | _ ->
             let label, vars, notes, help =
               if scoped_captures <> [] then
@@ -5928,7 +6387,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                   "Consume dependent streams, cursors, and borrowed values \
                    inside the with block, or derive ordinary data before \
                    detaching work." )
-              else
+              else if stream_captures <> [] then
                 ( "one-shot stream value",
                   stream_captures,
                   [
@@ -5938,6 +6397,16 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                   ],
                   "Create and consume the stream inside the detached work, or \
                    collect ordinary data before detaching work." )
+              else
+                ( "resource source value",
+                  source_captures,
+                  [
+                    "Resource sources produce owned resources. Detached work \
+                     needs an explicit move contract before source ownership \
+                     can cross that boundary.";
+                  ],
+                  "Consume resource sources with resource-source iteration, or \
+                   detach ordinary values derived from the source." )
             in
             error_with ~notes ~help:(Some help) loc
               (Printf.sprintf "detach cannot capture %s%s: %s" label
@@ -6512,6 +6981,11 @@ and infer_checked_collection_element ctx kind ~target_ty ~mismatch_label
   let* () = reject_resource_collection_element ctx expr.expr_loc kind elem_ty in
   let* () =
     reject_one_shot_stream_storage ctx.env expr.expr_loc
+      (collection_kind_user_name kind)
+      elem_ty
+  in
+  let* () =
+    reject_resource_source_storage ctx.env expr.expr_loc
       (collection_kind_user_name kind)
       elem_ty
   in
@@ -9275,6 +9749,9 @@ and infer_match ctx expr scrutinee cases loc =
   let* () =
     reject_void_value ~context:"match scrutinee" scrutinee.expr_loc scrutinee_ty
   in
+  let* () =
+    reject_resource_match_scrutinee ctx scrutinee.expr_loc scrutinee_ty
+  in
   if cases = [] then error loc "Match expression has no cases"
   else begin
     let* first_ty, cases' = infer_match_cases ctx scrutinee_ty cases in
@@ -9799,6 +10276,12 @@ and infer_list ctx expr elements loc =
   if elements = [] then
     match expected_elem_ty with
     | Some elem_ty ->
+        let* () =
+          reject_one_shot_stream_storage ctx.env loc "List literals" elem_ty
+        in
+        let* () =
+          reject_resource_source_storage ctx.env loc "List literals" elem_ty
+        in
         let list_ty = ty_list elem_ty in
         Ok (list_ty, with_inferred_type expr list_ty)
     | None ->
@@ -9948,6 +10431,10 @@ and infer_record_fields ctx field_types fields =
           actual_ty
       in
       let* () =
+        reject_resource_source_storage ctx.env value.expr_loc "record fields"
+          actual_ty
+      in
+      let* () =
         reject_scoped_resource_derived_storage ctx.env value.expr_loc
           "record fields" value'
       in
@@ -9981,6 +10468,10 @@ and infer_record_update ctx expr base fields loc =
   let* base_ty, base' = infer_unconstrained_value_expr ctx base in
   let* () =
     reject_one_shot_stream_storage ctx.env base.expr_loc "record updates"
+      base_ty
+  in
+  let* () =
+    reject_resource_source_storage ctx.env base.expr_loc "record updates"
       base_ty
   in
   let* () =
@@ -10019,6 +10510,10 @@ and infer_record_update ctx expr base fields loc =
                 in
                 let* () =
                   reject_one_shot_stream_storage ctx.env value.expr_loc
+                    "record fields" actual_ty
+                in
+                let* () =
+                  reject_resource_source_storage ctx.env value.expr_loc
                     "record fields" actual_ty
                 in
                 let* () =
