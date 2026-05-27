@@ -669,7 +669,8 @@ let test_stream_from_lines_uses_validated_path_buffer () =
 
 let parse_std_int_record_field line =
   match String.split_on_char ':' (String.trim line) with
-  | [ name; ty ] when String.trim ty = "Int," -> Some (String.trim name)
+  | [ name; ty ] when List.mem (String.trim ty) [ "Int"; "Int," ] ->
+      Some (String.trim name)
   | _ -> None
 
 let scheduler_stats_std_fields () =
