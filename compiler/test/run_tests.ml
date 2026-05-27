@@ -21,6 +21,27 @@ let () =
         (fun (name, cases) -> ("LspDiagnostics." ^ name, cases))
         Test_lsp_diagnostics.suite
     @ List.map
+        (fun (name, cases) -> ("LspJson." ^ name, cases))
+        Test_lsp_json.suite
+    @ List.map
+        (fun (name, cases) -> ("LspProtocol." ^ name, cases))
+        Test_lsp_protocol.suite
+    @ List.map
+        (fun (name, cases) -> ("LspRpc." ^ name, cases))
+        Test_lsp_rpc.suite
+    @ List.map
+        (fun (name, cases) -> ("LspState." ^ name, cases))
+        Test_lsp_state.suite
+    @ List.map
+        (fun (name, cases) -> ("LspServer." ^ name, cases))
+        Test_lsp_server.suite
+    @ List.map
+        (fun (name, cases) -> ("LspSymbols." ^ name, cases))
+        Test_lsp_symbols.suite
+    @ List.map
+        (fun (name, cases) -> ("Diagnostics." ^ name, cases))
+        Test_diagnostics.suite
+    @ List.map
         (fun (name, cases) -> ("LspSignature." ^ name, cases))
         Test_lsp_signature.suite
     @ List.map
@@ -29,6 +50,9 @@ let () =
     @ List.map
         (fun (name, cases) -> ("LspDefinition." ^ name, cases))
         Test_lsp_definition.suite
+    @ List.map
+        (fun (name, cases) -> ("LspPosition." ^ name, cases))
+        Test_lsp_position.suite
     @ List.map
         (fun (name, cases) -> ("TypeMetadataFormat." ^ name, cases))
         Test_type_metadata_format.suite
@@ -57,6 +81,9 @@ let () =
     @ List.map
         (fun (name, cases) -> ("FmtExprJson." ^ name, cases))
         Test_fmt_expr_doc.suite
+    @ List.map
+        (fun (name, cases) -> ("FmtComment." ^ name, cases))
+        Test_fmt_comment.suite
     @ List.map
         (fun (name, cases) -> ("FmtDeclDoc." ^ name, cases))
         Test_fmt_decl_doc.suite

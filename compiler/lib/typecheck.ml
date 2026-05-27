@@ -246,10 +246,6 @@ let register_resource_cleanup_metadata (decl : type_decl) : unit =
          ~type_name:decl.type_name)
       decl.type_resource_cleanup
 
-let type_is_env_resource env ty =
-  type_is_resource_name ty ~is_resource_name:(fun name ->
-      Env.get_type_kind env name = Some TypeResource)
-
 let type_is_scoped_dependency_carrier ty =
   match Types.head_resolve ty with
   | TyNamed (name, _) -> (
@@ -5170,17 +5166,6 @@ let typecheck_with_state_and_source ?module_origin ?(module_name = "")
   let state, typed_program = second_pass state program in
   (state, source_program, typed_program)
 
-(** Typecheck a main program and keep the final [check_state] so callers can
-    reuse resolved import metadata downstream. *)
-let typecheck_with_state ?module_origin ?(module_name = "")
-    ?(allow_debug_only_calls = false) (program : program) :
-    check_state * program =
-  let state, _source_program, typed_program =
-    typecheck_with_state_and_source ?module_origin ~module_name
-      ~allow_debug_only_calls program
-  in
-  (state, typed_program)
-
 let typed_ast_error_to_compiler_error (err : Typed_ast.error) : compiler_error =
   let loc, message =
     match err with
@@ -5307,12 +5292,6 @@ let typecheck ?module_origin ?(module_name = "")
   in
   (typed_program, errors)
 
-(** Type check a module's declarations, given an env pre-populated with
-    imported module signatures (types, functions, records, aliases, impls).
-    Returns typed AST and any errors. [module_origin] defaults to user-module
-    policy so project modules never receive stdlib-only [builtin] privileges by
-    omission. *)
-
 (** Check that public functions don't expose private types in their signatures. *)
 let check_private_type_leakage (state : check_state) (decls : program) :
     check_state =
@@ -5417,15 +5396,6 @@ let typecheck_module_with_state_and_source ?module_origin ?(module_name = "")
   let state = check_private_type_leakage state decls in
   (state, source_decls, typed_decls)
 
-let typecheck_module_with_state ?module_origin ?(module_name = "")
-    ?(allow_debug_only_calls = false) (env : env) (decls : program) :
-    check_state * program =
-  let state, _source_decls, typed_decls =
-    typecheck_module_with_state_and_source ?module_origin ~module_name
-      ~allow_debug_only_calls env decls
-  in
-  (state, typed_decls)
-
 let typecheck_module_with_state_typed ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (env : env) (decls : program) :
     (check_state * Typed_ast.program, check_state * compiler_error list) result
@@ -5443,12 +5413,3 @@ let typecheck_module_with_state_typed ?module_origin ?(module_name = "")
       with
       | Ok typed -> Ok (state, typed)
       | Error errors -> Error (state, errors))
-
-let typecheck_module ?module_origin ?(module_name = "")
-    ?(allow_debug_only_calls = false) (env : env) (decls : program) :
-    program * compiler_error list =
-  let state, typed_decls =
-    typecheck_module_with_state ?module_origin ~module_name
-      ~allow_debug_only_calls env decls
-  in
-  (typed_decls, List.rev state.errors)

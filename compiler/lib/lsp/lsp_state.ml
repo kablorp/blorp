@@ -31,6 +31,28 @@ type state = {
 let create () : state = { documents = Hashtbl.create 16; initialized = false }
 let find_document state uri = Hashtbl.find_opt state.documents uri
 
+let clear_analysis_state doc =
+  doc.parse_errors <- [];
+  doc.program <- None;
+  doc.typed_program <- None;
+  doc.env <- None;
+  doc.module_aliases <- []
+
+let module_aliases_of_program (program : program) =
+  (* Qualified imports always expose a module name/alias. Selective imports
+     expose a qualifier only when the import has an explicit alias, as in
+     `option as O: Option`. *)
+  List.filter_map
+    (fun (d : decl) ->
+      match d.decl_desc with
+      | DImport { import_module; import_symbols; import_alias; _ } -> (
+          match (import_alias, import_symbols) with
+          | Some alias, _ -> Some (alias, import_module)
+          | None, None -> Some (Filename.basename import_module, import_module)
+          | None, Some _ -> None)
+      | _ -> None)
+    program
+
 (* ============================================================================
    Analysis pipeline — reuses the existing compiler pipeline
    ============================================================================ *)
@@ -58,15 +80,14 @@ let analyze (_state : state) (doc : document) : unit =
 
   match parse_result with
   | Error errs ->
+      clear_analysis_state doc;
       doc.diagnostics <- errs;
-      doc.parse_errors <- List.map (fun e -> e.message) errs;
-      doc.program <- None;
-      doc.typed_program <- None;
-      doc.env <- None
+      doc.parse_errors <- List.map (fun e -> e.message) errs
   | Ok program ->
       doc.parse_errors <- [];
       doc.program <- Some program;
       doc.typed_program <- None;
+      doc.module_aliases <- [];
 
       (* Phase 2: Load modules *)
       init_module_paths base_dir;
@@ -88,24 +109,7 @@ let analyze (_state : state) (doc : document) : unit =
       in
       doc.env <- Some env;
       doc.diagnostics <- module_errors @ type_errors;
-
-      (* Extract module aliases for completion. Qualified imports always expose
-         a module name/alias. Selective imports expose a qualifier only when
-         the import has an explicit alias, as in `option as O: Option`. *)
-      let aliases =
-        List.filter_map
-          (fun (d : decl) ->
-            match d.decl_desc with
-            | DImport { import_module; import_symbols; import_alias; _ } -> (
-                match (import_alias, import_symbols) with
-                | Some alias, _ -> Some (alias, import_module)
-                | None, None ->
-                    Some (Filename.basename import_module, import_module)
-                | None, Some _ -> None)
-            | _ -> None)
-          program
-      in
-      doc.module_aliases <- aliases
+      doc.module_aliases <- module_aliases_of_program program
 
 (* ============================================================================
    Diagnostics publishing

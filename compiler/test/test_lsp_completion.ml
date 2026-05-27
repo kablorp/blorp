@@ -72,6 +72,32 @@ let item_detail label items =
   | None ->
       Alcotest.failf "missing completion item %s; got: [%s]" label item_labels
 
+let item_labels items =
+  items
+  |> List.filter_map (function
+    | Lsp_json.Object fields -> (
+        match List.assoc_opt "label" fields with
+        | Some (String label) -> Some label
+        | _ -> None)
+    | _ -> None)
+
+let check_item_absent label items =
+  let labels = item_labels items in
+  if List.mem label labels then
+    Alcotest.failf "unexpected completion item %s; got: [%s]" label
+      (String.concat ", " labels)
+
+let check_context text col expected_prefix expected_qualifier =
+  let prefix, qualifier = Lsp_completion.get_completion_context text col in
+  Alcotest.(check string) "prefix" expected_prefix prefix;
+  Alcotest.(check (option string)) "qualifier" expected_qualifier qualifier
+
+let test_completion_context_detects_prefix_and_qualifier () =
+  check_context "    glob" 8 "glob" None;
+  check_context "    O.So" 8 "So" (Some "O");
+  check_context "    O." 6 "" (Some "O");
+  check_context "    map2.value_1" 16 "value_1" (Some "map2")
+
 let test_completion_prefers_typed_function_source_signature () =
   let state, uri =
     analyzed_state
@@ -128,6 +154,26 @@ let test_completion_includes_function_parameters_and_locals () =
     "parameter completion keeps source type" "List[String]"
     (item_detail "args" all_items)
 
+let test_completion_does_not_leak_previous_function_locals_at_top_level () =
+  let state, uri =
+    analyzed_state
+      (String.concat "\n"
+         [
+           "func helper(arg: Int) -> Int:";
+           "    local_only: Int = 1";
+           "    local_only";
+           "";
+           "top_level_value: Int = 0";
+           "";
+         ])
+  in
+  let items = completion_items_at state uri ~line:3 ~character:0 in
+  check_item_absent "arg" items;
+  check_item_absent "local_only" items;
+  Alcotest.(check string)
+    "top-level binding remains available" "Int"
+    (item_detail "top_level_value" items)
+
 let test_completion_resolves_selective_import_alias_members () =
   Test_helpers.with_isolated_env (fun () ->
       let state, uri =
@@ -167,12 +213,17 @@ let suite =
   [
     ( "format",
       [
+        Alcotest.test_case "detects prefix and dot qualifier" `Quick
+          test_completion_context_detects_prefix_and_qualifier;
         Alcotest.test_case "prefers typed function source signature" `Quick
           test_completion_prefers_typed_function_source_signature;
         Alcotest.test_case "uses env source type for variables" `Quick
           test_completion_uses_env_source_type_for_local_variables;
         Alcotest.test_case "includes function parameters and local bindings"
           `Quick test_completion_includes_function_parameters_and_locals;
+        Alcotest.test_case "does not leak previous function locals at top level"
+          `Quick
+          test_completion_does_not_leak_previous_function_locals_at_top_level;
         Alcotest.test_case "resolves selective import aliases" `Quick
           test_completion_resolves_selective_import_alias_members;
       ] );

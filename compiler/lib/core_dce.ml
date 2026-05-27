@@ -262,9 +262,6 @@ let mark_reachable_decl (state : reachability) (decl_ref : decl_ref) : unit =
     state.worklist <- decl_ref :: state.worklist
   end
 
-let mark_reachable_function (state : reachability) (def_id : int) : unit =
-  mark_reachable_decl state (FunctionBody def_id)
-
 let mark_dependency (state : reachability) (reason : dependency_reason)
     (target : decl_ref) : unit =
   if declaration_exists state target then begin
@@ -898,9 +895,6 @@ let with_scan_source (state : reachability) source f =
 let scan_function_decl_body (state : reachability) (decl_ref : decl_ref)
     (f : core_func) : unit =
   with_scan_source state (Decl decl_ref) (fun () -> scan_function_decl state f)
-
-let scan_root_expr (state : reachability) reason expr : unit =
-  with_scan_source state (Root reason) (fun () -> scan_expr state expr)
 
 let collect_reachability_tables (prog : core_program) :
     (decl_ref, unit) Hashtbl.t

@@ -97,11 +97,6 @@ type storage_release_policy = Core.storage_release_policy =
   | StorageArcRelease
   | StorageUnknownRelease of string
 
-type storage_hash_policy = Core.storage_hash_policy =
-  | StorageHashBits
-  | StorageHashPointer
-  | StorageUnknownHash of string
-
 type storage_equality_policy = Core.storage_equality_policy =
   | StorageEqualityBits
   | StorageEqualityPointer

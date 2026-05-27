@@ -17,60 +17,39 @@ let create comments = { remaining = comments }
     position, but comment prose is user-authored text. *)
 let comment_text text = text
 
+let consume_prefix t predicate =
+  let rec collect acc = function
+    | c :: rest when predicate c -> collect (c :: acc) rest
+    | remaining ->
+        t.remaining <- remaining;
+        List.rev acc
+  in
+  collect [] t.remaining
+
+let pop_head_if t predicate =
+  match t.remaining with
+  | c :: rest when predicate c ->
+      t.remaining <- rest;
+      Some c
+  | _ -> None
+
 (** Take all leading comments with line < before_line.
     Trailing comments whose line < before_line are also collected — they are
     orphans that were never consumed by [take_trailing] (e.g. comments on
     import lines that the formatter reorganises). *)
 let take_leading t ~before_line =
-  let rec collect acc = function
-    | c :: rest when c.cc_line < before_line -> collect (c :: acc) rest
-    | remaining ->
-        t.remaining <- remaining;
-        List.rev acc
-  in
-  collect [] t.remaining
+  consume_prefix t (fun c -> c.cc_line < before_line)
 
 (** Take a trailing comment on the given line (if any) *)
 let take_trailing t ~on_line =
-  match t.remaining with
-  | c :: rest when c.cc_line = on_line && c.cc_trailing ->
-      t.remaining <- rest;
-      Some c
-  | _ -> None
+  pop_head_if t (fun c -> c.cc_line = on_line && c.cc_trailing)
 
 (** Take the next trailing comment if it appears before the next item line.
     This is used for block expression items whose parser location may point at
     the enclosing form rather than the physical expression line. *)
 let take_trailing_before t ~before_line =
-  match t.remaining with
-  | c :: rest when c.cc_trailing && c.cc_line < before_line ->
-      t.remaining <- rest;
-      Some c
-  | _ -> None
+  pop_head_if t (fun c -> c.cc_trailing && c.cc_line < before_line)
 
 (** Take the next trailing comment regardless of line. Used at the end of a
     scoped block after all child expressions have been rendered. *)
-let take_next_trailing t =
-  match t.remaining with
-  | c :: rest when c.cc_trailing ->
-      t.remaining <- rest;
-      Some c
-  | _ -> None
-
-(** Drain all comments (leading and trailing) with line <= through_line.
-    Returns them as a list. Used to consume comments in a section that is
-    being reformatted (e.g. the import block). *)
-let drain_through t ~through_line =
-  let rec collect acc = function
-    | c :: rest when c.cc_line <= through_line -> collect (c :: acc) rest
-    | remaining ->
-        t.remaining <- remaining;
-        List.rev acc
-  in
-  collect [] t.remaining
-
-(** Take all remaining comments *)
-let take_remaining t =
-  let result = t.remaining in
-  t.remaining <- [];
-  result
+let take_next_trailing t = pop_head_if t (fun c -> c.cc_trailing)

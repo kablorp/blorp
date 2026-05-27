@@ -23,6 +23,22 @@ make semantic identity and phase boundaries hard to reason about.
   partial invariants.
 - **P2:** Tooling, ergonomics, or low-risk cleanup that reduces future drift.
 
+## Hygiene Notes From Dead-Code Pass
+
+- Several large compiler modules intentionally expose many top-level values
+  because they do not have `.mli` boundaries. That makes internal helper drift
+  harder to detect: an unused declaration can look like exported API until every
+  cross-module use is checked.
+- The normal Dune warning configuration does not currently make unused top-level
+  declarations a reliable gate. Dead-code cleanup still needs a source scan plus
+  targeted regression guards unless the compiler warning policy is tightened.
+- Existing hygiene guardrails are token-based source checks. They are useful for
+  preventing known-dead helper names from reappearing, but they are approximate
+  and should stay narrow, with behavior tests covering real semantic contracts.
+- Stale comments are a recurring symptom around migrated phase boundaries. When
+  a helper is replaced by a more structured path, update the ownership comment in
+  the same change so future audits do not treat the retired path as intentional.
+
 ## Call Resolution Alignment
 
 `docs/CALL_RESOLUTION.md` is the governing design for call and name resolution

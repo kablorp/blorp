@@ -435,15 +435,6 @@ let try_resolve_bitwise_intrinsic name args =
     ~arity:(List.length args)
   |> Option.map (fun intrinsic -> CKIntrinsic intrinsic)
 
-(** Try to resolve a qualified module call [M.func(args)] where [M] is a
-    module alias. Returns [None] if [M] is not an alias for a known module. *)
-let try_resolve_qualified_call (env : env) (module_path : string)
-    (alias_name : string) (field : string) (args : core list) : call_kind option
-    =
-  match resolve_qualified_call_module_path env module_path alias_name with
-  | Some mp -> try_resolve_module_func_call env mp field args
-  | None -> None
-
 module Bound_names = Set.Make (String)
 
 let bind_var (bound : Bound_names.t) (v : Core.var) : Bound_names.t =

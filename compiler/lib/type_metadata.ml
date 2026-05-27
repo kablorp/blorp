@@ -23,39 +23,40 @@ let is_heap_indirected_name name =
   | Heap_indirected_recursion -> true
   | Inline_recursion -> false
 
+let primitive_home_for_name = function
+  | "Int" -> Some "std/int"
+  | "Int8" -> Some "std/int8"
+  | "Int16" -> Some "std/int16"
+  | "Int32" -> Some "std/int32"
+  | "Int64" -> Some "std/int64"
+  | "Int128" -> Some "std/int128"
+  | "UInt8" -> Some "std/uint8"
+  | "UInt16" -> Some "std/uint16"
+  | "UInt32" -> Some "std/uint32"
+  | "UInt64" -> Some "std/uint64"
+  | "UInt128" -> Some "std/uint128"
+  | "Float" -> Some "std/float"
+  | "Float32" -> Some "std/float32"
+  | "Float16" -> Some "std/float16"
+  | "Bool" -> Some "std/bool"
+  | "Char" -> Some "std/char"
+  | "String" -> Some "std/string"
+  | "StringSlice" -> Some "std/slice"
+  | "Bytes" -> Some "std/bytes"
+  | "Fixed" -> Some "std/fixed"
+  | "List" -> Some "std/list"
+  | "Dict" -> Some "std/dict"
+  | "Set" -> Some "std/set"
+  | "Tensor" | "Vector" | "Matrix" -> Some "std/tensor"
+  | "Option" -> Some "std/option"
+  | "Result" -> Some "std/result"
+  | _ -> None
+
 let primitive_home (ty : type_expr) : string option =
   match Codegen_types.normalize_type ty with
   | TyTuple _ -> Some "std/tuple"
   | TyArray _ -> Some "std/tensor"
-  | TyNamed (name, _) -> (
-      match name with
-      | "Int" -> Some "std/int"
-      | "Int8" -> Some "std/int8"
-      | "Int16" -> Some "std/int16"
-      | "Int32" -> Some "std/int32"
-      | "Int64" -> Some "std/int64"
-      | "Int128" -> Some "std/int128"
-      | "UInt8" -> Some "std/uint8"
-      | "UInt16" -> Some "std/uint16"
-      | "UInt32" -> Some "std/uint32"
-      | "UInt64" -> Some "std/uint64"
-      | "UInt128" -> Some "std/uint128"
-      | "Float" -> Some "std/float"
-      | "Float32" -> Some "std/float32"
-      | "Float16" -> Some "std/float16"
-      | "Bool" -> Some "std/bool"
-      | "Char" -> Some "std/char"
-      | "String" -> Some "std/string"
-      | "StringSlice" -> Some "std/slice"
-      | "Bytes" -> Some "std/bytes"
-      | "Fixed" -> Some "std/fixed"
-      | "List" -> Some "std/list"
-      | "Dict" -> Some "std/dict"
-      | "Set" -> Some "std/set"
-      | "Tensor" | "Vector" | "Matrix" -> Some "std/tensor"
-      | "Option" -> Some "std/option"
-      | "Result" -> Some "std/result"
-      | _ -> None)
+  | TyNamed (name, _) -> primitive_home_for_name name
   | _ -> None
 
 let is_struct_scalar_field_type = function

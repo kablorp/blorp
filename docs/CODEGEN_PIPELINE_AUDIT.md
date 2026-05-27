@@ -39,6 +39,11 @@ Removed in this pass:
 - `Core_collection_pipeline.add_vars`: unused local helper.
 - `Core_list_layout.layout_of_elem`: unused wrapper around
   `Core_layout_type.list_storage_layout_of_elem`.
+- Broader compiler cleanup removed additional unused Core/codegen helpers:
+  storage-hash policy plumbing, dead tensor storage constructors/accessors,
+  stale DCE wrappers, the retired AST-level `Core_flatten.build_import_tables`,
+  unused invariant/Perceus/resolve wrappers, stack Option/Result predicates, and
+  formatter/LSP/diagnostic/typecheck helper exports with no production callers.
 
 Guardrail added:
 

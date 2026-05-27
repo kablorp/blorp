@@ -201,38 +201,33 @@ and find_enclosing_call_in_children module_aliases expr ~line ~col =
   |> List.find_map (fun child ->
       find_enclosing_call_expr module_aliases child ~line ~col)
 
+let find_enclosing_call_in_func module_aliases (func : Ast.func_decl) ~line ~col
+    =
+  match Ast.func_body_expr_opt func.Ast.func_body with
+  | Some body -> find_enclosing_call_expr module_aliases body ~line ~col
+  | None -> None
+
+let rec find_enclosing_call_in_decl module_aliases (decl : Ast.decl) ~line ~col
+    =
+  match decl.decl_desc with
+  | DFunc func -> find_enclosing_call_in_func module_aliases func ~line ~col
+  | DVar var ->
+      find_enclosing_call_expr module_aliases var.Ast.var_value ~line ~col
+  | DPrivate inner ->
+      find_enclosing_call_in_decl module_aliases inner ~line ~col
+  | DImpl impl ->
+      impl.Ast.impl_methods
+      |> List.find_map (fun func ->
+          find_enclosing_call_in_func module_aliases func ~line ~col)
+  | _ -> None
+
 let find_enclosing_call_parsed (program : Ast.program) module_aliases
     (position : Lsp_protocol.position) =
   let line = position.line + 1 in
   let col = position.character + 1 in
   program
-  |> List.find_map (fun (decl : Ast.decl) ->
-      match decl.decl_desc with
-      | DFunc func -> (
-          match Ast.func_body_expr_opt func.Ast.func_body with
-          | Some body -> find_enclosing_call_expr module_aliases body ~line ~col
-          | None -> None)
-      | DVar var ->
-          find_enclosing_call_expr module_aliases var.Ast.var_value ~line ~col
-      | DPrivate inner -> (
-          match inner.decl_desc with
-          | DFunc func -> (
-              match Ast.func_body_expr_opt func.Ast.func_body with
-              | Some body ->
-                  find_enclosing_call_expr module_aliases body ~line ~col
-              | None -> None)
-          | DVar var ->
-              find_enclosing_call_expr module_aliases var.Ast.var_value ~line
-                ~col
-          | _ -> None)
-      | DImpl impl ->
-          impl.Ast.impl_methods
-          |> List.find_map (fun func ->
-              match Ast.func_body_expr_opt func.Ast.func_body with
-              | Some body ->
-                  find_enclosing_call_expr module_aliases body ~line ~col
-              | None -> None)
-      | _ -> None)
+  |> List.find_map (fun decl ->
+      find_enclosing_call_in_decl module_aliases decl ~line ~col)
 
 let find_enclosing_call doc position =
   match doc.Lsp_state.program with
@@ -274,42 +269,48 @@ let loc_matches_file ?file (loc : Ast.loc) =
 let typed_func_name (func : Typed_ast.func_decl) =
   (Typed_ast.func_ast func).Ast.func_name
 
+let typed_func_matches name func = typed_func_name func = Some name
+
+let rec typed_func_from_decl_view name = function
+  | Typed_ast.DeclFunction func when typed_func_matches name func -> Some func
+  | Typed_ast.DeclPrivate inner ->
+      typed_func_from_decl_view name (Typed_ast.decl_view inner)
+  | _ -> None
+
 let find_typed_func ?file (program : Typed_ast.program) name =
   program |> Typed_ast.program_decls
   |> List.find_map (fun decl ->
       let ast_decl = Typed_ast.decl_ast decl in
       if not (loc_matches_file ?file ast_decl.decl_loc) then None
-      else
-        match Typed_ast.decl_view decl with
-        | Typed_ast.DeclFunction func when typed_func_name func = Some name ->
-            Some func
-        | _ -> None)
+      else typed_func_from_decl_view name (Typed_ast.decl_view decl))
 
-let typed_func_signature (func : Typed_ast.func_decl) name active_param =
+let typed_func_param_label index (param : Typed_ast.func_param_info) =
+  let pname =
+    match param.Typed_ast.param_name with
+    | Some name -> name
+    | None -> Printf.sprintf "arg%d" index
+  in
+  Printf.sprintf "%s: %s" pname (Types.type_to_string param.source_param_ty)
+
+let typed_func_param_labels (func : Typed_ast.func_decl) =
+  Typed_ast.func_param_infos func |> List.mapi typed_func_param_label
+
+let typed_func_return_type (func : Typed_ast.func_decl) =
+  let info = Typed_ast.func_info func in
+  match info.source_return_ty with
+  | Some ty -> ty
+  | None -> Typed_ast.func_semantic_return_type func
+
+let typed_func_signature_label (func : Typed_ast.func_decl) name params =
   let ast = Typed_ast.func_ast func in
   let pure_str = if ast.func_is_pure then "pure " else "" in
-  let params =
-    Typed_ast.func_param_infos func
-    |> List.mapi (fun index param ->
-        let pname =
-          match param.Typed_ast.param_name with
-          | Some name -> name
-          | None -> Printf.sprintf "arg%d" index
-        in
-        Printf.sprintf "%s: %s" pname
-          (Types.type_to_string param.source_param_ty))
-  in
-  let info = Typed_ast.func_info func in
-  let ret_ty =
-    match info.source_return_ty with
-    | Some ty -> ty
-    | None -> Typed_ast.func_semantic_return_type func
-  in
-  let label =
-    Printf.sprintf "%sfunc %s(%s) -> %s" pure_str name
-      (String.concat ", " params)
-      (Types.type_to_string ret_ty)
-  in
+  Printf.sprintf "%sfunc %s(%s) -> %s" pure_str name
+    (String.concat ", " params)
+    (Types.type_to_string (typed_func_return_type func))
+
+let typed_func_signature (func : Typed_ast.func_decl) name active_param =
+  let params = typed_func_param_labels func in
+  let label = typed_func_signature_label func name params in
   make_sig_response label params active_param
 
 (** Try to build signature from a module-qualified call like "L.map" *)
@@ -334,6 +335,36 @@ let try_qualified_signature (module_aliases : (string * string) list)
                   Some (make_sig_response label params active_param)
               | _ -> None)))
 
+let env_func_signature name active_param func_type param_names purity =
+  let pure_str = match purity with Env.Pure -> "pure " | Env.Impure -> "" in
+  let param_types, ret_type =
+    match func_type with
+    | Ast.TyFunc { params; return; _ } -> (params, Some return)
+    | _ -> ([], None)
+  in
+  let params =
+    List.mapi
+      (fun i ty ->
+        let pname =
+          match List.nth_opt param_names i with
+          | Some (Some n) -> n
+          | _ -> Printf.sprintf "arg%d" i
+        in
+        Printf.sprintf "%s: %s" pname (Types.type_to_string ty))
+      param_types
+  in
+  let ret =
+    match ret_type with
+    | Some ty -> " -> " ^ Types.type_to_string ty
+    | None -> ""
+  in
+  let label =
+    Printf.sprintf "%sfunc %s(%s)%s" pure_str name
+      (String.concat ", " params)
+      ret
+  in
+  make_sig_response label params active_param
+
 (** Build signature from an env lookup *)
 let build_signature ?typed_program ?file (env : Env.env) (name : string)
     (active_param : int) (module_aliases : (string * string) list) : json =
@@ -357,36 +388,7 @@ let build_signature ?typed_program ?file (env : Env.env) (name : string)
           | Some
               { kind = Env.FuncSymbol { func_type; param_names; purity; _ }; _ }
             ->
-              let pure_str =
-                match purity with Env.Pure -> "pure " | Env.Impure -> ""
-              in
-              let param_types, ret_type =
-                match func_type with
-                | Ast.TyFunc { params; return; _ } -> (params, Some return)
-                | _ -> ([], None)
-              in
-              let params =
-                List.mapi
-                  (fun i ty ->
-                    let pname =
-                      match List.nth_opt param_names i with
-                      | Some (Some n) -> n
-                      | _ -> Printf.sprintf "arg%d" i
-                    in
-                    Printf.sprintf "%s: %s" pname (Types.type_to_string ty))
-                  param_types
-              in
-              let ret =
-                match ret_type with
-                | Some ty -> " -> " ^ Types.type_to_string ty
-                | None -> ""
-              in
-              let label =
-                Printf.sprintf "%sfunc %s(%s)%s" pure_str name
-                  (String.concat ", " params)
-                  ret
-              in
-              make_sig_response label params active_param
+              env_func_signature name active_param func_type param_names purity
           | _ -> Null))
 
 (* ============================================================================

@@ -112,6 +112,30 @@ let test_declaration_jumps_to_local_binding () =
     "declaration points at the local binding" (1, 4)
     (declaration_start_at state uri ~line:2 ~character:6)
 
+let test_definition_does_not_leak_previous_function_scope () =
+  let state, uri =
+    analyzed_state
+      (String.concat "\n"
+         [
+           "func helper(arg: Int) -> Int:";
+           "    local_only: Int = 1";
+           "    local_only";
+           "";
+           "arg: Int = 0";
+           "";
+           "func main(local_only: List[String]) -> Int:";
+           "    arg";
+           "    local_only.length()";
+           "";
+         ])
+  in
+  Alcotest.(check (pair int int))
+    "top-level use of arg ignores previous function parameter" (4, 0)
+    (definition_start_at state uri ~line:7 ~character:5);
+  Alcotest.(check (pair int int))
+    "current function parameter ignores previous function local" (6, 10)
+    (definition_start_at state uri ~line:8 ~character:8)
+
 let suite =
   [
     ( "locations",
@@ -122,6 +146,8 @@ let suite =
           test_definition_jumps_to_local_binding;
         Alcotest.test_case "declaration jumps to local binding" `Quick
           test_declaration_jumps_to_local_binding;
+        Alcotest.test_case "does not leak previous function scope" `Quick
+          test_definition_does_not_leak_previous_function_scope;
         Alcotest.test_case "advertises declaration navigation" `Quick
           check_definition_capabilities;
       ] );

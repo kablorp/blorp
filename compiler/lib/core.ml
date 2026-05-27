@@ -156,11 +156,6 @@ type storage_release_policy =
   | StorageArcRelease
   | StorageUnknownRelease of string
 
-type storage_hash_policy =
-  | StorageHashBits
-  | StorageHashPointer
-  | StorageUnknownHash of string
-
 type storage_equality_policy =
   | StorageEqualityBits
   | StorageEqualityPointer
@@ -189,12 +184,6 @@ let storage_policy_release = function
   | StoragePolicyManagedPointer -> StorageArcRelease
   | StoragePolicyOwnedErasedBox -> StorageArcRelease
   | StoragePolicyUnknown reason -> StorageUnknownRelease reason
-
-let storage_policy_hash = function
-  | StoragePolicyUnmanagedBits -> StorageHashBits
-  | StoragePolicyManagedPointer -> StorageHashPointer
-  | StoragePolicyOwnedErasedBox -> StorageHashPointer
-  | StoragePolicyUnknown reason -> StorageUnknownHash reason
 
 let storage_policy_equality = function
   | StoragePolicyUnmanagedBits -> StorageEqualityBits
@@ -315,10 +304,6 @@ let tensor_raw_scalar_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits)
   tensor_storage_layout ?elem_ty ~value_layout:(TensorValueRawScalar scalar)
     ~policy (TensorRawScalarStorage scalar)
 
-let tensor_word_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits) () =
-  tensor_storage_layout ?elem_ty ~value_layout:TensorValueWordSlot ~policy
-    TensorWordStorage
-
 let tensor_packed_storage ?elem_ty ?(policy = StoragePolicyUnmanagedBits) width
     =
   tensor_storage_layout ?elem_ty ~value_layout:(TensorValuePackedBits width)
@@ -353,8 +338,6 @@ type tensor_storage_provenance =
       tsp_layout : tensor_storage_layout;
     }
 
-let tensor_storage_unknown reason = TensorStorageUnknown reason
-
 let tensor_storage_known_producer layout =
   TensorStorageProven
     { tsp_kind = TensorStorageKnownProducer; tsp_layout = layout }
@@ -362,14 +345,6 @@ let tensor_storage_known_producer layout =
 let tensor_storage_preserved_producer layout =
   TensorStorageProven
     { tsp_kind = TensorStoragePreservedProducer; tsp_layout = layout }
-
-let tensor_storage_validated_boundary layout =
-  TensorStorageProven
-    { tsp_kind = TensorStorageValidatedBoundary; tsp_layout = layout }
-
-let tensor_storage_proven_layout = function
-  | TensorStorageProven { tsp_layout; _ } -> Some tsp_layout
-  | TensorStorageUnknown _ -> None
 
 type loop_range_direction = RangeMayRunBackward | RangeForwardOnly
 

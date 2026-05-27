@@ -60,7 +60,14 @@ exception Parse_error of string
 type parser_state = { src : string; mutable pos : int }
 
 let make_parser src = { src; pos = 0 }
-let peek p = if p.pos >= String.length p.src then '\000' else p.src.[p.pos]
+let is_whitespace = function ' ' | '\t' | '\n' | '\r' -> true | _ -> false
+let is_digit c = c >= '0' && c <= '9'
+
+let is_hex_digit c =
+  is_digit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+
+let at_end p = p.pos >= String.length p.src
+let peek p = if at_end p then '\000' else p.src.[p.pos]
 let advance p = p.pos <- p.pos + 1
 
 let consume p =
@@ -69,12 +76,7 @@ let consume p =
   c
 
 let skip_ws p =
-  while
-    p.pos < String.length p.src
-    &&
-    let c = p.src.[p.pos] in
-    c = ' ' || c = '\t' || c = '\n' || c = '\r'
-  do
+  while (not (at_end p)) && is_whitespace p.src.[p.pos] do
     advance p
   done
 
@@ -92,8 +94,7 @@ let parse_hex4 p =
   let hex = Buffer.create 4 in
   for _ = 1 to 4 do
     let c = consume p in
-    if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
-    then Buffer.add_char hex c
+    if is_hex_digit c then Buffer.add_char hex c
     else parse_error p "invalid hex digit in \\u escape"
   done;
   int_of_string ("0x" ^ Buffer.contents hex)
@@ -168,6 +169,8 @@ let parse_string p =
             loop ()
         | c -> parse_error p (Printf.sprintf "invalid escape '\\%c'" c))
     | '\000' -> parse_error p "unterminated string"
+    | c when Char.code c < 0x20 ->
+        parse_error p "unescaped control character in string"
     | c ->
         Buffer.add_char buf c;
         loop ()
@@ -182,7 +185,7 @@ let parse_number p =
   if peek p = '0' then advance p
   else if peek p >= '1' && peek p <= '9' then begin
     advance p;
-    while peek p >= '0' && peek p <= '9' do
+    while is_digit (peek p) do
       advance p
     done
   end
@@ -192,9 +195,9 @@ let parse_number p =
   if peek p = '.' then begin
     is_float := true;
     advance p;
-    if peek p < '0' || peek p > '9' then
+    if not (is_digit (peek p)) then
       parse_error p "expected digit after decimal point";
-    while peek p >= '0' && peek p <= '9' do
+    while is_digit (peek p) do
       advance p
     done
   end;
@@ -203,9 +206,8 @@ let parse_number p =
     is_float := true;
     advance p;
     if peek p = '+' || peek p = '-' then advance p;
-    if peek p < '0' || peek p > '9' then
-      parse_error p "expected digit in exponent";
-    while peek p >= '0' && peek p <= '9' do
+    if not (is_digit (peek p)) then parse_error p "expected digit in exponent";
+    while is_digit (peek p) do
       advance p
     done
   end;
@@ -290,6 +292,7 @@ let parse src =
   let p = make_parser src in
   let v = parse_value p in
   skip_ws p;
+  if not (at_end p) then parse_error p "unexpected trailing input";
   v
 
 (* ============================================================================

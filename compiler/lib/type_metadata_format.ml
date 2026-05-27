@@ -60,6 +60,20 @@ let widening_detail = function
   | Type_widening_metadata.Widen _ as decision ->
       Some ("widening: " ^ widening_to_string decision)
 
+let canonical_or_semantic_detail ~source_ty ~fallback_ty ~semantic_ty =
+  match source_ty with
+  | Some source_ty when not (Types.types_equal source_ty semantic_ty) ->
+      Some ("canonical type: " ^ type_to_string semantic_ty)
+  | _ when not (Types.types_equal fallback_ty semantic_ty) ->
+      Some ("semantic type: " ^ type_to_string semantic_ty)
+  | _ -> None
+
+let value_slot_detail ~value_ty ~semantic_ty =
+  if Types.types_equal value_ty semantic_ty then None
+  else Some ("value-slot type: " ^ type_to_string value_ty)
+
+let prepend_detail detail details = detail :: details
+
 let format_debug_type_info (info : Ast.expr_type_info) =
   let source =
     "source type: "
@@ -82,21 +96,25 @@ let hover_type_view ?fallback_ty (info : Ast.expr_type_info) =
     match info.source_ty with Some ty -> ty | None -> fallback_ty
   in
   let details =
-    match info.source_ty with
-    | Some source_ty when not (Types.types_equal source_ty info.semantic_ty) ->
-        [ "canonical type: " ^ type_to_string info.semantic_ty ]
-    | _ when not (Types.types_equal fallback_ty info.semantic_ty) ->
-        [ "semantic type: " ^ type_to_string info.semantic_ty ]
-    | _ -> []
-  in
-  let details =
-    if Types.types_equal info.value_ty info.semantic_ty then details
-    else details @ [ "value-slot type: " ^ type_to_string info.value_ty ]
-  in
-  let details =
+    []
+    |> (fun details ->
+    match
+      canonical_or_semantic_detail ~source_ty:info.source_ty ~fallback_ty
+        ~semantic_ty:info.semantic_ty
+    with
+    | Some detail -> prepend_detail detail details
+    | None -> details)
+    |> (fun details ->
+    match
+      value_slot_detail ~value_ty:info.value_ty ~semantic_ty:info.semantic_ty
+    with
+    | Some detail -> prepend_detail detail details
+    | None -> details)
+    |> (fun details ->
     match widening_detail info.widening with
-    | Some detail -> details @ [ detail ]
-    | None -> details
+    | Some detail -> prepend_detail detail details
+    | None -> details)
+    |> List.rev
   in
   { primary_type = type_to_string primary_ty; details }
 
