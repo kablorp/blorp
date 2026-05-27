@@ -35,7 +35,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BLORP="$PROJECT_DIR/blorp"
 PYTHON="${PYTHON:-python3}"
-PYTHON_CONCURRENCY="${PYTHON_CONCURRENCY:-python3.14t}"
+if [ "${PYTHON_CONCURRENCY+x}" ]; then
+    PYTHON_CONCURRENCY_DEFAULTED=0
+else
+    PYTHON_CONCURRENCY="python3.14t"
+    PYTHON_CONCURRENCY_DEFAULTED=1
+fi
 GO="${GO:-go}"
 CC="${CC:-cc}"
 BENCH_THREADS="${BENCH_THREADS:-4}"
@@ -57,6 +62,24 @@ SPEEDUP_SUPPRESSED_BENCHMARKS=""
 die() { echo "error: $1" >&2; exit 1; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+python_cmd_runs() {
+    "$1" -c 'import sys' >/dev/null 2>&1
+}
+
+resolve_default_python_concurrency() {
+    python_cmd_runs "$PYTHON_CONCURRENCY" && return 0
+    [ "$PYTHON_CONCURRENCY_DEFAULTED" = "1" ] || return 1
+    has_cmd pyenv || return 1
+
+    local version path
+    version="$(pyenv versions --bare 2>/dev/null | awk '/^3[.]14.*t$/ { candidate = $0 } END { print candidate }')"
+    [ -n "$version" ] || return 1
+    path="$(PYENV_VERSION="$version" pyenv which python3.14t 2>/dev/null)" || return 1
+    [ -n "$path" ] || return 1
+    PYTHON_CONCURRENCY="$path"
+    python_cmd_runs "$PYTHON_CONCURRENCY"
+}
 
 is_speedup_suppressed_benchmark() {
     local needle="$1"
@@ -440,6 +463,7 @@ run_python_lang() {
 
     write_python_runner "$runner"
     if is_concurrency_benchmark "$name"; then
+        resolve_default_python_concurrency || return 1
         py="$PYTHON_CONCURRENCY"
         py_args=(-X gil=0)
         "$py" "${py_args[@]}" - <<'PY'
@@ -508,7 +532,7 @@ run_one() {
 
     local py_cmd="$PYTHON"
     is_concurrency_benchmark "$name" && py_cmd="$PYTHON_CONCURRENCY"
-    if has_bench python "$name" && has_cmd "$py_cmd"; then
+    if has_bench python "$name" && python_cmd_runs "$py_cmd"; then
         src="$(src_for python "$name")"
         if pt=$(run_python_lang "$name" "$src" "${args[@]}" 2>/dev/null); then
             printf "  %9ss" "$pt"
@@ -574,7 +598,8 @@ else
 fi
 
 if contains_concurrency_benchmark $RUN_BENCHMARKS; then
-    has_cmd "$PYTHON_CONCURRENCY" && echo "Python concurrency: $($PYTHON_CONCURRENCY --version 2>&1 | sed 's/^/ /')"
+    resolve_default_python_concurrency || true
+    python_cmd_runs "$PYTHON_CONCURRENCY" && echo "Python concurrency: $($PYTHON_CONCURRENCY --version 2>&1 | sed 's/^/ /')"
     echo "BENCH_THREADS: $BENCH_THREADS"
     echo "BLORP_THREADS: $BLORP_CONCURRENCY_THREADS"
     echo "GOMAXPROCS:    $GO_CONCURRENCY_THREADS"
