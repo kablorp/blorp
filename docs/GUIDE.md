@@ -2897,7 +2897,7 @@ func option_methods() -> Bool:
 | `map` | `(opt: Option[T], f: (T) -> U) -> Option[U]` | Transform value |
 | `filter` | `(opt: Option[T], pred: (T) -> Bool) -> Option[T]` | Keep Some only if predicate holds |
 | `and_then` | `(opt: Option[T], f: (T) -> Option[U]) -> Option[U]` | Chain operations |
-| `ok_or` | `(opt: Option[T], err: E) -> Result[T, E]` | Promote to Result |
+| `to_result` | `(opt: Option[T], err: E) -> Result[T, E]` | Promote to Result |
 
 ### std/result
 
