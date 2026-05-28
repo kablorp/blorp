@@ -12,13 +12,32 @@ current project status, start here:
 
 ```blorp
 func main(args: List[String]):
-	println("Hello, world!")
+	print("Hello, world!")
 ```
 
 ## Try It Out
 
-Prerequisites: OCaml 4.14.x, dune, menhir, and a C compiler such as clang or
-gcc.
+The easiest way to try Blorp is to install the latest dev release. This
+downloads the matching binary for your system and installs a single binary to `~/.local/bin/blorp`.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-dev | bash
+
+~/.local/bin/blorp --version
+```
+
+To remove the dev binary:
+
+```bash
+rm -f "$HOME/.local/bin/blorp"
+```
+
+A C compiler such as clang or gcc is still required to compile and run Blorp
+programs.
+
+Building from source is mainly useful for compiler development. To do that,
+install OCaml 4.14.x, dune, menhir, and a C compiler such as clang or gcc, then
+run:
 
 ```bash
 make
@@ -58,5 +77,3 @@ Useful targeted commands:
 ./blorp test tests/test_blorp/types/test_bool.brp
 ./blorp format --check path/to/file.brp
 ```
-
-See [AGENTS.md](AGENTS.md) for repository development guidance.

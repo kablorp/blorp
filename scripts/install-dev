@@ -1,0 +1,147 @@
+#!/bin/bash
+set -euo pipefail
+
+repo="${BLORP_INSTALL_REPO:-kablorp/blorp}"
+tag="${BLORP_INSTALL_TAG:-dev}"
+install_dir="${BLORP_INSTALL_DIR:-$HOME/.local/bin}"
+print_url=0
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/install-dev [options]
+
+Download and install the latest Blorp dev binary for this platform.
+
+Options:
+  --install-dir DIR  Install blorp into DIR (default: $HOME/.local/bin)
+  --print-url        Print the resolved download URL without installing
+  -h, --help         Show this help
+
+Environment:
+  BLORP_INSTALL_REPO  GitHub repo to download from (default: kablorp/blorp)
+  BLORP_INSTALL_TAG   Release tag to download from (default: dev)
+  BLORP_INSTALL_DIR   Install directory (default: $HOME/.local/bin)
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --install-dir)
+            if [ $# -lt 2 ]; then
+                echo "Missing value for --install-dir" >&2
+                exit 1
+            fi
+            install_dir="$2"
+            shift 2
+            ;;
+        --print-url)
+            print_url=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+target_triple() {
+    local arch os
+    arch=$(uname -m)
+    os=$(uname -s)
+
+    case "$os:$arch" in
+        Darwin:arm64) echo "aarch64-apple-darwin" ;;
+        Darwin:x86_64) echo "x86_64-apple-darwin" ;;
+        Linux:x86_64) echo "x86_64-unknown-linux-gnu" ;;
+        Linux:aarch64|Linux:arm64) echo "aarch64-unknown-linux-gnu" ;;
+        *)
+            echo "Unsupported release target: $os/$arch" >&2
+            exit 1
+            ;;
+    esac
+}
+
+download_file() {
+    local url="$1"
+    local output="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$output"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$output"
+    else
+        echo "Install requires curl or wget." >&2
+        exit 1
+    fi
+}
+
+sha256_file() {
+    local path="$1"
+
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    else
+        echo "Install requires shasum or sha256sum." >&2
+        exit 1
+    fi
+}
+
+target="$(target_triple)"
+asset="blorp-dev-${target}.tar.gz"
+url="https://github.com/${repo}/releases/download/${tag}/${asset}"
+
+if [ "$print_url" -eq 1 ]; then
+    echo "$url"
+    exit 0
+fi
+
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-install-dev.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT
+
+archive="$tmp_dir/$asset"
+checksum="$archive.sha256"
+
+echo "Target: $target"
+echo "Download: $url"
+echo "Install path: $install_dir/blorp"
+
+download_file "$url" "$archive"
+download_file "$url.sha256" "$checksum"
+
+expected_checksum=$(awk '{print $1}' "$checksum")
+actual_checksum=$(sha256_file "$archive")
+
+if [ "$expected_checksum" != "$actual_checksum" ]; then
+    echo "Checksum mismatch for $asset" >&2
+    echo "expected: $expected_checksum" >&2
+    echo "actual:   $actual_checksum" >&2
+    exit 1
+fi
+
+tar -xzf "$archive" -C "$tmp_dir"
+binary_path=$(find "$tmp_dir" -type f -name blorp | head -n 1)
+
+if [ -z "$binary_path" ]; then
+    echo "Downloaded archive did not contain a blorp binary." >&2
+    exit 1
+fi
+
+mkdir -p "$install_dir"
+cp "$binary_path" "$install_dir/blorp"
+chmod 0755 "$install_dir/blorp"
+
+echo "Installed blorp dev to $install_dir/blorp"
+echo "Remove with: rm -f \"$install_dir/blorp\""
+
+case ":$PATH:" in
+    *":$install_dir:"*) ;;
+    *) echo "Note: $install_dir is not on PATH." ;;
+esac

@@ -283,7 +283,7 @@ trap 'rm -f "$tmpc" "$smoke" /tmp/blorp-repl-smoke.out /tmp/blorp-lsp-smoke.out'
 
 cat > "$smoke" <<'BRP'
 func main(args: List[String]) -> Int:
-	println("preview smoke")
+	print("preview smoke")
 	0
 BRP
 

@@ -8427,7 +8427,7 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
   (* ---- IO arm removed 2026-04-24: std/io.brp bodies migrated to
          [builtin("blorp_*")] which synthesize the call directly in
          [Core_lower.lower_func]. No more bare [builtin] bodies for
-         print/println/print_error/read_line/input. *)
+         print/print_error/read_line/input. *)
 
   (* Debug / Memory / Random / Crypto-random / Process / Signal arms
      removed 2026-04-24. std/{debug,memory,random,crypto_random,process}.brp

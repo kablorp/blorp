@@ -905,7 +905,6 @@ char* blorp_json_strip_array(const char* json, const char* field_name);
 // I/O
 void blorp_print(blorp_String* s);
 void blorp_puts(blorp_String* s);
-void blorp_println(blorp_String* s);
 void blorp_print_error(blorp_String* s);
 blorp_String* blorp_read_all(void);
 blorp_String* blorp_read_line(void);

@@ -6670,13 +6670,6 @@ void blorp_puts(blorp_String* s) {
     }
 }
 
-void blorp_println(blorp_String* s) {
-    if (s && s->len > 0) {
-        fwrite(s->data, 1, s->len, stdout);
-    }
-    putchar('\n');
-}
-
 void blorp_print_error(blorp_String* s) {
     if (s && s->len > 0) {
         fwrite(s->data, 1, s->len, stderr);
