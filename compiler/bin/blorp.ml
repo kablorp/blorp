@@ -2,7 +2,7 @@
 
     Usage:
       blorp compile program.brp          # Compile to C and binary
-      blorp compile --no-emit program.brp # Type check only
+      blorp check program.brp            # Type check only
       blorp compile --ast program.brp    # Show AST only
       blorp run program.brp              # Compile and run
       blorp run --release program.brp    # Compile and run optimized
@@ -1152,16 +1152,6 @@ let () =
                 "  --std-dir <d>             Use std library from directory";
               print_endline "  -o <file>                 Output C file path";
               exit 0
-          | "--no-emit" :: rest ->
-              prerr_endline
-                "Warning: 'blorp compile --no-emit' is deprecated, use 'blorp \
-                 check <file.brp>'";
-              parse_compile_args rest { opts with no_emit = true } std_dir files
-          | "--check" :: rest ->
-              prerr_endline
-                "Warning: 'blorp compile --check' is deprecated, use 'blorp \
-                 check <file.brp>'";
-              parse_compile_args rest { opts with no_emit = true } std_dir files
           | "--ast" :: rest ->
               parse_compile_args rest
                 { opts with ast_only = true }
@@ -1230,14 +1220,6 @@ let () =
               parse_compile_args rest
                 { opts with check_invariants = true }
                 std_dir files
-          | "--profile" :: rest ->
-              prerr_endline
-                "Warning: --profile on 'compile' is deprecated — use \
-                 --time-phases. ('blorp run --profile' is unchanged and times \
-                 the generated program.)";
-              parse_compile_args rest
-                { opts with time_phases = true }
-                std_dir files
           | "--debug" :: rest ->
               parse_compile_args rest { opts with debug = true } std_dir files
           | "--no-format" :: rest ->
@@ -1248,17 +1230,15 @@ let () =
               parse_compile_args rest
                 { opts with embed_runtime = false }
                 std_dir files
-          | "--core-emit" :: rest ->
-              prerr_endline
-                "Warning: --core-emit is deprecated (core-emit is the only \
-                 pipeline)";
-              parse_compile_args rest opts std_dir files
           | "--std-dir" :: dir :: rest ->
               parse_compile_args rest opts (Some dir) files
           | "-o" :: o :: rest ->
               parse_compile_args rest
                 { opts with output = Some o }
                 std_dir files
+          | arg :: _ when String.length arg > 0 && arg.[0] = '-' ->
+              prerr_endline ("Error: unknown compile option: " ^ arg);
+              exit 1
           | file :: rest -> parse_compile_args rest opts std_dir (file :: files)
         in
         let opts, std_dir, files =
@@ -1463,11 +1443,6 @@ let () =
           | "--no-format" :: rest ->
               parse_test_args rest profile debug sanitize leak_check true
                 timeout jobs repeat mode cache std_dir paths
-          | "--batch" :: _ ->
-              prerr_endline
-                "Error: --batch has been removed; blorp test now chooses the \
-                 fast test path automatically.";
-              exit 1
           | "--warmup-only" :: _ ->
               (* Pre-warm the precompiled runtime cache, then exit *)
               Test_runner.with_run_artifacts (fun () ->
@@ -1512,6 +1487,9 @@ let () =
               | None ->
                   prerr_endline "Error: -j requires an integer";
                   exit 1)
+          | arg :: _ when String.length arg > 0 && arg.[0] = '-' ->
+              prerr_endline ("Error: unknown test option: " ^ arg);
+              exit 1
           | path :: rest ->
               parse_test_args rest profile debug sanitize leak_check no_format
                 timeout jobs repeat mode cache std_dir (path :: paths)

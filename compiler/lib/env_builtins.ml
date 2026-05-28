@@ -1465,12 +1465,6 @@ let with_builtins (env : env) : env =
       ~type_params:[ generic_param "T" [] ]
       ~origin:Builtin ()
   in
-  let env =
-    add_func env "close"
-      (ty_func [ ty_channel_t ] ty_void)
-      ~type_params:[ generic_param "T" [] ]
-      ~origin:Builtin ()
-  in
 
   (* Push a new scope so user declarations are separate from builtins.
      This lets lookup_in_current_scope see only user symbols while

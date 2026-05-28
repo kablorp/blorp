@@ -111,9 +111,6 @@ The canonical lambda syntax uses the `func` keyword. This avoids ambiguity with
 tuple syntax `(a, b)` and keeps anonymous functions visually aligned with named
 functions. Pure lambdas should use `pure func`.
 
-The parser currently also accepts `pure (...)` as a compatibility spelling for
-pure lambdas. New examples and public APIs should prefer `pure func(...)`.
-
 ```blorp
 inc: (Int) -> Int = func(x: Int): x + 1                -- Explicit type
 inc2: (Int) -> Int = func(x): x + 1                    -- Type inferred from context
@@ -2141,7 +2138,7 @@ private func helper(x: Int) -> Int:
 
 ## 9. Concurrency
 
-blorp provides structured concurrency primitives: `concurrent:` blocks for parallel computation with automatic joining, `for ... concurrently(limit: N)` for statement fan-out with explicit width, `List.concurrent(...)` for value-collecting fan-out, `detach` for fire-and-forget tasks, and `Channel[T]` for inter-thread communication. The older `concurrent for` spelling has been removed.
+blorp provides structured concurrency primitives: `concurrent:` blocks for parallel computation with automatic joining, `for ... concurrently(limit: N)` for statement fan-out with explicit width, `List.concurrent(...)` for value-collecting fan-out, `detach` for fire-and-forget tasks, and `Channel[T]` for inter-thread communication.
 
 ### Concurrent Blocks
 
@@ -2966,7 +2963,6 @@ Key functions:
 | `sort_by` | `(list: List[T], key: (T) -> K) -> List[T]` | Sort by key (Int, Float, or String) |
 | `concurrent` | `(list: List[T], limit: Int, f: (T) -> U) -> List[Result[U, ConcurrencyError]]` | Concurrent map with explicit fan-out limit |
 | `concurrent_with_timeout` | `(list: List[T], limit: Int, timeout: Duration, f: (T) -> U) -> List[Result[U, ConcurrencyError]]` | Concurrent map with a whole-operation timeout |
-| `map_concurrently` | `(list: List[T], limit: Int, f: (T) -> U) -> List[Result[U, ConcurrencyError]]` | Compatibility spelling for `concurrent` |
 | `parallel` | `(list: List[T], body: pure (ParallelList[T]) -> ParallelList[U]) -> List[U]` | Parallel list pipeline |
 | `unique` | `(list: List[T]) -> List[T]` | Remove duplicates |
 | `windows` | `(list: List[T], size: Int) -> List[List[T]]` | Sliding windows |
@@ -3704,8 +3700,7 @@ today.
 - `Fixed` and some tensor shape helper APIs are preview surfaces. Prefer
   documenting concrete module imports in examples instead of relying on broad
   implicit availability.
-- The canonical pure-lambda spelling is `pure func(...)`. The parser still
-  accepts `pure (...)` as a compatibility form.
+- The canonical pure-lambda spelling is `pure func(...)`.
 
 ## 17. Editor Support
 

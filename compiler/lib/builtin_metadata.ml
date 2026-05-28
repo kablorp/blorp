@@ -54,11 +54,9 @@ let descriptors =
     effects "is_directory" [ Impure ];
     effects "exec" [ Impure ];
     effects "read_line" [ Impure ];
-    effects "read_line_opt" [ Impure ];
     effects "read_line_or_empty" [ Impure ];
     effects "read_all" [ Impure ];
     effects "input" [ Impure ];
-    effects "input_opt" [ Impure ];
     effects "input_or_empty" [ Impure ];
     effects "seed_random" [ Impure ];
     effects "random_int" [ Impure ];
@@ -82,7 +80,6 @@ let descriptors =
     effects "recv" [ Impure ];
     effects "try_send" [ Impure ];
     effects "try_recv" [ Impure ];
-    effects "close" [ Impure ];
     effects "send_timeout" [ Impure ];
     effects "recv_timeout" [ Impure ];
     effects "getenv" [ Impure ];

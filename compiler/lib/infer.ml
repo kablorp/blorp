@@ -113,14 +113,6 @@ let common_std_functions =
     ("file_exists", "system");
   ]
 
-let renamed_string_method_hint receiver_type method_name =
-  match (receiver_type, method_name) with
-  | "String", "to_upper" ->
-      Some "'to_upper' was renamed to 'upper'; write `value.upper()`"
-  | "String", "to_lower" ->
-      Some "'to_lower' was renamed to 'lower'; write `value.lower()`"
-  | _ -> None
-
 (** Suggest capitalized type name for common lowercase types *)
 let suggest_capitalized_type ty =
   let known =
@@ -665,27 +657,10 @@ let foreign_name_hints =
     ("nil", "blorp doesn't have nil. Use Option[T] with Some(value) or None");
     ("range", "blorp uses '..' for ranges: for i in 0..5:");
     ("len", "Use 'length(collection)' in blorp");
-    ( "to_upper",
-      "'to_upper' was renamed to 'upper'; import it with `import: string: \
-       upper` and call `upper(value)` or `value.upper()`" );
-    ( "to_lower",
-      "'to_lower' was renamed to 'lower'; import it with `import: string: \
-       lower` and call `lower(value)` or `value.lower()`" );
     ("int", "Capitalize type names in blorp: 'Int', not 'int'");
     ("float", "Capitalize type names in blorp: 'Float', not 'float'");
     ("str", "Use 'String' in blorp, not 'str'");
     ("bool", "Capitalize type names in blorp: 'Bool', not 'bool'");
-    ("sub", "Operator trait method 'sub' was renamed to 'subtract'");
-    ("mul", "Operator trait method 'mul' was renamed to 'multiply'");
-    ("div", "Operator trait method 'div' was renamed to 'divide'");
-    ("mod", "Operator trait method 'mod' was renamed to 'remainder'");
-    ("neg", "Operator trait method 'neg' was renamed to 'negate'");
-    ("eq", "Operator trait method 'eq' was renamed to 'equals'");
-    ("ne", "Operator trait method 'ne' was renamed to 'not_equals'");
-    ("lt", "Operator trait method 'lt' was renamed to 'less_than'");
-    ("gt", "Operator trait method 'gt' was renamed to 'greater_than'");
-    ("le", "Operator trait method 'le' was renamed to 'less_than_or_equal'");
-    ("ge", "Operator trait method 'ge' was renamed to 'greater_than_or_equal'");
   ]
 
 (** Error for an undefined identifier with Levenshtein did-you-mean suggestion. *)
@@ -8561,30 +8536,21 @@ and infer_call ctx expr callee args loc =
                                           | None -> "this value"
                                         in
                                         let ufcs_hint =
-                                          match
-                                            renamed_string_method_hint
-                                              obj_ty_str method_name
-                                          with
-                                          | Some hint -> hint
-                                          | None ->
-                                              if
-                                                Env.has_ufcs_method ctx.env
-                                                  method_name
-                                              then
-                                                Printf.sprintf
-                                                  "'%s' is available as a \
-                                                   method on other types but \
-                                                   not %s"
-                                                  method_name obj_ty_str
-                                              else
-                                                Printf.sprintf
-                                                  "method syntax \
-                                                   `value.%s(...)` is \
-                                                   shorthand for `%s(value, \
-                                                   ...)` — ensure '%s' is \
-                                                   imported"
-                                                  method_name method_name
-                                                  method_name
+                                          if
+                                            Env.has_ufcs_method ctx.env
+                                              method_name
+                                          then
+                                            Printf.sprintf
+                                              "'%s' is available as a method \
+                                               on other types but not %s"
+                                              method_name obj_ty_str
+                                          else
+                                            Printf.sprintf
+                                              "method syntax `value.%s(...)` \
+                                               is shorthand for `%s(value, \
+                                               ...)` — ensure '%s' is imported"
+                                              method_name method_name
+                                              method_name
                                         in
                                         error_with
                                           ~notes:

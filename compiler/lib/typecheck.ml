@@ -4571,31 +4571,9 @@ let rec check_matches_in_expr (state : check_state) (expr : expr) : check_state
       | None -> state)
   | _ -> List.fold_left check_matches_in_expr state (expr_children expr)
 
-(** Old operator-trait method spellings. This exists only for diagnostics; the
-    old names are not accepted as aliases. *)
-let legacy_operator_trait_method_name = function
-  | "subtract" -> Some "sub"
-  | "multiply" -> Some "mul"
-  | "divide" -> Some "div"
-  | "remainder" -> Some "mod"
-  | "negate" -> Some "neg"
-  | "equals" -> Some "eq"
-  | "not_equals" -> Some "ne"
-  | "less_than" -> Some "lt"
-  | "greater_than" -> Some "gt"
-  | "less_than_or_equal" -> Some "le"
-  | "greater_than_or_equal" -> Some "ge"
-  | _ -> None
-
-let missing_trait_method_message (impl_method_names : string list)
+let missing_trait_method_message (_impl_method_names : string list)
     (method_name : string) : string =
-  match legacy_operator_trait_method_name method_name with
-  | Some legacy when List.mem legacy impl_method_names ->
-      Printf.sprintf
-        "missing required method '%s' (found old spelling '%s'; rename it to \
-         '%s')"
-        method_name legacy method_name
-  | _ -> Printf.sprintf "missing required method '%s'" method_name
+  Printf.sprintf "missing required method '%s'" method_name
 
 (** Validate a trait impl: check missing methods, supertraits, and method signatures *)
 let validate_impl (state : check_state) (impl : impl_decl) (loc : loc) :

@@ -1016,9 +1016,8 @@ Staging plan:
    helper/storage patterns to scoped listeners, owned connection tasks, and
    explicit services/pools where sharing is intentional.
 5. Only then promote the simple TCP names to `TcpError` and resource return
-   types. The old typed-handle API should either remain as a clearly named
-   compatibility layer or produce migration diagnostics that point to `with`
-   and `connections(...).concurrently(...)`.
+   types, updating call sites to `with` and `connections(...).concurrently(...)`
+   in the same change.
 
 This staging preserves the main safety invariant: once `TcpStream` is a
 resource, shapes such as detached capture, list storage, and arbitrary helper
@@ -1078,8 +1077,7 @@ Semantics:
 - receiving parks the fiber when empty;
 - channel seal is normal stream end;
 - `Channel.seal` remains an explicit semantic operation, not automatic handle
-  cleanup by default; the old channel `close` spelling is only a compatibility
-  alias during migration;
+  cleanup by default;
 - a channel stream should not keep the process alive after all producers are
   gone unless the channel itself is still reachable.
 

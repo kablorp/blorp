@@ -499,7 +499,7 @@ spread_target = IDENT | "_" ;
 ```ebnf
 lambda_expr = lambda_purity "(" [ lambda_params ] ")" [ "->" type_expr ] ":" lambda_body ;
 
-lambda_purity = "pure" | "func" | "pure" "func" ;
+lambda_purity = "func" | "pure" "func" ;
 
 lambda_params = lambda_param { "," lambda_param } [ "," ] ;
 lambda_param  = IDENT [ ":" type_expr ]
@@ -508,9 +508,7 @@ lambda_param  = IDENT [ ":" type_expr ]
 lambda_body = or_expr | NEWLINE INDENT stmt_list DEDENT ;
 ```
 
-`func` and `pure func` are the canonical lambda spellings used in public
-examples. The parser currently accepts bare `pure (...)` as a compatibility
-spelling for pure lambdas; new code should prefer `pure func(...)`.
+`func` and `pure func` are the lambda spellings used in public examples.
 
 ### Names
 

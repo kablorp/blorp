@@ -413,7 +413,6 @@ unsupported_export_decl_start:
   | { None }
 
 %inline lambda_purity:
-  | PURE { true }
   | FUNC { false }
   | PURE FUNC { true }
 
@@ -1284,16 +1283,6 @@ primary_expr:
   (* concurrent(params): block — with named params *)
   | CONCURRENT LPAREN params = concurrent_params RPAREN COLON NEWLINE INDENT stmts = stmt_list DEDENT
     { make_expr_at $symbolstartpos (EConcurrent (stmts, params.conc_timeout, params.conc_max_threads)) }
-  (* concurrent for — no params *)
-  | CONCURRENT FOR name = binding_ident IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
-    { let _ = (name, iter, body) in
-      parse_fail_at $symbolstartpos
-        "`concurrent for` has been removed. Use `for n in nums concurrently(limit: N):` for statement fan-out, or `nums.concurrent(N, func(n): ...)` to collect results." }
-  (* concurrent(params) for — with named params *)
-  | CONCURRENT LPAREN params = concurrent_params RPAREN FOR name = binding_ident IN iter = expr COLON NEWLINE INDENT body = stmt_list DEDENT
-    { let _ = (params, name, iter, body) in
-      parse_fail_at $symbolstartpos
-        "`concurrent(...) for` has been removed. Use `for n in nums concurrently(limit: N, timeout: timeout):` for statement fan-out, or `nums.concurrent_with_timeout(N, timeout, func(n): ...)` to collect results." }
   | CONCURRENTLY COLON NEWLINE INDENT stmts = stmt_list DEDENT
     { let _ = stmts in
       parse_fail_at $symbolstartpos

@@ -561,9 +561,7 @@ let builtin_contract_table =
       builtins
         (channel_recv_stack_option_builtins "blorp_channel_recv_timeout")
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);
-      builtins
-        [ "blorp_channel_seal"; "blorp_channel_close" ]
-        (bfixed [ Borrow ] ReturnVoid);
+      builtins [ "blorp_channel_seal" ] (bfixed [ Borrow ] ReturnVoid);
       builtins [ "blorp_get_scheduler_stats" ] (bfixed [] ReturnOwned);
       builtins [ "blorp_reset_scheduler_stats" ] (bfixed [] ReturnVoid);
       (* Dict runtime functions. Mutating operations consume the dict owner through

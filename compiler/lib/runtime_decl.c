@@ -908,10 +908,8 @@ void blorp_puts(blorp_String* s);
 void blorp_print_error(blorp_String* s);
 blorp_String* blorp_read_all(void);
 blorp_String* blorp_read_line(void);
-blorp_String* blorp_read_line_opt(void);
 blorp_String* blorp_read_line_or_empty(void);
 blorp_String* blorp_input(blorp_String* prompt);
-blorp_String* blorp_input_opt(blorp_String* prompt);
 blorp_String* blorp_input_or_empty(blorp_String* prompt);
 // (removed blorp_exit — now IR intrinsic)
 
@@ -1515,7 +1513,6 @@ void* blorp_channel_recv_timeout(void* c, long timeout_ms);
 long blorp_channel_send_timeout(void* c, void* value, long timeout_ms);
 long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms);
 void blorp_channel_seal(void* c);
-void blorp_channel_close(void* c);
 bool blorp_channel_recv_raw(blorp_Channel* ch, void** out);
 long blorp_channel_try_recv_status_raw(blorp_Channel* ch, void** out);
 bool blorp_channel_try_recv_raw(blorp_Channel* ch, void** out);

@@ -537,8 +537,6 @@ let test_channel_runtime_builtins_have_ownership_contracts () =
   expect_builtin_contract "blorp_channel_send_timeout_attempt"
     [ borrow; retain; borrow ] ret_owned;
   expect_builtin_contract "blorp_channel_seal" [ borrow ]
-    Core_ownership.ReturnVoid;
-  expect_builtin_contract "blorp_channel_close" [ borrow ]
     Core_ownership.ReturnVoid
 
 let test_void_boxed_runtime_builtins_have_ownership_coverage () =

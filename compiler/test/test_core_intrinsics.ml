@@ -1859,41 +1859,6 @@ let test_list_map_synthesizes_presized_loop () =
         "no repeated append capacity growth" 0
         (count_intrinsic "list_ensure_capacity" body)
 
-let test_list_map_concurrently_synthesizes_concurrent_for () =
-  let return_ty = ty_list (ty_result ty_string ty_concurrency_error) in
-  let body =
-    Blorp.Core_intrinsics.synthesize_body ~func_name:"map_concurrently"
-      ~module_path:"std/list"
-      ~params:
-        [
-          param "self" (ty_list ty_int);
-          param "limit" ty_int;
-          param "f" (ty_func [ ty_int ] ty_string);
-        ]
-      ~return_ty
-  in
-  match body with
-  | None -> Alcotest.fail "List.map_concurrently should synthesize Core"
-  | Some { desc = CConcurrentFor cf; ty; _ } -> (
-      Alcotest.(check string)
-        "result type"
-        (Blorp.Types.type_to_string return_ty)
-        (Blorp.Types.type_to_string ty);
-      Alcotest.(check string)
-        "task body return" "String"
-        (Blorp.Types.type_to_string cf.cf_body.ty);
-      Alcotest.(check bool)
-        "map_concurrently collects results" true
-        (match cf.cf_output with
-        | ConcurrentForCollect -> true
-        | ConcurrentForDiscard -> false);
-      match cf.cf_width with
-      | ConcurrentForLimit limit ->
-          Alcotest.(check string)
-            "limit type" "Int"
-            (Blorp.Types.type_to_string limit.ty))
-  | Some _ -> Alcotest.fail "expected synthesized CConcurrentFor"
-
 let test_list_concurrent_synthesizes_concurrent_for () =
   let return_ty = ty_list (ty_result ty_string ty_concurrency_error) in
   let body =
@@ -3771,8 +3736,6 @@ let suite =
           test_tensor_mean_int_reads_int_and_casts_to_float;
         Alcotest.test_case "list_map_synthesizes_presized_loop" `Quick
           test_list_map_synthesizes_presized_loop;
-        Alcotest.test_case "list_map_concurrently_synthesizes_concurrent_for"
-          `Quick test_list_map_concurrently_synthesizes_concurrent_for;
         Alcotest.test_case "list_concurrent_synthesizes_concurrent_for" `Quick
           test_list_concurrent_synthesizes_concurrent_for;
         Alcotest.test_case "list_concurrent_timeout_synthesizes_concurrent_for"

@@ -8,11 +8,8 @@ practical power: cheap virtual tasks, direct blocking-style code, message
 passing, high-concurrency servers, database work, data-engineering pipelines,
 event loops, and resource-safe I/O.
 
-This proposal was written during the transition away from legacy
-`concurrent for`. Current source syntax is `concurrent:`,
-`for ... concurrently(...)`, `List.concurrent(...)`, and `detach`. Older phase
-notes below may still mention `concurrent for` when describing migration history
-or removed behavior.
+Current source syntax is `concurrent:`, `for ... concurrently(...)`,
+`List.concurrent(...)`, and `detach`.
 
 ## Goals
 
@@ -1189,7 +1186,7 @@ new ownership states.
 
 - Keep `concurrent:` as the fixed block syntax.
 - Introduce `for ... concurrently(...)` as the dynamic fan-out syntax.
-- Preserve old syntax long enough to produce helpful migration diagnostics.
+- Remove old syntax instead of carrying parser compatibility branches.
 - Prefer adding new explicit operations before changing existing behavior.
 - Represent ownership and cancellation in typed AST/Core before codegen relies
   on them.
@@ -1197,7 +1194,7 @@ new ownership states.
   function names.
 - Add runtime instrumentation before relying on humans to tune limits,
   backpressure, or deadlines.
-- Migrate examples only after the compiler has diagnostics for the old pattern.
+- Keep examples on the current syntax.
 - Treat runtime primitive contracts as compiler data, not scattered convention:
   when a concurrency primitive crosses the runtime ABI, its ownership,
   payload-boxing, blocking/cancellation behavior, and result shape should be
@@ -1209,11 +1206,11 @@ Goal: know exactly what existing concurrency code depends on.
 
 Work:
 
-- Catalogue all uses of `concurrent:`, `concurrent for`, `detach`, channels,
-  channel seal behavior and the legacy close alias, timeout helpers, and TCP
+- Catalogue all uses of `concurrent:`, `for ... concurrently`, `detach`,
+  channels, channel seal behavior, timeout helpers, and TCP
   concurrency examples.
 - Add snapshot tests for the current behavior before changing it.
-- Identify which tests rely on result collection from `concurrent for`.
+- Identify which tests require result-collecting fan-out.
 - Identify any code that assumes detached work can outlive resources.
 
 Migration impact: none. This phase should only add tests and notes.
@@ -1396,13 +1393,7 @@ Work:
   constraint.
 - Require `limit` in the first version. If a default is ever added, it should be
   a later ergonomic decision, not the initial migration.
-- Emit a migration diagnostic for `concurrent for`:
-
-```text
-`concurrent for` has been removed.
-Use `for ... concurrently(limit: N)` for statement fan-out, or
-`items.concurrent(N, func(item): ...)` to collect results.
-```
+- Do not preserve `concurrent for` as special parser syntax.
 
 Current:
 
@@ -1435,8 +1426,7 @@ Tests:
   `concurrent:`.
 - Formatter preserves the new loop modifier.
 
-Migration impact: old `concurrent for` now hard-errors with a migration
-diagnostic. Side-effecting code should use `for ... concurrently(limit: N):`;
+Migration impact: side-effecting code should use `for ... concurrently(limit: N):`;
 value-collecting code should use `List.concurrent(...)` or
 `List.concurrent_with_timeout(...)`.
 
@@ -1444,8 +1434,8 @@ Implementation status: the parser, AST, typed AST, Core, formatter, and
 expression-document bridge preserve `limit` as distinct from legacy
 `max_threads`. Codegen now treats `for ... concurrently(limit: N)` as a
 per-loop active-task limit by spawning and joining work in windows of at most
-`N` tasks. Legacy `concurrent for` and `concurrent(max_threads: ...) for`
-source syntax now fail at parse time with migration diagnostics.
+`N` tasks. Legacy `concurrent for` syntax is no longer represented as a
+distinct parser case.
 Parser coverage now pins the source syntax boundary: `limit` is the loop width
 spelling, `timeout` is accepted for whole-loop deadlines, `max_threads` remains
 legacy block syntax only, and `item_timeout` is reserved until per-item deadline
@@ -1528,8 +1518,7 @@ Work:
 - Make the loop statement-only and `Void`-typed.
 - Ensure the loop joins before continuing.
 - Enforce no implicit result collection.
-- Add `List.concurrent(limit, func)` for ordinary result collection, keeping
-  `List.map_concurrently(limit, func)` as a compatibility spelling.
+- Add `List.concurrent(limit, func)` for ordinary result collection.
 
 Tests:
 
@@ -1541,13 +1530,13 @@ Tests:
 Implementation status: ordinary list fan-out with `concurrently(limit: N)` now
 emits bounded windows of active child tasks, so total task allocation is capped
 by the local `limit` instead of the input length. The existing implementation
-still supports expression-level result collection for compatibility. The
-explicit collection helper now exists as
+supports expression-level result collection for compiler-owned helpers. The
+explicit collection helper is
 `List.concurrent(limit, func) -> List[Result[U, ConcurrencyError]]`, matching
 `List.parallel(...)` as a method-shaped list operation.
 `List.concurrent_with_timeout(limit, Duration, func)` now covers the collected
 whole-operation deadline case before diagnostics are added for value-producing
-loop syntax. `List.map_concurrently` remains as a compatibility spelling. The
+loop syntax. The
 compiler-owned list helpers synthesize directly to Core `CConcurrentFor` with a
 typed limit expression, instead of routing through a separate runtime
 algorithm, so they share task batching, task closure conversion, cancellation,
@@ -1558,7 +1547,7 @@ normalizes values less than 1 to serial execution. The user guide now teaches
 `for ... concurrently(limit:)` as statement fan-out, `List.concurrent` as the
 value-collecting form, and `List.concurrent_with_timeout` for collected
 fan-out with deadlines. Value-producing `for ... concurrently(...)` now fails
-in typechecking with a migration diagnostic that points at the list helpers.
+in typechecking with a diagnostic that points at the list helpers.
 The virtual-thread benchmark and the
 general virtual-thread runtime tests now use `List.concurrent`, and the
 Duration timeout runtime test, bounded-window codegen audit, and binder
@@ -1575,8 +1564,7 @@ users at an explicit `match` or Option/Result combinators instead of implying
 future implicit loop propagation. User-facing diagnostics for ordinary
 fan-out now use the source spelling `for ... concurrently` for non-list
 iterables, timeout type errors, mutable outer assignments, mutable captures,
-and purity reports; `concurrent for` remains only as the legacy spelling in
-migration diagnostics and Core-internal terminology.
+and purity reports. `concurrent for` remains only as Core-internal terminology.
 
 Migration impact: result-collecting `concurrent for` users move to
 `List.concurrent` or `List.concurrent_with_timeout`; side-effecting or
@@ -1679,8 +1667,7 @@ recv_timeout_attempt(ch: Channel[T], ms: Int) -> RecvAttempt[T]
 seal(ch: Channel[T]) -> Void
 ```
 
-- If channel `close` exists today, keep it as a deprecated channel-only alias
-  for `seal` during migration. Do not blur this with resource close.
+- Channel completion uses `seal`. Do not blur this with resource close.
 - Ensure cancellation of blocked senders/receivers removes waiters.
 - Decide whether plain `send` exists. If it remains, its blocking behavior must
   be obvious from docs and type.
@@ -1757,8 +1744,8 @@ by a separate sealed-state probe, so value, empty, and sealed are coherent
 across fiber boundaries. No source-level channel-state refinement is exposed
 because another fiber may seal the channel immediately after any observation.
 `send`, `try_send`, and
-`send_timeout` still return `Bool` as compatibility aliases; changing or
-removing those aliases remains a later migration step. The status send hooks
+`send_timeout` still return `Bool` as legacy boolean APIs; changing or
+removing those APIs remains a later cleanup step. The status send hooks
 and receive-status hooks also exposed a duplication hazard between runtime
 declarations, ownership contracts, and Core ABI boxing metadata; Phase 6 now
 includes hardening tests for that contract before adding more waitable channel
@@ -1779,9 +1766,7 @@ blocking, nonblocking, and timed send APIs. Managed receive paths also have
 strict leak-check coverage for `recv`, `try_recv`, `recv_timeout`, `wait_recv`,
 and typed receive attempts, including sealed-buffered values. The primary
 source-level `seal(ch)` operation
-now lowers through the seal-named `blorp_channel_seal` runtime entry point;
-`blorp_channel_close` remains as a compatibility ABI wrapper for the old
-channel `close` spelling.
+now lowers through the seal-named `blorp_channel_seal` runtime entry point.
 Ordinary channels cannot carry resources: typecheck coverage now rejects
 resource-containing channel aliases, function parameters, return types, and
 local bindings while still allowing direct aliases to resource handle types.
@@ -2346,8 +2331,8 @@ Work:
 - Demote `detach` to an explicit escape hatch.
 - Reject resource capture in detached work.
 - Document detached work as process-lifetime background work.
-- Keep old `concurrent for` as a hard error with a migration diagnostic.
-- Remove channel `close` alias after the channel `seal` migration window.
+- Remove old `concurrent for` parser branches.
+- Remove the channel `close` alias.
 - Update guide, grammar, examples, benchmarks, and doctests.
 
 Tests:
@@ -2355,10 +2340,11 @@ Tests:
 - `detach` cannot capture resources or scoped-derived values.
 - `detach handle_client(stream)` with a TCP stream resource is a compile-time
   error, not a runtime ownership convention.
-- Old syntax errors include a precise replacement.
+- Current syntax errors include precise replacements where the parser has
+  enough context.
 - Preview examples use only the new concurrency model.
 
-Migration impact: remaining legacy code receives actionable diagnostics.
+Migration impact: remaining legacy code is not preserved as special syntax.
 
 Stop condition: the language has one primary concurrency path:
 

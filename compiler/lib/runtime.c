@@ -6731,10 +6731,6 @@ blorp_String* blorp_read_line(void) {
     return blorp_read_line_nullable();
 }
 
-blorp_String* blorp_read_line_opt(void) {
-    return blorp_read_line();
-}
-
 blorp_String* blorp_read_line_or_empty(void) {
     blorp_String* line = blorp_read_line_nullable();
     if (line) return line;
@@ -6747,10 +6743,6 @@ blorp_String* blorp_input(blorp_String* prompt) {
         fflush(stdout);
     }
     return blorp_read_line_nullable();
-}
-
-blorp_String* blorp_input_opt(blorp_String* prompt) {
-    return blorp_input(prompt);
 }
 
 blorp_String* blorp_input_or_empty(blorp_String* prompt) {
@@ -16260,11 +16252,6 @@ void blorp_channel_seal(void* c) {
         f->wait_next = NULL;
         blorp_fiber_schedule(f);
     }
-}
-
-// close(ch) -> Void compatibility alias for seal(ch).
-void blorp_channel_close(void* c) {
-    blorp_channel_seal(c);
 }
 
 // Internal: blocking recv for for-in loop (avoids Option allocation overhead).

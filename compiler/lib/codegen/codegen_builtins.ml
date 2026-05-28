@@ -373,7 +373,6 @@ let builtin_c_mapping =
     (("", "recv_timeout"), "blorp_channel_recv_timeout");
     (("", "send_timeout"), "blorp_channel_send_timeout");
     (("", "seal"), "blorp_channel_seal");
-    (("", "close"), "blorp_channel_close");
   ]
 
 (** Look up a builtin's C name given its module and function name.

@@ -63,9 +63,6 @@ let is_path_under_dir ~dir path =
   String.length path > String.length prefix
   && String.sub path 0 (String.length prefix) = prefix
 
-let is_std_loaded_module (m : loaded_module) =
-  Session.module_origin_is_std m.origin
-
 let is_package_loaded_module (m : loaded_module) =
   Session.module_origin_is_package m.origin
 
@@ -399,114 +396,38 @@ let collect_private_names decls =
       | _ -> [])
     decls
 
-(** Explicit migration hints for renamed std exports. These run before typo
-    correction so API renames do not produce misleading near-name suggestions
-    such as [is_upper] for the old string case-conversion functions. *)
-let renamed_std_export_hint (m : loaded_module) (name : string) : string option
-    =
-  if not (is_std_loaded_module m) then None
-  else
-    match (Filename.basename m.name, name) with
-    | "string", "to_upper" ->
-        Some "'to_upper' was renamed to 'upper'; write `import: string: upper`"
-    | "string", "to_lower" ->
-        Some "'to_lower' was renamed to 'lower'; write `import: string: lower`"
-    | "matrix", "get_cell" ->
-        Some "'get_cell' was renamed to 'get'; write `import: matrix: get`"
-    | "matrix", "get_cell_or" ->
-        Some
-          "'get_cell_or' was renamed to 'get_or'; write `import: matrix: \
-           get_or`"
-    | "matrix", "set_at" ->
-        Some
-          "'set_at' was renamed to 'set_cell'; write `import: matrix: set_cell`"
-    | "matrix", "matmul" ->
-        Some
-          "'matmul' was renamed to 'multiply'; write `import: matrix: multiply`"
-    | "matrix", "matrix_multiply" ->
-        Some
-          "'matrix_multiply' was renamed to 'multiply'; write `import: matrix: \
-           multiply`"
-    | "matrix", "matvec" ->
-        Some
-          "'matvec' was renamed to 'multiply_vector'; write `import: matrix: \
-           multiply_vector`"
-    | "matrix", "matrix_vector_multiply" ->
-        Some
-          "'matrix_vector_multiply' was renamed to 'multiply_vector'; write \
-           `import: matrix: multiply_vector`"
-    | "matrix", "matvec_t" ->
-        Some
-          "'matvec_t' was renamed to 'multiply_transposed_vector'; write \
-           `import: matrix: multiply_transposed_vector`"
-    | "matrix", "transposed_matrix_vector_multiply" ->
-        Some
-          "'transposed_matrix_vector_multiply' was renamed to \
-           'multiply_transposed_vector'; write `import: matrix: \
-           multiply_transposed_vector`"
-    | "matrix", "outer_product" ->
-        Some
-          "'outer_product' was renamed to 'outer'; write `import: matrix: \
-           outer`"
-    | "matrix", "outer_multiply" ->
-        Some
-          "'outer_multiply' was renamed to 'outer'; write `import: matrix: \
-           outer`"
-    | "matrix", "cell_product" ->
-        Some
-          "'cell_product' was renamed to 'product'; write `import: matrix: \
-           product`"
-    | "matrix", "identity_matrix" ->
-        Some
-          "'identity_matrix' was renamed to 'identity'; write `import: matrix: \
-           identity`"
-    | "vector", "cumsum" ->
-        Some
-          "'cumsum' was renamed to 'cumulative_sum'; write `import: vector: \
-           cumulative_sum`"
-    | "vector", "vector_exp" ->
-        Some "'vector_exp' was renamed to 'exp'; write `import: vector: exp`"
-    | "vector", "vector_log" ->
-        Some "'vector_log' was renamed to 'log'; write `import: vector: log`"
-    | "vector", "vector_sqrt" ->
-        Some "'vector_sqrt' was renamed to 'sqrt'; write `import: vector: sqrt`"
-    | _ -> None
-
 (** Suggest a similar export name for typo correction.
     Uses simple Levenshtein-like matching on module exports. *)
 let suggest_export (m : loaded_module) (name : string) : string option =
-  match renamed_std_export_hint m name with
-  | Some hint -> Some hint
-  | None -> (
-      let exports = List.map fst m.exports in
-      let name_lower = String.lowercase_ascii name in
-      let best =
-        List.fold_left
-          (fun acc exp ->
-            let exp_lower = String.lowercase_ascii exp in
-            (* Simple edit distance: same length, differ by 1-2 chars *)
-            let nlen = String.length name_lower
-            and elen = String.length exp_lower in
-            if abs (nlen - elen) > 2 || nlen < 3 then acc
-            else
-              let diffs = ref 0 in
-              let min_len = min nlen elen in
-              for i = 0 to min_len - 1 do
-                if name_lower.[i] <> exp_lower.[i] then incr diffs
-              done;
-              diffs := !diffs + abs (nlen - elen);
-              if
-                !diffs <= 2
-                && (acc = None
-                   || !diffs < match acc with Some (_, d) -> d | None -> 999)
-              then Some (exp, !diffs)
-              else acc)
-          None exports
-      in
-      match best with
-      | Some (suggestion, _) ->
-          Some (Printf.sprintf "Did you mean '%s'?" suggestion)
-      | None -> None)
+  let exports = List.map fst m.exports in
+  let name_lower = String.lowercase_ascii name in
+  let best =
+    List.fold_left
+      (fun acc exp ->
+        let exp_lower = String.lowercase_ascii exp in
+        (* Simple edit distance: same length, differ by 1-2 chars *)
+        let nlen = String.length name_lower
+        and elen = String.length exp_lower in
+        if abs (nlen - elen) > 2 || nlen < 3 then acc
+        else
+          let diffs = ref 0 in
+          let min_len = min nlen elen in
+          for i = 0 to min_len - 1 do
+            if name_lower.[i] <> exp_lower.[i] then incr diffs
+          done;
+          diffs := !diffs + abs (nlen - elen);
+          if
+            !diffs <= 2
+            && (acc = None
+               || !diffs < match acc with Some (_, d) -> d | None -> 999)
+          then Some (exp, !diffs)
+          else acc)
+      None exports
+  in
+  match best with
+  | Some (suggestion, _) ->
+      Some (Printf.sprintf "Did you mean '%s'?" suggestion)
+  | None -> None
 
 let std_module_available ~(sess : Session.t) ~base_dir module_name =
   has_prefix "std/" module_name

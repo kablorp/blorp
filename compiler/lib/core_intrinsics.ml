@@ -499,9 +499,6 @@ let std_body_specs =
         "map" 2;
       list_spec ~return_shape:(ReturnNamed "List")
         ~param_shapes:[ ParamNamed "List"; ParamNamed "Int"; ParamFunc ]
-        "map_concurrently" 3;
-      list_spec ~return_shape:(ReturnNamed "List")
-        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int"; ParamFunc ]
         "concurrent" 3;
       list_spec ~return_shape:(ReturnNamed "List")
         ~param_shapes:
@@ -2409,8 +2406,7 @@ let list_map self_ty result_ty self f =
                    ty_void)
                 (vr "__result" result_ty)))))
 
-(** map_concurrently/concurrent(self, limit, f) -> List[Result[U,
-    ConcurrencyError]]
+(** concurrent(self, limit, f) -> List[Result[U, ConcurrencyError]]
 
     Build the public helper as Core concurrent-for instead of a separate
     runtime mapping primitive. This keeps task spawning, result wrapping,
@@ -5957,8 +5953,7 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
   | "map" when first_is_list () ->
       with_list2 (fun self_p f_p ->
           list_map self_p.cp_ty return_ty (param self_p) (param f_p))
-  | ("map_concurrently" | "concurrent")
-    when first_is_list () && return_is_list () ->
+  | "concurrent" when first_is_list () && return_is_list () ->
       with_list3 (fun self_p limit_p f_p ->
           list_concurrent_collect self_p.cp_ty return_ty (param self_p)
             (param limit_p) (param f_p))

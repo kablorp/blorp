@@ -26,9 +26,6 @@ type loaded_module = Session.loaded_module = {
     Alias for [Session.loaded_module] so existing qualified uses
     ([Modules.loaded_module]) keep working. *)
 
-val is_std_loaded_module : loaded_module -> bool
-(** True iff this loaded module came from the configured standard library. *)
-
 val is_package_loaded_module : loaded_module -> bool
 (** True iff this loaded module came from an explicit package import. *)
 
