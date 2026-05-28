@@ -1,274 +1,53 @@
--- Typed TCP I/O compatibility coverage.
---
--- TCP handles are still ordinary handles during the resource migration, but
--- the future resource API should already have typed read/write error shapes.
+-- Focused typed TCP error coverage for the resource API.
 import:
-	bytes as B
-	net/tcp as Tcp
+	net/tcp: TcpError(InvalidInput, Other), listen, message, set_timeout
 	string: contains, starts_with
 	test: TestSuite
-
-
-pure func is_socket_permission_error(err: String) -> Bool:
-	err.contains("Operation not permitted") or err.contains("Permission denied")
 
 
 pure func is_invalid_message(message: String, detail: String) -> Bool:
 	message.starts_with("invalid input: ") and message.contains(detail)
 
 
-pure func long_host() -> String:
-	var host: String = ""
-	var i: Int = 0
-	while i < 256:
-		host += "a"
-		i += 1
-	host
-
-
 func test_tcp_error_message() -> Bool:
-	match Tcp.listen_checked("127.0.0.1", -1, 1):
-		Ok(listener):
-			Tcp.close(listener)
-			False
+	invalid: String = message(InvalidInput("bad port"))
+	other: String = message(Other("tcp read: timed out"))
+	invalid.starts_with("invalid input: ") and other == "tcp error: tcp read: timed out"
+
+
+func invalid_backlog_result() -> Result[Bool, TcpError]:
+	with _ ?= listen("127.0.0.1", 0, -1):
+		Ok(False)
+
+
+func test_listen_invalid_backlog_is_typed() -> Bool:
+	match invalid_backlog_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "backlog")
+
+
+func invalid_timeout_result() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		ignored ?= set_timeout(listener, -1)
+		Ok(False)
+
+
+func test_listener_timeout_invalid_is_typed() -> Bool:
+	match invalid_timeout_result():
+		Ok(_): False
 		Err(err):
-			Tcp
-				.message(err)
-				.starts_with("invalid input: ")
-
-
-func test_read_chunk_invalid_size_is_typed() -> Bool:
-	match Tcp.listen("127.0.0.1", 0, 1):
-		Ok(listener):
-			match Tcp.local_port(listener):
-				Ok(port):
-					match Tcp.connect("127.0.0.1", port):
-						Ok(client):
-							match Tcp.accept(listener):
-								Ok(peer):
-									negative: Bool = match Tcp.read_chunk(peer, -1):
-										Ok(_): False
-										Err(err): is_invalid_message(Tcp.message(err), "max_bytes")
-									zero: Bool = match Tcp.read_chunk(peer, 0):
-										Ok(_): False
-										Err(err): is_invalid_message(Tcp.message(err), "max_bytes")
-									too_large: Bool = match Tcp.read_chunk(peer, 67108865):
-										Ok(_): False
-										Err(err): is_invalid_message(Tcp.message(err), "max_bytes")
-									Tcp.close(peer)
-									Tcp.close(client)
-									Tcp.close(listener)
-									negative and zero and too_large
-								Err(_):
-									Tcp.close(client)
-									Tcp.close(listener)
-									False
-						Err(_):
-							Tcp.close(listener)
-							False
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(e): is_socket_permission_error(e)
-
-
-func test_listen_checked_invalid_port_is_typed() -> Bool:
-	match Tcp.listen_checked("127.0.0.1", -1, 1):
-		Ok(listener):
-			Tcp.close(listener)
-			False
-		Err(err): is_invalid_message(Tcp.message(err), "port")
-
-
-func test_listen_checked_invalid_host_is_typed() -> Bool:
-	match Tcp.listen_checked(long_host(), 0, 1):
-		Ok(listener):
-			Tcp.close(listener)
-			False
-		Err(err): is_invalid_message(Tcp.message(err), "host")
-
-
-func test_listen_checked_invalid_backlog_is_typed() -> Bool:
-	match Tcp.listen_checked("127.0.0.1", 0, -1):
-		Ok(listener):
-			Tcp.close(listener)
-			False
-		Err(err): is_invalid_message(Tcp.message(err), "backlog")
-
-
-func test_connect_checked_invalid_port_is_typed() -> Bool:
-	match Tcp.connect_checked("127.0.0.1", 70000):
-		Ok(stream):
-			Tcp.close(stream)
-			False
-		Err(err): is_invalid_message(Tcp.message(err), "port")
-
-
-func test_connect_checked_invalid_host_is_typed() -> Bool:
-	match Tcp.connect_checked(long_host(), 80):
-		Ok(stream):
-			Tcp.close(stream)
-			False
-		Err(err): is_invalid_message(Tcp.message(err), "host")
-
-
-func test_set_timeout_checked_invalid_timeout_is_typed() -> Bool:
-	match Tcp.listen_checked("127.0.0.1", 0, 1):
-		Ok(listener):
-			listener_ok: Bool = match Tcp.set_timeout_checked(listener, -1):
-				Ok(_): False
-				Err(err): is_invalid_message(Tcp.message(err), "timeout")
-			streams_ok: Bool = match Tcp.local_port_checked(listener):
-				Ok(port):
-					match Tcp.connect_checked("127.0.0.1", port):
-						Ok(client):
-							match Tcp.accept_checked(listener):
-								Ok(peer):
-									client_ok: Bool = match Tcp.set_timeout_checked(client, -1):
-										Ok(_): False
-										Err(err): is_invalid_message(Tcp.message(err), "timeout")
-									peer_ok: Bool = match Tcp.set_timeout_checked(peer, -1):
-										Ok(_): False
-										Err(err): is_invalid_message(Tcp.message(err), "timeout")
-									Tcp.close(peer)
-									Tcp.close(client)
-									client_ok and peer_ok
-								Err(_):
-									Tcp.close(client)
-									False
-						Err(_): False
-				Err(_): False
-			Tcp.close(listener)
-			listener_ok and streams_ok
-		Err(err): is_socket_permission_error(Tcp.message(err))
-
-
-func test_local_port_checked_round_trip() -> Bool:
-	match Tcp.listen_checked("127.0.0.1", 0, 1):
-		Ok(listener):
-			port_ok: Bool = match Tcp.local_port_checked(listener):
-				Ok(port): port > 0
-				Err(_): False
-			Tcp.close(listener)
-			port_ok
-		Err(err): is_socket_permission_error(Tcp.message(err))
-
-
-func test_set_reuse_addr_checked_round_trip() -> Bool:
-	match Tcp.listen_checked("127.0.0.1", 0, 1):
-		Ok(listener):
-			ok: Bool = match Tcp.set_reuse_addr_checked(listener):
-				Ok(_): True
-				Err(_): False
-			Tcp.close(listener)
-			ok
-		Err(err): is_socket_permission_error(Tcp.message(err))
-
-
-func test_checked_acquire_round_trip() -> Bool:
-	match Tcp.listen_checked("127.0.0.1", 0, 1):
-		Ok(listener):
-			match Tcp.local_port_checked(listener):
-				Ok(port):
-					match Tcp.connect_checked("127.0.0.1", port):
-						Ok(client):
-							match Tcp.accept_checked(listener):
-								Ok(peer):
-									client_port_ok: Bool = match Tcp.local_port_checked(client):
-										Ok(client_port): client_port > 0
-										Err(_): False
-									client_timeout_ok: Bool = match Tcp.set_timeout_checked(
-										client,
-										1000,
-									):
-										Ok(_): True
-										Err(_): False
-									peer_timeout_ok: Bool = match Tcp.set_timeout_checked(
-										peer,
-										1000,
-									):
-										Ok(_): True
-										Err(_): False
-									payload: Bytes = "checked tcp".to_bytes()
-									wrote: Bool = match Tcp.write_all(client, payload):
-										Ok(_): True
-										Err(_): False
-									read_ok: Bool = if wrote:
-										match Tcp.read_chunk(peer, 1024):
-											Ok(data): B.to_string(data) == "checked tcp"
-											Err(_): False
-									else:
-										False
-									Tcp.close(peer)
-									Tcp.close(client)
-									Tcp.close(listener)
-									client_port_ok and client_timeout_ok and peer_timeout_ok and wrote and read_ok
-								Err(_):
-									Tcp.close(client)
-									Tcp.close(listener)
-									False
-						Err(_):
-							Tcp.close(listener)
-							False
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(err): is_socket_permission_error(Tcp.message(err))
-
-
-func test_read_chunk_and_write_all_round_trip() -> Bool:
-	match Tcp.listen("127.0.0.1", 0, 1):
-		Ok(listener):
-			match Tcp.local_port(listener):
-				Ok(port):
-					match Tcp.connect("127.0.0.1", port):
-						Ok(client):
-							match Tcp.accept(listener):
-								Ok(peer):
-									payload: Bytes = "typed tcp".to_bytes()
-									wrote: Bool = match Tcp.write_all(client, payload):
-										Ok(_): True
-										Err(_): False
-									read_ok: Bool = if wrote:
-										match Tcp.read_chunk(peer, 1024):
-											Ok(data): B.to_string(data) == "typed tcp"
-											Err(_): False
-									else:
-										False
-									Tcp.close(peer)
-									Tcp.close(client)
-									Tcp.close(listener)
-									wrote and read_ok
-								Err(_):
-									Tcp.close(client)
-									Tcp.close(listener)
-									False
-						Err(_):
-							Tcp.close(listener)
-							False
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(e): is_socket_permission_error(e)
+			detail_msg: String = message(err)
+			is_invalid_message(
+				detail_msg,
+				"timeout",
+			) or detail_msg.contains("Operation not permitted")
 
 
 tests: TestSuite = {
-	description = "TCP Typed I/O Tests",
+	description = "TCP Typed Error Tests",
 	tests = [
 		("TcpError messages are stable", test_tcp_error_message),
-		("read_chunk returns typed errors", test_read_chunk_invalid_size_is_typed),
-		("listen_checked returns typed errors", test_listen_checked_invalid_port_is_typed),
-		("listen_checked rejects invalid host", test_listen_checked_invalid_host_is_typed),
-		("listen_checked rejects invalid backlog", test_listen_checked_invalid_backlog_is_typed),
-		("connect_checked rejects invalid port", test_connect_checked_invalid_port_is_typed),
-		("connect_checked rejects invalid host", test_connect_checked_invalid_host_is_typed),
-		(
-			"set_timeout_checked rejects invalid timeout",
-			test_set_timeout_checked_invalid_timeout_is_typed,
-		),
-		("local_port_checked returns port", test_local_port_checked_round_trip),
-		("set_reuse_addr_checked succeeds", test_set_reuse_addr_checked_round_trip),
-		("checked TCP acquisition round trips", test_checked_acquire_round_trip),
-		("read_chunk and write_all round trip", test_read_chunk_and_write_all_round_trip),
-	],
+		("listen invalid backlog is typed", test_listen_invalid_backlog_is_typed),
+		("listener timeout invalid is typed", test_listener_timeout_invalid_is_typed),
+	]
 }

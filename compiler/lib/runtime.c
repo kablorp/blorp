@@ -492,6 +492,25 @@ struct blorp_TcpStream {
 };
 typedef struct blorp_TcpStream blorp_TcpStream;
 
+typedef enum {
+    BLORP_RESOURCE_SOURCE_TCP_CONNECTIONS = 1
+} blorp_ResourceSourceKind;
+
+typedef enum {
+    BLORP_RESOURCE_SOURCE_STOP_ON_ERROR = 0,
+    BLORP_RESOURCE_SOURCE_CONTINUE_ON_ERROR = 1
+} blorp_ResourceSourceErrorPolicy;
+
+struct blorp_ResourceSource {
+    blorp_Object header;
+    blorp_ResourceSourceKind kind;
+    blorp_ResourceSourceErrorPolicy error_policy;
+    union {
+        blorp_TcpListener* tcp_listener;
+    } owner;
+};
+typedef struct blorp_ResourceSource blorp_ResourceSource;
+
 static _Atomic uint64_t blorp_tcp_next_generation = 1;
 static void blorp_tcp_suppress_sigpipe(int fd);
 static int blorp_io_reactor_set_nonblocking(int fd);
@@ -7400,6 +7419,48 @@ typedef struct {
     blorp_String* detail;
 } blorp_FileVoidResult;
 
+typedef enum {
+    BLORP_TCP_ERROR_NONE = 0,
+    BLORP_TCP_ERROR_INVALID_INPUT = 1,
+    BLORP_TCP_ERROR_TIMED_OUT = 2,
+    BLORP_TCP_ERROR_CLOSED = 3,
+    BLORP_TCP_ERROR_BUSY = 4,
+    BLORP_TCP_ERROR_DNS = 5,
+    BLORP_TCP_ERROR_CONNECTION_FAILED = 6,
+    BLORP_TCP_ERROR_INTERRUPTED = 7,
+    BLORP_TCP_ERROR_UNSUPPORTED = 8,
+    BLORP_TCP_ERROR_OTHER = 9
+} blorp_TcpErrorKind;
+
+typedef struct {
+    blorp_TcpListener* handle;
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpListenerResult;
+
+typedef struct {
+    blorp_TcpStream* handle;
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpStreamResult;
+
+typedef struct {
+    blorp_Bytes* value;
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpBytesResult;
+
+typedef struct {
+    long value;
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpIntResult;
+
+typedef struct {
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpVoidResult;
+
 // ============================================================================
 // ConcurrencyError type — used by concurrent: blocks
 // ============================================================================
@@ -11897,11 +11958,15 @@ finish:
 }
 
 void blorp_tcp_close_listener(blorp_TcpListener* listener) {
-    if (listener) blorp_tcp_inner_close(listener->inner);
+    if (!listener) return;
+    blorp_tcp_inner_close(listener->inner);
+    blorp_release(listener);
 }
 
 void blorp_tcp_close_stream(blorp_TcpStream* stream) {
-    if (stream) blorp_tcp_inner_close(stream->inner);
+    if (!stream) return;
+    blorp_tcp_inner_close(stream->inner);
+    blorp_release(stream);
 }
 
 blorp_Result* blorp_tcp_set_reuse_addr(blorp_TcpListener* listener) {
@@ -11996,6 +12061,347 @@ blorp_Result* blorp_tcp_set_timeout_listener(blorp_TcpListener* listener, long m
 blorp_Result* blorp_tcp_set_timeout_stream(blorp_TcpStream* stream, long ms) {
     return blorp_tcp_set_timeout_inner(
         stream ? stream->inner : NULL, ms, "tcp set_timeout: closed stream");
+}
+
+static bool blorp_tcp_host_value_is_valid(const blorp_String* host) {
+    return host && host->len >= 0 && host->capacity >= 0 &&
+           host->len <= host->capacity && host->len < 256;
+}
+
+static blorp_String* blorp_tcp_steal_boxed_result_payload(blorp_Result* result) {
+    if (!result) return blorp_string_literal("tcp: missing runtime result");
+    void* payload = NULL;
+    if (result->tag == BLORP_TAG_OK) {
+        payload = result->data.Ok.field0;
+    } else if (result->tag == BLORP_TAG_ERR) {
+        payload = result->data.Err.field0;
+    }
+    result->release_mask = 0;
+    blorp_release(result);
+    return (blorp_String*)payload;
+}
+
+static blorp_TcpListenerResult blorp_tcp_listener_result_error(
+    blorp_TcpErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TcpListenerResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TcpStreamResult blorp_tcp_stream_result_error(
+    blorp_TcpErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TcpStreamResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TcpBytesResult blorp_tcp_bytes_result_error(
+    blorp_TcpErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TcpBytesResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TcpIntResult blorp_tcp_int_result_error(
+    blorp_TcpErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TcpIntResult){
+        .value = 0,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TcpVoidResult blorp_tcp_void_result_error(
+    blorp_TcpErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TcpVoidResult){
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TcpListenerResult blorp_tcp_listener_result_from_boxed(
+    blorp_Result* result
+) {
+    if (!result) {
+        return blorp_tcp_listener_result_error(
+            BLORP_TCP_ERROR_OTHER, "tcp: missing runtime result");
+    }
+    if (result->tag == BLORP_TAG_OK) {
+        blorp_TcpListener* handle = (blorp_TcpListener*)result->data.Ok.field0;
+        result->release_mask = 0;
+        blorp_release(result);
+        return (blorp_TcpListenerResult){
+            .handle = handle,
+            .error_kind = BLORP_TCP_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
+    return (blorp_TcpListenerResult){
+        .handle = NULL,
+        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .detail = detail
+    };
+}
+
+static blorp_TcpStreamResult blorp_tcp_stream_result_from_boxed(
+    blorp_Result* result
+) {
+    if (!result) {
+        return blorp_tcp_stream_result_error(
+            BLORP_TCP_ERROR_OTHER, "tcp: missing runtime result");
+    }
+    if (result->tag == BLORP_TAG_OK) {
+        blorp_TcpStream* handle = (blorp_TcpStream*)result->data.Ok.field0;
+        result->release_mask = 0;
+        blorp_release(result);
+        return (blorp_TcpStreamResult){
+            .handle = handle,
+            .error_kind = BLORP_TCP_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
+    return (blorp_TcpStreamResult){
+        .handle = NULL,
+        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .detail = detail
+    };
+}
+
+static blorp_TcpBytesResult blorp_tcp_bytes_result_from_boxed(
+    blorp_Result* result
+) {
+    if (!result) {
+        return blorp_tcp_bytes_result_error(
+            BLORP_TCP_ERROR_OTHER, "tcp: missing runtime result");
+    }
+    if (result->tag == BLORP_TAG_OK) {
+        blorp_Bytes* value = (blorp_Bytes*)result->data.Ok.field0;
+        result->release_mask = 0;
+        blorp_release(result);
+        return (blorp_TcpBytesResult){
+            .value = value,
+            .error_kind = BLORP_TCP_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
+    return (blorp_TcpBytesResult){
+        .value = NULL,
+        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .detail = detail
+    };
+}
+
+static blorp_TcpIntResult blorp_tcp_int_result_from_boxed(blorp_Result* result) {
+    if (!result) {
+        return blorp_tcp_int_result_error(
+            BLORP_TCP_ERROR_OTHER, "tcp: missing runtime result");
+    }
+    if (result->tag == BLORP_TAG_OK) {
+        long value = (long)result->data.Ok.field0;
+        result->release_mask = 0;
+        blorp_release(result);
+        return (blorp_TcpIntResult){
+            .value = value,
+            .error_kind = BLORP_TCP_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
+    return (blorp_TcpIntResult){
+        .value = 0,
+        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .detail = detail
+    };
+}
+
+static blorp_TcpVoidResult blorp_tcp_void_result_from_boxed(
+    blorp_Result* result
+) {
+    if (!result) {
+        return blorp_tcp_void_result_error(
+            BLORP_TCP_ERROR_OTHER, "tcp: missing runtime result");
+    }
+    if (result->tag == BLORP_TAG_OK) {
+        result->release_mask = 0;
+        blorp_release(result);
+        return (blorp_TcpVoidResult){
+            .error_kind = BLORP_TCP_ERROR_NONE,
+            .detail = NULL
+        };
+    }
+    blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
+    return (blorp_TcpVoidResult){
+        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .detail = detail
+    };
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_raw(
+    blorp_String* host,
+    long port,
+    long backlog
+) {
+    if (!blorp_tcp_host_value_is_valid(host)) {
+        return blorp_tcp_listener_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "host must be shorter than 256 bytes");
+    }
+    if (port < 0 || port > 65535) {
+        return blorp_tcp_listener_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "port must be between 0 and 65535");
+    }
+    if (backlog < 0 || backlog > INT_MAX) {
+        return blorp_tcp_listener_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "backlog must be between 0 and 2147483647");
+    }
+    return blorp_tcp_listener_result_from_boxed(
+        blorp_tcp_listen(host, port, backlog));
+}
+
+blorp_TcpStreamResult blorp_tcp_accept_raw(blorp_TcpListener* listener) {
+    return blorp_tcp_stream_result_from_boxed(blorp_tcp_accept(listener));
+}
+
+static blorp_ResourceSource* blorp_tcp_connection_source_new(
+    blorp_TcpListener* listener,
+    blorp_ResourceSourceErrorPolicy error_policy
+) {
+    blorp_ResourceSource* source =
+        (blorp_ResourceSource*)blorp_alloc(sizeof(blorp_ResourceSource));
+    BLORP_TAG(source, "ResourceSource");
+    source->kind = BLORP_RESOURCE_SOURCE_TCP_CONNECTIONS;
+    source->error_policy = error_policy;
+    source->owner.tcp_listener = listener;
+    return source;
+}
+
+blorp_ResourceSource* blorp_tcp_connections_stop_on_error_raw(
+    blorp_TcpListener* listener
+) {
+    return blorp_tcp_connection_source_new(
+        listener, BLORP_RESOURCE_SOURCE_STOP_ON_ERROR);
+}
+
+blorp_ResourceSource* blorp_tcp_connections_continue_on_error_raw(
+    blorp_TcpListener* listener
+) {
+    return blorp_tcp_connection_source_new(
+        listener, BLORP_RESOURCE_SOURCE_CONTINUE_ON_ERROR);
+}
+
+bool blorp_resource_source_next_raw(blorp_ResourceSource* source, void** out) {
+    if (out) *out = NULL;
+    if (!source || !out) return false;
+
+    switch (source->kind) {
+        case BLORP_RESOURCE_SOURCE_TCP_CONNECTIONS: {
+            blorp_TcpStreamResult result =
+                blorp_tcp_accept_raw(source->owner.tcp_listener);
+            if (result.error_kind == BLORP_TCP_ERROR_NONE) {
+                *out = (void*)result.handle;
+                return true;
+            }
+            if (result.detail) blorp_release(result.detail);
+            return false;
+        }
+        default:
+            return false;
+    }
+}
+
+blorp_TcpStreamResult blorp_tcp_connect_raw(blorp_String* host, long port) {
+    if (!blorp_tcp_host_value_is_valid(host)) {
+        return blorp_tcp_stream_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "host must be shorter than 256 bytes");
+    }
+    if (port < 0 || port > 65535) {
+        return blorp_tcp_stream_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "port must be between 0 and 65535");
+    }
+    return blorp_tcp_stream_result_from_boxed(blorp_tcp_connect(host, port));
+}
+
+blorp_TcpBytesResult blorp_tcp_read_raw(blorp_TcpStream* stream, long max_bytes) {
+    if (max_bytes <= 0 || max_bytes > BLORP_TCP_MAX_READ_BYTES) {
+        return blorp_tcp_bytes_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "max_bytes must be between 1 and 67108864");
+    }
+    return blorp_tcp_bytes_result_from_boxed(blorp_tcp_read(stream, max_bytes));
+}
+
+blorp_TcpIntResult blorp_tcp_write_raw(blorp_TcpStream* stream, blorp_Bytes* data) {
+    return blorp_tcp_int_result_from_boxed(blorp_tcp_write(stream, data));
+}
+
+blorp_TcpVoidResult blorp_tcp_write_all_raw(
+    blorp_TcpStream* stream,
+    blorp_Bytes* data
+) {
+    return blorp_tcp_void_result_from_boxed(blorp_tcp_write(stream, data));
+}
+
+blorp_TcpVoidResult blorp_tcp_set_reuse_addr_raw(blorp_TcpListener* listener) {
+    return blorp_tcp_void_result_from_boxed(blorp_tcp_set_reuse_addr(listener));
+}
+
+blorp_TcpIntResult blorp_tcp_local_port_listener_raw(
+    blorp_TcpListener* listener
+) {
+    return blorp_tcp_int_result_from_boxed(blorp_tcp_local_port_listener(listener));
+}
+
+blorp_TcpIntResult blorp_tcp_local_port_stream_raw(blorp_TcpStream* stream) {
+    return blorp_tcp_int_result_from_boxed(blorp_tcp_local_port_stream(stream));
+}
+
+blorp_TcpVoidResult blorp_tcp_set_timeout_listener_raw(
+    blorp_TcpListener* listener,
+    long ms
+) {
+    if (!blorp_tcp_timeout_ms_is_valid(ms)) {
+        return blorp_tcp_void_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "timeout must be between 0 and 18446744073709 ms");
+    }
+    return blorp_tcp_void_result_from_boxed(
+        blorp_tcp_set_timeout_listener(listener, ms));
+}
+
+blorp_TcpVoidResult blorp_tcp_set_timeout_stream_raw(
+    blorp_TcpStream* stream,
+    long ms
+) {
+    if (!blorp_tcp_timeout_ms_is_valid(ms)) {
+        return blorp_tcp_void_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "timeout must be between 0 and 18446744073709 ms");
+    }
+    return blorp_tcp_void_result_from_boxed(
+        blorp_tcp_set_timeout_stream(stream, ms));
 }
 
 // ============================================================================
@@ -15545,6 +15951,32 @@ void blorp_task_cancel_join_release(void* t) {
     blorp_release(task);
 }
 
+long blorp_test_cancel_after_parked(blorp_Closure* func) {
+    if (!func) return 0;
+    blorp_Task* task = (blorp_Task*)blorp_task_spawn(func);
+    bool observed_parked = false;
+
+    for (int i = 0; i < 100000; i++) {
+        pthread_mutex_lock(&task->mutex);
+        bool completed = task->completed;
+        blorp_Fiber* task_fiber = task->task_fiber;
+        bool parked =
+            task_fiber &&
+            __atomic_load_n(&task_fiber->parked, __ATOMIC_ACQUIRE) != 0;
+        pthread_mutex_unlock(&task->mutex);
+
+        if (parked) {
+            observed_parked = true;
+            break;
+        }
+        if (completed) break;
+        sched_yield();
+    }
+
+    blorp_task_cancel_join_release(task);
+    return observed_parked ? 1 : 0;
+}
+
 void* blorp_concurrent_join(void* t, long timeout_ms) {
     if (__blorp_cancel_current_task_if_requested()) {
         return blorp_result_err((void*)blorp_Cancelled);
@@ -15670,8 +16102,15 @@ long blorp_max_threads(void) {
 // Channel[T] — Bounded MPMC channel
 // ============================================================================
 
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool signaled;
+} blorp_SelectNonfiberWake;
+
 typedef struct blorp_ChannelSelectWaiter {
     blorp_Fiber* fiber;
+    blorp_SelectNonfiberWake* nonfiber_wake;
     struct blorp_ChannelSelectWaiter* next;
 } blorp_ChannelSelectWaiter;
 
@@ -15827,6 +16266,12 @@ static void __ch_select_waiters_wake_all_locked(blorp_Channel* ch) {
         blorp_ChannelSelectWaiter* next = waiter->next;
         waiter->next = NULL;
         if (waiter->fiber) blorp_fiber_schedule(waiter->fiber);
+        if (waiter->nonfiber_wake) {
+            pthread_mutex_lock(&waiter->nonfiber_wake->mutex);
+            waiter->nonfiber_wake->signaled = true;
+            pthread_cond_broadcast(&waiter->nonfiber_wake->cond);
+            pthread_mutex_unlock(&waiter->nonfiber_wake->mutex);
+        }
         waiter = next;
     }
 }
@@ -16429,20 +16874,71 @@ static void blorp_select_restore_running_fiber(blorp_Fiber* self) {
     __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
 }
 
-static void blorp_select_sleep_nonfiber_until(uint64_t deadline_ns) {
-    long sleep_ms = 1;
-    if (deadline_ns > 0) {
-        uint64_t now_ns = blorp_monotonic_now_ns();
-        if (deadline_ns <= now_ns) return;
-        uint64_t delta_ns = deadline_ns - now_ns;
-        uint64_t delta_ms = delta_ns / 1000000ULL;
-        if (delta_ns % 1000000ULL != 0) delta_ms++;
-        if (delta_ms == 0) delta_ms = 1;
-        if (delta_ms < (uint64_t)sleep_ms) sleep_ms = (long)delta_ms;
+static void blorp_select_nonfiber_wake_init(blorp_SelectNonfiberWake* wake) {
+    pthread_mutex_init(&wake->mutex, NULL);
+    pthread_cond_init(&wake->cond, NULL);
+    wake->signaled = false;
+}
+
+static void blorp_select_nonfiber_wake_destroy(blorp_SelectNonfiberWake* wake) {
+    pthread_cond_destroy(&wake->cond);
+    pthread_mutex_destroy(&wake->mutex);
+}
+
+static struct timespec blorp_realtime_after_ns(uint64_t delta_ns) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    uint64_t add_sec = delta_ns / 1000000000ULL;
+    uint64_t add_nsec = delta_ns % 1000000000ULL;
+    if (add_sec > (uint64_t)LONG_MAX ||
+        deadline.tv_sec > (time_t)(LONG_MAX - (long)add_sec - 1)) {
+        deadline.tv_sec = (time_t)LONG_MAX;
+        deadline.tv_nsec = 999999999L;
+        return deadline;
     }
+    deadline.tv_sec += (time_t)add_sec;
+    deadline.tv_nsec += (long)add_nsec;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return deadline;
+}
+
+static void blorp_select_nonfiber_wait_until_woken(
+    blorp_SelectNonfiberWake* wake,
+    uint64_t deadline_ns
+) {
+    pthread_mutex_lock(&wake->mutex);
+    if (!wake->signaled) {
+        if (deadline_ns > 0 && deadline_ns != UINT64_MAX) {
+            uint64_t now_ns = blorp_monotonic_now_ns();
+            if (deadline_ns > now_ns) {
+                struct timespec deadline =
+                    blorp_realtime_after_ns(deadline_ns - now_ns);
+                while (!wake->signaled) {
+                    int rc =
+                        pthread_cond_timedwait(&wake->cond, &wake->mutex, &deadline);
+                    if (rc == ETIMEDOUT) break;
+                }
+            }
+        } else {
+            while (!wake->signaled) {
+                pthread_cond_wait(&wake->cond, &wake->mutex);
+            }
+        }
+    }
+    pthread_mutex_unlock(&wake->mutex);
+}
+
+static void blorp_select_sleep_nonfiber_until(uint64_t deadline_ns) {
+    if (deadline_ns == 0 || deadline_ns == UINT64_MAX) return;
+    uint64_t now_ns = blorp_monotonic_now_ns();
+    if (deadline_ns <= now_ns) return;
+    uint64_t delta_ns = deadline_ns - now_ns;
     struct timespec ts;
-    ts.tv_sec = sleep_ms / 1000;
-    ts.tv_nsec = (sleep_ms % 1000) * 1000000L;
+    ts.tv_sec = delta_ns / 1000000000ULL;
+    ts.tv_nsec = (long)(delta_ns % 1000000000ULL);
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
 }
 
@@ -16467,7 +16963,46 @@ blorp_SelectResult blorp_select_wait(blorp_SelectArm* arms, long arm_count) {
             blorp_select_next_deadline(arms, arm_count, start_ns);
         blorp_Fiber* self = __blorp_current_fiber;
         if (!self) {
-            blorp_select_sleep_nonfiber_until(next_deadline);
+            long waiter_count = blorp_select_channel_arm_count(arms, arm_count);
+            if (waiter_count <= 0) {
+                blorp_select_sleep_nonfiber_until(next_deadline);
+                continue;
+            }
+
+            blorp_SelectNonfiberWake wake;
+            blorp_select_nonfiber_wake_init(&wake);
+            blorp_ChannelSelectWaiter* waiters =
+                (blorp_ChannelSelectWaiter*)blorp_calloc_checked(
+                    waiter_count, sizeof(blorp_ChannelSelectWaiter));
+
+            long waiter_index = 0;
+            for (long i = 0; i < arm_count; i++) {
+                if (arms[i].kind != BLORP_SELECT_RECV &&
+                    arms[i].kind != BLORP_SELECT_SEALED) {
+                    continue;
+                }
+                blorp_Channel* ch = arms[i].channel;
+                blorp_ChannelSelectWaiter* waiter = &waiters[waiter_index++];
+                waiter->fiber = NULL;
+                waiter->nonfiber_wake = &wake;
+                waiter->next = NULL;
+                if (!ch) continue;
+                pthread_mutex_lock(&ch->mutex);
+                __ch_select_waiter_enqueue_locked(ch, waiter);
+                pthread_mutex_unlock(&ch->mutex);
+            }
+
+            if (blorp_select_try_ready(arms, arm_count, start_ns, scan_start, &result)) {
+                blorp_select_remove_waiters(arms, arm_count, waiters);
+                free(waiters);
+                blorp_select_nonfiber_wake_destroy(&wake);
+                return result;
+            }
+
+            blorp_select_nonfiber_wait_until_woken(&wake, next_deadline);
+            blorp_select_remove_waiters(arms, arm_count, waiters);
+            free(waiters);
+            blorp_select_nonfiber_wake_destroy(&wake);
             continue;
         }
 
@@ -16488,6 +17023,7 @@ blorp_SelectResult blorp_select_wait(blorp_SelectArm* arms, long arm_count) {
             blorp_Channel* ch = arms[i].channel;
             blorp_ChannelSelectWaiter* waiter = &waiters[waiter_index++];
             waiter->fiber = self;
+            waiter->nonfiber_wake = NULL;
             waiter->next = NULL;
             if (!ch) continue;
             pthread_mutex_lock(&ch->mutex);

@@ -196,7 +196,54 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
         (name ^ " is not a parallel boundary")
         false
         (has_effect name Parallel_boundary))
-    [ "map"; "print"; "length" ]
+    [ "map"; "print"; "length" ];
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " is a cancellation point")
+        true
+        (is_cancellation_point name))
+    [
+      "sleep";
+      "yield_now";
+      "send";
+      "recv";
+      "send_timeout";
+      "recv_timeout";
+      "send_timeout_attempt";
+      "recv_timeout_attempt";
+      "cancel_after_parked_for_test";
+      "blorp_tcp_accept";
+      "blorp_tcp_connect";
+      "blorp_tcp_read";
+      "blorp_tcp_write";
+      "blorp_tcp_accept_raw";
+      "blorp_tcp_connect_raw";
+      "blorp_tcp_read_raw";
+      "blorp_tcp_write_raw";
+      "blorp_tcp_write_all_raw";
+    ];
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " is not a cancellation point")
+        false
+        (is_cancellation_point name))
+    [
+      "channel";
+      "try_send";
+      "try_recv";
+      "try_send_attempt";
+      "try_recv_attempt";
+      "seal";
+      "read";
+      "write";
+      "blorp_tcp_listen";
+      "blorp_tcp_listen_raw";
+      "blorp_tcp_local_port_listener_raw";
+      "blorp_tcp_set_timeout_listener_raw";
+      "parallel";
+    ]
 
 let test_type_metadata_classifies_typechecker_policy () =
   let open Blorp in

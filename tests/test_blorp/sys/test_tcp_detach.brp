@@ -1,440 +1,66 @@
--- TCP detach regression coverage.
---
--- This protects the current typed-handle API while TCP resource migration is
--- still pending. Once TcpStream becomes a resource, the detached accepted-stream
--- shape should become a compile-time error and this test should migrate to the
--- structured resource-source spelling.
+-- Detach remains useful with TCP resources when tasks acquire their own
+-- streams. Accepted streams are scoped resources and must not be detached.
 import:
 	bytes as B
-	net/tcp as Tcp
+	net/tcp: TcpError, accept, connect, listen, local_port, message, read_chunk, write_all
 	string: contains
 	test: TestSuite
 
 
-pure func is_socket_permission_error(err: String) -> Bool:
-	err.contains("Operation not permitted") or err.contains("Permission denied")
+pure func is_socket_permission_error(err: TcpError) -> Bool:
+	detail_msg: String = message(err)
+	detail_msg.contains("Operation not permitted") or detail_msg.contains("Permission denied")
 
 
-func echo_stream_once(stream: TcpStream) -> Bool:
-	var ok: Bool = False
-	match Tcp.read(stream, 64):
-		Ok(data):
-			match Tcp.write(stream, data):
-				Ok(written): ok = written == data.length()
-				Err(_): ok = False
-		Err(_): ok = False
-	Tcp.close(stream)
-	ok
+func send_one_byte(port: Int, value: Int, done: Channel[Int]) -> Bool:
+	result: Int = match send_one_byte_result(port, value):
+		Ok(n): n
+		Err(_): -1000
+	_ = send(done, result)
+	result == value
 
 
-func detached_echo_handler(stream: TcpStream, done: Channel[Int]) -> Bool:
-	ok: Bool = echo_stream_once(stream)
-	if ok:
-		_ = send(done, 1)
-	else:
-		_ = send(done, -1000)
-	ok
+func send_one_byte_result(port: Int, value: Int) -> Result[Int, TcpError]:
+	with stream ?= connect("127.0.0.1", port):
+		payload: Bytes = B
+			.bytes(1)
+			.fill(value)
+		ignored ?= write_all(stream, payload)
+		Ok(value)
 
 
-func accept_echo_loop(listener: TcpListener, count: Int) -> Int:
-	var handled: Int = 0
-	var failed: Int = 0
-	while handled + failed < count:
-		match Tcp.accept(listener):
-			Ok(stream):
-				if echo_stream_once(stream):
-					handled += 1
-				else:
-					failed += 1
-			Err(_): failed += 1
-	if failed == 0:
-		handled
-	else:
-		0 - failed
+func recv_or_zero(done: Channel[Int]) -> Int:
+	match recv(done):
+		Some(value): value
+		None: 0
 
 
-func accept_detached_echo_handlers(listener: TcpListener, count: Int, done: Channel[Int]) -> Int:
-	var accepted: Int = 0
-	var failed: Int = 0
-	while accepted + failed < count:
-		match Tcp.accept(listener):
-			Ok(peer):
-				detach detached_echo_handler(peer, done)
-				accepted += 1
-			Err(_): failed += 1
-	if failed == 0:
-		accepted
-	else:
-		0 - failed
+func scoped_detached_clients() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 4):
+		port ?= local_port(listener)
+		done: Channel[Int] = channel(2)
+		detach send_one_byte(port, 7, done)
+		detach send_one_byte(port, 9, done)
+		with first ?= accept(listener):
+			first_data ?= read_chunk(first, 1)
+			with second ?= accept(listener):
+				second_data ?= read_chunk(second, 1)
+				total: Int = recv_or_zero(done) + recv_or_zero(done)
+				Ok(first_data.length() == 1 and second_data.length() == 1 and total == 16)
 
 
-func echo_client(port: Int, value: Int) -> Bool:
-	match Tcp.connect("127.0.0.1", port):
-		Ok(stream):
-			payload: Bytes = B
-				.bytes(1)
-				.fill(value)
-			var wrote_ok: Bool = False
-			var read_ok: Bool = False
-			match Tcp.write(stream, payload):
-				Ok(written): wrote_ok = written == 1
-				Err(_): wrote_ok = False
-			if wrote_ok:
-				match Tcp.read(stream, 64):
-					Ok(data): read_ok = data.get(0) == Some(value)
-					Err(_): read_ok = False
-			Tcp.close(stream)
-			wrote_ok and read_ok
-		Err(_): False
-
-
-pure func bool_task_result_count(result: Result[Bool, ConcurrencyError]) -> Int:
-	match result:
-		Ok(value):
-			if value:
-				1
-			else:
-				0
-		Err(_): 0
-
-
-func test_structured_accept_loop_echo() -> Bool:
-	match Tcp.listen("127.0.0.1", 0, 16):
-		Ok(listener):
-			match Tcp.local_port(listener):
-				Ok(port):
-					concurrent(max_threads: 4, timeout: 5000):
-						server = accept_echo_loop(listener, 8)
-						clients = run_eight_echo_clients(port)
-					server_ok: Bool = match server:
-						Ok(n): n == 8
-						Err(_): False
-					clients_ok: Bool = match clients:
-						Ok(n): n == 8
-						Err(_): False
-					Tcp.close(listener)
-					server_ok and clients_ok
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(e): is_socket_permission_error(e)
-
-
-func run_eight_echo_clients(port: Int) -> Int:
-	concurrent(max_threads: 4, timeout: 5000):
-		c1 = echo_client(port, 41)
-		c2 = echo_client(port, 42)
-		c3 = echo_client(port, 43)
-		c4 = echo_client(port, 44)
-		c5 = echo_client(port, 45)
-		c6 = echo_client(port, 46)
-		c7 = echo_client(port, 47)
-		c8 = echo_client(port, 48)
-	var total: Int = 0
-	total += bool_task_result_count(c1)
-	total += bool_task_result_count(c2)
-	total += bool_task_result_count(c3)
-	total += bool_task_result_count(c4)
-	total += bool_task_result_count(c5)
-	total += bool_task_result_count(c6)
-	total += bool_task_result_count(c7)
-	total += bool_task_result_count(c8)
-	total
-
-
-func run_eight_echo_clients_sequential(port: Int) -> Int:
-	var total: Int = 0
-	if echo_client(port, 41):
-		total += 1
-	if echo_client(port, 42):
-		total += 1
-	if echo_client(port, 43):
-		total += 1
-	if echo_client(port, 44):
-		total += 1
-	if echo_client(port, 45):
-		total += 1
-	if echo_client(port, 46):
-		total += 1
-	if echo_client(port, 47):
-		total += 1
-	if echo_client(port, 48):
-		total += 1
-	total
-
-
-func wait_for_detached_handlers(done: Channel[Int], count: Int) -> Int:
-	var seen: Int = 0
-	var score: Int = 0
-	while seen < count:
-		match recv_timeout(done, 1000):
-			Some(value):
-				score += value
-				seen += 1
-			None:
-				score -= 100000
-				seen = count
-	score
-
-
-func accept_error_message(listener: TcpListener) -> String:
-	match Tcp.accept(listener):
-		Ok(stream):
-			Tcp.close(stream)
-			"accepted"
-		Err(e): e
-
-
-func accept_error_message_then_signal(listener: TcpListener, ready: Channel[Int]) -> String:
-	message: String = accept_error_message(listener)
-	_ = send(ready, 1)
-	message
-
-
-func read_error_message(stream: TcpStream) -> String:
-	match Tcp.read(stream, 1):
-		Ok(_): "read"
-		Err(e): e
-
-
-func read_error_message_then_signal(stream: TcpStream, ready: Channel[Int]) -> String:
-	message: String = read_error_message(stream)
-	_ = send(ready, 1)
-	message
-
-
-func delayed_connect_and_close(port: Int, delay_ms: Int) -> Bool:
-	sleep(delay_ms)
-	match Tcp.connect("127.0.0.1", port):
-		Ok(stream):
-			Tcp.close(stream)
-			True
-		Err(_): False
-
-
-func connect_after_signal(ready: Channel[Int], port: Int) -> Bool:
-	match recv_timeout(ready, 500):
-		Some(_): delayed_connect_and_close(port, 0)
-		None: False
-
-
-func delayed_write_byte(stream: TcpStream, delay_ms: Int, value: Int) -> Bool:
-	sleep(delay_ms)
-	payload: Bytes = B
-		.bytes(1)
-		.fill(value)
-	match Tcp.write(stream, payload):
-		Ok(written): written == 1
-		Err(_): False
-
-
-func write_byte_after_signal(ready: Channel[Int], stream: TcpStream, value: Int) -> Bool:
-	match recv_timeout(ready, 500):
-		Some(_): delayed_write_byte(stream, 0, value)
-		None: False
-
-
-pure func string_task_result_contains(
-	result: Result[String, ConcurrencyError],
-	fragment: String,
-) -> Bool:
-	match result:
-		Ok(message): message.contains(fragment)
-		Err(_): False
-
-
-pure func string_task_result_eq(result: Result[String, ConcurrencyError], expected: String) -> Bool:
-	match result:
-		Ok(message): message == expected
-		Err(_): False
-
-
-func test_overlapping_accept_reports_in_progress() -> Bool:
-	match Tcp.listen("127.0.0.1", 0, 16):
-		Ok(listener):
-			match Tcp.set_timeout(listener, 100):
-				Ok(_):
-					concurrent(max_threads: 1, timeout: 1000):
-						first = accept_error_message(listener)
-						second = accept_error_message(listener)
-					first_busy: Bool = string_task_result_contains(first, "already in progress")
-					second_busy: Bool = string_task_result_contains(second, "already in progress")
-					first_closed: Bool = string_task_result_contains(first, "closed")
-					second_closed: Bool = string_task_result_contains(second, "closed")
-					Tcp.close(listener)
-					(first_busy or second_busy) and not first_closed and not second_closed
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(e): is_socket_permission_error(e)
-
-
-func test_overlapping_accept_preserves_active_waiter() -> Bool:
-	match Tcp.listen("127.0.0.1", 0, 16):
-		Ok(listener):
-			match Tcp.local_port(listener):
-				Ok(port):
-					ready: Channel[Int] = channel(1)
-					concurrent(max_threads: 1, timeout: 1000):
-						first = accept_error_message_then_signal(listener, ready)
-						second = accept_error_message_then_signal(listener, ready)
-						client = connect_after_signal(ready, port)
-					first_accepted: Bool = string_task_result_eq(first, "accepted")
-					second_accepted: Bool = string_task_result_eq(second, "accepted")
-					first_busy: Bool = string_task_result_contains(first, "already in progress")
-					second_busy: Bool = string_task_result_contains(second, "already in progress")
-					client_ok: Bool = bool_task_result_count(client) == 1
-					pair_ok: Bool = first_accepted and second_busy or second_accepted and first_busy
-					Tcp.close(listener)
-					pair_ok and client_ok
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(e): is_socket_permission_error(e)
-
-
-func test_overlapping_read_reports_in_progress() -> Bool:
-	match Tcp.listen("127.0.0.1", 0, 16):
-		Ok(listener):
-			match Tcp.local_port(listener):
-				Ok(port):
-					match Tcp.connect("127.0.0.1", port):
-						Ok(client):
-							match Tcp.accept(listener):
-								Ok(peer):
-									match Tcp.set_timeout(peer, 100):
-										Ok(_):
-											concurrent(max_threads: 1, timeout: 1000):
-												first = read_error_message(peer)
-												second = read_error_message(peer)
-											first_busy: Bool = string_task_result_contains(
-												first,
-												"already in progress",
-											)
-											second_busy: Bool = string_task_result_contains(
-												second,
-												"already in progress",
-											)
-											first_closed: Bool = string_task_result_contains(
-												first,
-												"closed",
-											)
-											second_closed: Bool = string_task_result_contains(
-												second,
-												"closed",
-											)
-											Tcp.close(peer)
-											Tcp.close(client)
-											Tcp.close(listener)
-											(first_busy or second_busy) and not first_closed and not second_closed
-										Err(_):
-											Tcp.close(peer)
-											Tcp.close(client)
-											Tcp.close(listener)
-											False
-								Err(_):
-									Tcp.close(client)
-									Tcp.close(listener)
-									False
-						Err(_):
-							Tcp.close(listener)
-							False
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(e): is_socket_permission_error(e)
-
-
-func test_overlapping_read_preserves_active_waiter() -> Bool:
-	match Tcp.listen("127.0.0.1", 0, 16):
-		Ok(listener):
-			match Tcp.local_port(listener):
-				Ok(port):
-					match Tcp.connect("127.0.0.1", port):
-						Ok(client):
-							match Tcp.accept(listener):
-								Ok(peer):
-									ready: Channel[Int] = channel(1)
-									concurrent(max_threads: 1, timeout: 1000):
-										first = read_error_message_then_signal(peer, ready)
-										second = read_error_message_then_signal(peer, ready)
-										wrote = write_byte_after_signal(ready, client, 77)
-									first_read: Bool = string_task_result_eq(first, "read")
-									second_read: Bool = string_task_result_eq(second, "read")
-									first_busy: Bool = string_task_result_contains(
-										first,
-										"already in progress",
-									)
-									second_busy: Bool = string_task_result_contains(
-										second,
-										"already in progress",
-									)
-									wrote_ok: Bool = bool_task_result_count(wrote) == 1
-									pair_ok: Bool = first_read and second_busy or second_read and first_busy
-									Tcp.close(peer)
-									Tcp.close(client)
-									Tcp.close(listener)
-									pair_ok and wrote_ok
-								Err(_):
-									Tcp.close(client)
-									Tcp.close(listener)
-									False
-						Err(_):
-							Tcp.close(listener)
-							False
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(e): is_socket_permission_error(e)
-
-
-func test_detached_accepted_streams_echo() -> Bool:
-	match Tcp.listen("127.0.0.1", 0, 16):
-		Ok(listener):
-			match Tcp.local_port(listener):
-				Ok(port):
-					done: Channel[Int] = channel(8)
-					concurrent(max_threads: 4, timeout: 5000):
-						server = accept_detached_echo_handlers(listener, 8, done)
-						clients = run_eight_echo_clients_sequential(port)
-					server_ok: Bool = match server:
-						Ok(n): n == 8
-						Err(_): False
-					clients_ok: Bool = match clients:
-						Ok(n): n == 8
-						Err(_): False
-					done_ok: Bool = wait_for_detached_handlers(done, 8) == 8
-					Tcp.close(listener)
-					server_ok and clients_ok and done_ok
-				Err(_):
-					Tcp.close(listener)
-					False
-		Err(e): is_socket_permission_error(e)
+func test_detached_clients_can_use_scoped_tcp() -> Bool:
+	match scoped_detached_clients():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
 
 
 tests: TestSuite = {
-	description = "TCP Detach Regression Tests",
+	description = "TCP Detach Resource Tests",
 	tests = [
-		("structured TCP accept loop echoes under loopback load", test_structured_accept_loop_echo),
 		(
-			"detached accepted TCP streams echo under loopback load",
-			test_detached_accepted_streams_echo,
-		),
-		(
-			"overlapping TCP accept reports in-progress wait",
-			test_overlapping_accept_reports_in_progress,
-		),
-		(
-			"overlapping TCP accept preserves active waiter",
-			test_overlapping_accept_preserves_active_waiter,
-		),
-		(
-			"overlapping TCP read reports in-progress wait",
-			test_overlapping_read_reports_in_progress,
-		),
-		(
-			"overlapping TCP read preserves active waiter",
-			test_overlapping_read_preserves_active_waiter,
+			"detached clients acquire their own scoped streams",
+			test_detached_clients_can_use_scoped_tcp,
 		),
 	],
 }

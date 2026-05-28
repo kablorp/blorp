@@ -107,7 +107,7 @@
 ## Networking (`net/`)
 | Module | Description |
 |--------|-------------|
-| `net/tcp` | TCP sockets (listen, accept, connect, send, recv) |
+| `net/tcp` | Scoped TCP sockets (listen, accept, connect, typed read/write, connection source shape) |
 | `net/http` | Pure HTTP/1.1 request/response parsing |
 | `net/url` | URL parsing |
 | `net/mime` | MIME type detection |

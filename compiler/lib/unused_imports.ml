@@ -381,7 +381,7 @@ let rec scan_expr scope refs expr =
       scan_expr scope (scan_block scope refs exprs) timeout
   | EConcurrentBind (_name, ty, rhs) ->
       scan_type_opt scope (scan_expr scope refs rhs) ty
-  | EConcurrentFor (name, iterable, body, timeout, _) ->
+  | EConcurrentlyLoop (name, iterable, body, timeout, _) ->
       let refs = scan_expr scope refs iterable in
       let refs = scan_expr (add_term_binding name scope) refs body in
       Option.fold ~none:refs ~some:(scan_expr scope refs) timeout

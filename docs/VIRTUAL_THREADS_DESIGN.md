@@ -209,10 +209,10 @@ order:
    before changing scheduler behavior.
 
 3. **Core concurrency semantics**
-   Document and enforce the Core meaning of `CConcurrent` and `CConcurrentFor`:
+   Document and enforce the Core meaning of `CConcurrent` and `CConcurrentlyLoop`:
    fixed-block task spawning, bounded dynamic fan-out, result ordering for
    collected forms, timeout cancellation, closure capture ownership,
-   `limit`/legacy `max_threads` handling, and the exact points where child
+   loop `limit` / block `max_threads` handling, and the exact points where child
    results become managed values.
 
    Hardening target: extend Core invariants so backend emission can assume
@@ -221,7 +221,7 @@ order:
    makes an earlier check impossible.
 
    Initial compiler hardening: final Core invariants now enforce the typed
-   result contract for `CConcurrent` and `CConcurrentFor`: task bodies have raw
+   result contract for `CConcurrent` and `CConcurrentlyLoop`: task bodies have raw
    type `T`, joined bindings have public type `TaskResult[T]` backed by
    canonical Core `Result[T, ConcurrencyError]`,
    collected fan-out expressions have `List[Result[T, ConcurrencyError]]`,

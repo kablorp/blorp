@@ -955,11 +955,11 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
               conc_timeout = Option.map resolve_same block.conc_timeout;
             };
       }
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       {
         e with
         desc =
-          CConcurrentFor
+          CConcurrentlyLoop
             {
               cf with
               cf_iter = resolve_same cf.cf_iter;

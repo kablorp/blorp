@@ -273,7 +273,7 @@ and expr_has_runtime_free_var bound e =
   | CFor (binder, iter, body) ->
       expr_has_runtime_free_var bound iter
       || expr_has_runtime_free_var (add_var bound binder.loop_var) body
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       expr_has_runtime_free_var bound cf.cf_iter
       || expr_has_runtime_free_var (add_var bound cf.cf_var) cf.cf_body
       || option_exists (expr_has_runtime_free_var bound) cf.cf_timeout

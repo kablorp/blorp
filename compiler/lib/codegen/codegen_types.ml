@@ -558,8 +558,15 @@ let type_to_c ~(reg : registry) ty =
               | "FallibleStream" | "std/stream::FallibleStream"
               | "std_stream__FallibleStream" ->
                   "blorp_FallibleStream*"
-              | "TcpListener" -> "blorp_TcpListener*"
-              | "TcpStream" -> "blorp_TcpStream*"
+              | "ResourceSource" | "std/stream::ResourceSource"
+              | "std_stream__ResourceSource" ->
+                  "blorp_ResourceSource*"
+              | "TcpListener" | "std/net/tcp::TcpListener"
+              | "std_net_tcp__TcpListener" ->
+                  "blorp_TcpListener*"
+              | "TcpStream" | "std/net/tcp::TcpStream"
+              | "std_net_tcp__TcpStream" ->
+                  "blorp_TcpStream*"
               | "FileReader" | "std/file::FileReader" | "std_file__FileReader"
                 ->
                   "blorp_FileReader*"
@@ -597,8 +604,15 @@ let type_to_c ~(reg : registry) ty =
               | "FallibleStream" | "std/stream::FallibleStream"
               | "std_stream__FallibleStream" ->
                   "blorp_FallibleStream*"
-              | "TcpListener" -> "blorp_TcpListener*"
-              | "TcpStream" -> "blorp_TcpStream*"
+              | "ResourceSource" | "std/stream::ResourceSource"
+              | "std_stream__ResourceSource" ->
+                  "blorp_ResourceSource*"
+              | "TcpListener" | "std/net/tcp::TcpListener"
+              | "std_net_tcp__TcpListener" ->
+                  "blorp_TcpListener*"
+              | "TcpStream" | "std/net/tcp::TcpStream"
+              | "std_net_tcp__TcpStream" ->
+                  "blorp_TcpStream*"
               | "FileReader" | "std/file::FileReader" | "std_file__FileReader"
                 ->
                   "blorp_FileReader*"

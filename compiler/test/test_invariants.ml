@@ -1210,19 +1210,19 @@ let concurrent_block_expr ?timeout ?max_threads ?(node_ty = ty_void) bindings
        })
     node_ty
 
-let concurrent_for_expr ?iter_ty ?body_ty ?node_ty ?timeout ?task_ty ?task_scope
-    ?output () =
+let concurrently_loop_expr ?iter_ty ?body_ty ?node_ty ?timeout ?task_ty
+    ?task_scope ?output () =
   let iter_ty = Option.value iter_ty ~default:(ty_list ty_int) in
   let body_ty = Option.value body_ty ~default:ty_int in
   let node_ty = Option.value node_ty ~default:(ty_list (ty_result body_ty)) in
   let task_ty = Option.value task_ty ~default:body_ty in
-  let width = Core.ConcurrentForLimit (cint 2) in
+  let width = Core.ConcurrentlyLoopLimit (cint 2) in
   let task_scope =
     Option.value task_scope ~default:Core.synthetic_concurrent_task_scope
   in
-  let output = Option.value output ~default:Core.ConcurrentForCollect in
+  let output = Option.value output ~default:Core.ConcurrentlyLoopCollect in
   mk
-    (CConcurrentFor
+    (CConcurrentlyLoop
        {
          cf_var = Var.named "item";
          cf_iter = mk (CVar (Var.named "items")) iter_ty;
@@ -1350,8 +1350,8 @@ let test_concurrent_semantics_flags_non_positive_max_threads () =
         (Modules.contains v.Core_error.msg "max_threads")
   | _ -> Alcotest.fail "unreachable"
 
-let test_concurrent_semantics_flags_non_list_concurrent_for () =
-  let node = concurrent_for_expr ~iter_ty:(TyNamed ("Set", [ ty_int ])) () in
+let test_concurrent_semantics_flags_non_list_concurrently_loop () =
+  let node = concurrently_loop_expr ~iter_ty:(TyNamed ("Set", [ ty_int ])) () in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
   let violations =
     Core_invariants.check_concurrent_semantics_at Core_stage.Final prog
@@ -1364,9 +1364,9 @@ let test_concurrent_semantics_flags_non_list_concurrent_for () =
         (Modules.contains v.Core_error.msg "requires List")
   | _ -> Alcotest.fail "unreachable"
 
-let test_concurrent_semantics_flags_concurrent_for_result_shape () =
+let test_concurrent_semantics_flags_concurrently_loop_result_shape () =
   let node =
-    concurrent_for_expr ~body_ty:ty_string
+    concurrently_loop_expr ~body_ty:ty_string
       ~node_ty:(ty_list (ty_result ty_int))
       ()
   in
@@ -1378,13 +1378,14 @@ let test_concurrent_semantics_flags_concurrent_for_result_shape () =
   match violations with
   | [ v ] ->
       Alcotest.(check bool)
-        "mentions concurrent-for result" true
-        (Modules.contains v.Core_error.msg "concurrent-for result type")
+        "mentions for ... concurrently result" true
+        (Modules.contains v.Core_error.msg "for ... concurrently result type")
   | _ -> Alcotest.fail "unreachable"
 
 let test_concurrent_semantics_flags_discard_body_result () =
   let node =
-    concurrent_for_expr ~node_ty:ty_void ~output:Core.ConcurrentForDiscard ()
+    concurrently_loop_expr ~node_ty:ty_void ~output:Core.ConcurrentlyLoopDiscard
+      ()
   in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
   let violations =
@@ -1395,7 +1396,8 @@ let test_concurrent_semantics_flags_discard_body_result () =
   | [ v ] ->
       Alcotest.(check bool)
         "mentions discard body type" true
-        (Modules.contains v.Core_error.msg "discarding concurrent-for body type")
+        (Modules.contains v.Core_error.msg
+           "discarding for ... concurrently body type")
   | _ -> Alcotest.fail "unreachable"
 
 let test_concurrent_semantics_flags_malformed_task_scope () =
@@ -1405,7 +1407,7 @@ let test_concurrent_semantics_flags_malformed_task_scope () =
       task_child_scope_id = TaskScopeId 7;
     }
   in
-  let node = concurrent_for_expr ~task_scope:bad_scope () in
+  let node = concurrently_loop_expr ~task_scope:bad_scope () in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:node) ] in
   let violations =
     Core_invariants.check_concurrent_semantics_at Core_stage.Final prog
@@ -2264,12 +2266,12 @@ let suite =
           test_concurrent_semantics_flags_timeout_type;
         Alcotest.test_case "flags non-positive max_threads" `Quick
           test_concurrent_semantics_flags_non_positive_max_threads;
-        Alcotest.test_case "flags non-list concurrent for" `Quick
-          test_concurrent_semantics_flags_non_list_concurrent_for;
-        Alcotest.test_case "flags concurrent-for result shape" `Quick
-          test_concurrent_semantics_flags_concurrent_for_result_shape;
-        Alcotest.test_case "flags concurrent-for discard body result" `Quick
-          test_concurrent_semantics_flags_discard_body_result;
+        Alcotest.test_case "flags non-list for ... concurrently" `Quick
+          test_concurrent_semantics_flags_non_list_concurrently_loop;
+        Alcotest.test_case "flags for ... concurrently result shape" `Quick
+          test_concurrent_semantics_flags_concurrently_loop_result_shape;
+        Alcotest.test_case "flags for ... concurrently discard body result"
+          `Quick test_concurrent_semantics_flags_discard_body_result;
         Alcotest.test_case "flags malformed task scope" `Quick
           test_concurrent_semantics_flags_malformed_task_scope;
         Alcotest.test_case "dispatcher runs final check" `Quick

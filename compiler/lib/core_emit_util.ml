@@ -291,7 +291,7 @@ let collect_free_vars (e : core) : (string * Ast.type_expr) list =
           (fun _ a _ -> Some a)
           acquire
           (StringMap.union (fun _ a _ -> Some a) body cleanup)
-    | CConcurrentFor cf ->
+    | CConcurrentlyLoop cf ->
         let i = go bound cf.cf_iter in
         let b = go (StringSet.add cf.cf_var.vname bound) cf.cf_body in
         let timeout =

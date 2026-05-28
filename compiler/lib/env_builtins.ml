@@ -1414,7 +1414,7 @@ let with_builtins (env : env) : env =
       }
   in
 
-  (* Channel builtins (impure - block on send/recv, close) *)
+  (* Channel builtins (impure - block on send/recv) *)
   let ty_channel_t = TyNamed ("Channel", [ ty_t ]) in
   let ty_option_t = TyNamed ("Option", [ ty_t ]) in
   let env =
@@ -1465,7 +1465,6 @@ let with_builtins (env : env) : env =
       ~type_params:[ generic_param "T" [] ]
       ~origin:Builtin ()
   in
-
   (* Push a new scope so user declarations are separate from builtins.
      This lets lookup_in_current_scope see only user symbols while
      lookup still finds builtins in the outer scope. *)

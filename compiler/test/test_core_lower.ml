@@ -1009,16 +1009,16 @@ let test_lower_concurrent_preserves_explicit_bindings () =
       | _ -> Alcotest.fail "expected two conc_bindings")
   | _ -> Alcotest.fail "expected CConcurrent"
 
-let test_lower_concurrent_for () =
+let test_lower_concurrently_loop () =
   let range = mk_ast (ERange (ast_int 0, ast_int 10)) ty_range in
   let ast =
     mk_ast
-      (EConcurrentFor ("i", range, ast_void, None, ConcurrentForLimit 2))
+      (EConcurrentlyLoop ("i", range, ast_void, None, ConcurrentlyLoopLimit 2))
       ty_void
   in
   let c = lower_expr ast in
   match c.desc with
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       let parent_id =
         task_scope_id_to_int cf.cf_task_scope.task_parent_scope_id
       in
@@ -1026,47 +1026,48 @@ let test_lower_concurrent_for () =
         task_scope_id_to_int cf.cf_task_scope.task_child_scope_id
       in
       Alcotest.(check bool)
-        "void concurrent-for discards results" true
+        "void for ... concurrently discards results" true
         (match cf.cf_output with
-        | ConcurrentForDiscard -> true
-        | ConcurrentForCollect -> false);
+        | ConcurrentlyLoopDiscard -> true
+        | ConcurrentlyLoopCollect -> false);
       Alcotest.(check int) "root parent scope" 0 parent_id;
       Alcotest.(check bool) "fresh child scope" true (child_id > 0);
       Alcotest.(check bool)
         "child scope differs from parent" true (child_id <> parent_id)
-  | _ -> Alcotest.fail "expected CConcurrentFor"
+  | _ -> Alcotest.fail "expected CConcurrentlyLoop"
 
-let test_lower_nested_concurrent_for_task_scopes () =
+let test_lower_nested_concurrently_loop_task_scopes () =
   let outer_range = mk_ast (ERange (ast_int 0, ast_int 10)) ty_range in
   let inner_range = mk_ast (ERange (ast_int 0, ast_int 10)) ty_range in
   let inner =
     mk_ast
-      (EConcurrentFor ("j", inner_range, ast_void, None, ConcurrentForLimit 2))
+      (EConcurrentlyLoop
+         ("j", inner_range, ast_void, None, ConcurrentlyLoopLimit 2))
       ty_void
   in
   let outer =
     mk_ast
-      (EConcurrentFor ("i", outer_range, inner, None, ConcurrentForLimit 2))
+      (EConcurrentlyLoop ("i", outer_range, inner, None, ConcurrentlyLoopLimit 2))
       ty_void
   in
   let c = lower_expr outer in
   match c.desc with
-  | CConcurrentFor outer_cf -> (
+  | CConcurrentlyLoop outer_cf -> (
       Alcotest.(check bool)
-        "outer void concurrent-for discards results" true
+        "outer void for ... concurrently discards results" true
         (match outer_cf.cf_output with
-        | ConcurrentForDiscard -> true
-        | ConcurrentForCollect -> false);
+        | ConcurrentlyLoopDiscard -> true
+        | ConcurrentlyLoopCollect -> false);
       let outer_child_id =
         task_scope_id_to_int outer_cf.cf_task_scope.task_child_scope_id
       in
       match outer_cf.cf_body.desc with
-      | CConcurrentFor inner_cf ->
+      | CConcurrentlyLoop inner_cf ->
           Alcotest.(check bool)
-            "inner void concurrent-for discards results" true
+            "inner void for ... concurrently discards results" true
             (match inner_cf.cf_output with
-            | ConcurrentForDiscard -> true
-            | ConcurrentForCollect -> false);
+            | ConcurrentlyLoopDiscard -> true
+            | ConcurrentlyLoopCollect -> false);
           let inner_parent_id =
             task_scope_id_to_int inner_cf.cf_task_scope.task_parent_scope_id
           in
@@ -1078,8 +1079,8 @@ let test_lower_nested_concurrent_for_task_scopes () =
           Alcotest.(check bool)
             "inner child is fresh" true
             (inner_child_id <> inner_parent_id)
-      | _ -> Alcotest.fail "expected nested CConcurrentFor")
-  | _ -> Alcotest.fail "expected CConcurrentFor"
+      | _ -> Alcotest.fail "expected nested CConcurrentlyLoop")
+  | _ -> Alcotest.fail "expected CConcurrentlyLoop"
 
 (* ============================================================================
    Type preservation invariant
@@ -2310,9 +2311,10 @@ let suite =
           test_lower_concurrent_rejects_non_bindings;
         Alcotest.test_case "concurrent_preserves_explicit_bindings" `Quick
           test_lower_concurrent_preserves_explicit_bindings;
-        Alcotest.test_case "concurrent_for" `Quick test_lower_concurrent_for;
-        Alcotest.test_case "nested_concurrent_for_task_scopes" `Quick
-          test_lower_nested_concurrent_for_task_scopes;
+        Alcotest.test_case "concurrently_loop" `Quick
+          test_lower_concurrently_loop;
+        Alcotest.test_case "nested_concurrently_loop_task_scopes" `Quick
+          test_lower_nested_concurrently_loop_task_scopes;
       ] );
     ( "invariants",
       [

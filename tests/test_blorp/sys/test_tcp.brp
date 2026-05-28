@@ -1,1059 +1,268 @@
--- Test TCP networking basics
--- Uses loopback self-connection pattern: listen, connect, accept, write, read, close
+-- TCP resource tests.
+--
+-- TCP handles are scoped resources. Tests keep listener/stream values inside
+-- `with` blocks and communicate with detached clients through channels.
 import:
 	bytes as B
-	instrumentation: SchedulerStats, get_scheduler_stats, reset_scheduler_stats
-	net/tcp as Tcp
-	string: contains, repeat
-	system: now_microseconds
+	net/tcp:
+		TcpError,
+		TcpStream,
+		accept,
+		connect,
+		connections_continue_on_error,
+		connections_stop_on_error,
+		listen,
+		local_port,
+		message,
+		read_chunk,
+		set_reuse_addr,
+		set_stream_timeout,
+		set_timeout,
+		write_all,
+	stream: ResourceSource
+	string: contains, starts_with
 	test: TestSuite
 
 
-pure func is_socket_permission_error(err: String) -> Bool:
-	err.contains("Operation not permitted") or err.contains("Permission denied")
+pure func is_socket_permission_error(err: TcpError) -> Bool:
+	detail_msg: String = message(err)
+	detail_msg.contains("Operation not permitted") or detail_msg.contains("Permission denied")
 
 
-func accept_and_close(listener: TcpListener) -> Bool:
-	match Tcp.accept(listener):
-		Ok(peer):
-			Tcp.close(peer)
-			True
-		Err(_): False
+pure func is_invalid_message(message: String, detail: String) -> Bool:
+	message.starts_with("invalid input: ") and message.contains(detail)
 
 
-func delayed_connect_and_close(port: Int) -> Bool:
-	sleep(25)
-	match Tcp.connect("127.0.0.1", port):
-		Ok(client):
-			Tcp.close(client)
-			True
-		Err(_): False
+pure func long_host() -> String:
+	var host: String = ""
+	var i: Int = 0
+	while i < 256:
+		host += "a"
+		i += 1
+	host
 
 
-func accept_reports_error(listener: TcpListener) -> Bool:
-	match Tcp.accept(listener):
-		Ok(peer):
-			Tcp.close(peer)
-			False
-		Err(_): True
+func client_echo_once(port: Int, value: Int) -> Result[Int, TcpError]:
+	with stream ?= connect("127.0.0.1", port):
+		payload: Bytes = B
+			.bytes(1)
+			.fill(value)
+		ignored ?= write_all(stream, payload)
+		reply ?= read_chunk(stream, 64)
+		match reply.get(0):
+			Some(byte): Ok(byte)
+			None: Ok(-1)
 
 
-func close_listener_after(listener: TcpListener, delay_ms: Int) -> Bool:
-	sleep(delay_ms)
-	Tcp.close(listener)
-	True
+func detached_echo_client(port: Int, value: Int, done: Channel[Int]) -> Bool:
+	actual: Int = match client_echo_once(port, value):
+		Ok(byte): byte
+		Err(_): -1000
+	_ = send(done, actual)
+	actual == value
 
 
-func read_matches_string(stream: TcpStream, expected: String) -> Bool:
-	match Tcp.read(stream, 64):
-		Ok(data): B.to_string(data) == expected
-		Err(_): False
+func scoped_echo_once() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 16):
+		port ?= local_port(listener)
+		done: Channel[Int] = channel(1)
+		detach detached_echo_client(port, 42, done)
+		with peer ?= accept(listener):
+			data ?= read_chunk(peer, 64)
+			ignored ?= write_all(peer, data)
+			match recv(done):
+				Some(actual): Ok(actual == 42)
+				None: Ok(False)
 
 
-func read_reports_error(stream: TcpStream) -> Bool:
-	match Tcp.read(stream, 64):
+func test_listen_and_local_port() -> Bool:
+	match scoped_listen_and_local_port():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_listen_and_local_port() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		port ?= local_port(listener)
+		Ok(port > 0)
+
+
+func test_listen_any_host() -> Bool:
+	match scoped_listen_any_host():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_listen_any_host() -> Result[Bool, TcpError]:
+	with listener ?= listen("", 0, 1):
+		port ?= local_port(listener)
+		Ok(port > 0)
+
+
+func test_connections_source_shape() -> Bool:
+	match scoped_connections_source_shape():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_connections_source_shape() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		stop_source: ResourceSource[TcpStream, TcpError] = connections_stop_on_error(listener)
+		continue_source: ResourceSource[TcpStream, TcpError] = connections_continue_on_error(
+			listener,
+		)
+		Ok(True)
+
+
+func test_connections_source_for_echo() -> Bool:
+	match scoped_connections_source_for_echo():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_connections_source_for_echo() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 16):
+		port ?= local_port(listener)
+		done: Channel[Int] = channel(1)
+		detach detached_echo_client(port, 77, done)
+		var echoed: Bool = False
+		for peer in connections_stop_on_error(listener):
+			match read_chunk(peer, 64):
+				Ok(data):
+					match write_all(peer, data):
+						Ok(_): echoed = True
+						Err(_): echoed = False
+				Err(_): echoed = False
+			break
+		match recv(done):
+			Some(actual): Ok(echoed and actual == 77)
+			None: Ok(False)
+
+
+func test_scoped_echo_round_trip() -> Bool:
+	match scoped_echo_once():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func test_invalid_listen_port_is_typed() -> Bool:
+	match invalid_listen_port_result():
 		Ok(_): False
-		Err(_): True
+		Err(err): is_invalid_message(message(err), "port")
 
 
-func delayed_write_string(stream: TcpStream, message: String) -> Bool:
-	sleep(25)
-	match Tcp.write(stream, message.to_bytes()):
-		Ok(written): written == message.length()
-		Err(_): False
+func invalid_listen_port_result() -> Result[Bool, TcpError]:
+	with _ ?= listen("127.0.0.1", -1, 1):
+		Ok(False)
 
 
-func close_stream_after(stream: TcpStream, delay_ms: Int) -> Bool:
-	sleep(delay_ms)
-	Tcp.close(stream)
-	True
-
-
-func make_stream_nonblocking(stream: TcpStream) -> Bool:
-	match Tcp.set_timeout(stream, 1):
-		Ok(_):
-			read_reports_error(stream)
-		Err(_): False
-
-
-func write_filled_bytes(stream: TcpStream, size: Int, value: Int) -> Bool:
-	payload: Bytes = B
-		.bytes(size)
-		.fill(value)
-	match Tcp.write(stream, payload):
-		Ok(written): written == size
-		Err(_): False
-
-
-func write_filled_bytes_reports_error(stream: TcpStream, size: Int, value: Int) -> Bool:
-	payload: Bytes = B
-		.bytes(size)
-		.fill(value)
-	match Tcp.write(stream, payload):
+func test_invalid_listen_host_is_typed() -> Bool:
+	match invalid_listen_host_result():
 		Ok(_): False
+		Err(err): is_invalid_message(message(err), "host")
+
+
+func invalid_listen_host_result() -> Result[Bool, TcpError]:
+	with _ ?= listen(long_host(), 0, 1):
+		Ok(False)
+
+
+func test_invalid_connect_port_is_typed() -> Bool:
+	match invalid_connect_port_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "port")
+
+
+func invalid_connect_port_result() -> Result[Bool, TcpError]:
+	with _ ?= connect("127.0.0.1", 70000):
+		Ok(False)
+
+
+func test_read_chunk_invalid_size_is_typed() -> Bool:
+	match scoped_invalid_read_size():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_invalid_read_size() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		port ?= local_port(listener)
+		with client ?= connect("127.0.0.1", port):
+			with peer ?= accept(listener):
+				negative: Bool = match read_chunk(peer, -1):
+					Ok(_): False
+					Err(err): is_invalid_message(message(err), "max_bytes")
+				zero: Bool = match read_chunk(peer, 0):
+					Ok(_): False
+					Err(err): is_invalid_message(message(err), "max_bytes")
+				too_large: Bool = match read_chunk(peer, 67108865):
+					Ok(_): False
+					Err(err): is_invalid_message(message(err), "max_bytes")
+				Ok(negative and zero and too_large)
+
+
+func test_set_timeout_invalid_is_typed() -> Bool:
+	match scoped_invalid_timeout():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_invalid_timeout() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		listener_ok: Bool = match set_timeout(listener, -1):
+			Ok(_): False
+			Err(err): is_invalid_message(message(err), "timeout")
+		port ?= local_port(listener)
+		with client ?= connect("127.0.0.1", port):
+			with peer ?= accept(listener):
+				client_ok: Bool = match set_stream_timeout(client, -1):
+					Ok(_): False
+					Err(err): is_invalid_message(message(err), "timeout")
+				peer_ok: Bool = match set_stream_timeout(peer, -1):
+					Ok(_): False
+					Err(err): is_invalid_message(message(err), "timeout")
+				Ok(listener_ok and client_ok and peer_ok)
+
+
+func test_set_reuse_addr() -> Bool:
+	match scoped_set_reuse_addr():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_set_reuse_addr() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		ignored ?= set_reuse_addr(listener)
+		Ok(True)
+
+
+func test_accept_timeout_reports_error() -> Bool:
+	match scoped_accept_timeout():
+		Ok(ok): ok
 		Err(_): True
 
 
-func read_exact_count(stream: TcpStream, expected: Int) -> Bool:
-	var total: Int = 0
-	var ok: Bool = True
-	while total < expected and ok:
-		match Tcp.read(stream, 65536):
-			Ok(data):
-				chunk_len: Int = data.length()
-				if chunk_len == 0:
-					ok = False
-				else:
-					total += chunk_len
-			Err(_): ok = False
-	ok and total == expected
+func scoped_accept_timeout() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		ignored ?= set_timeout(listener, 10)
+		with _ ?= accept(listener):
+			Ok(False)
 
 
 tests: TestSuite = {
-	description = "TCP Tests",
+	description = "TCP Resource Tests",
 	tests = [
-		(
-			"Listen and close",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(fd):
-						match Tcp.local_port(fd):
-							Ok(port):
-								Tcp.close(fd)
-								port > 0
-							Err(_):
-								Tcp.close(fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Listen on any host uses passive bind",
-			func():
-				match Tcp.listen("", 0, 1):
-					Ok(fd):
-						match Tcp.local_port(fd):
-							Ok(port):
-								Tcp.close(fd)
-								port > 0
-							Err(_):
-								Tcp.close(fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Listen on invalid port fails",
-			func():
-				match Tcp.listen("127.0.0.1", -1, 1):
-					Ok(fd):
-						Tcp.close(fd)
-						False
-					Err(_): True
-		)
-		,
-		(
-			"Listen on negative backlog fails",
-			func():
-				match Tcp.listen("127.0.0.1", 0, -1):
-					Ok(fd):
-						Tcp.close(fd)
-						False
-					Err(e): e.contains("backlog")
-		)
-		,
-		(
-			"Listen on oversized backlog fails",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 2147483648):
-					Ok(fd):
-						Tcp.close(fd)
-						False
-					Err(e): e.contains("backlog")
-		)
-		,
-		(
-			"Listen rejects overlong host without truncation",
-			func():
-				long_host: String = "a".repeat(256)
-				match Tcp.listen(long_host, 0, 1):
-					Ok(fd):
-						Tcp.close(fd)
-						False
-					Err(e): e.contains("host too long")
-		)
-		,
-		(
-			"Connect rejects overlong host without truncation",
-			func():
-				long_host: String = "a".repeat(256)
-				match Tcp.connect(long_host, 80):
-					Ok(stream):
-						Tcp.close(stream)
-						False
-					Err(e): e.contains("host too long")
-		)
-		,
-		(
-			"Self-connect write and read round-trip",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(server_fd):
-						match Tcp.local_port(server_fd):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client_fd):
-										match Tcp.accept(server_fd):
-											Ok(peer_fd):
-												msg: Bytes = "hello tcp".to_bytes()
-												match Tcp.write(client_fd, msg):
-													Ok(_):
-														match Tcp.read(peer_fd, 1024):
-															Ok(data):
-																result: Bool = B.to_string(
-																	data,
-																) == "hello tcp"
-																Tcp.close(peer_fd)
-																Tcp.close(client_fd)
-																Tcp.close(server_fd)
-																result
-															Err(_):
-																Tcp.close(peer_fd)
-																Tcp.close(client_fd)
-																Tcp.close(server_fd)
-																False
-													Err(_):
-														Tcp.close(peer_fd)
-														Tcp.close(client_fd)
-														Tcp.close(server_fd)
-														False
-											Err(_):
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												False
-									Err(_):
-										Tcp.close(server_fd)
-										False
-							Err(_):
-								Tcp.close(server_fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Set timeout succeeds",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(fd):
-						match Tcp.set_timeout(fd, 1000):
-							Ok(_):
-								Tcp.close(fd)
-								True
-							Err(_):
-								Tcp.close(fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Set listener negative timeout fails",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(fd):
-						match Tcp.set_timeout(fd, -1):
-							Ok(_):
-								Tcp.close(fd)
-								False
-							Err(e):
-								Tcp.close(fd)
-								e.contains("timeout")
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Set stream negative timeout fails",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												match Tcp.set_timeout(client, -1):
-													Ok(_):
-														Tcp.close(peer)
-														Tcp.close(client)
-														Tcp.close(listener)
-														False
-													Err(e):
-														Tcp.close(peer)
-														Tcp.close(client)
-														Tcp.close(listener)
-														e.contains("timeout")
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Connect refused returns error",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								Tcp.close(listener)
-								match Tcp.connect("127.0.0.1", port):
-									Ok(stream):
-										Tcp.close(stream)
-										False
-									Err(_): True
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Close is idempotent",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(fd):
-						Tcp.close(fd)
-						Tcp.close(fd)
-						True
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Listener helpers fail after close",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(fd):
-						Tcp.close(fd)
-						local_port_failed: Bool = match Tcp.local_port(fd):
-							Ok(_): False
-							Err(e): e.contains("closed")
-						timeout_failed: Bool = match Tcp.set_timeout(fd, 10):
-							Ok(_): False
-							Err(e): e.contains("closed")
-						local_port_failed and timeout_failed
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read and write on closed stream fail",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(server_fd):
-						match Tcp.local_port(server_fd):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client_fd):
-										match Tcp.accept(server_fd):
-											Ok(peer_fd):
-												Tcp.close(client_fd)
-												Tcp.close(peer_fd)
-												write_failed: Bool = match Tcp.write(
-													client_fd,
-													"x".to_bytes(),
-												):
-													Ok(_): False
-													Err(_): True
-												read_failed: Bool = match Tcp.read(peer_fd, 1):
-													Ok(_): False
-													Err(_): True
-												Tcp.close(server_fd)
-												write_failed and read_failed
-											Err(_):
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												False
-									Err(_):
-										Tcp.close(server_fd)
-										False
-							Err(_):
-								Tcp.close(server_fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Stream helpers fail after close",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(server_fd):
-						match Tcp.local_port(server_fd):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client_fd):
-										match Tcp.accept(server_fd):
-											Ok(peer_fd):
-												Tcp.close(client_fd)
-												Tcp.close(peer_fd)
-												local_port_failed: Bool = match Tcp.local_port(
-													client_fd,
-												):
-													Ok(_): False
-													Err(e): e.contains("closed")
-												timeout_failed: Bool = match Tcp.set_timeout(
-													client_fd,
-													10,
-												):
-													Ok(_): False
-													Err(e): e.contains("closed")
-												Tcp.close(server_fd)
-												local_port_failed and timeout_failed
-											Err(_):
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												False
-									Err(_):
-										Tcp.close(server_fd)
-										False
-							Err(_):
-								Tcp.close(server_fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read zero bytes returns empty bytes",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(server_fd):
-						match Tcp.local_port(server_fd):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client_fd):
-										match Tcp.accept(server_fd):
-											Ok(peer_fd):
-												match Tcp.read(peer_fd, 0):
-													Ok(data):
-														result: Bool = data.length() == 0
-														Tcp.close(peer_fd)
-														Tcp.close(client_fd)
-														Tcp.close(server_fd)
-														result
-													Err(_):
-														Tcp.close(peer_fd)
-														Tcp.close(client_fd)
-														Tcp.close(server_fd)
-														False
-											Err(_):
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												False
-									Err(_):
-										Tcp.close(server_fd)
-										False
-							Err(_):
-								Tcp.close(server_fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read negative byte count fails",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(server_fd):
-						match Tcp.local_port(server_fd):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client_fd):
-										match Tcp.accept(server_fd):
-											Ok(peer_fd):
-												read_failed: Bool = match Tcp.read(peer_fd, -1):
-													Ok(_): False
-													Err(e): e.contains("max_bytes")
-												Tcp.close(peer_fd)
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												read_failed
-											Err(_):
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												False
-									Err(_):
-										Tcp.close(server_fd)
-										False
-							Err(_):
-								Tcp.close(server_fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read oversized byte count fails",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(server_fd):
-						match Tcp.local_port(server_fd):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client_fd):
-										match Tcp.accept(server_fd):
-											Ok(peer_fd):
-												read_failed: Bool = match Tcp.read(
-													peer_fd,
-													67108865,
-												):
-													Ok(_): False
-													Err(e): e.contains("max_bytes")
-												Tcp.close(peer_fd)
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												read_failed
-											Err(_):
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												False
-									Err(_):
-										Tcp.close(server_fd)
-										False
-							Err(_):
-								Tcp.close(server_fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Write empty bytes succeeds",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(server_fd):
-						match Tcp.local_port(server_fd):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client_fd):
-										match Tcp.accept(server_fd):
-											Ok(peer_fd):
-												empty: Bytes = B.bytes(0)
-												match Tcp.write(client_fd, empty):
-													Ok(n):
-														Tcp.close(peer_fd)
-														Tcp.close(client_fd)
-														Tcp.close(server_fd)
-														n == 0
-													Err(_):
-														Tcp.close(peer_fd)
-														Tcp.close(client_fd)
-														Tcp.close(server_fd)
-														False
-											Err(_):
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												False
-									Err(_):
-										Tcp.close(server_fd)
-										False
-							Err(_):
-								Tcp.close(server_fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Write empty bytes on closed stream fails",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(server_fd):
-						match Tcp.local_port(server_fd):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client_fd):
-										match Tcp.accept(server_fd):
-											Ok(peer_fd):
-												empty: Bytes = B.bytes(0)
-												Tcp.close(client_fd)
-												Tcp.close(peer_fd)
-												write_failed: Bool = match Tcp.write(
-													client_fd,
-													empty,
-												):
-													Ok(_): False
-													Err(_): True
-												Tcp.close(server_fd)
-												write_failed
-											Err(_):
-												Tcp.close(client_fd)
-												Tcp.close(server_fd)
-												False
-									Err(_):
-										Tcp.close(server_fd)
-										False
-							Err(_):
-								Tcp.close(server_fd)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Accept parks on a single worker",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								reset_scheduler_stats()
-								concurrent(max_threads: 1, timeout: 1000):
-									accepted = accept_and_close(listener)
-									connected = delayed_connect_and_close(port)
-								stats: SchedulerStats = get_scheduler_stats()
-								accepted_ok: Bool = match accepted:
-									Ok(result): result
-									Err(_): False
-								connected_ok: Bool = match connected:
-									Ok(result): result
-									Err(_): False
-								Tcp.close(listener)
-								accepted_ok and connected_ok and stats.fiber_parks >= 2
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Accept timeout wakes parked fiber",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.set_timeout(listener, 25):
-							Ok(_):
-								reset_scheduler_stats()
-								concurrent(max_threads: 1, timeout: 1000):
-									accepted = accept_reports_error(listener)
-								stats: SchedulerStats = get_scheduler_stats()
-								accepted_ok: Bool = match accepted:
-									Ok(result): result
-									Err(_): False
-								Tcp.close(listener)
-								accepted_ok and stats.fiber_parks >= 1
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Accept wakes when listener closes",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						reset_scheduler_stats()
-						concurrent(max_threads: 1, timeout: 1000):
-							accepted = accept_reports_error(listener)
-							closed = close_listener_after(listener, 25)
-						stats: SchedulerStats = get_scheduler_stats()
-						accepted_ok: Bool = match accepted:
-							Ok(result): result
-							Err(_): False
-						closed_ok: Bool = match closed:
-							Ok(result): result
-							Err(_): False
-						accepted_ok and closed_ok and stats.fiber_parks >= 2
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Accept is cancelled by concurrent timeout",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						reset_scheduler_stats()
-						start: Int = now_microseconds()
-						concurrent(max_threads: 1, timeout: 30):
-							accepted = accept_and_close(listener)
-						elapsed_ms: Int = (now_microseconds() - start) / 1000
-						stats: SchedulerStats = get_scheduler_stats()
-						cancelled: Bool = match accepted:
-							Ok(_): False
-							Err(_): True
-						Tcp.close(listener)
-						cancelled and elapsed_ms < 200 and stats.fiber_parks >= 1
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read parks on a single worker",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												reset_scheduler_stats()
-												concurrent(max_threads: 1, timeout: 1000):
-													read_matches = read_matches_string(
-														peer,
-														"read wake",
-													)
-													wrote = delayed_write_string(
-														client,
-														"read wake",
-													)
-												stats: SchedulerStats = get_scheduler_stats()
-												read_ok: Bool = match read_matches:
-													Ok(value): value
-													Err(_): False
-												write_ok: Bool = match wrote:
-													Ok(value): value
-													Err(_): False
-												Tcp.close(peer)
-												Tcp.close(client)
-												Tcp.close(listener)
-												read_ok and write_ok and stats.fiber_parks >= 2 and stats.reactor_ready_events >= 1 and stats.reactor_waiter_wakes >= 1
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read timeout wakes parked fiber",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												match Tcp.set_timeout(peer, 25):
-													Ok(_):
-														reset_scheduler_stats()
-														concurrent(max_threads: 1, timeout: 1000):
-															read_failed = read_reports_error(peer)
-														stats: SchedulerStats = get_scheduler_stats()
-														read_failed_ok: Bool = match read_failed:
-															Ok(result): result
-															Err(_): False
-														Tcp.close(peer)
-														Tcp.close(client)
-														Tcp.close(listener)
-														read_failed_ok and stats.fiber_parks >= 1
-													Err(_):
-														Tcp.close(peer)
-														Tcp.close(client)
-														Tcp.close(listener)
-														False
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read wakes when stream closes",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												reset_scheduler_stats()
-												concurrent(max_threads: 1, timeout: 1000):
-													read_failed = read_reports_error(peer)
-													closed = close_stream_after(peer, 25)
-												stats: SchedulerStats = get_scheduler_stats()
-												read_failed_ok: Bool = match read_failed:
-													Ok(result): result
-													Err(_): False
-												closed_ok: Bool = match closed:
-													Ok(result): result
-													Err(_): False
-												Tcp.close(client)
-												Tcp.close(listener)
-												read_failed_ok and closed_ok and stats.fiber_parks >= 2
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read is cancelled by concurrent timeout",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												reset_scheduler_stats()
-												start: Int = now_microseconds()
-												concurrent(max_threads: 1, timeout: 30):
-													read_blocked = read_matches_string(
-														peer,
-														"never",
-													)
-												elapsed_ms: Int = (now_microseconds() - start) / 1000
-												stats: SchedulerStats = get_scheduler_stats()
-												cancelled: Bool = match read_blocked:
-													Ok(_): False
-													Err(_): True
-												Tcp.close(peer)
-												Tcp.close(client)
-												Tcp.close(listener)
-												cancelled and elapsed_ms < 200 and stats.fiber_parks >= 1
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Read EOF returns empty bytes",
-			func():
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												Tcp.close(client)
-												match Tcp.read(peer, 64):
-													Ok(data):
-														result: Bool = B.to_string(data) == ""
-														Tcp.close(peer)
-														Tcp.close(listener)
-														result
-													Err(_):
-														Tcp.close(peer)
-														Tcp.close(listener)
-														False
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Write parks and completes under backpressure",
-			func():
-				size: Int = 8388608
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												if make_stream_nonblocking(client):
-													match Tcp.set_timeout(client, 1000):
-														Ok(_):
-															reset_scheduler_stats()
-															concurrent(max_threads: 1, timeout: 3000):
-																wrote = write_filled_bytes(
-																	client,
-																	size,
-																	65,
-																)
-																read_all = read_exact_count(
-																	peer,
-																	size,
-																)
-															stats: SchedulerStats = get_scheduler_stats()
-															write_ok: Bool = match wrote:
-																Ok(result): result
-																Err(_): False
-															read_ok: Bool = match read_all:
-																Ok(result): result
-																Err(_): False
-															Tcp.close(peer)
-															Tcp.close(client)
-															Tcp.close(listener)
-															write_ok and read_ok and stats.fiber_parks >= 1
-														Err(_):
-															Tcp.close(peer)
-															Tcp.close(client)
-															Tcp.close(listener)
-															False
-												else:
-													Tcp.close(peer)
-													Tcp.close(client)
-													Tcp.close(listener)
-													False
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Write timeout wakes parked fiber",
-			func():
-				size: Int = 8388608
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												if make_stream_nonblocking(client):
-													match Tcp.set_timeout(client, 25):
-														Ok(_):
-															reset_scheduler_stats()
-															concurrent(max_threads: 1, timeout: 1000):
-																write_failed = write_filled_bytes_reports_error(
-																	client,
-																	size,
-																	66,
-																)
-															stats: SchedulerStats = get_scheduler_stats()
-															write_failed_ok: Bool = match write_failed:
-																Ok(result): result
-																Err(_): False
-															Tcp.close(peer)
-															Tcp.close(client)
-															Tcp.close(listener)
-															write_failed_ok and stats.fiber_parks >= 1
-														Err(_):
-															Tcp.close(peer)
-															Tcp.close(client)
-															Tcp.close(listener)
-															False
-												else:
-													Tcp.close(peer)
-													Tcp.close(client)
-													Tcp.close(listener)
-													False
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
-		,
-		(
-			"Write wakes when stream closes",
-			func():
-				size: Int = 33554432
-				match Tcp.listen("127.0.0.1", 0, 1):
-					Ok(listener):
-						match Tcp.local_port(listener):
-							Ok(port):
-								match Tcp.connect("127.0.0.1", port):
-									Ok(client):
-										match Tcp.accept(listener):
-											Ok(peer):
-												if make_stream_nonblocking(client):
-													match Tcp.set_timeout(client, 10000):
-														Ok(_):
-															concurrent(max_threads: 1, timeout: 1000):
-																write_failed = write_filled_bytes_reports_error(
-																	client,
-																	size,
-																	67,
-																)
-																closed = close_stream_after(
-																	client,
-																	25,
-																)
-															write_failed_ok: Bool = match write_failed:
-																Ok(result): result
-																Err(_): False
-															closed_ok: Bool = match closed:
-																Ok(result): result
-																Err(_): False
-															Tcp.close(peer)
-															Tcp.close(listener)
-															write_failed_ok and closed_ok
-														Err(_):
-															Tcp.close(peer)
-															Tcp.close(client)
-															Tcp.close(listener)
-															False
-												else:
-													Tcp.close(peer)
-													Tcp.close(client)
-													Tcp.close(listener)
-													False
-											Err(_):
-												Tcp.close(client)
-												Tcp.close(listener)
-												False
-									Err(_):
-										Tcp.close(listener)
-										False
-							Err(_):
-								Tcp.close(listener)
-								False
-					Err(e): is_socket_permission_error(e)
-		)
+		("listen and local_port use scoped listener", test_listen_and_local_port),
+		("listen on any host uses passive bind", test_listen_any_host),
+		("connections exposes scoped resource source shape", test_connections_source_shape),
+		("connections source for loop echo", test_connections_source_for_echo),
+		("scoped TCP echo round trip", test_scoped_echo_round_trip),
+		("listen invalid port is typed", test_invalid_listen_port_is_typed),
+		("listen invalid host is typed", test_invalid_listen_host_is_typed),
+		("connect invalid port is typed", test_invalid_connect_port_is_typed),
+		("read_chunk invalid sizes are typed", test_read_chunk_invalid_size_is_typed),
+		("set_timeout invalid values are typed", test_set_timeout_invalid_is_typed),
+		("set_reuse_addr on scoped listener", test_set_reuse_addr),
+		("accept timeout reports an error", test_accept_timeout_reports_error),
 	]
 }

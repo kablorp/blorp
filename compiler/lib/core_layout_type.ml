@@ -226,7 +226,8 @@ let classify_source_value_layout_of_metadata ?(loc = Ast.dummy_loc)
 
 let runtime_builtin_arc_release_only = function
   | "String" | "Bytes" | "Fixed" | "MemStats" | "SchedulerStats"
-  | "ConcurrencyError" ->
+  | "ConcurrencyError" | "ResourceSource" | "std/stream::ResourceSource"
+  | "std_stream__ResourceSource" ->
       true
   | _ -> false
 

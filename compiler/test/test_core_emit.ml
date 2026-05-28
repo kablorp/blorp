@@ -3032,21 +3032,21 @@ let test_emit_concurrent_stack_result_join_conversion () =
     (contains_sub output
        "blorp_StackResult r = (blorp_StackResult)blorp_concurrent_join(")
 
-let test_emit_concurrent_for_rc_result_uses_spawn_rc () =
+let test_emit_concurrently_loop_rc_result_uses_spawn_rc () =
   let list_string_ty = TyNamed ("List", [ ty_string ]) in
   let result_string_ty =
     TyNamed ("Result", [ ty_string; TyNamed ("ConcurrencyError", []) ])
   in
   let e =
     mk
-      (CConcurrentFor
+      (CConcurrentlyLoop
          {
            cf_var = Var.named "item";
            cf_iter = cvar "items" list_string_ty;
            cf_body = cvar "item" ty_string;
            cf_timeout = None;
-           cf_width = ConcurrentForLimit (cint 2);
-           cf_output = ConcurrentForCollect;
+           cf_width = ConcurrentlyLoopLimit (cint 2);
+           cf_output = ConcurrentlyLoopCollect;
            cf_task_scope = synthetic_concurrent_task_scope;
            cf_task = None;
          })
@@ -3073,31 +3073,31 @@ let test_emit_concurrent_for_rc_result_uses_spawn_rc () =
     "rc task result uses owned spawn_rc" true
     (contains_sub output "blorp_task_spawn_owned_rc_in_batch");
   Alcotest.(check bool)
-    "concurrent for uses batch init" true
+    "for ... concurrently uses batch init" true
     (contains_sub output "blorp_task_batch_init(&__conc_batch_");
   Alcotest.(check bool)
-    "concurrent for flushes spawn batches" true
+    "for ... concurrently flushes spawn batches" true
     (contains_sub output "% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0");
   Alcotest.(check bool)
-    "concurrent for schedules batch before joins" true
+    "for ... concurrently schedules batch before joins" true
     (contains_sub output "blorp_task_batch_flush(&__conc_batch_");
   Alcotest.(check bool)
-    "concurrent for allocates cleanup frames" true
+    "for ... concurrently allocates cleanup frames" true
     (contains_sub output "blorp_CancelCleanupFrame* __conc_task_cleanups_");
   Alcotest.(check bool)
-    "concurrent for registers task cleanup" true
+    "for ... concurrently registers task cleanup" true
     (contains_sub output "blorp_task_cancel_join_release");
   Alcotest.(check bool)
-    "concurrent for pops task cleanup" true
+    "for ... concurrently pops task cleanup" true
     (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_tasks_");
   Alcotest.(check bool)
-    "concurrent for protects collected result list on cancellation" true
+    "for ... concurrently protects collected result list on cancellation" true
     (contains_sub output "blorp_cleanup_release_arc_value)");
   Alcotest.(check bool)
-    "concurrent for exposes partial result list length for cleanup" true
+    "for ... concurrently exposes partial result list length for cleanup" true
     (contains_sub output "->len = __conc_i_");
   Alcotest.(check bool)
-    "concurrent for transfers collected result list ownership" true
+    "for ... concurrently transfers collected result list ownership" true
     (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_results_")
 
 let test_emit_detach () =
@@ -5381,17 +5381,17 @@ let test_emit_rejects_unsupported_task_capture_kind () =
   in
   expect_core_error_at ~needle:"unsupported detach task capture" ~line:42
     (fun () -> ignore (emit_stmt_to_string detach));
-  let concurrent_for =
+  let concurrently_loop =
     {
       desc =
-        CConcurrentFor
+        CConcurrentlyLoop
           {
             cf_var = Var.named "item";
             cf_iter = cvar "items" (TyNamed ("List", [ ty_int ]));
             cf_body = rhs;
             cf_timeout = None;
-            cf_width = ConcurrentForLimit (cint 2);
-            cf_output = ConcurrentForCollect;
+            cf_width = ConcurrentlyLoopLimit (cint 2);
+            cf_output = ConcurrentlyLoopCollect;
             cf_task_scope = synthetic_concurrent_task_scope;
             cf_task = Some task;
           };
@@ -5399,8 +5399,8 @@ let test_emit_rejects_unsupported_task_capture_kind () =
       loc = invariant_loc;
     }
   in
-  expect_core_error_at ~needle:"unsupported concurrent-for task capture"
-    ~line:42 (fun () -> ignore (emit_stmt_to_string concurrent_for))
+  expect_core_error_at ~needle:"unsupported for ... concurrently task capture"
+    ~line:42 (fun () -> ignore (emit_stmt_to_string concurrently_loop))
 
 let test_emit_invariant_cmatch_expr () =
   (* Raw CMatchArms should never reach emit_expr — it should have been
@@ -5510,7 +5510,7 @@ let test_emit_invariant_for_malformed_dict () =
   expect_core_error_at ~needle:"dict iteration requires Dict[K, V]" ~line:42
     (fun () -> emit_stmt_to_string node)
 
-let test_emit_invariant_concurrent_for_requires_list () =
+let test_emit_invariant_concurrently_loop_requires_list () =
   let set_string_ty = TyNamed ("Set", [ ty_string ]) in
   let iter = { (cvar "items" set_string_ty) with loc = invariant_loc } in
   let task =
@@ -5524,14 +5524,14 @@ let test_emit_invariant_concurrent_for_requires_list () =
   let node =
     {
       desc =
-        CConcurrentFor
+        CConcurrentlyLoop
           {
             cf_var = Var.named "item";
             cf_iter = iter;
             cf_body = cvar "item" ty_string;
             cf_timeout = None;
-            cf_width = ConcurrentForLimit (cint 2);
-            cf_output = ConcurrentForCollect;
+            cf_width = ConcurrentlyLoopLimit (cint 2);
+            cf_output = ConcurrentlyLoopCollect;
             cf_task_scope = synthetic_concurrent_task_scope;
             cf_task = Some task;
           };
@@ -5544,7 +5544,7 @@ let test_emit_invariant_concurrent_for_requires_list () =
       loc = invariant_loc;
     }
   in
-  expect_core_error_at ~needle:"concurrent for requires List[T]" ~line:42
+  expect_core_error_at ~needle:"for ... concurrently requires List[T]" ~line:42
     (fun () -> emit_stmt_to_string node)
 
 (* ============================================================================
@@ -5569,8 +5569,8 @@ let suite =
           test_emit_invariant_for_malformed_dict;
         Alcotest.test_case "unsupported task capture kind" `Quick
           test_emit_rejects_unsupported_task_capture_kind;
-        Alcotest.test_case "concurrent for non-List" `Quick
-          test_emit_invariant_concurrent_for_requires_list;
+        Alcotest.test_case "for ... concurrently non-List" `Quick
+          test_emit_invariant_concurrently_loop_requires_list;
       ] );
     ( "lit",
       [
@@ -5848,8 +5848,8 @@ let suite =
           test_emit_concurrent_capture_release_mask;
         Alcotest.test_case "concurrent_stack_result_join_conversion" `Quick
           test_emit_concurrent_stack_result_join_conversion;
-        Alcotest.test_case "concurrent_for_rc_result_uses_spawn_rc" `Quick
-          test_emit_concurrent_for_rc_result_uses_spawn_rc;
+        Alcotest.test_case "concurrently_loop_rc_result_uses_spawn_rc" `Quick
+          test_emit_concurrently_loop_rc_result_uses_spawn_rc;
         Alcotest.test_case "detach" `Quick test_emit_detach;
         Alcotest.test_case "detach_void_task_abi" `Quick
           test_emit_detach_void_task_abi;

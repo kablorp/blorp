@@ -355,9 +355,17 @@ let builtin_c_mapping =
   (* Bytes: endian ops → blorp source using bitwise ops. from_hex stays builtin *)
   @ prefixed_group N.mod_bytes "blorp_bytes_" [ "from_hex" ]
   @ blorp_prefixed N.mod_bytes [ "encode_utf8"; "decode_utf8" ]
-  (* TCP builtins -- no prelude aliases *)
-  @ prefixed_group N.mod_tcp "blorp_tcp_"
-      [ "listen"; "accept"; "connect"; "read"; "write"; "set_reuse_addr" ]
+  (* TCP builtins -- no prelude aliases. Public std/net/tcp functions expose
+     typed TcpError results, so direct builtin resolution must use the typed
+     raw runtime bridge rather than the legacy boxed-string helpers. *)
+  @ [
+      ((N.mod_tcp, "listen"), "blorp_tcp_listen_raw");
+      ((N.mod_tcp, "accept"), "blorp_tcp_accept_raw");
+      ((N.mod_tcp, "connect"), "blorp_tcp_connect_raw");
+      ((N.mod_tcp, "read"), "blorp_tcp_read_raw");
+      ((N.mod_tcp, "write"), "blorp_tcp_write_raw");
+      ((N.mod_tcp, "set_reuse_addr"), "blorp_tcp_set_reuse_addr_raw");
+    ]
   @
   (* StringSlice builtins — all moved to IR intrinsics *)
   (* Concurrency builtins *)

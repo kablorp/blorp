@@ -521,7 +521,7 @@ let test_detach_gets_task_closure_metadata () =
         | Some _ -> Alcotest.fail "expected converted CDetach body"
         | None -> Alcotest.fail "missing run body"))
 
-let test_concurrent_for_gets_task_closure_metadata () =
+let test_concurrently_loop_gets_task_closure_metadata () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
         let list_string_ty = TyNamed ("List", [ ty_string ]) in
@@ -531,14 +531,14 @@ let test_concurrent_for_gets_task_closure_metadata () =
         let result_list_ty = TyNamed ("List", [ result_string_ty ]) in
         let cf =
           mk
-            (CConcurrentFor
+            (CConcurrentlyLoop
                {
                  cf_var = Var.named "item";
                  cf_iter = cvar "items" list_string_ty;
                  cf_body = cvar "item" ty_string;
                  cf_timeout = None;
-                 cf_width = ConcurrentForLimit (cint 2);
-                 cf_output = ConcurrentForCollect;
+                 cf_width = ConcurrentlyLoopLimit (cint 2);
+                 cf_output = ConcurrentlyLoopCollect;
                  cf_task_scope = synthetic_concurrent_task_scope;
                  cf_task = None;
                })
@@ -552,7 +552,7 @@ let test_concurrent_for_gets_task_closure_metadata () =
         let converted = Blorp.Core_closure.convert_program [ decl run ] in
         let run' = require_func "run" converted in
         match run'.cf_body with
-        | Some { desc = CConcurrentFor { cf_task = Some task; _ }; _ } ->
+        | Some { desc = CConcurrentlyLoop { cf_task = Some task; _ }; _ } ->
             Alcotest.(check string)
               "task closure name" "_blorp_task_0" task.tc_func;
             Alcotest.(check string)
@@ -568,9 +568,9 @@ let test_concurrent_for_gets_task_closure_metadata () =
               (match task_func.cf_kind with
               | CFClosureBody ca -> ca.ca_task_abi
               | _ -> false)
-        | Some { desc = CConcurrentFor { cf_task = None; _ }; _ } ->
-            Alcotest.fail "expected concurrent for task metadata"
-        | Some _ -> Alcotest.fail "expected converted CConcurrentFor body"
+        | Some { desc = CConcurrentlyLoop { cf_task = None; _ }; _ } ->
+            Alcotest.fail "expected for ... concurrently task metadata"
+        | Some _ -> Alcotest.fail "expected converted CConcurrentlyLoop body"
         | None -> Alcotest.fail "missing run body"))
 
 let test_resource_scope_binding_not_captured_by_nested_lambda () =
@@ -786,7 +786,7 @@ let suite =
           `Quick test_concurrent_binding_gets_task_closure_metadata;
         Alcotest.test_case "detach_gets_task_closure_metadata" `Quick
           test_detach_gets_task_closure_metadata;
-        Alcotest.test_case "concurrent_for_gets_task_closure_metadata" `Quick
-          test_concurrent_for_gets_task_closure_metadata;
+        Alcotest.test_case "concurrently_loop_gets_task_closure_metadata" `Quick
+          test_concurrently_loop_gets_task_closure_metadata;
       ] );
   ]

@@ -10,7 +10,7 @@
     2. A [CClosureCreate] node at the original site that references
        the hoisted function and lists captured variables.
 
-    [CConcurrent], [CDetach], and [CConcurrentFor] task bodies are also
+    [CConcurrent], [CDetach], and [CConcurrentlyLoop] task bodies are also
     hoisted here so the task ABI, captures, and DefIds are visible in Core
     before emission. Bare top-level function references are adapted into
     explicit eta closure adapters before Perceus so ownership-sensitive
@@ -250,7 +250,7 @@ let collect_free_vars_filtered (state : state) ~(capturable : StringSet.t)
           (fun _ a _ -> Some a)
           rhs_fv
           (SM.union (fun _ a _ -> Some a) body_fv timeout_fv)
-    | CConcurrentFor cf ->
+    | CConcurrentlyLoop cf ->
         let iter_fv = go bound cf.cf_iter in
         let body_fv = go (SS.add cf.cf_var.vname bound) cf.cf_body in
         let timeout_fv =
@@ -259,7 +259,7 @@ let collect_free_vars_filtered (state : state) ~(capturable : StringSet.t)
           | None -> SM.empty
         in
         let width_fv =
-          match cf.cf_width with ConcurrentForLimit limit -> go bound limit
+          match cf.cf_width with ConcurrentlyLoopLimit limit -> go bound limit
         in
         SM.union
           (fun _ a _ -> Some a)
@@ -592,18 +592,16 @@ and adapt_function_refs_expr (state : state) (bound : StringSet.t) (e : core) :
               conc_timeout = timeout';
             };
       }
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       let iter' = adapt_value bound cf.cf_iter in
       let body_bound = add_bound_var bound cf.cf_var in
       let body' = adapt_value body_bound cf.cf_body in
       let timeout' = Option.map (adapt_value bound) cf.cf_timeout in
-      let width' =
-        Core.map_concurrent_for_width (adapt_value bound) cf.cf_width
-      in
+      let width' = Core.map_loop_width (adapt_value bound) cf.cf_width in
       {
         e with
         desc =
-          CConcurrentFor
+          CConcurrentlyLoop
             {
               cf with
               cf_iter = iter';
@@ -753,7 +751,7 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
                    ~return_ty:(Ast.TyNamed ("Void", [])))
         in
         { e with desc = CDetach { detach_body = body'; detach_task = task' } }
-    | CConcurrentFor cf ->
+    | CConcurrentlyLoop cf ->
         let iter' =
           maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
             (convert_expr state ~wrap_fn_refs ~bound cf.cf_iter)
@@ -771,7 +769,7 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
             cf.cf_timeout
         in
         let width' =
-          Core.map_concurrent_for_width
+          Core.map_loop_width
             (fun limit ->
               maybe_wrap_fn_ref_as_closure state ~wrap_fn_refs ~bound
                 (convert_expr state ~wrap_fn_refs ~bound limit))
@@ -788,7 +786,7 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
         {
           e with
           desc =
-            CConcurrentFor
+            CConcurrentlyLoop
               {
                 cf with
                 cf_iter = iter';

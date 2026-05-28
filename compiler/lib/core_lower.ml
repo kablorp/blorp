@@ -193,6 +193,48 @@ let resource_cleanup_metadata ty =
       Session.find_resource_cleanup (Session.current ()) name
   | _ -> None
 
+let is_resource_source_type_name name =
+  match Types.split_canonical_module_type_name name with
+  | Some (module_path, "ResourceSource") -> module_path = "std/stream"
+  | _ ->
+      name = "ResourceSource"
+      || name = "std_stream__ResourceSource"
+      || name = "std/stream::ResourceSource"
+
+let resource_source_parts ty =
+  match Codegen_types.normalize_type ty |> Types.head_resolve with
+  | Ast.TyNamed (name, [ resource_ty; error_ty ])
+    when is_resource_source_type_name name ->
+      Some (resource_ty, error_ty)
+  | _ -> None
+
+let resource_cleanup_call ~loc resource_ty resource_var =
+  let void_ty = Ast.TyNamed ("Void", []) in
+  let resource_ref = { Core.desc = CVar resource_var; ty = resource_ty; loc } in
+  let callee_ty =
+    Ast.TyFunc { params = [ resource_ty ]; return = void_ty; is_pure = false }
+  in
+  match resource_cleanup_metadata resource_ty with
+  | Some (ResourceCleanupBuiltin c_name) ->
+      {
+        Core.desc =
+          CCall
+            ( CKBuiltin c_name,
+              { Core.desc = CVoid; ty = void_ty; loc },
+              [ resource_ref ] );
+        ty = void_ty;
+        loc;
+      }
+  | None ->
+      let callee =
+        { Core.desc = CVar (Core.Var.named "close"); ty = callee_ty; loc }
+      in
+      {
+        Core.desc = CCall (CKUnknown, callee, [ resource_ref ]);
+        ty = void_ty;
+        loc;
+      }
+
 (* ============================================================================
    Type resolution
    ============================================================================ *)
@@ -611,15 +653,51 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
       | TA.ELoopView
           { loop_view_kind = LoopEnumerate2; loop_view_source = m; _ } ->
           lower_for_enumerate2 ~loc ~ty ~destructure_names:None var m body
-      | _ ->
-          let loop_ty =
-            elem_type_of_iterable ~loc:(TA.loc iter) (type_of_child_expr iter)
-          in
-          mk
-            (CFor
-               ( loop_binder_for var loop_ty,
-                 lower_child_expr iter,
-                 lower_child_expr body )))
+      | _ -> (
+          let iter_ty = type_of_child_expr iter in
+          match resource_source_parts iter_ty with
+          | Some (resource_ty, _error_ty) ->
+              let item_name = fresh_resource_name () in
+              let item_var = Core.Var.named item_name in
+              let scoped_name =
+                if is_wildcard_name var then fresh_resource_name () else var
+              in
+              let scoped_var = Core.Var.named scoped_name in
+              let acquire =
+                {
+                  Core.desc = CVar item_var;
+                  ty = resource_ty;
+                  loc = TA.loc iter;
+                }
+              in
+              let body_scope =
+                {
+                  Core.desc =
+                    CResourceScope
+                      {
+                        rs_var = scoped_var;
+                        rs_ty = resource_ty;
+                        rs_acquire = acquire;
+                        rs_body = lower_child_expr body;
+                        rs_cleanup =
+                          resource_cleanup_call ~loc resource_ty scoped_var;
+                      };
+                  ty = TyNamed ("Void", []);
+                  loc;
+                }
+              in
+              mk
+                (CFor
+                   ( loop_binder_for item_name resource_ty,
+                     lower_child_expr iter,
+                     body_scope ))
+          | None ->
+              let loop_ty = elem_type_of_iterable ~loc:(TA.loc iter) iter_ty in
+              mk
+                (CFor
+                   ( loop_binder_for var loop_ty,
+                     lower_child_expr iter,
+                     lower_child_expr body ))))
   | TA.EForTuple (names, iter, body) -> (
       match typed_expr_desc iter with
       | TA.ELoopView
@@ -831,13 +909,13 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
          is a type error in the source, but tolerate it by lowering as a
          singleton block. *)
       lower_block ~loc ~ty [ typed ]
-  | TA.EConcurrentFor (var, iter, body, timeout, width) ->
+  | TA.EConcurrentlyLoop (var, iter, body, timeout, width) ->
       let output =
         if Types.types_equal ty (TyNamed ("Void", [])) then
-          Core.ConcurrentForDiscard
-        else Core.ConcurrentForCollect
+          Core.ConcurrentlyLoopDiscard
+        else Core.ConcurrentlyLoopCollect
       in
-      lower_concurrent_for ~loc ~ty ~output var iter body timeout width
+      lower_concurrently_loop ~loc ~ty ~output var iter body timeout width
   | TA.EDetach inner ->
       mk (CDetach { detach_body = lower_child_expr inner; detach_task = None })
   (* Subscript forms should never reach core_lower:
@@ -876,7 +954,7 @@ and lower_timeout_expr (e : TA.expr) : Core.core =
       "invalid concurrency timeout type reached Core lowering: %s"
       (Types.type_to_string lowered.ty)
 
-and lower_concurrent_for ~loc ~ty ~output var iter body timeout width =
+and lower_concurrently_loop ~loc ~ty ~output var iter body timeout width =
   let parent_scope = current_task_scope_id () in
   let child_scope = fresh_task_scope_id () in
   let task_scope =
@@ -884,16 +962,16 @@ and lower_concurrent_for ~loc ~ty ~output var iter body timeout width =
   in
   let width =
     match width with
-    | Ast.ConcurrentForLimit n ->
-        Core.ConcurrentForLimit (Core.Build.lit_int ~loc n)
+    | Ast.ConcurrentlyLoopLimit n ->
+        Core.ConcurrentlyLoopLimit (Core.Build.lit_int ~loc n)
   in
   let body_core =
     with_current_task_scope child_scope (fun () -> lower_child_expr body)
   in
   let body_core =
     match output with
-    | Core.ConcurrentForCollect -> body_core
-    | Core.ConcurrentForDiscard ->
+    | Core.ConcurrentlyLoopCollect -> body_core
+    | Core.ConcurrentlyLoopDiscard ->
         let ty_void = TyNamed ("Void", []) in
         if Types.types_equal body_core.ty ty_void then body_core
         else
@@ -906,7 +984,7 @@ and lower_concurrent_for ~loc ~ty ~output var iter body timeout width =
   in
   {
     Core.desc =
-      CConcurrentFor
+      CConcurrentlyLoop
         {
           cf_var = Core.Var.named var;
           cf_iter = lower_child_expr iter;
@@ -1093,11 +1171,12 @@ and lower_block ~loc ~ty (stmts : TA.expr list) : Core.core =
                  lowering"
               "EQuestionBind reached lowering without a success continuation"
           else lower_question_bind ~block_ty:ty first rest
-      | TA.EConcurrentFor (var, iter, body, timeout, width) when rest <> [] ->
+      | TA.EConcurrentlyLoop (var, iter, body, timeout, width) when rest <> []
+        ->
           let ty_void = TyNamed ("Void", []) in
           let first' =
-            lower_concurrent_for ~loc:(TA.loc first) ~ty:ty_void
-              ~output:Core.ConcurrentForDiscard var iter body timeout width
+            lower_concurrently_loop ~loc:(TA.loc first) ~ty:ty_void
+              ~output:Core.ConcurrentlyLoopDiscard var iter body timeout width
           in
           let rest' = lower_block ~loc:(TA.loc first) ~ty rest in
           mk (CSeq (first', rest'))
@@ -1203,7 +1282,6 @@ and lower_question_bind ~block_ty (stmt : TA.expr) (rest : TA.expr list) :
 
 and lower_with ~(loc : Ast.loc) ~(ty : Ast.type_expr)
     (binding : TA.with_binding) (body : TA.expr) : Core.core =
-  let void_ty = Ast.TyNamed ("Void", []) in
   let resource_ty =
     match binding.with_type with
     | Some t ->
@@ -1235,38 +1313,6 @@ and lower_with ~(loc : Ast.loc) ~(ty : Ast.type_expr)
     else binding.with_name
   in
   let scoped_var = Core.Var.named scoped_name in
-  let cleanup_for var cleanup_loc =
-    let resource_ref =
-      { Core.desc = CVar var; ty = resource_ty; loc = cleanup_loc }
-    in
-    let callee_ty =
-      Ast.TyFunc { params = [ resource_ty ]; return = void_ty; is_pure = false }
-    in
-    match resource_cleanup_metadata resource_ty with
-    | Some (ResourceCleanupBuiltin c_name) ->
-        {
-          Core.desc =
-            CCall
-              ( CKBuiltin c_name,
-                { Core.desc = CVoid; ty = void_ty; loc = cleanup_loc },
-                [ resource_ref ] );
-          ty = void_ty;
-          loc = cleanup_loc;
-        }
-    | None ->
-        let callee =
-          {
-            Core.desc = CVar (Core.Var.named "close");
-            ty = callee_ty;
-            loc = cleanup_loc;
-          }
-        in
-        {
-          Core.desc = CCall (CKUnknown, callee, [ resource_ref ]);
-          ty = void_ty;
-          loc = cleanup_loc;
-        }
-  in
   let resource_scope acquire =
     let body' = lower_child_expr body in
     {
@@ -1277,7 +1323,7 @@ and lower_with ~(loc : Ast.loc) ~(ty : Ast.type_expr)
             rs_ty = resource_ty;
             rs_acquire = acquire;
             rs_body = body';
-            rs_cleanup = cleanup_for scoped_var loc;
+            rs_cleanup = resource_cleanup_call ~loc resource_ty scoped_var;
           };
       ty;
       loc;

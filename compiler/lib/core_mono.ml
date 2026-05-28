@@ -1597,8 +1597,8 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
               conc_body = rewrite body_scope cb.conc_body;
               conc_timeout = Option.map (rewrite scope) cb.conc_timeout;
             }
-      | CConcurrentFor cf ->
-          CConcurrentFor
+      | CConcurrentlyLoop cf ->
+          CConcurrentlyLoop
             {
               cf with
               cf_iter = rewrite scope cf.cf_iter;
@@ -2025,7 +2025,7 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
               scope cb.conc_bindings
           in
           scan_expr body_scope cb.conc_body
-      | CConcurrentFor cf ->
+      | CConcurrentlyLoop cf ->
           scan_expr scope cf.cf_iter;
           Option.iter (scan_expr scope) cf.cf_timeout;
           scan_expr (scope_add_var scope cf.cf_var) cf.cf_body

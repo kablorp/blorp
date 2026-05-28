@@ -156,8 +156,8 @@ type expr_desc =
   | ESelect of select_arm list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr
-  | EConcurrentFor of
-      string * expr * expr * expr option * Ast.concurrent_for_width
+  | EConcurrentlyLoop of
+      string * expr * expr * expr option * Ast.concurrently_loop_width
   | EDetach of expr
   | EDict of (expr * expr) list
   | EBuiltin of string option
@@ -844,11 +844,11 @@ let expr_desc (expr : expr) =
   | Ast.EConcurrentBind (name, ty, value) ->
       let* value = typed_child value in
       Ok (EConcurrentBind (name, ty, value))
-  | Ast.EConcurrentFor (name, iter, body, timeout, width) ->
+  | Ast.EConcurrentlyLoop (name, iter, body, timeout, width) ->
       let* iter = typed_child iter in
       let* body = typed_child body in
       let* timeout = typed_child_opt timeout in
-      Ok (EConcurrentFor (name, iter, body, timeout, width))
+      Ok (EConcurrentlyLoop (name, iter, body, timeout, width))
   | Ast.EDetach body ->
       let* body = typed_child body in
       Ok (EDetach body)

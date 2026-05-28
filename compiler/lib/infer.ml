@@ -901,46 +901,160 @@ let split_resource_def_id_suffix (name : string) : string * int option =
       in
       (clean, int_of_string_opt id_str)
 
-let resource_result_policy_of_entry (entry : Env.overload_entry) =
-  match entry.ol_resource_args with
+let module_resource_type_names_from_decls (decls : Ast.program) : string list =
+  let rec collect acc decl =
+    match decl.decl_desc with
+    | DPrivate inner -> collect acc inner
+    | DType t when t.type_is_resource -> t.type_name :: acc
+    | _ -> acc
+  in
+  List.fold_left collect [] decls |> List.sort_uniq String.compare
+
+let type_mentions_named_resource resource_names ty =
+  let rec contains ty =
+    match ty with
+    | TyNamed (name, args) ->
+        let type_name =
+          match Types.split_canonical_module_type_name name with
+          | Some (_module_path, local_name) -> local_name
+          | None -> name
+        in
+        List.mem type_name resource_names || List.exists contains args
+    | TyTuple elems -> List.exists contains elems
+    | TyFunc { params; return; _ } ->
+        List.exists contains params || contains return
+    | TyArray (elem, dims) -> contains elem || List.exists contains dims
+    | TyRange inner -> contains inner
+    | TyDimOp (_, left, right) -> contains left || contains right
+    | TyVar _ | TyBoundVar _ | TyConstInt _ | TySelf | TyVarDims _ | TyMeta _ ->
+        false
+  in
+  contains ty
+
+let func_decl_has_named_resource_param resource_names func =
+  List.exists
+    (fun param ->
+      match param.param_type with
+      | Some ty -> type_mentions_named_resource resource_names ty
+      | None -> false)
+    func.func_params
+
+let resource_arg_policy_of_module_func resource_names func =
+  match func.func_body with
+  | FuncBuiltinBody _
+    when func_decl_has_named_resource_param resource_names func ->
+      let result_policy =
+        if func.func_resource_result_ordinary then ResourceResultOrdinary
+        else ResourceResultDependent
+      in
+      AllowResourceArgs result_policy
+  | FuncBuiltinBody _ | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
+      RejectResourceArgs
+
+let lookup_module_func_resource_arg_policy module_path func_name =
+  match Modules.find_cached module_path with
+  | None -> None
+  | Some m -> (
+      let decls_for_types =
+        match m.typed_decls with
+        | Some td -> Typed_ast.program_ast td
+        | None -> m.decls
+      in
+      let resource_names =
+        module_resource_type_names_from_decls decls_for_types
+      in
+      let from_func func =
+        Some (resource_arg_policy_of_module_func resource_names func)
+      in
+      let from_typed =
+        match m.typed_decls with
+        | Some typed_program ->
+            let rec find = function
+              | [] -> None
+              | typed_decl :: rest -> (
+                  match Typed_ast.decl_view typed_decl with
+                  | Typed_ast.DeclPrivate _ -> find rest
+                  | Typed_ast.DeclFunction typed_func
+                    when (Typed_ast.func_ast typed_func).func_name
+                         = Some func_name ->
+                      from_func (Typed_ast.func_ast typed_func)
+                  | _ -> find rest)
+            in
+            find (Typed_ast.program_decls typed_program)
+        | None -> None
+      in
+      match from_typed with
+      | Some _ -> from_typed
+      | None ->
+          List.find_map
+            (fun (name, decl) ->
+              if name = func_name then
+                match decl.decl_desc with
+                | DFunc func -> from_func func
+                | _ -> None
+              else None)
+            m.exports)
+
+let resource_result_policy_of_arg_policy = function
   | AllowResourceArgs policy -> Some policy
   | RejectResourceArgs -> None
 
-let resource_result_policy_for_callee env callee =
+let resource_arg_policy_for_callee ?(module_aliases = []) env callee =
   match callee.expr_desc with
   | EIdent name -> (
       let clean, def_id = split_resource_def_id_suffix name in
       match def_id with
       | Some id ->
-          Option.bind
-            (Env.find_overload_by_def_id env id)
-            resource_result_policy_of_entry
+          Option.bind (Env.find_overload_by_def_id env id) (fun entry ->
+              Some entry.ol_resource_args)
       | None -> (
           match Env.lookup env clean with
-          | Some { kind = FuncSymbol { resource_args; _ }; _ } -> (
-              match resource_args with
-              | AllowResourceArgs policy -> Some policy
-              | RejectResourceArgs -> None)
+          | Some { kind = FuncSymbol { resource_args; _ }; _ } ->
+              Some resource_args
           | _ -> (
               match Env.get_overloads env clean with
-              | [ entry ] -> resource_result_policy_of_entry entry
+              | [ entry ] -> Some entry.ol_resource_args
               | _ -> None)))
+  | EFieldAccess ({ expr_desc = EIdent alias; _ }, func_name) ->
+      Option.bind (List.assoc_opt alias module_aliases) (fun module_path ->
+          lookup_module_func_resource_arg_policy module_path func_name)
   | _ -> None
 
-let rec scoped_resource_dependency_refs env expr =
+let resource_result_policy_for_callee ?(module_aliases = []) env callee =
+  Option.bind
+    (resource_arg_policy_for_callee ~module_aliases env callee)
+    resource_result_policy_of_arg_policy
+
+let result_expr_of_body expr =
+  match expr.expr_desc with
+  | EBlock exprs ->
+      let rec last = function
+        | [] -> None
+        | [ x ] -> Some x
+        | _ :: rest -> last rest
+      in
+      last exprs
+  | _ -> Some expr
+
+let rec scoped_resource_dependency_refs ?(module_aliases = []) env expr =
   match expr.expr_desc with
   | EIdent name when Env.is_scoped_resource_related_var env name -> [ name ]
   | ECall (callee, _args)
-    when resource_result_policy_for_callee env callee
+    when resource_result_policy_for_callee ~module_aliases env callee
          = Some ResourceResultOrdinary ->
       []
+  | EWith (_binding, body) -> (
+      match result_expr_of_body body with
+      | Some result_expr ->
+          scoped_resource_dependency_refs ~module_aliases env result_expr
+      | None -> [])
   | _ ->
       expr |> expr_children
-      |> List.concat_map (scoped_resource_dependency_refs env)
+      |> List.concat_map (scoped_resource_dependency_refs ~module_aliases env)
       |> List.sort_uniq String.compare
 
-let scoped_resource_related_refs env expr =
-  scoped_resource_dependency_refs env expr
+let scoped_resource_related_refs ?(module_aliases = []) env expr =
+  scoped_resource_dependency_refs ~module_aliases env expr
 
 let is_one_shot_stream_type_name name =
   match Types.split_canonical_module_type_name name with
@@ -1047,6 +1161,15 @@ let type_is_one_shot_stream env ty =
 let type_is_resource_source env ty =
   type_is_named_target env is_resource_source_type_name ty
 
+let resource_source_parts env ty =
+  match
+    normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
+  with
+  | TyNamed (name, [ resource_ty; error_ty ])
+    when is_resource_source_type_name name ->
+      Some (resource_ty, error_ty)
+  | _ -> None
+
 let type_contains_named_type_function_carrier env is_target ty =
   let normalize ty =
     normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
@@ -1124,16 +1247,16 @@ let one_shot_stream_capture_refs env expr =
 let resource_source_capture_refs env expr =
   expr |> collect_free_var_refs |> resource_source_refs env
 
-let expression_derives_from_scoped_resource env expr =
-  scoped_resource_related_refs env expr <> []
+let expression_derives_from_scoped_resource ?(module_aliases = []) env expr =
+  scoped_resource_related_refs ~module_aliases env expr <> []
 
-let binding_origin_for_value env value =
-  if expression_derives_from_scoped_resource env value then
+let binding_origin_for_value ?(module_aliases = []) env value =
+  if expression_derives_from_scoped_resource ~module_aliases env value then
     Env.ScopedResourceDerived
   else Env.LetBinding
 
-let reject_scoped_resource_derived_escape env loc expr =
-  match scoped_resource_related_refs env expr with
+let reject_scoped_resource_derived_escape ?(module_aliases = []) env loc expr =
+  match scoped_resource_related_refs ~module_aliases env expr with
   | [] -> Ok ()
   | vars ->
       error_with
@@ -1152,8 +1275,9 @@ let reject_scoped_resource_derived_escape env loc expr =
            "scoped resource-derived values cannot escape a with block: %s"
            (String.concat ", " vars))
 
-let reject_scoped_resource_derived_assignment env loc target expr =
-  match scoped_resource_related_refs env expr with
+let reject_scoped_resource_derived_assignment ?(module_aliases = []) env loc
+    target expr =
+  match scoped_resource_related_refs ~module_aliases env expr with
   | [] -> Ok ()
   | vars ->
       error_with
@@ -1174,8 +1298,9 @@ let reject_scoped_resource_derived_assignment env loc target expr =
             variable '%s': %s"
            target (String.concat ", " vars))
 
-let reject_scoped_resource_derived_storage env loc container expr =
-  match scoped_resource_related_refs env expr with
+let reject_scoped_resource_derived_storage ?(module_aliases = []) env loc
+    container expr =
+  match scoped_resource_related_refs ~module_aliases env expr with
   | [] -> Ok ()
   | vars ->
       error_with
@@ -1396,6 +1521,54 @@ let reject_resource_source_ordinary_binding env loc binding_name ty =
          | Some n -> " '" ^ n ^ "'"))
   else Ok ()
 
+let reject_resource_source_copy_from_existing env loc binding_name ty rhs =
+  if type_is_resource_source env ty then
+    match resource_source_capture_refs env rhs with
+    | [] -> Ok ()
+    | refs ->
+        error_with
+          ~notes:
+            [
+              "Resource sources are one-shot cursors. Copying an existing \
+               source binding would duplicate cursor state before the \
+               resource-source iteration contract exists.";
+            ]
+          ~help:
+            (Some
+               "Keep one direct source binding from the producer call and \
+                consume that binding with resource-source iteration when it \
+                lands.")
+          loc
+          (Printf.sprintf
+             "resource source value%s cannot copy existing resource source \
+              value%s: %s"
+             (match binding_name with
+             | None | Some "_" -> ""
+             | Some n -> " '" ^ n ^ "'")
+             (if List.length refs = 1 then "" else "s")
+             (String.concat ", " refs))
+  else Ok ()
+
+let reject_resource_source_mutable_binding env loc binding_name ty is_mutable =
+  if is_mutable && type_is_resource_source env ty then
+    error_with
+      ~notes:
+        [
+          "Resource sources carry one-shot cursor state. Mutable bindings \
+           would allow reassignment of that cursor before resource-source \
+           iteration has a precise ownership-transfer model.";
+        ]
+      ~help:
+        (Some
+           "Use an immutable direct source binding, then consume it with \
+            resource-source iteration when it lands.")
+      loc
+      (Printf.sprintf "resource source value%s cannot be mutable"
+         (match binding_name with
+         | None | Some "_" -> ""
+         | Some n -> " '" ^ n ^ "'"))
+  else Ok ()
+
 let reject_scoped_resource_task_capture env loc expr =
   let scoped_captures =
     expr |> collect_free_var_refs
@@ -1423,6 +1596,16 @@ let reject_scoped_resource_task_capture env loc expr =
             ],
             "Use the resource synchronously inside the with block, or derive \
              ordinary data before starting concurrent work." )
+        else if source_captures <> [] then
+          ( "resource source value",
+            source_captures,
+            [
+              "Resource sources produce owned resources. Concurrent tasks need \
+               an explicit move contract before source ownership can cross \
+               task boundaries.";
+            ],
+            "Consume resource sources with resource-source iteration, or start \
+             concurrent work from ordinary values derived from the source." )
         else if derived_captures <> [] then
           ( "scoped resource-derived value",
             derived_captures,
@@ -1577,25 +1760,14 @@ let reject_scoped_resource_escape ctx loc ty =
       loc "scoped resource values cannot escape a with block"
   else Ok ()
 
-let result_expr_of_body expr =
-  match expr.expr_desc with
-  | EBlock exprs ->
-      let rec last = function
-        | [] -> None
-        | [ x ] -> Some x
-        | _ :: rest -> last rest
-      in
-      last exprs
-  | _ -> Some expr
-
 let reject_with_body_resource_escape ctx loc ty expr =
   if type_contains_resource ctx ty then reject_scoped_resource_escape ctx loc ty
   else if types_equal ty ty_void then Ok ()
   else
     match result_expr_of_body expr with
     | Some result_expr ->
-        reject_scoped_resource_derived_escape ctx.env result_expr.expr_loc
-          result_expr
+        reject_scoped_resource_derived_escape ~module_aliases:ctx.module_aliases
+          ctx.env result_expr.expr_loc result_expr
     | None -> Ok ()
 
 let reject_ordinary_resource_binding ctx loc binding_name ty =
@@ -1686,6 +1858,20 @@ let reject_concurrent_resource_result ctx loc ty =
            "Acquire resources with `with` inside synchronous code, and return \
             only ordinary data from concurrent tasks.")
       loc "concurrent task result cannot contain resource values"
+  else if type_contains_resource_source ctx.env ty then
+    error_with
+      ~notes:
+        [
+          "Concurrent task results are ordinary values stored for the parent \
+           to join. A resource source result would copy one-shot source state \
+           without an explicit ownership-transfer contract.";
+        ]
+      ~help:
+        (Some
+           "Create and consume resource sources synchronously, or use \
+            resource-source iteration once the transfer contract is \
+            implemented.")
+      loc "concurrent task result cannot contain resource source values"
   else Ok ()
 
 let root_assignment_ident (expr : expr) : string option =
@@ -1759,7 +1945,7 @@ let reject_concurrent_outer_mutation ?(allowed_targets = []) env context body =
         match timeout_opt with
         | Some timeout -> check bound timeout
         | None -> Ok ())
-    | EConcurrentFor (_, iter, _, timeout_opt, _) -> (
+    | EConcurrentlyLoop (_, iter, _, timeout_opt, _) -> (
         let* () = check bound iter in
         match timeout_opt with
         | Some timeout -> check bound timeout
@@ -1871,29 +2057,39 @@ let reject_concurrent_sibling_binding_refs env binding_names current_name loc
               dependency inside one task.")
         loc msg
 
-let resource_call_allows_resource_arg ctx callee_name resolved_overload =
+let resource_call_allows_resource_arg ctx source_callee callee_name
+    resolved_overload =
   match resolved_overload with
   | Some entry -> (
       match entry.Env.ol_resource_args with
       | AllowResourceArgs _ -> true
       | RejectResourceArgs -> false)
   | None -> (
-      match callee_name with
-      | Some name -> (
-          match Env.lookup ctx.env name with
-          | Some
-              {
-                kind = FuncSymbol { resource_args = AllowResourceArgs _; _ };
-                _;
-              } ->
-              true
-          | _ -> false)
-      | None -> false)
+      match
+        resource_arg_policy_for_callee ~module_aliases:ctx.module_aliases
+          ctx.env source_callee
+      with
+      | Some (AllowResourceArgs _) -> true
+      | Some RejectResourceArgs -> false
+      | None -> (
+          match callee_name with
+          | Some name -> (
+              match Env.lookup ctx.env name with
+              | Some
+                  {
+                    kind = FuncSymbol { resource_args = AllowResourceArgs _; _ };
+                    _;
+                  } ->
+                  true
+              | _ -> false)
+          | None -> false))
 
-let reject_ordinary_resource_call_arg ctx loc callee_name resolved_overload
-    arg_types =
+let reject_ordinary_resource_call_arg ctx loc source_callee callee_name
+    resolved_overload arg_types =
   if not (List.exists (type_contains_resource ctx) arg_types) then Ok ()
-  else if resource_call_allows_resource_arg ctx callee_name resolved_overload
+  else if
+    resource_call_allows_resource_arg ctx source_callee callee_name
+      resolved_overload
   then Ok ()
   else
     let callee_hint =
@@ -1937,9 +2133,12 @@ let is_direct_scoped_resource_arg env expr =
   | EIdent name -> Env.is_scoped_resource_var env name
   | _ -> false
 
-let reject_unscoped_resource_operation_arg ctx callee_name resolved_overload
-    typed_args =
-  if not (resource_call_allows_resource_arg ctx callee_name resolved_overload)
+let reject_unscoped_resource_operation_arg ctx source_callee callee_name
+    resolved_overload typed_args =
+  if
+    not
+      (resource_call_allows_resource_arg ctx source_callee callee_name
+         resolved_overload)
   then Ok ()
   else
     List.fold_left
@@ -1973,14 +2172,18 @@ let reject_unscoped_resource_operation_arg ctx callee_name resolved_overload
         else Ok ())
       (Ok ()) typed_args
 
-let reject_scoped_resource_derived_call_arg ctx loc callee_name
+let reject_scoped_resource_derived_call_arg ctx loc source_callee callee_name
     resolved_overload args =
-  if resource_call_allows_resource_arg ctx callee_name resolved_overload then
-    Ok ()
+  if
+    resource_call_allows_resource_arg ctx source_callee callee_name
+      resolved_overload
+  then Ok ()
   else
     let vars =
       args
-      |> List.concat_map (scoped_resource_related_refs ctx.env)
+      |> List.concat_map
+           (scoped_resource_related_refs ~module_aliases:ctx.module_aliases
+              ctx.env)
       |> List.sort_uniq String.compare
     in
     match vars with
@@ -2071,6 +2274,19 @@ let reject_discarded_resource_value ctx loc ty =
            "Acquire the resource with `with name = ...:` or `with name ?= \
             ...:` so cleanup is scoped explicitly.")
       loc "resource-containing value cannot be discarded"
+  else if type_contains_resource_source ctx.env ty then
+    error_with
+      ~notes:
+        [
+          "Resource sources are one-shot cursors that will transfer owned \
+           resources to their consumer. Discarding one creates source state \
+           that cannot be consumed or closed by a visible ownership edge.";
+        ]
+      ~help:
+        (Some
+           "Bind the source to an immutable local and consume it with \
+            resource-source iteration when it lands.")
+      loc "resource source value cannot be discarded"
   else Ok ()
 
 let reject_resource_match_scrutinee ctx loc ty =
@@ -2185,7 +2401,9 @@ let validate_question_bind ctx stmt name ty_ann inner_ty rhs' =
   in
   let env' =
     Env.add_var ctx.env name bind_ty
-      ~origin:(binding_origin_for_value ctx.env rhs')
+      ~origin:
+        (binding_origin_for_value ~module_aliases:ctx.module_aliases ctx.env
+           rhs')
       ()
   in
   let ctx' = { ctx with env = env' } in
@@ -3275,6 +3493,21 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
               notes = [];
               help = None;
             }
+      | [], _, _, (_ :: _ as vars), _ ->
+          Some
+            {
+              message =
+                Printf.sprintf
+                  "Closure cannot capture resource source value%s: %s. Consume \
+                   the source with resource-source iteration instead."
+                  (if List.length vars > 1 then "s" else "")
+                  (String.concat ", " vars);
+              loc;
+              phase = TypeCheck;
+              kind = OtherError;
+              notes = [];
+              help = None;
+            }
       | [], (_ :: _ as vars), _, _, _ ->
           Some
             {
@@ -3299,21 +3532,6 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
                   "Closure cannot capture one-shot stream value%s: %s. Create \
                    and consume the stream inside the closure, or collect \
                    ordinary data before creating the closure."
-                  (if List.length vars > 1 then "s" else "")
-                  (String.concat ", " vars);
-              loc;
-              phase = TypeCheck;
-              kind = OtherError;
-              notes = [];
-              help = None;
-            }
-      | [], [], [], vars, _ ->
-          Some
-            {
-              message =
-                Printf.sprintf
-                  "Closure cannot capture resource source value%s: %s. Consume \
-                   the source with resource-source iteration instead."
                   (if List.length vars > 1 then "s" else "")
                   (String.concat ", " vars);
               loc;
@@ -4042,8 +4260,8 @@ and zonk_expr_desc = function
       EConcurrent (List.map zonk_expr xs, Option.map zonk_expr t, m)
   | EConcurrentBind (n, ty, v) ->
       EConcurrentBind (n, Option.map Types.zonk_type ty, zonk_expr v)
-  | EConcurrentFor (v, it, b, t, width) ->
-      EConcurrentFor
+  | EConcurrentlyLoop (v, it, b, t, width) ->
+      EConcurrentlyLoop
         (v, zonk_expr it, zonk_expr b, Option.map zonk_expr t, width)
   | EDetach x -> EDetach (zonk_expr x)
   | EDict pairs ->
@@ -4652,7 +4870,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                 e_ty
             in
             let* () =
-              reject_scoped_resource_derived_storage ctx.env e.expr_loc
+              reject_scoped_resource_derived_storage
+                ~module_aliases:ctx.module_aliases ctx.env e.expr_loc
                 "tuple literals" e'
             in
             let* () =
@@ -4789,6 +5008,14 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           | _ -> Ok ()
         else Ok ()
       in
+      let resource_source_parts_opt =
+        if is_indices || is_enumerate || is_enumerate2 || is_zip || is_windows
+        then None
+        else
+          match elem_type_of_iterable iter_ty with
+          | Some _ -> None
+          | None -> resource_source_parts ctx.env iter_ty
+      in
       let* elem_ty =
         if is_indices then
           let* coll_ty =
@@ -4915,12 +5142,15 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         else
           match elem_type_of_iterable iter_ty with
           | Some ty -> Ok ty
-          | None ->
-              error iter'.expr_loc
-                (Printf.sprintf
-                   "Cannot iterate over type %s. For-in loops work with List, \
-                    Vector, Set, String, and Range types"
-                   (type_to_string iter_ty))
+          | None -> (
+              match resource_source_parts_opt with
+              | Some (resource_ty, _error_ty) -> Ok resource_ty
+              | None ->
+                  error iter'.expr_loc
+                    (Printf.sprintf
+                       "Cannot iterate over type %s. For-in loops work with \
+                        List, Vector, Set, String, and Range types"
+                       (type_to_string iter_ty)))
       in
       (* Refine elem_ty to range type when iterating 0..N with known bound *)
       let elem_ty =
@@ -4979,7 +5209,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       (* Reject same-scope re-declaration of loop variable *)
       let* () = check_no_redeclaration ctx.env var iter'.expr_loc in
       (* Add loop variable to scope for body *)
-      let body_env = add_var ctx.env var elem_ty ~origin:ForLoopVar () in
+      let loop_var_origin =
+        match resource_source_parts_opt with
+        | Some _ -> Env.ScopedResource
+        | None -> ForLoopVar
+      in
+      let body_env = add_var ctx.env var elem_ty ~origin:loop_var_origin () in
       (* Detect pattern: for i in 0..length(v) -> prove i is in bounds for v *)
       let proof_env =
         match iter'.expr_desc with
@@ -5676,6 +5911,10 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             reject_resource_source_ordinary_binding ctx.env loc (Some var)
               val_ty
           in
+          let* () =
+            reject_resource_source_copy_from_existing ctx.env loc (Some var)
+              val_ty value'
+          in
           let new_expr =
             with_inferred_type
               {
@@ -5706,7 +5945,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           let* val_ty, value' = infer_expected_value_expr ctx var_type value in
           let* () = reject_resource_assignment ctx loc var val_ty in
           let* () =
-            reject_scoped_resource_derived_assignment ctx.env loc var value'
+            reject_scoped_resource_derived_assignment
+              ~module_aliases:ctx.module_aliases ctx.env loc var value'
           in
           if ctx_types_compatible ctx var_type val_ty then
             let new_expr =
@@ -5802,6 +6042,16 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         reject_resource_source_ordinary_binding ctx.env loc
           (if name = "_" then None else Some name)
           val_ty
+      in
+      let* () =
+        reject_resource_source_mutable_binding ctx.env loc
+          (if name = "_" then None else Some name)
+          val_ty is_mutable
+      in
+      let* () =
+        reject_resource_source_copy_from_existing ctx.env loc
+          (if name = "_" then None else Some name)
+          val_ty value'
       in
       match ty_opt with
       | Some declared_ty ->
@@ -6246,7 +6496,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               ty_void )
       end
   (* for ... concurrently — dynamic fan-out *)
-  | EConcurrentFor (var, iter, body, timeout_opt, width) ->
+  | EConcurrentlyLoop (var, iter, body, timeout_opt, width) ->
       let discard_result =
         match expected_type_opt ctx with
         | Some expected when ctx_types_compatible ctx expected ty_void -> true
@@ -6275,6 +6525,24 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       let elem_ty =
         match iter_ty with
         | TyNamed ("List", [ t ]) -> Ok t
+        | _ when type_is_resource_source ctx.env iter_ty ->
+            error_with
+              ~notes:
+                [
+                  "Resource-source concurrent iteration must transfer each \
+                   produced resource into exactly one child task and make that \
+                   child task the cleanup owner.";
+                  "That move contract is not implemented yet, so accepting a \
+                   ResourceSource here would make resource ownership \
+                   ambiguous.";
+                ]
+              ~help:
+                (Some
+                   "Use an explicit accept/acquire loop for now, or keep the \
+                    source as a direct local until resource-source concurrent \
+                    iteration lands.")
+              iter.expr_loc
+              "resource-source concurrent iteration is not implemented yet"
         | _ ->
             error iter.expr_loc
               (Printf.sprintf "`for ... concurrently` requires a List, got %s"
@@ -6318,7 +6586,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           with_inferred_type
             {
               expr with
-              expr_desc = EConcurrentFor (var, iter', body', timeout_opt', width);
+              expr_desc =
+                EConcurrentlyLoop (var, iter', body', timeout_opt', width);
             }
             result_ty )
   (* detach expr — detach, returns Void *)
@@ -6352,6 +6621,16 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                   ],
                   "Use the resource synchronously inside the with block, or \
                    derive ordinary data before detaching work." )
+              else if source_captures <> [] then
+                ( "resource source value",
+                  source_captures,
+                  [
+                    "Resource sources produce owned resources. Detached work \
+                     needs an explicit move contract before source ownership \
+                     can cross that boundary.";
+                  ],
+                  "Consume resource sources with resource-source iteration, or \
+                   detach ordinary values derived from the source." )
               else if derived_captures <> [] then
                 ( "scoped resource-derived value",
                   derived_captures,
@@ -6965,7 +7244,8 @@ and infer_checked_collection_element ctx kind ~target_ty ~mismatch_label
       elem_ty
   in
   let* () =
-    reject_scoped_resource_derived_storage ctx.env expr.expr_loc
+    reject_scoped_resource_derived_storage ~module_aliases:ctx.module_aliases
+      ctx.env expr.expr_loc
       (collection_kind_user_name kind)
       elem'
   in
@@ -7005,7 +7285,7 @@ and infer_annotated_value_expr ctx expected_ty expr =
 and infer_statement_expr ctx expr =
   let* ty, expr' =
     match expr.expr_desc with
-    | EConcurrentFor _ | ESelect _ | EBlock _ -> (
+    | EConcurrentlyLoop _ | ESelect _ | EBlock _ -> (
         match expr.expr_desc with
         | EBlock exprs ->
             infer_statement_block (without_expected ctx) expr exprs
@@ -7030,14 +7310,19 @@ and ctx_after_inferred_expr ctx expr' =
           add_var ctx.env name var_ty
             ?source_type:(inferred_binding_source_type value)
             ~mutability:(if is_mutable then Mutable else Immutable)
-            ~origin:(binding_origin_for_value ctx.env value)
+            ~origin:
+              (binding_origin_for_value ~module_aliases:ctx.module_aliases
+                 ctx.env value)
             ();
       }
   | ETupleDestruct (names, value) -> (
       (* Get the tuple type from the value's type *)
       match expr_semantic_type_opt value with
       | Some (TyTuple elem_tys) when List.length elem_tys = List.length names ->
-          let origin = binding_origin_for_value ctx.env value in
+          let origin =
+            binding_origin_for_value ~module_aliases:ctx.module_aliases ctx.env
+              value
+          in
           let env' =
             List.fold_left2
               (fun env name ty ->
@@ -9210,16 +9495,16 @@ and infer_call ctx expr callee args loc =
             let arg_types = List.map fst typed_args in
 
             let* () =
-              reject_ordinary_resource_call_arg ctx loc callee_name
-                resolved_overload arg_types
+              reject_ordinary_resource_call_arg ctx loc source_callee
+                callee_name resolved_overload arg_types
             in
             let* () =
-              reject_unscoped_resource_operation_arg ctx callee_name
-                resolved_overload typed_args
+              reject_unscoped_resource_operation_arg ctx source_callee
+                callee_name resolved_overload typed_args
             in
             let* () =
-              reject_scoped_resource_derived_call_arg ctx loc callee_name
-                resolved_overload args'
+              reject_scoped_resource_derived_call_arg ctx loc source_callee
+                callee_name resolved_overload args'
             in
 
             (* Check trait bounds on type parameter arguments *)
@@ -10135,7 +10420,8 @@ and infer_block ctx expr exprs _loc =
             if types_equal last_ty ty_void || type_contains_resource ctx last_ty
             then Ok ()
             else
-              reject_scoped_resource_derived_escape ctx.env last.expr_loc last'
+              reject_scoped_resource_derived_escape
+                ~module_aliases:ctx.module_aliases ctx.env last.expr_loc last'
           in
           Ok (last_ty, List.rev (last' :: acc))
       | ({ expr_desc = EQuestionBind (name, ty_ann, rhs); _ } as stmt) :: rest
@@ -10433,7 +10719,8 @@ and infer_record_fields ctx field_types fields =
           actual_ty
       in
       let* () =
-        reject_scoped_resource_derived_storage ctx.env value.expr_loc
+        reject_scoped_resource_derived_storage
+          ~module_aliases:ctx.module_aliases ctx.env value.expr_loc
           "record fields" value'
       in
       (* Verify type matches expected if we have one *)
@@ -10473,8 +10760,8 @@ and infer_record_update ctx expr base fields loc =
       base_ty
   in
   let* () =
-    reject_scoped_resource_derived_storage ctx.env base.expr_loc
-      "record updates" base'
+    reject_scoped_resource_derived_storage ~module_aliases:ctx.module_aliases
+      ctx.env base.expr_loc "record updates" base'
   in
   match base_ty with
   | TyNamed (type_name, type_args) -> (
@@ -10515,7 +10802,8 @@ and infer_record_update ctx expr base fields loc =
                     "record fields" actual_ty
                 in
                 let* () =
-                  reject_scoped_resource_derived_storage ctx.env value.expr_loc
+                  reject_scoped_resource_derived_storage
+                    ~module_aliases:ctx.module_aliases ctx.env value.expr_loc
                     "record fields" value'
                 in
                 if ctx_types_compatible ctx expected_ty actual_ty then

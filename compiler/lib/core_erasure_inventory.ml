@@ -267,7 +267,8 @@ let collect_expr_sites ~(reg : Codegen_types.registry) acc (expr : Core.core) =
         (fun acc binding ->
           collect_optional_task_closure ~reg ~loc binding.cb_task acc)
         acc block.conc_bindings
-  | CConcurrentFor cf -> collect_optional_task_closure ~reg ~loc cf.cf_task acc
+  | CConcurrentlyLoop cf ->
+      collect_optional_task_closure ~reg ~loc cf.cf_task acc
   | CDetach detach ->
       collect_optional_task_closure ~reg ~loc detach.detach_task acc
   | _ -> acc

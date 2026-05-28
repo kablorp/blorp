@@ -115,34 +115,38 @@ exist, but channel lifecycle needs its own semantics.
 
 ### TCP
 
-`std/net/tcp.brp` now exposes opaque typed handles instead of raw `Int` file
+`std/net/tcp.brp` now exposes scoped resource handles instead of raw `Int` file
 descriptors:
 
 ```blorp
-TcpListener
-TcpStream
+resource type TcpListener = builtin("blorp_tcp_close_listener")
+resource type TcpStream = builtin("blorp_tcp_close_stream")
 ```
 
 The current public API is:
 
 ```blorp
-listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, String]
-accept(listener: TcpListener) -> Result[TcpStream, String]
-connect(host: String, port: Int) -> Result[TcpStream, String]
-read(stream: TcpStream, max_bytes: Int) -> Result[Bytes, String]
-write(stream: TcpStream, data: Bytes) -> Result[Int, String]
-close(handle: TcpListener) -> Void
-close(handle: TcpStream) -> Void
-local_port(handle: TcpListener) -> Result[Int, String]
-local_port(handle: TcpStream) -> Result[Int, String]
-set_timeout(handle: TcpListener, ms: Int) -> Result[Int, String]
-set_timeout(handle: TcpStream, ms: Int) -> Result[Int, String]
+listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
+accept(listener: TcpListener) -> Result[TcpStream, TcpError]
+connect(host: String, port: Int) -> Result[TcpStream, TcpError]
+read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
+read(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
+write(stream: TcpStream, data: Bytes) -> Result[Int, TcpError]
+write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]
+local_port(listener: TcpListener) -> Result[Int, TcpError]
+stream_local_port(stream: TcpStream) -> Result[Int, TcpError]
+set_timeout(listener: TcpListener, ms: Int) -> Result[Void, TcpError]
+set_stream_timeout(stream: TcpStream, ms: Int) -> Result[Void, TcpError]
+set_reuse_addr(listener: TcpListener) -> Result[Void, TcpError]
 ```
 
 Current runtime shape:
 
-- listener and stream handles are ARC-managed builtin values wrapping shared
-  runtime TCP state;
+- listener and stream handles are compiler-scoped resources wrapping runtime
+  TCP state; cleanup is installed by `with`, and manual `close` is private;
+- TCP resource cleanup consumes the scoped handle: it closes/wakes the socket
+  state and releases the ARC wrapper, so resource finalizers cannot silently
+  leak the handle object after closing the fd;
 - newly created and adopted sockets are placed in nonblocking mode;
 - `accept`, numeric-address `connect`, `read`, and `write` park fibers through
   the scheduler's poll-backed I/O reactor instead of pinning OS workers while
@@ -166,13 +170,10 @@ Remaining limitations:
 
 - hostname resolution still uses `getaddrinfo` and can block an OS worker before
   the nonblocking socket phase begins;
-- the original TCP entry points still report errors as `String`; typed
-  compatibility bridges exist for acquisition, local-port lookup, timeouts,
-  reuse-address configuration, and read/write, but the simple names have not
-  moved to `TcpError` yet. The bridges type their own precondition failures as
-  `InvalidInput` and preserve runtime-originated string failures as `Other`;
-- typed TCP handles are normal ARC-managed values, not compiler-scoped
-  resources yet;
+- concurrent resource-source iteration for
+  `connections_stop_on_error(listener)` and
+  `connections_continue_on_error(listener)`, typed transient accept-error
+  continuation, plus TCP chunk or line stream adapters, are still future work.
 - TCP does not yet expose `chunks`, `lines`, or other fallible stream adapters;
 - runtime interop helpers can still adopt or reveal raw fds for internal,
   package, and test use, but the public Blorp TCP API no longer accepts raw
@@ -892,39 +893,12 @@ operations or explicit `next()` APIs for fallible streams.
 
 ## TCP And Network Streaming Target
 
-Typed handles and nonblocking readiness are already in place at the user level:
-
-```blorp
-type TcpListener = builtin
-type TcpStream = builtin
-union TcpError
-
-listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, String]
-accept(self: TcpListener) -> Result[TcpStream, String]
-connect(host: String, port: Int) -> Result[TcpStream, String]
-listen_checked(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
-accept_checked(self: TcpListener) -> Result[TcpStream, TcpError]
-connect_checked(host: String, port: Int) -> Result[TcpStream, TcpError]
-local_port_checked(self: TcpListener) -> Result[Int, TcpError]
-local_port_checked(self: TcpStream) -> Result[Int, TcpError]
-set_timeout_checked(self: TcpListener, ms: Int) -> Result[Void, TcpError]
-set_timeout_checked(self: TcpStream, ms: Int) -> Result[Void, TcpError]
-set_reuse_addr_checked(self: TcpListener) -> Result[Void, TcpError]
-
-read(self: TcpStream, max_bytes: Int) -> Result[Bytes, String]
-write(self: TcpStream, data: Bytes) -> Result[Int, String]
-read_chunk(self: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
-write_all(self: TcpStream, data: Bytes) -> Result[Void, TcpError]
-close(self: TcpListener) -> Void
-close(self: TcpStream) -> Void
-```
-
-The next API target is not "typed sockets" anymore; it is scoped sockets,
-typed errors, and stream adapters layered on the current handles:
+Scoped resources and nonblocking readiness are in place at the user level:
 
 ```blorp
 resource type TcpListener = builtin
 resource type TcpStream = builtin
+union TcpError
 
 listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
 accept(self: TcpListener) -> Result[TcpStream, TcpError]
@@ -953,15 +927,28 @@ Runtime status and target:
 - landed: fiber parking for socket readiness in `accept`, numeric `connect`,
   `read`, and `write`;
 - landed: timeout/cancellation wakeups for socket waiters;
-- landed: `TcpError` plus typed `listen_checked`, `accept_checked`,
-  `connect_checked`, `local_port_checked`, `set_timeout_checked`,
-  `set_reuse_addr_checked`, `read_chunk`, and `write_all` compatibility
-  adapters over the current string-error runtime surface. Wrapper-owned invalid
-  host, port, backlog, timeout, and chunk-size inputs are already surfaced as
-  `InvalidInput`;
-- not landed: simple-name `TcpError` returns for `listen`, `accept`, and
-  `connect`;
-- not landed: compiler-enforced scoped resources and `with` cleanup;
+- landed: `TcpListener` and `TcpStream` are resource types with compiler-owned
+  `with` cleanup and private finalizers;
+- landed: simple-name TCP APIs now return `TcpError`; wrapper-owned invalid
+  host, port, backlog, timeout, and chunk-size inputs surface as
+  `InvalidInput`, while runtime-originated string failures are preserved as
+  `Other`;
+- landed: compiler rejects ordinary TCP resource params/returns, matching
+  acquisition results outside `with`, manual `close` imports, detached capture,
+  and concurrent capture;
+- landed: codegen routes public TCP builtins through typed raw runtime bridges;
+- landed: module-qualified resource-operation calls such as
+  `Tcp.write(stream, data)` preserve resource-operation metadata;
+- landed: deterministic cancellation leak coverage for parked TCP `accept` and
+  `read`, plus compiler-side cleanup coverage for owned `Bytes` payloads
+  borrowed by write calls;
+- landed: `connections_stop_on_error(listener)` and
+  `connections_continue_on_error(listener)` as scoped, listener-borrowing source
+  shapes with explicit accept-error policy; compiler tests cover direct
+  binding, scoped escape, closure/detached capture, and generated C for the
+  ARC-owned source wrappers that borrow the listener;
+- landed: sequential `for` over TCP connection sources transfers each accepted
+  stream into a scoped loop body with normal and cancellation cleanup;
 - not landed: `chunks` and `lines` adapters;
 - not landed: nonblocking DNS or a bounded DNS worker strategy for hostname
   resolution.
@@ -972,57 +959,54 @@ through a bounded blocking-worker path.
 
 ### TCP Resource Migration Staging
 
-A direct declaration change from `type TcpListener` / `type TcpStream` to
-`resource type TcpListener` / `resource type TcpStream` is intentionally not the
-next implementation step. The current resource rules correctly reject ordinary
-source functions that accept or return resource-containing types, storing
-resources in lists/channels/records/unions/options, and capturing resources in
-closures, detached tasks, or concurrent task bodies. Those rules are the right
-long-term shape, but flipping TCP immediately would turn broad existing TCP
-usage into hard errors before the replacement API is available.
+The first TCP resource slice has landed. The current resource rules reject
+ordinary source functions that accept or return resource-containing types,
+storing resources in lists/channels/records/unions/options, and capturing
+resources in closures, detached tasks, or concurrent task bodies. TCP now uses
+those general rules instead of bespoke handle restrictions.
 
-Observed migration blockers:
+Remaining migration blockers:
 
-- tests and examples pass `TcpListener` and `TcpStream` through ordinary helper
-  functions;
 - the TCP virtual-thread benchmark stores streams in `List[TcpStream]`;
-- the detached accepted-stream regression intentionally uses
-  `detach handle_client(stream)` while the resource-safe replacement is still
-  pending;
 - optional networking packages wrap or store `TCP.TcpStream` inside ordinary
   records and unions;
 - the current accept API returns one stream at a time rather than a
   resource-producing source that can transfer ownership into a concurrent loop.
 
-Staging plan:
+Remaining staging plan:
 
-1. Keep the current typed-handle compatibility API and typed `TcpError` bridges
-   until all examples and tests have a scoped spelling to migrate to.
-2. Define the resource-source shape first. The `ResourceSource[R, E]` type
-   anchor exists and is rejected at ordinary aggregate/function boundaries,
-   globals, type aliases that hide it in ordinary carriers, ordinary carrier
-   type ascriptions such as `None as Option[ResourceSource[...]]`, and
-   annotated local bindings such as `Option[ResourceSource[...]]`; the
-   compiler also rejects function values whose parameters or return values
-   hide resource-source carriers while preserving direct source producer
-   function types. The remaining work is the iteration contract, including how
-   `connections(listener)` transfers each accepted stream into a
+1. Define the resource-source shape. Landed: `ResourceSource[R, E]` is a
+   protected type anchor, and the explicit-policy TCP connection-source
+   constructors now provide the first real producers as ARC-owned source
+   wrappers that borrow their scoped listener and have type
+   `ResourceSource[TcpStream, TcpError]`. The compiler rejects ordinary
+   aggregate/function boundaries, globals, type aliases that hide it in
+   ordinary carriers, ordinary carrier type ascriptions such as
+   `None as Option[ResourceSource[...]]`, annotated local bindings such as
+   `Option[ResourceSource[...]]`, mutable direct source locals, direct source
+   locals copied from existing source bindings, discarded direct source values,
+   source values as concurrent task results, source escape from the listener
+   `with` block, closure capture, detached/concurrent capture, and attempted
+   concurrent resource-source iteration with an explicit staged-feature
+   diagnostic. Sequential resource-source iteration has landed. The remaining
+   work is the concurrent iteration contract, including how
+   `connections_continue_on_error(listener)` and
+   `connections_stop_on_error(listener)` transfer each accepted stream into a
    `for ... concurrently(limit:)` task and how cancellation closes streams owned
    by cancelled tasks.
-3. Decide whether ordinary user helpers may ever borrow resources. If not, keep
+2. Decide whether ordinary user helpers may ever borrow resources. If not, keep
    TCP resource helpers as compiler-owned resource operations and teach users to
    structure helpers around ordinary data or resource-source callbacks.
-4. Migrate internal tests, benchmarks, and package call sites from ordinary
+3. Migrate benchmarks and package call sites from ordinary
    helper/storage patterns to scoped listeners, owned connection tasks, and
    explicit services/pools where sharing is intentional.
-5. Only then promote the simple TCP names to `TcpError` and resource return
-   types, updating call sites to `with` and `connections(...).concurrently(...)`
-   in the same change.
+4. Keep module-qualified resource-operation metadata covered by regression
+   tests as more resource-backed modules adopt the pattern.
 
-This staging preserves the main safety invariant: once `TcpStream` is a
-resource, shapes such as detached capture, list storage, and arbitrary helper
-passing should be rejected by the same general resource rules that already
-protect file handles. TCP should not need special codegen exceptions.
+This staging preserves the main safety invariant: `TcpStream` is a resource, so
+shapes such as detached capture, list storage, and arbitrary helper passing are
+rejected by the same general resource rules that already protect file handles.
+TCP should not need special codegen exceptions.
 
 ## Database Connector Target
 
@@ -1742,6 +1726,11 @@ Completed in the current implementation:
 
 - Public APIs use `TcpListener` and `TcpStream` instead of raw `Int` socket
   descriptors.
+- `TcpListener` and `TcpStream` are scoped resource types; cleanup is installed
+  by `with`, and manual `close` is private.
+- Simple-name TCP APIs return `TcpError`; explicit invalid inputs are
+  `InvalidInput`, while runtime-originated string details currently map to
+  `Other`.
 - Socket operations use nonblocking fds and a poll-backed scheduler reactor for
   readiness waits.
 - `accept`, numeric `connect`, `read`, and `write` can park virtual threads
@@ -1750,17 +1739,17 @@ Completed in the current implementation:
 - Overlapping same-operation waiters report in-progress errors; the
   one-waiter-per-operation shape is documented as the compatibility policy
   until the resource model can make any broader shape explicit.
-- `TcpError` exists, with checked compatibility bridges for acquisition,
-  local-port lookup, timeouts, reuse-address configuration, chunk reads, and
-  all-byte writes. Wrapper-owned invalid inputs are surfaced as `InvalidInput`.
 - Typecheck regressions reject raw `Int` values passed to the public TCP API.
+- Typecheck regressions reject ordinary TCP resource params/returns, matching
+  acquisition results outside `with`, manual `close` import, detached capture,
+  and concurrent capture.
 
 Tasks:
 
-- Define and implement the TCP resource-source migration shape before changing
-  `TcpListener` and `TcpStream` into compiler-scoped resource types.
-- Promote the simple-name TCP APIs from legacy `String` errors to `TcpError`
-  when the scoped resource API lands.
+- Define and implement concurrent TCP resource-source iteration for accepted
+  streams.
+- Finish typed transient-error continuation for
+  `connections_continue_on_error`.
 - Add stream adapters for chunks and lines.
 - Decide the DNS story:
   - document numeric hosts as the virtual-thread-friendly path;
@@ -1795,6 +1784,10 @@ Tests:
 - stream over channel exits on seal;
 - stream over channel parks fibers rather than blocking workers;
 - cancellation removes waiters from channel queues;
+- landed for blocked channel sends, receives, structured joins, bounded
+  dynamic fan-out, ordinary `select`, and TCP `accept`/`read`: deterministic
+  cancellation tests cancel a task only after it is observed parked, so
+  owned-temporary leak baselines no longer rely on timer races;
 - no leak when a channel stream is dropped before the channel seals.
 
 ### Phase 6: Database And Package Connector Guidance

@@ -2408,7 +2408,7 @@ let list_map self_ty result_ty self f =
 
 (** concurrent(self, limit, f) -> List[Result[U, ConcurrencyError]]
 
-    Build the public helper as Core concurrent-for instead of a separate
+    Build the public helper as Core for ... concurrently instead of a separate
     runtime mapping primitive. This keeps task spawning, result wrapping,
     cancellation, and timeout join behavior on the same path as source
     [for ... concurrently(limit:)]. *)
@@ -2419,14 +2419,14 @@ let list_concurrent_collect ?timeout self_ty result_ty self limit f =
   let item = mk elem_ty (CVar item_var) in
   let body = closure_call f [ item ] result_elem_ty in
   mk result_ty
-    (CConcurrentFor
+    (CConcurrentlyLoop
        {
          cf_var = item_var;
          cf_iter = self;
          cf_body = body;
          cf_timeout = timeout;
-         cf_width = ConcurrentForLimit limit;
-         cf_output = ConcurrentForCollect;
+         cf_width = ConcurrentlyLoopLimit limit;
+         cf_output = ConcurrentlyLoopCollect;
          cf_task_scope = synthetic_concurrent_task_scope;
          cf_task = None;
        })

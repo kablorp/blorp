@@ -31,7 +31,7 @@
     - Treats direct foreign calls as borrowed at the Perceus layer; any FFI
       copying / conversion remains an emit/runtime boundary concern.
     - Handles [CConcurrent] binding lifetimes conservatively.
-    - Handles [CConcurrent], [CConcurrentFor], and [CDetach] captures as
+    - Handles [CConcurrent], [CConcurrentlyLoop], and [CDetach] captures as
       borrowed/captured spawn-site uses so the original owner is dropped after
       the task closure has retained it.
 
@@ -506,7 +506,7 @@ let rec count_uses (name : string) (e : core) : int =
         match cb.conc_timeout with Some t -> count_uses name t | None -> 0
       in
       rhs_uses + body_uses + timeout_uses
-  | CConcurrentFor cf -> (
+  | CConcurrentlyLoop cf -> (
       count_uses name cf.cf_iter
       + (if cf.cf_var.vname = name then 0 else count_uses name cf.cf_body)
       + match cf.cf_timeout with Some t -> count_uses name t | None -> 0)
@@ -1007,7 +1007,7 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
         else summarize_linear_ownership_uses env name cb.conc_body
       in
       seq_ownership_uses timeout_uses (seq_ownership_uses task_uses body_uses)
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       let iter_uses = summarize_linear_borrow env name cf.cf_iter in
       let task_uses =
         if cf.cf_var.vname = name then no_ownership_uses
@@ -1359,7 +1359,7 @@ let populate_user_call_contracts (env : type_env) (prog : core_program) : unit =
 let rec is_linear (e : core) : bool =
   match e.desc with
   | CIf _ | CMatchArms _ | CMatch _ | CWhile _ | CFor _ | CConcurrent _
-  | CConcurrentFor _ ->
+  | CConcurrentlyLoop _ ->
       false
   (* Lambda/closure bodies and detached task bodies are evaluated later. At
      this site, only closure construction/spawn happens, so treat them as
@@ -1612,7 +1612,7 @@ let lambda_has_runtime_captures (env : type_env) (lam : lambda) : bool =
         rhs_captures
         || has_core body_bound block.conc_body
         || Option.fold ~none:false ~some:(has_core bound) block.conc_timeout
-    | CConcurrentFor cf ->
+    | CConcurrentlyLoop cf ->
         has_core bound cf.cf_iter
         || has_core (SS.add cf.cf_var.vname bound) cf.cf_body
         || Option.fold ~none:false ~some:(has_core bound) cf.cf_timeout
@@ -2003,7 +2003,7 @@ let rec retain_borrowed_owned_call_args_in_expr (env : type_env)
               conc_timeout = timeout';
             };
       }
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       let iter' = recur consumed_params borrowed cf.cf_iter in
       let loop_borrowed =
         cf.cf_var.vname :: remove_bound_names [ cf.cf_var.vname ] borrowed
@@ -2019,7 +2019,7 @@ let rec retain_borrowed_owned_call_args_in_expr (env : type_env)
       {
         e with
         desc =
-          CConcurrentFor
+          CConcurrentlyLoop
             { cf with cf_iter = iter'; cf_body = body'; cf_timeout = timeout' };
       }
   | CMatchArms (scrut, arms) ->
@@ -2242,7 +2242,7 @@ let rec expr_contains_var (name : string) (e : core) : bool =
       rhs_mentions
       || ((not shadowed) && expr_contains_var name cb.conc_body)
       || Option.fold ~none:false ~some:(expr_contains_var name) cb.conc_timeout
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       expr_contains_var name cf.cf_iter
       || (cf.cf_var.vname <> name && expr_contains_var name cf.cf_body)
       || Option.fold ~none:false ~some:(expr_contains_var name) cf.cf_timeout
@@ -2369,7 +2369,7 @@ let rec expr_consumes_var_owner (env : type_env) (name : string) (e : core) :
       || Option.fold ~none:false
            ~some:(expr_consumes_var_owner env name)
            cb.conc_timeout
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       expr_consumes_var_owner env name cf.cf_iter
       || (cf.cf_var.vname <> name && expr_consumes_var_owner env name cf.cf_body)
       || Option.fold ~none:false
@@ -2447,7 +2447,7 @@ let rec expr_assigns_var (name : string) (e : core) : bool =
       rhs_assigns
       || ((not shadowed) && expr_assigns_var name cb.conc_body)
       || Option.fold ~none:false ~some:(expr_assigns_var name) cb.conc_timeout
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       expr_assigns_var name cf.cf_iter
       || (cf.cf_var.vname <> name && expr_assigns_var name cf.cf_body)
       || Option.fold ~none:false ~some:(expr_assigns_var name) cf.cf_timeout
@@ -2905,11 +2905,11 @@ let release_reassigned_mutable_var (env : type_env)
                     cb.conc_timeout;
               };
         }
-    | CConcurrentFor cf ->
+    | CConcurrentlyLoop cf ->
         {
           e with
           desc =
-            CConcurrentFor
+            CConcurrentlyLoop
               {
                 cf with
                 cf_iter =
@@ -3139,7 +3139,7 @@ let rec retain_borrowed_aggregate_members_in_expr (env : type_env)
                 conc_timeout = timeout';
               };
         }
-    | CConcurrentFor cf ->
+    | CConcurrentlyLoop cf ->
         let iter' = recur borrowed cf.cf_iter in
         let loop_borrowed =
           cf.cf_var.vname :: remove_bound_names [ cf.cf_var.vname ] borrowed
@@ -3149,7 +3149,7 @@ let rec retain_borrowed_aggregate_members_in_expr (env : type_env)
         {
           e with
           desc =
-            CConcurrentFor
+            CConcurrentlyLoop
               {
                 cf with
                 cf_iter = iter';
@@ -3466,14 +3466,14 @@ let rec retain_borrowed_result_vars_in_expr (env : type_env)
               iter,
               retain_borrowed_result_vars_in_expr env loop_borrowed body );
       }
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       let loop_borrowed =
         cf.cf_var.vname :: remove_bound_names [ cf.cf_var.vname ] borrowed
       in
       {
         e with
         desc =
-          CConcurrentFor
+          CConcurrentlyLoop
             {
               cf with
               cf_body =

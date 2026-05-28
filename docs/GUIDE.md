@@ -1706,8 +1706,17 @@ as `None as Option[ResourceSource[...]]`, globals, and ordinary source function
 parameters or returns cannot contain it. Function values may directly produce
 resource sources, such as `() -> ResourceSource[R, E]`, but their parameters
 and return values cannot hide resource sources in ordinary carriers such as
-`() -> Option[ResourceSource[R, E]]`. The iteration syntax for resource sources
-is still part of the concurrency and resource roadmap.
+`() -> Option[ResourceSource[R, E]]`. Direct source locals must be immutable,
+must come from producer calls rather than copies of existing source locals, and
+must not be discarded or returned from concurrent tasks. The
+sequential iteration syntax for resource sources transfers each produced
+resource into a scoped loop body that owns cleanup. Concurrent resource-source
+iteration is still part of the concurrency and resource roadmap.
+`net/tcp.connections_stop_on_error` and
+`net/tcp.connections_continue_on_error` already expose the TCP producer shape as
+ARC-owned source wrappers that borrow their scoped listener and have type
+`ResourceSource[TcpStream, TcpError]` so the ownership category and source-error
+policy are explicit.
 `writer.write_chunk(data)` performs one write attempt and returns the number of
 bytes written; use `writer.write_bytes(data)` when all bytes must be written
 before returning.
@@ -1735,9 +1744,43 @@ func line_count(path: String) -> Result[Int, IOError]:
         reader.count_lines()
 ```
 
-General resource-backed APIs are still under development; existing `system` and
-TCP helpers remain compatibility APIs unless their modules declare resource
-types.
+TCP listeners and streams are scoped resources. Acquire them with `with` so the
+compiler installs cleanup, and return ordinary data from the block. TCP APIs
+return `TcpError`; wrapper-owned invalid inputs such as bad ports, backlog
+values, timeouts, and chunk sizes are `InvalidInput`, while runtime-originated
+socket failures are currently preserved as `Other`. Numeric hosts such as
+`"127.0.0.1"` are the virtual-thread-friendly path; hostname resolution may
+still block an OS worker before the socket operation can park the current
+fiber.
+`connections_stop_on_error(listener)` and
+`connections_continue_on_error(listener)` return direct
+`ResourceSource[TcpStream, TcpError]` values. The source value is an ARC-owned
+cursor wrapper that borrows the scoped listener and carries an explicit
+accept-error policy for future iteration. It cannot escape the listener's
+`with` block or be captured by closures, detached work, or concurrent work.
+Resource-source `for` iteration is still being implemented.
+
+```blorp
+import:
+    net/tcp: TcpError, connect, read_chunk
+
+func fetch_once(port: Int) -> Result[Int, TcpError]:
+    with stream ?= connect("127.0.0.1", port):
+        data ?= read_chunk(stream, 4096)
+        Ok(data.length())
+```
+
+Module-qualified calls work too. A combined import can provide both the module
+alias and the error type:
+
+```blorp
+import:
+    net/tcp as Tcp: TcpError
+
+func local_stream_port(port: Int) -> Result[Int, TcpError]:
+    with stream ?= Tcp.connect("127.0.0.1", port):
+        Tcp.stream_local_port(stream)
+```
 
 The portable TCP module is still handle-based, not scoped with `with`, so close
 accepted listeners and streams explicitly. Its original `listen`, `accept`,
@@ -2697,7 +2740,7 @@ This table lists the main public modules. The source of truth is the `std/` and
 | `cache`, `parallel_list`, `deque`, `heap`, `sorted_map`, `graph`, `rate_limit`, `property` | `heap: Heap` | Extended collections and infrastructure |
 | `geometry`, `geographic`, `geojson`, `physics`, `units` | `geometry: Vec2` | Spatial, geographic, physics, and unit helpers |
 | `dsp`, `fft`, `noise` | `dsp: ...` | Signal and procedural numeric helpers |
-| `net/tcp`, `net/http`, `net/url`, `net/mime` | `net/tcp as Tcp` | Portable networking primitives and protocol helpers |
+| `net/tcp`, `net/http`, `net/url`, `net/mime` | `net/tcp: connect, read_chunk` | Portable networking primitives and protocol helpers |
 | `pkg/compress`, `pkg/crypto`, `pkg/sqlite` | `pkg/compress: gzip` | Optional native bindings and native-backed packages |
 | `pkg/net/dns`, `pkg/net/http_client`, `pkg/net/smtp`, `pkg/net/tls`, `pkg/net/udp`, `pkg/net/websocket` | `pkg/net/dns as DNS` | Native-backed networking packages |
 | `term` | `term: ...` | Terminal helpers |
@@ -2737,7 +2780,7 @@ Common compiler-registered builtins include:
 | Bitwise | `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shift_left`, `shift_right` |
 | Checked arithmetic | `checked_div`, `checked_mod` |
 | Tensor/array helpers | `vector`, `matrix`, `tensor3`, `tensor4`, `tensor5`, `assert_shape`, `checked_get`, `checked_set`, `checked_slice` |
-| Concurrency/channel | `sleep`, `sleep_for`, `yield_now`, `max_threads`, `Channel`, `channel`, `send`, `wait_send`, `recv`, `wait_recv`, `try_send`, `try_send_attempt`, `try_recv`, `try_recv_attempt`, `send_timeout`, `send_timeout_for`, `send_timeout_attempt`, `send_timeout_attempt_for`, `recv_timeout`, `recv_timeout_for`, `recv_timeout_attempt`, `recv_timeout_attempt_for`, `seal`, `close`, `ConcurrencyError`, `TaskResult`, `ChannelSealed`, `SendAttempt`, `RecvAttempt` |
+| Concurrency/channel | `sleep`, `sleep_for`, `yield_now`, `max_threads`, `Channel`, `channel`, `send`, `wait_send`, `recv`, `wait_recv`, `try_send`, `try_send_attempt`, `try_recv`, `try_recv_attempt`, `send_timeout`, `send_timeout_for`, `send_timeout_attempt`, `send_timeout_attempt_for`, `recv_timeout`, `recv_timeout_for`, `recv_timeout_attempt`, `recv_timeout_attempt_for`, `seal`, `ConcurrencyError`, `TaskResult`, `ChannelSealed`, `SendAttempt`, `RecvAttempt` |
 
 Most system APIs require explicit imports. Examples:
 

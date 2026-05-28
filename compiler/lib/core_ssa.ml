@@ -155,7 +155,7 @@ let rec classify_assignment_shape (name : string) (e : core) : assignment_shape
         else classify_control_boundary name block.conc_body
       in
       combine_assignment_shapes ((body_shape :: timeout_shapes) @ binding_shapes)
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       combine_assignment_shapes
         [
           classify_control_boundary name cf.cf_iter;

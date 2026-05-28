@@ -235,6 +235,7 @@ typedef struct {
 
 typedef struct blorp_TcpListener blorp_TcpListener;
 typedef struct blorp_TcpStream blorp_TcpStream;
+typedef struct blorp_ResourceSource blorp_ResourceSource;
 typedef struct blorp_FileReader blorp_FileReader;
 typedef struct blorp_FileWriter blorp_FileWriter;
 typedef struct blorp_File blorp_File;
@@ -321,6 +322,48 @@ typedef struct {
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
 } blorp_FileVoidResult;
+
+typedef enum {
+    BLORP_TCP_ERROR_NONE = 0,
+    BLORP_TCP_ERROR_INVALID_INPUT = 1,
+    BLORP_TCP_ERROR_TIMED_OUT = 2,
+    BLORP_TCP_ERROR_CLOSED = 3,
+    BLORP_TCP_ERROR_BUSY = 4,
+    BLORP_TCP_ERROR_DNS = 5,
+    BLORP_TCP_ERROR_CONNECTION_FAILED = 6,
+    BLORP_TCP_ERROR_INTERRUPTED = 7,
+    BLORP_TCP_ERROR_UNSUPPORTED = 8,
+    BLORP_TCP_ERROR_OTHER = 9
+} blorp_TcpErrorKind;
+
+typedef struct {
+    blorp_TcpListener* handle;
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpListenerResult;
+
+typedef struct {
+    blorp_TcpStream* handle;
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpStreamResult;
+
+typedef struct {
+    blorp_Bytes* value;
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpBytesResult;
+
+typedef struct {
+    long value;
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpIntResult;
+
+typedef struct {
+    blorp_TcpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TcpVoidResult;
 
 #define BLORP_LIST_STORAGE_POINTER 0
 #define BLORP_LIST_STORAGE_INLINE 1
@@ -1365,6 +1408,20 @@ blorp_Result* blorp_tcp_local_port_listener(blorp_TcpListener* listener);
 blorp_Result* blorp_tcp_local_port_stream(blorp_TcpStream* stream);
 blorp_Result* blorp_tcp_set_timeout_listener(blorp_TcpListener* listener, long ms);
 blorp_Result* blorp_tcp_set_timeout_stream(blorp_TcpStream* stream, long ms);
+blorp_TcpListenerResult blorp_tcp_listen_raw(blorp_String* host, long port, long backlog);
+blorp_TcpStreamResult blorp_tcp_accept_raw(blorp_TcpListener* listener);
+blorp_ResourceSource* blorp_tcp_connections_stop_on_error_raw(blorp_TcpListener* listener);
+blorp_ResourceSource* blorp_tcp_connections_continue_on_error_raw(blorp_TcpListener* listener);
+bool blorp_resource_source_next_raw(blorp_ResourceSource* source, void** out);
+blorp_TcpStreamResult blorp_tcp_connect_raw(blorp_String* host, long port);
+blorp_TcpBytesResult blorp_tcp_read_raw(blorp_TcpStream* stream, long max_bytes);
+blorp_TcpIntResult blorp_tcp_write_raw(blorp_TcpStream* stream, blorp_Bytes* data);
+blorp_TcpVoidResult blorp_tcp_write_all_raw(blorp_TcpStream* stream, blorp_Bytes* data);
+blorp_TcpVoidResult blorp_tcp_set_reuse_addr_raw(blorp_TcpListener* listener);
+blorp_TcpIntResult blorp_tcp_local_port_listener_raw(blorp_TcpListener* listener);
+blorp_TcpIntResult blorp_tcp_local_port_stream_raw(blorp_TcpStream* stream);
+blorp_TcpVoidResult blorp_tcp_set_timeout_listener_raw(blorp_TcpListener* listener, long ms);
+blorp_TcpVoidResult blorp_tcp_set_timeout_stream_raw(blorp_TcpStream* stream, long ms);
 blorp_TcpListener* blorp_tcp_listener_from_fd(long fd);
 blorp_TcpStream* blorp_tcp_stream_from_fd(long fd);
 long blorp_tcp_listener_fd(blorp_TcpListener* listener);
@@ -1471,6 +1528,7 @@ long blorp_concurrent_remaining_ms(long deadline_us);
 long blorp_concurrent_normalize_limit(long requested);
 void blorp_task_cancel(void* t);
 void blorp_task_cancel_join_release(void* t);
+long blorp_test_cancel_after_parked(blorp_Closure* func);
 void blorp_sleep(long ms);
 void blorp_yield_now(void);
 long blorp_max_threads(void);

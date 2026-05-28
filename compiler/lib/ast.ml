@@ -218,8 +218,8 @@ type rc_annotation = {
 (** RC annotation computed by pre-codegen pass from type information.
     None on expr means "unknown" — codegen falls back to existing heuristics. *)
 
-type concurrent_for_width =
-  | ConcurrentForLimit of int  (** [for ... concurrently(limit: N)]. *)
+type concurrently_loop_width =
+  | ConcurrentlyLoopLimit of int  (** [for ... concurrently(limit: N)]. *)
 
 type expr = {
   expr_desc : expr_desc;
@@ -291,7 +291,8 @@ and expr_desc =
       (** concurrent: block — bindings, optional timeout_ms expr, optional max_threads *)
   | EConcurrentBind of string * type_expr option * expr
       (** name = expr — concurrent task binding *)
-  | EConcurrentFor of string * expr * expr * expr option * concurrent_for_width
+  | EConcurrentlyLoop of
+      string * expr * expr * expr option * concurrently_loop_width
       (** var, iterable, body, optional timeout, explicit scheduling limit *)
   | EDetach of expr  (** detach expr — detach on thread pool *)
   | EDict of (expr * expr) list  (** {"key" => val, ...} — dict literal *)
@@ -731,8 +732,9 @@ let expr_children (e : expr) : expr list =
       List.filter_map
         (function InterpLit _ -> None | InterpExpr e -> Some e)
         parts
-  | EConcurrentFor (_, iter, body, None, _) -> [ iter; body ]
-  | EConcurrentFor (_, iter, body, Some timeout, _) -> [ iter; body; timeout ]
+  | EConcurrentlyLoop (_, iter, body, None, _) -> [ iter; body ]
+  | EConcurrentlyLoop (_, iter, body, Some timeout, _) ->
+      [ iter; body; timeout ]
   | EDetach body -> [ body ]
   | EDict pairs -> List.concat_map (fun (k, v) -> [ k; v ]) pairs
   | EFuncDecl func -> (
@@ -824,8 +826,8 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
                 | InterpLit _ as lit -> lit | InterpExpr e1 -> InterpExpr (f e1))
               parts,
             is_triple )
-    | EConcurrentFor (var, iter, body, timeout, mt) ->
-        EConcurrentFor (var, f iter, f body, Option.map f timeout, mt)
+    | EConcurrentlyLoop (var, iter, body, timeout, mt) ->
+        EConcurrentlyLoop (var, f iter, f body, Option.map f timeout, mt)
     | EDetach body -> EDetach (f body)
     | EDict pairs -> EDict (List.map (fun (k, v) -> (f k, f v)) pairs)
     | EFuncDecl func ->

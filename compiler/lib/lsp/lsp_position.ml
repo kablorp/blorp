@@ -320,7 +320,7 @@ let find_definition (program : program) ~(name : string) ~(line : int)
     | EConcurrentBind (n, _, _)
       when n = name && loc_starts_before_cursor e.expr_loc ->
         Some e.expr_loc
-    | EConcurrentFor (n, _, body, _, _) ->
+    | EConcurrentlyLoop (n, _, body, _, _) ->
         if n = name && loc_starts_before_cursor e.expr_loc then Some e.expr_loc
         else find_local_in_expr body
     | EDetach body -> find_local_in_expr body

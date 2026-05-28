@@ -72,7 +72,8 @@ let builtin_layout = function
   | "Set" | "Tensor" | "Vector" | "Matrix" | "Builder" | "Slice" | "Option"
   | "Result" | "Task" | "Channel" | "Stream" | "FallibleStream"
   | "std/stream::FallibleStream" | "std_stream__FallibleStream" | "TcpListener"
-  | "TcpStream" | "ConcurrencyError" ->
+  | "TcpStream" | "ResourceSource" | "std/stream::ResourceSource"
+  | "std_stream__ResourceSource" | "ConcurrencyError" ->
       Some managed_layout
   | "FileReader" | "FileWriter" | "File" | "std/file::FileReader"
   | "std/file::FileWriter" | "std/file::File" | "std_file__FileReader"

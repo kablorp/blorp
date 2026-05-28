@@ -3,7 +3,7 @@
     Keep semantic facts here instead of scattering name sets through compiler
     phases. Unknown names are treated as ordinary user/module functions. *)
 
-type builtin_effect = Impure | Parallel_boundary
+type builtin_effect = Impure | Parallel_boundary | Cancellation_point
 
 type special_inference =
   | Checked_get
@@ -73,15 +73,29 @@ let descriptors =
     effects "exec_output" [ Impure ];
     effects "now" [ Impure ];
     effects "now_us" [ Impure ];
-    effects "sleep" [ Impure ];
-    effects "yield_now" [ Impure ];
+    effects "sleep" [ Impure; Cancellation_point ];
+    effects "yield_now" [ Impure; Cancellation_point ];
     effects "channel" [ Impure ];
-    effects "send" [ Impure ];
-    effects "recv" [ Impure ];
+    effects "send" [ Impure; Cancellation_point ];
+    effects "recv" [ Impure; Cancellation_point ];
     effects "try_send" [ Impure ];
     effects "try_recv" [ Impure ];
-    effects "send_timeout" [ Impure ];
-    effects "recv_timeout" [ Impure ];
+    effects "try_send_attempt" [ Impure ];
+    effects "try_recv_attempt" [ Impure ];
+    effects "send_timeout" [ Impure; Cancellation_point ];
+    effects "recv_timeout" [ Impure; Cancellation_point ];
+    effects "send_timeout_attempt" [ Impure; Cancellation_point ];
+    effects "recv_timeout_attempt" [ Impure; Cancellation_point ];
+    effects "cancel_after_parked_for_test" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_accept" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_connect" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_read" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_write" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_accept_raw" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_connect_raw" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_read_raw" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_write_raw" [ Impure; Cancellation_point ];
+    effects "blorp_tcp_write_all_raw" [ Impure; Cancellation_point ];
     effects "getenv" [ Impure ];
     effects "setenv" [ Impure ];
     effects "init_window" [ Impure ];
@@ -179,6 +193,7 @@ let has_effect name builtin_effect =
 
 let is_impure name = has_effect name Impure
 let is_parallel_boundary name = has_effect name Parallel_boundary
+let is_cancellation_point name = has_effect name Cancellation_point
 
 let special_inference name =
   match find name with

@@ -14,7 +14,7 @@
     [emit_ctree_stmt]), allocation (tuples, lists, vectors, dicts,
     records, strings, closures), statement-level control flow
     ([CWhile] / [CFor] / [CAssign] / [CBreak]), concurrency
-    ([CConcurrent] / [CConcurrentFor] / [CDetach]), and RC ops
+    ([CConcurrent] / [CConcurrentlyLoop] / [CDetach]), and RC ops
     ([CDup] / [CDrop]).
 
     Sugar constructors ([CStringInterp] / [CRecordUpdate]), the pre-compile
@@ -172,6 +172,18 @@ let resource_cleanup_pop_slot_stmt (cleanup : core) : string option =
       Some (cancellation_cleanup_pop_slot_stmt resource_var)
   | None -> None
 
+let is_resource_source_type (ctx : Core_emit_context.t) (ty : Ast.type_expr) :
+    bool =
+  match normalize_type (expand_alias ~reg:ctx.reg ty) |> Types.head_resolve with
+  | Ast.TyNamed (name, [ _resource_ty; _error_ty ]) -> (
+      match Types.split_canonical_module_type_name name with
+      | Some (module_path, "ResourceSource") -> module_path = "std/stream"
+      | _ ->
+          name = "ResourceSource"
+          || name = "std_stream__ResourceSource"
+          || name = "std/stream::ResourceSource")
+  | _ -> false
+
 let cancellation_cleanup_tracks_binding (ctx : Core_emit_context.t) (v : var)
     (ty : Ast.type_expr) (body : core) : bool =
   v.vname <> "_"
@@ -229,6 +241,20 @@ let emit_arc_value_cleanup_push (ctx : Core_emit_context.t) value_c : unit =
        "blorp_task_cleanup_push(&%s, &%s, (void*)%s, \
         blorp_cleanup_release_arc_value);"
        frame_c value_c value_c)
+
+let emit_owned_temp_cancellation_cleanup_push (ctx : Core_emit_context.t)
+    ~(slot_c : string) ~(value_c : string) ~(ty : Ast.type_expr) : bool =
+  match cancellation_cleanup_release_fn ctx ty with
+  | None -> false
+  | Some release_fn ->
+      let frame_c =
+        Printf.sprintf "__blorp_owned_cleanup_%d" (fresh_temp ctx)
+      in
+      emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" frame_c);
+      emit_line ctx
+        (Printf.sprintf "blorp_task_cleanup_push(&%s, &%s, (void*)%s, %s);"
+           frame_c slot_c value_c release_fn);
+      true
 
 let emit_generated_stack_option_none_assignment ctx abi result_tmp =
   emit ctx
@@ -679,7 +705,7 @@ let rec match_scrutinee_needs_release (ctx : Core_emit_context.t) (scrut : core)
      §7. For-loop variants     — list / tensor / string / dict (~1887)
      §8. Pattern-match emit    — [emit_ctree_assign] / [emit_ctree_stmt] (~2170)
      §9. Lambda / closure emit — hoisted body + static closures (~2347)
-     §10. Concurrency emit     — [CConcurrent] / [CDetach] / [CConcurrentFor] (~2490)
+     §10. Concurrency emit     — [CConcurrent] / [CDetach] / [CConcurrentlyLoop] (~2490)
      §11. Collection / init    — hoisted lambdas + global init (~2643)
    ============================================================================ *)
 
@@ -3227,6 +3253,283 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                       true
                   | _ -> false
                 in
+                let tcp_error_type_name err_ty =
+                  match normalize_type (expand_alias ~reg:ctx.reg err_ty) with
+                  | Ast.TyNamed (name, [])
+                    when name = "TcpError"
+                         || name = "std_net_tcp__TcpError"
+                         ||
+                         match Types.split_canonical_module_type_name name with
+                         | Some (module_path, type_name) ->
+                             module_path = "std/net/tcp"
+                             && type_name = "TcpError"
+                         | None -> false ->
+                      name
+                  | Ast.TyNamed (name, []) ->
+                      Core_error.errorf Core_error.Emit e.loc
+                        ~hint:
+                          "typed TCP operations currently use the std/net/tcp \
+                           TcpError bridge; add a separate bridge before using \
+                           another TCP operation error type"
+                        "typed TCP operation error payload must be TcpError, \
+                         got `%s`"
+                        name
+                  | other ->
+                      Core_error.errorf Core_error.Emit e.loc
+                        ~hint:
+                          "typed TCP operations must return Result[..., \
+                           TcpError]"
+                        "typed TCP operation error payload has unsupported \
+                         type `%s`"
+                        (Types.type_to_string other)
+                in
+                let tcp_error_ctor err_name ctor_name =
+                  match
+                    Hashtbl.find_opt ctx.constructor_c_names_by_type
+                      (err_name, ctor_name)
+                  with
+                  | Some ctor_c -> ctor_c
+                  | None ->
+                      Core_error.errorf Core_error.Emit e.loc
+                        ~hint:
+                          "std/net/tcp TcpError constructors must be visible \
+                           to the C emitter before typed TCP operation \
+                           emission"
+                        "missing typed TCP error constructor `%s.%s`" err_name
+                        ctor_name
+                in
+                let emit_tcp_error_case state_tmp err_tmp err_name runtime_tag
+                    ctor_name =
+                  emit ctx (Printf.sprintf "case %s: " runtime_tag);
+                  emit ctx
+                    (Printf.sprintf
+                       "%s = %s((void*)%s.detail, %s.detail ? 1UL : 0UL); \
+                        break; "
+                       err_tmp
+                       (tcp_error_ctor err_name ctor_name)
+                       state_tmp state_tmp)
+                in
+                let emit_tcp_error_switch_cases state_tmp err_tmp err_name =
+                  List.iter
+                    (fun (runtime_tag, ctor_name) ->
+                      emit_tcp_error_case state_tmp err_tmp err_name runtime_tag
+                        ctor_name)
+                    [
+                      ("BLORP_TCP_ERROR_INVALID_INPUT", "InvalidInput");
+                      ("BLORP_TCP_ERROR_TIMED_OUT", "TimedOut");
+                      ("BLORP_TCP_ERROR_CLOSED", "Closed");
+                      ("BLORP_TCP_ERROR_BUSY", "Busy");
+                      ("BLORP_TCP_ERROR_DNS", "Dns");
+                      ("BLORP_TCP_ERROR_CONNECTION_FAILED", "ConnectionFailed");
+                      ("BLORP_TCP_ERROR_INTERRUPTED", "Interrupted");
+                      ("BLORP_TCP_ERROR_UNSUPPORTED", "Unsupported");
+                      ("BLORP_TCP_ERROR_OTHER", "Other");
+                    ]
+                in
+                let try_emit_tcp_operation_bridge () =
+                  let tcp_operation_spec = function
+                    | CKBuiltin "blorp_tcp_listen_raw" ->
+                        Some
+                          ( "blorp_tcp_listen_raw",
+                            "blorp_TcpListenerResult",
+                            `Listener )
+                    | CKBuiltin "blorp_tcp_accept_raw" ->
+                        Some
+                          ( "blorp_tcp_accept_raw",
+                            "blorp_TcpStreamResult",
+                            `Stream )
+                    | CKBuiltin "blorp_tcp_connect_raw" ->
+                        Some
+                          ( "blorp_tcp_connect_raw",
+                            "blorp_TcpStreamResult",
+                            `Stream )
+                    | CKBuiltin "blorp_tcp_read_raw" ->
+                        Some
+                          ("blorp_tcp_read_raw", "blorp_TcpBytesResult", `Bytes)
+                    | CKBuiltin "blorp_tcp_write_raw" ->
+                        Some ("blorp_tcp_write_raw", "blorp_TcpIntResult", `Int)
+                    | CKBuiltin "blorp_tcp_write_all_raw" ->
+                        Some
+                          ( "blorp_tcp_write_all_raw",
+                            "blorp_TcpVoidResult",
+                            `Void )
+                    | CKBuiltin "blorp_tcp_set_reuse_addr_raw" ->
+                        Some
+                          ( "blorp_tcp_set_reuse_addr_raw",
+                            "blorp_TcpVoidResult",
+                            `Void )
+                    | CKBuiltin "blorp_tcp_local_port_listener_raw" ->
+                        Some
+                          ( "blorp_tcp_local_port_listener_raw",
+                            "blorp_TcpIntResult",
+                            `Int )
+                    | CKBuiltin "blorp_tcp_local_port_stream_raw" ->
+                        Some
+                          ( "blorp_tcp_local_port_stream_raw",
+                            "blorp_TcpIntResult",
+                            `Int )
+                    | CKBuiltin "blorp_tcp_set_timeout_listener_raw" ->
+                        Some
+                          ( "blorp_tcp_set_timeout_listener_raw",
+                            "blorp_TcpVoidResult",
+                            `Void )
+                    | CKBuiltin "blorp_tcp_set_timeout_stream_raw" ->
+                        Some
+                          ( "blorp_tcp_set_timeout_stream_raw",
+                            "blorp_TcpVoidResult",
+                            `Void )
+                    | _ -> None
+                  in
+                  let is_tcp_resource expected ty =
+                    match normalize_type (expand_alias ~reg:ctx.reg ty) with
+                    | Ast.TyNamed (name, []) -> List.mem name expected
+                    | _ -> false
+                  in
+                  let ok_payload_matches payload ok_ty =
+                    match payload with
+                    | `Listener ->
+                        is_tcp_resource
+                          [
+                            "TcpListener";
+                            "std/net/tcp::TcpListener";
+                            "std_net_tcp__TcpListener";
+                          ]
+                          ok_ty
+                    | `Stream ->
+                        is_tcp_resource
+                          [
+                            "TcpStream";
+                            "std/net/tcp::TcpStream";
+                            "std_net_tcp__TcpStream";
+                          ]
+                          ok_ty
+                    | `Bytes -> (
+                        match
+                          normalize_type (expand_alias ~reg:ctx.reg ok_ty)
+                        with
+                        | Ast.TyNamed ("Bytes", []) -> true
+                        | _ -> false)
+                    | `Int -> (
+                        match
+                          normalize_type (expand_alias ~reg:ctx.reg ok_ty)
+                        with
+                        | Ast.TyNamed ("Int", []) -> true
+                        | _ -> false)
+                    | `Void -> (
+                        match
+                          normalize_type (expand_alias ~reg:ctx.reg ok_ty)
+                        with
+                        | Ast.TyNamed ("Void", []) -> true
+                        | _ -> false)
+                  in
+                  let ok_payload_release_mask = function
+                    | `Bytes -> 1
+                    | `Listener | `Stream | `Int | `Void -> 0
+                  in
+                  let emit_ok_payload op_tmp payload =
+                    match payload with
+                    | `Listener | `Stream ->
+                        emit ctx (Printf.sprintf "(void*)%s.handle" op_tmp)
+                    | `Bytes | `Int ->
+                        emit ctx (Printf.sprintf "(void*)%s.value" op_tmp)
+                    | `Void -> emit ctx "NULL"
+                  in
+                  let emit_arg_list args =
+                    List.iteri
+                      (fun i arg ->
+                        if i > 0 then emit ctx ", ";
+                        emit_expr ctx arg)
+                      args
+                  in
+                  match
+                    ( tcp_operation_spec kind,
+                      normalize_type (expand_alias ~reg:ctx.reg e.ty) )
+                  with
+                  | ( Some (op_c_name, op_result_c, payload),
+                      Ast.TyNamed ("Result", [ ok_ty; err_ty ]) )
+                    when ok_payload_matches payload ok_ty ->
+                      let err_name = tcp_error_type_name err_ty in
+                      let result_c = type_to_c ctx e.ty in
+                      let err_c = type_to_c ctx err_ty in
+                      let op_tmp =
+                        Printf.sprintf "__tcp_op_%d" (fresh_temp ctx)
+                      in
+                      let result_tmp =
+                        Printf.sprintf "__tcp_result_%d" (fresh_temp ctx)
+                      in
+                      let err_tmp =
+                        Printf.sprintf "__tcp_error_%d" (fresh_temp ctx)
+                      in
+                      let stack_result =
+                        Core_layout_type.stack_result_c_type ~reg:ctx.reg e.ty
+                        <> None
+                      in
+                      emit ctx
+                        (Printf.sprintf "({ %s %s = %s(" op_result_c op_tmp
+                           op_c_name);
+                      emit_arg_list args;
+                      emit ctx "); ";
+                      if stack_result then (
+                        emit ctx
+                          (Printf.sprintf
+                             "%s %s; if (%s.error_kind == \
+                              BLORP_TCP_ERROR_NONE) { %s = ((%s){ .tag = \
+                              BLORP_TAG_OK, .release_mask = %dUL, \
+                              .data.Ok.field0 = "
+                             result_c result_tmp op_tmp result_tmp result_c
+                             (ok_payload_release_mask payload));
+                        emit_ok_payload op_tmp payload;
+                        emit ctx
+                          (Printf.sprintf
+                             " }); } else { %s %s = NULL; switch \
+                              (%s.error_kind) { "
+                             err_c err_tmp op_tmp);
+                        emit_tcp_error_switch_cases op_tmp err_tmp err_name;
+                        emit ctx
+                          (Printf.sprintf
+                             "default: %s = %s((void*)%s.detail, %s.detail ? \
+                              1UL : 0UL); break; } %s = ((%s){ .tag = \
+                              BLORP_TAG_ERR, .release_mask = 1UL, \
+                              .data.Err.field0 = (void*)%s }); } %s; })"
+                             err_tmp
+                             (tcp_error_ctor err_name "Other")
+                             op_tmp op_tmp result_tmp result_c err_tmp
+                             result_tmp))
+                      else (
+                        emit ctx
+                          (Printf.sprintf
+                             "%s %s = NULL; if (%s.error_kind == \
+                              BLORP_TCP_ERROR_NONE) { %s = \
+                              (%s)blorp_result_ok("
+                             result_c result_tmp op_tmp result_tmp result_c);
+                        emit_ok_payload op_tmp payload;
+                        let ok_release_mask = ok_payload_release_mask payload in
+                        emit ctx
+                          (if ok_release_mask = 1 then
+                             Printf.sprintf
+                               "); ((blorp_Result*)%s)->release_mask = 1UL; } \
+                                else { %s %s = NULL; switch (%s.error_kind) { "
+                               result_tmp err_c err_tmp op_tmp
+                           else
+                             Printf.sprintf
+                               "); } else { %s %s = NULL; switch \
+                                (%s.error_kind) { "
+                               err_c err_tmp op_tmp);
+                        emit_tcp_error_switch_cases op_tmp err_tmp err_name;
+                        emit ctx
+                          (Printf.sprintf
+                             "default: %s = %s((void*)%s.detail, %s.detail ? \
+                              1UL : 0UL); break; } %s = \
+                              (%s)blorp_result_err((void*)%s); \
+                              ((blorp_Result*)%s)->release_mask = 1UL; } %s; \
+                              })"
+                             err_tmp
+                             (tcp_error_ctor err_name "Other")
+                             op_tmp op_tmp result_tmp result_c err_tmp
+                             result_tmp result_tmp));
+                      true
+                  | _ -> false
+                in
                 let try_emit_foreign_copy_call () =
                   match kind with
                   | CKForeign
@@ -3330,6 +3633,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 in
                 if try_emit_file_open_bridge () then ()
                 else if try_emit_file_operation_bridge () then ()
+                else if try_emit_tcp_operation_bridge () then ()
                 else if try_emit_foreign_copy_call () then ()
                 else begin
                   (match kind with
@@ -4297,26 +4601,26 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           "run with --check-invariants to localize the pass that produced this \
            sugar form; desugar should have eliminated it"
         "sugar node survived desugaring (emit invariant violated)"
-  (* ---- Concurrency (expression context) ---- *)
+  (* ---- Concurrency (expression/Core helper context) ---- *)
   | CConcurrent block ->
       emit ctx "({ ";
       emit_concurrent_block ctx block;
       emit ctx " })"
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       emit ctx "({ ";
       begin match cf.cf_output with
-      | ConcurrentForCollect ->
-          (* Expression position: the value of [concurrent for] is the
-               collected [List[Result[T, ConcurrencyError]]]. The result
-               list lives in the temp [__conc_results_<id>]; close the
-               stmt-expr with that name so the surrounding [blorp_List* x =
-               (concurrent for …)] gets the list, not [void]. *)
+      | ConcurrentlyLoopCollect ->
+          (* Collecting Core form: std helpers such as [List.concurrent]
+             synthesize this node and use the collected
+             [List[Result[T, ConcurrencyError]]]. The result list lives in
+             [__conc_results_<id>]; close the stmt-expr with that name so
+             the surrounding helper binding gets the list, not [void]. *)
           let results_var =
-            emit_concurrent_for_collecting ~collect:true ctx cf
+            emit_concurrently_loop_collecting ~collect:true ctx cf
           in
           emit ctx (Printf.sprintf " %s;" results_var)
-      | ConcurrentForDiscard ->
-          ignore (emit_concurrent_for_collecting ~collect:false ctx cf);
+      | ConcurrentlyLoopDiscard ->
+          ignore (emit_concurrently_loop_collecting ~collect:false ctx cf);
           emit ctx " (void)0;"
       end;
       emit ctx " })"
@@ -4721,7 +5025,7 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
      wrapping them in GCC statement-expressions. *)
   (* ---- Concurrency (statement context) ---- *)
   | CConcurrent block -> emit_concurrent_block ctx block
-  | CConcurrentFor cf -> emit_concurrent_for ctx cf
+  | CConcurrentlyLoop cf -> emit_concurrently_loop ctx cf
   | CDetach detach -> emit_detach_stmt ctx detach e.loc
   | CSelect select -> emit_select ctx select
   | CTensorRawWrite w ->
@@ -5796,6 +6100,8 @@ and emit_for_loop (ctx : Core_emit_context.t) (binder : loop_binder)
       | Ast.TyNamed ("Channel", _) -> emit_for_channel ctx binder iter body
       | Ast.TyNamed ("Stream", _) -> emit_for_stream ctx binder iter body
       | Ast.TyNamed ("Range", []) -> emit_for_range_value ctx binder iter body
+      | ty when is_resource_source_type ctx ty ->
+          emit_for_resource_source ctx binder iter body
       | ty when is_tensor_type ctx ty -> emit_for_list ctx binder iter body
       | Ast.TyNamed ("Bytes", _) -> emit_for_list ctx binder iter body
       | ty ->
@@ -5839,6 +6145,46 @@ and emit_for_stream (ctx : Core_emit_context.t) (binder : loop_binder)
        iter_c value_c);
   if iter_needs_release then
     emit_line ctx (Printf.sprintf "%s;" (release_value_call ctx iter.ty iter_c))
+
+and emit_for_resource_source (ctx : Core_emit_context.t) (binder : loop_binder)
+    (iter : core) (body : core) : unit =
+  let id = fresh_temp ctx in
+  let iter_c = Printf.sprintf "__resource_source_iter_%d" id in
+  let raw_c = Printf.sprintf "__resource_source_value_%d" id in
+  let var_c = escape_c_ident (Var.to_c_name binder.loop_var) in
+  let elem_ty = binder.loop_ty in
+  let iter_needs_release = boxed_expr_transfers_ownership ctx iter in
+  emit_indent ctx;
+  emit ctx (Printf.sprintf "blorp_ResourceSource* %s = " iter_c);
+  emit_expr ctx iter;
+  emitln ctx ";";
+  let cleanup_registered =
+    if iter_needs_release then
+      emit_owned_temp_cancellation_cleanup_push ctx ~slot_c:iter_c
+        ~value_c:iter_c ~ty:iter.ty
+    else false
+  in
+  emit_line ctx (Printf.sprintf "void* %s = NULL;" raw_c);
+  emit_indent ctx;
+  emit ctx
+    (Printf.sprintf "while (blorp_resource_source_next_raw(%s, &%s)) {" iter_c
+       raw_c);
+  emitln ctx "";
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx
+    (Printf.sprintf "%s %s = (%s)%s;" (type_to_c ctx elem_ty) var_c
+       (type_to_c ctx elem_ty) raw_c);
+  emit_line ctx (Printf.sprintf "%s = NULL;" raw_c);
+  emit_stmt ctx body;
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
+  emit_line ctx (Printf.sprintf "%s = NULL;" raw_c);
+  if iter_needs_release then begin
+    if cleanup_registered then
+      emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" iter_c);
+    emit_line ctx (Printf.sprintf "%s;" (release_value_call ctx iter.ty iter_c))
+  end
 
 and emit_for_range_value (ctx : Core_emit_context.t) (binder : loop_binder)
     (iter : core) (body : core) : unit =
@@ -7392,24 +7738,26 @@ and emit_detach_expr (ctx : Core_emit_context.t) (detach : detach_expr)
   emit_detach_stmt ctx detach loc;
   emit ctx "(void)0; })"
 
-(** Emit [concurrent for v in iter: body] in statement context.
+(** Emit [for v in iter concurrently(...): body] in statement context.
     Discards the per-iteration results — no list is allocated. *)
-and emit_concurrent_for (ctx : Core_emit_context.t) (cf : concurrent_for) : unit
-    =
-  ignore (emit_concurrent_for_collecting ~collect:false ctx cf)
+and emit_concurrently_loop (ctx : Core_emit_context.t) (cf : concurrently_loop)
+    : unit =
+  ignore (emit_concurrently_loop_collecting ~collect:false ctx cf)
 
-and concurrent_for_emit_plan (_ctx : Core_emit_context.t) (cf : concurrent_for)
-    : Ast.type_expr * Ast.type_expr * string * (string * Ast.type_expr) list =
+and concurrently_loop_emit_plan (_ctx : Core_emit_context.t)
+    (cf : concurrently_loop) :
+    Ast.type_expr * Ast.type_expr * string * (string * Ast.type_expr) list =
   let elem_ty =
     match normalize_type cf.cf_iter.ty with
     | Ast.TyNamed ("List", [ et ]) -> et
     | ty ->
         Core_error.errorf Core_error.Emit cf.cf_iter.loc
           ~hint:
-            "concurrent for is currently list-only; accept other collection \
-             layouts by adding explicit emitter paths rather than casting them \
-             to blorp_List"
-          "concurrent for requires List[T], got %s" (Types.type_to_string ty)
+            "for ... concurrently is currently list-only; accept other \
+             collection layouts by adding explicit emitter paths rather than \
+             casting them to blorp_List"
+          "for ... concurrently requires List[T], got %s"
+          (Types.type_to_string ty)
   in
   let task_ret_ty, lambda_name, captures =
     match cf.cf_task with
@@ -7421,18 +7769,18 @@ and concurrent_for_emit_plan (_ctx : Core_emit_context.t) (cf : concurrent_for)
         ( task.tc_return_ty,
           c_name,
           task_copy_capture_bindings_for_emit ~loc:cf.cf_body.loc
-            ~context:"concurrent-for" task.tc_captures )
+            ~context:"for ... concurrently" task.tc_captures )
     | None ->
         Core_error.errorf Core_error.Emit cf.cf_body.loc
           ~hint:
-            "Core_closure should attach task metadata to every concurrent-for \
-             body before emission"
-          "concurrent-for reached emit without task closure metadata"
+            "Core_closure should attach task metadata to every for ... \
+             concurrently body before emission"
+          "for ... concurrently reached emit without task closure metadata"
   in
   (elem_ty, task_ret_ty, lambda_name, captures)
 
-and emit_concurrent_for_collecting_limited ~(collect : bool)
-    (ctx : Core_emit_context.t) (cf : concurrent_for) (limit_expr : core) :
+and emit_concurrently_loop_collecting_limited ~(collect : bool)
+    (ctx : Core_emit_context.t) (cf : concurrently_loop) (limit_expr : core) :
     string =
   let id = fresh_temp ctx in
   let list_c = Printf.sprintf "__conc_list_%d" id in
@@ -7448,7 +7796,10 @@ and emit_concurrent_for_collecting_limited ~(collect : bool)
   let batch_c = Printf.sprintf "__conc_batch_%d" id in
   let var_c = escape_c_ident (Var.to_c_name cf.cf_var) in
   let elem_ty, task_ret_ty, lambda_name, captures =
-    concurrent_for_emit_plan ctx cf
+    concurrently_loop_emit_plan ctx cf
+  in
+  let iter_transfers_ownership =
+    boxed_expr_transfers_ownership ctx cf.cf_iter
   in
   emit_concurrent_limit_init ctx limit_c limit_expr;
   emit_line ctx (Printf.sprintf "blorp_thread_pool_init((int)%s);" limit_c);
@@ -7456,6 +7807,11 @@ and emit_concurrent_for_collecting_limited ~(collect : bool)
   emit ctx (Printf.sprintf "blorp_List* %s = (blorp_List*)" list_c);
   emit_expr ctx cf.cf_iter;
   emitln ctx ";";
+  let iter_cleanup_registered =
+    iter_transfers_ownership
+    && emit_owned_temp_cancellation_cleanup_push ctx ~slot_c:list_c
+         ~value_c:list_c ~ty:cf.cf_iter.ty
+  in
   emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c list_c);
   emit_line ctx
     (Printf.sprintf
@@ -7566,9 +7922,14 @@ and emit_concurrent_for_collecting_limited ~(collect : bool)
     emit_line ctx (Printf.sprintf "%s->len = %s;" results_c len_c);
     emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" results_c)
   end;
+  if iter_cleanup_registered then
+    emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" list_c);
+  if iter_transfers_ownership then
+    emit_line ctx
+      (Printf.sprintf "%s;" (release_value_call ctx cf.cf_iter.ty list_c));
   results_c
 
-(** Emit [concurrent for] and, when [collect] is true, return the C
+(** Emit a concurrently-loop Core node and, when [collect] is true, return the C
     identifier holding the collected [blorp_List*] of
     [Result[T, ConcurrencyError]] entries.
 
@@ -7577,17 +7938,17 @@ and emit_concurrent_for_collecting_limited ~(collect : bool)
     an allocation and avoids retaining N Results just to immediately
     drop them.
 
-    When [collect] is true (expression context), the list is allocated
-    with capacity = iter length, populated in the join loop by writing
+    When [collect] is true (std helper collection context), the list is
+    allocated with capacity = iter length, populated in the join loop by writing
     directly into [data[i]] (each [Result*] arrives at refcount 1, so
     we take ownership without a retain), and tagged with
     [blorp_elem_release_fn] so the list's destructor releases each
     Result when the list itself goes out of scope. *)
-and emit_concurrent_for_collecting ~(collect : bool) (ctx : Core_emit_context.t)
-    (cf : concurrent_for) : string =
+and emit_concurrently_loop_collecting ~(collect : bool)
+    (ctx : Core_emit_context.t) (cf : concurrently_loop) : string =
   match cf.cf_width with
-  | ConcurrentForLimit limit ->
-      emit_concurrent_for_collecting_limited ~collect ctx cf limit
+  | ConcurrentlyLoopLimit limit ->
+      emit_concurrently_loop_collecting_limited ~collect ctx cf limit
 
 (* --- §11. Collection / global init --------------------------------------- *)
 

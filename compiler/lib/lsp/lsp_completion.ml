@@ -381,7 +381,7 @@ let completions_from_local_scope ?(skip = fun _ -> false) (program : program)
       | EConcurrentBind (name, source_ty, init) ->
           add name (type_detail_opt source_ty);
           collect_expr init
-      | EConcurrentFor (name, iter, body, timeout, _) ->
+      | EConcurrentlyLoop (name, iter, body, timeout, _) ->
           collect_expr iter;
           add name "loop variable";
           collect_expr body;

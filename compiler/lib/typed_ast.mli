@@ -145,8 +145,8 @@ type expr_desc =
   | ESelect of select_arm list
   | EConcurrent of expr list * expr option * int option
   | EConcurrentBind of string * Ast.type_expr option * expr
-  | EConcurrentFor of
-      string * expr * expr * expr option * Ast.concurrent_for_width
+  | EConcurrentlyLoop of
+      string * expr * expr * expr option * Ast.concurrently_loop_width
   | EDetach of expr
   | EDict of (expr * expr) list
   | EBuiltin of string option

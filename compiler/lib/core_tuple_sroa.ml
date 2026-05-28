@@ -285,7 +285,7 @@ and scan_uses arity analysis aliases expr =
       if List.exists (fun b -> is_alias aliases b.cb_var) cb.conc_bindings then
         mark_shadow analysis
       else scan_uses arity analysis aliases cb.conc_body
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       scan_uses arity analysis aliases cf.cf_iter;
       Option.iter (scan_uses arity analysis aliases) cf.cf_timeout;
       if is_alias aliases cf.cf_var then mark_shadow analysis
@@ -675,11 +675,11 @@ let replace_field_uses root_var elem_vars elems expr =
                 conc_timeout = Option.map (go aliases) cb.conc_timeout;
               };
         }
-    | CConcurrentFor cf ->
+    | CConcurrentlyLoop cf ->
         {
           expr with
           desc =
-            CConcurrentFor
+            CConcurrentlyLoop
               {
                 cf with
                 cf_iter = go aliases cf.cf_iter;

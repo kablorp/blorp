@@ -564,6 +564,9 @@ let builtin_contract_table =
       builtins [ "blorp_channel_seal" ] (bfixed [ Borrow ] ReturnVoid);
       builtins [ "blorp_get_scheduler_stats" ] (bfixed [] ReturnOwned);
       builtins [ "blorp_reset_scheduler_stats" ] (bfixed [] ReturnVoid);
+      builtins
+        [ "blorp_test_cancel_after_parked" ]
+        (bfixed [ Borrow ] ReturnPrimitive);
       (* Dict runtime functions. Mutating operations consume the dict owner through
        COW; reads borrow and allocate owned result wrappers/lists as needed. *)
       builtins
@@ -752,7 +755,7 @@ let builtin_contract_table =
       builtins [ "blorp_tcp_write" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
         [ "blorp_tcp_close_listener"; "blorp_tcp_close_stream" ]
-        (bfixed [ Borrow ] ReturnVoid);
+        (bfixed [ Consume ] ReturnVoid);
       builtins
         [
           "blorp_tcp_set_reuse_addr";
@@ -762,6 +765,35 @@ let builtin_contract_table =
         (bfixed [ Borrow ] ReturnOwned);
       builtins
         [ "blorp_tcp_set_timeout_listener"; "blorp_tcp_set_timeout_stream" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_listen_raw" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_accept_raw" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_tcp_connections_stop_on_error_raw";
+          "blorp_tcp_connections_continue_on_error_raw";
+        ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_tcp_connect_raw" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_read_raw" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_tcp_write_raw"; "blorp_tcp_write_all_raw" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_tcp_set_reuse_addr_raw";
+          "blorp_tcp_local_port_listener_raw";
+          "blorp_tcp_local_port_stream_raw";
+        ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_tcp_set_timeout_listener_raw";
+          "blorp_tcp_set_timeout_stream_raw";
+        ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
         [

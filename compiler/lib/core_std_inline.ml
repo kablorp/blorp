@@ -331,13 +331,13 @@ and clone_expr state env e =
               conc_timeout = Option.map (clone env) cb.conc_timeout;
             };
       }
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       let iter = clone env cf.cf_iter in
       let cf_var, body_env = rename_binder state env cf.cf_var in
       {
         e with
         desc =
-          CConcurrentFor
+          CConcurrentlyLoop
             {
               cf with
               cf_var;

@@ -1,7 +1,13 @@
 (** Explicit metadata for builtins whose compiler behavior cannot be inferred
     from their source signature alone. *)
 
-type builtin_effect = Impure | Parallel_boundary
+type builtin_effect =
+  | Impure
+  | Parallel_boundary
+  | Cancellation_point
+      (** Cooperative boundary where a task can observe cancellation. Most are
+          fiber park points; [yield_now] is included because it can also unwind
+          a cancelled task. *)
 
 type special_inference =
   | Checked_get
@@ -26,4 +32,5 @@ val is_registered : string -> bool
 val has_effect : string -> builtin_effect -> bool
 val is_impure : string -> bool
 val is_parallel_boundary : string -> bool
+val is_cancellation_point : string -> bool
 val special_inference : string -> special_inference option

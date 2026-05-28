@@ -459,7 +459,7 @@ and var_occurs_free_in_body (name : string) bound (body : core) : bool =
       || Option.fold ~none:false
            ~some:(var_occurs_free_in_body name bound)
            block.conc_timeout
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       var_occurs_free_in_body name bound cf.cf_iter
       || var_occurs_free_in_body name (add_bound_var bound cf.cf_var) cf.cf_body
       || Option.fold ~none:false

@@ -108,7 +108,7 @@ let rec expr_source_end_line e =
         (max
            (expr_source_end_line binding.with_value)
            (expr_source_end_line body))
-  | EConcurrentFor (_, iterable, body, timeout, _) ->
+  | EConcurrentlyLoop (_, iterable, body, timeout, _) ->
       max_optional_expr
         (max base
            (max (expr_source_end_line iterable) (expr_source_end_line body)))

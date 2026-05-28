@@ -134,10 +134,10 @@ let test_expr_json_lines_from_source () =
         "includes detach case" true
         (string_contains jsonl {|{"tag":"Detach","body":|});
       Alcotest.(check bool)
-        "includes concurrent for case" true
-        (string_contains jsonl {|{"tag":"ConcurrentFor","var":"item"|});
+        "includes for ... concurrently case" true
+        (string_contains jsonl {|{"tag":"ConcurrentlyLoop","var":"item"|});
       Alcotest.(check bool)
-        "includes concurrent for limit" true
+        "includes for ... concurrently limit" true
         (string_contains jsonl {|"limit":2|})
 
 let suite =

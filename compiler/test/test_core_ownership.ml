@@ -149,6 +149,20 @@ let test_channel_recv_timeout_attempt_borrows_channel () =
     { args = [ Borrow; Borrow ]; result = ReturnOwned }
     (builtin_contract "blorp_channel_recv_timeout_attempt" 2)
 
+let test_tcp_close_finalizers_consume_handles () =
+  let expected = { args = [ Consume ]; result = ReturnVoid } in
+  check_contract "blorp_tcp_close_listener" expected
+    (builtin_contract "blorp_tcp_close_listener" 1);
+  check_contract "blorp_tcp_close_stream" expected
+    (builtin_contract "blorp_tcp_close_stream" 1)
+
+let test_tcp_connection_sources_borrow_listener () =
+  let expected = { args = [ Borrow ]; result = ReturnOwned } in
+  check_contract "blorp_tcp_connections_stop_on_error_raw" expected
+    (builtin_contract "blorp_tcp_connections_stop_on_error_raw" 1);
+  check_contract "blorp_tcp_connections_continue_on_error_raw" expected
+    (builtin_contract "blorp_tcp_connections_continue_on_error_raw" 1)
+
 let test_fixed_constructors_allocate_owned_fixed () =
   let expected = { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned } in
   check_contract "blorp_fixed_new" expected
@@ -912,6 +926,10 @@ let suite =
           test_channel_try_recv_attempt_borrows_channel;
         Alcotest.test_case "channel_recv_timeout_attempt_borrows_channel" `Quick
           test_channel_recv_timeout_attempt_borrows_channel;
+        Alcotest.test_case "tcp_close_finalizers_consume_handles" `Quick
+          test_tcp_close_finalizers_consume_handles;
+        Alcotest.test_case "tcp_connection_sources_borrow_listener" `Quick
+          test_tcp_connection_sources_borrow_listener;
         Alcotest.test_case "fixed_constructors_allocate_owned_fixed" `Quick
           test_fixed_constructors_allocate_owned_fixed;
         Alcotest.test_case "custom_dict_set_constructors_borrow_callbacks"

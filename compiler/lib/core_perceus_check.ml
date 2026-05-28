@@ -239,7 +239,7 @@ let rec simulate (target : string) (state : state) (e : core) : unit =
                state.rc)
         else state.rc <- state.rc - 1
         end
-  | CConcurrent _ | CConcurrentFor _ | CDetach _ -> ()
+  | CConcurrent _ | CConcurrentlyLoop _ | CDetach _ -> ()
   | CDebugBlock body -> simulate target state body
   | CListHandoff h ->
       (match h.lh_mode with

@@ -75,7 +75,7 @@ let expr_label (expr : Ast.expr) =
   | ESelect _ -> "select"
   | EConcurrent _ -> "concurrent"
   | EConcurrentBind (name, _, _) -> "concurrent_bind " ^ name
-  | EConcurrentFor (name, _, _, _, _) -> "concurrent_for " ^ name
+  | EConcurrentlyLoop (name, _, _, _, _) -> "concurrently_loop " ^ name
   | EDetach _ -> "detach"
   | EDict _ -> "dict"
   | EBuiltin None -> "builtin"
@@ -148,8 +148,9 @@ let expr_children_from_desc = function
         (function
           | Typed_ast.InterpLit _ -> None | InterpExpr expr -> Some expr)
         parts
-  | EConcurrentFor (_, iter, body, None, _) -> [ iter; body ]
-  | EConcurrentFor (_, iter, body, Some timeout, _) -> [ iter; body; timeout ]
+  | EConcurrentlyLoop (_, iter, body, None, _) -> [ iter; body ]
+  | EConcurrentlyLoop (_, iter, body, Some timeout, _) ->
+      [ iter; body; timeout ]
   | EDict pairs -> List.concat_map (fun (key, value) -> [ key; value ]) pairs
 
 let rec format_expr depth expr =

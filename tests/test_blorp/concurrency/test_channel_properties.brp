@@ -17,6 +17,13 @@ union ChannelHistoryEvent:
 	HistorySendRejected(Int)
 
 
+union CapacityOneHistoryOp:
+	LinearSendAccepted(Int)
+	LinearSendWouldBlock(Int)
+	LinearRecvValue(Int)
+	LinearRecvWouldBlock
+
+
 func send_range(out: Channel[Int], start: Int, count: Int) -> Int:
 	var sent: Int = 0
 	var i: Int = 0
@@ -252,6 +259,154 @@ func test_operation_history_records_valid_mpmc_run() -> Bool:
 	ok
 
 
+pure func apply_capacity_one_history_op(
+	buffer: Option[Int],
+	op: CapacityOneHistoryOp,
+) -> (Bool, Option[Int]):
+	match op:
+		LinearSendAccepted(value):
+			match buffer:
+				None: (True, Some(value))
+				Some(_): (False, buffer)
+		LinearSendWouldBlock(_):
+			match buffer:
+				Some(_): (True, buffer)
+				None: (False, buffer)
+		LinearRecvValue(value):
+			match buffer:
+				Some(current):
+					if current == value:
+						(True, None)
+					else:
+						(False, buffer)
+				None: (False, buffer)
+		LinearRecvWouldBlock:
+			match buffer:
+				None: (True, buffer)
+				Some(_): (False, buffer)
+
+
+pure func replay_capacity_one_history(ops: List[CapacityOneHistoryOp], expected_count: Int) -> Bool:
+	var buffer: Option[Int] = None
+	var count: Int = 0
+	var ok: Bool = True
+	for op in ops:
+		step = apply_capacity_one_history_op(buffer, op)
+		ok = ok and step.0
+		buffer = step.1
+		count += 1
+	ok and count == expected_count
+
+
+pure func test_capacity_one_replay_rejects_impossible_history() -> Bool:
+	accepted_while_full: List[CapacityOneHistoryOp] = [LinearSendAccepted(1), LinearSendAccepted(2)]
+	would_block_while_empty: List[CapacityOneHistoryOp] = [LinearSendWouldBlock(1)]
+	received_wrong_value: List[CapacityOneHistoryOp] = [LinearSendAccepted(1), LinearRecvValue(2)]
+	received_while_empty: List[CapacityOneHistoryOp] = [LinearRecvValue(1)]
+	var ok: Bool = not replay_capacity_one_history(accepted_while_full, 2)
+	ok = ok and not replay_capacity_one_history(would_block_while_empty, 1)
+	ok = ok and not replay_capacity_one_history(received_wrong_value, 2)
+	ok = ok and not replay_capacity_one_history(received_while_empty, 1)
+	ok
+
+
+func record_capacity_one_try_send(
+	ch: Channel[Int],
+	history: Channel[CapacityOneHistoryOp],
+	value: Int,
+) -> Bool:
+	match try_send_attempt(ch, value):
+		SendAccepted:
+			send(history, LinearSendAccepted(value))
+		SendWouldBlock:
+			send(history, LinearSendWouldBlock(value))
+		_: False
+
+
+func record_capacity_one_try_recv(ch: Channel[Int], history: Channel[CapacityOneHistoryOp]) -> Bool:
+	match try_recv_attempt(ch):
+		RecvValue(value):
+			send(history, LinearRecvValue(value))
+		RecvWouldBlock:
+			send(history, LinearRecvWouldBlock)
+		_: False
+
+
+func collect_capacity_one_history(
+	history: Channel[CapacityOneHistoryOp],
+) -> List[CapacityOneHistoryOp]:
+	var ops: List[CapacityOneHistoryOp] = []
+	var done: Bool = False
+	while not done:
+		match recv(history):
+			Some(op):
+				ops = ops.append(op)
+			None:
+				done = True
+	ops
+
+
+func test_nonblocking_history_replays_capacity_one_model() -> Bool:
+	ch: Channel[Int] = channel(1)
+	history: Channel[CapacityOneHistoryOp] = channel(8)
+	var ok: Bool = record_capacity_one_try_send(ch, history, 1)
+	ok = ok and record_capacity_one_try_send(ch, history, 2)
+	ok = ok and record_capacity_one_try_recv(ch, history)
+	ok = ok and record_capacity_one_try_recv(ch, history)
+	ok = ok and record_capacity_one_try_send(ch, history, 3)
+	ok = ok and record_capacity_one_try_recv(ch, history)
+	seal(history)
+	ops: List[CapacityOneHistoryOp] = collect_capacity_one_history(history)
+	ok and replay_capacity_one_history(ops, 6)
+
+
+func consume_per_producer_order(input: Channel[Int], summary: Channel[Bool]) -> Void:
+	var ok: Bool = True
+	var last_a: Int = -1
+	var last_b: Int = -1
+	var last_c: Int = -1
+	var done: Bool = False
+	while not done:
+		match recv(input):
+			Some(value):
+				producer: Int = value / 100
+				index: Int = value - producer * 100
+				if producer == 0:
+					ok = ok and index > last_a
+					last_a = index
+				else if producer == 1:
+					ok = ok and index > last_b
+					last_b = index
+				else if producer == 2:
+					ok = ok and index > last_c
+					last_c = index
+				else:
+					ok = False
+				yield_now()
+			None:
+				done = True
+	_ = send(summary, ok and last_a == 11 and last_b == 11 and last_c == 11)
+
+
+func test_mpsc_preserves_each_producer_order() -> Bool:
+	values: Channel[Int] = channel(1)
+	summary: Channel[Bool] = channel(1)
+	detach consume_per_producer_order(values, summary)
+
+	concurrent(timeout: 2000):
+		producer_a = send_range(values, 0, 12)
+		producer_b = send_range(values, 100, 12)
+		producer_c = send_range(values, 200, 12)
+
+	var producers_ok: Bool = task_sent_count_is(producer_a, 12)
+	producers_ok = producers_ok and task_sent_count_is(producer_b, 12)
+	producers_ok = producers_ok and task_sent_count_is(producer_c, 12)
+	seal(values)
+	match recv_timeout(summary, 500):
+		Some(order_ok): producers_ok and order_ok
+		None: False
+
+
 func fill_and_drain_fifo(capacity: Int) -> Bool:
 	ch: Channel[Int] = channel(capacity)
 	var ok: Bool = True
@@ -376,6 +531,15 @@ tests: TestSuite = {
 	tests = [
 		("MPMC values delivered exactly once", test_mpmc_values_delivered_exactly_once),
 		("operation history records valid MPMC run", test_operation_history_records_valid_mpmc_run),
+		(
+			"capacity-1 replay rejects impossible histories",
+			test_capacity_one_replay_rejects_impossible_history,
+		),
+		(
+			"nonblocking history replays capacity-1 model",
+			test_nonblocking_history_replays_capacity_one_model,
+		),
+		("MPSC preserves each producer order", test_mpsc_preserves_each_producer_order),
 		("small capacity FIFO model", test_small_capacity_fifo_model),
 		("seal is permanent across send APIs", test_seal_is_permanent_across_send_apis),
 		("timed out senders do not poison queue", test_timed_out_senders_do_not_poison_queue),

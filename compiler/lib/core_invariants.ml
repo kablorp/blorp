@@ -870,7 +870,7 @@ let check_no_raw_top_level_function_refs_at (stage : Core_stage.t)
             bound block.conc_bindings
         in
         visit body_bound acc block.conc_body
-    | Core.CConcurrentFor (cf : Core.concurrent_for) ->
+    | Core.CConcurrentlyLoop (cf : Core.concurrently_loop) ->
         let acc = visit bound acc cf.cf_iter in
         let acc =
           match cf.cf_timeout with
@@ -1167,16 +1167,16 @@ let check_no_preclosure_forms (prog : Core.core_program) : Core_error.t list =
                   in
                   v :: acc)
             acc block.conc_bindings
-      | Core.CConcurrentFor cf -> (
+      | Core.CConcurrentlyLoop cf -> (
           match cf.cf_task with
           | Some _ -> acc
           | None ->
               let v =
                 violation_at Core_stage.Closure cf.cf_body.loc
                   ~hint:
-                    "Core_closure should attach task metadata to every \
-                     concurrent-for body before emission."
-                  "concurrent-for is missing task closure metadata"
+                    "Core_closure should attach task metadata to every for ... \
+                     concurrently body before emission."
+                  "for ... concurrently is missing task closure metadata"
               in
               v :: acc)
       | Core.CDetach detach -> (
@@ -1278,9 +1278,9 @@ let check_no_resource_capture_metadata_at (stage : Core_stage.t)
               check_task b.cb_rhs.loc ~context:"concurrent binding task"
                 b.cb_task acc)
             acc block.conc_bindings
-      | Core.CConcurrentFor cf ->
-          check_task cf.cf_body.loc ~context:"concurrent-for task" cf.cf_task
-            acc
+      | Core.CConcurrentlyLoop cf ->
+          check_task cf.cf_body.loc ~context:"for ... concurrently task"
+            cf.cf_task acc
       | Core.CDetach detach ->
           check_task detach.detach_body.loc ~context:"detach task"
             detach.detach_task acc
@@ -1309,8 +1309,8 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
       ~hint:
         "Infer/Core_lower/Core_closure should preserve one explicit \
          concurrency contract: task bodies have raw type T, joined bindings \
-         have Result[T, ConcurrencyError], and concurrent-for expressions have \
-         List[Result[T, ConcurrencyError]]."
+         have Result[T, ConcurrencyError], and collecting concurrently-loop \
+         Core forms have List[Result[T, ConcurrencyError]]."
       (Printf.sprintf "%s `%s` does not match expected `%s`" subject
          (Types.type_to_string actual)
          (Types.type_to_string expected))
@@ -1334,12 +1334,12 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
         :: acc
     | _ -> acc
   in
-  let check_concurrent_for_width loc width acc =
+  let check_concurrently_loop_width loc width acc =
     match width with
-    | Core.ConcurrentForLimit limit ->
+    | Core.ConcurrentlyLoopLimit limit ->
         if invariant_types_equal ~reg limit.Core.ty int_ty then acc
         else
-          type_mismatch loc ~subject:"concurrent for limit type"
+          type_mismatch loc ~subject:"for ... concurrently limit type"
             ~expected:int_ty ~actual:limit.Core.ty acc
   in
   let check_concurrent_task_scope loc ~subject
@@ -1444,55 +1444,56 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
             | None -> acc
           in
           check_max_threads "concurrent block" e.loc block.conc_max_threads acc
-      | Core.CConcurrentFor cf ->
+      | Core.CConcurrentlyLoop cf ->
           let acc =
             match invariant_normalize_type ~reg cf.cf_iter.ty with
             | Ast.TyNamed ("List", [ _ ]) -> acc
             | _ ->
                 violation_at stage cf.cf_iter.loc
                   ~hint:
-                    "concurrent for is currently list-only in Core. Add an \
-                     explicit representation-aware Core form before accepting \
-                     other collection layouts."
-                  (Printf.sprintf "concurrent for requires List[T], got `%s`"
+                    "for ... concurrently is currently list-only in Core. Add \
+                     an explicit representation-aware Core form before \
+                     accepting other collection layouts."
+                  (Printf.sprintf
+                     "for ... concurrently requires List[T], got `%s`"
                      (Types.type_to_string cf.cf_iter.ty))
                 :: acc
           in
           let expected_result =
             match cf.cf_output with
-            | Core.ConcurrentForCollect ->
+            | Core.ConcurrentlyLoopCollect ->
                 list_ty (concurrent_result_ty cf.cf_body.ty)
-            | Core.ConcurrentForDiscard -> ty_void
+            | Core.ConcurrentlyLoopDiscard -> ty_void
           in
           let acc =
             if invariant_types_equal ~reg e.ty expected_result then acc
             else
-              type_mismatch e.loc ~subject:"concurrent-for result type"
+              type_mismatch e.loc ~subject:"for ... concurrently result type"
                 ~expected:expected_result ~actual:e.ty acc
           in
           let acc =
             match cf.cf_output with
-            | Core.ConcurrentForCollect -> acc
-            | Core.ConcurrentForDiscard
+            | Core.ConcurrentlyLoopCollect -> acc
+            | Core.ConcurrentlyLoopDiscard
               when invariant_types_equal ~reg cf.cf_body.ty ty_void ->
                 acc
-            | Core.ConcurrentForDiscard ->
+            | Core.ConcurrentlyLoopDiscard ->
                 type_mismatch cf.cf_body.loc
-                  ~subject:"discarding concurrent-for body type"
+                  ~subject:"discarding for ... concurrently body type"
                   ~expected:ty_void ~actual:cf.cf_body.ty acc
           in
           let acc =
-            check_task_return cf.cf_body.loc ~subject:"concurrent-for"
+            check_task_return cf.cf_body.loc ~subject:"for ... concurrently"
               cf.cf_task cf.cf_body.ty acc
           in
           let acc =
             match cf.cf_timeout with
             | Some timeout ->
-                check_timeout "concurrent for" timeout.loc timeout acc
+                check_timeout "for ... concurrently" timeout.loc timeout acc
             | None -> acc
           in
-          let acc = check_concurrent_for_width e.loc cf.cf_width acc in
-          check_concurrent_task_scope e.loc ~subject:"concurrent-for"
+          let acc = check_concurrently_loop_width e.loc cf.cf_width acc in
+          check_concurrent_task_scope e.loc ~subject:"for ... concurrently"
             cf.cf_task_scope acc
       | _ -> acc)
     [] prog
@@ -1850,7 +1851,7 @@ let check_no_unguarded_raw_tensor_gets_at (stage : Core_stage.t)
             env block.conc_bindings
         in
         visit body_env acc block.conc_body
-    | Core.CConcurrentFor cf ->
+    | Core.CConcurrentlyLoop cf ->
         let acc = visit env acc cf.cf_iter in
         let acc =
           match cf.cf_timeout with

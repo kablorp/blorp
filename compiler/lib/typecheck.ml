@@ -3294,6 +3294,13 @@ let process_import (state : check_state) (loc : loc) (decl : import_decl) :
                   state)
                 state symbols
             in
+            let state =
+              match decl.import_alias with
+              | Some _ ->
+                  register_qualified_import_resource_types
+                    ~module_path:canonical_name state exports
+              | None -> state
+            in
             (* If combined import (e.g., heap as H { Heap }), also register module alias *)
             match decl.import_alias with
             | Some alias ->
@@ -4261,11 +4268,11 @@ let validate_debug_usage (state : check_state) (body : expr) : check_state =
   in
   walk ~in_debug:false state body
 
-(** Check if an expression contains concurrent blocks or concurrent for.
+(** Check if an expression contains concurrent blocks or for ... concurrently.
     Used by the purify command to reject functions with concurrency. *)
 let rec has_concurrency (expr : expr) : bool =
   match expr.expr_desc with
-  | EConcurrent _ | EConcurrentFor _ | ESelect _ -> true
+  | EConcurrent _ | EConcurrentlyLoop _ | ESelect _ -> true
   | ELambda _ -> false (* don't recurse into nested lambdas *)
   | _ -> List.exists has_concurrency (expr_children expr)
 

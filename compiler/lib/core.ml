@@ -700,7 +700,8 @@ and desc =
                                          known constructors). *)
   (* === Concurrency === *)
   | CConcurrent of concurrent_block  (** [concurrent: { ... }] *)
-  | CConcurrentFor of concurrent_for  (** [concurrent for v in iter { ... }] *)
+  | CConcurrentlyLoop of concurrently_loop
+      (** [for v in iter concurrently(...): ...] *)
   | CDetach of detach_expr  (** [detach expr] *)
   | CSelect of select_expr  (** [select: ...] channel/timer wait. *)
   (* === Type operations (inserted by Core_specialize) === *)
@@ -1044,27 +1045,27 @@ and concurrent_block = {
   conc_max_threads : int option;
 }
 
-and concurrent_for_width =
-  | ConcurrentForLimit of core
+and concurrently_loop_width =
+  | ConcurrentlyLoopLimit of core
       (** [for ... concurrently(limit: expr)]. The parser currently admits only
           positive integer literals for source loops, but synthesized Core can
           carry a typed Int expression for helpers such as [List.concurrent]. *)
 
-and concurrent_for_output =
-  | ConcurrentForCollect
+and concurrently_loop_output =
+  | ConcurrentlyLoopCollect
       (** The loop is a value expression and produces
           [List[Result[T, ConcurrencyError]]]. *)
-  | ConcurrentForDiscard
+  | ConcurrentlyLoopDiscard
       (** The loop is statement fan-out and produces [Void]. Child task body
           values are sequenced for effect and discarded before task completion. *)
 
-and concurrent_for = {
+and concurrently_loop = {
   cf_var : var;
   cf_iter : core;
   cf_body : core;
   cf_timeout : core option;
-  cf_width : concurrent_for_width;
-  cf_output : concurrent_for_output;
+  cf_width : concurrently_loop_width;
+  cf_output : concurrently_loop_output;
   cf_task_scope : concurrent_task_scope;
   cf_task : task_closure option;
       (** Core-visible per-iteration task closure metadata after
@@ -1131,8 +1132,8 @@ let synthetic_concurrent_task_scope =
    Traversal
    ============================================================================ *)
 
-let map_concurrent_for_width f = function
-  | ConcurrentForLimit limit -> ConcurrentForLimit (f limit)
+let map_loop_width f = function
+  | ConcurrentlyLoopLimit limit -> ConcurrentlyLoopLimit (f limit)
 
 (** [map_children f e] applies [f] to each immediate child of [e] and
     rebuilds the node. Does not recurse — caller decides when to go deep.
@@ -1297,14 +1298,14 @@ let rec map_children (f : core -> core) (e : core) : core =
             conc_timeout = Option.map f cb.conc_timeout;
             conc_max_threads = cb.conc_max_threads;
           }
-    | CConcurrentFor cf ->
-        CConcurrentFor
+    | CConcurrentlyLoop cf ->
+        CConcurrentlyLoop
           {
             cf_var = cf.cf_var;
             cf_iter = f cf.cf_iter;
             cf_body = f cf.cf_body;
             cf_timeout = Option.map f cf.cf_timeout;
-            cf_width = map_concurrent_for_width f cf.cf_width;
+            cf_width = map_loop_width f cf.cf_width;
             cf_output = cf.cf_output;
             cf_task_scope = cf.cf_task_scope;
             cf_task = cf.cf_task;
@@ -1999,13 +2000,13 @@ let rec pp_to_string (e : core) : string =
       Printf.sprintf "concurrent { %s; %s }"
         (String.concat "; " bind_strs)
         (pp_to_string blk.conc_body)
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       let output =
         match cf.cf_output with
-        | ConcurrentForCollect -> "collect"
-        | ConcurrentForDiscard -> "discard"
+        | ConcurrentlyLoopCollect -> "collect"
+        | ConcurrentlyLoopDiscard -> "discard"
       in
-      Printf.sprintf "concurrent for[%s] %s in %s { %s }" output
+      Printf.sprintf "for ... concurrently[%s] %s in %s { %s }" output
         (Var.to_string cf.cf_var) (pp_to_string cf.cf_iter)
         (pp_to_string cf.cf_body)
   | CDetach d -> Printf.sprintf "detach %s" (pp_to_string d.detach_body)
@@ -2171,7 +2172,7 @@ let pp_to_string_indented (e : core) : string =
     | CStringSetLen _ | CVector _ | CTensorLiteral _ | CDict _
     | CDictConstruct _ | CSetAlloc _ | CRecord _ | CRecordConstruct _
     | CRecordUpdate _ | CRange _ | CStringInterp _ | CAssign _ | CConcurrent _
-    | CConcurrentFor _ | CDetach _ | CSelect _ | CCast _ | CUnbox _
+    | CConcurrentlyLoop _ | CDetach _ | CSelect _ | CCast _ | CUnbox _
     | CUnboxTyped _ | CBox _ | CBoxTyped _ | CUnionConstruct _
     | CResourceCleanupExit _ | CTailrecRecur _ ->
         p ^ pp_to_string e
@@ -2665,8 +2666,8 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
                     })
                   cb.conc_bindings;
             }
-      | CConcurrentFor cf ->
-          CConcurrentFor
+      | CConcurrentlyLoop cf ->
+          CConcurrentlyLoop
             { cf with cf_task = Option.map rewrite_task_closure cf.cf_task }
       | CDetach d ->
           CDetach

@@ -931,12 +931,12 @@ let rec annotate_tensor_storage_provenance env storage_env expr =
                 Option.map (annotate storage_env) block.conc_timeout;
             };
       }
-  | CConcurrentFor cf ->
+  | CConcurrentlyLoop cf ->
       let body_env = Storage_env.remove_var cf.cf_var storage_env in
       {
         expr with
         desc =
-          CConcurrentFor
+          CConcurrentlyLoop
             {
               cf with
               cf_iter = annotate storage_env cf.cf_iter;

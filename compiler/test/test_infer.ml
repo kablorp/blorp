@@ -2337,7 +2337,7 @@ func main(args: List[String]) -> Int:
                "concurrent task cannot capture scoped resource-derived value")
            errors))
 
-let test_with_resource_rejects_concurrent_for_capture () =
+let test_with_resource_rejects_concurrently_loop_capture () =
   with_isolated_env (fun () ->
       let _typed, errors, _env =
         parse_and_typecheck_std_with_env
@@ -2358,7 +2358,7 @@ func main(args: List[String]) -> Int:
 		0
 |}
       in
-      check_true "concurrent for scoped resource capture error"
+      check_true "for ... concurrently scoped resource capture error"
         (List.exists
            (fun (err : compiler_error) ->
              Blorp.Modules.contains err.message
@@ -2882,8 +2882,8 @@ let suite =
           test_with_resource_rejects_concurrent_capture;
         Alcotest.test_case "resource with rejects derived concurrent capture"
           `Quick test_with_resource_rejects_derived_concurrent_capture;
-        Alcotest.test_case "resource with rejects concurrent for capture" `Quick
-          test_with_resource_rejects_concurrent_for_capture;
+        Alcotest.test_case "resource with rejects for ... concurrently capture"
+          `Quick test_with_resource_rejects_concurrently_loop_capture;
         Alcotest.test_case "resource rejects concurrent resource result" `Quick
           test_resource_rejects_concurrent_resource_result;
         Alcotest.test_case "resource with rejects derived closure capture"

@@ -1,24 +1,55 @@
--- TCP Networking - Socket primitives for TCP connections
+-- TCP Networking - scoped socket resources.
 --
--- All functions are impure (I/O). The original handle operations still return
--- Result[T, String] for compatibility; future-facing checked/read/write helpers
--- return Result[T, TcpError]. Uses opaque TCP handles and Bytes for data buffers.
--- Numeric-address socket operations are fiber-aware; hostname resolution still
--- uses blocking DNS. Use numeric hosts such as "127.0.0.1" or "" bind-any hosts
--- when OS-worker pinning during DNS resolution is unacceptable.
-type TcpListener = builtin
+-- TcpListener and TcpStream are external capabilities. Acquire them with
+-- `with listener ?= listen(...):` or `with stream ?= connect(...):` so the
+-- compiler installs deterministic cleanup. Numeric-address socket operations
+-- are fiber-aware; hostname resolution still uses blocking DNS. Use numeric
+-- hosts such as "127.0.0.1" or "" bind-any hosts when OS-worker pinning during
+-- DNS resolution is unacceptable.
+import:
+	stream: ResourceSource
 
 
-type TcpStream = builtin
+---
+Opaque resource for a listening TCP socket.
+---
+resource type TcpListener = builtin("blorp_tcp_close_listener")
+
+
+---
+Opaque resource for a connected TCP socket.
+---
+resource type TcpStream = builtin("blorp_tcp_close_stream")
+
+
+---
+Private finalizer trait implemented by scoped TCP resources.
+
+`with` blocks use compiler-owned cleanup builtins directly. This trait keeps the
+runtime finalizers documented inside the module without exporting a manual
+`close` operation that could conflict with scoped cleanup ownership.
+---
+private trait TcpClosable:
+	func close(handle: Self) -> Void
+
+
+implements TcpClosable for TcpListener:
+	func close(listener: TcpListener) -> Void:
+		builtin("blorp_tcp_close_listener")
+
+
+implements TcpClosable for TcpStream:
+	func close(stream: TcpStream) -> Void:
+		builtin("blorp_tcp_close_stream")
 
 
 ---
 Typed error surface for TCP APIs.
 
-The current runtime still reports TCP failures as strings. Compatibility
-wrappers convert those runtime details to `Other` until the runtime exposes
-stable error classes directly. The variants are defined now so resource-backed
-TCP can move to typed errors without changing the public error type again.
+The current runtime still reports most TCP failures as strings. The resource
+bridge classifies explicit Blorp-side precondition failures as `InvalidInput`
+and preserves lower-level runtime details as `Other` until the runtime exposes
+stable TCP error classes directly.
 ---
 union TcpError:
 	InvalidInput(String)
@@ -60,276 +91,153 @@ implements Stringable for TcpError:
 		message(err)
 
 
-private pure func runtime_error(detail: String) -> TcpError:
-	Other(detail)
+---
+Return the local port for a scoped listener.
+---
+@resource_result_ordinary
+func local_port(listener: TcpListener) -> Result[Int, TcpError]:
+	builtin("blorp_tcp_local_port_listener_raw")
 
 
-private pure func valid_host(host: String) -> Bool:
-	host.length() < 256
+---
+Return the local port for a scoped stream.
+---
+@resource_result_ordinary
+func stream_local_port(stream: TcpStream) -> Result[Int, TcpError]:
+	builtin("blorp_tcp_local_port_stream_raw")
 
 
-private pure func valid_port(port: Int) -> Bool:
-	port >= 0 and port <= 65535
+---
+Set the default runtime operation timeout for a scoped listener.
+
+This is a virtual-thread deadline used by accept waits on an existing listener,
+not a kernel socket timeout. Negative timeouts are rejected.
+---
+@resource_result_ordinary
+func set_timeout(listener: TcpListener, ms: Int) -> Result[Void, TcpError]:
+	builtin("blorp_tcp_set_timeout_listener_raw")
 
 
-private pure func valid_backlog(backlog: Int) -> Bool:
-	backlog >= 0 and backlog <= 2147483647
+---
+Set the default runtime operation timeout for a scoped stream.
 
-
-private pure func valid_read_chunk_size(max_bytes: Int) -> Bool:
-	max_bytes > 0 and max_bytes <= 67108864
-
-
-private pure func valid_timeout_ms(ms: Int) -> Bool:
-	ms >= 0 and ms <= 18446744073709
-
-
-private pure func map_runtime_error[T](result: Result[T, String]) -> Result[T, TcpError]:
-	match result:
-		Ok(value): Ok(value)
-		Err(detail): Err(runtime_error(detail))
-
-
-private pure func map_runtime_void(result: Result[Int, String]) -> Result[Void, TcpError]:
-	match result:
-		Ok(_): Ok(void)
-		Err(detail): Err(runtime_error(detail))
-
-
-trait TcpClosable:
-	func close(handle: Self) -> Void
-
-
-trait TcpLocalPort:
-	func local_port(handle: Self) -> Result[Int, String]
-
-
-trait TcpLocalPortChecked:
-	func local_port_checked(handle: Self) -> Result[Int, TcpError]
-
-
--- Set the default runtime operation timeout for a TCP handle.
--- This is a virtual-thread deadline used by accept/read/write waits on an
--- existing handle, not a kernel socket timeout. Negative timeouts are rejected.
-trait TcpTimeout:
-	func set_timeout(handle: Self, ms: Int) -> Result[Int, String]
-
-
--- Set the default runtime operation timeout with typed input errors.
-trait TcpTimeoutChecked:
-	func set_timeout_checked(handle: Self, ms: Int) -> Result[Void, TcpError]
-
-
-implements TcpClosable for TcpListener:
-	func close(listener: TcpListener) -> Void:
-		builtin("blorp_tcp_close_listener")
-
-
-implements TcpClosable for TcpStream:
-	func close(stream: TcpStream) -> Void:
-		builtin("blorp_tcp_close_stream")
-
-
-implements TcpLocalPort for TcpListener:
-	func local_port(listener: TcpListener) -> Result[Int, String]:
-		builtin("blorp_tcp_local_port_listener")
-
-
-implements TcpLocalPort for TcpStream:
-	func local_port(stream: TcpStream) -> Result[Int, String]:
-		builtin("blorp_tcp_local_port_stream")
-
-
-implements TcpLocalPortChecked for TcpListener:
-	func local_port_checked(listener: TcpListener) -> Result[Int, TcpError]:
-		map_runtime_error(local_port(listener))
-
-
-implements TcpLocalPortChecked for TcpStream:
-	func local_port_checked(stream: TcpStream) -> Result[Int, TcpError]:
-		map_runtime_error(local_port(stream))
-
-
-implements TcpTimeout for TcpListener:
-	func set_timeout(listener: TcpListener, ms: Int) -> Result[Int, String]:
-		builtin("blorp_tcp_set_timeout_listener")
-
-
-implements TcpTimeout for TcpStream:
-	func set_timeout(stream: TcpStream, ms: Int) -> Result[Int, String]:
-		builtin("blorp_tcp_set_timeout_stream")
-
-
-implements TcpTimeoutChecked for TcpListener:
-	func set_timeout_checked(listener: TcpListener, ms: Int) -> Result[Void, TcpError]:
-		if not valid_timeout_ms(ms):
-			Err(InvalidInput("timeout must be between 0 and 18446744073709 ms"))
-		else:
-			map_runtime_void(set_timeout(listener, ms))
-
-
-implements TcpTimeoutChecked for TcpStream:
-	func set_timeout_checked(stream: TcpStream, ms: Int) -> Result[Void, TcpError]:
-		if not valid_timeout_ms(ms):
-			Err(InvalidInput("timeout must be between 0 and 18446744073709 ms"))
-		else:
-			map_runtime_void(set_timeout(stream, ms))
+This is a virtual-thread deadline used by read/write waits on an existing
+stream, not a kernel socket timeout. Negative timeouts are rejected.
+---
+@resource_result_ordinary
+func set_stream_timeout(stream: TcpStream, ms: Int) -> Result[Void, TcpError]:
+	builtin("blorp_tcp_set_timeout_stream_raw")
 
 
 ---
 Create a TCP server socket, bind to host:port, and start listening.
-Returns a listener handle on success.
-Numeric hosts avoid DNS. Hostnames may block an OS thread during resolution.
-Use "" to bind to the platform's passive any-host address without DNS.
-Hosts longer than 255 bytes are rejected instead of truncated.
-Negative backlog values and backlog values larger than the C runtime can
-represent are rejected before calling the OS.
----
-func listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, String]:
-	builtin
 
-
+Use with `with listener ?= listen(host, port, backlog):` so the listener is
+closed automatically when the block exits. Numeric hosts avoid DNS. Use "" to
+bind to the platform's passive any-host address without DNS.
 ---
-Create a TCP server socket with a typed TCP error.
-
-This compatibility bridge rejects invalid host, port, and backlog inputs before
-crossing into the runtime. Other failures are delegated to `listen` and
-preserved as `Err(Other(detail))`. The eventual resource API should move this
-typed error shape onto `listen` itself.
----
-func listen_checked(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]:
-	if not valid_host(host):
-		Err(InvalidInput("host must be shorter than 256 bytes"))
-	else if not valid_port(port):
-		Err(InvalidInput("port must be between 0 and 65535"))
-	else if not valid_backlog(backlog):
-		Err(InvalidInput("backlog must be between 0 and 2147483647"))
-	else:
-		map_runtime_error(listen(host, port, backlog))
+func listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_raw")
 
 
 ---
 Accept an incoming connection on a listening socket.
-Returns a stream handle on success.
-Only one parked accept may be in progress for a listener. Start one accept loop
-and fan accepted streams into worker tasks; overlapping parked accepts return an
-error instead of pretending the listener is closed.
+
+The listener must be a scoped `with` binding. Only one parked accept may be in
+progress for a listener. Start one accept loop and fan accepted streams into
+structured resource-source consumers once that syntax lands; overlapping parked
+accepts return an error instead of pretending the listener is closed.
 ---
-func accept(listener: TcpListener) -> Result[TcpStream, String]:
-	builtin
+func accept(listener: TcpListener) -> Result[TcpStream, TcpError]:
+	builtin("blorp_tcp_accept_raw")
 
 
 ---
-Accept an incoming connection with a typed TCP error.
+Create a resource-producing source of accepted streams.
 
-This compatibility bridge delegates to `accept` and preserves runtime string
-failures as `Err(Other(detail))`. The eventual resource API should move this
-typed error shape onto `accept` itself.
+The source borrows the scoped listener, so it must stay inside the listener's
+`with` block. Sequential `for` iteration transfers each accepted stream into a
+scoped loop body and closes it at the end of that iteration. Accept errors end
+the source.
 ---
-func accept_checked(listener: TcpListener) -> Result[TcpStream, TcpError]:
-	map_runtime_error(accept(listener))
+func connections_stop_on_error(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]:
+	builtin("blorp_tcp_connections_stop_on_error_raw")
+
+
+---
+Create a resource-producing source of accepted streams.
+
+The source borrows the scoped listener, so it must stay inside the listener's
+`with` block. Sequential `for` iteration transfers each accepted stream into a
+scoped loop body and closes it at the end of that iteration. The current runtime
+ends the source on accept errors while the typed transient-error policy is being
+finished.
+---
+func connections_continue_on_error(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]:
+	builtin("blorp_tcp_connections_continue_on_error_raw")
 
 
 ---
 Connect to a remote TCP server at host:port.
-Returns a stream handle on success.
-Numeric hosts avoid DNS and the socket connect parks fibers while waiting.
-Hostnames may block an OS thread during resolution before the socket connect.
-Hosts longer than 255 bytes are rejected instead of truncated.
----
-func connect(host: String, port: Int) -> Result[TcpStream, String]:
-	builtin
 
-
+Use with `with stream ?= connect(host, port):` so the stream is closed
+automatically when the block exits. Numeric hosts avoid DNS and the socket
+connect parks fibers while waiting. Hostnames may block an OS thread during
+resolution before the socket connect.
 ---
-Connect to a remote TCP server with a typed TCP error.
-
-This compatibility bridge rejects invalid host and port inputs before crossing
-into the runtime. Other failures are delegated to `connect` and preserved as
-`Err(Other(detail))`. The eventual resource API should move this typed error
-shape onto `connect` itself.
----
-func connect_checked(host: String, port: Int) -> Result[TcpStream, TcpError]:
-	if not valid_host(host):
-		Err(InvalidInput("host must be shorter than 256 bytes"))
-	else if not valid_port(port):
-		Err(InvalidInput("port must be between 0 and 65535"))
-	else:
-		map_runtime_error(connect(host, port))
+func connect(host: String, port: Int) -> Result[TcpStream, TcpError]:
+	builtin("blorp_tcp_connect_raw")
 
 
 ---
-Read up to max_bytes from a socket.
-Returns the data actually read (may be less than max_bytes).
-Returns empty Bytes on connection close.
-Reading zero bytes returns empty Bytes after validating the stream.
-Negative max_bytes values are rejected. Single read requests larger than 64 MiB
-are also rejected; loop over smaller reads for larger payloads.
-Only one parked read may be in progress for a stream. Overlapping parked reads
-return an error instead of pretending the stream is closed.
----
-func read(stream: TcpStream, max_bytes: Int) -> Result[Bytes, String]:
-	builtin
+Read up to `max_bytes` from a socket.
 
-
+The stream must be a scoped `with` binding. Returns the data actually read,
+which may be less than `max_bytes`. An empty `Bytes` value means the peer closed
+the connection. Passing a non-positive size or a size larger than 64 MiB returns
+`Err(InvalidInput(...))`.
 ---
-Read up to max_bytes from a socket with a typed TCP error.
-
-This is the future-facing spelling for TCP resources. Passing a non-positive
-size or a size larger than 64 MiB returns `Err(InvalidInput(...))` before
-crossing into the runtime. Other failures are delegated to `read` and preserved
-as `Err(Other(detail))`.
----
+@resource_result_ordinary
 func read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]:
-	if not valid_read_chunk_size(max_bytes):
-		Err(InvalidInput("max_bytes must be between 1 and 67108864"))
-	else:
-		map_runtime_error(read(stream, max_bytes))
+	builtin("blorp_tcp_read_raw")
 
 
 ---
-Write all bytes in data to a socket.
-Returns the number of bytes written on success.
-If cancellation, timeout, or an OS error happens after a partial send, the
-function returns an error and the peer may still have received the bytes already
-sent. Use protocol-level framing or acknowledgements when partial delivery must
-be recovered precisely.
-Peer-close write failures are reported as Result errors instead of terminating
-the process with SIGPIPE.
-Overlapping writes on the same stream return an error instead of interleaving
-bytes.
+Alias for `read_chunk`.
 ---
-func write(stream: TcpStream, data: Bytes) -> Result[Int, String]:
-	builtin
+@resource_result_ordinary
+func read(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]:
+	builtin("blorp_tcp_read_raw")
 
 
 ---
-Write all bytes in data to a socket with a typed TCP error.
+Write one byte chunk to a socket.
+
+The stream must be a scoped `with` binding. Returns the number of bytes written
+on success. If cancellation, timeout, or an OS error happens after a partial
+send, the function returns an error and the peer may still have received the
+bytes already sent.
+---
+@resource_result_ordinary
+func write(stream: TcpStream, data: Bytes) -> Result[Int, TcpError]:
+	builtin("blorp_tcp_write_raw")
+
+
+---
+Write all bytes in `data` to a socket.
 
 Returns `Ok(void)` once every byte has been written. If cancellation, timeout,
 or an OS error happens after a partial send, the function returns an error and
 the peer may still have received bytes already sent.
 ---
+@resource_result_ordinary
 func write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]:
-	match write(stream, data):
-		Ok(_): Ok(void)
-		Err(detail): Err(runtime_error(detail))
+	builtin("blorp_tcp_write_all_raw")
 
 
 ---
 Set SO_REUSEADDR on a listener.
 ---
-func set_reuse_addr(listener: TcpListener) -> Result[Int, String]:
-	builtin
-
-
----
-Set SO_REUSEADDR on a listener with a typed TCP error.
-
-This compatibility bridge delegates to `set_reuse_addr` and preserves runtime
-string failures as `Err(Other(detail))`. The eventual resource API should move
-this typed error shape onto `set_reuse_addr` itself if the helper remains part
-of the public TCP surface.
----
-func set_reuse_addr_checked(listener: TcpListener) -> Result[Void, TcpError]:
-	map_runtime_void(set_reuse_addr(listener))
+@resource_result_ordinary
+func set_reuse_addr(listener: TcpListener) -> Result[Void, TcpError]:
+	builtin("blorp_tcp_set_reuse_addr_raw")

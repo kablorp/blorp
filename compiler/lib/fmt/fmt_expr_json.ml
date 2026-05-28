@@ -867,7 +867,7 @@ let rec expr_to_json expr =
       | Some body_json ->
           Some (obj [ field "tag" (string "Detach"); field "body" body_json ])
       | None -> None)
-  | Ast.EConcurrentFor (var, iter, body, timeout, width) -> (
+  | Ast.EConcurrentlyLoop (var, iter, body, timeout, width) -> (
       match
         ( expr_to_json iter,
           expr_to_json body,
@@ -877,7 +877,7 @@ let rec expr_to_json expr =
           Some
             (obj
                ([
-                  field "tag" (string "ConcurrentFor");
+                  field "tag" (string "ConcurrentlyLoop");
                   field "var" (string var);
                   field "iter" iter_json;
                   field "body" body_json;
@@ -885,8 +885,8 @@ let rec expr_to_json expr =
                @ optional_field "timeout" timeout_json
                @
                match width with
-               | Ast.ConcurrentForLimit n -> [ field "limit" (string_of_int n) ]
-               ))
+               | Ast.ConcurrentlyLoopLimit n ->
+                   [ field "limit" (string_of_int n) ]))
       | _ -> None)
   | Ast.EWith (binding, body) -> (
       match (expr_to_json binding.with_value, expr_to_json body) with

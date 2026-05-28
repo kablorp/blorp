@@ -81,7 +81,7 @@ The pass should traverse reachable Core expression bodies and add edges for:
 - `CCall (CKUser (_, Some def_id), _, args)`.
 - `CClosureCreate { cc_def_id; ... }`.
 - `CConcurrent` task metadata once closure/task functions are represented.
-- `CConcurrentFor` task metadata once closure/task functions are represented.
+- `CConcurrentlyLoop` task metadata once closure/task functions are represented.
 - `CDetach` task metadata once closure/task functions are represented.
 - Global initializer expressions.
 - Function values/adapters produced by `Core_closure.adapt_function_refs_program`.

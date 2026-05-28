@@ -178,16 +178,16 @@ let concurrent_max_threads_or_error loc n =
     raise (Parse_error_at (loc, "max_threads is too large"))
   else Int64.to_int n
 
-let concurrent_loop_limit_or_error loc n =
+let concurrently_loop_limit_or_error loc n =
   if Int64.compare n 0L <= 0 then
     raise (Parse_error_at (loc, "concurrently limit must be positive"))
   else if Int64.compare n (Int64.of_int max_int) > 0 then
     raise (Parse_error_at (loc, "concurrently limit is too large"))
   else Int64.to_int n
 
-let concurrent_for_width_of_limit loc params =
+let concurrently_loop_width_of_limit loc params =
   match params.loop_limit with
-  | Some n -> ConcurrentForLimit n
+  | Some n -> ConcurrentlyLoopLimit n
   | None ->
       raise
         (Parse_error_at
@@ -204,7 +204,7 @@ let apply_concurrently_loop_param params (name, value) =
             {
               params with
               loop_limit =
-                Some (concurrent_loop_limit_or_error value.expr_loc n);
+                Some (concurrently_loop_limit_or_error value.expr_loc n);
             }
         | _ ->
             raise
@@ -219,7 +219,7 @@ let apply_concurrently_loop_param params (name, value) =
       raise
         (Parse_error_at
            (value.expr_loc,
-            "use `limit: N` in `concurrently(...)`; `max_threads` is for legacy `concurrent(...)`"))
+            "use `limit: N` in `concurrently(...)`; `max_threads` is only valid on `concurrent(...)` blocks"))
   | "item_timeout" ->
       raise
         (Parse_error_at
@@ -962,10 +962,10 @@ impl_method_list_after_newline:
 
 (* Impl method - just a regular function *)
 impl_method:
-  | p = purity_prefix FUNC fn_name = name type_params = type_params_opt
+  | annots = annotations p = purity_prefix FUNC fn_name = name type_params = type_params_opt
     params = params ret = return_type_opt wc = where_clause_opt COLON body = func_body
     { mk_func ~loc:(loc_of_pos $symbolstartpos) ~dim_constraints:wc ~is_pure:p
-        ~name:(Some fn_name) ~tparams:type_params ~params ~ret ~body ~annots:[] }
+        ~name:(Some fn_name) ~tparams:type_params ~params ~ret ~body ~annots }
 
 (* Type alias declaration *)
 type_alias_decl:
@@ -1250,22 +1250,22 @@ primary_expr:
     { parse_fail_at $startpos($3) "Expected ':' after with binding" }
   | FOR name = binding_ident IN iter = expr CONCURRENTLY LPAREN params = concurrently_loop_params RPAREN COLON NEWLINE INDENT body = stmt_list DEDENT
     { make_expr_at $symbolstartpos
-        (EConcurrentFor
+        (EConcurrentlyLoop
            ( name,
              iter,
              stmts_to_expr body,
              params.loop_timeout,
-             concurrent_for_width_of_limit
+             concurrently_loop_width_of_limit
                (loc_of_pos $startpos(params))
                params )) }
   | FOR UNDERSCORE IN iter = expr CONCURRENTLY LPAREN params = concurrently_loop_params RPAREN COLON NEWLINE INDENT body = stmt_list DEDENT
     { make_expr_at $symbolstartpos
-        (EConcurrentFor
+        (EConcurrentlyLoop
            ( "_",
              iter,
              stmts_to_expr body,
              params.loop_timeout,
-             concurrent_for_width_of_limit
+             concurrently_loop_width_of_limit
                (loc_of_pos $startpos(params))
                params )) }
   | FOR name = binding_ident IN iter = expr CONCURRENTLY COLON NEWLINE INDENT body = stmt_list DEDENT

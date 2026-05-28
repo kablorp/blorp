@@ -129,9 +129,9 @@ Semantics:
   resource and cleanup runs when the task exits.
 - Cancellation closes resources owned by cancelled child tasks.
 
-This replaces the old `concurrent for` mental model. Instead of making
-fan-out produce `List[Result[T, ConcurrencyError]]`, fan-out is a loop modifier.
-The base construct is about running work, not collecting values.
+Fan-out is a loop modifier. The base construct is about running work, not
+collecting values; use `List.concurrent(...)` when result collection is the
+goal.
 
 ### Fixed Concurrent Block
 
@@ -231,7 +231,7 @@ with listener ?= tcp.listen("", 8080, 1024):
 	concurrent:
 		run_metrics()
 
-		for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
+		for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 			handle_connection(conn)
 ```
 
@@ -272,7 +272,7 @@ Resource-producing branches are scoped to the selected branch:
 
 ```blorp
 select:
-	conn from listener.connections():
+	conn from listener.connections_continue_on_error():
 		handle_connection(conn)
 
 	sealed shutdown:
@@ -484,7 +484,7 @@ Allowed:
 
 ```blorp
 with listener ?= tcp.listen("", 8080, 1024):
-	for conn in listener.connections() concurrently(limit: 4096):
+	for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 		handle_connection(conn)
 ```
 
@@ -532,7 +532,8 @@ and the resource declaration names the concurrency contract.
 Some sources produce resources:
 
 ```blorp
-listener.connections() -> ResourceSource[TcpStream, TcpError]
+listener.connections_continue_on_error() -> ResourceSource[TcpStream, TcpError]
+listener.connections_stop_on_error() -> ResourceSource[TcpStream, TcpError]
 pool.checkouts() -> ResourceSource[DbConnection, DbError]
 fs.walk(root).files() -> FallibleStream[String, IOError]
 ```
@@ -554,7 +555,7 @@ Rules:
 Possible source-error policy:
 
 ```blorp
-for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
+for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 	handle_connection(conn)
 ```
 
@@ -817,7 +818,7 @@ When a source produces resources, use resource-producing iteration:
 
 ```blorp
 with listener ?= tcp.listen("", 8080, 1024):
-	for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
+	for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 		handle_connection(conn)
 ```
 
@@ -835,7 +836,7 @@ Performance tuning should stay in the same vocabulary:
 ```blorp
 func serve() -> Result[Void, TcpError]:
 	with listener ?= tcp.listen("", 8080, 1024):
-		for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
+		for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 			handle_connection(conn)
 
 		Ok(Void)
@@ -853,7 +854,7 @@ Desired properties:
 ### HTTP Handler
 
 ```blorp
-for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
+for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 	match conn.read_request():
 		Ok(req):
 			resp = route(req)
@@ -960,7 +961,7 @@ func run_game() -> Result[Void, TcpError]:
 		concurrent:
 			run_world(world_events)
 			-- TcpListener permits one structured accept-loop borrow.
-			for conn in listener.connections(on_error: Continue) concurrently(limit: 20000):
+			for conn in listener.connections_continue_on_error() concurrently(limit: 20000):
 				run_player_session(conn, world_events)
 
 	Ok(Void)
@@ -1041,7 +1042,8 @@ API shape:
 ```blorp
 listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
 connect(host: String, port: Int) -> Result[TcpStream, TcpError]
-connections(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]
+connections_continue_on_error(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]
+connections_stop_on_error(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]
 read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
 write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]
 chunks(stream: TcpStream) -> FallibleStream[Bytes, TcpError]
@@ -1101,7 +1103,7 @@ connection is moved into exactly one child task owned by a structured scope:
 
 ```blorp
 with listener ?= tcp.listen("", 8080, 1024):
-	for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
+	for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 		handle_connection(conn)
 ```
 
@@ -1206,11 +1208,10 @@ Goal: know exactly what existing concurrency code depends on.
 
 Work:
 
-- Catalogue all uses of `concurrent:`, `for ... concurrently`, `detach`,
-  channels, channel seal behavior, timeout helpers, and TCP
-  concurrency examples.
+- Catalogue all uses of `concurrent:`, `for ... concurrently`, `detach`, channels,
+  channel seal behavior, timeout helpers, and TCP concurrency examples.
 - Add snapshot tests for the current behavior before changing it.
-- Identify which tests require result-collecting fan-out.
+- Identify which tests rely on result collection from dynamic fan-out.
 - Identify any code that assumes detached work can outlive resources.
 
 Migration impact: none. This phase should only add tests and notes.
@@ -1268,6 +1269,10 @@ expression, and their visible length advances as each join result is stored so
 partially collected results are released correctly on cancellation. Child-task
 cleanup waits are cancellation-resistant once started, so a second cancellation
 request cannot interrupt the cleanup join and leave descendant tasks running.
+Owned iterable temporaries used by `for ... concurrently` are now also
+registered until the fan-out loop finishes, so cancellation during a join cannot
+leak a list literal or function-produced list that is live only as the fan-out
+source.
 Task join now also preserves the task result's runtime RC bit when boxing
 `Ok(payload)`, so `TaskResult[String]` and
 `List[Result[String, ConcurrencyError]]` release payloads through ordinary
@@ -1292,6 +1297,24 @@ counters.
 The compiler unit suite now compares the `SchedulerStats` field order in
 `std/instrumentation.brp`, `runtime.c`, and `runtime_decl.c`, so layout drift
 fails at the consistency-test boundary instead of becoming an ABI mismatch.
+Builtin metadata now has an explicit `Cancellation_point` capability for
+global scheduler/channel operations that can observe cooperative cancellation
+(`sleep`, `yield_now`, blocking/timed channel send/receive) and for runtime TCP
+reactor waits (`blorp_tcp_accept_raw`, `blorp_tcp_read_raw`, and related raw C
+builtins). This gives future cleanup audits a named fact to query instead of
+inferring cancellation behavior from `Impure`.
+`std/test.cancel_after_parked_for_test` now provides the first narrow
+deterministic cancellation harness: it runs a zero-argument child task, waits
+until that task is observed parked, then cancels and joins it without exposing a
+general source-level task handle. The blocked channel-send string leak baseline
+uses this hook instead of `concurrent(timeout: N)`. A matching receive-side
+baseline covers `recv`, `wait_recv`, and `recv_timeout` with a managed local
+live across the parked receive and verifies the channel remains usable after
+cancellation. Additional baselines cover a parent cancelled while joining a
+structured child and a parent cancelled while joining a bounded dynamic fan-out,
+including the owned iterable temporary that feeds the fan-out. Ordinary
+`select`, timer sleep, and TCP `accept`/`read` now have deterministic
+cancellation leak baselines as well.
 
 Migration impact: none visible unless existing timeout behavior is buggy. Fix
 bugs here before exposing new user-facing cancellation syntax.
@@ -1330,6 +1353,19 @@ Work:
 - Add a cancellation-point matrix for every operation that can park: timer
   sleep, channel send, channel receive, task join, dynamic fan-out joins,
   reactor waits, blocking-worker waits, and eventually resource cleanup.
+- Replace timer-dependent cancellation leak baselines with deterministic
+  cancellation tests. In particular, leak cases where an owned temporary is live
+  across a blocked channel send must not depend on `concurrent(timeout: N)`
+  racing the scheduler into the intended park point.
+- Add a test-only task cancellation primitive or harness that can force
+  "child is parked here, cancel and join it now" without exposing general
+  unstructured task handles as a user-facing API. Runtime already has internal
+  cancel/join/release machinery; the source-level test API should be narrower
+  and clearly marked as a test hook.
+- Extend builtin metadata so operations that may park are represented
+  explicitly, not just as `Impure`. The compiler and codegen audits should be
+  able to ask whether a call is a cancellation point, which matters for
+  task-local cleanup of owned values live across the call.
 - Add sanitizer and leak-check variants for parked, woken, cancelled,
   timed-out, sealed, and completed fiber paths.
 - Add performance guardrails for noop task spawn/join, park/wake, channel
@@ -1350,6 +1386,12 @@ Tests:
   mixed producer/consumer fan-out.
 - Cancellation matrix tests assert that timed-out waiters are removed from wait
   queues and task-local managed values are released.
+- Deterministic cancellation tests assert that owned temporaries live across
+  blocking channel send/receive calls are released when the parked child task is
+  cancelled.
+- Metadata tests assert that every runtime operation that may park is marked as
+  a cancellation point, including channel send/receive, sleep/yield, task join,
+  fan-out joins, TCP reactor waits, and future blocking-worker waits.
 - Sanitizer/leak gates run the focused concurrency and channel baselines.
 
 Implementation status: `blorp test --repeat N` now reruns selected runtime tests
@@ -1366,13 +1408,16 @@ which avoids concurrent resume of the same coroutine. Channel property coverage
 now also includes a small operation-history MPMC run: accepted sends, received
 values, and rejected sends are recorded into a separate channel and validated
 after the run. This is not a full linearizability checker yet, but it
-establishes the source-level pattern needed for one. The older MPMC property
-regression now uses structured concurrency instead of detached consumers, so
-strict leak checking can cover it directly. Channel property tests now cover
-capacity-1 and capacity-2 FIFO behavior, permanent seal behavior across
-blocking/nonblocking/timed send APIs, exact-once MPMC delivery through
-structured consumers, and timed sender/receiver cleanup that leaves the channel
-usable after waiters time out.
+establishes the source-level pattern needed for one. A bounded capacity-1 replay
+model now checks typed nonblocking send/receive histories against FIFO state
+transitions and includes negative cases for impossible histories. The older MPMC
+property regression now uses structured concurrency instead of detached
+consumers, so strict leak checking can cover it directly. Channel property tests
+now cover capacity-1 and capacity-2 FIFO behavior, producer-local ordering in an
+MPSC run under capacity-1 backpressure, permanent seal behavior across
+blocking/nonblocking/timed send APIs, exact-once MPMC delivery through structured
+consumers, and timed sender/receiver cleanup that leaves the channel usable
+after waiters time out.
 
 Migration impact: none. This phase adds testability, diagnostics, and gates; it
 should not alter source-level concurrency semantics.
@@ -1395,13 +1440,6 @@ Work:
   a later ergonomic decision, not the initial migration.
 - Do not preserve `concurrent for` as special parser syntax.
 
-Current:
-
-```blorp
-results = concurrent for item in items:
-	work(item)
-```
-
 Target for statement fan-out:
 
 ```blorp
@@ -1409,7 +1447,7 @@ for item in items concurrently(limit: 128):
 	work(item)
 ```
 
-Target for result collection:
+Result collection:
 
 ```blorp
 results = items.concurrent(128, work)
@@ -1419,8 +1457,8 @@ Tests:
 
 - Parser accepts `for ... concurrently(limit: N)`.
 - Parser rejects missing `limit` with a clear help message.
-- Parser rejects legacy `max_threads`, duplicate parameters, unknown
-  parameters, and reserved-but-unimplemented `item_timeout` in
+- Parser rejects `max_threads` in loop modifiers, duplicate parameters,
+  unknown parameters, and reserved-but-unimplemented `item_timeout` in
   `for ... concurrently(...)`.
 - Parser rejects `concurrently:` as a block spelling and suggests
   `concurrent:`.
@@ -1431,15 +1469,15 @@ value-collecting code should use `List.concurrent(...)` or
 `List.concurrent_with_timeout(...)`.
 
 Implementation status: the parser, AST, typed AST, Core, formatter, and
-expression-document bridge preserve `limit` as distinct from legacy
-`max_threads`. Codegen now treats `for ... concurrently(limit: N)` as a
+expression-document bridge preserve `limit` as distinct from block-level
+`max_threads`. Codegen treats `for ... concurrently(limit: N)` as a
 per-loop active-task limit by spawning and joining work in windows of at most
 `N` tasks. Legacy `concurrent for` syntax is no longer represented as a
 distinct parser case.
 Parser coverage now pins the source syntax boundary: `limit` is the loop width
 spelling, `timeout` is accepted for whole-loop deadlines, `max_threads` remains
-legacy block syntax only, and `item_timeout` is reserved until per-item deadline
-semantics are implemented.
+valid only on `concurrent(...)` blocks, and `item_timeout` is reserved until
+per-item deadline semantics are implemented.
 
 Stop condition: users can mechanically migrate syntax without changing program
 semantics yet.
@@ -1477,7 +1515,7 @@ Implementation status: Core task closure metadata now stores explicit
 `TaskCopyCapture`, `TaskMoveResourceItem`, or `TaskStructuredTaskBorrow`
 capture kinds instead of bare `(name, type)` pairs. Closure conversion
 currently constructs only `TaskCopyCapture`; Core invariants reject the reserved
-resource-oriented capture kinds until their lowering exists. `CConcurrentFor`
+resource-oriented capture kinds until their lowering exists. `CConcurrentlyLoop`
 and each `concurrent:` binding also carry explicit parent/child task-scope
 edges assigned by `Core_lower`; nested concurrent loops lowered inside a child
 task body use that child as the next parent. Core invariants reject malformed
@@ -1495,7 +1533,7 @@ block-local declarations do not get mistaken for captures solely because they
 reuse an outer name. Fixed `concurrent:` tasks, dynamic
 `for ... concurrently` bodies, and `detach` bodies also reject read-captures of
 outer mutable bindings; users must bind an immutable snapshot before starting
-work when a task needs the current value. `CConcurrentFor` now also carries an
+work when a task needs the current value. `CConcurrentlyLoop` now also carries an
 explicit output mode: collect-mode nodes produce
 `List[Result[T, ConcurrencyError]]`, while discard-mode nodes produce `Void`
 and require the child task body to be `Void` in Core. Core invariants enforce
@@ -1529,15 +1567,15 @@ Tests:
 
 Implementation status: ordinary list fan-out with `concurrently(limit: N)` now
 emits bounded windows of active child tasks, so total task allocation is capped
-by the local `limit` instead of the input length. The existing implementation
-supports expression-level result collection for compiler-owned helpers. The
-explicit collection helper is
+by the local `limit` instead of the input length. Source
+`for ... concurrently(...)` syntax is statement-only; result collection is a
+separate Core output mode synthesized by std list helpers. The explicit
+collection helper now exists as
 `List.concurrent(limit, func) -> List[Result[U, ConcurrencyError]]`, matching
 `List.parallel(...)` as a method-shaped list operation.
-`List.concurrent_with_timeout(limit, Duration, func)` now covers the collected
-whole-operation deadline case before diagnostics are added for value-producing
-loop syntax. The
-compiler-owned list helpers synthesize directly to Core `CConcurrentFor` with a
+`List.concurrent_with_timeout(limit, Duration, func)` covers the collected
+whole-operation deadline case. The
+compiler-owned list helpers synthesize directly to Core `CConcurrentlyLoop` with a
 typed limit expression, instead of routing through a separate runtime
 algorithm, so they share task batching, task closure conversion, cancellation,
 deadline handling, and Result wrapping with source
@@ -1554,21 +1592,21 @@ Duration timeout runtime test, bounded-window codegen audit, and binder
 shadowing typecheck case use statement fan-out. The ordinary runtime coverage
 for basic collection and timeout collection has also moved to
 `List.concurrent` / `List.concurrent_with_timeout`.
-TCP benchmarks still have legacy fan-out spelling and are intentionally
-deferred until the TCP/resource design resumes. A `for ... concurrently` loop
-in statement position or `Void` tail position is inferred and lowered as
+TCP benchmarks are intentionally deferred until the TCP/resource design resumes.
+A `for ... concurrently` loop in statement position or `Void` tail position is
+inferred and lowered as
 discard-mode statement fan-out, so it does not allocate an unobservable result
 list. Direct `?=` in loop bodies now has a stable diagnostic covering both
 ordinary loops and `for ... concurrently(...)` bodies, with help text pointing
 users at an explicit `match` or Option/Result combinators instead of implying
 future implicit loop propagation. User-facing diagnostics for ordinary
-fan-out now use the source spelling `for ... concurrently` for non-list
-iterables, timeout type errors, mutable outer assignments, mutable captures,
-and purity reports. `concurrent for` remains only as Core-internal terminology.
+fan-out use the source spelling `for ... concurrently` for non-list iterables,
+timeout type errors, mutable outer assignments, mutable captures, and purity
+reports.
 
-Migration impact: result-collecting `concurrent for` users move to
-`List.concurrent` or `List.concurrent_with_timeout`; side-effecting or
-channel-producing users move to `for ... concurrently`.
+Migration impact: result-collecting users use `List.concurrent` or
+`List.concurrent_with_timeout`; side-effecting or channel-producing users use
+`for ... concurrently`.
 
 Stop condition: ordinary non-resource concurrent loops work end to end without
 resource or TCP special cases.
@@ -1714,10 +1752,10 @@ Tests:
 - `seal` is one-way.
 - Channel memory cleanup is separate from sealing.
 
-Implementation status: `seal` is available and `close` remains a compatibility
-alias. Channel docs and concurrency tests now use sealed/unsealed wording for
-producer completion, with targeted compatibility tests left for `close`. Timed
-channel waits remove their waiters on timeout, and non-blocking `try_send` /
+Implementation status: `seal` is the only channel completion operation.
+Channel docs and concurrency tests now use sealed/unsealed wording for producer
+completion. Timed channel waits remove their waiters on timeout, and
+non-blocking `try_send` /
 `try_recv` now wake opposite-side fiber waiters when they make buffer progress,
 matching blocking send/recv behavior. Runtime tests cover `seal` waking blocked
 receivers and senders, draining buffered values before `None`, and one-way
@@ -1765,8 +1803,10 @@ across full-channel, sealed-channel, and cancelled blocked-send outcomes for
 blocking, nonblocking, and timed send APIs. Managed receive paths also have
 strict leak-check coverage for `recv`, `try_recv`, `recv_timeout`, `wait_recv`,
 and typed receive attempts, including sealed-buffered values. The primary
-source-level `seal(ch)` operation
-now lowers through the seal-named `blorp_channel_seal` runtime entry point.
+source-level `seal(ch)` operation lowers through the seal-named
+`blorp_channel_seal` runtime entry point, and the old channel `close` spelling
+has been removed so resource cleanup and channel producer completion do not
+share a misleading name.
 Ordinary channels cannot carry resources: typecheck coverage now rejects
 resource-containing channel aliases, function parameters, return types, and
 local bindings while still allowing direct aliases to resource handle types.
@@ -1782,8 +1822,7 @@ sealed-state check, because that would create a racy source contract before
 runtime receive-status constants instead of raw numeric tags, keeping the
 runtime/codegen ABI easier to audit as more waitable operations are added.
 
-Migration impact: channel producer code should switch from `close` wording to
-`seal` wording.
+Migration impact: channel producer code uses `seal` wording.
 
 Stop condition: examples can express backpressure and completion without hidden
 failure modes, and channel runtime primitives cannot be added without explicit
@@ -1849,10 +1888,9 @@ Tests:
 - Nested deadlines choose the earlier deadline.
 - Cleanup cannot be interrupted by ordinary cancellation once started.
 
-Implementation status: existing compatibility timeout forms,
-`concurrent(timeout: N):`, legacy `concurrent(timeout: N) for`, and
-`for ... concurrently(limit: N, timeout: M)` now compute their block/loop
-deadline through shared runtime helpers. These forms now accept either raw
+Implementation status: `concurrent(timeout: N):` and
+`for ... concurrently(limit: N, timeout: M)` compute their block/loop deadline
+through shared runtime helpers. These forms accept either raw
 `Int` milliseconds or typed `Duration` values from `std/units.brp`. `Duration`
 is currently represented as microseconds with add/subtract/order operations,
 and Core lowering normalizes it to integer milliseconds before the existing
@@ -1931,9 +1969,20 @@ and the typechecker rejects embedding it in ordinary records/unions, type
 aliases that hide it inside ordinary carriers, annotated local bindings such as
 `Option[ResourceSource[...]]`, ordinary carrier type ascriptions such as
 `None as Option[ResourceSource[...]]`, ordinary user function
-parameters/returns, and globals. That does not implement iteration yet; it
-makes the ownership category explicit so future TCP/database sources do not
-start as stringly named `Stream` variants.
+parameters/returns, and globals. `std/net/tcp.connections_stop_on_error` and
+`std/net/tcp.connections_continue_on_error` now provide the first real producers
+as ARC-owned source wrappers that borrow their scoped listener and have type
+`ResourceSource[TcpStream, TcpError]`; tests cover direct binding, source
+escape, mutable direct source locals, copies from existing source bindings,
+discarded direct source values, source values as concurrent task results,
+closure/detached/concurrent capture, attempted sequential/concurrent iteration
+diagnostics, generated C for the source wrappers, and sequential TCP
+resource-source iteration cleanup. Sequential `for` over `ResourceSource`
+transfers each produced resource into a scoped loop body and reuses
+`CResourceScope` cleanup, including cleanup before `break`/`continue` and
+task-local cancellation cleanup while the body is parked. Concurrent
+resource-source fan-out is still open because each accepted resource needs an
+explicit move-into-task representation.
 
 Work:
 
@@ -1941,20 +1990,24 @@ Work:
 - Reject collection and storage of resource sources in ordinary aggregates.
   Landed for record/union declarations, type aliases, annotated ordinary local
   bindings, ordinary carrier type ascriptions, function boundaries, globals,
-  list/dict/set/tuple literals, closures, detached tasks, and concurrent task
-  captures. Producer-backed integration tests still need the first real
-  resource-source producer.
-- Support sequential `for` over resource sources.
+  list/dict/set/tuple literals, mutable direct source locals, direct source
+  copies, discarded direct source values, closures, detached tasks, and
+  concurrent task captures.
+  Producer-backed tests now cover TCP listener connection sources.
+- Support sequential `for` over resource sources. Landed for TCP connection
+  sources.
 - Support concurrent `for ... concurrently` over resource sources by moving
   each resource item into the child task.
-- Represent source-error policy explicitly.
+- Represent source-error policy explicitly. The producer API is explicit today;
+  the current runtime still ends TCP connection sources on accept errors while
+  typed transient-error handling is finished.
 
 Open ergonomic choice for source errors:
 
 Policy argument:
 
 ```blorp
-for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
+for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 	handle_connection(conn)
 ```
 
@@ -2048,6 +2101,10 @@ runtime waiter multiplexing:
 - Runtime `blorp_select_wait` parks the current fiber on all channel arms plus
   the earliest timer arm, unregisters losing waiters before returning, and
   rotates scan order across calls for basic fairness.
+- In non-fiber contexts such as top-level test/main execution,
+  `blorp_select_wait` registers condition-variable waiters on channel arms
+  instead of retry polling. Timer-only non-fiber selects sleep until the next
+  deadline.
 - `sealed ch:` becomes ready when the channel is sealed and drained, matching
   the point where `recv(ch)` returns `None`.
 
@@ -2059,12 +2116,14 @@ Completed hardening from implementation review:
 - Generated receive-branch code must register selected managed values with the
   task cancellation cleanup stack before running the branch body. Otherwise a
   cancellation point inside the branch can skip the normal post-body release.
+- Deterministic cancellation coverage now exercises both sides of `select`
+  cleanup: a task cancelled while parked inside `blorp_select_wait`, and a task
+  cancelled after a managed value has been selected but before the branch body
+  finishes. This keeps waiter removal and selected-value cleanup independent of
+  timer races.
 
-Remaining select hardening:
-
-- Non-fiber `select` currently falls back to a short sleep-and-retry loop. Keep
-  this explicit in the roadmap until `main` and other non-fiber contexts either
-  run through the fiber scheduler or have a true condition-variable wait path.
+Remaining select hardening: resource-producing `select` is still deferred until
+resource ownership in selected branches is explicit in typed AST and Core.
 
 Tests:
 
@@ -2075,16 +2134,21 @@ Tests:
 - `sealed ch:` behaves consistently with `recv(ch) -> None`.
 - Buffered values drain before `sealed ch:` can run.
 - Integer and `Duration` timer arms share the same runtime wait path.
+- Non-fiber select on a channel without a timer wakes promptly when a detached
+  sender produces a value.
 - A select waiter blocked on `sealed ch:` wakes promptly when another consumer
   drains the final buffered value from a sealed channel.
-- Leak-check coverage cancels a task after it receives a managed value through
-  `select` and before the selected branch can finish.
+- Leak-check coverage cancels a task while it is parked in `select`, and also
+  after it receives a managed value through `select` before the selected branch
+  can finish.
 
 Migration impact: event loops can choose `select`; ordinary event-channel loops
 remain valid and recommended by default.
 
-Stop condition: channel/timer select is solid before accepting resources from
-select branches.
+Stop condition: ordinary channel/timer `select` has reached the intended
+checkpoint. Resource-producing select remains a separate phase and should not
+start until selected-branch resource ownership is explicit in typed AST and
+Core.
 
 ### Phase 11: Resource-Producing `select`
 
@@ -2102,7 +2166,7 @@ Sketch:
 
 ```blorp
 select:
-	conn from listener.connections():
+	conn from listener.connections_continue_on_error():
 		handle_connection(conn)
 
 	sealed shutdown:
@@ -2127,12 +2191,8 @@ AST/Core.
 Goal: add guardrails around current TCP handle behavior before changing TCP into
 a resource API.
 
-This is deliberately not the full TCP resource migration. The current
-`TcpListener` and `TcpStream` API is still typed ARC handle based, and existing
-code can still pass handles into ordinary functions and detached work. The point
-of this slice is to make the known risky states visible in tests and docs so the
-resource migration starts from a measured baseline rather than a remembered
-failure.
+This phase is complete. It established the measured baseline that made the first
+TCP resource migration safe rather than relying on the remembered detach crash.
 
 Work:
 
@@ -2148,16 +2208,8 @@ Work:
 - Document any remaining unsoundness that cannot be rejected until TCP is
   represented as a resource in typed AST/Core.
 
-Current implementation facts:
+Implementation facts from this baseline:
 
-- `std/net/tcp.brp` exposes opaque builtin `TcpListener` and `TcpStream`
-  handles. The original handle operations still use `Result[..., String]` for
-  compatibility, while `TcpError`, `listen_checked`, `accept_checked`,
-  `connect_checked`, `local_port_checked`, `set_timeout_checked`,
-  `set_reuse_addr_checked`, `read_chunk`, and `write_all` now provide typed
-  bridge APIs on top of those handles. The bridge reports wrapper-owned
-  precondition failures as `InvalidInput` and keeps runtime-originated string
-  failures as `Other` until the runtime exposes structured TCP error classes.
 - Core ownership metadata treats `listen`, `accept`, `connect`, `read`,
   `local_port`, `set_timeout`, and `set_reuse_addr` results as owned values;
   close/write/read inputs are borrowed at the call boundary.
@@ -2221,27 +2273,46 @@ Migration impact: current users get a safer compatibility baseline while the
 language gains enough test evidence to make the later resource migration a
 semantic cleanup rather than a bug hunt.
 
-Stop condition: current typed TCP handles have focused regression coverage and
-the remaining unsafe states are documented as resource-migration blockers.
+Stop condition: focused TCP regression coverage exists, and the remaining
+multi-waiter/read-write role questions are documented as resource-level design
+blockers instead of hidden runtime accidents.
 
 ### Phase 12: TCP Resource Migration
 
-Goal: migrate TCP only after resource sources, cancellation, and ordinary
-select are ready.
+Goal: finish the TCP migration now that the first scoped-resource slice has
+landed.
 
-Work:
+Landed:
 
-- Define TCP listener and stream as resources:
+- TCP listener and stream are resources:
 
 ```blorp
 resource type TcpListener = builtin("blorp_tcp_close_listener")
 resource type TcpStream = builtin("blorp_tcp_close_stream")
 ```
 
-- Promote the existing `TcpError` surface to the full resource API, including
-  `listen`, `accept`, and `connect` returning typed errors instead of legacy
-  strings.
-- Provide `connections(listener) -> ResourceSource[TcpStream, TcpError]`.
+- `listen`, `accept`, `connect`, `read`, `read_chunk`, `write`, `write_all`,
+  `local_port`, `stream_local_port`, `set_timeout`, `set_stream_timeout`, and
+  `set_reuse_addr` return `TcpError`.
+- Manual TCP `close` is private; `with` owns cleanup.
+- TCP resource finalizers consume the scoped handle: they close/wake the
+  underlying socket state and release the ARC wrapper. Leak-check coverage now
+  catches close-only finalizers that leave the resource object allocated.
+- Compiler tests reject ordinary TCP resource params/returns, matching
+  acquisition results outside `with`, manual close imports, detached resource
+  capture, and concurrent resource capture.
+- Runtime tests cover loopback round trips, typed invalid-input errors,
+  detached clients that acquire their own streams, and TCP virtual-thread
+  parking.
+- Module-qualified TCP resource operations preserve the same metadata as
+  selectively imported operations.
+
+Remaining work:
+
+- Implement concurrent resource-source iteration for
+  `connections_continue_on_error(listener)` and
+  `connections_stop_on_error(listener)`.
+- Finish typed transient-error handling for `connections_continue_on_error`.
 - Keep DNS limitations explicit.
 - Add `split(stream)` only if reader/writer resources can be represented as
   distinct ownership roles.
@@ -2251,7 +2322,7 @@ Migration sketch:
 ```blorp
 func serve() -> Result[Void, TcpError]:
 	with listener ?= tcp.listen("", 8080, 1024):
-		for conn in listener.connections(on_error: Continue) concurrently(limit: 4096):
+		for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 			handle_connection(conn)
 
 	Ok(Void)
@@ -2267,11 +2338,13 @@ Tests:
 - Socket waits park virtual tasks rather than pinning OS workers.
 - Hostname resolution docs match runtime behavior.
 
-Migration impact: old typed ARC TCP handles should either keep working through
-a compatibility layer or produce diagnostics pointing to `with` and
-resource-source iteration.
+Migration impact: old typed ARC TCP handle patterns now produce resource
+diagnostics. This is acceptable before external use, but optional packages and
+benchmarks still need migration to scoped ownership or resource-source
+iteration.
 
-Stop condition: TCP examples are resource-safe without special cases in codegen.
+Stop condition: TCP examples, benchmarks, and optional networking packages are
+resource-safe without TCP-specific codegen exceptions.
 
 Migration staging note: do not start this phase by simply changing the existing
 `TcpListener` and `TcpStream` declarations to `resource type`. The current
@@ -2332,7 +2405,8 @@ Work:
 - Reject resource capture in detached work.
 - Document detached work as process-lifetime background work.
 - Remove old `concurrent for` parser branches.
-- Remove the channel `close` alias.
+- Keep channel producer completion on `seal`; do not reintroduce a channel
+  `close` alias that can be confused with resource cleanup.
 - Update guide, grammar, examples, benchmarks, and doctests.
 
 Tests:
@@ -2362,51 +2436,51 @@ services                       intentionally shared external systems
 The branch is ready to continue, but the next changes should stay narrow. The
 high-leverage sequence is:
 
-1. Continue migrating ordinary expression-position concurrent fan-out toward
-   `List.concurrent(limit, func)` or
-   `List.concurrent_with_timeout(limit, Duration, func)`. Benchmarks and
-   general runtime tests have moved; focused compatibility, parser, and
-   codegen tests still intentionally cover old expression syntax. TCP
-   benchmarks still contain legacy spelling and should move with the
-   TCP/resource design rather than as part of ordinary concurrency cleanup.
-   Add diagnostics only after examples and docs have moved.
-2. Keep non-syntax Duration APIs as explicit helper names for this workstream
+1. Keep non-syntax Duration APIs as explicit helper names for this workstream
    (`sleep_for`, `recv_timeout_for`, `send_timeout_for`, etc.). Same-name
    source overloads such as `sleep(Duration)` should be a separate
    language/typechecker design because current typechecking rejects same-name
    impure overloads within one module.
-3. Keep ordinary channel/timer `select` in a hardening phase. The parser,
-   typed AST, Core node, C emitter, runtime wait primitive, formatter, GUIDE,
-   grammar, runtime tests, compiler tests, and generated-C audit coverage now
-   exist. Do not start resource-producing `select` until resource ownership in
-   branches is explicit in typed AST/Core. The remaining ordinary-select design
-   decision is whether non-fiber `select` keeps its polling fallback or gains a
-   true blocking wait path.
-4. Extend operation-history recording toward linearizability-style channel
-   stress tests. The current property tests now record a small MPMC history and
-   cover invariants and small bounded models, but they do not yet prove that
-   arbitrary MPMC histories have a valid serialization.
-5. Continue the TCP-adjacent readiness slice without starting the full resource
-   migration. Current guardrails cover a structured accept loop, the legacy
-   accepted-stream `detach` shape, and explicit `already in progress` errors for
-   overlapping parked waits. `TcpError`, `listen_checked`, `accept_checked`,
-   `connect_checked`, `local_port_checked`, `set_timeout_checked`,
-   `set_reuse_addr_checked`, `read_chunk`, and `write_all` have landed as typed
-   compatibility adapters. They type wrapper-owned precondition failures as
-   `InvalidInput` and preserve runtime-originated failures as `Other`; the
-   simple `listen`/`accept`/`connect` names still use legacy string errors until
-   the resource migration. The current one-waiter-per-operation TCP runtime
-   limitation is now a documented compatibility limit rather than an accidental
-   state: future work should revisit it only as part of the resource-level
-   ownership model, not as a standalone waiter-list refactor. The runtime now
-   names both write ownership and waiter-install outcomes, so future work can
-   reason about policy instead of first untangling magic states.
-   The latest migration audit shows that a direct `type` to `resource type`
-   flip would be too broad: current TCP tests, benchmarks, and packages pass
-   handles through ordinary helpers, store streams in ordinary aggregates, and
-   use detached accepted-stream handlers. Keep this as a staged migration:
-   define resource-source ownership first, migrate those call sites to scoped
-   connection ownership, then promote TCP handles to resources.
+2. Extend operation-history recording toward linearizability-style channel
+   stress tests. The current property tests now record a small MPMC history,
+   cover producer-local ordering in a capacity-1 MPSC run, and replay typed
+   nonblocking capacity-1 histories against a bounded FIFO model, but they do
+   not yet prove that arbitrary overlapping MPMC histories have a valid
+   serialization.
+3. Extend deterministic cancellation harness coverage for parked operations.
+   The first narrow test hook has landed, and channel send/receive,
+   structured-join, dynamic fan-out, ordinary `select`, timer sleep, and TCP
+   `accept`/`read` leak baselines now use it. TCP write has generated-C audit
+   coverage for the owned `Bytes` cleanup frame borrowed by the write call, but
+   a portable parked-write runtime leak baseline remains open because socket
+   buffer autotuning can let large local writes complete before the harness
+   observes a park. Next, cover TCP connect and write reactor waits with the same
+   "observe parked, then cancel/join" shape if that can be made portable,
+   without exposing a general user-facing task API.
+4. Extend cancellation-point metadata to future blocking-worker waits.
+   The `Cancellation_point` capability has landed for unambiguous global names
+   such as `send`, `recv`, `sleep`, and `yield_now`, and for runtime TCP
+   reactor builtins such as `blorp_tcp_accept_raw`, `blorp_tcp_read_raw`, and
+   `blorp_tcp_write_raw`. The metadata deliberately does not mark unrelated
+   bare names such as `read` and `write`. Future blocking-worker waits should
+   use this metadata for compiler audits and generated-C cleanup tests instead
+   of adding ad hoc name sets.
+5. Continue TCP resource migration by defining resource-source iteration.
+   Listener and stream handles are now `resource type`s, simple TCP APIs return
+   `TcpError`, manual close is private, resource capture/ordinary parameter
+   escapes are rejected, and the explicit-policy TCP connection-source
+   constructors provide the first `ResourceSource[TcpStream, TcpError]`
+   producer shape. Sequential `for` over TCP connection sources now transfers
+   each accepted stream into a scoped loop body with normal and cancellation
+   cleanup. Concurrent fan-out and typed transient-error continuation remain
+   open. The current
+   one-waiter-per-operation TCP runtime limitation remains a documented policy
+   boundary: future work should revisit it only as part of the resource-level
+   ownership model, not as a standalone waiter-list refactor. Next, define how
+   concurrent resource-source loops transfer each accepted stream into a child
+   task, how cancellation closes a stream owned by a cancelled child task, and
+   how benchmarks/packages migrate away from ordinary aggregate storage of TCP
+   handles.
 
 Each slice should add a failing parser/typecheck/runtime or codegen-audit test
 first, and should update this queue if implementation reveals a simpler or
@@ -2439,7 +2513,7 @@ safer order.
 
 ## Release Gates
 
-Before removing legacy concurrency paths, run:
+Before merging a concurrency cleanup checkpoint, run:
 
 - parser, infer, typecheck, formatter, codegen-audit, runtime, doctest, and
   leak-check suites;

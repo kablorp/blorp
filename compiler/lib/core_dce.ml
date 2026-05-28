@@ -736,7 +736,7 @@ let scan_expr (state : reachability) (expr : core) : unit =
           (fun binding -> mark_task state binding.cb_task)
           block.conc_bindings;
         visit_children ()
-    | CConcurrentFor cf ->
+    | CConcurrentlyLoop cf ->
         mark_task state cf.cf_task;
         visit_children ()
     | CDetach detach ->
