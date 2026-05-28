@@ -60,9 +60,14 @@ Blorp focuses on:
 ## Local Development
 
 ```bash
+git clone https://github.com/kablorp/blorp.git
+cd blorp
 make
 scripts/test
 ```
+
+Local builds write the compiler executable to `./blorp` in the repository root.
+Use that binary for development commands instead of an installed dev release.
 
 The main test runner is quiet by default and prints a gate summary plus failure
 details. Use `scripts/test --verbose` for pass-by-pass output, or

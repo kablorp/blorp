@@ -2255,15 +2255,31 @@ let is_doctest_result r = String.ends_with ~suffix:" (doctests)" r.file
 (** Print test result summary *)
 let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
     failed results =
-  let suite_tests = ref 0 in
-  let doc_tests = ref 0 in
+  let suite_passed = ref 0 in
+  let suite_failed = ref 0 in
+  let doc_passed = ref 0 in
+  let doc_failed = ref 0 in
   List.iter
     (fun r ->
       let p, f = count_individual_tests r.output in
-      if is_doctest_result r then doc_tests := !doc_tests + p + f
-      else suite_tests := !suite_tests + p + f)
+      if is_doctest_result r then begin
+        doc_passed := !doc_passed + p;
+        doc_failed := !doc_failed + f
+      end
+      else begin
+        suite_passed := !suite_passed + p;
+        suite_failed := !suite_failed + f
+      end)
     results;
-  let total_individual = !suite_tests + !doc_tests in
+  let suite_tests = !suite_passed + !suite_failed in
+  let doc_tests = !doc_passed + !doc_failed in
+  let total_individual = suite_tests + doc_tests in
+  let result_passed =
+    if total_individual > 0 then !suite_passed + !doc_passed else passed
+  in
+  let result_failed =
+    if total_individual > 0 then !suite_failed + !doc_failed else failed
+  in
   let time_str =
     if profile then
       if num_workers > 0 then
@@ -2271,12 +2287,12 @@ let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
       else Printf.sprintf " (total: %.3fs)" elapsed
     else ""
   in
-  if !doc_tests > 0 then
+  if doc_tests > 0 then
     Printf.printf "\nResults: %d passed, %d failed (%d tests, %d doctests)%s\n"
-      passed failed !suite_tests !doc_tests time_str
+      result_passed result_failed suite_tests doc_tests time_str
   else if total_individual > 0 then
-    Printf.printf "\nResults: %d passed, %d failed (%d tests)%s\n" passed failed
-      total_individual time_str
+    Printf.printf "\nResults: %d passed, %d failed (%d tests)%s\n" result_passed
+      result_failed total_individual time_str
   else
     Printf.printf "\nResults: %d passed, %d failed%s\n" passed failed time_str;
   match Sys.getenv_opt "BLORP_GATE_RESULT" with
@@ -2287,7 +2303,7 @@ let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
       in
       Printf.printf
         "BLORP_GATE_RESULT gate=%s status=%s passed=%d failed=%d tests=%d\n"
-        gate status passed failed tests
+        gate status result_passed result_failed tests
   | _ -> ()
 
 (* ============================================================================
