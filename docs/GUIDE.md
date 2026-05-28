@@ -371,7 +371,7 @@ func ufcs_examples() -> List[String]:
     person: Person = { name = "Alice" }
     person_name: String = person.name
     pair: (Int, String) = (1, "one")
-    first: Int = pair.0
+    first: Int = pair[0]
     result
 ```
 
@@ -391,7 +391,7 @@ func demo_heap() -> Int:
     h = h.push(42)          -- UFCS: push(h, 42) from std/heap
     h = h.push(10)
     match h.pop():          -- UFCS: pop(h) from std/heap
-        Some(pair): print(to_string(pair.0))  -- prints 10 (min)
+        Some(pair): print(to_string(pair[0]))  -- prints 10 (min)
         None: void
     0
 ```
@@ -503,9 +503,9 @@ func tuple_examples() -> Int:
     pair: (Int, String) = (42, "answer")
     triple: (Bool, Int, Float) = (True, 1, 3.14)
 
-    -- Access via dot notation (0-indexed)
-    first: Int = pair.0
-    second: String = pair.1
+    -- Access by compile-time index (0-indexed)
+    first: Int = pair[0]
+    second: String = pair[1]
 
     -- Destructuring
     (a, b) = pair
@@ -1124,7 +1124,7 @@ func identity_named[Elem2](x: Elem2) -> Elem2:
 	x
 
 func swap[A, B](pair: (A, B)) -> (B, A):
-	(pair.1, pair.0)
+	(pair[1], pair[0])
 
 -- Numeric type parameters (compile-time integers, prefixed with #)
 func add_vectors[#N](a: Float[#N], b: Float[#N]) -> Float[#N]:
@@ -2762,8 +2762,8 @@ import:
 func show_git_version() -> Int:
     match P.run("git", ["--version"]):
         Ok(out):
-            print(out.0)
-            out.2
+            print(out[0])
+            out[2]
         Err(msg):
             print(msg)
             1

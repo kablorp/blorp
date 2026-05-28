@@ -28,7 +28,8 @@
     v}
 
     - [EVarDecl] creates a [CLet] scoping over the rest of the block.
-    - [ETupleDestruct] desugars inline to: [let __dt = e in let a = __dt.0 in let b = __dt.1 in rest].
+    - [ETupleDestruct] desugars inline to Core field reads:
+      [let __dt = e in let a = CField(__dt, "0") in let b = CField(__dt, "1") in rest].
     - Any other expression becomes the [CSeq] head. The final block element
       is the block's result.
 
@@ -1902,8 +1903,8 @@ and lower_tuple_destruct_with_body ~loc names (value : TA.expr) body =
 (** Desugar [(a, b, ...) = value] inside a block:
     {v
     let __dt_N: T = value in
-    let a: T1 = __dt_N.0 in
-    let b: T2 = __dt_N.1 in
+    let a: T1 = CField(__dt_N, "0") in
+    let b: T2 = CField(__dt_N, "1") in
     ... rest
     v} *)
 and lower_tuple_destruct ~loc ~ty names (value : TA.expr) (rest : TA.expr list)

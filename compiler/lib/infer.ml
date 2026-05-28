@@ -7305,44 +7305,76 @@ and infer_checked_get ctx expr args loc =
   match args with
   | [ coll_arg; idx_arg ] -> (
       let* coll_ty, coll' = infer_unconstrained_value_expr ctx coll_arg in
-      match Types.array_parts coll_ty with
-      | Some (elem_ty, dims) when dims <> [] ->
-          let first_dim = List.hd dims in
-          let remaining = List.tl dims in
-          let result_ty =
-            match remaining with
-            | [] -> elem_ty
-            | rest -> Types.ty_array elem_ty rest
+      match coll_ty with
+      | TyTuple elems | TyNamed ("Tuple", elems) -> (
+          let tuple_arity = List.length elems in
+          let idx_result =
+            match idx_arg.expr_desc with
+            | ELiteral (LitInt n) -> Some n
+            | EUnary (Neg, { expr_desc = ELiteral (LitInt n); _ }) ->
+                Some (Int64.neg n)
+            | _ -> None
           in
-          let* validated_idx = validate_index ctx loc idx_arg first_dim coll' in
-          (* Distinct callee name when the result is a peeled sub-tensor
+          match idx_result with
+          | None ->
+              error idx_arg.expr_loc
+                "Tuple index must be a compile-time integer literal"
+          | Some idx
+            when Int64.compare idx 0L < 0
+                 || Int64.compare idx (Int64.of_int tuple_arity) >= 0 ->
+              error idx_arg.expr_loc
+                (Printf.sprintf
+                   "Tuple index %Ld out of bounds for tuple of arity %d" idx
+                   tuple_arity)
+          | Some idx ->
+              let idx_int = Int64.to_int idx in
+              let elem_ty = List.nth elems idx_int in
+              Ok
+                ( elem_ty,
+                  with_inferred_desc expr
+                    (EFieldAccess (coll', string_of_int idx_int))
+                    elem_ty ))
+      | _ -> (
+          match Types.array_parts coll_ty with
+          | Some (elem_ty, dims) when dims <> [] ->
+              let first_dim = List.hd dims in
+              let remaining = List.tl dims in
+              let result_ty =
+                match remaining with
+                | [] -> elem_ty
+                | rest -> Types.ty_array elem_ty rest
+              in
+              let* validated_idx =
+                validate_index ctx loc idx_arg first_dim coll'
+              in
+              (* Distinct callee name when the result is a peeled sub-tensor
               (remaining dims are non-empty). 1D case (remaining = [])
               still uses [checked_get] for direct scalar loads. *)
-          let callee_name =
-            if remaining = [] then "checked_get" else "tensor_peel"
-          in
-          let callee_expr =
-            inferred_ident_expr expr callee_name
-              (ty_func [ coll_ty; ty_int ] result_ty ~pure:true)
-          in
-          Ok
-            ( result_ty,
-              inferred_call_expr expr callee_expr [ coll'; validated_idx ]
-                result_ty )
-      | _ -> (
-          match coll_ty with
-          | TyNamed ("List", _) ->
-              error loc
-                "checked_get is not supported on List. Use get(list, index) \
-                 for bounds-checked access"
-          | TyNamed ("String", _) ->
-              error loc
-                "checked_get is not supported on String. Use get(str, index) \
-                 for bounds-checked access"
-          | _ ->
-              error loc
-                (Printf.sprintf "checked_get requires an array type, got %s"
-                   (type_to_string coll_ty))))
+              let callee_name =
+                if remaining = [] then "checked_get" else "tensor_peel"
+              in
+              let callee_expr =
+                inferred_ident_expr expr callee_name
+                  (ty_func [ coll_ty; ty_int ] result_ty ~pure:true)
+              in
+              Ok
+                ( result_ty,
+                  inferred_call_expr expr callee_expr [ coll'; validated_idx ]
+                    result_ty )
+          | _ -> (
+              match coll_ty with
+              | TyNamed ("List", _) ->
+                  error loc
+                    "checked_get is not supported on List. Use get(list, \
+                     index) for bounds-checked access"
+              | TyNamed ("String", _) ->
+                  error loc
+                    "checked_get is not supported on String. Use get(str, \
+                     index) for bounds-checked access"
+              | _ ->
+                  error loc
+                    (Printf.sprintf "checked_get requires an array type, got %s"
+                       (type_to_string coll_ty)))))
   | _ -> error loc "checked_get takes exactly 2 arguments: (tensor, index: Int)"
 
 (* checked_set: 1D element write with COW *)
@@ -8369,7 +8401,7 @@ and infer_call ctx expr callee args loc =
                               [infer_lambda] upgrades them to pure when the
                               call-site expects pure; resolving them too early
                               forces impure and breaks stdlib call sites like
-                              [entries(self).sort_by(func(p): p.0)] where the
+                              [entries(self).sort_by(func(p): p[0])] where the
                               lambda would upgrade. If any arg is a flexible
                               lambda OR any arg fails standalone inference,
                               fall back to the caller-context preference
@@ -10650,14 +10682,14 @@ and infer_field_access ctx expr obj field loc =
                   error loc
                     (Printf.sprintf
                        "Cannot access field on type %s. Field access is \
-                        supported on record fields and tuple indices (e.g., \
-                        .0, .1)"
+                        supported on record fields. Use tuple[index] for tuple \
+                        elements"
                        (type_to_string obj_ty))))
       | _ ->
           error loc
             (Printf.sprintf
                "Cannot access field on type %s. Field access is supported on \
-                record fields and tuple indices (e.g., .0, .1)"
+                record fields. Use tuple[index] for tuple elements"
                (type_to_string obj_ty)))
 
 (** Infer the type of a lambda expression *)

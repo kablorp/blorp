@@ -27,7 +27,7 @@ lower       non-terminal
 Blorp uses indentation-sensitive lexing. The lexer emits `INDENT` and `DEDENT` tokens
 based on indentation changes. `NEWLINE` tokens separate statements.
 Inside balanced delimiters (`()`, `[]`, `{}`), newlines are ignored.
-For method chains, a more-indented line that starts with `.identifier` or `.0`
+For method chains, a more-indented line that starts with `.identifier`
 continues the previous expression instead of starting an indented block.
 
 ### Keywords
@@ -364,7 +364,6 @@ unary_expr = "-" unary_expr
            | postfix_expr ;
 
 postfix_expr = postfix_expr "." identifier                  (* field access *)
-             | postfix_expr "." INT                         (* tuple index *)
              | postfix_expr "(" [ expr_list ] ")"           (* function call *)
              | postfix_expr "[" expr_list "]"               (* subscript *)
              | primary_expr ;

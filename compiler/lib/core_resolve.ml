@@ -544,7 +544,7 @@ let resolve_call_kind ?(module_path = "") ?(bound = Bound_names.empty)
                         | Ast.TyFunc _ -> CKClosure
                         | _ -> CKUnknown))
                 | None -> (
-                    (* Not a module alias — e.g. tuple field `test_pair.1`.
+                    (* Not a module alias — e.g. tuple field access lowered from `test_pair[1]`.
                        Fall back to closure dispatch on the callee's function
                        type. *)
                     match callee.ty with

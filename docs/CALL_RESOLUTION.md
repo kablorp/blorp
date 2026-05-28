@@ -204,8 +204,10 @@ This also parses as `ECall(EFieldAccess(xs, "map"), args)`.
 
 The current priority is:
 
-1. Try ordinary field access first. This lets tuple fields, record fields, and
-   function-valued fields keep their meaning.
+1. Try ordinary field access first. This lets record fields and
+   function-valued fields keep their meaning. Tuple element access uses
+   compile-time subscript syntax (`tuple[0]`) and lowers to the same internal
+   tuple-field representation after inference.
 2. If field access fails and the receiver is a value, rewrite method syntax into
    a function call shape by prepending the receiver:
 
@@ -554,7 +556,7 @@ Work:
   - selective import bare call
   - qualified module call
   - module-qualified impl method call
-  - record field call and tuple field access
+  - record field call and tuple index access
   - normal UFCS through an explicitly imported function
   - method-only UFCS from a type import
   - method-only UFCS from prelude registration

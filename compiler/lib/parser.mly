@@ -1169,7 +1169,6 @@ unary_expr:
 
 postfix_expr:
   | e = postfix_expr DOT name = identifier { make_expr_at $symbolstartpos (EFieldAccess (e, name)) }
-  | e = postfix_expr DOT n = INT { make_expr_at $symbolstartpos (EFieldAccess (e, Int64.to_string n)) }
   | callee = postfix_expr LPAREN args = trailing_list(COMMA, expr) RPAREN
     { make_expr_span $symbolstartpos $endpos (ECall (callee, args)) }
   | coll = postfix_expr LBRACKET idx_list = trailing_nonempty_list(COMMA, expr) RBRACKET

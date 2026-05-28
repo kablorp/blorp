@@ -49,8 +49,9 @@ Constraints to preserve while removing ad-hoc code:
 
 - Keep the documented source-level resolution order stable: local values,
   functions, constructors, then trait-method names for bare identifiers.
-- Keep field access ahead of UFCS. Tuple fields, record fields, and
-  function-valued fields must continue to win over method syntax.
+- Keep field access ahead of UFCS. Record fields and function-valued fields must
+  continue to win over method syntax. Tuple element access uses compile-time
+  subscript syntax and lowers to internal tuple fields after inference.
 - Keep method-only UFCS candidates method-only. Type imports and prelude type
   registration enable `value.method(...)`; they do not make `method(...)`
   available as a bare call.
