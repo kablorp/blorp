@@ -2285,8 +2285,8 @@ let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
       let tests =
         if total_individual > 0 then total_individual else passed + failed
       in
-      Printf.printf "BLORP_GATE_RESULT gate=%s status=%s passed=%d failed=%d \
-                     tests=%d\n"
+      Printf.printf
+        "BLORP_GATE_RESULT gate=%s status=%s passed=%d failed=%d tests=%d\n"
         gate status passed failed tests
   | _ -> ()
 

@@ -2638,6 +2638,33 @@ static void blorp_tcp_inner_release(blorp_TcpInner* inner) {
     free(inner);
 }
 
+static void blorp_tcp_inner_cleanup_release(void* value) {
+    blorp_tcp_inner_release((blorp_TcpInner*)value);
+}
+
+static void blorp_tcp_inner_operation_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_TcpInner** slot,
+    blorp_TcpInner* inner
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)slot;
+    (void)inner;
+#else
+    __blorp_task_cleanup_push_slow(
+        frame, slot, inner, blorp_tcp_inner_cleanup_release);
+#endif
+}
+
+static void blorp_tcp_inner_operation_cleanup_pop(blorp_TcpInner** slot) {
+#if defined(__clang_analyzer__)
+    (void)slot;
+#else
+    __blorp_task_cleanup_pop_slot_slow(slot);
+#endif
+}
+
 static long blorp_tcp_inner_fd(blorp_TcpInner* inner) {
     if (!inner) return -1;
     pthread_mutex_lock(&inner->mutex);
@@ -6449,8 +6476,8 @@ static blorp_String* blorp_unicode_case_map(const blorp_String* s, bool upper) {
             out_len = blorp_checked_add(out_len, (size_t)spans[i].length);
             continue;
         }
-        int32_t mapped[3];
-        uint8_t mapped_len;
+        int32_t mapped[3] = {0, 0, 0};
+        uint8_t mapped_len = 0;
         blorp_case_mapping_for_span(spans, count, i, upper, mapped, &mapped_len);
         for (uint8_t j = 0; j < mapped_len; j++) {
             unsigned char tmp[4];
@@ -6470,8 +6497,8 @@ static blorp_String* blorp_unicode_case_map(const blorp_String* s, bool upper) {
             write += (size_t)spans[i].length;
             continue;
         }
-        int32_t mapped[3];
-        uint8_t mapped_len;
+        int32_t mapped[3] = {0, 0, 0};
+        uint8_t mapped_len = 0;
         blorp_case_mapping_for_span(spans, count, i, upper, mapped, &mapped_len);
         for (uint8_t j = 0; j < mapped_len; j++) {
             unsigned char encoded[4];
@@ -11416,14 +11443,22 @@ blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog) {
 
 blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener) {
     blorp_TcpInner* inner = listener ? listener->inner : NULL;
+    if (!inner) return tcp_handle_error("tcp accept: closed listener");
+    blorp_tcp_inner_retain(inner);
+    blorp_CancelCleanupFrame inner_cleanup;
+    blorp_tcp_inner_operation_cleanup_push(&inner_cleanup, &inner, inner);
+    blorp_Result* result = NULL;
+
     while (true) {
         if (__blorp_cancel_current_task_if_requested()) {
-            return tcp_handle_error("tcp accept: cancelled");
+            result = tcp_handle_error("tcp accept: cancelled");
+            goto finish;
         }
 
         long server_fd = -1;
         if (blorp_tcp_inner_begin_op(inner, &server_fd) < 0) {
-            return tcp_handle_error("tcp accept: closed listener");
+            result = tcp_handle_error("tcp accept: closed listener");
+            goto finish;
         }
         uint64_t generation = inner->generation;
         long timeout_ms = inner->default_timeout_ms;
@@ -11434,7 +11469,8 @@ blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener) {
             (int)server_fd, (struct sockaddr*)&addr, &addr_len);
         if (client_fd >= 0) {
             blorp_tcp_inner_end_op(inner);
-            return tcp_owned_ok((void*)blorp_tcp_stream_from_open_fd(client_fd));
+            result = tcp_owned_ok((void*)blorp_tcp_stream_from_open_fd(client_fd));
+            goto finish;
         }
 
         int errnum = errno;
@@ -11449,27 +11485,39 @@ blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener) {
                     generation,
                     timeout_ms,
                     &reason) != 0) {
-                return tcp_handle_error("tcp accept: reactor unavailable");
+                result = tcp_handle_error("tcp accept: reactor unavailable");
+                goto finish;
             }
 
             switch (reason) {
                 case BLORP_IO_WAKE_READY:
                     continue;
                 case BLORP_IO_WAKE_TIMEOUT:
-                    return tcp_handle_error("tcp accept: timed out");
+                    result = tcp_handle_error("tcp accept: timed out");
+                    goto finish;
                 case BLORP_IO_WAKE_CANCELLED:
                     (void)__blorp_cancel_current_task_if_requested();
-                    return tcp_handle_error("tcp accept: cancelled");
+                    result = tcp_handle_error("tcp accept: cancelled");
+                    goto finish;
                 case BLORP_IO_WAKE_BUSY:
-                    return tcp_handle_error("tcp accept: accept already in progress");
+                    result =
+                        tcp_handle_error("tcp accept: accept already in progress");
+                    goto finish;
                 case BLORP_IO_WAKE_CLOSED:
                 case BLORP_IO_WAKE_NONE:
                 default:
-                    return tcp_handle_error("tcp accept: closed listener");
+                    result = tcp_handle_error("tcp accept: closed listener");
+                    goto finish;
             }
         }
-        return tcp_error_errno("tcp accept", errnum);
+        result = tcp_error_errno("tcp accept", errnum);
+        goto finish;
     }
+
+finish:
+    blorp_tcp_inner_operation_cleanup_pop(&inner);
+    blorp_tcp_inner_release(inner);
+    return result;
 }
 
 blorp_Result* blorp_tcp_connect(blorp_String* host, long port) {
@@ -11639,33 +11687,44 @@ blorp_Result* blorp_tcp_read(blorp_TcpStream* stream, long max_bytes) {
     if (!blorp_tcp_read_size_is_valid(max_bytes)) {
         return tcp_handle_error("tcp read: invalid max_bytes");
     }
+    if (!inner) return tcp_handle_error("tcp read: closed stream");
+    blorp_tcp_inner_retain(inner);
+    blorp_CancelCleanupFrame inner_cleanup;
+    blorp_tcp_inner_operation_cleanup_push(&inner_cleanup, &inner, inner);
+    blorp_Result* result = NULL;
+
     if (max_bytes == 0) {
         long fd = -1;
         if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
-            return tcp_handle_error("tcp read: closed stream");
+            result = tcp_handle_error("tcp read: closed stream");
+            goto finish;
         }
         blorp_tcp_inner_end_op(inner);
         blorp_Bytes* empty = blorp_bytes_new(0);
         blorp_Result* res = blorp_result_ok((void*)empty);
         res->release_mask = 1UL;
-        return res;
+        result = res;
+        goto finish;
     }
 
     while (true) {
         if (__blorp_cancel_current_task_if_requested()) {
-            return tcp_handle_error("tcp read: cancelled");
+            result = tcp_handle_error("tcp read: cancelled");
+            goto finish;
         }
 
         long fd = -1;
         if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
-            return tcp_handle_error("tcp read: closed stream");
+            result = tcp_handle_error("tcp read: closed stream");
+            goto finish;
         }
         uint64_t generation = inner->generation;
         long timeout_ms = inner->default_timeout_ms;
 
         if (blorp_io_reactor_set_nonblocking((int)fd) < 0) {
             blorp_tcp_inner_end_op(inner);
-            return tcp_error("tcp read: nonblocking");
+            result = tcp_error("tcp read: nonblocking");
+            goto finish;
         }
 
         blorp_Bytes* buf = blorp_bytes_new(max_bytes);
@@ -11675,7 +11734,8 @@ blorp_Result* blorp_tcp_read(blorp_TcpStream* stream, long max_bytes) {
             buf->len = n;
             blorp_Result* res = blorp_result_ok((void*)buf);
             res->release_mask = 1UL;
-            return res;
+            result = res;
+            goto finish;
         }
 
         int errnum = errno;
@@ -11693,27 +11753,38 @@ blorp_Result* blorp_tcp_read(blorp_TcpStream* stream, long max_bytes) {
                     generation,
                     timeout_ms,
                     &reason) != 0) {
-                return tcp_handle_error("tcp read: reactor unavailable");
+                result = tcp_handle_error("tcp read: reactor unavailable");
+                goto finish;
             }
 
             switch (reason) {
                 case BLORP_IO_WAKE_READY:
                     continue;
                 case BLORP_IO_WAKE_TIMEOUT:
-                    return tcp_handle_error("tcp read: timed out");
+                    result = tcp_handle_error("tcp read: timed out");
+                    goto finish;
                 case BLORP_IO_WAKE_CANCELLED:
                     (void)__blorp_cancel_current_task_if_requested();
-                    return tcp_handle_error("tcp read: cancelled");
+                    result = tcp_handle_error("tcp read: cancelled");
+                    goto finish;
                 case BLORP_IO_WAKE_BUSY:
-                    return tcp_handle_error("tcp read: read already in progress");
+                    result = tcp_handle_error("tcp read: read already in progress");
+                    goto finish;
                 case BLORP_IO_WAKE_CLOSED:
                 case BLORP_IO_WAKE_NONE:
                 default:
-                    return tcp_handle_error("tcp read: closed stream");
+                    result = tcp_handle_error("tcp read: closed stream");
+                    goto finish;
             }
         }
-        return tcp_error_errno("tcp read", errnum);
+        result = tcp_error_errno("tcp read", errnum);
+        goto finish;
     }
+
+finish:
+    blorp_tcp_inner_operation_cleanup_pop(&inner);
+    blorp_tcp_inner_release(inner);
+    return result;
 }
 
 blorp_Result* blorp_tcp_write(blorp_TcpStream* stream, blorp_Bytes* data) {
