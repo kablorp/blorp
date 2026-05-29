@@ -528,9 +528,6 @@ let std_body_specs =
         "fold_left" 3;
       list_spec
         ~param_shapes:[ ParamNamed "List"; AnyParam; ParamFunc ]
-        "fold" 3;
-      list_spec
-        ~param_shapes:[ ParamNamed "List"; AnyParam; ParamFunc ]
         "fold_right" 3;
       list_spec ~return_shape:(ReturnNamed "Bool")
         ~param_shapes:[ ParamNamed "List"; ParamFunc ]
@@ -962,8 +959,6 @@ let std_body_specs =
       stream_builtin ~return_shape:(ReturnNamed "Stream") "unfold" 2
         ~param_shapes:[ AnyParam; ParamFunc ] AnyReceiver;
       stream_builtin ~return_shape:(ReturnNamed "Stream") "empty" 0 NoReceiver;
-      stream_builtin ~return_shape:(ReturnNamed "Stream") "from_lines" 1
-        ~param_shapes:[ ParamNamed "String" ] (FirstParamNamed "String");
       stream_builtin ~return_shape:(ReturnNamed "Stream") "map" 2
         ~param_shapes:[ ParamNamed "Stream"; ParamFunc ]
         (FirstParamNamed "Stream");
@@ -2790,7 +2785,7 @@ let list_filter_map self_ty result_ty self f =
                       ty_void)
                    (vr "__result" result_ty))))))
 
-(** fold_left/fold/fold_right
+(** fold_left/fold_right
 
     Thread one owned accumulator through direct list storage. The callback
     receives borrowed arguments and must return an owned accumulator. After the
@@ -5985,7 +5980,7 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
   | "filter_map" when first_is_parallel_list () && return_is_parallel_list () ->
       with_parallel_list2 (fun self_p f_p ->
           list_filter_map self_p.cp_ty return_ty (param self_p) (param f_p))
-  | ("fold_left" | "fold")
+  | "fold_left"
     when first_is_list () && not (Codegen_types.has_type_vars return_ty) ->
       with_list3 (fun self_p init_p f_p ->
           list_fold_left self_p.cp_ty return_ty (param self_p) (param init_p)

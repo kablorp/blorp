@@ -131,7 +131,6 @@ let test_list_ir_functions_not_shadowed_by_codegen_builtins () =
       "find";
       "find_index";
       "flat_map";
-      "fold";
       "fold_left";
       "fold_right";
       "for_each";
@@ -720,34 +719,6 @@ let test_stream_element_layout_is_explicit () =
            booleans"
           label)
     [ ("runtime", runtime); ("runtime_decl", runtime_decl) ]
-
-let test_stream_from_lines_uses_validated_path_buffer () =
-  let runtime =
-    read_first_existing
-      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
-  in
-  Alcotest.(check bool)
-    "runtime defines stream from_lines" true
-    (contains_substring runtime "blorp_stream_from_lines(blorp_String* path)");
-  Alcotest.(check bool)
-    "from_lines validates and copies paths through the shared C-string helper"
-    true
-    (contains_substring runtime
-       "char* cpath = blorp_cstring_copy_if_valid(path);");
-  Alcotest.(check bool)
-    "shared path helper rejects interior NUL bytes" true
-    (contains_substring runtime
-       "if (!s || blorp_string_contains_nul(s)) return NULL;");
-  Alcotest.(check bool)
-    "shared path helper allocates room for the full path plus terminator" true
-    (contains_substring runtime "blorp_checked_add(len, 1)");
-  if
-    contains_substring runtime "char pathbuf[4096]"
-    || contains_substring runtime "path->len < 4095"
-  then
-    Alcotest.fail
-      "blorp_stream_from_lines must not truncate paths through a fixed-size \
-       stack buffer"
 
 let parse_std_int_record_field line =
   match String.split_on_char ':' (String.trim line) with
@@ -1451,8 +1422,6 @@ let suite =
           test_channel_status_runtime_abi_is_declared;
         Alcotest.test_case "stream element layout is explicit" `Quick
           test_stream_element_layout_is_explicit;
-        Alcotest.test_case "stream from_lines uses validated path buffer" `Quick
-          test_stream_from_lines_uses_validated_path_buffer;
         Alcotest.test_case "scheduler stats layout matches std record" `Quick
           test_scheduler_stats_layout_matches_std_record;
         Alcotest.test_case "std source dir initialized from config" `Quick

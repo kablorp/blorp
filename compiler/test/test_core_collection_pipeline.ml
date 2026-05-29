@@ -56,7 +56,7 @@ let filter_map_hof_call source f =
   call_user "std_list__filter_map__mono_Int_Int" [ source; f ] list_int
 
 let fold_call source init reducer =
-  call_user "std_list__fold__mono_Int_Int" [ source; init; reducer ] ty_int
+  call_user "std_list__fold_left__mono_Int_Int" [ source; init; reducer ] ty_int
 
 let length_call source =
   call_user "std_list__length__mono_Int" [ source ] ty_int
@@ -98,7 +98,7 @@ let map_int_float_call source f =
   call_user "std_list__map__mono_Int_Float" [ source; f ] list_float
 
 let fold_float_call source init reducer =
-  call_user "std_list__fold__mono_Float_Float" [ source; init; reducer ]
+  call_user "std_list__fold_left__mono_Float_Float" [ source; init; reducer ]
     ty_float
 
 let list_int128 = ty_list ty_int128
@@ -115,7 +115,7 @@ let map_int128_call source f =
   call_user "std_list__map__mono_Int128_Int128" [ source; f ] list_int128
 
 let fold_int128_call source init reducer =
-  call_user "std_list__fold__mono_Int128_Int128" [ source; init; reducer ]
+  call_user "std_list__fold_left__mono_Int128_Int128" [ source; init; reducer ]
     ty_int128
 
 let list_string = ty_list ty_string
@@ -517,7 +517,7 @@ let test_lowers_filter_map_fold_without_intermediate_hofs () =
   Alcotest.(check int) "one fused loop" 1 (count_for fused);
   Alcotest.(check int) "no filter call" 0 (count_user_call "filter" fused);
   Alcotest.(check int) "no map call" 0 (count_user_call "map" fused);
-  Alcotest.(check int) "no fold call" 0 (count_user_call "fold" fused);
+  Alcotest.(check int) "no fold_left call" 0 (count_user_call "fold_left" fused);
   Alcotest.(check int)
     "no list allocation for terminal fold" 0
     (count_intrinsic "list_alloc" fused)
@@ -525,7 +525,7 @@ let test_lowers_filter_map_fold_without_intermediate_hofs () =
 let test_lowers_bare_fold_with_borrowed_source () =
   let fused = P.fuse_expr (fold_call (cvar "xs" list_int) (cint 0) reducer) in
   Alcotest.(check int) "one fused loop" 1 (count_for fused);
-  Alcotest.(check int) "no fold call" 0 (count_user_call "fold" fused);
+  Alcotest.(check int) "no fold_left call" 0 (count_user_call "fold_left" fused);
   Alcotest.(check int)
     "pipeline source is a borrowed view" 1
     (count_borrow_prefix "__pipe_src_" fused);
@@ -623,7 +623,7 @@ let test_lowers_long_filter_map_map_fold_without_intermediate_hofs () =
   Alcotest.(check int) "one fused loop" 1 (count_for fused);
   Alcotest.(check int) "no filter call" 0 (count_user_call "filter" fused);
   Alcotest.(check int) "no map call" 0 (count_user_call "map" fused);
-  Alcotest.(check int) "no fold call" 0 (count_user_call "fold" fused);
+  Alcotest.(check int) "no fold_left call" 0 (count_user_call "fold_left" fused);
   Alcotest.(check int)
     "no list allocation for terminal fold" 0
     (count_intrinsic "list_alloc" fused)
@@ -634,7 +634,7 @@ let test_lowers_filter_map_hof_fold_without_result_allocation () =
   Alcotest.(check int)
     "no filter_map call" 0
     (count_user_call "filter_map" fused);
-  Alcotest.(check int) "no fold call" 0 (count_user_call "fold" fused);
+  Alcotest.(check int) "no fold_left call" 0 (count_user_call "fold_left" fused);
   Alcotest.(check int)
     "no list allocation for terminal fold" 0
     (count_intrinsic "list_alloc" fused);
@@ -683,12 +683,16 @@ let test_does_not_lower_impure_filter_map_fold () =
   let fused = P.fuse_expr (impure_filter_map_fold_expr ()) in
   Alcotest.(check int) "filter call remains" 1 (count_user_call "filter" fused);
   Alcotest.(check int) "map call remains" 1 (count_user_call "map" fused);
-  Alcotest.(check int) "fold call remains" 1 (count_user_call "fold" fused);
+  Alcotest.(check int)
+    "fold_left call remains" 1
+    (count_user_call "fold_left" fused);
   Alcotest.(check int) "no fused loop" 0 (count_for fused)
 
 let test_does_not_lower_impure_reducer_terminal_fold () =
   let fused = P.fuse_expr (impure_reducer_filter_map_fold_expr ()) in
-  Alcotest.(check int) "terminal fold remains" 1 (count_user_call "fold" fused)
+  Alcotest.(check int)
+    "terminal fold_left remains" 1
+    (count_user_call "fold_left" fused)
 
 let test_does_not_lower_impure_filter_map_hof_collect () =
   let fused = P.fuse_expr (impure_filter_map_hof_collect_expr ()) in
@@ -752,7 +756,7 @@ let test_lowers_range_filter_map_fold_without_materialized_range () =
   Alcotest.(check int) "no range call" 0 (count_user_call "range" fused);
   Alcotest.(check int) "no filter call" 0 (count_user_call "filter" fused);
   Alcotest.(check int) "no map call" 0 (count_user_call "map" fused);
-  Alcotest.(check int) "no fold call" 0 (count_user_call "fold" fused);
+  Alcotest.(check int) "no fold_left call" 0 (count_user_call "fold_left" fused);
   Alcotest.(check int)
     "no result allocation" 0
     (count_intrinsic "list_alloc" fused)
@@ -764,7 +768,7 @@ let test_lowers_range_filter_map_hof_fold_without_materialized_range () =
   Alcotest.(check int)
     "no filter_map call" 0
     (count_user_call "filter_map" fused);
-  Alcotest.(check int) "no fold call" 0 (count_user_call "fold" fused);
+  Alcotest.(check int) "no fold_left call" 0 (count_user_call "fold_left" fused);
   Alcotest.(check int)
     "no result allocation" 0
     (count_intrinsic "list_alloc" fused);
@@ -892,7 +896,7 @@ let test_lowers_float_filter_map_fold_without_intermediate_hofs () =
   Alcotest.(check int) "one fused loop" 1 (count_for fused);
   Alcotest.(check int) "no filter call" 0 (count_user_call "filter" fused);
   Alcotest.(check int) "no map call" 0 (count_user_call "map" fused);
-  Alcotest.(check int) "no fold call" 0 (count_user_call "fold" fused);
+  Alcotest.(check int) "no fold_left call" 0 (count_user_call "fold_left" fused);
   Alcotest.(check int)
     "no list allocation for terminal fold" 0
     (count_intrinsic "list_alloc" fused)
@@ -913,7 +917,9 @@ let test_does_not_fuse_heap_boxed_int128_pipeline () =
   let fused = P.fuse_expr (int128_filter_map_fold_expr ()) in
   Alcotest.(check int) "keeps filter call" 1 (count_user_call "filter" fused);
   Alcotest.(check int) "keeps map call" 1 (count_user_call "map" fused);
-  Alcotest.(check int) "keeps fold call" 1 (count_user_call "fold" fused);
+  Alcotest.(check int)
+    "keeps fold_left call" 1
+    (count_user_call "fold_left" fused);
   Alcotest.(check int) "no fused loop" 0 (count_for fused)
 
 let test_lowers_string_filter_map_collect_to_borrow_handoff () =

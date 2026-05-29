@@ -84,7 +84,6 @@ let supported_list_base_names =
     "filter";
     "filter_map";
     "map";
-    "fold";
     "fold_left";
     "length";
     "range";
@@ -212,7 +211,7 @@ let make_plan ~source ~stages ~sink ~cardinality ~result_ty ~loc =
 
 let plan_of_expr e =
   match call_base_and_args e with
-  | Some (("fold" | "fold_left"), [ source; init; reducer ]) -> (
+  | Some ("fold_left", [ source; init; reducer ]) -> (
       match collect source with
       | Some collected ->
           make_plan ~source:collected.collected_source
@@ -253,7 +252,7 @@ let describe_stage = function
 
 let describe_sink = function
   | SinkCollect _ -> "collect"
-  | SinkFold _ -> "fold"
+  | SinkFold _ -> "fold_left"
   | SinkLength -> "length"
 
 let describe_plan plan =

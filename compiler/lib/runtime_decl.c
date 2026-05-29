@@ -1669,7 +1669,6 @@ blorp_Stream* blorp_stream_unfold(
     long state_layout_code
 );
 blorp_Stream* blorp_stream_empty(void);
-blorp_Stream* blorp_stream_from_lines(blorp_String* path);
 blorp_FallibleStream* blorp_file_chunks_reader_raw(const blorp_FileReader* reader);
 blorp_FallibleStream* blorp_file_chunks_with_size_reader_raw(const blorp_FileReader* reader, long chunk_size);
 blorp_FallibleStream* blorp_file_lines_reader_raw(const blorp_FileReader* reader);

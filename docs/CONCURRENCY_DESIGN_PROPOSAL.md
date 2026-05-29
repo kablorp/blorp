@@ -1810,8 +1810,8 @@ share a misleading name.
 Ordinary channels cannot carry resources: typecheck coverage now rejects
 resource-containing channel aliases, function parameters, return types, and
 local bindings while still allowing direct aliases to resource handle types.
-`recv_timeout` and `recv_timeout_for` remain compatibility `Option` APIs that
-collapse timeout and sealed-and-drained into `None`.
+`recv_timeout` remains a compatibility `Option` API that collapses timeout and
+sealed-and-drained into `None`; the lossy Duration wrapper has been removed.
 `recv_timeout_attempt` and `recv_timeout_attempt_for` are now the typed timed
 forms. They distinguish value, timeout, and sealed-and-drained from a single
 runtime-backed channel wait, with generated C constructing the std
@@ -1896,8 +1896,8 @@ is currently represented as microseconds with add/subtract/order operations,
 and Core lowering normalizes it to integer milliseconds before the existing
 Core timeout invariant and C emission boundary. The std-library bridge also
 exists for channel and sleep operations: `sleep_for(Duration)`,
-`recv_timeout_for(Channel[T], Duration)`, `send_timeout_for(Channel[T], T,
-Duration)`, and `send_timeout_attempt_for(Channel[T], T, Duration)`. These
+`recv_timeout_attempt_for(Channel[T], Duration)`, and
+`send_timeout_attempt_for(Channel[T], T, Duration)`. These
 wrappers preserve the existing millisecond runtime ABI through the shared
 `units.to_timeout_milliseconds(Duration)` helper. That helper rounds positive
 sub-millisecond durations up to one millisecond so a tiny positive duration
@@ -2437,7 +2437,7 @@ The branch is ready to continue, but the next changes should stay narrow. The
 high-leverage sequence is:
 
 1. Keep non-syntax Duration APIs as explicit helper names for this workstream
-   (`sleep_for`, `recv_timeout_for`, `send_timeout_for`, etc.). Same-name
+   (`sleep_for`, `recv_timeout_attempt_for`, `send_timeout_attempt_for`, etc.). Same-name
    source overloads such as `sleep(Duration)` should be a separate
    language/typechecker design because current typechecking rejects same-name
    impure overloads within one module.

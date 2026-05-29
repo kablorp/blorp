@@ -202,7 +202,6 @@ let stream_builtins =
     ((N.mod_stream, "repeat"), "blorp_stream_repeat");
     ((N.mod_stream, "unfold"), "blorp_stream_unfold");
     ((N.mod_stream, "empty"), "blorp_stream_empty");
-    ((N.mod_stream, "from_lines"), "blorp_stream_from_lines");
     ((N.mod_stream, "map"), "blorp_stream_map");
     ((N.mod_stream, "filter"), "blorp_stream_filter");
     ((N.mod_stream, "filter_map"), "blorp_stream_filter_map");

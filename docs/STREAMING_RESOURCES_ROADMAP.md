@@ -62,8 +62,8 @@ This section records what exists today and what the design must account for.
 type Stream[T] = builtin
 ```
 
-Current sources include `from_list`, `from_range`, `repeat`, `unfold`, `empty`,
-and `from_lines`. Transformations include `map`, `filter`, `filter_map`,
+Current sources include `from_list`, `from_range`, `repeat`, `unfold`, and
+`empty`. Transformations include `map`, `filter`, `filter_map`,
 `take`, `drop`, `take_while`, and `enumerate`. Terminal operations include
 `collect`, `fold`, `count`, `for_each`, `find`, `any`, and `all`.
 
@@ -72,15 +72,15 @@ Current runtime shape:
 - `blorp_Stream` is a C runtime object with a pull function, opaque state, a
   state cleanup callback, and an explicit element layout enum.
 - Streams are lazy and one-shot in practice.
-- `from_lines` uses `FILE*` and `getline`.
-- `from_lines` returns an empty stream if open fails.
-- `from_lines` opens the exact path string provided by the caller.
+- The old `stream.from_lines(path)` source returned an empty stream when open
+  failed; it has been removed in favor of scoped `file.lines()` fallible
+  streams.
 - Terminal operations now include cooperative cancellation checkpoints.
 
 Correctness risks already identified:
 
-- `from_lines` still has compatibility semantics that are wrong for new I/O
-  APIs: empty-on-open-failure.
+- Fallible file streams report open/read failures through terminal
+  `Result` values instead of treating failure as end-of-stream.
 - Stream source/intermediate ABI should continue moving from scalar flags to
   named layout values as new adapters are added.
 - File reads can fail after open succeeds, so an API that only returns
@@ -130,7 +130,6 @@ listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
 accept(listener: TcpListener) -> Result[TcpStream, TcpError]
 connect(host: String, port: Int) -> Result[TcpStream, TcpError]
 read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
-read(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
 write(stream: TcpStream, data: Bytes) -> Result[Int, TcpError]
 write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]
 local_port(listener: TcpListener) -> Result[Int, TcpError]
@@ -1124,17 +1123,16 @@ Completed in the current implementation:
   function types such as `() -> ResourceSource[R, E]`.
 - Global `Stream`/`FallibleStream` bindings are rejected so mutable cursor state
   cannot become shared program state.
-- `from_lines` no longer truncates paths through a fixed-size stack buffer, and
-  its compatibility empty-on-open-failure behavior is documented.
+- The old `stream.from_lines` source has been removed; scoped file streams use
+  explicit `Result` terminals for open/read failures.
 - Runtime, leak-check, unit, and codegen-audit coverage exists for scalar-to-RC
   and RC-to-scalar stream transforms, stream `for`, repeat/unfold layout, and
   cancellation of an infinite stream terminal.
 
 Tasks:
 
-- Add the new fallible file-streaming API so open/read failures are represented
-  explicitly instead of reusing `from_lines`' compatibility empty-stream
-  behavior.
+- Continue hardening fallible file-streaming APIs so open/read failures stay
+  explicit across new sources and terminals.
 - Audit future stream constructors and adapters so every source either has
   explicit output/state layout metadata or is clearly rejected until the
   metadata exists.
@@ -1151,7 +1149,8 @@ Tests:
 - `Stream[Int].map(func(n): n.to_string()).collect()` passes leak-check.
 - `for n in from_list([1, 2, 3])` compiles and runs, or is rejected before
   codegen with a clear diagnostic.
-- `from_lines` has source-audit coverage preventing fixed-size path buffers.
+- Scoped file-stream paths use the shared C-string guard instead of fixed-size
+  stack buffers.
 - Timeout/cancellation tests cover a long-running stream terminal.
 - Closure, `detach`, `concurrent:`, and `for ... concurrently` bodies reject captured
   `Stream`/`FallibleStream` values while still allowing streams created and
@@ -1844,19 +1843,7 @@ with reader ?= path.open_read():
 ```
 
 ```blorp
--- Pre-typed TCP, raw descriptor
-fd ?= tcp.connect(host, port)
-data ?= tcp.read(fd, 4096)
-tcp.close(fd)
-Ok(data)
-
--- Current typed handle
-stream ?= tcp.connect(host, port)
-data ?= stream.read(4096)
-stream.close()
-Ok(data)
-
--- Future scoped typed handle
+-- Scoped typed handle
 with stream ?= tcp.connect(host, port):
 	data ?= stream.read_chunk(4096)
 	Ok(data)

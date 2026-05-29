@@ -767,7 +767,7 @@ let lower_plan ?reg model plan =
 
 let lower_bare_list_fold model e =
   match call_base_and_args e with
-  | Some (("fold" | "fold_left"), [ source; init; reducer ]) -> (
+  | Some ("fold_left", [ source; init; reducer ]) -> (
       match list_elem_ty source.ty with
       | Some elem_ty
         when callback_is_pure reducer

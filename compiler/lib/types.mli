@@ -37,10 +37,6 @@ val ty_array : type_expr -> type_expr list -> type_expr
 val is_array_type : type_expr -> bool
 val array_parts : type_expr -> (type_expr * type_expr list) option
 
-val removed_tensor_type_syntax_message : type_expr -> string option
-(** Return an error message when a source annotation uses removed
-    [Vector[T, #N]], [Matrix[T, #M, #N]], or [Tensor[T, ...]] syntax. *)
-
 val types_equal : type_expr -> type_expr -> bool
 (** Check if two types are structurally equal *)
 

@@ -19659,7 +19659,6 @@ typedef struct {
     bool done;
     blorp_StreamElementLayout state_layout;
 } StreamUnfoldState;
-typedef struct { FILE* fp; char* buf; size_t buf_size; } StreamLinesState;
 typedef struct {
     int fd;
     unsigned char* buf;
@@ -20667,51 +20666,6 @@ bool blorp_stream_all(blorp_Stream* stream, blorp_Closure* pred) {
         if (!keep) return false;
     }
     return true;
-}
-
-static char* blorp_cstring_copy_if_valid(const blorp_String* s);
-
-// --- from_lines ---
-static bool stream_lines_pull(blorp_Stream* self, void** out) {
-    StreamLinesState* st = (StreamLinesState*)self->state;
-    if (!st->fp) return false;
-    ssize_t len = getline(&st->buf, &st->buf_size, st->fp);
-    if (len < 0) {
-        fclose(st->fp);
-        st->fp = NULL;
-        return false;
-    }
-    // Strip trailing newline
-    while (len > 0 && (st->buf[len-1] == '\n' || st->buf[len-1] == '\r')) len--;
-    blorp_String* line = blorp_string_alloc_uninit((long)len, (long)len);
-    memcpy(line->data, st->buf, len);
-    line->data[len] = '\0';
-    *out = line;
-    return true;
-}
-static void stream_lines_cleanup(blorp_Stream* self) {
-    StreamLinesState* st = (StreamLinesState*)self->state;
-    if (st->fp) fclose(st->fp);
-    free(st->buf);
-    free(st);
-}
-blorp_Stream* blorp_stream_from_lines(blorp_String* path) {
-    if (!path) return blorp_stream_empty();
-    char* cpath = blorp_cstring_copy_if_valid(path);
-    if (!cpath) return blorp_stream_empty();
-    FILE* fp = fopen(cpath, "rb");
-    free(cpath);
-    if (!fp) return blorp_stream_empty();
-    blorp_Stream* s = blorp_stream_new();
-    StreamLinesState* st = (StreamLinesState*)blorp_malloc_checked(sizeof(StreamLinesState));
-    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
-    st->fp = fp;
-    st->buf = NULL;
-    st->buf_size = 0;
-    s->state = st;
-    s->pull = stream_lines_pull;
-    s->state_cleanup = stream_lines_cleanup;
-    return s;
 }
 
 #define BLORP_FILE_DEFAULT_CHUNK_SIZE 65536L

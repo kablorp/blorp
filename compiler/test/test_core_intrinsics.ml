@@ -350,7 +350,7 @@ let test_list_synthesis_rejects_malformed_signatures () =
   expect_no_list_synthesis "string_append"
     [ param "items" list_int; param "other" ty_string ]
     ty_string;
-  expect_no_list_synthesis "fold"
+  expect_no_list_synthesis "fold_left"
     [
       param "items" list_int;
       param "init" ty_int;
@@ -1006,10 +1006,6 @@ let test_stream_wrappers_synthesize_from_specs () =
         stream_int,
         "blorp_stream_unfold" );
       ("empty", [], stream_int, "blorp_stream_empty");
-      ( "from_lines",
-        [ param "text" ty_string ],
-        stream_int,
-        "blorp_stream_from_lines" );
       ( "map",
         [ param "items" stream_int; param "f" (ty_func [ ty_int ] ty_int) ],
         stream_int,
@@ -1159,7 +1155,7 @@ let test_list_strategy_contract_matches_synthesized_ir () =
        ]
        (ty_list ty_string));
   ignore
-    (assert_list_strategy_shape "fold"
+    (assert_list_strategy_shape "fold_left"
        [
          param "self" (ty_list ty_int);
          param "init" ty_string;
@@ -1218,7 +1214,7 @@ let test_list_synthesized_ir_does_not_own_borrowed_aliases () =
           param "self" list_string; param "f" (ty_func [ ty_string ] option_int);
         ],
         list_int );
-      ( "fold",
+      ( "fold_left",
         [
           param "self" list_string;
           param "init" ty_int;
@@ -2079,7 +2075,6 @@ let assert_fold_synthesizes_direct_loop name =
 
 let test_list_fold_synthesizes_direct_loop () =
   assert_fold_synthesizes_direct_loop "fold_left";
-  assert_fold_synthesizes_direct_loop "fold";
   assert_fold_synthesizes_direct_loop "fold_right"
 
 let test_list_map_indexed_synthesizes_presized_loop () =

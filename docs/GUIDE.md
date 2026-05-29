@@ -1393,9 +1393,9 @@ pure func apply_n_times(f: pure (Int) -> Int, start: Int, n: Int) -> Int:
         i += 1
     result
 
--- Or thread state through with fold:
+-- Or thread state through with fold_left:
 pure func sum_items(items: List[Int]) -> Int:
-    items.fold(0, pure func(acc: Int, x: Int): acc + x)
+    items.fold_left(0, pure func(acc: Int, x: Int): acc + x)
 ```
 
 ### Purity Subtyping
@@ -1780,35 +1780,6 @@ import:
 func local_stream_port(port: Int) -> Result[Int, TcpError]:
     with stream ?= Tcp.connect("127.0.0.1", port):
         Tcp.stream_local_port(stream)
-```
-
-The portable TCP module is still handle-based, not scoped with `with`, so close
-accepted listeners and streams explicitly. Its original `listen`, `accept`,
-`connect`, `read`, `write`, `local_port`, and `set_timeout` functions keep
-returning `Result[..., String]` for compatibility. New code that wants the
-future typed error shape can use `TcpError` bridge helpers:
-`listen_checked`, `accept_checked`, `connect_checked`,
-`local_port_checked`, `set_timeout_checked`, `set_reuse_addr_checked`,
-`read_chunk`, and `write_all`. These helpers report wrapper-owned invalid
-inputs such as bad ports, backlog values, timeouts, and chunk sizes as
-`InvalidInput`; runtime-originated socket failures are preserved as `Other`
-until TCP becomes a scoped resource API. Numeric hosts such as `"127.0.0.1"`
-are the virtual-thread-friendly path; hostname resolution may still block an OS
-worker before the socket operation can park the current fiber.
-
-```blorp
-import:
-    net/tcp as Tcp
-
-func fetch_once(port: Int) -> Result[Int, Tcp.TcpError]:
-    match Tcp.connect_checked("127.0.0.1", port):
-        Ok(stream):
-            result: Result[Int, Tcp.TcpError] = match stream.read_chunk(4096):
-                Ok(data): Ok(data.length())
-                Err(err): Err(err)
-            Tcp.close(stream)
-            result
-        Err(err): Err(err)
 ```
 
 `with ?=` follows the same loop restriction as direct `?=`. If acquisition is
@@ -2434,9 +2405,9 @@ func typed_pause() -> Int:
 ```
 
 Duration-aware wrappers use explicit names such as `sleep_for`,
-`recv_timeout_for`, and `send_timeout_for`. Same-name overloads such as
-`sleep(Duration)` are intentionally deferred until source-level overloads for
-ordinary functions have a complete design.
+`recv_timeout_attempt_for`, and `send_timeout_attempt_for`. Same-name overloads
+such as `sleep(Duration)` are intentionally deferred until source-level
+overloads for ordinary functions have a complete design.
 
 `Duration` values are integer microsecond intervals with arithmetic and
 ordering. Use constructors such as `microseconds`, `from_milliseconds`,
@@ -2780,7 +2751,7 @@ Common compiler-registered builtins include:
 | Bitwise | `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `shift_left`, `shift_right` |
 | Checked arithmetic | `checked_div`, `checked_mod` |
 | Tensor/array helpers | `vector`, `matrix`, `tensor3`, `tensor4`, `tensor5`, `assert_shape`, `checked_get`, `checked_set`, `checked_slice` |
-| Concurrency/channel | `sleep`, `sleep_for`, `yield_now`, `max_threads`, `Channel`, `channel`, `send`, `wait_send`, `recv`, `wait_recv`, `try_send`, `try_send_attempt`, `try_recv`, `try_recv_attempt`, `send_timeout`, `send_timeout_for`, `send_timeout_attempt`, `send_timeout_attempt_for`, `recv_timeout`, `recv_timeout_for`, `recv_timeout_attempt`, `recv_timeout_attempt_for`, `seal`, `ConcurrencyError`, `TaskResult`, `ChannelSealed`, `SendAttempt`, `RecvAttempt` |
+| Concurrency/channel | `sleep`, `sleep_for`, `yield_now`, `max_threads`, `Channel`, `channel`, `send`, `wait_send`, `recv`, `wait_recv`, `try_send`, `try_send_attempt`, `try_recv`, `try_recv_attempt`, `send_timeout`, `send_timeout_attempt`, `send_timeout_attempt_for`, `recv_timeout`, `recv_timeout_attempt`, `recv_timeout_attempt_for`, `seal`, `ConcurrencyError`, `TaskResult`, `ChannelSealed`, `SendAttempt`, `RecvAttempt` |
 
 Most system APIs require explicit imports. Examples:
 

@@ -49,9 +49,9 @@ Implemented in the first focused slice:
 - runtime text, regex, file, environment, stream, and process-output paths now
   reuse those helpers instead of open-coded variable-length String/Bytes
   allocation.
-- `Stream.from_lines` now uses the shared OS C-string guard instead of a fixed
-  4096-byte path buffer, rejects embedded-NUL paths, and marks yielded file
-  lines as owned managed values.
+- The old empty-on-open-failure `Stream.from_lines` source has been removed;
+  scoped `file.lines()` / `FallibleStream` file paths use the shared OS
+  C-string guard and report open/read errors explicitly.
 - `time.format_time`, `time.parse_time`, and regex builtins now reject
   embedded-NUL strings before crossing into C APIs that require NUL-terminated
   input.

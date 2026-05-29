@@ -181,9 +181,9 @@ let collection_strategy ~(module_path : string) ~(func_name : string) =
         (allocate_fresh ~growth:"list_ensure_capacity" "list_alloc"
            RetainBorrowedElement)
   | ( "std/list",
-      ( "fold" | "fold_left" | "fold_right" | "all" | "any" | "for_each"
-      | "find_index" | "find" | "min_by" | "max_by" | "count" | "get_or"
-      | "__unsafe_list_get" | "length" ) ) ->
+      ( "fold_left" | "fold_right" | "all" | "any" | "for_each" | "find_index"
+      | "find" | "min_by" | "max_by" | "count" | "get_or" | "__unsafe_list_get"
+      | "length" ) ) ->
       Some no_collection_result
   | "std/set", "add" -> Some (reuse_receiver "set_cow" RetainInputElement)
   | "std/set", "remove" ->
@@ -681,7 +681,6 @@ let builtin_contract_table =
       builtins [ "blorp_stream_unfold" ]
         (bfixed [ Retain; Retain; Borrow; Borrow ] ReturnOwned);
       builtins [ "blorp_stream_empty" ] (bfixed [] ReturnOwned);
-      builtins [ "blorp_stream_from_lines" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_stream_map" ]
         (bfixed [ Retain; Retain; Borrow ] ReturnOwned);
       builtins

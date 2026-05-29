@@ -641,14 +641,14 @@ let test_list_flat_map_dynamic_growth_strategy () =
     }
     (collection_strategy ~module_path:"std/list" ~func_name:"flat_map")
 
-let test_list_fold_no_collection_result_strategy () =
-  check_strategy "list fold strategy"
+let test_list_fold_left_no_collection_result_strategy () =
+  check_strategy "list fold_left strategy"
     {
       receiver = BorrowReceiver;
       result_collection = NoCollectionResult;
       element_storage = NoElementStorage;
     }
-    (collection_strategy ~module_path:"std/list" ~func_name:"fold")
+    (collection_strategy ~module_path:"std/list" ~func_name:"fold_left")
 
 let test_list_count_no_collection_result_strategy () =
   check_strategy "list count strategy"
@@ -1043,8 +1043,8 @@ let suite =
           test_list_chunks_fresh_nested_strategy;
         Alcotest.test_case "list_flat_map_dynamic_growth_strategy" `Quick
           test_list_flat_map_dynamic_growth_strategy;
-        Alcotest.test_case "list_fold_no_collection_result_strategy" `Quick
-          test_list_fold_no_collection_result_strategy;
+        Alcotest.test_case "list_fold_left_no_collection_result_strategy" `Quick
+          test_list_fold_left_no_collection_result_strategy;
         Alcotest.test_case "list_count_no_collection_result_strategy" `Quick
           test_list_count_no_collection_result_strategy;
         Alcotest.test_case "set_add_cow_mutator_strategy" `Quick

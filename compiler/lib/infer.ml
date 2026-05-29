@@ -49,7 +49,6 @@ let common_std_functions =
     ("sort", "list");
     ("map", "list");
     ("filter", "list");
-    ("fold", "list");
     ("fold_left", "list");
     ("fold_right", "list");
     ("flat_map", "list");
@@ -548,15 +547,6 @@ let resolve_function_return_annotation_type ctx ty =
 let canonicalize_inferred_type_for_ast ctx ty =
   let resolution_ctx = type_resolution_context ctx in
   Type_resolution.annotation_canonical resolution_ctx ty
-
-let reject_removed_tensor_type_syntax loc ty =
-  match Types.removed_tensor_type_syntax_message ty with
-  | Some msg -> error loc msg
-  | None -> Ok ()
-
-let reject_removed_tensor_type_syntax_opt loc = function
-  | Some ty -> reject_removed_tensor_type_syntax loc ty
-  | None -> Ok ()
 
 let normalize_type_with_env env purpose ty =
   let normalization_ctx = Infer_type_normalization.make_context ~env () in
@@ -4535,7 +4525,6 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               annotate_expected_value_slot ctx (with_inferred_type expr ty) ty
             ))
   | EWith (binding, body) -> (
-      let* () = reject_removed_tensor_type_syntax_opt loc binding.with_type in
       let ty_ann =
         binding.with_type
         |> Option.map (resolve_local_binding_annotation ctx)
@@ -4784,7 +4773,6 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       | Error e -> Error e)
   (* Type ascription *)
   | EAscription (inner, parsed_source_ty) ->
-      let* () = reject_removed_tensor_type_syntax loc parsed_source_ty in
       let resolved_ascription = resolve_value_ascription ctx parsed_source_ty in
       let source_ty = Type_resolution.source resolved_ascription in
       let ascribed_ty = Type_resolution.canonical resolved_ascription in
@@ -5976,7 +5964,6 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
   | EVarDecl (name, ty_opt, value, is_mutable) -> (
       (* Reject same-scope re-declaration *)
       let* () = check_no_redeclaration ctx.env name loc in
-      let* () = reject_removed_tensor_type_syntax_opt loc ty_opt in
       (* Resolve aliases (e.g., Vector -> Tensor) on declared type while
          retaining source spelling for typed metadata and tooling. *)
       let resolved_ty_opt =
@@ -6417,9 +6404,6 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           let* () =
             reject_concurrent_sibling_binding_refs ctx.env binding_names name
               body.expr_loc body
-          in
-          let* () =
-            reject_removed_tensor_type_syntax_opt stmt.expr_loc ty_ann
           in
           let* body_ty, body' = infer_unconstrained_value_expr ctx body in
           let* () =
@@ -10354,7 +10338,6 @@ and infer_question_bind_statement ctx stmt name ty_ann rhs =
             stay local to that iteration.")
       stmt.expr_loc "?= cannot be used inside loop bodies"
   else
-    let* () = reject_removed_tensor_type_syntax_opt stmt.expr_loc ty_ann in
     let* rhs_ty, rhs' = infer_unconstrained_value_expr ctx rhs in
     match (expected_type_opt ctx, rhs_ty) with
     | Some (TyNamed ("Option", [ _ ])), TyNamed ("Option", [ inner_ty ]) ->
@@ -10952,17 +10935,6 @@ and infer_lambda ctx expr func loc =
   match check_no_mutable_captures ctx.env func loc with
   | Some err -> Error err
   | None ->
-      let* () =
-        List.fold_left
-          (fun acc (param : Ast.param) ->
-            let* () = acc in
-            reject_removed_tensor_type_syntax_opt param.param_loc
-              param.param_type)
-          (Ok ()) func.func_params
-      in
-      let* () =
-        reject_removed_tensor_type_syntax_opt loc func.func_return_type
-      in
       (* Check if we have an expected function type for parameter inference *)
       let expected_func_type =
         match expected_type_opt ctx with
