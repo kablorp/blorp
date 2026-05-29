@@ -14745,6 +14745,19 @@ static void blorp_fiber_schedule(blorp_Fiber* f) {
     // mco_resume returns from the yield.
     if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&f->wake_pending, 1, __ATOMIC_RELEASE);
+        // The fiber sets parked immediately before yielding. If the owning
+        // worker clears running between our load and wake_pending store, it may
+        // have already passed its pending-wake check. Wait briefly for that
+        // handoff to settle; exactly one side claims wake_pending by exchange.
+        for (int i = 0; i < 1024; i++) {
+            if (!__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
+                if (__atomic_exchange_n(&f->wake_pending, 0, __ATOMIC_ACQ_REL)) {
+                    blorp_fiber_enqueue_runnable(f);
+                }
+                return;
+            }
+            sched_yield();
+        }
         return;
     }
     blorp_fiber_enqueue_runnable(f);
