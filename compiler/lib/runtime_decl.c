@@ -511,22 +511,7 @@ typedef struct blorp_CancelCleanupFrame {
     bool active;
 } blorp_CancelCleanupFrame;
 
-typedef struct blorp_Task_s {
-    blorp_Object header;
-    pthread_mutex_t mutex;
-    pthread_cond_t done_cond;
-    bool completed;
-    bool joined;
-    void* result;
-    blorp_Closure* func;
-    bool result_is_rc;
-    blorp_Fiber* waiting_fiber;
-    blorp_Fiber* task_fiber;
-    jmp_buf cancel_jmp;
-    bool cancel_jmp_ready;
-    blorp_CancelCleanupFrame* cleanup_stack;
-    _Atomic int cancelled;
-} blorp_Task;
+typedef struct blorp_Task_s blorp_Task;
 
 typedef struct {
     blorp_Object header;
