@@ -54,6 +54,17 @@ let test_sanitize_c_ident_passthrough () =
 let test_sanitize_c_ident_empty () =
   Alcotest.(check string) "empty string" "" (sanitize_c_ident "")
 
+let test_parse_ufcs_name_decodes_module_path () =
+  Alcotest.(check (option (pair string string)))
+    "ufcs name"
+    (Some ("std/list", "get"))
+    (parse_ufcs_name "__ufcs_std$list__get")
+
+let test_parse_ufcs_name_rejects_non_ufcs_name () =
+  Alcotest.(check (option (pair string string)))
+    "non ufcs name" None
+    (parse_ufcs_name "__def_1_std_list_get")
+
 let suite =
   [
     ( "mangle_by_def_id",
@@ -74,5 +85,12 @@ let suite =
         Alcotest.test_case "valid passthrough" `Quick
           test_sanitize_c_ident_passthrough;
         Alcotest.test_case "empty" `Quick test_sanitize_c_ident_empty;
+      ] );
+    ( "parse_ufcs_name",
+      [
+        Alcotest.test_case "decodes module path" `Quick
+          test_parse_ufcs_name_decodes_module_path;
+        Alcotest.test_case "rejects non-ufcs name" `Quick
+          test_parse_ufcs_name_rejects_non_ufcs_name;
       ] );
   ]

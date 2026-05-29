@@ -58,6 +58,12 @@ let add_term_binding name scope =
 let add_type_binding name scope =
   { scope with type_bindings = StringSet.add name scope.type_bindings }
 
+let add_term_bindings scope names =
+  List.fold_left (fun scope name -> add_term_binding name scope) scope names
+
+let add_unbound_term_reference scope refs name =
+  if StringSet.mem name scope.term_bindings then refs else add_term name refs
+
 let is_dim_name name = String.length name > 0 && name.[0] = '#'
 
 let local_symbol_name (sym : import_symbol) =
@@ -154,11 +160,7 @@ let rec collect_top_level_bindings scope decl =
       | Some name -> add_term_binding name scope
       | None -> (
           match v.var_pattern with
-          | Some pat ->
-              List.fold_left
-                (fun scope name -> add_term_binding name scope)
-                scope
-                (Ast.collect_pattern_vars pat)
+          | Some pat -> add_term_bindings scope (Ast.collect_pattern_vars pat)
           | None -> scope))
   | DType t -> add_type_binding t.type_name scope
   | DRecord r -> add_type_binding r.record_name scope
@@ -244,10 +246,7 @@ let rec scan_pattern scope refs pat =
       scan_pattern scope (List.fold_left (scan_pattern scope) refs pats) spread
 
 let add_pattern_bindings scope pat =
-  List.fold_left
-    (fun scope name -> add_term_binding name scope)
-    scope
-    (Ast.collect_pattern_vars pat)
+  add_term_bindings scope (Ast.collect_pattern_vars pat)
 
 let rec field_access_module_alias scope expr =
   match expr.expr_desc with
@@ -260,9 +259,7 @@ let rec field_access_module_alias scope expr =
 
 let rec scan_expr scope refs expr =
   match expr.expr_desc with
-  | EIdent name ->
-      if StringSet.mem name scope.term_bindings then refs
-      else add_term name refs
+  | EIdent name -> add_unbound_term_reference scope refs name
   | ELiteral _ | EVoid | EBreak | EContinue -> refs
   | EUnary (_, e) -> scan_expr scope refs e
   | EAscription (e, ty) -> scan_type scope (scan_expr scope refs e) ty
@@ -280,7 +277,7 @@ let rec scan_expr scope refs expr =
       List.fold_left (scan_expr scope) (scan_expr scope refs callee) args
   | EIf (cond, then_, else_) ->
       let refs = scan_expr scope (scan_expr scope refs cond) then_ in
-      Option.fold ~none:refs ~some:(scan_expr scope refs) else_
+      scan_expr_opt scope refs else_
   | EMatch (scrutinee, cases) ->
       List.fold_left
         (fun refs case ->
@@ -326,26 +323,17 @@ let rec scan_expr scope refs expr =
       scan_expr (add_term_binding name scope) refs body
   | EForTuple (names, iterable, body) ->
       let refs = scan_expr scope refs iterable in
-      let scope =
-        List.fold_left (fun s n -> add_term_binding n s) scope names
-      in
+      let scope = add_term_bindings scope names in
       scan_expr scope refs body
   | ELoopView view ->
       let refs = scan_expr scope refs view.loop_view_source in
       let refs = scan_type scope refs view.loop_view_elem_type in
-      Option.fold ~none:refs ~some:(scan_expr scope refs)
-        view.loop_view_size_arg
+      scan_expr_opt scope refs view.loop_view_size_arg
   | EAssign (name, value) ->
-      let refs =
-        if StringSet.mem name scope.term_bindings then refs
-        else add_term name refs
-      in
+      let refs = add_unbound_term_reference scope refs name in
       scan_expr scope refs value
   | ECompoundAssign (name, _, value) ->
-      let refs =
-        if StringSet.mem name scope.term_bindings then refs
-        else add_term name refs
-      in
+      let refs = add_unbound_term_reference scope refs name in
       scan_expr scope refs value
   | EVarDecl (_name, ty, init, _) ->
       scan_type_opt scope (scan_expr scope refs init) ty
@@ -384,7 +372,7 @@ let rec scan_expr scope refs expr =
   | EConcurrentlyLoop (name, iterable, body, timeout, _) ->
       let refs = scan_expr scope refs iterable in
       let refs = scan_expr (add_term_binding name scope) refs body in
-      Option.fold ~none:refs ~some:(scan_expr scope refs) timeout
+      scan_expr_opt scope refs timeout
   | EDetach e -> scan_expr scope refs e
   | EDict entries ->
       List.fold_left
@@ -394,12 +382,15 @@ let rec scan_expr scope refs expr =
   | EBuiltin _ -> refs
   | EFuncDecl f -> scan_func scope refs f
 
+and scan_expr_opt scope refs = function
+  | Some expr -> scan_expr scope refs expr
+  | None -> refs
+
 and scan_block scope refs exprs =
   let scope_after_expr scope expr =
     match expr.expr_desc with
     | EVarDecl (name, _, _, _) -> add_term_binding name scope
-    | ETupleDestruct (names, _) ->
-        List.fold_left (fun s n -> add_term_binding n s) scope names
+    | ETupleDestruct (names, _) -> add_term_bindings scope names
     | EQuestionBind (name, _, _) -> add_term_binding name scope
     | EConcurrentBind (name, _, _) -> add_term_binding name scope
     | _ -> scope

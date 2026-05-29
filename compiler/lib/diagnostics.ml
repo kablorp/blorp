@@ -51,6 +51,14 @@ let severity_text = function
 let label_file ~default_file loc =
   match loc.loc_file with Some file -> file | None -> default_file
 
+let make_label ?(message = "") ?(style = Primary) ~file loc =
+  {
+    label_loc = loc;
+    label_file = file;
+    label_message = message;
+    label_style = style;
+  }
+
 let primary_label labels =
   List.find_opt (fun label -> label.label_style = Primary) labels
 
@@ -153,15 +161,7 @@ let diagnostic_of_error ~file (err : compiler_error) : diagnostic =
   {
     diag_severity = Error;
     diag_message = message;
-    diag_labels =
-      [
-        {
-          label_loc = err.loc;
-          label_file;
-          label_message = "";
-          label_style = Primary;
-        };
-      ];
+    diag_labels = [ make_label ~file:label_file err.loc ];
     diag_notes = err.notes;
     diag_help = err.help;
   }
@@ -266,15 +266,7 @@ let format_diagnostic ~file ~loc ~severity ~message =
     {
       diag_severity = severity;
       diag_message = message;
-      diag_labels =
-        [
-          {
-            label_loc = loc;
-            label_file = file;
-            label_message = "";
-            label_style = Primary;
-          };
-        ];
+      diag_labels = [ make_label ~file loc ];
       diag_notes = [];
       diag_help = None;
     }

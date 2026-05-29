@@ -9,6 +9,18 @@ let add_unicode_escape b code =
     Buffer.add_string b (Printf.sprintf "\\u%04x\\u%04x" high low)
 
 let is_continuation byte = byte land 0xc0 = 0x80
+let is_control_code code = code < 0x20
+let is_ascii_code code = code < 0x80
+
+let escaped_ascii_char = function
+  | '"' -> Some "\\\""
+  | '\\' -> Some "\\\\"
+  | '\b' -> Some "\\b"
+  | '\012' -> Some "\\f"
+  | '\n' -> Some "\\n"
+  | '\r' -> Some "\\r"
+  | '\t' -> Some "\\t"
+  | _ -> None
 
 let decode_utf8_at s i =
   let len = String.length s in
@@ -51,34 +63,17 @@ let escape_string s =
   let rec loop i =
     if i >= String.length s then ()
     else
-      match s.[i] with
-      | '"' ->
-          Buffer.add_string b "\\\"";
+      let c = s.[i] in
+      match escaped_ascii_char c with
+      | Some escaped ->
+          Buffer.add_string b escaped;
           loop (i + 1)
-      | '\\' ->
-          Buffer.add_string b "\\\\";
-          loop (i + 1)
-      | '\b' ->
-          Buffer.add_string b "\\b";
-          loop (i + 1)
-      | '\012' ->
-          Buffer.add_string b "\\f";
-          loop (i + 1)
-      | '\n' ->
-          Buffer.add_string b "\\n";
-          loop (i + 1)
-      | '\r' ->
-          Buffer.add_string b "\\r";
-          loop (i + 1)
-      | '\t' ->
-          Buffer.add_string b "\\t";
-          loop (i + 1)
-      | c -> (
-          let code = Char.code c in
-          if code < 0x20 then (
+      | None -> (
+          let code = Char.code s.[i] in
+          if is_control_code code then (
             add_unicode_escape b code;
             loop (i + 1))
-          else if code < 0x80 then (
+          else if is_ascii_code code then (
             Buffer.add_char b c;
             loop (i + 1))
           else

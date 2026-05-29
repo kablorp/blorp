@@ -24,9 +24,10 @@ type normalized_type = {
 }
 
 let make_context ~env () = { env }
+let expand_aliases ctx source = Env.resolve_alias ctx.env source
 
 let normalize ctx purpose source =
-  { purpose; source; normalized = Env.resolve_alias ctx.env source }
+  { purpose; source; normalized = expand_aliases ctx source }
 
 let canonical ctx purpose source = (normalize ctx purpose source).normalized
 let purpose normalized = normalized.purpose

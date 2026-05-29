@@ -31,12 +31,13 @@ end = struct
       calls to the C runtime profiler around named user functions. *)
 
   let default_config = { embed_runtime = false; profile = false }
+  let make_config ~embed_runtime ~profile = { embed_runtime; profile }
+
+  let create_inner_context ~reg cfg =
+    Core_emit_context.create ~profile:cfg.profile ~reg ()
 
   let create_ctx ~(reg : Codegen_types.registry) (cfg : config) : ctx =
-    {
-      inner = Core_emit_context.create ~profile:cfg.profile ~reg ();
-      embed_runtime = cfg.embed_runtime;
-    }
+    { inner = create_inner_context ~reg cfg; embed_runtime = cfg.embed_runtime }
 
   let emit_program (ctx : ctx) (prog : Core.core_program) : unit =
     Core_emit.emit_program ~embed_runtime:ctx.embed_runtime ctx.inner prog
@@ -47,5 +48,5 @@ end = struct
       so [Core_pipeline] can toggle the flag per compile without
       reaching into the opaque [config] type. *)
   let config_with_embed ~embed_runtime ?(profile = false) () : config =
-    { embed_runtime; profile }
+    make_config ~embed_runtime ~profile
 end

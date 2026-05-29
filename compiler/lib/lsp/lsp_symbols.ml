@@ -57,6 +57,11 @@ let document_symbol ~name ~kind ~range ~selection_range ?(children = []) () :
   if children = [] then Object base
   else Object (base @ [ ("children", Array children) ])
 
+let symbol_at ?(children = []) ~name ~kind loc =
+  let range = loc_to_range loc in
+  let selection_range = selection_range loc (String.length name) in
+  document_symbol ~name ~kind ~range ~selection_range ~children ()
+
 (* ============================================================================
    AST walking
    ============================================================================ *)
@@ -66,97 +71,52 @@ let rec decl_to_symbol (d : decl) : json option =
   match d.decl_desc with
   | DFunc fd ->
       let name = match fd.func_name with Some n -> n | None -> "<lambda>" in
-      let range = loc_to_range d.decl_loc in
-      let sel = selection_range d.decl_loc (String.length name) in
-      Some
-        (document_symbol ~name ~kind:kind_function ~range ~selection_range:sel
-           ())
+      Some (symbol_at ~name ~kind:kind_function d.decl_loc)
   | DType td ->
-      let range = loc_to_range d.decl_loc in
-      let sel = selection_range d.decl_loc (String.length td.type_name) in
       let children =
         List.map
           (fun (v : variant) ->
-            let vrange = loc_to_range v.variant_loc in
-            let vsel =
-              selection_range v.variant_loc (String.length v.variant_name)
-            in
-            document_symbol ~name:v.variant_name ~kind:kind_enum_member
-              ~range:vrange ~selection_range:vsel ())
+            symbol_at ~name:v.variant_name ~kind:kind_enum_member v.variant_loc)
           td.type_variants
       in
-      Some
-        (document_symbol ~name:td.type_name ~kind:kind_class ~range
-           ~selection_range:sel ~children ())
+      Some (symbol_at ~name:td.type_name ~kind:kind_class ~children d.decl_loc)
   | DRecord rd ->
-      let range = loc_to_range d.decl_loc in
-      let sel = selection_range d.decl_loc (String.length rd.record_name) in
       let k = if rd.record_is_value then kind_struct else kind_class in
       let children =
         List.map
           (fun (f : field_decl) ->
-            let frange = loc_to_range f.field_loc in
-            let fsel =
-              selection_range f.field_loc (String.length f.field_name)
-            in
-            document_symbol ~name:f.field_name ~kind:kind_property ~range:frange
-              ~selection_range:fsel ())
+            symbol_at ~name:f.field_name ~kind:kind_property f.field_loc)
           rd.record_fields
       in
-      Some
-        (document_symbol ~name:rd.record_name ~kind:k ~range
-           ~selection_range:sel ~children ())
+      Some (symbol_at ~name:rd.record_name ~kind:k ~children d.decl_loc)
   | DVar vd ->
       let name = match vd.var_name with Some n -> n | None -> "_" in
-      let range = loc_to_range d.decl_loc in
-      let sel = selection_range d.decl_loc (String.length name) in
-      Some
-        (document_symbol ~name ~kind:kind_variable ~range ~selection_range:sel
-           ())
+      Some (symbol_at ~name ~kind:kind_variable d.decl_loc)
   | DTrait td ->
-      let range = loc_to_range d.decl_loc in
-      let sel = selection_range d.decl_loc (String.length td.trait_name) in
       let children =
         List.map
           (fun (m : trait_method) ->
-            let mrange = loc_to_range d.decl_loc in
             (* methods don't have own loc *)
-            let msel =
-              selection_range d.decl_loc (String.length m.method_name)
-            in
-            document_symbol ~name:m.method_name ~kind:kind_method ~range:mrange
-              ~selection_range:msel ())
+            symbol_at ~name:m.method_name ~kind:kind_method d.decl_loc)
           td.trait_methods
       in
       Some
-        (document_symbol ~name:td.trait_name ~kind:kind_interface ~range
-           ~selection_range:sel ~children ())
+        (symbol_at ~name:td.trait_name ~kind:kind_interface ~children d.decl_loc)
   | DImpl impl ->
       let name =
         Printf.sprintf "%s for %s" impl.impl_trait
           (Types.type_to_string impl.impl_for_type)
       in
-      let range = loc_to_range d.decl_loc in
-      let sel = selection_range d.decl_loc (String.length name) in
       let children =
         List.map
           (fun (fd : func_decl) ->
             let mname = match fd.func_name with Some n -> n | None -> "_" in
-            let mrange = loc_to_range d.decl_loc in
-            let msel = selection_range d.decl_loc (String.length mname) in
-            document_symbol ~name:mname ~kind:kind_method ~range:mrange
-              ~selection_range:msel ())
+            symbol_at ~name:mname ~kind:kind_method d.decl_loc)
           impl.impl_methods
       in
-      Some
-        (document_symbol ~name ~kind:kind_class ~range ~selection_range:sel
-           ~children ())
+      Some (symbol_at ~name ~kind:kind_class ~children d.decl_loc)
   | DTypeAlias ad ->
-      let range = loc_to_range d.decl_loc in
-      let sel = selection_range d.decl_loc (String.length ad.alias_name) in
-      Some
-        (document_symbol ~name:ad.alias_name ~kind:kind_class ~range
-           ~selection_range:sel ())
+      Some (symbol_at ~name:ad.alias_name ~kind:kind_class d.decl_loc)
   | DImport _ -> None
   | DPrivate inner -> decl_to_symbol inner
 

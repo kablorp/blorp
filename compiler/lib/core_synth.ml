@@ -40,6 +40,16 @@ let ends_with s suffix =
   let suffix_len = String.length suffix in
   slen >= suffix_len && String.sub s (slen - suffix_len) suffix_len = suffix
 
+let drop_prefix_if_present s prefix =
+  if starts_with s prefix then
+    String.sub s (String.length prefix) (String.length s - String.length prefix)
+  else s
+
+let drop_suffix_if_present s suffix =
+  if ends_with s suffix then
+    String.sub s 0 (String.length s - String.length suffix)
+  else s
+
 let source_name_for_synthesis (f : core_func) : string =
   let source_name = base_name f.cf_name in
   let source_name =
@@ -47,16 +57,9 @@ let source_name_for_synthesis (f : core_func) : string =
     | None -> source_name
     | Some module_path ->
         let prefix = Codegen_names.sanitize_module_name module_path ^ "__" in
-        if starts_with source_name prefix then
-          String.sub source_name (String.length prefix)
-            (String.length source_name - String.length prefix)
-        else source_name
+        drop_prefix_if_present source_name prefix
   in
-  let pure_suffix = "__pure" in
-  if ends_with source_name pure_suffix then
-    String.sub source_name 0
-      (String.length source_name - String.length pure_suffix)
-  else source_name
+  drop_suffix_if_present source_name "__pure"
 
 (** Attempt to synthesize a body for a monomorphized builtin.
     Returns the function unchanged if synthesis fails or is

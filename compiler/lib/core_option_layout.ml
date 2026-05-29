@@ -57,6 +57,12 @@ type classification =
   | Unknown_named of string
   | Invalid_option_type of string
 
+type primitive_stack_abi_info = {
+  c_type : string;
+  runtime_suffix : string;
+  payload_c_type : string;
+}
+
 let primitive_stack_abi_of_scalar = function
   | ScalarVoid -> Some StackOptionVoid
   | ScalarInt -> Some StackOptionInt
@@ -81,56 +87,34 @@ let primitive_stack_abi_of_layout = function
   | StackScalar scalar -> primitive_stack_abi_of_scalar scalar
   | StackValueRecord _ | NullableManagedPointer | BoxedUnion _ -> None
 
-let c_type_of_primitive_stack_abi = function
-  | StackOptionVoid -> "blorp_StackOption_Void"
-  | StackOptionInt -> "blorp_StackOption_Int"
-  | StackOptionInt8 -> "blorp_StackOption_Int8"
-  | StackOptionInt16 -> "blorp_StackOption_Int16"
-  | StackOptionInt32 -> "blorp_StackOption_Int32"
-  | StackOptionInt64 -> "blorp_StackOption_Int64"
-  | StackOptionUInt8 -> "blorp_StackOption_UInt8"
-  | StackOptionUInt16 -> "blorp_StackOption_UInt16"
-  | StackOptionUInt32 -> "blorp_StackOption_UInt32"
-  | StackOptionUInt64 -> "blorp_StackOption_UInt64"
-  | StackOptionFloat -> "blorp_StackOption_Float"
-  | StackOptionBool -> "blorp_StackOption_Bool"
-  | StackOptionChar -> "blorp_StackOption_Char"
-  | StackOptionFloat32 -> "blorp_StackOption_Float32"
-  | StackOptionFloat16 -> "blorp_StackOption_Float16"
+let primitive_stack_abi_info abi =
+  let c_type, runtime_suffix, payload_c_type =
+    match abi with
+    | StackOptionVoid -> ("blorp_StackOption_Void", "void", "long")
+    | StackOptionInt -> ("blorp_StackOption_Int", "int", "long")
+    | StackOptionInt8 -> ("blorp_StackOption_Int8", "int8", "int8_t")
+    | StackOptionInt16 -> ("blorp_StackOption_Int16", "int16", "int16_t")
+    | StackOptionInt32 -> ("blorp_StackOption_Int32", "int32", "int32_t")
+    | StackOptionInt64 -> ("blorp_StackOption_Int64", "int64", "long")
+    | StackOptionUInt8 -> ("blorp_StackOption_UInt8", "uint8", "uint8_t")
+    | StackOptionUInt16 -> ("blorp_StackOption_UInt16", "uint16", "uint16_t")
+    | StackOptionUInt32 -> ("blorp_StackOption_UInt32", "uint32", "uint32_t")
+    | StackOptionUInt64 -> ("blorp_StackOption_UInt64", "uint64", "uint64_t")
+    | StackOptionFloat -> ("blorp_StackOption_Float", "float", "double")
+    | StackOptionBool -> ("blorp_StackOption_Bool", "bool", "long")
+    | StackOptionChar -> ("blorp_StackOption_Char", "char", "int32_t")
+    | StackOptionFloat32 -> ("blorp_StackOption_Float32", "f32", "float")
+    | StackOptionFloat16 -> ("blorp_StackOption_Float16", "f16", "_Float16")
+  in
+  { c_type; runtime_suffix; payload_c_type }
 
-let runtime_suffix_of_primitive_stack_abi = function
-  | StackOptionVoid -> "void"
-  | StackOptionInt -> "int"
-  | StackOptionInt8 -> "int8"
-  | StackOptionInt16 -> "int16"
-  | StackOptionInt32 -> "int32"
-  | StackOptionInt64 -> "int64"
-  | StackOptionUInt8 -> "uint8"
-  | StackOptionUInt16 -> "uint16"
-  | StackOptionUInt32 -> "uint32"
-  | StackOptionUInt64 -> "uint64"
-  | StackOptionFloat -> "float"
-  | StackOptionBool -> "bool"
-  | StackOptionChar -> "char"
-  | StackOptionFloat32 -> "f32"
-  | StackOptionFloat16 -> "f16"
+let c_type_of_primitive_stack_abi abi = (primitive_stack_abi_info abi).c_type
 
-let payload_c_type_of_primitive_stack_abi = function
-  | StackOptionVoid -> "long"
-  | StackOptionInt -> "long"
-  | StackOptionInt8 -> "int8_t"
-  | StackOptionInt16 -> "int16_t"
-  | StackOptionInt32 -> "int32_t"
-  | StackOptionInt64 -> "long"
-  | StackOptionUInt8 -> "uint8_t"
-  | StackOptionUInt16 -> "uint16_t"
-  | StackOptionUInt32 -> "uint32_t"
-  | StackOptionUInt64 -> "uint64_t"
-  | StackOptionFloat -> "double"
-  | StackOptionBool -> "long"
-  | StackOptionChar -> "int32_t"
-  | StackOptionFloat32 -> "float"
-  | StackOptionFloat16 -> "_Float16"
+let runtime_suffix_of_primitive_stack_abi abi =
+  (primitive_stack_abi_info abi).runtime_suffix
+
+let payload_c_type_of_primitive_stack_abi abi =
+  (primitive_stack_abi_info abi).payload_c_type
 
 let apply_alias_subst = Core_type_layout.apply_alias_subst
 
@@ -188,8 +172,7 @@ let scalar_payload_of_type meta ty =
 
 let string_of_type ty = Types.type_to_string ty
 
-let classify_payload meta payload_ty =
-  let payload_ty = expand_aliases meta [] payload_ty in
+let classify_expanded_payload meta payload_ty =
   match scalar_payload_of_type meta payload_ty with
   | Some scalar -> Known (StackScalar scalar)
   | None -> (
@@ -216,10 +199,14 @@ let classify_payload meta payload_ty =
           | Core_type_layout.Unknown_named name -> Unknown_named name
           | Core_type_layout.Invalid_value_type msg -> Invalid_option_type msg))
 
+let classify_payload meta payload_ty =
+  classify_expanded_payload meta (expand_aliases meta [] payload_ty)
+
 let classify (meta : Core_type_layout.metadata) (option_ty : Ast.type_expr) :
     classification =
   match expand_aliases meta [] option_ty with
-  | Ast.TyNamed ("Option", [ payload_ty ]) -> classify_payload meta payload_ty
+  | Ast.TyNamed ("Option", [ payload_ty ]) ->
+      classify_expanded_payload meta payload_ty
   | Ast.TyNamed ("Option", args) ->
       Invalid_option_type
         (Printf.sprintf "Option expects 1 argument, got %d" (List.length args))
@@ -231,8 +218,7 @@ let nullable_managed_payload_type (meta : Core_type_layout.metadata)
     (option_ty : Ast.type_expr) : Ast.type_expr option =
   match expand_aliases meta [] option_ty with
   | Ast.TyNamed ("Option", [ payload_ty ]) -> (
-      let payload_ty = expand_aliases meta [] payload_ty in
-      match classify_payload meta payload_ty with
+      match classify_expanded_payload meta payload_ty with
       | Known NullableManagedPointer -> Some payload_ty
       | Known (StackScalar _ | StackValueRecord _ | BoxedUnion _)
       | Unknown_named _ | Invalid_option_type _ ->

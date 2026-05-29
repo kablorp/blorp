@@ -10,6 +10,8 @@ let field = Fmt_expr_json.field
 let obj = Fmt_expr_json.obj
 let array = Fmt_expr_json.array
 let string_array values = array (List.map string values)
+let doctest_header = "doctests:"
+let doctest_indent = "    "
 
 let string_starts_with s prefix =
   let s_len = String.length s in
@@ -29,7 +31,9 @@ let strip_blank_edges lines =
 
 let strip_doctest_indent line =
   let len = String.length line in
-  if len >= 4 && String.sub line 0 4 = "    " then String.sub line 4 (len - 4)
+  let indent_len = String.length doctest_indent in
+  if len >= indent_len && String.sub line 0 indent_len = doctest_indent then
+    String.sub line indent_len (len - indent_len)
   else if len >= 1 && line.[0] = '\t' then String.sub line 1 (len - 1)
   else line
 
@@ -44,28 +48,25 @@ let delimiter_desc line =
 let split_prefix lines =
   let rec loop acc = function
     | [] -> None
-    | line :: rest when String.trim line = "doctests:" ->
+    | line :: rest when String.trim line = doctest_header ->
         Some (List.rev acc, rest)
     | line :: rest -> loop (line :: acc) rest
   in
   loop [] lines
 
+let finish_group current_desc current_code groups =
+  match current_desc with
+  | Some desc -> (desc, List.rev current_code) :: groups
+  | None -> groups
+
 let split_groups lines =
   let rec loop current_desc current_code groups = function
     | [] ->
-        let groups =
-          match current_desc with
-          | Some desc -> (desc, List.rev current_code) :: groups
-          | None -> groups
-        in
+        let groups = finish_group current_desc current_code groups in
         Some (List.rev groups)
     | line :: rest -> (
         if is_delimiter line then
-          let groups =
-            match current_desc with
-            | Some desc -> (desc, List.rev current_code) :: groups
-            | None -> groups
-          in
+          let groups = finish_group current_desc current_code groups in
           loop (Some (delimiter_desc line)) [] groups rest
         else
           match current_desc with
@@ -80,8 +81,9 @@ let separate_imports lines =
   | first :: rest when String.trim first = "import:" ->
       let rec consume acc = function
         | line :: remaining
-          when string_starts_with line "    " && String.trim line <> "" ->
-            consume (("    " ^ String.trim line) :: acc) remaining
+          when string_starts_with line doctest_indent && String.trim line <> ""
+          ->
+            consume ((doctest_indent ^ String.trim line) :: acc) remaining
         | remaining -> (List.rev acc, remaining)
       in
       let imports, remaining = consume [] rest in

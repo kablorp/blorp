@@ -108,6 +108,21 @@ let rec transform_expr (e : expr) : expr =
 and transform_func (func : func_decl) : func_decl =
   { func with func_body = map_func_body_expr transform_expr func.func_body }
 
+and transform_trait_method (method_ : trait_method) : trait_method =
+  {
+    method_ with
+    method_default_body = Option.map transform_expr method_.method_default_body;
+  }
+
+and transform_impl (impl : impl_decl) : impl_decl =
+  { impl with impl_methods = List.map transform_func impl.impl_methods }
+
+and transform_trait (trait : trait_decl) : trait_decl =
+  {
+    trait with
+    trait_methods = List.map transform_trait_method trait.trait_methods;
+  }
+
 (** Transform a single declaration. *)
 let rec transform_decl (decl : decl) : decl =
   match decl.decl_desc with
@@ -118,34 +133,8 @@ let rec transform_decl (decl : decl) : decl =
         decl_desc = DVar { var with var_value = transform_expr var.var_value };
       }
   | DPrivate inner -> { decl with decl_desc = DPrivate (transform_decl inner) }
-  | DImpl impl ->
-      {
-        decl with
-        decl_desc =
-          DImpl
-            {
-              impl with
-              impl_methods = List.map transform_func impl.impl_methods;
-            };
-      }
-  | DTrait trait ->
-      {
-        decl with
-        decl_desc =
-          DTrait
-            {
-              trait with
-              trait_methods =
-                List.map
-                  (fun m ->
-                    {
-                      m with
-                      method_default_body =
-                        Option.map transform_expr m.method_default_body;
-                    })
-                  trait.trait_methods;
-            };
-      }
+  | DImpl impl -> { decl with decl_desc = DImpl (transform_impl impl) }
+  | DTrait trait -> { decl with decl_desc = DTrait (transform_trait trait) }
   | DType _ | DRecord _ | DImport _ | DTypeAlias _ -> decl
 
 (** Transform a full program. Must be called {b after}

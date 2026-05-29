@@ -31,37 +31,48 @@ let dispatch_for_key ~reg key_ty =
   | Ast.TyNamed _ -> HashCustom key_ty
   | _ -> HashGeneric
 
-let dict_constructor_kind ~reg key_ty =
-  match dispatch_for_key ~reg key_ty with
+let dict_constructor_kind_of_dispatch = function
   | HashString -> Core.DictString
   | HashFloat -> Core.DictFloat
   | HashGeneric -> Core.DictGeneric
   | HashCustom key_ty -> Core.DictCustom key_ty
 
-let set_constructor_kind ~reg elem_ty =
-  match dispatch_for_key ~reg elem_ty with
+let set_constructor_kind_of_dispatch = function
   | HashString -> Core.SetString
   | HashFloat -> Core.SetFloat
   | HashGeneric -> Core.SetGeneric
   | HashCustom elem_ty -> Core.SetCustom elem_ty
 
-let dict_constructor_builtin_name ~reg key_ty =
-  match dispatch_for_key ~reg key_ty with
+let dict_constructor_builtin_name_of_dispatch = function
   | HashString -> "blorp_dict_new_string"
   | HashFloat -> "blorp_dict_new_float"
   | HashGeneric -> "blorp_dict_new"
   | HashCustom _ -> "blorp_dict_new_custom"
 
-let dict_capacity_constructor_builtin_name ~reg key_ty =
-  match dispatch_for_key ~reg key_ty with
+let dict_capacity_constructor_builtin_name_of_dispatch = function
   | HashString -> "blorp_dict_with_capacity_string"
   | HashFloat -> "blorp_dict_with_capacity_float"
   | HashGeneric -> "blorp_dict_with_capacity"
   | HashCustom _ -> "blorp_dict_with_capacity_custom"
 
-let set_constructor_builtin_name ~reg elem_ty =
-  match dispatch_for_key ~reg elem_ty with
+let set_constructor_builtin_name_of_dispatch = function
   | HashString -> "blorp_set_new_string"
   | HashFloat -> "blorp_set_new_float"
   | HashGeneric -> "blorp_set_new"
   | HashCustom _ -> "blorp_set_new_custom"
+
+let dict_constructor_kind ~reg key_ty =
+  dispatch_for_key ~reg key_ty |> dict_constructor_kind_of_dispatch
+
+let set_constructor_kind ~reg elem_ty =
+  dispatch_for_key ~reg elem_ty |> set_constructor_kind_of_dispatch
+
+let dict_constructor_builtin_name ~reg key_ty =
+  dispatch_for_key ~reg key_ty |> dict_constructor_builtin_name_of_dispatch
+
+let dict_capacity_constructor_builtin_name ~reg key_ty =
+  dispatch_for_key ~reg key_ty
+  |> dict_capacity_constructor_builtin_name_of_dispatch
+
+let set_constructor_builtin_name ~reg elem_ty =
+  dispatch_for_key ~reg elem_ty |> set_constructor_builtin_name_of_dispatch

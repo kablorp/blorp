@@ -88,8 +88,7 @@ let is_immediate_integer_name = function
   | "Int128" | "UInt128" -> false
   | name -> List.mem name Types.all_int_type_names
 
-let payload_is_stack_erased meta payload_ty =
-  match expand_aliases meta [] payload_ty with
+let expanded_payload_is_stack_erased meta = function
   | Ast.TyNamed (("Int" | "Bool" | "Char" | "Ptr"), []) -> true
   | Ast.TyNamed (("Float" | "Float32" | "Float16"), []) -> true
   | Ast.TyNamed (name, []) when is_immediate_integer_name name -> true
@@ -98,6 +97,9 @@ let payload_is_stack_erased meta payload_ty =
   | Ast.TyVar name when Types.Dim.is_var_name name -> true
   | Ast.TyConstInt _ | Ast.TyDimOp _ -> true
   | _ -> false
+
+let payload_is_stack_erased meta payload_ty =
+  expanded_payload_is_stack_erased meta (expand_aliases meta [] payload_ty)
 
 let is_builtin_managed_payload_name = function
   | "String" | "List" | "ParallelList" | "ParallelVector" | "ParallelMatrix"
@@ -115,10 +117,9 @@ type payload_status =
   | PayloadUnknownNamed of string
   | PayloadUnsupported of string
 
-let payload_status meta payload_ty =
-  let ty = expand_aliases meta [] payload_ty in
+let payload_status_of_expanded meta ty =
   if contains_generic_type ty then PayloadGeneric
-  else if payload_is_stack_erased meta ty then PayloadErased
+  else if expanded_payload_is_stack_erased meta ty then PayloadErased
   else
     match ty with
     | Ast.TyNamed (("Int128" | "UInt128"), []) -> PayloadManaged
@@ -137,6 +138,9 @@ let payload_status meta payload_ty =
         PayloadGeneric
     | Ast.TyRange _ | Ast.TyConstInt _ | Ast.TyDimOp _ -> PayloadErased
 
+let payload_status meta payload_ty =
+  payload_status_of_expanded meta (expand_aliases meta [] payload_ty)
+
 let classification_from_payloads ok_status err_status =
   match (ok_status, err_status) with
   | PayloadErased, PayloadErased -> Known StackErased
@@ -151,8 +155,8 @@ let classification_from_payloads ok_status err_status =
 let classify (meta : metadata) (result_ty : Ast.type_expr) : classification =
   match expand_aliases meta [] result_ty with
   | Ast.TyNamed ("Result", [ ok_ty; err_ty ]) ->
-      let ok_status = payload_status meta ok_ty in
-      let err_status = payload_status meta err_ty in
+      let ok_status = payload_status_of_expanded meta ok_ty in
+      let err_status = payload_status_of_expanded meta err_ty in
       classification_from_payloads ok_status err_status
   | Ast.TyNamed ("Result", args) ->
       Invalid_result_type

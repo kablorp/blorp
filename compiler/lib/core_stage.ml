@@ -77,6 +77,9 @@ let to_string = function
   | Closure -> "closure"
   | Final -> "final"
 
+let stage_names = List.map (fun stage -> (to_string stage, stage)) all
+let valid_stage_names = List.map fst stage_names
+
 (* Small local Levenshtein — Core_stage intentionally has no deps beyond
    stdlib. Duplication with [Env.levenshtein] is acceptable; a shared
    helper module would require a new layer to avoid cycles. *)
@@ -105,44 +108,30 @@ let closest_stage s =
   let max_dist = max 1 ((String.length s / 3) + 1) in
   let scored =
     List.filter_map
-      (fun stage ->
-        let name = to_string stage in
+      (fun name ->
         let d = edit_distance s name in
         if d <= max_dist then Some (name, d) else None)
-      all
+      valid_stage_names
   in
   match List.sort (fun (_, a) (_, b) -> compare a b) scored with
   | (best, _) :: _ -> Some best
   | [] -> None
 
+let unknown_stage_error original normalized =
+  let suggestion =
+    match closest_stage normalized with
+    | Some name -> Printf.sprintf " (did you mean %S?)" name
+    | None -> ""
+  in
+  let valid = String.concat ", " valid_stage_names in
+  Error
+    (Printf.sprintf "unknown stage %S%s (valid: %s)" original suggestion valid)
+
 let of_string s =
   let normalized = String.lowercase_ascii (String.trim s) in
-  match normalized with
-  | "lower" -> Ok Lower
-  | "debug" -> Ok Debug
-  | "desugar" -> Ok Desugar
-  | "mono" -> Ok Mono
-  | "synth" -> Ok Synth
-  | "match" -> Ok Match
-  | "trait_resolve" -> Ok TraitResolve
-  | "resolve" -> Ok Resolve
-  | "std_inline" -> Ok StdInline
-  | "tailrec" -> Ok Tailrec
-  | "fusion" -> Ok Fusion
-  | "specialize" -> Ok Specialize
-  | "dce" -> Ok Dce
-  | "perceus" -> Ok Perceus
-  | "reuse" -> Ok Reuse
-  | "closure" -> Ok Closure
-  | "final" -> Ok Final
-  | _ ->
-      let suggestion =
-        match closest_stage normalized with
-        | Some name -> Printf.sprintf " (did you mean %S?)" name
-        | None -> ""
-      in
-      let valid = String.concat ", " (List.map to_string all) in
-      Error (Printf.sprintf "unknown stage %S%s (valid: %s)" s suggestion valid)
+  match List.assoc_opt normalized stage_names with
+  | Some stage -> Ok stage
+  | None -> unknown_stage_error s normalized
 
 (** Parse a comma-separated list of stage names. Used by the CLI so
     [--dump-core-after=desugar,mono] produces multiple dumps from a

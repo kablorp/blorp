@@ -34,11 +34,15 @@ let descriptor name capabilities =
       invalid_arg ("Builtin_metadata.descriptor: " ^ name ^ " has no behavior")
   | _ -> { name; capabilities }
 
-let effects name effects =
-  descriptor name (List.map (fun e -> Effect e) effects)
+let effect_capability builtin_effect = Effect builtin_effect
+
+let special_inference_capability special_inference =
+  Special_inference special_inference
+
+let effects name effects = descriptor name (List.map effect_capability effects)
 
 let special name special_inference =
-  descriptor name [ Special_inference special_inference ]
+  descriptor name [ special_inference_capability special_inference ]
 
 let descriptors =
   [
@@ -152,21 +156,24 @@ let descriptors =
 module StringMap = Map.Make (String)
 module StringSet = Set.Make (String)
 
+let add_duplicate_name (seen, duplicates) { name; _ } =
+  if StringSet.mem name seen then (seen, StringSet.add name duplicates)
+  else (StringSet.add name seen, duplicates)
+
 let duplicate_names =
   let _seen, duplicates =
-    List.fold_left
-      (fun (seen, duplicates) { name; _ } ->
-        if StringSet.mem name seen then (seen, StringSet.add name duplicates)
-        else (StringSet.add name seen, duplicates))
+    List.fold_left add_duplicate_name
       (StringSet.empty, StringSet.empty)
       descriptors
   in
   StringSet.elements duplicates
 
+let descriptor_is_inert { capabilities; _ } = capabilities = []
+
 let inert_descriptor_names =
   descriptors
-  |> List.filter_map (fun { name; capabilities } ->
-      match capabilities with [] -> Some name | _ -> None)
+  |> List.filter_map (fun ({ name; _ } as d) ->
+      if descriptor_is_inert d then Some name else None)
   |> List.sort_uniq String.compare
 
 let registry =
@@ -182,25 +189,25 @@ let registry =
 let find name = StringMap.find_opt name registry
 let is_registered name = Option.is_some (find name)
 
+let capability_matches_effect builtin_effect = function
+  | Effect e -> e = builtin_effect
+  | Special_inference _ -> false
+
 let has_effect name builtin_effect =
   match find name with
   | Some d ->
-      List.exists
-        (function
-          | Effect e -> e = builtin_effect | Special_inference _ -> false)
-        d.capabilities
+      List.exists (capability_matches_effect builtin_effect) d.capabilities
   | None -> false
 
 let is_impure name = has_effect name Impure
 let is_parallel_boundary name = has_effect name Parallel_boundary
 let is_cancellation_point name = has_effect name Cancellation_point
 
+let capability_special_inference = function
+  | Special_inference special_inference -> Some special_inference
+  | Effect _ -> None
+
 let special_inference name =
   match find name with
-  | Some d ->
-      List.find_map
-        (function
-          | Special_inference special_inference -> Some special_inference
-          | Effect _ -> None)
-        d.capabilities
+  | Some d -> List.find_map capability_special_inference d.capabilities
   | None -> None

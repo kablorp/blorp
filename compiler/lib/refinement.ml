@@ -26,6 +26,9 @@ let remove_proofs_for_var var proofs =
     (fun (entry_var, _) -> not (collection_identity_equal entry_var var))
     proofs
 
+let replace_proof_for_var var proof proofs =
+  (var, proof) :: remove_proofs_for_var var proofs
+
 let find_proof_for_var var proofs =
   List.find_map
     (fun (entry_var, proof) ->
@@ -43,11 +46,12 @@ let proof_env_without_range env ~var = without_range_name env ~var
 
 let proof_env_add_subscript ?(source = ProofSourceUnknown) env ~var ~collection
     =
-  let env = without_subscript_name env ~var in
   {
     env with
     subscript_proofs =
-      (var, make_subscript_proof ~source ~collection) :: env.subscript_proofs;
+      replace_proof_for_var var
+        (make_subscript_proof ~source ~collection)
+        env.subscript_proofs;
   }
 
 let proof_env_apply_subscript_to_binding env ~var binding =
@@ -60,8 +64,7 @@ let proof_env_apply_subscript_to_binding env ~var binding =
   | None -> binding
 
 let add_range_proof env ~var ~proof =
-  let env = without_range_name env ~var in
-  { env with range_proofs = (var, proof) :: env.range_proofs }
+  { env with range_proofs = replace_proof_for_var var proof env.range_proofs }
 
 let proof_env_add_range_bounds ?source env ~var ~range_start ~range_upper =
   let source = Option.value source ~default:ProofSourceUnknown in

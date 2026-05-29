@@ -56,6 +56,8 @@ type offset_subscript_proof =
   | OffsetProven
   | OffsetRejected of offset_rejection
 
+type index_span = { min_index : int; max_index : int }
+
 let collection_identity_equal (CollectionIdentity a) (CollectionIdentity b) =
   String.equal a b
 
@@ -134,11 +136,7 @@ let binding_add_range_proof binding proof = { binding with range = Some proof }
 
 let binding_add_subscript_proof ?(source = ProofSourceUnknown) binding
     ~collection =
-  {
-    binding with
-    subscript =
-      Some { subscript_collection = collection; subscript_source = source };
-  }
+  { binding with subscript = Some (make_subscript_proof ~source ~collection) }
 
 let binding_range_proof binding = binding.range
 
@@ -164,22 +162,28 @@ let constant_dim_bound dim = if dim < 0 then None else Some (ConstantDim dim)
 let dimension_bound dim = DimensionBound dim
 let collection_length_bound coll = CollectionLength coll
 
+let empty_subscript_bounds =
+  { constant_dims = []; dimension_bounds = []; collection_lengths = [] }
+
+let add_subscript_bound bounds = function
+  | ConstantDim dim ->
+      { bounds with constant_dims = dim :: bounds.constant_dims }
+  | DimensionBound dim ->
+      { bounds with dimension_bounds = dim :: bounds.dimension_bounds }
+  | CollectionLength coll ->
+      { bounds with collection_lengths = coll :: bounds.collection_lengths }
+
+let reverse_subscript_bounds bounds =
+  {
+    constant_dims = List.rev bounds.constant_dims;
+    dimension_bounds = List.rev bounds.dimension_bounds;
+    collection_lengths = List.rev bounds.collection_lengths;
+  }
+
 let subscript_bounds bounds =
-  let rec go constant_dims dimension_bounds collection_lengths = function
-    | [] ->
-        {
-          constant_dims = List.rev constant_dims;
-          dimension_bounds = List.rev dimension_bounds;
-          collection_lengths = List.rev collection_lengths;
-        }
-    | ConstantDim dim :: rest ->
-        go (dim :: constant_dims) dimension_bounds collection_lengths rest
-    | DimensionBound dim :: rest ->
-        go constant_dims (dim :: dimension_bounds) collection_lengths rest
-    | CollectionLength coll :: rest ->
-        go constant_dims dimension_bounds (coll :: collection_lengths) rest
-  in
-  go [] [] [] bounds
+  bounds
+  |> List.fold_left add_subscript_bound empty_subscript_bounds
+  |> reverse_subscript_bounds
 
 let covers_const_dim proof ~dim =
   match proof.range_upper with
@@ -202,20 +206,28 @@ let covers_same_collection proof ~coll =
       proof.range_start >= 0 && collection_identity_equal bounded_coll coll
   | RangeUpperLit _ | RangeUpperDimension _ -> false
 
+let literal_offset_span proof ~upper ~offset =
+  if upper <= proof.range_start then None
+  else
+    Some
+      { min_index = proof.range_start + offset; max_index = upper - 1 + offset }
+
+let offset_span_fits ~dim span =
+  span.min_index >= 0 && span.max_index >= 0 && span.max_index < dim
+
+let offset_span_error ~dim span =
+  Printf.sprintf
+    "index range [%d, %d] exceeds dimension of size %d. Adjust loop bounds to \
+     ensure all accesses are in [0, %d)"
+    span.min_index span.max_index dim dim
+
 let covers_const_dim_with_offset proof ~dim ~offset =
   match proof.range_upper with
-  | RangeUpperLit upper ->
-      if upper <= proof.range_start then Ok ()
-      else
-        let min_val = proof.range_start + offset in
-        let max_val = upper - 1 + offset in
-        if min_val >= 0 && max_val >= 0 && max_val < dim then Ok ()
-        else
-          Error
-            (Printf.sprintf
-               "index range [%d, %d] exceeds dimension of size %d. Adjust loop \
-                bounds to ensure all accesses are in [0, %d)"
-               min_val max_val dim dim)
+  | RangeUpperLit upper -> (
+      match literal_offset_span proof ~upper ~offset with
+      | None -> Ok ()
+      | Some span when offset_span_fits ~dim span -> Ok ()
+      | Some span -> Error (offset_span_error ~dim span))
   | RangeUpperDimension _ | RangeUpperLengthMinus _ | RangeUpperAtMostLength _
     ->
       Error ""
@@ -244,23 +256,27 @@ let proves_direct_subscript_with_bounds proof ~bounds =
 let proves_direct_subscript proof ~bounds =
   proves_direct_subscript_with_bounds proof ~bounds:(subscript_bounds bounds)
 
+let preserve_first_offset_error current = function
+  | "" -> current
+  | msg -> (
+      match current with
+      | OffsetOutOfBounds _ -> current
+      | OffsetNoMatchingBound -> OffsetOutOfBounds msg)
+
+let proves_literal_offset_subscript proof ~dims ~offset =
+  let rec check first_error = function
+    | [] -> OffsetRejected first_error
+    | dim :: rest -> (
+        match covers_const_dim_with_offset proof ~dim ~offset with
+        | Ok () -> OffsetProven
+        | Error msg -> check (preserve_first_offset_error first_error msg) rest)
+  in
+  check OffsetNoMatchingBound dims
+
 let proves_offset_subscript_with_bounds proof ~bounds ~offset =
   match proof.range_upper with
   | RangeUpperLit _ ->
-      let rec check first_error = function
-        | [] -> OffsetRejected first_error
-        | dim :: rest -> (
-            match covers_const_dim_with_offset proof ~dim ~offset with
-            | Ok () -> OffsetProven
-            | Error "" -> check first_error rest
-            | Error msg ->
-                check
-                  (match first_error with
-                  | OffsetOutOfBounds _ -> first_error
-                  | OffsetNoMatchingBound -> OffsetOutOfBounds msg)
-                  rest)
-      in
-      check OffsetNoMatchingBound bounds.constant_dims
+      proves_literal_offset_subscript proof ~dims:bounds.constant_dims ~offset
   | RangeUpperDimension _ -> OffsetRejected OffsetNoMatchingBound
   | RangeUpperLengthMinus _ | RangeUpperAtMostLength _ ->
       if

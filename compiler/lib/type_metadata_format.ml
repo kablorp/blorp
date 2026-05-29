@@ -72,7 +72,8 @@ let value_slot_detail ~value_ty ~semantic_ty =
   if Types.types_equal value_ty semantic_ty then None
   else Some ("value-slot type: " ^ type_to_string value_ty)
 
-let prepend_detail detail details = detail :: details
+let optional_details details =
+  List.filter_map (function Some detail -> Some detail | None -> None) details
 
 let format_debug_type_info (info : Ast.expr_type_info) =
   let source =
@@ -96,25 +97,13 @@ let hover_type_view ?fallback_ty (info : Ast.expr_type_info) =
     match info.source_ty with Some ty -> ty | None -> fallback_ty
   in
   let details =
-    []
-    |> (fun details ->
-    match
-      canonical_or_semantic_detail ~source_ty:info.source_ty ~fallback_ty
-        ~semantic_ty:info.semantic_ty
-    with
-    | Some detail -> prepend_detail detail details
-    | None -> details)
-    |> (fun details ->
-    match
-      value_slot_detail ~value_ty:info.value_ty ~semantic_ty:info.semantic_ty
-    with
-    | Some detail -> prepend_detail detail details
-    | None -> details)
-    |> (fun details ->
-    match widening_detail info.widening with
-    | Some detail -> prepend_detail detail details
-    | None -> details)
-    |> List.rev
+    optional_details
+      [
+        canonical_or_semantic_detail ~source_ty:info.source_ty ~fallback_ty
+          ~semantic_ty:info.semantic_ty;
+        value_slot_detail ~value_ty:info.value_ty ~semantic_ty:info.semantic_ty;
+        widening_detail info.widening;
+      ]
   in
   { primary_type = type_to_string primary_ty; details }
 

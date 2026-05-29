@@ -30,6 +30,7 @@ let test_param_list_helpers () =
 
 let test_constructor_helpers () =
   let param = make_bound_type_param "Item" [ "Hashable"; "Equatable" ] in
+  Alcotest.(check string) "param name" "Item" (bound_type_param_name param);
   Alcotest.(check string)
     "trait ref" "Hashable"
     (trait_ref_name (trait_ref "Hashable"));

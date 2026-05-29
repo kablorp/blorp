@@ -15,6 +15,9 @@ val trait_ref_name : trait_ref -> string
 val trait_ref_names : trait_ref list -> string list
 (** Extract names from trait references, preserving order. *)
 
+val bound_type_param_name : bound_type_param -> string
+(** Extract the declared name from a structured bound param. *)
+
 val make_bound_type_param : string -> string list -> bound_type_param
 (** Build a structured type parameter bound from parser-level trait names. *)
 

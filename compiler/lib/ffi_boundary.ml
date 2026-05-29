@@ -109,6 +109,10 @@ let is_ascii_digit c = c >= '0' && c <= '9'
 let is_c_ident_start c = is_ascii_alpha c || c = '_'
 let is_c_ident_continue c = is_c_ident_start c || is_ascii_digit c
 
+let has_prefix prefix s =
+  let prefix_len = String.length prefix in
+  String.length s >= prefix_len && String.sub s 0 prefix_len = prefix
+
 let exists_char pred s =
   let rec loop i =
     if i >= String.length s then false else pred s.[i] || loop (i + 1)
@@ -201,14 +205,11 @@ let validate_link_tokens flag tokens =
         error ForeignLinkFlag flag
           "-framework must be followed by a framework name"
     | "-pthread" :: rest -> loop rest
-    | token :: rest when String.length token >= 2 && String.sub token 0 2 = "-l"
-      -> (
+    | token :: rest when has_prefix "-l" token -> (
         match validate_library_token flag token with
         | Ok _ -> loop rest
         | Error _ as err -> err)
-    | token :: rest
-      when String.length token >= 2
-           && (String.sub token 0 2 = "-L" || String.sub token 0 2 = "-I") -> (
+    | token :: rest when has_prefix "-L" token || has_prefix "-I" token -> (
         match validate_link_path_token flag token with
         | Ok _ -> loop rest
         | Error _ as err -> err)
@@ -238,17 +239,26 @@ let link_flag_cc_args flag =
 
 let link_flags_cc_args flags = List.concat_map link_flag_cc_args flags
 
+let collect_validation_error result errors =
+  match result with Ok _ -> errors | Error err -> err :: errors
+
 let validate_metadata (foreign : Ast.foreign_func) =
-  let errors = ref [] in
-  let check = function Ok _ -> () | Error err -> errors := err :: !errors in
-  check (validate_c_name foreign.foreign_name);
-  List.iter
-    (fun include_path -> check (validate_include_path include_path))
-    foreign.foreign_includes;
-  List.iter
-    (fun (_platform, flag) -> check (validate_link_flag flag))
-    foreign.foreign_link_flags;
-  List.rev !errors
+  let errors =
+    collect_validation_error (validate_c_name foreign.foreign_name) []
+  in
+  let errors =
+    List.fold_left
+      (fun errors include_path ->
+        collect_validation_error (validate_include_path include_path) errors)
+      errors foreign.foreign_includes
+  in
+  let errors =
+    List.fold_left
+      (fun errors (_platform, flag) ->
+        collect_validation_error (validate_link_flag flag) errors)
+      errors foreign.foreign_link_flags
+  in
+  List.rev errors
 
 let metadata_for_env (env : Env.env) =
   let is_value_record_name name = Env.is_value_record env name in

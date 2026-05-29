@@ -9,6 +9,8 @@
 
 open Core
 
+let phase = Core_error.Stage Core_stage.Lower
+
 let copy_kind_to_core = function
   | Ffi_boundary.StringCopy -> ForeignStringCopy
   | Ffi_boundary.BytesCopy -> ForeignBytesCopy
@@ -16,6 +18,21 @@ let copy_kind_to_core = function
 let copy_spec_for_core_kind = function
   | ForeignStringCopy -> Ffi_boundary.string_copy_spec
   | ForeignBytesCopy -> Ffi_boundary.bytes_copy_spec
+
+let internal_borrow_policy_error param =
+  Core_error.errorf phase param.cp_loc
+    ~hint:"default foreign boundary classification should not produce borrow"
+    "internal error: explicit FFI borrow policy reached default boundary \
+     annotation"
+
+let rejected_default_arg_error param reason =
+  Core_error.errorf phase param.cp_loc
+    ~hint:
+      "typecheck should reject default foreign arguments that cannot be \
+       defensively copied; use @no_copy only for explicit read-only borrows"
+    "default foreign parameter '%s' has no safe boundary policy (%s)"
+    (Var.to_string param.cp_name)
+    (Ffi_boundary.rejected_default_reason_to_string reason)
 
 let classify_default_arg ~metadata (param : core_param) =
   match
@@ -25,33 +42,23 @@ let classify_default_arg ~metadata (param : core_param) =
   | Ffi_boundary.ScalarByValue -> ForeignScalarByValue
   | Ffi_boundary.DefensiveCopy spec ->
       ForeignDefensiveCopy (copy_kind_to_core spec.copy_kind)
-  | Ffi_boundary.ExplicitBorrow ->
-      Core_error.errorf (Core_error.Stage Core_stage.Lower) param.cp_loc
-        ~hint:
-          "default foreign boundary classification should not produce borrow"
-        "internal error: explicit FFI borrow policy reached default boundary \
-         annotation"
+  | Ffi_boundary.ExplicitBorrow -> internal_borrow_policy_error param
   | Ffi_boundary.RejectedDefault reason ->
-      Core_error.errorf (Core_error.Stage Core_stage.Lower) param.cp_loc
-        ~hint:
-          "typecheck should reject default foreign arguments that cannot be \
-           defensively copied; use @no_copy only for explicit read-only \
-           borrows"
-        "default foreign parameter '%s' has no safe boundary policy (%s)"
-        (Var.to_string param.cp_name)
-        (Ffi_boundary.rejected_default_reason_to_string reason)
+      rejected_default_arg_error param reason
+
+let classify_default_args ~metadata params =
+  List.map (classify_default_arg ~metadata) params
+
+let annotate_func_kind ~metadata params = function
+  | CFForeign ({ arg_passing = ForeignDefaultArgs _; _ } as foreign) ->
+      let policies = classify_default_args ~metadata params in
+      CFForeign { foreign with arg_passing = ForeignDefaultArgs policies }
+  | CFForeign ({ arg_passing = ForeignBorrowArgs; _ } as foreign) ->
+      CFForeign foreign
+  | (CFUser | CFBuiltin | CFClosureBody _) as kind -> kind
 
 let annotate_func ~metadata (f : core_func) =
-  let cf_kind =
-    match f.cf_kind with
-    | CFForeign ({ arg_passing = ForeignDefaultArgs _; _ } as foreign) ->
-        let policies = List.map (classify_default_arg ~metadata) f.cf_params in
-        CFForeign { foreign with arg_passing = ForeignDefaultArgs policies }
-    | CFForeign ({ arg_passing = ForeignBorrowArgs; _ } as foreign) ->
-        CFForeign foreign
-    | CFUser | CFBuiltin | CFClosureBody _ -> f.cf_kind
-  in
-  { f with cf_kind }
+  { f with cf_kind = annotate_func_kind ~metadata f.cf_params f.cf_kind }
 
 let rec annotate_decl ~metadata (d : core_decl) =
   match d.cd_desc with

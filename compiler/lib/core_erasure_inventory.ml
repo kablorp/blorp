@@ -148,6 +148,18 @@ let unbox_site ~reg ~loc (unbox : Core.unbox_op) =
 let boxed_storage_site ~reg ~kind ~loc (value : Core.boxed_storage_value) =
   box_site ~reg ~kind ~loc value.bsv_box
 
+let add_boxed_storage_site ~reg ~kind ~loc value acc =
+  boxed_storage_site ~reg ~kind ~loc value :: acc
+
+let fold_indexed_boxed_sites ~reg ~loc ~kind_of_index values acc =
+  List.fold_left
+    (fun (index, acc) value ->
+      ( index + 1,
+        add_boxed_storage_site ~reg ~kind:(kind_of_index index) ~loc value acc
+      ))
+    (0, acc) values
+  |> snd
+
 let list_elem_type ~(reg : Codegen_types.registry) ty =
   match canonical_type ~reg ty with
   | Ast.TyNamed ("List", [ elem ]) -> Some elem
@@ -202,12 +214,9 @@ let collect_expr_sites ~(reg : Codegen_types.registry) acc (expr : Core.core) =
       match lc.lc_layout.lsl_slots with
       | ListPointerStorage ->
           let acc = add_list_pointer_storage_site ~reg ~loc expr.ty acc in
-          List.mapi (fun i value -> (i, value)) lc.lc_elems
-          |> List.fold_left
-               (fun acc (i, value) ->
-                 boxed_storage_site ~reg ~kind:(ListElementValue i) ~loc value
-                 :: acc)
-               acc
+          fold_indexed_boxed_sites ~reg ~loc
+            ~kind_of_index:(fun i -> ListElementValue i)
+            lc.lc_elems acc
       | ListInlineStorage _ | ListInlineStructStorage _ -> acc)
   | CListHandoff handoff -> (
       match handoff.lh_layout.lsl_slots with
@@ -215,11 +224,9 @@ let collect_expr_sites ~(reg : Codegen_types.registry) acc (expr : Core.core) =
           add_list_pointer_storage_site ~reg ~loc handoff.lh_result_ty acc
       | ListInlineStorage _ | ListInlineStructStorage _ -> acc)
   | CTupleConstruct tuple ->
-      List.mapi (fun i value -> (i, value)) tuple.tc_elems
-      |> List.fold_left
-           (fun acc (i, value) ->
-             boxed_storage_site ~reg ~kind:(TupleField i) ~loc value :: acc)
-           acc
+      fold_indexed_boxed_sites ~reg ~loc
+        ~kind_of_index:(fun i -> TupleField i)
+        tuple.tc_elems acc
   | CDictConstruct dict ->
       List.fold_left
         (fun acc (key, value) ->
@@ -242,21 +249,13 @@ let collect_expr_sites ~(reg : Codegen_types.registry) acc (expr : Core.core) =
       | TensorPackedElements _ -> acc
       | TensorInlineStructElements _ -> acc
       | TensorBoxedElements elems ->
-          List.mapi (fun i value -> (i, value)) elems
-          |> List.fold_left
-               (fun acc (i, value) ->
-                 boxed_storage_site ~reg ~kind:(TensorElement i) ~loc value
-                 :: acc)
-               acc)
+          fold_indexed_boxed_sites ~reg ~loc
+            ~kind_of_index:(fun i -> TensorElement i)
+            elems acc)
   | CUnionConstruct union ->
-      List.mapi (fun i value -> (i, value)) union.uc_args
-      |> List.fold_left
-           (fun acc (i, value) ->
-             boxed_storage_site ~reg
-               ~kind:(UnionPayload (union.uc_constructor_name, i))
-               ~loc value
-             :: acc)
-           acc
+      fold_indexed_boxed_sites ~reg ~loc
+        ~kind_of_index:(fun i -> UnionPayload (union.uc_constructor_name, i))
+        union.uc_args acc
   | CClosureCreate closure ->
       List.fold_left
         (fun acc (name, ty) ->

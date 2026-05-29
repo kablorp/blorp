@@ -28,14 +28,15 @@ type decision = Type_widening_metadata.decision =
 type value_slot = { semantic_ty : type_expr; decision : decision }
 
 let semantic_type slot = slot.semantic_ty
-
-let value_type slot =
-  match slot.decision with Keep ty -> ty | Widen { to_ty; _ } -> to_ty
-
 let decision slot = slot.decision
+let decision_value_type = function Keep ty -> ty | Widen { to_ty; _ } -> to_ty
 
-let widening_reason slot =
-  match slot.decision with Keep _ -> None | Widen { reason; _ } -> Some reason
+let decision_reason = function
+  | Keep _ -> None
+  | Widen { reason; _ } -> Some reason
+
+let value_type slot = decision_value_type slot.decision
+let widening_reason slot = decision_reason slot.decision
 
 let collection_kind_to_string = function
   | ListLiteral -> "ListLiteral"
@@ -105,6 +106,12 @@ let can_use_concrete_argument_target ~target_ty ~semantic_ty =
   | TyNamed ("Int", []), TyConstInt _ -> true
   | _ -> false
 
+let target_keeps_semantic_slot = function
+  | ty when Types.collect_type_vars ty <> [] -> true
+  | ty when Types.Dim.is_value_dim ty -> true
+  | TyVarDims _ -> true
+  | _ -> false
+
 let mutable_binding_slot semantic_ty =
   singleton_int_slot MutableBinding semantic_ty
 
@@ -117,9 +124,7 @@ let argument_target_slot ~param_ty semantic_ty =
   match param_ty with
   | ty when param_accepts_singleton_argument_widening ty ->
       singleton_int_slot ArgumentSlot semantic_ty
-  | ty when Types.collect_type_vars ty <> [] -> keep_slot semantic_ty
-  | ty when Types.Dim.is_value_dim ty -> keep_slot semantic_ty
-  | TyVarDims _ -> keep_slot semantic_ty
+  | ty when target_keeps_semantic_slot ty -> keep_slot semantic_ty
   | target_ty when can_use_concrete_argument_target ~target_ty ~semantic_ty ->
       target_slot ArgumentSlot ~semantic_ty ~value_ty:target_ty
   | _ -> keep_slot semantic_ty

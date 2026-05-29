@@ -43,13 +43,15 @@ let reg_of_model (Model { reg }) = reg
 let canonical_type model ty =
   Core_layout_type.canonical_type ~reg:(reg_of_model model) ty
 
+let scalar_name_is_unboxed_pipeline_eligible = function
+  | "Int" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32"
+  | "UInt64" | "Bool" | "Char" | "Float" | "Float32" | "Float16" ->
+      true
+  | _ -> false
+
 let type_is_unboxed_pipeline_scalar model ty =
   match canonical_type model ty with
-  | Ast.TyNamed
-      ( ( "Int" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16"
-        | "UInt32" | "UInt64" | "Bool" | "Char" | "Float" | "Float32"
-        | "Float16" ),
-        [] ) ->
+  | Ast.TyNamed (name, []) when scalar_name_is_unboxed_pipeline_eligible name ->
       true
   | Ast.TyRange _ -> true
   | _ -> false
@@ -76,24 +78,34 @@ let classify_value_layout model ty =
       Ineligible (UnknownLayout name)
   | Core_layout_type.SourceValueInvalid msg -> Ineligible (InvalidValueType msg)
 
+let stage_types_match_source model ~source_elem_ty stage_value_tys =
+  List.for_all
+    (fun stage_ty -> canonical_types_equal model source_elem_ty stage_ty)
+    stage_value_tys
+
+let source_uses_arc_boxed_storage model source_elem_ty =
+  match
+    Core_layout_type.boxed_storage_scalar_kind ~reg:(reg_of_model model)
+      source_elem_ty
+  with
+  | Core_layout_type.BoxedStorageArcBoxedScalar -> true
+  | Core_layout_type.BoxedStorageInlineScalar
+  | Core_layout_type.BoxedStorageNonScalar ->
+      false
+
+let collect_result_elem_ty model ~source_elem_ty ~result_ty =
+  match list_elem_ty result_ty with
+  | Some result_elem_ty
+    when canonical_types_equal model source_elem_ty result_elem_ty ->
+      Some result_elem_ty
+  | _ -> None
+
 let same_type_source_access_policy model ~(source_elem_ty : Ast.type_expr)
     ~(stage_value_tys : Ast.type_expr list) : source_access_policy eligibility =
-  if
-    not
-      (List.for_all
-         (fun stage_ty -> canonical_types_equal model source_elem_ty stage_ty)
-         stage_value_tys)
-  then Ineligible NotSameTypeCollect
-  else if
-    match
-      Core_layout_type.boxed_storage_scalar_kind ~reg:(reg_of_model model)
-        source_elem_ty
-    with
-    | Core_layout_type.BoxedStorageArcBoxedScalar -> true
-    | Core_layout_type.BoxedStorageInlineScalar
-    | Core_layout_type.BoxedStorageNonScalar ->
-        false
-  then Ineligible ArcBoxedScalarStorage
+  if not (stage_types_match_source model ~source_elem_ty stage_value_tys) then
+    Ineligible NotSameTypeCollect
+  else if source_uses_arc_boxed_storage model source_elem_ty then
+    Ineligible ArcBoxedScalarStorage
   else
     match classify_value_layout model source_elem_ty with
     | Eligible layout ->
@@ -112,9 +124,8 @@ let same_type_collect_policy_for_stages model ~filter_map_payload_policy
   with
   | Ineligible reason -> Ineligible reason
   | Eligible source_policy -> (
-      match list_elem_ty result_ty with
-      | Some result_elem_ty
-        when canonical_types_equal model source_elem_ty result_elem_ty ->
+      match collect_result_elem_ty model ~source_elem_ty ~result_ty with
+      | Some result_elem_ty ->
           Eligible
             {
               source_access = source_policy.sap_access;

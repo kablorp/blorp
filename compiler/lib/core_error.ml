@@ -76,6 +76,16 @@ let to_string (e : t) : string =
   in
   match e.hint with Some h -> base ^ "\n  hint: " ^ h | None -> base
 
+let contains_substring haystack needle =
+  let needle_len = String.length needle in
+  let haystack_len = String.length haystack in
+  let rec search haystack_index =
+    if haystack_index + needle_len > haystack_len then false
+    else if String.sub haystack haystack_index needle_len = needle then true
+    else search (haystack_index + 1)
+  in
+  search 0
+
 (** Test helper: run [f] and assert it raised [Core_error] whose
     [phase] equals [~phase] and whose [msg] contains [~msg_contains]
     as a substring. Raises [Alcotest.Test_error] on mismatch. *)
@@ -97,17 +107,7 @@ let check_raises ~(phase : phase_tag) ~msg_contains f =
              (phase_tag_to_string phase)
              (phase_tag_to_string e.phase)
              e.msg);
-      let contains haystack needle =
-        let hn = String.length needle in
-        let hl = String.length haystack in
-        let rec go i =
-          if i + hn > hl then false
-          else if String.sub haystack i hn = needle then true
-          else go (i + 1)
-        in
-        go 0
-      in
-      if not (contains e.msg msg_contains) then
+      if not (contains_substring e.msg msg_contains) then
         failwith
           (Printf.sprintf "Core_error msg %S does not contain %S" e.msg
              msg_contains)

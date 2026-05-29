@@ -92,6 +92,13 @@ let apply_alias_subst params args body =
       Codegen_types.apply_codegen_subst [ (param, arg) ] acc)
     body subst
 
+let apply_alias_if_arity_matches params args target =
+  if List.length params = List.length args then
+    Some (apply_alias_subst params args target)
+  else None
+
+let option_exists pred = function Some value -> pred value | None -> false
+
 let normalize_for_ownership ty =
   Types.map_type_expr
     (function
@@ -118,8 +125,8 @@ let is_stack_option_payload_type (meta : metadata) (ty : Ast.type_expr) : bool =
     | Ast.TyNamed (name, args) -> (
         match meta.lookup_alias name with
         | Some (params, target) when not (List.mem name seen) ->
-            List.length params = List.length args
-            && go (name :: seen) (apply_alias_subst params args target)
+            apply_alias_if_arity_matches params args target
+            |> option_exists (go (name :: seen))
         | Some _ | None -> false)
     | Ast.TyRange _ -> true
     | _ -> false
@@ -134,8 +141,8 @@ let is_stack_option_type (meta : metadata) (ty : Ast.type_expr) : bool =
     | Ast.TyNamed (name, args) -> (
         match meta.lookup_alias name with
         | Some (params, target) when not (List.mem name seen) ->
-            List.length params = List.length args
-            && is_option (name :: seen) (apply_alias_subst params args target)
+            apply_alias_if_arity_matches params args target
+            |> option_exists (is_option (name :: seen))
         | Some _ | None -> false)
     | _ -> false
   in
@@ -181,14 +188,16 @@ let classify (meta : metadata) (ty : Ast.type_expr) : classification =
                 | None -> (
                     match meta.lookup_alias name with
                     | Some (params, target) when not (List.mem name seen) ->
-                        if List.length params = List.length args then
-                          go (name :: seen)
-                            (apply_alias_subst params args target)
-                        else
-                          Invalid_value_type
-                            (Printf.sprintf
-                               "type alias %s expects %d argument(s), got %d"
-                               name (List.length params) (List.length args))
+                        apply_alias_if_arity_matches params args target
+                        |> Option.fold
+                             ~none:
+                               (Invalid_value_type
+                                  (Printf.sprintf
+                                     "type alias %s expects %d argument(s), \
+                                      got %d"
+                                     name (List.length params)
+                                     (List.length args)))
+                             ~some:(go (name :: seen))
                     | Some _ ->
                         Invalid_value_type
                           (Printf.sprintf
@@ -229,6 +238,10 @@ let layout_or_error ?(phase = Core_error.Other "type_layout")
       Core_error.errorf phase loc
         ~hint:"only runtime value types may participate in ownership analysis"
         "%s" msg
+
+let release_or_error ?(phase = Core_error.Other "type_layout")
+    ?(loc = Ast.dummy_loc) meta ty =
+  (layout_or_error ~phase ~loc meta ty).release
 
 let requires_release (layout : ownership_layout) =
   match layout.release with ArcRelease -> true | NoReleaseNeeded -> false
@@ -276,17 +289,12 @@ let boxed_storage_release_or_error ?(phase = Core_error.Other "type_layout")
     | Ast.TyNamed (name, _) when meta.is_value_record_name name -> ArcRelease
     | Ast.TyNamed (name, args) -> (
         match meta.lookup_alias name with
-        | Some (params, target) when not (List.mem name seen) ->
-            if List.length params = List.length args then
-              go (name :: seen) (apply_alias_subst params args target)
-            else
-              layout_or_error ~phase ~loc meta ty |> fun layout ->
-              layout.release
-        | Some _ ->
-            layout_or_error ~phase ~loc meta ty |> fun layout -> layout.release
-        | None ->
-            layout_or_error ~phase ~loc meta ty |> fun layout -> layout.release)
-    | ty -> layout_or_error ~phase ~loc meta ty |> fun layout -> layout.release
+        | Some (params, target) when not (List.mem name seen) -> (
+            match apply_alias_if_arity_matches params args target with
+            | Some target -> go (name :: seen) target
+            | None -> release_or_error ~phase ~loc meta ty)
+        | Some _ | None -> release_or_error ~phase ~loc meta ty)
+    | ty -> release_or_error ~phase ~loc meta ty
   in
   go [] ty
 

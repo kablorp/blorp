@@ -12,21 +12,21 @@
 
 open Core
 
+let wrap_nonlocal_exit ~cleanups ~rce_exit exit =
+  match cleanups with
+  | [] -> exit
+  | _ :: _ ->
+      {
+        exit with
+        desc = CResourceCleanupExit { rce_cleanups = cleanups; rce_exit };
+      }
+
 let rec rewrite_nonlocal_exits_expr ?(cleanups = []) (expr : core) : core =
   let rewrite = rewrite_nonlocal_exits_expr ~cleanups in
   let rewrite_loop_body body = rewrite_nonlocal_exits_expr ~cleanups:[] body in
-  let cleanup_exit rce_exit exit =
-    match cleanups with
-    | [] -> exit
-    | _ :: _ ->
-        {
-          exit with
-          desc = CResourceCleanupExit { rce_cleanups = cleanups; rce_exit };
-        }
-  in
   match expr.desc with
-  | CBreak -> cleanup_exit ResourceBreak expr
-  | CContinue -> cleanup_exit ResourceContinue expr
+  | CBreak -> wrap_nonlocal_exit ~cleanups ~rce_exit:ResourceBreak expr
+  | CContinue -> wrap_nonlocal_exit ~cleanups ~rce_exit:ResourceContinue expr
   | CResourceCleanupExit _ -> expr
   | CResourceScope scope ->
       {
@@ -74,6 +74,7 @@ let rec rewrite_nonlocal_exits_expr ?(cleanups = []) (expr : core) : core =
   | _ -> Core.map_children rewrite expr
 
 and rewrite_ctree ~cleanups (tree : ctree) : ctree =
+  let rewrite_case (key, subtree) = (key, rewrite_ctree ~cleanups subtree) in
   match tree with
   | CTLeaf leaf ->
       CTLeaf
@@ -86,34 +87,22 @@ and rewrite_ctree ~cleanups (tree : ctree) : ctree =
       CTSwitchTag
         {
           t with
-          cts_cases =
-            List.map
-              (fun (ctor, subtree) -> (ctor, rewrite_ctree ~cleanups subtree))
-              t.cts_cases;
+          cts_cases = List.map rewrite_case t.cts_cases;
           cts_default = Option.map (rewrite_ctree ~cleanups) t.cts_default;
         }
   | CTSwitchLit t ->
       CTSwitchLit
         {
           t with
-          ctl_cases =
-            List.map
-              (fun (lit, subtree) -> (lit, rewrite_ctree ~cleanups subtree))
-              t.ctl_cases;
+          ctl_cases = List.map rewrite_case t.ctl_cases;
           ctl_default = rewrite_ctree ~cleanups t.ctl_default;
         }
   | CTSwitchLen t ->
       CTSwitchLen
         {
           t with
-          ctl_len_cases =
-            List.map
-              (fun (len, subtree) -> (len, rewrite_ctree ~cleanups subtree))
-              t.ctl_len_cases;
-          ctl_len_geq =
-            Option.map
-              (fun (len, subtree) -> (len, rewrite_ctree ~cleanups subtree))
-              t.ctl_len_geq;
+          ctl_len_cases = List.map rewrite_case t.ctl_len_cases;
+          ctl_len_geq = Option.map rewrite_case t.ctl_len_geq;
           ctl_len_default =
             Option.map (rewrite_ctree ~cleanups) t.ctl_len_default;
         }

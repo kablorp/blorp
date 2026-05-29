@@ -15,28 +15,29 @@ open Core
 let void_ty = Ast.TyNamed ("Void", [])
 let void_at (e : core) : core = { desc = CVoid; ty = void_ty; loc = e.loc }
 
+let lower_debug_block ~enabled source body =
+  if enabled then body else void_at source
+
+let lower_expr_node ~enabled e =
+  match e.desc with
+  | CDebugBlock body -> lower_debug_block ~enabled e body
+  | _ -> e
+
 let lower_expr ~(enabled : bool) (expr : core) : core =
-  transform_bottom_up
-    (fun e ->
-      match e.desc with
-      | CDebugBlock body -> if enabled then body else void_at e
-      | _ -> e)
-    expr
+  transform_bottom_up (lower_expr_node ~enabled) expr
 
 let lower_func ~(enabled : bool) (f : core_func) : core_func =
   { f with cf_body = Option.map (lower_expr ~enabled) f.cf_body }
+
+let lower_impl ~(enabled : bool) impl =
+  { impl with ci_methods = List.map (lower_func ~enabled) impl.ci_methods }
 
 let rec lower_decl ~(enabled : bool) (d : core_decl) : core_decl =
   let desc =
     match d.cd_desc with
     | CDFunc f -> CDFunc (lower_func ~enabled f)
     | CDVar v -> CDVar { v with cv_init = lower_expr ~enabled v.cv_init }
-    | CDImpl impl ->
-        CDImpl
-          {
-            impl with
-            ci_methods = List.map (lower_func ~enabled) impl.ci_methods;
-          }
+    | CDImpl impl -> CDImpl (lower_impl ~enabled impl)
     | CDPrivate inner -> CDPrivate (lower_decl ~enabled inner)
     | (CDTrait _ | CDType _ | CDRecord _ | CDImport _ | CDTypeAlias _) as other
       ->

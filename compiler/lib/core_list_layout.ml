@@ -37,26 +37,19 @@ let relayout_expr ~(reg : Codegen_types.registry) (e : core) : core =
 let annotate_expr ~(reg : Codegen_types.registry) (e : core) : core =
   Core.transform_bottom_up (relayout_expr ~reg) e
 
+let annotate_func ~(reg : Codegen_types.registry) fn =
+  { fn with cf_body = Option.map (annotate_expr ~reg) fn.cf_body }
+
+let annotate_impl ~(reg : Codegen_types.registry) impl =
+  { impl with ci_methods = List.map (annotate_func ~reg) impl.ci_methods }
+
 let rec annotate_decl ~(reg : Codegen_types.registry) (decl : core_decl) :
     core_decl =
   let desc =
     match decl.cd_desc with
-    | CDFunc fn ->
-        CDFunc { fn with cf_body = Option.map (annotate_expr ~reg) fn.cf_body }
+    | CDFunc fn -> CDFunc (annotate_func ~reg fn)
     | CDVar v -> CDVar { v with cv_init = annotate_expr ~reg v.cv_init }
-    | CDImpl impl ->
-        CDImpl
-          {
-            impl with
-            ci_methods =
-              List.map
-                (fun fn ->
-                  {
-                    fn with
-                    cf_body = Option.map (annotate_expr ~reg) fn.cf_body;
-                  })
-                impl.ci_methods;
-          }
+    | CDImpl impl -> CDImpl (annotate_impl ~reg impl)
     | CDPrivate inner -> CDPrivate (annotate_decl ~reg inner)
     | (CDTrait _ | CDType _ | CDRecord _ | CDImport _ | CDTypeAlias _) as other
       ->

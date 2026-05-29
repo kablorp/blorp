@@ -40,58 +40,26 @@ let resolve ?(qualify_owner = Fun.id) ctx source =
   in
   { source; canonical }
 
-let annotation ?qualify_owner ctx source = resolve ?qualify_owner ctx source
+let resolve_canonical ?qualify_owner ctx source =
+  (resolve ?qualify_owner ctx source).canonical
 
-let annotation_canonical ?qualify_owner ctx source =
-  (annotation ?qualify_owner ctx source).canonical
-
-let value_ascription ?qualify_owner ctx source =
-  resolve ?qualify_owner ctx source
-
-let value_ascription_canonical ?qualify_owner ctx source =
-  (value_ascription ?qualify_owner ctx source).canonical
-
-let local_binding_annotation ?qualify_owner ctx source =
-  resolve ?qualify_owner ctx source
-
-let local_binding_annotation_canonical ?qualify_owner ctx source =
-  (local_binding_annotation ?qualify_owner ctx source).canonical
-
-let function_parameter_annotation ?qualify_owner ctx source =
-  resolve ?qualify_owner ctx source
-
-let function_parameter_annotation_canonical ?qualify_owner ctx source =
-  (function_parameter_annotation ?qualify_owner ctx source).canonical
-
-let function_return_annotation ?qualify_owner ctx source =
-  resolve ?qualify_owner ctx source
-
-let function_return_annotation_canonical ?qualify_owner ctx source =
-  (function_return_annotation ?qualify_owner ctx source).canonical
-
-let imported_signature ?qualify_owner ctx source =
-  resolve ?qualify_owner ctx source
-
-let imported_signature_canonical ?qualify_owner ctx source =
-  (imported_signature ?qualify_owner ctx source).canonical
-
-let record_field_type ?qualify_owner ctx source =
-  resolve ?qualify_owner ctx source
-
-let record_field_type_canonical ?qualify_owner ctx source =
-  (record_field_type ?qualify_owner ctx source).canonical
-
-let variant_field_type ?qualify_owner ctx source =
-  resolve ?qualify_owner ctx source
-
-let variant_field_type_canonical ?qualify_owner ctx source =
-  (variant_field_type ?qualify_owner ctx source).canonical
-
-let type_alias_target ?qualify_owner ctx source =
-  resolve ?qualify_owner ctx source
-
-let type_alias_target_canonical ?qualify_owner ctx source =
-  (type_alias_target ?qualify_owner ctx source).canonical
-
+let annotation = resolve
+let annotation_canonical = resolve_canonical
+let value_ascription = resolve
+let value_ascription_canonical = resolve_canonical
+let local_binding_annotation = resolve
+let local_binding_annotation_canonical = resolve_canonical
+let function_parameter_annotation = resolve
+let function_parameter_annotation_canonical = resolve_canonical
+let function_return_annotation = resolve
+let function_return_annotation_canonical = resolve_canonical
+let imported_signature = resolve
+let imported_signature_canonical = resolve_canonical
+let record_field_type = resolve
+let record_field_type_canonical = resolve_canonical
+let variant_field_type = resolve
+let variant_field_type_canonical = resolve_canonical
+let type_alias_target = resolve
+let type_alias_target_canonical = resolve_canonical
 let source resolved = resolved.source
 let canonical resolved = resolved.canonical
