@@ -2874,7 +2874,7 @@ let test_emit_concurrent_block () =
     (contains_sub output "blorp_concurrent_join");
   Alcotest.(check bool)
     "registers task cleanup" true
-    (contains_sub output "blorp_task_cancel_join_release");
+    (contains_sub output "blorp_task_cleanup_push_task");
   Alcotest.(check bool)
     "pops task cleanup before normal release" true
     (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_task_");
@@ -3086,7 +3086,7 @@ let test_emit_concurrently_loop_rc_result_uses_spawn_rc () =
     (contains_sub output "blorp_CancelCleanupFrame* __conc_task_cleanups_");
   Alcotest.(check bool)
     "for ... concurrently registers task cleanup" true
-    (contains_sub output "blorp_task_cancel_join_release");
+    (contains_sub output "blorp_task_cleanup_push_task");
   Alcotest.(check bool)
     "for ... concurrently pops task cleanup" true
     (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_tasks_");

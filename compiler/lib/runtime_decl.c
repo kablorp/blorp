@@ -497,11 +497,17 @@ typedef struct {
 #define BLORP_TASK_BATCH_FLUSH_INTERVAL 256L
 typedef void (*blorp_CancelCleanupFn)(void*);
 
+typedef enum {
+    BLORP_CANCEL_CLEANUP_GENERIC = 0,
+    BLORP_CANCEL_CLEANUP_TASK = 1
+} blorp_CancelCleanupKind;
+
 typedef struct blorp_CancelCleanupFrame {
     struct blorp_CancelCleanupFrame* prev;
     const void* slot;
     void* value;
     blorp_CancelCleanupFn release_value;
+    blorp_CancelCleanupKind kind;
     bool active;
 } blorp_CancelCleanupFrame;
 
@@ -776,6 +782,8 @@ void blorp_cleanup_release_arc_only_value(void* value);
 void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
                                     const void* slot, void* value,
                                     blorp_CancelCleanupFn release_value);
+void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
+                                         const void* slot, void* task);
 void __blorp_task_cleanup_pop_slot_slow(const void* slot);
 
 static inline void blorp_task_cleanup_push(blorp_CancelCleanupFrame* frame,
@@ -783,6 +791,13 @@ static inline void blorp_task_cleanup_push(blorp_CancelCleanupFrame* frame,
                                            blorp_CancelCleanupFn release_value) {
     if (__builtin_expect(__blorp_current_task != NULL, 0)) {
         __blorp_task_cleanup_push_slow(frame, slot, value, release_value);
+    }
+}
+
+static inline void blorp_task_cleanup_push_task(blorp_CancelCleanupFrame* frame,
+                                                const void* slot, void* task) {
+    if (__builtin_expect(__blorp_current_task != NULL, 0)) {
+        __blorp_task_cleanup_push_task_slow(frame, slot, task);
     }
 }
 

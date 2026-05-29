@@ -2162,12 +2162,16 @@ static void __blorp_leak_report(void) {
     }
 }
 
-// Pool drain must run BEFORE leak report (atexit runs in reverse registration order)
-static void __blorp_drain_pool_at_exit(void);
+// Runtime teardown must run BEFORE leak report (atexit runs in reverse
+// registration order). Concurrency tests can otherwise report transient task
+// refs that are still owned by worker fibers between waking a joiner and
+// releasing the worker's runtime ref.
+void blorp_thread_pool_shutdown(void);
+static void __blorp_teardown_before_leak_report(void);
 __attribute__((constructor))
 static void __blorp_init_leak_report(void) {
     atexit(__blorp_leak_report);
-    atexit(__blorp_drain_pool_at_exit);  // registered after, so runs before leak report
+    atexit(__blorp_teardown_before_leak_report);  // registered after, so runs before leak report
 }
 
 __attribute__((constructor))
@@ -2225,7 +2229,10 @@ static void blorp_pool_drain(void) {
     }
 }
 
-static void __blorp_drain_pool_at_exit(void) { blorp_pool_drain(); }
+static void __blorp_teardown_before_leak_report(void) {
+    blorp_thread_pool_shutdown();
+    blorp_pool_drain();
+}
 
 void* blorp_alloc(size_t size) {
     void* obj;
@@ -2322,18 +2329,28 @@ static int blorp_io_reactor_take_ready(
 
 typedef void (*blorp_CancelCleanupFn)(void*);
 
+typedef enum {
+    BLORP_CANCEL_CLEANUP_GENERIC = 0,
+    BLORP_CANCEL_CLEANUP_TASK = 1
+} blorp_CancelCleanupKind;
+
 typedef struct blorp_CancelCleanupFrame {
     struct blorp_CancelCleanupFrame* prev;
     const void* slot;
     void* value;
     blorp_CancelCleanupFn release_value;
+    blorp_CancelCleanupKind kind;
     bool active;
 } blorp_CancelCleanupFrame;
 
 void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
                                     const void* slot, void* value,
                                     blorp_CancelCleanupFn release_value);
+void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
+                                         const void* slot, void* task);
 void __blorp_task_cleanup_pop_slot_slow(const void* slot);
+void blorp_task_cancel(void* t);
+void blorp_task_cancel_join_release(void* t);
 
 static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
     blorp_TcpInner* inner,
@@ -15447,8 +15464,25 @@ void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
     frame->slot = slot;
     frame->value = value;
     frame->release_value = release_value;
+    frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
     frame->active = false;
     if (!task || !slot || !release_value) return;
+    frame->prev = task->cleanup_stack;
+    frame->active = true;
+    task->cleanup_stack = frame;
+}
+
+void __blorp_task_cleanup_push_task_slow(blorp_CancelCleanupFrame* frame,
+                                         const void* slot, void* task_value) {
+    blorp_Task* task = (blorp_Task*)__blorp_current_task;
+    if (!frame) return;
+    frame->prev = NULL;
+    frame->slot = slot;
+    frame->value = task_value;
+    frame->release_value = blorp_task_cancel_join_release;
+    frame->kind = BLORP_CANCEL_CLEANUP_TASK;
+    frame->active = false;
+    if (!task || !slot || !task_value) return;
     frame->prev = task->cleanup_stack;
     frame->active = true;
     task->cleanup_stack = frame;
@@ -15466,6 +15500,7 @@ void __blorp_task_cleanup_pop_slot_slow(const void* slot) {
             frame->slot = NULL;
             frame->value = NULL;
             frame->release_value = NULL;
+            frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
             frame->active = false;
             return;
         }
@@ -15492,6 +15527,19 @@ static inline void blorp_task_cleanup_push(blorp_CancelCleanupFrame* frame,
 #endif
 }
 
+static inline void blorp_task_cleanup_push_task(blorp_CancelCleanupFrame* frame,
+                                                const void* slot, void* task) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)slot;
+    (void)task;
+#else
+    if (__builtin_expect(__blorp_current_task != NULL, 0)) {
+        __blorp_task_cleanup_push_task_slow(frame, slot, task);
+    }
+#endif
+}
+
 static inline void blorp_task_cleanup_pop_slot(const void* slot) {
 #if defined(__clang_analyzer__)
     (void)slot;
@@ -15506,6 +15554,17 @@ static void __blorp_task_cleanup_drain(blorp_Task* task) {
     if (!task) return;
     blorp_CancelCleanupFrame* frame = task->cleanup_stack;
     task->cleanup_stack = NULL;
+
+    // Structured task scopes should be cancelled as a group before any cleanup
+    // callback waits for one child. Otherwise a cancelled parent can block on
+    // the first child while sibling tasks remain live and able to consume
+    // channel values intended for the parent after cancellation returns.
+    for (blorp_CancelCleanupFrame* f = frame; f; f = f->prev) {
+        if (f->active && f->kind == BLORP_CANCEL_CLEANUP_TASK && f->value) {
+            blorp_task_cancel(f->value);
+        }
+    }
+
     while (frame) {
         blorp_CancelCleanupFrame* next = frame->prev;
         if (frame->active && frame->release_value) {
@@ -15515,6 +15574,7 @@ static void __blorp_task_cleanup_drain(blorp_Task* task) {
         frame->slot = NULL;
         frame->value = NULL;
         frame->release_value = NULL;
+        frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
         frame->active = false;
         frame = next;
     }
@@ -15672,6 +15732,7 @@ static blorp_Task* __blorp_task_alloc(
 ) {
     bool stats_active = __blorp_scheduler_stats_active();
     blorp_Task* task = (blorp_Task*)blorp_alloc(sizeof(blorp_Task));
+    BLORP_TAG(task, "Task");
     BLORP_SET_DESTRUCTOR(task, blorp_task_destructor);
     task->stats_active_counted = stats_active;
     if (stats_active) {

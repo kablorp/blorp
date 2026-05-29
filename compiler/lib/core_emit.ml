@@ -212,17 +212,14 @@ let emit_task_cancellation_cleanup_push (ctx : Core_emit_context.t) task_c :
   let frame_c = Printf.sprintf "__blorp_task_cleanup_%d" (fresh_temp ctx) in
   emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" frame_c);
   emit_line ctx
-    (Printf.sprintf
-       "blorp_task_cleanup_push(&%s, &%s, (void*)%s, \
-        blorp_task_cancel_join_release);"
-       frame_c task_c task_c)
+    (Printf.sprintf "blorp_task_cleanup_push_task(&%s, &%s, (void*)%s);" frame_c
+       task_c task_c)
 
 let emit_task_array_cancellation_cleanup_push (ctx : Core_emit_context.t)
     cleanups_c slot_c tasks_c : unit =
   emit_line ctx
     (Printf.sprintf
-       "blorp_task_cleanup_push(&%s[%s], &%s[%s], (void*)%s[%s], \
-        blorp_task_cancel_join_release);"
+       "blorp_task_cleanup_push_task(&%s[%s], &%s[%s], (void*)%s[%s]);"
        cleanups_c slot_c tasks_c slot_c tasks_c slot_c)
 
 let emit_heap_pointer_cleanup_push (ctx : Core_emit_context.t) pointer_c : unit
