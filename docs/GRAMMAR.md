@@ -192,6 +192,12 @@ var_decl = "var" IDENT [ ":" type_expr ] "=" expr    (* mutable *)
          | IDENT [ ":" type_expr ] "=" expr ;         (* immutable *)
 ```
 
+**Semantic constraints:**
+- A top-level variable initializer cannot call a function, method, or closure.
+  Union constructors are data construction and are allowed.
+- A top-level variable initializer cannot use a subscript expression, because
+  subscripts lower to runtime helper calls during startup initialization.
+
 ### Type Declarations
 
 ```ebnf

@@ -158,6 +158,12 @@ func variable_examples() -> Int:
     0
 ```
 
+Top-level variable initializers are for data that can be set up without
+running user code before `main`. They may use literals, records, structs,
+tuples, collections, arithmetic, and union constructors, but they cannot call
+functions or methods, use closure calls, or use subscripts that lower to runtime
+helper calls. Move runtime work into `main` or into a function called by `main`.
+
 ### Control Flow
 
 ```blorp

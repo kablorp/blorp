@@ -4330,6 +4330,120 @@ let report_impure_calls state ~func_name ~help_msg impure_calls =
               func_name called_name)))
     state impure_calls
 
+type top_level_initializer_startup_work =
+  | TopLevelInitializerCall of {
+      startup_call_name : string;
+      startup_call_loc : loc;
+    }
+  | TopLevelInitializerSubscript of { startup_subscript_loc : loc }
+
+let resolved_call_is_constructor = function
+  | Some { call_target = CallDirect { origin = CallableConstructor _; _ }; _ }
+    ->
+      true
+  | _ -> false
+
+let source_call_name_for_diagnostic callee resolved =
+  match resolved with
+  | Some { call_target = CallDirect { source_name; _ }; _ } ->
+      Purity_analysis.source_call_name source_name
+  | Some { call_target = CallTraitMethod { method_name; _ }; _ } ->
+      Purity_analysis.source_call_name method_name
+  | Some { call_target = CallClosure _; _ } -> (
+      match callee.expr_desc with
+      | EIdent name -> Purity_analysis.source_call_name name
+      | EFieldAccess (_, name) -> name
+      | _ -> "<expression>")
+  | None -> (
+      match callee.expr_desc with
+      | EIdent name -> Purity_analysis.source_call_name name
+      | EFieldAccess (_, name) -> name
+      | _ -> "<expression>")
+
+(* Subscript_desugar runs before typecheck and currently rewrites source
+   subscripts to ordinary helper calls without preserving a source-syntax tag.
+   Keep these helper names isolated so the top-level startup-call rule can
+   report source-level subscript diagnostics instead of exposing them. *)
+let is_subscript_desugar_call_name = function
+  | "checked_get" | "checked_slice" | "tensor_peel" | "matrix_checked_get"
+  | "tensor3_checked_get" | "tensor4_checked_get" | "tensor5_checked_get" ->
+      true
+  | _ -> false
+
+let resolved_call_is_subscript_desugar resolved =
+  match resolved with
+  | Some { call_target = CallDirect { source_name; _ }; _ } ->
+      is_subscript_desugar_call_name
+        (Purity_analysis.source_call_name source_name)
+  | Some { call_target = CallTraitMethod { method_name; _ }; _ } ->
+      is_subscript_desugar_call_name
+        (Purity_analysis.source_call_name method_name)
+  | Some { call_target = CallClosure _; _ } | None -> false
+
+let collect_top_level_initializer_startup_work (expr : expr) :
+    top_level_initializer_startup_work list =
+  let rec walk expr =
+    match expr.expr_desc with
+    | ELambda _ | EFuncDecl _ -> []
+    | ECall (callee, args) ->
+        let resolved = Ast.expr_resolved_call expr in
+        let nested = List.concat_map walk (callee :: args) in
+        if resolved_call_is_constructor resolved then nested
+        else if resolved_call_is_subscript_desugar resolved then
+          TopLevelInitializerSubscript { startup_subscript_loc = expr.expr_loc }
+          :: nested
+        else
+          TopLevelInitializerCall
+            {
+              startup_call_name =
+                source_call_name_for_diagnostic callee resolved;
+              startup_call_loc = expr.expr_loc;
+            }
+          :: nested
+    | _ -> List.concat_map walk (Ast.expr_children expr)
+  in
+  walk expr
+
+let validate_top_level_initializer_has_no_calls state var_name init =
+  let binding_name = Option.value var_name ~default:"_" in
+  let startup_work = collect_top_level_initializer_startup_work init in
+  List.fold_left
+    (fun st work ->
+      match work with
+      | TopLevelInitializerCall { startup_call_name; startup_call_loc } ->
+          add_error st
+            (error_with startup_call_loc
+               (Printf.sprintf
+                  "top-level initializer '%s' cannot call function '%s'"
+                  binding_name startup_call_name)
+               ~notes:
+                 [
+                   "Top-level values are initialized before main. Function \
+                    calls there create hidden startup work.";
+                 ]
+               ~help:
+                 (Some
+                    "Move the call into main or another function, then \
+                     initialize the top-level value with data that does not \
+                     run code at startup"))
+      | TopLevelInitializerSubscript { startup_subscript_loc } ->
+          add_error st
+            (error_with startup_subscript_loc
+               (Printf.sprintf
+                  "top-level initializer '%s' cannot use a subscript expression"
+                  binding_name)
+               ~notes:
+                 [
+                   "Top-level values are initialized before main. Subscripts \
+                    lower to runtime helper calls there.";
+                 ]
+               ~help:
+                 (Some
+                    "Move the subscript into main or another function, then \
+                     initialize the top-level value with data that does not \
+                     run code at startup")))
+    state startup_work
+
 (** Check purity of pure lambdas nested within an expression.
     This catches pure lambdas inside impure outer functions, which
     collect_impure_calls wouldn't reach since check_purity short-circuits. *)
@@ -4922,6 +5036,13 @@ let rec second_pass (state : check_state) (decls : program) :
             let state =
               match typed_value with
               | Some tv -> check_matches_in_expr state tv
+              | None -> state
+            in
+            let state =
+              match typed_value with
+              | Some tv ->
+                  validate_top_level_initializer_has_no_calls state
+                    var_decl.var_name tv
               | None -> state
             in
             let state, typed_var =
