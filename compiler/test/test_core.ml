@@ -22,7 +22,7 @@ let ty_void = TyNamed ("Void", [])
 let ty_test_resource = TyNamed ("TestResource", [])
 let ty_list_int = TyNamed ("List", [ ty_int ])
 let ty_opt_int = TyNamed ("Option", [ ty_int ])
-let str_flags = { sf_triple = false; sf_raw = false }
+let str_flags = { sf_multiline = false; sf_raw = false }
 
 (** Build a core node with the given desc and type. *)
 let mk d t = { desc = d; ty = t; loc }

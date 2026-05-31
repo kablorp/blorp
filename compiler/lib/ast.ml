@@ -181,8 +181,8 @@ type pattern =
   | PatOr of pattern list  (** p1 | p2 | p3 — or-pattern *)
 
 and string_flags = {
-  sf_triple : bool;  (** Triple-quoted string """...""" *)
-  sf_raw : bool;  (** Raw string r"..." — no escape processing *)
+  sf_multiline : bool;  (** Multiline string block. *)
+  sf_raw : bool;  (** Raw string raw"..." — no escape processing *)
 }
 (** String literal flags *)
 
@@ -274,9 +274,8 @@ and expr_desc =
       (** tensor[i, j, ...] — multi-index access *)
   | ESubscriptAssign of expr * expr list * expr
       (** tensor[i, j, ...] = val — subscript mutation *)
-  | EStringInterp of string_interp_part list * bool
-      (** parts * is_triple_quoted *)
-  | EStringInterpRaw of string * bool  (** raw_content * is_triple_quoted *)
+  | EStringInterp of string_interp_part list * bool  (** parts * is_multiline *)
+  | EStringInterpRaw of string * bool  (** raw_content * is_multiline *)
   | EQuestionBind of string * type_expr option * expr
       (** name ?= expr — propagate Option/Result from the enclosing block *)
   | EWith of with_binding * expr
@@ -819,13 +818,13 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
         ESubscriptMulti (f coll, List.map f indices)
     | ESubscriptAssign (coll, indices, value) ->
         ESubscriptAssign (f coll, List.map f indices, f value)
-    | EStringInterp (parts, is_triple) ->
+    | EStringInterp (parts, is_multiline) ->
         EStringInterp
           ( List.map
               (function
                 | InterpLit _ as lit -> lit | InterpExpr e1 -> InterpExpr (f e1))
               parts,
-            is_triple )
+            is_multiline )
     | EConcurrentlyLoop (var, iter, body, timeout, mt) ->
         EConcurrentlyLoop (var, f iter, f body, Option.map f timeout, mt)
     | EDetach body -> EDetach (f body)

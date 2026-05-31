@@ -212,15 +212,15 @@ let test_compile_ctor_with_int_literal () =
     [
       ( PatConstructor ("Ok", [ PatLiteral (LitInt 0L) ]),
         mk
-          (CLit (LitString ("zero", { sf_triple = false; sf_raw = false })))
+          (CLit (LitString ("zero", { sf_multiline = false; sf_raw = false })))
           ty_str );
       ( PatConstructor ("Ok", [ PatLiteral (LitInt 1L) ]),
         mk
-          (CLit (LitString ("one", { sf_triple = false; sf_raw = false })))
+          (CLit (LitString ("one", { sf_multiline = false; sf_raw = false })))
           ty_str );
       ( PatConstructor ("Ok", [ PatWildcard ]),
         mk
-          (CLit (LitString ("other", { sf_triple = false; sf_raw = false })))
+          (CLit (LitString ("other", { sf_multiline = false; sf_raw = false })))
           ty_str );
       (PatConstructor ("Err", [ PatVar "e" ]), cvar "e" ty_str);
     ]
@@ -245,12 +245,12 @@ let test_compile_ctor_mixed_lit_and_var () =
     [
       ( PatConstructor ("Some", [ PatLiteral (LitInt 42L) ]),
         mk
-          (CLit (LitString ("found", { sf_triple = false; sf_raw = false })))
+          (CLit (LitString ("found", { sf_multiline = false; sf_raw = false })))
           ty_str );
       (PatConstructor ("Some", [ PatVar "x" ]), cvar "x" ty_str);
       ( PatConstructor ("None", []),
         mk
-          (CLit (LitString ("none", { sf_triple = false; sf_raw = false })))
+          (CLit (LitString ("none", { sf_multiline = false; sf_raw = false })))
           ty_str );
     ]
   in
@@ -301,7 +301,7 @@ let test_compile_tuple_simple () =
 let test_compile_tuple_with_literals () =
   (* match p: (0, 0) -> "origin" | (0, _) -> "y" | _ -> "other" *)
   let ty_str = TyNamed ("String", []) in
-  let sf = { sf_triple = false; sf_raw = false } in
+  let sf = { sf_multiline = false; sf_raw = false } in
   let tup_ty = TyTuple [ ty_int; ty_int ] in
   let arms =
     [
@@ -662,7 +662,7 @@ let test_compile_tuple_ctor_elements () =
 let test_compile_tuple_lit_elements () =
   (* match p: (0, 0) -> "origin" | (0, _) -> "y" | (_, 0) -> "x" | _ -> "other" *)
   let ty_str = TyNamed ("String", []) in
-  let sf = { sf_triple = false; sf_raw = false } in
+  let sf = { sf_multiline = false; sf_raw = false } in
   let tup_ty = TyTuple [ ty_int; ty_int ] in
   let arms =
     [

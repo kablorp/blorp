@@ -123,7 +123,7 @@ let test_expr_json_lines_from_source () =
         (string_contains jsonl {|{"tag":"FuncDecl","name":"helper","pure":true|});
       Alcotest.(check bool)
         "includes string interpolation case" true
-        (string_contains jsonl {|{"tag":"StringInterp","triple":false|});
+        (string_contains jsonl {|{"tag":"StringInterp","multiline":false|});
       Alcotest.(check bool)
         "includes debug block case" true
         (string_contains jsonl {|{"tag":"DebugBlock","exprs":[|});

@@ -232,7 +232,7 @@ let literal_to_json = function
           field "tag" (string "String");
           field "text" (string text);
           field "raw" (bool flags.Ast.sf_raw);
-          field "triple" (bool flags.Ast.sf_triple);
+          field "multiline" (bool flags.Ast.sf_multiline);
         ]
   | Ast.LitBool value ->
       obj [ field "tag" (string "Bool"); field "value" (bool value) ]
@@ -903,7 +903,7 @@ let rec expr_to_json expr =
                @ optional_field "type"
                    (Option.map type_expr_to_json binding.with_type)))
       | _ -> None)
-  | Ast.EStringInterp (parts, is_triple) -> (
+  | Ast.EStringInterp (parts, is_multiline) -> (
       let part_to_json = function
         | Ast.InterpLit text ->
             Some
@@ -921,7 +921,7 @@ let rec expr_to_json expr =
             (obj
                [
                  field "tag" (string "StringInterp");
-                 field "triple" (bool is_triple);
+                 field "multiline" (bool is_multiline);
                  field "parts" (array part_jsons);
                ])
       | None -> None)

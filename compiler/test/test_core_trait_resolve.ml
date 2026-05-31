@@ -79,7 +79,7 @@ let widget_stringable_trait =
 let widget_stringable_impl =
   let method_body =
     mk
-      (CLit (LitString ("widget", { sf_triple = false; sf_raw = false })))
+      (CLit (LitString ("widget", { sf_multiline = false; sf_raw = false })))
       ty_string
   in
   let method_func =

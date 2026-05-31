@@ -358,10 +358,77 @@ let starts_dot_continuation lexbuf =
   | Some '.', Some c when is_ident_start_char c || is_digit_char c -> true
   | _ -> false
 
+let starts_pipe_string_continuation lexbuf =
+  match lexbuf_peek lexbuf 0 with
+  | Some '|' -> true
+  | _ -> false
+
 let starts_line_comment lexbuf =
   match lexbuf_peek lexbuf 0, lexbuf_peek lexbuf 1 with
   | Some '-', Some '-' -> true
   | _ -> false
+
+let next_line_starts_with_pipe_margin lexbuf margin_col =
+  let rec loop offset indent =
+    match lexbuf_peek lexbuf offset with
+    | Some ' ' -> loop (offset + 1) (indent + 1)
+    | Some '\t' -> loop (offset + 1) (indent + 4 - (indent mod 4))
+    | Some '|' -> indent = margin_col - 1
+    | _ -> false
+  in
+  loop 0 0
+
+let starts_raw_pipe_block lexbuf =
+  let rec skip_to_next_line offset =
+    match lexbuf_peek lexbuf offset with
+    | Some (' ' | '\t') -> skip_to_next_line (offset + 1)
+    | Some '\n' -> Some (offset + 1)
+    | Some '\r' -> (
+        match lexbuf_peek lexbuf (offset + 1) with
+        | Some '\n' -> Some (offset + 2)
+        | _ -> None)
+    | _ -> None
+  in
+  let rec next_token_is_pipe offset =
+    match lexbuf_peek lexbuf offset with
+    | Some ' ' -> next_token_is_pipe (offset + 1)
+    | Some '\t' -> next_token_is_pipe (offset + 1)
+    | Some '|' -> true
+    | _ -> false
+  in
+  match skip_to_next_line 0 with
+  | Some offset -> next_token_is_pipe offset
+  | None -> false
+
+let append_pipe_line_content ~raw buf line =
+  if raw then begin
+    Buffer.add_string buf line;
+    false
+  end else
+    let len = String.length line in
+    let rec loop i saw_interp =
+      if i >= len then saw_interp
+      else
+        match line.[i] with
+        | '$' when i + 1 < len && line.[i + 1] = '{' ->
+            Buffer.add_char buf '{';
+            loop (i + 2) true
+        | c ->
+            Buffer.add_char buf c;
+            loop (i + 1) saw_interp
+    in
+    loop 0 false
+
+let mark_direct_token tok =
+  state.has_token_on_line <- true;
+  state.just_dedented <- false;
+  tok
+
+let pipe_string_token ~raw content saw_interp =
+  mark_direct_token
+    (if raw then Parser.PIPE_STRING_RAW content
+     else if saw_interp then Parser.PIPE_STRING_INTERP content
+     else Parser.PIPE_STRING content)
 
 (** Check for pending tokens, process line start *)
 (* Decode a UTF-8 byte sequence into a Unicode codepoint.
@@ -493,6 +560,10 @@ rule token = parse
           state.pending_newline <- false;
           state.at_line_start <- false;
           token lexbuf
+        end else if state.pending_newline && starts_pipe_string_continuation lexbuf then begin
+          state.pending_newline <- false;
+          state.at_line_start <- false;
+          token lexbuf
         end else begin
           let _ = handle_indent indent in
           state.at_line_start <- false;
@@ -540,7 +611,36 @@ rule token = parse
   | '<' { update_pos lexbuf; emit_or_pending Parser.LT }
   | '>' { update_pos lexbuf; emit_or_pending Parser.GT }
   | '%' { update_pos lexbuf; emit_or_pending Parser.PERCENT }
-  | '|' { update_pos lexbuf; emit_or_pending Parser.PIPE }
+  | "||" {
+      if not state.has_token_on_line then begin
+        let margin_col = state.col in
+        update_pos lexbuf;
+        state.pending_newline <- false;
+        state.at_line_start <- false;
+        state.has_token_on_line <- true;
+        state.just_dedented <- false;
+        save_string_start ();
+        let buf = Buffer.create 256 in
+        Buffer.add_char buf '|';
+        read_pipe_line margin_col buf false false true lexbuf
+      end else
+        raise (LexError ("blorp uses 'or' instead of '||'", state.line, state.col))
+    }
+  | '|' {
+      if not state.has_token_on_line then begin
+        let margin_col = state.col in
+        update_pos lexbuf;
+        state.pending_newline <- false;
+        state.at_line_start <- false;
+        state.has_token_on_line <- true;
+        state.just_dedented <- false;
+        save_string_start ();
+        read_pipe_line margin_col (Buffer.create 256) false false true lexbuf
+      end else begin
+        update_pos lexbuf;
+        emit_or_pending Parser.PIPE
+      end
+    }
   | '#' { update_pos lexbuf; emit_or_pending Parser.HASH }
   | '@' { update_pos lexbuf; emit_or_pending Parser.AT }
   | '=' { update_pos lexbuf; emit_or_pending Parser.EQUALS }
@@ -551,11 +651,17 @@ rule token = parse
   (* Integer literal *)
   | integer as n { update_pos lexbuf; emit_or_pending (integer_token n) }
 
-  (* Triple-quoted string literal - longest match wins over single quote *)
-  | "\"\"\"" { update_pos lexbuf; check_line_start (); save_string_start (); read_triple_string (Buffer.create 256) lexbuf }
+  (* Triple-quoted strings were removed in favor of aligned pipe strings. *)
+  | "\"\"\"" {
+      update_pos lexbuf;
+      raise (LexError ("triple-quoted strings were removed; use aligned pipe strings for multiline text", state.line, state.col))
+    }
 
-  (* Raw string literal - r"..." with no escape processing *)
-  | "r\"" { update_pos lexbuf; check_line_start (); save_string_start (); read_raw_string (Buffer.create 64) lexbuf }
+  (* Raw string literal - raw"..." with no escape processing *)
+  | "raw\"" { update_pos lexbuf; check_line_start (); save_string_start (); read_raw_string (Buffer.create 64) lexbuf }
+
+  (* Removed compact raw string literal spelling. *)
+  | "r\"" { update_pos lexbuf; raise (LexError ("raw strings use raw\"...\", not r\"...\"", state.line, state.col)) }
 
   (* String literal *)
   | '"' { update_pos lexbuf; check_line_start (); save_string_start (); read_string (Buffer.create 64) lexbuf }
@@ -564,7 +670,18 @@ rule token = parse
   | '\'' { update_pos lexbuf; check_line_start (); read_char lexbuf }
 
   (* Identifiers and keywords *)
-  | ident as id { update_pos lexbuf; emit_or_pending (lookup_ident id) }
+  | ident as id {
+      if id = "raw" && starts_raw_pipe_block lexbuf then begin
+        update_pos lexbuf;
+        state.has_token_on_line <- true;
+        state.just_dedented <- false;
+        save_string_start ();
+        read_raw_pipe_start lexbuf
+      end else begin
+        update_pos lexbuf;
+        emit_or_pending (lookup_ident id)
+      end
+    }
 
   (* End of file *)
   | eof {
@@ -617,7 +734,7 @@ rule token = parse
     }
 
 and read_string buf = parse
-  | '"' { update_pos lexbuf; Parser.STRING (Buffer.contents buf) }
+  | '"' { update_pos lexbuf; mark_direct_token (Parser.STRING (Buffer.contents buf)) }
   | "\\u{" (['0'-'9' 'a'-'f' 'A'-'F']+ as hex) '}' {
       update_pos lexbuf;
       handle_unicode_escape buf hex;
@@ -651,22 +768,22 @@ and read_string buf = parse
       read_string buf lexbuf
     }
   | newline {
-      raise (LexError (Printf.sprintf "Unterminated string literal (started at line %d, column %d). Use triple-quoted strings (\"\"\"...\"\"\") for multiline text" state.string_start_line state.string_start_col, state.line, state.col))
+      raise (LexError (Printf.sprintf "Unterminated string literal (started at line %d, column %d). Use aligned pipe strings for multiline text" state.string_start_line state.string_start_col, state.line, state.col))
     }
   | eof {
       raise (LexError (Printf.sprintf "Unterminated string literal: missing closing '\"' (started at line %d, column %d)" state.string_start_line state.string_start_col, state.line, state.col))
     }
 
-(** Read a raw string literal r"..." — no escape processing, all characters are literal *)
+(** Read a raw string literal raw"..." — no escape processing, all characters are literal *)
 and read_raw_string buf = parse
-  | '"' { update_pos lexbuf; Parser.STRING_RAW (Buffer.contents buf) }
+  | '"' { update_pos lexbuf; mark_direct_token (Parser.STRING_RAW (Buffer.contents buf)) }
   | [^ '"' '\n']+ as s {
       update_pos lexbuf;
       Buffer.add_string buf s;
       read_raw_string buf lexbuf
     }
   | newline {
-      raise (LexError (Printf.sprintf "Raw string cannot span multiple lines (started at line %d, column %d). Use triple-quoted strings (\"\"\"...\"\"\") for multiline text" state.string_start_line state.string_start_col, state.line, state.col))
+      raise (LexError (Printf.sprintf "Raw string cannot span multiple lines (started at line %d, column %d). Use raw followed by an aligned pipe string for raw multiline text" state.string_start_line state.string_start_col, state.line, state.col))
     }
   | eof {
       raise (LexError (Printf.sprintf "Unterminated raw string literal: missing closing '\"' (started at line %d, column %d)" state.string_start_line state.string_start_col, state.line, state.col))
@@ -687,7 +804,7 @@ and read_interp_string prefix buf brace_depth in_string = parse
       end else begin
         state.interp_depth <- max 0 (state.interp_depth - 1);
         let rest = Buffer.contents buf in
-        Parser.STRING_INTERP (prefix ^ rest)
+        mark_direct_token (Parser.STRING_INTERP (prefix ^ rest))
       end
     }
   | "${" {
@@ -761,150 +878,116 @@ and read_interp_string prefix buf brace_depth in_string = parse
       if in_string then
         raise (LexError (Printf.sprintf "Unterminated string inside interpolation expression (started at line %d, column %d)" state.string_start_line state.string_start_col, state.line, state.col))
       else
-        raise (LexError (Printf.sprintf "Unterminated interpolated string (started at line %d, column %d). Use triple-quoted strings (\"\"\"...\"\"\") for multiline text" state.string_start_line state.string_start_col, state.line, state.col))
+        raise (LexError (Printf.sprintf "Unterminated interpolated string (started at line %d, column %d). Use aligned pipe strings for multiline text" state.string_start_line state.string_start_col, state.line, state.col))
     }
   | eof {
       raise (LexError (Printf.sprintf "Unterminated interpolated string: missing closing '\"' (started at line %d, column %d)" state.string_start_line state.string_start_col, state.line, state.col))
     }
 
-and read_triple_string buf = parse
-  | "\"\"\"" { update_pos lexbuf; Parser.TRIPLE_STRING (Buffer.contents buf) }
-  | "\\u{" (['0'-'9' 'a'-'f' 'A'-'F']+ as hex) '}' {
+and read_pipe_line margin_col buf saw_interp raw is_first = parse
+  | ([^ '\n' '\r']* as line) newline {
       update_pos lexbuf;
-      handle_unicode_escape buf hex;
-      read_triple_string buf lexbuf
+      if not is_first then Buffer.add_char buf '\n';
+      let line_saw_interp = append_pipe_line_content ~raw buf line in
+      state.at_line_start <- true;
+      state.has_token_on_line <- false;
+      if next_line_starts_with_pipe_margin lexbuf margin_col then
+        read_pipe_margin margin_col buf (saw_interp || line_saw_interp) raw false lexbuf
+      else begin
+        state.pending_newline <- true;
+        pipe_string_token ~raw (Buffer.contents buf) (saw_interp || line_saw_interp)
+      end
     }
-  | '\\' (_ as c) {
+  | ([^ '\n' '\r']* as line) eof {
       update_pos lexbuf;
-      Buffer.add_char buf (parse_escape c);
-      read_triple_string buf lexbuf
-    }
-  | "${" {
-      update_pos lexbuf;
-      state.interp_depth <- state.interp_depth + 1;
-      if state.interp_depth > 64 then
-        raise (LexError ("string interpolation nested too deeply (max 64)", state.line, state.col));
-      let prefix = Buffer.contents buf in
-      Buffer.clear buf;
-      Buffer.add_char buf '{';
-      read_triple_interp_string prefix buf 1 false lexbuf
-    }
-  | newline {
-      update_pos lexbuf;
-      Buffer.add_char buf '\n';
-      read_triple_string buf lexbuf
-    }
-  | '"' {
-      update_pos lexbuf;
-      Buffer.add_char buf '"';
-      read_triple_string buf lexbuf
-    }
-  | [^ '"' '\\' '\n' '$']+ as s {
-      update_pos lexbuf;
-      Buffer.add_string buf s;
-      read_triple_string buf lexbuf
-    }
-  | '$' {
-      update_pos lexbuf;
-      Buffer.add_char buf '$';
-      read_triple_string buf lexbuf
-    }
-  | eof {
-      raise (LexError (Printf.sprintf "Unterminated triple-quoted string: missing closing \"\"\" (started at line %d, column %d)" state.string_start_line state.string_start_col, state.line, state.col))
+      if not is_first then Buffer.add_char buf '\n';
+      let line_saw_interp = append_pipe_line_content ~raw buf line in
+      pipe_string_token ~raw (Buffer.contents buf) (saw_interp || line_saw_interp)
     }
 
-and read_triple_interp_string prefix buf brace_depth in_string = parse
-  | "\"\"\"" {
+and read_pipe_margin margin_col buf saw_interp raw is_first = parse
+  | whitespace as ws {
       update_pos lexbuf;
-      if brace_depth > 0 && not in_string then
-        raise (LexError ("Unclosed '${' in string interpolation", state.line, state.col))
-      else if in_string then begin
-        (* Triple quote inside a nested string in expression — just buffer *)
-        Buffer.add_string buf "\"\"\"";
-        read_triple_interp_string prefix buf brace_depth in_string lexbuf
-      end else begin
-        state.interp_depth <- max 0 (state.interp_depth - 1);
-        let rest = Buffer.contents buf in
-        Parser.TRIPLE_STRING_INTERP (prefix ^ rest)
-      end
+      let indent = calc_indent ws in
+      if indent <> margin_col - 1 then
+        raise (LexError (Printf.sprintf "Misaligned pipe string marker: expected column %d" margin_col, state.line, state.col))
+      else
+        read_pipe_margin_pipe margin_col buf saw_interp raw is_first lexbuf
     }
-  | "${" {
+  | '|' {
       update_pos lexbuf;
-      if in_string then begin
-        Buffer.add_string buf "${";
-        read_triple_interp_string prefix buf brace_depth in_string lexbuf
-      end else begin
-        Buffer.add_char buf '{';
-        read_triple_interp_string prefix buf (brace_depth + 1) false lexbuf
-      end
+      if margin_col <> 1 then
+        raise (LexError (Printf.sprintf "Misaligned pipe string marker: expected column %d" margin_col, state.line, state.col))
+      else
+        read_pipe_line margin_col buf saw_interp raw is_first lexbuf
     }
-  | '{' {
-      update_pos lexbuf;
-      if in_string then begin
-        Buffer.add_char buf '{';
-        read_triple_interp_string prefix buf brace_depth in_string lexbuf
-      end else if brace_depth > 0 then begin
-        Buffer.add_char buf '{';
-        read_triple_interp_string prefix buf (brace_depth + 1) false lexbuf
-      end else begin
-        Buffer.add_string buf "\\{";
-        read_triple_interp_string prefix buf brace_depth false lexbuf
-      end
+  | _ {
+      raise (LexError (Printf.sprintf "Expected aligned pipe string marker at column %d" margin_col, state.line, state.col))
     }
-  | '}' {
-      update_pos lexbuf;
-      if in_string then begin
-        Buffer.add_char buf '}';
-        read_triple_interp_string prefix buf brace_depth in_string lexbuf
-      end else if brace_depth > 0 then begin
-        Buffer.add_char buf '}';
-        read_triple_interp_string prefix buf (brace_depth - 1) false lexbuf
-      end else begin
-        Buffer.add_string buf "\\}";
-        read_triple_interp_string prefix buf brace_depth false lexbuf
-      end
+  | eof {
+      pipe_string_token ~raw (Buffer.contents buf) saw_interp
     }
-  | "\\u{" (['0'-'9' 'a'-'f' 'A'-'F']+ as hex) '}' {
+
+and read_pipe_margin_pipe margin_col buf saw_interp raw is_first = parse
+  | '|' {
       update_pos lexbuf;
-      Buffer.add_string buf "\\u{";
-      Buffer.add_string buf hex;
-      Buffer.add_char buf '}';
-      read_triple_interp_string prefix buf brace_depth in_string lexbuf
+      read_pipe_line margin_col buf saw_interp raw is_first lexbuf
     }
-  | '\\' (_ as c) {
+  | _ {
+      raise (LexError (Printf.sprintf "Expected aligned pipe string marker at column %d" margin_col, state.line, state.col))
+    }
+  | eof {
+      pipe_string_token ~raw (Buffer.contents buf) saw_interp
+    }
+
+and read_raw_pipe_start = parse
+  | whitespace newline {
       update_pos lexbuf;
-      Buffer.add_char buf '\\';
-      Buffer.add_char buf c;
-      read_triple_interp_string prefix buf brace_depth in_string lexbuf
+      state.at_line_start <- true;
+      state.has_token_on_line <- false;
+      read_raw_pipe_margin lexbuf
     }
   | newline {
       update_pos lexbuf;
-      Buffer.add_char buf '\n';
-      read_triple_interp_string prefix buf brace_depth in_string lexbuf
+      state.at_line_start <- true;
+      state.has_token_on_line <- false;
+      read_raw_pipe_margin lexbuf
     }
-  | '"' {
-      update_pos lexbuf;
-      if brace_depth > 0 then begin
-        (* Inside expression — toggle string context *)
-        Buffer.add_char buf '"';
-        read_triple_interp_string prefix buf brace_depth (not in_string) lexbuf
-      end else begin
-        Buffer.add_char buf '"';
-        read_triple_interp_string prefix buf brace_depth in_string lexbuf
-      end
-    }
-  | '$' {
-      update_pos lexbuf;
-      Buffer.add_char buf '$';
-      read_triple_interp_string prefix buf brace_depth in_string lexbuf
-    }
-  | [^ '"' '{' '}' '\\' '\n' '$']+ as s {
-      update_pos lexbuf;
-      Buffer.add_string buf s;
-      read_triple_interp_string prefix buf brace_depth in_string lexbuf
+  | _ {
+      raise (LexError ("raw pipe strings must start on the next line", state.line, state.col))
     }
   | eof {
-      raise (LexError (Printf.sprintf "Unterminated triple-quoted interpolated string: missing closing \"\"\" (started at line %d, column %d)" state.string_start_line state.string_start_col, state.line, state.col))
+      raise (LexError ("raw pipe strings must start on the next line", state.line, state.col))
+    }
+
+and read_raw_pipe_margin = parse
+  | whitespace as ws {
+      update_pos lexbuf;
+      let margin_col = calc_indent ws + 1 in
+      read_raw_pipe_marker margin_col lexbuf
+    }
+  | '|' {
+      let margin_col = state.col in
+      update_pos lexbuf;
+      read_pipe_line margin_col (Buffer.create 256) false true true lexbuf
+    }
+  | _ {
+      raise (LexError ("raw pipe strings must start with an aligned pipe marker", state.line, state.col))
+    }
+  | eof {
+      raise (LexError ("raw pipe strings must start with an aligned pipe marker", state.line, state.col))
+    }
+
+and read_raw_pipe_marker margin_col = parse
+  | '|' {
+      update_pos lexbuf;
+      read_pipe_line margin_col (Buffer.create 256) false true true lexbuf
+    }
+  | _ {
+      raise (LexError ("raw pipe strings must start with an aligned pipe marker", state.line, state.col))
+    }
+  | eof {
+      raise (LexError ("raw pipe strings must start with an aligned pipe marker", state.line, state.col))
     }
 
 and read_char = parse
@@ -917,12 +1000,12 @@ and read_char = parse
       else if codepoint >= 0xD800 && codepoint <= 0xDFFF then
         raise (LexError (Printf.sprintf "Unicode codepoint U+%s is a surrogate (U+D800..U+DFFF not allowed)" hex, state.line, state.col))
       else
-        Parser.CHAR codepoint
+        mark_direct_token (Parser.CHAR codepoint)
     }
   (* Standard escape sequences *)
   | '\\' (_ as c) '\'' {
       update_pos lexbuf;
-      Parser.CHAR (Char.code (parse_escape c))
+      mark_direct_token (Parser.CHAR (Char.code (parse_escape c)))
     }
   (* Simple character — may be multi-byte UTF-8 *)
   | ([^ '\\' '\'']+ as s) '\'' {
@@ -938,7 +1021,7 @@ and read_char = parse
       (* Reject multiple ASCII chars like 'ab' — those aren't valid char literals *)
       if String.length s > 1 && cp < 128 then
         raise (LexError (Printf.sprintf "Invalid character literal: '%s' is not a single character. Use double quotes for strings: \"%s\"" s s, state.line, state.col));
-      Parser.CHAR cp
+      mark_direct_token (Parser.CHAR cp)
     }
   | _ {
       raise (LexError ("Invalid character literal: expected single character between quotes (e.g., 'a')", state.line, state.col))
@@ -1009,10 +1092,11 @@ let token_to_string = function
   | Parser.BIGINT n -> n
   | Parser.FLOAT f -> string_of_float f
   | Parser.STRING s -> Printf.sprintf "\"%s\"" (String.sub s 0 (min 20 (String.length s)))
-  | Parser.STRING_RAW s -> Printf.sprintf "r\"%s\"" (String.sub s 0 (min 20 (String.length s)))
+  | Parser.STRING_RAW s -> Printf.sprintf "raw\"%s\"" (String.sub s 0 (min 20 (String.length s)))
   | Parser.STRING_INTERP _ -> "interpolated string"
-  | Parser.TRIPLE_STRING s -> Printf.sprintf "\"\"\"%s\"\"\"" (String.sub s 0 (min 20 (String.length s)))
-  | Parser.TRIPLE_STRING_INTERP _ -> "triple-quoted interpolated string"
+  | Parser.PIPE_STRING _ -> "multiline string"
+  | Parser.PIPE_STRING_RAW _ -> "raw pipe string"
+  | Parser.PIPE_STRING_INTERP _ -> "multiline interpolated string"
   | Parser.CHAR _ -> "character literal"
   | Parser.DOCSTRING _ -> "docstring"
   | Parser.LPAREN -> "(" | Parser.RPAREN -> ")"

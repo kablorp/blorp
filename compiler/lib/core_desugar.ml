@@ -122,7 +122,7 @@ let desugar_record_update (field_map : (string, Ast.field_decl list) Hashtbl.t)
 
 let ty_string = Ast.TyNamed ("String", [])
 let ty_int = Ast.TyNamed ("Int", [])
-let str_flags = { Ast.sf_triple = false; sf_raw = false }
+let str_flags = { Ast.sf_multiline = false; sf_raw = false }
 
 (** Map a type to its runtime to_string function name.
     Returns [None] for String (identity). All other types use

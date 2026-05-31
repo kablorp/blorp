@@ -34,7 +34,7 @@ let ty_result_file_reader_error =
   TyNamed ("Result", [ ty_file_reader; ty_io_error ])
 
 let ty_result_int_error = TyNamed ("Result", [ ty_int; ty_io_error ])
-let str_flags = { sf_triple = false; sf_raw = false }
+let str_flags = { sf_multiline = false; sf_raw = false }
 
 let with_type expr ty =
   Blorp.Ast.with_expr_type_info expr (Blorp.Ast.expr_type_info_from_type ty)

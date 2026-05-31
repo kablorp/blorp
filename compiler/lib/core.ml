@@ -628,7 +628,7 @@ and desc =
           uniqueness-guarded fast path. *)
   | CField of core * string  (** record field access *)
   | CStringInterp of interp_part list * bool
-      (** [f"x=${x}"] — sugar, parts * is_triple *)
+      (** [f"x=${x}"] — sugar, parts * is_multiline *)
   (* === Sequencing === *)
   | CLet of binding * core  (** [let x = e1 in e2] (body is the result) *)
   | CBorrowLet of borrowed_binding * core
@@ -1231,13 +1231,13 @@ let rec map_children (f : core -> core) (e : core) : core =
         CTensorRawWrite
           { w with trw_index = f w.trw_index; trw_value = f w.trw_value }
     | CField (e', name) -> CField (f e', name)
-    | CStringInterp (parts, is_triple) ->
+    | CStringInterp (parts, is_multiline) ->
         let parts' =
           List.map
             (function IPLit s -> IPLit s | IPExpr e' -> IPExpr (f e'))
             parts
         in
-        CStringInterp (parts', is_triple)
+        CStringInterp (parts', is_multiline)
     | CLet (b, body) -> CLet ({ b with bind_rhs = f b.bind_rhs }, f body)
     | CBorrowLet (b, body) ->
         CBorrowLet ({ b with borrow_rhs = f b.borrow_rhs }, f body)
@@ -2959,7 +2959,7 @@ module Build = struct
   let lit_bool ~loc b = mk ~loc ~ty:ty_bool (CLit (Ast.LitBool b))
 
   let lit_string ~loc s =
-    let flags = { Ast.sf_triple = false; sf_raw = false } in
+    let flags = { Ast.sf_multiline = false; sf_raw = false } in
     mk ~loc ~ty:ty_string (CLit (Ast.LitString (s, flags)))
 
   let lit_char ~loc c =

@@ -4209,14 +4209,14 @@ and zonk_expr_desc = function
          have rewritten it, or infer should have rejected it before zonking"
   | ESubscriptAssign (c, is, v) ->
       ESubscriptAssign (zonk_expr c, List.map zonk_expr is, zonk_expr v)
-  | EStringInterp (parts, triple) ->
+  | EStringInterp (parts, multiline) ->
       EStringInterp
         ( List.map
             (function
               | InterpLit s -> InterpLit s
               | InterpExpr x -> InterpExpr (zonk_expr x))
             parts,
-          triple )
+          multiline )
   | EQuestionBind (n, ty, v) ->
       EQuestionBind (n, Option.map Types.zonk_type ty, zonk_expr v)
   | EWith (binding, body) ->
@@ -6174,7 +6174,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             (Printf.sprintf "Tuple destructuring requires a tuple type, got %s"
                (type_to_string val_ty)))
   (* String interpolation *)
-  | EStringInterp (parts, is_triple) -> (
+  | EStringInterp (parts, is_multiline) -> (
       (* Check each expression part and ensure it's stringable *)
       let rec check_parts acc = function
         | [] -> Ok (List.rev acc)
@@ -6216,7 +6216,7 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           Ok
             ( ty_string,
               with_inferred_type
-                { expr with expr_desc = EStringInterp (parts', is_triple) }
+                { expr with expr_desc = EStringInterp (parts', is_multiline) }
                 ty_string ))
   (* Subscript reads (ESubscript, ESubscriptMulti) are rewritten to
      call syntax by [Subscript_desugar] before typecheck. Reaching
@@ -7461,7 +7461,7 @@ and infer_type_name ctx expr args loc =
         let lit_expr =
           with_inferred_desc expr
             (ELiteral
-               (LitString (type_str, { sf_triple = false; sf_raw = false })))
+               (LitString (type_str, { sf_multiline = false; sf_raw = false })))
             ty_string
         in
         Ok (ty_string, lit_expr)

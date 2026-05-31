@@ -44,7 +44,7 @@ let tparams names = List.map (fun name -> make_type_param name []) names
 let ty_pair_lists = TyTuple [ ty_list_int; ty_list_int ]
 let ty_pair_dicts = TyTuple [ ty_dict_string_string; ty_dict_string_string ]
 let ty_bool_fn = TyFunc { params = []; return = ty_bool; is_pure = false }
-let str_flags = { sf_triple = false; sf_raw = false }
+let str_flags = { sf_multiline = false; sf_raw = false }
 let mk d t = { desc = d; ty = t; loc }
 let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int
 let cbool b = mk (CLit (LitBool b)) ty_bool

@@ -29,7 +29,7 @@ let ty_result_int_string = TyNamed ("Result", [ ty_int; ty_string ])
 let ty_list_widget = TyNamed ("List", [ ty_widget ])
 let ty_set_widget = TyNamed ("Set", [ ty_widget ])
 let ty_func_int = TyFunc { params = []; return = ty_int; is_pure = true }
-let str_flags = { sf_triple = false; sf_raw = false }
+let str_flags = { sf_multiline = false; sf_raw = false }
 let mk desc ty = { desc; ty; loc }
 let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int
 let cstr s = mk (CLit (LitString (s, str_flags))) ty_string

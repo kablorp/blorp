@@ -283,40 +283,49 @@ row = row.append_char('#')
 row = row.append_str(" done")
 ```
 
-### Multiline Strings (Triple-Quoted)
+### Multiline Strings
 
-Triple-quoted strings (`"""..."""`) can span multiple lines with literal newlines preserved. Embedded `"` and `""` don't need escaping. Interpolation and escape sequences still work:
+Multiline strings use aligned `|` markers. The content after each marker is part
+of the string, and the markers themselves are stripped. Interpolation works the
+same way as in quoted strings:
 
 ```blorp
--- Multiline strings preserve literal newlines
-html: String = """<html>
-  <body>
-    <h1>Hello</h1>
-  </body>
-</html>"""
+html: String =
+    |<html>
+    |  <body>
+    |    <h1>Hello</h1>
+    |  </body>
+    |</html>
 
--- Embedded quotes without escaping
-dialog: String = """She said "hello" to him"""
-
--- Interpolation works in triple-quoted strings
 name: String = "world"
-msg: String = """Dear ${name},
-Welcome to blorp!"""
-
--- Empty triple-quoted string
-empty: String = """"""
+msg: String =
+    |Dear ${name},
+    |Welcome to blorp!
 ```
 
-Note: Triple-quoted strings do NOT strip leading indentation. All whitespace in the source is literal in the string value.
+Use `||` when a multiline string line should start with a literal pipe:
+
+```blorp
+text: String =
+    || starts with a pipe
+```
 
 ### Raw Strings
 
-Raw strings (`r"..."`) have no escape processing and no interpolation. Backslashes are literal:
+Raw strings (`raw"..."`) have no escape processing and no interpolation. Backslashes are literal:
 
 ```blorp
 -- Useful for regex patterns, file paths, etc.
-pattern: String = r"\d+\.\d+"
-path: String = r"C:\Users\name\Documents"
+pattern: String = raw"\d+\.\d+"
+path: String = raw"C:\Users\name\Documents"
+```
+
+Raw multiline strings use `raw` followed by an aligned pipe block:
+
+```blorp
+pattern: String = raw
+    |\d+\.\d+
+    |${not_interpolated}
 ```
 
 ### Comments

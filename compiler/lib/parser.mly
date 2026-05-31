@@ -248,8 +248,9 @@ let apply_concurrently_loop_param params (name, value) =
 %token <string> STRING
 %token <string> STRING_RAW
 %token <string> STRING_INTERP
-%token <string> TRIPLE_STRING
-%token <string> TRIPLE_STRING_INTERP
+%token <string> PIPE_STRING
+%token <string> PIPE_STRING_RAW
+%token <string> PIPE_STRING_INTERP
 %token <int> CHAR
 %token <string> DOCSTRING
 %token LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
@@ -1180,11 +1181,12 @@ primary_expr:
   | n = INT { make_expr_span $symbolstartpos $endpos (ELiteral (LitInt n)) }
   | n = BIGINT { make_expr_span $symbolstartpos $endpos (ELiteral (LitInt128 n)) }
   | f = FLOAT { make_expr_span $symbolstartpos $endpos (ELiteral (LitFloat f)) }
-  | s = STRING { make_expr_span $symbolstartpos $endpos (ELiteral (LitString (s, { sf_triple = false; sf_raw = false }))) }
-  | s = STRING_RAW { make_expr_span $symbolstartpos $endpos (ELiteral (LitString (s, { sf_triple = false; sf_raw = true }))) }
-  | s = TRIPLE_STRING { make_expr_span $symbolstartpos $endpos (ELiteral (LitString (s, { sf_triple = true; sf_raw = false }))) }
+  | s = STRING { make_expr_span $symbolstartpos $endpos (ELiteral (LitString (s, { sf_multiline = false; sf_raw = false }))) }
+  | s = STRING_RAW { make_expr_span $symbolstartpos $endpos (ELiteral (LitString (s, { sf_multiline = false; sf_raw = true }))) }
+  | s = PIPE_STRING { make_expr_span $symbolstartpos $endpos (ELiteral (LitString (s, { sf_multiline = true; sf_raw = false }))) }
+  | s = PIPE_STRING_RAW { make_expr_span $symbolstartpos $endpos (ELiteral (LitString (s, { sf_multiline = true; sf_raw = true }))) }
   | s = STRING_INTERP { make_expr_span $symbolstartpos $endpos (EStringInterpRaw (s, false)) }
-  | s = TRIPLE_STRING_INTERP { make_expr_span $symbolstartpos $endpos (EStringInterpRaw (s, true)) }
+  | s = PIPE_STRING_INTERP { make_expr_span $symbolstartpos $endpos (EStringInterpRaw (s, true)) }
   | c = CHAR { make_expr_span $symbolstartpos $endpos (ELiteral (LitChar c)) }
   | TRUE { make_expr_span $symbolstartpos $endpos (ELiteral (LitBool true)) }
   | FALSE { make_expr_span $symbolstartpos $endpos (ELiteral (LitBool false)) }
@@ -1434,8 +1436,8 @@ simple_pattern:
   | MINUS n = INT { PatLiteral (LitInt (Int64.neg n)) }
   | f = FLOAT { PatLiteral (LitFloat f) }
   | MINUS f = FLOAT { PatLiteral (LitFloat (-. f)) }
-  | s = STRING { PatLiteral (LitString (s, { sf_triple = false; sf_raw = false })) }
-  | s = TRIPLE_STRING { PatLiteral (LitString (s, { sf_triple = true; sf_raw = false })) }
+  | s = STRING { PatLiteral (LitString (s, { sf_multiline = false; sf_raw = false })) }
+  | s = STRING_RAW { PatLiteral (LitString (s, { sf_multiline = false; sf_raw = true })) }
   | c = CHAR { PatLiteral (LitChar c) }
   | TRUE { PatLiteral (LitBool true) }
   | FALSE { PatLiteral (LitBool false) }

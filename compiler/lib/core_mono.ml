@@ -1482,14 +1482,14 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
               trw_value = rewrite scope w.trw_value;
             }
       | CField (obj, field) -> CField (rewrite scope obj, field)
-      | CStringInterp (parts, is_triple) ->
+      | CStringInterp (parts, is_multiline) ->
           CStringInterp
             ( List.map
                 (function
                   | IPLit _ as lit -> lit
                   | IPExpr expr -> IPExpr (rewrite scope expr))
                 parts,
-              is_triple )
+              is_multiline )
       | CLet (binding, body) ->
           let rhs' = rewrite scope binding.bind_rhs in
           let body' = rewrite (scope_add_var scope binding.bind_var) body in

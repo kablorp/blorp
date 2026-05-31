@@ -243,7 +243,7 @@ let test_desugar_counter_resets () =
    CStringInterp desugaring
    ============================================================================ *)
 
-let str_flags = { sf_triple = false; sf_raw = false }
+let str_flags = { sf_multiline = false; sf_raw = false }
 let cstr s = mk (CLit (LitString (s, str_flags))) ty_string
 
 (** "hello" → just a string literal *)

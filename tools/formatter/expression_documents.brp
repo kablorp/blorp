@@ -23,7 +23,7 @@ import:
 
 record StringFlags {
 	raw: Bool,
-	triple: Bool
+	multiline: Bool
 }
 
 
@@ -230,7 +230,7 @@ pure func escape_string_value(s: String) -> String:
 	output
 
 
-private pure func escape_triple_string_value(s: String) -> String:
+private pure func escape_multiline_string_value(s: String) -> String:
 	var output: String = ""
 	var i: Int = 0
 	while i < s.length():
@@ -252,6 +252,80 @@ private pure func escape_triple_string_value(s: String) -> String:
 			None: void
 		i += 1
 	output
+
+
+private pure func pipe_string_line_document(line: String) -> Doc:
+	("|" + line).text()
+
+
+private pure func pipe_string_line_documents(lines: List[String]) -> List[Doc]:
+	var documents: List[Doc] = []
+	for line in lines:
+		documents = documents.append(line.pipe_string_line_document())
+	documents
+
+
+private pure func pipe_string_content_document(value: String) -> Doc:
+	value
+		.split("\n")
+		.pipe_string_line_documents()
+		.hardlines()
+
+
+private pure func pipe_string_literal_document(value: String, raw: Bool) -> Doc:
+	if raw:
+		"raw"
+			.text()
+			.cat(
+				hardline()
+					.cat(value.pipe_string_content_document())
+					.indent()
+			)
+	else:
+		value.pipe_string_content_document()
+
+
+private pure func is_pipe_string_expression(expr: Expression) -> Bool:
+	match expr:
+		LiteralExpression(StringLiteral(_, flags)): flags.multiline
+		StringInterpolationExpression(_, is_multiline): is_multiline
+		_: False
+
+
+pure func assignment_value_document(operator_text: String, value: Expression) -> Doc:
+	if value.is_pipe_string_expression():
+		match value:
+			LiteralExpression(StringLiteral(_, flags)):
+				if flags.raw:
+					operator_text
+						.text()
+						.cat(" ".text())
+						.cat(value.expression_document())
+				else:
+					operator_text
+						.text()
+						.cat(
+							hardline()
+								.cat(value.expression_document())
+								.indent()
+						)
+			StringInterpolationExpression(_, _):
+				operator_text
+					.text()
+					.cat(
+						hardline()
+							.cat(value.expression_document())
+							.indent()
+					)
+			_: operator_text
+				.text()
+				.cat(" ".text())
+				.cat(value.expression_document())
+	else:
+		operator_text
+			.text()
+			.cat(" ".text())
+			.cat(value.expression_document())
 
 
 private pure func string_literal_wrap_char_limit() -> Int:
@@ -369,7 +443,7 @@ private pure func plain_string_literal_value(expr: Expression) -> Option[String]
 		LiteralExpression(StringLiteral(value, flags)):
 			if (
 				flags.raw
-				or flags.triple
+				or flags.multiline
 				or not value.string_is_safe_to_wrap_as_plain_literal()
 			):
 				None
@@ -545,10 +619,10 @@ private pure func needs_detach_body_parens(expr: Expression) -> Bool:
 
 private pure func string_flags_from_json(value: JsonValue) -> Result[StringFlags, String]:
 	raw ?= value.bool_field("raw")
-	triple ?= value.bool_field("triple")
+	multiline ?= value.bool_field("multiline")
 	Ok({
 		raw = raw,
-		triple = triple
+		multiline = multiline
 	})
 
 
@@ -1091,8 +1165,8 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 				)
 		"StringInterp":
 			parts ?= value.string_interpolation_part_array_field("parts")
-			is_triple ?= value.bool_field("triple")
-			Ok(StringInterpolationExpression(parts, is_triple))
+			is_multiline ?= value.bool_field("multiline")
+			Ok(StringInterpolationExpression(parts, is_multiline))
 		"DebugBlock":
 			exprs ?= value.expression_array_field("exprs")
 			match value.get_field("items"):
@@ -1140,10 +1214,10 @@ private pure func literal_document(lit: Literal) -> Doc:
 		Int128Literal(raw): raw.text()
 		FloatLiteral(raw): raw.text()
 		StringLiteral(value, flags):
-			if flags.raw:
-				("r\"" + value + "\"").text()
-			else if flags.triple:
-				("\"\"\"" + value.escape_triple_string_value() + "\"\"\"").text()
+			if flags.multiline:
+				value.pipe_string_literal_document(flags.raw)
+			else if flags.raw:
+				("raw\"" + value + "\"").text()
 			else if value.string_literal_can_wrap():
 				value.wrapped_plain_string_literal_document()
 			else:
@@ -1510,12 +1584,10 @@ private pure func literal_compact_inline_width(lit: Literal) -> Option[Int]:
 		Int128Literal(raw): Some(raw.length())
 		FloatLiteral(raw): Some(raw.length())
 		StringLiteral(value, flags):
-			if flags.raw:
-				Some(value.length() + 3)
-			else if flags.triple:
-				Some(value
-						.escape_triple_string_value()
-						.length() + 6)
+			if flags.multiline:
+				None
+			else if flags.raw:
+				Some(value.length() + 5)
 			else:
 				Some(value
 						.escape_string_value()
@@ -2279,13 +2351,11 @@ private pure func assign_document(name: String, value: Expression) -> Doc:
 			else:
 				name
 					.text()
-					.cat(" = ".text())
-					.cat(value.expression_document())
+					.cat(" =".assignment_value_document(value))
 		_:
 			name
 				.text()
-				.cat(" = ".text())
-				.cat(value.expression_document())
+				.cat(" =".assignment_value_document(value))
 
 
 private pure func is_compound_assign_op(op: BinaryOp) -> Bool:
@@ -2337,8 +2407,7 @@ private pure func variable_declaration_document(
 	prefix
 		.cat(name.text())
 		.cat(type_document_part)
-		.cat(" = ".text())
-		.cat(value.expression_document())
+		.cat(" =".assignment_value_document(value))
 
 
 private pure func question_bind_document(
@@ -2880,12 +2949,12 @@ private pure func with_expression_document(
 
 private pure func string_interpolation_part_document(
 	part: StringInterpolationPart,
-	is_triple: Bool,
+	is_multiline: Bool,
 ) -> Doc:
 	match part:
 		StringInterpolationTextPart(value):
-			escaped: String = if is_triple:
-				value.escape_triple_string_value()
+			escaped: String = if is_multiline:
+				value.escape_multiline_string_value()
 			else:
 				value.escape_string_value()
 			escaped.text()
@@ -2899,30 +2968,74 @@ private pure func string_interpolation_part_document(
 
 private pure func string_interpolation_part_documents(
 	parts: List[StringInterpolationPart],
-	is_triple: Bool,
+	is_multiline: Bool,
 ) -> List[Doc]:
 	var documents: List[Doc] = []
 	for part in parts:
-		documents = documents.append(part.string_interpolation_part_document(is_triple))
+		documents = documents.append(part.string_interpolation_part_document(is_multiline))
 	documents
+
+
+private pure func append_to_last_document(lines: List[Doc], suffix: Doc) -> List[Doc]:
+	last_index: Int = lines.length() - 1
+	lines.set(
+		last_index,
+		lines
+			.get_or(last_index, "".text())
+			.cat(suffix),
+	)
+
+
+private pure func append_pipe_interpolation_text(lines: List[Doc], value: String) -> List[Doc]:
+	segments: List[String] = value.split("\n")
+	var output: List[Doc] = lines
+	var index: Int = 0
+	for segment in segments:
+		if index > 0:
+			output = output.append("|".text())
+		output = output.append_to_last_document(segment.text())
+		index += 1
+	output
+
+
+private pure func append_pipe_interpolation_part(
+	lines: List[Doc],
+	part: StringInterpolationPart,
+) -> List[Doc]:
+	match part:
+		StringInterpolationTextPart(value): lines.append_pipe_interpolation_text(value)
+		StringInterpolationExpressionPart(value):
+			lines.append_to_last_document(
+				"$"
+					.text()
+					.cat("{".text())
+					.cat(value.expression_document())
+					.cat("}".text())
+			)
+
+
+private pure func pipe_string_interpolation_document(parts: List[StringInterpolationPart]) -> Doc:
+	var lines: List[Doc] = ["|".text()]
+	for part in parts:
+		lines = lines.append_pipe_interpolation_part(part)
+	lines.hardlines()
 
 
 private pure func string_interpolation_document(
 	parts: List[StringInterpolationPart],
-	is_triple: Bool,
+	is_multiline: Bool,
 ) -> Doc:
-	quote: String = if is_triple:
-		"\"\"\""
+	if is_multiline:
+		parts.pipe_string_interpolation_document()
 	else:
 		"\""
-	quote
-		.text()
-		.cat(
-			parts
-				.string_interpolation_part_documents(is_triple)
-				.concat_documents()
-		)
-		.cat(quote.text())
+			.text()
+			.cat(
+				parts
+					.string_interpolation_part_documents(is_multiline)
+					.concat_documents()
+			)
+			.cat("\"".text())
 
 
 pure func expression_document(expr: Expression) -> Doc:
@@ -3272,9 +3385,9 @@ pure func expression_document(expr: Expression) -> Doc:
 			where_constraints,
 			body,
 		)
-		StringInterpolationExpression(parts, is_triple): string_interpolation_document(
+		StringInterpolationExpression(parts, is_multiline): string_interpolation_document(
 			parts,
-			is_triple,
+			is_multiline,
 		)
 		DebugBlockExpression(body):
 			"debug:"

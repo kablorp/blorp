@@ -409,7 +409,7 @@ let specialize_debug_string ~reg (e : core) callee arg : core =
     tensor_elem_type ~reg ~loc ~context ty
   in
   let lit_string s =
-    let flags = { Ast.sf_triple = false; sf_raw = false } in
+    let flags = { Ast.sf_multiline = false; sf_raw = false } in
     {
       e with
       desc = CLit (Ast.LitString (s, flags));
@@ -2955,7 +2955,8 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       let s = Types.type_to_string arg.ty in
       {
         e with
-        desc = CLit (Ast.LitString (s, { sf_triple = false; sf_raw = false }));
+        desc =
+          CLit (Ast.LitString (s, { sf_multiline = false; sf_raw = false }));
       }
   | CCall (CKIntrinsic "is_heap", _, [ arg ]) ->
       let desc =

@@ -820,7 +820,7 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
       in
       mk (CLambda lam)
   (* === String interpolation (preserved as Core sugar node) === *)
-  | TA.EStringInterp (parts, is_triple) ->
+  | TA.EStringInterp (parts, is_multiline) ->
       let parts' =
         List.map
           (function
@@ -828,7 +828,7 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
             | TA.InterpExpr e -> Core.IPExpr (lower_child_expr e))
           parts
       in
-      mk (CStringInterp (parts', is_triple))
+      mk (CStringInterp (parts', is_multiline))
   | TA.EStringInterpRaw _ ->
       Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
         ~hint:

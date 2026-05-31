@@ -21,7 +21,7 @@ let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
 let ty_list_int = TyNamed ("List", [ ty_int ])
 let ty_opt_int = TyNamed ("Option", [ ty_int ])
-let str_flags = { sf_triple = false; sf_raw = false }
+let str_flags = { sf_multiline = false; sf_raw = false }
 let mk d t = { desc = d; ty = t; loc }
 let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int
 let cbool b = mk (CLit (LitBool b)) ty_bool

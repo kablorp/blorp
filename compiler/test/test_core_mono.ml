@@ -23,7 +23,7 @@ let ast_with_type expr ty =
 let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int
 
 let cstr s =
-  mk (CLit (LitString (s, { sf_triple = false; sf_raw = false }))) ty_string
+  mk (CLit (LitString (s, { sf_multiline = false; sf_raw = false }))) ty_string
 
 let cvar n t = mk (CVar (Var.named n)) t
 

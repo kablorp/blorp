@@ -20,7 +20,7 @@ let param name ty = { cp_name = Var.named name; cp_ty = ty; cp_loc = loc }
 let fn_ty params return = TyFunc { params; return; is_pure = true }
 
 let cstring s =
-  mk ty_string (CLit (LitString (s, { sf_triple = false; sf_raw = false })))
+  mk ty_string (CLit (LitString (s, { sf_multiline = false; sf_raw = false })))
 
 let field obj name ty = mk ty (CField (obj, name))
 

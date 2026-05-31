@@ -39,7 +39,7 @@ let lit_int n = mk ty_int (CLit (LitInt (Int64.of_int n)))
 let lit_const_int n = mk (TyConstInt n) (CLit (LitInt (Int64.of_int n)))
 
 let lit_string s =
-  let flags = { sf_triple = false; sf_raw = false } in
+  let flags = { sf_multiline = false; sf_raw = false } in
   mk ty_string (CLit (LitString (s, flags)))
 
 let count_expr pred expr =

@@ -51,7 +51,7 @@ let cbool b = mk (CLit (LitBool b)) ty_bool
 let cfloat f = mk (CLit (LitFloat f)) ty_float
 
 let cstr s =
-  mk (CLit (LitString (s, { sf_triple = false; sf_raw = false }))) ty_string
+  mk (CLit (LitString (s, { sf_multiline = false; sf_raw = false }))) ty_string
 
 let cvoid = mk CVoid ty_void
 let cvar n t = mk (CVar (Var.named n)) t
@@ -1185,7 +1185,9 @@ let test_emit_dict_string_keys () =
   (* {"a" => 1} : Dict[String, Int] — uses blorp_dict_new_string() *)
   let dict_ty = TyNamed ("Dict", [ ty_string; ty_int ]) in
   let k =
-    mk (CLit (LitString ("a", { sf_triple = false; sf_raw = false }))) ty_string
+    mk
+      (CLit (LitString ("a", { sf_multiline = false; sf_raw = false })))
+      ty_string
   in
   let v = cint 1 in
   let e = mk (CDict [ (k, v) ]) dict_ty in
@@ -1923,7 +1925,7 @@ let test_emit_list_handoff_managed_reuse_releases_old_slots () =
 let test_emit_string_literal () =
   let e =
     mk
-      (CLit (LitString ("hello", { sf_triple = false; sf_raw = false })))
+      (CLit (LitString ("hello", { sf_multiline = false; sf_raw = false })))
       ty_string
   in
   (* gen_literal dedupes via a lazy helper for __sl_0 in a fresh ctx *)
@@ -2429,7 +2431,7 @@ let test_integration_perceus_emit () =
       bind_ty = ty_string;
       bind_rhs =
         mk
-          (CLit (LitString ("hi", { sf_triple = false; sf_raw = false })))
+          (CLit (LitString ("hi", { sf_multiline = false; sf_raw = false })))
           ty_string;
     }
   in
@@ -2578,7 +2580,7 @@ let test_escape_nul_string_literal_keeps_explicit_length () =
       cv_ty = ty_string;
       cv_init =
         mk
-          (CLit (LitString ("a\000b", { sf_triple = false; sf_raw = false })))
+          (CLit (LitString ("a\000b", { sf_multiline = false; sf_raw = false })))
           ty_string;
       cv_is_mutable = false;
       cv_is_const = true;

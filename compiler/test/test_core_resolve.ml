@@ -18,7 +18,7 @@ let loc =
 
 let ty_int = TyNamed ("Int", [])
 let ty_void = TyNamed ("Void", [])
-let str_flags = { sf_triple = false; sf_raw = false }
+let str_flags = { sf_multiline = false; sf_raw = false }
 let tparams names = List.map (fun name -> make_type_param name []) names
 let mk d t = { desc = d; ty = t; loc }
 let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int

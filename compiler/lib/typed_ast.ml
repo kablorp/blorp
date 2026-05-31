@@ -773,7 +773,7 @@ let expr_desc (expr : expr) =
       let* indices = typed_children indices in
       let* value = typed_child value in
       Ok (ESubscriptAssign (coll, indices, value))
-  | Ast.EStringInterp (parts, is_triple) ->
+  | Ast.EStringInterp (parts, is_multiline) ->
       let* parts =
         List.fold_right
           (fun part acc ->
@@ -785,9 +785,9 @@ let expr_desc (expr : expr) =
                 Ok (InterpExpr expr :: rest))
           parts (Ok [])
       in
-      Ok (EStringInterp (parts, is_triple))
-  | Ast.EStringInterpRaw (text, is_triple) ->
-      Ok (EStringInterpRaw (text, is_triple))
+      Ok (EStringInterp (parts, is_multiline))
+  | Ast.EStringInterpRaw (text, is_multiline) ->
+      Ok (EStringInterpRaw (text, is_multiline))
   | Ast.EQuestionBind (name, ty, value) ->
       let* value = typed_child value in
       Ok (EQuestionBind (name, ty, value))

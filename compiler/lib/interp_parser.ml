@@ -205,7 +205,7 @@ let parse_expr_string (s : string) (base_loc : loc) : expr =
 let rec transform_expr (expr : expr) : expr =
   let loc = expr.expr_loc in
   match expr.expr_desc with
-  | EStringInterpRaw (raw_str, is_triple) ->
+  | EStringInterpRaw (raw_str, is_multiline) ->
       (* Parse the raw string into parts *)
       let raw_parts = split_interpolated_string ~base_loc:loc raw_str in
       let parts =
@@ -216,7 +216,7 @@ let rec transform_expr (expr : expr) : expr =
             else InterpLit content)
           raw_parts
       in
-      { expr with expr_desc = EStringInterp (parts, is_triple) }
+      { expr with expr_desc = EStringInterp (parts, is_multiline) }
   (* All other expressions: recursively transform children *)
   | _ -> expr_map_children transform_expr expr
 

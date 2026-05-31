@@ -98,7 +98,7 @@ let test_expr_hover_type_view_uses_metadata_before_fallback () =
 let test_expr_hover_type_view_uses_fallback_without_metadata () =
   let expr =
     Ast.untyped_expr ~loc:Ast.dummy_loc
-      (ELiteral (LitString ("value", { sf_triple = false; sf_raw = false })))
+      (ELiteral (LitString ("value", { sf_multiline = false; sf_raw = false })))
   in
   match
     Type_metadata_format.hover_type_view_for_expr ~fallback_ty:Types.ty_string

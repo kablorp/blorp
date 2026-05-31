@@ -62,13 +62,17 @@ BIGINT               = digit { digit }              (* integer literal outside I
 FLOAT                = digit { digit } "." digit { digit } [ ("e" | "E") ["+" | "-"] digit { digit } ]
 STRING               = '"' { string_char } '"'
 STRING_INTERP        = '"' { string_char_or_interp } '"'
-RAW_STRING           = 'r"' { any_char_except_quote } '"'
-TRIPLE_STRING        = '"""' { any_char } '"""'
-TRIPLE_STRING_INTERP = '"""' { any_char_or_interp } '"""'
+RAW_STRING           = 'raw"' { any_char_except_quote } '"'
+PIPE_STRING          = aligned_pipe_line { newline aligned_pipe_line }
+RAW_PIPE_STRING      = "raw" newline aligned_pipe_line { newline aligned_pipe_line }
 CHAR                 = "'" unicode_char "'"
 IDENT                = (letter | "_") { letter | digit | "_" }
 DOCSTRING            = "---" newline { line } "---"
 ```
+
+`aligned_pipe_line` is indentation followed by `|` and line content. All lines
+in the same pipe string must use the same `|` column. Use `||` for a literal
+leading pipe in the content.
 
 ### Comments
 
@@ -386,8 +390,9 @@ operand-level ascription such as `(1 as Int32) + (2 as Int32)`.
 ### Primary Expressions
 
 ```ebnf
-primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING | TRIPLE_STRING
-             | STRING_INTERP | TRIPLE_STRING_INTERP
+primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING
+             | PIPE_STRING | RAW_PIPE_STRING
+             | STRING_INTERP
              | CHAR | "True" | "False"
              | IDENT | "debug"
              | "_" | "void"
@@ -482,7 +487,7 @@ simple_pattern = "_"                                    (* wildcard *)
                | IDENT                                  (* variable or constructor *)
                | INT | BIGINT | "-" INT                 (* integer literal *)
                | FLOAT | "-" FLOAT                      (* float literal *)
-               | STRING | TRIPLE_STRING                 (* string literal *)
+               | STRING | RAW_STRING
                | CHAR                                   (* char literal *)
                | "True" | "False"                       (* bool literal *)
                | IDENT "(" [ pattern_list ] ")"         (* constructor *)
