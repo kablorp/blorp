@@ -263,20 +263,13 @@ let handle_definition (state : Lsp_state.state) params =
     while Blorp has a single source definition for each symbol today. *)
 let handle_declaration = handle_definition
 
-(** Handle textDocument/formatting *)
-let handle_formatting (state : Lsp_state.state) params =
-  match get "textDocument" params with
-  | Some td -> (
-      let uri = get_uri td in
-      match Lsp_state.find_document state uri with
-      | Some doc -> (
-          match Fmt.format_string doc.text with
-          | Ok formatted ->
-              if formatted = doc.text then Array []
-              else Array [ full_document_edit formatted ]
-          | Error _ -> Array [])
-      | None -> Array [])
-  | None -> Array []
+(** Handle textDocument/formatting.
+
+    LSP formatting is deliberately disabled until formatter execution has a
+    bounded, editor-safe runtime model. Returning no edits keeps direct requests
+    from older clients non-blocking even though new clients should not issue
+    them because [documentFormattingProvider] is false. *)
+let handle_formatting (_state : Lsp_state.state) _params = Array []
 
 (* ============================================================================
    Main event loop

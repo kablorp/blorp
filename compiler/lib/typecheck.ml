@@ -3547,26 +3547,7 @@ let () =
             | _ -> env)
           env m.decls
       in
-      let prelude_type_imports =
-        [
-          ("option", "Option");
-          ("result", "Result");
-          ("bool", "Bool");
-          ("char", "Char");
-          ("bytes", "Bytes");
-          ("string", "String");
-          ("list", "List");
-          ("list", "ParallelList");
-          ("parallel_list", "ParallelList");
-          ("vector", "ParallelVector");
-          ("parallel_vector", "ParallelVector");
-          ("matrix", "ParallelMatrix");
-          ("parallel_matrix", "ParallelMatrix");
-          ("range", "Range");
-          ("dict", "Dict");
-          ("set", "Set");
-        ]
-      in
+      let prelude_type_imports = Language_surface.prelude_method_type_imports in
       let env =
         List.fold_left
           (fun env (mod_name, type_name) ->

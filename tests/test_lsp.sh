@@ -87,7 +87,7 @@ RESP=$(read_response)
 check "returns capabilities" "$RESP" '"capabilities"'
 check "has textDocumentSync" "$RESP" '"textDocumentSync"'
 check "has hoverProvider" "$RESP" '"hoverProvider":true'
-check "has formattingProvider" "$RESP" '"documentFormattingProvider":true'
+check "does not advertise formattingProvider" "$RESP" '"documentFormattingProvider":false'
 
 # Send initialized notification
 send_msg '{"jsonrpc":"2.0","method":"initialized","params":{}}'
@@ -172,7 +172,7 @@ check "definition on top-level const points to decl" "$RESP" '"line":0'
 # Cross-module: click on an imported function should jump to its source module
 # Source imports `get_or` from std/option and calls it.
 IMPORT_URI="${WORKSPACE_URI}/tests/.lsp_scratch_import.brp"
-send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${IMPORT_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    option { get_or }\\n\\nfunc main(args: List[String]) -> Int:\\n    x: Option[Int] = Some(42)\\n    _ = get_or(x, 0)\\n    0\\n\"}}}"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${IMPORT_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    option: get_or\\n\\nfunc main(args: List[String]) -> Int:\\n    x: Option[Int] = Some(42)\\n    _ = get_or(x, 0)\\n    0\\n\"}}}"
 read_response > /dev/null  # consume diagnostics
 
 # Cursor on `get_or` at line 5 character 10
@@ -183,7 +183,7 @@ check "definition on imported name points to std/option" "$RESP" 'std/option\.br
 
 # Click on the module path INSIDE an import block — should jump to the module file.
 IMPORT_MOD_URI="${WORKSPACE_URI}/tests/.lsp_scratch_import_mod.brp"
-send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${IMPORT_MOD_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    option { get_or }\\n\\nfunc main(args: List[String]) -> Int:\\n    0\\n\"}}}"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${IMPORT_MOD_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    option: get_or\\n\\nfunc main(args: List[String]) -> Int:\\n    0\\n\"}}}"
 read_response > /dev/null
 
 # Cursor on `option` at line 1 character 5
@@ -214,11 +214,11 @@ check "definition on module alias at use site points to module file" "$RESP" 'st
 # Uses std/codec — not in the prelude UFCS fallback list, so this exercises
 # the constructor-import path specifically.
 CTOR_URI="${WORKSPACE_URI}/tests/.lsp_scratch_import_ctor.brp"
-send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${CTOR_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    codec { Value(VNull, VBool) }\\n\\nfunc main(args: List[String]) -> Int:\\n    0\\n\"}}}"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${CTOR_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    codec: Value(VNull, VBool)\\n\\nfunc main(args: List[String]) -> Int:\\n    0\\n\"}}}"
 read_response > /dev/null
 
-# Cursor on `VNull` at line 1 character 21
-send_msg "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${CTOR_URI}\"},\"position\":{\"line\":1,\"character\":21}}}"
+# Cursor on `VNull` at line 1 character 17
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${CTOR_URI}\"},\"position\":{\"line\":1,\"character\":17}}}"
 RESP=$(read_response)
 check "definition on ctor in import block returns URI" "$RESP" '"uri"'
 check "definition on ctor in import block points to source module" "$RESP" 'std/codec\.brp'
@@ -242,7 +242,7 @@ read_response > /dev/null  # consume diagnostics
 send_msg '{"jsonrpc":"2.0","id":3,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///tmp/test_lsp_fmt.brp"},"options":{"tabSize":4,"insertSpaces":true}}}'
 RESP=$(read_response)
 check "formatting returns result" "$RESP" '"result"'
-check "formatting has text edits" "$RESP" '"newText"'
+check "formatting returns no edits" "$RESP" '"result":\[\]'
 
 # ── 6. didChange → updated diagnostics ──────────────────────────────
 

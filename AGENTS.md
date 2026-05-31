@@ -464,6 +464,7 @@ compiler/            # OCaml compiler implementation
     core_intrinsic_registry.ml  # Intrinsic manifest and contracts
     core_invariants.ml  # Stage-boundary invariant checks
     core_error.ml     # Core IR structured errors
+    language_surface.ml  # Shared source-language surface facts for tooling/typecheck
     codegen/      # Shared codegen utilities used by the core-emit pipeline
       codegen_names.ml     # C name mangling (UFCS, modules)
       codegen_types.ml     # Type classification and AST → C type mapping

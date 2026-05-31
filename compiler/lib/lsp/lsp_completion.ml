@@ -69,44 +69,7 @@ let kind_struct = 22
    Keyword list
    ============================================================================ *)
 
-let keywords =
-  [
-    "func";
-    "pure";
-    "var";
-    "union";
-    "record";
-    "void";
-    "while";
-    "for";
-    "in";
-    "if";
-    "else";
-    "and";
-    "or";
-    "not";
-    "match";
-    "True";
-    "False";
-    "break";
-    "continue";
-    "debug";
-    "struct";
-    "enum";
-    "foreign";
-    "private";
-    "builtin";
-    "concurrent";
-    "detach";
-    "import";
-    "as";
-    "trait";
-    "implements";
-    "type";
-    "alias";
-    "where";
-    "return";
-  ]
+let keywords = Language_surface.lsp_completion_keywords
 
 (* ============================================================================
    Completion sources

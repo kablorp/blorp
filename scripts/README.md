@@ -15,7 +15,7 @@ scripts/test compiler           # compiler fixtures and codegen audit
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines
 scripts/test doctest            # std doctests
-scripts/test cli                # public CLI smoke tests
+scripts/test cli                # public CLI, REPL, and LSP smoke tests
 scripts/test unit compiler      # multiple selected gates
 ```
 
@@ -49,7 +49,7 @@ cutting preview builds. It composes:
 - sanitizer tests
 - Docker validation when Docker is available
 - lightweight secret-pattern scan
-- drift and hygiene checks
+- drift and hygiene checks, including editor TextMate metadata sync
 
 Common forms:
 
@@ -93,6 +93,12 @@ Manual use:
 ```bash
 scripts/with-build-lock make quality-full
 ```
+
+## Drift Checks
+
+`scripts/check-editor-drift` verifies that shared VSCode and IntelliJ TextMate
+metadata stay byte-for-byte synchronized and parse as JSON. `make hygiene-check`
+runs it automatically.
 
 ## Release Helpers
 

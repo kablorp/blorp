@@ -12,7 +12,7 @@ scripts/test compiler           # Compiler tests (should_pass/should_fail)
 scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
-scripts/test cli                # CLI smoke and exit-code checks
+scripts/test cli                # CLI, REPL, and LSP smoke/exit-code checks
 scripts/test unit compiler      # Multiple gates
 scripts/test --coverage         # Unit tests with coverage report
 scripts/test --verbose          # Print pass-by-pass child-runner output
@@ -89,7 +89,8 @@ tests/
 │   └── stream/            # Stream tests
 ├── test_pkg/              # Optional runtime tests for pkg/, created when pkg tests exist
 ├── test_cli.sh            # CLI smoke and exit-code checks used by scripts/test
-├── test_lsp.sh, test_repl.sh, test_auto_format.sh, test_leak_report.sh
+├── test_lsp.sh            # LSP protocol integration smoke run by test_cli.sh
+├── test_repl.sh, test_auto_format.sh, test_leak_report.sh
 │                           # Standalone smoke tests, not part of scripts/test
 ├── stages/                # Historical golden fixtures; runners need refresh before use
 └── test_compiler/         # Compiler behavior tests
@@ -149,7 +150,7 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`
    - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
-   - CLI behavior → `tests/test_cli.sh`
+   - CLI/LSP behavior → `tests/test_cli.sh` and `tests/test_lsp.sh`
    - Standard library examples → doctests in `std/`
 2. Add positive and negative compiler cases when both sides describe meaningful
    behavior. Do not add mirrored fixtures just to satisfy ceremony.

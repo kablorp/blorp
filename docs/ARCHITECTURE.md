@@ -332,6 +332,7 @@ compiler/
 │   ├── core_invariants.ml # Stage-boundary invariant checks
 │   ├── core_pipeline.ml   # Core IR pipeline orchestration
 │   ├── core_error.ml      # Core IR structured errors
+│   ├── language_surface.ml # Shared source-language surface facts
 │   ├── pipeline.ml        # Top-level compilation pipeline orchestration
 │   ├── runtime.c          # Embedded C runtime (ARC, collections, IO)
 │   ├── runtime_decl.c     # Runtime forward declarations
@@ -691,20 +692,26 @@ Unified CLI with subcommands:
    - Add token declaration
    - Add grammar rules
 
-3. **AST** (`ast.ml`):
+3. **Shared language surface and editor metadata**:
+   - If the keyword is user-facing, add it to `language_surface.ml` for LSP
+     completions. Do not add legacy/error-only tokens such as removed syntax.
+   - Update shared TextMate and language-configuration metadata under
+     `editor/`, then run `scripts/check-editor-drift`.
+
+4. **AST** (`ast.ml`):
    - Add new variant to appropriate type
 
-4. **TypeCheck** (`typecheck.ml`, `infer.ml`):
+5. **TypeCheck** (`typecheck.ml`, `infer.ml`):
    - Add type checking for new construct
 
-5. **Core lowering** (`core_lower.ml`):
+6. **Core lowering** (`core_lower.ml`):
    - Translate the new AST node into Core IR. If the construct desugars
      to existing Core, handle it in `core_desugar.ml` instead.
    - If the construct has build-mode semantics like `debug:`, represent it
      explicitly in Core and lower it in a dedicated pass before shared
      optimizations.
 
-6. **Core emission** (`core_emit.ml`):
+7. **Core emission** (`core_emit.ml`):
    - Emit C for the new Core node, if one was introduced.
 
 ### Adding a New Builtin Function

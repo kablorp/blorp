@@ -3733,16 +3733,19 @@ today.
 
 ## 17. Editor Support
 
-The `editor/` directory provides IDE/editor extensions for syntax highlighting and language configuration:
+The `editor/` directory provides IDE/editor extensions backed by shared
+TextMate metadata and the `./blorp lsp` language server:
 
-- **VSCode**: `editor/vscode/` — TextMate grammar for syntax highlighting, language configuration for brackets/comments/auto-closing pairs. Install by copying or symlinking to `~/.vscode/extensions/`.
-- **IntelliJ**: `editor/intellij/` — TextMate grammar bundle for IntelliJ-based IDEs (CLion, IDEA, etc.). Import via Settings > Editor > TextMate Bundles.
+- **VSCode**: `editor/vscode/` — syntax highlighting, language configuration,
+  and LSP integration. The extension prefers an executable `./blorp` in the
+  workspace root, then falls back to `blorp` on `PATH`.
+- **IntelliJ**: `editor/intellij/` — TextMate highlighting plus optional
+  platform LSP integration for IntelliJ-based IDEs.
 
-Both extensions provide:
-- Keyword and operator highlighting
-- String interpolation (`${expr}`) highlighting
-- Comment highlighting (line `--`)
-- Bracket matching and auto-closing
+The current editor surface includes keyword/operator highlighting, string
+interpolation highlighting, diagnostics, hover, completion, and go-to-definition.
+LSP document formatting is intentionally not advertised yet; use
+`./blorp format` for source formatting.
 
 ---
 
@@ -3750,8 +3753,9 @@ Both extensions provide:
 
 ```
 func       pure       var        union      enum       record     struct     trait
-type       alias      private    import     as         implements
-Self       builtin    match      while      for        in         if         else
-and        or         not        True       False      void
-break      continue   foreign    concurrent detach     where
+type       alias      private    import     as         implements Self       builtin
+match      while      for        in         if         else       and        or
+not        True       False      void       break      continue   debug      foreign
+concurrent concurrently detach   select     from       after      sealed     with
+resource   where
 ```

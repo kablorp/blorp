@@ -1,7 +1,8 @@
 (** LSP protocol types, serialization, and server capabilities.
 
     Defines the subset of the Language Server Protocol needed for
-    diagnostics, hover, and formatting. *)
+    diagnostics, hover, definition, completion, document symbols, and signature
+    help. *)
 
 open Lsp_json
 
@@ -152,30 +153,6 @@ let publish_diagnostics ~uri ~diagnostics : json =
   Object [ ("uri", String uri); ("diagnostics", Array diagnostics) ]
 
 (* ============================================================================
-   Text edits (for formatting)
-   ============================================================================ *)
-
-(** Count lines in a string *)
-let count_lines s =
-  let count = ref 0 in
-  String.iter (fun c -> if c = '\n' then incr count) s;
-  !count
-
-(** Build a text edit replacing the entire document *)
-let full_document_edit text : json =
-  let lines = count_lines text in
-  Object
-    [
-      ( "range",
-        range_to_json
-          {
-            start = { line = 0; character = 0 };
-            end_ = { line = lines + 1; character = 0 };
-          } );
-      ("newText", String text);
-    ]
-
-(* ============================================================================
    Hover
    ============================================================================ *)
 
@@ -212,7 +189,7 @@ let capabilities : json =
             ("save", Object [ ("includeText", Bool true) ]);
           ] );
       ("hoverProvider", Bool true);
-      ("documentFormattingProvider", Bool true);
+      ("documentFormattingProvider", Bool false);
       ("definitionProvider", Bool true);
       ("declarationProvider", Bool true);
       ( "completionProvider",

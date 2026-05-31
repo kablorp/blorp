@@ -97,6 +97,7 @@ hygiene-check:
 		echo "Compiler sources live in './compiler'; remove stale generated or copied files."; \
 		exit 1; \
 	fi
+	@scripts/check-editor-drift
 	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
 		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \
 		echo "Run 'cd compiler && dune build @check' and inspect the conflict report."; \

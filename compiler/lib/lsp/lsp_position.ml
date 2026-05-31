@@ -33,14 +33,39 @@ let scan_ident_end (line_text : string) (col : int) : int =
   in
   scan col
 
+let dim_span_starting_at (line_text : string) (start_col : int) :
+    (int * int) option =
+  let len = String.length line_text in
+  if
+    start_col >= 0
+    && start_col + 1 < len
+    && line_text.[start_col] = '#'
+    && is_ident_char line_text.[start_col + 1]
+  then Some (start_col, scan_ident_end line_text (start_col + 1))
+  else None
+
 let ident_span_at (line_text : string) ~(col : int) : (int * int) option =
   let len = String.length line_text in
   if col < 0 || col > len then None
   else
     let cursor = min col len in
-    let start_col = scan_ident_start line_text cursor in
-    let end_col = scan_ident_end line_text cursor in
-    if start_col = end_col then None else Some (start_col, end_col)
+    let direct_dim =
+      if cursor < len then dim_span_starting_at line_text cursor else None
+    in
+    match direct_dim with
+    | Some _ as span -> span
+    | None ->
+        let start_col = scan_ident_start line_text cursor in
+        let end_col = scan_ident_end line_text cursor in
+        if start_col = end_col then None
+        else
+          let ident_span = (start_col, end_col) in
+          if start_col > 0 then
+            match dim_span_starting_at line_text (start_col - 1) with
+            | Some (dim_start, dim_end) when dim_end = end_col ->
+                Some (dim_start, dim_end)
+            | _ -> Some ident_span
+          else Some ident_span
 
 (** Return the identifier adjacent to [col] on [line] (0-based), or [None] if
     the cursor position is not next to an identifier. Works on the raw document
@@ -387,10 +412,8 @@ let find_definition (program : program) ~(name : string) ~(line : int)
    ============================================================================ *)
 
 (** Modules whose exports are available as UFCS methods on prelude types
-    without an explicit import. Kept in sync with
-    typecheck.ml:load_prelude_ref and Modules.prelude_module_names. *)
-let prelude_ufcs_modules =
-  [ "option"; "result"; "string"; "list"; "dict"; "set"; "bool" ]
+    without an explicit import. *)
+let prelude_ufcs_modules = Language_surface.prelude_ufcs_modules
 
 (** Map an embedded module path like [<embedded:std/option>] to the configured
     filesystem std path. Non-embedded paths and sessions without an explicit
