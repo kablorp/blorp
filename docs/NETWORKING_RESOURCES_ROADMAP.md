@@ -376,15 +376,28 @@ answer ?= dns.resolve("example.com")
 Ok(answer)
 ```
 
-Current TCP status: `std/net/tcp` now exposes `listen_numeric` and
-`connect_numeric` alongside the hostname-capable `listen` and `connect`. The
-numeric variants reject hostnames before the runtime reaches `getaddrinfo`, so
-code that needs to guarantee the no-DNS path can select a resource-producing
-API that enforces that precondition instead of relying on comments or call-site
-discipline. `listen_numeric` accepts numeric IPv4 hosts plus `""` for passive
-bind-any; `connect_numeric` accepts numeric IPv4 hosts only. Once the socket
-exists, readiness waits still park the current virtual thread through the
-reactor.
+Current TCP status: `std/net/tcp` now has a typed endpoint surface:
+`IpFamily`, `IpAddress`, `DnsName`, `InterfaceScope`, and `Port`.
+Applications can construct `Port` values only through validation, so concrete
+ports are 1 through 65535 and ephemeral listener binds use explicit
+`listen_*_any_port` APIs instead of magic port 0. Numeric addresses and DNS
+names are separated at the type level: use `ipv4(...)`/`parse_ip(...)` for
+numeric endpoints and `dns_name(...)` for name resolution. Listener helpers now
+distinguish loopback, any-interface, validated IP, and scoped IPv6-IP binds.
+Connection helpers distinguish loopback, validated IP, scoped IPv6-IP, and DNS
+name connects. The older raw `listen`/`connect` and `listen_numeric`/
+`connect_numeric` forms remain available as compatibility surfaces while
+tests/docs migrate, but they should not be treated as the preferred API for new
+code. Once a socket exists, readiness waits still park the current virtual
+thread through the reactor.
+
+Open ergonomic gap: many user inputs are generic host strings that may be DNS
+names, IPv4 literals, IPv6 literals, or scoped IPv6 literals. The current typed
+surface can represent each case, but callers must branch before choosing
+`connect_ip`, `connect_scoped_ip`, or `connect_name`. A future `Host` endpoint
+type or compiler-owned `connect_host` bridge could make that common case
+concise without collapsing validated names and numeric addresses back into raw
+strings.
 
 Current `std/net/dns` status: the first compiler-owned `resolve(hostname)`
 operation has landed. It returns `Result[List[String], DnsError]` with copied
@@ -1090,10 +1103,11 @@ Goals:
   data, and the public std function is the direct builtin boundary so compiler
   metadata is visible at source call sites; the package helper remains
   package-FFI-backed.
-- Keep no-DNS TCP paths explicit and tested. Landed as
-  `listen_numeric(host, port, backlog)` and `connect_numeric(host, port)`,
-  whose resource acquisition results are backed by the same operation-result
-  metadata as ordinary TCP but reject hostname inputs before `getaddrinfo`.
+- Keep no-DNS TCP paths explicit and tested. The preferred surface now uses
+  validated endpoint values: `ipv4(...)`/`parse_ip(...)` feed `listen_ip` and
+  `connect_ip`, while `dns_name(...)` feeds `connect_name`. The older
+  `listen_numeric(host, port, backlog)` and `connect_numeric(host, port)`
+  remain as compatibility helpers until the remaining tests/docs are migrated.
 - Replace the current blocking std DNS backend with a bounded runtime resolver
   pool unless a true nonblocking resolver is available on all target platforms.
 - Defer user-configurable resolver pool handles until Blorp has an explicit

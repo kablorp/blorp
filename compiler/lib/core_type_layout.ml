@@ -71,6 +71,7 @@ let builtin_layout = function
   | "List" | "ParallelList" | "ParallelVector" | "ParallelMatrix" | "Dict"
   | "Set" | "Tensor" | "Vector" | "Matrix" | "Builder" | "Slice" | "Option"
   | "Result" | "Task" | "Channel" | "TcpListener" | "TcpStream" | "TlsSession"
+  | "IpAddress" | "DnsName" | "InterfaceScope"
   | "std/net/tls::TlsSession" | "std_net_tls__TlsSession" | "WebSocketSession"
   | "std/net/websocket::WebSocketSession"
   | "std_net_websocket__WebSocketSession" | "ConcurrencyError" ->
@@ -85,7 +86,7 @@ let builtin_layout = function
   | "std/net/udp::UdpSocket" | "std_net_udp__UdpSocket" ->
       Some unmanaged_layout
   | "Int" | "Bool" | "Char" | "Float" | "Float32" | "Float16" | "Int128"
-  | "UInt128" | "Void" | "Ptr" | "Module" ->
+  | "UInt128" | "Void" | "Ptr" | "Module" | "Port" ->
       Some unmanaged_layout
   | name when List.mem name Types.all_int_type_names -> Some unmanaged_layout
   | _ -> None

@@ -402,6 +402,18 @@ let is_enum_type reg name = Hashtbl.mem reg.enum_types name
 let managed_type_info reg name = Hashtbl.find_opt reg.managed_types name
 let is_managed_type reg name = Hashtbl.mem reg.managed_types name
 
+let is_tcp_string_backed_builtin_name = function
+  | "IpAddress" | "std/net/tcp::IpAddress" | "std_net_tcp__IpAddress"
+  | "DnsName" | "std/net/tcp::DnsName" | "std_net_tcp__DnsName"
+  | "InterfaceScope" | "std/net/tcp::InterfaceScope"
+  | "std_net_tcp__InterfaceScope" ->
+      true
+  | _ -> false
+
+let is_tcp_port_builtin_name = function
+  | "Port" | "std/net/tcp::Port" | "std_net_tcp__Port" -> true
+  | _ -> false
+
 (* ============================================================================
    Type-to-C mapping
    ============================================================================ *)
@@ -543,6 +555,9 @@ let type_to_c ~(reg : registry) ty =
               | "Float" -> "double"
               | "Bool" -> "bool"
               | "String" | "LiteralString" -> "blorp_String*"
+              | name when is_tcp_string_backed_builtin_name name ->
+                  "blorp_String*"
+              | name when is_tcp_port_builtin_name name -> "long"
               | "ParallelList" -> "blorp_List*"
               | "ParallelVector" | "ParallelMatrix" -> "blorp_Vector*"
               | "Bytes" -> "blorp_Bytes*"
@@ -606,6 +621,9 @@ let type_to_c ~(reg : registry) ty =
               | "Fixed" ->
                   "blorp_Fixed*"
                   (* Fixed with any params still maps to blorp_Fixed* *)
+              | name when is_tcp_string_backed_builtin_name name ->
+                  "blorp_String*"
+              | name when is_tcp_port_builtin_name name -> "long"
               | "Task" -> "blorp_Task*"
               | "Channel" -> "blorp_Channel*"
               | name when Type_name_metadata.is_stream_name name ->

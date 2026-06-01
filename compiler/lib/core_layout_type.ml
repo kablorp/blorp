@@ -226,7 +226,7 @@ let classify_source_value_layout_of_metadata ?(loc = Ast.dummy_loc)
 
 let runtime_builtin_arc_release_only = function
   | "String" | "Bytes" | "Fixed" | "MemStats" | "SchedulerStats"
-  | "ConcurrencyError" ->
+  | "ConcurrencyError" | "IpAddress" | "DnsName" | "InterfaceScope" ->
       true
   | name when Type_name_metadata.is_resource_source_name name -> true
   | _ -> false

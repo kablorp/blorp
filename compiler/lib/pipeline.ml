@@ -40,6 +40,31 @@ let module_load_errors () = List.rev (Modules.get_load_errors ())
 let target_module_name filename =
   Option.value ~default:"" (Modules.std_module_name_for_source_file filename)
 
+let program_has_top_level_main (program : Ast.program) : bool =
+  List.exists
+    (fun decl ->
+      match decl.decl_desc with
+      | DFunc { func_name = Some "main"; _ } -> true
+      | _ -> false)
+    program
+
+let missing_main_error ~filename =
+  {
+    message = "cannot run source file without a main function";
+    loc = Ast.point_loc_in ~file:filename ~line:1 ~column:1;
+    phase = TypeCheck;
+    kind = OtherError;
+    notes =
+      [
+        "Runnable Blorp programs need a top-level `main` entry point.";
+        "Use `blorp check` for library-style files that only define helpers.";
+      ];
+    help =
+      Some
+        "Add `func main(args: List[String]) -> Int:` and return an exit code, \
+         or `func main(args: List[String]):` for an implicit zero exit.";
+  }
+
 (** Parse source and load imports. Shared by [typecheck_only] and [compile]. *)
 let parse_and_load_modules ?on_frontend_phase ~filename source =
   let record phase =
@@ -474,9 +499,9 @@ let typecheck_module_only ~filename ~source =
     the full runtime. When [false], the caller is expected to link a
     precompiled runtime object. *)
 let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
-    ?retain_debug_blocks ?(embed_runtime = true) ?(profile = false)
-    ?on_frontend_phase ?on_stage ?(check_invariants = false) ~filename ~source
-    () =
+    ?retain_debug_blocks ?(embed_runtime = true) ?(require_main = false)
+    ?(profile = false) ?on_frontend_phase ?on_stage ?(check_invariants = false)
+    ~filename ~source () =
   let allow_debug_only_calls =
     Option.value allow_debug_only_calls ~default:debug
   in
@@ -512,6 +537,8 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
                     program
                 in
                 if import_errors <> [] then Error import_errors
+                else if require_main && not (program_has_top_level_main program)
+                then Error [ missing_main_error ~filename ]
                 else
                   try
                     let c_code, link_flags, include_dirs =
@@ -577,11 +604,11 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
                         ])))
 
 let compile ?debug ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
-    ?profile ?on_frontend_phase ?on_stage ?check_invariants ~filename ~source ()
-    =
+    ?require_main ?profile ?on_frontend_phase ?on_stage ?check_invariants
+    ~filename ~source () =
   compile_impl ~source_kind:User_source ?debug ?allow_debug_only_calls
-    ?retain_debug_blocks ?embed_runtime ?profile ?on_frontend_phase ?on_stage
-    ?check_invariants ~filename ~source ()
+    ?retain_debug_blocks ?embed_runtime ?require_main ?profile
+    ?on_frontend_phase ?on_stage ?check_invariants ~filename ~source ()
 
 let compile_generated_test_harness ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ~filename ~source () =

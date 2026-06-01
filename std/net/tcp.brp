@@ -1,11 +1,11 @@
 -- TCP Networking - scoped socket resources.
 --
--- TcpListener and TcpStream are external capabilities. Acquire them with
--- `with listener ?= listen(...):` or `with stream ?= connect(...):` so the
--- compiler installs deterministic cleanup. Numeric-address socket operations
--- are fiber-aware; hostname resolution still uses blocking DNS. Use numeric
--- hosts such as "127.0.0.1" or "" bind-any hosts when OS-worker pinning during
--- DNS resolution is unacceptable.
+-- TcpListener and TcpStream are external capabilities. Acquire them with a
+-- scoped `with` binding so the compiler installs deterministic cleanup. Prefer
+-- the typed endpoint APIs (`listen_loopback`, `listen_any_interface`,
+-- `connect_ip`, `connect_name`) over raw string/int host-port pairs. Hostname
+-- resolution still uses blocking DNS; validated numeric addresses avoid that
+-- resolver path.
 import:
 	stream: FallibleStream, ResourceSource
 
@@ -20,6 +20,53 @@ resource type TcpListener = builtin("blorp_tcp_close_listener")
 Opaque resource for a connected TCP socket.
 ---
 resource type TcpStream = builtin("blorp_tcp_close_stream")
+
+
+---
+IP protocol family.
+---
+enum IpFamily:
+	IPv4
+	IPv6
+
+
+---
+Validated IP address text.
+
+`IpAddress` is a nominal builtin type, not a `String` alias. Construct it with
+`ipv4(...)` or `parse_ip(...)` so invalid IP text cannot flow into typed TCP
+APIs as an already-validated address.
+---
+type IpAddress = builtin
+
+
+---
+Validated DNS name text.
+
+`DnsName` keeps hostname resolution explicit. Use `dns_name(...)` before
+connecting by name, and use `ipv4(...)` or `parse_ip(...)` for IP literals.
+---
+type DnsName = builtin
+
+
+---
+Validated IPv6 interface scope or zone identifier.
+
+Scopes are OS-specific text, for example an interface name or numeric zone. The
+constructor rejects only empty, NUL-containing, and oversized values so the API
+does not rule out legal platform forms.
+---
+type InterfaceScope = builtin
+
+
+---
+Validated remote TCP port.
+
+`Port` represents concrete ports 1 through 65535. Binding to an OS-assigned
+ephemeral port is represented by `listen_*_any_port` APIs, not by passing magic
+port 0.
+---
+type Port = builtin
 
 
 ---
@@ -107,6 +154,130 @@ pure func is_timed_out(err: TcpError) -> Bool:
 		_: False
 
 
+private pure func map_address_error[T](result: Result[T, String]) -> Result[T, TcpError]:
+	match result:
+		Ok(value): Ok(value)
+		Err(detail): Err(InvalidInput(detail))
+
+
+---
+Construct a validated IPv4 address from four bytes.
+
+doctests:
+    :: IPv4 constructor formats dotted decimal
+    ipv4(to_uint8(127), to_uint8(0), to_uint8(0), to_uint8(1)).to_string() == "127.0.0.1"
+---
+pure func ipv4(a: UInt8, b: UInt8, c: UInt8, d: UInt8) -> IpAddress:
+	builtin("blorp_tcp_ipv4_raw")
+
+
+private pure func parse_ip_raw(text: String) -> Result[IpAddress, String]:
+	builtin("blorp_tcp_parse_ip_raw")
+
+
+---
+Parse IPv4 or IPv6 address text into a validated IP address.
+---
+pure func parse_ip(text: String) -> Result[IpAddress, TcpError]:
+	text
+		.parse_ip_raw()
+		.map_address_error()
+
+
+private pure func dns_name_raw(text: String) -> Result[DnsName, String]:
+	builtin("blorp_tcp_dns_name_raw")
+
+
+---
+Validate DNS name text.
+
+This intentionally performs only structural checks that are universally useful:
+the name must be non-empty, shorter than the runtime host buffer, and free of
+NUL bytes. IP literals are rejected so numeric endpoints stay explicit.
+Resolution remains a separate operation performed by connect APIs.
+---
+pure func dns_name(text: String) -> Result[DnsName, TcpError]:
+	text
+		.dns_name_raw()
+		.map_address_error()
+
+
+private pure func interface_scope_raw(text: String) -> Result[InterfaceScope, String]:
+	builtin("blorp_tcp_interface_scope_raw")
+
+
+---
+Validate an IPv6 interface scope or zone identifier.
+---
+pure func interface_scope(text: String) -> Result[InterfaceScope, TcpError]:
+	text
+		.interface_scope_raw()
+		.map_address_error()
+
+
+private pure func port_raw(value: Int) -> Result[Port, String]:
+	builtin("blorp_tcp_port_raw")
+
+
+---
+Validate a concrete remote TCP port.
+
+Ports are 1 through 65535. Use a `listen_*_any_port` API when binding a listener
+and asking the OS to assign an ephemeral port.
+---
+pure func port(value: Int) -> Result[Port, TcpError]:
+	value
+		.port_raw()
+		.map_address_error()
+
+
+---
+Return the stored text representation of a validated IP address.
+---
+pure func ip_text(address: IpAddress) -> String:
+	builtin("blorp_tcp_ip_text_raw")
+
+
+implements Stringable for IpAddress:
+	pure func to_string(address: IpAddress) -> String:
+		address.ip_text()
+
+
+---
+Return the text representation of a validated DNS name.
+---
+pure func dns_name_text(name: DnsName) -> String:
+	builtin("blorp_tcp_dns_name_text_raw")
+
+
+implements Stringable for DnsName:
+	pure func to_string(name: DnsName) -> String:
+		name.dns_name_text()
+
+
+---
+Return the text representation of an interface scope.
+---
+pure func interface_scope_text(scope: InterfaceScope) -> String:
+	builtin("blorp_tcp_interface_scope_text_raw")
+
+
+implements Stringable for InterfaceScope:
+	pure func to_string(scope: InterfaceScope) -> String:
+		scope.interface_scope_text()
+
+
+private pure func port_value(value: Port) -> Int:
+	builtin("blorp_tcp_port_value_raw")
+
+
+implements Stringable for Port:
+	pure func to_string(value: Port) -> String:
+		value
+			.port_value()
+			.to_string()
+
+
 ---
 Return the local port for a scoped listener.
 ---
@@ -151,6 +322,9 @@ Create a TCP server socket, bind to host:port, and start listening.
 Use with `with listener ?= listen(host, port, backlog):` so the listener is
 closed automatically when the block exits. Numeric hosts avoid DNS. Use "" to
 bind to the platform's passive any-host address without DNS.
+
+Prefer the typed endpoint APIs for new code. This raw compatibility surface
+still accepts magic port 0 for ephemeral binds.
 ---
 func listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]:
 	builtin("blorp_tcp_listen_raw")
@@ -165,6 +339,75 @@ listener resource exists.
 ---
 func listen_numeric(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]:
 	builtin("blorp_tcp_listen_numeric_raw")
+
+
+---
+Listen on a loopback address for one IP family.
+---
+func listen_loopback(family: IpFamily, port: Port, backlog: Int) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_loopback_raw")
+
+
+---
+Listen on a loopback address and ask the OS to assign an available port.
+---
+func listen_loopback_any_port(family: IpFamily, backlog: Int) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_loopback_any_port_raw")
+
+
+---
+Listen on all local interfaces for one IP family.
+---
+func listen_any_interface(
+	family: IpFamily,
+	port: Port,
+	backlog: Int,
+) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_any_interface_raw")
+
+
+---
+Listen on all local interfaces and ask the OS to assign an available port.
+---
+func listen_any_interface_any_port(family: IpFamily, backlog: Int) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_any_interface_any_port_raw")
+
+
+---
+Listen on a validated IP address.
+---
+func listen_ip(address: IpAddress, port: Port, backlog: Int) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_ip_raw")
+
+
+---
+Listen on a validated IP address and ask the OS to assign an available port.
+---
+func listen_ip_any_port(address: IpAddress, backlog: Int) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_ip_any_port_raw")
+
+
+---
+Listen on a validated IPv6 address with an explicit interface scope.
+---
+func listen_scoped_ip(
+	address: IpAddress,
+	scope: InterfaceScope,
+	port: Port,
+	backlog: Int,
+) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_scoped_ip_raw")
+
+
+---
+Listen on a scoped IPv6 address and ask the OS to assign an available port.
+---
+func listen_scoped_ip_any_port(
+	address: IpAddress,
+	scope: InterfaceScope,
+	backlog: Int,
+) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_scoped_ip_any_port_raw")
 
 
 ---
@@ -212,6 +455,9 @@ Use with `with stream ?= connect(host, port):` so the stream is closed
 automatically when the block exits. Numeric hosts avoid DNS and the socket
 connect parks fibers while waiting. Hostnames may block an OS thread during
 resolution before the socket connect.
+
+Prefer `connect_loopback`, `connect_ip`, or `connect_name` for new code so port
+and host validation are explicit.
 ---
 func connect(host: String, port: Int) -> Result[TcpStream, TcpError]:
 	builtin("blorp_tcp_connect_raw")
@@ -227,6 +473,38 @@ the current fiber while waiting.
 ---
 func connect_numeric(host: String, port: Int) -> Result[TcpStream, TcpError]:
 	builtin("blorp_tcp_connect_numeric_raw")
+
+
+---
+Connect to this machine's loopback address for one IP family.
+---
+func connect_loopback(family: IpFamily, port: Port) -> Result[TcpStream, TcpError]:
+	builtin("blorp_tcp_connect_loopback_raw")
+
+
+---
+Connect to a validated IP address.
+---
+func connect_ip(address: IpAddress, port: Port) -> Result[TcpStream, TcpError]:
+	builtin("blorp_tcp_connect_ip_raw")
+
+
+---
+Connect to a validated IPv6 address with an explicit interface scope.
+---
+func connect_scoped_ip(
+	address: IpAddress,
+	scope: InterfaceScope,
+	port: Port,
+) -> Result[TcpStream, TcpError]:
+	builtin("blorp_tcp_connect_scoped_ip_raw")
+
+
+---
+Connect to a validated DNS name.
+---
+func connect_name(name: DnsName, port: Port) -> Result[TcpStream, TcpError]:
+	builtin("blorp_tcp_connect_name_raw")
 
 
 ---

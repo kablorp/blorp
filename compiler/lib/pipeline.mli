@@ -71,6 +71,7 @@ val compile :
   ?allow_debug_only_calls:bool ->
   ?retain_debug_blocks:bool ->
   ?embed_runtime:bool ->
+  ?require_main:bool ->
   ?profile:bool ->
   ?on_frontend_phase:(frontend_phase -> unit) ->
   ?on_stage:Core_pipeline.on_stage_callback ->
@@ -100,6 +101,11 @@ val compile :
     intermediate IR and by [--stop-after] to terminate early. Callbacks
     that raise [Core_pipeline.Stopped_after] do not propagate the exception
     outward — [compile] catches it and returns [Ok (Stopped_at s)].
+
+    [require_main] rejects user sources that do not declare a top-level
+    [main] function before Core/codegen. It is intended for runnable entry
+    points such as [blorp run]; analysis-only and C-emission callers can leave
+    it disabled.
 
     [check_invariants] enables post-stage invariant checks defined in
     [Core_invariants]. If any check fires, compilation fails with a

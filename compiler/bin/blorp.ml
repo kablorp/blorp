@@ -671,7 +671,8 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
       let precompiled = Test_runner.precompile_runtime ~sanitize ~opt () in
       let embed_runtime = precompiled = None in
       match
-        Pipeline.compile ~profile ~debug ~embed_runtime ~filename ~source ()
+        Pipeline.compile ~profile ~debug ~embed_runtime ~require_main:true
+          ~filename ~source ()
       with
       | Error errors ->
           prerr_endline (format_pipeline_errors ~file:filename errors);

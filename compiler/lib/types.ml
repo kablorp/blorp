@@ -207,6 +207,10 @@ let global_abi_type_names =
     "FallibleStream";
     "TcpListener";
     "TcpStream";
+    "IpAddress";
+    "DnsName";
+    "InterfaceScope";
+    "Port";
     "UdpSocket";
     "ConcurrencyError";
   ]

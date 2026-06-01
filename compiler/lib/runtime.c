@@ -12173,7 +12173,7 @@ blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog) {
     snprintf(port_buf, sizeof(port_buf), "%ld", port);
 
     struct addrinfo hints = {0};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
@@ -12310,7 +12310,7 @@ blorp_Result* blorp_tcp_connect(blorp_String* host, long port) {
     snprintf(port_buf, sizeof(port_buf), "%ld", port);
 
     struct addrinfo hints = {0};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo* res;
@@ -12796,6 +12796,238 @@ blorp_Result* blorp_tcp_set_timeout_stream(blorp_TcpStream* stream, long ms) {
 static bool blorp_tcp_host_value_is_valid(const blorp_String* host) {
     return host && host->len >= 0 && host->capacity >= 0 &&
            host->len <= host->capacity && host->len < 256;
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_raw(
+    blorp_String* host,
+    long port,
+    long backlog
+);
+blorp_TcpStreamResult blorp_tcp_connect_raw(blorp_String* host, long port);
+
+static blorp_String* blorp_tcp_copy_runtime_string(const blorp_String* value) {
+    if (!value || value->len < 0 || value->capacity < 0 ||
+        value->len > value->capacity) {
+        return blorp_string_literal("");
+    }
+    return blorp_string_from_buf(value->data, value->len);
+}
+
+static blorp_Result* blorp_tcp_boxed_ok_ptr(void* value, bool managed) {
+    blorp_Result* result = blorp_result_ok(value);
+    if (managed) result->release_mask = 1UL;
+    return result;
+}
+
+static blorp_Result* blorp_tcp_boxed_err_string(const char* detail) {
+    return blorp_result_err((void*)blorp_string_literal(detail));
+}
+
+blorp_String* blorp_tcp_ipv4_raw(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+    char buf[16];
+    int len = snprintf(
+        buf, sizeof(buf), "%u.%u.%u.%u",
+        (unsigned)a, (unsigned)b, (unsigned)c, (unsigned)d);
+    if (len < 0) return blorp_string_literal("0.0.0.0");
+    return blorp_string_from_buf(buf, len);
+}
+
+blorp_Result* blorp_tcp_parse_ip_raw(blorp_String* text) {
+    if (!blorp_tcp_host_value_is_valid(text) || text->len == 0) {
+        return blorp_tcp_boxed_err_string("IP address must be non-empty and shorter than 256 bytes");
+    }
+    if (blorp_string_contains_nul(text)) {
+        return blorp_tcp_boxed_err_string("IP address cannot contain NUL bytes");
+    }
+
+    char buf[256];
+    memcpy(buf, text->data, (size_t)text->len);
+    buf[text->len] = '\0';
+
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET, buf, &addr4) == 1 ||
+        inet_pton(AF_INET6, buf, &addr6) == 1) {
+        return blorp_tcp_boxed_ok_ptr(
+            blorp_string_from_buf(text->data, text->len), true);
+    }
+    return blorp_tcp_boxed_err_string("IP address must be valid IPv4 or IPv6 text");
+}
+
+blorp_Result* blorp_tcp_dns_name_raw(blorp_String* text) {
+    if (!blorp_tcp_host_value_is_valid(text) || text->len == 0) {
+        return blorp_tcp_boxed_err_string("DNS name must be non-empty and shorter than 256 bytes");
+    }
+    if (blorp_string_contains_nul(text)) {
+        return blorp_tcp_boxed_err_string("DNS name cannot contain NUL bytes");
+    }
+
+    char buf[256];
+    memcpy(buf, text->data, (size_t)text->len);
+    buf[text->len] = '\0';
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET, buf, &addr4) == 1 ||
+        inet_pton(AF_INET6, buf, &addr6) == 1) {
+        return blorp_tcp_boxed_err_string("DNS name cannot be an IP literal; use parse_ip");
+    }
+
+    return blorp_tcp_boxed_ok_ptr(blorp_string_from_buf(text->data, text->len), true);
+}
+
+blorp_Result* blorp_tcp_interface_scope_raw(blorp_String* text) {
+    if (!blorp_tcp_host_value_is_valid(text) || text->len == 0) {
+        return blorp_tcp_boxed_err_string("interface scope must be non-empty and shorter than 256 bytes");
+    }
+    if (blorp_string_contains_nul(text)) {
+        return blorp_tcp_boxed_err_string("interface scope cannot contain NUL bytes");
+    }
+    return blorp_tcp_boxed_ok_ptr(blorp_string_from_buf(text->data, text->len), true);
+}
+
+blorp_Result* blorp_tcp_port_raw(long value) {
+    if (value < 1 || value > 65535) {
+        return blorp_tcp_boxed_err_string("port must be between 1 and 65535");
+    }
+    return blorp_tcp_boxed_ok_ptr((void*)value, false);
+}
+
+blorp_String* blorp_tcp_ip_text_raw(blorp_String* value) {
+    return blorp_tcp_copy_runtime_string(value);
+}
+
+blorp_String* blorp_tcp_dns_name_text_raw(blorp_String* value) {
+    return blorp_tcp_copy_runtime_string(value);
+}
+
+blorp_String* blorp_tcp_interface_scope_text_raw(blorp_String* value) {
+    return blorp_tcp_copy_runtime_string(value);
+}
+
+long blorp_tcp_port_value_raw(long value) {
+    return value;
+}
+
+static blorp_String* blorp_tcp_loopback_host_for_family(long family) {
+    return blorp_string_literal(family == 1 ? "::1" : "127.0.0.1");
+}
+
+static blorp_String* blorp_tcp_any_interface_host_for_family(long family) {
+    return blorp_string_literal(family == 1 ? "::" : "0.0.0.0");
+}
+
+static blorp_String* blorp_tcp_scoped_host_raw(
+    blorp_String* address,
+    blorp_String* scope
+) {
+    if (!address || !scope || address->len < 0 || scope->len < 0 ||
+        address->capacity < 0 || scope->capacity < 0 ||
+        address->len > address->capacity || scope->len > scope->capacity) {
+        return blorp_string_literal("");
+    }
+    long total = address->len + 1 + scope->len;
+    blorp_String* result = blorp_string_alloc_uninit(total, total);
+    memcpy(result->data, address->data, (size_t)address->len);
+    result->data[address->len] = '%';
+    memcpy(result->data + address->len + 1, scope->data, (size_t)scope->len);
+    result->data[total] = '\0';
+    return result;
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_loopback_raw(
+    long family,
+    long port,
+    long backlog
+) {
+    return blorp_tcp_listen_raw(
+        blorp_tcp_loopback_host_for_family(family), port, backlog);
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_loopback_any_port_raw(
+    long family,
+    long backlog
+) {
+    return blorp_tcp_listen_loopback_raw(family, 0, backlog);
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_any_interface_raw(
+    long family,
+    long port,
+    long backlog
+) {
+    return blorp_tcp_listen_raw(
+        blorp_tcp_any_interface_host_for_family(family), port, backlog);
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_any_interface_any_port_raw(
+    long family,
+    long backlog
+) {
+    return blorp_tcp_listen_any_interface_raw(family, 0, backlog);
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_ip_raw(
+    blorp_String* address,
+    long port,
+    long backlog
+) {
+    return blorp_tcp_listen_raw(address, port, backlog);
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_ip_any_port_raw(
+    blorp_String* address,
+    long backlog
+) {
+    return blorp_tcp_listen_ip_raw(address, 0, backlog);
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_scoped_ip_raw(
+    blorp_String* address,
+    blorp_String* scope,
+    long port,
+    long backlog
+) {
+    blorp_String* host = blorp_tcp_scoped_host_raw(address, scope);
+    blorp_TcpListenerResult result = blorp_tcp_listen_raw(host, port, backlog);
+    blorp_release(host);
+    return result;
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_scoped_ip_any_port_raw(
+    blorp_String* address,
+    blorp_String* scope,
+    long backlog
+) {
+    return blorp_tcp_listen_scoped_ip_raw(address, scope, 0, backlog);
+}
+
+blorp_TcpStreamResult blorp_tcp_connect_loopback_raw(long family, long port) {
+    return blorp_tcp_connect_raw(blorp_tcp_loopback_host_for_family(family), port);
+}
+
+blorp_TcpStreamResult blorp_tcp_connect_ip_raw(
+    blorp_String* address,
+    long port
+) {
+    return blorp_tcp_connect_raw(address, port);
+}
+
+blorp_TcpStreamResult blorp_tcp_connect_scoped_ip_raw(
+    blorp_String* address,
+    blorp_String* scope,
+    long port
+) {
+    blorp_String* host = blorp_tcp_scoped_host_raw(address, scope);
+    blorp_TcpStreamResult result = blorp_tcp_connect_raw(host, port);
+    blorp_release(host);
+    return result;
+}
+
+blorp_TcpStreamResult blorp_tcp_connect_name_raw(
+    blorp_String* name,
+    long port
+) {
+    return blorp_tcp_connect_raw(name, port);
 }
 
 static bool blorp_tcp_host_string_is_numeric(

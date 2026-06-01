@@ -422,7 +422,8 @@ let record_erased_field_release_mask_ref (state : reachability)
 
 let runtime_managed_builtin_release_path = function
   | "String" | "LiteralString" | "Bytes" | "Fixed" | "MemStats"
-  | "SchedulerStats" | "ConcurrencyError" ->
+  | "SchedulerStats" | "ConcurrencyError" | "IpAddress" | "DnsName"
+  | "InterfaceScope" ->
       Some RuntimeBuiltinArcReleaseOnly
   | "StringSlice" -> Some (RuntimeBuiltinDestructor "blorp_slice_destructor")
   | "List" | "ParallelList" ->

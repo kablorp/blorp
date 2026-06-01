@@ -667,11 +667,44 @@ let result_bridges =
     tcp_bridge "blorp_tcp_listen_numeric_raw" "blorp_TcpListenerResult"
       tcp_listener_payload
       [ ArgBorrow; ArgBorrow; ArgBorrow ];
+    tcp_bridge "blorp_tcp_listen_loopback_raw" "blorp_TcpListenerResult"
+      tcp_listener_payload
+      [ ArgBorrow; ArgBorrow; ArgBorrow ];
+    tcp_bridge "blorp_tcp_listen_loopback_any_port_raw"
+      "blorp_TcpListenerResult" tcp_listener_payload
+      [ ArgBorrow; ArgBorrow ];
+    tcp_bridge "blorp_tcp_listen_any_interface_raw" "blorp_TcpListenerResult"
+      tcp_listener_payload
+      [ ArgBorrow; ArgBorrow; ArgBorrow ];
+    tcp_bridge "blorp_tcp_listen_any_interface_any_port_raw"
+      "blorp_TcpListenerResult" tcp_listener_payload
+      [ ArgBorrow; ArgBorrow ];
+    tcp_bridge "blorp_tcp_listen_ip_raw" "blorp_TcpListenerResult"
+      tcp_listener_payload
+      [ ArgBorrow; ArgBorrow; ArgBorrow ];
+    tcp_bridge "blorp_tcp_listen_ip_any_port_raw" "blorp_TcpListenerResult"
+      tcp_listener_payload
+      [ ArgBorrow; ArgBorrow ];
+    tcp_bridge "blorp_tcp_listen_scoped_ip_raw" "blorp_TcpListenerResult"
+      tcp_listener_payload
+      [ ArgBorrow; ArgBorrow; ArgBorrow; ArgBorrow ];
+    tcp_bridge "blorp_tcp_listen_scoped_ip_any_port_raw"
+      "blorp_TcpListenerResult" tcp_listener_payload
+      [ ArgBorrow; ArgBorrow; ArgBorrow ];
     tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_accept_raw"
       "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow ];
     tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_raw"
       "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow; ArgBorrow ];
     tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_numeric_raw"
+      "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow; ArgBorrow ];
+    tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_loopback_raw"
+      "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow; ArgBorrow ];
+    tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_ip_raw"
+      "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow; ArgBorrow ];
+    tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_scoped_ip_raw"
+      "blorp_TcpStreamResult" tcp_stream_payload
+      [ ArgBorrow; ArgBorrow; ArgBorrow ];
+    tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_name_raw"
       "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow; ArgBorrow ];
     tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_read_raw"
       "blorp_TcpBytesResult"

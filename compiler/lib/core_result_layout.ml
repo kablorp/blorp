@@ -89,7 +89,7 @@ let is_immediate_integer_name = function
   | name -> List.mem name Types.all_int_type_names
 
 let expanded_payload_is_stack_erased meta = function
-  | Ast.TyNamed (("Int" | "Bool" | "Char" | "Ptr"), []) -> true
+  | Ast.TyNamed (("Int" | "Bool" | "Char" | "Ptr" | "Port"), []) -> true
   | Ast.TyNamed (("Float" | "Float32" | "Float16"), []) -> true
   | Ast.TyNamed (name, []) when is_immediate_integer_name name -> true
   | Ast.TyNamed (name, []) when meta.is_enum_name name -> true
@@ -106,7 +106,7 @@ let is_builtin_managed_payload_name = function
   | "Dict" | "Set" | "Tensor" | "Vector" | "Matrix" | "Bytes" | "Fixed"
   | "StringSlice" | "MemStats" | "SchedulerStats" | "Builder" | "Slice" | "Task"
   | "Channel" | "Option" | "Result" | "TcpListener" | "TcpStream"
-  | "ConcurrencyError" ->
+  | "ConcurrencyError" | "IpAddress" | "DnsName" | "InterfaceScope" ->
       true
   | name when Type_name_metadata.is_stream_name name -> true
   | _ -> false
