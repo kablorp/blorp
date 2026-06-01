@@ -1129,7 +1129,14 @@ let test_cf_kind_foreign_carries_c_name () =
   | _ -> Alcotest.fail "expected CFForeign"
 
 let test_cf_kind_closure_body_tag () =
-  let ca = { ca_params = []; ca_captures = []; ca_task_abi = false } in
+  let ca =
+    {
+      ca_params = [];
+      ca_captures = [];
+      ca_moved_captures = [];
+      ca_task_abi = false;
+    }
+  in
   let f = mk_kind_func ~name:"c" ~kind:(CFClosureBody ca) in
   let out = pp_program_indented [ mk_decl (CDFunc f) ] in
   Alcotest.(check bool)

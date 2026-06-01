@@ -371,6 +371,7 @@ let wrap_fn_ref_as_closure (state : state) ~(bound : StringSet.t) (arg : core) :
                   {
                     ca_params = fresh_params;
                     ca_captures = [];
+                    ca_moved_captures = [];
                     ca_task_abi = false;
                   };
               cf_def_id = def_id;
@@ -387,10 +388,27 @@ let wrap_fn_ref_as_closure (state : state) ~(bound : StringSet.t) (arg : core) :
           })
   | _ -> arg
 
-let hoist_task_closure (state : state) ~(loc : Ast.loc)
-    ~(capturable : StringSet.t) ~(body : core) ~(return_ty : Ast.type_expr) :
-    task_closure =
+let hoist_task_closure ?(capture_kind_of = fun _ -> TaskCopyCapture)
+    (state : state) ~(loc : Ast.loc) ~(capturable : StringSet.t) ~(body : core)
+    ~(return_ty : Ast.type_expr) : task_closure =
   let captures = collect_free_vars_filtered state ~capturable body [] in
+  let task_captures =
+    List.map
+      (fun (name, ty) ->
+        {
+          task_capture_name = name;
+          task_capture_ty = ty;
+          task_capture_kind = capture_kind_of name;
+        })
+      captures
+  in
+  let moved_captures =
+    task_captures
+    |> List.filter_map (fun capture ->
+        match capture.task_capture_kind with
+        | TaskMoveResourceItem -> Some capture.task_capture_name
+        | TaskCopyCapture | TaskStructuredTaskBorrow -> None)
+  in
   let id = state.task_counter in
   state.task_counter <- id + 1;
   let name = Printf.sprintf "_blorp_task_%d" id in
@@ -406,7 +424,12 @@ let hoist_task_closure (state : state) ~(loc : Ast.loc)
       cf_is_pure = false;
       cf_kind =
         CFClosureBody
-          { ca_params = []; ca_captures = captures; ca_task_abi = true };
+          {
+            ca_params = [];
+            ca_captures = captures;
+            ca_moved_captures = moved_captures;
+            ca_task_abi = true;
+          };
       cf_def_id = def_id;
     }
   in
@@ -416,7 +439,7 @@ let hoist_task_closure (state : state) ~(loc : Ast.loc)
   {
     tc_func = name;
     tc_def_id = def_id;
-    tc_captures = task_copy_captures captures;
+    tc_captures = task_captures;
     tc_return_ty = return_ty;
   }
 
@@ -779,9 +802,18 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
           match cf.cf_task with
           | Some task -> Some task
           | None ->
+              let capture_kind_of name =
+                match cf.cf_item_mode with
+                | ConcurrentlyLoopMoveResourceItem _ when name = cf.cf_var.vname
+                  ->
+                    TaskMoveResourceItem
+                | ConcurrentlyLoopCopyItem | ConcurrentlyLoopMoveResourceItem _
+                  ->
+                    TaskCopyCapture
+              in
               Some
                 (hoist_task_closure state ~loc:cf.cf_body.loc ~body:body'
-                   ~capturable:body_bound ~return_ty:body'.ty)
+                   ~capturable:body_bound ~return_ty:body'.ty ~capture_kind_of)
         in
         {
           e with
@@ -906,6 +938,7 @@ let rec convert_expr (state : state) ~(wrap_fn_refs : bool)
               {
                 ca_params = lam.lam_params;
                 ca_captures = captures;
+                ca_moved_captures = [];
                 ca_task_abi = false;
               };
           cf_def_id = def_id;

@@ -430,6 +430,39 @@ let bcases cases = Builtin_cases cases
 let bvariadic min_arity arg_at result =
   Builtin_variadic { min_arity; arg_at; result }
 
+let arg_mode_of_runtime_ownership = function
+  | Operation_result_metadata.ArgBorrow -> Borrow
+  | Operation_result_metadata.ArgRetain -> Retain
+  | Operation_result_metadata.ArgConsume -> Consume
+  | Operation_result_metadata.ArgCowConsume -> CowConsume
+  | Operation_result_metadata.ArgTransfer -> Transfer
+
+let operation_result_bridge_builtin_contracts =
+  Operation_result_metadata.result_bridges
+  |> List.map (fun (bridge : Operation_result_metadata.result_bridge) ->
+      builtin bridge.Operation_result_metadata.builtin_name
+        (bfixed
+           (List.map arg_mode_of_runtime_ownership bridge.arguments)
+           ReturnOwned))
+
+let fallible_stream_source_builtin_contracts =
+  Operation_result_metadata.fallible_stream_sources
+  |> List.map
+       (fun (source : Operation_result_metadata.fallible_stream_source) ->
+         builtin source.Operation_result_metadata.builtin_name
+           (bfixed
+              (List.map arg_mode_of_runtime_ownership source.arguments)
+              ReturnOwned))
+
+let fallible_stream_terminal_builtin_contracts =
+  Operation_result_metadata.fallible_stream_terminals
+  |> List.map
+       (fun (terminal : Operation_result_metadata.fallible_stream_terminal) ->
+         builtin ~void_boxed_args:terminal.void_boxed_args terminal.builtin_name
+           (bfixed
+              (List.map arg_mode_of_runtime_ownership terminal.arguments)
+              ReturnOwned))
+
 let channel_stack_option_suffixes =
   [
     "int";
@@ -567,6 +600,10 @@ let builtin_contract_table =
       builtins
         [ "blorp_test_cancel_after_parked" ]
         (bfixed [ Borrow ] ReturnPrimitive);
+      builtins [ "blorp_test_tls_state_probe" ] (bfixed [] ReturnPrimitive);
+      builtins
+        [ "blorp_test_websocket_state_probe" ]
+        (bfixed [] ReturnPrimitive);
       (* Dict runtime functions. Mutating operations consume the dict owner through
        COW; reads borrow and allocate owned result wrappers/lists as needed. *)
       builtins
@@ -765,9 +802,6 @@ let builtin_contract_table =
       builtins
         [ "blorp_tcp_set_timeout_listener"; "blorp_tcp_set_timeout_stream" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_tcp_listen_raw" ]
-        (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_tcp_accept_raw" ] (bfixed [ Borrow ] ReturnOwned);
       builtins
         [
           "blorp_tcp_connections_stop_on_error_raw";
@@ -775,104 +809,16 @@ let builtin_contract_table =
         ]
         (bfixed [ Borrow ] ReturnOwned);
       builtins
-        [ "blorp_tcp_connect_raw" ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_tcp_read_raw" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_tcp_write_raw"; "blorp_tcp_write_all_raw" ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
         [
-          "blorp_tcp_set_reuse_addr_raw";
-          "blorp_tcp_local_port_listener_raw";
-          "blorp_tcp_local_port_stream_raw";
+          "blorp_tls_native_available_raw";
+          "blorp_websocket_native_available_raw";
         ]
-        (bfixed [ Borrow ] ReturnOwned);
+        (bfixed [] ReturnPrimitive);
+      builtins [ "blorp_tls_close_session" ] (bfixed [ Borrow ] ReturnVoid);
       builtins
-        [
-          "blorp_tcp_set_timeout_listener_raw";
-          "blorp_tcp_set_timeout_stream_raw";
-        ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
-        [
-          "blorp_file_open_read_raw";
-          "blorp_file_open_write_raw";
-          "blorp_file_open_append_raw";
-          "blorp_file_open_read_write_raw";
-        ]
-        (bfixed [ Borrow ] ReturnOwned);
-      builtins
-        [
-          "blorp_file_read_text_reader_raw";
-          "blorp_file_read_bytes_reader_raw";
-          "blorp_file_read_text_file_raw";
-          "blorp_file_read_bytes_file_raw";
-        ]
-        (bfixed [ Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_file_read_chunk_reader_raw"; "blorp_file_read_chunk_file_raw" ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_file_chunks_reader_raw" ]
-        (bfixed [ Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_file_chunks_with_size_reader_raw" ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins [ "blorp_file_lines_reader_raw" ] (bfixed [ Borrow ] ReturnOwned);
-      builtins [ "blorp_file_bytes_reader_raw" ] (bfixed [ Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_file_windows_reader_raw" ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
-        [
-          "blorp_file_count_lines_reader_raw"; "blorp_file_count_lines_file_raw";
-        ]
-        (bfixed [ Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_fallible_stream_collect_file_raw" ]
-        (bfixed [ Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_fallible_stream_count_file_raw" ]
-        (bfixed [ Borrow ] ReturnOwned);
-      builtins
-        [
-          "blorp_fallible_stream_find_file_raw_nullable";
-          "blorp_fallible_stream_find_file_raw_int";
-          "blorp_fallible_stream_find_file_raw_int8";
-          "blorp_fallible_stream_find_file_raw_int16";
-          "blorp_fallible_stream_find_file_raw_int32";
-          "blorp_fallible_stream_find_file_raw_int64";
-          "blorp_fallible_stream_find_file_raw_uint8";
-          "blorp_fallible_stream_find_file_raw_uint16";
-          "blorp_fallible_stream_find_file_raw_uint32";
-          "blorp_fallible_stream_find_file_raw_uint64";
-          "blorp_fallible_stream_find_file_raw_float";
-          "blorp_fallible_stream_find_file_raw_bool";
-          "blorp_fallible_stream_find_file_raw_char";
-          "blorp_fallible_stream_find_file_raw_f32";
-          "blorp_fallible_stream_find_file_raw_f16";
-        ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
-        [
-          "blorp_fallible_stream_any_file_raw";
-          "blorp_fallible_stream_all_file_raw";
-        ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins ~void_boxed_args:[ 1 ]
-        [ "blorp_fallible_stream_fold_file_raw" ]
-        (bfixed [ Borrow; Consume; Borrow; Borrow ] ReturnOwned);
-      builtins
-        [
-          "blorp_file_write_text_writer_raw";
-          "blorp_file_write_bytes_writer_raw";
-          "blorp_file_write_chunk_writer_raw";
-          "blorp_file_write_text_file_raw";
-          "blorp_file_write_bytes_file_raw";
-          "blorp_file_write_chunk_file_raw";
-        ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
+        [ "blorp_websocket_close_session" ]
+        (bfixed [ Borrow ] ReturnVoid);
+      builtins [ "blorp_udp_close_socket" ] (bfixed [ Borrow ] ReturnVoid);
       builtins
         [
           "blorp_file_close_reader";
@@ -880,6 +826,9 @@ let builtin_contract_table =
           "blorp_file_close";
         ]
         (bfixed [ Borrow ] ReturnVoid);
+      operation_result_bridge_builtin_contracts;
+      fallible_stream_source_builtin_contracts;
+      fallible_stream_terminal_builtin_contracts;
       builtins [ "blorp_string_concat" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
         [ "blorp_string_concat_consume" ]

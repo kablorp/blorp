@@ -2422,6 +2422,7 @@ let list_concurrent_collect ?timeout self_ty result_ty self limit f =
          cf_timeout = timeout;
          cf_width = ConcurrentlyLoopLimit limit;
          cf_output = ConcurrentlyLoopCollect;
+         cf_item_mode = ConcurrentlyLoopCopyItem;
          cf_task_scope = synthetic_concurrent_task_scope;
          cf_task = None;
        })

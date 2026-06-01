@@ -447,7 +447,8 @@ select_arm  = destruct_id "from" expr ":" NEWLINE INDENT stmt_list DEDENT
             | "_" "after" expr ":" NEWLINE INDENT stmt_list DEDENT ;
 
 with_expr = "with" with_binding ":" NEWLINE INDENT stmt_list DEDENT ;
-with_binding = destruct_id [ ":" type_expr ] ( "=" | "?=" ) expr ;
+with_binding = destruct_id [ ":" type_expr ] "=" expr
+             | destruct_id [ ":" type_expr ] "?=" expr [ "on" destruct_id "=>" expr ] ;
 
 debug_block = "debug" ":" NEWLINE INDENT stmt_list DEDENT ;
 
@@ -528,7 +529,7 @@ Certain keywords can be used as identifiers in field/function name position:
 ```ebnf
 name = IDENT | "debug" | "and" | "or" | "not" | "type" | "match" | "if" | "else"
      | "True" | "False" | "in" | "for" | "while" | "with" | "foreign"
-     | "resource" | "concurrent"
+     | "resource" | "concurrent" | "on"
      | "select" | "from" | "after" | "sealed" ;
 ```
 

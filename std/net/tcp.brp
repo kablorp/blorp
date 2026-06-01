@@ -7,7 +7,7 @@
 -- hosts such as "127.0.0.1" or "" bind-any hosts when OS-worker pinning during
 -- DNS resolution is unacceptable.
 import:
-	stream: ResourceSource
+	stream: FallibleStream, ResourceSource
 
 
 ---
@@ -92,6 +92,22 @@ implements Stringable for TcpError:
 
 
 ---
+Return True when a TCP error is a timeout.
+
+doctests:
+    :: TimedOut is recognized
+    is_timed_out(TimedOut("accept")) == True
+
+    :: Other errors are not timeouts
+    is_timed_out(Other("closed")) == False
+---
+pure func is_timed_out(err: TcpError) -> Bool:
+	match err:
+		TimedOut(_): True
+		_: False
+
+
+---
 Return the local port for a scoped listener.
 ---
 @resource_result_ordinary
@@ -141,12 +157,24 @@ func listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpErr
 
 
 ---
+Create a TCP server socket without hostname DNS resolution.
+
+`host` must be a numeric IPv4 address, or "" to bind to the platform's passive
+any-host address. Use this when a server must avoid blocking DNS before the
+listener resource exists.
+---
+func listen_numeric(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]:
+	builtin("blorp_tcp_listen_numeric_raw")
+
+
+---
 Accept an incoming connection on a listening socket.
 
 The listener must be a scoped `with` binding. Only one parked accept may be in
-progress for a listener. Start one accept loop and fan accepted streams into
-structured resource-source consumers once that syntax lands; overlapping parked
-accepts return an error instead of pretending the listener is closed.
+progress for a listener. Use a single accept loop or a resource source such as
+`connections_continue_on_error(listener)` to fan accepted streams into
+structured concurrent consumers; overlapping parked accepts return an error
+instead of pretending the listener is closed.
 ---
 func accept(listener: TcpListener) -> Result[TcpStream, TcpError]:
 	builtin("blorp_tcp_accept_raw")
@@ -169,9 +197,9 @@ Create a resource-producing source of accepted streams.
 
 The source borrows the scoped listener, so it must stay inside the listener's
 `with` block. Sequential `for` iteration transfers each accepted stream into a
-scoped loop body and closes it at the end of that iteration. The current runtime
-ends the source on accept errors while the typed transient-error policy is being
-finished.
+scoped loop body and closes it at the end of that iteration. Accept timeouts
+are treated as transient and the source continues accepting; other accept
+errors end the source.
 ---
 func connections_continue_on_error(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]:
 	builtin("blorp_tcp_connections_continue_on_error_raw")
@@ -190,6 +218,18 @@ func connect(host: String, port: Int) -> Result[TcpStream, TcpError]:
 
 
 ---
+Connect to a numeric IPv4 address without hostname DNS resolution.
+
+Use with `with stream ?= connect_numeric(host, port):` so the stream is closed
+automatically when the block exits. Non-numeric hosts are rejected before the
+runtime reaches the platform resolver; the socket connect itself still parks
+the current fiber while waiting.
+---
+func connect_numeric(host: String, port: Int) -> Result[TcpStream, TcpError]:
+	builtin("blorp_tcp_connect_numeric_raw")
+
+
+---
 Read up to `max_bytes` from a socket.
 
 The stream must be a scoped `with` binding. Returns the data actually read,
@@ -200,6 +240,36 @@ the connection. Passing a non-positive size or a size larger than 64 MiB returns
 @resource_result_ordinary
 func read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]:
 	builtin("blorp_tcp_read_raw")
+
+
+---
+Alias for `read_chunk`.
+---
+@resource_result_ordinary
+func read(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]:
+	builtin("blorp_tcp_read_raw")
+
+
+---
+Create a fallible stream of byte chunks from a scoped TCP stream.
+
+Each pull reads up to `max_bytes` bytes. An empty read from the peer ends the
+stream normally; socket, timeout, and cancellation-adjacent failures are
+reported through terminal operations as `Result[..., TcpError]`.
+---
+func chunks(stream: TcpStream, max_bytes: Int) -> FallibleStream[Bytes, TcpError]:
+	builtin("blorp_tcp_chunks_raw")
+
+
+---
+Create a fallible stream of text lines from a scoped TCP stream.
+
+Lines are returned without trailing `\n` or `\r\n`. The stream ends normally
+when the peer closes the connection; a final line without a trailing newline is
+still yielded.
+---
+func lines(stream: TcpStream) -> FallibleStream[String, TcpError]:
+	builtin("blorp_tcp_lines_raw")
 
 
 ---

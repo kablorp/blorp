@@ -202,6 +202,7 @@ let test_closure_capture_and_abi_sites_are_cataloged () =
     {
       ca_params = [ (Var.named "arg", maybe_int) ];
       ca_captures = [ ("captured", maybe_int) ];
+      ca_moved_captures = [];
       ca_task_abi = false;
     }
   in

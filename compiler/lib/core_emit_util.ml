@@ -395,7 +395,10 @@ let release_value_call (ctx : Core_emit_context.t) (ty : Ast.type_expr)
 
 let cancellation_cleanup_release_fn (ctx : Core_emit_context.t)
     (ty : Ast.type_expr) : string option =
-  if is_stack_result_type ctx ty || not (type_requires_release ctx ty) then None
+  if is_stack_result_type ctx ty then
+    if type_requires_release ctx ty then Some "blorp_cleanup_stack_result_value"
+    else None
+  else if not (type_requires_release ctx ty) then None
   else if not (is_pointer_type ctx ty) then None
   else
     let layout =
@@ -408,6 +411,11 @@ let cancellation_cleanup_release_fn (ctx : Core_emit_context.t)
     | Core_layout_type.SourceValueArcReleaseWithDestructor ->
         Some "blorp_cleanup_release_arc_value"
     | Core_layout_type.SourceValueNoRelease -> None
+
+let cancellation_cleanup_value_arg (ctx : Core_emit_context.t)
+    (ty : Ast.type_expr) ~(slot_c : string) ~(value_c : string) : string =
+  if is_stack_result_type ctx ty then Printf.sprintf "(void*)&%s" slot_c
+  else Printf.sprintf "(void*)%s" value_c
 
 (** Box a C expression to [void*] for storage in generic containers,
     closure environments, or variant fields. Single source of truth

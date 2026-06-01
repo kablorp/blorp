@@ -176,7 +176,15 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
   List.iter
     (fun name ->
       Alcotest.(check bool) (name ^ " is impure") true (has_effect name Impure))
-    [ "print"; "read_file"; "write_file"; "getenv"; "send_timeout" ];
+    [
+      "print";
+      "read_file";
+      "write_file";
+      "getenv";
+      "send_timeout";
+      "websocket_state_probe_for_test";
+      "blorp_dns_resolve_raw";
+    ];
   List.iter
     (fun name ->
       Alcotest.(check bool)
@@ -212,15 +220,31 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "send_timeout_attempt";
       "recv_timeout_attempt";
       "cancel_after_parked_for_test";
+      "tls_state_probe_for_test";
       "blorp_tcp_accept";
       "blorp_tcp_connect";
       "blorp_tcp_read";
       "blorp_tcp_write";
       "blorp_tcp_accept_raw";
       "blorp_tcp_connect_raw";
+      "blorp_tcp_connect_numeric_raw";
       "blorp_tcp_read_raw";
       "blorp_tcp_write_raw";
       "blorp_tcp_write_all_raw";
+      "blorp_tls_connect_raw";
+      "blorp_tls_read_raw";
+      "blorp_tls_write_raw";
+      "blorp_tls_write_all_raw";
+      "blorp_websocket_connect_raw";
+      "blorp_websocket_receive_raw";
+      "blorp_websocket_send_text_raw";
+      "blorp_websocket_send_binary_raw";
+      "blorp_websocket_send_ping_raw";
+      "blorp_websocket_send_pong_raw";
+      "blorp_websocket_send_close_raw";
+      "blorp_udp_send_to_wait_raw";
+      "blorp_udp_send_to_wait_numeric_raw";
+      "blorp_udp_recv_from_raw";
     ];
   List.iter
     (fun name ->
@@ -238,11 +262,31 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "read";
       "write";
       "blorp_tcp_listen";
+      "blorp_dns_resolve_raw";
       "blorp_tcp_listen_raw";
+      "blorp_tcp_listen_numeric_raw";
       "blorp_tcp_local_port_listener_raw";
       "blorp_tcp_set_timeout_listener_raw";
+      "blorp_udp_bind_raw";
+      "blorp_udp_bind_numeric_raw";
+      "blorp_udp_send_to_raw";
+      "blorp_udp_send_to_numeric_raw";
       "parallel";
-    ]
+    ];
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " blocks an OS worker")
+        true
+        (is_os_worker_blocking name))
+    [ "blorp_dns_resolve_raw" ];
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " does not block an OS worker")
+        false
+        (is_os_worker_blocking name))
+    [ "sleep"; "send"; "blorp_tcp_connect_raw"; "blorp_tls_read_raw" ]
 
 let test_type_metadata_classifies_typechecker_policy () =
   let open Blorp in
@@ -453,23 +497,10 @@ let pkg_foreign_decl_modules () =
   |> List.sort_uniq String.compare
 
 let expected_pkg_foreign_decl_modules =
-  [
-    "compress.brp";
-    "crypto.brp";
-    "net/dns.brp";
-    "net/tls.brp";
-    "net/udp.brp";
-    "sqlite.brp";
-  ]
+  [ "compress.brp"; "crypto.brp"; "net/dns.brp"; "sqlite.brp" ]
 
 let expected_pkg_native_header_files =
-  [
-    "compress_ffi.h";
-    "crypto_ffi.h";
-    "net/tls_ffi.h";
-    "net/udp_ffi.h";
-    "sqlite_ffi.h";
-  ]
+  [ "compress_ffi.h"; "crypto_ffi.h"; "net/dns_ffi.h"; "sqlite_ffi.h" ]
 
 let test_std_foreign_inventory_is_explicit () =
   Alcotest.(check (list string))

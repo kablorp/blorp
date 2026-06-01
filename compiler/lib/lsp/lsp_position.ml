@@ -340,7 +340,18 @@ let find_definition (program : program) ~(name : string) ~(line : int)
     | EWith (binding, body) ->
         if binding.with_name = name && loc_starts_before_cursor e.expr_loc then
           Some e.expr_loc
-        else find_local_in_expr body
+        else
+          let mapper_match =
+            match binding.with_error_map with
+            | Some mapper
+              when mapper.with_error_name = name
+                   && loc_starts_before_cursor e.expr_loc ->
+                Some e.expr_loc
+            | _ -> None
+          in
+          Option.fold ~none:(find_local_in_expr body)
+            ~some:(fun loc -> Some loc)
+            mapper_match
     | EConcurrent (bindings, _, _) -> find_local_in_exprs bindings
     | EConcurrentBind (n, _, _)
       when n = name && loc_starts_before_cursor e.expr_loc ->

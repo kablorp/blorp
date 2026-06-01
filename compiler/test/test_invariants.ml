@@ -1230,6 +1230,7 @@ let concurrently_loop_expr ?iter_ty ?body_ty ?node_ty ?timeout ?task_ty
          cf_timeout = timeout;
          cf_width = width;
          cf_output = output;
+         cf_item_mode = ConcurrentlyLoopCopyItem;
          cf_task_scope = task_scope;
          cf_task = Some (task_closure task_ty);
        })

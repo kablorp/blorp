@@ -848,7 +848,16 @@ let collect_free_var_refs (expr : expr) : string list =
               go case_bound case.case_body)
             cases
     | EWith (binding, body) ->
+        let mapper_refs =
+          match binding.with_error_map with
+          | None -> []
+          | Some mapper ->
+              go
+                (add_bound_name mapper.with_error_name bound)
+                mapper.with_error_value
+        in
         go bound binding.with_value
+        @ mapper_refs
         @ go (add_bound_name binding.with_name bound) body
     | ESelect arms ->
         List.concat_map
@@ -900,16 +909,39 @@ let module_resource_type_names_from_decls (decls : Ast.program) : string list =
   in
   List.fold_left collect [] decls |> List.sort_uniq String.compare
 
-let type_mentions_named_resource resource_names ty =
+let resource_type_names_for_module module_path =
+  match Modules.find_cached module_path with
+  | None -> []
+  | Some m ->
+      let decls =
+        match m.typed_decls with
+        | Some td -> Typed_ast.program_ast td
+        | None -> m.decls
+      in
+      module_resource_type_names_from_decls decls
+
+let type_name_is_known_resource env resource_names name =
+  let local_name =
+    match Types.split_canonical_module_type_name name with
+    | Some (_module_path, local_name) -> local_name
+    | None -> name
+  in
+  Env.get_type_kind env name = Some TypeResource
+  || Env.get_type_kind env local_name = Some TypeResource
+  || List.mem name resource_names
+  || List.mem local_name resource_names
+  ||
+  match Types.split_canonical_module_type_name name with
+  | Some (module_path, local_name) ->
+      List.mem local_name (resource_type_names_for_module module_path)
+  | None -> false
+
+let type_mentions_named_resource env resource_names ty =
   let rec contains ty =
     match ty with
     | TyNamed (name, args) ->
-        let type_name =
-          match Types.split_canonical_module_type_name name with
-          | Some (_module_path, local_name) -> local_name
-          | None -> name
-        in
-        List.mem type_name resource_names || List.exists contains args
+        type_name_is_known_resource env resource_names name
+        || List.exists contains args
     | TyTuple elems -> List.exists contains elems
     | TyFunc { params; return; _ } ->
         List.exists contains params || contains return
@@ -925,23 +957,40 @@ let func_decl_has_named_resource_param resource_names func =
   List.exists
     (fun param ->
       match param.param_type with
-      | Some ty -> type_mentions_named_resource resource_names ty
+      | Some ty -> type_mentions_named_resource (Env.empty ()) resource_names ty
       | None -> false)
     func.func_params
 
-let resource_arg_policy_of_module_func resource_names func =
+let resource_arg_policy_of_module_func_param_types env resource_names func
+    param_types =
   match func.func_body with
-  | FuncBuiltinBody _
-    when func_decl_has_named_resource_param resource_names func ->
+  | FuncBuiltinBody (builtin_body, _)
+    when List.exists
+           (type_mentions_named_resource env resource_names)
+           param_types
+         || func_decl_has_named_resource_param resource_names func ->
       let result_policy =
         if func.func_resource_result_ordinary then ResourceResultOrdinary
-        else ResourceResultDependent
+        else
+          match builtin_body with
+          | BuiltinRuntime name -> (
+              match Operation_result_metadata.resource_result_policy name with
+              | Some policy -> policy
+              | None -> ResourceResultDependent)
+          | BuiltinIntrinsic -> ResourceResultDependent
       in
       AllowResourceArgs result_policy
   | FuncBuiltinBody _ | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
       RejectResourceArgs
 
-let lookup_module_func_resource_arg_policy module_path func_name =
+let resource_arg_policy_of_module_func resource_names func =
+  let param_types =
+    List.filter_map (fun param -> param.param_type) func.func_params
+  in
+  resource_arg_policy_of_module_func_param_types (Env.empty ()) resource_names
+    func param_types
+
+let lookup_module_func_resource_arg_policy env module_path func_name =
   match Modules.find_cached module_path with
   | None -> None
   | Some m -> (
@@ -967,7 +1016,15 @@ let lookup_module_func_resource_arg_policy module_path func_name =
                   | Typed_ast.DeclFunction typed_func
                     when (Typed_ast.func_ast typed_func).func_name
                          = Some func_name ->
-                      from_func (Typed_ast.func_ast typed_func)
+                      let func = Typed_ast.func_ast typed_func in
+                      let param_types =
+                        Typed_ast.func_param_infos typed_func
+                        |> List.map (fun info ->
+                            info.Typed_ast.semantic_param_ty)
+                      in
+                      Some
+                        (resource_arg_policy_of_module_func_param_types env
+                           resource_names func param_types)
                   | _ -> find rest)
             in
             find (Typed_ast.program_decls typed_program)
@@ -1007,7 +1064,7 @@ let resource_arg_policy_for_callee ?(module_aliases = []) env callee =
               | _ -> None)))
   | EFieldAccess ({ expr_desc = EIdent alias; _ }, func_name) ->
       Option.bind (List.assoc_opt alias module_aliases) (fun module_path ->
-          lookup_module_func_resource_arg_policy module_path func_name)
+          lookup_module_func_resource_arg_policy env module_path func_name)
   | _ -> None
 
 let resource_result_policy_for_callee ?(module_aliases = []) env callee =
@@ -1030,8 +1087,9 @@ let rec scoped_resource_dependency_refs ?(module_aliases = []) env expr =
   match expr.expr_desc with
   | EIdent name when Env.is_scoped_resource_related_var env name -> [ name ]
   | ECall (callee, _args)
-    when resource_result_policy_for_callee ~module_aliases env callee
-         = Some ResourceResultOrdinary ->
+    when match resource_result_policy_for_callee ~module_aliases env callee with
+         | Some ResourceResultOrdinary | Some ResourceResultIndependent -> true
+         | Some ResourceResultDependent | None -> false ->
       []
   | EWith (_binding, body) -> (
       match result_expr_of_body body with
@@ -1046,24 +1104,13 @@ let rec scoped_resource_dependency_refs ?(module_aliases = []) env expr =
 let scoped_resource_related_refs ?(module_aliases = []) env expr =
   scoped_resource_dependency_refs ~module_aliases env expr
 
-let is_one_shot_stream_type_name name =
+let is_channel_type_name name =
   match Types.split_canonical_module_type_name name with
-  | Some (module_path, ("Stream" | "FallibleStream")) ->
-      module_path = "std/stream"
+  | Some (module_path, "Channel") -> module_path = "std/channel"
   | _ ->
-      name = "Stream" || name = "FallibleStream"
-      || name = "std_stream__Stream"
-      || name = "std_stream__FallibleStream"
-      || name = "std/stream::Stream"
-      || name = "std/stream::FallibleStream"
-
-let is_resource_source_type_name name =
-  match Types.split_canonical_module_type_name name with
-  | Some (module_path, "ResourceSource") -> module_path = "std/stream"
-  | _ ->
-      name = "ResourceSource"
-      || name = "std_stream__ResourceSource"
-      || name = "std/stream::ResourceSource"
+      name = "Channel"
+      || name = "std_channel__Channel"
+      || name = "std/channel::Channel"
 
 let named_type_components env name args =
   (* Known source records/unions expose the values they actually store after
@@ -1133,10 +1180,10 @@ let type_contains_named_type env is_target ty =
   go [] ty
 
 let type_contains_one_shot_stream env ty =
-  type_contains_named_type env is_one_shot_stream_type_name ty
+  type_contains_named_type env Type_name_metadata.is_one_shot_stream_name ty
 
 let type_contains_resource_source env ty =
-  type_contains_named_type env is_resource_source_type_name ty
+  type_contains_named_type env Type_name_metadata.is_resource_source_name ty
 
 let type_is_named_target env is_target ty =
   match
@@ -1146,17 +1193,17 @@ let type_is_named_target env is_target ty =
   | _ -> false
 
 let type_is_one_shot_stream env ty =
-  type_is_named_target env is_one_shot_stream_type_name ty
+  type_is_named_target env Type_name_metadata.is_one_shot_stream_name ty
 
 let type_is_resource_source env ty =
-  type_is_named_target env is_resource_source_type_name ty
+  type_is_named_target env Type_name_metadata.is_resource_source_name ty
 
 let resource_source_parts env ty =
   match
     normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
   with
   | TyNamed (name, [ resource_ty; error_ty ])
-    when is_resource_source_type_name name ->
+    when Type_name_metadata.is_resource_source_name name ->
       Some (resource_ty, error_ty)
   | _ -> None
 
@@ -1203,10 +1250,12 @@ let type_contains_named_type_function_carrier env is_target ty =
   contains_function_carrier [] ty
 
 let type_contains_one_shot_stream_function_carrier env ty =
-  type_contains_named_type_function_carrier env is_one_shot_stream_type_name ty
+  type_contains_named_type_function_carrier env
+    Type_name_metadata.is_one_shot_stream_name ty
 
 let type_contains_resource_source_function_carrier env ty =
-  type_contains_named_type_function_carrier env is_resource_source_type_name ty
+  type_contains_named_type_function_carrier env
+    Type_name_metadata.is_resource_source_name ty
 
 let one_shot_stream_refs env refs =
   refs
@@ -1302,8 +1351,9 @@ let reject_scoped_resource_derived_storage ?(module_aliases = []) env loc
           ]
         ~help:
           (Some
-             "Consume dependent streams, cursors, and borrowed values inside \
-              the with block, or store only ordinary data computed from them.")
+             "Consume dependent streams, cursors, and resource-scoped values \
+              inside the with block, or store only ordinary data computed from \
+              them.")
         loc
         (Printf.sprintf
            "scoped resource-derived values cannot be stored in %s: %s" container
@@ -1559,10 +1609,12 @@ let reject_resource_source_mutable_binding env loc binding_name ty is_mutable =
          | Some n -> " '" ^ n ^ "'"))
   else Ok ()
 
-let reject_scoped_resource_task_capture env loc expr =
+let reject_scoped_resource_task_capture ?(allowed_scoped_captures = []) env loc
+    expr =
   let scoped_captures =
     expr |> collect_free_var_refs
     |> List.filter (Env.is_scoped_resource_var env)
+    |> List.filter (fun name -> not (List.mem name allowed_scoped_captures))
   in
   let derived_captures =
     expr |> collect_free_var_refs
@@ -1581,8 +1633,8 @@ let reject_scoped_resource_task_capture env loc expr =
             scoped_captures,
             [
               "Concurrent tasks copy their captures into task storage. Scoped \
-               resources need an explicit concurrency-safe borrow contract \
-               before they can cross that boundary.";
+               resources need an explicit concurrency-safe resource access \
+               contract before they can cross that boundary.";
             ],
             "Use the resource synchronously inside the with block, or derive \
              ordinary data before starting concurrent work." )
@@ -1604,8 +1656,8 @@ let reject_scoped_resource_task_capture env loc expr =
                derived from scoped resources inherit the resource lifetime and \
                cannot cross that boundary.";
             ],
-            "Consume dependent streams, cursors, and borrowed values inside \
-             the with block, or derive ordinary data before starting \
+            "Consume dependent streams, cursors, and resource-scoped values \
+             inside the with block, or derive ordinary data before starting \
              concurrent work." )
         else if stream_captures <> [] then
           ( "one-shot stream value",
@@ -1644,56 +1696,50 @@ let is_resource_type ctx ty =
   | None -> false
 
 let type_contains_resource ctx ty =
-  let apply_named_subst type_params args tys =
-    let subst =
-      if List.length type_params = List.length args then
-        List.map2
-          (fun var_name concrete_type -> { var_name; concrete_type })
-          type_params args
-      else []
-    in
-    List.map (apply_subst subst) tys
-  in
-  let named_component_types name args =
-    let record_fields =
-      match Env.get_record ctx.env name with
-      | Some (type_params, fields) ->
-          fields
-          |> List.map (fun field -> field.field_type)
-          |> apply_named_subst type_params args
-      | None -> []
-    in
-    let variant_fields =
-      match Env.get_type_decl ctx.env name with
-      | Some (type_params, variants) ->
-          variants
-          |> List.concat_map (fun variant -> variant.variant_fields)
-          |> apply_named_subst type_params args
-      | None -> []
-    in
-    record_fields @ variant_fields
-  in
-  let rec go visited ty =
+  let rec go ty =
     let ty = normalize_type ctx ResourceBinding ty |> Types.head_resolve in
     match ty with
-    | TyNamed (name, _) when is_resource_source_type_name name -> false
+    | TyNamed (name, _) when Type_name_metadata.is_resource_source_name name ->
+        false
     | TyNamed (name, args) ->
-        is_resource_type ctx ty
-        || List.exists (go visited) args
-        ||
-        if List.mem name visited then false
-        else
-          named_component_types name args |> List.exists (go (name :: visited))
-    | TyTuple elems -> List.exists (go visited) elems
-    | TyFunc { params; return; _ } ->
-        List.exists (go visited) params || go visited return
-    | TyRange inner -> go visited inner
-    | TyArray (elem, dims) -> go visited elem || List.exists (go visited) dims
-    | TyDimOp (_, left, right) -> go visited left || go visited right
+        is_resource_type ctx ty || List.exists go args
+        || Env.get_type_contains_resource ctx.env name
+    | TyTuple elems -> List.exists go elems
+    | TyFunc { params; return; _ } -> List.exists go params || go return
+    | TyRange inner -> go inner
+    | TyArray (elem, dims) -> go elem || List.exists go dims
+    | TyDimOp (_, left, right) -> go left || go right
     | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _ ->
         false
   in
-  go [] ty
+  go ty
+
+type select_waitable_kind =
+  | SelectWaitableChannel of Ast.type_expr
+  | SelectWaitableRejected of select_waitable_rejection
+
+and select_waitable_rejection =
+  | SelectRejectedResourceSource of Ast.type_expr
+  | SelectRejectedResourceProducing of Ast.type_expr
+  | SelectRejectedOperationResultWait of {
+      builtin_name : string;
+      wait_class : Operation_result_metadata.operation_wait_class;
+      result_ty : Ast.type_expr;
+    }
+  | SelectRejectedUnsupported of Ast.type_expr
+
+let classify_select_waitable ctx ty =
+  let normalized =
+    normalize_type ctx ResourceBinding ty |> Types.head_resolve
+  in
+  match normalized with
+  | TyNamed (name, [ elem_ty ]) when is_channel_type_name name ->
+      SelectWaitableChannel elem_ty
+  | _ when type_is_resource_source ctx.env normalized ->
+      SelectWaitableRejected (SelectRejectedResourceSource normalized)
+  | _ when type_contains_resource ctx normalized ->
+      SelectWaitableRejected (SelectRejectedResourceProducing normalized)
+  | _ -> SelectWaitableRejected (SelectRejectedUnsupported normalized)
 
 let type_contains_resource_function_endpoint ctx ty =
   let rec go visited ty =
@@ -2107,7 +2153,7 @@ let reject_ordinary_resource_call_arg ctx loc source_callee callee_name
         ~notes:
           [
             "Ordinary function parameters copy values. Resource values need an \
-             explicit borrow or compiler-owned resource operation.";
+             explicit scoped-resource or compiler-owned resource operation.";
           ]
         ~help:
           (Some
@@ -2123,6 +2169,14 @@ let is_direct_scoped_resource_arg env expr =
   | EIdent name -> Env.is_scoped_resource_var env name
   | _ -> false
 
+let unavailable_scoped_resource_arg env expr =
+  match expr.expr_desc with
+  | EIdent name -> (
+      match Env.scoped_resource_unavailable_owner env name with
+      | Some owner -> Some (name, owner)
+      | None -> None)
+  | _ -> None
+
 let reject_unscoped_resource_operation_arg ctx source_callee callee_name
     resolved_overload typed_args =
   if
@@ -2134,32 +2188,49 @@ let reject_unscoped_resource_operation_arg ctx source_callee callee_name
     List.fold_left
       (fun acc (arg_ty, arg) ->
         let* () = acc in
-        if
-          type_contains_resource ctx arg_ty
-          && not (is_direct_scoped_resource_arg ctx.env arg)
-        then
-          let callee_hint =
-            match callee_name with
-            | Some name -> Printf.sprintf " in call to '%s'" name
-            | None -> ""
-          in
-          error_with
-            ~notes:
-              [
-                "Compiler-owned resource operations borrow resources; they do \
-                 not acquire or own cleanup for fresh resource-producing \
-                 expressions.";
-              ]
-            ~help:
-              (Some
-                 "Acquire the resource with `with name = ...:` and pass that \
-                  scoped binding to the resource operation.")
-            arg.expr_loc
-            (Printf.sprintf
-               "resource argument to compiler-owned resource operation must be \
-                a scoped with binding%s"
-               callee_hint)
-        else Ok ())
+        match unavailable_scoped_resource_arg ctx.env arg with
+        | Some (resource_name, owner) ->
+            error_with
+              ~notes:
+                [
+                  "A dependent resource borrows the parent resource for its \
+                   scope. Using the parent directly while the dependent \
+                   resource is live could interleave protocol state behind the \
+                   compiler's back.";
+                ]
+              ~help:
+                (Some
+                   "Use the dependent resource inside this scope, then use the \
+                    parent resource again after the nested with block closes.")
+              arg.expr_loc
+              (Printf.sprintf
+                 "scoped resource '%s' is unavailable while %s is in scope"
+                 resource_name owner)
+        | None
+          when type_contains_resource ctx arg_ty
+               && not (is_direct_scoped_resource_arg ctx.env arg) ->
+            let callee_hint =
+              match callee_name with
+              | Some name -> Printf.sprintf " in call to '%s'" name
+              | None -> ""
+            in
+            error_with
+              ~notes:
+                [
+                  "Compiler-owned resource operations borrow resources; they \
+                   do not acquire or own cleanup for fresh resource-producing \
+                   expressions.";
+                ]
+              ~help:
+                (Some
+                   "Acquire the resource with `with name = ...:` and pass that \
+                    scoped binding to the resource operation.")
+              arg.expr_loc
+              (Printf.sprintf
+                 "resource argument to compiler-owned resource operation must \
+                  be a scoped with binding%s"
+                 callee_hint)
+        | None -> Ok ())
       (Ok ()) typed_args
 
 let reject_scoped_resource_derived_call_arg ctx loc source_callee callee_name
@@ -2186,13 +2257,15 @@ let reject_scoped_resource_derived_call_arg ctx loc source_callee callee_name
           ~notes:
             [
               "Ordinary function parameters copy values. Values derived from a \
-               scoped resource need an explicit borrow or resource operation \
-               contract before their lifetime can cross a call boundary.";
+               scoped resource need an explicit scoped-resource or resource \
+               operation contract before their lifetime can cross a call \
+               boundary.";
             ]
           ~help:
             (Some
-               "Keep dependent streams, cursors, and borrowed values inside \
-                the with block, or pass ordinary data computed from them.")
+               "Keep dependent streams, cursors, and resource-scoped values \
+                inside the with block, or pass ordinary data computed from \
+                them.")
           loc
           (Printf.sprintf
              "scoped resource-derived value cannot be passed to ordinary call%s"
@@ -2356,10 +2429,42 @@ let validate_with_binding_annotation ctx loc ty_ann inner_ty =
              (type_to_string ann_ty) (type_to_string inner_ty))
   | None -> Ok inner_ty
 
-let with_resource_scope_ctx ctx name binding_ty =
+let dependent_resource_owner_name name =
+  if name = "_" then "current dependent resource" else name
+
+let unavailable_parent_resource_names ctx acquire_expr =
+  scoped_resource_related_refs ~module_aliases:ctx.module_aliases ctx.env
+    acquire_expr
+  |> List.filter (Env.is_scoped_resource_var ctx.env)
+  |> List.sort_uniq String.compare
+
+let shadow_parent_resource_unavailable owner env name =
+  match Env.lookup env name with
+  | Some
+      {
+        kind = VarSymbol { var_type; source_type; mutability; refinement; _ };
+        _;
+      }
+    when Env.is_scoped_resource_var env name ->
+      add_var env name var_type ?source_type ~mutability
+        ~origin:(Env.ScopedResourceUnavailable owner) ~refinement ()
+  | _ -> env
+
+let with_resource_scope_ctx ?(unavailable_parents = []) ctx name binding_ty =
   let env = push_scope ctx.env in
+  let owner = dependent_resource_owner_name name in
+  let env =
+    List.fold_left
+      (shadow_parent_resource_unavailable owner)
+      env unavailable_parents
+  in
   if name = "_" then { ctx with env }
   else { ctx with env = add_var env name binding_ty ~origin:ScopedResource () }
+
+let with_error_map_ctx ctx name error_ty =
+  let env = push_scope ctx.env in
+  if name = "_" then { ctx with env }
+  else { ctx with env = add_var env name error_ty () }
 
 (** Validate a ?= type annotation against the unwrapped inner type,
     bind the variable, and return the updated context and typed stmt. *)
@@ -2470,6 +2575,7 @@ type module_func_resolution = {
   module_func_callable_id : int option;
   module_func_is_pure : bool;
   module_func_origin : Env.func_origin;
+  module_func_runtime_builtin : string option;
 }
 (** Look up a function's type from a specific module.
     Prefers [typed_decls] (post-typecheck) over [exports] (parsed decls)
@@ -2494,6 +2600,13 @@ let lookup_module_func_resolution module_path func_name =
       in
       let qualify ty =
         Types.qualify_module_local_types ~module_path:m.name local_type_names ty
+      in
+      let runtime_builtin_name func =
+        match func.func_body with
+        | FuncBuiltinBody (BuiltinRuntime name, _) -> Some name
+        | FuncBuiltinBody (BuiltinIntrinsic, _)
+        | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
+            None
       in
       let rec extract_func_resolution decl =
         match decl.decl_desc with
@@ -2522,6 +2635,7 @@ let lookup_module_func_resolution module_path func_name =
                 module_func_origin =
                   (if Ast.func_is_foreign f then Env.Foreign
                    else Env.UserDefined);
+                module_func_runtime_builtin = runtime_builtin_name f;
               }
         | _ -> None
       in
@@ -2546,6 +2660,7 @@ let lookup_module_func_resolution module_path func_name =
           module_func_is_pure = f.func_is_pure;
           module_func_origin =
             (if Ast.func_is_foreign f then Env.Foreign else Env.UserDefined);
+          module_func_runtime_builtin = runtime_builtin_name f;
         }
       in
       (* Try typed_decls first: after typecheck, func_type_params carries
@@ -2937,9 +3052,10 @@ let elem_type_of_iterable (ty : type_expr) : type_expr option =
       | TyNamed ("String", []) -> Some ty_char (* String iterates over Char *)
       | TyNamed ("Range", []) -> Some ty_int (* Range -> Int *)
       | TyNamed ("Range", [ elem ]) -> Some elem (* legacy Range[Int] shape *)
-      | TyNamed ("Channel", [ elem ]) ->
+      | TyNamed (name, [ elem ]) when is_channel_type_name name ->
           Some elem (* Channel iterates via blocking recv *)
-      | TyNamed ("Stream", [ elem ]) -> Some elem (* Stream iterates via pull *)
+      | TyNamed (name, [ elem ]) when Type_name_metadata.is_stream_name name ->
+          Some elem (* Stream iterates via pull *)
       | _ -> None)
 
 let infer_literal (lit : literal) : type_expr =
@@ -3504,8 +3620,8 @@ let check_no_mutable_captures (env : env) (func : func_decl) (loc : loc) :
               message =
                 Printf.sprintf
                   "Closure cannot capture scoped resource-derived value%s: %s. \
-                   Keep dependent streams, cursors, and borrowed values inside \
-                   the with block."
+                   Keep dependent streams, cursors, and resource-scoped values \
+                   inside the with block."
                   (if List.length vars > 1 then "s" else "")
                   (String.concat ", " vars);
               loc;
@@ -3975,6 +4091,102 @@ let attach_resolved_call_metadata ctx ~source_callee result_ty call_expr =
           | None -> call_expr)
       | _ -> call_expr)
 
+let module_runtime_builtin_name module_path func_name =
+  Option.bind (lookup_module_func_resolution module_path func_name) (fun info ->
+      info.module_func_runtime_builtin)
+
+(* Select currently accepts only channel/timer waits. When a source expression
+   is a compiler-owned operation-result builtin, keep the scheduler and
+   ownership facts explicit in the rejection diagnostic instead of falling back
+   to a generic Channel[T] mismatch. *)
+let rec runtime_builtin_name_for_call_expr ctx expr =
+  let from_resolved_call =
+    match Ast.expr_resolved_call expr with
+    | Some
+        {
+          call_target =
+            CallDirect { source_name; origin = CallableImported module_path; _ };
+          _;
+        } ->
+        module_runtime_builtin_name module_path
+          (strip_callable_id_suffix source_name)
+    | Some
+        {
+          call_target = CallDirect { source_name; origin = CallableBuiltin; _ };
+          _;
+        } ->
+        Some (strip_callable_id_suffix source_name)
+    | Some
+        {
+          call_target = CallDirect { source_name; origin = CallableLocal; _ };
+          _;
+        } -> (
+        match Env.lookup ctx.env (strip_callable_id_suffix source_name) with
+        | Some { kind = FuncSymbol { module_path = Some module_path; _ }; _ } ->
+            module_runtime_builtin_name module_path
+              (strip_callable_id_suffix source_name)
+        | _ -> None)
+    | Some { call_target = CallDirect { origin = CallableConstructor _; _ }; _ }
+    | Some { call_target = CallDirect { origin = CallableForeign; _ }; _ }
+    | Some { call_target = CallDirect { origin = CallableImplMethod; _ }; _ }
+    | Some { call_target = CallTraitMethod _; _ }
+    | Some { call_target = CallClosure _; _ }
+    | None ->
+        None
+  in
+  match from_resolved_call with
+  | Some _ as name -> name
+  | None -> (
+      match expr.expr_desc with
+      | EAscription (inner, _) -> runtime_builtin_name_for_call_expr ctx inner
+      | ECall
+          ( {
+              expr_desc = EFieldAccess ({ expr_desc = EIdent alias; _ }, name);
+              _;
+            },
+            _ ) ->
+          Option.bind (List.assoc_opt alias ctx.module_aliases)
+            (fun module_path -> module_runtime_builtin_name module_path name)
+      | ECall ({ expr_desc = EIdent name; _ }, _) -> (
+          match Env.lookup ctx.env (strip_callable_id_suffix name) with
+          | Some { kind = FuncSymbol { module_path = Some module_path; _ }; _ }
+            ->
+              module_runtime_builtin_name module_path
+                (strip_callable_id_suffix name)
+          | _ -> None)
+      | _ -> None)
+
+let operation_result_bridge_for_select_expr ctx expr =
+  Option.bind
+    (runtime_builtin_name_for_call_expr ctx expr)
+    Operation_result_metadata.find_result_bridge
+
+let classify_select_waitable_expr ctx expr ty =
+  match operation_result_bridge_for_select_expr ctx expr with
+  | Some bridge ->
+      let normalized =
+        normalize_type ctx ResourceBinding ty |> Types.head_resolve
+      in
+      SelectWaitableRejected
+        (SelectRejectedOperationResultWait
+           {
+             builtin_name = bridge.builtin_name;
+             wait_class =
+               Operation_result_metadata.bridge_operation_wait_class bridge;
+             result_ty = normalized;
+           })
+  | None -> classify_select_waitable ctx ty
+
+let resource_result_policy_label = function
+  | ResourceResultOrdinary -> "ordinary"
+  | ResourceResultIndependent -> "independently-owned resource"
+  | ResourceResultDependent -> "resource scoped to its parent"
+
+let result_ownership_note = function
+  | Operation_result_metadata.OrdinaryResult -> "ordinary data"
+  | Operation_result_metadata.ResourceResult policy ->
+      resource_result_policy_label policy
+
 (** Check if a type contains TySelf *)
 let rec contains_ty_self (ty : type_expr) : bool =
   match ty with
@@ -4225,6 +4437,14 @@ and zonk_expr_desc = function
             binding with
             with_type = Option.map Types.zonk_type binding.with_type;
             with_value = zonk_expr binding.with_value;
+            with_error_map =
+              Option.map
+                (fun mapper ->
+                  {
+                    mapper with
+                    with_error_value = zonk_expr mapper.with_error_value;
+                  })
+                binding.with_error_map;
           },
           zonk_expr body )
   | EDebugBlock xs -> EDebugBlock (List.map zonk_expr xs)
@@ -4544,8 +4764,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           let* () =
             require_resource_type ctx binding.with_value.expr_loc binding_ty
           in
+          let unavailable_parents =
+            unavailable_parent_resource_names ctx acquire'
+          in
           let resource_ctx =
-            with_resource_scope_ctx ctx binding.with_name binding_ty
+            with_resource_scope_ctx ~unavailable_parents ctx binding.with_name
+              binding_ty
           in
           let* body_ty, body' = infer_expr resource_ctx body in
           let* () =
@@ -4564,21 +4788,30 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           let* rhs_ty, rhs' =
             infer_unconstrained_value_expr ctx binding.with_value
           in
-          let* inner_ty =
-            match (expected_type_opt ctx, rhs_ty) with
-            | Some (TyNamed ("Option", [ _ ])), TyNamed ("Option", [ inner_ty ])
-              ->
-                Ok inner_ty
+          let* inner_ty, with_error_map =
+            match (expected_type_opt ctx, rhs_ty, binding.with_error_map) with
+            | ( Some (TyNamed ("Option", [ _ ])),
+                TyNamed ("Option", [ inner_ty ]),
+                None ) ->
+                Ok (inner_ty, None)
             | ( Some (TyNamed ("Option", _)),
-                TyNamed ("Result", [ _inner_ty; _err_ty ]) ) ->
+                (TyNamed ("Option", _) | TyNamed ("Result", _)),
+                Some _ ) ->
+                error binding.with_value.expr_loc
+                  "with ?= error mapping requires the enclosing block to \
+                   return Result[T, E]"
+            | ( Some (TyNamed ("Option", _)),
+                TyNamed ("Result", [ _inner_ty; _err_ty ]),
+                None ) ->
                 error binding.with_value.expr_loc
                   "Cannot use Result ?= in a with binding inside a block \
                    returning Option. Convert the Result to Option or return \
                    Result from the enclosing function"
             | ( Some (TyNamed ("Result", [ _ok_ty; expected_err_ty ])),
-                TyNamed ("Result", [ inner_ty; actual_err_ty ]) ) ->
+                TyNamed ("Result", [ inner_ty; actual_err_ty ]),
+                None ) ->
                 if ctx_types_compatible ctx expected_err_ty actual_err_ty then
-                  Ok inner_ty
+                  Ok (inner_ty, None)
                 else
                   error binding.with_value.expr_loc
                     (Printf.sprintf
@@ -4587,20 +4820,61 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                         Result[..., %s]"
                        (type_to_string expected_err_ty)
                        (type_to_string actual_err_ty))
-            | Some (TyNamed ("Result", _)), TyNamed ("Option", [ _inner_ty ]) ->
+            | ( Some (TyNamed ("Result", [ _ok_ty; expected_err_ty ])),
+                TyNamed ("Result", [ inner_ty; actual_err_ty ]),
+                Some mapper ) ->
+                let mapper_ctx =
+                  with_error_map_ctx ctx mapper.with_error_name actual_err_ty
+                in
+                let* mapped_ty, mapped_expr =
+                  infer_expected_value_expr mapper_ctx expected_err_ty
+                    mapper.with_error_value
+                in
+                if ctx_types_compatible mapper_ctx expected_err_ty mapped_ty
+                then
+                  let mapper' =
+                    { mapper with with_error_value = mapped_expr }
+                  in
+                  Ok (inner_ty, Some mapper')
+                else
+                  error mapper.with_error_value.expr_loc
+                    (Printf.sprintf
+                       "Type mismatch: with ?= error mapper must return %s, \
+                        got %s"
+                       (type_to_string expected_err_ty)
+                       (type_to_string mapped_ty))
+            | ( Some (TyNamed ("Result", _)),
+                TyNamed ("Option", [ _inner_ty ]),
+                Some _ ) ->
+                error binding.with_value.expr_loc
+                  "with ?= error mapping requires a Result acquisition \
+                   expression"
+            | ( Some (TyNamed ("Result", _)),
+                TyNamed ("Option", [ _inner_ty ]),
+                None ) ->
                 error binding.with_value.expr_loc
                   "Cannot use Option ?= in a with binding inside a block \
                    returning Result. Convert the Option to Result with \
                    to_result(...) or return Option from the enclosing function"
-            | Some carrier_ty, (TyNamed ("Option", _) | TyNamed ("Result", _))
-              ->
+            | ( Some carrier_ty,
+                (TyNamed ("Option", _) | TyNamed ("Result", _)),
+                None ) ->
                 error binding.with_value.expr_loc
                   (Printf.sprintf
                      "with ?= requires the enclosing block to return the same \
                       carrier as the acquisition expression; enclosing block \
                       returns %s"
                      (type_to_string carrier_ty))
-            | _, TyNamed ("Option", _) | _, TyNamed ("Result", _) ->
+            | _, (TyNamed ("Option", _) | TyNamed ("Result", _)), Some _ ->
+                error_with ~notes:[]
+                  ~help:
+                    (Some
+                       "give the enclosing function an explicit Result return \
+                        type, or remove the error mapper")
+                  binding.with_value.expr_loc
+                  "with ?= error mapping requires an enclosing block returning \
+                   Result[T, E]"
+            | _, TyNamed ("Option", _), None | _, TyNamed ("Result", _), None ->
                 error_with ~notes:[]
                   ~help:
                     (Some
@@ -4610,7 +4884,13 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                   binding.with_value.expr_loc
                   "with ?= requires an enclosing block returning Option[T] or \
                    Result[T, E]"
-            | _, _ ->
+            | _, _, Some _ ->
+                error binding.with_value.expr_loc
+                  (Printf.sprintf
+                     "Cannot use `?=` error mapping in a with binding on type \
+                      `%s` — only Result supports error mapping"
+                     (type_to_string rhs_ty))
+            | _, _, None ->
                 error binding.with_value.expr_loc
                   (Printf.sprintf
                      "Cannot use `?=` in a with binding on type `%s` — only \
@@ -4624,8 +4904,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           let* () =
             require_resource_type ctx binding.with_value.expr_loc binding_ty
           in
+          let unavailable_parents =
+            unavailable_parent_resource_names ctx rhs'
+          in
           let resource_ctx =
-            with_resource_scope_ctx ctx binding.with_name binding_ty
+            with_resource_scope_ctx ~unavailable_parents ctx binding.with_name
+              binding_ty
           in
           let* body_ty, body' = infer_expr resource_ctx body in
           let* () =
@@ -4633,7 +4917,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
               body'
           in
           let binding' =
-            { binding with with_type = Some binding_ty; with_value = rhs' }
+            {
+              binding with
+              with_type = Some binding_ty;
+              with_value = rhs';
+              with_error_map;
+            }
           in
           Ok
             ( body_ty,
@@ -6295,14 +6584,133 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       in
       if arms = [] then error loc "select: block cannot be empty"
       else
-        let channel_elem_ty arm_loc channel_ty arm_label =
-          match Types.head_resolve channel_ty with
-          | TyNamed ("Channel", [ elem_ty ]) -> Ok elem_ty
-          | _ ->
+        let reject_select_waitable arm_loc arm_label = function
+          | SelectRejectedResourceSource ty ->
+              error_with
+                ~notes:
+                  [
+                    "ResourceSource values produce scoped resources one at a \
+                     time. `select` does not yet have a selected-branch \
+                     resource ownership model.";
+                    Printf.sprintf "Got %s." (type_to_string ty);
+                  ]
+                ~help:
+                  (Some
+                     "Consume resource sources directly with `for item in \
+                      source:` or `for item in source concurrently(...):`, or \
+                      send ordinary events through a channel.")
+                arm_loc "resource-source select arms are not implemented yet"
+          | SelectRejectedOperationResultWait
+              { builtin_name; wait_class; result_ty } -> (
+              match wait_class with
+              | Operation_result_metadata.ParksFiberReturning
+                  (Operation_result_metadata.ResourceResult policy) ->
+                  error_with
+                    ~notes:
+                      [
+                        Printf.sprintf
+                          "`%s` parks the current fiber and returns %s."
+                          builtin_name
+                          (resource_result_policy_label policy);
+                        "A resource-producing wait must define which selected \
+                         branch owns cleanup, and must prove that unselected \
+                         waits did not acquire a resource.";
+                        Printf.sprintf "Got %s." (type_to_string result_ty);
+                      ]
+                    ~help:
+                      (Some
+                         "Use a `with` block, a sequential accept/read loop, \
+                          or a resource-source loop until resource-producing \
+                          `select` has explicit ownership in typed AST and \
+                          Core.")
+                    arm_loc
+                    "resource-producing select arms are not implemented yet"
+              | Operation_result_metadata.ParksFiberReturning result_kind ->
+                  error_with
+                    ~notes:
+                      [
+                        Printf.sprintf
+                          "`%s` parks the current fiber and returns %s through \
+                           Result."
+                          builtin_name
+                          (result_ownership_note result_kind);
+                        "`select` currently supports channels and timers; \
+                         operation-result waits need explicit typed AST and \
+                         Core lowering.";
+                        Printf.sprintf "Got %s." (type_to_string result_ty);
+                      ]
+                    ~help:
+                      (Some
+                         "Run the operation in a task and send ordinary events \
+                          through a channel when another task needs to select \
+                          over the result.")
+                    arm_loc
+                    "operation-result select arms are not implemented yet"
+              | Operation_result_metadata.BlocksOsWorkerReturning
+                  (reason, result_kind) ->
+                  error_with
+                    ~notes:
+                      [
+                        Printf.sprintf
+                          "`%s` blocks an OS worker (%s) and returns %s."
+                          builtin_name reason
+                          (result_ownership_note result_kind);
+                        "`select` must not hide OS-worker blocking behind a \
+                         fiber waitable arm.";
+                        Printf.sprintf "Got %s." (type_to_string result_ty);
+                      ]
+                    ~help:
+                      (Some
+                         "Use a bounded service or worker task that sends \
+                          ordinary results through a channel.")
+                    arm_loc "OS-worker-blocking select arms are not supported"
+              | Operation_result_metadata.DoesNotSuspend ->
+                  error_with
+                    ~notes:
+                      [
+                        Printf.sprintf
+                          "`%s` is an operation-result builtin, but it does \
+                           not suspend."
+                          builtin_name;
+                        Printf.sprintf "Got %s." (type_to_string result_ty);
+                      ]
+                    ~help:
+                      (Some
+                         "Run non-suspending operations before `select`, or \
+                          send their result through a channel.")
+                    arm_loc
+                    (Printf.sprintf
+                       "select %s arm requires a waitable operation" arm_label))
+          | SelectRejectedResourceProducing ty ->
+              error_with
+                ~notes:
+                  [
+                    "A resource-producing wait must define which selected \
+                     branch owns cleanup, and must prove that unselected waits \
+                     did not acquire a resource.";
+                    Printf.sprintf "Got %s." (type_to_string ty);
+                  ]
+                ~help:
+                  (Some
+                     "Use a `with` block, a sequential accept/read loop, or a \
+                      resource-source loop until resource-producing `select` \
+                      has explicit ownership in typed AST and Core.")
+                arm_loc "resource-producing select arms are not implemented yet"
+          | SelectRejectedUnsupported ty ->
               error arm_loc
                 (Printf.sprintf "select %s arm requires Channel[T], got %s"
-                   arm_label
-                   (type_to_string channel_ty))
+                   arm_label (type_to_string ty))
+        in
+        let channel_elem_ty ?channel_expr arm_loc channel_ty arm_label =
+          let waitable =
+            match channel_expr with
+            | Some expr -> classify_select_waitable_expr ctx expr channel_ty
+            | None -> classify_select_waitable ctx channel_ty
+          in
+          match waitable with
+          | SelectWaitableChannel elem_ty -> Ok elem_ty
+          | SelectWaitableRejected rejection ->
+              reject_select_waitable arm_loc arm_label rejection
         in
         let infer_select_arm arm =
           match arm.select_arm_kind with
@@ -6311,7 +6719,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                 infer_unconstrained_value_expr ctx select_channel
               in
               let* elem_ty =
-                channel_elem_ty select_channel.expr_loc channel_ty "receive"
+                channel_elem_ty ~channel_expr:select_channel'
+                  select_channel.expr_loc channel_ty "receive"
               in
               let body_env =
                 if select_bind = "_" then Env.push_scope ctx.env
@@ -6354,7 +6763,8 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                 infer_unconstrained_value_expr ctx channel
               in
               let* _elem_ty =
-                channel_elem_ty channel.expr_loc channel_ty "sealed"
+                channel_elem_ty ~channel_expr:channel' channel.expr_loc
+                  channel_ty "sealed"
               in
               let body_ctx =
                 { (without_expected ctx) with env = Env.push_scope ctx.env }
@@ -6506,37 +6916,30 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         | None -> Ok None
       in
       let* iter_ty, iter' = infer_unconstrained_value_expr ctx iter in
+      let resource_source_parts_opt = resource_source_parts ctx.env iter_ty in
       let elem_ty =
         match iter_ty with
         | TyNamed ("List", [ t ]) -> Ok t
-        | _ when type_is_resource_source ctx.env iter_ty ->
-            error_with
-              ~notes:
-                [
-                  "Resource-source concurrent iteration must transfer each \
-                   produced resource into exactly one child task and make that \
-                   child task the cleanup owner.";
-                  "That move contract is not implemented yet, so accepting a \
-                   ResourceSource here would make resource ownership \
-                   ambiguous.";
-                ]
-              ~help:
-                (Some
-                   "Use an explicit accept/acquire loop for now, or keep the \
-                    source as a direct local until resource-source concurrent \
-                    iteration lands.")
-              iter.expr_loc
-              "resource-source concurrent iteration is not implemented yet"
-        | _ ->
-            error iter.expr_loc
-              (Printf.sprintf "`for ... concurrently` requires a List, got %s"
-                 (type_to_string iter_ty))
+        | _ -> (
+            match resource_source_parts_opt with
+            | Some (resource_ty, _error_ty) -> Ok resource_ty
+            | None ->
+                error iter.expr_loc
+                  (Printf.sprintf
+                     "`for ... concurrently` requires a List or \
+                      ResourceSource, got %s"
+                     (type_to_string iter_ty)))
       in
       let* elem_ty = elem_ty in
+      let loop_var_origin =
+        match resource_source_parts_opt with
+        | Some _ -> Env.ScopedResource
+        | None -> ForLoopVar
+      in
       let inner_ctx =
         {
           (without_expected ctx) with
-          env = Env.add_var ctx.env var elem_ty ~origin:ForLoopVar ();
+          env = Env.add_var ctx.env var elem_ty ~origin:loop_var_origin ();
           in_loop = true;
         }
       in
@@ -6545,7 +6948,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
         else infer_unconstrained_value_expr inner_ctx body
       in
       let* () =
-        reject_scoped_resource_task_capture inner_ctx.env body.expr_loc body'
+        reject_scoped_resource_task_capture
+          ~allowed_scoped_captures:
+            (match resource_source_parts_opt with
+            | Some _ -> [ var ]
+            | None -> [])
+          inner_ctx.env body.expr_loc body'
       in
       let task_body_ty = if discard_result then ty_void else body_ty in
       let* () =
@@ -6622,9 +7030,9 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
                     "Detached work may outlive the resource scope that owns \
                      the value's dependency.";
                   ],
-                  "Consume dependent streams, cursors, and borrowed values \
-                   inside the with block, or derive ordinary data before \
-                   detaching work." )
+                  "Consume dependent streams, cursors, and resource-scoped \
+                   values inside the with block, or derive ordinary data \
+                   before detaching work." )
               else if stream_captures <> [] then
                 ( "one-shot stream value",
                   stream_captures,

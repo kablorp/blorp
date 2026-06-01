@@ -96,12 +96,14 @@ type match_case = {
 }
 
 type with_binding_kind = Ast.with_binding_kind = WithPlain | WithTry
+type with_error_map = { with_error_name : string; with_error_value : expr }
 
 type with_binding = {
   with_name : string;
   with_type : Ast.type_expr option;
   with_value : expr;
   with_kind : with_binding_kind;
+  with_error_map : with_error_map option;
 }
 
 type select_arm = {
@@ -111,9 +113,13 @@ type select_arm = {
 }
 
 and select_arm_kind =
-  | SelectRecv of { select_bind : string; select_channel : expr }
+  | SelectRecv of {
+      select_bind : string;
+      select_elem_ty : Ast.type_expr;
+      select_channel : expr;
+    }
   | SelectAfter of expr
-  | SelectSealed of expr
+  | SelectSealed of { select_elem_ty : Ast.type_expr; select_channel : expr }
 
 type expr_desc =
   | EIdent of string
@@ -400,6 +406,11 @@ let rec validate_expr_tree expr =
           ~context:"with binding annotation" binding.with_type
       in
       let* () = validate_expr_tree binding.with_value in
+      let* () =
+        match binding.with_error_map with
+        | Some mapper -> validate_expr_tree mapper.with_error_value
+        | None -> Ok ()
+      in
       validate_expr_tree body
   | Ast.EConcurrentBind (_, ty_opt, value) ->
       let* () =
@@ -793,6 +804,15 @@ let expr_desc (expr : expr) =
       Ok (EQuestionBind (name, ty, value))
   | Ast.EWith (binding, body) ->
       let* with_value = typed_child binding.with_value in
+      let* with_error_map =
+        match binding.with_error_map with
+        | None -> Ok None
+        | Some mapper ->
+            let* with_error_value = typed_child mapper.with_error_value in
+            Ok
+              (Some
+                 { with_error_name = mapper.with_error_name; with_error_value })
+      in
       let* body = typed_child body in
       Ok
         (EWith
@@ -801,24 +821,46 @@ let expr_desc (expr : expr) =
                with_type = binding.with_type;
                with_value;
                with_kind = binding.with_kind;
+               with_error_map;
              },
              body ))
   | Ast.EDebugBlock exprs ->
       let* exprs = typed_children exprs in
       Ok (EDebugBlock exprs)
   | Ast.ESelect arms ->
+      let select_channel_elem_ty loc channel =
+        match semantic_type channel with
+        | Ast.TyNamed ("Channel", [ elem_ty ])
+        | Ast.TyNamed ("std/channel::Channel", [ elem_ty ])
+        | Ast.TyNamed ("std_channel__Channel", [ elem_ty ]) ->
+            Ok elem_ty
+        | _ ->
+            Error
+              (InvalidTypeInfo
+                 {
+                   loc;
+                   context = "select receive channel type";
+                   message = "select receive arm expected Channel[T]";
+                 })
+      in
       let convert_arm arm =
         let* select_arm_kind =
           match arm.Ast.select_arm_kind with
           | Ast.SelectRecv { select_bind; select_channel } ->
               let* select_channel = typed_child select_channel in
-              Ok (SelectRecv { select_bind; select_channel })
+              let* select_elem_ty =
+                select_channel_elem_ty arm.select_arm_loc select_channel
+              in
+              Ok (SelectRecv { select_bind; select_elem_ty; select_channel })
           | Ast.SelectAfter timeout ->
               let* timeout = typed_child timeout in
               Ok (SelectAfter timeout)
           | Ast.SelectSealed channel ->
               let* channel = typed_child channel in
-              Ok (SelectSealed channel)
+              let* select_elem_ty =
+                select_channel_elem_ty arm.select_arm_loc channel
+              in
+              Ok (SelectSealed { select_elem_ty; select_channel = channel })
         in
         let* select_arm_body = typed_child arm.select_arm_body in
         Ok

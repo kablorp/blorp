@@ -31,6 +31,11 @@
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
+#if defined(BLORP_TLS_BACKEND_PROFILE_OPENSSL)
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+#endif
 
 #if defined(__has_feature)
   #if __has_feature(address_sanitizer)
@@ -48,6 +53,13 @@
 #endif
 
 #define BLORP_TCP_MAX_READ_BYTES (64L * 1024L * 1024L)
+#define BLORP_TLS_SERVER_NAME_MAX_BYTES 253L
+#define BLORP_WEBSOCKET_CONTROL_MAX_PAYLOAD_BYTES 125L
+#define BLORP_WEBSOCKET_CLOSE_REASON_MAX_BYTES \
+    (BLORP_WEBSOCKET_CONTROL_MAX_PAYLOAD_BYTES - 2L)
+#define BLORP_WEBSOCKET_MAX_HANDSHAKE_BYTES (64L * 1024L)
+#define BLORP_WEBSOCKET_HANDSHAKE_READ_CHUNK_BYTES 4096L
+#define BLORP_WEBSOCKET_MAX_FRAME_BYTES BLORP_TCP_MAX_READ_BYTES
 #define BLORP_PROCESS_DEFAULT_TIMEOUT_MS (30L * 1000L)
 #define BLORP_PROCESS_KILL_GRACE_MS 100L
 #define BLORP_PROCESS_DEFAULT_MAX_OUTPUT_BYTES (16L * 1024L * 1024L)
@@ -398,6 +410,11 @@ typedef enum {
 } blorp_TcpState;
 
 typedef enum {
+    BLORP_UDP_STATE_OPEN = 1,
+    BLORP_UDP_STATE_CLOSED = 2
+} blorp_UdpState;
+
+typedef enum {
     BLORP_TCP_WRITE_IDLE = 0,
     BLORP_TCP_WRITE_ACTIVE = 1
 } blorp_TcpWriteState;
@@ -409,11 +426,11 @@ typedef enum {
 } blorp_TcpBeginWriteResult;
 
 typedef enum {
-    BLORP_TCP_INSTALL_WAITER_OK = 0,
-    BLORP_TCP_INSTALL_WAITER_INVALID = 1,
-    BLORP_TCP_INSTALL_WAITER_CLOSED = 2,
-    BLORP_TCP_INSTALL_WAITER_BUSY = 3
-} blorp_TcpInstallWaiterResult;
+    BLORP_IO_INSTALL_WAITER_OK = 0,
+    BLORP_IO_INSTALL_WAITER_INVALID = 1,
+    BLORP_IO_INSTALL_WAITER_CLOSED = 2,
+    BLORP_IO_INSTALL_WAITER_BUSY = 3
+} blorp_IoInstallWaiterResult;
 
 typedef enum {
     BLORP_IO_WAIT_NONE = 0,
@@ -432,6 +449,20 @@ typedef enum {
     BLORP_IO_WAKE_BUSY = 5
 } blorp_IoWakeReason;
 
+typedef enum {
+    BLORP_IO_WAIT_OWNER_NONE = 0,
+    BLORP_IO_WAIT_OWNER_TCP = 1,
+    BLORP_IO_WAIT_OWNER_UDP = 2
+} blorp_IoWaitOwnerKind;
+
+typedef struct {
+    blorp_IoWaitOwnerKind kind;
+    union {
+        struct blorp_TcpInner* tcp_inner;
+        struct blorp_UdpSocket* udp_socket;
+    } value;
+} blorp_IoWaitOwner;
+
 typedef struct blorp_IoWaiter {
     _Atomic long refcount;
     blorp_IoWaitKind kind;
@@ -443,8 +474,8 @@ typedef struct blorp_IoWaiter {
     bool cancelled;
     bool installed;
     bool deadline_queued;
-    struct blorp_TcpInner* owner;
-    struct blorp_TcpInner* deadline_owner;
+    blorp_IoWaitOwner installed_owner;
+    blorp_IoWaitOwner deadline_owner;
     struct blorp_IoWaiter* next;
 } blorp_IoWaiter;
 
@@ -462,7 +493,7 @@ typedef struct {
 
 typedef struct {
     blorp_IoWaiter* waiter;
-    struct blorp_TcpInner* owner;
+    blorp_IoWaitOwner owner;
 } blorp_IoDeadlineEntry;
 
 typedef struct blorp_TcpInner {
@@ -493,6 +524,107 @@ struct blorp_TcpStream {
 typedef struct blorp_TcpStream blorp_TcpStream;
 
 typedef enum {
+    BLORP_TLS_BACKEND_UNSUPPORTED = 0,
+    BLORP_TLS_BACKEND_OPENSSL = 1
+} blorp_TlsBackendKind;
+
+struct blorp_TlsBackendOps;
+
+typedef enum {
+    BLORP_TLS_SESSION_HANDSHAKING = 0,
+    BLORP_TLS_SESSION_OPEN = 1,
+    BLORP_TLS_SESSION_CLOSING = 2,
+    BLORP_TLS_SESSION_CLOSED = 3,
+    BLORP_TLS_SESSION_FAILED = 4
+} blorp_TlsSessionState;
+
+typedef enum {
+    BLORP_TLS_OPERATION_NONE = 0,
+    BLORP_TLS_OPERATION_IO = 1
+} blorp_TlsOperationState;
+
+struct blorp_TlsSession {
+    blorp_Object header;
+    blorp_TcpStream* stream;
+    const struct blorp_TlsBackendOps* backend;
+    blorp_TlsSessionState state;
+    blorp_TlsOperationState operation_state;
+    void* backend_state;
+};
+typedef struct blorp_TlsSession blorp_TlsSession;
+
+typedef enum {
+    BLORP_WEBSOCKET_BACKEND_UNSUPPORTED = 0,
+    BLORP_WEBSOCKET_BACKEND_RUNTIME = 1,
+    BLORP_WEBSOCKET_BACKEND_TEST = 2
+} blorp_WebSocketBackendKind;
+
+typedef enum {
+    BLORP_WEBSOCKET_TRANSPORT_TCP = 0,
+    BLORP_WEBSOCKET_TRANSPORT_TLS = 1
+} blorp_WebSocketTransportKind;
+
+struct blorp_WebSocketBackendOps;
+
+typedef enum {
+    BLORP_WEBSOCKET_SESSION_HANDSHAKING = 0,
+    BLORP_WEBSOCKET_SESSION_OPEN = 1,
+    BLORP_WEBSOCKET_SESSION_CLOSE_RECEIVED = 2,
+    BLORP_WEBSOCKET_SESSION_CLOSING = 3,
+    BLORP_WEBSOCKET_SESSION_CLOSED = 4,
+    BLORP_WEBSOCKET_SESSION_FAILED = 5
+} blorp_WebSocketSessionState;
+
+typedef enum {
+    BLORP_WEBSOCKET_OPERATION_NONE = 0,
+    BLORP_WEBSOCKET_OPERATION_ACTIVE = 1
+} blorp_WebSocketOperationState;
+
+typedef enum {
+    BLORP_WEBSOCKET_TRANSPORT_OWNER_NONE = 0,
+    BLORP_WEBSOCKET_TRANSPORT_OWNER_TCP_STREAM = 1,
+    BLORP_WEBSOCKET_TRANSPORT_OWNER_TLS_SESSION = 2
+} blorp_WebSocketTransportOwnerKind;
+
+typedef struct {
+    blorp_WebSocketTransportOwnerKind kind;
+    union {
+        blorp_TcpStream* tcp_stream;
+        blorp_TlsSession* tls_session;
+    } handle;
+} blorp_WebSocketTransportOwner;
+
+typedef struct {
+    struct blorp_Bytes* bytes;
+    long offset;
+} blorp_WebSocketReadBuffer;
+
+struct blorp_WebSocketSession {
+    blorp_Object header;
+    const struct blorp_WebSocketBackendOps* backend;
+    blorp_WebSocketSessionState state;
+    blorp_WebSocketOperationState read_operation_state;
+    blorp_WebSocketOperationState write_operation_state;
+    blorp_WebSocketTransportOwner transport_owner;
+    blorp_WebSocketReadBuffer read_buffer;
+    void* backend_state;
+};
+typedef struct blorp_WebSocketSession blorp_WebSocketSession;
+
+typedef struct blorp_UdpSocket blorp_UdpSocket;
+
+struct blorp_UdpSocket {
+    _Atomic long refcount;
+    int fd;
+    uint64_t generation;
+    blorp_UdpState state;
+    long default_timeout_ms;
+    pthread_mutex_t mutex;
+    blorp_IoWaiter* read_waiter;
+    blorp_IoWaiter* write_waiter;
+};
+
+typedef enum {
     BLORP_RESOURCE_SOURCE_TCP_CONNECTIONS = 1
 } blorp_ResourceSourceKind;
 
@@ -512,6 +644,7 @@ struct blorp_ResourceSource {
 typedef struct blorp_ResourceSource blorp_ResourceSource;
 
 static _Atomic uint64_t blorp_tcp_next_generation = 1;
+static _Atomic uint64_t blorp_udp_next_generation = 1;
 static void blorp_tcp_suppress_sigpipe(int fd);
 static int blorp_io_reactor_set_nonblocking(int fd);
 static int blorp_runtime_set_cloexec(int fd);
@@ -539,7 +672,7 @@ typedef struct blorp_IoRegistration {
     uint64_t generation;
     int interests;
     int ready_events;
-    blorp_TcpInner* inner;
+    blorp_IoWaitOwner owner;
     struct blorp_IoRegistration* next;
 } blorp_IoRegistration;
 
@@ -2304,17 +2437,69 @@ void blorp_set_type_tag(void* obj, const char* tag) {
 #define BLORP_TAG(ptr, tag) blorp_set_type_tag((void*)(ptr), (tag))
 
 static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters);
+static blorp_IoWaitOwner blorp_io_wait_owner_none(void);
+static blorp_IoWaitOwner blorp_io_wait_owner_tcp(blorp_TcpInner* inner);
+static blorp_IoWaitOwner blorp_io_wait_owner_udp(blorp_UdpSocket* socket);
+static bool blorp_io_wait_owner_is_some(blorp_IoWaitOwner owner);
+static bool blorp_io_wait_owner_same(
+    blorp_IoWaitOwner left,
+    blorp_IoWaitOwner right
+);
+static void blorp_io_wait_owner_retain(blorp_IoWaitOwner owner);
+static void blorp_io_wait_owner_release(blorp_IoWaitOwner owner);
+static bool blorp_io_wait_owner_is_open(
+    blorp_IoWaitOwner owner,
+    int fd,
+    uint64_t generation
+);
+static blorp_IoInstallWaiterResult blorp_io_wait_owner_install_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaiter* waiter
+);
+static int blorp_io_wait_owner_remove_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaiter* waiter
+);
+static int blorp_io_wait_owner_cancel_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaiter* waiter
+);
+static blorp_IoWaiterList blorp_io_wait_owner_extract_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaitKind kind,
+    uint64_t generation,
+    blorp_IoWakeReason reason
+);
+static blorp_IoWaiterList blorp_io_wait_owner_extract_ready(
+    blorp_IoWaitOwner owner,
+    int ready_events,
+    uint64_t generation
+);
+static void blorp_udp_socket_retain(blorp_UdpSocket* socket);
+static void blorp_udp_socket_release(blorp_UdpSocket* socket);
+static blorp_IoWaiterList blorp_udp_socket_extract_waiter(
+    blorp_UdpSocket* socket,
+    blorp_IoWaitKind kind,
+    uint64_t generation,
+    blorp_IoWakeReason reason
+);
 static void blorp_io_deadline_queue_insert(
     blorp_IoWaiter* waiter,
-    blorp_TcpInner* owner
+    blorp_IoWaitOwner owner
 );
 static void blorp_io_deadline_queue_remove(blorp_IoWaiter* waiter);
 static long blorp_io_deadline_queue_count(void);
 static uint64_t blorp_io_deadline_queue_drain(void);
 static void blorp_io_deadline_queue_clear(void);
-static int blorp_io_reactor_unregister_inner(int fd, uint64_t generation);
+static int blorp_io_reactor_unregister_fd_generation(int fd, uint64_t generation);
 static inline int __blorp_is_cancelled(void);
 static int __blorp_cancel_current_task_if_requested(void);
+static int blorp_io_reactor_register_owner(
+    blorp_IoWaitOwner owner,
+    int fd,
+    uint64_t generation,
+    int interests
+);
 static int blorp_io_reactor_wait_ready(
     int fd,
     uint64_t generation,
@@ -2352,13 +2537,40 @@ void __blorp_task_cleanup_pop_slot_slow(const void* slot);
 void blorp_task_cancel(void* t);
 void blorp_task_cancel_join_release(void* t);
 
-static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
-    blorp_TcpInner* inner,
+static blorp_IoWakeReason blorp_io_wait_owner_park_current_fiber(
+    blorp_IoWaitOwner owner,
     blorp_IoWaitKind kind,
     int fd,
     uint64_t generation,
     int interest,
     long timeout_ms
+);
+static int blorp_io_wait_owner_wait_for_reactor(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaitKind wait_kind,
+    int interest,
+    int fd,
+    uint64_t generation,
+    long timeout_ms,
+    blorp_IoWakeReason* reason_out
+);
+static int blorp_tcp_inner_wait_for_reactor(
+    blorp_TcpInner* inner,
+    blorp_IoWaitKind wait_kind,
+    int interest,
+    int fd,
+    uint64_t generation,
+    long timeout_ms,
+    blorp_IoWakeReason* reason_out
+);
+static int blorp_udp_socket_wait_for_reactor(
+    blorp_UdpSocket* socket,
+    blorp_IoWaitKind wait_kind,
+    int interest,
+    int fd,
+    uint64_t generation,
+    long timeout_ms,
+    blorp_IoWakeReason* reason_out
 );
 
 static void blorp_io_waiter_init(
@@ -2379,8 +2591,8 @@ static void blorp_io_waiter_init(
     waiter->cancelled = false;
     waiter->installed = false;
     waiter->deadline_queued = false;
-    waiter->owner = NULL;
-    waiter->deadline_owner = NULL;
+    waiter->installed_owner = blorp_io_wait_owner_none();
+    waiter->deadline_owner = blorp_io_wait_owner_none();
     waiter->next = NULL;
 }
 
@@ -2406,7 +2618,10 @@ static void blorp_io_waiter_release(blorp_IoWaiter* waiter) {
     long old_refcount =
         atomic_fetch_sub_explicit(&waiter->refcount, 1, memory_order_acq_rel);
     if (old_refcount > 1) return;
-    if (waiter->installed || waiter->deadline_queued || waiter->deadline_owner) {
+    if (waiter->installed ||
+        blorp_io_wait_owner_is_some(waiter->installed_owner) ||
+        waiter->deadline_queued ||
+        blorp_io_wait_owner_is_some(waiter->deadline_owner)) {
         fprintf(stderr, "blorp: IO waiter released while still owned (bug)\n");
         abort();
     }
@@ -2479,13 +2694,13 @@ static blorp_IoWaiter** blorp_tcp_inner_waiter_slot(
     }
 }
 
-static blorp_TcpInstallWaiterResult blorp_tcp_inner_install_waiter(
+static blorp_IoInstallWaiterResult blorp_tcp_inner_install_waiter(
     blorp_TcpInner* inner,
     blorp_IoWaiter* waiter
 ) {
     if (!inner || !waiter || waiter->installed ||
         waiter->wake_reason != BLORP_IO_WAKE_NONE) {
-        return BLORP_TCP_INSTALL_WAITER_INVALID;
+        return BLORP_IO_INSTALL_WAITER_INVALID;
     }
 
     pthread_mutex_lock(&inner->mutex);
@@ -2493,18 +2708,18 @@ static blorp_TcpInstallWaiterResult blorp_tcp_inner_install_waiter(
     if (!slot || inner->state != BLORP_TCP_STATE_OPEN || inner->fd < 0 ||
         waiter->generation != inner->generation) {
         pthread_mutex_unlock(&inner->mutex);
-        return BLORP_TCP_INSTALL_WAITER_CLOSED;
+        return BLORP_IO_INSTALL_WAITER_CLOSED;
     }
     if (*slot) {
         pthread_mutex_unlock(&inner->mutex);
-        return BLORP_TCP_INSTALL_WAITER_BUSY;
+        return BLORP_IO_INSTALL_WAITER_BUSY;
     }
     *slot = waiter;
     waiter->installed = true;
-    waiter->owner = inner;
+    waiter->installed_owner = blorp_io_wait_owner_tcp(inner);
     waiter->next = NULL;
     pthread_mutex_unlock(&inner->mutex);
-    return BLORP_TCP_INSTALL_WAITER_OK;
+    return BLORP_IO_INSTALL_WAITER_OK;
 }
 
 static int blorp_tcp_inner_remove_waiter(
@@ -2520,7 +2735,7 @@ static int blorp_tcp_inner_remove_waiter(
     }
     *slot = NULL;
     waiter->installed = false;
-    waiter->owner = NULL;
+    waiter->installed_owner = blorp_io_wait_owner_none();
     waiter->next = NULL;
     pthread_mutex_unlock(&inner->mutex);
     blorp_io_deadline_queue_remove(waiter);
@@ -2578,7 +2793,7 @@ static void blorp_tcp_inner_extract_waiter_slot_locked(
     blorp_IoWaiter* waiter = *slot;
     *slot = NULL;
     waiter->installed = false;
-    waiter->owner = NULL;
+    waiter->installed_owner = blorp_io_wait_owner_none();
     waiter->wake_reason = reason;
     if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
     blorp_io_deadline_queue_remove(waiter);
@@ -2674,6 +2889,198 @@ static void blorp_tcp_inner_release(blorp_TcpInner* inner) {
     free(inner);
 }
 
+static blorp_IoWaitOwner blorp_io_wait_owner_none(void) {
+    return (blorp_IoWaitOwner){
+        .kind = BLORP_IO_WAIT_OWNER_NONE,
+        .value = { .tcp_inner = NULL }
+    };
+}
+
+static blorp_IoWaitOwner blorp_io_wait_owner_tcp(blorp_TcpInner* inner) {
+    return (blorp_IoWaitOwner){
+        .kind = inner ? BLORP_IO_WAIT_OWNER_TCP : BLORP_IO_WAIT_OWNER_NONE,
+        .value = { .tcp_inner = inner }
+    };
+}
+
+static blorp_IoWaitOwner blorp_io_wait_owner_udp(blorp_UdpSocket* socket) {
+    blorp_IoWaitOwner owner = blorp_io_wait_owner_none();
+    if (socket) {
+        owner.kind = BLORP_IO_WAIT_OWNER_UDP;
+        owner.value.udp_socket = socket;
+    }
+    return owner;
+}
+
+static bool blorp_io_wait_owner_is_some(blorp_IoWaitOwner owner) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return false;
+        case BLORP_IO_WAIT_OWNER_TCP:
+            return owner.value.tcp_inner != NULL;
+        case BLORP_IO_WAIT_OWNER_UDP:
+            return owner.value.udp_socket != NULL;
+        default:
+            return true;
+    }
+}
+
+static bool blorp_io_wait_owner_same(
+    blorp_IoWaitOwner left,
+    blorp_IoWaitOwner right
+) {
+    if (left.kind != right.kind) return false;
+    switch (left.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return true;
+        case BLORP_IO_WAIT_OWNER_TCP:
+            return left.value.tcp_inner == right.value.tcp_inner;
+        case BLORP_IO_WAIT_OWNER_UDP:
+            return left.value.udp_socket == right.value.udp_socket;
+        default:
+            return false;
+    }
+}
+
+static void blorp_io_wait_owner_retain(blorp_IoWaitOwner owner) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return;
+        case BLORP_IO_WAIT_OWNER_TCP:
+            blorp_tcp_inner_retain(owner.value.tcp_inner);
+            return;
+        case BLORP_IO_WAIT_OWNER_UDP:
+            blorp_udp_socket_retain(owner.value.udp_socket);
+            return;
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
+static void blorp_io_wait_owner_release(blorp_IoWaitOwner owner) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return;
+        case BLORP_IO_WAIT_OWNER_TCP:
+            blorp_tcp_inner_release(owner.value.tcp_inner);
+            return;
+        case BLORP_IO_WAIT_OWNER_UDP:
+            blorp_udp_socket_release(owner.value.udp_socket);
+            return;
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
+static bool blorp_io_wait_owner_is_open(
+    blorp_IoWaitOwner owner,
+    int fd,
+    uint64_t generation
+) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return false;
+        case BLORP_IO_WAIT_OWNER_TCP: {
+            blorp_TcpInner* inner = owner.value.tcp_inner;
+            if (!inner) return false;
+            pthread_mutex_lock(&inner->mutex);
+            bool open = inner->state == BLORP_TCP_STATE_OPEN && inner->fd == fd &&
+                inner->generation == generation;
+            pthread_mutex_unlock(&inner->mutex);
+            return open;
+        }
+        case BLORP_IO_WAIT_OWNER_UDP: {
+            blorp_UdpSocket* socket = owner.value.udp_socket;
+            if (!socket) return false;
+            pthread_mutex_lock(&socket->mutex);
+            bool open = socket->state == BLORP_UDP_STATE_OPEN && socket->fd == fd &&
+                socket->generation == generation;
+            pthread_mutex_unlock(&socket->mutex);
+            return open;
+        }
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
+static blorp_IoWaiterList blorp_io_wait_owner_extract_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaitKind kind,
+    uint64_t generation,
+    blorp_IoWakeReason reason
+) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return blorp_io_waiter_list_empty();
+        case BLORP_IO_WAIT_OWNER_TCP:
+            return blorp_tcp_inner_extract_waiter(
+                owner.value.tcp_inner, kind, generation, reason);
+        case BLORP_IO_WAIT_OWNER_UDP:
+            return blorp_udp_socket_extract_waiter(
+                owner.value.udp_socket, kind, generation, reason);
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
+static blorp_IoWaiterList blorp_io_wait_owner_extract_ready(
+    blorp_IoWaitOwner owner,
+    int ready_events,
+    uint64_t generation
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (ready_events == 0) return waiters;
+
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return waiters;
+        case BLORP_IO_WAIT_OWNER_TCP: {
+            blorp_TcpInner* inner = owner.value.tcp_inner;
+            if (!inner) return waiters;
+            if (ready_events & BLORP_IO_INTEREST_READ) {
+                blorp_IoWaiterList read_waiters =
+                    inner->kind == BLORP_TCP_HANDLE_LISTENER
+                        ? blorp_tcp_inner_extract_waiter(
+                              inner, BLORP_IO_WAIT_ACCEPT, generation,
+                              BLORP_IO_WAKE_READY)
+                        : blorp_tcp_inner_extract_waiter(
+                              inner, BLORP_IO_WAIT_READ, generation,
+                              BLORP_IO_WAKE_READY);
+                blorp_io_waiter_list_append(&waiters, &read_waiters);
+            }
+            if (ready_events & BLORP_IO_INTEREST_WRITE) {
+                blorp_IoWaiterList connect_waiters =
+                    blorp_tcp_inner_extract_waiter(
+                        inner, BLORP_IO_WAIT_CONNECT, generation,
+                        BLORP_IO_WAKE_READY);
+                blorp_IoWaiterList write_waiters =
+                    blorp_tcp_inner_extract_waiter(
+                        inner, BLORP_IO_WAIT_WRITE, generation,
+                        BLORP_IO_WAKE_READY);
+                blorp_io_waiter_list_append(&waiters, &connect_waiters);
+                blorp_io_waiter_list_append(&waiters, &write_waiters);
+            }
+            return waiters;
+        }
+        case BLORP_IO_WAIT_OWNER_UDP:
+            if (ready_events & BLORP_IO_INTEREST_READ) {
+                blorp_IoWaiterList read_waiters =
+                    blorp_udp_socket_extract_waiter(
+                        owner.value.udp_socket, BLORP_IO_WAIT_READ, generation,
+                        BLORP_IO_WAKE_READY);
+                blorp_io_waiter_list_append(&waiters, &read_waiters);
+            }
+            return waiters;
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
 static void blorp_tcp_inner_cleanup_release(void* value) {
     blorp_tcp_inner_release((blorp_TcpInner*)value);
 }
@@ -2759,7 +3166,8 @@ static void blorp_tcp_inner_close(blorp_TcpInner* inner) {
         blorp_tcp_inner_close_and_extract_waiters(
             inner, BLORP_IO_WAKE_CLOSED, &closed_fd, &closed_generation);
     if (closed_fd >= 0 && blorp_io_reactor_is_started()) {
-        (void)blorp_io_reactor_unregister_inner(closed_fd, closed_generation);
+        (void)blorp_io_reactor_unregister_fd_generation(
+            closed_fd, closed_generation);
     }
     blorp_io_waiter_wake_all(&waiters);
 }
@@ -3048,30 +3456,11 @@ static void blorp_io_reactor_mark_ready(
             // subscription. Suppress repeated level-triggered notifications
             // until the operation retries and explicitly re-registers.
             reg->interests &= ~current_ready;
-            if (reg->inner) {
-                if (current_ready & BLORP_IO_INTEREST_READ) {
-                    blorp_IoWaiterList read_waiters =
-                        reg->inner->kind == BLORP_TCP_HANDLE_LISTENER
-                            ? blorp_tcp_inner_extract_waiter(
-                                  reg->inner, BLORP_IO_WAIT_ACCEPT,
-                                  generation, BLORP_IO_WAKE_READY)
-                            : blorp_tcp_inner_extract_waiter(
-                                  reg->inner, BLORP_IO_WAIT_READ,
-                                  generation, BLORP_IO_WAKE_READY);
-                    blorp_io_waiter_list_append(&waiters, &read_waiters);
-                }
-                if (current_ready & BLORP_IO_INTEREST_WRITE) {
-                    blorp_IoWaiterList connect_waiters =
-                        blorp_tcp_inner_extract_waiter(
-                            reg->inner, BLORP_IO_WAIT_CONNECT,
-                            generation, BLORP_IO_WAKE_READY);
-                    blorp_IoWaiterList write_waiters =
-                        blorp_tcp_inner_extract_waiter(
-                            reg->inner, BLORP_IO_WAIT_WRITE,
-                            generation, BLORP_IO_WAKE_READY);
-                    blorp_io_waiter_list_append(&waiters, &connect_waiters);
-                    blorp_io_waiter_list_append(&waiters, &write_waiters);
-                }
+            if (blorp_io_wait_owner_is_some(reg->owner)) {
+                blorp_IoWaiterList ready_waiters =
+                    blorp_io_wait_owner_extract_ready(
+                        reg->owner, current_ready, generation);
+                blorp_io_waiter_list_append(&waiters, &ready_waiters);
             }
             pthread_cond_broadcast(&__blorp_io_reactor.ready_cond);
         }
@@ -3154,7 +3543,7 @@ void blorp_io_reactor_shutdown(void) {
     __blorp_io_reactor.registrations = NULL;
     while (reg) {
         blorp_IoRegistration* next = reg->next;
-        if (reg->inner) blorp_tcp_inner_release(reg->inner);
+        blorp_io_wait_owner_release(reg->owner);
         free(reg);
         reg = next;
     }
@@ -3218,29 +3607,31 @@ int blorp_io_reactor_start(void) {
     return __blorp_io_reactor_init_error == 0 ? 0 : -1;
 }
 
-static int blorp_io_reactor_register_inner(
-    blorp_TcpInner* inner,
+static int blorp_io_reactor_register_owner(
+    blorp_IoWaitOwner owner,
     int fd,
     uint64_t generation,
     int interests
 ) {
-    if (!inner || fd < 0 || interests == 0) return -1;
+    if (!blorp_io_wait_owner_is_some(owner) || fd < 0 || interests == 0) {
+        return -1;
+    }
     if (blorp_io_reactor_start() != 0) return -1;
 
     pthread_mutex_lock(&__blorp_io_reactor.mutex);
-    pthread_mutex_lock(&inner->mutex);
-    if (inner->state != BLORP_TCP_STATE_OPEN || inner->fd != fd ||
-        inner->generation != generation) {
-        pthread_mutex_unlock(&inner->mutex);
+    if (!blorp_io_wait_owner_is_open(owner, fd, generation)) {
         pthread_mutex_unlock(&__blorp_io_reactor.mutex);
         return -1;
     }
     blorp_IoRegistration* existing =
         blorp_io_reactor_find_locked(fd, generation);
     if (existing) {
+        if (!blorp_io_wait_owner_same(existing->owner, owner)) {
+            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+            return -1;
+        }
         existing->interests |= interests;
         existing->ready_events &= existing->interests;
-        pthread_mutex_unlock(&inner->mutex);
         pthread_mutex_unlock(&__blorp_io_reactor.mutex);
         blorp_io_reactor_wake_control();
         return 0;
@@ -3252,11 +3643,10 @@ static int blorp_io_reactor_register_inner(
     reg->generation = generation;
     reg->interests = interests;
     reg->ready_events = 0;
-    reg->inner = inner;
-    blorp_tcp_inner_retain(inner);
+    reg->owner = owner;
+    blorp_io_wait_owner_retain(reg->owner);
     reg->next = __blorp_io_reactor.registrations;
     __blorp_io_reactor.registrations = reg;
-    pthread_mutex_unlock(&inner->mutex);
     pthread_mutex_unlock(&__blorp_io_reactor.mutex);
     blorp_io_reactor_wake_control();
     return 0;
@@ -3273,6 +3663,10 @@ static int blorp_io_reactor_register_fd_for_smoke(
     blorp_IoRegistration* existing =
         blorp_io_reactor_find_locked(fd, generation);
     if (existing) {
+        if (blorp_io_wait_owner_is_some(existing->owner)) {
+            pthread_mutex_unlock(&__blorp_io_reactor.mutex);
+            return -1;
+        }
         existing->interests |= interests;
         existing->ready_events &= existing->interests;
         pthread_mutex_unlock(&__blorp_io_reactor.mutex);
@@ -3285,7 +3679,7 @@ static int blorp_io_reactor_register_fd_for_smoke(
     reg->generation = generation;
     reg->interests = interests;
     reg->ready_events = 0;
-    reg->inner = NULL;
+    reg->owner = blorp_io_wait_owner_none();
     reg->next = __blorp_io_reactor.registrations;
     __blorp_io_reactor.registrations = reg;
     pthread_mutex_unlock(&__blorp_io_reactor.mutex);
@@ -3314,7 +3708,7 @@ static int blorp_io_reactor_update_interest(
     return 0;
 }
 
-static int blorp_io_reactor_unregister_inner(int fd, uint64_t generation) {
+static int blorp_io_reactor_unregister_fd_generation(int fd, uint64_t generation) {
     if (fd < 0) return -1;
     if (blorp_io_reactor_start() != 0) return -1;
     pthread_mutex_lock(&__blorp_io_reactor.mutex);
@@ -3323,7 +3717,7 @@ static int blorp_io_reactor_unregister_inner(int fd, uint64_t generation) {
         blorp_IoRegistration* reg = *link;
         if (reg->fd == fd && reg->generation == generation) {
             *link = reg->next;
-            if (reg->inner) blorp_tcp_inner_release(reg->inner);
+            blorp_io_wait_owner_release(reg->owner);
             free(reg);
             pthread_mutex_unlock(&__blorp_io_reactor.mutex);
             blorp_io_reactor_wake_control();
@@ -3352,7 +3746,7 @@ static int blorp_io_reactor_release_interest(
             bool remove = reg->interests == 0;
             if (remove) {
                 *link = reg->next;
-                if (reg->inner) blorp_tcp_inner_release(reg->inner);
+                blorp_io_wait_owner_release(reg->owner);
                 free(reg);
             }
             pthread_mutex_unlock(&__blorp_io_reactor.mutex);
@@ -3407,8 +3801,36 @@ static void blorp_tcp_provisional_stream_cleanup_release(void* value) {
     blorp_release((void*)cleanup->stream);
 }
 
-static int blorp_tcp_inner_wait_for_reactor(
-    blorp_TcpInner* inner,
+static void blorp_io_wait_owner_cleanup_release(void* value) {
+    blorp_IoWaitOwner* owner = (blorp_IoWaitOwner*)value;
+    if (!owner || !blorp_io_wait_owner_is_some(*owner)) return;
+    blorp_io_wait_owner_release(*owner);
+    *owner = blorp_io_wait_owner_none();
+}
+
+static void blorp_io_wait_owner_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_IoWaitOwner* owner
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)owner;
+#else
+    __blorp_task_cleanup_push_slow(
+        frame, owner, owner, blorp_io_wait_owner_cleanup_release);
+#endif
+}
+
+static void blorp_io_wait_owner_cleanup_pop(blorp_IoWaitOwner* owner) {
+#if defined(__clang_analyzer__)
+    (void)owner;
+#else
+    __blorp_task_cleanup_pop_slot_slow(owner);
+#endif
+}
+
+static int blorp_io_wait_owner_wait_for_reactor(
+    blorp_IoWaitOwner owner,
     blorp_IoWaitKind wait_kind,
     int interest,
     int fd,
@@ -3418,10 +3840,16 @@ static int blorp_tcp_inner_wait_for_reactor(
 ) {
     if (!reason_out) return -1;
     *reason_out = BLORP_IO_WAKE_NONE;
-    if (!inner) return -1;
-    blorp_tcp_inner_retain(inner);
-    if (blorp_io_reactor_register_inner(inner, fd, generation, interest) != 0) {
-        blorp_tcp_inner_release(inner);
+    if (!blorp_io_wait_owner_is_some(owner)) return -1;
+
+    blorp_IoWaitOwner retained_owner = owner;
+    blorp_io_wait_owner_retain(retained_owner);
+    blorp_CancelCleanupFrame owner_cleanup;
+    blorp_io_wait_owner_cleanup_push(&owner_cleanup, &retained_owner);
+    if (blorp_io_reactor_register_owner(retained_owner, fd, generation, interest) !=
+        0) {
+        blorp_io_wait_owner_cleanup_pop(&retained_owner);
+        blorp_io_wait_owner_release(retained_owner);
         return -1;
     }
 
@@ -3439,8 +3867,8 @@ static int blorp_tcp_inner_wait_for_reactor(
         blorp_io_registration_cleanup_unregister);
 
     blorp_IoWakeReason reason =
-        blorp_tcp_inner_park_current_fiber(
-            inner, wait_kind, fd, generation, interest, timeout_ms);
+        blorp_io_wait_owner_park_current_fiber(
+            retained_owner, wait_kind, fd, generation, interest, timeout_ms);
     if (reason == BLORP_IO_WAKE_NONE) {
         int ready =
             blorp_io_reactor_wait_ready(fd, generation, interest, timeout_ms);
@@ -3459,8 +3887,28 @@ static int blorp_tcp_inner_wait_for_reactor(
     }
     __blorp_task_cleanup_pop_slot_slow(&registration_cleanup);
     *reason_out = reason;
-    blorp_tcp_inner_release(inner);
+    blorp_io_wait_owner_cleanup_pop(&retained_owner);
+    blorp_io_wait_owner_release(retained_owner);
     return 0;
+}
+
+static int blorp_tcp_inner_wait_for_reactor(
+    blorp_TcpInner* inner,
+    blorp_IoWaitKind wait_kind,
+    int interest,
+    int fd,
+    uint64_t generation,
+    long timeout_ms,
+    blorp_IoWakeReason* reason_out
+) {
+    return blorp_io_wait_owner_wait_for_reactor(
+        blorp_io_wait_owner_tcp(inner),
+        wait_kind,
+        interest,
+        fd,
+        generation,
+        timeout_ms,
+        reason_out);
 }
 
 static void blorp_io_reactor_deadline_from_now(
@@ -3562,7 +4010,7 @@ int blorp_io_reactor_smoke_test(void) {
 
 cleanup_registered:
     blorp_io_reactor_update_interest(fds[0], generation, 0);
-    blorp_io_reactor_unregister_inner(fds[0], generation);
+    blorp_io_reactor_unregister_fd_generation(fds[0], generation);
 cleanup:
     close(fds[0]);
     close(fds[1]);
@@ -7401,35 +7849,62 @@ typedef struct {
 } blorp_FileBytesResult;
 
 typedef struct {
-    void* value;
-    blorp_FileErrorKind error_kind;
-    blorp_String* detail;
-} blorp_FileValueResult;
-
-typedef struct {
-    long found;
-    void* value;
-    blorp_FileErrorKind error_kind;
-    blorp_String* detail;
-} blorp_FileFindResult;
-
-typedef struct {
     long value;
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
 } blorp_FileIntResult;
 
+typedef enum {
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_NONE = 0,
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE = 1,
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_UDP = 2,
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TCP = 3,
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TLS = 4
+} blorp_FallibleStreamErrorDomain;
+
 typedef struct {
-    long value;
-    blorp_FileErrorKind error_kind;
+    blorp_FallibleStreamErrorDomain domain;
+    long kind;
     blorp_String* detail;
-} blorp_FileBoolResult;
+} blorp_FallibleStreamError;
+
+typedef enum {
+    BLORP_DNS_ERROR_NONE = 0,
+    BLORP_DNS_ERROR_INVALID_HOST = 1,
+    BLORP_DNS_ERROR_LOOKUP_FAILED = 2
+} blorp_DnsErrorKind;
 
 typedef struct {
     blorp_List* value;
-    blorp_FileErrorKind error_kind;
+    blorp_DnsErrorKind error_kind;
     blorp_String* detail;
-} blorp_FileListResult;
+} blorp_DnsAddressesResult;
+
+typedef struct {
+    blorp_List* value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamListResult;
+
+typedef struct {
+    void* value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamValueResult;
+
+typedef struct {
+    long found;
+    void* value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamFindResult;
+
+typedef struct {
+    long value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamIntResult;
+
+typedef struct {
+    long value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamBoolResult;
 
 typedef struct {
     blorp_FileErrorKind error_kind;
@@ -7477,6 +7952,124 @@ typedef struct {
     blorp_TcpErrorKind error_kind;
     blorp_String* detail;
 } blorp_TcpVoidResult;
+
+typedef enum {
+    BLORP_TLS_ERROR_NONE = 0,
+    BLORP_TLS_ERROR_INVALID_INPUT = 1,
+    BLORP_TLS_ERROR_HANDSHAKE_FAILED = 2,
+    BLORP_TLS_ERROR_TRANSPORT = 3,
+    BLORP_TLS_ERROR_CERTIFICATE = 4,
+    BLORP_TLS_ERROR_PROTOCOL = 5,
+    BLORP_TLS_ERROR_TIMED_OUT = 6,
+    BLORP_TLS_ERROR_CLOSED = 7,
+    BLORP_TLS_ERROR_BUSY = 8,
+    BLORP_TLS_ERROR_UNSUPPORTED = 9,
+    BLORP_TLS_ERROR_OTHER = 10
+} blorp_TlsErrorKind;
+
+typedef struct {
+    blorp_TlsSession* handle;
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsSessionResult;
+
+typedef struct {
+    blorp_Bytes* value;
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsBytesResult;
+
+typedef struct {
+    long value;
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsIntResult;
+
+typedef struct {
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsVoidResult;
+
+typedef enum {
+    BLORP_WEBSOCKET_ERROR_NONE = 0,
+    BLORP_WEBSOCKET_ERROR_INVALID_URL = 1,
+    BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED = 2,
+    BLORP_WEBSOCKET_ERROR_TRANSPORT = 3,
+    BLORP_WEBSOCKET_ERROR_TLS = 4,
+    BLORP_WEBSOCKET_ERROR_PROTOCOL = 5,
+    BLORP_WEBSOCKET_ERROR_TIMED_OUT = 6,
+    BLORP_WEBSOCKET_ERROR_CLOSED = 7,
+    BLORP_WEBSOCKET_ERROR_BUSY = 8,
+    BLORP_WEBSOCKET_ERROR_UNSUPPORTED = 9,
+    BLORP_WEBSOCKET_ERROR_OTHER = 10
+} blorp_WebSocketErrorKind;
+
+typedef struct {
+    blorp_WebSocketSession* handle;
+    blorp_WebSocketErrorKind error_kind;
+    blorp_String* detail;
+} blorp_WebSocketSessionResult;
+
+typedef struct {
+    blorp_WebSocketErrorKind error_kind;
+    blorp_String* detail;
+} blorp_WebSocketVoidResult;
+
+typedef enum {
+    BLORP_WEBSOCKET_MESSAGE_NONE = 0,
+    BLORP_WEBSOCKET_MESSAGE_TEXT = 1,
+    BLORP_WEBSOCKET_MESSAGE_BINARY = 2,
+    BLORP_WEBSOCKET_MESSAGE_CLOSE = 3,
+    BLORP_WEBSOCKET_MESSAGE_PING = 4,
+    BLORP_WEBSOCKET_MESSAGE_PONG = 5
+} blorp_WebSocketMessageKind;
+
+typedef struct {
+    blorp_WebSocketMessageKind message_kind;
+    blorp_String* text;
+    blorp_Bytes* bytes;
+    long code;
+    blorp_String* reason;
+    blorp_WebSocketErrorKind error_kind;
+    blorp_String* detail;
+} blorp_WebSocketMessageResult;
+
+typedef enum {
+    BLORP_UDP_ERROR_NONE = 0,
+    BLORP_UDP_ERROR_INVALID_INPUT = 1,
+    BLORP_UDP_ERROR_TIMED_OUT = 2,
+    BLORP_UDP_ERROR_CLOSED = 3,
+    BLORP_UDP_ERROR_BUSY = 4,
+    BLORP_UDP_ERROR_DNS = 5,
+    BLORP_UDP_ERROR_INTERRUPTED = 6,
+    BLORP_UDP_ERROR_UNSUPPORTED = 7,
+    BLORP_UDP_ERROR_OTHER = 8
+} blorp_UdpErrorKind;
+
+typedef struct {
+    blorp_UdpSocket* handle;
+    blorp_UdpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_UdpSocketResult;
+
+typedef struct {
+    long value;
+    blorp_UdpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_UdpIntResult;
+
+typedef struct {
+    blorp_Bytes* data;
+    blorp_String* host;
+    long port;
+    blorp_UdpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_UdpDatagramResult;
+
+typedef struct {
+    blorp_UdpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_UdpVoidResult;
 
 // ============================================================================
 // ConcurrencyError type — used by concurrent: blocks
@@ -11328,6 +11921,126 @@ blorp_String* blorp_base64_decode(const blorp_String* s) {
 }
 
 // ============================================================================
+// DNS Networking
+// ============================================================================
+
+static blorp_DnsAddressesResult blorp_dns_error(
+    blorp_DnsErrorKind kind,
+    const char* message) {
+    return (blorp_DnsAddressesResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_create(message),
+    };
+}
+
+static blorp_DnsAddressesResult blorp_dns_error_from_buf(
+    blorp_DnsErrorKind kind,
+    const char* message,
+    size_t len) {
+    return (blorp_DnsAddressesResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_from_buf(message, len),
+    };
+}
+
+static blorp_DnsAddressesResult blorp_dns_addresses_ok(blorp_List* addresses) {
+    return (blorp_DnsAddressesResult){
+        .value = addresses,
+        .error_kind = BLORP_DNS_ERROR_NONE,
+        .detail = NULL,
+    };
+}
+
+static const char* blorp_dns_validate_hostname(blorp_String* hostname) {
+    if (!hostname) return "invalid host: missing hostname";
+    if (hostname->len <= 0) return "invalid host: hostname must not be empty";
+    if (hostname->capacity < 0 || hostname->len > hostname->capacity) {
+        return "invalid host: malformed string";
+    }
+    if (hostname->len > 253) return "invalid host: hostname is too long";
+    for (long i = 0; i < hostname->len; i++) {
+        unsigned char c = (unsigned char)hostname->data[i];
+        if (c == '\0') return "invalid host: hostname must not contain NUL";
+        if (c <= ' ' || c == 127) {
+            return "invalid host: hostname contains invalid character";
+        }
+    }
+    return NULL;
+}
+
+blorp_DnsAddressesResult blorp_dns_resolve_raw(blorp_String* hostname) {
+    const char* invalid = blorp_dns_validate_hostname(hostname);
+    if (invalid) return blorp_dns_error(BLORP_DNS_ERROR_INVALID_HOST, invalid);
+
+    char host_buf[254];
+    memcpy(host_buf, hostname->data, (size_t)hostname->len);
+    host_buf[hostname->len] = '\0';
+
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo* res = NULL;
+    int rc = getaddrinfo(host_buf, NULL, &hints, &res);
+    if (rc != 0) {
+        char err_buf[256];
+        int written = snprintf(
+            err_buf,
+            sizeof(err_buf),
+            "dns resolve: %s",
+            gai_strerror(rc));
+        size_t len = written < 0 ? 0 : (size_t)written;
+        if (len >= sizeof(err_buf)) len = sizeof(err_buf) - 1;
+        return blorp_dns_error_from_buf(
+            BLORP_DNS_ERROR_LOOKUP_FAILED,
+            err_buf,
+            len);
+    }
+
+    blorp_List* addresses = blorp_list_new(4);
+    blorp_list_init_elem_release(addresses, blorp_elem_release_fn);
+
+    for (struct addrinfo* p = res; p != NULL; p = p->ai_next) {
+        char ip_buf[INET6_ADDRSTRLEN];
+        const char* ip = NULL;
+        if (p->ai_family == AF_INET) {
+            ip = inet_ntop(
+                AF_INET,
+                &((struct sockaddr_in*)p->ai_addr)->sin_addr,
+                ip_buf,
+                sizeof(ip_buf));
+        } else if (p->ai_family == AF_INET6) {
+            ip = inet_ntop(
+                AF_INET6,
+                &((struct sockaddr_in6*)p->ai_addr)->sin6_addr,
+                ip_buf,
+                sizeof(ip_buf));
+        }
+        if (!ip) continue;
+
+        size_t ip_len = strlen(ip);
+        bool duplicate = false;
+        for (long i = 0; i < addresses->len; i++) {
+            blorp_String* existing = (blorp_String*)addresses->data[i];
+            if (existing && existing->len == (long)ip_len &&
+                memcmp(existing->data, ip, ip_len) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            blorp_String* address = blorp_string_from_buf(ip, ip_len);
+            addresses = blorp_list_append_owned(addresses, address);
+        }
+    }
+
+    freeaddrinfo(res);
+    return blorp_dns_addresses_ok(addresses);
+}
+
+// ============================================================================
 // TCP Networking
 // ============================================================================
 
@@ -12085,6 +12798,23 @@ static bool blorp_tcp_host_value_is_valid(const blorp_String* host) {
            host->len <= host->capacity && host->len < 256;
 }
 
+static bool blorp_tcp_host_string_is_numeric(
+    const blorp_String* host,
+    int family
+) {
+    if (!blorp_tcp_host_value_is_valid(host) || host->len <= 0) return false;
+    if (blorp_string_contains_nul(host)) return false;
+    char host_buf[256];
+    memcpy(host_buf, host->data, (size_t)host->len);
+    host_buf[host->len] = '\0';
+    return blorp_tcp_host_is_numeric(host_buf, family);
+}
+
+static bool blorp_tcp_listener_host_avoids_dns(const blorp_String* host) {
+    return blorp_tcp_host_value_is_valid(host) &&
+           (host->len == 0 || blorp_tcp_host_string_is_numeric(host, AF_INET));
+}
+
 static blorp_String* blorp_tcp_steal_boxed_result_payload(blorp_Result* result) {
     if (!result) return blorp_string_literal("tcp: missing runtime result");
     void* payload = NULL;
@@ -12096,6 +12826,42 @@ static blorp_String* blorp_tcp_steal_boxed_result_payload(blorp_Result* result) 
     result->release_mask = 0;
     blorp_release(result);
     return (blorp_String*)payload;
+}
+
+static bool blorp_tcp_detail_contains(
+    const blorp_String* detail,
+    const char* needle
+) {
+    if (!detail || !needle) return false;
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) return true;
+    if (detail->len < 0 || (size_t)detail->len < needle_len) return false;
+    size_t haystack_len = (size_t)detail->len;
+    for (size_t i = 0; i + needle_len <= haystack_len; i++) {
+        if (memcmp(detail->data + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+static blorp_TcpErrorKind blorp_tcp_classify_detail(
+    const blorp_String* detail
+) {
+    if (blorp_tcp_detail_contains(detail, "timed out")) {
+        return BLORP_TCP_ERROR_TIMED_OUT;
+    }
+    if (blorp_tcp_detail_contains(detail, "already in progress")) {
+        return BLORP_TCP_ERROR_BUSY;
+    }
+    if (blorp_tcp_detail_contains(detail, "closed")) {
+        return BLORP_TCP_ERROR_CLOSED;
+    }
+    if (blorp_tcp_detail_contains(detail, "cancelled")) {
+        return BLORP_TCP_ERROR_INTERRUPTED;
+    }
+    if (blorp_tcp_detail_contains(detail, "getaddrinfo")) {
+        return BLORP_TCP_ERROR_DNS;
+    }
+    return BLORP_TCP_ERROR_OTHER;
 }
 
 static blorp_TcpListenerResult blorp_tcp_listener_result_error(
@@ -12172,7 +12938,7 @@ static blorp_TcpListenerResult blorp_tcp_listener_result_from_boxed(
     blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
     return (blorp_TcpListenerResult){
         .handle = NULL,
-        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .error_kind = blorp_tcp_classify_detail(detail),
         .detail = detail
     };
 }
@@ -12197,7 +12963,7 @@ static blorp_TcpStreamResult blorp_tcp_stream_result_from_boxed(
     blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
     return (blorp_TcpStreamResult){
         .handle = NULL,
-        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .error_kind = blorp_tcp_classify_detail(detail),
         .detail = detail
     };
 }
@@ -12222,7 +12988,7 @@ static blorp_TcpBytesResult blorp_tcp_bytes_result_from_boxed(
     blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
     return (blorp_TcpBytesResult){
         .value = NULL,
-        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .error_kind = blorp_tcp_classify_detail(detail),
         .detail = detail
     };
 }
@@ -12245,7 +13011,7 @@ static blorp_TcpIntResult blorp_tcp_int_result_from_boxed(blorp_Result* result) 
     blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
     return (blorp_TcpIntResult){
         .value = 0,
-        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .error_kind = blorp_tcp_classify_detail(detail),
         .detail = detail
     };
 }
@@ -12267,7 +13033,7 @@ static blorp_TcpVoidResult blorp_tcp_void_result_from_boxed(
     }
     blorp_String* detail = blorp_tcp_steal_boxed_result_payload(result);
     return (blorp_TcpVoidResult){
-        .error_kind = BLORP_TCP_ERROR_OTHER,
+        .error_kind = blorp_tcp_classify_detail(detail),
         .detail = detail
     };
 }
@@ -12281,6 +13047,35 @@ blorp_TcpListenerResult blorp_tcp_listen_raw(
         return blorp_tcp_listener_result_error(
             BLORP_TCP_ERROR_INVALID_INPUT,
             "host must be shorter than 256 bytes");
+    }
+    if (port < 0 || port > 65535) {
+        return blorp_tcp_listener_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "port must be between 0 and 65535");
+    }
+    if (backlog < 0 || backlog > INT_MAX) {
+        return blorp_tcp_listener_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "backlog must be between 0 and 2147483647");
+    }
+    return blorp_tcp_listener_result_from_boxed(
+        blorp_tcp_listen(host, port, backlog));
+}
+
+blorp_TcpListenerResult blorp_tcp_listen_numeric_raw(
+    blorp_String* host,
+    long port,
+    long backlog
+) {
+    if (!blorp_tcp_host_value_is_valid(host)) {
+        return blorp_tcp_listener_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "host must be shorter than 256 bytes");
+    }
+    if (!blorp_tcp_listener_host_avoids_dns(host)) {
+        return blorp_tcp_listener_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "host must be a numeric IPv4 address or empty bind-any host");
     }
     if (port < 0 || port > 65535) {
         return blorp_tcp_listener_result_error(
@@ -12327,20 +13122,42 @@ blorp_ResourceSource* blorp_tcp_connections_continue_on_error_raw(
         listener, BLORP_RESOURCE_SOURCE_CONTINUE_ON_ERROR);
 }
 
+static bool blorp_resource_source_should_continue(
+    const blorp_ResourceSource* source,
+    blorp_TcpErrorKind error_kind
+) {
+    if (!source ||
+        source->error_policy != BLORP_RESOURCE_SOURCE_CONTINUE_ON_ERROR) {
+        return false;
+    }
+    switch (source->kind) {
+        case BLORP_RESOURCE_SOURCE_TCP_CONNECTIONS:
+            return error_kind == BLORP_TCP_ERROR_TIMED_OUT;
+        default:
+            return false;
+    }
+}
+
 bool blorp_resource_source_next_raw(blorp_ResourceSource* source, void** out) {
     if (out) *out = NULL;
     if (!source || !out) return false;
 
     switch (source->kind) {
         case BLORP_RESOURCE_SOURCE_TCP_CONNECTIONS: {
-            blorp_TcpStreamResult result =
-                blorp_tcp_accept_raw(source->owner.tcp_listener);
-            if (result.error_kind == BLORP_TCP_ERROR_NONE) {
-                *out = (void*)result.handle;
-                return true;
+            while (true) {
+                blorp_TcpStreamResult result =
+                    blorp_tcp_accept_raw(source->owner.tcp_listener);
+                if (result.error_kind == BLORP_TCP_ERROR_NONE) {
+                    *out = (void*)result.handle;
+                    return true;
+                }
+                blorp_TcpErrorKind error_kind = result.error_kind;
+                if (result.detail) blorp_release(result.detail);
+                if (blorp_resource_source_should_continue(source, error_kind)) {
+                    continue;
+                }
+                return false;
             }
-            if (result.detail) blorp_release(result.detail);
-            return false;
         }
         default:
             return false;
@@ -12352,6 +13169,25 @@ blorp_TcpStreamResult blorp_tcp_connect_raw(blorp_String* host, long port) {
         return blorp_tcp_stream_result_error(
             BLORP_TCP_ERROR_INVALID_INPUT,
             "host must be shorter than 256 bytes");
+    }
+    if (port < 0 || port > 65535) {
+        return blorp_tcp_stream_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "port must be between 0 and 65535");
+    }
+    return blorp_tcp_stream_result_from_boxed(blorp_tcp_connect(host, port));
+}
+
+blorp_TcpStreamResult blorp_tcp_connect_numeric_raw(blorp_String* host, long port) {
+    if (!blorp_tcp_host_value_is_valid(host)) {
+        return blorp_tcp_stream_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "host must be shorter than 256 bytes");
+    }
+    if (!blorp_tcp_host_string_is_numeric(host, AF_INET)) {
+        return blorp_tcp_stream_result_error(
+            BLORP_TCP_ERROR_INVALID_INPUT,
+            "host must be a numeric IPv4 address");
     }
     if (port < 0 || port > 65535) {
         return blorp_tcp_stream_result_error(
@@ -12419,6 +13255,5838 @@ blorp_TcpVoidResult blorp_tcp_set_timeout_stream_raw(
     }
     return blorp_tcp_void_result_from_boxed(
         blorp_tcp_set_timeout_stream(stream, ms));
+}
+
+// ============================================================================
+// TLS Networking
+// ============================================================================
+
+static blorp_String* blorp_tls_unsupported_detail(void) {
+    return blorp_string_literal("native TLS support is not implemented yet");
+}
+
+static blorp_TlsSessionResult blorp_tls_session_result_error(
+    blorp_TlsErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TlsSessionResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TlsSessionResult blorp_tls_session_result_error_detail(
+    blorp_TlsErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_TlsSessionResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail ? detail : blorp_string_literal("")
+    };
+}
+
+static blorp_TlsSessionResult blorp_tls_session_result_ok(
+    blorp_TlsSession* session
+) {
+    return (blorp_TlsSessionResult){
+        .handle = session,
+        .error_kind = BLORP_TLS_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_TlsBytesResult blorp_tls_bytes_result_error(
+    blorp_TlsErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TlsBytesResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TlsIntResult blorp_tls_int_result_error(
+    blorp_TlsErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TlsIntResult){
+        .value = 0,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TlsVoidResult blorp_tls_void_result_error(
+    blorp_TlsErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TlsVoidResult){
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_TlsBytesResult blorp_tls_bytes_result_error_detail(
+    blorp_TlsErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_TlsBytesResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail ? detail : blorp_string_literal("")
+    };
+}
+
+static blorp_TlsIntResult blorp_tls_int_result_error_detail(
+    blorp_TlsErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_TlsIntResult){
+        .value = 0,
+        .error_kind = kind,
+        .detail = detail ? detail : blorp_string_literal("")
+    };
+}
+
+static blorp_TlsVoidResult blorp_tls_void_result_error_detail(
+    blorp_TlsErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_TlsVoidResult){
+        .error_kind = kind,
+        .detail = detail ? detail : blorp_string_literal("")
+    };
+}
+
+typedef enum {
+    BLORP_TLS_BACKEND_STEP_DONE = 0,
+    BLORP_TLS_BACKEND_STEP_WANT_READ = 1,
+    BLORP_TLS_BACKEND_STEP_WANT_WRITE = 2,
+    BLORP_TLS_BACKEND_STEP_ERROR = 3
+} blorp_TlsBackendStepStatus;
+
+typedef struct {
+    blorp_TlsBackendStepStatus status;
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+    blorp_Bytes* bytes;
+    long count;
+} blorp_TlsBackendStepResult;
+
+typedef struct {
+    bool ready;
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsBackendWaitResult;
+
+static blorp_TlsBackendStepResult blorp_tls_backend_step_error(
+    blorp_TlsErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_TlsBackendStepResult){
+        .status = BLORP_TLS_BACKEND_STEP_ERROR,
+        .error_kind = kind,
+        .detail = detail,
+        .bytes = NULL,
+        .count = 0
+    };
+}
+
+static blorp_TlsBackendWaitResult blorp_tls_backend_wait_ready(void) {
+    return (blorp_TlsBackendWaitResult){
+        .ready = true,
+        .error_kind = BLORP_TLS_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_TlsBackendWaitResult blorp_tls_backend_wait_error(
+    blorp_TlsErrorKind kind,
+    const char* detail
+) {
+    return (blorp_TlsBackendWaitResult){
+        .ready = false,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+typedef struct blorp_TlsBackendOps {
+    blorp_TlsBackendKind kind;
+    unsigned capabilities;
+    void (*close)(blorp_TlsSession* session);
+    blorp_TlsSessionResult (*connect)(
+        blorp_TcpStream* stream,
+        blorp_String* server_name
+    );
+    blorp_TlsBackendStepResult (*handshake_step)(blorp_TlsSession* session);
+    blorp_TlsBackendStepResult (*read_step)(
+        blorp_TlsSession* session,
+        long max_bytes
+    );
+    blorp_TlsBackendStepResult (*write_step)(
+        blorp_TlsSession* session,
+        blorp_Bytes* data,
+        long offset
+    );
+} blorp_TlsBackendOps;
+
+enum {
+    BLORP_TLS_BACKEND_CAP_NONE = 0u,
+    BLORP_TLS_BACKEND_CAP_CONNECT = 1u << 0,
+    BLORP_TLS_BACKEND_CAP_HANDSHAKE = 1u << 1,
+    BLORP_TLS_BACKEND_CAP_READ = 1u << 2,
+    BLORP_TLS_BACKEND_CAP_WRITE = 1u << 3,
+    BLORP_TLS_BACKEND_CAP_NATIVE_IO =
+        BLORP_TLS_BACKEND_CAP_CONNECT |
+        BLORP_TLS_BACKEND_CAP_HANDSHAKE |
+        BLORP_TLS_BACKEND_CAP_READ |
+        BLORP_TLS_BACKEND_CAP_WRITE
+};
+
+static blorp_TlsSession* blorp_tls_session_new(
+    blorp_TcpStream* stream,
+    const blorp_TlsBackendOps* backend,
+    blorp_TlsSessionState state,
+    void* backend_state
+);
+
+static void blorp_tls_backend_close_unsupported(blorp_TlsSession* session) {
+    (void)session;
+}
+
+static bool blorp_tls_session_ready_for_io(
+    blorp_TlsSession* session,
+    blorp_TlsErrorKind* kind,
+    const char** detail
+) {
+    if (!session) {
+        *kind = BLORP_TLS_ERROR_CLOSED;
+        *detail = "closed TLS session";
+        return false;
+    }
+    switch (session->state) {
+        case BLORP_TLS_SESSION_OPEN:
+            return true;
+        case BLORP_TLS_SESSION_HANDSHAKING:
+            *kind = BLORP_TLS_ERROR_BUSY;
+            *detail = "TLS handshake is not complete";
+            return false;
+        case BLORP_TLS_SESSION_CLOSING:
+        case BLORP_TLS_SESSION_CLOSED:
+            *kind = BLORP_TLS_ERROR_CLOSED;
+            *detail = "closed TLS session";
+            return false;
+        case BLORP_TLS_SESSION_FAILED:
+            *kind = BLORP_TLS_ERROR_OTHER;
+            *detail = "TLS session is failed";
+            return false;
+    }
+    *kind = BLORP_TLS_ERROR_OTHER;
+    *detail = "invalid TLS session state";
+    return false;
+}
+
+static blorp_TlsSessionResult blorp_tls_backend_connect_unsupported(
+    blorp_TcpStream* stream,
+    blorp_String* server_name
+) {
+    (void)stream;
+    (void)server_name;
+    return (blorp_TlsSessionResult){
+        .handle = NULL,
+        .error_kind = BLORP_TLS_ERROR_UNSUPPORTED,
+        .detail = blorp_tls_unsupported_detail()
+    };
+}
+
+static blorp_TlsBackendStepResult blorp_tls_backend_handshake_step_unsupported(
+    blorp_TlsSession* session
+) {
+    (void)session;
+    return blorp_tls_backend_step_error(
+        BLORP_TLS_ERROR_UNSUPPORTED,
+        blorp_tls_unsupported_detail());
+}
+
+static blorp_TlsBackendStepResult blorp_tls_backend_read_step_unsupported(
+    blorp_TlsSession* session,
+    long max_bytes
+) {
+    (void)session;
+    (void)max_bytes;
+    return blorp_tls_backend_step_error(
+        BLORP_TLS_ERROR_UNSUPPORTED,
+        blorp_tls_unsupported_detail());
+}
+
+static blorp_TlsBackendStepResult blorp_tls_backend_write_step_unsupported(
+    blorp_TlsSession* session,
+    blorp_Bytes* data,
+    long offset
+) {
+    (void)session;
+    (void)data;
+    (void)offset;
+    return blorp_tls_backend_step_error(
+        BLORP_TLS_ERROR_UNSUPPORTED,
+        blorp_tls_unsupported_detail());
+}
+
+static const blorp_TlsBackendOps BLORP_TLS_UNSUPPORTED_BACKEND = {
+    .kind = BLORP_TLS_BACKEND_UNSUPPORTED,
+    .capabilities = BLORP_TLS_BACKEND_CAP_NONE,
+    .close = blorp_tls_backend_close_unsupported,
+    .connect = blorp_tls_backend_connect_unsupported,
+    .handshake_step = blorp_tls_backend_handshake_step_unsupported,
+    .read_step = blorp_tls_backend_read_step_unsupported,
+    .write_step = blorp_tls_backend_write_step_unsupported
+};
+
+#if defined(BLORP_TLS_BACKEND_PROFILE_OPENSSL)
+static const blorp_TlsBackendOps BLORP_TLS_OPENSSL_BACKEND;
+
+typedef struct {
+    SSL_CTX* ctx;
+    SSL* ssl;
+} blorp_TlsOpenSslState;
+
+static blorp_String* blorp_tls_errno_detail(
+    const char* operation,
+    int errnum
+) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s: %s", operation, strerror(errnum));
+    return blorp_string_literal(buf);
+}
+
+static char* blorp_tls_string_to_c_copy(blorp_String* value) {
+    if (!value || value->len < 0) return NULL;
+    if (blorp_string_contains_nul(value)) return NULL;
+    if ((unsigned long)value->len > SIZE_MAX - 1UL) return NULL;
+    char* out = (char*)malloc((size_t)value->len + 1U);
+    if (!out) return NULL;
+    memcpy(out, value->data, (size_t)value->len);
+    out[value->len] = '\0';
+    return out;
+}
+
+static void blorp_tls_openssl_clear_error_state(void) {
+    errno = 0;
+    ERR_clear_error();
+}
+
+static blorp_String* blorp_tls_openssl_error_detail(
+    SSL* ssl,
+    const char* operation,
+    int ssl_error
+) {
+    char buf[512];
+    if (ssl && ssl_error == SSL_ERROR_SSL) {
+        long verify_result = SSL_get_verify_result(ssl);
+        if (verify_result != X509_V_OK) {
+            snprintf(
+                buf,
+                sizeof(buf),
+                "%s: %s",
+                operation,
+                X509_verify_cert_error_string(verify_result));
+            return blorp_string_literal(buf);
+        }
+    }
+
+    unsigned long err = ERR_get_error();
+    if (err != 0) {
+        char err_buf[256];
+        ERR_error_string_n(err, err_buf, sizeof(err_buf));
+        snprintf(buf, sizeof(buf), "%s: %s", operation, err_buf);
+        return blorp_string_literal(buf);
+    }
+    if (errno != 0) {
+        return blorp_tls_errno_detail(operation, errno);
+    }
+    snprintf(
+        buf,
+        sizeof(buf),
+        "%s: OpenSSL operation failed",
+        operation);
+    return blorp_string_literal(buf);
+}
+
+static blorp_TlsErrorKind blorp_tls_openssl_error_kind(
+    SSL* ssl,
+    int ssl_error
+) {
+    if (ssl && ssl_error == SSL_ERROR_SSL &&
+        SSL_get_verify_result(ssl) != X509_V_OK) {
+        return BLORP_TLS_ERROR_CERTIFICATE;
+    }
+    switch (ssl_error) {
+        case SSL_ERROR_ZERO_RETURN:
+            return BLORP_TLS_ERROR_CLOSED;
+        case SSL_ERROR_SYSCALL:
+            return errno == 0 ? BLORP_TLS_ERROR_CLOSED
+                              : BLORP_TLS_ERROR_TRANSPORT;
+        case SSL_ERROR_SSL:
+            return BLORP_TLS_ERROR_PROTOCOL;
+        default:
+            return BLORP_TLS_ERROR_OTHER;
+    }
+}
+
+static blorp_TlsBackendStepResult blorp_tls_openssl_step_wait(
+    blorp_TlsBackendStepStatus status,
+    const char* detail
+) {
+    return (blorp_TlsBackendStepResult){
+        .status = status,
+        .error_kind = BLORP_TLS_ERROR_NONE,
+        .detail = blorp_string_literal(detail),
+        .bytes = NULL,
+        .count = 0
+    };
+}
+
+static blorp_TlsBackendStepResult blorp_tls_openssl_step_done(
+    blorp_Bytes* bytes,
+    long count
+) {
+    return (blorp_TlsBackendStepResult){
+        .status = BLORP_TLS_BACKEND_STEP_DONE,
+        .error_kind = BLORP_TLS_ERROR_NONE,
+        .detail = NULL,
+        .bytes = bytes,
+        .count = count
+    };
+}
+
+static blorp_TlsBackendStepResult blorp_tls_openssl_step_from_error(
+    SSL* ssl,
+    int ret,
+    const char* operation,
+    bool zero_return_is_eof
+) {
+    int ssl_error = SSL_get_error(ssl, ret);
+    switch (ssl_error) {
+        case SSL_ERROR_WANT_READ:
+            return blorp_tls_openssl_step_wait(
+                BLORP_TLS_BACKEND_STEP_WANT_READ,
+                "OpenSSL wants read readiness");
+        case SSL_ERROR_WANT_WRITE:
+            return blorp_tls_openssl_step_wait(
+                BLORP_TLS_BACKEND_STEP_WANT_WRITE,
+                "OpenSSL wants write readiness");
+        case SSL_ERROR_ZERO_RETURN:
+            if (zero_return_is_eof) {
+                return blorp_tls_openssl_step_done(blorp_bytes_new(0), 0);
+            }
+            return blorp_tls_backend_step_error(
+                BLORP_TLS_ERROR_CLOSED,
+                blorp_string_literal("TLS connection closed"));
+        default:
+            return blorp_tls_backend_step_error(
+                blorp_tls_openssl_error_kind(ssl, ssl_error),
+                blorp_tls_openssl_error_detail(
+                    ssl,
+                    operation,
+                    ssl_error));
+    }
+}
+
+static void blorp_tls_backend_close_openssl(blorp_TlsSession* session) {
+    blorp_TlsOpenSslState* state = session
+        ? (blorp_TlsOpenSslState*)session->backend_state
+        : NULL;
+    if (!state) return;
+    session->backend_state = NULL;
+    if (state->ssl) SSL_free(state->ssl);
+    if (state->ctx) SSL_CTX_free(state->ctx);
+    free(state);
+}
+
+static bool blorp_tls_prepare_stream_for_openssl(
+    blorp_TcpStream* stream,
+    int* fd_out,
+    blorp_TlsErrorKind* kind,
+    blorp_String** detail
+) {
+    blorp_TcpInner* inner = stream ? stream->inner : NULL;
+    long fd = -1;
+    if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+        *kind = BLORP_TLS_ERROR_CLOSED;
+        *detail = blorp_string_literal("closed TLS transport");
+        return false;
+    }
+    if (blorp_io_reactor_set_nonblocking((int)fd) < 0) {
+        int errnum = errno;
+        blorp_tcp_inner_end_op(inner);
+        *kind = BLORP_TLS_ERROR_TRANSPORT;
+        *detail = blorp_tls_errno_detail(
+            "TLS transport nonblocking setup",
+            errnum);
+        return false;
+    }
+    blorp_tcp_inner_end_op(inner);
+    *fd_out = (int)fd;
+    return true;
+}
+
+static blorp_TlsSessionResult blorp_tls_backend_connect_openssl(
+    blorp_TcpStream* stream,
+    blorp_String* server_name
+) {
+    blorp_tls_openssl_clear_error_state();
+    if (OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL) != 1) {
+        return blorp_tls_session_result_error_detail(
+            BLORP_TLS_ERROR_OTHER,
+            blorp_tls_openssl_error_detail(NULL, "OpenSSL init", 0));
+    }
+
+    int fd = -1;
+    blorp_TlsErrorKind kind = BLORP_TLS_ERROR_NONE;
+    blorp_String* detail = NULL;
+    if (!blorp_tls_prepare_stream_for_openssl(
+            stream,
+            &fd,
+            &kind,
+            &detail)) {
+        return blorp_tls_session_result_error_detail(kind, detail);
+    }
+
+    char* host = blorp_tls_string_to_c_copy(server_name);
+    if (!host) {
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_INVALID_INPUT,
+            "server name is invalid");
+    }
+
+    blorp_TlsOpenSslState* state =
+        (blorp_TlsOpenSslState*)calloc(1, sizeof(blorp_TlsOpenSslState));
+    if (!state) {
+        free(host);
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_OTHER,
+            "OpenSSL state allocation failed");
+    }
+
+    blorp_tls_openssl_clear_error_state();
+    state->ctx = SSL_CTX_new(TLS_client_method());
+    if (!state->ctx) {
+        detail = blorp_tls_openssl_error_detail(NULL, "OpenSSL context", 0);
+        free(host);
+        free(state);
+        return blorp_tls_session_result_error_detail(
+            BLORP_TLS_ERROR_OTHER,
+            detail);
+    }
+    SSL_CTX_set_verify(state->ctx, SSL_VERIFY_PEER, NULL);
+    blorp_tls_openssl_clear_error_state();
+    if (SSL_CTX_set_min_proto_version(state->ctx, TLS1_2_VERSION) != 1) {
+        detail = blorp_tls_openssl_error_detail(
+            NULL,
+            "OpenSSL minimum protocol",
+            0);
+        SSL_CTX_free(state->ctx);
+        free(host);
+        free(state);
+        return blorp_tls_session_result_error_detail(
+            BLORP_TLS_ERROR_PROTOCOL,
+            detail);
+    }
+    blorp_tls_openssl_clear_error_state();
+    if (SSL_CTX_set_default_verify_paths(state->ctx) != 1) {
+        detail = blorp_tls_openssl_error_detail(
+            NULL,
+            "OpenSSL trust store",
+            0);
+        SSL_CTX_free(state->ctx);
+        free(host);
+        free(state);
+        return blorp_tls_session_result_error_detail(
+            BLORP_TLS_ERROR_CERTIFICATE,
+            detail);
+    }
+
+    blorp_tls_openssl_clear_error_state();
+    state->ssl = SSL_new(state->ctx);
+    if (!state->ssl) {
+        detail = blorp_tls_openssl_error_detail(NULL, "OpenSSL session", 0);
+        SSL_CTX_free(state->ctx);
+        free(host);
+        free(state);
+        return blorp_tls_session_result_error_detail(
+            BLORP_TLS_ERROR_OTHER,
+            detail);
+    }
+    SSL_set_mode(
+        state->ssl,
+        SSL_MODE_ENABLE_PARTIAL_WRITE |
+            SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    X509_VERIFY_PARAM* verify_param = SSL_get0_param(state->ssl);
+    if (!verify_param) {
+        SSL_free(state->ssl);
+        SSL_CTX_free(state->ctx);
+        free(host);
+        free(state);
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_OTHER,
+            "OpenSSL verification parameters unavailable");
+    }
+    X509_VERIFY_PARAM_set_hostflags(
+        verify_param,
+        X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    blorp_tls_openssl_clear_error_state();
+    if (X509_VERIFY_PARAM_set1_host(verify_param, host, 0) != 1 ||
+        SSL_set_tlsext_host_name(state->ssl, host) != 1 ||
+        SSL_set_fd(state->ssl, fd) != 1) {
+        detail = blorp_tls_openssl_error_detail(
+            state->ssl,
+            "OpenSSL session setup",
+            SSL_ERROR_SSL);
+        SSL_free(state->ssl);
+        SSL_CTX_free(state->ctx);
+        free(host);
+        free(state);
+        return blorp_tls_session_result_error_detail(
+            BLORP_TLS_ERROR_OTHER,
+            detail);
+    }
+    SSL_set_connect_state(state->ssl);
+    free(host);
+
+    return blorp_tls_session_result_ok(blorp_tls_session_new(
+        stream,
+        &BLORP_TLS_OPENSSL_BACKEND,
+        BLORP_TLS_SESSION_HANDSHAKING,
+        state));
+}
+
+static blorp_TlsBackendStepResult
+blorp_tls_backend_handshake_step_openssl(
+    blorp_TlsSession* session
+) {
+    blorp_TlsOpenSslState* state = session
+        ? (blorp_TlsOpenSslState*)session->backend_state
+        : NULL;
+    if (!state || !state->ssl) {
+        return blorp_tls_backend_step_error(
+            BLORP_TLS_ERROR_CLOSED,
+            blorp_string_literal("closed TLS session"));
+    }
+    blorp_tls_openssl_clear_error_state();
+    int rc = SSL_connect(state->ssl);
+    if (rc == 1) return blorp_tls_openssl_step_done(NULL, 0);
+    return blorp_tls_openssl_step_from_error(
+        state->ssl,
+        rc,
+        "TLS handshake",
+        false);
+}
+
+static blorp_TlsBackendStepResult blorp_tls_backend_read_step_openssl(
+    blorp_TlsSession* session,
+    long max_bytes
+) {
+    blorp_TlsOpenSslState* state = session
+        ? (blorp_TlsOpenSslState*)session->backend_state
+        : NULL;
+    if (!state || !state->ssl) {
+        return blorp_tls_backend_step_error(
+            BLORP_TLS_ERROR_CLOSED,
+            blorp_string_literal("closed TLS session"));
+    }
+    long capped = max_bytes > INT_MAX ? INT_MAX : max_bytes;
+    blorp_Bytes* bytes = blorp_bytes_new(capped);
+    blorp_tls_openssl_clear_error_state();
+    int n = SSL_read(state->ssl, bytes->data, (int)capped);
+    if (n > 0) {
+        bytes->len = n;
+        return blorp_tls_openssl_step_done(bytes, n);
+    }
+    int ssl_error = SSL_get_error(state->ssl, n);
+    if (ssl_error == SSL_ERROR_WANT_READ) {
+        blorp_release(bytes);
+        return blorp_tls_openssl_step_wait(
+            BLORP_TLS_BACKEND_STEP_WANT_READ,
+            "OpenSSL wants read readiness");
+    }
+    if (ssl_error == SSL_ERROR_WANT_WRITE) {
+        blorp_release(bytes);
+        return blorp_tls_openssl_step_wait(
+            BLORP_TLS_BACKEND_STEP_WANT_WRITE,
+            "OpenSSL wants write readiness");
+    }
+    if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+        bytes->len = 0;
+        return blorp_tls_openssl_step_done(bytes, 0);
+    }
+    blorp_release(bytes);
+    return blorp_tls_backend_step_error(
+        blorp_tls_openssl_error_kind(state->ssl, ssl_error),
+        blorp_tls_openssl_error_detail(state->ssl, "TLS read", ssl_error));
+}
+
+static blorp_TlsBackendStepResult
+blorp_tls_backend_write_step_openssl(
+    blorp_TlsSession* session,
+    blorp_Bytes* data,
+    long offset
+) {
+    blorp_TlsOpenSslState* state = session
+        ? (blorp_TlsOpenSslState*)session->backend_state
+        : NULL;
+    if (!state || !state->ssl) {
+        return blorp_tls_backend_step_error(
+            BLORP_TLS_ERROR_CLOSED,
+            blorp_string_literal("closed TLS session"));
+    }
+    if (!data || offset < 0 || offset > data->len) {
+        return blorp_tls_backend_step_error(
+            BLORP_TLS_ERROR_INVALID_INPUT,
+            blorp_string_literal("invalid TLS write buffer"));
+    }
+    long remaining = data->len - offset;
+    if (remaining <= 0) return blorp_tls_openssl_step_done(NULL, 0);
+    int to_write = remaining > INT_MAX ? INT_MAX : (int)remaining;
+    blorp_tls_openssl_clear_error_state();
+    int n = SSL_write(state->ssl, data->data + offset, to_write);
+    if (n > 0) return blorp_tls_openssl_step_done(NULL, n);
+    return blorp_tls_openssl_step_from_error(
+        state->ssl,
+        n,
+        "TLS write",
+        false);
+}
+
+static const blorp_TlsBackendOps BLORP_TLS_OPENSSL_BACKEND = {
+    .kind = BLORP_TLS_BACKEND_OPENSSL,
+    .capabilities = BLORP_TLS_BACKEND_CAP_NATIVE_IO,
+    .close = blorp_tls_backend_close_openssl,
+    .connect = blorp_tls_backend_connect_openssl,
+    .handshake_step = blorp_tls_backend_handshake_step_openssl,
+    .read_step = blorp_tls_backend_read_step_openssl,
+    .write_step = blorp_tls_backend_write_step_openssl
+};
+#endif
+
+static const blorp_TlsBackendOps* blorp_tls_active_backend(void) {
+#if defined(BLORP_TLS_BACKEND_PROFILE_OPENSSL)
+    return &BLORP_TLS_OPENSSL_BACKEND;
+#else
+    return &BLORP_TLS_UNSUPPORTED_BACKEND;
+#endif
+}
+
+static bool blorp_tls_backend_ops_complete(
+    const blorp_TlsBackendOps* backend
+) {
+    return backend && backend->close && backend->connect &&
+           backend->handshake_step && backend->read_step &&
+           backend->write_step;
+}
+
+static bool blorp_tls_backend_has_capabilities(
+    const blorp_TlsBackendOps* backend,
+    unsigned required_capabilities
+) {
+    return backend &&
+           (backend->capabilities & required_capabilities) ==
+               required_capabilities;
+}
+
+static bool blorp_tls_backend_native_available(
+    const blorp_TlsBackendOps* backend
+) {
+    return blorp_tls_backend_ops_complete(backend) &&
+           blorp_tls_backend_has_capabilities(
+               backend,
+               BLORP_TLS_BACKEND_CAP_NATIVE_IO);
+}
+
+static bool blorp_tls_session_backend_ready(
+    blorp_TlsSession* session,
+    const blorp_TlsBackendOps** backend,
+    blorp_TlsErrorKind* kind,
+    const char** detail
+) {
+    const blorp_TlsBackendOps* selected = session && session->backend
+        ? session->backend
+        : blorp_tls_active_backend();
+    if (!blorp_tls_backend_ops_complete(selected)) {
+        *kind = BLORP_TLS_ERROR_OTHER;
+        *detail = "TLS backend is incomplete";
+        *backend = NULL;
+        return false;
+    }
+    *backend = selected;
+    return true;
+}
+
+static blorp_String* blorp_tls_backend_step_wait_detail(
+    blorp_TlsBackendStepStatus status,
+    blorp_String* detail
+) {
+    if (detail) return detail;
+    switch (status) {
+        case BLORP_TLS_BACKEND_STEP_WANT_READ:
+            return blorp_string_literal("TLS backend is waiting for read readiness");
+        case BLORP_TLS_BACKEND_STEP_WANT_WRITE:
+            return blorp_string_literal("TLS backend is waiting for write readiness");
+        case BLORP_TLS_BACKEND_STEP_DONE:
+        case BLORP_TLS_BACKEND_STEP_ERROR:
+        default:
+            return blorp_string_literal("TLS backend step is not ready");
+    }
+}
+
+static bool blorp_tls_backend_step_wait_target(
+    blorp_TlsBackendStepStatus status,
+    blorp_IoWaitKind* wait_kind,
+    int* interest
+) {
+    if (!wait_kind || !interest) return false;
+    switch (status) {
+        case BLORP_TLS_BACKEND_STEP_WANT_READ:
+            *wait_kind = BLORP_IO_WAIT_READ;
+            *interest = BLORP_IO_INTEREST_READ;
+            return true;
+        case BLORP_TLS_BACKEND_STEP_WANT_WRITE:
+            *wait_kind = BLORP_IO_WAIT_WRITE;
+            *interest = BLORP_IO_INTEREST_WRITE;
+            return true;
+        case BLORP_TLS_BACKEND_STEP_DONE:
+        case BLORP_TLS_BACKEND_STEP_ERROR:
+        default:
+            return false;
+    }
+}
+
+static blorp_TlsBackendWaitResult blorp_tls_backend_wait_for_step(
+    blorp_TlsSession* session,
+    blorp_TlsBackendStepStatus status,
+    blorp_String* step_detail
+) {
+    if (step_detail) blorp_release(step_detail);
+
+    blorp_IoWaitKind wait_kind = BLORP_IO_WAIT_NONE;
+    int interest = 0;
+    if (!blorp_tls_backend_step_wait_target(status, &wait_kind, &interest)) {
+        return blorp_tls_backend_wait_error(
+            BLORP_TLS_ERROR_OTHER,
+            "TLS backend step is not waitable");
+    }
+
+    blorp_TcpInner* inner =
+        session && session->stream ? session->stream->inner : NULL;
+    long fd = -1;
+    if (blorp_tcp_inner_begin_op(inner, &fd) < 0) {
+        return blorp_tls_backend_wait_error(
+            BLORP_TLS_ERROR_CLOSED,
+            "closed TLS transport");
+    }
+    uint64_t generation = inner->generation;
+    long timeout_ms = inner->default_timeout_ms;
+    if (blorp_io_reactor_set_nonblocking((int)fd) < 0) {
+        blorp_tcp_inner_end_op(inner);
+        return blorp_tls_backend_wait_error(
+            BLORP_TLS_ERROR_TRANSPORT,
+            "TLS transport nonblocking setup failed");
+    }
+    blorp_tcp_inner_end_op(inner);
+
+    blorp_IoWakeReason reason;
+    if (blorp_tcp_inner_wait_for_reactor(
+            inner,
+            wait_kind,
+            interest,
+            (int)fd,
+            generation,
+            timeout_ms,
+            &reason) != 0) {
+        return blorp_tls_backend_wait_error(
+            BLORP_TLS_ERROR_TRANSPORT,
+            "TLS transport reactor unavailable");
+    }
+
+    switch (reason) {
+        case BLORP_IO_WAKE_READY:
+            return blorp_tls_backend_wait_ready();
+        case BLORP_IO_WAKE_TIMEOUT:
+            return blorp_tls_backend_wait_error(
+                BLORP_TLS_ERROR_TIMED_OUT,
+                "TLS transport timed out");
+        case BLORP_IO_WAKE_CANCELLED:
+            (void)__blorp_cancel_current_task_if_requested();
+            return blorp_tls_backend_wait_error(
+                BLORP_TLS_ERROR_OTHER,
+                "TLS transport wait cancelled");
+        case BLORP_IO_WAKE_BUSY:
+            return blorp_tls_backend_wait_error(
+                BLORP_TLS_ERROR_BUSY,
+                status == BLORP_TLS_BACKEND_STEP_WANT_READ
+                    ? "TLS transport read already in progress"
+                    : "TLS transport write already in progress");
+        case BLORP_IO_WAKE_CLOSED:
+        case BLORP_IO_WAKE_NONE:
+        default:
+            return blorp_tls_backend_wait_error(
+                BLORP_TLS_ERROR_CLOSED,
+                "closed TLS transport");
+    }
+}
+
+static blorp_TlsBytesResult blorp_tls_backend_read_bytes(
+    const blorp_TlsBackendOps* backend,
+    blorp_TlsSession* session,
+    long max_bytes
+) {
+    while (true) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            return blorp_tls_bytes_result_error(
+                BLORP_TLS_ERROR_OTHER,
+                "TLS read cancelled");
+        }
+
+        blorp_TlsBackendStepResult step =
+            backend->read_step(session, max_bytes);
+        switch (step.status) {
+            case BLORP_TLS_BACKEND_STEP_DONE:
+                if (step.detail) blorp_release(step.detail);
+                return (blorp_TlsBytesResult){
+                    .value = step.bytes,
+                    .error_kind = BLORP_TLS_ERROR_NONE,
+                    .detail = NULL
+                };
+            case BLORP_TLS_BACKEND_STEP_ERROR:
+                return blorp_tls_bytes_result_error_detail(
+                    step.error_kind,
+                    step.detail);
+            case BLORP_TLS_BACKEND_STEP_WANT_READ:
+            case BLORP_TLS_BACKEND_STEP_WANT_WRITE: {
+                if (step.bytes) blorp_release(step.bytes);
+                blorp_TlsBackendWaitResult wait =
+                    blorp_tls_backend_wait_for_step(
+                        session,
+                        step.status,
+                        step.detail);
+                if (wait.ready) continue;
+                return blorp_tls_bytes_result_error_detail(
+                    wait.error_kind,
+                    wait.detail);
+            }
+            default:
+                if (step.bytes) blorp_release(step.bytes);
+                return blorp_tls_bytes_result_error_detail(
+                    BLORP_TLS_ERROR_BUSY,
+                    blorp_tls_backend_step_wait_detail(
+                        step.status,
+                        step.detail));
+        }
+    }
+}
+
+static blorp_TlsIntResult blorp_tls_backend_write_once(
+    const blorp_TlsBackendOps* backend,
+    blorp_TlsSession* session,
+    blorp_Bytes* data
+) {
+    while (true) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            return blorp_tls_int_result_error(
+                BLORP_TLS_ERROR_OTHER,
+                "TLS write cancelled");
+        }
+
+        blorp_TlsBackendStepResult step =
+            backend->write_step(session, data, 0);
+        switch (step.status) {
+            case BLORP_TLS_BACKEND_STEP_DONE:
+                if (step.bytes) blorp_release(step.bytes);
+                if (step.detail) blorp_release(step.detail);
+                return (blorp_TlsIntResult){
+                    .value = step.count,
+                    .error_kind = BLORP_TLS_ERROR_NONE,
+                    .detail = NULL
+                };
+            case BLORP_TLS_BACKEND_STEP_ERROR:
+                return blorp_tls_int_result_error_detail(
+                    step.error_kind,
+                    step.detail);
+            case BLORP_TLS_BACKEND_STEP_WANT_READ:
+            case BLORP_TLS_BACKEND_STEP_WANT_WRITE: {
+                if (step.bytes) blorp_release(step.bytes);
+                blorp_TlsBackendWaitResult wait =
+                    blorp_tls_backend_wait_for_step(
+                        session,
+                        step.status,
+                        step.detail);
+                if (wait.ready) continue;
+                return blorp_tls_int_result_error_detail(
+                    wait.error_kind,
+                    wait.detail);
+            }
+            default:
+                if (step.bytes) blorp_release(step.bytes);
+                return blorp_tls_int_result_error_detail(
+                    BLORP_TLS_ERROR_BUSY,
+                    blorp_tls_backend_step_wait_detail(
+                        step.status,
+                        step.detail));
+        }
+    }
+}
+
+static blorp_TlsVoidResult blorp_tls_backend_write_all_steps(
+    const blorp_TlsBackendOps* backend,
+    blorp_TlsSession* session,
+    blorp_Bytes* data
+) {
+    long offset = 0;
+    bool first_step = true;
+    while (first_step || offset < data->len) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            return blorp_tls_void_result_error(
+                BLORP_TLS_ERROR_OTHER,
+                "TLS write cancelled");
+        }
+
+        first_step = false;
+        blorp_TlsBackendStepResult step =
+            backend->write_step(session, data, offset);
+        switch (step.status) {
+            case BLORP_TLS_BACKEND_STEP_DONE:
+                if (step.bytes) blorp_release(step.bytes);
+                if (step.detail) blorp_release(step.detail);
+                if (step.count < 0 || offset > LONG_MAX - step.count) {
+                    return blorp_tls_void_result_error(
+                        BLORP_TLS_ERROR_OTHER,
+                        "TLS backend write returned an invalid count");
+                }
+                if (step.count == 0 && offset < data->len) {
+                    return blorp_tls_void_result_error(
+                        BLORP_TLS_ERROR_BUSY,
+                        "TLS backend write made no progress");
+                }
+                offset += step.count;
+                if (offset >= data->len) {
+                    return (blorp_TlsVoidResult){
+                        .error_kind = BLORP_TLS_ERROR_NONE,
+                        .detail = NULL
+                    };
+                }
+                break;
+            case BLORP_TLS_BACKEND_STEP_ERROR:
+                return blorp_tls_void_result_error_detail(
+                    step.error_kind,
+                    step.detail);
+            case BLORP_TLS_BACKEND_STEP_WANT_READ:
+            case BLORP_TLS_BACKEND_STEP_WANT_WRITE: {
+                if (step.bytes) blorp_release(step.bytes);
+                blorp_TlsBackendWaitResult wait =
+                    blorp_tls_backend_wait_for_step(
+                        session,
+                        step.status,
+                        step.detail);
+                if (wait.ready) break;
+                return blorp_tls_void_result_error_detail(
+                    wait.error_kind,
+                    wait.detail);
+            }
+            default:
+                if (step.bytes) blorp_release(step.bytes);
+                return blorp_tls_void_result_error_detail(
+                    BLORP_TLS_ERROR_BUSY,
+                    blorp_tls_backend_step_wait_detail(
+                        step.status,
+                        step.detail));
+        }
+    }
+    return (blorp_TlsVoidResult){
+        .error_kind = BLORP_TLS_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+typedef struct {
+    blorp_TlsSession* session;
+    bool active;
+} blorp_TlsOperationCleanup;
+
+typedef struct {
+    blorp_TlsSession* session;
+    bool active;
+} blorp_TlsProvisionalSessionCleanup;
+
+static bool blorp_tls_session_begin_io_op(
+    blorp_TlsSession* session,
+    blorp_TlsErrorKind* kind,
+    const char** detail
+) {
+    blorp_TlsOperationState expected = BLORP_TLS_OPERATION_NONE;
+    if (!session || !__atomic_compare_exchange_n(
+            &session->operation_state,
+            &expected,
+            BLORP_TLS_OPERATION_IO,
+            false,
+            __ATOMIC_ACQ_REL,
+            __ATOMIC_ACQUIRE)) {
+        *kind = BLORP_TLS_ERROR_BUSY;
+        *detail = "TLS session already has an operation in progress";
+        return false;
+    }
+    return true;
+}
+
+static void blorp_tls_operation_cleanup_end(void* value) {
+    blorp_TlsOperationCleanup* cleanup =
+        (blorp_TlsOperationCleanup*)value;
+    if (!cleanup || !cleanup->active || !cleanup->session) return;
+    cleanup->active = false;
+    __atomic_store_n(
+        &cleanup->session->operation_state,
+        BLORP_TLS_OPERATION_NONE,
+        __ATOMIC_RELEASE);
+}
+
+static void blorp_tls_operation_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_TlsOperationCleanup* cleanup
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)cleanup;
+#else
+    __blorp_task_cleanup_push_slow(
+        frame,
+        cleanup,
+        cleanup,
+        blorp_tls_operation_cleanup_end);
+#endif
+}
+
+static void blorp_tls_operation_cleanup_pop(
+    blorp_TlsOperationCleanup* cleanup
+) {
+#if defined(__clang_analyzer__)
+    (void)cleanup;
+#else
+    __blorp_task_cleanup_pop_slot_slow(cleanup);
+#endif
+}
+
+static void blorp_tls_provisional_session_cleanup_release(void* value) {
+    blorp_TlsProvisionalSessionCleanup* cleanup =
+        (blorp_TlsProvisionalSessionCleanup*)value;
+    if (!cleanup || !cleanup->active || !cleanup->session) return;
+    cleanup->active = false;
+    blorp_release(cleanup->session);
+    cleanup->session = NULL;
+}
+
+static void blorp_tls_session_destroy(void* obj) {
+    blorp_TlsSession* session = (blorp_TlsSession*)obj;
+    if (!session) return;
+    const blorp_TlsBackendOps* backend =
+        session->backend ? session->backend : blorp_tls_active_backend();
+    session->state = BLORP_TLS_SESSION_CLOSING;
+    if (backend->close) backend->close(session);
+    session->state = BLORP_TLS_SESSION_CLOSED;
+    if (session->stream) {
+        blorp_release(session->stream);
+        session->stream = NULL;
+    }
+    session->backend = NULL;
+    session->backend_state = NULL;
+}
+
+static blorp_TlsSession* blorp_tls_session_new(
+    blorp_TcpStream* stream,
+    const blorp_TlsBackendOps* backend,
+    blorp_TlsSessionState state,
+    void* backend_state
+) {
+    blorp_TlsSession* session =
+        (blorp_TlsSession*)blorp_alloc(sizeof(blorp_TlsSession));
+    BLORP_TAG(session, "std_net_tls__TlsSession");
+    BLORP_SET_DESTRUCTOR(session, blorp_tls_session_destroy);
+    session->stream = stream ? blorp_retain(stream) : NULL;
+    session->backend = backend ? backend : blorp_tls_active_backend();
+    session->state = state;
+    session->operation_state = BLORP_TLS_OPERATION_NONE;
+    session->backend_state = backend_state;
+    return session;
+}
+
+static blorp_TlsSessionResult blorp_tls_backend_drive_handshake(
+    const blorp_TlsBackendOps* backend,
+    blorp_TlsSession* session
+) {
+    if (!session) {
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_OTHER,
+            "TLS backend did not create a session");
+    }
+    if (!blorp_tls_backend_ops_complete(backend)) {
+        blorp_release(session);
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_OTHER,
+            "TLS backend is incomplete");
+    }
+    if (session->state == BLORP_TLS_SESSION_OPEN) {
+        return blorp_tls_session_result_ok(session);
+    }
+    if (session->state != BLORP_TLS_SESSION_HANDSHAKING) {
+        session->state = BLORP_TLS_SESSION_FAILED;
+        blorp_release(session);
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_OTHER,
+            "TLS backend created an invalid session state");
+    }
+
+    blorp_TlsProvisionalSessionCleanup session_cleanup = {
+        .session = session,
+        .active = true
+    };
+    blorp_CancelCleanupFrame cleanup_frame;
+    __blorp_task_cleanup_push_slow(
+        &cleanup_frame,
+        &session_cleanup,
+        &session_cleanup,
+        blorp_tls_provisional_session_cleanup_release);
+
+    while (true) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            blorp_TlsSessionResult result = blorp_tls_session_result_error(
+                BLORP_TLS_ERROR_OTHER,
+                "TLS handshake cancelled");
+            blorp_tls_provisional_session_cleanup_release(&session_cleanup);
+            __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+            return result;
+        }
+
+        blorp_TlsBackendStepResult step = backend->handshake_step(session);
+        switch (step.status) {
+            case BLORP_TLS_BACKEND_STEP_DONE:
+                if (step.bytes) blorp_release(step.bytes);
+                if (step.detail) blorp_release(step.detail);
+                session->state = BLORP_TLS_SESSION_OPEN;
+                session_cleanup.active = false;
+                __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+                return blorp_tls_session_result_ok(session);
+            case BLORP_TLS_BACKEND_STEP_ERROR: {
+                if (step.bytes) blorp_release(step.bytes);
+                session->state = BLORP_TLS_SESSION_FAILED;
+                blorp_TlsSessionResult result =
+                    blorp_tls_session_result_error_detail(
+                        step.error_kind,
+                        step.detail);
+                blorp_tls_provisional_session_cleanup_release(
+                    &session_cleanup);
+                __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+                return result;
+            }
+            case BLORP_TLS_BACKEND_STEP_WANT_READ:
+            case BLORP_TLS_BACKEND_STEP_WANT_WRITE: {
+                if (step.bytes) blorp_release(step.bytes);
+                blorp_TlsBackendWaitResult wait =
+                    blorp_tls_backend_wait_for_step(
+                        session,
+                        step.status,
+                        step.detail);
+                if (wait.ready) continue;
+                blorp_TlsSessionResult result =
+                    blorp_tls_session_result_error_detail(
+                        wait.error_kind,
+                        wait.detail);
+                blorp_tls_provisional_session_cleanup_release(
+                    &session_cleanup);
+                __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+                return result;
+            }
+            default: {
+                if (step.bytes) blorp_release(step.bytes);
+                blorp_TlsSessionResult result =
+                    blorp_tls_session_result_error_detail(
+                        BLORP_TLS_ERROR_BUSY,
+                        blorp_tls_backend_step_wait_detail(
+                            step.status,
+                            step.detail));
+                blorp_tls_provisional_session_cleanup_release(
+                    &session_cleanup);
+                __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+                return result;
+            }
+        }
+    }
+}
+
+static blorp_TlsSessionResult blorp_tls_connect_with_backend(
+    blorp_TcpStream* stream,
+    blorp_String* server_name,
+    const blorp_TlsBackendOps* backend
+) {
+    if (!blorp_tls_backend_ops_complete(backend)) {
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_OTHER,
+            "TLS backend is incomplete");
+    }
+    blorp_TlsSessionResult connected = backend->connect(stream, server_name);
+    if (connected.error_kind != BLORP_TLS_ERROR_NONE) {
+        if (connected.handle) blorp_release(connected.handle);
+        return connected;
+    }
+    if (!connected.handle) {
+        if (connected.detail) blorp_release(connected.detail);
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_OTHER,
+            "TLS backend did not create a session");
+    }
+    if (connected.detail) blorp_release(connected.detail);
+    return blorp_tls_backend_drive_handshake(backend, connected.handle);
+}
+
+void blorp_tls_close_session(blorp_TlsSession* session) {
+    if (!session) return;
+    blorp_release(session);
+}
+
+bool blorp_tls_native_available_raw(void) {
+    return blorp_tls_backend_native_available(blorp_tls_active_backend());
+}
+
+blorp_TlsSessionResult blorp_tls_connect_raw(
+    blorp_TcpStream* stream,
+    blorp_String* server_name
+) {
+    if (!stream) {
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_INVALID_INPUT, "missing TCP stream");
+    }
+    if (!server_name || server_name->len <= 0) {
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_INVALID_INPUT, "server name must not be empty");
+    }
+    if (server_name->len > BLORP_TLS_SERVER_NAME_MAX_BYTES) {
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_INVALID_INPUT,
+            "server name must be at most 253 bytes");
+    }
+    if (blorp_string_contains_nul(server_name)) {
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_INVALID_INPUT,
+            "server name must not contain embedded NUL");
+    }
+    const blorp_TlsBackendOps* backend = blorp_tls_active_backend();
+    if (!blorp_tls_backend_ops_complete(backend)) {
+        return blorp_tls_session_result_error(
+            BLORP_TLS_ERROR_OTHER, "TLS backend is incomplete");
+    }
+    return blorp_tls_connect_with_backend(stream, server_name, backend);
+}
+
+blorp_TlsBytesResult blorp_tls_read_raw(
+    blorp_TlsSession* session,
+    long max_bytes
+) {
+    blorp_TlsErrorKind error_kind = BLORP_TLS_ERROR_NONE;
+    const char* detail = NULL;
+    if (!blorp_tls_session_ready_for_io(session, &error_kind, &detail)) {
+        return blorp_tls_bytes_result_error(error_kind, detail);
+    }
+    if (max_bytes <= 0 || max_bytes > BLORP_TCP_MAX_READ_BYTES) {
+        return blorp_tls_bytes_result_error(
+            BLORP_TLS_ERROR_INVALID_INPUT,
+            "max_bytes must be between 1 and 67108864");
+    }
+    const blorp_TlsBackendOps* backend = NULL;
+    if (!blorp_tls_session_backend_ready(
+            session, &backend, &error_kind, &detail)) {
+        return blorp_tls_bytes_result_error(error_kind, detail);
+    }
+    blorp_TlsOperationCleanup op_cleanup = {
+        .session = session,
+        .active = false
+    };
+    if (!blorp_tls_session_begin_io_op(session, &error_kind, &detail)) {
+        return blorp_tls_bytes_result_error(error_kind, detail);
+    }
+    op_cleanup.active = true;
+    blorp_CancelCleanupFrame cleanup_frame;
+    blorp_tls_operation_cleanup_push(&cleanup_frame, &op_cleanup);
+    blorp_TlsBytesResult result =
+        blorp_tls_backend_read_bytes(backend, session, max_bytes);
+    blorp_tls_operation_cleanup_end(&op_cleanup);
+    blorp_tls_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+blorp_TlsIntResult blorp_tls_write_raw(
+    blorp_TlsSession* session,
+    blorp_Bytes* data
+) {
+    blorp_TlsErrorKind error_kind = BLORP_TLS_ERROR_NONE;
+    const char* detail = NULL;
+    if (!blorp_tls_session_ready_for_io(session, &error_kind, &detail)) {
+        return blorp_tls_int_result_error(error_kind, detail);
+    }
+    if (!blorp_tcp_write_buffer_is_valid(data)) {
+        return blorp_tls_int_result_error(
+            BLORP_TLS_ERROR_INVALID_INPUT, "invalid data");
+    }
+    const blorp_TlsBackendOps* backend = NULL;
+    if (!blorp_tls_session_backend_ready(
+            session, &backend, &error_kind, &detail)) {
+        return blorp_tls_int_result_error(error_kind, detail);
+    }
+    blorp_TlsOperationCleanup op_cleanup = {
+        .session = session,
+        .active = false
+    };
+    if (!blorp_tls_session_begin_io_op(session, &error_kind, &detail)) {
+        return blorp_tls_int_result_error(error_kind, detail);
+    }
+    op_cleanup.active = true;
+    blorp_CancelCleanupFrame cleanup_frame;
+    blorp_tls_operation_cleanup_push(&cleanup_frame, &op_cleanup);
+    blorp_TlsIntResult result =
+        blorp_tls_backend_write_once(backend, session, data);
+    blorp_tls_operation_cleanup_end(&op_cleanup);
+    blorp_tls_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+blorp_TlsVoidResult blorp_tls_write_all_raw(
+    blorp_TlsSession* session,
+    blorp_Bytes* data
+) {
+    blorp_TlsErrorKind error_kind = BLORP_TLS_ERROR_NONE;
+    const char* detail = NULL;
+    if (!blorp_tls_session_ready_for_io(session, &error_kind, &detail)) {
+        return blorp_tls_void_result_error(error_kind, detail);
+    }
+    if (!blorp_tcp_write_buffer_is_valid(data)) {
+        return blorp_tls_void_result_error(
+            BLORP_TLS_ERROR_INVALID_INPUT, "invalid data");
+    }
+    const blorp_TlsBackendOps* backend = NULL;
+    if (!blorp_tls_session_backend_ready(
+            session, &backend, &error_kind, &detail)) {
+        return blorp_tls_void_result_error(error_kind, detail);
+    }
+    blorp_TlsOperationCleanup op_cleanup = {
+        .session = session,
+        .active = false
+    };
+    if (!blorp_tls_session_begin_io_op(session, &error_kind, &detail)) {
+        return blorp_tls_void_result_error(error_kind, detail);
+    }
+    op_cleanup.active = true;
+    blorp_CancelCleanupFrame cleanup_frame;
+    blorp_tls_operation_cleanup_push(&cleanup_frame, &op_cleanup);
+    blorp_TlsVoidResult result =
+        blorp_tls_backend_write_all_steps(backend, session, data);
+    blorp_tls_operation_cleanup_end(&op_cleanup);
+    blorp_tls_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+// ============================================================================
+// WebSocket Networking
+// ============================================================================
+
+blorp_String* blorp_sha1(blorp_String* s);
+
+static blorp_String* blorp_websocket_unsupported_detail(void) {
+    return blorp_string_literal(
+        "WebSocket backend operation is not available in this runtime");
+}
+
+static blorp_WebSocketSessionResult blorp_websocket_session_result_error(
+    blorp_WebSocketErrorKind kind,
+    const char* detail
+) {
+    return (blorp_WebSocketSessionResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_WebSocketSessionResult blorp_websocket_session_result_error_detail(
+    blorp_WebSocketErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_WebSocketSessionResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail ? detail : blorp_string_literal("")
+    };
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_void_result_error(
+    blorp_WebSocketErrorKind kind,
+    const char* detail
+) {
+    return (blorp_WebSocketVoidResult){
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_void_result_error_detail(
+    blorp_WebSocketErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_WebSocketVoidResult){
+        .error_kind = kind,
+        .detail = detail ? detail : blorp_string_literal("")
+    };
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_message_result_error(
+    blorp_WebSocketErrorKind kind,
+    const char* detail
+) {
+    return (blorp_WebSocketMessageResult){
+        .message_kind = BLORP_WEBSOCKET_MESSAGE_NONE,
+        .text = NULL,
+        .bytes = NULL,
+        .code = 0,
+        .reason = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_message_result_error_detail(
+    blorp_WebSocketErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_WebSocketMessageResult){
+        .message_kind = BLORP_WEBSOCKET_MESSAGE_NONE,
+        .text = NULL,
+        .bytes = NULL,
+        .code = 0,
+        .reason = NULL,
+        .error_kind = kind,
+        .detail = detail ? detail : blorp_string_literal("")
+    };
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_message_result_text(
+    blorp_String* text
+) {
+    return (blorp_WebSocketMessageResult){
+        .message_kind = BLORP_WEBSOCKET_MESSAGE_TEXT,
+        .text = text,
+        .bytes = NULL,
+        .code = 0,
+        .reason = NULL,
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_message_result_binary(
+    blorp_Bytes* bytes
+) {
+    return (blorp_WebSocketMessageResult){
+        .message_kind = BLORP_WEBSOCKET_MESSAGE_BINARY,
+        .text = NULL,
+        .bytes = bytes,
+        .code = 0,
+        .reason = NULL,
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_message_result_close(
+    long code,
+    blorp_String* reason
+) {
+    return (blorp_WebSocketMessageResult){
+        .message_kind = BLORP_WEBSOCKET_MESSAGE_CLOSE,
+        .text = NULL,
+        .bytes = NULL,
+        .code = code,
+        .reason = reason,
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_message_result_ping(
+    blorp_Bytes* bytes
+) {
+    return (blorp_WebSocketMessageResult){
+        .message_kind = BLORP_WEBSOCKET_MESSAGE_PING,
+        .text = NULL,
+        .bytes = bytes,
+        .code = 0,
+        .reason = NULL,
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_message_result_pong(
+    blorp_Bytes* bytes
+) {
+    return (blorp_WebSocketMessageResult){
+        .message_kind = BLORP_WEBSOCKET_MESSAGE_PONG,
+        .text = NULL,
+        .bytes = bytes,
+        .code = 0,
+        .reason = NULL,
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_void_result_ok(void) {
+    return (blorp_WebSocketVoidResult){
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+typedef struct {
+    blorp_Bytes* value;
+    blorp_WebSocketErrorKind error_kind;
+    blorp_String* detail;
+} blorp_WebSocketBytesResult;
+
+static blorp_WebSocketBytesResult blorp_websocket_bytes_result_ok(
+    blorp_Bytes* value
+) {
+    return (blorp_WebSocketBytesResult){
+        .value = value,
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_WebSocketBytesResult blorp_websocket_bytes_result_error(
+    blorp_WebSocketErrorKind kind,
+    const char* detail
+) {
+    return (blorp_WebSocketBytesResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = blorp_string_literal(detail)
+    };
+}
+
+static blorp_WebSocketBytesResult blorp_websocket_bytes_result_error_detail(
+    blorp_WebSocketErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_WebSocketBytesResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail ? detail : blorp_string_literal("")
+    };
+}
+
+typedef struct {
+    blorp_WebSocketTransportKind transport;
+    blorp_String* host;
+    bool host_is_ipv6_literal;
+    long port;
+    blorp_String* path;
+    blorp_String* query;
+} blorp_WebSocketConnectTarget;
+
+typedef struct blorp_WebSocketBackendOps {
+    blorp_WebSocketBackendKind kind;
+    unsigned capabilities;
+    void (*close)(blorp_WebSocketSession* session);
+    blorp_WebSocketSessionResult (*connect)(
+        const blorp_WebSocketConnectTarget* target
+    );
+    blorp_WebSocketVoidResult (*handshake)(
+        blorp_WebSocketSession* session,
+        const blorp_WebSocketConnectTarget* target
+    );
+    blorp_WebSocketMessageResult (*receive)(blorp_WebSocketSession* session);
+    blorp_WebSocketVoidResult (*send_text)(
+        blorp_WebSocketSession* session,
+        blorp_String* text
+    );
+    blorp_WebSocketVoidResult (*send_binary)(
+        blorp_WebSocketSession* session,
+        blorp_Bytes* bytes
+    );
+    blorp_WebSocketVoidResult (*send_ping)(
+        blorp_WebSocketSession* session,
+        blorp_Bytes* bytes
+    );
+    blorp_WebSocketVoidResult (*send_pong)(
+        blorp_WebSocketSession* session,
+        blorp_Bytes* bytes
+    );
+    blorp_WebSocketVoidResult (*send_close)(
+        blorp_WebSocketSession* session,
+        long code,
+        blorp_String* reason
+    );
+} blorp_WebSocketBackendOps;
+
+enum {
+    BLORP_WEBSOCKET_BACKEND_CAP_NONE = 0u,
+    BLORP_WEBSOCKET_BACKEND_CAP_CONNECT = 1u << 0,
+    BLORP_WEBSOCKET_BACKEND_CAP_HANDSHAKE = 1u << 1,
+    BLORP_WEBSOCKET_BACKEND_CAP_RECEIVE = 1u << 2,
+    BLORP_WEBSOCKET_BACKEND_CAP_SEND_TEXT = 1u << 3,
+    BLORP_WEBSOCKET_BACKEND_CAP_SEND_BINARY = 1u << 4,
+    BLORP_WEBSOCKET_BACKEND_CAP_SEND_CONTROL = 1u << 5,
+    BLORP_WEBSOCKET_BACKEND_CAP_NATIVE_IO =
+        BLORP_WEBSOCKET_BACKEND_CAP_CONNECT |
+        BLORP_WEBSOCKET_BACKEND_CAP_HANDSHAKE |
+        BLORP_WEBSOCKET_BACKEND_CAP_RECEIVE |
+        BLORP_WEBSOCKET_BACKEND_CAP_SEND_TEXT |
+        BLORP_WEBSOCKET_BACKEND_CAP_SEND_BINARY |
+        BLORP_WEBSOCKET_BACKEND_CAP_SEND_CONTROL
+};
+
+static blorp_WebSocketSessionResult blorp_websocket_session_result_ok(
+    blorp_WebSocketSession* session
+) {
+    return (blorp_WebSocketSessionResult){
+        .handle = session,
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static void blorp_websocket_backend_close_unsupported(
+    blorp_WebSocketSession* session
+) {
+    (void)session;
+}
+
+static bool blorp_websocket_session_ready_for_io(
+    blorp_WebSocketSession* session,
+    blorp_WebSocketErrorKind* kind,
+    const char** detail
+) {
+    if (!session) {
+        *kind = BLORP_WEBSOCKET_ERROR_CLOSED;
+        *detail = "websocket session is closed";
+        return false;
+    }
+    switch (session->state) {
+        case BLORP_WEBSOCKET_SESSION_OPEN:
+            return true;
+        case BLORP_WEBSOCKET_SESSION_HANDSHAKING:
+            *kind = BLORP_WEBSOCKET_ERROR_BUSY;
+            *detail = "websocket handshake is not complete";
+            return false;
+        case BLORP_WEBSOCKET_SESSION_CLOSE_RECEIVED:
+            *kind = BLORP_WEBSOCKET_ERROR_CLOSED;
+            *detail = "websocket peer started closing";
+            return false;
+        case BLORP_WEBSOCKET_SESSION_CLOSING:
+        case BLORP_WEBSOCKET_SESSION_CLOSED:
+            *kind = BLORP_WEBSOCKET_ERROR_CLOSED;
+            *detail = "websocket session is closed";
+            return false;
+        case BLORP_WEBSOCKET_SESSION_FAILED:
+            *kind = BLORP_WEBSOCKET_ERROR_OTHER;
+            *detail = "websocket session is failed";
+            return false;
+    }
+    *kind = BLORP_WEBSOCKET_ERROR_OTHER;
+    *detail = "invalid websocket session state";
+    return false;
+}
+
+static bool blorp_websocket_session_ready_for_close_send(
+    blorp_WebSocketSession* session,
+    blorp_WebSocketErrorKind* kind,
+    const char** detail
+) {
+    if (!session) {
+        *kind = BLORP_WEBSOCKET_ERROR_CLOSED;
+        *detail = "websocket session is closed";
+        return false;
+    }
+    switch (session->state) {
+        case BLORP_WEBSOCKET_SESSION_OPEN:
+        case BLORP_WEBSOCKET_SESSION_CLOSE_RECEIVED:
+            return true;
+        case BLORP_WEBSOCKET_SESSION_HANDSHAKING:
+            *kind = BLORP_WEBSOCKET_ERROR_BUSY;
+            *detail = "websocket handshake is not complete";
+            return false;
+        case BLORP_WEBSOCKET_SESSION_CLOSING:
+        case BLORP_WEBSOCKET_SESSION_CLOSED:
+            *kind = BLORP_WEBSOCKET_ERROR_CLOSED;
+            *detail = "websocket session is closed";
+            return false;
+        case BLORP_WEBSOCKET_SESSION_FAILED:
+            *kind = BLORP_WEBSOCKET_ERROR_OTHER;
+            *detail = "websocket session is failed";
+            return false;
+    }
+    *kind = BLORP_WEBSOCKET_ERROR_OTHER;
+    *detail = "invalid websocket session state";
+    return false;
+}
+
+static blorp_WebSocketSessionResult blorp_websocket_backend_connect_unsupported(
+    const blorp_WebSocketConnectTarget* target
+) {
+    (void)target;
+    return (blorp_WebSocketSessionResult){
+        .handle = NULL,
+        .error_kind = BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+        .detail = blorp_websocket_unsupported_detail()
+    };
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_backend_handshake_unsupported(
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketConnectTarget* target
+) {
+    (void)session;
+    (void)target;
+    return blorp_websocket_void_result_error_detail(
+        BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+        blorp_websocket_unsupported_detail());
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_backend_receive_unsupported(
+    blorp_WebSocketSession* session
+) {
+    (void)session;
+    return blorp_websocket_message_result_error_detail(
+        BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+        blorp_websocket_unsupported_detail());
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_validate_text_arg(
+    blorp_String* text
+);
+static blorp_WebSocketVoidResult blorp_websocket_validate_bytes_arg(
+    blorp_Bytes* bytes,
+    const char* missing_detail,
+    const char* invalid_detail
+);
+static blorp_WebSocketVoidResult blorp_websocket_validate_control_bytes_arg(
+    blorp_Bytes* bytes,
+    const char* missing_detail,
+    const char* invalid_detail,
+    const char* too_large_detail
+);
+static bool blorp_websocket_close_code_is_valid(long code);
+static blorp_WebSocketVoidResult blorp_websocket_validate_close_args(
+    long code,
+    blorp_String* reason
+);
+static blorp_WebSocketVoidResult blorp_websocket_validate_received_close_args(
+    long code,
+    blorp_String* reason
+);
+
+static void blorp_websocket_message_result_release_payload(
+    blorp_WebSocketMessageResult* result
+) {
+    if (!result) return;
+    if (result->text) blorp_release(result->text);
+    if (result->bytes) blorp_release(result->bytes);
+    if (result->reason && result->reason != result->text) {
+        blorp_release(result->reason);
+    }
+    result->message_kind = BLORP_WEBSOCKET_MESSAGE_NONE;
+    result->text = NULL;
+    result->bytes = NULL;
+    result->code = 0;
+    result->reason = NULL;
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_message_payload_error(
+    blorp_WebSocketMessageResult result,
+    blorp_WebSocketVoidResult validation
+) {
+    blorp_websocket_message_result_release_payload(&result);
+    if (result.detail) blorp_release(result.detail);
+    return blorp_websocket_message_result_error_detail(
+        validation.error_kind,
+        validation.detail);
+}
+
+static blorp_WebSocketMessageResult blorp_websocket_normalize_message_result(
+    blorp_WebSocketMessageResult result
+) {
+    if (result.error_kind == BLORP_WEBSOCKET_ERROR_NONE) {
+        blorp_WebSocketVoidResult validation;
+        switch (result.message_kind) {
+            case BLORP_WEBSOCKET_MESSAGE_TEXT:
+                validation = blorp_websocket_validate_text_arg(result.text);
+                break;
+            case BLORP_WEBSOCKET_MESSAGE_BINARY:
+                validation = blorp_websocket_validate_bytes_arg(
+                    result.bytes,
+                    "websocket binary payload is missing",
+                    "invalid websocket binary payload");
+                break;
+            case BLORP_WEBSOCKET_MESSAGE_CLOSE:
+                validation = blorp_websocket_validate_received_close_args(
+                    result.code,
+                    result.reason);
+                break;
+            case BLORP_WEBSOCKET_MESSAGE_PING:
+                validation = blorp_websocket_validate_control_bytes_arg(
+                    result.bytes,
+                    "websocket ping payload is missing",
+                    "invalid websocket ping payload",
+                    "websocket ping payload must be 125 bytes or fewer");
+                break;
+            case BLORP_WEBSOCKET_MESSAGE_PONG:
+                validation = blorp_websocket_validate_control_bytes_arg(
+                    result.bytes,
+                    "websocket pong payload is missing",
+                    "invalid websocket pong payload",
+                    "websocket pong payload must be 125 bytes or fewer");
+                break;
+            case BLORP_WEBSOCKET_MESSAGE_NONE:
+            default:
+                blorp_websocket_message_result_release_payload(&result);
+                if (result.detail) blorp_release(result.detail);
+                return blorp_websocket_message_result_error(
+                    BLORP_WEBSOCKET_ERROR_OTHER,
+                    "websocket backend returned no message");
+        }
+        if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+            return blorp_websocket_message_payload_error(result, validation);
+        }
+        if (validation.detail) blorp_release(validation.detail);
+        if (result.detail) {
+            blorp_release(result.detail);
+            result.detail = NULL;
+        }
+        return result;
+    }
+    blorp_websocket_message_result_release_payload(&result);
+    if (!result.detail) result.detail = blorp_string_literal("");
+    return result;
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_backend_send_text_unsupported(
+    blorp_WebSocketSession* session,
+    blorp_String* text
+) {
+    (void)session;
+    (void)text;
+    return blorp_websocket_void_result_error_detail(
+        BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+        blorp_websocket_unsupported_detail());
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_backend_send_binary_unsupported(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    (void)session;
+    (void)bytes;
+    return blorp_websocket_void_result_error_detail(
+        BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+        blorp_websocket_unsupported_detail());
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_backend_send_ping_unsupported(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    (void)session;
+    (void)bytes;
+    return blorp_websocket_void_result_error_detail(
+        BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+        blorp_websocket_unsupported_detail());
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_backend_send_pong_unsupported(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    (void)session;
+    (void)bytes;
+    return blorp_websocket_void_result_error_detail(
+        BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+        blorp_websocket_unsupported_detail());
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_backend_send_close_unsupported(
+    blorp_WebSocketSession* session,
+    long code,
+    blorp_String* reason
+) {
+    (void)session;
+    (void)code;
+    (void)reason;
+    return blorp_websocket_void_result_error_detail(
+        BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+        blorp_websocket_unsupported_detail());
+}
+
+static const blorp_WebSocketBackendOps BLORP_WEBSOCKET_UNSUPPORTED_BACKEND = {
+    .kind = BLORP_WEBSOCKET_BACKEND_UNSUPPORTED,
+    .capabilities = BLORP_WEBSOCKET_BACKEND_CAP_NONE,
+    .close = blorp_websocket_backend_close_unsupported,
+    .connect = blorp_websocket_backend_connect_unsupported,
+    .handshake = blorp_websocket_backend_handshake_unsupported,
+    .receive = blorp_websocket_backend_receive_unsupported,
+    .send_text = blorp_websocket_backend_send_text_unsupported,
+    .send_binary = blorp_websocket_backend_send_binary_unsupported,
+    .send_ping = blorp_websocket_backend_send_ping_unsupported,
+    .send_pong = blorp_websocket_backend_send_pong_unsupported,
+    .send_close = blorp_websocket_backend_send_close_unsupported
+};
+
+static const blorp_WebSocketBackendOps BLORP_WEBSOCKET_RUNTIME_BACKEND;
+
+static const blorp_WebSocketBackendOps* blorp_websocket_active_backend(void) {
+    return &BLORP_WEBSOCKET_RUNTIME_BACKEND;
+}
+
+static bool blorp_websocket_backend_ops_complete(
+    const blorp_WebSocketBackendOps* backend
+) {
+    return backend && backend->close && backend->connect &&
+           backend->handshake && backend->receive && backend->send_text &&
+           backend->send_binary && backend->send_ping && backend->send_pong &&
+           backend->send_close;
+}
+
+static bool blorp_websocket_backend_has_capabilities(
+    const blorp_WebSocketBackendOps* backend,
+    unsigned required_capabilities
+) {
+    return backend &&
+           (backend->capabilities & required_capabilities) ==
+               required_capabilities;
+}
+
+static bool blorp_websocket_backend_kind_can_provide_native_io(
+    blorp_WebSocketBackendKind kind
+) {
+    switch (kind) {
+        case BLORP_WEBSOCKET_BACKEND_RUNTIME:
+        case BLORP_WEBSOCKET_BACKEND_TEST:
+            return true;
+        case BLORP_WEBSOCKET_BACKEND_UNSUPPORTED:
+        default:
+            return false;
+    }
+}
+
+static bool blorp_websocket_backend_native_available(
+    const blorp_WebSocketBackendOps* backend
+) {
+    return backend &&
+           blorp_websocket_backend_kind_can_provide_native_io(backend->kind) &&
+           blorp_websocket_backend_ops_complete(backend) &&
+           blorp_websocket_backend_has_capabilities(
+               backend,
+               BLORP_WEBSOCKET_BACKEND_CAP_NATIVE_IO);
+}
+
+static bool blorp_websocket_backend_supports(
+    const blorp_WebSocketBackendOps* backend,
+    unsigned capability
+) {
+    return blorp_websocket_backend_has_capabilities(backend, capability);
+}
+
+static bool blorp_websocket_session_backend_ready(
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketBackendOps** backend,
+    blorp_WebSocketErrorKind* kind,
+    const char** detail
+) {
+    const blorp_WebSocketBackendOps* selected = session && session->backend
+        ? session->backend
+        : blorp_websocket_active_backend();
+    if (!blorp_websocket_backend_ops_complete(selected)) {
+        *kind = BLORP_WEBSOCKET_ERROR_OTHER;
+        *detail = "websocket backend is incomplete";
+        *backend = NULL;
+        return false;
+    }
+    *backend = selected;
+    return true;
+}
+
+typedef enum {
+    BLORP_WEBSOCKET_OPERATION_READ = 0,
+    BLORP_WEBSOCKET_OPERATION_WRITE = 1
+} blorp_WebSocketOperationKind;
+
+typedef struct {
+    blorp_WebSocketSession* session;
+    blorp_WebSocketOperationKind operation;
+    bool active;
+} blorp_WebSocketOperationCleanup;
+
+typedef struct {
+    blorp_WebSocketSession* session;
+    bool active;
+} blorp_WebSocketProvisionalSessionCleanup;
+
+static blorp_WebSocketOperationState* blorp_websocket_operation_slot(
+    blorp_WebSocketSession* session,
+    blorp_WebSocketOperationKind operation
+) {
+    if (!session) return NULL;
+    switch (operation) {
+        case BLORP_WEBSOCKET_OPERATION_READ:
+            return &session->read_operation_state;
+        case BLORP_WEBSOCKET_OPERATION_WRITE:
+            return &session->write_operation_state;
+    }
+    return NULL;
+}
+
+static bool blorp_websocket_session_begin_operation(
+    blorp_WebSocketSession* session,
+    blorp_WebSocketOperationKind operation,
+    blorp_WebSocketErrorKind* kind,
+    const char** detail
+) {
+    blorp_WebSocketOperationState* slot =
+        blorp_websocket_operation_slot(session, operation);
+    blorp_WebSocketOperationState expected = BLORP_WEBSOCKET_OPERATION_NONE;
+    if (!slot || !__atomic_compare_exchange_n(
+            slot,
+            &expected,
+            BLORP_WEBSOCKET_OPERATION_ACTIVE,
+            false,
+            __ATOMIC_ACQ_REL,
+            __ATOMIC_ACQUIRE)) {
+        *kind = BLORP_WEBSOCKET_ERROR_BUSY;
+        *detail = operation == BLORP_WEBSOCKET_OPERATION_READ
+            ? "websocket receive already in progress"
+            : "websocket write already in progress";
+        return false;
+    }
+    return true;
+}
+
+static void blorp_websocket_operation_cleanup_end(void* value) {
+    blorp_WebSocketOperationCleanup* cleanup =
+        (blorp_WebSocketOperationCleanup*)value;
+    if (!cleanup || !cleanup->active || !cleanup->session) return;
+    blorp_WebSocketOperationState* slot =
+        blorp_websocket_operation_slot(cleanup->session, cleanup->operation);
+    if (slot) {
+        __atomic_store_n(
+            slot,
+            BLORP_WEBSOCKET_OPERATION_NONE,
+            __ATOMIC_RELEASE);
+    }
+    cleanup->active = false;
+}
+
+static void blorp_websocket_operation_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_WebSocketOperationCleanup* cleanup
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)cleanup;
+#else
+    __blorp_task_cleanup_push_slow(
+        frame,
+        cleanup,
+        cleanup,
+        blorp_websocket_operation_cleanup_end);
+#endif
+}
+
+static void blorp_websocket_operation_cleanup_pop(
+    blorp_WebSocketOperationCleanup* cleanup
+) {
+#if defined(__clang_analyzer__)
+    (void)cleanup;
+#else
+    __blorp_task_cleanup_pop_slot_slow(cleanup);
+#endif
+}
+
+static void blorp_websocket_provisional_session_cleanup_release(void* value) {
+    blorp_WebSocketProvisionalSessionCleanup* cleanup =
+        (blorp_WebSocketProvisionalSessionCleanup*)value;
+    if (!cleanup || !cleanup->active || !cleanup->session) return;
+    cleanup->active = false;
+    blorp_release(cleanup->session);
+    cleanup->session = NULL;
+}
+
+static bool blorp_websocket_begin_operation_cleanup(
+    blorp_WebSocketSession* session,
+    blorp_WebSocketOperationKind operation,
+    blorp_WebSocketOperationCleanup* cleanup,
+    blorp_CancelCleanupFrame* cleanup_frame,
+    blorp_WebSocketErrorKind* kind,
+    const char** detail
+) {
+    cleanup->session = session;
+    cleanup->operation = operation;
+    cleanup->active = false;
+    if (!blorp_websocket_session_begin_operation(
+            session,
+            operation,
+            kind,
+            detail)) {
+        return false;
+    }
+    cleanup->active = true;
+    blorp_websocket_operation_cleanup_push(cleanup_frame, cleanup);
+    return true;
+}
+
+static bool blorp_websocket_begin_write_cleanup(
+    blorp_WebSocketSession* session,
+    blorp_WebSocketOperationCleanup* cleanup,
+    blorp_CancelCleanupFrame* cleanup_frame,
+    blorp_WebSocketVoidResult* error_result
+) {
+    blorp_WebSocketErrorKind error_kind = BLORP_WEBSOCKET_ERROR_NONE;
+    const char* detail = NULL;
+    if (blorp_websocket_begin_operation_cleanup(
+            session,
+            BLORP_WEBSOCKET_OPERATION_WRITE,
+            cleanup,
+            cleanup_frame,
+            &error_kind,
+            &detail)) {
+        return true;
+    }
+    *error_result = blorp_websocket_void_result_error(error_kind, detail);
+    return false;
+}
+
+static blorp_WebSocketTransportOwner
+blorp_websocket_transport_owner_none(void) {
+    return (blorp_WebSocketTransportOwner){
+        .kind = BLORP_WEBSOCKET_TRANSPORT_OWNER_NONE,
+        .handle.tcp_stream = NULL
+    };
+}
+
+static blorp_WebSocketTransportOwner
+blorp_websocket_transport_owner_retain_tcp(blorp_TcpStream* stream) {
+    if (!stream) return blorp_websocket_transport_owner_none();
+    return (blorp_WebSocketTransportOwner){
+        .kind = BLORP_WEBSOCKET_TRANSPORT_OWNER_TCP_STREAM,
+        .handle.tcp_stream = (blorp_TcpStream*)blorp_retain(stream)
+    };
+}
+
+static blorp_WebSocketTransportOwner
+blorp_websocket_transport_owner_own_tcp(blorp_TcpStream* stream) {
+    if (!stream) return blorp_websocket_transport_owner_none();
+    return (blorp_WebSocketTransportOwner){
+        .kind = BLORP_WEBSOCKET_TRANSPORT_OWNER_TCP_STREAM,
+        .handle.tcp_stream = stream
+    };
+}
+
+static blorp_WebSocketTransportOwner
+blorp_websocket_transport_owner_retain_tls(blorp_TlsSession* session) {
+    if (!session) return blorp_websocket_transport_owner_none();
+    return (blorp_WebSocketTransportOwner){
+        .kind = BLORP_WEBSOCKET_TRANSPORT_OWNER_TLS_SESSION,
+        .handle.tls_session = (blorp_TlsSession*)blorp_retain(session)
+    };
+}
+
+static blorp_WebSocketTransportOwner
+blorp_websocket_transport_owner_own_tls(blorp_TlsSession* session) {
+    if (!session) return blorp_websocket_transport_owner_none();
+    return (blorp_WebSocketTransportOwner){
+        .kind = BLORP_WEBSOCKET_TRANSPORT_OWNER_TLS_SESSION,
+        .handle.tls_session = session
+    };
+}
+
+static void blorp_websocket_transport_owner_release(
+    blorp_WebSocketTransportOwner* owner
+) {
+    if (!owner) return;
+    switch (owner->kind) {
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_TCP_STREAM:
+            if (owner->handle.tcp_stream) {
+                blorp_release(owner->handle.tcp_stream);
+            }
+            break;
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_TLS_SESSION:
+            if (owner->handle.tls_session) {
+                blorp_release(owner->handle.tls_session);
+            }
+            break;
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_NONE:
+        default:
+            break;
+    }
+    *owner = blorp_websocket_transport_owner_none();
+}
+
+static void blorp_websocket_tcp_stream_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_TcpStream** slot
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)slot;
+#else
+    __blorp_task_cleanup_push_slow(frame, slot, *slot, blorp_release);
+#endif
+}
+
+static void blorp_websocket_tcp_stream_cleanup_pop(
+    blorp_TcpStream** slot
+) {
+#if defined(__clang_analyzer__)
+    (void)slot;
+#else
+    __blorp_task_cleanup_pop_slot_slow(slot);
+#endif
+}
+
+static blorp_WebSocketErrorKind blorp_websocket_error_from_tcp(
+    blorp_TcpErrorKind kind
+) {
+    switch (kind) {
+        case BLORP_TCP_ERROR_NONE:
+            return BLORP_WEBSOCKET_ERROR_NONE;
+        case BLORP_TCP_ERROR_TIMED_OUT:
+            return BLORP_WEBSOCKET_ERROR_TIMED_OUT;
+        case BLORP_TCP_ERROR_CLOSED:
+            return BLORP_WEBSOCKET_ERROR_CLOSED;
+        case BLORP_TCP_ERROR_BUSY:
+            return BLORP_WEBSOCKET_ERROR_BUSY;
+        case BLORP_TCP_ERROR_UNSUPPORTED:
+            return BLORP_WEBSOCKET_ERROR_UNSUPPORTED;
+        case BLORP_TCP_ERROR_INVALID_INPUT:
+        case BLORP_TCP_ERROR_DNS:
+        case BLORP_TCP_ERROR_CONNECTION_FAILED:
+        case BLORP_TCP_ERROR_INTERRUPTED:
+        case BLORP_TCP_ERROR_OTHER:
+        default:
+            return BLORP_WEBSOCKET_ERROR_TRANSPORT;
+    }
+}
+
+static blorp_WebSocketErrorKind blorp_websocket_error_from_tls(
+    blorp_TlsErrorKind kind
+) {
+    switch (kind) {
+        case BLORP_TLS_ERROR_NONE:
+            return BLORP_WEBSOCKET_ERROR_NONE;
+        case BLORP_TLS_ERROR_TIMED_OUT:
+            return BLORP_WEBSOCKET_ERROR_TIMED_OUT;
+        case BLORP_TLS_ERROR_CLOSED:
+            return BLORP_WEBSOCKET_ERROR_CLOSED;
+        case BLORP_TLS_ERROR_BUSY:
+            return BLORP_WEBSOCKET_ERROR_BUSY;
+        case BLORP_TLS_ERROR_HANDSHAKE_FAILED:
+        case BLORP_TLS_ERROR_TRANSPORT:
+        case BLORP_TLS_ERROR_CERTIFICATE:
+        case BLORP_TLS_ERROR_PROTOCOL:
+            return BLORP_WEBSOCKET_ERROR_TLS;
+        case BLORP_TLS_ERROR_UNSUPPORTED:
+            return BLORP_WEBSOCKET_ERROR_UNSUPPORTED;
+        case BLORP_TLS_ERROR_INVALID_INPUT:
+        case BLORP_TLS_ERROR_OTHER:
+        default:
+            return BLORP_WEBSOCKET_ERROR_OTHER;
+    }
+}
+
+static bool blorp_websocket_read_buffer_has_bytes(
+    const blorp_WebSocketSession* session
+) {
+    return session && session->read_buffer.bytes;
+}
+
+static void blorp_websocket_read_buffer_clear(
+    blorp_WebSocketSession* session
+) {
+    if (!session) return;
+    if (session->read_buffer.bytes) {
+        blorp_release(session->read_buffer.bytes);
+    }
+    session->read_buffer.bytes = NULL;
+    session->read_buffer.offset = 0;
+}
+
+static bool blorp_websocket_read_buffer_is_valid(
+    const blorp_WebSocketSession* session
+) {
+    if (!session) return false;
+    blorp_Bytes* bytes = (blorp_Bytes*)session->read_buffer.bytes;
+    long offset = session->read_buffer.offset;
+    if (!bytes) return offset == 0;
+    return offset >= 0 && bytes->len >= 0 && bytes->capacity >= 0 &&
+           bytes->len <= bytes->capacity && offset <= bytes->len;
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_read_buffer_store_copy(
+    blorp_WebSocketSession* session,
+    const unsigned char* data,
+    long len
+) {
+    if (!session) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_CLOSED,
+            "websocket session is closed");
+    }
+    if (len < 0 || (len > 0 && !data)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket read buffer source is invalid");
+    }
+    if (len == 0) return blorp_websocket_void_result_ok();
+    if (blorp_websocket_read_buffer_has_bytes(session)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket read buffer already contains data");
+    }
+    blorp_Bytes* bytes = blorp_bytes_new(len);
+    memcpy(bytes->data, data, (size_t)len);
+    session->read_buffer.bytes = (struct blorp_Bytes*)bytes;
+    session->read_buffer.offset = 0;
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketBytesResult blorp_websocket_read_buffer_take(
+    blorp_WebSocketSession* session,
+    long max_bytes
+) {
+    if (!blorp_websocket_read_buffer_is_valid(session)) {
+        blorp_websocket_read_buffer_clear(session);
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket read buffer is invalid");
+    }
+    blorp_Bytes* bytes = (blorp_Bytes*)session->read_buffer.bytes;
+    if (!bytes) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket read buffer is empty");
+    }
+    if (max_bytes <= 0) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket read size must be positive");
+    }
+    long available = bytes->len - session->read_buffer.offset;
+    long take = available < max_bytes ? available : max_bytes;
+    blorp_Bytes* out = blorp_bytes_new(take);
+    if (take > 0) {
+        memcpy(
+            out->data,
+            bytes->data + session->read_buffer.offset,
+            (size_t)take);
+    }
+    session->read_buffer.offset += take;
+    if (session->read_buffer.offset == bytes->len) {
+        blorp_websocket_read_buffer_clear(session);
+    }
+    return blorp_websocket_bytes_result_ok(out);
+}
+
+static blorp_WebSocketBytesResult
+blorp_websocket_transport_read_bytes_uncached(
+    blorp_WebSocketSession* session,
+    long max_bytes
+) {
+    if (!session) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_CLOSED,
+            "websocket session is closed");
+    }
+    switch (session->transport_owner.kind) {
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_TCP_STREAM: {
+            blorp_TcpBytesResult result = blorp_tcp_read_raw(
+                session->transport_owner.handle.tcp_stream,
+                max_bytes);
+            if (result.error_kind == BLORP_TCP_ERROR_NONE) {
+                return blorp_websocket_bytes_result_ok(result.value);
+            }
+            return blorp_websocket_bytes_result_error_detail(
+                blorp_websocket_error_from_tcp(result.error_kind),
+                result.detail);
+        }
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_TLS_SESSION: {
+            blorp_TlsBytesResult result = blorp_tls_read_raw(
+                session->transport_owner.handle.tls_session,
+                max_bytes);
+            if (result.error_kind == BLORP_TLS_ERROR_NONE) {
+                return blorp_websocket_bytes_result_ok(result.value);
+            }
+            return blorp_websocket_bytes_result_error_detail(
+                blorp_websocket_error_from_tls(result.error_kind),
+                result.detail);
+        }
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_NONE:
+        default:
+            return blorp_websocket_bytes_result_error(
+                BLORP_WEBSOCKET_ERROR_OTHER,
+                "websocket session has no transport");
+    }
+}
+
+static blorp_WebSocketBytesResult blorp_websocket_transport_read_bytes(
+    blorp_WebSocketSession* session,
+    long max_bytes
+) {
+    if (!session) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_CLOSED,
+            "websocket session is closed");
+    }
+    if (blorp_websocket_read_buffer_has_bytes(session)) {
+        return blorp_websocket_read_buffer_take(session, max_bytes);
+    }
+    return blorp_websocket_transport_read_bytes_uncached(session, max_bytes);
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_transport_read_exact_into(
+    blorp_WebSocketSession* session,
+    unsigned char* out,
+    long byte_count
+) {
+    if (byte_count < 0 || byte_count > BLORP_WEBSOCKET_MAX_FRAME_BYTES) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket frame is too large");
+    }
+    if (byte_count > 0 && !out) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket exact-read destination is missing");
+    }
+    long filled = 0;
+    while (filled < byte_count) {
+        long remaining = byte_count - filled;
+        blorp_WebSocketBytesResult chunk_result =
+            blorp_websocket_transport_read_bytes(session, remaining);
+        if (chunk_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+            return blorp_websocket_void_result_error_detail(
+                chunk_result.error_kind,
+                chunk_result.detail);
+        }
+        blorp_Bytes* chunk = chunk_result.value;
+        if (!chunk || chunk->len < 0 || chunk->capacity < 0 ||
+            chunk->len > chunk->capacity || chunk->len > remaining) {
+            if (chunk) blorp_release(chunk);
+            if (chunk_result.detail) blorp_release(chunk_result.detail);
+            return blorp_websocket_void_result_error(
+                BLORP_WEBSOCKET_ERROR_OTHER,
+                "websocket transport returned an invalid read chunk");
+        }
+        if (chunk->len == 0) {
+            blorp_release(chunk);
+            if (chunk_result.detail) blorp_release(chunk_result.detail);
+            return blorp_websocket_void_result_error(
+                BLORP_WEBSOCKET_ERROR_CLOSED,
+                "transport closed while reading websocket frame");
+        }
+        memcpy(out + filled, chunk->data, (size_t)chunk->len);
+        filled += chunk->len;
+        blorp_release(chunk);
+        if (chunk_result.detail) blorp_release(chunk_result.detail);
+    }
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_transport_write_all(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    if (!session) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_CLOSED,
+            "websocket session is closed");
+    }
+    switch (session->transport_owner.kind) {
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_TCP_STREAM: {
+            blorp_TcpVoidResult result = blorp_tcp_write_all_raw(
+                session->transport_owner.handle.tcp_stream,
+                bytes);
+            if (result.error_kind == BLORP_TCP_ERROR_NONE) {
+                return blorp_websocket_void_result_ok();
+            }
+            return blorp_websocket_void_result_error_detail(
+                blorp_websocket_error_from_tcp(result.error_kind),
+                result.detail);
+        }
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_TLS_SESSION: {
+            blorp_TlsVoidResult result = blorp_tls_write_all_raw(
+                session->transport_owner.handle.tls_session,
+                bytes);
+            if (result.error_kind == BLORP_TLS_ERROR_NONE) {
+                return blorp_websocket_void_result_ok();
+            }
+            return blorp_websocket_void_result_error_detail(
+                blorp_websocket_error_from_tls(result.error_kind),
+                result.detail);
+        }
+        case BLORP_WEBSOCKET_TRANSPORT_OWNER_NONE:
+        default:
+            return blorp_websocket_void_result_error(
+                BLORP_WEBSOCKET_ERROR_OTHER,
+                "websocket session has no transport");
+    }
+}
+
+typedef enum {
+    BLORP_WEBSOCKET_OPCODE_TEXT = 1,
+    BLORP_WEBSOCKET_OPCODE_BINARY = 2,
+    BLORP_WEBSOCKET_OPCODE_CLOSE = 8,
+    BLORP_WEBSOCKET_OPCODE_PING = 9,
+    BLORP_WEBSOCKET_OPCODE_PONG = 10
+} blorp_WebSocketOpcode;
+
+static bool blorp_websocket_opcode_is_valid(long opcode) {
+    switch (opcode) {
+        case BLORP_WEBSOCKET_OPCODE_TEXT:
+        case BLORP_WEBSOCKET_OPCODE_BINARY:
+        case BLORP_WEBSOCKET_OPCODE_CLOSE:
+        case BLORP_WEBSOCKET_OPCODE_PING:
+        case BLORP_WEBSOCKET_OPCODE_PONG:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool blorp_websocket_opcode_is_control(long opcode) {
+    return opcode == BLORP_WEBSOCKET_OPCODE_CLOSE ||
+           opcode == BLORP_WEBSOCKET_OPCODE_PING ||
+           opcode == BLORP_WEBSOCKET_OPCODE_PONG;
+}
+
+static void blorp_websocket_frame_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_Bytes** slot
+);
+
+static void blorp_websocket_frame_cleanup_pop(blorp_Bytes** slot);
+
+static blorp_WebSocketBytesResult blorp_websocket_build_client_frame(
+    long opcode,
+    blorp_Bytes* payload
+) {
+    if (!blorp_websocket_opcode_is_valid(opcode)) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "invalid websocket frame opcode");
+    }
+    blorp_WebSocketVoidResult payload_validation =
+        blorp_websocket_validate_bytes_arg(
+            payload,
+            "websocket frame payload is missing",
+            "invalid websocket frame payload");
+    if (payload_validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return blorp_websocket_bytes_result_error_detail(
+            payload_validation.error_kind,
+            payload_validation.detail);
+    }
+    if (payload_validation.detail) blorp_release(payload_validation.detail);
+    if (blorp_websocket_opcode_is_control(opcode) &&
+        payload->len > BLORP_WEBSOCKET_CONTROL_MAX_PAYLOAD_BYTES) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket control frame payload must be 125 bytes or fewer");
+    }
+
+    long header_len = 2;
+    if (payload->len >= 65536) {
+        header_len += 8;
+    } else if (payload->len >= 126) {
+        header_len += 2;
+    }
+    header_len += 4;
+    if (payload->len > LONG_MAX - header_len) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket frame is too large");
+    }
+
+    blorp_Bytes* frame = blorp_bytes_new(header_len + payload->len);
+    frame->data[0] = (unsigned char)(0x80 | (opcode & 0x0f));
+    long mask_offset = 2;
+    if (payload->len < 126) {
+        frame->data[1] = (unsigned char)(0x80 | payload->len);
+    } else if (payload->len < 65536) {
+        frame->data[1] = 0x80 | 126;
+        frame->data[2] = (unsigned char)((payload->len >> 8) & 0xff);
+        frame->data[3] = (unsigned char)(payload->len & 0xff);
+        mask_offset = 4;
+    } else {
+        frame->data[1] = 0x80 | 127;
+        uint64_t len = (uint64_t)payload->len;
+        for (int i = 0; i < 8; i++) {
+            frame->data[2 + i] =
+                (unsigned char)((len >> (56 - (i * 8))) & 0xffU);
+        }
+        mask_offset = 10;
+    }
+
+    unsigned char* mask = frame->data + mask_offset;
+    blorp_fill_random_or_die(mask, 4);
+    long payload_offset = mask_offset + 4;
+    for (long i = 0; i < payload->len; i++) {
+        frame->data[payload_offset + i] =
+            payload->data[i] ^ mask[i % 4];
+    }
+    return blorp_websocket_bytes_result_ok(frame);
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_send_client_frame(
+    blorp_WebSocketSession* session,
+    long opcode,
+    blorp_Bytes* payload
+) {
+    blorp_WebSocketBytesResult frame_result =
+        blorp_websocket_build_client_frame(opcode, payload);
+    if (frame_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return blorp_websocket_void_result_error_detail(
+            frame_result.error_kind,
+            frame_result.detail);
+    }
+    blorp_Bytes* frame = frame_result.value;
+    blorp_CancelCleanupFrame frame_cleanup;
+    blorp_websocket_frame_cleanup_push(&frame_cleanup, &frame);
+    blorp_WebSocketVoidResult result =
+        blorp_websocket_transport_write_all(session, frame);
+    blorp_websocket_frame_cleanup_pop(&frame);
+    blorp_release(frame);
+    return result;
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_send_owned_payload_frame(
+    blorp_WebSocketSession* session,
+    long opcode,
+    blorp_Bytes* payload
+) {
+    blorp_CancelCleanupFrame payload_cleanup;
+    blorp_websocket_frame_cleanup_push(&payload_cleanup, &payload);
+    blorp_WebSocketVoidResult result =
+        blorp_websocket_send_client_frame(session, opcode, payload);
+    blorp_websocket_frame_cleanup_pop(&payload);
+    blorp_release(payload);
+    return result;
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_send_text_frame(
+    blorp_WebSocketSession* session,
+    blorp_String* text
+) {
+    blorp_WebSocketVoidResult validation =
+        blorp_websocket_validate_text_arg(text);
+    if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return validation;
+    }
+    if (validation.detail) blorp_release(validation.detail);
+    return blorp_websocket_send_owned_payload_frame(
+        session,
+        BLORP_WEBSOCKET_OPCODE_TEXT,
+        blorp_bytes_from_string(text));
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_send_binary_frame(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    return blorp_websocket_send_client_frame(
+        session,
+        BLORP_WEBSOCKET_OPCODE_BINARY,
+        bytes);
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_send_ping_frame(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    return blorp_websocket_send_client_frame(
+        session,
+        BLORP_WEBSOCKET_OPCODE_PING,
+        bytes);
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_send_pong_frame(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    return blorp_websocket_send_client_frame(
+        session,
+        BLORP_WEBSOCKET_OPCODE_PONG,
+        bytes);
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_send_close_frame(
+    blorp_WebSocketSession* session,
+    long code,
+    blorp_String* reason
+) {
+    blorp_WebSocketVoidResult validation =
+        blorp_websocket_validate_close_args(code, reason);
+    if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return validation;
+    }
+    if (validation.detail) blorp_release(validation.detail);
+    blorp_Bytes* payload = blorp_bytes_new(2 + reason->len);
+    payload->data[0] = (unsigned char)((code >> 8) & 0xff);
+    payload->data[1] = (unsigned char)(code & 0xff);
+    if (reason->len > 0) {
+        memcpy(payload->data + 2, reason->data, (size_t)reason->len);
+    }
+    return blorp_websocket_send_owned_payload_frame(
+        session,
+        BLORP_WEBSOCKET_OPCODE_CLOSE,
+        payload);
+}
+
+static bool blorp_websocket_payload_is_valid_utf8(
+    const unsigned char* data,
+    long len
+) {
+    if (len < 0) return false;
+    long i = 0;
+    while (i < len) {
+        unsigned char byte = data[i];
+        if (byte <= 0x7f) {
+            i++;
+        } else if (byte >= 0xc2 && byte <= 0xdf) {
+            if (i + 1 >= len) return false;
+            if ((data[i + 1] & 0xc0) != 0x80) return false;
+            i += 2;
+        } else if (byte == 0xe0) {
+            if (i + 2 >= len) return false;
+            if (data[i + 1] < 0xa0 || data[i + 1] > 0xbf) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            i += 3;
+        } else if (byte >= 0xe1 && byte <= 0xec) {
+            if (i + 2 >= len) return false;
+            if ((data[i + 1] & 0xc0) != 0x80) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            i += 3;
+        } else if (byte == 0xed) {
+            if (i + 2 >= len) return false;
+            if (data[i + 1] < 0x80 || data[i + 1] > 0x9f) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            i += 3;
+        } else if (byte >= 0xee && byte <= 0xef) {
+            if (i + 2 >= len) return false;
+            if ((data[i + 1] & 0xc0) != 0x80) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            i += 3;
+        } else if (byte == 0xf0) {
+            if (i + 3 >= len) return false;
+            if (data[i + 1] < 0x90 || data[i + 1] > 0xbf) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            if ((data[i + 3] & 0xc0) != 0x80) return false;
+            i += 4;
+        } else if (byte >= 0xf1 && byte <= 0xf3) {
+            if (i + 3 >= len) return false;
+            if ((data[i + 1] & 0xc0) != 0x80) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            if ((data[i + 3] & 0xc0) != 0x80) return false;
+            i += 4;
+        } else if (byte == 0xf4) {
+            if (i + 3 >= len) return false;
+            if (data[i + 1] < 0x80 || data[i + 1] > 0x8f) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            if ((data[i + 3] & 0xc0) != 0x80) return false;
+            i += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static blorp_Bytes* blorp_websocket_copy_payload_bytes(
+    const unsigned char* data,
+    long len
+) {
+    blorp_Bytes* bytes = blorp_bytes_new(len);
+    if (data && len > 0) memcpy(bytes->data, data, (size_t)len);
+    return bytes;
+}
+
+static blorp_String* blorp_websocket_copy_payload_string(
+    const unsigned char* data,
+    long len
+) {
+    if (len <= 0 || !data) return blorp_string_literal("");
+    return blorp_string_from_buf((const char*)data, len);
+}
+
+static void blorp_websocket_frame_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_Bytes** slot
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)slot;
+#else
+    __blorp_task_cleanup_push_slow(frame, slot, *slot, blorp_release);
+#endif
+}
+
+static void blorp_websocket_frame_cleanup_pop(blorp_Bytes** slot) {
+#if defined(__clang_analyzer__)
+    (void)slot;
+#else
+    __blorp_task_cleanup_pop_slot_slow(slot);
+#endif
+}
+
+static void blorp_websocket_string_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_String** slot
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)slot;
+#else
+    __blorp_task_cleanup_push_slow(frame, slot, *slot, blorp_release);
+#endif
+}
+
+static void blorp_websocket_string_cleanup_pop(blorp_String** slot) {
+#if defined(__clang_analyzer__)
+    (void)slot;
+#else
+    __blorp_task_cleanup_pop_slot_slow(slot);
+#endif
+}
+
+static blorp_WebSocketMessageResult
+blorp_websocket_decode_complete_server_frame(blorp_Bytes* frame) {
+    blorp_WebSocketVoidResult frame_validation =
+        blorp_websocket_validate_bytes_arg(
+            frame,
+            "websocket frame is missing",
+            "invalid websocket frame");
+    if (frame_validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return blorp_websocket_message_result_error_detail(
+            frame_validation.error_kind,
+            frame_validation.detail);
+    }
+    if (frame_validation.detail) blorp_release(frame_validation.detail);
+    if (frame->len < 2) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket frame header is incomplete");
+    }
+
+    unsigned char first = frame->data[0];
+    bool fin = (first & 0x80u) != 0;
+    bool has_reserved_bits = (first & 0x70u) != 0;
+    long opcode = (long)(first & 0x0fu);
+    if (has_reserved_bits) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket frame has reserved bits set");
+    }
+    if (!fin) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "fragmented websocket frames are not supported yet");
+    }
+    if (!blorp_websocket_opcode_is_valid(opcode)) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "invalid websocket frame opcode");
+    }
+
+    unsigned char second = frame->data[1];
+    if ((second & 0x80u) != 0) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "server websocket frames must not be masked");
+    }
+
+    long offset = 2;
+    unsigned char length_code = second & 0x7fu;
+    uint64_t payload_len64 = length_code;
+    if (length_code == 126) {
+        if (frame->len < offset + 2) {
+            return blorp_websocket_message_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame extended length is incomplete");
+        }
+        payload_len64 =
+            ((uint64_t)frame->data[offset] << 8) |
+            (uint64_t)frame->data[offset + 1];
+        if (payload_len64 < 126) {
+            return blorp_websocket_message_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame length is not minimally encoded");
+        }
+        offset += 2;
+    } else if (length_code == 127) {
+        if (frame->len < offset + 8) {
+            return blorp_websocket_message_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame extended length is incomplete");
+        }
+        if ((frame->data[offset] & 0x80u) != 0) {
+            return blorp_websocket_message_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame length is too large");
+        }
+        payload_len64 = 0;
+        for (int i = 0; i < 8; i++) {
+            payload_len64 =
+                (payload_len64 << 8) | (uint64_t)frame->data[offset + i];
+        }
+        if (payload_len64 < 65536) {
+            return blorp_websocket_message_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame length is not minimally encoded");
+        }
+        if (payload_len64 > (uint64_t)LONG_MAX) {
+            return blorp_websocket_message_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame length is too large");
+        }
+        offset += 8;
+    }
+
+    long payload_len = (long)payload_len64;
+    if (blorp_websocket_opcode_is_control(opcode) &&
+        payload_len > BLORP_WEBSOCKET_CONTROL_MAX_PAYLOAD_BYTES) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket control frame payload must be 125 bytes or fewer");
+    }
+    if (payload_len > LONG_MAX - offset) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket frame length is too large");
+    }
+    if (frame->len != offset + payload_len) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket frame length does not match payload");
+    }
+
+    const unsigned char* payload = frame->data + offset;
+    switch (opcode) {
+        case BLORP_WEBSOCKET_OPCODE_TEXT:
+            if (!blorp_websocket_payload_is_valid_utf8(
+                    payload,
+                    payload_len)) {
+                return blorp_websocket_message_result_error(
+                    BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                    "websocket text payload is not valid UTF-8");
+            }
+            return blorp_websocket_message_result_text(
+                blorp_websocket_copy_payload_string(payload, payload_len));
+        case BLORP_WEBSOCKET_OPCODE_BINARY:
+            return blorp_websocket_message_result_binary(
+                blorp_websocket_copy_payload_bytes(payload, payload_len));
+        case BLORP_WEBSOCKET_OPCODE_PING:
+            return blorp_websocket_message_result_ping(
+                blorp_websocket_copy_payload_bytes(payload, payload_len));
+        case BLORP_WEBSOCKET_OPCODE_PONG:
+            return blorp_websocket_message_result_pong(
+                blorp_websocket_copy_payload_bytes(payload, payload_len));
+        case BLORP_WEBSOCKET_OPCODE_CLOSE: {
+            if (payload_len == 0) {
+                return blorp_websocket_message_result_close(
+                    1005,
+                    blorp_string_literal(""));
+            }
+            if (payload_len == 1) {
+                return blorp_websocket_message_result_error(
+                    BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                    "websocket close frame status code is incomplete");
+            }
+            long code = ((long)payload[0] << 8) | (long)payload[1];
+            if (!blorp_websocket_close_code_is_valid(code)) {
+                return blorp_websocket_message_result_error(
+                    BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                    "invalid websocket close code");
+            }
+            if (!blorp_websocket_payload_is_valid_utf8(
+                    payload + 2,
+                    payload_len - 2)) {
+                return blorp_websocket_message_result_error(
+                    BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                    "websocket close reason is not valid UTF-8");
+            }
+            return blorp_websocket_message_result_close(
+                code,
+                blorp_websocket_copy_payload_string(
+                    payload + 2,
+                    payload_len - 2));
+        }
+    }
+    return blorp_websocket_message_result_error(
+        BLORP_WEBSOCKET_ERROR_PROTOCOL,
+        "invalid websocket frame opcode");
+}
+
+static blorp_WebSocketBytesResult
+blorp_websocket_transport_read_complete_server_frame_bytes(
+    blorp_WebSocketSession* session
+) {
+    unsigned char header[10] = { 0 };
+    blorp_WebSocketVoidResult read_result =
+        blorp_websocket_transport_read_exact_into(session, header, 2);
+    if (read_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return blorp_websocket_bytes_result_error_detail(
+            read_result.error_kind,
+            read_result.detail);
+    }
+    if (read_result.detail) blorp_release(read_result.detail);
+
+    unsigned char first = header[0];
+    bool fin = (first & 0x80u) != 0;
+    bool has_reserved_bits = (first & 0x70u) != 0;
+    long opcode = (long)(first & 0x0fu);
+    if (has_reserved_bits) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket frame has reserved bits set");
+    }
+    if (!fin) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "fragmented websocket frames are not supported yet");
+    }
+    if (!blorp_websocket_opcode_is_valid(opcode)) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "invalid websocket frame opcode");
+    }
+    if ((header[1] & 0x80u) != 0) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "server websocket frames must not be masked");
+    }
+
+    long prefix_len = 2;
+    unsigned char length_code = header[1] & 0x7fu;
+    uint64_t payload_len64 = length_code;
+    if (length_code == 126) {
+        read_result =
+            blorp_websocket_transport_read_exact_into(session, header + 2, 2);
+        if (read_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+            return blorp_websocket_bytes_result_error_detail(
+                read_result.error_kind,
+                read_result.detail);
+        }
+        if (read_result.detail) blorp_release(read_result.detail);
+        payload_len64 = ((uint64_t)header[2] << 8) | (uint64_t)header[3];
+        if (payload_len64 < 126) {
+            return blorp_websocket_bytes_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame length is not minimally encoded");
+        }
+        prefix_len = 4;
+    } else if (length_code == 127) {
+        read_result =
+            blorp_websocket_transport_read_exact_into(session, header + 2, 8);
+        if (read_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+            return blorp_websocket_bytes_result_error_detail(
+                read_result.error_kind,
+                read_result.detail);
+        }
+        if (read_result.detail) blorp_release(read_result.detail);
+        if ((header[2] & 0x80u) != 0) {
+            return blorp_websocket_bytes_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame length is too large");
+        }
+        payload_len64 = 0;
+        for (int i = 0; i < 8; i++) {
+            payload_len64 =
+                (payload_len64 << 8) | (uint64_t)header[2 + i];
+        }
+        if (payload_len64 < 65536) {
+            return blorp_websocket_bytes_result_error(
+                BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                "websocket frame length is not minimally encoded");
+        }
+        prefix_len = 10;
+    }
+
+    if (blorp_websocket_opcode_is_control(opcode) &&
+        payload_len64 > (uint64_t)BLORP_WEBSOCKET_CONTROL_MAX_PAYLOAD_BYTES) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket control frame payload must be 125 bytes or fewer");
+    }
+    if (opcode == BLORP_WEBSOCKET_OPCODE_CLOSE && payload_len64 == 1) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket close frame status code is incomplete");
+    }
+    if (payload_len64 >
+        (uint64_t)(BLORP_WEBSOCKET_MAX_FRAME_BYTES - prefix_len)) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket frame is too large");
+    }
+
+    long payload_len = (long)payload_len64;
+    long frame_len = prefix_len + payload_len;
+    blorp_Bytes* frame = blorp_bytes_new(frame_len);
+    memcpy(frame->data, header, (size_t)prefix_len);
+    blorp_CancelCleanupFrame frame_cleanup;
+    blorp_websocket_frame_cleanup_push(&frame_cleanup, &frame);
+    read_result = blorp_websocket_transport_read_exact_into(
+        session,
+        frame->data + prefix_len,
+        payload_len);
+    if (read_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        blorp_websocket_frame_cleanup_pop(&frame);
+        blorp_release(frame);
+        return blorp_websocket_bytes_result_error_detail(
+            read_result.error_kind,
+            read_result.detail);
+    }
+    if (read_result.detail) blorp_release(read_result.detail);
+    blorp_websocket_frame_cleanup_pop(&frame);
+    return blorp_websocket_bytes_result_ok(frame);
+}
+
+static blorp_WebSocketMessageResult
+blorp_websocket_transport_read_complete_server_frame(
+    blorp_WebSocketSession* session
+) {
+    blorp_WebSocketBytesResult frame_result =
+        blorp_websocket_transport_read_complete_server_frame_bytes(session);
+    if (frame_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return blorp_websocket_message_result_error_detail(
+            frame_result.error_kind,
+            frame_result.detail);
+    }
+    blorp_WebSocketMessageResult message =
+        blorp_websocket_decode_complete_server_frame(frame_result.value);
+    blorp_release(frame_result.value);
+    if (frame_result.detail) blorp_release(frame_result.detail);
+    return message;
+}
+
+static blorp_WebSocketMessageResult
+blorp_websocket_backend_receive_transport_frame(
+    blorp_WebSocketSession* session
+) {
+    return blorp_websocket_transport_read_complete_server_frame(session);
+}
+
+static blorp_WebSocketVoidResult
+blorp_websocket_backend_send_text_transport_frame(
+    blorp_WebSocketSession* session,
+    blorp_String* text
+) {
+    return blorp_websocket_send_text_frame(session, text);
+}
+
+static blorp_WebSocketVoidResult
+blorp_websocket_backend_send_binary_transport_frame(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    return blorp_websocket_send_binary_frame(session, bytes);
+}
+
+static blorp_WebSocketVoidResult
+blorp_websocket_backend_send_ping_transport_frame(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    return blorp_websocket_send_ping_frame(session, bytes);
+}
+
+static blorp_WebSocketVoidResult
+blorp_websocket_backend_send_pong_transport_frame(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    return blorp_websocket_send_pong_frame(session, bytes);
+}
+
+static blorp_WebSocketVoidResult
+blorp_websocket_backend_send_close_transport_frame(
+    blorp_WebSocketSession* session,
+    long code,
+    blorp_String* reason
+) {
+    return blorp_websocket_send_close_frame(session, code, reason);
+}
+
+static void blorp_websocket_session_destroy(void* obj) {
+    blorp_WebSocketSession* session = (blorp_WebSocketSession*)obj;
+    if (!session) return;
+    const blorp_WebSocketBackendOps* backend =
+        session->backend ? session->backend : blorp_websocket_active_backend();
+    session->state = BLORP_WEBSOCKET_SESSION_CLOSING;
+    if (backend->close) backend->close(session);
+    // Backend-private state may refer to transport internals during close.
+    blorp_websocket_read_buffer_clear(session);
+    blorp_websocket_transport_owner_release(&session->transport_owner);
+    session->state = BLORP_WEBSOCKET_SESSION_CLOSED;
+    session->backend = NULL;
+    session->backend_state = NULL;
+}
+
+static blorp_WebSocketSession* blorp_websocket_session_new(
+    const blorp_WebSocketBackendOps* backend,
+    blorp_WebSocketSessionState state,
+    blorp_WebSocketTransportOwner transport_owner,
+    void* backend_state
+) {
+    blorp_WebSocketSession* session =
+        (blorp_WebSocketSession*)blorp_alloc(sizeof(blorp_WebSocketSession));
+    BLORP_TAG(session, "std_net_websocket__WebSocketSession");
+    BLORP_SET_DESTRUCTOR(session, blorp_websocket_session_destroy);
+    session->backend = backend ? backend : blorp_websocket_active_backend();
+    session->state = state;
+    session->read_operation_state = BLORP_WEBSOCKET_OPERATION_NONE;
+    session->write_operation_state = BLORP_WEBSOCKET_OPERATION_NONE;
+    session->transport_owner = transport_owner;
+    session->read_buffer.bytes = NULL;
+    session->read_buffer.offset = 0;
+    session->backend_state = backend_state;
+    return session;
+}
+
+static blorp_WebSocketSessionResult
+blorp_websocket_backend_connect_runtime(
+    const blorp_WebSocketConnectTarget* target
+) {
+    if (!target) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_INVALID_URL,
+            "websocket connect target is missing");
+    }
+    if (target->transport != BLORP_WEBSOCKET_TRANSPORT_TCP &&
+        target->transport != BLORP_WEBSOCKET_TRANSPORT_TLS) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_INVALID_URL,
+            "websocket connect target has invalid transport");
+    }
+
+    if (target->transport == BLORP_WEBSOCKET_TRANSPORT_TLS &&
+        !blorp_tls_native_available_raw()) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+            "native TLS support is required for wss:// WebSocket URLs");
+    }
+
+    blorp_TcpStreamResult tcp_result =
+        blorp_tcp_connect_raw(target->host, target->port);
+    if (tcp_result.error_kind != BLORP_TCP_ERROR_NONE) {
+        if (tcp_result.handle) blorp_release(tcp_result.handle);
+        return blorp_websocket_session_result_error_detail(
+            blorp_websocket_error_from_tcp(tcp_result.error_kind),
+            tcp_result.detail);
+    }
+    blorp_TcpStream* stream = tcp_result.handle;
+    if (tcp_result.detail) blorp_release(tcp_result.detail);
+    if (!stream) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_TRANSPORT,
+            "websocket TCP connect returned no stream");
+    }
+
+    if (target->transport == BLORP_WEBSOCKET_TRANSPORT_TCP) {
+        return blorp_websocket_session_result_ok(
+            blorp_websocket_session_new(
+                &BLORP_WEBSOCKET_RUNTIME_BACKEND,
+                BLORP_WEBSOCKET_SESSION_HANDSHAKING,
+                blorp_websocket_transport_owner_own_tcp(stream),
+                NULL));
+    }
+
+    blorp_CancelCleanupFrame stream_cleanup;
+    blorp_websocket_tcp_stream_cleanup_push(&stream_cleanup, &stream);
+    blorp_TlsSessionResult tls_result =
+        blorp_tls_connect_raw(stream, target->host);
+    blorp_websocket_tcp_stream_cleanup_pop(&stream);
+    blorp_release(stream);
+    if (tls_result.error_kind != BLORP_TLS_ERROR_NONE) {
+        if (tls_result.handle) blorp_release(tls_result.handle);
+        return blorp_websocket_session_result_error_detail(
+            blorp_websocket_error_from_tls(tls_result.error_kind),
+            tls_result.detail);
+    }
+    blorp_TlsSession* tls_session = tls_result.handle;
+    if (tls_result.detail) blorp_release(tls_result.detail);
+    if (!tls_session) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_TLS,
+            "websocket TLS connect returned no session");
+    }
+    return blorp_websocket_session_result_ok(
+        blorp_websocket_session_new(
+            &BLORP_WEBSOCKET_RUNTIME_BACKEND,
+            BLORP_WEBSOCKET_SESSION_HANDSHAKING,
+            blorp_websocket_transport_owner_own_tls(tls_session),
+            NULL));
+}
+
+static blorp_WebSocketSessionResult blorp_websocket_backend_drive_handshake(
+    const blorp_WebSocketBackendOps* backend,
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketConnectTarget* target
+) {
+    if (!session) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket backend did not create a session");
+    }
+    if (!blorp_websocket_backend_ops_complete(backend)) {
+        blorp_release(session);
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket backend is incomplete");
+    }
+    if (session->backend != backend) {
+        session->state = BLORP_WEBSOCKET_SESSION_FAILED;
+        blorp_release(session);
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket backend created a session owned by a different backend");
+    }
+    if (session->state != BLORP_WEBSOCKET_SESSION_HANDSHAKING) {
+        session->state = BLORP_WEBSOCKET_SESSION_FAILED;
+        blorp_release(session);
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket backend created an invalid session state");
+    }
+
+    blorp_WebSocketProvisionalSessionCleanup session_cleanup = {
+        .session = session,
+        .active = true
+    };
+    blorp_CancelCleanupFrame cleanup_frame;
+    __blorp_task_cleanup_push_slow(
+        &cleanup_frame,
+        &session_cleanup,
+        &session_cleanup,
+        blorp_websocket_provisional_session_cleanup_release);
+
+    if (__blorp_cancel_current_task_if_requested()) {
+        blorp_WebSocketSessionResult result =
+            blorp_websocket_session_result_error(
+                BLORP_WEBSOCKET_ERROR_OTHER,
+                "websocket handshake cancelled");
+        blorp_websocket_provisional_session_cleanup_release(&session_cleanup);
+        __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+        return result;
+    }
+
+    blorp_WebSocketVoidResult handshake_result =
+        backend->handshake(session, target);
+    if (handshake_result.error_kind == BLORP_WEBSOCKET_ERROR_NONE) {
+        if (handshake_result.detail) blorp_release(handshake_result.detail);
+        if (session->state != BLORP_WEBSOCKET_SESSION_HANDSHAKING) {
+            blorp_WebSocketSessionResult result =
+                blorp_websocket_session_result_error(
+                    BLORP_WEBSOCKET_ERROR_OTHER,
+                    "websocket backend changed state during handshake");
+            session->state = BLORP_WEBSOCKET_SESSION_FAILED;
+            blorp_websocket_provisional_session_cleanup_release(&session_cleanup);
+            __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+            return result;
+        }
+        session->state = BLORP_WEBSOCKET_SESSION_OPEN;
+        session_cleanup.active = false;
+        __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+        return blorp_websocket_session_result_ok(session);
+    }
+
+    session->state = BLORP_WEBSOCKET_SESSION_FAILED;
+    blorp_WebSocketSessionResult result =
+        blorp_websocket_session_result_error_detail(
+            handshake_result.error_kind,
+            handshake_result.detail);
+    blorp_websocket_provisional_session_cleanup_release(&session_cleanup);
+    __blorp_task_cleanup_pop_slot_slow(&session_cleanup);
+    return result;
+}
+
+static const char* blorp_websocket_connect_target_error(
+    const blorp_WebSocketConnectTarget* target
+) {
+    if (!target) return "websocket connect target is missing";
+    switch (target->transport) {
+        case BLORP_WEBSOCKET_TRANSPORT_TCP:
+        case BLORP_WEBSOCKET_TRANSPORT_TLS:
+            break;
+        default:
+            return "websocket connect target has invalid transport";
+    }
+    if (!target->host) {
+        return "websocket connect target host is missing";
+    }
+    if (target->host->len < 0 || target->host->capacity < 0 ||
+        target->host->len > target->host->capacity) {
+        return "websocket connect target host is malformed";
+    }
+    if (target->host->len == 0) return "websocket connect target host is empty";
+    if (blorp_string_contains_nul(target->host)) {
+        return "websocket connect target host contains NUL";
+    }
+    if (target->port < 0 || target->port > 65535) {
+        return "websocket connect target port is out of range";
+    }
+    if (!target->path) return "websocket connect target path is missing";
+    if (target->path->len < 0 || target->path->capacity < 0 ||
+        target->path->len > target->path->capacity) {
+        return "websocket connect target path is malformed";
+    }
+    if (target->path->len == 0 || target->path->data[0] != '/') {
+        return "websocket connect target path must start with /";
+    }
+    if (blorp_string_contains_nul(target->path)) {
+        return "websocket connect target path contains NUL";
+    }
+    if (!target->query) return "websocket connect target query is missing";
+    if (target->query->len < 0 || target->query->capacity < 0 ||
+        target->query->len > target->query->capacity) {
+        return "websocket connect target query is malformed";
+    }
+    if (blorp_string_contains_nul(target->query)) {
+        return "websocket connect target query contains NUL";
+    }
+    return NULL;
+}
+
+static blorp_WebSocketSessionResult blorp_websocket_connect_with_backend(
+    const blorp_WebSocketConnectTarget* target,
+    const blorp_WebSocketBackendOps* backend
+) {
+    const char* target_error = blorp_websocket_connect_target_error(target);
+    if (target_error) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_INVALID_URL,
+            target_error);
+    }
+    if (!blorp_websocket_backend_ops_complete(backend)) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket backend is incomplete");
+    }
+    if (!blorp_websocket_backend_supports(
+            backend,
+            BLORP_WEBSOCKET_BACKEND_CAP_CONNECT |
+                BLORP_WEBSOCKET_BACKEND_CAP_HANDSHAKE)) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+            "WebSocket backend does not support connect");
+    }
+    blorp_WebSocketSessionResult connected = backend->connect(target);
+    if (connected.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        if (connected.handle) blorp_release(connected.handle);
+        return connected;
+    }
+    if (!connected.handle) {
+        if (connected.detail) blorp_release(connected.detail);
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket backend did not create a session");
+    }
+    if (connected.detail) blorp_release(connected.detail);
+    return blorp_websocket_backend_drive_handshake(
+        backend,
+        connected.handle,
+        target);
+}
+
+void blorp_websocket_close_session(blorp_WebSocketSession* session) {
+    if (!session) return;
+    blorp_release(session);
+}
+
+bool blorp_websocket_native_available_raw(void) {
+    return blorp_websocket_backend_native_available(
+        blorp_websocket_active_backend());
+}
+
+static bool blorp_websocket_url_starts_with(
+    const blorp_String* url,
+    const char* prefix,
+    long prefix_len
+) {
+    return url && url->len >= prefix_len &&
+           memcmp(url->data, prefix, (size_t)prefix_len) == 0;
+}
+
+static bool blorp_websocket_url_authority_delimiter(char c) {
+    return c == '/' || c == '?' || c == '#';
+}
+
+static const char* blorp_websocket_validate_host_bytes(
+    const char* data,
+    long start,
+    long end
+) {
+    if (start >= end) return "url must include a host";
+    for (long i = start; i < end; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c <= ' ' || c == 127) {
+            return "host contains invalid character";
+        }
+    }
+    return NULL;
+}
+
+static const char* blorp_websocket_parse_port_bytes(
+    const char* data,
+    long start,
+    long end,
+    long* port_out
+) {
+    if (start >= end) return "port must not be empty";
+    long value = 0;
+    for (long i = start; i < end; i++) {
+        char c = data[i];
+        if (c < '0' || c > '9') {
+            return "port must contain only digits";
+        }
+        value = value * 10 + (long)(c - '0');
+        if (value > 65535) {
+            return "port must be between 0 and 65535";
+        }
+    }
+    *port_out = value;
+    return NULL;
+}
+
+static void blorp_websocket_connect_target_init(
+    blorp_WebSocketConnectTarget* target
+) {
+    if (!target) return;
+    target->transport = BLORP_WEBSOCKET_TRANSPORT_TCP;
+    target->host = NULL;
+    target->host_is_ipv6_literal = false;
+    target->port = 80;
+    target->path = NULL;
+    target->query = NULL;
+}
+
+static void blorp_websocket_connect_target_cleanup(
+    blorp_WebSocketConnectTarget* target
+) {
+    if (!target) return;
+    if (target->host) blorp_release(target->host);
+    if (target->path) blorp_release(target->path);
+    if (target->query) blorp_release(target->query);
+    blorp_websocket_connect_target_init(target);
+}
+
+static blorp_String* blorp_websocket_copy_url_slice(
+    const blorp_String* url,
+    long start,
+    long end
+) {
+    long len = end - start;
+    return blorp_string_from_buf(len > 0 ? url->data + start : "", len);
+}
+
+static const char* blorp_websocket_parse_url(
+    const blorp_String* url,
+    blorp_WebSocketConnectTarget* target
+) {
+    if (!target) return "websocket connect target is missing";
+    blorp_websocket_connect_target_init(target);
+    if (!url || url->len <= 0) return "url must not be empty";
+    if (blorp_string_contains_nul(url)) return "url must not contain embedded NUL";
+    for (long i = 0; i < url->len; i++) {
+        unsigned char c = (unsigned char)url->data[i];
+        if (c <= ' ' || c == 127) {
+            return "url must not contain raw control or space characters";
+        }
+        if (c == '#') {
+            return "url must not include a fragment";
+        }
+    }
+
+    long host_start = -1;
+    blorp_WebSocketTransportKind transport = BLORP_WEBSOCKET_TRANSPORT_TCP;
+    if (blorp_websocket_url_starts_with(url, "ws://", 5)) {
+        host_start = 5;
+    } else if (blorp_websocket_url_starts_with(url, "wss://", 6)) {
+        host_start = 6;
+        transport = BLORP_WEBSOCKET_TRANSPORT_TLS;
+    } else {
+        return "scheme must be ws:// or wss://";
+    }
+
+    if (host_start >= url->len) return "url must include a host";
+    long authority_end = host_start;
+    while (authority_end < url->len &&
+           !blorp_websocket_url_authority_delimiter(
+               url->data[authority_end])) {
+        if (url->data[authority_end] == '@') {
+            return "url must not include user info";
+        }
+        authority_end++;
+    }
+    if (authority_end == host_start) {
+        return "url must include a host";
+    }
+
+    long host_slice_start;
+    long host_slice_end;
+    bool host_is_ipv6_literal = false;
+    long port = transport == BLORP_WEBSOCKET_TRANSPORT_TLS ? 443 : 80;
+    long path_slice_start = -1;
+    long path_slice_end = -1;
+    long query_slice_start = -1;
+    long query_slice_end = -1;
+
+    if (url->data[host_start] == '[') {
+        long bracket_end = -1;
+        for (long i = host_start + 1; i < authority_end; i++) {
+            if (url->data[i] == ']') {
+                bracket_end = i;
+                break;
+            }
+        }
+        if (bracket_end < 0) return "IPv6 host must close with ]";
+        const char* host_error = blorp_websocket_validate_host_bytes(
+            url->data,
+            host_start + 1,
+            bracket_end);
+        if (host_error) return host_error;
+        host_slice_start = host_start + 1;
+        host_slice_end = bracket_end;
+        host_is_ipv6_literal = true;
+        if (bracket_end + 1 < authority_end) {
+            if (url->data[bracket_end + 1] != ':') {
+                return "invalid character after IPv6 host";
+            }
+            const char* port_error = blorp_websocket_parse_port_bytes(
+                url->data,
+                bracket_end + 2,
+                authority_end,
+                &port);
+            if (port_error) return port_error;
+        }
+    } else {
+        long host_end = authority_end;
+        long port_start = -1;
+        for (long i = host_start; i < authority_end; i++) {
+            if (url->data[i] == ':') {
+                host_end = i;
+                port_start = i + 1;
+                break;
+            }
+        }
+        const char* host_error =
+            blorp_websocket_validate_host_bytes(url->data, host_start, host_end);
+        if (host_error) return host_error;
+        host_slice_start = host_start;
+        host_slice_end = host_end;
+        if (port_start >= 0) {
+            const char* port_error = blorp_websocket_parse_port_bytes(
+                url->data,
+                port_start,
+                authority_end,
+                &port);
+            if (port_error) return port_error;
+        }
+    }
+
+    if (authority_end < url->len) {
+        if (url->data[authority_end] == '?') {
+            query_slice_start = authority_end + 1;
+            query_slice_end = url->len;
+        } else if (url->data[authority_end] == '/') {
+            long path_start = authority_end;
+            long path_end = url->len;
+            long query_start = -1;
+            for (long i = path_start; i < url->len; i++) {
+                if (url->data[i] == '?') {
+                    path_end = i;
+                    query_start = i + 1;
+                    break;
+                }
+            }
+            path_slice_start = path_start;
+            path_slice_end = path_end;
+            if (query_start >= 0) {
+                query_slice_start = query_start;
+                query_slice_end = url->len;
+            }
+        }
+    }
+
+    target->transport = transport;
+    target->host_is_ipv6_literal = host_is_ipv6_literal;
+    target->port = port;
+    target->host =
+        blorp_websocket_copy_url_slice(url, host_slice_start, host_slice_end);
+    target->path = path_slice_start >= 0
+        ? blorp_websocket_copy_url_slice(url, path_slice_start, path_slice_end)
+        : blorp_string_literal("/");
+    target->query = query_slice_start >= 0
+        ? blorp_websocket_copy_url_slice(url, query_slice_start, query_slice_end)
+        : blorp_string_literal("");
+    return NULL;
+}
+
+static bool blorp_websocket_header_component_is_safe(const blorp_String* s) {
+    if (!s || s->len < 0 || s->capacity < 0 || s->len > s->capacity) {
+        return false;
+    }
+    for (long i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        if (c <= ' ' || c == 127) return false;
+    }
+    return true;
+}
+
+static bool blorp_websocket_client_key_is_valid(blorp_String* key) {
+    if (!blorp_websocket_header_component_is_safe(key)) return false;
+    blorp_String* decoded = blorp_base64_decode_nullable(key);
+    bool valid = decoded && decoded->len == 16;
+    if (decoded) blorp_release(decoded);
+    return valid;
+}
+
+static blorp_String* blorp_websocket_generate_client_key(void) {
+    blorp_Bytes* raw = blorp_bytes_new(16);
+    blorp_fill_random_or_die(raw->data, 16);
+    blorp_String* raw_string = blorp_bytes_to_string(raw);
+    blorp_release(raw);
+    blorp_String* key = blorp_base64_encode(raw_string);
+    blorp_release(raw_string);
+    return key;
+}
+
+static blorp_String* blorp_websocket_compute_accept_value(blorp_String* key) {
+    if (!key) return blorp_string_literal("");
+    blorp_String* combined = blorp_string_concat_many(
+        2,
+        (blorp_String*)blorp_retain(key),
+        blorp_string_literal("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+    blorp_String* hex_digest = blorp_sha1(combined);
+    blorp_release(combined);
+    blorp_Bytes* raw_digest = blorp_bytes_from_hex(hex_digest);
+    blorp_release(hex_digest);
+    if (!raw_digest) return blorp_string_literal("");
+    blorp_String* raw_string = blorp_bytes_to_string(raw_digest);
+    blorp_release(raw_digest);
+    blorp_String* accept = blorp_base64_encode(raw_string);
+    blorp_release(raw_string);
+    return accept;
+}
+
+static bool blorp_websocket_target_uses_default_port(
+    const blorp_WebSocketConnectTarget* target
+) {
+    return target && (
+        (target->transport == BLORP_WEBSOCKET_TRANSPORT_TCP &&
+         target->port == 80) ||
+        (target->transport == BLORP_WEBSOCKET_TRANSPORT_TLS &&
+         target->port == 443));
+}
+
+static void blorp_websocket_append_bytes(
+    blorp_Bytes* out,
+    long* offset,
+    const void* data,
+    long len
+) {
+    if (len > 0) {
+        memcpy(out->data + *offset, data, (size_t)len);
+        *offset += len;
+    }
+}
+
+static void blorp_websocket_append_literal(
+    blorp_Bytes* out,
+    long* offset,
+    const char* literal
+) {
+    blorp_websocket_append_bytes(
+        out,
+        offset,
+        literal,
+        (long)strlen(literal));
+}
+
+static void blorp_websocket_append_string(
+    blorp_Bytes* out,
+    long* offset,
+    const blorp_String* s
+) {
+    blorp_websocket_append_bytes(out, offset, s->data, s->len);
+}
+
+static blorp_WebSocketBytesResult blorp_websocket_build_handshake_request(
+    const blorp_WebSocketConnectTarget* target,
+    blorp_String* key
+) {
+    const char* target_error = blorp_websocket_connect_target_error(target);
+    if (target_error) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_INVALID_URL,
+            target_error);
+    }
+    if (!target->host || !target->path || !target->query ||
+        !blorp_websocket_header_component_is_safe(target->host) ||
+        !blorp_websocket_header_component_is_safe(target->path) ||
+        (target->query->len > 0 &&
+         !blorp_websocket_header_component_is_safe(target->query))) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_INVALID_URL,
+            "websocket URL contains an invalid request character");
+    }
+    if (!blorp_websocket_client_key_is_valid(key)) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket client key must encode exactly 16 bytes");
+    }
+
+    bool include_query = target->query->len > 0;
+    bool include_port = !blorp_websocket_target_uses_default_port(target);
+    char port_buf[32];
+    long port_len = 0;
+    if (include_port) {
+        int written = snprintf(port_buf, sizeof(port_buf), ":%ld", target->port);
+        if (written < 0 || written >= (int)sizeof(port_buf)) {
+            return blorp_websocket_bytes_result_error(
+                BLORP_WEBSOCKET_ERROR_INVALID_URL,
+                "websocket port is invalid");
+        }
+        port_len = (long)written;
+    }
+
+    size_t total = 0;
+#define BLORP_WS_ADD_LEN(n) \
+    total = blorp_checked_add(total, (size_t)(n))
+    BLORP_WS_ADD_LEN(strlen("GET "));
+    BLORP_WS_ADD_LEN(target->path->len);
+    if (include_query) {
+        BLORP_WS_ADD_LEN(1);
+        BLORP_WS_ADD_LEN(target->query->len);
+    }
+    BLORP_WS_ADD_LEN(strlen(" HTTP/1.1\r\nHost: "));
+    if (target->host_is_ipv6_literal) BLORP_WS_ADD_LEN(2);
+    BLORP_WS_ADD_LEN(target->host->len);
+    BLORP_WS_ADD_LEN(port_len);
+    BLORP_WS_ADD_LEN(strlen("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"));
+    BLORP_WS_ADD_LEN(strlen("Sec-WebSocket-Key: "));
+    BLORP_WS_ADD_LEN(key->len);
+    BLORP_WS_ADD_LEN(strlen("\r\nSec-WebSocket-Version: 13\r\n\r\n"));
+#undef BLORP_WS_ADD_LEN
+
+    if (total > (size_t)LONG_MAX) {
+        blorp_fatal_invalid_runtime_length("Bytes", LONG_MAX, LONG_MAX);
+    }
+    blorp_Bytes* request = blorp_bytes_alloc_uninit((long)total, (long)total);
+    long offset = 0;
+    blorp_websocket_append_literal(request, &offset, "GET ");
+    blorp_websocket_append_string(request, &offset, target->path);
+    if (include_query) {
+        blorp_websocket_append_literal(request, &offset, "?");
+        blorp_websocket_append_string(request, &offset, target->query);
+    }
+    blorp_websocket_append_literal(request, &offset, " HTTP/1.1\r\nHost: ");
+    if (target->host_is_ipv6_literal) {
+        blorp_websocket_append_literal(request, &offset, "[");
+    }
+    blorp_websocket_append_string(request, &offset, target->host);
+    if (target->host_is_ipv6_literal) {
+        blorp_websocket_append_literal(request, &offset, "]");
+    }
+    if (include_port) {
+        blorp_websocket_append_bytes(request, &offset, port_buf, port_len);
+    }
+    blorp_websocket_append_literal(
+        request,
+        &offset,
+        "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n");
+    blorp_websocket_append_literal(request, &offset, "Sec-WebSocket-Key: ");
+    blorp_websocket_append_string(request, &offset, key);
+    blorp_websocket_append_literal(
+        request,
+        &offset,
+        "\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    return blorp_websocket_bytes_result_ok(request);
+}
+
+static long blorp_websocket_response_header_end(const blorp_Bytes* response) {
+    if (!response || response->len < 4 || response->capacity < response->len) {
+        return -1;
+    }
+    for (long i = 0; i <= response->len - 4; i++) {
+        if (response->data[i] == '\r' && response->data[i + 1] == '\n' &&
+            response->data[i + 2] == '\r' &&
+            response->data[i + 3] == '\n') {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static long blorp_websocket_find_crlf(
+    const unsigned char* data,
+    long start,
+    long end
+) {
+    for (long i = start; i + 1 < end; i++) {
+        if (data[i] == '\r' && data[i + 1] == '\n') return i;
+    }
+    return -1;
+}
+
+static unsigned char blorp_websocket_ascii_lower(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return (unsigned char)(c - 'A' + 'a');
+    return c;
+}
+
+static bool blorp_websocket_ascii_equals_ci(
+    const unsigned char* data,
+    long start,
+    long end,
+    const char* expected
+) {
+    long expected_len = (long)strlen(expected);
+    if (end - start != expected_len) return false;
+    for (long i = 0; i < expected_len; i++) {
+        if (blorp_websocket_ascii_lower(data[start + i]) !=
+            blorp_websocket_ascii_lower((unsigned char)expected[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void blorp_websocket_trim_ows(
+    const unsigned char* data,
+    long* start,
+    long* end
+) {
+    while (*start < *end && (data[*start] == ' ' || data[*start] == '\t')) {
+        (*start)++;
+    }
+    while (*end > *start &&
+           (data[*end - 1] == ' ' || data[*end - 1] == '\t')) {
+        (*end)--;
+    }
+}
+
+static bool blorp_websocket_connection_has_upgrade_token(
+    const unsigned char* data,
+    long start,
+    long end
+) {
+    long token_start = start;
+    for (long i = start; i <= end; i++) {
+        if (i == end || data[i] == ',') {
+            long token_end = i;
+            blorp_websocket_trim_ows(data, &token_start, &token_end);
+            if (blorp_websocket_ascii_equals_ci(
+                    data,
+                    token_start,
+                    token_end,
+                    "upgrade")) {
+                return true;
+            }
+            token_start = i + 1;
+        }
+    }
+    return false;
+}
+
+static bool blorp_websocket_bytes_equal_string(
+    const unsigned char* data,
+    long start,
+    long end,
+    const blorp_String* expected
+) {
+    return expected && end - start == expected->len &&
+           memcmp(data + start, expected->data, (size_t)expected->len) == 0;
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_verify_handshake_response(
+    blorp_Bytes* response,
+    blorp_String* key
+) {
+    if (!response || response->len < 0 || response->capacity < 0 ||
+        response->len > response->capacity) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+            "websocket handshake response is malformed");
+    }
+    if (!blorp_websocket_client_key_is_valid(key)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket client key must encode exactly 16 bytes");
+    }
+    long header_end = blorp_websocket_response_header_end(response);
+    if (header_end < 0) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+            "websocket handshake response is incomplete");
+    }
+    const unsigned char* data = response->data;
+    long status_end = blorp_websocket_find_crlf(data, 0, header_end + 2);
+    if (status_end < 0 || status_end < 12 ||
+        memcmp(data, "HTTP/1.1 ", 9) != 0 || data[9] != '1' ||
+        data[10] != '0' || data[11] != '1' ||
+        (status_end > 12 && data[12] != ' ')) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+            "server did not accept websocket upgrade");
+    }
+
+    blorp_String* expected_accept =
+        blorp_websocket_compute_accept_value(key);
+    bool saw_upgrade = false;
+    bool saw_connection_upgrade = false;
+    bool saw_accept = false;
+    bool duplicate_accept = false;
+    bool accept_matches = false;
+
+    long line_start = status_end + 2;
+    while (line_start < header_end) {
+        long line_end =
+            blorp_websocket_find_crlf(data, line_start, header_end + 2);
+        if (line_end < 0 || line_end > header_end) {
+            blorp_release(expected_accept);
+            return blorp_websocket_void_result_error(
+                BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+                "websocket handshake header is incomplete");
+        }
+        long colon = -1;
+        for (long i = line_start; i < line_end; i++) {
+            if (data[i] == ':') {
+                colon = i;
+                break;
+            }
+        }
+        if (colon <= line_start) {
+            blorp_release(expected_accept);
+            return blorp_websocket_void_result_error(
+                BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+                "websocket handshake header is malformed");
+        }
+        long value_start = colon + 1;
+        long value_end = line_end;
+        blorp_websocket_trim_ows(data, &value_start, &value_end);
+        if (blorp_websocket_ascii_equals_ci(
+                data,
+                line_start,
+                colon,
+                "upgrade")) {
+            saw_upgrade = saw_upgrade ||
+                          blorp_websocket_ascii_equals_ci(
+                              data,
+                              value_start,
+                              value_end,
+                              "websocket");
+        } else if (blorp_websocket_ascii_equals_ci(
+                       data,
+                       line_start,
+                       colon,
+                       "connection")) {
+            saw_connection_upgrade =
+                saw_connection_upgrade ||
+                blorp_websocket_connection_has_upgrade_token(
+                    data,
+                    value_start,
+                    value_end);
+        } else if (blorp_websocket_ascii_equals_ci(
+                       data,
+                       line_start,
+                       colon,
+                       "sec-websocket-accept")) {
+            if (saw_accept) {
+                duplicate_accept = true;
+            }
+            saw_accept = true;
+            accept_matches =
+                accept_matches ||
+                blorp_websocket_bytes_equal_string(
+                    data,
+                    value_start,
+                    value_end,
+                    expected_accept);
+        }
+        line_start = line_end + 2;
+    }
+    blorp_release(expected_accept);
+
+    if (!saw_upgrade) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+            "websocket handshake is missing Upgrade: websocket");
+    }
+    if (!saw_connection_upgrade) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+            "websocket handshake is missing Connection: Upgrade");
+    }
+    if (!saw_accept) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+            "websocket handshake is missing Sec-WebSocket-Accept");
+    }
+    if (duplicate_accept) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+            "websocket handshake has multiple Sec-WebSocket-Accept headers");
+    }
+    if (!accept_matches) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+            "websocket handshake accept value is invalid");
+    }
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketBytesResult
+blorp_websocket_transport_read_handshake_response(
+    blorp_WebSocketSession* session
+) {
+    if (blorp_websocket_read_buffer_has_bytes(session)) {
+        return blorp_websocket_bytes_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "websocket handshake started with buffered data");
+    }
+    blorp_Bytes* response = blorp_bytes_alloc_uninit(
+        0,
+        BLORP_WEBSOCKET_MAX_HANDSHAKE_BYTES);
+    blorp_CancelCleanupFrame response_cleanup;
+    blorp_websocket_frame_cleanup_push(&response_cleanup, &response);
+    while (response->len < BLORP_WEBSOCKET_MAX_HANDSHAKE_BYTES) {
+        long remaining = BLORP_WEBSOCKET_MAX_HANDSHAKE_BYTES - response->len;
+        long read_size =
+            remaining < BLORP_WEBSOCKET_HANDSHAKE_READ_CHUNK_BYTES
+                ? remaining
+                : BLORP_WEBSOCKET_HANDSHAKE_READ_CHUNK_BYTES;
+        blorp_WebSocketBytesResult chunk_result =
+            blorp_websocket_transport_read_bytes_uncached(session, read_size);
+        if (chunk_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+            blorp_websocket_frame_cleanup_pop(&response);
+            blorp_release(response);
+            return blorp_websocket_bytes_result_error_detail(
+                chunk_result.error_kind,
+                chunk_result.detail);
+        }
+        blorp_Bytes* chunk = chunk_result.value;
+        if (!chunk || chunk->len < 0 || chunk->capacity < 0 ||
+            chunk->len > chunk->capacity || chunk->len > read_size) {
+            if (chunk) blorp_release(chunk);
+            if (chunk_result.detail) blorp_release(chunk_result.detail);
+            blorp_websocket_frame_cleanup_pop(&response);
+            blorp_release(response);
+            return blorp_websocket_bytes_result_error(
+                BLORP_WEBSOCKET_ERROR_OTHER,
+                "websocket transport returned an invalid handshake chunk");
+        }
+        if (chunk->len == 0) {
+            blorp_release(chunk);
+            if (chunk_result.detail) blorp_release(chunk_result.detail);
+            blorp_websocket_frame_cleanup_pop(&response);
+            blorp_release(response);
+            return blorp_websocket_bytes_result_error(
+                BLORP_WEBSOCKET_ERROR_CLOSED,
+                "transport closed while reading websocket handshake");
+        }
+        memcpy(response->data + response->len, chunk->data, (size_t)chunk->len);
+        response->len += chunk->len;
+        long header_end = blorp_websocket_response_header_end(response);
+        if (header_end >= 0) {
+            long header_len = header_end + 4;
+            long buffered_len = response->len - header_len;
+            if (buffered_len > 0) {
+                blorp_WebSocketVoidResult buffer_result =
+                    blorp_websocket_read_buffer_store_copy(
+                        session,
+                        response->data + header_len,
+                        buffered_len);
+                if (buffer_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+                    blorp_release(chunk);
+                    if (chunk_result.detail) blorp_release(chunk_result.detail);
+                    blorp_websocket_frame_cleanup_pop(&response);
+                    blorp_release(response);
+                    return blorp_websocket_bytes_result_error_detail(
+                        buffer_result.error_kind,
+                        buffer_result.detail);
+                }
+                if (buffer_result.detail) blorp_release(buffer_result.detail);
+                response->len = header_len;
+            }
+            blorp_release(chunk);
+            if (chunk_result.detail) blorp_release(chunk_result.detail);
+            blorp_websocket_frame_cleanup_pop(&response);
+            return blorp_websocket_bytes_result_ok(response);
+        }
+        blorp_release(chunk);
+        if (chunk_result.detail) blorp_release(chunk_result.detail);
+    }
+    blorp_websocket_frame_cleanup_pop(&response);
+    blorp_release(response);
+    return blorp_websocket_bytes_result_error(
+        BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED,
+        "websocket handshake response is too large");
+}
+
+static blorp_WebSocketVoidResult
+blorp_websocket_transport_drive_handshake_with_key(
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketConnectTarget* target,
+    blorp_String* key
+) {
+    blorp_WebSocketBytesResult request_result =
+        blorp_websocket_build_handshake_request(target, key);
+    if (request_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return blorp_websocket_void_result_error_detail(
+            request_result.error_kind,
+            request_result.detail);
+    }
+
+    blorp_Bytes* request = request_result.value;
+    blorp_CancelCleanupFrame request_cleanup;
+    blorp_websocket_frame_cleanup_push(&request_cleanup, &request);
+    blorp_WebSocketVoidResult write_result =
+        blorp_websocket_transport_write_all(session, request);
+    blorp_websocket_frame_cleanup_pop(&request);
+    blorp_release(request);
+    if (write_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return write_result;
+    }
+    if (write_result.detail) blorp_release(write_result.detail);
+
+    blorp_WebSocketBytesResult response_result =
+        blorp_websocket_transport_read_handshake_response(session);
+    if (response_result.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return blorp_websocket_void_result_error_detail(
+            response_result.error_kind,
+            response_result.detail);
+    }
+
+    blorp_Bytes* response = response_result.value;
+    blorp_CancelCleanupFrame response_cleanup;
+    blorp_websocket_frame_cleanup_push(&response_cleanup, &response);
+    blorp_WebSocketVoidResult verify_result =
+        blorp_websocket_verify_handshake_response(response, key);
+    blorp_websocket_frame_cleanup_pop(&response);
+    blorp_release(response);
+    if (response_result.detail) blorp_release(response_result.detail);
+    return verify_result;
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_transport_drive_handshake(
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketConnectTarget* target
+) {
+    blorp_String* key = blorp_websocket_generate_client_key();
+    blorp_CancelCleanupFrame key_cleanup;
+    blorp_websocket_string_cleanup_push(&key_cleanup, &key);
+    blorp_WebSocketVoidResult result =
+        blorp_websocket_transport_drive_handshake_with_key(session, target, key);
+    blorp_websocket_string_cleanup_pop(&key);
+    blorp_release(key);
+    return result;
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_backend_handshake_transport(
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketConnectTarget* target
+) {
+    return blorp_websocket_transport_drive_handshake(session, target);
+}
+
+static const blorp_WebSocketBackendOps BLORP_WEBSOCKET_RUNTIME_BACKEND = {
+    .kind = BLORP_WEBSOCKET_BACKEND_RUNTIME,
+    .capabilities = BLORP_WEBSOCKET_BACKEND_CAP_NATIVE_IO,
+    .close = blorp_websocket_backend_close_unsupported,
+    .connect = blorp_websocket_backend_connect_runtime,
+    .handshake = blorp_websocket_backend_handshake_transport,
+    .receive = blorp_websocket_backend_receive_transport_frame,
+    .send_text = blorp_websocket_backend_send_text_transport_frame,
+    .send_binary = blorp_websocket_backend_send_binary_transport_frame,
+    .send_ping = blorp_websocket_backend_send_ping_transport_frame,
+    .send_pong = blorp_websocket_backend_send_pong_transport_frame,
+    .send_close = blorp_websocket_backend_send_close_transport_frame
+};
+
+blorp_WebSocketSessionResult blorp_websocket_connect_raw(blorp_String* url) {
+    blorp_WebSocketConnectTarget target;
+    const char* invalid_reason = blorp_websocket_parse_url(url, &target);
+    if (invalid_reason) {
+        blorp_websocket_connect_target_cleanup(&target);
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_INVALID_URL,
+            invalid_reason);
+    }
+    const blorp_WebSocketBackendOps* backend =
+        blorp_websocket_active_backend();
+    blorp_WebSocketSessionResult result =
+        blorp_websocket_connect_with_backend(&target, backend);
+    blorp_websocket_connect_target_cleanup(&target);
+    return result;
+}
+
+static bool blorp_websocket_ready_for_write(
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketBackendOps** backend,
+    blorp_WebSocketVoidResult* error_result
+) {
+    blorp_WebSocketErrorKind error_kind = BLORP_WEBSOCKET_ERROR_NONE;
+    const char* detail = NULL;
+    if (!blorp_websocket_session_ready_for_io(
+            session, &error_kind, &detail)) {
+        *error_result =
+            blorp_websocket_void_result_error(error_kind, detail);
+        return false;
+    }
+    if (!blorp_websocket_session_backend_ready(
+            session, backend, &error_kind, &detail)) {
+        *error_result =
+            blorp_websocket_void_result_error(error_kind, detail);
+        return false;
+    }
+    return true;
+}
+
+static bool blorp_websocket_ready_for_close_send(
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketBackendOps** backend,
+    blorp_WebSocketVoidResult* error_result
+) {
+    blorp_WebSocketErrorKind error_kind = BLORP_WEBSOCKET_ERROR_NONE;
+    const char* detail = NULL;
+    if (!blorp_websocket_session_ready_for_close_send(
+            session, &error_kind, &detail)) {
+        *error_result =
+            blorp_websocket_void_result_error(error_kind, detail);
+        return false;
+    }
+    if (!blorp_websocket_session_backend_ready(
+            session, backend, &error_kind, &detail)) {
+        *error_result =
+            blorp_websocket_void_result_error(error_kind, detail);
+        return false;
+    }
+    return true;
+}
+
+static bool blorp_websocket_close_code_is_valid(long code) {
+    if (code < 1000 || code > 4999) return false;
+    switch (code) {
+        case 1004:
+        case 1005:
+        case 1006:
+        case 1015:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_validate_text_arg(
+    blorp_String* text
+) {
+    if (!text) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket text payload is missing");
+    }
+    if (text->len < 0 || text->capacity < 0 || text->len > text->capacity) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "invalid websocket text payload");
+    }
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_validate_bytes_arg(
+    blorp_Bytes* bytes,
+    const char* missing_detail,
+    const char* invalid_detail
+) {
+    if (!bytes) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            missing_detail);
+    }
+    if (bytes->len < 0 || bytes->capacity < 0 || bytes->len > bytes->capacity) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            invalid_detail);
+    }
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_validate_control_bytes_arg(
+    blorp_Bytes* bytes,
+    const char* missing_detail,
+    const char* invalid_detail,
+    const char* too_large_detail
+) {
+    blorp_WebSocketVoidResult validation =
+        blorp_websocket_validate_bytes_arg(
+            bytes,
+            missing_detail,
+            invalid_detail);
+    if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return validation;
+    }
+    if (bytes->len > BLORP_WEBSOCKET_CONTROL_MAX_PAYLOAD_BYTES) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            too_large_detail);
+    }
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_validate_close_args(
+    long code,
+    blorp_String* reason
+) {
+    if (!blorp_websocket_close_code_is_valid(code)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "invalid websocket close code");
+    }
+    if (!reason) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket close reason is missing");
+    }
+    if (reason->len < 0 || reason->capacity < 0 ||
+        reason->len > reason->capacity) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "invalid websocket close reason");
+    }
+    if (reason->len > BLORP_WEBSOCKET_CLOSE_REASON_MAX_BYTES) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket close reason must be 123 bytes or fewer");
+    }
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_websocket_validate_received_close_args(
+    long code,
+    blorp_String* reason
+) {
+    if (!reason) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket close reason is missing");
+    }
+    if (reason->len < 0 || reason->capacity < 0 ||
+        reason->len > reason->capacity) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "invalid websocket close reason");
+    }
+    if (reason->len > BLORP_WEBSOCKET_CLOSE_REASON_MAX_BYTES) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket close reason must be 123 bytes or fewer");
+    }
+    if (code == 1005) {
+        if (reason->len == 0) return blorp_websocket_void_result_ok();
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "websocket absent close code cannot include a reason");
+    }
+    if (!blorp_websocket_close_code_is_valid(code)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_PROTOCOL,
+            "invalid websocket close code");
+    }
+    return blorp_websocket_void_result_ok();
+}
+
+blorp_WebSocketVoidResult blorp_websocket_send_text_raw(
+    blorp_WebSocketSession* session,
+    blorp_String* text
+) {
+    const blorp_WebSocketBackendOps* backend = NULL;
+    blorp_WebSocketVoidResult error_result;
+    if (!blorp_websocket_ready_for_write(session, &backend, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult validation =
+        blorp_websocket_validate_text_arg(text);
+    if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return validation;
+    }
+    if (!blorp_websocket_backend_supports(
+            backend,
+            BLORP_WEBSOCKET_BACKEND_CAP_SEND_TEXT)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+            "WebSocket backend does not support text sends");
+    }
+    blorp_WebSocketOperationCleanup op_cleanup;
+    blorp_CancelCleanupFrame cleanup_frame;
+    if (!blorp_websocket_begin_write_cleanup(
+            session, &op_cleanup, &cleanup_frame, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult result = backend->send_text(session, text);
+    blorp_websocket_operation_cleanup_end(&op_cleanup);
+    blorp_websocket_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+blorp_WebSocketMessageResult blorp_websocket_receive_raw(
+    blorp_WebSocketSession* session
+) {
+    const blorp_WebSocketBackendOps* backend = NULL;
+    blorp_WebSocketErrorKind error_kind = BLORP_WEBSOCKET_ERROR_NONE;
+    const char* detail = NULL;
+    if (!blorp_websocket_session_ready_for_io(
+            session, &error_kind, &detail)) {
+        return blorp_websocket_message_result_error(error_kind, detail);
+    }
+    if (!blorp_websocket_session_backend_ready(
+            session, &backend, &error_kind, &detail)) {
+        return blorp_websocket_message_result_error(error_kind, detail);
+    }
+    if (!blorp_websocket_backend_supports(
+            backend,
+            BLORP_WEBSOCKET_BACKEND_CAP_RECEIVE)) {
+        return blorp_websocket_message_result_error(
+            BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+            "WebSocket backend does not support receives");
+    }
+    blorp_WebSocketOperationCleanup op_cleanup;
+    blorp_CancelCleanupFrame cleanup_frame;
+    if (!blorp_websocket_begin_operation_cleanup(
+            session,
+            BLORP_WEBSOCKET_OPERATION_READ,
+            &op_cleanup,
+            &cleanup_frame,
+            &error_kind,
+            &detail)) {
+        return blorp_websocket_message_result_error(error_kind, detail);
+    }
+    blorp_WebSocketMessageResult result =
+        blorp_websocket_normalize_message_result(backend->receive(session));
+    if (result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+        result.message_kind == BLORP_WEBSOCKET_MESSAGE_CLOSE &&
+        session->state == BLORP_WEBSOCKET_SESSION_OPEN) {
+        session->state = BLORP_WEBSOCKET_SESSION_CLOSE_RECEIVED;
+    }
+    blorp_websocket_operation_cleanup_end(&op_cleanup);
+    blorp_websocket_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+blorp_WebSocketVoidResult blorp_websocket_send_binary_raw(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    const blorp_WebSocketBackendOps* backend = NULL;
+    blorp_WebSocketVoidResult error_result;
+    if (!blorp_websocket_ready_for_write(session, &backend, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult validation =
+        blorp_websocket_validate_bytes_arg(
+            bytes,
+            "websocket binary payload is missing",
+            "invalid websocket binary payload");
+    if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return validation;
+    }
+    if (!blorp_websocket_backend_supports(
+            backend,
+            BLORP_WEBSOCKET_BACKEND_CAP_SEND_BINARY)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+            "WebSocket backend does not support binary sends");
+    }
+    blorp_WebSocketOperationCleanup op_cleanup;
+    blorp_CancelCleanupFrame cleanup_frame;
+    if (!blorp_websocket_begin_write_cleanup(
+            session, &op_cleanup, &cleanup_frame, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult result = backend->send_binary(session, bytes);
+    blorp_websocket_operation_cleanup_end(&op_cleanup);
+    blorp_websocket_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+blorp_WebSocketVoidResult blorp_websocket_send_ping_raw(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    const blorp_WebSocketBackendOps* backend = NULL;
+    blorp_WebSocketVoidResult error_result;
+    if (!blorp_websocket_ready_for_write(session, &backend, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult validation =
+        blorp_websocket_validate_control_bytes_arg(
+            bytes,
+            "websocket ping payload is missing",
+            "invalid websocket ping payload",
+            "websocket ping payload must be 125 bytes or fewer");
+    if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return validation;
+    }
+    if (!blorp_websocket_backend_supports(
+            backend,
+            BLORP_WEBSOCKET_BACKEND_CAP_SEND_CONTROL)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+            "WebSocket backend does not support control sends");
+    }
+    blorp_WebSocketOperationCleanup op_cleanup;
+    blorp_CancelCleanupFrame cleanup_frame;
+    if (!blorp_websocket_begin_write_cleanup(
+            session, &op_cleanup, &cleanup_frame, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult result = backend->send_ping(session, bytes);
+    blorp_websocket_operation_cleanup_end(&op_cleanup);
+    blorp_websocket_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+blorp_WebSocketVoidResult blorp_websocket_send_pong_raw(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    const blorp_WebSocketBackendOps* backend = NULL;
+    blorp_WebSocketVoidResult error_result;
+    if (!blorp_websocket_ready_for_write(session, &backend, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult validation =
+        blorp_websocket_validate_control_bytes_arg(
+            bytes,
+            "websocket pong payload is missing",
+            "invalid websocket pong payload",
+            "websocket pong payload must be 125 bytes or fewer");
+    if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return validation;
+    }
+    if (!blorp_websocket_backend_supports(
+            backend,
+            BLORP_WEBSOCKET_BACKEND_CAP_SEND_CONTROL)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+            "WebSocket backend does not support control sends");
+    }
+    blorp_WebSocketOperationCleanup op_cleanup;
+    blorp_CancelCleanupFrame cleanup_frame;
+    if (!blorp_websocket_begin_write_cleanup(
+            session, &op_cleanup, &cleanup_frame, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult result = backend->send_pong(session, bytes);
+    blorp_websocket_operation_cleanup_end(&op_cleanup);
+    blorp_websocket_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+blorp_WebSocketVoidResult blorp_websocket_send_close_raw(
+    blorp_WebSocketSession* session,
+    long code,
+    blorp_String* reason
+) {
+    const blorp_WebSocketBackendOps* backend = NULL;
+    blorp_WebSocketVoidResult error_result;
+    if (!blorp_websocket_ready_for_close_send(
+            session, &backend, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult validation =
+        blorp_websocket_validate_close_args(code, reason);
+    if (validation.error_kind != BLORP_WEBSOCKET_ERROR_NONE) {
+        return validation;
+    }
+    if (validation.detail) blorp_release(validation.detail);
+    if (!blorp_websocket_backend_supports(
+            backend,
+            BLORP_WEBSOCKET_BACKEND_CAP_SEND_CONTROL)) {
+        return blorp_websocket_void_result_error(
+            BLORP_WEBSOCKET_ERROR_UNSUPPORTED,
+            "WebSocket backend does not support control sends");
+    }
+    blorp_WebSocketOperationCleanup op_cleanup;
+    blorp_CancelCleanupFrame cleanup_frame;
+    if (!blorp_websocket_begin_write_cleanup(
+            session, &op_cleanup, &cleanup_frame, &error_result)) {
+        return error_result;
+    }
+    blorp_WebSocketVoidResult result =
+        backend->send_close(session, code, reason);
+    if (result.error_kind == BLORP_WEBSOCKET_ERROR_NONE) {
+        session->state = BLORP_WEBSOCKET_SESSION_CLOSING;
+    }
+    blorp_websocket_operation_cleanup_end(&op_cleanup);
+    blorp_websocket_operation_cleanup_pop(&op_cleanup);
+    return result;
+}
+
+// ============================================================================
+// UDP Networking
+// ============================================================================
+
+static bool blorp_udp_payload_is_valid(const blorp_Bytes* data) {
+    return data && data->len >= 0 && data->capacity >= 0 &&
+           data->len <= data->capacity;
+}
+
+static blorp_UdpErrorKind blorp_udp_error_kind_from_errno(int errnum) {
+    if (errnum == EINTR) return BLORP_UDP_ERROR_INTERRUPTED;
+    if (errnum == EAGAIN) return BLORP_UDP_ERROR_BUSY;
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    if (errnum == EWOULDBLOCK) return BLORP_UDP_ERROR_BUSY;
+#endif
+    if (errnum == ETIMEDOUT) return BLORP_UDP_ERROR_TIMED_OUT;
+    if (errnum == EBADF || errnum == ENOTSOCK) return BLORP_UDP_ERROR_CLOSED;
+    if (errnum == EINVAL || errnum == EDESTADDRREQ || errnum == EMSGSIZE) {
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+#if defined(EAFNOSUPPORT)
+    if (errnum == EAFNOSUPPORT) return BLORP_UDP_ERROR_UNSUPPORTED;
+#endif
+#if defined(EPROTONOSUPPORT)
+    if (errnum == EPROTONOSUPPORT) return BLORP_UDP_ERROR_UNSUPPORTED;
+#endif
+#if defined(EOPNOTSUPP)
+    if (errnum == EOPNOTSUPP) return BLORP_UDP_ERROR_UNSUPPORTED;
+#endif
+#if defined(ENOPROTOOPT)
+    if (errnum == ENOPROTOOPT) return BLORP_UDP_ERROR_UNSUPPORTED;
+#endif
+    return BLORP_UDP_ERROR_OTHER;
+}
+
+static blorp_String* blorp_udp_errno_detail(const char* operation, int errnum) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s: %s", operation, strerror(errnum));
+    return blorp_string_from_buf(buf, (long)strlen(buf));
+}
+
+static blorp_UdpSocketResult blorp_udp_socket_error(
+    blorp_UdpErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_UdpSocketResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_UdpSocketResult blorp_udp_socket_ok(blorp_UdpSocket* socket) {
+    return (blorp_UdpSocketResult){
+        .handle = socket,
+        .error_kind = BLORP_UDP_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_UdpVoidResult blorp_udp_void_error(
+    blorp_UdpErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_UdpVoidResult){ .error_kind = kind, .detail = detail };
+}
+
+static blorp_UdpVoidResult blorp_udp_void_ok(void) {
+    return (blorp_UdpVoidResult){
+        .error_kind = BLORP_UDP_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_UdpIntResult blorp_udp_int_error(
+    blorp_UdpErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_UdpIntResult){
+        .value = 0,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_UdpIntResult blorp_udp_int_ok(long value) {
+    return (blorp_UdpIntResult){
+        .value = value,
+        .error_kind = BLORP_UDP_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_UdpDatagramResult blorp_udp_datagram_error(
+    blorp_UdpErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_UdpDatagramResult){
+        .data = NULL,
+        .host = NULL,
+        .port = 0,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_UdpDatagramResult blorp_udp_datagram_ok(
+    blorp_Bytes* data,
+    blorp_String* host,
+    long port
+) {
+    return (blorp_UdpDatagramResult){
+        .data = data,
+        .host = host,
+        .port = port,
+        .error_kind = BLORP_UDP_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_IoWaiter** blorp_udp_socket_waiter_slot(
+    blorp_UdpSocket* socket,
+    blorp_IoWaitKind kind
+) {
+    if (!socket) return NULL;
+    switch (kind) {
+        case BLORP_IO_WAIT_READ:
+            return &socket->read_waiter;
+        case BLORP_IO_WAIT_WRITE:
+            return &socket->write_waiter;
+        case BLORP_IO_WAIT_NONE:
+        case BLORP_IO_WAIT_ACCEPT:
+        case BLORP_IO_WAIT_CONNECT:
+        default:
+            return NULL;
+    }
+}
+
+static blorp_IoInstallWaiterResult blorp_udp_socket_install_waiter(
+    blorp_UdpSocket* socket,
+    blorp_IoWaiter* waiter
+) {
+    if (!socket || !waiter || waiter->installed ||
+        waiter->wake_reason != BLORP_IO_WAKE_NONE) {
+        return BLORP_IO_INSTALL_WAITER_INVALID;
+    }
+
+    pthread_mutex_lock(&socket->mutex);
+    blorp_IoWaiter** slot =
+        blorp_udp_socket_waiter_slot(socket, waiter->kind);
+    if (!slot || socket->state != BLORP_UDP_STATE_OPEN || socket->fd < 0 ||
+        waiter->generation != socket->generation) {
+        pthread_mutex_unlock(&socket->mutex);
+        return BLORP_IO_INSTALL_WAITER_CLOSED;
+    }
+    if (*slot) {
+        pthread_mutex_unlock(&socket->mutex);
+        return BLORP_IO_INSTALL_WAITER_BUSY;
+    }
+    *slot = waiter;
+    waiter->installed = true;
+    waiter->installed_owner = blorp_io_wait_owner_udp(socket);
+    waiter->next = NULL;
+    pthread_mutex_unlock(&socket->mutex);
+    return BLORP_IO_INSTALL_WAITER_OK;
+}
+
+static int blorp_udp_socket_remove_waiter(
+    blorp_UdpSocket* socket,
+    blorp_IoWaiter* waiter
+) {
+    if (!socket || !waiter) return 0;
+    pthread_mutex_lock(&socket->mutex);
+    blorp_IoWaiter** slot =
+        blorp_udp_socket_waiter_slot(socket, waiter->kind);
+    if (!slot || *slot != waiter) {
+        pthread_mutex_unlock(&socket->mutex);
+        return 0;
+    }
+    *slot = NULL;
+    waiter->installed = false;
+    waiter->installed_owner = blorp_io_wait_owner_none();
+    waiter->next = NULL;
+    pthread_mutex_unlock(&socket->mutex);
+    blorp_io_deadline_queue_remove(waiter);
+    return 1;
+}
+
+static void blorp_udp_socket_extract_waiter_slot_locked(
+    blorp_IoWaiter** slot,
+    blorp_IoWakeReason reason,
+    blorp_IoWaiterList* waiters
+) {
+    if (!slot || !*slot) return;
+    blorp_IoWaiter* waiter = *slot;
+    *slot = NULL;
+    waiter->installed = false;
+    waiter->installed_owner = blorp_io_wait_owner_none();
+    waiter->wake_reason = reason;
+    if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
+    blorp_io_deadline_queue_remove(waiter);
+    blorp_io_waiter_list_push(waiters, waiter);
+}
+
+static blorp_IoWaiterList blorp_udp_socket_extract_waiter(
+    blorp_UdpSocket* socket,
+    blorp_IoWaitKind kind,
+    uint64_t generation,
+    blorp_IoWakeReason reason
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (!socket || reason == BLORP_IO_WAKE_NONE) return waiters;
+    pthread_mutex_lock(&socket->mutex);
+    blorp_IoWaiter** slot = blorp_udp_socket_waiter_slot(socket, kind);
+    if (slot && *slot && socket->generation == generation &&
+        (*slot)->generation == generation) {
+        blorp_udp_socket_extract_waiter_slot_locked(slot, reason, &waiters);
+    }
+    pthread_mutex_unlock(&socket->mutex);
+    return waiters;
+}
+
+static int blorp_udp_socket_cancel_waiter(
+    blorp_UdpSocket* socket,
+    blorp_IoWaiter* waiter
+) {
+    if (!socket || !waiter) return 0;
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    pthread_mutex_lock(&socket->mutex);
+    blorp_IoWaiter** slot =
+        blorp_udp_socket_waiter_slot(socket, waiter->kind);
+    if (slot && *slot == waiter) {
+        blorp_udp_socket_extract_waiter_slot_locked(
+            slot, BLORP_IO_WAKE_CANCELLED, &waiters);
+    }
+    pthread_mutex_unlock(&socket->mutex);
+    int cancelled = waiters.head != NULL;
+    blorp_io_waiter_wake_all(&waiters);
+    return cancelled;
+}
+
+static blorp_IoWaiterList blorp_udp_socket_close_and_extract_waiters(
+    blorp_UdpSocket* socket,
+    blorp_IoWakeReason reason,
+    int* closed_fd_out,
+    uint64_t* closed_generation_out
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (closed_fd_out) *closed_fd_out = -1;
+    if (closed_generation_out) *closed_generation_out = 0;
+    if (!socket) return waiters;
+
+    pthread_mutex_lock(&socket->mutex);
+    if (socket->state != BLORP_UDP_STATE_CLOSED) {
+        socket->state = BLORP_UDP_STATE_CLOSED;
+        if (socket->fd >= 0) {
+            if (closed_fd_out) *closed_fd_out = socket->fd;
+            if (closed_generation_out) *closed_generation_out = socket->generation;
+            close(socket->fd);
+            socket->fd = -1;
+        }
+    }
+    blorp_udp_socket_extract_waiter_slot_locked(
+        &socket->read_waiter, reason, &waiters);
+    blorp_udp_socket_extract_waiter_slot_locked(
+        &socket->write_waiter, reason, &waiters);
+    pthread_mutex_unlock(&socket->mutex);
+    return waiters;
+}
+
+static void blorp_udp_socket_retain(blorp_UdpSocket* socket) {
+    if (socket) {
+        atomic_fetch_add_explicit(&socket->refcount, 1, memory_order_relaxed);
+    }
+}
+
+static void blorp_udp_socket_release(blorp_UdpSocket* socket) {
+    if (!socket) return;
+    long old_refcount =
+        atomic_fetch_sub_explicit(&socket->refcount, 1, memory_order_acq_rel);
+    if (old_refcount > 1) return;
+
+    blorp_IoWaiterList waiters =
+        blorp_udp_socket_close_and_extract_waiters(
+            socket, BLORP_IO_WAKE_CLOSED, NULL, NULL);
+    if (waiters.head) {
+        fprintf(stderr, "blorp: UDP socket destroyed with waiting fiber (bug)\n");
+    }
+    blorp_io_waiter_wake_all(&waiters);
+    pthread_mutex_destroy(&socket->mutex);
+    free(socket);
+}
+
+static void blorp_udp_socket_cleanup_release(void* value) {
+    blorp_udp_socket_release((blorp_UdpSocket*)value);
+}
+
+static void blorp_udp_socket_operation_cleanup_push(
+    blorp_CancelCleanupFrame* frame,
+    blorp_UdpSocket** slot,
+    blorp_UdpSocket* socket
+) {
+#if defined(__clang_analyzer__)
+    (void)frame;
+    (void)slot;
+    (void)socket;
+#else
+    __blorp_task_cleanup_push_slow(
+        frame, slot, socket, blorp_udp_socket_cleanup_release);
+#endif
+}
+
+static void blorp_udp_socket_operation_cleanup_pop(blorp_UdpSocket** slot) {
+#if defined(__clang_analyzer__)
+    (void)slot;
+#else
+    __blorp_task_cleanup_pop_slot_slow(slot);
+#endif
+}
+
+static int blorp_udp_socket_begin_op(
+    blorp_UdpSocket* socket,
+    long* fd_out,
+    uint64_t* generation_out,
+    long* timeout_ms_out
+) {
+    if (!socket || !fd_out) return -1;
+    pthread_mutex_lock(&socket->mutex);
+    if (socket->state != BLORP_UDP_STATE_OPEN || socket->fd < 0) {
+        pthread_mutex_unlock(&socket->mutex);
+        return -1;
+    }
+    *fd_out = socket->fd;
+    if (generation_out) *generation_out = socket->generation;
+    if (timeout_ms_out) *timeout_ms_out = socket->default_timeout_ms;
+    return 0;
+}
+
+static void blorp_udp_socket_end_op(blorp_UdpSocket* socket) {
+    if (socket) pthread_mutex_unlock(&socket->mutex);
+}
+
+static bool blorp_udp_host_is_numeric(const char* host, int family) {
+    if (!host || host[0] == '\0') return false;
+
+    struct in_addr addr4;
+    if ((family == AF_INET || family == AF_UNSPEC) &&
+        inet_pton(AF_INET, host, &addr4) == 1) {
+        return true;
+    }
+
+    struct in6_addr addr6;
+    if ((family == AF_INET6 || family == AF_UNSPEC) &&
+        inet_pton(AF_INET6, host, &addr6) == 1) {
+        return true;
+    }
+
+    return false;
+}
+
+static blorp_UdpErrorKind blorp_udp_copy_host(
+    const char* operation,
+    const blorp_String* host,
+    char* host_buf,
+    size_t host_buf_len,
+    blorp_String** detail_out
+) {
+    if (detail_out) *detail_out = NULL;
+    if (!operation || !host_buf || host_buf_len == 0 || !detail_out) {
+        if (detail_out) *detail_out = blorp_string_literal("udp: invalid host");
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+    if (!host) {
+        *detail_out = blorp_string_literal("host must not be null");
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+    if (host->len < 0 || host->capacity < 0 || host->len > host->capacity) {
+        *detail_out = blorp_string_literal("host has invalid length");
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+    if ((size_t)host->len >= host_buf_len) {
+        *detail_out = blorp_string_literal("host must be shorter than 256 bytes");
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+    if (memchr(host->data, '\0', (size_t)host->len) != NULL) {
+        *detail_out = blorp_string_literal("host contains NUL byte");
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+    (void)operation;
+    memcpy(host_buf, host->data, (size_t)host->len);
+    host_buf[host->len] = '\0';
+    return BLORP_UDP_ERROR_NONE;
+}
+
+static int blorp_udp_getaddrinfo(
+    const char* host,
+    const char* port,
+    struct addrinfo* hints,
+    struct addrinfo** res
+) {
+    const char* lookup_host = host;
+    if (host && host[0] == '\0' && hints && (hints->ai_flags & AI_PASSIVE)) {
+        lookup_host = NULL;
+    }
+
+    struct addrinfo numeric_hints;
+    if (lookup_host &&
+        blorp_udp_host_is_numeric(lookup_host, hints ? hints->ai_family : AF_UNSPEC)) {
+        numeric_hints = hints ? *hints : (struct addrinfo){0};
+        hints = &numeric_hints;
+        hints->ai_flags |= AI_NUMERICHOST;
+    }
+    return getaddrinfo(lookup_host, port, hints, res);
+}
+
+static blorp_UdpErrorKind blorp_udp_resolve_addr(
+    const char* operation,
+    const blorp_String* host,
+    long port,
+    bool passive,
+    bool numeric_only,
+    struct addrinfo** out,
+    blorp_String** detail_out
+) {
+    if (out) *out = NULL;
+    if (detail_out) *detail_out = NULL;
+    if (!out || !detail_out) {
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+    if (port < 0 || port > 65535) {
+        *detail_out = blorp_string_literal("port must be between 0 and 65535");
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+
+    char host_buf[256];
+    blorp_UdpErrorKind host_kind =
+        blorp_udp_copy_host(operation, host, host_buf, sizeof(host_buf), detail_out);
+    if (host_kind != BLORP_UDP_ERROR_NONE) return host_kind;
+    if (numeric_only) {
+        if (host_buf[0] == '\0') {
+            if (!passive) {
+                *detail_out =
+                    blorp_string_literal("host must be a numeric IPv4 address");
+                return BLORP_UDP_ERROR_INVALID_INPUT;
+            }
+        } else if (!blorp_udp_host_is_numeric(host_buf, AF_INET)) {
+            *detail_out = blorp_string_literal(
+                passive
+                    ? "host must be a numeric IPv4 address or empty bind-any host"
+                    : "host must be a numeric IPv4 address");
+            return BLORP_UDP_ERROR_INVALID_INPUT;
+        }
+    }
+
+    char port_buf[8];
+    snprintf(port_buf, sizeof(port_buf), "%ld", port);
+
+    struct addrinfo hints = {0};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (passive) hints.ai_flags = AI_PASSIVE;
+    if (numeric_only && host_buf[0] != '\0') hints.ai_flags |= AI_NUMERICHOST;
+
+    int rc = blorp_udp_getaddrinfo(host_buf, port_buf, &hints, out);
+    if (rc != 0) {
+        char err_buf[256];
+        snprintf(
+            err_buf,
+            sizeof(err_buf),
+            "%s: getaddrinfo: %s",
+            operation,
+            gai_strerror(rc));
+        *detail_out = blorp_string_from_buf(err_buf, (long)strlen(err_buf));
+        return BLORP_UDP_ERROR_DNS;
+    }
+    return BLORP_UDP_ERROR_NONE;
+}
+
+static blorp_UdpErrorKind blorp_udp_socket_fd(
+    blorp_UdpSocket* socket,
+    int* fd_out,
+    blorp_String** detail_out
+) {
+    if (fd_out) *fd_out = -1;
+    if (detail_out) *detail_out = NULL;
+    if (!socket) {
+        if (detail_out) *detail_out = blorp_string_literal("udp socket is closed");
+        return BLORP_UDP_ERROR_CLOSED;
+    }
+    if (!fd_out) {
+        if (detail_out) *detail_out = blorp_string_literal("missing fd output");
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+    pthread_mutex_lock(&socket->mutex);
+    if (socket->state != BLORP_UDP_STATE_OPEN || socket->fd < 0) {
+        pthread_mutex_unlock(&socket->mutex);
+        if (detail_out) *detail_out = blorp_string_literal("udp socket is closed");
+        return BLORP_UDP_ERROR_CLOSED;
+    }
+    *fd_out = socket->fd;
+    pthread_mutex_unlock(&socket->mutex);
+    return BLORP_UDP_ERROR_NONE;
+}
+
+blorp_UdpSocketResult blorp_udp_socket_raw(void) {
+    int fd = blorp_runtime_socket_cloexec(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        int errnum = errno;
+        return blorp_udp_socket_error(
+            blorp_udp_error_kind_from_errno(errnum),
+            blorp_udp_errno_detail("udp socket", errnum));
+    }
+    if (blorp_io_reactor_set_nonblocking(fd) < 0) {
+        int errnum = errno;
+        close(fd);
+        return blorp_udp_socket_error(
+            blorp_udp_error_kind_from_errno(errnum),
+            blorp_udp_errno_detail("udp socket nonblocking", errnum));
+    }
+
+    blorp_UdpSocket* socket =
+        (blorp_UdpSocket*)blorp_malloc_checked(sizeof(blorp_UdpSocket));
+    atomic_init(&socket->refcount, 1);
+    socket->fd = fd;
+    socket->generation =
+        atomic_fetch_add_explicit(&blorp_udp_next_generation, 1, memory_order_relaxed);
+    socket->state = BLORP_UDP_STATE_OPEN;
+    socket->default_timeout_ms = -1;
+    socket->read_waiter = NULL;
+    socket->write_waiter = NULL;
+    if (pthread_mutex_init(&socket->mutex, NULL) != 0) {
+        close(socket->fd);
+        free(socket);
+        return blorp_udp_socket_error(
+            BLORP_UDP_ERROR_OTHER,
+            blorp_string_literal("udp socket: failed to initialize mutex"));
+    }
+    return blorp_udp_socket_ok(socket);
+}
+
+static blorp_UdpVoidResult blorp_udp_bind_with_policy(
+    blorp_UdpSocket* socket,
+    blorp_String* host,
+    long port,
+    bool numeric_only
+) {
+    int fd = -1;
+    blorp_String* detail = NULL;
+    blorp_UdpErrorKind fd_kind = blorp_udp_socket_fd(socket, &fd, &detail);
+    if (fd_kind != BLORP_UDP_ERROR_NONE) {
+        return blorp_udp_void_error(fd_kind, detail);
+    }
+
+    struct addrinfo* res = NULL;
+    blorp_UdpErrorKind resolve_kind =
+        blorp_udp_resolve_addr(
+            "udp bind", host, port, true, numeric_only, &res, &detail);
+    if (resolve_kind != BLORP_UDP_ERROR_NONE) {
+        return blorp_udp_void_error(resolve_kind, detail);
+    }
+
+    if (bind(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        int errnum = errno;
+        freeaddrinfo(res);
+        return blorp_udp_void_error(
+            blorp_udp_error_kind_from_errno(errnum),
+            blorp_udp_errno_detail("udp bind", errnum));
+    }
+    freeaddrinfo(res);
+    return blorp_udp_void_ok();
+}
+
+blorp_UdpVoidResult blorp_udp_bind_raw(
+    blorp_UdpSocket* socket,
+    blorp_String* host,
+    long port
+) {
+    return blorp_udp_bind_with_policy(socket, host, port, false);
+}
+
+blorp_UdpVoidResult blorp_udp_bind_numeric_raw(
+    blorp_UdpSocket* socket,
+    blorp_String* host,
+    long port
+) {
+    return blorp_udp_bind_with_policy(socket, host, port, true);
+}
+
+static blorp_UdpIntResult blorp_udp_send_to_with_policy(
+    blorp_UdpSocket* socket,
+    blorp_Bytes* data,
+    blorp_String* host,
+    long port,
+    bool numeric_only
+) {
+    int fd = -1;
+    blorp_String* detail = NULL;
+    blorp_UdpErrorKind fd_kind = blorp_udp_socket_fd(socket, &fd, &detail);
+    if (fd_kind != BLORP_UDP_ERROR_NONE) {
+        return blorp_udp_int_error(fd_kind, detail);
+    }
+    if (!blorp_udp_payload_is_valid(data)) {
+        return blorp_udp_int_error(
+            BLORP_UDP_ERROR_INVALID_INPUT,
+            blorp_string_literal("payload bytes are invalid"));
+    }
+
+    struct addrinfo* res = NULL;
+    blorp_UdpErrorKind resolve_kind =
+        blorp_udp_resolve_addr(
+            "udp send_to", host, port, false, numeric_only, &res, &detail);
+    if (resolve_kind != BLORP_UDP_ERROR_NONE) {
+        return blorp_udp_int_error(resolve_kind, detail);
+    }
+
+    while (true) {
+        ssize_t n = sendto(
+            fd,
+            data->data,
+            (size_t)data->len,
+            0,
+            res->ai_addr,
+            res->ai_addrlen);
+        if (n >= 0) {
+            freeaddrinfo(res);
+            return blorp_udp_int_ok((long)n);
+        }
+        int errnum = errno;
+        if (errnum == EINTR) continue;
+        freeaddrinfo(res);
+        return blorp_udp_int_error(
+            blorp_udp_error_kind_from_errno(errnum),
+            blorp_udp_errno_detail("udp send_to", errnum));
+    }
+}
+
+blorp_UdpIntResult blorp_udp_send_to_raw(
+    blorp_UdpSocket* socket,
+    blorp_Bytes* data,
+    blorp_String* host,
+    long port
+) {
+    return blorp_udp_send_to_with_policy(socket, data, host, port, false);
+}
+
+blorp_UdpIntResult blorp_udp_send_to_numeric_raw(
+    blorp_UdpSocket* socket,
+    blorp_Bytes* data,
+    blorp_String* host,
+    long port
+) {
+    return blorp_udp_send_to_with_policy(socket, data, host, port, true);
+}
+
+static blorp_UdpIntResult blorp_udp_send_to_wait_with_policy(
+    blorp_UdpSocket* socket,
+    blorp_Bytes* data,
+    blorp_String* host,
+    long port,
+    bool numeric_only
+) {
+    if (!socket) {
+        return blorp_udp_int_error(
+            BLORP_UDP_ERROR_CLOSED,
+            blorp_string_literal("udp socket is closed"));
+    }
+    if (!blorp_udp_payload_is_valid(data)) {
+        return blorp_udp_int_error(
+            BLORP_UDP_ERROR_INVALID_INPUT,
+            blorp_string_literal("payload bytes are invalid"));
+    }
+
+    blorp_String* detail = NULL;
+    struct addrinfo* res = NULL;
+    blorp_UdpErrorKind resolve_kind =
+        blorp_udp_resolve_addr(
+            "udp send_to_wait",
+            host,
+            port,
+            false,
+            numeric_only,
+            &res,
+            &detail);
+    if (resolve_kind != BLORP_UDP_ERROR_NONE) {
+        return blorp_udp_int_error(resolve_kind, detail);
+    }
+    if (!res || res->ai_addrlen > sizeof(struct sockaddr_storage)) {
+        if (res) freeaddrinfo(res);
+        return blorp_udp_int_error(
+            BLORP_UDP_ERROR_INVALID_INPUT,
+            blorp_string_literal("udp send_to_wait: resolved address is invalid"));
+    }
+
+    struct sockaddr_storage addr;
+    memset(&addr, 0, sizeof(addr));
+    memcpy(&addr, res->ai_addr, res->ai_addrlen);
+    socklen_t addr_len = res->ai_addrlen;
+    freeaddrinfo(res);
+
+    blorp_udp_socket_retain(socket);
+    blorp_CancelCleanupFrame socket_cleanup;
+    blorp_udp_socket_operation_cleanup_push(
+        &socket_cleanup, &socket, socket);
+    blorp_UdpIntResult result;
+
+    while (true) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            result = blorp_udp_int_error(
+                BLORP_UDP_ERROR_INTERRUPTED,
+                blorp_string_literal("udp send_to_wait: cancelled"));
+            goto finish;
+        }
+
+        long fd = -1;
+        uint64_t generation = 0;
+        long timeout_ms = -1;
+        if (blorp_udp_socket_begin_op(
+                socket, &fd, &generation, &timeout_ms) < 0) {
+            result = blorp_udp_int_error(
+                BLORP_UDP_ERROR_CLOSED,
+                blorp_string_literal("udp socket is closed"));
+            goto finish;
+        }
+
+        ssize_t n = sendto(
+            (int)fd,
+            data->data,
+            (size_t)data->len,
+            0,
+            (const struct sockaddr*)&addr,
+            addr_len);
+        int errnum = errno;
+        blorp_udp_socket_end_op(socket);
+
+        if (n >= 0) {
+            result = blorp_udp_int_ok((long)n);
+            goto finish;
+        }
+        if (errnum == EINTR) continue;
+        if (errnum == EAGAIN || errnum == EWOULDBLOCK) {
+            blorp_IoWakeReason reason;
+            if (blorp_udp_socket_wait_for_reactor(
+                    socket,
+                    BLORP_IO_WAIT_WRITE,
+                    BLORP_IO_INTEREST_WRITE,
+                    (int)fd,
+                    generation,
+                    timeout_ms,
+                    &reason) != 0) {
+                result = blorp_udp_int_error(
+                    BLORP_UDP_ERROR_OTHER,
+                    blorp_string_literal("udp send_to_wait: reactor unavailable"));
+                goto finish;
+            }
+
+            switch (reason) {
+                case BLORP_IO_WAKE_READY:
+                    continue;
+                case BLORP_IO_WAKE_TIMEOUT:
+                    result = blorp_udp_int_error(
+                        BLORP_UDP_ERROR_TIMED_OUT,
+                        blorp_string_literal("udp send_to_wait: timed out"));
+                    goto finish;
+                case BLORP_IO_WAKE_CANCELLED:
+                    (void)__blorp_cancel_current_task_if_requested();
+                    result = blorp_udp_int_error(
+                        BLORP_UDP_ERROR_INTERRUPTED,
+                        blorp_string_literal("udp send_to_wait: cancelled"));
+                    goto finish;
+                case BLORP_IO_WAKE_BUSY:
+                    result = blorp_udp_int_error(
+                        BLORP_UDP_ERROR_BUSY,
+                        blorp_string_literal(
+                            "udp send_to_wait: send already in progress"));
+                    goto finish;
+                case BLORP_IO_WAKE_CLOSED:
+                case BLORP_IO_WAKE_NONE:
+                default:
+                    result = blorp_udp_int_error(
+                        BLORP_UDP_ERROR_CLOSED,
+                        blorp_string_literal("udp socket is closed"));
+                    goto finish;
+            }
+        }
+
+        result = blorp_udp_int_error(
+            blorp_udp_error_kind_from_errno(errnum),
+            blorp_udp_errno_detail("udp send_to_wait", errnum));
+        goto finish;
+    }
+
+finish:
+    blorp_udp_socket_operation_cleanup_pop(&socket);
+    blorp_udp_socket_release(socket);
+    return result;
+}
+
+blorp_UdpIntResult blorp_udp_send_to_wait_raw(
+    blorp_UdpSocket* socket,
+    blorp_Bytes* data,
+    blorp_String* host,
+    long port
+) {
+    return blorp_udp_send_to_wait_with_policy(socket, data, host, port, false);
+}
+
+blorp_UdpIntResult blorp_udp_send_to_wait_numeric_raw(
+    blorp_UdpSocket* socket,
+    blorp_Bytes* data,
+    blorp_String* host,
+    long port
+) {
+    return blorp_udp_send_to_wait_with_policy(socket, data, host, port, true);
+}
+
+static blorp_UdpErrorKind blorp_udp_sockaddr_to_host_port(
+    const struct sockaddr_storage* addr,
+    socklen_t addr_len,
+    blorp_String** host_out,
+    long* port_out,
+    blorp_String** detail_out
+) {
+    if (host_out) *host_out = NULL;
+    if (port_out) *port_out = 0;
+    if (detail_out) *detail_out = NULL;
+    if (!addr || !host_out || !port_out || !detail_out) {
+        if (detail_out) {
+            *detail_out = blorp_string_literal("udp recv_from: missing address output");
+        }
+        return BLORP_UDP_ERROR_INVALID_INPUT;
+    }
+
+    char host[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    int rc = getnameinfo(
+        (const struct sockaddr*)addr,
+        addr_len,
+        host,
+        sizeof(host),
+        service,
+        sizeof(service),
+        NI_NUMERICHOST | NI_NUMERICSERV);
+    if (rc != 0) {
+        char err_buf[256];
+        snprintf(
+            err_buf,
+            sizeof(err_buf),
+            "udp recv_from: getnameinfo: %s",
+            gai_strerror(rc));
+        *detail_out = blorp_string_from_buf(err_buf, (long)strlen(err_buf));
+        return BLORP_UDP_ERROR_DNS;
+    }
+
+    char* end = NULL;
+    errno = 0;
+    long parsed_port = strtol(service, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed_port < 0 ||
+        parsed_port > 65535) {
+        *detail_out = blorp_string_literal("udp recv_from: invalid source port");
+        return BLORP_UDP_ERROR_OTHER;
+    }
+
+    *host_out = blorp_string_from_buf(host, (long)strlen(host));
+    *port_out = parsed_port;
+    return BLORP_UDP_ERROR_NONE;
+}
+
+blorp_UdpDatagramResult blorp_udp_recv_from_raw(
+    blorp_UdpSocket* socket,
+    long max_bytes
+) {
+    if (max_bytes <= 0 || max_bytes > 65535) {
+        return blorp_udp_datagram_error(
+            BLORP_UDP_ERROR_INVALID_INPUT,
+            blorp_string_literal("max_bytes must be between 1 and 65535"));
+    }
+    if (!socket) {
+        return blorp_udp_datagram_error(
+            BLORP_UDP_ERROR_CLOSED,
+            blorp_string_literal("udp socket is closed"));
+    }
+
+    blorp_udp_socket_retain(socket);
+    blorp_CancelCleanupFrame socket_cleanup;
+    blorp_udp_socket_operation_cleanup_push(
+        &socket_cleanup, &socket, socket);
+    blorp_UdpDatagramResult result;
+
+    while (true) {
+        if (__blorp_cancel_current_task_if_requested()) {
+            result = blorp_udp_datagram_error(
+                BLORP_UDP_ERROR_INTERRUPTED,
+                blorp_string_literal("udp recv_from: cancelled"));
+            goto finish;
+        }
+
+        long fd = -1;
+        uint64_t generation = 0;
+        long timeout_ms = -1;
+        if (blorp_udp_socket_begin_op(
+                socket, &fd, &generation, &timeout_ms) < 0) {
+            result = blorp_udp_datagram_error(
+                BLORP_UDP_ERROR_CLOSED,
+                blorp_string_literal("udp socket is closed"));
+            goto finish;
+        }
+
+        blorp_Bytes* buf = blorp_bytes_new(max_bytes);
+        struct sockaddr_storage addr;
+        socklen_t addr_len = sizeof(addr);
+        ssize_t n = recvfrom(
+            (int)fd,
+            buf->data,
+            (size_t)max_bytes,
+            0,
+            (struct sockaddr*)&addr,
+            &addr_len);
+        if (n >= 0) {
+            blorp_udp_socket_end_op(socket);
+            buf->len = (long)n;
+            blorp_String* host = NULL;
+            long port = 0;
+            blorp_String* detail = NULL;
+            blorp_UdpErrorKind addr_kind =
+                blorp_udp_sockaddr_to_host_port(
+                    &addr, addr_len, &host, &port, &detail);
+            if (addr_kind != BLORP_UDP_ERROR_NONE) {
+                blorp_release((void*)buf);
+                result = blorp_udp_datagram_error(addr_kind, detail);
+                goto finish;
+            }
+            result = blorp_udp_datagram_ok(buf, host, port);
+            goto finish;
+        }
+
+        int errnum = errno;
+        blorp_udp_socket_end_op(socket);
+        blorp_release((void*)buf);
+
+        if (errnum == EINTR) continue;
+        if (errnum == EAGAIN || errnum == EWOULDBLOCK) {
+            blorp_IoWakeReason reason;
+            if (blorp_udp_socket_wait_for_reactor(
+                    socket,
+                    BLORP_IO_WAIT_READ,
+                    BLORP_IO_INTEREST_READ,
+                    (int)fd,
+                    generation,
+                    timeout_ms,
+                    &reason) != 0) {
+                result = blorp_udp_datagram_error(
+                    BLORP_UDP_ERROR_OTHER,
+                    blorp_string_literal("udp recv_from: reactor unavailable"));
+                goto finish;
+            }
+
+            switch (reason) {
+                case BLORP_IO_WAKE_READY:
+                    continue;
+                case BLORP_IO_WAKE_TIMEOUT:
+                    result = blorp_udp_datagram_error(
+                        BLORP_UDP_ERROR_TIMED_OUT,
+                        blorp_string_literal("udp recv_from: timed out"));
+                    goto finish;
+                case BLORP_IO_WAKE_CANCELLED:
+                    (void)__blorp_cancel_current_task_if_requested();
+                    result = blorp_udp_datagram_error(
+                        BLORP_UDP_ERROR_INTERRUPTED,
+                        blorp_string_literal("udp recv_from: cancelled"));
+                    goto finish;
+                case BLORP_IO_WAKE_BUSY:
+                    result = blorp_udp_datagram_error(
+                        BLORP_UDP_ERROR_BUSY,
+                        blorp_string_literal(
+                            "udp recv_from: receive already in progress"));
+                    goto finish;
+                case BLORP_IO_WAKE_CLOSED:
+                case BLORP_IO_WAKE_NONE:
+                default:
+                    result = blorp_udp_datagram_error(
+                        BLORP_UDP_ERROR_CLOSED,
+                        blorp_string_literal("udp socket is closed"));
+                    goto finish;
+            }
+        }
+        result = blorp_udp_datagram_error(
+            blorp_udp_error_kind_from_errno(errnum),
+            blorp_udp_errno_detail("udp recv_from", errnum));
+        goto finish;
+    }
+
+finish:
+    blorp_udp_socket_operation_cleanup_pop(&socket);
+    blorp_udp_socket_release(socket);
+    return result;
+}
+
+blorp_UdpIntResult blorp_udp_local_port_raw(blorp_UdpSocket* socket) {
+    int fd = -1;
+    blorp_String* detail = NULL;
+    blorp_UdpErrorKind fd_kind = blorp_udp_socket_fd(socket, &fd, &detail);
+    if (fd_kind != BLORP_UDP_ERROR_NONE) {
+        return blorp_udp_int_error(fd_kind, detail);
+    }
+
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr*)&addr, &addr_len) < 0) {
+        int errnum = errno;
+        return blorp_udp_int_error(
+            blorp_udp_error_kind_from_errno(errnum),
+            blorp_udp_errno_detail("udp local_port", errnum));
+    }
+
+    switch (addr.ss_family) {
+        case AF_INET:
+            return blorp_udp_int_ok(
+                (long)ntohs(((struct sockaddr_in*)&addr)->sin_port));
+        case AF_INET6:
+            return blorp_udp_int_ok(
+                (long)ntohs(((struct sockaddr_in6*)&addr)->sin6_port));
+        default:
+            return blorp_udp_int_error(
+                BLORP_UDP_ERROR_UNSUPPORTED,
+                blorp_string_literal("udp local_port: unsupported address family"));
+    }
+}
+
+void blorp_udp_close_socket(blorp_UdpSocket* socket) {
+    if (!socket) return;
+    int closed_fd = -1;
+    uint64_t closed_generation = 0;
+    blorp_IoWaiterList waiters =
+        blorp_udp_socket_close_and_extract_waiters(
+            socket, BLORP_IO_WAKE_CLOSED, &closed_fd, &closed_generation);
+    if (closed_fd >= 0 && blorp_io_reactor_is_started()) {
+        (void)blorp_io_reactor_unregister_fd_generation(
+            closed_fd, closed_generation);
+    }
+    blorp_io_waiter_wake_all(&waiters);
+    blorp_udp_socket_release(socket);
 }
 
 // ============================================================================
@@ -14900,14 +21568,17 @@ static void blorp_io_deadline_heap_reserve(size_t needed) {
 }
 
 static blorp_IoDeadlineEntry blorp_io_deadline_entry_empty(void) {
-    return (blorp_IoDeadlineEntry){ .waiter = NULL, .owner = NULL };
+    return (blorp_IoDeadlineEntry){
+        .waiter = NULL,
+        .owner = { .kind = BLORP_IO_WAIT_OWNER_NONE, .value = { .tcp_inner = NULL } }
+    };
 }
 
 static void blorp_io_deadline_entry_release(blorp_IoDeadlineEntry* entry) {
     if (!entry) return;
-    if (entry->owner) blorp_tcp_inner_release(entry->owner);
+    blorp_io_wait_owner_release(entry->owner);
     if (entry->waiter) blorp_io_waiter_release(entry->waiter);
-    entry->owner = NULL;
+    entry->owner = blorp_io_wait_owner_none();
     entry->waiter = NULL;
 }
 
@@ -14922,7 +21593,7 @@ static blorp_IoDeadlineEntry blorp_io_deadline_heap_remove_at_locked(size_t idx)
     };
     removed->deadline_index = -1;
     removed->deadline_queued = false;
-    removed->deadline_owner = NULL;
+    removed->deadline_owner = blorp_io_wait_owner_none();
     __blorp_io_deadline_queue.len--;
     if (idx == __blorp_io_deadline_queue.len) return removed_entry;
     __blorp_io_deadline_queue.items[idx] =
@@ -14942,7 +21613,7 @@ static blorp_IoDeadlineEntry blorp_io_deadline_heap_pop_min_locked(void) {
 
 static void blorp_io_deadline_queue_insert(
     blorp_IoWaiter* waiter,
-    blorp_TcpInner* owner
+    blorp_IoWaitOwner owner
 ) {
     if (!waiter || waiter->deadline_ns == 0) return;
     blorp_io_deadline_queue_ensure_init();
@@ -14971,7 +21642,7 @@ static void blorp_io_deadline_queue_insert(
     size_t idx = __blorp_io_deadline_queue.len++;
     __blorp_io_deadline_queue.items[idx] = waiter;
     blorp_io_waiter_retain(waiter);
-    if (owner) blorp_tcp_inner_retain(owner);
+    blorp_io_wait_owner_retain(owner);
     waiter->deadline_index = (long)idx;
     waiter->deadline_queued = true;
     waiter->deadline_owner = owner;
@@ -15041,10 +21712,11 @@ static uint64_t blorp_io_deadline_queue_drain(void) {
         blorp_IoDeadlineEntry expired = blorp_io_deadline_heap_pop_min_locked();
         pthread_mutex_unlock(&__blorp_io_deadline_queue.lock);
 
-        if (expired.waiter && expired.owner) {
-            blorp_IoWaiterList timed_out = blorp_tcp_inner_extract_waiter(
-                expired.owner, expired.waiter->kind, expired.waiter->generation,
-                BLORP_IO_WAKE_TIMEOUT);
+        if (expired.waiter && blorp_io_wait_owner_is_some(expired.owner)) {
+            blorp_IoWaiterList timed_out =
+                blorp_io_wait_owner_extract_waiter(
+                    expired.owner, expired.waiter->kind,
+                    expired.waiter->generation, BLORP_IO_WAKE_TIMEOUT);
             blorp_io_waiter_wake_all(&timed_out);
         }
         blorp_io_deadline_entry_release(&expired);
@@ -15073,7 +21745,7 @@ static void blorp_io_deadline_queue_clear(void) {
         removed[i].owner = waiter->deadline_owner;
         waiter->deadline_queued = false;
         waiter->deadline_index = -1;
-        waiter->deadline_owner = NULL;
+        waiter->deadline_owner = blorp_io_wait_owner_none();
     }
     free(__blorp_io_deadline_queue.items);
     __blorp_io_deadline_queue.items = NULL;
@@ -15086,8 +21758,85 @@ static void blorp_io_deadline_queue_clear(void) {
     free(removed);
 }
 
-static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
-    blorp_TcpInner* inner,
+typedef struct {
+    blorp_IoWaitOwner owner;
+    blorp_IoWaiter* waiter;
+    bool active;
+} blorp_IoWaiterCleanup;
+
+static void blorp_io_waiter_cleanup_release(void* value) {
+    blorp_IoWaiterCleanup* cleanup = (blorp_IoWaiterCleanup*)value;
+    if (!cleanup || !cleanup->active || !cleanup->waiter) return;
+    cleanup->active = false;
+    if (cleanup->waiter->installed) {
+        (void)blorp_io_wait_owner_remove_waiter(
+            cleanup->owner, cleanup->waiter);
+    } else if (cleanup->waiter->deadline_queued) {
+        blorp_io_deadline_queue_remove(cleanup->waiter);
+    }
+    blorp_io_waiter_release(cleanup->waiter);
+    cleanup->waiter = NULL;
+}
+
+static blorp_IoInstallWaiterResult blorp_io_wait_owner_install_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaiter* waiter
+) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return BLORP_IO_INSTALL_WAITER_INVALID;
+        case BLORP_IO_WAIT_OWNER_TCP:
+            return blorp_tcp_inner_install_waiter(
+                owner.value.tcp_inner, waiter);
+        case BLORP_IO_WAIT_OWNER_UDP:
+            return blorp_udp_socket_install_waiter(
+                owner.value.udp_socket, waiter);
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
+static int blorp_io_wait_owner_remove_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaiter* waiter
+) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return 0;
+        case BLORP_IO_WAIT_OWNER_TCP:
+            return blorp_tcp_inner_remove_waiter(
+                owner.value.tcp_inner, waiter);
+        case BLORP_IO_WAIT_OWNER_UDP:
+            return blorp_udp_socket_remove_waiter(
+                owner.value.udp_socket, waiter);
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
+static int blorp_io_wait_owner_cancel_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaiter* waiter
+) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return 0;
+        case BLORP_IO_WAIT_OWNER_TCP:
+            return blorp_tcp_inner_cancel_waiter(
+                owner.value.tcp_inner, waiter);
+        case BLORP_IO_WAIT_OWNER_UDP:
+            return blorp_udp_socket_cancel_waiter(
+                owner.value.udp_socket, waiter);
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
+static blorp_IoWakeReason blorp_io_wait_owner_park_current_fiber(
+    blorp_IoWaitOwner owner,
     blorp_IoWaitKind kind,
     int fd,
     uint64_t generation,
@@ -15099,13 +21848,12 @@ static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
     }
 
     blorp_Fiber* self = __blorp_current_fiber;
-    if (!inner || !self) return BLORP_IO_WAKE_NONE;
-
-    pthread_mutex_lock(&inner->mutex);
-    bool open = inner->state == BLORP_TCP_STATE_OPEN && inner->fd == fd &&
-        inner->generation == generation;
-    pthread_mutex_unlock(&inner->mutex);
-    if (!open) return BLORP_IO_WAKE_CLOSED;
+    if (!blorp_io_wait_owner_is_some(owner) || !self) {
+        return BLORP_IO_WAKE_NONE;
+    }
+    if (!blorp_io_wait_owner_is_open(owner, fd, generation)) {
+        return BLORP_IO_WAKE_CLOSED;
+    }
 
     uint64_t deadline_ns = 0;
     if (timeout_ms >= 0) {
@@ -15117,22 +21865,37 @@ static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
 
     blorp_IoWaiter* waiter =
         blorp_io_waiter_new(kind, self, generation, deadline_ns);
+    blorp_IoWaiterCleanup waiter_cleanup = {
+        .owner = owner,
+        .waiter = waiter,
+        .active = true
+    };
+    blorp_CancelCleanupFrame cleanup_frame;
+    __blorp_task_cleanup_push_slow(
+        &cleanup_frame,
+        &waiter_cleanup,
+        &waiter_cleanup,
+        blorp_io_waiter_cleanup_release);
     blorp_IoWakeReason result = BLORP_IO_WAKE_NONE;
 
     __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-    blorp_TcpInstallWaiterResult install_result =
-        blorp_tcp_inner_install_waiter(inner, waiter);
+    blorp_IoInstallWaiterResult install_result =
+        blorp_io_wait_owner_install_waiter(owner, waiter);
     switch (install_result) {
-        case BLORP_TCP_INSTALL_WAITER_OK:
+        case BLORP_IO_INSTALL_WAITER_OK:
             break;
-        case BLORP_TCP_INSTALL_WAITER_BUSY:
+        case BLORP_IO_INSTALL_WAITER_BUSY:
             __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+            waiter_cleanup.active = false;
+            __blorp_task_cleanup_pop_slot_slow(&waiter_cleanup);
             blorp_io_waiter_release(waiter);
             return BLORP_IO_WAKE_BUSY;
-        case BLORP_TCP_INSTALL_WAITER_INVALID:
-        case BLORP_TCP_INSTALL_WAITER_CLOSED:
+        case BLORP_IO_INSTALL_WAITER_INVALID:
+        case BLORP_IO_INSTALL_WAITER_CLOSED:
         default:
             __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+            waiter_cleanup.active = false;
+            __blorp_task_cleanup_pop_slot_slow(&waiter_cleanup);
             blorp_io_waiter_release(waiter);
             return BLORP_IO_WAKE_CLOSED;
     }
@@ -15141,13 +21904,17 @@ static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
     // is installed. Take that pending readiness before yielding so one-shot
     // readiness suppression cannot lose a wake.
     if (blorp_io_reactor_take_ready(fd, generation, interest) > 0) {
-        (void)blorp_tcp_inner_remove_waiter(inner, waiter);
+        (void)blorp_io_wait_owner_remove_waiter(owner, waiter);
         __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+        waiter_cleanup.active = false;
+        __blorp_task_cleanup_pop_slot_slow(&waiter_cleanup);
         blorp_io_waiter_release(waiter);
         return BLORP_IO_WAKE_READY;
     }
 
-    if (deadline_ns != 0) blorp_io_deadline_queue_insert(waiter, inner);
+    if (deadline_ns != 0) {
+        blorp_io_deadline_queue_insert(waiter, owner);
+    }
 
     blorp_fiber_park();
 
@@ -15155,26 +21922,49 @@ static blorp_IoWakeReason blorp_tcp_inner_park_current_fiber(
 
     if (__blorp_is_cancelled()) {
         if (waiter->installed) {
-            (void)blorp_tcp_inner_cancel_waiter(inner, waiter);
+            (void)blorp_io_wait_owner_cancel_waiter(owner, waiter);
         }
         (void)__blorp_cancel_current_task_if_requested();
+        waiter_cleanup.active = false;
+        __blorp_task_cleanup_pop_slot_slow(&waiter_cleanup);
         blorp_io_waiter_release(waiter);
         return BLORP_IO_WAKE_CANCELLED;
     }
 
     if (waiter->wake_reason == BLORP_IO_WAKE_NONE && deadline_ns != 0) {
-        blorp_IoWaiterList timed_out = blorp_tcp_inner_extract_waiter(
-            inner, kind, generation, BLORP_IO_WAKE_TIMEOUT);
+        blorp_IoWaiterList timed_out = blorp_io_wait_owner_extract_waiter(
+            owner, kind, generation, BLORP_IO_WAKE_TIMEOUT);
         blorp_io_waiter_wake_all(&timed_out);
     }
 
     if (waiter->wake_reason == BLORP_IO_WAKE_NONE) {
-        (void)blorp_tcp_inner_remove_waiter(inner, waiter);
+        (void)blorp_io_wait_owner_remove_waiter(owner, waiter);
     }
 
     result = waiter->wake_reason;
+    waiter_cleanup.active = false;
+    __blorp_task_cleanup_pop_slot_slow(&waiter_cleanup);
     blorp_io_waiter_release(waiter);
     return result;
+}
+
+static int blorp_udp_socket_wait_for_reactor(
+    blorp_UdpSocket* socket,
+    blorp_IoWaitKind wait_kind,
+    int interest,
+    int fd,
+    uint64_t generation,
+    long timeout_ms,
+    blorp_IoWakeReason* reason_out
+) {
+    return blorp_io_wait_owner_wait_for_reactor(
+        blorp_io_wait_owner_udp(socket),
+        wait_kind,
+        interest,
+        fd,
+        generation,
+        timeout_ms,
+        reason_out);
 }
 
 static void blorp_timer_heap_swap(size_t a, size_t b) {
@@ -15453,6 +22243,10 @@ void blorp_cleanup_release_arc_value(void* value) {
 
 void blorp_cleanup_release_arc_only_value(void* value) {
     if (value) blorp_release_arc_only(value);
+}
+
+void blorp_cleanup_stack_result_value(void* value) {
+    if (value) blorp_stack_result_release(*(blorp_StackResult*)value);
 }
 
 void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
@@ -19566,30 +26360,41 @@ blorp_Tuple* blorp_tuple_new(long arity, ...) {
 // Stream[T] — Lazy pull-based sequences
 // ============================================================================
 
-static blorp_FileListResult blorp_file_list_ok(blorp_List* value);
-static blorp_FileListResult blorp_file_list_error(
+static blorp_FallibleStreamError blorp_fallible_stream_no_error(void);
+static blorp_FallibleStreamError blorp_fallible_stream_file_error(
     blorp_FileErrorKind kind,
     blorp_String* detail
 );
-static blorp_FileValueResult blorp_file_value_ok(void* value);
-static blorp_FileValueResult blorp_file_value_error(
-    blorp_FileErrorKind kind,
+static blorp_FallibleStreamError blorp_fallible_stream_udp_error(
+    blorp_UdpErrorKind kind,
     blorp_String* detail
 );
-static blorp_FileFindResult blorp_file_find_ok(long found, void* value);
-static blorp_FileFindResult blorp_file_find_error(
-    blorp_FileErrorKind kind,
-    blorp_String* detail
+static blorp_FallibleStreamListResult blorp_fallible_stream_list_ok(
+    blorp_List* value
 );
-static blorp_FileIntResult blorp_file_int_ok(long value);
-static blorp_FileIntResult blorp_file_int_error(
-    blorp_FileErrorKind kind,
-    blorp_String* detail
+static blorp_FallibleStreamListResult blorp_fallible_stream_list_error(
+    blorp_FallibleStreamError error
 );
-static blorp_FileBoolResult blorp_file_bool_ok(long value);
-static blorp_FileBoolResult blorp_file_bool_error(
-    blorp_FileErrorKind kind,
-    blorp_String* detail
+static blorp_FallibleStreamValueResult blorp_fallible_stream_value_ok(
+    void* value
+);
+static blorp_FallibleStreamValueResult blorp_fallible_stream_value_error(
+    blorp_FallibleStreamError error
+);
+static blorp_FallibleStreamFindResult blorp_fallible_stream_find_ok(
+    long found,
+    void* value
+);
+static blorp_FallibleStreamFindResult blorp_fallible_stream_find_error(
+    blorp_FallibleStreamError error
+);
+static blorp_FallibleStreamIntResult blorp_fallible_stream_int_ok(long value);
+static blorp_FallibleStreamIntResult blorp_fallible_stream_int_error(
+    blorp_FallibleStreamError error
+);
+static blorp_FallibleStreamBoolResult blorp_fallible_stream_bool_ok(long value);
+static blorp_FallibleStreamBoolResult blorp_fallible_stream_bool_error(
+    blorp_FallibleStreamError error
 );
 static blorp_FileErrorKind blorp_file_error_kind_from_errno(int errnum);
 static blorp_String* blorp_file_operation_errno_detail(
@@ -19623,8 +26428,7 @@ typedef struct blorp_FallibleStream {
     blorp_FallibleStreamPullStatus (*pull)(
         struct blorp_FallibleStream* self,
         void** out,
-        blorp_FileErrorKind* error_kind,
-        blorp_String** error_detail
+        blorp_FallibleStreamError* error
     );
     void* state;
     void (*state_cleanup)(struct blorp_FallibleStream* self);
@@ -19689,6 +26493,40 @@ typedef struct {
     bool initialized;
     bool done;
 } FallibleFileWindowsState;
+typedef struct {
+    blorp_UdpSocket* socket;
+    long max_bytes;
+    bool done;
+} FallibleUdpDatagramsState;
+typedef struct {
+    blorp_Bytes* value;
+    long error_kind;
+    blorp_String* detail;
+} FallibleByteChunkReadResult;
+typedef FallibleByteChunkReadResult (*FallibleByteChunkReadFn)(
+    void* resource,
+    long max_bytes
+);
+typedef struct {
+    blorp_FallibleStreamErrorDomain error_domain;
+    FallibleByteChunkReadFn read;
+} FallibleByteChunkSource;
+typedef struct {
+    void* resource;
+    const FallibleByteChunkSource* source;
+    long max_bytes;
+    bool done;
+} FallibleByteChunksState;
+typedef struct {
+    blorp_FallibleStream* chunks;
+    blorp_Bytes* chunk;
+    long chunk_pos;
+    char* line;
+    long line_len;
+    long line_cap;
+    bool chunk_owned;
+    bool done;
+} FallibleByteLinesState;
 
 // --- Helper: allocate a stream ---
 static blorp_Stream* blorp_stream_new(void) {
@@ -19768,6 +26606,72 @@ static inline void blorp_fallible_stream_release_pulled_if_owned(
     if (blorp_fallible_stream_pulls_owned_arc(stream) && value) {
         blorp_release(value);
     }
+}
+
+static inline bool blorp_stream_push_owned_pull_cleanup(
+    blorp_StreamElementLayout layout,
+    blorp_CancelCleanupFrame* frame,
+    void** slot
+) {
+    if (!blorp_stream_layout_is_owned_arc(layout) || !slot || !*slot) {
+        return false;
+    }
+    blorp_task_cleanup_push(frame, slot, *slot, blorp_cleanup_release_arc_value);
+    return true;
+}
+
+static inline void blorp_stream_pop_owned_pull_cleanup(
+    bool active,
+    void** slot
+) {
+    if (active) blorp_task_cleanup_pop_slot(slot);
+}
+
+static void fallible_line_append(
+    char** line,
+    long* line_len,
+    long* line_cap,
+    const unsigned char* data,
+    long len
+) {
+    if (!line || !line_len || !line_cap || len <= 0) return;
+    if (*line_len > LONG_MAX - len) {
+        fprintf(stderr, "blorp: out of memory (line buffer overflow)\n");
+        exit(1);
+    }
+    long needed = *line_len + len;
+    if (needed > *line_cap) {
+        long next_cap = *line_cap > 0 ? *line_cap : 128;
+        while (next_cap < needed) {
+            if (next_cap > LONG_MAX / 2) {
+                next_cap = needed;
+                break;
+            }
+            next_cap *= 2;
+        }
+        char* next = (char*)realloc(*line, (size_t)next_cap);
+        if (!next) {
+            fprintf(stderr, "blorp: out of memory (realloc %ld bytes)\n",
+                next_cap);
+            exit(1);
+        }
+        *line = next;
+        *line_cap = next_cap;
+    }
+    memcpy(*line + *line_len, data, (size_t)len);
+    *line_len += len;
+}
+
+static blorp_String* fallible_line_take(
+    char** line,
+    long* line_len
+) {
+    long len = line_len ? *line_len : 0;
+    if (line && *line && len > 0 && (*line)[len - 1] == '\r') len--;
+    blorp_String* result =
+        blorp_string_from_buf((line && *line && len > 0) ? *line : "", len);
+    if (line_len) *line_len = 0;
+    return result;
 }
 
 #define BLORP_STREAM_CANCEL_CHECK_INTERVAL 1024L
@@ -19927,7 +26831,12 @@ static bool stream_map_pull(blorp_Stream* self, void** out) {
     StreamMapState* st = (StreamMapState*)self->state;
     void* val;
     if (!st->inner->pull(st->inner, &val)) return false;
+    blorp_CancelCleanupFrame val_cleanup;
+    bool val_cleanup_active =
+        blorp_stream_push_owned_pull_cleanup(
+            st->inner->elem_layout, &val_cleanup, &val);
     void* mapped = blorp_call1(st->func, val);
+    blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
     blorp_stream_release_pulled_if_owned(st->inner, val);
     *out = mapped;
     return true;
@@ -19960,10 +26869,16 @@ static bool stream_filter_pull(blorp_Stream* self, void** out) {
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
         if (!st->inner->pull(st->inner, &val)) return false;
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                st->inner->elem_layout, &val_cleanup, &val);
         if ((long)blorp_call1(st->pred, val)) {
+            blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
             *out = val;
             return true;
         }
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_stream_release_pulled_if_owned(st->inner, val);
     }
 }
@@ -19995,7 +26910,12 @@ static bool stream_filter_map_pull(blorp_Stream* self, void** out) {
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
         if (!st->inner->pull(st->inner, &val)) return false;
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                st->inner->elem_layout, &val_cleanup, &val);
         blorp_Option* opt = (blorp_Option*)blorp_call1(st->func, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_stream_release_pulled_if_owned(st->inner, val);
         if (opt && opt->tag == BLORP_TAG_SOME) {
             *out = opt->data.Some.field0;
@@ -20028,7 +26948,12 @@ static bool stream_filter_map_pull_##PUBLIC_SUFFIX(blorp_Stream* self, void** ou
     while (true) { \
         blorp_stream_cancellation_checkpoint(&cancel_check); \
         if (!st->inner->pull(st->inner, &val)) return false; \
+        blorp_CancelCleanupFrame val_cleanup; \
+        bool val_cleanup_active = \
+            blorp_stream_push_owned_pull_cleanup( \
+                st->inner->elem_layout, &val_cleanup, &val); \
         void* opt_box = blorp_call1(st->func, val); \
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val); \
         blorp_stream_release_pulled_if_owned(st->inner, val); \
         if (!opt_box) continue; \
         blorp_StackOption_##NAME opt = blorp_unbox_struct(opt_box, blorp_StackOption_##NAME); \
@@ -20080,7 +27005,12 @@ static bool stream_filter_map_pull_nullable(blorp_Stream* self, void** out) {
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
         if (!st->inner->pull(st->inner, &val)) return false;
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                st->inner->elem_layout, &val_cleanup, &val);
         void* opt = blorp_call1(st->func, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_stream_release_pulled_if_owned(st->inner, val);
         if (opt) {
             *out = opt;
@@ -20165,10 +27095,16 @@ static bool stream_take_while_pull(blorp_Stream* self, void** out) {
     if (st->done) return false;
     void* val;
     if (!st->inner->pull(st->inner, &val)) { st->done = true; return false; }
+    blorp_CancelCleanupFrame val_cleanup;
+    bool val_cleanup_active =
+        blorp_stream_push_owned_pull_cleanup(
+            st->inner->elem_layout, &val_cleanup, &val);
     if ((long)blorp_call1(st->pred, val)) {
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         *out = val;
         return true;
     }
+    blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
     blorp_stream_release_pulled_if_owned(st->inner, val);
     st->done = true;
     return false;
@@ -20254,13 +27190,13 @@ blorp_List* blorp_stream_collect(blorp_Stream* stream) {
     return result;
 }
 
-blorp_FileListResult blorp_fallible_stream_collect_file_raw(
+blorp_FallibleStreamListResult blorp_fallible_stream_collect_raw(
     blorp_FallibleStream* stream,
     uint8_t storage_mode,
     int16_t elem_size
 ) {
     if (!stream) {
-        return blorp_file_list_ok(
+        return blorp_fallible_stream_list_ok(
             blorp_list_new_layout(0, storage_mode, elem_size));
     }
     blorp_List* result = blorp_list_new_layout(16, storage_mode, elem_size);
@@ -20275,15 +27211,14 @@ blorp_FileListResult blorp_fallible_stream_collect_file_raw(
     long cancel_check = 0;
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
-        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
-        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamError error = blorp_fallible_stream_no_error();
         blorp_FallibleStreamPullStatus status =
-            stream->pull(stream, &val, &error_kind, &error_detail);
+            stream->pull(stream, &val, &error);
         if (status == BLORP_FALLIBLE_STREAM_END) break;
         if (status == BLORP_FALLIBLE_STREAM_ERROR) {
             blorp_task_cleanup_pop_slot(&result);
             blorp_release(result);
-            return blorp_file_list_error(error_kind, error_detail);
+            return blorp_fallible_stream_list_error(error);
         }
         if (blorp_fallible_stream_pulls_owned_arc(stream)) {
             result = blorp_list_append_owned(result, val);
@@ -20293,16 +27228,16 @@ blorp_FileListResult blorp_fallible_stream_collect_file_raw(
         result_cleanup.value = result;
     }
     blorp_task_cleanup_pop_slot(&result);
-    return blorp_file_list_ok(result);
+    return blorp_fallible_stream_list_ok(result);
 }
 
-blorp_FileValueResult blorp_fallible_stream_fold_file_raw(
+blorp_FallibleStreamValueResult blorp_fallible_stream_fold_raw(
     blorp_FallibleStream* stream,
     void* init,
     blorp_Closure* func,
     bool acc_is_rc
 ) {
-    if (!stream || !func) return blorp_file_value_ok(init);
+    if (!stream || !func) return blorp_fallible_stream_value_ok(init);
     void* acc = init;
     void* val = NULL;
     long cancel_check = 0;
@@ -20313,125 +27248,132 @@ blorp_FileValueResult blorp_fallible_stream_fold_file_raw(
     }
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
-        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
-        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamError error = blorp_fallible_stream_no_error();
         blorp_FallibleStreamPullStatus status =
-            stream->pull(stream, &val, &error_kind, &error_detail);
+            stream->pull(stream, &val, &error);
         if (status == BLORP_FALLIBLE_STREAM_END) break;
         if (status == BLORP_FALLIBLE_STREAM_ERROR) {
             if (acc_is_rc) {
                 blorp_task_cleanup_pop_slot(&acc);
                 if (acc) blorp_release(acc);
             }
-            return blorp_file_value_error(error_kind, error_detail);
+            return blorp_fallible_stream_value_error(error);
         }
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         void* new_acc =
             ((void* (*)(void*, void*, void*))(func->func))(func->env, acc, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_fallible_stream_release_pulled_if_owned(stream, val);
         if (acc_is_rc && new_acc != acc && acc) blorp_release(acc);
         acc = new_acc;
         if (acc_is_rc) acc_cleanup.value = acc;
     }
     if (acc_is_rc) blorp_task_cleanup_pop_slot(&acc);
-    return blorp_file_value_ok(acc);
+    return blorp_fallible_stream_value_ok(acc);
 }
 
-blorp_FileIntResult blorp_fallible_stream_count_file_raw(
+blorp_FallibleStreamIntResult blorp_fallible_stream_count_raw(
     blorp_FallibleStream* stream
 ) {
-    if (!stream) return blorp_file_int_ok(0);
+    if (!stream) return blorp_fallible_stream_int_ok(0);
     long n = 0;
     void* val = NULL;
     long cancel_check = 0;
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
-        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
-        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamError error = blorp_fallible_stream_no_error();
         blorp_FallibleStreamPullStatus status =
-            stream->pull(stream, &val, &error_kind, &error_detail);
+            stream->pull(stream, &val, &error);
         if (status == BLORP_FALLIBLE_STREAM_END) break;
         if (status == BLORP_FALLIBLE_STREAM_ERROR) {
-            return blorp_file_int_error(error_kind, error_detail);
+            return blorp_fallible_stream_int_error(error);
         }
         n++;
         blorp_fallible_stream_release_pulled_if_owned(stream, val);
     }
-    return blorp_file_int_ok(n);
+    return blorp_fallible_stream_int_ok(n);
 }
 
-static blorp_FileFindResult blorp_fallible_stream_find_file_raw_find(
+static blorp_FallibleStreamFindResult blorp_fallible_stream_find_raw_find(
     blorp_FallibleStream* stream,
     blorp_Closure* pred,
     bool retain_borrowed_match
 ) {
-    if (!stream || !pred) return blorp_file_find_ok(0, NULL);
+    if (!stream || !pred) return blorp_fallible_stream_find_ok(0, NULL);
     void* val = NULL;
     long cancel_check = 0;
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
-        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
-        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamError error = blorp_fallible_stream_no_error();
         blorp_FallibleStreamPullStatus status =
-            stream->pull(stream, &val, &error_kind, &error_detail);
+            stream->pull(stream, &val, &error);
         if (status == BLORP_FALLIBLE_STREAM_END) break;
         if (status == BLORP_FALLIBLE_STREAM_ERROR) {
-            return blorp_file_find_error(error_kind, error_detail);
+            return blorp_fallible_stream_find_error(error);
         }
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         long keep = (long)blorp_call1(pred, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         if (keep) {
             if (retain_borrowed_match
                 && blorp_stream_layout_is_borrowed_arc(stream->elem_layout)
                 && val) {
                 blorp_retain(val);
             }
-            return blorp_file_find_ok(1, val);
+            return blorp_fallible_stream_find_ok(1, val);
         }
         blorp_fallible_stream_release_pulled_if_owned(stream, val);
     }
-    return blorp_file_find_ok(0, NULL);
+    return blorp_fallible_stream_find_ok(0, NULL);
 }
 
-blorp_FileValueResult blorp_fallible_stream_find_file_raw(
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw(
     blorp_FallibleStream* stream,
     blorp_Closure* pred
 ) {
-    blorp_FileFindResult found =
-        blorp_fallible_stream_find_file_raw_find(stream, pred, true);
-    if (found.error_kind != BLORP_FILE_ERROR_NONE) {
-        return blorp_file_value_error(found.error_kind, found.detail);
+    blorp_FallibleStreamFindResult found =
+        blorp_fallible_stream_find_raw_find(stream, pred, true);
+    if (found.error.domain != BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_NONE) {
+        return blorp_fallible_stream_value_error(found.error);
     }
     if (!found.found) {
-        return blorp_file_value_ok(blorp_option_none());
+        return blorp_fallible_stream_value_ok(blorp_option_none());
     }
     blorp_Option* opt = blorp_option_some(found.value);
     if (blorp_fallible_stream_has_arc_elements(stream)) {
         opt->release_mask = 1UL;
     }
-    return blorp_file_value_ok(opt);
+    return blorp_fallible_stream_value_ok(opt);
 }
 
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_nullable(
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_nullable(
     blorp_FallibleStream* stream,
     blorp_Closure* pred
 ) {
-    blorp_FileFindResult found =
-        blorp_fallible_stream_find_file_raw_find(stream, pred, true);
-    if (found.error_kind != BLORP_FILE_ERROR_NONE) {
-        return blorp_file_value_error(found.error_kind, found.detail);
+    blorp_FallibleStreamFindResult found =
+        blorp_fallible_stream_find_raw_find(stream, pred, true);
+    if (found.error.domain != BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_NONE) {
+        return blorp_fallible_stream_value_error(found.error);
     }
-    return blorp_file_value_ok(found.found ? found.value : NULL);
+    return blorp_fallible_stream_value_ok(found.found ? found.value : NULL);
 }
 
 #define BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION( \
     PUBLIC_SUFFIX, STACK_SUFFIX, NAME, CTYPE, UNBOX) \
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_##PUBLIC_SUFFIX( \
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_##PUBLIC_SUFFIX( \
     blorp_FallibleStream* stream, \
     blorp_Closure* pred \
 ) { \
-    blorp_FileFindResult found = \
-        blorp_fallible_stream_find_file_raw_find(stream, pred, false); \
-    if (found.error_kind != BLORP_FILE_ERROR_NONE) { \
-        return blorp_file_value_error(found.error_kind, found.detail); \
+    blorp_FallibleStreamFindResult found = \
+        blorp_fallible_stream_find_raw_find(stream, pred, false); \
+    if (found.error.domain != BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_NONE) { \
+        return blorp_fallible_stream_value_error(found.error); \
     } \
     blorp_StackOption_##NAME opt = found.found \
         ? blorp_stack_option_##STACK_SUFFIX##_some((CTYPE)UNBOX(found.value)) \
@@ -20440,7 +27382,7 @@ blorp_FileValueResult blorp_fallible_stream_find_file_raw_##PUBLIC_SUFFIX( \
         && found.value) { \
         blorp_release(found.value); \
     } \
-    return blorp_file_value_ok(blorp_box_struct(&opt, sizeof(opt))); \
+    return blorp_fallible_stream_value_ok(blorp_box_struct(&opt, sizeof(opt))); \
 }
 
 BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
@@ -20476,52 +27418,60 @@ BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION(
 
 #undef BLORP_DEFINE_FALLIBLE_STREAM_FIND_STACK_OPTION
 
-blorp_FileBoolResult blorp_fallible_stream_any_file_raw(
+blorp_FallibleStreamBoolResult blorp_fallible_stream_any_raw(
     blorp_FallibleStream* stream,
     blorp_Closure* pred
 ) {
-    if (!stream || !pred) return blorp_file_bool_ok(0);
+    if (!stream || !pred) return blorp_fallible_stream_bool_ok(0);
     void* val = NULL;
     long cancel_check = 0;
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
-        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
-        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamError error = blorp_fallible_stream_no_error();
         blorp_FallibleStreamPullStatus status =
-            stream->pull(stream, &val, &error_kind, &error_detail);
+            stream->pull(stream, &val, &error);
         if (status == BLORP_FALLIBLE_STREAM_END) break;
         if (status == BLORP_FALLIBLE_STREAM_ERROR) {
-            return blorp_file_bool_error(error_kind, error_detail);
+            return blorp_fallible_stream_bool_error(error);
         }
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         long keep = (long)blorp_call1(pred, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_fallible_stream_release_pulled_if_owned(stream, val);
-        if (keep) return blorp_file_bool_ok(1);
+        if (keep) return blorp_fallible_stream_bool_ok(1);
     }
-    return blorp_file_bool_ok(0);
+    return blorp_fallible_stream_bool_ok(0);
 }
 
-blorp_FileBoolResult blorp_fallible_stream_all_file_raw(
+blorp_FallibleStreamBoolResult blorp_fallible_stream_all_raw(
     blorp_FallibleStream* stream,
     blorp_Closure* pred
 ) {
-    if (!stream || !pred) return blorp_file_bool_ok(1);
+    if (!stream || !pred) return blorp_fallible_stream_bool_ok(1);
     void* val = NULL;
     long cancel_check = 0;
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
-        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
-        blorp_String* error_detail = NULL;
+        blorp_FallibleStreamError error = blorp_fallible_stream_no_error();
         blorp_FallibleStreamPullStatus status =
-            stream->pull(stream, &val, &error_kind, &error_detail);
+            stream->pull(stream, &val, &error);
         if (status == BLORP_FALLIBLE_STREAM_END) break;
         if (status == BLORP_FALLIBLE_STREAM_ERROR) {
-            return blorp_file_bool_error(error_kind, error_detail);
+            return blorp_fallible_stream_bool_error(error);
         }
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         long keep = (long)blorp_call1(pred, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_fallible_stream_release_pulled_if_owned(stream, val);
-        if (!keep) return blorp_file_bool_ok(0);
+        if (!keep) return blorp_fallible_stream_bool_ok(0);
     }
-    return blorp_file_bool_ok(1);
+    return blorp_fallible_stream_bool_ok(1);
 }
 
 // --- Terminal: fold ---
@@ -20537,7 +27487,12 @@ void* blorp_stream_fold(blorp_Stream* stream, void* init, blorp_Closure* func, b
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
         if (!stream->pull(stream, &val)) break;
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         void* new_acc = ((void* (*)(void*, void*, void*))(func->func))(func->env, acc, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_stream_release_pulled_if_owned(stream, val);
         if (acc_is_rc && new_acc != acc && acc) blorp_release(acc);
         acc = new_acc;
@@ -20570,7 +27525,12 @@ void blorp_stream_for_each(blorp_Stream* stream, blorp_Closure* func) {
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
         if (!stream->pull(stream, &val)) break;
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         blorp_call1(func, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_stream_release_pulled_if_owned(stream, val);
     }
 }
@@ -20583,10 +27543,16 @@ bool blorp_stream_find_raw(blorp_Stream* stream, blorp_Closure* pred, void** out
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
         if (!stream->pull(stream, &val)) break;
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         if ((long)blorp_call1(pred, val)) {
+            blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
             *out = val;
             return true;
         }
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_stream_release_pulled_if_owned(stream, val);
     }
     return false;
@@ -20646,7 +27612,12 @@ bool blorp_stream_any(blorp_Stream* stream, blorp_Closure* pred) {
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
         if (!stream->pull(stream, &val)) break;
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         long keep = (long)blorp_call1(pred, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_stream_release_pulled_if_owned(stream, val);
         if (keep) return true;
     }
@@ -20661,7 +27632,12 @@ bool blorp_stream_all(blorp_Stream* stream, blorp_Closure* pred) {
     while (true) {
         blorp_stream_cancellation_checkpoint(&cancel_check);
         if (!stream->pull(stream, &val)) break;
+        blorp_CancelCleanupFrame val_cleanup;
+        bool val_cleanup_active =
+            blorp_stream_push_owned_pull_cleanup(
+                stream->elem_layout, &val_cleanup, &val);
         long keep = (long)blorp_call1(pred, val);
+        blorp_stream_pop_owned_pull_cleanup(val_cleanup_active, &val);
         blorp_stream_release_pulled_if_owned(stream, val);
         if (!keep) return false;
     }
@@ -20738,20 +27714,21 @@ static FallibleFileByteReadStatus fallible_file_byte_buffer_read(
 static blorp_FallibleStreamPullStatus fallible_file_chunks_pull(
     blorp_FallibleStream* self,
     void** out,
-    blorp_FileErrorKind* error_kind,
-    blorp_String** error_detail
+    blorp_FallibleStreamError* error
 ) {
     FallibleFileChunksState* st = (FallibleFileChunksState*)self->state;
     if (st->done) return BLORP_FALLIBLE_STREAM_END;
     if (st->fd < 0) {
-        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
-        *error_detail = blorp_string_literal("chunks: closed file handle");
+        *error = blorp_fallible_stream_file_error(
+            BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("chunks: closed file handle"));
         st->done = true;
         return BLORP_FALLIBLE_STREAM_ERROR;
     }
     if (st->chunk_size <= 0) {
-        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
-        *error_detail = blorp_string_literal("chunks: chunk_size must be positive");
+        *error = blorp_fallible_stream_file_error(
+            BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("chunks: chunk_size must be positive"));
         st->done = true;
         return BLORP_FALLIBLE_STREAM_ERROR;
     }
@@ -20772,8 +27749,9 @@ static blorp_FallibleStreamPullStatus fallible_file_chunks_pull(
         if (errno == EINTR) continue;
 
         int errnum = errno;
-        *error_kind = blorp_file_error_kind_from_errno(errnum);
-        *error_detail = blorp_file_operation_errno_detail("chunks", errnum);
+        *error = blorp_fallible_stream_file_error(
+            blorp_file_error_kind_from_errno(errnum),
+            blorp_file_operation_errno_detail("chunks", errnum));
         st->done = true;
         blorp_release(bytes);
         return BLORP_FALLIBLE_STREAM_ERROR;
@@ -20854,14 +27832,14 @@ static blorp_String* fallible_file_lines_take_line(
 static blorp_FallibleStreamPullStatus fallible_file_lines_pull(
     blorp_FallibleStream* self,
     void** out,
-    blorp_FileErrorKind* error_kind,
-    blorp_String** error_detail
+    blorp_FallibleStreamError* error
 ) {
     FallibleFileLinesState* st = (FallibleFileLinesState*)self->state;
     if (st->done) return BLORP_FALLIBLE_STREAM_END;
     if (st->fd < 0) {
-        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
-        *error_detail = blorp_string_literal("lines: closed file handle");
+        *error = blorp_fallible_stream_file_error(
+            BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("lines: closed file handle"));
         st->done = true;
         return BLORP_FALLIBLE_STREAM_ERROR;
     }
@@ -20883,9 +27861,9 @@ static blorp_FallibleStreamPullStatus fallible_file_lines_pull(
                 continue;
             } else {
                 int errnum = errno;
-                *error_kind = blorp_file_error_kind_from_errno(errnum);
-                *error_detail =
-                    blorp_file_operation_errno_detail("lines", errnum);
+                *error = blorp_fallible_stream_file_error(
+                    blorp_file_error_kind_from_errno(errnum),
+                    blorp_file_operation_errno_detail("lines", errnum));
                 st->done = true;
                 return BLORP_FALLIBLE_STREAM_ERROR;
             }
@@ -20943,20 +27921,21 @@ blorp_FallibleStream* blorp_file_lines_reader_raw(
 static blorp_FallibleStreamPullStatus fallible_file_bytes_pull(
     blorp_FallibleStream* self,
     void** out,
-    blorp_FileErrorKind* error_kind,
-    blorp_String** error_detail
+    blorp_FallibleStreamError* error
 ) {
     FallibleFileBytesState* st = (FallibleFileBytesState*)self->state;
     if (st->done) return BLORP_FALLIBLE_STREAM_END;
 
     unsigned char byte = 0;
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
     FallibleFileByteReadStatus status = fallible_file_byte_buffer_read(
         &st->input,
         "bytes",
         "bytes: closed file handle",
         &byte,
-        error_kind,
-        error_detail
+        &error_kind,
+        &error_detail
     );
     switch (status) {
         case FALLIBLE_FILE_BYTE_READ_ITEM:
@@ -20968,6 +27947,7 @@ static blorp_FallibleStreamPullStatus fallible_file_bytes_pull(
         case FALLIBLE_FILE_BYTE_READ_ERROR:
         default:
             st->done = true;
+            *error = blorp_fallible_stream_file_error(error_kind, error_detail);
             return BLORP_FALLIBLE_STREAM_ERROR;
     }
 }
@@ -21017,19 +27997,21 @@ static blorp_Bytes* fallible_file_windows_copy_current(
 static blorp_FallibleStreamPullStatus fallible_file_windows_pull(
     blorp_FallibleStream* self,
     void** out,
-    blorp_FileErrorKind* error_kind,
-    blorp_String** error_detail
+    blorp_FallibleStreamError* error
 ) {
     FallibleFileWindowsState* st = (FallibleFileWindowsState*)self->state;
     if (st->done) return BLORP_FALLIBLE_STREAM_END;
     if (st->window_size <= 0) {
-        *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
-        *error_detail = blorp_string_literal("windows: size must be positive");
+        *error = blorp_fallible_stream_file_error(
+            BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("windows: size must be positive"));
         st->done = true;
         return BLORP_FALLIBLE_STREAM_ERROR;
     }
 
     unsigned char byte = 0;
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
     if (!st->initialized) {
         long cancel_check = 0;
         while (st->filled < st->window_size) {
@@ -21039,17 +28021,19 @@ static blorp_FallibleStreamPullStatus fallible_file_windows_pull(
                 "windows",
                 "windows: closed file handle",
                 &byte,
-                error_kind,
-                error_detail
+                &error_kind,
+                &error_detail
             );
             if (status == FALLIBLE_FILE_BYTE_READ_ITEM) {
                 st->ring[st->filled++] = byte;
                 continue;
             }
             st->done = true;
-            return status == FALLIBLE_FILE_BYTE_READ_EOF
-                ? BLORP_FALLIBLE_STREAM_END
-                : BLORP_FALLIBLE_STREAM_ERROR;
+            if (status == FALLIBLE_FILE_BYTE_READ_EOF) {
+                return BLORP_FALLIBLE_STREAM_END;
+            }
+            *error = blorp_fallible_stream_file_error(error_kind, error_detail);
+            return BLORP_FALLIBLE_STREAM_ERROR;
         }
         st->initialized = true;
         st->start = 0;
@@ -21059,8 +28043,8 @@ static blorp_FallibleStreamPullStatus fallible_file_windows_pull(
             "windows",
             "windows: closed file handle",
             &byte,
-            error_kind,
-            error_detail
+            &error_kind,
+            &error_detail
         );
         if (status == FALLIBLE_FILE_BYTE_READ_EOF) {
             st->done = true;
@@ -21068,6 +28052,7 @@ static blorp_FallibleStreamPullStatus fallible_file_windows_pull(
         }
         if (status == FALLIBLE_FILE_BYTE_READ_ERROR) {
             st->done = true;
+            *error = blorp_fallible_stream_file_error(error_kind, error_detail);
             return BLORP_FALLIBLE_STREAM_ERROR;
         }
         st->ring[st->start] = byte;
@@ -21108,6 +28093,2540 @@ blorp_FallibleStream* blorp_file_windows_reader_raw(
     s->pull = fallible_file_windows_pull;
     s->state_cleanup = fallible_file_windows_cleanup;
     return s;
+}
+
+// Runtime-owned layout-compatible payload for std/net/udp.Datagram.
+// Keep field order in sync with the source record: data, host, port.
+typedef struct blorp_UdpDatagramRecord {
+    blorp_Object header;
+    blorp_Bytes* data;
+    blorp_String* host;
+    long port;
+} blorp_UdpDatagramRecord;
+
+static void blorp_udp_datagram_record_destroy(void* obj) {
+    blorp_UdpDatagramRecord* datagram = (blorp_UdpDatagramRecord*)obj;
+    if (datagram->data) blorp_release((blorp_Object*)datagram->data);
+    if (datagram->host) blorp_release((blorp_Object*)datagram->host);
+}
+
+static blorp_UdpDatagramRecord* blorp_udp_datagram_record_make(
+    blorp_Bytes* data,
+    blorp_String* host,
+    long port
+) {
+    blorp_UdpDatagramRecord* datagram =
+        (blorp_UdpDatagramRecord*)blorp_alloc(sizeof(blorp_UdpDatagramRecord));
+    BLORP_TAG(datagram, "std_net_udp__Datagram");
+    BLORP_SET_DESTRUCTOR(datagram, blorp_udp_datagram_record_destroy);
+    datagram->data = data;
+    datagram->host = host;
+    datagram->port = port;
+    return datagram;
+}
+
+static blorp_FallibleStreamPullStatus fallible_udp_datagrams_pull(
+    blorp_FallibleStream* self,
+    void** out,
+    blorp_FallibleStreamError* error
+) {
+    FallibleUdpDatagramsState* st = (FallibleUdpDatagramsState*)self->state;
+    if (st->done) return BLORP_FALLIBLE_STREAM_END;
+
+    blorp_UdpDatagramResult datagram =
+        blorp_udp_recv_from_raw(st->socket, st->max_bytes);
+    if (datagram.error_kind != BLORP_UDP_ERROR_NONE) {
+        *error = blorp_fallible_stream_udp_error(
+            datagram.error_kind,
+            datagram.detail);
+        st->done = true;
+        return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+
+    *out = blorp_udp_datagram_record_make(
+        datagram.data,
+        datagram.host,
+        datagram.port);
+    return BLORP_FALLIBLE_STREAM_ITEM;
+}
+
+static void fallible_udp_datagrams_cleanup(blorp_FallibleStream* self) {
+    FallibleUdpDatagramsState* st = (FallibleUdpDatagramsState*)self->state;
+    if (st) {
+        blorp_udp_socket_release(st->socket);
+        free(st);
+    }
+}
+
+blorp_FallibleStream* blorp_udp_datagrams_raw(
+    blorp_UdpSocket* socket,
+    long max_bytes
+) {
+    blorp_FallibleStream* s = blorp_fallible_stream_new();
+    FallibleUdpDatagramsState* st =
+        (FallibleUdpDatagramsState*)blorp_malloc_checked(
+            sizeof(FallibleUdpDatagramsState));
+    st->socket = socket;
+    st->max_bytes = max_bytes;
+    st->done = false;
+    if (socket) blorp_udp_socket_retain(socket);
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
+    s->state = st;
+    s->pull = fallible_udp_datagrams_pull;
+    s->state_cleanup = fallible_udp_datagrams_cleanup;
+    return s;
+}
+
+static FallibleByteChunkReadResult fallible_tcp_chunk_read(
+    void* resource,
+    long max_bytes
+) {
+    blorp_TcpBytesResult chunk =
+        blorp_tcp_read_raw((blorp_TcpStream*)resource, max_bytes);
+    return (FallibleByteChunkReadResult){
+        .value = chunk.value,
+        .error_kind = (long)chunk.error_kind,
+        .detail = chunk.detail
+    };
+}
+
+static FallibleByteChunkReadResult fallible_tls_chunk_read(
+    void* resource,
+    long max_bytes
+) {
+    blorp_TlsBytesResult chunk =
+        blorp_tls_read_raw((blorp_TlsSession*)resource, max_bytes);
+    return (FallibleByteChunkReadResult){
+        .value = chunk.value,
+        .error_kind = (long)chunk.error_kind,
+        .detail = chunk.detail
+    };
+}
+
+static const FallibleByteChunkSource FALLIBLE_TCP_BYTE_CHUNKS = {
+    .error_domain = BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TCP,
+    .read = fallible_tcp_chunk_read
+};
+
+static const FallibleByteChunkSource FALLIBLE_TLS_BYTE_CHUNKS = {
+    .error_domain = BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TLS,
+    .read = fallible_tls_chunk_read
+};
+
+static blorp_FallibleStreamPullStatus fallible_byte_chunks_pull(
+    blorp_FallibleStream* self,
+    void** out,
+    blorp_FallibleStreamError* error
+) {
+    FallibleByteChunksState* st = (FallibleByteChunksState*)self->state;
+    if (st->done) return BLORP_FALLIBLE_STREAM_END;
+
+    FallibleByteChunkReadResult chunk =
+        st->source->read(st->resource, st->max_bytes);
+    if (chunk.error_kind != 0) {
+        *error = (blorp_FallibleStreamError){
+            .domain = st->source->error_domain,
+            .kind = chunk.error_kind,
+            .detail = chunk.detail
+        };
+        st->done = true;
+        return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+
+    if (!chunk.value || chunk.value->len == 0) {
+        if (chunk.value) blorp_release(chunk.value);
+        st->done = true;
+        return BLORP_FALLIBLE_STREAM_END;
+    }
+
+    *out = chunk.value;
+    return BLORP_FALLIBLE_STREAM_ITEM;
+}
+
+static void fallible_byte_chunks_cleanup(blorp_FallibleStream* self) {
+    FallibleByteChunksState* st = (FallibleByteChunksState*)self->state;
+    if (st) {
+        if (st->resource) blorp_release(st->resource);
+        free(st);
+    }
+}
+
+static blorp_FallibleStream* fallible_byte_chunks_from_resource(
+    void* resource,
+    const FallibleByteChunkSource* source,
+    long max_bytes
+) {
+    blorp_FallibleStream* s = blorp_fallible_stream_new();
+    FallibleByteChunksState* st =
+        (FallibleByteChunksState*)blorp_malloc_checked(
+            sizeof(FallibleByteChunksState));
+    st->resource = resource;
+    st->source = source;
+    st->max_bytes = max_bytes;
+    st->done = false;
+    if (resource) blorp_retain(resource);
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
+    s->state = st;
+    s->pull = fallible_byte_chunks_pull;
+    s->state_cleanup = fallible_byte_chunks_cleanup;
+    return s;
+}
+
+blorp_FallibleStream* blorp_tcp_chunks_raw(
+    blorp_TcpStream* stream,
+    long max_bytes
+) {
+    return fallible_byte_chunks_from_resource(
+        stream,
+        &FALLIBLE_TCP_BYTE_CHUNKS,
+        max_bytes);
+}
+
+blorp_FallibleStream* blorp_tls_chunks_raw(
+    blorp_TlsSession* session,
+    long max_bytes
+) {
+    return fallible_byte_chunks_from_resource(
+        session,
+        &FALLIBLE_TLS_BYTE_CHUNKS,
+        max_bytes);
+}
+
+static bool blorp_test_tls_read_has_error(
+    blorp_TlsSession* session,
+    long max_bytes,
+    blorp_TlsErrorKind kind
+) {
+    blorp_TlsBytesResult result = blorp_tls_read_raw(session, max_bytes);
+    bool matches = result.error_kind == kind;
+    if (result.value) blorp_release(result.value);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_tls_write_has_error(
+    blorp_TlsSession* session,
+    blorp_Bytes* data,
+    blorp_TlsErrorKind kind
+) {
+    blorp_TlsIntResult result = blorp_tls_write_raw(session, data);
+    bool matches = result.error_kind == kind;
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_tls_write_all_has_error(
+    blorp_TlsSession* session,
+    blorp_Bytes* data,
+    blorp_TlsErrorKind kind
+) {
+    blorp_TlsVoidResult result = blorp_tls_write_all_raw(session, data);
+    bool matches = result.error_kind == kind;
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_tls_read_is_ok(blorp_TlsSession* session) {
+    blorp_TlsBytesResult result = blorp_tls_read_raw(session, 64);
+    bool matches = result.error_kind == BLORP_TLS_ERROR_NONE && result.value;
+    if (result.value) blorp_release(result.value);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_tls_write_is_ok(
+    blorp_TlsSession* session,
+    blorp_Bytes* data
+) {
+    blorp_TlsIntResult result = blorp_tls_write_raw(session, data);
+    bool matches =
+        result.error_kind == BLORP_TLS_ERROR_NONE &&
+        result.value == (data ? data->len : 0);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_tls_write_all_is_ok(
+    blorp_TlsSession* session,
+    blorp_Bytes* data
+) {
+    blorp_TlsVoidResult result = blorp_tls_write_all_raw(session, data);
+    bool matches = result.error_kind == BLORP_TLS_ERROR_NONE;
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+typedef struct {
+    bool close_called;
+    bool saw_closing_state;
+} blorp_TestTlsCloseProbe;
+
+static void blorp_test_tls_backend_close_probe(blorp_TlsSession* session) {
+    blorp_TestTlsCloseProbe* probe =
+        session ? (blorp_TestTlsCloseProbe*)session->backend_state : NULL;
+    if (!probe) return;
+    probe->close_called = true;
+    probe->saw_closing_state = session->state == BLORP_TLS_SESSION_CLOSING;
+}
+
+static const blorp_TlsBackendOps BLORP_TEST_TLS_CLOSE_PROBE_BACKEND = {
+    .kind = BLORP_TLS_BACKEND_UNSUPPORTED,
+    .capabilities = BLORP_TLS_BACKEND_CAP_NONE,
+    .close = blorp_test_tls_backend_close_probe,
+    .connect = blorp_tls_backend_connect_unsupported,
+    .handshake_step = blorp_tls_backend_handshake_step_unsupported,
+    .read_step = blorp_tls_backend_read_step_unsupported,
+    .write_step = blorp_tls_backend_write_step_unsupported
+};
+
+static blorp_TlsBackendStepResult blorp_test_tls_handshake_step_done(
+    blorp_TlsSession* session
+) {
+    (void)session;
+    return (blorp_TlsBackendStepResult){
+        .status = BLORP_TLS_BACKEND_STEP_DONE,
+        .error_kind = BLORP_TLS_ERROR_NONE,
+        .detail = NULL,
+        .bytes = NULL,
+        .count = 0
+    };
+}
+
+static blorp_TlsBackendStepResult blorp_test_tls_read_step_done(
+    blorp_TlsSession* session,
+    long max_bytes
+) {
+    (void)session;
+    (void)max_bytes;
+    return (blorp_TlsBackendStepResult){
+        .status = BLORP_TLS_BACKEND_STEP_DONE,
+        .error_kind = BLORP_TLS_ERROR_NONE,
+        .detail = NULL,
+        .bytes = blorp_bytes_new(1),
+        .count = 0
+    };
+}
+
+static blorp_TlsBackendStepResult blorp_test_tls_write_step_done(
+    blorp_TlsSession* session,
+    blorp_Bytes* data,
+    long offset
+) {
+    (void)session;
+    long remaining = data && offset < data->len ? data->len - offset : 0;
+    return (blorp_TlsBackendStepResult){
+        .status = BLORP_TLS_BACKEND_STEP_DONE,
+        .error_kind = BLORP_TLS_ERROR_NONE,
+        .detail = NULL,
+        .bytes = NULL,
+        .count = remaining
+    };
+}
+
+static const blorp_TlsBackendOps BLORP_TEST_TLS_STEP_PROBE_BACKEND = {
+    .kind = BLORP_TLS_BACKEND_UNSUPPORTED,
+    .capabilities = BLORP_TLS_BACKEND_CAP_NONE,
+    .close = blorp_tls_backend_close_unsupported,
+    .connect = blorp_tls_backend_connect_unsupported,
+    .handshake_step = blorp_test_tls_handshake_step_done,
+    .read_step = blorp_test_tls_read_step_done,
+    .write_step = blorp_test_tls_write_step_done
+};
+
+static blorp_TlsSessionResult blorp_test_tls_backend_connect_probe(
+    blorp_TcpStream* stream,
+    blorp_String* server_name
+);
+
+static const blorp_TlsBackendOps BLORP_TEST_TLS_CONNECT_PROBE_BACKEND = {
+    .kind = BLORP_TLS_BACKEND_UNSUPPORTED,
+    .capabilities = BLORP_TLS_BACKEND_CAP_NONE,
+    .close = blorp_tls_backend_close_unsupported,
+    .connect = blorp_test_tls_backend_connect_probe,
+    .handshake_step = blorp_test_tls_handshake_step_done,
+    .read_step = blorp_test_tls_read_step_done,
+    .write_step = blorp_test_tls_write_step_done
+};
+
+static blorp_TlsSessionResult blorp_test_tls_backend_connect_probe(
+    blorp_TcpStream* stream,
+    blorp_String* server_name
+) {
+    (void)stream;
+    (void)server_name;
+    return blorp_tls_session_result_ok(blorp_tls_session_new(
+        NULL,
+        &BLORP_TEST_TLS_CONNECT_PROBE_BACKEND,
+        BLORP_TLS_SESSION_HANDSHAKING,
+        NULL));
+}
+
+typedef struct {
+    long handshake_steps;
+    long read_steps;
+    long write_steps;
+} blorp_TestTlsWaitProbe;
+
+static blorp_TlsBackendStepResult blorp_test_tls_handshake_step_wait_once(
+    blorp_TlsSession* session
+) {
+    blorp_TestTlsWaitProbe* probe =
+        session ? (blorp_TestTlsWaitProbe*)session->backend_state : NULL;
+    if (probe && probe->handshake_steps++ == 0) {
+        return (blorp_TlsBackendStepResult){
+            .status = BLORP_TLS_BACKEND_STEP_WANT_READ,
+            .error_kind = BLORP_TLS_ERROR_NONE,
+            .detail = blorp_string_literal("test TLS handshake wants read"),
+            .bytes = NULL,
+            .count = 0
+        };
+    }
+    return blorp_test_tls_handshake_step_done(session);
+}
+
+static blorp_TlsBackendStepResult blorp_test_tls_read_step_wait_once(
+    blorp_TlsSession* session,
+    long max_bytes
+) {
+    blorp_TestTlsWaitProbe* probe =
+        session ? (blorp_TestTlsWaitProbe*)session->backend_state : NULL;
+    if (probe && probe->read_steps++ == 0) {
+        return (blorp_TlsBackendStepResult){
+            .status = BLORP_TLS_BACKEND_STEP_WANT_READ,
+            .error_kind = BLORP_TLS_ERROR_NONE,
+            .detail = blorp_string_literal("test TLS read wants read"),
+            .bytes = NULL,
+            .count = 0
+        };
+    }
+    return blorp_test_tls_read_step_done(session, max_bytes);
+}
+
+static blorp_TlsBackendStepResult blorp_test_tls_write_step_wait_once(
+    blorp_TlsSession* session,
+    blorp_Bytes* data,
+    long offset
+) {
+    blorp_TestTlsWaitProbe* probe =
+        session ? (blorp_TestTlsWaitProbe*)session->backend_state : NULL;
+    if (probe && probe->write_steps++ == 0) {
+        return (blorp_TlsBackendStepResult){
+            .status = BLORP_TLS_BACKEND_STEP_WANT_WRITE,
+            .error_kind = BLORP_TLS_ERROR_NONE,
+            .detail = blorp_string_literal("test TLS write wants write"),
+            .bytes = NULL,
+            .count = 0
+        };
+    }
+    return blorp_test_tls_write_step_done(session, data, offset);
+}
+
+static const blorp_TlsBackendOps BLORP_TEST_TLS_WAIT_PROBE_BACKEND = {
+    .kind = BLORP_TLS_BACKEND_UNSUPPORTED,
+    .capabilities = BLORP_TLS_BACKEND_CAP_NONE,
+    .close = blorp_tls_backend_close_unsupported,
+    .connect = blorp_tls_backend_connect_unsupported,
+    .handshake_step = blorp_test_tls_handshake_step_wait_once,
+    .read_step = blorp_test_tls_read_step_wait_once,
+    .write_step = blorp_test_tls_write_step_wait_once
+};
+
+long blorp_test_tls_state_probe(void) {
+    bool ok = true;
+    blorp_Bytes* bytes = blorp_bytes_new(1);
+    const blorp_TlsBackendOps* active_backend = blorp_tls_active_backend();
+    switch (active_backend->kind) {
+        case BLORP_TLS_BACKEND_UNSUPPORTED:
+        case BLORP_TLS_BACKEND_OPENSSL:
+            break;
+        default:
+            ok = false;
+            break;
+    }
+    ok = ok && blorp_tls_backend_ops_complete(active_backend);
+    ok = ok &&
+         !blorp_tls_backend_native_available(&BLORP_TLS_UNSUPPORTED_BACKEND);
+#if defined(BLORP_TLS_BACKEND_PROFILE_OPENSSL)
+    ok = ok && blorp_tls_backend_native_available(&BLORP_TLS_OPENSSL_BACKEND);
+#endif
+    blorp_TlsBackendOps native_capable_backend =
+        BLORP_TEST_TLS_CONNECT_PROBE_BACKEND;
+    native_capable_backend.kind = BLORP_TLS_BACKEND_OPENSSL;
+    native_capable_backend.capabilities = BLORP_TLS_BACKEND_CAP_NATIVE_IO;
+    ok = ok && blorp_tls_backend_native_available(&native_capable_backend);
+    native_capable_backend.read_step = NULL;
+    ok = ok && !blorp_tls_backend_native_available(&native_capable_backend);
+    native_capable_backend = BLORP_TEST_TLS_CONNECT_PROBE_BACKEND;
+    native_capable_backend.kind = BLORP_TLS_BACKEND_OPENSSL;
+    native_capable_backend.capabilities =
+        BLORP_TLS_BACKEND_CAP_CONNECT |
+        BLORP_TLS_BACKEND_CAP_HANDSHAKE |
+        BLORP_TLS_BACKEND_CAP_READ;
+    ok = ok && !blorp_tls_backend_native_available(&native_capable_backend);
+
+    blorp_TlsSessionResult handshake_result = blorp_tls_connect_with_backend(
+        NULL,
+        blorp_string_literal("localhost"),
+        &BLORP_TEST_TLS_CONNECT_PROBE_BACKEND);
+    ok = ok && handshake_result.error_kind == BLORP_TLS_ERROR_NONE;
+    ok = ok && handshake_result.handle;
+    ok = ok && handshake_result.handle->state == BLORP_TLS_SESSION_OPEN;
+    if (handshake_result.detail) blorp_release(handshake_result.detail);
+    if (handshake_result.handle) blorp_release(handshake_result.handle);
+
+    int wait_fds[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, wait_fds) == 0 &&
+        blorp_runtime_set_cloexec(wait_fds[0]) == 0 &&
+        blorp_runtime_set_cloexec(wait_fds[1]) == 0 &&
+        blorp_io_reactor_set_nonblocking(wait_fds[0]) == 0 &&
+        blorp_io_reactor_set_nonblocking(wait_fds[1]) == 0) {
+        blorp_TcpStream* wait_stream =
+            blorp_tcp_stream_from_open_fd(wait_fds[0]);
+        wait_fds[0] = -1;
+        blorp_Result* timeout_result =
+            blorp_tcp_set_timeout_stream(wait_stream, 50);
+        ok = ok && timeout_result && timeout_result->tag == BLORP_TAG_OK;
+        if (timeout_result) blorp_release(timeout_result);
+        unsigned char wake = 1;
+        ssize_t written = send(
+            wait_fds[1],
+            &wake,
+            1,
+            BLORP_TCP_SEND_FLAGS);
+        bool wait_ready = written == 1;
+        ok = ok && wait_ready;
+        if (wait_ready) {
+            blorp_TestTlsWaitProbe wait_handshake_probe = {
+                .handshake_steps = 0,
+                .read_steps = 0,
+                .write_steps = 0
+            };
+            blorp_TlsSession* wait_handshake = blorp_tls_session_new(
+                wait_stream,
+                &BLORP_TEST_TLS_WAIT_PROBE_BACKEND,
+                BLORP_TLS_SESSION_HANDSHAKING,
+                &wait_handshake_probe);
+            blorp_TlsSessionResult wait_handshake_result =
+                blorp_tls_backend_drive_handshake(
+                    &BLORP_TEST_TLS_WAIT_PROBE_BACKEND,
+                    wait_handshake);
+            ok = ok &&
+                 wait_handshake_result.error_kind == BLORP_TLS_ERROR_NONE &&
+                 wait_handshake_result.handle &&
+                 wait_handshake_result.handle->state ==
+                     BLORP_TLS_SESSION_OPEN &&
+                 wait_handshake_probe.handshake_steps == 2;
+            if (wait_handshake_result.detail) {
+                blorp_release(wait_handshake_result.detail);
+            }
+            if (wait_handshake_result.handle) {
+                blorp_release(wait_handshake_result.handle);
+            }
+
+            blorp_TestTlsWaitProbe wait_read_probe = {
+                .handshake_steps = 0,
+                .read_steps = 0,
+                .write_steps = 0
+            };
+            blorp_TlsSession* wait_read = blorp_tls_session_new(
+                wait_stream,
+                &BLORP_TEST_TLS_WAIT_PROBE_BACKEND,
+                BLORP_TLS_SESSION_OPEN,
+                &wait_read_probe);
+            ok = ok && blorp_test_tls_read_is_ok(wait_read);
+            ok = ok && wait_read_probe.read_steps == 2;
+            blorp_release(wait_read);
+
+            blorp_TestTlsWaitProbe wait_write_probe = {
+                .handshake_steps = 0,
+                .read_steps = 0,
+                .write_steps = 0
+            };
+            blorp_TlsSession* wait_write = blorp_tls_session_new(
+                wait_stream,
+                &BLORP_TEST_TLS_WAIT_PROBE_BACKEND,
+                BLORP_TLS_SESSION_OPEN,
+                &wait_write_probe);
+            ok = ok && blorp_test_tls_write_is_ok(wait_write, bytes);
+            ok = ok && wait_write_probe.write_steps == 2;
+            blorp_release(wait_write);
+
+            blorp_TestTlsWaitProbe wait_write_all_probe = {
+                .handshake_steps = 0,
+                .read_steps = 0,
+                .write_steps = 0
+            };
+            blorp_TlsSession* wait_write_all = blorp_tls_session_new(
+                wait_stream,
+                &BLORP_TEST_TLS_WAIT_PROBE_BACKEND,
+                BLORP_TLS_SESSION_OPEN,
+                &wait_write_all_probe);
+            ok = ok && blorp_test_tls_write_all_is_ok(wait_write_all, bytes);
+            ok = ok && wait_write_all_probe.write_steps == 2;
+            blorp_release(wait_write_all);
+        }
+
+        blorp_release(wait_stream);
+        close(wait_fds[1]);
+        wait_fds[1] = -1;
+    } else {
+        ok = false;
+    }
+    if (wait_fds[0] >= 0) close(wait_fds[0]);
+    if (wait_fds[1] >= 0) close(wait_fds[1]);
+
+    ok = ok && blorp_test_tls_read_has_error(
+        NULL,
+        64,
+        BLORP_TLS_ERROR_CLOSED);
+
+    blorp_TlsSession* closed = blorp_tls_session_new(
+        NULL,
+        &BLORP_TLS_UNSUPPORTED_BACKEND,
+        BLORP_TLS_SESSION_CLOSED,
+        NULL);
+    ok = ok && blorp_test_tls_read_has_error(
+        closed,
+        64,
+        BLORP_TLS_ERROR_CLOSED);
+    ok = ok && blorp_test_tls_write_has_error(
+        closed,
+        bytes,
+        BLORP_TLS_ERROR_CLOSED);
+    ok = ok && blorp_test_tls_write_all_has_error(
+        closed,
+        bytes,
+        BLORP_TLS_ERROR_CLOSED);
+    blorp_release(closed);
+
+    blorp_TlsSession* closing = blorp_tls_session_new(
+        NULL,
+        &BLORP_TLS_UNSUPPORTED_BACKEND,
+        BLORP_TLS_SESSION_CLOSING,
+        NULL);
+    ok = ok && blorp_test_tls_read_has_error(
+        closing,
+        64,
+        BLORP_TLS_ERROR_CLOSED);
+    blorp_release(closing);
+
+    blorp_TlsSession* handshaking = blorp_tls_session_new(
+        NULL,
+        &BLORP_TLS_UNSUPPORTED_BACKEND,
+        BLORP_TLS_SESSION_HANDSHAKING,
+        NULL);
+    ok = ok && blorp_test_tls_read_has_error(
+        handshaking,
+        64,
+        BLORP_TLS_ERROR_BUSY);
+    ok = ok && blorp_test_tls_write_has_error(
+        handshaking,
+        bytes,
+        BLORP_TLS_ERROR_BUSY);
+    blorp_release(handshaking);
+
+    blorp_TlsSession* failed = blorp_tls_session_new(
+        NULL,
+        &BLORP_TLS_UNSUPPORTED_BACKEND,
+        BLORP_TLS_SESSION_FAILED,
+        NULL);
+    ok = ok && blorp_test_tls_read_has_error(
+        failed,
+        64,
+        BLORP_TLS_ERROR_OTHER);
+    blorp_release(failed);
+
+    blorp_TestTlsCloseProbe close_probe = {
+        .close_called = false,
+        .saw_closing_state = false
+    };
+    blorp_TlsSession* cleanup_session = blorp_tls_session_new(
+        NULL,
+        &BLORP_TEST_TLS_CLOSE_PROBE_BACKEND,
+        BLORP_TLS_SESSION_OPEN,
+        &close_probe);
+    blorp_release(cleanup_session);
+    ok = ok && close_probe.close_called && close_probe.saw_closing_state;
+
+    blorp_TlsSession* step_session = blorp_tls_session_new(
+        NULL,
+        &BLORP_TEST_TLS_STEP_PROBE_BACKEND,
+        BLORP_TLS_SESSION_OPEN,
+        NULL);
+    ok = ok && blorp_test_tls_read_is_ok(step_session);
+    ok = ok && blorp_test_tls_write_is_ok(step_session, bytes);
+    ok = ok && blorp_test_tls_write_all_is_ok(step_session, bytes);
+    blorp_release(step_session);
+
+    blorp_TlsSession* open = blorp_tls_session_new(
+        NULL,
+        &BLORP_TLS_UNSUPPORTED_BACKEND,
+        BLORP_TLS_SESSION_OPEN,
+        NULL);
+    ok = ok && blorp_test_tls_read_has_error(
+        open,
+        64,
+        BLORP_TLS_ERROR_UNSUPPORTED);
+    ok = ok && blorp_test_tls_read_has_error(
+        open,
+        0,
+        BLORP_TLS_ERROR_INVALID_INPUT);
+    ok = ok && blorp_test_tls_read_has_error(
+        open,
+        BLORP_TCP_MAX_READ_BYTES + 1,
+        BLORP_TLS_ERROR_INVALID_INPUT);
+    ok = ok && blorp_test_tls_write_has_error(
+        open,
+        bytes,
+        BLORP_TLS_ERROR_UNSUPPORTED);
+    ok = ok && blorp_test_tls_write_has_error(
+        open,
+        NULL,
+        BLORP_TLS_ERROR_INVALID_INPUT);
+    ok = ok && blorp_test_tls_write_all_has_error(
+        open,
+        bytes,
+        BLORP_TLS_ERROR_UNSUPPORTED);
+    ok = ok && blorp_test_tls_write_all_has_error(
+        open,
+        NULL,
+        BLORP_TLS_ERROR_INVALID_INPUT);
+
+    __atomic_store_n(
+        &open->operation_state,
+        BLORP_TLS_OPERATION_IO,
+        __ATOMIC_RELEASE);
+    ok = ok && blorp_test_tls_read_has_error(
+        open,
+        64,
+        BLORP_TLS_ERROR_BUSY);
+    ok = ok && blorp_test_tls_write_has_error(
+        open,
+        bytes,
+        BLORP_TLS_ERROR_BUSY);
+    ok = ok && blorp_test_tls_write_all_has_error(
+        open,
+        bytes,
+        BLORP_TLS_ERROR_BUSY);
+    __atomic_store_n(
+        &open->operation_state,
+        BLORP_TLS_OPERATION_NONE,
+        __ATOMIC_RELEASE);
+
+    blorp_TlsBackendOps incomplete_backend = BLORP_TLS_UNSUPPORTED_BACKEND;
+    incomplete_backend.read_step = NULL;
+    open->backend = &incomplete_backend;
+    ok = ok && blorp_test_tls_read_has_error(
+        open,
+        64,
+        BLORP_TLS_ERROR_OTHER);
+    open->backend = &BLORP_TLS_UNSUPPORTED_BACKEND;
+
+    blorp_FallibleStream* chunks = blorp_tls_chunks_raw(open, 64);
+    blorp_FallibleStreamIntResult count =
+        blorp_fallible_stream_count_raw(chunks);
+    ok = ok && count.error.domain == BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TLS;
+    ok = ok && count.error.kind == (long)BLORP_TLS_ERROR_UNSUPPORTED;
+    if (count.error.detail) blorp_release(count.error.detail);
+    blorp_release(chunks);
+    blorp_release(open);
+
+    blorp_release(bytes);
+    return ok ? 1 : 0;
+}
+
+typedef struct {
+    bool close_called;
+    bool saw_closing_state;
+} blorp_TestWebSocketCloseProbe;
+
+static void blorp_test_websocket_backend_close_probe(
+    blorp_WebSocketSession* session
+) {
+    blorp_TestWebSocketCloseProbe* probe = session
+        ? (blorp_TestWebSocketCloseProbe*)session->backend_state
+        : NULL;
+    if (!probe) return;
+    probe->close_called = true;
+    probe->saw_closing_state =
+        session->state == BLORP_WEBSOCKET_SESSION_CLOSING;
+}
+
+static const blorp_WebSocketBackendOps
+    BLORP_TEST_WEBSOCKET_CLOSE_PROBE_BACKEND = {
+        .kind = BLORP_WEBSOCKET_BACKEND_TEST,
+        .capabilities = BLORP_WEBSOCKET_BACKEND_CAP_NONE,
+        .close = blorp_test_websocket_backend_close_probe,
+        .connect = blorp_websocket_backend_connect_unsupported,
+        .handshake = blorp_websocket_backend_handshake_unsupported,
+        .receive = blorp_websocket_backend_receive_unsupported,
+        .send_text = blorp_websocket_backend_send_text_unsupported,
+        .send_binary = blorp_websocket_backend_send_binary_unsupported,
+        .send_ping = blorp_websocket_backend_send_ping_unsupported,
+        .send_pong = blorp_websocket_backend_send_pong_unsupported,
+        .send_close = blorp_websocket_backend_send_close_unsupported
+    };
+
+static blorp_WebSocketVoidResult blorp_test_websocket_send_text_ok(
+    blorp_WebSocketSession* session,
+    blorp_String* text
+) {
+    (void)session;
+    (void)text;
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_test_websocket_handshake_ok(
+    blorp_WebSocketSession* session,
+    const blorp_WebSocketConnectTarget* target
+) {
+    (void)session;
+    (void)target;
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketMessageResult
+blorp_test_websocket_receive_without_message(
+    blorp_WebSocketSession* session
+) {
+    (void)session;
+    return (blorp_WebSocketMessageResult){
+        .message_kind = BLORP_WEBSOCKET_MESSAGE_NONE,
+        .text = NULL,
+        .bytes = NULL,
+        .code = 0,
+        .reason = NULL,
+        .error_kind = BLORP_WEBSOCKET_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_WebSocketMessageResult blorp_test_websocket_receive_close(
+    blorp_WebSocketSession* session
+) {
+    (void)session;
+    return blorp_websocket_message_result_close(
+        1000,
+        blorp_string_literal("peer closing"));
+}
+
+static blorp_WebSocketVoidResult blorp_test_websocket_send_binary_ok(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    (void)session;
+    (void)bytes;
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_test_websocket_send_ping_ok(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    (void)session;
+    (void)bytes;
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_test_websocket_send_pong_ok(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    (void)session;
+    (void)bytes;
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketVoidResult blorp_test_websocket_send_close_ok(
+    blorp_WebSocketSession* session,
+    long code,
+    blorp_String* reason
+) {
+    (void)session;
+    (void)code;
+    (void)reason;
+    return blorp_websocket_void_result_ok();
+}
+
+static blorp_WebSocketSessionResult blorp_test_websocket_backend_connect_probe(
+    const blorp_WebSocketConnectTarget* target
+);
+
+static const blorp_WebSocketBackendOps
+    BLORP_TEST_WEBSOCKET_CONNECT_PROBE_BACKEND = {
+        .kind = BLORP_WEBSOCKET_BACKEND_TEST,
+        .capabilities = BLORP_WEBSOCKET_BACKEND_CAP_NATIVE_IO,
+        .close = blorp_websocket_backend_close_unsupported,
+        .connect = blorp_test_websocket_backend_connect_probe,
+        .handshake = blorp_test_websocket_handshake_ok,
+        .receive = blorp_test_websocket_receive_without_message,
+        .send_text = blorp_test_websocket_send_text_ok,
+        .send_binary = blorp_test_websocket_send_binary_ok,
+        .send_ping = blorp_test_websocket_send_ping_ok,
+        .send_pong = blorp_test_websocket_send_pong_ok,
+        .send_close = blorp_test_websocket_send_close_ok
+    };
+
+static const blorp_WebSocketBackendOps
+    BLORP_TEST_WEBSOCKET_CLOSE_RECEIVE_BACKEND = {
+        .kind = BLORP_WEBSOCKET_BACKEND_TEST,
+        .capabilities = BLORP_WEBSOCKET_BACKEND_CAP_NATIVE_IO,
+        .close = blorp_websocket_backend_close_unsupported,
+        .connect = blorp_test_websocket_backend_connect_probe,
+        .handshake = blorp_test_websocket_handshake_ok,
+        .receive = blorp_test_websocket_receive_close,
+        .send_text = blorp_test_websocket_send_text_ok,
+        .send_binary = blorp_test_websocket_send_binary_ok,
+        .send_ping = blorp_test_websocket_send_ping_ok,
+        .send_pong = blorp_test_websocket_send_pong_ok,
+        .send_close = blorp_test_websocket_send_close_ok
+    };
+
+static const blorp_WebSocketBackendOps
+    BLORP_TEST_WEBSOCKET_TRANSPORT_FRAME_BACKEND = {
+        .kind = BLORP_WEBSOCKET_BACKEND_TEST,
+        .capabilities = BLORP_WEBSOCKET_BACKEND_CAP_RECEIVE |
+                        BLORP_WEBSOCKET_BACKEND_CAP_SEND_TEXT |
+                        BLORP_WEBSOCKET_BACKEND_CAP_SEND_BINARY |
+                        BLORP_WEBSOCKET_BACKEND_CAP_SEND_CONTROL,
+        .close = blorp_websocket_backend_close_unsupported,
+        .connect = blorp_websocket_backend_connect_unsupported,
+        .handshake = blorp_websocket_backend_handshake_transport,
+        .receive = blorp_websocket_backend_receive_transport_frame,
+        .send_text = blorp_websocket_backend_send_text_transport_frame,
+        .send_binary = blorp_websocket_backend_send_binary_transport_frame,
+        .send_ping = blorp_websocket_backend_send_ping_transport_frame,
+        .send_pong = blorp_websocket_backend_send_pong_transport_frame,
+        .send_close = blorp_websocket_backend_send_close_transport_frame
+    };
+
+static blorp_WebSocketSessionResult blorp_test_websocket_backend_connect_probe(
+    const blorp_WebSocketConnectTarget* target
+) {
+    if (!target || target->transport != BLORP_WEBSOCKET_TRANSPORT_TCP ||
+        target->port != 80 || target->host_is_ipv6_literal ||
+        !target->host || target->host->len != 11 ||
+        memcmp(target->host->data, "example.com", 11) != 0 ||
+        !target->path || target->path->len != 7 ||
+        memcmp(target->path->data, "/socket", 7) != 0 ||
+        !target->query || target->query->len != 0) {
+        return blorp_websocket_session_result_error(
+            BLORP_WEBSOCKET_ERROR_OTHER,
+            "test websocket connect target mismatch");
+    }
+    return blorp_websocket_session_result_ok(blorp_websocket_session_new(
+        &BLORP_TEST_WEBSOCKET_CONNECT_PROBE_BACKEND,
+        BLORP_WEBSOCKET_SESSION_HANDSHAKING,
+        blorp_websocket_transport_owner_none(),
+        NULL));
+}
+
+static bool blorp_test_websocket_string_equals(
+    const blorp_String* actual,
+    const char* expected
+) {
+    long expected_len = expected ? (long)strlen(expected) : 0;
+    if (!actual || actual->len != expected_len) return false;
+    if (expected_len == 0) return true;
+    return memcmp(actual->data, expected, (size_t)expected_len) == 0;
+}
+
+static bool blorp_test_websocket_parse_matches(
+    const char* url_text,
+    blorp_WebSocketTransportKind transport,
+    const char* host,
+    bool host_is_ipv6_literal,
+    long port,
+    const char* path,
+    const char* query
+) {
+    blorp_WebSocketConnectTarget target;
+    blorp_String* url = blorp_string_literal(url_text);
+    const char* error = blorp_websocket_parse_url(url, &target);
+    bool matches =
+        !error && target.transport == transport &&
+        target.host_is_ipv6_literal == host_is_ipv6_literal &&
+        target.port == port &&
+        blorp_test_websocket_string_equals(target.host, host) &&
+        blorp_test_websocket_string_equals(target.path, path) &&
+        blorp_test_websocket_string_equals(target.query, query);
+    blorp_websocket_connect_target_cleanup(&target);
+    blorp_release(url);
+    return matches;
+}
+
+static blorp_Bytes* blorp_test_websocket_bytes_from_data(
+    const unsigned char* data,
+    long len
+);
+
+static bool blorp_test_websocket_void_matches(
+    blorp_WebSocketVoidResult result,
+    blorp_WebSocketErrorKind expected_kind
+) {
+    bool matches = result.error_kind == expected_kind;
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_websocket_handshake_response_matches(
+    const char* response,
+    blorp_String* key,
+    blorp_WebSocketErrorKind expected_kind
+) {
+    blorp_Bytes* bytes = blorp_test_websocket_bytes_from_data(
+        (const unsigned char*)response,
+        response ? (long)strlen(response) : 0);
+    bool matches = blorp_test_websocket_void_matches(
+        blorp_websocket_verify_handshake_response(bytes, key),
+        expected_kind);
+    blorp_release(bytes);
+    return matches;
+}
+
+static bool blorp_test_websocket_message_matches(
+    blorp_WebSocketMessageResult result,
+    blorp_WebSocketErrorKind expected_kind
+) {
+    bool matches = result.error_kind == expected_kind;
+    blorp_websocket_message_result_release_payload(&result);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_websocket_text_message_result_matches(
+    blorp_WebSocketMessageResult result,
+    const char* expected
+) {
+    bool matches =
+        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+        result.message_kind == BLORP_WEBSOCKET_MESSAGE_TEXT &&
+        blorp_test_websocket_string_equals(result.text, expected);
+    blorp_websocket_message_result_release_payload(&result);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_websocket_bytes_message_result_matches(
+    blorp_WebSocketMessageResult result,
+    blorp_WebSocketMessageKind expected_kind,
+    const unsigned char* expected,
+    long expected_len
+) {
+    blorp_Bytes* actual = result.bytes;
+    bool matches =
+        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+        result.message_kind == expected_kind && actual &&
+        actual->len == expected_len;
+    if (matches && expected_len > 0) {
+        matches =
+            expected && memcmp(actual->data, expected, (size_t)expected_len) == 0;
+    }
+    blorp_websocket_message_result_release_payload(&result);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static blorp_Bytes* blorp_test_websocket_bytes_from_data(
+    const unsigned char* data,
+    long len
+) {
+    blorp_Bytes* bytes = blorp_bytes_new(len);
+    if (data && len > 0) memcpy(bytes->data, data, (size_t)len);
+    return bytes;
+}
+
+static bool blorp_test_websocket_decoded_text_matches(
+    const unsigned char* frame_data,
+    long frame_len,
+    const char* expected
+) {
+    blorp_Bytes* frame =
+        blorp_test_websocket_bytes_from_data(frame_data, frame_len);
+    blorp_WebSocketMessageResult result =
+        blorp_websocket_decode_complete_server_frame(frame);
+    bool matches =
+        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+        result.message_kind == BLORP_WEBSOCKET_MESSAGE_TEXT &&
+        blorp_test_websocket_string_equals(result.text, expected);
+    blorp_websocket_message_result_release_payload(&result);
+    if (result.detail) blorp_release(result.detail);
+    blorp_release(frame);
+    return matches;
+}
+
+static bool blorp_test_websocket_decoded_bytes_matches(
+    const unsigned char* frame_data,
+    long frame_len,
+    blorp_WebSocketMessageKind expected_kind,
+    const unsigned char* expected,
+    long expected_len
+) {
+    blorp_Bytes* frame =
+        blorp_test_websocket_bytes_from_data(frame_data, frame_len);
+    blorp_WebSocketMessageResult result =
+        blorp_websocket_decode_complete_server_frame(frame);
+    blorp_Bytes* actual = result.bytes;
+    bool matches =
+        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+        result.message_kind == expected_kind && actual &&
+        actual->len == expected_len;
+    if (matches && expected_len > 0) {
+        matches =
+            expected && memcmp(actual->data, expected, (size_t)expected_len) == 0;
+    }
+    blorp_websocket_message_result_release_payload(&result);
+    if (result.detail) blorp_release(result.detail);
+    blorp_release(frame);
+    return matches;
+}
+
+static bool blorp_test_websocket_decoded_close_matches(
+    const unsigned char* frame_data,
+    long frame_len,
+    long expected_code,
+    const char* expected_reason
+) {
+    blorp_Bytes* frame =
+        blorp_test_websocket_bytes_from_data(frame_data, frame_len);
+    blorp_WebSocketMessageResult result =
+        blorp_websocket_decode_complete_server_frame(frame);
+    bool matches =
+        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+        result.message_kind == BLORP_WEBSOCKET_MESSAGE_CLOSE &&
+        result.code == expected_code &&
+        blorp_test_websocket_string_equals(result.reason, expected_reason);
+    blorp_websocket_message_result_release_payload(&result);
+    if (result.detail) blorp_release(result.detail);
+    blorp_release(frame);
+    return matches;
+}
+
+static bool blorp_test_websocket_decoded_frame_has_error(
+    const unsigned char* frame_data,
+    long frame_len,
+    blorp_WebSocketErrorKind expected_kind
+) {
+    blorp_Bytes* frame =
+        blorp_test_websocket_bytes_from_data(frame_data, frame_len);
+    bool matches = blorp_test_websocket_message_matches(
+        blorp_websocket_decode_complete_server_frame(frame),
+        expected_kind);
+    blorp_release(frame);
+    return matches;
+}
+
+static bool blorp_test_websocket_bytes_matches(
+    blorp_WebSocketBytesResult result,
+    blorp_WebSocketErrorKind expected_kind,
+    long expected_len
+) {
+    bool matches = result.error_kind == expected_kind;
+    if (expected_kind == BLORP_WEBSOCKET_ERROR_NONE) {
+        matches = matches && result.value && result.value->len == expected_len;
+    }
+    if (result.value) blorp_release(result.value);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_websocket_bytes_equal_cstr(
+    blorp_WebSocketBytesResult result,
+    const char* expected
+) {
+    long expected_len = expected ? (long)strlen(expected) : 0;
+    bool matches =
+        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE && result.value &&
+        result.value->len == expected_len &&
+        memcmp(result.value->data, expected, (size_t)expected_len) == 0;
+    if (result.value) blorp_release(result.value);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_websocket_client_frame_data_matches(
+    const unsigned char* frame,
+    long frame_len,
+    long opcode,
+    const unsigned char* expected,
+    long expected_len
+) {
+    if (!frame || frame_len < 6 || expected_len < 0) return false;
+    if (frame[0] != (unsigned char)(0x80 | (opcode & 0x0f))) return false;
+    if ((frame[1] & 0x80) == 0) return false;
+
+    long payload_len = 0;
+    long mask_offset = 2;
+    unsigned char len_code = frame[1] & 0x7f;
+    if (len_code < 126) {
+        payload_len = len_code;
+    } else if (len_code == 126) {
+        if (frame_len < 8) return false;
+        payload_len = ((long)frame[2] << 8) | (long)frame[3];
+        mask_offset = 4;
+    } else {
+        if (frame_len < 14) return false;
+        uint64_t len = 0;
+        for (int i = 0; i < 8; i++) {
+            len = (len << 8) | (uint64_t)frame[2 + i];
+        }
+        if (len > (uint64_t)LONG_MAX) return false;
+        payload_len = (long)len;
+        mask_offset = 10;
+    }
+    if (payload_len != expected_len) return false;
+    if (payload_len > LONG_MAX - mask_offset - 4) return false;
+    if (frame_len != mask_offset + 4 + payload_len) return false;
+
+    const unsigned char* mask = frame + mask_offset;
+    const unsigned char* payload = frame + mask_offset + 4;
+    for (long i = 0; i < payload_len; i++) {
+        unsigned char actual = payload[i] ^ mask[i % 4];
+        unsigned char want = expected ? expected[i] : 0;
+        if (actual != want) return false;
+    }
+    return true;
+}
+
+static bool blorp_test_websocket_client_frame_matches(
+    blorp_WebSocketBytesResult result,
+    long opcode,
+    const unsigned char* expected,
+    long expected_len
+) {
+    bool matches =
+        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE && result.value &&
+        blorp_test_websocket_client_frame_data_matches(
+            result.value->data,
+            result.value->len,
+            opcode,
+            expected,
+            expected_len);
+    if (result.value) blorp_release(result.value);
+    if (result.detail) blorp_release(result.detail);
+    return matches;
+}
+
+static bool blorp_test_websocket_receive_has_error(
+    blorp_WebSocketSession* session,
+    blorp_WebSocketErrorKind expected_kind
+) {
+    return blorp_test_websocket_message_matches(
+        blorp_websocket_receive_raw(session),
+        expected_kind);
+}
+
+static bool blorp_test_websocket_send_text_has_error(
+    blorp_WebSocketSession* session,
+    blorp_WebSocketErrorKind expected_kind
+) {
+    return blorp_test_websocket_void_matches(
+        blorp_websocket_send_text_raw(session, blorp_string_literal("hello")),
+        expected_kind);
+}
+
+static bool blorp_test_websocket_send_close_has_error(
+    blorp_WebSocketSession* session,
+    long code,
+    blorp_String* reason,
+    blorp_WebSocketErrorKind expected_kind
+) {
+    return blorp_test_websocket_void_matches(
+        blorp_websocket_send_close_raw(session, code, reason),
+        expected_kind);
+}
+
+static bool blorp_test_websocket_all_sends_are_ok(
+    blorp_WebSocketSession* session,
+    blorp_Bytes* bytes
+) {
+    return blorp_test_websocket_void_matches(
+               blorp_websocket_send_text_raw(
+                   session,
+                   blorp_string_literal("hello")),
+               BLORP_WEBSOCKET_ERROR_NONE) &&
+           blorp_test_websocket_void_matches(
+               blorp_websocket_send_binary_raw(session, bytes),
+               BLORP_WEBSOCKET_ERROR_NONE) &&
+           blorp_test_websocket_void_matches(
+               blorp_websocket_send_ping_raw(session, bytes),
+               BLORP_WEBSOCKET_ERROR_NONE) &&
+           blorp_test_websocket_void_matches(
+               blorp_websocket_send_pong_raw(session, bytes),
+               BLORP_WEBSOCKET_ERROR_NONE) &&
+           blorp_test_websocket_void_matches(
+               blorp_websocket_send_close_raw(
+                   session,
+                   1000,
+                   blorp_string_literal("done")),
+	               BLORP_WEBSOCKET_ERROR_NONE);
+}
+
+typedef struct {
+    int listen_fd;
+    bool ok;
+} blorp_TestWebSocketLoopbackServer;
+
+static bool blorp_test_websocket_send_all(
+    int fd,
+    const unsigned char* data,
+    size_t len
+) {
+    size_t offset = 0;
+    uint64_t deadline = blorp_monotonic_now_ns() + 5000000000ULL;
+    while (offset < len) {
+        ssize_t n = send(
+            fd,
+            data + offset,
+            len - offset,
+            BLORP_TCP_SEND_FLAGS);
+        if (n > 0) {
+            offset += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+                      || errno == EWOULDBLOCK
+#endif
+                      )) {
+            if (blorp_monotonic_now_ns() >= deadline) return false;
+            usleep(1000);
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static long blorp_test_websocket_find_header_end(
+    const unsigned char* data,
+    long len
+) {
+    if (!data || len < 4) return -1;
+    for (long i = 0; i <= len - 4; i++) {
+        if (data[i] == '\r' && data[i + 1] == '\n' &&
+            data[i + 2] == '\r' && data[i + 3] == '\n') {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool blorp_test_websocket_extract_client_key(
+    const unsigned char* request,
+    long request_len,
+    const unsigned char** key_start,
+    long* key_len
+) {
+    static const char key_header[] = "Sec-WebSocket-Key: ";
+    long header_len = (long)strlen(key_header);
+    if (!request || request_len < header_len || !key_start || !key_len) {
+        return false;
+    }
+    for (long i = 0; i <= request_len - header_len; i++) {
+        if (memcmp(request + i, key_header, (size_t)header_len) != 0) {
+            continue;
+        }
+        long start = i + header_len;
+        long end = start;
+        while (end < request_len && request[end] != '\r') end++;
+        if (end >= request_len || end == start) return false;
+        *key_start = request + start;
+        *key_len = end - start;
+        return true;
+    }
+    return false;
+}
+
+static bool blorp_test_websocket_handle_loopback_client(int fd) {
+    if (blorp_io_reactor_set_nonblocking(fd) != 0) return false;
+    unsigned char request[2048] = { 0 };
+    long request_len = 0;
+    uint64_t deadline = blorp_monotonic_now_ns() + 5000000000ULL;
+    while (request_len < (long)sizeof(request)) {
+        ssize_t n = recv(
+            fd,
+            request + request_len,
+            sizeof(request) - (size_t)request_len,
+            0);
+        if (n > 0) {
+            request_len += n;
+            if (blorp_test_websocket_find_header_end(request, request_len) >=
+                0) {
+                break;
+            }
+            continue;
+        }
+        if (n == 0) return false;
+        if (errno == EINTR || errno == EAGAIN
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+            || errno == EWOULDBLOCK
+#endif
+        ) {
+            if (blorp_monotonic_now_ns() >= deadline) return false;
+            usleep(1000);
+            continue;
+        }
+        return false;
+    }
+    long header_end =
+        blorp_test_websocket_find_header_end(request, request_len);
+    if (header_end < 0) return false;
+
+    const unsigned char* key_start = NULL;
+    long key_len = 0;
+    if (!blorp_test_websocket_extract_client_key(
+            request,
+            header_end + 4,
+            &key_start,
+            &key_len)) {
+        return false;
+    }
+
+    blorp_String* key = blorp_string_from_buf((const char*)key_start, key_len);
+    blorp_String* accept = blorp_websocket_compute_accept_value(key);
+    blorp_release(key);
+    if (!accept || accept->len <= 0 || accept->len > 128) {
+        if (accept) blorp_release(accept);
+        return false;
+    }
+
+    char response[512];
+    int response_len = snprintf(
+        response,
+        sizeof(response),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %.*s\r\n\r\n",
+        (int)accept->len,
+        accept->data);
+    blorp_release(accept);
+    if (response_len <= 0 || (size_t)response_len >= sizeof(response)) {
+        return false;
+    }
+    const unsigned char early_frame[4] = { 0x81, 0x02, 'o', 'k' };
+    return blorp_test_websocket_send_all(
+               fd,
+               (const unsigned char*)response,
+               (size_t)response_len) &&
+           blorp_test_websocket_send_all(fd, early_frame, sizeof(early_frame));
+}
+
+static void* blorp_test_websocket_loopback_server_thread(void* arg) {
+    blorp_TestWebSocketLoopbackServer* server =
+        (blorp_TestWebSocketLoopbackServer*)arg;
+    if (!server) return NULL;
+    int listen_fd = server->listen_fd;
+    int client_fd = -1;
+    uint64_t deadline = blorp_monotonic_now_ns() + 5000000000ULL;
+    while (blorp_monotonic_now_ns() < deadline) {
+        client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd >= 0) break;
+        if (errno == EINTR || errno == EAGAIN
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+            || errno == EWOULDBLOCK
+#endif
+        ) {
+            usleep(1000);
+            continue;
+        }
+        break;
+    }
+    if (client_fd >= 0) {
+        server->ok = blorp_test_websocket_handle_loopback_client(client_fd);
+        close(client_fd);
+    } else {
+        server->ok = false;
+    }
+    close(listen_fd);
+    server->listen_fd = -1;
+    return NULL;
+}
+
+static bool blorp_test_websocket_loopback_connect_probe(void) {
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) return false;
+    bool ok = true;
+    int enabled = 1;
+    (void)setsockopt(
+        listen_fd,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &enabled,
+        sizeof(enabled));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(listen_fd);
+        return false;
+    }
+    if (listen(listen_fd, 1) != 0) {
+        close(listen_fd);
+        return false;
+    }
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(listen_fd, (struct sockaddr*)&addr, &addr_len) != 0) {
+        close(listen_fd);
+        return false;
+    }
+    long port = (long)ntohs(addr.sin_port);
+    if (port <= 0 || blorp_io_reactor_set_nonblocking(listen_fd) != 0) {
+        close(listen_fd);
+        return false;
+    }
+
+    blorp_TestWebSocketLoopbackServer server = {
+        .listen_fd = listen_fd,
+        .ok = false
+    };
+    pthread_t thread;
+    if (pthread_create(
+            &thread,
+            NULL,
+            blorp_test_websocket_loopback_server_thread,
+            &server) != 0) {
+        close(listen_fd);
+        return false;
+    }
+
+    char url_buf[128];
+    int url_len = snprintf(
+        url_buf,
+        sizeof(url_buf),
+        "ws://127.0.0.1:%ld/socket",
+        port);
+    if (url_len <= 0 || (size_t)url_len >= sizeof(url_buf)) {
+        ok = false;
+    } else {
+        blorp_String* url = blorp_string_from_buf(url_buf, (long)url_len);
+        blorp_WebSocketSessionResult result = blorp_websocket_connect_raw(url);
+        blorp_release(url);
+        ok = ok && result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+             result.handle &&
+             result.handle->state == BLORP_WEBSOCKET_SESSION_OPEN;
+        if (ok && result.handle) {
+            ok = ok && blorp_test_websocket_text_message_result_matches(
+                           blorp_websocket_receive_raw(result.handle),
+                           "ok");
+        }
+        if (result.detail) blorp_release(result.detail);
+        if (result.handle) blorp_release(result.handle);
+    }
+
+    pthread_join(thread, NULL);
+    return ok && server.ok;
+}
+
+long blorp_test_websocket_state_probe(void) {
+    bool ok = true;
+    blorp_Bytes* bytes = blorp_bytes_new(0);
+
+    blorp_WebSocketMessageResult text_message =
+        blorp_websocket_normalize_message_result(
+            blorp_websocket_message_result_text(blorp_string_literal("hello")));
+    ok = ok &&
+         text_message.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+         text_message.message_kind == BLORP_WEBSOCKET_MESSAGE_TEXT &&
+         blorp_test_websocket_string_equals(text_message.text, "hello");
+    blorp_websocket_message_result_release_payload(&text_message);
+    if (text_message.detail) blorp_release(text_message.detail);
+
+    blorp_WebSocketMessageResult binary_message =
+        blorp_websocket_normalize_message_result(
+            blorp_websocket_message_result_binary(blorp_bytes_new(0)));
+    ok = ok &&
+         binary_message.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+         binary_message.message_kind == BLORP_WEBSOCKET_MESSAGE_BINARY;
+    blorp_websocket_message_result_release_payload(&binary_message);
+    if (binary_message.detail) blorp_release(binary_message.detail);
+
+    blorp_WebSocketMessageResult close_message =
+        blorp_websocket_normalize_message_result(
+            blorp_websocket_message_result_close(
+                1000,
+                blorp_string_literal("done")));
+    ok = ok &&
+         close_message.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+         close_message.message_kind == BLORP_WEBSOCKET_MESSAGE_CLOSE &&
+         close_message.code == 1000 &&
+         blorp_test_websocket_string_equals(close_message.reason, "done");
+    blorp_websocket_message_result_release_payload(&close_message);
+    if (close_message.detail) blorp_release(close_message.detail);
+
+    blorp_WebSocketMessageResult ping_message =
+        blorp_websocket_normalize_message_result(
+            blorp_websocket_message_result_ping(blorp_bytes_new(0)));
+    ok = ok &&
+         ping_message.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+         ping_message.message_kind == BLORP_WEBSOCKET_MESSAGE_PING;
+    blorp_websocket_message_result_release_payload(&ping_message);
+    if (ping_message.detail) blorp_release(ping_message.detail);
+
+    blorp_WebSocketMessageResult pong_message =
+        blorp_websocket_normalize_message_result(
+            blorp_websocket_message_result_pong(blorp_bytes_new(0)));
+    ok = ok &&
+         pong_message.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+         pong_message.message_kind == BLORP_WEBSOCKET_MESSAGE_PONG;
+    blorp_websocket_message_result_release_payload(&pong_message);
+    if (pong_message.detail) blorp_release(pong_message.detail);
+
+    blorp_Bytes* frame_payload = blorp_bytes_new(2);
+    frame_payload->data[0] = 'h';
+    frame_payload->data[1] = 'i';
+    ok = ok && blorp_test_websocket_client_frame_matches(
+                   blorp_websocket_build_client_frame(
+                       BLORP_WEBSOCKET_OPCODE_TEXT,
+                       frame_payload),
+                   BLORP_WEBSOCKET_OPCODE_TEXT,
+                   frame_payload->data,
+                   frame_payload->len);
+
+    blorp_Bytes* extended_frame_payload = blorp_bytes_new(126);
+    for (long i = 0; i < extended_frame_payload->len; i++) {
+        extended_frame_payload->data[i] = (unsigned char)(i & 0xff);
+    }
+    ok = ok && blorp_test_websocket_client_frame_matches(
+                   blorp_websocket_build_client_frame(
+                       BLORP_WEBSOCKET_OPCODE_BINARY,
+                       extended_frame_payload),
+                   BLORP_WEBSOCKET_OPCODE_BINARY,
+                   extended_frame_payload->data,
+                   extended_frame_payload->len);
+
+    ok = ok && blorp_test_websocket_bytes_matches(
+                   blorp_websocket_build_client_frame(3, frame_payload),
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                   0);
+    ok = ok && blorp_test_websocket_bytes_matches(
+                   blorp_websocket_build_client_frame(
+                       BLORP_WEBSOCKET_OPCODE_PING,
+                       extended_frame_payload),
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL,
+                   0);
+
+    const unsigned char server_text_frame[4] = { 0x81, 0x02, 'h', 'i' };
+    ok = ok && blorp_test_websocket_decoded_text_matches(
+                   server_text_frame,
+                   4,
+                   "hi");
+
+    blorp_Bytes* server_binary_frame = blorp_bytes_new(130);
+    server_binary_frame->data[0] = 0x82;
+    server_binary_frame->data[1] = 126;
+    server_binary_frame->data[2] = 0;
+    server_binary_frame->data[3] = 126;
+    for (long i = 0; i < 126; i++) {
+        server_binary_frame->data[4 + i] = (unsigned char)(255 - i);
+    }
+    ok = ok && blorp_test_websocket_decoded_bytes_matches(
+                   server_binary_frame->data,
+                   server_binary_frame->len,
+                   BLORP_WEBSOCKET_MESSAGE_BINARY,
+                   server_binary_frame->data + 4,
+                   126);
+    blorp_release(server_binary_frame);
+
+    const unsigned char server_ping_frame[2] = { 0x89, 0x00 };
+    ok = ok && blorp_test_websocket_decoded_bytes_matches(
+                   server_ping_frame,
+                   2,
+                   BLORP_WEBSOCKET_MESSAGE_PING,
+                   NULL,
+                   0);
+    const unsigned char server_close_frame[8] = {
+        0x88, 0x06, 0x03, 0xe8, 'd', 'o', 'n', 'e'
+    };
+    ok = ok && blorp_test_websocket_decoded_close_matches(
+                   server_close_frame,
+                   8,
+                   1000,
+                   "done");
+    const unsigned char server_close_no_code_frame[2] = { 0x88, 0x00 };
+    ok = ok && blorp_test_websocket_decoded_close_matches(
+                   server_close_no_code_frame,
+                   2,
+                   1005,
+                   "");
+
+    const unsigned char masked_server_frame[6] = {
+        0x81, 0x80, 0x01, 0x02, 0x03, 0x04
+    };
+    ok = ok && blorp_test_websocket_decoded_frame_has_error(
+                   masked_server_frame,
+                   6,
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    const unsigned char fragmented_frame[2] = { 0x01, 0x00 };
+    ok = ok && blorp_test_websocket_decoded_frame_has_error(
+                   fragmented_frame,
+                   2,
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    const unsigned char reserved_frame[2] = { 0xc1, 0x00 };
+    ok = ok && blorp_test_websocket_decoded_frame_has_error(
+                   reserved_frame,
+                   2,
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    const unsigned char truncated_extended_frame[3] = {
+        0x82, 126, 0
+    };
+    ok = ok && blorp_test_websocket_decoded_frame_has_error(
+                   truncated_extended_frame,
+                   3,
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    const unsigned char trailing_frame[3] = { 0x89, 0x00, 0x00 };
+    ok = ok && blorp_test_websocket_decoded_frame_has_error(
+                   trailing_frame,
+                   3,
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    blorp_Bytes* oversized_ping_frame = blorp_bytes_new(130);
+    oversized_ping_frame->data[0] = 0x89;
+    oversized_ping_frame->data[1] = 126;
+    oversized_ping_frame->data[2] = 0;
+    oversized_ping_frame->data[3] = 126;
+    ok = ok && blorp_test_websocket_decoded_frame_has_error(
+                   oversized_ping_frame->data,
+                   oversized_ping_frame->len,
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    blorp_release(oversized_ping_frame);
+    const unsigned char invalid_utf8_text_frame[4] = {
+        0x81, 0x02, 0xc0, 0x80
+    };
+    ok = ok && blorp_test_websocket_decoded_frame_has_error(
+                   invalid_utf8_text_frame,
+                   4,
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    blorp_release(extended_frame_payload);
+    blorp_release(frame_payload);
+
+    const blorp_WebSocketBackendOps* active_backend =
+        blorp_websocket_active_backend();
+    switch (active_backend->kind) {
+        case BLORP_WEBSOCKET_BACKEND_RUNTIME:
+            break;
+        case BLORP_WEBSOCKET_BACKEND_UNSUPPORTED:
+        case BLORP_WEBSOCKET_BACKEND_TEST:
+        default:
+            ok = false;
+            break;
+    }
+    ok = ok && blorp_websocket_backend_ops_complete(active_backend);
+    ok = ok && blorp_websocket_backend_native_available(active_backend);
+    ok = ok && !blorp_websocket_backend_native_available(
+                   &BLORP_WEBSOCKET_UNSUPPORTED_BACKEND);
+    ok = ok && !blorp_websocket_backend_native_available(
+                   &BLORP_TEST_WEBSOCKET_TRANSPORT_FRAME_BACKEND);
+
+    blorp_WebSocketBackendOps native_capable_backend =
+        BLORP_TEST_WEBSOCKET_CONNECT_PROBE_BACKEND;
+    native_capable_backend.capabilities =
+        BLORP_WEBSOCKET_BACKEND_CAP_NATIVE_IO;
+    ok = ok &&
+         blorp_websocket_backend_native_available(&native_capable_backend);
+    native_capable_backend.kind = BLORP_WEBSOCKET_BACKEND_UNSUPPORTED;
+    ok = ok &&
+         !blorp_websocket_backend_native_available(&native_capable_backend);
+    native_capable_backend = BLORP_TEST_WEBSOCKET_CONNECT_PROBE_BACKEND;
+    native_capable_backend.send_binary = NULL;
+    ok = ok &&
+         !blorp_websocket_backend_native_available(&native_capable_backend);
+    native_capable_backend = BLORP_TEST_WEBSOCKET_CONNECT_PROBE_BACKEND;
+    native_capable_backend.capabilities =
+        BLORP_WEBSOCKET_BACKEND_CAP_CONNECT |
+        BLORP_WEBSOCKET_BACKEND_CAP_RECEIVE |
+        BLORP_WEBSOCKET_BACKEND_CAP_SEND_TEXT |
+        BLORP_WEBSOCKET_BACKEND_CAP_SEND_CONTROL;
+    ok = ok &&
+         !blorp_websocket_backend_native_available(&native_capable_backend);
+
+    ok = ok && blorp_test_websocket_parse_matches(
+                   "ws://example.com/socket",
+                   BLORP_WEBSOCKET_TRANSPORT_TCP,
+                   "example.com",
+                   false,
+                   80,
+                   "/socket",
+                   "");
+    ok = ok && blorp_test_websocket_parse_matches(
+                   "wss://example.com/chat?room=blue",
+                   BLORP_WEBSOCKET_TRANSPORT_TLS,
+                   "example.com",
+                   false,
+                   443,
+                   "/chat",
+                   "room=blue");
+    ok = ok && blorp_test_websocket_parse_matches(
+                   "ws://[::1]:8080?x=1",
+                   BLORP_WEBSOCKET_TRANSPORT_TCP,
+                   "::1",
+                   true,
+                   8080,
+                   "/",
+                   "x=1");
+
+    blorp_String* sample_key =
+        blorp_string_literal("dGhlIHNhbXBsZSBub25jZQ==");
+    blorp_String* sample_accept =
+        blorp_websocket_compute_accept_value(sample_key);
+    ok = ok && blorp_test_websocket_string_equals(
+                   sample_accept,
+                   "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    blorp_release(sample_accept);
+
+    blorp_String* generated_key = blorp_websocket_generate_client_key();
+    blorp_String* decoded_generated_key =
+        blorp_base64_decode_nullable(generated_key);
+    ok = ok && decoded_generated_key && decoded_generated_key->len == 16;
+    if (decoded_generated_key) blorp_release(decoded_generated_key);
+    blorp_release(generated_key);
+
+    blorp_WebSocketConnectTarget request_target;
+    blorp_String* request_url =
+        blorp_string_literal("wss://[::1]:8443/chat?room=blue");
+    const char* request_error =
+        blorp_websocket_parse_url(request_url, &request_target);
+    ok = ok && !request_error;
+    if (!request_error) {
+        ok = ok && blorp_test_websocket_bytes_equal_cstr(
+                       blorp_websocket_build_handshake_request(
+                           &request_target,
+                           sample_key),
+                       "GET /chat?room=blue HTTP/1.1\r\n"
+                       "Host: [::1]:8443\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Key: "
+                       "dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n\r\n");
+    }
+    blorp_websocket_connect_target_cleanup(&request_target);
+    blorp_release(request_url);
+
+    blorp_WebSocketConnectTarget secure_target;
+    blorp_String* secure_url =
+        blorp_string_literal("wss://example.com/socket");
+    const char* secure_error =
+        blorp_websocket_parse_url(secure_url, &secure_target);
+    ok = ok && !secure_error;
+    if (!secure_error && !blorp_tls_native_available_raw()) {
+        blorp_WebSocketSessionResult secure_result =
+            blorp_websocket_connect_with_backend(
+                &secure_target,
+                &BLORP_WEBSOCKET_RUNTIME_BACKEND);
+        ok = ok &&
+             secure_result.error_kind == BLORP_WEBSOCKET_ERROR_UNSUPPORTED &&
+             !secure_result.handle;
+        if (secure_result.detail) blorp_release(secure_result.detail);
+    }
+    blorp_websocket_connect_target_cleanup(&secure_target);
+    blorp_release(secure_url);
+
+    ok = ok && blorp_test_websocket_loopback_connect_probe();
+
+    ok = ok && blorp_test_websocket_handshake_response_matches(
+                   "HTTP/1.1 101 Switching Protocols\r\n"
+                   "Upgrade: WebSocket\r\n"
+                   "Connection: keep-alive, Upgrade\r\n"
+                   "Sec-WebSocket-Accept: "
+                   "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                   sample_key,
+                   BLORP_WEBSOCKET_ERROR_NONE);
+    ok = ok && blorp_test_websocket_handshake_response_matches(
+                   "HTTP/1.1 200 OK\r\n"
+                   "Upgrade: websocket\r\n"
+                   "Connection: Upgrade\r\n"
+                   "Sec-WebSocket-Accept: "
+                   "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                   sample_key,
+                   BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED);
+    ok = ok && blorp_test_websocket_handshake_response_matches(
+                   "HTTP/1.1 101 Switching Protocols\r\n"
+                   "Connection: keep-alive\r\n"
+                   "Sec-WebSocket-Accept: "
+                   "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                   sample_key,
+                   BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED);
+    ok = ok && blorp_test_websocket_handshake_response_matches(
+                   "HTTP/1.1 101 Switching Protocols\r\n"
+                   "Upgrade: websocket\r\n"
+                   "Connection: Upgrade\r\n"
+                   "Sec-WebSocket-Accept: wrong\r\n\r\n",
+                   sample_key,
+                   BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED);
+    ok = ok && blorp_test_websocket_handshake_response_matches(
+                   "HTTP/1.1 101 Switching Protocols\r\n"
+                   "Upgrade: websocket\r\n"
+                   "Connection: Upgrade\r\n"
+                   "Sec-WebSocket-Accept: "
+                   "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+                   "Sec-WebSocket-Accept: "
+                   "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                   sample_key,
+                   BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED);
+
+    blorp_WebSocketConnectTarget connect_target;
+    blorp_String* connect_url = blorp_string_literal("ws://example.com/socket");
+    const char* connect_target_error = blorp_websocket_parse_url(
+        connect_url,
+        &connect_target);
+    ok = ok && !connect_target_error;
+    if (!connect_target_error) {
+        int handshake_fds[2] = { -1, -1 };
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, handshake_fds) == 0) {
+            ok = ok && blorp_io_reactor_set_nonblocking(handshake_fds[1]) == 0;
+            blorp_TcpStream* handshake_stream =
+                blorp_tcp_stream_from_open_fd(handshake_fds[0]);
+            handshake_fds[0] = -1;
+            blorp_WebSocketSession* handshake_session =
+                blorp_websocket_session_new(
+                    &BLORP_TEST_WEBSOCKET_TRANSPORT_FRAME_BACKEND,
+                    BLORP_WEBSOCKET_SESSION_HANDSHAKING,
+                    blorp_websocket_transport_owner_retain_tcp(
+                        handshake_stream),
+                    NULL);
+            const char* handshake_response =
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Accept: "
+                "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+            const unsigned char early_text_frame[4] = {
+                0x81, 0x02, 'o', 'k'
+            };
+            unsigned char handshake_wire[256] = { 0 };
+            size_t handshake_response_len = strlen(handshake_response);
+            size_t handshake_wire_len =
+                handshake_response_len + sizeof(early_text_frame);
+            ssize_t handshake_response_written = -1;
+            if (handshake_wire_len <= sizeof(handshake_wire)) {
+                memcpy(
+                    handshake_wire,
+                    handshake_response,
+                    handshake_response_len);
+                memcpy(
+                    handshake_wire + handshake_response_len,
+                    early_text_frame,
+                    sizeof(early_text_frame));
+                handshake_response_written = send(
+                    handshake_fds[1],
+                    handshake_wire,
+                    handshake_wire_len,
+                    BLORP_TCP_SEND_FLAGS);
+            }
+            if (handshake_response_written ==
+                    (ssize_t)handshake_wire_len &&
+                shutdown(handshake_fds[1], SHUT_WR) == 0) {
+                ok = ok && blorp_test_websocket_void_matches(
+                               blorp_websocket_transport_drive_handshake_with_key(
+                                   handshake_session,
+                                   &connect_target,
+                                   sample_key),
+                               BLORP_WEBSOCKET_ERROR_NONE);
+                ok = ok &&
+                     handshake_session->state ==
+                         BLORP_WEBSOCKET_SESSION_HANDSHAKING;
+                handshake_session->state = BLORP_WEBSOCKET_SESSION_OPEN;
+                ok = ok && blorp_test_websocket_text_message_result_matches(
+                               blorp_websocket_receive_raw(handshake_session),
+                               "ok");
+                const char* expected_request =
+                    "GET /socket HTTP/1.1\r\n"
+                    "Host: example.com\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: "
+                    "dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n";
+                unsigned char request_buf[256] = { 0 };
+                ssize_t request_len = recv(
+                    handshake_fds[1],
+                    request_buf,
+                    sizeof(request_buf),
+                    0);
+                ok = ok && request_len == (ssize_t)strlen(expected_request) &&
+                     memcmp(
+                         request_buf,
+                         expected_request,
+                         strlen(expected_request)) == 0;
+            } else {
+                ok = false;
+            }
+            blorp_release(handshake_session);
+            blorp_release(handshake_stream);
+            close(handshake_fds[1]);
+            handshake_fds[1] = -1;
+        } else {
+            ok = false;
+        }
+        if (handshake_fds[0] >= 0) close(handshake_fds[0]);
+        if (handshake_fds[1] >= 0) close(handshake_fds[1]);
+    }
+    blorp_WebSocketSessionResult connect_result =
+        connect_target_error
+            ? blorp_websocket_session_result_error(
+                  BLORP_WEBSOCKET_ERROR_INVALID_URL,
+                  connect_target_error)
+            : blorp_websocket_connect_with_backend(
+                  &connect_target,
+                  &BLORP_TEST_WEBSOCKET_CONNECT_PROBE_BACKEND);
+    ok = ok &&
+         connect_result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+         connect_result.handle &&
+         connect_result.handle->state == BLORP_WEBSOCKET_SESSION_OPEN;
+    if (connect_result.detail) blorp_release(connect_result.detail);
+    if (connect_result.handle) blorp_release(connect_result.handle);
+    blorp_websocket_connect_target_cleanup(&connect_target);
+    blorp_release(connect_url);
+
+    blorp_TestWebSocketCloseProbe close_probe = {
+        .close_called = false,
+        .saw_closing_state = false
+    };
+    blorp_WebSocketSession* cleanup_session = blorp_websocket_session_new(
+        &BLORP_TEST_WEBSOCKET_CLOSE_PROBE_BACKEND,
+        BLORP_WEBSOCKET_SESSION_OPEN,
+        blorp_websocket_transport_owner_none(),
+        &close_probe);
+    blorp_release(cleanup_session);
+    ok = ok && close_probe.close_called && close_probe.saw_closing_state;
+
+    int transport_fds[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, transport_fds) == 0) {
+        ok = ok && blorp_io_reactor_set_nonblocking(transport_fds[1]) == 0;
+        blorp_TcpStream* owned_stream =
+            blorp_tcp_stream_from_open_fd(transport_fds[0]);
+        transport_fds[0] = -1;
+        long stream_refs_before = atomic_load_explicit(
+            &((blorp_Object*)owned_stream)->refcount,
+            memory_order_relaxed);
+        blorp_WebSocketSession* stream_owner_session =
+            blorp_websocket_session_new(
+                &BLORP_TEST_WEBSOCKET_TRANSPORT_FRAME_BACKEND,
+                BLORP_WEBSOCKET_SESSION_OPEN,
+                blorp_websocket_transport_owner_retain_tcp(owned_stream),
+                NULL);
+        ok = ok &&
+             atomic_load_explicit(
+                 &((blorp_Object*)owned_stream)->refcount,
+                 memory_order_relaxed) == stream_refs_before + 1;
+        unsigned char input_bytes[3] = { 'w', 's', '!' };
+        ssize_t input_written =
+            send(transport_fds[1], input_bytes, 3, BLORP_TCP_SEND_FLAGS);
+        if (input_written == 3) {
+            ok = ok && blorp_test_websocket_bytes_matches(
+                           blorp_websocket_transport_read_bytes(
+                               stream_owner_session,
+                               8),
+                           BLORP_WEBSOCKET_ERROR_NONE,
+                           3);
+        } else {
+            ok = false;
+        }
+        blorp_Bytes* output_bytes = blorp_bytes_new(2);
+        output_bytes->data[0] = 'o';
+        output_bytes->data[1] = 'k';
+        blorp_WebSocketVoidResult output_result =
+            blorp_websocket_transport_write_all(
+                stream_owner_session,
+                output_bytes);
+        bool output_ok =
+            output_result.error_kind == BLORP_WEBSOCKET_ERROR_NONE;
+        ok = ok && output_ok;
+        if (output_result.detail) blorp_release(output_result.detail);
+        blorp_release(output_bytes);
+        if (output_ok) {
+            unsigned char output_read[2] = { 0, 0 };
+            ssize_t output_read_len =
+                recv(transport_fds[1], output_read, 2, 0);
+            ok = ok && output_read_len == 2 && output_read[0] == 'o' &&
+                 output_read[1] == 'k';
+        }
+        blorp_Bytes* wire_frame_payload = blorp_bytes_new(1);
+        wire_frame_payload->data[0] = 'z';
+        blorp_WebSocketVoidResult wire_frame_result =
+            blorp_websocket_send_binary_raw(
+                stream_owner_session,
+                wire_frame_payload);
+        bool wire_frame_ok =
+            wire_frame_result.error_kind == BLORP_WEBSOCKET_ERROR_NONE;
+        ok = ok && wire_frame_ok;
+        if (wire_frame_result.detail) blorp_release(wire_frame_result.detail);
+        if (wire_frame_ok) {
+            unsigned char wire_frame[7] = { 0 };
+            ssize_t wire_frame_len =
+                recv(transport_fds[1], wire_frame, 7, 0);
+            ok = ok && wire_frame_len == 7 &&
+                 blorp_test_websocket_client_frame_data_matches(
+                     wire_frame,
+                     7,
+                     BLORP_WEBSOCKET_OPCODE_BINARY,
+                     wire_frame_payload->data,
+                     wire_frame_payload->len);
+        }
+        blorp_release(wire_frame_payload);
+        blorp_String* text_frame_text = blorp_string_literal("yo");
+        blorp_WebSocketVoidResult text_frame_result =
+            blorp_websocket_send_text_raw(
+                stream_owner_session,
+                text_frame_text);
+        bool text_frame_ok =
+            text_frame_result.error_kind == BLORP_WEBSOCKET_ERROR_NONE;
+        ok = ok && text_frame_ok;
+        if (text_frame_result.detail) blorp_release(text_frame_result.detail);
+        if (text_frame_ok) {
+            unsigned char text_frame[8] = { 0 };
+            ssize_t text_frame_len =
+                recv(transport_fds[1], text_frame, 8, 0);
+            ok = ok && text_frame_len == 8 &&
+                 blorp_test_websocket_client_frame_data_matches(
+                     text_frame,
+                     8,
+                     BLORP_WEBSOCKET_OPCODE_TEXT,
+                     (const unsigned char*)text_frame_text->data,
+                     text_frame_text->len);
+        }
+        blorp_WebSocketVoidResult ping_frame_result =
+            blorp_websocket_send_ping_raw(stream_owner_session, bytes);
+        bool ping_frame_ok =
+            ping_frame_result.error_kind == BLORP_WEBSOCKET_ERROR_NONE;
+        ok = ok && ping_frame_ok;
+        if (ping_frame_result.detail) blorp_release(ping_frame_result.detail);
+        if (ping_frame_ok) {
+            unsigned char ping_frame[6] = { 0 };
+            ssize_t ping_frame_len =
+                recv(transport_fds[1], ping_frame, 6, 0);
+            ok = ok && ping_frame_len == 6 &&
+                 blorp_test_websocket_client_frame_data_matches(
+                     ping_frame,
+                     6,
+                     BLORP_WEBSOCKET_OPCODE_PING,
+                     NULL,
+                     0);
+        }
+        blorp_WebSocketVoidResult pong_frame_result =
+            blorp_websocket_send_pong_raw(stream_owner_session, bytes);
+        bool pong_frame_ok =
+            pong_frame_result.error_kind == BLORP_WEBSOCKET_ERROR_NONE;
+        ok = ok && pong_frame_ok;
+        if (pong_frame_result.detail) blorp_release(pong_frame_result.detail);
+        if (pong_frame_ok) {
+            unsigned char pong_frame[6] = { 0 };
+            ssize_t pong_frame_len =
+                recv(transport_fds[1], pong_frame, 6, 0);
+            ok = ok && pong_frame_len == 6 &&
+                 blorp_test_websocket_client_frame_data_matches(
+                     pong_frame,
+                     6,
+                     BLORP_WEBSOCKET_OPCODE_PONG,
+                     NULL,
+                     0);
+        }
+        ssize_t server_text_written = send(
+            transport_fds[1],
+            server_text_frame,
+            sizeof(server_text_frame),
+            BLORP_TCP_SEND_FLAGS);
+        if (server_text_written == (ssize_t)sizeof(server_text_frame)) {
+            ok = ok && blorp_test_websocket_text_message_result_matches(
+                           blorp_websocket_receive_raw(stream_owner_session),
+                           "hi");
+        } else {
+            ok = false;
+        }
+        blorp_Bytes* server_wire_binary_frame = blorp_bytes_new(130);
+        server_wire_binary_frame->data[0] = 0x82;
+        server_wire_binary_frame->data[1] = 126;
+        server_wire_binary_frame->data[2] = 0;
+        server_wire_binary_frame->data[3] = 126;
+        for (long i = 0; i < 126; i++) {
+            server_wire_binary_frame->data[4 + i] = (unsigned char)(i + 1);
+        }
+        ssize_t server_binary_written = send(
+            transport_fds[1],
+            server_wire_binary_frame->data,
+            (size_t)server_wire_binary_frame->len,
+            BLORP_TCP_SEND_FLAGS);
+        if (server_binary_written == server_wire_binary_frame->len) {
+            ok = ok && blorp_test_websocket_bytes_message_result_matches(
+                           blorp_websocket_receive_raw(stream_owner_session),
+                           BLORP_WEBSOCKET_MESSAGE_BINARY,
+                           server_wire_binary_frame->data + 4,
+                           126);
+        } else {
+            ok = false;
+        }
+        blorp_release(server_wire_binary_frame);
+        const unsigned char partial_server_frame[2] = { 0x81, 0x02 };
+        ssize_t partial_written = send(
+            transport_fds[1],
+            partial_server_frame,
+            sizeof(partial_server_frame),
+            BLORP_TCP_SEND_FLAGS);
+        if (partial_written == (ssize_t)sizeof(partial_server_frame) &&
+            shutdown(transport_fds[1], SHUT_WR) == 0) {
+            ok = ok && blorp_test_websocket_message_matches(
+                           blorp_websocket_receive_raw(stream_owner_session),
+                           BLORP_WEBSOCKET_ERROR_CLOSED);
+        } else {
+            ok = false;
+        }
+        blorp_String* close_frame_reason = blorp_string_literal("bye");
+        blorp_WebSocketVoidResult close_frame_result =
+            blorp_websocket_send_close_raw(
+                stream_owner_session,
+                1000,
+                close_frame_reason);
+        bool close_frame_ok =
+            close_frame_result.error_kind == BLORP_WEBSOCKET_ERROR_NONE;
+        ok = ok && close_frame_ok;
+        if (close_frame_result.detail) blorp_release(close_frame_result.detail);
+        if (close_frame_ok) {
+            unsigned char close_frame[11] = { 0 };
+            unsigned char expected_close_payload[5] = {
+                0x03, 0xe8, 'b', 'y', 'e'
+            };
+            ssize_t close_frame_len =
+                recv(transport_fds[1], close_frame, 11, 0);
+            ok = ok && close_frame_len == 11 &&
+                 stream_owner_session->state ==
+                     BLORP_WEBSOCKET_SESSION_CLOSING &&
+                 blorp_test_websocket_client_frame_data_matches(
+                     close_frame,
+                     11,
+                     BLORP_WEBSOCKET_OPCODE_CLOSE,
+                     expected_close_payload,
+                     5);
+        }
+        blorp_release(stream_owner_session);
+        ok = ok &&
+             atomic_load_explicit(
+                 &((blorp_Object*)owned_stream)->refcount,
+                 memory_order_relaxed) == stream_refs_before;
+        blorp_release(owned_stream);
+        close(transport_fds[1]);
+        transport_fds[1] = -1;
+    } else {
+        ok = false;
+    }
+    if (transport_fds[0] >= 0) close(transport_fds[0]);
+    if (transport_fds[1] >= 0) close(transport_fds[1]);
+
+    blorp_TlsSession* owned_tls = blorp_tls_session_new(
+        NULL,
+        &BLORP_TLS_UNSUPPORTED_BACKEND,
+        BLORP_TLS_SESSION_CLOSED,
+        NULL);
+    long tls_refs_before = atomic_load_explicit(
+        &((blorp_Object*)owned_tls)->refcount,
+        memory_order_relaxed);
+    blorp_WebSocketSession* tls_owner_session =
+        blorp_websocket_session_new(
+            &BLORP_WEBSOCKET_UNSUPPORTED_BACKEND,
+            BLORP_WEBSOCKET_SESSION_CLOSED,
+            blorp_websocket_transport_owner_retain_tls(owned_tls),
+            NULL);
+    ok = ok &&
+         atomic_load_explicit(
+             &((blorp_Object*)owned_tls)->refcount,
+             memory_order_relaxed) == tls_refs_before + 1;
+    ok = ok && blorp_test_websocket_bytes_matches(
+                   blorp_websocket_transport_read_bytes(
+                       tls_owner_session,
+                       8),
+                   BLORP_WEBSOCKET_ERROR_CLOSED,
+                   0);
+    blorp_release(tls_owner_session);
+    ok = ok &&
+         atomic_load_explicit(
+             &((blorp_Object*)owned_tls)->refcount,
+             memory_order_relaxed) == tls_refs_before;
+    blorp_release(owned_tls);
+
+    blorp_WebSocketSession* ready_session = blorp_websocket_session_new(
+        &BLORP_TEST_WEBSOCKET_CONNECT_PROBE_BACKEND,
+        BLORP_WEBSOCKET_SESSION_OPEN,
+        blorp_websocket_transport_owner_none(),
+        NULL);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   ready_session,
+                   BLORP_WEBSOCKET_ERROR_OTHER);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   ready_session,
+                   BLORP_WEBSOCKET_ERROR_OTHER);
+    __atomic_store_n(
+        &ready_session->read_operation_state,
+        BLORP_WEBSOCKET_OPERATION_ACTIVE,
+        __ATOMIC_RELEASE);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   ready_session,
+                   BLORP_WEBSOCKET_ERROR_BUSY);
+    __atomic_store_n(
+        &ready_session->read_operation_state,
+        BLORP_WEBSOCKET_OPERATION_NONE,
+        __ATOMIC_RELEASE);
+    __atomic_store_n(
+        &ready_session->write_operation_state,
+        BLORP_WEBSOCKET_OPERATION_ACTIVE,
+        __ATOMIC_RELEASE);
+    ok = ok && blorp_test_websocket_send_text_has_error(
+                   ready_session,
+                   BLORP_WEBSOCKET_ERROR_BUSY);
+    __atomic_store_n(
+        &ready_session->write_operation_state,
+        BLORP_WEBSOCKET_OPERATION_NONE,
+        __ATOMIC_RELEASE);
+    ok = ok && blorp_test_websocket_send_close_has_error(
+                   ready_session,
+                   1005,
+                   blorp_string_literal("reserved"),
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    ok = ok && ready_session->state == BLORP_WEBSOCKET_SESSION_OPEN;
+    ok = ok && blorp_test_websocket_send_close_has_error(
+                   ready_session,
+                   1000,
+                   blorp_string_literal(
+                       "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    ok = ok && ready_session->state == BLORP_WEBSOCKET_SESSION_OPEN;
+    blorp_Bytes* oversized_control =
+        blorp_bytes_new(BLORP_WEBSOCKET_CONTROL_MAX_PAYLOAD_BYTES + 1);
+    ok = ok && blorp_test_websocket_void_matches(
+                   blorp_websocket_send_text_raw(ready_session, NULL),
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    ok = ok && blorp_test_websocket_void_matches(
+                   blorp_websocket_send_binary_raw(ready_session, NULL),
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    ok = ok && blorp_test_websocket_void_matches(
+                   blorp_websocket_send_ping_raw(
+                       ready_session,
+                       oversized_control),
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    ok = ok && blorp_test_websocket_void_matches(
+                   blorp_websocket_send_pong_raw(
+                       ready_session,
+                       oversized_control),
+                   BLORP_WEBSOCKET_ERROR_PROTOCOL);
+    ok = ok && ready_session->state == BLORP_WEBSOCKET_SESSION_OPEN;
+    blorp_release(oversized_control);
+    ok = ok && blorp_test_websocket_all_sends_are_ok(ready_session, bytes);
+    ok = ok && ready_session->state == BLORP_WEBSOCKET_SESSION_CLOSING;
+    blorp_release(ready_session);
+
+    blorp_WebSocketSession* peer_closing_session = blorp_websocket_session_new(
+        &BLORP_TEST_WEBSOCKET_CLOSE_RECEIVE_BACKEND,
+        BLORP_WEBSOCKET_SESSION_OPEN,
+        blorp_websocket_transport_owner_none(),
+        NULL);
+    blorp_WebSocketMessageResult peer_close =
+        blorp_websocket_receive_raw(peer_closing_session);
+    ok = ok &&
+         peer_close.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+         peer_close.message_kind == BLORP_WEBSOCKET_MESSAGE_CLOSE &&
+         peer_closing_session->state ==
+             BLORP_WEBSOCKET_SESSION_CLOSE_RECEIVED;
+    blorp_websocket_message_result_release_payload(&peer_close);
+    if (peer_close.detail) blorp_release(peer_close.detail);
+    ok = ok && blorp_test_websocket_send_text_has_error(
+                   peer_closing_session,
+                   BLORP_WEBSOCKET_ERROR_CLOSED);
+    ok = ok && blorp_test_websocket_send_close_has_error(
+                   peer_closing_session,
+                   1000,
+                   blorp_string_literal("ack"),
+                   BLORP_WEBSOCKET_ERROR_NONE);
+    ok = ok &&
+         peer_closing_session->state == BLORP_WEBSOCKET_SESSION_CLOSING;
+    blorp_release(peer_closing_session);
+
+    blorp_WebSocketSession* handshaking_session = blorp_websocket_session_new(
+        &BLORP_TEST_WEBSOCKET_CONNECT_PROBE_BACKEND,
+        BLORP_WEBSOCKET_SESSION_HANDSHAKING,
+        blorp_websocket_transport_owner_none(),
+        NULL);
+    ok = ok && blorp_test_websocket_send_text_has_error(
+                   handshaking_session,
+                   BLORP_WEBSOCKET_ERROR_BUSY);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   handshaking_session,
+                   BLORP_WEBSOCKET_ERROR_BUSY);
+    blorp_release(handshaking_session);
+
+    blorp_WebSocketSession* unsupported_session = blorp_websocket_session_new(
+        &BLORP_WEBSOCKET_UNSUPPORTED_BACKEND,
+        BLORP_WEBSOCKET_SESSION_OPEN,
+        blorp_websocket_transport_owner_none(),
+        NULL);
+    ok = ok && blorp_test_websocket_send_text_has_error(
+                   unsupported_session,
+                   BLORP_WEBSOCKET_ERROR_UNSUPPORTED);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   unsupported_session,
+                   BLORP_WEBSOCKET_ERROR_UNSUPPORTED);
+
+    blorp_WebSocketBackendOps incomplete_backend =
+        BLORP_WEBSOCKET_UNSUPPORTED_BACKEND;
+    incomplete_backend.receive = NULL;
+    unsupported_session->backend = &incomplete_backend;
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   unsupported_session,
+                   BLORP_WEBSOCKET_ERROR_OTHER);
+    unsupported_session->backend = &BLORP_WEBSOCKET_UNSUPPORTED_BACKEND;
+    blorp_release(unsupported_session);
+
+    ok = ok && blorp_test_websocket_send_text_has_error(
+                   NULL,
+                   BLORP_WEBSOCKET_ERROR_CLOSED);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   NULL,
+                   BLORP_WEBSOCKET_ERROR_CLOSED);
+
+    blorp_WebSocketSession* closed_session = blorp_websocket_session_new(
+        &BLORP_WEBSOCKET_UNSUPPORTED_BACKEND,
+        BLORP_WEBSOCKET_SESSION_CLOSED,
+        blorp_websocket_transport_owner_none(),
+        NULL);
+    ok = ok && blorp_test_websocket_send_text_has_error(
+                   closed_session,
+                   BLORP_WEBSOCKET_ERROR_CLOSED);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   closed_session,
+                   BLORP_WEBSOCKET_ERROR_CLOSED);
+    blorp_release(closed_session);
+
+    blorp_WebSocketSession* closing_session = blorp_websocket_session_new(
+        &BLORP_WEBSOCKET_UNSUPPORTED_BACKEND,
+        BLORP_WEBSOCKET_SESSION_CLOSING,
+        blorp_websocket_transport_owner_none(),
+        NULL);
+    ok = ok && blorp_test_websocket_send_text_has_error(
+                   closing_session,
+                   BLORP_WEBSOCKET_ERROR_CLOSED);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   closing_session,
+                   BLORP_WEBSOCKET_ERROR_CLOSED);
+    blorp_release(closing_session);
+
+    blorp_WebSocketSession* failed_session = blorp_websocket_session_new(
+        &BLORP_WEBSOCKET_UNSUPPORTED_BACKEND,
+        BLORP_WEBSOCKET_SESSION_FAILED,
+        blorp_websocket_transport_owner_none(),
+        NULL);
+    ok = ok && blorp_test_websocket_send_text_has_error(
+                   failed_session,
+                   BLORP_WEBSOCKET_ERROR_OTHER);
+    ok = ok && blorp_test_websocket_receive_has_error(
+                   failed_session,
+                   BLORP_WEBSOCKET_ERROR_OTHER);
+    blorp_release(failed_session);
+
+    blorp_release(bytes);
+    return ok ? 1 : 0;
+}
+
+static void fallible_byte_lines_release_chunk(FallibleByteLinesState* st) {
+    if (!st || !st->chunk) return;
+    if (st->chunk_owned) blorp_release(st->chunk);
+    st->chunk = NULL;
+    st->chunk_pos = 0;
+}
+
+static blorp_FallibleStreamPullStatus fallible_byte_lines_pull(
+    blorp_FallibleStream* self,
+    void** out,
+    blorp_FallibleStreamError* error
+) {
+    FallibleByteLinesState* st = (FallibleByteLinesState*)self->state;
+    if (st->done) return BLORP_FALLIBLE_STREAM_END;
+
+    while (true) {
+        if (!st->chunk || st->chunk_pos >= st->chunk->len) {
+            fallible_byte_lines_release_chunk(st);
+
+            void* next = NULL;
+            blorp_FallibleStreamError pull_error =
+                blorp_fallible_stream_no_error();
+            blorp_FallibleStreamPullStatus status =
+                st->chunks->pull(st->chunks, &next, &pull_error);
+            if (status == BLORP_FALLIBLE_STREAM_ERROR) {
+                *error = pull_error;
+                st->done = true;
+                return BLORP_FALLIBLE_STREAM_ERROR;
+            }
+            if (status == BLORP_FALLIBLE_STREAM_END) {
+                st->done = true;
+                if (st->line_len > 0) {
+                    *out = fallible_line_take(&st->line, &st->line_len);
+                    return BLORP_FALLIBLE_STREAM_ITEM;
+                }
+                return BLORP_FALLIBLE_STREAM_END;
+            }
+
+            st->chunk = (blorp_Bytes*)next;
+            st->chunk_pos = 0;
+            if (!st->chunk || st->chunk->len <= 0) {
+                fallible_byte_lines_release_chunk(st);
+                continue;
+            }
+        }
+
+        long start = st->chunk_pos;
+        while (st->chunk_pos < st->chunk->len &&
+               st->chunk->data[st->chunk_pos] != '\n') {
+            st->chunk_pos++;
+        }
+        fallible_line_append(
+            &st->line,
+            &st->line_len,
+            &st->line_cap,
+            st->chunk->data + start,
+            st->chunk_pos - start);
+        if (st->chunk_pos < st->chunk->len &&
+            st->chunk->data[st->chunk_pos] == '\n') {
+            st->chunk_pos++;
+            *out = fallible_line_take(&st->line, &st->line_len);
+            return BLORP_FALLIBLE_STREAM_ITEM;
+        }
+    }
+}
+
+static void fallible_byte_lines_cleanup(blorp_FallibleStream* self) {
+    FallibleByteLinesState* st = (FallibleByteLinesState*)self->state;
+    if (st) {
+        fallible_byte_lines_release_chunk(st);
+        if (st->chunks) blorp_release(st->chunks);
+        free(st->line);
+        free(st);
+    }
+}
+
+static blorp_FallibleStream* blorp_fallible_lines_from_byte_chunks(
+    blorp_FallibleStream* chunks
+) {
+    blorp_FallibleStream* s = blorp_fallible_stream_new();
+    FallibleByteLinesState* st =
+        (FallibleByteLinesState*)blorp_malloc_checked(
+            sizeof(FallibleByteLinesState));
+    st->chunks = chunks;
+    st->chunk = NULL;
+    st->chunk_pos = 0;
+    st->line = NULL;
+    st->line_len = 0;
+    st->line_cap = 0;
+    st->chunk_owned = blorp_fallible_stream_pulls_owned_arc(chunks);
+    st->done = false;
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
+    s->state = st;
+    s->pull = fallible_byte_lines_pull;
+    s->state_cleanup = fallible_byte_lines_cleanup;
+    return s;
+}
+
+blorp_FallibleStream* blorp_tcp_lines_raw(blorp_TcpStream* stream) {
+    return blorp_fallible_lines_from_byte_chunks(
+        blorp_tcp_chunks_raw(stream, BLORP_FILE_DEFAULT_CHUNK_SIZE));
 }
 
 // --- Raw pull for for-in codegen ---
@@ -22402,62 +31921,124 @@ static blorp_FileBytesResult blorp_file_bytes_error(
     };
 }
 
-static blorp_FileListResult blorp_file_list_ok(blorp_List* value) {
-    return (blorp_FileListResult){
-        .value = value,
-        .error_kind = BLORP_FILE_ERROR_NONE,
+static blorp_FallibleStreamError blorp_fallible_stream_no_error(void) {
+    return (blorp_FallibleStreamError){
+        .domain = BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_NONE,
+        .kind = 0,
         .detail = NULL
     };
 }
 
-static blorp_FileListResult blorp_file_list_error(
+static blorp_FallibleStreamError blorp_fallible_stream_file_error(
     blorp_FileErrorKind kind,
     blorp_String* detail
 ) {
-    return (blorp_FileListResult){
-        .value = NULL,
-        .error_kind = kind,
+    return (blorp_FallibleStreamError){
+        .domain = BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE,
+        .kind = (long)kind,
         .detail = detail
     };
 }
 
-static blorp_FileValueResult blorp_file_value_ok(void* value) {
-    return (blorp_FileValueResult){
+static blorp_FallibleStreamError blorp_fallible_stream_udp_error(
+    blorp_UdpErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FallibleStreamError){
+        .domain = BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_UDP,
+        .kind = (long)kind,
+        .detail = detail
+    };
+}
+
+static blorp_FallibleStreamListResult blorp_fallible_stream_list_ok(
+    blorp_List* value
+) {
+    return (blorp_FallibleStreamListResult){
         .value = value,
-        .error_kind = BLORP_FILE_ERROR_NONE,
-        .detail = NULL
+        .error = blorp_fallible_stream_no_error()
     };
 }
 
-static blorp_FileValueResult blorp_file_value_error(
-    blorp_FileErrorKind kind,
-    blorp_String* detail
+static blorp_FallibleStreamListResult blorp_fallible_stream_list_error(
+    blorp_FallibleStreamError error
 ) {
-    return (blorp_FileValueResult){
+    return (blorp_FallibleStreamListResult){
         .value = NULL,
-        .error_kind = kind,
-        .detail = detail
+        .error = error
     };
 }
 
-static blorp_FileFindResult blorp_file_find_ok(long found, void* value) {
-    return (blorp_FileFindResult){
+static blorp_FallibleStreamValueResult blorp_fallible_stream_value_ok(
+    void* value
+) {
+    return (blorp_FallibleStreamValueResult){
+        .value = value,
+        .error = blorp_fallible_stream_no_error()
+    };
+}
+
+static blorp_FallibleStreamValueResult blorp_fallible_stream_value_error(
+    blorp_FallibleStreamError error
+) {
+    return (blorp_FallibleStreamValueResult){
+        .value = NULL,
+        .error = error
+    };
+}
+
+static blorp_FallibleStreamFindResult blorp_fallible_stream_find_ok(
+    long found,
+    void* value
+) {
+    return (blorp_FallibleStreamFindResult){
         .found = found ? 1 : 0,
         .value = value,
-        .error_kind = BLORP_FILE_ERROR_NONE,
-        .detail = NULL
+        .error = blorp_fallible_stream_no_error()
     };
 }
 
-static blorp_FileFindResult blorp_file_find_error(
-    blorp_FileErrorKind kind,
-    blorp_String* detail
+static blorp_FallibleStreamFindResult blorp_fallible_stream_find_error(
+    blorp_FallibleStreamError error
 ) {
-    return (blorp_FileFindResult){
+    return (blorp_FallibleStreamFindResult){
         .found = 0,
         .value = NULL,
-        .error_kind = kind,
-        .detail = detail
+        .error = error
+    };
+}
+
+static blorp_FallibleStreamIntResult blorp_fallible_stream_int_ok(long value) {
+    return (blorp_FallibleStreamIntResult){
+        .value = value,
+        .error = blorp_fallible_stream_no_error()
+    };
+}
+
+static blorp_FallibleStreamIntResult blorp_fallible_stream_int_error(
+    blorp_FallibleStreamError error
+) {
+    return (blorp_FallibleStreamIntResult){
+        .value = 0,
+        .error = error
+    };
+}
+
+static blorp_FallibleStreamBoolResult blorp_fallible_stream_bool_ok(
+    long value
+) {
+    return (blorp_FallibleStreamBoolResult){
+        .value = value ? 1 : 0,
+        .error = blorp_fallible_stream_no_error()
+    };
+}
+
+static blorp_FallibleStreamBoolResult blorp_fallible_stream_bool_error(
+    blorp_FallibleStreamError error
+) {
+    return (blorp_FallibleStreamBoolResult){
+        .value = 0,
+        .error = error
     };
 }
 
@@ -22474,25 +32055,6 @@ static blorp_FileIntResult blorp_file_int_error(
     blorp_String* detail
 ) {
     return (blorp_FileIntResult){
-        .value = 0,
-        .error_kind = kind,
-        .detail = detail
-    };
-}
-
-static blorp_FileBoolResult blorp_file_bool_ok(long value) {
-    return (blorp_FileBoolResult){
-        .value = value ? 1 : 0,
-        .error_kind = BLORP_FILE_ERROR_NONE,
-        .detail = NULL
-    };
-}
-
-static blorp_FileBoolResult blorp_file_bool_error(
-    blorp_FileErrorKind kind,
-    blorp_String* detail
-) {
-    return (blorp_FileBoolResult){
         .value = 0,
         .error_kind = kind,
         .detail = detail

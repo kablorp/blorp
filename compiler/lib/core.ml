@@ -1015,6 +1015,11 @@ and concurrent_task_scope = {
 and closure_abi = {
   ca_params : (var * Ast.type_expr) list;  (** original typed parameters *)
   ca_captures : (string * Ast.type_expr) list;  (** captured variables *)
+  ca_moved_captures : string list;
+      (** Capture slots moved out of the closure environment by task-entry
+          code. The closure owns these slots until the task body starts; entry
+          unboxes and nulls each slot so the body can transfer ownership into a
+          more precise cleanup scope. *)
   ca_task_abi : bool;  (** true when task runtime calls this closure *)
 }
 (** Closure ABI metadata on hoisted lambda functions. When present on
@@ -1059,6 +1064,19 @@ and concurrently_loop_output =
       (** The loop is statement fan-out and produces [Void]. Child task body
           values are sequenced for effect and discarded before task completion. *)
 
+and concurrently_loop_item_mode =
+  | ConcurrentlyLoopCopyItem
+      (** Ordinary iterable item. The parent reads the item and copies/retains
+          it into the child task closure. *)
+  | ConcurrentlyLoopMoveResourceItem of {
+      clmi_resource_ty : Ast.type_expr;
+      clmi_error_ty : Ast.type_expr;
+    }
+      (** Resource-source item. The parent pulls one owned resource and moves
+          that ownership slot into exactly one child task. The child must
+          rebind it into an explicit [CResourceScope] before user code can
+          reach a cancellation point. *)
+
 and concurrently_loop = {
   cf_var : var;
   cf_iter : core;
@@ -1066,6 +1084,7 @@ and concurrently_loop = {
   cf_timeout : core option;
   cf_width : concurrently_loop_width;
   cf_output : concurrently_loop_output;
+  cf_item_mode : concurrently_loop_item_mode;
   cf_task_scope : concurrent_task_scope;
   cf_task : task_closure option;
       (** Core-visible per-iteration task closure metadata after
@@ -1134,6 +1153,15 @@ let synthetic_concurrent_task_scope =
 
 let map_loop_width f = function
   | ConcurrentlyLoopLimit limit -> ConcurrentlyLoopLimit (f limit)
+
+let map_concurrently_loop_item_mode_types f = function
+  | ConcurrentlyLoopCopyItem -> ConcurrentlyLoopCopyItem
+  | ConcurrentlyLoopMoveResourceItem { clmi_resource_ty; clmi_error_ty } ->
+      ConcurrentlyLoopMoveResourceItem
+        {
+          clmi_resource_ty = f clmi_resource_ty;
+          clmi_error_ty = f clmi_error_ty;
+        }
 
 (** [map_children f e] applies [f] to each immediate child of [e] and
     rebuilds the node. Does not recurse — caller decides when to go deep.
@@ -1307,6 +1335,7 @@ let rec map_children (f : core -> core) (e : core) : core =
             cf_timeout = Option.map f cf.cf_timeout;
             cf_width = map_loop_width f cf.cf_width;
             cf_output = cf.cf_output;
+            cf_item_mode = cf.cf_item_mode;
             cf_task_scope = cf.cf_task_scope;
             cf_task = cf.cf_task;
           }
@@ -2006,8 +2035,13 @@ let rec pp_to_string (e : core) : string =
         | ConcurrentlyLoopCollect -> "collect"
         | ConcurrentlyLoopDiscard -> "discard"
       in
-      Printf.sprintf "for ... concurrently[%s] %s in %s { %s }" output
-        (Var.to_string cf.cf_var) (pp_to_string cf.cf_iter)
+      let item_mode =
+        match cf.cf_item_mode with
+        | ConcurrentlyLoopCopyItem -> "copy"
+        | ConcurrentlyLoopMoveResourceItem _ -> "move-resource"
+      in
+      Printf.sprintf "for ... concurrently[%s,%s] %s in %s { %s }" output
+        item_mode (Var.to_string cf.cf_var) (pp_to_string cf.cf_iter)
         (pp_to_string cf.cf_body)
   | CDetach d -> Printf.sprintf "detach %s" (pp_to_string d.detach_body)
   | CSelect select ->
@@ -2668,7 +2702,12 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
             }
       | CConcurrentlyLoop cf ->
           CConcurrentlyLoop
-            { cf with cf_task = Option.map rewrite_task_closure cf.cf_task }
+            {
+              cf with
+              cf_item_mode =
+                map_concurrently_loop_item_mode_types f cf.cf_item_mode;
+              cf_task = Option.map rewrite_task_closure cf.cf_task;
+            }
       | CDetach d ->
           CDetach
             {
@@ -2748,6 +2787,7 @@ let rec map_types_in_decl (f : Ast.type_expr -> Ast.type_expr)
     {
       ca_params = List.map (fun (v, ty) -> (v, f ty)) abi.ca_params;
       ca_captures = List.map (fun (name, ty) -> (name, f ty)) abi.ca_captures;
+      ca_moved_captures = abi.ca_moved_captures;
       ca_task_abi = abi.ca_task_abi;
     }
   in

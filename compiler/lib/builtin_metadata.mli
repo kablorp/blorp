@@ -8,6 +8,11 @@ type builtin_effect =
       (** Cooperative boundary where a task can observe cancellation. Most are
           fiber park points; [yield_now] is included because it can also unwind
           a cancelled task. *)
+  | Os_worker_blocking
+      (** Operation that blocks a scheduler OS worker instead of parking the
+          current fiber. This is intentionally distinct from
+          [Cancellation_point] until the runtime owns a cancellation-aware
+          worker handoff. *)
 
 type special_inference =
   | Checked_get
@@ -33,4 +38,5 @@ val has_effect : string -> builtin_effect -> bool
 val is_impure : string -> bool
 val is_parallel_boundary : string -> bool
 val is_cancellation_point : string -> bool
+val is_os_worker_blocking : string -> bool
 val special_inference : string -> special_inference option

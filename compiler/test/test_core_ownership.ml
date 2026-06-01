@@ -163,6 +163,83 @@ let test_tcp_connection_sources_borrow_listener () =
   check_contract "blorp_tcp_connections_continue_on_error_raw" expected
     (builtin_contract "blorp_tcp_connections_continue_on_error_raw" 1)
 
+let test_network_capability_queries_return_primitives () =
+  let expected = { args = []; result = ReturnPrimitive } in
+  check_contract "blorp_tls_native_available_raw" expected
+    (builtin_contract "blorp_tls_native_available_raw" 0);
+  check_contract "blorp_websocket_native_available_raw" expected
+    (builtin_contract "blorp_websocket_native_available_raw" 0)
+
+let test_operation_result_bridges_use_manifested_ownership () =
+  let arg_mode_of_runtime_ownership = function
+    | Blorp.Operation_result_metadata.ArgBorrow -> Borrow
+    | Blorp.Operation_result_metadata.ArgRetain -> Retain
+    | Blorp.Operation_result_metadata.ArgConsume -> Consume
+    | Blorp.Operation_result_metadata.ArgCowConsume -> CowConsume
+    | Blorp.Operation_result_metadata.ArgTransfer -> Transfer
+  in
+  List.iter
+    (fun (bridge : Blorp.Operation_result_metadata.result_bridge) ->
+      let expected =
+        {
+          args = List.map arg_mode_of_runtime_ownership bridge.arguments;
+          result = ReturnOwned;
+        }
+      in
+      check_contract bridge.builtin_name expected
+        (builtin_contract bridge.builtin_name (List.length bridge.arguments)))
+    Blorp.Operation_result_metadata.result_bridges
+
+let test_fallible_stream_sources_use_manifested_ownership () =
+  let arg_mode_of_runtime_ownership = function
+    | Blorp.Operation_result_metadata.ArgBorrow -> Borrow
+    | Blorp.Operation_result_metadata.ArgRetain -> Retain
+    | Blorp.Operation_result_metadata.ArgConsume -> Consume
+    | Blorp.Operation_result_metadata.ArgCowConsume -> CowConsume
+    | Blorp.Operation_result_metadata.ArgTransfer -> Transfer
+  in
+  List.iter
+    (fun (source : Blorp.Operation_result_metadata.fallible_stream_source) ->
+      let expected =
+        {
+          args = List.map arg_mode_of_runtime_ownership source.arguments;
+          result = ReturnOwned;
+        }
+      in
+      check_contract source.builtin_name expected
+        (builtin_contract source.builtin_name (List.length source.arguments)))
+    Blorp.Operation_result_metadata.fallible_stream_sources
+
+let test_fallible_stream_terminals_use_manifested_ownership () =
+  let arg_mode_of_runtime_ownership = function
+    | Blorp.Operation_result_metadata.ArgBorrow -> Borrow
+    | Blorp.Operation_result_metadata.ArgRetain -> Retain
+    | Blorp.Operation_result_metadata.ArgConsume -> Consume
+    | Blorp.Operation_result_metadata.ArgCowConsume -> CowConsume
+    | Blorp.Operation_result_metadata.ArgTransfer -> Transfer
+  in
+  List.iter
+    (fun (terminal : Blorp.Operation_result_metadata.fallible_stream_terminal)
+       ->
+      let expected =
+        {
+          args = List.map arg_mode_of_runtime_ownership terminal.arguments;
+          result = ReturnOwned;
+        }
+      in
+      let arity = List.length terminal.arguments in
+      check_contract terminal.builtin_name expected
+        (builtin_contract terminal.builtin_name arity);
+      let entry =
+        List.find
+          (fun entry -> entry.builtin_name = terminal.builtin_name)
+          builtin_contract_table
+      in
+      Alcotest.(check (list int))
+        (terminal.builtin_name ^ " void boxed args")
+        terminal.void_boxed_args entry.builtin_void_boxed_args)
+    Blorp.Operation_result_metadata.fallible_stream_terminals
+
 let test_fixed_constructors_allocate_owned_fixed () =
   let expected = { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned } in
   check_contract "blorp_fixed_new" expected
@@ -930,6 +1007,14 @@ let suite =
           test_tcp_close_finalizers_consume_handles;
         Alcotest.test_case "tcp_connection_sources_borrow_listener" `Quick
           test_tcp_connection_sources_borrow_listener;
+        Alcotest.test_case "network_capability_queries_return_primitives" `Quick
+          test_network_capability_queries_return_primitives;
+        Alcotest.test_case "operation_result_bridges_use_manifested_ownership"
+          `Quick test_operation_result_bridges_use_manifested_ownership;
+        Alcotest.test_case "fallible_stream_sources_use_manifested_ownership"
+          `Quick test_fallible_stream_sources_use_manifested_ownership;
+        Alcotest.test_case "fallible_stream_terminals_use_manifested_ownership"
+          `Quick test_fallible_stream_terminals_use_manifested_ownership;
         Alcotest.test_case "fixed_constructors_allocate_owned_fixed" `Quick
           test_fixed_constructors_allocate_owned_fixed;
         Alcotest.test_case "custom_dict_set_constructors_borrow_callbacks"

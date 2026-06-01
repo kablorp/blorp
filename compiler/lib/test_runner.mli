@@ -160,10 +160,37 @@ val generate_suite_selector_harness : ?leak_check:bool -> string list -> string
 val raylib_linker_flags : unit -> string
 (** Platform-specific linker flags for raylib *)
 
+(** Runtime TLS backend selected for compiling and linking the C runtime.
+    [TlsUnsupported] is the portable default. [TlsOpenSsl] selects the native
+    OpenSSL backend profile and requires discoverable or explicitly configured
+    OpenSSL compiler and linker arguments. *)
+type tls_backend_profile = TlsUnsupported | TlsOpenSsl
+
+val configured_tls_backend_profile :
+  unit -> (tls_backend_profile, string) result
+(** Parse BLORP_TLS_BACKEND. Missing/empty values select [TlsUnsupported]. *)
+
+val current_tls_backend_profile : unit -> tls_backend_profile
+(** Current parsed TLS backend profile, raising [Invalid_argument] if
+    BLORP_TLS_BACKEND is set to an unsupported value. *)
+
+val tls_backend_profile_to_string : tls_backend_profile -> string
+(** Stable name used in runtime cache manifests. *)
+
+val tls_backend_link_cc_args : tls_backend_profile -> string list
+(** Linker arguments required by the selected TLS backend. OpenSSL arguments
+    come from BLORP_OPENSSL_LIBS when set, otherwise pkg-config. *)
+
+val tls_backend_runtime_cc_args : tls_backend_profile -> string list
+(** C compiler defines required when embedding/compiling the runtime source for
+    the selected TLS backend. OpenSSL include arguments come from
+    BLORP_OPENSSL_CFLAGS when set, otherwise pkg-config. *)
+
 type precompiled = {
   runtime_obj : string;
   header_file : string;
   pch_file : string option;
+  tls_backend : tls_backend_profile;
 }
 (** Precompiled artifacts for fast compilation *)
 

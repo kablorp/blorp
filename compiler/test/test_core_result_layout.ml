@@ -55,6 +55,8 @@ let test_managed_and_wide_payloads_use_managed_stack_layout () =
   let meta = meta ~value_records:[ "Vec2" ] () in
   expect_known "Result[Int, String]" L.StackManaged
     (L.classify meta (result (ty "Int" []) (ty "String" [])));
+  expect_known "Result[Void, String]" L.StackManaged
+    (L.classify meta (result (ty "Void" []) (ty "String" [])));
   expect_known "Result[String, Int]" L.StackManaged
     (L.classify meta (result (ty "String" []) (ty "Int" [])));
   expect_known "Result[(Int, Int), Int]" L.StackManaged
@@ -125,7 +127,9 @@ let test_codegen_stack_result_c_type_is_explicit () =
   expect_stack_result_c_type reg "Result[Color, Int]" "blorp_StackResult"
     (result (ty "Color" []) (ty "Int" []));
   expect_stack_result_c_type reg "Result[Int, String]" "blorp_StackResult"
-    (result (ty "Int" []) (ty "String" []))
+    (result (ty "Int" []) (ty "String" []));
+  expect_stack_result_c_type reg "Result[Void, String]" "blorp_StackResult"
+    (result (ty "Void" []) (ty "String" []))
 
 let suite =
   [

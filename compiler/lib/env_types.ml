@@ -32,9 +32,13 @@ type purity = Pure | Impure
     builtin, or a foreign (C FFI) function. *)
 type func_origin = UserDefined | Builtin | Foreign
 
-(** Whether a resource-borrowing operation returns ordinary data or a value
-    whose lifetime remains tied to the borrowed resource. *)
-type resource_result_policy = ResourceResultDependent | ResourceResultOrdinary
+(** Whether a resource-borrowing operation returns ordinary data, an
+    independently-owned resource, or a value whose lifetime remains tied to the
+    borrowed resource. *)
+type resource_result_policy =
+  | ResourceResultDependent
+  | ResourceResultIndependent
+  | ResourceResultOrdinary
 
 (** Whether a function may receive scoped resource values directly.
     Ordinary source functions reject resource arguments because parameters copy

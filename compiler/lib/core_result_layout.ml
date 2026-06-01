@@ -105,9 +105,10 @@ let is_builtin_managed_payload_name = function
   | "String" | "List" | "ParallelList" | "ParallelVector" | "ParallelMatrix"
   | "Dict" | "Set" | "Tensor" | "Vector" | "Matrix" | "Bytes" | "Fixed"
   | "StringSlice" | "MemStats" | "SchedulerStats" | "Builder" | "Slice" | "Task"
-  | "Channel" | "Stream" | "Option" | "Result" | "TcpListener" | "TcpStream"
+  | "Channel" | "Option" | "Result" | "TcpListener" | "TcpStream"
   | "ConcurrencyError" ->
       true
+  | name when Type_name_metadata.is_stream_name name -> true
   | _ -> false
 
 type payload_status =
@@ -123,8 +124,8 @@ let payload_status_of_expanded meta ty =
   else
     match ty with
     | Ast.TyNamed (("Int128" | "UInt128"), []) -> PayloadManaged
-    | Ast.TyNamed (("Void" | "Module"), []) ->
-        PayloadUnsupported (string_of_type ty)
+    | Ast.TyNamed ("Void", []) -> PayloadErased
+    | Ast.TyNamed ("Module", []) -> PayloadUnsupported (string_of_type ty)
     | Ast.TyNamed (name, _) when is_builtin_managed_payload_name name ->
         PayloadManaged
     | Ast.TyNamed (name, _) when meta.is_managed_name name -> PayloadManaged

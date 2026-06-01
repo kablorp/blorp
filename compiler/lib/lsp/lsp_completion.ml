@@ -339,6 +339,11 @@ let completions_from_local_scope ?(skip = fun _ -> false) (program : program)
           collect_expr init
       | EWith (binding, body) ->
           collect_expr binding.with_value;
+          Option.iter
+            (fun mapper ->
+              add mapper.with_error_name "with error";
+              collect_expr mapper.with_error_value)
+            binding.with_error_map;
           add binding.with_name (type_detail_opt binding.with_type);
           collect_expr body
       | EConcurrentBind (name, source_ty, init) ->

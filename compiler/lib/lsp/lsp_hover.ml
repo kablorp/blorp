@@ -89,7 +89,7 @@ let hover_info_for_symbol name expr (symbol : Env.symbol) =
       hover_for_var_symbol name expr ~var_type ~source_type ~mutability
   | Env.TypeSymbol { type_params; variants; _ } ->
       hover_for_type_symbol name ~type_params ~variants
-  | Env.RecordSymbol { type_params; fields; is_value } ->
+  | Env.RecordSymbol { type_params; fields; is_value; _ } ->
       hover_for_record_symbol name ~type_params ~fields ~is_value
   | Env.ConstructorSymbol { parent_type; field_types; _ } ->
       hover_for_constructor_symbol name ~parent_type ~field_types

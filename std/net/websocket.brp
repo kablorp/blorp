@@ -1,0 +1,203 @@
+-- WebSocket Networking - scoped session resource foundation.
+--
+-- WebSocketSession is an external protocol capability. The std surface keeps
+-- protocol ownership scoped so sessions cannot be copied out of their cleanup
+-- lifetime.
+---
+Opaque resource for a WebSocket session.
+---
+resource type WebSocketSession = builtin("blorp_websocket_close_session")
+
+
+---
+Private finalizer trait implemented by scoped WebSocket resources.
+
+`with` blocks use compiler-owned cleanup builtins directly. This trait keeps
+the runtime finalizer documented inside the module without exporting a manual
+`close` operation that could conflict with scoped cleanup ownership.
+---
+private trait WebSocketClosable:
+	func close(handle: Self) -> Void
+
+
+implements WebSocketClosable for WebSocketSession:
+	func close(session: WebSocketSession) -> Void:
+		builtin("blorp_websocket_close_session")
+
+
+---
+Ordinary WebSocket message values.
+---
+union Message:
+	Text(String)
+	Binary(Bytes)
+	Close(Int, String)
+	Ping(Bytes)
+	Pong(Bytes)
+
+
+---
+Typed error surface for WebSocket APIs.
+---
+union WebSocketError:
+	InvalidUrl(String)
+	HandshakeFailed(String)
+	Transport(String)
+	Tls(String)
+	Protocol(String)
+	TimedOut(String)
+	Closed(String)
+	Busy(String)
+	Unsupported(String)
+	Other(String)
+
+
+---
+Return a stable, human-readable description of a WebSocket error.
+
+doctests:
+    :: Unsupported includes detail
+    message(Unsupported("not built")) == "unsupported: not built"
+
+    :: InvalidUrl includes detail
+    message(InvalidUrl("missing scheme")) == "invalid URL: missing scheme"
+---
+pure func message(err: WebSocketError) -> String:
+	match err:
+		InvalidUrl(detail): "invalid URL: " + detail
+		HandshakeFailed(detail): "handshake failed: " + detail
+		Transport(detail): "transport error: " + detail
+		Tls(detail): "tls error: " + detail
+		Protocol(detail): "protocol error: " + detail
+		TimedOut(detail): "timed out: " + detail
+		Closed(detail): "closed: " + detail
+		Busy(detail): "busy: " + detail
+		Unsupported(detail): "unsupported: " + detail
+		Other(detail): "websocket error: " + detail
+
+
+implements Stringable for WebSocketError:
+	pure func to_string(err: WebSocketError) -> String:
+		message(err)
+
+
+---
+Return True when this runtime has an implemented native WebSocket backend.
+
+The default runtime supports native `ws://` sessions over TCP. `wss://`
+sessions additionally require a native TLS backend; runtimes without TLS return
+a typed `Unsupported` error for secure URLs before opening the network.
+---
+func native_available() -> Bool:
+	builtin("blorp_websocket_native_available_raw")
+
+
+---
+Return True when a WebSocket error is a timeout.
+
+doctests:
+    :: TimedOut is recognized
+    is_timed_out(TimedOut("handshake")) == True
+
+    :: Unsupported is not a timeout
+    is_timed_out(Unsupported("not built")) == False
+---
+pure func is_timed_out(err: WebSocketError) -> Bool:
+	match err:
+		TimedOut(_): True
+		_: False
+
+
+---
+Connect to a WebSocket URL as a scoped session resource.
+
+The URL must start with `ws://` or `wss://` and include a non-empty host.
+The optional port must be numeric and in range. Raw spaces/control characters
+fragments, and user-info authority syntax are rejected before the backend
+boundary.
+The returned session is a scoped resource. `ws://` connects through TCP and
+performs the HTTP upgrade handshake before the resource is published. `wss://`
+requires a native TLS backend.
+---
+func connect(url: String) -> Result[WebSocketSession, WebSocketError]:
+	builtin("blorp_websocket_connect_raw")
+
+
+---
+Receive one complete message from a scoped WebSocket session.
+
+Overlapping receives on the same session return `Err(Busy(...))`. Runtime
+backends return a frame kind plus owned payload fields; generated code
+constructs these ordinary `Message` values at the Blorp boundary. Receiving a
+close frame moves the session into a peer-closing state: ordinary reads and
+writes then return `Err(Closed(...))`, but one `send_close` reply remains valid.
+---
+@resource_result_ordinary
+func receive(session: WebSocketSession) -> Result[Message, WebSocketError]:
+	builtin("blorp_websocket_receive_raw")
+
+
+---
+Send a complete text message on a scoped WebSocket session.
+
+Missing or malformed text payloads return `Err(Protocol(...))`. Overlapping
+writes on the same session return `Err(Busy(...))`.
+---
+@resource_result_ordinary
+func send_text(session: WebSocketSession, text: String) -> Result[Void, WebSocketError]:
+	builtin("blorp_websocket_send_text_raw")
+
+
+---
+Send a complete binary message on a scoped WebSocket session.
+
+Missing or malformed binary payloads return `Err(Protocol(...))`. Overlapping
+writes on the same session return `Err(Busy(...))`.
+---
+@resource_result_ordinary
+func send_binary(session: WebSocketSession, bytes: Bytes) -> Result[Void, WebSocketError]:
+	builtin("blorp_websocket_send_binary_raw")
+
+
+---
+Send a ping control frame on a scoped WebSocket session.
+
+Ping payloads must be 125 bytes or fewer. Missing, malformed, or oversized
+payloads return `Err(Protocol(...))`. Overlapping writes on the same session
+return `Err(Busy(...))`.
+---
+@resource_result_ordinary
+func send_ping(session: WebSocketSession, bytes: Bytes) -> Result[Void, WebSocketError]:
+	builtin("blorp_websocket_send_ping_raw")
+
+
+---
+Send a pong control frame on a scoped WebSocket session.
+
+Pong payloads must be 125 bytes or fewer. Missing, malformed, or oversized
+payloads return `Err(Protocol(...))`. Overlapping writes on the same session
+return `Err(Busy(...))`.
+---
+@resource_result_ordinary
+func send_pong(session: WebSocketSession, bytes: Bytes) -> Result[Void, WebSocketError]:
+	builtin("blorp_websocket_send_pong_raw")
+
+
+---
+Send a close control frame on a scoped WebSocket session.
+
+Overlapping writes on the same session return `Err(Busy(...))`. A successful
+close-frame send moves the session into a closing state; later reads or writes
+on that session return `Err(Closed(...))`. If the peer has already sent a close
+frame, `send_close` remains valid so callers can reply with the closing frame
+required by the protocol.
+Close codes must be valid WebSocket wire close codes, and the reason must fit
+inside the close frame.
+---
+@resource_result_ordinary
+func send_close(
+	session: WebSocketSession,
+	code: Int,
+	reason: String,
+) -> Result[Void, WebSocketError]:
+	builtin("blorp_websocket_send_close_raw")

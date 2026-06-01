@@ -13,6 +13,7 @@ type collected_lambda = {
   cl_profile_name : string;
   cl_params : (Core.var * Ast.type_expr) list;
   cl_captures : (string * Ast.type_expr) list;
+  cl_moved_captures : string list;
   cl_body : Core.core;
   cl_return_ty : Ast.type_expr;
   cl_task_abi : bool;

@@ -150,7 +150,7 @@ union Expression:
 	ConcurrentBindExpression(String, Option[TypeExpression], Expression)
 	DetachExpression(Expression)
 	ConcurrentlyLoopExpression(String, Expression, Expression, Option[Expression], ConcurrentlyLoopWidth)
-	WithExpression(String, Option[TypeExpression], Bool, Expression, Expression)
+	WithExpression(String, Option[TypeExpression], Bool, Expression, Option[String], Option[Expression], Expression)
 
 
 union ConcurrentlyLoopWidth:
@@ -595,7 +595,7 @@ private pure func needs_field_receiver_parens(expr: Expression) -> Bool:
 		SelectExpression(_): True
 		RangeExpression(_, _): True
 		UnaryExpression(_, _): True
-		WithExpression(_, _, _, _, _): True
+		WithExpression(_, _, _, _, _, _, _): True
 		WhileExpression(_, _): True
 		_: False
 
@@ -1123,15 +1123,43 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 			type_expression ?= value.optional_type_expression_field("type")
 			is_try ?= value.bool_field("try")
 			expr ?= value.expression_field("value")
+			error_name ?= value.optional_string_field("error_name")
+			error_value ?= value.optional_expression_field("error_value")
+			error_map_valid ?= match error_name:
+				Some(map_name):
+					match error_value:
+						Some(_): Ok(0)
+						None: Err("With expression has error_name without error_value")
+				None:
+					match error_value:
+						Some(_): Err("With expression has error_value without error_name")
+						None: Ok(0)
 			body ?= value.expression_field("body")
-			Ok(WithExpression(name, type_expression, is_try, expr, body))
+			Ok(
+				WithExpression(
+					name,
+					type_expression,
+					is_try,
+					expr,
+					error_name,
+					error_value,
+					body,
+				),
+			)
 		"Lambda":
 			is_pure ?= value.bool_field("pure")
 			params ?= value.function_parameter_array_field("params")
 			body ?= value.expression_field("body")
 			return_type ?= value.optional_type_expression_field("return")
 			match return_type:
-				Some(return_type): Ok(TypedLambdaExpression(is_pure, params, return_type, body))
+				Some(return_type): Ok(
+					TypedLambdaExpression(
+						is_pure,
+						params,
+						return_type,
+						body,
+					),
+				)
 				None: Ok(LambdaExpression(is_pure, params, body))
 		"FuncDecl":
 			name ?= value.string_field("name")
@@ -1199,7 +1227,15 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 			timeout ?= value.optional_expression_field("timeout")
 			limit ?= value.optional_int_field("limit")
 			width ?= concurrently_loop_width_from_json(limit)
-			Ok(ConcurrentlyLoopExpression(var_name, iter, body, timeout, width))
+			Ok(
+				ConcurrentlyLoopExpression(
+					var_name,
+					iter,
+					body,
+					timeout,
+					width,
+				),
+			)
 		_: Err("unknown expression JSON tag: " + tag)
 
 
@@ -1530,7 +1566,7 @@ private pure func expression_renders_with_block_syntax(expr: Expression) -> Bool
 		WhileExpression(_, _): True
 		ForExpression(_, _, _): True
 		TupleForExpression(_, _, _): True
-		WithExpression(_, _, _, _, _): True
+		WithExpression(_, _, _, _, _, _, _): True
 		DebugBlockExpression(_): True
 		ConcurrentExpression(_, _, _): True
 		ConcurrentlyLoopExpression(_, _, _, _, _): True
@@ -3078,11 +3114,29 @@ private pure func with_operator_document(is_try: Bool) -> Doc:
 		" = ".text()
 
 
+private pure func with_error_map_document(
+	error_name: Option[String],
+	error_value: Option[Expression],
+) -> Doc:
+	match error_name:
+		Some(mapper_name):
+			match error_value:
+				Some(mapper_value): " on "
+					.text()
+					.cat(mapper_name.text())
+					.cat(" => ".text())
+					.cat(mapper_value.expression_document())
+				None: "".text()
+		None: "".text()
+
+
 private pure func with_expression_document(
 	name: String,
 	type_expression: Option[TypeExpression],
 	is_try: Bool,
 	value: Expression,
+	error_name: Option[String],
+	error_value: Option[Expression],
 	body: Expression,
 ) -> Doc:
 	"with "
@@ -3091,6 +3145,7 @@ private pure func with_expression_document(
 		.cat(type_expression.with_type_suffix_document())
 		.cat(is_try.with_operator_document())
 		.cat(value.expression_document())
+		.cat(with_error_map_document(error_name, error_value))
 		.cat(":".text())
 		.cat(
 			hardline()
@@ -3505,14 +3560,21 @@ pure func expression_document(expr: Expression) -> Doc:
 						.cat(body.block_body_document())
 						.indent(),
 				)
-		WithExpression(name, type_expression, is_try, value, body): with_expression_document(
+		WithExpression(name, type_expression, is_try, value, error_name, error_value, body): with_expression_document(
 			name,
 			type_expression,
 			is_try,
 			value,
+			error_name,
+			error_value,
 			body,
 		)
-		LambdaExpression(is_pure, params, body): lambda_document(is_pure, params, None, body)
+		LambdaExpression(is_pure, params, body): lambda_document(
+			is_pure,
+			params,
+			None,
+			body,
+		)
 		TypedLambdaExpression(is_pure, params, return_type, body): lambda_document(
 			is_pure,
 			params,
@@ -3573,7 +3635,12 @@ pure func expression_document(expr: Expression) -> Doc:
 				body.expression_document()
 			text("detach ").cat(body_document)
 		ConcurrentlyLoopExpression(var_name, iter, body, timeout, width):
-			concurrently_loop_head_document(var_name, iter, timeout, width).cat(
+			concurrently_loop_head_document(
+				var_name,
+				iter,
+				timeout,
+				width,
+			).cat(
 				hardline()
 					.cat(body.block_body_document())
 					.indent(),

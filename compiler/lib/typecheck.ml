@@ -184,7 +184,9 @@ let type_contains_known_resource state ty =
            resource-source-specific checks below reject ordinary storage and
            source function boundaries. *)
         false
-    | TyNamed (_, args) -> List.exists contains_forward_resource args
+    | TyNamed (name, args) ->
+        Env.get_type_contains_resource state.env name
+        || List.exists contains_forward_resource args
     | TyTuple elems -> List.exists contains_forward_resource elems
     | TyFunc { params; return; _ } ->
         List.exists contains_forward_resource params
@@ -198,8 +200,7 @@ let type_contains_known_resource state ty =
     | TyVar _ | TyBoundVar _ | TyConstInt _ | TySelf | TyVarDims _ | TyMeta _ ->
         false
   in
-  Infer.type_contains_resource (ctx_of_state state) ty
-  || contains_forward_resource ty
+  contains_forward_resource ty
 
 let resource_containing_aggregate_error loc message =
   error_with
@@ -335,16 +336,9 @@ let register_resource_cleanup_metadata (decl : type_decl) : unit =
 
 let type_is_scoped_dependency_carrier ty =
   match Types.head_resolve ty with
-  | TyNamed (name, _) -> (
-      match Types.split_canonical_module_type_name name with
-      | Some (module_path, type_name) ->
-          module_path = "std/stream"
-          && (type_name = "FallibleStream" || type_name = "ResourceSource")
-      | None ->
-          name = "FallibleStream"
-          || name = "std_stream__FallibleStream"
-          || name = "ResourceSource"
-          || name = "std_stream__ResourceSource")
+  | TyNamed (name, _) ->
+      Type_name_metadata.is_fallible_stream_name name
+      || Type_name_metadata.is_resource_source_name name
   | _ -> false
 
 let type_is_scoped_dependency_carrier_in_env env ty =
@@ -379,11 +373,17 @@ let type_contains_scoped_dependency_carrier env ty =
 let resource_arg_policy_of_func ~contains_resource_param
     ~contains_scoped_dependency_param (func : func_decl) : resource_arg_policy =
   match func.func_body with
-  | FuncBuiltinBody _
+  | FuncBuiltinBody (builtin_body, _)
     when contains_resource_param || contains_scoped_dependency_param ->
       let result_policy =
         if func.func_resource_result_ordinary then ResourceResultOrdinary
-        else ResourceResultDependent
+        else
+          match builtin_body with
+          | BuiltinRuntime name -> (
+              match Operation_result_metadata.resource_result_policy name with
+              | Some policy -> policy
+              | None -> ResourceResultDependent)
+          | BuiltinIntrinsic -> ResourceResultDependent
       in
       AllowResourceArgs result_policy
   | FuncBuiltinBody _ | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
@@ -1261,13 +1261,20 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
     else if decl.type_is_enum then TypeEnum
     else TypeUnion
   in
+  let contains_resource =
+    (not (decl.type_is_builtin || decl.type_is_resource))
+    && List.exists
+         (fun v ->
+           List.exists (type_contains_known_resource state) v.variant_fields)
+         variants
+  in
   let state =
     {
       state with
       env =
         add_type state.env decl.type_name
           (Ast.type_param_names decl.type_params)
-          variants ~kind:type_kind;
+          variants ~kind:type_kind ~contains_resource;
     }
   in
   register_resource_cleanup_metadata decl;
@@ -1348,6 +1355,7 @@ let process_record_decl ?(imported = false) (state : check_state)
                 type_params = Ast.type_param_names decl.record_type_params;
                 variants = [];
                 type_kind = TypeBuiltin;
+                contains_resource = false;
               };
         }
     in
@@ -1509,13 +1517,19 @@ let process_record_decl ?(imported = false) (state : check_state)
       end
       else state
     in
+    let contains_resource =
+      List.exists
+        (fun f -> type_contains_known_resource state f.field_type)
+        decl.record_fields
+    in
     let state =
       {
         state with
         env =
           add_record state.env decl.record_name
             (Ast.type_param_names decl.record_type_params)
-            decl.record_fields ~is_value:decl.record_is_value ();
+            decl.record_fields ~is_value:decl.record_is_value ~contains_resource
+            ();
       }
     in
     (* Register owning module for Phase 3.4's orphan-rule check. *)
@@ -5254,6 +5268,15 @@ let rec second_pass (state : check_state) (decls : program) :
                                   binding with
                                   with_type = Option.map subst binding.with_type;
                                   with_value = subst_body binding.with_value;
+                                  with_error_map =
+                                    Option.map
+                                      (fun mapper ->
+                                        {
+                                          mapper with
+                                          with_error_value =
+                                            subst_body mapper.with_error_value;
+                                        })
+                                      binding.with_error_map;
                                 },
                                 subst_body body )
                         | EConcurrentBind (name, ty, e1) ->

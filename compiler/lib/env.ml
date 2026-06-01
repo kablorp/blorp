@@ -22,6 +22,7 @@ type var_origin =
   | ForLoopVar
   | MatchBinding
   | ScopedResource
+  | ScopedResourceUnavailable of string
   | ScopedResourceDerived
   | Other
 
@@ -36,6 +37,7 @@ type def_id = Env_types.def_id
 
 type resource_result_policy = Env_types.resource_result_policy =
   | ResourceResultDependent
+  | ResourceResultIndependent
   | ResourceResultOrdinary
 
 type resource_arg_policy = Env_types.resource_arg_policy =
@@ -100,11 +102,13 @@ type symbol_kind =
       type_params : string list;
       variants : variant list; (* For union types *)
       type_kind : type_kind;
+      contains_resource : bool;
     }
   | RecordSymbol of {
       type_params : string list;
       fields : field_decl list;
       is_value : bool;
+      contains_resource : bool;
     }
   | AliasSymbol of { type_params : string list; target : type_expr }
   | ConstructorSymbol of {
@@ -297,14 +301,36 @@ let is_scoped_resource_var (env : env) (name : string) : bool =
 
 let is_scoped_resource_derived_var (env : env) (name : string) : bool =
   match lookup env name with
-  | Some { kind = VarSymbol { origin = ScopedResourceDerived; _ }; _ } -> true
+  | Some
+      {
+        kind =
+          VarSymbol
+            { origin = ScopedResourceDerived | ScopedResourceUnavailable _; _ };
+        _;
+      } ->
+      true
   | _ -> false
+
+let scoped_resource_unavailable_owner (env : env) (name : string) :
+    string option =
+  match lookup env name with
+  | Some { kind = VarSymbol { origin = ScopedResourceUnavailable owner; _ }; _ }
+    ->
+      Some owner
+  | _ -> None
 
 let is_scoped_resource_related_var (env : env) (name : string) : bool =
   match lookup env name with
   | Some
       {
-        kind = VarSymbol { origin = ScopedResource | ScopedResourceDerived; _ };
+        kind =
+          VarSymbol
+            {
+              origin =
+                ( ScopedResource | ScopedResourceDerived
+                | ScopedResourceUnavailable _ );
+              _;
+            };
         _;
       } ->
       true
@@ -356,12 +382,17 @@ let is_debug_only_overload_set (env : env) (name : string) : bool =
   | _ -> false
 
 (** Add a type declaration to the environment *)
-let add_type ?(with_ctors = true) ?(kind = TypeUnion) (env : env)
-    (name : string) (type_params : string list) (variants : variant list) : env
-    =
+let add_type ?(with_ctors = true) ?(kind = TypeUnion)
+    ?(contains_resource = false) (env : env) (name : string)
+    (type_params : string list) (variants : variant list) : env =
   let env =
     add_symbol env
-      { name; kind = TypeSymbol { type_params; variants; type_kind = kind } }
+      {
+        name;
+        kind =
+          TypeSymbol
+            { type_params; variants; type_kind = kind; contains_resource };
+      }
   in
   if not with_ctors then env
   else
@@ -385,8 +416,13 @@ let add_type ?(with_ctors = true) ?(kind = TypeUnion) (env : env)
 
 (** Add a record declaration to the environment *)
 let add_record (env : env) (name : string) (type_params : string list)
-    (fields : field_decl list) ?(is_value = false) () : env =
-  add_symbol env { name; kind = RecordSymbol { type_params; fields; is_value } }
+    (fields : field_decl list) ?(is_value = false) ?(contains_resource = false)
+    () : env =
+  add_symbol env
+    {
+      name;
+      kind = RecordSymbol { type_params; fields; is_value; contains_resource };
+    }
 
 (** Check if a record type is a value type (struct) *)
 let is_value_record (env : env) (name : string) : bool =
@@ -504,6 +540,13 @@ let get_type_kind (env : env) (name : string) : type_kind option =
   match lookup env name with
   | Some { kind = TypeSymbol { type_kind; _ }; _ } -> Some type_kind
   | _ -> None
+
+let get_type_contains_resource (env : env) (name : string) : bool =
+  match lookup env name with
+  | Some { kind = TypeSymbol { contains_resource; _ }; _ }
+  | Some { kind = RecordSymbol { contains_resource; _ }; _ } ->
+      contains_resource
+  | _ -> false
 
 (** Get a constructor info *)
 let get_constructor (env : env) (name : string) :

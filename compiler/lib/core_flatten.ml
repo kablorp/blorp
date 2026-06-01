@@ -322,6 +322,7 @@ let prefix_module_names ?(debug = false) (mod_name : string)
         List.map
           (fun (name, ty) -> (name, rewrite_type ty))
           abi.Core.ca_captures;
+      ca_moved_captures = abi.Core.ca_moved_captures;
       ca_task_abi = abi.Core.ca_task_abi;
     }
   in

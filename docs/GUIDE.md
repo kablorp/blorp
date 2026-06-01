@@ -1667,6 +1667,27 @@ Fallible acquisition results that contain resources, such as
 `with name ?= ...:` rather than matched or stored directly, so the compiler can
 install the cleanup edge before exposing the resource handle.
 
+If the acquisition error needs to be converted to the enclosing function's
+error type, map it in the `with ?=` header:
+
+```blorp
+import:
+    file: message, open_read
+
+union AppError:
+    Io(String)
+
+func load_count(path: String) -> Result[Int, AppError]:
+    with reader ?= open_read(path) on err => Io(message(err)):
+        Ok(1)
+```
+
+The `on err => ...` mapper runs only for `Err(err)`, before the resource handle
+is exposed. It must produce the exact error type of the enclosing
+`Result[..., E]`. This is intentionally not `Result.map_err`; acquisition
+carriers that contain resources still cannot be passed through ordinary
+functions.
+
 Source functions cannot accept resource handles as parameters or return values.
 That keeps resource cleanup ownership out of ordinary value semantics. Keep
 handle use inside the `with` body, and pass ordinary data to helpers.
@@ -1773,7 +1794,9 @@ fiber.
 cursor wrapper that borrows the scoped listener and carries an explicit
 accept-error policy for future iteration. It cannot escape the listener's
 `with` block or be captured by closures, detached work, or concurrent work.
-Resource-source `for` iteration is still being implemented.
+Sequential resource-source `for` iteration transfers each accepted stream into
+a scoped loop body. `for ... concurrently(limit:)` moves each accepted stream
+into exactly one child task; the child task owns scoped cleanup for that stream.
 
 ```blorp
 import:
@@ -1783,6 +1806,29 @@ func fetch_once(port: Int) -> Result[Int, TcpError]:
     with stream ?= connect("127.0.0.1", port):
         data ?= read_chunk(stream, 4096)
         Ok(data.length())
+```
+
+For repeated reads, `chunks(stream, max_bytes)` creates a scoped
+`FallibleStream[Bytes, TcpError]`. Terminal operations return `Result`, so read
+failures remain explicit and an empty peer read is treated as normal end of
+stream. `lines(stream)` yields text lines with the same framing as file lines:
+trailing `\n` and optional `\r` are removed, and a final unterminated line is
+yielded when the peer closes.
+
+```blorp
+import:
+    net/tcp: TcpError, chunks, connect, lines
+    stream: fold_result
+
+func count_bytes(port: Int) -> Result[Int, TcpError]:
+    with stream ?= connect("127.0.0.1", port):
+        chunks(stream, 16 * 1024)
+            .fold_result(0, func(total: Int, chunk: Bytes): total + chunk.length())
+
+func count_lines(port: Int) -> Result[Int, TcpError]:
+    with stream ?= connect("127.0.0.1", port):
+        lines(stream)
+            .fold_result(0, func(total: Int, line: String): total + 1)
 ```
 
 Module-qualified calls work too. A combined import can provide both the module
@@ -1796,6 +1842,46 @@ func local_stream_port(port: Int) -> Result[Int, TcpError]:
     with stream ?= Tcp.connect("127.0.0.1", port):
         Tcp.stream_local_port(stream)
 ```
+
+Sequential connection-source loops are useful for single-accept flows and for
+code that wants to decide its own fan-out shape:
+
+```blorp
+import:
+    net/tcp as Tcp: TcpError
+
+func accept_one() -> Result[Int, TcpError]:
+    with listener ?= Tcp.listen("127.0.0.1", 0, 1):
+        var seen: Int = 0
+        for conn in Tcp.connections_stop_on_error(listener):
+            _ = Tcp.stream_local_port(conn)
+            seen += 1
+            break
+        Ok(seen)
+```
+
+Concurrent connection-source loops are useful for server-style fan-out. The
+source is pulled by the parent task, and each accepted stream is transferred
+into one child task:
+
+```blorp
+import:
+    net/tcp as Tcp: TcpError
+
+func serve_until_timeout() -> Result[Void, TcpError]:
+    with listener ?= Tcp.listen("127.0.0.1", 8080, 128):
+        ignored ?= Tcp.set_timeout(listener, 1000)
+        for conn in Tcp.connections_stop_on_error(listener) concurrently(limit: 128):
+            _ = Tcp.stream_local_port(conn)
+        Ok(void)
+```
+
+For HTTP servers, keep resource operations in the connection loop and factor
+application behavior over ordinary data. For example, a pure route function can
+accept `net/http.Request` and return `net/http.Response`, while the loop owns
+the scoped `TcpStream` read/write calls. Ordinary user functions still cannot
+accept `TcpStream` resources; that restriction keeps cleanup ownership
+compiler-visible.
 
 `with ?=` follows the same loop restriction as direct `?=`. If acquisition is
 inside loop control flow, use an explicit `match` around the loop or keep the
@@ -2726,9 +2812,9 @@ This table lists the main public modules. The source of truth is the `std/` and
 | `cache`, `parallel_list`, `deque`, `heap`, `sorted_map`, `graph`, `rate_limit`, `property` | `heap: Heap` | Extended collections and infrastructure |
 | `geometry`, `geographic`, `geojson`, `physics`, `units` | `geometry: Vec2` | Spatial, geographic, physics, and unit helpers |
 | `dsp`, `fft`, `noise` | `dsp: ...` | Signal and procedural numeric helpers |
-| `net/tcp`, `net/http`, `net/url`, `net/mime` | `net/tcp: connect, read_chunk` | Portable networking primitives and protocol helpers |
+| `net/dns`, `net/tcp`, `net/tls`, `net/udp`, `net/websocket`, `net/http`, `net/url`, `net/mime` | `net/tcp: connect, read_chunk` | Portable networking primitives and protocol helpers |
 | `pkg/compress`, `pkg/crypto`, `pkg/sqlite` | `pkg/compress: gzip` | Optional native bindings and native-backed packages |
-| `pkg/net/dns`, `pkg/net/http_client`, `pkg/net/smtp`, `pkg/net/tls`, `pkg/net/udp`, `pkg/net/websocket` | `pkg/net/dns as DNS` | Native-backed networking packages |
+| `pkg/net/dns`, `pkg/net/http_client`, `pkg/net/smtp`, `pkg/net/tls`, `pkg/net/udp`, `pkg/net/websocket` | `pkg/net/dns as DNS` | Native-backed networking packages, WebSocket helpers, and resource-migration placeholders |
 | `term` | `term: ...` | Terminal helpers |
 | `tuple`, `ptr`, `void`, `traits`, `test` | `test: TestSuite` | Core support modules and test framework |
 
@@ -3532,6 +3618,9 @@ tests/
 | `BLORP_FIBER_OBJECT_CACHE_COUNT=N` | Maximum dead fiber handle objects to cache for reuse (default 4096; `0` disables) |
 | `BLORP_THREADS=N` | Runtime worker thread pool size; `./blorp run --threads N` sets this for the launched program |
 | `BLORP_SANITIZE=1` | Enable sanitizers (CLI flag overrides) |
+| `BLORP_TLS_BACKEND=unsupported/openssl` | Select the runtime TLS backend profile. `unsupported` is the portable default; `openssl` builds and links the native OpenSSL backend. |
+| `BLORP_OPENSSL_CFLAGS` | Compiler arguments for the OpenSSL TLS backend; if unset, `pkg-config --cflags openssl` is used. |
+| `BLORP_OPENSSL_LIBS` | Linker arguments for the OpenSSL TLS backend; if unset, `pkg-config --libs openssl` is used. |
 | `BLORP_NO_FORMAT=1` | Skip auto-formatting before command execution |
 
 ### Project Configuration

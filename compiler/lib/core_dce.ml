@@ -433,9 +433,9 @@ let runtime_managed_builtin_release_path = function
   | "Set" -> Some (RuntimeBuiltinDestructor "blorp_set_destroy")
   | "Task" -> Some (RuntimeBuiltinDestructor "blorp_task_destructor")
   | "Channel" -> Some (RuntimeBuiltinDestructor "blorp_channel_destructor")
-  | "Stream" -> Some (RuntimeBuiltinDestructor "blorp_stream_destroy")
-  | "FallibleStream" | "std/stream::FallibleStream"
-  | "std_stream__FallibleStream" ->
+  | name when Type_name_metadata.is_stream_name name ->
+      Some (RuntimeBuiltinDestructor "blorp_stream_destroy")
+  | name when Type_name_metadata.is_fallible_stream_name name ->
       Some (RuntimeBuiltinDestructor "blorp_fallible_stream_destroy")
   | "TcpListener" ->
       Some (RuntimeBuiltinDestructor "blorp_tcp_listener_destructor")

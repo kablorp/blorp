@@ -1,0 +1,131 @@
+-- TLS resource tests.
+--
+-- The default runtime backend is intentionally unsupported. These tests pin
+-- deterministic typed error behavior around the scoped TLS surface without
+-- requiring a real TLS server or native TLS libraries. When the test binary is
+-- compiled with BLORP_TLS_BACKEND=openssl, native_available reflects that
+-- opt-in backend instead.
+import:
+	net/tcp as TCP
+	net/tls as TLS: TlsError
+	string: contains, lower, starts_with
+	system: getenv
+	test: TestSuite, tls_state_probe_for_test
+
+
+pure func is_socket_permission_error(err: TlsError) -> Bool:
+	detail_msg: String = TLS.message(err)
+	detail_msg.contains("Operation not permitted") or detail_msg.contains("Permission denied")
+
+
+pure func is_invalid_message(message: String, detail: String) -> Bool:
+	message.starts_with("invalid input: ") and message.contains(detail)
+
+
+func tls_connect_invalid_server_name_result() -> Result[Bool, TlsError]:
+	with listener ?= TCP.listen("127.0.0.1", 0, 1) on err => TLS.Transport(TCP.message(err)):
+		match TCP.local_port(listener):
+			Err(err): Err(TLS.Transport(TCP.message(err)))
+			Ok(port):
+				with stream ?= TCP.connect(
+					"127.0.0.1",
+					port,
+				) on err => TLS.Transport(TCP.message(err)):
+					with _ ?= TLS.connect(stream, ""):
+						Ok(False)
+
+
+func test_tls_connect_invalid_server_name_is_typed() -> Bool:
+	match tls_connect_invalid_server_name_result():
+		Ok(_): False
+		Err(err):
+			if is_socket_permission_error(err):
+				True
+			else:
+				is_invalid_message(TLS.message(err), "server name")
+
+
+func tls_connect_nul_server_name_result() -> Result[Bool, TlsError]:
+	with listener ?= TCP.listen("127.0.0.1", 0, 1) on err => TLS.Transport(TCP.message(err)):
+		match TCP.local_port(listener):
+			Err(err): Err(TLS.Transport(TCP.message(err)))
+			Ok(port):
+				with stream ?= TCP.connect(
+					"127.0.0.1",
+					port,
+				) on err => TLS.Transport(TCP.message(err)):
+					with _ ?= TLS.connect(stream, "local\0host"):
+						Ok(False)
+
+
+func test_tls_connect_nul_server_name_is_typed() -> Bool:
+	match tls_connect_nul_server_name_result():
+		Ok(_): False
+		Err(err):
+			if is_socket_permission_error(err):
+				True
+			else:
+				is_invalid_message(TLS.message(err), "embedded NUL")
+
+
+func tls_connect_unsupported_backend_result() -> Result[Bool, TlsError]:
+	with listener ?= TCP.listen("127.0.0.1", 0, 1) on err => TLS.Transport(TCP.message(err)):
+		match TCP.local_port(listener):
+			Err(err): Err(TLS.Transport(TCP.message(err)))
+			Ok(port):
+				with stream ?= TCP.connect(
+					"127.0.0.1",
+					port,
+				) on err => TLS.Transport(TCP.message(err)):
+					with _ ?= TLS.connect(stream, "localhost"):
+						Ok(False)
+
+
+func test_tls_connect_unsupported_backend_is_typed() -> Bool:
+	if tls_openssl_backend_selected():
+		True
+	else:
+		match tls_connect_unsupported_backend_result():
+			Ok(_): False
+			Err(err):
+				if is_socket_permission_error(err):
+					True
+				else:
+					detail_msg: String = TLS.message(err)
+					detail_msg.starts_with("unsupported: ") and detail_msg.contains("native TLS")
+
+
+func test_tls_runtime_state_probe() -> Bool:
+	tls_state_probe_for_test()
+
+
+pure func tls_openssl_profile_selected(value: String) -> Bool:
+	value.lower() == "openssl"
+
+
+func tls_openssl_backend_selected() -> Bool:
+	match getenv("BLORP_TLS_BACKEND"):
+		Some(value): tls_openssl_profile_selected(value)
+		None: False
+
+
+func test_tls_native_backend_query_matches_profile() -> Bool:
+	match getenv("BLORP_TLS_BACKEND"):
+		Some(value):
+			TLS.native_available() == tls_openssl_profile_selected(value)
+		None: not TLS.native_available()
+
+
+tests: TestSuite = {
+	description = "TLS Resource Tests",
+	tests = [
+		("TLS connect invalid server name is typed", test_tls_connect_invalid_server_name_is_typed),
+		("TLS connect NUL server name is typed", test_tls_connect_nul_server_name_is_typed),
+		("TLS connect unsupported backend is typed", test_tls_connect_unsupported_backend_is_typed),
+		("TLS runtime state transitions are typed", test_tls_runtime_state_probe),
+		(
+			"TLS native backend query matches profile",
+			test_tls_native_backend_query_matches_profile,
+		),
+	]
+}

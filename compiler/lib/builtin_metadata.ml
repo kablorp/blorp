@@ -3,7 +3,11 @@
     Keep semantic facts here instead of scattering name sets through compiler
     phases. Unknown names are treated as ordinary user/module functions. *)
 
-type builtin_effect = Impure | Parallel_boundary | Cancellation_point
+type builtin_effect =
+  | Impure
+  | Parallel_boundary
+  | Cancellation_point
+  | Os_worker_blocking
 
 type special_inference =
   | Checked_get
@@ -43,6 +47,32 @@ let effects name effects = descriptor name (List.map effect_capability effects)
 
 let special name special_inference =
   descriptor name [ special_inference_capability special_inference ]
+
+let effects_for_wait_behavior wait_behavior =
+  let open Operation_result_metadata in
+  match wait_behavior with
+  | DoesNotWait -> [ Impure ]
+  | ParksFiber -> [ Impure; Cancellation_point ]
+  | BlocksOsWorker _ -> [ Impure; Os_worker_blocking ]
+
+let operation_result_descriptors =
+  Operation_result_metadata.result_bridges
+  |> List.map (fun (bridge : Operation_result_metadata.result_bridge) ->
+      let effect_list = effects_for_wait_behavior bridge.wait_behavior in
+      effects bridge.builtin_name effect_list)
+
+let fallible_stream_source_descriptors =
+  Operation_result_metadata.fallible_stream_sources
+  |> List.map
+       (fun (source : Operation_result_metadata.fallible_stream_source) ->
+         effects source.builtin_name [ Impure ])
+
+let fallible_stream_terminal_descriptors =
+  Operation_result_metadata.fallible_stream_terminals
+  |> List.map
+       (fun (terminal : Operation_result_metadata.fallible_stream_terminal) ->
+         let effect_list = effects_for_wait_behavior terminal.wait_behavior in
+         effects terminal.builtin_name effect_list)
 
 let descriptors =
   [
@@ -91,67 +121,68 @@ let descriptors =
     effects "send_timeout_attempt" [ Impure; Cancellation_point ];
     effects "recv_timeout_attempt" [ Impure; Cancellation_point ];
     effects "cancel_after_parked_for_test" [ Impure; Cancellation_point ];
+    effects "tls_state_probe_for_test" [ Impure; Cancellation_point ];
+    effects "websocket_state_probe_for_test" [ Impure ];
     effects "blorp_tcp_accept" [ Impure; Cancellation_point ];
     effects "blorp_tcp_connect" [ Impure; Cancellation_point ];
     effects "blorp_tcp_read" [ Impure; Cancellation_point ];
     effects "blorp_tcp_write" [ Impure; Cancellation_point ];
-    effects "blorp_tcp_accept_raw" [ Impure; Cancellation_point ];
-    effects "blorp_tcp_connect_raw" [ Impure; Cancellation_point ];
-    effects "blorp_tcp_read_raw" [ Impure; Cancellation_point ];
-    effects "blorp_tcp_write_raw" [ Impure; Cancellation_point ];
-    effects "blorp_tcp_write_all_raw" [ Impure; Cancellation_point ];
-    effects "getenv" [ Impure ];
-    effects "setenv" [ Impure ];
-    effects "init_window" [ Impure ];
-    effects "close_window" [ Impure ];
-    effects "window_should_close" [ Impure ];
-    effects "set_target_fps" [ Impure ];
-    effects "get_fps" [ Impure ];
-    effects "begin_drawing" [ Impure ];
-    effects "end_drawing" [ Impure ];
-    effects "clear_background" [ Impure ];
-    effects "draw_rectangle" [ Impure ];
-    effects "draw_rectangle_rec" [ Impure ];
-    effects "draw_circle" [ Impure ];
-    effects "draw_line" [ Impure ];
-    effects "draw_text" [ Impure ];
-    effects "is_key_pressed" [ Impure ];
-    effects "is_key_down" [ Impure ];
-    effects "get_mouse_x" [ Impure ];
-    effects "get_mouse_y" [ Impure ];
-    effects "is_mouse_button_pressed" [ Impure ];
-    effects "is_mouse_button_down" [ Impure ];
-    effects "get_frame_time" [ Impure ];
-    effects "get_time" [ Impure ];
-    effects "parallel" [ Parallel_boundary ];
-    special "checked_get" Checked_get;
-    special "checked_set" Checked_set;
-    special "checked_slice" Checked_slice;
-    special "matrix_checked_get" Matrix_checked_get;
-    special "matrix_checked_set" Matrix_checked_set;
-    special "tensor3_checked_get" (Tensor_checked_get 3);
-    special "tensor4_checked_get" (Tensor_checked_get 4);
-    special "tensor5_checked_get" (Tensor_checked_get 5);
-    special "tensor3_checked_set" (Tensor_checked_set 3);
-    special "tensor4_checked_set" (Tensor_checked_set 4);
-    special "tensor5_checked_set" (Tensor_checked_set 5);
-    special "assert_shape" Assert_shape;
-    special "length" Length_refined;
-    special "vector_length" Length_refined;
-    special "type_name" Type_name;
-    special "is_heap" Is_heap;
-    special "vector" Vector_ctor;
-    special "matrix" Matrix_ctor;
-    special "tensor3" (Tensor_ctor 3);
-    special "tensor4" (Tensor_ctor 4);
-    special "tensor5" (Tensor_ctor 5);
-    special "bit_and" Bitwise;
-    special "bit_or" Bitwise;
-    special "bit_xor" Bitwise;
-    special "bit_not" Bitwise;
-    special "shift_left" Bitwise;
-    special "shift_right" Bitwise;
   ]
+  @ operation_result_descriptors @ fallible_stream_source_descriptors
+  @ fallible_stream_terminal_descriptors
+  @ [
+      effects "getenv" [ Impure ];
+      effects "setenv" [ Impure ];
+      effects "init_window" [ Impure ];
+      effects "close_window" [ Impure ];
+      effects "window_should_close" [ Impure ];
+      effects "set_target_fps" [ Impure ];
+      effects "get_fps" [ Impure ];
+      effects "begin_drawing" [ Impure ];
+      effects "end_drawing" [ Impure ];
+      effects "clear_background" [ Impure ];
+      effects "draw_rectangle" [ Impure ];
+      effects "draw_rectangle_rec" [ Impure ];
+      effects "draw_circle" [ Impure ];
+      effects "draw_line" [ Impure ];
+      effects "draw_text" [ Impure ];
+      effects "is_key_pressed" [ Impure ];
+      effects "is_key_down" [ Impure ];
+      effects "get_mouse_x" [ Impure ];
+      effects "get_mouse_y" [ Impure ];
+      effects "is_mouse_button_pressed" [ Impure ];
+      effects "is_mouse_button_down" [ Impure ];
+      effects "get_frame_time" [ Impure ];
+      effects "get_time" [ Impure ];
+      effects "parallel" [ Parallel_boundary ];
+      special "checked_get" Checked_get;
+      special "checked_set" Checked_set;
+      special "checked_slice" Checked_slice;
+      special "matrix_checked_get" Matrix_checked_get;
+      special "matrix_checked_set" Matrix_checked_set;
+      special "tensor3_checked_get" (Tensor_checked_get 3);
+      special "tensor4_checked_get" (Tensor_checked_get 4);
+      special "tensor5_checked_get" (Tensor_checked_get 5);
+      special "tensor3_checked_set" (Tensor_checked_set 3);
+      special "tensor4_checked_set" (Tensor_checked_set 4);
+      special "tensor5_checked_set" (Tensor_checked_set 5);
+      special "assert_shape" Assert_shape;
+      special "length" Length_refined;
+      special "vector_length" Length_refined;
+      special "type_name" Type_name;
+      special "is_heap" Is_heap;
+      special "vector" Vector_ctor;
+      special "matrix" Matrix_ctor;
+      special "tensor3" (Tensor_ctor 3);
+      special "tensor4" (Tensor_ctor 4);
+      special "tensor5" (Tensor_ctor 5);
+      special "bit_and" Bitwise;
+      special "bit_or" Bitwise;
+      special "bit_xor" Bitwise;
+      special "bit_not" Bitwise;
+      special "shift_left" Bitwise;
+      special "shift_right" Bitwise;
+    ]
 
 module StringMap = Map.Make (String)
 module StringSet = Set.Make (String)
@@ -202,6 +233,7 @@ let has_effect name builtin_effect =
 let is_impure name = has_effect name Impure
 let is_parallel_boundary name = has_effect name Parallel_boundary
 let is_cancellation_point name = has_effect name Cancellation_point
+let is_os_worker_blocking name = has_effect name Os_worker_blocking
 
 let capability_special_inference = function
   | Special_inference special_inference -> Some special_inference

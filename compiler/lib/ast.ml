@@ -327,12 +327,14 @@ and select_arm_kind =
   | SelectSealed of expr  (** sealed channel: *)
 
 and with_binding_kind = WithPlain | WithTry
+and with_error_map = { with_error_name : string; with_error_value : expr }
 
 and with_binding = {
   with_name : string;
   with_type : type_expr option;
   with_value : expr;
   with_kind : with_binding_kind;
+  with_error_map : with_error_map option;
 }
 
 and loop_view_kind =
@@ -717,7 +719,12 @@ let expr_children (e : expr) : expr list =
           | SelectAfter timeout -> [ timeout; arm.select_arm_body ]
           | SelectSealed channel -> [ channel; arm.select_arm_body ])
         arms
-  | EWith (binding, body) -> [ binding.with_value; body ]
+  | EWith (binding, body) ->
+      binding.with_value
+      ::
+      (match binding.with_error_map with
+      | Some mapper -> [ mapper.with_error_value; body ]
+      | None -> [ body ])
   | ERecord fields -> List.map snd fields
   | ERecordUpdate (base, fields) -> base :: List.map snd fields
   | ELambda func -> (
@@ -805,7 +812,17 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
     | EConcurrent (exprs, timeout, mt) ->
         EConcurrent (List.map f exprs, Option.map f timeout, mt)
     | EWith (binding, body) ->
-        EWith ({ binding with with_value = f binding.with_value }, f body)
+        EWith
+          ( {
+              binding with
+              with_value = f binding.with_value;
+              with_error_map =
+                Option.map
+                  (fun mapper ->
+                    { mapper with with_error_value = f mapper.with_error_value })
+                  binding.with_error_map;
+            },
+            f body )
     | ERecord fields ->
         ERecord (List.map (fun (name, e1) -> (name, f e1)) fields)
     | ERecordUpdate (base, fields) ->

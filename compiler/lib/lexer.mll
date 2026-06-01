@@ -97,6 +97,7 @@ let () =
     ("and", Parser.AND);
     ("or", Parser.OR);
     ("not", Parser.NOT);
+    ("on", Parser.ON);
     ("implements", Parser.IMPLEMENTS);
     ("trait", Parser.TRAIT);
     ("Self", Parser.SELF_TYPE);
@@ -1080,6 +1081,7 @@ let token_to_string = function
   | Parser.WHILE -> "while" | Parser.FOR -> "for" | Parser.IN -> "in"
   | Parser.IF -> "if" | Parser.ELSE -> "else"
   | Parser.AND -> "and" | Parser.OR -> "or" | Parser.NOT -> "not"
+  | Parser.ON -> "on"
   | Parser.BREAK -> "break" | Parser.CONTINUE -> "continue"
   | Parser.IMPLEMENTS -> "implements" | Parser.TRAIT -> "trait"
   | Parser.SELF_TYPE -> "Self"

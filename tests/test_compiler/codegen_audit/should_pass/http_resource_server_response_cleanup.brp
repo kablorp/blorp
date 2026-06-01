@@ -1,0 +1,41 @@
+-- HTTP resource-server fan-out keeps response data ordinary, but the owned
+-- Bytes passed to Tcp.write_all may live across a cancellation point inside a
+-- resource-source child task. Generated C must protect that payload with a
+-- task-local cleanup frame and must still close the moved TcpStream resource.
+-- EXPECT-C: blorp_resource_source_next_raw(
+-- EXPECT-C: blorp_task_cleanup_push(&__blorp_cleanup_conn, &conn, (void*)conn, (blorp_CancelCleanupFn)blorp_tcp_close_stream);
+-- EXPECT-C: blorp_cleanup_stack_result_value
+-- EXPECT-C: blorp_CancelCleanupFrame __blorp_cleanup_payload;
+-- EXPECT-C: blorp_task_cleanup_push(&__blorp_cleanup_payload, &payload, (void*)payload, blorp_cleanup_release_arc_only_value);
+-- EXPECT-C: blorp_task_cleanup_pop_slot(&payload);
+-- EXPECT-C: blorp_release_arc_only(payload);
+-- EXPECT-C: blorp_tcp_close_stream(conn);
+import:
+	net/http as HTTP: Request, Response
+	net/tcp as Tcp: TcpError
+
+
+pure func route(req: Request) -> Response:
+	HTTP.ok_text("handled " + req.path)
+
+
+func serve_once() -> Result[Int, TcpError]:
+	with listener ?= Tcp.listen("127.0.0.1", 0, 1):
+		for conn in Tcp.connections_stop_on_error(listener) concurrently(limit: 1):
+			match Tcp.read_chunk(conn, 4096):
+				Ok(raw):
+					response: Response = match HTTP.parse_request(raw):
+						Ok(req): route(req)
+						Err(msg): HTTP.error_response(400, msg)
+					payload: Bytes = HTTP.format_response(response)
+					match Tcp.write_all(conn, payload):
+						Ok(_): void
+						Err(_): void
+				Err(_): void
+		Ok(0)
+
+
+func main(args: List[String]) -> Int:
+	match serve_once():
+		Ok(value): value
+		Err(_): 1

@@ -8,6 +8,9 @@ practical power: cheap virtual tasks, direct blocking-style code, message
 passing, high-concurrency servers, database work, data-engineering pipelines,
 event loops, and resource-safe I/O.
 
+The networking-specific resource migration plan lives in
+`docs/NETWORKING_RESOURCES_ROADMAP.md`.
+
 Current source syntax is `concurrent:`, `for ... concurrently(...)`,
 `List.concurrent(...)`, and `detach`.
 
@@ -1301,8 +1304,13 @@ Builtin metadata now has an explicit `Cancellation_point` capability for
 global scheduler/channel operations that can observe cooperative cancellation
 (`sleep`, `yield_now`, blocking/timed channel send/receive) and for runtime TCP
 reactor waits (`blorp_tcp_accept_raw`, `blorp_tcp_read_raw`, and related raw C
-builtins). This gives future cleanup audits a named fact to query instead of
-inferring cancellation behavior from `Impure`.
+builtins). Fallible-stream terminal builtins now derive the same metadata from
+their terminal manifest because those loops check cancellation and may park
+while pulling from I/O-backed sources. This gives future cleanup audits a named
+fact to query instead of inferring cancellation behavior from `Impure`.
+Builtin metadata also has a separate `Os_worker_blocking` capability for
+operation-result builtins such as the current platform DNS resolver that block
+an OS scheduler worker instead of parking a fiber.
 `std/test.cancel_after_parked_for_test` now provides the first narrow
 deterministic cancellation harness: it runs a zero-argument child task, waits
 until that task is observed parked, then cancels and joins it without exposing a
@@ -1391,7 +1399,9 @@ Tests:
   cancelled.
 - Metadata tests assert that every runtime operation that may park is marked as
   a cancellation point, including channel send/receive, sleep/yield, task join,
-  fan-out joins, TCP reactor waits, and future blocking-worker waits.
+  fan-out joins, TCP reactor waits, and fallible-stream terminals. Blocking
+  OS-worker operations should stay explicit as blocking until they gain a
+  cancellation-aware worker wait.
 - Sanitizer/leak gates run the focused concurrency and channel baselines.
 
 Implementation status: `blorp test --repeat N` now reruns selected runtime tests
@@ -1975,14 +1985,16 @@ as ARC-owned source wrappers that borrow their scoped listener and have type
 `ResourceSource[TcpStream, TcpError]`; tests cover direct binding, source
 escape, mutable direct source locals, copies from existing source bindings,
 discarded direct source values, source values as concurrent task results,
-closure/detached/concurrent capture, attempted sequential/concurrent iteration
-diagnostics, generated C for the source wrappers, and sequential TCP
-resource-source iteration cleanup. Sequential `for` over `ResourceSource`
-transfers each produced resource into a scoped loop body and reuses
-`CResourceScope` cleanup, including cleanup before `break`/`continue` and
-task-local cancellation cleanup while the body is parked. Concurrent
-resource-source fan-out is still open because each accepted resource needs an
-explicit move-into-task representation.
+closure/detached/concurrent capture, generated C for the source wrappers,
+sequential TCP resource-source iteration cleanup, and concurrent TCP
+resource-source fan-out. Sequential `for` over `ResourceSource` transfers each
+produced resource into a scoped loop body and reuses `CResourceScope` cleanup,
+including cleanup before `break`/`continue` and task-local cancellation cleanup
+while the body is parked. Concurrent `for ... concurrently(limit:)` over a
+resource source now lowers each item as an explicit move-resource task capture:
+the parent consumes the source item, the child nulls the moved closure slot
+after taking ownership, and the child immediately installs scoped cleanup
+before user code can park.
 
 Work:
 
@@ -1997,7 +2009,9 @@ Work:
 - Support sequential `for` over resource sources. Landed for TCP connection
   sources.
 - Support concurrent `for ... concurrently` over resource sources by moving
-  each resource item into the child task.
+  each resource item into the child task. Landed for TCP connection sources,
+  with typecheck, Core invariant, codegen-audit, runtime, and deterministic
+  leak-check coverage.
 - Represent source-error policy explicitly. The producer API is explicit today;
   the current runtime still ends TCP connection sources on accept errors while
   typed transient-error handling is finished.
@@ -2309,10 +2323,8 @@ resource type TcpStream = builtin("blorp_tcp_close_stream")
 
 Remaining work:
 
-- Implement concurrent resource-source iteration for
-  `connections_continue_on_error(listener)` and
-  `connections_stop_on_error(listener)`.
-- Finish typed transient-error handling for `connections_continue_on_error`.
+- Extend typed transient-error handling for `connections_continue_on_error`
+  beyond accept timeouts only when runtime error classes make the policy stable.
 - Keep DNS limitations explicit.
 - Add `split(stream)` only if reader/writer resources can be represented as
   distinct ownership roles.
@@ -2339,25 +2351,28 @@ Tests:
 - Hostname resolution docs match runtime behavior.
 
 Migration impact: old typed ARC TCP handle patterns now produce resource
-diagnostics. This is acceptable before external use, but optional packages and
-benchmarks still need migration to scoped ownership or resource-source
-iteration.
+diagnostics. This is acceptable before external use. Optional packages and
+benchmarks have been migrated off old TCP ownership shapes; richer HTTPS,
+STARTTLS, WebSocket connection, and TLS behavior should return through scoped
+resource APIs rather than compatibility shims. UDP has started that path in
+`std/net/udp`; `recv_from` now parks through the shared reactor owner path, and
+datagram streaming should build on that instead of creating a second scheduler
+path.
 
 Stop condition: TCP examples, benchmarks, and optional networking packages are
 resource-safe without TCP-specific codegen exceptions.
 
-Migration staging note: do not start this phase by simply changing the existing
-`TcpListener` and `TcpStream` declarations to `resource type`. The current
-resource rules intentionally reject ordinary function parameters/returns,
-container storage, closure capture, detached capture, and concurrent task
-capture for resource-containing values. Existing TCP tests, benchmarks, and
-optional networking packages still rely on several of those patterns while TCP
-is handle-based. First land the resource-source ownership shape
-(`connections(listener)` transferring each accepted stream into a structured
-task), migrate call sites away from ordinary stream storage and detached
-accepted-stream handlers, and then flip TCP to resources. The desired endpoint
-is that TCP uses the same general resource restrictions as files, not
-TCP-specific codegen exceptions.
+Migration staging note: TCP listener and stream handles are now resource types,
+so old tests, benchmarks, and optional networking packages that store streams,
+pass streams as ordinary parameters, or manually close streams need migration.
+Do not reintroduce compatibility shims for those shapes. Finish the
+resource-source ownership path instead: sequential connection-source iteration
+and structured `for ... concurrently(limit:)` connection-source fan-out have
+landed without TCP-specific codegen exceptions. Accept timeouts now classify as
+`TimedOut`, and `connections_continue_on_error` skips those timeouts. The
+remaining TCP work is broader source error policy, stream adapters, DNS story,
+and restoring protocol/package features on top of scoped TLS/UDP/WebSocket
+resources.
 
 ### Phase 13: Services And Pools
 
@@ -2449,38 +2464,42 @@ high-leverage sequence is:
    serialization.
 3. Extend deterministic cancellation harness coverage for parked operations.
    The first narrow test hook has landed, and channel send/receive,
-   structured-join, dynamic fan-out, ordinary `select`, timer sleep, and TCP
-   `accept`/`read` leak baselines now use it. TCP write has generated-C audit
-   coverage for the owned `Bytes` cleanup frame borrowed by the write call, but
-   a portable parked-write runtime leak baseline remains open because socket
-   buffer autotuning can let large local writes complete before the harness
-   observes a park. Next, cover TCP connect and write reactor waits with the same
-   "observe parked, then cancel/join" shape if that can be made portable,
-   without exposing a general user-facing task API.
-4. Extend cancellation-point metadata to future blocking-worker waits.
+   structured-join, dynamic fan-out, ordinary `select`, timer sleep, TCP
+   `accept`/`read`, and cancelled TCP resource-source fan-out leak baselines now
+   use it. TCP write has generated-C audit coverage for the owned `Bytes`
+   cleanup frame borrowed by the write call, but a portable parked-write runtime
+   leak baseline remains open because socket buffer autotuning can let large
+   local writes complete before the harness observes a park. Next, cover TCP
+   connect and write reactor waits with the same "observe parked, then
+   cancel/join" shape if that can be made portable, without exposing a general
+   user-facing task API.
+4. Keep wait-behavior metadata explicit for future blocking-worker waits.
    The `Cancellation_point` capability has landed for unambiguous global names
    such as `send`, `recv`, `sleep`, and `yield_now`, and for runtime TCP
    reactor builtins such as `blorp_tcp_accept_raw`, `blorp_tcp_read_raw`, and
-   `blorp_tcp_write_raw`. The metadata deliberately does not mark unrelated
-   bare names such as `read` and `write`. Future blocking-worker waits should
-   use this metadata for compiler audits and generated-C cleanup tests instead
-   of adding ad hoc name sets.
-5. Continue TCP resource migration by defining resource-source iteration.
+   `blorp_tcp_write_raw`. Fallible-stream terminal builtins also carry
+   manifest-derived cancellation-point metadata. Operation-result builtins whose
+   current implementation blocks an OS worker, such as platform DNS, carry
+   `Os_worker_blocking` instead. The metadata deliberately does not mark
+   unrelated bare names such as `read` and `write`. Future blocking-worker waits
+   should first be represented as explicit blocking wait behavior, then become
+   cancellation points only if the runtime owns a cancellation-aware worker wait.
+5. Continue TCP resource migration from the current resource-source checkpoint.
    Listener and stream handles are now `resource type`s, simple TCP APIs return
    `TcpError`, manual close is private, resource capture/ordinary parameter
    escapes are rejected, and the explicit-policy TCP connection-source
    constructors provide the first `ResourceSource[TcpStream, TcpError]`
    producer shape. Sequential `for` over TCP connection sources now transfers
    each accepted stream into a scoped loop body with normal and cancellation
-   cleanup. Concurrent fan-out and typed transient-error continuation remain
-   open. The current
-   one-waiter-per-operation TCP runtime limitation remains a documented policy
-   boundary: future work should revisit it only as part of the resource-level
-   ownership model, not as a standalone waiter-list refactor. Next, define how
-   concurrent resource-source loops transfer each accepted stream into a child
-   task, how cancellation closes a stream owned by a cancelled child task, and
-   how benchmarks/packages migrate away from ordinary aggregate storage of TCP
-   handles.
+   cleanup. Concurrent fan-out now moves each accepted stream into one child
+   task with explicit Core metadata and deterministic cancellation cleanup, and
+   `connections_continue_on_error` skips typed accept timeouts. The TCP virtual
+   thread benchmark has migrated away from manual close and aggregate storage.
+   The current one-waiter-per-operation TCP runtime limitation remains a
+   documented policy boundary: future work should revisit it only as part of the
+   resource-level ownership model, not as a standalone waiter-list refactor.
+   Next, migrate optional packages away from ordinary TCP handle storage and
+   generalize fallible-stream terminal bridges before adding TCP chunks/lines.
 
 Each slice should add a failing parser/typecheck/runtime or codegen-audit test
 first, and should update this queue if implementation reveals a simpler or

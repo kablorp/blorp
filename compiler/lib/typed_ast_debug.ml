@@ -100,7 +100,12 @@ let expr_children_from_desc = function
   | EConcurrentBind (_, _, expr)
   | EDetach expr ->
       [ expr ]
-  | EWith (binding, body) -> [ binding.with_value; body ]
+  | EWith (binding, body) ->
+      binding.with_value
+      ::
+      (match binding.with_error_map with
+      | Some mapper -> [ mapper.with_error_value; body ]
+      | None -> [ body ])
   | EBinary (_, left, right)
   | ELogical (_, left, right)
   | EWhile (left, right)
@@ -135,7 +140,8 @@ let expr_children_from_desc = function
           | SelectRecv { select_channel; _ } ->
               [ select_channel; arm.select_arm_body ]
           | SelectAfter timeout -> [ timeout; arm.select_arm_body ]
-          | SelectSealed channel -> [ channel; arm.select_arm_body ])
+          | SelectSealed { select_channel = channel; _ } ->
+              [ channel; arm.select_arm_body ])
         arms
   | ERecord fields -> List.map snd fields
   | ERecordUpdate (base, fields) -> base :: List.map snd fields

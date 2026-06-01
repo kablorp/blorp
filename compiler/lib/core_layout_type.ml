@@ -226,9 +226,9 @@ let classify_source_value_layout_of_metadata ?(loc = Ast.dummy_loc)
 
 let runtime_builtin_arc_release_only = function
   | "String" | "Bytes" | "Fixed" | "MemStats" | "SchedulerStats"
-  | "ConcurrencyError" | "ResourceSource" | "std/stream::ResourceSource"
-  | "std_stream__ResourceSource" ->
+  | "ConcurrencyError" ->
       true
+  | name when Type_name_metadata.is_resource_source_name name -> true
   | _ -> false
 
 let source_release_path_of_named_type ~reg name =

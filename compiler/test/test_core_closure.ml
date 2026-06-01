@@ -539,6 +539,7 @@ let test_concurrently_loop_gets_task_closure_metadata () =
                  cf_timeout = None;
                  cf_width = ConcurrentlyLoopLimit (cint 2);
                  cf_output = ConcurrentlyLoopCollect;
+                 cf_item_mode = ConcurrentlyLoopCopyItem;
                  cf_task_scope = synthetic_concurrent_task_scope;
                  cf_task = None;
                })
@@ -571,6 +572,70 @@ let test_concurrently_loop_gets_task_closure_metadata () =
         | Some { desc = CConcurrentlyLoop { cf_task = None; _ }; _ } ->
             Alcotest.fail "expected for ... concurrently task metadata"
         | Some _ -> Alcotest.fail "expected converted CConcurrentlyLoop body"
+        | None -> Alcotest.fail "missing run body"))
+
+let test_resource_source_concurrently_loop_moves_item_capture () =
+  Blorp.Session.(
+    with_current (create ()) (fun () ->
+        let resource_ty = TyNamed ("TcpStream", []) in
+        let source_ty =
+          TyNamed ("ResourceSource", [ resource_ty; ty_string ])
+        in
+        let item = Var.named "__resource_1" in
+        let conn = Var.named "conn" in
+        let body =
+          mk
+            (CResourceScope
+               {
+                 rs_var = conn;
+                 rs_ty = resource_ty;
+                 rs_acquire = cvar "__resource_1" resource_ty;
+                 rs_body = mk CVoid ty_void;
+                 rs_cleanup = mk CVoid ty_void;
+               })
+            ty_void
+        in
+        let cf =
+          mk
+            (CConcurrentlyLoop
+               {
+                 cf_var = item;
+                 cf_iter = cvar "source" source_ty;
+                 cf_body = body;
+                 cf_timeout = None;
+                 cf_width = ConcurrentlyLoopLimit (cint 2);
+                 cf_output = ConcurrentlyLoopDiscard;
+                 cf_item_mode =
+                   ConcurrentlyLoopMoveResourceItem
+                     {
+                       clmi_resource_ty = resource_ty;
+                       clmi_error_ty = ty_string;
+                     };
+                 cf_task_scope = synthetic_concurrent_task_scope;
+                 cf_task = None;
+               })
+            ty_void
+        in
+        let run =
+          mk_func "run" [ ("source", source_ty) ] ty_void (Some cf) 13
+        in
+        let converted = Blorp.Core_closure.convert_program [ decl run ] in
+        let run' = require_func "run" converted in
+        match run'.cf_body with
+        | Some { desc = CConcurrentlyLoop { cf_task = Some task; _ }; _ } -> (
+            Alcotest.(check (list (triple string string string)))
+              "move capture metadata"
+              [ ("__resource_1", "TcpStream", "move_resource_item") ]
+              (List.map task_capture_summary task.tc_captures);
+            let task_func = require_func "_blorp_task_0" converted in
+            match task_func.cf_kind with
+            | CFClosureBody ca ->
+                Alcotest.(check (list string))
+                  "moved closure slots" [ "__resource_1" ] ca.ca_moved_captures
+            | _ -> Alcotest.fail "expected task closure body")
+        | Some { desc = CConcurrentlyLoop { cf_task = None; _ }; _ } ->
+            Alcotest.fail "expected for ... concurrently task metadata"
+        | Some _ -> Alcotest.fail "expected CConcurrentlyLoop"
         | None -> Alcotest.fail "missing run body"))
 
 let test_resource_scope_binding_not_captured_by_nested_lambda () =
@@ -788,5 +853,8 @@ let suite =
           test_detach_gets_task_closure_metadata;
         Alcotest.test_case "concurrently_loop_gets_task_closure_metadata" `Quick
           test_concurrently_loop_gets_task_closure_metadata;
+        Alcotest.test_case
+          "resource_source_concurrently_loop_moves_item_capture" `Quick
+          test_resource_source_concurrently_loop_moves_item_capture;
       ] );
   ]

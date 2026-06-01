@@ -694,12 +694,23 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
           let pch_file =
             Option.bind precompiled (fun p -> p.Test_runner.pch_file)
           in
+          let tls_backend =
+            match precompiled with
+            | Some p -> p.Test_runner.tls_backend
+            | None -> Test_runner.current_tls_backend_profile ()
+          in
+          let runtime_feature_args =
+            if Option.is_none precompiled then
+              Test_runner.tls_backend_runtime_cc_args tls_backend
+            else []
+          in
           let cc_args =
             [ "-" ^ opt; "-fwrapv"; "-pipe" ]
             @ (if Lazy.force Test_runner.cc_is_clang && Sys.os_type = "Unix"
                then [ "-Wl,-stack_size,0x1000000" ]
                else [])
             @ (if sanitize then [] else [ "-w" ])
+            @ runtime_feature_args
             @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
             @ (match pch_file with
               | Some pch_f ->
@@ -715,6 +726,7 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
               | None -> [])
             @ [ "-lm"; "-lpthread" ]
             @ (if sanitize then Test_runner.sanitize_cc_args else [])
+            @ Test_runner.tls_backend_link_cc_args tls_backend
             @ (if raylib_flags = "" then []
                else String.split_on_char ' ' (String.trim raylib_flags))
             @ Ffi_boundary.link_flags_cc_args link_flags
@@ -785,6 +797,10 @@ let usage () =
   print_endline "  BLORP_SANITIZE=1      Enable sanitizers (CLI flag overrides)";
   print_endline
     "  BLORP_LEAK_CHECK=1    Enable leak reporting (CLI flag overrides)";
+  print_endline "  BLORP_TLS_BACKEND=unsupported|openssl";
+  print_endline
+    "                         Select runtime TLS backend profile (default: \
+     unsupported)";
   print_endline
     "  BLORP_THREADS=N       Runtime worker thread pool size (run --threads \
      overrides)";
@@ -1600,6 +1616,10 @@ let () =
       exit 1
   | Failure msg ->
       Printf.eprintf "Internal error: %s\n" msg;
+      exit 1
+  | Invalid_argument msg
+    when String.starts_with ~prefix:"Invalid BLORP_TLS_BACKEND" msg ->
+      Printf.eprintf "Error: %s\n" msg;
       exit 1
   | exn ->
       Printf.eprintf

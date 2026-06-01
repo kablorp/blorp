@@ -405,7 +405,51 @@ let test_precompile_runtime_writes_verified_manifest () =
                (( = )
                   ("runtime.h="
                   ^ Digest.to_hex (Digest.file precompiled.header_file)))
+               manifest_lines);
+          Alcotest.(check bool)
+            "manifest records TLS backend" true
+            (List.exists
+               (( = )
+                  ("tls_backend="
+                  ^ Blorp.Test_runner.tls_backend_profile_to_string
+                      precompiled.tls_backend))
                manifest_lines))
+
+let test_tls_backend_profile_env_parsing () =
+  let check_profile label expected value =
+    with_env "BLORP_TLS_BACKEND" value (fun () ->
+        match Blorp.Test_runner.configured_tls_backend_profile () with
+        | Ok actual -> Alcotest.(check bool) label true (actual = expected)
+        | Error msg -> Alcotest.fail msg)
+  in
+  check_profile "default profile" Blorp.Test_runner.TlsUnsupported "unsupported";
+  check_profile "openssl profile" Blorp.Test_runner.TlsOpenSsl "openssl";
+  with_env "BLORP_TLS_BACKEND" "bogus" (fun () ->
+      match Blorp.Test_runner.configured_tls_backend_profile () with
+      | Ok _ -> Alcotest.fail "invalid TLS backend profile accepted"
+      | Error msg ->
+          Alcotest.(check bool)
+            "mentions env var" true
+            (contains_substring msg "BLORP_TLS_BACKEND"))
+
+let test_tls_backend_openssl_args_use_named_configuration () =
+  with_env "BLORP_OPENSSL_CFLAGS" "-I/tmp/blorp-openssl/include -DTEST_TLS"
+    (fun () ->
+      Alcotest.(check (list string))
+        "openssl runtime args include define and configured cflags"
+        [
+          "-DBLORP_TLS_BACKEND_PROFILE_OPENSSL=1";
+          "-I/tmp/blorp-openssl/include";
+          "-DTEST_TLS";
+        ]
+        (Blorp.Test_runner.tls_backend_runtime_cc_args
+           Blorp.Test_runner.TlsOpenSsl));
+  with_env "BLORP_OPENSSL_LIBS" "-L/tmp/blorp-openssl/lib -lssl -lcrypto"
+    (fun () ->
+      Alcotest.(check (list string))
+        "openssl link args use configured libs"
+        [ "-L/tmp/blorp-openssl/lib"; "-lssl"; "-lcrypto" ]
+        (Blorp.Test_runner.tls_backend_link_cc_args Blorp.Test_runner.TlsOpenSsl))
 
 let test_precompile_runtime_reuses_verified_cache () =
   let real_cc =
@@ -753,6 +797,10 @@ let suite =
       [
         Alcotest.test_case "writes_verified_manifest" `Quick
           test_precompile_runtime_writes_verified_manifest;
+        Alcotest.test_case "tls_backend_env_parsing" `Quick
+          test_tls_backend_profile_env_parsing;
+        Alcotest.test_case "tls_backend_openssl_args" `Quick
+          test_tls_backend_openssl_args_use_named_configuration;
         Alcotest.test_case "reuses_verified_cache" `Quick
           test_precompile_runtime_reuses_verified_cache;
         Alcotest.test_case "repairs_incomplete_cache" `Quick

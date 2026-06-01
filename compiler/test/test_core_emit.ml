@@ -876,7 +876,8 @@ let test_emit_box_managed_stack_result_uses_stack_box_helper () =
   in
   Alcotest.(check string)
     "box managed stack Result"
-    "({ blorp_StackResult __box_0 = r; blorp_box_stack_result(__box_0); })"
+    "({ blorp_StackResult __box_0 = r; \
+     blorp_box_stack_result(blorp_stack_result_retain_value(__box_0)); })"
     (emit_to_string e)
 
 let test_emit_stack_option_int_mangled_none_cvar () =
@@ -3049,6 +3050,7 @@ let test_emit_concurrently_loop_rc_result_uses_spawn_rc () =
            cf_timeout = None;
            cf_width = ConcurrentlyLoopLimit (cint 2);
            cf_output = ConcurrentlyLoopCollect;
+           cf_item_mode = ConcurrentlyLoopCopyItem;
            cf_task_scope = synthetic_concurrent_task_scope;
            cf_task = None;
          })
@@ -5394,6 +5396,7 @@ let test_emit_rejects_unsupported_task_capture_kind () =
             cf_timeout = None;
             cf_width = ConcurrentlyLoopLimit (cint 2);
             cf_output = ConcurrentlyLoopCollect;
+            cf_item_mode = ConcurrentlyLoopCopyItem;
             cf_task_scope = synthetic_concurrent_task_scope;
             cf_task = Some task;
           };
@@ -5534,6 +5537,7 @@ let test_emit_invariant_concurrently_loop_requires_list () =
             cf_timeout = None;
             cf_width = ConcurrentlyLoopLimit (cint 2);
             cf_output = ConcurrentlyLoopCollect;
+            cf_item_mode = ConcurrentlyLoopCopyItem;
             cf_task_scope = synthetic_concurrent_task_scope;
             cf_task = Some task;
           };

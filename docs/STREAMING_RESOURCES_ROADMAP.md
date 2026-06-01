@@ -8,6 +8,10 @@ make resource lifetime, one-shot streaming, fallible I/O, virtual-thread
 blocking behavior, and ownership semantics explicit enough that later compiler
 work can make illegal states unrepresentable.
 
+For the TCP-specific checkpoint and the broader plan for TLS, UDP, DNS, HTTP,
+WebSocket, database connectors, and event/game networking, see
+`docs/NETWORKING_RESOURCES_ROADMAP.md`.
+
 ## Executive Summary
 
 Blorp should grow a first-class `with` expression for scoped resources:
@@ -71,6 +75,10 @@ Current runtime shape:
 
 - `blorp_Stream` is a C runtime object with a pull function, opaque state, a
   state cleanup callback, and an explicit element layout enum.
+- `blorp_FallibleStream` uses the same one-shot cursor shape, but fallible
+  pulls now report `domain + kind + detail` instead of a file-only error enum.
+  Terminal operations bridge that domain to the stream's `E`, which keeps file,
+  UDP, TCP, TLS, database, and event streams on one terminal-operation ABI.
 - Streams are lazy and one-shot in practice.
 - The old `stream.from_lines(path)` source returned an empty stream when open
   failed; it has been removed in favor of scoped `file.lines()` fallible
@@ -127,8 +135,10 @@ The current public API is:
 
 ```blorp
 listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
+listen_numeric(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
 accept(listener: TcpListener) -> Result[TcpStream, TcpError]
 connect(host: String, port: Int) -> Result[TcpStream, TcpError]
+connect_numeric(host: String, port: Int) -> Result[TcpStream, TcpError]
 read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
 write(stream: TcpStream, data: Bytes) -> Result[Int, TcpError]
 write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]
@@ -150,6 +160,9 @@ Current runtime shape:
 - `accept`, numeric-address `connect`, `read`, and `write` park fibers through
   the scheduler's poll-backed I/O reactor instead of pinning OS workers while
   waiting for socket readiness;
+- `listen_numeric` and `connect_numeric` reject hostname inputs before
+  `getaddrinfo`, giving callers an enforceable no-DNS acquisition path for
+  virtual-thread-friendly networking setup;
 - timeout and cancellation paths wake parked socket waiters;
 - same-stream writes are serialized by an explicit runtime write-ownership
   state so concurrent writes cannot interleave bytes;
@@ -167,13 +180,13 @@ Current runtime shape:
 
 Remaining limitations:
 
-- hostname resolution still uses `getaddrinfo` and can block an OS worker before
-  the nonblocking socket phase begins;
-- concurrent resource-source iteration for
-  `connections_stop_on_error(listener)` and
-  `connections_continue_on_error(listener)`, typed transient accept-error
-  continuation, plus TCP chunk or line stream adapters, are still future work.
-- TCP does not yet expose `chunks`, `lines`, or other fallible stream adapters;
+- hostname-capable `listen`/`connect` still use `getaddrinfo` and can block an
+  OS worker before the nonblocking socket phase begins; use
+  `listen_numeric`/`connect_numeric` when that is unacceptable;
+- TCP line stream adapters have landed; `chunks(stream, max_bytes)` exposes byte
+  chunks as a scoped `FallibleStream[Bytes, TcpError]`, and `lines(stream)`
+  exposes scoped `FallibleStream[String, TcpError]` with file-compatible line
+  framing.
 - runtime interop helpers can still adopt or reveal raw fds for internal,
   package, and test use, but the public Blorp TCP API no longer accepts raw
   `Int` descriptors.
@@ -186,7 +199,7 @@ unless and until a dedicated error conversion mechanism exists. This matters for
 resource APIs because file, TCP, database, parser, and application errors will
 often meet inside one propagation context.
 
-Short-term ergonomic pattern:
+Current ergonomic pattern for resource acquisition:
 
 ```blorp
 union AnalyzeError:
@@ -194,13 +207,20 @@ union AnalyzeError:
 	Db(DbError)
 
 func analyze(path: String, url: String) -> Result[Int, AnalyzeError]:
-	with reader ?= path.open_read().map_err(func(e): Io(e)):
+	with reader ?= path.open_read() on err => Io(err):
 		file_count ?= reader.lines().count().map_err(func(e): Io(e))
 
-		with conn ?= db.connect(url).map_err(func(e): Db(e)):
+		with conn ?= db.connect(url) on err => Db(err):
 			user_count ?= conn.query_count("select count(*) from users").map_err(func(e): Db(e))
 			Ok(file_count + user_count)
 ```
+
+`Result[Resource, E]` is still not an ordinary value, so a normal
+`Result.map_err` call remains invalid on resource acquisition carriers. The
+`on err => mapped` clause is part of the `with ?=` acquisition boundary: it maps
+the failure before the resource payload is exposed and before cleanup ownership
+is installed for the success arm. Ordinary fallible operations after the
+resource has already been scoped can still use normal `Result.map_err`.
 
 Possible later improvement:
 
@@ -915,8 +935,7 @@ Example:
 func read_connection(host: String, port: Int) -> Result[Int, TcpError]:
 	with conn ?= connect(host, port):
 		n ?= conn.chunks(16 * 1024)
-			.map(func(chunk): chunk.length())
-			.fold(0, func(total, n): total + n)
+			.fold_result(0, func(total, chunk): total + chunk.length())
 		Ok(n)
 ```
 
@@ -938,9 +957,18 @@ Runtime status and target:
 - landed: codegen routes public TCP builtins through typed raw runtime bridges;
 - landed: module-qualified resource-operation calls such as
   `Tcp.write(stream, data)` preserve resource-operation metadata;
+- landed: WebSocket has a scoped session resource plus a typed
+  `receive(session) -> Result[Message, WebSocketError]` operation; the
+  underlying session now has explicit one-reader/one-writer operation guards
+  that return typed `Busy` for overlapping same-direction operations; the
+  `messages(session) -> FallibleStream[Message, WebSocketError]` adapter is
+  intentionally deferred until stream ownership and stream element bridging can
+  represent source-level union construction without teaching the runtime about
+  generated `Message` constructors or allowing scoped streams to escape;
 - landed: deterministic cancellation leak coverage for parked TCP `accept` and
-  `read`, plus compiler-side cleanup coverage for owned `Bytes` payloads
-  borrowed by write calls;
+  `read`, deterministic leak coverage for cancelled TCP resource-source fan-out,
+  plus compiler-side cleanup coverage for owned `Bytes` payloads borrowed by
+  write calls;
 - landed: `connections_stop_on_error(listener)` and
   `connections_continue_on_error(listener)` as scoped, listener-borrowing source
   shapes with explicit accept-error policy; compiler tests cover direct
@@ -948,7 +976,17 @@ Runtime status and target:
   ARC-owned source wrappers that borrow the listener;
 - landed: sequential `for` over TCP connection sources transfers each accepted
   stream into a scoped loop body with normal and cancellation cleanup;
-- not landed: `chunks` and `lines` adapters;
+- landed: concurrent `for ... concurrently(limit:)` over TCP connection sources
+  transfers each accepted stream into exactly one child task, marks that capture
+  as a moved resource item in Core, and installs child cleanup before user code
+  can park;
+- landed: TCP accept/read timeout errors classify as `TimedOut`, and
+  `connections_continue_on_error(listener)` skips accept timeouts before
+  accepting later connections;
+- landed: `chunks(stream, max_bytes)` exposes scoped TCP byte chunks as
+  `FallibleStream[Bytes, TcpError]` on the generic fallible-stream terminal ABI;
+- landed: `lines(stream)` exposes scoped TCP text lines as
+  `FallibleStream[String, TcpError]` using the same terminal ABI;
 - not landed: nonblocking DNS or a bounded DNS worker strategy for hostname
   resolution.
 
@@ -964,13 +1002,29 @@ storing resources in lists/channels/records/unions/options, and capturing
 resources in closures, detached tasks, or concurrent task bodies. TCP now uses
 those general rules instead of bespoke handle restrictions.
 
-Remaining migration blockers:
+Completed migration blockers:
 
-- the TCP virtual-thread benchmark stores streams in `List[TcpStream]`;
-- optional networking packages wrap or store `TCP.TcpStream` inside ordinary
-  records and unions;
-- the current accept API returns one stream at a time rather than a
-  resource-producing source that can transfer ownership into a concurrent loop.
+- the TCP virtual-thread benchmark now uses scoped listeners, scoped client
+  streams, TCP connection sources, and channel aggregation;
+- optional networking packages no longer wrap or store `TCP.TcpStream` inside
+  ordinary records and unions;
+- TCP accept sources can transfer each accepted stream into a sequential or
+  concurrent resource-source loop.
+
+Remaining TCP-adjacent work:
+
+- define whether TCP split reader/writer resource roles should land before TLS
+  and WebSocket resources, or whether those protocols should drive the role
+  design;
+- define the DNS strategy for hostname resolution;
+- restore richer TLS-backed package behavior after native TLS behavior lands on
+  the scoped `std/net/tls` surface. The first dependent `TlsSession` resource
+  API now exists with typed unsupported runtime stubs.
+- build UDP datagram streams on the generic reactor waiter owner. The scoped
+  `std/net/udp` resource path currently covers socket acquisition, `bind`,
+  no-DNS `bind_numeric`, one-shot `send_to`, no-DNS `send_to_numeric`,
+  virtual-thread-aware `send_to_wait`, no-DNS `send_to_wait_numeric`,
+  `recv_from`, and `local_port`.
 
 Remaining staging plan:
 
@@ -984,15 +1038,12 @@ Remaining staging plan:
    `None as Option[ResourceSource[...]]`, annotated local bindings such as
    `Option[ResourceSource[...]]`, mutable direct source locals, direct source
    locals copied from existing source bindings, discarded direct source values,
-   source values as concurrent task results, source escape from the listener
-   `with` block, closure capture, detached/concurrent capture, and attempted
-   concurrent resource-source iteration with an explicit staged-feature
-   diagnostic. Sequential resource-source iteration has landed. The remaining
-   work is the concurrent iteration contract, including how
-   `connections_continue_on_error(listener)` and
-   `connections_stop_on_error(listener)` transfer each accepted stream into a
-   `for ... concurrently(limit:)` task and how cancellation closes streams owned
-   by cancelled tasks.
+  source values as concurrent task results, source escape from the listener
+  `with` block, closure capture, and detached/concurrent capture. Sequential
+  resource-source iteration has landed. Concurrent resource-source iteration has
+  also landed for TCP connection sources: each accepted stream moves into one
+  `for ... concurrently(limit:)` child task, and cancellation closes streams
+  owned by cancelled tasks.
 2. Decide whether ordinary user helpers may ever borrow resources. If not, keep
    TCP resource helpers as compiler-owned resource operations and teach users to
    structure helpers around ordinary data or resource-source callbacks.
@@ -1652,6 +1703,31 @@ Completed in the current implementation:
   their pull loops. `find_result` uses an explicit
   `Result[Option[T], E]` bridge ABI for nullable-managed options, primitive
   stack-option payloads, and boxed Option payloads such as nested options.
+- Generalized the fallible-stream terminal ABI away from file-only result
+  structs. Runtime pulls now carry an explicit error domain plus kind/detail,
+  and codegen maps that domain to the terminal result's `E`. File streams, UDP
+  datagram streams, TCP byte-chunk streams, TCP line streams, and TLS
+  byte-chunk streams now reuse the same terminal functions; database streams
+  should follow the same pattern. The codegen audit suite pins the TLS terminal
+  bridge so future backend work cannot accidentally route TLS failures through a
+  TCP/file-specific terminal.
+- Added explicit wait-behavior metadata for fallible-stream terminals in the
+  operation-result manifest. Terminal operations that pull from I/O-backed
+  sources are now classified as cancellation points by builtin metadata, while
+  source constructors remain impure non-terminals. This keeps cleanup audits
+  pointed at the operation that actually pulls and may park.
+- Centralized compiler recognition of `Stream`, `FallibleStream`, and
+  `ResourceSource` type names, including qualified and mangled `std/stream`
+  spellings. Resource/source escape checks, Core invariants, layout, and C type
+  emission now share one source of truth instead of parallel string lists.
+- Added task-local cancellation cleanup for owned values pulled from fallible
+  streams before terminal callbacks run. If cancellation lands inside
+  `fold_result`, `find_result`, `any_result`, or `all_result` user code, the
+  pulled item is released before the task exits.
+- Applied the same owned-pulled-value cleanup rule to infallible stream
+  adapters and terminals that invoke user callbacks. `map`, `filter`,
+  `filter_map`, `take_while`, `fold`, `for_each`, `find`, `any`, and `all` now
+  protect owned pulled items while callback code may park or be cancelled.
 - Hardened `collect_result` so the runtime list it returns uses the concrete
   `List[T]` storage layout selected by the compiler. Inline primitive lists
   such as `List[UInt8]` are no longer accidentally produced as pointer-backed
@@ -1695,6 +1771,9 @@ Tasks:
 
 - Add cancellation/yield checks in future fallible stream producers as they are
   introduced.
+- Audit future stream adapters and terminals against the same rule: any owned
+  pulled value live across a cancellation point or user callback must have a
+  task-local cleanup frame.
 
 Tests:
 
@@ -1742,14 +1821,58 @@ Completed in the current implementation:
 - Typecheck regressions reject ordinary TCP resource params/returns, matching
   acquisition results outside `with`, manual `close` import, detached capture,
   and concurrent capture.
+- `chunks(stream, max_bytes)` exposes TCP byte chunks as
+  `FallibleStream[Bytes, TcpError]` and shares the generic fallible-stream
+  terminal ABI with file and UDP streams.
+- `lines(stream)` exposes TCP text lines as `FallibleStream[String, TcpError]`
+  with file-compatible line framing on the same terminal ABI.
 
 Tasks:
 
-- Define and implement concurrent TCP resource-source iteration for accepted
-  streams.
-- Finish typed transient-error continuation for
-  `connections_continue_on_error`.
-- Add stream adapters for chunks and lines.
+- Extend typed transient-error continuation for
+  `connections_continue_on_error` beyond accept timeouts only when the runtime
+  has stable typed classes for those cases.
+- Decide whether split TCP reader/writer resource roles should be added before
+  TLS/WebSocket resources or derived from those designs.
+- Implement native TLS behavior behind the landed dependent `std/net/tls`
+  resource surface. `chunks(session, max_bytes)` now exists on the generic
+  fallible-stream terminal ABI with a TLS error domain, but native pulls still
+  report typed `Unsupported` until the TLS backend lands.
+- Keep TLS native backend work below the public `FallibleStream` API. The
+  stream contract should not change when the runtime moves from the unsupported
+  backend to a nonblocking native TLS backend.
+- The TLS unsupported backend now has an explicit runtime boundary and
+  `TlsSession` state model. Public TLS calls dispatch through a backend
+  operation table, and the unsupported backend implements the same
+  connect/read/write/write_all/close hooks that native backends should fill in
+  later rather than adding another public resource shape. Dispatch goes through
+  a single active-backend selector and validates table completeness before I/O,
+  returning typed TLS errors for incomplete internal backend tables. Resource
+  cleanup now transitions sessions through `Closing` while the backend close
+  hook runs, then marks them `Closed`. TLS read/write/write_all operations
+  install an atomic same-session operation guard and return typed `Busy` for
+  overlap, with a cancellation cleanup frame so future native cancellation
+  cannot leave the session stuck busy. Backend I/O now routes through explicit
+  `handshake_step`, `read_step`, and `write_step` hooks. Public connect now
+  consumes a provisional backend session through the handshake driver before
+  exposing it, and public read/write result adapters sit above the same step
+  boundary. Failed, cancelled, or not-ready handshakes release the provisional
+  session instead of leaking or exposing a partial TLS handle. Backend
+  `WantRead`/`WantWrite` steps now wait through the existing TCP reactor
+  machinery, so future native TLS reads, writes, and handshakes can park the
+  virtual thread on the underlying scoped stream instead of blocking an OS
+  scheduler thread.
+- Runtime TLS coverage now exercises deterministic invalid-acquisition and
+  unsupported-backend paths through scoped TCP streams. A test-only
+  `std/test.tls_state_probe_for_test` helper also covers closed, closing,
+  handshaking, failed, open, invalid read/write, incomplete backend dispatch,
+  backend cleanup transition, overlapping-operation `Busy`, and TLS
+  chunk-stream terminal mappings through internal runtime sessions. It also
+  checks successful synthetic connect-plus-handshake, read, write, and
+  write_all step adapters plus reactor-backed `WantRead`/`WantWrite`
+  continuations without exposing a fake `TlsSession` resource. TLS
+  cancellation-point metadata is covered by unit tests, and codegen audit now
+  pins cleanup-frame emission for owned `Bytes` locals passed into TLS writes.
 - Decide the DNS story:
   - document numeric hosts as the virtual-thread-friendly path;
   - add a bounded DNS worker pool; or
@@ -1915,8 +2038,18 @@ The highest-ROI path is:
    introduced.
 4. Design explicit resource-helper syntax before source-defined helpers are
    allowed to accept scoped resources or produce streams/cursors.
-5. Layer scoped cleanup, typed errors, and stream adapters on top of the current
-   typed nonblocking TCP handles.
+5. Use the completed TCP and TLS stream adapters as the template for
+   WebSocket/database scoped streaming. TLS chunk streams now have a `TlsError`
+   fallible-stream domain; native TLS pulls still need a backend.
+
+Recent hardening: typed file open/read/write/count result bridges now share the
+operation-result manifest with TCP, TLS, UDP, and WebSocket. The manifest is the
+source of truth for success payload ownership, error mapping, wait behavior,
+layout policy, and Core ownership contracts. File opens are explicitly
+boxed-result-only until a stack-resource acquisition ABI exists.
+Fallible-stream terminals now carry wait behavior in the same compiler-owned
+metadata family, so future file/database stream producers should extend those
+typed manifests instead of adding local codegen switches.
 
 This order keeps correctness ahead of ergonomics. It also prevents the new
 streaming API from being built on today's known unsound stream ownership and

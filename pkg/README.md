@@ -20,9 +20,9 @@ Current native packages:
 | `pkg/compress` | gzip/deflate compression via zlib |
 | `pkg/crypto` | AES-256-CBC + HMAC-SHA256 encryption and PBKDF2 key derivation |
 | `pkg/net/dns` | DNS resolution via system resolver |
-| `pkg/net/http_client` | HTTP client with optional TLS |
-| `pkg/net/smtp` | SMTP client with optional STARTTLS |
-| `pkg/net/tls` | TLS sockets via OpenSSL |
-| `pkg/net/udp` | UDP sockets |
-| `pkg/net/websocket` | WebSocket client over TCP/TLS |
+| `pkg/net/http_client` | HTTP client over scoped TCP; HTTPS targets `std/net/tls` and is pending native TLS |
+| `pkg/net/smtp` | SMTP client over scoped TCP; STARTTLS targets `std/net/tls` and is pending native TLS |
+| `pkg/net/tls` | TLS resource API placeholder; raw pointer API removed |
+| `pkg/net/udp` | UDP resource API placeholder; raw descriptor API removed |
+| `pkg/net/websocket` | WebSocket frame and handshake helpers; scoped native sessions live under `std/net/websocket` |
 | `pkg/sqlite` | SQLite bindings via sqlite3 |

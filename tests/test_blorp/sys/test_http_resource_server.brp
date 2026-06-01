@@ -1,0 +1,97 @@
+-- High-concurrency HTTP-over-TCP resource server smoke.
+--
+-- The server loop owns only scoped TcpStream resources. Request routing and
+-- response construction use ordinary net/http values, so user code does not
+-- need resource parameters or shared mutable state.
+import:
+	channel: Channel, channel, recv_timeout, send
+	net/http as HTTP: Request, Response
+	net/tcp:
+		TcpError,
+		connect,
+		connections_stop_on_error,
+		listen,
+		local_port,
+		message,
+		read_chunk,
+		set_timeout,
+		write_all,
+	string: contains
+	test: TestSuite
+
+
+pure func is_socket_permission_error(err: TcpError) -> Bool:
+	detail: String = message(err)
+	detail.contains("Operation not permitted") or detail.contains("Permission denied")
+
+
+pure func route(req: Request) -> Response:
+	HTTP.ok_text("handled " + req.path)
+
+
+func client_get(port: Int, path: String) -> Result[Bool, TcpError]:
+	with stream ?= connect("127.0.0.1", port):
+		request: Bytes = ("GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n").to_bytes()
+		ignored ?= write_all(stream, request)
+		raw ?= read_chunk(stream, 4096)
+		text: String = raw.to_string()
+		Ok(text.contains("HTTP/1.1 200 OK") and text.contains("handled " + path))
+
+
+func detached_client(port: Int, path: String, results: Channel[Bool]):
+	match client_get(port, path):
+		Ok(ok): _ = send(results, ok)
+		Err(_): _ = send(results, False)
+
+
+func launch_clients(port: Int, count: Int, results: Channel[Bool]):
+	var i: Int = 0
+	while i < count:
+		path: String = "/item-${i}"
+		detach detached_client(port, path, results)
+		i += 1
+
+
+func collect_client_results(results: Channel[Bool], count: Int) -> Bool:
+	var seen: Int = 0
+	var ok: Bool = True
+	while seen < count:
+		match recv_timeout(results, 1000):
+			Some(value):
+				ok = ok and value
+				seen += 1
+			None:
+				ok = False
+				seen = count
+	ok
+
+
+func run_resource_http_server(client_count: Int) -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 32):
+		ignored ?= set_timeout(listener, 100)
+		port ?= local_port(listener)
+		results: Channel[Bool] = channel(client_count)
+		launch_clients(port, client_count, results)
+		for peer in connections_stop_on_error(listener) concurrently(limit: 4):
+			match read_chunk(peer, 4096):
+				Ok(raw):
+					response: Response = match HTTP.parse_request(raw):
+						Ok(req): route(req)
+						Err(msg): HTTP.error_response(400, msg)
+					match write_all(peer, HTTP.format_response(response)):
+						Ok(_): void
+						Err(_): void
+				Err(_): void
+		Ok(collect_client_results(results, client_count))
+
+
+func test_concurrent_resource_http_server() -> Bool:
+	match run_resource_http_server(4):
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+tests: TestSuite = {
+	description = "HTTP resource server tests",
+	tests = [("concurrent resource HTTP server", test_concurrent_resource_http_server)]
+}

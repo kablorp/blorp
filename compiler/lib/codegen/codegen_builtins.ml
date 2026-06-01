@@ -354,16 +354,61 @@ let builtin_c_mapping =
   (* Bytes: endian ops → blorp source using bitwise ops. from_hex stays builtin *)
   @ prefixed_group N.mod_bytes "blorp_bytes_" [ "from_hex" ]
   @ blorp_prefixed N.mod_bytes [ "encode_utf8"; "decode_utf8" ]
+  (* DNS builtin -- compiler-owned operation returning ordinary copied data. *)
+  @ [ ((N.mod_dns, "resolve"), "blorp_dns_resolve_raw") ]
   (* TCP builtins -- no prelude aliases. Public std/net/tcp functions expose
      typed TcpError results, so direct builtin resolution must use the typed
      raw runtime bridge rather than the legacy boxed-string helpers. *)
   @ [
       ((N.mod_tcp, "listen"), "blorp_tcp_listen_raw");
+      ((N.mod_tcp, "listen_numeric"), "blorp_tcp_listen_numeric_raw");
       ((N.mod_tcp, "accept"), "blorp_tcp_accept_raw");
       ((N.mod_tcp, "connect"), "blorp_tcp_connect_raw");
+      ((N.mod_tcp, "connect_numeric"), "blorp_tcp_connect_numeric_raw");
       ((N.mod_tcp, "read"), "blorp_tcp_read_raw");
+      ((N.mod_tcp, "chunks"), "blorp_tcp_chunks_raw");
+      ((N.mod_tcp, "lines"), "blorp_tcp_lines_raw");
       ((N.mod_tcp, "write"), "blorp_tcp_write_raw");
       ((N.mod_tcp, "set_reuse_addr"), "blorp_tcp_set_reuse_addr_raw");
+    ]
+  (* TLS builtins -- scoped dependent resource operations over TCP. The first
+     runtime slice reports typed unsupported errors without exposing raw native
+     pointers or manual close. *)
+  @ [
+      ((N.mod_tls, "native_available"), "blorp_tls_native_available_raw");
+      ((N.mod_tls, "connect"), "blorp_tls_connect_raw");
+      ((N.mod_tls, "read_chunk"), "blorp_tls_read_raw");
+      ((N.mod_tls, "read"), "blorp_tls_read_raw");
+      ((N.mod_tls, "chunks"), "blorp_tls_chunks_raw");
+      ((N.mod_tls, "write"), "blorp_tls_write_raw");
+      ((N.mod_tls, "write_all"), "blorp_tls_write_all_raw");
+    ]
+  (* UDP builtins -- no prelude aliases. These are scoped resource operations
+     and intentionally expose only the typed raw Result ABI. *)
+  @ [
+      ((N.mod_udp, "socket"), "blorp_udp_socket_raw");
+      ((N.mod_udp, "bind"), "blorp_udp_bind_raw");
+      ((N.mod_udp, "bind_numeric"), "blorp_udp_bind_numeric_raw");
+      ((N.mod_udp, "send_to"), "blorp_udp_send_to_raw");
+      ((N.mod_udp, "send_to_numeric"), "blorp_udp_send_to_numeric_raw");
+      ((N.mod_udp, "send_to_wait"), "blorp_udp_send_to_wait_raw");
+      ((N.mod_udp, "send_to_wait_numeric"), "blorp_udp_send_to_wait_numeric_raw");
+      ((N.mod_udp, "recv_from"), "blorp_udp_recv_from_raw");
+      ((N.mod_udp, "datagrams"), "blorp_udp_datagrams_raw");
+      ((N.mod_udp, "local_port"), "blorp_udp_local_port_raw");
+    ]
+  (* WebSocket builtins -- first scoped resource surface. Protocol operations
+     remain unsupported until a runtime session implementation lands. *)
+  @ [
+      ( (N.mod_websocket, "native_available"),
+        "blorp_websocket_native_available_raw" );
+      ((N.mod_websocket, "connect"), "blorp_websocket_connect_raw");
+      ((N.mod_websocket, "receive"), "blorp_websocket_receive_raw");
+      ((N.mod_websocket, "send_text"), "blorp_websocket_send_text_raw");
+      ((N.mod_websocket, "send_binary"), "blorp_websocket_send_binary_raw");
+      ((N.mod_websocket, "send_ping"), "blorp_websocket_send_ping_raw");
+      ((N.mod_websocket, "send_pong"), "blorp_websocket_send_pong_raw");
+      ((N.mod_websocket, "send_close"), "blorp_websocket_send_close_raw");
     ]
   @
   (* StringSlice builtins — all moved to IR intrinsics *)

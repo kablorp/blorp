@@ -513,12 +513,67 @@ let compile_c_from_stdin c_code bin_file extra_args =
   let _, status = waitpid_retry [] pid in
   (exit_code_of_status status, output)
 
+type tls_backend_profile = TlsUnsupported | TlsOpenSsl
+
 type precompiled = {
   runtime_obj : string;  (** Compiled runtime.o *)
   header_file : string;  (** Runtime declarations for -include *)
   pch_file : string option;  (** Optional precompiled header path. *)
+  tls_backend : tls_backend_profile;
+      (** TLS backend profile used to compile [runtime_obj]. *)
 }
 (** Precompiled artifacts for test runs *)
+
+let tls_backend_profile_to_string = function
+  | TlsUnsupported -> "unsupported"
+  | TlsOpenSsl -> "openssl"
+
+let tls_backend_profile_of_string value =
+  match String.lowercase_ascii (String.trim value) with
+  | "" | "unsupported" -> Ok TlsUnsupported
+  | "openssl" -> Ok TlsOpenSsl
+  | other ->
+      Error
+        (Printf.sprintf
+           "Invalid BLORP_TLS_BACKEND=%S. Expected 'unsupported' or 'openssl'."
+           other)
+
+let configured_tls_backend_profile () =
+  match Sys.getenv_opt "BLORP_TLS_BACKEND" with
+  | None -> Ok TlsUnsupported
+  | Some value -> tls_backend_profile_of_string value
+
+let current_tls_backend_profile () =
+  match configured_tls_backend_profile () with
+  | Ok profile -> profile
+  | Error msg -> invalid_arg msg
+
+let split_cc_arg_string value =
+  value |> String.split_on_char ' ' |> List.map String.trim
+  |> List.filter (fun part -> part <> "")
+
+let openssl_pkg_config_args flag =
+  let code, output = run_process_capture "pkg-config" [ flag; "openssl" ] in
+  if code = 0 then split_cc_arg_string output else []
+
+let openssl_cflags () =
+  match Sys.getenv_opt "BLORP_OPENSSL_CFLAGS" with
+  | Some value -> split_cc_arg_string value
+  | None -> openssl_pkg_config_args "--cflags"
+
+let openssl_libs () =
+  match Sys.getenv_opt "BLORP_OPENSSL_LIBS" with
+  | Some value -> split_cc_arg_string value
+  | None -> openssl_pkg_config_args "--libs"
+
+let tls_backend_runtime_cc_args = function
+  | TlsUnsupported -> []
+  | TlsOpenSsl ->
+      [ "-DBLORP_TLS_BACKEND_PROFILE_OPENSSL=1" ] @ openssl_cflags ()
+
+let tls_backend_link_cc_args = function
+  | TlsUnsupported -> []
+  | TlsOpenSsl -> openssl_libs ()
 
 (** Persistent cache directory for precompiled artifacts *)
 let cache_dir () =
@@ -622,26 +677,29 @@ let compiler_hash =
         cached := Some h;
         h
 
-let runtime_cache_key ~sanitize ~opt =
+let runtime_cache_key ~sanitize ~opt ~tls_backend =
   Digest.to_hex
     (Digest.string
        (String.concat "\000"
           [
-            "runtime-cache-v5";
+            "runtime-cache-v6";
             runtime_hash ();
             compiler_hash ();
             opt;
             string_of_bool sanitize;
+            tls_backend_profile_to_string tls_backend;
             Sys.os_type;
             Lazy.force cc_identity;
             String.concat " " sanitize_cc_args;
+            String.concat " " (tls_backend_runtime_cc_args tls_backend);
           ]))
 
-let runtime_manifest ~key ~obj_path ~h_path =
+let runtime_manifest ~key ~obj_path ~h_path ~tls_backend =
   String.concat "\n"
     [
       "runtime-cache-manifest-v1";
       "key=" ^ key;
+      "tls_backend=" ^ tls_backend_profile_to_string tls_backend;
       "runtime.o=" ^ file_content_hash obj_path;
       "runtime.h=" ^ file_content_hash h_path;
       "";
@@ -650,26 +708,27 @@ let runtime_manifest ~key ~obj_path ~h_path =
 let runtime_obj_path dir = Filename.concat dir "runtime.o"
 let runtime_header_path dir = Filename.concat dir "runtime.h"
 
-let write_runtime_manifest ~key ~obj_path ~h_path dir =
+let write_runtime_manifest ~key ~obj_path ~h_path ~tls_backend dir =
   let path = cache_manifest_path dir in
   let oc = open_out path in
   Fun.protect
     ~finally:(fun () -> close_out oc)
-    (fun () -> output_string oc (runtime_manifest ~key ~obj_path ~h_path))
+    (fun () ->
+      output_string oc (runtime_manifest ~key ~obj_path ~h_path ~tls_backend))
 
-let runtime_cache_verified ~key dir =
+let runtime_cache_verified ~key ~tls_backend dir =
   let obj_path = runtime_obj_path dir in
   let h_path = runtime_header_path dir in
   cache_dir_ready dir && Sys.file_exists obj_path && Sys.file_exists h_path
   &&
     try
       read_file (cache_manifest_path dir)
-      = runtime_manifest ~key ~obj_path ~h_path
+      = runtime_manifest ~key ~obj_path ~h_path ~tls_backend
     with _ -> false
 
 (** Compile runtime artifacts to the given paths (no caching logic here) *)
-let compile_runtime_artifacts ?(sanitize = false) ?(opt = "O0") obj_path
-    _pch_path h_path =
+let compile_runtime_artifacts ?(sanitize = false) ?(opt = "O0")
+    ?(tls_backend = TlsUnsupported) obj_path _pch_path h_path =
   let runtime_c =
     run_artifact_path ~kind:"runtime-src" ~prefix:"runtime" ~suffix:".c"
   in
@@ -693,6 +752,7 @@ let compile_runtime_artifacts ?(sanitize = false) ?(opt = "O0") obj_path
           runtime_c;
           "-lpthread";
         ]
+        @ tls_backend_runtime_cc_args tls_backend
         @ if sanitize then sanitize_cc_args else []
       in
       let result, _output = run_process_capture "cc" cc_args in
@@ -704,18 +764,31 @@ let compile_runtime_artifacts ?(sanitize = false) ?(opt = "O0") obj_path
         (* PCH artifacts embed the header path in at least Clang, so moving them
          from a staging directory into CAS corrupts the cache. Keep runtime
          caching immutable by caching runtime.o + header only. *)
-        Some { runtime_obj = obj_path; header_file = h_path; pch_file = None }
+        Some
+          {
+            runtime_obj = obj_path;
+            header_file = h_path;
+            pch_file = None;
+            tls_backend;
+          }
       end
       else None)
 
 let precompile_runtime ?(sanitize = false) ?(opt = "O0") () =
-  let key = runtime_cache_key ~sanitize ~opt in
+  let tls_backend = current_tls_backend_profile () in
+  let key = runtime_cache_key ~sanitize ~opt ~tls_backend in
   let dir = cache_object_dir ~kind:"runtime" key in
   let obj_path = runtime_obj_path dir in
   let h_path = runtime_header_path dir in
   let check_cached () =
-    if runtime_cache_verified ~key dir then
-      Some { runtime_obj = obj_path; header_file = h_path; pch_file = None }
+    if runtime_cache_verified ~key ~tls_backend dir then
+      Some
+        {
+          runtime_obj = obj_path;
+          header_file = h_path;
+          pch_file = None;
+          tls_backend;
+        }
     else None
   in
   match check_cached () with
@@ -727,7 +800,7 @@ let precompile_runtime ?(sanitize = false) ?(opt = "O0") () =
       let stage_obj = runtime_obj_path stage_dir in
       let stage_h = runtime_header_path stage_dir in
       match
-        compile_runtime_artifacts ~sanitize ~opt stage_obj
+        compile_runtime_artifacts ~sanitize ~opt ~tls_backend stage_obj
           (Filename.concat stage_dir "runtime.h.pch")
           stage_h
       with
@@ -736,11 +809,11 @@ let precompile_runtime ?(sanitize = false) ?(opt = "O0") () =
           None
       | Some _ ->
           write_runtime_manifest ~key ~obj_path:stage_obj ~h_path:stage_h
-            stage_dir;
+            ~tls_backend stage_dir;
           write_ready_marker stage_dir;
           ignore
             (publish_verified_cache_dir ~kind:"runtime" ~key stage_dir
-               ~is_ready:(runtime_cache_verified ~key));
+               ~is_ready:(runtime_cache_verified ~key ~tls_backend));
           check_cached ())
 
 (** Check if raylib was imported (must be called after Pipeline.compile) *)
@@ -1748,6 +1821,39 @@ let remap_compiler_error (table : loc_remap_table) (e : Ast.compiler_error) :
     Ast.compiler_error =
   { e with loc = remap_loc table e.loc }
 
+let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
+    ~link_flags () =
+  let raylib_flags =
+    if has_raylib_import () then raylib_linker_flags () else ""
+  in
+  let header_args =
+    match precompiled with
+    | Some p -> [ "-include"; p.header_file ]
+    | None -> []
+  in
+  let runtime_obj_args =
+    match precompiled with Some p -> [ p.runtime_obj ] | None -> []
+  in
+  let tls_backend =
+    match precompiled with
+    | Some p -> p.tls_backend
+    | None -> current_tls_backend_profile ()
+  in
+  let runtime_feature_args =
+    if Option.is_none precompiled then tls_backend_runtime_cc_args tls_backend
+    else []
+  in
+  [ "-O0"; "-fwrapv"; "-pipe" ]
+  @ (if sanitize then [] else [ "-w" ])
+  @ runtime_feature_args
+  @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
+  @ header_args @ runtime_obj_args @ [ "-lm"; "-lpthread" ]
+  @ (if sanitize then sanitize_cc_args else [])
+  @ tls_backend_link_cc_args tls_backend
+  @ (if raylib_flags = "" then []
+     else String.split_on_char ' ' (String.trim raylib_flags))
+  @ Ffi_boundary.link_flags_cc_args link_flags
+
 let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
     ?(leak_check = false) ?loc_remap ?module_base_dir ~timeout filename =
   let start_time = get_time () in
@@ -1839,26 +1945,9 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
         Fun.protect
           ~finally:(fun () -> try Sys.remove bin_file with _ -> ())
           (fun () ->
-            let raylib_flags =
-              if has_raylib_import () then raylib_linker_flags () else ""
-            in
-            let header_args =
-              match precompiled with
-              | Some p -> [ "-include"; p.header_file ]
-              | None -> []
-            in
-            let runtime_obj_args =
-              match precompiled with Some p -> [ p.runtime_obj ] | None -> []
-            in
             let cc_args =
-              [ "-O0"; "-fwrapv"; "-pipe" ]
-              @ (if sanitize then [] else [ "-w" ])
-              @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
-              @ header_args @ runtime_obj_args @ [ "-lm"; "-lpthread" ]
-              @ (if sanitize then sanitize_cc_args else [])
-              @ (if raylib_flags = "" then []
-                 else String.split_on_char ' ' (String.trim raylib_flags))
-              @ Ffi_boundary.link_flags_cc_args link_flags
+              cc_args_for_test_binary ?precompiled ~include_dirs ~sanitize
+                ~link_flags ()
             in
             let cc_result, cc_output =
               compile_c_from_stdin c_code bin_file cc_args
@@ -2037,28 +2126,6 @@ let print_test_start ?worker file =
   match worker with
   | Some id -> Printf.eprintf "RUN[%d]: %s\n%!" id file
   | None -> Printf.eprintf "RUN: %s\n%!" file
-
-let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
-    ~link_flags () =
-  let raylib_flags =
-    if has_raylib_import () then raylib_linker_flags () else ""
-  in
-  let header_args =
-    match precompiled with
-    | Some p -> [ "-include"; p.header_file ]
-    | None -> []
-  in
-  let runtime_obj_args =
-    match precompiled with Some p -> [ p.runtime_obj ] | None -> []
-  in
-  [ "-O0"; "-fwrapv"; "-pipe" ]
-  @ (if sanitize then [] else [ "-w" ])
-  @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
-  @ header_args @ runtime_obj_args @ [ "-lm"; "-lpthread" ]
-  @ (if sanitize then sanitize_cc_args else [])
-  @ (if raylib_flags = "" then []
-     else String.split_on_char ' ' (String.trim raylib_flags))
-  @ Ffi_boundary.link_flags_cc_args link_flags
 
 let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
     ?precompiled ?(leak_check = false) files =

@@ -570,7 +570,7 @@ let list_result_elem_needs_release ~reg ~loc ~context ty =
 
 let stream_elem_type ~loc ~context ty =
   match normalize_type ty with
-  | Ast.TyNamed (name, [ elem ]) when type_name_is "Stream" name ->
+  | Ast.TyNamed (name, [ elem ]) when Type_name_metadata.is_stream_name name ->
       normalize_type elem
   | _ ->
       Core_error.errorf (Core_error.Stage Core_stage.Specialize) loc
@@ -1226,7 +1226,7 @@ let channel_recv_builtin_for_option_layout ~reg base ty =
 
 let stream_filter_map_builtin_for_option_layout ~reg base ty =
   match Core_layout_type.canonical_type ~reg ty with
-  | Ast.TyNamed ("Stream", [ elem ]) ->
+  | Ast.TyNamed (name, [ elem ]) when Type_name_metadata.is_stream_name name ->
       option_payload_runtime_builtin ~reg elem
         ~primitive:(Printf.sprintf "%s_%s" base)
         ~nullable:(base ^ "_nullable")
@@ -2598,8 +2598,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
       in
       if is_pointer_type ~reg e.ty then { e with desc = CCast (raw, e.ty) }
       else { e with desc = CUnbox (raw, e.ty) }
-  | CCall (CKBuiltin ("blorp_fallible_stream_fold_file_raw" as c), callee, args)
-    ->
+  | CCall (CKBuiltin ("blorp_fallible_stream_fold_raw" as c), callee, args) ->
       let mk_int n =
         {
           desc = CLit (Ast.LitInt (Int64.of_int n));
@@ -2618,8 +2617,7 @@ let rec specialize_expr ?(env = empty_specialize_env) ~reg (e : core) : core =
         e with
         desc = CCall (CKBuiltin c, callee, args @ [ mk_int acc_needs_release ]);
       }
-  | CCall (CKBuiltin ("blorp_fallible_stream_find_file_raw" as c), callee, args)
-    ->
+  | CCall (CKBuiltin ("blorp_fallible_stream_find_raw" as c), callee, args) ->
       let c =
         fallible_stream_find_builtin_for_result_option_layout ~reg ~loc:e.loc c
           e.ty

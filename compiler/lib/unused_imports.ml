@@ -362,6 +362,14 @@ let rec scan_expr scope refs expr =
           (scan_expr scope refs binding.with_value)
           binding.with_type
       in
+      let refs =
+        match binding.with_error_map with
+        | None -> refs
+        | Some mapper ->
+            scan_expr
+              (add_term_binding mapper.with_error_name scope)
+              refs mapper.with_error_value
+      in
       scan_expr (add_term_binding binding.with_name scope) refs body
   | EDebugBlock exprs | EConcurrent (exprs, None, _) ->
       scan_block scope refs exprs

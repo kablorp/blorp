@@ -1,0 +1,219 @@
+-- UDP Networking - scoped socket resources.
+--
+-- UdpSocket is an external capability. Acquire it with
+-- `with sock ?= socket():` so the compiler installs deterministic cleanup.
+-- UDP supports binding, sending datagrams, receiving one datagram, streaming
+-- received datagrams, numeric no-DNS helpers, and querying the local port.
+import:
+	stream: FallibleStream
+
+
+---
+Opaque resource for a UDP socket.
+---
+resource type UdpSocket = builtin("blorp_udp_close_socket")
+
+
+---
+Private finalizer trait implemented by scoped UDP resources.
+
+`with` blocks use compiler-owned cleanup builtins directly. This trait keeps the
+runtime finalizer documented inside the module without exporting a manual
+`close` operation that could conflict with scoped cleanup ownership.
+---
+private trait UdpClosable:
+	func close(handle: Self) -> Void
+
+
+implements UdpClosable for UdpSocket:
+	func close(socket: UdpSocket) -> Void:
+		builtin("blorp_udp_close_socket")
+
+
+---
+Typed error surface for UDP APIs.
+---
+union UdpError:
+	InvalidInput(String)
+	TimedOut(String)
+	Closed(String)
+	Busy(String)
+	Dns(String)
+	Interrupted(String)
+	Unsupported(String)
+	Other(String)
+
+
+---
+Return a stable, human-readable description of a UDP error.
+
+doctests:
+    :: Invalid input includes detail
+    message(InvalidInput("bad port")) == "invalid input: bad port"
+
+    :: Runtime compatibility errors preserve detail
+    message(Other("udp send_to: network unreachable")) == "udp error: udp send_to: network unreachable"
+---
+pure func message(err: UdpError) -> String:
+	match err:
+		InvalidInput(detail): "invalid input: " + detail
+		TimedOut(detail): "timed out: " + detail
+		Closed(detail): "closed: " + detail
+		Busy(detail): "busy: " + detail
+		Dns(detail): "dns error: " + detail
+		Interrupted(detail): "interrupted: " + detail
+		Unsupported(detail): "unsupported: " + detail
+		Other(detail): "udp error: " + detail
+
+
+implements Stringable for UdpError:
+	pure func to_string(err: UdpError) -> String:
+		message(err)
+
+
+---
+Ordinary received UDP datagram data.
+
+`data` contains the bytes received. `host` and `port` describe the sender using
+numeric address text from the OS; no reverse DNS is performed.
+---
+record Datagram {
+	data: Bytes,
+	host: String,
+	port: Int
+}
+
+
+---
+Create an unbound UDP socket.
+
+Use with `with sock ?= socket():` so the socket is closed automatically when the
+block exits.
+---
+func socket() -> Result[UdpSocket, UdpError]:
+	builtin("blorp_udp_socket_raw")
+
+
+---
+Bind a scoped UDP socket to host:port.
+
+Use "" to bind to the platform's passive any-host address without DNS. Numeric
+hosts avoid resolver work. Passing port 0 asks the OS to choose an ephemeral
+port.
+---
+@resource_result_ordinary
+func bind(socket: UdpSocket, host: String, port: Int) -> Result[Void, UdpError]:
+	builtin("blorp_udp_bind_raw")
+
+
+---
+Bind a scoped UDP socket to a numeric IPv4 host:port.
+
+Use "" to bind to the platform's passive any-host address. Hostnames are
+rejected before resolver APIs are reached, so this is the enforceable no-DNS
+binding path.
+---
+@resource_result_ordinary
+func bind_numeric(socket: UdpSocket, host: String, port: Int) -> Result[Void, UdpError]:
+	builtin("blorp_udp_bind_numeric_raw")
+
+
+---
+Send a datagram to host:port from a scoped UDP socket.
+
+The payload is ordinary `Bytes` data and is not retained after the call returns.
+This operation performs a nonblocking one-shot send and reports `Busy` if the
+socket would block.
+---
+@resource_result_ordinary
+func send_to(
+	socket: UdpSocket,
+	data: Bytes,
+	host: String,
+	port: Int,
+) -> Result[Int, UdpError]:
+	builtin("blorp_udp_send_to_raw")
+
+
+---
+Send a datagram to a numeric IPv4 host:port from a scoped UDP socket.
+
+Hostnames are rejected before resolver APIs are reached. This operation keeps
+the same one-shot nonblocking behavior as `send_to`.
+---
+@resource_result_ordinary
+func send_to_numeric(
+	socket: UdpSocket,
+	data: Bytes,
+	host: String,
+	port: Int,
+) -> Result[Int, UdpError]:
+	builtin("blorp_udp_send_to_numeric_raw")
+
+
+---
+Send a datagram to host:port, parking the current virtual thread if needed.
+
+UDP datagram sends are atomic at the OS boundary: this returns the number of
+bytes accepted for one datagram or a typed error. If the socket would block,
+the current virtual thread parks until the socket is writable, without blocking
+an OS thread. Concurrent parked sends on the same socket are rejected as `Busy`
+rather than sharing mutable socket state implicitly.
+---
+@resource_result_ordinary
+func send_to_wait(
+	socket: UdpSocket,
+	data: Bytes,
+	host: String,
+	port: Int,
+) -> Result[Int, UdpError]:
+	builtin("blorp_udp_send_to_wait_raw")
+
+
+---
+Send a datagram to a numeric IPv4 host:port, parking the current virtual thread
+if needed.
+
+Hostnames are rejected before resolver APIs are reached. Concurrent parked sends
+on the same socket are rejected as `Busy`.
+---
+@resource_result_ordinary
+func send_to_wait_numeric(
+	socket: UdpSocket,
+	data: Bytes,
+	host: String,
+	port: Int,
+) -> Result[Int, UdpError]:
+	builtin("blorp_udp_send_to_wait_numeric_raw")
+
+
+---
+Receive one datagram from a scoped UDP socket.
+
+The socket must be bound before receiving. The call parks the current virtual
+thread when no datagram is available, without blocking an OS thread. Passing a
+non-positive size or a size larger than 65535 returns `Err(InvalidInput(...))`.
+---
+@resource_result_ordinary
+func recv_from(socket: UdpSocket, max_bytes: Int) -> Result[Datagram, UdpError]:
+	builtin("blorp_udp_recv_from_raw")
+
+
+---
+Create a fallible stream of datagrams from a scoped UDP socket.
+
+The stream never ends normally; it yields received datagrams until the socket
+reports an error or the surrounding operation is cancelled. Use terminal
+operations such as `find_result` or `any_result` when the consumer has a
+bounded stopping condition.
+---
+func datagrams(socket: UdpSocket, max_bytes: Int) -> FallibleStream[Datagram, UdpError]:
+	builtin("blorp_udp_datagrams_raw")
+
+
+---
+Return the local port for a scoped UDP socket.
+---
+@resource_result_ordinary
+func local_port(socket: UdpSocket) -> Result[Int, UdpError]:
+	builtin("blorp_udp_local_port_raw")

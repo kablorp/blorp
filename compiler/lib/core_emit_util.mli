@@ -201,10 +201,22 @@ val release_value_call :
   Core_emit_context.t -> Ast.type_expr -> string -> string
 (** Render the type-aware release call for a C value expression. *)
 
+val is_stack_result_type : Core_emit_context.t -> Ast.type_expr -> bool
+(** Is this type represented as a stack [Result] value in generated C? *)
+
 val cancellation_cleanup_release_fn :
   Core_emit_context.t -> Ast.type_expr -> string option
 (** Runtime cleanup callback for a cancellable owned local of this type, if the
     value can be safely stored in a cancellation-cleanup frame. *)
+
+val cancellation_cleanup_value_arg :
+  Core_emit_context.t ->
+  Ast.type_expr ->
+  slot_c:string ->
+  value_c:string ->
+  string
+(** Render the cleanup-frame value argument for [ty]. Pointer values are stored
+    directly; stack values are stored by address through their cleanup slot. *)
 
 val boxed_value_needs_release :
   Core_emit_context.t -> Ast.type_expr -> Ast.loc -> bool

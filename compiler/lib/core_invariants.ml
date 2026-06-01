@@ -1229,23 +1229,39 @@ let check_no_resource_capture_metadata_at (stage : Core_stage.t)
          capture.Core.task_capture_name
          (Types.type_to_string capture.Core.task_capture_ty))
   in
-  let check_task_captures loc ~context task acc =
+  let check_task_captures ?allowed_resource_move loc ~context task acc =
     let acc =
       List.fold_left
         (fun acc capture ->
           match capture.Core.task_capture_kind with
           | Core.TaskCopyCapture -> acc
-          | Core.TaskMoveResourceItem | Core.TaskStructuredTaskBorrow ->
+          | Core.TaskMoveResourceItem -> (
+              match allowed_resource_move with
+              | Some (name, ty)
+                when capture.Core.task_capture_name = name
+                     && invariant_types_equal ~reg capture.Core.task_capture_ty
+                          ty ->
+                  acc
+              | _ ->
+                  unsupported_task_capture_violation loc ~context capture :: acc
+              )
+          | Core.TaskStructuredTaskBorrow ->
               unsupported_task_capture_violation loc ~context capture :: acc)
         acc task.Core.tc_captures
     in
-    check_captures loc ~context
-      (Core.task_capture_bindings task.Core.tc_captures)
-      acc
+    let copy_capture_bindings =
+      task.Core.tc_captures
+      |> List.filter_map (fun capture ->
+          match capture.Core.task_capture_kind with
+          | Core.TaskCopyCapture -> Some (Core.task_capture_binding capture)
+          | Core.TaskMoveResourceItem | Core.TaskStructuredTaskBorrow -> None)
+    in
+    check_captures loc ~context copy_capture_bindings acc
   in
-  let check_task loc ~context task_opt acc =
+  let check_task ?allowed_resource_move loc ~context task_opt acc =
     match task_opt with
-    | Some task -> check_task_captures loc ~context task acc
+    | Some task ->
+        check_task_captures ?allowed_resource_move loc ~context task acc
     | None -> acc
   in
   let check_func acc (f : Core.core_func) =
@@ -1254,7 +1270,12 @@ let check_no_resource_capture_metadata_at (stage : Core_stage.t)
         let loc =
           match f.cf_body with Some body -> body.loc | None -> Ast.dummy_loc
         in
-        check_captures loc ~context:"closure ABI" abi.ca_captures acc
+        let copied_captures =
+          List.filter
+            (fun (name, _) -> not (List.mem name abi.ca_moved_captures))
+            abi.ca_captures
+        in
+        check_captures loc ~context:"closure ABI" copied_captures acc
     | Core.CFUser | Core.CFBuiltin | Core.CFForeign _ -> acc
   in
   let rec visit_decl acc (d : Core.core_decl) =
@@ -1279,8 +1300,14 @@ let check_no_resource_capture_metadata_at (stage : Core_stage.t)
                 b.cb_task acc)
             acc block.conc_bindings
       | Core.CConcurrentlyLoop cf ->
-          check_task cf.cf_body.loc ~context:"for ... concurrently task"
-            cf.cf_task acc
+          let allowed_resource_move =
+            match cf.cf_item_mode with
+            | Core.ConcurrentlyLoopMoveResourceItem { clmi_resource_ty; _ } ->
+                Some (cf.cf_var.Core.vname, clmi_resource_ty)
+            | Core.ConcurrentlyLoopCopyItem -> None
+          in
+          check_task ?allowed_resource_move cf.cf_body.loc
+            ~context:"for ... concurrently task" cf.cf_task acc
       | Core.CDetach detach ->
           check_task detach.detach_body.loc ~context:"detach task"
             detach.detach_task acc
@@ -1446,18 +1473,51 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
           check_max_threads "concurrent block" e.loc block.conc_max_threads acc
       | Core.CConcurrentlyLoop cf ->
           let acc =
-            match invariant_normalize_type ~reg cf.cf_iter.ty with
-            | Ast.TyNamed ("List", [ _ ]) -> acc
-            | _ ->
+            match
+              (cf.cf_item_mode, invariant_normalize_type ~reg cf.cf_iter.ty)
+            with
+            | Core.ConcurrentlyLoopCopyItem, Ast.TyNamed ("List", [ _ ]) -> acc
+            | ( Core.ConcurrentlyLoopMoveResourceItem
+                  { clmi_resource_ty; clmi_error_ty },
+                Ast.TyNamed (name, [ resource_ty; error_ty ]) )
+              when Type_name_metadata.is_resource_source_name name
+                   && invariant_types_equal ~reg resource_ty clmi_resource_ty
+                   && invariant_types_equal ~reg error_ty clmi_error_ty ->
+                acc
+            | Core.ConcurrentlyLoopCopyItem, _ ->
                 violation_at stage cf.cf_iter.loc
                   ~hint:
-                    "for ... concurrently is currently list-only in Core. Add \
-                     an explicit representation-aware Core form before \
-                     accepting other collection layouts."
+                    "List fan-out must use copy-item mode. Resource-source \
+                     fan-out must use move-resource-item mode."
                   (Printf.sprintf
-                     "for ... concurrently requires List[T], got `%s`"
+                     "copy-item for ... concurrently requires List[T], got `%s`"
                      (Types.type_to_string cf.cf_iter.ty))
                 :: acc
+            | Core.ConcurrentlyLoopMoveResourceItem _, _ ->
+                violation_at stage cf.cf_iter.loc
+                  ~hint:
+                    "Resource-source fan-out must keep the source type and \
+                     moved item metadata in sync."
+                  (Printf.sprintf
+                     "move-resource for ... concurrently requires \
+                      ResourceSource[R, E], got `%s`"
+                     (Types.type_to_string cf.cf_iter.ty))
+                :: acc
+          in
+          let acc =
+            match (cf.cf_item_mode, cf.cf_output) with
+            | ( Core.ConcurrentlyLoopMoveResourceItem _,
+                Core.ConcurrentlyLoopCollect ) ->
+                violation_at stage e.loc
+                  ~hint:
+                    "Resource-source fan-out is statement-only until result \
+                     collection has an explicit ownership story."
+                  "resource-source for ... concurrently cannot collect results"
+                :: acc
+            | Core.ConcurrentlyLoopCopyItem, _
+            | ( Core.ConcurrentlyLoopMoveResourceItem _,
+                Core.ConcurrentlyLoopDiscard ) ->
+                acc
           in
           let expected_result =
             match cf.cf_output with

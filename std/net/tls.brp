@@ -1,0 +1,176 @@
+-- TLS Networking - scoped dependent TLS session resources.
+--
+-- TlsSession is an external capability acquired inside an existing scoped
+-- TcpStream. The portable default runtime reports typed Unsupported errors;
+-- runtimes built with the OpenSSL backend profile provide native TLS.
+import:
+	net/tcp: TcpStream
+	stream: FallibleStream
+
+
+---
+Opaque resource for a TLS session layered over a scoped TCP stream.
+---
+resource type TlsSession = builtin("blorp_tls_close_session")
+
+
+---
+Private finalizer trait implemented by scoped TLS resources.
+
+`with` blocks use compiler-owned cleanup builtins directly. This trait keeps
+the runtime finalizer documented inside the module without exporting a manual
+`close` operation that could conflict with scoped cleanup ownership.
+---
+private trait TlsClosable:
+	func close(handle: Self) -> Void
+
+
+implements TlsClosable for TlsSession:
+	func close(session: TlsSession) -> Void:
+		builtin("blorp_tls_close_session")
+
+
+---
+Typed error surface for TLS APIs.
+
+The portable default backend reports `Unsupported`. Native TLS backends report
+typed input, transport, certificate, protocol, timeout, closed, busy, and other
+failures through this same surface. Transport failures are string details for
+now; a future operation-result bridge can carry nested `TcpError` values once
+nested error payloads are represented explicitly in compiler metadata.
+---
+union TlsError:
+	InvalidInput(String)
+	HandshakeFailed(String)
+	Transport(String)
+	Certificate(String)
+	Protocol(String)
+	TimedOut(String)
+	Closed(String)
+	Busy(String)
+	Unsupported(String)
+	Other(String)
+
+
+---
+Return a stable, human-readable description of a TLS error.
+
+doctests:
+    :: Unsupported includes detail
+    message(Unsupported("native TLS not built")) == "unsupported: native TLS not built"
+
+    :: Transport includes detail
+    message(Transport("tcp reset")) == "transport error: tcp reset"
+---
+pure func message(err: TlsError) -> String:
+	match err:
+		InvalidInput(detail): "invalid input: " + detail
+		HandshakeFailed(detail): "handshake failed: " + detail
+		Transport(detail): "transport error: " + detail
+		Certificate(detail): "certificate error: " + detail
+		Protocol(detail): "protocol error: " + detail
+		TimedOut(detail): "timed out: " + detail
+		Closed(detail): "closed: " + detail
+		Busy(detail): "busy: " + detail
+		Unsupported(detail): "unsupported: " + detail
+		Other(detail): "tls error: " + detail
+
+
+implements Stringable for TlsError:
+	pure func to_string(err: TlsError) -> String:
+		message(err)
+
+
+---
+Return True when this runtime has an implemented native TLS backend.
+
+The portable default backend returns False. A runtime built with
+`BLORP_TLS_BACKEND=openssl` returns True when OpenSSL was available at compile
+and link time. Use this for high-level helpers that should report deterministic
+TLS unsupported errors before opening a transport.
+---
+func native_available() -> Bool:
+	builtin("blorp_tls_native_available_raw")
+
+
+---
+Return True when a TLS error is a timeout.
+
+doctests:
+    :: TimedOut is recognized
+    is_timed_out(TimedOut("handshake")) == True
+
+    :: Unsupported is not a timeout
+    is_timed_out(Unsupported("not built")) == False
+---
+pure func is_timed_out(err: TlsError) -> Bool:
+	match err:
+		TimedOut(_): True
+		_: False
+
+
+---
+Begin a TLS client session over an existing scoped TCP stream.
+
+The returned `TlsSession` is a dependent resource. It must be acquired inside
+the parent TCP stream's `with` scope so TLS cleanup runs before TCP cleanup.
+The portable default backend returns `Err(Unsupported(...))`; native backends
+perform a nonblocking TLS client handshake before exposing the session.
+---
+func connect(stream: TcpStream, server_name: String) -> Result[TlsSession, TlsError]:
+	builtin("blorp_tls_connect_raw")
+
+
+---
+Read up to `max_bytes` decrypted bytes from a TLS session.
+
+The portable default backend returns `Err(Unsupported(...))`; native backends
+park the current virtual thread on transport readiness when the TLS engine
+needs more socket I/O.
+---
+@resource_result_ordinary
+func read_chunk(session: TlsSession, max_bytes: Int) -> Result[Bytes, TlsError]:
+	builtin("blorp_tls_read_raw")
+
+
+---
+Alias for `read_chunk`.
+---
+@resource_result_ordinary
+func read(session: TlsSession, max_bytes: Int) -> Result[Bytes, TlsError]:
+	builtin("blorp_tls_read_raw")
+
+
+---
+Create a fallible stream of decrypted byte chunks from a scoped TLS session.
+
+Each pull reads up to `max_bytes` decrypted bytes. An empty read ends the stream
+normally; handshake, protocol, transport, timeout, and cancellation-adjacent
+failures are reported through terminal operations as `Result[..., TlsError]`.
+The portable default backend returns `Err(Unsupported(...))` from terminal
+operations.
+---
+func chunks(session: TlsSession, max_bytes: Int) -> FallibleStream[Bytes, TlsError]:
+	builtin("blorp_tls_chunks_raw")
+
+
+---
+Write encrypted bytes to a TLS session.
+
+The portable default backend returns `Err(Unsupported(...))`; native backends
+may write fewer bytes than requested.
+---
+@resource_result_ordinary
+func write(session: TlsSession, data: Bytes) -> Result[Int, TlsError]:
+	builtin("blorp_tls_write_raw")
+
+
+---
+Write all encrypted bytes to a TLS session.
+
+The portable default backend returns `Err(Unsupported(...))`; native backends
+loop until all bytes are written or a typed error occurs.
+---
+@resource_result_ordinary
+func write_all(session: TlsSession, data: Bytes) -> Result[Void, TlsError]:
+	builtin("blorp_tls_write_all_raw")

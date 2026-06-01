@@ -21,6 +21,7 @@ type var_origin =
   | ForLoopVar
   | MatchBinding
   | ScopedResource
+  | ScopedResourceUnavailable of string
   | ScopedResourceDerived
   | Other
 
@@ -35,6 +36,7 @@ type def_id = Env_types.def_id
 
 type resource_result_policy = Env_types.resource_result_policy =
   | ResourceResultDependent
+  | ResourceResultIndependent
   | ResourceResultOrdinary
 
 type resource_arg_policy = Env_types.resource_arg_policy =
@@ -103,11 +105,13 @@ type symbol_kind =
       type_params : string list;
       variants : variant list;
       type_kind : type_kind;
+      contains_resource : bool;
     }
   | RecordSymbol of {
       type_params : string list;
       fields : field_decl list;
       is_value : bool;
+      contains_resource : bool;
     }
   | AliasSymbol of { type_params : string list; target : type_expr }
   | ConstructorSymbol of {
@@ -257,6 +261,10 @@ val is_scoped_resource_var : env -> string -> bool
 val is_scoped_resource_derived_var : env -> string -> bool
 (** Check if a variable is derived from a scoped resource binding. *)
 
+val scoped_resource_unavailable_owner : env -> string -> string option
+(** Return the dependent resource that temporarily makes a scoped resource
+    unavailable, when applicable. *)
+
 val is_scoped_resource_related_var : env -> string -> bool
 (** Check if a variable is either a scoped resource or a value derived from one. *)
 
@@ -288,6 +296,7 @@ val is_debug_only_overload_set : env -> string -> bool
 val add_type :
   ?with_ctors:bool ->
   ?kind:type_kind ->
+  ?contains_resource:bool ->
   env ->
   string ->
   string list ->
@@ -301,6 +310,7 @@ val add_record :
   string list ->
   field_decl list ->
   ?is_value:bool ->
+  ?contains_resource:bool ->
   unit ->
   env
 (** Add a record declaration to the environment *)
@@ -353,6 +363,10 @@ val get_type_decl : env -> string -> (string list * variant list) option
 
 val get_type_kind : env -> string -> type_kind option
 (** Get a type declaration's explicit kind *)
+
+val get_type_contains_resource : env -> string -> bool
+(** True when a named record/union declaration stores resource-containing
+    fields or payloads independently of its type arguments. *)
 
 val get_constructor :
   env -> string -> (string * string list * type_expr list * int) option

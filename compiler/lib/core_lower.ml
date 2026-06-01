@@ -193,18 +193,10 @@ let resource_cleanup_metadata ty =
       Session.find_resource_cleanup (Session.current ()) name
   | _ -> None
 
-let is_resource_source_type_name name =
-  match Types.split_canonical_module_type_name name with
-  | Some (module_path, "ResourceSource") -> module_path = "std/stream"
-  | _ ->
-      name = "ResourceSource"
-      || name = "std_stream__ResourceSource"
-      || name = "std/stream::ResourceSource"
-
 let resource_source_parts ty =
   match Codegen_types.normalize_type ty |> Types.head_resolve with
   | Ast.TyNamed (name, [ resource_ty; error_ty ])
-    when is_resource_source_type_name name ->
+    when Type_name_metadata.is_resource_source_name name ->
       Some (resource_ty, error_ty)
   | _ -> None
 
@@ -403,7 +395,7 @@ let elem_type_of_iterable ~loc (ty : type_expr) : type_expr =
   | TyNamed ("Range", []) -> ty_int
   | TyNamed ("Range", [ elem ]) -> elem
   | TyNamed ("Channel", [ elem ]) -> elem
-  | TyNamed ("Stream", [ elem ]) -> elem
+  | TyNamed (name, [ elem ]) when Type_name_metadata.is_stream_name name -> elem
   | _ -> unsupported_iterable ~loc ty
 
 let enumerate_elem_type ~loc (coll_ty : type_expr) : type_expr * type_expr =
@@ -850,31 +842,19 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
       let body = lower_block ~loc ~ty:debug_ty body in
       mk (CDebugBlock body)
   | TA.ESelect arms ->
-      let channel_elem_ty arm_loc channel =
-        match Types.head_resolve (TA.semantic_type channel) with
-        | TyNamed ("Channel", [ elem_ty ]) -> elem_ty
-        | ty ->
-            Core_error.errorf (Core_error.Stage Core_stage.Lower) arm_loc
-              ~hint:
-                "Inference should accept only Channel[T] expressions in select \
-                 receive and sealed arms."
-              "select channel arm reached lowering with non-channel type %s"
-              (Types.type_to_string ty)
-      in
       let lower_arm (arm : TA.select_arm) =
         let select_arm_kind =
           match arm.select_arm_kind with
-          | TA.SelectRecv { select_bind; select_channel } ->
+          | TA.SelectRecv { select_bind; select_elem_ty; select_channel } ->
               Core.SelectRecv
                 {
                   select_bind = Core.Var.named select_bind;
-                  select_elem_ty =
-                    channel_elem_ty arm.select_arm_loc select_channel;
+                  select_elem_ty;
                   select_channel = lower_child_expr select_channel;
                 }
           | TA.SelectAfter timeout ->
               Core.SelectAfter (lower_timeout_expr timeout)
-          | TA.SelectSealed channel ->
+          | TA.SelectSealed { select_channel = channel; _ } ->
               Core.SelectSealed (lower_child_expr channel)
         in
         {
@@ -965,8 +945,46 @@ and lower_concurrently_loop ~loc ~ty ~output var iter body timeout width =
     | Ast.ConcurrentlyLoopLimit n ->
         Core.ConcurrentlyLoopLimit (Core.Build.lit_int ~loc n)
   in
-  let body_core =
-    with_current_task_scope child_scope (fun () -> lower_child_expr body)
+  let iter_ty = type_of_child_expr iter in
+  let cf_var, cf_item_mode, body_core =
+    match resource_source_parts iter_ty with
+    | Some (resource_ty, error_ty) ->
+        let item_name = fresh_resource_name () in
+        let item_var = Core.Var.named item_name in
+        let scoped_name =
+          if is_wildcard_name var then fresh_resource_name () else var
+        in
+        let scoped_var = Core.Var.named scoped_name in
+        let acquire =
+          { Core.desc = CVar item_var; ty = resource_ty; loc = TA.loc iter }
+        in
+        let user_body =
+          with_current_task_scope child_scope (fun () -> lower_child_expr body)
+        in
+        let body_core =
+          {
+            Core.desc =
+              CResourceScope
+                {
+                  rs_var = scoped_var;
+                  rs_ty = resource_ty;
+                  rs_acquire = acquire;
+                  rs_body = user_body;
+                  rs_cleanup = resource_cleanup_call ~loc resource_ty scoped_var;
+                };
+            ty = TyNamed ("Void", []);
+            loc;
+          }
+        in
+        ( item_var,
+          Core.ConcurrentlyLoopMoveResourceItem
+            { clmi_resource_ty = resource_ty; clmi_error_ty = error_ty },
+          body_core )
+    | None ->
+        ( Core.Var.named var,
+          Core.ConcurrentlyLoopCopyItem,
+          with_current_task_scope child_scope (fun () -> lower_child_expr body)
+        )
   in
   let body_core =
     match output with
@@ -986,12 +1004,13 @@ and lower_concurrently_loop ~loc ~ty ~output var iter body timeout width =
     Core.desc =
       CConcurrentlyLoop
         {
-          cf_var = Core.Var.named var;
+          cf_var;
           cf_iter = lower_child_expr iter;
           cf_body = body_core;
           cf_timeout = Option.map lower_timeout_expr timeout;
           cf_width = width;
           cf_output = output;
+          cf_item_mode;
           cf_task_scope = task_scope;
           cf_task = None;
         };
@@ -1368,7 +1387,12 @@ and lower_with ~(loc : Ast.loc) ~(ty : Ast.type_expr)
         }
       in
       let success_body = resource_scope payload in
-      let failure_name = fresh_question_bind_name () in
+      let failure_name =
+        match binding.with_error_map with
+        | Some mapper when not (is_wildcard_name mapper.with_error_name) ->
+            mapper.with_error_name
+        | _ -> fresh_question_bind_name ()
+      in
       let failure_ty =
         match node_kind with
         | CarrierOption -> Ast.TyNamed ("Void", [])
@@ -1381,8 +1405,21 @@ and lower_with ~(loc : Ast.loc) ~(ty : Ast.type_expr)
               ~what:"with ?= acquisition" rhs.ty
       in
       let fallback_body =
-        carrier_failure_expr ~loc ~kind:node_kind ~carrier_ty:ty ~failure_name
-          ~failure_ty
+        match binding.with_error_map with
+        | None ->
+            carrier_failure_expr ~loc ~kind:node_kind ~carrier_ty:ty
+              ~failure_name ~failure_ty
+        | Some mapper -> (
+            match node_kind with
+            | CarrierOption ->
+                Core_error.errorf (Core_error.Stage Core_stage.Lower) loc
+                  ~hint:
+                    "typechecking should only allow with ?= error mapping on \
+                     Result acquisitions"
+                  "with ?= error mapping reached lowering for Option"
+            | CarrierResult ->
+                let mapped_error = lower_child_expr mapper.with_error_value in
+                builtin_call ~loc "blorp_result_err" [ mapped_error ] ty)
       in
       let arms =
         [

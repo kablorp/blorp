@@ -85,12 +85,14 @@ type match_case = {
 }
 
 type with_binding_kind = Ast.with_binding_kind = WithPlain | WithTry
+type with_error_map = { with_error_name : string; with_error_value : expr }
 
 type with_binding = {
   with_name : string;
   with_type : Ast.type_expr option;
   with_value : expr;
   with_kind : with_binding_kind;
+  with_error_map : with_error_map option;
 }
 
 type select_arm = {
@@ -100,9 +102,13 @@ type select_arm = {
 }
 
 and select_arm_kind =
-  | SelectRecv of { select_bind : string; select_channel : expr }
+  | SelectRecv of {
+      select_bind : string;
+      select_elem_ty : Ast.type_expr;
+      select_channel : expr;
+    }
   | SelectAfter of expr
-  | SelectSealed of expr
+  | SelectSealed of { select_elem_ty : Ast.type_expr; select_channel : expr }
 
 type expr_desc =
   | EIdent of string

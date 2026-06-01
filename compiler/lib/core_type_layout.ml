@@ -70,14 +70,19 @@ let builtin_layout = function
   | "String" | "Bytes" | "Fixed" | "StringSlice" | "MemStats" | "SchedulerStats"
   | "List" | "ParallelList" | "ParallelVector" | "ParallelMatrix" | "Dict"
   | "Set" | "Tensor" | "Vector" | "Matrix" | "Builder" | "Slice" | "Option"
-  | "Result" | "Task" | "Channel" | "Stream" | "FallibleStream"
-  | "std/stream::FallibleStream" | "std_stream__FallibleStream" | "TcpListener"
-  | "TcpStream" | "ResourceSource" | "std/stream::ResourceSource"
-  | "std_stream__ResourceSource" | "ConcurrencyError" ->
+  | "Result" | "Task" | "Channel" | "TcpListener" | "TcpStream" | "TlsSession"
+  | "std/net/tls::TlsSession" | "std_net_tls__TlsSession" | "WebSocketSession"
+  | "std/net/websocket::WebSocketSession"
+  | "std_net_websocket__WebSocketSession" | "ConcurrencyError" ->
+      Some managed_layout
+  | name
+    when Type_name_metadata.is_one_shot_stream_name name
+         || Type_name_metadata.is_resource_source_name name ->
       Some managed_layout
   | "FileReader" | "FileWriter" | "File" | "std/file::FileReader"
   | "std/file::FileWriter" | "std/file::File" | "std_file__FileReader"
-  | "std_file__FileWriter" | "std_file__File" ->
+  | "std_file__FileWriter" | "std_file__File" | "UdpSocket"
+  | "std/net/udp::UdpSocket" | "std_net_udp__UdpSocket" ->
       Some unmanaged_layout
   | "Int" | "Bool" | "Char" | "Float" | "Float32" | "Float16" | "Int128"
   | "UInt128" | "Void" | "Ptr" | "Module" ->

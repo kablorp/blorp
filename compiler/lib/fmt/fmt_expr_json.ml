@@ -889,8 +889,23 @@ let rec expr_to_json expr =
                    [ field "limit" (string_of_int n) ]))
       | _ -> None)
   | Ast.EWith (binding, body) -> (
-      match (expr_to_json binding.with_value, expr_to_json body) with
-      | Some value_json, Some body_json ->
+      let error_fields =
+        match binding.with_error_map with
+        | None -> Some []
+        | Some mapper -> (
+            match expr_to_json mapper.with_error_value with
+            | Some error_json ->
+                Some
+                  [
+                    field "error_name" (string mapper.with_error_name);
+                    field "error_value" error_json;
+                  ]
+            | None -> None)
+      in
+      match
+        (expr_to_json binding.with_value, error_fields, expr_to_json body)
+      with
+      | Some value_json, Some error_fields, Some body_json ->
           Some
             (obj
                ([
@@ -900,6 +915,7 @@ let rec expr_to_json expr =
                   field "value" value_json;
                   field "body" body_json;
                 ]
+               @ error_fields
                @ optional_field "type"
                    (Option.map type_expr_to_json binding.with_type)))
       | _ -> None)

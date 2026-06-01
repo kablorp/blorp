@@ -235,6 +235,9 @@ typedef struct {
 
 typedef struct blorp_TcpListener blorp_TcpListener;
 typedef struct blorp_TcpStream blorp_TcpStream;
+typedef struct blorp_TlsSession blorp_TlsSession;
+typedef struct blorp_WebSocketSession blorp_WebSocketSession;
+typedef struct blorp_UdpSocket blorp_UdpSocket;
 typedef struct blorp_ResourceSource blorp_ResourceSource;
 typedef struct blorp_FileReader blorp_FileReader;
 typedef struct blorp_FileWriter blorp_FileWriter;
@@ -262,6 +265,20 @@ typedef enum {
     BLORP_FILE_ERROR_UNSUPPORTED = 7,
     BLORP_FILE_ERROR_OTHER = 8
 } blorp_FileErrorKind;
+
+typedef enum {
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_NONE = 0,
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE = 1,
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_UDP = 2,
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TCP = 3,
+    BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TLS = 4
+} blorp_FallibleStreamErrorDomain;
+
+typedef struct {
+    blorp_FallibleStreamErrorDomain domain;
+    long kind;
+    blorp_String* detail;
+} blorp_FallibleStreamError;
 
 typedef struct {
     blorp_FileReader* handle;
@@ -294,29 +311,10 @@ typedef struct {
 } blorp_FileBytesResult;
 
 typedef struct {
-    void* value;
-    blorp_FileErrorKind error_kind;
-    blorp_String* detail;
-} blorp_FileValueResult;
-
-typedef struct {
-    long found;
-    void* value;
-    blorp_FileErrorKind error_kind;
-    blorp_String* detail;
-} blorp_FileFindResult;
-
-typedef struct {
     long value;
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
 } blorp_FileIntResult;
-
-typedef struct {
-    long value;
-    blorp_FileErrorKind error_kind;
-    blorp_String* detail;
-} blorp_FileBoolResult;
 
 typedef struct {
     blorp_FileErrorKind error_kind;
@@ -365,6 +363,124 @@ typedef struct {
     blorp_String* detail;
 } blorp_TcpVoidResult;
 
+typedef enum {
+    BLORP_TLS_ERROR_NONE = 0,
+    BLORP_TLS_ERROR_INVALID_INPUT = 1,
+    BLORP_TLS_ERROR_HANDSHAKE_FAILED = 2,
+    BLORP_TLS_ERROR_TRANSPORT = 3,
+    BLORP_TLS_ERROR_CERTIFICATE = 4,
+    BLORP_TLS_ERROR_PROTOCOL = 5,
+    BLORP_TLS_ERROR_TIMED_OUT = 6,
+    BLORP_TLS_ERROR_CLOSED = 7,
+    BLORP_TLS_ERROR_BUSY = 8,
+    BLORP_TLS_ERROR_UNSUPPORTED = 9,
+    BLORP_TLS_ERROR_OTHER = 10
+} blorp_TlsErrorKind;
+
+typedef struct {
+    blorp_TlsSession* handle;
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsSessionResult;
+
+typedef struct {
+    blorp_Bytes* value;
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsBytesResult;
+
+typedef struct {
+    long value;
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsIntResult;
+
+typedef struct {
+    blorp_TlsErrorKind error_kind;
+    blorp_String* detail;
+} blorp_TlsVoidResult;
+
+typedef enum {
+    BLORP_WEBSOCKET_ERROR_NONE = 0,
+    BLORP_WEBSOCKET_ERROR_INVALID_URL = 1,
+    BLORP_WEBSOCKET_ERROR_HANDSHAKE_FAILED = 2,
+    BLORP_WEBSOCKET_ERROR_TRANSPORT = 3,
+    BLORP_WEBSOCKET_ERROR_TLS = 4,
+    BLORP_WEBSOCKET_ERROR_PROTOCOL = 5,
+    BLORP_WEBSOCKET_ERROR_TIMED_OUT = 6,
+    BLORP_WEBSOCKET_ERROR_CLOSED = 7,
+    BLORP_WEBSOCKET_ERROR_BUSY = 8,
+    BLORP_WEBSOCKET_ERROR_UNSUPPORTED = 9,
+    BLORP_WEBSOCKET_ERROR_OTHER = 10
+} blorp_WebSocketErrorKind;
+
+typedef struct {
+    blorp_WebSocketSession* handle;
+    blorp_WebSocketErrorKind error_kind;
+    blorp_String* detail;
+} blorp_WebSocketSessionResult;
+
+typedef struct {
+    blorp_WebSocketErrorKind error_kind;
+    blorp_String* detail;
+} blorp_WebSocketVoidResult;
+
+typedef enum {
+    BLORP_WEBSOCKET_MESSAGE_NONE = 0,
+    BLORP_WEBSOCKET_MESSAGE_TEXT = 1,
+    BLORP_WEBSOCKET_MESSAGE_BINARY = 2,
+    BLORP_WEBSOCKET_MESSAGE_CLOSE = 3,
+    BLORP_WEBSOCKET_MESSAGE_PING = 4,
+    BLORP_WEBSOCKET_MESSAGE_PONG = 5
+} blorp_WebSocketMessageKind;
+
+typedef struct {
+    blorp_WebSocketMessageKind message_kind;
+    blorp_String* text;
+    blorp_Bytes* bytes;
+    long code;
+    blorp_String* reason;
+    blorp_WebSocketErrorKind error_kind;
+    blorp_String* detail;
+} blorp_WebSocketMessageResult;
+
+typedef enum {
+    BLORP_UDP_ERROR_NONE = 0,
+    BLORP_UDP_ERROR_INVALID_INPUT = 1,
+    BLORP_UDP_ERROR_TIMED_OUT = 2,
+    BLORP_UDP_ERROR_CLOSED = 3,
+    BLORP_UDP_ERROR_BUSY = 4,
+    BLORP_UDP_ERROR_DNS = 5,
+    BLORP_UDP_ERROR_INTERRUPTED = 6,
+    BLORP_UDP_ERROR_UNSUPPORTED = 7,
+    BLORP_UDP_ERROR_OTHER = 8
+} blorp_UdpErrorKind;
+
+typedef struct {
+    blorp_UdpSocket* handle;
+    blorp_UdpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_UdpSocketResult;
+
+typedef struct {
+    long value;
+    blorp_UdpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_UdpIntResult;
+
+typedef struct {
+    blorp_Bytes* data;
+    blorp_String* host;
+    long port;
+    blorp_UdpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_UdpDatagramResult;
+
+typedef struct {
+    blorp_UdpErrorKind error_kind;
+    blorp_String* detail;
+} blorp_UdpVoidResult;
+
 #define BLORP_LIST_STORAGE_POINTER 0
 #define BLORP_LIST_STORAGE_INLINE 1
 #define BLORP_LIST_CALLBACK_BITS 0
@@ -375,11 +491,37 @@ typedef struct {
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT32 3
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_List;
 
+typedef enum {
+    BLORP_DNS_ERROR_NONE = 0,
+    BLORP_DNS_ERROR_INVALID_HOST = 1,
+    BLORP_DNS_ERROR_LOOKUP_FAILED = 2
+} blorp_DnsErrorKind;
+
 typedef struct {
     blorp_List* value;
-    blorp_FileErrorKind error_kind;
+    blorp_DnsErrorKind error_kind;
     blorp_String* detail;
-} blorp_FileListResult;
+} blorp_DnsAddressesResult;
+
+typedef struct {
+    blorp_List* value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamListResult;
+
+typedef struct {
+    void* value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamValueResult;
+
+typedef struct {
+    long value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamIntResult;
+
+typedef struct {
+    long value;
+    blorp_FallibleStreamError error;
+} blorp_FallibleStreamBoolResult;
 
 typedef struct {
     blorp_Object header;
@@ -764,6 +906,7 @@ static inline void blorp_release_arc_only(void* obj) {
 
 void blorp_cleanup_release_arc_value(void* value);
 void blorp_cleanup_release_arc_only_value(void* value);
+void blorp_cleanup_stack_result_value(void* value);
 void __blorp_task_cleanup_push_slow(blorp_CancelCleanupFrame* frame,
                                     const void* slot, void* value,
                                     blorp_CancelCleanupFn release_value);
@@ -1422,10 +1565,47 @@ blorp_TcpIntResult blorp_tcp_local_port_listener_raw(blorp_TcpListener* listener
 blorp_TcpIntResult blorp_tcp_local_port_stream_raw(blorp_TcpStream* stream);
 blorp_TcpVoidResult blorp_tcp_set_timeout_listener_raw(blorp_TcpListener* listener, long ms);
 blorp_TcpVoidResult blorp_tcp_set_timeout_stream_raw(blorp_TcpStream* stream, long ms);
+blorp_TcpListenerResult blorp_tcp_listen_numeric_raw(blorp_String* host, long port, long backlog);
+blorp_TcpStreamResult blorp_tcp_connect_numeric_raw(blorp_String* host, long port);
 blorp_TcpListener* blorp_tcp_listener_from_fd(long fd);
 blorp_TcpStream* blorp_tcp_stream_from_fd(long fd);
 long blorp_tcp_listener_fd(blorp_TcpListener* listener);
 long blorp_tcp_stream_fd(blorp_TcpStream* stream);
+
+// DNS Networking
+blorp_DnsAddressesResult blorp_dns_resolve_raw(blorp_String* hostname);
+
+// TLS Networking
+void blorp_tls_close_session(blorp_TlsSession* session);
+bool blorp_tls_native_available_raw(void);
+blorp_TlsSessionResult blorp_tls_connect_raw(blorp_TcpStream* stream, blorp_String* server_name);
+blorp_TlsBytesResult blorp_tls_read_raw(blorp_TlsSession* session, long max_bytes);
+blorp_TlsIntResult blorp_tls_write_raw(blorp_TlsSession* session, blorp_Bytes* data);
+blorp_TlsVoidResult blorp_tls_write_all_raw(blorp_TlsSession* session, blorp_Bytes* data);
+
+// WebSocket Networking
+void blorp_websocket_close_session(blorp_WebSocketSession* session);
+bool blorp_websocket_native_available_raw(void);
+blorp_WebSocketSessionResult blorp_websocket_connect_raw(blorp_String* url);
+blorp_WebSocketMessageResult blorp_websocket_receive_raw(blorp_WebSocketSession* session);
+blorp_WebSocketVoidResult blorp_websocket_send_text_raw(blorp_WebSocketSession* session, blorp_String* text);
+blorp_WebSocketVoidResult blorp_websocket_send_binary_raw(blorp_WebSocketSession* session, blorp_Bytes* bytes);
+blorp_WebSocketVoidResult blorp_websocket_send_ping_raw(blorp_WebSocketSession* session, blorp_Bytes* bytes);
+blorp_WebSocketVoidResult blorp_websocket_send_pong_raw(blorp_WebSocketSession* session, blorp_Bytes* bytes);
+blorp_WebSocketVoidResult blorp_websocket_send_close_raw(blorp_WebSocketSession* session, long code, blorp_String* reason);
+
+// UDP Networking
+blorp_UdpSocketResult blorp_udp_socket_raw(void);
+blorp_UdpVoidResult blorp_udp_bind_raw(blorp_UdpSocket* socket, blorp_String* host, long port);
+blorp_UdpVoidResult blorp_udp_bind_numeric_raw(blorp_UdpSocket* socket, blorp_String* host, long port);
+blorp_UdpIntResult blorp_udp_send_to_raw(blorp_UdpSocket* socket, blorp_Bytes* data, blorp_String* host, long port);
+blorp_UdpIntResult blorp_udp_send_to_numeric_raw(blorp_UdpSocket* socket, blorp_Bytes* data, blorp_String* host, long port);
+blorp_UdpIntResult blorp_udp_send_to_wait_raw(blorp_UdpSocket* socket, blorp_Bytes* data, blorp_String* host, long port);
+blorp_UdpIntResult blorp_udp_send_to_wait_numeric_raw(blorp_UdpSocket* socket, blorp_Bytes* data, blorp_String* host, long port);
+blorp_UdpDatagramResult blorp_udp_recv_from_raw(blorp_UdpSocket* socket, long max_bytes);
+blorp_UdpIntResult blorp_udp_local_port_raw(blorp_UdpSocket* socket);
+void blorp_udp_close_socket(blorp_UdpSocket* socket);
+
 int blorp_io_reactor_start(void);
 void blorp_io_reactor_shutdown(void);
 int blorp_io_reactor_smoke_test(void);
@@ -1529,6 +1709,8 @@ long blorp_concurrent_normalize_limit(long requested);
 void blorp_task_cancel(void* t);
 void blorp_task_cancel_join_release(void* t);
 long blorp_test_cancel_after_parked(blorp_Closure* func);
+long blorp_test_tls_state_probe(void);
+long blorp_test_websocket_state_probe(void);
 void blorp_sleep(long ms);
 void blorp_yield_now(void);
 long blorp_max_threads(void);
@@ -1651,8 +1833,7 @@ typedef struct blorp_FallibleStream {
     blorp_FallibleStreamPullStatus (*pull)(
         struct blorp_FallibleStream* self,
         void** out,
-        blorp_FileErrorKind* error_kind,
-        blorp_String** error_detail
+        blorp_FallibleStreamError* error
     );
     void* state;
     void (*state_cleanup)(struct blorp_FallibleStream* self);
@@ -1674,6 +1855,10 @@ blorp_FallibleStream* blorp_file_chunks_with_size_reader_raw(const blorp_FileRea
 blorp_FallibleStream* blorp_file_lines_reader_raw(const blorp_FileReader* reader);
 blorp_FallibleStream* blorp_file_bytes_reader_raw(const blorp_FileReader* reader);
 blorp_FallibleStream* blorp_file_windows_reader_raw(const blorp_FileReader* reader, long size);
+blorp_FallibleStream* blorp_udp_datagrams_raw(blorp_UdpSocket* socket, long max_bytes);
+blorp_FallibleStream* blorp_tcp_chunks_raw(blorp_TcpStream* stream, long max_bytes);
+blorp_FallibleStream* blorp_tcp_lines_raw(blorp_TcpStream* stream);
+blorp_FallibleStream* blorp_tls_chunks_raw(blorp_TlsSession* session, long max_bytes);
 blorp_Stream* blorp_stream_map(blorp_Stream* inner, blorp_Closure* func, long result_elem_layout_code);
 blorp_Stream* blorp_stream_filter(blorp_Stream* inner, blorp_Closure* pred);
 blorp_Stream* blorp_stream_filter_map(blorp_Stream* inner, blorp_Closure* func);
@@ -1699,29 +1884,29 @@ blorp_Stream* blorp_stream_drop(blorp_Stream* inner, long n);
 blorp_Stream* blorp_stream_take_while(blorp_Stream* inner, blorp_Closure* pred);
 blorp_Stream* blorp_stream_enumerate(blorp_Stream* inner);
 blorp_List* blorp_stream_collect(blorp_Stream* stream);
-blorp_FileListResult blorp_fallible_stream_collect_file_raw(blorp_FallibleStream* stream, uint8_t storage_mode, int16_t elem_size);
-blorp_FileValueResult blorp_fallible_stream_fold_file_raw(blorp_FallibleStream* stream, void* init, blorp_Closure* func, bool acc_is_rc);
-blorp_FileIntResult blorp_fallible_stream_count_file_raw(blorp_FallibleStream* stream);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_nullable(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_int(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_int8(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_int16(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_int32(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_int64(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_uint8(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_uint16(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_uint32(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_uint64(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_float(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_bool(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_char(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_f32(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamListResult blorp_fallible_stream_collect_raw(blorp_FallibleStream* stream, uint8_t storage_mode, int16_t elem_size);
+blorp_FallibleStreamValueResult blorp_fallible_stream_fold_raw(blorp_FallibleStream* stream, void* init, blorp_Closure* func, bool acc_is_rc);
+blorp_FallibleStreamIntResult blorp_fallible_stream_count_raw(blorp_FallibleStream* stream);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_nullable(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_int(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_int8(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_int16(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_int32(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_int64(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_uint8(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_uint16(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_uint32(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_uint64(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_float(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_bool(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_char(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_f32(blorp_FallibleStream* stream, blorp_Closure* pred);
 #ifdef __FLT16_MAX__
-blorp_FileValueResult blorp_fallible_stream_find_file_raw_f16(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamValueResult blorp_fallible_stream_find_raw_f16(blorp_FallibleStream* stream, blorp_Closure* pred);
 #endif
-blorp_FileBoolResult blorp_fallible_stream_any_file_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
-blorp_FileBoolResult blorp_fallible_stream_all_file_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamBoolResult blorp_fallible_stream_any_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
+blorp_FallibleStreamBoolResult blorp_fallible_stream_all_raw(blorp_FallibleStream* stream, blorp_Closure* pred);
 void* blorp_stream_fold(blorp_Stream* stream, void* init, blorp_Closure* func, bool acc_is_rc);
 long blorp_stream_count(blorp_Stream* stream);
 void blorp_stream_for_each(blorp_Stream* stream, blorp_Closure* func);

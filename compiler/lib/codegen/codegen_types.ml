@@ -554,12 +554,11 @@ let type_to_c ~(reg : registry) ty =
               | "SchedulerStats" -> "blorp_SchedulerStats*"
               | "Task" -> "blorp_Task*"
               | "Channel" -> "blorp_Channel*"
-              | "Stream" -> "blorp_Stream*"
-              | "FallibleStream" | "std/stream::FallibleStream"
-              | "std_stream__FallibleStream" ->
+              | name when Type_name_metadata.is_stream_name name ->
+                  "blorp_Stream*"
+              | name when Type_name_metadata.is_fallible_stream_name name ->
                   "blorp_FallibleStream*"
-              | "ResourceSource" | "std/stream::ResourceSource"
-              | "std_stream__ResourceSource" ->
+              | name when Type_name_metadata.is_resource_source_name name ->
                   "blorp_ResourceSource*"
               | "TcpListener" | "std/net/tcp::TcpListener"
               | "std_net_tcp__TcpListener" ->
@@ -567,6 +566,15 @@ let type_to_c ~(reg : registry) ty =
               | "TcpStream" | "std/net/tcp::TcpStream"
               | "std_net_tcp__TcpStream" ->
                   "blorp_TcpStream*"
+              | "TlsSession" | "std/net/tls::TlsSession"
+              | "std_net_tls__TlsSession" ->
+                  "blorp_TlsSession*"
+              | "WebSocketSession" | "std/net/websocket::WebSocketSession"
+              | "std_net_websocket__WebSocketSession" ->
+                  "blorp_WebSocketSession*"
+              | "UdpSocket" | "std/net/udp::UdpSocket"
+              | "std_net_udp__UdpSocket" ->
+                  "blorp_UdpSocket*"
               | "FileReader" | "std/file::FileReader" | "std_file__FileReader"
                 ->
                   "blorp_FileReader*"
@@ -600,12 +608,11 @@ let type_to_c ~(reg : registry) ty =
                   (* Fixed with any params still maps to blorp_Fixed* *)
               | "Task" -> "blorp_Task*"
               | "Channel" -> "blorp_Channel*"
-              | "Stream" -> "blorp_Stream*"
-              | "FallibleStream" | "std/stream::FallibleStream"
-              | "std_stream__FallibleStream" ->
+              | name when Type_name_metadata.is_stream_name name ->
+                  "blorp_Stream*"
+              | name when Type_name_metadata.is_fallible_stream_name name ->
                   "blorp_FallibleStream*"
-              | "ResourceSource" | "std/stream::ResourceSource"
-              | "std_stream__ResourceSource" ->
+              | name when Type_name_metadata.is_resource_source_name name ->
                   "blorp_ResourceSource*"
               | "TcpListener" | "std/net/tcp::TcpListener"
               | "std_net_tcp__TcpListener" ->
@@ -613,6 +620,15 @@ let type_to_c ~(reg : registry) ty =
               | "TcpStream" | "std/net/tcp::TcpStream"
               | "std_net_tcp__TcpStream" ->
                   "blorp_TcpStream*"
+              | "TlsSession" | "std/net/tls::TlsSession"
+              | "std_net_tls__TlsSession" ->
+                  "blorp_TlsSession*"
+              | "WebSocketSession" | "std/net/websocket::WebSocketSession"
+              | "std_net_websocket__WebSocketSession" ->
+                  "blorp_WebSocketSession*"
+              | "UdpSocket" | "std/net/udp::UdpSocket"
+              | "std_net_udp__UdpSocket" ->
+                  "blorp_UdpSocket*"
               | "FileReader" | "std/file::FileReader" | "std_file__FileReader"
                 ->
                   "blorp_FileReader*"

@@ -8,10 +8,15 @@ import:
 		TcpError,
 		TcpStream,
 		accept,
+		chunks,
 		connect,
+		connect_numeric,
 		connections_continue_on_error,
 		connections_stop_on_error,
+		is_timed_out,
+		lines,
 		listen,
+		listen_numeric,
 		local_port,
 		message,
 		read_chunk,
@@ -19,7 +24,7 @@ import:
 		set_stream_timeout,
 		set_timeout,
 		write_all,
-	stream: ResourceSource
+	stream: ResourceSource, collect_result, find_result
 	string: contains, starts_with
 	test: TestSuite
 
@@ -54,12 +59,60 @@ func client_echo_once(port: Int, value: Int) -> Result[Int, TcpError]:
 			None: Ok(-1)
 
 
+func client_echo_once_numeric(port: Int, value: Int) -> Result[Int, TcpError]:
+	with stream ?= connect_numeric("127.0.0.1", port):
+		payload: Bytes = B
+			.bytes(1)
+			.fill(value)
+		ignored ?= write_all(stream, payload)
+		reply ?= read_chunk(stream, 64)
+		match reply.get(0):
+			Some(byte): Ok(byte)
+			None: Ok(-1)
+
+
 func detached_echo_client(port: Int, value: Int, done: Channel[Int]) -> Bool:
 	actual: Int = match client_echo_once(port, value):
 		Ok(byte): byte
 		Err(_): -1000
 	_ = send(done, actual)
 	actual == value
+
+
+func detached_echo_client_numeric(port: Int, value: Int, done: Channel[Int]) -> Bool:
+	actual: Int = match client_echo_once_numeric(port, value):
+		Ok(byte): byte
+		Err(_): -1000
+	_ = send(done, actual)
+	actual == value
+
+
+func delayed_connect_only_result(port: Int) -> Result[Int, TcpError]:
+	sleep(30)
+	with _ ?= connect("127.0.0.1", port):
+		Ok(1)
+
+
+func delayed_connect_only(port: Int, done: Channel[Int]) -> Bool:
+	status: Int = match delayed_connect_only_result(port):
+		Ok(value): value
+		Err(_): -1
+	_ = send(done, status)
+	status > 0
+
+
+func client_write_once(port: Int, text: String) -> Result[Void, TcpError]:
+	with stream ?= connect("127.0.0.1", port):
+		ignored ?= write_all(stream, text.to_bytes())
+		Ok(void)
+
+
+func detached_write_client(port: Int, text: String, done: Channel[Bool]) -> Bool:
+	ok: Bool = match client_write_once(port, text):
+		Ok(_): True
+		Err(_): False
+	_ = send(done, ok)
+	ok
 
 
 func scoped_echo_once() -> Result[Bool, TcpError]:
@@ -73,6 +126,81 @@ func scoped_echo_once() -> Result[Bool, TcpError]:
 			match recv(done):
 				Some(actual): Ok(actual == 42)
 				None: Ok(False)
+
+
+func scoped_numeric_echo_once() -> Result[Bool, TcpError]:
+	with listener ?= listen_numeric("127.0.0.1", 0, 16):
+		port ?= local_port(listener)
+		done: Channel[Int] = channel(1)
+		detach detached_echo_client_numeric(port, 43, done)
+		with peer ?= accept(listener):
+			data ?= read_chunk(peer, 64)
+			ignored ?= write_all(peer, data)
+			match recv(done):
+				Some(actual): Ok(actual == 43)
+				None: Ok(False)
+
+
+func test_numeric_tcp_echo_round_trip() -> Bool:
+	match scoped_numeric_echo_once():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func test_chunks_stream_reads_bytes() -> Bool:
+	match scoped_chunks_stream_reads_bytes():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_chunks_stream_reads_bytes() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 16):
+		port ?= local_port(listener)
+		done: Channel[Bool] = channel(1)
+		detach detached_write_client(port, "hello", done)
+		with peer ?= accept(listener):
+			first ?= chunks(peer, 2).find_result(func(chunk: Bytes): chunk.length() == 2)
+			client_ok: Bool = match recv(done):
+				Some(ok): ok
+				None: False
+			match first:
+				Some(chunk): Ok(client_ok and chunk.to_string() == "he")
+				None: Ok(False)
+
+
+pure func expected_tcp_lines(items: List[String]) -> Bool:
+	if items.length() != 3:
+		False
+	else:
+		first_ok: Bool = match items.get(0):
+			Some(line): line == "alpha"
+			None: False
+		second_ok: Bool = match items.get(1):
+			Some(line): line == "beta"
+			None: False
+		third_ok: Bool = match items.get(2):
+			Some(line): line == "gamma"
+			None: False
+		first_ok and second_ok and third_ok
+
+
+func test_lines_stream_reads_text() -> Bool:
+	match scoped_lines_stream_reads_text():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_lines_stream_reads_text() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 16):
+		port ?= local_port(listener)
+		done: Channel[Bool] = channel(1)
+		detach detached_write_client(port, "alpha\nbeta\r\ngamma", done)
+		with peer ?= accept(listener):
+			items ?= lines(peer).collect_result()
+			client_ok: Bool = match recv(done):
+				Some(ok): ok
+				None: False
+			Ok(client_ok and expected_tcp_lines(items))
 
 
 func test_listen_and_local_port() -> Bool:
@@ -139,6 +267,49 @@ func scoped_connections_source_for_echo() -> Result[Bool, TcpError]:
 			None: Ok(False)
 
 
+func test_connections_source_concurrent_echo() -> Bool:
+	match scoped_connections_source_concurrent_echo():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_connections_source_concurrent_echo() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 16):
+		ignored ?= set_timeout(listener, 50)
+		port ?= local_port(listener)
+		done: Channel[Int] = channel(1)
+		detach detached_echo_client(port, 88, done)
+		for peer in connections_stop_on_error(listener) concurrently(limit: 2):
+			match read_chunk(peer, 64):
+				Ok(data): _ = write_all(peer, data)
+				Err(_): void
+		match recv(done):
+			Some(actual): Ok(actual == 88)
+			None: Ok(False)
+
+
+func test_connections_continue_skips_accept_timeout() -> Bool:
+	match scoped_connections_continue_skips_accept_timeout():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_connections_continue_skips_accept_timeout() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 16):
+		ignored ?= set_timeout(listener, 1)
+		port ?= local_port(listener)
+		done: Channel[Int] = channel(1)
+		detach delayed_connect_only(port, done)
+		var accepted: Bool = False
+		for peer in connections_continue_on_error(listener):
+			accepted = True
+			break
+		client_connected: Bool = match recv_timeout(done, 1000):
+			Some(status): status > 0
+			None: False
+		Ok(accepted and client_connected)
+
+
 func test_scoped_echo_round_trip() -> Bool:
 	match scoped_echo_once():
 		Ok(ok): ok
@@ -175,6 +346,28 @@ func test_invalid_connect_port_is_typed() -> Bool:
 
 func invalid_connect_port_result() -> Result[Bool, TcpError]:
 	with _ ?= connect("127.0.0.1", 70000):
+		Ok(False)
+
+
+func test_listen_numeric_rejects_hostname_without_dns() -> Bool:
+	match listen_numeric_hostname_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "numeric")
+
+
+func listen_numeric_hostname_result() -> Result[Bool, TcpError]:
+	with _ ?= listen_numeric("localhost", 0, 1):
+		Ok(False)
+
+
+func test_connect_numeric_rejects_hostname_without_dns() -> Bool:
+	match connect_numeric_hostname_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "numeric")
+
+
+func connect_numeric_hostname_result() -> Result[Bool, TcpError]:
+	with _ ?= connect_numeric("localhost", 80):
 		Ok(False)
 
 
@@ -238,8 +431,12 @@ func scoped_set_reuse_addr() -> Result[Bool, TcpError]:
 
 func test_accept_timeout_reports_error() -> Bool:
 	match scoped_accept_timeout():
-		Ok(ok): ok
-		Err(_): True
+		Ok(_): False
+		Err(err):
+			if is_timed_out(err):
+				True
+			else:
+				is_socket_permission_error(err)
 
 
 func scoped_accept_timeout() -> Result[Bool, TcpError]:
@@ -249,6 +446,26 @@ func scoped_accept_timeout() -> Result[Bool, TcpError]:
 			Ok(False)
 
 
+func test_read_timeout_reports_error() -> Bool:
+	match scoped_read_timeout():
+		Ok(_): False
+		Err(err):
+			if is_timed_out(err):
+				True
+			else:
+				is_socket_permission_error(err)
+
+
+func scoped_read_timeout() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		port ?= local_port(listener)
+		with _ ?= connect("127.0.0.1", port):
+			with peer ?= accept(listener):
+				ignored ?= set_stream_timeout(peer, 10)
+				data ?= read_chunk(peer, 64)
+				Ok(False)
+
+
 tests: TestSuite = {
 	description = "TCP Resource Tests",
 	tests = [
@@ -256,13 +473,30 @@ tests: TestSuite = {
 		("listen on any host uses passive bind", test_listen_any_host),
 		("connections exposes scoped resource source shape", test_connections_source_shape),
 		("connections source for loop echo", test_connections_source_for_echo),
+		("connections source concurrent echo", test_connections_source_concurrent_echo),
+		("TCP chunks stream reads bytes", test_chunks_stream_reads_bytes),
+		("TCP lines stream reads text", test_lines_stream_reads_text),
+		(
+			"connections continue skips accept timeout",
+			test_connections_continue_skips_accept_timeout,
+		),
 		("scoped TCP echo round trip", test_scoped_echo_round_trip),
 		("listen invalid port is typed", test_invalid_listen_port_is_typed),
 		("listen invalid host is typed", test_invalid_listen_host_is_typed),
 		("connect invalid port is typed", test_invalid_connect_port_is_typed),
+		("numeric TCP echo round trip", test_numeric_tcp_echo_round_trip),
+		(
+			"listen_numeric rejects hostnames without DNS",
+			test_listen_numeric_rejects_hostname_without_dns,
+		),
+		(
+			"connect_numeric rejects hostnames without DNS",
+			test_connect_numeric_rejects_hostname_without_dns,
+		),
 		("read_chunk invalid sizes are typed", test_read_chunk_invalid_size_is_typed),
 		("set_timeout invalid values are typed", test_set_timeout_invalid_is_typed),
 		("set_reuse_addr on scoped listener", test_set_reuse_addr),
 		("accept timeout reports an error", test_accept_timeout_reports_error),
+		("read timeout reports an error", test_read_timeout_reports_error),
 	]
 }

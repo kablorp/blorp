@@ -17,8 +17,13 @@ let mod_vector = "std/vector"
 let mod_matrix = "std/matrix"
 let mod_bytes = "std/bytes"
 let mod_stream = "std/stream"
+let mod_file = "std/file"
 let mod_regex = "std/regex"
+let mod_dns = "std/net/dns"
 let mod_tcp = "std/net/tcp"
+let mod_tls = "std/net/tls"
+let mod_udp = "std/net/udp"
+let mod_websocket = "std/net/websocket"
 
 (** Sanitize a module path for use as a C identifier prefix.
     [std/list] → [std_list], [./utils] → [__utils]. *)

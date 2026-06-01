@@ -78,7 +78,7 @@ let test_metadata_accepts_narrow_forms () =
   expect_metadata_ok "valid metadata"
     (validate_metadata
        (foreign
-          ~includes:[ "sqlite_ffi.h"; "net/tls_ffi.h" ]
+          ~includes:[ "sqlite_ffi.h"; "net/dns_ffi.h" ]
           ~links:
             [
               (None, "-lsqlite3");

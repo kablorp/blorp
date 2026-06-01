@@ -757,6 +757,7 @@ let test_lower_plain_with_to_resource_scope () =
       with_type = Some ty_test_resource;
       with_value = acquire;
       with_kind = WithPlain;
+      with_error_map = None;
     }
   in
   let ast = mk_ast (EWith (binding, ast_int 7)) ty_int in
@@ -797,6 +798,7 @@ let test_lower_with_uses_registered_resource_cleanup () =
             with_type = Some ty_widget;
             with_value = acquire;
             with_kind = WithPlain;
+            with_error_map = None;
           }
         in
         let ast = mk_ast (EWith (binding, ast_int 7)) ty_int in
@@ -823,6 +825,7 @@ let test_lower_fallible_with_to_resource_scope_success_arm () =
       with_type = Some ty_test_resource;
       with_value = acquire;
       with_kind = WithTry;
+      with_error_map = None;
     }
   in
   let ast = mk_ast (EWith (binding, ast_var "success" ty_opt_int)) ty_opt_int in
@@ -871,6 +874,7 @@ let test_lower_fallible_with_body_question_bind_stays_inside_resource_scope () =
       with_type = Some ty_test_resource;
       with_value = acquire;
       with_kind = WithTry;
+      with_error_map = None;
     }
   in
   let question =

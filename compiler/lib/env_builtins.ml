@@ -11,6 +11,15 @@ open Env
 let generic_param name bounds = Generic_params.make_bound_type_param name bounds
 let generic_type name bounds = TyBoundVar (generic_param name bounds)
 
+let builtin_type_symbol ?(type_params = []) ?(variants = []) () =
+  TypeSymbol
+    {
+      type_params;
+      variants;
+      type_kind = TypeBuiltin;
+      contains_resource = false;
+    }
+
 (** Create an environment with built-in types and functions.
 
     Scope symbols (primitive type names, constructors, aliases, builtin
@@ -31,176 +40,34 @@ let with_builtins (env : env) : env =
     env
     (* Primitive types - no variants needed *)
     |> fun e ->
-    add_symbol e
-      {
-        name = "Int";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Float";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Bool";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "String";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Char";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Void";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Bytes";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Ptr";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Fixed";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
+    add_symbol e { name = "Int"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Float"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Bool"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "String"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Char"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Void"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Bytes"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Ptr"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Fixed"; kind = builtin_type_symbol () }
     (* Internal runtime array ABI type. Source programs use postfix T[#N] syntax. *)
     |> fun e ->
     add_symbol e
-      {
-        name = "Tensor";
-        kind =
-          TypeSymbol
-            { type_params = [ "T" ]; variants = []; type_kind = TypeBuiltin };
-      }
+      { name = "Tensor"; kind = builtin_type_symbol ~type_params:[ "T" ] () }
     (* Sized integer types *)
     |> fun e ->
-    add_symbol e
-      {
-        name = "Int8";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Int16";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Int32";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Int128";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "UInt8";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "UInt16";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "UInt32";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "UInt64";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "UInt128";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
+    add_symbol e { name = "Int8"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Int16"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Int32"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Int128"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "UInt8"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "UInt16"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "UInt32"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "UInt64"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "UInt128"; kind = builtin_type_symbol () }
     (* Sized float types *)
     |> fun e ->
-    add_symbol e
-      {
-        name = "Float32";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
-    |> fun e ->
-    add_symbol e
-      {
-        name = "Float16";
-        kind =
-          TypeSymbol
-            { type_params = []; variants = []; type_kind = TypeBuiltin };
-      }
+    add_symbol e { name = "Float32"; kind = builtin_type_symbol () } |> fun e ->
+    add_symbol e { name = "Float16"; kind = builtin_type_symbol () }
   in
 
   (* Int64 is an alias for Int *)
@@ -218,28 +85,25 @@ let with_builtins (env : env) : env =
       {
         name = "Option";
         kind =
-          TypeSymbol
-            {
-              type_params = [ "T" ];
-              type_kind = TypeBuiltin;
-              variants =
-                [
-                  {
-                    variant_name = "Some";
-                    variant_fields = [ TyVar "T" ];
-                    variant_tag = 0;
-                    variant_loc = dummy_loc;
-                    variant_def_id = None;
-                  };
-                  {
-                    variant_name = "None";
-                    variant_fields = [];
-                    variant_tag = 1;
-                    variant_loc = dummy_loc;
-                    variant_def_id = None;
-                  };
-                ];
-            };
+          builtin_type_symbol ~type_params:[ "T" ]
+            ~variants:
+              [
+                {
+                  variant_name = "Some";
+                  variant_fields = [ TyVar "T" ];
+                  variant_tag = 0;
+                  variant_loc = dummy_loc;
+                  variant_def_id = None;
+                };
+                {
+                  variant_name = "None";
+                  variant_fields = [];
+                  variant_tag = 1;
+                  variant_loc = dummy_loc;
+                  variant_def_id = None;
+                };
+              ]
+            ();
       }
   in
   let env =
@@ -280,28 +144,25 @@ let with_builtins (env : env) : env =
       {
         name = "Result";
         kind =
-          TypeSymbol
-            {
-              type_params = [ "T"; "E" ];
-              type_kind = TypeBuiltin;
-              variants =
-                [
-                  {
-                    variant_name = "Ok";
-                    variant_fields = [ TyVar "T" ];
-                    variant_tag = 0;
-                    variant_loc = dummy_loc;
-                    variant_def_id = None;
-                  };
-                  {
-                    variant_name = "Err";
-                    variant_fields = [ TyVar "E" ];
-                    variant_tag = 1;
-                    variant_loc = dummy_loc;
-                    variant_def_id = None;
-                  };
-                ];
-            };
+          builtin_type_symbol ~type_params:[ "T"; "E" ]
+            ~variants:
+              [
+                {
+                  variant_name = "Ok";
+                  variant_fields = [ TyVar "T" ];
+                  variant_tag = 0;
+                  variant_loc = dummy_loc;
+                  variant_def_id = None;
+                };
+                {
+                  variant_name = "Err";
+                  variant_fields = [ TyVar "E" ];
+                  variant_tag = 1;
+                  variant_loc = dummy_loc;
+                  variant_def_id = None;
+                };
+              ]
+            ();
       }
   in
   let env =
@@ -1311,35 +1172,32 @@ let with_builtins (env : env) : env =
       {
         name = "ConcurrencyError";
         kind =
-          TypeSymbol
-            {
-              type_params = [];
-              type_kind = TypeBuiltin;
-              variants =
-                [
-                  {
-                    variant_name = "Timeout";
-                    variant_fields = [];
-                    variant_tag = 0;
-                    variant_loc = dummy_loc;
-                    variant_def_id = None;
-                  };
-                  {
-                    variant_name = "TaskFailed";
-                    variant_fields = [ ty_string ];
-                    variant_tag = 1;
-                    variant_loc = dummy_loc;
-                    variant_def_id = None;
-                  };
-                  {
-                    variant_name = "Cancelled";
-                    variant_fields = [];
-                    variant_tag = 2;
-                    variant_loc = dummy_loc;
-                    variant_def_id = None;
-                  };
-                ];
-            };
+          builtin_type_symbol
+            ~variants:
+              [
+                {
+                  variant_name = "Timeout";
+                  variant_fields = [];
+                  variant_tag = 0;
+                  variant_loc = dummy_loc;
+                  variant_def_id = None;
+                };
+                {
+                  variant_name = "TaskFailed";
+                  variant_fields = [ ty_string ];
+                  variant_tag = 1;
+                  variant_loc = dummy_loc;
+                  variant_def_id = None;
+                };
+                {
+                  variant_name = "Cancelled";
+                  variant_fields = [];
+                  variant_tag = 2;
+                  variant_loc = dummy_loc;
+                  variant_def_id = None;
+                };
+              ]
+            ();
       }
   in
   let env =
@@ -1406,12 +1264,7 @@ let with_builtins (env : env) : env =
   (* Channel type for bounded MPMC channels *)
   let env =
     add_symbol env
-      {
-        name = "Channel";
-        kind =
-          TypeSymbol
-            { type_params = [ "T" ]; variants = []; type_kind = TypeBuiltin };
-      }
+      { name = "Channel"; kind = builtin_type_symbol ~type_params:[ "T" ] () }
   in
 
   (* Channel builtins (impure - block on send/recv) *)

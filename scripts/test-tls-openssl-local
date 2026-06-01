@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Exercise the opt-in OpenSSL TLS backend against a local TLS endpoint.
+#
+# This is intentionally not part of the default gate: it requires the OpenSSL
+# command-line tool and a host OpenSSL install that can compile/link the runtime
+# backend. It does not depend on public network access.
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+repo_root="$(cd "$script_dir/.." && pwd -P)"
+cd "$repo_root"
+
+command -v openssl >/dev/null 2>&1 || {
+    echo "error: openssl is required for this integration test" >&2
+    exit 1
+}
+
+command -v python3 >/dev/null 2>&1 || {
+    echo "error: python3 is required for this integration test" >&2
+    exit 1
+}
+
+tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/blorp-tls-openssl.XXXXXX")"
+server_pid=""
+
+cleanup() {
+    if [ -n "$server_pid" ]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    fi
+    rm -rf "$tmpdir"
+}
+trap cleanup EXIT INT TERM
+
+cert="$tmpdir/localhost.pem"
+key="$tmpdir/localhost.key"
+program="$tmpdir/tls_openssl_local.brp"
+server_log="$tmpdir/s_server.log"
+
+openssl req \
+    -x509 \
+    -newkey rsa:2048 \
+    -nodes \
+    -days 1 \
+    -sha256 \
+    -keyout "$key" \
+    -out "$cert" \
+    -subj "/CN=localhost" \
+    -addext "subjectAltName=DNS:localhost" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
+    >/dev/null 2>&1
+
+port="$(python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)"
+
+openssl s_server \
+    -quiet \
+    -www \
+    -accept "127.0.0.1:${port}" \
+    -cert "$cert" \
+    -key "$key" \
+    >"$server_log" 2>&1 &
+server_pid="$!"
+
+python3 - "$port" "$server_pid" <<'PY'
+import os
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+server_pid = int(sys.argv[2])
+deadline = time.time() + 5.0
+
+while time.time() < deadline:
+    try:
+        os.kill(server_pid, 0)
+    except OSError:
+        raise SystemExit("openssl s_server exited before accepting connections")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.1)
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise SystemExit(0)
+    time.sleep(0.05)
+
+raise SystemExit("timed out waiting for openssl s_server")
+PY
+
+cat >"$program" <<'BRP'
+import:
+	bytes as B
+	net/tcp as TCP
+	net/tls as TLS
+	string: contains, parse_int
+	system: getenv
+
+
+func configured_port() -> Int:
+	match getenv("BLORP_TLS_TEST_PORT"):
+		Some(raw):
+			match raw.parse_int():
+				Some(port): port
+				None: 0
+		None: 0
+
+
+func tls_round_trip() -> Result[Bool, String]:
+	if not TLS.native_available():
+		Err("native TLS unavailable")
+	else:
+		port: Int = configured_port()
+		if port <= 0:
+			Err("missing BLORP_TLS_TEST_PORT")
+		else:
+			with stream ?= TCP.connect_numeric(
+				"127.0.0.1",
+				port,
+			) on err => "tcp connect: " + TCP.message(err):
+				match TCP.set_stream_timeout(stream, 5000):
+					Err(err): Err("tcp timeout setup: " + TCP.message(err))
+					Ok(_):
+						with session ?= TLS.connect(stream, "localhost") on err => "tls connect: " + TLS.message(err):
+							request: Bytes = "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n".to_bytes()
+							match TLS.write_all(session, request):
+								Err(err): Err("tls write: " + TLS.message(err))
+								Ok(_):
+									match TLS.read_chunk(session, 4096):
+										Err(err): Err("tls read: " + TLS.message(err))
+										Ok(chunk):
+											text: String = B.to_string(chunk)
+											Ok(B.length(chunk) > 0 and text.contains("HTTP/"))
+
+
+func main(args: List[String]) -> Int:
+	match tls_round_trip():
+		Ok(True): 0
+		Ok(False):
+			print("TLS round trip returned an unexpected response")
+			1
+		Err(err):
+			print(err)
+			1
+BRP
+
+env \
+    SSL_CERT_FILE="$cert" \
+    BLORP_TLS_BACKEND=openssl \
+    BLORP_TLS_TEST_PORT="$port" \
+    ./blorp run --no-format "$program"
+

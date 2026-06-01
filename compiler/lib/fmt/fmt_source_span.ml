@@ -104,9 +104,14 @@ let rec expr_source_end_line e =
           max acc (expr_source_end_line arm.select_arm_body))
         base arms
   | EWith (binding, body) ->
+      let mapped_end =
+        match binding.with_error_map with
+        | Some mapper -> expr_source_end_line mapper.with_error_value
+        | None -> base
+      in
       max base
         (max
-           (expr_source_end_line binding.with_value)
+           (max (expr_source_end_line binding.with_value) mapped_end)
            (expr_source_end_line body))
   | EConcurrentlyLoop (_, iterable, body, timeout, _) ->
       max_optional_expr

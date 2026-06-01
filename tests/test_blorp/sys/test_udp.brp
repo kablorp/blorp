@@ -1,0 +1,242 @@
+-- UDP resource tests.
+--
+-- UDP sockets are scoped resources. Tests keep the socket inside `with` and
+-- only move ordinary datagram data through operations.
+import:
+	net/udp:
+		Datagram,
+		UdpError,
+		bind,
+		bind_numeric,
+		datagrams,
+		local_port,
+		message,
+		recv_from,
+		send_to,
+		send_to_numeric,
+		send_to_wait,
+		send_to_wait_numeric,
+		socket,
+	stream: find_result
+	test: TestSuite
+
+
+pure func is_socket_permission_error(err: UdpError) -> Bool:
+	detail_msg: String = message(err)
+	detail_msg.contains("Operation not permitted") or detail_msg.contains("Permission denied")
+
+
+pure func is_invalid_message(message: String, detail: String) -> Bool:
+	message.starts_with("invalid input: ") and message.contains(detail)
+
+
+func scoped_bind_local_port() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= bind(sock, "127.0.0.1", 0)
+		port ?= local_port(sock)
+		Ok(port > 0)
+
+
+func test_bind_local_port() -> Bool:
+	match scoped_bind_local_port():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_send_to_loopback() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= bind(sock, "127.0.0.1", 0)
+		sent ?= send_to(sock, "ping".to_bytes(), "127.0.0.1", 9)
+		Ok(sent == 4)
+
+
+func test_send_to_loopback() -> Bool:
+	match scoped_send_to_loopback():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_send_to_wait_loopback() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= bind(sock, "127.0.0.1", 0)
+		sent ?= send_to_wait(sock, "ping".to_bytes(), "127.0.0.1", 9)
+		Ok(sent == 4)
+
+
+func test_send_to_wait_loopback() -> Bool:
+	match scoped_send_to_wait_loopback():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_numeric_send_to_loopback() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= bind_numeric(sock, "127.0.0.1", 0)
+		sent ?= send_to_numeric(sock, "ping".to_bytes(), "127.0.0.1", 9)
+		Ok(sent == 4)
+
+
+func test_numeric_send_to_loopback() -> Bool:
+	match scoped_numeric_send_to_loopback():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_numeric_send_to_wait_loopback() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= bind_numeric(sock, "127.0.0.1", 0)
+		sent ?= send_to_wait_numeric(sock, "ping".to_bytes(), "127.0.0.1", 9)
+		Ok(sent == 4)
+
+
+func test_numeric_send_to_wait_loopback() -> Bool:
+	match scoped_numeric_send_to_wait_loopback():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_recv_from_loopback() -> Result[Bool, UdpError]:
+	with receiver ?= socket():
+		ignored ?= bind(receiver, "127.0.0.1", 0)
+		port ?= local_port(receiver)
+		with sender ?= socket():
+			sent ?= send_to(sender, "pong".to_bytes(), "127.0.0.1", port)
+			datagram ?= recv_from(receiver, 64)
+			Ok(
+				sent == 4 and datagram.data.to_string() == "pong" and datagram.host == "127.0.0.1" and datagram.port > 0,
+			)
+
+
+func test_recv_from_loopback() -> Bool:
+	match scoped_recv_from_loopback():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_datagram_stream_find() -> Result[Bool, UdpError]:
+	with receiver ?= socket():
+		ignored ?= bind(receiver, "127.0.0.1", 0)
+		port ?= local_port(receiver)
+		with sender ?= socket():
+			sent1 ?= send_to(sender, "skip".to_bytes(), "127.0.0.1", port)
+			sent2 ?= send_to(sender, "target".to_bytes(), "127.0.0.1", port)
+			match datagrams(
+				receiver,
+				64,
+			).find_result(
+				func(datagram: Datagram): datagram.data.to_string() == "target",
+			):
+				Ok(Some(datagram)):
+					Ok(
+						sent1 == 4 and sent2 == 6 and datagram.data.to_string() == "target" and datagram.host == "127.0.0.1" and datagram.port > 0,
+					)
+				Ok(None): Ok(False)
+				Err(err): Err(err)
+
+
+func test_datagram_stream_find() -> Bool:
+	match scoped_datagram_stream_find():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func invalid_bind_port_result() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= bind(sock, "127.0.0.1", -1)
+		Ok(False)
+
+
+func test_invalid_bind_port_is_typed() -> Bool:
+	match invalid_bind_port_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "port")
+
+
+func invalid_recv_size_result() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= recv_from(sock, 0)
+		Ok(False)
+
+
+func test_invalid_recv_size_is_typed() -> Bool:
+	match invalid_recv_size_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "max_bytes")
+
+
+func invalid_datagram_stream_size_result() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		match datagrams(sock, 0).find_result(func(datagram: Datagram): True):
+			Ok(_): Ok(False)
+			Err(err): Err(err)
+
+
+func test_invalid_datagram_stream_size_is_typed() -> Bool:
+	match invalid_datagram_stream_size_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "max_bytes")
+
+
+func bind_numeric_hostname_result() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= bind_numeric(sock, "localhost", 0)
+		Ok(False)
+
+
+func test_bind_numeric_rejects_hostname_without_dns() -> Bool:
+	match bind_numeric_hostname_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "numeric IPv4")
+
+
+func send_to_numeric_hostname_result() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= send_to_numeric(sock, "ping".to_bytes(), "localhost", 9)
+		Ok(False)
+
+
+func test_send_to_numeric_rejects_hostname_without_dns() -> Bool:
+	match send_to_numeric_hostname_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "numeric IPv4")
+
+
+func send_to_wait_numeric_hostname_result() -> Result[Bool, UdpError]:
+	with sock ?= socket():
+		ignored ?= send_to_wait_numeric(sock, "ping".to_bytes(), "localhost", 9)
+		Ok(False)
+
+
+func test_send_to_wait_numeric_rejects_hostname_without_dns() -> Bool:
+	match send_to_wait_numeric_hostname_result():
+		Ok(_): False
+		Err(err): is_invalid_message(message(err), "numeric IPv4")
+
+
+tests: TestSuite = {
+	description = "UDP resource tests",
+	tests = [
+		("bind and local_port use scoped socket", test_bind_local_port),
+		("send_to accepts ordinary bytes", test_send_to_loopback),
+		("send_to_wait accepts ordinary bytes", test_send_to_wait_loopback),
+		("send_to_numeric rejects DNS and sends bytes", test_numeric_send_to_loopback),
+		("send_to_wait_numeric rejects DNS and sends bytes", test_numeric_send_to_wait_loopback),
+		("recv_from returns ordinary datagram data", test_recv_from_loopback),
+		("datagram stream yields ordinary datagrams", test_datagram_stream_find),
+		("invalid bind port is typed", test_invalid_bind_port_is_typed),
+		("invalid recv size is typed", test_invalid_recv_size_is_typed),
+		("invalid datagram stream size is typed", test_invalid_datagram_stream_size_is_typed),
+		(
+			"bind_numeric rejects hostnames before DNS",
+			test_bind_numeric_rejects_hostname_without_dns,
+		),
+		(
+			"send_to_numeric rejects hostnames before DNS",
+			test_send_to_numeric_rejects_hostname_without_dns,
+		),
+		(
+			"send_to_wait_numeric rejects hostnames before DNS",
+			test_send_to_wait_numeric_rejects_hostname_without_dns,
+		),
+	]
+}

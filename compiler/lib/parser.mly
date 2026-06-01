@@ -258,7 +258,7 @@ let apply_concurrently_loop_param params (name, value) =
 %token LT GT PERCENT HASH AT ARROW LE GE EQ NE EQUALS
 %token PLUS_EQ MINUS_EQ STAR_EQ SLASH_EQ
 %token QUESTION_EQUALS FATARROW
-%token TRY WITH DEBUG RESOURCE
+%token TRY WITH DEBUG RESOURCE ON
 %token CONCURRENT CONCURRENTLY
 %token SELECT FROM AFTER SEALED
 %token PIPE
@@ -329,6 +329,7 @@ name:
   | FROM { "from" }
   | AFTER { "after" }
   | SEALED { "sealed" }
+  | ON { "on" }
 
 identifier:
   | n = IDENT { n }
@@ -339,12 +340,14 @@ identifier:
   | FROM { "from" }
   | AFTER { "after" }
   | SEALED { "sealed" }
+  | ON { "on" }
 
 binding_ident:
   | n = IDENT { n }
   | FROM { "from" }
   | AFTER { "after" }
   | SEALED { "sealed" }
+  | ON { "on" }
 
 (* Optional docstring preceding a declaration *)
 docstring:
@@ -577,16 +580,21 @@ select_recv_ident:
 with_binding:
   | name = destruct_ident EQUALS value = expr
     { { with_name = name; with_type = None;
-        with_value = value; with_kind = WithPlain } }
+        with_value = value; with_kind = WithPlain; with_error_map = None } }
   | name = destruct_ident COLON ty = type_expr EQUALS value = expr
     { { with_name = name; with_type = Some ty;
-        with_value = value; with_kind = WithPlain } }
-  | name = destruct_ident QUESTION_EQUALS value = expr
+        with_value = value; with_kind = WithPlain; with_error_map = None } }
+  | name = destruct_ident QUESTION_EQUALS value = expr m = with_error_map_opt
     { { with_name = name; with_type = None;
-        with_value = value; with_kind = WithTry } }
-  | name = destruct_ident COLON ty = type_expr QUESTION_EQUALS value = expr
+        with_value = value; with_kind = WithTry; with_error_map = m } }
+  | name = destruct_ident COLON ty = type_expr QUESTION_EQUALS value = expr m = with_error_map_opt
     { { with_name = name; with_type = Some ty;
-        with_value = value; with_kind = WithTry } }
+        with_value = value; with_kind = WithTry; with_error_map = m } }
+
+with_error_map_opt:
+  | ON name = destruct_ident FATARROW value = expr
+    { Some { with_error_name = name; with_error_value = value } }
+  | { None }
 
 stmt:
   | d = stmt_var_decl

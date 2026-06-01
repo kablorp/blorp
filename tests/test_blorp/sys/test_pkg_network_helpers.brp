@@ -1,0 +1,256 @@
+import:
+	bytes as B
+	net/tls as StdTLS
+	net/url as U
+	pkg/net/dns: DnsError(LookupFailed)
+	pkg/net/http_client as HTTP
+	pkg/net/smtp as SMTP
+	pkg/net/tls as TLS
+	pkg/net/udp as UDP
+	pkg/net/websocket as WS
+	test: TestSuite
+
+
+func test_websocket_apply_mask_known_value() -> Bool:
+	var mask: Bytes = B.bytes(4)
+	mask = mask.set_index(0, 1)
+	mask = mask.set_index(1, 2)
+	mask = mask.set_index(2, 3)
+	mask = mask.set_index(3, 4)
+	B.to_hex(WS.apply_mask("ping".to_bytes(), mask)) == "716b6d63"
+
+
+func test_websocket_accept_matches_rfc_example() -> Bool:
+	key: String = "dGhlIHNhbXBsZSBub25jZQ=="
+	WS.compute_accept(key) == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+
+
+func test_websocket_verify_handshake_accepts_matching_key() -> Bool:
+	key: String = "dGhlIHNhbXBsZSBub25jZQ=="
+	response: String = "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " + WS.compute_accept(
+		key,
+	) + "\r\n\r\n"
+	match WS.verify_handshake(response, key):
+		Ok(value): value
+		Err(_): False
+
+
+func test_websocket_connect_reports_std_migration() -> Bool:
+	match WS.connect("ws://example.com/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("std/net/websocket")
+
+
+func test_websocket_connect_reports_invalid_url() -> Bool:
+	match WS.connect("not a url"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("invalid URL")
+
+
+func test_websocket_connect_reports_invalid_scheme() -> Bool:
+	match WS.connect("http://example.com/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("scheme must be ws:// or wss://")
+
+
+func test_websocket_connect_reports_missing_host() -> Bool:
+	match WS.connect("ws://"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("url must include a host")
+
+
+func test_websocket_connect_reports_empty_host_with_port() -> Bool:
+	match WS.connect("ws://:80/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("url must include a host")
+
+
+func test_websocket_connect_reports_empty_port() -> Bool:
+	match WS.connect("ws://example.com:/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("port must not be empty")
+
+
+func test_websocket_connect_reports_non_numeric_port() -> Bool:
+	match WS.connect("ws://example.com:abc/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("port must contain only digits")
+
+
+func test_websocket_connect_reports_oversized_port() -> Bool:
+	match WS.connect("ws://example.com:65536/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("port must be between 0 and 65535")
+
+
+func test_websocket_connect_reports_userinfo() -> Bool:
+	match WS.connect("ws://user@example.com/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("url must not include user info")
+
+
+func test_websocket_connect_reports_raw_space() -> Bool:
+	match WS.connect("ws://exa mple.com/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("url must not contain raw control or space characters")
+
+
+func test_websocket_connect_reports_fragment() -> Bool:
+	match WS.connect("ws://example.com/socket#section"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("url must not include a fragment")
+
+
+func test_websocket_connect_accepts_ipv6_authority_shape() -> Bool:
+	match WS.connect("ws://[::1]:80/socket"):
+		Ok(_): False
+		Err(err): WS
+			.message(err)
+			.contains("std/net/websocket")
+
+
+func test_websocket_build_handshake_keeps_path_and_query() -> Bool:
+	match U.parse("ws://example.com/chat?room=blue"):
+		Err(_): False
+		Ok(url):
+			raw: String = B.to_string(WS.build_handshake("example.com", 80, url, "key"))
+			raw.contains(
+				"GET /chat?room=blue HTTP/1.1\r\n",
+			) and raw.contains("Sec-WebSocket-Key: key\r\n")
+
+
+func test_smtp_tls_guard_matches_native_availability() -> Bool:
+	config: SMTP.Config = {
+		host = "127.0.0.1",
+		port = 1,
+		username = "from@example.com",
+		password = "secret",
+		use_tls = True
+	}
+	match SMTP.send_email(config, "to@example.com", "subject", "body"):
+		Ok(_): False
+		Err(err):
+			if StdTLS.native_available():
+				not err.contains("STARTTLS requires TLS resource")
+			else:
+				err.contains("STARTTLS requires TLS resource") and err.contains("native TLS")
+
+
+func test_smtp_message_has_headers_and_dot_terminator() -> Bool:
+	message: String = SMTP.build_message(
+		"from@example.com",
+		"to@example.com",
+		"subject",
+		"body",
+		"text/plain",
+	)
+	message.contains(
+		"Subject: subject\r\n",
+	) and message.contains(
+		"Content-Type: text/plain; charset=utf-8\r\n",
+	) and message.contains("\r\n.\r\n")
+
+
+func test_udp_socket_reports_resource_gap() -> Bool:
+	match UDP.socket():
+		Ok(_): False
+		Err(err): UDP
+			.message(err)
+			.contains("scoped UDP resource")
+
+
+func test_tls_connect_reports_resource_gap() -> Bool:
+	match TLS.connect("example.com", 443):
+		Ok(_): False
+		Err(err): TLS
+			.message(err)
+			.contains("scoped TLS resource")
+
+
+func test_http_https_guard_matches_native_availability() -> Bool:
+	match HTTP.request("GET", "https://127.0.0.1:1/", [], None):
+		Ok(_): False
+		Err(err):
+			if StdTLS.native_available():
+				not err.contains("TLS resource support")
+			else:
+				err.contains("TLS resource support")
+
+
+func test_dns_message_reports_lookup_failure() -> Bool:
+	LookupFailed("missing host").to_string() == "lookup failed: missing host"
+
+
+tests: TestSuite = {
+	description = "package networking helper tests",
+	tests = [
+		("websocket apply_mask known value", test_websocket_apply_mask_known_value),
+		("websocket accept matches RFC example", test_websocket_accept_matches_rfc_example),
+		(
+			"websocket verify_handshake accepts matching key",
+			test_websocket_verify_handshake_accepts_matching_key,
+		),
+		("websocket connect reports std migration", test_websocket_connect_reports_std_migration),
+		("websocket connect reports invalid url", test_websocket_connect_reports_invalid_url),
+		("websocket connect reports invalid scheme", test_websocket_connect_reports_invalid_scheme),
+		("websocket connect reports missing host", test_websocket_connect_reports_missing_host),
+		(
+			"websocket connect reports empty host with port",
+			test_websocket_connect_reports_empty_host_with_port,
+		),
+		("websocket connect reports empty port", test_websocket_connect_reports_empty_port),
+		(
+			"websocket connect reports non-numeric port",
+			test_websocket_connect_reports_non_numeric_port,
+		),
+		("websocket connect reports oversized port", test_websocket_connect_reports_oversized_port),
+		("websocket connect reports userinfo", test_websocket_connect_reports_userinfo),
+		("websocket connect reports raw space", test_websocket_connect_reports_raw_space),
+		("websocket connect reports fragment", test_websocket_connect_reports_fragment),
+		(
+			"websocket connect accepts IPv6 authority shape",
+			test_websocket_connect_accepts_ipv6_authority_shape,
+		),
+		(
+			"websocket build_handshake keeps path and query",
+			test_websocket_build_handshake_keeps_path_and_query,
+		),
+		(
+			"smtp tls guard matches native availability",
+			test_smtp_tls_guard_matches_native_availability,
+		),
+		(
+			"smtp message has headers and dot terminator",
+			test_smtp_message_has_headers_and_dot_terminator,
+		),
+		("udp socket reports resource gap", test_udp_socket_reports_resource_gap),
+		("tls connect reports resource gap", test_tls_connect_reports_resource_gap),
+		(
+			"http https guard matches native availability",
+			test_http_https_guard_matches_native_availability,
+		),
+		("dns message reports lookup failure", test_dns_message_reports_lookup_failure),
+	]
+}
