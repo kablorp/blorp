@@ -13,7 +13,7 @@ func main(args: List[String]):
     print("Hello, world!")
 ```
 
-Every program needs a `main` function. The return type can be `Int` (exit code) or omitted/`Void` (implicit exit 0). If `-> Int` is written, the body must end with an `Int` expression. `args` contains `argv` including the program name at index 0.
+Every runnable program needs a `main` function in the root source file being compiled or run. The return type can be `Int` (exit code) or omitted/`Void` (implicit exit 0). If `-> Int` is written, the body must end with an `Int` expression. `args` contains `argv` including the program name at index 0. Imported modules may also export functions named `main`; those imports are ordinary functions and do not become the program entrypoint.
 
 ```blorp
 -- same function with explicit status code 

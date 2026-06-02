@@ -119,7 +119,8 @@ and expr_has_tail_self_call (f : core_func) (e : core) : bool =
       | _ -> false)
 
 let should_lower_unmanaged ~reg (f : core_func) (body : core) : bool =
-  f.cf_name <> "main" && f.cf_params <> [] && unmanaged_safe ~reg f body
+  (not (Core.is_program_entrypoint f))
+  && f.cf_params <> [] && unmanaged_safe ~reg f body
   && expr_has_tail_self_call f body
 
 let list_type ~reg ty = Option.is_some (Core_layout_type.list_type ~reg ty)
@@ -140,7 +141,7 @@ let list_param_plan ~reg (f : core_func) : (int * core_param) option =
             && non_list_params_unmanaged (i + 1) rest
       in
       if
-        f.cf_name <> "main"
+        (not (Core.is_program_entrypoint f))
         && type_is_known_unmanaged ~reg f.cf_return_ty
         && non_list_params_unmanaged 0 f.cf_params
       then Some (list_index, list_param)

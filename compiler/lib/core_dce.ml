@@ -980,7 +980,7 @@ let seed_roots (state : reachability) (prog : core_program) : bool =
   let saw_main = ref false in
   let rec visit_decl decl =
     match decl.cd_desc with
-    | CDFunc f when String.equal f.cf_name "main" ->
+    | CDFunc f when Core.is_program_entrypoint f ->
         saw_main := true;
         if has_concrete_emitted_body f then
           mark_root state RootMain (FunctionBody f.cf_def_id)
