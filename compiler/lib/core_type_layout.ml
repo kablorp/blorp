@@ -71,8 +71,8 @@ let builtin_layout = function
   | "List" | "ParallelList" | "ParallelVector" | "ParallelMatrix" | "Dict"
   | "Set" | "Tensor" | "Vector" | "Matrix" | "Builder" | "Slice" | "Option"
   | "Result" | "Task" | "Channel" | "TcpListener" | "TcpStream" | "TlsSession"
-  | "IpAddress" | "DnsName" | "InterfaceScope"
-  | "std/net/tls::TlsSession" | "std_net_tls__TlsSession" | "WebSocketSession"
+  | "IpAddress" | "DnsName" | "InterfaceScope" | "std/net/tls::TlsSession"
+  | "std_net_tls__TlsSession" | "WebSocketSession"
   | "std/net/websocket::WebSocketSession"
   | "std_net_websocket__WebSocketSession" | "ConcurrencyError" ->
       Some managed_layout

@@ -113,6 +113,46 @@ let expected_tcp_operations =
       [ "TcpListener" ],
       0,
       Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_listen_loopback_raw",
+      "blorp_TcpListenerResult",
+      [ "TcpListener" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_listen_loopback_any_port_raw",
+      "blorp_TcpListenerResult",
+      [ "TcpListener" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_listen_any_interface_raw",
+      "blorp_TcpListenerResult",
+      [ "TcpListener" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_listen_any_interface_any_port_raw",
+      "blorp_TcpListenerResult",
+      [ "TcpListener" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_listen_ip_raw",
+      "blorp_TcpListenerResult",
+      [ "TcpListener" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_listen_ip_any_port_raw",
+      "blorp_TcpListenerResult",
+      [ "TcpListener" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_listen_scoped_ip_raw",
+      "blorp_TcpListenerResult",
+      [ "TcpListener" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_listen_scoped_ip_any_port_raw",
+      "blorp_TcpListenerResult",
+      [ "TcpListener" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
     ( "blorp_tcp_accept_raw",
       "blorp_TcpStreamResult",
       [ "TcpStream" ],
@@ -124,6 +164,26 @@ let expected_tcp_operations =
       0,
       Blorp.Env_types.ResourceResultIndependent );
     ( "blorp_tcp_connect_numeric_raw",
+      "blorp_TcpStreamResult",
+      [ "TcpStream" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_connect_loopback_raw",
+      "blorp_TcpStreamResult",
+      [ "TcpStream" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_connect_ip_raw",
+      "blorp_TcpStreamResult",
+      [ "TcpStream" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_connect_scoped_ip_raw",
+      "blorp_TcpStreamResult",
+      [ "TcpStream" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_tcp_connect_name_raw",
       "blorp_TcpStreamResult",
       [ "TcpStream" ],
       0,
@@ -386,9 +446,23 @@ let expected_operation_arguments =
     ("blorp_dns_resolve_raw", [ ArgBorrow ]);
     ("blorp_tcp_listen_raw", [ ArgBorrow; ArgBorrow; ArgBorrow ]);
     ("blorp_tcp_listen_numeric_raw", [ ArgBorrow; ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_listen_loopback_raw", [ ArgBorrow; ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_listen_loopback_any_port_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_listen_any_interface_raw", [ ArgBorrow; ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_listen_any_interface_any_port_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_listen_ip_raw", [ ArgBorrow; ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_listen_ip_any_port_raw", [ ArgBorrow; ArgBorrow ]);
+    ( "blorp_tcp_listen_scoped_ip_raw",
+      [ ArgBorrow; ArgBorrow; ArgBorrow; ArgBorrow ] );
+    ( "blorp_tcp_listen_scoped_ip_any_port_raw",
+      [ ArgBorrow; ArgBorrow; ArgBorrow ] );
     ("blorp_tcp_accept_raw", [ ArgBorrow ]);
     ("blorp_tcp_connect_raw", [ ArgBorrow; ArgBorrow ]);
     ("blorp_tcp_connect_numeric_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_connect_loopback_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_connect_ip_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_connect_scoped_ip_raw", [ ArgBorrow; ArgBorrow; ArgBorrow ]);
+    ("blorp_tcp_connect_name_raw", [ ArgBorrow; ArgBorrow ]);
     ("blorp_tcp_read_raw", [ ArgBorrow; ArgBorrow ]);
     ("blorp_tcp_write_raw", [ ArgBorrow; ArgBorrow ]);
     ("blorp_tcp_write_all_raw", [ ArgBorrow; ArgBorrow ]);
@@ -453,6 +527,10 @@ let expected_parking_operations =
     "blorp_tcp_accept_raw";
     "blorp_tcp_connect_raw";
     "blorp_tcp_connect_numeric_raw";
+    "blorp_tcp_connect_loopback_raw";
+    "blorp_tcp_connect_ip_raw";
+    "blorp_tcp_connect_scoped_ip_raw";
+    "blorp_tcp_connect_name_raw";
     "blorp_tcp_read_raw";
     "blorp_tcp_write_raw";
     "blorp_tcp_write_all_raw";
@@ -499,6 +577,10 @@ let expected_fiber_resource_result_wait_operations =
     ("blorp_tcp_accept_raw", "independent");
     ("blorp_tcp_connect_raw", "independent");
     ("blorp_tcp_connect_numeric_raw", "independent");
+    ("blorp_tcp_connect_loopback_raw", "independent");
+    ("blorp_tcp_connect_ip_raw", "independent");
+    ("blorp_tcp_connect_scoped_ip_raw", "independent");
+    ("blorp_tcp_connect_name_raw", "independent");
     ("blorp_tls_connect_raw", "dependent");
     ("blorp_websocket_connect_raw", "independent");
   ]

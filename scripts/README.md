@@ -10,13 +10,13 @@ lower-level test runners directly.
 
 ```bash
 scripts/test                    # all gates
-scripts/test unit               # OCaml unit tests
+scripts/test compiler-unit      # compiler-internal OCaml/Alcotest tests
 scripts/test compiler           # compiler fixtures and codegen audit
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines
 scripts/test doctest            # std doctests
 scripts/test cli                # public CLI, REPL, and LSP smoke tests
-scripts/test unit compiler      # multiple selected gates
+scripts/test compiler-unit compiler  # multiple selected gates
 ```
 
 Useful options:
@@ -25,7 +25,7 @@ Useful options:
 scripts/test --serial           # run selected gates one at a time
 scripts/test --verbose          # stream child-runner output
 scripts/test --log-dir logs     # keep complete gate logs
-scripts/test --coverage         # OCaml unit coverage
+scripts/test --coverage         # compiler-unit coverage
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary;

@@ -671,20 +671,17 @@ let result_bridges =
       tcp_listener_payload
       [ ArgBorrow; ArgBorrow; ArgBorrow ];
     tcp_bridge "blorp_tcp_listen_loopback_any_port_raw"
-      "blorp_TcpListenerResult" tcp_listener_payload
-      [ ArgBorrow; ArgBorrow ];
+      "blorp_TcpListenerResult" tcp_listener_payload [ ArgBorrow; ArgBorrow ];
     tcp_bridge "blorp_tcp_listen_any_interface_raw" "blorp_TcpListenerResult"
       tcp_listener_payload
       [ ArgBorrow; ArgBorrow; ArgBorrow ];
     tcp_bridge "blorp_tcp_listen_any_interface_any_port_raw"
-      "blorp_TcpListenerResult" tcp_listener_payload
-      [ ArgBorrow; ArgBorrow ];
+      "blorp_TcpListenerResult" tcp_listener_payload [ ArgBorrow; ArgBorrow ];
     tcp_bridge "blorp_tcp_listen_ip_raw" "blorp_TcpListenerResult"
       tcp_listener_payload
       [ ArgBorrow; ArgBorrow; ArgBorrow ];
     tcp_bridge "blorp_tcp_listen_ip_any_port_raw" "blorp_TcpListenerResult"
-      tcp_listener_payload
-      [ ArgBorrow; ArgBorrow ];
+      tcp_listener_payload [ ArgBorrow; ArgBorrow ];
     tcp_bridge "blorp_tcp_listen_scoped_ip_raw" "blorp_TcpListenerResult"
       tcp_listener_payload
       [ ArgBorrow; ArgBorrow; ArgBorrow; ArgBorrow ];

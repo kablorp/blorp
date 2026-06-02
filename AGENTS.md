@@ -111,6 +111,7 @@ When documentation, tests, and implementation disagree:
 When choosing implementation strategies:
 
 - Do not rely on flimsy heuristics. If correctness depends on a distinction, represent it explicitly in the AST/IR/data model, a parser or type-checker rule, or a named configuration point. Avoid guessing from names, shapes, string prefixes, source formatting, or "usually true" patterns unless there is no better representation; if a heuristic is unavoidable, isolate it, document the tradeoff, and cover failure modes with tests.
+- Avoid magic values. Give non-obvious numbers, strings, limits, sentinel values, and protocol constants meaningful names at the narrowest useful scope. If a literal is required by an external format, ABI, wire protocol, or compiler invariant, name it or document that source of truth near the value.
 - Make illegal states unrepresentable, especially in compiler code. Prefer precise variants, phase-specific types, explicit enums, and smart constructors over boolean flag combinations, stringly typed tags, nullable fields with hidden coupling, or comments that describe invariants the type system could enforce. Push validation to construction boundaries so later phases can rely on well-formed inputs.
 
 ---
@@ -215,19 +216,19 @@ meaningfully improve first-time user experience or prevent confusing parser/type
 # Build the compiler (outputs ./blorp in project root)
 make
 
-# Run ALL tests (unit + compiler + runtime + leak + doctest + cli)
+# Run ALL tests (compiler-unit + compiler + runtime + leak + doctest + cli)
 scripts/test
 
 # Run specific test gates
-scripts/test unit               # OCaml unit tests (compiler internals)
+scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest tests
 scripts/test compiler           # Compiler tests (should_pass/should_fail)
 scripts/test runtime            # Runtime .brp tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI smoke and exit-code checks
-scripts/test unit compiler      # Multiple gates
+scripts/test compiler-unit compiler  # Multiple gates
 scripts/test --serial           # Run selected gates one at a time
-scripts/test --coverage         # Unit tests with coverage report
+scripts/test --coverage         # Compiler-unit coverage report
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
@@ -237,8 +238,8 @@ scripts/test --log-dir logs     # Save complete gate logs with compact console o
 # Makefile shortcuts
 make test                         # Top-level local test gate
 make runtime-test                 # Runtime tests only
-make unit-test                    # Unit tests only
-make coverage                     # Unit tests with coverage
+make compiler-unit-test           # Compiler-internal OCaml/Alcotest tests only
+make coverage                     # Compiler-unit coverage
 make fmt-check                    # OCaml formatting check
 make quality                      # OCaml checks + hygiene + C static analysis
 make quality-full                 # quality + ocamlformat check
@@ -257,7 +258,7 @@ failure.
 ```bash
 make
 make fmt-check
-scripts/test unit
+scripts/test compiler-unit
 scripts/test compiler
 scripts/test runtime
 scripts/test leak
@@ -405,7 +406,7 @@ Notes:
 compiler/            # OCaml compiler implementation
   bin/            # CLI executables
     blorp.ml      # Main unified CLI
-  test/           # OCaml unit tests (Alcotest)
+  test/           # Compiler-internal OCaml/Alcotest tests
     run_tests.ml  # Test runner
     test_types.ml # Types module tests
     test_env.ml   # Env module tests
@@ -725,9 +726,9 @@ Run with: `./blorp test path/to/test.brp`
 See Development Rule 3 (write a failing test first) for the TDD workflow.
 Do not write tests arbitrarily — understand what is already tested before adding new ones.
 
-### OCaml Unit Tests
+### Compiler Unit Tests
 
-Unit tests for compiler internals live in `compiler/test/`. They use [Alcotest](https://github.com/mirage/alcotest) and test OCaml functions directly (no `.brp` compilation needed).
+Compiler-unit tests live in `compiler/test/`. They use [Alcotest](https://github.com/mirage/alcotest) and test compiler internals directly in OCaml (no `.brp` compilation needed).
 
 **Structure:**
 - `compiler/test/run_tests.ml` — Main runner, aggregates all test suites
@@ -735,7 +736,7 @@ Unit tests for compiler internals live in `compiler/test/`. They use [Alcotest](
 
 **Running:**
 ```bash
-make unit-test          # Run all OCaml unit tests
+make compiler-unit-test # Run all compiler-internal OCaml/Alcotest tests
 make coverage           # Run with coverage, report in compiler/_coverage/index.html
 ```
 

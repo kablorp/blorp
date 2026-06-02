@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 FORMATTER_SOURCES := $(shell find tools/formatter -name '*.brp' 2>/dev/null)
@@ -73,11 +73,14 @@ runtime-test: all
 
 # Fast local validation path for compiler work
 smoke: all
-	scripts/test unit compiler
+	scripts/test compiler-unit compiler
 
-# Run OCaml unit tests
-unit-test: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml
+# Run compiler-internal OCaml/Alcotest tests
+compiler-unit-test: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter.ml
 	cd compiler && dune runtest
+
+# Legacy alias for compiler-unit-test
+unit-test: compiler-unit-test
 
 ocaml-check:
 	cd compiler && dune build @check
@@ -122,7 +125,7 @@ fmt-check:
 	}
 	cd compiler && dune fmt --preview --display=quiet
 
-# Run unit tests with coverage report
+# Run compiler-unit tests with coverage report
 coverage:
 	rm -rf compiler/_coverage
 	mkdir -p compiler/_coverage

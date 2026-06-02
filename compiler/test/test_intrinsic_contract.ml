@@ -8,7 +8,7 @@
     2. Every emit clause name corresponds to a registry entry.
     3. The registry's declared arity matches what emit accepts.
 
-    Drift between these two is caught at [make unit-test], not at
+    Drift between these two is caught at [make compiler-unit-test], not at
     runtime-compile of user code. *)
 
 open Blorp

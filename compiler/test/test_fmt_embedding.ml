@@ -13,7 +13,8 @@ let contains_substring source needle =
 
 let test_embedded_formatter_source_includes_main () =
   if Blorp.Embedded_formatter.files = [] then
-    Alcotest.fail "embedded formatter source missing; run make unit-test"
+    Alcotest.fail
+      "embedded formatter source missing; run make compiler-unit-test"
   else begin
     Alcotest.(check bool)
       "main formatter source embedded" true

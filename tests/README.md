@@ -7,14 +7,14 @@
 scripts/test
 
 # Run specific gates
-scripts/test unit               # OCaml unit tests (compiler internals)
+scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest tests
 scripts/test compiler           # Compiler tests (should_pass/should_fail)
 scripts/test runtime            # Runtime language, std, and pkg tests
 scripts/test leak               # Focused leak-check baselines
 scripts/test doctest            # Doctests (std/ library)
 scripts/test cli                # CLI, REPL, and LSP smoke/exit-code checks
-scripts/test unit compiler      # Multiple gates
-scripts/test --coverage         # Unit tests with coverage report
+scripts/test compiler-unit compiler  # Multiple gates
+scripts/test --coverage         # Compiler-unit coverage report
 scripts/test --verbose          # Print pass-by-pass child-runner output
 scripts/test --log-dir logs     # Save complete gate logs with compact console output
 
@@ -48,7 +48,7 @@ top-level gate summary. `./blorp test` emits the line only when
 
 ## Terminology
 
-- A **gate** is a top-level validation entry such as `unit`, `compiler`,
+- A **gate** is a top-level validation entry such as `compiler-unit`, `compiler`,
   `runtime`, `leak`, `doctest`, or `cli`.
 - A **suite** is an organized group inside a gate, such as
   `typecheck/should_fail`, `codegen_audit`, or one `.brp` file containing a
@@ -66,7 +66,7 @@ scripts/test              # Main local test gate
 scripts/premerge-gate     # Full local pre-merge validation gate
 scripts/docker-gate       # Docker-backed validation gate
 scripts/with-build-lock   # Shared lock wrapper for build/test gates
-compiler/test/               # OCaml unit tests (Alcotest)
+compiler/test/               # Compiler-internal OCaml/Alcotest tests
   run_tests.ml            # Test runner
   test_types.ml           # Types module tests
   test_env.ml             # Env module tests
@@ -110,9 +110,9 @@ tests/
 
 ## Writing Tests
 
-### OCaml Unit Tests
+### Compiler Unit Tests
 
-Add tests in `compiler/test/test_*.ml`. See `test_types.ml` for examples. Run with `make unit-test`.
+Add tests in `compiler/test/test_*.ml`. See `test_types.ml` for examples. Run with `make compiler-unit-test`.
 
 ### Runtime Tests (TestSuite)
 
@@ -142,7 +142,7 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
 ## Adding Tests
 
 1. Choose the right location:
-   - Compiler internals → `compiler/test/` (OCaml unit tests)
+   - Compiler internals → `compiler/test/` (compiler-unit tests)
    - New syntax → `test_compiler/parser/`
    - Type inference behavior → `test_compiler/infer/`
    - Type checking rules → `test_compiler/typecheck/`
