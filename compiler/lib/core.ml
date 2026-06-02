@@ -2511,6 +2511,12 @@ type core_func = {
 let is_builtin_kind (k : cf_kind) : bool =
   match k with CFBuiltin -> true | _ -> false
 
+(** [is_program_entrypoint f] — true iff [f] is the root module's
+    executable entrypoint. Imported module functions named [main] are
+    ordinary functions and must not emit as the C [main] symbol. *)
+let is_program_entrypoint (f : core_func) : bool =
+  String.equal f.cf_name "main" && Option.is_none f.cf_module
+
 type core_var = {
   cv_name : var;
   cv_module : string option;

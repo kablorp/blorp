@@ -145,11 +145,11 @@ let should_log_dedup_debug () =
     to match. After this, the IR has a flat namespace with globally
     unique names — no downstream pass needs module awareness.
 
-    Skips for value-level names: main functions, builtin and foreign functions
-    (anything other than [CFUser]), and UFCS-mangled names (already encode
-    module). Std primitive/prelude ABI type names stay stable; all other
-    std-local type declarations are flattened like user module types to avoid
-    same-name layout collisions. *)
+    Skips for value-level names: builtin and foreign functions (anything
+    other than [CFUser]), and UFCS-mangled names (already encode module).
+    Std primitive/prelude ABI type names stay stable; all other std-local type
+    declarations are flattened like user module types to avoid same-name layout
+    collisions. *)
 let prefix_module_names ?(debug = false) (mod_name : string)
     (decls : Core.core_program) : Core.core_program =
   let log_dedup_debug = debug && should_log_dedup_debug () in
@@ -262,7 +262,6 @@ let prefix_module_names ?(debug = false) (mod_name : string)
     | Core.CDFunc f
       when f.cf_body <> None
            && (not (Core.is_builtin_kind f.cf_kind))
-           && f.cf_name <> "main"
            && not (should_skip f.cf_name) ->
         let has_pure, has_impure =
           match Hashtbl.find_opt purity_overloads f.cf_name with
@@ -294,7 +293,6 @@ let prefix_module_names ?(debug = false) (mod_name : string)
     | Core.CDFunc f
       when f.cf_body <> None
            && (not (Core.is_builtin_kind f.cf_kind))
-           && f.cf_name <> "main"
            && not (should_skip f.cf_name) ->
         let src = disambiguate_source f in
         Hashtbl.replace defined src (prefix ^ "__" ^ src)

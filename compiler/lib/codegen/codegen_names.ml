@@ -53,8 +53,8 @@ let sanitize_c_ident name =
       [c_name] verbatim.
     - Runtime builtins ([CKBuiltin]) emit the fixed [blorp_*] name from
       [Codegen_builtins.builtin_c_mapping].
-    - The program entry point [main] keeps its bare name so the C linker
-      can find it.
+    - The root program entrypoint keeps the bare C name [main] so the C
+      linker can find it.
 
     {b Stability} — two calls with equal [(id, name)] arguments produce
     the same string. The function is pure. *)

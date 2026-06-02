@@ -72,17 +72,18 @@ open Core_emit_util
 
    Every user-defined function / global / impl method / constructor
    emits its C symbol via [Codegen_names.mangle_by_def_id]. The single
-   exception is [main], which must stay bare so the C linker can find
-   it as the program entry point. Foreign functions ([CFForeign]) and
-   runtime builtins ([CKBuiltin]) bypass this helper entirely — their
-   C names come from the user-specified [c_name] / the
-   [Codegen_builtins] registry.
+   exception is the root program entrypoint, which must stay bare [main]
+   so the C linker can find it. Imported module functions whose source
+   name is [main] are ordinary functions. Foreign functions ([CFForeign])
+   and runtime builtins ([CKBuiltin]) bypass this helper entirely — their
+   C names come from the user-specified [c_name] / the [Codegen_builtins]
+   registry.
    ============================================================================ *)
 
 (** C symbol for a function decl. Mangled via the function's [cf_def_id]
-    unless the function is [main]. *)
+    unless the function is the program entrypoint. *)
 let func_c_name (f : core_func) : string =
-  if f.cf_name = "main" then "main"
+  if Core.is_program_entrypoint f then "main"
   else Codegen_names.mangle_by_def_id f.cf_def_id f.cf_name
 
 (** C symbol for a call site that resolved to a user function. The
@@ -5663,7 +5664,7 @@ and emit_func (ctx : Core_emit_context.t) (f : core_func) : unit =
              (escape_c_ident c_name) "BLORP_IMMORTAL_REFCOUNT"
              (escape_c_ident c_name))
   | Some body, _ ->
-      if f.cf_name = "main" then emit_main_func ctx f body
+      if Core.is_program_entrypoint f then emit_main_func ctx f body
       else begin
         let profile_name = profile_name_for_func f in
         let ret_ty_c = type_to_c ctx f.cf_return_ty in
@@ -5965,7 +5966,9 @@ and emit_program ?(embed_runtime = false) (ctx : Core_emit_context.t)
   let rec collect_func_fwds acc = function
     | [] -> List.rev acc
     | { cd_desc = CDFunc f; _ } :: rest
-      when f.cf_body <> None && f.cf_name <> "main" && f.cf_type_params = [] ->
+      when f.cf_body <> None
+           && (not (Core.is_program_entrypoint f))
+           && f.cf_type_params = [] ->
         collect_func_fwds (f :: acc) rest
     | { cd_desc = CDImpl i; _ } :: rest ->
         if has_type_vars i.ci_for_type then collect_func_fwds acc rest
@@ -6830,7 +6833,7 @@ and tailrec_list_param_plan (ctx : Core_emit_context.t) (f : core_func) :
             && non_list_params_unmanaged (i + 1) rest
       in
       if
-        f.cf_name <> "main"
+        (not (Core.is_program_entrypoint f))
         && tailrec_type_is_known_unmanaged ctx f.cf_return_ty
         && non_list_params_unmanaged 0 f.cf_params
       then Some (list_index, list_param)
