@@ -446,6 +446,67 @@ func scoped_accept_timeout() -> Result[Bool, TcpError]:
 			Ok(False)
 
 
+func keepalive_timeout_client_result(
+	port: Int,
+	count: Int,
+	delay_ms: Int,
+	idle_ms: Int,
+) -> Result[Bool, TcpError]:
+	sleep(delay_ms)
+	with stream ?= connect("127.0.0.1", port):
+		var i: Int = 0
+		var writes_ok: Bool = True
+		while i < count and writes_ok:
+			sleep(delay_ms)
+			payload: Bytes = B
+				.bytes(1)
+				.fill(65)
+			match write_all(stream, payload):
+				Ok(_): i += 1
+				Err(_): writes_ok = False
+		sleep(idle_ms)
+		Ok(writes_ok and i == count)
+
+
+func keepalive_timeout_client(port: Int, done: Channel[Bool]) -> Bool:
+	ok: Bool = match keepalive_timeout_client_result(port, 60, 10, 100):
+		Ok(value): value
+		Err(_): False
+	_ = send(done, ok)
+	ok
+
+
+func test_keepalive_reads_do_not_inherit_stale_timeout() -> Bool:
+	match scoped_keepalive_reads_do_not_inherit_stale_timeout():
+		Ok(ok): ok
+		Err(err): is_socket_permission_error(err)
+
+
+func scoped_keepalive_reads_do_not_inherit_stale_timeout() -> Result[Bool, TcpError]:
+	with listener ?= listen("127.0.0.1", 0, 1):
+		port ?= local_port(listener)
+		done: Channel[Bool] = channel(1)
+		detach keepalive_timeout_client(port, done)
+		with peer ?= accept(listener):
+			ignored ?= set_stream_timeout(peer, 30)
+			var count: Int = 0
+			var reads_ok: Bool = True
+			while count < 60 and reads_ok:
+				match read_chunk(peer, 1):
+					Ok(chunk):
+						reads_ok = chunk.length() == 1
+						count += 1
+					Err(_):
+						reads_ok = False
+			idle_timed_out: Bool = match read_chunk(peer, 1):
+				Ok(_): False
+				Err(err): is_timed_out(err)
+			client_ok: Bool = match recv_timeout(done, 1000):
+				Some(ok): ok
+				None: False
+			Ok(reads_ok and count == 60 and idle_timed_out and client_ok)
+
+
 func test_read_timeout_reports_error() -> Bool:
 	match scoped_read_timeout():
 		Ok(_): False
@@ -497,6 +558,10 @@ tests: TestSuite = {
 		("set_timeout invalid values are typed", test_set_timeout_invalid_is_typed),
 		("set_reuse_addr on scoped listener", test_set_reuse_addr),
 		("accept timeout reports an error", test_accept_timeout_reports_error),
+		(
+			"keepalive reads do not inherit stale timeouts",
+			test_keepalive_reads_do_not_inherit_stale_timeout,
+		),
 		("read timeout reports an error", test_read_timeout_reports_error),
 	]
 }

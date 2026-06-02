@@ -465,6 +465,7 @@ typedef struct {
 
 typedef struct blorp_IoWaiter {
     _Atomic long refcount;
+    uint64_t wait_id;
     blorp_IoWaitKind kind;
     blorp_IoWakeReason wake_reason;
     struct blorp_Fiber* fiber;
@@ -723,6 +724,7 @@ static blorp_IoDeadlineQueue __blorp_io_deadline_queue = {
     .cap = 0,
 };
 static pthread_once_t __blorp_io_deadline_queue_once = PTHREAD_ONCE_INIT;
+static _Atomic uint64_t __blorp_next_io_wait_id = 1;
 
 // Thread-safe global counters (atomic for concurrent alloc/release).
 // Note: ++/-- on _Atomic long is atomic per C11 (equivalent to atomic_fetch_add/sub).
@@ -2470,6 +2472,11 @@ static blorp_IoWaiterList blorp_io_wait_owner_extract_waiter(
     uint64_t generation,
     blorp_IoWakeReason reason
 );
+static blorp_IoWaiterList blorp_io_wait_owner_extract_exact_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaiter* waiter,
+    blorp_IoWakeReason reason
+);
 static blorp_IoWaiterList blorp_io_wait_owner_extract_ready(
     blorp_IoWaitOwner owner,
     int ready_events,
@@ -2481,6 +2488,11 @@ static blorp_IoWaiterList blorp_udp_socket_extract_waiter(
     blorp_UdpSocket* socket,
     blorp_IoWaitKind kind,
     uint64_t generation,
+    blorp_IoWakeReason reason
+);
+static blorp_IoWaiterList blorp_udp_socket_extract_exact_waiter(
+    blorp_UdpSocket* socket,
+    blorp_IoWaiter* waiter,
     blorp_IoWakeReason reason
 );
 static void blorp_io_deadline_queue_insert(
@@ -2582,6 +2594,9 @@ static void blorp_io_waiter_init(
 ) {
     if (!waiter) return;
     atomic_init(&waiter->refcount, 1);
+    waiter->wait_id =
+        atomic_fetch_add_explicit(
+            &__blorp_next_io_wait_id, 1, memory_order_relaxed);
     waiter->kind = kind;
     waiter->wake_reason = BLORP_IO_WAKE_NONE;
     waiter->fiber = fiber;
@@ -2611,6 +2626,17 @@ static blorp_IoWaiter* blorp_io_waiter_new(
 static void blorp_io_waiter_retain(blorp_IoWaiter* waiter) {
     if (!waiter) return;
     atomic_fetch_add_explicit(&waiter->refcount, 1, memory_order_relaxed);
+}
+
+// Deadline expiry and cancellation must target the exact parked operation.
+// Matching only owner/kind/generation can time out a later read/write that
+// reused the same stream slot after the original waiter was woken.
+static bool blorp_io_waiter_same_operation(
+    blorp_IoWaiter* installed,
+    blorp_IoWaiter* expected
+) {
+    return installed && expected && installed == expected &&
+           installed->wait_id == expected->wait_id;
 }
 
 static void blorp_io_waiter_release(blorp_IoWaiter* waiter) {
@@ -2766,19 +2792,30 @@ static blorp_IoWaiterList blorp_tcp_inner_extract_waiter(
     return waiters;
 }
 
+static blorp_IoWaiterList blorp_tcp_inner_extract_exact_waiter(
+    blorp_TcpInner* inner,
+    blorp_IoWaiter* waiter,
+    blorp_IoWakeReason reason
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (!inner || !waiter || reason == BLORP_IO_WAKE_NONE) return waiters;
+    pthread_mutex_lock(&inner->mutex);
+    blorp_IoWaiter** slot = blorp_tcp_inner_waiter_slot(inner, waiter->kind);
+    if (slot && blorp_io_waiter_same_operation(*slot, waiter)) {
+        blorp_tcp_inner_extract_waiter_slot_locked(slot, reason, &waiters);
+    }
+    pthread_mutex_unlock(&inner->mutex);
+    return waiters;
+}
+
 static int blorp_tcp_inner_cancel_waiter(
     blorp_TcpInner* inner,
     blorp_IoWaiter* waiter
 ) {
     if (!inner || !waiter) return 0;
-    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
-    pthread_mutex_lock(&inner->mutex);
-    blorp_IoWaiter** slot = blorp_tcp_inner_waiter_slot(inner, waiter->kind);
-    if (slot && *slot == waiter) {
-        blorp_tcp_inner_extract_waiter_slot_locked(
-            slot, BLORP_IO_WAKE_CANCELLED, &waiters);
-    }
-    pthread_mutex_unlock(&inner->mutex);
+    blorp_IoWaiterList waiters =
+        blorp_tcp_inner_extract_exact_waiter(
+            inner, waiter, BLORP_IO_WAKE_CANCELLED);
     int cancelled = waiters.head != NULL;
     blorp_io_waiter_wake_all(&waiters);
     return cancelled;
@@ -3021,6 +3058,26 @@ static blorp_IoWaiterList blorp_io_wait_owner_extract_waiter(
         case BLORP_IO_WAIT_OWNER_UDP:
             return blorp_udp_socket_extract_waiter(
                 owner.value.udp_socket, kind, generation, reason);
+        default:
+            fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
+            abort();
+    }
+}
+
+static blorp_IoWaiterList blorp_io_wait_owner_extract_exact_waiter(
+    blorp_IoWaitOwner owner,
+    blorp_IoWaiter* waiter,
+    blorp_IoWakeReason reason
+) {
+    switch (owner.kind) {
+        case BLORP_IO_WAIT_OWNER_NONE:
+            return blorp_io_waiter_list_empty();
+        case BLORP_IO_WAIT_OWNER_TCP:
+            return blorp_tcp_inner_extract_exact_waiter(
+                owner.value.tcp_inner, waiter, reason);
+        case BLORP_IO_WAIT_OWNER_UDP:
+            return blorp_udp_socket_extract_exact_waiter(
+                owner.value.udp_socket, waiter, reason);
         default:
             fprintf(stderr, "blorp: invalid IO wait owner kind (bug)\n");
             abort();
@@ -18500,20 +18557,31 @@ static blorp_IoWaiterList blorp_udp_socket_extract_waiter(
     return waiters;
 }
 
+static blorp_IoWaiterList blorp_udp_socket_extract_exact_waiter(
+    blorp_UdpSocket* socket,
+    blorp_IoWaiter* waiter,
+    blorp_IoWakeReason reason
+) {
+    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
+    if (!socket || !waiter || reason == BLORP_IO_WAKE_NONE) return waiters;
+    pthread_mutex_lock(&socket->mutex);
+    blorp_IoWaiter** slot =
+        blorp_udp_socket_waiter_slot(socket, waiter->kind);
+    if (slot && blorp_io_waiter_same_operation(*slot, waiter)) {
+        blorp_udp_socket_extract_waiter_slot_locked(slot, reason, &waiters);
+    }
+    pthread_mutex_unlock(&socket->mutex);
+    return waiters;
+}
+
 static int blorp_udp_socket_cancel_waiter(
     blorp_UdpSocket* socket,
     blorp_IoWaiter* waiter
 ) {
     if (!socket || !waiter) return 0;
-    blorp_IoWaiterList waiters = blorp_io_waiter_list_empty();
-    pthread_mutex_lock(&socket->mutex);
-    blorp_IoWaiter** slot =
-        blorp_udp_socket_waiter_slot(socket, waiter->kind);
-    if (slot && *slot == waiter) {
-        blorp_udp_socket_extract_waiter_slot_locked(
-            slot, BLORP_IO_WAKE_CANCELLED, &waiters);
-    }
-    pthread_mutex_unlock(&socket->mutex);
+    blorp_IoWaiterList waiters =
+        blorp_udp_socket_extract_exact_waiter(
+            socket, waiter, BLORP_IO_WAKE_CANCELLED);
     int cancelled = waiters.head != NULL;
     blorp_io_waiter_wake_all(&waiters);
     return cancelled;
@@ -21946,9 +22014,8 @@ static uint64_t blorp_io_deadline_queue_drain(void) {
 
         if (expired.waiter && blorp_io_wait_owner_is_some(expired.owner)) {
             blorp_IoWaiterList timed_out =
-                blorp_io_wait_owner_extract_waiter(
-                    expired.owner, expired.waiter->kind,
-                    expired.waiter->generation, BLORP_IO_WAKE_TIMEOUT);
+                blorp_io_wait_owner_extract_exact_waiter(
+                    expired.owner, expired.waiter, BLORP_IO_WAKE_TIMEOUT);
             blorp_io_waiter_wake_all(&timed_out);
         }
         blorp_io_deadline_entry_release(&expired);
@@ -22164,8 +22231,9 @@ static blorp_IoWakeReason blorp_io_wait_owner_park_current_fiber(
     }
 
     if (waiter->wake_reason == BLORP_IO_WAKE_NONE && deadline_ns != 0) {
-        blorp_IoWaiterList timed_out = blorp_io_wait_owner_extract_waiter(
-            owner, kind, generation, BLORP_IO_WAKE_TIMEOUT);
+        blorp_IoWaiterList timed_out =
+            blorp_io_wait_owner_extract_exact_waiter(
+                owner, waiter, BLORP_IO_WAKE_TIMEOUT);
         blorp_io_waiter_wake_all(&timed_out);
     }
 
