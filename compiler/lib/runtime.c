@@ -485,6 +485,7 @@ typedef struct blorp_IoWaiter {
 typedef struct {
     blorp_IoWaiter* head;
     blorp_IoWaiter* tail;
+    long count;
 } blorp_IoWaiterList;
 
 typedef struct {
@@ -2657,7 +2658,7 @@ static void blorp_io_waiter_release(blorp_IoWaiter* waiter) {
 }
 
 static blorp_IoWaiterList blorp_io_waiter_list_empty(void) {
-    return (blorp_IoWaiterList){ .head = NULL, .tail = NULL };
+    return (blorp_IoWaiterList){ .head = NULL, .tail = NULL, .count = 0 };
 }
 
 static void blorp_io_waiter_list_push(
@@ -2665,6 +2666,10 @@ static void blorp_io_waiter_list_push(
     blorp_IoWaiter* waiter
 ) {
     if (!list || !waiter) return;
+    // Ready lists cross from the reactor/deadline path back to the parked
+    // fiber. Hold a list reference so the fiber cannot free the waiter while
+    // the reactor is still counting or walking the ready list.
+    blorp_io_waiter_retain(waiter);
     waiter->next = NULL;
     if (list->tail) {
         list->tail->next = waiter;
@@ -2672,6 +2677,7 @@ static void blorp_io_waiter_list_push(
         list->head = waiter;
     }
     list->tail = waiter;
+    list->count++;
 }
 
 static void blorp_io_waiter_list_append(
@@ -2685,17 +2691,15 @@ static void blorp_io_waiter_list_append(
         list->head = extra->head;
     }
     list->tail = extra->tail;
+    list->count += extra->count;
     extra->head = NULL;
     extra->tail = NULL;
+    extra->count = 0;
 }
 
 static long blorp_io_waiter_list_count(const blorp_IoWaiterList* list) {
-    long count = 0;
     if (!list) return 0;
-    for (blorp_IoWaiter* waiter = list->head; waiter; waiter = waiter->next) {
-        count++;
-    }
-    return count;
+    return list->count;
 }
 
 static blorp_IoWaiter** blorp_tcp_inner_waiter_slot(
@@ -2743,6 +2747,7 @@ static blorp_IoInstallWaiterResult blorp_tcp_inner_install_waiter(
         return BLORP_IO_INSTALL_WAITER_BUSY;
     }
     *slot = waiter;
+    blorp_io_waiter_retain(waiter);
     waiter->installed = true;
     waiter->installed_owner = blorp_io_wait_owner_tcp(inner);
     waiter->next = NULL;
@@ -2767,6 +2772,7 @@ static int blorp_tcp_inner_remove_waiter(
     waiter->next = NULL;
     pthread_mutex_unlock(&inner->mutex);
     blorp_io_deadline_queue_remove(waiter);
+    blorp_io_waiter_release(waiter);
     return 1;
 }
 
@@ -2837,6 +2843,7 @@ static void blorp_tcp_inner_extract_waiter_slot_locked(
     if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
     blorp_io_deadline_queue_remove(waiter);
     blorp_io_waiter_list_push(waiters, waiter);
+    blorp_io_waiter_release(waiter);
 }
 
 static blorp_IoWaiterList blorp_tcp_inner_extract_waiters_locked(
@@ -18583,6 +18590,7 @@ static blorp_IoInstallWaiterResult blorp_udp_socket_install_waiter(
         return BLORP_IO_INSTALL_WAITER_BUSY;
     }
     *slot = waiter;
+    blorp_io_waiter_retain(waiter);
     waiter->installed = true;
     waiter->installed_owner = blorp_io_wait_owner_udp(socket);
     waiter->next = NULL;
@@ -18608,6 +18616,7 @@ static int blorp_udp_socket_remove_waiter(
     waiter->next = NULL;
     pthread_mutex_unlock(&socket->mutex);
     blorp_io_deadline_queue_remove(waiter);
+    blorp_io_waiter_release(waiter);
     return 1;
 }
 
@@ -18625,6 +18634,7 @@ static void blorp_udp_socket_extract_waiter_slot_locked(
     if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
     blorp_io_deadline_queue_remove(waiter);
     blorp_io_waiter_list_push(waiters, waiter);
+    blorp_io_waiter_release(waiter);
 }
 
 static blorp_IoWaiterList blorp_udp_socket_extract_waiter(
@@ -20824,6 +20834,8 @@ typedef struct blorp_Fiber {
     int queued;                  // 1 while present in the runnable queue
     int running;                 // 1 while a worker is inside mco_resume
     int wake_pending;            // waker arrived before the running fiber yielded
+    int state_lock;              // guards running/wake_pending handoff
+    int owner_worker_id;         // carrier queue this fiber must resume on
 } blorp_Fiber;
 
 static _Thread_local blorp_Fiber* __blorp_current_fiber = NULL;
@@ -21073,6 +21085,8 @@ static void __blorp_install_stack_overflow_handler(void) {
 static void blorp_fiber_init(void);
 static uint64_t blorp_timer_queue_drain(void);
 static blorp_Fiber* blorp_fiber_pop(void);
+static void blorp_fiber_state_lock(blorp_Fiber* f);
+static void blorp_fiber_state_unlock(blorp_Fiber* f);
 static void blorp_fiber_schedule(blorp_Fiber* f);
 static void blorp_fiber_enqueue_runnable(blorp_Fiber* f);
 static void blorp_fiber_enqueue_runnable_batch(
@@ -21157,23 +21171,6 @@ static void* __blorp_worker(void* arg) {
                     &global_scheduler_stats.run_queue_lock_contentions);
                 fiber = blorp_fiber_run_queue_pop(local_queue);
                 pthread_mutex_unlock(&local_queue->lock);
-                if (!fiber) {
-                    for (long offset = 1; offset < pool->num_threads; offset++) {
-                        long victim_id = (worker_id + offset) % pool->num_threads;
-                        blorp_FiberRunQueue* victim_queue =
-                            &pool->fiber_queues[victim_id];
-                        __blorp_scheduler_stat_lock(
-                            &victim_queue->lock,
-                            &global_scheduler_stats.run_queue_lock_contentions);
-                        fiber = blorp_fiber_run_queue_pop(victim_queue);
-                        pthread_mutex_unlock(&victim_queue->lock);
-                        if (fiber) {
-                            __blorp_scheduler_stat_inc(
-                                &global_scheduler_stats.work_steals);
-                            break;
-                        }
-                    }
-                }
             }
             if (!fiber) {
                 __blorp_scheduler_stat_lock(
@@ -21185,7 +21182,9 @@ static void* __blorp_worker(void* arg) {
         }
 
         if (fiber) {
-            // (mco_status wait is in blorp_fiber_schedule)
+            if (fiber->owner_worker_id < 0 && worker_id >= 0) {
+                fiber->owner_worker_id = worker_id;
+            }
             // Resume the fiber on this worker thread. The active task is
             // fiber-scoped, not OS-thread-scoped: a worker can run many
             // different fibers over time, and each fiber may yield at channel
@@ -21195,9 +21194,29 @@ static void* __blorp_worker(void* arg) {
             void* previous_task = __blorp_current_task;
             __blorp_current_fiber = fiber;
             __blorp_current_task = mco_get_user_data(fiber->coro);
+            blorp_fiber_state_lock(fiber);
+            mco_state before_resume_status = mco_status(fiber->coro);
+            if (before_resume_status != MCO_SUSPENDED) {
+                fprintf(stderr,
+                    "blorp: scheduler tried to resume non-suspended fiber "
+                    "(status=%d parked=%d queued=%d running=%d wake_pending=%d)\n",
+                    (int)before_resume_status,
+                    __atomic_load_n(&fiber->parked, __ATOMIC_ACQUIRE),
+                    __atomic_load_n(&fiber->queued, __ATOMIC_ACQUIRE),
+                    __atomic_load_n(&fiber->running, __ATOMIC_ACQUIRE),
+                    __atomic_load_n(&fiber->wake_pending, __ATOMIC_ACQUIRE));
+                abort();
+            }
             __atomic_store_n(&fiber->running, 1, __ATOMIC_RELEASE);
+            blorp_fiber_state_unlock(fiber);
             __blorp_scheduler_stat_inc(&global_scheduler_stats.fiber_resumes);
             mco_result resume_res = mco_resume(fiber->coro);
+            blorp_fiber_state_lock(fiber);
+            mco_state fiber_status = mco_status(fiber->coro);
+            // Keep ownership of the coroutine state until after mco_status.
+            // Wakers that arrive while this flag is set use wake_pending, so no
+            // other carrier can resume this fiber while the current carrier is
+            // still reading minicoro state after mco_resume returns.
             __atomic_store_n(&fiber->running, 0, __ATOMIC_RELEASE);
             __blorp_current_task = previous_task;
             __blorp_current_fiber = NULL;
@@ -21209,10 +21228,12 @@ static void* __blorp_worker(void* arg) {
                 abort();
             }
 
-            if (mco_status(fiber->coro) == MCO_DEAD) {
+            if (fiber_status == MCO_DEAD) {
                 // Fiber completed — clean up
                 __blorp_scheduler_stat_inc(
                     &global_scheduler_stats.fibers_completed);
+                __atomic_store_n(&fiber->wake_pending, 0, __ATOMIC_RELEASE);
+                blorp_fiber_state_unlock(fiber);
                 mco_destroy(fiber->coro);
                 blorp_fiber_object_recycle(fiber);
             } else if (__atomic_exchange_n(&fiber->wake_pending, 0, __ATOMIC_ACQ_REL)) {
@@ -21224,6 +21245,9 @@ static void* __blorp_worker(void* arg) {
                 // mco_yield.
                 __atomic_store_n(&fiber->parked, 0, __ATOMIC_RELEASE);
                 blorp_fiber_enqueue_runnable(fiber);
+                blorp_fiber_state_unlock(fiber);
+            } else {
+                blorp_fiber_state_unlock(fiber);
             }
             // If fiber is parked (yielded), it's been placed in a wait queue
             // by the park point code. Don't touch it.
@@ -21550,6 +21574,27 @@ static void blorp_fiber_object_pool_clear(void) {
     }
 }
 
+static void blorp_fiber_state_lock(blorp_Fiber* f) {
+    if (!f) return;
+    int expected = 0;
+    while (!__atomic_compare_exchange_n(
+        &f->state_lock,
+        &expected,
+        1,
+        0,
+        __ATOMIC_ACQUIRE,
+        __ATOMIC_RELAXED
+    )) {
+        expected = 0;
+        sched_yield();
+    }
+}
+
+static void blorp_fiber_state_unlock(blorp_Fiber* f) {
+    if (!f) return;
+    __atomic_store_n(&f->state_lock, 0, __ATOMIC_RELEASE);
+}
+
 // Create a new fiber wrapping a coroutine
 static blorp_Fiber* blorp_fiber_create(void (*func)(mco_coro*), void* user_data) {
     blorp_Fiber* f = blorp_fiber_object_alloc();
@@ -21564,6 +21609,8 @@ static blorp_Fiber* blorp_fiber_create(void (*func)(mco_coro*), void* user_data)
     f->queued = 0;
     f->running = 0;
     f->wake_pending = 0;
+    f->state_lock = 0;
+    f->owner_worker_id = -1;
     mco_desc desc = mco_desc_init(func, __blorp_fiber_stack_size);
     desc.user_data = user_data;
     // Use guard-page allocator for stack overflow protection
@@ -21577,20 +21624,30 @@ static blorp_Fiber* blorp_fiber_create(void (*func)(mco_coro*), void* user_data)
     return f;
 }
 
+static long blorp_fiber_choose_worker_id(blorp_ThreadPool* pool) {
+    if (!pool || !pool->fiber_queues || pool->num_threads <= 0) return -1;
+    if (__blorp_current_worker_id >= 0 &&
+        __blorp_current_worker_id < pool->num_threads) {
+        return __blorp_current_worker_id;
+    }
+    long ticket =
+        atomic_fetch_add_explicit(
+            &pool->fiber_enqueue_cursor, 1, memory_order_relaxed);
+    long idx = ticket % pool->num_threads;
+    if (idx < 0) idx += pool->num_threads;
+    return idx;
+}
+
 // Push a known-runnable fiber to the run queue tail, signal workers.
 // Caller is responsible for transitioning parked 1 -> 0 before calling.
-static blorp_FiberRunQueue* blorp_fiber_select_run_queue(void) {
+static blorp_FiberRunQueue* blorp_fiber_select_run_queue(blorp_Fiber* f) {
     blorp_ThreadPool* pool = __blorp_pool;
     if (pool && pool->fiber_queues && pool->num_threads > 0) {
-        if (__blorp_current_worker_id >= 0 &&
-            __blorp_current_worker_id < pool->num_threads) {
-            return &pool->fiber_queues[__blorp_current_worker_id];
+        long idx = f ? f->owner_worker_id : -1;
+        if (idx < 0 || idx >= pool->num_threads) {
+            idx = blorp_fiber_choose_worker_id(pool);
+            if (f) f->owner_worker_id = (int)idx;
         }
-        long ticket =
-            atomic_fetch_add_explicit(
-                &pool->fiber_enqueue_cursor, 1, memory_order_relaxed);
-        long idx = ticket % pool->num_threads;
-        if (idx < 0) idx += pool->num_threads;
         return &pool->fiber_queues[idx];
     }
     return &__fiber_run_queue;
@@ -21603,7 +21660,7 @@ static void blorp_fiber_enqueue_runnable(blorp_Fiber* f) {
         return;
     }
     f->run_next = NULL;
-    blorp_FiberRunQueue* queue = blorp_fiber_select_run_queue();
+    blorp_FiberRunQueue* queue = blorp_fiber_select_run_queue(f);
     __blorp_scheduler_stat_lock(
         &queue->lock, &global_scheduler_stats.run_queue_lock_contentions);
     if (queue->tail) {
@@ -21618,13 +21675,12 @@ static void blorp_fiber_enqueue_runnable(blorp_Fiber* f) {
     atomic_fetch_add_explicit(
         &__fiber_runnable_count, 1, memory_order_release);
     pthread_mutex_unlock(&queue->lock);
-    // Wake workers on a queue's empty->nonempty transition. Round-robin
-    // external injection spreads large bursts across queues, so one signal per
-    // newly active queue is enough to wake available carriers without creating
-    // a condition-variable storm.
+    // Wake workers on a queue's empty->nonempty transition. Fibers are pinned
+    // to their owner queue so a single condition-variable signal can wake the
+    // wrong carrier; broadcast lets the owner observe its queue.
     if (__blorp_pool && queued_count == 1) {
         pthread_mutex_lock(&__blorp_pool->queue_lock);
-        pthread_cond_signal(&__blorp_pool->queue_cond);
+        pthread_cond_broadcast(&__blorp_pool->queue_cond);
         pthread_mutex_unlock(&__blorp_pool->queue_lock);
     }
 }
@@ -21660,24 +21716,13 @@ static bool blorp_fiber_run_queue_append_locked(
 #define BLORP_STACK_BATCH_QUEUES 64
 
 static long blorp_fiber_batch_queue_index(blorp_ThreadPool* pool) {
-    if (__blorp_current_worker_id >= 0 &&
-        __blorp_current_worker_id < pool->num_threads) {
-        return __blorp_current_worker_id;
-    }
-    long ticket =
-        atomic_fetch_add_explicit(
-            &pool->fiber_enqueue_cursor, 1, memory_order_relaxed);
-    long idx = ticket % pool->num_threads;
-    if (idx < 0) idx += pool->num_threads;
-    return idx;
+    return blorp_fiber_choose_worker_id(pool);
 }
 
 static void blorp_signal_fiber_workers(long signals) {
     if (!__blorp_pool || signals <= 0) return;
     pthread_mutex_lock(&__blorp_pool->queue_lock);
-    for (long i = 0; i < signals; i++) {
-        pthread_cond_signal(&__blorp_pool->queue_cond);
-    }
+    pthread_cond_broadcast(&__blorp_pool->queue_cond);
     pthread_mutex_unlock(&__blorp_pool->queue_lock);
 }
 
@@ -21704,6 +21749,7 @@ static void blorp_fiber_enqueue_runnable_batch(
         while (f) {
             blorp_Fiber* next = f->run_next;
             long idx = blorp_fiber_batch_queue_index(pool);
+            f->owner_worker_id = (int)idx;
             blorp_fiber_batch_list_append(&batches[idx], f);
             f = next;
         }
@@ -21816,29 +21862,17 @@ static void blorp_fiber_schedule(blorp_Fiber* f) {
     }
     __blorp_scheduler_stat_inc(
         &global_scheduler_stats.fiber_schedule_transitions);
-    // If the fiber is still inside mco_resume, it has marked itself parked
-    // but has not actually yielded yet. Do not poll minicoro state from this
-    // thread. Record the wake and let the running worker enqueue it after
-    // mco_resume returns from the yield.
+    blorp_fiber_state_lock(f);
+    // If the fiber is still inside mco_resume, it has marked itself parked but
+    // has not actually yielded yet. Record the wake and let the owning worker
+    // enqueue after it observes the coroutine's post-resume state.
     if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&f->wake_pending, 1, __ATOMIC_RELEASE);
-        // The fiber sets parked immediately before yielding. If the owning
-        // worker clears running between our load and wake_pending store, it may
-        // have already passed its pending-wake check. Wait briefly for that
-        // handoff to settle; exactly one side claims wake_pending by exchange.
-        for (int i = 0; i < BLORP_FIBER_WAKE_HANDOFF_SPINS; i++) {
-            if (!__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
-                if (__atomic_exchange_n(&f->wake_pending, 0, __ATOMIC_ACQ_REL)) {
-                    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
-                    blorp_fiber_enqueue_runnable(f);
-                }
-                return;
-            }
-            sched_yield();
-        }
+        blorp_fiber_state_unlock(f);
         return;
     }
     blorp_fiber_enqueue_runnable(f);
+    blorp_fiber_state_unlock(f);
 }
 
 static void blorp_fiber_enqueue_cancel_wake(blorp_Fiber* f) {
@@ -21926,10 +21960,12 @@ static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters) {
     blorp_IoWaiter* waiter = waiters->head;
     waiters->head = NULL;
     waiters->tail = NULL;
+    waiters->count = 0;
     while (waiter) {
         blorp_IoWaiter* next = waiter->next;
         waiter->next = NULL;
         if (waiter->fiber) blorp_fiber_schedule(waiter->fiber);
+        blorp_io_waiter_release(waiter);
         waiter = next;
     }
 }
@@ -26648,21 +26684,48 @@ long blorp_time_now(void) {
     return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
 }
 
+static time_t blorp_floor_microseconds_to_seconds(long microseconds) {
+    long secs = microseconds / 1000000L;
+    long rem = microseconds % 1000000L;
+    if (rem < 0) secs--;
+    return (time_t)secs;
+}
+
 // Helper: convert microseconds to struct tm (UTC)
-static struct tm blorp_us_to_tm(long us) {
-    time_t secs = us / 1000000L;
+static struct tm blorp_microseconds_to_tm(long microseconds) {
+    time_t secs = blorp_floor_microseconds_to_seconds(microseconds);
     struct tm result;
     gmtime_r(&secs, &result);
     return result;
 }
 
-long blorp_time_to_year(long us)    { return blorp_us_to_tm(us).tm_year + 1900; }
-long blorp_time_to_month(long us)   { return blorp_us_to_tm(us).tm_mon + 1; }
-long blorp_time_to_day(long us)     { return blorp_us_to_tm(us).tm_mday; }
-long blorp_time_to_hour(long us)    { return blorp_us_to_tm(us).tm_hour; }
-long blorp_time_to_minute(long us)  { return blorp_us_to_tm(us).tm_min; }
-long blorp_time_to_second(long us)  { return blorp_us_to_tm(us).tm_sec; }
-long blorp_time_to_weekday(long us) { return blorp_us_to_tm(us).tm_wday; }
+long blorp_time_to_year(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_year + 1900;
+}
+
+long blorp_time_to_month(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_mon + 1;
+}
+
+long blorp_time_to_day(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_mday;
+}
+
+long blorp_time_to_hour(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_hour;
+}
+
+long blorp_time_to_minute(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_min;
+}
+
+long blorp_time_to_second(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_sec;
+}
+
+long blorp_time_to_weekday(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_wday;
+}
 
 // Construct POSIX microseconds from calendar parts (UTC)
 long blorp_time_from_parts(long year, long month, long day, long hour, long minute, long second) {
@@ -26677,12 +26740,237 @@ long blorp_time_from_parts(long year, long month, long day, long hour, long minu
     return (long)secs * 1000000L;
 }
 
+static bool blorp_time_is_leap_year(long year) {
+    if (year % 400 == 0) return true;
+    if (year % 100 == 0) return false;
+    return year % 4 == 0;
+}
+
+static int blorp_time_days_in_month(long year, long month) {
+    switch (month) {
+        case 1: return 31;
+        case 2: return blorp_time_is_leap_year(year) ? 29 : 28;
+        case 3: return 31;
+        case 4: return 30;
+        case 5: return 31;
+        case 6: return 30;
+        case 7: return 31;
+        case 8: return 31;
+        case 9: return 30;
+        case 10: return 31;
+        case 11: return 30;
+        case 12: return 31;
+        default: return 0;
+    }
+}
+
+static bool blorp_time_valid_date(long year, long month, long day) {
+    int days = blorp_time_days_in_month(year, month);
+    return days > 0 && day >= 1 && day <= days;
+}
+
+static bool blorp_time_valid_time(long hour, long minute, long second) {
+    return hour >= 0 && hour <= 23 &&
+           minute >= 0 && minute <= 59 &&
+           second >= 0 && second <= 59;
+}
+
+static bool blorp_time_tm_matches_utc_fields(
+    const struct tm* original,
+    const struct tm* normalized
+) {
+    return original->tm_year == normalized->tm_year &&
+           original->tm_mon == normalized->tm_mon &&
+           original->tm_mday == normalized->tm_mday &&
+           original->tm_hour == normalized->tm_hour &&
+           original->tm_min == normalized->tm_min &&
+           original->tm_sec == normalized->tm_sec;
+}
+
+static bool blorp_time_is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static bool blorp_time_is_ascii_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' ||
+           c == '\r' || c == '\f' || c == '\v';
+}
+
+typedef struct {
+    bool has_year;
+    bool has_month;
+    bool has_day;
+    bool has_hour;
+    bool has_minute;
+    bool has_second;
+    long year;
+    long month;
+    long day;
+    long hour;
+    long minute;
+    long second;
+} blorp_TimeParsedNumericFields;
+
+static bool blorp_time_read_number_width(
+    const char* input,
+    size_t* pos,
+    size_t min_width,
+    size_t max_width,
+    long* out
+) {
+    size_t start = *pos;
+    long value = 0;
+    size_t digits = 0;
+    while (digits < max_width && blorp_time_is_digit(input[*pos])) {
+        value = value * 10 + (input[*pos] - '0');
+        (*pos)++;
+        digits++;
+    }
+    if (digits < min_width) {
+        *pos = start;
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
+static bool blorp_time_record_numeric_directive(
+    blorp_TimeParsedNumericFields* fields,
+    char directive,
+    const char* input,
+    size_t* input_pos
+) {
+    long value = 0;
+    switch (directive) {
+        case 'Y':
+            if (!blorp_time_read_number_width(input, input_pos, 4, 4, &value)) return false;
+            fields->has_year = true;
+            fields->year = value;
+            return true;
+        case 'm':
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_month = true;
+            fields->month = value;
+            return true;
+        case 'd':
+        case 'e':
+            while (input[*input_pos] == ' ') (*input_pos)++;
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_day = true;
+            fields->day = value;
+            return true;
+        case 'H':
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_hour = true;
+            fields->hour = value;
+            return true;
+        case 'M':
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_minute = true;
+            fields->minute = value;
+            return true;
+        case 'S':
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_second = true;
+            fields->second = value;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool blorp_time_scan_literal(const char* input, size_t* input_pos, char expected) {
+    if (input[*input_pos] != expected) return false;
+    (*input_pos)++;
+    return true;
+}
+
+static bool blorp_time_collected_numeric_fields_valid(
+    const blorp_TimeParsedNumericFields* fields
+) {
+    if (fields->has_month && (fields->month < 1 || fields->month > 12)) return false;
+    if (fields->has_day && (fields->day < 1 || fields->day > 31)) return false;
+    if (fields->has_hour && (fields->hour < 0 || fields->hour > 23)) return false;
+    if (fields->has_minute && (fields->minute < 0 || fields->minute > 59)) return false;
+    if (fields->has_second && (fields->second < 0 || fields->second > 59)) return false;
+    if (fields->has_year && fields->has_month && fields->has_day) {
+        return blorp_time_valid_date(fields->year, fields->month, fields->day);
+    }
+    return true;
+}
+
+static bool blorp_time_validate_numeric_fields_for_format(
+    const char* input,
+    const char* fmt
+) {
+    blorp_TimeParsedNumericFields fields = {0};
+    size_t input_pos = 0;
+    size_t fmt_pos = 0;
+
+    while (fmt[fmt_pos] != '\0') {
+        char fmt_char = fmt[fmt_pos];
+        if (blorp_time_is_ascii_space(fmt_char)) {
+            while (blorp_time_is_ascii_space(fmt[fmt_pos])) fmt_pos++;
+            while (blorp_time_is_ascii_space(input[input_pos])) input_pos++;
+            continue;
+        }
+        if (fmt_char != '%') {
+            if (!blorp_time_scan_literal(input, &input_pos, fmt_char)) {
+                return blorp_time_collected_numeric_fields_valid(&fields);
+            }
+            fmt_pos++;
+            continue;
+        }
+
+        fmt_pos++;
+        char directive = fmt[fmt_pos];
+        if (directive == '\0') {
+            return blorp_time_collected_numeric_fields_valid(&fields);
+        }
+        if (directive == '%') {
+            if (!blorp_time_scan_literal(input, &input_pos, '%')) {
+                return blorp_time_collected_numeric_fields_valid(&fields);
+            }
+            fmt_pos++;
+            continue;
+        }
+        if (directive == 'F') {
+            if (!blorp_time_record_numeric_directive(&fields, 'Y', input, &input_pos) ||
+                !blorp_time_scan_literal(input, &input_pos, '-') ||
+                !blorp_time_record_numeric_directive(&fields, 'm', input, &input_pos) ||
+                !blorp_time_scan_literal(input, &input_pos, '-') ||
+                !blorp_time_record_numeric_directive(&fields, 'd', input, &input_pos)) {
+                return blorp_time_collected_numeric_fields_valid(&fields);
+            }
+            fmt_pos++;
+            continue;
+        }
+        if (directive == 'T') {
+            if (!blorp_time_record_numeric_directive(&fields, 'H', input, &input_pos) ||
+                !blorp_time_scan_literal(input, &input_pos, ':') ||
+                !blorp_time_record_numeric_directive(&fields, 'M', input, &input_pos) ||
+                !blorp_time_scan_literal(input, &input_pos, ':') ||
+                !blorp_time_record_numeric_directive(&fields, 'S', input, &input_pos)) {
+                return blorp_time_collected_numeric_fields_valid(&fields);
+            }
+            fmt_pos++;
+            continue;
+        }
+        if (!blorp_time_record_numeric_directive(&fields, directive, input, &input_pos)) {
+            return blorp_time_collected_numeric_fields_valid(&fields);
+        }
+        fmt_pos++;
+    }
+
+    return blorp_time_collected_numeric_fields_valid(&fields);
+}
+
 // Format microsecond timestamp using strftime (256-byte output limit)
-blorp_String* blorp_time_format(long us, const blorp_String* fmt) {
+blorp_String* blorp_time_format(long microseconds, const blorp_String* fmt) {
     if (!fmt || blorp_string_contains_nul(fmt)) {
         return blorp_string_alloc_uninit(0, 0);
     }
-    struct tm t = blorp_us_to_tm(us);
+    struct tm t = blorp_microseconds_to_tm(microseconds);
     char* cfmt = (char*)blorp_malloc_checked(fmt->len + 1);
     memcpy(cfmt, fmt->data, fmt->len);
     cfmt[fmt->len] = '\0';
@@ -26720,59 +27008,131 @@ blorp_StackOption_Int blorp_time_parse(const blorp_String* s, const blorp_String
         free(cfmt);
         return blorp_stack_option_int_none();
     }
+    bool numeric_fields_valid = blorp_time_validate_numeric_fields_for_format(cs, cfmt);
     free(cs);
     free(cfmt);
 
+    if (!numeric_fields_valid) {
+        return blorp_stack_option_int_none();
+    }
+    if (t.tm_sec < 0 || t.tm_sec > 59) {
+        return blorp_stack_option_int_none();
+    }
     time_t secs = timegm(&t);
+    struct tm normalized;
+    gmtime_r(&secs, &normalized);
+    if (!blorp_time_tm_matches_utc_fields(&t, &normalized)) {
+        return blorp_stack_option_int_none();
+    }
     return blorp_stack_option_int_some(secs * 1000000L);
 }
 
-// from_iso: Parse ISO 8601 / RFC 3339 date string to POSIX microseconds.
-blorp_StackOption_Int blorp_time_from_iso(const blorp_String* s) {
+static bool blorp_time_parse_fixed_digits(
+    const char* p,
+    long len,
+    long pos,
+    long digits,
+    int* out
+) {
+    if (pos < 0 || digits < 1 || pos + digits > len) return false;
+    int value = 0;
+    for (long i = 0; i < digits; i++) {
+        char c = p[pos + i];
+        if (!blorp_time_is_digit(c)) return false;
+        value = value * 10 + (c - '0');
+    }
+    *out = value;
+    return true;
+}
+
+static blorp_StackOption_Int blorp_time_parse_iso_like(
+    const blorp_String* s,
+    bool allow_date_only
+) {
     if (!s || s->len < 10) return blorp_stack_option_int_none();
     const char* p = s->data;
     long len = s->len;
 
     int year = 0, month = 0, day = 0;
     if (p[4] != '-' || p[7] != '-') return blorp_stack_option_int_none();
-    for (int i = 0; i < 4; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); year = year * 10 + (p[i] - '0'); }
-    for (int i = 5; i < 7; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); month = month * 10 + (p[i] - '0'); }
-    for (int i = 8; i < 10; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); day = day * 10 + (p[i] - '0'); }
-    if (month < 1 || month > 12 || day < 1 || day > 31) return blorp_stack_option_int_none();
+    if (!blorp_time_parse_fixed_digits(p, len, 0, 4, &year) ||
+        !blorp_time_parse_fixed_digits(p, len, 5, 2, &month) ||
+        !blorp_time_parse_fixed_digits(p, len, 8, 2, &day)) {
+        return blorp_stack_option_int_none();
+    }
+    if (!blorp_time_valid_date(year, month, day)) {
+        return blorp_stack_option_int_none();
+    }
 
     int hour = 0, minute = 0, second = 0;
-    long frac_us = 0, offset_us = 0;
+    long fraction_microseconds = 0;
+    long offset_microseconds = 0;
 
-    if (len > 10) {
+    if (len == 10) {
+        if (!allow_date_only) return blorp_stack_option_int_none();
+    } else {
         if (p[10] != 'T' && p[10] != 't') return blorp_stack_option_int_none();
-        if (len < 19) return blorp_stack_option_int_none();
+        if (len < 20) return blorp_stack_option_int_none();
         if (p[13] != ':' || p[16] != ':') return blorp_stack_option_int_none();
-        for (int i = 11; i < 13; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); hour = hour * 10 + (p[i] - '0'); }
-        for (int i = 14; i < 16; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); minute = minute * 10 + (p[i] - '0'); }
-        for (int i = 17; i < 19; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); second = second * 10 + (p[i] - '0'); }
-        if (hour > 23 || minute > 59 || second > 59) return blorp_stack_option_int_none();
+        if (!blorp_time_parse_fixed_digits(p, len, 11, 2, &hour) ||
+            !blorp_time_parse_fixed_digits(p, len, 14, 2, &minute) ||
+            !blorp_time_parse_fixed_digits(p, len, 17, 2, &second)) {
+            return blorp_stack_option_int_none();
+        }
+        if (!blorp_time_valid_time(hour, minute, second)) {
+            return blorp_stack_option_int_none();
+        }
 
         long pos = 19;
         if (pos < len && p[pos] == '.') {
             pos++;
-            long frac_digits = 0, frac_val = 0;
-            while (pos < len && p[pos] >= '0' && p[pos] <= '9' && frac_digits < 6) {
-                frac_val = frac_val * 10 + (p[pos] - '0'); frac_digits++; pos++;
+            if (pos >= len || !blorp_time_is_digit(p[pos])) {
+                return blorp_stack_option_int_none();
             }
-            while (pos < len && p[pos] >= '0' && p[pos] <= '9') pos++;
-            while (frac_digits < 6) { frac_val *= 10; frac_digits++; }
-            frac_us = frac_val;
-        }
-        if (pos < len) {
-            if (p[pos] == 'Z' || p[pos] == 'z') { /* UTC */ }
-            else if (p[pos] == '+' || p[pos] == '-') {
-                int sign = (p[pos] == '+') ? 1 : -1;
+            long frac_digits = 0;
+            long frac_val = 0;
+            while (pos < len && blorp_time_is_digit(p[pos])) {
+                if (frac_digits < 6) {
+                    frac_val = frac_val * 10 + (p[pos] - '0');
+                    frac_digits++;
+                }
                 pos++;
-                if (pos + 5 > len || p[pos+2] != ':') return blorp_stack_option_int_none();
-                int oh = (p[pos] - '0') * 10 + (p[pos+1] - '0');
-                int om = (p[pos+3] - '0') * 10 + (p[pos+4] - '0');
-                offset_us = (long)sign * ((long)oh * 3600000000L + (long)om * 60000000L);
             }
+            while (frac_digits < 6) {
+                frac_val *= 10;
+                frac_digits++;
+            }
+            fraction_microseconds = frac_val;
+        }
+
+        if (pos >= len) return blorp_stack_option_int_none();
+        if (p[pos] == 'Z' || p[pos] == 'z') {
+            pos++;
+            if (pos != len) return blorp_stack_option_int_none();
+        } else if (p[pos] == '+' || p[pos] == '-') {
+            int sign = (p[pos] == '+') ? 1 : -1;
+            pos++;
+            if (pos + 5 != len || p[pos + 2] != ':') {
+                return blorp_stack_option_int_none();
+            }
+            int offset_hour = 0;
+            int offset_minute = 0;
+            if (!blorp_time_parse_fixed_digits(p, len, pos, 2, &offset_hour) ||
+                !blorp_time_parse_fixed_digits(p, len, pos + 3, 2, &offset_minute)) {
+                return blorp_stack_option_int_none();
+            }
+            if (offset_hour > 23 || offset_minute > 59) {
+                return blorp_stack_option_int_none();
+            }
+            if (sign < 0 && offset_hour == 0 && offset_minute == 0) {
+                return blorp_stack_option_int_none();
+            }
+            offset_microseconds =
+                (long)sign *
+                ((long)offset_hour * 3600000000L +
+                 (long)offset_minute * 60000000L);
+        } else {
+            return blorp_stack_option_int_none();
         }
     }
 
@@ -26780,9 +27140,19 @@ blorp_StackOption_Int blorp_time_from_iso(const blorp_String* s) {
     t.tm_year = year - 1900; t.tm_mon = month - 1; t.tm_mday = day;
     t.tm_hour = hour; t.tm_min = minute; t.tm_sec = second;
     time_t secs = timegm(&t);
-    if (secs == (time_t)-1 && year != 1969) return blorp_stack_option_int_none();
-    long us = secs * 1000000L + frac_us - offset_us;
-    return blorp_stack_option_int_some(us);
+    long microseconds =
+        secs * 1000000L + fraction_microseconds - offset_microseconds;
+    return blorp_stack_option_int_some(microseconds);
+}
+
+// from_iso: Parse ISO calendar date or RFC3339 date-time to POSIX microseconds.
+blorp_StackOption_Int blorp_time_from_iso(const blorp_String* s) {
+    return blorp_time_parse_iso_like(s, true);
+}
+
+// parse_rfc3339: Parse strict RFC3339 date-time to POSIX microseconds.
+blorp_StackOption_Int blorp_time_parse_rfc3339(const blorp_String* s) {
+    return blorp_time_parse_iso_like(s, false);
 }
 
 

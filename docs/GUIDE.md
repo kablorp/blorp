@@ -2911,6 +2911,42 @@ import:
     debug: debug_string, type_name, is_heap
 ```
 
+### Date And Time
+
+`std/time` is UTC and POSIX-time-centric. Raw timestamp helpers use signed
+microseconds since `1970-01-01T00:00:00Z`, but new code should prefer the
+stack `Instant` wrapper when the value is semantically a wall-clock instant.
+
+```blorp
+import:
+    time:
+        Instant,
+        now_instant,
+        parse_rfc3339,
+        format_rfc3339,
+        add_duration,
+    units: Duration, seconds
+
+func deadline() -> Option[String]:
+    start: Instant = now_instant()          -- CLOCK_REALTIME wall clock
+    delay: Duration = seconds(5)            -- exact elapsed microseconds
+    finish: Instant = add_duration(start, delay)
+    Some(format_rfc3339(finish))
+```
+
+Use `time.now()` or `now_instant()` for wall-clock dates. Use
+`system.now_microseconds()` for monotonic elapsed-time measurement; it is not a
+calendar timestamp. `parse_rfc3339` accepts complete RFC3339 date-times with an
+explicit `Z` or numeric offset and returns `Option[Instant]`. Calendar date-only
+compatibility remains on `from_iso`, which returns raw POSIX microseconds.
+`format_time` and `parse_time` are POSIX/C-library format helpers; use the
+RFC3339 functions for stable interchange strings.
+
+`Duration` lives in `std/units` and stores integer microseconds in a
+`microseconds` field. Timeout APIs accept typed `Duration` values and round
+positive sub-millisecond durations up to one millisecond; non-positive
+durations are immediate polls.
+
 ### Process Helpers
 
 `std/process` is explicit-import only:

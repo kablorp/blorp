@@ -173,7 +173,7 @@ warmups = int(sys.argv[1])
 runs = int(sys.argv[2])
 cmd = sys.argv[3:]
 
-bench_re = re.compile(r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|micros=([0-9]+))", re.M)
+    bench_re = re.compile(r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))", re.M)
 
 def run_once():
     proc = subprocess.run(
@@ -196,9 +196,11 @@ def run_once():
             sys.stderr.write(proc.stderr)
         raise SystemExit(125)
 
-    seconds, micros = match.groups()
+    seconds, microseconds, micros = match.groups()
     if seconds is not None:
         return float(seconds)
+    if microseconds is not None:
+        return float(microseconds) / 1_000_000.0
     return float(micros) / 1_000_000.0
 
 for _ in range(warmups):

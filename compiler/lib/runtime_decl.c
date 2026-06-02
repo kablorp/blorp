@@ -2063,17 +2063,18 @@ long blorp_now_us(void);
 long blorp_black_box_int(long value);
 double blorp_black_box_float(double value);
 long blorp_time_now(void);
-long blorp_time_to_year(long us);
-long blorp_time_to_month(long us);
-long blorp_time_to_day(long us);
-long blorp_time_to_hour(long us);
-long blorp_time_to_minute(long us);
-long blorp_time_to_second(long us);
-long blorp_time_to_weekday(long us);
+long blorp_time_to_year(long microseconds);
+long blorp_time_to_month(long microseconds);
+long blorp_time_to_day(long microseconds);
+long blorp_time_to_hour(long microseconds);
+long blorp_time_to_minute(long microseconds);
+long blorp_time_to_second(long microseconds);
+long blorp_time_to_weekday(long microseconds);
 long blorp_time_from_parts(long year, long month, long day, long hour, long minute, long second);
-blorp_String* blorp_time_format(long us, const blorp_String* fmt);
+blorp_String* blorp_time_format(long microseconds, const blorp_String* fmt);
 blorp_StackOption_Int blorp_time_parse(const blorp_String* s, const blorp_String* fmt);
 blorp_StackOption_Int blorp_time_from_iso(const blorp_String* s);
+blorp_StackOption_Int blorp_time_parse_rfc3339(const blorp_String* s);
 
 // Tuple / Closure
 blorp_Tuple* blorp_tuple_new(long arity, ...);

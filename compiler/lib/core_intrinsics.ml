@@ -926,6 +926,9 @@ let std_body_specs =
       time_spec ~return_shape:(ReturnOptionOfNamed "Int")
         ~c_name:"blorp_time_from_iso" "from_iso" 1
         ~param_shapes:[ ParamNamed "String" ] (FirstParamNamed "String");
+      time_spec ~return_shape:(ReturnOptionOfNamed "Int")
+        ~c_name:"blorp_time_parse_rfc3339" "parse_rfc3339_posix" 1
+        ~param_shapes:[ ParamNamed "String" ] (FirstParamNamed "String");
     ]
     @ int_part_specs
   in
