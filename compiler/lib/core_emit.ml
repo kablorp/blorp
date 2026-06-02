@@ -692,6 +692,22 @@ let emit_closure_env_release_mask_stmt (ctx : Core_emit_context.t)
   let mask = closure_env_release_mask ctx captures in
   emit_line ctx (Printf.sprintf "%s->env_release_mask = %dUL;" tmp mask)
 
+let task_closure_env_release_mask (ctx : Core_emit_context.t)
+    (captures : task_capture list) : int =
+  captures
+  |> List.mapi (fun i capture ->
+      match capture.task_capture_kind with
+      | (TaskCopyCapture | TaskMoveResourceItem)
+        when capture_slot_needs_release ctx capture.task_capture_ty ->
+          1 lsl i
+      | TaskCopyCapture | TaskMoveResourceItem | TaskStructuredTaskBorrow -> 0)
+  |> List.fold_left ( lor ) 0
+
+let emit_task_closure_env_release_mask_stmt (ctx : Core_emit_context.t)
+    (tmp : string) (captures : task_capture list) : unit =
+  let mask = task_closure_env_release_mask ctx captures in
+  emit_line ctx (Printf.sprintf "%s->env_release_mask = %dUL;" tmp mask)
+
 let direct_returned_capture (ctx : Core_emit_context.t)
     (captures : (string * Ast.type_expr) list) (body : core) : string option =
   match body.desc with
@@ -7775,7 +7791,6 @@ and emit_task_closure (ctx : Core_emit_context.t) ~(loc : Ast.loc)
     ~(context : string) (lambda_name : string) (captures : task_capture list) :
     string =
   let fn_tmp = Printf.sprintf "__conc_fn_%d" (fresh_temp ctx) in
-  let capture_bindings = task_capture_bindings captures in
   emit_indent ctx;
   if captures = [] then
     emitln ctx
@@ -7809,7 +7824,7 @@ and emit_task_closure (ctx : Core_emit_context.t) ~(loc : Ast.loc)
               (Types.type_to_string capture.task_capture_ty));
         emitln ctx ";")
       captures;
-    emit_closure_env_release_mask_stmt ctx fn_tmp capture_bindings
+    emit_task_closure_env_release_mask_stmt ctx fn_tmp captures
   end;
   fn_tmp
 
@@ -8279,13 +8294,10 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
        batch_c fn_tmp);
   emit_task_array_cancellation_cleanup_push ctx cleanups_c slot_c tasks_c;
   emit_line ctx (Printf.sprintf "%s++;" count_c);
-  emit_line ctx
-    (Printf.sprintf "if ((%s %% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0) {"
-       count_c);
-  ctx.indent <- ctx.indent + 1;
+  (* A resource source can park while pulling the next item. Flush each spawned
+     child before the parent goes back to [resource_source_next], otherwise an
+     idle listener can queue a handler and then park before scheduling it. *)
   emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
   ctx.indent <- ctx.indent - 1;
   emit_line ctx "}";
   emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);

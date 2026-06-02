@@ -98,6 +98,18 @@ let contains_sub output sub =
   let rec go i = i + n <= m && (String.sub output i n = sub || go (i + 1)) in
   go 0
 
+let count_sub output sub =
+  let n = String.length sub in
+  let m = String.length output in
+  if n = 0 then 0
+  else
+    let rec go i count =
+      if i + n > m then count
+      else if String.sub output i n = sub then go (i + n) (count + 1)
+      else go (i + 1) count
+    in
+    go 0 0
+
 (** Emit a Core expression and return the resulting C string. *)
 let emit_to_string (e : core) : string =
   let ctx = Blorp.Core_emit_context.create () in
@@ -3122,6 +3134,60 @@ let test_emit_concurrently_loop_rc_result_uses_spawn_rc () =
     "for ... concurrently transfers collected result list ownership" true
     (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_results_")
 
+let test_emit_resource_source_concurrently_flushes_each_spawn () =
+  let resource_ty = TyNamed ("TcpStream", []) in
+  let error_ty = TyNamed ("TcpError", []) in
+  let source_ty = TyNamed ("ResourceSource", [ resource_ty; error_ty ]) in
+  let task =
+    {
+      tc_func = "handle_conn";
+      tc_def_id = 4242;
+      tc_captures =
+        [
+          {
+            task_capture_name = "conn";
+            task_capture_ty = resource_ty;
+            task_capture_kind = TaskMoveResourceItem;
+          };
+        ];
+      tc_return_ty = ty_void;
+    }
+  in
+  let e =
+    mk
+      (CConcurrentlyLoop
+         {
+           cf_var = Var.named "conn";
+           cf_iter = cvar "source" source_ty;
+           cf_body = cvoid;
+           cf_timeout = None;
+           cf_width = ConcurrentlyLoopLimit (cint 8192);
+           cf_output = ConcurrentlyLoopDiscard;
+           cf_item_mode =
+             ConcurrentlyLoopMoveResourceItem
+               { clmi_resource_ty = resource_ty; clmi_error_ty = error_ty };
+           cf_task_scope = synthetic_concurrent_task_scope;
+           cf_task = Some task;
+         })
+      ty_void
+  in
+  let output = emit_stmt_to_string e in
+  Alcotest.(check bool)
+    "resource-source fan-out pulls resources" true
+    (contains_sub output "blorp_resource_source_next_raw(");
+  Alcotest.(check bool)
+    "resource-source fan-out spawns into a task batch" true
+    (contains_sub output "blorp_task_spawn_owned_in_batch(&__conc_batch_");
+  Alcotest.(check bool)
+    "resource-source moved resource has pre-entry fallback release" true
+    (contains_sub output "->env_release_mask = 1UL;");
+  Alcotest.(check bool)
+    "resource-source fan-out does not wait for batch interval" false
+    (contains_sub output "% BLORP_TASK_BATCH_FLUSH_INTERVAL");
+  Alcotest.(check bool)
+    "resource-source fan-out flushes each spawn and before join" true
+    (count_sub output "blorp_task_batch_flush(&__conc_batch_" >= 2)
+
 let test_emit_detach () =
   let fty = TyFunc { params = []; return = ty_void; is_pure = false } in
   let inner =
@@ -6053,6 +6119,8 @@ let suite =
           test_emit_concurrent_stack_result_join_conversion;
         Alcotest.test_case "concurrently_loop_rc_result_uses_spawn_rc" `Quick
           test_emit_concurrently_loop_rc_result_uses_spawn_rc;
+        Alcotest.test_case "resource_source_concurrently_flushes_each_spawn"
+          `Quick test_emit_resource_source_concurrently_flushes_each_spawn;
         Alcotest.test_case "detach" `Quick test_emit_detach;
         Alcotest.test_case "detach_void_task_abi" `Quick
           test_emit_detach_void_task_abi;
