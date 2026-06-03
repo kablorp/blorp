@@ -65,7 +65,7 @@ let test_builtin_layout_is_single_source_of_truth () =
       retain = NoRetainNeeded;
       release = NoReleaseNeeded;
     };
-  check_builtin "std/file::FileReader"
+  check_builtin "std/fs::FileReader"
     {
       ownership = Unmanaged;
       retain = NoRetainNeeded;
@@ -110,7 +110,7 @@ let test_builtin_unmanaged_type_needs_no_release () =
   expect_known_layout "Int layout" expected
     (Blorp.Core_type_layout.classify (meta ()) (ty "Int" []));
   expect_known_layout "FileReader layout" expected
-    (Blorp.Core_type_layout.classify (meta ()) (ty "std/file::FileReader" []));
+    (Blorp.Core_type_layout.classify (meta ()) (ty "std/fs::FileReader" []));
   expect_known_layout "UdpSocket layout" expected
     (Blorp.Core_type_layout.classify (meta ()) (ty "std/net/udp::UdpSocket" []))
 

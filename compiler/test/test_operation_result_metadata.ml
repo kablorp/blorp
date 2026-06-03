@@ -360,6 +360,16 @@ let expected_file_operations =
       [ "FileReadAppender" ],
       0,
       Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_dir_open_raw",
+      "blorp_DirectoryOpenResult",
+      [ "Directory" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_dir_read_entry_raw",
+      "blorp_DirectoryEntryResult",
+      [ "Option" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
     ( "blorp_file_read_text_reader_raw",
       "blorp_FileStringResult",
       [ "String" ],
@@ -581,6 +591,8 @@ let expected_operation_arguments =
     ("blorp_file_open_append_raw", [ ArgBorrow ]);
     ("blorp_file_open_read_write_raw", [ ArgBorrow ]);
     ("blorp_file_open_read_append_raw", [ ArgBorrow ]);
+    ("blorp_dir_open_raw", [ ArgBorrow ]);
+    ("blorp_dir_read_entry_raw", [ ArgBorrow ]);
     ("blorp_file_read_text_reader_raw", [ ArgBorrow ]);
     ("blorp_file_read_bytes_reader_raw", [ ArgBorrow ]);
     ("blorp_file_read_chunk_reader_raw", [ ArgBorrow; ArgBorrow ]);
@@ -624,6 +636,7 @@ let expected_boxed_only_operations =
     "blorp_file_open_append_raw";
     "blorp_file_open_read_write_raw";
     "blorp_file_open_read_append_raw";
+    "blorp_dir_open_raw";
   ]
 
 let expected_parking_operations =
@@ -705,6 +718,9 @@ let expected_fallible_stream_sources =
     ( "blorp_file_windows_reader_raw",
       "BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE",
       [ ArgBorrow; ArgBorrow ] );
+    ( "blorp_dir_entries_raw",
+      "BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE",
+      [ ArgBorrow ] );
     ( "blorp_udp_datagrams_raw",
       "BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_UDP",
       [ ArgBorrow; ArgBorrow ] );

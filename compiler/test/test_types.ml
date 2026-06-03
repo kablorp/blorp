@@ -514,7 +514,7 @@ let test_std_global_abi_type_identity_stays_bare () =
     (canonical_module_type_name ~module_path:"std/list" "List");
   check_true "FileReader is ABI global" (is_global_abi_type_name "FileReader");
   check_string "std FileReader stays bare" "FileReader"
-    (canonical_module_type_name ~module_path:"std/file" "FileReader")
+    (canonical_module_type_name ~module_path:"std/fs" "FileReader")
 
 let test_std_non_abi_type_identity_is_owner_qualified () =
   check_false "AABB3 is not ABI global" (is_global_abi_type_name "AABB3");

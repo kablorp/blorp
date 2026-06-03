@@ -26,8 +26,8 @@ let ty_list_int = TyNamed ("List", [ ty_int ])
 let ty_opt_int = TyNamed ("Option", [ ty_int ])
 let ty_test_resource = TyNamed ("TestResource", [])
 let ty_opt_test_resource = TyNamed ("Option", [ ty_test_resource ])
-let ty_file_reader = TyNamed ("std/file::FileReader", [])
-let ty_io_error = TyNamed ("std/file::IOError", [])
+let ty_file_reader = TyNamed ("std/fs::FileReader", [])
+let ty_io_error = TyNamed ("std/fs::IOError", [])
 let ty_fixed = TyNamed ("Fixed", [])
 
 let ty_result_file_reader_error =

@@ -210,6 +210,8 @@ let global_abi_type_names =
     "FileAppender";
     "FileReadWriter";
     "FileReadAppender";
+    "Directory";
+    "DirectoryEntry";
     "TcpListener";
     "TcpStream";
     "IpAddress";

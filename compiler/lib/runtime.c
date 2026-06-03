@@ -17,6 +17,7 @@
 #include <math.h>
 #include <errno.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -7872,6 +7873,31 @@ typedef struct blorp_FileReadAppender {
     int fd;
 } blorp_FileReadAppender;
 
+typedef struct blorp_Directory {
+    DIR* dir;
+    char* path;
+} blorp_Directory;
+
+typedef struct blorp_DirectoryEntry {
+    blorp_Object header;
+    blorp_String* name;
+    long kind;
+} blorp_DirectoryEntry;
+
+typedef enum {
+    BLORP_DIRECTORY_ENTRY_FILE = 0,
+    BLORP_DIRECTORY_ENTRY_DIRECTORY = 1,
+    BLORP_DIRECTORY_ENTRY_SYMLINK = 2,
+    BLORP_DIRECTORY_ENTRY_OTHER = 3,
+    BLORP_DIRECTORY_ENTRY_UNKNOWN = 4
+} blorp_DirectoryEntryKind;
+
+typedef enum {
+    BLORP_DIRECTORY_READ_ITEM,
+    BLORP_DIRECTORY_READ_END,
+    BLORP_DIRECTORY_READ_ERROR
+} blorp_DirectoryReadStatus;
+
 typedef enum {
     BLORP_FILE_ERROR_NONE = 0,
     BLORP_FILE_ERROR_NOT_FOUND = 1,
@@ -7913,6 +7939,12 @@ typedef struct {
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
 } blorp_FileOpenReadAppenderResult;
+
+typedef struct {
+    blorp_Directory* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_DirectoryOpenResult;
 
 typedef struct {
     blorp_String* value;
@@ -7988,6 +8020,12 @@ typedef struct {
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
 } blorp_FileVoidResult;
+
+typedef struct {
+    blorp_DirectoryEntry* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_DirectoryEntryResult;
 
 typedef enum {
     BLORP_TCP_ERROR_NONE = 0,
@@ -26642,6 +26680,12 @@ static blorp_FallibleStreamError blorp_fallible_stream_udp_error(
     blorp_UdpErrorKind kind,
     blorp_String* detail
 );
+static blorp_DirectoryReadStatus blorp_dir_read_next_entry(
+    blorp_Directory* dir,
+    blorp_DirectoryEntry** out,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+);
 static blorp_FallibleStreamListResult blorp_fallible_stream_list_ok(
     blorp_List* value
 );
@@ -26766,6 +26810,10 @@ typedef struct {
     bool initialized;
     bool done;
 } FallibleFileWindowsState;
+typedef struct {
+    blorp_Directory* dir;
+    bool done;
+} FallibleDirectoryEntriesState;
 typedef struct {
     blorp_UdpSocket* socket;
     long max_bytes;
@@ -28365,6 +28413,53 @@ blorp_FallibleStream* blorp_file_windows_reader_raw(
     s->state = st;
     s->pull = fallible_file_windows_pull;
     s->state_cleanup = fallible_file_windows_cleanup;
+    return s;
+}
+
+static blorp_FallibleStreamPullStatus fallible_directory_entries_pull(
+    blorp_FallibleStream* self,
+    void** out,
+    blorp_FallibleStreamError* error
+) {
+    FallibleDirectoryEntriesState* st =
+        (FallibleDirectoryEntriesState*)self->state;
+    if (st->done) return BLORP_FALLIBLE_STREAM_END;
+
+    blorp_DirectoryEntry* entry = NULL;
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    blorp_DirectoryReadStatus status =
+        blorp_dir_read_next_entry(st->dir, &entry, &error_kind, &error_detail);
+    switch (status) {
+        case BLORP_DIRECTORY_READ_ITEM:
+            *out = entry;
+            return BLORP_FALLIBLE_STREAM_ITEM;
+        case BLORP_DIRECTORY_READ_END:
+            st->done = true;
+            return BLORP_FALLIBLE_STREAM_END;
+        case BLORP_DIRECTORY_READ_ERROR:
+        default:
+            st->done = true;
+            *error = blorp_fallible_stream_file_error(error_kind, error_detail);
+            return BLORP_FALLIBLE_STREAM_ERROR;
+    }
+}
+
+static void fallible_directory_entries_cleanup(blorp_FallibleStream* self) {
+    free(self->state);
+}
+
+blorp_FallibleStream* blorp_dir_entries_raw(blorp_Directory* dir) {
+    blorp_FallibleStream* s = blorp_fallible_stream_new();
+    FallibleDirectoryEntriesState* st =
+        (FallibleDirectoryEntriesState*)blorp_malloc_checked(
+            sizeof(FallibleDirectoryEntriesState));
+    st->dir = dir;
+    st->done = false;
+    s->elem_layout = BLORP_STREAM_ELEM_OWNED_ARC;
+    s->state = st;
+    s->pull = fallible_directory_entries_pull;
+    s->state_cleanup = fallible_directory_entries_cleanup;
     return s;
 }
 
@@ -32182,6 +32277,17 @@ static blorp_FileOpenReadAppenderResult blorp_file_open_read_appender_error(
     };
 }
 
+static blorp_DirectoryOpenResult blorp_dir_open_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_DirectoryOpenResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
 static blorp_FileStringResult blorp_file_string_ok(blorp_String* value) {
     return (blorp_FileStringResult){
         .value = value,
@@ -32372,6 +32478,27 @@ static blorp_FileVoidResult blorp_file_void_error(
     blorp_String* detail
 ) {
     return (blorp_FileVoidResult){ .error_kind = kind, .detail = detail };
+}
+
+static blorp_DirectoryEntryResult blorp_dir_entry_ok(
+    blorp_DirectoryEntry* value
+) {
+    return (blorp_DirectoryEntryResult){
+        .value = value,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_DirectoryEntryResult blorp_dir_entry_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_DirectoryEntryResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
 }
 
 static blorp_String* blorp_file_open_errno_detail(
@@ -32886,6 +33013,198 @@ blorp_FileOpenReadAppenderResult blorp_file_open_read_append_raw(
     };
 }
 
+blorp_DirectoryOpenResult blorp_dir_open_raw(const blorp_String* path) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    char* cpath = blorp_file_copy_path_for_open(path, &error_kind, &error_detail);
+    if (!cpath) return blorp_dir_open_error(error_kind, error_detail);
+
+    DIR* raw_dir = opendir(cpath);
+    if (!raw_dir) {
+        int errnum = errno;
+        free(cpath);
+        error_kind = blorp_file_error_kind_from_errno(errnum);
+        error_detail = blorp_file_open_errno_detail(path, error_kind, errnum);
+        return blorp_dir_open_error(error_kind, error_detail);
+    }
+
+    blorp_Directory* dir =
+        (blorp_Directory*)blorp_malloc_checked(sizeof(blorp_Directory));
+    dir->dir = raw_dir;
+    dir->path = cpath;
+    return (blorp_DirectoryOpenResult){
+        .handle = dir,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static void blorp_directory_entry_destroy(void* obj) {
+    blorp_DirectoryEntry* entry = (blorp_DirectoryEntry*)obj;
+    if (entry->name) blorp_release(entry->name);
+}
+
+static blorp_DirectoryEntry* blorp_directory_entry_make(
+    const char* name,
+    size_t name_len,
+    long kind
+) {
+    blorp_DirectoryEntry* entry =
+        (blorp_DirectoryEntry*)blorp_alloc(sizeof(blorp_DirectoryEntry));
+    BLORP_TAG(entry, "DirectoryEntry");
+    BLORP_SET_DESTRUCTOR(entry, blorp_directory_entry_destroy);
+    entry->name = blorp_string_from_buf_size(name, name_len);
+    entry->kind = kind;
+    return entry;
+}
+
+static long blorp_directory_entry_kind_from_mode(mode_t mode) {
+    if (S_ISREG(mode)) return BLORP_DIRECTORY_ENTRY_FILE;
+    if (S_ISDIR(mode)) return BLORP_DIRECTORY_ENTRY_DIRECTORY;
+    if (S_ISLNK(mode)) return BLORP_DIRECTORY_ENTRY_SYMLINK;
+    return BLORP_DIRECTORY_ENTRY_OTHER;
+}
+
+static long blorp_directory_entry_kind_from_path(
+    const blorp_Directory* dir,
+    const char* name,
+    size_t name_len
+) {
+    if (!dir || !dir->path || !name) return BLORP_DIRECTORY_ENTRY_UNKNOWN;
+
+    size_t dir_len = strlen(dir->path);
+    bool needs_sep = dir_len > 0 && dir->path[dir_len - 1] != '/';
+    size_t extra = (needs_sep ? 1U : 0U) + 1U;
+    if (dir_len > SIZE_MAX - name_len - extra) {
+        return BLORP_DIRECTORY_ENTRY_UNKNOWN;
+    }
+
+    size_t full_len = dir_len + (needs_sep ? 1U : 0U) + name_len;
+    char* full = (char*)blorp_malloc_checked(full_len + 1U);
+    memcpy(full, dir->path, dir_len);
+    size_t pos = dir_len;
+    if (needs_sep) full[pos++] = '/';
+    memcpy(full + pos, name, name_len);
+    full[full_len] = '\0';
+
+    struct stat st;
+    int result = lstat(full, &st);
+    free(full);
+    if (result != 0) return BLORP_DIRECTORY_ENTRY_UNKNOWN;
+    return blorp_directory_entry_kind_from_mode(st.st_mode);
+}
+
+static long blorp_directory_entry_kind_from_dirent(
+    const blorp_Directory* dir,
+    const struct dirent* entry
+) {
+    if (!entry) return BLORP_DIRECTORY_ENTRY_UNKNOWN;
+#if defined(DT_REG)
+    switch (entry->d_type) {
+#ifdef DT_REG
+        case DT_REG:
+            return BLORP_DIRECTORY_ENTRY_FILE;
+#endif
+#ifdef DT_DIR
+        case DT_DIR:
+            return BLORP_DIRECTORY_ENTRY_DIRECTORY;
+#endif
+#ifdef DT_LNK
+        case DT_LNK:
+            return BLORP_DIRECTORY_ENTRY_SYMLINK;
+#endif
+#ifdef DT_FIFO
+        case DT_FIFO:
+            return BLORP_DIRECTORY_ENTRY_OTHER;
+#endif
+#ifdef DT_SOCK
+        case DT_SOCK:
+            return BLORP_DIRECTORY_ENTRY_OTHER;
+#endif
+#ifdef DT_CHR
+        case DT_CHR:
+            return BLORP_DIRECTORY_ENTRY_OTHER;
+#endif
+#ifdef DT_BLK
+        case DT_BLK:
+            return BLORP_DIRECTORY_ENTRY_OTHER;
+#endif
+        default:
+            break;
+    }
+#endif
+    return blorp_directory_entry_kind_from_path(
+        dir,
+        entry->d_name,
+        strlen(entry->d_name)
+    );
+}
+
+static blorp_DirectoryReadStatus blorp_dir_read_next_entry(
+    blorp_Directory* dir,
+    blorp_DirectoryEntry** out,
+    blorp_FileErrorKind* error_kind,
+    blorp_String** error_detail
+) {
+    if (out) *out = NULL;
+    if (error_kind) *error_kind = BLORP_FILE_ERROR_NONE;
+    if (error_detail) *error_detail = NULL;
+    if (!dir || !dir->dir) {
+        if (error_kind) *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
+        if (error_detail) {
+            *error_detail = blorp_string_literal("read_entry: closed directory handle");
+        }
+        return BLORP_DIRECTORY_READ_ERROR;
+    }
+
+    while (true) {
+        errno = 0;
+        struct dirent* entry = readdir(dir->dir);
+        if (!entry) {
+            if (errno == 0) return BLORP_DIRECTORY_READ_END;
+            int errnum = errno;
+            if (error_kind) {
+                *error_kind = blorp_file_error_kind_from_errno(errnum);
+            }
+            if (error_detail) {
+                *error_detail =
+                    blorp_file_operation_errno_detail("read_entry", errnum);
+            }
+            return BLORP_DIRECTORY_READ_ERROR;
+        }
+
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        size_t name_len = strlen(entry->d_name);
+        long kind = blorp_directory_entry_kind_from_dirent(dir, entry);
+        if (out) {
+            *out = blorp_directory_entry_make(entry->d_name, name_len, kind);
+        }
+        return BLORP_DIRECTORY_READ_ITEM;
+    }
+}
+
+blorp_DirectoryEntryResult blorp_dir_read_entry_raw(
+    blorp_Directory* dir
+) {
+    blorp_DirectoryEntry* entry = NULL;
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    blorp_DirectoryReadStatus status =
+        blorp_dir_read_next_entry(dir, &entry, &error_kind, &error_detail);
+    switch (status) {
+        case BLORP_DIRECTORY_READ_ITEM:
+            return blorp_dir_entry_ok(entry);
+        case BLORP_DIRECTORY_READ_END:
+            return blorp_dir_entry_ok(NULL);
+        case BLORP_DIRECTORY_READ_ERROR:
+        default:
+            return blorp_dir_entry_error(error_kind, error_detail);
+    }
+}
+
 blorp_FileStringResult blorp_file_read_text_reader_raw(
     const blorp_FileReader* reader
 ) {
@@ -33147,11 +33466,20 @@ void blorp_file_close_read_appender(blorp_FileReadAppender* file) {
     free(file);
 }
 
+void blorp_dir_close(blorp_Directory* dir) {
+    if (!dir) return;
+    if (dir->dir) {
+        closedir(dir->dir);
+        dir->dir = NULL;
+    }
+    free(dir->path);
+    dir->path = NULL;
+    free(dir);
+}
+
 // ============================================================================
 // System Functions
 // ============================================================================
-
-#include <dirent.h>
 
 bool blorp_is_directory(const blorp_String* path) {
     if (!path) return false;
@@ -33164,42 +33492,6 @@ bool blorp_is_directory(const blorp_String* path) {
     free(cpath);
 
     return result == 0 && S_ISDIR(st.st_mode);
-}
-
-blorp_List* blorp_list_dir(const blorp_String* path) {
-    blorp_List* result = blorp_list_new(16);
-    if (!path) {
-        blorp_list_init_elem_release(result, blorp_elem_release_fn);
-        return result;
-    }
-
-    char* cpath = blorp_cstring_copy_if_valid(path);
-    if (!cpath) {
-        blorp_list_init_elem_release(result, blorp_elem_release_fn);
-        return result;
-    }
-
-    DIR* dir = opendir(cpath);
-    free(cpath);
-
-    if (!dir) {
-        blorp_list_init_elem_release(result, blorp_elem_release_fn);
-        return result;
-    }
-
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        result = blorp_list_append(
-            result,
-            (void*)blorp_string_from_buf_size(entry->d_name, strlen(entry->d_name))
-        );
-    }
-    closedir(dir);
-    blorp_list_init_elem_release(result, blorp_elem_release_fn);
-    return result;
 }
 
 long blorp_exec(const blorp_String* command) {

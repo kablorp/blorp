@@ -356,8 +356,8 @@ with resource ?= acquire_resource():
 Optional type annotation:
 
 ```blorp
-with file: FileReader ?= path.open_read():
-	file.read_all()
+with reader: FileReader ?= path.open_read():
+	reader.read_all()
 ```
 
 Anonymous guard:
@@ -626,7 +626,7 @@ Detached work must not capture scoped resources.
 Prefer adding a focused module instead of continuing to grow `std/system.brp`:
 
 ```text
-std/file.brp or std/fs.brp
+std/fs.brp
 ```
 
 `std/system.brp` can keep compatibility helpers and process/environment
@@ -668,7 +668,7 @@ These are easier to teach than `File[Read]`, `File[Write]`,
 `File[ReadWrite]`, and the operation surface is now factored through
 capability traits rather than suffix-heavy operation names. The concrete handle
 types and `IOError` are in the prelude so annotations can name them without an
-explicit import; opener functions still come from `file`.
+explicit import; opener functions still come from `fs`.
 
 Common opens:
 
@@ -1590,10 +1590,10 @@ Goal: introduce typed file handles without breaking existing `system` helpers.
 
 Completed in the current implementation:
 
-- `std/file.brp` defines a typed `IOError` union, stable `message` helper, and
+- `std/fs.brp` defines a typed `IOError` union, stable `message` helper, and
   `Stringable` implementation. This gives file-resource APIs a typed error
   surface instead of stringly typed system errors.
-- `std/file.brp` defines opaque resource type anchors for `FileReader`,
+- `std/fs.brp` defines opaque resource type anchors for `FileReader`,
   `FileWriter`, `FileAppender`, `FileReadWriter`, and `FileReadAppender`, each
   with explicit compiler-owned cleanup metadata.
 - `open_read(path)` returns `Result[FileReader, IOError]`, `open_write(path)`
@@ -1633,7 +1633,7 @@ Completed in the current implementation:
 - Compiler integration coverage proves explicit cleanup metadata remains
   std-only; user modules cannot declare `resource type Name =
   builtin("cleanup")`.
-- File finalizers are private module internals. Selective `file: close` imports
+- File finalizers are private module internals. Selective `fs: close` imports
   are rejected, and module-qualified calls do not fall back to unrelated bare
   functions when the module has no exported function by that name.
 - Typecheck integration tests prove imported std file resources can be named in
@@ -1676,7 +1676,7 @@ Completed in the current implementation:
 - File handle resource types and `IOError` are now included in the prelude, and
   compiler-registered prelude UFCS imports make their method syntax available
   without importing each operation name. Open functions and capability traits
-  remain ordinary `file` module declarations that must be imported when used by
+  remain ordinary `fs` module declarations that must be imported when used by
   bare name or in trait bounds.
 - The private-finalizer policy is now general for std-owned resource
   declarations: `resource type Name = builtin("c_cleanup_name")` records
@@ -2018,7 +2018,8 @@ or goes through a bounded blocking-worker path.
 
 These should remain explicit until implementation forces an answer:
 
-- Should the public module be named `file`, `fs`, or something else?
+- The public filesystem resource module is now named `fs`; remaining cleanup is
+  mostly internal naming and implementation structure.
 - Should `with` eventually support multiple bindings in one header?
 - Should scoped resources support explicit moves in a later affine-value model?
 - Should source-defined helpers ever be able to accept scoped resources or

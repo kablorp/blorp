@@ -74,19 +74,21 @@ let builtin_layout = function
   | "IpAddress" | "DnsName" | "InterfaceScope" | "std/net/tls::TlsSession"
   | "std_net_tls__TlsSession" | "WebSocketSession"
   | "std/net/websocket::WebSocketSession"
-  | "std_net_websocket__WebSocketSession" | "ConcurrencyError" ->
+  | "std_net_websocket__WebSocketSession" | "ConcurrencyError"
+  | "DirectoryEntry" | "std/fs::DirectoryEntry" | "std_fs__DirectoryEntry" ->
       Some managed_layout
   | name
     when Type_name_metadata.is_one_shot_stream_name name
          || Type_name_metadata.is_resource_source_name name ->
       Some managed_layout
   | "FileReader" | "FileWriter" | "FileAppender" | "FileReadWriter"
-  | "FileReadAppender" | "std/file::FileReader" | "std/file::FileWriter"
-  | "std/file::FileAppender" | "std/file::FileReadWriter"
-  | "std/file::FileReadAppender" | "std_file__FileReader"
-  | "std_file__FileWriter" | "std_file__FileAppender"
-  | "std_file__FileReadWriter" | "std_file__FileReadAppender" | "UdpSocket"
-  | "std/net/udp::UdpSocket" | "std_net_udp__UdpSocket" ->
+  | "FileReadAppender" | "std/fs::FileReader" | "std/fs::FileWriter"
+  | "std/fs::FileAppender" | "std/fs::FileReadWriter"
+  | "std/fs::FileReadAppender" | "std_fs__FileReader" | "std_fs__FileWriter"
+  | "std_fs__FileAppender" | "std_fs__FileReadWriter"
+  | "std_fs__FileReadAppender" | "Directory" | "std/fs::Directory"
+  | "std_fs__Directory" | "UdpSocket" | "std/net/udp::UdpSocket"
+  | "std_net_udp__UdpSocket" ->
       Some unmanaged_layout
   | "Int" | "Bool" | "Char" | "Float" | "Float32" | "Float16" | "Int128"
   | "UInt128" | "Void" | "Ptr" | "Module" | "Port" ->

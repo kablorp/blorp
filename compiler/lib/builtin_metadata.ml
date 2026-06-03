@@ -84,7 +84,6 @@ let descriptors =
     effects "read_bytes" [ Impure ];
     effects "write_bytes" [ Impure ];
     effects "file_exists" [ Impure ];
-    effects "list_dir" [ Impure ];
     effects "is_directory" [ Impure ];
     effects "exec" [ Impure ];
     effects "read_line" [ Impure ];

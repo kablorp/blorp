@@ -65,13 +65,7 @@ type operation_wait_class =
   | ParksFiberReturning of result_ownership_kind
   | BlocksOsWorkerReturning of string * result_ownership_kind
 
-type source_module =
-  | StdDns
-  | StdTcp
-  | StdTls
-  | StdUdp
-  | StdWebSocket
-  | StdFile
+type source_module = StdDns | StdTcp | StdTls | StdUdp | StdWebSocket | StdFs
 
 let source_module_path = function
   | StdDns -> Codegen_names.mod_dns
@@ -79,7 +73,7 @@ let source_module_path = function
   | StdTls -> Codegen_names.mod_tls
   | StdUdp -> Codegen_names.mod_udp
   | StdWebSocket -> Codegen_names.mod_websocket
-  | StdFile -> Codegen_names.mod_file
+  | StdFs -> Codegen_names.mod_fs
 
 type result_bridge = {
   builtin_name : string;
@@ -123,6 +117,7 @@ type fallible_stream_terminal = {
 let named_type names = NamedType (names, [])
 let simple_type name = named_type [ name ]
 let list_type elem = NamedType ([ "List" ], [ elem ])
+let option_type elem = NamedType ([ "Option" ], [ elem ])
 
 let rec accepted_type_shape_to_string = function
   | NamedType (names, []) -> String.concat "|" names
@@ -313,8 +308,7 @@ let websocket_error_mapping =
 
 let file_error_mapping =
   {
-    accepted_type_names =
-      [ "IOError"; "std/file::IOError"; "std_file__IOError" ];
+    accepted_type_names = [ "IOError"; "std/fs::IOError"; "std_fs__IOError" ];
     none_tag = "BLORP_FILE_ERROR_NONE";
     detail_field = "detail";
     other_constructor = "Other";
@@ -410,27 +404,41 @@ let udp_socket_payload =
 
 let file_reader_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
-    [ "FileReader"; "std/file::FileReader"; "std_file__FileReader" ]
+    [ "FileReader"; "std/fs::FileReader"; "std_fs__FileReader" ]
 
 let file_writer_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
-    [ "FileWriter"; "std/file::FileWriter"; "std_file__FileWriter" ]
+    [ "FileWriter"; "std/fs::FileWriter"; "std_fs__FileWriter" ]
 
 let file_appender_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
-    [ "FileAppender"; "std/file::FileAppender"; "std_file__FileAppender" ]
+    [ "FileAppender"; "std/fs::FileAppender"; "std_fs__FileAppender" ]
 
 let file_read_writer_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
-    [ "FileReadWriter"; "std/file::FileReadWriter"; "std_file__FileReadWriter" ]
+    [ "FileReadWriter"; "std/fs::FileReadWriter"; "std_fs__FileReadWriter" ]
 
 let file_read_appender_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
     [
-      "FileReadAppender";
-      "std/file::FileReadAppender";
-      "std_file__FileReadAppender";
+      "FileReadAppender"; "std/fs::FileReadAppender"; "std_fs__FileReadAppender";
     ]
+
+let directory_payload =
+  resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
+    [ "Directory"; "std/fs::Directory"; "std_fs__Directory" ]
+
+let directory_entry_type =
+  named_type
+    [ "DirectoryEntry"; "std/fs::DirectoryEntry"; "std_fs__DirectoryEntry" ]
+
+let directory_entry_option_payload =
+  {
+    accepted_type = option_type directory_entry_type;
+    runtime_payload = RuntimeField "value";
+    release_mask = 1;
+    resource_result_policy = Env_types.ResourceResultOrdinary;
+  }
 
 let tls_session_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultDependent
@@ -604,7 +612,7 @@ let websocket_bridge ?(wait_behavior = DoesNotWait) builtin_name
 let file_operation_bridge builtin_name runtime_result_c_type success arguments =
   {
     builtin_name;
-    source_module = StdFile;
+    source_module = StdFs;
     runtime_c_name = builtin_name;
     runtime_result_c_type;
     temp_prefix = "file";
@@ -632,7 +640,7 @@ let dns_bridge builtin_name runtime_result_c_type success arguments =
 let file_open_bridge builtin_name runtime_result_c_type success =
   {
     builtin_name;
-    source_module = StdFile;
+    source_module = StdFs;
     runtime_c_name = builtin_name;
     runtime_result_c_type;
     temp_prefix = "file_open";
@@ -780,6 +788,10 @@ let result_bridges =
       "blorp_FileOpenReadWriterResult" file_read_writer_payload;
     file_open_bridge "blorp_file_open_read_append_raw"
       "blorp_FileOpenReadAppenderResult" file_read_appender_payload;
+    file_open_bridge "blorp_dir_open_raw" "blorp_DirectoryOpenResult"
+      directory_payload;
+    file_operation_bridge "blorp_dir_read_entry_raw"
+      "blorp_DirectoryEntryResult" directory_entry_option_payload [ ArgBorrow ];
     file_operation_bridge "blorp_file_read_text_reader_raw"
       "blorp_FileStringResult"
       (value_payload ~release_mask:1 "String")
@@ -877,18 +889,20 @@ let find_result_bridge builtin_name =
 
 let fallible_stream_sources =
   [
-    fallible_stream_source StdFile "blorp_file_chunks_reader_raw"
+    fallible_stream_source StdFs "blorp_file_chunks_reader_raw"
       ~error_domain:"BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE" [ ArgBorrow ];
-    fallible_stream_source StdFile "blorp_file_chunks_with_size_reader_raw"
+    fallible_stream_source StdFs "blorp_file_chunks_with_size_reader_raw"
       ~error_domain:"BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE"
       [ ArgBorrow; ArgBorrow ];
-    fallible_stream_source StdFile "blorp_file_lines_reader_raw"
+    fallible_stream_source StdFs "blorp_file_lines_reader_raw"
       ~error_domain:"BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE" [ ArgBorrow ];
-    fallible_stream_source StdFile "blorp_file_bytes_reader_raw"
+    fallible_stream_source StdFs "blorp_file_bytes_reader_raw"
       ~error_domain:"BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE" [ ArgBorrow ];
-    fallible_stream_source StdFile "blorp_file_windows_reader_raw"
+    fallible_stream_source StdFs "blorp_file_windows_reader_raw"
       ~error_domain:"BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE"
       [ ArgBorrow; ArgBorrow ];
+    fallible_stream_source StdFs "blorp_dir_entries_raw"
+      ~error_domain:"BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE" [ ArgBorrow ];
     fallible_stream_source StdUdp "blorp_udp_datagrams_raw"
       ~error_domain:"BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_UDP"
       [ ArgBorrow; ArgBorrow ];

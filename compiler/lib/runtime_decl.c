@@ -244,6 +244,8 @@ typedef struct blorp_FileWriter blorp_FileWriter;
 typedef struct blorp_FileAppender blorp_FileAppender;
 typedef struct blorp_FileReadWriter blorp_FileReadWriter;
 typedef struct blorp_FileReadAppender blorp_FileReadAppender;
+typedef struct blorp_Directory blorp_Directory;
+typedef struct blorp_DirectoryEntry blorp_DirectoryEntry;
 typedef struct blorp_Bytes blorp_Bytes;
 
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_Vector;
@@ -255,6 +257,12 @@ typedef struct { blorp_Object header; long len; long capacity; void (*elem_relea
 #define BLORP_VECTOR_STORAGE_I64 5
 
 typedef struct { blorp_Object header; long len; long capacity; char data[]; } blorp_String;
+
+struct blorp_DirectoryEntry {
+    blorp_Object header;
+    blorp_String* name;
+    long kind;
+};
 
 typedef enum {
     BLORP_FILE_ERROR_NONE = 0,
@@ -311,6 +319,12 @@ typedef struct {
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
 } blorp_FileOpenReadAppenderResult;
+
+typedef struct {
+    blorp_Directory* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_DirectoryOpenResult;
 
 typedef struct {
     blorp_String* value;
@@ -546,6 +560,12 @@ typedef struct {
         char None;
     } data;
 } blorp_Option;
+
+typedef struct {
+    blorp_DirectoryEntry* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_DirectoryEntryResult;
 
 typedef struct {
     blorp_Object header;
@@ -1876,6 +1896,7 @@ blorp_FallibleStream* blorp_file_chunks_with_size_reader_raw(const blorp_FileRea
 blorp_FallibleStream* blorp_file_lines_reader_raw(const blorp_FileReader* reader);
 blorp_FallibleStream* blorp_file_bytes_reader_raw(const blorp_FileReader* reader);
 blorp_FallibleStream* blorp_file_windows_reader_raw(const blorp_FileReader* reader, long size);
+blorp_FallibleStream* blorp_dir_entries_raw(blorp_Directory* dir);
 blorp_FallibleStream* blorp_udp_datagrams_raw(blorp_UdpSocket* socket, long max_bytes);
 blorp_FallibleStream* blorp_tcp_chunks_raw(blorp_TcpStream* stream, long max_bytes);
 blorp_FallibleStream* blorp_tcp_lines_raw(blorp_TcpStream* stream);
@@ -2163,6 +2184,8 @@ blorp_FileOpenWriterResult blorp_file_open_write_raw(const blorp_String* path);
 blorp_FileOpenAppenderResult blorp_file_open_append_raw(const blorp_String* path);
 blorp_FileOpenReadWriterResult blorp_file_open_read_write_raw(const blorp_String* path);
 blorp_FileOpenReadAppenderResult blorp_file_open_read_append_raw(const blorp_String* path);
+blorp_DirectoryOpenResult blorp_dir_open_raw(const blorp_String* path);
+blorp_DirectoryEntryResult blorp_dir_read_entry_raw(blorp_Directory* dir);
 blorp_FileStringResult blorp_file_read_text_reader_raw(const blorp_FileReader* reader);
 blorp_FileBytesResult blorp_file_read_bytes_reader_raw(const blorp_FileReader* reader);
 blorp_FileBytesResult blorp_file_read_chunk_reader_raw(const blorp_FileReader* reader, long max_bytes);
@@ -2200,8 +2223,8 @@ void blorp_file_close_writer(blorp_FileWriter* writer);
 void blorp_file_close_appender(blorp_FileAppender* appender);
 void blorp_file_close_read_writer(blorp_FileReadWriter* file);
 void blorp_file_close_read_appender(blorp_FileReadAppender* file);
+void blorp_dir_close(blorp_Directory* dir);
 bool blorp_is_directory(const blorp_String* path);
-blorp_List* blorp_list_dir(const blorp_String* path);
 long blorp_exec(const blorp_String* command);
 blorp_String* blorp_getenv(const blorp_String* name);
 blorp_String* blorp_getenv_nullable(const blorp_String* name);

@@ -567,6 +567,9 @@ let type_to_c ~(reg : registry) ty =
               | "StringSlice" -> "blorp_StringSlice*"
               | "MemStats" -> "blorp_MemStats*"
               | "SchedulerStats" -> "blorp_SchedulerStats*"
+              | "DirectoryEntry" | "std/fs::DirectoryEntry"
+              | "std_fs__DirectoryEntry" ->
+                  "blorp_DirectoryEntry*"
               | "Task" -> "blorp_Task*"
               | "Channel" -> "blorp_Channel*"
               | name when Type_name_metadata.is_stream_name name ->
@@ -590,21 +593,21 @@ let type_to_c ~(reg : registry) ty =
               | "UdpSocket" | "std/net/udp::UdpSocket"
               | "std_net_udp__UdpSocket" ->
                   "blorp_UdpSocket*"
-              | "FileReader" | "std/file::FileReader" | "std_file__FileReader"
-                ->
+              | "FileReader" | "std/fs::FileReader" | "std_fs__FileReader" ->
                   "blorp_FileReader*"
-              | "FileWriter" | "std/file::FileWriter" | "std_file__FileWriter"
-                ->
+              | "FileWriter" | "std/fs::FileWriter" | "std_fs__FileWriter" ->
                   "blorp_FileWriter*"
-              | "FileAppender" | "std/file::FileAppender"
-              | "std_file__FileAppender" ->
+              | "FileAppender" | "std/fs::FileAppender" | "std_fs__FileAppender"
+                ->
                   "blorp_FileAppender*"
-              | "FileReadWriter" | "std/file::FileReadWriter"
-              | "std_file__FileReadWriter" ->
+              | "FileReadWriter" | "std/fs::FileReadWriter"
+              | "std_fs__FileReadWriter" ->
                   "blorp_FileReadWriter*"
-              | "FileReadAppender" | "std/file::FileReadAppender"
-              | "std_file__FileReadAppender" ->
+              | "FileReadAppender" | "std/fs::FileReadAppender"
+              | "std_fs__FileReadAppender" ->
                   "blorp_FileReadAppender*"
+              | "Directory" | "std/fs::Directory" | "std_fs__Directory" ->
+                  "blorp_Directory*"
               | "Ptr" -> "void*"
               | "ConcurrencyError" -> "blorp_ConcurrencyError*"
               | _ when List.mem name Types.all_int_type_names ->
@@ -655,21 +658,24 @@ let type_to_c ~(reg : registry) ty =
               | "UdpSocket" | "std/net/udp::UdpSocket"
               | "std_net_udp__UdpSocket" ->
                   "blorp_UdpSocket*"
-              | "FileReader" | "std/file::FileReader" | "std_file__FileReader"
-                ->
+              | "FileReader" | "std/fs::FileReader" | "std_fs__FileReader" ->
                   "blorp_FileReader*"
-              | "FileWriter" | "std/file::FileWriter" | "std_file__FileWriter"
-                ->
+              | "FileWriter" | "std/fs::FileWriter" | "std_fs__FileWriter" ->
                   "blorp_FileWriter*"
-              | "FileAppender" | "std/file::FileAppender"
-              | "std_file__FileAppender" ->
+              | "FileAppender" | "std/fs::FileAppender" | "std_fs__FileAppender"
+                ->
                   "blorp_FileAppender*"
-              | "FileReadWriter" | "std/file::FileReadWriter"
-              | "std_file__FileReadWriter" ->
+              | "FileReadWriter" | "std/fs::FileReadWriter"
+              | "std_fs__FileReadWriter" ->
                   "blorp_FileReadWriter*"
-              | "FileReadAppender" | "std/file::FileReadAppender"
-              | "std_file__FileReadAppender" ->
+              | "FileReadAppender" | "std/fs::FileReadAppender"
+              | "std_fs__FileReadAppender" ->
                   "blorp_FileReadAppender*"
+              | "Directory" | "std/fs::Directory" | "std_fs__Directory" ->
+                  "blorp_Directory*"
+              | "DirectoryEntry" | "std/fs::DirectoryEntry"
+              | "std_fs__DirectoryEntry" ->
+                  "blorp_DirectoryEntry*"
               | _ -> name ^ "*" (* Generic types are pointers *))
           | TyArray _ -> "blorp_Vector*"
           | TyFunc _ -> "blorp_Closure*"

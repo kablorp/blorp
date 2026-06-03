@@ -504,9 +504,7 @@ let builtin_contract_table =
       builtins
         [ "blorp_write_file"; "blorp_write_bytes" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_read_all_lines"; "blorp_list_dir" ]
-        (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_read_all_lines" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_append_file" ]
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);
       builtins [ "blorp_for_each_line" ] (bfixed [ Borrow; Borrow ] ReturnOwned);

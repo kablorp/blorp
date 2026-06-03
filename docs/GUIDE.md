@@ -1677,7 +1677,7 @@ expression, closure capture, `detach`, `concurrent:`, or
 
 ```blorp
 import:
-    file: open_read
+    fs: open_read
 
 func load_text(path: String) -> Result[String, IOError]:
     with reader ?= open_read(path):
@@ -1694,7 +1694,7 @@ error type, map it in the `with ?=` header:
 
 ```blorp
 import:
-    file: message, open_read
+    fs: message, open_read
 
 union AppError:
     Io(String)
@@ -1721,12 +1721,13 @@ resource declarations may attach compiler cleanup metadata with
 `resource type Name = builtin("c_cleanup_name")`; lowering uses that metadata
 instead of recognizing resource names by convention.
 
-The typed `file` module exposes scoped opens for read, write, append,
-read-write, and read-append handles. The handle types `FileReader`,
-`FileWriter`, `FileAppender`, `FileReadWriter`, `FileReadAppender`, and
+The typed `fs` module exposes scoped opens for read, write, append,
+read-write, read-append, and directory handles. The handle and entry types
+`FileReader`, `FileWriter`, `FileAppender`, `FileReadWriter`,
+`FileReadAppender`, `Directory`, `DirectoryEntry`, `DirectoryEntryKind`, and
 `IOError` are in the prelude so they can be named in type positions without an
-explicit import. Openers such as `open_read` and `open_read_append` remain
-ordinary `file` module functions and must be imported.
+explicit import. Openers such as `open_read`, `open_read_append`, and
+`open_dir` remain ordinary `fs` module functions and must be imported.
 
 File operations are capability methods. Read-capable handles support
 `read_text()`, `read_bytes()`, `read_chunk(n)`, `read_chunk_at(offset, n)`,
@@ -1758,6 +1759,12 @@ carry. They also cannot be captured by closures, `detach`, or concurrent task
 bodies. Keep a stream in a direct local binding while building a pipeline, then
 consume it with a terminal operation. Create and consume a stream inside the
 task when concurrent work needs its own stream.
+
+Directory handles support `read_entry()` for manual loops and `entries()` for
+fallible-stream consumers. `read_entry()` returns `Ok(Some(entry))` until the
+directory is exhausted, then `Ok(None)`; `.` and `..` are skipped. Each
+`DirectoryEntry` contains a basename and a `DirectoryEntryKind` value such as
+`EntryFile`, `EntryDirectory`, or `EntrySymlink`.
 `ResourceSource[R, E]` is the reserved source type for future APIs that produce
 owned resources one at a time, such as TCP listener connections or database
 pool checkouts. It is not usable as an ordinary collection: records, unions,
@@ -1784,7 +1791,7 @@ before returning.
 
 ```blorp
 import:
-    file: open_read
+    fs: open_read
     stream: collect_result
 
 func load_in_chunks(path: String) -> Result[Int, IOError]:
@@ -1798,7 +1805,7 @@ needed:
 
 ```blorp
 import:
-    file: open_read
+    fs: open_read
 
 func line_count(path: String) -> Result[Int, IOError]:
     with reader ?= open_read(path):
@@ -2833,7 +2840,7 @@ This table lists the main public modules. The source of truth is the `std/` and
 | `uint8`, `uint16`, `uint32`, `uint64`, `uint128` | `uint8: ...` | Unsigned sized integer modules |
 | `float16`, `float32`, `fixed` | `float32: ...` | Sized floats and fixed-point decimals |
 | `math`, `stats`, `tensor`, `vector`, `matrix`, `parallel_vector`, `parallel_matrix` | `math: PI, TAU` | Numeric helpers, statistics, and fixed-size array/tensor APIs |
-| `io`, `file`, `system`, `path`, `process`, `time`, `channel` | `system: read_file` | I/O, typed file resources, filesystem, process, path, time, and concurrency channel APIs |
+| `io`, `fs`, `system`, `path`, `process`, `time`, `channel` | `system: read_file` | I/O, typed filesystem resources, filesystem convenience APIs, process, path, time, and concurrency channel APIs |
 | `debug`, `memory`, `instrumentation`, `log` | `debug: debug_string, type_name` | Diagnostics, memory stats, scheduler stats, timing/barrier helpers, and logging |
 | `argparse`, `validation`, `uuid`, `random`, `crypto_random` | `argparse: ...` | Application utilities |
 | `hash` | `hash: sha256` | Hashing helpers |
@@ -2857,14 +2864,14 @@ and are not part of the standard library.
 
 `std/prelude.brp` imports a deliberately small surface into every module:
 `Bool`, `Bytes`, `Char`, `Dict`, `Float`, `Float16`, `Float32`, `Int`, `List`,
-`Option(Some, None)`, `Result(Ok, Err)`, `Set`, `String`, typed file handle
+`Option(Some, None)`, `Result(Ok, Err)`, `Set`, `String`, typed filesystem resource
 types (`FileReader`, `FileWriter`, `FileAppender`, `FileReadWriter`,
-`FileReadAppender`) and `IOError`, plus `print`, `puts`, `print_error`,
-`read_line`, and `input`.
+`FileReadAppender`, `Directory`, `DirectoryEntry`, `DirectoryEntryKind`) and
+`IOError`, plus `print`, `puts`, `print_error`, `read_line`, and `input`.
 
 There are three practical buckets of names available without an explicit import:
 
-1. **Prelude imports** — the types, file resource handles, and constructors
+1. **Prelude imports** — the types, filesystem resource handles, and constructors
    listed above, plus
    console I/O helpers. `print` writes a trailing newline; `puts`
    writes without adding one; `print_error` writes to stderr. `read_line` and
