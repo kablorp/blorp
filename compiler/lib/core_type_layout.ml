@@ -80,9 +80,12 @@ let builtin_layout = function
     when Type_name_metadata.is_one_shot_stream_name name
          || Type_name_metadata.is_resource_source_name name ->
       Some managed_layout
-  | "FileReader" | "FileWriter" | "File" | "std/file::FileReader"
-  | "std/file::FileWriter" | "std/file::File" | "std_file__FileReader"
-  | "std_file__FileWriter" | "std_file__File" | "UdpSocket"
+  | "FileReader" | "FileWriter" | "FileAppender" | "FileReadWriter"
+  | "FileReadAppender" | "std/file::FileReader" | "std/file::FileWriter"
+  | "std/file::FileAppender" | "std/file::FileReadWriter"
+  | "std/file::FileReadAppender" | "std_file__FileReader"
+  | "std_file__FileWriter" | "std_file__FileAppender"
+  | "std_file__FileReadWriter" | "std_file__FileReadAppender" | "UdpSocket"
   | "std/net/udp::UdpSocket" | "std_net_udp__UdpSocket" ->
       Some unmanaged_layout
   | "Int" | "Bool" | "Char" | "Float" | "Float32" | "Float16" | "Int128"

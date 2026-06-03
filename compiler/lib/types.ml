@@ -205,6 +205,11 @@ let global_abi_type_names =
     "Channel";
     "Stream";
     "FallibleStream";
+    "FileReader";
+    "FileWriter";
+    "FileAppender";
+    "FileReadWriter";
+    "FileReadAppender";
     "TcpListener";
     "TcpStream";
     "IpAddress";

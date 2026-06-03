@@ -1046,22 +1046,27 @@ let resource_result_policy_of_arg_policy = function
   | AllowResourceArgs policy -> Some policy
   | RejectResourceArgs -> None
 
+let resource_arg_policy_for_ident_name env name =
+  let clean, def_id = split_resource_def_id_suffix name in
+  match def_id with
+  | Some id ->
+      let entry =
+        match Env.find_overload_by_def_id env id with
+        | Some _ as found -> found
+        | None -> Env.find_ufcs_method_by_def_id env id
+      in
+      Option.bind entry (fun entry -> Some entry.ol_resource_args)
+  | None -> (
+      match Env.lookup env clean with
+      | Some { kind = FuncSymbol { resource_args; _ }; _ } -> Some resource_args
+      | _ -> (
+          match Env.get_overloads env clean with
+          | [ entry ] -> Some entry.ol_resource_args
+          | _ -> None))
+
 let resource_arg_policy_for_callee ?(module_aliases = []) env callee =
   match callee.expr_desc with
-  | EIdent name -> (
-      let clean, def_id = split_resource_def_id_suffix name in
-      match def_id with
-      | Some id ->
-          Option.bind (Env.find_overload_by_def_id env id) (fun entry ->
-              Some entry.ol_resource_args)
-      | None -> (
-          match Env.lookup env clean with
-          | Some { kind = FuncSymbol { resource_args; _ }; _ } ->
-              Some resource_args
-          | _ -> (
-              match Env.get_overloads env clean with
-              | [ entry ] -> Some entry.ol_resource_args
-              | _ -> None)))
+  | EIdent name -> resource_arg_policy_for_ident_name env name
   | EFieldAccess ({ expr_desc = EIdent alias; _ }, func_name) ->
       Option.bind (List.assoc_opt alias module_aliases) (fun module_path ->
           lookup_module_func_resource_arg_policy env module_path func_name)
@@ -2110,14 +2115,9 @@ let resource_call_allows_resource_arg ctx source_callee callee_name
       | None -> (
           match callee_name with
           | Some name -> (
-              match Env.lookup ctx.env name with
-              | Some
-                  {
-                    kind = FuncSymbol { resource_args = AllowResourceArgs _; _ };
-                    _;
-                  } ->
-                  true
-              | _ -> false)
+              match resource_arg_policy_for_ident_name ctx.env name with
+              | Some (AllowResourceArgs _) -> true
+              | Some RejectResourceArgs | None -> false)
           | None -> false))
 
 let reject_ordinary_resource_call_arg ctx loc source_callee callee_name

@@ -596,7 +596,15 @@ let type_to_c ~(reg : registry) ty =
               | "FileWriter" | "std/file::FileWriter" | "std_file__FileWriter"
                 ->
                   "blorp_FileWriter*"
-              | "File" | "std/file::File" | "std_file__File" -> "blorp_File*"
+              | "FileAppender" | "std/file::FileAppender"
+              | "std_file__FileAppender" ->
+                  "blorp_FileAppender*"
+              | "FileReadWriter" | "std/file::FileReadWriter"
+              | "std_file__FileReadWriter" ->
+                  "blorp_FileReadWriter*"
+              | "FileReadAppender" | "std/file::FileReadAppender"
+              | "std_file__FileReadAppender" ->
+                  "blorp_FileReadAppender*"
               | "Ptr" -> "void*"
               | "ConcurrencyError" -> "blorp_ConcurrencyError*"
               | _ when List.mem name Types.all_int_type_names ->
@@ -653,7 +661,15 @@ let type_to_c ~(reg : registry) ty =
               | "FileWriter" | "std/file::FileWriter" | "std_file__FileWriter"
                 ->
                   "blorp_FileWriter*"
-              | "File" | "std/file::File" | "std_file__File" -> "blorp_File*"
+              | "FileAppender" | "std/file::FileAppender"
+              | "std_file__FileAppender" ->
+                  "blorp_FileAppender*"
+              | "FileReadWriter" | "std/file::FileReadWriter"
+              | "std_file__FileReadWriter" ->
+                  "blorp_FileReadWriter*"
+              | "FileReadAppender" | "std/file::FileReadAppender"
+              | "std_file__FileReadAppender" ->
+                  "blorp_FileReadAppender*"
               | _ -> name ^ "*" (* Generic types are pointers *))
           | TyArray _ -> "blorp_Vector*"
           | TyFunc _ -> "blorp_Closure*"

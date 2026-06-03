@@ -64,21 +64,32 @@ let std_source_decls path =
   | Ok decls -> decls
   | Error err -> Alcotest.failf "failed to parse %s: %s" path err.message
 
+let direct_builtin_func_exposure builtin_name (func : Blorp.Ast.func_decl) =
+  match func with
+  | {
+   func_name = Some func_name;
+   func_body = FuncBuiltinBody (BuiltinRuntime runtime_name, _);
+   _;
+  }
+    when runtime_name = builtin_name ->
+      Some func_name
+  | _ -> None
+
 let public_direct_builtin_exposures builtin_name decls =
   decls
-  |> List.filter_map (fun (decl : Blorp.Ast.decl) ->
+  |> List.concat_map (fun (decl : Blorp.Ast.decl) ->
       match decl.decl_desc with
-      | DFunc
-          {
-            func_name = Some func_name;
-            func_body = FuncBuiltinBody (BuiltinRuntime runtime_name, _);
-            _;
-          }
-        when runtime_name = builtin_name ->
-          Some func_name
-      | DFunc _ | DType _ | DTypeAlias _ | DRecord _ | DVar _ | DTrait _
-      | DImpl _ | DImport _ | DPrivate _ ->
-          None)
+      | DFunc func -> (
+          match direct_builtin_func_exposure builtin_name func with
+          | Some func_name -> [ func_name ]
+          | None -> [])
+      | DImpl impl ->
+          List.filter_map
+            (direct_builtin_func_exposure builtin_name)
+            impl.impl_methods
+      | DType _ | DTypeAlias _ | DRecord _ | DVar _ | DTrait _ | DImport _
+      | DPrivate _ ->
+          [])
 
 let assert_public_direct_std_builtin ~source_module ~builtin_name =
   let path = std_source_path_for_module (source_module_path source_module) in
@@ -335,21 +346,21 @@ let expected_file_operations =
       0,
       Blorp.Env_types.ResourceResultIndependent );
     ( "blorp_file_open_append_raw",
-      "blorp_FileOpenWriterResult",
-      [ "FileWriter" ],
+      "blorp_FileOpenAppenderResult",
+      [ "FileAppender" ],
       0,
       Blorp.Env_types.ResourceResultIndependent );
     ( "blorp_file_open_read_write_raw",
-      "blorp_FileOpenResult",
-      [ "File" ],
+      "blorp_FileOpenReadWriterResult",
+      [ "FileReadWriter" ],
+      0,
+      Blorp.Env_types.ResourceResultIndependent );
+    ( "blorp_file_open_read_append_raw",
+      "blorp_FileOpenReadAppenderResult",
+      [ "FileReadAppender" ],
       0,
       Blorp.Env_types.ResourceResultIndependent );
     ( "blorp_file_read_text_reader_raw",
-      "blorp_FileStringResult",
-      [ "String" ],
-      1,
-      Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_read_text_file_raw",
       "blorp_FileStringResult",
       [ "String" ],
       1,
@@ -359,27 +370,27 @@ let expected_file_operations =
       [ "Bytes" ],
       1,
       Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_read_bytes_file_raw",
-      "blorp_FileBytesResult",
-      [ "Bytes" ],
-      1,
-      Blorp.Env_types.ResourceResultOrdinary );
     ( "blorp_file_read_chunk_reader_raw",
       "blorp_FileBytesResult",
       [ "Bytes" ],
       1,
       Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_read_chunk_file_raw",
+    ( "blorp_file_read_chunk_at_reader_raw",
       "blorp_FileBytesResult",
       [ "Bytes" ],
       1,
       Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_write_text_writer_raw",
-      "blorp_FileVoidResult",
-      [ "Void" ],
+    ( "blorp_file_count_lines_reader_raw",
+      "blorp_FileIntResult",
+      [ "Int" ],
       0,
       Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_write_text_file_raw",
+    ( "blorp_file_size_reader_raw",
+      "blorp_FileIntResult",
+      [ "Int" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_write_text_writer_raw",
       "blorp_FileVoidResult",
       [ "Void" ],
       0,
@@ -389,27 +400,122 @@ let expected_file_operations =
       [ "Void" ],
       0,
       Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_write_bytes_file_raw",
-      "blorp_FileVoidResult",
-      [ "Void" ],
-      0,
-      Blorp.Env_types.ResourceResultOrdinary );
     ( "blorp_file_write_chunk_writer_raw",
       "blorp_FileIntResult",
       [ "Int" ],
       0,
       Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_write_chunk_file_raw",
+    ( "blorp_file_size_writer_raw",
       "blorp_FileIntResult",
       [ "Int" ],
       0,
       Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_count_lines_reader_raw",
+    ( "blorp_file_append_text_appender_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_append_bytes_appender_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_append_chunk_appender_raw",
       "blorp_FileIntResult",
       [ "Int" ],
       0,
       Blorp.Env_types.ResourceResultOrdinary );
-    ( "blorp_file_count_lines_file_raw",
+    ( "blorp_file_size_appender_raw",
+      "blorp_FileIntResult",
+      [ "Int" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_read_text_read_writer_raw",
+      "blorp_FileStringResult",
+      [ "String" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_read_bytes_read_writer_raw",
+      "blorp_FileBytesResult",
+      [ "Bytes" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_read_chunk_read_writer_raw",
+      "blorp_FileBytesResult",
+      [ "Bytes" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_read_chunk_at_read_writer_raw",
+      "blorp_FileBytesResult",
+      [ "Bytes" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_count_lines_read_writer_raw",
+      "blorp_FileIntResult",
+      [ "Int" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_write_text_read_writer_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_write_bytes_read_writer_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_write_chunk_read_writer_raw",
+      "blorp_FileIntResult",
+      [ "Int" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_size_read_writer_raw",
+      "blorp_FileIntResult",
+      [ "Int" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_read_text_read_appender_raw",
+      "blorp_FileStringResult",
+      [ "String" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_read_bytes_read_appender_raw",
+      "blorp_FileBytesResult",
+      [ "Bytes" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_read_chunk_read_appender_raw",
+      "blorp_FileBytesResult",
+      [ "Bytes" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_read_chunk_at_read_appender_raw",
+      "blorp_FileBytesResult",
+      [ "Bytes" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_count_lines_read_appender_raw",
+      "blorp_FileIntResult",
+      [ "Int" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_append_text_read_appender_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_append_bytes_read_appender_raw",
+      "blorp_FileVoidResult",
+      [ "Void" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_append_chunk_read_appender_raw",
+      "blorp_FileIntResult",
+      [ "Int" ],
+      0,
+      Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_file_size_read_appender_raw",
       "blorp_FileIntResult",
       [ "Int" ],
       0,
@@ -474,20 +580,41 @@ let expected_operation_arguments =
     ("blorp_file_open_write_raw", [ ArgBorrow ]);
     ("blorp_file_open_append_raw", [ ArgBorrow ]);
     ("blorp_file_open_read_write_raw", [ ArgBorrow ]);
+    ("blorp_file_open_read_append_raw", [ ArgBorrow ]);
     ("blorp_file_read_text_reader_raw", [ ArgBorrow ]);
-    ("blorp_file_read_text_file_raw", [ ArgBorrow ]);
     ("blorp_file_read_bytes_reader_raw", [ ArgBorrow ]);
-    ("blorp_file_read_bytes_file_raw", [ ArgBorrow ]);
     ("blorp_file_read_chunk_reader_raw", [ ArgBorrow; ArgBorrow ]);
-    ("blorp_file_read_chunk_file_raw", [ ArgBorrow; ArgBorrow ]);
-    ("blorp_file_write_text_writer_raw", [ ArgBorrow; ArgBorrow ]);
-    ("blorp_file_write_text_file_raw", [ ArgBorrow; ArgBorrow ]);
-    ("blorp_file_write_bytes_writer_raw", [ ArgBorrow; ArgBorrow ]);
-    ("blorp_file_write_bytes_file_raw", [ ArgBorrow; ArgBorrow ]);
-    ("blorp_file_write_chunk_writer_raw", [ ArgBorrow; ArgBorrow ]);
-    ("blorp_file_write_chunk_file_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_read_chunk_at_reader_raw", [ ArgBorrow; ArgBorrow; ArgBorrow ]);
     ("blorp_file_count_lines_reader_raw", [ ArgBorrow ]);
-    ("blorp_file_count_lines_file_raw", [ ArgBorrow ]);
+    ("blorp_file_size_reader_raw", [ ArgBorrow ]);
+    ("blorp_file_write_text_writer_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_write_bytes_writer_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_write_chunk_writer_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_size_writer_raw", [ ArgBorrow ]);
+    ("blorp_file_append_text_appender_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_append_bytes_appender_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_append_chunk_appender_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_size_appender_raw", [ ArgBorrow ]);
+    ("blorp_file_read_text_read_writer_raw", [ ArgBorrow ]);
+    ("blorp_file_read_bytes_read_writer_raw", [ ArgBorrow ]);
+    ("blorp_file_read_chunk_read_writer_raw", [ ArgBorrow; ArgBorrow ]);
+    ( "blorp_file_read_chunk_at_read_writer_raw",
+      [ ArgBorrow; ArgBorrow; ArgBorrow ] );
+    ("blorp_file_count_lines_read_writer_raw", [ ArgBorrow ]);
+    ("blorp_file_write_text_read_writer_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_write_bytes_read_writer_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_write_chunk_read_writer_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_size_read_writer_raw", [ ArgBorrow ]);
+    ("blorp_file_read_text_read_appender_raw", [ ArgBorrow ]);
+    ("blorp_file_read_bytes_read_appender_raw", [ ArgBorrow ]);
+    ("blorp_file_read_chunk_read_appender_raw", [ ArgBorrow; ArgBorrow ]);
+    ( "blorp_file_read_chunk_at_read_appender_raw",
+      [ ArgBorrow; ArgBorrow; ArgBorrow ] );
+    ("blorp_file_count_lines_read_appender_raw", [ ArgBorrow ]);
+    ("blorp_file_append_text_read_appender_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_append_bytes_read_appender_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_append_chunk_read_appender_raw", [ ArgBorrow; ArgBorrow ]);
+    ("blorp_file_size_read_appender_raw", [ ArgBorrow ]);
   ]
 
 let expected_boxed_only_operations =
@@ -496,6 +623,7 @@ let expected_boxed_only_operations =
     "blorp_file_open_write_raw";
     "blorp_file_open_append_raw";
     "blorp_file_open_read_write_raw";
+    "blorp_file_open_read_append_raw";
   ]
 
 let expected_parking_operations =

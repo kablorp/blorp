@@ -823,7 +823,9 @@ let builtin_contract_table =
         [
           "blorp_file_close_reader";
           "blorp_file_close_writer";
-          "blorp_file_close";
+          "blorp_file_close_appender";
+          "blorp_file_close_read_writer";
+          "blorp_file_close_read_appender";
         ]
         (bfixed [ Borrow ] ReturnVoid);
       operation_result_bridge_builtin_contracts;

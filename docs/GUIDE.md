@@ -1677,7 +1677,7 @@ expression, closure capture, `detach`, `concurrent:`, or
 
 ```blorp
 import:
-    file: IOError, open_read, read_text
+    file: open_read
 
 func load_text(path: String) -> Result[String, IOError]:
     with reader ?= open_read(path):
@@ -1719,19 +1719,22 @@ cleanup for normal completion, body-level `?=` short-circuit results,
 `break`/`continue`, and cooperative timeout/cancellation paths. Standard-library
 resource declarations may attach compiler cleanup metadata with
 `resource type Name = builtin("c_cleanup_name")`; lowering uses that metadata
-instead of recognizing resource names by convention. The typed `file` module
-currently exposes scoped opens for read, write, append, and read-write handles.
-It also exposes permission-specific
-`reader.read_text()`, `reader.read_bytes()`, `reader.read_chunk(n)`,
-`reader.chunks()`, `reader.chunks_with_size(n)`, `reader.lines()`,
-`reader.bytes()`, `reader.windows(n)`, `reader.count_lines()`,
-`writer.write_text(text)`, `writer.write_bytes(data)`, and
-`writer.write_chunk(data)` operations that borrow the scoped handle and return
-typed `IOError` results. Read-write handles use explicit `*_rw` names, such as
-`file.read_text_rw()`, `file.read_chunk_rw(n)`, `file.count_lines_rw()`,
-`file.write_text_rw(text)`, `file.write_bytes_rw(data)`, and
-`file.write_chunk_rw(data)`, because same-module overloads are not currently
-part of Blorp's call resolution.
+instead of recognizing resource names by convention.
+
+The typed `file` module exposes scoped opens for read, write, append,
+read-write, and read-append handles. The handle types `FileReader`,
+`FileWriter`, `FileAppender`, `FileReadWriter`, `FileReadAppender`, and
+`IOError` are in the prelude so they can be named in type positions without an
+explicit import. Openers such as `open_read` and `open_read_append` remain
+ordinary `file` module functions and must be imported.
+
+File operations are capability methods. Read-capable handles support
+`read_text()`, `read_bytes()`, `read_chunk(n)`, `read_chunk_at(offset, n)`,
+`count_lines()`, and `size()`. Write-capable handles support
+`write_text(text)`, `write_bytes(data)`, and `write_chunk(data)`.
+Append-capable handles support `append_text(text)`, `append_bytes(data)`, and
+`append_chunk(data)`. These operations borrow the scoped handle and return typed
+`IOError` results.
 `reader.chunks()`, `reader.chunks_with_size(n)`, and `reader.windows(n)`
 return `FallibleStream[Bytes, IOError]`; `reader.lines()` returns
 `FallibleStream[String, IOError]`; `reader.bytes()` returns
@@ -1781,7 +1784,7 @@ before returning.
 
 ```blorp
 import:
-    file: IOError, chunks_with_size, open_read
+    file: open_read
     stream: collect_result
 
 func load_in_chunks(path: String) -> Result[Int, IOError]:
@@ -1795,7 +1798,7 @@ needed:
 
 ```blorp
 import:
-    file: IOError, count_lines, open_read
+    file: open_read
 
 func line_count(path: String) -> Result[Int, IOError]:
     with reader ?= open_read(path):
@@ -2854,12 +2857,15 @@ and are not part of the standard library.
 
 `std/prelude.brp` imports a deliberately small surface into every module:
 `Bool`, `Bytes`, `Char`, `Dict`, `Float`, `Float16`, `Float32`, `Int`, `List`,
-`Option(Some, None)`, `Result(Ok, Err)`, `Set`, `String`, plus `print`, `puts`,
-`print_error`, `read_line`, and `input`.
+`Option(Some, None)`, `Result(Ok, Err)`, `Set`, `String`, typed file handle
+types (`FileReader`, `FileWriter`, `FileAppender`, `FileReadWriter`,
+`FileReadAppender`) and `IOError`, plus `print`, `puts`, `print_error`,
+`read_line`, and `input`.
 
 There are three practical buckets of names available without an explicit import:
 
-1. **Prelude imports** — the types and constructors listed above, plus
+1. **Prelude imports** — the types, file resource handles, and constructors
+   listed above, plus
    console I/O helpers. `print` writes a trailing newline; `puts`
    writes without adding one; `print_error` writes to stderr. `read_line` and
    `input` return `None` at EOF. On interactive terminals, Ctrl-D produces

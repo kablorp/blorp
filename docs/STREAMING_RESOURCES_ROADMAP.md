@@ -642,11 +642,10 @@ union IOError:
 	NotFound(String)
 	PermissionDenied(String)
 	AlreadyExists(String)
-	InvalidPath(String)
-	InvalidMode(String)
+	InvalidInput(String)
 	Interrupted(String)
-	WouldBlock(String)
-	UnexpectedEof(String)
+	TimedOut(String)
+	Unsupported(String)
 	Other(String)
 ```
 
@@ -660,20 +659,25 @@ Start with named handle types:
 ```blorp
 resource type FileReader = builtin("blorp_file_close_reader")
 resource type FileWriter = builtin("blorp_file_close_writer")
-resource type File = builtin("blorp_file_close")
+resource type FileAppender = builtin("blorp_file_close_appender")
+resource type FileReadWriter = builtin("blorp_file_close_read_writer")
+resource type FileReadAppender = builtin("blorp_file_close_read_appender")
 ```
 
 These are easier to teach than `File[Read]`, `File[Write]`,
-`File[ReadWrite]`. A later generic capability form can be added if it buys real
-precision.
+`File[ReadWrite]`, and the operation surface is now factored through
+capability traits rather than suffix-heavy operation names. The concrete handle
+types and `IOError` are in the prelude so annotations can name them without an
+explicit import; opener functions still come from `file`.
 
 Common opens:
 
 ```blorp
 open_read(path: String) -> Result[FileReader, IOError]
 open_write(path: String) -> Result[FileWriter, IOError]
-open_append(path: String) -> Result[FileWriter, IOError]
-open_read_write(path: String) -> Result[File, IOError]
+open_append(path: String) -> Result[FileAppender, IOError]
+open_read_write(path: String) -> Result[FileReadWriter, IOError]
+open_read_append(path: String) -> Result[FileReadAppender, IOError]
 ```
 
 UFCS:
@@ -699,7 +703,8 @@ record OpenOptions {
 	create_new: Bool,
 }
 
-open(path: String, options: OpenOptions) -> Result[File, IOError]
+-- Future design. Return type still needs an explicit static-mode story.
+open(path: String, options: OpenOptions) -> Result[ModeSpecificHandle, IOError]
 ```
 
 Initial semantics:
@@ -708,19 +713,47 @@ Initial semantics:
 - `open_write` creates if missing and truncates if present.
 - `open_append` creates if missing and writes at end.
 - `open_read_write` requires the path to exist and does not truncate.
+- `open_read_append` requires the path to exist and appends writes at end.
 - `open(path, options)` is fully explicit and rejects contradictory options,
   such as `truncate = True` with `access = Read`.
 
-### Read API
+### Capability API
 
 ```blorp
-read_chunk(self: FileReader, max_bytes: Int) -> Result[Bytes, IOError]
-read_all(self: FileReader) -> Result[Bytes, IOError]
-read_text(self: FileReader) -> Result[String, IOError]
+trait FileReadable:
+	read_text(self: Self) -> Result[String, IOError]
+	read_bytes(self: Self) -> Result[Bytes, IOError]
+	read_chunk(self: Self, max_bytes: Int) -> Result[Bytes, IOError]
+	count_lines(self: Self) -> Result[Int, IOError]
+
+trait FileReadAt:
+	read_chunk_at(self: Self, offset: Int, max_bytes: Int) -> Result[Bytes, IOError]
+
+trait FileWritable:
+	write_text(self: Self, text: String) -> Result[Void, IOError]
+	write_bytes(self: Self, data: Bytes) -> Result[Void, IOError]
+	write_chunk(self: Self, data: Bytes) -> Result[Int, IOError]
+
+trait FileAppendable:
+	append_text(self: Self, text: String) -> Result[Void, IOError]
+	append_bytes(self: Self, data: Bytes) -> Result[Void, IOError]
+	append_chunk(self: Self, data: Bytes) -> Result[Int, IOError]
+
+trait FileSized:
+	size(self: Self) -> Result[Int, IOError]
+```
+
+`FileReader` implements read, read-at, and size. `FileWriter` implements write
+and size. `FileAppender` implements append and size. `FileReadWriter`
+implements read, read-at, write, and size. `FileReadAppender` implements read,
+read-at, append, and size.
+
+Reader stream helpers remain concrete reader operations:
+
+```blorp
 chunks(self: FileReader) -> FallibleStream[Bytes, IOError]
-chunks(self: FileReader, chunk_size: Int) -> FallibleStream[Bytes, IOError]
+chunks_with_size(self: FileReader, chunk_size: Int) -> FallibleStream[Bytes, IOError]
 lines(self: FileReader) -> FallibleStream[String, IOError]
-count_lines(self: FileReader) -> Result[Int, IOError]
 bytes(self: FileReader) -> FallibleStream[UInt8, IOError]
 windows(self: FileReader, size: Int) -> FallibleStream[Bytes, IOError]
 ```
@@ -738,43 +771,9 @@ are themselves scoped resources.
 
 `count_lines` uses a chunk scanner and does not allocate a `String` per line.
 
-### Write API
-
-```blorp
-write_chunk(self: FileWriter, data: Bytes) -> Result[Int, IOError]
-write_bytes(self: FileWriter, data: Bytes) -> Result[Void, IOError]
-write_text(self: FileWriter, text: String) -> Result[Void, IOError]
-flush(self: FileWriter) -> Result[Void, IOError]
-finish(self: FileWriter) -> Result[Void, IOError]
-```
-
-`finish` is for operations where successful completion matters. `close` still
-exists and remains infallible cleanup.
-
-### Read/Write API
-
-```blorp
-seek(self: File, offset: Int) -> Result[Void, IOError]
-position(self: File) -> Result[Int, IOError]
-read_text_rw(self: File) -> Result[String, IOError]
-read_bytes_rw(self: File) -> Result[Bytes, IOError]
-read_chunk_rw(self: File, max_bytes: Int) -> Result[Bytes, IOError]
-count_lines_rw(self: File) -> Result[Int, IOError]
-write_text_rw(self: File, text: String) -> Result[Void, IOError]
-write_bytes_rw(self: File, data: Bytes) -> Result[Void, IOError]
-write_chunk_rw(self: File, data: Bytes) -> Result[Int, IOError]
-flush(self: File) -> Result[Void, IOError]
-```
-
-Avoid C stdio read/write switching pitfalls by implementing these handles on
-file descriptors or platform equivalents, not `FILE*`, once this layer exists.
-If buffering is added on top, the buffer state must make read/write transitions
-explicit and tested.
-
-The current implementation uses explicit `*_rw` names for `File` operations.
-This is less elegant than sharing `read_text`/`write_text`, but it keeps the
-permission model type-safe without relying on same-module overloads that Blorp
-does not support yet.
+Avoid C stdio read/write switching pitfalls by keeping these handles on file
+descriptors or platform equivalents, not `FILE*`. If buffering is added on top,
+the buffer state must make read/write transitions explicit and tested.
 
 ### Chunk Size
 
@@ -1595,17 +1594,19 @@ Completed in the current implementation:
   `Stringable` implementation. This gives file-resource APIs a typed error
   surface instead of stringly typed system errors.
 - `std/file.brp` defines opaque resource type anchors for `FileReader`,
-  `FileWriter`, and `File`, each with explicit compiler-owned cleanup metadata.
+  `FileWriter`, `FileAppender`, `FileReadWriter`, and `FileReadAppender`, each
+  with explicit compiler-owned cleanup metadata.
 - `open_read(path)` returns `Result[FileReader, IOError]`, `open_write(path)`
   returns `Result[FileWriter, IOError]`, `open_append(path)` returns
-  `Result[FileWriter, IOError]`, and `open_read_write(path)` returns
-  `Result[File, IOError]`. These are backed by runtime file-descriptor handles.
-  The implementation uses exact path buffers and rejects empty or interior-NUL
-  paths as `InvalidInput`.
+  `Result[FileAppender, IOError]`, `open_read_write(path)` returns
+  `Result[FileReadWriter, IOError]`, and `open_read_append(path)` returns
+  `Result[FileReadAppender, IOError]`. These are backed by runtime
+  file-descriptor handles. The implementation uses exact path buffers and
+  rejects empty or interior-NUL paths as `InvalidInput`.
 - The write-mode opens now cover the first permission-specific resource split:
   `open_write` creates/truncates, `open_append` creates/preserves existing
-  contents, and `open_read_write` requires an existing path and preserves file
-  contents.
+  contents, while `open_read_write` and `open_read_append` require an existing
+  path and preserve file contents.
 - The generated-C bridge converts runtime file-open error facts into the
   source-level `IOError` union before wrapping them in `Result.Err`. This keeps
   the public API typed while avoiding a runtime dependency on generated union
@@ -1628,7 +1629,7 @@ Completed in the current implementation:
   depend on importing a source-level `close` function or matching file-resource
   names in codegen.
 - Runtime fd-count coverage exercises repeated normal-completion cleanup for
-  `FileReader`, `FileWriter`, and read-write `File` handles.
+  `FileReader`, `FileWriter`, and read-write `FileReadWriter` handles.
 - Compiler integration coverage proves explicit cleanup metadata remains
   std-only; user modules cannot declare `resource type Name =
   builtin("cleanup")`.
@@ -1648,8 +1649,9 @@ Completed in the current implementation:
   short-circuits inside file-resource `with` scopes, proving the generated
   cleanup path does not leak reader handles.
 - Runtime coverage proves write-mode acquisition semantics for create,
-  truncate, append/preserve, and existing-only read-write opens. Codegen-audit
-  coverage proves `FileWriter` and `File` cleanup metadata emits the matching
+  truncate, append/preserve, existing-only read-write opens, and existing-only
+  read-append opens. Codegen-audit coverage proves `FileWriter`,
+  `FileReadWriter`, and `FileReadAppender` cleanup metadata emits the matching
   finalizers.
 - Runtime coverage proves text written through a scoped `FileWriter` can be
   read back through a scoped `FileReader`. Typecheck coverage rejects the
@@ -1665,13 +1667,17 @@ Completed in the current implementation:
 - `write_chunk(writer, data)` is now a permission-specific compiler-owned
   resource operation that performs one runtime write attempt and returns the
   number of bytes written. `write_bytes` remains the write-all helper.
-- Read-write `File` handles now have an explicit operation surface:
-  `read_text_rw`, `read_bytes_rw`, `read_chunk_rw`, `count_lines_rw`,
-  `write_text_rw`, `write_bytes_rw`, and `write_chunk_rw`. These use the same
-  typed `IOError` bridge and current-offset file-descriptor semantics as the
-  permission-specific reader/writer operations. The `*_rw` suffix is a
-  deliberate interim naming choice until call resolution supports a cleaner
-  overload or trait-dispatch story.
+- File operations now share capability method names instead of read-write
+  suffixes. `FileReadable`, `FileReadAt`, `FileWritable`, `FileAppendable`, and
+  `FileSized` define the public operation surface, and concrete handles
+  implement only the capabilities their open mode supports. Read-at operations
+  use `pread` so `read_chunk_at(offset, n)` does not change the current
+  sequential read offset.
+- File handle resource types and `IOError` are now included in the prelude, and
+  compiler-registered prelude UFCS imports make their method syntax available
+  without importing each operation name. Open functions and capability traits
+  remain ordinary `file` module declarations that must be imported when used by
+  bare name or in trait bounds.
 - The private-finalizer policy is now general for std-owned resource
   declarations: `resource type Name = builtin("c_cleanup_name")` records
   explicit compiler cleanup metadata, and `with` lowering emits that metadata
@@ -1693,8 +1699,9 @@ Tests:
 - byte write/read round-trip through scoped handles;
 - chunk write returns the number of bytes written and rejects reader handles at
   typecheck time;
-- read-write handles support text, byte, chunk, and line-count operations and
-  reject reader/writer-only handles for `*_rw` calls;
+- read-write handles support text, byte, chunk, line-count, read-at, and size
+  operations through capability methods, and reader/writer-only handles reject
+  methods outside their capabilities;
 - handle close runs exactly once;
 - leak-check for early-exit `with` blocks.
 
@@ -2039,15 +2046,11 @@ The highest-ROI path is:
 
 1. Design the typed `open(path, options)` shape so impossible file-mode
    combinations are unrepresentable. Current constraint: one value-level
-   `options` argument cannot select between `FileReader`, `FileWriter`, and
-   `File` return types without one of three broader language moves: same-module
-   overloads, static mode types that participate in return-type selection, or a
-   resource-containing sum type. A resource-containing sum type conflicts with
-   the current "resources do not enter ordinary aggregates" rule, so the next
-   design pass should prefer static modes or overload/trait dispatch.
-2. Decide whether `File` should keep explicit `*_rw` operation names or wait
-   for a broader overload/trait-dispatch improvement before exposing shared
-   `read_text`/`write_text` names.
+   `options` argument cannot select between `FileReader`, `FileWriter`,
+   `FileAppender`, `FileReadWriter`, and `FileReadAppender` return types without
+   a broader static-mode or overload story.
+2. Keep the capability trait surface small while adding only operations that
+   fit the current resource guardrails.
 3. Keep hardening `Stream[T]` and `FallibleStream[T, E]` as new producers are
    introduced.
 4. Design explicit resource-helper syntax before source-defined helpers are

@@ -241,7 +241,9 @@ typedef struct blorp_UdpSocket blorp_UdpSocket;
 typedef struct blorp_ResourceSource blorp_ResourceSource;
 typedef struct blorp_FileReader blorp_FileReader;
 typedef struct blorp_FileWriter blorp_FileWriter;
-typedef struct blorp_File blorp_File;
+typedef struct blorp_FileAppender blorp_FileAppender;
+typedef struct blorp_FileReadWriter blorp_FileReadWriter;
+typedef struct blorp_FileReadAppender blorp_FileReadAppender;
 typedef struct blorp_Bytes blorp_Bytes;
 
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_Vector;
@@ -293,10 +295,22 @@ typedef struct {
 } blorp_FileOpenWriterResult;
 
 typedef struct {
-    blorp_File* handle;
+    blorp_FileAppender* handle;
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
-} blorp_FileOpenResult;
+} blorp_FileOpenAppenderResult;
+
+typedef struct {
+    blorp_FileReadWriter* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenReadWriterResult;
+
+typedef struct {
+    blorp_FileReadAppender* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenReadAppenderResult;
 
 typedef struct {
     blorp_String* value;
@@ -2146,25 +2160,46 @@ blorp_Result* blorp_for_each_chunk(const blorp_String* path, long chunk_size, bl
 bool blorp_file_exists(const blorp_String* path);
 blorp_FileOpenReaderResult blorp_file_open_read_raw(const blorp_String* path);
 blorp_FileOpenWriterResult blorp_file_open_write_raw(const blorp_String* path);
-blorp_FileOpenWriterResult blorp_file_open_append_raw(const blorp_String* path);
-blorp_FileOpenResult blorp_file_open_read_write_raw(const blorp_String* path);
+blorp_FileOpenAppenderResult blorp_file_open_append_raw(const blorp_String* path);
+blorp_FileOpenReadWriterResult blorp_file_open_read_write_raw(const blorp_String* path);
+blorp_FileOpenReadAppenderResult blorp_file_open_read_append_raw(const blorp_String* path);
 blorp_FileStringResult blorp_file_read_text_reader_raw(const blorp_FileReader* reader);
 blorp_FileBytesResult blorp_file_read_bytes_reader_raw(const blorp_FileReader* reader);
 blorp_FileBytesResult blorp_file_read_chunk_reader_raw(const blorp_FileReader* reader, long max_bytes);
+blorp_FileBytesResult blorp_file_read_chunk_at_reader_raw(const blorp_FileReader* reader, long offset, long max_bytes);
 blorp_FileIntResult blorp_file_count_lines_reader_raw(const blorp_FileReader* reader);
+blorp_FileIntResult blorp_file_size_reader_raw(const blorp_FileReader* reader);
 blorp_FileVoidResult blorp_file_write_text_writer_raw(blorp_FileWriter* writer, const blorp_String* text);
 blorp_FileVoidResult blorp_file_write_bytes_writer_raw(blorp_FileWriter* writer, const blorp_Bytes* bytes);
 blorp_FileIntResult blorp_file_write_chunk_writer_raw(blorp_FileWriter* writer, const blorp_Bytes* bytes);
-blorp_FileStringResult blorp_file_read_text_file_raw(const blorp_File* file);
-blorp_FileBytesResult blorp_file_read_bytes_file_raw(const blorp_File* file);
-blorp_FileBytesResult blorp_file_read_chunk_file_raw(const blorp_File* file, long max_bytes);
-blorp_FileIntResult blorp_file_count_lines_file_raw(const blorp_File* file);
-blorp_FileVoidResult blorp_file_write_text_file_raw(blorp_File* file, const blorp_String* text);
-blorp_FileVoidResult blorp_file_write_bytes_file_raw(blorp_File* file, const blorp_Bytes* bytes);
-blorp_FileIntResult blorp_file_write_chunk_file_raw(blorp_File* file, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_size_writer_raw(const blorp_FileWriter* writer);
+blorp_FileVoidResult blorp_file_append_text_appender_raw(blorp_FileAppender* appender, const blorp_String* text);
+blorp_FileVoidResult blorp_file_append_bytes_appender_raw(blorp_FileAppender* appender, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_append_chunk_appender_raw(blorp_FileAppender* appender, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_size_appender_raw(const blorp_FileAppender* appender);
+blorp_FileStringResult blorp_file_read_text_read_writer_raw(const blorp_FileReadWriter* file);
+blorp_FileBytesResult blorp_file_read_bytes_read_writer_raw(const blorp_FileReadWriter* file);
+blorp_FileBytesResult blorp_file_read_chunk_read_writer_raw(const blorp_FileReadWriter* file, long max_bytes);
+blorp_FileBytesResult blorp_file_read_chunk_at_read_writer_raw(const blorp_FileReadWriter* file, long offset, long max_bytes);
+blorp_FileIntResult blorp_file_count_lines_read_writer_raw(const blorp_FileReadWriter* file);
+blorp_FileVoidResult blorp_file_write_text_read_writer_raw(blorp_FileReadWriter* file, const blorp_String* text);
+blorp_FileVoidResult blorp_file_write_bytes_read_writer_raw(blorp_FileReadWriter* file, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_write_chunk_read_writer_raw(blorp_FileReadWriter* file, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_size_read_writer_raw(const blorp_FileReadWriter* file);
+blorp_FileStringResult blorp_file_read_text_read_appender_raw(const blorp_FileReadAppender* file);
+blorp_FileBytesResult blorp_file_read_bytes_read_appender_raw(const blorp_FileReadAppender* file);
+blorp_FileBytesResult blorp_file_read_chunk_read_appender_raw(const blorp_FileReadAppender* file, long max_bytes);
+blorp_FileBytesResult blorp_file_read_chunk_at_read_appender_raw(const blorp_FileReadAppender* file, long offset, long max_bytes);
+blorp_FileIntResult blorp_file_count_lines_read_appender_raw(const blorp_FileReadAppender* file);
+blorp_FileVoidResult blorp_file_append_text_read_appender_raw(blorp_FileReadAppender* file, const blorp_String* text);
+blorp_FileVoidResult blorp_file_append_bytes_read_appender_raw(blorp_FileReadAppender* file, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_append_chunk_read_appender_raw(blorp_FileReadAppender* file, const blorp_Bytes* bytes);
+blorp_FileIntResult blorp_file_size_read_appender_raw(const blorp_FileReadAppender* file);
 void blorp_file_close_reader(blorp_FileReader* reader);
 void blorp_file_close_writer(blorp_FileWriter* writer);
-void blorp_file_close(blorp_File* file);
+void blorp_file_close_appender(blorp_FileAppender* appender);
+void blorp_file_close_read_writer(blorp_FileReadWriter* file);
+void blorp_file_close_read_appender(blorp_FileReadAppender* file);
 bool blorp_is_directory(const blorp_String* path);
 blorp_List* blorp_list_dir(const blorp_String* path);
 long blorp_exec(const blorp_String* command);

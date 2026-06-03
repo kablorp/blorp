@@ -416,9 +416,21 @@ let file_writer_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
     [ "FileWriter"; "std/file::FileWriter"; "std_file__FileWriter" ]
 
-let file_payload =
+let file_appender_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
-    [ "File"; "std/file::File"; "std_file__File" ]
+    [ "FileAppender"; "std/file::FileAppender"; "std_file__FileAppender" ]
+
+let file_read_writer_payload =
+  resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
+    [ "FileReadWriter"; "std/file::FileReadWriter"; "std_file__FileReadWriter" ]
+
+let file_read_appender_payload =
+  resource_payload ~resource_result_policy:Env_types.ResourceResultIndependent
+    [
+      "FileReadAppender";
+      "std/file::FileReadAppender";
+      "std_file__FileReadAppender";
+    ]
 
 let tls_session_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultDependent
@@ -762,15 +774,13 @@ let result_bridges =
       file_reader_payload;
     file_open_bridge "blorp_file_open_write_raw" "blorp_FileOpenWriterResult"
       file_writer_payload;
-    file_open_bridge "blorp_file_open_append_raw" "blorp_FileOpenWriterResult"
-      file_writer_payload;
-    file_open_bridge "blorp_file_open_read_write_raw" "blorp_FileOpenResult"
-      file_payload;
+    file_open_bridge "blorp_file_open_append_raw" "blorp_FileOpenAppenderResult"
+      file_appender_payload;
+    file_open_bridge "blorp_file_open_read_write_raw"
+      "blorp_FileOpenReadWriterResult" file_read_writer_payload;
+    file_open_bridge "blorp_file_open_read_append_raw"
+      "blorp_FileOpenReadAppenderResult" file_read_appender_payload;
     file_operation_bridge "blorp_file_read_text_reader_raw"
-      "blorp_FileStringResult"
-      (value_payload ~release_mask:1 "String")
-      [ ArgBorrow ];
-    file_operation_bridge "blorp_file_read_text_file_raw"
       "blorp_FileStringResult"
       (value_payload ~release_mask:1 "String")
       [ ArgBorrow ];
@@ -778,33 +788,85 @@ let result_bridges =
       "blorp_FileBytesResult"
       (value_payload ~release_mask:1 "Bytes")
       [ ArgBorrow ];
-    file_operation_bridge "blorp_file_read_bytes_file_raw"
-      "blorp_FileBytesResult"
-      (value_payload ~release_mask:1 "Bytes")
-      [ ArgBorrow ];
     file_operation_bridge "blorp_file_read_chunk_reader_raw"
       "blorp_FileBytesResult"
       (value_payload ~release_mask:1 "Bytes")
       [ ArgBorrow; ArgBorrow ];
-    file_operation_bridge "blorp_file_read_chunk_file_raw"
+    file_operation_bridge "blorp_file_read_chunk_at_reader_raw"
       "blorp_FileBytesResult"
       (value_payload ~release_mask:1 "Bytes")
-      [ ArgBorrow; ArgBorrow ];
+      [ ArgBorrow; ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_count_lines_reader_raw"
+      "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow ];
+    file_operation_bridge "blorp_file_size_reader_raw" "blorp_FileIntResult"
+      (value_payload "Int") [ ArgBorrow ];
     file_operation_bridge "blorp_file_write_text_writer_raw"
-      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
-    file_operation_bridge "blorp_file_write_text_file_raw"
       "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
     file_operation_bridge "blorp_file_write_bytes_writer_raw"
       "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
-    file_operation_bridge "blorp_file_write_bytes_file_raw"
-      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
     file_operation_bridge "blorp_file_write_chunk_writer_raw"
       "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow; ArgBorrow ];
-    file_operation_bridge "blorp_file_write_chunk_file_raw"
+    file_operation_bridge "blorp_file_size_writer_raw" "blorp_FileIntResult"
+      (value_payload "Int") [ ArgBorrow ];
+    file_operation_bridge "blorp_file_append_text_appender_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_append_bytes_appender_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_append_chunk_appender_raw"
       "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow; ArgBorrow ];
-    file_operation_bridge "blorp_file_count_lines_reader_raw"
+    file_operation_bridge "blorp_file_size_appender_raw" "blorp_FileIntResult"
+      (value_payload "Int") [ ArgBorrow ];
+    file_operation_bridge "blorp_file_read_text_read_writer_raw"
+      "blorp_FileStringResult"
+      (value_payload ~release_mask:1 "String")
+      [ ArgBorrow ];
+    file_operation_bridge "blorp_file_read_bytes_read_writer_raw"
+      "blorp_FileBytesResult"
+      (value_payload ~release_mask:1 "Bytes")
+      [ ArgBorrow ];
+    file_operation_bridge "blorp_file_read_chunk_read_writer_raw"
+      "blorp_FileBytesResult"
+      (value_payload ~release_mask:1 "Bytes")
+      [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_read_chunk_at_read_writer_raw"
+      "blorp_FileBytesResult"
+      (value_payload ~release_mask:1 "Bytes")
+      [ ArgBorrow; ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_count_lines_read_writer_raw"
       "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow ];
-    file_operation_bridge "blorp_file_count_lines_file_raw"
+    file_operation_bridge "blorp_file_write_text_read_writer_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_write_bytes_read_writer_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_write_chunk_read_writer_raw"
+      "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_size_read_writer_raw"
+      "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow ];
+    file_operation_bridge "blorp_file_read_text_read_appender_raw"
+      "blorp_FileStringResult"
+      (value_payload ~release_mask:1 "String")
+      [ ArgBorrow ];
+    file_operation_bridge "blorp_file_read_bytes_read_appender_raw"
+      "blorp_FileBytesResult"
+      (value_payload ~release_mask:1 "Bytes")
+      [ ArgBorrow ];
+    file_operation_bridge "blorp_file_read_chunk_read_appender_raw"
+      "blorp_FileBytesResult"
+      (value_payload ~release_mask:1 "Bytes")
+      [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_read_chunk_at_read_appender_raw"
+      "blorp_FileBytesResult"
+      (value_payload ~release_mask:1 "Bytes")
+      [ ArgBorrow; ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_count_lines_read_appender_raw"
+      "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow ];
+    file_operation_bridge "blorp_file_append_text_read_appender_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_append_bytes_read_appender_raw"
+      "blorp_FileVoidResult" void_payload [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_append_chunk_read_appender_raw"
+      "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow; ArgBorrow ];
+    file_operation_bridge "blorp_file_size_read_appender_raw"
       "blorp_FileIntResult" (value_payload "Int") [ ArgBorrow ];
   ]
 

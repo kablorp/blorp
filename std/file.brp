@@ -1,8 +1,7 @@
 -- Typed file resource API foundation.
 --
--- This module starts the resource-backed file API with a typed error surface.
--- Existing whole-file helpers remain in `system` while scoped file handles are
--- added incrementally on top of `with` resource cleanup.
+-- This module exposes scoped file handles through explicit capability traits.
+-- `with` owns handle cleanup; operation traits describe what a handle can do.
 import:
 	stream: FallibleStream
 
@@ -20,9 +19,21 @@ resource type FileWriter = builtin("blorp_file_close_writer")
 
 
 ---
+Opaque handle for append-only file operations.
+---
+resource type FileAppender = builtin("blorp_file_close_appender")
+
+
+---
 Opaque handle for read-write file operations.
 ---
-resource type File = builtin("blorp_file_close")
+resource type FileReadWriter = builtin("blorp_file_close_read_writer")
+
+
+---
+Opaque handle for read-append file operations.
+---
+resource type FileReadAppender = builtin("blorp_file_close_read_appender")
 
 
 ---
@@ -46,9 +57,61 @@ implements FileClosable for FileWriter:
 		builtin("blorp_file_close_writer")
 
 
-implements FileClosable for File:
-	func close(file: File) -> Void:
-		builtin("blorp_file_close")
+implements FileClosable for FileAppender:
+	func close(appender: FileAppender) -> Void:
+		builtin("blorp_file_close_appender")
+
+
+implements FileClosable for FileReadWriter:
+	func close(file: FileReadWriter) -> Void:
+		builtin("blorp_file_close_read_writer")
+
+
+implements FileClosable for FileReadAppender:
+	func close(file: FileReadAppender) -> Void:
+		builtin("blorp_file_close_read_appender")
+
+
+---
+Read sequentially from a scoped file handle.
+---
+trait FileReadable:
+	func read_text(handle: Self) -> Result[String, IOError]
+	func read_bytes(handle: Self) -> Result[Bytes, IOError]
+	func read_chunk(handle: Self, max_bytes: Int) -> Result[Bytes, IOError]
+	func count_lines(handle: Self) -> Result[Int, IOError]
+
+
+---
+Read from a stable offset without changing the handle's current file offset.
+---
+trait FileReadAt:
+	func read_chunk_at(handle: Self, offset: Int, max_bytes: Int) -> Result[Bytes, IOError]
+
+
+---
+Write at the handle's current file offset.
+---
+trait FileWritable:
+	func write_text(handle: Self, text: String) -> Result[Void, IOError]
+	func write_bytes(handle: Self, data: Bytes) -> Result[Void, IOError]
+	func write_chunk(handle: Self, data: Bytes) -> Result[Int, IOError]
+
+
+---
+Append to the end of the file.
+---
+trait FileAppendable:
+	func append_text(handle: Self, text: String) -> Result[Void, IOError]
+	func append_bytes(handle: Self, data: Bytes) -> Result[Void, IOError]
+	func append_chunk(handle: Self, data: Bytes) -> Result[Int, IOError]
+
+
+---
+Query metadata from an open file handle.
+---
+trait FileSized:
+	func size(handle: Self) -> Result[Int, IOError]
 
 
 ---
@@ -120,10 +183,10 @@ func open_write(path: String) -> Result[FileWriter, IOError]:
 Open a file for appending as a scoped resource.
 
 Creates the file if it is missing and preserves existing contents. Use with
-`with writer ?= open_append(path):` so the writer is closed automatically when
-the block exits.
+`with appender ?= open_append(path):` so the appender is closed automatically
+when the block exits.
 ---
-func open_append(path: String) -> Result[FileWriter, IOError]:
+func open_append(path: String) -> Result[FileAppender, IOError]:
 	builtin("blorp_file_open_append_raw")
 
 
@@ -134,42 +197,180 @@ The path must already exist. The file is not truncated. Use with
 `with file ?= open_read_write(path):` so the handle is closed automatically
 when the block exits.
 ---
-func open_read_write(path: String) -> Result[File, IOError]:
+func open_read_write(path: String) -> Result[FileReadWriter, IOError]:
 	builtin("blorp_file_open_read_write_raw")
 
 
 ---
-Read the remaining text from a scoped read handle.
+Open an existing file for reading and appending as a scoped resource.
 
-The handle must come directly from a `with` binding. The result is ordinary text
-and may leave the scope; the handle itself is still closed at the end of the
-`with` block.
+The path must already exist. Reads use the current file offset, while append
+operations always write at the end of the file.
 ---
-@resource_result_ordinary
-func read_text(reader: FileReader) -> Result[String, IOError]:
-	builtin("blorp_file_read_text_reader_raw")
+func open_read_append(path: String) -> Result[FileReadAppender, IOError]:
+	builtin("blorp_file_open_read_append_raw")
 
 
----
-Read the remaining bytes from a scoped read handle.
+implements FileReadable for FileReader:
+	@resource_result_ordinary
+	func read_text(reader: FileReader) -> Result[String, IOError]:
+		builtin("blorp_file_read_text_reader_raw")
 
-The handle must come directly from a `with` binding. The returned `Bytes` value
-is ordinary data and may leave the scope.
----
-@resource_result_ordinary
-func read_bytes(reader: FileReader) -> Result[Bytes, IOError]:
-	builtin("blorp_file_read_bytes_reader_raw")
+	@resource_result_ordinary
+	func read_bytes(reader: FileReader) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_bytes_reader_raw")
+
+	@resource_result_ordinary
+	func read_chunk(reader: FileReader, max_bytes: Int) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_chunk_reader_raw")
+
+	@resource_result_ordinary
+	func count_lines(reader: FileReader) -> Result[Int, IOError]:
+		builtin("blorp_file_count_lines_reader_raw")
 
 
----
-Read up to `max_bytes` bytes from a scoped read handle.
+implements FileReadAt for FileReader:
+	@resource_result_ordinary
+	func read_chunk_at(reader: FileReader, offset: Int, max_bytes: Int) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_chunk_at_reader_raw")
 
-Returns an empty `Bytes` value at end of file. Passing a non-positive size
-returns `Err(InvalidInput(...))`.
----
-@resource_result_ordinary
-func read_chunk(reader: FileReader, max_bytes: Int) -> Result[Bytes, IOError]:
-	builtin("blorp_file_read_chunk_reader_raw")
+
+implements FileSized for FileReader:
+	@resource_result_ordinary
+	func size(reader: FileReader) -> Result[Int, IOError]:
+		builtin("blorp_file_size_reader_raw")
+
+
+implements FileWritable for FileWriter:
+	@resource_result_ordinary
+	func write_text(writer: FileWriter, text: String) -> Result[Void, IOError]:
+		builtin("blorp_file_write_text_writer_raw")
+
+	@resource_result_ordinary
+	func write_bytes(writer: FileWriter, data: Bytes) -> Result[Void, IOError]:
+		builtin("blorp_file_write_bytes_writer_raw")
+
+	@resource_result_ordinary
+	func write_chunk(writer: FileWriter, data: Bytes) -> Result[Int, IOError]:
+		builtin("blorp_file_write_chunk_writer_raw")
+
+
+implements FileSized for FileWriter:
+	@resource_result_ordinary
+	func size(writer: FileWriter) -> Result[Int, IOError]:
+		builtin("blorp_file_size_writer_raw")
+
+
+implements FileAppendable for FileAppender:
+	@resource_result_ordinary
+	func append_text(appender: FileAppender, text: String) -> Result[Void, IOError]:
+		builtin("blorp_file_append_text_appender_raw")
+
+	@resource_result_ordinary
+	func append_bytes(appender: FileAppender, data: Bytes) -> Result[Void, IOError]:
+		builtin("blorp_file_append_bytes_appender_raw")
+
+	@resource_result_ordinary
+	func append_chunk(appender: FileAppender, data: Bytes) -> Result[Int, IOError]:
+		builtin("blorp_file_append_chunk_appender_raw")
+
+
+implements FileSized for FileAppender:
+	@resource_result_ordinary
+	func size(appender: FileAppender) -> Result[Int, IOError]:
+		builtin("blorp_file_size_appender_raw")
+
+
+implements FileReadable for FileReadWriter:
+	@resource_result_ordinary
+	func read_text(file: FileReadWriter) -> Result[String, IOError]:
+		builtin("blorp_file_read_text_read_writer_raw")
+
+	@resource_result_ordinary
+	func read_bytes(file: FileReadWriter) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_bytes_read_writer_raw")
+
+	@resource_result_ordinary
+	func read_chunk(file: FileReadWriter, max_bytes: Int) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_chunk_read_writer_raw")
+
+	@resource_result_ordinary
+	func count_lines(file: FileReadWriter) -> Result[Int, IOError]:
+		builtin("blorp_file_count_lines_read_writer_raw")
+
+
+implements FileReadAt for FileReadWriter:
+	@resource_result_ordinary
+	func read_chunk_at(file: FileReadWriter, offset: Int, max_bytes: Int) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_chunk_at_read_writer_raw")
+
+
+implements FileWritable for FileReadWriter:
+	@resource_result_ordinary
+	func write_text(file: FileReadWriter, text: String) -> Result[Void, IOError]:
+		builtin("blorp_file_write_text_read_writer_raw")
+
+	@resource_result_ordinary
+	func write_bytes(file: FileReadWriter, data: Bytes) -> Result[Void, IOError]:
+		builtin("blorp_file_write_bytes_read_writer_raw")
+
+	@resource_result_ordinary
+	func write_chunk(file: FileReadWriter, data: Bytes) -> Result[Int, IOError]:
+		builtin("blorp_file_write_chunk_read_writer_raw")
+
+
+implements FileSized for FileReadWriter:
+	@resource_result_ordinary
+	func size(file: FileReadWriter) -> Result[Int, IOError]:
+		builtin("blorp_file_size_read_writer_raw")
+
+
+implements FileReadable for FileReadAppender:
+	@resource_result_ordinary
+	func read_text(file: FileReadAppender) -> Result[String, IOError]:
+		builtin("blorp_file_read_text_read_appender_raw")
+
+	@resource_result_ordinary
+	func read_bytes(file: FileReadAppender) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_bytes_read_appender_raw")
+
+	@resource_result_ordinary
+	func read_chunk(file: FileReadAppender, max_bytes: Int) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_chunk_read_appender_raw")
+
+	@resource_result_ordinary
+	func count_lines(file: FileReadAppender) -> Result[Int, IOError]:
+		builtin("blorp_file_count_lines_read_appender_raw")
+
+
+implements FileReadAt for FileReadAppender:
+	@resource_result_ordinary
+	func read_chunk_at(
+		file: FileReadAppender,
+		offset: Int,
+		max_bytes: Int,
+	) -> Result[Bytes, IOError]:
+		builtin("blorp_file_read_chunk_at_read_appender_raw")
+
+
+implements FileAppendable for FileReadAppender:
+	@resource_result_ordinary
+	func append_text(file: FileReadAppender, text: String) -> Result[Void, IOError]:
+		builtin("blorp_file_append_text_read_appender_raw")
+
+	@resource_result_ordinary
+	func append_bytes(file: FileReadAppender, data: Bytes) -> Result[Void, IOError]:
+		builtin("blorp_file_append_bytes_read_appender_raw")
+
+	@resource_result_ordinary
+	func append_chunk(file: FileReadAppender, data: Bytes) -> Result[Int, IOError]:
+		builtin("blorp_file_append_chunk_read_appender_raw")
+
+
+implements FileSized for FileReadAppender:
+	@resource_result_ordinary
+	func size(file: FileReadAppender) -> Result[Int, IOError]:
+		builtin("blorp_file_size_read_appender_raw")
 
 
 ---
@@ -223,118 +424,3 @@ terminal operations such as `collect_result` return `Err(InvalidInput(...))`.
 ---
 func windows(reader: FileReader, size: Int) -> FallibleStream[Bytes, IOError]:
 	builtin("blorp_file_windows_reader_raw")
-
-
----
-Count text lines from the scoped read handle without materializing them.
-
-The count matches file line streaming semantics: an empty file has 0 lines, a
-trailing newline does not add an extra empty line, and a final line without a
-trailing newline is counted.
----
-@resource_result_ordinary
-func count_lines(reader: FileReader) -> Result[Int, IOError]:
-	builtin("blorp_file_count_lines_reader_raw")
-
-
----
-Write all text to a scoped write handle.
-
-The handle must come directly from a `with` binding. This writes the full string
-or returns a typed `IOError`.
----
-@resource_result_ordinary
-func write_text(writer: FileWriter, text: String) -> Result[Void, IOError]:
-	builtin("blorp_file_write_text_writer_raw")
-
-
----
-Write all bytes to a scoped write handle.
-
-The handle must come directly from a `with` binding. This writes the full buffer
-or returns a typed `IOError`.
----
-@resource_result_ordinary
-func write_bytes(writer: FileWriter, data: Bytes) -> Result[Void, IOError]:
-	builtin("blorp_file_write_bytes_writer_raw")
-
-
----
-Write one byte chunk to a scoped write handle.
-
-This performs one runtime write attempt and returns the number of bytes written.
-Use `write_bytes` when all bytes must be written before returning.
----
-@resource_result_ordinary
-func write_chunk(writer: FileWriter, data: Bytes) -> Result[Int, IOError]:
-	builtin("blorp_file_write_chunk_writer_raw")
-
-
----
-Read the remaining text from a scoped read-write handle.
-
-The handle must come directly from a `with` binding. Reading starts at the
-handle's current file offset.
----
-@resource_result_ordinary
-func read_text_rw(file: File) -> Result[String, IOError]:
-	builtin("blorp_file_read_text_file_raw")
-
-
----
-Read the remaining bytes from a scoped read-write handle.
-
-The handle must come directly from a `with` binding. Reading starts at the
-handle's current file offset.
----
-@resource_result_ordinary
-func read_bytes_rw(file: File) -> Result[Bytes, IOError]:
-	builtin("blorp_file_read_bytes_file_raw")
-
-
----
-Read up to `max_bytes` bytes from a scoped read-write handle.
-
-Returns an empty `Bytes` value at end of file. Passing a non-positive size
-returns `Err(InvalidInput(...))`.
----
-@resource_result_ordinary
-func read_chunk_rw(file: File, max_bytes: Int) -> Result[Bytes, IOError]:
-	builtin("blorp_file_read_chunk_file_raw")
-
-
----
-Count text lines from a scoped read-write handle without materializing them.
-
-Counting starts at the handle's current file offset.
----
-@resource_result_ordinary
-func count_lines_rw(file: File) -> Result[Int, IOError]:
-	builtin("blorp_file_count_lines_file_raw")
-
-
----
-Write all text to a scoped read-write handle at the current file offset.
----
-@resource_result_ordinary
-func write_text_rw(file: File, text: String) -> Result[Void, IOError]:
-	builtin("blorp_file_write_text_file_raw")
-
-
----
-Write all bytes to a scoped read-write handle at the current file offset.
----
-@resource_result_ordinary
-func write_bytes_rw(file: File, data: Bytes) -> Result[Void, IOError]:
-	builtin("blorp_file_write_bytes_file_raw")
-
-
----
-Write one byte chunk to a scoped read-write handle at the current file offset.
-
-This performs one runtime write attempt and returns the number of bytes written.
-Use `write_bytes_rw` when all bytes must be written before returning.
----
-@resource_result_ordinary
-func write_chunk_rw(file: File, data: Bytes) -> Result[Int, IOError]:
-	builtin("blorp_file_write_chunk_file_raw")

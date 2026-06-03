@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
@@ -7859,9 +7860,17 @@ typedef struct blorp_FileWriter {
     int fd;
 } blorp_FileWriter;
 
-typedef struct blorp_File {
+typedef struct blorp_FileAppender {
     int fd;
-} blorp_File;
+} blorp_FileAppender;
+
+typedef struct blorp_FileReadWriter {
+    int fd;
+} blorp_FileReadWriter;
+
+typedef struct blorp_FileReadAppender {
+    int fd;
+} blorp_FileReadAppender;
 
 typedef enum {
     BLORP_FILE_ERROR_NONE = 0,
@@ -7888,10 +7897,22 @@ typedef struct {
 } blorp_FileOpenWriterResult;
 
 typedef struct {
-    blorp_File* handle;
+    blorp_FileAppender* handle;
     blorp_FileErrorKind error_kind;
     blorp_String* detail;
-} blorp_FileOpenResult;
+} blorp_FileOpenAppenderResult;
+
+typedef struct {
+    blorp_FileReadWriter* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenReadWriterResult;
+
+typedef struct {
+    blorp_FileReadAppender* handle;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_FileOpenReadAppenderResult;
 
 typedef struct {
     blorp_String* value;
@@ -32097,6 +32118,10 @@ static blorp_FileErrorKind blorp_file_error_kind_from_errno(int errnum) {
         case EOPNOTSUPP:
             return BLORP_FILE_ERROR_UNSUPPORTED;
 #endif
+#ifdef ESPIPE
+        case ESPIPE:
+            return BLORP_FILE_ERROR_UNSUPPORTED;
+#endif
         default:
             return BLORP_FILE_ERROR_OTHER;
     }
@@ -32124,11 +32149,33 @@ static blorp_FileOpenWriterResult blorp_file_open_writer_error(
     };
 }
 
-static blorp_FileOpenResult blorp_file_open_error(
+static blorp_FileOpenAppenderResult blorp_file_open_appender_error(
     blorp_FileErrorKind kind,
     blorp_String* detail
 ) {
-    return (blorp_FileOpenResult){
+    return (blorp_FileOpenAppenderResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileOpenReadWriterResult blorp_file_open_read_writer_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileOpenReadWriterResult){
+        .handle = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
+static blorp_FileOpenReadAppenderResult blorp_file_open_read_appender_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_FileOpenReadAppenderResult){
         .handle = NULL,
         .error_kind = kind,
         .detail = detail
@@ -32545,6 +32592,61 @@ static blorp_FileBytesResult blorp_file_read_chunk_fd(int fd, long max_bytes) {
     }
 }
 
+static blorp_FileBytesResult blorp_file_read_chunk_at_fd(
+    int fd,
+    long offset,
+    long max_bytes
+) {
+    if (fd < 0) {
+        return blorp_file_bytes_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("read_chunk_at: closed file handle"));
+    }
+    if (offset < 0) {
+        return blorp_file_bytes_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("read_chunk_at: offset must be non-negative"));
+    }
+    if (max_bytes <= 0) {
+        return blorp_file_bytes_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("read_chunk_at: max_bytes must be positive"));
+    }
+
+    blorp_Bytes* bytes = blorp_bytes_new(max_bytes);
+    while (true) {
+        ssize_t n = pread(fd, bytes->data, (size_t)max_bytes, (off_t)offset);
+        if (n >= 0) {
+            bytes->len = (long)n;
+            return blorp_file_bytes_ok(bytes);
+        }
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("read_chunk_at", errnum);
+        blorp_release(bytes);
+        return blorp_file_bytes_error(kind, detail);
+    }
+}
+
+static blorp_FileIntResult blorp_file_size_fd(int fd) {
+    if (fd < 0) {
+        return blorp_file_int_error(BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("size: closed file handle"));
+    }
+
+    struct stat st;
+    while (true) {
+        if (fstat(fd, &st) == 0) return blorp_file_int_ok((long)st.st_size);
+        if (errno == EINTR) continue;
+
+        int errnum = errno;
+        blorp_FileErrorKind kind = blorp_file_error_kind_from_errno(errnum);
+        blorp_String* detail =
+            blorp_file_operation_errno_detail("size", errnum);
+        return blorp_file_int_error(kind, detail);
+    }
+}
+
 static blorp_FileIntResult blorp_file_count_lines_fd(int fd) {
     if (fd < 0) {
         return blorp_file_int_error(BLORP_FILE_ERROR_INVALID_INPUT,
@@ -32723,34 +32825,61 @@ blorp_FileOpenWriterResult blorp_file_open_write_raw(const blorp_String* path) {
     };
 }
 
-blorp_FileOpenWriterResult blorp_file_open_append_raw(const blorp_String* path) {
+blorp_FileOpenAppenderResult blorp_file_open_append_raw(
+    const blorp_String* path
+) {
     blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
     blorp_String* error_detail = NULL;
     int fd = blorp_file_open_fd(path, O_WRONLY | O_CREAT | O_APPEND, 0666,
         &error_kind, &error_detail);
     if (fd < 0) {
-        return blorp_file_open_writer_error(error_kind, error_detail);
+        return blorp_file_open_appender_error(error_kind, error_detail);
     }
-    blorp_FileWriter* writer =
-        (blorp_FileWriter*)blorp_malloc_checked(sizeof(blorp_FileWriter));
-    writer->fd = fd;
-    return (blorp_FileOpenWriterResult){
-        .handle = writer,
+    blorp_FileAppender* appender =
+        (blorp_FileAppender*)blorp_malloc_checked(sizeof(blorp_FileAppender));
+    appender->fd = fd;
+    return (blorp_FileOpenAppenderResult){
+        .handle = appender,
         .error_kind = BLORP_FILE_ERROR_NONE,
         .detail = NULL
     };
 }
 
-blorp_FileOpenResult blorp_file_open_read_write_raw(const blorp_String* path) {
+blorp_FileOpenReadWriterResult blorp_file_open_read_write_raw(
+    const blorp_String* path
+) {
     blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
     blorp_String* error_detail = NULL;
     int fd = blorp_file_open_fd(path, O_RDWR, 0, &error_kind, &error_detail);
     if (fd < 0) {
-        return blorp_file_open_error(error_kind, error_detail);
+        return blorp_file_open_read_writer_error(error_kind, error_detail);
     }
-    blorp_File* file = (blorp_File*)blorp_malloc_checked(sizeof(blorp_File));
+    blorp_FileReadWriter* file =
+        (blorp_FileReadWriter*)blorp_malloc_checked(
+            sizeof(blorp_FileReadWriter));
     file->fd = fd;
-    return (blorp_FileOpenResult){
+    return (blorp_FileOpenReadWriterResult){
+        .handle = file,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+blorp_FileOpenReadAppenderResult blorp_file_open_read_append_raw(
+    const blorp_String* path
+) {
+    blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+    blorp_String* error_detail = NULL;
+    int fd = blorp_file_open_fd(path, O_RDWR | O_APPEND, 0, &error_kind,
+        &error_detail);
+    if (fd < 0) {
+        return blorp_file_open_read_appender_error(error_kind, error_detail);
+    }
+    blorp_FileReadAppender* file =
+        (blorp_FileReadAppender*)blorp_malloc_checked(
+            sizeof(blorp_FileReadAppender));
+    file->fd = fd;
+    return (blorp_FileOpenReadAppenderResult){
         .handle = file,
         .error_kind = BLORP_FILE_ERROR_NONE,
         .detail = NULL
@@ -32776,10 +32905,28 @@ blorp_FileBytesResult blorp_file_read_chunk_reader_raw(
     return blorp_file_read_chunk_fd(reader ? reader->fd : -1, max_bytes);
 }
 
+blorp_FileBytesResult blorp_file_read_chunk_at_reader_raw(
+    const blorp_FileReader* reader,
+    long offset,
+    long max_bytes
+) {
+    return blorp_file_read_chunk_at_fd(
+        reader ? reader->fd : -1,
+        offset,
+        max_bytes
+    );
+}
+
 blorp_FileIntResult blorp_file_count_lines_reader_raw(
     const blorp_FileReader* reader
 ) {
     return blorp_file_count_lines_fd(reader ? reader->fd : -1);
+}
+
+blorp_FileIntResult blorp_file_size_reader_raw(
+    const blorp_FileReader* reader
+) {
+    return blorp_file_size_fd(reader ? reader->fd : -1);
 }
 
 blorp_FileVoidResult blorp_file_write_text_writer_raw(
@@ -32803,76 +32950,200 @@ blorp_FileIntResult blorp_file_write_chunk_writer_raw(
     return blorp_file_write_chunk_fd(writer ? writer->fd : -1, bytes);
 }
 
-blorp_FileStringResult blorp_file_read_text_file_raw(
-    const blorp_File* file
+blorp_FileIntResult blorp_file_size_writer_raw(
+    const blorp_FileWriter* writer
+) {
+    return blorp_file_size_fd(writer ? writer->fd : -1);
+}
+
+blorp_FileVoidResult blorp_file_append_text_appender_raw(
+    blorp_FileAppender* appender,
+    const blorp_String* text
+) {
+    return blorp_file_write_text_fd(appender ? appender->fd : -1, text);
+}
+
+blorp_FileVoidResult blorp_file_append_bytes_appender_raw(
+    blorp_FileAppender* appender,
+    const blorp_Bytes* bytes
+) {
+    return blorp_file_write_bytes_fd(appender ? appender->fd : -1, bytes);
+}
+
+blorp_FileIntResult blorp_file_append_chunk_appender_raw(
+    blorp_FileAppender* appender,
+    const blorp_Bytes* bytes
+) {
+    return blorp_file_write_chunk_fd(appender ? appender->fd : -1, bytes);
+}
+
+blorp_FileIntResult blorp_file_size_appender_raw(
+    const blorp_FileAppender* appender
+) {
+    return blorp_file_size_fd(appender ? appender->fd : -1);
+}
+
+blorp_FileStringResult blorp_file_read_text_read_writer_raw(
+    const blorp_FileReadWriter* file
 ) {
     return blorp_file_read_text_fd(file ? file->fd : -1);
 }
 
-blorp_FileBytesResult blorp_file_read_bytes_file_raw(
-    const blorp_File* file
+blorp_FileBytesResult blorp_file_read_bytes_read_writer_raw(
+    const blorp_FileReadWriter* file
 ) {
     return blorp_file_read_bytes_fd(file ? file->fd : -1);
 }
 
-blorp_FileBytesResult blorp_file_read_chunk_file_raw(
-    const blorp_File* file,
+blorp_FileBytesResult blorp_file_read_chunk_read_writer_raw(
+    const blorp_FileReadWriter* file,
     long max_bytes
 ) {
     return blorp_file_read_chunk_fd(file ? file->fd : -1, max_bytes);
 }
 
-blorp_FileIntResult blorp_file_count_lines_file_raw(
-    const blorp_File* file
+blorp_FileBytesResult blorp_file_read_chunk_at_read_writer_raw(
+    const blorp_FileReadWriter* file,
+    long offset,
+    long max_bytes
+) {
+    return blorp_file_read_chunk_at_fd(
+        file ? file->fd : -1,
+        offset,
+        max_bytes
+    );
+}
+
+blorp_FileIntResult blorp_file_count_lines_read_writer_raw(
+    const blorp_FileReadWriter* file
 ) {
     return blorp_file_count_lines_fd(file ? file->fd : -1);
 }
 
-blorp_FileVoidResult blorp_file_write_text_file_raw(
-    blorp_File* file,
+blorp_FileVoidResult blorp_file_write_text_read_writer_raw(
+    blorp_FileReadWriter* file,
     const blorp_String* text
 ) {
     return blorp_file_write_text_fd(file ? file->fd : -1, text);
 }
 
-blorp_FileVoidResult blorp_file_write_bytes_file_raw(
-    blorp_File* file,
+blorp_FileVoidResult blorp_file_write_bytes_read_writer_raw(
+    blorp_FileReadWriter* file,
     const blorp_Bytes* bytes
 ) {
     return blorp_file_write_bytes_fd(file ? file->fd : -1, bytes);
 }
 
-blorp_FileIntResult blorp_file_write_chunk_file_raw(
-    blorp_File* file,
+blorp_FileIntResult blorp_file_write_chunk_read_writer_raw(
+    blorp_FileReadWriter* file,
     const blorp_Bytes* bytes
 ) {
     return blorp_file_write_chunk_fd(file ? file->fd : -1, bytes);
 }
 
+blorp_FileIntResult blorp_file_size_read_writer_raw(
+    const blorp_FileReadWriter* file
+) {
+    return blorp_file_size_fd(file ? file->fd : -1);
+}
+
+blorp_FileStringResult blorp_file_read_text_read_appender_raw(
+    const blorp_FileReadAppender* file
+) {
+    return blorp_file_read_text_fd(file ? file->fd : -1);
+}
+
+blorp_FileBytesResult blorp_file_read_bytes_read_appender_raw(
+    const blorp_FileReadAppender* file
+) {
+    return blorp_file_read_bytes_fd(file ? file->fd : -1);
+}
+
+blorp_FileBytesResult blorp_file_read_chunk_read_appender_raw(
+    const blorp_FileReadAppender* file,
+    long max_bytes
+) {
+    return blorp_file_read_chunk_fd(file ? file->fd : -1, max_bytes);
+}
+
+blorp_FileBytesResult blorp_file_read_chunk_at_read_appender_raw(
+    const blorp_FileReadAppender* file,
+    long offset,
+    long max_bytes
+) {
+    return blorp_file_read_chunk_at_fd(
+        file ? file->fd : -1,
+        offset,
+        max_bytes
+    );
+}
+
+blorp_FileIntResult blorp_file_count_lines_read_appender_raw(
+    const blorp_FileReadAppender* file
+) {
+    return blorp_file_count_lines_fd(file ? file->fd : -1);
+}
+
+blorp_FileVoidResult blorp_file_append_text_read_appender_raw(
+    blorp_FileReadAppender* file,
+    const blorp_String* text
+) {
+    return blorp_file_write_text_fd(file ? file->fd : -1, text);
+}
+
+blorp_FileVoidResult blorp_file_append_bytes_read_appender_raw(
+    blorp_FileReadAppender* file,
+    const blorp_Bytes* bytes
+) {
+    return blorp_file_write_bytes_fd(file ? file->fd : -1, bytes);
+}
+
+blorp_FileIntResult blorp_file_append_chunk_read_appender_raw(
+    blorp_FileReadAppender* file,
+    const blorp_Bytes* bytes
+) {
+    return blorp_file_write_chunk_fd(file ? file->fd : -1, bytes);
+}
+
+blorp_FileIntResult blorp_file_size_read_appender_raw(
+    const blorp_FileReadAppender* file
+) {
+    return blorp_file_size_fd(file ? file->fd : -1);
+}
+
+static void blorp_file_close_fd(int* fd) {
+    if (!fd || *fd < 0) return;
+    close(*fd);
+    *fd = -1;
+}
+
 void blorp_file_close_reader(blorp_FileReader* reader) {
     if (!reader) return;
-    if (reader->fd >= 0) {
-        close(reader->fd);
-        reader->fd = -1;
-    }
+    blorp_file_close_fd(&reader->fd);
     free(reader);
 }
 
 void blorp_file_close_writer(blorp_FileWriter* writer) {
     if (!writer) return;
-    if (writer->fd >= 0) {
-        close(writer->fd);
-        writer->fd = -1;
-    }
+    blorp_file_close_fd(&writer->fd);
     free(writer);
 }
 
-void blorp_file_close(blorp_File* file) {
+void blorp_file_close_appender(blorp_FileAppender* appender) {
+    if (!appender) return;
+    blorp_file_close_fd(&appender->fd);
+    free(appender);
+}
+
+void blorp_file_close_read_writer(blorp_FileReadWriter* file) {
     if (!file) return;
-    if (file->fd >= 0) {
-        close(file->fd);
-        file->fd = -1;
-    }
+    blorp_file_close_fd(&file->fd);
+    free(file);
+}
+
+void blorp_file_close_read_appender(blorp_FileReadAppender* file) {
+    if (!file) return;
+    blorp_file_close_fd(&file->fd);
     free(file);
 }
 
@@ -32881,7 +33152,6 @@ void blorp_file_close(blorp_File* file) {
 // ============================================================================
 
 #include <dirent.h>
-#include <sys/stat.h>
 
 bool blorp_is_directory(const blorp_String* path) {
     if (!path) return false;

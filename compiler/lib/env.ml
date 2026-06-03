@@ -1489,6 +1489,15 @@ let find_overload_by_def_id (env : env) (def_id : def_id) :
       | None -> List.find_opt (fun entry -> entry.ol_def_id = def_id) entries)
     env.overloads None
 
+let find_ufcs_method_by_def_id (env : env) (def_id : def_id) :
+    overload_entry option =
+  Hashtbl.fold
+    (fun _ entries found ->
+      match found with
+      | Some _ -> found
+      | None -> List.find_opt (fun entry -> entry.ol_def_id = def_id) entries)
+    env.ufcs_methods None
+
 (** Extract the head type name from a type expression (e.g., "List" from List[Int]). *)
 let head_type_name (ty : type_expr) : string option =
   match ty with

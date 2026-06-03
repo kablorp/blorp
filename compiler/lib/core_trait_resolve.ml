@@ -350,6 +350,15 @@ let is_local_direct_function (reg : registry) (module_path : string option)
         candidates
   | None -> false
 
+let is_direct_ufcs_function (reg : registry) (module_path : string)
+    (name : string) (args : core list) : bool =
+  match Hashtbl.find_opt reg.direct_functions (module_path, name) with
+  | Some candidates ->
+      List.exists
+        (fun entry -> direct_function_matches_args entry args)
+        candidates
+  | None -> Codegen_builtins.lookup module_path name <> None
+
 (** Pick the closest candidate type (by edit distance) from [candidates]
     relative to [target], within a threshold that scales with the length
     of [target]. Threshold matches [Core_stage.closest_stage]'s
@@ -554,19 +563,28 @@ let rec resolve_expr (reg : registry) (module_path : string option)
       | CVar v -> (
           if StringSet.mem v.vname shadowed_locals then e
           else
+            let ufcs_target = Codegen_names.parse_ufcs_name v.vname in
+            let method_name =
+              match ufcs_target with Some (_, name) -> name | None -> v.vname
+            in
+            let is_direct_call_target () =
+              match ufcs_target with
+              | Some (target_module, target_name) ->
+                  is_direct_ufcs_function reg target_module target_name args
+              | None ->
+                  is_direct_imported_function reg module_path callee v.vname
+                    args
+                  || is_local_direct_function reg module_path v.vname args
+            in
             let try_static_self_dispatch () =
               match args with
               | [] -> (
-                  if
-                    is_direct_imported_function reg module_path callee v.vname
-                      args
-                    || is_local_direct_function reg module_path v.vname args
-                  then e
+                  if is_direct_call_target () then e
                   else
-                    match static_self_return_type_name reg v.vname e.ty with
+                    match static_self_return_type_name reg method_name e.ty with
                     | Some type_name -> (
                         match
-                          Hashtbl.find_opt reg.impls (v.vname, type_name)
+                          Hashtbl.find_opt reg.impls (method_name, type_name)
                         with
                         | Some mangled ->
                             let callee' =
@@ -576,25 +594,22 @@ let rec resolve_expr (reg : registry) (module_path : string option)
                         | None ->
                             let has_other_impls =
                               match
-                                Hashtbl.find_opt reg.impls_by_method v.vname
+                                Hashtbl.find_opt reg.impls_by_method method_name
                               with
                               | Some (_ :: _) -> true
                               | _ -> false
                             in
                             if
                               has_other_impls
-                              && Codegen_builtins.lookup "" v.vname = None
-                            then error_no_impl reg e.loc v.vname type_name
+                              && Codegen_builtins.lookup "" method_name = None
+                            then error_no_impl reg e.loc method_name type_name
                             else e)
                     | None -> e)
               | _ -> e
             in
             match first_arg_type_name args with
             | Some type_name -> (
-                if
-                  is_direct_imported_function reg module_path callee v.vname
-                    args
-                then e
+                if is_direct_call_target () then e
                 else
                   (* Surgical shadow guard: a top-level [CDFunc] with the
                      same bare name shadows this call only if its
@@ -604,18 +619,25 @@ let rec resolve_expr (reg : registry) (module_path : string option)
                      [to_string(JsonValue)]) route through the impl
                      registry uniformly. *)
                   let shadowed_here =
-                    match Hashtbl.find_opt reg.shadowed_names v.vname with
-                    | Some heads -> (
-                        List.mem type_name heads
-                        ||
-                        match first_arg_type_head args with
-                        | Some head -> List.mem head heads
+                    match ufcs_target with
+                    | Some _ -> false
+                    | None -> (
+                        match
+                          Hashtbl.find_opt reg.shadowed_names method_name
+                        with
+                        | Some heads -> (
+                            List.mem type_name heads
+                            ||
+                            match first_arg_type_head args with
+                            | Some head -> List.mem head heads
+                            | None -> false)
                         | None -> false)
-                    | None -> false
                   in
                   if shadowed_here then e
                   else
-                    match Hashtbl.find_opt reg.impls (v.vname, type_name) with
+                    match
+                      Hashtbl.find_opt reg.impls (method_name, type_name)
+                    with
                     | Some mangled ->
                         (* Self-recursion guard: the stdlib pattern
                             [implements Stringable for Int:
@@ -646,20 +668,20 @@ let rec resolve_expr (reg : registry) (module_path : string option)
                           section for why. *)
                         let has_other_impls =
                           match
-                            Hashtbl.find_opt reg.impls_by_method v.vname
+                            Hashtbl.find_opt reg.impls_by_method method_name
                           with
                           | Some (_ :: _) -> true
                           | _ -> false
                         in
                         if
                           has_other_impls
-                          && Hashtbl.mem reg.trait_methods v.vname
-                          && Codegen_builtins.lookup "" v.vname = None
+                          && Hashtbl.mem reg.trait_methods method_name
+                          && Codegen_builtins.lookup "" method_name = None
                           && not
                                (match args with
                                | first :: _ -> has_operator_fast_path first.ty
                                | [] -> false)
-                        then error_no_impl reg e.loc v.vname type_name
+                        then error_no_impl reg e.loc method_name type_name
                         else e)
             | None -> try_static_self_dispatch ())
       | _ -> e)

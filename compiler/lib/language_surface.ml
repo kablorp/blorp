@@ -73,6 +73,11 @@ let prelude_method_type_imports =
     ("range", "Range");
     ("dict", "Dict");
     ("set", "Set");
+    ("file", "FileReader");
+    ("file", "FileWriter");
+    ("file", "FileAppender");
+    ("file", "FileReadWriter");
+    ("file", "FileReadAppender");
   ]
 
 let prelude_ufcs_modules =

@@ -576,6 +576,9 @@ val get_overloads : env -> string -> overload_entry list
 val find_overload_by_def_id : env -> def_id -> overload_entry option
 (** Find a registered overload by its canonical def id. *)
 
+val find_ufcs_method_by_def_id : env -> def_id -> overload_entry option
+(** Find a registered method-only UFCS overload by its canonical def id. *)
+
 val resolve_overload : env -> string -> type_expr -> overload_entry option
 (** Resolve an overloaded function name given the first argument's type *)
 
