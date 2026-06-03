@@ -13351,35 +13351,6 @@ blorp_TcpListenerResult blorp_tcp_listen_raw(
         blorp_tcp_listen(host, port, backlog));
 }
 
-blorp_TcpListenerResult blorp_tcp_listen_numeric_raw(
-    blorp_String* host,
-    long port,
-    long backlog
-) {
-    if (!blorp_tcp_host_value_is_valid(host)) {
-        return blorp_tcp_listener_result_error(
-            BLORP_TCP_ERROR_INVALID_INPUT,
-            "host must be shorter than 256 bytes");
-    }
-    if (!blorp_tcp_listener_host_avoids_dns(host)) {
-        return blorp_tcp_listener_result_error(
-            BLORP_TCP_ERROR_INVALID_INPUT,
-            "host must be a numeric IPv4 address or empty bind-any host");
-    }
-    if (port < 0 || port > 65535) {
-        return blorp_tcp_listener_result_error(
-            BLORP_TCP_ERROR_INVALID_INPUT,
-            "port must be between 0 and 65535");
-    }
-    if (backlog < 0 || backlog > INT_MAX) {
-        return blorp_tcp_listener_result_error(
-            BLORP_TCP_ERROR_INVALID_INPUT,
-            "backlog must be between 0 and 2147483647");
-    }
-    return blorp_tcp_listener_result_from_boxed(
-        blorp_tcp_listen(host, port, backlog));
-}
-
 blorp_TcpStreamResult blorp_tcp_accept_raw(blorp_TcpListener* listener) {
     return blorp_tcp_stream_result_from_boxed(blorp_tcp_accept(listener));
 }
@@ -13458,25 +13429,6 @@ blorp_TcpStreamResult blorp_tcp_connect_raw(blorp_String* host, long port) {
         return blorp_tcp_stream_result_error(
             BLORP_TCP_ERROR_INVALID_INPUT,
             "host must be shorter than 256 bytes");
-    }
-    if (port < 0 || port > 65535) {
-        return blorp_tcp_stream_result_error(
-            BLORP_TCP_ERROR_INVALID_INPUT,
-            "port must be between 0 and 65535");
-    }
-    return blorp_tcp_stream_result_from_boxed(blorp_tcp_connect(host, port));
-}
-
-blorp_TcpStreamResult blorp_tcp_connect_numeric_raw(blorp_String* host, long port) {
-    if (!blorp_tcp_host_value_is_valid(host)) {
-        return blorp_tcp_stream_result_error(
-            BLORP_TCP_ERROR_INVALID_INPUT,
-            "host must be shorter than 256 bytes");
-    }
-    if (!blorp_tcp_host_string_is_numeric(host, AF_INET)) {
-        return blorp_tcp_stream_result_error(
-            BLORP_TCP_ERROR_INVALID_INPUT,
-            "host must be a numeric IPv4 address");
     }
     if (port < 0 || port > 65535) {
         return blorp_tcp_stream_result_error(

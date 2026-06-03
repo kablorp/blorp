@@ -48,9 +48,20 @@ resource type TcpStream = builtin("blorp_tcp_close_stream")
 Public TCP operations now use typed errors and scoped handles:
 
 ```blorp
-listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
+port(value: Int) -> Result[Port, TcpError]
+ipv4(a: UInt8, b: UInt8, c: UInt8, d: UInt8) -> IpAddress
+parse_ip(text: String) -> Result[IpAddress, TcpError]
+dns_name(text: String) -> Result[DnsName, TcpError]
+listen_loopback(family: IpFamily, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+listen_loopback_any_port(family: IpFamily, backlog: Int) -> Result[TcpListener, TcpError]
+listen_any_interface(family: IpFamily, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+listen_any_interface_any_port(family: IpFamily, backlog: Int) -> Result[TcpListener, TcpError]
+listen_ip(address: IpAddress, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+listen_ip_any_port(address: IpAddress, backlog: Int) -> Result[TcpListener, TcpError]
 accept(listener: TcpListener) -> Result[TcpStream, TcpError]
-connect(host: String, port: Int) -> Result[TcpStream, TcpError]
+connect_loopback(family: IpFamily, port: Port) -> Result[TcpStream, TcpError]
+connect_ip(address: IpAddress, port: Port) -> Result[TcpStream, TcpError]
+connect_name(name: DnsName, port: Port) -> Result[TcpStream, TcpError]
 read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
 chunks(stream: TcpStream, max_bytes: Int) -> FallibleStream[Bytes, TcpError]
 lines(stream: TcpStream) -> FallibleStream[String, TcpError]
@@ -60,7 +71,8 @@ write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]
 
 Landed behavior:
 
-- `with listener ?= listen(...):` and `with stream ?= connect(...):` install
+- `with listener ?= listen_loopback/listen_any_interface/listen_ip(...):` and
+  `with stream ?= connect_loopback/connect_ip/connect_name(...):` install
   cleanup through Core `CResourceScope`.
 - TCP manual `close` is private; public code cannot import and call it.
 - Numeric-address `accept`, `connect`, `read`, and `write` park fibers through
@@ -133,7 +145,9 @@ Use `resource type` for capabilities with a single cleanup owner:
 Resource APIs should be acquired with `with`:
 
 ```blorp
-with stream ?= tcp.connect(host, port):
+remote ?= tcp.port(port_num)
+name ?= tcp.dns_name(host)
+with stream ?= tcp.connect_name(name, remote):
 	data ?= stream.read_chunk(4096)
 	Ok(data.length())
 ```
@@ -223,13 +237,14 @@ or returned from ordinary user functions.
 ```blorp
 import:
 	net/http as HTTP: Request, Response
-	net/tcp as TCP: TcpError
+	net/tcp as TCP: IpFamily(IPv4), TcpError
 
 pure func route(req: Request) -> Response:
 	HTTP.ok_text("handled " + req.path)
 
 func serve() -> Result[Void, TcpError]:
-	with listener ?= TCP.listen("", 8080, 1024):
+	http_port ?= TCP.port(8080)
+	with listener ?= TCP.listen_any_interface(IPv4, http_port, 1024):
 		ignored ?= TCP.set_timeout(listener, 1000)
 		for conn in TCP.connections_continue_on_error(listener) concurrently(limit: 4096):
 			match TCP.read_chunk(conn, 8192):
@@ -254,8 +269,10 @@ operations while application routing stays easy to factor and test.
 ### TCP Client Streaming
 
 ```blorp
-func download(host: String, port: Int) -> Result[Int, TcpError]:
-	with stream ?= tcp.connect(host, port):
+func download(host: String, port_num: Int) -> Result[Int, TcpError]:
+	remote ?= tcp.port(port_num)
+	name ?= tcp.dns_name(host)
+	with stream ?= tcp.connect_name(name, remote):
 		stream
 			.chunks(16 * 1024)
 			.fold_result(0, func(total, chunk): Ok(total + chunk.length()))
@@ -266,7 +283,9 @@ This requires TCP chunk adapters over a scoped stream.
 ### TLS
 
 ```blorp
-with tcp_stream ?= tcp.connect(host, 443):
+remote ?= tcp.port(443)
+name ?= tcp.dns_name(host)
+with tcp_stream ?= tcp.connect_name(name, remote):
 	with tls ?= tls.connect(tcp_stream, host):
 		_ ?= tls.write_all(request)
 		tls.chunks(16 * 1024).collect_result()
@@ -327,7 +346,9 @@ Nested TLS acquisition can now map acquisition errors at the `with ?=`
 boundary:
 
 ```blorp
-with stream ?= tcp.connect(host, 443) on err => Transport(tcp.message(err)):
+remote ?= tcp.port(443)
+name ?= tcp.dns_name(host)
+with stream ?= tcp.connect_name(name, remote) on err => Transport(tcp.message(err)):
 	with session ?= tls.connect(stream, host):
 		...
 ```
@@ -385,11 +406,10 @@ names are separated at the type level: use `ipv4(...)`/`parse_ip(...)` for
 numeric endpoints and `dns_name(...)` for name resolution. Listener helpers now
 distinguish loopback, any-interface, validated IP, and scoped IPv6-IP binds.
 Connection helpers distinguish loopback, validated IP, scoped IPv6-IP, and DNS
-name connects. The older raw `listen`/`connect` and `listen_numeric`/
-`connect_numeric` forms remain available as compatibility surfaces while
-tests/docs migrate, but they should not be treated as the preferred API for new
-code. Once a socket exists, readiness waits still park the current virtual
-thread through the reactor.
+name connects. The older string/int TCP entry points have been removed from the
+public Blorp API; raw C helpers that remain in the runtime are internal
+implementation details for the typed surface. Once a socket exists, readiness
+waits still park the current virtual thread through the reactor.
 
 Open ergonomic gap: many user inputs are generic host strings that may be DNS
 names, IPv4 literals, IPv6 literals, or scoped IPv6 literals. The current typed
@@ -535,7 +555,8 @@ out of the cursor.
 ### Event Systems And Games
 
 ```blorp
-with server ?= game.listen("", 7777):
+game_port ?= game.port(7777)
+with server ?= game.listen_any_interface(game_port):
 	for session in server.sessions() concurrently(limit: 10000):
 		run_session(session)
 ```
@@ -1105,9 +1126,9 @@ Goals:
   package-FFI-backed.
 - Keep no-DNS TCP paths explicit and tested. The preferred surface now uses
   validated endpoint values: `ipv4(...)`/`parse_ip(...)` feed `listen_ip` and
-  `connect_ip`, while `dns_name(...)` feeds `connect_name`. The older
-  `listen_numeric(host, port, backlog)` and `connect_numeric(host, port)`
-  remain as compatibility helpers until the remaining tests/docs are migrated.
+  `connect_ip`, while `dns_name(...)` feeds `connect_name`. Loopback and
+  any-interface helpers cover the common local bind/connect cases without
+  passing magic host strings.
 - Replace the current blocking std DNS backend with a bounded runtime resolver
   pool unless a true nonblocking resolver is available on all target platforms.
 - Defer user-configurable resolver pool handles until Blorp has an explicit

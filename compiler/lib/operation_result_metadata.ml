@@ -661,12 +661,6 @@ let result_bridges =
   [
     dns_bridge "blorp_dns_resolve_raw" "blorp_DnsAddressesResult"
       dns_addresses_payload [ ArgBorrow ];
-    tcp_bridge "blorp_tcp_listen_raw" "blorp_TcpListenerResult"
-      tcp_listener_payload
-      [ ArgBorrow; ArgBorrow; ArgBorrow ];
-    tcp_bridge "blorp_tcp_listen_numeric_raw" "blorp_TcpListenerResult"
-      tcp_listener_payload
-      [ ArgBorrow; ArgBorrow; ArgBorrow ];
     tcp_bridge "blorp_tcp_listen_loopback_raw" "blorp_TcpListenerResult"
       tcp_listener_payload
       [ ArgBorrow; ArgBorrow; ArgBorrow ];
@@ -690,10 +684,6 @@ let result_bridges =
       [ ArgBorrow; ArgBorrow; ArgBorrow ];
     tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_accept_raw"
       "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow ];
-    tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_raw"
-      "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow; ArgBorrow ];
-    tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_numeric_raw"
-      "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow; ArgBorrow ];
     tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_loopback_raw"
       "blorp_TcpStreamResult" tcp_stream_payload [ ArgBorrow; ArgBorrow ];
     tcp_bridge ~wait_behavior:ParksFiber "blorp_tcp_connect_ip_raw"

@@ -6,6 +6,18 @@ import:
 	net/url as U: effective_port, is_https
 
 
+private func tcp_port_for_message(port_num: Int, context: String) -> Result[TCP.Port, String]:
+	match TCP.port(port_num):
+		Ok(remote): Ok(remote)
+		Err(err): Err(context + ": " + TCP.message(err))
+
+
+private func tcp_dns_name_for_message(host: String, context: String) -> Result[TCP.DnsName, String]:
+	match TCP.dns_name(host):
+		Ok(name): Ok(name)
+		Err(err): Err(context + ": " + TCP.message(err))
+
+
 ---
 Make an HTTP GET request to the given URL.
 
@@ -16,12 +28,7 @@ doctests:
         Err(_): True
 ---
 func http_get(url: String) -> Result[Response, String]:
-	request(
-		"GET",
-		url,
-		[],
-		None,
-	)
+	request("GET", url, [], None)
 
 
 ---
@@ -33,12 +40,7 @@ func http_post(url: String, body: String, content_type: String) -> Result[Respon
 		value = content_type
 	}
 	hdrs: List[Header] = [ct_header]
-	request(
-		"POST",
-		url,
-		hdrs,
-		Some(body),
-	)
+	request("POST", url, hdrs, Some(body))
 
 
 ---
@@ -51,13 +53,7 @@ func request(
 	headers: List[Header],
 	body: Option[String],
 ) -> Result[Response, String]:
-	request_with_redirects(
-		method,
-		url,
-		headers,
-		body,
-		0,
-	)
+	request_with_redirects(method, url, headers, body, 0)
 
 
 private func request_with_redirects(
@@ -70,12 +66,7 @@ private func request_with_redirects(
 	if redirect_count > 10:
 		Err("too many redirects")
 	else:
-		match do_request(
-			method,
-			url,
-			headers,
-			body,
-		):
+		match do_request(method, url, headers, body):
 			Ok(resp):
 				if resp.status_code >= 300 and resp.status_code < 400:
 					match get_header(resp.headers, "Location"):
@@ -208,37 +199,77 @@ private func tls_request_bytes(
 	port: Int,
 	request_data: Bytes,
 ) -> Result[Bytes, String]:
-	with stream ?= TCP.connect(
-		host,
-		port,
-	) on err => "HTTPS TCP connect failed: " + TCP.message(err):
-		with session ?= TLS.connect(
-			stream,
-			host,
-		) on err => "HTTPS requires TLS resource support: " + TLS.message(err):
-			var write_error: Option[String] = None
-			match TLS.write_all(session, request_data):
-				Ok(_): void
-				Err(e): write_error = Some("HTTPS TLS write failed: " + TLS.message(e))
-			match write_error:
-				Some(e): Err(e)
-				None:
-					var buf: Bytes = B.bytes(0)
-					var done: Bool = False
-					var read_error: Option[String] = None
-					while not done:
-						match TLS.read(session, 8192):
-							Ok(chunk):
-								if B.length(chunk) == 0:
-									done = True
-								else:
-									buf = B.append(buf, chunk)
-							Err(e):
-								read_error = Some("HTTPS TLS read failed: " + TLS.message(e))
-								done = True
-					match read_error:
+	remote ?= tcp_port_for_message(port, "HTTPS TCP connect failed")
+	match TCP.parse_ip(host):
+		Ok(address):
+			with stream ?= TCP.connect_ip(
+				address,
+				remote,
+			) on err => "HTTPS TCP connect failed: " + TCP.message(err):
+				with session ?= TLS.connect(
+					stream,
+					host,
+				) on err => "HTTPS requires TLS resource support: " + TLS.message(err):
+					var write_error: Option[String] = None
+					match TLS.write_all(session, request_data):
+						Ok(_): void
+						Err(e): write_error = Some("HTTPS TLS write failed: " + TLS.message(e))
+					match write_error:
 						Some(e): Err(e)
-						None: Ok(buf)
+						None:
+							var buf: Bytes = B.bytes(0)
+							var done: Bool = False
+							var read_error: Option[String] = None
+							while not done:
+								match TLS.read(session, 8192):
+									Ok(chunk):
+										if B.length(chunk) == 0:
+											done = True
+										else:
+											buf = B.append(buf, chunk)
+									Err(e):
+										read_error = Some(
+											"HTTPS TLS read failed: " + TLS.message(e),
+										)
+										done = True
+							match read_error:
+								Some(e): Err(e)
+								None: Ok(buf)
+		Err(_):
+			name ?= tcp_dns_name_for_message(host, "HTTPS TCP connect failed")
+			with stream ?= TCP.connect_name(
+				name,
+				remote,
+			) on err => "HTTPS TCP connect failed: " + TCP.message(err):
+				with session ?= TLS.connect(
+					stream,
+					host,
+				) on err => "HTTPS requires TLS resource support: " + TLS.message(err):
+					var write_error: Option[String] = None
+					match TLS.write_all(session, request_data):
+						Ok(_): void
+						Err(e): write_error = Some("HTTPS TLS write failed: " + TLS.message(e))
+					match write_error:
+						Some(e): Err(e)
+						None:
+							var buf: Bytes = B.bytes(0)
+							var done: Bool = False
+							var read_error: Option[String] = None
+							while not done:
+								match TLS.read(session, 8192):
+									Ok(chunk):
+										if B.length(chunk) == 0:
+											done = True
+										else:
+											buf = B.append(buf, chunk)
+									Err(e):
+										read_error = Some(
+											"HTTPS TLS read failed: " + TLS.message(e),
+										)
+										done = True
+							match read_error:
+								Some(e): Err(e)
+								None: Ok(buf)
 
 
 private func tcp_request_bytes(
@@ -246,30 +277,59 @@ private func tcp_request_bytes(
 	port: Int,
 	request_data: Bytes,
 ) -> Result[Bytes, TCP.TcpError]:
-	with stream ?= TCP.connect(host, port):
-		var write_error: Option[TCP.TcpError] = None
-		match TCP.write_all(stream, request_data):
-			Ok(_): void
-			Err(e): write_error = Some(e)
-		match write_error:
-			Some(e): Err(e)
-			None:
-				var buf: Bytes = B.bytes(0)
-				var done: Bool = False
-				var read_error: Option[TCP.TcpError] = None
-				while not done:
-					match TCP.read(stream, 8192):
-						Ok(chunk):
-							if B.length(chunk) == 0:
-								done = True
-							else:
-								buf = B.append(buf, chunk)
-						Err(e):
-							read_error = Some(e)
-							done = True
-				match read_error:
+	remote ?= TCP.port(port)
+	match TCP.parse_ip(host):
+		Ok(address):
+			with stream ?= TCP.connect_ip(address, remote):
+				var write_error: Option[TCP.TcpError] = None
+				match TCP.write_all(stream, request_data):
+					Ok(_): void
+					Err(e): write_error = Some(e)
+				match write_error:
 					Some(e): Err(e)
-					None: Ok(buf)
+					None:
+						var buf: Bytes = B.bytes(0)
+						var done: Bool = False
+						var read_error: Option[TCP.TcpError] = None
+						while not done:
+							match TCP.read(stream, 8192):
+								Ok(chunk):
+									if B.length(chunk) == 0:
+										done = True
+									else:
+										buf = B.append(buf, chunk)
+								Err(e):
+									read_error = Some(e)
+									done = True
+						match read_error:
+							Some(e): Err(e)
+							None: Ok(buf)
+		Err(_):
+			name ?= TCP.dns_name(host)
+			with stream ?= TCP.connect_name(name, remote):
+				var write_error: Option[TCP.TcpError] = None
+				match TCP.write_all(stream, request_data):
+					Ok(_): void
+					Err(e): write_error = Some(e)
+				match write_error:
+					Some(e): Err(e)
+					None:
+						var buf: Bytes = B.bytes(0)
+						var done: Bool = False
+						var read_error: Option[TCP.TcpError] = None
+						while not done:
+							match TCP.read(stream, 8192):
+								Ok(chunk):
+									if B.length(chunk) == 0:
+										done = True
+									else:
+										buf = B.append(buf, chunk)
+								Err(e):
+									read_error = Some(e)
+									done = True
+						match read_error:
+							Some(e): Err(e)
+							None: Ok(buf)
 
 
 private func parse_http_response(raw: Bytes) -> Result[Response, String]:

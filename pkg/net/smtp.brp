@@ -51,6 +51,18 @@ private union SmtpOutcome:
 	SmtpProtocolError(String)
 
 
+private func smtp_port_for_message(port_num: Int) -> Result[TCP.Port, String]:
+	match TCP.port(port_num):
+		Ok(remote): Ok(remote)
+		Err(err): Err("SMTP transport: " + TCP.message(err))
+
+
+private func smtp_dns_name_for_message(host: String) -> Result[TCP.DnsName, String]:
+	match TCP.dns_name(host):
+		Ok(name): Ok(name)
+		Err(err): Err("SMTP transport: " + TCP.message(err))
+
+
 -- ============================================================================
 -- Public API
 -- ============================================================================
@@ -116,7 +128,79 @@ private func smtp_plain_tcp_session(
 	to: String,
 	message: String,
 ) -> Result[SmtpOutcome, TCP.TcpError]:
-	with stream ?= TCP.connect(config.host, config.port):
+	remote ?= TCP.port(config.port)
+	match TCP.parse_ip(config.host):
+		Ok(address): smtp_plain_tcp_session_ip(config, to, message, address, remote)
+		Err(_):
+			name ?= TCP.dns_name(config.host)
+			smtp_plain_tcp_session_name(config, to, message, name, remote)
+
+
+private func smtp_plain_tcp_session_ip(
+	config: Config,
+	to: String,
+	message: String,
+	address: TCP.IpAddress,
+	remote: TCP.Port,
+) -> Result[SmtpOutcome, TCP.TcpError]:
+	with stream ?= TCP.connect_ip(address, remote):
+		ignored ?= TCP.set_stream_timeout(stream, 10000)
+		steps: List[(String, String, String)] = smtp_steps(config, to, message)
+		var outcome: SmtpOutcome = SmtpSent
+		var failed: Bool = False
+		var transport_error: Option[TCP.TcpError] = None
+		for step in steps:
+			if not failed:
+				command: String = step[0]
+				expect_prefix: String = step[1]
+				label: String = step[2]
+				if command.length() > 0:
+					match TCP.write_all(stream, command.to_bytes()):
+						Ok(_): void
+						Err(err):
+							transport_error = Some(err)
+							failed = True
+				if not failed:
+					var buf: Bytes = B.bytes(0)
+					var done: Bool = False
+					while not done and not failed:
+						match TCP.read(stream, 4096):
+							Ok(chunk):
+								if B.length(chunk) == 0:
+									done = True
+								else:
+									buf = B.append(buf, chunk)
+									response_so_far: String = B.to_string(buf)
+									if response_so_far.contains("\r\n"):
+										done = True
+							Err(err):
+								transport_error = Some(err)
+								done = True
+								failed = True
+					if not failed:
+						response: String = B.to_string(buf)
+						if not response.starts_with(expect_prefix):
+							outcome = SmtpProtocolError(
+								label + ": expected " + expect_prefix + ", got: " + response,
+							)
+							failed = True
+		if not failed:
+			match TCP.write_all(stream, "QUIT\r\n".to_bytes()):
+				Ok(_): void
+				Err(_): void
+		match transport_error:
+			Some(err): Err(err)
+			None: Ok(outcome)
+
+
+private func smtp_plain_tcp_session_name(
+	config: Config,
+	to: String,
+	message: String,
+	name: TCP.DnsName,
+	remote: TCP.Port,
+) -> Result[SmtpOutcome, TCP.TcpError]:
+	with stream ?= TCP.connect_name(name, remote):
 		ignored ?= TCP.set_stream_timeout(stream, 10000)
 		steps: List[(String, String, String)] = smtp_steps(config, to, message)
 		var outcome: SmtpOutcome = SmtpSent
@@ -171,10 +255,150 @@ private func smtp_starttls_session(
 	to: String,
 	message: String,
 ) -> Result[SmtpOutcome, String]:
-	with stream ?= TCP.connect(
-		config.host,
-		config.port,
-	) on err => "SMTP transport: " + TCP.message(err):
+	remote ?= smtp_port_for_message(config.port)
+	match TCP.parse_ip(config.host):
+		Ok(address): smtp_starttls_session_ip(config, to, message, address, remote)
+		Err(_):
+			name ?= smtp_dns_name_for_message(config.host)
+			smtp_starttls_session_name(config, to, message, name, remote)
+
+
+private func smtp_starttls_session_ip(
+	config: Config,
+	to: String,
+	message: String,
+	address: TCP.IpAddress,
+	remote: TCP.Port,
+) -> Result[SmtpOutcome, String]:
+	with stream ?= TCP.connect_ip(address, remote) on err => "SMTP transport: " + TCP.message(err):
+		var setup_error: Option[String] = None
+		match TCP.set_stream_timeout(stream, 10000):
+			Ok(_): void
+			Err(err): setup_error = Some("SMTP transport: " + TCP.message(err))
+		match setup_error:
+			Some(err): Err(err)
+			None:
+				pre_tls_steps: List[(String, String, String)] = smtp_starttls_preamble_steps()
+				var outcome: SmtpOutcome = SmtpSent
+				var failed: Bool = False
+				var transport_error: Option[String] = None
+				for step in pre_tls_steps:
+					if not failed:
+						command: String = step[0]
+						expect_prefix: String = step[1]
+						label: String = step[2]
+						if command.length() > 0:
+							match TCP.write_all(stream, command.to_bytes()):
+								Ok(_): void
+								Err(err):
+									transport_error = Some("SMTP transport: " + TCP.message(err))
+									failed = True
+						if not failed:
+							var buf: Bytes = B.bytes(0)
+							var done: Bool = False
+							while not done and not failed:
+								match TCP.read(stream, 4096):
+									Ok(chunk):
+										if B.length(chunk) == 0:
+											done = True
+										else:
+											buf = B.append(buf, chunk)
+											response_so_far: String = B.to_string(buf)
+											if response_so_far.contains("\r\n"):
+												done = True
+									Err(err):
+										transport_error = Some(
+											"SMTP transport: " + TCP.message(err),
+										)
+										done = True
+										failed = True
+							if not failed:
+								response: String = B.to_string(buf)
+								if not response.starts_with(expect_prefix):
+									outcome = SmtpProtocolError(
+										label + ": expected " + expect_prefix + ", got: " + response,
+									)
+									failed = True
+				match transport_error:
+					Some(err): Err(err)
+					None:
+						if failed:
+							Ok(outcome)
+						else:
+							with session ?= TLS.connect(
+								stream,
+								config.host,
+							) on err => "SMTP STARTTLS requires TLS resource support: " + TLS.message(
+								err,
+							):
+								tls_steps: List[(String, String, String)] = smtp_tls_steps(
+									config,
+									to,
+									message,
+								)
+								var tls_outcome: SmtpOutcome = SmtpSent
+								var tls_failed: Bool = False
+								var tls_error: Option[String] = None
+								for step in tls_steps:
+									if not tls_failed:
+										command: String = step[0]
+										expect_prefix: String = step[1]
+										label: String = step[2]
+										if command.length() > 0:
+											match TLS.write_all(session, command.to_bytes()):
+												Ok(_): void
+												Err(err):
+													tls_error = Some(
+														"SMTP TLS transport: " + TLS.message(err),
+													)
+													tls_failed = True
+										if not tls_failed:
+											var buf: Bytes = B.bytes(0)
+											var done: Bool = False
+											while not done and not tls_failed:
+												match TLS.read(session, 4096):
+													Ok(chunk):
+														if B.length(chunk) == 0:
+															done = True
+														else:
+															buf = B.append(buf, chunk)
+															response_so_far: String = B.to_string(
+																buf,
+															)
+															if response_so_far.contains("\r\n"):
+																done = True
+													Err(err):
+														tls_error = Some(
+															"SMTP TLS transport: " + TLS.message(
+																err,
+															),
+														)
+														done = True
+														tls_failed = True
+											if not tls_failed:
+												response: String = B.to_string(buf)
+												if not response.starts_with(expect_prefix):
+													tls_outcome = SmtpProtocolError(
+														label + ": expected " + expect_prefix + ", got: " + response,
+													)
+													tls_failed = True
+								if not tls_failed:
+									match TLS.write_all(session, "QUIT\r\n".to_bytes()):
+										Ok(_): void
+										Err(_): void
+								match tls_error:
+									Some(err): Err(err)
+									None: Ok(tls_outcome)
+
+
+private func smtp_starttls_session_name(
+	config: Config,
+	to: String,
+	message: String,
+	name: TCP.DnsName,
+	remote: TCP.Port,
+) -> Result[SmtpOutcome, String]:
+	with stream ?= TCP.connect_name(name, remote) on err => "SMTP transport: " + TCP.message(err):
 		var setup_error: Option[String] = None
 		match TCP.set_stream_timeout(stream, 10000):
 			Ok(_): void

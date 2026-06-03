@@ -4629,7 +4629,9 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
   (* ---- Concurrency (expression/Core helper context) ---- *)
   | CConcurrent block ->
       emit ctx "({ ";
-      emit_concurrent_block ctx block;
+      emit_concurrent_block ctx block ~emit_tail:(fun ctx tail ->
+          emit_expr ctx tail;
+          emit ctx ";");
       emit ctx " })"
   | CConcurrentlyLoop cf ->
       emit ctx "({ ";
@@ -5058,7 +5060,7 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
      so emission produces proper sequential statements rather than
      wrapping them in GCC statement-expressions. *)
   (* ---- Concurrency (statement context) ---- *)
-  | CConcurrent block -> emit_concurrent_block ctx block
+  | CConcurrent block -> emit_concurrent_block ctx block ~emit_tail:emit_stmt
   | CConcurrentlyLoop cf -> emit_concurrently_loop ctx cf
   | CDetach detach -> emit_detach_stmt ctx detach e.loc
   | CSelect select -> emit_select ctx select
@@ -7715,7 +7717,7 @@ and emit_concurrent_limit_init (ctx : Core_emit_context.t) limit_c limit_expr :
     return type), which drives the spawned lambda's return type and the
     RC classification of what the task stores. *)
 and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
-    : unit =
+    ~(emit_tail : Core_emit_context.t -> core -> unit) : unit =
   (match block.conc_max_threads with
   | Some n -> emit_line ctx (Printf.sprintf "blorp_thread_pool_init(%d);" n)
   | None -> ());
@@ -7799,8 +7801,10 @@ and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
         emit_line ctx
           (Printf.sprintf "blorp_release((blorp_Object*)%s);" task_tmp))
       task_infos;
-  (* Tail body *)
-  emit_stmt ctx block.conc_body
+  (* Expression-position concurrent blocks must leave the tail value as the
+     GNU statement-expression result; statement-position concurrent blocks
+     intentionally discard it. *)
+  emit_tail ctx block.conc_body
 
 (** Emit [detach expr] in statement context. *)
 and emit_detach_stmt (ctx : Core_emit_context.t) (detach : detach_expr)

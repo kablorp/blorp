@@ -1,0 +1,301 @@
+import:
+	bytes as B
+	channel: yield_now
+	file: message, open_read_write, read_chunk_rw, write_text_rw
+	memory: get_mem_stats
+	system: file_size, mkdir, remove_dir, remove_file, write_file
+	test: TestSuite
+
+
+pure func bounded_read_chunk_size(file_size_bytes: Int) -> Int:
+	if file_size_bytes <= 0:
+		1
+	else if file_size_bytes < 1048576:
+		file_size_bytes
+	else:
+		1048576
+
+
+func read_chunk_size_for_file(file_path: String) -> Int:
+	match file_path.file_size():
+		Ok(size): bounded_read_chunk_size(size)
+		Err(_): 65536
+
+
+pure func chunk_last_byte(chunk: Bytes) -> Option[Int]:
+	chunk_len: Int = B.length(chunk)
+	if chunk_len == 0:
+		None
+	else:
+		B.get(chunk, chunk_len - 1)
+
+
+func add_final_newline_if_needed(file_path: String) -> Result[Bool, String]:
+	with file ?= open_read_write(
+		file_path,
+	) on err => "failed to open " + file_path + ": " + message(err):
+		chunk_size: Int = read_chunk_size_for_file(file_path)
+		var saw_content: Bool = False
+		var last_byte: Int = 0
+		var done: Bool = False
+		var read_error: Option[String] = None
+		while not done:
+			match file.read_chunk_rw(chunk_size):
+				Ok(chunk):
+					if B.length(chunk) == 0:
+						done = True
+					else:
+						saw_content = True
+						match chunk_last_byte(chunk):
+							Some(byte):
+								last_byte = byte
+							None:
+								done = True
+				Err(err):
+					read_error = Some("failed to read " + file_path + ": " + message(err))
+					done = True
+		match read_error:
+			Some(msg): Err(msg)
+			None:
+				if not saw_content or last_byte != 10:
+					match file.write_text_rw("\n"):
+						Ok(_): Ok(True)
+						Err(err): Err(
+							"failed to append newline to " + file_path + ": " + message(err),
+						)
+				else:
+					Ok(False)
+
+
+func make_job(i: Int) -> String:
+	"job-" + i.to_string()
+
+
+func detached_string_producer(jobs: Channel[String], done: Channel[Int], count: Int) -> Void:
+	var i: Int = 0
+	while i < count:
+		if send(jobs, make_job(i)):
+			i += 1
+		else:
+			i = count
+	seal(jobs)
+	_ = send(done, count)
+
+
+func drain_on_current_fiber(jobs: Channel[String]) -> Int:
+	var seen: Int = 0
+	for job in jobs:
+		if job.length() > 0:
+			seen += 1
+	seen
+
+
+func detached_worker(jobs: Channel[String], done: Channel[Int]) -> Void:
+	var seen: Int = 0
+	for job in jobs:
+		if job.length() > 0:
+			seen += 1
+	_ = send(done, seen)
+
+
+func detached_file_worker(jobs: Channel[String], done: Channel[Int]) -> Void:
+	var changed: Int = 0
+	var errors: Int = 0
+	for file_path in jobs:
+		yield_now()
+		match file_path.add_final_newline_if_needed():
+			Ok(was_changed):
+				if was_changed:
+					changed += 1
+			Err(_):
+				errors += 1
+		yield_now()
+	_ = send(done, changed * 1000 + errors)
+
+
+func recursively_seal_channel(ch: Channel[String], depth: Int) -> Void:
+	if depth <= 0:
+		seal(ch)
+	else:
+		recursively_seal_channel(ch, depth - 1)
+
+
+func detached_recursive_sealer(ch: Channel[String], done: Channel[Int]) -> Void:
+	_ = send(ch, "ready")
+	recursively_seal_channel(ch, 2)
+	_ = send(done, 1)
+
+
+func start_workers(count: Int, jobs: Channel[String], done: Channel[Int]) -> Void:
+	var i: Int = 0
+	while i < count:
+		detach detached_worker(jobs, done)
+		i += 1
+
+
+func start_file_workers(count: Int, jobs: Channel[String], done: Channel[Int]) -> Void:
+	var i: Int = 0
+	while i < count:
+		detach detached_file_worker(jobs, done)
+		i += 1
+
+
+func recv_int_or(ch: Channel[Int], fallback: Int) -> Int:
+	match recv_timeout(ch, 1000):
+		Some(value): value
+		None: fallback
+
+
+func wait_for_detached_cleanup() -> Void:
+	var attempts: Int = 0
+	var done: Bool = False
+	while attempts < 100 and not done:
+		yield_now()
+		done = get_mem_stats().current_objects == 0
+		attempts += 1
+
+
+func sum_worker_reports(done: Channel[Int], workers: Int) -> Int:
+	var total: Int = 0
+	var remaining: Int = workers
+	while remaining > 0:
+		match recv_timeout(done, 1000):
+			Some(value):
+				total += value
+				remaining -= 1
+			None:
+				total = -1
+				remaining = 0
+	total
+
+
+func clean_fixture(root: String) -> Void:
+	var i: Int = 0
+	while i < 16:
+		_ = remove_file(root + "/f" + i.to_string() + ".py")
+		i += 1
+	_ = remove_dir(root)
+
+
+func setup_fixture(root: String) -> Void:
+	clean_fixture(root)
+	_ = mkdir(root)
+	var i: Int = 0
+	while i < 16:
+		_ = write_file(root + "/f" + i.to_string() + ".py", "x")
+		i += 1
+
+
+func detached_file_producer(root: String, jobs: Channel[String], done: Channel[Int]) -> Void:
+	var i: Int = 0
+	while i < 16:
+		_ = send(jobs, root + "/f" + i.to_string() + ".py")
+		yield_now()
+		i += 1
+	seal(jobs)
+	_ = send(done, 1)
+
+
+func sum_file_worker_reports(done: Channel[Int], workers: Int) -> Int:
+	var changed: Int = 0
+	var errors: Int = 0
+	var remaining: Int = workers
+	while remaining > 0:
+		report: Int = recv_int_or(done, -1)
+		if report < 0:
+			errors += 1
+		else:
+			changed += report / 1000
+			errors += report % 1000
+		remaining -= 1
+	if errors > 0:
+		0 - errors
+	else:
+		changed
+
+
+func detached_producer_current_consumer_once(count: Int) -> Bool:
+	jobs: Channel[String] = channel(1)
+	producer_done: Channel[Int] = channel(1)
+	detach detached_string_producer(jobs, producer_done, count)
+	consumed: Int = drain_on_current_fiber(jobs)
+	produced: Int = recv_int_or(producer_done, -1)
+	consumed == count and produced == count
+
+
+func detached_multi_worker_once(workers: Int, count: Int) -> Bool:
+	jobs: Channel[String] = channel(2)
+	producer_done: Channel[Int] = channel(1)
+	worker_done: Channel[Int] = channel(workers)
+	start_workers(workers, jobs, worker_done)
+	detach detached_string_producer(jobs, producer_done, count)
+	total_consumed: Int = sum_worker_reports(worker_done, workers)
+	produced: Int = recv_int_or(producer_done, -1)
+	total_consumed == count and produced == count
+
+
+func detached_file_worker_once(round: Int) -> Bool:
+	root: String = "/tmp/__blorp_detached_file_worker_regression_" + round.to_string()
+	setup_fixture(root)
+	jobs: Channel[String] = channel(4)
+	producer_done: Channel[Int] = channel(1)
+	worker_done: Channel[Int] = channel(4)
+	detach detached_file_producer(root, jobs, producer_done)
+	start_file_workers(4, jobs, worker_done)
+	produced: Int = recv_int_or(producer_done, -1)
+	changed: Int = sum_file_worker_reports(worker_done, 4)
+	clean_fixture(root)
+	wait_for_detached_cleanup()
+	produced == 1 and changed == 16
+
+
+func test_detached_producer_current_consumer() -> Bool:
+	ok: Bool = detached_producer_current_consumer_once(64)
+	wait_for_detached_cleanup()
+	ok
+
+
+func test_detached_multi_worker_repeated() -> Bool:
+	var ok: Bool = True
+	var i: Int = 0
+	while i < 20:
+		ok = ok and detached_multi_worker_once(4, 80)
+		i += 1
+	ok
+
+
+func test_detached_file_worker_repeated() -> Bool:
+	var ok: Bool = True
+	var i: Int = 0
+	while i < 20:
+		ok = ok and detached_file_worker_once(i)
+		i += 1
+	ok
+
+
+func test_detached_capture_consumed_by_recursive_helper() -> Bool:
+	ch: Channel[String] = channel(2)
+	done: Channel[Int] = channel(1)
+	detach detached_recursive_sealer(ch, done)
+	got_ready: Bool = match recv_timeout(ch, 1000):
+		Some(value): value == "ready"
+		None: False
+	got_done: Bool = match recv_timeout(done, 1000):
+		Some(value): value == 1
+		None: False
+	got_seal: Bool = not send(ch, "after-seal")
+	got_ready and got_done and got_seal
+
+
+tests: TestSuite = {
+	description = "Detached channel fan-out regressions",
+	tests = [
+		("detached producer current consumer", test_detached_producer_current_consumer),
+		("detached multi worker repeated", test_detached_multi_worker_repeated),
+		("detached file worker repeated", test_detached_file_worker_repeated),
+		(
+			"detached capture consumed by recursive helper",
+			test_detached_capture_consumed_by_recursive_helper,
+		),
+	]
+}

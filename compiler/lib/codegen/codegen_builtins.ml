@@ -357,14 +357,11 @@ let builtin_c_mapping =
   (* DNS builtin -- compiler-owned operation returning ordinary copied data. *)
   @ [ ((N.mod_dns, "resolve"), "blorp_dns_resolve_raw") ]
   (* TCP builtins -- no prelude aliases. Public std/net/tcp functions expose
-     typed TcpError results, so direct builtin resolution must use the typed
-     raw runtime bridge rather than the legacy boxed-string helpers. *)
+     typed endpoint values and typed TcpError results, so direct builtin
+     resolution must use the typed raw runtime bridge rather than legacy
+     string/int host-port helpers. *)
   @ [
-      ((N.mod_tcp, "listen"), "blorp_tcp_listen_raw");
-      ((N.mod_tcp, "listen_numeric"), "blorp_tcp_listen_numeric_raw");
       ((N.mod_tcp, "accept"), "blorp_tcp_accept_raw");
-      ((N.mod_tcp, "connect"), "blorp_tcp_connect_raw");
-      ((N.mod_tcp, "connect_numeric"), "blorp_tcp_connect_numeric_raw");
       ((N.mod_tcp, "read"), "blorp_tcp_read_raw");
       ((N.mod_tcp, "chunks"), "blorp_tcp_chunks_raw");
       ((N.mod_tcp, "lines"), "blorp_tcp_lines_raw");
