@@ -2345,10 +2345,10 @@ Timeouts can also use typed `Duration` values from `units`:
 
 ```blorp
 import:
-    units: from_milliseconds
+    units: milliseconds
 
 func typed_timeout_example() -> Int:
-    concurrent(timeout: from_milliseconds(500)):
+    concurrent(timeout: milliseconds(500)):
         result = quick_computation()
     0
 ```
@@ -2389,10 +2389,10 @@ values:
 
 ```blorp
 import:
-    units: from_seconds
+    units: seconds
 
 func index_with_deadline(pages: List[Int]) -> Void:
-    for page in pages concurrently(limit: 4, timeout: from_seconds(2)):
+    for page in pages concurrently(limit: 4, timeout: seconds(2)):
         index_page(page)
 ```
 
@@ -2412,10 +2412,10 @@ deadline:
 
 ```blorp
 import:
-    units: from_seconds
+    units: seconds
 
 func square_all_with_deadline(nums: List[Int]) -> List[Result[Int, ConcurrencyError]]:
-    nums.concurrent_with_timeout(8, from_seconds(2), func(n: Int): compute_square(n))
+    nums.concurrent_with_timeout(8, seconds(2), func(n: Int): compute_square(n))
 ```
 
 The `limit` argument is the maximum number of active tasks. A computed value
@@ -2527,10 +2527,10 @@ Use `sleep_for` when the timeout is a typed `Duration` from `units`:
 ```blorp
 import:
     channel: sleep_for
-    units: from_milliseconds
+    units: milliseconds
 
 func typed_pause() -> Int:
-    sleep_for(from_milliseconds(1000))
+    sleep_for(milliseconds(1000))
     0
 ```
 
@@ -2540,8 +2540,8 @@ such as `sleep(Duration)` are intentionally deferred until source-level
 overloads for ordinary functions have a complete design.
 
 `Duration` values are integer microsecond intervals with arithmetic and
-ordering. Use constructors such as `microseconds`, `from_milliseconds`,
-`from_seconds`, `from_minutes`, `from_hours`, `from_days`, and `from_weeks`.
+ordering. Use constructors such as `microseconds`, `milliseconds`,
+`seconds`, `minutes`, `hours`, `days`, and `weeks`.
 Timeout APIs convert them through `to_timeout_milliseconds`, which rounds
 positive sub-millisecond durations up to one millisecond and treats
 non-positive durations as immediate polls. `concurrent(timeout: ...)` and
