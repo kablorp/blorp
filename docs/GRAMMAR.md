@@ -36,9 +36,9 @@ continues the previous expression instead of starting an indented block.
 func   pure   var   union   enum   record   struct   void
 while  for    in    if      else   and      or       not
 break  continue    match   import   as       private
-debug  resource     implements   trait   Self   type   alias
+debug  resource     implements   trait   Self   type   alias   opaque
 builtin    foreign      concurrent    concurrently    detach      where
-select     from         after         sealed
+select     from         after         sealed         into
 True   False
 ```
 
@@ -223,7 +223,8 @@ struct_decl = "struct" IDENT "{" field_list "}" ;
 field_list = [ field_decl { "," field_decl } [ "," ] ] ;
 field_decl = identifier ":" type_expr ;
 
-type_alias_decl = "type" "alias" IDENT [ type_params ] "=" type_expr ;
+type_alias_decl = "type" "alias" IDENT [ type_params ] "=" type_expr
+                | "opaque" "type" IDENT [ type_params ] "=" type_expr ;
 ```
 
 ### Import System
@@ -250,7 +251,7 @@ module_path = module_part { "/" module_part }
             | { "../" } module_part { "/" module_part } ;
 
 module_part = identifier ;
-identifier  = IDENT | "debug" | "with" | "concurrent" | "select" | "from" | "after" | "sealed" ;
+identifier  = IDENT | "debug" | "with" | "concurrent" | "select" | "after" | "sealed" ;
 ```
 
 **Semantic constraints:**
@@ -394,6 +395,8 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING
              | PIPE_STRING | RAW_PIPE_STRING
              | STRING_INTERP
              | CHAR | "True" | "False"
+             | "into" opaque_conversion_type "(" expr ")"
+             | "from" opaque_conversion_type "(" expr ")"
              | IDENT | "debug"
              | "_" | "void"
              | "break" | "continue"
@@ -417,6 +420,9 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING
 dict_pairs  = dict_pair { "," dict_pair } [ "," ] ;
 dict_pair   = or_expr "=>" expr ;
 vector_elems = or_expr { "," or_expr } [ "," ] ;
+
+opaque_conversion_type = IDENT [ "[" type_arg { "," type_arg } [ "," ] "]" ]
+                       | IDENT "." IDENT [ "[" type_arg { "," type_arg } [ "," ] "]" ] ;
 
 field_inits = field_init { "," field_init } [ "," ] ;
 field_init  = identifier "=" expr ;
@@ -527,10 +533,10 @@ lambda_body = or_expr | NEWLINE INDENT stmt_list DEDENT ;
 Certain keywords can be used as identifiers in field/function name position:
 
 ```ebnf
-name = IDENT | "debug" | "and" | "or" | "not" | "type" | "match" | "if" | "else"
+name = IDENT | "debug" | "and" | "or" | "not" | "type" | "opaque" | "match" | "if" | "else"
      | "True" | "False" | "in" | "for" | "while" | "with" | "foreign"
      | "resource" | "concurrent" | "on"
-     | "select" | "from" | "after" | "sealed" ;
+     | "select" | "after" | "sealed" ;
 ```
 
 ## Operator Precedence (lowest to highest)

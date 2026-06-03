@@ -238,7 +238,7 @@ let apply_concurrently_loop_param params (name, value) =
 (* Tokens *)
 %token FUNC PURE VAR UNION ENUM RECORD STRUCT VOID_KW FOREIGN DETACH WHERE
 %token WHILE FOR IN IF ELSE AND OR NOT BREAK CONTINUE
-%token IMPLEMENTS TRAIT SELF_TYPE TYPE ALIAS BUILTIN
+%token IMPLEMENTS TRAIT SELF_TYPE TYPE ALIAS OPAQUE BUILTIN INTO
 %token IMPORT AS PRIVATE EXPORT MATCH
 %token TRUE FALSE
 %token <string> IDENT
@@ -313,6 +313,7 @@ name:
   | OR { "or" }
   | NOT { "not" }
   | TYPE { "type" }
+  | OPAQUE { "opaque" }
   | MATCH { "match" }
   | IF { "if" }
   | ELSE { "else" }
@@ -326,7 +327,6 @@ name:
   | RESOURCE { "resource" }
   | CONCURRENT { "concurrent" }
   | SELECT { "select" }
-  | FROM { "from" }
   | AFTER { "after" }
   | SEALED { "sealed" }
   | ON { "on" }
@@ -337,14 +337,18 @@ identifier:
   | WITH { "with" }
   | CONCURRENT { "concurrent" }
   | SELECT { "select" }
-  | FROM { "from" }
   | AFTER { "after" }
   | SEALED { "sealed" }
   | ON { "on" }
 
 binding_ident:
   | n = IDENT { n }
-  | FROM { "from" }
+  | FROM
+    { parse_fail_at $symbolstartpos
+        "`from` is reserved for select receive arms and opaque type conversion; use a name like `source`, `origin`, or `sender`." }
+  | INTO
+    { parse_fail_at $symbolstartpos
+        "`into` is reserved for opaque type conversion; use a more specific local name." }
   | AFTER { "after" }
   | SEALED { "sealed" }
   | ON { "on" }
@@ -979,7 +983,9 @@ impl_method:
 (* Type alias declaration *)
 type_alias_decl:
   | TYPE ALIAS name = IDENT type_params = type_params_opt EQUALS ty = type_expr
-    { { alias_name = name; alias_type_params = type_params; alias_target = ty } }
+    { { alias_name = name; alias_type_params = type_params; alias_target = ty; alias_is_opaque = false } }
+  | OPAQUE TYPE name = IDENT type_params = type_params_opt EQUALS ty = type_expr
+    { { alias_name = name; alias_type_params = type_params; alias_target = ty; alias_is_opaque = true } }
 
 (* Type expressions *)
 type_expr:
@@ -1027,6 +1033,17 @@ non_dim_type_expr:
         | _ -> parse_fail_at $symbolstartpos "Tuples support 2-4 elements"
       in
       apply_array_suffixes base suffixes }
+
+opaque_conversion_type:
+  | name = IDENT { TyNamed (name, []) }
+  | name = IDENT LBRACKET args = trailing_nonempty_list(COMMA, type_arg) RBRACKET
+    suffixes = array_suffixes
+    { apply_array_suffixes (named_type_or_array name args) suffixes }
+  | mod_name = IDENT DOT type_name = IDENT
+    { TyNamed (mod_name ^ "." ^ type_name, []) }
+  | mod_name = IDENT DOT type_name = IDENT LBRACKET args = trailing_nonempty_list(COMMA, type_arg) RBRACKET
+    suffixes = array_suffixes
+    { apply_array_suffixes (named_type_or_array (mod_name ^ "." ^ type_name) args) suffixes }
 
 type_dim_atom:
   (* Dimension variable as type: #N — allows dim params to be used as parameter types *)
@@ -1186,6 +1203,10 @@ postfix_expr:
   | e = primary_expr { e }
 
 primary_expr:
+  | INTO ty = opaque_conversion_type LPAREN arg = expr RPAREN
+    { make_expr_span $symbolstartpos $endpos (EOpaqueInto (ty, arg)) }
+  | FROM ty = opaque_conversion_type LPAREN arg = expr RPAREN
+    { make_expr_span $symbolstartpos $endpos (EOpaqueFrom (ty, arg)) }
   | n = INT { make_expr_span $symbolstartpos $endpos (ELiteral (LitInt n)) }
   | n = BIGINT { make_expr_span $symbolstartpos $endpos (ELiteral (LitInt128 n)) }
   | f = FLOAT { make_expr_span $symbolstartpos $endpos (ELiteral (LitFloat f)) }
@@ -1199,7 +1220,6 @@ primary_expr:
   | TRUE { make_expr_span $symbolstartpos $endpos (ELiteral (LitBool true)) }
   | FALSE { make_expr_span $symbolstartpos $endpos (ELiteral (LitBool false)) }
   | name = IDENT { make_expr_span $symbolstartpos $endpos (EIdent name) }
-  | FROM { make_expr_span $symbolstartpos $endpos (EIdent "from") }
   | AFTER { make_expr_span $symbolstartpos $endpos (EIdent "after") }
   | SEALED { make_expr_span $symbolstartpos $endpos (EIdent "sealed") }
   | DEBUG { make_expr_span $symbolstartpos $endpos (EIdent "debug") }

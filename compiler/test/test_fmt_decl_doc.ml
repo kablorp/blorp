@@ -176,6 +176,7 @@ let test_type_record_alias_decl_json () =
       alias_type_params =
         [ Ast.make_type_param "A" []; Ast.make_type_param "B" [] ];
       alias_target = Ast.TyTuple [ Ast.TyVar "A"; Ast.TyVar "B" ];
+      alias_is_opaque = false;
     }
   in
   match

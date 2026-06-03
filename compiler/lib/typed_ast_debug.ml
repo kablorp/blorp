@@ -40,6 +40,8 @@ let expr_label (expr : Ast.expr) =
   | EUnary _ -> "unary"
   | ELogical _ -> "logical"
   | EAscription _ -> "ascription"
+  | EOpaqueInto _ -> "opaque_into"
+  | EOpaqueFrom _ -> "opaque_from"
   | ECall _ -> "call"
   | EIf _ -> "if"
   | EMatch _ -> "match"
@@ -93,6 +95,8 @@ let expr_children_from_desc = function
       []
   | EUnary (_, expr)
   | EAscription (expr, _)
+  | EOpaqueInto (_, expr)
+  | EOpaqueFrom (_, expr)
   | EFieldAccess (expr, _)
   | EAssign (_, expr)
   | ECompoundAssign (_, _, expr)

@@ -377,12 +377,12 @@ std/                       # Portable standard library (.brp files)
 ├── range.brp, ptr.brp, tuple.brp, void.brp  # Core helper/value types
 ├── string.brp, slice.brp, bytes.brp  # String ecosystem
 ├── list.brp, dict.brp, set.brp  # Core collections
-├── cache.brp, deque.brp, heap.brp, sorted_map.brp, graph.brp  # Extended collections
-├── parallel_list.brp, rate_limit.brp, property.brp, stream.brp  # Infrastructure helpers
+├── cache.brp, deque.brp, heap.brp, sorted_map.brp  # Extended collections
+├── parallel_list.brp, property.brp, stream.brp  # Infrastructure helpers
 ├── tensor.brp, vector.brp, matrix.brp, parallel_vector.brp, parallel_matrix.brp  # Numeric arrays
 ├── math.brp, stats.brp, fft.brp, dsp.brp  # Math and signal processing
 ├── io.brp, file.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp, channel.brp  # System
-├── path.brp, process.brp, log.brp, term.brp  # OS/terminal
+├── path.brp, process.brp, log.brp, terminal.brp  # OS/terminal
 ├── random.brp, crypto_random.brp, hash.brp  # Random/crypto helpers
 ├── parser.brp, regex.brp  # Text processing
 ├── csv.brp, toml.brp, xml.brp, yaml.brp, html.brp, json.brp  # Format parsers

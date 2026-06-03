@@ -118,6 +118,7 @@ let type_alias_to_json ~is_private alias_decl =
     [
       field "tag" (string "TypeAlias");
       field "private" (bool is_private);
+      field "opaque" (bool alias_decl.Ast.alias_is_opaque);
       field "name" (string alias_decl.Ast.alias_name);
       field "type_params" (type_params_to_json alias_decl.Ast.alias_type_params);
       field "target"

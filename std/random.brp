@@ -85,9 +85,63 @@ func choice[T](items: List[T]) -> Option[T]:
 -- ============================================================================
 -- Pure PRNG (SplitMix64)
 -- ============================================================================
--- State is a single Int. Each call returns (value, new_state).
+-- State has an Int representation, but callers use RngState and RngStep.
 -- All functions are pure -- no global state mutation.
 -- Uses SplitMix64 algorithm (pure bitwise arithmetic).
+opaque type RngState = Int
+
+opaque type RngStep[T] = (T, RngState)
+
+private SPLITMIX_GAMMA: Int = -7046029254386353131
+
+private SPLITMIX_MIX_MULTIPLIER_1: Int = -4658895280553007687
+
+private SPLITMIX_MIX_MULTIPLIER_2: Int = -7723592293110705685
+
+private SPLITMIX_FLOAT_SHIFT: Int = 11
+
+private SPLITMIX_FLOAT_DENOMINATOR: Float = 9007199254740992.0
+
+
+---
+Value produced by a pure RNG step.
+---
+pure func rng_value[T](step: RngStep[T]) -> T:
+	parts: (T, RngState) = from RngStep[T](step)
+	parts[0]
+
+
+---
+State to pass to the next pure RNG call.
+---
+pure func rng_next_state[T](step: RngStep[T]) -> RngState:
+	parts: (T, RngState) = from RngStep[T](step)
+	parts[1]
+
+
+---
+Compare two pure RNG states explicitly.
+---
+pure func rng_state_equal(a: RngState, b: RngState) -> Bool:
+	rng_state_raw(a) == rng_state_raw(b)
+
+
+---
+Construct a pure RNG step from a value and next state.
+Useful for custom generators built on RngState.
+---
+pure func rng_step[T](value: T, next_state: RngState) -> RngStep[T]:
+	into RngStep[T]((value, next_state))
+
+
+private pure func rng_state_raw(state: RngState) -> Int:
+	from RngState(state)
+
+
+private pure func rng_state_from_raw(raw: Int) -> RngState:
+	into RngState(raw)
+
+
 -- SplitMix64 mixing function
 private pure func __unsigned_shift_right(x: Int, n: Int) -> Int:
 	if n <= 0:
@@ -103,9 +157,9 @@ private pure func __unsigned_shift_right(x: Int, n: Int) -> Int:
 
 
 private pure func __splitmix64(s: Int) -> Int:
-	var z: Int = s + -7046029254386353131
-	z = bit_xor(z, __unsigned_shift_right(z, 30)) * -4658895280553007687
-	z = bit_xor(z, __unsigned_shift_right(z, 27)) * -7723592293110705685
+	var z: Int = s + SPLITMIX_GAMMA
+	z = bit_xor(z, __unsigned_shift_right(z, 30)) * SPLITMIX_MIX_MULTIPLIER_1
+	z = bit_xor(z, __unsigned_shift_right(z, 27)) * SPLITMIX_MIX_MULTIPLIER_2
 	bit_xor(z, __unsigned_shift_right(z, 31))
 
 
@@ -114,53 +168,60 @@ Create a new RNG state from a seed. Pure.
 
 doctests:
     :: Seed creates deterministic state
-    rng_new(42) == rng_new(42)
+    rng_state_equal(rng_new(42), rng_new(42))
 ---
-pure func rng_new(seed: Int) -> Int:
-	seed
+pure func rng_new(seed: Int) -> RngState:
+	rng_state_from_raw(seed)
 
 
 ---
-Generate the next random Int. Returns (value, new_state). Pure.
+Generate the next random Int. Pure.
 
 doctests:
     :: rng_next is deterministic
-    r1: (Int, Int) = rng_next(rng_new(42))
-    r2: (Int, Int) = rng_next(rng_new(42))
-    r1[0] == r2[0]
+    r1 = rng_next(rng_new(42))
+    r2 = rng_next(rng_new(42))
+    r1.rng_value() == r2.rng_value()
 ---
-pure func rng_next(state: Int) -> (Int, Int):
-	new_state: Int = state + -7046029254386353131
-	value: Int = __splitmix64(state)
-	(value, new_state)
+pure func rng_next(state: RngState) -> RngStep[Int]:
+	raw_state: Int = rng_state_raw(state)
+	new_state: RngState = rng_state_from_raw(raw_state + SPLITMIX_GAMMA)
+	value: Int = __splitmix64(raw_state)
+	rng_step(value, new_state)
 
 
 ---
-Generate a random Float in [0.0, 1.0). Returns (value, new_state). Pure.
+Generate a random Float in [0.0, 1.0). Pure.
 
 doctests:
     :: rng_float in unit interval
-    r: (Float, Int) = rng_float(rng_new(42))
-    r[0] >= 0.0 and r[0] < 1.0
+    r = rng_float(rng_new(42))
+    r.rng_value() >= 0.0 and r.rng_value() < 1.0
 ---
-pure func rng_float(state: Int) -> (Float, Int):
-	new_state: Int = state + -7046029254386353131
-	value: Int = __splitmix64(state)
-	f: Float = to_float(__unsigned_shift_right(value, 11)) * (1.0 / 9007199254740992.0)
-	(f, new_state)
+pure func rng_float(state: RngState) -> RngStep[Float]:
+	raw_state: Int = rng_state_raw(state)
+	new_state: RngState = rng_state_from_raw(raw_state + SPLITMIX_GAMMA)
+	value: Int = __splitmix64(raw_state)
+	f: Float = to_float(
+		__unsigned_shift_right(
+			value,
+			SPLITMIX_FLOAT_SHIFT,
+		),
+	) * (1.0 / SPLITMIX_FLOAT_DENOMINATOR)
+	rng_step(f, new_state)
 
 
 ---
-Generate a random Int in [min, max). Returns (value, new_state). Pure.
+Generate a random Int in [min, max). Pure.
 
 doctests:
     :: rng_int in range
-    r: (Int, Int) = rng_int(rng_new(42), 1, 100)
-    r[0] >= 1 and r[0] < 100
+    r = rng_int(rng_new(42), 1, 100)
+    r.rng_value() >= 1 and r.rng_value() < 100
 ---
-pure func rng_int(state: Int, min: Int, max: Int) -> (Int, Int):
-	r: (Int, Int) = rng_next(state)
-	val: Int = r[0]
+pure func rng_int(state: RngState, min: Int, max: Int) -> RngStep[Int]:
+	r: RngStep[Int] = rng_next(state)
+	val: Int = r.rng_value()
 	range: Int = max - min
 
 	-- Make positive and mod to range
@@ -168,17 +229,17 @@ pure func rng_int(state: Int, min: Int, max: Int) -> (Int, Int):
 	if v < 0:
 		v = -(v + 1)
 	v = v % range + min
-	(v, r[1])
+	rng_step(v, r.rng_next_state())
 
 
 ---
-Generate a random Bool. Returns (value, new_state). Pure.
+Generate a random Bool. Pure.
 
 doctests:
     :: rng_bool returns Bool
-    r: (Bool, Int) = rng_bool(rng_new(42))
-    r[0] == True or r[0] == False
+    r = rng_bool(rng_new(42))
+    r.rng_value() == True or r.rng_value() == False
 ---
-pure func rng_bool(state: Int) -> (Bool, Int):
-	r: (Float, Int) = rng_float(state)
-	(r[0] < 0.5, r[1])
+pure func rng_bool(state: RngState) -> RngStep[Bool]:
+	r: RngStep[Float] = rng_float(state)
+	rng_step(r.rng_value() < 0.5, r.rng_next_state())

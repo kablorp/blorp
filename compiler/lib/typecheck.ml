@@ -559,6 +559,7 @@ let env_has_type_name env name =
   || Env.get_type_decl env name <> None
   || Env.get_record env name <> None
   || Env.get_alias env name <> None
+  || Env.get_opaque_alias env name <> None
 
 let state_has_type_name state name =
   Hashtbl.mem state.known_type_names name || env_has_type_name state.env name
@@ -568,8 +569,9 @@ let canonical_type_lookup_name env name =
   | Some _ -> name
   | None -> (
       match Env.get_alias env name with
-      | Some (_, TyNamed (target, _)) when Env.get_type_decl env target <> None
-        ->
+      | Some (_, TyNamed (target, _))
+        when Env.get_type_decl env target <> None
+             || Env.get_opaque_alias env target <> None ->
           target
       | _ -> name)
 
@@ -1539,7 +1541,7 @@ let process_record_decl ?(imported = false) (state : check_state)
     | None -> state
 
 (** Process a type alias declaration *)
-let process_type_alias ?(loc = dummy_loc) (state : check_state)
+let process_type_alias ?(loc = dummy_loc) ?home_module (state : check_state)
     (decl : type_alias_decl) : check_state =
   let state = validate_type_params state loc decl.alias_type_params in
   let decl =
@@ -1601,13 +1603,17 @@ let process_type_alias ?(loc = dummy_loc) (state : check_state)
               decl.alias_name))
     else state
   in
-  {
-    state with
-    env =
-      add_alias state.env decl.alias_name
-        (Ast.type_param_names decl.alias_type_params)
-        decl.alias_target;
-  }
+  let type_params = Ast.type_param_names decl.alias_type_params in
+  let env =
+    if decl.alias_is_opaque then
+      add_opaque_alias state.env decl.alias_name type_params decl.alias_target
+        ~home_module:
+          (match home_module with
+          | Some _ -> home_module
+          | None -> loc.loc_file)
+    else add_alias state.env decl.alias_name type_params decl.alias_target
+  in
+  { state with env }
 
 let validate_default_foreign_arg_safety loc (state : check_state)
     (sig_ : checked_func_signature) (func : func_decl) : check_state =
@@ -2255,7 +2261,9 @@ let process_imported_type_alias_decl ?alias ~(module_path : string option) state
             qualify_imported_type_expr ~module_path decl.alias_target;
         }
       in
-      let state = process_type_alias ~loc state canonical_decl in
+      let state =
+        process_type_alias ~loc ?home_module:module_path state canonical_decl
+      in
       let alias = Option.value alias ~default:original_name in
       add_imported_type_alias ~module_path state ~alias ~original_name
         ~type_params:(Ast.type_param_names decl.alias_type_params)

@@ -111,6 +111,11 @@ type symbol_kind =
       contains_resource : bool;
     }
   | AliasSymbol of { type_params : string list; target : type_expr }
+  | OpaqueAliasSymbol of {
+      type_params : string list;
+      target : type_expr;
+      home_module : string option;
+    }
   | ConstructorSymbol of {
       parent_type : string; (* The union type this constructor belongs to *)
       constructor_id : int; (* Callable identity for constructor calls *)
@@ -266,6 +271,7 @@ let symbol_kind_label (sym : symbol) : string =
   | TypeSymbol _ -> "type"
   | RecordSymbol _ -> "record"
   | AliasSymbol _ -> "type alias"
+  | OpaqueAliasSymbol _ -> "opaque type"
   | ConstructorSymbol _ -> "constructor"
 
 (* ============================================================================
@@ -434,6 +440,14 @@ let is_value_record (env : env) (name : string) : bool =
 let add_alias (env : env) (name : string) (type_params : string list)
     (target : type_expr) : env =
   add_symbol env { name; kind = AliasSymbol { type_params; target } }
+
+(** Add an opaque type alias to the environment.
+    Unlike [add_alias], this is not expanded by [resolve_alias]; it is a
+    nominal type during frontend checking and erased only by backend layout. *)
+let add_opaque_alias (env : env) (name : string) (type_params : string list)
+    (target : type_expr) ~(home_module : string option) : env =
+  add_symbol env
+    { name; kind = OpaqueAliasSymbol { type_params; target; home_module } }
 
 (* ============================================================================
    Symbol lookup helpers
@@ -605,6 +619,13 @@ let get_alias (env : env) (name : string) : (string list * type_expr) option =
       Some (type_params, target)
   | _ -> None
 
+let get_opaque_alias (env : env) (name : string) :
+    (string list * type_expr * string option) option =
+  match lookup env name with
+  | Some { kind = OpaqueAliasSymbol { type_params; target; home_module }; _ } ->
+      Some (type_params, target, home_module)
+  | _ -> None
+
 let rec disambiguate_nominal_dim_application (env : env) (ty : type_expr) :
     type_expr =
   let nominal_dim_params name =
@@ -617,7 +638,10 @@ let rec disambiguate_nominal_dim_application (env : env) (ty : type_expr) :
           | None -> (
               match get_alias env name with
               | Some (ps, _) -> Some ps
-              | None -> None))
+              | None -> (
+                  match get_opaque_alias env name with
+                  | Some (ps, _, _) -> Some ps
+                  | None -> None)))
     in
     match params with
     | Some ps when ps <> [] && List.for_all Types.Dim.is_var_name ps -> Some ps
@@ -1750,7 +1774,9 @@ let all_value_identifiers (env : env) : string list =
       List.iter
         (fun (sym : symbol) ->
           match sym.kind with
-          | TypeSymbol _ | RecordSymbol _ | AliasSymbol _ -> ()
+          | TypeSymbol _ | RecordSymbol _ | AliasSymbol _ | OpaqueAliasSymbol _
+            ->
+              ()
           | VarSymbol _ | FuncSymbol _ | ConstructorSymbol _ ->
               if not (Hashtbl.mem names sym.name) then
                 Hashtbl.add names sym.name true)

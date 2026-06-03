@@ -117,6 +117,8 @@ type expr_desc =
   | EUnary of Ast.unop * expr
   | ELogical of Ast.logop * expr * expr
   | EAscription of expr * Ast.type_expr
+  | EOpaqueInto of Ast.type_expr * expr
+  | EOpaqueFrom of Ast.type_expr * expr
   | ECall of expr * expr list
   | EIf of expr * expr * expr option
   | EMatch of expr * match_case list

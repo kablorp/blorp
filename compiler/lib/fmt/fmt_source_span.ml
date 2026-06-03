@@ -27,6 +27,8 @@ let rec expr_source_end_line e =
   | EIdent _ | ELiteral _ | EVoid | EBreak | EContinue | EBuiltin _ -> base
   | EUnary (_, inner)
   | EAscription (inner, _)
+  | EOpaqueInto (_, inner)
+  | EOpaqueFrom (_, inner)
   | EFieldAccess (inner, _)
   | EDetach inner ->
       max base (expr_source_end_line inner)

@@ -128,6 +128,8 @@ type expr_desc =
   | EUnary of Ast.unop * expr
   | ELogical of Ast.logop * expr * expr
   | EAscription of expr * Ast.type_expr
+  | EOpaqueInto of Ast.type_expr * expr
+  | EOpaqueFrom of Ast.type_expr * expr
   | ECall of expr * expr list
   | EIf of expr * expr * expr option
   | EMatch of expr * match_case list
@@ -664,6 +666,12 @@ let expr_desc (expr : expr) =
   | Ast.EAscription (inner, ty) ->
       let* inner = typed_child inner in
       Ok (EAscription (inner, ty))
+  | Ast.EOpaqueInto (ty, inner) ->
+      let* inner = typed_child inner in
+      Ok (EOpaqueInto (ty, inner))
+  | Ast.EOpaqueFrom (ty, inner) ->
+      let* inner = typed_child inner in
+      Ok (EOpaqueFrom (ty, inner))
   | Ast.ECall (callee, args) ->
       let* callee = typed_child callee in
       let* args = typed_children args in

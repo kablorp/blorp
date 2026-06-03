@@ -1125,6 +1125,28 @@ type alias StringMap[V] = Dict[String, V]
 type alias Row[T, #N] = T[#N]
 ```
 
+Aliases are transparent: `IntPair` and `(Int, Int)` are the same type.
+
+Use `opaque type` when a module should expose a distinct API type while keeping
+the same runtime representation as an existing type:
+
+```blorp
+opaque type Email = String
+
+pure func email(raw: String) -> Email:
+	into Email(raw)
+
+pure func email_value(value: Email) -> String:
+	from Email(value)
+```
+
+`Email` is not interchangeable with `String`, so callers cannot accidentally
+pass arbitrary strings where an `Email` is required. `into Email(...)` and
+`from Email(...)` work only in the module that defines `Email`; expose public
+constructor/accessor functions when other modules need controlled access. The
+compiler erases the conversion after typechecking, so the representation keeps
+the same layout and optimizations as the target type.
+
 ### Generics
 
 ```blorp
@@ -2809,13 +2831,13 @@ This table lists the main public modules. The source of truth is the `std/` and
 | `json`, `toml`, `yaml`, `xml`, `html`, `csv` | `json: JsonValue, parse_json` | Data format parsers/encoders |
 | `codec`, `codec_bridge` | `codec: Value` | Generic serialization and format bridge |
 | `string`, `slice`, `stream` | `string: string, append_char` | String operations/building, slices, streams |
-| `cache`, `parallel_list`, `deque`, `heap`, `sorted_map`, `graph`, `rate_limit`, `property` | `heap: Heap` | Extended collections and infrastructure |
+| `cache`, `parallel_list`, `deque`, `heap`, `sorted_map`, `property` | `heap: Heap` | Extended collections and infrastructure |
 | `geometry`, `geographic`, `geojson`, `physics`, `units` | `geometry: Vec2` | Spatial, geographic, physics, and unit helpers |
 | `dsp`, `fft`, `noise` | `dsp: ...` | Signal and procedural numeric helpers |
 | `net/dns`, `net/tcp`, `net/tls`, `net/udp`, `net/websocket`, `net/http`, `net/url`, `net/mime` | `net/tcp: connect, read_chunk` | Portable networking primitives and protocol helpers |
 | `pkg/compress`, `pkg/crypto`, `pkg/sqlite` | `pkg/compress: gzip` | Optional native bindings and native-backed packages |
 | `pkg/net/dns`, `pkg/net/http_client`, `pkg/net/smtp`, `pkg/net/tls`, `pkg/net/udp`, `pkg/net/websocket` | `pkg/net/dns as DNS` | Native-backed networking packages, WebSocket helpers, and resource-migration placeholders |
-| `term` | `term: ...` | Terminal helpers |
+| `terminal` | `terminal: ...` | Terminal helpers |
 | `tuple`, `ptr`, `void`, `traits`, `test` | `test: TestSuite` | Core support modules and test framework |
 
 Benchmark harness helpers live under `benchmarks/blorp/support/benchmark.brp`
@@ -2869,13 +2891,13 @@ import:
 
 ```blorp
 import:
-    process as P
+    process as P: exit_code, stdout
 
 func show_git_version() -> Int:
     match P.run("git", ["--version"]):
         Ok(out):
-            print(out[0])
-            out[2]
+            print(out.stdout())
+            out.exit_code()
         Err(msg):
             print(msg)
             1
@@ -3846,5 +3868,5 @@ type       alias      private    import     as         implements Self       bui
 match      while      for        in         if         else       and        or
 not        True       False      void       break      continue   debug      foreign
 concurrent concurrently detach   select     from       after      sealed     with
-resource   where
+resource   where        into
 ```

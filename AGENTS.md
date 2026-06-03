@@ -503,7 +503,6 @@ std/              # Standard library (.brp files)
   heap.brp        # Priority queue (min-heap)
   deque.brp       # Double-ended queue
   sorted_map.brp  # Sorted key-value map
-  graph.brp       # Graph algorithms
   int.brp, float.brp, bool.brp, char.brp  # Primitives
   int8.brp, int16.brp, int32.brp, int128.brp  # Sized signed integers
   uint8.brp, uint16.brp, uint32.brp, uint64.brp, uint128.brp  # Sized unsigned integers
@@ -516,11 +515,11 @@ std/              # Standard library (.brp files)
   dsp.brp, fft.brp, noise.brp  # Signal/procedural helpers
   random.brp, crypto_random.brp  # Random
   io.brp, file.brp, system.brp, debug.brp, memory.brp, instrumentation.brp, time.brp  # System
-  path.brp, process.brp, log.brp, term.brp  # OS/terminal
+  path.brp, process.brp, log.brp, terminal.brp  # OS/terminal
   csv.brp, html.brp, json.brp, toml.brp, xml.brp, yaml.brp  # Format parsers
   argparse.brp, hash.brp, uuid.brp  # Utilities
   codec.brp, codec_bridge.brp, validation.brp  # Encoding/validation
-  cache.brp, parallel_list.brp, rate_limit.brp, property.brp, stream.brp, channel.brp  # Infrastructure
+  cache.brp, parallel_list.brp, property.brp, stream.brp, channel.brp  # Infrastructure
   net/            # Portable networking/protocol helpers (tcp, http, url, mime)
 
 pkg/              # Optional native-backed packages and third-party bindings

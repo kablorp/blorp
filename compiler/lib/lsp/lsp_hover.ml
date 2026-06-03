@@ -95,6 +95,12 @@ let hover_info_for_symbol name expr (symbol : Env.symbol) =
       hover_for_constructor_symbol name ~parent_type ~field_types
   | Env.AliasSymbol { type_params; target } ->
       hover_for_alias_symbol name ~type_params ~target
+  | Env.OpaqueAliasSymbol { type_params; target; _ } ->
+      let params_str = Lsp_protocol.format_type_params type_params in
+      Some
+        (hover_code
+           (Printf.sprintf "opaque type %s%s = %s" name params_str
+              (Types.type_to_string target)))
 
 (** Get hover info for an expression using the environment *)
 let hover_info_for_expr (env : Env.env) (e : expr) : string option =

@@ -6,8 +6,8 @@
 -- 3. Compiled programs produce correct results
 -- 4. The parser never crashes (returns errors gracefully)
 import:
-	process: run
-	random: rng_bool, rng_int, rng_new
+	process: exit_code, run, stderr, stdout
+	random as R: RngState, RngStep, rng_next_state, rng_value
 	string: contains
 	system: mkstemp_path, remove_file, write_file
 	test: TestSuite
@@ -23,6 +23,20 @@ TYPECHECK_CASES: Int = 1
 RUN_CASES: Int = 1
 
 FUZZ_CASES: Int = 1
+
+
+pure func rng_new(seed: Int) -> RngState:
+	R.rng_new(seed)
+
+
+pure func rng_int(state: RngState, min: Int, max: Int) -> (Int, RngState):
+	r: RngStep[Int] = R.rng_int(state, min, max)
+	(r.rng_value(), r.rng_next_state())
+
+
+pure func rng_bool(state: RngState) -> (Bool, RngState):
+	r: RngStep[Bool] = R.rng_bool(state)
+	(r.rng_value(), r.rng_next_state())
 
 
 -- ============================================================================
@@ -44,8 +58,11 @@ func compile_check(src: String) -> (Bool, String):
 	match write_source_file(src):
 		Err(e): (False, e)
 		Ok(path):
-			result: (Bool, String) = match run(BLORP, ["check", path]):
-				Ok(out): (out[2] == 0, out[1])
+			result: (Bool, String) = match run(
+				BLORP,
+				["check", path],
+			):
+				Ok(out): (out.exit_code() == 0, out.stderr())
 				Err(e): (False, "run failed: " + e)
 			_ = remove_file(path)
 			result
@@ -56,8 +73,11 @@ func compile_and_run(src: String) -> (Bool, String, Int):
 	match write_source_file(src):
 		Err(e): (False, e, 1)
 		Ok(path):
-			result: (Bool, String, Int) = match run(BLORP, ["run", path]):
-				Ok(out): (out[2] == 0, out[0], out[2])
+			result: (Bool, String, Int) = match run(
+				BLORP,
+				["run", path],
+			):
+				Ok(out): (out.exit_code() == 0, out.stdout(), out.exit_code())
 				Err(e): (False, "run failed: " + e, 1)
 			_ = remove_file(path)
 			result
@@ -67,33 +87,33 @@ func compile_and_run(src: String) -> (Bool, String, Int):
 -- Program Generators
 -- ============================================================================
 -- Generate a valid arithmetic expression
-pure func gen_arith_expr(state: Int, depth: Int) -> (String, Int):
+pure func gen_arith_expr(state: RngState, depth: Int) -> (String, RngState):
 	if depth <= 0:
-		r: (Int, Int) = rng_int(state, 0, 100)
+		r: (Int, RngState) = rng_int(state, 0, 100)
 		(r[0].to_string(), r[1])
 	else:
-		op_r: (Int, Int) = rng_int(state, 0, 4)
+		op_r: (Int, RngState) = rng_int(state, 0, 4)
 		op: String = match op_r[0]:
 			0: " + "
 			1: " - "
 			2: " * "
 			_: " / "
-		left: (String, Int) = gen_arith_expr(op_r[1], depth - 1)
-		right: (String, Int) = gen_arith_expr(left[1], depth - 1)
+		left: (String, RngState) = gen_arith_expr(op_r[1], depth - 1)
+		right: (String, RngState) = gen_arith_expr(left[1], depth - 1)
 		("(" + left[0] + op + right[0] + ")", right[1])
 
 
 -- Generate a valid program that prints an arithmetic result
-pure func gen_arith_program(state: Int) -> (String, Int):
-	expr: (String, Int) = gen_arith_expr(state, 3)
+pure func gen_arith_program(state: RngState) -> (String, RngState):
+	expr: (String, RngState) = gen_arith_expr(state, 3)
 	src: String = "func main(args: List[String]) -> Int:\n    result: Int = " + expr[0] + "\n    print(result.to_string())\n    0\n"
 	(src, expr[1])
 
 
 -- Generate a valid program with if/else
-pure func gen_if_program(state: Int) -> (String, Int):
-	val_r: (Int, Int) = rng_int(state, 0, 200)
-	thresh_r: (Int, Int) = rng_int(val_r[1], 0, 200)
+pure func gen_if_program(state: RngState) -> (String, RngState):
+	val_r: (Int, RngState) = rng_int(state, 0, 200)
+	thresh_r: (Int, RngState) = rng_int(val_r[1], 0, 200)
 	src: String = "func main(args: List[String]) -> Int:\n    x: Int = " + to_string(
 		val_r[0],
 	) + "\n    result: String = if x > " + to_string(
@@ -103,9 +123,9 @@ pure func gen_if_program(state: Int) -> (String, Int):
 
 
 -- Generate a valid program with match on Option
-pure func gen_option_program(state: Int) -> (String, Int):
-	val_r: (Int, Int) = rng_int(state, 0, 100)
-	use_some: (Bool, Int) = rng_bool(val_r[1])
+pure func gen_option_program(state: RngState) -> (String, RngState):
+	val_r: (Int, RngState) = rng_int(state, 0, 100)
+	use_some: (Bool, RngState) = rng_bool(val_r[1])
 	opt_expr: String = if use_some[0]:
 		"Some(" + val_r[0].to_string() + ")"
 	else:
@@ -115,9 +135,9 @@ pure func gen_option_program(state: Int) -> (String, Int):
 
 
 -- Generate a valid program with a pure function
-pure func gen_pure_func_program(state: Int) -> (String, Int):
-	a_r: (Int, Int) = rng_int(state, 1, 50)
-	b_r: (Int, Int) = rng_int(a_r[1], 1, 50)
+pure func gen_pure_func_program(state: RngState) -> (String, RngState):
+	a_r: (Int, RngState) = rng_int(state, 1, 50)
+	b_r: (Int, RngState) = rng_int(a_r[1], 1, 50)
 	src: String = "pure func add(a: Int, b: Int) -> Int:\n    a + b\n\nfunc main(args: List[String]) -> Int:\n    print(to_string(add(" + to_string(
 		a_r[0],
 	) + ", " + b_r[0].to_string() + ")))\n    0\n"
@@ -125,8 +145,8 @@ pure func gen_pure_func_program(state: Int) -> (String, Int):
 
 
 -- Generate a program with a type error (Int + String)
-pure func gen_type_error_program(state: Int) -> (String, Int):
-	val_r: (Int, Int) = rng_int(state, 0, 100)
+pure func gen_type_error_program(state: RngState) -> (String, RngState):
+	val_r: (Int, RngState) = rng_int(state, 0, 100)
 	src: String = "func main(args: List[String]) -> Int:\n    x: Int = " + to_string(
 		val_r[0],
 	) + " + \"hello\"\n    0\n"
@@ -134,19 +154,19 @@ pure func gen_type_error_program(state: Int) -> (String, Int):
 
 
 -- Generate a program with a purity violation
-pure func gen_purity_error_program(state: Int) -> (String, Int):
+pure func gen_purity_error_program(state: RngState) -> (String, RngState):
 	src: String = "pure func bad() -> Void:\n    print(\"side effect\")\n\nfunc main(args: List[String]) -> Int:\n    0\n"
 	(src, state)
 
 
 -- Generate random garbage strings to fuzz the parser
-pure func gen_fuzz_string(state: Int, max_len: Int) -> (String, Int):
-	len_r: (Int, Int) = rng_int(state, 1, max_len)
-	var st: Int = len_r[1]
+pure func gen_fuzz_string(state: RngState, max_len: Int) -> (String, RngState):
+	len_r: (Int, RngState) = rng_int(state, 1, max_len)
+	var st: RngState = len_r[1]
 	var result: String = ""
 	var i: Int = 0
 	while i < len_r[0]:
-		ch_r: (Int, Int) = rng_int(st, 32, 127)
+		ch_r: (Int, RngState) = rng_int(st, 32, 127)
 		result += to_char(ch_r[0]).to_string()
 		st = ch_r[1]
 		i += 1
@@ -158,11 +178,11 @@ pure func gen_fuzz_string(state: Int, max_len: Int) -> (String, Int):
 -- ============================================================================
 -- Property: random arithmetic programs type-check
 func test_arith_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 42)
+	var state: RngState = rng_new(SEED + 42)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_arith_program(state)
+		prog: (String, RngState) = gen_arith_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -178,11 +198,11 @@ func test_arith_programs_typecheck() -> Bool:
 
 -- Property: random if/else programs type-check
 func test_if_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 123)
+	var state: RngState = rng_new(SEED + 123)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_if_program(state)
+		prog: (String, RngState) = gen_if_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -196,11 +216,11 @@ func test_if_programs_typecheck() -> Bool:
 
 -- Property: random Option programs type-check
 func test_option_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 999)
+	var state: RngState = rng_new(SEED + 999)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_option_program(state)
+		prog: (String, RngState) = gen_option_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -216,11 +236,11 @@ func test_option_programs_typecheck() -> Bool:
 
 -- Property: pure function programs type-check
 func test_pure_func_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 777)
+	var state: RngState = rng_new(SEED + 777)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_pure_func_program(state)
+		prog: (String, RngState) = gen_pure_func_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -236,11 +256,11 @@ func test_pure_func_programs_typecheck() -> Bool:
 
 -- Property: type error programs are rejected
 func test_type_errors_rejected() -> Bool:
-	var state: Int = rng_new(SEED + 55)
+	var state: RngState = rng_new(SEED + 55)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_type_error_program(state)
+		prog: (String, RngState) = gen_type_error_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if result[0]:
@@ -264,11 +284,11 @@ func test_purity_violations_rejected() -> Bool:
 
 -- Property: arithmetic programs run correctly (safe division by zero)
 func test_arith_programs_run() -> Bool:
-	var state: Int = rng_new(SEED + 314)
+	var state: RngState = rng_new(SEED + 314)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		prog: (String, Int) = gen_arith_program(state)
+		prog: (String, RngState) = gen_arith_program(state)
 		state = prog[1]
 		result: (Bool, String, Int) = compile_and_run(prog[0])
 		if not result[0]:
@@ -297,23 +317,26 @@ func test_pure_func_deterministic() -> Bool:
 
 -- Property: parser doesn't crash on random input
 func test_parser_doesnt_crash() -> Bool:
-	var state: Int = rng_new(SEED + 666)
+	var state: RngState = rng_new(SEED + 666)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < FUZZ_CASES and all_ok:
-		fuzz: (String, Int) = gen_fuzz_string(state, 50)
+		fuzz: (String, RngState) = gen_fuzz_string(state, 50)
 		state = fuzz[1]
 
 		-- Compiler should return an error, not crash (exit != signal)
 		match write_source_file(fuzz[0]):
 			Ok(path):
-				match run(BLORP, ["check", path]):
+				match run(
+					BLORP,
+					["check", path],
+				):
 					Ok(out):
 						-- Exit code 1 = error (good), exit code > 128 = signal (crash)
-						if out[2] > 128:
+						if out.exit_code() > 128:
 							print(
 								"  FAIL: parser crashed on fuzz input (signal " + to_string(
-									out[2] - 128,
+									out.exit_code() - 128,
 								) + ")",
 							)
 							all_ok = False
@@ -327,11 +350,11 @@ func test_parser_doesnt_crash() -> Bool:
 -- Property: safe arithmetic never crashes
 func test_safe_arithmetic_never_crashes() -> Bool:
 	-- Generate programs with division by zero, modulo by zero, overflow
-	var state: Int = rng_new(SEED + 1234)
+	var state: RngState = rng_new(SEED + 1234)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		a_r: (Int, Int) = rng_int(state, -1000, 1000)
+		a_r: (Int, RngState) = rng_int(state, -1000, 1000)
 		src: String = "func main(args: List[String]) -> Int:\n    x: Int = " + to_string(
 			a_r[0],
 		) + " / 0\n    y: Int = " + to_string(
@@ -354,10 +377,10 @@ func test_safe_arithmetic_never_crashes() -> Bool:
 -- Vector / Tensor Generators & Properties
 -- ============================================================================
 -- Generate a program that creates and operates on a fixed-size Vector
-pure func gen_vector_program(state: Int) -> (String, Int):
-	size_r: (Int, Int) = rng_int(state, 2, 8)
-	val_r: (Int, Int) = rng_int(size_r[1], 1, 50)
-	op_r: (Int, Int) = rng_int(val_r[1], 0, 3)
+pure func gen_vector_program(state: RngState) -> (String, RngState):
+	size_r: (Int, RngState) = rng_int(state, 2, 8)
+	val_r: (Int, RngState) = rng_int(size_r[1], 1, 50)
+	op_r: (Int, RngState) = rng_int(val_r[1], 0, 3)
 	op: String = match op_r[0]:
 		0: "    var total: Float = 0.0\n    for i in 0..length(v):\n        total = total + v[i]\n    print(total.to_string())"
 		1: "    v2: Float[#" + to_string(
@@ -376,10 +399,10 @@ pure func gen_vector_program(state: Int) -> (String, Int):
 
 
 -- Generate a program that creates and operates on a Matrix
-pure func gen_matrix_program(state: Int) -> (String, Int):
-	rows_r: (Int, Int) = rng_int(state, 2, 5)
-	cols_r: (Int, Int) = rng_int(rows_r[1], 2, 5)
-	val_r: (Int, Int) = rng_int(cols_r[1], 1, 20)
+pure func gen_matrix_program(state: RngState) -> (String, RngState):
+	rows_r: (Int, RngState) = rng_int(state, 2, 5)
+	cols_r: (Int, RngState) = rng_int(rows_r[1], 2, 5)
+	val_r: (Int, RngState) = rng_int(cols_r[1], 1, 20)
 	fval: String = val_r[0].to_string() + ".0"
 	src: String = "import:\n    vector: length\n\nfunc main(args: List[String]) -> Int:\n    m: Float[#" + to_string(
 		rows_r[0],
@@ -392,11 +415,11 @@ pure func gen_matrix_program(state: Int) -> (String, Int):
 
 
 func test_vector_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 500)
+	var state: RngState = rng_new(SEED + 500)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_vector_program(state)
+		prog: (String, RngState) = gen_vector_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -411,11 +434,11 @@ func test_vector_programs_typecheck() -> Bool:
 
 
 func test_vector_programs_run() -> Bool:
-	var state: Int = rng_new(SEED + 501)
+	var state: RngState = rng_new(SEED + 501)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		prog: (String, Int) = gen_vector_program(state)
+		prog: (String, RngState) = gen_vector_program(state)
 		state = prog[1]
 		result: (Bool, String, Int) = compile_and_run(prog[0])
 		if not result[0]:
@@ -430,11 +453,11 @@ func test_vector_programs_run() -> Bool:
 
 
 func test_matrix_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 600)
+	var state: RngState = rng_new(SEED + 600)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_matrix_program(state)
+		prog: (String, RngState) = gen_matrix_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -452,16 +475,16 @@ func test_matrix_programs_typecheck() -> Bool:
 -- List Generators & Properties
 -- ============================================================================
 -- Generate a program with random list operations
-pure func gen_list_program(state: Int) -> (String, Int):
-	len_r: (Int, Int) = rng_int(state, 0, 10)
-	op_r: (Int, Int) = rng_int(len_r[1], 0, 5)
+pure func gen_list_program(state: RngState) -> (String, RngState):
+	len_r: (Int, RngState) = rng_int(state, 0, 10)
+	op_r: (Int, RngState) = rng_int(len_r[1], 0, 5)
 
 	-- Build list literal
-	var st: Int = op_r[1]
+	var st: RngState = op_r[1]
 	var elems: String = ""
 	var j: Int = 0
 	while j < len_r[0]:
-		val: (Int, Int) = rng_int(st, 0, 100)
+		val: (Int, RngState) = rng_int(st, 0, 100)
 		if j > 0:
 			elems += ", "
 		elems += val[0].to_string()
@@ -484,11 +507,11 @@ pure func gen_list_program(state: Int) -> (String, Int):
 
 
 func test_list_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 700)
+	var state: RngState = rng_new(SEED + 700)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_list_program(state)
+		prog: (String, RngState) = gen_list_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -503,11 +526,11 @@ func test_list_programs_typecheck() -> Bool:
 
 
 func test_list_programs_run() -> Bool:
-	var state: Int = rng_new(SEED + 701)
+	var state: RngState = rng_new(SEED + 701)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		prog: (String, Int) = gen_list_program(state)
+		prog: (String, RngState) = gen_list_program(state)
 		state = prog[1]
 		result: (Bool, String, Int) = compile_and_run(prog[0])
 		if not result[0]:
@@ -524,13 +547,13 @@ func test_list_programs_run() -> Bool:
 -- ============================================================================
 -- Set & Dict Generators & Properties
 -- ============================================================================
-pure func gen_set_program(state: Int) -> (String, Int):
-	len_r: (Int, Int) = rng_int(state, 1, 8)
-	var st: Int = len_r[1]
+pure func gen_set_program(state: RngState) -> (String, RngState):
+	len_r: (Int, RngState) = rng_int(state, 1, 8)
+	var st: RngState = len_r[1]
 	var adds: String = ""
 	var j: Int = 0
 	while j < len_r[0]:
-		val: (Int, Int) = rng_int(st, 0, 50)
+		val: (Int, RngState) = rng_int(st, 0, 50)
 		adds = adds + "    s = S.add(s, " + val[0].to_string() + ")\n"
 		st = val[1]
 		j += 1
@@ -538,13 +561,13 @@ pure func gen_set_program(state: Int) -> (String, Int):
 	(src, st)
 
 
-pure func gen_dict_program(state: Int) -> (String, Int):
-	len_r: (Int, Int) = rng_int(state, 1, 6)
-	var st: Int = len_r[1]
+pure func gen_dict_program(state: RngState) -> (String, RngState):
+	len_r: (Int, RngState) = rng_int(state, 1, 6)
+	var st: RngState = len_r[1]
 	var sets: String = ""
 	var j: Int = 0
 	while j < len_r[0]:
-		val: (Int, Int) = rng_int(st, 0, 100)
+		val: (Int, RngState) = rng_int(st, 0, 100)
 		sets = sets + "    d = D.set(d, \"k" + j.to_string() + "\", " + val[0].to_string() + ")\n"
 		st = val[1]
 		j += 1
@@ -553,11 +576,11 @@ pure func gen_dict_program(state: Int) -> (String, Int):
 
 
 func test_set_programs_run() -> Bool:
-	var state: Int = rng_new(SEED + 800)
+	var state: RngState = rng_new(SEED + 800)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		prog: (String, Int) = gen_set_program(state)
+		prog: (String, RngState) = gen_set_program(state)
 		state = prog[1]
 		result: (Bool, String, Int) = compile_and_run(prog[0])
 		if not result[0]:
@@ -572,11 +595,11 @@ func test_set_programs_run() -> Bool:
 
 
 func test_dict_programs_run() -> Bool:
-	var state: Int = rng_new(SEED + 801)
+	var state: RngState = rng_new(SEED + 801)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		prog: (String, Int) = gen_dict_program(state)
+		prog: (String, RngState) = gen_dict_program(state)
 		state = prog[1]
 		result: (Bool, String, Int) = compile_and_run(prog[0])
 		if not result[0]:
@@ -593,10 +616,10 @@ func test_dict_programs_run() -> Bool:
 -- ============================================================================
 -- Record Generators & Properties
 -- ============================================================================
-pure func gen_record_program(state: Int) -> (String, Int):
-	x_r: (Int, Int) = rng_int(state, 0, 100)
-	y_r: (Int, Int) = rng_int(x_r[1], 0, 100)
-	op_r: (Int, Int) = rng_int(y_r[1], 0, 3)
+pure func gen_record_program(state: RngState) -> (String, RngState):
+	x_r: (Int, RngState) = rng_int(state, 0, 100)
+	y_r: (Int, RngState) = rng_int(x_r[1], 0, 100)
+	op_r: (Int, RngState) = rng_int(y_r[1], 0, 3)
 	op: String = match op_r[0]:
 		0: "    print((p.x + p.y).to_string())"
 		1: "    q: Point = { p | x = 99 }\n    print(q.x.to_string())"
@@ -608,11 +631,11 @@ pure func gen_record_program(state: Int) -> (String, Int):
 
 
 func test_record_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 900)
+	var state: RngState = rng_new(SEED + 900)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_record_program(state)
+		prog: (String, RngState) = gen_record_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -627,11 +650,11 @@ func test_record_programs_typecheck() -> Bool:
 
 
 func test_record_programs_run() -> Bool:
-	var state: Int = rng_new(SEED + 901)
+	var state: RngState = rng_new(SEED + 901)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		prog: (String, Int) = gen_record_program(state)
+		prog: (String, RngState) = gen_record_program(state)
 		state = prog[1]
 		result: (Bool, String, Int) = compile_and_run(prog[0])
 		if not result[0]:
@@ -666,18 +689,18 @@ func gen_generic_src(v: Int, n: Int) -> String:
 		) + "), 0)\n    print(a.to_string())\n    0\n"
 
 
-func gen_generic_program(state: Int) -> (String, Int):
-	variant_r: (Int, Int) = rng_int(state, 0, 4)
-	val_r: (Int, Int) = rng_int(variant_r[1], 1, 50)
+func gen_generic_program(state: RngState) -> (String, RngState):
+	variant_r: (Int, RngState) = rng_int(state, 0, 4)
+	val_r: (Int, RngState) = rng_int(variant_r[1], 1, 50)
 	(gen_generic_src(variant_r[0], val_r[0]), val_r[1])
 
 
 func test_generic_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 1000)
+	var state: RngState = rng_new(SEED + 1000)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_generic_program(state)
+		prog: (String, RngState) = gen_generic_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -692,11 +715,11 @@ func test_generic_programs_typecheck() -> Bool:
 
 
 func test_generic_programs_run() -> Bool:
-	var state: Int = rng_new(SEED + 1001)
+	var state: RngState = rng_new(SEED + 1001)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		prog: (String, Int) = gen_generic_program(state)
+		prog: (String, RngState) = gen_generic_program(state)
 		state = prog[1]
 		result: (Bool, String, Int) = compile_and_run(prog[0])
 		if not result[0]:
@@ -735,18 +758,18 @@ func gen_match_src(v: Int, n: Int) -> String:
 		) + "]))\n    print(safe_first([]))\n    0\n"
 
 
-func gen_match_program(state: Int) -> (String, Int):
-	variant_r: (Int, Int) = rng_int(state, 0, 5)
-	val_r: (Int, Int) = rng_int(variant_r[1], 0, 100)
+func gen_match_program(state: RngState) -> (String, RngState):
+	variant_r: (Int, RngState) = rng_int(state, 0, 5)
+	val_r: (Int, RngState) = rng_int(variant_r[1], 0, 100)
 	(gen_match_src(variant_r[0], val_r[0]), val_r[1])
 
 
 func test_match_programs_typecheck() -> Bool:
-	var state: Int = rng_new(SEED + 1100)
+	var state: RngState = rng_new(SEED + 1100)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_match_program(state)
+		prog: (String, RngState) = gen_match_program(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if not result[0]:
@@ -761,11 +784,11 @@ func test_match_programs_typecheck() -> Bool:
 
 
 func test_match_programs_run() -> Bool:
-	var state: Int = rng_new(SEED + 1101)
+	var state: RngState = rng_new(SEED + 1101)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < RUN_CASES and all_ok:
-		prog: (String, Int) = gen_match_program(state)
+		prog: (String, RngState) = gen_match_program(state)
 		state = prog[1]
 		result: (Bool, String, Int) = compile_and_run(prog[0])
 		if not result[0]:
@@ -799,17 +822,17 @@ func gen_type_error_src(v: Int) -> String:
 
 
 -- Bool used where Int expected
-func gen_type_error_variant(state: Int) -> (String, Int):
-	variant_r: (Int, Int) = rng_int(state, 0, 6)
+func gen_type_error_variant(state: RngState) -> (String, RngState):
+	variant_r: (Int, RngState) = rng_int(state, 0, 6)
 	(gen_type_error_src(variant_r[0]), variant_r[1])
 
 
 func test_type_error_variants_rejected() -> Bool:
-	var state: Int = rng_new(SEED + 1200)
+	var state: RngState = rng_new(SEED + 1200)
 	var all_ok: Bool = True
 	var i: Int = 0
 	while i < TYPECHECK_CASES and all_ok:
-		prog: (String, Int) = gen_type_error_variant(state)
+		prog: (String, RngState) = gen_type_error_variant(state)
 		state = prog[1]
 		result: (Bool, String) = compile_check(prog[0])
 		if result[0]:

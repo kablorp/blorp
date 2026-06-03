@@ -109,6 +109,8 @@ union Expression:
 	BuiltinRuntimeExpression(String)
 	FieldAccessExpression(Expression, String)
 	CallExpression(Expression, List[Expression])
+	OpaqueIntoExpression(TypeExpression, Expression)
+	OpaqueFromExpression(TypeExpression, Expression)
 	UnaryExpression(UnaryOp, Expression)
 	BinaryExpression(BinaryOp, Expression, Expression)
 	LogicalExpression(LogicalOp, Expression, Expression)
@@ -986,6 +988,14 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 			callee ?= value.expression_field("callee")
 			args ?= value.expression_array_field("args")
 			Ok(CallExpression(callee, args))
+		"OpaqueInto":
+			type_expression ?= value.type_expression_field("type")
+			inner ?= value.expression_field("value")
+			Ok(OpaqueIntoExpression(type_expression, inner))
+		"OpaqueFrom":
+			type_expression ?= value.type_expression_field("type")
+			inner ?= value.expression_field("value")
+			Ok(OpaqueFromExpression(type_expression, inner))
 		"Unary":
 			raw_op ?= value.string_field("op")
 			op ?= raw_op.unary_op_from_json()
@@ -1135,31 +1145,14 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 						Some(_): Err("With expression has error_value without error_name")
 						None: Ok(0)
 			body ?= value.expression_field("body")
-			Ok(
-				WithExpression(
-					name,
-					type_expression,
-					is_try,
-					expr,
-					error_name,
-					error_value,
-					body,
-				),
-			)
+			Ok(WithExpression(name, type_expression, is_try, expr, error_name, error_value, body))
 		"Lambda":
 			is_pure ?= value.bool_field("pure")
 			params ?= value.function_parameter_array_field("params")
 			body ?= value.expression_field("body")
 			return_type ?= value.optional_type_expression_field("return")
 			match return_type:
-				Some(return_type): Ok(
-					TypedLambdaExpression(
-						is_pure,
-						params,
-						return_type,
-						body,
-					),
-				)
+				Some(return_type): Ok(TypedLambdaExpression(is_pure, params, return_type, body))
 				None: Ok(LambdaExpression(is_pure, params, body))
 		"FuncDecl":
 			name ?= value.string_field("name")
@@ -1227,15 +1220,7 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 			timeout ?= value.optional_expression_field("timeout")
 			limit ?= value.optional_int_field("limit")
 			width ?= concurrently_loop_width_from_json(limit)
-			Ok(
-				ConcurrentlyLoopExpression(
-					var_name,
-					iter,
-					body,
-					timeout,
-					width,
-				),
-			)
+			Ok(ConcurrentlyLoopExpression(var_name, iter, body, timeout, width))
 		_: Err("unknown expression JSON tag: " + tag)
 
 
@@ -1665,6 +1650,8 @@ private pure func expression_prefers_multiline_call_argument(expr: Expression) -
 			DictionaryExpression(entries):
 				entries.length() > 1 or entries.dictionary_entries_prefer_multiline_call_argument()
 			AscriptionExpression(inner, _): inner.expression_prefers_multiline_call_argument()
+			OpaqueIntoExpression(_, inner): inner.expression_prefers_multiline_call_argument()
+			OpaqueFromExpression(_, inner): inner.expression_prefers_multiline_call_argument()
 			RangeExpression(start_expr, end_expr): expression_pair_prefers_multiline_call_argument(
 				start_expr,
 				end_expr,
@@ -2103,6 +2090,8 @@ private pure func expression_contains_multiline_collection_call_arg(expr: Expres
 		ListExpression(elems): elems.expression_list_contains_multiline_collection_call_arg()
 		VectorExpression(elems): elems.expression_list_contains_multiline_collection_call_arg()
 		AscriptionExpression(inner, _): inner.expression_contains_multiline_collection_call_arg()
+		OpaqueIntoExpression(_, inner): inner.expression_contains_multiline_collection_call_arg()
+		OpaqueFromExpression(_, inner): inner.expression_contains_multiline_collection_call_arg()
 		RangeExpression(start_expr, end_expr):
 			start_has_multiline_call: Bool = start_expr.expression_contains_multiline_collection_call_arg()
 			end_has_multiline_call: Bool = end_expr.expression_contains_multiline_collection_call_arg()
@@ -3280,6 +3269,16 @@ pure func expression_document(expr: Expression) -> Doc:
 						callee
 							.expression_document()
 							.cat(args.call_arguments_document())
+		OpaqueIntoExpression(type_expression, inner):
+			"into "
+				.text()
+				.cat(type_expression.type_document())
+				.cat([inner].call_arguments_document())
+		OpaqueFromExpression(type_expression, inner):
+			"from "
+				.text()
+				.cat(type_expression.type_document())
+				.cat([inner].call_arguments_document())
 		UnaryExpression(op, inner):
 			inner_document: Doc = match inner:
 				BinaryExpression(_, _, _): inner
@@ -3569,12 +3568,7 @@ pure func expression_document(expr: Expression) -> Doc:
 			error_value,
 			body,
 		)
-		LambdaExpression(is_pure, params, body): lambda_document(
-			is_pure,
-			params,
-			None,
-			body,
-		)
+		LambdaExpression(is_pure, params, body): lambda_document(is_pure, params, None, body)
 		TypedLambdaExpression(is_pure, params, return_type, body): lambda_document(
 			is_pure,
 			params,
@@ -3635,12 +3629,7 @@ pure func expression_document(expr: Expression) -> Doc:
 				body.expression_document()
 			text("detach ").cat(body_document)
 		ConcurrentlyLoopExpression(var_name, iter, body, timeout, width):
-			concurrently_loop_head_document(
-				var_name,
-				iter,
-				timeout,
-				width,
-			).cat(
+			concurrently_loop_head_document(var_name, iter, timeout, width).cat(
 				hardline()
 					.cat(body.block_body_document())
 					.indent(),

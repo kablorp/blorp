@@ -546,6 +546,8 @@ let rec lower_typed_expr_core (typed : TA.expr) : Core.core =
   | TA.ELogical (op, l, r) ->
       mk (CLog (op, lower_child_expr l, lower_child_expr r))
   | TA.EAscription (inner, _) -> lower_child_expr inner
+  | TA.EOpaqueInto (_, inner) | TA.EOpaqueFrom (_, inner) ->
+      { (lower_child_expr inner) with ty }
   (* === Call / Field === *)
   | TA.ECall (callee, args) -> (
       (* Phase 4.2 element-wise tensor lift: a unary call to a pure scalar

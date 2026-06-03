@@ -66,7 +66,12 @@ let task_closure ?(name = "_blorp_task_test") ?(def_id = 9000) ?(captures = [])
   }
 
 let type_alias_decl name target =
-  { alias_name = name; alias_type_params = []; alias_target = target }
+  {
+    alias_name = name;
+    alias_type_params = [];
+    alias_target = target;
+    alias_is_opaque = false;
+  }
 
 let resource_type_decl =
   {

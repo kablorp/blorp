@@ -386,6 +386,23 @@ let rec expr_to_json expr =
                  field "args" (array arg_jsons);
                ])
       | _ -> None)
+  | Ast.EOpaqueInto (ty, inner) | Ast.EOpaqueFrom (ty, inner) -> (
+      match expr_to_json inner with
+      | None -> None
+      | Some inner_json ->
+          let tag =
+            match expr.Ast.expr_desc with
+            | Ast.EOpaqueInto _ -> "OpaqueInto"
+            | Ast.EOpaqueFrom _ -> "OpaqueFrom"
+            | _ -> assert false
+          in
+          Some
+            (obj
+               [
+                 field "tag" (string tag);
+                 field "type" (type_expr_to_json ty);
+                 field "value" inner_json;
+               ]))
   | Ast.EUnary (op, inner) -> (
       match expr_to_json inner with
       | None -> None

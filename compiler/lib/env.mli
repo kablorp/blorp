@@ -114,6 +114,11 @@ type symbol_kind =
       contains_resource : bool;
     }
   | AliasSymbol of { type_params : string list; target : type_expr }
+  | OpaqueAliasSymbol of {
+      type_params : string list;
+      target : type_expr;
+      home_module : string option;
+    }
   | ConstructorSymbol of {
       parent_type : string;
       constructor_id : int;
@@ -321,6 +326,10 @@ val is_value_record : env -> string -> bool
 val add_alias : env -> string -> string list -> type_expr -> env
 (** Add a type alias to the environment *)
 
+val add_opaque_alias :
+  env -> string -> string list -> type_expr -> home_module:string option -> env
+(** Add an opaque type alias to the environment. *)
+
 val get_var_type : env -> string -> type_expr option
 (** Get the type of a variable *)
 
@@ -383,6 +392,10 @@ val find_records_with_fields : env -> string list -> string list
 
 val get_alias : env -> string -> (string list * type_expr) option
 (** Get a type alias: (type_params, target) *)
+
+val get_opaque_alias :
+  env -> string -> (string list * type_expr * string option) option
+(** Get an opaque type alias: (type_params, target, home_module) *)
 
 val disambiguate_nominal_dim_application : env -> type_expr -> type_expr
 (** Reinterpret parser-produced [Name[#N]] array suffix syntax as nominal type

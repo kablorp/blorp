@@ -41,6 +41,7 @@ let lsp_completion_keywords =
     "concurrently";
     "detach";
     "select";
+    "into";
     "from";
     "after";
     "sealed";

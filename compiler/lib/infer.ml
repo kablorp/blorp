@@ -3159,6 +3159,14 @@ let is_enum_type_in_env (env : Env.env) (name : string) : bool =
   | None -> false
 
 let type_layout_metadata_for_env (env : Env.env) =
+  let lookup_layout_alias name =
+    match Env.get_alias env name with
+    | Some _ as alias -> alias
+    | None -> (
+        match Env.get_opaque_alias env name with
+        | Some (type_params, target, _) -> Some (type_params, target)
+        | None -> None)
+  in
   let is_managed_name name =
     match Env.get_record env name with
     | Some _ -> not (Env.is_value_record env name)
@@ -3169,7 +3177,7 @@ let type_layout_metadata_for_env (env : Env.env) =
   in
   Core_type_layout.metadata ~is_managed_name
     ~is_value_record_name:(Env.is_value_record env)
-    ~is_enum_name:(is_enum_type_in_env env) ~lookup_alias:(Env.get_alias env) ()
+    ~is_enum_name:(is_enum_type_in_env env) ~lookup_alias:lookup_layout_alias ()
 
 (** Check if a type is a primitive that has built-in operator support *)
 let is_primitive_type ?(env : Env.env option) (ty : type_expr) : bool =
@@ -4372,6 +4380,8 @@ and zonk_expr_desc = function
   | EUnary (op, x) -> EUnary (op, zonk_expr x)
   | ELogical (op, a, b) -> ELogical (op, zonk_expr a, zonk_expr b)
   | EAscription (x, ty) -> EAscription (zonk_expr x, Types.zonk_type ty)
+  | EOpaqueInto (ty, x) -> EOpaqueInto (Types.zonk_type ty, zonk_expr x)
+  | EOpaqueFrom (ty, x) -> EOpaqueFrom (Types.zonk_type ty, zonk_expr x)
   | ECall (fn, args) -> ECall (zonk_expr fn, List.map zonk_expr args)
   | EIf (c, t, e) -> EIf (zonk_expr c, zonk_expr t, Option.map zonk_expr e)
   | EMatch (scrut, arms) ->
@@ -4535,6 +4545,63 @@ let validate_value_ascription_type loc ty =
 (* ============================================================================
    Main Expression Inference
    ============================================================================ *)
+
+type opaque_conversion = OpaqueInto | OpaqueFrom
+
+let opaque_conversion_name = function
+  | OpaqueInto -> "into"
+  | OpaqueFrom -> "from"
+
+let opaque_conversion_desc conversion ty expr =
+  match conversion with
+  | OpaqueInto -> EOpaqueInto (ty, expr)
+  | OpaqueFrom -> EOpaqueFrom (ty, expr)
+
+let opaque_conversion_same_module ~home_module loc =
+  match (home_module, loc.loc_file) with
+  | None, _ -> true
+  | Some home, Some current -> String.equal home current
+  | Some _, None -> false
+
+let resolve_opaque_conversion_type ctx loc parsed_ty =
+  let resolved = resolve_value_ascription ctx parsed_ty in
+  let source_ty = Type_resolution.source resolved in
+  let opaque_ty = Type_resolution.canonical resolved in
+  match opaque_ty with
+  | TyNamed (name, args) -> (
+      match Env.get_opaque_alias ctx.env name with
+      | Some (type_params, target, home_module) ->
+          if List.length type_params <> List.length args then
+            error loc
+              (Printf.sprintf
+                 "Opaque type '%s' expects %d type argument%s, got %d" name
+                 (List.length type_params)
+                 (if List.length type_params = 1 then "" else "s")
+                 (List.length args))
+          else if not (opaque_conversion_same_module ~home_module loc) then
+            error_with ~notes:[]
+              ~help:
+                (Some
+                   "Use a public constructor or accessor from the module that \
+                    defines the opaque type.")
+              loc
+              (Printf.sprintf
+                 "Opaque type '%s' can only use into/from conversions in its \
+                  defining module"
+                 name)
+          else
+            let target =
+              Env.direct_subst (List.combine type_params args) target
+            in
+            Ok (source_ty, opaque_ty, target)
+      | None ->
+          error loc
+            (Printf.sprintf "Type '%s' is not an opaque type"
+               (type_to_string opaque_ty)))
+  | _ ->
+      error loc
+        (Printf.sprintf "Expected an opaque named type, got %s"
+           (type_to_string opaque_ty))
 
 (** Infer the type of an expression *)
 let rec infer_expr (ctx : infer_ctx) (expr : expr) :
@@ -5101,6 +5168,10 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
              \       found: %s"
              (type_to_string ascribed_ty)
              (type_to_string value_ty))
+  | EOpaqueInto (parsed_ty, inner) ->
+      infer_opaque_conversion ctx expr OpaqueInto parsed_ty inner loc
+  | EOpaqueFrom (parsed_ty, inner) ->
+      infer_opaque_conversion ctx expr OpaqueFrom parsed_ty inner loc
   (* Function calls *)
   | ECall (callee, args) -> infer_call ctx expr callee args loc
   (* If expressions *)
@@ -6248,7 +6319,9 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       | Some { kind = ConstructorSymbol _; _ } ->
           error loc (Printf.sprintf "Cannot assign to constructor '%s'" var)
       | Some { kind = AliasSymbol _; _ } ->
-          error loc (Printf.sprintf "Cannot assign to type alias '%s'" var))
+          error loc (Printf.sprintf "Cannot assign to type alias '%s'" var)
+      | Some { kind = OpaqueAliasSymbol _; _ } ->
+          error loc (Printf.sprintf "Cannot assign to opaque type '%s'" var))
   (* Variable declaration *)
   | EVarDecl (name, ty_opt, value, is_mutable) -> (
       (* Reject same-scope re-declaration *)
@@ -7592,6 +7665,46 @@ and validate_index ctx loc idx dim coll' =
             "Subscript index must be a compile-time constant or a loop \
              variable proven in-bounds (e.g., for i in 0..length(v): v[i]). \
              Use get() for runtime-checked access")
+
+and infer_opaque_conversion ctx expr conversion parsed_ty inner loc =
+  let* source_ty, opaque_ty, target_ty =
+    resolve_opaque_conversion_type ctx loc parsed_ty
+  in
+  match conversion with
+  | OpaqueInto ->
+      let* inner_ty, inner' = infer_expected_value_expr ctx target_ty inner in
+      let value_ty = expr_value_type_or inner' inner_ty in
+      if ctx_types_compatible ctx target_ty value_ty then
+        Ok
+          ( opaque_ty,
+            with_inferred_type
+              {
+                expr with
+                expr_desc = opaque_conversion_desc conversion source_ty inner';
+              }
+              opaque_ty )
+      else
+        error inner.expr_loc
+          (Printf.sprintf "%s expected %s, got %s"
+             (opaque_conversion_name conversion)
+             (type_to_string target_ty) (type_to_string value_ty))
+  | OpaqueFrom ->
+      let* inner_ty, inner' = infer_expected_value_expr ctx opaque_ty inner in
+      let value_ty = expr_value_type_or inner' inner_ty in
+      if ctx_types_compatible ctx opaque_ty value_ty then
+        Ok
+          ( target_ty,
+            with_inferred_type
+              {
+                expr with
+                expr_desc = opaque_conversion_desc conversion source_ty inner';
+              }
+              target_ty )
+      else
+        error inner.expr_loc
+          (Printf.sprintf "%s expected %s, got %s"
+             (opaque_conversion_name conversion)
+             (type_to_string opaque_ty) (type_to_string value_ty))
 
 (** Infer a value expression that must choose its own type. Surrounding return
     or container expectations must not shape operands, scrutinees, indices,

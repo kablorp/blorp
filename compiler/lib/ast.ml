@@ -238,6 +238,10 @@ and expr_desc =
   | EUnary of unop * expr
   | ELogical of logop * expr * expr
   | EAscription of expr * type_expr
+  | EOpaqueInto of type_expr * expr
+      (** [into Type(expr)] — module-local construction for opaque types. *)
+  | EOpaqueFrom of type_expr * expr
+      (** [from Type(expr)] — module-local representation access for opaque types. *)
   | ECall of expr * expr list
   | EIf of expr * expr * expr option  (** condition, then, else *)
   | EMatch of expr * match_case list
@@ -536,6 +540,7 @@ type type_alias_decl = {
   alias_name : string;
   alias_type_params : type_param_decl list;
   alias_target : type_expr;
+  alias_is_opaque : bool;
 }
 (** Type alias declaration *)
 
@@ -680,6 +685,8 @@ let expr_children (e : expr) : expr list =
       []
   | EUnary (_, e)
   | EAscription (e, _)
+  | EOpaqueInto (_, e)
+  | EOpaqueFrom (_, e)
   | EFieldAccess (e, _)
   | EAssign (_, e)
   | ECompoundAssign (_, _, e)
@@ -761,6 +768,8 @@ let expr_map_children (f : expr -> expr) (e : expr) : expr =
         e.expr_desc
     | EUnary (op, e1) -> EUnary (op, f e1)
     | EAscription (e1, ty) -> EAscription (f e1, ty)
+    | EOpaqueInto (ty, e1) -> EOpaqueInto (ty, f e1)
+    | EOpaqueFrom (ty, e1) -> EOpaqueFrom (ty, f e1)
     | EFieldAccess (e1, field) -> EFieldAccess (f e1, field)
     | EAssign (name, e1) -> EAssign (name, f e1)
     | ECompoundAssign (name, op, e1) -> ECompoundAssign (name, op, f e1)

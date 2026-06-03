@@ -263,6 +263,8 @@ let rec scan_expr scope refs expr =
   | ELiteral _ | EVoid | EBreak | EContinue -> refs
   | EUnary (_, e) -> scan_expr scope refs e
   | EAscription (e, ty) -> scan_type scope (scan_expr scope refs e) ty
+  | EOpaqueInto (ty, e) | EOpaqueFrom (ty, e) ->
+      scan_type scope (scan_expr scope refs e) ty
   | EBinary (_, a, b) | ELogical (_, a, b) | ERange (a, b) ->
       scan_expr scope (scan_expr scope refs a) b
   | ECall (({ expr_desc = EFieldAccess (recv, method_name); _ } as callee), args)

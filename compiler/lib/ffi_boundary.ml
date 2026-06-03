@@ -261,6 +261,14 @@ let validate_metadata (foreign : Ast.foreign_func) =
   List.rev errors
 
 let metadata_for_env (env : Env.env) =
+  let lookup_layout_alias name =
+    match Env.get_alias env name with
+    | Some _ as alias -> alias
+    | None -> (
+        match Env.get_opaque_alias env name with
+        | Some (type_params, target, _) -> Some (type_params, target)
+        | None -> None)
+  in
   let is_value_record_name name = Env.is_value_record env name in
   let is_enum_name name =
     match Env.get_type_kind env name with Some TypeEnum -> true | _ -> false
@@ -274,4 +282,4 @@ let metadata_for_env (env : Env.env) =
         | Some TypeEnum | Some TypeBuiltin | Some TypeResource | None -> false)
   in
   Core_type_layout.metadata ~is_managed_name ~is_value_record_name ~is_enum_name
-    ~lookup_alias:(Env.get_alias env) ()
+    ~lookup_alias:lookup_layout_alias ()

@@ -25,7 +25,6 @@
 | `heap` | Min-heap priority queue |
 | `deque` | Double-ended queue |
 | `sorted_map` | Sorted key-value map |
-| `graph` | Directed weighted graph |
 | `stream` | Lazy, composable sequences |
 | `cache` | LRU cache with fixed capacity |
 
@@ -37,7 +36,7 @@
 | `parser` | Parser combinator library |
 | `regex` | POSIX Extended regular expressions |
 | `html` | HTML escaping/unescaping |
-| `term` | ANSI terminal colors, styles, tables, progress bars |
+| `terminal` | ANSI terminal colors, styles, tables, progress bars |
 
 ## Serialization & Formats
 | Module | Description |
@@ -88,7 +87,6 @@
 | `memory` | Memory statistics and leak detection |
 | `instrumentation` | Scheduler stats, timing, and optimizer-barrier helpers for profiling and benchmarks |
 | `log` | Structured logging with JSON output |
-| `rate_limit` | Pure token-bucket and fixed-window rate limiters |
 | `channel` | Bounded channels and `ConcurrencyError` declarations |
 
 ## Cryptography

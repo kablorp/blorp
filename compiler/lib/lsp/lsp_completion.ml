@@ -152,6 +152,13 @@ let completions_from_env ?(skip = fun _ -> false) (env : Env.env)
                          (Printf.sprintf "alias %s = %s" sym.name
                             (Types.type_to_string target))
                        ~sort_text:("2_" ^ sym.name))
+              | Env.OpaqueAliasSymbol { target; _ } ->
+                  Some
+                    (completion_item ~label:sym.name ~kind:kind_class
+                       ~detail:
+                         (Printf.sprintf "opaque type %s = %s" sym.name
+                            (Types.type_to_string target))
+                       ~sort_text:("2_" ^ sym.name))
             in
             match item with Some i -> items := i :: !items | None -> ()
           end)

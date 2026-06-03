@@ -84,7 +84,7 @@ tests/
 │   └── simd/              # SIMD compatibility and runtime tests
 ├── test_std/              # Runtime tests for std/, mirroring std/ where practical
 │   ├── list/ dict/ set/   # Core collection tests
-│   ├── cache/ deque/ heap/ sorted_map/ graph/
+│   ├── cache/ deque/ heap/ sorted_map/
 │   ├── io/                # I/O module tests
 │   └── stream/            # Stream tests
 ├── test_pkg/              # Optional runtime tests for pkg/, created when pkg tests exist

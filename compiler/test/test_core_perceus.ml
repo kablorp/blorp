@@ -424,7 +424,12 @@ let test_unknown_named_type_raises () =
 
 let test_alias_layout_uses_registry () =
   let alias name target =
-    { alias_name = name; alias_type_params = []; alias_target = target }
+    {
+      alias_name = name;
+      alias_type_params = [];
+      alias_target = target;
+      alias_is_opaque = false;
+    }
   in
   let decl a = { cd_desc = CDTypeAlias a; cd_loc = loc; cd_doc = None } in
   let env =

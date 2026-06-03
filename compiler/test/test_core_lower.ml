@@ -1648,6 +1648,7 @@ let test_lower_type_alias_passthrough () =
       alias_name = "Coord";
       alias_type_params = [];
       alias_target = TyTuple [ ty_int; ty_int ];
+      alias_is_opaque = false;
     }
   in
   let cd = lower_decl (mk_decl (DTypeAlias adecl)) in
