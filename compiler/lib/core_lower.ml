@@ -466,17 +466,22 @@ let bind_loop_view_fields ~loc
 let lower_duration_timeout_milliseconds (duration : Core.core) : Core.core =
   let loc = duration.loc in
   let module B = Core.Build in
+  let microseconds_per_millisecond = 1000 in
   let duration_name = fresh_timeout_name "duration" in
   let us_name = fresh_timeout_name "us" in
   let whole_ms_name = fresh_timeout_name "whole_ms" in
-  let duration_ref = B.var ~loc ~ty:duration.ty duration_name in
-  let us_field = B.field duration_ref "us" ~ty:ty_int in
+  let duration_us = B.var ~loc ~ty:ty_int duration_name in
   let us_ref = B.var ~loc ~ty:ty_int us_name in
-  let whole_ms_rhs = B.div us_ref (B.lit_int ~loc 1000) in
+  let whole_ms_rhs =
+    B.div us_ref (B.lit_int ~loc microseconds_per_millisecond)
+  in
   let whole_ms_ref = B.var ~loc ~ty:ty_int whole_ms_name in
   let rounded_ms =
     B.if_
-      ~cond:(B.eq (B.modulo us_ref (B.lit_int ~loc 1000)) (B.lit_int ~loc 0))
+      ~cond:
+        (B.eq
+           (B.modulo us_ref (B.lit_int ~loc microseconds_per_millisecond))
+           (B.lit_int ~loc 0))
       ~then_:whole_ms_ref
       ~else_:(B.add whole_ms_ref (B.lit_int ~loc 1))
   in
@@ -488,7 +493,7 @@ let lower_duration_timeout_milliseconds (duration : Core.core) : Core.core =
       ~cond:(B.le us_ref (B.lit_int ~loc 0))
       ~then_:(B.lit_int ~loc 0) ~else_:positive_ms
   in
-  let converted = B.let_ us_name ~ty:ty_int ~rhs:us_field ~body:clamped_ms in
+  let converted = B.let_ us_name ~ty:ty_int ~rhs:duration_us ~body:clamped_ms in
   B.let_ duration_name ~ty:duration.ty ~rhs:duration ~body:converted
 
 (* ============================================================================

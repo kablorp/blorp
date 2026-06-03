@@ -1613,7 +1613,17 @@ let process_type_alias ?(loc = dummy_loc) ?home_module (state : check_state)
           | None -> loc.loc_file)
     else add_alias state.env decl.alias_name type_params decl.alias_target
   in
-  { state with env }
+  let state = { state with env } in
+  if decl.alias_is_opaque then
+    match home_module with
+    | Some module_path ->
+        record_type_home state ~name:decl.alias_name ~module_path
+    | None -> (
+        match loc.loc_file with
+        | Some module_path ->
+            record_type_home state ~name:decl.alias_name ~module_path
+        | None -> state)
+  else state
 
 let validate_default_foreign_arg_safety loc (state : check_state)
     (sig_ : checked_func_signature) (func : func_decl) : check_state =

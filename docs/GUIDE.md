@@ -1207,10 +1207,10 @@ does not satisfy `T` unless it came from a value already typed as `T`, but the
 declared return type still guides nested literals:
 
 ```blorp
-record Cache[K, V] {capacity: Int, data: Dict[K, (V, Int)], counter: Int}
+record Box[K, V] {key: K, value: V}
 
-pure func cache[K, V](capacity: Int) -> Cache[K, V]:
-    {capacity = capacity, data = {}, counter = 0}
+pure func box[K, V](key: K, value: V) -> Box[K, V]:
+    {key = key, value = value}
 
 pure func bad[T]() -> T:
     42   -- error: Int is not an arbitrary T

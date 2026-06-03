@@ -1382,6 +1382,102 @@ let import_line_module_name line =
   in
   if stop = 0 then "" else Filename.basename (String.sub trimmed 0 stop)
 
+let import_block_indent = "    "
+
+let split_import_symbols raw =
+  let flush current acc =
+    let sym = Buffer.contents current |> String.trim in
+    Buffer.clear current;
+    if sym = "" then acc else sym :: acc
+  in
+  let rec loop depth current acc i =
+    if i >= String.length raw then List.rev (flush current acc)
+    else
+      let ch = raw.[i] in
+      match ch with
+      | ',' when depth = 0 -> loop depth current (flush current acc) (i + 1)
+      | '(' ->
+          Buffer.add_char current ch;
+          loop (depth + 1) current acc (i + 1)
+      | ')' ->
+          Buffer.add_char current ch;
+          loop (max 0 (depth - 1)) current acc (i + 1)
+      | _ ->
+          Buffer.add_char current ch;
+          loop depth current acc (i + 1)
+  in
+  loop 0 (Buffer.create (String.length raw)) [] 0
+
+type selective_import_line = {
+  import_head : string;
+  import_module_name : string;
+  import_symbols : string list;
+}
+
+let parse_selective_import_line line =
+  let trimmed = String.trim line in
+  match String.index_opt trimmed ':' with
+  | None -> None
+  | Some colon ->
+      let head = String.sub trimmed 0 colon |> String.trim in
+      let raw_symbols =
+        String.sub trimmed (colon + 1) (String.length trimmed - colon - 1)
+      in
+      Some
+        {
+          import_head = head;
+          import_module_name = import_line_module_name line;
+          import_symbols = split_import_symbols raw_symbols;
+        }
+
+let format_selective_import_line parsed =
+  Printf.sprintf "%s%s: %s" import_block_indent parsed.import_head
+    (String.concat ", " parsed.import_symbols)
+
+let merge_symbol_lists existing additions =
+  List.fold_left
+    (fun acc sym -> if List.mem sym acc then acc else acc @ [ sym ])
+    existing additions
+
+let merge_doctest_import_line lines line =
+  match parse_selective_import_line line with
+  | Some requested ->
+      let rec go acc = function
+        | [] ->
+            if
+              List.exists
+                (fun existing ->
+                  import_line_module_name existing
+                  = requested.import_module_name)
+                lines
+            then lines
+            else lines @ [ line ]
+        | existing :: rest -> (
+            match parse_selective_import_line existing with
+            | Some parsed when parsed.import_head = requested.import_head ->
+                let merged =
+                  {
+                    parsed with
+                    import_symbols =
+                      merge_symbol_lists parsed.import_symbols
+                        requested.import_symbols;
+                  }
+                  |> format_selective_import_line
+                in
+                List.rev_append acc (merged :: rest)
+            | _ -> go (existing :: acc) rest)
+      in
+      go [] lines
+  | None ->
+      if
+        List.mem line lines
+        || List.exists
+             (fun existing ->
+               import_line_module_name existing = import_line_module_name line)
+             lines
+      then lines
+      else lines @ [ line ]
+
 (** Collect exported function names from a program *)
 let collect_exported_names program =
   List.filter_map
@@ -1505,14 +1601,11 @@ let generate_doctest_program_with_map_impl source_path program doctests =
        else [])
     @ prelude_imports
   in
-  let doctest_imports =
-    doctest_imports
-    |> List.filter (fun line ->
-        let mod_name = import_line_module_name line in
-        (not (List.mem line import_lines))
-        && not (List.mem mod_name imported_mod_names))
+  let all_import_lines =
+    List.fold_left merge_doctest_import_line
+      (import_lines @ extra_lines)
+      doctest_imports
   in
-  let all_import_lines = import_lines @ extra_lines @ doctest_imports in
   if all_import_lines <> [] then begin
     emit "import:\n";
     List.iter
