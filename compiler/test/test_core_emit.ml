@@ -2595,12 +2595,26 @@ let test_escape_nul_string_literal_keeps_explicit_length () =
     (contains_sub output "blorp_string_literal_len(\"a\\000b\", 3L)")
 
 let test_emit_impl_methods () =
+  let point_ty = TyNamed ("Point", []) in
+  let point_decl : record_decl =
+    {
+      record_name = "Point";
+      record_type_params = [];
+      record_fields =
+        [
+          { field_name = "x"; field_type = ty_int; field_loc = loc };
+          { field_name = "y"; field_type = ty_int; field_loc = loc };
+        ];
+      record_is_value = true;
+      record_is_builtin = false;
+    }
+  in
   let body =
     mk
       (CBin
          ( Add,
-           mk (CField (cvar "self" (TyNamed ("Point", [])), "x")) ty_int,
-           mk (CField (cvar "other" (TyNamed ("Point", [])), "x")) ty_int ))
+           mk (CField (cvar "self" point_ty, "x")) ty_int,
+           mk (CField (cvar "other" point_ty, "x")) ty_int ))
       ty_int
   in
   let method_func : core_func =
@@ -2610,16 +2624,8 @@ let test_emit_impl_methods () =
       cf_module = None;
       cf_params =
         [
-          {
-            cp_name = Var.named "self";
-            cp_ty = TyNamed ("Point", []);
-            cp_loc = loc;
-          };
-          {
-            cp_name = Var.named "other";
-            cp_ty = TyNamed ("Point", []);
-            cp_loc = loc;
-          };
+          { cp_name = Var.named "self"; cp_ty = point_ty; cp_loc = loc };
+          { cp_name = Var.named "other"; cp_ty = point_ty; cp_loc = loc };
         ];
       cf_return_ty = ty_int;
       cf_body = Some body;
@@ -2631,11 +2637,16 @@ let test_emit_impl_methods () =
   let impl : core_impl =
     {
       ci_trait = "Addable";
-      ci_for_type = TyNamed ("Point", []);
+      ci_for_type = point_ty;
       ci_methods = [ method_func ];
     }
   in
-  let prog = [ { cd_desc = CDImpl impl; cd_loc = loc; cd_doc = None } ] in
+  let prog =
+    [
+      { cd_desc = CDRecord point_decl; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDImpl impl; cd_loc = loc; cd_doc = None };
+    ]
+  in
   let output = emit_program_to_string prog in
   Alcotest.(check bool)
     "has mangled name" true
@@ -2980,6 +2991,11 @@ let test_emit_concurrent_capture_release_mask () =
   Alcotest.(check bool)
     "releases captured task value with closure" true
     (contains_sub output "->env_release_mask = 1UL;");
+  Alcotest.(check bool)
+    "protects moved task capture during cancellation" true
+    (contains_sub output
+       "blorp_task_cleanup_push(&__blorp_cleanup_s, &s, (void*)s, \
+        blorp_cleanup_release_arc_only_value);");
   Alcotest.(check bool)
     "transfers emitter's closure ref to task spawn" true
     (contains_sub output "blorp_task_spawn_owned");

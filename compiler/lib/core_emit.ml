@@ -7551,8 +7551,10 @@ and emit_lambda_body (ctx : Core_emit_context.t)
     List.iteri
       (fun i (name, ty) ->
         emit_capture_unbox ctx name ty i;
-        if List.mem name cl.cl_moved_captures then
-          emit_line ctx (Printf.sprintf "__e[%d] = NULL;" i))
+        if List.mem name cl.cl_moved_captures then begin
+          emit_line ctx (Printf.sprintf "__e[%d] = NULL;" i);
+          emit_cancellation_cleanup_push ctx (Var.named name) ty
+        end)
       cl.cl_captures
   end;
   List.iteri
