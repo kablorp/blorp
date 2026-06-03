@@ -95,8 +95,20 @@ func detached_echo_client_ip(port: Int, value: Int, done: Channel[Int]) -> Bool:
 	actual == value
 
 
+pure func delayed_connect_sleep_ms() -> Int:
+	50
+
+
+pure func continue_source_accept_timeout_ms() -> Int:
+	10
+
+
+pure func concurrent_echo_accept_timeout_ms() -> Int:
+	1000
+
+
 func delayed_connect_only_result(port_num: Int) -> Result[Int, TcpError]:
-	sleep(30)
+	sleep(delayed_connect_sleep_ms())
 	remote ?= port(port_num)
 	with _ ?= connect_loopback(IPv4, remote):
 		Ok(1)
@@ -286,7 +298,7 @@ func test_connections_source_concurrent_echo() -> Bool:
 
 func scoped_connections_source_concurrent_echo() -> Result[Bool, TcpError]:
 	with listener ?= listen_loopback_any_port(IPv4, 16):
-		ignored ?= set_timeout(listener, 50)
+		ignored ?= set_timeout(listener, concurrent_echo_accept_timeout_ms())
 		port_num ?= local_port(listener)
 		done: Channel[Int] = channel(1)
 		detach detached_echo_client(port_num, 88, done)
@@ -307,7 +319,7 @@ func test_connections_continue_skips_accept_timeout() -> Bool:
 
 func scoped_connections_continue_skips_accept_timeout() -> Result[Bool, TcpError]:
 	with listener ?= listen_loopback_any_port(IPv4, 16):
-		ignored ?= set_timeout(listener, 1)
+		ignored ?= set_timeout(listener, continue_source_accept_timeout_ms())
 		port_num ?= local_port(listener)
 		done: Channel[Int] = channel(1)
 		detach delayed_connect_only(port_num, done)
@@ -416,6 +428,22 @@ func scoped_accept_timeout() -> Result[Bool, TcpError]:
 			Ok(False)
 
 
+pure func keepalive_chunk_count() -> Int:
+	40
+
+
+pure func keepalive_write_delay_ms() -> Int:
+	10
+
+
+pure func keepalive_read_timeout_ms() -> Int:
+	250
+
+
+pure func keepalive_idle_after_writes_ms() -> Int:
+	keepalive_read_timeout_ms() + 100
+
+
 func keepalive_timeout_client_result(
 	port_num: Int,
 	count: Int,
@@ -440,7 +468,12 @@ func keepalive_timeout_client_result(
 
 
 func keepalive_timeout_client(port: Int, done: Channel[Bool]) -> Bool:
-	ok: Bool = match keepalive_timeout_client_result(port, 60, 10, 100):
+	ok: Bool = match keepalive_timeout_client_result(
+		port,
+		keepalive_chunk_count(),
+		keepalive_write_delay_ms(),
+		keepalive_idle_after_writes_ms(),
+	):
 		Ok(value): value
 		Err(_): False
 	_ = send(done, ok)
@@ -459,10 +492,10 @@ func scoped_keepalive_reads_do_not_inherit_stale_timeout() -> Result[Bool, TcpEr
 		done: Channel[Bool] = channel(1)
 		detach keepalive_timeout_client(port_num, done)
 		with peer ?= accept(listener):
-			ignored ?= set_stream_timeout(peer, 30)
+			ignored ?= set_stream_timeout(peer, keepalive_read_timeout_ms())
 			var count: Int = 0
 			var reads_ok: Bool = True
-			while count < 60 and reads_ok:
+			while count < keepalive_chunk_count() and reads_ok:
 				match read_chunk(peer, 1):
 					Ok(chunk):
 						reads_ok = chunk.length() == 1
@@ -475,7 +508,7 @@ func scoped_keepalive_reads_do_not_inherit_stale_timeout() -> Result[Bool, TcpEr
 			client_ok: Bool = match recv_timeout(done, 1000):
 				Some(ok): ok
 				None: False
-			Ok(reads_ok and count == 60 and idle_timed_out and client_ok)
+			Ok(reads_ok and count == keepalive_chunk_count() and idle_timed_out and client_ok)
 
 
 func test_read_timeout_reports_error() -> Bool:
