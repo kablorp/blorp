@@ -53,6 +53,7 @@ type state = {
   mutable task_counter : int;
   mutable hoisted : core_decl list;
   mutable current_module : string option;
+  perceus_env : Core_perceus.type_env;
   constructor_names : (string, unit) Hashtbl.t;
   global_function_refs : (string, function_ref_target) Hashtbl.t;
   global_function_refs_by_def_id : (int, function_ref_target) Hashtbl.t;
@@ -388,6 +389,29 @@ let wrap_fn_ref_as_closure (state : state) ~(bound : StringSet.t) (arg : core) :
           })
   | _ -> arg
 
+let task_capture_moves_env_slot (capture : task_capture) : bool =
+  match capture.task_capture_kind with
+  | TaskCopyCapture | TaskMoveResourceItem -> true
+  | TaskStructuredTaskBorrow -> false
+
+let balance_task_copy_capture (state : state) ~(loc : Ast.loc)
+    (capture : task_capture) (body : core) : core =
+  match capture.task_capture_kind with
+  | TaskCopyCapture ->
+      let param =
+        {
+          cp_name = Var.named capture.task_capture_name;
+          cp_ty = capture.task_capture_ty;
+          cp_loc = loc;
+        }
+      in
+      Core_perceus.balance_consumed_param_body state.perceus_env param body
+  | TaskMoveResourceItem | TaskStructuredTaskBorrow -> body
+
+let balance_task_copy_captures (state : state) ~(loc : Ast.loc)
+    (captures : task_capture list) (body : core) : core =
+  List.fold_right (balance_task_copy_capture state ~loc) captures body
+
 let hoist_task_closure ?(capture_kind_of = fun _ -> TaskCopyCapture)
     (state : state) ~(loc : Ast.loc) ~(capturable : StringSet.t) ~(body : core)
     ~(return_ty : Ast.type_expr) : task_closure =
@@ -402,12 +426,13 @@ let hoist_task_closure ?(capture_kind_of = fun _ -> TaskCopyCapture)
         })
       captures
   in
+  let body = balance_task_copy_captures state ~loc task_captures body in
   let moved_captures =
     task_captures
     |> List.filter_map (fun capture ->
-        match capture.task_capture_kind with
-        | TaskMoveResourceItem -> Some capture.task_capture_name
-        | TaskCopyCapture | TaskStructuredTaskBorrow -> None)
+        if task_capture_moves_env_slot capture then
+          Some capture.task_capture_name
+        else None)
   in
   let id = state.task_counter in
   state.task_counter <- id + 1;
@@ -1123,11 +1148,14 @@ let scan_names (prog : core_program) :
 
 let make_state ?(wrap_function_refs = true) (prog : core_program) : state =
   let ctors, function_refs, function_refs_by_def_id = scan_names prog in
+  let perceus_env = Core_perceus.build_type_env prog in
+  Core_perceus.populate_user_call_contracts perceus_env prog;
   {
     counter = 0;
     task_counter = 0;
     hoisted = [];
     current_module = None;
+    perceus_env;
     constructor_names = ctors;
     global_function_refs = function_refs;
     global_function_refs_by_def_id = function_refs_by_def_id;

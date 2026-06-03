@@ -877,6 +877,9 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
         consumed_refs = max 0 (uses.consumed_refs - 1);
         touched = true;
       }
+  | CDrop (v, _, body) when v.vname = name ->
+      seq_ownership_uses consume_ownership_use
+        (summarize_linear_ownership_uses env name body)
   | CDup (_, _, body) | CDrop (_, _, body) ->
       summarize_linear_ownership_uses env name body
   | CIf (c, t, el) ->
@@ -1241,6 +1244,9 @@ let rec summarize_function_return_ownership_uses (env : type_env)
       seq_ownership_uses
         (summarize_linear_ownership_uses env name head)
         (summarize_function_return_ownership_uses env name return_ty tail)
+  | CDrop (v, _, body) when v.vname = name ->
+      seq_ownership_uses consume_ownership_use
+        (summarize_function_return_ownership_uses env name return_ty body)
   | CDup (_, _, body) | CDrop (_, _, body) ->
       summarize_function_return_ownership_uses env name return_ty body
   | _ when managed_return && expr_result_aliases_name env name e ->

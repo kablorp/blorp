@@ -134,11 +134,19 @@ resource type TcpStream = builtin("blorp_tcp_close_stream")
 The current public API is:
 
 ```blorp
-listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
-listen_numeric(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
+port(value: Int) -> Result[Port, TcpError]
+parse_ip(text: String) -> Result[IpAddress, TcpError]
+dns_name(text: String) -> Result[DnsName, TcpError]
+listen_loopback(family: IpFamily, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+listen_loopback_any_port(family: IpFamily, backlog: Int) -> Result[TcpListener, TcpError]
+listen_any_interface(family: IpFamily, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+listen_any_interface_any_port(family: IpFamily, backlog: Int) -> Result[TcpListener, TcpError]
+listen_ip(address: IpAddress, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+listen_ip_any_port(address: IpAddress, backlog: Int) -> Result[TcpListener, TcpError]
 accept(listener: TcpListener) -> Result[TcpStream, TcpError]
-connect(host: String, port: Int) -> Result[TcpStream, TcpError]
-connect_numeric(host: String, port: Int) -> Result[TcpStream, TcpError]
+connect_loopback(family: IpFamily, port: Port) -> Result[TcpStream, TcpError]
+connect_ip(address: IpAddress, port: Port) -> Result[TcpStream, TcpError]
+connect_name(name: DnsName, port: Port) -> Result[TcpStream, TcpError]
 read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
 write(stream: TcpStream, data: Bytes) -> Result[Int, TcpError]
 write_all(stream: TcpStream, data: Bytes) -> Result[Void, TcpError]
@@ -157,12 +165,11 @@ Current runtime shape:
   state and releases the ARC wrapper, so resource finalizers cannot silently
   leak the handle object after closing the fd;
 - newly created and adopted sockets are placed in nonblocking mode;
-- `accept`, numeric-address `connect`, `read`, and `write` park fibers through
+- `accept`, validated numeric-address `connect`, `read`, and `write` park fibers through
   the scheduler's poll-backed I/O reactor instead of pinning OS workers while
   waiting for socket readiness;
-- `listen_numeric` and `connect_numeric` reject hostname inputs before
-  `getaddrinfo`, giving callers an enforceable no-DNS acquisition path for
-  virtual-thread-friendly networking setup;
+- `listen_ip`, `connect_ip`, and loopback helpers give callers an enforceable
+  no-DNS acquisition path for virtual-thread-friendly networking setup;
 - timeout and cancellation paths wake parked socket waiters;
 - same-stream writes are serialized by an explicit runtime write-ownership
   state so concurrent writes cannot interleave bytes;
@@ -180,9 +187,9 @@ Current runtime shape:
 
 Remaining limitations:
 
-- hostname-capable `listen`/`connect` still use `getaddrinfo` and can block an
-  OS worker before the nonblocking socket phase begins; use
-  `listen_numeric`/`connect_numeric` when that is unacceptable;
+- DNS-name `connect_name` still uses `getaddrinfo` and can block an OS worker
+  before the nonblocking socket phase begins; use loopback, `parse_ip`/`ipv4`,
+  `listen_ip`, and `connect_ip` when that is unacceptable;
 - TCP line stream adapters have landed; `chunks(stream, max_bytes)` exposes byte
   chunks as a scoped `FallibleStream[Bytes, TcpError]`, and `lines(stream)`
   exposes scoped `FallibleStream[String, TcpError]` with file-compatible line
@@ -919,9 +926,12 @@ resource type TcpListener = builtin
 resource type TcpStream = builtin
 union TcpError
 
-listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
+listen_loopback(family: IpFamily, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+listen_ip(address: IpAddress, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
 accept(self: TcpListener) -> Result[TcpStream, TcpError]
-connect(host: String, port: Int) -> Result[TcpStream, TcpError]
+connect_loopback(family: IpFamily, port: Port) -> Result[TcpStream, TcpError]
+connect_ip(address: IpAddress, port: Port) -> Result[TcpStream, TcpError]
+connect_name(name: DnsName, port: Port) -> Result[TcpStream, TcpError]
 
 read_chunk(self: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
 write_all(self: TcpStream, data: Bytes) -> Result[Void, TcpError]
@@ -932,8 +942,10 @@ lines(self: TcpStream) -> FallibleStream[String, TcpError]
 Example:
 
 ```blorp
-func read_connection(host: String, port: Int) -> Result[Int, TcpError]:
-	with conn ?= connect(host, port):
+func read_connection(host: String, port_num: Int) -> Result[Int, TcpError]:
+	remote ?= port(port_num)
+	name ?= dns_name(host)
+	with conn ?= connect_name(name, remote):
 		n ?= conn.chunks(16 * 1024)
 			.fold_result(0, func(total, chunk): total + chunk.length())
 		Ok(n)
@@ -1967,7 +1979,9 @@ with reader ?= path.open_read():
 
 ```blorp
 -- Scoped typed handle
-with stream ?= tcp.connect(host, port):
+remote ?= tcp.port(port_num)
+name ?= tcp.dns_name(host)
+with stream ?= tcp.connect_name(name, remote):
 	data ?= stream.read_chunk(4096)
 	Ok(data)
 ```

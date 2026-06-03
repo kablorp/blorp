@@ -230,7 +230,8 @@ Rules:
 Example:
 
 ```blorp
-with listener ?= tcp.listen("", 8080, 1024):
+http_port ?= tcp.port(8080)
+with listener ?= tcp.listen_any_interface(IPv4, http_port, 1024):
 	concurrent:
 		run_metrics()
 
@@ -486,7 +487,8 @@ for path in paths concurrently(limit: 128):
 Allowed:
 
 ```blorp
-with listener ?= tcp.listen("", 8080, 1024):
+http_port ?= tcp.port(8080)
+with listener ?= tcp.listen_any_interface(IPv4, http_port, 1024):
 	for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 		handle_connection(conn)
 ```
@@ -494,7 +496,9 @@ with listener ?= tcp.listen("", 8080, 1024):
 Rejected:
 
 ```blorp
-with conn ?= tcp.connect(host, port):
+remote ?= tcp.port(port_num)
+name ?= tcp.dns_name(host)
+with conn ?= tcp.connect_name(name, remote):
 	for req in requests concurrently(limit: 64):
 		conn.write_all(req)  -- parent-owned resource capture
 ```
@@ -820,7 +824,8 @@ select:
 When a source produces resources, use resource-producing iteration:
 
 ```blorp
-with listener ?= tcp.listen("", 8080, 1024):
+http_port ?= tcp.port(8080)
+with listener ?= tcp.listen_any_interface(IPv4, http_port, 1024):
 	for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 		handle_connection(conn)
 ```
@@ -838,7 +843,8 @@ Performance tuning should stay in the same vocabulary:
 
 ```blorp
 func serve() -> Result[Void, TcpError]:
-	with listener ?= tcp.listen("", 8080, 1024):
+	http_port ?= tcp.port(8080)
+	with listener ?= tcp.listen_any_interface(IPv4, http_port, 1024):
 		for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 			handle_connection(conn)
 
@@ -960,7 +966,8 @@ func event_loop(events: Channel[AppEvent], shutdown: Channel[Void]) -> Void:
 func run_game() -> Result[Void, TcpError]:
 	world_events: Channel[WorldEvent] = channel(16384)
 
-	with listener ?= tcp.listen("", 7777, 1024):
+	game_port ?= tcp.port(7777)
+	with listener ?= tcp.listen_any_interface(IPv4, game_port, 1024):
 		concurrent:
 			run_world(world_events)
 			-- TcpListener permits one structured accept-loop borrow.
@@ -1043,8 +1050,10 @@ resource type TcpStream = builtin("blorp_tcp_close_stream")
 API shape:
 
 ```blorp
-listen(host: String, port: Int, backlog: Int) -> Result[TcpListener, TcpError]
-connect(host: String, port: Int) -> Result[TcpStream, TcpError]
+listen_any_interface(family: IpFamily, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+listen_ip(address: IpAddress, port: Port, backlog: Int) -> Result[TcpListener, TcpError]
+connect_ip(address: IpAddress, port: Port) -> Result[TcpStream, TcpError]
+connect_name(name: DnsName, port: Port) -> Result[TcpStream, TcpError]
 connections_continue_on_error(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]
 connections_stop_on_error(listener: TcpListener) -> ResourceSource[TcpStream, TcpError]
 read_chunk(stream: TcpStream, max_bytes: Int) -> Result[Bytes, TcpError]
@@ -1105,7 +1114,8 @@ The replacement should be resource-producing iteration, where each accepted
 connection is moved into exactly one child task owned by a structured scope:
 
 ```blorp
-with listener ?= tcp.listen("", 8080, 1024):
+http_port ?= tcp.port(8080)
+with listener ?= tcp.listen_any_interface(IPv4, http_port, 1024):
 	for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 		handle_connection(conn)
 ```
@@ -2333,7 +2343,8 @@ Migration sketch:
 
 ```blorp
 func serve() -> Result[Void, TcpError]:
-	with listener ?= tcp.listen("", 8080, 1024):
+	http_port ?= tcp.port(8080)
+	with listener ?= tcp.listen_any_interface(IPv4, http_port, 1024):
 		for conn in listener.connections_continue_on_error() concurrently(limit: 4096):
 			handle_connection(conn)
 

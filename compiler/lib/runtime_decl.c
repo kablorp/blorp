@@ -1539,24 +1539,12 @@ blorp_String* blorp_base64_decode(const blorp_String* s);
 blorp_String* blorp_base64_decode_nullable(const blorp_String* s);
 
 // TCP Networking
-blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog);
-blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener);
-blorp_Result* blorp_tcp_connect(blorp_String* host, long port);
-blorp_Result* blorp_tcp_read(blorp_TcpStream* stream, long max_bytes);
-blorp_Result* blorp_tcp_write(blorp_TcpStream* stream, blorp_Bytes* data);
 void blorp_tcp_close_listener(blorp_TcpListener* listener);
 void blorp_tcp_close_stream(blorp_TcpStream* stream);
-blorp_Result* blorp_tcp_set_reuse_addr(blorp_TcpListener* listener);
-blorp_Result* blorp_tcp_local_port_listener(blorp_TcpListener* listener);
-blorp_Result* blorp_tcp_local_port_stream(blorp_TcpStream* stream);
-blorp_Result* blorp_tcp_set_timeout_listener(blorp_TcpListener* listener, long ms);
-blorp_Result* blorp_tcp_set_timeout_stream(blorp_TcpStream* stream, long ms);
-blorp_TcpListenerResult blorp_tcp_listen_raw(blorp_String* host, long port, long backlog);
 blorp_TcpStreamResult blorp_tcp_accept_raw(blorp_TcpListener* listener);
 blorp_ResourceSource* blorp_tcp_connections_stop_on_error_raw(blorp_TcpListener* listener);
 blorp_ResourceSource* blorp_tcp_connections_continue_on_error_raw(blorp_TcpListener* listener);
 bool blorp_resource_source_next_raw(blorp_ResourceSource* source, void** out);
-blorp_TcpStreamResult blorp_tcp_connect_raw(blorp_String* host, long port);
 blorp_TcpBytesResult blorp_tcp_read_raw(blorp_TcpStream* stream, long max_bytes);
 blorp_TcpIntResult blorp_tcp_write_raw(blorp_TcpStream* stream, blorp_Bytes* data);
 blorp_TcpVoidResult blorp_tcp_write_all_raw(blorp_TcpStream* stream, blorp_Bytes* data);
@@ -1565,8 +1553,6 @@ blorp_TcpIntResult blorp_tcp_local_port_listener_raw(blorp_TcpListener* listener
 blorp_TcpIntResult blorp_tcp_local_port_stream_raw(blorp_TcpStream* stream);
 blorp_TcpVoidResult blorp_tcp_set_timeout_listener_raw(blorp_TcpListener* listener, long ms);
 blorp_TcpVoidResult blorp_tcp_set_timeout_stream_raw(blorp_TcpStream* stream, long ms);
-blorp_TcpListenerResult blorp_tcp_listen_numeric_raw(blorp_String* host, long port, long backlog);
-blorp_TcpStreamResult blorp_tcp_connect_numeric_raw(blorp_String* host, long port);
 blorp_String* blorp_tcp_ipv4_raw(uint8_t a, uint8_t b, uint8_t c, uint8_t d);
 blorp_Result* blorp_tcp_parse_ip_raw(blorp_String* text);
 blorp_Result* blorp_tcp_dns_name_raw(blorp_String* text);

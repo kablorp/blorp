@@ -226,8 +226,9 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "blorp_tcp_read";
       "blorp_tcp_write";
       "blorp_tcp_accept_raw";
-      "blorp_tcp_connect_raw";
-      "blorp_tcp_connect_numeric_raw";
+      "blorp_tcp_connect_loopback_raw";
+      "blorp_tcp_connect_ip_raw";
+      "blorp_tcp_connect_name_raw";
       "blorp_tcp_read_raw";
       "blorp_tcp_write_raw";
       "blorp_tcp_write_all_raw";
@@ -263,8 +264,9 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "write";
       "blorp_tcp_listen";
       "blorp_dns_resolve_raw";
-      "blorp_tcp_listen_raw";
-      "blorp_tcp_listen_numeric_raw";
+      "blorp_tcp_listen_loopback_raw";
+      "blorp_tcp_listen_any_interface_raw";
+      "blorp_tcp_listen_ip_raw";
       "blorp_tcp_local_port_listener_raw";
       "blorp_tcp_set_timeout_listener_raw";
       "blorp_udp_bind_raw";
@@ -286,7 +288,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
         (name ^ " does not block an OS worker")
         false
         (is_os_worker_blocking name))
-    [ "sleep"; "send"; "blorp_tcp_connect_raw"; "blorp_tls_read_raw" ]
+    [ "sleep"; "send"; "blorp_tcp_connect_loopback_raw"; "blorp_tls_read_raw" ]
 
 let test_type_metadata_classifies_typechecker_policy () =
   let open Blorp in

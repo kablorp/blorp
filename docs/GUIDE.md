@@ -1784,10 +1784,12 @@ TCP listeners and streams are scoped resources. Acquire them with `with` so the
 compiler installs cleanup, and return ordinary data from the block. TCP APIs
 return `TcpError`; wrapper-owned invalid inputs such as bad ports, backlog
 values, timeouts, and chunk sizes are `InvalidInput`, while runtime-originated
-socket failures are currently preserved as `Other`. Numeric hosts such as
-`"127.0.0.1"` are the virtual-thread-friendly path; hostname resolution may
-still block an OS worker before the socket operation can park the current
-fiber.
+socket failures are currently preserved as `Other`. Endpoints are explicit typed
+values: use `Port` for concrete ports, `listen_*_any_port` when the OS should
+choose an ephemeral listener port, `IpAddress` for numeric addresses, and
+`DnsName` when hostname resolution is intended. Loopback and validated numeric
+IP paths are virtual-thread-friendly; DNS resolution may still block an OS
+worker before the socket operation can park the current fiber.
 `connections_stop_on_error(listener)` and
 `connections_continue_on_error(listener)` return direct
 `ResourceSource[TcpStream, TcpError]` values. The source value is an ARC-owned
@@ -1800,10 +1802,11 @@ into exactly one child task; the child task owns scoped cleanup for that stream.
 
 ```blorp
 import:
-    net/tcp: TcpError, connect, read_chunk
+    net/tcp: IpFamily(IPv4), TcpError, connect_loopback, port, read_chunk
 
-func fetch_once(port: Int) -> Result[Int, TcpError]:
-    with stream ?= connect("127.0.0.1", port):
+func fetch_once(port_num: Int) -> Result[Int, TcpError]:
+    remote ?= port(port_num)
+    with stream ?= connect_loopback(IPv4, remote):
         data ?= read_chunk(stream, 4096)
         Ok(data.length())
 ```
@@ -1817,16 +1820,18 @@ yielded when the peer closes.
 
 ```blorp
 import:
-    net/tcp: TcpError, chunks, connect, lines
+    net/tcp: IpFamily(IPv4), TcpError, chunks, connect_loopback, lines, port
     stream: fold_result
 
-func count_bytes(port: Int) -> Result[Int, TcpError]:
-    with stream ?= connect("127.0.0.1", port):
+func count_bytes(port_num: Int) -> Result[Int, TcpError]:
+    remote ?= port(port_num)
+    with stream ?= connect_loopback(IPv4, remote):
         chunks(stream, 16 * 1024)
             .fold_result(0, func(total: Int, chunk: Bytes): total + chunk.length())
 
-func count_lines(port: Int) -> Result[Int, TcpError]:
-    with stream ?= connect("127.0.0.1", port):
+func count_lines(port_num: Int) -> Result[Int, TcpError]:
+    remote ?= port(port_num)
+    with stream ?= connect_loopback(IPv4, remote):
         lines(stream)
             .fold_result(0, func(total: Int, line: String): total + 1)
 ```
@@ -1836,10 +1841,11 @@ alias and the error type:
 
 ```blorp
 import:
-    net/tcp as Tcp: TcpError
+    net/tcp as Tcp: IpFamily(IPv4), TcpError
 
-func local_stream_port(port: Int) -> Result[Int, TcpError]:
-    with stream ?= Tcp.connect("127.0.0.1", port):
+func local_stream_port(port_num: Int) -> Result[Int, TcpError]:
+    remote ?= Tcp.port(port_num)
+    with stream ?= Tcp.connect_loopback(IPv4, remote):
         Tcp.stream_local_port(stream)
 ```
 
@@ -1848,10 +1854,10 @@ code that wants to decide its own fan-out shape:
 
 ```blorp
 import:
-    net/tcp as Tcp: TcpError
+    net/tcp as Tcp: IpFamily(IPv4), TcpError
 
 func accept_one() -> Result[Int, TcpError]:
-    with listener ?= Tcp.listen("127.0.0.1", 0, 1):
+    with listener ?= Tcp.listen_loopback_any_port(IPv4, 1):
         var seen: Int = 0
         for conn in Tcp.connections_stop_on_error(listener):
             _ = Tcp.stream_local_port(conn)
@@ -1866,10 +1872,11 @@ into one child task:
 
 ```blorp
 import:
-    net/tcp as Tcp: TcpError
+    net/tcp as Tcp: IpFamily(IPv4), TcpError
 
 func serve_until_timeout() -> Result[Void, TcpError]:
-    with listener ?= Tcp.listen("127.0.0.1", 8080, 128):
+    http_port ?= Tcp.port(8080)
+    with listener ?= Tcp.listen_loopback(IPv4, http_port, 128):
         ignored ?= Tcp.set_timeout(listener, 1000)
         for conn in Tcp.connections_stop_on_error(listener) concurrently(limit: 128):
             _ = Tcp.stream_local_port(conn)
