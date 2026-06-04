@@ -130,8 +130,16 @@ type symbol_kind =
 type symbol = { name : string; kind : symbol_kind }
 (** Symbol table entry *)
 
-type scope = symbol list
-(** A scope contains symbols *)
+type scope
+(** A lexical scope. Scopes preserve insertion order for diagnostics and
+    completion, while supporting indexed name lookup. *)
+
+val scope_symbols : scope -> symbol list
+(** Symbols in this scope, newest binding first. *)
+
+type type_index
+(** Indexed visible type namespace facts. Maintained by [add_symbol] alongside
+    the lexical scope stack. *)
 
 type trait_obligation = {
   obligation_type : type_expr;
@@ -204,6 +212,7 @@ type impl_instance = Env_types.impl_instance = {
 
 type env = {
   scopes : scope list;
+  type_index : type_index;
   current_function : string option;
   current_function_pure : bool;
   type_params_in_scope : string list;

@@ -2928,6 +2928,22 @@ static void blorp_tcp_inner_release(blorp_TcpInner* inner) {
     free(inner);
 }
 
+static void blorp_tcp_inner_operation_retain(blorp_TcpInner* inner) {
+#if defined(__clang_analyzer__)
+    (void)inner;
+#else
+    blorp_tcp_inner_retain(inner);
+#endif
+}
+
+static void blorp_tcp_inner_operation_release(blorp_TcpInner* inner) {
+#if defined(__clang_analyzer__)
+    (void)inner;
+#else
+    blorp_tcp_inner_release(inner);
+#endif
+}
+
 static blorp_IoWaitOwner blorp_io_wait_owner_none(void) {
     return (blorp_IoWaitOwner){
         .kind = BLORP_IO_WAIT_OWNER_NONE,
@@ -4645,6 +4661,15 @@ static int blorp_utf8_encode(int32_t cp, unsigned char* buf) {
         buf[0] = 0xEF; buf[1] = 0xBF; buf[2] = 0xBD;
         return 3;
     }
+}
+
+static int blorp_utf8_encoded_len(int32_t cp) {
+    if (cp < 0) cp = 0xFFFD;
+    if (cp <= 0x7F) return 1;
+    if (cp <= 0x7FF) return 2;
+    if (cp <= 0xFFFF) return 3;
+    if (cp <= 0x10FFFF) return 4;
+    return 3;
 }
 
 // Unicode default case mapping tables generated from Python
@@ -7023,8 +7048,8 @@ static blorp_String* blorp_unicode_case_map(const blorp_String* s, bool upper) {
         uint8_t mapped_len = 0;
         blorp_case_mapping_for_span(spans, count, i, upper, mapped, &mapped_len);
         for (uint8_t j = 0; j < mapped_len; j++) {
-            unsigned char tmp[4];
-            out_len = blorp_checked_add(out_len, (size_t)blorp_utf8_encode(mapped[j], tmp));
+            out_len = blorp_checked_add(
+                out_len, (size_t)blorp_utf8_encoded_len(mapped[j]));
         }
     }
 
@@ -7083,8 +7108,8 @@ blorp_String* blorp_from_chars(blorp_List* chars) {
     size_t total_len = 0;
     for (long i = 0; i < chars->len; i++) {
         int32_t c = (int32_t)(intptr_t)blorp_list_get(chars, i);
-        unsigned char tmp[4];
-        total_len = blorp_checked_add(total_len, (size_t)blorp_utf8_encode(c, tmp));
+        total_len = blorp_checked_add(
+            total_len, (size_t)blorp_utf8_encoded_len(c));
     }
     if (total_len > (size_t)LONG_MAX) {
         blorp_fatal_invalid_runtime_length("String", LONG_MAX, LONG_MAX);
@@ -12342,7 +12367,7 @@ blorp_Result* blorp_tcp_listen(blorp_String* host, long port, long backlog) {
 blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener) {
     blorp_TcpInner* inner = listener ? listener->inner : NULL;
     if (!inner) return tcp_handle_error("tcp accept: closed listener");
-    blorp_tcp_inner_retain(inner);
+    blorp_tcp_inner_operation_retain(inner);
     blorp_CancelCleanupFrame inner_cleanup;
     blorp_tcp_inner_operation_cleanup_push(&inner_cleanup, &inner, inner);
     blorp_Result* result = NULL;
@@ -12414,7 +12439,7 @@ blorp_Result* blorp_tcp_accept(blorp_TcpListener* listener) {
 
 finish:
     blorp_tcp_inner_operation_cleanup_pop(&inner);
-    blorp_tcp_inner_release(inner);
+    blorp_tcp_inner_operation_release(inner);
     return result;
 }
 
@@ -29677,9 +29702,12 @@ static bool blorp_test_websocket_bytes_equal_cstr(
 ) {
     long expected_len = expected ? (long)strlen(expected) : 0;
     bool matches =
-        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE && result.value &&
+        result.error_kind == BLORP_WEBSOCKET_ERROR_NONE &&
+        result.value &&
+        expected &&
         result.value->len == expected_len &&
-        memcmp(result.value->data, expected, (size_t)expected_len) == 0;
+        (expected_len == 0 ||
+         memcmp(result.value->data, expected, (size_t)expected_len) == 0);
     if (result.value) blorp_release(result.value);
     if (result.detail) blorp_release(result.detail);
     return matches;

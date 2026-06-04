@@ -11,10 +11,19 @@ type 'a infer_result = ('a, compiler_error) Result.t
 type infer_ctx
 (** Inference context *)
 
+type type_shape_memo
+(** Ephemeral memo table for type-shape resource checks. Callers may share one
+    within a single typecheck pass, then discard it. It must not be persisted
+    across compiler runs or reused after type/alias declarations change. *)
+
+val make_type_shape_memo : unit -> type_shape_memo
+(** Create an empty ephemeral type-shape memo table. *)
+
 val make_ctx :
   ?module_aliases:(string * string) list ->
   ?allow_debug_only_calls:bool ->
   ?rigid_type_params:string list ->
+  ?type_shape_memo:type_shape_memo ->
   Env.env ->
   infer_ctx
 (** Create an inference context from an environment *)
@@ -40,13 +49,14 @@ val type_contains_resource : infer_ctx -> type_expr -> bool
 (** True when the type is or contains a resource type in the current
     environment. *)
 
-val type_contains_one_shot_stream : Env.env -> type_expr -> bool
+val type_contains_one_shot_stream :
+  ?memo:type_shape_memo -> Env.env -> type_expr -> bool
 (** True when the type is or contains a Stream/FallibleStream cursor in the
     current environment. Function values returning streams are producer values,
     not stream cursor state, and are not considered containing streams. *)
 
 val type_contains_one_shot_stream_function_carrier :
-  Env.env -> type_expr -> bool
+  ?memo:type_shape_memo -> Env.env -> type_expr -> bool
 (** True when a function type inside this type accepts or returns a one-shot
     stream hidden in an ordinary carrier, such as [() -> Option[Stream[Int]]].
     Direct producers such as [() -> Stream[Int]] remain ordinary function
@@ -56,13 +66,14 @@ val type_is_one_shot_stream : Env.env -> type_expr -> bool
 (** True when the type is directly a Stream/FallibleStream cursor in the current
     environment, after alias normalization. *)
 
-val type_contains_resource_source : Env.env -> type_expr -> bool
+val type_contains_resource_source :
+  ?memo:type_shape_memo -> Env.env -> type_expr -> bool
 (** True when the type is or contains a ResourceSource cursor in the current
     environment. Function values returning resource sources are producer values,
     not source cursor state, and are not considered containing sources. *)
 
 val type_contains_resource_source_function_carrier :
-  Env.env -> type_expr -> bool
+  ?memo:type_shape_memo -> Env.env -> type_expr -> bool
 (** True when a function type inside this type accepts or returns a
     ResourceSource hidden in an ordinary carrier, such as
     [() -> Option[ResourceSource[R, E]]]. Direct producers such as

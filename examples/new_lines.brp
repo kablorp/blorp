@@ -1,0 +1,537 @@
+import:
+	bytes as B
+	fs: DirectoryEntry, IOError, message, open_dir, open_read_append, read_next_entries
+	list: chunks, list
+	system: file_exists, is_directory
+
+
+record CliConfig {
+	extensions: List[String],
+	paths: List[String]
+}
+
+
+union ParsedCli:
+	CliOk(CliConfig)
+	CliHelp
+	CliError(String)
+
+
+record RunStats {
+	matched: Int,
+	changed: Int,
+	errors: Int
+}
+
+
+union PathWork:
+	WorkFile(String)
+	WorkDirectory(String)
+
+
+record DirectoryWork {
+	items: List[PathWork],
+	files: Int,
+	directories: Int
+}
+
+
+record DirectoryScan {
+	stats: RunStats,
+	directories: List[PathWork]
+}
+
+
+union ClassifiedEntry:
+	ClassifiedFile(String)
+	ClassifiedDirectory(String)
+	ClassifiedIgnored
+
+
+CONCURRENT_WORK_THRESHOLD: Int = 16
+
+CONCURRENT_DIRECTORY_THRESHOLD: Int = 2
+
+CONCURRENT_TASK_LIMIT: Int = 8
+
+CONCURRENT_CHUNK_SIZE: Int = 8
+
+DIRECTORY_WORK_BATCH_CAPACITY: Int = 512
+
+DIRECTORY_ENTRY_BATCH_CAPACITY: Int = DIRECTORY_WORK_BATCH_CAPACITY
+
+
+pure func empty_stats() -> RunStats:
+	{
+		matched = 0,
+		changed = 0,
+		errors = 0
+	}
+
+
+pure func merge_stats(left: RunStats, right: RunStats) -> RunStats:
+	{
+		matched = left.matched + right.matched,
+		changed = left.changed + right.changed,
+		errors = left.errors + right.errors
+	}
+
+
+pure func usage() -> String:
+	"usage: new-lines EXTENSION... [--path PATH]..."
+
+
+pure func default_paths(paths: List[String]) -> List[String]:
+	if paths.length() == 0:
+		["."]
+	else:
+		paths
+
+
+pure func validate_extension(ext: String) -> Result[String, String]:
+	if ext.length() == 0:
+		Err("extension cannot be empty")
+	else if not ext.starts_with("."):
+		Err("extension must start with '.': " + ext)
+	else:
+		Ok(ext)
+
+
+pure func parse_args(args: List[String]) -> ParsedCli:
+	path_flag: String = "--path"
+	path_equals_prefix: String = "--path="
+	var extensions: List[String] = []
+	var paths: List[String] = []
+	var error: Option[String] = None
+	var help_requested: Bool = False
+	var i: Int = 0
+	while i < args.length():
+		arg: String = args
+			.get(i)
+			.get_or("")
+		match error:
+			Some(_):
+				i += 1
+			None:
+				if help_requested:
+					i += 1
+				else if arg == "--help" or arg == "-h":
+					help_requested = True
+					i += 1
+				else if arg == path_flag:
+					match args.get(i + 1):
+						Some(path):
+							paths = paths.append(path)
+							i += 2
+						None:
+							error = Some("missing value for --path")
+							i += 1
+				else if arg.starts_with(path_equals_prefix):
+					path: String = arg.drop_left(path_equals_prefix.length())
+					if path.length() == 0:
+						error = Some("missing value for --path")
+					else:
+						paths = paths.append(path)
+					i += 1
+				else if arg.starts_with("--"):
+					error = Some("unknown option: " + arg)
+					i += 1
+				else:
+					match arg.validate_extension():
+						Ok(ext):
+							extensions = extensions.append(ext)
+							i += 1
+						Err(msg):
+							error = Some(msg)
+							i += 1
+	match error:
+		Some(msg): CliError(msg)
+		None:
+			if help_requested:
+				CliHelp
+			else if extensions.length() == 0:
+				CliError("at least one extension is required")
+			else:
+				CliOk({
+					extensions = extensions,
+					paths = default_paths(paths),
+				})
+
+
+pure func has_extension_suffix(file_path: String, ext: String) -> Bool:
+	path_len: Int = file_path.length()
+	ext_len: Int = ext.length()
+	if path_len <= ext_len:
+		False
+	else if not file_path.ends_with(ext):
+		False
+	else:
+		match file_path.get(path_len - ext_len - 1):
+			Some('/'): False
+			Some(_): True
+			None: False
+
+
+pure func matches_extension(file_path: String, extensions: List[String]) -> Bool:
+	var matched: Bool = False
+	for ext in extensions:
+		if not matched and file_path.has_extension_suffix(ext):
+			matched = True
+	matched
+
+
+pure func content_needs_newline(content: String) -> Bool:
+	not content.ends_with("\n")
+
+
+func add_final_newline_if_needed(file_path: String) -> Result[Bool, String]:
+	with file ?= open_read_append(
+		file_path,
+	) on err => "failed to open " + file_path + ": " + message(err):
+		match file.size():
+			Ok(size):
+				if size == 0:
+					match file.append_text("\n"):
+						Ok(_): Ok(True)
+						Err(err): Err(
+							"failed to append newline to " + file_path + ": " + message(err),
+						)
+				else:
+					match file.read_chunk_at(size - 1, 1):
+						Ok(chunk):
+							byte: Int = B
+								.get(chunk, 0)
+								.get_or(0)
+							if byte == 10:
+								Ok(False)
+							else:
+								match file.append_text("\n"):
+									Ok(_): Ok(True)
+									Err(err): Err(
+										"failed to append newline to " + file_path + ": " + message(
+											err,
+										),
+									)
+						Err(err): Err("failed to read " + file_path + ": " + message(err))
+			Err(err): Err("failed to get size of " + file_path + ": " + message(err))
+
+
+pure func increment_matched(stats: RunStats) -> RunStats:
+	{ stats |
+		matched = stats.matched + 1
+	}
+
+
+pure func record_changed(stats: RunStats) -> RunStats:
+	{ stats |
+		changed = stats.changed + 1
+	}
+
+
+pure func record_error(stats: RunStats) -> RunStats:
+	{ stats |
+		errors = stats.errors + 1
+	}
+
+
+pure func empty_directory_work() -> DirectoryWork:
+	{
+		items = list(DIRECTORY_WORK_BATCH_CAPACITY),
+		files = 0,
+		directories = 0
+	}
+
+
+pure func add_file_work(work: DirectoryWork, file_path: String) -> DirectoryWork:
+	{ work |
+		items = work.items.append(WorkFile(file_path)),
+		files = work.files + 1
+	}
+
+
+pure func add_directory_work(work: DirectoryWork, directory_path: String) -> DirectoryWork:
+	{ work |
+		items = work.items.append(WorkDirectory(directory_path)),
+		directories = work.directories + 1
+	}
+
+
+pure func classify_file_if_matching(file_path: String, extensions: List[String]) -> ClassifiedEntry:
+	if file_path.matches_extension(extensions):
+		ClassifiedFile(file_path)
+	else:
+		ClassifiedIgnored
+
+
+func classify_unknown_entry(full_path: String, extensions: List[String]) -> ClassifiedEntry:
+	if full_path.is_directory():
+		ClassifiedDirectory(full_path)
+	else:
+		classify_file_if_matching(full_path, extensions)
+
+
+func classify_entry(
+	root: String,
+	entry: DirectoryEntry,
+	extensions: List[String],
+) -> ClassifiedEntry:
+	match entry.kind:
+		EntryDirectory:
+			ClassifiedDirectory(root + "/" + entry.name)
+		EntryFile:
+			if entry.name.matches_extension(extensions):
+				ClassifiedFile(root + "/" + entry.name)
+			else:
+				ClassifiedIgnored
+		EntrySymlink:
+			if entry.name.matches_extension(extensions):
+				ClassifiedFile(root + "/" + entry.name)
+			else:
+				ClassifiedIgnored
+		EntryOther:
+			ClassifiedIgnored
+		EntryUnknown:
+			classify_unknown_entry(root + "/" + entry.name, extensions)
+
+
+pure func should_flush_work_batch(work: DirectoryWork) -> Bool:
+	work.items.length() >= DIRECTORY_WORK_BATCH_CAPACITY
+
+
+pure func should_process_work_concurrently(work: DirectoryWork) -> Bool:
+	work.items.length() >= CONCURRENT_WORK_THRESHOLD
+
+
+pure func should_process_directories_concurrently(directories: List[PathWork]) -> Bool:
+	directories.length() >= CONCURRENT_DIRECTORY_THRESHOLD
+
+
+func process_matching_file(file_path: String) -> RunStats:
+	matched_stats: RunStats = {
+		matched = 1,
+		changed = 0,
+		errors = 0
+	}
+	match add_final_newline_if_needed(file_path):
+		Ok(changed):
+			if changed:
+				matched_stats.record_changed()
+			else:
+				matched_stats
+		Err(msg):
+			print_error(msg)
+			matched_stats.record_error()
+
+
+func process_work(item: PathWork, extensions: List[String]) -> RunStats:
+	match item:
+		WorkFile(file_path):
+			process_matching_file(file_path)
+		WorkDirectory(dir_path):
+			process_directory(dir_path, extensions)
+
+
+func process_work_sequentially(work: List[PathWork], extensions: List[String]) -> RunStats:
+	var stats: RunStats = empty_stats()
+	for item in work:
+		stats = merge_stats(stats, process_work(item, extensions))
+	stats
+
+
+func merge_concurrent_results(results: List[Result[RunStats, ConcurrencyError]]) -> RunStats:
+	var stats: RunStats = empty_stats()
+	for result in results:
+		match result:
+			Ok(child_stats):
+				stats = merge_stats(stats, child_stats)
+			Err(_):
+				stats = stats.record_error()
+	stats
+
+
+func process_work_with_chunked_concurrent(
+	work: DirectoryWork,
+	extensions: List[String],
+) -> RunStats:
+	work_chunks: List[List[PathWork]] = work.items.chunks(CONCURRENT_CHUNK_SIZE)
+	results: List[Result[RunStats, ConcurrencyError]] = work_chunks.concurrent(
+		CONCURRENT_TASK_LIMIT,
+		func(items: List[PathWork]): process_work_sequentially(items, extensions),
+	)
+	merge_concurrent_results(results)
+
+
+func process_file_work_items(
+	work: DirectoryWork,
+	extensions: List[String],
+	allow_concurrent: Bool,
+) -> RunStats:
+	if work.items.length() == 0:
+		empty_stats()
+	else if allow_concurrent and work.should_process_work_concurrently():
+		process_work_with_chunked_concurrent(work, extensions)
+	else:
+		process_work_sequentially(work.items, extensions)
+
+
+func process_directory_chunk_sequentially(
+	directories: List[PathWork],
+	extensions: List[String],
+) -> RunStats:
+	var stats: RunStats = empty_stats()
+	for item in directories:
+		match item:
+			WorkFile(file_path):
+				stats = merge_stats(stats, process_matching_file(file_path))
+			WorkDirectory(dir_path):
+				stats = merge_stats(stats, process_directory_sequential(dir_path, extensions))
+	stats
+
+
+func process_directories_concurrently(
+	directories: List[PathWork],
+	extensions: List[String],
+) -> RunStats:
+	directory_chunks: List[List[PathWork]] = directories.chunks(CONCURRENT_CHUNK_SIZE)
+	results: List[Result[RunStats, ConcurrencyError]] = directory_chunks.concurrent(
+		CONCURRENT_TASK_LIMIT,
+		func(items: List[PathWork]): process_directory_chunk_sequentially(items, extensions),
+	)
+	merge_concurrent_results(results)
+
+
+func process_directories_normally(
+	directories: List[PathWork],
+	extensions: List[String],
+) -> RunStats:
+	var stats: RunStats = empty_stats()
+	for item in directories:
+		match item:
+			WorkFile(file_path):
+				stats = merge_stats(stats, process_matching_file(file_path))
+			WorkDirectory(dir_path):
+				stats = merge_stats(stats, process_directory(dir_path, extensions))
+	stats
+
+
+func process_directory_work(directories: List[PathWork], extensions: List[String]) -> RunStats:
+	if directories.length() == 0:
+		empty_stats()
+	else if directories.should_process_directories_concurrently():
+		process_directories_concurrently(directories, extensions)
+	else:
+		process_directories_normally(directories, extensions)
+
+
+func scan_directory(
+	root: String,
+	extensions: List[String],
+	allow_file_concurrent: Bool,
+) -> Result[DirectoryScan, IOError]:
+	with dir ?= open_dir(root):
+		var stats: RunStats = empty_stats()
+		var file_work: DirectoryWork = empty_directory_work()
+		var directories: List[PathWork] = []
+		var done: Bool = False
+		var error: Option[IOError] = None
+		while not done:
+			match read_next_entries(dir, DIRECTORY_ENTRY_BATCH_CAPACITY):
+				Ok(entries):
+					if entries.length() == 0:
+						done = True
+					else:
+						for entry in entries:
+							match classify_entry(root, entry, extensions):
+								ClassifiedFile(file_path):
+									file_work = file_work.add_file_work(file_path)
+									if file_work.should_flush_work_batch():
+										stats = merge_stats(
+											stats,
+											process_file_work_items(
+												file_work,
+												extensions,
+												allow_file_concurrent,
+											),
+										)
+										file_work = empty_directory_work()
+								ClassifiedDirectory(directory_path):
+									directories = directories.append(WorkDirectory(directory_path))
+								ClassifiedIgnored:
+									void
+				Err(err):
+					error = Some(err)
+					done = True
+		match error:
+			Some(err): Err(err)
+			None:
+				stats = merge_stats(
+					stats,
+					process_file_work_items(
+						file_work,
+						extensions,
+						allow_file_concurrent,
+					),
+				)
+				Ok({
+					stats = stats,
+					directories = directories,
+				})
+
+
+func process_directory(root: String, extensions: List[String]) -> RunStats:
+	match scan_directory(root, extensions, True):
+		Ok(scan):
+			merge_stats(scan.stats, process_directory_work(scan.directories, extensions))
+		Err(err):
+			print_error("failed to scan directory " + root + ": " + message(err))
+			empty_stats().record_error()
+
+
+func process_directory_sequential(root: String, extensions: List[String]) -> RunStats:
+	match scan_directory(root, extensions, False):
+		Ok(scan):
+			merge_stats(
+				scan.stats,
+				process_directory_chunk_sequentially(
+					scan.directories,
+					extensions,
+				),
+			)
+		Err(err):
+			print_error("failed to scan directory " + root + ": " + message(err))
+			empty_stats().record_error()
+
+
+func process_root(root: String, extensions: List[String]) -> RunStats:
+	if not root.file_exists():
+		print_error("path not found: " + root)
+		empty_stats().record_error()
+	else if not root.is_directory():
+		print_error("path is not a directory: " + root)
+		empty_stats().record_error()
+	else:
+		process_directory(root, extensions)
+
+
+func run_config(config: CliConfig) -> RunStats:
+	var stats: RunStats = empty_stats()
+	for root in config.paths:
+		stats = merge_stats(stats, process_root(root, config.extensions))
+	stats
+
+
+func main(args: List[String]) -> Int:
+	match parse_args(args.drop(1)):
+		CliHelp:
+			print(usage())
+			0
+		CliError(msg):
+			print_error(msg)
+			print_error(usage())
+			1
+		CliOk(config):
+			stats = run_config(config)
+			if stats.errors > 0:
+				1
+			else:
+				0

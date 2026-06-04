@@ -112,6 +112,10 @@ type check_state = {
       (** Callable ids minted for named source functions in this compilation
       unit. Keyed by declaration name and source declaration location so typed
       AST construction can preserve identity without re-resolving by name. *)
+  type_shape_memo : Infer.type_shape_memo;
+      (** Ephemeral type-shape memo shared by inference contexts during this
+      compilation unit's typecheck. Discarded with [check_state]; never reused
+      across module typechecks. *)
 }
 (** Check result - collects multiple errors *)
 
@@ -159,7 +163,8 @@ let get_state_func_callable_id state ~name ~loc =
 
 let ctx_of_state state =
   make_ctx ~module_aliases:state.module_aliases
-    ~allow_debug_only_calls:state.allow_debug_only_calls state.env
+    ~allow_debug_only_calls:state.allow_debug_only_calls
+    ~type_shape_memo:state.type_shape_memo state.env
 
 let type_is_resource_name ~is_resource_name ty =
   match Types.head_resolve ty with
@@ -178,7 +183,9 @@ let type_contains_known_resource state ty =
     type_is_known_resource state ty
     ||
     match Types.head_resolve ty with
-    | TyNamed (_, _) when Infer.type_contains_resource_source state.env ty ->
+    | TyNamed (_, _)
+      when Infer.type_contains_resource_source ~memo:state.type_shape_memo
+             state.env ty ->
         (* ResourceSource[R, E] names a source that can later produce resources;
            it does not itself store an owned R as ordinary value data. The
            resource-source-specific checks below reject ordinary storage and
@@ -820,6 +827,7 @@ let init_state ?module_origin ?(allow_debug_only_calls = false) () =
     top_level_names = Hashtbl.create 32;
     type_home = Hashtbl.create 32;
     func_callable_ids = Hashtbl.create 32;
+    type_shape_memo = Infer.make_type_shape_memo ();
   }
 
 (** Add an error to the state *)
@@ -1207,8 +1215,8 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
                 else state
               in
               if
-                Infer.type_contains_one_shot_stream_function_carrier state.env
-                  field_ty
+                Infer.type_contains_one_shot_stream_function_carrier
+                  ~memo:state.type_shape_memo state.env field_ty
               then
                 add_error state
                   (one_shot_stream_function_carrier_error v.variant_loc
@@ -1216,7 +1224,9 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
                         "Union variant '%s' cannot contain a one-shot stream \
                          carrier"
                         v.variant_name))
-              else if Infer.type_contains_one_shot_stream state.env field_ty
+              else if
+                Infer.type_contains_one_shot_stream ~memo:state.type_shape_memo
+                  state.env field_ty
               then
                 add_error state
                   (one_shot_stream_containing_aggregate_error v.variant_loc
@@ -1225,8 +1235,8 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
                          type"
                         v.variant_name))
               else if
-                Infer.type_contains_resource_source_function_carrier state.env
-                  field_ty
+                Infer.type_contains_resource_source_function_carrier
+                  ~memo:state.type_shape_memo state.env field_ty
               then
                 add_error state
                   (resource_source_function_carrier_error v.variant_loc
@@ -1234,7 +1244,9 @@ let process_type_decl ?(loc : loc option) ?(imported = false)
                         "Union variant '%s' cannot contain a resource source \
                          carrier"
                         v.variant_name))
-              else if Infer.type_contains_resource_source state.env field_ty
+              else if
+                Infer.type_contains_resource_source ~memo:state.type_shape_memo
+                  state.env field_ty
               then
                 add_error state
                   (resource_source_containing_aggregate_error v.variant_loc
@@ -1391,8 +1403,8 @@ let process_record_decl ?(imported = false) (state : check_state)
             else state
           in
           if
-            Infer.type_contains_one_shot_stream_function_carrier state.env
-              f.field_type
+            Infer.type_contains_one_shot_stream_function_carrier
+              ~memo:state.type_shape_memo state.env f.field_type
           then
             add_error state
               (one_shot_stream_function_carrier_error f.field_loc
@@ -1400,7 +1412,9 @@ let process_record_decl ?(imported = false) (state : check_state)
                     "%s '%s' field '%s' cannot contain a one-shot stream \
                      carrier"
                     kind decl.record_name f.field_name))
-          else if Infer.type_contains_one_shot_stream state.env f.field_type
+          else if
+            Infer.type_contains_one_shot_stream ~memo:state.type_shape_memo
+              state.env f.field_type
           then
             add_error state
               (one_shot_stream_containing_aggregate_error f.field_loc
@@ -1408,8 +1422,8 @@ let process_record_decl ?(imported = false) (state : check_state)
                     "%s '%s' field '%s' cannot contain a one-shot stream type"
                     kind decl.record_name f.field_name))
           else if
-            Infer.type_contains_resource_source_function_carrier state.env
-              f.field_type
+            Infer.type_contains_resource_source_function_carrier
+              ~memo:state.type_shape_memo state.env f.field_type
           then
             add_error state
               (resource_source_function_carrier_error f.field_loc
@@ -1417,7 +1431,9 @@ let process_record_decl ?(imported = false) (state : check_state)
                     "%s '%s' field '%s' cannot contain a resource source \
                      carrier"
                     kind decl.record_name f.field_name))
-          else if Infer.type_contains_resource_source state.env f.field_type
+          else if
+            Infer.type_contains_resource_source ~memo:state.type_shape_memo
+              state.env f.field_type
           then
             add_error state
               (resource_source_containing_aggregate_error f.field_loc
@@ -1563,8 +1579,8 @@ let process_type_alias ?(loc = dummy_loc) ?home_module (state : check_state)
   in
   let state =
     if
-      Infer.type_contains_resource_source_function_carrier state.env
-        decl.alias_target
+      Infer.type_contains_resource_source_function_carrier
+        ~memo:state.type_shape_memo state.env decl.alias_target
     then
       add_error state
         (resource_source_function_carrier_error loc
@@ -1573,7 +1589,8 @@ let process_type_alias ?(loc = dummy_loc) ?home_module (state : check_state)
               decl.alias_name))
     else if
       (not (Infer.type_is_resource_source state.env decl.alias_target))
-      && Infer.type_contains_resource_source state.env decl.alias_target
+      && Infer.type_contains_resource_source ~memo:state.type_shape_memo
+           state.env decl.alias_target
     then
       add_error state
         (resource_source_containing_type_alias_error loc
@@ -1584,8 +1601,8 @@ let process_type_alias ?(loc = dummy_loc) ?home_module (state : check_state)
   in
   let state =
     if
-      Infer.type_contains_one_shot_stream_function_carrier state.env
-        decl.alias_target
+      Infer.type_contains_one_shot_stream_function_carrier
+        ~memo:state.type_shape_memo state.env decl.alias_target
     then
       add_error state
         (one_shot_stream_function_carrier_error loc
@@ -1594,7 +1611,8 @@ let process_type_alias ?(loc = dummy_loc) ?home_module (state : check_state)
               decl.alias_name))
     else if
       (not (Infer.type_is_one_shot_stream state.env decl.alias_target))
-      && Infer.type_contains_one_shot_stream state.env decl.alias_target
+      && Infer.type_contains_one_shot_stream ~memo:state.type_shape_memo
+           state.env decl.alias_target
     then
       add_error state
         (one_shot_stream_containing_type_alias_error loc
@@ -1872,8 +1890,8 @@ let validate_resource_signature_boundary loc (state : check_state)
       List.fold_left
         (fun state ((param : Ast.param), param_ty) ->
           if
-            Infer.type_contains_resource_source_function_carrier state.env
-              param_ty
+            Infer.type_contains_resource_source_function_carrier
+              ~memo:state.type_shape_memo state.env param_ty
           then
             let param_name = Option.value param.param_name ~default:"_" in
             add_error state
@@ -1882,7 +1900,10 @@ let validate_resource_signature_boundary loc (state : check_state)
                     "Function '%s' parameter '%s' cannot contain a resource \
                      source carrier"
                     sig_.cfs_name param_name))
-          else if Infer.type_contains_resource_source state.env param_ty then
+          else if
+            Infer.type_contains_resource_source ~memo:state.type_shape_memo
+              state.env param_ty
+          then
             let param_name = Option.value param.param_name ~default:"_" in
             add_error state
               (resource_source_signature_boundary_error param.param_loc
@@ -1897,8 +1918,8 @@ let validate_resource_signature_boundary loc (state : check_state)
       List.fold_left
         (fun state ((param : Ast.param), param_ty) ->
           if
-            Infer.type_contains_one_shot_stream_function_carrier state.env
-              param_ty
+            Infer.type_contains_one_shot_stream_function_carrier
+              ~memo:state.type_shape_memo state.env param_ty
           then
             let param_name = Option.value param.param_name ~default:"_" in
             add_error state
@@ -1908,7 +1929,8 @@ let validate_resource_signature_boundary loc (state : check_state)
                      stream carrier"
                     sig_.cfs_name param_name))
           else if
-            Infer.type_contains_one_shot_stream state.env param_ty
+            Infer.type_contains_one_shot_stream ~memo:state.type_shape_memo
+              state.env param_ty
             && not (Infer.type_is_one_shot_stream state.env param_ty)
           then
             let param_name = Option.value param.param_name ~default:"_" in
@@ -1928,8 +1950,8 @@ let validate_resource_signature_boundary loc (state : check_state)
               "Function '%s' return type cannot contain a resource type"
               sig_.cfs_name))
     else if
-      Infer.type_contains_resource_source_function_carrier state.env
-        sig_.cfs_return_type
+      Infer.type_contains_resource_source_function_carrier
+        ~memo:state.type_shape_memo state.env sig_.cfs_return_type
     then
       add_error state
         (resource_source_function_carrier_error loc
@@ -1937,7 +1959,9 @@ let validate_resource_signature_boundary loc (state : check_state)
               "Function '%s' return type cannot contain a resource source \
                carrier"
               sig_.cfs_name))
-    else if Infer.type_contains_resource_source state.env sig_.cfs_return_type
+    else if
+      Infer.type_contains_resource_source ~memo:state.type_shape_memo state.env
+        sig_.cfs_return_type
     then
       add_error state
         (resource_source_signature_boundary_error loc
@@ -1945,8 +1969,8 @@ let validate_resource_signature_boundary loc (state : check_state)
               "Function '%s' return type cannot contain a resource source type"
               sig_.cfs_name))
     else if
-      Infer.type_contains_one_shot_stream_function_carrier state.env
-        sig_.cfs_return_type
+      Infer.type_contains_one_shot_stream_function_carrier
+        ~memo:state.type_shape_memo state.env sig_.cfs_return_type
     then
       add_error state
         (one_shot_stream_function_carrier_error loc
@@ -1955,7 +1979,8 @@ let validate_resource_signature_boundary loc (state : check_state)
                carrier"
               sig_.cfs_name))
     else if
-      Infer.type_contains_one_shot_stream state.env sig_.cfs_return_type
+      Infer.type_contains_one_shot_stream ~memo:state.type_shape_memo state.env
+        sig_.cfs_return_type
       && not (Infer.type_is_one_shot_stream state.env sig_.cfs_return_type)
     then
       add_error state
@@ -3603,6 +3628,7 @@ let () =
                     top_level_names = Hashtbl.create 4;
                     type_home = Hashtbl.create 4;
                     func_callable_ids = Hashtbl.create 4;
+                    type_shape_memo = Infer.make_type_shape_memo ();
                   }
                 in
                 let state =
@@ -3644,6 +3670,7 @@ let () =
               top_level_names = Hashtbl.create 4;
               type_home = Hashtbl.create 4;
               func_callable_ids = Hashtbl.create 4;
+              type_shape_memo = Infer.make_type_shape_memo ();
             }
           in
           let state =
@@ -4072,7 +4099,8 @@ let check_function_body (state : check_state) (func : func_decl) (_loc : loc) :
       let ctx =
         make_ctx ~module_aliases:state.module_aliases
           ~allow_debug_only_calls:state.allow_debug_only_calls
-          ~rigid_type_params:(Env.get_type_params env) env
+          ~rigid_type_params:(Env.get_type_params env)
+          ~type_shape_memo:state.type_shape_memo env
       in
       (* Infer body type. Reset the meta-variable environment so
          unification bindings from earlier function bodies don't leak in,
@@ -5092,7 +5120,7 @@ let rec second_pass (state : check_state) (decls : program) :
                                 name))
                     | Some name, Some ty
                       when Infer.type_contains_one_shot_stream_function_carrier
-                             state.env ty ->
+                             ~memo:state.type_shape_memo state.env ty ->
                         add_error state
                           (one_shot_stream_function_carrier_error loc
                              (Printf.sprintf
@@ -5100,7 +5128,8 @@ let rec second_pass (state : check_state) (decls : program) :
                                  one-shot stream carrier"
                                 name))
                     | Some name, Some ty
-                      when Infer.type_contains_one_shot_stream state.env ty ->
+                      when Infer.type_contains_one_shot_stream
+                             ~memo:state.type_shape_memo state.env ty ->
                         add_error state
                           (error_with loc
                              (Printf.sprintf
@@ -5122,7 +5151,7 @@ let rec second_pass (state : check_state) (decls : program) :
                                    terminal stream operation."))
                     | Some name, Some ty
                       when Infer.type_contains_resource_source_function_carrier
-                             state.env ty ->
+                             ~memo:state.type_shape_memo state.env ty ->
                         add_error state
                           (resource_source_function_carrier_error loc
                              (Printf.sprintf
@@ -5130,7 +5159,8 @@ let rec second_pass (state : check_state) (decls : program) :
                                  resource source carrier"
                                 name))
                     | Some name, Some ty
-                      when Infer.type_contains_resource_source state.env ty ->
+                      when Infer.type_contains_resource_source
+                             ~memo:state.type_shape_memo state.env ty ->
                         add_error state
                           (error_with loc
                              (Printf.sprintf
