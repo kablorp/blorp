@@ -52,6 +52,7 @@ BENCH_RUNS="${BENCH_RUNS:-1}"
 BENCH_WARMUPS="${BENCH_WARMUPS:-0}"
 BENCH_ALLOC_STATS="${BENCH_ALLOC_STATS:-0}"
 BENCH_VERBOSE="${BENCH_VERBOSE:-0}"
+BENCH_FAILED=0
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 export BENCH_THREADS
@@ -173,7 +174,7 @@ warmups = int(sys.argv[1])
 runs = int(sys.argv[2])
 cmd = sys.argv[3:]
 
-    bench_re = re.compile(r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))", re.M)
+bench_re = re.compile(r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))", re.M)
 
 def run_once():
     proc = subprocess.run(
@@ -613,7 +614,7 @@ run_one() {
     local name="$1"
     local bt="" ct="" gt="" ot="" pt=""
     local blorp_alloc_stats=""
-    local args_text
+    local args_text src
     local args=()
 
     has_bench blorp "$name" || {
@@ -635,6 +636,7 @@ run_one() {
             blorp_alloc_stats="$(run_blorp_alloc_stats "$name" "${args[@]}" 2>/dev/null || true)"
         fi
     else
+        BENCH_FAILED=1
         printf "  %8s" "FAIL"
     fi
 
@@ -642,6 +644,7 @@ run_one() {
         if ct=$(run_built_lang c "$name" "${args[@]}" 2>/dev/null); then
             printf "  %9ss" "$ct"
         else
+            BENCH_FAILED=1
             printf "  %8s" "FAIL"
         fi
     else
@@ -652,6 +655,7 @@ run_one() {
         if gt=$(run_built_lang go "$name" "${args[@]}" 2>/dev/null); then
             printf "  %9ss" "$gt"
         else
+            BENCH_FAILED=1
             printf "  %8s" "FAIL"
         fi
     else
@@ -662,6 +666,7 @@ run_one() {
         if ot=$(run_built_lang ocaml "$name" "${args[@]}" 2>/dev/null); then
             printf "  %9ss" "$ot"
         else
+            BENCH_FAILED=1
             printf "  %8s" "FAIL"
         fi
     else
@@ -675,6 +680,7 @@ run_one() {
         if pt=$(run_python_lang "$name" "$src" "${args[@]}" 2>/dev/null); then
             printf "  %9ss" "$pt"
         else
+            BENCH_FAILED=1
             printf "  %8s" "FAIL"
         fi
     else
@@ -762,6 +768,10 @@ printf "  %-18s  %10s  %10s  %10s  %10s  %10s\n" "---------" "-----" "-" "--" "-
 for name in $RUN_BENCHMARKS; do
     run_one "$name"
 done
+
+if [ "$BENCH_FAILED" -ne 0 ]; then
+    exit 1
+fi
 
 echo ""
 echo "Done."

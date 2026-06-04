@@ -2942,10 +2942,11 @@ compatibility remains on `from_iso`, which returns raw POSIX microseconds.
 `format_time` and `parse_time` are POSIX/C-library format helpers; use the
 RFC3339 functions for stable interchange strings.
 
-`Duration` lives in `std/units` and stores integer microseconds in a
-`microseconds` field. Timeout APIs accept typed `Duration` values and round
-positive sub-millisecond durations up to one millisecond; non-positive
-durations are immediate polls.
+`Duration` lives in `std/units` as an opaque `Int`-backed microsecond value;
+use `microseconds(...)` and `to_microseconds(...)` at raw integer boundaries.
+Timeout APIs accept typed `Duration` values and round positive
+sub-millisecond durations up to one millisecond; non-positive durations are
+immediate polls.
 
 ### Process Helpers
 

@@ -11492,18 +11492,27 @@ and infer_field_access ctx expr obj field loc =
                        "Record %s has no field '%s'. Valid fields: %s" type_name
                        field valid)
               | None -> (
-                  match
-                    ambiguous_record_type_error loc type_name
-                      (Printf.sprintf "Field access '.%s'" field)
-                  with
-                  | Some err -> err
-                  | None ->
+                  match Env.get_opaque_alias ctx.env type_name with
+                  | Some _ ->
                       error loc
                         (Printf.sprintf
-                           "Cannot access field on type %s. Field access is \
-                            supported on record fields. Use tuple[index] for \
-                            tuple elements"
-                           (type_to_string obj_ty)))))
+                           "Cannot access field on opaque type %s. Use the \
+                            public constructor and accessor functions for this \
+                            type"
+                           (type_to_string obj_ty))
+                  | None -> (
+                      match
+                        ambiguous_record_type_error loc type_name
+                          (Printf.sprintf "Field access '.%s'" field)
+                      with
+                      | Some err -> err
+                      | None ->
+                          error loc
+                            (Printf.sprintf
+                               "Cannot access field on type %s. Field access \
+                                is supported on record fields. Use tuple[index] \
+                                for tuple elements"
+                               (type_to_string obj_ty))))))
       | _ ->
           error loc
             (Printf.sprintf

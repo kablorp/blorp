@@ -21626,10 +21626,10 @@ static blorp_Fiber* blorp_fiber_create(void (*func)(mco_coro*), void* user_data)
 
 static long blorp_fiber_choose_worker_id(blorp_ThreadPool* pool) {
     if (!pool || !pool->fiber_queues || pool->num_threads <= 0) return -1;
-    if (__blorp_current_worker_id >= 0 &&
-        __blorp_current_worker_id < pool->num_threads) {
-        return __blorp_current_worker_id;
-    }
+    // This path assigns the first owner for a newly runnable fiber. Resumed
+    // fibers keep their existing owner queue, but new task fibers have no
+    // coroutine thread affinity yet and should be spread across carriers now
+    // that owner pinning prevents later work stealing.
     long ticket =
         atomic_fetch_add_explicit(
             &pool->fiber_enqueue_cursor, 1, memory_order_relaxed);
