@@ -162,7 +162,7 @@ let completions_from_env ?(skip = fun _ -> false) (env : Env.env)
             in
             match item with Some i -> items := i :: !items | None -> ()
           end)
-        scope)
+        (Env.scope_symbols scope))
     env.scopes;
   List.rev !items
 

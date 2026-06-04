@@ -478,6 +478,29 @@ type return_annotation_inference =
   | ReturnAnnotationDoesNotGuideInference
   | ReturnAnnotationGuidesInference of type_expr
 
+type resource_shape_target = OneShotStreamShape | ResourceSourceShape
+
+type type_shape_memo = {
+  named_components : (string * type_expr list, type_expr list option) Hashtbl.t;
+  record_field_types :
+    (string * type_expr list, (string * type_expr) list option) Hashtbl.t;
+  record_field_type :
+    (string * type_expr list * string, type_expr option) Hashtbl.t;
+  contains_target :
+    (resource_shape_target * string list * type_expr, bool) Hashtbl.t;
+  function_carrier :
+    (resource_shape_target * string list * type_expr, bool) Hashtbl.t;
+}
+
+let make_type_shape_memo () =
+  {
+    named_components = Hashtbl.create 128;
+    record_field_types = Hashtbl.create 128;
+    record_field_type = Hashtbl.create 512;
+    contains_target = Hashtbl.create 256;
+    function_carrier = Hashtbl.create 256;
+  }
+
 type record_literal_target =
   | RecordLiteralTarget of {
       target_ty : type_expr;
@@ -501,12 +524,15 @@ type infer_ctx = {
   allow_debug_only_calls : bool;
       (* Debug/test builds may call @debug_only helpers directly. *)
   in_debug_context : bool; (* True while inferring a debug: block. *)
+  type_shape_memo : type_shape_memo;
+      (* Ephemeral memo table for type-shape resource checks during this
+         inference pass. It is not persisted and needs no invalidation. *)
 }
 (** Inference context *)
 
 (** Create a context *)
 let make_ctx ?(module_aliases = []) ?(allow_debug_only_calls = false)
-    ?(rigid_type_params = []) env =
+    ?(rigid_type_params = []) ?type_shape_memo env =
   {
     env;
     expected = NoExpectedType;
@@ -516,6 +542,8 @@ let make_ctx ?(module_aliases = []) ?(allow_debug_only_calls = false)
     module_aliases;
     allow_debug_only_calls;
     in_debug_context = false;
+    type_shape_memo =
+      Option.value type_shape_memo ~default:(make_type_shape_memo ());
   }
 
 let type_resolution_context ctx =
@@ -1117,7 +1145,20 @@ let is_channel_type_name name =
       || name = "std_channel__Channel"
       || name = "std/channel::Channel"
 
-let named_type_components env name args =
+let memo_find table key compute =
+  match Hashtbl.find_opt table key with
+  | Some result -> result
+  | None ->
+      let result = compute () in
+      Hashtbl.replace table key result;
+      result
+
+let resource_shape_target_matches target name =
+  match target with
+  | OneShotStreamShape -> Type_name_metadata.is_one_shot_stream_name name
+  | ResourceSourceShape -> Type_name_metadata.is_resource_source_name name
+
+let named_type_components_uncached env name args =
   (* Known source records/unions expose the values they actually store after
      generic substitution. Opaque builtin containers do not, so callers must
      inspect their type arguments conservatively. *)
@@ -1157,95 +1198,125 @@ let named_type_components env name args =
         (Option.value record_fields ~default:[]
         @ Option.value variant_fields ~default:[])
 
-let type_contains_named_type env is_target ty =
+let named_type_components ?memo env name args =
+  match memo with
+  | None -> named_type_components_uncached env name args
+  | Some memo ->
+      memo_find memo.named_components (name, args) (fun () ->
+          named_type_components_uncached env name args)
+
+let type_contains_resource_shape_target ?memo env target ty =
   let rec go visited ty =
     let ty =
       normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
     in
-    match ty with
-    | TyNamed (name, args) -> (
-        is_target name
-        ||
-        if List.mem name visited then false
-        else
-          match named_type_components env name args with
-          | Some components -> List.exists (go (name :: visited)) components
-          | None -> List.exists (go visited) args)
-    | TyTuple elems -> List.exists (go visited) elems
-    | TyFunc _ ->
-        (* Function values do not themselves contain stream cursor state.
-           Closures that capture a stream are rejected at closure construction. *)
-        false
-    | TyRange inner -> go visited inner
-    | TyArray (elem, dims) -> go visited elem || List.exists (go visited) dims
-    | TyDimOp (_, left, right) -> go visited left || go visited right
-    | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _ ->
-        false
+    let compute () =
+      match ty with
+      | TyNamed (name, args) -> (
+          resource_shape_target_matches target name
+          ||
+          if List.mem name visited then false
+          else
+            match named_type_components ?memo env name args with
+            | Some components -> List.exists (go (name :: visited)) components
+            | None -> List.exists (go visited) args)
+      | TyTuple elems -> List.exists (go visited) elems
+      | TyFunc _ ->
+          (* Function values do not themselves contain stream/source cursor
+             state. Closures that capture one are rejected at closure
+             construction. *)
+          false
+      | TyRange inner -> go visited inner
+      | TyArray (elem, dims) -> go visited elem || List.exists (go visited) dims
+      | TyDimOp (_, left, right) -> go visited left || go visited right
+      | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _
+        ->
+          false
+    in
+    match memo with
+    | None -> compute ()
+    | Some memo -> memo_find memo.contains_target (target, visited, ty) compute
   in
   go [] ty
 
-let type_contains_one_shot_stream env ty =
-  type_contains_named_type env Type_name_metadata.is_one_shot_stream_name ty
+let type_contains_one_shot_stream ?memo env ty =
+  type_contains_resource_shape_target ?memo env OneShotStreamShape ty
 
-let type_contains_resource_source env ty =
-  type_contains_named_type env Type_name_metadata.is_resource_source_name ty
+let type_contains_resource_source ?memo env ty =
+  type_contains_resource_shape_target ?memo env ResourceSourceShape ty
 
-let type_is_named_target env is_target ty =
+let type_contains_one_shot_stream_memo memo env ty =
+  type_contains_one_shot_stream ~memo env ty
+
+let type_contains_resource_source_memo memo env ty =
+  type_contains_resource_source ~memo env ty
+
+let type_is_resource_shape_target env target ty =
   match
     normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
   with
-  | TyNamed (name, _) -> is_target name
+  | TyNamed (name, _) -> resource_shape_target_matches target name
   | _ -> false
 
 let type_is_one_shot_stream env ty =
-  type_is_named_target env Type_name_metadata.is_one_shot_stream_name ty
+  type_is_resource_shape_target env OneShotStreamShape ty
 
 let type_is_resource_source env ty =
-  type_is_named_target env Type_name_metadata.is_resource_source_name ty
+  type_is_resource_shape_target env ResourceSourceShape ty
 
 let resource_source_parts env ty =
   match
     normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
   with
   | TyNamed (name, [ resource_ty; error_ty ])
-    when Type_name_metadata.is_resource_source_name name ->
+    when resource_shape_target_matches ResourceSourceShape name ->
       Some (resource_ty, error_ty)
   | _ -> None
 
-let type_contains_named_type_function_carrier env is_target ty =
+let type_contains_resource_shape_function_carrier ?memo env target ty =
   let normalize ty =
     normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
   in
+  let type_contains_target ty =
+    type_contains_resource_shape_target ?memo env target ty
+  in
+  let type_is_target ty = type_is_resource_shape_target env target ty in
   let endpoint_hides_target_carrier ty =
-    type_contains_named_type env is_target ty
-    && not (type_is_named_target env is_target ty)
+    type_contains_target ty && not (type_is_target ty)
   in
   let rec contains_function_carrier visited ty =
-    match normalize ty with
-    | TyFunc { params; return; _ } ->
-        List.exists (endpoint_has_forbidden_shape visited) params
-        || endpoint_has_forbidden_shape visited return
-    | TyNamed (name, args) -> (
-        (not (is_target name))
-        &&
-        if List.mem name visited then false
-        else
-          match named_type_components env name args with
-          | Some components ->
-              List.exists
-                (contains_function_carrier (name :: visited))
-                components
-          | None -> List.exists (contains_function_carrier visited) args)
-    | TyTuple elems -> List.exists (contains_function_carrier visited) elems
-    | TyRange inner -> contains_function_carrier visited inner
-    | TyArray (elem, dims) ->
-        contains_function_carrier visited elem
-        || List.exists (contains_function_carrier visited) dims
-    | TyDimOp (_, left, right) ->
-        contains_function_carrier visited left
-        || contains_function_carrier visited right
-    | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _ ->
-        false
+    let ty = normalize ty in
+    let compute () =
+      match ty with
+      | TyFunc { params; return; _ } ->
+          List.exists (endpoint_has_forbidden_shape visited) params
+          || endpoint_has_forbidden_shape visited return
+      | TyNamed (name, args) -> (
+          (not (resource_shape_target_matches target name))
+          &&
+          if List.mem name visited then false
+          else
+            match named_type_components ?memo env name args with
+            | Some components ->
+                List.exists
+                  (contains_function_carrier (name :: visited))
+                  components
+            | None -> List.exists (contains_function_carrier visited) args)
+      | TyTuple elems -> List.exists (contains_function_carrier visited) elems
+      | TyRange inner -> contains_function_carrier visited inner
+      | TyArray (elem, dims) ->
+          contains_function_carrier visited elem
+          || List.exists (contains_function_carrier visited) dims
+      | TyDimOp (_, left, right) ->
+          contains_function_carrier visited left
+          || contains_function_carrier visited right
+      | TyVar _ | TyConstInt _ | TyMeta _ | TyVarDims _ | TySelf | TyBoundVar _
+        ->
+          false
+    in
+    match memo with
+    | None -> compute ()
+    | Some memo -> memo_find memo.function_carrier (target, visited, ty) compute
   and endpoint_has_forbidden_shape visited ty =
     match normalize ty with
     | TyFunc _ -> contains_function_carrier visited ty
@@ -1254,13 +1325,17 @@ let type_contains_named_type_function_carrier env is_target ty =
   in
   contains_function_carrier [] ty
 
-let type_contains_one_shot_stream_function_carrier env ty =
-  type_contains_named_type_function_carrier env
-    Type_name_metadata.is_one_shot_stream_name ty
+let type_contains_one_shot_stream_function_carrier ?memo env ty =
+  type_contains_resource_shape_function_carrier ?memo env OneShotStreamShape ty
 
-let type_contains_resource_source_function_carrier env ty =
-  type_contains_named_type_function_carrier env
-    Type_name_metadata.is_resource_source_name ty
+let type_contains_resource_source_function_carrier ?memo env ty =
+  type_contains_resource_shape_function_carrier ?memo env ResourceSourceShape ty
+
+let type_contains_one_shot_stream_function_carrier_memo memo env ty =
+  type_contains_one_shot_stream_function_carrier ~memo env ty
+
+let type_contains_resource_source_function_carrier_memo memo env ty =
+  type_contains_resource_source_function_carrier ~memo env ty
 
 let one_shot_stream_refs env refs =
   refs
@@ -1364,8 +1439,13 @@ let reject_scoped_resource_derived_storage ?(module_aliases = []) env loc
            "scoped resource-derived values cannot be stored in %s: %s" container
            (String.concat ", " vars))
 
-let reject_one_shot_stream_storage env loc container ty =
-  if type_contains_one_shot_stream env ty then
+let reject_one_shot_stream_storage ?memo env loc container ty =
+  let contains =
+    match memo with
+    | Some memo -> type_contains_one_shot_stream_memo memo env ty
+    | None -> type_contains_one_shot_stream env ty
+  in
+  if contains then
     error_with
       ~notes:
         [
@@ -1382,8 +1462,19 @@ let reject_one_shot_stream_storage env loc container ty =
          container (type_to_string ty))
   else Ok ()
 
-let reject_one_shot_stream_ordinary_carrier_type env loc carrier ty =
-  if type_contains_one_shot_stream_function_carrier env ty then
+let reject_one_shot_stream_ordinary_carrier_type ?memo env loc carrier ty =
+  let contains_function_carrier =
+    match memo with
+    | Some memo ->
+        type_contains_one_shot_stream_function_carrier_memo memo env ty
+    | None -> type_contains_one_shot_stream_function_carrier env ty
+  in
+  let contains =
+    match memo with
+    | Some memo -> type_contains_one_shot_stream_memo memo env ty
+    | None -> type_contains_one_shot_stream env ty
+  in
+  if contains_function_carrier then
     error_with
       ~notes:
         [
@@ -1402,9 +1493,7 @@ let reject_one_shot_stream_ordinary_carrier_type env loc carrier ty =
          "function type cannot accept or return a one-shot stream carrier \
           (found %s)"
          (type_to_string ty))
-  else if
-    type_contains_one_shot_stream env ty && not (type_is_one_shot_stream env ty)
-  then
+  else if contains && not (type_is_one_shot_stream env ty) then
     error_with
       ~notes:
         [
@@ -1422,8 +1511,19 @@ let reject_one_shot_stream_ordinary_carrier_type env loc carrier ty =
          carrier (type_to_string ty))
   else Ok ()
 
-let reject_one_shot_stream_ordinary_binding env loc binding_name ty =
-  if type_contains_one_shot_stream_function_carrier env ty then
+let reject_one_shot_stream_ordinary_binding ?memo env loc binding_name ty =
+  let contains_function_carrier =
+    match memo with
+    | Some memo ->
+        type_contains_one_shot_stream_function_carrier_memo memo env ty
+    | None -> type_contains_one_shot_stream_function_carrier env ty
+  in
+  let contains =
+    match memo with
+    | Some memo -> type_contains_one_shot_stream_memo memo env ty
+    | None -> type_contains_one_shot_stream env ty
+  in
+  if contains_function_carrier then
     error_with
       ~notes:
         [
@@ -1443,9 +1543,7 @@ let reject_one_shot_stream_ordinary_binding env loc binding_name ty =
          (match binding_name with
          | None | Some "_" -> ""
          | Some n -> " '" ^ n ^ "'"))
-  else if
-    type_contains_one_shot_stream env ty && not (type_is_one_shot_stream env ty)
-  then
+  else if contains && not (type_is_one_shot_stream env ty) then
     error_with
       ~notes:
         [
@@ -1465,8 +1563,13 @@ let reject_one_shot_stream_ordinary_binding env loc binding_name ty =
          | Some n -> " '" ^ n ^ "'"))
   else Ok ()
 
-let reject_resource_source_storage env loc container ty =
-  if type_contains_resource_source env ty then
+let reject_resource_source_storage ?memo env loc container ty =
+  let contains =
+    match memo with
+    | Some memo -> type_contains_resource_source_memo memo env ty
+    | None -> type_contains_resource_source env ty
+  in
+  if contains then
     error_with
       ~notes:
         [
@@ -1483,8 +1586,19 @@ let reject_resource_source_storage env loc container ty =
          container (type_to_string ty))
   else Ok ()
 
-let reject_resource_source_ordinary_carrier_type env loc carrier ty =
-  if type_contains_resource_source_function_carrier env ty then
+let reject_resource_source_ordinary_carrier_type ?memo env loc carrier ty =
+  let contains_function_carrier =
+    match memo with
+    | Some memo ->
+        type_contains_resource_source_function_carrier_memo memo env ty
+    | None -> type_contains_resource_source_function_carrier env ty
+  in
+  let contains =
+    match memo with
+    | Some memo -> type_contains_resource_source_memo memo env ty
+    | None -> type_contains_resource_source env ty
+  in
+  if contains_function_carrier then
     error_with
       ~notes:
         [
@@ -1502,9 +1616,7 @@ let reject_resource_source_ordinary_carrier_type env loc carrier ty =
          "function type cannot accept or return a resource source carrier \
           (found %s)"
          (type_to_string ty))
-  else if
-    type_contains_resource_source env ty && not (type_is_resource_source env ty)
-  then
+  else if contains && not (type_is_resource_source env ty) then
     error_with
       ~notes:
         [
@@ -1523,8 +1635,19 @@ let reject_resource_source_ordinary_carrier_type env loc carrier ty =
          carrier (type_to_string ty))
   else Ok ()
 
-let reject_resource_source_ordinary_binding env loc binding_name ty =
-  if type_contains_resource_source_function_carrier env ty then
+let reject_resource_source_ordinary_binding ?memo env loc binding_name ty =
+  let contains_function_carrier =
+    match memo with
+    | Some memo ->
+        type_contains_resource_source_function_carrier_memo memo env ty
+    | None -> type_contains_resource_source_function_carrier env ty
+  in
+  let contains =
+    match memo with
+    | Some memo -> type_contains_resource_source_memo memo env ty
+    | None -> type_contains_resource_source env ty
+  in
+  if contains_function_carrier then
     error_with
       ~notes:
         [
@@ -1543,9 +1666,7 @@ let reject_resource_source_ordinary_binding env loc binding_name ty =
          (match binding_name with
          | None | Some "_" -> ""
          | Some n -> " '" ^ n ^ "'"))
-  else if
-    type_contains_resource_source env ty && not (type_is_resource_source env ty)
-  then
+  else if contains && not (type_is_resource_source env ty) then
     error_with
       ~notes:
         [
@@ -1566,7 +1687,8 @@ let reject_resource_source_ordinary_binding env loc binding_name ty =
          | Some n -> " '" ^ n ^ "'"))
   else Ok ()
 
-let reject_resource_source_copy_from_existing env loc binding_name ty rhs =
+let reject_resource_source_copy_from_existing ?memo:_ env loc binding_name ty
+    rhs =
   if type_is_resource_source env ty then
     match resource_source_capture_refs env rhs with
     | [] -> Ok ()
@@ -1594,7 +1716,8 @@ let reject_resource_source_copy_from_existing env loc binding_name ty rhs =
              (String.concat ", " refs))
   else Ok ()
 
-let reject_resource_source_mutable_binding env loc binding_name ty is_mutable =
+let reject_resource_source_mutable_binding ?memo:_ env loc binding_name ty
+    is_mutable =
   if is_mutable && type_is_resource_source env ty then
     error_with
       ~notes:
@@ -2487,12 +2610,12 @@ let validate_question_bind ctx stmt name ty_ann inner_ty rhs' =
     reject_question_bind_resource_binding ctx stmt.expr_loc binding_name bind_ty
   in
   let* () =
-    reject_one_shot_stream_ordinary_binding ctx.env stmt.expr_loc binding_name
-      bind_ty
+    reject_one_shot_stream_ordinary_binding ~memo:ctx.type_shape_memo ctx.env
+      stmt.expr_loc binding_name bind_ty
   in
   let* () =
-    reject_resource_source_ordinary_binding ctx.env stmt.expr_loc binding_name
-      bind_ty
+    reject_resource_source_ordinary_binding ~memo:ctx.type_shape_memo ctx.env
+      stmt.expr_loc binding_name bind_ty
   in
   let env' =
     Env.add_var ctx.env name bind_ty
@@ -2916,7 +3039,7 @@ let lookup_module_impl_method module_path method_name (arg_ty : type_expr) :
     (e.g., [GeoLineString(ls)] -> [ls: LineString]) have their fields accessed
     without an explicit import of the record type, while duplicate public names
     fail deterministically instead of depending on module-cache order. *)
-let resolve_record_field_types env type_name type_args =
+let resolve_record_field_types_uncached env type_name type_args =
   let resolve_with ?(qualify = fun ty -> ty) (type_params, field_list) =
     let subst =
       if List.length type_params = List.length type_args then
@@ -2981,6 +3104,24 @@ let resolve_record_field_types env type_name type_args =
               | None -> None)
           | [] | _ :: _ :: _ -> None))
 
+let resolve_record_field_types ?memo env type_name type_args =
+  match memo with
+  | None -> resolve_record_field_types_uncached env type_name type_args
+  | Some memo ->
+      memo_find memo.record_field_types (type_name, type_args) (fun () ->
+          resolve_record_field_types_uncached env type_name type_args)
+
+let resolve_record_field_type ?memo env type_name type_args field =
+  let resolve () =
+    Option.bind
+      (resolve_record_field_types ?memo env type_name type_args)
+      (List.assoc_opt field)
+  in
+  match memo with
+  | None -> resolve ()
+  | Some memo ->
+      memo_find memo.record_field_type (type_name, type_args, field) resolve
+
 let ambiguous_bare_record_type_homes type_name =
   match Types.split_canonical_module_type_name type_name with
   | Some _ -> None
@@ -3013,7 +3154,10 @@ let record_literal_target_from_expected ctx literal_fields =
   let from_type ~annotated ty =
     match ty with
     | TyNamed (name, type_args) -> (
-        match resolve_record_field_types ctx.env name type_args with
+        match
+          resolve_record_field_types ~memo:ctx.type_shape_memo ctx.env name
+            type_args
+        with
         | Some field_types ->
             RecordLiteralTarget { target_ty = ty; field_types }
         | None when literal_fields = [] && is_empty_record_collection_type ty ->
@@ -3889,6 +4033,17 @@ let get_callee_name (callee : expr) : string option =
   | EFieldAccess (_, name) -> Some name
   | _ -> None
 
+let identifier_may_resolve_as_call_target env name =
+  match Env.lookup env name with
+  | Some
+      { kind = Env.FuncSymbol _ | Env.VarSymbol _ | Env.ConstructorSymbol _; _ }
+    ->
+      true
+  | Some _ -> false
+  | None ->
+      Option.is_some (Env.get_constructor env name)
+      || Option.is_some (Env.get_function_trait env name)
+
 let strip_callable_id_suffix name =
   match String.index_opt name '#' with
   | Some idx -> String.sub name 0 idx
@@ -4513,7 +4668,7 @@ let vardims_bound_in_scope (env : Env.env) : string list =
           | Env.VarSymbol { var_type; origin = Env.FuncParam; _ } ->
               Types.Dim.collect_vardim_names var_type
           | _ -> [])
-        scope)
+        (Env.scope_symbols scope))
     env.scopes
 
 let validate_value_ascription_type loc ty =
@@ -5143,12 +5298,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       in
       if ctx_types_compatible ctx ascribed_ty value_ty then
         let* () =
-          reject_one_shot_stream_ordinary_carrier_type ctx.env loc
-            "ascribed type" ascribed_ty
+          reject_one_shot_stream_ordinary_carrier_type ~memo:ctx.type_shape_memo
+            ctx.env loc "ascribed type" ascribed_ty
         in
         let* () =
-          reject_resource_source_ordinary_carrier_type ctx.env loc
-            "ascribed type" ascribed_ty
+          reject_resource_source_ordinary_carrier_type ~memo:ctx.type_shape_memo
+            ctx.env loc "ascribed type" ascribed_ty
         in
         let ascribed_expr =
           with_inferred_type
@@ -5210,12 +5365,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             in
             let* () = reject_resource_tuple_element ctx e.expr_loc e_ty in
             let* () =
-              reject_one_shot_stream_storage ctx.env e.expr_loc "tuple literals"
-                e_ty
+              reject_one_shot_stream_storage ~memo:ctx.type_shape_memo ctx.env
+                e.expr_loc "tuple literals" e_ty
             in
             let* () =
-              reject_resource_source_storage ctx.env e.expr_loc "tuple literals"
-                e_ty
+              reject_resource_source_storage ~memo:ctx.type_shape_memo ctx.env
+                e.expr_loc "tuple literals" e_ty
             in
             let* () =
               reject_scoped_resource_derived_storage
@@ -6252,16 +6407,16 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
             reject_ordinary_resource_binding ctx loc (Some var) val_ty
           in
           let* () =
-            reject_one_shot_stream_ordinary_binding ctx.env loc (Some var)
-              val_ty
+            reject_one_shot_stream_ordinary_binding ~memo:ctx.type_shape_memo
+              ctx.env loc (Some var) val_ty
           in
           let* () =
-            reject_resource_source_ordinary_binding ctx.env loc (Some var)
-              val_ty
+            reject_resource_source_ordinary_binding ~memo:ctx.type_shape_memo
+              ctx.env loc (Some var) val_ty
           in
           let* () =
-            reject_resource_source_copy_from_existing ctx.env loc (Some var)
-              val_ty value'
+            reject_resource_source_copy_from_existing ~memo:ctx.type_shape_memo
+              ctx.env loc (Some var) val_ty value'
           in
           let new_expr =
             with_inferred_type
@@ -6383,22 +6538,26 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
           val_ty
       in
       let* () =
-        reject_one_shot_stream_ordinary_binding ctx.env loc
+        reject_one_shot_stream_ordinary_binding ~memo:ctx.type_shape_memo
+          ctx.env loc
           (if name = "_" then None else Some name)
           val_ty
       in
       let* () =
-        reject_resource_source_ordinary_binding ctx.env loc
+        reject_resource_source_ordinary_binding ~memo:ctx.type_shape_memo
+          ctx.env loc
           (if name = "_" then None else Some name)
           val_ty
       in
       let* () =
-        reject_resource_source_mutable_binding ctx.env loc
+        reject_resource_source_mutable_binding ~memo:ctx.type_shape_memo ctx.env
+          loc
           (if name = "_" then None else Some name)
           val_ty is_mutable
       in
       let* () =
-        reject_resource_source_copy_from_existing ctx.env loc
+        reject_resource_source_copy_from_existing ~memo:ctx.type_shape_memo
+          ctx.env loc
           (if name = "_" then None else Some name)
           val_ty value'
       in
@@ -6505,10 +6664,12 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       let* val_ty, value' = infer_unconstrained_value_expr ctx value in
       let* () = reject_ordinary_resource_binding ctx loc None val_ty in
       let* () =
-        reject_one_shot_stream_ordinary_binding ctx.env loc None val_ty
+        reject_one_shot_stream_ordinary_binding ~memo:ctx.type_shape_memo
+          ctx.env loc None val_ty
       in
       let* () =
-        reject_resource_source_ordinary_binding ctx.env loc None val_ty
+        reject_resource_source_ordinary_binding ~memo:ctx.type_shape_memo
+          ctx.env loc None val_ty
       in
       (* Value must be a tuple type *)
       match val_ty with
@@ -7739,12 +7900,14 @@ and infer_checked_collection_element ctx kind ~target_ty ~mismatch_label
   in
   let* () = reject_resource_collection_element ctx expr.expr_loc kind elem_ty in
   let* () =
-    reject_one_shot_stream_storage ctx.env expr.expr_loc
+    reject_one_shot_stream_storage ~memo:ctx.type_shape_memo ctx.env
+      expr.expr_loc
       (collection_kind_user_name kind)
       elem_ty
   in
   let* () =
-    reject_resource_source_storage ctx.env expr.expr_loc
+    reject_resource_source_storage ~memo:ctx.type_shape_memo ctx.env
+      expr.expr_loc
       (collection_kind_user_name kind)
       elem_ty
   in
@@ -9018,62 +9181,72 @@ and infer_call ctx expr callee args loc =
                                   { callee with expr_desc = EIdent method_name }
                                 in
                                 let normal_result =
-                                  match
-                                    infer_unconstrained_value_expr ctx ident
-                                  with
-                                  | Ok (callee_ty, callee') ->
-                                      (* Check if the resolved function can actually
+                                  if
+                                    not
+                                      (identifier_may_resolve_as_call_target
+                                         ctx.env method_name)
+                                  then None
+                                  else
+                                    match
+                                      infer_unconstrained_value_expr ctx ident
+                                    with
+                                    | Ok (callee_ty, callee') ->
+                                        (* Check if the resolved function can actually
 
                                  accept the receiver as its first argument. If
                                  not, try UFCS-only methods. *)
-                                      let first_param_matches =
-                                        let obj_ty =
-                                          match expr_semantic_type_opt obj' with
-                                          | Some t -> t
-                                          | None -> ty_void
-                                        in
-                                        let builtin_trait_accepts_receiver () =
-                                          match
-                                            ( Env.is_builtin_func ctx.env
-                                                method_name,
-                                              Env.get_function_trait ctx.env
-                                                method_name )
-                                          with
-                                          | true, Some trait_name ->
-                                              trait_obligation_satisfied ctx.env
-                                                obj_ty trait_name
-                                          | _ -> true
-                                        in
-                                        let normal_function_type_params =
-                                          match
-                                            Env.get_func_info ctx.env
-                                              method_name
-                                          with
-                                          | Some (_, type_params, _) ->
-                                              Env.bound_type_param_names
-                                                type_params
-                                          | None -> Env.get_type_params ctx.env
-                                        in
-                                        let receiver_family = function
-                                          | TyNamed (name, _) -> Some name
-                                          | TyArray _ ->
-                                              Some Types.array_head_name
-                                          | _ -> None
-                                        in
-                                        match callee_ty with
-                                        | TyFunc
-                                            { params = first_param :: _; _ }
-                                          -> (
-                                            let first_param =
-                                              normalize_type ctx
-                                                UfcsCandidateFiltering
-                                                first_param
-                                            in
-                                            let obj_ty =
-                                              normalize_type ctx
-                                                UfcsCandidateFiltering obj_ty
-                                            in
-                                            (* Generic builtin trait functions like
+                                        let first_param_matches =
+                                          let obj_ty =
+                                            match
+                                              expr_semantic_type_opt obj'
+                                            with
+                                            | Some t -> t
+                                            | None -> ty_void
+                                          in
+                                          let builtin_trait_accepts_receiver ()
+                                              =
+                                            match
+                                              ( Env.is_builtin_func ctx.env
+                                                  method_name,
+                                                Env.get_function_trait ctx.env
+                                                  method_name )
+                                            with
+                                            | true, Some trait_name ->
+                                                trait_obligation_satisfied
+                                                  ctx.env obj_ty trait_name
+                                            | _ -> true
+                                          in
+                                          let normal_function_type_params =
+                                            match
+                                              Env.get_func_info ctx.env
+                                                method_name
+                                            with
+                                            | Some (_, type_params, _) ->
+                                                Env.bound_type_param_names
+                                                  type_params
+                                            | None ->
+                                                Env.get_type_params ctx.env
+                                          in
+                                          let receiver_family = function
+                                            | TyNamed (name, _) -> Some name
+                                            | TyArray _ ->
+                                                Some Types.array_head_name
+                                            | _ -> None
+                                          in
+                                          match callee_ty with
+                                          | TyFunc
+                                              { params = first_param :: _; _ }
+                                            -> (
+                                              let first_param =
+                                                normalize_type ctx
+                                                  UfcsCandidateFiltering
+                                                  first_param
+                                              in
+                                              let obj_ty =
+                                                normalize_type ctx
+                                                  UfcsCandidateFiltering obj_ty
+                                              in
+                                              (* Generic builtin trait functions like
                                        [length(T)] are only valid method
                                        candidates when the receiver satisfies
                                        the trait.
@@ -9085,42 +9258,43 @@ and infer_call ctx expr callee args loc =
                                        this phase, but cross-family candidates
                                        like tensor get on List should fall
                                        through to UFCS-only methods. *)
-                                            if
-                                              Env.is_builtin_func ctx.env
-                                                method_name
-                                              && Option.is_some
-                                                   (Env.get_function_trait
-                                                      ctx.env method_name)
-                                            then
-                                              builtin_trait_accepts_receiver ()
-                                            else
-                                              match
-                                                ( receiver_family first_param,
-                                                  receiver_family obj_ty )
-                                              with
-                                              | ( Some param_family,
-                                                  Some obj_family ) ->
-                                                  param_family = obj_family
-                                              | _ ->
-                                                  types_compatible
-                                                    ~type_params:
-                                                      normal_function_type_params
-                                                    first_param obj_ty)
-                                        | _ -> false
-                                      in
-                                      if first_param_matches then
-                                        Some
-                                          (Ok
-                                             ( callee_ty,
-                                               callee',
-                                               ident,
-                                               receiver_arg :: args,
-                                               None,
-                                               None,
-                                               None ))
-                                      else None
-                                      (* Type mismatch — try UFCS methods *)
-                                  | Error _ -> None
+                                              if
+                                                Env.is_builtin_func ctx.env
+                                                  method_name
+                                                && Option.is_some
+                                                     (Env.get_function_trait
+                                                        ctx.env method_name)
+                                              then
+                                                builtin_trait_accepts_receiver
+                                                  ()
+                                              else
+                                                match
+                                                  ( receiver_family first_param,
+                                                    receiver_family obj_ty )
+                                                with
+                                                | ( Some param_family,
+                                                    Some obj_family ) ->
+                                                    param_family = obj_family
+                                                | _ ->
+                                                    types_compatible
+                                                      ~type_params:
+                                                        normal_function_type_params
+                                                      first_param obj_ty)
+                                          | _ -> false
+                                        in
+                                        if first_param_matches then
+                                          Some
+                                            (Ok
+                                               ( callee_ty,
+                                                 callee',
+                                                 ident,
+                                                 receiver_arg :: args,
+                                                 None,
+                                                 None,
+                                                 None ))
+                                        else None
+                                        (* Type mismatch — try UFCS methods *)
+                                    | Error _ -> None
                                 in
                                 match normal_result with
                                 | Some r -> r
@@ -11065,10 +11239,12 @@ and infer_list ctx expr elements loc =
     match expected_elem_ty with
     | Some elem_ty ->
         let* () =
-          reject_one_shot_stream_storage ctx.env loc "List literals" elem_ty
+          reject_one_shot_stream_storage ~memo:ctx.type_shape_memo ctx.env loc
+            "List literals" elem_ty
         in
         let* () =
-          reject_resource_source_storage ctx.env loc "List literals" elem_ty
+          reject_resource_source_storage ~memo:ctx.type_shape_memo ctx.env loc
+            "List literals" elem_ty
         in
         let list_ty = ty_list elem_ty in
         Ok (list_ty, with_inferred_type expr list_ty)
@@ -11137,7 +11313,10 @@ and infer_record ctx expr fields loc =
             "Cannot infer record type without annotation. Add an explicit \
              record type, e.g. p: Point = {x = 1, y = 2}"
       | [ single_type ] -> (
-          match resolve_record_field_types ctx.env single_type [] with
+          match
+            resolve_record_field_types ~memo:ctx.type_shape_memo ctx.env
+              single_type []
+          with
           | Some field_types ->
               infer_known_record (TyNamed (single_type, [])) field_types
           | None ->
@@ -11215,12 +11394,12 @@ and infer_record_fields ctx field_types fields =
         reject_resource_record_field ctx value.expr_loc name actual_ty
       in
       let* () =
-        reject_one_shot_stream_storage ctx.env value.expr_loc "record fields"
-          actual_ty
+        reject_one_shot_stream_storage ~memo:ctx.type_shape_memo ctx.env
+          value.expr_loc "record fields" actual_ty
       in
       let* () =
-        reject_resource_source_storage ctx.env value.expr_loc "record fields"
-          actual_ty
+        reject_resource_source_storage ~memo:ctx.type_shape_memo ctx.env
+          value.expr_loc "record fields" actual_ty
       in
       let* () =
         reject_scoped_resource_derived_storage
@@ -11256,12 +11435,12 @@ and infer_record_update ctx expr base fields loc =
   (* Infer base expression type without expected type context *)
   let* base_ty, base' = infer_unconstrained_value_expr ctx base in
   let* () =
-    reject_one_shot_stream_storage ctx.env base.expr_loc "record updates"
-      base_ty
+    reject_one_shot_stream_storage ~memo:ctx.type_shape_memo ctx.env
+      base.expr_loc "record updates" base_ty
   in
   let* () =
-    reject_resource_source_storage ctx.env base.expr_loc "record updates"
-      base_ty
+    reject_resource_source_storage ~memo:ctx.type_shape_memo ctx.env
+      base.expr_loc "record updates" base_ty
   in
   let* () =
     reject_scoped_resource_derived_storage ~module_aliases:ctx.module_aliases
@@ -11269,7 +11448,10 @@ and infer_record_update ctx expr base fields loc =
   in
   match base_ty with
   | TyNamed (type_name, type_args) -> (
-      match resolve_record_field_types ctx.env type_name type_args with
+      match
+        resolve_record_field_types ~memo:ctx.type_shape_memo ctx.env type_name
+          type_args
+      with
       | Some field_types ->
           (* Verify all update field names exist in the record *)
           let valid_fields = String.concat ", " (List.map fst field_types) in
@@ -11298,12 +11480,12 @@ and infer_record_update ctx expr base fields loc =
                   reject_resource_record_field ctx value.expr_loc name actual_ty
                 in
                 let* () =
-                  reject_one_shot_stream_storage ctx.env value.expr_loc
-                    "record fields" actual_ty
+                  reject_one_shot_stream_storage ~memo:ctx.type_shape_memo
+                    ctx.env value.expr_loc "record fields" actual_ty
                 in
                 let* () =
-                  reject_resource_source_storage ctx.env value.expr_loc
-                    "record fields" actual_ty
+                  reject_resource_source_storage ~memo:ctx.type_shape_memo
+                    ctx.env value.expr_loc "record fields" actual_ty
                 in
                 let* () =
                   reject_scoped_resource_derived_storage
@@ -11415,34 +11597,40 @@ and infer_field_access ctx expr obj field loc =
                    (List.length elems) field))
       (* Record field access *)
       | TyNamed (type_name, type_args) -> (
-          match resolve_record_field_types ctx.env type_name type_args with
-          | Some field_types -> (
-              match List.assoc_opt field field_types with
-              | Some field_type ->
-                  Ok
-                    ( field_type,
-                      with_inferred_desc expr
-                        (EFieldAccess (obj', field))
-                        field_type )
-              | None ->
+          match
+            resolve_record_field_type ~memo:ctx.type_shape_memo ctx.env
+              type_name type_args field
+          with
+          | Some field_type ->
+              Ok
+                ( field_type,
+                  with_inferred_desc expr
+                    (EFieldAccess (obj', field))
+                    field_type )
+          | None -> (
+              match
+                resolve_record_field_types ~memo:ctx.type_shape_memo ctx.env
+                  type_name type_args
+              with
+              | Some field_types ->
                   let valid = String.concat ", " (List.map fst field_types) in
                   error loc
                     (Printf.sprintf
                        "Record %s has no field '%s'. Valid fields: %s" type_name
-                       field valid))
-          | None -> (
-              match
-                ambiguous_record_type_error loc type_name
-                  (Printf.sprintf "Field access '.%s'" field)
-              with
-              | Some err -> err
-              | None ->
-                  error loc
-                    (Printf.sprintf
-                       "Cannot access field on type %s. Field access is \
-                        supported on record fields. Use tuple[index] for tuple \
-                        elements"
-                       (type_to_string obj_ty))))
+                       field valid)
+              | None -> (
+                  match
+                    ambiguous_record_type_error loc type_name
+                      (Printf.sprintf "Field access '.%s'" field)
+                  with
+                  | Some err -> err
+                  | None ->
+                      error loc
+                        (Printf.sprintf
+                           "Cannot access field on type %s. Field access is \
+                            supported on record fields. Use tuple[index] for \
+                            tuple elements"
+                           (type_to_string obj_ty)))))
       | _ ->
           error loc
             (Printf.sprintf

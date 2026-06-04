@@ -127,8 +127,91 @@ type symbol_kind =
 type symbol = { name : string; kind : symbol_kind }
 (** Symbol table entry *)
 
-type scope = symbol list
-(** A scope contains symbols *)
+module StringMap = Map.Make (String)
+
+type type_binding =
+  | TypeBinding of {
+      tb_type_params : string list;
+      tb_variants : variant list;
+      tb_type_kind : type_kind;
+      tb_contains_resource : bool;
+    }
+  | RecordBinding of {
+      rb_type_params : string list;
+      rb_fields : field_decl list;
+      rb_is_value : bool;
+      rb_contains_resource : bool;
+    }
+  | AliasBinding of { ab_type_params : string list; ab_target : type_expr }
+  | OpaqueAliasBinding of {
+      oab_type_params : string list;
+      oab_target : type_expr;
+      oab_home_module : string option;
+    }
+
+type scope = { symbols : symbol list; by_name : symbol StringMap.t }
+(** A scope preserves binding order for scans and diagnostics while indexing
+    names for hot lookup paths. [symbols] is newest binding first. *)
+
+type type_index = type_binding option StringMap.t
+
+let empty_scope = { symbols = []; by_name = StringMap.empty }
+
+let type_binding_of_symbol sym =
+  match sym.kind with
+  | TypeSymbol { type_params; variants; type_kind; contains_resource } ->
+      Some
+        (TypeBinding
+           {
+             tb_type_params = type_params;
+             tb_variants = variants;
+             tb_type_kind = type_kind;
+             tb_contains_resource = contains_resource;
+           })
+  | RecordSymbol { type_params; fields; is_value; contains_resource } ->
+      Some
+        (RecordBinding
+           {
+             rb_type_params = type_params;
+             rb_fields = fields;
+             rb_is_value = is_value;
+             rb_contains_resource = contains_resource;
+           })
+  | AliasSymbol { type_params; target } ->
+      Some (AliasBinding { ab_type_params = type_params; ab_target = target })
+  | OpaqueAliasSymbol { type_params; target; home_module } ->
+      Some
+        (OpaqueAliasBinding
+           {
+             oab_type_params = type_params;
+             oab_target = target;
+             oab_home_module = home_module;
+           })
+  | VarSymbol _ | FuncSymbol _ | ConstructorSymbol _ -> None
+
+let scope_of_symbols symbols =
+  let by_name =
+    List.fold_right
+      (fun sym by_name -> StringMap.add sym.name sym by_name)
+      symbols StringMap.empty
+  in
+  { symbols; by_name }
+
+let add_symbol_to_scope scope sym =
+  {
+    symbols = sym :: scope.symbols;
+    by_name = StringMap.add sym.name sym scope.by_name;
+  }
+
+let scope_symbols scope = scope.symbols
+
+let update_type_index type_index sym =
+  match type_binding_of_symbol sym with
+  | Some binding -> StringMap.add sym.name (Some binding) type_index
+  | None ->
+      if StringMap.mem sym.name type_index then
+        StringMap.add sym.name None type_index
+      else type_index
 
 type trait_obligation = {
   obligation_type : type_expr;
@@ -185,6 +268,7 @@ type impl_instance = Env_types.impl_instance = {
 
 type env = {
   scopes : scope list;
+  type_index : type_index;
   current_function : string option; (* For checking purity *)
   current_function_pure : bool;
   type_params_in_scope : string list;
@@ -223,7 +307,8 @@ type env = {
 let empty () : env =
   let sess = Session.current () in
   {
-    scopes = [ [] ];
+    scopes = [ empty_scope ];
+    type_index = StringMap.empty;
     current_function = None;
     current_function_pure = false;
     type_params_in_scope = [];
@@ -237,19 +322,23 @@ let empty () : env =
   }
 
 (** Push a new scope *)
-let push_scope (env : env) : env = { env with scopes = [] :: env.scopes }
+let push_scope (env : env) : env =
+  { env with scopes = empty_scope :: env.scopes }
 
 (** Add a symbol to the current scope *)
 let add_symbol (env : env) (sym : symbol) : env =
+  let type_index = update_type_index env.type_index sym in
   match env.scopes with
-  | [] -> { env with scopes = [ [ sym ] ] }
-  | current :: rest -> { env with scopes = (sym :: current) :: rest }
+  | [] ->
+      { env with scopes = [ add_symbol_to_scope empty_scope sym ]; type_index }
+  | current :: rest ->
+      { env with scopes = add_symbol_to_scope current sym :: rest; type_index }
 
 (** Look up a symbol by name in the current (topmost) scope only *)
 let lookup_in_current_scope (env : env) (name : string) : symbol option =
   match env.scopes with
   | [] -> None
-  | current :: _ -> List.find_opt (fun s -> s.name = name) current
+  | current :: _ -> StringMap.find_opt name current.by_name
 
 (** Look up a symbol by name in all scopes *)
 let lookup (env : env) (name : string) : symbol option =
@@ -257,11 +346,16 @@ let lookup (env : env) (name : string) : symbol option =
     match scopes with
     | [] -> None
     | scope :: rest -> (
-        match List.find_opt (fun s -> s.name = name) scope with
+        match StringMap.find_opt name scope.by_name with
         | Some s -> Some s
         | None -> search rest)
   in
   search env.scopes
+
+let find_type_binding (env : env) (name : string) : type_binding option =
+  match StringMap.find_opt name env.type_index with
+  | Some binding -> binding
+  | None -> None
 
 (** Human-readable label for a symbol kind, used in error messages *)
 let symbol_kind_label (sym : symbol) : string =
@@ -432,8 +526,8 @@ let add_record (env : env) (name : string) (type_params : string list)
 
 (** Check if a record type is a value type (struct) *)
 let is_value_record (env : env) (name : string) : bool =
-  match lookup env name with
-  | Some { kind = RecordSymbol { is_value = true; _ }; _ } -> true
+  match find_type_binding env name with
+  | Some (RecordBinding { rb_is_value = true; _ }) -> true
   | _ -> false
 
 (** Add a type alias to the environment *)
@@ -485,8 +579,9 @@ let set_var_refinement (env : env) (name : string)
   let rec update_scopes acc = function
     | [] -> None
     | scope :: rest -> (
-        match update_scope [] scope with
-        | Some updated_scope ->
+        match update_scope [] (scope_symbols scope) with
+        | Some updated_symbols ->
+            let updated_scope = scope_of_symbols updated_symbols in
             Some
               { env with scopes = List.rev_append acc (updated_scope :: rest) }
         | None -> update_scopes (scope :: acc) rest)
@@ -544,22 +639,21 @@ let get_func_param_names (env : env) (name : string) : string option list option
 (** Get a type declaration *)
 let get_type_decl (env : env) (name : string) :
     (string list * variant list) option =
-  match lookup env name with
-  | Some { kind = TypeSymbol { type_params; variants; _ }; _ } ->
-      Some (type_params, variants)
+  match find_type_binding env name with
+  | Some (TypeBinding { tb_type_params; tb_variants; _ }) ->
+      Some (tb_type_params, tb_variants)
   | _ -> None
 
 (** Get a type declaration's kind *)
 let get_type_kind (env : env) (name : string) : type_kind option =
-  match lookup env name with
-  | Some { kind = TypeSymbol { type_kind; _ }; _ } -> Some type_kind
+  match find_type_binding env name with
+  | Some (TypeBinding { tb_type_kind; _ }) -> Some tb_type_kind
   | _ -> None
 
 let get_type_contains_resource (env : env) (name : string) : bool =
-  match lookup env name with
-  | Some { kind = TypeSymbol { contains_resource; _ }; _ }
-  | Some { kind = RecordSymbol { contains_resource; _ }; _ } ->
-      contains_resource
+  match find_type_binding env name with
+  | Some (TypeBinding { tb_contains_resource; _ }) -> tb_contains_resource
+  | Some (RecordBinding { rb_contains_resource; _ }) -> rb_contains_resource
   | _ -> false
 
 (** Get a constructor info *)
@@ -584,9 +678,9 @@ let get_constructor_callable_id (env : env) (name : string) : int option =
 (** Get a record declaration *)
 let get_record (env : env) (name : string) :
     (string list * field_decl list) option =
-  match lookup env name with
-  | Some { kind = RecordSymbol { type_params; fields; _ }; _ } ->
-      Some (type_params, fields)
+  match find_type_binding env name with
+  | Some (RecordBinding { rb_type_params; rb_fields; _ }) ->
+      Some (rb_type_params, rb_fields)
   | _ -> None
 
 (** Find all record/struct type names whose field names exactly match the given set.
@@ -608,22 +702,23 @@ let find_records_with_fields (env : env) (field_names : string list) :
               if sym_fields = sorted_names && not (List.mem sym.name !matches)
               then matches := sym.name :: !matches
           | _ -> ())
-        scope)
+        (scope_symbols scope))
     env.scopes;
   List.rev !matches
 
 (** Get a type alias *)
 let get_alias (env : env) (name : string) : (string list * type_expr) option =
-  match lookup env name with
-  | Some { kind = AliasSymbol { type_params; target }; _ } ->
-      Some (type_params, target)
+  match find_type_binding env name with
+  | Some (AliasBinding { ab_type_params; ab_target }) ->
+      Some (ab_type_params, ab_target)
   | _ -> None
 
 let get_opaque_alias (env : env) (name : string) :
     (string list * type_expr * string option) option =
-  match lookup env name with
-  | Some { kind = OpaqueAliasSymbol { type_params; target; home_module }; _ } ->
-      Some (type_params, target, home_module)
+  match find_type_binding env name with
+  | Some (OpaqueAliasBinding { oab_type_params; oab_target; oab_home_module })
+    ->
+      Some (oab_type_params, oab_target, oab_home_module)
   | _ -> None
 
 let rec disambiguate_nominal_dim_application (env : env) (ty : type_expr) :
@@ -1789,7 +1884,7 @@ let all_value_identifiers (env : env) : string list =
           | VarSymbol _ | FuncSymbol _ | ConstructorSymbol _ ->
               if not (Hashtbl.mem names sym.name) then
                 Hashtbl.add names sym.name true)
-        scope)
+        (scope_symbols scope))
     env.scopes;
   Hashtbl.fold (fun name _ acc -> name :: acc) names []
 
