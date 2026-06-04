@@ -348,22 +348,29 @@ let test_collect_test_files_preserves_multi_root_order () =
       let pkg_dir = Filename.concat dir "test_pkg" in
       Unix.mkdir std_dir 0o700;
       Unix.mkdir pkg_dir 0o700;
-      let std_file = Filename.concat std_dir "test_string.brp" in
+      let std_a_file = Filename.concat std_dir "test_a.brp" in
+      let std_z_file = Filename.concat std_dir "test_z.brp" in
       let pkg_file = Filename.concat pkg_dir "test_crypto.brp" in
       let ignored_file = Filename.concat std_dir "helper.brp" in
-      write_file std_file
-        {|
+      let write_suite file description test_name =
+        write_file file
+          (Printf.sprintf
+             {|
 import:
     test: TestSuite
 
-func test_std() -> Bool:
+func %s() -> Bool:
     True
 
 tests: TestSuite = {
-    description = "std",
-    tests = [("std", test_std)]
+    description = "%s",
+    tests = [("%s", %s)]
 }
-|};
+|}
+             test_name description description test_name)
+      in
+      write_suite std_z_file "std z" "test_std_z";
+      write_suite std_a_file "std a" "test_std_a";
       write_file pkg_file {|
 func main(args: List[String]) -> Int:
     0
@@ -373,7 +380,8 @@ pure func helper() -> Int:
     1
 |};
       Alcotest.(check (list string))
-        "valid test files from each root" [ std_file; pkg_file ]
+        "valid test files from each root"
+        [ std_a_file; std_z_file; pkg_file ]
         (Blorp.Test_runner.collect_test_files [ std_dir; pkg_dir ]))
 
 let with_env name value f =
@@ -633,12 +641,19 @@ let test_suite_run_all_harness_calls_generated_functions () =
     "imports test module 1" true
     (contains_substring source "    ./tests/test_blorp/b as T1");
   Alcotest.(check bool)
-    "wraps each suite with markers" true
-    (contains_substring source "__BLORP_SUITE_RUN_ALL_BEGIN__ 0"
-    && contains_substring source "__BLORP_SUITE_RUN_ALL_END__ 1 FAIL");
+    "imports suite type for local copy" true
+    (contains_substring source "std/test: TestSuite, run_suite");
   Alcotest.(check bool)
-    "calls run_suite directly" true
-    (contains_substring source "passed: Bool = run_suite(T0.tests)");
+    "wraps each suite with markers" true
+    (contains_substring source
+       "__BLORP_SUITE_RUN_ALL_BEGIN__ 0 tests/test_blorp/a.brp"
+    && contains_substring source
+         "__BLORP_SUITE_RUN_ALL_END__ 1 FAIL tests/test_blorp/b.brp");
+  Alcotest.(check bool)
+    "copies suite before run_suite" true
+    (contains_substring source "suite: TestSuite = T0.tests"
+    && contains_substring source "passed: Bool = run_suite(suite)"
+    && not (contains_substring source "run_suite(T0.tests)"));
   Alcotest.(check bool)
     "calls generated suite functions" true
     (contains_substring source "    if not __run_suite_0():"
@@ -646,6 +661,27 @@ let test_suite_run_all_harness_calls_generated_functions () =
   Alcotest.(check bool)
     "does not parse selector arguments" false
     (contains_substring source "match parse_int(selector):")
+
+let test_suite_run_all_batch_timeout_scales_by_suite_count () =
+  let suite_count = 64 in
+  let per_suite_timeout_seconds = 30 in
+  let expected_batch_timeout_seconds =
+    suite_count * per_suite_timeout_seconds
+  in
+  Alcotest.(check (option int))
+    "disabled timeout remains disabled" None
+    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count None);
+  Alcotest.(check (option int))
+    "zero timeout remains disabled" (Some 0)
+    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count (Some 0));
+  Alcotest.(check (option int))
+    "single suite timeout is unchanged" (Some per_suite_timeout_seconds)
+    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count:1
+       (Some per_suite_timeout_seconds));
+  Alcotest.(check (option int))
+    "batch timeout scales by suite count" (Some expected_batch_timeout_seconds)
+    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count
+       (Some per_suite_timeout_seconds))
 
 let test_memory_suite_paths_require_filesystem_isolation () =
   let cwd = Sys.getcwd () in
@@ -681,7 +717,7 @@ let test_runtime_sensitive_suite_paths_require_process_isolation () =
     (Blorp.Test_runner.requires_process_isolation
        "tests/test_blorp/types/test_bool.brp")
 
-let test_suite_run_all_harness_runs_combined_without_result_cache () =
+let test_suite_harness_runs_combined_without_result_cache () =
   with_temp_dir "blorp-suite-selector-" (fun dir ->
       let home = Filename.concat dir "home" in
       Unix.mkdir home 0o700;
@@ -891,12 +927,14 @@ let suite =
           test_suite_selector_harness_dispatches_by_index;
         Alcotest.test_case "run_all_generated_functions" `Quick
           test_suite_run_all_harness_calls_generated_functions;
+        Alcotest.test_case "run_all_batch_timeout" `Quick
+          test_suite_run_all_batch_timeout_scales_by_suite_count;
         Alcotest.test_case "memory_filesystem_isolation_policy" `Quick
           test_memory_suite_paths_require_filesystem_isolation;
         Alcotest.test_case "runtime_sensitive_process_isolation_policy" `Quick
           test_runtime_sensitive_suite_paths_require_process_isolation;
-        Alcotest.test_case "run_all_skips_result_cache" `Quick
-          test_suite_run_all_harness_runs_combined_without_result_cache;
+        Alcotest.test_case "combined_harness_skips_result_cache" `Quick
+          test_suite_harness_runs_combined_without_result_cache;
         Alcotest.test_case "compile_failure_is_hard_failure" `Quick
           test_suite_selector_compile_failure_is_hard_failure;
         Alcotest.test_case "uses_leak_check_runner" `Quick

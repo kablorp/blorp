@@ -250,6 +250,10 @@ let kill_process_group_or_process pid signal =
   try Unix.kill (-pid) signal
   with _ -> ( try Unix.kill pid signal with _ -> ())
 
+let process_timeout_sigterm_grace_seconds = 1.0
+let process_timeout_sigkill_settle_seconds = 0.25
+let process_timeout_poll_interval_seconds = 0.05
+
 let reap_child_if_needed pid status =
   match !status with
   | Some _ -> ()
@@ -326,14 +330,15 @@ let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
             let now = get_time () in
             if (not !timed_out) && now >= deadline then begin
               timed_out := true;
-              kill_grace := Some (now +. 0.25);
+              kill_grace := Some (now +. process_timeout_sigterm_grace_seconds);
               kill_process_group_or_process pid Sys.sigterm
             end;
             (match !kill_grace with
             | Some grace_deadline
               when !timed_out && (not !sent_kill) && now >= grace_deadline ->
                 sent_kill := true;
-                kill_grace := Some (now +. 0.25);
+                kill_grace :=
+                  Some (now +. process_timeout_sigkill_settle_seconds);
                 kill_process_group_or_process pid Sys.sigkill
             | _ -> ());
             let now = get_time () in
@@ -349,7 +354,7 @@ let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
                 | None -> max 0.0 (deadline -. get_time ())
               in
               let read_fds = if !pipe_open then [ read_fd ] else [] in
-              let wait = min wait 0.05 in
+              let wait = min wait process_timeout_poll_interval_seconds in
               (try ignore (Unix.select read_fds [] [] wait) with _ -> ());
               loop ()
             end
@@ -434,7 +439,8 @@ let run_process_timeout ~timeout prog args =
                 let now = get_time () in
                 if (not !timed_out) && now >= deadline then begin
                   timed_out := true;
-                  kill_grace := Some (now +. 0.25);
+                  kill_grace :=
+                    Some (now +. process_timeout_sigterm_grace_seconds);
                   kill_process_group_or_process pid Sys.sigterm
                 end;
                 (match !kill_grace with
@@ -442,7 +448,8 @@ let run_process_timeout ~timeout prog args =
                   when !timed_out && (not !sent_kill) && now >= grace_deadline
                   ->
                     sent_kill := true;
-                    kill_grace := Some (now +. 0.25);
+                    kill_grace :=
+                      Some (now +. process_timeout_sigkill_settle_seconds);
                     kill_process_group_or_process pid Sys.sigkill
                 | _ -> ());
                 let now = get_time () in
@@ -458,7 +465,10 @@ let run_process_timeout ~timeout prog args =
                         max 0.0 (grace_deadline -. get_time ())
                     | None -> max 0.0 (deadline -. get_time ())
                   in
-                  (try ignore (Unix.select [] [] [] (min wait 0.05))
+                  (try
+                     ignore
+                       (Unix.select [] [] []
+                          (min wait process_timeout_poll_interval_seconds))
                    with _ -> ());
                   loop ()
                 end
@@ -1737,15 +1747,19 @@ let skip_directories =
   [ "stages"; "test_compiler"; "should_fail"; "should_pass"; "traits" ]
 
 (** Find all .brp test files in a directory *)
+let sorted_directory_entries path =
+  Sys.readdir path |> Array.to_list |> List.sort String.compare
+
 let find_brp_files dir =
   let rec walk acc path =
     if Sys.is_directory path then
       let dirname = Filename.basename path in
       if List.mem dirname skip_directories then acc
       else
-        Array.fold_left
+        List.fold_left
           (fun acc name -> walk acc (Filename.concat path name))
-          acc (Sys.readdir path)
+          acc
+          (sorted_directory_entries path)
     else if Filename.check_suffix path ".brp" && is_valid_test_file path then
       path :: acc
     else acc
@@ -1854,10 +1868,13 @@ let module_path_for_import filename =
 
 let blorp_string_literal value = Printf.sprintf "%S" value
 
-let emit_suite_harness_imports ?(selector_support = false) emit run_fn
-    test_files =
+let emit_suite_harness_imports ?(selector_support = false)
+    ?(suite_type_support = false) emit run_fn test_files =
   emit "import:";
-  emit (Printf.sprintf "    std/test: %s" run_fn);
+  let test_import =
+    if suite_type_support then Printf.sprintf "TestSuite, %s" run_fn else run_fn
+  in
+  emit (Printf.sprintf "    std/test: %s" test_import);
   if selector_support then begin
     emit "    std/string: parse_int";
     emit "    std/list: get";
@@ -1916,25 +1933,26 @@ let generate_suite_run_all_harness test_files =
     Buffer.add_string buf line;
     Buffer.add_char buf '\n'
   in
-  emit_suite_harness_imports emit run_fn test_files;
+  emit_suite_harness_imports ~suite_type_support:true emit run_fn test_files;
   List.iteri
-    (fun i _file ->
+    (fun i file ->
       emit (Printf.sprintf "func __run_suite_%d() -> Bool:" i);
       emit
         (Printf.sprintf "    print(%s)"
            (blorp_string_literal
-              (Printf.sprintf "%s %d" suite_run_all_begin_marker i)));
-      emit (Printf.sprintf "    passed: Bool = %s(T%d.tests)" run_fn i);
+              (Printf.sprintf "%s %d %s" suite_run_all_begin_marker i file)));
+      emit (Printf.sprintf "    suite: TestSuite = T%d.tests" i);
+      emit (Printf.sprintf "    passed: Bool = %s(suite)" run_fn);
       emit "    if passed:";
       emit
         (Printf.sprintf "        print(%s)"
            (blorp_string_literal
-              (Printf.sprintf "%s %d PASS" suite_run_all_end_marker i)));
+              (Printf.sprintf "%s %d PASS %s" suite_run_all_end_marker i file)));
       emit "    else:";
       emit
         (Printf.sprintf "        print(%s)"
            (blorp_string_literal
-              (Printf.sprintf "%s %d FAIL" suite_run_all_end_marker i)));
+              (Printf.sprintf "%s %d FAIL %s" suite_run_all_end_marker i file)));
       emit "    passed";
       emit "";
       emit "")
@@ -2430,14 +2448,14 @@ let split_marker_fields line =
 
 let parse_suite_run_all_begin line =
   match split_marker_fields line with
-  | [ marker; raw_index ] when marker = suite_run_all_begin_marker ->
+  | marker :: raw_index :: _ when marker = suite_run_all_begin_marker ->
       int_of_string_opt raw_index
   | _ -> None
 
 let parse_suite_run_all_end line =
   match split_marker_fields line with
-  | [ marker; raw_index; raw_status ] when marker = suite_run_all_end_marker
-    -> (
+  | marker :: raw_index :: raw_status :: _
+    when marker = suite_run_all_end_marker -> (
       match (int_of_string_opt raw_index, raw_status) with
       | Some index, "PASS" -> Some (index, true)
       | Some index, "FAIL" -> Some (index, false)
@@ -2495,8 +2513,16 @@ let suite_run_all_results_from_output ~elapsed files output =
       (List.init expected_count (fun index ->
            Hashtbl.find results_by_index index))
 
+let timeout_for_suite_run_all_batch ~suite_count timeout =
+  match timeout with
+  | None | Some 0 -> timeout
+  | Some seconds -> Some (seconds * max 1 suite_count)
+
 let run_suite_run_all_case ~timeout ~bin_file ~files =
   let start_time = get_time () in
+  let batch_timeout =
+    timeout_for_suite_run_all_batch ~suite_count:(List.length files) timeout
+  in
   let make_harness_result ?(output = "") ?(error_detail = "") passed =
     [
       {
@@ -2508,7 +2534,9 @@ let run_suite_run_all_case ~timeout ~bin_file ~files =
       };
     ]
   in
-  let result, output = run_process_capture_timeout ~timeout bin_file [] in
+  let result, output =
+    run_process_capture_timeout ~timeout:batch_timeout bin_file []
+  in
   let elapsed = get_time () -. start_time in
   match result with
   | 0 | 1 -> (
@@ -2520,7 +2548,7 @@ let run_suite_run_all_case ~timeout ~bin_file ~files =
   | 99 ->
       make_harness_result ~output ~error_detail:"(leak detected at exit)" false
   | 124 ->
-      let secs = match timeout with Some s -> s | None -> 0 in
+      let secs = match batch_timeout with Some s -> s | None -> 0 in
       make_harness_result ~output
         ~error_detail:(Printf.sprintf "(timed out after %ds)" secs)
         false
