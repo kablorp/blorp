@@ -568,6 +568,12 @@ typedef struct {
 } blorp_DirectoryEntryResult;
 
 typedef struct {
+    blorp_List* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_DirectoryEntryListResult;
+
+typedef struct {
     blorp_Object header;
     int tag;
     unsigned long release_mask;
@@ -2186,6 +2192,7 @@ blorp_FileOpenReadWriterResult blorp_file_open_read_write_raw(const blorp_String
 blorp_FileOpenReadAppenderResult blorp_file_open_read_append_raw(const blorp_String* path);
 blorp_DirectoryOpenResult blorp_dir_open_raw(const blorp_String* path);
 blorp_DirectoryEntryResult blorp_dir_read_entry_raw(blorp_Directory* dir);
+blorp_DirectoryEntryListResult blorp_dir_read_next_entries_raw(blorp_Directory* dir, long max_entries);
 blorp_FileStringResult blorp_file_read_text_reader_raw(const blorp_FileReader* reader);
 blorp_FileBytesResult blorp_file_read_bytes_reader_raw(const blorp_FileReader* reader);
 blorp_FileBytesResult blorp_file_read_chunk_reader_raw(const blorp_FileReader* reader, long max_bytes);

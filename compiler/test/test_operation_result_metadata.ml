@@ -370,6 +370,11 @@ let expected_file_operations =
       [ "Option" ],
       1,
       Blorp.Env_types.ResourceResultOrdinary );
+    ( "blorp_dir_read_next_entries_raw",
+      "blorp_DirectoryEntryListResult",
+      [ "List" ],
+      1,
+      Blorp.Env_types.ResourceResultOrdinary );
     ( "blorp_file_read_text_reader_raw",
       "blorp_FileStringResult",
       [ "String" ],
@@ -593,6 +598,7 @@ let expected_operation_arguments =
     ("blorp_file_open_read_append_raw", [ ArgBorrow ]);
     ("blorp_dir_open_raw", [ ArgBorrow ]);
     ("blorp_dir_read_entry_raw", [ ArgBorrow ]);
+    ("blorp_dir_read_next_entries_raw", [ ArgBorrow; ArgBorrow ]);
     ("blorp_file_read_text_reader_raw", [ ArgBorrow ]);
     ("blorp_file_read_bytes_reader_raw", [ ArgBorrow ]);
     ("blorp_file_read_chunk_reader_raw", [ ArgBorrow; ArgBorrow ]);

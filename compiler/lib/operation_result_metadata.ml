@@ -440,6 +440,14 @@ let directory_entry_option_payload =
     resource_result_policy = Env_types.ResourceResultOrdinary;
   }
 
+let directory_entry_list_payload =
+  {
+    accepted_type = list_type directory_entry_type;
+    runtime_payload = RuntimeField "value";
+    release_mask = 1;
+    resource_result_policy = Env_types.ResourceResultOrdinary;
+  }
+
 let tls_session_payload =
   resource_payload ~resource_result_policy:Env_types.ResourceResultDependent
     [ "TlsSession"; "std/net/tls::TlsSession"; "std_net_tls__TlsSession" ]
@@ -792,6 +800,9 @@ let result_bridges =
       directory_payload;
     file_operation_bridge "blorp_dir_read_entry_raw"
       "blorp_DirectoryEntryResult" directory_entry_option_payload [ ArgBorrow ];
+    file_operation_bridge "blorp_dir_read_next_entries_raw"
+      "blorp_DirectoryEntryListResult" directory_entry_list_payload
+      [ ArgBorrow; ArgBorrow ];
     file_operation_bridge "blorp_file_read_text_reader_raw"
       "blorp_FileStringResult"
       (value_payload ~release_mask:1 "String")
