@@ -250,6 +250,10 @@ let kill_process_group_or_process pid signal =
   try Unix.kill (-pid) signal
   with _ -> ( try Unix.kill pid signal with _ -> ())
 
+let process_timeout_sigterm_grace_seconds = 1.0
+let process_timeout_sigkill_settle_seconds = 0.25
+let process_timeout_poll_interval_seconds = 0.05
+
 let reap_child_if_needed pid status =
   match !status with
   | Some _ -> ()
@@ -326,14 +330,15 @@ let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
             let now = get_time () in
             if (not !timed_out) && now >= deadline then begin
               timed_out := true;
-              kill_grace := Some (now +. 0.25);
+              kill_grace := Some (now +. process_timeout_sigterm_grace_seconds);
               kill_process_group_or_process pid Sys.sigterm
             end;
             (match !kill_grace with
             | Some grace_deadline
               when !timed_out && (not !sent_kill) && now >= grace_deadline ->
                 sent_kill := true;
-                kill_grace := Some (now +. 0.25);
+                kill_grace :=
+                  Some (now +. process_timeout_sigkill_settle_seconds);
                 kill_process_group_or_process pid Sys.sigkill
             | _ -> ());
             let now = get_time () in
@@ -349,7 +354,7 @@ let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
                 | None -> max 0.0 (deadline -. get_time ())
               in
               let read_fds = if !pipe_open then [ read_fd ] else [] in
-              let wait = min wait 0.05 in
+              let wait = min wait process_timeout_poll_interval_seconds in
               (try ignore (Unix.select read_fds [] [] wait) with _ -> ());
               loop ()
             end
@@ -434,7 +439,8 @@ let run_process_timeout ~timeout prog args =
                 let now = get_time () in
                 if (not !timed_out) && now >= deadline then begin
                   timed_out := true;
-                  kill_grace := Some (now +. 0.25);
+                  kill_grace :=
+                    Some (now +. process_timeout_sigterm_grace_seconds);
                   kill_process_group_or_process pid Sys.sigterm
                 end;
                 (match !kill_grace with
@@ -442,7 +448,8 @@ let run_process_timeout ~timeout prog args =
                   when !timed_out && (not !sent_kill) && now >= grace_deadline
                   ->
                     sent_kill := true;
-                    kill_grace := Some (now +. 0.25);
+                    kill_grace :=
+                      Some (now +. process_timeout_sigkill_settle_seconds);
                     kill_process_group_or_process pid Sys.sigkill
                 | _ -> ());
                 let now = get_time () in
@@ -458,7 +465,10 @@ let run_process_timeout ~timeout prog args =
                         max 0.0 (grace_deadline -. get_time ())
                     | None -> max 0.0 (deadline -. get_time ())
                   in
-                  (try ignore (Unix.select [] [] [] (min wait 0.05))
+                  (try
+                     ignore
+                       (Unix.select [] [] []
+                          (min wait process_timeout_poll_interval_seconds))
                    with _ -> ());
                   loop ()
                 end
@@ -2495,8 +2505,16 @@ let suite_run_all_results_from_output ~elapsed files output =
       (List.init expected_count (fun index ->
            Hashtbl.find results_by_index index))
 
+let timeout_for_suite_run_all_batch ~suite_count timeout =
+  match timeout with
+  | None | Some 0 -> timeout
+  | Some seconds -> Some (seconds * max 1 suite_count)
+
 let run_suite_run_all_case ~timeout ~bin_file ~files =
   let start_time = get_time () in
+  let batch_timeout =
+    timeout_for_suite_run_all_batch ~suite_count:(List.length files) timeout
+  in
   let make_harness_result ?(output = "") ?(error_detail = "") passed =
     [
       {
@@ -2508,7 +2526,9 @@ let run_suite_run_all_case ~timeout ~bin_file ~files =
       };
     ]
   in
-  let result, output = run_process_capture_timeout ~timeout bin_file [] in
+  let result, output =
+    run_process_capture_timeout ~timeout:batch_timeout bin_file []
+  in
   let elapsed = get_time () -. start_time in
   match result with
   | 0 | 1 -> (
@@ -2520,7 +2540,7 @@ let run_suite_run_all_case ~timeout ~bin_file ~files =
   | 99 ->
       make_harness_result ~output ~error_detail:"(leak detected at exit)" false
   | 124 ->
-      let secs = match timeout with Some s -> s | None -> 0 in
+      let secs = match batch_timeout with Some s -> s | None -> 0 in
       make_harness_result ~output
         ~error_detail:(Printf.sprintf "(timed out after %ds)" secs)
         false

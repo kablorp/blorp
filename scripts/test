@@ -181,13 +181,24 @@ if [ -n "$log_dir" ]; then
     mkdir -p "$log_dir"
 fi
 
-test_timeout="${BLORP_TEST_TIMEOUT:-30}"
+default_test_timeout=30
+test_timeout="${BLORP_TEST_TIMEOUT:-$default_test_timeout}"
 runtime_roots=()
 for root in tests/test_blorp/ tests/test_std/ tests/test_pkg/; do
     if [ -d "$root" ]; then
         runtime_roots+=("$root")
     fi
 done
+
+parallel_default_timeout() {
+    local base_timeout="$1"
+    local gate_count="$2"
+    if [ -n "${BLORP_TEST_TIMEOUT:-}" ] || [ "$base_timeout" -eq 0 ]; then
+        printf '%s\n' "$base_timeout"
+    else
+        printf '%s\n' $((base_timeout * gate_count))
+    fi
+}
 
 # Background process tracking. Bash does not give us structured child cleanup,
 # so keep this small and explicit: track the real worker PIDs and recursively
@@ -714,27 +725,9 @@ run_cli() {
 any_failed=false
 parallel_gates=("${gates[@]}")
 
-# Dune-backed work must stay serial. The initial make preflight above already
-# runs before any gate work; keep compiler-unit tests out of the parallel worker
-# block as well so this script never starts dune from a background gate.
-if [ ${#gates[@]} -gt 1 ]; then
-    non_dune_gates=()
-    for gate in "${gates[@]}"; do
-        case "$gate" in
-            unit)
-                run_unit || any_failed=true
-                ;;
-            *)
-                non_dune_gates+=("$gate")
-                ;;
-        esac
-    done
-    parallel_gates=("${non_dune_gates[@]}")
-fi
-
-# When running multiple non-Dune gates, run them in parallel for speed unless
-# --serial is set. CI uses serial mode so per-test timeouts are not distorted by
-# concurrent generated-C compiles and other gate-level load.
+# When running multiple gates, run them in parallel for speed unless --serial is
+# set. CI uses serial mode so per-test timeouts are not distorted by concurrent
+# generated-C compiles and other gate-level load.
 # Each gate's output is captured for summary parsing; --verbose prints it back.
 if [ ${#parallel_gates[@]} -eq 0 ]; then
     :
@@ -751,12 +744,13 @@ elif $serial || [ ${#parallel_gates[@]} -le 1 ]; then
         esac
     done
 else
-    # Multiple non-Dune gates: run in parallel, collect results
+    # Multiple gates: run in parallel, collect results.
     # Pre-warm the precompiled runtime cache to prevent race conditions
     # between parallel gate runners that both call precompile_runtime()
     if ! ./blorp test --warmup-only 2>/dev/null; then
         echo "Warning: runtime cache warmup failed — parallel tests may have cache misses" >&2
     fi
+    parallel_leak_timeout=$(parallel_default_timeout "$test_timeout" "${#parallel_gates[@]}")
     gate_tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_gates.XXXXXX")
 
     for gate in "${parallel_gates[@]}"; do
@@ -822,7 +816,7 @@ else
                     env BLORP_GATE_RESULT=runtime ./blorp test --no-format --timeout "$test_timeout" "${runtime_roots[@]}" >> "$outfile" 2>&1
                     ;;
                 leak)
-                    env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$test_timeout" tests/test_blorp/memory/leak_check_baselines/ >> "$outfile" 2>&1
+                    env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$parallel_leak_timeout" tests/test_blorp/memory/leak_check_baselines/ >> "$outfile" 2>&1
                     ;;
                 doctest)
                     env BLORP_GATE_RESULT=doctest ./blorp test --no-format --doc --timeout "$test_timeout" std/ >> "$outfile" 2>&1
@@ -932,9 +926,9 @@ for s in "${gates[@]}"; do
     printf "  %-13s %-6s %8d %7d %7d %8s\n" "$label" "$st" "$p" "$f" "$t" "$(format_seconds "$sec")"
 done
 echo "──────────────────────────────────────────────────────────"
-printf "  %-13s %-6s %8d %7d %7d %8s\n" "Total" "$overall" "$total_passed" "$total_failed" "$total_tests" "$(format_seconds "$total_gate_seconds")"
+printf "  %-13s %-6s %8d %7d %7d %8s\n" "Total" "$overall" "$total_passed" "$total_failed" "$total_tests" "$(format_seconds "$total_wall_seconds")"
 echo "══════════════════════════════════════════════════════════"
-echo "Setup: build $(format_seconds "$build_seconds"), std preflight $(format_seconds "$std_preflight_seconds"), wall $(format_seconds "$total_wall_seconds")."
+echo "Setup: build $(format_seconds "$build_seconds"), std preflight $(format_seconds "$std_preflight_seconds"), gate-sum $(format_seconds "$total_gate_seconds")."
 
 # List failing tests if any
 if [ "$overall" = "FAIL" ]; then

@@ -647,6 +647,27 @@ let test_suite_run_all_harness_calls_generated_functions () =
     "does not parse selector arguments" false
     (contains_substring source "match parse_int(selector):")
 
+let test_suite_run_all_batch_timeout_scales_by_suite_count () =
+  let suite_count = 64 in
+  let per_suite_timeout_seconds = 30 in
+  let expected_batch_timeout_seconds =
+    suite_count * per_suite_timeout_seconds
+  in
+  Alcotest.(check (option int))
+    "disabled timeout remains disabled" None
+    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count None);
+  Alcotest.(check (option int))
+    "zero timeout remains disabled" (Some 0)
+    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count (Some 0));
+  Alcotest.(check (option int))
+    "single suite timeout is unchanged" (Some per_suite_timeout_seconds)
+    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count:1
+       (Some per_suite_timeout_seconds));
+  Alcotest.(check (option int))
+    "batch timeout scales by suite count" (Some expected_batch_timeout_seconds)
+    (Blorp.Test_runner.timeout_for_suite_run_all_batch ~suite_count
+       (Some per_suite_timeout_seconds))
+
 let test_memory_suite_paths_require_filesystem_isolation () =
   let cwd = Sys.getcwd () in
   Alcotest.(check bool)
@@ -891,6 +912,8 @@ let suite =
           test_suite_selector_harness_dispatches_by_index;
         Alcotest.test_case "run_all_generated_functions" `Quick
           test_suite_run_all_harness_calls_generated_functions;
+        Alcotest.test_case "run_all_batch_timeout" `Quick
+          test_suite_run_all_batch_timeout_scales_by_suite_count;
         Alcotest.test_case "memory_filesystem_isolation_policy" `Quick
           test_memory_suite_paths_require_filesystem_isolation;
         Alcotest.test_case "runtime_sensitive_process_isolation_policy" `Quick

@@ -29,13 +29,18 @@ scripts/test --coverage         # compiler-unit coverage
 ```
 
 `scripts/test` is quiet by default. Successful runs print a gate summary with
-per-gate wall-clock time plus build/std-preflight setup time; failures print
-focused excerpts and can save full logs with `--log-dir`.
+per-gate timing, total wall-clock time, and build/std-preflight setup timing;
+failures print focused excerpts and can save full logs with `--log-dir`.
+After setup preflight, multiple selected gates run in parallel by default. Use
+`--serial` when you need one gate at a time.
 
 Timeouts:
 
 - `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations.
+- In multi-gate parallel runs, the leak-check gate scales the built-in default
+  timeout by the selected gate count to avoid false timeouts under local CPU
+  contention. Set `BLORP_TEST_TIMEOUT` to use an exact timeout instead.
 - `BLORP_TEST_PREFLIGHT_CACHE=0` disables the content-addressed std preflight
   cache. The default cache key includes `./blorp`, local `std/*.brp` contents,
   and the `BLORP_STD` tree when an override is set.
