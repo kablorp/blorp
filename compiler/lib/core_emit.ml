@@ -5458,26 +5458,34 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
       ctx.indent <- ctx.indent + 1;
       emit_line ctx (Printf.sprintf "%s* self = (%s*)obj;" n n);
       if not has_destructor_body then emit_line ctx "(void)self;";
-      List.iter
-        (fun (v, rc_indices) ->
-          if rc_indices <> [] then begin
-            emit_indent ctx;
-            emitln ctx
-              (Printf.sprintf "if (self->tag == %s) {" (variant_tag_c_name n v));
-            ctx.indent <- ctx.indent + 1;
-            List.iter
-              (fun (i, _) ->
-                emit_line ctx
-                  (Printf.sprintf
-                     "if ((self->release_mask & %dUL) && \
-                      self->data.%s.field%d) \
-                      blorp_release(self->data.%s.field%d);"
-                     (1 lsl i) v.variant_name i v.variant_name i))
-              rc_indices;
-            ctx.indent <- ctx.indent - 1;
-            emit_line ctx "}"
-          end)
-        rc_indices_by_variant;
+      if has_destructor_body then begin
+        emit_line ctx "switch (self->tag) {";
+        ctx.indent <- ctx.indent + 1;
+        List.iter
+          (fun (v, rc_indices) ->
+            if rc_indices <> [] then begin
+              emit_line ctx (Printf.sprintf "case %s:" (variant_tag_c_name n v));
+              ctx.indent <- ctx.indent + 1;
+              List.iter
+                (fun (i, _) ->
+                  emit_line ctx
+                    (Printf.sprintf
+                       "if ((self->release_mask & %dUL) && \
+                        self->data.%s.field%d) \
+                        blorp_release(self->data.%s.field%d);"
+                       (1 lsl i) v.variant_name i v.variant_name i))
+                rc_indices;
+              emit_line ctx "break;";
+              ctx.indent <- ctx.indent - 1
+            end)
+          rc_indices_by_variant;
+        emit_line ctx "default:";
+        ctx.indent <- ctx.indent + 1;
+        emit_line ctx "break;";
+        ctx.indent <- ctx.indent - 1;
+        ctx.indent <- ctx.indent - 1;
+        emit_line ctx "}"
+      end;
       ctx.indent <- ctx.indent - 1;
       emitln ctx "}";
       emit ctx "\n");

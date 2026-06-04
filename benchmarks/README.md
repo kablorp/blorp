@@ -1,6 +1,6 @@
 # blorp Benchmarks
 
-Performance benchmarks comparing blorp against C, Go, and Python.
+Performance benchmarks comparing blorp against C, Go, OCaml, and Python.
 
 ## Quick Start
 
@@ -29,12 +29,13 @@ benchmarks/
   blorp/<name>.brp
   c/<name>.c
   go/<name>.go
+  ocaml/<name>.ml
   python/<name>.py
   args/<name>.txt        # optional shared CLI args
 ```
 
 The benchmark name is the filename without the extension. A benchmark must have
-a blorp source file; C, Go, and Python counterparts are optional.
+a blorp source file; C, Go, OCaml, and Python counterparts are optional.
 Blorp benchmark sources can import harness helpers from `./support/benchmark`.
 Reusable low-level timing and optimizer-barrier primitives live in the standard
 `instrumentation` module.
@@ -45,26 +46,29 @@ These run when the filter is omitted or set to `all`.
 
 | Benchmark | What it tests | Languages |
 |-----------|--------------|-----------|
-| `numeric_loop` | Collatz sequence (1M numbers), arithmetic loops | blorp, C, Go, Python |
-| `fib` | Recursive fib(40), function call overhead | blorp, C, Go, Python |
-| `string` | Checksum-based search, replace, substring, case conversion, split, trim, and reverse | blorp, C, Go, Python |
-| `array_sum` | Explicit integer vector sum (10k iterations, 1000 elements) | blorp, C, Go, Python |
-| `array_ops` | Integer vector add + scale + sum (10k iterations) | blorp, C, Go, Python |
-| `dict_ops` | Hash map build/lookup/remove/iterate | blorp, Go, Python |
-| `list_ops` | List append/sort/filter/fold/reverse/concat | blorp, Go, Python |
-| `set_ops` | Hash set build/contains/union/intersect/diff | blorp, Go, Python |
-| `threaded_cpu_map` | Fixed-width CPU-bound worker partitioning | blorp, C, Go, Python |
-| `channel_pipeline` | Bounded producer/worker/consumer channel pipeline | blorp, C, Go, Python |
-| `sleep_fanout` | Many sleeping tasks/threads spawned and joined together | blorp, C, Go, Python |
+| `numeric_loop` | Collatz sequence (1M numbers), arithmetic loops | blorp, C, Go, OCaml, Python |
+| `fib` | Recursive fib(40), function call overhead | blorp, C, Go, OCaml, Python |
+| `string` | Checksum-based search, replace, substring, case conversion, split, trim, and reverse | blorp, C, Go, OCaml, Python |
+| `array_sum` | Explicit integer vector sum (10k iterations, 1000 elements) | blorp, C, Go, OCaml, Python |
+| `array_ops` | Integer vector add + scale + sum (10k iterations) | blorp, C, Go, OCaml, Python |
+| `dict_ops` | Hash map build/lookup/remove/iterate | blorp, Go, OCaml, Python |
+| `list_ops` | List append/sort/filter/fold/reverse/concat | blorp, Go, OCaml, Python |
+| `set_ops` | Hash set build/contains/union/intersect/diff | blorp, Go, OCaml, Python |
+| `threaded_cpu_map` | Fixed-width CPU-bound worker partitioning | blorp, C, Go, OCaml, Python |
+| `channel_pipeline` | Bounded producer/worker/consumer channel pipeline | blorp, C, Go, OCaml, Python |
+| `sleep_fanout` | Many sleeping tasks/threads spawned and joined together | blorp, C, Go, OCaml, Python |
 | `options` | `Option` representation and layout costs | blorp |
 | `simd` | SIMD vector operations with checksum output | blorp, C |
-| `nbody` | Struct-of-arrays N-body planetary simulation | blorp, C, Go, Python |
-| `binary_trees` | Allocation-heavy binary tree construction/checking | blorp, C, Go, Python |
-| `fannkuch` | Permutation-heavy integer workload | blorp, C, Go, Python |
-| `spectral_norm` | Floating-point matrix/vector kernel with fresh intermediates | blorp, C, Go, Python |
-| `mandelbrot` | Complex-number style nested numeric loops | blorp, C, Go, Python |
-| `knucleotide` | String slicing and frequency maps | blorp, Go, Python |
-| `reverse_complement` | Shared FASTA reverse-complement transforms | blorp, Go, Python |
+| `nbody` | Struct-of-arrays N-body planetary simulation | blorp, C, Go, OCaml, Python |
+| `binary_trees` | Allocation-heavy binary tree construction/checking | blorp, C, Go, OCaml, Python |
+| `fannkuch` | Permutation-heavy integer workload | blorp, C, Go, OCaml, Python |
+| `spectral_norm` | Floating-point matrix/vector kernel with fresh intermediates | blorp, C, Go, OCaml, Python |
+| `mandelbrot` | Complex-number style nested numeric loops | blorp, C, Go, OCaml, Python |
+| `knucleotide` | String slicing and frequency maps | blorp, Go, OCaml, Python |
+| `reverse_complement` | Shared FASTA reverse-complement transforms | blorp, Go, OCaml, Python |
+| `compiler_ast` | Recursive AST construction, immutable tree rewrites, and pattern matching | blorp, Go, OCaml |
+| `compiler_symbols` | Persistent symbol tables, nested scope walks, and repeated lookups | blorp, Go, OCaml |
+| `compiler_emit` | C-like code emission and generated-text checksumming | blorp, Go, OCaml |
 
 ## Extra Benchmarks
 
@@ -107,8 +111,8 @@ BLORP_THREADS=4 ./blorp run --no-format benchmarks/blorp/vector_parallel.brp -- 
 
 `bench.sh` first compiles all compiled-language binaries for the selected
 benchmark set into a temporary directory. Timed execution remains
-benchmark-major, so the comparison table still runs `fib` across blorp/C/Go/Python
-before moving to the next benchmark.
+benchmark-major, so the comparison table still runs `fib` across
+blorp/C/Go/OCaml/Python before moving to the next benchmark.
 
 The harness does not time benchmarks from the outside. It runs a
 language-specific instrumented entry point, and that entry point prints a
@@ -135,6 +139,7 @@ or runner rather than reintroducing shell timing.
 PYTHON=python3.11               bash benchmarks/bench.sh   # Use specific Python
 PYTHON_CONCURRENCY=python3.14t  bash benchmarks/bench.sh   # Free-threaded Python for concurrency rows
 GO=go1.22                       bash benchmarks/bench.sh   # Use specific Go
+OCAMLOPT=ocamlopt               bash benchmarks/bench.sh   # Use specific OCaml native compiler
 CC=gcc                          bash benchmarks/bench.sh   # Use specific C compiler
 BENCH_THREADS=4                 bash benchmarks/bench.sh   # Worker/task width for concurrency rows
 BLORP_THREADS=4                 bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
@@ -152,8 +157,8 @@ that the GIL is disabled.
 ## Adding a New Benchmark
 
 1. Add `benchmarks/blorp/<name>.brp`.
-2. Optionally add `benchmarks/c/<name>.c`, `benchmarks/go/<name>.go`, and
-   `benchmarks/python/<name>.py`.
+2. Optionally add `benchmarks/c/<name>.c`, `benchmarks/go/<name>.go`,
+   `benchmarks/ocaml/<name>.ml`, and `benchmarks/python/<name>.py`.
 3. If every language should receive the same CLI args, add
    `benchmarks/args/<name>.txt`.
 4. Import `./support/benchmark` from Blorp benchmark sources when you need the

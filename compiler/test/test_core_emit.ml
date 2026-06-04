@@ -3673,6 +3673,12 @@ let test_emit_union_with_rc () =
   let output = emit_program_to_string prog in
   Alcotest.(check bool) "has destroy" true (contains_sub output "Expr_destroy");
   Alcotest.(check bool)
+    "destructor switches on tag" true
+    (contains_sub output "switch (self->tag)");
+  Alcotest.(check bool)
+    "destructor has Name case" true
+    (contains_sub output "case TAG_Expr_Name:");
+  Alcotest.(check bool)
     "has release for Name.field0" true
     (contains_sub output "blorp_release(self->data.Name.field0)");
   Alcotest.(check bool)

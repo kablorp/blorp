@@ -5,6 +5,7 @@
 #   benchmarks/blorp/<name>.brp
 #   benchmarks/c/<name>.c
 #   benchmarks/go/<name>.go
+#   benchmarks/ocaml/<name>.ml
 #   benchmarks/python/<name>.py
 #   benchmarks/args/<name>.txt        # optional shared CLI args
 #
@@ -21,6 +22,7 @@
 #   PYTHON=python3.11                  bash benchmarks/bench.sh   # Use specific Python
 #   PYTHON_CONCURRENCY=python3.14t     bash benchmarks/bench.sh   # Free-threaded Python for concurrency rows
 #   GO=go1.22                          bash benchmarks/bench.sh   # Use specific Go
+#   OCAMLOPT=ocamlopt                  bash benchmarks/bench.sh   # Use specific OCaml native compiler
 #   CC=gcc                             bash benchmarks/bench.sh   # Use specific C compiler
 #   BENCH_THREADS=4                    bash benchmarks/bench.sh   # Worker/task width for concurrency rows
 #   BLORP_THREADS=4                    bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
@@ -42,6 +44,7 @@ else
     PYTHON_CONCURRENCY_DEFAULTED=1
 fi
 GO="${GO:-go}"
+OCAMLOPT="${OCAMLOPT:-ocamlopt}"
 CC="${CC:-cc}"
 BENCH_THREADS="${BENCH_THREADS:-4}"
 BENCH_RUNS="${BENCH_RUNS:-1}"
@@ -54,7 +57,7 @@ BLORP_CONCURRENCY_THREADS="${BLORP_THREADS:-$BENCH_THREADS}"
 GO_CONCURRENCY_THREADS="${GOMAXPROCS:-$BENCH_THREADS}"
 
 # Ordered benchmark list (determines display order)
-ALL_BENCHMARKS="numeric_loop fib string array_sum array_ops dict_ops list_ops set_ops threaded_cpu_map channel_pipeline sleep_fanout options simd nbody binary_trees fannkuch spectral_norm mandelbrot knucleotide reverse_complement"
+ALL_BENCHMARKS="numeric_loop fib string array_sum array_ops dict_ops list_ops set_ops threaded_cpu_map channel_pipeline sleep_fanout options simd nbody binary_trees fannkuch spectral_norm mandelbrot knucleotide reverse_complement compiler_ast compiler_symbols compiler_emit"
 EXTRA_BENCHMARKS="numeric_vector paradigms particle_gravity virtual_threads"
 CONCURRENCY_BENCHMARKS="threaded_cpu_map channel_pipeline sleep_fanout"
 SPEEDUP_SUPPRESSED_BENCHMARKS=""
@@ -118,6 +121,7 @@ src_for() {
         blorp) printf "%s/blorp/%s.brp" "$SCRIPT_DIR" "$name" ;;
         c) printf "%s/c/%s.c" "$SCRIPT_DIR" "$name" ;;
         go) printf "%s/go/%s.go" "$SCRIPT_DIR" "$name" ;;
+        ocaml) printf "%s/ocaml/%s.ml" "$SCRIPT_DIR" "$name" ;;
         python) printf "%s/python/%s.py" "$SCRIPT_DIR" "$name" ;;
         *) return 1 ;;
     esac
@@ -314,12 +318,62 @@ EOF
     $GO build -o "$out" "$main_go" "$timer_go"
 }
 
+compile_ocaml() {
+    local name="$1" src="$2" out="$3"
+    local work="$TEMP_DIR/ocaml_$name"
+    local main_ml="$work/${name}.ml"
+    local timer_ml="$work/bench_timer.ml"
+    local module_name
+
+    mkdir -p "$work"
+    module_name="$("$PYTHON" - "$name" <<'PY'
+import sys
+name = sys.argv[1]
+print(name[:1].upper() + name[1:])
+PY
+)"
+    "$PYTHON" - "$src" "$main_ml" <<'PY'
+import pathlib
+import re
+import sys
+
+src = pathlib.Path(sys.argv[1])
+out = pathlib.Path(sys.argv[2])
+text = src.read_text()
+rewritten, count = re.subn(r"\blet\s*\(\s*\)\s*=", "let bench_main () =", text, count=1)
+if count != 1:
+    raise SystemExit(f"could not find OCaml entrypoint 'let () =' in {src}")
+out.write_text(rewritten)
+PY
+    cat >"$timer_ml" <<EOF
+let () =
+  let start = Unix.gettimeofday () in
+  let exit_code =
+    try
+      ${module_name}.bench_main ();
+      0
+    with exn ->
+      prerr_endline (Printexc.to_string exn);
+      1
+  in
+  flush stdout;
+  Printf.eprintf "BENCH name=%s lang=ocaml seconds=%.9f\\n" "$name"
+    (Unix.gettimeofday () -. start);
+  exit exit_code
+EOF
+    "$OCAMLOPT" -O3 -unsafe -I +unix -I +threads -I "$work" -o "$out" unix.cmxa threads.cmxa "$main_ml" "$timer_ml"
+}
+
 build_compiled_lang() {
     local lang="$1" name="$2"
     local src out log
 
     has_bench "$lang" "$name" || return 0
     if [ "$lang" = "go" ] && ! has_cmd "$GO"; then
+        mark_build_status "$lang" "$name" "skip"
+        return 0
+    fi
+    if [ "$lang" = "ocaml" ] && ! has_cmd "$OCAMLOPT"; then
         mark_build_status "$lang" "$name" "skip"
         return 0
     fi
@@ -332,6 +386,7 @@ build_compiled_lang() {
         blorp) compile_blorp "$name" "$src" "$out" >"$log" 2>&1 ;;
         c) compile_c "$name" "$src" "$out" >"$log" 2>&1 ;;
         go) compile_go "$name" "$src" "$out" >"$log" 2>&1 ;;
+        ocaml) compile_ocaml "$name" "$src" "$out" >"$log" 2>&1 ;;
         *) return 1 ;;
     esac
 
@@ -353,9 +408,13 @@ build_compiled_benchmarks() {
     local name lang total=0 failed=0
 
     for name in $names; do
-        for lang in blorp c go; do
+        for lang in blorp c go ocaml; do
             has_bench "$lang" "$name" || continue
             if [ "$lang" = "go" ] && ! has_cmd "$GO"; then
+                mark_build_status "$lang" "$name" "skip"
+                continue
+            fi
+            if [ "$lang" = "ocaml" ] && ! has_cmd "$OCAMLOPT"; then
                 mark_build_status "$lang" "$name" "skip"
                 continue
             fi
@@ -425,6 +484,7 @@ list_benchmarks() {
         local langs="blorp"
         has_bench c "$name" && langs="$langs, C"
         has_bench go "$name" && langs="$langs, Go"
+        has_bench ocaml "$name" && langs="$langs, OCaml"
         has_bench python "$name" && langs="$langs, Python"
         printf "  %-18s  (%s)\n" "$name" "$langs"
     done
@@ -487,7 +547,7 @@ PY
 
 run_one() {
     local name="$1"
-    local bt="" ct="" gt="" pt=""
+    local bt="" ct="" gt="" ot="" pt=""
     local args_text
     local args=()
 
@@ -530,6 +590,16 @@ run_one() {
         printf "  %8s" "-"
     fi
 
+    if has_bench ocaml "$name" && has_cmd "$OCAMLOPT"; then
+        if ot=$(run_built_lang ocaml "$name" "${args[@]}" 2>/dev/null); then
+            printf "  %9ss" "$ot"
+        else
+            printf "  %8s" "FAIL"
+        fi
+    else
+        printf "  %8s" "-"
+    fi
+
     local py_cmd="$PYTHON"
     is_concurrency_benchmark "$name" && py_cmd="$PYTHON_CONCURRENCY"
     if has_bench python "$name" && python_cmd_runs "$py_cmd"; then
@@ -551,6 +621,10 @@ run_one() {
         if [ -n "$gt" ]; then
             [ -n "$notes" ] && notes="$notes, "
             notes="${notes}vs Go: $(fmt_speedup "$bt" "$gt")"
+        fi
+        if [ -n "$ot" ]; then
+            [ -n "$notes" ] && notes="$notes, "
+            notes="${notes}vs OCaml: $(fmt_speedup "$bt" "$ot")"
         fi
         if [ -n "$pt" ]; then
             [ -n "$notes" ] && notes="$notes, "
@@ -588,6 +662,7 @@ echo "Timing: in-process BENCH markers from language-specific runners"
 echo "blorp: $BLORP"
 echo "C:     $($CC --version 2>&1 | head -1)"
 has_cmd "$GO" && echo "Go:    $($GO version 2>&1 | sed 's/go version //')"
+has_cmd "$OCAMLOPT" && echo "OCaml: $($OCAMLOPT -version 2>&1 | sed 's/^/ /')"
 has_cmd "$PYTHON" && echo "Python:$($PYTHON --version 2>&1 | sed 's/^/ /')"
 
 if [ "$FILTER" = "all" ]; then
@@ -609,8 +684,8 @@ echo ""
 build_compiled_benchmarks "$RUN_BENCHMARKS"
 echo ""
 
-printf "  %-18s  %10s  %10s  %10s  %10s\n" "Benchmark" "blorp" "C" "Go" "Python"
-printf "  %-18s  %10s  %10s  %10s  %10s\n" "---------" "-----" "-" "--" "------"
+printf "  %-18s  %10s  %10s  %10s  %10s  %10s\n" "Benchmark" "blorp" "C" "Go" "OCaml" "Python"
+printf "  %-18s  %10s  %10s  %10s  %10s  %10s\n" "---------" "-----" "-" "--" "-----" "------"
 
 for name in $RUN_BENCHMARKS; do
     run_one "$name"
