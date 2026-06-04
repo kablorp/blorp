@@ -490,6 +490,7 @@ type type_shape_memo = {
     (resource_shape_target * string list * type_expr, bool) Hashtbl.t;
   function_carrier :
     (resource_shape_target * string list * type_expr, bool) Hashtbl.t;
+  value_capabilities : (type_expr, Value_capability.t) Hashtbl.t;
 }
 
 let make_type_shape_memo () =
@@ -499,6 +500,7 @@ let make_type_shape_memo () =
     record_field_type = Hashtbl.create 512;
     contains_target = Hashtbl.create 256;
     function_carrier = Hashtbl.create 256;
+    value_capabilities = Hashtbl.create 256;
   }
 
 type record_literal_target =
@@ -1096,7 +1098,8 @@ let resource_arg_policy_for_callee ?(module_aliases = []) env callee =
   match callee.expr_desc with
   | EIdent name -> resource_arg_policy_for_ident_name env name
   | EFieldAccess ({ expr_desc = EIdent alias; _ }, func_name) ->
-      Option.bind (List.assoc_opt alias module_aliases) (fun module_path ->
+      Option.bind (Checker_query.module_alias_path module_aliases alias)
+        (fun module_path ->
           lookup_module_func_resource_arg_policy env module_path func_name)
   | _ -> None
 
@@ -1245,12 +1248,6 @@ let type_contains_one_shot_stream ?memo env ty =
 let type_contains_resource_source ?memo env ty =
   type_contains_resource_shape_target ?memo env ResourceSourceShape ty
 
-let type_contains_one_shot_stream_memo memo env ty =
-  type_contains_one_shot_stream ~memo env ty
-
-let type_contains_resource_source_memo memo env ty =
-  type_contains_resource_source ~memo env ty
-
 let type_is_resource_shape_target env target ty =
   match
     normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
@@ -1331,11 +1328,58 @@ let type_contains_one_shot_stream_function_carrier ?memo env ty =
 let type_contains_resource_source_function_carrier ?memo env ty =
   type_contains_resource_shape_function_carrier ?memo env ResourceSourceShape ty
 
-let type_contains_one_shot_stream_function_carrier_memo memo env ty =
-  type_contains_one_shot_stream_function_carrier ~memo env ty
+let capability_target_of_shape = function
+  | OneShotStreamShape -> Value_capability.OneShotStream
+  | ResourceSourceShape -> Value_capability.ResourceSource
 
-let type_contains_resource_source_function_carrier_memo memo env ty =
-  type_contains_resource_source_function_carrier ~memo env ty
+let type_capability_items_for_target ?memo env ty shape_target =
+  let target = capability_target_of_shape shape_target in
+  let is_direct = type_is_resource_shape_target env shape_target ty in
+  let contains =
+    type_contains_resource_shape_target ?memo env shape_target ty
+  in
+  let contains_function_carrier =
+    type_contains_resource_shape_function_carrier ?memo env shape_target ty
+  in
+  let direct =
+    if is_direct then
+      [ { Value_capability.target; placement = Value_capability.Direct } ]
+    else []
+  in
+  let ordinary_carrier =
+    if contains && not is_direct then
+      [
+        {
+          Value_capability.target;
+          placement = Value_capability.OrdinaryCarrier;
+        };
+      ]
+    else []
+  in
+  let function_carrier =
+    if contains_function_carrier then
+      [
+        {
+          Value_capability.target;
+          placement = Value_capability.FunctionCarrier;
+        };
+      ]
+    else []
+  in
+  direct @ ordinary_carrier @ function_carrier
+
+let value_capability_of_type ?memo env ty =
+  let ty =
+    normalize_type_with_env env ResourceBinding ty |> Types.head_resolve
+  in
+  let compute () =
+    Value_capability.of_items
+      (type_capability_items_for_target ?memo env ty OneShotStreamShape
+      @ type_capability_items_for_target ?memo env ty ResourceSourceShape)
+  in
+  match memo with
+  | None -> compute ()
+  | Some memo -> memo_find memo.value_capabilities ty compute
 
 let one_shot_stream_refs env refs =
   refs
@@ -1440,12 +1484,12 @@ let reject_scoped_resource_derived_storage ?(module_aliases = []) env loc
            (String.concat ", " vars))
 
 let reject_one_shot_stream_storage ?memo env loc container ty =
-  let contains =
-    match memo with
-    | Some memo -> type_contains_one_shot_stream_memo memo env ty
-    | None -> type_contains_one_shot_stream env ty
-  in
-  if contains then
+  let capability = value_capability_of_type ?memo env ty in
+  if
+    Value_capability.is_direct Value_capability.OneShotStream capability
+    || Value_capability.has_ordinary_carrier Value_capability.OneShotStream
+         capability
+  then
     error_with
       ~notes:
         [
@@ -1463,18 +1507,11 @@ let reject_one_shot_stream_storage ?memo env loc container ty =
   else Ok ()
 
 let reject_one_shot_stream_ordinary_carrier_type ?memo env loc carrier ty =
-  let contains_function_carrier =
-    match memo with
-    | Some memo ->
-        type_contains_one_shot_stream_function_carrier_memo memo env ty
-    | None -> type_contains_one_shot_stream_function_carrier env ty
-  in
-  let contains =
-    match memo with
-    | Some memo -> type_contains_one_shot_stream_memo memo env ty
-    | None -> type_contains_one_shot_stream env ty
-  in
-  if contains_function_carrier then
+  let capability = value_capability_of_type ?memo env ty in
+  if
+    Value_capability.has_function_carrier Value_capability.OneShotStream
+      capability
+  then
     error_with
       ~notes:
         [
@@ -1493,7 +1530,10 @@ let reject_one_shot_stream_ordinary_carrier_type ?memo env loc carrier ty =
          "function type cannot accept or return a one-shot stream carrier \
           (found %s)"
          (type_to_string ty))
-  else if contains && not (type_is_one_shot_stream env ty) then
+  else if
+    Value_capability.has_ordinary_carrier Value_capability.OneShotStream
+      capability
+  then
     error_with
       ~notes:
         [
@@ -1512,18 +1552,11 @@ let reject_one_shot_stream_ordinary_carrier_type ?memo env loc carrier ty =
   else Ok ()
 
 let reject_one_shot_stream_ordinary_binding ?memo env loc binding_name ty =
-  let contains_function_carrier =
-    match memo with
-    | Some memo ->
-        type_contains_one_shot_stream_function_carrier_memo memo env ty
-    | None -> type_contains_one_shot_stream_function_carrier env ty
-  in
-  let contains =
-    match memo with
-    | Some memo -> type_contains_one_shot_stream_memo memo env ty
-    | None -> type_contains_one_shot_stream env ty
-  in
-  if contains_function_carrier then
+  let capability = value_capability_of_type ?memo env ty in
+  if
+    Value_capability.has_function_carrier Value_capability.OneShotStream
+      capability
+  then
     error_with
       ~notes:
         [
@@ -1543,7 +1576,10 @@ let reject_one_shot_stream_ordinary_binding ?memo env loc binding_name ty =
          (match binding_name with
          | None | Some "_" -> ""
          | Some n -> " '" ^ n ^ "'"))
-  else if contains && not (type_is_one_shot_stream env ty) then
+  else if
+    Value_capability.has_ordinary_carrier Value_capability.OneShotStream
+      capability
+  then
     error_with
       ~notes:
         [
@@ -1564,12 +1600,12 @@ let reject_one_shot_stream_ordinary_binding ?memo env loc binding_name ty =
   else Ok ()
 
 let reject_resource_source_storage ?memo env loc container ty =
-  let contains =
-    match memo with
-    | Some memo -> type_contains_resource_source_memo memo env ty
-    | None -> type_contains_resource_source env ty
-  in
-  if contains then
+  let capability = value_capability_of_type ?memo env ty in
+  if
+    Value_capability.is_direct Value_capability.ResourceSource capability
+    || Value_capability.has_ordinary_carrier Value_capability.ResourceSource
+         capability
+  then
     error_with
       ~notes:
         [
@@ -1587,18 +1623,11 @@ let reject_resource_source_storage ?memo env loc container ty =
   else Ok ()
 
 let reject_resource_source_ordinary_carrier_type ?memo env loc carrier ty =
-  let contains_function_carrier =
-    match memo with
-    | Some memo ->
-        type_contains_resource_source_function_carrier_memo memo env ty
-    | None -> type_contains_resource_source_function_carrier env ty
-  in
-  let contains =
-    match memo with
-    | Some memo -> type_contains_resource_source_memo memo env ty
-    | None -> type_contains_resource_source env ty
-  in
-  if contains_function_carrier then
+  let capability = value_capability_of_type ?memo env ty in
+  if
+    Value_capability.has_function_carrier Value_capability.ResourceSource
+      capability
+  then
     error_with
       ~notes:
         [
@@ -1616,7 +1645,10 @@ let reject_resource_source_ordinary_carrier_type ?memo env loc carrier ty =
          "function type cannot accept or return a resource source carrier \
           (found %s)"
          (type_to_string ty))
-  else if contains && not (type_is_resource_source env ty) then
+  else if
+    Value_capability.has_ordinary_carrier Value_capability.ResourceSource
+      capability
+  then
     error_with
       ~notes:
         [
@@ -1636,18 +1668,11 @@ let reject_resource_source_ordinary_carrier_type ?memo env loc carrier ty =
   else Ok ()
 
 let reject_resource_source_ordinary_binding ?memo env loc binding_name ty =
-  let contains_function_carrier =
-    match memo with
-    | Some memo ->
-        type_contains_resource_source_function_carrier_memo memo env ty
-    | None -> type_contains_resource_source_function_carrier env ty
-  in
-  let contains =
-    match memo with
-    | Some memo -> type_contains_resource_source_memo memo env ty
-    | None -> type_contains_resource_source env ty
-  in
-  if contains_function_carrier then
+  let capability = value_capability_of_type ?memo env ty in
+  if
+    Value_capability.has_function_carrier Value_capability.ResourceSource
+      capability
+  then
     error_with
       ~notes:
         [
@@ -1666,7 +1691,10 @@ let reject_resource_source_ordinary_binding ?memo env loc binding_name ty =
          (match binding_name with
          | None | Some "_" -> ""
          | Some n -> " '" ^ n ^ "'"))
-  else if contains && not (type_is_resource_source env ty) then
+  else if
+    Value_capability.has_ordinary_carrier Value_capability.ResourceSource
+      capability
+  then
     error_with
       ~notes:
         [
@@ -1687,9 +1715,10 @@ let reject_resource_source_ordinary_binding ?memo env loc binding_name ty =
          | Some n -> " '" ^ n ^ "'"))
   else Ok ()
 
-let reject_resource_source_copy_from_existing ?memo:_ env loc binding_name ty
-    rhs =
-  if type_is_resource_source env ty then
+let reject_resource_source_copy_from_existing ?memo env loc binding_name ty rhs
+    =
+  let capability = value_capability_of_type ?memo env ty in
+  if Value_capability.is_direct Value_capability.ResourceSource capability then
     match resource_source_capture_refs env rhs with
     | [] -> Ok ()
     | refs ->
@@ -1716,9 +1745,13 @@ let reject_resource_source_copy_from_existing ?memo:_ env loc binding_name ty
              (String.concat ", " refs))
   else Ok ()
 
-let reject_resource_source_mutable_binding ?memo:_ env loc binding_name ty
+let reject_resource_source_mutable_binding ?memo env loc binding_name ty
     is_mutable =
-  if is_mutable && type_is_resource_source env ty then
+  let capability = value_capability_of_type ?memo env ty in
+  if
+    is_mutable
+    && Value_capability.is_direct Value_capability.ResourceSource capability
+  then
     error_with
       ~notes:
         [
@@ -4027,79 +4060,15 @@ let check_trait_bound_on_arg (ctx : infer_ctx) ?(is_builtin = false) callee_name
                      callee_name)))
 
 (** Extract function name from a callee expression *)
-let get_callee_name (callee : expr) : string option =
-  match callee.expr_desc with
-  | EIdent name -> Some name
-  | EFieldAccess (_, name) -> Some name
-  | _ -> None
+let get_callee_name = Call_resolution.get_callee_name
 
-let identifier_may_resolve_as_call_target env name =
-  match Env.lookup env name with
-  | Some
-      { kind = Env.FuncSymbol _ | Env.VarSymbol _ | Env.ConstructorSymbol _; _ }
-    ->
-      true
-  | Some _ -> false
-  | None ->
-      Option.is_some (Env.get_constructor env name)
-      || Option.is_some (Env.get_function_trait env name)
+let identifier_may_resolve_as_call_target =
+  Checker_query.identifier_may_resolve_as_call_target
 
-let strip_callable_id_suffix name =
-  match String.index_opt name '#' with
-  | Some idx -> String.sub name 0 idx
-  | None -> name
+let strip_callable_id_suffix = Call_resolution.strip_callable_id_suffix
 
-let parse_callable_id_suffix name =
-  match String.index_opt name '#' with
-  | Some idx when idx + 1 < String.length name ->
-      String.sub name (idx + 1) (String.length name - idx - 1)
-      |> int_of_string_opt
-  | _ -> None
-
-let callable_origin_of_env ~(module_path : string option)
-    (origin : Env.func_origin) : callable_origin =
-  match origin with
-  | Env.Builtin -> CallableBuiltin
-  | Env.Foreign -> CallableForeign
-  | Env.UserDefined -> (
-      match module_path with
-      | Some path -> CallableImported path
-      | None -> CallableLocal)
-
-let call_purity_bool = function Env.Pure -> true | Env.Impure -> false
-
-let is_ufcs_mangled_name name =
-  let clean = strip_callable_id_suffix name in
-  String.length clean >= 7 && String.sub clean 0 7 = "__ufcs_"
-
-let call_syntax_of_source_callee ctx source_callee target =
-  match target with
-  | CallClosure _ -> CallClosureSyntax
-  | CallDirect { source_name; _ } when is_ufcs_mangled_name source_name ->
-      CallMethodOnlyUfcs
-  | _ -> (
-      match source_callee.expr_desc with
-      | EFieldAccess ({ expr_desc = EIdent alias; _ }, _) -> (
-          match List.assoc_opt alias ctx.module_aliases with
-          | Some module_path -> CallQualified module_path
-          | None -> CallMethod)
-      | EFieldAccess _ -> CallMethod
-      | EIdent _ -> (
-          match target with
-          | CallTraitMethod _ -> CallTraitDispatch
-          | _ -> CallBare)
-      | _ -> CallClosureSyntax)
-
-let resolved_target_from_overload name (entry : Env.overload_entry) =
-  let source_name = strip_callable_id_suffix name in
-  CallDirect
-    {
-      callable_id = entry.ol_def_id;
-      source_name;
-      call_pure = call_purity_bool entry.ol_purity;
-      origin =
-        callable_origin_of_env ~module_path:entry.ol_module_path entry.ol_origin;
-    }
+let resolved_target_from_overload =
+  Call_resolution.resolved_target_from_overload
 
 let resolved_target_from_module_func module_path func_name
     (info : module_func_resolution) =
@@ -4111,15 +4080,15 @@ let resolved_target_from_module_func module_path func_name
           source_name = func_name;
           call_pure = info.module_func_is_pure;
           origin =
-            callable_origin_of_env ~module_path:(Some module_path)
-              info.module_func_origin;
+            Call_resolution.callable_origin_of_env
+              ~module_path:(Some module_path) info.module_func_origin;
         })
     info.module_func_callable_id
 
 let resolved_target_from_qualified_callee ctx callee =
   match callee.expr_desc with
   | EFieldAccess ({ expr_desc = EIdent alias; _ }, func_name) -> (
-      match List.assoc_opt alias ctx.module_aliases with
+      match Checker_query.module_alias_path ctx.module_aliases alias with
       | Some module_path -> (
           match lookup_module_func_resolution module_path func_name with
           | Some info ->
@@ -4128,98 +4097,15 @@ let resolved_target_from_qualified_callee ctx callee =
       | None -> None)
   | _ -> None
 
-let resolved_target_from_callee ctx callee_name callee_ty =
-  match callee_name with
-  | Some name -> (
-      match Env.lookup ctx.env name with
-      | Some
-          {
-            kind =
-              Env.FuncSymbol { callable_id; purity; origin; module_path; _ };
-            _;
-          } ->
-          Some
-            (CallDirect
-               {
-                 callable_id;
-                 source_name = strip_callable_id_suffix name;
-                 call_pure = call_purity_bool purity;
-                 origin = callable_origin_of_env ~module_path origin;
-               })
-      | Some
-          { kind = Env.ConstructorSymbol { parent_type; constructor_id; _ }; _ }
-        ->
-          Some
-            (CallDirect
-               {
-                 callable_id = constructor_id;
-                 source_name = strip_callable_id_suffix name;
-                 call_pure = true;
-                 origin = CallableConstructor parent_type;
-               })
-      | Some { kind = Env.VarSymbol { var_type; _ }; _ } -> (
-          match Env.function_type_purity ctx.env var_type with
-          | Some purity ->
-              Some (CallClosure { call_pure = call_purity_bool purity })
-          | None -> None)
-      | _ -> (
-          match parse_callable_id_suffix name with
-          | Some callable_id ->
-              let call_pure =
-                match callee_ty with
-                | TyFunc { is_pure; _ } -> is_pure
-                | _ -> false
-              in
-              Some
-                (CallDirect
-                   {
-                     callable_id;
-                     source_name = strip_callable_id_suffix name;
-                     call_pure;
-                     origin = CallableImported "";
-                   })
-          | None -> (
-              match callee_ty with
-              | TyFunc { is_pure; _ } ->
-                  Some (CallClosure { call_pure = is_pure })
-              | _ -> None)))
-  | None -> (
-      match callee_ty with
-      | TyFunc { is_pure; _ } -> Some (CallClosure { call_pure = is_pure })
-      | _ -> None)
-
 let resolved_call_metadata ?call_syntax_hint ctx ~source_callee ~resolved_callee
     ~resolved_overload ~resolved_trait ~resolved_target_hint ~callee_ty
     ~instantiated_params ~instantiated_return =
-  let callee_name = get_callee_name resolved_callee in
-  let target =
-    match
-      (resolved_target_hint, resolved_trait, callee_name, resolved_overload)
-    with
-    | Some target, _, _, _ -> Some target
-    | None, Some (trait_name, method_name, call_pure, callable_id), _, _ ->
-        Some
-          (CallTraitMethod { trait_name; method_name; call_pure; callable_id })
-    | None, None, Some name, Some entry ->
-        Some (resolved_target_from_overload name entry)
-    | None, None, _, None -> (
-        match resolved_target_from_qualified_callee ctx resolved_callee with
-        | Some target -> Some target
-        | None -> resolved_target_from_callee ctx callee_name callee_ty)
-    | None, None, None, Some _ -> None
-  in
-  Option.map
-    (fun call_target ->
-      {
-        call_syntax =
-          Option.value call_syntax_hint
-            ~default:
-              (call_syntax_of_source_callee ctx source_callee call_target);
-        call_target;
-        instantiated_params;
-        instantiated_return;
-      })
-    target
+  Call_resolution.resolved_call_metadata ?call_syntax_hint
+    ~module_aliases:ctx.module_aliases
+    ~resolved_target_from_qualified:(resolved_target_from_qualified_callee ctx)
+    ~source_callee ~resolved_callee ~resolved_overload ~resolved_trait
+    ~resolved_target_hint ~callee_ty ~instantiated_params ~instantiated_return
+    ctx.env
 
 let attach_resolved_call_metadata ctx ~source_callee result_ty call_expr =
   match call_expr.expr_type_info with
@@ -4308,7 +4194,7 @@ let rec runtime_builtin_name_for_call_expr ctx expr =
               _;
             },
             _ ) ->
-          Option.bind (List.assoc_opt alias ctx.module_aliases)
+          Option.bind (Checker_query.module_alias_path ctx.module_aliases alias)
             (fun module_path -> module_runtime_builtin_name module_path name)
       | ECall ({ expr_desc = EIdent name; _ }, _) -> (
           match Env.lookup ctx.env (strip_callable_id_suffix name) with
@@ -8831,7 +8717,7 @@ and debug_only_name_for_callee ctx callee =
          || Env.is_debug_only_overload_set ctx.env name ->
       Some name
   | EFieldAccess ({ expr_desc = EIdent alias; _ }, func_name) -> (
-      match List.assoc_opt alias ctx.module_aliases with
+      match Checker_query.module_alias_path ctx.module_aliases alias with
       | Some module_path
         when Modules.exported_func_is_debug_only module_path func_name ->
           Some func_name
@@ -8862,6 +8748,25 @@ and reject_debug_only_callee ctx callee =
 and infer_call ctx expr callee args loc =
   let* () = reject_debug_only_callee ctx callee in
   let source_callee = callee in
+  let unconstrained_arg_facts = ref [] in
+  let infer_unconstrained_call_arg arg =
+    match expr_semantic_type_opt arg with
+    | Some ty -> Ok (ty, arg)
+    | None -> (
+        match
+          List.find_opt (fun (seen, _) -> seen == arg) !unconstrained_arg_facts
+        with
+        | Some (_, result) -> result
+        | None ->
+            let result = infer_unconstrained_value_expr ctx arg in
+            unconstrained_arg_facts := (arg, result) :: !unconstrained_arg_facts;
+            result)
+  in
+  let infer_unconstrained_call_arg_type_opt arg =
+    match infer_unconstrained_call_arg arg with
+    | Ok (ty, _) -> Some ty
+    | Error _ -> None
+  in
   (* Builtin inference dispatch — registry shape (Phase 5.2, 2026-04-21).
      [dispatch_builtin_inference] returns [Some result] when [name] is a
      recognized builtin (and [Env.is_builtin_func] confirms the user hasn't
@@ -8894,26 +8799,10 @@ and infer_call ctx expr callee args loc =
   match builtin_result with
   | Some result -> result
   | None -> (
-      let is_flexible_lambda_arg arg =
-        match arg.expr_desc with
-        | ELambda f when not f.func_is_pure -> true
-        | _ -> false
-      in
-      let overload_pure_callback_count (entry : Env.overload_entry) =
-        match entry.ol_func_type with
-        | TyFunc { params; _ } ->
-            List.fold_left
-              (fun acc param_ty ->
-                match param_ty with
-                | TyFunc { is_pure = true; _ } -> acc + 1
-                | _ -> acc)
-              0 params
-        | _ -> 0
-      in
       let select_pure_overload_for_flexible_lambdas
           (entries : Env.overload_entry list) (arg_exprs : expr list) :
           Env.overload_entry option =
-        if not (List.exists is_flexible_lambda_arg arg_exprs) then None
+        if not (Call_resolution.has_flexible_lambda arg_exprs) then None
         else
           let arg_satisfies_param entry subst arg param_ty =
             let param_ty = apply_subst subst param_ty in
@@ -8974,8 +8863,8 @@ and infer_call ctx expr callee args loc =
                 List.sort
                   (fun a b ->
                     compare
-                      (overload_pure_callback_count b)
-                      (overload_pure_callback_count a))
+                      (Call_resolution.overload_pure_callback_count b)
+                      (Call_resolution.overload_pure_callback_count a))
                   many
               in
               match sorted with
@@ -8983,8 +8872,8 @@ and infer_call ctx expr callee args loc =
                 when not
                        (List.exists
                           (fun entry ->
-                            overload_pure_callback_count entry
-                            = overload_pure_callback_count best)
+                            Call_resolution.overload_pure_callback_count entry
+                            = Call_resolution.overload_pure_callback_count best)
                           rest) ->
                   Some best
               | _ -> None)
@@ -8995,258 +8884,277 @@ and infer_call ctx expr callee args loc =
      module alias), try rewriting as a function call with obj prepended to args.
      If neither works, return the original field access error so existing error
      filters handle it gracefully for unresolved imports. *)
-      let* ( callee_ty,
-             callee',
-             callee,
-             args,
-             resolved_trait_hint,
-             resolved_target_hint,
-             resolved_syntax_hint ) =
-        match callee.expr_desc with
-        | EFieldAccess (obj, method_name) -> (
-            let alias_name =
-              match obj.expr_desc with EIdent n -> Some n | _ -> None
-            in
-            let module_path =
-              match alias_name with
-              | Some name -> List.assoc_opt name ctx.module_aliases
-              | None -> None
-            in
-            (* Module-qualified impl-method dispatch: before plain field-access
+      let callee_resolution_of_tuple
+          ( callee_ty,
+            callee_expr,
+            source_callee,
+            args,
+            resolved_trait,
+            resolved_target,
+            syntax_hint ) : Call_resolution.callee_resolution =
+        {
+          callee_ty;
+          callee_expr;
+          source_callee;
+          args;
+          resolved_trait;
+          resolved_target;
+          syntax_hint;
+        }
+      in
+      let* callee_resolution =
+        Result.map callee_resolution_of_tuple
+          (match callee.expr_desc with
+          | EFieldAccess (obj, method_name) -> (
+              let alias_name =
+                match obj.expr_desc with EIdent n -> Some n | _ -> None
+              in
+              let module_path =
+                match alias_name with
+                | Some name ->
+                    Checker_query.module_alias_path ctx.module_aliases name
+                | None -> None
+              in
+              (* Module-qualified impl-method dispatch: before plain field-access
            inference, check if [obj] is a module alias AND the field names a
            trait-impl method in that module. If so, rewrite the callee to
            the impl's mangled name. Runs first because [infer_field_access]
            has a successful fallback path (via bare-identifier lookup) that
            would otherwise swallow the case and leave the [EFieldAccess]
            structure intact — producing [V->to_string] in generated C. *)
-            let impl_first =
-              match module_path with
-              | None -> None
-              | Some mp -> (
-                  match args with
-                  | first :: _ -> (
-                      match infer_unconstrained_value_expr ctx first with
-                      | Ok (first_ty, first') -> (
-                          match
-                            lookup_module_impl_method mp method_name first_ty
-                          with
-                          | Some method_info ->
-                              let mangled =
-                                method_info.module_impl_mangled_name
-                              in
-                              let callee_ty =
-                                method_info.module_impl_func_type
-                              in
-                              let mangled_ident =
-                                inferred_ident_expr callee mangled callee_ty
-                              in
-                              let args' = first' :: List.tl args in
-                              Some
-                                ( callee_ty,
-                                  mangled_ident,
-                                  mangled_ident,
-                                  args',
-                                  resolved_trait_of_module_impl_method
-                                    method_info,
-                                  None,
-                                  None )
-                          | None -> None)
-                      | Error _ -> None)
-                  | [] -> None)
-            in
-            let module_func_first =
-              match module_path with
-              | None -> None
-              | Some mod_path -> (
-                  let ident = { callee with expr_desc = EIdent method_name } in
-                  match lookup_module_func_resolution mod_path method_name with
-                  | Some module_func ->
-                      let callee_ty = module_func.module_func_type in
-                      let typed_obj =
-                        with_inferred_type obj (TyNamed ("Module", []))
-                      in
-                      let callee' =
-                        with_inferred_desc callee
-                          (EFieldAccess (typed_obj, method_name))
-                          callee_ty
-                      in
-                      let target_hint =
-                        resolved_target_from_module_func mod_path method_name
-                          module_func
-                      in
-                      Some
-                        (Ok
-                           ( callee_ty,
-                             callee',
-                             ident,
-                             args,
-                             None,
-                             target_hint,
-                             None ))
-                  | None -> None)
-            in
-            match impl_first with
-            | Some
-                ( callee_ty,
-                  callee',
-                  ident,
-                  args',
-                  resolved_trait_hint,
-                  resolved_target_hint,
-                  resolved_syntax_hint ) ->
-                Ok
+              let impl_first =
+                match module_path with
+                | None -> None
+                | Some mp -> (
+                    match args with
+                    | first :: _ -> (
+                        match infer_unconstrained_call_arg first with
+                        | Ok (first_ty, first') -> (
+                            match
+                              lookup_module_impl_method mp method_name first_ty
+                            with
+                            | Some method_info ->
+                                let mangled =
+                                  method_info.module_impl_mangled_name
+                                in
+                                let callee_ty =
+                                  method_info.module_impl_func_type
+                                in
+                                let mangled_ident =
+                                  inferred_ident_expr callee mangled callee_ty
+                                in
+                                let args' = first' :: List.tl args in
+                                Some
+                                  ( callee_ty,
+                                    mangled_ident,
+                                    mangled_ident,
+                                    args',
+                                    resolved_trait_of_module_impl_method
+                                      method_info,
+                                    None,
+                                    None )
+                            | None -> None)
+                        | Error _ -> None)
+                    | [] -> None)
+              in
+              let module_func_first =
+                match module_path with
+                | None -> None
+                | Some mod_path -> (
+                    let ident =
+                      { callee with expr_desc = EIdent method_name }
+                    in
+                    match
+                      lookup_module_func_resolution mod_path method_name
+                    with
+                    | Some module_func ->
+                        let callee_ty = module_func.module_func_type in
+                        let typed_obj =
+                          with_inferred_type obj (TyNamed ("Module", []))
+                        in
+                        let callee' =
+                          with_inferred_desc callee
+                            (EFieldAccess (typed_obj, method_name))
+                            callee_ty
+                        in
+                        let target_hint =
+                          resolved_target_from_module_func mod_path method_name
+                            module_func
+                        in
+                        Some
+                          (Ok
+                             ( callee_ty,
+                               callee',
+                               ident,
+                               args,
+                               None,
+                               target_hint,
+                               None ))
+                    | None -> None)
+              in
+              match impl_first with
+              | Some
                   ( callee_ty,
                     callee',
                     ident,
                     args',
                     resolved_trait_hint,
                     resolved_target_hint,
-                    resolved_syntax_hint )
-            | None -> (
-                match module_func_first with
-                | Some result -> result
-                | None -> (
-                    match module_path with
-                    | Some mod_path -> (
-                        let ident =
-                          { callee with expr_desc = EIdent method_name }
-                        in
-                        let mod_name =
-                          match alias_name with
-                          | Some n -> n
-                          | None -> "<unknown>"
-                        in
-                        let help =
-                          match Modules.find_cached mod_path with
-                          | Some m -> Modules.suggest_export m method_name
-                          | None -> None
-                        in
-                        (* Module aliases may resolve exported functions,
+                    resolved_syntax_hint ) ->
+                  Ok
+                    ( callee_ty,
+                      callee',
+                      ident,
+                      args',
+                      resolved_trait_hint,
+                      resolved_target_hint,
+                      resolved_syntax_hint )
+              | None -> (
+                  match module_func_first with
+                  | Some result -> result
+                  | None -> (
+                      match module_path with
+                      | Some mod_path -> (
+                          let ident =
+                            { callee with expr_desc = EIdent method_name }
+                          in
+                          let mod_name =
+                            match alias_name with
+                            | Some n -> n
+                            | None -> "<unknown>"
+                          in
+                          let help =
+                            match Modules.find_cached mod_path with
+                            | Some m -> Modules.suggest_export m method_name
+                            | None -> None
+                          in
+                          (* Module aliases may resolve exported functions,
                            public impl methods, or legacy qualified
                            constructors. They must not fall back to an
                            unrelated bare function, because that bypasses
                            module visibility and can expose private resource
                            finalizers through same-named prelude functions. *)
-                        match lookup ctx.env method_name with
-                        | Some { kind = ConstructorSymbol _; _ } -> (
-                            match infer_unconstrained_value_expr ctx ident with
-                            | Ok (callee_ty, _callee') ->
-                                let typed_obj =
-                                  with_inferred_type obj
-                                    (TyNamed ("Module", []))
-                                in
-                                let qualified_callee =
-                                  with_inferred_desc callee
-                                    (EFieldAccess (typed_obj, method_name))
-                                    callee_ty
-                                in
-                                Ok
-                                  ( callee_ty,
-                                    qualified_callee,
-                                    ident,
-                                    args,
-                                    None,
-                                    None,
-                                    None )
-                            | Error _ ->
-                                error_with ~notes:[] ~help loc
-                                  (Printf.sprintf
-                                     "Module '%s' has no exported function '%s'"
-                                     mod_name method_name))
-                        | _ ->
-                            error_with ~notes:[] ~help loc
-                              (Printf.sprintf
-                                 "Module '%s' has no exported function '%s'"
-                                 mod_name method_name))
-                    | None -> (
-                        match infer_unconstrained_value_expr ctx callee with
-                        | Ok (callee_ty, callee') ->
-                            Ok
-                              ( callee_ty,
-                                callee',
-                                callee,
-                                args,
-                                None,
-                                None,
-                                None )
-                        | Error original_err -> (
-                            match infer_unconstrained_value_expr ctx obj with
-                            | Error _ -> Error original_err
-                            | Ok (_, obj') -> (
-                                (* obj is a value — try method-call rewrite *)
-                                let receiver_arg =
-                                  annotate_method_receiver_expr obj'
-                                in
-                                let ident =
-                                  { callee with expr_desc = EIdent method_name }
-                                in
-                                let normal_result =
-                                  if
-                                    not
-                                      (identifier_may_resolve_as_call_target
-                                         ctx.env method_name)
-                                  then None
-                                  else
-                                    match
-                                      infer_unconstrained_value_expr ctx ident
-                                    with
-                                    | Ok (callee_ty, callee') ->
-                                        (* Check if the resolved function can actually
+                          match lookup ctx.env method_name with
+                          | Some { kind = ConstructorSymbol _; _ } -> (
+                              match
+                                infer_unconstrained_value_expr ctx ident
+                              with
+                              | Ok (callee_ty, _callee') ->
+                                  let typed_obj =
+                                    with_inferred_type obj
+                                      (TyNamed ("Module", []))
+                                  in
+                                  let qualified_callee =
+                                    with_inferred_desc callee
+                                      (EFieldAccess (typed_obj, method_name))
+                                      callee_ty
+                                  in
+                                  Ok
+                                    ( callee_ty,
+                                      qualified_callee,
+                                      ident,
+                                      args,
+                                      None,
+                                      None,
+                                      None )
+                              | Error _ ->
+                                  error_with ~notes:[] ~help loc
+                                    (Printf.sprintf
+                                       "Module '%s' has no exported function \
+                                        '%s'"
+                                       mod_name method_name))
+                          | _ ->
+                              error_with ~notes:[] ~help loc
+                                (Printf.sprintf
+                                   "Module '%s' has no exported function '%s'"
+                                   mod_name method_name))
+                      | None -> (
+                          match infer_unconstrained_value_expr ctx callee with
+                          | Ok (callee_ty, callee') ->
+                              Ok
+                                ( callee_ty,
+                                  callee',
+                                  callee,
+                                  args,
+                                  None,
+                                  None,
+                                  None )
+                          | Error original_err -> (
+                              match infer_unconstrained_value_expr ctx obj with
+                              | Error _ -> Error original_err
+                              | Ok (_, obj') -> (
+                                  (* obj is a value — try method-call rewrite *)
+                                  let receiver_arg =
+                                    annotate_method_receiver_expr obj'
+                                  in
+                                  let ident =
+                                    {
+                                      callee with
+                                      expr_desc = EIdent method_name;
+                                    }
+                                  in
+                                  let normal_result =
+                                    if
+                                      not
+                                        (identifier_may_resolve_as_call_target
+                                           ctx.env method_name)
+                                    then None
+                                    else
+                                      match
+                                        infer_unconstrained_value_expr ctx ident
+                                      with
+                                      | Ok (callee_ty, callee') ->
+                                          (* Check if the resolved function can actually
 
                                  accept the receiver as its first argument. If
                                  not, try UFCS-only methods. *)
-                                        let first_param_matches =
-                                          let obj_ty =
-                                            match
-                                              expr_semantic_type_opt obj'
-                                            with
-                                            | Some t -> t
-                                            | None -> ty_void
-                                          in
-                                          let builtin_trait_accepts_receiver ()
-                                              =
-                                            match
-                                              ( Env.is_builtin_func ctx.env
-                                                  method_name,
-                                                Env.get_function_trait ctx.env
-                                                  method_name )
-                                            with
-                                            | true, Some trait_name ->
-                                                trait_obligation_satisfied
-                                                  ctx.env obj_ty trait_name
-                                            | _ -> true
-                                          in
-                                          let normal_function_type_params =
-                                            match
-                                              Env.get_func_info ctx.env
-                                                method_name
-                                            with
-                                            | Some (_, type_params, _) ->
-                                                Env.bound_type_param_names
-                                                  type_params
-                                            | None ->
-                                                Env.get_type_params ctx.env
-                                          in
-                                          let receiver_family = function
-                                            | TyNamed (name, _) -> Some name
-                                            | TyArray _ ->
-                                                Some Types.array_head_name
-                                            | _ -> None
-                                          in
-                                          match callee_ty with
-                                          | TyFunc
-                                              { params = first_param :: _; _ }
-                                            -> (
-                                              let first_param =
-                                                normalize_type ctx
-                                                  UfcsCandidateFiltering
-                                                  first_param
-                                              in
-                                              let obj_ty =
-                                                normalize_type ctx
-                                                  UfcsCandidateFiltering obj_ty
-                                              in
-                                              (* Generic builtin trait functions like
+                                          let first_param_matches =
+                                            let obj_ty =
+                                              match
+                                                expr_semantic_type_opt obj'
+                                              with
+                                              | Some t -> t
+                                              | None -> ty_void
+                                            in
+                                            let builtin_trait_accepts_receiver
+                                                () =
+                                              match
+                                                ( Env.is_builtin_func ctx.env
+                                                    method_name,
+                                                  Env.get_function_trait ctx.env
+                                                    method_name )
+                                              with
+                                              | true, Some trait_name ->
+                                                  trait_obligation_satisfied
+                                                    ctx.env obj_ty trait_name
+                                              | _ -> true
+                                            in
+                                            let normal_function_type_params =
+                                              match
+                                                Env.get_func_info ctx.env
+                                                  method_name
+                                              with
+                                              | Some (_, type_params, _) ->
+                                                  Env.bound_type_param_names
+                                                    type_params
+                                              | None ->
+                                                  Env.get_type_params ctx.env
+                                            in
+                                            match callee_ty with
+                                            | TyFunc
+                                                { params = first_param :: _; _ }
+                                              -> (
+                                                let first_param =
+                                                  normalize_type ctx
+                                                    UfcsCandidateFiltering
+                                                    first_param
+                                                in
+                                                let obj_ty =
+                                                  normalize_type ctx
+                                                    UfcsCandidateFiltering
+                                                    obj_ty
+                                                in
+                                                (* Generic builtin trait functions like
                                        [length(T)] are only valid method
                                        candidates when the receiver satisfies
                                        the trait.
@@ -9258,81 +9166,84 @@ and infer_call ctx expr callee args loc =
                                        this phase, but cross-family candidates
                                        like tensor get on List should fall
                                        through to UFCS-only methods. *)
-                                              if
-                                                Env.is_builtin_func ctx.env
-                                                  method_name
-                                                && Option.is_some
-                                                     (Env.get_function_trait
-                                                        ctx.env method_name)
-                                              then
-                                                builtin_trait_accepts_receiver
-                                                  ()
-                                              else
-                                                match
-                                                  ( receiver_family first_param,
-                                                    receiver_family obj_ty )
-                                                with
-                                                | ( Some param_family,
-                                                    Some obj_family ) ->
-                                                    param_family = obj_family
-                                                | _ ->
-                                                    types_compatible
-                                                      ~type_params:
-                                                        normal_function_type_params
-                                                      first_param obj_ty)
-                                          | _ -> false
-                                        in
-                                        if first_param_matches then
-                                          Some
-                                            (Ok
-                                               ( callee_ty,
-                                                 callee',
-                                                 ident,
-                                                 receiver_arg :: args,
-                                                 None,
-                                                 None,
-                                                 None ))
-                                        else None
-                                        (* Type mismatch — try UFCS methods *)
-                                    | Error _ -> None
-                                in
-                                match normal_result with
-                                | Some r -> r
-                                | None -> (
-                                    (* Method not in normal scope or type mismatch — check UFCS-only methods
+                                                if
+                                                  Env.is_builtin_func ctx.env
+                                                    method_name
+                                                  && Option.is_some
+                                                       (Env.get_function_trait
+                                                          ctx.env method_name)
+                                                then
+                                                  builtin_trait_accepts_receiver
+                                                    ()
+                                                else
+                                                  match
+                                                    ( Checker_query
+                                                      .receiver_family
+                                                        first_param,
+                                                      Checker_query
+                                                      .receiver_family obj_ty )
+                                                  with
+                                                  | ( Some param_family,
+                                                      Some obj_family ) ->
+                                                      param_family = obj_family
+                                                  | _ ->
+                                                      types_compatible
+                                                        ~type_params:
+                                                          normal_function_type_params
+                                                        first_param obj_ty)
+                                            | _ -> false
+                                          in
+                                          if first_param_matches then
+                                            Some
+                                              (Ok
+                                                 ( callee_ty,
+                                                   callee',
+                                                   ident,
+                                                   receiver_arg :: args,
+                                                   None,
+                                                   None,
+                                                   None ))
+                                          else None
+                                          (* Type mismatch — try UFCS methods *)
+                                      | Error _ -> None
+                                  in
+                                  match normal_result with
+                                  | Some r -> r
+                                  | None -> (
+                                      (* Method not in normal scope or type mismatch — check UFCS-only methods
                           (auto-imported when a type is imported from a module) *)
-                                    let obj_ty =
-                                      match expr_semantic_type_opt obj' with
-                                      | Some t -> t
-                                      | None -> ty_void
-                                    in
-                                    let ufcs_matches =
-                                      Env.lookup_ufcs_methods ctx.env
-                                        method_name obj_ty
-                                    in
-                                    match ufcs_matches with
-                                    | _ :: _ -> (
-                                        (* Found UFCS method(s) — use mangled names to avoid
+                                      let obj_ty =
+                                        match expr_semantic_type_opt obj' with
+                                        | Some t -> t
+                                        | None -> ty_void
+                                      in
+                                      let ufcs_matches =
+                                        Env.lookup_ufcs_methods ctx.env
+                                          method_name obj_ty
+                                      in
+                                      match ufcs_matches with
+                                      | _ :: _ -> (
+                                          (* Found UFCS method(s) — use mangled names to avoid
                               conflicts with the current module's own functions.
                               E.g., list's get becomes __ufcs_std$list__get
                               Uses $ for path separators to avoid ambiguity with _ in names *)
-                                        let mod_path =
-                                          match
-                                            (List.hd ufcs_matches)
-                                              .Env.ol_module_path
-                                          with
-                                          | Some p -> p
-                                          | None -> ""
-                                        in
-                                        let base_mangled =
-                                          "__ufcs_"
-                                          ^ String.map
-                                              (fun c ->
-                                                if c = '/' then '$' else c)
-                                              mod_path
-                                          ^ "__" ^ method_name
-                                        in
-                                        (* Phase 2.7 tasks 48/49: when pure/impure overloads
+                                          let mod_path =
+                                            match
+                                              (List.hd ufcs_matches)
+                                                .Env.ol_module_path
+                                            with
+                                            | Some p -> p
+                                            | None -> ""
+                                          in
+                                          let base_mangled =
+                                            "__ufcs_"
+                                            ^ String.map
+                                                (fun c ->
+                                                  if c = '/' then '$' else c)
+                                                mod_path
+                                            ^ "__" ^ method_name
+                                          in
+                                          (* Phase 2.7 tasks 48/49: when pure/impure overloads
                               exist, try to pick by callback purity — but ONLY
                               when every function-typed arg has a firm purity
                               (i.e. a named [func]/[pure func] reference).
@@ -9345,46 +9256,40 @@ and infer_call ctx expr callee args loc =
                               lambda OR any arg fails standalone inference,
                               fall back to the caller-context preference
                               (pure in pure scope, impure otherwise). *)
-                                        let has_flexible_lambda =
-                                          List.exists
-                                            (fun a ->
-                                              match a.expr_desc with
-                                              | ELambda f
-                                                when not f.func_is_pure ->
-                                                  true
-                                              | _ -> false)
-                                            args
-                                        in
-                                        let selected =
-                                          match
-                                            select_pure_overload_for_flexible_lambdas
-                                              ufcs_matches (receiver_arg :: args)
-                                          with
-                                          | Some entry -> Some entry
-                                          | None -> (
-                                              if has_flexible_lambda then None
-                                              else
-                                                let arg_tys_opt =
-                                                  List.map
-                                                    (fun a ->
-                                                      match
-                                                        infer_unconstrained_value_expr
-                                                          ctx a
-                                                      with
-                                                      | Ok (ty, _) -> Some ty
-                                                      | Error _ -> None)
-                                                    (receiver_arg :: args)
-                                                in
-                                                match all_some arg_tys_opt with
-                                                | Some arg_tys ->
-                                                    Env.select_overload_for_args
-                                                      ufcs_matches arg_tys
-                                                | None -> None)
-                                        in
-                                        let in_pure_ctx =
-                                          ctx.env.current_function_pure
-                                        in
-                                        (* A3.3 UFCS handoff: encode the selected
+                                          let has_flexible_lambda =
+                                            Call_resolution.has_flexible_lambda
+                                              args
+                                          in
+                                          let selected =
+                                            match
+                                              select_pure_overload_for_flexible_lambdas
+                                                ufcs_matches
+                                                (receiver_arg :: args)
+                                            with
+                                            | Some entry -> Some entry
+                                            | None -> (
+                                                if has_flexible_lambda then None
+                                                else
+                                                  let arg_tys_opt =
+                                                    List.map
+                                                      (fun a ->
+                                                        infer_unconstrained_call_arg_type_opt
+                                                          a)
+                                                      (receiver_arg :: args)
+                                                  in
+                                                  match
+                                                    all_some arg_tys_opt
+                                                  with
+                                                  | Some arg_tys ->
+                                                      Call_resolution
+                                                      .select_by_typed_args
+                                                        ufcs_matches arg_tys
+                                                  | None -> None)
+                                          in
+                                          let in_pure_ctx =
+                                            ctx.env.current_function_pure
+                                          in
+                                          (* A3.3 UFCS handoff: encode the selected
                               overload's [ol_def_id] directly in the
                               mangled identifier as a ["#<id>"] suffix.
                               [Core_lower] strips the suffix into
@@ -9399,141 +9304,160 @@ and infer_call ctx expr callee args loc =
                               was keyed on the unsuffixed form and
                               last-write-wins produced wrong-body
                               mangling for pure/impure pairs. *)
-                                        let mangled =
-                                          match selected with
-                                          | Some entry ->
-                                              Printf.sprintf "%s#%d"
-                                                base_mangled entry.Env.ol_def_id
-                                          | None -> base_mangled
-                                        in
-                                        (* When selection is firm, [mangled] already
+                                          let mangled =
+                                            match selected with
+                                            | Some entry ->
+                                                Printf.sprintf "%s#%d"
+                                                  base_mangled
+                                                  entry.Env.ol_def_id
+                                            | None -> base_mangled
+                                          in
+                                          (* When selection is firm, [mangled] already
                               includes [entry]'s def_id, so only [entry]
                               belongs under that name in the temp env —
                               registering other overloads there would
                               invite spurious resolution between
                               distinct IDs. *)
-                                        let to_register =
-                                          match selected with
-                                          | Some entry -> [ entry ]
-                                          | None ->
-                                              if in_pure_ctx then
-                                                (* In pure context: put pure overloads last (found first by lookup) *)
-                                                List.sort
-                                                  (fun a b ->
-                                                    match
-                                                      ( a.Env.ol_purity,
-                                                        b.Env.ol_purity )
-                                                    with
-                                                    | Env.Pure, Env.Impure -> 1
-                                                    | Env.Impure, Env.Pure -> -1
-                                                    | _ -> 0)
-                                                  ufcs_matches
-                                              else
-                                                (* In impure context: put impure overloads last (found first by lookup) *)
-                                                List.sort
-                                                  (fun a b ->
-                                                    match
-                                                      ( a.Env.ol_purity,
-                                                        b.Env.ol_purity )
-                                                    with
-                                                    | Env.Impure, Env.Pure -> 1
-                                                    | Env.Pure, Env.Impure -> -1
-                                                    | _ -> 0)
-                                                  ufcs_matches
-                                        in
-                                        let temp_env =
-                                          List.fold_left
-                                            (fun env e ->
-                                              Env.add_func env mangled
-                                                e.Env.ol_func_type
-                                                ~callable_id:e.Env.ol_def_id
-                                                ~type_params:
-                                                  e.Env.ol_type_params
-                                                ~param_names:e.ol_param_names
-                                                ~purity:e.ol_purity
-                                                ~origin:e.ol_origin
-                                                ~resource_args:
-                                                  e.ol_resource_args
-                                                ?module_path:e.ol_module_path
-                                                ~dim_constraints:
-                                                  e.ol_dim_constraints
-                                                ?loop_producer:
-                                                  e.ol_loop_producer
-                                                ~debug_only:e.ol_debug_only ())
-                                            ctx.env to_register
-                                        in
-                                        let temp_ctx =
-                                          { ctx with env = temp_env }
-                                        in
-                                        let ident2 =
-                                          {
-                                            callee with
-                                            expr_desc = EIdent mangled;
-                                          }
-                                        in
-                                        match
-                                          infer_expr
-                                            (without_expected temp_ctx)
-                                            ident2
-                                        with
-                                        | Ok (callee_ty, callee') ->
-                                            let target_hint =
-                                              Option.map
-                                                (resolved_target_from_overload
-                                                   method_name)
-                                                selected
-                                            in
-                                            Ok
-                                              ( callee_ty,
-                                                callee',
-                                                ident2,
-                                                receiver_arg :: args,
-                                                None,
-                                                target_hint,
-                                                Some CallMethodOnlyUfcs )
-                                        | Error e -> Error e)
-                                    | [] ->
-                                        (* No UFCS method either — give helpful error *)
-                                        let obj_ty_str =
-                                          match expr_semantic_type_opt obj' with
-                                          | Some ty -> type_to_string ty
-                                          | None -> "this value"
-                                        in
-                                        let ufcs_hint =
-                                          if
-                                            Env.has_ufcs_method ctx.env
-                                              method_name
-                                          then
-                                            Printf.sprintf
-                                              "'%s' is available as a method \
-                                               on other types but not %s"
-                                              method_name obj_ty_str
-                                          else
-                                            Printf.sprintf
-                                              "method syntax `value.%s(...)` \
-                                               is shorthand for `%s(value, \
-                                               ...)` — ensure '%s' is imported"
-                                              method_name method_name
-                                              method_name
-                                        in
-                                        error_with
-                                          ~notes:
-                                            [
+                                          let to_register =
+                                            match selected with
+                                            | Some entry -> [ entry ]
+                                            | None ->
+                                                if in_pure_ctx then
+                                                  (* In pure context: put pure overloads last (found first by lookup) *)
+                                                  List.sort
+                                                    (fun a b ->
+                                                      match
+                                                        ( a.Env.ol_purity,
+                                                          b.Env.ol_purity )
+                                                      with
+                                                      | Env.Pure, Env.Impure ->
+                                                          1
+                                                      | Env.Impure, Env.Pure ->
+                                                          -1
+                                                      | _ -> 0)
+                                                    ufcs_matches
+                                                else
+                                                  (* In impure context: put impure overloads last (found first by lookup) *)
+                                                  List.sort
+                                                    (fun a b ->
+                                                      match
+                                                        ( a.Env.ol_purity,
+                                                          b.Env.ol_purity )
+                                                      with
+                                                      | Env.Impure, Env.Pure ->
+                                                          1
+                                                      | Env.Pure, Env.Impure ->
+                                                          -1
+                                                      | _ -> 0)
+                                                    ufcs_matches
+                                          in
+                                          let temp_env =
+                                            List.fold_left
+                                              (fun env e ->
+                                                Env.add_func env mangled
+                                                  e.Env.ol_func_type
+                                                  ~callable_id:e.Env.ol_def_id
+                                                  ~type_params:
+                                                    e.Env.ol_type_params
+                                                  ~param_names:e.ol_param_names
+                                                  ~purity:e.ol_purity
+                                                  ~origin:e.ol_origin
+                                                  ~resource_args:
+                                                    e.ol_resource_args
+                                                  ?module_path:e.ol_module_path
+                                                  ~dim_constraints:
+                                                    e.ol_dim_constraints
+                                                  ?loop_producer:
+                                                    e.ol_loop_producer
+                                                  ~debug_only:e.ol_debug_only ())
+                                              ctx.env to_register
+                                          in
+                                          let temp_ctx =
+                                            { ctx with env = temp_env }
+                                          in
+                                          let ident2 =
+                                            {
+                                              callee with
+                                              expr_desc = EIdent mangled;
+                                            }
+                                          in
+                                          match
+                                            infer_expr
+                                              (without_expected temp_ctx)
+                                              ident2
+                                          with
+                                          | Ok (callee_ty, callee') ->
+                                              let target_hint =
+                                                Option.map
+                                                  (resolved_target_from_overload
+                                                     method_name)
+                                                  selected
+                                              in
+                                              Ok
+                                                ( callee_ty,
+                                                  callee',
+                                                  ident2,
+                                                  receiver_arg :: args,
+                                                  None,
+                                                  target_hint,
+                                                  Some CallMethodOnlyUfcs )
+                                          | Error e -> Error e)
+                                      | [] ->
+                                          (* No UFCS method either — give helpful error *)
+                                          let obj_ty_str =
+                                            match
+                                              expr_semantic_type_opt obj'
+                                            with
+                                            | Some ty -> type_to_string ty
+                                            | None -> "this value"
+                                          in
+                                          let ufcs_hint =
+                                            if
+                                              Env.has_ufcs_method ctx.env
+                                                method_name
+                                            then
                                               Printf.sprintf
-                                                "'%s' is not defined in the \
-                                                 current scope"
-                                                method_name;
-                                            ]
-                                          ~help:(Some ufcs_hint) loc
-                                          (Printf.sprintf
-                                             "No function '%s' available for \
-                                              type %s"
-                                             method_name obj_ty_str))))))))
-        | _ ->
-            let* callee_ty, callee' =
-              infer_unconstrained_value_expr ctx callee
-            in
-            Ok (callee_ty, callee', callee, args, None, None, None)
+                                                "'%s' is available as a method \
+                                                 on other types but not %s"
+                                                method_name obj_ty_str
+                                            else
+                                              Printf.sprintf
+                                                "method syntax `value.%s(...)` \
+                                                 is shorthand for `%s(value, \
+                                                 ...)` — ensure '%s' is \
+                                                 imported"
+                                                method_name method_name
+                                                method_name
+                                          in
+                                          error_with
+                                            ~notes:
+                                              [
+                                                Printf.sprintf
+                                                  "'%s' is not defined in the \
+                                                   current scope"
+                                                  method_name;
+                                              ]
+                                            ~help:(Some ufcs_hint) loc
+                                            (Printf.sprintf
+                                               "No function '%s' available for \
+                                                type %s"
+                                               method_name obj_ty_str))))))))
+          | _ ->
+              let* callee_ty, callee' =
+                infer_unconstrained_value_expr ctx callee
+              in
+              Ok (callee_ty, callee', callee, args, None, None, None))
+      in
+      let {
+        Call_resolution.callee_ty;
+        callee_expr = callee';
+        source_callee = callee;
+        args;
+        resolved_trait = resolved_trait_hint;
+        resolved_target = resolved_target_hint;
+        syntax_hint = resolved_syntax_hint;
+      } =
+        callee_resolution
       in
       (* Overload resolution: when multiple signatures exist for a name,
      use the argument types to select the correct one. Phase 2.7 tasks
@@ -9561,34 +9485,24 @@ and infer_call ctx expr callee args loc =
             if Env.is_local_func ctx.env n then (callee_ty, callee', None)
             else if List.length overloads > 1 && args <> [] then
               let has_flexible_lambda =
-                List.exists
-                  (fun a ->
-                    match a.expr_desc with
-                    | ELambda f when not f.func_is_pure -> true
-                    | _ -> false)
-                  args
+                Call_resolution.has_flexible_lambda args
               in
               let inferred =
-                List.map
-                  (fun a ->
-                    match infer_unconstrained_value_expr ctx a with
-                    | Ok (ty, _) -> Some ty
-                    | Error _ -> None)
-                  args
+                List.map infer_unconstrained_call_arg_type_opt args
+              in
+              let first_arg_ty =
+                match inferred with Some ty :: _ -> Some ty | _ -> None
               in
               let try_with_args () =
                 if has_flexible_lambda then None
                 else
                   match all_some inferred with
                   | Some arg_tys ->
-                      Env.select_overload_for_args overloads arg_tys
+                      Call_resolution.select_by_typed_args overloads arg_tys
                   | None -> None
               in
               let try_with_first_arg () =
-                match inferred with
-                | Some first_arg_ty :: _ ->
-                    Env.resolve_overload ctx.env n first_arg_ty
-                | _ -> None
+                Call_resolution.select_by_first_arg ctx.env n first_arg_ty
               in
               (* Fall back to context-purity bias when the arg-based resolvers
              are stuck (ambiguous first-arg head + flexible lambda). Mirrors
@@ -9599,49 +9513,9 @@ and infer_call ctx expr callee args loc =
              overloads come from different modules (length across
              List/String/Set, where the correct pick is by first-arg type). *)
               let try_by_context_purity () =
-                let head_name ty =
-                  match ty with TyNamed (n, _) -> Some n | _ -> None
-                in
-                let overloads =
-                  match inferred with
-                  | Some first_arg_ty :: _ ->
-                      let first_arg_head = head_name first_arg_ty in
-                      List.filter
-                        (fun (entry : Env.overload_entry) ->
-                          match entry.ol_func_type with
-                          | TyFunc { params = first_param :: _; _ } -> (
-                              match (head_name first_param, first_arg_head) with
-                              | Some pn, Some an -> pn = an
-                              | None, _ ->
-                                  Types.types_compatible
-                                    ~type_params:
-                                      (Env.overload_type_param_names entry)
-                                    first_param first_arg_ty
-                              | _ -> false)
-                          | _ -> false)
-                        overloads
-                  | _ -> overloads
-                in
-                match overloads with
-                | [ a; b ] when a.Env.ol_purity <> b.Env.ol_purity ->
-                    let same_receiver =
-                      match (a.ol_func_type, b.ol_func_type) with
-                      | ( TyFunc { params = ap :: _; _ },
-                          TyFunc { params = bp :: _; _ } ) -> (
-                          match (head_name ap, head_name bp) with
-                          | Some an, Some bn -> an = bn
-                          | None, None -> true (* both generic — likely T *)
-                          | _ -> false)
-                      | _ -> false
-                    in
-                    if not same_receiver then None
-                    else
-                      let pref =
-                        if ctx.env.current_function_pure then Env.Pure
-                        else Env.Impure
-                      in
-                      List.find_opt (fun e -> e.Env.ol_purity = pref) overloads
-                | _ -> None
+                Call_resolution.select_by_context_purity
+                  ~current_function_pure:ctx.env.current_function_pure
+                  ~overloads ~first_arg_ty
               in
               match try_with_args () with
               | Some entry -> from_entry entry
@@ -9696,7 +9570,7 @@ and infer_call ctx expr callee args loc =
                 let first_arg_result =
                   match expr_semantic_type_opt first_arg with
                   | Some t -> Ok (t, first_arg)
-                  | None -> infer_unconstrained_value_expr ctx first_arg
+                  | None -> infer_unconstrained_call_arg first_arg
                 in
                 match first_arg_result with
                 | Ok (TyVar param_name, _) -> (
@@ -9898,7 +9772,7 @@ and infer_call ctx expr callee args loc =
                 let first_arg_result =
                   match expr_semantic_type_opt first_arg with
                   | Some t -> Ok (t, first_arg)
-                  | None -> infer_unconstrained_value_expr ctx first_arg
+                  | None -> infer_unconstrained_call_arg first_arg
                 in
                 match first_arg_result with
                 | Ok (first_arg_ty, _) ->
@@ -11538,7 +11412,7 @@ and infer_field_access ctx expr obj field loc =
       in
       let module_path =
         match alias_name with
-        | Some name -> List.assoc_opt name ctx.module_aliases
+        | Some name -> Checker_query.module_alias_path ctx.module_aliases name
         | None -> None
       in
       match module_path with
