@@ -1747,15 +1747,19 @@ let skip_directories =
   [ "stages"; "test_compiler"; "should_fail"; "should_pass"; "traits" ]
 
 (** Find all .brp test files in a directory *)
+let sorted_directory_entries path =
+  Sys.readdir path |> Array.to_list |> List.sort String.compare
+
 let find_brp_files dir =
   let rec walk acc path =
     if Sys.is_directory path then
       let dirname = Filename.basename path in
       if List.mem dirname skip_directories then acc
       else
-        Array.fold_left
+        List.fold_left
           (fun acc name -> walk acc (Filename.concat path name))
-          acc (Sys.readdir path)
+          acc
+          (sorted_directory_entries path)
     else if Filename.check_suffix path ".brp" && is_valid_test_file path then
       path :: acc
     else acc
@@ -1864,10 +1868,13 @@ let module_path_for_import filename =
 
 let blorp_string_literal value = Printf.sprintf "%S" value
 
-let emit_suite_harness_imports ?(selector_support = false) emit run_fn
-    test_files =
+let emit_suite_harness_imports ?(selector_support = false)
+    ?(suite_type_support = false) emit run_fn test_files =
   emit "import:";
-  emit (Printf.sprintf "    std/test: %s" run_fn);
+  let test_import =
+    if suite_type_support then Printf.sprintf "TestSuite, %s" run_fn else run_fn
+  in
+  emit (Printf.sprintf "    std/test: %s" test_import);
   if selector_support then begin
     emit "    std/string: parse_int";
     emit "    std/list: get";
@@ -1926,25 +1933,26 @@ let generate_suite_run_all_harness test_files =
     Buffer.add_string buf line;
     Buffer.add_char buf '\n'
   in
-  emit_suite_harness_imports emit run_fn test_files;
+  emit_suite_harness_imports ~suite_type_support:true emit run_fn test_files;
   List.iteri
-    (fun i _file ->
+    (fun i file ->
       emit (Printf.sprintf "func __run_suite_%d() -> Bool:" i);
       emit
         (Printf.sprintf "    print(%s)"
            (blorp_string_literal
-              (Printf.sprintf "%s %d" suite_run_all_begin_marker i)));
-      emit (Printf.sprintf "    passed: Bool = %s(T%d.tests)" run_fn i);
+              (Printf.sprintf "%s %d %s" suite_run_all_begin_marker i file)));
+      emit (Printf.sprintf "    suite: TestSuite = T%d.tests" i);
+      emit (Printf.sprintf "    passed: Bool = %s(suite)" run_fn);
       emit "    if passed:";
       emit
         (Printf.sprintf "        print(%s)"
            (blorp_string_literal
-              (Printf.sprintf "%s %d PASS" suite_run_all_end_marker i)));
+              (Printf.sprintf "%s %d PASS %s" suite_run_all_end_marker i file)));
       emit "    else:";
       emit
         (Printf.sprintf "        print(%s)"
            (blorp_string_literal
-              (Printf.sprintf "%s %d FAIL" suite_run_all_end_marker i)));
+              (Printf.sprintf "%s %d FAIL %s" suite_run_all_end_marker i file)));
       emit "    passed";
       emit "";
       emit "")
@@ -2440,14 +2448,14 @@ let split_marker_fields line =
 
 let parse_suite_run_all_begin line =
   match split_marker_fields line with
-  | [ marker; raw_index ] when marker = suite_run_all_begin_marker ->
+  | marker :: raw_index :: _ when marker = suite_run_all_begin_marker ->
       int_of_string_opt raw_index
   | _ -> None
 
 let parse_suite_run_all_end line =
   match split_marker_fields line with
-  | [ marker; raw_index; raw_status ] when marker = suite_run_all_end_marker
-    -> (
+  | marker :: raw_index :: raw_status :: _
+    when marker = suite_run_all_end_marker -> (
       match (int_of_string_opt raw_index, raw_status) with
       | Some index, "PASS" -> Some (index, true)
       | Some index, "FAIL" -> Some (index, false)

@@ -20788,6 +20788,7 @@ typedef struct {
 } blorp_TaskScheduleTarget;
 
 #define BLORP_TASK_BATCH_FLUSH_INTERVAL 256L
+#define BLORP_FIBER_WAKE_HANDOFF_SPINS 1024
 
 typedef struct {
     blorp_Fiber** items;         // binary min-heap by wake_time_ns
@@ -21145,9 +21146,12 @@ static void* __blorp_worker(void* arg) {
                 blorp_fiber_object_recycle(fiber);
             } else if (__atomic_exchange_n(&fiber->wake_pending, 0, __ATOMIC_ACQ_REL)) {
                 // A waker found this fiber after it had marked itself parked
-                // but before it reached mco_yield. Enqueue now, from the worker
-                // that observed the coroutine actually suspend, instead of
-                // letting another thread race mco_resume against mco_yield.
+                // but before it reached mco_yield, or cancellation arrived just
+                // before the fiber entered a blocking park. Enqueue now, from
+                // the worker that observed the coroutine actually suspend,
+                // instead of letting another thread race mco_resume against
+                // mco_yield.
+                __atomic_store_n(&fiber->parked, 0, __ATOMIC_RELEASE);
                 blorp_fiber_enqueue_runnable(fiber);
             }
             // If fiber is parked (yielded), it's been placed in a wait queue
@@ -21751,9 +21755,10 @@ static void blorp_fiber_schedule(blorp_Fiber* f) {
         // worker clears running between our load and wake_pending store, it may
         // have already passed its pending-wake check. Wait briefly for that
         // handoff to settle; exactly one side claims wake_pending by exchange.
-        for (int i = 0; i < 1024; i++) {
+        for (int i = 0; i < BLORP_FIBER_WAKE_HANDOFF_SPINS; i++) {
             if (!__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
                 if (__atomic_exchange_n(&f->wake_pending, 0, __ATOMIC_ACQ_REL)) {
+                    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
                     blorp_fiber_enqueue_runnable(f);
                 }
                 return;
@@ -21763,6 +21768,58 @@ static void blorp_fiber_schedule(blorp_Fiber* f) {
         return;
     }
     blorp_fiber_enqueue_runnable(f);
+}
+
+static void blorp_fiber_enqueue_cancel_wake(blorp_Fiber* f) {
+    blorp_fiber_enqueue_runnable(f);
+    blorp_signal_fiber_workers(1);
+}
+
+static void blorp_fiber_request_cancel_wake(blorp_Fiber* f) {
+    if (!f) return;
+    int expected = 1;
+    if (__atomic_compare_exchange_n(
+            &f->parked, &expected, 0, 0,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        __blorp_scheduler_stat_inc(
+            &global_scheduler_stats.fiber_schedule_transitions);
+        if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&f->wake_pending, 1, __ATOMIC_RELEASE);
+            for (int i = 0; i < BLORP_FIBER_WAKE_HANDOFF_SPINS; i++) {
+                if (!__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
+                    if (__atomic_exchange_n(
+                            &f->wake_pending, 0, __ATOMIC_ACQ_REL)) {
+                        __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
+                        blorp_fiber_enqueue_cancel_wake(f);
+                    }
+                    return;
+                }
+                sched_yield();
+            }
+            return;
+        }
+        blorp_fiber_enqueue_cancel_wake(f);
+        return;
+    }
+
+    // Cancellation can arrive after a fiber checks the task flag but before it
+    // marks itself parked in a blocking operation. Leave a pending wake so the
+    // worker re-enqueues the fiber if that running task yields into the park.
+    if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&f->wake_pending, 1, __ATOMIC_RELEASE);
+        for (int i = 0; i < BLORP_FIBER_WAKE_HANDOFF_SPINS; i++) {
+            if (!__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
+                if (__atomic_exchange_n(&f->wake_pending, 0, __ATOMIC_ACQ_REL)) {
+                    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
+                    blorp_fiber_enqueue_cancel_wake(f);
+                }
+                return;
+            }
+            sched_yield();
+        }
+        return;
+    }
+    blorp_signal_fiber_workers(1);
 }
 
 // Park current fiber — yields back to scheduler.
@@ -22956,7 +23013,7 @@ void blorp_task_cancel(void* t) {
     pthread_mutex_lock(&task->mutex);
     blorp_Fiber* task_fiber = task->task_fiber;
     pthread_cond_broadcast(&task->done_cond);
-    if (task_fiber) blorp_fiber_schedule(task_fiber);
+    if (task_fiber) blorp_fiber_request_cancel_wake(task_fiber);
     pthread_mutex_unlock(&task->mutex);
 }
 
@@ -23145,9 +23202,12 @@ long blorp_test_cancel_after_parked(blorp_Closure* func) {
         pthread_mutex_lock(&task->mutex);
         bool completed = task->completed;
         blorp_Fiber* task_fiber = task->task_fiber;
+        // parked is set before mco_yield; wait until running is clear so this
+        // test hook cancels only after the fiber has actually yielded.
         bool parked =
             task_fiber &&
-            __atomic_load_n(&task_fiber->parked, __ATOMIC_ACQUIRE) != 0;
+            __atomic_load_n(&task_fiber->parked, __ATOMIC_ACQUIRE) != 0 &&
+            __atomic_load_n(&task_fiber->running, __ATOMIC_ACQUIRE) == 0;
         pthread_mutex_unlock(&task->mutex);
 
         if (parked) {
