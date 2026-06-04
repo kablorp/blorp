@@ -327,6 +327,21 @@ let with_temp_dir prefix f =
   Unix.mkdir dir 0o700;
   Fun.protect ~finally:(fun () -> remove_tree dir) (fun () -> f dir)
 
+let test_capture_process_uses_supplied_cwd_and_env () =
+  with_temp_dir "blorp-process-env-" (fun dir ->
+      let marker = Filename.concat dir "marker.txt" in
+      let code, _ =
+        Blorp.Test_runner.run_process_capture_timeout ~cwd:dir
+          ~env:[ ("TMPDIR", "isolated-tmp") ]
+          ~timeout:(Some 1) "/bin/sh"
+          [ "-c"; "printf '%s' \"$TMPDIR\" > marker.txt" ]
+      in
+      Alcotest.(check int) "process exit" 0 code;
+      Alcotest.(check bool)
+        "marker written under cwd" true (Sys.file_exists marker);
+      Alcotest.(check string)
+        "env propagated" "isolated-tmp" (read_whole_file marker))
+
 let test_collect_test_files_preserves_multi_root_order () =
   with_temp_dir "blorp-test-roots-" (fun dir ->
       let std_dir = Filename.concat dir "test_std" in
@@ -606,7 +621,67 @@ let test_suite_selector_harness_dispatches_by_index () =
     "has invalid selector fallback" true
     (contains_substring source "        _:\n            False")
 
-let test_suite_selector_harness_runs_each_suite_separately () =
+let test_suite_run_all_harness_calls_generated_functions () =
+  let source =
+    Blorp.Test_runner.generate_suite_run_all_harness
+      [ "tests/test_blorp/a.brp"; "tests/test_blorp/b.brp" ]
+  in
+  Alcotest.(check bool)
+    "imports test module 0" true
+    (contains_substring source "    ./tests/test_blorp/a as T0");
+  Alcotest.(check bool)
+    "imports test module 1" true
+    (contains_substring source "    ./tests/test_blorp/b as T1");
+  Alcotest.(check bool)
+    "wraps each suite with markers" true
+    (contains_substring source "__BLORP_SUITE_RUN_ALL_BEGIN__ 0"
+    && contains_substring source "__BLORP_SUITE_RUN_ALL_END__ 1 FAIL");
+  Alcotest.(check bool)
+    "calls run_suite directly" true
+    (contains_substring source "passed: Bool = run_suite(T0.tests)");
+  Alcotest.(check bool)
+    "calls generated suite functions" true
+    (contains_substring source "    if not __run_suite_0():"
+    && contains_substring source "    if not __run_suite_1():");
+  Alcotest.(check bool)
+    "does not parse selector arguments" false
+    (contains_substring source "match parse_int(selector):")
+
+let test_memory_suite_paths_require_filesystem_isolation () =
+  let cwd = Sys.getcwd () in
+  Alcotest.(check bool)
+    "memory directory is isolated" true
+    (Blorp.Test_runner.requires_filesystem_isolation
+       "tests/test_blorp/memory/test_memstats_observability.brp");
+  Alcotest.(check bool)
+    "absolute memory directory path is isolated" true
+    (Blorp.Test_runner.requires_filesystem_isolation
+       (Filename.concat cwd
+          "tests/test_blorp/memory/test_builtin_borrowed_arg_ownership.brp"));
+  Alcotest.(check bool)
+    "ordinary type suite is not filesystem isolated" false
+    (Blorp.Test_runner.requires_filesystem_isolation
+       "tests/test_blorp/types/test_bool.brp")
+
+let test_runtime_sensitive_suite_paths_require_process_isolation () =
+  Alcotest.(check bool)
+    "memory directory is process isolated" true
+    (Blorp.Test_runner.requires_process_isolation
+       "tests/test_blorp/memory/test_memstats_observability.brp");
+  Alcotest.(check bool)
+    "concurrency suites are process isolated" true
+    (Blorp.Test_runner.requires_process_isolation
+       "tests/test_blorp/concurrency/test_list_concurrent.brp");
+  Alcotest.(check bool)
+    "system resource suites are process isolated" true
+    (Blorp.Test_runner.requires_process_isolation
+       "tests/test_blorp/sys/test_file_resource.brp");
+  Alcotest.(check bool)
+    "ordinary type suite is not process isolated" false
+    (Blorp.Test_runner.requires_process_isolation
+       "tests/test_blorp/types/test_bool.brp")
+
+let test_suite_run_all_harness_runs_combined_without_result_cache () =
   with_temp_dir "blorp-suite-selector-" (fun dir ->
       let home = Filename.concat dir "home" in
       Unix.mkdir home 0o700;
@@ -651,9 +726,9 @@ tests: TestSuite = {
               let test_results_dir =
                 Filename.concat home ".cache/blorp/cas/test-results"
               in
-              Alcotest.(check int) "selector suite run" 0 code;
+              Alcotest.(check int) "combined suite run" 0 code;
               Alcotest.(check bool)
-                "selector skips per-file result cache" false
+                "run-all skips per-file result cache" false
                 (Sys.file_exists test_results_dir))))
 
 let test_suite_selector_compile_failure_is_hard_failure () =
@@ -773,6 +848,8 @@ let suite =
           test_capture_timeout_sends_sigterm_before_sigkill;
         Alcotest.test_case "capture_timeout_kills_descendants" `Quick
           test_capture_timeout_kills_descendant_processes;
+        Alcotest.test_case "capture_process_cwd_env" `Quick
+          test_capture_process_uses_supplied_cwd_and_env;
         Alcotest.test_case "inherited_timeout_does_not_block_waitpid" `Quick
           test_inherited_timeout_does_not_block_waitpid;
         Alcotest.test_case "inherited_timeout_kills_descendants" `Quick
@@ -812,8 +889,14 @@ let suite =
           test_collect_test_files_preserves_multi_root_order;
         Alcotest.test_case "dispatches_by_index" `Quick
           test_suite_selector_harness_dispatches_by_index;
-        Alcotest.test_case "runs_each_suite_separately" `Quick
-          test_suite_selector_harness_runs_each_suite_separately;
+        Alcotest.test_case "run_all_generated_functions" `Quick
+          test_suite_run_all_harness_calls_generated_functions;
+        Alcotest.test_case "memory_filesystem_isolation_policy" `Quick
+          test_memory_suite_paths_require_filesystem_isolation;
+        Alcotest.test_case "runtime_sensitive_process_isolation_policy" `Quick
+          test_runtime_sensitive_suite_paths_require_process_isolation;
+        Alcotest.test_case "run_all_skips_result_cache" `Quick
+          test_suite_run_all_harness_runs_combined_without_result_cache;
         Alcotest.test_case "compile_failure_is_hard_failure" `Quick
           test_suite_selector_compile_failure_is_hard_failure;
         Alcotest.test_case "uses_leak_check_runner" `Quick

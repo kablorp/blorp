@@ -24,6 +24,100 @@ fi
 cd "$script_dir/.."
 
 runner_label="scripts/test"
+script_start_seconds=$(date +%s)
+std_preflight_cache_version="blorp-std-preflight-v1"
+
+now_seconds() {
+    date +%s
+}
+
+elapsed_since() {
+    local start="$1"
+    local end
+    end=$(now_seconds)
+    echo $((end - start))
+}
+
+format_seconds() {
+    local seconds="$1"
+    if [ "$seconds" -lt 60 ]; then
+        printf "%ds" "$seconds"
+    else
+        printf "%dm%02ds" $((seconds / 60)) $((seconds % 60))
+    fi
+}
+
+hash_stream() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum
+    else
+        return 1
+    fi
+}
+
+hash_stdin_key() {
+    local output_file key
+    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_hash.XXXXXX") || return 1
+    if ! hash_stream > "$output_file"; then
+        rm -f "$output_file"
+        return 1
+    fi
+    key=$(awk '{print $1}' "$output_file")
+    rm -f "$output_file"
+    [ -n "$key" ] || return 1
+    printf '%s\n' "$key"
+}
+
+hash_file() {
+    local file="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file"
+    else
+        return 1
+    fi
+}
+
+hash_blorp_source_tree() {
+    local root="$1"
+    [ -d "$root" ] || return 0
+    while IFS= read -r file; do
+        hash_file "$file" || return 1
+    done < <(find "$root" -name '*.brp' -type f | LC_ALL=C sort)
+}
+
+std_preflight_cache_key() {
+    local input_file key
+    input_file=$(mktemp "${TMPDIR:-/tmp}/blorp_std_preflight_key.XXXXXX") || return 1
+    if ! {
+        printf '%s\n' "$std_preflight_cache_version" &&
+            printf 'BLORP_STD=%s\n' "${BLORP_STD:-}" &&
+            hash_file ./blorp &&
+            hash_blorp_source_tree std &&
+            { [ -z "${BLORP_STD:-}" ] || hash_blorp_source_tree "$BLORP_STD"; }
+    } > "$input_file"; then
+        rm -f "$input_file"
+        return 1
+    fi
+    key=$(hash_stdin_key < "$input_file") || {
+        rm -f "$input_file"
+        return 1
+    }
+    rm -f "$input_file"
+    printf '%s\n' "$key"
+}
+
+std_preflight_cache_file() {
+    local key="$1"
+    local repo_key cache_root
+    repo_key=$(printf '%s\n' "$(pwd -P)" | hash_stdin_key) || return 1
+    cache_root="${TMPDIR:-/tmp}/blorp-std-preflight-${repo_key}"
+    mkdir -p "$cache_root"
+    printf '%s/%s.ok\n' "$cache_root" "$key"
+}
 
 usage() {
     echo "Usage: $runner_label [options] [compiler-unit] [compiler] [runtime] [leak] [doctest] [cli]"
@@ -168,12 +262,16 @@ trap cleanup_gate_tmpdir EXIT
 # Ensure compiler is built. If the rebuild fails, stop here; continuing with a
 # stale ./blorp is worse than not running tests because it can hide strict
 # typecheck failures behind old compiler behavior.
+build_seconds=0
+build_start_seconds=$(now_seconds)
 if ! make --quiet 2>/dev/null; then
     if ! make; then
+        build_seconds=$(elapsed_since "$build_start_seconds")
         echo "Error: compiler build failed; aborting test run." >&2
         exit 1
     fi
 fi
+build_seconds=$(elapsed_since "$build_start_seconds")
 
 # ─── Result tracking (bash 3.2 compatible) ──────────────────────────
 # Each gate gets: _status, _passed, _failed, _tests, _failures (newline-separated list)
@@ -183,6 +281,14 @@ runtime_status="SKIP"; runtime_passed=0; runtime_failed=0; runtime_tests=0; runt
 leak_status="SKIP"; leak_passed=0; leak_failed=0; leak_tests=0; leak_failures=""
 doctest_status="SKIP"; doctest_passed=0; doctest_failed=0; doctest_tests=0; doctest_failures=""
 cli_status="SKIP"; cli_passed=0; cli_failed=0; cli_tests=0; cli_failures=""
+
+unit_seconds=0
+compiler_seconds=0
+runtime_seconds=0
+leak_seconds=0
+doctest_seconds=0
+cli_seconds=0
+std_preflight_seconds=0
 
 # ─── Parsers ────────────────────────────────────────────────────────
 
@@ -424,21 +530,43 @@ run_std_typecheck_preflight() {
     echo "═══ Std Typecheck Preflight ═══"
     echo ""
 
-    local checked output_file
+    local checked output_file start_seconds cache_key cache_file tmp_cache_file
+    start_seconds=$(now_seconds)
     checked=$(find std -name '*.brp' | wc -l | tr -d ' ')
+
+    if [ "${BLORP_TEST_PREFLIGHT_CACHE:-1}" != "0" ]; then
+        cache_key=$(std_preflight_cache_key || true)
+        if [ -n "$cache_key" ]; then
+            cache_file=$(std_preflight_cache_file "$cache_key")
+            if [ -f "$cache_file" ]; then
+                std_preflight_seconds=$(elapsed_since "$start_seconds")
+                echo "Std typecheck preflight cached ($checked modules, $(format_seconds "$std_preflight_seconds"))."
+                echo ""
+                return 0
+            fi
+        fi
+    fi
+
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_std_typecheck.XXXXXX") || exit 1
 
     if ! {
         ./blorp check --no-format std
     } > "$output_file" 2>&1; then
+        std_preflight_seconds=$(elapsed_since "$start_seconds")
         echo "FAIL: std typecheck preflight"
         sed -n '1,80p' "$output_file"
         rm -f "$output_file"
         return 1
     fi
 
+    std_preflight_seconds=$(elapsed_since "$start_seconds")
+    if [ -n "${cache_file:-}" ]; then
+        tmp_cache_file="${cache_file}.$$"
+        printf 'ok\nmodules=%s\n' "$checked" > "$tmp_cache_file"
+        mv "$tmp_cache_file" "$cache_file"
+    fi
     rm -f "$output_file"
-    echo "Std typecheck preflight passed ($checked modules)."
+    echo "Std typecheck preflight passed ($checked modules, $(format_seconds "$std_preflight_seconds"))."
     echo ""
     return 0
 }
@@ -461,7 +589,8 @@ fi
 run_unit() {
     echo "═══ Compiler Unit Tests (OCaml/Alcotest) ═══"
     echo ""
-    local output exit_code output_file
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_unit.XXXXXX") || exit 1
     if $coverage; then
         capture_stream "$output_file" make coverage
@@ -474,6 +603,7 @@ run_unit() {
     record_gate_log "compiler-unit" "$output_file"
     maybe_print_failure_excerpt "compiler-unit" "$output_file" "$exit_code"
     rm -f "$output_file"
+    unit_seconds=$(elapsed_since "$start_seconds")
     echo ""
     if [ $exit_code -eq 0 ]; then
         parse_unit "$output"
@@ -488,7 +618,8 @@ run_unit() {
 run_compiler() {
     echo "═══ Compiler Tests (should_pass/should_fail + codegen audit) ═══"
     echo ""
-    local output exit_code output_file
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler.XXXXXX") || exit 1
     if $verbose || [ -n "$log_dir" ]; then
         capture_stream "$output_file" tests/test_compiler/run_compiler_tests.sh --verbose
@@ -500,6 +631,7 @@ run_compiler() {
     record_gate_log "compiler" "$output_file"
     maybe_print_failure_excerpt "compiler" "$output_file" "$exit_code"
     rm -f "$output_file"
+    compiler_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_compiler "$output"
     return $exit_code
@@ -508,14 +640,16 @@ run_compiler() {
 run_runtime() {
     echo "═══ Runtime Tests (.brp) ═══"
     echo ""
-    local output exit_code output_file
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_runtime.XXXXXX") || exit 1
-    capture_stream "$output_file" env BLORP_GATE_RESULT=runtime ./blorp test --timeout "$test_timeout" "${runtime_roots[@]}"
+    capture_stream "$output_file" env BLORP_GATE_RESULT=runtime ./blorp test --no-format --timeout "$test_timeout" "${runtime_roots[@]}"
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "runtime" "$output_file"
     maybe_print_failure_excerpt "runtime" "$output_file" "$exit_code"
     rm -f "$output_file"
+    runtime_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_blorp_output "$output" "runtime"
     return $exit_code
@@ -524,14 +658,16 @@ run_runtime() {
 run_leak() {
     echo "═══ Leak-Check Baselines (.brp) ═══"
     echo ""
-    local output exit_code output_file
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_leak.XXXXXX") || exit 1
-    capture_stream "$output_file" env BLORP_GATE_RESULT=leak ./blorp test --leak-check --suite --timeout "$test_timeout" tests/test_blorp/memory/leak_check_baselines/
+    capture_stream "$output_file" env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$test_timeout" tests/test_blorp/memory/leak_check_baselines/
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "leak" "$output_file"
     maybe_print_failure_excerpt "leak" "$output_file" "$exit_code"
     rm -f "$output_file"
+    leak_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_blorp_output "$output" "leak"
     return $exit_code
@@ -540,14 +676,16 @@ run_leak() {
 run_doctest() {
     echo "═══ Doctests (std/) ═══"
     echo ""
-    local output exit_code output_file
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_doctest.XXXXXX") || exit 1
-    capture_stream "$output_file" env BLORP_GATE_RESULT=doctest ./blorp test --doc --timeout "$test_timeout" std/
+    capture_stream "$output_file" env BLORP_GATE_RESULT=doctest ./blorp test --no-format --doc --timeout "$test_timeout" std/
     exit_code=$?
     output=$(cat "$output_file")
     record_gate_log "doctest" "$output_file"
     maybe_print_failure_excerpt "doctest" "$output_file" "$exit_code"
     rm -f "$output_file"
+    doctest_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_blorp_output "$output" "doctest"
     return $exit_code
@@ -556,7 +694,8 @@ run_doctest() {
 run_cli() {
     echo "═══ CLI Smoke / Exit Codes ═══"
     echo ""
-    local output exit_code output_file
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_cli.XXXXXX") || exit 1
     capture_stream "$output_file" env BLORP_CLI_TEST_TIMEOUT="${BLORP_CLI_TEST_TIMEOUT:-$test_timeout}" tests/test_cli.sh
     exit_code=$?
@@ -564,6 +703,7 @@ run_cli() {
     record_gate_log "cli" "$output_file"
     maybe_print_failure_excerpt "cli" "$output_file" "$exit_code"
     rm -f "$output_file"
+    cli_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_cli "$output"
     return $exit_code
@@ -621,72 +761,91 @@ else
 
     for gate in "${parallel_gates[@]}"; do
         outfile="$gate_tmpdir/${gate}_output"
+        exitfile="$gate_tmpdir/${gate}_exit"
+        secondsfile="$gate_tmpdir/${gate}_seconds"
         case "$gate" in
             unit)
                 {
                     echo "═══ Compiler Unit Tests (OCaml/Alcotest) ═══"
                     echo ""
                 } > "$outfile"
-                if $coverage; then
-                    make coverage >> "$outfile" 2>&1 &
-                else
-                    (cd compiler && exec dune runtest --force) >> "$outfile" 2>&1 &
-                fi
                 ;;
             compiler)
                 {
                     echo "═══ Compiler Tests (should_pass/should_fail + codegen audit) ═══"
                     echo ""
                 } > "$outfile"
-                if $verbose || [ -n "$log_dir" ]; then
-                    tests/test_compiler/run_compiler_tests.sh --verbose >> "$outfile" 2>&1 &
-                else
-                    tests/test_compiler/run_compiler_tests.sh --quiet >> "$outfile" 2>&1 &
-                fi
                 ;;
             runtime)
                 {
                     echo "═══ Runtime Tests (.brp) ═══"
                     echo ""
                 } > "$outfile"
-                env BLORP_GATE_RESULT=runtime ./blorp test --timeout "$test_timeout" "${runtime_roots[@]}" >> "$outfile" 2>&1 &
                 ;;
             leak)
                 {
                     echo "═══ Leak-Check Baselines (.brp) ═══"
                     echo ""
                 } > "$outfile"
-                env BLORP_GATE_RESULT=leak ./blorp test --leak-check --suite --timeout "$test_timeout" tests/test_blorp/memory/leak_check_baselines/ >> "$outfile" 2>&1 &
                 ;;
             doctest)
                 {
                     echo "═══ Doctests (std/) ═══"
                     echo ""
                 } > "$outfile"
-                env BLORP_GATE_RESULT=doctest ./blorp test --doc --timeout "$test_timeout" std/ >> "$outfile" 2>&1 &
                 ;;
             cli)
                 {
                     echo "═══ CLI Smoke / Exit Codes ═══"
                     echo ""
                 } > "$outfile"
-                env BLORP_CLI_TEST_TIMEOUT="${BLORP_CLI_TEST_TIMEOUT:-$test_timeout}" tests/test_cli.sh >> "$outfile" 2>&1 &
                 ;;
         esac
+        {
+            gate_start_seconds=$(now_seconds)
+            case "$gate" in
+                unit)
+                    if $coverage; then
+                        make coverage >> "$outfile" 2>&1
+                    else
+                        (cd compiler && exec dune runtest --force) >> "$outfile" 2>&1
+                    fi
+                    ;;
+                compiler)
+                    if $verbose || [ -n "$log_dir" ]; then
+                        tests/test_compiler/run_compiler_tests.sh --verbose >> "$outfile" 2>&1
+                    else
+                        tests/test_compiler/run_compiler_tests.sh --quiet >> "$outfile" 2>&1
+                    fi
+                    ;;
+                runtime)
+                    env BLORP_GATE_RESULT=runtime ./blorp test --no-format --timeout "$test_timeout" "${runtime_roots[@]}" >> "$outfile" 2>&1
+                    ;;
+                leak)
+                    env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$test_timeout" tests/test_blorp/memory/leak_check_baselines/ >> "$outfile" 2>&1
+                    ;;
+                doctest)
+                    env BLORP_GATE_RESULT=doctest ./blorp test --no-format --doc --timeout "$test_timeout" std/ >> "$outfile" 2>&1
+                    ;;
+                cli)
+                    env BLORP_CLI_TEST_TIMEOUT="${BLORP_CLI_TEST_TIMEOUT:-$test_timeout}" tests/test_cli.sh >> "$outfile" 2>&1
+                    ;;
+            esac
+            gate_exit=$?
+            echo "$gate_exit" > "$exitfile"
+            elapsed_since "$gate_start_seconds" > "$secondsfile"
+            exit "$gate_exit"
+        } &
         gate_pids+=($!)
         gate_names+=("$gate")
         echo "RUN gate: $gate (pid $!)"
     done
 
-    # Wait for all gates to complete
-    for i in "${!gate_pids[@]}"; do
-        pid="${gate_pids[$i]}"
-        gate="${gate_names[$i]}"
-        if wait "$pid" 2>/dev/null; then
-            echo 0 > "$gate_tmpdir/${gate}_exit"
-        else
-            echo $? > "$gate_tmpdir/${gate}_exit"
-        fi
+    # Wait for all gates to complete. Gate worker subshells write their own
+    # exit and timing files at the actual finish time, so a slow earlier gate
+    # does not inflate timings for faster later gates.
+    for pid in "${gate_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
     done
     gate_pids=()
     gate_names=()
@@ -695,8 +854,12 @@ else
     for gate in "${parallel_gates[@]}"; do
         outfile="$gate_tmpdir/${gate}_output"
         exitfile="$gate_tmpdir/${gate}_exit"
+        secondsfile="$gate_tmpdir/${gate}_seconds"
         local_exit=1
+        local_seconds=0
         [ -f "$exitfile" ] && local_exit=$(cat "$exitfile")
+        [ -f "$secondsfile" ] && local_seconds=$(cat "$secondsfile")
+        eval "${gate}_seconds=\$local_seconds"
 
         if [ -f "$outfile" ]; then
             record_gate_log "$gate" "$outfile"
@@ -729,6 +892,7 @@ fi
 total_tests=0
 total_passed=0
 total_failed=0
+total_gate_seconds=0
 overall="PASS"
 
 for s in "${gates[@]}"; do
@@ -736,22 +900,27 @@ for s in "${gates[@]}"; do
     p=$(eval echo "\$${s}_passed")
     f=$(eval echo "\$${s}_failed")
     t=$(eval echo "\$${s}_tests")
+    sec=$(eval echo "\$${s}_seconds")
     total_passed=$((total_passed + p))
     total_failed=$((total_failed + f))
     total_tests=$((total_tests + t))
+    total_gate_seconds=$((total_gate_seconds + sec))
     if [ "$st" = "FAIL" ]; then
         overall="FAIL"
     fi
 done
 
-echo "════════════════════════════════════════════════"
-echo "  Gate          Status   Passed  Failed   Tests"
-echo "────────────────────────────────────────────────"
+total_wall_seconds=$(elapsed_since "$script_start_seconds")
+
+echo "══════════════════════════════════════════════════════════"
+echo "  Gate          Status   Passed  Failed   Tests     Time"
+echo "──────────────────────────────────────────────────────────"
 for s in "${gates[@]}"; do
     st=$(eval echo "\$${s}_status")
     p=$(eval echo "\$${s}_passed")
     f=$(eval echo "\$${s}_failed")
     t=$(eval echo "\$${s}_tests")
+    sec=$(eval echo "\$${s}_seconds")
     case "$s" in
         unit)     label="Compiler-unit" ;;
         compiler) label="Compiler" ;;
@@ -760,11 +929,12 @@ for s in "${gates[@]}"; do
         doctest)  label="Doctests" ;;
         cli)      label="CLI" ;;
     esac
-    printf "  %-13s %-6s %8d %7d %7d\n" "$label" "$st" "$p" "$f" "$t"
+    printf "  %-13s %-6s %8d %7d %7d %8s\n" "$label" "$st" "$p" "$f" "$t" "$(format_seconds "$sec")"
 done
-echo "────────────────────────────────────────────────"
-printf "  %-13s %-6s %8d %7d %7d\n" "Total" "$overall" "$total_passed" "$total_failed" "$total_tests"
-echo "════════════════════════════════════════════════"
+echo "──────────────────────────────────────────────────────────"
+printf "  %-13s %-6s %8d %7d %7d %8s\n" "Total" "$overall" "$total_passed" "$total_failed" "$total_tests" "$(format_seconds "$total_gate_seconds")"
+echo "══════════════════════════════════════════════════════════"
+echo "Setup: build $(format_seconds "$build_seconds"), std preflight $(format_seconds "$std_preflight_seconds"), wall $(format_seconds "$total_wall_seconds")."
 
 # List failing tests if any
 if [ "$overall" = "FAIL" ]; then

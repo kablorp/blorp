@@ -28,13 +28,17 @@ scripts/test --log-dir logs     # keep complete gate logs
 scripts/test --coverage         # compiler-unit coverage
 ```
 
-`scripts/test` is quiet by default. Successful runs print a gate summary;
-failures print focused excerpts and can save full logs with `--log-dir`.
+`scripts/test` is quiet by default. Successful runs print a gate summary with
+per-gate wall-clock time plus build/std-preflight setup time; failures print
+focused excerpts and can save full logs with `--log-dir`.
 
 Timeouts:
 
 - `BLORP_TEST_TIMEOUT` sets the default per-test timeout.
 - `BLORP_COMPILER_TEST_TIMEOUT` overrides only compiler-test invocations.
+- `BLORP_TEST_PREFLIGHT_CACHE=0` disables the content-addressed std preflight
+  cache. The default cache key includes `./blorp`, local `std/*.brp` contents,
+  and the `BLORP_STD` tree when an override is set.
 
 ## Premerge Gate
 

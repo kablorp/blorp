@@ -227,13 +227,15 @@ let run_compilation_dir () =
 
 (** Run a program directly (no shell), capture stdout+stderr via pipe.
     Returns (exit_code, output). *)
-let create_process_direct ?(new_session = false) ?(close_fds = []) prog argv
-    stdin_fd stdout_fd stderr_fd =
+let create_process_direct ?(new_session = false) ?(close_fds = []) ?cwd
+    ?(env = []) prog argv stdin_fd stdout_fd stderr_fd =
   match Unix.fork () with
   | 0 -> (
       (try if new_session then ignore (Unix.setsid ()) with _ -> ());
       List.iter close_noerr close_fds;
       try
+        Option.iter Unix.chdir cwd;
+        List.iter (fun (name, value) -> Unix.putenv name value) env;
         Unix.dup2 stdin_fd Unix.stdin;
         Unix.dup2 stdout_fd Unix.stdout;
         Unix.dup2 stderr_fd Unix.stderr;
@@ -257,12 +259,12 @@ let reap_child_if_needed pid status =
         status := Some st
       with Unix.Unix_error (Unix.ECHILD, _, _) -> ())
 
-let run_process_capture prog args =
+let run_process_capture ?cwd ?(env = []) prog args =
   let read_fd, write_fd = Unix.pipe () in
   let argv = Array.of_list (prog :: args) in
   let pid =
-    create_process_direct ~close_fds:[ read_fd ] prog argv Unix.stdin write_fd
-      write_fd
+    create_process_direct ~close_fds:[ read_fd ] ?cwd ~env prog argv Unix.stdin
+      write_fd write_fd
   in
   Unix.close write_fd;
   let output = read_all_fd read_fd in
@@ -272,15 +274,15 @@ let run_process_capture prog args =
 
 (** Run a program directly with timeout, capture output.
     Returns (exit_code, output). exit_code 124 = timed out. *)
-let run_process_capture_timeout ~timeout prog args =
+let run_process_capture_timeout ?cwd ?(env = []) ~timeout prog args =
   match timeout with
-  | None | Some 0 -> run_process_capture prog args
+  | None | Some 0 -> run_process_capture ?cwd ~env prog args
   | Some seconds ->
       let read_fd, write_fd = Unix.pipe () in
       let argv = Array.of_list (prog :: args) in
       let pid =
-        create_process_direct ~new_session:true ~close_fds:[ read_fd ] prog argv
-          Unix.stdin write_fd write_fd
+        create_process_direct ~new_session:true ~close_fds:[ read_fd ] ?cwd ~env
+          prog argv Unix.stdin write_fd write_fd
       in
       Unix.close write_fd;
       let timed_out = ref false in
@@ -866,6 +868,44 @@ type test_result = {
 
 (** Test mode for --doc / --suite filtering *)
 type test_mode = TestAll | DocOnly | SuiteOnly
+
+let suite_run_all_begin_marker = "__BLORP_SUITE_RUN_ALL_BEGIN__"
+let suite_run_all_end_marker = "__BLORP_SUITE_RUN_ALL_END__"
+
+let normalized_relative_test_path filename =
+  let cwd_prefix = Sys.getcwd () ^ Filename.dir_sep in
+  if starts_with filename cwd_prefix then
+    String.sub filename (String.length cwd_prefix)
+      (String.length filename - String.length cwd_prefix)
+  else if starts_with filename ("." ^ Filename.dir_sep) then
+    String.sub filename 2 (String.length filename - 2)
+  else filename
+
+let path_under root path =
+  path = root || starts_with path (root ^ Filename.dir_sep)
+
+let process_isolated_suite_roots =
+  [
+    "tests/test_blorp/concurrency";
+    "tests/test_blorp/memory";
+    "tests/test_blorp/sys";
+  ]
+
+let filesystem_isolated_suite_roots = [ "tests/test_blorp/memory" ]
+
+let requires_process_isolation filename =
+  let path = normalized_relative_test_path filename in
+  List.exists (fun root -> path_under root path) process_isolated_suite_roots
+
+let requires_filesystem_isolation filename =
+  let path = normalized_relative_test_path filename in
+  List.exists (fun root -> path_under root path) filesystem_isolated_suite_roots
+
+let isolated_test_environment cwd = [ ("TMPDIR", cwd) ]
+
+let isolated_test_cwd filename =
+  run_artifact_dir ~kind:"isolated-filesystems"
+    ~prefix:(Filename.basename (Filename.remove_extension filename))
 
 type doctest_group = {
   dtg_func_name : string;
@@ -1812,6 +1852,24 @@ let module_path_for_import filename =
   then "." ^ Filename.dir_sep ^ relative
   else relative
 
+let blorp_string_literal value = Printf.sprintf "%S" value
+
+let emit_suite_harness_imports ?(selector_support = false) emit run_fn
+    test_files =
+  emit "import:";
+  emit (Printf.sprintf "    std/test: %s" run_fn);
+  if selector_support then begin
+    emit "    std/string: parse_int";
+    emit "    std/list: get";
+    emit "    std/option: Option(Some, None)"
+  end;
+  List.iteri
+    (fun i file ->
+      emit (Printf.sprintf "    %s as T%d" (module_path_for_import file) i))
+    test_files;
+  emit "";
+  emit ""
+
 (** Generate a selector harness that compiles multiple TestSuite modules once
     while still running exactly one suite per process. *)
 let generate_suite_selector_harness ?(leak_check = false) test_files =
@@ -1821,17 +1879,7 @@ let generate_suite_selector_harness ?(leak_check = false) test_files =
     Buffer.add_string buf line;
     Buffer.add_char buf '\n'
   in
-  emit "import:";
-  emit (Printf.sprintf "    std/test: %s" run_fn);
-  emit "    std/string: parse_int";
-  emit "    std/list: get";
-  emit "    std/option: Option(Some, None)";
-  List.iteri
-    (fun i file ->
-      emit (Printf.sprintf "    %s as T%d" (module_path_for_import file) i))
-    test_files;
-  emit "";
-  emit "";
+  emit_suite_harness_imports ~selector_support:true emit run_fn test_files;
   emit "func __run_selected(index: Int) -> Bool:";
   emit "    match index:";
   List.iteri
@@ -1856,6 +1904,56 @@ let generate_suite_selector_harness ?(leak_check = false) test_files =
   emit "                    2";
   emit "        None:";
   emit "            2";
+  Buffer.contents buf
+
+(** Generate a harness that compiles multiple TestSuite modules once and runs
+    ordinary suites inside one process. Process-sensitive suites are kept out
+    by [suite_run_all_eligible]; this generator only builds the fast path. *)
+let generate_suite_run_all_harness test_files =
+  let run_fn = "run_suite" in
+  let buf = Buffer.create 4096 in
+  let emit line =
+    Buffer.add_string buf line;
+    Buffer.add_char buf '\n'
+  in
+  emit_suite_harness_imports emit run_fn test_files;
+  List.iteri
+    (fun i _file ->
+      emit (Printf.sprintf "func __run_suite_%d() -> Bool:" i);
+      emit
+        (Printf.sprintf "    print(%s)"
+           (blorp_string_literal
+              (Printf.sprintf "%s %d" suite_run_all_begin_marker i)));
+      emit (Printf.sprintf "    passed: Bool = %s(T%d.tests)" run_fn i);
+      emit "    if passed:";
+      emit
+        (Printf.sprintf "        print(%s)"
+           (blorp_string_literal
+              (Printf.sprintf "%s %d PASS" suite_run_all_end_marker i)));
+      emit "    else:";
+      emit
+        (Printf.sprintf "        print(%s)"
+           (blorp_string_literal
+              (Printf.sprintf "%s %d FAIL" suite_run_all_end_marker i)));
+      emit "    passed";
+      emit "";
+      emit "")
+    test_files;
+  emit "func __run_all_suites() -> Bool:";
+  emit "    var passed: Bool = True";
+  List.iteri
+    (fun i _file ->
+      emit (Printf.sprintf "    if not __run_suite_%d():" i);
+      emit "        passed = False")
+    test_files;
+  emit "    passed";
+  emit "";
+  emit "";
+  emit "func main(args: List[String]) -> Int:";
+  emit "    if __run_all_suites():";
+  emit "        0";
+  emit "    else:";
+  emit "        1";
   Buffer.contents buf
 
 (* ============================================================================
@@ -1948,7 +2046,8 @@ let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
   @ Ffi_boundary.link_flags_cc_args link_flags
 
 let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
-    ?(leak_check = false) ?loc_remap ?module_base_dir ~timeout filename =
+    ?(leak_check = false) ?(isolate_filesystem = false) ?(cache_result = true)
+    ?loc_remap ?module_base_dir ~timeout filename =
   let start_time = get_time () in
   let make_result ?(output = "") ?(error_detail = "") passed =
     {
@@ -2055,8 +2154,17 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
               in
               make_result ~error_detail:detail false
             else begin
+              let cwd =
+                if isolate_filesystem then Some (isolated_test_cwd filename)
+                else None
+              in
+              let env =
+                match cwd with
+                | Some dir -> isolated_test_environment dir
+                | None -> []
+              in
               let result, output =
-                run_process_capture_timeout ~timeout bin_file []
+                run_process_capture_timeout ?cwd ~env ~timeout bin_file []
               in
               if result = 0 then make_result ~output true
               else if result = 99 then
@@ -2080,7 +2188,8 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
       in
       (* Save result to cache — modules are still loaded from Pipeline.compile *)
       (match loc_remap with
-      | None -> save_test_cache filename result
+      | None when cache_result -> save_test_cache filename result
+      | None -> ()
       | Some _ -> ());
       result
 
@@ -2173,16 +2282,20 @@ let print_test_result ?(profile = false) ?(leak_check = false) r =
 
 (** Run a suite test, checking cache first *)
 let run_suite_test_cached ?(debug = false) ?(sanitize = false) ?precompiled
-    ?(leak_check = false) ~timeout filename =
-  match check_test_cache filename with
+    ?(leak_check = false) ?(isolate_filesystem = false) ~timeout filename =
+  match if isolate_filesystem then None else check_test_cache filename with
   | Some cached -> cached
   | None ->
-      run_test_result ~debug ~sanitize ?precompiled ~leak_check ~timeout
+      run_test_result ~debug ~sanitize ?precompiled ~leak_check
+        ~isolate_filesystem ~cache_result:(not isolate_filesystem) ~timeout
         filename
 
 (** Run a single test file with mode dispatch *)
 let run_test_with_mode ?(debug = false) ?(sanitize = false) ?precompiled
     ?(leak_check = false) ?(mode = TestAll) ~timeout filename =
+  let isolate_filesystem =
+    leak_check || requires_filesystem_isolation filename
+  in
   let is_suite_file =
     is_testsuite_file filename
     || has_top_level_main_source (try read_file filename with _ -> "")
@@ -2196,7 +2309,7 @@ let run_test_with_mode ?(debug = false) ?(sanitize = false) ?precompiled
       if is_suite_file then
         [
           run_suite_test_cached ~debug ~sanitize ?precompiled ~leak_check
-            ~timeout filename;
+            ~isolate_filesystem ~timeout filename;
         ]
       else []
   | TestAll ->
@@ -2204,7 +2317,7 @@ let run_test_with_mode ?(debug = false) ?(sanitize = false) ?precompiled
         if is_suite_file then
           [
             run_suite_test_cached ~debug ~sanitize ?precompiled ~leak_check
-              ~timeout filename;
+              ~isolate_filesystem ~timeout filename;
           ]
         else []
       in
@@ -2220,9 +2333,8 @@ let print_test_start ?worker file =
   | Some id -> Printf.eprintf "RUN[%d]: %s\n%!" id file
   | None -> Printf.eprintf "RUN: %s\n%!" file
 
-let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
-    ?precompiled ?(leak_check = false) files =
-  let source = generate_suite_selector_harness ~leak_check files in
+let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
+    ?precompiled ~harness_label ~filename_base source =
   (match Sys.getenv_opt "BLORP_DUMP_WRAPPED" with
   | Some path ->
       let oc = open_out path in
@@ -2233,14 +2345,14 @@ let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
   Lexer.reset_state ();
   let cwd = Sys.getcwd () in
   init_module_paths cwd;
-  let filename = Filename.concat cwd "__suite_selector_harness__.brp" in
+  let filename = Filename.concat cwd filename_base in
   let embed_runtime = Option.is_none precompiled in
   match
     Pipeline.compile ~debug ~allow_debug_only_calls:true
       ~retain_debug_blocks:true ~embed_runtime ~filename ~source ()
   with
   | Error errors ->
-      Error (format_pipeline_errors ~file:"<suite-selector-harness>" errors)
+      Error (format_pipeline_errors ~file:("<" ^ harness_label ^ ">") errors)
   | Ok (Pipeline.Stopped_at _) -> assert false
   | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
       (match Sys.getenv_opt "BLORP_DUMP_C" with
@@ -2267,13 +2379,31 @@ let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
         in
         Error detail
 
-let run_suite_selector_case ~timeout ~bin_file ~file ~index =
+let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
+    ?precompiled ?(leak_check = false) files =
+  compile_suite_harness_source ~debug ~sanitize ?precompiled
+    ~harness_label:"suite-selector-harness"
+    ~filename_base:"__suite_selector_harness__.brp"
+    (generate_suite_selector_harness ~leak_check files)
+
+let compile_suite_run_all_harness ?(debug = false) ?(sanitize = false)
+    ?precompiled files =
+  compile_suite_harness_source ~debug ~sanitize ?precompiled
+    ~harness_label:"suite-run-all-harness"
+    ~filename_base:"__suite_run_all_harness__.brp"
+    (generate_suite_run_all_harness files)
+
+let run_suite_selector_case ~cwd ~timeout ~bin_file ~file ~index =
   let start_time = get_time () in
   let make_result ?(output = "") ?(error_detail = "") passed =
     { file; passed; duration = get_time () -. start_time; output; error_detail }
   in
+  let env =
+    match cwd with Some dir -> isolated_test_environment dir | None -> []
+  in
   let result, output =
-    run_process_capture_timeout ~timeout bin_file [ string_of_int index ]
+    run_process_capture_timeout ?cwd ~env ~timeout bin_file
+      [ string_of_int index ]
   in
   if result = 0 then make_result ~output true
   else if result = 99 then
@@ -2291,6 +2421,115 @@ let run_suite_selector_case ~timeout ~bin_file ~file ~index =
       else Printf.sprintf "(exit code %d)\n  %s" result (String.trim output)
     in
     make_result ~output ~error_detail:detail false
+
+let int_of_string_opt value = try Some (int_of_string value) with _ -> None
+
+let split_marker_fields line =
+  line |> String.split_on_char ' '
+  |> List.filter (fun part -> String.trim part <> "")
+
+let parse_suite_run_all_begin line =
+  match split_marker_fields line with
+  | [ marker; raw_index ] when marker = suite_run_all_begin_marker ->
+      int_of_string_opt raw_index
+  | _ -> None
+
+let parse_suite_run_all_end line =
+  match split_marker_fields line with
+  | [ marker; raw_index; raw_status ] when marker = suite_run_all_end_marker
+    -> (
+      match (int_of_string_opt raw_index, raw_status) with
+      | Some index, "PASS" -> Some (index, true)
+      | Some index, "FAIL" -> Some (index, false)
+      | _ -> None)
+  | _ -> None
+
+let suite_run_all_results_from_output ~elapsed files output =
+  let file_array = Array.of_list files in
+  let expected_count = Array.length file_array in
+  let results_by_index = Hashtbl.create expected_count in
+  let current = ref None in
+  let invalid = ref false in
+  let valid_index index = index >= 0 && index < expected_count in
+  let append_output buffer line =
+    Buffer.add_string buffer line;
+    Buffer.add_char buffer '\n'
+  in
+  let finish_suite index passed buffer =
+    if (not (valid_index index)) || Hashtbl.mem results_by_index index then
+      invalid := true
+    else
+      Hashtbl.add results_by_index index
+        {
+          file = file_array.(index);
+          passed;
+          duration = elapsed;
+          output = Buffer.contents buffer;
+          error_detail = (if passed then "" else "(suite failed)");
+        }
+  in
+  output |> String.split_on_char '\n'
+  |> List.iter (fun line ->
+      if not !invalid then
+        match
+          (parse_suite_run_all_begin line, parse_suite_run_all_end line)
+        with
+        | Some index, _ ->
+            if Option.is_some !current || not (valid_index index) then
+              invalid := true
+            else current := Some (index, Buffer.create 1024)
+        | _, Some (index, passed) -> (
+            match !current with
+            | Some (current_index, buffer) when current_index = index ->
+                finish_suite index passed buffer;
+                current := None
+            | _ -> invalid := true)
+        | None, None -> (
+            match !current with
+            | Some (_, buffer) -> append_output buffer line
+            | None -> ()));
+  (match !current with Some _ -> invalid := true | None -> ());
+  if !invalid || Hashtbl.length results_by_index <> expected_count then None
+  else
+    Some
+      (List.init expected_count (fun index ->
+           Hashtbl.find results_by_index index))
+
+let run_suite_run_all_case ~timeout ~bin_file ~files =
+  let start_time = get_time () in
+  let make_harness_result ?(output = "") ?(error_detail = "") passed =
+    [
+      {
+        file = "combined TestSuite run-all harness";
+        passed;
+        duration = get_time () -. start_time;
+        output;
+        error_detail;
+      };
+    ]
+  in
+  let result, output = run_process_capture_timeout ~timeout bin_file [] in
+  let elapsed = get_time () -. start_time in
+  match result with
+  | 0 | 1 -> (
+      match suite_run_all_results_from_output ~elapsed files output with
+      | Some results -> results
+      | None ->
+          make_harness_result ~output
+            ~error_detail:"(test harness run-all output was incomplete)" false)
+  | 99 ->
+      make_harness_result ~output ~error_detail:"(leak detected at exit)" false
+  | 124 ->
+      let secs = match timeout with Some s -> s | None -> 0 in
+      make_harness_result ~output
+        ~error_detail:(Printf.sprintf "(timed out after %ds)" secs)
+        false
+  | code ->
+      let detail =
+        if String.trim output = "" then Printf.sprintf "(exit code %d)" code
+        else Printf.sprintf "(exit code %d)\n  %s" code (String.trim output)
+      in
+      make_harness_result ~output ~error_detail:detail false
 
 let importable_test_module filename =
   Filename.is_relative filename
@@ -2310,6 +2549,30 @@ let suite_selector_eligible mode filename =
       && is_testsuite_file filename
       && (not (has_doctests filename))
       && not (has_top_level_main_source (try read_file filename with _ -> ""))
+
+let suite_run_all_eligible ~leak_check mode filename =
+  (not leak_check)
+  && suite_selector_eligible mode filename
+  && not (requires_process_isolation filename)
+
+let run_all_suite_batch_size = 64
+
+let chunk_by_count size items =
+  let rec take remaining count taken =
+    if count = 0 then (List.rev taken, remaining)
+    else
+      match remaining with
+      | [] -> (List.rev taken, [])
+      | item :: rest -> take rest (count - 1) (item :: taken)
+  in
+  let rec loop remaining chunks =
+    match remaining with
+    | [] -> List.rev chunks
+    | _ ->
+        let chunk, rest = take remaining size [] in
+        loop rest (chunk :: chunks)
+  in
+  loop items []
 
 (* ============================================================================
    Parallel Execution
@@ -2473,64 +2736,121 @@ let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
 let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
     ?(sanitize = false) ?precompiled ?(leak_check = false) ?(mode = TestAll)
     ~timeout files =
-  let eligible = List.filter (suite_selector_eligible mode) files in
-  if List.length eligible < 2 then None
+  let run_all_files =
+    List.filter (suite_run_all_eligible ~leak_check mode) files
+  in
+  let selector_files =
+    List.filter
+      (fun file ->
+        suite_selector_eligible mode file && not (List.mem file run_all_files))
+      files
+  in
+  if List.length run_all_files < 2 && List.length selector_files < 2 then None
   else begin
     let start_time = get_time () in
-    (* The selector path compiles all eligible suites together. Per-file result
-       caching is counterproductive here: after a combined compile, saving one
-       result per suite hashes the same loaded module graph repeatedly. *)
-    let harness_files = eligible in
-    match
-      compile_suite_selector_harness ~debug ~sanitize ?precompiled ~leak_check
-        harness_files
-    with
-    | Error detail ->
-        Printf.eprintf "Combined test compile failed:\n%s\n%!" detail;
-        Some 1
-    | Ok bin_file ->
-        let harness_index = Hashtbl.create (List.length harness_files) in
-        List.iteri
-          (fun i file -> Hashtbl.replace harness_index file i)
-          harness_files;
-        let all_results = ref [] in
-        let run_and_record results =
-          List.iter
-            (fun r ->
-              print_test_result ~profile ~leak_check r;
-              all_results := r :: !all_results)
-            results
-        in
-        let run_one_file file =
-          print_test_start file;
-          match Hashtbl.find_opt harness_index file with
-          | Some index ->
-              let result =
-                run_suite_selector_case ~timeout ~bin_file ~file ~index
-              in
-              run_and_record [ result ]
-          | None ->
-              run_and_record
-                (run_test_with_mode ~debug ~sanitize ?precompiled ~leak_check
-                   ~mode ~timeout file)
-        in
-        let result =
-          Fun.protect
-            ~finally:(fun () -> try Sys.remove bin_file with _ -> ())
-            (fun () ->
-              List.iter run_one_file files;
-              let results = List.rev !all_results in
-              let elapsed = get_time () -. start_time in
-              let passed =
-                List.length (List.filter (fun r -> r.passed) results)
-              in
-              let failed =
-                List.length (List.filter (fun r -> not r.passed) results)
-              in
-              print_results_summary ~profile elapsed passed failed results;
-              if failed > 0 then 1 else 0)
-        in
-        Some result
+    (* Combined harnesses deliberately skip per-file result caching. After one
+       combined compile, saving one cache entry per suite hashes the same loaded
+       module graph repeatedly and can hide memory-focused regressions. *)
+    let result_by_file = Hashtbl.create (List.length files) in
+    let handled_files = Hashtbl.create (List.length files) in
+    let extra_results = ref [] in
+    let mark_handled files =
+      List.iter (fun file -> Hashtbl.replace handled_files file ()) files
+    in
+    let record_result result =
+      if List.mem result.file files then
+        Hashtbl.replace result_by_file result.file result
+      else extra_results := result :: !extra_results
+    in
+    let record_results results = List.iter record_result results in
+    let record_harness_failure file detail =
+      record_result
+        {
+          file;
+          passed = false;
+          duration = get_time () -. start_time;
+          output = "";
+          error_detail = detail;
+        }
+    in
+    let run_all_combined () =
+      run_all_files
+      |> chunk_by_count run_all_suite_batch_size
+      |> List.iter (fun batch ->
+          if List.length batch >= 2 then begin
+            mark_handled batch;
+            match
+              compile_suite_run_all_harness ~debug ~sanitize ?precompiled batch
+            with
+            | Error detail ->
+                Printf.eprintf "Combined run-all test compile failed:\n%s\n%!"
+                  detail;
+                record_harness_failure "combined TestSuite run-all compile"
+                  ("(compile failed)\n  " ^ detail)
+            | Ok bin_file ->
+                Fun.protect
+                  ~finally:(fun () -> try Sys.remove bin_file with _ -> ())
+                  (fun () ->
+                    record_results
+                      (run_suite_run_all_case ~timeout ~bin_file ~files:batch))
+          end)
+    in
+    let run_selector_combined () =
+      if List.length selector_files < 2 then ()
+      else begin
+        mark_handled selector_files;
+        match
+          compile_suite_selector_harness ~debug ~sanitize ?precompiled
+            ~leak_check selector_files
+        with
+        | Error detail ->
+            Printf.eprintf "Combined isolated test compile failed:\n%s\n%!"
+              detail;
+            record_harness_failure "combined isolated TestSuite compile"
+              ("(compile failed)\n  " ^ detail)
+        | Ok bin_file ->
+            Fun.protect
+              ~finally:(fun () -> try Sys.remove bin_file with _ -> ())
+              (fun () ->
+                List.iteri
+                  (fun index file ->
+                    let cwd =
+                      if leak_check || requires_filesystem_isolation file then
+                        Some (isolated_test_cwd file)
+                      else None
+                    in
+                    record_result
+                      (run_suite_selector_case ~cwd ~timeout ~bin_file ~file
+                         ~index))
+                  selector_files)
+      end
+    in
+    run_all_combined ();
+    run_selector_combined ();
+    List.iter
+      (fun file ->
+        if
+          (not (Hashtbl.mem handled_files file))
+          && not (Hashtbl.mem result_by_file file)
+        then
+          record_results
+            (run_test_with_mode ~debug ~sanitize ?precompiled ~leak_check ~mode
+               ~timeout file))
+      files;
+    let ordered_results =
+      List.filter_map (fun file -> Hashtbl.find_opt result_by_file file) files
+      @ List.rev !extra_results
+    in
+    List.iter (print_test_result ~profile ~leak_check) ordered_results;
+    let elapsed = get_time () -. start_time in
+    let passed =
+      List.length (List.filter (fun r -> r.passed) ordered_results)
+    in
+    let failed =
+      List.length (List.filter (fun r -> not r.passed) ordered_results)
+    in
+    print_results_summary ~profile elapsed passed failed ordered_results;
+    Some (if failed > 0 then 1 else 0)
   end
 
 let run_tests_sequential ?(profile = false) ?(debug = false) ?(sanitize = false)

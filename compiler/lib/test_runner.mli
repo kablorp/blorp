@@ -55,7 +55,12 @@ val run_process_timeout : timeout:int option -> string -> string list -> int
     Returns exit code (124 = timed out). For interactive use (blorp run). *)
 
 val run_process_capture_timeout :
-  timeout:int option -> string -> string list -> int * string
+  ?cwd:string ->
+  ?env:(string * string) list ->
+  timeout:int option ->
+  string ->
+  string list ->
+  int * string
 (** Run a program directly with timeout, capturing stdout+stderr.
     Returns exit code 124 on timeout. *)
 
@@ -156,6 +161,17 @@ val generate_doctest_program_with_map :
 val generate_suite_selector_harness : ?leak_check:bool -> string list -> string
 (** Generate a multi-suite harness that imports each test file once and
     dispatches one selected suite per process via argv[0]. Exposed for tests. *)
+
+val generate_suite_run_all_harness : string list -> string
+(** Generate a multi-suite harness that imports each test file once and runs
+    ordinary suites through generated suite functions. Exposed for tests. *)
+
+val requires_filesystem_isolation : string -> bool
+(** True when a test path is configured for isolated process filesystem state. *)
+
+val requires_process_isolation : string -> bool
+(** True when a test path is configured to stay out of aggregate run-all
+    harnesses because it exercises process-global runtime state. *)
 
 val raylib_linker_flags : unit -> string
 (** Platform-specific linker flags for raylib *)
