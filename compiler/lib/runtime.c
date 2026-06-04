@@ -8027,6 +8027,12 @@ typedef struct {
     blorp_String* detail;
 } blorp_DirectoryEntryResult;
 
+typedef struct {
+    blorp_List* value;
+    blorp_FileErrorKind error_kind;
+    blorp_String* detail;
+} blorp_DirectoryEntryListResult;
+
 typedef enum {
     BLORP_TCP_ERROR_NONE = 0,
     BLORP_TCP_ERROR_INVALID_INPUT = 1,
@@ -26682,6 +26688,7 @@ static blorp_FallibleStreamError blorp_fallible_stream_udp_error(
 );
 static blorp_DirectoryReadStatus blorp_dir_read_next_entry(
     blorp_Directory* dir,
+    const char* operation,
     blorp_DirectoryEntry** out,
     blorp_FileErrorKind* error_kind,
     blorp_String** error_detail
@@ -28429,7 +28436,13 @@ static blorp_FallibleStreamPullStatus fallible_directory_entries_pull(
     blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
     blorp_String* error_detail = NULL;
     blorp_DirectoryReadStatus status =
-        blorp_dir_read_next_entry(st->dir, &entry, &error_kind, &error_detail);
+        blorp_dir_read_next_entry(
+            st->dir,
+            "entries",
+            &entry,
+            &error_kind,
+            &error_detail
+        );
     switch (status) {
         case BLORP_DIRECTORY_READ_ITEM:
             *out = entry;
@@ -32501,6 +32514,27 @@ static blorp_DirectoryEntryResult blorp_dir_entry_error(
     };
 }
 
+static blorp_DirectoryEntryListResult blorp_dir_entry_list_ok(
+    blorp_List* value
+) {
+    return (blorp_DirectoryEntryListResult){
+        .value = value,
+        .error_kind = BLORP_FILE_ERROR_NONE,
+        .detail = NULL
+    };
+}
+
+static blorp_DirectoryEntryListResult blorp_dir_entry_list_error(
+    blorp_FileErrorKind kind,
+    blorp_String* detail
+) {
+    return (blorp_DirectoryEntryListResult){
+        .value = NULL,
+        .error_kind = kind,
+        .detail = detail
+    };
+}
+
 static blorp_String* blorp_file_open_errno_detail(
     const blorp_String* path,
     blorp_FileErrorKind kind,
@@ -33142,6 +33176,7 @@ static long blorp_directory_entry_kind_from_dirent(
 
 static blorp_DirectoryReadStatus blorp_dir_read_next_entry(
     blorp_Directory* dir,
+    const char* operation,
     blorp_DirectoryEntry** out,
     blorp_FileErrorKind* error_kind,
     blorp_String** error_detail
@@ -33152,7 +33187,15 @@ static blorp_DirectoryReadStatus blorp_dir_read_next_entry(
     if (!dir || !dir->dir) {
         if (error_kind) *error_kind = BLORP_FILE_ERROR_INVALID_INPUT;
         if (error_detail) {
-            *error_detail = blorp_string_literal("read_entry: closed directory handle");
+            *error_detail = blorp_string_from_buf(
+                operation,
+                (long)strlen(operation)
+            );
+            blorp_String* suffix =
+                blorp_string_literal(": closed directory handle");
+            blorp_String* detail = blorp_string_concat(*error_detail, suffix);
+            blorp_release(*error_detail);
+            *error_detail = detail;
         }
         return BLORP_DIRECTORY_READ_ERROR;
     }
@@ -33168,7 +33211,7 @@ static blorp_DirectoryReadStatus blorp_dir_read_next_entry(
             }
             if (error_detail) {
                 *error_detail =
-                    blorp_file_operation_errno_detail("read_entry", errnum);
+                    blorp_file_operation_errno_detail(operation, errnum);
             }
             return BLORP_DIRECTORY_READ_ERROR;
         }
@@ -33193,7 +33236,13 @@ blorp_DirectoryEntryResult blorp_dir_read_entry_raw(
     blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
     blorp_String* error_detail = NULL;
     blorp_DirectoryReadStatus status =
-        blorp_dir_read_next_entry(dir, &entry, &error_kind, &error_detail);
+        blorp_dir_read_next_entry(
+            dir,
+            "read_entry",
+            &entry,
+            &error_kind,
+            &error_detail
+        );
     switch (status) {
         case BLORP_DIRECTORY_READ_ITEM:
             return blorp_dir_entry_ok(entry);
@@ -33203,6 +33252,49 @@ blorp_DirectoryEntryResult blorp_dir_read_entry_raw(
         default:
             return blorp_dir_entry_error(error_kind, error_detail);
     }
+}
+
+blorp_DirectoryEntryListResult blorp_dir_read_next_entries_raw(
+    blorp_Directory* dir,
+    long max_entries
+) {
+    if (max_entries <= 0) {
+        return blorp_dir_entry_list_error(
+            BLORP_FILE_ERROR_INVALID_INPUT,
+            blorp_string_literal("read_next_entries: max_entries must be positive")
+        );
+    }
+
+    blorp_List* entries = blorp_list_new(max_entries);
+    blorp_list_init_elem_release(entries, blorp_elem_release_fn);
+
+    while (entries->len < max_entries) {
+        blorp_DirectoryEntry* entry = NULL;
+        blorp_FileErrorKind error_kind = BLORP_FILE_ERROR_NONE;
+        blorp_String* error_detail = NULL;
+        blorp_DirectoryReadStatus status =
+            blorp_dir_read_next_entry(
+                dir,
+                "read_next_entries",
+                &entry,
+                &error_kind,
+                &error_detail
+            );
+        switch (status) {
+            case BLORP_DIRECTORY_READ_ITEM:
+                blorp_list_store_raw(entries, entries->len, entry);
+                entries->len++;
+                break;
+            case BLORP_DIRECTORY_READ_END:
+                return blorp_dir_entry_list_ok(entries);
+            case BLORP_DIRECTORY_READ_ERROR:
+            default:
+                blorp_release(entries);
+                return blorp_dir_entry_list_error(error_kind, error_detail);
+        }
+    }
+
+    return blorp_dir_entry_list_ok(entries);
 }
 
 blorp_FileStringResult blorp_file_read_text_reader_raw(

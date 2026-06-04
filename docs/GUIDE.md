@@ -1760,11 +1760,16 @@ bodies. Keep a stream in a direct local binding while building a pipeline, then
 consume it with a terminal operation. Create and consume a stream inside the
 task when concurrent work needs its own stream.
 
-Directory handles support `read_entry()` for manual loops and `entries()` for
+Directory handles support `read_entry()` for manual single-entry loops,
+`read_next_entries()` for explicit fixed-size batch loops, and `entries()` for
 fallible-stream consumers. `read_entry()` returns `Ok(Some(entry))` until the
-directory is exhausted, then `Ok(None)`; `.` and `..` are skipped. Each
-`DirectoryEntry` contains a basename and a `DirectoryEntryKind` value such as
-`EntryFile`, `EntryDirectory`, or `EntrySymlink`.
+directory is exhausted, then `Ok(None)`.
+`read_next_entries(dir, max_entries)` advances the directory handle and returns
+up to `max_entries` entries from the next batch. It returns `Ok([])` after
+exhaustion and rejects non-positive batch sizes with `Err(InvalidInput(...))`.
+`.` and `..` are skipped. Each `DirectoryEntry` contains a basename and a
+`DirectoryEntryKind` value such as `EntryFile`, `EntryDirectory`, or
+`EntrySymlink`.
 `ResourceSource[R, E]` is the reserved source type for future APIs that produce
 owned resources one at a time, such as TCP listener connections or database
 pool checkouts. It is not usable as an ordinary collection: records, unions,
