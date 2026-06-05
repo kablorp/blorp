@@ -2157,15 +2157,20 @@ and lower_func_with_return_ty ?typed_body ?callable_id
                 match on name + param types. *)
         Core_intrinsics.synthesize_body ~func_name:name ~module_path:""
           ~params:core_params ~return_ty
-    | FuncBuiltinBody (BuiltinRuntime cname, loc) ->
-        (* [builtin("cname")] — synthesize a body that forwards the
-                function's declared parameters to the named C runtime helper.
-                Mirrors the [builtin_call] pattern used elsewhere in lowering:
-                a [CCall] with [CKBuiltin cname] and a dummy [CVoid] callee
-                (the callee slot is unused for CKBuiltin but required by the
-                CCall shape). Each param becomes a [CVar] with the param's
-                declared type. Wrapped with pattern params so destructured
-                params (e.g., [(x, y): (Int, Int)]) flow correctly. *)
+    | FuncBuiltinBody (BuiltinStdIntrinsic identity, _) -> (
+        match
+          Core_intrinsics.synthesize_std_body
+            ~module_path:identity.std_builtin_module_path
+            ~func_name:identity.std_builtin_func_name ~params:core_params
+            ~return_ty
+        with
+        | Core_intrinsics.StdBuiltinBody body ->
+            Some (wrap_body_with_pattern_params body params_with_pats)
+        | Core_intrinsics.StdBuiltinNoBody -> None)
+    | FuncBuiltinBody (BuiltinRuntimeHelper cname, loc) ->
+        (* [builtin("cname")] forwards declared parameters to the named C
+           runtime helper. Std compiler intrinsics use [BuiltinStdIntrinsic]
+           instead, so this branch does not inspect naming conventions. *)
         let dummy_callee =
           { Core.desc = CVoid; ty = Ast.TyNamed ("Void", []); loc }
         in

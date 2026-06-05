@@ -103,7 +103,7 @@ func factorial(n: Int, acc: Int) -> Int:
 - `pure func` declares a pure function (no side effects)
 - Return type follows `->`. Body is indented; last expression is the return value
 - `@tail_recursive` verifies all recursive calls are in tail position. The Core pipeline lowers unmanaged scalar self-recursion to explicit loops, and lowers common list-consumer patterns like `[x, ...rest]` into cursor loops instead of allocating a tail list on every step
-- `builtin` as a function body indicates a compiler/runtime-provided implementation; `builtin("c_name")` binds std/runtime wrappers to a named C helper
+- `builtin("std/module.name")` as a std function body names a compiler-provided intrinsic; `builtin("c_name")` binds std/runtime wrappers to a named C helper. Bare function-body `builtin` is not used in std source.
 
 ### Lambdas (Anonymous Functions)
 

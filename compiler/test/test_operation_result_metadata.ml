@@ -68,7 +68,7 @@ let direct_builtin_func_exposure builtin_name (func : Blorp.Ast.func_decl) =
   match func with
   | {
    func_name = Some func_name;
-   func_body = FuncBuiltinBody (BuiltinRuntime runtime_name, _);
+   func_body = FuncBuiltinBody (BuiltinRuntimeHelper runtime_name, _);
    _;
   }
     when runtime_name = builtin_name ->

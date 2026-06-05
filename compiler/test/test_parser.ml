@@ -10,6 +10,11 @@ let parse_ok source =
   | Ok program -> program
   | Error err -> Alcotest.fail err.message
 
+let parse_error_message source =
+  match Blorp.Modules.parse_source source with
+  | Ok _ -> Alcotest.fail "expected parse error"
+  | Error err -> err.message
+
 let test_empty_programs_parse_to_no_decls () =
   check_int "empty source" 0 (List.length (parse_ok ""));
   check_int "newline-only source" 0 (List.length (parse_ok "\n\n"))
@@ -36,10 +41,37 @@ let test_builtin_direct_runtime_body () =
   match program with
   | [ { Blorp.Ast.decl_desc = Blorp.Ast.DFunc f; _ } ] -> (
       match f.Blorp.Ast.func_body with
-      | Blorp.Ast.FuncBuiltinBody (Blorp.Ast.BuiltinRuntime c_name, _) ->
+      | Blorp.Ast.FuncBuiltinBody (Blorp.Ast.BuiltinRuntimeHelper c_name, _) ->
           check_string "runtime builtin target" "blorp_to_string" c_name
       | _ -> Alcotest.fail "expected builtin(\"...\") function body")
   | _ -> Alcotest.fail "expected one function declaration"
+
+let test_builtin_std_identity_body () =
+  let source =
+    "private pure func __unsafe_list_get[T](self: List[T], index: Int) -> T:\n"
+    ^ "\tbuiltin(\"std/list.__unsafe_list_get\")\n"
+  in
+  let program = parse_ok source in
+  match program with
+  | [ { Blorp.Ast.decl_desc = Blorp.Ast.DPrivate private_decl; _ } ] -> (
+      match private_decl.Blorp.Ast.decl_desc with
+      | Blorp.Ast.DFunc f -> (
+          match f.Blorp.Ast.func_body with
+          | Blorp.Ast.FuncBuiltinBody (Blorp.Ast.BuiltinStdIntrinsic identity, _)
+            ->
+              check_string "std builtin module" "std/list"
+                identity.Blorp.Ast.std_builtin_module_path;
+              check_string "std builtin function" "__unsafe_list_get"
+                identity.Blorp.Ast.std_builtin_func_name
+          | _ -> Alcotest.fail "expected std builtin identity body")
+      | _ -> Alcotest.fail "expected private function declaration")
+  | _ -> Alcotest.fail "expected one private function declaration"
+
+let test_builtin_std_identity_rejects_missing_function_name () =
+  let source = "pure func bad() -> Int:\n" ^ "\tbuiltin(\"std/list\")\n" in
+  check_string "parse error"
+    "std builtin identities must use builtin(\"std/module.function\")"
+    (parse_error_message source)
 
 let test_builtin_sentinel_body_has_explicit_kind () =
   let source = "func length(xs: List[Int]) -> Int:\n" ^ "\tbuiltin\n" in
@@ -246,6 +278,10 @@ let suite =
       [
         Alcotest.test_case "builtin direct runtime body" `Quick
           test_builtin_direct_runtime_body;
+        Alcotest.test_case "builtin std identity body" `Quick
+          test_builtin_std_identity_body;
+        Alcotest.test_case "builtin std identity requires function name" `Quick
+          test_builtin_std_identity_rejects_missing_function_name;
         Alcotest.test_case "builtin sentinel body has explicit kind" `Quick
           test_builtin_sentinel_body_has_explicit_kind;
         Alcotest.test_case "old builtin spelling is plain identifier" `Quick

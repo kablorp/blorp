@@ -1002,12 +1002,12 @@ let resource_arg_policy_of_module_func_param_types env resource_names func
       let result_policy =
         if func.func_resource_result_ordinary then ResourceResultOrdinary
         else
-          match builtin_body with
-          | BuiltinRuntime name -> (
+          match runtime_helper_name_of_builtin_body builtin_body with
+          | Some name -> (
               match Operation_result_metadata.resource_result_policy name with
               | Some policy -> policy
               | None -> ResourceResultDependent)
-          | BuiltinIntrinsic -> ResourceResultDependent
+          | None -> ResourceResultDependent
       in
       AllowResourceArgs result_policy
   | FuncBuiltinBody _ | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
@@ -2759,10 +2759,9 @@ let lookup_module_func_resolution module_path func_name =
       in
       let runtime_builtin_name func =
         match func.func_body with
-        | FuncBuiltinBody (BuiltinRuntime name, _) -> Some name
-        | FuncBuiltinBody (BuiltinIntrinsic, _)
-        | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->
-            None
+        | FuncBuiltinBody (builtin_body, _) ->
+            runtime_helper_name_of_builtin_body builtin_body
+        | FuncBodyExpr _ | FuncForeign _ | FuncNoBody -> None
       in
       let rec extract_func_resolution decl =
         match decl.decl_desc with

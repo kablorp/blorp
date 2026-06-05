@@ -305,10 +305,12 @@ and expr_desc =
         parser converts this to [FuncBuiltinBody (BuiltinIntrinsic, _)] when
         it is the whole function body; this node should never reach
         [Core_lower].
-        [EBuiltin (Some c_name)] — [builtin("c_name")]. Lowering synthesizes
-        a [CCall (CKBuiltin c_name, ...)] body that forwards all parameters
-        to the named C runtime helper from [FuncBuiltinBody]. Distinct from
-        [foreign:] blocks, which are reserved for user-facing FFI. *)
+        [EBuiltin (Some name)] — [builtin("name")]. Std identities such as
+        ["std/list.map"] route through compiler intrinsic synthesis; runtime
+        helper names synthesize a [CCall (CKBuiltin name, ...)] body that
+        forwards all parameters to the named C helper from [FuncBuiltinBody].
+        Distinct from [foreign:] blocks, which are reserved for user-facing
+        FFI. *)
   | EFuncDecl of func_decl
       (** Nested function declaration in a block.
       Transient node produced by the parser for [pure func name[T](...)]
@@ -371,10 +373,17 @@ and string_interp_part =
 and match_case = { case_pattern : pattern; case_body : expr; case_loc : loc }
 (** Match case *)
 
+and std_builtin_identity = {
+  std_builtin_module_path : string;
+  std_builtin_func_name : string;
+}
+
 and builtin_body =
   | BuiltinIntrinsic
       (** [builtin] — compiler intrinsic body synthesized by lowering. *)
-  | BuiltinRuntime of string
+  | BuiltinStdIntrinsic of std_builtin_identity
+      (** [builtin("std/module.name")] — named std compiler intrinsic. *)
+  | BuiltinRuntimeHelper of string
       (** [builtin("c_name")] — direct runtime helper forwarding body. *)
 
 and foreign_func = {
@@ -560,6 +569,40 @@ and decl = { decl_desc : decl_desc; decl_loc : loc; decl_doc : string option }
 
 type program = decl list
 (** A program is a list of declarations *)
+
+let string_starts_with ~prefix value =
+  let prefix_len = String.length prefix in
+  String.length value >= prefix_len && String.sub value 0 prefix_len = prefix
+
+let std_builtin_identity_to_string identity =
+  identity.std_builtin_module_path ^ "." ^ identity.std_builtin_func_name
+
+let parse_std_builtin_identity name =
+  if not (string_starts_with ~prefix:"std/" name) then None
+  else
+    match String.rindex_opt name '.' with
+    | None -> None
+    | Some idx when idx <= String.length "std/" || idx + 1 >= String.length name
+      ->
+        None
+    | Some idx ->
+        Some
+          {
+            std_builtin_module_path = String.sub name 0 idx;
+            std_builtin_func_name =
+              String.sub name (idx + 1) (String.length name - idx - 1);
+          }
+
+let builtin_body_of_name name =
+  match parse_std_builtin_identity name with
+  | Some identity -> Ok (BuiltinStdIntrinsic identity)
+  | None when string_starts_with ~prefix:"std/" name ->
+      Error "std builtin identities must use builtin(\"std/module.function\")"
+  | None -> Ok (BuiltinRuntimeHelper name)
+
+let runtime_helper_name_of_builtin_body = function
+  | BuiltinRuntimeHelper name -> Some name
+  | BuiltinIntrinsic | BuiltinStdIntrinsic _ -> None
 
 (** Compatibility constructor for transitional typed AST payloads.
 

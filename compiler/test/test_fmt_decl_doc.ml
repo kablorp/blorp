@@ -246,7 +246,7 @@ let test_non_expression_impl_method_decl_json () =
             "to_string"
             [ typed_param "val" (ty_named "Char" []) ]
             (Ast.FuncBuiltinBody
-               (Ast.BuiltinRuntime "blorp_from_char", Ast.dummy_loc));
+               (Ast.BuiltinRuntimeHelper "blorp_from_char", Ast.dummy_loc));
         ];
     }
   in
@@ -269,7 +269,8 @@ let test_non_expression_impl_method_decl_json () =
 let test_non_expression_func_decl_json () =
   let builtin_func =
     func_with_body ~return_type:(ty_named "Int" []) "read_clock" []
-      (Ast.FuncBuiltinBody (Ast.BuiltinRuntime "blorp_read_clock", Ast.dummy_loc))
+      (Ast.FuncBuiltinBody
+         (Ast.BuiltinRuntimeHelper "blorp_read_clock", Ast.dummy_loc))
   in
   let foreign_func =
     func_with_body ~return_type:(ty_named "Float" []) "floor"

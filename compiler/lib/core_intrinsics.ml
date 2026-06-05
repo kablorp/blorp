@@ -8646,3 +8646,12 @@ let synthesize_body = synthesize_body_impl None
 
 let synthesize_body_with_reg ~(reg : Codegen_types.registry) =
   synthesize_body_impl (Some reg)
+
+type std_body_resolution = StdBuiltinNoBody | StdBuiltinBody of core
+
+let synthesize_std_body_impl reg ~module_path ~func_name ~params ~return_ty =
+  match synthesize_body_impl reg ~func_name ~module_path ~params ~return_ty with
+  | Some body -> StdBuiltinBody body
+  | None -> StdBuiltinNoBody
+
+let synthesize_std_body = synthesize_std_body_impl None

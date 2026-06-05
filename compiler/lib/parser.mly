@@ -78,14 +78,18 @@ let stmts_to_expr = function [e] -> e | es -> make_expr (EBlock es)
 let stmts_to_expr_at pos = function [e] -> e | es -> make_expr_at pos (EBlock es)
 
 let func_body_of_expr e =
-  let builtin_body_of_opt = function
+  let builtin_body_of_opt loc = function
     | None -> BuiltinIntrinsic
-    | Some c_name -> BuiltinRuntime c_name
+    | Some name -> (
+        match builtin_body_of_name name with
+        | Ok body -> body
+        | Error message -> raise (Parse_error_at (loc, message)))
   in
   match e.expr_desc with
-  | EBuiltin opt -> FuncBuiltinBody (builtin_body_of_opt opt, e.expr_loc)
+  | EBuiltin opt -> FuncBuiltinBody (builtin_body_of_opt e.expr_loc opt, e.expr_loc)
   | EBlock [ ({ expr_desc = EBuiltin opt; _ } as builtin_expr) ] ->
-      FuncBuiltinBody (builtin_body_of_opt opt, builtin_expr.expr_loc)
+      FuncBuiltinBody
+        (builtin_body_of_opt builtin_expr.expr_loc opt, builtin_expr.expr_loc)
   | _ -> FuncBodyExpr e
 
 (** Create binary expression with span *)
@@ -1228,7 +1232,7 @@ primary_expr:
   | BREAK { make_expr_at $symbolstartpos EBreak }
   | CONTINUE { make_expr_at $symbolstartpos EContinue }
   | BUILTIN LPAREN cname = STRING RPAREN
-    { make_expr_at $symbolstartpos (EBuiltin (Some cname)) }  (* builtin("cname"): synthesized body that forwards params to the named C runtime helper *)
+    { make_expr_at $symbolstartpos (EBuiltin (Some cname)) }  (* builtin("name"): named std compiler intrinsic or runtime helper forwarding body *)
   | BUILTIN { make_expr_at $symbolstartpos (EBuiltin None) } %prec BUILTIN_BARE  (* builtin is a placeholder for compiler-provided implementation *)
   | LPAREN RPAREN { make_expr_span $symbolstartpos $endpos (ELiteral (LitInt 0L)) }  (* Void - placeholder *)
   | LPAREN e = expr RPAREN { e }

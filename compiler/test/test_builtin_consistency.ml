@@ -1336,7 +1336,7 @@ let test_public_abi_types_have_std_anchors () =
     Alcotest.failf "Public ABI types must have source anchors in std/:\n  %s"
       (String.concat "\n  " missing)
 
-let builtin_runtime_option_returns_in_std () =
+let direct_runtime_option_returns_in_std () =
   let reg = Blorp.Codegen_types.create_registry () in
   let meta = Blorp.Core_type_layout.metadata_for_registry reg in
   all_std_blorp_files ()
@@ -1354,7 +1354,7 @@ let builtin_runtime_option_returns_in_std () =
                         func_return_type = Some return_ty;
                         func_body =
                           Blorp.Ast.FuncBuiltinBody
-                            (Blorp.Ast.BuiltinRuntime symbol, _);
+                            (Blorp.Ast.BuiltinRuntimeHelper symbol, _);
                         _;
                       };
                   _;
@@ -1387,7 +1387,7 @@ let test_optimized_option_runtime_builtins_have_matching_c_abi () =
     |> List.sort_uniq String.compare
   in
   let missing_direct_cases =
-    builtin_runtime_option_returns_in_std ()
+    direct_runtime_option_returns_in_std ()
     |> List.filter (fun (_path, _func_name, symbol, _expected_c_return) ->
         not (List.mem symbol known_symbols))
   in

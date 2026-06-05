@@ -400,7 +400,9 @@ primary_expr = INT | BIGINT | FLOAT | STRING | RAW_STRING
              | IDENT | "debug"
              | "_" | "void"
              | "break" | "continue"
-             | "builtin" [ "(" STRING ")" ]
+             | "builtin" [ "(" STRING ")" ]                 (* std function
+                                                                bodies use the
+                                                                named form *)
              | "(" ")"                                      (* void literal *)
              | "(" expr ")"                                 (* grouping *)
              | "(" expr "," expr_list ")"                   (* tuple *)

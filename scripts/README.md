@@ -109,6 +109,11 @@ scripts/with-build-lock make quality-full
 metadata stay byte-for-byte synchronized and parse as JSON. `make hygiene-check`
 runs it automatically.
 
+`scripts/check-std-builtins` verifies that standalone `std/` function builtin
+bodies use explicit identities matching their source declaration, for example
+`builtin("std/list.__unsafe_list_get")`. Bare `builtin` function bodies are not
+allowed in `std/`.
+
 ## Release Helpers
 
 `scripts/target-triple` prints the release target for the current machine:

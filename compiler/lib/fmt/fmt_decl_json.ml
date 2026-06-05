@@ -145,7 +145,13 @@ let var_to_json ~is_private var =
 
 let builtin_body_fields = function
   | Ast.BuiltinIntrinsic -> [ field "body_kind" (string "builtin") ]
-  | Ast.BuiltinRuntime name ->
+  | Ast.BuiltinStdIntrinsic identity ->
+      [
+        field "body_kind" (string "builtin");
+        field "builtin_name"
+          (string (Ast.std_builtin_identity_to_string identity));
+      ]
+  | Ast.BuiltinRuntimeHelper name ->
       [
         field "body_kind" (string "builtin"); field "builtin_name" (string name);
       ]

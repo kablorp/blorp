@@ -385,12 +385,12 @@ let resource_arg_policy_of_func ~contains_resource_param
       let result_policy =
         if func.func_resource_result_ordinary then ResourceResultOrdinary
         else
-          match builtin_body with
-          | BuiltinRuntime name -> (
+          match runtime_helper_name_of_builtin_body builtin_body with
+          | Some name -> (
               match Operation_result_metadata.resource_result_policy name with
               | Some policy -> policy
               | None -> ResourceResultDependent)
-          | BuiltinIntrinsic -> ResourceResultDependent
+          | None -> ResourceResultDependent
       in
       AllowResourceArgs result_policy
   | FuncBuiltinBody _ | FuncBodyExpr _ | FuncForeign _ | FuncNoBody ->

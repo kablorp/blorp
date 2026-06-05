@@ -101,6 +101,7 @@ hygiene-check:
 		exit 1; \
 	fi
 	@scripts/check-editor-drift
+	@scripts/check-std-builtins
 	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
 		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \
 		echo "Run 'cd compiler && dune build @check' and inspect the conflict report."; \
