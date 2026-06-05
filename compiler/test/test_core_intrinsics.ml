@@ -310,6 +310,9 @@ let test_list_synthesis_rejects_malformed_signatures () =
   expect_no_list_synthesis "append"
     [ param "items" list_int; param "elem" ty_string ]
     list_int;
+  expect_no_list_synthesis "get"
+    [ param "items" list_int; param "idx" ty_string ]
+    (ty_option ty_int);
   expect_no_list_synthesis "get_or"
     [ param "items" list_int; param "idx" ty_int; param "default" ty_string ]
     ty_int;
@@ -1978,6 +1981,30 @@ let test_list_get_or_synthesizes_option_free_bounds_check () =
       Alcotest.(check int)
         "does not construct Some" 0
         (count_unknown_call "Some" body)
+
+let test_list_get_synthesizes_checked_option () =
+  let body =
+    Blorp.Core_intrinsics.synthesize_body ~func_name:"get"
+      ~module_path:"std/list"
+      ~params:[ param "self" (ty_list ty_string); param "index" ty_int ]
+      ~return_ty:(ty_option ty_string)
+  in
+  match body with
+  | None -> Alcotest.fail "List.get should synthesize a Core IR body"
+  | Some body ->
+      Alcotest.(check int)
+        "bounds check reads length" 1
+        (count_intrinsic "list_len" body);
+      Alcotest.(check int)
+        "reads element after explicit bounds proof" 1
+        (count_intrinsic "list_get_unchecked" body);
+      Alcotest.(check int)
+        "retains returned borrowed element" 1
+        (count_intrinsic "list_retain_for" body);
+      Alcotest.(check int)
+        "constructs Some on hit" 1
+        (count_unknown_call "Some" body);
+      assert_no_borrowed_managed_alias_lets "List.get" body
 
 let test_list_set_synthesizes_option_free_cow_set () =
   let body =
@@ -3743,6 +3770,8 @@ let suite =
           `Quick test_list_filter_synthesizes_retain_then_transfer_loop;
         Alcotest.test_case "list_get_or_synthesizes_option_free_bounds_check"
           `Quick test_list_get_or_synthesizes_option_free_bounds_check;
+        Alcotest.test_case "list_get_synthesizes_checked_option" `Quick
+          test_list_get_synthesizes_checked_option;
         Alcotest.test_case "list_set_synthesizes_option_free_cow_set" `Quick
           test_list_set_synthesizes_option_free_cow_set;
         Alcotest.test_case

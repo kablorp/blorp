@@ -452,6 +452,9 @@ let std_body_specs =
       list_spec ~return_shape:(ReturnNamed "List")
         ~param_shapes:[ ParamNamed "List"; ParamSameAsFirstListElement ]
         "__unsafe_list_append" 2;
+      list_spec ~return_shape:(ReturnNamed "Option")
+        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int" ]
+        "get" 2;
       list_spec ~return_shape:(ReturnNamed "List")
         ~param_shapes:
           [ ParamNamed "List"; ParamNamed "Int"; ParamSameAsFirstListElement ]
@@ -1627,6 +1630,20 @@ let list_in_bounds self index =
     Bounds-check directly in IR and return the default for misses. The
     in-bounds element is a borrowed alias from [self], so retain it before
     returning ownership to the caller. *)
+let list_get self_ty return_ty self index =
+  let elem_ty = list_elem_ty self_ty in
+  let elem =
+    mk elem_ty
+      (CUnbox (intr "list_get_unchecked" [ self; index ] ty_ptr, elem_ty))
+  in
+  if_
+    (list_in_bounds self index)
+    (borrow "__elem" elem
+       (seq
+          (intr "list_retain_for" [ self; vr "__elem" elem_ty ] ty_void)
+          (option_some return_ty (vr "__elem" elem_ty))))
+    (option_none return_ty) return_ty
+
 let list_get_or _self_ty return_ty self index default =
   let elem =
     mk return_ty
@@ -5901,6 +5918,9 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
   | ("append" | "__unsafe_list_append") when first_is_list () ->
       with_list2 (fun self_p elem_p ->
           list_append self_p.cp_ty (param self_p) (param elem_p))
+  | "get" when first_is_list () ->
+      with_list2 (fun self_p idx_p ->
+          list_get self_p.cp_ty return_ty (param self_p) (param idx_p))
   | "__unsafe_list_set_index" when first_is_list () ->
       with_list3 (fun self_p idx_p elem_p ->
           list_set_index self_p.cp_ty (param self_p) (param idx_p)
