@@ -120,10 +120,11 @@ let test_list_spread_recur_omits_list_rebind () =
               CTLeaf
                 {
                   ct_bindings =
-                    [
-                      (x, AccListElem (AccRoot, 0));
-                      (rest, AccListSpread (AccRoot, 1));
-                    ];
+                    borrowed_match_binding_pairs
+                      [
+                        (x, AccListElem (AccRoot, 0));
+                        (rest, AccListSpread (AccRoot, 1));
+                      ];
                   ct_body = recur;
                 } );
         ctl_len_default = None;
@@ -215,10 +216,11 @@ let test_list_spread_loop_preserves_prefix_binding () =
               CTLeaf
                 {
                   ct_bindings =
-                    [
-                      (x, AccListElem (AccRoot, 0));
-                      (rest, AccListSpread (AccRoot, 1));
-                    ];
+                    borrowed_match_binding_pairs
+                      [
+                        (x, AccListElem (AccRoot, 0));
+                        (rest, AccListSpread (AccRoot, 1));
+                      ];
                   ct_body = recur;
                 } );
         ctl_len_default = None;
@@ -283,10 +285,11 @@ let test_list_spread_loop_recognizes_alias_param () =
               CTLeaf
                 {
                   ct_bindings =
-                    [
-                      (x, AccListElem (AccRoot, 0));
-                      (rest, AccListSpread (AccRoot, 1));
-                    ];
+                    borrowed_match_binding_pairs
+                      [
+                        (x, AccListElem (AccRoot, 0));
+                        (rest, AccListSpread (AccRoot, 1));
+                      ];
                   ct_body = recur;
                 } );
         ctl_len_default = None;
@@ -337,10 +340,11 @@ let test_list_spread_ignores_resource_scope_shadowed_spread_var () =
               CTLeaf
                 {
                   ct_bindings =
-                    [
-                      (x, AccListElem (AccRoot, 0));
-                      (rest, AccListSpread (AccRoot, 1));
-                    ];
+                    borrowed_match_binding_pairs
+                      [
+                        (x, AccListElem (AccRoot, 0));
+                        (rest, AccListSpread (AccRoot, 1));
+                      ];
                   ct_body = recur;
                 } );
         ctl_len_default = None;

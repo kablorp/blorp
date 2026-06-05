@@ -763,7 +763,7 @@ let check_no_raw_top_level_function_refs_at (stage : Core_stage.t)
     | Core.CTLeaf { ct_bindings; ct_body } ->
         let bound =
           List.fold_left
-            (fun acc (v, _) -> add_bound_var acc v)
+            (fun acc binding -> add_bound_var acc binding.Core.mb_var)
             bound ct_bindings
         in
         visit bound acc ct_body
@@ -1951,7 +1951,8 @@ let check_no_unguarded_raw_tensor_gets_at (stage : Core_stage.t)
     | Core.CTLeaf { ct_bindings; ct_body } ->
         let body_env =
           List.fold_left
-            (fun env (v, _) -> remove_guarded_raw_tensor_source env v)
+            (fun env binding ->
+              remove_guarded_raw_tensor_source env binding.Core.mb_var)
             env ct_bindings
         in
         visit body_env acc ct_body
@@ -2098,7 +2099,7 @@ let check_tensor_loop_storage_provenance_at (stage : Core_stage.t)
 let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
     Core_error.t list =
   match stage with
-  | Core_stage.Specialize | Core_stage.Dce ->
+  | Core_stage.Specialize | Core_stage.Dce | Core_stage.ConsumeSpecialize ->
       check_no_ckunknown_at stage prog
       @ check_no_layoutless_list_alloc_at stage prog
       @ check_raw_tensor_views_at stage prog

@@ -58,7 +58,7 @@ let test_compile_single_var () =
   let m = mk_match (cvar "x" ty_int) [ (PatVar "y", body) ] ty_int in
   let compiled = Blorp.Core_match.try_compile_match m in
   match get_ctree compiled with
-  | CTLeaf { ct_bindings = [ (v, AccRoot) ]; _ } ->
+  | CTLeaf { ct_bindings = [ { mb_var = v; mb_accessor = AccRoot; _ } ]; _ } ->
       Alcotest.(check string) "binds y" "y" v.vname
   | _ -> Alcotest.fail "expected CTLeaf with [(y, AccRoot)]"
 
@@ -120,7 +120,17 @@ let test_compile_option_match () =
       let some_tree = List.assoc "Some" cts_cases in
       (match some_tree with
       | CTLeaf
-          { ct_bindings = [ (v, AccVariantField (AccRoot, "Some", 0)) ]; _ } ->
+          {
+            ct_bindings =
+              [
+                {
+                  mb_var = v;
+                  mb_accessor = AccVariantField (AccRoot, "Some", 0);
+                  _;
+                };
+              ];
+            _;
+          } ->
           Alcotest.(check string) "binds v" "v" v.vname
       | _ -> Alcotest.fail "Some leaf wrong");
       (* None case has empty bindings *)
@@ -265,8 +275,17 @@ let test_compile_ctor_mixed_lit_and_var () =
           (* default is the Some(x) arm with a binding *)
           match ctl_default with
           | CTLeaf
-              { ct_bindings = [ (v, AccVariantField (AccRoot, "Some", 0)) ]; _ }
-            ->
+              {
+                ct_bindings =
+                  [
+                    {
+                      mb_var = v;
+                      mb_accessor = AccVariantField (AccRoot, "Some", 0);
+                      _;
+                    };
+                  ];
+                _;
+              } ->
               Alcotest.(check string) "binds x" "x" v.vname
           | _ -> Alcotest.fail "default not CTLeaf with x binding")
       | _ -> Alcotest.fail "Some case not CTSwitchLit")
@@ -286,8 +305,10 @@ let test_compile_tuple_simple () =
   match get_ctree compiled with
   | CTLeaf { ct_bindings; _ } -> (
       Alcotest.(check int) "2 bindings" 2 (List.length ct_bindings);
-      let va, aa = List.nth ct_bindings 0 in
-      let vb, ab = List.nth ct_bindings 1 in
+      let ba = List.nth ct_bindings 0 in
+      let bb = List.nth ct_bindings 1 in
+      let va, aa = (ba.mb_var, ba.mb_accessor) in
+      let vb, ab = (bb.mb_var, bb.mb_accessor) in
       Alcotest.(check string) "a" "a" va.vname;
       Alcotest.(check string) "b" "b" vb.vname;
       (match aa with
@@ -375,7 +396,7 @@ let test_compile_nested_some_some () =
           (* Inner Some should bind x *)
           let inner_some = List.assoc "Some" inner_cases in
           match inner_some with
-          | CTLeaf { ct_bindings = [ (v, _) ]; _ } ->
+          | CTLeaf { ct_bindings = [ { mb_var = v; _ } ]; _ } ->
               Alcotest.(check string) "binds x" "x" v.vname
           | _ -> Alcotest.fail "inner Some not CTLeaf with binding")
       | _ -> Alcotest.fail "Some branch not nested CTSwitchTag")
@@ -487,12 +508,14 @@ let test_compile_list_spread_before_exact_order () =
 
 let has_spread_binding bindings =
   List.exists
-    (fun (_, acc) -> match acc with AccListSpread _ -> true | _ -> false)
+    (fun binding ->
+      match binding.mb_accessor with AccListSpread _ -> true | _ -> false)
     bindings
 
 let has_elem_binding bindings =
   List.exists
-    (fun (_, acc) -> match acc with AccListElem _ -> true | _ -> false)
+    (fun binding ->
+      match binding.mb_accessor with AccListElem _ -> true | _ -> false)
     bindings
 
 let test_compile_list_unused_spread () =

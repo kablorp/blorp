@@ -952,7 +952,7 @@ and annotate_ctree env storage_env tree =
   | CTLeaf { ct_bindings; ct_body } ->
       let leaf_env =
         List.fold_left
-          (fun e (binding, _) -> Storage_env.remove_var binding e)
+          (fun e binding -> Storage_env.remove_var binding.mb_var e)
           storage_env ct_bindings
       in
       CTLeaf { ct_bindings; ct_body = annotate leaf_env ct_body }

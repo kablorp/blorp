@@ -392,6 +392,11 @@ let rec count_uses (name : string) (e : core) : int =
       List.fold_left
         (fun a c -> a + count_boxed_storage_uses name c)
         0 uc.uc_args
+  | CUnionReuseConstruct urc ->
+      count_uses name urc.urc_source
+      + List.fold_left
+          (fun a c -> a + count_boxed_storage_uses name c)
+          0 urc.urc_args
   | CRecordUpdate (b, fs) ->
       count_uses name b
       + List.fold_left (fun a (_, v) -> a + count_uses name v) 0 fs
@@ -534,7 +539,7 @@ and count_boxed_storage_uses name value =
 and max_uses_ctree_inner (name : string) (tree : ctree) : int =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> v.vname = name) ct_bindings then 0
+      if match_bindings_shadow name ct_bindings then 0
       else count_uses name ct_body
   | CTFail -> 0
   | CTSwitchTag { cts_cases; cts_default; _ } ->
@@ -796,6 +801,11 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
   | CUnionConstruct uc ->
       aggregate_ownership_uses
         (List.map (summarize_boxed_storage_uses env name) uc.uc_args)
+  | CUnionReuseConstruct urc ->
+      seq_ownership_uses
+        (summarize_linear_ownership_uses env name urc.urc_source)
+        (aggregate_ownership_uses
+           (List.map (summarize_boxed_storage_uses env name) urc.urc_args))
   | CRecordUpdate (b, fs) ->
       aggregate_ownership_uses
         [
@@ -1030,8 +1040,7 @@ and summarize_ctree_ownership_uses (env : type_env) (name : string)
     (tree : ctree) : ownership_uses =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> v.vname = name) ct_bindings then
-        no_ownership_uses
+      if match_bindings_shadow name ct_bindings then no_ownership_uses
       else summarize_linear_ownership_uses env name ct_body
   | CTFail -> no_ownership_uses
   | CTSwitchTag { cts_cases; cts_default; _ } ->
@@ -1573,7 +1582,7 @@ let lambda_has_runtime_captures (env : type_env) (lam : lambda) : bool =
     (not (SS.mem name bound)) && not (is_global_name name)
   in
   let add_var bound (v, _) = SS.add v.vname bound in
-  let add_ctree_binding bound (v, _) = SS.add v.vname bound in
+  let add_ctree_binding bound binding = SS.add binding.mb_var.vname bound in
   let add_names bound names =
     List.fold_left (fun acc name -> SS.add name acc) bound names
   in
@@ -1798,13 +1807,15 @@ let remove_bound_names (bound : string list) (borrowed : string list) :
     string list =
   List.filter (fun name -> not (List.exists (( = ) name) bound)) borrowed
 
-let add_match_bindings (bindings : (var * accessor) list)
-    (borrowed : string list) : string list =
+let add_match_bindings (bindings : match_binding list) (borrowed : string list)
+    : string list =
   List.fold_left
-    (fun acc (v, accessor) ->
-      match accessor with
-      | AccListSpread _ -> acc
-      | _ -> if borrowed_contains v.vname acc then acc else v.vname :: acc)
+    (fun acc binding ->
+      match (binding.mb_mode, binding.mb_accessor) with
+      | MatchOwn, _ | _, AccListSpread _ -> acc
+      | MatchBorrow, _ ->
+          if borrowed_contains binding.mb_var.vname acc then acc
+          else binding.mb_var.vname :: acc)
     borrowed bindings
 
 let rec expr_result_aliases_borrowed (env : type_env) (borrowed : string list)
@@ -2071,7 +2082,7 @@ and retain_borrowed_owned_call_args_in_ctree (env : type_env)
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
       let leaf_borrowed = add_match_bindings ct_bindings borrowed in
-      let bound = List.map (fun (v, _) -> v.vname) ct_bindings in
+      let bound = match_binding_names ct_bindings in
       CTLeaf
         {
           ct_bindings;
@@ -2260,7 +2271,7 @@ let rec expr_contains_var (name : string) (e : core) : bool =
 and ctree_contains_var (name : string) (tree : ctree) : bool =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      (not (List.exists (fun (v, _) -> v.vname = name) ct_bindings))
+      (not (match_bindings_shadow name ct_bindings))
       && expr_contains_var name ct_body
   | CTFail -> false
   | CTSwitchTag { cts_cases; cts_default; _ } ->
@@ -2390,7 +2401,7 @@ and ctree_consumes_var_owner (env : type_env) (name : string) (tree : ctree) :
     bool =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      (not (List.exists (fun (v, _) -> v.vname = name) ct_bindings))
+      (not (match_bindings_shadow name ct_bindings))
       && expr_consumes_var_owner env name ct_body
   | CTFail -> false
   | CTSwitchTag { cts_cases; cts_default; _ } ->
@@ -2465,7 +2476,7 @@ let rec expr_assigns_var (name : string) (e : core) : bool =
 and ctree_assigns_var (name : string) (tree : ctree) : bool =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      (not (List.exists (fun (v, _) -> v.vname = name) ct_bindings))
+      (not (match_bindings_shadow name ct_bindings))
       && expr_assigns_var name ct_body
   | CTFail -> false
   | CTSwitchTag { cts_cases; cts_default; _ } ->
@@ -2484,8 +2495,10 @@ and ctree_assigns_var (name : string) (tree : ctree) : bool =
 let remove_names names set =
   List.fold_left (fun acc name -> StringSet.remove name acc) set names
 
-let remove_var_names vars set =
-  List.fold_left (fun acc (v, _) -> StringSet.remove v.vname acc) set vars
+let remove_match_binding_names bindings set =
+  List.fold_left
+    (fun acc binding -> StringSet.remove binding.mb_var.vname acc)
+    set bindings
 
 let rec expr_tail_alias_vars (e : core) : StringSet.t =
   match e.desc with
@@ -2527,7 +2540,7 @@ let rec expr_tail_alias_vars (e : core) : StringSet.t =
 and ctree_tail_alias_vars (tree : ctree) : StringSet.t =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      remove_var_names ct_bindings (expr_tail_alias_vars ct_body)
+      remove_match_binding_names ct_bindings (expr_tail_alias_vars ct_body)
   | CTFail -> StringSet.empty
   | CTSwitchTag { cts_cases; cts_default; _ } ->
       List.fold_left
@@ -2617,8 +2630,7 @@ and ctree_final_consumes_var_owner (env : type_env) (name : string)
   in
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> v.vname = name) ct_bindings then
-        [ Some false ]
+      if match_bindings_shadow name ct_bindings then [ Some false ]
       else if expr_touches_current_owner ct_body then
         [ Some (expr_final_consumes_var_owner env name ct_body) ]
       else [ None ]
@@ -2934,11 +2946,10 @@ let release_reassigned_mutable_var (env : type_env)
     match tree with
     | CTLeaf { ct_bindings; ct_body } ->
         let ct_body =
-          if List.exists (fun (v, _) -> v.vname = target.vname) ct_bindings then
-            ct_body
+          if match_bindings_shadow target.vname ct_bindings then ct_body
           else
             let borrowed_aliases =
-              List.map (fun (v, _) -> v.vname) ct_bindings @ borrowed_aliases
+              match_binding_names ct_bindings @ borrowed_aliases
             in
             rewrite ~skip_old_release ~borrowed_aliases ct_body
         in
@@ -3697,7 +3708,7 @@ and rename_shadow_var_refs_ctree (old_name : string) (new_var : var)
     (tree : ctree) : ctree =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> v.vname = old_name) ct_bindings then tree
+      if match_bindings_shadow old_name ct_bindings then tree
       else
         CTLeaf
           {
@@ -3790,14 +3801,15 @@ let freshen_match_arm_shadows (v : var) (arms : (Ast.pattern * core) list) :
 let rec freshen_ctree_shadow_bindings (v : var) (tree : ctree) : ctree =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if not (List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings) then
-        tree
+      if not (match_bindings_shadow v.vname ct_bindings) then tree
       else
         let shadow = fresh_shadow_var v in
         let ct_bindings' =
           List.map
-            (fun (bv, acc) ->
-              if bv.vname = v.vname then (shadow, acc) else (bv, acc))
+            (fun binding ->
+              if binding.mb_var.vname = v.vname then
+                { binding with mb_var = shadow }
+              else binding)
             ct_bindings
         in
         let ct_body' = rename_shadow_var_refs v.vname shadow ct_body in
@@ -3947,8 +3959,8 @@ and balance_nested_branch_body (env : type_env) (v : var) (ty : Ast.type_expr)
         match tree with
         | CTLeaf { ct_bindings; ct_body } ->
             let uses =
-              if List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings
-              then no_ownership_uses
+              if match_bindings_shadow v.vname ct_bindings then
+                no_ownership_uses
               else summarize_linear_ownership_uses env v.vname ct_body
             in
             let uses =
@@ -4088,8 +4100,7 @@ let rec collect_ctree_leaf_uses (env : type_env) (v : var) (tree : ctree) :
     ownership_uses list =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings then
-        [ no_ownership_uses ]
+      if match_bindings_shadow v.vname ct_bindings then [ no_ownership_uses ]
       else [ summarize_linear_ownership_uses env v.vname ct_body ]
   | CTFail -> [ no_ownership_uses ]
   | CTSwitchTag { cts_cases; cts_default; _ } ->
@@ -4134,8 +4145,7 @@ let rec balance_ctree_leaves (env : type_env) (v : var) (ty : Ast.type_expr)
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
       let uses =
-        if List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings then
-          no_ownership_uses
+        if match_bindings_shadow v.vname ct_bindings then no_ownership_uses
         else summarize_linear_ownership_uses env v.vname ct_body
       in
       let uses =
@@ -4313,7 +4323,7 @@ and protect_consuming_calls_in_ctree ?(user_calls_only = false)
     (v : var) (ty : Ast.type_expr) (tree : ctree) : ctree =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings then tree
+      if match_bindings_shadow v.vname ct_bindings then tree
       else
         CTLeaf
           {
@@ -4430,7 +4440,7 @@ and protect_loop_consumes_in_ctree (env : type_env) (v : var)
     (ty : Ast.type_expr) (tree : ctree) : ctree =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (bv, _) -> bv.vname = v.vname) ct_bindings then tree
+      if match_bindings_shadow v.vname ct_bindings then tree
       else
         CTLeaf
           {

@@ -29,6 +29,7 @@
 #   GOMAXPROCS=4                       bash benchmarks/bench.sh   # Go runtime parallelism for concurrency rows
 #   BENCH_RUNS=5                       bash benchmarks/bench.sh   # Timed runs per language (default: 1)
 #   BENCH_WARMUPS=1                    bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
+#   BENCH_ALLOC_STATS=1                bash benchmarks/bench.sh   # Add Blorp allocation/release counts
 #   BENCH_VERBOSE=1                    bash benchmarks/bench.sh   # Print build logs on failures
 
 set -e
@@ -49,6 +50,7 @@ CC="${CC:-cc}"
 BENCH_THREADS="${BENCH_THREADS:-4}"
 BENCH_RUNS="${BENCH_RUNS:-1}"
 BENCH_WARMUPS="${BENCH_WARMUPS:-0}"
+BENCH_ALLOC_STATS="${BENCH_ALLOC_STATS:-0}"
 BENCH_VERBOSE="${BENCH_VERBOSE:-0}"
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
@@ -204,6 +206,46 @@ for _ in range(warmups):
 
 samples = [run_once() for _ in range(runs)]
 print(f"{min(samples):.4f}")
+PY
+}
+
+run_and_read_blorp_alloc_stats() {
+    "$PYTHON" - "$@" <<'PY'
+import re
+import subprocess
+import sys
+
+cmd = sys.argv[1:]
+leak_re = re.compile(
+    r"blorp: leak check: ([0-9]+) allocs, ([0-9]+) releases, "
+    r"([0-9]+) leaked, ([0-9]+) bytes"
+)
+
+proc = subprocess.run(
+    cmd,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    text=True,
+)
+if proc.returncode != 0:
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    raise SystemExit(proc.returncode)
+
+match = None
+for candidate in leak_re.finditer(proc.stderr):
+    match = candidate
+if match is None:
+    sys.stderr.write("benchmark did not report a Blorp leak-check line\n")
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    raise SystemExit(125)
+
+allocs, releases, leaked, bytes_allocated = match.groups()
+print(
+    f"allocs={allocs} releases={releases} leaked={leaked} "
+    f"bytes={bytes_allocated}"
+)
 PY
 }
 
@@ -513,6 +555,26 @@ run_built_lang() {
     run_and_read_seconds "$out" "${args[@]}"
 }
 
+run_blorp_alloc_stats() {
+    local name="$1"
+    shift
+    local args=("$@")
+    local out
+
+    is_built blorp "$name" || return 1
+    out="$(compiled_out_for blorp "$name")"
+    if is_concurrency_benchmark "$name"; then
+        run_and_read_blorp_alloc_stats env \
+            "BLORP_THREADS=$BLORP_CONCURRENCY_THREADS" \
+            "BLORP_LEAK_CHECK=1" \
+            "$out" "${args[@]}"
+    else
+        run_and_read_blorp_alloc_stats env \
+            "BLORP_LEAK_CHECK=1" \
+            "$out" "${args[@]}"
+    fi
+}
+
 run_python_lang() {
     local name="$1" src="$2"
     shift 2
@@ -548,6 +610,7 @@ PY
 run_one() {
     local name="$1"
     local bt="" ct="" gt="" ot="" pt=""
+    local blorp_alloc_stats=""
     local args_text
     local args=()
 
@@ -566,6 +629,9 @@ run_one() {
 
     if bt=$(run_built_lang blorp "$name" "${args[@]}" 2>/dev/null); then
         printf "  %9ss" "$bt"
+        if [ "$BENCH_ALLOC_STATS" = "1" ]; then
+            blorp_alloc_stats="$(run_blorp_alloc_stats "$name" "${args[@]}" 2>/dev/null || true)"
+        fi
     else
         printf "  %8s" "FAIL"
     fi
@@ -617,7 +683,11 @@ run_one() {
         printf "   speedups suppressed (see benchmarks/AUDIT.md)"
     elif [ -n "$bt" ]; then
         local notes=""
-        [ -n "$ct" ] && notes="vs C: $(fmt_speedup "$bt" "$ct")"
+        [ -n "$blorp_alloc_stats" ] && notes="$blorp_alloc_stats"
+        if [ -n "$ct" ]; then
+            [ -n "$notes" ] && notes="$notes, "
+            notes="${notes}vs C: $(fmt_speedup "$bt" "$ct")"
+        fi
         if [ -n "$gt" ]; then
             [ -n "$notes" ] && notes="$notes, "
             notes="${notes}vs Go: $(fmt_speedup "$bt" "$gt")"

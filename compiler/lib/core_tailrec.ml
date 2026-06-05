@@ -172,8 +172,8 @@ let rec core_uses_var (target : var) (e : core) : bool =
         false e
 
 let list_self_call_spread_binding (f : core_func) (list_index : int)
-    (bindings : (var * accessor) list) (e : core) :
-    (var * int * core list) option =
+    (bindings : match_binding list) (e : core) : (var * int * core list) option
+    =
   match self_tail_call_args f e with
   | None -> None
   | Some args -> (
@@ -181,15 +181,15 @@ let list_self_call_spread_binding (f : core_func) (list_index : int)
       | Some { desc = CVar spread_var; _ } -> (
           match
             List.find_opt
-              (fun (v, acc) ->
-                Var.equal v spread_var
+              (fun binding ->
+                Var.equal binding.mb_var spread_var
                 &&
-                match acc with
+                match binding.mb_accessor with
                 | AccListSpread (AccRoot, _) -> true
                 | _ -> false)
               bindings
           with
-          | Some (_, AccListSpread (AccRoot, offset))
+          | Some { mb_accessor = AccListSpread (AccRoot, offset); _ }
             when List.for_all
                    (fun (i, arg) ->
                      i = list_index || not (core_uses_var spread_var arg))
@@ -210,7 +210,9 @@ let rec list_ctree_supported (f : core_func) (list_index : int) (tree : ctree) :
     bool =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      List.for_all (fun (_, acc) -> list_accessor_supported acc) ct_bindings
+      List.for_all
+        (fun binding -> list_accessor_supported binding.mb_accessor)
+        ct_bindings
       && ((not (expr_has_tail_self_call f ct_body))
          || Option.is_some
               (list_self_call_spread_binding f list_index ct_bindings ct_body))

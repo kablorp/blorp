@@ -146,6 +146,7 @@ BLORP_THREADS=4                 bash benchmarks/bench.sh   # Blorp runtime threa
 GOMAXPROCS=4                    bash benchmarks/bench.sh   # Go runtime parallelism for concurrency rows
 BENCH_RUNS=5                    bash benchmarks/bench.sh   # Timed runs per language (default: 1)
 BENCH_WARMUPS=1                 bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
+BENCH_ALLOC_STATS=1             bash benchmarks/bench.sh   # Add Blorp allocation/release counts
 BENCH_VERBOSE=1                 bash benchmarks/bench.sh   # Print build logs on failures
 ```
 

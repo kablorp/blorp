@@ -388,7 +388,9 @@ let add_bound_typed_vars bound vars =
 let rec var_occurs_free_in_ctree (name : string) bound = function
   | CTLeaf { ct_bindings; ct_body } ->
       let body_bound =
-        List.fold_left (fun acc (v, _) -> add_bound_var acc v) bound ct_bindings
+        List.fold_left
+          (fun acc binding -> add_bound_var acc binding.mb_var)
+          bound ct_bindings
       in
       var_occurs_free_in_body name body_bound ct_body
   | CTFail -> false
@@ -510,7 +512,12 @@ let drop_unused_spread_bindings body bindings =
 
 let ct_leaf bindings body =
   CTLeaf
-    { ct_bindings = drop_unused_spread_bindings body bindings; ct_body = body }
+    {
+      ct_bindings =
+        drop_unused_spread_bindings body bindings
+        |> List.map (fun (v, acc) -> borrowed_match_binding v acc);
+      ct_body = body;
+    }
 
 (** Build a [CTLeaf] from a catch-all pattern. If the pattern is
     [PatVar x], bind [x] to the root scrutinee. If it's [PatWildcard],
@@ -683,7 +690,10 @@ let rec compile_subpats_at ~(base : accessor) ~(ctor : string) ~(pos : int)
           (* Prepend outer bindings to every leaf in the inner tree *)
           let rec prepend_bindings tree =
             match tree with
-            | CTLeaf l -> ct_leaf (outer_bindings @ l.ct_bindings) l.ct_body
+            | CTLeaf l ->
+                ct_leaf
+                  (outer_bindings @ List.map match_binding_pair l.ct_bindings)
+                  l.ct_body
             | CTSwitchTag s ->
                 CTSwitchTag
                   {

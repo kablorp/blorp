@@ -494,6 +494,34 @@ let union_destructor_policy (ctx : Core_emit_context.t) (t : Ast.type_decl) :
       Codegen_types.register_union_type ctx.reg t.type_name ~destructor;
       destructor
 
+let union_field_may_need_release (ctx : Core_emit_context.t)
+    (field_ty : Ast.type_expr) (loc : Ast.loc) : bool =
+  if Codegen_types.has_type_vars field_ty then true
+  else boxed_value_needs_release ctx field_ty loc
+
+let union_variant_needs_release_mask (ctx : Core_emit_context.t)
+    (v : Ast.variant) : bool =
+  List.exists
+    (fun field_ty -> union_field_may_need_release ctx field_ty v.variant_loc)
+    v.variant_fields
+
+let union_type_has_release_mask (ctx : Core_emit_context.t) (t : Ast.type_decl)
+    : bool =
+  List.exists (union_variant_needs_release_mask ctx) t.type_variants
+
+let union_constructor_needs_release_mask (ctx : Core_emit_context.t) type_name
+    ctor_name : bool =
+  match Codegen_types.lookup_union_variant ctx.reg type_name ctor_name with
+  | Some variant -> union_variant_needs_release_mask ctx variant
+  | None -> true
+
+let union_constructor_needs_release_mask_for_type (ctx : Core_emit_context.t)
+    (result_ty : Ast.type_expr) ctor_name : bool =
+  match normalize_type result_ty with
+  | Ast.TyNamed (type_name, _) ->
+      union_constructor_needs_release_mask ctx type_name ctor_name
+  | _ -> true
+
 let record_field_decl (ctx : Core_emit_context.t) type_name field_name =
   match Hashtbl.find_opt ctx.record_decls type_name with
   | None -> None
@@ -1631,6 +1659,10 @@ and emit_union_construct ctx uc =
       | (Some Core_layout_type.OptionConstructorBoxedUnion | None), [] ->
           emit ctx (escape_c_ident uc.uc_c_name)
       | (Some Core_layout_type.OptionConstructorBoxedUnion | None), args ->
+          let needs_release_mask =
+            union_constructor_needs_release_mask ctx uc.uc_type_name
+              uc.uc_constructor_name
+          in
           emit ctx uc.uc_c_name;
           emit ctx "(";
           List.iteri
@@ -1638,7 +1670,35 @@ and emit_union_construct ctx uc =
               if i > 0 then emit ctx ", ";
               emit_boxed_storage ctx arg)
             args;
-          emit ctx (Printf.sprintf ", %dUL)" uc.uc_release_mask))
+          if needs_release_mask then begin
+            if args <> [] then emit ctx ", ";
+            emit ctx (Printf.sprintf "%dUL" uc.uc_release_mask)
+          end;
+          emit ctx ")")
+
+and emit_union_reuse_construct ctx urc =
+  match urc.urc_representation with
+  | GenericUnion ->
+      let needs_release_mask =
+        union_constructor_needs_release_mask ctx urc.urc_type_name
+          urc.urc_constructor_name
+      in
+      emit ctx urc.urc_reuse_c_name;
+      emit ctx "(";
+      emit_expr ctx urc.urc_source;
+      List.iter
+        (fun arg ->
+          emit ctx ", ";
+          emit_boxed_storage ctx arg)
+        urc.urc_args;
+      if needs_release_mask then
+        emit ctx (Printf.sprintf ", %dUL" urc.urc_release_mask);
+      emit ctx ")"
+  | OptionUnion _ | ResultUnion _ ->
+      Core_error.errorf Core_error.Emit Ast.dummy_loc
+        ~hint:"union reuse is only supported for heap-allocated generic unions"
+        "unsupported union reuse constructor for %s.%s" urc.urc_type_name
+        urc.urc_constructor_name
 
 and emit_generated_stack_option_vector_get ctx abi arr idx =
   let vec_tmp = Printf.sprintf "__gso_vec_%d" (fresh_temp ctx) in
@@ -3855,6 +3915,13 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                             Hashtbl.mem ctx.constructor_names field
                         | _ -> false
                       in
+                      let union_constructor_name =
+                        match callee.desc with
+                        | CVar v when is_union_constructor -> Some v.vname
+                        | CField (_, field) when is_union_constructor ->
+                            Some field
+                        | _ -> None
+                      in
                       let box_all =
                         match (kind, void_positions) with
                         | _, Some _ -> false
@@ -3892,13 +3959,22 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                           else emit_expr ctx arg)
                         args;
                       (* Union-variant constructors take a trailing release_mask
-              parameter — see [emit_union_type]'s constructor for why
-              the mask must be computed at the call site rather than
-              baked in. Bit [i] is set iff the boxed payload is owned
-              ARC-managed heap storage. RC source values and boxed
-              value-record structs are releasable; scalar bit-pattern
-              boxes such as Float stay unowned. *)
-                      if is_union_constructor then begin
+              parameter only when their declared fields may need release.
+              For those variants the mask is computed at the call site rather
+              than baked in because generic payload ownership depends on the
+              monomorphic argument types. Bit [i] is set iff the boxed payload
+              is owned ARC-managed heap storage. RC source values and boxed
+              value-record structs are releasable; scalar bit-pattern boxes
+              such as Float stay unowned. *)
+                      let constructor_needs_release_mask =
+                        match union_constructor_name with
+                        | Some ctor_name ->
+                            union_constructor_needs_release_mask_for_type ctx
+                              e.ty ctor_name
+                        | None -> false
+                      in
+                      if is_union_constructor && constructor_needs_release_mask
+                      then begin
                         let mask =
                           List.fold_left
                             (fun acc (i, ty) ->
@@ -4176,6 +4252,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
   | CSetAlloc sa -> emit_set_alloc ctx e.loc sa.sa_constructor
   | CTensorLiteral tl -> emit_tensor_literal ctx e.loc tl
   | CUnionConstruct uc -> emit_union_construct ctx uc
+  | CUnionReuseConstruct urc -> emit_union_reuse_construct ctx urc
   (* ---- Record construction: [TypeName_make(field0, field1, ...)] ----
      Matches the legacy codegen's constructor convention. The result
      type's name is used as the constructor prefix. Fields are emitted
@@ -5080,7 +5157,8 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
   | CDictConstruct _ | CSetAlloc _ | CRecord _ | CRecordConstruct _
   | CRecordUpdate _ | CRange _ | CLambda _ | CClosureCreate _ | CStringInterp _
   | CDebugBlock _ | CCast _ | CUnbox _ | CUnboxTyped _ | CBox _ | CBoxTyped _
-  | CUnionConstruct _ | CListHandoff _ | CTailrecLoop _ | CTailrecRecur _ ->
+  | CUnionConstruct _ | CUnionReuseConstruct _ | CListHandoff _ | CTailrecLoop _
+  | CTailrecRecur _ ->
       emit_indent ctx;
       emit_expr ctx e;
       emitln ctx ";"
@@ -5402,12 +5480,13 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
     source_emitted_destructor_name ~loc:(loc_for_type_decl t) ~type_name:n
       (union_destructor_policy ctx t)
   in
-  (* typedef struct Name { header; tag; release_mask; union { ... } data; } Name; *)
+  let has_release_mask = union_type_has_release_mask ctx t in
+  (* typedef struct Name { header; tag; optional release_mask; union { ... } data; } Name; *)
   emitln ctx (Printf.sprintf "typedef struct %s {" n);
   ctx.indent <- ctx.indent + 1;
   emit_line ctx "blorp_Object header;";
   emit_line ctx "int tag;";
-  emit_line ctx "unsigned long release_mask;";
+  if has_release_mask then emit_line ctx "unsigned long release_mask;";
   emit_line ctx "union {";
   ctx.indent <- ctx.indent + 1;
   List.iter
@@ -5444,7 +5523,7 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
             let rc_indices =
               List.mapi (fun i ft -> (i, ft)) v.variant_fields
               |> List.filter (fun (_, ft) ->
-                  boxed_value_needs_release ctx ft v.variant_loc)
+                  union_field_may_need_release ctx ft v.variant_loc)
             in
             (v, rc_indices))
           t.type_variants
@@ -5491,15 +5570,14 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
       emit ctx "\n");
   (* Constructor functions for non-empty variants.
 
-     The release_mask is passed as a trailing parameter rather than
-     baked in at emission time. Generic union fields are typed [TyVar T]
+     The release_mask is passed as a trailing parameter only for variants whose
+     declared fields may need release. Generic union fields are typed [TyVar T]
      at the constructor site, where source-value ownership can differ from
      boxed-storage ownership; using a constant declaration-time mask would
      produce a destroy-time [blorp_release(42)] when [Option[Int]] is destroyed
-     (the Int payload is non-null and "looks like" a heap pointer).
-     Each call site already knows the real per-arg types post-mono, so
-     the mask is computed there — see [constructor_release_mask] in
-     [emit_expr]'s [CCall] case. *)
+     (the Int payload is non-null and "looks like" a heap pointer). Each call
+     site already knows the real per-arg types post-mono, so the mask is
+     computed there. Concrete primitive-only variants omit the parameter. *)
   List.iter
     (fun (v : Ast.variant) ->
       if v.variant_fields <> [] then begin
@@ -5514,13 +5592,18 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
           | Some id -> Codegen_names.mangle_by_def_id id v.variant_name
           | None -> v.variant_name
         in
+        let needs_release_mask = union_variant_needs_release_mask ctx v in
         emit ctx (Printf.sprintf "%s* %s(" n ctor_c);
         List.iteri
           (fun i _ft ->
             if i > 0 then emit ctx ", ";
             emit ctx (Printf.sprintf "void* field%d" i))
           v.variant_fields;
-        emitln ctx ", unsigned long release_mask) {";
+        if needs_release_mask then begin
+          if v.variant_fields <> [] then emit ctx ", ";
+          emit ctx "unsigned long release_mask"
+        end;
+        emitln ctx ") {";
         ctx.indent <- ctx.indent + 1;
         emit_line ctx
           (Printf.sprintf "%s* __vc = (%s*)blorp_alloc(sizeof(%s));" n n n);
@@ -5532,7 +5615,9 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
               (Printf.sprintf "BLORP_SET_DESTRUCTOR(__vc, %s);" destroy_name));
         emit_line ctx
           (Printf.sprintf "__vc->tag = %s;" (variant_tag_c_name n v));
-        emit_line ctx "__vc->release_mask = release_mask;";
+        if needs_release_mask then
+          emit_line ctx "__vc->release_mask = release_mask;"
+        else if has_release_mask then emit_line ctx "__vc->release_mask = 0UL;";
         List.iteri
           (fun i _ ->
             emit_line ctx
@@ -5540,6 +5625,53 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
                  i i))
           v.variant_fields;
         emit_line ctx "return __vc;";
+        ctx.indent <- ctx.indent - 1;
+        emitln ctx "}";
+        emit ctx "\n";
+        let reuse_c =
+          Codegen_names.union_reuse_constructor_name ~type_name:n
+            ~constructor_c_name:ctor_c
+        in
+        emit ctx (Printf.sprintf "static inline %s* %s(%s* __old" n reuse_c n);
+        List.iteri
+          (fun i _ft -> emit ctx (Printf.sprintf ", void* field%d" i))
+          v.variant_fields;
+        if needs_release_mask then emit ctx ", unsigned long release_mask";
+        emitln ctx ") {";
+        ctx.indent <- ctx.indent + 1;
+        emit_line ctx "if (__old && blorp_is_unique(__old)) {";
+        ctx.indent <- ctx.indent + 1;
+        (match destructor_name with
+        | None -> ()
+        | Some destroy_name ->
+            emit_line ctx (Printf.sprintf "%s(__old);" destroy_name));
+        emit_line ctx
+          (Printf.sprintf "__old->tag = %s;" (variant_tag_c_name n v));
+        if needs_release_mask then
+          emit_line ctx "__old->release_mask = release_mask;"
+        else if has_release_mask then emit_line ctx "__old->release_mask = 0UL;";
+        List.iteri
+          (fun i _ ->
+            emit_line ctx
+              (Printf.sprintf "__old->data.%s.field%d = field%d;" v.variant_name
+                 i i))
+          v.variant_fields;
+        emit_line ctx "return __old;";
+        ctx.indent <- ctx.indent - 1;
+        emit_line ctx "}";
+        emit ctx (Printf.sprintf "%s* __fresh = %s(" n ctor_c);
+        List.iteri
+          (fun i _ ->
+            if i > 0 then emit ctx ", ";
+            emit ctx (Printf.sprintf "field%d" i))
+          v.variant_fields;
+        if needs_release_mask then begin
+          if v.variant_fields <> [] then emit ctx ", ";
+          emit ctx "release_mask"
+        end;
+        emitln ctx ");";
+        emit_line ctx "if (__old) blorp_release(__old);";
+        emit_line ctx "return __fresh;";
         ctx.indent <- ctx.indent - 1;
         emitln ctx "}";
         emit ctx "\n"
@@ -5874,6 +6006,8 @@ and emit_program ?(embed_runtime = false) (ctx : Core_emit_context.t)
         | CDType t when t.type_is_enum ->
             Codegen_types.register_enum_type ctx.reg t.type_name t.type_variants
         | CDType t when not t.type_is_builtin ->
+            Codegen_types.register_union_variants ctx.reg t.type_name
+              t.type_variants;
             Codegen_types.register_union_type ctx.reg t.type_name
               ~destructor:
                 (Codegen_types.GeneratedDestructor (t.type_name ^ "_destroy"))
@@ -6866,8 +7000,8 @@ and tailrec_core_uses_var (target : var) (e : core) : bool =
        false e
 
 and tailrec_list_self_call_spread_binding (f : core_func) (list_index : int)
-    (bindings : (var * accessor) list) (e : core) :
-    (var * int * core list) option =
+    (bindings : match_binding list) (e : core) : (var * int * core list) option
+    =
   match self_tail_call_args f e with
   | None -> None
   | Some args -> (
@@ -6875,15 +7009,15 @@ and tailrec_list_self_call_spread_binding (f : core_func) (list_index : int)
       | Some { desc = CVar spread_var; _ } -> (
           match
             List.find_opt
-              (fun (v, acc) ->
-                Var.equal v spread_var
+              (fun binding ->
+                Var.equal binding.mb_var spread_var
                 &&
-                match acc with
+                match binding.mb_accessor with
                 | AccListSpread (AccRoot, _) -> true
                 | _ -> false)
               bindings
           with
-          | Some (_, AccListSpread (AccRoot, offset))
+          | Some { mb_accessor = AccListSpread (AccRoot, offset); _ }
             when List.for_all
                    (fun (i, arg) ->
                      i = list_index
@@ -6906,7 +7040,7 @@ and tailrec_list_ctree_supported (f : core_func) (list_index : int)
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
       List.for_all
-        (fun (_, acc) -> tailrec_list_accessor_supported acc)
+        (fun binding -> tailrec_list_accessor_supported binding.mb_accessor)
         ct_bindings
       && ((not (expr_has_tail_self_call f ct_body))
          || Option.is_some
@@ -7088,9 +7222,8 @@ and emit_list_tailrec_rebinds (ctx : Core_emit_context.t) (f : core_func)
   emit_line ctx "continue;"
 
 and emit_list_tailrec_tail (ctx : Core_emit_context.t) (f : core_func)
-    ~(list_index : int) ~(cursor_name : string)
-    ~(bindings : (var * accessor) list) ~(profile_name : string)
-    ~(return_ty : Ast.type_expr) (e : core) : unit =
+    ~(list_index : int) ~(cursor_name : string) ~(bindings : match_binding list)
+    ~(profile_name : string) ~(return_ty : Ast.type_expr) (e : core) : unit =
   match e.desc with
   | CTailrecRecur (TailrecListSpreadRecur { tr_rebinds; tr_cursor_advance }) ->
       emit_list_tailrec_rebinds ctx f ~cursor_name ~offset:tr_cursor_advance
@@ -7104,8 +7237,8 @@ and emit_list_tailrec_tail (ctx : Core_emit_context.t) (f : core_func)
 and emit_list_tailrec_leaf (ctx : Core_emit_context.t) (f : core_func)
     ~(list_index : int) ~(list_ty : Ast.type_expr) ~(list_name : string)
     ~(cursor_name : string) ~(profile_name : string)
-    ~(return_ty : Ast.type_expr) (bindings : (var * accessor) list)
-    (body : core) : unit =
+    ~(return_ty : Ast.type_expr) (bindings : match_binding list) (body : core) :
+    unit =
   let skip_spread_var =
     match tailrec_list_self_call_spread_binding f list_index bindings body with
     | Some (v, _, _) -> Some v
@@ -7118,7 +7251,9 @@ and emit_list_tailrec_leaf (ctx : Core_emit_context.t) (f : core_func)
   in
   let var_types = collect_var_types body in
   List.iter
-    (fun (v, acc) ->
+    (fun binding ->
+      let v = binding.mb_var in
+      let acc = binding.mb_accessor in
       let should_skip =
         match skip_spread_var with
         | Some skip -> Var.equal v skip

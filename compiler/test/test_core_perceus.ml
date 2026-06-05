@@ -1427,7 +1427,10 @@ let shadow_value_tree () =
     CTLeaf
       {
         ct_bindings =
-          [ (Var.named "value", AccVariantField (AccRoot, "ShadowString", 0)) ];
+          borrowed_match_binding_pairs
+            [
+              (Var.named "value", AccVariantField (AccRoot, "ShadowString", 0));
+            ];
         ct_body = retained_shadow_value ();
       }
   in
@@ -1824,7 +1827,8 @@ let test_match_tree_aliasing_scrutinee_post_drops_owner () =
   let leaf =
     CTLeaf
       {
-        ct_bindings = [ (Var.named "item", AccRoot) ];
+        ct_bindings =
+          borrowed_match_binding_pairs [ (Var.named "item", AccRoot) ];
         ct_body = intrinsic "string_len" [ cvar "item" ty_string ] ty_int;
       }
   in
@@ -1849,7 +1853,8 @@ let test_match_tree_local_scrutinee_post_drops_owner () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "s", AccVariantField (AccRoot, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "s", AccVariantField (AccRoot, "Some", 0)) ];
                   ct_body = intrinsic "string_len" [ cvar "s" ty_string ] ty_int;
                 } );
             ("None", CTLeaf { ct_bindings = []; ct_body = cint 0 });
@@ -1895,7 +1900,8 @@ let test_match_tree_record_literal_retains_borrowed_binding () =
   let leaf =
     CTLeaf
       {
-        ct_bindings = [ (Var.named "seq", AccRoot) ];
+        ct_bindings =
+          borrowed_match_binding_pairs [ (Var.named "seq", AccRoot) ];
         ct_body = mk (CRecord [ ("sequence", cvar "seq" ty_string) ]) record_ty;
       }
   in
@@ -1938,7 +1944,7 @@ let test_match_tree_record_literal_retains_borrowed_field () =
   let leaf =
     CTLeaf
       {
-        ct_bindings = [ (Var.named "p", AccRoot) ];
+        ct_bindings = borrowed_match_binding_pairs [ (Var.named "p", AccRoot) ];
         ct_body =
           mk
             (CRecord
@@ -2011,7 +2017,7 @@ let test_match_alias_result_binding_retains_binding () =
   let leaf =
     CTLeaf
       {
-        ct_bindings = [ (Var.named "s", AccRoot) ];
+        ct_bindings = borrowed_match_binding_pairs [ (Var.named "s", AccRoot) ];
         ct_body = cvar "s" ty_string;
       }
   in
@@ -2068,7 +2074,7 @@ let test_match_field_result_binding_retains_binding () =
   let leaf =
     CTLeaf
       {
-        ct_bindings = [ (Var.named "p", AccRoot) ];
+        ct_bindings = borrowed_match_binding_pairs [ (Var.named "p", AccRoot) ];
         ct_body = mk (CField (cvar "p" source_ty, "name")) ty_string;
       }
   in
@@ -2164,7 +2170,7 @@ let test_match_aliasing_call_result_binding_retains_result () =
   let leaf =
     CTLeaf
       {
-        ct_bindings = [ (Var.named "xs", AccRoot) ];
+        ct_bindings = borrowed_match_binding_pairs [ (Var.named "xs", AccRoot) ];
         ct_body =
           intrinsic "list_get" [ cvar "xs" ty_list_string; cint 0 ] ty_string;
       }
@@ -2275,7 +2281,8 @@ let test_match_tree_list_eq_retains_borrowed_payload () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "r", AccVariantField (AccRoot, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "r", AccVariantField (AccRoot, "Some", 0)) ];
                   ct_body = eq;
                 } );
           ];
@@ -2355,7 +2362,8 @@ let test_match_tree_handoff_store_retains_borrowed_payload () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "s", AccVariantField (AccRoot, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "s", AccVariantField (AccRoot, "Some", 0)) ];
                   ct_body = store;
                 } );
           ];
@@ -2944,9 +2952,10 @@ let test_mutable_assignment_match_scrutinee_consumes_target_skips_old_release ()
               CTLeaf
                 {
                   ct_bindings =
-                    [
-                      (Var.named "new_v", AccVariantField (AccRoot, "Some", 0));
-                    ];
+                    borrowed_match_binding_pairs
+                      [
+                        (Var.named "new_v", AccVariantField (AccRoot, "Some", 0));
+                      ];
                   ct_body =
                     mk
                       (CAssign (Var.named "v", cvar "new_v" ty_list_int))
@@ -4227,7 +4236,8 @@ let test_program_constructor_retains_borrowed_match_payload () =
     CTLeaf
       {
         ct_bindings =
-          [ (Var.named "seq", AccVariantField (AccRoot, "Boxed", 0)) ];
+          borrowed_match_binding_pairs
+            [ (Var.named "seq", AccVariantField (AccRoot, "Boxed", 0)) ];
         ct_body =
           mk
             (CCall

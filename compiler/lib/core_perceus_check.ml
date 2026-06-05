@@ -148,6 +148,9 @@ let rec simulate (target : string) (state : state) (e : core) : unit =
           List.iter (simulate_boxed_storage target state) elems)
   | CUnionConstruct uc ->
       List.iter (simulate_boxed_storage target state) uc.uc_args
+  | CUnionReuseConstruct urc ->
+      simulate target state urc.urc_source;
+      List.iter (simulate_boxed_storage target state) urc.urc_args
   | CRecordUpdate (b, fs) ->
       simulate target state b;
       List.iter (fun (_, v) -> simulate target state v) fs
@@ -336,7 +339,8 @@ and pattern_binds_ (name : string) (pat : Ast.pattern) : bool =
 and collect_tree_leaves (target : string) (tree : ctree) : core list =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> v.vname = target) ct_bindings then []
+      if List.exists (fun binding -> binding.mb_var.vname = target) ct_bindings
+      then []
       else [ ct_body ]
   | CTFail -> []
   | CTSwitchTag { cts_cases; cts_default; _ } ->

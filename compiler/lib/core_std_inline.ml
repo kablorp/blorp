@@ -148,9 +148,9 @@ let rec clone_ctree state env tree =
   | CTLeaf { ct_bindings; ct_body } ->
       let bindings, env =
         List.fold_left
-          (fun (bindings, env) (v, acc) ->
-            let v', env = rename_binder state env v in
-            ((v', acc) :: bindings, env))
+          (fun (bindings, env) binding ->
+            let v', env = rename_binder state env binding.mb_var in
+            ({ binding with mb_var = v' } :: bindings, env))
           ([], env) ct_bindings
       in
       CTLeaf

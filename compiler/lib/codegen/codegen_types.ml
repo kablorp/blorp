@@ -344,6 +344,12 @@ type registry = {
       (** All-nullary union types — [type_to_c] emits these as [long] since
         they live at runtime as integer tags. The metadata also drives packed
         list/tensor storage decisions. *)
+  union_variants : (string, (string, variant) Hashtbl.t) Hashtbl.t;
+      (** Union variant metadata keyed by type name, then constructor name.
+        This is intentionally separate from [managed_types]: enum and managed
+        unions both have constructors, but only managed unions allocate ARC
+        objects. Earlier Core passes use this table to recognize constructor
+        calls without guessing from source names. *)
   managed_types : (string, managed_type_info) Hashtbl.t;
       (** Heap-allocated user types with ARC headers: records and non-enum
         unions. The value records the type's release/destructor policy, so
@@ -367,6 +373,7 @@ let create_registry () : registry =
   {
     value_records = Hashtbl.create 16;
     enum_types = Hashtbl.create 8;
+    union_variants = Hashtbl.create 16;
     managed_types = Hashtbl.create 32;
     type_aliases = Hashtbl.create 16;
   }
@@ -375,8 +382,21 @@ let create_registry () : registry =
 let reset_registry (reg : registry) : unit =
   Hashtbl.clear reg.value_records;
   Hashtbl.clear reg.enum_types;
+  Hashtbl.clear reg.union_variants;
   Hashtbl.clear reg.managed_types;
   Hashtbl.clear reg.type_aliases
+
+let register_union_variants reg name variants =
+  let by_name =
+    match Hashtbl.find_opt reg.union_variants name with
+    | Some tbl -> tbl
+    | None ->
+        let tbl = Hashtbl.create 8 in
+        Hashtbl.add reg.union_variants name tbl;
+        tbl
+  in
+  Hashtbl.clear by_name;
+  List.iter (fun v -> Hashtbl.replace by_name v.variant_name v) variants
 
 let register_managed_type reg name info =
   Hashtbl.replace reg.managed_types name info
@@ -395,10 +415,17 @@ let enum_info_of_variants variants =
   { enum_variant_count = List.length variants; enum_max_tag = max_tag }
 
 let register_enum_type reg name variants =
+  register_union_variants reg name variants;
   Hashtbl.replace reg.enum_types name (enum_info_of_variants variants)
 
 let enum_info reg name = Hashtbl.find_opt reg.enum_types name
 let is_enum_type reg name = Hashtbl.mem reg.enum_types name
+
+let lookup_union_variant reg type_name variant_name =
+  match Hashtbl.find_opt reg.union_variants type_name with
+  | None -> None
+  | Some variants -> Hashtbl.find_opt variants variant_name
+
 let managed_type_info reg name = Hashtbl.find_opt reg.managed_types name
 let is_managed_type reg name = Hashtbl.mem reg.managed_types name
 

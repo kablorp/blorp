@@ -580,10 +580,11 @@ let test_tuple_match_bindings_scalar_replaced () =
            CTLeaf
              {
                ct_bindings =
-                 [
-                   (a, AccTupleField (AccRoot, 0));
-                   (b, AccTupleField (AccRoot, 1));
-                 ];
+                 borrowed_match_binding_pairs
+                   [
+                     (a, AccTupleField (AccRoot, 0));
+                     (b, AccTupleField (AccRoot, 1));
+                   ];
                ct_body =
                  mk ty_int (CBin (Add, cvar "a" ty_int, cvar "b" ty_int));
              } ))
@@ -612,7 +613,9 @@ let test_tuple_match_literal_split_scalar_replaced () =
                    ( LitInt 0L,
                      CTLeaf
                        {
-                         ct_bindings = [ (y, AccTupleField (AccRoot, 1)) ];
+                         ct_bindings =
+                           borrowed_match_binding_pairs
+                             [ (y, AccTupleField (AccRoot, 1)) ];
                          ct_body = cvar "y" ty_int;
                        } );
                  ];
@@ -643,7 +646,9 @@ let test_immediate_tuple_match_scalar_replaced () =
                    ( LitInt 0L,
                      CTLeaf
                        {
-                         ct_bindings = [ (y, AccTupleField (AccRoot, 1)) ];
+                         ct_bindings =
+                           borrowed_match_binding_pairs
+                             [ (y, AccTupleField (AccRoot, 1)) ];
                          ct_body = cvar "y" ty_int;
                        } );
                  ];
@@ -782,10 +787,11 @@ let test_immediate_tuple_return_call_match_scalar_replaced () =
            CTLeaf
              {
                ct_bindings =
-                 [
-                   (x, AccTupleField (AccRoot, 0));
-                   (y, AccTupleField (AccRoot, 1));
-                 ];
+                 borrowed_match_binding_pairs
+                   [
+                     (x, AccTupleField (AccRoot, 0));
+                     (y, AccTupleField (AccRoot, 1));
+                   ];
                ct_body =
                  mk ty_int (CBin (Add, cvar "x" ty_int, cvar "y" ty_int));
              } ))

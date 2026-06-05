@@ -9,18 +9,24 @@ open Blorp.Core
 let ty_int = TyNamed ("Int", [])
 let ty_int32 = TyNamed ("Int32", [])
 let ty_uint64 = TyNamed ("UInt64", [])
+let ty_bool = TyNamed ("Bool", [])
 let ty_ptr = TyNamed ("Ptr", [])
 let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
 let ty_test_resource = TyNamed ("TestResource", [])
+let ty_expr = TyNamed ("Expr", [])
 let ty_list elem = TyNamed ("List", [ elem ])
 let ty_set elem = TyNamed ("Set", [ elem ])
 let ty_dict key value = TyNamed ("Dict", [ key; value ])
 let mk ty desc = { desc; ty; loc = dummy_loc }
 let void () = mk ty_void CVoid
 let int n = mk ty_int (CLit (LitInt (Int64.of_int n)))
+let bool b = mk ty_bool (CLit (LitBool b))
 let var name ty = mk ty (CVar (Var.named name))
 let intrinsic name args ty = mk ty (CCall (CKIntrinsic name, void (), args))
+
+let user_call ?def_id name args ty =
+  mk ty (CCall (CKUser (name, def_id), void (), args))
 
 let lett name rhs body =
   mk body.ty
@@ -59,6 +65,82 @@ let dict_construct ty =
          dc_entries = [];
          dc_value_needs_release = false;
        })
+
+let expr_type_decl =
+  {
+    type_name = "Expr";
+    type_params = [];
+    type_variants =
+      [
+        {
+          variant_name = "Lit";
+          variant_fields = [ ty_int ];
+          variant_tag = 0;
+          variant_loc = dummy_loc;
+          variant_def_id = Some 100;
+        };
+        {
+          variant_name = "Add";
+          variant_fields = [ ty_expr; ty_expr ];
+          variant_tag = 1;
+          variant_loc = dummy_loc;
+          variant_def_id = Some 101;
+        };
+      ];
+    type_is_enum = false;
+    type_is_builtin = false;
+    type_is_resource = false;
+    type_resource_cleanup = None;
+  }
+
+let expr_reg () =
+  let reg = Blorp.Codegen_types.create_registry () in
+  Blorp.Core_flatten.register_types reg
+    [ { cd_desc = CDType expr_type_decl; cd_loc = dummy_loc; cd_doc = None } ];
+  reg
+
+let boxed_expr_storage value =
+  {
+    bsv_box =
+      { box_value = value; box_source_ty = ty_expr; box_kind = BoxPointer };
+    bsv_needs_release = true;
+    bsv_transfers_ownership = true;
+  }
+
+let prepared_expr_construct ctor_name ctor_def_id tag args =
+  mk ty_expr
+    (CUnionConstruct
+       {
+         uc_type_name = "Expr";
+         uc_constructor_name = ctor_name;
+         uc_c_name = Blorp.Codegen_names.mangle_by_def_id ctor_def_id ctor_name;
+         uc_tag = tag;
+         uc_representation = GenericUnion;
+         uc_args = args;
+         uc_release_mask =
+           List.mapi
+             (fun idx arg -> if arg.bsv_needs_release then 1 lsl idx else 0)
+             args
+           |> List.fold_left ( lor ) 0;
+       })
+
+let prepared_add_construct left right =
+  prepared_expr_construct "Add" 101 1
+    [ boxed_expr_storage left; boxed_expr_storage right ]
+
+let owned_add_bindings =
+  [
+    owned_match_binding (Var.named "left") (AccVariantField (AccRoot, "Add", 0));
+    owned_match_binding (Var.named "right")
+      (AccVariantField (AccRoot, "Add", 1));
+  ]
+
+let borrowed_add_bindings =
+  borrowed_match_binding_pairs
+    [
+      (Var.named "left", AccVariantField (AccRoot, "Add", 0));
+      (Var.named "right", AccVariantField (AccRoot, "Add", 1));
+    ]
 
 let list_handoff ?(mode = BorrowFresh) ?result_ty source =
   let source_ty = source.ty in
@@ -198,6 +280,50 @@ let test_marks_dead_dict_before_explicit_dict_construct () =
     "candidate"
     [ ("d", "next", "dict") ]
     (candidate_names (Blorp.Core_reuse.analyze_expr body))
+
+let test_marks_dead_managed_union_before_constructor_call () =
+  let reg = expr_reg () in
+  let next = user_call ~def_id:100 "Lit" [ int 7 ] ty_expr in
+  let body = drop "expr" ty_expr (lett "next" next (var "next" ty_expr)) in
+  let analysis =
+    Blorp.Core_reuse.analyze_drop_block ~reg (Var.named "expr") ty_expr
+      (match body.desc with
+      | CDrop (_, _, body) -> body
+      | _ -> failwith "expected drop")
+  in
+  Alcotest.(check (list string))
+    "block facts"
+    [ "alloc:next:managed-union:Expr" ]
+    (block_fact_tags analysis.facts);
+  Alcotest.(check (list (triple string string string)))
+    "candidate"
+    [ ("expr", "next", "managed-union:Expr") ]
+    (candidate_names (Blorp.Core_reuse.analyze_expr ~reg body));
+  match analysis.candidate with
+  | Some
+      {
+        allocation = { allocation_managed_constructor = Some constructor; _ };
+        _;
+      } ->
+      Alcotest.(check string)
+        "constructor type" "Expr" constructor.managed_type_name;
+      Alcotest.(check string)
+        "constructor name" "Lit" constructor.managed_constructor_name;
+      Alcotest.(check (option int))
+        "constructor def id" (Some 100) constructor.managed_constructor_def_id;
+      Alcotest.(check int)
+        "constructor tag" 0 constructor.managed_constructor_tag;
+      Alcotest.(check int)
+        "constructor arity" 1 constructor.managed_constructor_arity
+  | _ -> Alcotest.fail "expected managed union constructor allocation fact"
+
+let test_rejects_managed_union_constructor_def_id_mismatch () =
+  let reg = expr_reg () in
+  let next = user_call ~def_id:999 "Lit" [ int 7 ] ty_expr in
+  let body = drop "expr" ty_expr (lett "next" next (var "next" ty_expr)) in
+  Alcotest.(check int)
+    "candidate count" 0
+    (List.length (Blorp.Core_reuse.analyze_expr ~reg body))
 
 let test_marks_later_allocation_after_safe_binding () =
   let list_ty = ty_list ty_int in
@@ -388,6 +514,38 @@ let test_rewrite_program_keeps_same_family_without_reuse_boundary () =
   Alcotest.(check bool)
     "program unchanged" true
     (Blorp.Core_reuse.rewrite_program prog = prog)
+
+let test_rewrite_program_keeps_managed_union_candidate_without_reuse_boundary ()
+    =
+  let reg = expr_reg () in
+  let body =
+    drop "expr" ty_expr
+      (lett "next"
+         (user_call ~def_id:100 "Lit" [ int 7 ] ty_expr)
+         (var "next" ty_expr))
+  in
+  let fn =
+    {
+      cf_name = "main";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params = [];
+      cf_return_ty = ty_expr;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 1;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDType expr_type_decl; cd_loc = dummy_loc; cd_doc = None };
+      { cd_desc = CDFunc fn; cd_loc = dummy_loc; cd_doc = None };
+    ]
+  in
+  Alcotest.(check bool)
+    "program unchanged" true
+    (Blorp.Core_reuse.rewrite_program ~reg prog = prog)
 
 let test_rewrite_program_reuses_dead_list_allocation () =
   let list_ty = ty_list ty_int in
@@ -870,6 +1028,150 @@ let test_rewrite_program_upgrades_same_layout_handoff_drop () =
   | _ ->
       Alcotest.fail "expected same-layout handoff to become consuming handoff"
 
+let prepared_union_match_with_body ct_bindings ct_body =
+  let match_expr =
+    mk ty_expr
+      (CMatch
+         ( var "expr" ty_expr,
+           CTSwitchTag
+             {
+               cts_scrut = AccRoot;
+               cts_cases = [ ("Add", CTLeaf { ct_bindings; ct_body }) ];
+               cts_default = None;
+             } ))
+  in
+  lett "__result" match_expr (drop "expr" ty_expr (var "__result" ty_expr))
+
+let prepared_union_match_with_bindings ct_bindings =
+  prepared_union_match_with_body ct_bindings
+    (prepared_add_construct (var "left" ty_expr) (var "right" ty_expr))
+
+let rewrite_prepared_expr_body ?body ct_bindings =
+  let reg = expr_reg () in
+  let body =
+    match body with
+    | Some body -> prepared_union_match_with_body ct_bindings body
+    | None -> prepared_union_match_with_bindings ct_bindings
+  in
+  let fn =
+    {
+      cf_name = "rewrite_prepared";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params =
+        [ { cp_name = Var.named "expr"; cp_ty = ty_expr; cp_loc = dummy_loc } ];
+      cf_return_ty = ty_expr;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 1;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDType expr_type_decl; cd_loc = dummy_loc; cd_doc = None };
+      { cd_desc = CDFunc fn; cd_loc = dummy_loc; cd_doc = None };
+    ]
+  in
+  match Blorp.Core_reuse.rewrite_prepared_program ~reg prog with
+  | [ _; { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] -> body
+  | _ -> failwith "expected rewritten prepared function body"
+
+let count_union_reuse_constructs body =
+  fold_tree
+    (fun acc node ->
+      match node.desc with CUnionReuseConstruct _ -> acc + 1 | _ -> acc)
+    0 body
+
+let test_rewrite_prepared_program_reuses_owned_union_match_result () =
+  let body = rewrite_prepared_expr_body owned_add_bindings in
+  Alcotest.(check int)
+    "reuse constructor count" 1
+    (count_union_reuse_constructs body);
+  match body.desc with
+  | CMatch
+      ( { desc = CVar { vname = "expr"; _ }; _ },
+        CTSwitchTag
+          {
+            cts_cases =
+              [
+                ( "Add",
+                  CTLeaf
+                    {
+                      ct_body =
+                        {
+                          desc =
+                            CUnionReuseConstruct
+                              {
+                                urc_source = { desc = CVar source; _ };
+                                urc_constructor_name = "Add";
+                                urc_release_mask = 3;
+                                _;
+                              };
+                          _;
+                        };
+                      _;
+                    } );
+              ];
+            _;
+          } ) ->
+      Alcotest.(check string) "source" "expr" source.vname
+  | _ -> Alcotest.fail "expected match leaf to use CUnionReuseConstruct"
+
+let test_rewrite_prepared_program_rejects_borrowed_union_match_fields () =
+  let body = rewrite_prepared_expr_body borrowed_add_bindings in
+  Alcotest.(check int)
+    "reuse constructor count" 0
+    (count_union_reuse_constructs body);
+  match body.desc with
+  | CLet (_, { desc = CDrop ({ vname = "expr"; _ }, _, _); _ }) -> ()
+  | _ -> Alcotest.fail "expected borrowed match fields to keep original drop"
+
+let test_rewrite_prepared_program_reuses_all_if_branches () =
+  let branch_body =
+    mk ty_expr
+      (CIf
+         ( bool true,
+           prepared_add_construct (var "left" ty_expr) (var "right" ty_expr),
+           prepared_add_construct (var "right" ty_expr) (var "left" ty_expr) ))
+  in
+  let body = rewrite_prepared_expr_body ~body:branch_body owned_add_bindings in
+  Alcotest.(check int)
+    "reuse constructor count" 2
+    (count_union_reuse_constructs body);
+  match body.desc with
+  | CMatch _ -> ()
+  | _ -> Alcotest.fail "expected fully reusable if to replace outer drop"
+
+let test_rewrite_prepared_program_rejects_partial_if_branch () =
+  let branch_body =
+    mk ty_expr
+      (CIf
+         ( bool true,
+           prepared_add_construct (var "left" ty_expr) (var "right" ty_expr),
+           var "left" ty_expr ))
+  in
+  let body = rewrite_prepared_expr_body ~body:branch_body owned_add_bindings in
+  Alcotest.(check int)
+    "reuse constructor count" 0
+    (count_union_reuse_constructs body);
+  match body.desc with
+  | CLet (_, { desc = CDrop ({ vname = "expr"; _ }, _, _); _ }) -> ()
+  | _ -> Alcotest.fail "expected partial if to keep original drop"
+
+let test_rewrite_prepared_program_rejects_source_alias_payload () =
+  let alias_body =
+    lett "same" (var "expr" ty_expr)
+      (prepared_add_construct (var "same" ty_expr) (var "right" ty_expr))
+  in
+  let body = rewrite_prepared_expr_body ~body:alias_body owned_add_bindings in
+  Alcotest.(check int)
+    "reuse constructor count" 0
+    (count_union_reuse_constructs body);
+  match body.desc with
+  | CLet (_, { desc = CDrop ({ vname = "expr"; _ }, _, _); _ }) -> ()
+  | _ -> Alcotest.fail "expected source alias payload to keep original drop"
+
 let test_rewrite_emits_reuse_boundary_without_extra_drop () =
   let list_ty = ty_list ty_int in
   let body = drop "xs" list_ty (lett "ys" (list_alloc ()) (var "ys" list_ty)) in
@@ -910,6 +1212,10 @@ let suite =
           test_marks_dead_set_before_explicit_set_alloc;
         Alcotest.test_case "dead_dict_before_explicit_dict_construct" `Quick
           test_marks_dead_dict_before_explicit_dict_construct;
+        Alcotest.test_case "dead_managed_union_before_constructor_call" `Quick
+          test_marks_dead_managed_union_before_constructor_call;
+        Alcotest.test_case "rejects_managed_union_constructor_def_id_mismatch"
+          `Quick test_rejects_managed_union_constructor_def_id_mismatch;
         Alcotest.test_case "later_allocation_after_safe_binding" `Quick
           test_marks_later_allocation_after_safe_binding;
         Alcotest.test_case "later_allocation_after_safe_statement" `Quick
@@ -933,6 +1239,10 @@ let suite =
         Alcotest.test_case
           "rewrite_program_keeps_same_family_without_reuse_boundary" `Quick
           test_rewrite_program_keeps_same_family_without_reuse_boundary;
+        Alcotest.test_case
+          "rewrite_program_keeps_managed_union_candidate_without_reuse_boundary"
+          `Quick
+          test_rewrite_program_keeps_managed_union_candidate_without_reuse_boundary;
         Alcotest.test_case "rewrite_program_reuses_dead_list_allocation" `Quick
           test_rewrite_program_reuses_dead_list_allocation;
         Alcotest.test_case "rewrite_program_reuses_dead_set_allocation" `Quick
@@ -963,6 +1273,19 @@ let suite =
           test_rewrite_program_upgrades_nested_later_handoff_before_post_drop;
         Alcotest.test_case "rewrite_program_upgrades_same_layout_handoff_drop"
           `Quick test_rewrite_program_upgrades_same_layout_handoff_drop;
+        Alcotest.test_case
+          "rewrite_prepared_program_reuses_owned_union_match_result" `Quick
+          test_rewrite_prepared_program_reuses_owned_union_match_result;
+        Alcotest.test_case
+          "rewrite_prepared_program_rejects_borrowed_union_match_fields" `Quick
+          test_rewrite_prepared_program_rejects_borrowed_union_match_fields;
+        Alcotest.test_case "rewrite_prepared_program_reuses_all_if_branches"
+          `Quick test_rewrite_prepared_program_reuses_all_if_branches;
+        Alcotest.test_case "rewrite_prepared_program_rejects_partial_if_branch"
+          `Quick test_rewrite_prepared_program_rejects_partial_if_branch;
+        Alcotest.test_case
+          "rewrite_prepared_program_rejects_source_alias_payload" `Quick
+          test_rewrite_prepared_program_rejects_source_alias_payload;
         Alcotest.test_case "rewrite_emits_reuse_boundary_without_extra_drop"
           `Quick test_rewrite_emits_reuse_boundary_without_extra_drop;
       ] );

@@ -1123,7 +1123,7 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
     | CTLeaf { ct_bindings; ct_body } ->
         let body_scope =
           List.fold_left
-            (fun acc (v, _) -> scope_add_var acc v)
+            (fun acc binding -> scope_add_var acc binding.mb_var)
             scope ct_bindings
         in
         CTLeaf { ct_bindings; ct_body = rewrite body_scope ct_body }
@@ -1616,6 +1616,13 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
       | CUnionConstruct uc ->
           CUnionConstruct
             { uc with uc_args = List.map rewrite_boxed_storage uc.uc_args }
+      | CUnionReuseConstruct urc ->
+          CUnionReuseConstruct
+            {
+              urc with
+              urc_source = rewrite scope urc.urc_source;
+              urc_args = List.map rewrite_boxed_storage urc.urc_args;
+            }
       | CListHandoff h ->
           let body_scope =
             scope_add_vars scope
@@ -1854,7 +1861,7 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
       | CTLeaf { ct_bindings; ct_body } ->
           let body_scope =
             List.fold_left
-              (fun acc (v, _) -> scope_add_var acc v)
+              (fun acc binding -> scope_add_var acc binding.mb_var)
               scope ct_bindings
           in
           scan_expr body_scope ct_body
@@ -1931,6 +1938,9 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
               | RecordErasedField (_, value) -> scan_boxed_storage scope value)
             rc.rc_fields
       | CUnionConstruct uc -> List.iter (scan_boxed_storage scope) uc.uc_args
+      | CUnionReuseConstruct urc ->
+          scan_expr scope urc.urc_source;
+          List.iter (scan_boxed_storage scope) urc.urc_args
       | CRecordUpdate (base, fs) ->
           scan_expr scope base;
           List.iter (fun (_, value) -> scan_expr scope value) fs

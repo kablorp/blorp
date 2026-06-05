@@ -50,7 +50,9 @@ let option_exists f = function Some value -> f value | None -> false
 let rec ctree_mentions_alias aliases tree =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> is_alias aliases v) ct_bindings then false
+      if
+        List.exists (fun binding -> is_alias aliases binding.mb_var) ct_bindings
+      then false
       else expr_mentions_alias aliases ct_body
   | CTFail -> false
   | CTSwitchTag { cts_cases; cts_default; _ } ->
@@ -177,10 +179,12 @@ let rec tuple_ctree_plan arity tree =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
       ct_bindings
-      |> List.map (fun (v, acc) ->
-          Option.map
-            (fun index -> (v, index))
-            (direct_tuple_field_index arity acc))
+      |> List.map (fun binding ->
+          if not (match_binding_is_borrowed binding) then None
+          else
+            Option.map
+              (fun index -> (binding.mb_var, index))
+              (direct_tuple_field_index arity binding.mb_accessor))
       |> all_some
       |> Option.map (fun bindings -> TupleLeaf (bindings, ct_body))
   | CTFail -> None
@@ -205,8 +209,9 @@ let rec tuple_ctree_plan arity tree =
 let rec scan_ctree_uses arity analysis aliases tree =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> is_alias aliases v) ct_bindings then
-        mark_shadow analysis
+      if
+        List.exists (fun binding -> is_alias aliases binding.mb_var) ct_bindings
+      then mark_shadow analysis
       else scan_uses arity analysis aliases ct_body
   | CTFail -> ()
   | CTSwitchTag { cts_cases; cts_default; _ } ->

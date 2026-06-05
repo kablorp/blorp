@@ -17,6 +17,72 @@ open Core_emit_context
 open Core_emit_util
 open Codegen_types
 
+let owned_match_binding_decl_str (ctx : Core_emit_context.t) var_name
+    ~(scrut_name : string) ~(scrut_ty : Ast.type_expr) ~(accessor : accessor)
+    ~(source : string) ~(scrut_unique_name : string) (var_ty : Ast.type_expr) :
+    string =
+  let decl =
+    unbox_decl_for_accessor_str ctx var_name ~scrut_ty ~accessor ~source var_ty
+  in
+  if not (type_requires_release ctx var_ty) then decl
+  else
+    match accessor with
+    | AccVariantField (AccRoot, _, idx) ->
+        let bit = Printf.sprintf "(1UL << %d)" idx in
+        Printf.sprintf
+          "%s if (%s) { if (%s && ((%s->release_mask & %s) != 0UL)) { \
+           %s->release_mask &= ~%s; } else { blorp_retain(%s); } }"
+          decl var_name scrut_unique_name scrut_name bit scrut_name bit var_name
+    | _ ->
+        Core_error.errorf Core_error.Emit Ast.dummy_loc
+          ~hint:
+            "owned match bindings are currently only supported for direct \
+             variant payload fields"
+          "unsupported owned match binding accessor"
+
+let match_binding_decl_str (ctx : Core_emit_context.t) ?scrut_unique_name
+    scrut_name scrut_ty var_types binding : string =
+  let v = binding.mb_var in
+  let acc = binding.mb_accessor in
+  let var_ty = find_var_type v.vname var_types in
+  let var_name = escape_c_ident (Var.to_c_name v) in
+  let acc_c = render_accessor_typed ctx scrut_name scrut_ty acc in
+  match binding.mb_mode with
+  | MatchBorrow ->
+      unbox_decl_for_accessor_str ctx var_name ~scrut_ty ~accessor:acc
+        ~source:acc_c var_ty
+  | MatchOwn ->
+      let scrut_unique_name =
+        match scrut_unique_name with
+        | Some name -> name
+        | None ->
+            Core_error.errorf Core_error.Emit Ast.dummy_loc
+              ~hint:
+                "owned match binding emission requires a leaf uniqueness temp"
+              "missing owned match uniqueness guard"
+      in
+      owned_match_binding_decl_str ctx var_name ~scrut_name ~scrut_ty
+        ~accessor:acc ~source:acc_c ~scrut_unique_name var_ty
+
+let leaf_owned_unique_name ctx ct_bindings =
+  if List.exists match_binding_is_owned ct_bindings then
+    Some (Printf.sprintf "__match_owned_unique_%d" (fresh_temp ctx))
+  else None
+
+let emit_leaf_owned_unique_expr ctx scrut_name = function
+  | None -> ()
+  | Some name ->
+      emit ctx
+        (Printf.sprintf "bool %s = %s && blorp_is_unique(%s); " name scrut_name
+           scrut_name)
+
+let emit_leaf_owned_unique_stmt ctx scrut_name = function
+  | None -> ()
+  | Some name ->
+      emit_line ctx
+        (Printf.sprintf "bool %s = %s && blorp_is_unique(%s);" name scrut_name
+           scrut_name)
+
 (** Expression-context walk: each leaf's body assigns to [result_name].
 
     Only [emit_expr] (for leaf bodies) and [emit_ctree_assign] (self,
@@ -31,15 +97,15 @@ let assign ~(emit_expr : Core_emit_context.t -> core -> unit)
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
       let var_types = collect_var_types ct_body in
+      let scrut_unique_name = leaf_owned_unique_name ctx ct_bindings in
+      emit_leaf_owned_unique_expr ctx scrut_name scrut_unique_name;
       List.iter
-        (fun (v, acc) ->
+        (fun binding ->
+          let v = binding.mb_var in
           if not (Hashtbl.mem ctx.constructor_names v.vname) then begin
-            let var_ty = find_var_type v.vname var_types in
-            let acc_c = render_accessor_typed ctx scrut_name scrut_ty acc in
             emit ctx
-              (unbox_decl_for_accessor_str ctx
-                 (escape_c_ident (Var.to_c_name v))
-                 ~scrut_ty ~accessor:acc ~source:acc_c var_ty);
+              (match_binding_decl_str ctx ?scrut_unique_name scrut_name scrut_ty
+                 var_types binding);
             emit ctx " "
           end)
         ct_bindings;
@@ -121,15 +187,15 @@ let stmt ~(emit_stmt : Core_emit_context.t -> core -> unit)
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
       let var_types = collect_var_types ct_body in
+      let scrut_unique_name = leaf_owned_unique_name ctx ct_bindings in
+      emit_leaf_owned_unique_stmt ctx scrut_name scrut_unique_name;
       List.iter
-        (fun (v, acc) ->
+        (fun binding ->
+          let v = binding.mb_var in
           if not (Hashtbl.mem ctx.constructor_names v.vname) then begin
-            let var_ty = find_var_type v.vname var_types in
-            let acc_c = render_accessor_typed ctx scrut_name scrut_ty acc in
             emit_line ctx
-              (unbox_decl_for_accessor_str ctx
-                 (escape_c_ident (Var.to_c_name v))
-                 ~scrut_ty ~accessor:acc ~source:acc_c var_ty)
+              (match_binding_decl_str ctx ?scrut_unique_name scrut_name scrut_ty
+                 var_types binding)
           end)
         ct_bindings;
       emit_stmt ctx ct_body

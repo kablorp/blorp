@@ -28,7 +28,7 @@ Source (.brp)
     |
     v
 +------------+
-| Core IR    |  Lowering → 15 observed transform stages → final preparation
+| Core IR    |  Lowering → 16 observed transform stages → final preparation
 | pipeline   |  → final snapshot → default C backend (see "Core IR Pipeline")
 +------------+
     |
@@ -140,6 +140,12 @@ Typed AST
              (core_dce.ml)
     |
     v
++-------------------------+
+| Core_consume_specialize |  Clone safe source-owned self-replacement callees
++-------------------------+  with explicit consumed parameters before Perceus
+                            (core_consume_specialize.ml)
+    |
+    v
 +--------------+
 | Core_perceus |  Insert CDup/CDrop for reference counting (core_perceus.ml)
 +--------------+  Koka-style precise RC: branch-aware, last-use semantics
@@ -163,6 +169,11 @@ Typed AST
 +----------------------+
 | Core_codegen_prepare |  Make final storage/layout decisions explicit:
 +----------------------+  typed box/unbox, constructors, release policy
+    |
+    v
++------------------------+
+| Core_reuse (prepared) |  Rewrite source-owned union-node reuse after
++------------------------+  constructor and erased-storage shapes are explicit
     |
     v
 +-------+
@@ -226,6 +237,7 @@ boxing, or ownership behavior from source spelling.
 | `core_tuple_sroa.ml` | Scalar replacement for non-escaping local tuple bindings and narrow tuple-return call sites |
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
 | `core_dce.ml` | Conservative Core declaration dead-code elimination before ownership insertion |
+| `core_consume_specialize.ml` | Pre-Perceus consuming-call clones for safe source-owned self-replacement |
 | `core_resource.ml` | Explicit resource cleanup exits for nonlocal loop control |
 | `core_codegen_prepare.ml` | Final Core preparation: explicit constructors, box/unbox, and release/layout facts |
 | `core_erased_storage_layout.ml` | Late-Core classification for typed values crossing erased `void*` storage |
@@ -234,7 +246,7 @@ boxing, or ownership behavior from source spelling.
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
 | `core_perceus.ml` | Perceus RC insertion (CDup/CDrop) |
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
-| `core_reuse.ml` | Post-Perceus allocation reuse analysis and rewrites |
+| `core_reuse.ml` | Post-Perceus allocation reuse analysis and prepared-Core union-node reuse rewrites |
 | `core_closure.ml` | Closure conversion / lambda hoisting |
 | `core_perceus_check.ml` | RC balance simulator for testing |
 | `core_emit.ml`, `core_emit_c.ml` | Core → C emission and default C backend |
@@ -307,6 +319,7 @@ compiler/
 │   ├── core_tuple_sroa.ml # Local/call-site tuple scalar replacement
 │   ├── core_specialize.ml # Type-dispatch builtins → CCast / concrete names
 │   ├── core_dce.ml       # Dead concrete declaration pruning before ownership
+│   ├── core_consume_specialize.ml # Source-owned consuming-call clones
 │   ├── core_perceus.ml    # Core IR Perceus RC insertion
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
 │   ├── core_reuse.ml      # Post-Perceus allocation reuse rewrites

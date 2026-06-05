@@ -617,6 +617,7 @@ let register_types (reg : Codegen_types.registry) (prog : Core.core_program) :
     | Core.CDType t when t.type_is_enum ->
         Codegen_types.register_enum_type reg t.type_name t.type_variants
     | Core.CDType t when not t.type_is_builtin ->
+        Codegen_types.register_union_variants reg t.type_name t.type_variants;
         Codegen_types.register_union_type reg t.type_name
           ~destructor:
             (Codegen_types.GeneratedDestructor (t.type_name ^ "_destroy"))

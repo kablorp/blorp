@@ -28,6 +28,7 @@ let ty_channel_int = TyNamed ("Channel", [ ty_int ])
 let ty_list_string = TyNamed ("List", [ ty_string ])
 let ty_set_string = TyNamed ("Set", [ ty_string ])
 let ty_dict_string_string = TyNamed ("Dict", [ ty_string; ty_string ])
+let ty_expr = TyNamed ("Expr", [])
 let ty_opt_string = TyNamed ("Option", [ ty_string ])
 let ty_result_int_bool = TyNamed ("Result", [ ty_int; ty_bool ])
 let ty_result_int_string = TyNamed ("Result", [ ty_int; ty_string ])
@@ -994,7 +995,8 @@ let test_emit_nullable_option_string_type_and_match () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "s", AccVariantField (AccRoot, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "s", AccVariantField (AccRoot, "Some", 0)) ];
                   ct_body = cvar "s" ty_string;
                 } );
             ("None", CTLeaf { ct_bindings = []; ct_body = cstr "fallback" });
@@ -3625,7 +3627,7 @@ let test_emit_union_no_rc () =
     (contains_sub output "blorp_Object header;");
   Alcotest.(check bool) "has tag" true (contains_sub output "int tag;");
   Alcotest.(check bool)
-    "has release_mask" true
+    "no release_mask for primitive-only union" false
     (contains_sub output "unsigned long release_mask;");
   Alcotest.(check bool)
     "has Circle struct" true
@@ -3638,7 +3640,10 @@ let test_emit_union_no_rc () =
     (contains_sub output "#define TAG_Shape_Rect 1");
   Alcotest.(check bool)
     "has Circle ctor" true
-    (contains_sub output "Shape* Circle(");
+    (contains_sub output "Shape* Circle(void* field0)");
+  Alcotest.(check bool)
+    "Circle ctor omits mask" false
+    (contains_sub output "Circle(void* field0, unsigned long release_mask)");
   Alcotest.(check bool) "no destroy" false (contains_sub output "Shape_destroy")
 
 let test_emit_union_with_rc () =
@@ -3684,12 +3689,15 @@ let test_emit_union_with_rc () =
   Alcotest.(check bool)
     "has destructor assign" true
     (contains_sub output "BLORP_SET_DESTRUCTOR(__vc, Expr_destroy)");
-  (* Constructors take [unsigned long release_mask] as a trailing param —
-     the mask is computed at each call site from the actual arg types,
-     not baked in here. See [emit_union_type] for the rationale (Option
-     [Int] would otherwise destroy a non-pointer Int payload). *)
+  (* Constructors only take [unsigned long release_mask] when their declared
+     fields may need release. The mask is still computed at each call site for
+     those variants because generic payload ownership depends on the
+     monomorphic argument types. *)
   Alcotest.(check bool)
-    "Lit ctor takes mask" true
+    "Lit ctor omits mask" true
+    (contains_sub output "Lit(void* field0)");
+  Alcotest.(check bool)
+    "Lit ctor does not take mask" false
     (contains_sub output "Lit(void* field0, unsigned long release_mask)");
   Alcotest.(check bool)
     "Name ctor takes mask" true
@@ -3697,6 +3705,99 @@ let test_emit_union_with_rc () =
   Alcotest.(check bool)
     "ctor assigns mask param" true
     (contains_sub output "release_mask = release_mask;")
+
+let test_emit_union_reuse_constructor_helper_and_call () =
+  let tdecl : type_decl =
+    {
+      type_name = "Expr";
+      type_params = [];
+      type_is_enum = false;
+      type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
+      type_variants =
+        [
+          {
+            variant_name = "Lit";
+            variant_fields = [ ty_int ];
+            variant_tag = 0;
+            variant_loc = loc;
+            variant_def_id = None;
+          };
+          {
+            variant_name = "Name";
+            variant_fields = [ ty_string ];
+            variant_tag = 1;
+            variant_loc = loc;
+            variant_def_id = None;
+          };
+        ];
+    }
+  in
+  let body =
+    mk
+      (CUnionReuseConstruct
+         {
+           urc_source = cvar "old" ty_expr;
+           urc_type_name = "Expr";
+           urc_constructor_name = "Name";
+           urc_c_name = "Name";
+           urc_reuse_c_name = "__blorp_reuse_Expr_Name";
+           urc_tag = 1;
+           urc_representation = GenericUnion;
+           urc_args =
+             [ boxed_pointer_storage (cvar "name" ty_string) ty_string ];
+           urc_release_mask = 1;
+         })
+      ty_expr
+  in
+  let fn =
+    {
+      cf_name = "reuse_name";
+      cf_module = None;
+      cf_type_params = [];
+      cf_params =
+        [
+          { cp_name = Var.named "old"; cp_ty = ty_expr; cp_loc = loc };
+          { cp_name = Var.named "name"; cp_ty = ty_string; cp_loc = loc };
+        ];
+      cf_return_ty = ty_expr;
+      cf_body = Some body;
+      cf_is_pure = true;
+      cf_kind = CFUser;
+      cf_def_id = 900;
+    }
+  in
+  let prog =
+    [
+      { cd_desc = CDType tdecl; cd_loc = loc; cd_doc = None };
+      { cd_desc = CDFunc fn; cd_loc = loc; cd_doc = None };
+    ]
+  in
+  let output = emit_program_to_string prog in
+  Alcotest.(check bool)
+    "helper signature" true
+    (contains_sub output
+       "static inline Expr* __blorp_reuse_Expr_Name(Expr* __old, void* field0, \
+        unsigned long release_mask)");
+  Alcotest.(check bool)
+    "unique guard" true
+    (contains_sub output "if (__old && blorp_is_unique(__old))");
+  Alcotest.(check bool)
+    "clears previous payloads" true
+    (contains_sub output "Expr_destroy(__old);");
+  Alcotest.(check bool)
+    "retags reused object" true
+    (contains_sub output "__old->tag = TAG_Expr_Name;");
+  Alcotest.(check bool)
+    "allocates fresh fallback" true
+    (contains_sub output "Expr* __fresh = Name(field0, release_mask);");
+  Alcotest.(check bool)
+    "releases old fallback owner" true
+    (contains_sub output "if (__old) blorp_release(__old);");
+  Alcotest.(check bool)
+    "emits reuse call" true
+    (contains_sub output "__blorp_reuse_Expr_Name(old,")
 
 let test_emit_union_with_int128_boxed_payload_has_destructor () =
   let tdecl : type_decl =
@@ -4781,7 +4882,8 @@ let test_emit_match_tree_tag_with_bindings () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "x", AccVariantField (AccRoot, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "x", AccVariantField (AccRoot, "Some", 0)) ];
                   ct_body = cvar "x" ty_int;
                 } );
             ("None", CTLeaf { ct_bindings = []; ct_body = cint 0 });
@@ -4798,6 +4900,67 @@ let test_emit_match_tree_tag_with_bindings () =
      __mr_1; })"
     (emit_to_string e)
 
+let test_emit_match_tree_owned_variant_binding_moves_or_retains () =
+  let ctx = Blorp.Core_emit_context.create () in
+  let expr_type_decl =
+    {
+      type_name = "Expr";
+      type_params = [];
+      type_variants =
+        [
+          {
+            variant_name = "Add";
+            variant_fields = [ ty_expr; ty_expr ];
+            variant_tag = 0;
+            variant_loc = loc;
+            variant_def_id = Some 9001;
+          };
+        ];
+      type_is_enum = false;
+      type_is_builtin = false;
+      type_is_resource = false;
+      type_resource_cleanup = None;
+    }
+  in
+  Blorp.Core_flatten.register_types ctx.reg
+    [ { cd_desc = CDType expr_type_decl; cd_loc = loc; cd_doc = None } ];
+  let tree =
+    CTSwitchTag
+      {
+        cts_scrut = AccRoot;
+        cts_cases =
+          [
+            ( "Add",
+              CTLeaf
+                {
+                  ct_bindings =
+                    [
+                      owned_match_binding (Var.named "left")
+                        (AccVariantField (AccRoot, "Add", 0));
+                    ];
+                  ct_body = cvar "left" ty_expr;
+                } );
+          ];
+        cts_default = None;
+      }
+  in
+  let output =
+    emit_to_string_with_ctx ctx
+      (mk (CMatch (cvar "expr" ty_expr, tree)) ty_expr)
+  in
+  Alcotest.(check bool)
+    "declares payload" true
+    (contains_sub output "Expr* left = (Expr*)__scrut_0->data.Add.field0;");
+  Alcotest.(check bool)
+    "checks uniqueness" true
+    (contains_sub output "blorp_is_unique(__scrut_0)");
+  Alcotest.(check bool)
+    "clears payload release bit" true
+    (contains_sub output "__scrut_0->release_mask &= ~(1UL << 0);");
+  Alcotest.(check bool)
+    "retains fallback" true
+    (contains_sub output "blorp_retain(left);")
+
 let test_emit_match_tree_stack_option_int () =
   let tree =
     CTSwitchTag
@@ -4809,7 +4972,8 @@ let test_emit_match_tree_stack_option_int () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "x", AccVariantField (AccRoot, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "x", AccVariantField (AccRoot, "Some", 0)) ];
                   ct_body = cvar "x" ty_int;
                 } );
             ("None", CTLeaf { ct_bindings = []; ct_body = cint 0 });
@@ -4836,7 +5000,8 @@ let test_emit_match_tree_stack_option_float () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "x", AccVariantField (AccRoot, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "x", AccVariantField (AccRoot, "Some", 0)) ];
                   ct_body = cvar "x" ty_float;
                 } );
             ("None", CTLeaf { ct_bindings = []; ct_body = cfloat 0.0 });
@@ -4864,7 +5029,8 @@ let test_emit_match_tree_stack_result_int_bool () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "x", AccVariantField (AccRoot, "Ok", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "x", AccVariantField (AccRoot, "Ok", 0)) ];
                   ct_body = cvar "x" ty_int;
                 } );
             ("Err", CTLeaf { ct_bindings = []; ct_body = cint 0 });
@@ -4916,7 +5082,11 @@ let test_emit_match_tree_borrowed_intrinsic_scrutinee_does_not_release () =
       ty_string
   in
   let tree =
-    CTLeaf { ct_bindings = [ (Var.named "s", AccRoot) ]; ct_body = cint 1 }
+    CTLeaf
+      {
+        ct_bindings = borrowed_match_binding_pairs [ (Var.named "s", AccRoot) ];
+        ct_body = cint 1;
+      }
   in
   let e = mk (CMatch (scrut, tree)) ty_int in
   let output = emit_to_string e in
@@ -4960,7 +5130,8 @@ let test_emit_match_tree_tuple_nullable_option_string () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "s", AccVariantField (first, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "s", AccVariantField (first, "Some", 0)) ];
                   ct_body = cvar "s" ty_string;
                 } );
             ("None", CTLeaf { ct_bindings = []; ct_body = cstr "fallback" });
@@ -4998,7 +5169,8 @@ let test_emit_match_tree_tuple_stack_option_float () =
               CTLeaf
                 {
                   ct_bindings =
-                    [ (Var.named "x", AccVariantField (first, "Some", 0)) ];
+                    borrowed_match_binding_pairs
+                      [ (Var.named "x", AccVariantField (first, "Some", 0)) ];
                   ct_body = cvar "x" ty_float;
                 } );
             ("None", CTLeaf { ct_bindings = []; ct_body = cfloat 0.0 });
@@ -5045,10 +5217,11 @@ let test_emit_match_tree_result_nullable_option_string () =
                         CTLeaf
                           {
                             ct_bindings =
-                              [
-                                ( Var.named "s",
-                                  AccVariantField (ok_payload, "Some", 0) );
-                              ];
+                              borrowed_match_binding_pairs
+                                [
+                                  ( Var.named "s",
+                                    AccVariantField (ok_payload, "Some", 0) );
+                                ];
                             ct_body = cvar "s" ty_string;
                           } );
                       ( "None",
@@ -5103,7 +5276,7 @@ let test_emit_match_tree_catchall () =
   let tree =
     CTLeaf
       {
-        ct_bindings = [ (Var.named "y", AccRoot) ];
+        ct_bindings = borrowed_match_binding_pairs [ (Var.named "y", AccRoot) ];
         ct_body = mk (CBin (Add, cvar "y" ty_int, cint 1)) ty_int;
       }
   in
@@ -5319,7 +5492,7 @@ let test_e2e_match_catchall_binding () =
   let tree =
     CTLeaf
       {
-        ct_bindings = [ (Var.named "y", AccRoot) ];
+        ct_bindings = borrowed_match_binding_pairs [ (Var.named "y", AccRoot) ];
         ct_body = mk (CBin (Add, cvar "y" ty_int, cint 2)) ty_int;
       }
   in
@@ -5821,6 +5994,8 @@ let suite =
           test_emit_match_tree_tag_no_bindings;
         Alcotest.test_case "tag_with_bindings" `Quick
           test_emit_match_tree_tag_with_bindings;
+        Alcotest.test_case "owned_variant_binding_move_or_retain" `Quick
+          test_emit_match_tree_owned_variant_binding_moves_or_retains;
         Alcotest.test_case "stack_option_int" `Quick
           test_emit_match_tree_stack_option_int;
         Alcotest.test_case "stack_option_float" `Quick
@@ -5944,6 +6119,8 @@ let suite =
         Alcotest.test_case "enum" `Quick test_emit_enum_type;
         Alcotest.test_case "union_no_rc" `Quick test_emit_union_no_rc;
         Alcotest.test_case "union_with_rc" `Quick test_emit_union_with_rc;
+        Alcotest.test_case "union_reuse_constructor_helper_and_call" `Quick
+          test_emit_union_reuse_constructor_helper_and_call;
         Alcotest.test_case "union_int128_boxed_payload_destroy" `Quick
           test_emit_union_with_int128_boxed_payload_has_destructor;
         Alcotest.test_case "union_obeys_registered_arc_only_policy" `Quick

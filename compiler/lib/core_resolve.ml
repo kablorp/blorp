@@ -787,7 +787,9 @@ let rec resolve_expr ?(module_path = "") ?(bound = Bound_names.empty)
     let rec go bound = function
       | CTLeaf { ct_bindings; ct_body } ->
           let body_bound =
-            List.fold_left (fun acc (v, _) -> bind_var acc v) bound ct_bindings
+            List.fold_left
+              (fun acc binding -> bind_var acc binding.mb_var)
+              bound ct_bindings
           in
           CTLeaf { ct_bindings; ct_body = resolve_with body_bound ct_body }
       | CTFail -> CTFail

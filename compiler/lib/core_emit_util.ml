@@ -172,7 +172,7 @@ let collect_free_vars (e : core) : (string * Ast.type_expr) list =
     | CTLeaf { ct_bindings; ct_body } ->
         let inner =
           List.fold_left
-            (fun s (v, _) -> StringSet.add v.vname s)
+            (fun s binding -> StringSet.add binding.mb_var.vname s)
             bound ct_bindings
         in
         go inner ct_body

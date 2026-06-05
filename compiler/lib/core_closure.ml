@@ -119,7 +119,9 @@ let collect_free_vars_filtered (state : state) ~(capturable : StringSet.t)
   let rec go_ctree bound = function
     | CTLeaf { ct_bindings; ct_body } ->
         let inner =
-          List.fold_left (fun s (v, _) -> SS.add v.vname s) bound ct_bindings
+          List.fold_left
+            (fun s binding -> SS.add binding.mb_var.vname s)
+            bound ct_bindings
         in
         go inner ct_body
     | CTFail -> SM.empty
@@ -482,7 +484,9 @@ let rec adapt_function_refs_ctree (state : state) (bound : StringSet.t)
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
       let bound' =
-        List.fold_left (fun acc (v, _) -> add_bound_var acc v) bound ct_bindings
+        List.fold_left
+          (fun acc binding -> add_bound_var acc binding.mb_var)
+          bound ct_bindings
       in
       CTLeaf { ct_bindings; ct_body = adapt_value bound' ct_body }
   | CTFail -> CTFail

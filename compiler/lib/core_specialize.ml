@@ -783,7 +783,14 @@ let tensor_get_or_match_default tree =
   let leaf_returns_some_payload = function
     | CTLeaf
         {
-          ct_bindings = [ (some_v, AccVariantField (AccRoot, "Some", 0)) ];
+          ct_bindings =
+            [
+              {
+                mb_var = some_v;
+                mb_accessor = AccVariantField (AccRoot, "Some", 0);
+                mb_mode = MatchBorrow;
+              };
+            ];
           ct_body = { desc = CVar body_v; _ };
         }
       when Var.equal some_v body_v ->

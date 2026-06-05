@@ -181,7 +181,8 @@ and classify_ctree_control_boundary (name : string) (tree : ctree) :
     assignment_shape =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> v.vname = name) ct_bindings then No_assign
+      if List.exists (fun binding -> binding.mb_var.vname = name) ct_bindings
+      then No_assign
       else classify_control_boundary name ct_body
   | CTFail -> No_assign
   | CTSwitchTag { cts_cases; cts_default; _ } ->
@@ -288,8 +289,9 @@ let rec subst_var (old_name : string) (new_var : var) (e : core) : core =
 and subst_var_ctree (old_name : string) (new_var : var) (tree : ctree) : ctree =
   match tree with
   | CTLeaf { ct_bindings; ct_body } ->
-      if List.exists (fun (v, _) -> v.vname = old_name) ct_bindings then tree
-        (* binding shadows *)
+      if
+        List.exists (fun binding -> binding.mb_var.vname = old_name) ct_bindings
+      then tree (* binding shadows *)
       else CTLeaf { ct_bindings; ct_body = subst_var old_name new_var ct_body }
   | CTFail -> CTFail
   | CTSwitchTag { cts_scrut; cts_cases; cts_default } ->

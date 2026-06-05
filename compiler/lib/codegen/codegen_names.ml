@@ -61,6 +61,12 @@ let sanitize_c_ident name =
 let mangle_by_def_id (id : int) (name : string) : string =
   Printf.sprintf "__def_%d_%s" id (sanitize_c_ident name)
 
+let union_reuse_constructor_name ~(type_name : string)
+    ~(constructor_c_name : string) : string =
+  Printf.sprintf "__blorp_reuse_%s_%s"
+    (sanitize_c_ident type_name)
+    (sanitize_c_ident constructor_c_name)
+
 let ufcs_prefix = "__ufcs_"
 
 let has_prefix prefix name =

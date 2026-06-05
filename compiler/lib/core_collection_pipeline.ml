@@ -223,7 +223,9 @@ let option_exists f = function Some value -> f value | None -> false
 let rec ctree_has_runtime_free_var bound = function
   | CTLeaf { ct_bindings; ct_body } ->
       let bound =
-        List.fold_left (fun acc (v, _) -> add_var acc v) bound ct_bindings
+        List.fold_left
+          (fun acc binding -> add_var acc binding.mb_var)
+          bound ct_bindings
       in
       expr_has_runtime_free_var bound ct_body
   | CTFail -> false
@@ -427,8 +429,8 @@ let rec emit_stream_stages ~loc stages current terminal =
                            {
                              ct_bindings =
                                [
-                                 ( Var.named value_name,
-                                   AccVariantField (AccRoot, "Some", 0) );
+                                 borrowed_match_binding (Var.named value_name)
+                                   (AccVariantField (AccRoot, "Some", 0));
                                ];
                              ct_body = keep;
                            } );

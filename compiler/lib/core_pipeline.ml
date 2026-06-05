@@ -22,12 +22,16 @@
     13. [Core_dce] — prune unreachable concrete functions, impl methods,
        non-runtime generic function/impl templates, and source-only type
        declarations
-    14. [Core_perceus] — insert CDup/CDrop for reference counting
-    15. [Core_reuse] — analyze post-Perceus reuse candidates
-    16. [Core_closure] — hoist lambdas and create closure values
-    17. [Core_resource] — make resource cleanup before nonlocal loop exits explicit
-    18. [Core_codegen_prepare] — make final representation/layout facts explicit
-    19. [Core_emit_c] — Core IR → C string via the default backend
+    14. [Core_consume_specialize] — clone safe self-replacement callees with
+       explicit consumed parameters
+    15. [Core_perceus] — insert CDup/CDrop for reference counting
+    16. [Core_reuse] — analyze post-Perceus reuse candidates
+    17. [Core_closure] — hoist lambdas and create closure values
+    18. [Core_resource] — make resource cleanup before nonlocal loop exits explicit
+    19. [Core_codegen_prepare] — make final representation/layout facts explicit
+    20. [Core_reuse] prepared union reuse — reuse source-owned union nodes after
+       constructors and box/unbox storage have explicit final-Core shapes
+    21. [Core_emit_c] — Core IR → C string via the default backend
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -74,6 +78,7 @@ let transform_stage_order =
     Core_stage.Fusion;
     Core_stage.Specialize;
     Core_stage.Dce;
+    Core_stage.ConsumeSpecialize;
     Core_stage.Perceus;
     Core_stage.Reuse;
     Core_stage.Closure;
@@ -197,12 +202,15 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
       |> Core_specialize.specialize_program ~reg
       |> Core_closure.adapt_function_refs_program)
   |> run_stage Core_stage.Dce (Core_dce.prune_unreachable_declarations ~reg)
+  |> run_stage Core_stage.ConsumeSpecialize
+       (Core_consume_specialize.rewrite_program ~reg)
   |> run_stage Core_stage.Perceus Core_perceus.insert_drops_program
   |> run_stage Core_stage.Reuse (Core_reuse.rewrite_program ~reg)
   |> run_stage Core_stage.Closure
        (Core_closure.convert_program ~wrap_function_refs:false)
   |> Core_resource.rewrite_nonlocal_exits_program
   |> Core_codegen_prepare.prepare_program ~reg
+  |> Core_reuse.rewrite_prepared_program ~reg
   |> observe Core_stage.Final
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)

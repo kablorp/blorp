@@ -133,6 +133,9 @@ let () =
         (fun (name, cases) -> ("CoreDce." ^ name, cases))
         Test_core_dce.suite
     @ List.map
+        (fun (name, cases) -> ("CoreConsumeSpecialize." ^ name, cases))
+        Test_core_consume_specialize.suite
+    @ List.map
         (fun (name, cases) -> ("CoreCodegenPrepare." ^ name, cases))
         Test_core_codegen_prepare.suite
     @ List.map

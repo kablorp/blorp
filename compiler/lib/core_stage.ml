@@ -26,6 +26,7 @@ type t =
   | Fusion
   | Specialize
   | Dce
+  | ConsumeSpecialize
   | Perceus
   | Reuse
   | Closure
@@ -52,6 +53,7 @@ let all =
     Fusion;
     Specialize;
     Dce;
+    ConsumeSpecialize;
     Perceus;
     Reuse;
     Closure;
@@ -72,6 +74,7 @@ let to_string = function
   | Fusion -> "fusion"
   | Specialize -> "specialize"
   | Dce -> "dce"
+  | ConsumeSpecialize -> "consume_specialize"
   | Perceus -> "perceus"
   | Reuse -> "reuse"
   | Closure -> "closure"

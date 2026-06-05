@@ -475,6 +475,21 @@ and accessor =
   | AccListElem of accessor * int  (** list element at index [i] *)
   | AccListSpread of accessor * int  (** sub-list starting at index [i] *)
 
+and match_binding_mode =
+  | MatchBorrow
+      (** The binding aliases storage reachable through the match scrutinee.
+          This is the normal pattern-match behavior. *)
+  | MatchOwn
+      (** The binding owns one reference to the value it names. Late
+          optimization passes may introduce this only when emission can move
+          or retain the payload before the scrutinee is released. *)
+
+and match_binding = {
+  mb_var : var;
+  mb_accessor : accessor;
+  mb_mode : match_binding_mode;
+}
+
 (** A decision tree compiled from a [CMatchArms] by [Core_match].
 
     Each internal node represents a runtime test; each leaf carries the
@@ -489,9 +504,11 @@ and accessor =
     analysis straightforward. *)
 and ctree =
   | CTLeaf of {
-      ct_bindings : (var * accessor) list;
+      ct_bindings : match_binding list;
           (** Pattern variables to bind before evaluating [ct_body]. The
-          accessor is resolved against the root scrutinee at emission. *)
+          accessor is resolved against the root scrutinee at emission. Borrowed
+          bindings alias the scrutinee; owned bindings hold one owned
+          reference and must be introduced only by late ownership-aware passes. *)
       ct_body : core;
     }
   | CTFail
@@ -728,6 +745,7 @@ and desc =
                                          CUnbox's target_ty.) *)
   | CBoxTyped of box_op
   | CUnionConstruct of union_construct
+  | CUnionReuseConstruct of union_reuse_construct
   | CListHandoff of list_handoff
       (** Internal producer/fusion handoff for
                                          list pipelines. Starts in
@@ -917,6 +935,18 @@ and union_construct = {
   uc_representation : union_representation;
   uc_args : boxed_storage_value list;
   uc_release_mask : int;
+}
+
+and union_reuse_construct = {
+  urc_source : core;
+  urc_type_name : string;
+  urc_constructor_name : string;
+  urc_c_name : string;
+  urc_reuse_c_name : string;
+  urc_tag : int;
+  urc_representation : union_representation;
+  urc_args : boxed_storage_value list;
+  urc_release_mask : int;
 }
 
 and list_handoff = {
@@ -1109,6 +1139,37 @@ and select_arm = {
 }
 
 and select_expr = { select_arms : select_arm list }
+
+let match_binding ?(mode = MatchBorrow) mb_var mb_accessor =
+  { mb_var; mb_accessor; mb_mode = mode }
+
+let borrowed_match_binding mb_var mb_accessor =
+  match_binding ~mode:MatchBorrow mb_var mb_accessor
+
+let borrowed_match_binding_pairs bindings =
+  List.map
+    (fun (mb_var, mb_accessor) -> borrowed_match_binding mb_var mb_accessor)
+    bindings
+
+let owned_match_binding mb_var mb_accessor =
+  match_binding ~mode:MatchOwn mb_var mb_accessor
+
+let match_binding_var binding = binding.mb_var
+let match_binding_accessor binding = binding.mb_accessor
+let match_binding_is_borrowed binding = binding.mb_mode = MatchBorrow
+let match_binding_is_owned binding = binding.mb_mode = MatchOwn
+let match_binding_name binding = binding.mb_var.vname
+let match_binding_pair binding = (binding.mb_var, binding.mb_accessor)
+let match_binding_shadows name binding = binding.mb_var.vname = name
+
+let match_bindings_shadow name bindings =
+  List.exists (match_binding_shadows name) bindings
+
+let match_binding_names bindings = List.map match_binding_name bindings
+
+let match_binding_mode_str = function
+  | MatchBorrow -> "borrow"
+  | MatchOwn -> "own"
 
 (* ============================================================================
    Smart constructors
@@ -1360,6 +1421,13 @@ let rec map_children (f : core -> core) (e : core) : core =
     | CUnionConstruct uc ->
         CUnionConstruct
           { uc with uc_args = List.map map_boxed_storage_value uc.uc_args }
+    | CUnionReuseConstruct urc ->
+        CUnionReuseConstruct
+          {
+            urc with
+            urc_source = f urc.urc_source;
+            urc_args = List.map map_boxed_storage_value urc.urc_args;
+          }
     | CListHandoff h ->
         CListHandoff
           {
@@ -2082,6 +2150,14 @@ let rec pp_to_string (e : core) : string =
         (union_representation_str uc.uc_representation)
         (String.concat ", " (List.map pp_boxed_storage uc.uc_args))
         uc.uc_release_mask
+  | CUnionReuseConstruct urc ->
+      Printf.sprintf "%s[reuse %s,%s,tag=%d,%s](%s, mask=%d)"
+        urc.urc_reuse_c_name
+        (pp_to_string urc.urc_source)
+        urc.urc_type_name urc.urc_tag
+        (union_representation_str urc.urc_representation)
+        (String.concat ", " (List.map pp_boxed_storage urc.urc_args))
+        urc.urc_release_mask
   | CListHandoff h ->
       Printf.sprintf
         "list-handoff[%s,%s,%s](%s as %s, cap=%s, len=%s, out=%s, result=%s) { \
@@ -2116,8 +2192,15 @@ and pp_ctree = function
   | CTLeaf { ct_bindings; ct_body } ->
       let binds =
         List.map
-          (fun (v, a) ->
-            Printf.sprintf "%s=%s" (Var.to_string v) (pp_accessor a))
+          (fun binding ->
+            let prefix =
+              match binding.mb_mode with
+              | MatchBorrow -> ""
+              | MatchOwn -> "own "
+            in
+            Printf.sprintf "%s%s=%s" prefix
+              (Var.to_string binding.mb_var)
+              (pp_accessor binding.mb_accessor))
           ct_bindings
       in
       let bind_str =
@@ -2208,7 +2291,7 @@ let pp_to_string_indented (e : core) : string =
     | CRecordUpdate _ | CRange _ | CStringInterp _ | CAssign _ | CConcurrent _
     | CConcurrentlyLoop _ | CDetach _ | CSelect _ | CCast _ | CUnbox _
     | CUnboxTyped _ | CBox _ | CBoxTyped _ | CUnionConstruct _
-    | CResourceCleanupExit _ | CTailrecRecur _ ->
+    | CUnionReuseConstruct _ | CResourceCleanupExit _ | CTailrecRecur _ ->
         p ^ pp_to_string e
     | CTailrecLoop (TailrecUnmanagedLoop l) ->
         Printf.sprintf "%stailrec-loop[unmanaged] {\n%s\n%s}" p
@@ -2334,8 +2417,15 @@ let pp_to_string_indented (e : core) : string =
     | CTLeaf { ct_bindings; ct_body } ->
         let binds =
           List.map
-            (fun (v, a) ->
-              Printf.sprintf "%s=%s" (Var.to_string v) (pp_accessor a))
+            (fun binding ->
+              let prefix =
+                match binding.mb_mode with
+                | MatchBorrow -> ""
+                | MatchOwn -> "own "
+              in
+              Printf.sprintf "%s%s=%s" prefix
+                (Var.to_string binding.mb_var)
+                (pp_accessor binding.mb_accessor))
             ct_bindings
         in
         let bind_str =
@@ -2770,6 +2860,12 @@ let map_types_in_expr (f : Ast.type_expr -> Ast.type_expr) (expr : core) : core
       | CUnionConstruct uc ->
           CUnionConstruct
             { uc with uc_args = List.map rewrite_boxed_storage_ty uc.uc_args }
+      | CUnionReuseConstruct urc ->
+          CUnionReuseConstruct
+            {
+              urc with
+              urc_args = List.map rewrite_boxed_storage_ty urc.urc_args;
+            }
       | CListHandoff h ->
           CListHandoff
             {
