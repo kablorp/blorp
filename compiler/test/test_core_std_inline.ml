@@ -10,10 +10,12 @@ open Blorp.Core
 let ty_int = TyNamed ("Int", [])
 let ty_void = TyNamed ("Void", [])
 let ty_list elem = TyNamed ("List", [ elem ])
+let ty_option elem = TyNamed ("Option", [ elem ])
 let mk ty desc = { desc; ty; loc = dummy_loc }
 let void () = mk ty_void CVoid
 let int n = mk ty_int (CLit (LitInt (Int64.of_int n)))
 let var name ty = mk ty (CVar (Var.named name))
+let none ty = mk (ty_option ty) (CVar (Var.named "None"))
 let param name ty = { cp_name = Var.named name; cp_ty = ty; cp_loc = dummy_loc }
 
 let user_call ?(def_id = None) name args ty =
@@ -68,6 +70,14 @@ let target_get_or ?body () =
   func ~module_path:(Some "std/list") ~name:"std_list__get_or__mono_Int"
     ~def_id:10 ~params:[ self; index; default ] ~body ~return_ty:ty_int ()
 
+let target_get ?body () =
+  let self = param "self" (ty_list ty_int) in
+  let index = param "index" ty_int in
+  let return_ty = ty_option ty_int in
+  let body = Option.value body ~default:(none ty_int) in
+  func ~module_path:(Some "std/list") ~name:"std_list__get__mono_Int" ~def_id:14
+    ~params:[ self; index ] ~body ~return_ty ()
+
 let target_append () =
   let self = param "self" (ty_list ty_int) in
   let elem = param "elem" ty_int in
@@ -102,7 +112,7 @@ let count_user_calls_by_def_id def_id body =
     0 body
 
 let target_std_list_user_call = function
-  | "std_list__get_or__mono_Int" -> true
+  | "std_list__get__mono_Int" | "std_list__get_or__mono_Int" -> true
   | _ -> false
 
 let append_std_list_user_call = function
@@ -197,6 +207,25 @@ let test_inlines_allowed_std_list_target () =
   Alcotest.(check int) "target calls removed" 0 (count_target_calls body);
   Alcotest.(check bool)
     "existing variable argument is borrowed before cloned body" true
+    (List.exists
+       (fun name -> String.starts_with ~prefix:"__std_inline_self" name)
+       (borrow_c_names body))
+
+let test_inlines_allowed_std_list_get_target () =
+  let return_ty = ty_option ty_int in
+  let call =
+    user_call ~def_id:(Some 14) "std_list__get__mono_Int"
+      [ var "xs" (ty_list ty_int); int 0 ]
+      return_ty
+  in
+  let body =
+    rewritten_body [ decl_func (target_get ()); decl_func (caller call) ]
+  in
+  Alcotest.(check int)
+    "get wrapper call is removed" 0
+    (count_user_calls_by_def_id 14 body);
+  Alcotest.(check bool)
+    "existing list argument is borrowed before cloned body" true
     (List.exists
        (fun name -> String.starts_with ~prefix:"__std_inline_self" name)
        (borrow_c_names body))
@@ -418,6 +447,8 @@ let suite =
       [
         Alcotest.test_case "inlines_allowed_std_list_target" `Quick
           test_inlines_allowed_std_list_target;
+        Alcotest.test_case "inlines_allowed_std_list_get_target" `Quick
+          test_inlines_allowed_std_list_get_target;
         Alcotest.test_case "preserves_argument_single_evaluation" `Quick
           test_preserves_argument_single_evaluation;
         Alcotest.test_case "alpha_renames_cloned_locals" `Quick
