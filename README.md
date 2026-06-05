@@ -69,6 +69,12 @@ scripts/test
 Local builds write the compiler executable to `./blorp` in the repository root.
 Use that binary for development commands instead of an installed dev release.
 
+CI installs OCaml dependencies from `compiler/blorp.opam.locked` with
+`opam install --locked`. When changing `compiler/dune-project` dependencies,
+regenerate `compiler/blorp.opam`, refresh the lockfile from an OCaml 4.14.2
+switch, and commit both files so the CI dependency cache key changes with the
+resolved dependency set.
+
 The main test runner is quiet by default and prints a gate summary plus failure
 details. Use `scripts/test --verbose` for pass-by-pass output, or
 `scripts/test --log-dir logs` to keep complete gate logs while preserving
