@@ -1124,6 +1124,7 @@ blorp_String* blorp_from_char(int32_t c);
 blorp_String* blorp_from_chars(blorp_List* chars);
 blorp_String* blorp_string_with_capacity(long cap);
 blorp_String* blorp_string_append(blorp_String* s, const blorp_String* other);
+blorp_String* blorp_string_append_int(blorp_String* s, long value);
 blorp_String* blorp_string_copy_ffi(blorp_String* src);
 blorp_Vector* blorp_parse_json_float_array(const char* json, const char* field_name);
 char* blorp_json_strip_array(const char* json, const char* field_name);

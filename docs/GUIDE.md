@@ -276,10 +276,11 @@ Capacity-aware construction uses the normal `String` type. Capacity is a perform
 
 ```blorp
 import:
-    string: string
+    string: append_int, string
 
 var row: String = string(80)
 row = row.append_char('#')
+row = row.append_int(42)
 row = row.append_str(" done")
 ```
 

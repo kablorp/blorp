@@ -7139,31 +7139,63 @@ blorp_String* blorp_string_with_capacity(long cap) {
 blorp_String* blorp_string_append(blorp_String* s, const blorp_String* other) {
     if (!other || other->len == 0) return s ? s : __blorp_empty_str;
     if (!s) s = blorp_string_with_capacity(other->len);
+    bool append_self = s == other;
+    long old_len = s->len;
+    long other_len = other->len;
 
     // COW: if refcount > 1, make a copy
     if (!blorp_is_unique(s)) {
-        long need_cap = (long)blorp_checked_add((size_t)s->len, (size_t)other->len);
+        long need_cap = (long)blorp_checked_add((size_t)old_len, (size_t)other_len);
         if (need_cap < s->capacity) need_cap = s->capacity;
-        blorp_String* copy = blorp_string_alloc_uninit(s->len, need_cap);
-        memcpy(copy->data, s->data, s->len + 1);
+        blorp_String* copy = blorp_string_alloc_uninit(old_len, need_cap);
+        memcpy(copy->data, s->data, old_len + 1);
         blorp_release((void*)s);
         s = copy;
     }
 
     // Grow if needed
-    long needed = (long)blorp_checked_add((size_t)s->len, (size_t)other->len);
+    long needed = (long)blorp_checked_add((size_t)old_len, (size_t)other_len);
     if (needed > s->capacity) {
         long new_cap = (long)blorp_checked_mul(needed, 2);
-        blorp_String* new_str = blorp_string_alloc_uninit(s->len, new_cap);
-        memcpy(new_str->data, s->data, s->len);
+        blorp_String* new_str = blorp_string_alloc_uninit(old_len, new_cap);
+        memcpy(new_str->data, s->data, old_len);
         blorp_release((void*)s);
         s = new_str;
     }
 
-    memcpy(s->data + s->len, other->data, other->len);
-    s->len += other->len;
+    const char* source = append_self ? s->data : other->data;
+    memmove(s->data + old_len, source, (size_t)other_len);
+    s->len = needed;
     s->data[s->len] = '\0';
     return s;
+}
+
+static int blorp_format_long_decimal(char* buf, size_t buf_len, long value) {
+    if (buf_len == 0) return 0;
+
+    size_t pos = buf_len;
+    bool negative = value < 0;
+    unsigned long magnitude;
+    if (negative) {
+        magnitude = (unsigned long)(-(value + 1L)) + 1UL;
+    } else {
+        magnitude = (unsigned long)value;
+    }
+
+    do {
+        if (pos == 0) return 0;
+        buf[--pos] = (char)('0' + (magnitude % 10UL));
+        magnitude /= 10UL;
+    } while (magnitude != 0UL);
+
+    if (negative) {
+        if (pos == 0) return 0;
+        buf[--pos] = '-';
+    }
+
+    int len = (int)(buf_len - pos);
+    memmove(buf, buf + pos, (size_t)len);
+    return len;
 }
 
 // IR intrinsic: allocate an empty mutable string with given byte capacity.
@@ -7210,6 +7242,20 @@ blorp_String* blorp_string_ensure_capacity(blorp_String* s, long min_cap) {
     copy->data[s->len] = '\0';
     blorp_release(s);
     return copy;
+}
+
+blorp_String* blorp_string_append_int(blorp_String* s, long value) {
+    char buf[32];
+    int len = blorp_format_long_decimal(buf, sizeof(buf), value);
+    if (len <= 0) return s ? s : blorp_string_alloc(1);
+
+    long old_len = s ? s->len : 0;
+    long new_len = (long)blorp_checked_add((size_t)old_len, (size_t)len);
+    blorp_String* result = blorp_string_ensure_capacity(s, new_len);
+    memcpy(result->data + old_len, buf, (size_t)len);
+    result->len = new_len;
+    result->data[new_len] = '\0';
+    return result;
 }
 
 // FFI copy: create independent deep copy of a string (refcount = 1)
@@ -7325,7 +7371,7 @@ blorp_String* blorp_input_or_empty(blorp_String* prompt) {
 
 blorp_String* blorp_to_string(long i) {
     char buf[32];
-    int len = snprintf(buf, sizeof(buf), "%ld", i);
+    int len = blorp_format_long_decimal(buf, sizeof(buf), i);
     if (len < 0) len = 0;
     return blorp_string_from_buf(buf, len);
 }

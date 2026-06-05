@@ -853,6 +853,12 @@ let test_list_join_uses_ir_string_append () =
       "List.join should use the synthesized IR string_append helper, not \
        direct blorp_string_append C runtime calls"
 
+let test_string_append_str_uses_runtime_bulk_append () =
+  let string_src = read_std_file "string.brp" in
+  if not (contains_substring string_src "builtin(\"blorp_string_append\")") then
+    Alcotest.fail
+      "std/string.append_str should use the runtime bulk append helper"
+
 let test_builder_module_removed_from_std () =
   Alcotest.(check bool)
     "std/builder.brp removed" false
@@ -1461,6 +1467,8 @@ let suite =
           test_std_source_dir_initialized_from_config;
         Alcotest.test_case "list join uses IR string_append" `Quick
           test_list_join_uses_ir_string_append;
+        Alcotest.test_case "string append_str uses runtime bulk append" `Quick
+          test_string_append_str_uses_runtime_bulk_append;
         Alcotest.test_case "builder module removed from std" `Quick
           test_builder_module_removed_from_std;
         Alcotest.test_case "public ABI types have std anchors" `Quick

@@ -618,12 +618,6 @@ let std_body_specs =
       string_spec ~return_shape:(ReturnNamed "String")
         ~param_shapes:[ ParamNamed "String"; ParamNamed "Char" ]
         "string_append_char" 2;
-      string_spec ~return_shape:(ReturnNamed "String")
-        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
-        "append_str" 2;
-      string_spec ~return_shape:(ReturnNamed "String")
-        ~param_shapes:[ ParamNamed "String"; ParamNamed "String" ]
-        "string_append" 2;
       string_spec ~return_shape:(ReturnNamed "Int")
         ~param_shapes:[ ParamNamed "String" ] "length" 1;
       string_spec ~return_shape:(ReturnNamed "String")
@@ -7688,8 +7682,8 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
       let cap = param (param_at 1) in
       Some (intr "string_ensure_capacity" [ s; cap ] ty_string)
   | ("append_char" | "string_append_char") when first_is_string () && arity 2 ->
-      (* UTF-8 encode the codepoint in IR, then use the same COW/capacity
-         primitive that string_append uses for owned string mutation. *)
+      (* UTF-8 encode the codepoint in IR, then use the COW/capacity primitive
+         for owned string mutation. *)
       let s = param (param_at 0) in
       let c = param (param_at 1) in
       let set_byte offset byte =
@@ -7784,7 +7778,7 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
                              [ vr "__r" ty_string; vr "__newlen" ty_int ]
                              ty_void)
                           (vr "__r" ty_string)))))))
-  | ("append_str" | "string_append") when first_is_string () && arity 2 ->
+  | "string_append" when first_is_string () && arity 2 ->
       (* ensure_capacity(s, s.len + other.len) + copy other bytes + set_len *)
       let s = param (param_at 0) in
       let other = param (param_at 1) in

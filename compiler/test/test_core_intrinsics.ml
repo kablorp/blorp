@@ -265,7 +265,7 @@ let expect_no_synthesis ~module_path func_name params return_ty =
   with
   | None -> ()
   | Some _ ->
-      Alcotest.failf "%s.%s should not synthesize for malformed signature"
+      Alcotest.failf "%s.%s should not synthesize for this signature"
         module_path func_name
   | exception exn ->
       Alcotest.failf "%s.%s should return None, not raise %s" module_path
@@ -402,6 +402,9 @@ let test_std_synthesis_rejects_malformed_signatures () =
     ty_string;
   expect_no_synthesis ~module_path:"std/string" "append_str"
     [ param "items" (ty_list ty_int); param "suffix" ty_string ]
+    ty_string;
+  expect_no_synthesis ~module_path:"std/string" "append_str"
+    [ param "s" ty_string; param "suffix" ty_string ]
     ty_string;
   expect_no_synthesis ~module_path:"std/string" "split"
     [ param "s" ty_string ]

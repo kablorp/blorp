@@ -838,6 +838,9 @@ let builtin_contract_table =
         (bvariadic 1 (fun i -> if i = 0 then Borrow else Consume) ReturnOwned);
       builtins [ "blorp_string_append" ]
         (bfixed [ CowConsume; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_string_append_int" ]
+        (bfixed [ CowConsume; Borrow ] ReturnOwned);
       builtins [ "blorp_string_eq" ] (bfixed [ Borrow; Borrow ] ReturnPrimitive);
       builtins
         [
