@@ -11510,8 +11510,8 @@ and infer_field_access ctx expr obj field loc =
                           error loc
                             (Printf.sprintf
                                "Cannot access field on type %s. Field access \
-                                is supported on record fields. Use tuple[index] \
-                                for tuple elements"
+                                is supported on record fields. Use \
+                                tuple[index] for tuple elements"
                                (type_to_string obj_ty))))))
       | _ ->
           error loc
