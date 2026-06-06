@@ -1,0 +1,116 @@
+name: Setup Cached OCaml
+description: Restore an opam root cache, install opam, and prepare the locked OCaml switch.
+
+inputs:
+  ocaml-compiler:
+    description: opam switch/compiler package to use.
+    required: true
+  opam-version:
+    description: opam binary version to install.
+    required: false
+    default: 2.1.5
+
+outputs:
+  cache_hit:
+    description: Whether the exact opam root cache key was restored.
+    value: ${{ steps.opam_cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore opam root cache
+      id: opam_cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.opam
+          ~/.cache/dune
+          ~/Library/Caches/dune
+        key: opam-root-v1-${{ runner.os }}-${{ runner.arch }}-opam-${{ inputs.opam-version }}-${{ inputs.ocaml-compiler }}-${{ hashFiles('compiler/blorp.opam', 'compiler/blorp.opam.locked') }}
+        restore-keys: |
+          opam-root-v1-${{ runner.os }}-${{ runner.arch }}-opam-${{ inputs.opam-version }}-${{ inputs.ocaml-compiler }}-
+
+    - name: Install opam binary
+      shell: bash
+      env:
+        OPAM_VERSION: ${{ inputs.opam-version }}
+      run: |
+        set -euo pipefail
+
+        case "$(uname -s)" in
+          Linux) opam_os=linux ;;
+          Darwin) opam_os=macos ;;
+          *)
+            echo "Unsupported opam host OS: $(uname -s)" >&2
+            exit 1
+            ;;
+        esac
+
+        case "$(uname -m)" in
+          x86_64|amd64) opam_arch=x86_64 ;;
+          arm64|aarch64) opam_arch=arm64 ;;
+          *)
+            echo "Unsupported opam host architecture: $(uname -m)" >&2
+            exit 1
+            ;;
+        esac
+
+        bin_dir="${RUNNER_TEMP}/opam-bin"
+        mkdir -p "$bin_dir"
+        curl -fsSL \
+          "https://github.com/ocaml/opam/releases/download/${OPAM_VERSION}/opam-${OPAM_VERSION}-${opam_arch}-${opam_os}" \
+          -o "${bin_dir}/opam"
+        chmod +x "${bin_dir}/opam"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        echo "DUNE_CACHE=enabled" >> "$GITHUB_ENV"
+        "${bin_dir}/opam" --version
+
+    - name: Prepare opam switch
+      id: opam_switch
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.opam_cache.outputs.cache-hit }}
+        OCAML_COMPILER: ${{ inputs.ocaml-compiler }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "${HOME}/.opam/config" ]; then
+          opam init --bare --disable-sandboxing --no-setup -y
+        fi
+
+        needs_deps=false
+        if [ "$CACHE_HIT" != "true" ]; then
+          needs_deps=true
+        fi
+
+        if ! opam switch list --short 2>/dev/null | grep -Fxq "$OCAML_COMPILER"; then
+          opam switch create "$OCAML_COMPILER" "$OCAML_COMPILER" -y
+          needs_deps=true
+        fi
+
+        opam switch set "$OCAML_COMPILER"
+        eval "$(opam env --switch "$OCAML_COMPILER" --set-switch)"
+        ocaml -version
+        echo "needs_deps=${needs_deps}" >> "$GITHUB_OUTPUT"
+
+    - name: Install locked dependencies
+      if: steps.opam_switch.outputs.needs_deps == 'true'
+      shell: bash
+      env:
+        OCAML_COMPILER: ${{ inputs.ocaml-compiler }}
+      run: |
+        set -euo pipefail
+        eval "$(opam env --switch "$OCAML_COMPILER" --set-switch)"
+        opam update -y
+        opam install ./compiler/blorp.opam --deps-only --with-test --locked -y
+
+    - name: Save opam root cache
+      if: steps.opam_cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: |
+          ~/.opam
+          ~/.cache/dune
+          ~/Library/Caches/dune
+        key: ${{ steps.opam_cache.outputs.cache-primary-key }}
