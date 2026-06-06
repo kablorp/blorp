@@ -1,0 +1,86 @@
+#!/bin/bash
+set -euo pipefail
+
+ocaml_compiler="${1:-${OCAML_COMPILER:-ocaml-base-compiler.4.14.2}}"
+image_name="${BLORP_CI_IMAGE_NAME:-ci-deps}"
+
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$repo_root"
+
+case "${RUNNER_ARCH:-$(uname -m)}" in
+    X64|x86_64|amd64)
+        platform="linux/amd64"
+        platform_slug="linux-amd64"
+        ;;
+    ARM64|aarch64|arm64)
+        platform="linux/arm64"
+        platform_slug="linux-arm64"
+        ;;
+    *)
+        echo "Unsupported CI Docker runner architecture: ${RUNNER_ARCH:-$(uname -m)}" >&2
+        exit 1
+        ;;
+esac
+
+sanitize_component() {
+    tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^-+//; s/-+$//'
+}
+
+repository="${GITHUB_REPOSITORY:-local/blorp}"
+owner="${GITHUB_REPOSITORY_OWNER:-${repository%%/*}}"
+repo="${repository#*/}"
+owner="$(printf '%s' "$owner" | sanitize_component)"
+repo="$(printf '%s' "$repo" | sanitize_component)"
+ocaml_slug="$(printf '%s' "$ocaml_compiler" | sanitize_component)"
+
+input_digest="$(
+    {
+        printf 'ocaml=%s\n' "$ocaml_compiler"
+        printf 'platform=%s\n' "$platform"
+        sha256sum scripts/docker/Dockerfile compiler/blorp.opam compiler/blorp.opam.locked
+    } | sha256sum | awk '{print substr($1, 1, 24)}'
+)"
+
+image="ghcr.io/${owner}/${repo}-${image_name}:${ocaml_slug}-${platform_slug}-${input_digest}"
+cache_scope="${image_name}-${platform_slug}-${ocaml_slug}"
+can_push="false"
+
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+        can_push="$(
+            python3 - <<'PY'
+import json
+import os
+
+event_path = os.environ.get("GITHUB_EVENT_PATH")
+repository = os.environ.get("GITHUB_REPOSITORY")
+if not event_path or not repository:
+    print("false")
+    raise SystemExit
+
+with open(event_path, "r", encoding="utf-8") as event_file:
+    event = json.load(event_file)
+
+head_repo = event.get("pull_request", {}).get("head", {}).get("repo", {}).get("full_name")
+print("true" if head_repo == repository else "false")
+PY
+        )"
+    else
+        can_push="true"
+    fi
+fi
+
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    {
+        echo "image=${image}"
+        echo "platform=${platform}"
+        echo "platform_slug=${platform_slug}"
+        echo "cache_scope=${cache_scope}"
+        echo "can_push=${can_push}"
+    } >> "$GITHUB_OUTPUT"
+fi
+
+echo "image=${image}"
+echo "platform=${platform}"
+echo "cache_scope=${cache_scope}"
+echo "can_push=${can_push}"

@@ -80,6 +80,8 @@ claiming a preview/release-sensitive change is ready.
 ```bash
 scripts/docker-gate
 scripts/docker-gate --premerge-gate
+scripts/docker-gate --ci-gate -- --serial
+scripts/docker-gate --test-gate -- --serial
 scripts/docker-gate --premerge-gate --all-platforms
 scripts/docker-gate --platform linux/arm64 -- tests/test_blorp/numeric/test_float16_vector.brp
 scripts/docker-gate --shell
@@ -90,6 +92,14 @@ Modes:
 - Default volume mode mounts the working tree into the container.
 - `--clean` copies source into the image for a more CI-like run.
 - `--premerge-gate` runs `scripts/premerge-gate --no-docker` inside Docker.
+- `--ci-gate` runs `make`, `make quality-full`, and `scripts/test` inside
+  Docker; arguments after `--` are passed to `scripts/test`.
+- `--test-gate` runs `scripts/test` inside Docker; arguments after `--` are
+  passed to `scripts/test`.
+
+By default the script builds or uses a local `blorp-test-<platform>` image. CI
+sets `BLORP_DOCKER_IMAGE` to a GHCR image keyed by the OCaml compiler, Dockerfile,
+and locked opam inputs so normal Linux runs can start with `docker pull`.
 
 ## Build Lock
 

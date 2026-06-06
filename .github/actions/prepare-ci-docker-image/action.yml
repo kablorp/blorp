@@ -1,0 +1,92 @@
+name: Prepare CI Docker Image
+description: Pull or build the blorp CI dependency image.
+
+inputs:
+  ocaml-compiler:
+    description: OCaml compiler switch to bake into the image.
+    required: true
+  registry-username:
+    description: Username for ghcr.io login.
+    required: true
+  registry-token:
+    description: Token for ghcr.io login.
+    required: true
+
+outputs:
+  image:
+    description: Fully-qualified Docker image tag.
+    value: ${{ steps.meta.outputs.image }}
+  platform:
+    description: Docker platform for the current runner.
+    value: ${{ steps.meta.outputs.platform }}
+  cache_hit:
+    description: Whether docker pull found an existing image.
+    value: ${{ steps.cache-state.outputs.cache_hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve image metadata
+      id: meta
+      shell: bash
+      run: scripts/ci/resolve-docker-image '${{ inputs.ocaml-compiler }}'
+
+    - name: Login to GHCR
+      if: steps.meta.outputs.can_push == 'true'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-token }}
+
+    - name: Pull CI Docker image
+      id: pull
+      shell: bash
+      continue-on-error: true
+      run: docker pull '${{ steps.meta.outputs.image }}'
+
+    - name: Record image cache state
+      id: cache-state
+      shell: bash
+      run: |
+        if [ '${{ steps.pull.outcome }}' = 'success' ]; then
+          echo 'cache_hit=true' >> "$GITHUB_OUTPUT"
+        else
+          echo 'cache_hit=false' >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up Docker Buildx
+      if: steps.pull.outcome != 'success'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build CI Docker image with writable cache
+      if: steps.pull.outcome != 'success' && steps.meta.outputs.can_push == 'true'
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: scripts/docker/Dockerfile
+        platforms: ${{ steps.meta.outputs.platform }}
+        load: true
+        tags: ${{ steps.meta.outputs.image }}
+        build-args: |
+          OCAML_COMPILER=${{ inputs.ocaml-compiler }}
+        cache-from: type=gha,scope=${{ steps.meta.outputs.cache_scope }}
+        cache-to: type=gha,mode=max,scope=${{ steps.meta.outputs.cache_scope }}
+
+    - name: Build CI Docker image with read-only cache
+      if: steps.pull.outcome != 'success' && steps.meta.outputs.can_push != 'true'
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: scripts/docker/Dockerfile
+        platforms: ${{ steps.meta.outputs.platform }}
+        load: true
+        tags: ${{ steps.meta.outputs.image }}
+        build-args: |
+          OCAML_COMPILER=${{ inputs.ocaml-compiler }}
+        cache-from: type=gha,scope=${{ steps.meta.outputs.cache_scope }}
+
+    - name: Push CI Docker image
+      if: steps.pull.outcome != 'success' && steps.meta.outputs.can_push == 'true'
+      shell: bash
+      run: docker push '${{ steps.meta.outputs.image }}'
