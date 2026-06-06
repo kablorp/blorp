@@ -96,10 +96,10 @@ Modes:
 GitHub workflows use `.github/actions/setup-cached-ocaml` instead of
 `ocaml/setup-ocaml`. The action restores `~/.opam` before doing setup work,
 installs only the fixed opam binary, and skips `opam install` on an exact cache
-hit. It also enables Dune's shared cache. The cache key includes OS,
-architecture, opam version, `OCAML_COMPILER`, `compiler/blorp.opam`, and
-`compiler/blorp.opam.locked`; changing the compiler, opam version, or locked
-dependencies rebuilds the switch once.
+hit. It also enables Dune's shared cache. The cache key includes the concrete
+GitHub runner label, architecture, `OCAML_COMPILER`, and
+`compiler/blorp.opam.locked`; changing the compiler, OS image, architecture, or
+locked dependencies rebuilds the switch once.
 
 ## Build Lock
 
