@@ -194,6 +194,10 @@ let test_codegen_intrinsic_renderer_manifest_matches_checked_in_templates () =
       Alcotest.(check string)
         "generated manifest matches checked-in compiler template manifest"
         (String.trim manifest) (String.trim output);
+      Alcotest.(check string)
+        "embedded template module matches checked-in manifest"
+        (String.trim manifest)
+        (String.trim Blorp.Core_emit_blorp_intrinsic_templates.tsv);
       assert_source_contains output "manifest includes math sqrt"
         "math_sqrt\t1\tsqrt(@0@)";
       assert_source_contains output "manifest includes shift left"

@@ -8,7 +8,7 @@
 
 type template = { name : string; arity : int; body : string }
 
-let manifest_tsv = Embedded_codegen_intrinsic_templates.tsv
+let manifest_tsv = Core_emit_blorp_intrinsic_templates.tsv
 
 let strip_trailing_cr line =
   let len = String.length line in
