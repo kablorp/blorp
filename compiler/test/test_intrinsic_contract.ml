@@ -13,7 +13,8 @@
 
 open Blorp
 
-(** Extract intrinsic names that appear in emit_intrinsic match clauses.
+(** Extract intrinsic names that appear in emit_intrinsic match clauses or in
+    the Blorp-owned template manifest consumed by the emitter.
     Reads [core_emit_intrinsic.ml] (Phase 5.1 step 3 moved the match
     body there; prior to that it lived in [core_emit.ml]) and
     regex-matches the patterns used by the dispatcher. Handles both
@@ -119,7 +120,7 @@ let emit_intrinsic_names () : string list =
     else scan (i + 1)
   in
   scan 0;
-  List.sort_uniq String.compare !names
+  List.sort_uniq String.compare (!names @ Core_emit_blorp_intrinsic.names ())
 
 (* ============================================================================
    Tests

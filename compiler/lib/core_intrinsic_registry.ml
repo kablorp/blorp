@@ -12,7 +12,8 @@
     {1 Contract}
 
     Every intrinsic listed here MUST have:
-    - An emitter in [core_emit.ml]'s [emit_intrinsic]
+    - An emitter in [core_emit_intrinsic.ml] or a Blorp-owned template entry in
+      [core_emit_blorp_intrinsic_templates.tsv]
     - Documentation of its semantics (what it does, not how)
 
     IR bodies in [core_intrinsics.ml] compose these primitives into
@@ -22,7 +23,9 @@
     {1 Adding new intrinsics}
 
     1. Add the entry here with name, arg types, return type, and semantics.
-    2. Add the emitter case in [core_emit.ml]'s [emit_intrinsic].
+    2. Add the emitter case in [core_emit_intrinsic.ml], or add a simple
+       expression template through [tools/compiler/codegen_intrinsic_renderer.brp]
+       and regenerate [core_emit_blorp_intrinsic_templates.tsv].
     3. Use it in [core_intrinsics.ml] IR bodies via [intr "name" args ty].
 
     {1 How builtin works}

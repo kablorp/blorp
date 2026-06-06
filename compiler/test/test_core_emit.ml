@@ -28,6 +28,8 @@ let ty_channel_int = TyNamed ("Channel", [ ty_int ])
 let ty_list_string = TyNamed ("List", [ ty_string ])
 let ty_set_string = TyNamed ("Set", [ ty_string ])
 let ty_dict_string_string = TyNamed ("Dict", [ ty_string; ty_string ])
+let ty_slice = TyNamed ("StringSlice", [])
+let ty_vector_float = TyNamed ("Vector", [ ty_float ])
 let ty_expr = TyNamed ("Expr", [])
 let ty_opt_string = TyNamed ("Option", [ ty_string ])
 let ty_result_int_bool = TyNamed ("Result", [ ty_int; ty_bool ])
@@ -1785,6 +1787,41 @@ let test_emit_list_inline_struct_get_unknown_storage_reads_inline_slot_directly
   Alcotest.(check bool)
     "does not memcpy from raw value returned by blorp_list_get" false
     memcpys_from_raw
+
+let test_emit_blorp_template_intrinsics () =
+  let intrinsic name args ty = mk (CCall (CKIntrinsic name, cvoid, args)) ty in
+  let check name expected expr =
+    Alcotest.(check string) name expected (emit_to_string expr)
+  in
+  check "math sqrt" "sqrt(x)"
+    (intrinsic "math_sqrt" [ cvar "x" ty_float ] ty_float);
+  check "math pow" "pow(x, y)"
+    (intrinsic "math_pow" [ cvar "x" ty_float; cvar "y" ty_float ] ty_float);
+  check "bit and" "(1L & 2L)" (intrinsic "bit_and" [ cint 1; cint 2 ] ty_int);
+  check "shift left" "((long)(1L << (8L & 63)))"
+    (intrinsic "shift_left" [ cint 1; cint 8 ] ty_int);
+  check "list len" "((blorp_List*)xs)->len"
+    (intrinsic "list_len" [ cvar "xs" ty_list_string ] ty_int);
+  check "string len" "((blorp_String*)s)->len"
+    (intrinsic "string_len" [ cvar "s" ty_string ] ty_int);
+  check "bytes len" "((blorp_Bytes*)b)->len"
+    (intrinsic "bytes_len" [ cvar "b" (TyNamed ("Bytes", [])) ] ty_int);
+  check "dict len" "((blorp_Dict*)d)->size"
+    (intrinsic "dict_len" [ cvar "d" ty_dict_string_string ] ty_int);
+  check "set bucket" "((void*)((blorp_Set*)s)->buckets[3L])"
+    (intrinsic "set_bucket" [ cvar "s" ty_set_string; cint 3 ] ty_ptr);
+  check "dict meta get" "((long)((blorp_Dict*)d)->meta[2L])"
+    (intrinsic "dict_meta_get"
+       [ cvar "d" ty_dict_string_string; cint 2 ]
+       ty_int);
+  check "slice source" "((void*)((blorp_StringSlice*)slice)->source)"
+    (intrinsic "slice_source" [ cvar "slice" ty_slice ] ty_string);
+  check "slice len" "((blorp_StringSlice*)slice)->len"
+    (intrinsic "slice_len" [ cvar "slice" ty_slice ] ty_int);
+  check "tensor capacity" "((blorp_Vector*)vec)->capacity"
+    (intrinsic "tensor_capacity" [ cvar "vec" ty_vector_float ] ty_int);
+  check "fixed scale" "(long)((blorp_Fixed*)fx)->scale"
+    (intrinsic "fixed_scale" [ cvar "fx" ty_fixed ] ty_int)
 
 let test_emit_list_ensure_intrinsics_use_common_fast_paths () =
   let list_ty = TyNamed ("List", [ ty_int ]) in
@@ -6036,6 +6073,8 @@ let suite =
           test_emit_list_inline_struct_set_unknown_storage_branches_safely;
         Alcotest.test_case "list_inline_struct_get_unknown_safe" `Quick
           test_emit_list_inline_struct_get_unknown_storage_reads_inline_slot_directly;
+        Alcotest.test_case "blorp_template_intrinsics" `Quick
+          test_emit_blorp_template_intrinsics;
         Alcotest.test_case "list_ensure_common_fast_paths" `Quick
           test_emit_list_ensure_intrinsics_use_common_fast_paths;
         Alcotest.test_case "list_new_managed_release" `Quick

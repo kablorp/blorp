@@ -81,18 +81,9 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
   let _ = emit_stmt in
   (* reserved — see file header *)
   match (name, args) with
+  | _ when Core_emit_blorp_intrinsic.emit ~emit_expr ctx name args -> ()
   (* ---- List primitives ---- *)
   | "elem_release_fn", [] -> emit ctx "((void*)blorp_elem_release_fn)"
-  | "list_len", [ lst ] ->
-      (* list->len *)
-      emit ctx "((blorp_List*)";
-      emit_expr ctx lst;
-      emit ctx ")->len"
-  | "list_capacity", [ lst ] ->
-      (* list->capacity *)
-      emit ctx "((blorp_List*)";
-      emit_expr ctx lst;
-      emit ctx ")->capacity"
   | "list_get", [ lst; idx ] ->
       (* Layout-aware unchecked get. Returns a void* storage value. *)
       emit ctx "blorp_list_get((blorp_List*)";
@@ -242,10 +233,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit_expr ctx fn;
       emit ctx ")"
   (* ---- String primitives ---- *)
-  | "string_len", [ s ] ->
-      emit ctx "((blorp_String*)";
-      emit_expr ctx s;
-      emit ctx ")->len"
   | "string_get_byte", [ s; idx ] ->
       (* s->data[idx] as unsigned char → Int *)
       emit ctx "(long)(unsigned char)((blorp_String*)";
@@ -327,10 +314,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit_expr ctx cap;
       emit ctx ")"
   (* ---- Bytes primitives ---- *)
-  | "bytes_len", [ b ] ->
-      emit ctx "((blorp_Bytes*)";
-      emit_expr ctx b;
-      emit ctx ")->len"
   | "bytes_get", [ b; idx ] ->
       emit ctx "(long)((blorp_Bytes*)";
       emit_expr ctx b;
@@ -359,71 +342,13 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit ctx "blorp_bytes_cow(";
       emit_expr ctx b;
       emit ctx ")"
-  (* ---- Bitwise primitives ---- *)
-  | "bit_and", [ a; b ] ->
-      emit ctx "(";
-      emit_expr ctx a;
-      emit ctx " & ";
-      emit_expr ctx b;
-      emit ctx ")"
-  | "bit_or", [ a; b ] ->
-      emit ctx "(";
-      emit_expr ctx a;
-      emit ctx " | ";
-      emit_expr ctx b;
-      emit ctx ")"
-  | "bit_xor", [ a; b ] ->
-      emit ctx "(";
-      emit_expr ctx a;
-      emit ctx " ^ ";
-      emit_expr ctx b;
-      emit ctx ")"
-  | "bit_not", [ a ] ->
-      emit ctx "(~";
-      emit_expr ctx a;
-      emit ctx ")"
-  | "shift_left", [ a; n ] ->
-      emit ctx "((long)(";
-      emit_expr ctx a;
-      emit ctx " << (";
-      emit_expr ctx n;
-      emit ctx " & 63)))"
-  | "shift_right", [ a; n ] ->
-      emit ctx "((long)(";
-      emit_expr ctx a;
-      emit ctx " >> (";
-      emit_expr ctx n;
-      emit ctx " & 63)))"
-  (* ---- Dict primitives ---- *)
-  | "dict_len", [ d ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->size"
   (* ---- Set primitives ---- *)
-  | "set_len", [ s ] ->
-      emit ctx "((blorp_Set*)";
-      emit_expr ctx s;
-      emit ctx ")->size"
-  | "set_capacity", [ s ] ->
-      emit ctx "((blorp_Set*)";
-      emit_expr ctx s;
-      emit ctx ")->capacity"
-  | "set_mask", [ s ] ->
-      emit ctx "((blorp_Set*)";
-      emit_expr ctx s;
-      emit ctx ")->mask"
   | "set_set_len", [ s; n ] ->
       emit ctx "(((blorp_Set*)";
       emit_expr ctx s;
       emit ctx ")->size = ";
       emit_expr ctx n;
       emit ctx ")"
-  | "set_bucket", [ s; idx ] ->
-      emit ctx "((void*)((blorp_Set*)";
-      emit_expr ctx s;
-      emit ctx ")->buckets[";
-      emit_expr ctx idx;
-      emit ctx "])"
   | "set_set_bucket", [ s; idx; entry ] ->
       emit ctx "(((blorp_Set*)";
       emit_expr ctx s;
@@ -432,14 +357,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit ctx "] = (blorp_SetEntry*)";
       emit_expr ctx entry;
       emit ctx ")"
-  | "set_first", [ s ] ->
-      emit ctx "((void*)((blorp_Set*)";
-      emit_expr ctx s;
-      emit ctx ")->first)"
-  | "set_last", [ s ] ->
-      emit ctx "((void*)((blorp_Set*)";
-      emit_expr ctx s;
-      emit ctx ")->last)"
   | "set_set_first", [ s; e ] ->
       emit ctx "(((blorp_Set*)";
       emit_expr ctx s;
@@ -452,28 +369,12 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit ctx ")->last = (blorp_SetEntry*)";
       emit_expr ctx e;
       emit ctx ")"
-  | "set_entry_key", [ e ] ->
-      emit ctx "((blorp_SetEntry*)";
-      emit_expr ctx e;
-      emit ctx ")->key"
-  | "set_entry_next", [ e ] ->
-      emit ctx "((void*)((blorp_SetEntry*)";
-      emit_expr ctx e;
-      emit ctx ")->next)"
   | "set_entry_set_next", [ e; n ] ->
       emit ctx "(((blorp_SetEntry*)";
       emit_expr ctx e;
       emit ctx ")->next = (blorp_SetEntry*)";
       emit_expr ctx n;
       emit ctx ")"
-  | "set_entry_prev_order", [ e ] ->
-      emit ctx "((void*)((blorp_SetEntry*)";
-      emit_expr ctx e;
-      emit ctx ")->prev_order)"
-  | "set_entry_next_order", [ e ] ->
-      emit ctx "((void*)((blorp_SetEntry*)";
-      emit_expr ctx e;
-      emit ctx ")->next_order)"
   | "set_entry_set_prev_order", [ e; p ] ->
       emit ctx "(((blorp_SetEntry*)";
       emit_expr ctx e;
@@ -554,36 +455,12 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit_expr ctx len;
       emit ctx ")"
   (* ---- Dict primitives ---- *)
-  | "dict_capacity", [ d ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->capacity"
-  | "dict_mask", [ d ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->mask"
-  | "dict_grow_at", [ d ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->grow_at"
   | "dict_set_len", [ d; n ] ->
       emit ctx "(((blorp_Dict*)";
       emit_expr ctx d;
       emit ctx ")->size = ";
       emit_expr ctx n;
       emit ctx ")"
-  | "dict_key_at", [ d; idx ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->keys[";
-      emit_expr ctx idx;
-      emit ctx "]"
-  | "dict_value_at", [ d; idx ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->values[";
-      emit_expr ctx idx;
-      emit ctx "]"
   | "dict_set_key_at", [ d; idx; k ] ->
       emit ctx "(((blorp_Dict*)";
       emit_expr ctx d;
@@ -600,12 +477,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit ctx "] = ";
       emit_expr ctx v;
       emit ctx ")"
-  | "dict_meta_get", [ d; idx ] ->
-      emit ctx "((long)((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->meta[";
-      emit_expr ctx idx;
-      emit ctx "])"
   | "dict_meta_set", [ d; idx; v ] ->
       emit ctx "(((blorp_Dict*)";
       emit_expr ctx d;
@@ -614,12 +485,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit ctx "] = (uint8_t)";
       emit_expr ctx v;
       emit ctx ")"
-  | "dict_order_get", [ d; i ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->order[";
-      emit_expr ctx i;
-      emit ctx "]"
   | "dict_order_set", [ d; i; v ] ->
       emit ctx "(((blorp_Dict*)";
       emit_expr ctx d;
@@ -628,22 +493,12 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit ctx "] = ";
       emit_expr ctx v;
       emit ctx ")"
-  | "dict_order_len", [ d ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->order_len"
   | "dict_set_order_len", [ d; n ] ->
       emit ctx "(((blorp_Dict*)";
       emit_expr ctx d;
       emit ctx ")->order_len = ";
       emit_expr ctx n;
       emit ctx ")"
-  | "dict_order_index_get", [ d; slot ] ->
-      emit ctx "((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->order_index[";
-      emit_expr ctx slot;
-      emit ctx "]"
   | "dict_order_index_set", [ d; slot; v ] ->
       emit ctx "(((blorp_Dict*)";
       emit_expr ctx d;
@@ -652,14 +507,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit ctx "] = ";
       emit_expr ctx v;
       emit ctx ")"
-  | "dict_key_release_fn", [ d ] ->
-      emit ctx "((void*)((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->key_release)"
-  | "dict_value_release_fn", [ d ] ->
-      emit ctx "((void*)((blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx ")->value_release)"
   | "dict_hash", [ d; key ] ->
       emit ctx "((long)((blorp_Dict*)";
       emit_expr ctx d;
@@ -727,18 +574,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit_expr ctx cap;
       emit ctx ")"
   (* ---- Slice primitives ---- *)
-  | "slice_source", [ s ] ->
-      emit ctx "((void*)((blorp_StringSlice*)";
-      emit_expr ctx s;
-      emit ctx ")->source)"
-  | "slice_start", [ s ] ->
-      emit ctx "((blorp_StringSlice*)";
-      emit_expr ctx s;
-      emit ctx ")->start"
-  | "slice_len", [ s ] ->
-      emit ctx "((blorp_StringSlice*)";
-      emit_expr ctx s;
-      emit ctx ")->len"
   | "slice_alloc", [ src; start; len ] ->
       emit ctx "blorp_slice_alloc(";
       emit_expr ctx src;
@@ -748,14 +583,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit_expr ctx len;
       emit ctx ")"
   (* ---- Tensor/Vector primitives ---- *)
-  | "tensor_len", [ t ] ->
-      emit ctx "((blorp_Vector*)";
-      emit_expr ctx t;
-      emit ctx ")->len"
-  | "tensor_capacity", [ t ] ->
-      emit ctx "((blorp_Vector*)";
-      emit_expr ctx t;
-      emit ctx ")->capacity"
   | "tensor_is_word_storage", [ t ] ->
       let vec_tmp = Printf.sprintf "__tensor_layout_%d" (fresh_temp ctx) in
       emit ctx (Printf.sprintf "({ blorp_Vector* %s = (blorp_Vector*)" vec_tmp);
@@ -922,68 +749,6 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       emit ctx ")"
   | "tensor_alloc", [ size ] -> emit_tensor_alloc ~emit_expr ctx e size
   (* ---- Fixed primitives ---- *)
-  | "fixed_value", [ f ] ->
-      emit ctx "((blorp_Fixed*)";
-      emit_expr ctx f;
-      emit ctx ")->value"
-  | "fixed_scale", [ f ] ->
-      emit ctx "(long)((blorp_Fixed*)";
-      emit_expr ctx f;
-      emit ctx ")->scale"
-  | "fixed_precision", [ f ] ->
-      emit ctx "(long)((blorp_Fixed*)";
-      emit_expr ctx f;
-      emit ctx ")->precision"
-  (* ---- Math intrinsics ---- *)
-  (* Unary: emit as bare C math function call *)
-  | ( ( "math_sin" | "math_cos" | "math_tan" | "math_asin" | "math_acos"
-      | "math_atan" | "math_sinh" | "math_cosh" | "math_tanh" | "math_asinh"
-      | "math_acosh" | "math_atanh" | "math_exp" | "math_exp2" | "math_expm1"
-      | "math_log" | "math_log2" | "math_log10" | "math_log1p" | "math_sqrt"
-      | "math_cbrt" | "math_floor" | "math_ceil" | "math_trunc" ),
-      [ x ] ) ->
-      (* Strip "math_" prefix to get the C function name *)
-      let c_name = String.sub name 5 (String.length name - 5) in
-      emit ctx c_name;
-      emit ctx "(";
-      emit_expr ctx x;
-      emit ctx ")"
-  (* Binary *)
-  | ( ("math_pow" | "math_atan2" | "math_hypot" | "math_fmod" | "math_copysign"),
-      [ x; y ] ) ->
-      let c_name = String.sub name 5 (String.length name - 5) in
-      emit ctx c_name;
-      emit ctx "(";
-      emit_expr ctx x;
-      emit ctx ", ";
-      emit_expr ctx y;
-      emit ctx ")"
-  (* Ternary *)
-  | "math_fma", [ x; y; z ] ->
-      emit ctx "fma(";
-      emit_expr ctx x;
-      emit ctx ", ";
-      emit_expr ctx y;
-      emit ctx ", ";
-      emit_expr ctx z;
-      emit ctx ")"
-  (* Constants — inline, no function call *)
-  | "math_infinity", [] -> emit ctx "(1.0/0.0)"
-  | "math_neg_infinity", [] -> emit ctx "(-1.0/0.0)"
-  | "math_nan", [] -> emit ctx "(0.0/0.0)"
-  (* Classification — C macros *)
-  | "math_is_nan", [ x ] ->
-      emit ctx "isnan(";
-      emit_expr ctx x;
-      emit ctx ")"
-  | "math_is_inf", [ x ] ->
-      emit ctx "isinf(";
-      emit_expr ctx x;
-      emit ctx ")"
-  | "math_is_finite", [ x ] ->
-      emit ctx "isfinite(";
-      emit_expr ctx x;
-      emit ctx ")"
   | "fixed_alloc", [ v; s; p ] ->
       emit ctx "blorp_fixed_raw(";
       emit_expr ctx v;
