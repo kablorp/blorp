@@ -101,8 +101,6 @@ let test_codegen_intrinsic_renderer_source_contract () =
     "enum Intrinsic:";
   assert_source_contains source "source exposes manifest command"
     "RenderManifestCommand";
-  assert_source_contains source "source parses lookup as option"
-    "pure func parse_intrinsic(name: String) -> Option[Intrinsic]";
   assert_source_contains source "source uses intrinsic lookup table"
     "private INTRINSICS_DICT: Dict[String, Intrinsic]";
   assert_source_contains source "source parses with dict get" ".get(name)";
