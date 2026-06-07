@@ -4,6 +4,10 @@
 -- 2. send_timeout that expires, followed by recv (stale fiber in wait queue)
 -- 3. recv_timeout that succeeds (data arrives before timeout)
 -- 4. Multiple recv_timeouts on same channel (stress the wait queue cleanup)
+-- 5. Timed-out waiters must not consume later try_send/try_recv or seal wakeups
+-- Coverage note: these pin known channel-timeout interleavings, but they are
+-- not exhaustive scheduler exploration. A deterministic channel scheduler or
+-- fuzz harness would be stronger for future wait-queue changes.
 import:
 	channel:
 		ChannelSealed(Sealed),
@@ -186,6 +190,99 @@ func test_multiple_recv_timeouts_then_send() -> Bool:
 		Ok(v): ok = ok and v
 		Err(_): ok = False
 	ok
+
+
+func timeout_send_value_task(ch: Channel[String], value: String) -> Bool:
+	result: Bool = send_timeout(ch, value, 10)
+	not result
+
+
+func delayed_single_recv_task(ch: Channel[String]) -> Bool:
+	sleep(50)
+	match recv(ch):
+		Some(v): v == "first"
+		None: False
+
+
+-- Stress: multiple send_timeouts on the same full channel all expire,
+-- then a recv frees capacity. Expired senders must not be woken as if they
+-- had won the freed slot.
+func test_multiple_send_timeouts_then_recv() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, "first")
+	concurrent:
+		t1 = timeout_send_value_task(ch, "overflow-1")
+		t2 = timeout_send_value_task(ch, "overflow-2")
+		t3 = timeout_send_value_task(ch, "overflow-3")
+		recvd = delayed_single_recv_task(ch)
+	var ok: Bool = True
+	match t1:
+		Ok(v): ok = ok and v
+		Err(_): ok = False
+	match t2:
+		Ok(v): ok = ok and v
+		Err(_): ok = False
+	match t3:
+		Ok(v): ok = ok and v
+		Err(_): ok = False
+	match recvd:
+		Ok(v): ok = ok and v
+		Err(_): ok = False
+	empty_ok: Bool = match try_recv(ch):
+		None: True
+		Some(_): False
+	ok and empty_ok
+
+
+func delayed_try_send_after_recv_timeout(ch: Channel[Int]) -> Bool:
+	sleep(50)
+	sent_ok: Bool = try_send(ch, 88)
+	sleep(20)
+	drained_ok: Bool = match try_recv(ch):
+		Some(v): v == 88
+		None: False
+	sent_ok and drained_ok
+
+
+func test_try_send_skips_expired_recv_timeout() -> Bool:
+	ch: Channel[Int] = channel(1)
+	concurrent(timeout: channel_concurrent_guard_ms):
+		timed_out = timeout_recv_task(ch)
+		sent = delayed_try_send_after_recv_timeout(ch)
+	timed_out_ok: Bool = match timed_out:
+		Ok(v): v
+		Err(_): False
+	sent_ok: Bool = match sent:
+		Ok(v): v
+		Err(_): False
+	timed_out_ok and sent_ok
+
+
+func delayed_try_recv_after_send_timeout(ch: Channel[String]) -> Bool:
+	sleep(50)
+	first_ok: Bool = match try_recv(ch):
+		Some(v): v == "first"
+		None: False
+	sleep(20)
+	empty_ok: Bool = match try_recv(ch):
+		None: True
+		Some(_): False
+	first_ok and empty_ok
+
+
+func test_try_recv_skips_expired_send_timeout() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, "first")
+	concurrent(timeout: channel_concurrent_guard_ms):
+		timed_out = send_timeout_task(ch)
+		recvd = delayed_try_recv_after_send_timeout(ch)
+	timed_out_ok: Bool = match timed_out:
+		Ok(v): v
+		Err(_): False
+	recvd_ok: Bool = match recvd:
+		Ok(v): v
+		Err(_): False
+	timed_out_ok and recvd_ok
 
 
 func delayed_send_int(ch: Channel[Int]) -> Bool:
@@ -606,6 +703,106 @@ func test_send_timeout_attempt_sealed() -> Bool:
 		_: False
 
 
+func recv_timeout_attempt_waits_for_seal(ch: Channel[Int]) -> Bool:
+	match recv_timeout_attempt(ch, 200):
+		RecvSealed: True
+		_: False
+
+
+func test_recv_timeout_attempt_seal_before_deadline() -> Bool:
+	ch: Channel[Int] = channel(1)
+	concurrent(timeout: channel_concurrent_guard_ms):
+		attempted = recv_timeout_attempt_waits_for_seal(ch)
+		sealed = delayed_seal_int(ch)
+	attempted_ok: Bool = match attempted:
+		Ok(v): v
+		Err(_): False
+	sealed_ok: Bool = match sealed:
+		Ok(v): v
+		Err(_): False
+	attempted_ok and sealed_ok
+
+
+func send_timeout_attempt_waits_for_seal(ch: Channel[String]) -> Bool:
+	match send_timeout_attempt(ch, "second", 200):
+		SendSealed: True
+		_: False
+
+
+func test_send_timeout_attempt_seal_before_deadline() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, "first")
+	concurrent(timeout: channel_concurrent_guard_ms):
+		attempted = send_timeout_attempt_waits_for_seal(ch)
+		sealed = delayed_seal_string(ch)
+	attempted_ok: Bool = match attempted:
+		Ok(v): v
+		Err(_): False
+	sealed_ok: Bool = match sealed:
+		Ok(v): v
+		Err(_): False
+	drained_ok: Bool = match recv(ch):
+		Some(v): v == "first"
+		None: False
+	attempted_ok and sealed_ok and drained_ok
+
+
+func recv_timeout_attempt_expires_before_late_seal(ch: Channel[Int]) -> Bool:
+	match recv_timeout_attempt(ch, 10):
+		RecvTimedOut: True
+		_: False
+
+
+func delayed_late_seal_int(ch: Channel[Int]) -> Bool:
+	sleep(50)
+	seal(ch)
+	True
+
+
+func test_recv_timeout_attempt_timeout_before_late_seal() -> Bool:
+	ch: Channel[Int] = channel(1)
+	concurrent(timeout: channel_concurrent_guard_ms):
+		attempted = recv_timeout_attempt_expires_before_late_seal(ch)
+		sealed = delayed_late_seal_int(ch)
+	attempted_ok: Bool = match attempted:
+		Ok(v): v
+		Err(_): False
+	sealed_ok: Bool = match sealed:
+		Ok(v): v
+		Err(_): False
+	attempted_ok and sealed_ok
+
+
+func send_timeout_attempt_expires_before_late_seal(ch: Channel[String]) -> Bool:
+	match send_timeout_attempt(ch, "second", 10):
+		SendTimedOut: True
+		_: False
+
+
+func delayed_late_seal_string(ch: Channel[String]) -> Bool:
+	sleep(50)
+	seal(ch)
+	True
+
+
+func test_send_timeout_attempt_timeout_before_late_seal() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, "first")
+	concurrent(timeout: channel_concurrent_guard_ms):
+		attempted = send_timeout_attempt_expires_before_late_seal(ch)
+		sealed = delayed_late_seal_string(ch)
+	attempted_ok: Bool = match attempted:
+		Ok(v): v
+		Err(_): False
+	sealed_ok: Bool = match sealed:
+		Ok(v): v
+		Err(_): False
+	drained_ok: Bool = match recv(ch):
+		Some(v): v == "first"
+		None: False
+	attempted_ok and sealed_ok and drained_ok
+
+
 func test_recv_timeout_negative_is_immediate() -> Bool:
 	ch: Channel[Int] = channel(1)
 	start: Int = now()
@@ -729,6 +926,9 @@ tests: TestSuite = {
 		("recv_timeout then send (UAF regression)", test_recv_timeout_then_send),
 		("send_timeout then recv (UAF regression)", test_send_timeout_then_recv),
 		("multiple recv_timeouts then send (stress)", test_multiple_recv_timeouts_then_send),
+		("multiple send_timeouts then recv (stress)", test_multiple_send_timeouts_then_recv),
+		("try_send skips expired recv_timeout", test_try_send_skips_expired_recv_timeout),
+		("try_recv skips expired send_timeout", test_try_recv_skips_expired_send_timeout),
 		("try_send wakes blocked recv", test_try_send_wakes_blocked_recv),
 		("try_recv wakes blocked send", test_try_recv_wakes_blocked_send),
 		("seal wakes blocked recv", test_seal_wakes_blocked_recv),
@@ -762,6 +962,22 @@ tests: TestSuite = {
 		("send_timeout_attempt succeeds", test_send_timeout_attempt_success),
 		("send_timeout_attempt reports timeout", test_send_timeout_attempt_timed_out),
 		("send_timeout_attempt reports sealed", test_send_timeout_attempt_sealed),
+		(
+			"recv_timeout_attempt reports seal before deadline",
+			test_recv_timeout_attempt_seal_before_deadline,
+		),
+		(
+			"send_timeout_attempt reports seal before deadline",
+			test_send_timeout_attempt_seal_before_deadline,
+		),
+		(
+			"recv_timeout_attempt keeps timeout before late seal",
+			test_recv_timeout_attempt_timeout_before_late_seal,
+		),
+		(
+			"send_timeout_attempt keeps timeout before late seal",
+			test_send_timeout_attempt_timeout_before_late_seal,
+		),
 		("recv_timeout negative is immediate", test_recv_timeout_negative_is_immediate),
 		(
 			"recv_timeout negative receives ready value",
