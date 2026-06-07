@@ -16,10 +16,20 @@ import:
 		message,
 		port,
 		read_chunk,
+		set_stream_timeout,
 		set_timeout,
 		write_all,
 	string: contains
 	test: TestSuite
+
+
+http_stream_timeout_ms: Int = 1000
+
+http_client_result_timeout_ms: Int = 5000
+
+http_read_chunk_size: Int = 4096
+
+http_listener_backlog: Int = 32
 
 
 pure func is_socket_permission_error(err: TcpError) -> Bool:
@@ -34,9 +44,10 @@ pure func route(req: Request) -> Response:
 func client_get(port_num: Int, path: String) -> Result[Bool, TcpError]:
 	remote ?= port(port_num)
 	with stream ?= connect_loopback(IPv4, remote):
+		ignored_timeout ?= set_stream_timeout(stream, http_stream_timeout_ms)
 		request: Bytes = ("GET " + path + " HTTP/1.1\r\nHost: localhost\r\n\r\n").to_bytes()
 		ignored ?= write_all(stream, request)
-		raw ?= read_chunk(stream, 4096)
+		raw ?= read_chunk(stream, http_read_chunk_size)
 		text: String = raw.to_string()
 		Ok(text.contains("HTTP/1.1 200 OK") and text.contains("handled " + path))
 
@@ -59,7 +70,7 @@ func collect_client_results(results: Channel[Bool], count: Int) -> Bool:
 	var seen: Int = 0
 	var ok: Bool = True
 	while seen < count:
-		match recv_timeout(results, 1000):
+		match recv_timeout(results, http_client_result_timeout_ms):
 			Some(value):
 				ok = ok and value
 				seen += 1
@@ -70,19 +81,22 @@ func collect_client_results(results: Channel[Bool], count: Int) -> Bool:
 
 
 func run_resource_http_server(client_count: Int) -> Result[Bool, TcpError]:
-	with listener ?= listen_loopback_any_port(IPv4, 32):
-		ignored ?= set_timeout(listener, 100)
+	with listener ?= listen_loopback_any_port(IPv4, http_listener_backlog):
+		ignored ?= set_timeout(listener, http_stream_timeout_ms)
 		port_num ?= local_port(listener)
 		results: Channel[Bool] = channel(client_count)
 		launch_clients(port_num, client_count, results)
 		for peer in connections_stop_on_error(listener) concurrently(limit: 4):
-			match read_chunk(peer, 4096):
-				Ok(raw):
-					response: Response = match HTTP.parse_request(raw):
-						Ok(req): route(req)
-						Err(msg): HTTP.error_response(400, msg)
-					match write_all(peer, HTTP.format_response(response)):
-						Ok(_): void
+			match set_stream_timeout(peer, http_stream_timeout_ms):
+				Ok(_):
+					match read_chunk(peer, http_read_chunk_size):
+						Ok(raw):
+							response: Response = match HTTP.parse_request(raw):
+								Ok(req): route(req)
+								Err(msg): HTTP.error_response(400, msg)
+							match write_all(peer, HTTP.format_response(response)):
+								Ok(_): void
+								Err(_): void
 						Err(_): void
 				Err(_): void
 		Ok(collect_client_results(results, client_count))
