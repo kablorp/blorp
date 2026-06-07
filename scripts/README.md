@@ -91,6 +91,16 @@ Modes:
 - `--clean` copies source into the image for a more CI-like run.
 - `--premerge-gate` runs `scripts/premerge-gate --no-docker` inside Docker.
 
+## CI OCaml Cache
+
+GitHub workflows use `.github/actions/setup-cached-ocaml` instead of
+`ocaml/setup-ocaml`. The action restores `~/.opam` before doing setup work,
+installs only the fixed opam binary, and skips `opam install` on an exact cache
+hit. It also enables Dune's shared cache. The cache key includes the concrete
+GitHub runner label, architecture, `OCAML_COMPILER`, and
+`compiler/blorp.opam.locked`; changing the compiler, OS image, architecture, or
+locked dependencies rebuilds the switch once.
+
 ## Build Lock
 
 `scripts/with-build-lock` serializes build/test gates per worktree. `scripts/test`
