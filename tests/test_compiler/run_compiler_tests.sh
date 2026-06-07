@@ -75,6 +75,16 @@ case "$compiler_test_timeout" in
         ;;
 esac
 
+if ! $self_test_timeout && [ "${BLORP_COMPILER_TEST_RUNNER:-in-process}" != "legacy" ]; then
+    runner_args=(__compiler-tests --blorp-bin "$BLORP_BIN" --timeout "$compiler_test_timeout")
+    if $verbose; then
+        runner_args+=(--verbose)
+    else
+        runner_args+=(--quiet)
+    fi
+    exec "$BLORP_BIN" "${runner_args[@]}"
+fi
+
 if [ "$compiler_test_timeout" -eq 0 ]; then
     echo "Compiler Tests (${NJOBS} workers, timeout disabled)"
 else
