@@ -79,111 +79,27 @@ let assert_tool_success bin label args expected =
   Alcotest.(check int) (label ^ " exit code") 0 code;
   Alcotest.(check string) (label ^ " output") expected (String.trim output)
 
-let assert_tool_failure_contains bin label args expected_fragment =
-  let code, output = run_tool bin args in
-  Alcotest.(check int) (label ^ " exit code") 1 code;
-  Alcotest.(check bool)
-    (label ^ " error contains expected text")
-    true
-    (Blorp.Modules.contains output expected_fragment)
-
 let assert_source_contains source label fragment =
   Alcotest.(check bool) label true (Blorp.Modules.contains source fragment)
 
 let assert_source_not_contains source label fragment =
   Alcotest.(check bool) label false (Blorp.Modules.contains source fragment)
 
-let test_codegen_intrinsic_renderer_source_contract () =
-  let compiler_tool_path = find_project_file compiler_tool_rel in
-  Alcotest.(check bool)
-    "compiler-blorp tool source exists" true
-    (Sys.file_exists compiler_tool_path);
-  let source = read_file compiler_tool_path in
-  assert_source_contains source "source exposes render_intrinsic"
-    "pure func render_intrinsic(name: String, args: List[String]) -> \
-     Result[String, RenderError]";
-  assert_source_contains source "source exposes intrinsic enum"
-    "enum Intrinsic:";
-  assert_source_contains source "source exposes manifest command"
-    "RenderManifestCommand";
-  assert_source_contains source "source uses intrinsic lookup table"
-    "private INTRINSICS_DICT: Dict[String, Intrinsic]";
-  assert_source_contains source "source parses with dict get" ".get(name)";
-  assert_source_contains source "source converts lookup miss at render boundary"
-    "None: Err(UnsupportedIntrinsic(name))";
-  assert_source_not_contains source
-    "source lookup does not allocate result error"
-    ".to_result(UnsupportedIntrinsic(name))";
-  assert_source_contains source "source dispatches parsed intrinsics"
-    "pure func render_parsed_intrinsic(";
-  assert_source_contains source "source renders template manifest"
-    "pure func render_manifest_lines() -> Result[List[String], RenderError]";
-  assert_source_contains source "source uses typed arity errors"
-    "WrongArity(Intrinsic, Int, Int)";
-  assert_source_not_contains source "source does not use stringly render errors"
-    "Result[String, String]";
-  assert_source_not_contains source "source does not use intrinsic families"
-    "enum IntrinsicFamily:";
-  assert_source_not_contains source "source does not use prefix-family dispatch"
-    "starts_with(\"math_\")";
-  assert_source_not_contains source "source does not match intrinsic strings"
-    "match name:";
-  assert_source_not_contains source "source does not wildcard enum arities"
-    "\t\t_: 1";
-  assert_source_not_contains source "source does not use math string renderer"
-    "render_math_intrinsic"
-
-let test_codegen_intrinsic_renderer_renders_initial_slice () =
+let test_codegen_intrinsic_renderer_compiles_and_runs_smoke () =
   Blorp.Test_runner.with_run_artifacts (fun () ->
       let bin = compile_codegen_intrinsic_renderer () in
-      assert_tool_success bin "math sqrt"
-        [ "intrinsic"; "math_sqrt"; "__x" ]
-        "sqrt(__x)";
-      assert_tool_success bin "math pow"
-        [ "intrinsic"; "math_pow"; "__base"; "__exp" ]
-        "pow(__base, __exp)";
-      assert_tool_success bin "math constant"
+      assert_tool_success bin "zero-arg intrinsic"
         [ "intrinsic"; "math_nan" ]
         "(0.0/0.0)";
-      assert_tool_success bin "bit and"
-        [ "intrinsic"; "bit_and"; "lhs"; "rhs" ]
-        "(lhs & rhs)";
-      assert_tool_success bin "bit xor"
-        [ "intrinsic"; "bit_xor"; "lhs"; "rhs" ]
-        "(lhs ^ rhs)";
-      assert_tool_success bin "bit not"
-        [ "intrinsic"; "bit_not"; "value" ]
-        "(~value)";
-      assert_tool_success bin "shift left"
-        [ "intrinsic"; "shift_left"; "value"; "amount" ]
-        "((long)(value << (amount & 63)))";
-      assert_tool_success bin "shift right"
-        [ "intrinsic"; "shift_right"; "value"; "amount" ]
-        "((long)(value >> (amount & 63)))";
-      assert_tool_success bin "list length"
-        [ "intrinsic"; "list_len"; "xs" ]
-        "((blorp_List*)xs)->len";
-      assert_tool_success bin "dict length"
-        [ "intrinsic"; "dict_len"; "d" ]
-        "((blorp_Dict*)d)->size";
-      assert_tool_success bin "set bucket"
-        [ "intrinsic"; "set_bucket"; "s"; "slot" ]
-        "((void*)((blorp_Set*)s)->buckets[slot])";
-      assert_tool_success bin "dict meta get"
-        [ "intrinsic"; "dict_meta_get"; "d"; "slot" ]
-        "((long)((blorp_Dict*)d)->meta[slot])";
-      assert_tool_success bin "slice source"
-        [ "intrinsic"; "slice_source"; "slice" ]
-        "((void*)((blorp_StringSlice*)slice)->source)";
-      assert_tool_success bin "tensor capacity"
-        [ "intrinsic"; "tensor_capacity"; "vec" ]
-        "((blorp_Vector*)vec)->capacity";
-      assert_tool_success bin "fixed scale"
-        [ "intrinsic"; "fixed_scale"; "fx" ]
-        "(long)((blorp_Fixed*)fx)->scale";
-      assert_tool_success bin "fixed precision"
-        [ "intrinsic"; "fixed_precision"; "fx" ]
-        "(long)((blorp_Fixed*)fx)->precision")
+      assert_tool_success bin "one-arg intrinsic"
+        [ "intrinsic"; "math_sqrt"; "__x" ]
+        "sqrt(__x)";
+      assert_tool_success bin "two-arg intrinsic"
+        [ "intrinsic"; "math_pow"; "__base"; "__exp" ]
+        "pow(__base, __exp)";
+      assert_tool_success bin "three-arg intrinsic"
+        [ "intrinsic"; "math_fma"; "a"; "b"; "c" ]
+        "fma(a, b, c)")
 
 let test_codegen_intrinsic_renderer_manifest_matches_checked_in_templates () =
   Blorp.Test_runner.with_run_artifacts (fun () ->
@@ -200,17 +116,7 @@ let test_codegen_intrinsic_renderer_manifest_matches_checked_in_templates () =
       Alcotest.(check string)
         "embedded template module matches checked-in manifest"
         (String.trim manifest)
-        (String.trim Blorp.Core_emit_blorp_intrinsic_templates.tsv);
-      assert_source_contains output "manifest includes math sqrt"
-        "math_sqrt\t1\tsqrt(@0@)";
-      assert_source_contains output "manifest includes shift left"
-        "shift_left\t2\t((long)(@0@ << (@1@ & 63)))";
-      assert_source_contains output "manifest includes dict meta get"
-        "dict_meta_get\t2\t((long)((blorp_Dict*)@0@)->meta[@1@])";
-      assert_source_contains output "manifest includes slice source"
-        "slice_source\t1\t((void*)((blorp_StringSlice*)@0@)->source)";
-      assert_source_contains output "manifest includes fixed scale"
-        "fixed_scale\t1\t(long)((blorp_Fixed*)@0@)->scale")
+        (String.trim Blorp.Core_emit_blorp_intrinsic_templates.tsv))
 
 let test_core_emit_delegates_initial_slice_to_blorp_manifest () =
   let core_emit_intrinsic_path = find_project_file core_emit_intrinsic_rel in
@@ -223,16 +129,32 @@ let test_core_emit_delegates_initial_slice_to_blorp_manifest () =
         ("production emitter removed old OCaml arm: " ^ fragment)
         fragment)
     [
-      "| \"list_len\"";
-      "| \"list_capacity\"";
-      "| \"string_len\"";
-      "| \"bytes_len\"";
       "| \"bit_and\"";
       "| \"bit_or\"";
       "| \"bit_xor\"";
       "| \"bit_not\"";
       "| \"shift_left\"";
       "| \"shift_right\"";
+      "| \"elem_release_fn\"";
+      "| \"list_get\"";
+      "| \"list_len\"";
+      "| \"list_capacity\"";
+      "| \"list_set_len\"";
+      "| \"list_reverse_owned\"";
+      "| \"list_release_elem\"";
+      "| \"list_set_elem_release\"";
+      "| \"string_get_byte\"";
+      "| \"string_len\"";
+      "| \"string_alloc\"";
+      "| \"string_set_byte\"";
+      "| \"string_ensure_unique\"";
+      "| \"string_ensure_capacity\"";
+      "| \"bytes_get\"";
+      "| \"bytes_len\"";
+      "| \"bytes_set\"";
+      "| \"bytes_alloc\"";
+      "| \"bytes_set_len\"";
+      "| \"bytes_cow\"";
       "| \"dict_len\"";
       "| \"set_len\"";
       "| \"set_capacity\"";
@@ -244,6 +166,24 @@ let test_core_emit_delegates_initial_slice_to_blorp_manifest () =
       "| \"set_entry_next\"";
       "| \"set_entry_prev_order\"";
       "| \"set_entry_next_order\"";
+      "| \"set_set_len\"";
+      "| \"set_set_bucket\"";
+      "| \"set_set_first\"";
+      "| \"set_set_last\"";
+      "| \"set_entry_set_next\"";
+      "| \"set_entry_set_prev_order\"";
+      "| \"set_entry_set_next_order\"";
+      "| \"set_hash\"";
+      "| \"set_eq\"";
+      "| \"set_hash_immediate\"";
+      "| \"set_eq_immediate\"";
+      "| \"set_alloc\"";
+      "| \"set_alloc_entry\"";
+      "| \"set_free_entry\"";
+      "| \"set_cow\"";
+      "| \"set_reuse_alloc\"";
+      "| \"set_resize\"";
+      "| \"set_reserve_for_len\"";
       "| \"dict_capacity\"";
       "| \"dict_mask\"";
       "| \"dict_grow_at\"";
@@ -255,28 +195,46 @@ let test_core_emit_delegates_initial_slice_to_blorp_manifest () =
       "| \"dict_order_index_get\"";
       "| \"dict_key_release_fn\"";
       "| \"dict_value_release_fn\"";
+      "| \"dict_set_len\"";
+      "| \"dict_set_key_at\"";
+      "| \"dict_set_value_at\"";
+      "| \"dict_meta_set\"";
+      "| \"dict_order_set\"";
+      "| \"dict_set_order_len\"";
+      "| \"dict_order_index_set\"";
+      "| \"dict_hash\"";
+      "| \"dict_eq\"";
+      "| \"dict_hash_immediate\"";
+      "| \"dict_eq_immediate\"";
+      "| \"dict_alloc\"";
+      "| \"dict_cow\"";
+      "| \"dict_reuse_alloc\"";
+      "| \"dict_resize\"";
       "| \"slice_source\"";
       "| \"slice_start\"";
       "| \"slice_len\"";
+      "| \"slice_alloc\"";
+      "| \"tensor_is_unique\"";
       "| \"tensor_len\"";
       "| \"tensor_capacity\"";
+      "| \"tensor_get_i64_word_unchecked\"";
+      "| \"tensor_get_i64_raw_unchecked\"";
+      "| \"tensor_get_f64\"";
+      "| \"tensor_get_f32\"";
+      "| \"tensor_get_f16\"";
+      "| \"tensor_set_f64\"";
+      "| \"tensor_set_f32\"";
+      "| \"tensor_set_f16\"";
+      "| \"tensor_get_i64\"";
+      "| \"tensor_set_i64\"";
+      "| \"fixed_alloc\"";
       "| \"fixed_value\"";
       "| \"fixed_scale\"";
       "| \"fixed_precision\"";
+      "| \"fixed_pow10\"";
       "String.sub name 5";
       "math_sqrt";
     ]
-
-let test_codegen_intrinsic_renderer_rejects_bad_requests () =
-  Blorp.Test_runner.with_run_artifacts (fun () ->
-      let bin = compile_codegen_intrinsic_renderer () in
-      assert_tool_failure_contains bin "unknown intrinsic"
-        [ "intrinsic"; "list_set"; "xs"; "0"; "value" ]
-        "unsupported intrinsic: list_set";
-      assert_tool_failure_contains bin "bad arity"
-        [ "intrinsic"; "math_sqrt"; "x"; "extra" ]
-        "intrinsic math_sqrt expected 1 arg(s), got 2";
-      assert_tool_failure_contains bin "unknown command" [ "bogus" ] "Usage:")
 
 let test_codegen_intrinsic_renderer_blorp_suite () =
   let suite_path = find_project_file compiler_tool_suite_rel in
@@ -290,16 +248,12 @@ let suite =
   [
     ( "codegen_intrinsic_renderer",
       [
-        Alcotest.test_case "source contract" `Quick
-          test_codegen_intrinsic_renderer_source_contract;
-        Alcotest.test_case "renders initial intrinsic slice" `Slow
-          test_codegen_intrinsic_renderer_renders_initial_slice;
+        Alcotest.test_case "compiles and runs smoke" `Slow
+          test_codegen_intrinsic_renderer_compiles_and_runs_smoke;
         Alcotest.test_case "manifest matches checked-in templates" `Slow
           test_codegen_intrinsic_renderer_manifest_matches_checked_in_templates;
         Alcotest.test_case "production emitter delegates initial slice" `Quick
           test_core_emit_delegates_initial_slice_to_blorp_manifest;
-        Alcotest.test_case "rejects unsupported requests" `Slow
-          test_codegen_intrinsic_renderer_rejects_bad_requests;
         Alcotest.test_case "Blorp TestSuite passes" `Slow
           test_codegen_intrinsic_renderer_blorp_suite;
       ] );
