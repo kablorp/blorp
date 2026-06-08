@@ -574,11 +574,11 @@ let test_fiber_intrusive_links_are_role_specific () =
   let required =
     [
       ("run queue link", "struct blorp_Fiber* run_next;");
-      ("channel wait link", "struct blorp_Fiber* wait_next;");
       ("object pool link", "struct blorp_Fiber* pool_next;");
       ("timer drain link", "struct blorp_Fiber* timer_drain_next;");
+      ("channel waiter link", "struct blorp_ChannelFiberWaiter* next;");
       ("run queue pop uses run_next", "queue->head = f->run_next;");
-      ("channel enqueue uses wait_next", "(*tail)->wait_next = f");
+      ("channel enqueue uses waiter next", "(*tail)->next = waiter");
       ("object pool uses pool_next", "__fiber_object_pool = f->pool_next;");
     ]
   in
@@ -589,8 +589,154 @@ let test_fiber_intrusive_links_are_role_specific () =
   if contains_substring runtime "struct blorp_Fiber* next;" then
     Alcotest.fail
       "Fiber scheduler ownership must use role-specific intrusive links, not a \
-       shared next pointer for run queues, channel waits, object-pool reuse, \
-       and timer drain batches."
+       shared next pointer for run queues, object-pool reuse, and timer drain \
+       batches. Channel waits use explicit waiter records with their own links."
+
+let test_scheduler_debug_observability_has_named_hooks () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("debug env gate", "BLORP_SCHEDULER_DEBUG");
+      ("debug enabled helper", "blorp_scheduler_debug_enabled");
+      ("fiber snapshot helper", "blorp_fiber_debug_snapshot");
+      ("fiber invariant helper", "blorp_scheduler_debug_assert_fiber");
+      ("debug abort helper", "blorp_scheduler_debug_abort_fiber");
+      ("queued plus parked invariant", "queued and parked");
+      ("running plus queued invariant", "running and queued");
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required
+
+let test_fiber_lifecycle_state_is_explicit () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("fiber state enum", "typedef enum blorp_FiberState");
+      ("free state", "BLORP_FIBER_FREE");
+      ("created state", "BLORP_FIBER_CREATED");
+      ("queued state", "BLORP_FIBER_QUEUED");
+      ("running state", "BLORP_FIBER_RUNNING");
+      ("parked state", "BLORP_FIBER_PARKED");
+      ("completed state", "BLORP_FIBER_COMPLETED");
+      ("fiber carries lifecycle state", "_Atomic int lifecycle_state;");
+      ("state name helper", "blorp_fiber_state_debug_name");
+      ("transition helper", "blorp_fiber_transition_state");
+      ("mark created helper", "blorp_fiber_mark_created");
+      ("mark queued helper", "blorp_fiber_mark_queued");
+      ("mark running helper", "blorp_fiber_mark_running");
+      ("mark parked helper", "blorp_fiber_mark_parked");
+      ("mark completed helper", "blorp_fiber_mark_completed");
+      ("mark free helper", "blorp_fiber_mark_free");
+      ("recycled fibers clear coroutine pointer", "f->coro = NULL;");
+      ("completed fibers clear coroutine pointer", "fiber->coro = NULL;");
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required
+
+let test_fiber_wake_cause_is_explicit () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("fiber wake cause enum", "typedef enum blorp_FiberWakeCause");
+      ("ready wake cause", "BLORP_WAKE_READY");
+      ("timeout wake cause", "BLORP_WAKE_TIMEOUT");
+      ("cancelled wake cause", "BLORP_WAKE_CANCELLED");
+      ("closed wake cause", "BLORP_WAKE_CLOSED");
+      ("sealed wake cause", "BLORP_WAKE_SEALED");
+      ("fiber carries wake cause", "_Atomic int wake_cause;");
+      ("wake cause name helper", "blorp_fiber_wake_cause_debug_name");
+      ("wake helper", "blorp_fiber_wake");
+      ( "cancel wake delegates to wake helper",
+        "blorp_fiber_wake(f, BLORP_WAKE_CANCELLED" );
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  Alcotest.(check bool)
+    "no separate cancel enqueue path" false
+    (contains_substring runtime "blorp_fiber_enqueue_cancel_wake")
+
+let test_fiber_wait_owner_is_explicit () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("fiber wait owner enum", "typedef enum blorp_FiberWaitOwnerKind");
+      ("no wait owner", "BLORP_WAIT_OWNER_NONE");
+      ("sleep wait owner", "BLORP_WAIT_OWNER_SLEEP");
+      ("task join wait owner", "BLORP_WAIT_OWNER_TASK_JOIN");
+      ("channel send wait owner", "BLORP_WAIT_OWNER_CHANNEL_SEND");
+      ("channel recv wait owner", "BLORP_WAIT_OWNER_CHANNEL_RECV");
+      ("select wait owner", "BLORP_WAIT_OWNER_SELECT");
+      ("io wait owner", "BLORP_WAIT_OWNER_IO");
+      ("fiber carries wait owner", "_Atomic int wait_owner_kind;");
+      ("fiber carries wait operation id", "_Atomic uint64_t wait_operation_id;");
+      ("fiber carries timer wait operation id", "_Atomic uint64_t timer_wait_operation_id;");
+      ("global wait operation counter", "__blorp_next_wait_operation_id");
+      ("wait owner name helper", "blorp_fiber_wait_owner_debug_name");
+      ("wait operation id helper", "blorp_fiber_current_wait_operation_id");
+      ("begin wait helper", "blorp_fiber_begin_wait");
+      ("clear wait helper", "blorp_fiber_clear_wait");
+      ("snapshot includes wait owner", "wait_owner=%s");
+      ("snapshot includes wait id", "wait_operation_id=%llu");
+      ("timer stale guard", "stale timer wait operation");
+      ("parked owner invariant", "parked without wait owner");
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required
+
+let test_channel_waiters_carry_operation_identity () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("channel waiter record", "typedef struct blorp_ChannelFiberWaiter");
+      ("channel waiter carries fiber", "blorp_Fiber* fiber;");
+      ("channel waiter carries operation id", "uint64_t wait_operation_id;");
+      ("channel waiter carries kind", "blorp_ChannelWaitKind kind;");
+      ("channel waiter carries deadline", "uint64_t deadline_ns;");
+      ("channel waiter carries wake reason", "blorp_ChannelWakeReason wake_reason;");
+      ("channel send queue uses waiter records", "blorp_ChannelFiberWaiter* send_waiters_head;");
+      ("channel recv queue uses waiter records", "blorp_ChannelFiberWaiter* recv_waiters_head;");
+      ("channel waiter init helper", "__ch_fiber_waiter_init");
+      ("channel waiter current helper", "__ch_fiber_waiter_current");
+      ("channel stale wait guard", "stale channel wait operation");
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  Alcotest.(check bool)
+    "channel send queue no longer stores raw fibers" false
+    (contains_substring runtime "blorp_Fiber* send_waiters_head;");
+  Alcotest.(check bool)
+    "channel recv queue no longer stores raw fibers" false
+    (contains_substring runtime "blorp_Fiber* recv_waiters_head;")
 
 let test_cloexec_helpers_declare_fallback_locals_once () =
   let runtime =
@@ -1453,6 +1599,16 @@ let suite =
           test_list_ir_hofs_have_no_runtime_c_abi;
         Alcotest.test_case "fiber intrusive links are role-specific" `Quick
           test_fiber_intrusive_links_are_role_specific;
+        Alcotest.test_case "scheduler debug observability has named hooks" `Quick
+          test_scheduler_debug_observability_has_named_hooks;
+        Alcotest.test_case "fiber lifecycle state is explicit" `Quick
+          test_fiber_lifecycle_state_is_explicit;
+        Alcotest.test_case "fiber wake cause is explicit" `Quick
+          test_fiber_wake_cause_is_explicit;
+        Alcotest.test_case "fiber wait owner is explicit" `Quick
+          test_fiber_wait_owner_is_explicit;
+        Alcotest.test_case "channel waiters carry operation identity" `Quick
+          test_channel_waiters_carry_operation_identity;
         Alcotest.test_case "cloexec helpers declare fallback locals once" `Quick
           test_cloexec_helpers_declare_fallback_locals_once;
         Alcotest.test_case "Float16 vector reader ABI uses feature guard" `Quick

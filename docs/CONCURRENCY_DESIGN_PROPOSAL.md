@@ -1197,6 +1197,14 @@ change. Each phase should include parser/typecheck tests, runtime tests,
 leak-check coverage where resources are involved, and Core invariant checks for
 new ownership states.
 
+Runtime scheduler hardening has its own source of truth in
+`docs/VIRTUAL_THREADS_DESIGN.md`. That document owns fiber lifecycle state,
+the unified wake path, wait-owner identity, task-scope runtime APIs, scheduler
+capacity, timer scalability, and runtime verification gates. This proposal owns
+source-language ergonomics, typed ownership rules, resource/concurrency
+composition, channels, `select`, TCP/service APIs, and migration notes visible
+to users.
+
 ### Migration Principles
 
 - Keep `concurrent:` as the fixed block syntax.
@@ -2459,21 +2467,27 @@ services                       intentionally shared external systems
 
 ## Next Implementation Queue
 
-The branch is ready to continue, but the next changes should stay narrow. The
-high-leverage sequence is:
+The next changes should stay narrow. Runtime scheduler state-machine work now
+comes first; source-level API polish should not outrun the runtime guarantees
+described in `docs/VIRTUAL_THREADS_DESIGN.md`.
 
-1. Keep non-syntax Duration APIs as explicit helper names for this workstream
-   (`sleep_for`, `recv_timeout_attempt_for`, `send_timeout_attempt_for`, etc.). Same-name
-   source overloads such as `sleep(Duration)` should be a separate
+1. Execute the runtime scheduler hardening sequence in
+   `docs/VIRTUAL_THREADS_DESIGN.md`: debug observability, explicit fiber
+   lifecycle state, one wake path, and exact wait-owner identity. This is the
+   highest-leverage path for removing concurrency flakes without adding surface
+   complexity.
+2. Keep non-syntax Duration APIs as explicit helper names for this workstream
+   (`sleep_for`, `recv_timeout_attempt_for`, `send_timeout_attempt_for`, etc.).
+   Same-name source overloads such as `sleep(Duration)` should be a separate
    language/typechecker design because current typechecking rejects same-name
    impure overloads within one module.
-2. Extend operation-history recording toward linearizability-style channel
+3. Extend operation-history recording toward linearizability-style channel
    stress tests. The current property tests now record a small MPMC history,
    cover producer-local ordering in a capacity-1 MPSC run, and replay typed
    nonblocking capacity-1 histories against a bounded FIFO model, but they do
    not yet prove that arbitrary overlapping MPMC histories have a valid
    serialization.
-3. Extend deterministic cancellation harness coverage for parked operations.
+4. Extend deterministic cancellation harness coverage for parked operations.
    The first narrow test hook has landed, and channel send/receive,
    structured-join, dynamic fan-out, ordinary `select`, timer sleep, TCP
    `accept`/`read`, and cancelled TCP resource-source fan-out leak baselines now
@@ -2484,7 +2498,7 @@ high-leverage sequence is:
    connect and write reactor waits with the same "observe parked, then
    cancel/join" shape if that can be made portable, without exposing a general
    user-facing task API.
-4. Keep wait-behavior metadata explicit for future blocking-worker waits.
+5. Keep wait-behavior metadata explicit for future blocking-worker waits.
    The `Cancellation_point` capability has landed for unambiguous global names
    such as `send`, `recv`, `sleep`, and `yield_now`, and for runtime TCP
    reactor builtins such as `blorp_tcp_accept_raw`, `blorp_tcp_read_raw`, and
@@ -2495,7 +2509,7 @@ high-leverage sequence is:
    unrelated bare names such as `read` and `write`. Future blocking-worker waits
    should first be represented as explicit blocking wait behavior, then become
    cancellation points only if the runtime owns a cancellation-aware worker wait.
-5. Continue TCP resource migration from the current resource-source checkpoint.
+6. Continue TCP resource migration from the current resource-source checkpoint.
    Listener and stream handles are now `resource type`s, simple TCP APIs return
    `TcpError`, manual close is private, resource capture/ordinary parameter
    escapes are rejected, and the explicit-policy TCP connection-source
