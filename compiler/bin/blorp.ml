@@ -972,6 +972,7 @@ let () =
     | [ "--version" ] | [ "-v" ] ->
         Printf.printf "%s\n" (Version.describe ());
         exit 0
+    | "__compiler-tests" :: rest -> exit (Compiler_test_runner.run_cli rest)
     | "lsp" :: rest -> (
         match parse_lsp_cli_args rest with
         | LspHelp ->

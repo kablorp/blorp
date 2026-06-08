@@ -1,0 +1,120 @@
+-- These tests force representative late-resume schedules with one worker,
+-- explicit start handshakes, and a busy loop. They guard ready-before-deadline
+-- regressions, not every possible scheduler interleaving.
+-- Known hole: the final "resume after deadline" step still depends on real
+-- wall-clock time. A deterministic scheduler or virtual clock would be the
+-- stronger long-term test shape.
+import:
+	test: TestSuite
+	time: now
+
+
+ready_wake_deadline_ms: Int = 1000
+
+ready_wake_late_resume_ms: Int = 1200
+
+ready_wake_block_guard_ms: Int = 5000
+
+
+func busy_for_ms(ms: Int) -> Void:
+	start: Int = now()
+	var done: Bool = False
+	while not done:
+		elapsed_ms: Int = (now() - start) / 1000
+		if elapsed_ms >= ms:
+			done = True
+
+
+func wait_for_start(started: Channel[Int]) -> Bool:
+	match recv(started):
+		Some(_): True
+		None: False
+
+
+func recv_timeout_waits_for_ready_value(ch: Channel[Int], started: Channel[Int]) -> Bool:
+	started_ok: Bool = send(started, 1)
+	if started_ok:
+		match recv_timeout(ch, ready_wake_deadline_ms):
+			Some(v): v == 42
+			None: False
+	else:
+		False
+
+
+func send_after_receiver_is_parked(ch: Channel[Int], started: Channel[Int]) -> Bool:
+	var sent_ok: Bool = False
+	if wait_for_start(started):
+		sent_ok = send(ch, 42)
+		busy_for_ms(ready_wake_late_resume_ms)
+	sent_ok
+
+
+-- REGRESSION: a recv_timeout woken by a send before its deadline must receive
+-- the value even if the scheduler resumes it after the nominal deadline.
+func test_recv_timeout_ready_wake_survives_late_resume() -> Bool:
+	ch: Channel[Int] = channel(1)
+	started: Channel[Int] = channel(1)
+	concurrent(max_threads: 1, timeout: ready_wake_block_guard_ms):
+		received = recv_timeout_waits_for_ready_value(ch, started)
+		sent = send_after_receiver_is_parked(ch, started)
+	received_ok: Bool = match received:
+		Ok(v): v
+		Err(_): False
+	sent_ok: Bool = match sent:
+		Ok(v): v
+		Err(_): False
+	received_ok and sent_ok
+
+
+func send_timeout_waits_for_ready_slot(ch: Channel[String], started: Channel[Int]) -> Bool:
+	started_ok: Bool = send(started, 1)
+	if started_ok:
+		send_timeout(ch, "second", ready_wake_deadline_ms)
+	else:
+		False
+
+
+func recv_after_sender_is_parked(ch: Channel[String], started: Channel[Int]) -> Bool:
+	var first_ok: Bool = False
+	if wait_for_start(started):
+		first_ok = match recv(ch):
+			Some(v): v == "first"
+			None: False
+		busy_for_ms(ready_wake_late_resume_ms)
+	first_ok
+
+
+-- REGRESSION: a send_timeout woken by freed capacity before its deadline must
+-- send the value even if the scheduler resumes it after the nominal deadline.
+func test_send_timeout_ready_wake_survives_late_resume() -> Bool:
+	ch: Channel[String] = channel(1)
+	started: Channel[Int] = channel(1)
+	_ = send(ch, "first")
+	concurrent(max_threads: 1, timeout: ready_wake_block_guard_ms):
+		sent = send_timeout_waits_for_ready_slot(ch, started)
+		drained = recv_after_sender_is_parked(ch, started)
+	sent_ok: Bool = match sent:
+		Ok(v): v
+		Err(_): False
+	drained_ok: Bool = match drained:
+		Ok(v): v
+		Err(_): False
+	final_ok: Bool = match recv_timeout(ch, ready_wake_deadline_ms):
+		Some(v): v == "second"
+		None: False
+	sent_ok and drained_ok and final_ok
+
+
+tests: TestSuite = {
+	description = "Concurrency: channel ready wake deadlines",
+	tests = [
+		(
+			"recv_timeout ready wake survives late resume",
+			test_recv_timeout_ready_wake_survives_late_resume,
+		),
+		(
+			"send_timeout ready wake survives late resume",
+			test_send_timeout_ready_wake_survives_late_resume,
+		),
+	]
+}

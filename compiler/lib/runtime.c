@@ -20821,6 +20821,18 @@ static inline void* blorp_call4(blorp_Closure* closure, void* arg1, void* arg2, 
 
 // --- Virtual Threads: types and globals (before worker for visibility) ---
 
+typedef enum {
+    BLORP_CHANNEL_WAIT_NONE = 0,
+    BLORP_CHANNEL_WAIT_SEND = 1,
+    BLORP_CHANNEL_WAIT_RECV = 2
+} blorp_ChannelWaitKind;
+
+typedef enum {
+    BLORP_CHANNEL_WAKE_PENDING = 0,
+    BLORP_CHANNEL_WAKE_READY = 1,
+    BLORP_CHANNEL_WAKE_TIMED_OUT = 2
+} blorp_ChannelWakeReason;
+
 typedef struct blorp_Fiber {
     mco_coro* coro;              // minicoro coroutine
     struct blorp_Fiber* run_next;  // run queues, protected by that queue's lock
@@ -20836,6 +20848,9 @@ typedef struct blorp_Fiber {
     int wake_pending;            // waker arrived before the running fiber yielded
     int state_lock;              // guards running/wake_pending handoff
     int owner_worker_id;         // carrier queue this fiber must resume on
+    blorp_ChannelWaitKind channel_wait_kind;
+    blorp_ChannelWakeReason channel_wake_reason;
+    uint64_t channel_wait_deadline_ns; // 0 means this channel wait has no timeout
 } blorp_Fiber;
 
 static _Thread_local blorp_Fiber* __blorp_current_fiber = NULL;
@@ -21545,6 +21560,9 @@ static void blorp_fiber_object_recycle(blorp_Fiber* f) {
     f->wait_next = NULL;
     f->pool_next = NULL;
     f->timer_drain_next = NULL;
+    f->channel_wait_kind = BLORP_CHANNEL_WAIT_NONE;
+    f->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    f->channel_wait_deadline_ns = 0;
     size_t limit = blorp_fiber_object_pool_limit();
     if (limit > 0) {
         pthread_mutex_lock(&__fiber_object_pool_lock);
@@ -21611,6 +21629,9 @@ static blorp_Fiber* blorp_fiber_create(void (*func)(mco_coro*), void* user_data)
     f->wake_pending = 0;
     f->state_lock = 0;
     f->owner_worker_id = -1;
+    f->channel_wait_kind = BLORP_CHANNEL_WAIT_NONE;
+    f->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    f->channel_wait_deadline_ns = 0;
     mco_desc desc = mco_desc_init(func, __blorp_fiber_stack_size);
     desc.user_data = user_data;
     // Use guard-page allocator for stack overflow protection
@@ -23541,6 +23562,32 @@ void blorp_channel_init_elem_release(blorp_Channel* ch, void (*release_fn)(void*
     if (ch) ch->elem_release = release_fn;
 }
 
+static inline void __ch_fiber_wait_begin(
+    blorp_Fiber* f,
+    blorp_ChannelWaitKind kind,
+    uint64_t deadline_ns
+) {
+    f->channel_wait_kind = kind;
+    f->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    f->channel_wait_deadline_ns = deadline_ns;
+}
+
+static inline void __ch_fiber_wait_clear(blorp_Fiber* f) {
+    f->channel_wait_kind = BLORP_CHANNEL_WAIT_NONE;
+    f->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    f->channel_wait_deadline_ns = 0;
+}
+
+static inline bool __ch_fiber_wait_expired(
+    blorp_Fiber* f,
+    blorp_ChannelWaitKind kind,
+    uint64_t now_ns
+) {
+    return f->channel_wait_kind == kind &&
+           f->channel_wait_deadline_ns > 0 &&
+           now_ns >= f->channel_wait_deadline_ns;
+}
+
 // Helper: enqueue fiber to channel wait list (caller holds ch->mutex)
 static void __ch_fiber_enqueue(blorp_Fiber** head, blorp_Fiber** tail, blorp_Fiber* f) {
     f->wait_next = NULL;
@@ -23548,15 +23595,53 @@ static void __ch_fiber_enqueue(blorp_Fiber** head, blorp_Fiber** tail, blorp_Fib
     *tail = f;
 }
 
-// Helper: dequeue one fiber from channel wait list (caller holds ch->mutex)
-static blorp_Fiber* __ch_fiber_dequeue(blorp_Fiber** head, blorp_Fiber** tail) {
-    blorp_Fiber* f = *head;
-    if (f) {
-        *head = f->wait_next;
+static void __ch_schedule_fiber_wait_list(blorp_Fiber* fibers) {
+    while (fibers) {
+        blorp_Fiber* f = fibers;
+        fibers = f->wait_next;
+        f->wait_next = NULL;
+        blorp_fiber_schedule(f);
+    }
+}
+
+// Helper: dequeue one live fiber from a channel wait list (caller holds ch->mutex).
+// Expired timed waiters are removed and returned through expired_* so the caller
+// can schedule them outside the channel mutex as timeout winners.
+// Known hole to preserve in future edits: every channel wake path that consumes
+// send/recv wait queues must make this same expired-waiter distinction.
+static blorp_Fiber* __ch_fiber_dequeue_ready(
+    blorp_Fiber** head,
+    blorp_Fiber** tail,
+    blorp_ChannelWaitKind kind,
+    blorp_Fiber** expired_head,
+    blorp_Fiber** expired_tail
+) {
+    blorp_Fiber** pp = head;
+    blorp_Fiber* prev = NULL;
+    uint64_t now_ns = 0;
+    while (*pp) {
+        blorp_Fiber* f = *pp;
+        if (f->channel_wait_kind == kind && f->channel_wait_deadline_ns > 0) {
+            if (now_ns == 0) now_ns = blorp_monotonic_now_ns();
+            if (__ch_fiber_wait_expired(f, kind, now_ns)) {
+                *pp = f->wait_next;
+                if (*tail == f) *tail = prev;
+                if (!*head) *tail = NULL;
+                f->wait_next = NULL;
+                f->channel_wake_reason = BLORP_CHANNEL_WAKE_TIMED_OUT;
+                __ch_fiber_enqueue(expired_head, expired_tail, f);
+                continue;
+            }
+        }
+
+        *pp = f->wait_next;
+        if (*tail == f) *tail = prev;
         if (!*head) *tail = NULL;
         f->wait_next = NULL;
+        f->channel_wake_reason = BLORP_CHANNEL_WAKE_READY;
+        return f;
     }
-    return f;
+    return NULL;
 }
 
 // Helper: remove a specific fiber from a channel wait list (caller holds ch->mutex).
@@ -23575,6 +23660,24 @@ static void __ch_fiber_remove(blorp_Fiber** head, blorp_Fiber** tail, blorp_Fibe
         }
         prev = *pp;
         pp = &(*pp)->wait_next;
+    }
+}
+
+static void __ch_mark_detached_waiters(
+    blorp_Fiber* waiters,
+    blorp_ChannelWaitKind kind
+) {
+    uint64_t now_ns = 0;
+    for (blorp_Fiber* f = waiters; f; f = f->wait_next) {
+        if (f->channel_wait_kind == kind && f->channel_wait_deadline_ns > 0) {
+            if (now_ns == 0) now_ns = blorp_monotonic_now_ns();
+            f->channel_wake_reason =
+                __ch_fiber_wait_expired(f, kind, now_ns)
+                    ? BLORP_CHANNEL_WAKE_TIMED_OUT
+                    : BLORP_CHANNEL_WAKE_READY;
+        } else {
+            f->channel_wake_reason = BLORP_CHANNEL_WAKE_READY;
+        }
     }
 }
 
@@ -23695,14 +23798,33 @@ static inline void __ch_store_value_locked(blorp_Channel* ch, void* value) {
     ch->count++;
 }
 
-static inline void __ch_wake_recv_after_send(blorp_Channel* ch, blorp_Fiber** recv_waiter) {
-    *recv_waiter = __ch_fiber_dequeue(&ch->recv_waiters_head, &ch->recv_waiters_tail);
+static inline void __ch_wake_recv_after_send(
+    blorp_Channel* ch,
+    blorp_Fiber** recv_waiter,
+    blorp_Fiber** expired_head,
+    blorp_Fiber** expired_tail
+) {
+    *recv_waiter = __ch_fiber_dequeue_ready(
+        &ch->recv_waiters_head,
+        &ch->recv_waiters_tail,
+        BLORP_CHANNEL_WAIT_RECV,
+        expired_head,
+        expired_tail);
     pthread_cond_signal(&ch->not_empty);
 }
 
-static inline blorp_Fiber* __ch_wake_after_recv_locked(blorp_Channel* ch) {
+static inline blorp_Fiber* __ch_wake_after_recv_locked(
+    blorp_Channel* ch,
+    blorp_Fiber** expired_head,
+    blorp_Fiber** expired_tail
+) {
     blorp_Fiber* send_waiter =
-        __ch_fiber_dequeue(&ch->send_waiters_head, &ch->send_waiters_tail);
+        __ch_fiber_dequeue_ready(
+            &ch->send_waiters_head,
+            &ch->send_waiters_tail,
+            BLORP_CHANNEL_WAIT_SEND,
+            expired_head,
+            expired_tail);
     pthread_cond_signal(&ch->not_full);
     if (ch->sealed && ch->count == 0) {
         __ch_select_waiters_wake_all_locked(ch);
@@ -23722,6 +23844,7 @@ long blorp_channel_send(void* c, void* value) {
             // Fiber path: set parked before enqueueing, then unlock before
             // parking. Wakers dequeue under the channel mutex and schedule
             // after releasing it.
+            __ch_fiber_wait_begin(self, BLORP_CHANNEL_WAIT_SEND, 0);
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->send_waiters_head, &ch->send_waiters_tail, self);
             __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_send_parks);
@@ -23729,6 +23852,7 @@ long blorp_channel_send(void* c, void* value) {
             blorp_fiber_park();
             pthread_mutex_lock(&ch->mutex);
             __ch_fiber_remove(&ch->send_waiters_head, &ch->send_waiters_tail, self);
+            __ch_fiber_wait_clear(self);
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -23750,9 +23874,13 @@ long blorp_channel_send(void* c, void* value) {
     __ch_store_value_locked(ch, value);
     // Wake one recv waiter (fiber or condvar)
     blorp_Fiber* recv_waiter = NULL;
-    __ch_wake_recv_after_send(ch, &recv_waiter);
+    blorp_Fiber* expired_waiters = NULL;
+    blorp_Fiber* expired_tail = NULL;
+    __ch_wake_recv_after_send(
+        ch, &recv_waiter, &expired_waiters, &expired_tail);
     __ch_select_waiters_wake_all_locked(ch);
     pthread_mutex_unlock(&ch->mutex);
+    __ch_schedule_fiber_wait_list(expired_waiters);
     if (recv_waiter) blorp_fiber_schedule(recv_waiter);
     return 1; // true
 }
@@ -23767,6 +23895,7 @@ void* blorp_channel_recv(void* c) {
     while (ch->count == 0 && !ch->sealed) {
         if (self) {
             // Fiber path: set parked BEFORE enqueueing
+            __ch_fiber_wait_begin(self, BLORP_CHANNEL_WAIT_RECV, 0);
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
             __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_recv_parks);
@@ -23774,6 +23903,7 @@ void* blorp_channel_recv(void* c) {
             blorp_fiber_park();
             pthread_mutex_lock(&ch->mutex);
             __ch_fiber_remove(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            __ch_fiber_wait_clear(self);
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -23796,8 +23926,12 @@ void* blorp_channel_recv(void* c) {
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
     // Wake one send waiter (fiber or condvar)
-    blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+    blorp_Fiber* expired_waiters = NULL;
+    blorp_Fiber* expired_tail = NULL;
+    blorp_Fiber* send_waiter =
+        __ch_wake_after_recv_locked(ch, &expired_waiters, &expired_tail);
     pthread_mutex_unlock(&ch->mutex);
+    __ch_schedule_fiber_wait_list(expired_waiters);
     if (send_waiter) blorp_fiber_schedule(send_waiter);
     blorp_Option* opt = blorp_option_some(value);
     if (ch->elem_release) opt->release_mask = 1UL;
@@ -23824,9 +23958,13 @@ long blorp_channel_try_send_status(void* c, void* value) {
     }
     __ch_store_value_locked(ch, value);
     blorp_Fiber* recv_waiter = NULL;
-    __ch_wake_recv_after_send(ch, &recv_waiter);
+    blorp_Fiber* expired_waiters = NULL;
+    blorp_Fiber* expired_tail = NULL;
+    __ch_wake_recv_after_send(
+        ch, &recv_waiter, &expired_waiters, &expired_tail);
     __ch_select_waiters_wake_all_locked(ch);
     pthread_mutex_unlock(&ch->mutex);
+    __ch_schedule_fiber_wait_list(expired_waiters);
     if (recv_waiter) blorp_fiber_schedule(recv_waiter);
     return BLORP_CHANNEL_SEND_ACCEPTED;
 }
@@ -23843,8 +23981,12 @@ long blorp_channel_try_recv_status_raw(blorp_Channel* ch, void** out) {
     *out = ch->buffer[ch->head];
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
-    blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+    blorp_Fiber* expired_waiters = NULL;
+    blorp_Fiber* expired_tail = NULL;
+    blorp_Fiber* send_waiter =
+        __ch_wake_after_recv_locked(ch, &expired_waiters, &expired_tail);
     pthread_mutex_unlock(&ch->mutex);
+    __ch_schedule_fiber_wait_list(expired_waiters);
     if (send_waiter) blorp_fiber_schedule(send_waiter);
     return BLORP_CHANNEL_RECV_VALUE;
 }
@@ -23885,6 +24027,8 @@ long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, v
             if (blorp_monotonic_now_ns() >= monotonic_deadline) break;
             // Fiber path: park with timer for wakeup on timeout
             self->wake_time_ns = monotonic_deadline;
+            __ch_fiber_wait_begin(
+                self, BLORP_CHANNEL_WAIT_RECV, monotonic_deadline);
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
             blorp_timer_queue_insert(self);
@@ -23896,6 +24040,16 @@ long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, v
             blorp_timer_queue_remove(self);
             pthread_mutex_lock(&ch->mutex);
             __ch_fiber_remove(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            blorp_ChannelWakeReason wake_reason = self->channel_wake_reason;
+            bool timeout_won =
+                wake_reason == BLORP_CHANNEL_WAKE_TIMED_OUT ||
+                (wake_reason == BLORP_CHANNEL_WAKE_PENDING &&
+                 blorp_monotonic_now_ns() >= monotonic_deadline);
+            __ch_fiber_wait_clear(self);
+            if (timeout_won) {
+                pthread_mutex_unlock(&ch->mutex);
+                return BLORP_CHANNEL_RECV_TIMED_OUT;
+            }
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -23925,8 +24079,12 @@ long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, v
     *out = ch->buffer[ch->head];
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
-    blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+    blorp_Fiber* expired_waiters = NULL;
+    blorp_Fiber* expired_tail = NULL;
+    blorp_Fiber* send_waiter =
+        __ch_wake_after_recv_locked(ch, &expired_waiters, &expired_tail);
     pthread_mutex_unlock(&ch->mutex);
+    __ch_schedule_fiber_wait_list(expired_waiters);
     if (send_waiter) blorp_fiber_schedule(send_waiter);
     return BLORP_CHANNEL_RECV_VALUE;
 }
@@ -23974,6 +24132,8 @@ long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms) {
         if (self) {
             if (blorp_monotonic_now_ns() >= monotonic_deadline) break;
             self->wake_time_ns = monotonic_deadline;
+            __ch_fiber_wait_begin(
+                self, BLORP_CHANNEL_WAIT_SEND, monotonic_deadline);
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->send_waiters_head, &ch->send_waiters_tail, self);
             blorp_timer_queue_insert(self);
@@ -23985,6 +24145,16 @@ long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms) {
             blorp_timer_queue_remove(self);
             pthread_mutex_lock(&ch->mutex);
             __ch_fiber_remove(&ch->send_waiters_head, &ch->send_waiters_tail, self);
+            blorp_ChannelWakeReason wake_reason = self->channel_wake_reason;
+            bool timeout_won =
+                wake_reason == BLORP_CHANNEL_WAKE_TIMED_OUT ||
+                (wake_reason == BLORP_CHANNEL_WAKE_PENDING &&
+                 blorp_monotonic_now_ns() >= monotonic_deadline);
+            __ch_fiber_wait_clear(self);
+            if (timeout_won) {
+                pthread_mutex_unlock(&ch->mutex);
+                return BLORP_CHANNEL_SEND_TIMED_OUT;
+            }
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -24015,9 +24185,13 @@ long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms) {
     }
     __ch_store_value_locked(ch, value);
     blorp_Fiber* recv_waiter = NULL;
-    __ch_wake_recv_after_send(ch, &recv_waiter);
+    blorp_Fiber* expired_waiters = NULL;
+    blorp_Fiber* expired_tail = NULL;
+    __ch_wake_recv_after_send(
+        ch, &recv_waiter, &expired_waiters, &expired_tail);
     __ch_select_waiters_wake_all_locked(ch);
     pthread_mutex_unlock(&ch->mutex);
+    __ch_schedule_fiber_wait_list(expired_waiters);
     if (recv_waiter) blorp_fiber_schedule(recv_waiter);
     return BLORP_CHANNEL_SEND_ACCEPTED;
 }
@@ -24032,23 +24206,15 @@ void blorp_channel_seal(void* c) {
     ch->send_waiters_head = ch->send_waiters_tail = NULL;
     blorp_Fiber* recv_list = ch->recv_waiters_head;
     ch->recv_waiters_head = ch->recv_waiters_tail = NULL;
+    __ch_mark_detached_waiters(send_list, BLORP_CHANNEL_WAIT_SEND);
+    __ch_mark_detached_waiters(recv_list, BLORP_CHANNEL_WAIT_RECV);
     pthread_cond_broadcast(&ch->not_empty);
     pthread_cond_broadcast(&ch->not_full);
     __ch_select_waiters_wake_all_locked(ch);
     pthread_mutex_unlock(&ch->mutex);
     // Schedule collected fibers outside ch->mutex
-    while (send_list) {
-        blorp_Fiber* f = send_list;
-        send_list = f->wait_next;
-        f->wait_next = NULL;
-        blorp_fiber_schedule(f);
-    }
-    while (recv_list) {
-        blorp_Fiber* f = recv_list;
-        recv_list = f->wait_next;
-        f->wait_next = NULL;
-        blorp_fiber_schedule(f);
-    }
+    __ch_schedule_fiber_wait_list(send_list);
+    __ch_schedule_fiber_wait_list(recv_list);
 }
 
 // Internal: blocking recv for for-in loop (avoids Option allocation overhead).
@@ -24059,6 +24225,7 @@ bool blorp_channel_recv_raw(blorp_Channel* ch, void** out) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count == 0 && !ch->sealed) {
         if (self) {
+            __ch_fiber_wait_begin(self, BLORP_CHANNEL_WAIT_RECV, 0);
             __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
             __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
             __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_recv_parks);
@@ -24066,6 +24233,7 @@ bool blorp_channel_recv_raw(blorp_Channel* ch, void** out) {
             blorp_fiber_park();
             pthread_mutex_lock(&ch->mutex);
             __ch_fiber_remove(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            __ch_fiber_wait_clear(self);
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -24087,8 +24255,12 @@ bool blorp_channel_recv_raw(blorp_Channel* ch, void** out) {
     *out = ch->buffer[ch->head];
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
-    blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+    blorp_Fiber* expired_waiters = NULL;
+    blorp_Fiber* expired_tail = NULL;
+    blorp_Fiber* send_waiter =
+        __ch_wake_after_recv_locked(ch, &expired_waiters, &expired_tail);
     pthread_mutex_unlock(&ch->mutex);
+    __ch_schedule_fiber_wait_list(expired_waiters);
     if (send_waiter) blorp_fiber_schedule(send_waiter);
     return true;
 }
@@ -24162,8 +24334,12 @@ static bool blorp_select_try_ready(
             void* value = ch->buffer[ch->head];
             ch->head = (ch->head + 1) % ch->capacity;
             ch->count--;
-            blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+            blorp_Fiber* expired_waiters = NULL;
+            blorp_Fiber* expired_tail = NULL;
+            blorp_Fiber* send_waiter =
+                __ch_wake_after_recv_locked(ch, &expired_waiters, &expired_tail);
             pthread_mutex_unlock(&ch->mutex);
+            __ch_schedule_fiber_wait_list(expired_waiters);
             if (send_waiter) blorp_fiber_schedule(send_waiter);
             *out = (blorp_SelectResult) {
                 .arm_index = i,
