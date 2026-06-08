@@ -1,5 +1,5 @@
 (* Generated from core_emit_blorp_intrinsic_templates.tsv by
-   tools/compiler/codegen_intrinsic_renderer.brp. *)
+   compiler/blorp/codegen_intrinsic_renderer.brp. *)
 
 let tsv =
   {|math_sin	1	sin(@0@)

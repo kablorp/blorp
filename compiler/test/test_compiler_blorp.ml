@@ -1,6 +1,6 @@
 let compiler_tool_rel =
   Filename.concat
-    (Filename.concat "tools" "compiler")
+    (Filename.concat "compiler" "blorp")
     "codegen_intrinsic_renderer.brp"
 
 let compiler_intrinsic_template_manifest_rel =
