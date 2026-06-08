@@ -3,6 +3,11 @@ let compiler_tool_rel =
     (Filename.concat "compiler" "blorp")
     "codegen_intrinsic_renderer.brp"
 
+let compiler_tool_suite_rel =
+  Filename.concat
+    (Filename.concat (Filename.concat "compiler" "blorp") "tests")
+    "test_codegen_intrinsic_renderer.brp"
+
 let compiler_intrinsic_template_manifest_rel =
   Filename.concat
     (Filename.concat "compiler" "lib")
@@ -273,6 +278,14 @@ let test_codegen_intrinsic_renderer_rejects_bad_requests () =
         "intrinsic math_sqrt expected 1 arg(s), got 2";
       assert_tool_failure_contains bin "unknown command" [ "bogus" ] "Usage:")
 
+let test_codegen_intrinsic_renderer_blorp_suite () =
+  let suite_path = find_project_file compiler_tool_suite_rel in
+  let exit_code =
+    Blorp.Test_runner.run_tests ~mode:Blorp.Test_runner.SuiteOnly
+      ~timeout:(Some 30) ~jobs:1 ~cache:false suite_path
+  in
+  Alcotest.(check int) "Blorp TestSuite exit code" 0 exit_code
+
 let suite =
   [
     ( "codegen_intrinsic_renderer",
@@ -287,5 +300,7 @@ let suite =
           test_core_emit_delegates_initial_slice_to_blorp_manifest;
         Alcotest.test_case "rejects unsupported requests" `Slow
           test_codegen_intrinsic_renderer_rejects_bad_requests;
+        Alcotest.test_case "Blorp TestSuite passes" `Slow
+          test_codegen_intrinsic_renderer_blorp_suite;
       ] );
   ]
