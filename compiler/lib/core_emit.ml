@@ -129,12 +129,6 @@ let cancellation_cleanup_pop_slot_stmt (v : var) : string =
   Printf.sprintf "blorp_task_cleanup_pop_slot(&%s)"
     (escape_c_ident (Var.to_c_name v))
 
-let task_cleanup_pop_slot_stmt task_c : string =
-  Printf.sprintf "blorp_task_cleanup_pop_slot(&%s)" task_c
-
-let task_array_cleanup_pop_slot_stmt tasks_c slot_c : string =
-  Printf.sprintf "blorp_task_cleanup_pop_slot(&%s[%s])" tasks_c slot_c
-
 let cleanup_release_fn_for_call_kind = function
   | CKUser (name, def_id) ->
       Some (escape_c_ident (user_call_c_name name def_id))
@@ -205,21 +199,6 @@ let emit_cancellation_cleanup_push (ctx : Core_emit_context.t) (v : var)
       emit_line ctx
         (Printf.sprintf "blorp_task_cleanup_push(&%s, &%s, %s, %s);" frame_c
            var_c value_arg release_fn)
-
-let emit_task_cancellation_cleanup_push (ctx : Core_emit_context.t) task_c :
-    unit =
-  let frame_c = Printf.sprintf "__blorp_task_cleanup_%d" (fresh_temp ctx) in
-  emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" frame_c);
-  emit_line ctx
-    (Printf.sprintf "blorp_task_cleanup_push_task(&%s, &%s, (void*)%s);" frame_c
-       task_c task_c)
-
-let emit_task_array_cancellation_cleanup_push (ctx : Core_emit_context.t)
-    cleanups_c slot_c tasks_c : unit =
-  emit_line ctx
-    (Printf.sprintf
-       "blorp_task_cleanup_push_task(&%s[%s], &%s[%s], (void*)%s[%s]);"
-       cleanups_c slot_c tasks_c slot_c tasks_c slot_c)
 
 let emit_heap_pointer_cleanup_push (ctx : Core_emit_context.t) pointer_c : unit
     =
@@ -1939,6 +1918,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
          codegen uses [(void)0] when a void value needs to sit inside an
          expression slot. *)
       emit ctx "(void)0"
+  | CCooperativeCheckpoint -> emit ctx "blorp_cooperative_checkpoint()"
   | CListHandoff h -> emit_list_handoff ctx e h
   (* ---- Operators ---- *)
   | CBin (op, l, r) -> (
@@ -5061,6 +5041,7 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
       emit_indent ctx;
       emitln ctx "}"
   | CFor (binder, iter, body) -> emit_for_loop ctx binder iter body
+  | CCooperativeCheckpoint -> emit_line ctx "blorp_cooperative_checkpoint();"
   | CResourceScope scope ->
       let resource_ty_c = type_to_c ctx scope.rs_ty in
       let resource_c = escape_c_ident (Var.to_c_name scope.rs_var) in
@@ -7873,59 +7854,34 @@ and emit_concurrent_limit_init (ctx : Core_emit_context.t) limit_c limit_expr :
     [block.conc_bindings] carries the explicit (var, user-type, rhs)
     triples; [block.conc_body] is the tail that uses the bindings.
     [cb_ty] is [Result[T, ConcurrencyError]] — the type of the C variable
-    after [blorp_concurrent_join]. [cb_rhs.ty] is [T] (the task body's raw
-    return type), which drives the spawned lambda's return type and the
-    RC classification of what the task stores. *)
+    after the task-window join helper returns the boxed task result. [cb_rhs.ty]
+    is [T] (the task body's raw return type), which drives the spawned lambda's
+    return type and the RC classification of what the task stores. *)
 and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
     ~(emit_tail : Core_emit_context.t -> core -> unit) : unit =
-  (match block.conc_max_threads with
-  | Some n -> emit_line ctx (Printf.sprintf "blorp_thread_pool_init(%d);" n)
-  | None -> ());
-  let batch_tmp = Printf.sprintf "__conc_batch_%d" (fresh_temp ctx) in
-  emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_tmp);
-  emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_tmp);
-  (* Spawn phase *)
-  let task_infos =
-    List.map
-      (fun (cb : conc_binding) ->
-        let task_ret_ty, lambda_name, captures =
-          match cb.cb_task with
-          | Some task ->
-              let c_name =
-                Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func
-                |> escape_c_ident
-              in
-              ( task.tc_return_ty,
-                c_name,
-                task_copy_capture_bindings_for_emit ~loc:cb.cb_rhs.loc
-                  ~context:"concurrent binding" task.tc_captures )
-          | None ->
-              Core_error.errorf Core_error.Emit cb.cb_rhs.loc
-                ~hint:
-                  "Core_closure should attach task metadata to every \
-                   concurrent binding before emission"
-                "concurrent binding reached emit without task closure metadata"
-        in
-        let fn_tmp = emit_conc_closure ctx lambda_name captures in
-        let task_tmp = Printf.sprintf "__conc_task_%d" (fresh_temp ctx) in
-        let use_rc = type_requires_release ctx task_ret_ty in
-        let spawn_fn =
-          if use_rc then "blorp_task_spawn_owned_rc_in_batch"
-          else "blorp_task_spawn_owned_in_batch"
-        in
-        emit_line ctx
-          (Printf.sprintf "blorp_Task* %s = (blorp_Task*)%s(&%s, %s);" task_tmp
-             spawn_fn batch_tmp fn_tmp);
-        emit_task_cancellation_cleanup_push ctx task_tmp;
-        (cb, task_tmp))
-      block.conc_bindings
+  emit_line ctx "blorp_thread_pool_ensure_initialized();";
+  let window_id = fresh_temp ctx in
+  let window_c = Printf.sprintf "__conc_task_window_%d" window_id in
+  let window_cleanup_c =
+    Printf.sprintf "__blorp_task_window_cleanup_%d" window_id
   in
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_tmp);
-  let emit_join_binding (cb : conc_binding) task_tmp timeout_c =
+  let binding_count = List.length block.conc_bindings in
+  let window_capacity =
+    match block.conc_max_threads with
+    | Some n -> max 1 (min n binding_count)
+    | None -> binding_count
+  in
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s;" window_c);
+  emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
+  emit_line ctx
+    (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %d);" window_c
+       window_cleanup_c window_capacity);
+  let emit_join_binding (cb : conc_binding) slot timeout_c =
     let var_c = escape_c_ident (Var.to_c_name cb.cb_var) in
     let ty_c = type_to_c ctx cb.cb_ty in
     let join_call =
-      Printf.sprintf "blorp_concurrent_join(%s, %s)" task_tmp timeout_c
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %d, %s)"
+        window_c slot timeout_c
     in
     let rhs_c =
       if Core_layout_type.is_stack_result_type ~reg:ctx.reg cb.cb_ty then
@@ -7938,29 +7894,79 @@ and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
   (* Join phase — compute deadline from timeout if specified *)
   let has_timeout = block.conc_timeout <> None in
   let conc_id = fresh_temp ctx in
-  if has_timeout then begin
-    let deadline = Printf.sprintf "__conc_deadline_%d" conc_id in
-    (match block.conc_timeout with
-    | Some timeout -> emit_concurrent_deadline_init ctx deadline timeout
-    | None -> ());
-    List.iter
-      (fun ((cb : conc_binding), task_tmp) ->
+  let deadline =
+    if has_timeout then begin
+      let deadline = Printf.sprintf "__conc_deadline_%d" conc_id in
+      (match block.conc_timeout with
+      | Some timeout -> emit_concurrent_deadline_init ctx deadline timeout
+      | None -> ());
+      Some deadline
+    end
+    else None
+  in
+  let emit_timeout_arg () =
+    match deadline with
+    | Some deadline ->
         let rem = Printf.sprintf "__conc_rem_%d" (fresh_temp ctx) in
         emit_concurrent_remaining_init ctx rem deadline;
-        emit_join_binding cb task_tmp rem;
-        emit_line ctx (task_cleanup_pop_slot_stmt task_tmp ^ ";");
-        emit_line ctx
-          (Printf.sprintf "blorp_release((blorp_Object*)%s);" task_tmp))
-      task_infos
-  end
-  else
+        rem
+    | None -> "-1"
+  in
+  let rec take n acc rest =
+    if n <= 0 then (List.rev acc, rest)
+    else
+      match rest with
+      | [] -> (List.rev acc, [])
+      | x :: xs -> take (n - 1) (x :: acc) xs
+  in
+  let rec chunks acc rest =
+    match rest with
+    | [] -> List.rev acc
+    | _ ->
+        let chunk, rest' = take window_capacity [] rest in
+        chunks (chunk :: acc) rest'
+  in
+  let emit_spawn slot (cb : conc_binding) =
+    let task_ret_ty, lambda_name, captures =
+      match cb.cb_task with
+      | Some task ->
+          let c_name =
+            Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func
+            |> escape_c_ident
+          in
+          ( task.tc_return_ty,
+            c_name,
+            task_copy_capture_bindings_for_emit ~loc:cb.cb_rhs.loc
+              ~context:"concurrent binding" task.tc_captures )
+      | None ->
+          Core_error.errorf Core_error.Emit cb.cb_rhs.loc
+            ~hint:
+              "Core_closure should attach task metadata to every concurrent \
+               binding before emission"
+            "concurrent binding reached emit without task closure metadata"
+    in
+    let fn_tmp = emit_conc_closure ctx lambda_name captures in
+    let use_rc = type_requires_release ctx task_ret_ty in
+    let spawn_helper =
+      if use_rc then "blorp_concurrent_task_window_spawn_owned_rc"
+      else "blorp_concurrent_task_window_spawn_owned"
+    in
+    emit_line ctx
+      (Printf.sprintf "%s(&%s, %d, %s, BLORP_CONCURRENT_TASK_FLUSH_PERIODIC);"
+         spawn_helper window_c slot fn_tmp);
+    (cb, slot)
+  in
+  let emit_chunk chunk =
+    let task_infos = List.mapi emit_spawn chunk in
     List.iter
-      (fun ((cb : conc_binding), task_tmp) ->
-        emit_join_binding cb task_tmp "-1";
-        emit_line ctx (task_cleanup_pop_slot_stmt task_tmp ^ ";");
-        emit_line ctx
-          (Printf.sprintf "blorp_release((blorp_Object*)%s);" task_tmp))
-      task_infos;
+      (fun ((cb : conc_binding), slot) ->
+        let timeout_c = emit_timeout_arg () in
+        emit_join_binding cb slot timeout_c)
+      task_infos
+  in
+  List.iter emit_chunk (chunks [] block.conc_bindings);
+  emit_line ctx
+    (Printf.sprintf "blorp_concurrent_task_window_end(&%s);" window_c);
   (* Expression-position concurrent blocks must leave the tail value as the
      GNU statement-expression result; statement-position concurrent blocks
      intentionally discard it. *)
@@ -8054,14 +8060,13 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
   let list_c = Printf.sprintf "__conc_list_%d" id in
   let len_c = Printf.sprintf "__conc_len_%d" id in
   let limit_c = Printf.sprintf "__conc_limit_%d" id in
-  let tasks_c = Printf.sprintf "__conc_tasks_%d" id in
-  let cleanups_c = Printf.sprintf "__conc_task_cleanups_%d" id in
+  let window_c = Printf.sprintf "__conc_task_window_%d" id in
+  let window_cleanup_c = Printf.sprintf "__blorp_task_window_cleanup_%d" id in
   let start_c = Printf.sprintf "__conc_start_%d" id in
   let window_end_c = Printf.sprintf "__conc_window_end_%d" id in
   let idx_c = Printf.sprintf "__conc_i_%d" id in
   let slot_c = Printf.sprintf "__conc_slot_%d" id in
   let results_c = Printf.sprintf "__conc_results_%d" id in
-  let batch_c = Printf.sprintf "__conc_batch_%d" id in
   let var_c = escape_c_ident (Var.to_c_name cf.cf_var) in
   let elem_ty, task_ret_ty, lambda_name, captures =
     concurrently_loop_emit_plan ctx cf
@@ -8070,7 +8075,7 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
     boxed_expr_transfers_ownership ctx cf.cf_iter
   in
   emit_concurrent_limit_init ctx limit_c limit_expr;
-  emit_line ctx (Printf.sprintf "blorp_thread_pool_init((int)%s);" limit_c);
+  emit_line ctx "blorp_thread_pool_ensure_initialized();";
   emit_indent ctx;
   emit ctx (Printf.sprintf "blorp_List* %s = (blorp_List*)" list_c);
   emit_expr ctx cf.cf_iter;
@@ -8081,19 +8086,11 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
          ~value_c:list_c ~ty:cf.cf_iter.ty
   in
   emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c list_c);
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s;" window_c);
+  emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
   emit_line ctx
-    (Printf.sprintf
-       "blorp_Task** %s = blorp_malloc_checked((%s > 0 ? %s : 1) * \
-        sizeof(blorp_Task*));"
-       tasks_c limit_c limit_c);
-  emit_heap_pointer_cleanup_push ctx tasks_c;
-  emit_line ctx
-    (Printf.sprintf
-       "blorp_CancelCleanupFrame* %s = blorp_malloc_checked((%s > 0 ? %s : 1) \
-        * sizeof(blorp_CancelCleanupFrame));"
-       cleanups_c limit_c limit_c);
-  emit_heap_pointer_cleanup_push ctx cleanups_c;
-  emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_c);
+    (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %s);" window_c
+       window_cleanup_c limit_c);
   if collect then begin
     emit_line ctx
       (Printf.sprintf "blorp_List* %s = blorp_list_new(%s);" results_c len_c);
@@ -8110,9 +8107,9 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
     | None -> ()
     end;
   let use_rc = type_requires_release ctx task_ret_ty in
-  let spawn_fn =
-    if use_rc then "blorp_task_spawn_owned_rc_in_batch"
-    else "blorp_task_spawn_owned_in_batch"
+  let spawn_helper =
+    if use_rc then "blorp_concurrent_task_window_spawn_owned_rc"
+    else "blorp_concurrent_task_window_spawn_owned"
   in
   emit_indent ctx;
   emitln ctx
@@ -8124,7 +8121,6 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
   emit_line ctx
     (Printf.sprintf "if (%s > %s) %s = %s;" window_end_c len_c window_end_c
        len_c);
-  emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_c);
   emit_indent ctx;
   emitln ctx
     (Printf.sprintf "for (long %s = %s; %s < %s; %s++) {" idx_c start_c idx_c
@@ -8136,20 +8132,11 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
     elem_ty;
   let fn_tmp = emit_conc_closure ctx lambda_name captures in
   emit_line ctx
-    (Printf.sprintf "%s[%s] = (blorp_Task*)%s(&%s, %s);" tasks_c slot_c spawn_fn
-       batch_c fn_tmp);
-  emit_task_array_cancellation_cleanup_push ctx cleanups_c slot_c tasks_c;
-  emit_line ctx
-    (Printf.sprintf "if (((%s + 1) %% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0) {"
-       slot_c);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
+    (Printf.sprintf "%s(&%s, %s, %s, BLORP_CONCURRENT_TASK_FLUSH_PERIODIC);"
+       spawn_helper window_c slot_c fn_tmp);
   ctx.indent <- ctx.indent - 1;
   emit_indent ctx;
   emitln ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
   emit_indent ctx;
   emitln ctx
     (Printf.sprintf "for (long %s = %s; %s < %s; %s++) {" idx_c start_c idx_c
@@ -8160,9 +8147,12 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
     if has_timeout then begin
       let rem = Printf.sprintf "__cf_rem_%d" (fresh_temp ctx) in
       emit_concurrent_remaining_init ctx rem deadline_c;
-      Printf.sprintf "blorp_concurrent_join(%s[%s], %s)" tasks_c slot_c rem
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %s, %s)"
+        window_c slot_c rem
     end
-    else Printf.sprintf "blorp_concurrent_join(%s[%s], -1)" tasks_c slot_c
+    else
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %s, -1)"
+        window_c slot_c
   in
   if collect then begin
     emit_line ctx
@@ -8173,19 +8163,14 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
   else
     emit_line ctx
       (Printf.sprintf "blorp_release((blorp_Object*)(%s));" join_call);
-  emit_line ctx (task_array_cleanup_pop_slot_stmt tasks_c slot_c ^ ";");
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
   emit_line ctx
-    (Printf.sprintf "blorp_release((blorp_Object*)%s[%s]);" tasks_c slot_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_indent ctx;
-  emitln ctx "}";
-  ctx.indent <- ctx.indent - 1;
-  emit_indent ctx;
-  emitln ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" cleanups_c);
-  emit_line ctx (Printf.sprintf "free(%s);" cleanups_c);
-  emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" tasks_c);
-  emit_line ctx (Printf.sprintf "free(%s);" tasks_c);
+    (Printf.sprintf "blorp_concurrent_task_window_end(&%s);" window_c);
   if collect then begin
     emit_line ctx (Printf.sprintf "%s->len = %s;" results_c len_c);
     emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" results_c)
@@ -8209,13 +8194,12 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
   let id = fresh_temp ctx in
   let source_c = Printf.sprintf "__conc_resource_source_%d" id in
   let limit_c = Printf.sprintf "__conc_limit_%d" id in
-  let tasks_c = Printf.sprintf "__conc_tasks_%d" id in
-  let cleanups_c = Printf.sprintf "__conc_task_cleanups_%d" id in
+  let window_c = Printf.sprintf "__conc_task_window_%d" id in
+  let window_cleanup_c = Printf.sprintf "__blorp_task_window_cleanup_%d" id in
   let raw_c = Printf.sprintf "__conc_resource_raw_%d" id in
   let count_c = Printf.sprintf "__conc_count_%d" id in
   let slot_c = Printf.sprintf "__conc_slot_%d" id in
   let done_c = Printf.sprintf "__conc_source_done_%d" id in
-  let batch_c = Printf.sprintf "__conc_batch_%d" id in
   let var_c = escape_c_ident (Var.to_c_name cf.cf_var) in
   let task_ret_ty, lambda_name, task_captures =
     concurrently_loop_task_emit_plan cf
@@ -8224,7 +8208,7 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
     boxed_expr_transfers_ownership ctx cf.cf_iter
   in
   emit_concurrent_limit_init ctx limit_c limit_expr;
-  emit_line ctx (Printf.sprintf "blorp_thread_pool_init((int)%s);" limit_c);
+  emit_line ctx "blorp_thread_pool_ensure_initialized();";
   emit_indent ctx;
   emit ctx (Printf.sprintf "blorp_ResourceSource* %s = " source_c);
   emit_expr ctx cf.cf_iter;
@@ -8234,18 +8218,11 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
     && emit_owned_temp_cancellation_cleanup_push ctx ~slot_c:source_c
          ~value_c:source_c ~ty:cf.cf_iter.ty
   in
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s;" window_c);
+  emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
   emit_line ctx
-    (Printf.sprintf
-       "blorp_Task** %s = blorp_malloc_checked((%s > 0 ? %s : 1) * \
-        sizeof(blorp_Task*));"
-       tasks_c limit_c limit_c);
-  emit_heap_pointer_cleanup_push ctx tasks_c;
-  emit_line ctx
-    (Printf.sprintf
-       "blorp_CancelCleanupFrame* %s = blorp_malloc_checked((%s > 0 ? %s : 1) \
-        * sizeof(blorp_CancelCleanupFrame));"
-       cleanups_c limit_c limit_c);
-  emit_heap_pointer_cleanup_push ctx cleanups_c;
+    (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %s);" window_c
+       window_cleanup_c limit_c);
   let has_timeout = cf.cf_timeout <> None in
   let deadline_c = Printf.sprintf "__conc_deadline_%d" (fresh_temp ctx) in
   if has_timeout then
@@ -8258,8 +8235,6 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
   emitln ctx (Printf.sprintf "while (!%s) {" done_c);
   ctx.indent <- ctx.indent + 1;
   emit_line ctx (Printf.sprintf "long %s = 0;" count_c);
-  emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_c);
-  emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_c);
   emit_indent ctx;
   emitln ctx (Printf.sprintf "while (%s < %s) {" count_c limit_c);
   ctx.indent <- ctx.indent + 1;
@@ -8285,22 +8260,16 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
       ~context:"resource-source for ... concurrently" lambda_name task_captures
   in
   let use_rc = type_requires_release ctx task_ret_ty in
-  let spawn_fn =
-    if use_rc then "blorp_task_spawn_owned_rc_in_batch"
-    else "blorp_task_spawn_owned_in_batch"
+  let spawn_helper =
+    if use_rc then "blorp_concurrent_task_window_spawn_owned_rc"
+    else "blorp_concurrent_task_window_spawn_owned"
   in
   emit_line ctx
-    (Printf.sprintf "%s[%s] = (blorp_Task*)%s(&%s, %s);" tasks_c slot_c spawn_fn
-       batch_c fn_tmp);
-  emit_task_array_cancellation_cleanup_push ctx cleanups_c slot_c tasks_c;
+    (Printf.sprintf "%s(&%s, %s, %s, BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE);"
+       spawn_helper window_c slot_c fn_tmp);
   emit_line ctx (Printf.sprintf "%s++;" count_c);
-  (* A resource source can park while pulling the next item. Flush each spawned
-     child before the parent goes back to [resource_source_next], otherwise an
-     idle listener can queue a handler and then park before scheduling it. *)
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
   ctx.indent <- ctx.indent - 1;
   emit_line ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
   emit_indent ctx;
   emitln ctx
     (Printf.sprintf "for (long %s = 0; %s < %s; %s++) {" slot_c slot_c count_c
@@ -8310,22 +8279,20 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
     if has_timeout then begin
       let rem = Printf.sprintf "__cf_rem_%d" (fresh_temp ctx) in
       emit_concurrent_remaining_init ctx rem deadline_c;
-      Printf.sprintf "blorp_concurrent_join(%s[%s], %s)" tasks_c slot_c rem
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %s, %s)"
+        window_c slot_c rem
     end
-    else Printf.sprintf "blorp_concurrent_join(%s[%s], -1)" tasks_c slot_c
+    else
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %s, -1)"
+        window_c slot_c
   in
   emit_line ctx (Printf.sprintf "blorp_release((blorp_Object*)(%s));" join_call);
-  emit_line ctx (task_array_cleanup_pop_slot_stmt tasks_c slot_c ^ ";");
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "}";
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "}";
   emit_line ctx
-    (Printf.sprintf "blorp_release((blorp_Object*)%s[%s]);" tasks_c slot_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" cleanups_c);
-  emit_line ctx (Printf.sprintf "free(%s);" cleanups_c);
-  emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" tasks_c);
-  emit_line ctx (Printf.sprintf "free(%s);" tasks_c);
+    (Printf.sprintf "blorp_concurrent_task_window_end(&%s);" window_c);
   if iter_cleanup_registered then
     emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" source_c);
   if iter_transfers_ownership then

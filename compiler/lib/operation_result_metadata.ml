@@ -526,6 +526,10 @@ let wait_behavior_is_cancellation_point = function
   | ParksFiber -> true
   | DoesNotWait | BlocksOsWorker _ -> false
 
+let wait_behavior_parks_fiber = function
+  | ParksFiber -> true
+  | DoesNotWait | BlocksOsWorker _ -> false
+
 let wait_behavior_blocks_os_worker = function
   | BlocksOsWorker _ -> true
   | DoesNotWait | ParksFiber -> false
@@ -548,11 +552,17 @@ let bridge_operation_wait_class (bridge : result_bridge) =
 let bridge_is_cancellation_point (bridge : result_bridge) =
   wait_behavior_is_cancellation_point bridge.wait_behavior
 
+let bridge_parks_fiber (bridge : result_bridge) =
+  wait_behavior_parks_fiber bridge.wait_behavior
+
 let bridge_blocks_os_worker (bridge : result_bridge) =
   wait_behavior_blocks_os_worker bridge.wait_behavior
 
 let terminal_is_cancellation_point (terminal : fallible_stream_terminal) =
   wait_behavior_is_cancellation_point terminal.wait_behavior
+
+let terminal_parks_fiber (terminal : fallible_stream_terminal) =
+  wait_behavior_parks_fiber terminal.wait_behavior
 
 let terminal_blocks_os_worker (terminal : fallible_stream_terminal) =
   wait_behavior_blocks_os_worker terminal.wait_behavior

@@ -1438,14 +1438,18 @@ values, and rejected sends are recorded into a separate channel and validated
 after the run. This is not a full linearizability checker yet, but it
 establishes the source-level pattern needed for one. A bounded capacity-1 replay
 model now checks typed nonblocking send/receive histories against FIFO state
-transitions and includes negative cases for impossible histories. The older MPMC
-property regression now uses structured concurrency instead of detached
-consumers, so strict leak checking can cover it directly. Channel property tests
-now cover capacity-1 and capacity-2 FIFO behavior, producer-local ordering in an
-MPSC run under capacity-1 backpressure, permanent seal behavior across
-blocking/nonblocking/timed send APIs, exact-once MPMC delivery through structured
-consumers, and timed sender/receiver cleanup that leaves the channel usable
-after waiters time out.
+transitions and includes negative cases for impossible histories. A small
+linearizability-style check now collects per-worker nonblocking operation
+histories from three concurrent workers and searches for a capacity-1 FIFO
+serialization that preserves each worker's program order; it deliberately does
+not rely on a side-channel's event arrival order as the linearization order. The
+older MPMC property regression now uses structured concurrency instead of
+detached consumers, so strict leak checking can cover it directly. Channel
+property tests now cover capacity-1 and capacity-2 FIFO behavior,
+producer-local ordering in an MPSC run under capacity-1 backpressure, permanent
+seal behavior across blocking/nonblocking/timed send APIs, exact-once MPMC
+delivery through structured consumers, and timed sender/receiver cleanup that
+leaves the channel usable after waiters time out.
 
 Migration impact: none. This phase adds testability, diagnostics, and gates; it
 should not alter source-level concurrency semantics.
@@ -2483,10 +2487,12 @@ described in `docs/VIRTUAL_THREADS_DESIGN.md`.
    impure overloads within one module.
 3. Extend operation-history recording toward linearizability-style channel
    stress tests. The current property tests now record a small MPMC history,
-   cover producer-local ordering in a capacity-1 MPSC run, and replay typed
-   nonblocking capacity-1 histories against a bounded FIFO model, but they do
-   not yet prove that arbitrary overlapping MPMC histories have a valid
-   serialization.
+   cover producer-local ordering in a capacity-1 MPSC run, replay typed
+   nonblocking capacity-1 histories against a bounded FIFO model, and search
+   for valid serializations of small three-worker overlapping histories at
+   capacity 1 and capacity 2. The capacity-2 model adds observable FIFO order
+   across multiple buffered values, but this remains bounded testing rather
+   than a proof for arbitrary overlapping MPMC histories.
 4. Extend deterministic cancellation harness coverage for parked operations.
    The first narrow test hook has landed, and channel send/receive,
    structured-join, dynamic fan-out, ordinary `select`, timer sleep, TCP

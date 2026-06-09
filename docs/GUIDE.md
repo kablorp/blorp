@@ -2369,13 +2369,15 @@ func typed_timeout_example() -> Int:
     0
 ```
 
-**Note:** Timeouts are cooperative — they take effect at yield points (`sleep`,
-`yield_now`, channel send/recv, task join). When a timeout fires, the timed-out task is
-cancelled and the block waits for it to reach its next cancellation point before
-continuing, so code after that point does not run. Resources acquired with
-`with` are closed by cancellation cleanup before the task unwinds. A CPU-bound
-computation loop will not be interrupted by a timeout. If you need
-interruptible compute, insert periodic `yield_now()` calls.
+**Note:** Timeouts are cooperative — they take effect at cancellation points
+(`sleep`, `yield_now`, channel send/recv, task join, and compiler-inserted loop
+checkpoints). When a timeout fires, the timed-out task is cancelled and the
+block waits for it to reach its next cancellation point before continuing, so
+code after that point does not run. Resources acquired with `with` are closed by
+cancellation cleanup before the task unwinds. CPU-bound `while`, `for`, and
+`@tail_recursive` loops are checked by compiler-owned checkpoints; use
+`yield_now()` only when you also want an explicit scheduling handoff to other
+ready fibers.
 
 ### Concurrent Loops
 
@@ -2538,6 +2540,11 @@ Use `yield_now()` when you want to cooperatively give another ready fiber a
 chance to run without installing a timer. It is a scheduling hint, not an
 ordering guarantee.
 
+Ordinary `while` and `for` loops, plus loops lowered from `@tail_recursive`
+functions, also receive compiler-owned cancellation checkpoints. Those
+checkpoints let timeouts stop CPU-heavy loops, but they use a runtime reduction
+budget and are not a source-level ordering primitive.
+
 Use `sleep_for` when the timeout is a typed `Duration` from `units`:
 
 ```blorp
@@ -2574,7 +2581,7 @@ func compute_b() -> Int: 2
 func pool_example() -> Int:
     n: Int = max_threads()
 
-    -- Set max threads via concurrent block parameter
+    -- Limit this block's active child tasks
     concurrent(max_threads: 8):
         a = compute_a()
         b = compute_b()
@@ -2584,7 +2591,7 @@ func pool_example() -> Int:
 -- ./blorp run program.brp --threads 4
 ```
 
-The thread pool is lazily initialized on first concurrent operation. The `max_threads` parameter must be a positive integer literal. It sets the pool size for the first concurrent block encountered; subsequent blocks reuse the existing pool.
+The thread pool is lazily initialized on first concurrent operation. Global OS-worker capacity comes from `BLORP_THREADS`, `--threads`, or the platform default. The `max_threads` parameter must be a positive integer literal and limits only that `concurrent:` block's active child tasks; it does not resize the process-wide worker pool.
 
 ### Virtual Threads (Fibers)
 

@@ -176,7 +176,7 @@ either work or produce a helpful message.
     core_string_pipeline + core_collection_pipeline + core_parallel_tensor_pipeline +
     core_tensor_fusion + core_tuple_sroa →
     core_specialize → core_dce → core_consume_specialize → core_perceus → core_reuse → core_closure →
-    core_resource → core_codegen_prepare → core_reuse(prepared unions) → backend emit
+    core_resource → core_fairness → core_codegen_prepare → core_reuse(prepared unions) → backend emit
 
 Don't put type-checking logic in Core IR passes or parsing constraints in
 type-checking. If a check belongs in an earlier phase, move it there. If it must stay in a
@@ -457,6 +457,7 @@ compiler/            # OCaml compiler implementation
     core_reuse.ml     # Core IR post-Perceus reuse analysis and prepared union reuse
     core_closure.ml   # Core IR closure conversion / lambda hoisting
     core_resource.ml  # Resource-scope cleanup-exit lowering
+    core_fairness.ml  # Cooperative loop checkpoint insertion
     core_codegen_prepare.ml  # Final Core representation preparation
     core_emit.ml      # Core IR → C emission
     core_emit_c.ml    # Default C backend wrapper

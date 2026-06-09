@@ -28,10 +28,11 @@
     16. [Core_reuse] — analyze post-Perceus reuse candidates
     17. [Core_closure] — hoist lambdas and create closure values
     18. [Core_resource] — make resource cleanup before nonlocal loop exits explicit
-    19. [Core_codegen_prepare] — make final representation/layout facts explicit
-    20. [Core_reuse] prepared union reuse — reuse source-owned union nodes after
+    19. [Core_fairness] — insert compiler-owned cooperative loop checkpoints
+    20. [Core_codegen_prepare] — make final representation/layout facts explicit
+    21. [Core_reuse] prepared union reuse — reuse source-owned union nodes after
        constructors and box/unbox storage have explicit final-Core shapes
-    21. [Core_emit_c] — Core IR → C string via the default backend
+    22. [Core_emit_c] — Core IR → C string via the default backend
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -209,6 +210,7 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
   |> run_stage Core_stage.Closure
        (Core_closure.convert_program ~wrap_function_refs:false)
   |> Core_resource.rewrite_nonlocal_exits_program
+  |> Core_fairness.insert_program_checkpoints
   |> Core_codegen_prepare.prepare_program ~reg
   |> Core_reuse.rewrite_prepared_program ~reg
   |> observe Core_stage.Final

@@ -598,6 +598,15 @@ let builtin_contract_table =
       builtins
         [ "blorp_test_cancel_after_parked" ]
         (bfixed [ Borrow ] ReturnPrimitive);
+      builtins
+        [ "blorp_test_cooperative_checkpoint_probe" ]
+        (bfixed [] ReturnPrimitive);
+      builtins
+        [ "blorp_test_wait_ready_to_park_probe" ]
+        (bfixed [] ReturnPrimitive);
+      builtins
+        [ "blorp_test_current_timer_wait_install_probe" ]
+        (bfixed [] ReturnPrimitive);
       builtins [ "blorp_test_tls_state_probe" ] (bfixed [] ReturnPrimitive);
       builtins
         [ "blorp_test_websocket_state_probe" ]

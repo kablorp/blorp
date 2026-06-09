@@ -22,12 +22,15 @@ The current Core pipeline is:
     `Core_parallel_tensor_pipeline`, `Core_tensor_fusion`, `Core_tuple_sroa`
 12. `Core_specialize` plus function-reference adaptation
 13. `Core_dce`
-14. `Core_perceus`
-15. `Core_reuse`
-16. `Core_closure`
-17. `Core_resource`
-18. `Core_codegen_prepare`
-19. `Core_emit_c`
+14. `Core_consume_specialize`
+15. `Core_perceus`
+16. `Core_reuse`
+17. `Core_closure`
+18. `Core_resource`
+19. `Core_fairness`
+20. `Core_codegen_prepare`
+21. `Core_reuse` for prepared unions
+22. `Core_emit_c`
 
 `Core_pipeline.run_core_passes` is the source of truth for pass ordering. Keep
 docs, stage names, invariants, and `--dump-core-after` behavior aligned with it.
