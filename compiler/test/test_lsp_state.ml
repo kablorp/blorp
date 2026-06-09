@@ -9,6 +9,7 @@ let document ?(module_aliases = []) ~uri text : Lsp_state.document =
     text;
     diagnostics = [];
     parse_errors = [];
+    source_program = None;
     program = None;
     typed_program = None;
     env = None;
@@ -55,6 +56,9 @@ let test_parse_error_clears_stale_analysis_state () =
       Alcotest.(check (list (pair string string)))
         "stale aliases cleared" [] doc.module_aliases;
       Alcotest.(check bool) "program cleared" true (doc.program = None);
+      Alcotest.(check bool)
+        "source program cleared" true
+        (doc.source_program = None);
       Alcotest.(check bool)
         "typed program cleared" true (doc.typed_program = None);
       Alcotest.(check bool) "env cleared" true (doc.env = None))

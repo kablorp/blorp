@@ -192,6 +192,9 @@ let capabilities : json =
       ("documentFormattingProvider", Bool false);
       ("definitionProvider", Bool true);
       ("declarationProvider", Bool true);
+      ("referencesProvider", Bool true);
+      ("documentHighlightProvider", Bool true);
+      ("inlayHintProvider", Object [ ("resolveProvider", Bool false) ]);
       ( "completionProvider",
         Object
           [

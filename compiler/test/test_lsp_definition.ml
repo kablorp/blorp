@@ -13,6 +13,7 @@ let analyzed_state source =
           text = source;
           diagnostics = [];
           parse_errors = [];
+          source_program = None;
           program = None;
           typed_program = None;
           env = None;
@@ -136,6 +137,26 @@ let test_definition_does_not_leak_previous_function_scope () =
     "current function parameter ignores previous function local" (6, 10)
     (definition_start_at state uri ~line:8 ~character:8)
 
+let test_definition_jumps_to_function_type_parameter () =
+  let state, uri =
+    analyzed_state
+      (String.concat "\n"
+         [
+           "func identity[T](value: T) -> T:";
+           "    value";
+           "";
+           "func main(args: List[String]) -> Int:";
+           "    identity(1)";
+           "";
+         ])
+  in
+  Alcotest.(check (pair int int))
+    "parameter type points at the type parameter" (0, 14)
+    (definition_start_at state uri ~line:0 ~character:24);
+  Alcotest.(check (pair int int))
+    "return type points at the type parameter" (0, 14)
+    (definition_start_at state uri ~line:0 ~character:30)
+
 let suite =
   [
     ( "locations",
@@ -148,6 +169,8 @@ let suite =
           test_declaration_jumps_to_local_binding;
         Alcotest.test_case "does not leak previous function scope" `Quick
           test_definition_does_not_leak_previous_function_scope;
+        Alcotest.test_case "jumps to function type parameter" `Quick
+          test_definition_jumps_to_function_type_parameter;
         Alcotest.test_case "advertises declaration navigation" `Quick
           check_definition_capabilities;
       ] );

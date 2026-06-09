@@ -46,6 +46,7 @@ let make_document ~uri ~version ~text : Lsp_state.document =
     text;
     diagnostics = [];
     parse_errors = [];
+    source_program = None;
     program = None;
     typed_program = None;
     env = None;
@@ -112,6 +113,36 @@ let handle_did_close (state : Lsp_state.state) oc params =
   | None -> ()
 
 (** Handle textDocument/hover *)
+let hover_for_typed_record_field_at (record : Typed_ast.record_decl) ~line ~col
+    =
+  let ast_record = Typed_ast.record_ast record in
+  let field_infos = Typed_ast.record_field_infos record in
+  let rec loop fields infos =
+    match (fields, infos) with
+    | (field : Ast.field_decl) :: _, info :: _
+      when Lsp_position.col_inside_name field.field_loc field.field_name ~line
+             ~col ->
+        Lsp_hover.hover_info_for_typed_record_field info
+    | _ :: rest_fields, _ :: rest_infos -> loop rest_fields rest_infos
+    | _ -> None
+  in
+  loop ast_record.record_fields field_infos
+
+let find_typed_record_field_hover typed_program ~file ~line ~col =
+  typed_program |> Typed_ast.program_decls
+  |> List.find_map (fun decl ->
+      let ast_decl = Typed_ast.decl_ast decl in
+      if not (Lsp_position.loc_matches_file ~file ast_decl.decl_loc) then None
+      else
+        match Typed_ast.decl_view decl with
+        | DeclRecord record -> hover_for_typed_record_field_at record ~line ~col
+        | DeclPrivate inner -> (
+            match Typed_ast.decl_view inner with
+            | DeclRecord record ->
+                hover_for_typed_record_field_at record ~line ~col
+            | _ -> None)
+        | _ -> None)
+
 let handle_hover (state : Lsp_state.state) params =
   let td = get "textDocument" params in
   let pos = get "position" params in
@@ -122,8 +153,14 @@ let handle_hover (state : Lsp_state.state) params =
       match (Lsp_state.find_document state uri, position) with
       | Some doc, Some pos -> (
           let file = Lsp_protocol.uri_to_path uri in
-          (* Try expression lookup first *)
-          let expr_hover =
+          let typed_record_field_hover () =
+            match doc.typed_program with
+            | Some typed_program ->
+                find_typed_record_field_hover typed_program ~file ~line:pos.line
+                  ~col:pos.character
+            | None -> None
+          in
+          let expr_hover () =
             match (doc.program, doc.env) with
             | Some program, Some env -> (
                 match
@@ -134,53 +171,99 @@ let handle_hover (state : Lsp_state.state) params =
                 | None -> None)
             | _ -> None
           in
-          (* Fall back to declaration lookup *)
+          let type_name_hover () =
+            match (doc.env, Lsp_position.line_at doc.text ~line:pos.line) with
+            | Some env, Some line_text
+              when Lsp_position.is_type_name_context line_text pos.character
+              -> (
+                match
+                  Lsp_position.word_at doc.text ~line:pos.line
+                    ~col:pos.character
+                with
+                | Some name -> (
+                    match Env.lookup env name with
+                    | Some symbol ->
+                        Lsp_hover.hover_info_for_type_like_symbol name symbol
+                    | None -> None)
+                | None -> None)
+            | _ -> None
+          in
+          let type_param_hover () =
+            match doc.program with
+            | Some program -> (
+                match
+                  Lsp_position.find_function_type_param_at program ~file
+                    ~text:doc.text ~line:pos.line ~col:pos.character
+                with
+                | Some hit ->
+                    Lsp_hover.hover_info_for_type_param
+                      ~label:hit.Lsp_position.type_param_label
+                | None -> None)
+            | None -> None
+          in
+          let record_field_assignment_hover () =
+            match (doc.program, doc.env) with
+            | Some program, Some env -> (
+                match
+                  Lsp_position.find_record_field_assignment_hit
+                    ~module_aliases:doc.module_aliases ~file env program
+                    ~text:doc.text ~line:pos.line ~col:pos.character
+                with
+                | Some (hit : Lsp_position.record_field_hit) ->
+                    Lsp_hover.hover_info_for_record_field_assignment
+                      ~name:hit.field_name ~field_type:hit.field_type
+                | None -> None)
+            | _ -> None
+          in
+          let typed_param_hover () =
+            match doc.typed_program with
+            | Some typed_program -> (
+                match
+                  Lsp_position.find_typed_param_at typed_program ~file
+                    ~line:pos.line ~col:pos.character
+                with
+                | Some hit ->
+                    Some
+                      (Lsp_hover.hover_info_for_typed_param
+                         ~name:hit.Lsp_position.param_name
+                         ~source_ty:hit.source_param_ty
+                         ~semantic_ty:hit.semantic_param_ty)
+                | None -> None)
+            | None -> None
+          in
+          let typed_decl_hover () =
+            match doc.typed_program with
+            | Some typed_program -> (
+                match
+                  Lsp_position.find_typed_decl_at typed_program ~file
+                    ~line:pos.line
+                with
+                | Some d -> Lsp_hover.hover_info_for_typed_decl d
+                | None -> None)
+            | None -> None
+          in
+          let source_decl_hover () =
+            match doc.program with
+            | Some program -> (
+                match
+                  Lsp_position.find_decl_at program ~line:pos.line ~file
+                with
+                | Some d -> Lsp_hover.hover_info_for_decl d
+                | None -> None)
+            | None -> None
+          in
           let hover =
-            match expr_hover with
-            | Some _ -> expr_hover
-            | None -> (
-                let typed_param_hover =
-                  match doc.typed_program with
-                  | Some typed_program -> (
-                      match
-                        Lsp_position.find_typed_param_at typed_program ~file
-                          ~line:pos.line ~col:pos.character
-                      with
-                      | Some hit ->
-                          Some
-                            (Lsp_hover.hover_info_for_typed_param
-                               ~name:hit.Lsp_position.param_name
-                               ~source_ty:hit.source_param_ty
-                               ~semantic_ty:hit.semantic_param_ty)
-                      | None -> None)
-                  | None -> None
-                in
-                match typed_param_hover with
-                | Some _ -> typed_param_hover
-                | None -> (
-                    let typed_decl_hover =
-                      match doc.typed_program with
-                      | Some typed_program -> (
-                          match
-                            Lsp_position.find_typed_decl_at typed_program ~file
-                              ~line:pos.line
-                          with
-                          | Some d -> Lsp_hover.hover_info_for_typed_decl d
-                          | None -> None)
-                      | None -> None
-                    in
-                    match typed_decl_hover with
-                    | Some _ -> typed_decl_hover
-                    | None -> (
-                        match doc.program with
-                        | Some program -> (
-                            match
-                              Lsp_position.find_decl_at program ~line:pos.line
-                                ~file
-                            with
-                            | Some d -> Lsp_hover.hover_info_for_decl d
-                            | None -> None)
-                        | None -> None)))
+            [
+              typed_record_field_hover;
+              record_field_assignment_hover;
+              type_param_hover;
+              type_name_hover;
+              expr_hover;
+              typed_param_hover;
+              typed_decl_hover;
+              source_decl_hover;
+            ]
+            |> List.find_map (fun provider -> provider ())
           in
           match hover with
           | Some contents ->
@@ -196,6 +279,19 @@ let handle_hover (state : Lsp_state.state) params =
   | _ -> Null
 
 (** Handle textDocument/definition *)
+let position_on_definition_name def_loc name (pos : Lsp_protocol.position) =
+  let def_line = def_loc.Ast.line - 1 in
+  let def_col = def_loc.column - 1 in
+  pos.line = def_line && def_col <= pos.character
+  && pos.character < def_col + String.length name
+
+let uses_for_definition_site uri doc program pos def_loc =
+  Lsp_references.matching_occurrences doc program pos
+  |> List.filter (fun occurrence ->
+      not
+        (Lsp_references.loc_same_position occurrence.Lsp_references.loc def_loc))
+  |> List.map (Lsp_references.location_json uri)
+
 let handle_definition (state : Lsp_state.state) params =
   let td = get "textDocument" params in
   let pos = get "position" params in
@@ -205,6 +301,7 @@ let handle_definition (state : Lsp_state.state) params =
       let position = position_of_json pos_json in
       match (Lsp_state.find_document state uri, position) with
       | Some doc, Some pos -> (
+          let file = Lsp_protocol.uri_to_path uri in
           (* Identify the word under the cursor from the raw text — this covers
               identifiers that aren't EIdent nodes (type annotations, pattern
               constructors, field names, etc.). *)
@@ -229,30 +326,78 @@ let handle_definition (state : Lsp_state.state) params =
                     in
                     Lsp_protocol.location_json ~uri:target_uri ~range
                   in
-                  match
-                    Lsp_position.find_definition program ~name ~line:pos.line
-                      ~col:pos.character
-                  with
-                  | Some def_loc -> make_location uri def_loc
+                  let make_location_for_loc def_loc =
+                    match def_loc.Ast.loc_file with
+                    | Some file ->
+                        make_location (Lsp_protocol.path_to_uri file) def_loc
+                    | None -> make_location uri def_loc
+                  in
+                  let field_definition =
+                    match doc.env with
+                    | Some env ->
+                        Lsp_references.field_definition_at_cursor doc program
+                          env pos
+                    | None -> None
+                  in
+                  let type_param_definition =
+                    Lsp_position.find_function_type_param_at program ~file
+                      ~text:doc.text ~line:pos.line ~col:pos.character
+                    |> Option.map (fun hit -> hit.Lsp_position.type_param_loc)
+                  in
+                  let imported_definition () =
+                    (* Fall back to imported / prelude modules. Embedded
+                       std paths get remapped to the on-disk std/ dir if
+                       one is reachable from the open document. *)
+                    match
+                      Lsp_position.find_cross_module_definition program ~name
+                    with
+                    | Some (path, def_loc) ->
+                        let base_dir =
+                          Filename.dirname (Lsp_protocol.uri_to_path uri)
+                        in
+                        let real_path =
+                          Lsp_position.resolve_module_source_path ~base_dir path
+                        in
+                        make_location
+                          (Lsp_protocol.path_to_uri real_path)
+                          def_loc
+                    | None -> Null
+                  in
+                  let local_definition () =
+                    match
+                      Lsp_position.find_definition program ~name ~line:pos.line
+                        ~col:pos.character
+                    with
+                    | Some def_loc ->
+                        if position_on_definition_name def_loc name pos then
+                          match
+                            uses_for_definition_site uri doc program pos def_loc
+                          with
+                          | [] -> make_location uri def_loc
+                          | uses -> Array uses
+                        else make_location uri def_loc
+                    | None -> imported_definition ()
+                  in
+                  match field_definition with
+                  | Some field_loc ->
+                      if position_on_definition_name field_loc name pos then
+                        match
+                          uses_for_definition_site uri doc program pos field_loc
+                        with
+                        | [] -> make_location_for_loc field_loc
+                        | uses -> Array uses
+                      else make_location_for_loc field_loc
                   | None -> (
-                      (* Fall back to imported / prelude modules. Embedded
-                             std paths get remapped to the on-disk std/ dir if
-                             one is reachable from the open document. *)
-                      match
-                        Lsp_position.find_cross_module_definition program ~name
-                      with
-                      | Some (path, def_loc) ->
-                          let base_dir =
-                            Filename.dirname (Lsp_protocol.uri_to_path uri)
-                          in
-                          let real_path =
-                            Lsp_position.resolve_module_source_path ~base_dir
-                              path
-                          in
-                          make_location
-                            (Lsp_protocol.path_to_uri real_path)
-                            def_loc
-                      | None -> Null))
+                      match type_param_definition with
+                      | Some loc ->
+                          if position_on_definition_name loc name pos then
+                            match
+                              uses_for_definition_site uri doc program pos loc
+                            with
+                            | [] -> make_location_for_loc loc
+                            | uses -> Array uses
+                          else make_location_for_loc loc
+                      | None -> local_definition ()))
               | None -> Null)
           | None -> Null)
       | _ -> Null)
@@ -341,6 +486,26 @@ and dispatch state _ic oc (msg : message) shutdown_requested =
       match msg.id with
       | Some id ->
           let result = handle_declaration state msg.params in
+          send_response oc ~id ~result
+      | None -> ())
+  | "textDocument/references" -> (
+      match msg.id with
+      | Some id ->
+          let result = Lsp_references.handle_references state msg.params in
+          send_response oc ~id ~result
+      | None -> ())
+  | "textDocument/documentHighlight" -> (
+      match msg.id with
+      | Some id ->
+          let result =
+            Lsp_references.handle_document_highlight state msg.params
+          in
+          send_response oc ~id ~result
+      | None -> ())
+  | "textDocument/inlayHint" -> (
+      match msg.id with
+      | Some id ->
+          let result = Lsp_inlay_hint.handle_inlay_hint state msg.params in
           send_response oc ~id ~result
       | None -> ())
   | "textDocument/formatting" -> (

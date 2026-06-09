@@ -87,6 +87,9 @@ RESP=$(read_response)
 check "returns capabilities" "$RESP" '"capabilities"'
 check "has textDocumentSync" "$RESP" '"textDocumentSync"'
 check "has hoverProvider" "$RESP" '"hoverProvider":true'
+check "has referencesProvider" "$RESP" '"referencesProvider":true'
+check "has documentHighlightProvider" "$RESP" '"documentHighlightProvider":true'
+check "has inlayHintProvider" "$RESP" '"inlayHintProvider"'
 check "does not advertise formattingProvider" "$RESP" '"documentFormattingProvider":false'
 
 # Send initialized notification
@@ -274,6 +277,22 @@ else
     FAIL=$((FAIL + 1))
     ERRORS="$ERRORS  FAIL: clean exit (exit code $EXIT_CODE)\n"
     echo "  FAIL: clean exit (code $EXIT_CODE)"
+fi
+
+# ── 8. Marker-based fixture suite ───────────────────────────────────
+
+echo "== Fixture suite =="
+if ! command -v python3 >/dev/null 2>&1; then
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS  FAIL: fixture suite (python3 is required)\n"
+    echo "  FAIL: fixture suite (python3 is required)"
+elif python3 tests/lsp/run_lsp_fixtures.py "$BLORP" tests/lsp/fixtures; then
+    PASS=$((PASS + 1))
+    echo "  PASS: fixture suite"
+else
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS  FAIL: fixture suite\n"
+    echo "  FAIL: fixture suite"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────

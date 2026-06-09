@@ -17,6 +17,7 @@ type document = {
   text : string;
   mutable diagnostics : compiler_error list;
   mutable parse_errors : string list;
+  mutable source_program : program option;
   mutable program : program option;
   mutable typed_program : Typed_ast.program option;
   mutable env : Env.env option;
@@ -33,6 +34,7 @@ let find_document state uri = Hashtbl.find_opt state.documents uri
 
 let clear_analysis_state doc =
   doc.parse_errors <- [];
+  doc.source_program <- None;
   doc.program <- None;
   doc.typed_program <- None;
   doc.env <- None;
@@ -85,6 +87,7 @@ let analyze (_state : state) (doc : document) : unit =
       doc.parse_errors <- List.map (fun e -> e.message) errs
   | Ok program ->
       doc.parse_errors <- [];
+      doc.source_program <- Some program;
       doc.program <- Some program;
       doc.typed_program <- None;
       doc.module_aliases <- [];
