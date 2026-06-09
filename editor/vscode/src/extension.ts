@@ -6,7 +6,6 @@ import {
   LanguageClient,
   LanguageClientOptions,
   ServerOptions,
-  TransportKind,
 } from "vscode-languageclient/node";
 import { accessSync, constants } from "fs";
 import { join } from "path";
@@ -49,10 +48,16 @@ export function activate(context: ExtensionContext) {
   const cwd = workspaceRoot();
 
   const serverOptions: ServerOptions = {
-    command,
-    args: ["lsp"],
-    transport: TransportKind.stdio,
-    options: cwd === undefined ? undefined : { cwd },
+    run: {
+      command,
+      args: ["lsp"],
+      options: cwd === undefined ? undefined : { cwd },
+    },
+    debug: {
+      command,
+      args: ["lsp"],
+      options: cwd === undefined ? undefined : { cwd },
+    },
   };
 
   const clientOptions: LanguageClientOptions = {
@@ -60,9 +65,12 @@ export function activate(context: ExtensionContext) {
   };
 
   client = new LanguageClient("blorp", "Blorp Language Server", serverOptions, clientOptions);
-  client.start();
+  context.subscriptions.push(client);
+  void client.start();
 }
 
 export function deactivate(): Thenable<void> | undefined {
-  return client?.stop();
+  const activeClient = client;
+  client = undefined;
+  return activeClient?.stop().then(undefined, () => undefined);
 }

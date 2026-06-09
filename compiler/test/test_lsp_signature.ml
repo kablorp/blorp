@@ -12,6 +12,7 @@ let analyzed_state_unisolated source =
       text = source;
       diagnostics = [];
       parse_errors = [];
+      source_program = None;
       program = None;
       typed_program = None;
       env = None;
@@ -184,6 +185,7 @@ let test_signature_help_text_fallback_for_incomplete_document () =
       text;
       diagnostics = [];
       parse_errors = [];
+      source_program = None;
       program = None;
       typed_program = None;
       env = None;

@@ -166,6 +166,11 @@ Typed AST
 +---------------+  cleanup-exit Core (core_resource.ml)
     |
     v
++---------------+
+| Core_fairness |  Insert compiler-owned cooperative checkpoints at loop
++---------------+  boundaries (core_fairness.ml)
+    |
+    v
 +----------------------+
 | Core_codegen_prepare |  Make final storage/layout decisions explicit:
 +----------------------+  typed box/unbox, constructors, release policy
@@ -239,6 +244,7 @@ boxing, or ownership behavior from source spelling.
 | `core_dce.ml` | Conservative Core declaration dead-code elimination before ownership insertion |
 | `core_consume_specialize.ml` | Pre-Perceus consuming-call clones for safe source-owned self-replacement |
 | `core_resource.ml` | Explicit resource cleanup exits for nonlocal loop control |
+| `core_fairness.ml` | Compiler-owned cooperative checkpoint insertion for ordinary and tailrec loops |
 | `core_codegen_prepare.ml` | Final Core preparation: explicit constructors, box/unbox, and release/layout facts |
 | `core_erased_storage_layout.ml` | Late-Core classification for typed values crossing erased `void*` storage |
 | `core_erasure_inventory.ml` | Observational inventory of typed values crossing erased storage boundaries |
@@ -325,6 +331,7 @@ compiler/
 │   ├── core_reuse.ml      # Post-Perceus allocation reuse rewrites
 │   ├── core_closure.ml    # Closure conversion / lambda hoisting
 │   ├── core_resource.ml   # Resource-scope cleanup-exit lowering
+│   ├── core_fairness.ml   # Cooperative loop checkpoint insertion
 │   ├── core_codegen_prepare.ml # Final Core representation preparation
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
 │   ├── core_erased_storage_layout.ml # Typed values crossing erased storage
@@ -561,9 +568,8 @@ val typecheck_program : Ast.program -> check_result
 - Nested parallelism detection
 - If condition must be Bool
 
-See [CALL_RESOLUTION.md](CALL_RESOLUTION.md) for the current name/call
-resolution behavior and the proposed path toward a single semantic call-target
-model shared by `check`, `compile`, and `purify`.
+See [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) for the active path toward a
+single semantic call-target model shared by `check`, `compile`, and `purify`.
 
 ---
 
@@ -666,8 +672,8 @@ Embedded C runtime compiled into the generated binary:
 - Fixed-point arithmetic
 - Thread pool + M:N fiber scheduling (`minicoro.h`), channels, structured concurrency
 
-The long-term runtime target for fibers is documented in
-`docs/VIRTUAL_THREADS_DESIGN.md`.
+The runtime, cancellation, and resource direction is tracked in
+[CONCURRENCY_AND_RESOURCES.md](CONCURRENCY_AND_RESOURCES.md).
 
 When adding a new runtime function, declare it in **both** `runtime.c` and
 `runtime_decl.c` — the latter holds forward declarations used by generated

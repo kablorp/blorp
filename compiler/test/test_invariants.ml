@@ -1443,6 +1443,62 @@ let test_dispatcher_final_runs_concurrent_semantics () =
         (Modules.contains v.Core_error.msg "concurrent binding")
   | _ -> Alcotest.fail "unreachable"
 
+let checkpoint = mk CCooperativeCheckpoint ty_void
+
+let loop_with_body body =
+  mk (CWhile (mk (CLit (LitBool true)) ty_bool, body)) ty_void
+
+let test_cooperative_checkpoint_accepts_loop_entry () =
+  let loop_body = mk (CSeq (checkpoint, mk CVoid ty_void)) ty_void in
+  let prog =
+    mk_prog
+      [ CDFunc (mk_simple_func ~name:"main" ~body:(loop_with_body loop_body)) ]
+  in
+  let violations =
+    Core_invariants.check_cooperative_checkpoints_at Core_stage.Final prog
+  in
+  Alcotest.(check int) "no violations" 0 (List.length violations)
+
+let test_cooperative_checkpoint_flags_top_level () =
+  let prog =
+    mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:checkpoint) ]
+  in
+  let violations =
+    Core_invariants.check_cooperative_checkpoints_at Core_stage.Final prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions cooperative checkpoint" true
+        (Modules.contains v.Core_error.msg "cooperative checkpoint")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_cooperative_checkpoint_flags_duplicate_loop_entry () =
+  let duplicate_tail = mk (CSeq (checkpoint, mk CVoid ty_void)) ty_void in
+  let loop_body = mk (CSeq (checkpoint, duplicate_tail)) ty_void in
+  let prog =
+    mk_prog
+      [ CDFunc (mk_simple_func ~name:"main" ~body:(loop_with_body loop_body)) ]
+  in
+  let violations =
+    Core_invariants.check_cooperative_checkpoints_at Core_stage.Final prog
+  in
+  Alcotest.(check int) "one violation" 1 (List.length violations)
+
+let test_dispatcher_final_runs_cooperative_checkpoint_check () =
+  let prog =
+    mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:checkpoint) ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions cooperative checkpoint" true
+        (Modules.contains v.Core_error.msg "cooperative checkpoint")
+  | _ -> Alcotest.fail "unreachable"
+
 (* ============================================================================
    Pipeline integration: ~check_invariants fires the checks
    ============================================================================ *)
@@ -2282,6 +2338,17 @@ let suite =
           test_concurrent_semantics_flags_malformed_task_scope;
         Alcotest.test_case "dispatcher runs final check" `Quick
           test_dispatcher_final_runs_concurrent_semantics;
+      ] );
+    ( "cooperative_checkpoints",
+      [
+        Alcotest.test_case "accepts loop entry" `Quick
+          test_cooperative_checkpoint_accepts_loop_entry;
+        Alcotest.test_case "flags top-level checkpoint" `Quick
+          test_cooperative_checkpoint_flags_top_level;
+        Alcotest.test_case "flags duplicate loop-entry checkpoint" `Quick
+          test_cooperative_checkpoint_flags_duplicate_loop_entry;
+        Alcotest.test_case "dispatcher runs final check" `Quick
+          test_dispatcher_final_runs_cooperative_checkpoint_check;
       ] );
     ( "pipeline",
       [

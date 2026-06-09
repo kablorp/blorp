@@ -141,6 +141,7 @@ let analyzed_state source =
           text = source;
           diagnostics = [];
           parse_errors = [];
+          source_program = None;
           program = None;
           typed_program = None;
           env = None;
@@ -235,7 +236,17 @@ func main(args: List[String]) -> Int:
     (contains_substring record_hover "record User {id: UserId}");
   Alcotest.(check bool)
     "record declaration hover includes field canonical type" true
-    (contains_substring record_hover "id canonical type: Int")
+    (contains_substring record_hover "id canonical type: Int");
+  let field_hover = hover_value_at state uri ~line:6 ~character:14 in
+  Alcotest.(check bool)
+    "record field hover is field-specific" true
+    (contains_substring field_hover "```blorp\nid: UserId\n```");
+  Alcotest.(check bool)
+    "record field hover includes canonical type" true
+    (contains_substring field_hover "id canonical type: Int");
+  Alcotest.(check bool)
+    "record field hover does not show the whole record" false
+    (contains_substring field_hover "record User")
 
 let test_hover_integration_uses_typed_parameter_metadata () =
   let state, uri =
@@ -257,6 +268,51 @@ func consume(user_id: UserId) -> UserId:
   Alcotest.(check bool)
     "parameter hover is parameter-specific" false
     (contains_substring param_hover "func consume")
+
+let test_hover_integration_supports_type_name_positions () =
+  let state, uri =
+    analyzed_state
+      {|
+record Point {x: Int, y: Int}
+
+func make_point() -> Point:
+    {x = 1, y = 2}
+
+func main(args: List[String]) -> Int:
+    point: Point = make_point()
+    point.x
+|}
+  in
+  let return_type_hover = hover_value_at state uri ~line:3 ~character:21 in
+  Alcotest.(check bool)
+    "return type hover shows record definition" true
+    (contains_substring return_type_hover "record Point {x: Int, y: Int}");
+  let annotation_hover = hover_value_at state uri ~line:7 ~character:11 in
+  Alcotest.(check bool)
+    "local annotation hover shows record definition" true
+    (contains_substring annotation_hover "record Point {x: Int, y: Int}")
+
+let test_hover_integration_supports_type_parameters () =
+  let state, uri =
+    analyzed_state
+      (String.concat "\n"
+         [
+           "func identity[T](value: T) -> T:";
+           "    value";
+           "";
+           "func main(args: List[String]) -> Int:";
+           "    identity(1)";
+           "";
+         ])
+  in
+  let decl_hover = hover_value_at state uri ~line:0 ~character:14 in
+  Alcotest.(check bool)
+    "type parameter declaration hover is specific" true
+    (contains_substring decl_hover "type parameter T");
+  let param_hover = hover_value_at state uri ~line:0 ~character:24 in
+  Alcotest.(check bool)
+    "type parameter use hover is specific" true
+    (contains_substring param_hover "type parameter T")
 
 let test_hover_integration_preserves_function_doc_on_typed_declaration () =
   let state, uri =
@@ -299,6 +355,10 @@ let suite =
           test_hover_integration_uses_typed_declaration_metadata;
         Alcotest.test_case "integration uses typed parameter metadata" `Quick
           test_hover_integration_uses_typed_parameter_metadata;
+        Alcotest.test_case "integration supports type name positions" `Quick
+          test_hover_integration_supports_type_name_positions;
+        Alcotest.test_case "integration supports type parameters" `Quick
+          test_hover_integration_supports_type_parameters;
         Alcotest.test_case
           "integration preserves function doc on typed declaration" `Quick
           test_hover_integration_preserves_function_doc_on_typed_declaration;

@@ -1,8 +1,8 @@
 (** LSP protocol types, serialization, and server capabilities.
 
     Defines the subset of the Language Server Protocol needed for
-    diagnostics, hover, definition, completion, document symbols, and signature
-    help. *)
+    diagnostics, hover, definition, declaration, type definition, completion,
+    document symbols, and signature help. *)
 
 open Lsp_json
 
@@ -173,6 +173,27 @@ let hover_response ~contents ~range : json =
 let location_json ~uri ~range : json =
   Object [ ("uri", String uri); ("range", range_to_json range) ]
 
+(** Build an LSP LocationLink object.
+
+    JetBrains' LSP navigation path relies on [originSelectionRange] when
+    resolving Cmd+Click references, so definition-like responses use links
+    instead of plain locations. *)
+let location_link_json ?origin_selection_range ~target_uri ~target_range
+    ~target_selection_range () : json =
+  let base_fields =
+    [
+      ("targetUri", String target_uri);
+      ("targetRange", range_to_json target_range);
+      ("targetSelectionRange", range_to_json target_selection_range);
+    ]
+  in
+  let fields =
+    match origin_selection_range with
+    | None -> base_fields
+    | Some range -> ("originSelectionRange", range_to_json range) :: base_fields
+  in
+  Object fields
+
 (* ============================================================================
    Server capabilities
    ============================================================================ *)
@@ -192,6 +213,10 @@ let capabilities : json =
       ("documentFormattingProvider", Bool false);
       ("definitionProvider", Bool true);
       ("declarationProvider", Bool true);
+      ("typeDefinitionProvider", Bool true);
+      ("referencesProvider", Bool true);
+      ("documentHighlightProvider", Bool true);
+      ("inlayHintProvider", Object [ ("resolveProvider", Bool false) ]);
       ( "completionProvider",
         Object
           [

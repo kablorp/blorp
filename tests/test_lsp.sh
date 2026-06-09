@@ -87,6 +87,11 @@ RESP=$(read_response)
 check "returns capabilities" "$RESP" '"capabilities"'
 check "has textDocumentSync" "$RESP" '"textDocumentSync"'
 check "has hoverProvider" "$RESP" '"hoverProvider":true'
+check "has referencesProvider" "$RESP" '"referencesProvider":true'
+check "has declarationProvider" "$RESP" '"declarationProvider":true'
+check "has typeDefinitionProvider" "$RESP" '"typeDefinitionProvider":true'
+check "has documentHighlightProvider" "$RESP" '"documentHighlightProvider":true'
+check "has inlayHintProvider" "$RESP" '"inlayHintProvider"'
 check "does not advertise formattingProvider" "$RESP" '"documentFormattingProvider":false'
 
 # Send initialized notification
@@ -135,6 +140,15 @@ check "definition has URI" "$RESP" '"uri"'
 check "definition has range" "$RESP" '"range"'
 check "definition points to line 0" "$RESP" '"line":0'
 
+# Some clients expose their primary click action as declaration rather than
+# definition. Blorp currently has one source declaration per symbol, so the same
+# call-site lookup should work for textDocument/declaration.
+send_msg '{"jsonrpc":"2.0","id":20,"method":"textDocument/declaration","params":{"textDocument":{"uri":"file:///tmp/test_lsp_def.brp"},"position":{"line":4,"character":4}}}'
+RESP=$(read_response)
+check "declaration returns result" "$RESP" '"result"'
+check "declaration has URI" "$RESP" '"uri"'
+check "declaration points to line 0" "$RESP" '"line":0'
+
 # Go to definition on a type name in a type annotation
 # Source: "record Point {x: Int, y: Int}\n\nfunc main(args: List[String]) -> Int:\n    p: Point = {x = 1, y = 2}\n    0\n"
 # Click on 'Point' at line 3 character 8 — should jump to record declaration on line 0
@@ -147,8 +161,13 @@ RESP=$(read_response)
 check "definition on type annotation returns URI" "$RESP" '"uri"'
 check "definition on type annotation points to record" "$RESP" '"line":0'
 
-# Go to definition on a union variant name in a pattern
-# Source: union Shape on line 0-2, func on line 4+, 'Circle' pattern on line 6
+send_msg '{"jsonrpc":"2.0","id":21,"method":"textDocument/typeDefinition","params":{"textDocument":{"uri":"file:///tmp/test_lsp_def_type.brp"},"position":{"line":3,"character":8}}}'
+RESP=$(read_response)
+check "type definition on type annotation returns URI" "$RESP" '"uri"'
+check "type definition on type annotation points to record" "$RESP" '"line":0'
+
+# Go to definition on a union variant name in a pattern.
+# Source: union Shape on line 0-2, Circle variant on line 1, func on line 4+.
 VARIANT_URI="file:///tmp/test_lsp_def_variant.brp"
 send_msg '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/test_lsp_def_variant.brp","languageId":"blorp","version":1,"text":"union Shape:\n    Circle(Float)\n    Square(Float)\n\nfunc area(s: Shape) -> Float:\n    match s:\n        Circle(r): r * r\n        Square(s): s * s\n\nfunc main(args: List[String]) -> Int:\n    _ = area(Circle(1.0))\n    0\n"}}}'
 read_response > /dev/null  # consume diagnostics
@@ -156,7 +175,7 @@ read_response > /dev/null  # consume diagnostics
 send_msg '{"jsonrpc":"2.0","id":12,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///tmp/test_lsp_def_variant.brp"},"position":{"line":6,"character":10}}}'
 RESP=$(read_response)
 check "definition on pattern constructor returns URI" "$RESP" '"uri"'
-check "definition on pattern constructor points to union" "$RESP" '"line":0'
+check "definition on pattern constructor points to variant" "$RESP" '"line":1'
 
 # Go to definition on a top-level constant
 # Source: MAX: Int = 100 on line 0, reference on line 3
@@ -274,6 +293,22 @@ else
     FAIL=$((FAIL + 1))
     ERRORS="$ERRORS  FAIL: clean exit (exit code $EXIT_CODE)\n"
     echo "  FAIL: clean exit (code $EXIT_CODE)"
+fi
+
+# ── 8. Marker-based fixture suite ───────────────────────────────────
+
+echo "== Fixture suite =="
+if ! command -v python3 >/dev/null 2>&1; then
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS  FAIL: fixture suite (python3 is required)\n"
+    echo "  FAIL: fixture suite (python3 is required)"
+elif python3 tests/lsp/run_lsp_fixtures.py "$BLORP" tests/lsp/fixtures; then
+    PASS=$((PASS + 1))
+    echo "  PASS: fixture suite"
+else
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS  FAIL: fixture suite\n"
+    echo "  FAIL: fixture suite"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────

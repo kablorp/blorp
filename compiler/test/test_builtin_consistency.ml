@@ -182,7 +182,14 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "write_file";
       "getenv";
       "send_timeout";
+      "task_join_slot_probe_for_test";
+      "fiber_created_schedule_probe_for_test";
       "websocket_state_probe_for_test";
+      "wait_ready_to_park_probe_for_test";
+      "fiber_lifecycle_ready_to_park_probe_for_test";
+      "fiber_cancel_before_park_probe_for_test";
+      "current_timer_wait_install_probe_for_test";
+      "cooperative_checkpoint_probe_for_test";
       "blorp_dns_resolve_raw";
     ];
   List.iter
@@ -220,6 +227,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "send_timeout_attempt";
       "recv_timeout_attempt";
       "cancel_after_parked_for_test";
+      "cooperative_checkpoint_probe_for_test";
       "tls_state_probe_for_test";
       "blorp_tcp_accept";
       "blorp_tcp_connect";
@@ -228,6 +236,7 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "blorp_tcp_accept_raw";
       "blorp_tcp_connect_loopback_raw";
       "blorp_tcp_connect_ip_raw";
+      "blorp_tcp_connect_scoped_ip_raw";
       "blorp_tcp_connect_name_raw";
       "blorp_tcp_read_raw";
       "blorp_tcp_write_raw";
@@ -259,6 +268,12 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "try_recv";
       "try_send_attempt";
       "try_recv_attempt";
+      "task_join_slot_probe_for_test";
+      "fiber_created_schedule_probe_for_test";
+      "wait_ready_to_park_probe_for_test";
+      "fiber_lifecycle_ready_to_park_probe_for_test";
+      "fiber_cancel_before_park_probe_for_test";
+      "current_timer_wait_install_probe_for_test";
       "seal";
       "read";
       "write";
@@ -271,6 +286,73 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "blorp_tcp_set_timeout_listener_raw";
       "blorp_udp_bind_raw";
       "blorp_udp_bind_numeric_raw";
+      "blorp_udp_send_to_raw";
+      "blorp_udp_send_to_numeric_raw";
+      "parallel";
+    ];
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " may park a fiber")
+        true (may_park_fiber name))
+    [
+      "sleep";
+      "send";
+      "recv";
+      "send_timeout";
+      "recv_timeout";
+      "send_timeout_attempt";
+      "recv_timeout_attempt";
+      "blorp_tcp_accept";
+      "blorp_tcp_connect";
+      "blorp_tcp_read";
+      "blorp_tcp_write";
+      "blorp_tcp_accept_raw";
+      "blorp_tcp_connect_loopback_raw";
+      "blorp_tcp_connect_ip_raw";
+      "blorp_tcp_connect_scoped_ip_raw";
+      "blorp_tcp_connect_name_raw";
+      "blorp_tcp_read_raw";
+      "blorp_tcp_write_raw";
+      "blorp_tcp_write_all_raw";
+      "blorp_tls_connect_raw";
+      "blorp_tls_read_raw";
+      "blorp_tls_write_raw";
+      "blorp_tls_write_all_raw";
+      "blorp_websocket_connect_raw";
+      "blorp_websocket_receive_raw";
+      "blorp_websocket_send_text_raw";
+      "blorp_websocket_send_binary_raw";
+      "blorp_websocket_send_ping_raw";
+      "blorp_websocket_send_pong_raw";
+      "blorp_websocket_send_close_raw";
+      "blorp_udp_send_to_wait_raw";
+      "blorp_udp_send_to_wait_numeric_raw";
+      "blorp_udp_recv_from_raw";
+    ];
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " does not park a fiber")
+        false (may_park_fiber name))
+    [
+      "yield_now";
+      "cancel_after_parked_for_test";
+      "task_join_slot_probe_for_test";
+      "fiber_created_schedule_probe_for_test";
+      "wait_ready_to_park_probe_for_test";
+      "fiber_lifecycle_ready_to_park_probe_for_test";
+      "fiber_cancel_before_park_probe_for_test";
+      "current_timer_wait_install_probe_for_test";
+      "cooperative_checkpoint_probe_for_test";
+      "tls_state_probe_for_test";
+      "channel";
+      "try_send";
+      "try_recv";
+      "try_send_attempt";
+      "try_recv_attempt";
+      "seal";
+      "blorp_dns_resolve_raw";
       "blorp_udp_send_to_raw";
       "blorp_udp_send_to_numeric_raw";
       "parallel";
@@ -574,11 +656,11 @@ let test_fiber_intrusive_links_are_role_specific () =
   let required =
     [
       ("run queue link", "struct blorp_Fiber* run_next;");
-      ("channel wait link", "struct blorp_Fiber* wait_next;");
       ("object pool link", "struct blorp_Fiber* pool_next;");
-      ("timer drain link", "struct blorp_Fiber* timer_drain_next;");
+      ("timer heap uses waiter records", "blorp_TimerWaiter** items;");
+      ("channel waiter link", "struct blorp_ChannelFiberWaiter* next;");
       ("run queue pop uses run_next", "queue->head = f->run_next;");
-      ("channel enqueue uses wait_next", "(*tail)->wait_next = f");
+      ("channel enqueue uses waiter next", "(*tail)->next = waiter");
       ("object pool uses pool_next", "__fiber_object_pool = f->pool_next;");
     ]
   in
@@ -589,8 +671,390 @@ let test_fiber_intrusive_links_are_role_specific () =
   if contains_substring runtime "struct blorp_Fiber* next;" then
     Alcotest.fail
       "Fiber scheduler ownership must use role-specific intrusive links, not a \
-       shared next pointer for run queues, channel waits, object-pool reuse, \
-       and timer drain batches."
+       shared next pointer for run queues or object-pool reuse. Timer and \
+       channel waits use explicit waiter records with their own links."
+
+let test_scheduler_debug_observability_has_named_hooks () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("debug env gate", "BLORP_SCHEDULER_DEBUG");
+      ("debug enabled helper", "blorp_scheduler_debug_enabled");
+      ("fiber snapshot helper", "blorp_fiber_debug_snapshot");
+      ("fiber invariant helper", "blorp_scheduler_debug_assert_fiber");
+      ("debug abort helper", "blorp_scheduler_debug_abort_fiber");
+      ("queued plus parked invariant", "queued and parked");
+      ("running plus queued invariant", "running and queued");
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required
+
+let test_fiber_lifecycle_state_is_explicit () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("fiber state enum", "typedef enum blorp_FiberState");
+      ("free state", "BLORP_FIBER_FREE");
+      ("created state", "BLORP_FIBER_CREATED");
+      ("queued state", "BLORP_FIBER_QUEUED");
+      ("dispatched state", "BLORP_FIBER_DISPATCHED");
+      ("running state", "BLORP_FIBER_RUNNING");
+      ("ready-to-park state", "BLORP_FIBER_READY_TO_PARK");
+      ("parked state", "BLORP_FIBER_PARKED");
+      ("completed state", "BLORP_FIBER_COMPLETED");
+      ("fiber carries lifecycle state", "_Atomic int lifecycle_state;");
+      ("state name helper", "blorp_fiber_state_debug_name");
+      ("transition helper", "blorp_fiber_transition_state");
+      ("mark created helper", "blorp_fiber_mark_created");
+      ("mark queued helper", "blorp_fiber_mark_queued");
+      ("mark dispatched helper", "blorp_fiber_mark_dispatched");
+      ("mark running helper", "blorp_fiber_mark_running");
+      ("mark ready-to-park helper", "blorp_fiber_mark_ready_to_park");
+      ("mark parked helper", "blorp_fiber_mark_parked");
+      ("mark completed helper", "blorp_fiber_mark_completed");
+      ("mark free helper", "blorp_fiber_mark_free");
+      ("created queue helper", "blorp_fiber_prepare_created_for_queue");
+      ("created enqueue helper", "blorp_fiber_enqueue_created_runnable");
+      ( "created exclusive ownership invariant",
+        "created fiber is not exclusively owned by scheduler" );
+      ( "dispatched mirror invariant",
+        "dispatched fiber still queued, parked, or running" );
+      ("created schedule probe", "blorp_test_fiber_created_schedule_probe");
+      ("cancel-before-park probe", "blorp_test_fiber_cancel_before_park_probe");
+      ("recycled fibers clear coroutine pointer", "f->coro = NULL;");
+      ("completed fibers clear coroutine pointer", "fiber->coro = NULL;");
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  Alcotest.(check bool)
+    "new fibers no longer start as parked" false
+    (contains_substring runtime "f->parked = 1;");
+  Alcotest.(check bool)
+    "new fibers no longer schedule through parked wake wrapper" false
+    (contains_substring runtime "static void blorp_fiber_schedule(")
+
+let test_fiber_wake_cause_is_explicit () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("fiber wake cause enum", "typedef enum blorp_FiberWakeCause");
+      ("ready wake cause", "BLORP_WAKE_READY");
+      ("timeout wake cause", "BLORP_WAKE_TIMEOUT");
+      ("cancelled wake cause", "BLORP_WAKE_CANCELLED");
+      ("closed wake cause", "BLORP_WAKE_CLOSED");
+      ("sealed wake cause", "BLORP_WAKE_SEALED");
+      ("fiber carries wake cause", "_Atomic int wake_cause;");
+      ("wake cause name helper", "blorp_fiber_wake_cause_debug_name");
+      ("wake helper", "blorp_fiber_wake");
+      ( "cancel wake delegates to wake helper",
+        "blorp_fiber_wake(f, BLORP_WAKE_CANCELLED" );
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  Alcotest.(check bool)
+    "no separate cancel enqueue path" false
+    (contains_substring runtime "blorp_fiber_enqueue_cancel_wake")
+
+let test_fiber_wait_owner_is_explicit () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("fiber wait owner enum", "typedef enum blorp_FiberWaitOwnerKind");
+      ("no wait owner", "BLORP_WAIT_OWNER_NONE");
+      ("sleep wait owner", "BLORP_WAIT_OWNER_SLEEP");
+      ("task join wait owner", "BLORP_WAIT_OWNER_TASK_JOIN");
+      ("channel send wait owner", "BLORP_WAIT_OWNER_CHANNEL_SEND");
+      ("channel recv wait owner", "BLORP_WAIT_OWNER_CHANNEL_RECV");
+      ("select wait owner", "BLORP_WAIT_OWNER_SELECT");
+      ("io wait owner", "BLORP_WAIT_OWNER_IO");
+      ("fiber carries wait owner", "_Atomic int wait_owner_kind;");
+      ("fiber carries wait operation id", "_Atomic uint64_t wait_operation_id;");
+      ("fiber owns stable timer waiter", "blorp_TimerWaiter timer_waiter;");
+      ("global wait operation counter", "__blorp_next_wait_operation_id");
+      ("explicit wait operation type", "typedef struct blorp_FiberWaitOperation");
+      ("explicit wait operation carries fiber", "blorp_Fiber* fiber;");
+      ( "explicit wait operation carries owner",
+        "blorp_FiberWaitOwnerKind owner;" );
+      ("explicit wait operation carries id", "uint64_t id;");
+      ("wait owner name helper", "blorp_fiber_wait_owner_debug_name");
+      ("wait operation id helper", "blorp_fiber_current_wait_operation_id");
+      ( "shared wait operation validator",
+        "blorp_fiber_debug_assert_current_wait_operation" );
+      ("begin wait helper", "blorp_fiber_begin_wait");
+      ("prepare wait to park helper", "blorp_fiber_prepare_wait_to_park");
+      ("abandon wait before park helper", "blorp_fiber_abandon_wait_before_park");
+      ( "park takes explicit wait operation",
+        "blorp_fiber_park(blorp_FiberWaitOperation wait)" );
+      ("clear wait helper", "blorp_fiber_clear_wait");
+      ("snapshot includes wait owner", "wait_owner=%s");
+      ("snapshot includes wait id", "wait_operation_id=%llu");
+      ("timer stale guard", "stale timer wait operation");
+      ("parked owner invariant", "parked without wait owner");
+      ("ready-to-park lifecycle invariant", "ready to park but not running");
+      ( "ready-to-park wake invariant",
+        "ready to park without parked bit or pending wake" );
+      ("ready to park owner invariant", "wait ready to park without owner");
+      ("ready to park stale guard", "wait ready to park with stale operation");
+      ("abandon stale operation guard", "abandoning stale wait operation");
+      ("park stale operation guard", "park entered with stale wait operation");
+      ( "park requires ready-to-park lifecycle",
+        "park entered before ready-to-park lifecycle transition" );
+      ( "deterministic lifecycle ready-to-park probe",
+        "blorp_test_fiber_lifecycle_ready_to_park_probe" );
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  Alcotest.(check bool)
+    "fiber park is never called without a wait operation" false
+    (contains_substring runtime "blorp_fiber_park();");
+  Alcotest.(check bool)
+    "io waits abandon through the shared helper" false
+    (contains_substring runtime "blorp_fiber_clear_wait(self, \"io wait")
+
+let test_timer_waiters_carry_operation_identity () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("timer waiter record", "typedef struct blorp_TimerWaiter");
+      ("timer waiter carries fiber", "blorp_Fiber* fiber;");
+      ("timer waiter carries wait operation", "blorp_FiberWaitOperation wait;");
+      ("timer waiter carries deadline", "uint64_t deadline_ns;");
+      ("timer waiter carries heap index", "long heap_index;");
+      ("timer waiter carries wake cause", "blorp_FiberWakeCause wake_cause;");
+      ("fiber owns stable timer waiter", "blorp_TimerWaiter timer_waiter;");
+      ("timer heap stores waiter records", "blorp_TimerWaiter** items;");
+      ("timer waiter prepare helper", "blorp_timer_waiter_prepare");
+      ("timer wait install helper", "blorp_fiber_install_timer_wait");
+      ("timer wait remove helper", "blorp_fiber_remove_timer_wait");
+      ( "timer wait remove stale guard",
+        "timer wait removed for different wait operation" );
+      ("timer waiter current helper", "blorp_timer_waiter_current");
+      ("timer waiter wake helper", "blorp_timer_waiter_wake");
+      ("timer drain uses stack batch", "blorp_TimerWaiter* stack_expired[64];");
+      ("timer drain chunks expired waiters", "bool more_expired = false;");
+      ( "timer drain wakes batched waiters",
+        "stack_expired[i], BLORP_WAKE_TIMEOUT" );
+      ("timer stale wait guard", "stale timer wait operation");
+      ( "timer waiter stale operation guard",
+        "timer waiter prepared for stale wait operation" );
+      ( "deterministic current timer install probe",
+        "blorp_test_current_timer_wait_install_probe" );
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  Alcotest.(check bool)
+    "fiber no longer stores timer heap index directly" false
+    (contains_substring runtime "long timer_index;");
+  Alcotest.(check bool)
+    "fiber no longer stores timer wait id directly" false
+    (contains_substring runtime "_Atomic uint64_t timer_wait_operation_id;");
+  Alcotest.(check bool)
+    "production timer waits do not prepare self timer waiter directly" false
+    (contains_substring runtime
+       "blorp_timer_waiter_prepare(\n                &self->timer_waiter")
+
+let test_timeout_arithmetic_is_centralized () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("named millisecond to nanosecond constant", "BLORP_NSEC_PER_MSEC");
+      ("saturating timeout conversion", "blorp_timeout_ms_to_ns_saturated");
+      ("saturating monotonic deadline", "blorp_deadline_ns_from_start_ms");
+      ("saturating realtime deadline", "blorp_realtime_deadline_from_now_ms");
+      ("deterministic timeout probe", "blorp_test_timeout_arithmetic_probe");
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  List.iter
+    (fun name ->
+      Alcotest.(check bool)
+        (name ^ " was removed") false
+        (contains_substring runtime name))
+    [
+      "__blorp_deadline_ns_from_timeout_ms";
+      "__blorp_realtime_deadline_from_timeout_ms";
+      "__ch_monotonic_deadline_from_timeout_ms";
+      "__ch_realtime_deadline_from_timeout_ms";
+      "blorp_select_deadline_from_start";
+      "__process_deadline_from_now_ms";
+    ]
+
+let test_channel_waiters_carry_operation_identity () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("channel waiter record", "typedef struct blorp_ChannelFiberWaiter");
+      ("channel waiter carries wait operation", "blorp_FiberWaitOperation wait;");
+      ("channel waiter carries kind", "blorp_ChannelWaitKind kind;");
+      ("channel waiter carries deadline", "uint64_t deadline_ns;");
+      ( "channel waiter carries wake reason",
+        "blorp_ChannelWakeReason wake_reason;" );
+      ( "channel send queue uses waiter records",
+        "blorp_ChannelFiberWaiter* send_waiters_head;" );
+      ( "channel recv queue uses waiter records",
+        "blorp_ChannelFiberWaiter* recv_waiters_head;" );
+      ("channel waiter init helper", "__ch_fiber_waiter_init");
+      ("channel waiter current helper", "__ch_fiber_waiter_current");
+      ("channel stale wait guard", "stale channel wait operation");
+      ( "channel waiter stale operation guard",
+        "channel waiter created for stale wait operation" );
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  Alcotest.(check bool)
+    "channel send queue no longer stores raw fibers" false
+    (contains_substring runtime "blorp_Fiber* send_waiters_head;");
+  Alcotest.(check bool)
+    "channel recv queue no longer stores raw fibers" false
+    (contains_substring runtime "blorp_Fiber* recv_waiters_head;")
+
+let test_select_waiters_carry_operation_identity () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("select waiter record", "typedef struct blorp_ChannelSelectWaiter");
+      ("select waiter carries wait operation", "blorp_FiberWaitOperation wait;");
+      ("select waiter carries wake cause", "blorp_FiberWakeCause wake_cause;");
+      ("select waiter init helper", "__ch_select_waiter_init");
+      ("select waiter current helper", "__ch_select_waiter_current");
+      ("select waiter wake helper", "__ch_select_waiter_wake");
+      ("select stale wait guard", "stale select wait operation");
+      ( "select waiter stale operation guard",
+        "select waiter created for stale wait operation" );
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required
+
+let test_task_join_waiters_carry_operation_identity () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ("task join waiter record", "typedef struct blorp_TaskJoinWaiter");
+      ( "task join waiter carries wait operation",
+        "blorp_FiberWaitOperation wait;" );
+      ("task join waiter carries wake cause", "blorp_FiberWakeCause wake_cause;");
+      ( "task join slot state enum",
+        "typedef enum {\n    BLORP_TASK_JOIN_SLOT_EMPTY," );
+      ("task stores join slot state", "blorp_TaskJoinSlotState join_slot_state;");
+      ("task stores join waiter record", "blorp_TaskJoinWaiter* waiting_joiner;");
+      ("task join slot clear helper", "__blorp_task_join_slot_clear_locked");
+      ("task join waiter init helper", "__blorp_task_join_waiter_init");
+      ("task join waiter current helper", "__blorp_task_join_waiter_current");
+      ("task join waiter wake helper", "__blorp_task_join_waiter_wake");
+      ("task join stale wait guard", "stale task join wait operation");
+      ( "task join waiter stale operation guard",
+        "task join waiter created for stale wait operation" );
+      ("task join second waiter guard", "task already has a current join waiter");
+      ("deterministic task join slot probe", "blorp_test_task_join_slot_probe");
+      ( "task completion wakes joiner before unlocking task mutex",
+        "__blorp_task_join_waiter_wake(waiter, BLORP_WAKE_READY);\n\
+        \    pthread_mutex_unlock(&task->mutex);" );
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required;
+  Alcotest.(check bool)
+    "task no longer stores raw waiting fiber" false
+    (contains_substring runtime "blorp_Fiber* waiting_fiber;")
+
+let test_concurrent_task_window_cleanup_owns_active_slots () =
+  let runtime =
+    read_first_existing
+      [ "compiler/lib/runtime.c"; "../lib/runtime.c"; "lib/runtime.c" ]
+  in
+  let required =
+    [
+      ( "task window cleanup helper",
+        "blorp_concurrent_task_window_cancel_join_active" );
+      ("task window cleanup kind", "BLORP_CANCEL_CLEANUP_TASK_WINDOW");
+      ("task window lifecycle state", "BLORP_CONCURRENT_TASK_WINDOW_ACTIVE");
+      ("task window active guard", "blorp_concurrent_task_window_check_active");
+      ( "task window frames are marked distinctly",
+        "cleanup->kind = BLORP_CANCEL_CLEANUP_TASK_WINDOW;" );
+      ( "cancellation drain flushes task windows first",
+        "blorp_concurrent_task_window_flush_pending(\n\
+        \                (blorp_ConcurrentTaskWindow*)f->value);" );
+      ( "task window cleanup flushes batched spawns",
+        "blorp_concurrent_task_window_flush_pending(window);" );
+      ( "task window cleanup pops task cleanup frames",
+        "__blorp_task_cleanup_pop_slot_slow(&window->tasks[i]);" );
+      ( "cancellation drain deactivates detached slot frames",
+        "blorp_task_cleanup_deactivate_slot_in_frame_list(\n\
+        \            frames,\n\
+        \            &window->tasks[i]);" );
+      ( "cancellation drain joins task windows before generic cleanup",
+        "blorp_concurrent_task_window_cancel_join_active_from_cancel_frames(\n\
+        \                (blorp_ConcurrentTaskWindow*)f->value,\n\
+        \                frame);" );
+      ( "cancellation drain delays cleanup-frame storage free",
+        "f->release_value =\n\
+        \                blorp_concurrent_task_window_cleanup_storage;" );
+      ( "task window cleanup cancels active slots",
+        "blorp_task_cancel_join_release(task);" );
+      ("task window cleanup nulls active slots", "window->tasks[i] = NULL;");
+      ( "task window cleanup marks ended",
+        "window->state = BLORP_CONCURRENT_TASK_WINDOW_ENDED;" );
+      ( "deterministic task window cleanup probe",
+        "blorp_test_task_window_pending_cleanup_probe" );
+    ]
+  in
+  List.iter
+    (fun (name, needle) ->
+      Alcotest.(check bool) name true (contains_substring runtime needle))
+    required
 
 let test_cloexec_helpers_declare_fallback_locals_once () =
   let runtime =
@@ -1453,6 +1917,26 @@ let suite =
           test_list_ir_hofs_have_no_runtime_c_abi;
         Alcotest.test_case "fiber intrusive links are role-specific" `Quick
           test_fiber_intrusive_links_are_role_specific;
+        Alcotest.test_case "scheduler debug observability has named hooks"
+          `Quick test_scheduler_debug_observability_has_named_hooks;
+        Alcotest.test_case "fiber lifecycle state is explicit" `Quick
+          test_fiber_lifecycle_state_is_explicit;
+        Alcotest.test_case "fiber wake cause is explicit" `Quick
+          test_fiber_wake_cause_is_explicit;
+        Alcotest.test_case "fiber wait owner is explicit" `Quick
+          test_fiber_wait_owner_is_explicit;
+        Alcotest.test_case "timer waiters carry operation identity" `Quick
+          test_timer_waiters_carry_operation_identity;
+        Alcotest.test_case "timeout arithmetic is centralized" `Quick
+          test_timeout_arithmetic_is_centralized;
+        Alcotest.test_case "channel waiters carry operation identity" `Quick
+          test_channel_waiters_carry_operation_identity;
+        Alcotest.test_case "select waiters carry operation identity" `Quick
+          test_select_waiters_carry_operation_identity;
+        Alcotest.test_case "task join waiters carry operation identity" `Quick
+          test_task_join_waiters_carry_operation_identity;
+        Alcotest.test_case "concurrent task window cleanup owns active slots"
+          `Quick test_concurrent_task_window_cleanup_owns_active_slots;
         Alcotest.test_case "cloexec helpers declare fallback locals once" `Quick
           test_cloexec_helpers_declare_fallback_locals_once;
         Alcotest.test_case "Float16 vector reader ABI uses feature guard" `Quick

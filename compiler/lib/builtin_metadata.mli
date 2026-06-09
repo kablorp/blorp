@@ -7,7 +7,11 @@ type builtin_effect =
   | Cancellation_point
       (** Cooperative boundary where a task can observe cancellation. Most are
           fiber park points; [yield_now] is included because it can also unwind
-          a cancelled task. *)
+          a cancelled task without being owned by a wait structure. *)
+  | Fiber_parking
+      (** Operation that may park the current fiber and release the scheduler
+          OS worker until readiness, timeout, seal, close, or cancellation
+          wakes the exact wait operation. *)
   | Os_worker_blocking
       (** Operation that blocks a scheduler OS worker instead of parking the
           current fiber. This is intentionally distinct from
@@ -38,5 +42,6 @@ val has_effect : string -> builtin_effect -> bool
 val is_impure : string -> bool
 val is_parallel_boundary : string -> bool
 val is_cancellation_point : string -> bool
+val may_park_fiber : string -> bool
 val is_os_worker_blocking : string -> bool
 val special_inference : string -> special_inference option

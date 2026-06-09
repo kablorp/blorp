@@ -80,6 +80,96 @@ let word_at (text : string) ~(line : int) ~(col : int) : string option =
           String.sub line_text start_col (end_col - start_col))
 
 (* ============================================================================
+   Source context lookup — conservative line-local cursor classification
+   ============================================================================ *)
+
+let clamp_col text col =
+  let len = String.length text in
+  max 0 (min col len)
+
+let identifier_start_at_cursor text col =
+  scan_ident_start text (clamp_col text col)
+
+let rec last_index_satisfying text start predicate =
+  if start < 0 then None
+  else if predicate start then Some start
+  else last_index_satisfying text (start - 1) predicate
+
+let last_char_before text ch before =
+  let start = min (before - 1) (String.length text - 1) in
+  last_index_satisfying text start (fun i -> text.[i] = ch)
+
+let last_arrow_before text before =
+  let start = min (before - 2) (String.length text - 2) in
+  last_index_satisfying text start (fun i ->
+      text.[i] = '-' && text.[i + 1] = '>')
+
+let char_between text ch start stop =
+  let rec loop i = if i >= stop then false else text.[i] = ch || loop (i + 1) in
+  loop (max 0 start)
+
+let split_words text =
+  text |> String.trim |> String.split_on_char ' '
+  |> List.filter (fun word -> word <> "")
+
+let is_identifier_text text =
+  let len = String.length text in
+  len > 0
+  && ((text.[0] >= 'a' && text.[0] <= 'z')
+     || (text.[0] >= 'A' && text.[0] <= 'Z')
+     || text.[0] = '_')
+  &&
+  let rec loop i =
+    if i >= len then true else is_ident_char text.[i] && loop (i + 1)
+  in
+  loop 1
+
+let binding_segment_before_colon text colon_index =
+  let last_delim =
+    List.filter_map
+      (fun ch -> last_char_before text ch colon_index)
+      [ '('; '['; '{'; ',' ]
+    |> List.fold_left max (-1)
+  in
+  String.sub text (last_delim + 1) (colon_index - last_delim - 1)
+
+let segment_can_introduce_type_annotation segment =
+  match split_words segment with
+  | [ name ] -> is_identifier_text name
+  | [ "var"; name ] | [ "private"; name ] | [ "const"; name ] ->
+      is_identifier_text name
+  | [ "private"; "var"; name ] | [ "private"; "const"; name ] ->
+      is_identifier_text name
+  | _ -> false
+
+(** Completion and hover often run while the source is temporarily incomplete,
+    so the parser cannot provide a cursor context. Keep this line-local detector
+    conservative: it recognizes return-type arrows and annotation colons whose
+    left side looks like a binding/field/type parameter, and it rejects contexts
+    already past an initializer or single-line function body. *)
+let is_type_name_context (text : string) (col : int) =
+  let ident_start = identifier_start_at_cursor text col in
+  let has_invalidator_after start =
+    char_between text '=' start ident_start
+    || char_between text ':' start ident_start
+  in
+  match last_arrow_before text ident_start with
+  | Some arrow_index when not (has_invalidator_after (arrow_index + 2)) -> true
+  | _ -> (
+      match last_char_before text ':' ident_start with
+      | Some colon_index
+        when (not (char_between text '=' (colon_index + 1) ident_start))
+             && segment_can_introduce_type_annotation
+                  (binding_segment_before_colon text colon_index) ->
+          true
+      | _ -> false)
+
+let is_type_name_context_at (text : string) ~(line : int) ~(col : int) =
+  match line_at text ~line with
+  | None -> false
+  | Some line_text -> is_type_name_context line_text col
+
+(* ============================================================================
    Expression lookup — find the deepest expression at a cursor position
    ============================================================================ *)
 
@@ -137,6 +227,10 @@ let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
     declarations in that document. *)
 let loc_matches_file ?file (loc : loc) =
   match file with None -> true | Some expected -> loc.loc_file = Some expected
+
+let loc_same_position a b =
+  a.line = b.line && a.column = b.column
+  && Option.equal String.equal a.loc_file b.loc_file
 
 let func_header_line decl_loc (fd : func_decl) =
   match fd.func_params with
@@ -230,8 +324,240 @@ let find_typed_param_at ?file (program : Typed_ast.program) ~(line : int)
         | DeclVar _ | DeclRecord _ | DeclTypeAlias _ | DeclOther -> None)
 
 (* ============================================================================
-   Definition lookup — for go-to-definition
+   Record field lookup
    ============================================================================ *)
+
+let expr_type_opt expr =
+  match expr.expr_type_info with
+  | Some { semantic_ty; _ } -> Some semantic_ty
+  | None -> None
+
+let instantiate_type_params type_params args ty =
+  if List.length type_params <> List.length args then ty
+  else
+    let subst = List.combine type_params args in
+    Types.map_type_expr
+      (function
+        | TyVar name | TyNamed (name, []) -> List.assoc_opt name subst
+        | TyBoundVar param -> List.assoc_opt param.param_name subst
+        | _ -> None)
+      ty
+
+type record_field_hit = {
+  field_name : string;
+  field_type : type_expr;
+  field_loc : loc;
+  occurrence_loc : loc;
+}
+
+let record_field_info ?(module_aliases = []) (env : Env.env) receiver_ty
+    field_name : (loc * type_expr) option =
+  let resolution_ctx = Type_resolution.make_context ~env ~module_aliases () in
+  match Type_resolution.annotation_canonical resolution_ctx receiver_ty with
+  | TyNamed (record_name, type_args) -> (
+      match Env.get_record env record_name with
+      | Some (type_params, fields) ->
+          fields
+          |> List.find_opt (fun (field : Ast.field_decl) ->
+              field.field_name = field_name)
+          |> Option.map (fun (field : Ast.field_decl) ->
+              ( field.field_loc,
+                instantiate_type_params type_params type_args field.field_type
+              ))
+      | None -> None)
+  | _ -> None
+
+let field_span_after_receiver text receiver_loc field_name :
+    (int * int * int) option =
+  match line_at text ~line:(receiver_loc.end_line - 1) with
+  | None -> None
+  | Some line_text ->
+      let field_start = receiver_loc.end_column in
+      let field_end = field_start + String.length field_name in
+      if
+        receiver_loc.end_line > 0 && field_start > 0
+        && field_end <= String.length line_text
+        && line_text.[field_start - 1] = '.'
+        && String.sub line_text field_start (String.length field_name)
+           = field_name
+      then Some (receiver_loc.end_line - 1, field_start, field_end)
+      else None
+
+let position_inside_span ~line ~col (span_line, start_col, end_col) =
+  line = span_line && start_col <= col && col <= end_col
+
+let record_field_loc ?module_aliases (env : Env.env) receiver_ty field_name :
+    loc option =
+  record_field_info ?module_aliases env receiver_ty field_name |> Option.map fst
+
+let next_non_space line_text start stop =
+  let rec loop i =
+    if i >= stop then None
+    else if line_text.[i] = ' ' || line_text.[i] = '\t' then loop (i + 1)
+    else Some i
+  in
+  loop start
+
+let only_spaces_between line_text start stop =
+  let rec loop i =
+    if i >= stop then true
+    else (line_text.[i] = ' ' || line_text.[i] = '\t') && loop (i + 1)
+  in
+  loop start
+
+let occurrence_loc_of_span ?file line start_col end_col =
+  {
+    line = line + 1;
+    column = start_col + 1;
+    end_line = line + 1;
+    end_column = end_col + 1;
+    loc_file = file;
+  }
+
+let field_assignment_loc_before_value ?file text field_name value_expr :
+    loc option =
+  let value_line = value_expr.expr_loc.line - 1 in
+  let value_col = max 0 (value_expr.expr_loc.column - 1) in
+  match line_at text ~line:value_line with
+  | None -> None
+  | Some line_text ->
+      let stop = min value_col (String.length line_text) in
+      let rec scan i best =
+        if i >= stop then best
+        else if is_ident_char line_text.[i] then
+          let start_col = scan_ident_start line_text i in
+          let end_col = scan_ident_end line_text i in
+          let word = String.sub line_text start_col (end_col - start_col) in
+          let best =
+            if word = field_name then
+              match next_non_space line_text end_col stop with
+              | Some eq_col
+                when line_text.[eq_col] = '='
+                     && only_spaces_between line_text (eq_col + 1) stop ->
+                  Some
+                    (occurrence_loc_of_span ?file value_line start_col end_col)
+              | _ -> best
+            else best
+          in
+          scan end_col best
+        else scan (i + 1) best
+      in
+      scan 0 None
+
+let record_assignment_fields = function
+  | ERecord fields | ERecordUpdate (_, fields) -> Some fields
+  | _ -> None
+
+let record_assignment_receiver_type expr =
+  match expr.expr_desc with
+  | ERecord _ -> expr_type_opt expr
+  | ERecordUpdate (base, _) -> (
+      match expr_type_opt expr with
+      | Some _ as ty -> ty
+      | None -> expr_type_opt base)
+  | _ -> None
+
+let record_field_assignment_hits_for_expr ?(module_aliases = []) ?file
+    (env : Env.env) text expr : record_field_hit list =
+  match
+    ( record_assignment_fields expr.expr_desc,
+      record_assignment_receiver_type expr )
+  with
+  | Some fields, Some receiver_ty ->
+      fields
+      |> List.filter_map (fun (field_name, value_expr) ->
+          match
+            ( field_assignment_loc_before_value ?file text field_name value_expr,
+              record_field_info ~module_aliases env receiver_ty field_name )
+          with
+          | Some occurrence_loc, Some (field_loc, field_type) ->
+              Some { field_name; field_type; field_loc; occurrence_loc }
+          | _ -> None)
+  | _ -> []
+
+let find_record_field_assignment_hit ?(module_aliases = []) ?file
+    (env : Env.env) (program : program) ~(text : string) ~(line : int)
+    ~(col : int) : record_field_hit option =
+  let best = ref None in
+  let best_start = ref (-1, -1) in
+  let loc_starts_after a (line_b, col_b) =
+    a.line > line_b || (a.line = line_b && a.column > col_b)
+  in
+  let consider expr =
+    let expr_start = (expr.expr_loc.line, expr.expr_loc.column) in
+    if loc_starts_after expr.expr_loc !best_start then
+      record_field_assignment_hits_for_expr ~module_aliases ?file env text expr
+      |> List.iter (fun hit ->
+          if col_inside_name hit.occurrence_loc hit.field_name ~line ~col then begin
+            best := Some hit;
+            best_start := expr_start
+          end)
+  in
+  let rec walk_expr expr =
+    (match expr.expr_desc with
+    | ERecord _ | ERecordUpdate _ -> consider expr
+    | _ -> ());
+    List.iter walk_expr (expr_children expr)
+  in
+  let rec walk_decl decl =
+    match decl.decl_desc with
+    | DFunc fd -> fd.func_body |> func_body_expr_opt |> Option.iter walk_expr
+    | DVar vd -> walk_expr vd.var_value
+    | DImpl impl ->
+        List.iter
+          (fun fd ->
+            fd.func_body |> func_body_expr_opt |> Option.iter walk_expr)
+          impl.impl_methods
+    | DPrivate inner -> walk_decl inner
+    | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ -> ()
+  in
+  List.iter walk_decl program;
+  !best
+
+let find_record_field_definition (env : Env.env) (program : program)
+    ~(text : string) ~(line : int) ~(col : int) : loc option =
+  let field_name_opt = word_at text ~line ~col in
+  let best = ref None in
+  let best_col = ref (-1) in
+  let consider receiver field_name =
+    match field_name_opt with
+    | Some wanted when wanted = field_name -> (
+        match field_span_after_receiver text receiver.expr_loc field_name with
+        | Some ((_, start_col, _end_col) as span)
+          when position_inside_span ~line ~col span && start_col >= !best_col
+          -> (
+            match expr_type_opt receiver with
+            | Some receiver_ty -> (
+                match record_field_loc env receiver_ty field_name with
+                | Some loc ->
+                    best := Some loc;
+                    best_col := start_col
+                | None -> ())
+            | None -> ())
+        | _ -> ())
+    | _ -> ()
+  in
+  let rec walk_expr expr =
+    match expr.expr_desc with
+    | EFieldAccess (receiver, field_name) ->
+        consider receiver field_name;
+        walk_expr receiver
+    | _ -> List.iter walk_expr (expr_children expr)
+  in
+  let rec walk_decl decl =
+    match decl.decl_desc with
+    | DFunc fd -> fd.func_body |> func_body_expr_opt |> Option.iter walk_expr
+    | DVar vd -> walk_expr vd.var_value
+    | DImpl impl ->
+        List.iter
+          (fun fd ->
+            fd.func_body |> func_body_expr_opt |> Option.iter walk_expr)
+          impl.impl_methods
+    | DPrivate inner -> walk_decl inner
+    | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ -> ()
+  in
+  List.iter walk_decl program;
+  !best
 
 let loc_end_line loc = max loc.line loc.end_line
 
@@ -248,6 +574,304 @@ let function_body_reaches_target_line fd ~target_line =
   match func_body_end_line fd with
   | Some body_end_line -> target_line <= body_end_line
   | None -> false
+
+type type_param_hit = {
+  type_param_name : string;
+  type_param_label : string;
+  type_param_loc : loc;
+}
+
+let skip_spaces text stop i =
+  let rec loop i =
+    if i >= stop || i >= String.length text || text.[i] <> ' ' then i
+    else loop (i + 1)
+  in
+  loop i
+
+let type_param_name_span_in_segment text segment_start segment_stop :
+    (string * int * int) option =
+  let start = skip_spaces text segment_stop segment_start in
+  if start >= segment_stop then None
+  else if text.[start] = '#' then
+    let name_start = start in
+    let ident_start = start + 1 in
+    if ident_start < segment_stop && is_ident_char text.[ident_start] then
+      let name_end = scan_ident_end text ident_start in
+      Some
+        ( String.sub text name_start (name_end - name_start),
+          name_start,
+          name_end )
+    else None
+  else if
+    (text.[start] >= 'a' && text.[start] <= 'z')
+    || (text.[start] >= 'A' && text.[start] <= 'Z')
+    || text.[start] = '_'
+  then
+    let name_end = scan_ident_end text start in
+    Some (String.sub text start (name_end - start), start, name_end)
+  else None
+
+let rec matching_bracket text open_index depth i =
+  if i >= String.length text then None
+  else
+    match text.[i] with
+    | '[' -> matching_bracket text open_index (depth + 1) (i + 1)
+    | ']' when depth = 1 -> Some i
+    | ']' -> matching_bracket text open_index (depth - 1) (i + 1)
+    | _ -> matching_bracket text open_index depth (i + 1)
+
+let first_type_param_list_after_name line_text name =
+  let name_len = String.length name in
+  let rec find_name start =
+    if start + name_len > String.length line_text then None
+    else if String.sub line_text start name_len = name then
+      Some (start + name_len)
+    else find_name (start + 1)
+  in
+  match find_name 0 with
+  | None -> None
+  | Some after_name -> (
+      let rec find_open i =
+        if i >= String.length line_text then None
+        else
+          match line_text.[i] with
+          | '[' -> Some i
+          | '(' | ':' | '=' -> None
+          | _ -> find_open (i + 1)
+      in
+      match find_open after_name with
+      | None -> None
+      | Some open_index -> (
+          match matching_bracket line_text open_index 1 (open_index + 1) with
+          | Some close_index -> Some (open_index, close_index)
+          | None -> None))
+
+let type_param_decl_span line_text ~decl_name ~param_name =
+  match first_type_param_list_after_name line_text decl_name with
+  | None -> None
+  | Some (open_index, close_index) ->
+      let rec loop segment_start i =
+        if i > close_index then None
+        else if i = close_index || line_text.[i] = ',' then
+          let match_segment =
+            match type_param_name_span_in_segment line_text segment_start i with
+            | Some (name, start_col, end_col) when name = param_name ->
+                Some (start_col, end_col)
+            | _ -> None
+          in
+          match match_segment with
+          | Some _ as span -> span
+          | None -> loop (i + 1) (i + 1)
+        else loop segment_start (i + 1)
+      in
+      loop (open_index + 1) (open_index + 1)
+
+let type_param_loc_for_decl_name ?file text decl_loc decl_name param_name =
+  if not (loc_matches_file ?file decl_loc) then None
+  else
+    let line_index = decl_loc.line - 1 in
+    match line_at text ~line:line_index with
+    | None -> None
+    | Some line_text ->
+        type_param_decl_span line_text ~decl_name ~param_name
+        |> Option.map (fun (start_col, end_col) ->
+            {
+              line = decl_loc.line;
+              column = start_col + 1;
+              end_line = decl_loc.line;
+              end_column = end_col + 1;
+              loc_file = decl_loc.loc_file;
+            })
+
+let type_param_hit_for_decl ?file text decl_loc decl_name type_params name =
+  match
+    List.find_opt (fun param -> Ast.type_param_name param = name) type_params
+  with
+  | None -> None
+  | Some param ->
+      type_param_loc_for_decl_name ?file text decl_loc decl_name name
+      |> Option.map (fun type_param_loc ->
+          {
+            type_param_name = name;
+            type_param_label =
+              Printf.sprintf "type parameter %s"
+                (Ast.type_param_to_parser_string param);
+            type_param_loc;
+          })
+
+let cursor_is_type_param_decl_site hit ~line ~col =
+  col_inside_name hit.type_param_loc hit.type_param_name ~line ~col
+
+let function_body_or_header_reaches_target_line decl_loc fd ~target_line =
+  decl_loc.line <= target_line
+  && (target_line = decl_loc.line
+     || function_body_reaches_target_line fd ~target_line)
+
+let find_function_type_param_at ?file (program : program) ~(text : string)
+    ~(line : int) ~(col : int) : type_param_hit option =
+  let target_line = line + 1 in
+  match word_at text ~line ~col with
+  | None -> None
+  | Some name ->
+      let in_type_context = is_type_name_context_at text ~line ~col in
+      let check_func decl_loc fd =
+        match fd.func_name with
+        | None -> None
+        | Some decl_name ->
+            if
+              function_body_or_header_reaches_target_line decl_loc fd
+                ~target_line
+            then
+              match
+                type_param_hit_for_decl ?file text decl_loc decl_name
+                  fd.func_type_params name
+              with
+              | Some hit
+                when in_type_context
+                     || cursor_is_type_param_decl_site hit ~line ~col ->
+                  Some hit
+              | _ -> None
+            else None
+      in
+      let rec check_decl decl =
+        match decl.decl_desc with
+        | DFunc fd -> check_func decl.decl_loc fd
+        | DImpl impl ->
+            List.find_map (check_func decl.decl_loc) impl.impl_methods
+        | DPrivate inner -> check_decl inner
+        | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ | DVar _ ->
+            None
+      in
+      List.find_map check_decl program
+
+let identifier_spans_for_line (line_text : string) : (string * int * int) list =
+  let len = String.length line_text in
+  let rec loop i acc =
+    if i >= len then List.rev acc
+    else
+      match dim_span_starting_at line_text i with
+      | Some (start_col, end_col) ->
+          let name = String.sub line_text start_col (end_col - start_col) in
+          loop end_col ((name, start_col, end_col) :: acc)
+      | None ->
+          if
+            (line_text.[i] >= 'a' && line_text.[i] <= 'z')
+            || (line_text.[i] >= 'A' && line_text.[i] <= 'Z')
+            || line_text.[i] = '_'
+          then
+            let end_col = scan_ident_end line_text i in
+            let name = String.sub line_text i (end_col - i) in
+            loop end_col ((name, i, end_col) :: acc)
+          else loop (i + 1) acc
+  in
+  loop 0 []
+
+let type_param_occurrence_loc ?file ~line start_col end_col =
+  {
+    line = line + 1;
+    column = start_col + 1;
+    end_line = line + 1;
+    end_column = end_col + 1;
+    loc_file = file;
+  }
+
+let collect_function_type_param_occurrences ?file (program : program)
+    ~(text : string) (target : type_param_hit) : loc list =
+  let function_matches decl_loc fd =
+    match fd.func_name with
+    | None -> false
+    | Some decl_name -> (
+        match
+          type_param_hit_for_decl ?file text decl_loc decl_name
+            fd.func_type_params target.type_param_name
+        with
+        | Some hit -> loc_same_position hit.type_param_loc target.type_param_loc
+        | None -> false)
+  in
+  let collect_from_func decl_loc fd =
+    let start_line = decl_loc.line - 1 in
+    let end_line =
+      match func_body_end_line fd with
+      | Some line -> max decl_loc.line line - 1
+      | None -> start_line
+    in
+    let rec collect_line line acc =
+      if line > end_line then List.rev acc
+      else
+        match line_at text ~line with
+        | None -> collect_line (line + 1) acc
+        | Some line_text ->
+            let line_occurrences =
+              identifier_spans_for_line line_text
+              |> List.filter_map (fun (name, start_col, end_col) ->
+                  if name <> target.type_param_name then None
+                  else
+                    let loc =
+                      type_param_occurrence_loc ?file ~line start_col end_col
+                    in
+                    if loc_same_position loc target.type_param_loc then Some loc
+                    else if is_type_name_context line_text start_col then
+                      Some loc
+                    else None)
+            in
+            collect_line (line + 1) (List.rev_append line_occurrences acc)
+    in
+    collect_line start_line []
+  in
+  let rec collect_decl decl =
+    match decl.decl_desc with
+    | DFunc fd when function_matches decl.decl_loc fd ->
+        collect_from_func decl.decl_loc fd
+    | DImpl impl -> (
+        match
+          List.find_opt (function_matches decl.decl_loc) impl.impl_methods
+        with
+        | Some fd -> collect_from_func decl.decl_loc fd
+        | None -> [])
+    | DPrivate inner -> collect_decl inner
+    | DFunc _ | DVar _ | DType _ | DRecord _ | DImport _ | DTrait _
+    | DTypeAlias _ ->
+        []
+  in
+  List.find_map
+    (fun decl ->
+      match collect_decl decl with
+      | [] -> None
+      | occurrences -> Some occurrences)
+    program
+  |> Option.value ~default:[]
+
+(* ============================================================================
+   Definition lookup — for go-to-definition
+   ============================================================================ *)
+
+let loc_at_declared_name loc ~name ~keyword_prefix =
+  let column = loc.column + String.length keyword_prefix in
+  {
+    loc with
+    column;
+    end_line = loc.line;
+    end_column = column + String.length name;
+  }
+
+let type_decl_name_loc loc (td : type_decl) =
+  let keyword_prefix =
+    if td.type_is_resource then "resource type "
+    else if td.type_is_enum then "enum "
+    else if td.type_variants = [] then "type "
+    else "union "
+  in
+  loc_at_declared_name loc ~name:td.type_name ~keyword_prefix
+
+let record_decl_name_loc loc (rd : record_decl) =
+  let keyword_prefix = if rd.record_is_value then "struct " else "record " in
+  loc_at_declared_name loc ~name:rd.record_name ~keyword_prefix
+
+let type_alias_name_loc loc (ad : type_alias_decl) =
+  let keyword_prefix =
+    if ad.alias_is_opaque then "opaque type " else "type alias "
+  in
+  loc_at_declared_name loc ~name:ad.alias_name ~keyword_prefix
 
 (** Find the definition location of a name in the program.
     Searches top-level declarations first, then local definitions
@@ -271,18 +895,24 @@ let find_definition (program : program) ~(name : string) ~(line : int)
           match d.decl_desc with
           | DFunc fd when fd.func_name = Some name -> Some d.decl_loc
           | DVar vd when vd.var_name = Some name -> Some d.decl_loc
-          | DType td when td.type_name = name -> Some d.decl_loc
+          | DType td when td.type_name = name ->
+              Some (type_decl_name_loc d.decl_loc td)
           | DType td -> (
               match
                 List.find_opt
                   (fun (v : variant) -> v.variant_name = name)
                   td.type_variants
               with
-              | Some _ -> Some d.decl_loc
+              | Some variant ->
+                  Some
+                    (loc_at_declared_name variant.variant_loc
+                       ~name:variant.variant_name ~keyword_prefix:"")
               | None -> None)
-          | DRecord rd when rd.record_name = name -> Some d.decl_loc
+          | DRecord rd when rd.record_name = name ->
+              Some (record_decl_name_loc d.decl_loc rd)
           | DTrait td when td.trait_name = name -> Some d.decl_loc
-          | DTypeAlias ad when ad.alias_name = name -> Some d.decl_loc
+          | DTypeAlias ad when ad.alias_name = name ->
+              Some (type_alias_name_loc d.decl_loc ad)
           | DPrivate inner -> find_in_decls [ inner ]
           | _ -> None
         in

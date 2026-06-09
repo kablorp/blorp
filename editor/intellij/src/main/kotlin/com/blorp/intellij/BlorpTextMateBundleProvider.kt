@@ -1,5 +1,6 @@
 package com.blorp.intellij
 
+import com.intellij.openapi.diagnostic.Logger
 import org.jetbrains.plugins.textmate.api.TextMateBundleProvider
 import java.nio.file.Files
 import java.nio.file.Path
@@ -26,6 +27,7 @@ class BlorpTextMateBundleProvider : TextMateBundleProvider {
 
             dir
         } catch (e: Exception) {
+            LOG.warn("Failed to extract bundled Blorp TextMate grammar", e)
             null
         }
     }
@@ -34,5 +36,9 @@ class BlorpTextMateBundleProvider : TextMateBundleProvider {
         val stream = javaClass.classLoader.getResourceAsStream(resourcePath)
             ?: throw IllegalStateException("Missing resource: $resourcePath")
         stream.use { Files.copy(it, target, StandardCopyOption.REPLACE_EXISTING) }
+    }
+
+    companion object {
+        private val LOG = Logger.getInstance(BlorpTextMateBundleProvider::class.java)
     }
 }

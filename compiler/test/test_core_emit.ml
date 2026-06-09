@@ -2292,6 +2292,11 @@ let test_stmt_break_continue () =
     "continue" "continue;\n"
     (emit_stmt_to_string (mk CContinue ty_void))
 
+let test_stmt_cooperative_checkpoint () =
+  Alcotest.(check string)
+    "cooperative checkpoint" "blorp_cooperative_checkpoint();\n"
+    (emit_stmt_to_string (mk CCooperativeCheckpoint ty_void))
+
 let test_stmt_assign () =
   let e = mk (CAssign (Var.named "i", cint 5)) ty_void in
   Alcotest.(check string) "assign" "i = 5L;\n" (emit_stmt_to_string e)
@@ -2926,29 +2931,120 @@ let test_emit_concurrent_block () =
       [ { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None } ]
   in
   Alcotest.(check bool)
-    "has batch init" true
+    "ensures thread pool without operation width" true
+    (contains_sub output "blorp_thread_pool_ensure_initialized();");
+  Alcotest.(check bool)
+    "uses runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_");
+  Alcotest.(check bool)
+    "zero-initializes runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_"
+    && contains_sub output " = {0};");
+  Alcotest.(check bool)
+    "begins protected task window through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_begin");
+  Alcotest.(check bool)
+    "spawns through task window slots" true
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned");
+  Alcotest.(check bool)
+    "joins through task window slots" true
+    (contains_sub output "blorp_concurrent_task_window_join_release");
+  Alcotest.(check bool)
+    "finishes task window through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_end");
+  Alcotest.(check bool)
+    "does not open-code fixed task batch init" false
     (contains_sub output "blorp_task_batch_init(&__conc_batch_");
   Alcotest.(check bool)
-    "has owned batched task_spawn" true
-    (contains_sub output "blorp_task_spawn_owned_in_batch(&__conc_batch_");
-  Alcotest.(check bool)
-    "flushes batch before join" true
+    "does not open-code fixed task batch flush" false
     (contains_sub output "blorp_task_batch_flush(&__conc_batch_");
   Alcotest.(check bool)
-    "has concurrent_join" true
-    (contains_sub output "blorp_concurrent_join");
+    "does not use batch-level fixed spawn helper" false
+    (contains_sub output
+       "blorp_concurrent_spawn_owned_cleanup_in_batch(&__conc_batch_");
   Alcotest.(check bool)
-    "registers task cleanup" true
+    "does not declare raw fixed task handles" false
+    (contains_sub output "blorp_Task* __conc_task_");
+  Alcotest.(check bool)
+    "does not declare raw fixed task cleanup frames" false
+    (contains_sub output "blorp_CancelCleanupFrame __blorp_task_cleanup_");
+  Alcotest.(check bool)
+    "does not emit task cleanup registration separately" false
     (contains_sub output "blorp_task_cleanup_push_task");
   Alcotest.(check bool)
-    "pops task cleanup before normal release" true
+    "does not pop task cleanup directly after join" false
     (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_task_");
   Alcotest.(check bool)
-    "has task release" true
-    (contains_sub output "blorp_release((blorp_Object*)");
+    "does not release task directly after join" false
+    (contains_sub output "blorp_release((blorp_Object*)__conc_task_");
   Alcotest.(check bool)
-    "has two tasks" true
-    (contains_sub output "__conc_task_")
+    "uses periodic task-window flush mode" true
+    (contains_sub output "BLORP_CONCURRENT_TASK_FLUSH_PERIODIC")
+
+let test_emit_concurrent_block_max_threads_limits_window () =
+  let fty = TyFunc { params = []; return = ty_int; is_pure = true } in
+  let bind name =
+    {
+      cb_var = Var.named name;
+      cb_ty = ty_int;
+      cb_rhs = mk (CCall (CKUser (name, None), cvar name fty, [])) ty_int;
+      cb_task_scope = synthetic_concurrent_task_scope;
+      cb_task = None;
+    }
+  in
+  let tail =
+    mk
+      (CBin
+         ( Add,
+           mk (CBin (Add, cvar "a" ty_int, cvar "b" ty_int)) ty_int,
+           cvar "c" ty_int ))
+      ty_int
+  in
+  let e =
+    mk
+      (CConcurrent
+         {
+           conc_bindings = [ bind "a"; bind "b"; bind "c" ];
+           conc_body = tail;
+           conc_timeout = None;
+           conc_max_threads = Some 2;
+         })
+      ty_int
+  in
+  let func : core_func =
+    {
+      cf_name = "run_three";
+      cf_type_params = [];
+      cf_params = [];
+      cf_module = None;
+      cf_return_ty = ty_int;
+      cf_body = Some e;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let output =
+    emit_program_to_string
+      [ { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None } ]
+  in
+  Alcotest.(check bool)
+    "max_threads initializes pool with runtime default capacity" true
+    (contains_sub output "blorp_thread_pool_ensure_initialized();");
+  Alcotest.(check bool)
+    "max_threads does not become process-wide thread pool size" false
+    (contains_sub output "blorp_thread_pool_init(2);");
+  Alcotest.(check bool)
+    "max_threads caps fixed concurrent task window" true
+    (contains_sub output
+       "blorp_concurrent_task_window_begin(&__conc_task_window_"
+    && contains_sub output ", 2);");
+  Alcotest.(check int)
+    "spawns all fixed bindings" 3
+    (count_sub output "blorp_concurrent_task_window_spawn_owned(");
+  Alcotest.(check int)
+    "joins all fixed bindings" 3
+    (count_sub output "blorp_concurrent_task_window_join_release(")
 
 let test_emit_concurrent_program () =
   let fty = TyFunc { params = []; return = ty_int; is_pure = true } in
@@ -2992,8 +3088,8 @@ let test_emit_concurrent_program () =
     "has lambda body" true
     (contains_sub output "_blorp_task_0(void* __env)");
   Alcotest.(check bool)
-    "has spawn" true
-    (contains_sub output "blorp_task_spawn")
+    "has spawn cleanup helper" true
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned")
 
 let test_emit_concurrent_capture_release_mask () =
   let result_ty =
@@ -3049,7 +3145,7 @@ let test_emit_concurrent_capture_release_mask () =
         blorp_cleanup_release_arc_only_value);");
   Alcotest.(check bool)
     "transfers emitter's closure ref to task spawn" true
-    (contains_sub output "blorp_task_spawn_owned");
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned_rc");
   Alcotest.(check bool)
     "does not release transferred task closure in caller" false
     (contains_sub output "blorp_release((blorp_Object*)__conc_fn_")
@@ -3096,7 +3192,7 @@ let test_emit_concurrent_stack_result_join_conversion () =
     "converts boxed join Result to stack Result" true
     (contains_sub output
        "blorp_StackResult r = \
-        blorp_stack_result_from_boxed((blorp_Result*)blorp_concurrent_join(");
+        blorp_stack_result_from_boxed((blorp_Result*)blorp_concurrent_task_window_join_release(");
   Alcotest.(check bool)
     "does not cast boxed join Result to stack Result" false
     (contains_sub output
@@ -3142,25 +3238,74 @@ let test_emit_concurrently_loop_rc_result_uses_spawn_rc () =
   in
   Alcotest.(check bool)
     "rc task result uses owned spawn_rc" true
-    (contains_sub output "blorp_task_spawn_owned_rc_in_batch");
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned_rc");
   Alcotest.(check bool)
-    "for ... concurrently uses batch init" true
+    "for ... concurrently initializes carrier pool independently of limit" true
+    (contains_sub output "blorp_thread_pool_ensure_initialized();");
+  Alcotest.(check bool)
+    "for ... concurrently does not use limit as process-wide pool size" false
+    (contains_sub output "blorp_thread_pool_init((int)__conc_limit_");
+  Alcotest.(check bool)
+    "for ... concurrently uses runtime-owned task window batch" false
+    (contains_sub output "blorp_TaskBatch __conc_batch_");
+  Alcotest.(check bool)
+    "for ... concurrently does not open-code task batch init" false
     (contains_sub output "blorp_task_batch_init(&__conc_batch_");
   Alcotest.(check bool)
-    "for ... concurrently flushes spawn batches" true
+    "for ... concurrently does not open-code task batch flushing" false
+    (contains_sub output "blorp_task_batch_flush");
+  Alcotest.(check bool)
+    "for ... concurrently uses periodic task-window flush mode" true
+    (contains_sub output "BLORP_CONCURRENT_TASK_FLUSH_PERIODIC");
+  Alcotest.(check bool)
+    "for ... concurrently does not open-code batch interval policy" false
     (contains_sub output "% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0");
   Alcotest.(check bool)
-    "for ... concurrently schedules batch before joins" true
-    (contains_sub output "blorp_task_batch_flush(&__conc_batch_");
+    "for ... concurrently schedules before joins through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_join_release");
   Alcotest.(check bool)
-    "for ... concurrently allocates cleanup frames" true
+    "for ... concurrently uses one runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_");
+  Alcotest.(check bool)
+    "for ... concurrently zero-initializes runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_"
+    && contains_sub output " = {0};");
+  Alcotest.(check bool)
+    "for ... concurrently begins protected task window through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_begin");
+  Alcotest.(check bool)
+    "for ... concurrently finishes task window through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_end");
+  Alcotest.(check bool)
+    "for ... concurrently does not allocate separate task arrays" false
+    (contains_sub output "blorp_Task** __conc_tasks_");
+  Alcotest.(check bool)
+    "for ... concurrently does not allocate separate cleanup frame arrays" false
     (contains_sub output "blorp_CancelCleanupFrame* __conc_task_cleanups_");
   Alcotest.(check bool)
-    "for ... concurrently registers task cleanup" true
+    "for ... concurrently does not emit task cleanup registration separately"
+    false
     (contains_sub output "blorp_task_cleanup_push_task");
   Alcotest.(check bool)
-    "for ... concurrently pops task cleanup" true
-    (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_tasks_");
+    "for ... concurrently joins through runtime cleanup helper" true
+    (contains_sub output "blorp_concurrent_task_window_join_release");
+  Alcotest.(check bool)
+    "for ... concurrently spawns through task window slots" true
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned_rc");
+  Alcotest.(check bool)
+    "for ... concurrently does not index task window task slots directly" false
+    (contains_sub output ".tasks[");
+  Alcotest.(check bool)
+    "for ... concurrently does not index task window cleanup slots directly"
+    false
+    (contains_sub output ".cleanups[");
+  Alcotest.(check bool)
+    "for ... concurrently does not open-code task window cleanup pop" false
+    (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_task_window_");
+  Alcotest.(check bool)
+    "for ... concurrently does not open-code task window cleanup release" false
+    (contains_sub output
+       "blorp_concurrent_task_window_cleanup(&__conc_task_window_");
   Alcotest.(check bool)
     "for ... concurrently protects collected result list on cancellation" true
     (contains_sub output "blorp_cleanup_release_arc_value)");
@@ -3213,8 +3358,29 @@ let test_emit_resource_source_concurrently_flushes_each_spawn () =
     "resource-source fan-out pulls resources" true
     (contains_sub output "blorp_resource_source_next_raw(");
   Alcotest.(check bool)
-    "resource-source fan-out spawns into a task batch" true
-    (contains_sub output "blorp_task_spawn_owned_in_batch(&__conc_batch_");
+    "resource-source fan-out initializes carrier pool independently of limit"
+    true
+    (contains_sub output "blorp_thread_pool_ensure_initialized();");
+  Alcotest.(check bool)
+    "resource-source fan-out does not use limit as process-wide pool size" false
+    (contains_sub output "blorp_thread_pool_init((int)__conc_limit_");
+  Alcotest.(check bool)
+    "resource-source fan-out spawns and registers cleanup together" true
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned(");
+  Alcotest.(check bool)
+    "resource-source fan-out flushes each spawn through runtime" true
+    (contains_sub output "BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE");
+  Alcotest.(check bool)
+    "resource-source fan-out joins through task window slots" true
+    (contains_sub output "blorp_concurrent_task_window_join_release");
+  Alcotest.(check bool)
+    "resource-source fan-out does not index task window task slots directly"
+    false
+    (contains_sub output ".tasks[");
+  Alcotest.(check bool)
+    "resource-source fan-out does not index task window cleanup slots directly"
+    false
+    (contains_sub output ".cleanups[");
   Alcotest.(check bool)
     "resource-source moved resource has pre-entry fallback release" true
     (contains_sub output "->env_release_mask = 1UL;");
@@ -3222,8 +3388,8 @@ let test_emit_resource_source_concurrently_flushes_each_spawn () =
     "resource-source fan-out does not wait for batch interval" false
     (contains_sub output "% BLORP_TASK_BATCH_FLUSH_INTERVAL");
   Alcotest.(check bool)
-    "resource-source fan-out flushes each spawn and before join" true
-    (count_sub output "blorp_task_batch_flush(&__conc_batch_" >= 2)
+    "resource-source fan-out does not open-code task batch flushing" false
+    (contains_sub output "blorp_task_batch_flush")
 
 let test_emit_detach () =
   let fty = TyFunc { params = []; return = ty_void; is_pure = false } in
@@ -6150,6 +6316,8 @@ let suite =
     ( "concurrency",
       [
         Alcotest.test_case "concurrent_block" `Quick test_emit_concurrent_block;
+        Alcotest.test_case "concurrent_block_max_threads_limits_window" `Quick
+          test_emit_concurrent_block_max_threads_limits_window;
         Alcotest.test_case "concurrent_program" `Quick
           test_emit_concurrent_program;
         Alcotest.test_case "concurrent_capture_release_mask" `Quick
@@ -6188,6 +6356,8 @@ let suite =
         Alcotest.test_case "if_else" `Quick test_stmt_if_else;
         Alcotest.test_case "while" `Quick test_stmt_while;
         Alcotest.test_case "break_continue" `Quick test_stmt_break_continue;
+        Alcotest.test_case "cooperative_checkpoint" `Quick
+          test_stmt_cooperative_checkpoint;
         Alcotest.test_case "assign" `Quick test_stmt_assign;
         Alcotest.test_case "discard_managed_var" `Quick
           test_stmt_discard_managed_var_releases;

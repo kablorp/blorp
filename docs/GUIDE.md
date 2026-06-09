@@ -2141,7 +2141,7 @@ import:
     option: Option(Some, None)         -- Type + constructors from std/option
     dict as D                          -- Qualified import
     heap as H: Heap                    -- Combined: qualified alias + selective symbols
-    math: PI                           -- Specific constants
+    math: PI, TAU                      -- Specific constants
     float: sin, cos                    -- Specific functions
 
 -- Project modules use relative paths in the same form:
@@ -2369,13 +2369,15 @@ func typed_timeout_example() -> Int:
     0
 ```
 
-**Note:** Timeouts are cooperative — they take effect at yield points (`sleep`,
-`yield_now`, channel send/recv, task join). When a timeout fires, the timed-out task is
-cancelled and the block waits for it to reach its next cancellation point before
-continuing, so code after that point does not run. Resources acquired with
-`with` are closed by cancellation cleanup before the task unwinds. A CPU-bound
-computation loop will not be interrupted by a timeout. If you need
-interruptible compute, insert periodic `yield_now()` calls.
+**Note:** Timeouts are cooperative — they take effect at cancellation points
+(`sleep`, `yield_now`, channel send/recv, task join, and compiler-inserted loop
+checkpoints). When a timeout fires, the timed-out task is cancelled and the
+block waits for it to reach its next cancellation point before continuing, so
+code after that point does not run. Resources acquired with `with` are closed by
+cancellation cleanup before the task unwinds. CPU-bound `while`, `for`, and
+`@tail_recursive` loops are checked by compiler-owned checkpoints; use
+`yield_now()` only when you also want an explicit scheduling handoff to other
+ready fibers.
 
 ### Concurrent Loops
 
@@ -2538,6 +2540,11 @@ Use `yield_now()` when you want to cooperatively give another ready fiber a
 chance to run without installing a timer. It is a scheduling hint, not an
 ordering guarantee.
 
+Ordinary `while` and `for` loops, plus loops lowered from `@tail_recursive`
+functions, also receive compiler-owned cancellation checkpoints. Those
+checkpoints let timeouts stop CPU-heavy loops, but they use a runtime reduction
+budget and are not a source-level ordering primitive.
+
 Use `sleep_for` when the timeout is a typed `Duration` from `units`:
 
 ```blorp
@@ -2574,7 +2581,7 @@ func compute_b() -> Int: 2
 func pool_example() -> Int:
     n: Int = max_threads()
 
-    -- Set max threads via concurrent block parameter
+    -- Limit this block's active child tasks
     concurrent(max_threads: 8):
         a = compute_a()
         b = compute_b()
@@ -2584,7 +2591,7 @@ func pool_example() -> Int:
 -- ./blorp run program.brp --threads 4
 ```
 
-The thread pool is lazily initialized on first concurrent operation. The `max_threads` parameter must be a positive integer literal. It sets the pool size for the first concurrent block encountered; subsequent blocks reuse the existing pool.
+The thread pool is lazily initialized on first concurrent operation. Global OS-worker capacity comes from `BLORP_THREADS`, `--threads`, or the platform default. The `max_threads` parameter must be a positive integer literal and limits only that `concurrent:` block's active child tasks; it does not resize the process-wide worker pool.
 
 ### Virtual Threads (Fibers)
 
@@ -2845,7 +2852,7 @@ This table lists the main public modules. The source of truth is the `std/` and
 | `int8`, `int16`, `int32`, `int128` | `int8: ...` | Signed sized integer modules |
 | `uint8`, `uint16`, `uint32`, `uint64`, `uint128` | `uint8: ...` | Unsigned sized integer modules |
 | `float16`, `float32`, `fixed` | `float32: ...` | Sized floats and fixed-point decimals |
-| `math`, `stats`, `tensor`, `vector`, `matrix`, `parallel_vector`, `parallel_matrix` | `math: PI, TAU` | Numeric helpers, statistics, and fixed-size array/tensor APIs |
+| `math`, `stats`, `tensor`, `vector`, `matrix`, `parallel_vector`, `parallel_matrix` | `math: PI, TAU, PHI` | Numeric helpers, statistics, and fixed-size array/tensor APIs |
 | `io`, `fs`, `system`, `path`, `process`, `time`, `channel` | `system: read_file` | I/O, typed filesystem resources, filesystem convenience APIs, process, path, time, and concurrency channel APIs |
 | `debug`, `memory`, `instrumentation`, `log` | `debug: debug_string, type_name` | Diagnostics, memory stats, scheduler stats, timing/barrier helpers, and logging |
 | `argparse`, `validation`, `uuid`, `random`, `crypto_random` | `argparse: ...` | Application utilities |
@@ -3227,17 +3234,18 @@ func dict_methods() -> Bool:
 Element-wise scalar math (`sqrt`, `exp`, `log`, `sin`, `cos`, `tan`, `pow`,
 `abs`, etc.) is in the prelude via the `FloatingPoint`/`Absolute` traits and
 does **not** require this module. `std/math` contains constants such as `PI`,
-`E`, and `TAU`, plus cross-type helpers that have not moved to their type
+`E`, `TAU`, and `PHI`, plus cross-type helpers that have not moved to their type
 modules yet.
 
 ```blorp
 import:
     int:
+        INT_MAX, INT_MIN,
         divide_checked, mod_checked,
         add_checked, subtract_checked, multiply_checked,
         add_saturating, subtract_saturating, multiply_saturating,
         clamp, sign, is_even, is_odd, gcd, lcm, factorial,
-        is_power_of_two, next_power_of_two, max_int, min_int
+        is_power_of_two, next_power_of_two
     math:
         MathError(DivByZero, Overflow, Underflow),
         divide_checked_float
@@ -3248,7 +3256,7 @@ import:
 | Checked | `add_checked`, `subtract_checked`, `multiply_checked`, `divide_checked`, `mod_checked` — return `Result[Int, MathError]` |
 | Saturating | `add_saturating`, `subtract_saturating`, `multiply_saturating` — clamp at `INT_MAX`/`INT_MIN` |
 | Integer theory | `gcd`, `lcm`, `factorial`, `sign`, `is_even`, `is_odd`, `is_power_of_two`, `next_power_of_two` |
-| Bounds | `clamp`, `max_int`, `min_int` |
+| Bounds | `clamp`, `INT_MAX`, `INT_MIN` |
 
 ### std/json
 
@@ -3672,6 +3680,7 @@ tests/
 | `--threads N` | run | Set max thread pool size |
 | `--timeout N` | run, test | Kill after N seconds (`test` defaults to 30; `0` disables) |
 | `--sanitize` | run, test | Enable AddressSanitizer + UBSan |
+| `--sanitize=undefined` | run, test | Enable UBSan only, useful for fiber-heavy tests on Darwin where Apple ASan does not reliably support user-land stack switching |
 | `--doc` | test | Run only doctests |
 | `--suite` | test | Run only TestSuite tests |
 | `-j N` | test | Run tests with N parallel workers |
@@ -3702,7 +3711,7 @@ tests/
 | `BLORP_FIBER_STACK_CACHE_BYTES=N` | Maximum bytes of dead fiber coroutine/stack regions to cache for reuse (default 134217728; `0` disables) |
 | `BLORP_FIBER_OBJECT_CACHE_COUNT=N` | Maximum dead fiber handle objects to cache for reuse (default 4096; `0` disables) |
 | `BLORP_THREADS=N` | Runtime worker thread pool size; `./blorp run --threads N` sets this for the launched program |
-| `BLORP_SANITIZE=1` | Enable sanitizers (CLI flag overrides) |
+| `BLORP_SANITIZE=1/address/undefined` | Enable sanitizers (CLI flag overrides) |
 | `BLORP_TLS_BACKEND=unsupported/openssl` | Select the runtime TLS backend profile. `unsupported` is the portable default; `openssl` builds and links the native OpenSSL backend. |
 | `BLORP_OPENSSL_CFLAGS` | Compiler arguments for the OpenSSL TLS backend; if unset, `pkg-config --cflags openssl` is used. |
 | `BLORP_OPENSSL_LIBS` | Linker arguments for the OpenSSL TLS backend; if unset, `pkg-config --libs openssl` is used. |
@@ -3728,8 +3737,11 @@ BLORP_LEAK_CHECK=1 ./blorp run program.brp
 # Run the focused compiler/runtime leak baselines
 scripts/test leak
 
-# Run with AddressSanitizer
+# Run with AddressSanitizer + UBSan
 ./blorp test --sanitize tests/test_blorp/memory/
+
+# Run fiber-heavy tests with UBSan only on Darwin
+./blorp test --sanitize=undefined tests/test_blorp/concurrency/
 
 # Memory stats builtins (in blorp code)
 reset_mem_stats()          -- Reset allocation counters

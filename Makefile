@@ -155,9 +155,16 @@ security-check: all c-static-analysis
 	./blorp test --no-cache --timeout 20 $(SECURITY_RUNTIME_TESTS)
 	./blorp test --no-cache --leak-check --timeout 20 $(SECURITY_LEAK_TESTS)
 
-# Run all tests with AddressSanitizer + UBSan
+# Run runtime tests with sanitizer instrumentation. On Darwin, Apple
+# AddressSanitizer does not reliably compose with user-land fiber stack
+# switching, so the runtime-wide gate uses UBSan there. Linux keeps the
+# stronger ASan + UBSan combination.
 test-asan: all
-	./blorp test --sanitize $(RUNTIME_TEST_ROOTS)
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		./blorp test --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
+	else \
+		./blorp test --sanitize $(RUNTIME_TEST_ROOTS); \
+	fi
 
 # Docker targets
 docker-build:
