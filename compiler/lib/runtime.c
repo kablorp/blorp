@@ -34723,7 +34723,7 @@ static void blorp_profile_maybe_terminate(void) {
 // Debug Functions
 // ============================================================================
 
-static int blorp_debug_log_level = 0;
+static int blorp_debug_log_level = 1;
 
 void blorp_debug_log_msg(blorp_String* s) {
     if (s && s->len > 0) fwrite(s->data, 1, s->len, stderr);
@@ -35944,6 +35944,26 @@ static void __blorp_sig_init(void) {
 
 // Track which signals have handlers installed
 static _Atomic(int) __blorp_sig_installed[BLORP_MAX_SIGNAL];
+
+long blorp_signal_hangup(void) {
+    return (long)SIGHUP;
+}
+
+long blorp_signal_interrupt(void) {
+    return (long)SIGINT;
+}
+
+long blorp_signal_terminate(void) {
+    return (long)SIGTERM;
+}
+
+long blorp_signal_user1(void) {
+    return (long)SIGUSR1;
+}
+
+long blorp_signal_user2(void) {
+    return (long)SIGUSR2;
+}
 
 // Install the flag-setting handler for a signal (idempotent)
 static void __blorp_sig_install(int signum) {

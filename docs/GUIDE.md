@@ -2141,7 +2141,7 @@ import:
     option: Option(Some, None)         -- Type + constructors from std/option
     dict as D                          -- Qualified import
     heap as H: Heap                    -- Combined: qualified alias + selective symbols
-    math: PI                           -- Specific constants
+    math: PI, TAU                      -- Specific constants
     float: sin, cos                    -- Specific functions
 
 -- Project modules use relative paths in the same form:
@@ -2845,7 +2845,7 @@ This table lists the main public modules. The source of truth is the `std/` and
 | `int8`, `int16`, `int32`, `int128` | `int8: ...` | Signed sized integer modules |
 | `uint8`, `uint16`, `uint32`, `uint64`, `uint128` | `uint8: ...` | Unsigned sized integer modules |
 | `float16`, `float32`, `fixed` | `float32: ...` | Sized floats and fixed-point decimals |
-| `math`, `stats`, `tensor`, `vector`, `matrix`, `parallel_vector`, `parallel_matrix` | `math: PI, TAU` | Numeric helpers, statistics, and fixed-size array/tensor APIs |
+| `math`, `stats`, `tensor`, `vector`, `matrix`, `parallel_vector`, `parallel_matrix` | `math: PI, TAU, PHI` | Numeric helpers, statistics, and fixed-size array/tensor APIs |
 | `io`, `fs`, `system`, `path`, `process`, `time`, `channel` | `system: read_file` | I/O, typed filesystem resources, filesystem convenience APIs, process, path, time, and concurrency channel APIs |
 | `debug`, `memory`, `instrumentation`, `log` | `debug: debug_string, type_name` | Diagnostics, memory stats, scheduler stats, timing/barrier helpers, and logging |
 | `argparse`, `validation`, `uuid`, `random`, `crypto_random` | `argparse: ...` | Application utilities |
@@ -3227,17 +3227,18 @@ func dict_methods() -> Bool:
 Element-wise scalar math (`sqrt`, `exp`, `log`, `sin`, `cos`, `tan`, `pow`,
 `abs`, etc.) is in the prelude via the `FloatingPoint`/`Absolute` traits and
 does **not** require this module. `std/math` contains constants such as `PI`,
-`E`, and `TAU`, plus cross-type helpers that have not moved to their type
+`E`, `TAU`, and `PHI`, plus cross-type helpers that have not moved to their type
 modules yet.
 
 ```blorp
 import:
     int:
+        INT_MAX, INT_MIN,
         divide_checked, mod_checked,
         add_checked, subtract_checked, multiply_checked,
         add_saturating, subtract_saturating, multiply_saturating,
         clamp, sign, is_even, is_odd, gcd, lcm, factorial,
-        is_power_of_two, next_power_of_two, max_int, min_int
+        is_power_of_two, next_power_of_two
     math:
         MathError(DivByZero, Overflow, Underflow),
         divide_checked_float
@@ -3248,7 +3249,7 @@ import:
 | Checked | `add_checked`, `subtract_checked`, `multiply_checked`, `divide_checked`, `mod_checked` — return `Result[Int, MathError]` |
 | Saturating | `add_saturating`, `subtract_saturating`, `multiply_saturating` — clamp at `INT_MAX`/`INT_MIN` |
 | Integer theory | `gcd`, `lcm`, `factorial`, `sign`, `is_even`, `is_odd`, `is_power_of_two`, `next_power_of_two` |
-| Bounds | `clamp`, `max_int`, `min_int` |
+| Bounds | `clamp`, `INT_MAX`, `INT_MIN` |
 
 ### std/json
 

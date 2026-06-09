@@ -2340,6 +2340,11 @@ blorp_String* blorp_result_to_string_string_string(void* r);
 void blorp_tuple_destructor(void* obj);
 
 // Signal handling
+long blorp_signal_hangup(void);
+long blorp_signal_interrupt(void);
+long blorp_signal_terminate(void);
+long blorp_signal_user1(void);
+long blorp_signal_user2(void);
 void blorp_signal_on(long signum, blorp_Closure* handler);
 long blorp_signal_received(long signum);
 void blorp_signal_raise(long signum);
