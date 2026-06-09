@@ -7871,7 +7871,7 @@ and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
     | Some n -> max 1 (min n binding_count)
     | None -> binding_count
   in
-  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s;" window_c);
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s = {0};" window_c);
   emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
   emit_line ctx
     (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %d);" window_c
@@ -8086,7 +8086,7 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
          ~value_c:list_c ~ty:cf.cf_iter.ty
   in
   emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c list_c);
-  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s;" window_c);
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s = {0};" window_c);
   emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
   emit_line ctx
     (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %s);" window_c
@@ -8218,7 +8218,7 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
     && emit_owned_temp_cancellation_cleanup_push ctx ~slot_c:source_c
          ~value_c:source_c ~ty:cf.cf_iter.ty
   in
-  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s;" window_c);
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s = {0};" window_c);
   emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
   emit_line ctx
     (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %s);" window_c

@@ -682,7 +682,8 @@ typedef void (*blorp_CancelCleanupFn)(void*);
 
 typedef enum {
     BLORP_CANCEL_CLEANUP_GENERIC = 0,
-    BLORP_CANCEL_CLEANUP_TASK = 1
+    BLORP_CANCEL_CLEANUP_TASK = 1,
+    BLORP_CANCEL_CLEANUP_TASK_WINDOW = 2
 } blorp_CancelCleanupKind;
 
 typedef struct blorp_CancelCleanupFrame {
@@ -701,12 +702,19 @@ typedef enum {
     BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE = 1
 } blorp_ConcurrentTaskFlushMode;
 
+typedef enum {
+    BLORP_CONCURRENT_TASK_WINDOW_UNINITIALIZED = 0,
+    BLORP_CONCURRENT_TASK_WINDOW_ACTIVE = 1,
+    BLORP_CONCURRENT_TASK_WINDOW_ENDED = 2
+} blorp_ConcurrentTaskWindowState;
+
 typedef struct {
     blorp_Task** tasks;
     blorp_CancelCleanupFrame* cleanups;
     blorp_TaskBatch batch;
     long capacity;
     long batch_spawn_count;
+    blorp_ConcurrentTaskWindowState state;
 } blorp_ConcurrentTaskWindow;
 
 typedef struct {
@@ -1788,8 +1796,11 @@ void blorp_task_cancel_join_release(void* t);
 long blorp_test_cancel_after_parked(blorp_Closure* func);
 long blorp_test_task_window_pending_cleanup_probe(void);
 long blorp_test_task_join_slot_probe(void);
+long blorp_test_fiber_created_schedule_probe(void);
 long blorp_test_timer_waiter_identity_probe(void);
 long blorp_test_wait_ready_to_park_probe(void);
+long blorp_test_fiber_lifecycle_ready_to_park_probe(void);
+long blorp_test_fiber_cancel_before_park_probe(void);
 long blorp_test_current_timer_wait_install_probe(void);
 long blorp_test_timeout_arithmetic_probe(void);
 long blorp_test_cooperative_checkpoint_probe(void);

@@ -160,8 +160,11 @@ let descriptors =
     fiber_parking "recv_timeout_attempt";
     cancellation_point "cancel_after_parked_for_test";
     impure "task_join_slot_probe_for_test";
+    impure "fiber_created_schedule_probe_for_test";
     impure "timer_waiter_identity_probe_for_test";
     impure "wait_ready_to_park_probe_for_test";
+    impure "fiber_lifecycle_ready_to_park_probe_for_test";
+    impure "fiber_cancel_before_park_probe_for_test";
     impure "current_timer_wait_install_probe_for_test";
     impure "timeout_arithmetic_probe_for_test";
     cancellation_point "cooperative_checkpoint_probe_for_test";

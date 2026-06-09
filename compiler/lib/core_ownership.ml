@@ -602,7 +602,16 @@ let builtin_contract_table =
         [ "blorp_test_cooperative_checkpoint_probe" ]
         (bfixed [] ReturnPrimitive);
       builtins
+        [ "blorp_test_fiber_created_schedule_probe" ]
+        (bfixed [] ReturnPrimitive);
+      builtins
         [ "blorp_test_wait_ready_to_park_probe" ]
+        (bfixed [] ReturnPrimitive);
+      builtins
+        [ "blorp_test_fiber_lifecycle_ready_to_park_probe" ]
+        (bfixed [] ReturnPrimitive);
+      builtins
+        [ "blorp_test_fiber_cancel_before_park_probe" ]
         (bfixed [] ReturnPrimitive);
       builtins
         [ "blorp_test_current_timer_wait_install_probe" ]

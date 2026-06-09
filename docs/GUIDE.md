@@ -3680,6 +3680,7 @@ tests/
 | `--threads N` | run | Set max thread pool size |
 | `--timeout N` | run, test | Kill after N seconds (`test` defaults to 30; `0` disables) |
 | `--sanitize` | run, test | Enable AddressSanitizer + UBSan |
+| `--sanitize=undefined` | run, test | Enable UBSan only, useful for fiber-heavy tests on Darwin where Apple ASan does not reliably support user-land stack switching |
 | `--doc` | test | Run only doctests |
 | `--suite` | test | Run only TestSuite tests |
 | `-j N` | test | Run tests with N parallel workers |
@@ -3710,7 +3711,7 @@ tests/
 | `BLORP_FIBER_STACK_CACHE_BYTES=N` | Maximum bytes of dead fiber coroutine/stack regions to cache for reuse (default 134217728; `0` disables) |
 | `BLORP_FIBER_OBJECT_CACHE_COUNT=N` | Maximum dead fiber handle objects to cache for reuse (default 4096; `0` disables) |
 | `BLORP_THREADS=N` | Runtime worker thread pool size; `./blorp run --threads N` sets this for the launched program |
-| `BLORP_SANITIZE=1` | Enable sanitizers (CLI flag overrides) |
+| `BLORP_SANITIZE=1/address/undefined` | Enable sanitizers (CLI flag overrides) |
 | `BLORP_TLS_BACKEND=unsupported/openssl` | Select the runtime TLS backend profile. `unsupported` is the portable default; `openssl` builds and links the native OpenSSL backend. |
 | `BLORP_OPENSSL_CFLAGS` | Compiler arguments for the OpenSSL TLS backend; if unset, `pkg-config --cflags openssl` is used. |
 | `BLORP_OPENSSL_LIBS` | Linker arguments for the OpenSSL TLS backend; if unset, `pkg-config --libs openssl` is used. |
@@ -3736,8 +3737,11 @@ BLORP_LEAK_CHECK=1 ./blorp run program.brp
 # Run the focused compiler/runtime leak baselines
 scripts/test leak
 
-# Run with AddressSanitizer
+# Run with AddressSanitizer + UBSan
 ./blorp test --sanitize tests/test_blorp/memory/
+
+# Run fiber-heavy tests with UBSan only on Darwin
+./blorp test --sanitize=undefined tests/test_blorp/concurrency/
 
 # Memory stats builtins (in blorp code)
 reset_mem_stats()          -- Reset allocation counters

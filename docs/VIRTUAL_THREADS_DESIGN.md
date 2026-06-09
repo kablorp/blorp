@@ -83,7 +83,7 @@ distinct runtime values.
 Target lifecycle:
 
 ```text
-free fiber/stack -> created -> queued -> running -> parked/queued -> completed -> free
+free fiber/stack -> created -> queued -> dispatched -> running -> ready_to_park -> parked/queued -> completed -> free
 ```
 
 Fiber creation should avoid hot-path `mmap`/`mprotect` and repeated coroutine
@@ -177,8 +177,8 @@ order:
 - represent correctness-critical distinctions explicitly in Core IR, runtime
   state, or a closed registry, not in C name prefixes, comments, or coupled
   booleans;
-- run the relevant thread-count matrix, leak-check, sanitizer, and benchmark
-  gates before claiming the slice is complete;
+- run the relevant thread-count matrix, leak-check, supported sanitizer mode,
+  and benchmark gates before claiming the slice is complete;
 - remove stale code and generated artifacts that could make future agents edit
   or measure the wrong implementation.
 
@@ -197,7 +197,8 @@ Already implemented or partially implemented:
   fiber snapshots and conservative assertions at enqueue, park, timer insert,
   channel wait enqueue, worker resume, and wake handoff boundaries;
 - runtime-internal `blorp_FiberState` lifecycle tracking with named transition
-  helpers for created, queued, running, parked, completed, and free states;
+  helpers for created, queued, dispatched, running, ready-to-park, parked,
+  completed, and free states;
 - runtime-internal `blorp_FiberWakeCause` tracking for ready, timeout,
   cancelled, closed, and sealed wakeups, with dynamic wake sites routed through
   `blorp_fiber_wake` where the existing parked-to-runnable CAS chooses the
@@ -209,9 +210,10 @@ Already implemented or partially implemented:
   wait, carrying the fiber, wait owner, and operation id through waiter setup
   and through scheduler-owned timer, task-join, channel, and select waiter
   records;
-- a named ready-to-park transition helper that marks an explicit wait operation
-  parked only after a wait owner and wait operation id exist, replacing
-  open-coded current-fiber `parked = 1` stores in wait paths;
+- a named ready-to-park transition helper that moves a running fiber into an
+  explicit `READY_TO_PARK` lifecycle state only after a wait owner and wait
+  operation id exist, replacing open-coded current-fiber `parked = 1` stores in
+  wait paths;
 - a named abandon-before-park helper that clears the parked and pending-wake
   mirrors only for the exact wait operation being abandoned, replacing
   open-coded cleanup in IO readiness-before-park and select ready-before-park
@@ -219,6 +221,9 @@ Already implemented or partially implemented:
 - `blorp_fiber_park` takes the explicit wait operation and verifies, in
   scheduler debug mode, that park entry and resume still refer to that exact
   operation;
+- wake-before-yield and cancellation-before-park both record pending wakes
+  through one locked runtime helper, with a deterministic probe covering the
+  cancellation path before a running fiber publishes its parked bit;
 - shared timer-wait install/remove helpers for timed waits, so sleep, timed
   task joins, timed channel waits, and timed select use one runtime-owned path
   for preparing the stable per-fiber timer waiter and removing it after resume;
@@ -238,8 +243,7 @@ Already implemented or partially implemented:
   operation id, and wake cause, so a stale timeout or completion cannot target a
   later wait operation on the same fiber;
 - fiber object caching and guarded stack-region caching;
-- worker-local run queues, owner-pinned queues, a global fallback queue, and
-  work stealing;
+- worker-local run queues, owner-pinned queues, and a global fallback queue;
 - explicit Core concurrency nodes and invariants for `CConcurrent`,
   `CConcurrentlyLoop`, `CDetach`, `CSelect`, task scopes, capture kinds, output
   modes, limits, timeouts, and result contracts;
@@ -257,8 +261,9 @@ Known remaining weakness:
 
 - general fiber lifecycle still depends on coupled fields such as `parked`,
   `queued`, `running`, `wake_pending`, timer waiter heap state, channel wait
-  kind, and channel wake reason; the lifecycle enum is currently a checked
-  mirror rather than the sole source of truth;
+  kind, and channel wake reason; the lifecycle enum now explicitly models the
+  created-to-queued, queued-to-dispatched, and ready-to-park handoffs, but it
+  remains a checked mirror rather than the sole source of truth;
 - channel send/receive waits, channel-backed select waits, task joins, and
   timer waits now store the same explicit wait-operation token in their waiter
   records, use a shared ready-to-park transition, and use shared timer-wait
@@ -267,9 +272,10 @@ Known remaining weakness:
   wake set that distinguishes ready waiters from expired timeout winners.
   Remaining duplication is now in owner-specific cleanup and queue handling
   rather than in the fiber/owner/id identity check;
-- cancellation now enters the same `blorp_fiber_wake` boundary, but
-  cancellation-before-park remains a cooperative pending-wake case until all
-  wait owners share one explicit wait-operation abstraction;
+- cancellation now enters the same `blorp_fiber_wake` boundary and shares the
+  locked pending-wake helper used by wake-before-yield handoffs. The remaining
+  cancellation hardening is owner-specific cleanup/removal when a cancellation
+  races with a waiter's queue membership, not a separate fiber wake protocol;
 - generated C still emits some deadline arithmetic and task-window sequencing
   directly instead of calling one narrow runtime task-scope API, but task batch
   setup, batch flushing, task slot cleanup registration, task joins, task
@@ -339,23 +345,28 @@ typedef enum {
     BLORP_FIBER_FREE,
     BLORP_FIBER_CREATED,
     BLORP_FIBER_QUEUED,
+    BLORP_FIBER_DISPATCHED,
     BLORP_FIBER_RUNNING,
+    BLORP_FIBER_READY_TO_PARK,
     BLORP_FIBER_PARKED,
     BLORP_FIBER_COMPLETED
 } blorp_FiberState;
 ```
 
-The `CREATED` state is important. Today new fibers start with `parked = 1` so
-the first schedule call can reuse the parked-to-runnable CAS. In the target
-model, a never-run fiber should not pretend to be parked in a wait structure.
+The `CREATED` and `DISPATCHED` states are important. A never-run fiber should
+not pretend to be parked in a wait structure. New fibers should move to
+`QUEUED` through a created-fiber scheduling path, while parked fibers should
+move back to `QUEUED` through the wake path. Once a worker pops a fiber from a
+run queue, the fiber is `DISPATCHED` until that worker marks it `RUNNING`.
 
 Work:
 
 - Add `blorp_FiberState` and transition helpers without removing the existing
   fields immediately.
 - Make transition helpers the only normal path for lifecycle changes:
-  `fiber_mark_created`, `fiber_mark_queued`, `fiber_mark_running`,
-  `fiber_mark_parked`, `fiber_mark_completed`, `fiber_mark_free`.
+  `fiber_mark_created`, `fiber_mark_queued`, `fiber_mark_dispatched`,
+  `fiber_mark_running`, `fiber_mark_ready_to_park`, `fiber_mark_parked`,
+  `fiber_mark_completed`, `fiber_mark_free`.
 - Define the synchronization rule for state changes in code: either the
   existing fiber state lock owns transitions, or a documented atomic CAS helper
   owns them. Do not let the enum become another loosely coupled field.
@@ -378,13 +389,21 @@ Tests:
   accept/read smoke cases under scheduler assertions;
 - run the same cases under `BLORP_THREADS=1,2,4,8`.
 
-Initial implementation: `blorp_FiberState` and lifecycle transition helpers are
+Current implementation: `blorp_FiberState` and lifecycle transition helpers are
 present in `runtime.c`, and scheduler debug snapshots report lifecycle state.
-The old `parked`, `queued`, `running`, and `wake_pending` fields remain
-compatibility mirrors for the current scheduler. New fibers still use the
-historical first-schedule `parked = 1` convention, but the lifecycle state
-records `CREATED` before the first queue transition. Recycled fibers now clear
-stale coroutine pointers before entering the object cache.
+`READY_TO_PARK` is explicit, so the runtime can distinguish a running fiber
+that has published a wait operation from a fiber that is actually suspended in
+`mco_yield`. `DISPATCHED` is explicit too, so the runtime no longer has a
+`QUEUED` lifecycle state whose queued mirror has already been cleared by
+run-queue pop. This matters for wake-before-yield races: a waker may clear the
+parked bit and set `wake_pending` before the fiber reaches `mco_yield`, and the
+owning worker requeues it after the coroutine suspends. The old `parked`,
+`queued`, `running`, and `wake_pending` fields remain compatibility mirrors for
+the current scheduler, but the main handoffs now use named lifecycle helpers.
+New fibers start unparked in `CREATED` and use a separate created-to-queued
+helper for immediate and batched task scheduling; the parked-to-runnable CAS is
+reserved for actual wait wakeups. Recycled fibers now clear stale coroutine
+pointers before entering the object cache.
 
 ### Phase 2: One Wake Path
 
@@ -428,9 +447,10 @@ sites for timers, IO waiters, task completion, channels, and select now use
 `blorp_fiber_wake`. The helper records the wake cause only after the existing
 parked-to-runnable CAS succeeds, so a losing timeout/readiness race cannot
 overwrite the winning cause. Cancellation also delegates through
-`blorp_fiber_wake`; the helper owns the cooperative cancellation-before-park
-pending-wake case. Initial fiber scheduling still uses the lower-level schedule
-helper because a never-run fiber is not being woken from a wait.
+`blorp_fiber_wake`; cancellation-before-park and wake-before-yield both record
+pending wakes through the same locked helper. Initial fiber scheduling no
+longer uses this parked-wake path: never-run fibers start unparked in
+`CREATED` and publish through the created-to-queued helper.
 
 ### Phase 3: Wait Owner Model
 
@@ -544,8 +564,15 @@ Channel-backed `select` waiters now also record the current select operation id
 and selected wake cause. A select wake from another channel or timer can leave
 brief stale waiter records on sibling channels; those stale records are ignored
 if the fiber has already cleared or moved past that select wait. The remaining
-hardening step is to factor the duplicated wait-owner pieces into a common
-runtime abstraction.
+hardening step is to keep factoring owner-specific queue and cleanup handling
+toward a common runtime abstraction.
+
+Wait-operation validation is now shared through
+`blorp_fiber_debug_assert_current_wait_operation`. Timer waiters, timer install,
+task join waiters, channel waiters, select waiters, and park setup all route
+their scheduler-debug owner/id/current checks through this helper. Owner-specific
+structures still own their queue links, removal rules, wake reason storage, and
+cleanup obligations.
 
 Task joins now use the same operation-identified shape. Each join wait installs
 a stack-scoped `blorp_TaskJoinWaiter` on the task, recording the fiber and the
@@ -645,6 +672,13 @@ Initial implementation:
   `window.tasks[slot]` and `window.cleanups[slot]` directly, so the runtime owns
   the invariant that a task handle and its cancellation cleanup frame come from
   the same bounded slot.
+- Task windows now have an explicit runtime lifecycle state
+  (`UNINITIALIZED`, `ACTIVE`, `ENDED`). `blorp_concurrent_task_window_begin`
+  initializes the whole stack window before allocation, and runtime spawn,
+  join, flush, and end helpers require an active window. Cleanup paths tolerate
+  already-ended windows. This makes double-end, spawn-after-end, and
+  join-after-cleanup runtime bugs fail at a named boundary instead of through
+  stale pointer/capacity combinations.
 - Dynamic fan-out task-window spawning now owns its spawn batch internally.
   Generated C chooses only the flush policy (`periodic` for list fan-out,
   `immediate` for resource-source fan-out) and no longer declares
@@ -708,6 +742,11 @@ Initial implementation:
 - `for ... concurrently(limit:)`, `List.concurrent`, resource-source fan-out,
   and fixed `concurrent(max_threads:)` now keep operation width local to their
   task-window capacity instead of passing it to `blorp_thread_pool_init`.
+- Work stealing remains deliberately deferred. Fibers are owner-pinned after
+  queue assignment; resuming a previously run fiber on a different carrier must
+  wait until the runtime has a written carrier-migration invariant covering
+  coroutine stacks, runtime TLS rebinding, FFI/resource code, signal stacks, and
+  reactor interactions, plus end-to-end migrated-fiber tests.
 
 ### Phase 6: Timer Scalability
 
@@ -736,6 +775,11 @@ Initial implementation:
   millisecond durations to nanoseconds, adding monotonic deadlines from either
   `now` or a captured start time, and creating realtime deadlines for
   condition-variable waits.
+- Timer heap draining now moves a fixed stack batch of expired timer waiters
+  while holding the timer lock, records the next deadline, releases the timer
+  lock, and only then wakes fibers. This preserves exact wait-operation
+  identity while keeping scheduler wake/enqueue work and heap allocation out of
+  the global timer lock.
 - Task joins, sleep, channel timeouts, `select` `after` arms, IO waiters, TCP
   timeout validation, worker timer waits, and process deadlines route through
   the shared helper instead of each carrying independent multiplication and
@@ -888,8 +932,12 @@ A virtual-thread optimization is ready when it has:
 - a failing test, stress case, or benchmark that demonstrates the need;
 - runtime tests for correctness and cancellation behavior;
 - thread-count coverage for `BLORP_THREADS=1,2,4,8` when scheduling is touched;
-- leak-check and sanitizer coverage for parked, woken, cancelled, and completed
-  fibers;
+- leak-check and supported sanitizer coverage for parked, woken, cancelled, and
+  completed fibers. On Darwin, use `--sanitize=undefined` for fiber-heavy
+  coverage because Apple AddressSanitizer does not reliably compose with
+  user-land fiber stack switching; keep full `--sanitize` coverage for
+  non-fiber memory-sensitive tests and for platforms where ASan supports the
+  runtime stack-switching path;
 - benchmark results before and after the change;
 - clear ownership-state transitions in code, preferably as explicit enum-like
   states rather than coupled booleans;

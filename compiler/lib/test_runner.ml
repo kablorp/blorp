@@ -15,6 +15,37 @@ let init_module_paths = Modules.init_module_paths
 
 let contains_substring = Modules.contains
 
+type sanitizer_mode =
+  | SanitizerOff
+  | SanitizerAddressUndefined
+  | SanitizerUndefinedOnly
+
+let sanitizer_mode_of_bool sanitize =
+  if sanitize then SanitizerAddressUndefined else SanitizerOff
+
+let select_sanitizer_mode ?sanitizer_mode ~sanitize () =
+  match sanitizer_mode with
+  | Some mode -> mode
+  | None -> sanitizer_mode_of_bool sanitize
+
+let sanitizer_enabled = function
+  | SanitizerOff -> false
+  | SanitizerAddressUndefined | SanitizerUndefinedOnly -> true
+
+let sanitizer_mode_to_string = function
+  | SanitizerOff -> "off"
+  | SanitizerAddressUndefined -> "address,undefined"
+  | SanitizerUndefinedOnly -> "undefined"
+
+let sanitizer_mode_of_string value =
+  match String.lowercase_ascii (String.trim value) with
+  | "" | "0" | "false" | "off" | "none" -> Some SanitizerOff
+  | "1" | "true" | "on" | "address" | "asan" | "address,undefined"
+  | "undefined,address" ->
+      Some SanitizerAddressUndefined
+  | "undefined" | "ubsan" -> Some SanitizerUndefinedOnly
+  | _ -> None
+
 let starts_with s prefix =
   let s_len = String.length s in
   let p_len = String.length prefix in
@@ -479,14 +510,20 @@ let run_process_timeout ~timeout prog args =
           else
             match !status with Some st -> exit_code_of_status st | None -> 124)
 
-let sanitize_cc_args =
-  [ "-fsanitize=address,undefined"; "-fno-omit-frame-pointer"; "-g" ]
-
 (** Detect whether `cc` is Clang or GCC. Cached after first call. *)
 let cc_is_clang =
   lazy
     (let _, output = run_process_capture "cc" [ "--version" ] in
      contains_substring output "clang")
+
+let sanitizer_cc_args = function
+  | SanitizerOff -> []
+  | SanitizerAddressUndefined ->
+      [ "-fsanitize=address,undefined"; "-fno-omit-frame-pointer"; "-g" ]
+  | SanitizerUndefinedOnly ->
+      [ "-fsanitize=undefined"; "-fno-omit-frame-pointer"; "-g" ]
+
+let sanitize_cc_args = sanitizer_cc_args SanitizerAddressUndefined
 
 (** Compile C code piped via stdin, avoiding temp file I/O.
     Uses `cc -x c - -x none` to read C from stdin, then resets the
@@ -689,7 +726,7 @@ let compiler_hash =
         cached := Some h;
         h
 
-let runtime_cache_key ~sanitize ~opt ~tls_backend =
+let runtime_cache_key ~sanitizer_mode ~opt ~tls_backend =
   Digest.to_hex
     (Digest.string
        (String.concat "\000"
@@ -698,11 +735,11 @@ let runtime_cache_key ~sanitize ~opt ~tls_backend =
             runtime_hash ();
             compiler_hash ();
             opt;
-            string_of_bool sanitize;
+            sanitizer_mode_to_string sanitizer_mode;
             tls_backend_profile_to_string tls_backend;
             Sys.os_type;
             Lazy.force cc_identity;
-            String.concat " " sanitize_cc_args;
+            String.concat " " (sanitizer_cc_args sanitizer_mode);
             String.concat " " (tls_backend_runtime_cc_args tls_backend);
           ]))
 
@@ -739,8 +776,9 @@ let runtime_cache_verified ~key ~tls_backend dir =
     with _ -> false
 
 (** Compile runtime artifacts to the given paths (no caching logic here) *)
-let compile_runtime_artifacts ?(sanitize = false) ?(opt = "O0")
+let compile_runtime_artifacts ?(sanitize = false) ?sanitizer_mode ?(opt = "O0")
     ?(tls_backend = TlsUnsupported) obj_path _pch_path h_path =
+  let sanitizer_mode = select_sanitizer_mode ?sanitizer_mode ~sanitize () in
   let runtime_c =
     run_artifact_path ~kind:"runtime-src" ~prefix:"runtime" ~suffix:".c"
   in
@@ -765,7 +803,7 @@ let compile_runtime_artifacts ?(sanitize = false) ?(opt = "O0")
           "-lpthread";
         ]
         @ tls_backend_runtime_cc_args tls_backend
-        @ if sanitize then sanitize_cc_args else []
+        @ sanitizer_cc_args sanitizer_mode
       in
       let result, _output = run_process_capture "cc" cc_args in
       if result = 0 then begin
@@ -786,9 +824,10 @@ let compile_runtime_artifacts ?(sanitize = false) ?(opt = "O0")
       end
       else None)
 
-let precompile_runtime ?(sanitize = false) ?(opt = "O0") () =
+let precompile_runtime ?(sanitize = false) ?sanitizer_mode ?(opt = "O0") () =
+  let sanitizer_mode = select_sanitizer_mode ?sanitizer_mode ~sanitize () in
   let tls_backend = current_tls_backend_profile () in
-  let key = runtime_cache_key ~sanitize ~opt ~tls_backend in
+  let key = runtime_cache_key ~sanitizer_mode ~opt ~tls_backend in
   let dir = cache_object_dir ~kind:"runtime" key in
   let obj_path = runtime_obj_path dir in
   let h_path = runtime_header_path dir in
@@ -812,7 +851,7 @@ let precompile_runtime ?(sanitize = false) ?(opt = "O0") () =
       let stage_obj = runtime_obj_path stage_dir in
       let stage_h = runtime_header_path stage_dir in
       match
-        compile_runtime_artifacts ~sanitize ~opt ~tls_backend stage_obj
+        compile_runtime_artifacts ~sanitizer_mode ~opt ~tls_backend stage_obj
           (Filename.concat stage_dir "runtime.h.pch")
           stage_h
       with
@@ -2030,8 +2069,10 @@ let remap_compiler_error (table : loc_remap_table) (e : Ast.compiler_error) :
     Ast.compiler_error =
   { e with loc = remap_loc table e.loc }
 
-let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
-    ~link_flags () =
+let cc_args_for_test_binary ?precompiled ?(include_dirs = [])
+    ?(sanitize = false) ?sanitizer_mode ~link_flags () =
+  let sanitizer_mode = select_sanitizer_mode ?sanitizer_mode ~sanitize () in
+  let sanitize = sanitizer_enabled sanitizer_mode in
   let raylib_flags =
     if has_raylib_import () then raylib_linker_flags () else ""
   in
@@ -2057,15 +2098,15 @@ let cc_args_for_test_binary ?precompiled ?(include_dirs = []) ~sanitize
   @ runtime_feature_args
   @ List.concat_map (fun dir -> [ "-I"; dir ]) include_dirs
   @ header_args @ runtime_obj_args @ [ "-lm"; "-lpthread" ]
-  @ (if sanitize then sanitize_cc_args else [])
+  @ sanitizer_cc_args sanitizer_mode
   @ tls_backend_link_cc_args tls_backend
   @ (if raylib_flags = "" then []
      else String.split_on_char ' ' (String.trim raylib_flags))
   @ Ffi_boundary.link_flags_cc_args link_flags
 
-let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
-    ?(leak_check = false) ?(isolate_filesystem = false) ?(cache_result = true)
-    ?loc_remap ?module_base_dir ~timeout filename =
+let run_test_result ?(debug = false) ?(sanitize = false) ?sanitizer_mode
+    ?precompiled ?(leak_check = false) ?(isolate_filesystem = false)
+    ?(cache_result = true) ?loc_remap ?module_base_dir ~timeout filename =
   let start_time = get_time () in
   let make_result ?(output = "") ?(error_detail = "") passed =
     {
@@ -2157,7 +2198,7 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
           (fun () ->
             let cc_args =
               cc_args_for_test_binary ?precompiled ~include_dirs ~sanitize
-                ~link_flags ()
+                ?sanitizer_mode ~link_flags ()
             in
             let cc_result, cc_output =
               compile_c_from_stdin c_code bin_file cc_args
@@ -2212,8 +2253,8 @@ let run_test_result ?(debug = false) ?(sanitize = false) ?precompiled
       result
 
 (** Run doctests from a source file. *)
-let run_doctests ?(debug = false) ?(sanitize = false) ?precompiled ~timeout
-    source_filename =
+let run_doctests ?(debug = false) ?(sanitize = false) ?sanitizer_mode
+    ?precompiled ~timeout source_filename =
   match parse_file source_filename with
   | Error msg ->
       [
@@ -2261,7 +2302,8 @@ let run_doctests ?(debug = false) ?(sanitize = false) ?precompiled ~timeout
              so the snippet, line-number gutter, column marker, and
              file path all agree with the user's real source. *)
             let r =
-              run_test_result ~debug ~sanitize ?precompiled ~loc_remap:remap
+              run_test_result ~debug ~sanitize ?sanitizer_mode ?precompiled
+                ~loc_remap:remap
                 ~module_base_dir:(extract_directory source_filename)
                 ~timeout tmp_file
             in
@@ -2299,18 +2341,19 @@ let print_test_result ?(profile = false) ?(leak_check = false) r =
   end
 
 (** Run a suite test, checking cache first *)
-let run_suite_test_cached ?(debug = false) ?(sanitize = false) ?precompiled
-    ?(leak_check = false) ?(isolate_filesystem = false) ~timeout filename =
+let run_suite_test_cached ?(debug = false) ?(sanitize = false) ?sanitizer_mode
+    ?precompiled ?(leak_check = false) ?(isolate_filesystem = false) ~timeout
+    filename =
   match if isolate_filesystem then None else check_test_cache filename with
   | Some cached -> cached
   | None ->
-      run_test_result ~debug ~sanitize ?precompiled ~leak_check
+      run_test_result ~debug ~sanitize ?sanitizer_mode ?precompiled ~leak_check
         ~isolate_filesystem ~cache_result:(not isolate_filesystem) ~timeout
         filename
 
 (** Run a single test file with mode dispatch *)
-let run_test_with_mode ?(debug = false) ?(sanitize = false) ?precompiled
-    ?(leak_check = false) ?(mode = TestAll) ~timeout filename =
+let run_test_with_mode ?(debug = false) ?(sanitize = false) ?sanitizer_mode
+    ?precompiled ?(leak_check = false) ?(mode = TestAll) ~timeout filename =
   let isolate_filesystem =
     leak_check || requires_filesystem_isolation filename
   in
@@ -2321,27 +2364,29 @@ let run_test_with_mode ?(debug = false) ?(sanitize = false) ?precompiled
   match mode with
   | DocOnly ->
       if has_doctests filename then
-        run_doctests ~debug ~sanitize ?precompiled ~timeout filename
+        run_doctests ~debug ~sanitize ?sanitizer_mode ?precompiled ~timeout
+          filename
       else []
   | SuiteOnly ->
       if is_suite_file then
         [
-          run_suite_test_cached ~debug ~sanitize ?precompiled ~leak_check
-            ~isolate_filesystem ~timeout filename;
+          run_suite_test_cached ~debug ~sanitize ?sanitizer_mode ?precompiled
+            ~leak_check ~isolate_filesystem ~timeout filename;
         ]
       else []
   | TestAll ->
       let suite_results =
         if is_suite_file then
           [
-            run_suite_test_cached ~debug ~sanitize ?precompiled ~leak_check
-              ~isolate_filesystem ~timeout filename;
+            run_suite_test_cached ~debug ~sanitize ?sanitizer_mode ?precompiled
+              ~leak_check ~isolate_filesystem ~timeout filename;
           ]
         else []
       in
       let doc_results =
         if has_doctests filename then
-          run_doctests ~debug ~sanitize ?precompiled ~timeout filename
+          run_doctests ~debug ~sanitize ?sanitizer_mode ?precompiled ~timeout
+            filename
         else []
       in
       suite_results @ doc_results
@@ -2352,7 +2397,7 @@ let print_test_start ?worker file =
   | None -> Printf.eprintf "RUN: %s\n%!" file
 
 let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
-    ?precompiled ~harness_label ~filename_base source =
+    ?sanitizer_mode ?precompiled ~harness_label ~filename_base source =
   (match Sys.getenv_opt "BLORP_DUMP_WRAPPED" with
   | Some path ->
       let oc = open_out path in
@@ -2382,8 +2427,8 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
       let compilation_dir = run_compilation_dir () in
       let bin_file = Filename.concat compilation_dir "program.bin" in
       let cc_args =
-        cc_args_for_test_binary ?precompiled ~include_dirs ~sanitize ~link_flags
-          ()
+        cc_args_for_test_binary ?precompiled ~include_dirs ~sanitize
+          ?sanitizer_mode ~link_flags ()
       in
       let cc_result, cc_output = compile_c_from_stdin c_code bin_file cc_args in
       if cc_result = 0 then Ok bin_file
@@ -2398,15 +2443,15 @@ let compile_suite_harness_source ?(debug = false) ?(sanitize = false)
         Error detail
 
 let compile_suite_selector_harness ?(debug = false) ?(sanitize = false)
-    ?precompiled ?(leak_check = false) files =
-  compile_suite_harness_source ~debug ~sanitize ?precompiled
+    ?sanitizer_mode ?precompiled ?(leak_check = false) files =
+  compile_suite_harness_source ~debug ~sanitize ?sanitizer_mode ?precompiled
     ~harness_label:"suite-selector-harness"
     ~filename_base:"__suite_selector_harness__.brp"
     (generate_suite_selector_harness ~leak_check files)
 
 let compile_suite_run_all_harness ?(debug = false) ?(sanitize = false)
-    ?precompiled files =
-  compile_suite_harness_source ~debug ~sanitize ?precompiled
+    ?sanitizer_mode ?precompiled files =
+  compile_suite_harness_source ~debug ~sanitize ?sanitizer_mode ?precompiled
     ~harness_label:"suite-run-all-harness"
     ~filename_base:"__suite_run_all_harness__.brp"
     (generate_suite_run_all_harness files)
@@ -2762,8 +2807,8 @@ let print_results_summary ?(profile = false) ?(num_workers = 0) elapsed passed
    ============================================================================ *)
 
 let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
-    ?(sanitize = false) ?precompiled ?(leak_check = false) ?(mode = TestAll)
-    ~timeout files =
+    ?(sanitize = false) ?sanitizer_mode ?precompiled ?(leak_check = false)
+    ?(mode = TestAll) ~timeout files =
   let run_all_files =
     List.filter (suite_run_all_eligible ~leak_check mode) files
   in
@@ -2808,7 +2853,8 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
           if List.length batch >= 2 then begin
             mark_handled batch;
             match
-              compile_suite_run_all_harness ~debug ~sanitize ?precompiled batch
+              compile_suite_run_all_harness ~debug ~sanitize ?sanitizer_mode
+                ?precompiled batch
             with
             | Error detail ->
                 Printf.eprintf "Combined run-all test compile failed:\n%s\n%!"
@@ -2828,8 +2874,8 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
       else begin
         mark_handled selector_files;
         match
-          compile_suite_selector_harness ~debug ~sanitize ?precompiled
-            ~leak_check selector_files
+          compile_suite_selector_harness ~debug ~sanitize ?sanitizer_mode
+            ?precompiled ~leak_check selector_files
         with
         | Error detail ->
             Printf.eprintf "Combined isolated test compile failed:\n%s\n%!"
@@ -2862,8 +2908,8 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
           && not (Hashtbl.mem result_by_file file)
         then
           record_results
-            (run_test_with_mode ~debug ~sanitize ?precompiled ~leak_check ~mode
-               ~timeout file))
+            (run_test_with_mode ~debug ~sanitize ?sanitizer_mode ?precompiled
+               ~leak_check ~mode ~timeout file))
       files;
     let ordered_results =
       List.filter_map (fun file -> Hashtbl.find_opt result_by_file file) files
@@ -2882,7 +2928,8 @@ let try_run_suite_selector_tests ?(profile = false) ?(debug = false)
   end
 
 let run_tests_sequential ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?precompiled ?(leak_check = false) ?(mode = TestAll) ~timeout files =
+    ?sanitizer_mode ?precompiled ?(leak_check = false) ?(mode = TestAll)
+    ~timeout files =
   let start_time = get_time () in
   let passed = ref 0 in
   let failed = ref 0 in
@@ -2891,8 +2938,8 @@ let run_tests_sequential ?(profile = false) ?(debug = false) ?(sanitize = false)
     (fun file ->
       print_test_start file;
       let results =
-        run_test_with_mode ~debug ~sanitize ?precompiled ~leak_check ~mode
-          ~timeout file
+        run_test_with_mode ~debug ~sanitize ?sanitizer_mode ?precompiled
+          ~leak_check ~mode ~timeout file
       in
       List.iter
         (fun r ->
@@ -2907,8 +2954,8 @@ let run_tests_sequential ?(profile = false) ?(debug = false) ?(sanitize = false)
 
 (** Run tests in parallel using fork *)
 let run_tests_parallel ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?precompiled ?(leak_check = false) ?(mode = TestAll) ~timeout ~num_workers
-    files =
+    ?sanitizer_mode ?precompiled ?(leak_check = false) ?(mode = TestAll)
+    ~timeout ~num_workers files =
   let start_time = get_time () in
   let n = min num_workers (List.length files) in
 
@@ -2961,8 +3008,8 @@ let run_tests_parallel ?(profile = false) ?(debug = false) ?(sanitize = false)
                 List.concat_map
                   (fun file ->
                     print_test_start ~worker:(worker_idx + 1) file;
-                    run_test_with_mode ~debug ~sanitize ?precompiled ~leak_check
-                      ~mode ~timeout file)
+                    run_test_with_mode ~debug ~sanitize ?sanitizer_mode
+                      ?precompiled ~leak_check ~mode ~timeout file)
                   tests
               with exn ->
                 List.map
@@ -3034,9 +3081,11 @@ let run_tests_parallel ?(profile = false) ?(debug = false) ?(sanitize = false)
 
 (** Run tests: dispatches to sequential or parallel *)
 let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0) ?(cache = true)
-    ?(repeat = 1) files =
+    ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
+    ?(cache = true) ?(repeat = 1) files =
   with_run_artifacts (fun () ->
+      let sanitizer_mode = select_sanitizer_mode ?sanitizer_mode ~sanitize () in
+      let sanitize = sanitizer_enabled sanitizer_mode in
       (* Warn if std/ sources are newer than the compiler binary *)
       check_stale_std ();
       (* Set leak check env var at top level — inherited by forked workers *)
@@ -3058,20 +3107,20 @@ let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
         else if jobs > 0 then jobs
         else detect_num_cores ()
       in
-      let precompiled = precompile_runtime ~sanitize ~opt:"O0" () in
+      let precompiled = precompile_runtime ~sanitizer_mode ~opt:"O0" () in
       let run_once iteration =
         if repeat > 1 then Printf.printf "\nRepeat %d/%d\n%!" iteration repeat;
         match
-          try_run_suite_selector_tests ~profile ~debug ~sanitize ?precompiled
-            ~leak_check ~mode ~timeout files
+          try_run_suite_selector_tests ~profile ~debug ~sanitizer_mode
+            ?precompiled ~leak_check ~mode ~timeout files
         with
         | Some result -> result
         | None ->
             if effective_jobs = 1 then
-              run_tests_sequential ~profile ~debug ~sanitize ?precompiled
+              run_tests_sequential ~profile ~debug ~sanitizer_mode ?precompiled
                 ~leak_check ~mode ~timeout files
             else
-              run_tests_parallel ~profile ~debug ~sanitize ?precompiled
+              run_tests_parallel ~profile ~debug ~sanitizer_mode ?precompiled
                 ~leak_check ~mode ~timeout ~num_workers:effective_jobs files
       in
       let rec loop iteration =
@@ -3083,14 +3132,14 @@ let run_test_files ?(profile = false) ?(debug = false) ?(sanitize = false)
 
 (** Run tests: dispatches to sequential or parallel *)
 let run_tests ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0) ?(cache = true)
-    ?(repeat = 1) path =
-  run_test_files ~profile ~debug ~sanitize ~leak_check ~mode ~timeout ~jobs
-    ~cache ~repeat
+    ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
+    ?(cache = true) ?(repeat = 1) path =
+  run_test_files ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
+    ~timeout ~jobs ~cache ~repeat
     (collect_test_files [ path ])
 
 let run_tests_paths ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0) ?(cache = true)
-    ?(repeat = 1) paths =
-  run_test_files ~profile ~debug ~sanitize ~leak_check ~mode ~timeout ~jobs
-    ~cache ~repeat (collect_test_files paths)
+    ?sanitizer_mode ?(leak_check = false) ?(mode = TestAll) ~timeout ?(jobs = 0)
+    ?(cache = true) ?(repeat = 1) paths =
+  run_test_files ~profile ~debug ~sanitize ?sanitizer_mode ~leak_check ~mode
+    ~timeout ~jobs ~cache ~repeat (collect_test_files paths)

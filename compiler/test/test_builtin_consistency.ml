@@ -183,8 +183,11 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "getenv";
       "send_timeout";
       "task_join_slot_probe_for_test";
+      "fiber_created_schedule_probe_for_test";
       "websocket_state_probe_for_test";
       "wait_ready_to_park_probe_for_test";
+      "fiber_lifecycle_ready_to_park_probe_for_test";
+      "fiber_cancel_before_park_probe_for_test";
       "current_timer_wait_install_probe_for_test";
       "cooperative_checkpoint_probe_for_test";
       "blorp_dns_resolve_raw";
@@ -266,7 +269,10 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "try_send_attempt";
       "try_recv_attempt";
       "task_join_slot_probe_for_test";
+      "fiber_created_schedule_probe_for_test";
       "wait_ready_to_park_probe_for_test";
+      "fiber_lifecycle_ready_to_park_probe_for_test";
+      "fiber_cancel_before_park_probe_for_test";
       "current_timer_wait_install_probe_for_test";
       "seal";
       "read";
@@ -333,7 +339,10 @@ let test_builtin_effect_metadata_classifies_typechecker_sets () =
       "yield_now";
       "cancel_after_parked_for_test";
       "task_join_slot_probe_for_test";
+      "fiber_created_schedule_probe_for_test";
       "wait_ready_to_park_probe_for_test";
+      "fiber_lifecycle_ready_to_park_probe_for_test";
+      "fiber_cancel_before_park_probe_for_test";
       "current_timer_wait_install_probe_for_test";
       "cooperative_checkpoint_probe_for_test";
       "tls_state_probe_for_test";
@@ -697,7 +706,9 @@ let test_fiber_lifecycle_state_is_explicit () =
       ("free state", "BLORP_FIBER_FREE");
       ("created state", "BLORP_FIBER_CREATED");
       ("queued state", "BLORP_FIBER_QUEUED");
+      ("dispatched state", "BLORP_FIBER_DISPATCHED");
       ("running state", "BLORP_FIBER_RUNNING");
+      ("ready-to-park state", "BLORP_FIBER_READY_TO_PARK");
       ("parked state", "BLORP_FIBER_PARKED");
       ("completed state", "BLORP_FIBER_COMPLETED");
       ("fiber carries lifecycle state", "_Atomic int lifecycle_state;");
@@ -705,10 +716,20 @@ let test_fiber_lifecycle_state_is_explicit () =
       ("transition helper", "blorp_fiber_transition_state");
       ("mark created helper", "blorp_fiber_mark_created");
       ("mark queued helper", "blorp_fiber_mark_queued");
+      ("mark dispatched helper", "blorp_fiber_mark_dispatched");
       ("mark running helper", "blorp_fiber_mark_running");
+      ("mark ready-to-park helper", "blorp_fiber_mark_ready_to_park");
       ("mark parked helper", "blorp_fiber_mark_parked");
       ("mark completed helper", "blorp_fiber_mark_completed");
       ("mark free helper", "blorp_fiber_mark_free");
+      ("created queue helper", "blorp_fiber_prepare_created_for_queue");
+      ("created enqueue helper", "blorp_fiber_enqueue_created_runnable");
+      ( "created exclusive ownership invariant",
+        "created fiber is not exclusively owned by scheduler" );
+      ( "dispatched mirror invariant",
+        "dispatched fiber still queued, parked, or running" );
+      ("created schedule probe", "blorp_test_fiber_created_schedule_probe");
+      ("cancel-before-park probe", "blorp_test_fiber_cancel_before_park_probe");
       ("recycled fibers clear coroutine pointer", "f->coro = NULL;");
       ("completed fibers clear coroutine pointer", "fiber->coro = NULL;");
     ]
@@ -716,7 +737,13 @@ let test_fiber_lifecycle_state_is_explicit () =
   List.iter
     (fun (name, needle) ->
       Alcotest.(check bool) name true (contains_substring runtime needle))
-    required
+    required;
+  Alcotest.(check bool)
+    "new fibers no longer start as parked" false
+    (contains_substring runtime "f->parked = 1;");
+  Alcotest.(check bool)
+    "new fibers no longer schedule through parked wake wrapper" false
+    (contains_substring runtime "static void blorp_fiber_schedule(")
 
 let test_fiber_wake_cause_is_explicit () =
   let runtime =
@@ -772,6 +799,8 @@ let test_fiber_wait_owner_is_explicit () =
       ("explicit wait operation carries id", "uint64_t id;");
       ("wait owner name helper", "blorp_fiber_wait_owner_debug_name");
       ("wait operation id helper", "blorp_fiber_current_wait_operation_id");
+      ( "shared wait operation validator",
+        "blorp_fiber_debug_assert_current_wait_operation" );
       ("begin wait helper", "blorp_fiber_begin_wait");
       ("prepare wait to park helper", "blorp_fiber_prepare_wait_to_park");
       ("abandon wait before park helper", "blorp_fiber_abandon_wait_before_park");
@@ -782,10 +811,17 @@ let test_fiber_wait_owner_is_explicit () =
       ("snapshot includes wait id", "wait_operation_id=%llu");
       ("timer stale guard", "stale timer wait operation");
       ("parked owner invariant", "parked without wait owner");
+      ("ready-to-park lifecycle invariant", "ready to park but not running");
+      ( "ready-to-park wake invariant",
+        "ready to park without parked bit or pending wake" );
       ("ready to park owner invariant", "wait ready to park without owner");
       ("ready to park stale guard", "wait ready to park with stale operation");
       ("abandon stale operation guard", "abandoning stale wait operation");
       ("park stale operation guard", "park entered with stale wait operation");
+      ( "park requires ready-to-park lifecycle",
+        "park entered before ready-to-park lifecycle transition" );
+      ( "deterministic lifecycle ready-to-park probe",
+        "blorp_test_fiber_lifecycle_ready_to_park_probe" );
     ]
   in
   List.iter
@@ -821,6 +857,10 @@ let test_timer_waiters_carry_operation_identity () =
         "timer wait removed for different wait operation" );
       ("timer waiter current helper", "blorp_timer_waiter_current");
       ("timer waiter wake helper", "blorp_timer_waiter_wake");
+      ("timer drain uses stack batch", "blorp_TimerWaiter* stack_expired[64];");
+      ("timer drain chunks expired waiters", "bool more_expired = false;");
+      ( "timer drain wakes batched waiters",
+        "stack_expired[i], BLORP_WAKE_TIMEOUT" );
       ("timer stale wait guard", "stale timer wait operation");
       ( "timer waiter stale operation guard",
         "timer waiter prepared for stale wait operation" );
@@ -980,6 +1020,8 @@ let test_concurrent_task_window_cleanup_owns_active_slots () =
       ( "task window cleanup helper",
         "blorp_concurrent_task_window_cancel_join_active" );
       ("task window cleanup kind", "BLORP_CANCEL_CLEANUP_TASK_WINDOW");
+      ("task window lifecycle state", "BLORP_CONCURRENT_TASK_WINDOW_ACTIVE");
+      ("task window active guard", "blorp_concurrent_task_window_check_active");
       ( "task window frames are marked distinctly",
         "cleanup->kind = BLORP_CANCEL_CLEANUP_TASK_WINDOW;" );
       ( "cancellation drain flushes task windows first",
@@ -991,8 +1033,8 @@ let test_concurrent_task_window_cleanup_owns_active_slots () =
         "__blorp_task_cleanup_pop_slot_slow(&window->tasks[i]);" );
       ( "cancellation drain deactivates detached slot frames",
         "blorp_task_cleanup_deactivate_slot_in_frame_list(\n\
-        \                frames,\n\
-        \                &window->tasks[i]);" );
+        \            frames,\n\
+        \            &window->tasks[i]);" );
       ( "cancellation drain joins task windows before generic cleanup",
         "blorp_concurrent_task_window_cancel_join_active_from_cancel_frames(\n\
         \                (blorp_ConcurrentTaskWindow*)f->value,\n\
@@ -1003,6 +1045,8 @@ let test_concurrent_task_window_cleanup_owns_active_slots () =
       ( "task window cleanup cancels active slots",
         "blorp_task_cancel_join_release(task);" );
       ("task window cleanup nulls active slots", "window->tasks[i] = NULL;");
+      ( "task window cleanup marks ended",
+        "window->state = BLORP_CONCURRENT_TASK_WINDOW_ENDED;" );
       ( "deterministic task window cleanup probe",
         "blorp_test_task_window_pending_cleanup_probe" );
     ]

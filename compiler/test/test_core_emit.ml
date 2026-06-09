@@ -2937,6 +2937,10 @@ let test_emit_concurrent_block () =
     "uses runtime task window" true
     (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_");
   Alcotest.(check bool)
+    "zero-initializes runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_"
+    && contains_sub output " = {0};");
+  Alcotest.(check bool)
     "begins protected task window through runtime" true
     (contains_sub output "blorp_concurrent_task_window_begin");
   Alcotest.(check bool)
@@ -3262,6 +3266,10 @@ let test_emit_concurrently_loop_rc_result_uses_spawn_rc () =
   Alcotest.(check bool)
     "for ... concurrently uses one runtime task window" true
     (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_");
+  Alcotest.(check bool)
+    "for ... concurrently zero-initializes runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_"
+    && contains_sub output " = {0};");
   Alcotest.(check bool)
     "for ... concurrently begins protected task window through runtime" true
     (contains_sub output "blorp_concurrent_task_window_begin");
