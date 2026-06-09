@@ -61,6 +61,9 @@ let module_aliases_of_program (program : program) =
 
 let init_module_paths = Modules.init_module_paths
 
+let target_module_name path =
+  Option.value ~default:"" (Modules.std_module_name_for_source_file path)
+
 (** Run the full analysis pipeline on a document.
     Collects parse errors, type errors, and module errors. *)
 let analyze (_state : state) (doc : document) : unit =
@@ -94,6 +97,8 @@ let analyze (_state : state) (doc : document) : unit =
 
       (* Phase 2: Load modules *)
       init_module_paths base_dir;
+      let module_origin = Modules.module_origin_for_source_file path in
+      let module_name = target_module_name path in
       let _modules = Modules.load_imports program base_dir in
       let module_errors = List.rev (Modules.get_load_errors ()) in
 
@@ -101,7 +106,9 @@ let analyze (_state : state) (doc : document) : unit =
          analysis stores the validated typed compatibility view for hover and
          definition lookup. *)
       let type_errors, env =
-        match Typecheck.typecheck_with_env_typed program with
+        match
+          Typecheck.typecheck_with_env_typed ~module_origin ~module_name program
+        with
         | Ok (typed_program, env) ->
             doc.typed_program <- Some typed_program;
             doc.program <- Some (Typed_ast.program_ast typed_program);

@@ -845,6 +845,34 @@ let collect_function_type_param_occurrences ?file (program : program)
    Definition lookup — for go-to-definition
    ============================================================================ *)
 
+let loc_at_declared_name loc ~name ~keyword_prefix =
+  let column = loc.column + String.length keyword_prefix in
+  {
+    loc with
+    column;
+    end_line = loc.line;
+    end_column = column + String.length name;
+  }
+
+let type_decl_name_loc loc (td : type_decl) =
+  let keyword_prefix =
+    if td.type_is_resource then "resource type "
+    else if td.type_is_enum then "enum "
+    else if td.type_variants = [] then "type "
+    else "union "
+  in
+  loc_at_declared_name loc ~name:td.type_name ~keyword_prefix
+
+let record_decl_name_loc loc (rd : record_decl) =
+  let keyword_prefix = if rd.record_is_value then "struct " else "record " in
+  loc_at_declared_name loc ~name:rd.record_name ~keyword_prefix
+
+let type_alias_name_loc loc (ad : type_alias_decl) =
+  let keyword_prefix =
+    if ad.alias_is_opaque then "opaque type " else "type alias "
+  in
+  loc_at_declared_name loc ~name:ad.alias_name ~keyword_prefix
+
 (** Find the definition location of a name in the program.
     Searches top-level declarations first, then local definitions
     within the enclosing function body at the given cursor position. *)
@@ -867,18 +895,24 @@ let find_definition (program : program) ~(name : string) ~(line : int)
           match d.decl_desc with
           | DFunc fd when fd.func_name = Some name -> Some d.decl_loc
           | DVar vd when vd.var_name = Some name -> Some d.decl_loc
-          | DType td when td.type_name = name -> Some d.decl_loc
+          | DType td when td.type_name = name ->
+              Some (type_decl_name_loc d.decl_loc td)
           | DType td -> (
               match
                 List.find_opt
                   (fun (v : variant) -> v.variant_name = name)
                   td.type_variants
               with
-              | Some _ -> Some d.decl_loc
+              | Some variant ->
+                  Some
+                    (loc_at_declared_name variant.variant_loc
+                       ~name:variant.variant_name ~keyword_prefix:"")
               | None -> None)
-          | DRecord rd when rd.record_name = name -> Some d.decl_loc
+          | DRecord rd when rd.record_name = name ->
+              Some (record_decl_name_loc d.decl_loc rd)
           | DTrait td when td.trait_name = name -> Some d.decl_loc
-          | DTypeAlias ad when ad.alias_name = name -> Some d.decl_loc
+          | DTypeAlias ad when ad.alias_name = name ->
+              Some (type_alias_name_loc d.decl_loc ad)
           | DPrivate inner -> find_in_decls [ inner ]
           | _ -> None
         in

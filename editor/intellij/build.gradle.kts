@@ -31,6 +31,11 @@ intellijPlatform {
             sinceBuild = "253"
         }
     }
+    pluginVerification {
+        ides {
+            recommended()
+        }
+    }
     instrumentCode = false
     buildSearchableOptions = false
 }

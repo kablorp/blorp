@@ -285,12 +285,28 @@ let position_on_definition_name def_loc name (pos : Lsp_protocol.position) =
   pos.line = def_line && def_col <= pos.character
   && pos.character < def_col + String.length name
 
-let uses_for_definition_site uri doc program pos def_loc =
+let selection_range_at_cursor (doc : Lsp_state.document)
+    (pos : Lsp_protocol.position) =
+  match Lsp_position.line_at doc.text ~line:pos.line with
+  | None -> None
+  | Some line_text ->
+      Lsp_position.ident_span_at line_text ~col:pos.character
+      |> Option.map (fun (start_col, end_col) ->
+          {
+            Lsp_protocol.start = { line = pos.line; character = start_col };
+            end_ = { line = pos.line; character = end_col };
+          })
+
+let uses_for_definition_site ?origin_selection_range uri doc program pos def_loc
+    =
   Lsp_references.matching_occurrences doc program pos
   |> List.filter (fun occurrence ->
       not
         (Lsp_references.loc_same_position occurrence.Lsp_references.loc def_loc))
-  |> List.map (Lsp_references.location_json uri)
+  |> List.map (fun occurrence ->
+      let range = Lsp_references.occurrence_range occurrence in
+      Lsp_protocol.location_link_json ?origin_selection_range ~target_uri:uri
+        ~target_range:range ~target_selection_range:range ())
 
 let handle_definition (state : Lsp_state.state) params =
   let td = get "textDocument" params in
@@ -312,6 +328,9 @@ let handle_definition (state : Lsp_state.state) params =
               in
               match name_opt with
               | Some name -> (
+                  let origin_selection_range =
+                    selection_range_at_cursor doc pos
+                  in
                   let make_location target_uri def_loc =
                     let def_pos = Lsp_protocol.loc_to_position def_loc in
                     let range =
@@ -324,13 +343,18 @@ let handle_definition (state : Lsp_state.state) params =
                           };
                       }
                     in
-                    Lsp_protocol.location_json ~uri:target_uri ~range
+                    Lsp_protocol.location_link_json ?origin_selection_range
+                      ~target_uri ~target_range:range
+                      ~target_selection_range:range ()
+                  in
+                  let single_location target_uri def_loc =
+                    Array [ make_location target_uri def_loc ]
                   in
                   let make_location_for_loc def_loc =
                     match def_loc.Ast.loc_file with
                     | Some file ->
-                        make_location (Lsp_protocol.path_to_uri file) def_loc
-                    | None -> make_location uri def_loc
+                        single_location (Lsp_protocol.path_to_uri file) def_loc
+                    | None -> single_location uri def_loc
                   in
                   let field_definition =
                     match doc.env with
@@ -358,7 +382,7 @@ let handle_definition (state : Lsp_state.state) params =
                         let real_path =
                           Lsp_position.resolve_module_source_path ~base_dir path
                         in
-                        make_location
+                        single_location
                           (Lsp_protocol.path_to_uri real_path)
                           def_loc
                     | None -> Null
@@ -371,18 +395,20 @@ let handle_definition (state : Lsp_state.state) params =
                     | Some def_loc ->
                         if position_on_definition_name def_loc name pos then
                           match
-                            uses_for_definition_site uri doc program pos def_loc
+                            uses_for_definition_site ?origin_selection_range uri
+                              doc program pos def_loc
                           with
-                          | [] -> make_location uri def_loc
+                          | [] -> single_location uri def_loc
                           | uses -> Array uses
-                        else make_location uri def_loc
+                        else single_location uri def_loc
                     | None -> imported_definition ()
                   in
                   match field_definition with
                   | Some field_loc ->
                       if position_on_definition_name field_loc name pos then
                         match
-                          uses_for_definition_site uri doc program pos field_loc
+                          uses_for_definition_site ?origin_selection_range uri
+                            doc program pos field_loc
                         with
                         | [] -> make_location_for_loc field_loc
                         | uses -> Array uses
@@ -392,7 +418,8 @@ let handle_definition (state : Lsp_state.state) params =
                       | Some loc ->
                           if position_on_definition_name loc name pos then
                             match
-                              uses_for_definition_site uri doc program pos loc
+                              uses_for_definition_site ?origin_selection_range
+                                uri doc program pos loc
                             with
                             | [] -> make_location_for_loc loc
                             | uses -> Array uses
@@ -407,6 +434,12 @@ let handle_definition (state : Lsp_state.state) params =
     JetBrains exposes its primary navigation action as "Go to Declaration",
     while Blorp has a single source definition for each symbol today. *)
 let handle_declaration = handle_definition
+
+(** Handle textDocument/typeDefinition.
+    Some clients send this request when navigating names in type annotations. A
+    Blorp type name still has a single source declaration, so reuse the same
+    source-definition lookup. *)
+let handle_type_definition = handle_definition
 
 (** Handle textDocument/formatting.
 
@@ -486,6 +519,12 @@ and dispatch state _ic oc (msg : message) shutdown_requested =
       match msg.id with
       | Some id ->
           let result = handle_declaration state msg.params in
+          send_response oc ~id ~result
+      | None -> ())
+  | "textDocument/typeDefinition" -> (
+      match msg.id with
+      | Some id ->
+          let result = handle_type_definition state msg.params in
           send_response oc ~id ~result
       | None -> ())
   | "textDocument/references" -> (

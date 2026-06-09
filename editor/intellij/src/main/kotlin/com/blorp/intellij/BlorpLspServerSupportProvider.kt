@@ -1,6 +1,7 @@
 package com.blorp.intellij
 
 import com.intellij.execution.configurations.GeneralCommandLine
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.platform.lsp.api.LspServerSupportProvider
@@ -15,19 +16,26 @@ internal class BlorpLspServerSupportProvider : LspServerSupportProvider {
         file: VirtualFile,
         serverStarter: LspServerStarter
     ) {
-        if (file.extension == "brp") {
+        if (file.isBlorpSourceFile()) {
+            LOG.info("Starting Blorp LSP support for ${file.path}")
             serverStarter.ensureServerStarted(BlorpLspServerDescriptor(project))
         }
+    }
+
+    companion object {
+        private val LOG = Logger.getInstance(BlorpLspServerSupportProvider::class.java)
     }
 }
 
 private class BlorpLspServerDescriptor(project: Project) :
     ProjectWideLspServerDescriptor(project, "Blorp") {
 
-    override fun isSupportedFile(file: VirtualFile) = file.extension == "brp"
+    override fun isSupportedFile(file: VirtualFile) = file.isBlorpSourceFile()
 
     override fun createCommandLine(): GeneralCommandLine {
-        val commandLine = GeneralCommandLine(resolveBlorpPath(), "lsp")
+        val blorpPath = resolveBlorpPath()
+        LOG.info("Launching Blorp LSP: $blorpPath lsp")
+        val commandLine = GeneralCommandLine(blorpPath, "lsp")
         this.project.basePath?.let { commandLine.withWorkDirectory(it) }
         return commandLine
     }
@@ -48,4 +56,11 @@ private class BlorpLspServerDescriptor(project: Project) :
 
         return "blorp"
     }
+
+    companion object {
+        private val LOG = Logger.getInstance(BlorpLspServerDescriptor::class.java)
+    }
 }
+
+private fun VirtualFile.isBlorpSourceFile(): Boolean =
+    extension.equals("brp", ignoreCase = true)
