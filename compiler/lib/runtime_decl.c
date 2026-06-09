@@ -2254,7 +2254,6 @@ void blorp_debug_log_msg(blorp_String* s);
 void blorp_debug_info(blorp_String* s);
 void blorp_debug_warn(blorp_String* s);
 void blorp_debug_error(blorp_String* s);
-void blorp_debug_set_log_level(long level);
 
 // System / Filesystem Ops
 blorp_String* blorp_getcwd(void);

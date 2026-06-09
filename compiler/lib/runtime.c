@@ -34723,8 +34723,6 @@ static void blorp_profile_maybe_terminate(void) {
 // Debug Functions
 // ============================================================================
 
-static int blorp_debug_log_level = 1;
-
 void blorp_debug_log_msg(blorp_String* s) {
     if (s && s->len > 0) fwrite(s->data, 1, s->len, stderr);
     fputc('\n', stderr);
@@ -34742,10 +34740,15 @@ static void blorp_debug_log(const char* level, blorp_String* msg) {
     fputc('\n', stderr);
 }
 
-void blorp_debug_info(blorp_String* s)  { if (blorp_debug_log_level <= 1) blorp_debug_log("INFO", s); }
-void blorp_debug_warn(blorp_String* s)  { if (blorp_debug_log_level <= 2) blorp_debug_log("WARN", s); }
-void blorp_debug_error(blorp_String* s) { if (blorp_debug_log_level <= 3) blorp_debug_log("ERROR", s); }
-void blorp_debug_set_log_level(long level) { blorp_debug_log_level = (int)level; }
+void blorp_debug_info(blorp_String* s) {
+    blorp_debug_log("INFO", s);
+}
+void blorp_debug_warn(blorp_String* s) {
+    blorp_debug_log("WARN", s);
+}
+void blorp_debug_error(blorp_String* s) {
+    blorp_debug_log("ERROR", s);
+}
 
 // ============================================================================
 // Filesystem Operations
