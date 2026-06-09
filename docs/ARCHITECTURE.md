@@ -568,9 +568,8 @@ val typecheck_program : Ast.program -> check_result
 - Nested parallelism detection
 - If condition must be Bool
 
-See [CALL_RESOLUTION.md](CALL_RESOLUTION.md) for the current name/call
-resolution behavior and the proposed path toward a single semantic call-target
-model shared by `check`, `compile`, and `purify`.
+See [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) for the active path toward a
+single semantic call-target model shared by `check`, `compile`, and `purify`.
 
 ---
 
@@ -673,8 +672,8 @@ Embedded C runtime compiled into the generated binary:
 - Fixed-point arithmetic
 - Thread pool + M:N fiber scheduling (`minicoro.h`), channels, structured concurrency
 
-The long-term runtime target for fibers is documented in
-`docs/VIRTUAL_THREADS_DESIGN.md`.
+The runtime, cancellation, and resource direction is tracked in
+[CONCURRENCY_AND_RESOURCES.md](CONCURRENCY_AND_RESOURCES.md).
 
 When adding a new runtime function, declare it in **both** `runtime.c` and
 `runtime_decl.c` — the latter holds forward declarations used by generated
