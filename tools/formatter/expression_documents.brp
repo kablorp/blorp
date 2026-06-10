@@ -394,7 +394,10 @@ private pure func string_literal_wrap_chunks(value: String) -> List[String]:
 
 
 private pure func string_literal_can_wrap(value: String) -> Bool:
-	value.length() > string_literal_wrap_char_limit and value.string_is_safe_to_wrap_as_plain_literal()
+	(
+		value.length() > string_literal_wrap_char_limit
+		and value.string_is_safe_to_wrap_as_plain_literal()
+	)
 
 
 private pure func plain_string_literal_document(value: String) -> Doc:
@@ -566,16 +569,6 @@ private pure func expression_precedence(expr: Expression) -> Int:
 		BinaryExpression(op, _, _): op.binary_prec()
 		LogicalExpression(op, _, _): op.logical_prec()
 		_: 100
-
-
-private pure func logical_left_ends_with_block(expr: Expression) -> Bool:
-	match expr:
-		MatchExpression(_, _): True
-		SelectExpression(_): True
-		IfExpression(_, _): True
-		IfElseExpression(_, _, _): True
-		LogicalExpression(_, _, right): right.logical_left_ends_with_block()
-		_: False
 
 
 private pure func needs_field_receiver_parens(expr: Expression) -> Bool:
@@ -1357,7 +1350,7 @@ private pure func logical_chain_terms(expr: Expression, op: LogicalOp) -> List[E
 		_: [expr]
 
 
-private pure func logical_condition_term_document(expr: Expression, op: LogicalOp) -> Doc:
+private pure func logical_term_document(expr: Expression, op: LogicalOp) -> Doc:
 	if expr.expression_precedence() < op.logical_prec():
 		expr
 			.expression_document()
@@ -1373,7 +1366,7 @@ private pure func logical_condition_term_documents(
 	var documents: List[Doc] = []
 	var index: Int = 0
 	for term in terms:
-		term_document: Doc = term.logical_condition_term_document(op)
+		term_document: Doc = term.logical_term_document(op)
 		if index == 0:
 			documents = documents.append(term_document)
 		else:
@@ -1386,6 +1379,54 @@ private pure func logical_condition_term_documents(
 			)
 		index += 1
 	documents
+
+
+private pure func logical_expression_flat_document(terms: List[Expression], op: LogicalOp) -> Doc:
+	match terms:
+		[]: "".text()
+		[first, ...rest]:
+			var document: Doc = first.logical_term_document(op)
+			for term in rest:
+				document = document
+					.cat(" ".text())
+					.cat(
+						op
+							.logical_text()
+							.text(),
+					)
+					.cat(" ".text())
+					.cat(term.logical_term_document(op))
+			document
+
+
+-- Ordinary expression continuations cannot start with `and`/`or` unless the
+-- chain is explicitly grouped. Keep broken logical chains parenthesized.
+private pure func logical_expression_broken_document(terms: List[Expression], op: LogicalOp) -> Doc:
+	"("
+		.text()
+		.cat(
+			hardline
+				.cat(
+					terms
+						.logical_condition_term_documents(op)
+						.hardlines(),
+				)
+				.indent(),
+		)
+		.cat(hardline)
+		.cat(")".text())
+
+
+private pure func logical_expression_document(expr: Expression, op: LogicalOp) -> Doc:
+	terms: List[Expression] = expr.logical_chain_terms(op)
+	match terms:
+		[]: expr.expression_document()
+		[_]: terms.logical_expression_flat_document(op)
+		_:
+			terms
+				.logical_expression_broken_document(op)
+				.if_break(terms.logical_expression_flat_document(op))
+				.group()
 
 
 private pure func if_condition_document(cond: Expression) -> Doc:
@@ -1428,13 +1469,19 @@ private pure func expression_list_should_use_block_call_arguments(args: List[Exp
 private pure func expression_list_should_use_nested_block_call_arguments(
 	args: List[Expression],
 ) -> Bool:
-	args.expression_list_should_use_block_call_arguments() or args.expression_list_has_inline_lambda()
+	(
+		args.expression_list_should_use_block_call_arguments()
+		or args.expression_list_has_inline_lambda()
+	)
 
 
 private pure func call_argument_document(expr: Expression) -> Doc:
 	match expr:
 		CallExpression(callee, args):
-			if args.expression_list_should_use_nested_block_call_arguments() and callee.is_breakable_call_callee():
+			if (
+				args.expression_list_should_use_nested_block_call_arguments()
+				and callee.is_breakable_call_callee()
+			):
 				callee
 					.expression_document()
 					.cat(args.block_call_arguments_document())
@@ -1592,7 +1639,10 @@ private pure func expression_pair_prefers_multiline_call_argument(
 	left: Expression,
 	right: Expression,
 ) -> Bool:
-	left.expression_prefers_multiline_call_argument() or right.expression_prefers_multiline_call_argument()
+	(
+		left.expression_prefers_multiline_call_argument()
+		or right.expression_prefers_multiline_call_argument()
+	)
 
 
 private pure func expression_pair_list_prefers_multiline_call_argument(
@@ -1646,10 +1696,19 @@ private pure func expression_prefers_multiline_call_argument(expr: Expression) -
 			)
 			CallExpression(_, args): args.expression_list_should_use_block_call_arguments()
 			TupleExpression(elems): elems.expression_list_prefers_multiline_call_argument()
-			ListExpression(elems): elems.length() > 1 or elems.expression_list_prefers_multiline_call_argument()
-			VectorExpression(elems): elems.length() > 1 or elems.expression_list_prefers_multiline_call_argument()
+			ListExpression(elems): (
+				elems.length() > 1
+				or elems.expression_list_prefers_multiline_call_argument()
+			)
+			VectorExpression(elems): (
+				elems.length() > 1
+				or elems.expression_list_prefers_multiline_call_argument()
+			)
 			RecordExpression(fields):
-				fields.record_expression_prefers_multiline() or fields.expression_pair_list_prefers_multiline_call_argument()
+				(
+					fields.record_expression_prefers_multiline()
+					or fields.expression_pair_list_prefers_multiline_call_argument()
+				)
 			RecordUpdateExpression(base, fields): record_update_prefers_multiline_call_argument(
 				base,
 				fields,
@@ -1668,7 +1727,10 @@ private pure func expression_prefers_multiline_call_argument(expr: Expression) -
 				index,
 			)
 			MultiSubscriptExpression(target, indices):
-				target.expression_prefers_multiline_call_argument() or indices.expression_list_prefers_multiline_call_argument()
+				(
+					target.expression_prefers_multiline_call_argument()
+					or indices.expression_list_prefers_multiline_call_argument()
+				)
 			_: False
 
 
@@ -1703,15 +1765,30 @@ private pure func expression_has_block(expr: Expression) -> Bool:
 			CallExpression(_, args): call_expression_has_block_or_forced_multiline(expr, args)
 			AscriptionExpression(inner, _): inner.expression_has_block()
 			TupleExpression(elems):
-				elems.expression_list_has_block() or elems.expression_list_prefers_multiline_call_argument()
+				(
+					elems.expression_list_has_block()
+					or elems.expression_list_prefers_multiline_call_argument()
+				)
 			ListExpression(elems):
-				elems.expression_list_has_block() or elems.expression_list_prefers_multiline_call_argument()
+				(
+					elems.expression_list_has_block()
+					or elems.expression_list_prefers_multiline_call_argument()
+				)
 			VectorExpression(elems):
-				elems.expression_list_has_block() or elems.expression_list_prefers_multiline_call_argument()
+				(
+					elems.expression_list_has_block()
+					or elems.expression_list_prefers_multiline_call_argument()
+				)
 			RecordExpression(fields):
-				fields.expression_pair_list_has_block() or fields.expression_pair_list_prefers_multiline_call_argument()
+				(
+					fields.expression_pair_list_has_block()
+					or fields.expression_pair_list_prefers_multiline_call_argument()
+				)
 			RecordUpdateExpression(_, fields):
-				fields.expression_pair_list_has_block() or fields.expression_pair_list_prefers_multiline_call_argument()
+				(
+					fields.expression_pair_list_has_block()
+					or fields.expression_pair_list_prefers_multiline_call_argument()
+				)
 			_: False
 
 
@@ -2084,7 +2161,12 @@ private pure func expression_contains_multiline_collection_call_arg(expr: Expres
 			callee_has_multiline_call: Bool = callee.expression_contains_multiline_collection_call_arg()
 			args_are_multiline_collection: Bool = args.expression_list_is_multiline_collection_call_arguments()
 			args_contain_multiline_call: Bool = args.expression_list_contains_multiline_collection_call_arg()
-			callee_has_multiline_call or args_are_multiline_collection or args_contain_multiline_call
+
+			(
+				callee_has_multiline_call
+				or args_are_multiline_collection
+				or args_contain_multiline_call
+			)
 		UnaryExpression(_, inner): inner.expression_contains_multiline_collection_call_arg()
 		BinaryExpression(_, left, right):
 			left_has_multiline_call: Bool = left.expression_contains_multiline_collection_call_arg()
@@ -2339,7 +2421,10 @@ private pure func call_arguments_document(args: List[Expression]) -> Doc:
 		match args.collection_call_arguments_document():
 			Some(doc): doc
 			None:
-				if args.expression_list_has_non_lambda_block() or args.expression_list_should_use_block_call_arguments():
+				if (
+					args.expression_list_has_non_lambda_block()
+					or args.expression_list_should_use_block_call_arguments()
+				):
 					args.block_call_arguments_document()
 				else:
 					args.grouped_call_arguments_document()
@@ -3383,33 +3468,8 @@ pure func expression_document(expr: Expression) -> Doc:
 						)
 						.cat(" ".text())
 						.cat(right_document)
-		LogicalExpression(op, left, right):
-			prec: Int = op.logical_prec()
-			left_document: Doc = if left.expression_precedence() < prec:
-				left
-					.expression_document()
-					.parens()
-			else:
-				left.expression_document()
-			right_document: Doc = if right.expression_precedence() <= prec:
-				right
-					.expression_document()
-					.parens()
-			else:
-				right.expression_document()
-			separator: Doc = if left.logical_left_ends_with_block():
-				hardline
-			else:
-				" ".text()
-			left_document
-				.cat(separator)
-				.cat(
-					op
-						.logical_text()
-						.text(),
-				)
-				.cat(" ".text())
-				.cat(right_document)
+		LogicalExpression(op, _, _):
+			expr.logical_expression_document(op)
 		TupleExpression(elems): elems.tuple_expression_document()
 		ListExpression(elems): bracketed_expression_document("[", "]", elems)
 		VectorExpression(elems): elems.vector_literal_document()
