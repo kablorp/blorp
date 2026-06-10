@@ -3,10 +3,8 @@ let compiler_tool_rel =
     (Filename.concat "compiler" "blorp")
     "codegen_intrinsic_renderer.brp"
 
-let compiler_tool_suite_rel =
-  Filename.concat
-    (Filename.concat (Filename.concat "compiler" "blorp") "tests")
-    "test_codegen_intrinsic_renderer.brp"
+let compiler_tool_tests_dir_rel =
+  Filename.concat (Filename.concat "compiler" "blorp") "tests"
 
 let compiler_intrinsic_template_manifest_rel =
   Filename.concat
@@ -236,13 +234,16 @@ let test_core_emit_delegates_initial_slice_to_blorp_manifest () =
       "math_sqrt";
     ]
 
-let test_codegen_intrinsic_renderer_blorp_suite () =
-  let suite_path = find_project_file compiler_tool_suite_rel in
+let test_compiler_blorp_test_suites () =
+  let suite_path = find_project_file compiler_tool_tests_dir_rel in
+  let test_files = Blorp.Test_runner.collect_test_files [ suite_path ] in
+  Alcotest.(check bool)
+    "discovers compiler/blorp TestSuite files" true (test_files <> []);
   let exit_code =
     Blorp.Test_runner.run_tests ~mode:Blorp.Test_runner.SuiteOnly
       ~timeout:(Some 30) ~jobs:1 ~cache:false suite_path
   in
-  Alcotest.(check int) "Blorp TestSuite exit code" 0 exit_code
+  Alcotest.(check int) "compiler/blorp TestSuite exit code" 0 exit_code
 
 let suite =
   [
@@ -254,7 +255,7 @@ let suite =
           test_codegen_intrinsic_renderer_manifest_matches_checked_in_templates;
         Alcotest.test_case "production emitter delegates initial slice" `Quick
           test_core_emit_delegates_initial_slice_to_blorp_manifest;
-        Alcotest.test_case "Blorp TestSuite passes" `Slow
-          test_codegen_intrinsic_renderer_blorp_suite;
+        Alcotest.test_case "compiler/blorp TestSuites pass" `Slow
+          test_compiler_blorp_test_suites;
       ] );
   ]
