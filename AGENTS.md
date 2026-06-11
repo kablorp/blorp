@@ -139,18 +139,19 @@ meaningful, clear, and proportional to their scope.
 
 ### Before you write code
 
-**1. One change per change.** Fix the bug, add the feature, or refactor — not all three.
+**1. Write a failing test first.** We strongly prefer TDD. Define what success looks like 
+before writing implementation. For parser changes: `should_pass/` and `should_fail/` cases. For 
+type system changes: `infer/` and `typecheck/` cases. For runtime behavior: `test_blorp/` tests. 
+For bug fixes: a regression test that fails before the fix and passes after.
+
+**2. One change per change.** Fix the bug, add the feature, or refactor — not all three.
 If you discover adjacent work, note it separately. If you can't describe your change in one
 sentence, it's too big.
 
-**2. Check for precedent.** Before implementing, look at how blorp already handles similar things.
+**3. Check for precedent.** Before implementing, look at how blorp already handles similar things.
 Follow existing naming conventions, error styles, and API patterns. If you're establishing a
 new pattern, call it out explicitly.
 
-**3. Write a failing test first.** Define what success looks like before writing implementation.
-For parser changes: `should_pass/` and `should_fail/` cases. For type system changes: `infer/`
-and `typecheck/` cases. For runtime behavior: `test_blorp/` tests. For bug fixes: a regression
-test that fails before the fix and passes after.
 
 ### While you write code
 
@@ -207,6 +208,15 @@ new behavior is clearer, safer, or simpler, remove the old form and make the cur
 coherent. Breaking changes still require updating all call sites in std/, tests/, examples/, docs,
 and formatter expectations in the same change. Add migration-style error messages only when they
 meaningfully improve first-time user experience or prevent confusing parser/typechecker failures.
+
+**12. Focus on quality.** If your code is not ready to pass a review for production, then your
+work is incomplete. Do not settle for ad-hoc hacks or incoherent architecture.
+
+**13. Document the "Why"s.** When your code is read in the future, readers need to understand why
+any non-obvious solutions exist.
+
+**14. Keep Track of Rough Edges.** If you run into obstacles, confusion, or bugs, surface them. We
+don't want subtle bugs to remain simmering under the surface.
 
 ---
 
