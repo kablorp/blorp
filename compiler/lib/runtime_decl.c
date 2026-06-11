@@ -915,6 +915,8 @@ extern _Thread_local void* __blorp_current_task;
 
 // ARC / Memory Management
 void* blorp_alloc(size_t size);
+void* blorp_make_immortal_constant(void* obj);
+blorp_StackResult blorp_make_immortal_stack_result_constant(blorp_StackResult res);
 void blorp_move_ref(void* obj);
 void blorp_set_type_tag(void* obj, const char* tag);
 uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);

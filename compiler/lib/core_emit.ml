@@ -366,6 +366,41 @@ let is_c_static_literal = function
       true
   | Ast.LitString _ -> false
 
+type global_constant_immortal_init =
+  | GlobalConstantNoImmortalInit
+  | GlobalConstantHeapObject
+  | GlobalConstantStackResultPayload
+
+let global_constant_immortal_init (ctx : Core_emit_context.t) (v : core_var) :
+    global_constant_immortal_init =
+  if (not v.cv_is_const) || not (type_requires_release ctx v.cv_ty) then
+    GlobalConstantNoImmortalInit
+  else if is_stack_result_type ctx v.cv_ty then
+    (* Known boundary: stack-result constants are by-value wrappers. Only the
+       selected managed payload can be made immortal; adding deeper by-value
+       managed aggregates would require their own explicit ABI helper. *)
+    GlobalConstantStackResultPayload
+  else if is_pointer_type ctx v.cv_ty then
+    (* Known boundary: this marks the constant's root object immortal. Nested
+       managed fields are still protected by Perceus' field-alias retain rules
+       when extracted; making whole constant graphs transitively immortal would
+       require generated type-specific traversal. *)
+    GlobalConstantHeapObject
+  else GlobalConstantNoImmortalInit
+
+let emit_global_constant_immortal_init (ctx : Core_emit_context.t)
+    (v : core_var) : unit =
+  let name = escape_c_ident (Var.to_c_name v.cv_name) in
+  match global_constant_immortal_init ctx v with
+  | GlobalConstantNoImmortalInit -> ()
+  | GlobalConstantHeapObject ->
+      emit_line ctx
+        (Printf.sprintf "%s = blorp_make_immortal_constant(%s);" name name)
+  | GlobalConstantStackResultPayload ->
+      emit_line ctx
+        (Printf.sprintf "%s = blorp_make_immortal_stack_result_constant(%s);"
+           name name)
+
 let float_modulo_emission (ty : Ast.type_expr) =
   match normalize_type ty with
   | Ast.TyNamed ("Float", []) -> Some ("double", "0.0", "fmod", false)
@@ -8359,13 +8394,11 @@ and emit_global_init (ctx : Core_emit_context.t) (prog : core_program) : unit =
     | { cd_desc = CDVar v; _ } :: rest -> (
         match v.cv_init.desc with
         | CLit lit when is_c_static_literal lit -> collect acc rest
-        | _ ->
-            collect ((v.cv_name, v.cv_def_id, v.cv_ty, v.cv_init) :: acc) rest)
+        | _ -> collect (v :: acc) rest)
     | { cd_desc = CDPrivate { cd_desc = CDVar v; _ }; _ } :: rest -> (
         match v.cv_init.desc with
         | CLit lit when is_c_static_literal lit -> collect acc rest
-        | _ ->
-            collect ((v.cv_name, v.cv_def_id, v.cv_ty, v.cv_init) :: acc) rest)
+        | _ -> collect (v :: acc) rest)
     | _ :: rest -> collect acc rest
   in
   let deferred = collect [] prog in
@@ -8390,14 +8423,16 @@ and emit_global_init (ctx : Core_emit_context.t) (prog : core_program) : unit =
   if deferred <> [] then begin
     ctx.indent <- ctx.indent + 1;
     List.iter
-      (fun (var, _def_id, ty, init) ->
-        let init = expr_with_expected_type_for_constructors ctx init ty in
+      (fun v ->
+        let ty = v.cv_ty in
+        let init = expr_with_expected_type_for_constructors ctx v.cv_init ty in
         emit_indent ctx;
         (* Global bare name — matches [emit_global_var]'s bare decl. *)
-        emit ctx (escape_c_ident (Var.to_c_name var));
+        emit ctx (escape_c_ident (Var.to_c_name v.cv_name));
         emit ctx " = ";
         emit_expr ctx init;
-        emitln ctx ";")
+        emitln ctx ";";
+        emit_global_constant_immortal_init ctx v)
       deferred;
     ctx.indent <- ctx.indent - 1
   end;

@@ -4112,6 +4112,18 @@ cleanup:
 // Sentinel refcount for immortal singleton objects (nullary constructors like None)
 #define BLORP_IMMORTAL_REFCOUNT LONG_MAX
 
+void* blorp_make_immortal_constant(void* obj) {
+    if (!obj) return NULL;
+    blorp_Object* header = (blorp_Object*)obj;
+#ifdef BLORP_SINGLE_THREADED
+    header->refcount = BLORP_IMMORTAL_REFCOUNT;
+#else
+    atomic_store_explicit(&header->refcount, BLORP_IMMORTAL_REFCOUNT, memory_order_relaxed);
+#endif
+    blorp_untrack_allocated_object(obj);
+    return obj;
+}
+
 // Slow path for release — called when refcount reaches zero.
 // Separated so the fast path (decrement + check) can be inlined.
 __attribute__((noinline))
@@ -7686,6 +7698,13 @@ static inline void blorp_stack_result_release(blorp_StackResult res) {
     if ((res.release_mask & 1UL) == 0) return;
     void* payload = blorp_stack_result_payload(res);
     if (payload) blorp_release(payload);
+}
+
+blorp_StackResult blorp_make_immortal_stack_result_constant(blorp_StackResult res) {
+    if ((res.release_mask & 1UL) == 0) return res;
+    void* payload = blorp_stack_result_payload(res);
+    if (payload) blorp_make_immortal_constant(payload);
+    return res;
 }
 
 static void blorp_stack_result_box_destroy(void* obj) {
