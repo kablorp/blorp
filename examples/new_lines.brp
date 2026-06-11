@@ -1,14 +1,22 @@
 import:
 	bytes as B
-	fs: DirectoryEntry, IOError, message, open_dir, open_read_append, read_next_entries
+	fs: DirectoryEntry, IOError, message, open_dir, open_read, open_read_append, read_next_entries
 	list: chunks, concat
 	system: file_exists, is_directory
+
+
+union RunMode:
+	ApplyChanges
+	DryRun
+	CheckOnly
 
 
 record CliConfig {
 	extensions: List[String],
 	paths: List[String],
-	show_changed_list: Bool
+	show_changed_list: Bool,
+	mode: RunMode,
+	include_empty: Bool
 }
 
 
@@ -16,6 +24,12 @@ union ParsedCli:
 	CliOk(CliConfig)
 	CliHelp
 	CliError(String)
+
+
+record ProcessingOptions {
+	mode: RunMode,
+	include_empty: Bool
+}
 
 
 record RunStats {
@@ -79,7 +93,10 @@ pure func merge_stats(left: RunStats, right: RunStats) -> RunStats:
 	}
 
 
-USAGE: String = "usage: new-lines [--no-changed-list] EXTENSION... [--path PATH]..."
+USAGE: String = (
+	"usage: new-lines [--check | --dry-run] [--include-empty] [--no-changed-list] "
+	+ "EXTENSION... [--path PATH]..."
+)
 
 
 pure func default_paths(paths: List[String]) -> List[String]:
@@ -104,6 +121,8 @@ pure func parse_args(args: List[String]) -> ParsedCli:
 	var extensions: List[String] = []
 	var paths: List[String] = []
 	var show_changed_list: Bool = True
+	var mode: RunMode = ApplyChanges
+	var include_empty: Bool = False
 	var error: Option[String] = None
 	var help_requested: Bool = False
 	var i: Int = 0
@@ -122,6 +141,27 @@ pure func parse_args(args: List[String]) -> ParsedCli:
 					i += 1
 				else if arg == "--no-changed-list":
 					show_changed_list = False
+					i += 1
+				else if arg == "--include-empty":
+					include_empty = True
+					i += 1
+				else if arg == "--check":
+					match mode:
+						ApplyChanges:
+							mode = CheckOnly
+						DryRun:
+							error = Some("--check cannot be used with --dry-run")
+						CheckOnly:
+							void
+					i += 1
+				else if arg == "--dry-run":
+					match mode:
+						ApplyChanges:
+							mode = DryRun
+						DryRun:
+							void
+						CheckOnly:
+							error = Some("--dry-run cannot be used with --check")
 					i += 1
 				else if arg == path_flag:
 					match args.get(i + 1):
@@ -161,6 +201,8 @@ pure func parse_args(args: List[String]) -> ParsedCli:
 					extensions = extensions,
 					paths = default_paths(paths),
 					show_changed_list = show_changed_list,
+					mode = mode,
+					include_empty = include_empty,
 				})
 
 
@@ -186,22 +228,45 @@ pure func matches_extension(file_path: String, extensions: List[String]) -> Bool
 	matched
 
 
-pure func content_needs_newline(content: String) -> Bool:
-	not content.ends_with("\n")
+pure func should_write_changes(mode: RunMode) -> Bool:
+	match mode:
+		ApplyChanges: True
+		DryRun: False
+		CheckOnly: False
 
 
-func add_final_newline_if_needed(file_path: String) -> Result[Bool, String]:
+func file_needs_final_newline(file_path: String, include_empty: Bool) -> Result[Bool, String]:
+	with file ?= open_read(file_path) on err => "failed to open " + file_path + ": " + message(err):
+		match file.size():
+			Ok(size):
+				if size == 0:
+					Ok(include_empty)
+				else:
+					match file.read_chunk_at(size - 1, 1):
+						Ok(chunk):
+							byte: Int = B
+								.get(chunk, 0)
+								.get_or(0)
+							Ok(byte != 10)
+						Err(err): Err("failed to read " + file_path + ": " + message(err))
+			Err(err): Err("failed to get size of " + file_path + ": " + message(err))
+
+
+func add_final_newline_if_needed(file_path: String, include_empty: Bool) -> Result[Bool, String]:
 	with file ?= open_read_append(
 		file_path,
 	) on err => "failed to open " + file_path + ": " + message(err):
 		match file.size():
 			Ok(size):
 				if size == 0:
-					match file.append_text("\n"):
-						Ok(_): Ok(True)
-						Err(err): Err(
-							"failed to append newline to " + file_path + ": " + message(err),
-						)
+					if include_empty:
+						match file.append_text("\n"):
+							Ok(_): Ok(True)
+							Err(err): Err(
+								"failed to append newline to " + file_path + ": " + message(err),
+							)
+					else:
+						Ok(False)
 				else:
 					match file.read_chunk_at(size - 1, 1):
 						Ok(chunk):
@@ -220,6 +285,16 @@ func add_final_newline_if_needed(file_path: String) -> Result[Bool, String]:
 									)
 						Err(err): Err("failed to read " + file_path + ": " + message(err))
 			Err(err): Err("failed to get size of " + file_path + ": " + message(err))
+
+
+func update_final_newline_if_needed(
+	file_path: String,
+	options: ProcessingOptions,
+) -> Result[Bool, String]:
+	if should_write_changes(options.mode):
+		add_final_newline_if_needed(file_path, options.include_empty)
+	else:
+		file_needs_final_newline(file_path, options.include_empty)
 
 
 pure func increment_matched(stats: RunStats) -> RunStats:
@@ -308,14 +383,14 @@ pure func should_process_directories_concurrently(directories: List[PathWork]) -
 	directories.length() >= CONCURRENT_DIRECTORY_THRESHOLD
 
 
-func process_matching_file(file_path: String) -> RunStats:
+func process_matching_file(file_path: String, options: ProcessingOptions) -> RunStats:
 	matched_stats: RunStats = {
 		matched = 1,
 		changed = 0,
 		errors = 0,
 		changed_files = []
 	}
-	match add_final_newline_if_needed(file_path):
+	match update_final_newline_if_needed(file_path, options):
 		Ok(changed):
 			if changed:
 				matched_stats.record_changed(file_path)
@@ -326,18 +401,22 @@ func process_matching_file(file_path: String) -> RunStats:
 			matched_stats.record_error()
 
 
-func process_work(item: PathWork, extensions: List[String]) -> RunStats:
+func process_work(item: PathWork, extensions: List[String], options: ProcessingOptions) -> RunStats:
 	match item:
 		WorkFile(file_path):
-			process_matching_file(file_path)
+			process_matching_file(file_path, options)
 		WorkDirectory(dir_path):
-			process_directory(dir_path, extensions)
+			process_directory(dir_path, extensions, options)
 
 
-func process_work_sequentially(work: List[PathWork], extensions: List[String]) -> RunStats:
+func process_work_sequentially(
+	work: List[PathWork],
+	extensions: List[String],
+	options: ProcessingOptions,
+) -> RunStats:
 	var stats: RunStats = EMPTY_STATS
 	for item in work:
-		stats = merge_stats(stats, process_work(item, extensions))
+		stats = merge_stats(stats, process_work(item, extensions, options))
 	stats
 
 
@@ -355,11 +434,12 @@ pure func merge_concurrent_results(results: List[Result[RunStats, ConcurrencyErr
 func process_work_with_chunked_concurrent(
 	work: DirectoryWork,
 	extensions: List[String],
+	options: ProcessingOptions,
 ) -> RunStats:
 	work_chunks: List[List[PathWork]] = work.items.chunks(CONCURRENT_CHUNK_SIZE)
 	results: List[Result[RunStats, ConcurrencyError]] = work_chunks.concurrent(
 		CONCURRENT_TASK_LIMIT,
-		func(items: List[PathWork]): process_work_sequentially(items, extensions),
+		func(items: List[PathWork]): process_work_sequentially(items, extensions, options),
 	)
 	merge_concurrent_results(results)
 
@@ -368,37 +448,49 @@ func process_file_work_items(
 	work: DirectoryWork,
 	extensions: List[String],
 	allow_concurrent: Bool,
+	options: ProcessingOptions,
 ) -> RunStats:
 	if work.items.length() == 0:
 		EMPTY_STATS
 	else if allow_concurrent and work.should_process_work_concurrently():
-		process_work_with_chunked_concurrent(work, extensions)
+		process_work_with_chunked_concurrent(work, extensions, options)
 	else:
-		process_work_sequentially(work.items, extensions)
+		process_work_sequentially(work.items, extensions, options)
 
 
 func process_directory_chunk_sequentially(
 	directories: List[PathWork],
 	extensions: List[String],
+	options: ProcessingOptions,
 ) -> RunStats:
 	var stats: RunStats = EMPTY_STATS
 	for item in directories:
 		match item:
 			WorkFile(file_path):
-				stats = merge_stats(stats, process_matching_file(file_path))
+				stats = merge_stats(stats, process_matching_file(file_path, options))
 			WorkDirectory(dir_path):
-				stats = merge_stats(stats, process_directory_sequential(dir_path, extensions))
+				stats = merge_stats(
+					stats,
+					process_directory_sequential(
+						dir_path,
+						extensions,
+						options,
+					),
+				)
 	stats
 
 
 func process_directories_concurrently(
 	directories: List[PathWork],
 	extensions: List[String],
+	options: ProcessingOptions,
 ) -> RunStats:
 	directory_chunks: List[List[PathWork]] = directories.chunks(CONCURRENT_CHUNK_SIZE)
 	results: List[Result[RunStats, ConcurrencyError]] = directory_chunks.concurrent(
 		CONCURRENT_TASK_LIMIT,
-		func(items: List[PathWork]): process_directory_chunk_sequentially(items, extensions),
+		func(
+			items: List[PathWork],
+		): process_directory_chunk_sequentially(items, extensions, options),
 	)
 	merge_concurrent_results(results)
 
@@ -406,30 +498,36 @@ func process_directories_concurrently(
 func process_directories_normally(
 	directories: List[PathWork],
 	extensions: List[String],
+	options: ProcessingOptions,
 ) -> RunStats:
 	var stats: RunStats = EMPTY_STATS
 	for item in directories:
 		match item:
 			WorkFile(file_path):
-				stats = merge_stats(stats, process_matching_file(file_path))
+				stats = merge_stats(stats, process_matching_file(file_path, options))
 			WorkDirectory(dir_path):
-				stats = merge_stats(stats, process_directory(dir_path, extensions))
+				stats = merge_stats(stats, process_directory(dir_path, extensions, options))
 	stats
 
 
-func process_directory_work(directories: List[PathWork], extensions: List[String]) -> RunStats:
+func process_directory_work(
+	directories: List[PathWork],
+	extensions: List[String],
+	options: ProcessingOptions,
+) -> RunStats:
 	if directories.length() == 0:
 		EMPTY_STATS
 	else if directories.should_process_directories_concurrently():
-		process_directories_concurrently(directories, extensions)
+		process_directories_concurrently(directories, extensions, options)
 	else:
-		process_directories_normally(directories, extensions)
+		process_directories_normally(directories, extensions, options)
 
 
 func scan_directory(
 	root: String,
 	extensions: List[String],
 	allow_file_concurrent: Bool,
+	options: ProcessingOptions,
 ) -> Result[DirectoryScan, IOError]:
 	with dir ?= open_dir(root):
 		var stats: RunStats = EMPTY_STATS
@@ -454,6 +552,7 @@ func scan_directory(
 												file_work,
 												extensions,
 												allow_file_concurrent,
+												options,
 											),
 										)
 										file_work = EMPTY_DIRECTORY_WORK
@@ -473,6 +572,7 @@ func scan_directory(
 						file_work,
 						extensions,
 						allow_file_concurrent,
+						options,
 					),
 				)
 				Ok({
@@ -481,23 +581,32 @@ func scan_directory(
 				})
 
 
-func process_directory(root: String, extensions: List[String]) -> RunStats:
-	match scan_directory(root, extensions, True):
+func process_directory(
+	root: String,
+	extensions: List[String],
+	options: ProcessingOptions,
+) -> RunStats:
+	match scan_directory(root, extensions, True, options):
 		Ok(scan):
-			merge_stats(scan.stats, process_directory_work(scan.directories, extensions))
+			merge_stats(scan.stats, process_directory_work(scan.directories, extensions, options))
 		Err(err):
 			print_error("failed to scan directory " + root + ": " + message(err))
 			EMPTY_STATS.record_error()
 
 
-func process_directory_sequential(root: String, extensions: List[String]) -> RunStats:
-	match scan_directory(root, extensions, False):
+func process_directory_sequential(
+	root: String,
+	extensions: List[String],
+	options: ProcessingOptions,
+) -> RunStats:
+	match scan_directory(root, extensions, False, options):
 		Ok(scan):
 			merge_stats(
 				scan.stats,
 				process_directory_chunk_sequentially(
 					scan.directories,
 					extensions,
+					options,
 				),
 			)
 		Err(err):
@@ -505,7 +614,7 @@ func process_directory_sequential(root: String, extensions: List[String]) -> Run
 			EMPTY_STATS.record_error()
 
 
-func process_root(root: String, extensions: List[String]) -> RunStats:
+func process_root(root: String, extensions: List[String], options: ProcessingOptions) -> RunStats:
 	if not root.file_exists():
 		print_error("path not found: " + root)
 		EMPTY_STATS.record_error()
@@ -513,13 +622,17 @@ func process_root(root: String, extensions: List[String]) -> RunStats:
 		print_error("path is not a directory: " + root)
 		EMPTY_STATS.record_error()
 	else:
-		process_directory(root, extensions)
+		process_directory(root, extensions, options)
 
 
 func run_config(config: CliConfig) -> RunStats:
+	options: ProcessingOptions = {
+		mode = config.mode,
+		include_empty = config.include_empty
+	}
 	var stats: RunStats = EMPTY_STATS
 	for root in config.paths:
-		stats = merge_stats(stats, process_root(root, config.extensions))
+		stats = merge_stats(stats, process_root(root, config.extensions, options))
 	stats
 
 
@@ -528,9 +641,30 @@ func print_changed_files(files: List[String]):
 		print(file_path)
 
 
-func print_summary(stats: RunStats):
-	print("changed: " + stats.changed.to_string())
+pure func changed_summary_label(mode: RunMode) -> String:
+	match mode:
+		ApplyChanges: "changed"
+		DryRun: "would change"
+		CheckOnly: "would change"
+
+
+func print_summary(stats: RunStats, mode: RunMode):
+	print(changed_summary_label(mode) + ": " + stats.changed.to_string())
 	print("examined: " + stats.matched.to_string())
+
+
+pure func exit_status(stats: RunStats, mode: RunMode) -> Int:
+	if stats.errors > 0:
+		1
+	else:
+		match mode:
+			ApplyChanges: 0
+			DryRun: 0
+			CheckOnly:
+				if stats.changed > 0:
+					1
+				else:
+					0
 
 
 func main(args: List[String]) -> Int:
@@ -546,8 +680,5 @@ func main(args: List[String]) -> Int:
 			stats = run_config(config)
 			if config.show_changed_list:
 				print_changed_files(stats.changed_files)
-			print_summary(stats)
-			if stats.errors > 0:
-				1
-			else:
-				0
+			print_summary(stats, config.mode)
+			exit_status(stats, config.mode)
