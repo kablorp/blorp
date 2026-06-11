@@ -1,0 +1,273 @@
+-- Blorp-authored renderer for prepared tensor Core nodes.
+--
+-- OCaml still owns Core traversal, child expression emission, ABI strings, and
+-- variable naming. This module owns only the final C snippet shape for prepared
+-- tensor raw-view access.
+enum CompilerCommand:
+	RenderPreparedTensorCommand
+	RenderManifestCommand
+	UnknownCommand
+
+
+enum PreparedTensorTemplate:
+	TensorRawViewDeclTemplate
+	TensorRawReadTemplate
+	TensorRawWriteExprTemplate
+	TensorRawWriteStmtTemplate
+
+
+-- These payloads carry rendered C snippets and ABI strings. They are records
+-- because Blorp structs cannot contain String fields.
+record RawViewDeclArgs {
+	pointer_c_type: String,
+	view: String,
+	source: String
+}
+
+
+record RawWriteArgs {
+	view: String,
+	index: String,
+	value: String
+}
+
+
+union PreparedTensorOp:
+	RawViewDecl(RawViewDeclArgs)
+	RawRead(String, String)
+	RawWriteExpr(RawWriteArgs)
+	RawWriteStmt(RawWriteArgs)
+
+
+union RenderError:
+	WrongArity(PreparedTensorTemplate, Int, Int)
+	UnsupportedPreparedTensorOp(String)
+
+
+private PREPARED_TENSOR_TEMPLATES: Dict[String, PreparedTensorTemplate] = {
+	"tensor_raw_view_decl" => TensorRawViewDeclTemplate,
+	"tensor_raw_read" => TensorRawReadTemplate,
+	"tensor_raw_write_expr" => TensorRawWriteExprTemplate,
+	"tensor_raw_write_stmt" => TensorRawWriteStmtTemplate,
+}
+
+USAGE: String = (
+	"Usage: codegen_prepared_tensor_renderer prepared-tensor <name> [rendered-arg..."
+	+ "] | manifest"
+)
+
+ALL_TEMPLATES: List[PreparedTensorTemplate] = [
+	TensorRawViewDeclTemplate,
+	TensorRawReadTemplate,
+	TensorRawWriteExprTemplate,
+	TensorRawWriteStmtTemplate,
+]
+
+
+pure func parse_command(command: String) -> CompilerCommand:
+	match command:
+		"prepared-tensor": RenderPreparedTensorCommand
+		"manifest": RenderManifestCommand
+		_: UnknownCommand
+
+
+pure func prepared_tensor_template_name(template: PreparedTensorTemplate) -> String:
+	match template:
+		TensorRawViewDeclTemplate: "tensor_raw_view_decl"
+		TensorRawReadTemplate: "tensor_raw_read"
+		TensorRawWriteExprTemplate: "tensor_raw_write_expr"
+		TensorRawWriteStmtTemplate: "tensor_raw_write_stmt"
+
+
+pure func prepared_tensor_template_arity(template: PreparedTensorTemplate) -> Int:
+	match template:
+		TensorRawViewDeclTemplate: 3
+		TensorRawReadTemplate: 2
+		TensorRawWriteExprTemplate: 3
+		TensorRawWriteStmtTemplate: 3
+
+
+pure func parse_prepared_tensor_template(name: String) -> Option[PreparedTensorTemplate]:
+	PREPARED_TENSOR_TEMPLATES.get(name)
+
+
+pure func render_error_to_string(error: RenderError) -> String:
+	match error:
+		WrongArity(template, expected, got):
+			template_name: String = prepared_tensor_template_name(template)
+			"prepared tensor op ${template_name} expected ${expected} arg(s), got ${got}"
+		UnsupportedPreparedTensorOp(name): "unsupported prepared tensor op: ${name}"
+
+
+pure func wrong_arity_for_args(template: PreparedTensorTemplate, args: List[String]) -> RenderError:
+	WrongArity(template, prepared_tensor_template_arity(template), args.length())
+
+
+private pure func parse_raw_view_decl_args(args: List[String]) -> Option[RawViewDeclArgs]:
+	match args:
+		[pointer_c_type, view, source]:
+			Some({
+				pointer_c_type = pointer_c_type,
+				view = view,
+				source = source,
+			})
+		_: None
+
+
+private pure func parse_raw_read_op(args: List[String]) -> Option[PreparedTensorOp]:
+	match args:
+		[view, index]: Some(RawRead(view, index))
+		_: None
+
+
+private pure func parse_raw_write_args(args: List[String]) -> Option[RawWriteArgs]:
+	match args:
+		[view, index, value]:
+			Some({
+				view = view,
+				index = index,
+				value = value,
+			})
+		_: None
+
+
+pure func render_tensor_raw_view_decl(
+	pointer_c_type: String,
+	view: String,
+	source: String,
+) -> String:
+	"${pointer_c_type} ${view} = (${pointer_c_type})((blorp_Vector*)${source})->data"
+
+
+pure func render_tensor_raw_read(view: String, index: String) -> String:
+	"${view}[${index}]"
+
+
+pure func render_tensor_raw_write_expr(view: String, index: String, value: String) -> String:
+	"(" + "{" + " ${view}[${index}] = ${value}; (void)0; })"
+
+
+pure func render_tensor_raw_write_stmt(view: String, index: String, value: String) -> String:
+	"${view}[${index}] = ${value};"
+
+
+pure func render_prepared_tensor_op(op: PreparedTensorOp) -> String:
+	match op:
+		RawViewDecl(args):
+			render_tensor_raw_view_decl(args.pointer_c_type, args.view, args.source)
+		RawRead(view, index): render_tensor_raw_read(view, index)
+		RawWriteExpr(args): render_tensor_raw_write_expr(args.view, args.index, args.value)
+		RawWriteStmt(args): render_tensor_raw_write_stmt(args.view, args.index, args.value)
+
+
+pure func build_prepared_tensor_op(
+	template: PreparedTensorTemplate,
+	args: List[String],
+) -> Result[PreparedTensorOp, RenderError]:
+	match template:
+		TensorRawViewDeclTemplate:
+			match parse_raw_view_decl_args(args):
+				Some(parsed): Ok(RawViewDecl(parsed))
+				None: Err(wrong_arity_for_args(template, args))
+		TensorRawReadTemplate:
+			match parse_raw_read_op(args):
+				Some(op): Ok(op)
+				None: Err(wrong_arity_for_args(template, args))
+		TensorRawWriteExprTemplate:
+			match parse_raw_write_args(args):
+				Some(parsed): Ok(RawWriteExpr(parsed))
+				None: Err(wrong_arity_for_args(template, args))
+		TensorRawWriteStmtTemplate:
+			match parse_raw_write_args(args):
+				Some(parsed): Ok(RawWriteStmt(parsed))
+				None: Err(wrong_arity_for_args(template, args))
+
+
+pure func render_prepared_tensor(name: String, args: List[String]) -> Result[String, RenderError]:
+	match parse_prepared_tensor_template(name):
+		Some(template):
+			match build_prepared_tensor_op(template, args):
+				Ok(op): Ok(render_prepared_tensor_op(op))
+				Err(error): Err(error)
+		None: Err(UnsupportedPreparedTensorOp(name))
+
+
+private pure func placeholder_raw_view_decl_args() -> RawViewDeclArgs:
+	{
+		pointer_c_type = "@0@",
+		view = "@1@",
+		source = "@2@"
+	}
+
+
+private pure func placeholder_raw_write_args() -> RawWriteArgs:
+	{
+		view = "@0@",
+		index = "@1@",
+		value = "@2@"
+	}
+
+
+private pure func placeholder_prepared_tensor_op(
+	template: PreparedTensorTemplate,
+) -> PreparedTensorOp:
+	match template:
+		TensorRawViewDeclTemplate: RawViewDecl(placeholder_raw_view_decl_args())
+		TensorRawReadTemplate: RawRead("@0@", "@1@")
+		TensorRawWriteExprTemplate: RawWriteExpr(placeholder_raw_write_args())
+		TensorRawWriteStmtTemplate: RawWriteStmt(placeholder_raw_write_args())
+
+
+pure func render_manifest_line(template: PreparedTensorTemplate) -> String:
+	name: String = prepared_tensor_template_name(template)
+	arity: Int = prepared_tensor_template_arity(template)
+	body: String = render_prepared_tensor_op(placeholder_prepared_tensor_op(template))
+	"${name}\t${arity}\t${body}"
+
+
+pure func render_manifest_lines() -> List[String]:
+	ALL_TEMPLATES.map(render_manifest_line)
+
+
+func print_manifest() -> Void:
+	for line in render_manifest_lines():
+		print(line)
+
+
+func print_result(result: Result[String, RenderError]) -> Int:
+	match result:
+		Ok(rendered):
+			puts(rendered)
+			0
+		Err(error):
+			print(render_error_to_string(error))
+			1
+
+
+func main(args: List[String]) -> Int:
+	match args:
+		[program_name, command_name, ...command_args]:
+			match parse_command(command_name):
+				RenderPreparedTensorCommand:
+					match command_args:
+						[name, ...rendered_args]: print_result(
+							render_prepared_tensor(
+								name,
+								rendered_args,
+							),
+						)
+						[]:
+							print(USAGE)
+							1
+				RenderManifestCommand:
+					print_manifest()
+					0
+				UnknownCommand:
+					print(USAGE)
+					1
+		[]:
+			print(USAGE)
+			1
+		[program_name]:
+			print(USAGE)
+			1

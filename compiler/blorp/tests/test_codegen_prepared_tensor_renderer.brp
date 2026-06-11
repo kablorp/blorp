@@ -1,0 +1,163 @@
+import:
+	../codegen_prepared_tensor_renderer:
+		ALL_TEMPLATES,
+		CompilerCommand(RenderManifestCommand, RenderPreparedTensorCommand, UnknownCommand),
+		PreparedTensorOp(RawRead, RawViewDecl, RawWriteExpr, RawWriteStmt),
+		PreparedTensorTemplate(
+			TensorRawReadTemplate,
+			TensorRawViewDeclTemplate,
+			TensorRawWriteExprTemplate,
+			TensorRawWriteStmtTemplate,
+		),
+		RenderError(UnsupportedPreparedTensorOp, WrongArity),
+		parse_command,
+		parse_prepared_tensor_template,
+		prepared_tensor_template_arity,
+		prepared_tensor_template_name,
+		render_error_to_string,
+		render_manifest_line,
+		render_manifest_lines,
+		render_prepared_tensor,
+		render_prepared_tensor_op,
+	test: TestSuite
+
+
+func parsed_template_has(name: String, expected_name: String, expected_arity: Int) -> Bool:
+	match parse_prepared_tensor_template(name):
+		Some(template):
+			(
+				prepared_tensor_template_name(template) == expected_name
+				and prepared_tensor_template_arity(template) == expected_arity
+			)
+		None: False
+
+
+func test_parse_command_routes() -> Bool:
+	render_command: CompilerCommand = parse_command("prepared-tensor")
+	manifest_command: CompilerCommand = parse_command("manifest")
+	unknown_command: CompilerCommand = parse_command("wat")
+	render_ok: Bool = match render_command:
+		RenderPreparedTensorCommand: True
+		RenderManifestCommand: False
+		UnknownCommand: False
+	manifest_ok: Bool = match manifest_command:
+		RenderPreparedTensorCommand: False
+		RenderManifestCommand: True
+		UnknownCommand: False
+	unknown_ok: Bool = match unknown_command:
+		RenderPreparedTensorCommand: False
+		RenderManifestCommand: False
+		UnknownCommand: True
+	render_ok and manifest_ok and unknown_ok
+
+
+func test_parse_template_shapes() -> Bool:
+	view_ok: Bool = parsed_template_has("tensor_raw_view_decl", "tensor_raw_view_decl", 3)
+	read_ok: Bool = parsed_template_has("tensor_raw_read", "tensor_raw_read", 2)
+	stmt_ok: Bool = parsed_template_has("tensor_raw_write_stmt", "tensor_raw_write_stmt", 3)
+	missing_ok: Bool = match parse_prepared_tensor_template("tensor_get_f64"):
+		Some(template): False
+		None: True
+	view_ok and read_ok and stmt_ok and missing_ok
+
+
+func test_render_prepared_tensor_op_successes() -> Bool:
+	view_ok: Bool = render_prepared_tensor_op(RawViewDecl({
+		pointer_c_type = "double*",
+		view = "raw",
+		source = "vec",
+	})) == "double* raw = (double*)((blorp_Vector*)vec)->data"
+	read_ok: Bool = render_prepared_tensor_op(RawRead("raw", "i")) == "raw[i]"
+	expr_ok: Bool = render_prepared_tensor_op(RawWriteExpr({
+		view = "raw",
+		index = "i",
+		value = "value",
+	})) == "({ raw[i] = value; (void)0; })"
+	stmt_ok: Bool = render_prepared_tensor_op(RawWriteStmt({
+		view = "raw",
+		index = "i",
+		value = "value",
+	})) == "raw[i] = value;"
+	view_ok and read_ok and expr_ok and stmt_ok
+
+
+func test_render_prepared_tensor_successes() -> Bool:
+	view_ok: Bool = match render_prepared_tensor(
+		"tensor_raw_view_decl",
+		["float*", "__raw", "tensor"],
+	):
+		Ok(rendered): rendered == "float* __raw = (float*)((blorp_Vector*)tensor)->data"
+		Err(error): False
+	read_ok: Bool = match render_prepared_tensor(
+		"tensor_raw_read",
+		["__raw", "idx"],
+	):
+		Ok(rendered): rendered == "__raw[idx]"
+		Err(error): False
+	stmt_ok: Bool = match render_prepared_tensor(
+		"tensor_raw_write_stmt",
+		["__raw", "idx", "next"],
+	):
+		Ok(rendered): rendered == "__raw[idx] = next;"
+		Err(error): False
+	view_ok and read_ok and stmt_ok
+
+
+func test_render_prepared_tensor_errors_are_typed() -> Bool:
+	wrong_arity_ok: Bool = match render_prepared_tensor("tensor_raw_read", ["raw"]):
+		Ok(rendered): False
+		Err(error):
+			match error:
+				WrongArity(template, expected, got):
+					(
+						prepared_tensor_template_name(template) == "tensor_raw_read"
+						and expected == 2
+						and got == 1
+					)
+				UnsupportedPreparedTensorOp(name): False
+	unsupported_ok: Bool = match render_prepared_tensor("tensor_len", ["vec"]):
+		Ok(rendered): False
+		Err(error):
+			match error:
+				WrongArity(template, expected, got): False
+				UnsupportedPreparedTensorOp(name): name == "tensor_len"
+	wrong_arity_ok and unsupported_ok
+
+
+func test_render_error_to_string() -> Bool:
+	arity_error: RenderError = WrongArity(TensorRawWriteExprTemplate, 3, 2)
+	unsupported_error: RenderError = UnsupportedPreparedTensorOp("missing")
+	arity_text: String = render_error_to_string(arity_error)
+	unsupported_text: String = render_error_to_string(unsupported_error)
+
+	(
+		arity_text == "prepared tensor op tensor_raw_write_expr expected 3 arg(s), got 2"
+		and unsupported_text == "unsupported prepared tensor op: missing"
+	)
+
+
+func test_render_manifest_lines() -> Bool:
+	lines: List[String] = render_manifest_lines()
+	count_ok: Bool = lines.length() == ALL_TEMPLATES.length()
+	first_ok: Bool = match lines:
+		[]: False
+		[first, ...rest]:
+			first == "tensor_raw_view_decl\t3\t@0@ @1@ = (@0@)((blorp_Vector*)@2@)->data"
+	stmt_ok: Bool = render_manifest_line(
+		TensorRawWriteStmtTemplate,
+	) == "tensor_raw_write_stmt\t3\t@0@[@1@] = @2@;"
+	count_ok and first_ok and stmt_ok
+
+
+tests: TestSuite = {
+	description = "Self-hosted compiler prepared tensor renderer",
+	tests = [
+		("parse command routes", test_parse_command_routes),
+		("parse template shapes", test_parse_template_shapes),
+		("render prepared tensor op successes", test_render_prepared_tensor_op_successes),
+		("render prepared tensor successes", test_render_prepared_tensor_successes),
+		("render prepared tensor errors are typed", test_render_prepared_tensor_errors_are_typed),
+		("render error to string", test_render_error_to_string),
+		("render manifest lines", test_render_manifest_lines),
+	]
+}

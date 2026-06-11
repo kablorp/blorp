@@ -1,0 +1,434 @@
+-- Blorp-authored renderer for prepared list Core nodes.
+--
+-- OCaml still owns Core traversal, child expression emission, layout metadata,
+-- and fresh temp allocation. This module owns only the final C snippet shape
+-- for prepared list operations.
+enum CompilerCommand:
+	RenderPreparedListCommand
+	RenderManifestCommand
+	UnknownCommand
+
+
+enum PreparedListTemplate:
+	ListGetPointerTemplate
+	ListGetInlineCheckedTemplate
+	ListGetInlineProvenTemplate
+	ListInlineBitsLoadTemplate
+	ListInlineStructLoadCheckedTemplate
+	ListInlineStructLoadProvenTemplate
+
+
+-- These payloads carry rendered C snippets and temp names. They are records
+-- because Blorp structs cannot contain String fields.
+record InlineGetArgs {
+	list: String,
+	index: String,
+	list_tmp: String,
+	index_tmp: String,
+	bits_tmp: String,
+	width_bytes: String
+}
+
+
+record InlineStructLoadArgs {
+	list_tmp: String,
+	index_tmp: String,
+	out_tmp: String,
+	raw_tmp: String,
+	struct_ty: String
+}
+
+
+record InlineBitsLoadArgs {
+	list_tmp: String,
+	index_tmp: String,
+	bits_tmp: String,
+	width_bytes: String
+}
+
+
+union PreparedListOp:
+	PointerGet(String, String)
+	InlineCheckedGet(InlineGetArgs)
+	InlineProvenGet(InlineGetArgs)
+	InlineBitsLoad(InlineBitsLoadArgs)
+	InlineStructLoadChecked(InlineStructLoadArgs)
+	InlineStructLoadProven(InlineStructLoadArgs)
+
+
+union RenderError:
+	WrongArity(PreparedListTemplate, Int, Int)
+	UnsupportedPreparedListOp(String)
+
+
+private PREPARED_LIST_TEMPLATES: Dict[String, PreparedListTemplate] = {
+	"list_get_pointer" => ListGetPointerTemplate,
+	"list_get_inline_checked" => ListGetInlineCheckedTemplate,
+	"list_get_inline_proven" => ListGetInlineProvenTemplate,
+	"list_inline_bits_load" => ListInlineBitsLoadTemplate,
+	"list_inline_struct_load_checked" => ListInlineStructLoadCheckedTemplate,
+	"list_inline_struct_load_proven" => ListInlineStructLoadProvenTemplate,
+}
+
+USAGE: String = (
+	"Usage: codegen_prepared_list_renderer prepared-list <name> [rendered-arg...] | "
+	+ "manifest"
+)
+
+private OPEN_BRACE: String = "{"
+
+private CLOSE_BRACE: String = "}"
+
+
+pure func parse_command(command: String) -> CompilerCommand:
+	match command:
+		"prepared-list": RenderPreparedListCommand
+		"manifest": RenderManifestCommand
+		_: UnknownCommand
+
+
+pure func prepared_list_template_name(template: PreparedListTemplate) -> String:
+	match template:
+		ListGetPointerTemplate: "list_get_pointer"
+		ListGetInlineCheckedTemplate: "list_get_inline_checked"
+		ListGetInlineProvenTemplate: "list_get_inline_proven"
+		ListInlineBitsLoadTemplate: "list_inline_bits_load"
+		ListInlineStructLoadCheckedTemplate: "list_inline_struct_load_checked"
+		ListInlineStructLoadProvenTemplate: "list_inline_struct_load_proven"
+
+
+pure func prepared_list_template_arity(template: PreparedListTemplate) -> Int:
+	match template:
+		ListGetPointerTemplate: 2
+		ListGetInlineCheckedTemplate: 6
+		ListGetInlineProvenTemplate: 6
+		ListInlineBitsLoadTemplate: 4
+		ListInlineStructLoadCheckedTemplate: 5
+		ListInlineStructLoadProvenTemplate: 5
+
+
+ALL_TEMPLATES: List[PreparedListTemplate] = [
+	ListGetPointerTemplate,
+	ListGetInlineCheckedTemplate,
+	ListGetInlineProvenTemplate,
+	ListInlineBitsLoadTemplate,
+	ListInlineStructLoadCheckedTemplate,
+	ListInlineStructLoadProvenTemplate,
+]
+
+
+pure func parse_prepared_list_template(name: String) -> Option[PreparedListTemplate]:
+	PREPARED_LIST_TEMPLATES.get(name)
+
+
+pure func render_error_to_string(error: RenderError) -> String:
+	match error:
+		WrongArity(template, expected, got):
+			template_name: String = prepared_list_template_name(template)
+			"prepared list op ${template_name} expected ${expected} arg(s), got ${got}"
+		UnsupportedPreparedListOp(name): "unsupported prepared list op: ${name}"
+
+
+pure func wrong_arity_for_args(template: PreparedListTemplate, args: List[String]) -> RenderError:
+	WrongArity(template, prepared_list_template_arity(template), args.length())
+
+
+private pure func parse_pointer_get_op(args: List[String]) -> Option[PreparedListOp]:
+	match args:
+		[list, index]: Some(PointerGet(list, index))
+		_: None
+
+
+private pure func parse_inline_get_args(args: List[String]) -> Option[InlineGetArgs]:
+	match args:
+		[list, index, list_tmp, index_tmp, bits_tmp, width_bytes]:
+			Some({
+				list = list,
+				index = index,
+				list_tmp = list_tmp,
+				index_tmp = index_tmp,
+				bits_tmp = bits_tmp,
+				width_bytes = width_bytes,
+			})
+		_: None
+
+
+private pure func parse_inline_struct_load_args(args: List[String]) -> Option[InlineStructLoadArgs]:
+	match args:
+		[list_tmp, index_tmp, out_tmp, raw_tmp, struct_ty]:
+			Some({
+				list_tmp = list_tmp,
+				index_tmp = index_tmp,
+				out_tmp = out_tmp,
+				raw_tmp = raw_tmp,
+				struct_ty = struct_ty,
+			})
+		_: None
+
+
+private pure func parse_inline_bits_load_args(args: List[String]) -> Option[InlineBitsLoadArgs]:
+	match args:
+		[list_tmp, index_tmp, bits_tmp, width_bytes]:
+			Some({
+				list_tmp = list_tmp,
+				index_tmp = index_tmp,
+				bits_tmp = bits_tmp,
+				width_bytes = width_bytes,
+			})
+		_: None
+
+
+pure func render_runtime_get(list: String, index: String) -> String:
+	"blorp_list_get((blorp_List*)${list}, ${index})"
+
+
+pure func render_inline_load(
+	list_tmp: String,
+	index_tmp: String,
+	bits_tmp: String,
+	width_bytes: String,
+) -> String:
+	"(" + "{" + " uintptr_t ${bits_tmp} = 0; memcpy(&${bits_tmp}, (char*)${list_tmp}->data + ${index_tmp} * ${width_bytes}, ${width_bytes}); (void*)${bits_tmp}; })"
+
+
+pure func render_inline_checked_get(
+	list: String,
+	index: String,
+	list_tmp: String,
+	index_tmp: String,
+	bits_tmp: String,
+	width_bytes: String,
+) -> String:
+	prefix: String = "(" + "{" + " blorp_List* ${list_tmp} = (blorp_List*)${list}; "
+	bind_index: String = "long ${index_tmp} = ${index}; "
+	bounds: String = "(__builtin_expect(!${list_tmp} || ${index_tmp} < 0 || ${index_tmp} >= ${list_tmp}->len, 0) ? NULL : "
+	prefix + bind_index + bounds + render_inline_load(
+		list_tmp,
+		index_tmp,
+		bits_tmp,
+		width_bytes,
+	) + "); })"
+
+
+pure func render_inline_proven_get(
+	list: String,
+	index: String,
+	list_tmp: String,
+	index_tmp: String,
+	bits_tmp: String,
+	width_bytes: String,
+) -> String:
+	prefix: String = "(" + "{" + " blorp_List* ${list_tmp} = (blorp_List*)${list}; "
+	bind_index: String = "long ${index_tmp} = ${index}; "
+	prefix + bind_index + render_inline_load(list_tmp, index_tmp, bits_tmp, width_bytes) + "; })"
+
+
+pure func render_inline_bits_load(args: InlineBitsLoadArgs) -> String:
+	list_tmp: String = args.list_tmp
+	index_tmp: String = args.index_tmp
+	bits_tmp: String = args.bits_tmp
+	width_bytes: String = args.width_bytes
+	bits_decl: String = "uintptr_t ${bits_tmp} = 0;"
+	copy_bits: String = "memcpy(&${bits_tmp}, (char*)${list_tmp}->data + ${index_tmp} " + "* ${width_bytes}, ${width_bytes});"
+
+	bits_decl + " " + copy_bits
+
+
+pure func render_inline_struct_load_body(args: InlineStructLoadArgs) -> String:
+	list_tmp: String = args.list_tmp
+	index_tmp: String = args.index_tmp
+	out_tmp: String = args.out_tmp
+	raw_tmp: String = args.raw_tmp
+	struct_ty: String = args.struct_ty
+	storage_check: String = "if (${list_tmp}->storage_mode == BLORP_LIST_STORAGE_INLINE " + "&& ${list_tmp}->elem_size == (int16_t)sizeof(${struct_ty})) "
+
+	inline_copy: String = "memcpy(&${out_tmp}, (char*)${list_tmp}->data + ${index_tmp} " + "* sizeof(${struct_ty}), sizeof(${struct_ty}));"
+
+	fallback_get: String = "void* ${raw_tmp} = blorp_list_get(${list_tmp}, ${index_tmp});"
+	null_check: String = "if (!${raw_tmp}) "
+	zero_out: String = "memset(&${out_tmp}, 0, sizeof(${struct_ty}));"
+	unbox_out: String = "${out_tmp} = blorp_unbox_struct(${raw_tmp}, ${struct_ty});"
+	inline_branch: String = OPEN_BRACE + " " + inline_copy + " " + CLOSE_BRACE
+	null_branch: String = OPEN_BRACE + " " + zero_out + " " + CLOSE_BRACE
+	unbox_branch: String = OPEN_BRACE + " " + unbox_out + " " + CLOSE_BRACE
+	fallback_prefix: String = OPEN_BRACE + " " + fallback_get + " "
+	fallback_choice: String = null_check + null_branch + " else " + unbox_branch
+	fallback_branch: String = fallback_prefix + fallback_choice + " " + CLOSE_BRACE
+
+	storage_check + inline_branch + " else " + fallback_branch
+
+
+pure func render_inline_struct_checked_load(args: InlineStructLoadArgs) -> String:
+	list_tmp: String = args.list_tmp
+	index_tmp: String = args.index_tmp
+	out_tmp: String = args.out_tmp
+	struct_ty: String = args.struct_ty
+	bounds_check: String = "if (__builtin_expect(!${list_tmp} || ${index_tmp} < 0 " + "|| ${index_tmp} >= ${list_tmp}->len, 0)) "
+
+	zero_out: String = "memset(&${out_tmp}, 0, sizeof(${struct_ty}));"
+	bounds_branch: String = OPEN_BRACE + " " + zero_out + " " + CLOSE_BRACE
+	bounds: String = bounds_check + bounds_branch + " else "
+
+	bounds + render_inline_struct_load_body(args)
+
+
+pure func render_prepared_list_op(op: PreparedListOp) -> String:
+	match op:
+		PointerGet(list, index): render_runtime_get(list, index)
+		InlineCheckedGet(args):
+			render_inline_checked_get(
+				args.list,
+				args.index,
+				args.list_tmp,
+				args.index_tmp,
+				args.bits_tmp,
+				args.width_bytes,
+			)
+		InlineProvenGet(args):
+			render_inline_proven_get(
+				args.list,
+				args.index,
+				args.list_tmp,
+				args.index_tmp,
+				args.bits_tmp,
+				args.width_bytes,
+			)
+		InlineBitsLoad(args): render_inline_bits_load(args)
+		InlineStructLoadChecked(args): render_inline_struct_checked_load(args)
+		InlineStructLoadProven(args): render_inline_struct_load_body(args)
+
+
+pure func build_prepared_list_op(
+	template: PreparedListTemplate,
+	args: List[String],
+) -> Result[PreparedListOp, RenderError]:
+	match template:
+		ListGetPointerTemplate:
+			match parse_pointer_get_op(args):
+				Some(op): Ok(op)
+				None: Err(wrong_arity_for_args(template, args))
+		ListGetInlineCheckedTemplate:
+			match parse_inline_get_args(args):
+				Some(parsed): Ok(InlineCheckedGet(parsed))
+				None: Err(wrong_arity_for_args(template, args))
+		ListGetInlineProvenTemplate:
+			match parse_inline_get_args(args):
+				Some(parsed): Ok(InlineProvenGet(parsed))
+				None: Err(wrong_arity_for_args(template, args))
+		ListInlineBitsLoadTemplate:
+			match parse_inline_bits_load_args(args):
+				Some(parsed): Ok(InlineBitsLoad(parsed))
+				None: Err(wrong_arity_for_args(template, args))
+		ListInlineStructLoadCheckedTemplate:
+			match parse_inline_struct_load_args(args):
+				Some(parsed): Ok(InlineStructLoadChecked(parsed))
+				None: Err(wrong_arity_for_args(template, args))
+		ListInlineStructLoadProvenTemplate:
+			match parse_inline_struct_load_args(args):
+				Some(parsed): Ok(InlineStructLoadProven(parsed))
+				None: Err(wrong_arity_for_args(template, args))
+
+
+pure func render_prepared_list(name: String, args: List[String]) -> Result[String, RenderError]:
+	match parse_prepared_list_template(name):
+		Some(template):
+			match build_prepared_list_op(template, args):
+				Ok(op): Ok(render_prepared_list_op(op))
+				Err(error): Err(error)
+		None: Err(UnsupportedPreparedListOp(name))
+
+
+private pure func placeholder_inline_get_args() -> InlineGetArgs:
+	{
+		list = "@0@",
+		index = "@1@",
+		list_tmp = "@2@",
+		index_tmp = "@3@",
+		bits_tmp = "@4@",
+		width_bytes = "@5@"
+	}
+
+
+private pure func placeholder_prepared_list_op(template: PreparedListTemplate) -> PreparedListOp:
+	match template:
+		ListGetPointerTemplate: PointerGet("@0@", "@1@")
+		ListGetInlineCheckedTemplate: InlineCheckedGet(placeholder_inline_get_args())
+		ListGetInlineProvenTemplate: InlineProvenGet(placeholder_inline_get_args())
+		ListInlineBitsLoadTemplate:
+			InlineBitsLoad({
+				list_tmp = "@0@",
+				index_tmp = "@1@",
+				bits_tmp = "@2@",
+				width_bytes = "@3@",
+			})
+		ListInlineStructLoadCheckedTemplate:
+			InlineStructLoadChecked({
+				list_tmp = "@0@",
+				index_tmp = "@1@",
+				out_tmp = "@2@",
+				raw_tmp = "@3@",
+				struct_ty = "@4@",
+			})
+		ListInlineStructLoadProvenTemplate:
+			InlineStructLoadProven({
+				list_tmp = "@0@",
+				index_tmp = "@1@",
+				out_tmp = "@2@",
+				raw_tmp = "@3@",
+				struct_ty = "@4@",
+			})
+
+
+pure func render_manifest_line(template: PreparedListTemplate) -> String:
+	name: String = prepared_list_template_name(template)
+	arity: Int = prepared_list_template_arity(template)
+	body: String = render_prepared_list_op(placeholder_prepared_list_op(template))
+	"${name}\t${arity}\t${body}"
+
+
+pure func render_manifest_lines() -> List[String]:
+	ALL_TEMPLATES.map(render_manifest_line)
+
+
+func print_manifest() -> Void:
+	for line in render_manifest_lines():
+		print(line)
+
+
+func print_result(result: Result[String, RenderError]) -> Int:
+	match result:
+		Ok(rendered):
+			puts(rendered)
+			0
+		Err(error):
+			print(render_error_to_string(error))
+			1
+
+
+func main(args: List[String]) -> Int:
+	match args:
+		[program_name, command_name, ...command_args]:
+			match parse_command(command_name):
+				RenderPreparedListCommand:
+					match command_args:
+						[name, ...rendered_args]: print_result(
+							render_prepared_list(
+								name,
+								rendered_args,
+							),
+						)
+						[]:
+							print(USAGE)
+							1
+				RenderManifestCommand:
+					print_manifest()
+					0
+				UnknownCommand:
+					print(USAGE)
+					1
+		[]:
+			print(USAGE)
+			1
+		[program_name]:
+			print(USAGE)
+			1

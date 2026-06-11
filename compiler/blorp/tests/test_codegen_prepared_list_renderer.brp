@@ -1,0 +1,310 @@
+import:
+	../codegen_prepared_list_renderer:
+		ALL_TEMPLATES,
+		CompilerCommand(RenderManifestCommand, RenderPreparedListCommand, UnknownCommand),
+		PreparedListOp(
+			InlineCheckedGet,
+			InlineBitsLoad,
+			InlineProvenGet,
+			InlineStructLoadChecked,
+			InlineStructLoadProven,
+			PointerGet,
+		),
+		PreparedListTemplate(
+			ListGetInlineCheckedTemplate,
+			ListGetInlineProvenTemplate,
+			ListGetPointerTemplate,
+			ListInlineBitsLoadTemplate,
+			ListInlineStructLoadCheckedTemplate,
+			ListInlineStructLoadProvenTemplate,
+		),
+		RenderError(UnsupportedPreparedListOp, WrongArity),
+		parse_command,
+		parse_prepared_list_template,
+		prepared_list_template_arity,
+		prepared_list_template_name,
+		render_error_to_string,
+		render_manifest_line,
+		render_manifest_lines,
+		render_prepared_list,
+		render_prepared_list_op,
+	test: TestSuite
+
+
+func parsed_template_has(name: String, expected_name: String, expected_arity: Int) -> Bool:
+	match parse_prepared_list_template(name):
+		Some(template):
+			(
+				prepared_list_template_name(template) == expected_name
+				and prepared_list_template_arity(template) == expected_arity
+			)
+		None: False
+
+
+func test_parse_command_routes() -> Bool:
+	render_command: CompilerCommand = parse_command("prepared-list")
+	manifest_command: CompilerCommand = parse_command("manifest")
+	unknown_command: CompilerCommand = parse_command("wat")
+	render_ok: Bool = match render_command:
+		RenderPreparedListCommand: True
+		RenderManifestCommand: False
+		UnknownCommand: False
+	manifest_ok: Bool = match manifest_command:
+		RenderPreparedListCommand: False
+		RenderManifestCommand: True
+		UnknownCommand: False
+	unknown_ok: Bool = match unknown_command:
+		RenderPreparedListCommand: False
+		RenderManifestCommand: False
+		UnknownCommand: True
+	render_ok and manifest_ok and unknown_ok
+
+
+func test_parse_template_shapes() -> Bool:
+	pointer_ok: Bool = parsed_template_has("list_get_pointer", "list_get_pointer", 2)
+	inline_checked_ok: Bool = parsed_template_has(
+		"list_get_inline_checked",
+		"list_get_inline_checked",
+		6,
+	)
+	inline_proven_ok: Bool = parsed_template_has(
+		"list_get_inline_proven",
+		"list_get_inline_proven",
+		6,
+	)
+	bits_load_ok: Bool = parsed_template_has("list_inline_bits_load", "list_inline_bits_load", 4)
+	struct_load_checked_ok: Bool = parsed_template_has(
+		"list_inline_struct_load_checked",
+		"list_inline_struct_load_checked",
+		5,
+	)
+	struct_load_proven_ok: Bool = parsed_template_has(
+		"list_inline_struct_load_proven",
+		"list_inline_struct_load_proven",
+		5,
+	)
+	missing_ok: Bool = match parse_prepared_list_template("list_len"):
+		Some(template): False
+		None: True
+	all_ok: Bool = (
+		pointer_ok
+		and inline_checked_ok
+		and inline_proven_ok
+		and bits_load_ok
+		and struct_load_checked_ok
+		and struct_load_proven_ok
+		and missing_ok
+	)
+
+	all_ok
+
+
+func test_render_prepared_list_op_successes() -> Bool:
+	pointer_ok: Bool = render_prepared_list_op(
+		PointerGet(
+			"xs",
+			"idx",
+		),
+	) == "blorp_list_get((blorp_List*)xs, idx)"
+	checked_ok: Bool = render_prepared_list_op(InlineCheckedGet({
+		list = "xs",
+		index = "idx",
+		list_tmp = "__list",
+		index_tmp = "__idx",
+		bits_tmp = "__bits",
+		width_bytes = "8",
+	})) == (
+		"({ blorp_List* __list = (blorp_List*)xs; long __idx = idx; "
+		+ "(__builtin_expect(!__list || __idx < 0 || __idx >= __list->len, 0) ? NULL : ({ "
+		+ "uintptr_t __bits = 0; memcpy(&__bits, (char*)__list->data + __idx * 8, 8); "
+		+ "(void*)__bits; })); })"
+	)
+	proven_ok: Bool = render_prepared_list_op(InlineProvenGet({
+		list = "xs",
+		index = "idx",
+		list_tmp = "__list",
+		index_tmp = "__idx",
+		bits_tmp = "__bits",
+		width_bytes = "4",
+	})) == (
+		"({ blorp_List* __list = (blorp_List*)xs; long __idx = idx; ({ uintptr_t __bits "
+		+ "= 0; memcpy(&__bits, (char*)__list->data + __idx * 4, 4); (void*)__bits; }); })"
+	)
+	load_checked_ok: Bool = render_prepared_list_op(InlineStructLoadChecked({
+		list_tmp = "__list",
+		index_tmp = "__idx",
+		out_tmp = "__out",
+		raw_tmp = "__raw",
+		struct_ty = "Small",
+	})) == (
+		"if (__builtin_expect(!__list || __idx < 0 || __idx >= __list->len, 0)) { "
+		+ "memset(&__out, 0, sizeof(Small)); } else if (__list->storage_mode == "
+		+ "BLORP_LIST_STORAGE_INLINE && __list->elem_size == (int16_t)sizeof(Small)) { "
+		+ "memcpy(&__out, (char*)__list->data + __idx * sizeof(Small), sizeof(Small)); } "
+		+ "else { void* __raw = blorp_list_get(__list, __idx); if (!__raw) { memset(&__out,"
+		+ " 0, sizeof(Small)); } else { __out = blorp_unbox_struct(__raw, Small); } }"
+	)
+	load_proven_ok: Bool = render_prepared_list_op(InlineStructLoadProven({
+		list_tmp = "__list",
+		index_tmp = "__idx",
+		out_tmp = "__out",
+		raw_tmp = "__raw",
+		struct_ty = "Small",
+	})) == (
+		"if (__list->storage_mode == BLORP_LIST_STORAGE_INLINE && __list->elem_size == "
+		+ "(int16_t)sizeof(Small)) { memcpy(&__out, (char*)__list->data + __idx * "
+		+ "sizeof(Small), sizeof(Small)); } else { void* __raw = blorp_list_get(__list, "
+		+ "__idx); if (!__raw) { memset(&__out, 0, sizeof(Small)); } else { __out = "
+		+ "blorp_unbox_struct(__raw, Small); } }"
+	)
+	bits_load_ok: Bool = render_prepared_list_op(InlineBitsLoad({
+		list_tmp = "__list",
+		index_tmp = "__idx",
+		bits_tmp = "__bits",
+		width_bytes = "8",
+	})) == "uintptr_t __bits = 0; memcpy(&__bits, (char*)__list->data + __idx * 8, 8);"
+
+	pointer_ok and checked_ok and proven_ok and load_checked_ok and load_proven_ok and bits_load_ok
+
+
+func test_render_prepared_list_successes() -> Bool:
+	pointer_ok: Bool = match render_prepared_list(
+		"list_get_pointer",
+		["xs", "i"],
+	):
+		Ok(rendered): rendered == "blorp_list_get((blorp_List*)xs, i)"
+		Err(error): False
+	inline_ok: Bool = match render_prepared_list(
+		"list_get_inline_proven",
+		["xs", "i", "__lg_list_0", "__lg_idx_1", "__lg_bits_2", "8"],
+	):
+		Ok(rendered):
+			rendered == (
+				"({ blorp_List* __lg_list_0 = (blorp_List*)xs; long __lg_idx_1 = i; ({ uintptr_t "
+				+ "__lg_bits_2 = 0; memcpy(&__lg_bits_2, (char*)__lg_list_0->data + __lg_idx_1 * 8,"
+				+ " 8); (void*)__lg_bits_2; }); })"
+			)
+		Err(error): False
+	load_ok: Bool = match render_prepared_list(
+		"list_inline_struct_load_proven",
+		["__list", "__idx", "__out", "__raw", "Small"],
+	):
+		Ok(rendered):
+			rendered == (
+				"if (__list->storage_mode == BLORP_LIST_STORAGE_INLINE && __list->elem_size == "
+				+ "(int16_t)sizeof(Small)) { memcpy(&__out, (char*)__list->data + __idx * "
+				+ "sizeof(Small), sizeof(Small)); } else { void* __raw = blorp_list_get(__list, "
+				+ "__idx); if (!__raw) { memset(&__out, 0, sizeof(Small)); } else { __out = "
+				+ "blorp_unbox_struct(__raw, Small); } }"
+			)
+		Err(error): False
+	bits_load_ok: Bool = match render_prepared_list(
+		"list_inline_bits_load",
+		["((blorp_List*)lst)", "__tailrec_i", "__tailrec_bits_0", "8"],
+	):
+		Ok(rendered):
+			rendered == (
+				"uintptr_t __tailrec_bits_0 = 0; memcpy(&__tailrec_bits_0, "
+				+ "(char*)((blorp_List*)lst)->data + __tailrec_i * 8, 8);"
+			)
+		Err(error): False
+	pointer_ok and inline_ok and load_ok and bits_load_ok
+
+
+func test_render_prepared_list_errors_are_typed() -> Bool:
+	wrong_arity_ok: Bool = match render_prepared_list("list_get_pointer", ["xs"]):
+		Ok(rendered): False
+		Err(error):
+			match error:
+				WrongArity(template, expected, got):
+					(
+						prepared_list_template_name(template) == "list_get_pointer"
+						and expected == 2
+						and got == 1
+					)
+				UnsupportedPreparedListOp(name): False
+	load_arity_ok: Bool = match render_prepared_list("list_inline_struct_load_checked", ["__list"]):
+		Ok(rendered): False
+		Err(error):
+			match error:
+				WrongArity(template, expected, got):
+					(
+						prepared_list_template_name(template) == "list_inline_struct_load_checked"
+						and expected == 5
+						and got == 1
+					)
+				UnsupportedPreparedListOp(name): False
+	bits_load_arity_ok: Bool = match render_prepared_list("list_inline_bits_load", ["__list"]):
+		Ok(rendered): False
+		Err(error):
+			match error:
+				WrongArity(template, expected, got):
+					(
+						prepared_list_template_name(template) == "list_inline_bits_load"
+						and expected == 4
+						and got == 1
+					)
+				UnsupportedPreparedListOp(name): False
+	unsupported_ok: Bool = match render_prepared_list("list_len", ["xs"]):
+		Ok(rendered): False
+		Err(error):
+			match error:
+				WrongArity(template, expected, got): False
+				UnsupportedPreparedListOp(name): name == "list_len"
+	wrong_arity_ok and load_arity_ok and bits_load_arity_ok and unsupported_ok
+
+
+func test_render_error_to_string() -> Bool:
+	arity_error: RenderError = WrongArity(ListGetInlineCheckedTemplate, 6, 5)
+	unsupported_error: RenderError = UnsupportedPreparedListOp("missing")
+	arity_text: String = render_error_to_string(arity_error)
+	unsupported_text: String = render_error_to_string(unsupported_error)
+
+	(
+		arity_text == "prepared list op list_get_inline_checked expected 6 arg(s), got 5"
+		and unsupported_text == "unsupported prepared list op: missing"
+	)
+
+
+func test_render_manifest_lines() -> Bool:
+	lines: List[String] = render_manifest_lines()
+	count_ok: Bool = lines.length() == ALL_TEMPLATES.length()
+	first_ok: Bool = match lines:
+		[]: False
+		[first, ...rest]:
+			first == "list_get_pointer\t2\tblorp_list_get((blorp_List*)@0@, @1@)"
+	inline_checked_ok: Bool = render_manifest_line(
+		ListGetInlineCheckedTemplate,
+	) == "list_get_inline_checked\t6\t({ blorp_List* @2@ = (blorp_List*)@0@; long @3@ = @1@; (__builtin_expect(!@2@ || @3@ < 0 || @3@ >= @2@->len, 0) ? NULL : ({ uintptr_t @4@ = 0; memcpy(&@4@, (char*)@2@->data + @3@ * @5@, @5@); (void*)@4@; })); })"
+	bits_load_ok: Bool = render_manifest_line(
+		ListInlineBitsLoadTemplate,
+	) == "list_inline_bits_load\t4\tuintptr_t @2@ = 0; memcpy(&@2@, (char*)@0@->data + @1@ * @3@, @3@);"
+	struct_load_checked_ok: Bool = render_manifest_line(
+		ListInlineStructLoadCheckedTemplate,
+	) == "list_inline_struct_load_checked\t5\tif (__builtin_expect(!@0@ || @1@ < 0 || @1@ >= @0@->len, 0)) { memset(&@2@, 0, sizeof(@4@)); } else if (@0@->storage_mode == BLORP_LIST_STORAGE_INLINE && @0@->elem_size == (int16_t)sizeof(@4@)) { memcpy(&@2@, (char*)@0@->data + @1@ * sizeof(@4@), sizeof(@4@)); } else { void* @3@ = blorp_list_get(@0@, @1@); if (!@3@) { memset(&@2@, 0, sizeof(@4@)); } else { @2@ = blorp_unbox_struct(@3@, @4@); } }"
+	struct_load_proven_ok: Bool = render_manifest_line(
+		ListInlineStructLoadProvenTemplate,
+	) == "list_inline_struct_load_proven\t5\tif (@0@->storage_mode == BLORP_LIST_STORAGE_INLINE && @0@->elem_size == (int16_t)sizeof(@4@)) { memcpy(&@2@, (char*)@0@->data + @1@ * sizeof(@4@), sizeof(@4@)); } else { void* @3@ = blorp_list_get(@0@, @1@); if (!@3@) { memset(&@2@, 0, sizeof(@4@)); } else { @2@ = blorp_unbox_struct(@3@, @4@); } }"
+
+	(
+		count_ok
+		and first_ok
+		and inline_checked_ok
+		and bits_load_ok
+		and struct_load_checked_ok
+		and struct_load_proven_ok
+	)
+
+
+tests: TestSuite = {
+	description = "Self-hosted compiler prepared list renderer",
+	tests = [
+		("parse command routes", test_parse_command_routes),
+		("parse template shapes", test_parse_template_shapes),
+		("render prepared list op successes", test_render_prepared_list_op_successes),
+		("render prepared list successes", test_render_prepared_list_successes),
+		("render prepared list errors are typed", test_render_prepared_list_errors_are_typed),
+		("render error to string", test_render_error_to_string),
+		("render manifest lines", test_render_manifest_lines),
+	]
+}

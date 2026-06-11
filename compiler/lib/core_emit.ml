@@ -909,112 +909,26 @@ let rec emit_intrinsic (ctx : Core_emit_context.t) (e : core) (name : string)
 
 and emit_tensor_raw_view_decl (ctx : Core_emit_context.t)
     (b : tensor_raw_view_binding) : unit =
-  let c_ty =
-    (Core_layout_type.tensor_raw_scalar_abi b.trv_kind).tras_pointer_c_type
-  in
-  emit ctx c_ty;
-  emit ctx " ";
-  emit ctx (escape_c_ident (Var.to_c_name b.trv_var));
-  emit ctx " = (";
-  emit ctx c_ty;
-  emit ctx ")((blorp_Vector*)";
-  emit_expr ctx b.trv_source;
-  emit ctx ")->data"
+  Core_emit_blorp_prepared_tensor.emit_raw_view_decl ~emit_expr ctx b
 
 and emit_list_get (ctx : Core_emit_context.t) (get : list_get) : unit =
-  match get.lg_layout.lsl_slots with
-  | ListPointerStorage ->
-      emit ctx "blorp_list_get((blorp_List*)";
-      emit_expr ctx get.lg_list;
-      emit ctx ", ";
-      emit_expr ctx get.lg_index;
-      emit ctx ")"
-  | ListInlineStorage width ->
-      let list_tmp = Printf.sprintf "__lg_list_%d" (fresh_temp ctx) in
-      let idx_tmp = Printf.sprintf "__lg_idx_%d" (fresh_temp ctx) in
-      let bits_tmp = Printf.sprintf "__lg_bits_%d" (fresh_temp ctx) in
-      let width_bytes = inline_storage_width_bytes width in
-      emit ctx (Printf.sprintf "({\nblorp_List* %s = (blorp_List*)" list_tmp);
-      emit_expr ctx get.lg_list;
-      emit ctx (Printf.sprintf ";\nlong %s = " idx_tmp);
-      emit_expr ctx get.lg_index;
-      emit ctx ";\n";
-      (match get.lg_bounds with
-      | ListBoundsChecked ->
-          emit ctx
-            (Printf.sprintf
-               "(__builtin_expect(!%s || %s < 0 || %s >= %s->len, 0) ? NULL : "
-               list_tmp idx_tmp idx_tmp list_tmp)
-      | ListBoundsProven -> ());
-      (* [CListGet] carries the concrete monomorphized list storage layout.
-         Re-checking [storage_mode]/[elem_size] here turns an impossible Core
-         state into a hot runtime branch. Generic pointer storage still uses the
-         runtime helper above; inline storage can load the slot directly. *)
-      emit ctx
-        (Printf.sprintf
-           "({ uintptr_t %s = 0; memcpy(&%s, (char*)%s->data + %s * %d, %d); \
-            (void*)%s; })"
-           bits_tmp bits_tmp list_tmp idx_tmp width_bytes width_bytes bits_tmp);
-      (match get.lg_bounds with
-      | ListBoundsChecked -> emit ctx ")"
-      | ListBoundsProven -> ());
-      emit ctx ";\n})"
-  | ListInlineStructStorage _ ->
-      emit ctx "blorp_list_get((blorp_List*)";
-      emit_expr ctx get.lg_list;
-      emit ctx ", ";
-      emit_expr ctx get.lg_index;
-      emit ctx ")"
+  Core_emit_blorp_prepared_list.emit_get ~emit_expr ctx get
 
 and emit_string_byte_read (ctx : Core_emit_context.t) (read : string_byte_read)
     : unit =
-  emit ctx "(long)(unsigned char)((blorp_String*)";
-  emit_expr ctx read.sbr_source;
-  emit ctx ")->data[";
-  emit_expr ctx read.sbr_index;
-  emit ctx "]"
+  Core_emit_blorp_prepared_string.emit_byte_read ~emit_expr ctx read
 
 and emit_string_byte_write (ctx : Core_emit_context.t)
     (write : string_byte_write) : unit =
-  emit ctx "(((blorp_String*)";
-  emit_expr ctx write.sbw_target;
-  emit ctx ")->data[";
-  emit_expr ctx write.sbw_index;
-  emit ctx "] = (char)";
-  emit_expr ctx write.sbw_byte;
-  emit ctx ")"
+  Core_emit_blorp_prepared_string.emit_byte_write ~emit_expr ctx write
 
 and emit_string_byte_copy (ctx : Core_emit_context.t) (copy : string_byte_copy)
     : unit =
-  let id = fresh_temp ctx in
-  let dst_tmp = Printf.sprintf "__string_copy_dst_%d" id in
-  let dst_pos_tmp = Printf.sprintf "__string_copy_dst_pos_%d" id in
-  let src_tmp = Printf.sprintf "__string_copy_src_%d" id in
-  let src_pos_tmp = Printf.sprintf "__string_copy_src_pos_%d" id in
-  let len_tmp = Printf.sprintf "__string_copy_len_%d" id in
-  emit ctx (Printf.sprintf "({ blorp_String* %s = (blorp_String*)" dst_tmp);
-  emit_expr ctx copy.sbc_dst;
-  emit ctx (Printf.sprintf "; long %s = " dst_pos_tmp);
-  emit_expr ctx copy.sbc_dst_pos;
-  emit ctx (Printf.sprintf "; blorp_String* %s = (blorp_String*)" src_tmp);
-  emit_expr ctx copy.sbc_src;
-  emit ctx (Printf.sprintf "; long %s = " src_pos_tmp);
-  emit_expr ctx copy.sbc_src_pos;
-  emit ctx (Printf.sprintf "; long %s = " len_tmp);
-  emit_expr ctx copy.sbc_len;
-  emit ctx
-    (Printf.sprintf
-       "; if (%s > 0) { memcpy(%s->data + %s, %s->data + %s, (size_t)%s); } \
-        (void)0; })"
-       len_tmp dst_tmp dst_pos_tmp src_tmp src_pos_tmp len_tmp)
+  Core_emit_blorp_prepared_string.emit_byte_copy ~emit_expr ctx copy
 
 and emit_string_set_len (ctx : Core_emit_context.t) (set_len : string_set_len) :
     unit =
-  emit ctx "({ blorp_String* __sl = (blorp_String*)";
-  emit_expr ctx set_len.ssl_target;
-  emit ctx "; long __sn = ";
-  emit_expr ctx set_len.ssl_len;
-  emit ctx "; __sl->len = __sn; __sl->data[__sn] = '\\0'; (void)0; })"
+  Core_emit_blorp_prepared_string.emit_set_len ~emit_expr ctx set_len
 
 and emit_box_op (ctx : Core_emit_context.t) (b : box_op) : unit =
   match b.box_kind with
@@ -1051,28 +965,6 @@ and emit_boxed_storage (ctx : Core_emit_context.t) (value : boxed_storage_value)
     : unit =
   emit_box_op ctx value.bsv_box
 
-and emit_list_inline_struct_dynamic_load ctx ~list_tmp ~idx_tmp ~out_tmp
-    ~struct_ty ~bounds =
-  let raw_tmp = Printf.sprintf "__lg_raw_%d" (fresh_temp ctx) in
-  (match bounds with
-  | ListBoundsChecked ->
-      emit ctx
-        (Printf.sprintf
-           "if (__builtin_expect(!%s || %s < 0 || %s >= %s->len, 0)) { \
-            memset(&%s, 0, sizeof(%s)); } else "
-           list_tmp idx_tmp idx_tmp list_tmp out_tmp struct_ty)
-  | ListBoundsProven -> ());
-  emit ctx
-    (Printf.sprintf
-       "if (%s->storage_mode == BLORP_LIST_STORAGE_INLINE && %s->elem_size == \
-        (int16_t)sizeof(%s)) { memcpy(&%s, (char*)%s->data + %s * sizeof(%s), \
-        sizeof(%s)); } else { void* %s = blorp_list_get(%s, %s); if (!%s) { \
-        memset(&%s, 0, sizeof(%s)); } else { %s = blorp_unbox_struct(%s, %s); \
-        } }"
-       list_tmp list_tmp struct_ty out_tmp list_tmp idx_tmp struct_ty struct_ty
-       raw_tmp list_tmp idx_tmp raw_tmp out_tmp struct_ty out_tmp raw_tmp
-       struct_ty)
-
 and emit_unbox_op (ctx : Core_emit_context.t) (u : unbox_op) : unit =
   let c_ty = type_to_c ctx u.unbox_target_ty in
   match (u.unbox_kind, u.unbox_value.desc) with
@@ -1086,8 +978,8 @@ and emit_unbox_op (ctx : Core_emit_context.t) (u : unbox_op) : unit =
       emit ctx (Printf.sprintf "; long %s = " idx_tmp);
       emit_expr ctx get.lg_index;
       emit ctx (Printf.sprintf "; %s %s; " struct_ty out_tmp);
-      emit_list_inline_struct_dynamic_load ctx ~list_tmp ~idx_tmp ~out_tmp
-        ~struct_ty ~bounds:get.lg_bounds;
+      Core_emit_blorp_prepared_list.emit_inline_struct_dynamic_load ctx
+        ~list_tmp ~idx_tmp ~out_tmp ~struct_ty ~bounds:get.lg_bounds;
       emit ctx (Printf.sprintf " %s; })" out_tmp)
   | UnboxStruct struct_ty, CCall (CKBuiltin "blorp_checked_get", _, [ arr; idx ])
     ->
@@ -4056,18 +3948,9 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                       then emit ctx ")"
                 end))
   | CTensorRawRead r ->
-      emit ctx (escape_c_ident (Var.to_c_name r.trr_view));
-      emit ctx "[";
-      emit_expr ctx r.trr_index;
-      emit ctx "]"
+      Core_emit_blorp_prepared_tensor.emit_raw_read ~emit_expr ctx r
   | CTensorRawWrite w ->
-      emit ctx "({ ";
-      emit ctx (escape_c_ident (Var.to_c_name w.trw_view));
-      emit ctx "[";
-      emit_expr ctx w.trw_index;
-      emit ctx "] = ";
-      emit_expr ctx w.trw_value;
-      emit ctx "; (void)0; })"
+      Core_emit_blorp_prepared_tensor.emit_raw_write_expr ~emit_expr ctx w
   | CStringByteRead read -> emit_string_byte_read ctx read
   | CStringByteWrite write -> emit_string_byte_write ctx write
   | CStringByteCopy copy -> emit_string_byte_copy ctx copy
@@ -5175,12 +5058,8 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
   | CSelect select -> emit_select ctx select
   | CTensorRawWrite w ->
       emit_indent ctx;
-      emit ctx (escape_c_ident (Var.to_c_name w.trw_view));
-      emit ctx "[";
-      emit_expr ctx w.trw_index;
-      emit ctx "] = ";
-      emit_expr ctx w.trw_value;
-      emitln ctx ";"
+      Core_emit_blorp_prepared_tensor.emit_raw_write_stmt ~emit_expr ctx w;
+      emitln ctx ""
   (* ---- Everything else: evaluate and discard the result ---- *)
   | CLit _ | CVar _ | CBin _ | CUn _ | CLog _ | CCall _ | CTensorRawRead _
   | CStringByteRead _ | CStringByteWrite _ | CStringByteCopy _ | CStringSetLen _
@@ -6505,16 +6384,16 @@ and emit_for_list_flat (ctx : Core_emit_context.t) (binder : loop_binder)
     | ListInlineStructStorage c_ty ->
         emit_indent ctx;
         emit ctx (Printf.sprintf "%s %s; " c_ty var_c);
-        emit_list_inline_struct_dynamic_load ctx ~list_tmp:iter_c ~idx_tmp:idx_c
-          ~out_tmp:var_c ~struct_ty:c_ty ~bounds:ListBoundsProven;
+        Core_emit_blorp_prepared_list.emit_inline_struct_dynamic_load ctx
+          ~list_tmp:iter_c ~idx_tmp:idx_c ~out_tmp:var_c ~struct_ty:c_ty
+          ~bounds:ListBoundsProven;
         emitln ctx ""
     | ListInlineStorage width ->
-        let width_bytes = inline_storage_width_bytes width in
         let bits_tmp = Printf.sprintf "__iter_bits_%d" (fresh_temp ctx) in
-        emit_line ctx
-          (Printf.sprintf
-             "uintptr_t %s = 0; memcpy(&%s, (char*)%s->data + %s * %d, %d);"
-             bits_tmp bits_tmp iter_c idx_c width_bytes width_bytes);
+        emit_indent ctx;
+        Core_emit_blorp_prepared_list.emit_inline_bits_load ctx ~list_tmp:iter_c
+          ~idx_tmp:idx_c ~bits_tmp ~width;
+        emitln ctx "";
         emit_unbox_decl ctx var_c (Printf.sprintf "(void*)%s" bits_tmp) elem_ty
     | ListPointerStorage ->
         emit_unbox_decl ctx var_c
@@ -7152,18 +7031,17 @@ and emit_tailrec_list_binding (ctx : Core_emit_context.t)
       let layout = list_storage_layout_of_type ctx list_ty loc in
       match layout.lsl_slots with
       | ListInlineStorage width ->
-          let width_bytes = inline_storage_width_bytes width in
           let bits_tmp = Printf.sprintf "__tailrec_bits_%d" (fresh_temp ctx) in
-          emit_line ctx
-            (Printf.sprintf
-               "uintptr_t %s = 0; memcpy(&%s, (char*)((blorp_List*)%s)->data + \
-                %s * %d, %d);"
-               bits_tmp bits_tmp list_name idx_c width_bytes width_bytes);
+          emit_indent ctx;
+          Core_emit_blorp_prepared_list.emit_inline_bits_load ctx
+            ~list_tmp:(Printf.sprintf "((blorp_List*)%s)" list_name)
+            ~idx_tmp:idx_c ~bits_tmp ~width;
+          emitln ctx "";
           emit_line ctx (unbox_decl_str ctx var_c ("(void*)" ^ bits_tmp) var_ty)
       | ListInlineStructStorage c_ty ->
           emit_indent ctx;
           emit ctx (Printf.sprintf "%s %s; " c_ty var_c);
-          emit_list_inline_struct_dynamic_load ctx
+          Core_emit_blorp_prepared_list.emit_inline_struct_dynamic_load ctx
             ~list_tmp:(Printf.sprintf "((blorp_List*)%s)" list_name)
             ~idx_tmp:idx_c ~out_tmp:var_c ~struct_ty:c_ty
             ~bounds:ListBoundsProven;
