@@ -279,6 +279,14 @@ let col_inside_name (loc : loc) name ~(line : int) ~(col : int) =
   loc.line = target_line && loc.column <= target_col
   && target_col < loc.column + String.length name
 
+let position_compare (line_a, col_a) (line_b, col_b) =
+  match compare line_a line_b with 0 -> compare col_a col_b | c -> c
+
+let loc_contains_position (loc : loc) ~(line : int) ~(col : int) =
+  let target = (line + 1, col + 1) in
+  position_compare (loc.line, loc.column) target <= 0
+  && position_compare target (loc.end_line, loc.end_column) <= 0
+
 let find_typed_param_in_func ?file (func : Typed_ast.func_decl) ~(line : int)
     ~(col : int) : typed_param_hit option =
   let ast = Typed_ast.func_ast func in
@@ -867,11 +875,54 @@ let record_decl_name_loc loc (rd : record_decl) =
   let keyword_prefix = if rd.record_is_value then "struct " else "record " in
   loc_at_declared_name loc ~name:rd.record_name ~keyword_prefix
 
+let trait_decl_name_loc loc (td : trait_decl) =
+  loc_at_declared_name loc ~name:td.trait_name ~keyword_prefix:"trait "
+
 let type_alias_name_loc loc (ad : type_alias_decl) =
   let keyword_prefix =
     if ad.alias_is_opaque then "opaque type " else "type alias "
   in
   loc_at_declared_name loc ~name:ad.alias_name ~keyword_prefix
+
+let func_decl_name_loc loc (fd : func_decl) =
+  match fd.func_name with
+  | None -> loc
+  | Some name -> (
+      let from_first_param =
+        match fd.func_params with
+        | first_param :: _ ->
+            let type_param_suffix_len =
+              match fd.func_type_params with
+              | [] -> 0
+              | params ->
+                  2
+                  + String.length
+                      (String.concat ", "
+                         (List.map type_param_to_parser_string params))
+            in
+            let column =
+              first_param.param_loc.column - String.length name
+              - type_param_suffix_len - 1
+            in
+            if column > 0 then
+              Some
+                {
+                  line = first_param.param_loc.line;
+                  column;
+                  end_line = first_param.param_loc.line;
+                  end_column = column + String.length name;
+                  loc_file = loc.loc_file;
+                }
+            else None
+        | [] -> None
+      in
+      match from_first_param with
+      | Some loc -> loc
+      | None ->
+          let keyword_prefix =
+            if fd.func_is_pure then "pure func " else "func "
+          in
+          loc_at_declared_name loc ~name ~keyword_prefix)
 
 (** Find the definition location of a name in the program.
     Searches top-level declarations first, then local definitions
@@ -893,7 +944,8 @@ let find_definition (program : program) ~(name : string) ~(line : int)
     | d :: rest -> (
         let found =
           match d.decl_desc with
-          | DFunc fd when fd.func_name = Some name -> Some d.decl_loc
+          | DFunc fd when fd.func_name = Some name ->
+              Some (func_decl_name_loc d.decl_loc fd)
           | DVar vd when vd.var_name = Some name -> Some d.decl_loc
           | DType td when td.type_name = name ->
               Some (type_decl_name_loc d.decl_loc td)
@@ -910,7 +962,8 @@ let find_definition (program : program) ~(name : string) ~(line : int)
               | None -> None)
           | DRecord rd when rd.record_name = name ->
               Some (record_decl_name_loc d.decl_loc rd)
-          | DTrait td when td.trait_name = name -> Some d.decl_loc
+          | DTrait td when td.trait_name = name ->
+              Some (trait_decl_name_loc d.decl_loc td)
           | DTypeAlias ad when ad.alias_name = name ->
               Some (type_alias_name_loc d.decl_loc ad)
           | DPrivate inner -> find_in_decls [ inner ]
@@ -1056,6 +1109,11 @@ let find_definition (program : program) ~(name : string) ~(line : int)
     without an explicit import. *)
 let prelude_ufcs_modules = Language_surface.prelude_ufcs_modules
 
+(* Core trait names are accepted in bounds without an explicit source import.
+   Navigation should expose only trait declarations from these modules, not every
+   helper function or method declaration they contain. *)
+let prelude_trait_modules = [ "traits" ]
+
 (** Map an embedded module path like [<embedded:std/option>] to the configured
     filesystem std path. Non-embedded paths and sessions without an explicit
     filesystem std override are returned unchanged. *)
@@ -1129,6 +1187,257 @@ let find_in_module (m : Modules.loaded_module) ~(name : string) : Ast.loc option
     =
   find_definition m.decls ~name ~line:0 ~col:0
 
+let find_trait_in_module (m : Modules.loaded_module) ~(name : string) :
+    Ast.loc option =
+  let rec find_in_decls decls =
+    match decls with
+    | [] -> None
+    | (d : Ast.decl) :: rest -> (
+        match d.decl_desc with
+        | DTrait trait when trait.trait_name = name ->
+            Some (trait_decl_name_loc d.decl_loc trait)
+        | DPrivate inner -> (
+            match find_in_decls [ inner ] with
+            | Some _ as hit -> hit
+            | None -> find_in_decls rest)
+        | _ -> find_in_decls rest)
+  in
+  find_in_decls m.decls
+
+type resolved_call_definition = {
+  resolved_definition_path : string option;
+  resolved_definition_loc : Ast.loc;
+}
+
+let visible_call_source_name name =
+  let clean = Call_resolution.strip_callable_id_suffix name in
+  match Codegen_names.parse_ufcs_name clean with
+  | Some (_, original_name) -> original_name
+  | None -> clean
+
+let resolved_call_source_name (call : Ast.resolved_call) =
+  match call.call_target with
+  | CallDirect { source_name; _ } -> Some (visible_call_source_name source_name)
+  | CallTraitMethod { method_name; _ } -> Some method_name
+  | CallClosure _ -> None
+
+let typed_expr_loc expr = (Typed_ast.ast expr).expr_loc
+let optional_expr = function Some expr -> [ expr ] | None -> []
+
+let typed_func_body_expr_opt func =
+  match Typed_ast.func_body_expr func with Ok body -> body | Error _ -> None
+
+let typed_expr_children expr =
+  match Typed_ast.expr_desc expr with
+  | Error _ -> []
+  | Ok desc -> (
+      match desc with
+      | Typed_ast.EIdent _ | ELiteral _ | EVoid | EBreak | EContinue
+      | EStringInterpRaw _ | EBuiltin _ ->
+          []
+      | EUnary (_, inner)
+      | EAscription (inner, _)
+      | EOpaqueInto (_, inner)
+      | EOpaqueFrom (_, inner)
+      | EDetach inner ->
+          [ inner ]
+      | EBinary (_, left, right)
+      | ELogical (_, left, right)
+      | EWhile (left, right)
+      | ERange (left, right)
+      | ESubscript (left, right) ->
+          [ left; right ]
+      | ECall (callee, args) -> callee :: args
+      | EIf (cond, then_, else_) -> cond :: then_ :: optional_expr else_
+      | EMatch (scrutinee, cases) ->
+          scrutinee :: List.map (fun case -> case.Typed_ast.case_body) cases
+      | EBlock exprs
+      | ETuple exprs
+      | EVector exprs
+      | EList exprs
+      | EDebugBlock exprs
+      | EConcurrent (exprs, _, _) ->
+          exprs
+      | ERecord fields -> List.map snd fields
+      | ERecordUpdate (base, fields) -> base :: List.map snd fields
+      | EFieldAccess (receiver, _) -> [ receiver ]
+      | ELambda func | EFuncDecl func -> (
+          match typed_func_body_expr_opt func with
+          | Some body -> [ body ]
+          | None -> [])
+      | EFor (_, iter, body) | EForTuple (_, iter, body) -> [ iter; body ]
+      | ELoopView view ->
+          view.Typed_ast.loop_view_source
+          :: optional_expr view.loop_view_size_arg
+      | EAssign (_, rhs)
+      | ECompoundAssign (_, _, rhs)
+      | EVarDecl (_, _, rhs, _)
+      | ETupleDestruct (_, rhs)
+      | EQuestionBind (_, _, rhs)
+      | EConcurrentBind (_, _, rhs) ->
+          [ rhs ]
+      | ESubscriptMulti (coll, indices) -> coll :: indices
+      | ESubscriptAssign (coll, indices, value) -> coll :: (indices @ [ value ])
+      | EStringInterp (parts, _) ->
+          List.filter_map
+            (function
+              | Typed_ast.InterpExpr expr -> Some expr | InterpLit _ -> None)
+            parts
+      | EWith (binding, body) ->
+          binding.with_value :: body
+          ::
+          (match binding.with_error_map with
+          | Some mapper -> [ mapper.with_error_value ]
+          | None -> [])
+      | ESelect arms ->
+          List.concat_map
+            (fun arm ->
+              let kind_exprs =
+                match arm.Typed_ast.select_arm_kind with
+                | SelectRecv { select_channel; _ }
+                | SelectSealed { select_channel; _ } ->
+                    [ select_channel ]
+                | SelectAfter timeout -> [ timeout ]
+              in
+              kind_exprs @ [ arm.select_arm_body ])
+            arms
+      | EConcurrentlyLoop (_, iter, body, timeout, _) ->
+          iter :: body :: optional_expr timeout
+      | EDict pairs -> List.concat_map (fun (k, v) -> [ k; v ]) pairs)
+
+let find_resolved_call_at (program : Typed_ast.program) ~(name : string)
+    ~(line : int) ~(col : int) : Ast.resolved_call option =
+  let best = ref None in
+  let best_start = ref (-1, -1) in
+  let target_line = line + 1 in
+  let target_col = col + 1 in
+  let loc_starts_after loc (line_b, col_b) =
+    loc.line > line_b || (loc.line = line_b && loc.column > col_b)
+  in
+  let call_loc_can_refer_to_cursor loc =
+    loc_contains_position loc ~line ~col
+    || (loc.line = target_line && loc.column <= target_col)
+  in
+  let consider expr =
+    let loc = typed_expr_loc expr in
+    if call_loc_can_refer_to_cursor loc && loc_starts_after loc !best_start then
+      match Typed_ast.expr_resolved_call expr with
+      | Some call when resolved_call_source_name call = Some name ->
+          best := Some call;
+          best_start := (loc.line, loc.column)
+      | _ -> ()
+  in
+  let rec walk_expr expr =
+    consider expr;
+    List.iter walk_expr (typed_expr_children expr)
+  in
+  let walk_func func = typed_func_body_expr_opt func |> Option.iter walk_expr in
+  let rec walk_decl decl =
+    match Typed_ast.decl_view decl with
+    | DeclFunction func -> walk_func func
+    | DeclVar var -> (
+        match Typed_ast.var_value_expr var with
+        | Ok expr -> walk_expr expr
+        | Error _ -> ())
+    | DeclImpl impl -> List.iter walk_func (Typed_ast.impl_methods impl)
+    | DeclPrivate inner -> walk_decl inner
+    | DeclRecord _ | DeclTypeAlias _ | DeclOther -> ()
+  in
+  program |> Typed_ast.program_decls |> List.iter walk_decl;
+  !best
+
+let find_callable_definition_in_program (program : Typed_ast.program)
+    ~(callable_id : int) : Ast.loc option =
+  let rec find_decl decl =
+    let ast_decl = Typed_ast.decl_ast decl in
+    match Typed_ast.decl_view decl with
+    | DeclFunction func when Typed_ast.func_callable_id func = Some callable_id
+      ->
+        Some (func_decl_name_loc ast_decl.decl_loc (Typed_ast.func_ast func))
+    | DeclPrivate inner -> find_decl inner
+    | DeclFunction _ | DeclVar _ | DeclRecord _ | DeclTypeAlias _ | DeclImpl _
+    | DeclOther ->
+        None
+  in
+  program |> Typed_ast.program_decls |> List.find_map find_decl
+
+let find_loaded_module_by_path ?base_dir module_path =
+  match Modules.find_cached module_path with
+  | Some _ as hit -> hit
+  | None -> (
+      let cached_by_path =
+        Modules.get_all_modules ()
+        |> List.find_opt (fun (m : Modules.loaded_module) ->
+            m.name = module_path || m.path = module_path)
+      in
+      match cached_by_path with
+      | Some _ as hit -> hit
+      | None -> (
+          match base_dir with
+          | Some base_dir -> Modules.load_module module_path base_dir
+          | None -> None))
+
+let find_callable_definition_in_module (m : Modules.loaded_module)
+    ~(callable_id : int) ~(source_name : string) :
+    resolved_call_definition option =
+  match
+    Option.bind m.typed_decls (fun typed_program ->
+        find_callable_definition_in_program typed_program ~callable_id)
+  with
+  | Some loc ->
+      Some
+        {
+          resolved_definition_path = Some m.path;
+          resolved_definition_loc = loc;
+        }
+  | None ->
+      find_in_module m ~name:source_name
+      |> Option.map (fun loc ->
+          {
+            resolved_definition_path = Some m.path;
+            resolved_definition_loc = loc;
+          })
+
+let find_callable_definition_anywhere (current_program : Typed_ast.program)
+    ~(callable_id : int) ~(source_name : string) :
+    resolved_call_definition option =
+  match find_callable_definition_in_program current_program ~callable_id with
+  | Some loc ->
+      Some { resolved_definition_path = None; resolved_definition_loc = loc }
+  | None ->
+      Modules.get_all_modules ()
+      |> List.find_map (fun m ->
+          find_callable_definition_in_module m ~callable_id ~source_name)
+
+let find_resolved_call_definition ?base_dir (program : Typed_ast.program)
+    ~(name : string) ~(line : int) ~(col : int) :
+    resolved_call_definition option =
+  match find_resolved_call_at program ~name ~line ~col with
+  | None -> None
+  | Some call -> (
+      match call.call_target with
+      | CallDirect { callable_id; source_name; origin; _ } -> (
+          let source_name = visible_call_source_name source_name in
+          let by_id () =
+            find_callable_definition_anywhere program ~callable_id ~source_name
+          in
+          let by_imported_module module_path =
+            match find_loaded_module_by_path ?base_dir module_path with
+            | Some m ->
+                find_callable_definition_in_module m ~callable_id ~source_name
+            | None -> by_id ()
+          in
+          match origin with
+          | CallableLocal -> by_id ()
+          | CallableImported module_path -> by_imported_module module_path
+          | CallableBuiltin | CallableForeign | CallableConstructor _
+          | CallableImplMethod ->
+              by_id ())
+      | CallTraitMethod { callable_id = Some callable_id; method_name; _ } ->
+          find_callable_definition_anywhere program ~callable_id
+            ~source_name:method_name
+      | CallTraitMethod { callable_id = None; _ } | CallClosure _ -> None)
+
 (** Top-of-file location used when navigating to a whole module. *)
 let module_top_loc : Ast.loc =
   { line = 1; column = 1; end_line = 1; end_column = 1; loc_file = None }
@@ -1147,13 +1456,22 @@ let import_names_module (imp : Ast.import_decl) (name : string) : bool =
     Resolution order:
       1. Symbol exported by an explicit import ({name}, {name as alias}).
       2. Module itself — click on `option` or an alias `L` jumps to top-of-file.
-      3. Symbol reachable through a prelude UFCS module. *)
+      3. Symbol reachable through a prelude UFCS module.
+      4. Trait declaration reachable through implicit core trait bounds. *)
 let find_cross_module_definition (program : Ast.program) ~(name : string) :
     (string * Ast.loc) option =
   let try_module mod_name lookup_name =
     match Modules.find_cached mod_name with
     | Some m -> (
         match find_in_module m ~name:lookup_name with
+        | Some loc -> Some (m.path, loc)
+        | None -> None)
+    | None -> None
+  in
+  let try_trait_module mod_name lookup_name =
+    match Modules.find_cached mod_name with
+    | Some m -> (
+        match find_trait_in_module m ~name:lookup_name with
         | Some loc -> Some (m.path, loc)
         | None -> None)
     | None -> None
@@ -1193,8 +1511,17 @@ let find_cross_module_definition (program : Ast.program) ~(name : string) :
       in
       match module_match with
       | Some _ as r -> r
-      | None ->
+      | None -> (
           (* 3. Fall back to prelude UFCS modules — no import required. *)
-          List.find_map
-            (fun mod_name -> try_module mod_name name)
-            prelude_ufcs_modules)
+          match
+            List.find_map
+              (fun mod_name -> try_module mod_name name)
+              prelude_ufcs_modules
+          with
+          | Some _ as r -> r
+          | None ->
+              (* 4. Trait bounds use core std traits without an explicit import,
+                 but only trait names are globally reachable this way. *)
+              List.find_map
+                (fun mod_name -> try_trait_module mod_name name)
+                prelude_trait_modules))

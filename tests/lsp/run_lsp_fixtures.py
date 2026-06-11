@@ -253,10 +253,30 @@ def locations_from_result(result: Any) -> list[dict[str, Any]]:
     if result is None:
         return []
     if isinstance(result, list):
-        return result
+        return [normalize_location(location) for location in result]
     if isinstance(result, dict):
-        return [result]
+        return [normalize_location(result)]
     raise AssertionError(f"definition returned unexpected result: {result!r}")
+
+
+def normalize_location(location: Any) -> dict[str, Any]:
+    if not isinstance(location, dict):
+        raise AssertionError(f"definition returned unexpected location: {location!r}")
+    if "uri" in location and "range" in location:
+        return location
+    if "targetUri" in location:
+        target_range = location.get("targetSelectionRange") or location.get(
+            "targetRange"
+        )
+        if not isinstance(target_range, dict):
+            raise AssertionError(
+                f"definition LocationLink missing target range: {location!r}"
+            )
+        normalized = {"uri": location["targetUri"], "range": target_range}
+        if "originSelectionRange" in location:
+            normalized["originSelectionRange"] = location["originSelectionRange"]
+        return normalized
+    raise AssertionError(f"definition returned unsupported location shape: {location!r}")
 
 
 def assert_definition(result: Any, expect: dict[str, Any], source: FixtureSource) -> None:

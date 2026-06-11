@@ -24,12 +24,55 @@ type document = {
   mutable module_aliases : (string * string) list;
 }
 
+type client_capabilities = {
+  definition_link_support : bool;
+  declaration_link_support : bool;
+  type_definition_link_support : bool;
+}
+
+let default_client_capabilities =
+  {
+    definition_link_support = false;
+    declaration_link_support = false;
+    type_definition_link_support = false;
+  }
+
 type state = {
   documents : (string, document) Hashtbl.t;
   mutable initialized : bool;
+  mutable client_capabilities : client_capabilities;
 }
 
-let create () : state = { documents = Hashtbl.create 16; initialized = false }
+let create () : state =
+  {
+    documents = Hashtbl.create 16;
+    initialized = false;
+    client_capabilities = default_client_capabilities;
+  }
+
+let get_nested path json =
+  List.fold_left
+    (fun current key ->
+      match current with Some json -> get key json | None -> None)
+    (Some json) path
+
+let link_support_capability method_name params =
+  match
+    get_nested
+      [ "capabilities"; "textDocument"; method_name; "linkSupport" ]
+      params
+  with
+  | Some (Bool true) -> true
+  | _ -> false
+
+let client_capabilities_of_initialize_params params =
+  {
+    definition_link_support = link_support_capability "definition" params;
+    declaration_link_support = link_support_capability "declaration" params;
+    type_definition_link_support =
+      link_support_capability "typeDefinition" params;
+  }
+
 let find_document state uri = Hashtbl.find_opt state.documents uri
 
 let clear_analysis_state doc =

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Verify the packaged IntelliJ plugin keeps the integration pieces needed for
+# TextMate highlighting, native token PSI, LSP, and Cmd+Click navigation.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+fail() {
+    echo "$1" >&2
+    exit 1
+}
+
+if [ $# -eq 0 ]; then
+    echo "Building IntelliJ plugin zip."
+    (cd editor/intellij && ./gradlew buildPlugin >/dev/null)
+fi
+
+zip_path="${1:-editor/intellij/build/distributions/blorp-intellij-0.0.1.zip}"
+[ -f "$zip_path" ] || fail "IntelliJ plugin zip not found: $zip_path"
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-intellij-plugin.XXXXXX")
+trap 'rm -rf "$tmpdir"' EXIT
+
+jar_entry=$(
+    zipinfo -1 "$zip_path" |
+        grep -E '^blorp-intellij/lib/blorp-intellij-[^/]+\.jar$' |
+        grep -v -- '-base\.jar$' |
+        head -n 1
+)
+[ -n "$jar_entry" ] || fail "Could not find plugin jar inside $zip_path"
+
+jar_path="$tmpdir/plugin.jar"
+unzip -p "$zip_path" "$jar_entry" > "$jar_path"
+
+require_entry() {
+    local entry="$1"
+    zipinfo -1 "$jar_path" "$entry" >/dev/null 2>&1 ||
+        fail "Packaged IntelliJ plugin is missing $entry"
+}
+
+require_xml_contains() {
+    local entry="$1"
+    local needle="$2"
+    local label="$3"
+    local xml
+
+    xml=$(unzip -p "$jar_path" "$entry")
+    [[ "$xml" == *"$needle"* ]] ||
+        fail "Packaged IntelliJ plugin missing $label in $entry"
+}
+
+require_class_contains() {
+    local entry="$1"
+    local needle="$2"
+    local label="$3"
+
+    unzip -p "$jar_path" "$entry" | LC_ALL=C grep -aFq "$needle" ||
+        fail "Packaged IntelliJ plugin missing $label in $entry"
+}
+
+require_entry "META-INF/plugin.xml"
+require_entry "META-INF/lsp.xml"
+require_entry "textmate/blorp/syntaxes/blorp.tmLanguage.json"
+require_entry "com/blorp/intellij/BlorpFileType.class"
+require_entry "com/blorp/intellij/BlorpLanguage.class"
+require_entry "com/blorp/intellij/BlorpLexer.class"
+require_entry "com/blorp/intellij/BlorpParserDefinition.class"
+require_entry "com/blorp/intellij/BlorpSyntaxHighlighterFactory.class"
+require_entry "com/blorp/intellij/BlorpEditorHighlighterProvider.class"
+require_entry "com/blorp/intellij/BlorpTextMateBundleProvider.class"
+require_entry "com/blorp/intellij/BlorpGotoDeclarationHandler.class"
+require_entry "com/blorp/intellij/BlorpLspServerSupportProvider.class"
+
+require_xml_contains "META-INF/plugin.xml" "com.blorp.intellij.BlorpFileType" "Blorp file type registration"
+require_xml_contains "META-INF/plugin.xml" "com.blorp.intellij.BlorpParserDefinition" "Blorp parser definition"
+require_xml_contains "META-INF/plugin.xml" "com.blorp.intellij.BlorpSyntaxHighlighterFactory" "Blorp syntax highlighter"
+require_xml_contains "META-INF/plugin.xml" "com.blorp.intellij.BlorpEditorHighlighterProvider" "Blorp editor highlighter provider"
+require_xml_contains "META-INF/plugin.xml" "com.blorp.intellij.BlorpTextMateBundleProvider" "TextMate bundle provider"
+require_xml_contains "META-INF/plugin.xml" "com.blorp.intellij.BlorpGotoDeclarationHandler" "goto declaration handler"
+require_xml_contains "META-INF/lsp.xml" "com.blorp.intellij.BlorpLspServerSupportProvider" "LSP support provider"
+
+require_class_contains \
+    "com/blorp/intellij/BlorpEditorHighlighterProvider.class" \
+    "TextMateEditorHighlighterProvider" \
+    "TextMate editor highlighter wrapper reference"
+
+echo "IntelliJ plugin package smoke passed: $zip_path"

@@ -116,8 +116,14 @@ scripts/with-build-lock make quality-full
 ## Drift Checks
 
 `scripts/check-editor-drift` verifies that shared VSCode and IntelliJ TextMate
-metadata stay byte-for-byte synchronized and parse as JSON. `make hygiene-check`
-runs it automatically.
+metadata stay byte-for-byte synchronized, parse as JSON, and keep the IntelliJ
+plugin's required editor integration registrations in place. `make
+hygiene-check` runs it automatically.
+
+`scripts/check-intellij-plugin` verifies the built IntelliJ plugin zip contains
+the native Blorp file type, token lexer/parser, TextMate highlighter bridge, LSP
+provider, goto handler, and bundled TextMate grammar. It builds the default
+plugin zip before checking; pass a zip path to inspect an existing package.
 
 `scripts/check-std-builtins` verifies that standalone `std/` function builtin
 bodies use explicit identities matching their source declaration, for example

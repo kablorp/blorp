@@ -12,8 +12,16 @@ open Lsp_protocol
    ============================================================================ *)
 
 (** Handle initialize request *)
-let handle_initialize (state : Lsp_state.state) _params =
+let handle_initialize (state : Lsp_state.state) params =
   state.initialized <- true;
+  state.client_capabilities <-
+    Lsp_state.client_capabilities_of_initialize_params params;
+  log
+    "initialize: definition.linkSupport=%b declaration.linkSupport=%b \
+     typeDefinition.linkSupport=%b"
+    state.client_capabilities.definition_link_support
+    state.client_capabilities.declaration_link_support
+    state.client_capabilities.type_definition_link_support;
   Object
     [
       ("capabilities", capabilities);
@@ -279,6 +287,18 @@ let handle_hover (state : Lsp_state.state) params =
   | _ -> Null
 
 (** Handle textDocument/definition *)
+type definition_request_kind = Definition | Declaration | TypeDefinition
+
+let definition_request_kind_name = function
+  | Definition -> "textDocument/definition"
+  | Declaration -> "textDocument/declaration"
+  | TypeDefinition -> "textDocument/typeDefinition"
+
+let client_supports_location_links (state : Lsp_state.state) = function
+  | Definition -> state.client_capabilities.definition_link_support
+  | Declaration -> state.client_capabilities.declaration_link_support
+  | TypeDefinition -> state.client_capabilities.type_definition_link_support
+
 let position_on_definition_name def_loc name (pos : Lsp_protocol.position) =
   let def_line = def_loc.Ast.line - 1 in
   let def_col = def_loc.column - 1 in
@@ -297,149 +317,233 @@ let selection_range_at_cursor (doc : Lsp_state.document)
             end_ = { line = pos.line; character = end_col };
           })
 
-let uses_for_definition_site ?origin_selection_range uri doc program pos def_loc
-    =
+let definition_location_json ~use_location_links ~origin_selection_range
+    ~target_uri ~target_range ~target_selection_range =
+  if use_location_links then
+    Lsp_protocol.location_link_json ?origin_selection_range ~target_uri
+      ~target_range ~target_selection_range ()
+  else Lsp_protocol.location_json ~uri:target_uri ~range:target_selection_range
+
+let uses_for_definition_site ~use_location_links ?origin_selection_range uri doc
+    program pos def_loc =
   Lsp_references.matching_occurrences doc program pos
   |> List.filter (fun occurrence ->
       not
         (Lsp_references.loc_same_position occurrence.Lsp_references.loc def_loc))
   |> List.map (fun occurrence ->
       let range = Lsp_references.occurrence_range occurrence in
-      Lsp_protocol.location_link_json ?origin_selection_range ~target_uri:uri
-        ~target_range:range ~target_selection_range:range ())
+      definition_location_json ~use_location_links ~origin_selection_range
+        ~target_uri:uri ~target_range:range ~target_selection_range:range)
 
-let handle_definition (state : Lsp_state.state) params =
+let definition_result_summary = function
+  | Null -> "null"
+  | Array [] -> "array(count=0)"
+  | Array (first :: rest) ->
+      let payload =
+        match first with
+        | Object _ when Option.is_some (get "targetUri" first) -> "LocationLink"
+        | Object _ when Option.is_some (get "uri" first) -> "Location"
+        | Object _ -> "object"
+        | _ -> "other"
+      in
+      Printf.sprintf "array(count=%d, first=%s)" (List.length rest + 1) payload
+  | Object _ as value when Option.is_some (get "targetUri" value) ->
+      "LocationLink"
+  | Object _ as value when Option.is_some (get "uri" value) -> "Location"
+  | Object _ -> "object"
+  | _ -> "other"
+
+let log_definition_result kind (state : Lsp_state.state) uri pos result =
+  let method_ = definition_request_kind_name kind in
+  let link_support = client_supports_location_links state kind in
+  let uri_text = Option.value ~default:"<missing-uri>" uri in
+  let pos_text =
+    match pos with
+    | Some (pos : Lsp_protocol.position) ->
+        Printf.sprintf "%d:%d" pos.line pos.character
+    | None -> "<missing-position>"
+  in
+  log "%s uri=%s position=%s linkSupport=%b result=%s" method_ uri_text pos_text
+    link_support
+    (definition_result_summary result)
+
+let handle_definition_like kind (state : Lsp_state.state) params =
   let td = get "textDocument" params in
   let pos = get "position" params in
-  match (td, pos) with
-  | Some td, Some pos_json -> (
-      let uri = get_uri td in
-      let position = position_of_json pos_json in
-      match (Lsp_state.find_document state uri, position) with
-      | Some doc, Some pos -> (
-          let file = Lsp_protocol.uri_to_path uri in
-          (* Identify the word under the cursor from the raw text — this covers
+  let uri_for_log = Option.map get_uri td in
+  let position_for_log = Option.bind pos position_of_json in
+  let result =
+    match (td, pos) with
+    | Some td, Some pos_json -> (
+        let uri = get_uri td in
+        let position = position_of_json pos_json in
+        match (Lsp_state.find_document state uri, position) with
+        | Some doc, Some pos -> (
+            let file = Lsp_protocol.uri_to_path uri in
+            let base_dir = Filename.dirname file in
+            (* Identify the word under the cursor from the raw text — this covers
               identifiers that aren't EIdent nodes (type annotations, pattern
               constructors, field names, etc.). *)
-          match doc.program with
-          | Some program -> (
-              let name_opt =
-                Lsp_position.word_at doc.text ~line:pos.line ~col:pos.character
-              in
-              match name_opt with
-              | Some name -> (
-                  let origin_selection_range =
-                    selection_range_at_cursor doc pos
-                  in
-                  let make_location target_uri def_loc =
-                    let def_pos = Lsp_protocol.loc_to_position def_loc in
-                    let range =
-                      {
-                        start = def_pos;
-                        end_ =
-                          {
-                            def_pos with
-                            character = def_pos.character + String.length name;
-                          };
-                      }
+            match doc.program with
+            | Some program -> (
+                let name_opt =
+                  Lsp_position.word_at doc.text ~line:pos.line
+                    ~col:pos.character
+                in
+                match name_opt with
+                | Some name -> (
+                    let use_location_links =
+                      client_supports_location_links state kind
                     in
-                    Lsp_protocol.location_link_json ?origin_selection_range
-                      ~target_uri ~target_range:range
-                      ~target_selection_range:range ()
-                  in
-                  let single_location target_uri def_loc =
-                    Array [ make_location target_uri def_loc ]
-                  in
-                  let make_location_for_loc def_loc =
-                    match def_loc.Ast.loc_file with
-                    | Some file ->
-                        single_location (Lsp_protocol.path_to_uri file) def_loc
-                    | None -> single_location uri def_loc
-                  in
-                  let field_definition =
-                    match doc.env with
-                    | Some env ->
-                        Lsp_references.field_definition_at_cursor doc program
-                          env pos
-                    | None -> None
-                  in
-                  let type_param_definition =
-                    Lsp_position.find_function_type_param_at program ~file
-                      ~text:doc.text ~line:pos.line ~col:pos.character
-                    |> Option.map (fun hit -> hit.Lsp_position.type_param_loc)
-                  in
-                  let imported_definition () =
-                    (* Fall back to imported / prelude modules. Embedded
+                    let origin_selection_range =
+                      selection_range_at_cursor doc pos
+                    in
+                    let make_location target_uri def_loc =
+                      let def_pos = Lsp_protocol.loc_to_position def_loc in
+                      let range =
+                        {
+                          start = def_pos;
+                          end_ =
+                            {
+                              def_pos with
+                              character = def_pos.character + String.length name;
+                            };
+                        }
+                      in
+                      definition_location_json ~use_location_links
+                        ~origin_selection_range ~target_uri ~target_range:range
+                        ~target_selection_range:range
+                    in
+                    let single_location target_uri def_loc =
+                      Array [ make_location target_uri def_loc ]
+                    in
+                    let make_location_for_loc def_loc =
+                      match def_loc.Ast.loc_file with
+                      | Some file ->
+                          single_location
+                            (Lsp_protocol.path_to_uri file)
+                            def_loc
+                      | None -> single_location uri def_loc
+                    in
+                    let make_location_for_resolved_definition
+                        (target : Lsp_position.resolved_call_definition) =
+                      match target.resolved_definition_path with
+                      | None ->
+                          make_location_for_loc target.resolved_definition_loc
+                      | Some path ->
+                          let real_path =
+                            Lsp_position.resolve_module_source_path ~base_dir
+                              path
+                          in
+                          single_location
+                            (Lsp_protocol.path_to_uri real_path)
+                            target.resolved_definition_loc
+                    in
+                    let field_definition =
+                      match doc.env with
+                      | Some env ->
+                          Lsp_references.field_definition_at_cursor doc program
+                            env pos
+                      | None -> None
+                    in
+                    let type_param_definition =
+                      Lsp_position.find_function_type_param_at program ~file
+                        ~text:doc.text ~line:pos.line ~col:pos.character
+                      |> Option.map (fun hit -> hit.Lsp_position.type_param_loc)
+                    in
+                    let typed_call_definition =
+                      match doc.typed_program with
+                      | Some typed_program ->
+                          Lsp_position.find_resolved_call_definition ~base_dir
+                            typed_program ~name ~line:pos.line
+                            ~col:pos.character
+                      | None -> None
+                    in
+                    let imported_definition () =
+                      (* Fall back to imported / prelude modules. Embedded
                        std paths get remapped to the on-disk std/ dir if
                        one is reachable from the open document. *)
-                    match
-                      Lsp_position.find_cross_module_definition program ~name
-                    with
-                    | Some (path, def_loc) ->
-                        let base_dir =
-                          Filename.dirname (Lsp_protocol.uri_to_path uri)
-                        in
-                        let real_path =
-                          Lsp_position.resolve_module_source_path ~base_dir path
-                        in
-                        single_location
-                          (Lsp_protocol.path_to_uri real_path)
-                          def_loc
-                    | None -> Null
-                  in
-                  let local_definition () =
-                    match
-                      Lsp_position.find_definition program ~name ~line:pos.line
-                        ~col:pos.character
-                    with
-                    | Some def_loc ->
-                        if position_on_definition_name def_loc name pos then
-                          match
-                            uses_for_definition_site ?origin_selection_range uri
-                              doc program pos def_loc
-                          with
-                          | [] -> single_location uri def_loc
-                          | uses -> Array uses
-                        else single_location uri def_loc
-                    | None -> imported_definition ()
-                  in
-                  match field_definition with
-                  | Some field_loc ->
-                      if position_on_definition_name field_loc name pos then
-                        match
-                          uses_for_definition_site ?origin_selection_range uri
-                            doc program pos field_loc
-                        with
-                        | [] -> make_location_for_loc field_loc
-                        | uses -> Array uses
-                      else make_location_for_loc field_loc
-                  | None -> (
-                      match type_param_definition with
-                      | Some loc ->
-                          if position_on_definition_name loc name pos then
+                      match
+                        Lsp_position.find_cross_module_definition program ~name
+                      with
+                      | Some (path, def_loc) ->
+                          let real_path =
+                            Lsp_position.resolve_module_source_path ~base_dir
+                              path
+                          in
+                          single_location
+                            (Lsp_protocol.path_to_uri real_path)
+                            def_loc
+                      | None -> Null
+                    in
+                    let local_definition () =
+                      match
+                        Lsp_position.find_definition program ~name
+                          ~line:pos.line ~col:pos.character
+                      with
+                      | Some def_loc ->
+                          if position_on_definition_name def_loc name pos then
                             match
-                              uses_for_definition_site ?origin_selection_range
-                                uri doc program pos loc
+                              uses_for_definition_site ~use_location_links
+                                ?origin_selection_range uri doc program pos
+                                def_loc
                             with
-                            | [] -> make_location_for_loc loc
+                            | [] -> single_location uri def_loc
                             | uses -> Array uses
-                          else make_location_for_loc loc
-                      | None -> local_definition ()))
-              | None -> Null)
-          | None -> Null)
-      | _ -> Null)
-  | _ -> Null
+                          else single_location uri def_loc
+                      | None -> imported_definition ()
+                    in
+                    match field_definition with
+                    | Some field_loc ->
+                        if position_on_definition_name field_loc name pos then
+                          match
+                            uses_for_definition_site ~use_location_links
+                              ?origin_selection_range uri doc program pos
+                              field_loc
+                          with
+                          | [] -> make_location_for_loc field_loc
+                          | uses -> Array uses
+                        else make_location_for_loc field_loc
+                    | None -> (
+                        match type_param_definition with
+                        | Some loc ->
+                            if position_on_definition_name loc name pos then
+                              match
+                                uses_for_definition_site ~use_location_links
+                                  ?origin_selection_range uri doc program pos
+                                  loc
+                              with
+                              | [] -> make_location_for_loc loc
+                              | uses -> Array uses
+                            else make_location_for_loc loc
+                        | None -> (
+                            match typed_call_definition with
+                            | Some target ->
+                                make_location_for_resolved_definition target
+                            | None -> local_definition ())))
+                | None -> Null)
+            | None -> Null)
+        | _ -> Null)
+    | _ -> Null
+  in
+  log_definition_result kind state uri_for_log position_for_log result;
+  result
+
+let handle_definition state params =
+  handle_definition_like Definition state params
 
 (** Handle textDocument/declaration.
     JetBrains exposes its primary navigation action as "Go to Declaration",
     while Blorp has a single source definition for each symbol today. *)
-let handle_declaration = handle_definition
+let handle_declaration state params =
+  handle_definition_like Declaration state params
 
 (** Handle textDocument/typeDefinition.
     Some clients send this request when navigating names in type annotations. A
     Blorp type name still has a single source declaration, so reuse the same
     source-definition lookup. *)
-let handle_type_definition = handle_definition
+let handle_type_definition state params =
+  handle_definition_like TypeDefinition state params
 
 (** Handle textDocument/formatting.
 
@@ -496,6 +600,7 @@ and dispatch state _ic oc (msg : message) shutdown_requested =
       match msg.id with
       | Some id -> send_response oc ~id ~result:Null
       | None -> ())
+  | "$/cancelRequest" -> ()
   | "exit" ->
       log "exit";
       exit (if !shutdown_requested then 0 else 1)

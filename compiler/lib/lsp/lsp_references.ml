@@ -116,7 +116,10 @@ let rec collect_decl occurrences ?file (decl : decl) =
   let add name loc = add_occurrence occurrences ?file name loc in
   match decl.decl_desc with
   | DFunc func ->
-      Option.iter (fun name -> add name decl.decl_loc) func.func_name;
+      Option.iter
+        (fun name ->
+          add name (Lsp_position.func_decl_name_loc decl.decl_loc func))
+        func.func_name;
       collect_func occurrences ?file func
   | DVar var ->
       Option.iter (fun name -> add name decl.decl_loc) var.var_name;
