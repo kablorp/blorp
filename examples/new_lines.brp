@@ -1,13 +1,14 @@
 import:
 	bytes as B
 	fs: DirectoryEntry, IOError, message, open_dir, open_read_append, read_next_entries
-	list: chunks
+	list: chunks, concat
 	system: file_exists, is_directory
 
 
 record CliConfig {
 	extensions: List[String],
-	paths: List[String]
+	paths: List[String],
+	show_changed_list: Bool
 }
 
 
@@ -20,7 +21,8 @@ union ParsedCli:
 record RunStats {
 	matched: Int,
 	changed: Int,
-	errors: Int
+	errors: Int,
+	changed_files: List[String]
 }
 
 
@@ -63,7 +65,8 @@ DIRECTORY_ENTRY_BATCH_CAPACITY: Int = DIRECTORY_WORK_BATCH_CAPACITY
 EMPTY_STATS: RunStats = {
 	matched = 0,
 	changed = 0,
-	errors = 0
+	errors = 0,
+	changed_files = []
 }
 
 
@@ -71,11 +74,12 @@ pure func merge_stats(left: RunStats, right: RunStats) -> RunStats:
 	{
 		matched = left.matched + right.matched,
 		changed = left.changed + right.changed,
-		errors = left.errors + right.errors
+		errors = left.errors + right.errors,
+		changed_files = left.changed_files.concat(right.changed_files)
 	}
 
 
-USAGE: String = "usage: new-lines EXTENSION... [--path PATH]..."
+USAGE: String = "usage: new-lines [--no-changed-list] EXTENSION... [--path PATH]..."
 
 
 pure func default_paths(paths: List[String]) -> List[String]:
@@ -99,6 +103,7 @@ pure func parse_args(args: List[String]) -> ParsedCli:
 	path_equals_prefix: String = "--path="
 	var extensions: List[String] = []
 	var paths: List[String] = []
+	var show_changed_list: Bool = True
 	var error: Option[String] = None
 	var help_requested: Bool = False
 	var i: Int = 0
@@ -114,6 +119,9 @@ pure func parse_args(args: List[String]) -> ParsedCli:
 					i += 1
 				else if arg == "--help" or arg == "-h":
 					help_requested = True
+					i += 1
+				else if arg == "--no-changed-list":
+					show_changed_list = False
 					i += 1
 				else if arg == path_flag:
 					match args.get(i + 1):
@@ -152,6 +160,7 @@ pure func parse_args(args: List[String]) -> ParsedCli:
 				CliOk({
 					extensions = extensions,
 					paths = default_paths(paths),
+					show_changed_list = show_changed_list,
 				})
 
 
@@ -217,8 +226,11 @@ pure func increment_matched(stats: RunStats) -> RunStats:
 	{ stats | matched = stats.matched + 1 }
 
 
-pure func record_changed(stats: RunStats) -> RunStats:
-	{ stats | changed = stats.changed + 1 }
+pure func record_changed(stats: RunStats, file_path: String) -> RunStats:
+	{ stats |
+		changed = stats.changed + 1,
+		changed_files = stats.changed_files.append(file_path)
+	}
 
 
 pure func record_error(stats: RunStats) -> RunStats:
@@ -300,12 +312,13 @@ func process_matching_file(file_path: String) -> RunStats:
 	matched_stats: RunStats = {
 		matched = 1,
 		changed = 0,
-		errors = 0
+		errors = 0,
+		changed_files = []
 	}
 	match add_final_newline_if_needed(file_path):
 		Ok(changed):
 			if changed:
-				matched_stats.record_changed()
+				matched_stats.record_changed(file_path)
 			else:
 				matched_stats
 		Err(msg):
@@ -510,6 +523,16 @@ func run_config(config: CliConfig) -> RunStats:
 	stats
 
 
+func print_changed_files(files: List[String]):
+	for file_path in files:
+		print(file_path)
+
+
+func print_summary(stats: RunStats):
+	print("changed: " + stats.changed.to_string())
+	print("examined: " + stats.matched.to_string())
+
+
 func main(args: List[String]) -> Int:
 	match parse_args(args.drop(1)):
 		CliHelp:
@@ -521,6 +544,9 @@ func main(args: List[String]) -> Int:
 			1
 		CliOk(config):
 			stats = run_config(config)
+			if config.show_changed_list:
+				print_changed_files(stats.changed_files)
+			print_summary(stats)
 			if stats.errors > 0:
 				1
 			else:
