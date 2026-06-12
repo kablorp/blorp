@@ -2214,6 +2214,7 @@ typedef struct { blorp_Object header; long len; long capacity; char data[]; } bl
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT 2
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT32 3
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_List;
+typedef void (*blorp_ImmortalizeElementFn)(void*);
 void* blorp_list_get(blorp_List* list, long index);
 
 // Memory statistics — struct defined above (before SIMD section)
@@ -4285,6 +4286,15 @@ void blorp_list_set_elem_release(blorp_List* list, void (*release_fn)(void*)) {
 void blorp_list_init_elem_release(blorp_List* list, void (*release_fn)(void*)) {
     if (!list || list->storage_mode != BLORP_LIST_STORAGE_POINTER || list->elem_release) return;  // already set or null list
     list->elem_release = release_fn;
+}
+
+void blorp_make_immortal_list_constant(blorp_List* list, blorp_ImmortalizeElementFn immortalize_elem) {
+    if (!list) return;
+    blorp_make_immortal_constant(list);
+    if (!immortalize_elem || list->storage_mode != BLORP_LIST_STORAGE_POINTER) return;
+    for (long i = 0; i < list->len; i++) {
+        if (list->data[i]) immortalize_elem(list->data[i]);
+    }
 }
 
 // Vector destructor — releases elements if elem_release is set
@@ -7698,13 +7708,6 @@ static inline void blorp_stack_result_release(blorp_StackResult res) {
     if ((res.release_mask & 1UL) == 0) return;
     void* payload = blorp_stack_result_payload(res);
     if (payload) blorp_release(payload);
-}
-
-blorp_StackResult blorp_make_immortal_stack_result_constant(blorp_StackResult res) {
-    if ((res.release_mask & 1UL) == 0) return res;
-    void* payload = blorp_stack_result_payload(res);
-    if (payload) blorp_make_immortal_constant(payload);
-    return res;
 }
 
 static void blorp_stack_result_box_destroy(void* obj) {

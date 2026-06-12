@@ -2650,6 +2650,43 @@ let test_escape_nul_string_literal_keeps_explicit_length () =
     "literal includes explicit byte length" true
     (contains_sub output "blorp_string_literal_len(\"a\\000b\", 3L)")
 
+let test_emit_global_managed_container_constant_rejected () =
+  let v : core_var =
+    {
+      cv_name = Var.named "NAMES";
+      cv_module = None;
+      cv_ty = ty_dict_string_string;
+      cv_init =
+        mk (CDict [ (cstr "Ada", cstr "Lovelace") ]) ty_dict_string_string;
+      cv_is_mutable = false;
+      cv_is_const = true;
+      cv_def_id = 0;
+    }
+  in
+  let prog = [ { cd_desc = CDVar v; cd_loc = loc; cd_doc = None } ] in
+  match emit_program_to_string prog with
+  | exception Blorp.Core_error.Core_error err ->
+      Alcotest.(check bool)
+        "phase is Emit" true
+        (err.Blorp.Core_error.phase = Blorp.Core_error.Emit);
+      Alcotest.(check string)
+        "message"
+        "managed global constant layout cannot yet be made safely immortal: \
+         NAMES has unsupported container type `Dict[String, String]` with \
+         managed contents"
+        err.Blorp.Core_error.msg;
+      Alcotest.(check (option string))
+        "hint"
+        (Some
+           "Use a function to construct this value at runtime, or reduce the \
+            constant to supported shapes: strings, heap records, heap unions, \
+            tuples, stack Result payloads, and Lists with supported element \
+            types.")
+        err.Blorp.Core_error.hint
+  | exception exn ->
+      Alcotest.failf "expected Core_error, got %s" (Printexc.to_string exn)
+  | _ -> Alcotest.fail "expected unsupported managed global constant error"
+
 let test_emit_impl_methods () =
   let point_ty = TyNamed ("Point", []) in
   let point_decl : record_decl =
@@ -6422,6 +6459,8 @@ let suite =
           test_emit_global_var_non_const;
         Alcotest.test_case "global_string_literal_deferred" `Quick
           test_emit_global_var_string_literal_deferred;
+        Alcotest.test_case "global_managed_container_constant_rejected" `Quick
+          test_emit_global_managed_container_constant_rejected;
         Alcotest.test_case "impl_methods" `Quick test_emit_impl_methods;
       ] );
     ( "pipeline",

@@ -366,40 +366,610 @@ let is_c_static_literal = function
       true
   | Ast.LitString _ -> false
 
-type global_constant_immortal_init =
-  | GlobalConstantNoImmortalInit
-  | GlobalConstantHeapObject
-  | GlobalConstantStackResultPayload
+type global_constant_immortalization =
+  | NoImmortalizationNeeded
+  | ImmortalizeConstantGraph of global_constant_immortal_plan
+  | UnsupportedManagedConstant of string
 
-let global_constant_immortal_init (ctx : Core_emit_context.t) (v : core_var) :
-    global_constant_immortal_init =
+and global_constant_immortal_plan =
+  | ImmortalRootOnly of Ast.type_expr
+  | ImmortalRecord of {
+      record_ty : Ast.type_expr;
+      record_fields : global_constant_record_field_plan list;
+    }
+  | ImmortalUnion of {
+      union_ty : Ast.type_expr;
+      union_type_name : string;
+      union_variants : global_constant_union_variant_plan list;
+    }
+  | ImmortalTuple of {
+      tuple_ty : Ast.type_expr;
+      tuple_elements : global_constant_tuple_element_plan list;
+    }
+  | ImmortalStackResult of {
+      result_ty : Ast.type_expr;
+      ok_payload : global_constant_payload_plan option;
+      err_payload : global_constant_payload_plan option;
+    }
+  | ImmortalList of {
+      list_ty : Ast.type_expr;
+      list_elem_plan : global_constant_immortal_plan option;
+    }
+
+and global_constant_record_field_plan = {
+  gc_field_name : string;
+  gc_field_plan : global_constant_immortal_plan;
+}
+
+and global_constant_tuple_element_plan = {
+  gc_tuple_index : int;
+  gc_tuple_plan : global_constant_immortal_plan;
+}
+
+and global_constant_union_variant_plan = {
+  gc_variant : Ast.variant;
+  gc_variant_fields : global_constant_union_field_plan list;
+}
+
+and global_constant_union_field_plan = {
+  gc_union_field_index : int;
+  gc_union_field_plan : global_constant_immortal_plan;
+}
+
+and global_constant_payload_plan = {
+  gc_payload_plan : global_constant_immortal_plan;
+}
+
+type checked_global_constant_immortalization =
+  | CheckedNoImmortalizationNeeded
+  | CheckedImmortalizeConstantGraph of global_constant_immortal_plan
+
+type global_constant_storage = DirectTypedStorage | VoidPointerPayload
+
+let global_constant_unsupported_hint =
+  "Use a function to construct this value at runtime, or reduce the constant \
+   to supported shapes: strings, heap records, heap unions, tuples, stack \
+   Result payloads, and Lists with supported element types."
+
+let type_param_subst params args =
+  let names = Ast.type_param_names params in
+  if List.length names = List.length args then Some (List.combine names args)
+  else None
+
+let apply_type_param_subst_or_original params args ty =
+  match type_param_subst params args with
+  | Some subst -> Codegen_types.apply_codegen_subst subst ty
+  | None -> ty
+
+let global_constant_type_string ty = Types.type_to_string (normalize_type ty)
+
+let global_constant_list_element_type = function
+  | Ast.TyNamed (("List" | "ParallelList"), [ elem ]) -> Some elem
+  | _ -> None
+
+let managed_container_nested_release (ctx : Core_emit_context.t)
+    (ty : Ast.type_expr) : (bool, string) result option =
+  let release ty =
+    try Ok (type_requires_release ctx ty)
+    with Core_error.Core_error err -> Error err.msg
+  in
+  let boxed_release ty =
+    try Ok (boxed_value_needs_release ctx ty Ast.dummy_loc)
+    with Core_error.Core_error err -> Error err.msg
+  in
+  let named_container name checks =
+    let rec combine = function
+      | [] -> Ok false
+      | check :: rest -> (
+          match check with
+          | Error msg -> Error msg
+          | Ok true -> Ok true
+          | Ok false -> combine rest)
+    in
+    Some (combine checks |> Result.map_error (fun msg -> name ^ ": " ^ msg))
+  in
+  match normalize_type ty with
+  | Ast.TyNamed ("Dict", [ key; value ]) ->
+      named_container "Dict" [ boxed_release key; boxed_release value ]
+  | Ast.TyNamed ("Set", [ elem ]) ->
+      named_container "Set" [ boxed_release elem ]
+  | Ast.TyNamed ("Tensor", elem :: _) | Ast.TyArray (elem, _) ->
+      named_container "Tensor" [ boxed_release elem ]
+  | Ast.TyNamed
+      ( ( "Channel" | "Task" | "Stream" | "FallibleStream" | "ResourceSource"
+        | "OneShotStream" ),
+        _ ) ->
+      Some (Ok true)
+  | Ast.TyNamed (name, _) when Type_name_metadata.is_one_shot_stream_name name
+    ->
+      Some (Ok true)
+  | Ast.TyNamed (name, _) when Type_name_metadata.is_resource_source_name name
+    ->
+      Some (Ok true)
+  | _ -> (
+      match normalize_type ty with
+      | Ast.TyNamed ("Slice", [ elem ]) ->
+          named_container "Slice" [ release elem ]
+      | _ -> None)
+
+let simple_arc_global_constant_root = function
+  | Ast.TyFunc _ -> true
+  | Ast.TyNamed (("String" | "LiteralString" | "Bytes" | "Fixed"), _) -> true
+  | _ -> false
+
+let global_constant_plan_type = function
+  | ImmortalRootOnly ty -> ty
+  | ImmortalRecord { record_ty; _ } -> record_ty
+  | ImmortalUnion { union_ty; _ } -> union_ty
+  | ImmortalTuple { tuple_ty; _ } -> tuple_ty
+  | ImmortalStackResult { result_ty; _ } -> result_ty
+  | ImmortalList { list_ty; _ } -> list_ty
+
+let union_variants_for_type (ctx : Core_emit_context.t) type_name =
+  match Hashtbl.find_opt ctx.reg.union_variants type_name with
+  | None -> []
+  | Some variants ->
+      Hashtbl.fold (fun _ variant acc -> variant :: acc) variants []
+
+let global_constant_nullary_union_singleton (ctx : Core_emit_context.t)
+    (v : core_var) : bool =
+  match (normalize_type v.cv_ty, v.cv_init.desc) with
+  | Ast.TyNamed (type_name, _), CVar ctor_var -> (
+      match Codegen_types.managed_type_info ctx.reg type_name with
+      | Some { managed_kind = ManagedUnion; _ } ->
+          union_variants_for_type ctx type_name
+          |> List.exists (fun (variant : Ast.variant) ->
+              variant.variant_fields = []
+              && String.equal variant.variant_name ctor_var.vname)
+      | _ -> false)
+  | _ -> false
+
+let rec build_global_constant_plan (ctx : Core_emit_context.t)
+    ~(storage : global_constant_storage) ~(path : string) ~(seen : string list)
+    (ty : Ast.type_expr) : (global_constant_immortal_plan, string) result =
+  let ty = normalize_type ty in
+  let ty_key = Types.type_to_string ty in
+  if List.mem ty_key seen then
+    Error
+      (Printf.sprintf "%s has recursive managed type `%s`" path
+         (global_constant_type_string ty))
+  else if not (type_requires_release ctx ty) then
+    Error
+      (Printf.sprintf "%s has type `%s`, which does not need immortalization"
+         path
+         (global_constant_type_string ty))
+  else
+    match global_constant_list_element_type ty with
+    | Some elem_ty -> (
+        match
+          build_optional_child_plan ctx ~storage:VoidPointerPayload
+            ~path:(path ^ "[]") ~seen:(ty_key :: seen) elem_ty
+        with
+        | Error _ as err -> err
+        | Ok list_elem_plan ->
+            Ok (ImmortalList { list_ty = ty; list_elem_plan }))
+    | None -> (
+        match managed_container_nested_release ctx ty with
+        | Some (Ok false) -> Ok (ImmortalRootOnly ty)
+        | Some (Ok true) ->
+            Error
+              (Printf.sprintf
+                 "%s has unsupported container type `%s` with managed contents"
+                 path
+                 (global_constant_type_string ty))
+        | Some (Error reason) ->
+            Error
+              (Printf.sprintf "could not classify container in %s: %s" path
+                 reason)
+        | None -> (
+            match storage with
+            | VoidPointerPayload when not (is_pointer_type ctx ty) ->
+                Error
+                  (Printf.sprintf
+                     "%s has boxed by-value payload type `%s`; this constant \
+                      layout cannot be traversed safely yet"
+                     path
+                     (global_constant_type_string ty))
+            | DirectTypedStorage | VoidPointerPayload -> (
+                match ty with
+                | ty when is_stack_result_type ctx ty -> (
+                    match (storage, ty) with
+                    | ( DirectTypedStorage,
+                        Ast.TyNamed ("Result", [ ok_ty; err_ty ]) ) ->
+                        build_result_plan ctx ~path ~seen:(ty_key :: seen) ty
+                          ok_ty err_ty
+                    | VoidPointerPayload, _ ->
+                        Error
+                          (Printf.sprintf
+                             "%s has boxed stack Result payload type `%s`; \
+                              this constant layout cannot be traversed safely \
+                              yet"
+                             path
+                             (global_constant_type_string ty))
+                    | DirectTypedStorage, _ ->
+                        Error
+                          (Printf.sprintf
+                             "%s has unsupported Result spelling `%s`" path
+                             (global_constant_type_string ty)))
+                | Ast.TyTuple elems ->
+                    build_tuple_plan ctx ~path ~seen:(ty_key :: seen) ty elems
+                | Ast.TyNamed (type_name, args) -> (
+                    match Hashtbl.find_opt ctx.record_decls type_name with
+                    | Some record_decl when not record_decl.record_is_value ->
+                        build_record_plan ctx ~path ~seen:(ty_key :: seen) ty
+                          record_decl args
+                    | _ -> (
+                        match
+                          Codegen_types.managed_type_info ctx.reg type_name
+                        with
+                        | Some { managed_kind = ManagedUnion; _ } ->
+                            build_union_plan ctx ~path ~seen:(ty_key :: seen) ty
+                              type_name
+                        | Some { managed_kind = ManagedHeapRecord; _ } ->
+                            Error
+                              (Printf.sprintf
+                                 "%s has heap record type `%s` but no record \
+                                  declaration is available for traversal"
+                                 path type_name)
+                        | _ when simple_arc_global_constant_root ty ->
+                            Ok (ImmortalRootOnly ty)
+                        | _ when is_pointer_type ctx ty ->
+                            Error
+                              (Printf.sprintf
+                                 "%s has managed pointer type `%s` without a \
+                                  supported constant traversal contract"
+                                 path
+                                 (global_constant_type_string ty))
+                        | _ ->
+                            Error
+                              (Printf.sprintf
+                                 "%s has unsupported managed type `%s`" path
+                                 (global_constant_type_string ty))))
+                | _ when simple_arc_global_constant_root ty ->
+                    Ok (ImmortalRootOnly ty)
+                | _ when is_pointer_type ctx ty ->
+                    Error
+                      (Printf.sprintf
+                         "%s has managed pointer type `%s` without a supported \
+                          constant traversal contract"
+                         path
+                         (global_constant_type_string ty))
+                | _ ->
+                    Error
+                      (Printf.sprintf "%s has unsupported managed type `%s`"
+                         path
+                         (global_constant_type_string ty)))))
+
+and build_optional_child_plan ctx ~storage ~path ~seen ty =
+  if type_requires_release ctx ty then
+    build_global_constant_plan ctx ~storage ~path ~seen ty
+    |> Result.map Option.some
+  else Ok None
+
+and build_result_plan ctx ~path ~seen result_ty ok_ty err_ty =
+  let build_payload label payload_ty =
+    build_optional_child_plan ctx ~storage:VoidPointerPayload
+      ~path:(path ^ "." ^ label)
+      ~seen payload_ty
+    |> Result.map (Option.map (fun gc_payload_plan -> { gc_payload_plan }))
+  in
+  match build_payload "Ok" ok_ty with
+  | Error _ as err -> err
+  | Ok ok_payload -> (
+      match build_payload "Err" err_ty with
+      | Error _ as err -> err
+      | Ok err_payload ->
+          Ok (ImmortalStackResult { result_ty; ok_payload; err_payload }))
+
+and build_tuple_plan ctx ~path ~seen tuple_ty elems =
+  let rec go i = function
+    | [] -> Ok []
+    | elem_ty :: rest ->
+        if type_requires_release ctx elem_ty then
+          match
+            build_global_constant_plan ctx ~storage:VoidPointerPayload
+              ~path:(Printf.sprintf "%s[%d]" path i)
+              ~seen elem_ty
+          with
+          | Error _ as err -> err
+          | Ok gc_tuple_plan -> (
+              match go (i + 1) rest with
+              | Error _ as err -> err
+              | Ok tail -> Ok ({ gc_tuple_index = i; gc_tuple_plan } :: tail))
+        else go (i + 1) rest
+  in
+  go 0 elems
+  |> Result.map (fun tuple_elements ->
+      ImmortalTuple { tuple_ty; tuple_elements })
+
+and build_record_plan ctx ~path ~seen record_ty record_decl args =
+  let rec go = function
+    | [] -> Ok []
+    | (fd : Ast.field_decl) :: rest ->
+        let field_ty =
+          apply_type_param_subst_or_original record_decl.record_type_params args
+            fd.field_type
+        in
+        if type_requires_release ctx field_ty then
+          if
+            Core_layout_type.record_field_uses_erased_storage ~reg:ctx.reg
+              fd.field_type
+          then
+            Error
+              (Printf.sprintf
+                 "%s.%s has erased generic storage for managed type `%s`; this \
+                  constant layout cannot be traversed safely yet"
+                 path fd.field_name
+                 (global_constant_type_string field_ty))
+          else
+            match
+              build_global_constant_plan ctx ~storage:DirectTypedStorage
+                ~path:(path ^ "." ^ fd.field_name)
+                ~seen field_ty
+            with
+            | Error _ as err -> err
+            | Ok gc_field_plan -> (
+                match go rest with
+                | Error _ as err -> err
+                | Ok tail ->
+                    Ok ({ gc_field_name = fd.field_name; gc_field_plan } :: tail)
+                )
+        else go rest
+  in
+  go record_decl.record_fields
+  |> Result.map (fun record_fields ->
+      ImmortalRecord { record_ty; record_fields })
+
+and build_union_plan ctx ~path ~seen union_ty type_name =
+  let build_variant (variant : Ast.variant) =
+    let rec go i = function
+      | [] -> Ok []
+      | field_ty :: rest ->
+          if Codegen_types.has_type_vars field_ty then
+            Error
+              (Printf.sprintf
+                 "%s.%s field %d has generic payload type `%s`; generic union \
+                  constants cannot be traversed safely yet"
+                 path variant.variant_name i
+                 (global_constant_type_string field_ty))
+          else if type_requires_release ctx field_ty then
+            match
+              build_global_constant_plan ctx ~storage:VoidPointerPayload
+                ~path:
+                  (Printf.sprintf "%s.%s.field%d" path variant.variant_name i)
+                ~seen field_ty
+            with
+            | Error _ as err -> err
+            | Ok gc_union_field_plan -> (
+                match go (i + 1) rest with
+                | Error _ as err -> err
+                | Ok tail ->
+                    Ok
+                      ({ gc_union_field_index = i; gc_union_field_plan } :: tail)
+                )
+          else go (i + 1) rest
+    in
+    go 0 variant.variant_fields
+    |> Result.map (fun gc_variant_fields ->
+        { gc_variant = variant; gc_variant_fields })
+  in
+  let rec build_all = function
+    | [] -> Ok []
+    | variant :: rest -> (
+        match build_variant variant with
+        | Error _ as err -> err
+        | Ok planned -> (
+            match build_all rest with
+            | Error _ as err -> err
+            | Ok tail -> Ok (planned :: tail)))
+  in
+  build_all (union_variants_for_type ctx type_name)
+  |> Result.map (fun union_variants ->
+      ImmortalUnion { union_ty; union_type_name = type_name; union_variants })
+
+let global_constant_immortalization (ctx : Core_emit_context.t) (v : core_var) :
+    global_constant_immortalization =
   if (not v.cv_is_const) || not (type_requires_release ctx v.cv_ty) then
-    GlobalConstantNoImmortalInit
-  else if is_stack_result_type ctx v.cv_ty then
-    (* Known boundary: stack-result constants are by-value wrappers. Only the
-       selected managed payload can be made immortal; adding deeper by-value
-       managed aggregates would require their own explicit ABI helper. *)
-    GlobalConstantStackResultPayload
-  else if is_pointer_type ctx v.cv_ty then
-    (* Known boundary: this marks the constant's root object immortal. Nested
-       managed fields are still protected by Perceus' field-alias retain rules
-       when extracted; making whole constant graphs transitively immortal would
-       require generated type-specific traversal. *)
-    GlobalConstantHeapObject
-  else GlobalConstantNoImmortalInit
+    NoImmortalizationNeeded
+  else if global_constant_nullary_union_singleton ctx v then
+    ImmortalizeConstantGraph (ImmortalRootOnly (normalize_type v.cv_ty))
+  else
+    match
+      build_global_constant_plan ctx ~storage:DirectTypedStorage
+        ~path:(Var.to_string v.cv_name) ~seen:[] v.cv_ty
+    with
+    | Error reason -> UnsupportedManagedConstant reason
+    | Ok plan -> ImmortalizeConstantGraph plan
+
+let emit_make_immortal_root (ctx : Core_emit_context.t) c_expr =
+  emit_line ctx (Printf.sprintf "blorp_make_immortal_constant(%s);" c_expr)
+
+let cast_void_payload_for_type (ctx : Core_emit_context.t) ty c_expr =
+  if is_pointer_type ctx ty then
+    Printf.sprintf "((%s)%s)" (type_to_c ctx ty) c_expr
+  else c_expr
+
+let rec emit_immortalize_plan (ctx : Core_emit_context.t) c_expr plan : unit =
+  match plan with
+  | ImmortalRootOnly _ -> emit_make_immortal_root ctx c_expr
+  | ImmortalRecord { record_fields; _ } ->
+      emit_immortalize_record ctx c_expr record_fields
+  | ImmortalUnion { union_type_name; union_variants; _ } ->
+      emit_immortalize_union ctx c_expr union_type_name union_variants
+  | ImmortalTuple { tuple_elements; _ } ->
+      emit_immortalize_tuple ctx c_expr tuple_elements
+  | ImmortalStackResult { ok_payload; err_payload; _ } ->
+      emit_immortalize_stack_result ctx c_expr ok_payload err_payload
+  | ImmortalList { list_elem_plan; _ } ->
+      emit_immortalize_list ctx c_expr list_elem_plan
+
+and emit_immortalize_record ctx c_expr record_fields =
+  emit_make_immortal_root ctx c_expr;
+  List.iter
+    (fun { gc_field_name; gc_field_plan } ->
+      emit_immortalize_plan ctx
+        (Printf.sprintf "%s->%s" c_expr (escape_c_ident gc_field_name))
+        gc_field_plan)
+    record_fields
+
+and emit_immortalize_list ctx c_expr elem_plan =
+  emit_make_immortal_root ctx c_expr;
+  match elem_plan with
+  | None -> ()
+  | Some elem_plan ->
+      let helper = global_container_element_immortalizer ctx elem_plan in
+      emit_line ctx
+        (Printf.sprintf "blorp_make_immortal_list_constant(%s, %s);" c_expr
+           helper)
+
+and emit_immortalize_tuple ctx c_expr tuple_elements =
+  emit_make_immortal_root ctx c_expr;
+  List.iter
+    (fun { gc_tuple_index; gc_tuple_plan } ->
+      let bit = 1 lsl gc_tuple_index in
+      let slot = Printf.sprintf "%s->elem[%d]" c_expr gc_tuple_index in
+      emit_line ctx
+        (Printf.sprintf "if ((%s->release_mask & %dUL) && %s) {" c_expr bit slot);
+      ctx.indent <- ctx.indent + 1;
+      emit_immortalize_plan ctx
+        (cast_void_payload_for_type ctx
+           (global_constant_plan_type gc_tuple_plan)
+           slot)
+        gc_tuple_plan;
+      ctx.indent <- ctx.indent - 1;
+      emit_line ctx "}")
+    tuple_elements
+
+and emit_immortalize_union ctx c_expr type_name union_variants =
+  emit_make_immortal_root ctx c_expr;
+  if
+    List.exists
+      (fun { gc_variant_fields; _ } -> gc_variant_fields <> [])
+      union_variants
+  then begin
+    emit_line ctx (Printf.sprintf "switch (%s->tag) {" c_expr);
+    ctx.indent <- ctx.indent + 1;
+    List.iter
+      (fun { gc_variant = variant; gc_variant_fields } ->
+        match gc_variant_fields with
+        | [] -> ()
+        | fields ->
+            emit_line ctx
+              (Printf.sprintf "case %s:" (variant_tag_c_name type_name variant));
+            ctx.indent <- ctx.indent + 1;
+            List.iter
+              (fun { gc_union_field_index; gc_union_field_plan } ->
+                let bit = 1 lsl gc_union_field_index in
+                let slot =
+                  Printf.sprintf "%s->data.%s.field%d" c_expr
+                    variant.variant_name gc_union_field_index
+                in
+                emit_line ctx
+                  (Printf.sprintf "if ((%s->release_mask & %dUL) && %s) {"
+                     c_expr bit slot);
+                ctx.indent <- ctx.indent + 1;
+                emit_immortalize_plan ctx
+                  (cast_void_payload_for_type ctx
+                     (global_constant_plan_type gc_union_field_plan)
+                     slot)
+                  gc_union_field_plan;
+                ctx.indent <- ctx.indent - 1;
+                emit_line ctx "}")
+              fields;
+            emit_line ctx "break;";
+            ctx.indent <- ctx.indent - 1)
+      union_variants;
+    emit_line ctx "default:";
+    ctx.indent <- ctx.indent + 1;
+    emit_line ctx "break;";
+    ctx.indent <- ctx.indent - 1;
+    ctx.indent <- ctx.indent - 1;
+    emit_line ctx "}"
+  end
+
+and emit_immortalize_stack_result ctx c_expr ok_payload err_payload =
+  let emit_payload tag field = function
+    | None -> ()
+    | Some { gc_payload_plan } ->
+        let slot = Printf.sprintf "%s.data.%s.field0" c_expr field in
+        emit_line ctx
+          (Printf.sprintf "if ((%s.release_mask & 1UL) && %s.tag == %s && %s) {"
+             c_expr c_expr tag slot);
+        ctx.indent <- ctx.indent + 1;
+        emit_immortalize_plan ctx
+          (cast_void_payload_for_type ctx
+             (global_constant_plan_type gc_payload_plan)
+             slot)
+          gc_payload_plan;
+        ctx.indent <- ctx.indent - 1;
+        emit_line ctx "}"
+  in
+  emit_payload "BLORP_TAG_OK" "Ok" ok_payload;
+  emit_payload "BLORP_TAG_ERR" "Err" err_payload
+
+and global_container_element_immortalizer ctx elem_plan =
+  let elem_ty = normalize_type (global_constant_plan_type elem_plan) in
+  let key = Types.type_to_string elem_ty in
+  match Hashtbl.find_opt ctx.global_immortalizer_helpers key with
+  | Some name -> name
+  | None ->
+      let id = ctx.global_immortalizer_helper_counter in
+      ctx.global_immortalizer_helper_counter <- id + 1;
+      let name = Printf.sprintf "__blorp_immortalize_global_elem_%d" id in
+      Hashtbl.add ctx.global_immortalizer_helpers key name;
+      prepare_global_constant_immortal_helpers ctx elem_plan;
+      emitln ctx (Printf.sprintf "static void %s(void* value) {" name);
+      ctx.indent <- ctx.indent + 1;
+      emit_line ctx "if (!value) return;";
+      emit_immortalize_plan ctx
+        (cast_void_payload_for_type ctx elem_ty "value")
+        elem_plan;
+      ctx.indent <- ctx.indent - 1;
+      emitln ctx "}";
+      emit ctx "\n";
+      name
+
+and prepare_global_constant_immortal_helpers (ctx : Core_emit_context.t)
+    (plan : global_constant_immortal_plan) : unit =
+  match plan with
+  | ImmortalRootOnly _ -> ()
+  | ImmortalRecord { record_fields; _ } ->
+      List.iter
+        (fun { gc_field_plan; _ } ->
+          prepare_global_constant_immortal_helpers ctx gc_field_plan)
+        record_fields
+  | ImmortalUnion { union_variants; _ } ->
+      List.iter
+        (fun { gc_variant_fields; _ } ->
+          List.iter
+            (fun { gc_union_field_plan; _ } ->
+              prepare_global_constant_immortal_helpers ctx gc_union_field_plan)
+            gc_variant_fields)
+        union_variants
+  | ImmortalTuple { tuple_elements; _ } ->
+      List.iter
+        (fun { gc_tuple_plan; _ } ->
+          prepare_global_constant_immortal_helpers ctx gc_tuple_plan)
+        tuple_elements
+  | ImmortalStackResult { ok_payload; err_payload; _ } ->
+      List.iter
+        (function
+          | None -> ()
+          | Some { gc_payload_plan } ->
+              prepare_global_constant_immortal_helpers ctx gc_payload_plan)
+        [ ok_payload; err_payload ]
+  | ImmortalList { list_elem_plan; _ } -> (
+      match list_elem_plan with
+      | None -> ()
+      | Some elem_plan ->
+          ignore (global_container_element_immortalizer ctx elem_plan))
 
 let emit_global_constant_immortal_init (ctx : Core_emit_context.t)
-    (v : core_var) : unit =
+    (plan : checked_global_constant_immortalization) (v : core_var) : unit =
   let name = escape_c_ident (Var.to_c_name v.cv_name) in
-  match global_constant_immortal_init ctx v with
-  | GlobalConstantNoImmortalInit -> ()
-  | GlobalConstantHeapObject ->
-      emit_line ctx
-        (Printf.sprintf "%s = blorp_make_immortal_constant(%s);" name name)
-  | GlobalConstantStackResultPayload ->
-      emit_line ctx
-        (Printf.sprintf "%s = blorp_make_immortal_stack_result_constant(%s);"
-           name name)
+  match plan with
+  | CheckedNoImmortalizationNeeded -> ()
+  | CheckedImmortalizeConstantGraph plan -> emit_immortalize_plan ctx name plan
 
 let float_modulo_emission (ty : Ast.type_expr) =
   match normalize_type ty with
@@ -8269,17 +8839,40 @@ and emit_collected_lambdas (ctx : Core_emit_context.t) : unit =
 and emit_global_init (ctx : Core_emit_context.t) (prog : core_program) : unit =
   let rec collect acc = function
     | [] -> List.rev acc
-    | { cd_desc = CDVar v; _ } :: rest -> (
+    | { cd_desc = CDVar v; cd_loc; _ } :: rest -> (
         match v.cv_init.desc with
         | CLit lit when is_c_static_literal lit -> collect acc rest
-        | _ -> collect (v :: acc) rest)
-    | { cd_desc = CDPrivate { cd_desc = CDVar v; _ }; _ } :: rest -> (
+        | _ -> collect ((v, cd_loc) :: acc) rest)
+    | { cd_desc = CDPrivate { cd_desc = CDVar v; cd_loc; _ }; _ } :: rest -> (
         match v.cv_init.desc with
         | CLit lit when is_c_static_literal lit -> collect acc rest
-        | _ -> collect (v :: acc) rest)
+        | _ -> collect ((v, cd_loc) :: acc) rest)
     | _ :: rest -> collect acc rest
   in
   let deferred = collect [] prog in
+  let planned =
+    List.map
+      (fun (v, loc) ->
+        let plan = global_constant_immortalization ctx v in
+        match plan with
+        | UnsupportedManagedConstant reason ->
+            Core_error.errorf Core_error.Emit loc
+              ~hint:global_constant_unsupported_hint
+              "managed global constant layout cannot yet be made safely \
+               immortal: %s"
+              reason
+        | NoImmortalizationNeeded -> (v, CheckedNoImmortalizationNeeded)
+        | ImmortalizeConstantGraph plan ->
+            (v, CheckedImmortalizeConstantGraph plan))
+      deferred
+  in
+  List.iter
+    (fun (_, plan) ->
+      match plan with
+      | CheckedImmortalizeConstantGraph plan ->
+          prepare_global_constant_immortal_helpers ctx plan
+      | CheckedNoImmortalizationNeeded -> ())
+    planned;
   emit ctx "\n";
   emitln ctx "void __blorp_init_globals(void) {";
   ctx.indent <- ctx.indent + 1;
@@ -8301,7 +8894,7 @@ and emit_global_init (ctx : Core_emit_context.t) (prog : core_program) : unit =
   if deferred <> [] then begin
     ctx.indent <- ctx.indent + 1;
     List.iter
-      (fun v ->
+      (fun (v, plan) ->
         let ty = v.cv_ty in
         let init = expr_with_expected_type_for_constructors ctx v.cv_init ty in
         emit_indent ctx;
@@ -8310,8 +8903,8 @@ and emit_global_init (ctx : Core_emit_context.t) (prog : core_program) : unit =
         emit ctx " = ";
         emit_expr ctx init;
         emitln ctx ";";
-        emit_global_constant_immortal_init ctx v)
-      deferred;
+        emit_global_constant_immortal_init ctx plan v)
+      planned;
     ctx.indent <- ctx.indent - 1
   end;
   emitln ctx "}"

@@ -519,6 +519,7 @@ typedef struct {
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT 2
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT32 3
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_List;
+typedef void (*blorp_ImmortalizeElementFn)(void*);
 
 typedef enum {
     BLORP_DNS_ERROR_NONE = 0,
@@ -916,7 +917,7 @@ extern _Thread_local void* __blorp_current_task;
 // ARC / Memory Management
 void* blorp_alloc(size_t size);
 void* blorp_make_immortal_constant(void* obj);
-blorp_StackResult blorp_make_immortal_stack_result_constant(blorp_StackResult res);
+void blorp_make_immortal_list_constant(blorp_List* list, blorp_ImmortalizeElementFn immortalize_elem);
 void blorp_move_ref(void* obj);
 void blorp_set_type_tag(void* obj, const char* tag);
 uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);
