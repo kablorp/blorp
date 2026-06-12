@@ -16,6 +16,13 @@ enum PreparedStringTemplate:
 	StringSetLenTemplate
 
 
+record PreparedStringTemplateInfo {
+	template: PreparedStringTemplate,
+	name: String,
+	arity: Int
+}
+
+
 -- These payloads carry rendered C snippets and temp names. They are records
 -- because Blorp structs cannot contain String fields.
 record ByteCopyArgs {
@@ -48,21 +55,44 @@ union PreparedStringOp:
 
 
 union RenderError:
-	WrongArity(PreparedStringTemplate, Int, Int)
+	WrongArity(PreparedStringTemplateInfo, Int)
 	UnsupportedPreparedStringOp(String)
 
 
-private PREPARED_STRING_TEMPLATES: Dict[String, PreparedStringTemplate] = {
-	"string_byte_read" => StringByteReadTemplate,
-	"string_byte_write" => StringByteWriteTemplate,
-	"string_byte_copy" => StringByteCopyTemplate,
-	"string_set_len" => StringSetLenTemplate,
-}
+ALL_TEMPLATES: List[PreparedStringTemplateInfo] = [{
+		template = StringByteReadTemplate,
+		name = "string_byte_read",
+		arity = 2
+	}, {
+		template = StringByteWriteTemplate,
+		name = "string_byte_write",
+		arity = 3
+	}, {
+		template = StringByteCopyTemplate,
+		name = "string_byte_copy",
+		arity = 10
+	}, {
+		template = StringSetLenTemplate,
+		name = "string_set_len",
+		arity = 4
+	}]
 
 USAGE: String = (
 	"Usage: codegen_prepared_string_renderer prepared-string <name> [rendered-arg..."
 	+ "] | manifest"
 )
+
+private OPEN_BRACE: String = "{"
+
+private CLOSE_BRACE: String = "}"
+
+
+private pure func c_block(body: String) -> String:
+	OPEN_BRACE + " " + body + " " + CLOSE_BRACE
+
+
+private pure func c_statement_expr(body: String) -> String:
+	"(" + c_block(body) + ")"
 
 
 pure func parse_command(command: String) -> CompilerCommand:
@@ -72,44 +102,31 @@ pure func parse_command(command: String) -> CompilerCommand:
 		_: UnknownCommand
 
 
-pure func prepared_string_template_name(template: PreparedStringTemplate) -> String:
-	match template:
-		StringByteReadTemplate: "string_byte_read"
-		StringByteWriteTemplate: "string_byte_write"
-		StringByteCopyTemplate: "string_byte_copy"
-		StringSetLenTemplate: "string_set_len"
+pure func prepared_string_template_name(info: PreparedStringTemplateInfo) -> String:
+	info.name
 
 
-pure func prepared_string_template_arity(template: PreparedStringTemplate) -> Int:
-	match template:
-		StringByteReadTemplate: 2
-		StringByteWriteTemplate: 3
-		StringByteCopyTemplate: 10
-		StringSetLenTemplate: 4
+pure func prepared_string_template_arity(info: PreparedStringTemplateInfo) -> Int:
+	info.arity
 
 
-ALL_TEMPLATES: List[PreparedStringTemplate] = [
-	StringByteReadTemplate,
-	StringByteWriteTemplate,
-	StringByteCopyTemplate,
-	StringSetLenTemplate,
-]
-
-
-pure func parse_prepared_string_template(name: String) -> Option[PreparedStringTemplate]:
-	PREPARED_STRING_TEMPLATES.get(name)
+pure func parse_prepared_string_template(name: String) -> Option[PreparedStringTemplateInfo]:
+	var found: Option[PreparedStringTemplateInfo] = None
+	for info in ALL_TEMPLATES:
+		if found.is_none() and info.name == name:
+			found = Some(info)
+	found
 
 
 pure func render_error_to_string(error: RenderError) -> String:
 	match error:
-		WrongArity(template, expected, got):
-			template_name: String = prepared_string_template_name(template)
-			"prepared string op ${template_name} expected ${expected} arg(s), got ${got}"
+		WrongArity(info, got):
+			"prepared string op ${info.name} expected ${info.arity} arg(s), got ${got}"
 		UnsupportedPreparedStringOp(name): "unsupported prepared string op: ${name}"
 
 
-pure func wrong_arity_for_args(template: PreparedStringTemplate, args: List[String]) -> RenderError:
-	WrongArity(template, prepared_string_template_arity(template), args.length())
+pure func wrong_arity_for_args(info: PreparedStringTemplateInfo, args: List[String]) -> RenderError:
+	WrongArity(info, args.length())
 
 
 private pure func parse_byte_read_op(args: List[String]) -> Option[PreparedStringOp]:
@@ -174,13 +191,14 @@ pure func render_string_byte_copy(
 	src_pos_tmp: String,
 	len_tmp: String,
 ) -> String:
-	bind_dst: String = "(" + "{" + " blorp_String* ${dst_tmp} = (blorp_String*)${dst}; "
-	bind_dst_pos: String = "long ${dst_pos_tmp} = ${dst_pos}; "
-	bind_src: String = "blorp_String* ${src_tmp} = (blorp_String*)${src}; "
-	bind_src_pos: String = "long ${src_pos_tmp} = ${src_pos}; "
-	bind_len: String = "long ${len_tmp} = ${len}; "
-	copy: String = "if (${len_tmp} > 0) { memcpy(${dst_tmp}->data + ${dst_pos_tmp}, ${src_tmp}->data + ${src_pos_tmp}, (size_t)${len_tmp}); } "
-	bind_dst + bind_dst_pos + bind_src + bind_src_pos + bind_len + copy + "(void)0; })"
+	bind_dst: String = "blorp_String* ${dst_tmp} = (blorp_String*)${dst};"
+	bind_dst_pos: String = "long ${dst_pos_tmp} = ${dst_pos};"
+	bind_src: String = "blorp_String* ${src_tmp} = (blorp_String*)${src};"
+	bind_src_pos: String = "long ${src_pos_tmp} = ${src_pos};"
+	bind_len: String = "long ${len_tmp} = ${len};"
+	copy: String = "if (${len_tmp} > 0) { memcpy(${dst_tmp}->data + ${dst_pos_tmp}, ${src_tmp}->data + ${src_pos_tmp}, (size_t)${len_tmp}); }"
+	body: String = bind_dst + " " + bind_dst_pos + " " + bind_src + " " + bind_src_pos + " " + bind_len + " " + copy + " (void)0;"
+	c_statement_expr(body)
 
 
 pure func render_string_set_len(
@@ -189,7 +207,8 @@ pure func render_string_set_len(
 	target_tmp: String,
 	len_tmp: String,
 ) -> String:
-	"(" + "{" + " blorp_String* ${target_tmp} = (blorp_String*)${target}; long ${len_tmp} = ${len}; ${target_tmp}->len = ${len_tmp}; ${target_tmp}->data[${len_tmp}] = '\\0'; (void)0; })"
+	body: String = "blorp_String* ${target_tmp} = (blorp_String*)${target}; long ${len_tmp} = ${len}; ${target_tmp}->len = ${len_tmp}; ${target_tmp}->data[${len_tmp}] = '\\0'; (void)0;"
+	c_statement_expr(body)
 
 
 pure func render_prepared_string_op(op: PreparedStringOp) -> String:
@@ -214,32 +233,28 @@ pure func render_prepared_string_op(op: PreparedStringOp) -> String:
 
 
 pure func build_prepared_string_op(
-	template: PreparedStringTemplate,
+	info: PreparedStringTemplateInfo,
 	args: List[String],
 ) -> Result[PreparedStringOp, RenderError]:
-	match template:
+	match info.template:
 		StringByteReadTemplate:
-			match parse_byte_read_op(args):
-				Some(op): Ok(op)
-				None: Err(wrong_arity_for_args(template, args))
+			op ?= parse_byte_read_op(args).to_result(wrong_arity_for_args(info, args))
+			Ok(op)
 		StringByteWriteTemplate:
-			match parse_byte_write_op(args):
-				Some(op): Ok(op)
-				None: Err(wrong_arity_for_args(template, args))
+			op ?= parse_byte_write_op(args).to_result(wrong_arity_for_args(info, args))
+			Ok(op)
 		StringByteCopyTemplate:
-			match parse_byte_copy_args(args):
-				Some(parsed): Ok(ByteCopy(parsed))
-				None: Err(wrong_arity_for_args(template, args))
+			parsed ?= parse_byte_copy_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(ByteCopy(parsed))
 		StringSetLenTemplate:
-			match parse_set_len_args(args):
-				Some(parsed): Ok(SetLen(parsed))
-				None: Err(wrong_arity_for_args(template, args))
+			parsed ?= parse_set_len_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(SetLen(parsed))
 
 
 pure func render_prepared_string(name: String, args: List[String]) -> Result[String, RenderError]:
 	match parse_prepared_string_template(name):
-		Some(template):
-			match build_prepared_string_op(template, args):
+		Some(info):
+			match build_prepared_string_op(info, args):
 				Ok(op): Ok(render_prepared_string_op(op))
 				Err(error): Err(error)
 		None: Err(UnsupportedPreparedStringOp(name))
@@ -270,19 +285,19 @@ private pure func placeholder_set_len_args() -> SetLenArgs:
 
 
 private pure func placeholder_prepared_string_op(
-	template: PreparedStringTemplate,
+	info: PreparedStringTemplateInfo,
 ) -> PreparedStringOp:
-	match template:
+	match info.template:
 		StringByteReadTemplate: ByteRead("@0@", "@1@")
 		StringByteWriteTemplate: ByteWrite("@0@", "@1@", "@2@")
 		StringByteCopyTemplate: ByteCopy(placeholder_byte_copy_args())
 		StringSetLenTemplate: SetLen(placeholder_set_len_args())
 
 
-pure func render_manifest_line(template: PreparedStringTemplate) -> String:
-	name: String = prepared_string_template_name(template)
-	arity: Int = prepared_string_template_arity(template)
-	body: String = render_prepared_string_op(placeholder_prepared_string_op(template))
+pure func render_manifest_line(info: PreparedStringTemplateInfo) -> String:
+	name: String = prepared_string_template_name(info)
+	arity: Int = prepared_string_template_arity(info)
+	body: String = render_prepared_string_op(placeholder_prepared_string_op(info))
 	"${name}\t${arity}\t${body}"
 
 

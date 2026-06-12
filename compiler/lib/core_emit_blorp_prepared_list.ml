@@ -16,6 +16,18 @@ let manifest =
 let render_arg = Core_emit_blorp_template.render_arg
 let emit_template = Core_emit_blorp_template.emit manifest
 
+type store_runtime_template =
+  | SetRawStoreTemplate
+  | HandoffSetOwnedStoreTemplate
+
+let pointer_store_template_name = function
+  | SetRawStoreTemplate -> "list_pointer_set_raw_store"
+  | HandoffSetOwnedStoreTemplate -> "list_pointer_handoff_set_owned_store"
+
+let inline_struct_store_template_name = function
+  | SetRawStoreTemplate -> "list_inline_struct_set_raw_store"
+  | HandoffSetOwnedStoreTemplate -> "list_inline_struct_handoff_set_owned_store"
+
 let emit_runtime_get ~emit_expr ctx ~template_name list index =
   let list_arg = render_arg ~emit_expr ctx list in
   let index_arg = render_arg ~emit_expr ctx index in
@@ -51,6 +63,210 @@ let emit_inline_bits_load ctx ~list_tmp ~idx_tmp ~bits_tmp ~width =
   let width_bytes = string_of_int (inline_storage_width_bytes width) in
   emit_template ctx "list_inline_bits_load"
     [ list_tmp; idx_tmp; bits_tmp; width_bytes ]
+
+let emit_inline_bits_store ~emit_expr ~emit_boxed ctx lst idx val_ width =
+  let list_tmp = Printf.sprintf "__list_store_%d" (fresh_temp ctx) in
+  let idx_tmp = Printf.sprintf "__list_store_idx_%d" (fresh_temp ctx) in
+  let bits_tmp = Printf.sprintf "__list_store_bits_%d" (fresh_temp ctx) in
+  let width_bytes = string_of_int (inline_storage_width_bytes width) in
+  let list_arg = render_arg ~emit_expr ctx lst in
+  let index_arg = render_arg ~emit_expr ctx idx in
+  let value_arg = render_arg ~emit_expr:emit_boxed ctx val_ in
+  emit_template ctx "list_inline_bits_store"
+    [ list_arg; index_arg; value_arg; list_tmp; idx_tmp; bits_tmp; width_bytes ]
+
+let emit_pointer_store ~emit_expr ~emit_boxed ctx ~template lst idx val_ =
+  let list_arg = render_arg ~emit_expr ctx lst in
+  let index_arg = render_arg ~emit_expr ctx idx in
+  let value_arg = render_arg ~emit_expr:emit_boxed ctx val_ in
+  let template_name = pointer_store_template_name template in
+  emit_template ctx template_name [ list_arg; index_arg; value_arg ]
+
+let emit_pointer_set_raw_store ~emit_expr ~emit_boxed ctx lst idx val_ =
+  emit_pointer_store ~emit_expr ~emit_boxed ctx ~template:SetRawStoreTemplate
+    lst idx val_
+
+let emit_pointer_handoff_set_owned_store ~emit_expr ~emit_boxed ctx lst idx val_
+    =
+  emit_pointer_store ~emit_expr ~emit_boxed ctx
+    ~template:HandoffSetOwnedStoreTemplate lst idx val_
+
+let boxed_struct_temp_arg ctx tmp c_ty value_ty =
+  if Core_layout_type.is_stack_result_type ~reg:ctx.reg value_ty then
+    Printf.sprintf "blorp_box_stack_result(%s)" tmp
+  else Printf.sprintf "blorp_box_struct(&%s, sizeof(%s))" tmp c_ty
+
+let emit_inline_struct_store_template ~emit_expr ctx ~template lst idx val_
+    ~struct_ty =
+  let list_tmp = Printf.sprintf "__list_store_%d" (fresh_temp ctx) in
+  let idx_tmp = Printf.sprintf "__list_store_idx_%d" (fresh_temp ctx) in
+  let elem_tmp = Printf.sprintf "__list_elem_%d" (fresh_temp ctx) in
+  let list_arg = render_arg ~emit_expr ctx lst in
+  let index_arg = render_arg ~emit_expr ctx idx in
+  let value_arg = render_arg ~emit_expr ctx val_ in
+  let boxed_value_arg = boxed_struct_temp_arg ctx elem_tmp struct_ty val_.ty in
+  let template_name = inline_struct_store_template_name template in
+  emit_template ctx template_name
+    [
+      list_arg;
+      index_arg;
+      value_arg;
+      boxed_value_arg;
+      list_tmp;
+      idx_tmp;
+      elem_tmp;
+      struct_ty;
+    ]
+
+let emit_inline_struct_set_raw_store ~emit_expr ctx lst idx val_ ~struct_ty =
+  emit_inline_struct_store_template ~emit_expr ctx ~template:SetRawStoreTemplate
+    lst idx val_ ~struct_ty
+
+let emit_inline_struct_handoff_set_owned_store ~emit_expr ctx lst idx val_
+    ~struct_ty =
+  emit_inline_struct_store_template ~emit_expr ctx
+    ~template:HandoffSetOwnedStoreTemplate lst idx val_ ~struct_ty
+
+let swap_prefix_args ~emit_expr ctx lst left_index right_index =
+  let list_tmp = Printf.sprintf "__list_swap_%d" (fresh_temp ctx) in
+  let left_index_tmp = Printf.sprintf "__list_swap_i_%d" (fresh_temp ctx) in
+  let right_index_tmp = Printf.sprintf "__list_swap_j_%d" (fresh_temp ctx) in
+  let list_arg = render_arg ~emit_expr ctx lst in
+  let left_index_arg = render_arg ~emit_expr ctx left_index in
+  let right_index_arg = render_arg ~emit_expr ctx right_index in
+  ( list_arg,
+    left_index_arg,
+    right_index_arg,
+    list_tmp,
+    left_index_tmp,
+    right_index_tmp )
+
+let emit_pointer_swap ~emit_expr ctx lst left_index right_index =
+  let ( list_arg,
+        left_index_arg,
+        right_index_arg,
+        list_tmp,
+        left_index_tmp,
+        right_index_tmp ) =
+    swap_prefix_args ~emit_expr ctx lst left_index right_index
+  in
+  let value_tmp = Printf.sprintf "__list_swap_tmp_%d" (fresh_temp ctx) in
+  emit_template ctx "list_pointer_swap"
+    [
+      list_arg;
+      left_index_arg;
+      right_index_arg;
+      list_tmp;
+      left_index_tmp;
+      right_index_tmp;
+      value_tmp;
+    ]
+
+let emit_inline_bits_swap ~emit_expr ctx lst left_index right_index width =
+  let ( list_arg,
+        left_index_arg,
+        right_index_arg,
+        list_tmp,
+        left_index_tmp,
+        right_index_tmp ) =
+    swap_prefix_args ~emit_expr ctx lst left_index right_index
+  in
+  let base_tmp = Printf.sprintf "__list_swap_base_%d" (fresh_temp ctx) in
+  let bits_tmp = Printf.sprintf "__list_swap_bits_%d" (fresh_temp ctx) in
+  let width_bytes = string_of_int (inline_storage_width_bytes width) in
+  emit_template ctx "list_inline_bits_swap"
+    [
+      list_arg;
+      left_index_arg;
+      right_index_arg;
+      list_tmp;
+      left_index_tmp;
+      right_index_tmp;
+      base_tmp;
+      bits_tmp;
+      width_bytes;
+    ]
+
+let emit_inline_struct_swap ~emit_expr ctx lst left_index right_index =
+  let ( list_arg,
+        left_index_arg,
+        right_index_arg,
+        list_tmp,
+        left_index_tmp,
+        right_index_tmp ) =
+    swap_prefix_args ~emit_expr ctx lst left_index right_index
+  in
+  let base_tmp = Printf.sprintf "__list_swap_base_%d" (fresh_temp ctx) in
+  let size_tmp = Printf.sprintf "__list_swap_size_%d" (fresh_temp ctx) in
+  let left_slot_tmp = Printf.sprintf "__list_swap_a_%d" (fresh_temp ctx) in
+  let right_slot_tmp = Printf.sprintf "__list_swap_b_%d" (fresh_temp ctx) in
+  let bytes_tmp = Printf.sprintf "__list_swap_bytes_%d" (fresh_temp ctx) in
+  let value_tmp = Printf.sprintf "__list_swap_tmp_%d" (fresh_temp ctx) in
+  emit_template ctx "list_inline_struct_swap"
+    [
+      list_arg;
+      left_index_arg;
+      right_index_arg;
+      list_tmp;
+      left_index_tmp;
+      right_index_tmp;
+      base_tmp;
+      size_tmp;
+      left_slot_tmp;
+      right_slot_tmp;
+      bytes_tmp;
+      value_tmp;
+    ]
+
+let emit_handoff_set_source_slot ~emit_expr ctx result out_idx source source_idx
+    =
+  let result_arg = render_arg ~emit_expr ctx result in
+  let out_idx_arg = render_arg ~emit_expr ctx out_idx in
+  let source_arg = render_arg ~emit_expr ctx source in
+  let source_idx_arg = render_arg ~emit_expr ctx source_idx in
+  emit_template ctx "list_handoff_set_source_slot"
+    [ result_arg; out_idx_arg; source_arg; source_idx_arg ]
+
+let emit_copy_span_uninit ~emit_expr ctx dst dst_start src src_start count =
+  let dst_arg = render_arg ~emit_expr ctx dst in
+  let dst_start_arg = render_arg ~emit_expr ctx dst_start in
+  let src_arg = render_arg ~emit_expr ctx src in
+  let src_start_arg = render_arg ~emit_expr ctx src_start in
+  let count_arg = render_arg ~emit_expr ctx count in
+  emit_template ctx "list_copy_span_uninit"
+    [ dst_arg; dst_start_arg; src_arg; src_start_arg; count_arg ]
+
+let emit_ensure_unique ~emit_expr ctx lst =
+  let list_tmp = Printf.sprintf "__list_unique_%d" (fresh_temp ctx) in
+  let list_arg = render_arg ~emit_expr ctx lst in
+  emit_template ctx "list_ensure_unique" [ list_arg; list_tmp ]
+
+let emit_ensure_capacity ~emit_expr ctx lst cap =
+  let list_tmp = Printf.sprintf "__list_cap_%d" (fresh_temp ctx) in
+  let cap_tmp = Printf.sprintf "__list_cap_min_%d" (fresh_temp ctx) in
+  let list_arg = render_arg ~emit_expr ctx lst in
+  let cap_arg = render_arg ~emit_expr ctx cap in
+  emit_template ctx "list_ensure_capacity"
+    [ list_arg; cap_arg; list_tmp; cap_tmp ]
+
+let emit_reuse_alloc ~emit_expr ctx lst cap =
+  let list_arg = render_arg ~emit_expr ctx lst in
+  let cap_arg = render_arg ~emit_expr ctx cap in
+  emit_template ctx "list_reuse_alloc" [ list_arg; cap_arg ]
+
+let emit_reuse_alloc_with_release ~emit_expr ctx lst cap =
+  let result_tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
+  let list_arg = render_arg ~emit_expr ctx lst in
+  let cap_arg = render_arg ~emit_expr ctx cap in
+  emit_template ctx "list_reuse_alloc_with_release"
+    [ list_arg; cap_arg; result_tmp ]
+
+let emit_retain_for ~emit_expr ~emit_boxed ctx lst value =
+  let list_arg = render_arg ~emit_expr ctx lst in
+  let value_arg = render_arg ~emit_expr:emit_boxed ctx value in
+  emit_template ctx "list_retain_for" [ list_arg; value_arg ]
+
+let emit_retain_for_noop ctx = emit_template ctx "list_retain_for_noop" []
 
 let emit_get ~emit_expr (ctx : Core_emit_context.t) (get : list_get) : unit =
   match get.lg_layout.lsl_slots with

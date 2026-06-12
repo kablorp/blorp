@@ -16,6 +16,24 @@ let render_arg = Core_emit_blorp_template.render_arg
 let emit_template = Core_emit_blorp_template.emit manifest
 let tensor_view_c_name v = Codegen_types.escape_c_ident (Var.to_c_name v)
 
+type storage_check_template =
+  | WordStorageCheckTemplate
+  | F64StorageCheckTemplate
+  | F32StorageCheckTemplate
+  | I64StorageCheckTemplate
+
+type raw_scalar_get_template = F64RawGetTemplate | F32RawGetTemplate
+
+let storage_check_template_name = function
+  | WordStorageCheckTemplate -> "tensor_is_word_storage"
+  | F64StorageCheckTemplate -> "tensor_is_f64_storage"
+  | F32StorageCheckTemplate -> "tensor_is_f32_storage"
+  | I64StorageCheckTemplate -> "tensor_is_i64_storage"
+
+let raw_scalar_get_template_name = function
+  | F64RawGetTemplate -> "tensor_get_f64_raw_unchecked"
+  | F32RawGetTemplate -> "tensor_get_f32_raw_unchecked"
+
 let emit_raw_view_decl ~emit_expr (ctx : Core_emit_context.t)
     (binding : tensor_raw_view_binding) : unit =
   let pointer_c_type =
@@ -45,3 +63,72 @@ let emit_raw_write_stmt ~emit_expr (ctx : Core_emit_context.t)
   let value_arg = render_arg ~emit_expr ctx write.trw_value in
   emit_template ctx "tensor_raw_write_stmt"
     [ tensor_view_c_name write.trw_view; index_arg; value_arg ]
+
+let emit_storage_check ~emit_expr ctx template tensor =
+  let tensor_arg = render_arg ~emit_expr ctx tensor in
+  let vector_tmp =
+    Printf.sprintf "__tensor_layout_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  emit_template ctx
+    (storage_check_template_name template)
+    [ tensor_arg; vector_tmp ]
+
+let emit_word_storage_check ~emit_expr ctx tensor =
+  emit_storage_check ~emit_expr ctx WordStorageCheckTemplate tensor
+
+let emit_f64_storage_check ~emit_expr ctx tensor =
+  emit_storage_check ~emit_expr ctx F64StorageCheckTemplate tensor
+
+let emit_f32_storage_check ~emit_expr ctx tensor =
+  emit_storage_check ~emit_expr ctx F32StorageCheckTemplate tensor
+
+let emit_i64_storage_check ~emit_expr ctx tensor =
+  emit_storage_check ~emit_expr ctx I64StorageCheckTemplate tensor
+
+let emit_data_pointer_get_unchecked ~emit_expr ctx tensor index =
+  let tensor_arg = render_arg ~emit_expr ctx tensor in
+  let index_arg = render_arg ~emit_expr ctx index in
+  emit_template ctx "tensor_data_pointer_get_unchecked"
+    [ tensor_arg; index_arg ]
+
+let emit_inline_struct_get_unchecked ~emit_expr ctx tensor index ~struct_ty =
+  let tensor_arg = render_arg ~emit_expr ctx tensor in
+  let index_arg = render_arg ~emit_expr ctx index in
+  let vector_tmp =
+    Printf.sprintf "__tgu_vec_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  let index_tmp =
+    Printf.sprintf "__tgu_idx_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  let out_tmp =
+    Printf.sprintf "__tgu_out_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  let raw_tmp =
+    Printf.sprintf "__tgu_raw_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  emit_template ctx "tensor_inline_struct_get_unchecked"
+    [
+      tensor_arg; index_arg; vector_tmp; index_tmp; out_tmp; raw_tmp; struct_ty;
+    ]
+
+let emit_raw_scalar_get_unchecked ~emit_expr ctx template tensor index =
+  let tensor_arg = render_arg ~emit_expr ctx tensor in
+  let index_arg = render_arg ~emit_expr ctx index in
+  let vector_tmp =
+    Printf.sprintf "__tensor_raw_vec_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  let index_tmp =
+    Printf.sprintf "__tensor_raw_idx_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  let out_tmp =
+    Printf.sprintf "__tensor_raw_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  emit_template ctx
+    (raw_scalar_get_template_name template)
+    [ tensor_arg; index_arg; vector_tmp; index_tmp; out_tmp ]
+
+let emit_f64_raw_get_unchecked ~emit_expr ctx tensor index =
+  emit_raw_scalar_get_unchecked ~emit_expr ctx F64RawGetTemplate tensor index
+
+let emit_f32_raw_get_unchecked ~emit_expr ctx tensor index =
+  emit_raw_scalar_get_unchecked ~emit_expr ctx F32RawGetTemplate tensor index

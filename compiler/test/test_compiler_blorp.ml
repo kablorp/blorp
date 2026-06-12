@@ -21,6 +21,10 @@ let compiler_lib_rel file =
 
 let compiler_tool_tests_dir_rel = compiler_blorp_rel "tests"
 let core_emit_intrinsic_rel = compiler_lib_rel "core_emit_intrinsic.ml"
+
+let core_emit_list_intrinsic_rel =
+  compiler_lib_rel "core_emit_list_intrinsic.ml"
+
 let core_emit_rel = compiler_lib_rel "core_emit.ml"
 
 type renderer_spec = {
@@ -342,7 +346,16 @@ let test_core_emit_delegates_prepared_string_slice_to_blorp_manifest () =
 
 let test_core_emit_delegates_prepared_list_slice_to_blorp_manifest () =
   let core_emit_path = find_project_file core_emit_rel in
-  let source = read_file core_emit_path in
+  let core_emit_list_intrinsic_path =
+    find_project_file core_emit_list_intrinsic_rel
+  in
+  let core_emit_intrinsic_path = find_project_file core_emit_intrinsic_rel in
+  let source =
+    read_file core_emit_path ^ "\n"
+    ^ read_file core_emit_list_intrinsic_path
+    ^ "\n"
+    ^ read_file core_emit_intrinsic_path
+  in
   assert_source_contains source
     "production emitter calls Blorp prepared list bridge"
     "Core_emit_blorp_prepared_list.emit_get";
@@ -351,6 +364,41 @@ let test_core_emit_delegates_prepared_list_slice_to_blorp_manifest () =
     "Core_emit_blorp_prepared_list.emit_inline_struct_dynamic_load";
   assert_source_contains source "production emitter delegates inline bit loads"
     "Core_emit_blorp_prepared_list.emit_inline_bits_load";
+  assert_source_contains source "production emitter delegates inline bit stores"
+    "Core_emit_blorp_prepared_list.emit_inline_bits_store";
+  assert_source_contains source
+    "production emitter delegates pointer set-raw stores"
+    "Core_emit_blorp_prepared_list.emit_pointer_set_raw_store";
+  assert_source_contains source
+    "production emitter delegates pointer handoff-owned stores"
+    "Core_emit_blorp_prepared_list.emit_pointer_handoff_set_owned_store";
+  assert_source_contains source
+    "production emitter delegates inline struct set-raw stores"
+    "Core_emit_blorp_prepared_list.emit_inline_struct_set_raw_store";
+  assert_source_contains source
+    "production emitter delegates inline struct handoff-owned stores"
+    "Core_emit_blorp_prepared_list.emit_inline_struct_handoff_set_owned_store";
+  assert_source_contains source "production emitter delegates pointer swaps"
+    "Core_emit_blorp_prepared_list.emit_pointer_swap";
+  assert_source_contains source "production emitter delegates inline bit swaps"
+    "Core_emit_blorp_prepared_list.emit_inline_bits_swap";
+  assert_source_contains source
+    "production emitter delegates inline struct swaps"
+    "Core_emit_blorp_prepared_list.emit_inline_struct_swap";
+  assert_source_contains source
+    "production emitter delegates list handoff source slots"
+    "Core_emit_blorp_prepared_list.emit_handoff_set_source_slot";
+  assert_source_contains source "production emitter delegates list copy spans"
+    "Core_emit_blorp_prepared_list.emit_copy_span_uninit";
+  assert_source_contains source "production emitter delegates list COW checks"
+    "Core_emit_blorp_prepared_list.emit_ensure_unique";
+  assert_source_contains source
+    "production emitter delegates list capacity checks"
+    "Core_emit_blorp_prepared_list.emit_ensure_capacity";
+  assert_source_contains source "production emitter delegates list reuse alloc"
+    "Core_emit_blorp_prepared_list.emit_reuse_alloc";
+  assert_source_contains source "production emitter delegates list retain-for"
+    "Core_emit_blorp_prepared_list.emit_retain_for";
   List.iter
     (fun fragment ->
       assert_source_not_contains source
@@ -360,14 +408,29 @@ let test_core_emit_delegates_prepared_list_slice_to_blorp_manifest () =
       "emit ctx \"blorp_list_get((blorp_List*)\"";
       "({ uintptr_t %s = 0; memcpy(&%s, (char*)%s->data";
       "uintptr_t %s = 0; memcpy(&%s, (char*)%s->data + %s * %d, %d);";
+      "uintptr_t %s = (uintptr_t)";
+      "memcpy((char*)%s->data + %s * %d, &%s, %d); })";
+      "let emit_boxed_struct_temp";
+      "blorp_list_set_raw_copy(%s, %s, &%s);";
+      "let emit_pointer_swap_slots";
+      "void* %s = blorp_list_get(%s, %s); blorp_list_set_raw(%s, %s,";
+      "unsigned char %s[%s];";
+      "char* %s = (char*)%s->data; uintptr_t %s = 0; memcpy(&%s, %s + %s";
       "char*)((blorp_List*)%s)->data +";
       "if (%s->storage_mode == BLORP_LIST_STORAGE_INLINE && %s->elem_size ==";
       "void* %s = blorp_list_get(%s, %s); if (!%s)";
+      "emit ctx \"blorp_list_handoff_set_source_slot((blorp_List*)\"";
+      "emit ctx \"blorp_list_copy_span_uninit((blorp_List*)\"";
+      "let list_tmp = Printf.sprintf \"__list_unique_%d\"";
+      "let list_tmp = Printf.sprintf \"__list_cap_%d\"";
+      "emit ctx \"blorp_list_retain_for((blorp_List*)\"";
     ]
 
 let test_core_emit_delegates_prepared_tensor_slice_to_blorp_manifest () =
   let core_emit_path = find_project_file core_emit_rel in
+  let core_emit_intrinsic_path = find_project_file core_emit_intrinsic_rel in
   let source = read_file core_emit_path in
+  let intrinsic_source = read_file core_emit_intrinsic_path in
   assert_source_contains source
     "production emitter calls Blorp prepared tensor bridge"
     "Core_emit_blorp_prepared_tensor.emit_raw_view_decl";
@@ -375,6 +438,24 @@ let test_core_emit_delegates_prepared_tensor_slice_to_blorp_manifest () =
     "Core_emit_blorp_prepared_tensor.emit_raw_read";
   assert_source_contains source "production emitter delegates tensor raw write"
     "Core_emit_blorp_prepared_tensor.emit_raw_write_stmt";
+  assert_source_contains intrinsic_source
+    "production emitter delegates tensor word storage checks"
+    "Core_emit_blorp_prepared_tensor.emit_word_storage_check";
+  assert_source_contains intrinsic_source
+    "production emitter delegates tensor f64 storage checks"
+    "Core_emit_blorp_prepared_tensor.emit_f64_storage_check";
+  assert_source_contains intrinsic_source
+    "production emitter delegates tensor inline struct unchecked gets"
+    "Core_emit_blorp_prepared_tensor.emit_inline_struct_get_unchecked";
+  assert_source_contains intrinsic_source
+    "production emitter delegates tensor pointer unchecked gets"
+    "Core_emit_blorp_prepared_tensor.emit_data_pointer_get_unchecked";
+  assert_source_contains intrinsic_source
+    "production emitter delegates tensor f64 raw unchecked gets"
+    "Core_emit_blorp_prepared_tensor.emit_f64_raw_get_unchecked";
+  assert_source_contains intrinsic_source
+    "production emitter delegates tensor f32 raw unchecked gets"
+    "Core_emit_blorp_prepared_tensor.emit_f32_raw_get_unchecked";
   List.iter
     (fun fragment ->
       assert_source_not_contains source
@@ -384,6 +465,18 @@ let test_core_emit_delegates_prepared_tensor_slice_to_blorp_manifest () =
       "Core_layout_type.tensor_raw_scalar_abi b.trv_kind).tras_pointer_c_type";
       "emit ctx (escape_c_ident (Var.to_c_name r.trr_view));";
       "emit ctx (escape_c_ident (Var.to_c_name w.trw_view));";
+    ];
+  List.iter
+    (fun fragment ->
+      assert_source_not_contains intrinsic_source
+        ("production intrinsic emitter removed old tensor body: " ^ fragment)
+        fragment)
+    [
+      "let vec_tmp = Printf.sprintf \"__tensor_layout_%d\"";
+      "let vec_tmp = Printf.sprintf \"__tgu_vec_%d\"";
+      "emit ctx \"((blorp_Vector*)\"";
+      "; double %s; memcpy(&%s, (char*)%s->data + %s * sizeof(double)";
+      "; float %s; memcpy(&%s, (char*)%s->data + %s * sizeof(float)";
     ]
 
 let emit_bridge render =
@@ -434,6 +527,8 @@ let test_prepared_string_bridge_emits_expected_c () =
     copy_c
 
 let test_prepared_list_bridge_emits_expected_c () =
+  let small_ty = Ast.TyNamed ("Small", []) in
+  let ty_list_small = Ast.TyNamed ("List", [ small_ty ]) in
   let get =
     {
       Core.lg_list = cvar "xs" ty_list_int;
@@ -459,6 +554,37 @@ let test_prepared_list_bridge_emits_expected_c () =
           ~list_tmp:"__list" ~idx_tmp:"__idx" ~bits_tmp:"__bits"
           ~width:Core.InlineBytes8)
   in
+  let inline_bits_store =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_inline_bits_store
+          ~emit_expr:Blorp.Core_emit.emit_expr
+          ~emit_boxed:Blorp.Core_emit.emit_boxed ctx (cvar "xs" ty_list_int)
+          (cint 1) (cint 42) Core.InlineBytes8)
+  in
+  let inline_struct_store =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_inline_struct_set_raw_store
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx (cvar "xs" ty_list_small)
+          (cint 1) (cvar "next" small_ty) ~struct_ty:"Small")
+  in
+  let pointer_swap =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_pointer_swap
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx (cvar "xs" ty_list_int)
+          (cint 1) (cint 2))
+  in
+  let inline_bits_swap =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_inline_bits_swap
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx (cvar "xs" ty_list_int)
+          (cint 1) (cint 2) Core.InlineBytes8)
+  in
+  let inline_struct_swap =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_inline_struct_swap
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx (cvar "xs" ty_list_small)
+          (cint 1) (cint 2))
+  in
   Alcotest.(check string)
     "inline list get bridge output"
     "({ blorp_List* __lg_list_0 = (blorp_List*)xs; long __lg_idx_1 = 1L; \
@@ -471,6 +597,67 @@ let test_prepared_list_bridge_emits_expected_c () =
     "inline bits load bridge output"
     "uintptr_t __bits = 0; memcpy(&__bits, (char*)__list->data + __idx * 8, 8);"
     inline_bits_load;
+  Alcotest.(check string)
+    "inline bits store bridge output"
+    "({ blorp_List* __list_store_0 = (blorp_List*)xs; long __list_store_idx_1 \
+     = 1L; uintptr_t __list_store_bits_2 = (uintptr_t)(void*)(long)(42L); \
+     memcpy((char*)__list_store_0->data + __list_store_idx_1 * 8, \
+     &__list_store_bits_2, 8); })"
+    inline_bits_store;
+  Alcotest.(check string)
+    "inline struct store bridge output"
+    "({ blorp_List* __list_store_0 = (blorp_List*)xs; long __list_store_idx_1 \
+     = 1L; Small __list_elem_2 = next; if (__list_store_0 && \
+     __list_store_0->storage_mode == BLORP_LIST_STORAGE_INLINE && \
+     __list_store_0->elem_size == (int16_t)sizeof(Small)) { \
+     blorp_list_set_raw_copy(__list_store_0, __list_store_idx_1, \
+     &__list_elem_2); } else { blorp_list_set_raw((blorp_List*)__list_store_0, \
+     __list_store_idx_1, (void*)blorp_box_struct(&__list_elem_2, \
+     sizeof(Small))); } })"
+    inline_struct_store;
+  Alcotest.(check string)
+    "pointer swap bridge output"
+    "({ blorp_List* __list_swap_0 = (blorp_List*)xs; long __list_swap_i_1 = \
+     1L; long __list_swap_j_2 = 2L; if (__builtin_expect(__list_swap_0 && \
+     __list_swap_i_1 != __list_swap_j_2, 1)) { void* __list_swap_tmp_3 = \
+     blorp_list_get(__list_swap_0, __list_swap_i_1); \
+     blorp_list_set_raw(__list_swap_0, __list_swap_i_1, \
+     blorp_list_get(__list_swap_0, __list_swap_j_2)); \
+     blorp_list_set_raw(__list_swap_0, __list_swap_j_2, __list_swap_tmp_3); } \
+     })"
+    pointer_swap;
+  Alcotest.(check string)
+    "inline bits swap bridge output"
+    "({ blorp_List* __list_swap_0 = (blorp_List*)xs; long __list_swap_i_1 = \
+     1L; long __list_swap_j_2 = 2L; if (__builtin_expect(__list_swap_0 && \
+     __list_swap_i_1 != __list_swap_j_2, 1)) { char* __list_swap_base_3 = \
+     (char*)__list_swap_0->data; uintptr_t __list_swap_bits_4 = 0; \
+     memcpy(&__list_swap_bits_4, __list_swap_base_3 + __list_swap_i_1 * 8, 8); \
+     memcpy(__list_swap_base_3 + __list_swap_i_1 * 8, __list_swap_base_3 + \
+     __list_swap_j_2 * 8, 8); memcpy(__list_swap_base_3 + __list_swap_j_2 * 8, \
+     &__list_swap_bits_4, 8); } })"
+    inline_bits_swap;
+  Alcotest.(check string)
+    "inline struct swap bridge output"
+    "({ blorp_List* __list_swap_0 = (blorp_List*)xs; long __list_swap_i_1 = \
+     1L; long __list_swap_j_2 = 2L; if (__builtin_expect(__list_swap_0 && \
+     __list_swap_i_1 != __list_swap_j_2, 1)) { if (__list_swap_0->storage_mode \
+     == BLORP_LIST_STORAGE_INLINE) { char* __list_swap_base_3 = \
+     (char*)__list_swap_0->data; size_t __list_swap_size_4 = \
+     (size_t)__list_swap_0->elem_size; void* __list_swap_a_5 = \
+     __list_swap_base_3 + __list_swap_i_1 * __list_swap_size_4; void* \
+     __list_swap_b_6 = __list_swap_base_3 + __list_swap_j_2 * \
+     __list_swap_size_4; unsigned char \
+     __list_swap_bytes_7[__list_swap_size_4]; memcpy(__list_swap_bytes_7, \
+     __list_swap_a_5, __list_swap_size_4); memcpy(__list_swap_a_5, \
+     __list_swap_b_6, __list_swap_size_4); memcpy(__list_swap_b_6, \
+     __list_swap_bytes_7, __list_swap_size_4); } else { void* \
+     __list_swap_tmp_8 = blorp_list_get(__list_swap_0, __list_swap_i_1); \
+     blorp_list_set_raw(__list_swap_0, __list_swap_i_1, \
+     blorp_list_get(__list_swap_0, __list_swap_j_2)); \
+     blorp_list_set_raw(__list_swap_0, __list_swap_j_2, __list_swap_tmp_8); } \
+     } })"
+    inline_struct_swap;
   Alcotest.(check string)
     "inline struct load bridge output"
     "if (__builtin_expect(!__list || __idx < 0 || __idx >= __list->len, 0)) { \
@@ -508,11 +695,118 @@ let test_prepared_tensor_bridge_emits_expected_c () =
         Blorp.Core_emit_blorp_prepared_tensor.emit_raw_write_stmt
           ~emit_expr:Blorp.Core_emit.emit_expr ctx raw_write)
   in
+  let storage_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_word_storage_check
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "values" ty_tensor_float))
+  in
+  let f64_storage_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_f64_storage_check
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "values" ty_tensor_float))
+  in
+  let f32_storage_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_f32_storage_check
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "values" ty_tensor_float))
+  in
+  let i64_storage_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_i64_storage_check
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "values" ty_tensor_float))
+  in
+  let pointer_get_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_data_pointer_get_unchecked
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "values" ty_tensor_float)
+          (cint 1))
+  in
+  let inline_struct_get_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_inline_struct_get_unchecked
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "values" ty_tensor_float)
+          (cint 1) ~struct_ty:"Small")
+  in
+  let f64_raw_get_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_f64_raw_get_unchecked
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "values" ty_tensor_float)
+          (cint 1))
+  in
+  let f32_raw_get_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_f32_raw_get_unchecked
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "values" ty_tensor_float)
+          (cint 1))
+  in
   Alcotest.(check string)
     "tensor raw view bridge output"
     "double* __raw = (double*)((blorp_Vector*)values)->data" view_c;
   Alcotest.(check string)
-    "tensor raw write bridge output" "__raw[1L] = 2.5;" write_c
+    "tensor raw write bridge output" "__raw[1L] = 2.5;" write_c;
+  Alcotest.(check string)
+    "tensor word storage bridge output"
+    "({ blorp_Vector* __tensor_layout_0 = (blorp_Vector*)values; \
+     __tensor_layout_0 && __tensor_layout_0->storage_mode == \
+     BLORP_VECTOR_STORAGE_POINTER && __tensor_layout_0->elem_size == \
+     (int16_t)sizeof(void*) && __tensor_layout_0->elem_release == NULL; })"
+    storage_c;
+  Alcotest.(check string)
+    "tensor f64 storage bridge output"
+    "({ blorp_Vector* __tensor_layout_0 = (blorp_Vector*)values; \
+     __tensor_layout_0 && __tensor_layout_0->storage_mode == \
+     BLORP_VECTOR_STORAGE_F64 && __tensor_layout_0->elem_size == \
+     (int16_t)sizeof(double); })"
+    f64_storage_c;
+  Alcotest.(check string)
+    "tensor f32 storage bridge output"
+    "({ blorp_Vector* __tensor_layout_0 = (blorp_Vector*)values; \
+     __tensor_layout_0 && __tensor_layout_0->storage_mode == \
+     BLORP_VECTOR_STORAGE_F32 && __tensor_layout_0->elem_size == \
+     (int16_t)sizeof(float); })"
+    f32_storage_c;
+  Alcotest.(check string)
+    "tensor i64 storage bridge output"
+    "({ blorp_Vector* __tensor_layout_0 = (blorp_Vector*)values; \
+     __tensor_layout_0 && __tensor_layout_0->storage_mode == \
+     BLORP_VECTOR_STORAGE_I64 && __tensor_layout_0->elem_size == \
+     (int16_t)sizeof(long); })"
+    i64_storage_c;
+  Alcotest.(check string)
+    "tensor pointer get bridge output" "((blorp_Vector*)values)->data[1L]"
+    pointer_get_c;
+  Alcotest.(check string)
+    "tensor inline struct get bridge output"
+    "({ blorp_Vector* __tgu_vec_0 = (blorp_Vector*)values; long __tgu_idx_1 = \
+     1L; Small __tgu_out_2; if (__builtin_expect(__tgu_vec_0->storage_mode == \
+     BLORP_VECTOR_STORAGE_INLINE && __tgu_vec_0->elem_size == sizeof(Small), \
+     1)) { memcpy(&__tgu_out_2, (char*)__tgu_vec_0->data + __tgu_idx_1 * \
+     sizeof(Small), sizeof(Small)); } else { void* __tgu_raw_3 = \
+     __tgu_vec_0->data[__tgu_idx_1]; __tgu_out_2 = \
+     blorp_unbox_struct(__tgu_raw_3, Small); } __tgu_out_2; })"
+    inline_struct_get_c;
+  Alcotest.(check string)
+    "tensor f64 raw get bridge output"
+    "({ blorp_Vector* __tensor_raw_vec_0 = (blorp_Vector*)values; long \
+     __tensor_raw_idx_1 = 1L; double __tensor_raw_2; memcpy(&__tensor_raw_2, \
+     (char*)__tensor_raw_vec_0->data + __tensor_raw_idx_1 * sizeof(double), \
+     sizeof(double)); __tensor_raw_2; })"
+    f64_raw_get_c;
+  Alcotest.(check string)
+    "tensor f32 raw get bridge output"
+    "({ blorp_Vector* __tensor_raw_vec_0 = (blorp_Vector*)values; long \
+     __tensor_raw_idx_1 = 1L; float __tensor_raw_2; memcpy(&__tensor_raw_2, \
+     (char*)__tensor_raw_vec_0->data + __tensor_raw_idx_1 * sizeof(float), \
+     sizeof(float)); __tensor_raw_2; })"
+    f32_raw_get_c
 
 let test_compiler_blorp_test_suites () =
   let suite_path = find_project_file compiler_tool_tests_dir_rel in

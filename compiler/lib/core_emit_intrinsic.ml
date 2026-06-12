@@ -100,29 +100,13 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       (* Handoff write from an existing source slot. The runtime moves the slot
          when handoff reuse succeeds and retains it when writing to a fresh
          result, so source aliases are never misclassified as owned temporaries. *)
-      emit ctx "blorp_list_handoff_set_source_slot((blorp_List*)";
-      emit_expr ctx result;
-      emit ctx ", ";
-      emit_expr ctx out_idx;
-      emit ctx ", (blorp_List*)";
-      emit_expr ctx source;
-      emit ctx ", ";
-      emit_expr ctx source_idx;
-      emit ctx ")"
+      Core_emit_blorp_prepared_list.emit_handoff_set_source_slot ~emit_expr ctx
+        result out_idx source source_idx
   | "list_copy_span_uninit", [ dst; dst_start; src; src_start; count ] ->
       (* Bulk copy into uninitialized list storage. The helper retains copied
          pointer elements only when the destination storage owns elements. *)
-      emit ctx "blorp_list_copy_span_uninit((blorp_List*)";
-      emit_expr ctx dst;
-      emit ctx ", ";
-      emit_expr ctx dst_start;
-      emit ctx ", (blorp_List*)";
-      emit_expr ctx src;
-      emit ctx ", ";
-      emit_expr ctx src_start;
-      emit ctx ", ";
-      emit_expr ctx count;
-      emit ctx ")"
+      Core_emit_blorp_prepared_list.emit_copy_span_uninit ~emit_expr ctx dst
+        dst_start src src_start count
   | "list_swap_slots", [ lst; i; j ] ->
       (* Layout-aware unchecked swap. The operation only rearranges initialized
          slots, so it does not retain or release elements. *)
@@ -137,28 +121,11 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
   | "list_ensure_unique", [ lst ] ->
       (* COW check: if shared, copy; if unique, return as-is.
          blorp_list_cow(list) *)
-      let list_tmp = Printf.sprintf "__list_unique_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_List* %s = (blorp_List*)" list_tmp);
-      emit_expr ctx lst;
-      emit ctx
-        (Printf.sprintf
-           "; (__builtin_expect(%s && blorp_is_unique(%s), 1) ? %s : \
-            blorp_list_cow(%s)); })"
-           list_tmp list_tmp list_tmp list_tmp)
+      Core_emit_blorp_prepared_list.emit_ensure_unique ~emit_expr ctx lst
   | "list_ensure_capacity", [ lst; cap ] ->
       (* COW + grow: ensure list has capacity >= cap.
          blorp_list_ensure_capacity(list, cap) *)
-      let list_tmp = Printf.sprintf "__list_cap_%d" (fresh_temp ctx) in
-      let cap_tmp = Printf.sprintf "__list_cap_min_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_List* %s = (blorp_List*)" list_tmp);
-      emit_expr ctx lst;
-      emit ctx (Printf.sprintf "; long %s = " cap_tmp);
-      emit_expr ctx cap;
-      emit ctx
-        (Printf.sprintf
-           "; (__builtin_expect(%s && blorp_is_unique(%s) && %s->capacity >= \
-            %s, 1) ? %s : blorp_list_ensure_capacity(%s, %s)); })"
-           list_tmp list_tmp list_tmp cap_tmp list_tmp list_tmp cap_tmp)
+      Core_emit_blorp_prepared_list.emit_ensure_capacity ~emit_expr ctx lst cap
   | "list_reuse_alloc", [ lst; cap ] ->
       (* Consume a dead list owner and return an empty list allocation.
          blorp_list_reuse_alloc(list, cap) *)
@@ -166,40 +133,20 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
       if
         list_storage_layout_requires_release_or_error ~phase:Core_error.Emit
           ~loc:e.loc layout
-      then begin
-        let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-        emit ctx
-          (Printf.sprintf "({ blorp_List* %s = blorp_list_reuse_alloc(" tmp);
-        emit_expr ctx lst;
-        emit ctx ", ";
-        emit_expr ctx cap;
-        emit ctx
-          (Printf.sprintf
-             "); blorp_list_init_elem_release(%s, blorp_elem_release_fn); %s; \
-              })"
-             tmp tmp)
-      end
-      else begin
-        emit ctx "blorp_list_reuse_alloc(";
-        emit_expr ctx lst;
-        emit ctx ", ";
-        emit_expr ctx cap;
-        emit ctx ")"
-      end
+      then
+        Core_emit_blorp_prepared_list.emit_reuse_alloc_with_release ~emit_expr
+          ctx lst cap
+      else Core_emit_blorp_prepared_list.emit_reuse_alloc ~emit_expr ctx lst cap
   | "list_retain_for", [ lst; value ] ->
       (* Retain a value being stored into list, if list has elem_release. *)
       let layout = list_storage_layout_of_type ctx lst.ty lst.loc in
       if
         list_storage_layout_requires_retain_or_error ~phase:Core_error.Emit
           ~loc:lst.loc layout
-      then begin
-        emit ctx "blorp_list_retain_for((blorp_List*)";
-        emit_expr ctx lst;
-        emit ctx ", (void*)";
-        emit_boxed ctx value;
-        emit ctx ")"
-      end
-      else emit ctx "((void)0)"
+      then
+        Core_emit_blorp_prepared_list.emit_retain_for ~emit_expr ~emit_boxed ctx
+          lst value
+      else Core_emit_blorp_prepared_list.emit_retain_for_noop ctx
   (* ---- String primitives ---- *)
   | "string_find_byte_from", [ s; byte; start ] ->
       (* Find a byte via memchr. Returns -1 for not found or invalid start. *)
@@ -281,97 +228,30 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
          (void)0; })"
   (* ---- Tensor/Vector primitives ---- *)
   | "tensor_is_word_storage", [ t ] ->
-      let vec_tmp = Printf.sprintf "__tensor_layout_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_Vector* %s = (blorp_Vector*)" vec_tmp);
-      emit_expr ctx t;
-      emit ctx
-        (Printf.sprintf
-           "; %s && %s->storage_mode == BLORP_VECTOR_STORAGE_POINTER && \
-            %s->elem_size == (int16_t)sizeof(void*) && %s->elem_release == \
-            NULL; })"
-           vec_tmp vec_tmp vec_tmp vec_tmp)
+      Core_emit_blorp_prepared_tensor.emit_word_storage_check ~emit_expr ctx t
   | "tensor_is_f64_storage", [ t ] ->
-      let vec_tmp = Printf.sprintf "__tensor_layout_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_Vector* %s = (blorp_Vector*)" vec_tmp);
-      emit_expr ctx t;
-      emit ctx
-        (Printf.sprintf
-           "; %s && %s->storage_mode == BLORP_VECTOR_STORAGE_F64 && \
-            %s->elem_size == (int16_t)sizeof(double); })"
-           vec_tmp vec_tmp vec_tmp)
+      Core_emit_blorp_prepared_tensor.emit_f64_storage_check ~emit_expr ctx t
   | "tensor_is_f32_storage", [ t ] ->
-      let vec_tmp = Printf.sprintf "__tensor_layout_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_Vector* %s = (blorp_Vector*)" vec_tmp);
-      emit_expr ctx t;
-      emit ctx
-        (Printf.sprintf
-           "; %s && %s->storage_mode == BLORP_VECTOR_STORAGE_F32 && \
-            %s->elem_size == (int16_t)sizeof(float); })"
-           vec_tmp vec_tmp vec_tmp)
+      Core_emit_blorp_prepared_tensor.emit_f32_storage_check ~emit_expr ctx t
   | "tensor_is_i64_storage", [ t ] ->
-      let vec_tmp = Printf.sprintf "__tensor_layout_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_Vector* %s = (blorp_Vector*)" vec_tmp);
-      emit_expr ctx t;
-      emit ctx
-        (Printf.sprintf
-           "; %s && %s->storage_mode == BLORP_VECTOR_STORAGE_I64 && \
-            %s->elem_size == (int16_t)sizeof(long); })"
-           vec_tmp vec_tmp vec_tmp)
+      Core_emit_blorp_prepared_tensor.emit_i64_storage_check ~emit_expr ctx t
   | "tensor_get_unchecked", [ t; idx ] -> (
       (* Direct data[idx] access — bounds proven safe at compile time. *)
       match Core_layout_type.tensor_element_storage ~reg:ctx.reg e.ty with
       | Core_layout_type.TensorElementInlineStruct c_ty ->
-          let vec_tmp = Printf.sprintf "__tgu_vec_%d" (fresh_temp ctx) in
-          let idx_tmp = Printf.sprintf "__tgu_idx_%d" (fresh_temp ctx) in
-          let out_tmp = Printf.sprintf "__tgu_out_%d" (fresh_temp ctx) in
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = (blorp_Vector*)" vec_tmp);
-          emit_expr ctx t;
-          emit ctx (Printf.sprintf "; long %s = " idx_tmp);
-          emit_expr ctx idx;
-          emit ctx
-            (Printf.sprintf
-               "; %s %s; if (__builtin_expect(%s->storage_mode == \
-                BLORP_VECTOR_STORAGE_INLINE && %s->elem_size == sizeof(%s), \
-                1)) { memcpy(&%s, (char*)%s->data + %s * sizeof(%s), \
-                sizeof(%s)); } else { void* __raw = %s->data[%s]; %s = \
-                blorp_unbox_struct(__raw, %s); } %s; })"
-               c_ty out_tmp vec_tmp vec_tmp c_ty out_tmp vec_tmp idx_tmp c_ty
-               c_ty vec_tmp idx_tmp out_tmp c_ty out_tmp)
+          Core_emit_blorp_prepared_tensor.emit_inline_struct_get_unchecked
+            ~emit_expr ctx t idx ~struct_ty:c_ty
       | Core_layout_type.TensorElementRawScalar _
       | Core_layout_type.TensorElementPackedBits _
       | Core_layout_type.TensorElementBoxed ->
-          emit ctx "((blorp_Vector*)";
-          emit_expr ctx t;
-          emit ctx ")->data[";
-          emit_expr ctx idx;
-          emit ctx "]")
+          Core_emit_blorp_prepared_tensor.emit_data_pointer_get_unchecked
+            ~emit_expr ctx t idx)
   | "tensor_get_f64_raw_unchecked", [ t; idx ] ->
-      let vec_tmp = Printf.sprintf "__tensor_raw_vec_%d" (fresh_temp ctx) in
-      let idx_tmp = Printf.sprintf "__tensor_raw_idx_%d" (fresh_temp ctx) in
-      let raw_tmp = Printf.sprintf "__tensor_raw_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_Vector* %s = (blorp_Vector*)" vec_tmp);
-      emit_expr ctx t;
-      emit ctx (Printf.sprintf "; long %s = " idx_tmp);
-      emit_expr ctx idx;
-      emit ctx
-        (Printf.sprintf
-           "; double %s; memcpy(&%s, (char*)%s->data + %s * sizeof(double), \
-            sizeof(double)); %s; })"
-           raw_tmp raw_tmp vec_tmp idx_tmp raw_tmp)
+      Core_emit_blorp_prepared_tensor.emit_f64_raw_get_unchecked ~emit_expr ctx
+        t idx
   | "tensor_get_f32_raw_unchecked", [ t; idx ] ->
-      let vec_tmp = Printf.sprintf "__tensor_raw_vec_%d" (fresh_temp ctx) in
-      let idx_tmp = Printf.sprintf "__tensor_raw_idx_%d" (fresh_temp ctx) in
-      let raw_tmp = Printf.sprintf "__tensor_raw_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_Vector* %s = (blorp_Vector*)" vec_tmp);
-      emit_expr ctx t;
-      emit ctx (Printf.sprintf "; long %s = " idx_tmp);
-      emit_expr ctx idx;
-      emit ctx
-        (Printf.sprintf
-           "; float %s; memcpy(&%s, (char*)%s->data + %s * sizeof(float), \
-            sizeof(float)); %s; })"
-           raw_tmp raw_tmp vec_tmp idx_tmp raw_tmp)
+      Core_emit_blorp_prepared_tensor.emit_f32_raw_get_unchecked ~emit_expr ctx
+        t idx
   | "tensor_alloc", [ size ] -> emit_tensor_alloc ~emit_expr ctx e size
   | _ ->
       if Core_intrinsic_registry.is_known name then

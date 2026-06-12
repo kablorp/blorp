@@ -2,12 +2,19 @@ import:
 	../codegen_prepared_tensor_renderer:
 		ALL_TEMPLATES,
 		CompilerCommand(RenderManifestCommand, RenderPreparedTensorCommand, UnknownCommand),
-		PreparedTensorOp(RawRead, RawViewDecl, RawWriteExpr, RawWriteStmt),
-		PreparedTensorTemplate(
-			TensorRawReadTemplate,
-			TensorRawViewDeclTemplate,
-			TensorRawWriteExprTemplate,
-			TensorRawWriteStmtTemplate,
+		PreparedTensorOp(
+			DataPointerGetUnchecked,
+			F32RawGetUnchecked,
+			F32StorageCheck,
+			F64RawGetUnchecked,
+			F64StorageCheck,
+			I64StorageCheck,
+			InlineStructGetUnchecked,
+			RawRead,
+			RawViewDecl,
+			RawWriteExpr,
+			RawWriteStmt,
+			WordStorageCheck,
 		),
 		RenderError(UnsupportedPreparedTensorOp, WrongArity),
 		parse_command,
@@ -24,11 +31,17 @@ import:
 
 func parsed_template_has(name: String, expected_name: String, expected_arity: Int) -> Bool:
 	match parse_prepared_tensor_template(name):
-		Some(template):
+		Some(info):
 			(
-				prepared_tensor_template_name(template) == expected_name
-				and prepared_tensor_template_arity(template) == expected_arity
+				prepared_tensor_template_name(info) == expected_name
+				and prepared_tensor_template_arity(info) == expected_arity
 			)
+		None: False
+
+
+func manifest_line_is(name: String, expected: String) -> Bool:
+	match parse_prepared_tensor_template(name):
+		Some(info): render_manifest_line(info) == expected
 		None: False
 
 
@@ -55,10 +68,53 @@ func test_parse_template_shapes() -> Bool:
 	view_ok: Bool = parsed_template_has("tensor_raw_view_decl", "tensor_raw_view_decl", 3)
 	read_ok: Bool = parsed_template_has("tensor_raw_read", "tensor_raw_read", 2)
 	stmt_ok: Bool = parsed_template_has("tensor_raw_write_stmt", "tensor_raw_write_stmt", 3)
+	word_storage_ok: Bool = parsed_template_has(
+		"tensor_is_word_storage",
+		"tensor_is_word_storage",
+		2,
+	)
+	f64_storage_ok: Bool = parsed_template_has("tensor_is_f64_storage", "tensor_is_f64_storage", 2)
+	f32_storage_ok: Bool = parsed_template_has("tensor_is_f32_storage", "tensor_is_f32_storage", 2)
+	i64_storage_ok: Bool = parsed_template_has("tensor_is_i64_storage", "tensor_is_i64_storage", 2)
+	data_get_ok: Bool = parsed_template_has(
+		"tensor_data_pointer_get_unchecked",
+		"tensor_data_pointer_get_unchecked",
+		2,
+	)
+	inline_struct_get_ok: Bool = parsed_template_has(
+		"tensor_inline_struct_get_unchecked",
+		"tensor_inline_struct_get_unchecked",
+		7,
+	)
+	f64_raw_get_ok: Bool = parsed_template_has(
+		"tensor_get_f64_raw_unchecked",
+		"tensor_get_f64_raw_unchecked",
+		5,
+	)
+	f32_raw_get_ok: Bool = parsed_template_has(
+		"tensor_get_f32_raw_unchecked",
+		"tensor_get_f32_raw_unchecked",
+		5,
+	)
 	missing_ok: Bool = match parse_prepared_tensor_template("tensor_get_f64"):
 		Some(template): False
 		None: True
-	view_ok and read_ok and stmt_ok and missing_ok
+	all_ok: Bool = (
+		view_ok
+		and read_ok
+		and stmt_ok
+		and word_storage_ok
+		and f64_storage_ok
+		and f32_storage_ok
+		and i64_storage_ok
+		and data_get_ok
+		and inline_struct_get_ok
+		and f64_raw_get_ok
+		and f32_raw_get_ok
+		and missing_ok
+	)
+
+	all_ok
 
 
 func test_render_prepared_tensor_op_successes() -> Bool:
@@ -78,7 +134,91 @@ func test_render_prepared_tensor_op_successes() -> Bool:
 		index = "i",
 		value = "value",
 	})) == "raw[i] = value;"
-	view_ok and read_ok and expr_ok and stmt_ok
+	word_storage_ok: Bool = render_prepared_tensor_op(WordStorageCheck({
+		tensor = "tensor",
+		vector_tmp = "__vec",
+	})) == (
+		"({ blorp_Vector* __vec = (blorp_Vector*)tensor; __vec && __vec->storage_mode == "
+		+ "BLORP_VECTOR_STORAGE_POINTER && __vec->elem_size == (int16_t)sizeof(void*) && "
+		+ "__vec->elem_release == NULL; })"
+	)
+	f64_storage_ok: Bool = render_prepared_tensor_op(F64StorageCheck({
+		tensor = "tensor",
+		vector_tmp = "__vec",
+	})) == (
+		"({ blorp_Vector* __vec = (blorp_Vector*)tensor; __vec && __vec->storage_mode == "
+		+ "BLORP_VECTOR_STORAGE_F64 && __vec->elem_size == (int16_t)sizeof(double); })"
+	)
+	f32_storage_ok: Bool = render_prepared_tensor_op(F32StorageCheck({
+		tensor = "tensor",
+		vector_tmp = "__vec",
+	})) == (
+		"({ blorp_Vector* __vec = (blorp_Vector*)tensor; __vec && __vec->storage_mode == "
+		+ "BLORP_VECTOR_STORAGE_F32 && __vec->elem_size == (int16_t)sizeof(float); })"
+	)
+	i64_storage_ok: Bool = render_prepared_tensor_op(I64StorageCheck({
+		tensor = "tensor",
+		vector_tmp = "__vec",
+	})) == (
+		"({ blorp_Vector* __vec = (blorp_Vector*)tensor; __vec && __vec->storage_mode == "
+		+ "BLORP_VECTOR_STORAGE_I64 && __vec->elem_size == (int16_t)sizeof(long); })"
+	)
+	data_get_ok: Bool = render_prepared_tensor_op(DataPointerGetUnchecked({
+		tensor = "tensor",
+		index = "i",
+	})) == "((blorp_Vector*)tensor)->data[i]"
+	inline_struct_get_ok: Bool = render_prepared_tensor_op(InlineStructGetUnchecked({
+		tensor = "tensor",
+		index = "i",
+		vector_tmp = "__vec",
+		index_tmp = "__idx",
+		out_tmp = "__out",
+		raw_tmp = "__raw",
+		struct_ty = "Small",
+	})) == (
+		"({ blorp_Vector* __vec = (blorp_Vector*)tensor; long __idx = i; Small __out; if "
+		+ "(__builtin_expect(__vec->storage_mode == BLORP_VECTOR_STORAGE_INLINE && __vec-"
+		+ ">elem_size == sizeof(Small), 1)) { memcpy(&__out, (char*)__vec->data + __idx * "
+		+ "sizeof(Small), sizeof(Small)); } else { void* __raw = __vec->data[__idx]; __out "
+		+ "= blorp_unbox_struct(__raw, Small); } __out; })"
+	)
+	f64_raw_get_ok: Bool = render_prepared_tensor_op(F64RawGetUnchecked({
+		tensor = "tensor",
+		index = "i",
+		vector_tmp = "__vec",
+		index_tmp = "__idx",
+		out_tmp = "__raw",
+	})) == (
+		"({ blorp_Vector* __vec = (blorp_Vector*)tensor; long __idx = i; double __raw; "
+		+ "memcpy(&__raw, (char*)__vec->data + __idx * sizeof(double), sizeof(double)); "
+		+ "__raw; })"
+	)
+	f32_raw_get_ok: Bool = render_prepared_tensor_op(F32RawGetUnchecked({
+		tensor = "tensor",
+		index = "i",
+		vector_tmp = "__vec",
+		index_tmp = "__idx",
+		out_tmp = "__raw",
+	})) == (
+		"({ blorp_Vector* __vec = (blorp_Vector*)tensor; long __idx = i; float __raw; "
+		+ "memcpy(&__raw, (char*)__vec->data + __idx * sizeof(float), sizeof(float)); "
+		+ "__raw; })"
+	)
+
+	(
+		view_ok
+		and read_ok
+		and expr_ok
+		and stmt_ok
+		and word_storage_ok
+		and f64_storage_ok
+		and f32_storage_ok
+		and i64_storage_ok
+		and data_get_ok
+		and inline_struct_get_ok
+		and f64_raw_get_ok
+		and f32_raw_get_ok
+	)
 
 
 func test_render_prepared_tensor_successes() -> Bool:
@@ -100,7 +240,28 @@ func test_render_prepared_tensor_successes() -> Bool:
 	):
 		Ok(rendered): rendered == "__raw[idx] = next;"
 		Err(error): False
-	view_ok and read_ok and stmt_ok
+	storage_ok: Bool = match render_prepared_tensor(
+		"tensor_is_i64_storage",
+		["tensor", "__vec"],
+	):
+		Ok(rendered):
+			rendered == (
+				"({ blorp_Vector* __vec = (blorp_Vector*)tensor; __vec && __vec->storage_mode == "
+				+ "BLORP_VECTOR_STORAGE_I64 && __vec->elem_size == (int16_t)sizeof(long); })"
+			)
+		Err(error): False
+	raw_get_ok: Bool = match render_prepared_tensor(
+		"tensor_get_f32_raw_unchecked",
+		["tensor", "idx", "__vec", "__idx", "__raw"],
+	):
+		Ok(rendered):
+			rendered == (
+				"({ blorp_Vector* __vec = (blorp_Vector*)tensor; long __idx = idx; float __raw; "
+				+ "memcpy(&__raw, (char*)__vec->data + __idx * sizeof(float), sizeof(float)); "
+				+ "__raw; })"
+			)
+		Err(error): False
+	view_ok and read_ok and stmt_ok and storage_ok and raw_get_ok
 
 
 func test_render_prepared_tensor_errors_are_typed() -> Bool:
@@ -108,10 +269,24 @@ func test_render_prepared_tensor_errors_are_typed() -> Bool:
 		Ok(rendered): False
 		Err(error):
 			match error:
-				WrongArity(template, expected, got):
+				WrongArity(info, got):
 					(
-						prepared_tensor_template_name(template) == "tensor_raw_read"
-						and expected == 2
+						prepared_tensor_template_name(info) == "tensor_raw_read"
+						and prepared_tensor_template_arity(info) == 2
+						and got == 1
+					)
+				UnsupportedPreparedTensorOp(name): False
+	inline_struct_arity_ok: Bool = match render_prepared_tensor(
+		"tensor_inline_struct_get_unchecked",
+		["tensor"],
+	):
+		Ok(rendered): False
+		Err(error):
+			match error:
+				WrongArity(info, got):
+					(
+						prepared_tensor_template_name(info) == "tensor_inline_struct_get_unchecked"
+						and prepared_tensor_template_arity(info) == 7
 						and got == 1
 					)
 				UnsupportedPreparedTensorOp(name): False
@@ -119,15 +294,19 @@ func test_render_prepared_tensor_errors_are_typed() -> Bool:
 		Ok(rendered): False
 		Err(error):
 			match error:
-				WrongArity(template, expected, got): False
+				WrongArity(info, got): False
 				UnsupportedPreparedTensorOp(name): name == "tensor_len"
-	wrong_arity_ok and unsupported_ok
+	wrong_arity_ok and inline_struct_arity_ok and unsupported_ok
 
 
 func test_render_error_to_string() -> Bool:
-	arity_error: RenderError = WrongArity(TensorRawWriteExprTemplate, 3, 2)
 	unsupported_error: RenderError = UnsupportedPreparedTensorOp("missing")
-	arity_text: String = render_error_to_string(arity_error)
+	arity_text: String = match render_prepared_tensor(
+		"tensor_raw_write_expr",
+		["a", "b"],
+	):
+		Ok(rendered): rendered
+		Err(error): render_error_to_string(error)
 	unsupported_text: String = render_error_to_string(unsupported_error)
 
 	(
@@ -143,10 +322,23 @@ func test_render_manifest_lines() -> Bool:
 		[]: False
 		[first, ...rest]:
 			first == "tensor_raw_view_decl\t3\t@0@ @1@ = (@0@)((blorp_Vector*)@2@)->data"
-	stmt_ok: Bool = render_manifest_line(
-		TensorRawWriteStmtTemplate,
-	) == "tensor_raw_write_stmt\t3\t@0@[@1@] = @2@;"
-	count_ok and first_ok and stmt_ok
+	stmt_ok: Bool = manifest_line_is(
+		"tensor_raw_write_stmt",
+		"tensor_raw_write_stmt\t3\t@0@[@1@] = @2@;",
+	)
+	storage_ok: Bool = manifest_line_is(
+		"tensor_is_word_storage",
+		"tensor_is_word_storage\t2\t({ blorp_Vector* @1@ = (blorp_Vector*)@0@; @1@ && @1@->storage_mode == BLORP_VECTOR_STORAGE_POINTER && @1@->elem_size == (int16_t)sizeof(void*) && @1@->elem_release == NULL; })",
+	)
+	inline_struct_get_ok: Bool = manifest_line_is(
+		"tensor_inline_struct_get_unchecked",
+		"tensor_inline_struct_get_unchecked\t7\t({ blorp_Vector* @2@ = (blorp_Vector*)@0@; long @3@ = @1@; @6@ @4@; if (__builtin_expect(@2@->storage_mode == BLORP_VECTOR_STORAGE_INLINE && @2@->elem_size == sizeof(@6@), 1)) { memcpy(&@4@, (char*)@2@->data + @3@ * sizeof(@6@), sizeof(@6@)); } else { void* @5@ = @2@->data[@3@]; @4@ = blorp_unbox_struct(@5@, @6@); } @4@; })",
+	)
+	raw_get_ok: Bool = manifest_line_is(
+		"tensor_get_f64_raw_unchecked",
+		"tensor_get_f64_raw_unchecked\t5\t({ blorp_Vector* @2@ = (blorp_Vector*)@0@; long @3@ = @1@; double @4@; memcpy(&@4@, (char*)@2@->data + @3@ * sizeof(double), sizeof(double)); @4@; })",
+	)
+	count_ok and first_ok and stmt_ok and storage_ok and inline_struct_get_ok and raw_get_ok
 
 
 tests: TestSuite = {
