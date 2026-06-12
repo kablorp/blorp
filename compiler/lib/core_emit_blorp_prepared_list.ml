@@ -14,11 +14,14 @@ let manifest =
     Core_emit_blorp_prepared_list_templates.tsv
 
 let render_arg = Core_emit_blorp_template.render_arg
+let render_template = Core_emit_blorp_template.render_exn manifest
 let emit_template = Core_emit_blorp_template.emit manifest
 
 type store_runtime_template =
   | SetRawStoreTemplate
   | HandoffSetOwnedStoreTemplate
+
+type alloc_template = PointerAllocTemplate | InlineAllocTemplate of string
 
 let pointer_store_template_name = function
   | SetRawStoreTemplate -> "list_pointer_set_raw_store"
@@ -27,6 +30,27 @@ let pointer_store_template_name = function
 let inline_struct_store_template_name = function
   | SetRawStoreTemplate -> "list_inline_struct_set_raw_store"
   | HandoffSetOwnedStoreTemplate -> "list_inline_struct_handoff_set_owned_store"
+
+let alloc_template_of_layout (layout : list_storage_layout) =
+  match layout.lsl_slots with
+  | ListPointerStorage -> PointerAllocTemplate
+  | ListInlineStorage width ->
+      InlineAllocTemplate (string_of_int (inline_storage_width_bytes width))
+  | ListInlineStructStorage c_ty ->
+      InlineAllocTemplate (Printf.sprintf "sizeof(%s)" c_ty)
+
+let render_alloc_call layout capacity_arg =
+  match alloc_template_of_layout layout with
+  | PointerAllocTemplate ->
+      render_template "list_alloc_pointer" [ capacity_arg ]
+  | InlineAllocTemplate elem_size ->
+      render_template "list_alloc_inline" [ capacity_arg; elem_size ]
+
+let emit_alloc_call ctx layout capacity_arg =
+  emit ctx (render_alloc_call layout capacity_arg)
+
+let render_alloc_with_release ~alloc_expr ~result_tmp =
+  render_template "list_alloc_with_release" [ alloc_expr; result_tmp ]
 
 let emit_runtime_get ~emit_expr ctx ~template_name list index =
   let list_arg = render_arg ~emit_expr ctx list in
@@ -267,6 +291,28 @@ let emit_retain_for ~emit_expr ~emit_boxed ctx lst value =
   emit_template ctx "list_retain_for" [ list_arg; value_arg ]
 
 let emit_retain_for_noop ctx = emit_template ctx "list_retain_for_noop" []
+
+let emit_construct_init_elem_release ctx ~list_tmp =
+  emit_template ctx "list_construct_init_elem_release" [ list_tmp ]
+
+let emit_construct_inline_struct_set ~emit_expr ctx ~list_tmp ~index ~struct_ty
+    value =
+  let elem_tmp =
+    Printf.sprintf "__lst_elem_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  let value_arg = render_arg ~emit_expr ctx value in
+  emit_template ctx "list_construct_inline_struct_set"
+    [ list_tmp; string_of_int index; value_arg; elem_tmp; struct_ty ]
+
+let emit_construct_set_len ctx ~list_tmp ~len =
+  emit_template ctx "list_construct_set_len" [ list_tmp; string_of_int len ]
+
+let emit_construct_append ~emit_boxed ctx ~list_tmp ~owned value =
+  let value_arg = render_arg ~emit_expr:emit_boxed ctx value in
+  let template_name =
+    if owned then "list_construct_append_owned" else "list_construct_append"
+  in
+  emit_template ctx template_name [ list_tmp; value_arg ]
 
 let emit_get ~emit_expr (ctx : Core_emit_context.t) (get : list_get) : unit =
   match get.lg_layout.lsl_slots with

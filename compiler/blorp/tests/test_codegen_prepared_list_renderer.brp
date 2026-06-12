@@ -17,6 +17,14 @@ import:
 			InlineStructLoadChecked,
 			InlineStructLoadProven,
 			InlineStructSetRawStore,
+			ListAllocInline,
+			ListAllocPointer,
+			ListAllocWithRelease,
+			ListConstructAppend,
+			ListConstructAppendOwned,
+			ListConstructInitElemRelease,
+			ListConstructInlineStructSet,
+			ListConstructSetLen,
 			PointerHandoffSetOwnedStore,
 			PointerSwap,
 			PointerGet,
@@ -143,8 +151,40 @@ func test_parse_template_shapes() -> Bool:
 		"list_reuse_alloc_with_release",
 		3,
 	)
+	alloc_pointer_ok: Bool = parsed_template_has("list_alloc_pointer", "list_alloc_pointer", 1)
+	alloc_inline_ok: Bool = parsed_template_has("list_alloc_inline", "list_alloc_inline", 2)
+	alloc_release_ok: Bool = parsed_template_has(
+		"list_alloc_with_release",
+		"list_alloc_with_release",
+		2,
+	)
 	retain_for_ok: Bool = parsed_template_has("list_retain_for", "list_retain_for", 2)
 	retain_noop_ok: Bool = parsed_template_has("list_retain_for_noop", "list_retain_for_noop", 0)
+	construct_release_ok: Bool = parsed_template_has(
+		"list_construct_init_elem_release",
+		"list_construct_init_elem_release",
+		1,
+	)
+	construct_struct_ok: Bool = parsed_template_has(
+		"list_construct_inline_struct_set",
+		"list_construct_inline_struct_set",
+		5,
+	)
+	construct_len_ok: Bool = parsed_template_has(
+		"list_construct_set_len",
+		"list_construct_set_len",
+		2,
+	)
+	construct_append_ok: Bool = parsed_template_has(
+		"list_construct_append",
+		"list_construct_append",
+		2,
+	)
+	construct_append_owned_ok: Bool = parsed_template_has(
+		"list_construct_append_owned",
+		"list_construct_append_owned",
+		2,
+	)
 	missing_ok: Bool = match parse_prepared_list_template("list_len"):
 		Some(template): False
 		None: True
@@ -169,8 +209,16 @@ func test_parse_template_shapes() -> Bool:
 		and ensure_capacity_ok
 		and reuse_alloc_ok
 		and reuse_alloc_release_ok
+		and alloc_pointer_ok
+		and alloc_inline_ok
+		and alloc_release_ok
 		and retain_for_ok
 		and retain_noop_ok
+		and construct_release_ok
+		and construct_struct_ok
+		and construct_len_ok
+		and construct_append_ok
+		and construct_append_owned_ok
 		and missing_ok
 	)
 
@@ -401,11 +449,51 @@ func test_render_prepared_list_op_successes() -> Bool:
 		"({ blorp_List* __result = blorp_list_reuse_alloc(xs, capacity); "
 		+ "blorp_list_init_elem_release(__result, blorp_elem_release_fn); __result; })"
 	)
+	alloc_pointer_ok: Bool = render_prepared_list_op(
+		ListAllocPointer("capacity"),
+	) == "blorp_list_new(capacity)"
+	alloc_inline_ok: Bool = render_prepared_list_op(ListAllocInline({
+		capacity = "capacity",
+		elem_size = "8",
+	})) == "blorp_list_new_inline(capacity, 8)"
+	alloc_release_ok: Bool = render_prepared_list_op(ListAllocWithRelease({
+		alloc_expr = "blorp_list_new(capacity)",
+		result_tmp = "__result",
+	})) == (
+		"({ blorp_List* __result = blorp_list_new(capacity); "
+		+ "blorp_list_init_elem_release(__result, blorp_elem_release_fn); __result; })"
+	)
 	retain_for_ok: Bool = render_prepared_list_op(RetainFor({
 		list = "xs",
 		value = "value",
 	})) == "blorp_list_retain_for((blorp_List*)xs, (void*)value)"
 	retain_noop_ok: Bool = render_prepared_list_op(RetainForNoop) == "((void)0)"
+	construct_release_ok: Bool = render_prepared_list_op(
+		ListConstructInitElemRelease(
+			"__lst",
+		),
+	) == "blorp_list_init_elem_release(__lst, blorp_elem_release_fn);"
+	construct_struct_ok: Bool = render_prepared_list_op(ListConstructInlineStructSet({
+		list = "__lst",
+		index = "2",
+		value = "next",
+		elem_tmp = "__elem",
+		struct_ty = "Small",
+	})) == "{ Small __elem = next; blorp_list_set_raw_copy(__lst, 2, &__elem); }"
+	construct_len_ok: Bool = render_prepared_list_op(
+		ListConstructSetLen(
+			"__lst",
+			"3",
+		),
+	) == "__lst->len = 3;"
+	construct_append_ok: Bool = render_prepared_list_op(ListConstructAppend({
+		list = "__lst",
+		value = "value",
+	})) == "__lst = blorp_list_append(__lst, value);"
+	construct_append_owned_ok: Bool = render_prepared_list_op(ListConstructAppendOwned({
+		list = "__lst",
+		value = "value",
+	})) == "__lst = blorp_list_append_owned(__lst, value);"
 
 	(
 		pointer_ok
@@ -428,8 +516,16 @@ func test_render_prepared_list_op_successes() -> Bool:
 		and ensure_capacity_ok
 		and reuse_alloc_ok
 		and reuse_alloc_release_ok
+		and alloc_pointer_ok
+		and alloc_inline_ok
+		and alloc_release_ok
 		and retain_for_ok
 		and retain_noop_ok
+		and construct_release_ok
+		and construct_struct_ok
+		and construct_len_ok
+		and construct_append_ok
+		and construct_append_owned_ok
 	)
 
 
@@ -507,6 +603,35 @@ func test_render_prepared_list_successes() -> Bool:
 				+ "(void*)blorp_box_struct(&__elem, sizeof(Small))); } })"
 			)
 		Err(error): False
+	alloc_inline_ok: Bool = match render_prepared_list(
+		"list_alloc_inline",
+		["capacity", "sizeof(Small)"],
+	):
+		Ok(rendered): rendered == "blorp_list_new_inline(capacity, sizeof(Small))"
+		Err(error): False
+	alloc_release_ok: Bool = match render_prepared_list(
+		"list_alloc_with_release",
+		["blorp_list_new(capacity)", "__result"],
+	):
+		Ok(rendered):
+			rendered == (
+				"({ blorp_List* __result = blorp_list_new(capacity); "
+				+ "blorp_list_init_elem_release(__result, blorp_elem_release_fn); __result; })"
+			)
+		Err(error): False
+	construct_append_ok: Bool = match render_prepared_list(
+		"list_construct_append_owned",
+		["__lst", "value"],
+	):
+		Ok(rendered): rendered == "__lst = blorp_list_append_owned(__lst, value);"
+		Err(error): False
+	construct_struct_ok: Bool = match render_prepared_list(
+		"list_construct_inline_struct_set",
+		["__lst", "2", "next", "__elem", "Small"],
+	):
+		Ok(rendered):
+			rendered == "{ Small __elem = next; blorp_list_set_raw_copy(__lst, 2, &__elem); }"
+		Err(error): False
 	all_ok: Bool = (
 		pointer_ok
 		and inline_ok
@@ -514,6 +639,10 @@ func test_render_prepared_list_successes() -> Bool:
 		and bits_load_ok
 		and bits_store_ok
 		and struct_store_ok
+		and alloc_inline_ok
+		and alloc_release_ok
+		and construct_append_ok
+		and construct_struct_ok
 	)
 
 	all_ok
@@ -627,6 +756,17 @@ func test_render_prepared_list_errors_are_typed() -> Bool:
 						and got == 1
 					)
 				UnsupportedPreparedListOp(name): False
+	alloc_inline_arity_ok: Bool = match render_prepared_list("list_alloc_inline", ["capacity"]):
+		Ok(rendered): False
+		Err(error):
+			match error:
+				WrongArity(info, got):
+					(
+						prepared_list_template_name(info) == "list_alloc_inline"
+						and prepared_list_template_arity(info) == 2
+						and got == 1
+					)
+				UnsupportedPreparedListOp(name): False
 	unsupported_ok: Bool = match render_prepared_list("list_len", ["xs"]):
 		Ok(rendered): False
 		Err(error):
@@ -642,6 +782,7 @@ func test_render_prepared_list_errors_are_typed() -> Bool:
 		and pointer_swap_arity_ok
 		and ensure_capacity_arity_ok
 		and retain_noop_arity_ok
+		and alloc_inline_arity_ok
 		and unsupported_ok
 	)
 
@@ -743,6 +884,18 @@ func test_render_manifest_lines() -> Bool:
 		"list_reuse_alloc_with_release",
 		"list_reuse_alloc_with_release\t3\t({ blorp_List* @2@ = blorp_list_reuse_alloc(@0@, @1@); blorp_list_init_elem_release(@2@, blorp_elem_release_fn); @2@; })",
 	)
+	alloc_pointer_ok: Bool = manifest_line_is(
+		"list_alloc_pointer",
+		"list_alloc_pointer\t1\tblorp_list_new(@0@)",
+	)
+	alloc_inline_ok: Bool = manifest_line_is(
+		"list_alloc_inline",
+		"list_alloc_inline\t2\tblorp_list_new_inline(@0@, @1@)",
+	)
+	alloc_release_ok: Bool = manifest_line_is(
+		"list_alloc_with_release",
+		"list_alloc_with_release\t2\t({ blorp_List* @1@ = @0@; blorp_list_init_elem_release(@1@, blorp_elem_release_fn); @1@; })",
+	)
 	retain_for_ok: Bool = manifest_line_is(
 		"list_retain_for",
 		"list_retain_for\t2\tblorp_list_retain_for((blorp_List*)@0@, (void*)@1@)",
@@ -773,6 +926,9 @@ func test_render_manifest_lines() -> Bool:
 		and ensure_capacity_ok
 		and reuse_alloc_ok
 		and reuse_alloc_release_ok
+		and alloc_pointer_ok
+		and alloc_inline_ok
+		and alloc_release_ok
 		and retain_for_ok
 		and retain_noop_ok
 	)

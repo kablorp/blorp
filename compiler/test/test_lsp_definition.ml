@@ -239,7 +239,7 @@ let test_definition_resolves_list_ufcs_to_list_module () =
          ])
   in
   Alcotest.(check (pair int int))
-    "definition points at the std/list append name" (98, 10)
+    "definition points at the std/list append name" (102, 10)
     (definition_start_at state uri ~line:2 ~character:25);
   let target_uri = definition_uri_at state uri ~line:2 ~character:25 in
   Alcotest.(check bool)

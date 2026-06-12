@@ -19799,6 +19799,26 @@ static void blorp_dict_destroy(void* obj) {
     free(dict->order_index);
 }
 
+void blorp_make_immortal_dict_constant(
+    blorp_Dict* dict,
+    blorp_ImmortalizeElementFn immortalize_key,
+    blorp_ImmortalizeElementFn immortalize_value
+) {
+    if (!dict) return;
+    blorp_make_immortal_constant(dict);
+    if (!immortalize_key && !immortalize_value) return;
+    for (long i = 0; i < dict->order_len; i++) {
+        long slot = dict->order[i];
+        if (slot < 0) continue;
+        if (immortalize_key && dict->keys[slot]) {
+            immortalize_key(dict->keys[slot]);
+        }
+        if (immortalize_value && dict->values[slot]) {
+            immortalize_value(dict->values[slot]);
+        }
+    }
+}
+
 blorp_Dict* blorp_dict_new(void) {
     long initial_capacity = 16;
     blorp_Dict* dict = (blorp_Dict*)blorp_alloc(sizeof(blorp_Dict));

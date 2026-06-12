@@ -5,10 +5,13 @@ let test_loc =
   { Ast.line = 1; column = 1; end_line = 1; end_column = 1; loc_file = None }
 
 let ty_int = Ast.TyNamed ("Int", [])
+let ty_bool = Ast.TyNamed ("Bool", [])
 let ty_float = Ast.TyNamed ("Float", [])
 let ty_string = Ast.TyNamed ("String", [])
 let ty_list_int = Ast.TyNamed ("List", [ ty_int ])
 let ty_tensor_float = Ast.TyNamed ("Tensor", [ ty_float ])
+let ty_float_vector = Ast.TyArray (ty_float, [ Ast.TyConstInt 3 ])
+let ty_string_vector = Ast.TyArray (ty_string, [ Ast.TyConstInt 3 ])
 let core desc ty : Core.core = { desc; ty; loc = test_loc }
 let cvar name ty = core (Core.CVar (Core.Var.named name)) ty
 let cint value = core (Core.CLit (Ast.LitInt (Int64.of_int value))) ty_int
@@ -26,6 +29,9 @@ let core_emit_list_intrinsic_rel =
   compiler_lib_rel "core_emit_list_intrinsic.ml"
 
 let core_emit_rel = compiler_lib_rel "core_emit.ml"
+
+let core_emit_blorp_prepared_string_rel =
+  compiler_lib_rel "core_emit_blorp_prepared_string.ml"
 
 type renderer_spec = {
   name : string;
@@ -265,6 +271,7 @@ let test_core_emit_delegates_initial_slice_to_blorp_manifest () =
       "| \"set_eq\"";
       "| \"set_hash_immediate\"";
       "| \"set_eq_immediate\"";
+      "| \"set_retain_key_for\"";
       "| \"set_alloc\"";
       "| \"set_alloc_entry\"";
       "| \"set_free_entry\"";
@@ -294,6 +301,9 @@ let test_core_emit_delegates_initial_slice_to_blorp_manifest () =
       "| \"dict_eq\"";
       "| \"dict_hash_immediate\"";
       "| \"dict_eq_immediate\"";
+      "| \"dict_retain_key_for\"";
+      "| \"dict_retain_value_for\"";
+      "| \"dict_release_value_for\"";
       "| \"dict_alloc\"";
       "| \"dict_cow\"";
       "| \"dict_reuse_alloc\"";
@@ -326,15 +336,33 @@ let test_core_emit_delegates_initial_slice_to_blorp_manifest () =
 
 let test_core_emit_delegates_prepared_string_slice_to_blorp_manifest () =
   let core_emit_path = find_project_file core_emit_rel in
-  let source = read_file core_emit_path in
+  let core_emit_intrinsic_path = find_project_file core_emit_intrinsic_rel in
+  let core_emit_blorp_prepared_string_path =
+    find_project_file core_emit_blorp_prepared_string_rel
+  in
+  let core_emit_source = read_file core_emit_path in
+  let core_emit_intrinsic_source = read_file core_emit_intrinsic_path in
+  let prepared_string_source = read_file core_emit_blorp_prepared_string_path in
+  let source =
+    core_emit_source ^ "\n" ^ core_emit_intrinsic_source ^ "\n"
+    ^ prepared_string_source
+  in
+  let old_body_source = core_emit_source ^ "\n" ^ core_emit_intrinsic_source in
+  assert_source_contains source
+    "production emitter delegates string find-byte intrinsic"
+    "Core_emit_blorp_prepared_string.emit_find_byte_from";
   assert_source_contains source
     "production emitter calls Blorp prepared string bridge"
     "Core_emit_blorp_prepared_string.emit_byte_read";
   assert_source_contains source "production emitter delegates string byte copy"
     "Core_emit_blorp_prepared_string.emit_byte_copy";
+  assert_source_contains source "raw string byte-copy fallback delegates"
+    "Core_emit_blorp_prepared_string.emit_byte_copy_intrinsic";
+  assert_source_contains source "raw string set-len fallback delegates"
+    "Core_emit_blorp_prepared_string.emit_set_len_intrinsic";
   List.iter
     (fun fragment ->
-      assert_source_not_contains source
+      assert_source_not_contains old_body_source
         ("production emitter removed old prepared string body: " ^ fragment)
         fragment)
     [
@@ -399,6 +427,23 @@ let test_core_emit_delegates_prepared_list_slice_to_blorp_manifest () =
     "Core_emit_blorp_prepared_list.emit_reuse_alloc";
   assert_source_contains source "production emitter delegates list retain-for"
     "Core_emit_blorp_prepared_list.emit_retain_for";
+  assert_source_contains source "production emitter delegates list allocation"
+    "Core_emit_blorp_prepared_list.emit_alloc_call";
+  assert_source_contains source
+    "production emitter delegates release-wrapped list allocation"
+    "Core_emit_blorp_prepared_list.render_alloc_with_release";
+  assert_source_contains source
+    "production emitter delegates list construct inline struct stores"
+    "Core_emit_blorp_prepared_list.emit_construct_inline_struct_set";
+  assert_source_contains source
+    "production emitter delegates list construct appends"
+    "Core_emit_blorp_prepared_list.emit_construct_append";
+  assert_source_contains source
+    "production emitter rejects unprepared tuple literals"
+    "unprepared CTuple reached emission";
+  assert_source_contains source
+    "production emitter rejects unprepared list literals"
+    "unprepared CList reached emission";
   List.iter
     (fun fragment ->
       assert_source_not_contains source
@@ -423,7 +468,13 @@ let test_core_emit_delegates_prepared_list_slice_to_blorp_manifest () =
       "emit ctx \"blorp_list_copy_span_uninit((blorp_List*)\"";
       "let list_tmp = Printf.sprintf \"__list_unique_%d\"";
       "let list_tmp = Printf.sprintf \"__list_cap_%d\"";
+      "emit ctx \"blorp_list_new(\"";
+      "emit ctx \"blorp_list_new_inline(\"";
       "emit ctx \"blorp_list_retain_for((blorp_List*)\"";
+      "tuple_field_needs_retain ctx el";
+      "boxed_expr_transfers_ownership ctx el";
+      "let append_fn";
+      "__lst_elem_%d";
     ]
 
 let test_core_emit_delegates_prepared_tensor_slice_to_blorp_manifest () =
@@ -456,6 +507,27 @@ let test_core_emit_delegates_prepared_tensor_slice_to_blorp_manifest () =
   assert_source_contains intrinsic_source
     "production emitter delegates tensor f32 raw unchecked gets"
     "Core_emit_blorp_prepared_tensor.emit_f32_raw_get_unchecked";
+  assert_source_contains intrinsic_source
+    "production emitter delegates tensor allocation"
+    "Core_emit_blorp_prepared_tensor.emit_alloc";
+  assert_source_contains source
+    "production emitter delegates tensor fill allocation"
+    "Core_emit_blorp_prepared_tensor.emit_fill_alloc_call";
+  assert_source_contains source
+    "production emitter delegates tensor literal allocation"
+    "Core_emit_blorp_prepared_tensor.render_literal_alloc_call";
+  assert_source_contains source
+    "production emitter delegates tensor literal f64 writes"
+    "Core_emit_blorp_prepared_tensor.emit_literal_f64_write";
+  assert_source_contains source
+    "production emitter delegates tensor literal inline struct writes"
+    "Core_emit_blorp_prepared_tensor.emit_literal_inline_struct_write";
+  assert_source_contains source
+    "production emitter delegates tensor literal boxed writes"
+    "Core_emit_blorp_prepared_tensor.emit_literal_boxed_write";
+  assert_source_contains source
+    "production emitter rejects unprepared vector literals"
+    "unprepared CVector reached emission";
   List.iter
     (fun fragment ->
       assert_source_not_contains source
@@ -465,6 +537,21 @@ let test_core_emit_delegates_prepared_tensor_slice_to_blorp_manifest () =
       "Core_layout_type.tensor_raw_scalar_abi b.trv_kind).tras_pointer_c_type";
       "emit ctx (escape_c_ident (Var.to_c_name r.trr_view));";
       "emit ctx (escape_c_ident (Var.to_c_name w.trw_view));";
+      "and emit_tensor_fill_alloc_call";
+      "emit ctx \"blorp_tensor_new_i64(\"";
+      "emit ctx \"blorp_tensor_new_f64(\"";
+      "emit ctx \"blorp_tensor_new_f32(\"";
+      "emit ctx \"blorp_tensor_new_packed(\"";
+      "let vector_ctor, tensor_ctor";
+      "let packed_width_arg";
+      "TensorStaticShape (_ :: _) -> (";
+      "blorp_vector_write_f64(%s, %d";
+      "%s->data[%d] = (void*)(intptr_t)(";
+      "blorp_packed_set(%s, %d, (long)(";
+      "__ten_elem_%d";
+      "let is_float32_literal";
+      "let tensor_dims";
+      "collect_leaves";
     ];
   List.iter
     (fun fragment ->
@@ -477,6 +564,10 @@ let test_core_emit_delegates_prepared_tensor_slice_to_blorp_manifest () =
       "emit ctx \"((blorp_Vector*)\"";
       "; double %s; memcpy(&%s, (char*)%s->data + %s * sizeof(double)";
       "; float %s; memcpy(&%s, (char*)%s->data + %s * sizeof(float)";
+      "let emit_tensor_alloc_ctor";
+      "let emit_tensor_alloc";
+      "emit ctx \"blorp_vector_new_i64(\"";
+      "blorp_vector_init_elem_release(%s";
     ]
 
 let emit_bridge render =
@@ -585,6 +676,58 @@ let test_prepared_list_bridge_emits_expected_c () =
           ~emit_expr:Blorp.Core_emit.emit_expr ctx (cvar "xs" ty_list_small)
           (cint 1) (cint 2))
   in
+  let pointer_alloc =
+    Blorp.Core_emit_blorp_prepared_list.render_alloc_call
+      (Core.list_pointer_storage ())
+      "4L"
+  in
+  let inline_alloc =
+    Blorp.Core_emit_blorp_prepared_list.render_alloc_call
+      (Core.list_inline_storage Core.InlineBytes8)
+      "4L"
+  in
+  let inline_struct_alloc =
+    Blorp.Core_emit_blorp_prepared_list.render_alloc_call
+      (Core.list_inline_struct_storage "Small")
+      "4L"
+  in
+  let release_alloc =
+    Blorp.Core_emit_blorp_prepared_list.render_alloc_with_release
+      ~alloc_expr:"blorp_list_new(4L)" ~result_tmp:"__lst"
+  in
+  let construct_release =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_construct_init_elem_release ctx
+          ~list_tmp:"__lst")
+  in
+  let construct_inline_struct =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_construct_inline_struct_set
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx ~list_tmp:"__lst" ~index:2
+          ~struct_ty:"Small" (cvar "next" small_ty))
+  in
+  let construct_set_len =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_construct_set_len ctx
+          ~list_tmp:"__lst" ~len:3)
+  in
+  let boxed_int =
+    Blorp.Core_codegen_prepare.boxed_storage_value
+      ~reg:(Blorp.Codegen_types.create_registry ())
+      (cint 7)
+  in
+  let construct_append =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_construct_append
+          ~emit_boxed:Blorp.Core_emit.emit_boxed_storage ctx ~list_tmp:"__lst"
+          ~owned:false boxed_int)
+  in
+  let construct_append_owned =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_list.emit_construct_append
+          ~emit_boxed:Blorp.Core_emit.emit_boxed_storage ctx ~list_tmp:"__lst"
+          ~owned:true boxed_int)
+  in
   Alcotest.(check string)
     "inline list get bridge output"
     "({ blorp_List* __lg_list_0 = (blorp_List*)xs; long __lg_idx_1 = 1L; \
@@ -667,9 +810,44 @@ let test_prepared_list_bridge_emits_expected_c () =
      sizeof(Small)); } else { void* __lg_raw_0 = blorp_list_get(__list, \
      __idx); if (!__lg_raw_0) { memset(&__out, 0, sizeof(Small)); } else { \
      __out = blorp_unbox_struct(__lg_raw_0, Small); } }"
-    inline_struct_load
+    inline_struct_load;
+  Alcotest.(check string)
+    "list pointer alloc bridge output" "blorp_list_new(4L)" pointer_alloc;
+  Alcotest.(check string)
+    "list inline alloc bridge output" "blorp_list_new_inline(4L, 8)"
+    inline_alloc;
+  Alcotest.(check string)
+    "list inline struct alloc bridge output"
+    "blorp_list_new_inline(4L, sizeof(Small))" inline_struct_alloc;
+  Alcotest.(check string)
+    "list release alloc bridge output"
+    "({ blorp_List* __lst = blorp_list_new(4L); \
+     blorp_list_init_elem_release(__lst, blorp_elem_release_fn); __lst; })"
+    release_alloc;
+  Alcotest.(check string)
+    "list construct release bridge output"
+    "blorp_list_init_elem_release(__lst, blorp_elem_release_fn);"
+    construct_release;
+  Alcotest.(check string)
+    "list construct inline struct bridge output"
+    "{ Small __lst_elem_0 = next; blorp_list_set_raw_copy(__lst, 2, \
+     &__lst_elem_0); }"
+    construct_inline_struct;
+  Alcotest.(check string)
+    "list construct set len bridge output" "__lst->len = 3;" construct_set_len;
+  Alcotest.(check string)
+    "list construct append bridge output"
+    "__lst = blorp_list_append(__lst, ({ long __box_0 = 7L; \
+     (void*)(long)(__box_0); }));"
+    construct_append;
+  Alcotest.(check string)
+    "list construct append owned bridge output"
+    "__lst = blorp_list_append_owned(__lst, ({ long __box_0 = 7L; \
+     (void*)(long)(__box_0); }));"
+    construct_append_owned
 
 let test_prepared_tensor_bridge_emits_expected_c () =
+  let ty_small = Ast.TyNamed ("Small", []) in
   let raw_view =
     {
       Core.trv_var = Core.Var.named "__raw";
@@ -747,6 +925,92 @@ let test_prepared_tensor_bridge_emits_expected_c () =
           (cvar "values" ty_tensor_float)
           (cint 1))
   in
+  let f64_alloc_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_alloc
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "result" ty_float_vector)
+          (cint 3))
+  in
+  let string_alloc_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_alloc
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx
+          (cvar "result" ty_string_vector)
+          (cint 3))
+  in
+  let fill_f64_alloc_c =
+    Blorp.Core_emit_blorp_prepared_tensor.render_fill_alloc_call
+      (Core.tensor_raw_scalar_storage ~elem_ty:ty_float
+         Core.TensorFloat64Elements)
+      ~first_dim:"rows" ~total_dim:"total" test_loc
+  in
+  let fill_packed_alloc_c =
+    Blorp.Core_emit_blorp_prepared_tensor.render_fill_alloc_call
+      (Core.tensor_packed_storage ~elem_ty:ty_bool Core.InlineBytes1)
+      ~first_dim:"rows" ~total_dim:"total" test_loc
+  in
+  let literal_f64_alloc_c =
+    Blorp.Core_emit_blorp_prepared_tensor.render_literal_alloc_call
+      (Core.tensor_raw_scalar_storage ~elem_ty:ty_float
+         Core.TensorFloat64Elements)
+      (Core.TensorStaticShape [ 2; 3 ])
+  in
+  let literal_packed_vector_alloc_c =
+    Blorp.Core_emit_blorp_prepared_tensor.render_literal_alloc_call
+      (Core.tensor_packed_storage ~elem_ty:ty_bool Core.InlineBytes1)
+      (Core.TensorVectorLength 5)
+  in
+  let literal_inline_struct_alloc_c =
+    Blorp.Core_emit_blorp_prepared_tensor.render_literal_alloc_call
+      (Core.tensor_inline_struct_storage ~elem_ty:ty_small "Small")
+      (Core.TensorStaticShape [ 2; 4 ])
+  in
+  let literal_init_release_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_literal_init_elem_release ctx
+          ~tensor_tmp:"vec")
+  in
+  let literal_f64_write_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_literal_f64_write
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx ~tensor_tmp:"vec" ~index:2
+          (core (Core.CLit (Ast.LitFloat 2.5)) ty_float))
+  in
+  let literal_i64_write_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_literal_i64_write
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx ~tensor_tmp:"vec" ~index:1
+          (cint 42))
+  in
+  let literal_word_write_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_literal_word_write
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx ~tensor_tmp:"vec" ~index:0
+          (cint 7))
+  in
+  let literal_packed_write_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_literal_packed_write
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx ~tensor_tmp:"vec" ~index:3
+          (cint 1))
+  in
+  let literal_inline_struct_write_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_literal_inline_struct_write
+          ~emit_expr:Blorp.Core_emit.emit_expr ctx ~tensor_tmp:"vec" ~index:4
+          ~struct_ty:"Small" (cvar "point" ty_small))
+  in
+  let literal_boxed_write_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_literal_boxed_write_rendered
+          ctx ~tensor_tmp:"vec" ~index:5 ~value_arg:"boxed")
+  in
+  let literal_boxed_retain_c =
+    emit_bridge (fun ctx ->
+        Blorp.Core_emit_blorp_prepared_tensor.emit_literal_boxed_retain ctx
+          "boxed")
+  in
   Alcotest.(check string)
     "tensor raw view bridge output"
     "double* __raw = (double*)((blorp_Vector*)values)->data" view_c;
@@ -806,7 +1070,57 @@ let test_prepared_tensor_bridge_emits_expected_c () =
      __tensor_raw_idx_1 = 1L; float __tensor_raw_2; memcpy(&__tensor_raw_2, \
      (char*)__tensor_raw_vec_0->data + __tensor_raw_idx_1 * sizeof(float), \
      sizeof(float)); __tensor_raw_2; })"
-    f32_raw_get_c
+    f32_raw_get_c;
+  Alcotest.(check string)
+    "tensor f64 alloc bridge output" "blorp_vector_new_f64(3L)" f64_alloc_c;
+  Alcotest.(check string)
+    "tensor string alloc bridge output"
+    "({ blorp_Vector* __tensor_alloc_0 = blorp_vector_new(3L); \
+     blorp_vector_init_elem_release(__tensor_alloc_0, blorp_elem_release_fn); \
+     __tensor_alloc_0; })"
+    string_alloc_c;
+  Alcotest.(check string)
+    "tensor fill f64 alloc bridge output" "blorp_tensor_new_f64(rows, total)"
+    fill_f64_alloc_c;
+  Alcotest.(check string)
+    "tensor fill packed alloc bridge output"
+    "blorp_tensor_new_packed(rows, total, 1)" fill_packed_alloc_c;
+  Alcotest.(check string)
+    "tensor literal f64 alloc bridge output" "blorp_tensor_new_f64(2, 6)"
+    literal_f64_alloc_c;
+  Alcotest.(check string)
+    "tensor literal packed vector alloc bridge output"
+    "blorp_vector_new_packed(5, 1)" literal_packed_vector_alloc_c;
+  Alcotest.(check string)
+    "tensor literal inline struct alloc bridge output"
+    "blorp_tensor_new_sized(2, 8, sizeof(Small))" literal_inline_struct_alloc_c;
+  Alcotest.(check string)
+    "tensor literal init release bridge output"
+    "blorp_vector_init_elem_release(vec, blorp_elem_release_fn);"
+    literal_init_release_c;
+  Alcotest.(check string)
+    "tensor literal f64 write bridge output"
+    "blorp_vector_write_f64(vec, 2, 2.5);" literal_f64_write_c;
+  Alcotest.(check string)
+    "tensor literal i64 write bridge output" "((long*)vec->data)[1] = 42L;"
+    literal_i64_write_c;
+  Alcotest.(check string)
+    "tensor literal word write bridge output"
+    "vec->data[0] = (void*)(intptr_t)(7L);" literal_word_write_c;
+  Alcotest.(check string)
+    "tensor literal packed write bridge output"
+    "blorp_packed_set(vec, 3, (long)(1L));" literal_packed_write_c;
+  Alcotest.(check string)
+    "tensor literal inline struct write bridge output"
+    "{ Small __ten_elem_0 = point; memcpy((char*)vec->data + 4 * \
+     sizeof(Small), &__ten_elem_0, sizeof(Small)); }"
+    literal_inline_struct_write_c;
+  Alcotest.(check string)
+    "tensor literal boxed write bridge output" "vec->data[5] = boxed;"
+    literal_boxed_write_c;
+  Alcotest.(check string)
+    "tensor literal boxed retain bridge output"
+    "if (boxed) blorp_retain(boxed);" literal_boxed_retain_c
 
 let test_compiler_blorp_test_suites () =
   let suite_path = find_project_file compiler_tool_tests_dir_rel in

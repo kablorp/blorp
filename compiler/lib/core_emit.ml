@@ -395,6 +395,11 @@ and global_constant_immortal_plan =
       list_ty : Ast.type_expr;
       list_elem_plan : global_constant_immortal_plan option;
     }
+  | ImmortalDict of {
+      dict_ty : Ast.type_expr;
+      dict_key_plan : global_constant_immortal_plan option;
+      dict_value_plan : global_constant_immortal_plan option;
+    }
 
 and global_constant_record_field_plan = {
   gc_field_name : string;
@@ -429,7 +434,7 @@ type global_constant_storage = DirectTypedStorage | VoidPointerPayload
 let global_constant_unsupported_hint =
   "Use a function to construct this value at runtime, or reduce the constant \
    to supported shapes: strings, heap records, heap unions, tuples, stack \
-   Result payloads, and Lists with supported element types."
+   Result payloads, Lists, and Dicts with supported element types."
 
 let type_param_subst params args =
   let names = Ast.type_param_names params in
@@ -445,6 +450,10 @@ let global_constant_type_string ty = Types.type_to_string (normalize_type ty)
 
 let global_constant_list_element_type = function
   | Ast.TyNamed (("List" | "ParallelList"), [ elem ]) -> Some elem
+  | _ -> None
+
+let global_constant_dict_entry_types = function
+  | Ast.TyNamed ("Dict", [ key; value ]) -> Some (key, value)
   | _ -> None
 
 let managed_container_nested_release (ctx : Core_emit_context.t)
@@ -504,6 +513,7 @@ let global_constant_plan_type = function
   | ImmortalTuple { tuple_ty; _ } -> tuple_ty
   | ImmortalStackResult { result_ty; _ } -> result_ty
   | ImmortalList { list_ty; _ } -> list_ty
+  | ImmortalDict { dict_ty; _ } -> dict_ty
 
 let union_variants_for_type (ctx : Core_emit_context.t) type_name =
   match Hashtbl.find_opt ctx.reg.union_variants type_name with
@@ -549,96 +559,104 @@ let rec build_global_constant_plan (ctx : Core_emit_context.t)
         | Ok list_elem_plan ->
             Ok (ImmortalList { list_ty = ty; list_elem_plan }))
     | None -> (
-        match managed_container_nested_release ctx ty with
-        | Some (Ok false) -> Ok (ImmortalRootOnly ty)
-        | Some (Ok true) ->
-            Error
-              (Printf.sprintf
-                 "%s has unsupported container type `%s` with managed contents"
-                 path
-                 (global_constant_type_string ty))
-        | Some (Error reason) ->
-            Error
-              (Printf.sprintf "could not classify container in %s: %s" path
-                 reason)
+        match global_constant_dict_entry_types ty with
+        | Some (key_ty, value_ty) ->
+            build_dict_plan ctx ~path ~seen:(ty_key :: seen) ty key_ty value_ty
         | None -> (
-            match storage with
-            | VoidPointerPayload when not (is_pointer_type ctx ty) ->
+            match managed_container_nested_release ctx ty with
+            | Some (Ok false) -> Ok (ImmortalRootOnly ty)
+            | Some (Ok true) ->
                 Error
                   (Printf.sprintf
-                     "%s has boxed by-value payload type `%s`; this constant \
-                      layout cannot be traversed safely yet"
+                     "%s has unsupported container type `%s` with managed \
+                      contents"
                      path
                      (global_constant_type_string ty))
-            | DirectTypedStorage | VoidPointerPayload -> (
-                match ty with
-                | ty when is_stack_result_type ctx ty -> (
-                    match (storage, ty) with
-                    | ( DirectTypedStorage,
-                        Ast.TyNamed ("Result", [ ok_ty; err_ty ]) ) ->
-                        build_result_plan ctx ~path ~seen:(ty_key :: seen) ty
-                          ok_ty err_ty
-                    | VoidPointerPayload, _ ->
-                        Error
-                          (Printf.sprintf
-                             "%s has boxed stack Result payload type `%s`; \
-                              this constant layout cannot be traversed safely \
-                              yet"
-                             path
-                             (global_constant_type_string ty))
-                    | DirectTypedStorage, _ ->
-                        Error
-                          (Printf.sprintf
-                             "%s has unsupported Result spelling `%s`" path
-                             (global_constant_type_string ty)))
-                | Ast.TyTuple elems ->
-                    build_tuple_plan ctx ~path ~seen:(ty_key :: seen) ty elems
-                | Ast.TyNamed (type_name, args) -> (
-                    match Hashtbl.find_opt ctx.record_decls type_name with
-                    | Some record_decl when not record_decl.record_is_value ->
-                        build_record_plan ctx ~path ~seen:(ty_key :: seen) ty
-                          record_decl args
-                    | _ -> (
-                        match
-                          Codegen_types.managed_type_info ctx.reg type_name
-                        with
-                        | Some { managed_kind = ManagedUnion; _ } ->
-                            build_union_plan ctx ~path ~seen:(ty_key :: seen) ty
-                              type_name
-                        | Some { managed_kind = ManagedHeapRecord; _ } ->
-                            Error
-                              (Printf.sprintf
-                                 "%s has heap record type `%s` but no record \
-                                  declaration is available for traversal"
-                                 path type_name)
-                        | _ when simple_arc_global_constant_root ty ->
-                            Ok (ImmortalRootOnly ty)
-                        | _ when is_pointer_type ctx ty ->
-                            Error
-                              (Printf.sprintf
-                                 "%s has managed pointer type `%s` without a \
-                                  supported constant traversal contract"
-                                 path
-                                 (global_constant_type_string ty))
-                        | _ ->
-                            Error
-                              (Printf.sprintf
-                                 "%s has unsupported managed type `%s`" path
-                                 (global_constant_type_string ty))))
-                | _ when simple_arc_global_constant_root ty ->
-                    Ok (ImmortalRootOnly ty)
-                | _ when is_pointer_type ctx ty ->
+            | Some (Error reason) ->
+                Error
+                  (Printf.sprintf "could not classify container in %s: %s" path
+                     reason)
+            | None -> (
+                match storage with
+                | VoidPointerPayload when not (is_pointer_type ctx ty) ->
                     Error
                       (Printf.sprintf
-                         "%s has managed pointer type `%s` without a supported \
-                          constant traversal contract"
+                         "%s has boxed by-value payload type `%s`; this \
+                          constant layout cannot be traversed safely yet"
                          path
                          (global_constant_type_string ty))
-                | _ ->
-                    Error
-                      (Printf.sprintf "%s has unsupported managed type `%s`"
-                         path
-                         (global_constant_type_string ty)))))
+                | DirectTypedStorage | VoidPointerPayload -> (
+                    match ty with
+                    | ty when is_stack_result_type ctx ty -> (
+                        match (storage, ty) with
+                        | ( DirectTypedStorage,
+                            Ast.TyNamed ("Result", [ ok_ty; err_ty ]) ) ->
+                            build_result_plan ctx ~path ~seen:(ty_key :: seen)
+                              ty ok_ty err_ty
+                        | VoidPointerPayload, _ ->
+                            Error
+                              (Printf.sprintf
+                                 "%s has boxed stack Result payload type `%s`; \
+                                  this constant layout cannot be traversed \
+                                  safely yet"
+                                 path
+                                 (global_constant_type_string ty))
+                        | DirectTypedStorage, _ ->
+                            Error
+                              (Printf.sprintf
+                                 "%s has unsupported Result spelling `%s`" path
+                                 (global_constant_type_string ty)))
+                    | Ast.TyTuple elems ->
+                        build_tuple_plan ctx ~path ~seen:(ty_key :: seen) ty
+                          elems
+                    | Ast.TyNamed (type_name, args) -> (
+                        match Hashtbl.find_opt ctx.record_decls type_name with
+                        | Some record_decl when not record_decl.record_is_value
+                          ->
+                            build_record_plan ctx ~path ~seen:(ty_key :: seen)
+                              ty record_decl args
+                        | _ -> (
+                            match
+                              Codegen_types.managed_type_info ctx.reg type_name
+                            with
+                            | Some { managed_kind = ManagedUnion; _ } ->
+                                build_union_plan ctx ~path
+                                  ~seen:(ty_key :: seen) ty type_name
+                            | Some { managed_kind = ManagedHeapRecord; _ } ->
+                                Error
+                                  (Printf.sprintf
+                                     "%s has heap record type `%s` but no \
+                                      record declaration is available for \
+                                      traversal"
+                                     path type_name)
+                            | _ when simple_arc_global_constant_root ty ->
+                                Ok (ImmortalRootOnly ty)
+                            | _ when is_pointer_type ctx ty ->
+                                Error
+                                  (Printf.sprintf
+                                     "%s has managed pointer type `%s` without \
+                                      a supported constant traversal contract"
+                                     path
+                                     (global_constant_type_string ty))
+                            | _ ->
+                                Error
+                                  (Printf.sprintf
+                                     "%s has unsupported managed type `%s`" path
+                                     (global_constant_type_string ty))))
+                    | _ when simple_arc_global_constant_root ty ->
+                        Ok (ImmortalRootOnly ty)
+                    | _ when is_pointer_type ctx ty ->
+                        Error
+                          (Printf.sprintf
+                             "%s has managed pointer type `%s` without a \
+                              supported constant traversal contract"
+                             path
+                             (global_constant_type_string ty))
+                    | _ ->
+                        Error
+                          (Printf.sprintf "%s has unsupported managed type `%s`"
+                             path
+                             (global_constant_type_string ty))))))
 
 and build_optional_child_plan ctx ~storage ~path ~seen ty =
   if type_requires_release ctx ty then
@@ -660,6 +678,20 @@ and build_result_plan ctx ~path ~seen result_ty ok_ty err_ty =
       | Error _ as err -> err
       | Ok err_payload ->
           Ok (ImmortalStackResult { result_ty; ok_payload; err_payload }))
+
+and build_dict_plan ctx ~path ~seen dict_ty key_ty value_ty =
+  let build_entry label entry_ty =
+    build_optional_child_plan ctx ~storage:VoidPointerPayload
+      ~path:(path ^ "." ^ label ^ "[]")
+      ~seen entry_ty
+  in
+  match build_entry "key" key_ty with
+  | Error _ as err -> err
+  | Ok dict_key_plan -> (
+      match build_entry "value" value_ty with
+      | Error _ as err -> err
+      | Ok dict_value_plan ->
+          Ok (ImmortalDict { dict_ty; dict_key_plan; dict_value_plan }))
 
 and build_tuple_plan ctx ~path ~seen tuple_ty elems =
   let rec go i = function
@@ -802,6 +834,8 @@ let rec emit_immortalize_plan (ctx : Core_emit_context.t) c_expr plan : unit =
       emit_immortalize_stack_result ctx c_expr ok_payload err_payload
   | ImmortalList { list_elem_plan; _ } ->
       emit_immortalize_list ctx c_expr list_elem_plan
+  | ImmortalDict { dict_key_plan; dict_value_plan; _ } ->
+      emit_immortalize_dict ctx c_expr dict_key_plan dict_value_plan
 
 and emit_immortalize_record ctx c_expr record_fields =
   emit_make_immortal_root ctx c_expr;
@@ -821,6 +855,20 @@ and emit_immortalize_list ctx c_expr elem_plan =
       emit_line ctx
         (Printf.sprintf "blorp_make_immortal_list_constant(%s, %s);" c_expr
            helper)
+
+and emit_immortalize_dict ctx c_expr key_plan value_plan =
+  emit_make_immortal_root ctx c_expr;
+  let helper_or_null = function
+    | None -> "NULL"
+    | Some plan -> global_container_element_immortalizer ctx plan
+  in
+  match (key_plan, value_plan) with
+  | None, None -> ()
+  | _ ->
+      emit_line ctx
+        (Printf.sprintf "blorp_make_immortal_dict_constant(%s, %s, %s);" c_expr
+           (helper_or_null key_plan)
+           (helper_or_null value_plan))
 
 and emit_immortalize_tuple ctx c_expr tuple_elements =
   emit_make_immortal_root ctx c_expr;
@@ -963,6 +1011,12 @@ and prepare_global_constant_immortal_helpers (ctx : Core_emit_context.t)
       | None -> ()
       | Some elem_plan ->
           ignore (global_container_element_immortalizer ctx elem_plan))
+  | ImmortalDict { dict_key_plan; dict_value_plan; _ } ->
+      List.iter
+        (function
+          | None -> ()
+          | Some plan -> ignore (global_container_element_immortalizer ctx plan))
+        [ dict_key_plan; dict_value_plan ]
 
 let emit_global_constant_immortal_init (ctx : Core_emit_context.t)
     (plan : checked_global_constant_immortalization) (v : core_var) : unit =
@@ -1160,16 +1214,6 @@ let emit_void_as_type ctx target_ty emit_source =
       emit_source ();
       emit ctx ")"
 
-let tuple_field_needs_release ctx field =
-  boxed_value_needs_release ctx field.ty field.loc
-
-let tuple_field_needs_retain ctx field =
-  tuple_field_needs_release ctx field
-  &&
-  match field.desc with
-  | CField _ | CUnbox _ | CUnboxTyped _ | CLit (Ast.LitString _) -> true
-  | _ -> false
-
 let dict_value_needs_release ctx dict_ty loc =
   match normalize_type dict_ty with
   | Ast.TyNamed ("Dict", [ _key_ty; value_ty ]) ->
@@ -1357,21 +1401,34 @@ let rec match_scrutinee_needs_release (ctx : Core_emit_context.t) (scrut : core)
 
 (* --- §1. emit_intrinsic ----------------------------------------------------- *)
 
+let render_emitted_fragment (ctx : Core_emit_context.t)
+    (emit_fragment : unit -> unit) : string =
+  let original_output = ctx.output in
+  let fragment_output = Buffer.create 64 in
+  ctx.output <- fragment_output;
+  Fun.protect
+    ~finally:(fun () -> ctx.output <- original_output)
+    (fun () ->
+      emit_fragment ();
+      Buffer.contents fragment_output)
+
+let render_list_alloc_call (ctx : Core_emit_context.t)
+    (layout : list_storage_layout) (emit_cap : unit -> unit) : string =
+  let capacity_arg = render_emitted_fragment ctx emit_cap in
+  Core_emit_blorp_prepared_list.render_alloc_call layout capacity_arg
+
 let emit_list_alloc_call (ctx : Core_emit_context.t)
     (layout : list_storage_layout) (emit_cap : unit -> unit) : unit =
-  match layout.lsl_slots with
-  | ListPointerStorage ->
-      emit ctx "blorp_list_new(";
-      emit_cap ();
-      emit ctx ")"
-  | ListInlineStorage width ->
-      emit ctx "blorp_list_new_inline(";
-      emit_cap ();
-      emit ctx (Printf.sprintf ", %d)" (inline_storage_width_bytes width))
-  | ListInlineStructStorage c_ty ->
-      emit ctx "blorp_list_new_inline(";
-      emit_cap ();
-      emit ctx (Printf.sprintf ", sizeof(%s))" c_ty)
+  let capacity_arg = render_emitted_fragment ctx emit_cap in
+  Core_emit_blorp_prepared_list.emit_alloc_call ctx layout capacity_arg
+
+let emit_list_alloc_with_release (ctx : Core_emit_context.t)
+    (layout : list_storage_layout) ~result_tmp (emit_cap : unit -> unit) : unit
+    =
+  let alloc_expr = render_list_alloc_call ctx layout emit_cap in
+  emit ctx
+    (Core_emit_blorp_prepared_list.render_alloc_with_release ~alloc_expr
+       ~result_tmp)
 
 let list_storage_runtime_args (layout : list_storage_layout) : string * string =
   match layout.lsl_slots with
@@ -1752,29 +1809,26 @@ and emit_list_construct ctx lc =
   | ListInlineStructStorage c_ty ->
       List.iteri
         (fun i value ->
-          let elem_tmp = Printf.sprintf "__lst_elem_%d" (fresh_temp ctx) in
-          emit ctx (Printf.sprintf " { %s %s = " c_ty elem_tmp);
-          emit_expr ctx value.bsv_box.box_value;
-          emit ctx
-            (Printf.sprintf "; blorp_list_set_raw_copy(%s, %d, &%s); }" tmp i
-               elem_tmp))
+          emit ctx " ";
+          Core_emit_blorp_prepared_list.emit_construct_inline_struct_set
+            ~emit_expr ctx ~list_tmp:tmp ~index:i ~struct_ty:c_ty
+            value.bsv_box.box_value)
         lc.lc_elems;
-      emit ctx (Printf.sprintf " %s->len = %d;" tmp (List.length lc.lc_elems))
+      emit ctx " ";
+      Core_emit_blorp_prepared_list.emit_construct_set_len ctx ~list_tmp:tmp
+        ~len:(List.length lc.lc_elems)
   | ListPointerStorage | ListInlineStorage _ ->
-      if lc.lc_elem_needs_release then
-        emit ctx
-          (Printf.sprintf
-             " blorp_list_init_elem_release(%s, blorp_elem_release_fn);" tmp);
+      if lc.lc_elem_needs_release then (
+        emit ctx " ";
+        Core_emit_blorp_prepared_list.emit_construct_init_elem_release ctx
+          ~list_tmp:tmp);
       List.iter
         (fun value ->
-          let append_fn =
-            if lc.lc_elem_needs_release && value.bsv_transfers_ownership then
-              "blorp_list_append_owned"
-            else "blorp_list_append"
-          in
-          emit ctx (Printf.sprintf " %s = %s(%s, " tmp append_fn tmp);
-          emit_boxed_storage ctx value;
-          emit ctx ");")
+          emit ctx " ";
+          Core_emit_blorp_prepared_list.emit_construct_append
+            ~emit_boxed:emit_boxed_storage ctx ~list_tmp:tmp
+            ~owned:(lc.lc_elem_needs_release && value.bsv_transfers_ownership)
+            value)
         lc.lc_elems);
   emit ctx (Printf.sprintf " %s; })" tmp)
 
@@ -1809,117 +1863,62 @@ and emit_tensor_literal ctx loc tl =
       "tensor literal layout `%s` does not match payload storage `%s`" expected
       actual
   else ();
-  let vector_ctor, tensor_ctor =
-    match tl.tl_layout.tsl_slots with
-    | TensorRawScalarStorage TensorFloat32Elements ->
-        ("blorp_vector_new_f32", "blorp_tensor_new_f32")
-    | TensorRawScalarStorage TensorFloat64Elements ->
-        ("blorp_vector_new_f64", "blorp_tensor_new_f64")
-    | TensorRawScalarStorage TensorInt64Elements ->
-        ("blorp_vector_new_i64", "blorp_tensor_new_i64")
-    | TensorWordStorage -> ("blorp_vector_new", "blorp_tensor_new")
-    | TensorPackedStorage _ ->
-        ("blorp_vector_new_packed", "blorp_tensor_new_packed")
-    | TensorInlineStructStorage _ ->
-        ("blorp_vector_new_sized", "blorp_tensor_new_sized")
-    | TensorBoxedStorage -> ("blorp_vector_new", "blorp_tensor_new")
-  in
-  let packed_width_arg = function
-    | InlineBytes1 -> "1"
-    | InlineBytes2 -> "2"
-    | InlineBytes4 -> "4"
-    | InlineBytes8 -> "8"
-  in
-  let ctor, first_dim, total =
-    match tl.tl_shape with
-    | TensorStaticShape (first :: _ as dims) ->
-        (tensor_ctor, first, List.fold_left ( * ) 1 dims)
-    | TensorStaticShape [] -> (vector_ctor, 0, 0)
-    | TensorVectorLength n -> (vector_ctor, n, n)
-  in
   let tmp = Printf.sprintf "__ten_%d" (fresh_temp ctx) in
-  (match tl.tl_shape with
-  | TensorStaticShape (_ :: _) -> (
-      match tl.tl_layout.tsl_slots with
-      | TensorPackedStorage width ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %d, %s);" tmp ctor
-               first_dim total (packed_width_arg width))
-      | TensorInlineStructStorage c_ty ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %d, sizeof(%s));" tmp
-               ctor first_dim total c_ty)
-      | _ ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %d);" tmp ctor
-               first_dim total))
-  | TensorStaticShape [] | TensorVectorLength _ -> (
-      match tl.tl_layout.tsl_slots with
-      | TensorPackedStorage width ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %s);" tmp ctor
-               first_dim (packed_width_arg width))
-      | TensorInlineStructStorage c_ty ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, sizeof(%s));" tmp ctor
-               first_dim c_ty)
-      | _ ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d);" tmp ctor first_dim)));
+  let alloc_call =
+    Core_emit_blorp_prepared_tensor.render_literal_alloc_call tl.tl_layout
+      tl.tl_shape
+  in
+  emit ctx (Printf.sprintf "({ blorp_Vector* %s = %s;" tmp alloc_call);
   let elem_needs_release =
     tensor_storage_layout_requires_release_or_error ~phase:Core_error.Emit ~loc
       tl.tl_layout
   in
-  if elem_needs_release then
-    emit ctx
-      (Printf.sprintf
-         " blorp_vector_init_elem_release(%s, blorp_elem_release_fn);" tmp);
+  if elem_needs_release then (
+    emit ctx " ";
+    Core_emit_blorp_prepared_tensor.emit_literal_init_elem_release ctx
+      ~tensor_tmp:tmp);
   (match tl.tl_payload with
   | TensorRawElements (TensorFloat32Elements, elems) ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " ((float*)%s->data)[%d] = " tmp i);
-          emit_expr ctx el;
-          emit ctx ";")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_f32_write ~emit_expr ctx
+            ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorRawElements (TensorFloat64Elements, elems) ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " blorp_vector_write_f64(%s, %d, " tmp i);
-          emit_expr ctx el;
-          emit ctx ");")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_f64_write ~emit_expr ctx
+            ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorRawElements (TensorInt64Elements, elems) ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " ((long*)%s->data)[%d] = " tmp i);
-          emit_expr ctx el;
-          emit ctx ";")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_i64_write ~emit_expr ctx
+            ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorWordElements elems ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " %s->data[%d] = (void*)(intptr_t)(" tmp i);
-          emit_expr ctx el;
-          emit ctx ");")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_word_write ~emit_expr ctx
+            ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorPackedElements (_, elems) ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " blorp_packed_set(%s, %d, (long)(" tmp i);
-          emit_expr ctx el;
-          emit ctx "));")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_packed_write ~emit_expr
+            ctx ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorInlineStructElements (c_ty, elems) ->
       List.iteri
         (fun i el ->
-          let elem_tmp = Printf.sprintf "__ten_elem_%d" (fresh_temp ctx) in
-          emit ctx (Printf.sprintf " { %s %s = " c_ty elem_tmp);
-          emit_expr ctx el;
-          emit ctx
-            (Printf.sprintf
-               "; memcpy((char*)%s->data + %d * sizeof(%s), &%s, sizeof(%s)); }"
-               tmp i c_ty elem_tmp c_ty))
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_inline_struct_write
+            ~emit_expr ctx ~tensor_tmp:tmp ~index:i ~struct_ty:c_ty el)
         elems
   | TensorBoxedElements elems ->
       List.iteri
@@ -1928,15 +1927,18 @@ and emit_tensor_literal ctx loc tl =
             let elem_tmp = Printf.sprintf "__elem_%d" (fresh_temp ctx) in
             emit ctx (Printf.sprintf " void* %s = " elem_tmp);
             emit_boxed_storage ctx value;
-            emit ctx (Printf.sprintf "; %s->data[%d] = %s;" tmp i elem_tmp);
-            if not value.bsv_transfers_ownership then
-              emit ctx
-                (Printf.sprintf " if (%s) blorp_retain(%s);" elem_tmp elem_tmp)
+            emit ctx "; ";
+            Core_emit_blorp_prepared_tensor.emit_literal_boxed_write_rendered
+              ctx ~tensor_tmp:tmp ~index:i ~value_arg:elem_tmp;
+            if not value.bsv_transfers_ownership then (
+              emit ctx " ";
+              Core_emit_blorp_prepared_tensor.emit_literal_boxed_retain ctx
+                elem_tmp)
           end
           else begin
-            emit ctx (Printf.sprintf " %s->data[%d] = " tmp i);
-            emit_boxed_storage ctx value;
-            emit ctx ";"
+            emit ctx " ";
+            Core_emit_blorp_prepared_tensor.emit_literal_boxed_write
+              ~emit_boxed:emit_boxed_storage ctx ~tensor_tmp:tmp ~index:i value
           end)
         elems);
   emit ctx (Printf.sprintf " %s; })" tmp)
@@ -1953,36 +1955,6 @@ and emit_tensor_fill_total_expr ctx dim_tmps =
         emit ctx ")"
   in
   emit_product dim_tmps
-
-and emit_tensor_fill_alloc_call ctx loc layout first_dim total_dim =
-  match layout.tsl_slots with
-  | TensorRawScalarStorage TensorInt64Elements ->
-      emit ctx "blorp_tensor_new_i64(";
-      emit ctx first_dim;
-      emit ctx ", ";
-      emit ctx total_dim;
-      emit ctx ")"
-  | TensorRawScalarStorage TensorFloat64Elements ->
-      emit ctx "blorp_tensor_new_f64(";
-      emit ctx first_dim;
-      emit ctx ", ";
-      emit ctx total_dim;
-      emit ctx ")"
-  | TensorRawScalarStorage TensorFloat32Elements ->
-      emit ctx "blorp_tensor_new_f32(";
-      emit ctx first_dim;
-      emit ctx ", ";
-      emit ctx total_dim;
-      emit ctx ")"
-  | TensorPackedStorage width ->
-      emit ctx "blorp_tensor_new_packed(";
-      emit ctx first_dim;
-      emit ctx ", ";
-      emit ctx total_dim;
-      emit ctx (Printf.sprintf ", %d)" (inline_storage_width_bytes width))
-  | _ ->
-      Core_error.errorf Core_error.Emit loc
-        "unsupported tensor fill allocation layout"
 
 and emit_tensor_fill_factory ctx loc ty value dims =
   let layout =
@@ -2062,8 +2034,8 @@ and emit_tensor_fill_factory ctx loc ty value dims =
           emit_expr ctx value;
           emit ctx "; ";
           emit ctx (Printf.sprintf "blorp_Vector* %s = " vec_tmp);
-          emit_tensor_fill_alloc_call ctx loc layout (List.hd dim_tmps)
-            total_tmp;
+          Core_emit_blorp_prepared_tensor.emit_fill_alloc_call ctx loc layout
+            ~first_dim:(List.hd dim_tmps) ~total_dim:total_tmp;
           emit ctx "; ";
           emit_store ();
           emit ctx (Printf.sprintf " %s; })" vec_tmp))
@@ -2932,12 +2904,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
       in
       if list_element_needs_release ctx e.ty e.loc then begin
         let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-        emit ctx (Printf.sprintf "({ blorp_List* %s = " tmp);
-        emit_list_alloc_call ctx layout (fun () -> emit_expr ctx cap);
-        emit ctx
-          (Printf.sprintf
-             "; blorp_list_init_elem_release(%s, blorp_elem_release_fn); %s; })"
-             tmp tmp)
+        emit_list_alloc_with_release ctx layout ~result_tmp:tmp (fun () ->
+            emit_expr ctx cap)
       end
       else emit_list_alloc_call ctx layout (fun () -> emit_expr ctx cap)
   | CCall (CKBuiltin "blorp_channel_new", _, [ cap ])
@@ -4634,98 +4602,27 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
   (* ---- Allocating: tuple / list ---- *)
   | CTupleConstruct tc -> emit_tuple_construct ctx tc
   | CListConstruct lc -> emit_list_construct ctx lc
-  | CTuple elems ->
-      let release_mask =
-        List.mapi
-          (fun i el -> if tuple_field_needs_release ctx el then 1 lsl i else 0)
-          elems
-        |> List.fold_left ( lor ) 0
-      in
-      if release_mask = 0 then begin
-        emit ctx (Printf.sprintf "blorp_tuple_new(%d" (List.length elems));
-        List.iter
-          (fun el ->
-            emit ctx ", ";
-            emit_boxed ctx el)
-          elems;
-        emit ctx ")"
-      end
-      else begin
-        let tmp = Printf.sprintf "__tup_%d" (fresh_temp ctx) in
-        emit ctx
-          (Printf.sprintf "({ blorp_Tuple* %s = blorp_tuple_new(%d" tmp
-             (List.length elems));
-        List.iter
-          (fun el ->
-            emit ctx ", ";
-            emit_boxed ctx el)
-          elems;
-        emit ctx ");";
-        List.iteri
-          (fun i el ->
-            if tuple_field_needs_retain ctx el then
-              emit ctx
-                (Printf.sprintf " if (%s->elem[%d]) blorp_retain(%s->elem[%d]);"
-                   tmp i tmp i))
-          elems;
-        emit ctx
-          (Printf.sprintf " blorp_tuple_set_rc(%s, %dUL); %s; })" tmp
-             release_mask tmp)
-      end
-  | CList lit ->
-      let elems = lit.ll_elems in
-      let n = List.length elems in
-      let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_List* %s = " tmp);
-      emit_list_alloc_call ctx lit.ll_layout (fun () ->
-          emit ctx (string_of_int n));
-      emit ctx ";";
-      (match lit.ll_layout.lsl_slots with
-      | ListInlineStructStorage c_ty ->
-          List.iteri
-            (fun i el ->
-              let elem_tmp = Printf.sprintf "__lst_elem_%d" (fresh_temp ctx) in
-              emit ctx (Printf.sprintf " { %s %s = " c_ty elem_tmp);
-              emit_expr ctx el;
-              emit ctx
-                (Printf.sprintf "; blorp_list_set_raw_copy(%s, %d, &%s); }" tmp
-                   i elem_tmp))
-            elems;
-          emit ctx (Printf.sprintf " %s->len = %d;" tmp n)
-      | ListPointerStorage | ListInlineStorage _ ->
-          let elem_needs_release =
-            list_storage_layout_requires_release_or_error ~phase:Core_error.Emit
-              ~loc:e.loc lit.ll_layout
-          in
-          if elem_needs_release then
-            emit ctx
-              (Printf.sprintf
-                 " blorp_list_init_elem_release(%s, blorp_elem_release_fn);" tmp);
-          List.iter
-            (fun el ->
-              let append_fn =
-                if elem_needs_release && boxed_expr_transfers_ownership ctx el
-                then "blorp_list_append_owned"
-                else "blorp_list_append"
-              in
-              emit ctx (Printf.sprintf " %s = %s(%s, " tmp append_fn tmp);
-              emit_boxed ctx el;
-              emit ctx ");")
-            elems);
-      emit ctx (Printf.sprintf " %s; })" tmp)
+  | CTuple _ ->
+      Core_error.errorf Core_error.Emit e.loc
+        ~hint:
+          "Core_codegen_prepare should rewrite CTuple into CTupleConstruct, \
+           which carries explicit boxed storage and release-mask decisions."
+        "unprepared CTuple reached emission"
+  | CList _ ->
+      Core_error.errorf Core_error.Emit e.loc
+        ~hint:
+          "Core_codegen_prepare should rewrite CList into CListConstruct, \
+           which carries explicit list storage layout and element ownership \
+           decisions."
+        "unprepared CList reached emission"
   | CListAlloc alloc ->
       if
         list_storage_layout_requires_release_or_error ~phase:Core_error.Emit
           ~loc:e.loc alloc.la_layout
       then begin
         let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-        emit ctx (Printf.sprintf "({ blorp_List* %s = " tmp);
-        emit_list_alloc_call ctx alloc.la_layout (fun () ->
-            emit_expr ctx alloc.la_capacity);
-        emit ctx
-          (Printf.sprintf
-             "; blorp_list_init_elem_release(%s, blorp_elem_release_fn); %s; })"
-             tmp tmp)
+        emit_list_alloc_with_release ctx alloc.la_layout ~result_tmp:tmp
+          (fun () -> emit_expr ctx alloc.la_capacity)
       end
       else
         emit_list_alloc_call ctx alloc.la_layout (fun () ->
@@ -4763,13 +4660,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           in
           if list_element_needs_release ctx e.ty e.loc then begin
             let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-            emit ctx (Printf.sprintf "({ blorp_List* %s = " tmp);
-            emit_list_alloc_call ctx layout (fun () -> emit ctx "0");
-            emit ctx
-              (Printf.sprintf
-                 "; blorp_list_init_elem_release(%s, blorp_elem_release_fn); \
-                  %s; })"
-                 tmp tmp)
+            emit_list_alloc_with_release ctx layout ~result_tmp:tmp (fun () ->
+                emit ctx "0")
           end
           else emit_list_alloc_call ctx layout (fun () -> emit ctx "0")
       | ty, _ ->
@@ -4895,153 +4787,13 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           emit ctx ");")
         kvs;
       emit ctx (Printf.sprintf " %s; })" tmp)
-  | CVector elems -> (
-      (* Multi-dimensional tensor literal (e.g. {{1,2,3},{4,5,6}} typed
-         as Int[#2, #3]) must flatten into row-major storage so
-         subscript peeling ([blorp_tensor_slice_row]) reads the right
-         bytes. A naive per-level [blorp_vector_new] produces a
-         vector-of-vectors whose outer [data[i]] holds a pointer to an
-         inner vector — incompatible with flat-storage peel/set
-         primitives. Detect T[d0, d1, ...] types and flatten. *)
-      let tensor_ty =
-        match tensor_type_of_expr ctx e with
-        | Some tensor_ty -> tensor_ty
-        | None ->
-            Core_error.errorf Core_error.Emit e.loc
-              ~hint:
-                "CVector nodes should only reach emission with a tensor, \
-                 vector, or matrix semantic type carrying at least one \
-                 dimension"
-              "CVector emission requires a ranked tensor type, got %s"
-              (Types.type_to_string e.ty)
-      in
-      let elem_ty = tensor_ty.elem_ty in
-      let is_float32_literal =
-        match elem_ty with Ast.TyNamed ("Float32", _) -> true | _ -> false
-      in
-      let is_float64_literal =
-        match elem_ty with Ast.TyNamed ("Float", _) -> true | _ -> false
-      in
-      let is_i64_literal =
-        match elem_ty with Ast.TyNamed ("Int", _) -> true | _ -> false
-      in
-      let elem_needs_release = boxed_value_needs_release ctx elem_ty e.loc in
-      let tensor_dims =
-        match tensor_ty.dims with
-        | dims when List.length dims >= 2 ->
-            (* Require all dims to be constant for flat allocation. *)
-            let all_const =
-              List.for_all
-                (function Ast.TyConstInt _ -> true | _ -> false)
-                dims
-            in
-            if all_const then
-              Some (List.map (function Ast.TyConstInt n -> n | _ -> 0) dims)
-            else None
-        | _ -> None
-      in
-      match tensor_dims with
-      | Some dims ->
-          (* Flatten nested CVectors in row-major order. Inner elements
-              are scalars (or nested CVectors one level deep per dim). *)
-          let first_dim = List.hd dims in
-          let total = List.fold_left ( * ) 1 dims in
-          let rec collect_leaves acc e =
-            match e.desc with
-            | CVector inner -> List.fold_left collect_leaves acc inner
-            | _ -> e :: acc
-          in
-          let flat = List.rev (List.fold_left collect_leaves [] elems) in
-          let tmp = Printf.sprintf "__ten_%d" (fresh_temp ctx) in
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %d);" tmp
-               (if is_i64_literal then "blorp_tensor_new_i64"
-                else if is_float64_literal then "blorp_tensor_new_f64"
-                else if is_float32_literal then "blorp_tensor_new_f32"
-                else "blorp_tensor_new")
-               first_dim total);
-          if elem_needs_release then
-            emit ctx
-              (Printf.sprintf
-                 " blorp_vector_init_elem_release(%s, blorp_elem_release_fn);"
-                 tmp);
-          List.iteri
-            (fun i el ->
-              if is_i64_literal then begin
-                emit ctx (Printf.sprintf " ((long*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if is_float64_literal then begin
-                emit ctx (Printf.sprintf " ((double*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if is_float32_literal then begin
-                emit ctx (Printf.sprintf " ((float*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if elem_needs_release then begin
-                let elem_tmp = Printf.sprintf "__elem_%d" (fresh_temp ctx) in
-                emit ctx (Printf.sprintf " void* %s = " elem_tmp);
-                emit_boxed ctx el;
-                emit ctx (Printf.sprintf "; %s->data[%d] = %s;" tmp i elem_tmp);
-                if not (boxed_expr_transfers_ownership ctx el) then
-                  emit ctx
-                    (Printf.sprintf " if (%s) blorp_retain(%s);" elem_tmp
-                       elem_tmp)
-              end
-              else begin
-                emit ctx (Printf.sprintf " %s->data[%d] = " tmp i);
-                emit_boxed ctx el
-              end;
-              emit ctx ";")
-            flat;
-          emit ctx (Printf.sprintf " %s; })" tmp)
-      | None ->
-          let n = List.length elems in
-          let tmp = Printf.sprintf "__vec_%d" (fresh_temp ctx) in
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d);" tmp
-               (if is_i64_literal then "blorp_vector_new_i64"
-                else if is_float64_literal then "blorp_vector_new_f64"
-                else if is_float32_literal then "blorp_vector_new_f32"
-                else "blorp_vector_new")
-               n);
-          if elem_needs_release then
-            emit ctx
-              (Printf.sprintf
-                 " blorp_vector_init_elem_release(%s, blorp_elem_release_fn);"
-                 tmp);
-          List.iteri
-            (fun i el ->
-              if is_i64_literal then begin
-                emit ctx (Printf.sprintf " ((long*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if is_float64_literal then begin
-                emit ctx (Printf.sprintf " ((double*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if is_float32_literal then begin
-                emit ctx (Printf.sprintf " ((float*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if elem_needs_release then begin
-                let elem_tmp = Printf.sprintf "__elem_%d" (fresh_temp ctx) in
-                emit ctx (Printf.sprintf " void* %s = " elem_tmp);
-                emit_boxed ctx el;
-                emit ctx (Printf.sprintf "; %s->data[%d] = %s;" tmp i elem_tmp);
-                if not (boxed_expr_transfers_ownership ctx el) then
-                  emit ctx
-                    (Printf.sprintf " if (%s) blorp_retain(%s);" elem_tmp
-                       elem_tmp)
-              end
-              else begin
-                emit ctx (Printf.sprintf " %s->data[%d] = " tmp i);
-                emit_boxed ctx el
-              end;
-              emit ctx ";")
-            elems;
-          emit ctx (Printf.sprintf " %s; })" tmp))
+  | CVector _ ->
+      Core_error.errorf Core_error.Emit e.loc
+        ~hint:
+          "Core_codegen_prepare should rewrite CVector into CTensorLiteral, \
+           which carries the explicit tensor shape, storage layout, and \
+           payload representation required by emission."
+        "unprepared CVector reached emission"
   | CRecordUpdate _ ->
       (* Phase 2.4: Core_desugar.desugar_record_update rewrites every
          record update (value or heap) into CLet + CRecord. Reaching

@@ -16,6 +16,18 @@ let manifest =
 let render_arg = Core_emit_blorp_template.render_arg
 let emit_template = Core_emit_blorp_template.emit manifest
 
+let emit_find_byte_from ~emit_expr (ctx : Core_emit_context.t) source byte start
+    : unit =
+  let id = fresh_temp ctx in
+  let source_tmp = Printf.sprintf "__string_find_src_%d" id in
+  let byte_tmp = Printf.sprintf "__string_find_byte_%d" id in
+  let start_tmp = Printf.sprintf "__string_find_start_%d" id in
+  let source_arg = render_arg ~emit_expr ctx source in
+  let byte_arg = render_arg ~emit_expr ctx byte in
+  let start_arg = render_arg ~emit_expr ctx start in
+  emit_template ctx "string_find_byte_from"
+    [ source_arg; byte_arg; start_arg; source_tmp; byte_tmp; start_tmp ]
+
 let emit_byte_read ~emit_expr (ctx : Core_emit_context.t)
     (read : string_byte_read) : unit =
   let source_arg = render_arg ~emit_expr ctx read.sbr_source in
@@ -29,19 +41,19 @@ let emit_byte_write ~emit_expr (ctx : Core_emit_context.t)
   let byte_arg = render_arg ~emit_expr ctx write.sbw_byte in
   emit_template ctx "string_byte_write" [ target_arg; index_arg; byte_arg ]
 
-let emit_byte_copy ~emit_expr (ctx : Core_emit_context.t)
-    (copy : string_byte_copy) : unit =
+let emit_byte_copy_intrinsic ~emit_expr (ctx : Core_emit_context.t) dst dst_pos
+    src src_pos len : unit =
   let id = fresh_temp ctx in
   let dst_tmp = Printf.sprintf "__string_copy_dst_%d" id in
   let dst_pos_tmp = Printf.sprintf "__string_copy_dst_pos_%d" id in
   let src_tmp = Printf.sprintf "__string_copy_src_%d" id in
   let src_pos_tmp = Printf.sprintf "__string_copy_src_pos_%d" id in
   let len_tmp = Printf.sprintf "__string_copy_len_%d" id in
-  let dst_arg = render_arg ~emit_expr ctx copy.sbc_dst in
-  let dst_pos_arg = render_arg ~emit_expr ctx copy.sbc_dst_pos in
-  let src_arg = render_arg ~emit_expr ctx copy.sbc_src in
-  let src_pos_arg = render_arg ~emit_expr ctx copy.sbc_src_pos in
-  let len_arg = render_arg ~emit_expr ctx copy.sbc_len in
+  let dst_arg = render_arg ~emit_expr ctx dst in
+  let dst_pos_arg = render_arg ~emit_expr ctx dst_pos in
+  let src_arg = render_arg ~emit_expr ctx src in
+  let src_pos_arg = render_arg ~emit_expr ctx src_pos in
+  let len_arg = render_arg ~emit_expr ctx len in
   emit_template ctx "string_byte_copy"
     [
       dst_arg;
@@ -56,8 +68,17 @@ let emit_byte_copy ~emit_expr (ctx : Core_emit_context.t)
       len_tmp;
     ]
 
+let emit_byte_copy ~emit_expr (ctx : Core_emit_context.t)
+    (copy : string_byte_copy) : unit =
+  emit_byte_copy_intrinsic ~emit_expr ctx copy.sbc_dst copy.sbc_dst_pos
+    copy.sbc_src copy.sbc_src_pos copy.sbc_len
+
+let emit_set_len_intrinsic ~emit_expr (ctx : Core_emit_context.t) target len :
+    unit =
+  let target_arg = render_arg ~emit_expr ctx target in
+  let len_arg = render_arg ~emit_expr ctx len in
+  emit_template ctx "string_set_len" [ target_arg; len_arg; "__sl"; "__sn" ]
+
 let emit_set_len ~emit_expr (ctx : Core_emit_context.t)
     (set_len : string_set_len) : unit =
-  let target_arg = render_arg ~emit_expr ctx set_len.ssl_target in
-  let len_arg = render_arg ~emit_expr ctx set_len.ssl_len in
-  emit_template ctx "string_set_len" [ target_arg; len_arg; "__sl"; "__sn" ]
+  emit_set_len_intrinsic ~emit_expr ctx set_len.ssl_target set_len.ssl_len

@@ -23,55 +23,8 @@
     one indirect call per sub-expr. *)
 
 open Core
-open Core_emit_context
 open Core_emit_util
 module List_emit = Core_emit_list_intrinsic
-
-let emit_tensor_alloc_ctor ~emit_expr ctx (layout : tensor_storage_layout) size
-    =
-  let emit_size () = emit_expr ctx size in
-  match layout.tsl_slots with
-  | TensorRawScalarStorage TensorInt64Elements ->
-      emit ctx "blorp_vector_new_i64(";
-      emit_size ();
-      emit ctx ")"
-  | TensorRawScalarStorage TensorFloat64Elements ->
-      emit ctx "blorp_vector_new_f64(";
-      emit_size ();
-      emit ctx ")"
-  | TensorRawScalarStorage TensorFloat32Elements ->
-      emit ctx "blorp_vector_new_f32(";
-      emit_size ();
-      emit ctx ")"
-  | TensorPackedStorage width ->
-      emit ctx "blorp_vector_new_packed(";
-      emit_size ();
-      emit ctx (Printf.sprintf ", %d)" (Core.inline_storage_width_bytes width))
-  | TensorInlineStructStorage c_ty ->
-      emit ctx "blorp_vector_new_sized(";
-      emit_size ();
-      emit ctx (Printf.sprintf ", sizeof(%s))" c_ty)
-  | TensorWordStorage | TensorBoxedStorage ->
-      emit ctx "blorp_vector_new(";
-      emit_size ();
-      emit ctx ")"
-
-let emit_tensor_alloc ~emit_expr ctx e size =
-  let layout =
-    Core_layout_type.tensor_storage_layout_of_type ~reg:ctx.reg e.ty e.loc
-  in
-  if
-    tensor_storage_layout_requires_release_or_error ~phase:Core_error.Emit
-      ~loc:e.loc layout
-  then (
-    let tmp = Printf.sprintf "__tensor_alloc_%d" (fresh_temp ctx) in
-    emit ctx (Printf.sprintf "({ blorp_Vector* %s = " tmp);
-    emit_tensor_alloc_ctor ~emit_expr ctx layout size;
-    emit ctx
-      (Printf.sprintf
-         "; blorp_vector_init_elem_release(%s, blorp_elem_release_fn); %s; })"
-         tmp tmp))
-  else emit_tensor_alloc_ctor ~emit_expr ctx layout size
 
 let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
     ~(emit_stmt : Core_emit_context.t -> core -> unit)
@@ -150,82 +103,19 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
   (* ---- String primitives ---- *)
   | "string_find_byte_from", [ s; byte; start ] ->
       (* Find a byte via memchr. Returns -1 for not found or invalid start. *)
-      let id = fresh_temp ctx in
-      let s_tmp = Printf.sprintf "__string_find_src_%d" id in
-      let byte_tmp = Printf.sprintf "__string_find_byte_%d" id in
-      let start_tmp = Printf.sprintf "__string_find_start_%d" id in
-      emit ctx (Printf.sprintf "({ blorp_String* %s = (blorp_String*)" s_tmp);
-      emit_expr ctx s;
-      emit ctx (Printf.sprintf "; long %s = " byte_tmp);
-      emit_expr ctx byte;
-      emit ctx (Printf.sprintf "; long %s = " start_tmp);
-      emit_expr ctx start;
-      emit ctx
-        (Printf.sprintf "; blorp_string_find_byte_from(%s, %s, %s); })" s_tmp
-           byte_tmp start_tmp)
+      Core_emit_blorp_prepared_string.emit_find_byte_from ~emit_expr ctx s byte
+        start
   | "string_copy_bytes", [ dst; dst_pos; src; src_pos; len ] ->
-      (* Bulk byte copy. Callers prove bounds, nonnegative length, and
-         non-overlap before constructing this intrinsic; zero-length copies are
-         skipped. *)
-      let id = fresh_temp ctx in
-      let dst_tmp = Printf.sprintf "__string_copy_dst_%d" id in
-      let dst_pos_tmp = Printf.sprintf "__string_copy_dst_pos_%d" id in
-      let src_tmp = Printf.sprintf "__string_copy_src_%d" id in
-      let src_pos_tmp = Printf.sprintf "__string_copy_src_pos_%d" id in
-      let len_tmp = Printf.sprintf "__string_copy_len_%d" id in
-      emit ctx (Printf.sprintf "({ blorp_String* %s = (blorp_String*)" dst_tmp);
-      emit_expr ctx dst;
-      emit ctx (Printf.sprintf "; long %s = " dst_pos_tmp);
-      emit_expr ctx dst_pos;
-      emit ctx (Printf.sprintf "; blorp_String* %s = (blorp_String*)" src_tmp);
-      emit_expr ctx src;
-      emit ctx (Printf.sprintf "; long %s = " src_pos_tmp);
-      emit_expr ctx src_pos;
-      emit ctx (Printf.sprintf "; long %s = " len_tmp);
-      emit_expr ctx len;
-      emit ctx
-        (Printf.sprintf
-           "; if (%s > 0) { memcpy(%s->data + %s, %s->data + %s, (size_t)%s); \
-            } (void)0; })"
-           len_tmp dst_tmp dst_pos_tmp src_tmp src_pos_tmp len_tmp)
+      (* Raw final Core should normally be rewritten to CStringByteCopy by
+         Core_codegen_prepare; this arm keeps the registry/emitter contract
+         total and delegates the fallback shape to the Blorp renderer. *)
+      Core_emit_blorp_prepared_string.emit_byte_copy_intrinsic ~emit_expr ctx
+        dst dst_pos src src_pos len
   | "string_set_len", [ s; n ] ->
-      (* s->len = n; s->data[n] = '\0' (null-terminate) *)
-      emit ctx "({ blorp_String* __sl = (blorp_String*)";
-      emit_expr ctx s;
-      emit ctx "; long __sn = ";
-      emit_expr ctx n;
-      emit ctx "; __sl->len = __sn; __sl->data[__sn] = '\\0'; (void)0; })"
-  (* ---- Set primitives ---- *)
-  | "set_retain_key_for", [ s; key ] ->
-      emit ctx "({ blorp_Set* __rts = (blorp_Set*)";
-      emit_expr ctx s;
-      emit ctx "; void* __rtk = (void*)";
-      emit_expr ctx key;
-      emit ctx
-        "; if (__rts->key_release && __rtk) blorp_retain(__rtk); (void)0; })"
-  (* ---- Dict primitives ---- *)
-  | "dict_retain_key_for", [ d; key ] ->
-      emit ctx "({ blorp_Dict* __rtd = (blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx "; void* __rtk = (void*)";
-      emit_expr ctx key;
-      emit ctx
-        "; if (__rtd->key_release && __rtk) blorp_retain(__rtk); (void)0; })"
-  | "dict_retain_value_for", [ d; value ] ->
-      emit ctx "({ blorp_Dict* __rtd = (blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx "; void* __rtv = (void*)";
-      emit_expr ctx value;
-      emit ctx
-        "; if (__rtd->value_release && __rtv) blorp_retain(__rtv); (void)0; })"
-  | "dict_release_value_for", [ d; value ] ->
-      emit ctx "({ blorp_Dict* __rtd = (blorp_Dict*)";
-      emit_expr ctx d;
-      emit ctx "; void* __rv = (void*)";
-      emit_expr ctx value;
-      emit ctx
-        "; if (__rtd->value_release && __rv) __rtd->value_release(__rv); \
-         (void)0; })"
+      (* Raw final Core should normally be rewritten to CStringSetLen by
+         Core_codegen_prepare; this arm keeps the registry/emitter contract
+         total and delegates the fallback shape to the Blorp renderer. *)
+      Core_emit_blorp_prepared_string.emit_set_len_intrinsic ~emit_expr ctx s n
   (* ---- Tensor/Vector primitives ---- *)
   | "tensor_is_word_storage", [ t ] ->
       Core_emit_blorp_prepared_tensor.emit_word_storage_check ~emit_expr ctx t
@@ -252,7 +142,8 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
   | "tensor_get_f32_raw_unchecked", [ t; idx ] ->
       Core_emit_blorp_prepared_tensor.emit_f32_raw_get_unchecked ~emit_expr ctx
         t idx
-  | "tensor_alloc", [ size ] -> emit_tensor_alloc ~emit_expr ctx e size
+  | "tensor_alloc", [ size ] ->
+      Core_emit_blorp_prepared_tensor.emit_alloc ~emit_expr ctx e size
   | _ ->
       if Core_intrinsic_registry.is_known name then
         Core_error.errorf Core_error.Emit e.loc

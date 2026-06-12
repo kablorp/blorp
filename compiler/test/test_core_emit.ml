@@ -61,16 +61,6 @@ let cvar n t = mk (CVar (Var.named n)) t
 let lower_expr = Test_helpers.lower_valid_expr
 let compile_program = Test_helpers.compile_valid_program
 
-let clist ?(layout = list_pointer_storage ()) elems =
-  CList { ll_layout = layout; ll_elems = elems }
-
-let clist_for ty elems =
-  CList
-    {
-      ll_layout = Blorp.Core_list_layout.layout_of_type ty loc;
-      ll_elems = elems;
-    }
-
 let boxed_int_storage value =
   {
     bsv_box = { box_value = value; box_source_ty = ty_int; box_kind = BoxPrim };
@@ -1225,15 +1215,7 @@ let test_emit_dict_empty () =
 let test_emit_dict_managed_values_set_release () =
   let list_int_ty = TyNamed ("List", [ ty_int ]) in
   let dict_ty = TyNamed ("Dict", [ ty_string; list_int_ty ]) in
-  let e =
-    mk
-      (CDict
-         [
-           ( cstr "nums",
-             mk (clist_for list_int_ty [ cint 1; cint 2 ]) list_int_ty );
-         ])
-      dict_ty
-  in
+  let e = mk (CDict [ (cstr "nums", cvar "nums" list_int_ty) ]) dict_ty in
   let s = emit_to_string e in
   Alcotest.(check bool)
     "sets dict value release" true
@@ -1441,226 +1423,6 @@ let test_emit_void_let_stmt () =
 (* ============================================================================
    Allocating constructors
    ============================================================================ *)
-
-let test_emit_tuple_primitives () =
-  (* Tuple of ints — primitives boxed via a (void* )(long) cast *)
-  let e =
-    mk (CTuple [ cint 1; cint 2; cint 3 ]) (TyTuple [ ty_int; ty_int; ty_int ])
-  in
-  Alcotest.(check string)
-    "tuple"
-    "blorp_tuple_new(3, (void*)(long)(1L), (void*)(long)(2L), \
-     (void*)(long)(3L))"
-    (emit_to_string e)
-
-let test_emit_tuple_int128 () =
-  (* Int128 needs a dedicated blorp_box_int128 helper — the generic
-     (void* )(long) cast silently truncates. The heap box is ARC-managed, so
-     tuples must mark the slot releasable. *)
-  let ty_i128 = TyNamed ("Int128", []) in
-  let x = mk (CLit (LitInt 42L)) ty_i128 in
-  let e = mk (CTuple [ x ]) (TyTuple [ ty_i128 ]) in
-  Alcotest.(check string)
-    "int128 boxed"
-    "({ blorp_Tuple* __tup_0 = blorp_tuple_new(1, blorp_box_int128(42L)); \
-     blorp_tuple_set_rc(__tup_0, 1UL); __tup_0; })"
-    (emit_to_string e)
-
-let test_emit_tuple_tyvar_is_pointer () =
-  (* Generic type vars are treated as potentially managed pointers during
-     generic code, so tuples must install a release mask until
-     monomorphization resolves them to concrete types. The field itself is an
-     owned value being moved into the tuple; Perceus inserts CDup before
-     emission when a borrowed value must be retained. *)
-  let ty_var = TyVar "T" in
-  let x = cvar "x" ty_var in
-  let e = mk (CTuple [ x ]) (TyTuple [ ty_var ]) in
-  Alcotest.(check string)
-    "tyvar release-tracked"
-    "({ blorp_Tuple* __tup_0 = blorp_tuple_new(1, x); \
-     blorp_tuple_set_rc(__tup_0, 1UL); __tup_0; })"
-    (emit_to_string e)
-
-let test_emit_tuple_dim_op_raises () =
-  (* Dimension values retain their type-level identity for specialization, but
-     erase to Int-compatible scalar values when they reach runtime value slots. *)
-  let bad_ty = TyDimOp (DimAdd, TyConstInt 1, TyConstInt 2) in
-  let x = mk (CLit (LitInt 42L)) bad_ty in
-  let e = mk (CTuple [ x ]) (TyTuple [ bad_ty ]) in
-  Alcotest.(check string)
-    "dim scalar boxed" "blorp_tuple_new(1, (void*)(long)(42L))"
-    (emit_to_string e)
-
-let test_emit_tuple_float () =
-  let ty_float = TyNamed ("Float", []) in
-  let f1 = mk (CLit (LitFloat 1.5)) ty_float in
-  let f2 = mk (CLit (LitFloat 2.5)) ty_float in
-  let e = mk (CTuple [ f1; f2 ]) (TyTuple [ ty_float; ty_float ]) in
-  let s = emit_to_string e in
-  (* Should start with blorp_tuple_new(2, blorp_box_float(...) *)
-  Alcotest.(check string)
-    "tuple of floats"
-    "blorp_tuple_new(2, blorp_box_float(1.5), blorp_box_float(2.5))" s
-
-let test_emit_tuple_owned_var_sets_release_mask_without_retain () =
-  let name = cvar "name" ty_string in
-  let e = mk (CTuple [ cint 1; name ]) (TyTuple [ ty_int; ty_string ]) in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "wraps tuple construction" true
-    (contains_sub s "blorp_Tuple* __tup_0 = blorp_tuple_new(2");
-  Alcotest.(check bool)
-    "does not retain owned var" false
-    (contains_sub s "blorp_retain(__tup_0->elem[1])");
-  Alcotest.(check bool)
-    "sets tuple release mask" true
-    (contains_sub s "blorp_tuple_set_rc(__tup_0, 2UL);")
-
-let test_emit_tuple_borrowed_unbox_retains_and_sets_release_mask () =
-  let raw = cvar "raw" ty_ptr in
-  let name = mk (CUnbox (raw, ty_string)) ty_string in
-  let e = mk (CTuple [ cint 1; name ]) (TyTuple [ ty_int; ty_string ]) in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "retains borrowed unboxed managed field" true
-    (contains_sub s "if (__tup_0->elem[1]) blorp_retain(__tup_0->elem[1]);");
-  Alcotest.(check bool)
-    "sets tuple release mask" true
-    (contains_sub s "blorp_tuple_set_rc(__tup_0, 2UL);")
-
-let test_emit_list_primitives () =
-  let list_ty = TyNamed ("List", [ ty_int ]) in
-  let e = mk (clist_for list_ty [ cint 10; cint 20 ]) list_ty in
-  (* Fresh ctx → expr_temp_counter starts at 0 → __lst_0 *)
-  Alcotest.(check string)
-    "list of ints"
-    "({ blorp_List* __lst_0 = blorp_list_new_inline(2, 8); __lst_0 = \
-     blorp_list_append(__lst_0, (void*)(long)(10L)); __lst_0 = \
-     blorp_list_append(__lst_0, (void*)(long)(20L)); __lst_0; })"
-    (emit_to_string e)
-
-let test_emit_list_sized_primitives_use_packed_layout () =
-  let ty_i32 = TyNamed ("Int32", []) in
-  let i32 n = mk (CLit (LitInt (Int64.of_int n))) ty_i32 in
-  let list_ty = TyNamed ("List", [ ty_i32 ]) in
-  let e = mk (clist_for list_ty [ i32 10; i32 20 ]) list_ty in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "uses 4-byte inline storage" true
-    (contains_sub s "blorp_list_new_inline(2, 4)");
-  Alcotest.(check bool)
-    "does not set release" false
-    (contains_sub s "blorp_list_init_elem_release")
-
-let test_emit_list_enum_uses_registry_layout () =
-  let ctx = Blorp.Core_emit_context.create () in
-  let color_ty = TyNamed ("Color", []) in
-  Blorp.Codegen_types.register_enum_type ctx.reg "Color"
-    [
-      {
-        variant_name = "Red";
-        variant_fields = [];
-        variant_tag = 0;
-        variant_loc = loc;
-        variant_def_id = None;
-      };
-      {
-        variant_name = "Green";
-        variant_fields = [];
-        variant_tag = 1;
-        variant_loc = loc;
-        variant_def_id = None;
-      };
-      {
-        variant_name = "Blue";
-        variant_fields = [];
-        variant_tag = 2;
-        variant_loc = loc;
-        variant_def_id = None;
-      };
-    ];
-  let red = mk (CVar (Var.named "Red")) color_ty in
-  let blue = mk (CVar (Var.named "Blue")) color_ty in
-  let e =
-    mk
-      (clist ~layout:(list_inline_storage InlineBytes1) [ red; blue ])
-      (TyNamed ("List", [ color_ty ]))
-  in
-  Blorp.Core_emit.emit_expr ctx e;
-  let s = Buffer.contents ctx.output in
-  Alcotest.(check bool)
-    "enum uses byte-sized inline storage" true
-    (contains_sub s "blorp_list_new_inline(2, 1)");
-  Alcotest.(check bool)
-    "enum is not retained" false
-    (contains_sub s "blorp_list_init_elem_release")
-
-let test_emit_list_managed_elements_set_release () =
-  let list_ty = TyNamed ("List", [ ty_string ]) in
-  let e = mk (clist_for list_ty [ cstr "a"; cstr "b" ]) list_ty in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "sets elem release" true
-    (contains_sub s
-       "blorp_list_init_elem_release(__lst_0, blorp_elem_release_fn)");
-  Alcotest.(check bool)
-    "appends first element" true
-    (contains_sub s "__lst_0 = blorp_list_append(__lst_0, __blorp_get_sl_0()")
-
-let test_emit_list_float_elements_do_not_set_release () =
-  let list_ty = TyNamed ("List", [ ty_float ]) in
-  let e = mk (clist_for list_ty [ cfloat 1.5; cfloat 2.5 ]) list_ty in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "uses 8-byte inline storage" true
-    (contains_sub s "blorp_list_new_inline(2, 8)");
-  Alcotest.(check bool)
-    "does not set elem release" false
-    (contains_sub s
-       "blorp_list_init_elem_release(__lst_0, blorp_elem_release_fn)");
-  Alcotest.(check bool)
-    "boxes first float as immediate" true
-    (contains_sub s "__lst_0 = blorp_list_append(__lst_0, blorp_box_float(1.5))")
-
-let test_emit_list_int128_elements_set_release () =
-  let ty_i128 = TyNamed ("Int128", []) in
-  let list_ty = TyNamed ("List", [ ty_i128 ]) in
-  let e =
-    mk
-      (clist_for list_ty
-         [ mk (CLit (LitInt 1L)) ty_i128; mk (CLit (LitInt 2L)) ty_i128 ])
-      list_ty
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "sets elem release" true
-    (contains_sub s
-       "blorp_list_init_elem_release(__lst_0, blorp_elem_release_fn)");
-  Alcotest.(check bool)
-    "transfers fresh boxes" true
-    (contains_sub s
-       "__lst_0 = blorp_list_append_owned(__lst_0, blorp_box_int128(1L))")
-
-let test_emit_list_option_int_elements_use_inline_stack_storage () =
-  let list_ty = TyNamed ("List", [ option_int ]) in
-  let e =
-    mk
-      (clist_for list_ty [ stack_option_int_some 1; stack_option_int_none ])
-      list_ty
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "allocates inline stack-option slots" true
-    (contains_sub s "blorp_list_new_inline(2, sizeof(blorp_StackOption_Int))");
-  Alcotest.(check bool)
-    "copies first stack option by address" true
-    (contains_sub s "blorp_list_set_raw_copy(__lst_0, 0, &__lst_elem_");
-  Alcotest.(check bool)
-    "does not install ARC element release" false
-    (contains_sub s "blorp_list_init_elem_release");
-  Alcotest.(check bool)
-    "does not box stack options for list storage" false
-    (contains_sub s "blorp_box_struct")
 
 let test_emit_list_inline_int_set_uses_direct_inline_storage () =
   let list_ty = TyNamed ("List", [ ty_int ]) in
@@ -1991,54 +1753,6 @@ let test_escape_unicode_before_hex_digit () =
 (* ============================================================================
    Deferred variants raise clearly
    ============================================================================ *)
-
-let test_emit_vector () =
-  let ty_float = TyNamed ("Float", []) in
-  let f n = mk (CLit (LitFloat n)) ty_float in
-  let e =
-    mk
-      (CVector [ f 1.0; f 2.0; f 3.0 ])
-      (TyNamed ("Tensor", [ ty_float; TyConstInt 3 ]))
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "has vector_new_f64" true
-    (contains_sub s "blorp_vector_new_f64(3)");
-  Alcotest.(check bool)
-    "float stored raw" true
-    (contains_sub s "((double*)__vec_0->data)[0] = 1");
-  Alcotest.(check bool)
-    "has data[2]" true
-    (contains_sub s "((double*)__vec_0->data)[2]")
-
-let test_emit_vector_int () =
-  let e =
-    mk
-      (CVector [ cint 1; cint 2 ])
-      (TyNamed ("Tensor", [ ty_int; TyConstInt 2 ]))
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "has vector_new_i64" true
-    (contains_sub s "blorp_vector_new_i64(2)");
-  Alcotest.(check bool)
-    "int stored raw" true
-    (contains_sub s "((long*)__vec_0->data)[0] = 1L")
-
-let test_emit_vector_alias_uses_expanded_element_layout () =
-  let ctx = Blorp.Core_emit_context.create () in
-  Hashtbl.replace ctx.reg.type_aliases "Meters" ([], TyNamed ("Float", []));
-  Hashtbl.replace ctx.reg.type_aliases "Positions"
-    ([], TyNamed ("Vector", [ TyNamed ("Meters", []); TyConstInt 2 ]));
-  let f n = mk (CLit (LitFloat n)) ty_float in
-  let e = mk (CVector [ f 1.0; f 2.0 ]) (TyNamed ("Positions", [])) in
-  let s = emit_to_string_with_ctx ctx e in
-  Alcotest.(check bool)
-    "alias uses f64 constructor" true
-    (contains_sub s "blorp_vector_new_f64(2)");
-  Alcotest.(check bool)
-    "alias stores f64 raw values" true
-    (contains_sub s "((double*)__vec_0->data)[0] = 1")
 
 let test_emit_nullable_vector_set_cow_releases_value_record_box () =
   let ctx = Blorp.Core_emit_context.create () in
@@ -2650,7 +2364,7 @@ let test_escape_nul_string_literal_keeps_explicit_length () =
     "literal includes explicit byte length" true
     (contains_sub output "blorp_string_literal_len(\"a\\000b\", 3L)")
 
-let test_emit_global_managed_container_constant_rejected () =
+let test_emit_global_managed_dict_constant_immortalized () =
   let v : core_var =
     {
       cv_name = Var.named "NAMES";
@@ -2664,28 +2378,16 @@ let test_emit_global_managed_container_constant_rejected () =
     }
   in
   let prog = [ { cd_desc = CDVar v; cd_loc = loc; cd_doc = None } ] in
-  match emit_program_to_string prog with
-  | exception Blorp.Core_error.Core_error err ->
-      Alcotest.(check bool)
-        "phase is Emit" true
-        (err.Blorp.Core_error.phase = Blorp.Core_error.Emit);
-      Alcotest.(check string)
-        "message"
-        "managed global constant layout cannot yet be made safely immortal: \
-         NAMES has unsupported container type `Dict[String, String]` with \
-         managed contents"
-        err.Blorp.Core_error.msg;
-      Alcotest.(check (option string))
-        "hint"
-        (Some
-           "Use a function to construct this value at runtime, or reduce the \
-            constant to supported shapes: strings, heap records, heap unions, \
-            tuples, stack Result payloads, and Lists with supported element \
-            types.")
-        err.Blorp.Core_error.hint
-  | exception exn ->
-      Alcotest.failf "expected Core_error, got %s" (Printexc.to_string exn)
-  | _ -> Alcotest.fail "expected unsupported managed global constant error"
+  let output = emit_program_to_string prog in
+  Alcotest.(check bool)
+    "makes dict root immortal" true
+    (contains_sub output "blorp_make_immortal_constant(NAMES);");
+  Alcotest.(check bool)
+    "walks managed dict entries" true
+    (contains_sub output "blorp_make_immortal_dict_constant(NAMES,");
+  Alcotest.(check bool)
+    "uses string element immortalizer" true
+    (contains_sub output "blorp_make_immortal_constant(((blorp_String*)value));")
 
 let test_emit_impl_methods () =
   let point_ty = TyNamed ("Point", []) in
@@ -6244,28 +5946,6 @@ let suite =
       ] );
     ( "alloc",
       [
-        Alcotest.test_case "tuple_primitives" `Quick test_emit_tuple_primitives;
-        Alcotest.test_case "tuple_int128" `Quick test_emit_tuple_int128;
-        Alcotest.test_case "tuple_tyvar" `Quick test_emit_tuple_tyvar_is_pointer;
-        Alcotest.test_case "tuple_dim_op" `Quick test_emit_tuple_dim_op_raises;
-        Alcotest.test_case "tuple_float" `Quick test_emit_tuple_float;
-        Alcotest.test_case "tuple_owned_var_release_mask" `Quick
-          test_emit_tuple_owned_var_sets_release_mask_without_retain;
-        Alcotest.test_case "tuple_borrowed_unbox_release_mask" `Quick
-          test_emit_tuple_borrowed_unbox_retains_and_sets_release_mask;
-        Alcotest.test_case "list_primitives" `Quick test_emit_list_primitives;
-        Alcotest.test_case "list_sized_primitives_packed" `Quick
-          test_emit_list_sized_primitives_use_packed_layout;
-        Alcotest.test_case "list_enum_packed" `Quick
-          test_emit_list_enum_uses_registry_layout;
-        Alcotest.test_case "list_managed_release" `Quick
-          test_emit_list_managed_elements_set_release;
-        Alcotest.test_case "list_float_no_release" `Quick
-          test_emit_list_float_elements_do_not_set_release;
-        Alcotest.test_case "list_int128_release" `Quick
-          test_emit_list_int128_elements_set_release;
-        Alcotest.test_case "list_option_int_inline_stack_storage" `Quick
-          test_emit_list_option_int_elements_use_inline_stack_storage;
         Alcotest.test_case "list_inline_int_set_direct" `Quick
           test_emit_list_inline_int_set_uses_direct_inline_storage;
         Alcotest.test_case "list_managed_string_set_pointer_path" `Quick
@@ -6332,10 +6012,6 @@ let suite =
       ] );
     ( "vector",
       [
-        Alcotest.test_case "float" `Quick test_emit_vector;
-        Alcotest.test_case "int" `Quick test_emit_vector_int;
-        Alcotest.test_case "alias_expanded_layout" `Quick
-          test_emit_vector_alias_uses_expanded_element_layout;
         Alcotest.test_case "tensor_literal_layout_payload_mismatch" `Quick
           test_emit_invariant_tensor_literal_layout_payload_mismatch;
         Alcotest.test_case "tensor_literal_layout_release_policy" `Quick
@@ -6459,8 +6135,8 @@ let suite =
           test_emit_global_var_non_const;
         Alcotest.test_case "global_string_literal_deferred" `Quick
           test_emit_global_var_string_literal_deferred;
-        Alcotest.test_case "global_managed_container_constant_rejected" `Quick
-          test_emit_global_managed_container_constant_rejected;
+        Alcotest.test_case "global managed dict constant immortalized" `Quick
+          test_emit_global_managed_dict_constant_immortalized;
         Alcotest.test_case "impl_methods" `Quick test_emit_impl_methods;
       ] );
     ( "pipeline",

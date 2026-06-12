@@ -918,6 +918,11 @@ extern _Thread_local void* __blorp_current_task;
 void* blorp_alloc(size_t size);
 void* blorp_make_immortal_constant(void* obj);
 void blorp_make_immortal_list_constant(blorp_List* list, blorp_ImmortalizeElementFn immortalize_elem);
+void blorp_make_immortal_dict_constant(
+    blorp_Dict* dict,
+    blorp_ImmortalizeElementFn immortalize_key,
+    blorp_ImmortalizeElementFn immortalize_value
+);
 void blorp_move_ref(void* obj);
 void blorp_set_type_tag(void* obj, const char* tag);
 uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);

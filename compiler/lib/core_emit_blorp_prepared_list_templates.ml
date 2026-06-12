@@ -22,6 +22,14 @@ list_ensure_unique	2	({ blorp_List* @1@ = (blorp_List*)@0@; (__builtin_expect(@1
 list_ensure_capacity	4	({ blorp_List* @2@ = (blorp_List*)@0@; long @3@ = @1@; (__builtin_expect(@2@ && blorp_is_unique(@2@) && @2@->capacity >= @3@, 1) ? @2@ : blorp_list_ensure_capacity(@2@, @3@)); })
 list_reuse_alloc	2	blorp_list_reuse_alloc(@0@, @1@)
 list_reuse_alloc_with_release	3	({ blorp_List* @2@ = blorp_list_reuse_alloc(@0@, @1@); blorp_list_init_elem_release(@2@, blorp_elem_release_fn); @2@; })
+list_alloc_pointer	1	blorp_list_new(@0@)
+list_alloc_inline	2	blorp_list_new_inline(@0@, @1@)
+list_alloc_with_release	2	({ blorp_List* @1@ = @0@; blorp_list_init_elem_release(@1@, blorp_elem_release_fn); @1@; })
 list_retain_for	2	blorp_list_retain_for((blorp_List*)@0@, (void*)@1@)
 list_retain_for_noop	0	((void)0)
+list_construct_init_elem_release	1	blorp_list_init_elem_release(@0@, blorp_elem_release_fn);
+list_construct_inline_struct_set	5	{ @4@ @3@ = @2@; blorp_list_set_raw_copy(@0@, @1@, &@3@); }
+list_construct_set_len	2	@0@->len = @1@;
+list_construct_append	2	@0@ = blorp_list_append(@0@, @1@);
+list_construct_append_owned	2	@0@ = blorp_list_append_owned(@0@, @1@);
 |}

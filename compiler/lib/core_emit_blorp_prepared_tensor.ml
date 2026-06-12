@@ -13,6 +13,7 @@ let manifest =
     Core_emit_blorp_prepared_tensor_templates.tsv
 
 let render_arg = Core_emit_blorp_template.render_arg
+let render_template = Core_emit_blorp_template.render_exn manifest
 let emit_template = Core_emit_blorp_template.emit manifest
 let tensor_view_c_name v = Codegen_types.escape_c_ident (Var.to_c_name v)
 
@@ -24,6 +25,29 @@ type storage_check_template =
 
 type raw_scalar_get_template = F64RawGetTemplate | F32RawGetTemplate
 
+type literal_write_template =
+  | LiteralF32WriteTemplate
+  | LiteralF64WriteTemplate
+  | LiteralI64WriteTemplate
+  | LiteralWordWriteTemplate
+  | LiteralPackedWriteTemplate
+
+type alloc_template =
+  | PointerAllocTemplate
+  | I64AllocTemplate
+  | F64AllocTemplate
+  | F32AllocTemplate
+  | PackedAllocTemplate of int
+  | SizedAllocTemplate of string
+
+type ranked_alloc_template =
+  | PointerRankedAllocTemplate
+  | I64RankedAllocTemplate
+  | F64RankedAllocTemplate
+  | F32RankedAllocTemplate
+  | PackedRankedAllocTemplate of int
+  | SizedRankedAllocTemplate of string
+
 let storage_check_template_name = function
   | WordStorageCheckTemplate -> "tensor_is_word_storage"
   | F64StorageCheckTemplate -> "tensor_is_f64_storage"
@@ -33,6 +57,169 @@ let storage_check_template_name = function
 let raw_scalar_get_template_name = function
   | F64RawGetTemplate -> "tensor_get_f64_raw_unchecked"
   | F32RawGetTemplate -> "tensor_get_f32_raw_unchecked"
+
+let literal_write_template_name = function
+  | LiteralF32WriteTemplate -> "tensor_literal_write_f32"
+  | LiteralF64WriteTemplate -> "tensor_literal_write_f64"
+  | LiteralI64WriteTemplate -> "tensor_literal_write_i64"
+  | LiteralWordWriteTemplate -> "tensor_literal_write_word"
+  | LiteralPackedWriteTemplate -> "tensor_literal_write_packed"
+
+let alloc_template_of_layout (layout : tensor_storage_layout) =
+  match layout.tsl_slots with
+  | TensorRawScalarStorage TensorInt64Elements -> I64AllocTemplate
+  | TensorRawScalarStorage TensorFloat64Elements -> F64AllocTemplate
+  | TensorRawScalarStorage TensorFloat32Elements -> F32AllocTemplate
+  | TensorPackedStorage width ->
+      PackedAllocTemplate (Core.inline_storage_width_bytes width)
+  | TensorInlineStructStorage c_ty -> SizedAllocTemplate c_ty
+  | TensorWordStorage | TensorBoxedStorage -> PointerAllocTemplate
+
+let render_alloc_template template size_arg =
+  match template with
+  | PointerAllocTemplate -> render_template "tensor_alloc_pointer" [ size_arg ]
+  | I64AllocTemplate -> render_template "tensor_alloc_i64" [ size_arg ]
+  | F64AllocTemplate -> render_template "tensor_alloc_f64" [ size_arg ]
+  | F32AllocTemplate -> render_template "tensor_alloc_f32" [ size_arg ]
+  | PackedAllocTemplate elem_size ->
+      render_template "tensor_alloc_packed"
+        [ size_arg; string_of_int elem_size ]
+  | SizedAllocTemplate struct_ty ->
+      render_template "tensor_alloc_sized" [ size_arg; struct_ty ]
+
+let ranked_alloc_template_of_layout (layout : tensor_storage_layout) =
+  match layout.tsl_slots with
+  | TensorRawScalarStorage TensorInt64Elements -> I64RankedAllocTemplate
+  | TensorRawScalarStorage TensorFloat64Elements -> F64RankedAllocTemplate
+  | TensorRawScalarStorage TensorFloat32Elements -> F32RankedAllocTemplate
+  | TensorPackedStorage width ->
+      PackedRankedAllocTemplate (Core.inline_storage_width_bytes width)
+  | TensorInlineStructStorage c_ty -> SizedRankedAllocTemplate c_ty
+  | TensorWordStorage | TensorBoxedStorage -> PointerRankedAllocTemplate
+
+let render_ranked_alloc_template template ~first_dim ~total_dim =
+  match template with
+  | PointerRankedAllocTemplate ->
+      render_template "tensor_ranked_alloc_pointer" [ first_dim; total_dim ]
+  | I64RankedAllocTemplate ->
+      render_template "tensor_ranked_alloc_i64" [ first_dim; total_dim ]
+  | F64RankedAllocTemplate ->
+      render_template "tensor_ranked_alloc_f64" [ first_dim; total_dim ]
+  | F32RankedAllocTemplate ->
+      render_template "tensor_ranked_alloc_f32" [ first_dim; total_dim ]
+  | PackedRankedAllocTemplate elem_size ->
+      render_template "tensor_ranked_alloc_packed"
+        [ first_dim; total_dim; string_of_int elem_size ]
+  | SizedRankedAllocTemplate struct_ty ->
+      render_template "tensor_ranked_alloc_sized"
+        [ first_dim; total_dim; struct_ty ]
+
+let render_ranked_alloc_call layout ~first_dim ~total_dim =
+  render_ranked_alloc_template
+    (ranked_alloc_template_of_layout layout)
+    ~first_dim ~total_dim
+
+let render_fill_alloc_call layout ~first_dim ~total_dim loc =
+  match ranked_alloc_template_of_layout layout with
+  | I64RankedAllocTemplate ->
+      render_ranked_alloc_template I64RankedAllocTemplate ~first_dim ~total_dim
+  | F64RankedAllocTemplate ->
+      render_ranked_alloc_template F64RankedAllocTemplate ~first_dim ~total_dim
+  | F32RankedAllocTemplate ->
+      render_ranked_alloc_template F32RankedAllocTemplate ~first_dim ~total_dim
+  | PackedRankedAllocTemplate elem_size ->
+      render_ranked_alloc_template (PackedRankedAllocTemplate elem_size)
+        ~first_dim ~total_dim
+  | PointerRankedAllocTemplate | SizedRankedAllocTemplate _ ->
+      Core_error.errorf Core_error.Emit loc
+        "unsupported tensor fill allocation layout"
+
+let render_literal_alloc_call layout shape =
+  match shape with
+  | TensorStaticShape (first :: _ as dims) ->
+      let total = List.fold_left ( * ) 1 dims in
+      render_ranked_alloc_call layout ~first_dim:(string_of_int first)
+        ~total_dim:(string_of_int total)
+  | TensorStaticShape [] ->
+      render_alloc_template (alloc_template_of_layout layout) "0"
+  | TensorVectorLength n ->
+      render_alloc_template (alloc_template_of_layout layout) (string_of_int n)
+
+let emit_literal_init_elem_release ctx ~tensor_tmp =
+  emit_template ctx "tensor_init_elem_release" [ tensor_tmp ]
+
+let emit_literal_write ~emit_expr ctx template ~tensor_tmp ~index value =
+  let value_arg = render_arg ~emit_expr ctx value in
+  emit_template ctx
+    (literal_write_template_name template)
+    [ tensor_tmp; string_of_int index; value_arg ]
+
+let emit_literal_f32_write ~emit_expr ctx ~tensor_tmp ~index value =
+  emit_literal_write ~emit_expr ctx LiteralF32WriteTemplate ~tensor_tmp ~index
+    value
+
+let emit_literal_f64_write ~emit_expr ctx ~tensor_tmp ~index value =
+  emit_literal_write ~emit_expr ctx LiteralF64WriteTemplate ~tensor_tmp ~index
+    value
+
+let emit_literal_i64_write ~emit_expr ctx ~tensor_tmp ~index value =
+  emit_literal_write ~emit_expr ctx LiteralI64WriteTemplate ~tensor_tmp ~index
+    value
+
+let emit_literal_word_write ~emit_expr ctx ~tensor_tmp ~index value =
+  emit_literal_write ~emit_expr ctx LiteralWordWriteTemplate ~tensor_tmp ~index
+    value
+
+let emit_literal_packed_write ~emit_expr ctx ~tensor_tmp ~index value =
+  emit_literal_write ~emit_expr ctx LiteralPackedWriteTemplate ~tensor_tmp
+    ~index value
+
+let emit_literal_inline_struct_write ~emit_expr ctx ~tensor_tmp ~index
+    ~struct_ty value =
+  let elem_tmp =
+    Printf.sprintf "__ten_elem_%d" (Core_emit_context.fresh_temp ctx)
+  in
+  let value_arg = render_arg ~emit_expr ctx value in
+  emit_template ctx "tensor_literal_write_inline_struct"
+    [ tensor_tmp; string_of_int index; value_arg; elem_tmp; struct_ty ]
+
+let emit_literal_boxed_write_rendered ctx ~tensor_tmp ~index ~value_arg =
+  emit_template ctx "tensor_literal_write_boxed"
+    [ tensor_tmp; string_of_int index; value_arg ]
+
+let emit_literal_boxed_write ~emit_boxed ctx ~tensor_tmp ~index value =
+  let value_arg = render_arg ~emit_expr:emit_boxed ctx value in
+  emit_literal_boxed_write_rendered ctx ~tensor_tmp ~index ~value_arg
+
+let emit_literal_boxed_retain ctx value_arg =
+  emit_template ctx "tensor_literal_boxed_retain" [ value_arg ]
+
+let emit_fill_alloc_call ctx loc layout ~first_dim ~total_dim =
+  Core_emit_context.emit ctx
+    (render_fill_alloc_call layout ~first_dim ~total_dim loc)
+
+let emit_alloc ~emit_expr (ctx : Core_emit_context.t) (e : core) size : unit =
+  let layout =
+    Core_layout_type.tensor_storage_layout_of_type ~reg:ctx.reg e.ty e.loc
+  in
+  let requires_release =
+    tensor_storage_layout_requires_release_or_error ~phase:Core_error.Emit
+      ~loc:e.loc layout
+  in
+  let result_tmp =
+    if requires_release then
+      Some
+        (Printf.sprintf "__tensor_alloc_%d" (Core_emit_context.fresh_temp ctx))
+    else None
+  in
+  let size_arg = render_arg ~emit_expr ctx size in
+  let alloc_expr =
+    render_alloc_template (alloc_template_of_layout layout) size_arg
+  in
+  match result_tmp with
+  | Some tmp ->
+      emit_template ctx "tensor_alloc_with_release" [ alloc_expr; tmp ]
+  | None -> Core_emit_context.emit ctx alloc_expr
 
 let emit_raw_view_decl ~emit_expr (ctx : Core_emit_context.t)
     (binding : tensor_raw_view_binding) : unit =
