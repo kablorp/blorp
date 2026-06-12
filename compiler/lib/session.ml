@@ -121,6 +121,14 @@ type loaded_module = {
   mutable typed_import_bindings : import_binding list option;
 }
 
+type parsed_module_cache_entry = {
+  parsed_path : string;
+  parsed_origin : module_origin;
+  parsed_source_hash : string;
+  parsed_decls : program;
+  parsed_exports : (string * decl) list;
+}
+
 type type_home = UniqueTypeHome of string | AmbiguousTypeHome of string list
 
 (* ============================================================================
@@ -137,12 +145,12 @@ type t = {
       imports never consult these roots. *)
   module_cache : (string, loaded_module) Hashtbl.t;
       (** Canonical module name → loaded module. *)
-  parse_cache :
-    (string, string * module_origin * program * (string * decl) list) Hashtbl.t;
-      (** Module name → (path, origin, decls, exports). A pre-parsed store for
-      fast reload. Session-scoped by design — sharing across sessions
-      would require a separate process-level cache keyed by source
-      hash; not worth it today. *)
+  parse_cache : (string, parsed_module_cache_entry) Hashtbl.t;
+      (** Module name → source-stamped parsed module. A pre-parsed store for
+      fast reload. Filesystem-backed entries are validated against the current
+      source hash before reuse; embedded std entries are process-stable.
+      Session-scoped by design — sharing across sessions would require a
+      separate process-level cache with its own invalidation policy. *)
   type_index : (string, type_home) Hashtbl.t;
       (** Type name → canonical module name(s) that declared it.
       Populated by [register_module_types] whenever a module is loaded;

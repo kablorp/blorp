@@ -157,6 +157,113 @@ let test_loaded_module_callback_types_share_import_origins () =
         "LSP analysis keeps std JsonValue identity across loaded modules" ""
         (Test_helpers.format_errors doc.diagnostics))
 
+let test_reuses_unchanged_import_parse_cache_between_lsp_analyses () =
+  with_temp_project (fun root ->
+      let helper_path = Filename.concat root "helper.brp" in
+      write_file helper_path
+        (String.concat "\n" [ "func value() -> Int:"; "    1"; "" ]);
+      let main_path = Filename.concat root "main.brp" in
+      let source =
+        String.concat "\n"
+          [
+            "import:";
+            "    ./helper: value";
+            "";
+            "func main(args: List[String]) -> Int:";
+            "    value()";
+            "";
+          ]
+      in
+      let uri = Lsp_protocol.path_to_uri main_path in
+      let state = Lsp_state.create () in
+      let doc = document ~uri source in
+      Lsp_state.analyze state doc;
+      Alcotest.(check string)
+        "first analysis has no diagnostics" ""
+        (Test_helpers.format_errors doc.diagnostics);
+      let first_entry = Hashtbl.find doc.session.parse_cache "./helper" in
+      Lsp_state.analyze state doc;
+      Alcotest.(check string)
+        "second analysis has no diagnostics" ""
+        (Test_helpers.format_errors doc.diagnostics);
+      let second_entry = Hashtbl.find doc.session.parse_cache "./helper" in
+      Alcotest.(check bool)
+        "unchanged imported module parse cache entry was reused" true
+        (first_entry == second_entry))
+
+let test_replaces_changed_import_parse_cache_between_lsp_analyses () =
+  with_temp_project (fun root ->
+      let helper_path = Filename.concat root "helper.brp" in
+      write_file helper_path
+        (String.concat "\n" [ "func value() -> Int:"; "    1"; "" ]);
+      let main_path = Filename.concat root "main.brp" in
+      let source =
+        String.concat "\n"
+          [
+            "import:";
+            "    ./helper: value";
+            "";
+            "func main(args: List[String]) -> Int:";
+            "    value()";
+            "";
+          ]
+      in
+      let uri = Lsp_protocol.path_to_uri main_path in
+      let state = Lsp_state.create () in
+      let doc = document ~uri source in
+      Lsp_state.analyze state doc;
+      Alcotest.(check string)
+        "first analysis has no diagnostics" ""
+        (Test_helpers.format_errors doc.diagnostics);
+      let first_entry = Hashtbl.find doc.session.parse_cache "./helper" in
+      write_file helper_path
+        (String.concat "\n" [ "func value() -> String:"; "    \"oops\""; "" ]);
+      Lsp_state.analyze state doc;
+      let second_entry = Hashtbl.find doc.session.parse_cache "./helper" in
+      Alcotest.(check bool)
+        "changed imported module parse cache entry was replaced" false
+        (first_entry == second_entry);
+      Alcotest.(check bool)
+        "changed imported module diagnostics are visible" true
+        (doc.diagnostics <> []))
+
+let test_prunes_dropped_user_import_parse_cache_after_lsp_analysis () =
+  with_temp_project (fun root ->
+      let helper_path = Filename.concat root "helper.brp" in
+      write_file helper_path
+        (String.concat "\n" [ "func value() -> Int:"; "    1"; "" ]);
+      let main_path = Filename.concat root "main.brp" in
+      let source_with_import =
+        String.concat "\n"
+          [
+            "import:";
+            "    ./helper: value";
+            "";
+            "func main(args: List[String]) -> Int:";
+            "    value()";
+            "";
+          ]
+      in
+      let source_without_import =
+        String.concat "\n"
+          [ "func main(args: List[String]) -> Int:"; "    0"; "" ]
+      in
+      let uri = Lsp_protocol.path_to_uri main_path in
+      let state = Lsp_state.create () in
+      let doc = document ~uri source_with_import in
+      Lsp_state.analyze state doc;
+      Alcotest.(check bool)
+        "imported user module is cached" true
+        (Hashtbl.mem doc.session.parse_cache "./helper");
+      let edited_doc =
+        Lsp_state.create_document ~session:doc.session ~uri ~version:2
+          ~text:source_without_import ()
+      in
+      Lsp_state.analyze state edited_doc;
+      Alcotest.(check bool)
+        "dropped user import parse cache entry is pruned" false
+        (Hashtbl.mem edited_doc.session.parse_cache "./helper"))
+
 let suite =
   [
     ( "state",
@@ -169,5 +276,14 @@ let suite =
           test_std_source_uses_stdlib_origin;
         Alcotest.test_case "loaded module callback types share import origins"
           `Quick test_loaded_module_callback_types_share_import_origins;
+        Alcotest.test_case
+          "reuses unchanged import parse cache between LSP analyses" `Quick
+          test_reuses_unchanged_import_parse_cache_between_lsp_analyses;
+        Alcotest.test_case
+          "replaces changed import parse cache between LSP analyses" `Quick
+          test_replaces_changed_import_parse_cache_between_lsp_analyses;
+        Alcotest.test_case
+          "prunes dropped user import parse cache after LSP analysis" `Quick
+          test_prunes_dropped_user_import_parse_cache_after_lsp_analysis;
       ] );
   ]

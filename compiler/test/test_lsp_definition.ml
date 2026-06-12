@@ -31,6 +31,32 @@ let analyzed_state ?client_capabilities source =
   analyzed_state_for_uri ?client_capabilities
     ~uri:"file:///tmp/lsp_definition_integration.brp" source
 
+let string_starts_with ~prefix s =
+  String.length s >= String.length prefix
+  && String.sub s 0 (String.length prefix) = prefix
+
+let rec find_project_root dir =
+  if Sys.file_exists (Filename.concat dir "std/list.brp") then dir
+  else
+    let parent = Filename.dirname dir in
+    if parent = dir then
+      Alcotest.failf "could not find project root from %s" (Sys.getcwd ());
+    find_project_root parent
+
+let std_list_append_start () =
+  let root = find_project_root (Sys.getcwd ()) in
+  let path = Filename.concat root "std/list.brp" in
+  let lines = String.split_on_char '\n' (Modules.read_file path) in
+  let rec find line_number = function
+    | [] -> Alcotest.fail "could not find std/list append declaration"
+    | line :: rest ->
+        let prefix = "pure func append" in
+        if string_starts_with ~prefix line then
+          (line_number, String.length "pure func ")
+        else find (line_number + 1) rest
+  in
+  find 0 lines
+
 let write_file path contents =
   let oc = open_out path in
   Fun.protect
@@ -239,7 +265,7 @@ let test_definition_resolves_list_ufcs_to_list_module () =
          ])
   in
   Alcotest.(check (pair int int))
-    "definition points at the std/list append name" (102, 10)
+    "definition points at the std/list append name" (std_list_append_start ())
     (definition_start_at state uri ~line:2 ~character:25);
   let target_uri = definition_uri_at state uri ~line:2 ~character:25 in
   Alcotest.(check bool)

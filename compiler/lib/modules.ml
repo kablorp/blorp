@@ -317,6 +317,56 @@ let read_file path =
       let n = in_channel_length ic in
       really_input_string ic n)
 
+let source_hash source = Digest.to_hex (Digest.string source)
+let embedded_module_path path = has_prefix "<embedded:" path
+
+let parsed_entry_tuple (entry : Session.parsed_module_cache_entry) =
+  ( entry.parsed_path,
+    entry.parsed_origin,
+    entry.parsed_decls,
+    entry.parsed_exports )
+
+let resolved_origin_equal left right =
+  match (left, right) with
+  | Session.Stdlib_module, Session.Stdlib_module -> true
+  | Session.User_module, Session.User_module -> true
+  | Session.Package_module left_id, Session.Package_module right_id ->
+      Session.package_id_name left_id = Session.package_id_name right_id
+  | (Session.Stdlib_module | Session.User_module | Session.Package_module _), _
+    ->
+      false
+
+type cached_parse_result =
+  | Cached_current of
+      (string * Session.module_origin * program * (string * decl) list)
+  | Cached_changed_source of string
+
+let cached_filesystem_entry_is_current ~sess ~base_dir ~module_name
+    (entry : Session.parsed_module_cache_entry) =
+  match resolve_module_file ~sess base_dir module_name with
+  | None -> None
+  | Some resolved
+    when resolved.resolved_path <> entry.parsed_path
+         || not
+              (resolved_origin_equal resolved.resolved_origin
+                 entry.parsed_origin) ->
+      None
+  | Some _ -> (
+      match read_file entry.parsed_path with
+      | exception Sys_error _ -> None
+      | source ->
+          if source_hash source = entry.parsed_source_hash then
+            Some (Cached_current (parsed_entry_tuple entry))
+          else Some (Cached_changed_source source))
+
+let cached_parse_entry ~sess ~base_dir ~module_name
+    (entry : Session.parsed_module_cache_entry) =
+  if
+    embedded_module_path entry.parsed_path
+    && not sess.Session.std_override_active
+  then Some (Cached_current (parsed_entry_tuple entry))
+  else cached_filesystem_entry_is_current ~sess ~base_dir ~module_name entry
+
 (** Extract export names from a single declaration (inner decl_desc).
     Returns a list of (name, decl) pairs. *)
 let extract_export_names _decl inner_decl =
@@ -491,7 +541,7 @@ let rec load_module ?sess module_name base_dir =
         Hashtbl.remove sess.module_cache module_name
     | _ -> ());
     match Hashtbl.find_opt sess.parse_cache module_name with
-    | Some (path, _, _, _) when path <> resolved_path ->
+    | Some entry when entry.parsed_path <> resolved_path ->
         Hashtbl.remove sess.parse_cache module_name
     | _ -> ()
   in
@@ -563,8 +613,16 @@ and parse_module_source ~(sess : Session.t) ~module_name ~path ~origin source =
     with
     | Ok decls ->
         let exports = collect_exports decls in
-        Hashtbl.replace sess.parse_cache module_name
-          (path, origin, decls, exports);
+        let entry : Session.parsed_module_cache_entry =
+          {
+            parsed_path = path;
+            parsed_origin = origin;
+            parsed_source_hash = source_hash source;
+            parsed_decls = decls;
+            parsed_exports = exports;
+          }
+        in
+        Hashtbl.replace sess.parse_cache module_name entry;
         Some (path, origin, decls, exports)
     | Error err ->
         sess.load_errors <- err :: sess.load_errors;
@@ -591,110 +649,119 @@ and load_module_inner ~(sess : Session.t) module_name base_dir =
   match Hashtbl.find_opt sess.Session.module_cache module_name with
   | Some m -> Some m
   | None -> (
-      (* Try parse cache (avoids re-parsing std modules between tests) *)
+      let parse_fresh () =
+        let from_embedded =
+          if has_prefix "std/" module_name && not sess.std_override_active then
+            match Embedded_std.find module_name with
+            | Some source ->
+                let path = Printf.sprintf "<embedded:%s>" module_name in
+                parse_module_source ~sess ~module_name ~path
+                  ~origin:Session.Stdlib_module source
+            | None -> None
+          else None
+        in
+        match from_embedded with
+        | Some _ -> from_embedded
+        | None -> (
+            (* Fall back to filesystem resolution. For std modules, this
+               only succeeds when an explicit std override is active. *)
+            match resolve_module_file ~sess base_dir module_name with
+            | None ->
+                let msg =
+                  if has_prefix "std/" module_name then
+                    begin if sess.std_override_active then
+                      let dir =
+                        match sess.std_override_dir with
+                        | Some d -> d
+                        | None -> "<unknown>"
+                      in
+                      Printf.sprintf
+                        "Could not find module '%s'\n\
+                        \  = note: the standard library override is set to \
+                         '%s' but '%s.brp' was not found\n\
+                        \  = help: Check --std-dir, BLORP_STD, or blorp.toml; \
+                         remove the override to use the embedded standard \
+                         library"
+                        module_name dir
+                        (strip_prefix "std/" module_name)
+                    else
+                      (* Build the "available std modules" list from
+                         [Embedded_std.modules] so it stays in sync
+                         automatically as modules are added/removed. *)
+                      let available =
+                        Embedded_std.modules
+                        |> List.filter_map (fun (name, _) ->
+                            if has_prefix "std/" name then
+                              Some (strip_prefix "std/" name)
+                            else None)
+                        |> List.sort String.compare |> String.concat ", "
+                      in
+                      Printf.sprintf
+                        "Unknown standard library module '%s'\n\
+                        \  = help: Available std modules: %s"
+                        module_name available
+                    end
+                  else if has_prefix "pkg/" module_name then
+                    let roots =
+                      match List.rev sess.package_roots with
+                      | [] -> "<none>"
+                      | roots -> String.concat ", " roots
+                    in
+                    Printf.sprintf
+                      "Could not find package module '%s'\n\
+                      \  = help: Package imports resolve only from local \
+                       package roots. Create %s.brp under a local pkg/ \
+                       directory or add a package root.\n\
+                      \  Package roots: %s"
+                      module_name module_name roots
+                  else
+                    let suggestion =
+                      let lower = String.lowercase_ascii module_name in
+                      if lower <> module_name then
+                        match resolve_module_path ~sess base_dir lower with
+                        | Some _ -> Printf.sprintf " (did you mean '%s'?)" lower
+                        | None -> ""
+                      else ""
+                    in
+                    Printf.sprintf
+                      "Could not find module '%s'%s\n  Search paths: %s"
+                      module_name suggestion
+                      (String.concat ", " sess.search_paths)
+                in
+                let err =
+                  {
+                    Ast.message = msg;
+                    loc = Ast.dummy_loc;
+                    phase = Ast.ModuleLoad;
+                    kind = Ast.OtherError;
+                    notes = [];
+                    help = None;
+                  }
+                in
+                sess.load_errors <- err :: sess.load_errors;
+                None
+            | Some resolved ->
+                let path = resolved.resolved_path in
+                let source = read_file path in
+                let origin = resolved.resolved_origin in
+                parse_module_source ~sess ~module_name ~path ~origin source)
+      in
+      (* Try parse cache first. Filesystem-backed entries validate the current
+         source hash before reuse; stale/moved entries fall through to a fresh
+         resolve+parse. *)
       let parsed =
         match Hashtbl.find_opt sess.parse_cache module_name with
-        | Some _ as cached -> cached
-        | None -> (
-            let from_embedded =
-              if has_prefix "std/" module_name && not sess.std_override_active
-              then
-                match Embedded_std.find module_name with
-                | Some source ->
-                    let path = Printf.sprintf "<embedded:%s>" module_name in
-                    parse_module_source ~sess ~module_name ~path
-                      ~origin:Session.Stdlib_module source
-                | None -> None
-              else None
-            in
-            match from_embedded with
-            | Some _ -> from_embedded
-            | None -> (
-                (* Fall back to filesystem resolution. For std modules, this
-                   only succeeds when an explicit std override is active. *)
-                match resolve_module_file ~sess base_dir module_name with
-                | None ->
-                    let msg =
-                      if has_prefix "std/" module_name then
-                        begin if sess.std_override_active then
-                          let dir =
-                            match sess.std_override_dir with
-                            | Some d -> d
-                            | None -> "<unknown>"
-                          in
-                          Printf.sprintf
-                            "Could not find module '%s'\n\
-                            \  = note: the standard library override is set to \
-                             '%s' but '%s.brp' was not found\n\
-                            \  = help: Check --std-dir, BLORP_STD, or \
-                             blorp.toml; remove the override to use the \
-                             embedded standard library"
-                            module_name dir
-                            (strip_prefix "std/" module_name)
-                        else
-                          (* Build the "available std modules" list from
-                             [Embedded_std.modules] so it stays in sync
-                             automatically as modules are added/removed. *)
-                          let available =
-                            Embedded_std.modules
-                            |> List.filter_map (fun (name, _) ->
-                                if has_prefix "std/" name then
-                                  Some (strip_prefix "std/" name)
-                                else None)
-                            |> List.sort String.compare |> String.concat ", "
-                          in
-                          Printf.sprintf
-                            "Unknown standard library module '%s'\n\
-                            \  = help: Available std modules: %s"
-                            module_name available
-                        end
-                      else if has_prefix "pkg/" module_name then
-                        let roots =
-                          match List.rev sess.package_roots with
-                          | [] -> "<none>"
-                          | roots -> String.concat ", " roots
-                        in
-                        Printf.sprintf
-                          "Could not find package module '%s'\n\
-                          \  = help: Package imports resolve only from local \
-                           package roots. Create %s.brp under a local pkg/ \
-                           directory or add a package root.\n\
-                          \  Package roots: %s"
-                          module_name module_name roots
-                      else begin
-                        let suggestion =
-                          let lower = String.lowercase_ascii module_name in
-                          if lower <> module_name then
-                            match resolve_module_path ~sess base_dir lower with
-                            | Some _ ->
-                                Printf.sprintf " (did you mean '%s'?)" lower
-                            | None -> ""
-                          else ""
-                        in
-                        Printf.sprintf
-                          "Could not find module '%s'%s\n  Search paths: %s"
-                          module_name suggestion
-                          (String.concat ", " sess.search_paths)
-                      end
-                    in
-                    let err =
-                      {
-                        Ast.message = msg;
-                        loc = Ast.dummy_loc;
-                        phase = Ast.ModuleLoad;
-                        kind = Ast.OtherError;
-                        notes = [];
-                        help = None;
-                      }
-                    in
-                    sess.load_errors <- err :: sess.load_errors;
-                    None
-                | Some resolved ->
-                    let path = resolved.resolved_path in
-                    let source = read_file path in
-                    let origin = resolved.resolved_origin in
-                    parse_module_source ~sess ~module_name ~path ~origin source)
-            )
+        | Some entry -> (
+            match cached_parse_entry ~sess ~base_dir ~module_name entry with
+            | Some (Cached_current parsed) -> Some parsed
+            | Some (Cached_changed_source source) ->
+                Hashtbl.remove sess.parse_cache module_name;
+                parse_module_source ~sess ~module_name ~path:entry.parsed_path
+                  ~origin:entry.parsed_origin source
+            | None ->
+                Hashtbl.remove sess.parse_cache module_name;
+                parse_fresh ())
+        | None -> parse_fresh ()
       in
       match parsed with
       | None -> None
@@ -785,6 +852,24 @@ let get_all_modules ?sess () =
   List.iter (fun m -> visit m.name) all;
   List.rev !result
 
+let prune_parse_cache_to_loaded_modules ?sess () =
+  let sess = sess_of ?sess () in
+  let active = Hashtbl.create 16 in
+  Hashtbl.iter
+    (fun _ (m : loaded_module) -> Hashtbl.replace active m.name ())
+    sess.module_cache;
+  let stale = ref [] in
+  Hashtbl.iter
+    (fun module_name (entry : Session.parsed_module_cache_entry) ->
+      if
+        (not (Session.module_origin_is_std entry.parsed_origin))
+        && not (Hashtbl.mem active module_name)
+      then stale := module_name :: !stale)
+    sess.parse_cache;
+  List.iter
+    (fun module_name -> Hashtbl.remove sess.parse_cache module_name)
+    !stale
+
 (** Look up a module in the cache by name *)
 let find_cached ?sess name =
   Hashtbl.find_opt (sess_of ?sess ()).module_cache name
@@ -806,8 +891,8 @@ let reset ?sess () =
   sess.load_errors <- [];
   sess.prelude_modules_loaded <- false
 
-(** Full reset including parse cache.
-    Use in the LSP server where source files may have changed since last parse. *)
+(** Full reset including parse cache. Use when reusing a session would be
+    incorrect, or when a caller explicitly wants to release parsed modules. *)
 let full_reset ?sess () =
   let sess = sess_of ?sess () in
   reset ~sess ();

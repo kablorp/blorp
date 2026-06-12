@@ -125,31 +125,70 @@ let init_module_paths = Modules.init_module_paths
 let target_module_name path =
   Option.value ~default:"" (Modules.std_module_name_for_source_file path)
 
+let timed f =
+  let start = Unix.gettimeofday () in
+  let result = f () in
+  (result, (Unix.gettimeofday () -. start) *. 1000.0)
+
+let slow_analysis_log_threshold_ms = 100.0
+
+let lsp_profile_enabled () =
+  match Sys.getenv_opt "BLORP_LSP_PROFILE" with
+  | Some ("1" | "true" | "TRUE" | "yes" | "YES") -> true
+  | _ -> false
+
+let log_analysis_timing ~path ~reset_ms ~parse_ms ~load_ms ~module_check_ms
+    ~typecheck_ms ~prune_ms ~total_ms =
+  if total_ms >= slow_analysis_log_threshold_ms || lsp_profile_enabled () then
+    Printf.eprintf
+      "[blorp-lsp] analyze path=%s reset=%.1fms parse=%.1fms load=%.1fms \
+       module_check=%.1fms typecheck=%.1fms prune=%.1fms total=%.1fms\n\
+       %!"
+      path reset_ms parse_ms load_ms module_check_ms typecheck_ms prune_ms
+      total_ms
+
 (** Run the full analysis pipeline on a document.
     Collects parse errors, type errors, and module errors. *)
 let analyze (_state : state) (doc : document) : unit =
   with_document_session doc (fun () ->
+      let total_start = Unix.gettimeofday () in
+      let reset_ms = ref 0.0 in
+      let parse_ms = ref 0.0 in
+      let load_ms = ref 0.0 in
+      let module_check_ms = ref 0.0 in
+      let typecheck_ms = ref 0.0 in
+      let prune_ms = ref 0.0 in
       let path = Lsp_protocol.uri_to_path doc.uri in
       let base_dir = Filename.dirname path in
       let base_dir = if base_dir = "" then "." else base_dir in
 
-      (* Reset state for fresh analysis — full_reset clears parse cache
-     so that edited module files are re-parsed *)
-      Modules.full_reset ();
-      Lexer.reset_state ();
+      (* Reset the active graph, but keep source-stamped parsed modules. Each
+         filesystem cache hit validates the current source hash before reuse. *)
+      let (), elapsed =
+        timed (fun () ->
+            Modules.reset ();
+            Lexer.reset_state ())
+      in
+      reset_ms := elapsed;
 
       (* Phase 1: Parse *)
-      let parse_result =
-        match Modules.parse_source ~filename:path doc.text with
-        | Ok program -> Ok program
-        | Error err -> Error [ err ]
+      let parse_result, elapsed =
+        timed (fun () ->
+            match Modules.parse_source ~filename:path doc.text with
+            | Ok program -> Ok program
+            | Error err -> Error [ err ])
       in
+      parse_ms := elapsed;
 
-      match parse_result with
+      (match parse_result with
       | Error errs ->
           clear_analysis_state doc;
           doc.diagnostics <- errs;
-          doc.parse_errors <- List.map (fun e -> e.message) errs
+          doc.parse_errors <- List.map (fun e -> e.message) errs;
+          let (), elapsed =
+            timed (fun () -> Modules.prune_parse_cache_to_loaded_modules ())
+          in
+          prune_ms := elapsed
       | Ok program ->
           doc.parse_errors <- [];
           doc.source_program <- Some program;
@@ -161,33 +200,49 @@ let analyze (_state : state) (doc : document) : unit =
           init_module_paths base_dir;
           let module_origin = Modules.module_origin_for_source_file path in
           let module_name = target_module_name path in
-          let _modules = Modules.load_imports program base_dir in
-          let module_errors = List.rev (Modules.get_load_errors ()) in
-          let module_type_errors =
-            if module_errors = [] then Pipeline.check_modules () else []
+          let _modules, elapsed =
+            timed (fun () -> Modules.load_imports program base_dir)
           in
+          load_ms := elapsed;
+          let module_errors = List.rev (Modules.get_load_errors ()) in
+          let module_type_errors, elapsed =
+            timed (fun () ->
+                if module_errors = [] then Pipeline.check_modules () else [])
+          in
+          module_check_ms := elapsed;
 
           (* Phase 3: Type check. Keep the parsed AST only on error; successful
-         analysis stores the validated typed compatibility view for hover and
-         definition lookup. *)
-          let type_errors, env =
-            if module_errors <> [] || module_type_errors <> [] then ([], None)
-            else
-              match
-                Typecheck.typecheck_with_env_typed ~module_origin ~module_name
-                  program
-              with
-              | Ok (typed_program, env) ->
-                  doc.typed_program <- Some typed_program;
-                  doc.program <- Some (Typed_ast.program_ast typed_program);
-                  ([], Some env)
-              | Error (errors, env) ->
-                  doc.typed_program <- None;
-                  (errors, Some env)
+             analysis stores the validated typed compatibility view for hover and
+             definition lookup. *)
+          let (type_errors, env), elapsed =
+            timed (fun () ->
+                if module_errors <> [] || module_type_errors <> [] then
+                  ([], None)
+                else
+                  match
+                    Typecheck.typecheck_with_env_typed ~module_origin
+                      ~module_name program
+                  with
+                  | Ok (typed_program, env) ->
+                      doc.typed_program <- Some typed_program;
+                      doc.program <- Some (Typed_ast.program_ast typed_program);
+                      ([], Some env)
+                  | Error (errors, env) ->
+                      doc.typed_program <- None;
+                      (errors, Some env))
           in
+          typecheck_ms := elapsed;
           doc.env <- env;
           doc.diagnostics <- module_errors @ module_type_errors @ type_errors;
-          doc.module_aliases <- module_aliases_of_program program)
+          doc.module_aliases <- module_aliases_of_program program;
+          let (), elapsed =
+            timed (fun () -> Modules.prune_parse_cache_to_loaded_modules ())
+          in
+          prune_ms := elapsed);
+      let total_ms = (Unix.gettimeofday () -. total_start) *. 1000.0 in
+      log_analysis_timing ~path ~reset_ms:!reset_ms ~parse_ms:!parse_ms
+        ~load_ms:!load_ms ~module_check_ms:!module_check_ms
+        ~typecheck_ms:!typecheck_ms ~prune_ms:!prune_ms ~total_ms)
 
 (* ============================================================================
    Diagnostics publishing
