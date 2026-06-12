@@ -1182,6 +1182,24 @@ let resolve_imported_name (imp : Ast.import_decl) (local_name : string) :
          search confirm. *)
       Some local_name
 
+let resolve_imported_name_on_import_line (imp : Ast.import_decl)
+    (clicked_name : string) : string option =
+  match imp.import_symbols with
+  | Some syms -> (
+      match
+        List.find_opt
+          (fun s ->
+            s.sym_name = clicked_name
+            || import_symbol_local_name s = clicked_name)
+          syms
+      with
+      | Some s -> Some s.sym_name
+      | None ->
+          if List.exists (import_symbol_imports_ctor clicked_name) syms then
+            Some clicked_name
+          else None)
+  | None -> Some clicked_name
+
 (** Search a loaded module's AST for [name]; returns its location if found. *)
 let find_in_module (m : Modules.loaded_module) ~(name : string) : Ast.loc option
     =
@@ -1362,20 +1380,23 @@ let find_callable_definition_in_program (program : Typed_ast.program)
   program |> Typed_ast.program_decls |> List.find_map find_decl
 
 let find_loaded_module_by_path ?base_dir module_path =
-  match Modules.find_cached module_path with
-  | Some _ as hit -> hit
-  | None -> (
-      let cached_by_path =
+  let cached_by_name_or_path () =
+    match Modules.find_cached module_path with
+    | Some _ as hit -> hit
+    | None ->
         Modules.get_all_modules ()
         |> List.find_opt (fun (m : Modules.loaded_module) ->
             m.name = module_path || m.path = module_path)
-      in
-      match cached_by_path with
+  in
+  match base_dir with
+  | Some base_dir -> (
+      match Modules.load_module module_path base_dir with
       | Some _ as hit -> hit
-      | None -> (
-          match base_dir with
-          | Some base_dir -> Modules.load_module module_path base_dir
-          | None -> None))
+      | None -> cached_by_name_or_path ())
+  | None -> cached_by_name_or_path ()
+
+let find_loaded_import_module ?base_dir (imp : Ast.import_decl) =
+  find_loaded_module_by_path ?base_dir imp.import_module
 
 let find_callable_definition_in_module (m : Modules.loaded_module)
     ~(callable_id : int) ~(source_name : string) :
@@ -1442,12 +1463,197 @@ let find_resolved_call_definition ?base_dir (program : Typed_ast.program)
 let module_top_loc : Ast.loc =
   { line = 1; column = 1; end_line = 1; end_column = 1; loc_file = None }
 
+let is_inline_whitespace = function ' ' | '\t' -> true | _ -> false
+
+let leading_whitespace_len text =
+  let len = String.length text in
+  let rec loop i =
+    if i >= len || not (is_inline_whitespace text.[i]) then i else loop (i + 1)
+  in
+  loop 0
+
+let skip_inline_whitespace text i =
+  let len = String.length text in
+  let rec loop i =
+    if i >= len || not (is_inline_whitespace text.[i]) then i else loop (i + 1)
+  in
+  loop i
+
+let starts_with_at text ~pos prefix =
+  let prefix_len = String.length prefix in
+  pos >= 0
+  && pos + prefix_len <= String.length text
+  && String.sub text pos prefix_len = prefix
+
+let import_alias_end text start =
+  let start = skip_inline_whitespace text start in
+  let stop = scan_ident_end text start in
+  if stop > start then Some stop else None
+
+let import_header_colon_index (line_text : string) module_end =
+  let len = String.length line_text in
+  let after_module = skip_inline_whitespace line_text module_end in
+  if after_module >= len then None
+  else if line_text.[after_module] = ':' then Some after_module
+  else if
+    starts_with_at line_text ~pos:after_module "as"
+    && (after_module + 2 >= len
+       || not (is_ident_char line_text.[after_module + 2]))
+  then
+    match import_alias_end line_text (after_module + 2) with
+    | Some alias_end ->
+        let after_alias = skip_inline_whitespace line_text alias_end in
+        if after_alias < len && line_text.[after_alias] = ':' then
+          Some after_alias
+        else None
+    | None -> None
+  else None
+
+let import_header_span_on_line (line_text : string) (imp : Ast.import_decl) :
+    (int * int) option =
+  let start = leading_whitespace_len line_text in
+  let module_len = String.length imp.import_module in
+  let module_end = start + module_len in
+  if starts_with_at line_text ~pos:start imp.import_module then
+    let after_module = skip_inline_whitespace line_text module_end in
+    if
+      after_module = String.length line_text
+      || Option.is_some (import_header_colon_index line_text module_end)
+      || starts_with_at line_text ~pos:after_module "as"
+    then Some (start, module_end)
+    else None
+  else None
+
+let import_header_has_symbol_block line_text imp =
+  match import_header_span_on_line line_text imp with
+  | None -> false
+  | Some (_, module_end) -> (
+      match import_header_colon_index line_text module_end with
+      | None -> false
+      | Some colon ->
+          let after_colon = colon + 1 in
+          let suffix =
+            String.sub line_text after_colon
+              (String.length line_text - after_colon)
+          in
+          String.trim suffix = "")
+
+let cursor_inside_span ~(col : int) (start_col, end_col) =
+  col >= start_col && col <= end_col
+
+let rec collect_imports acc = function
+  | [] -> List.rev acc
+  | (d : Ast.decl) :: rest -> (
+      match d.decl_desc with
+      | DImport imp -> collect_imports (imp :: acc) rest
+      | DPrivate inner -> collect_imports acc (inner :: rest)
+      | _ -> collect_imports acc rest)
+
+let find_import_module_at_cursor (program : Ast.program) ~(text : string)
+    ~(line : int) ~(col : int) : Ast.import_decl option =
+  match line_at text ~line with
+  | None -> None
+  | Some line_text ->
+      collect_imports [] program
+      |> List.find_opt (fun imp ->
+          match import_header_span_on_line line_text imp with
+          | Some span -> cursor_inside_span ~col span
+          | None -> false)
+
+let find_import_module_span_at_cursor (program : Ast.program) ~(text : string)
+    ~(line : int) ~(col : int) : (int * int) option =
+  match line_at text ~line with
+  | None -> None
+  | Some line_text ->
+      collect_imports [] program
+      |> List.find_map (fun imp ->
+          match import_header_span_on_line line_text imp with
+          | Some span when cursor_inside_span ~col span -> Some span
+          | _ -> None)
+
+let find_import_header_on_line imports line_text =
+  List.find_map
+    (fun imp ->
+      match import_header_span_on_line line_text imp with
+      | Some span -> Some (imp, span)
+      | None -> None)
+    imports
+
+let line_is_inside_import_symbol_block lines ~header_line ~target_line
+    ~header_indent =
+  let rec loop line_index =
+    if line_index > target_line then true
+    else
+      let line_text = lines.(line_index) in
+      if String.trim line_text = "" then loop (line_index + 1)
+      else if leading_whitespace_len line_text > header_indent then
+        loop (line_index + 1)
+      else false
+  in
+  loop (header_line + 1)
+
+let find_import_declaration_line_at_cursor (program : Ast.program)
+    ~(text : string) ~(line : int) ~(col : int) : Ast.import_decl option =
+  let lines = String.split_on_char '\n' text |> Array.of_list in
+  if line < 0 || line >= Array.length lines then None
+  else
+    let imports = collect_imports [] program in
+    let line_text = lines.(line) in
+    match find_import_header_on_line imports line_text with
+    | Some (imp, (start_col, _)) when col >= start_col -> Some imp
+    | _ ->
+        let target_indent = leading_whitespace_len line_text in
+        let rec scan header_line =
+          if header_line < 0 then None
+          else
+            let header_text = lines.(header_line) in
+            match find_import_header_on_line imports header_text with
+            | Some (imp, _) ->
+                let header_indent = leading_whitespace_len header_text in
+                if
+                  target_indent > header_indent
+                  && import_header_has_symbol_block header_text imp
+                  && line_is_inside_import_symbol_block lines ~header_line
+                       ~target_line:line ~header_indent
+                then Some imp
+                else None
+            | None -> scan (header_line - 1)
+        in
+        scan (line - 1)
+
+let find_import_module_definition_at_cursor ?base_dir (program : Ast.program)
+    ~(text : string) ~(line : int) ~(col : int) : (string * Ast.loc) option =
+  match find_import_module_at_cursor program ~text ~line ~col with
+  | None -> None
+  | Some imp -> (
+      match find_loaded_import_module ?base_dir imp with
+      | Some m -> Some (m.path, module_top_loc)
+      | None -> None)
+
 (** Does [name] refer to the module imported by [imp]? Matches either the
     explicit `as` alias or the last segment of the module path. *)
 let import_names_module (imp : Ast.import_decl) (name : string) : bool =
   match imp.import_alias with
   | Some a -> a = name
   | None -> Filename.basename imp.import_module = name
+
+let find_imported_name_definition_at_cursor ?base_dir (program : Ast.program)
+    ~(text : string) ~(line : int) ~(col : int) ~(name : string) :
+    (string * Ast.loc) option =
+  match find_import_declaration_line_at_cursor program ~text ~line ~col with
+  | None -> None
+  | Some imp -> (
+      match find_loaded_import_module ?base_dir imp with
+      | None -> None
+      | Some m -> (
+          if import_names_module imp name then Some (m.path, module_top_loc)
+          else
+            match resolve_imported_name_on_import_line imp name with
+            | Some original -> (
+                match find_in_module m ~name:original with
+                | Some loc -> Some (m.path, loc)
+                | None -> None)
+            | None -> None))
 
 (** Find [name] across modules imported by [program] and across the prelude
     UFCS modules (list/option/string/...). Returns the module's file path and
@@ -1458,10 +1664,10 @@ let import_names_module (imp : Ast.import_decl) (name : string) : bool =
       2. Module itself — click on `option` or an alias `L` jumps to top-of-file.
       3. Symbol reachable through a prelude UFCS module.
       4. Trait declaration reachable through implicit core trait bounds. *)
-let find_cross_module_definition (program : Ast.program) ~(name : string) :
-    (string * Ast.loc) option =
+let find_cross_module_definition ?base_dir (program : Ast.program)
+    ~(name : string) : (string * Ast.loc) option =
   let try_module mod_name lookup_name =
-    match Modules.find_cached mod_name with
+    match find_loaded_module_by_path ?base_dir mod_name with
     | Some m -> (
         match find_in_module m ~name:lookup_name with
         | Some loc -> Some (m.path, loc)
@@ -1469,7 +1675,7 @@ let find_cross_module_definition (program : Ast.program) ~(name : string) :
     | None -> None
   in
   let try_trait_module mod_name lookup_name =
-    match Modules.find_cached mod_name with
+    match find_loaded_module_by_path ?base_dir mod_name with
     | Some m -> (
         match find_trait_in_module m ~name:lookup_name with
         | Some loc -> Some (m.path, loc)
@@ -1477,17 +1683,9 @@ let find_cross_module_definition (program : Ast.program) ~(name : string) :
     | None -> None
   in
   let try_module_itself (imp : Ast.import_decl) : (string * Ast.loc) option =
-    match Modules.find_cached imp.import_module with
+    match find_loaded_import_module ?base_dir imp with
     | Some m -> Some (m.path, module_top_loc)
     | None -> None
-  in
-  let rec collect_imports acc = function
-    | [] -> List.rev acc
-    | (d : Ast.decl) :: rest -> (
-        match d.decl_desc with
-        | DImport imp -> collect_imports (imp :: acc) rest
-        | DPrivate inner -> collect_imports acc (inner :: rest)
-        | _ -> collect_imports acc rest)
   in
   let imports = collect_imports [] program in
   (* 1. Exported symbol via a selective import. *)

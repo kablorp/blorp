@@ -66,6 +66,12 @@ val typecheck_module_only_typed :
 (** Parse and type-check a module, returning the final state and a validated
     typed program. *)
 
+val check_modules :
+  ?debug:bool -> ?allow_debug_only_calls:bool -> unit -> Ast.compiler_error list
+(** Type-check all currently loaded modules in the active {!Session.t}, caching
+    their typed declarations and import bindings. This is the dependency
+    typecheck stage used before checking a target module. *)
+
 val compile :
   ?debug:bool ->
   ?allow_debug_only_calls:bool ->

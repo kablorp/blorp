@@ -3,18 +3,9 @@
 open Blorp
 
 let document ?(module_aliases = []) ~uri text : Lsp_state.document =
-  {
-    uri;
-    version = 1;
-    text;
-    diagnostics = [];
-    parse_errors = [];
-    source_program = None;
-    program = None;
-    typed_program = None;
-    env = None;
-    module_aliases;
-  }
+  let doc = Lsp_state.create_document ~uri ~version:1 ~text () in
+  doc.module_aliases <- module_aliases;
+  doc
 
 let analyze_doc source =
   Test_helpers.with_isolated_env (fun () ->
@@ -43,6 +34,27 @@ let analyze_file path source =
       let doc = document ~uri source in
       Lsp_state.analyze state doc;
       doc)
+
+let write_file path contents =
+  let oc = open_out path in
+  Fun.protect
+    ~finally:(fun () -> close_out oc)
+    (fun () -> output_string oc contents)
+
+let rec remove_tree path =
+  if Sys.file_exists path then
+    if Sys.is_directory path then begin
+      Sys.readdir path
+      |> Array.iter (fun name -> remove_tree (Filename.concat path name));
+      Unix.rmdir path
+    end
+    else Sys.remove path
+
+let with_temp_project f =
+  let root = Filename.temp_file "blorp-lsp-state" "" in
+  Sys.remove root;
+  Unix.mkdir root 0o700;
+  Fun.protect ~finally:(fun () -> remove_tree root) (fun () -> f root)
 
 let test_module_aliases_include_qualified_imports () =
   let doc =
@@ -99,6 +111,52 @@ let test_std_source_uses_stdlib_origin () =
     "std files allow builtin declarations in LSP analysis" false
     builtin_policy_error
 
+let test_loaded_module_callback_types_share_import_origins () =
+  with_temp_project (fun root ->
+      write_file
+        (Filename.concat root "json_fields.brp")
+        (String.concat "\n"
+           [
+             "import:";
+             "    json: JsonValue";
+             "";
+             "pure func apply_json[T](";
+             "    value: JsonValue,";
+             "    parse_item: pure (JsonValue) -> Result[T, String],";
+             ") -> Result[T, String]:";
+             "    parse_item(value)";
+             "";
+           ]);
+      write_file
+        (Filename.concat root "type_documents.brp")
+        (String.concat "\n"
+           [
+             "import:";
+             "    json: JsonValue";
+             "";
+             "pure func parse_type(value: JsonValue) -> Result[Int, String]:";
+             "    Ok(1)";
+             "";
+           ]);
+      let main_path = Filename.concat root "main.brp" in
+      let source =
+        String.concat "\n"
+          [
+            "import:";
+            "    ./json_fields: apply_json";
+            "    ./type_documents: parse_type";
+            "    json: JsonValue";
+            "";
+            "pure func parse(value: JsonValue) -> Result[Int, String]:";
+            "    value.apply_json(parse_type)";
+            "";
+          ]
+      in
+      let doc = analyze_file main_path source in
+      Alcotest.(check string)
+        "LSP analysis keeps std JsonValue identity across loaded modules" ""
+        (Test_helpers.format_errors doc.diagnostics))
+
 let suite =
   [
     ( "state",
@@ -109,5 +167,7 @@ let suite =
           test_parse_error_clears_stale_analysis_state;
         Alcotest.test_case "std source uses stdlib origin" `Quick
           test_std_source_uses_stdlib_origin;
+        Alcotest.test_case "loaded module callback types share import origins"
+          `Quick test_loaded_module_callback_types_share_import_origins;
       ] );
   ]

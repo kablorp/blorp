@@ -5,20 +5,7 @@ open Blorp
 let analyzed_state_unisolated source =
   let uri = "file:///tmp/lsp_completion_integration.brp" in
   let state = Lsp_state.create () in
-  let doc : Lsp_state.document =
-    {
-      uri;
-      version = 1;
-      text = source;
-      diagnostics = [];
-      parse_errors = [];
-      source_program = None;
-      program = None;
-      typed_program = None;
-      env = None;
-      module_aliases = [];
-    }
-  in
+  let doc = Lsp_state.create_document ~uri ~version:1 ~text:source () in
   Hashtbl.add state.documents uri doc;
   Lsp_state.analyze state doc;
   if doc.diagnostics <> [] then
@@ -334,7 +321,13 @@ let test_completion_resolves_selective_import_alias_members () =
                O -> option, got [%s]"
               aliases
       | None -> Alcotest.fail "missing analyzed document");
-      let direct_items = Lsp_completion.completions_from_module "option" "" in
+      let direct_items =
+        match Lsp_state.find_document state uri with
+        | Some doc ->
+            Lsp_state.with_document_session doc (fun () ->
+                Lsp_completion.completions_from_module "option" "")
+        | None -> Alcotest.fail "missing analyzed document"
+      in
       let _ = item_detail "None" direct_items in
       let items = completion_items_at state uri ~line:4 ~character:27 in
       let _ = item_detail "None" items in

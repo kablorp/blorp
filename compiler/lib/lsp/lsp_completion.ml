@@ -1027,131 +1027,136 @@ let handle_completion (state : Lsp_state.state) (params : json) : json =
       let position = Lsp_protocol.position_of_json pos_json in
       match (Lsp_state.find_document state uri, position) with
       | Some doc, Some pos ->
-          (* Get the current line text *)
-          let lines = String.split_on_char '\n' doc.text in
-          let line_text =
-            if pos.line < List.length lines then List.nth lines pos.line else ""
-          in
-          let prefix, qualifier =
-            get_completion_context line_text pos.character
-          in
-          let type_context =
-            is_type_completion_context line_text pos.character
-          in
-          let record_field_context =
-            match (qualifier, doc.program) with
-            | None, Some program ->
-                record_field_completion_context program line_text ~line:pos.line
-                  ~character:pos.character
-            | _ -> None
-          in
-          let items =
-            match qualifier with
-            | Some alias -> (
-                (* Module-qualified completion first; otherwise treat the
+          Lsp_state.with_document_session doc (fun () ->
+              (* Get the current line text *)
+              let lines = String.split_on_char '\n' doc.text in
+              let line_text =
+                if pos.line < List.length lines then List.nth lines pos.line
+                else ""
+              in
+              let prefix, qualifier =
+                get_completion_context line_text pos.character
+              in
+              let type_context =
+                is_type_completion_context line_text pos.character
+              in
+              let record_field_context =
+                match (qualifier, doc.program) with
+                | None, Some program ->
+                    record_field_completion_context program line_text
+                      ~line:pos.line ~character:pos.character
+                | _ -> None
+              in
+              let items =
+                match qualifier with
+                | Some alias -> (
+                    (* Module-qualified completion first; otherwise treat the
                    qualifier as a simple receiver expression for UFCS methods. *)
-                match List.assoc_opt alias doc.module_aliases with
-                | Some path ->
-                    if type_context then
-                      completions_from_module_types path prefix
-                    else completions_from_module path prefix
-                | None when type_context -> []
+                    match List.assoc_opt alias doc.module_aliases with
+                    | Some path ->
+                        if type_context then
+                          completions_from_module_types path prefix
+                        else completions_from_module path prefix
+                    | None when type_context -> []
+                    | None -> (
+                        match (doc.program, doc.env) with
+                        | Some program, Some env -> (
+                            match
+                              receiver_type_from_local_scope program
+                                ~line:pos.line ~character:pos.character alias
+                            with
+                            | Some receiver_ty ->
+                                let field_items, field_names =
+                                  completions_from_receiver_fields env
+                                    receiver_ty prefix
+                                    ~module_aliases:doc.module_aliases
+                                in
+                                let method_items =
+                                  completions_from_receiver_methods env
+                                    receiver_ty prefix ~skip:(fun name ->
+                                      Hashtbl.mem field_names name)
+                                in
+                                field_items @ method_items
+                            | None -> [])
+                        | _ -> []))
                 | None -> (
-                    match (doc.program, doc.env) with
-                    | Some program, Some env -> (
-                        match
-                          receiver_type_from_local_scope program ~line:pos.line
-                            ~character:pos.character alias
-                        with
-                        | Some receiver_ty ->
-                            let field_items, field_names =
-                              completions_from_receiver_fields env receiver_ty
-                                prefix ~module_aliases:doc.module_aliases
-                            in
-                            let method_items =
-                              completions_from_receiver_methods env receiver_ty
-                                prefix ~skip:(fun name ->
-                                  Hashtbl.mem field_names name)
-                            in
-                            field_items @ method_items
-                        | None -> [])
-                    | _ -> []))
-            | None -> (
-                (* General completion: record fields in field-name slots,
+                    (* General completion: record fields in field-name slots,
                    type-only in annotation contexts, otherwise identifiers +
                    keywords. *)
-                let file = Lsp_protocol.uri_to_path uri in
-                match (record_field_context, doc.env) with
-                | Some context, Some env ->
-                    let field_items, _ =
-                      completions_from_receiver_fields env context.record_ty
-                        prefix ~module_aliases:doc.module_aliases
-                        ~skip:(fun name ->
-                          Hashtbl.mem context.assigned_fields name)
-                    in
-                    field_items
-                | Some _, None -> []
-                | None, _ ->
-                    if type_context then (
-                      let type_param_items, type_param_names =
-                        match doc.source_program with
-                        | Some program ->
-                            completions_from_enclosing_type_params program
-                              ~line:pos.line ~character:pos.character prefix
-                        | None -> ([], Hashtbl.create 0)
-                      in
-                      let source_items, source_names =
-                        match doc.source_program with
-                        | Some program ->
-                            completions_from_source_types program ~file prefix
-                              ~skip:(fun name ->
-                                Hashtbl.mem type_param_names name)
-                        | None -> ([], Hashtbl.create 0)
-                      in
-                      Hashtbl.iter
-                        (fun name () ->
-                          Hashtbl.replace type_param_names name ())
-                        source_names;
-                      let env_items =
-                        match doc.env with
-                        | Some env ->
-                            completions_from_env_types
-                              ~skip:(fun name ->
-                                Hashtbl.mem type_param_names name)
-                              env prefix
-                        | None -> []
-                      in
-                      type_param_items @ source_items @ env_items)
-                    else
-                      let typed_items, typed_names =
-                        match doc.typed_program with
-                        | Some typed_program ->
-                            completions_from_typed_program typed_program ~file
-                              prefix
-                        | None -> ([], Hashtbl.create 0)
-                      in
-                      let local_items, local_names =
-                        match doc.program with
-                        | Some program ->
-                            completions_from_local_scope program ~line:pos.line
-                              ~character:pos.character prefix ~skip:(fun name ->
-                                Hashtbl.mem typed_names name)
-                        | None -> ([], Hashtbl.create 0)
-                      in
-                      Hashtbl.iter
-                        (fun name () -> Hashtbl.replace typed_names name ())
-                        local_names;
-                      let env_items =
-                        match doc.env with
-                        | Some env ->
-                            completions_from_env
-                              ~skip:(fun name -> Hashtbl.mem typed_names name)
-                              env prefix
-                        | None -> []
-                      in
-                      let kw_items = completions_from_keywords prefix in
-                      typed_items @ local_items @ env_items @ kw_items)
-          in
-          Object [ ("isIncomplete", Bool false); ("items", Array items) ]
+                    let file = Lsp_protocol.uri_to_path uri in
+                    match (record_field_context, doc.env) with
+                    | Some context, Some env ->
+                        let field_items, _ =
+                          completions_from_receiver_fields env context.record_ty
+                            prefix ~module_aliases:doc.module_aliases
+                            ~skip:(fun name ->
+                              Hashtbl.mem context.assigned_fields name)
+                        in
+                        field_items
+                    | Some _, None -> []
+                    | None, _ ->
+                        if type_context then (
+                          let type_param_items, type_param_names =
+                            match doc.source_program with
+                            | Some program ->
+                                completions_from_enclosing_type_params program
+                                  ~line:pos.line ~character:pos.character prefix
+                            | None -> ([], Hashtbl.create 0)
+                          in
+                          let source_items, source_names =
+                            match doc.source_program with
+                            | Some program ->
+                                completions_from_source_types program ~file
+                                  prefix ~skip:(fun name ->
+                                    Hashtbl.mem type_param_names name)
+                            | None -> ([], Hashtbl.create 0)
+                          in
+                          Hashtbl.iter
+                            (fun name () ->
+                              Hashtbl.replace type_param_names name ())
+                            source_names;
+                          let env_items =
+                            match doc.env with
+                            | Some env ->
+                                completions_from_env_types
+                                  ~skip:(fun name ->
+                                    Hashtbl.mem type_param_names name)
+                                  env prefix
+                            | None -> []
+                          in
+                          type_param_items @ source_items @ env_items)
+                        else
+                          let typed_items, typed_names =
+                            match doc.typed_program with
+                            | Some typed_program ->
+                                completions_from_typed_program typed_program
+                                  ~file prefix
+                            | None -> ([], Hashtbl.create 0)
+                          in
+                          let local_items, local_names =
+                            match doc.program with
+                            | Some program ->
+                                completions_from_local_scope program
+                                  ~line:pos.line ~character:pos.character prefix
+                                  ~skip:(fun name ->
+                                    Hashtbl.mem typed_names name)
+                            | None -> ([], Hashtbl.create 0)
+                          in
+                          Hashtbl.iter
+                            (fun name () -> Hashtbl.replace typed_names name ())
+                            local_names;
+                          let env_items =
+                            match doc.env with
+                            | Some env ->
+                                completions_from_env
+                                  ~skip:(fun name ->
+                                    Hashtbl.mem typed_names name)
+                                  env prefix
+                            | None -> []
+                          in
+                          let kw_items = completions_from_keywords prefix in
+                          typed_items @ local_items @ env_items @ kw_items)
+              in
+              Object [ ("isIncomplete", Bool false); ("items", Array items) ])
       | _ -> Object [ ("isIncomplete", Bool false); ("items", Array []) ])
   | _ -> Object [ ("isIncomplete", Bool false); ("items", Array []) ]

@@ -15,6 +15,7 @@ type document = {
   uri : string;
   version : int;
   text : string;
+  session : Session.t;
   mutable diagnostics : compiler_error list;
   mutable parse_errors : string list;
   mutable source_program : program option;
@@ -49,6 +50,23 @@ let create () : state =
     initialized = false;
     client_capabilities = default_client_capabilities;
   }
+
+let create_document ?session ~uri ~version ~text () : document =
+  {
+    uri;
+    version;
+    text;
+    session = Option.value session ~default:(Session.create ());
+    diagnostics = [];
+    parse_errors = [];
+    source_program = None;
+    program = None;
+    typed_program = None;
+    env = None;
+    module_aliases = [];
+  }
+
+let with_document_session doc f = Session.with_current doc.session f
 
 let get_nested path json =
   List.fold_left
@@ -110,59 +128,66 @@ let target_module_name path =
 (** Run the full analysis pipeline on a document.
     Collects parse errors, type errors, and module errors. *)
 let analyze (_state : state) (doc : document) : unit =
-  let path = Lsp_protocol.uri_to_path doc.uri in
-  let base_dir = Filename.dirname path in
-  let base_dir = if base_dir = "" then "." else base_dir in
+  with_document_session doc (fun () ->
+      let path = Lsp_protocol.uri_to_path doc.uri in
+      let base_dir = Filename.dirname path in
+      let base_dir = if base_dir = "" then "." else base_dir in
 
-  (* Reset state for fresh analysis — full_reset clears parse cache
+      (* Reset state for fresh analysis — full_reset clears parse cache
      so that edited module files are re-parsed *)
-  Modules.full_reset ();
-  Lexer.reset_state ();
+      Modules.full_reset ();
+      Lexer.reset_state ();
 
-  (* Phase 1: Parse *)
-  let parse_result =
-    match Modules.parse_source ~filename:path doc.text with
-    | Ok program -> Ok program
-    | Error err -> Error [ err ]
-  in
+      (* Phase 1: Parse *)
+      let parse_result =
+        match Modules.parse_source ~filename:path doc.text with
+        | Ok program -> Ok program
+        | Error err -> Error [ err ]
+      in
 
-  match parse_result with
-  | Error errs ->
-      clear_analysis_state doc;
-      doc.diagnostics <- errs;
-      doc.parse_errors <- List.map (fun e -> e.message) errs
-  | Ok program ->
-      doc.parse_errors <- [];
-      doc.source_program <- Some program;
-      doc.program <- Some program;
-      doc.typed_program <- None;
-      doc.module_aliases <- [];
+      match parse_result with
+      | Error errs ->
+          clear_analysis_state doc;
+          doc.diagnostics <- errs;
+          doc.parse_errors <- List.map (fun e -> e.message) errs
+      | Ok program ->
+          doc.parse_errors <- [];
+          doc.source_program <- Some program;
+          doc.program <- Some program;
+          doc.typed_program <- None;
+          doc.module_aliases <- [];
 
-      (* Phase 2: Load modules *)
-      init_module_paths base_dir;
-      let module_origin = Modules.module_origin_for_source_file path in
-      let module_name = target_module_name path in
-      let _modules = Modules.load_imports program base_dir in
-      let module_errors = List.rev (Modules.get_load_errors ()) in
+          (* Phase 2: Load modules *)
+          init_module_paths base_dir;
+          let module_origin = Modules.module_origin_for_source_file path in
+          let module_name = target_module_name path in
+          let _modules = Modules.load_imports program base_dir in
+          let module_errors = List.rev (Modules.get_load_errors ()) in
+          let module_type_errors =
+            if module_errors = [] then Pipeline.check_modules () else []
+          in
 
-      (* Phase 3: Type check. Keep the parsed AST only on error; successful
+          (* Phase 3: Type check. Keep the parsed AST only on error; successful
          analysis stores the validated typed compatibility view for hover and
          definition lookup. *)
-      let type_errors, env =
-        match
-          Typecheck.typecheck_with_env_typed ~module_origin ~module_name program
-        with
-        | Ok (typed_program, env) ->
-            doc.typed_program <- Some typed_program;
-            doc.program <- Some (Typed_ast.program_ast typed_program);
-            ([], env)
-        | Error (errors, env) ->
-            doc.typed_program <- None;
-            (errors, env)
-      in
-      doc.env <- Some env;
-      doc.diagnostics <- module_errors @ type_errors;
-      doc.module_aliases <- module_aliases_of_program program
+          let type_errors, env =
+            if module_errors <> [] || module_type_errors <> [] then ([], None)
+            else
+              match
+                Typecheck.typecheck_with_env_typed ~module_origin ~module_name
+                  program
+              with
+              | Ok (typed_program, env) ->
+                  doc.typed_program <- Some typed_program;
+                  doc.program <- Some (Typed_ast.program_ast typed_program);
+                  ([], Some env)
+              | Error (errors, env) ->
+                  doc.typed_program <- None;
+                  (errors, Some env)
+          in
+          doc.env <- env;
+          doc.diagnostics <- module_errors @ module_type_errors @ type_errors;
+          doc.module_aliases <- module_aliases_of_program program)
 
 (* ============================================================================
    Diagnostics publishing

@@ -139,9 +139,9 @@ meaningful, clear, and proportional to their scope.
 
 ### Before you write code
 
-**1. Write a failing test first.** We strongly prefer TDD. Define what success looks like 
-before writing implementation. For parser changes: `should_pass/` and `should_fail/` cases. For 
-type system changes: `infer/` and `typecheck/` cases. For runtime behavior: `test_blorp/` tests. 
+**1. Write a failing test first.** We strongly prefer TDD. Define what success looks like
+before writing implementation. For parser changes: `should_pass/` and `should_fail/` cases. For
+type system changes: `infer/` and `typecheck/` cases. For runtime behavior: `test_blorp/` tests.
 For bug fixes: a regression test that fails before the fix and passes after.
 
 **2. One change per change.** Fix the bug, add the feature, or refactor — not all three.

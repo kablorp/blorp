@@ -403,15 +403,16 @@ let handle_signature_help (state : Lsp_state.state) (params : json) : json =
       let uri = Lsp_protocol.get_uri td in
       let position = Lsp_protocol.position_of_json pos_json in
       match (Lsp_state.find_document state uri, position) with
-      | Some doc, Some pos -> (
-          match doc.env with
-          | Some env -> (
-              match find_enclosing_call doc pos with
-              | Some (name, active_param) ->
-                  build_signature ?typed_program:doc.typed_program
-                    ~file:(Lsp_protocol.uri_to_path uri)
-                    env name active_param doc.module_aliases
+      | Some doc, Some pos ->
+          Lsp_state.with_document_session doc (fun () ->
+              match doc.env with
+              | Some env -> (
+                  match find_enclosing_call doc pos with
+                  | Some (name, active_param) ->
+                      build_signature ?typed_program:doc.typed_program
+                        ~file:(Lsp_protocol.uri_to_path uri)
+                        env name active_param doc.module_aliases
+                  | None -> Null)
               | None -> Null)
-          | None -> Null)
       | _ -> Null)
   | _ -> Null

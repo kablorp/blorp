@@ -200,6 +200,74 @@ RESP=$(read_response)
 check "definition on imported name returns URI" "$RESP" '"uri"'
 check "definition on imported name points to std/option" "$RESP" 'std/option\.brp'
 
+# Cross-module: click through a user-defined module path, selective import item,
+# and imported call site.
+USER_MOD_DIR="$TMPDIR_LSP/helpers"
+mkdir -p "$USER_MOD_DIR"
+USER_MOD_FILE="$USER_MOD_DIR/math.brp"
+cat > "$USER_MOD_FILE" <<'BRP'
+func triple(x: Int) -> Int:
+    x * 3
+BRP
+USER_MAIN_URI="file://${TMPDIR_LSP}/main.brp"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${USER_MAIN_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    ./helpers/math: triple\\n\\nfunc main(args: List[String]) -> Int:\\n    triple(3)\\n\"}}}"
+read_response > /dev/null
+
+# Cursor on `/` inside `./helpers/math` at line 1 character 5
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${USER_MAIN_URI}\"},\"position\":{\"line\":1,\"character\":5}}}"
+RESP=$(read_response)
+check "definition on user module path returns URI" "$RESP" '"uri"'
+check "definition on user module path points to module file" "$RESP" 'helpers/math\.brp'
+
+# Cursor on imported `triple` at line 1 character 22
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${USER_MAIN_URI}\"},\"position\":{\"line\":1,\"character\":22}}}"
+RESP=$(read_response)
+check "definition on user imported item returns URI" "$RESP" '"uri"'
+check "definition on user imported item points to function" "$RESP" 'helpers/math\.brp'
+check "definition on user imported item points to line 0" "$RESP" '"line":0'
+
+# Cursor on call-site `triple` at line 4 character 6
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${USER_MAIN_URI}\"},\"position\":{\"line\":4,\"character\":6}}}"
+RESP=$(read_response)
+check "definition on user imported call returns URI" "$RESP" '"uri"'
+check "definition on user imported call points to function" "$RESP" 'helpers/math\.brp'
+
+# Cross-module: multiline relative import items should keep the import line's
+# module origin, even when another imported module exports the same source name.
+mkdir -p "$TMPDIR_LSP/left" "$TMPDIR_LSP/right"
+cat > "$TMPDIR_LSP/left/maker.brp" <<'BRP'
+func make() -> Int:
+    1
+BRP
+cat > "$TMPDIR_LSP/right/maker.brp" <<'BRP'
+func make() -> Int:
+    2
+BRP
+MULTILINE_IMPORT_URI="file://${TMPDIR_LSP}/multiline_import.brp"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${MULTILINE_IMPORT_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    ./left/maker:\\n        make as make_left\\n    ./right/maker:\\n        make\\n\\nfunc main(args: List[String]) -> Int:\\n    make_left() + make()\\n\"}}}"
+read_response > /dev/null
+
+# Cursor on the original `make` in the first multiline import item.
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${MULTILINE_IMPORT_URI}\"},\"position\":{\"line\":2,\"character\":10}}}"
+RESP=$(read_response)
+check "definition on multiline relative import item returns URI" "$RESP" '"uri"'
+check "definition on multiline relative import item keeps origin" "$RESP" 'left/maker\.brp'
+
+# Std selective imports used by formatter sources.
+JSON_IMPORT_URI="${WORKSPACE_URI}/tests/.lsp_scratch_json_import.brp"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${JSON_IMPORT_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    json: JsonValue, parse_json\\n\\nfunc main(args: List[String]) -> Int:\\n    0\\n\"}}}"
+read_response > /dev/null
+
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${JSON_IMPORT_URI}\"},\"position\":{\"line\":1,\"character\":11}}}"
+RESP=$(read_response)
+check "definition on JsonValue import item returns URI" "$RESP" '"uri"'
+check "definition on JsonValue import item points to std/json" "$RESP" 'std/json\.brp'
+
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${JSON_IMPORT_URI}\"},\"position\":{\"line\":1,\"character\":22}}}"
+RESP=$(read_response)
+check "definition on parse_json import item returns URI" "$RESP" '"uri"'
+check "definition on parse_json import item points to std/json" "$RESP" 'std/json\.brp'
+
 # Click on the module path INSIDE an import block — should jump to the module file.
 IMPORT_MOD_URI="${WORKSPACE_URI}/tests/.lsp_scratch_import_mod.brp"
 send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${IMPORT_MOD_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    option: get_or\\n\\nfunc main(args: List[String]) -> Int:\\n    0\\n\"}}}"

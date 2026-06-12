@@ -5,13 +5,14 @@ import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
+import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.TextRange
-import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.platform.lsp.api.LspServer
 import com.intellij.platform.lsp.api.LspServerManager
 import com.intellij.platform.lsp.api.LspServerState
+import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiManager
@@ -29,16 +30,25 @@ class BlorpGotoDeclarationHandler : GotoDeclarationHandler {
         offset: Int,
         editor: Editor
     ): Array<PsiElement>? {
-        val sourceFile = sourceElement?.containingFile ?: return null
-        val virtualFile = sourceFile.virtualFile ?: return null
+        val document = editor.document
+        val project = sourceElement?.project ?: editor.project ?: return null
+        val sourceFile =
+            sourceElement?.containingFile
+                ?: PsiDocumentManager.getInstance(project).getPsiFile(document)
+                ?: return null
+        val virtualFile = sourceFile.virtualFile ?: FileDocumentManager.getInstance().getFile(document) ?: return null
         if (!virtualFile.isBlorpSourceFile()) {
             return null
         }
 
-        val project = sourceElement.project
-        val document = editor.document
         val navigationOffset =
-            navigationOffsetForIdentifier(sourceElement, document, offset) ?: return null
+            navigationOffsetForTarget(sourceElement, document, offset)
+                ?: run {
+                    LOG.info(
+                        "Blorp goto declaration rejected local target for ${virtualFile.path} at offset $offset"
+                    )
+                    return null
+                }
         val position = lspPositionAtOffset(document, navigationOffset) ?: return null
         val serverManager = LspServerManager.getInstance(project)
         val servers = serverManager.getServersForProvider(BlorpLspServerSupportProvider::class.java)
@@ -72,8 +82,8 @@ class BlorpGotoDeclarationHandler : GotoDeclarationHandler {
         return null
     }
 
-    private fun navigationOffsetForIdentifier(
-        sourceElement: PsiElement,
+    private fun navigationOffsetForTarget(
+        sourceElement: PsiElement?,
         document: Document,
         offset: Int
     ): Int? {
@@ -84,8 +94,14 @@ class BlorpGotoDeclarationHandler : GotoDeclarationHandler {
 
         val safeOffset = offset.coerceIn(0, text.length)
         if (safeOffset < text.length) {
-            val identifierRange = identifierRangeAt(text, safeOffset)
-            if (identifierRange != null && sourceElementIsWithin(sourceElement, identifierRange)) {
+            if (BlorpNavigationRanges.importTargetRangeAt(text, safeOffset) != null) {
+                return safeOffset
+            }
+            if (sourceElement == null) {
+                return null
+            }
+            val targetRange = BlorpNavigationRanges.identifierRangeAt(text, safeOffset)
+            if (targetRange != null && sourceElementIsWithin(sourceElement, targetRange)) {
                 return safeOffset
             }
         }
@@ -95,8 +111,15 @@ class BlorpGotoDeclarationHandler : GotoDeclarationHandler {
             return null
         }
 
-        val identifierRange = identifierRangeAt(text, previousOffset) ?: return null
-        return if (sourceElementIsWithin(sourceElement, identifierRange)) {
+        if (BlorpNavigationRanges.importTargetRangeAt(text, previousOffset) != null) {
+            return previousOffset
+        }
+        if (sourceElement == null) {
+            return null
+        }
+
+        val targetRange = BlorpNavigationRanges.identifierRangeAt(text, previousOffset) ?: return null
+        return if (sourceElementIsWithin(sourceElement, targetRange)) {
             // Mouse offsets can land just after the painted glyph; only accept
             // that boundary case when JetBrains identified the exact token leaf.
             previousOffset
@@ -105,55 +128,10 @@ class BlorpGotoDeclarationHandler : GotoDeclarationHandler {
         }
     }
 
-    private fun sourceElementIsWithin(sourceElement: PsiElement, identifierRange: TextRange): Boolean {
+    private fun sourceElementIsWithin(sourceElement: PsiElement, targetRange: TextRange): Boolean {
         val sourceRange = sourceElement.textRange ?: return false
-        return sourceRange.startOffset >= identifierRange.startOffset &&
-            sourceRange.endOffset <= identifierRange.endOffset
-    }
-
-    private fun identifierRangeAt(text: CharSequence, offset: Int): TextRange? {
-        if (offset < 0 || offset >= text.length) {
-            return null
-        }
-
-        if (text[offset] == '#') {
-            if (offset + 1 >= text.length || !BlorpIdentifiers.isStart(text[offset + 1])) {
-                return null
-            }
-
-            var end = offset + 2
-            while (end < text.length && BlorpIdentifiers.isBody(text[end])) {
-                end += 1
-            }
-            return TextRange(offset, end)
-        }
-
-        if (!BlorpIdentifiers.isBody(text[offset])) {
-            return null
-        }
-
-        var start = offset
-        while (start > 0 && BlorpIdentifiers.isBody(text[start - 1])) {
-            start -= 1
-        }
-        if (start > 0 && text[start - 1] == '#') {
-            start -= 1
-        }
-
-        if (text[start] == '#') {
-            if (start + 1 >= text.length || !BlorpIdentifiers.isStart(text[start + 1])) {
-                return null
-            }
-        } else if (!BlorpIdentifiers.isStart(text[start])) {
-            return null
-        }
-
-        var end = offset + 1
-        while (end < text.length && BlorpIdentifiers.isBody(text[end])) {
-            end += 1
-        }
-
-        return TextRange(start, end)
+        return sourceRange.startOffset >= targetRange.startOffset &&
+            sourceRange.endOffset <= targetRange.endOffset
     }
 
     private fun requestDefinitions(
@@ -204,8 +182,18 @@ class BlorpGotoDeclarationHandler : GotoDeclarationHandler {
         sourcePsiFile: PsiFile,
         target: BlorpNavigationTarget
     ): PsiElement? {
-        val targetFile = server.descriptor.findFileByUri(target.uri) ?: return null
-        val targetDocument = FileDocumentManager.getInstance().getDocument(targetFile) ?: return null
+        val targetFile =
+            server.descriptor.findFileByUri(target.uri)
+                ?: run {
+                    LOG.info("Blorp goto declaration could not resolve target URI ${target.uri}")
+                    return null
+                }
+        val targetDocument =
+            FileDocumentManager.getInstance().getDocument(targetFile)
+                ?: run {
+                    LOG.info("Blorp goto declaration target has no document: ${targetFile.path}")
+                    return null
+                }
         val targetOffset = offsetForPosition(targetDocument, target.range.start) ?: return null
 
         if (targetFile == sourceFile && targetOffset == sourceOffset) {
@@ -215,7 +203,11 @@ class BlorpGotoDeclarationHandler : GotoDeclarationHandler {
         val psiFile = if (targetFile == sourceFile) {
             sourcePsiFile
         } else {
-            PsiManager.getInstance(server.project).findFile(targetFile) ?: return null
+            PsiManager.getInstance(server.project).findFile(targetFile)
+                ?: run {
+                    LOG.info("Blorp goto declaration target has no PSI file: ${targetFile.path}")
+                    return null
+                }
         }
 
         return BlorpNavigationPsiElement(

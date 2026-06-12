@@ -445,15 +445,23 @@ let std_module_available ~(sess : Session.t) ~base_dir module_name =
 *)
 let rec load_module ?sess module_name base_dir =
   let sess = sess_of ?sess () in
+  let is_relative =
+    has_prefix "./" module_name || has_prefix "../" module_name
+  in
   (* Bare imports (no std/, ./, ../ prefix) resolve to std/ canonical name *)
   let is_bare =
     (not (has_prefix "std/" module_name))
     && (not (has_prefix "pkg/" module_name))
-    && (not (has_prefix "./" module_name))
-    && not (has_prefix "../" module_name)
+    && not is_relative
   in
-  let relative_path_alias =
-    if has_prefix "./" module_name || has_prefix "../" module_name then
+  let bare_std_name = "std/" ^ module_name in
+  let bare_resolves_to_std =
+    is_bare
+    && (Hashtbl.mem sess.module_cache bare_std_name
+       || std_module_available ~sess ~base_dir bare_std_name)
+  in
+  let local_path_alias =
+    if is_relative || (is_bare && not bare_resolves_to_std) then
       resolve_module_path ~sess base_dir module_name
     else None
   in
@@ -463,14 +471,13 @@ let rec load_module ?sess module_name base_dir =
          exist. The availability check is side-effect free: a failed std
          probe must not leave diagnostics behind when a local module of the
          same bare name exists. *)
-      let std_name = "std/" ^ module_name in
-      match Hashtbl.find_opt sess.module_cache std_name with
+      match Hashtbl.find_opt sess.module_cache bare_std_name with
       | Some m ->
           Hashtbl.replace sess.module_cache module_name m;
           Some m
       | None ->
-          if std_module_available ~sess ~base_dir std_name then
-            match load_module_inner ~sess std_name base_dir with
+          if bare_resolves_to_std then
+            match load_module_inner ~sess bare_std_name base_dir with
             | Some m ->
                 Hashtbl.replace sess.module_cache module_name m;
                 Some m
@@ -478,13 +485,33 @@ let rec load_module ?sess module_name base_dir =
           else load_module_inner ~sess module_name base_dir
     else load_module_inner ~sess module_name base_dir
   in
-  match Hashtbl.find_opt sess.module_cache module_name with
-  | Some m -> Some m
-  | None -> (
-      match Option.bind relative_path_alias (find_cached_by_path sess) with
+  let discard_stale_local_alias resolved_path =
+    (match Hashtbl.find_opt sess.module_cache module_name with
+    | Some m when m.path <> resolved_path ->
+        Hashtbl.remove sess.module_cache module_name
+    | _ -> ());
+    match Hashtbl.find_opt sess.parse_cache module_name with
+    | Some (path, _, _, _) when path <> resolved_path ->
+        Hashtbl.remove sess.parse_cache module_name
+    | _ -> ()
+  in
+  match local_path_alias with
+  | Some resolved_path -> (
+      match find_cached_by_path sess resolved_path with
       | Some m ->
           Hashtbl.replace sess.module_cache module_name m;
           Some m
+      | None -> (
+          discard_stale_local_alias resolved_path;
+          match load_bare_or_direct () with
+          | Some m ->
+              Hashtbl.replace sess.module_cache resolved_path m;
+              Hashtbl.replace sess.module_cache module_name m;
+              Some m
+          | None -> None))
+  | None -> (
+      match Hashtbl.find_opt sess.module_cache module_name with
+      | Some m -> Some m
       | None -> load_bare_or_direct ())
 
 (** Stamp the filename onto a lexbuf so positions recorded by the parser

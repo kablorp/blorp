@@ -134,20 +134,7 @@ let analyzed_state source =
   Test_helpers.with_isolated_env (fun () ->
       let uri = "file:///tmp/lsp_hover_integration.brp" in
       let state = Lsp_state.create () in
-      let doc : Lsp_state.document =
-        {
-          uri;
-          version = 1;
-          text = source;
-          diagnostics = [];
-          parse_errors = [];
-          source_program = None;
-          program = None;
-          typed_program = None;
-          env = None;
-          module_aliases = [];
-        }
-      in
+      let doc = Lsp_state.create_document ~uri ~version:1 ~text:source () in
       Hashtbl.add state.documents uri doc;
       Lsp_state.analyze state doc;
       if doc.diagnostics <> [] then

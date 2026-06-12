@@ -3,7 +3,9 @@ package com.blorp.intellij
 import com.intellij.execution.configurations.GeneralCommandLine
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.platform.lsp.api.LspServerSupportProvider
 import com.intellij.platform.lsp.api.LspServerSupportProvider.LspServerStarter
 import com.intellij.platform.lsp.api.ProjectWideLspServerDescriptor
@@ -12,8 +14,10 @@ import org.eclipse.lsp4j.DeclarationCapabilities
 import org.eclipse.lsp4j.DefinitionCapabilities
 import org.eclipse.lsp4j.TextDocumentClientCapabilities
 import org.eclipse.lsp4j.TypeDefinitionCapabilities
+import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 
 internal class BlorpLspServerSupportProvider : LspServerSupportProvider {
     override fun fileOpened(
@@ -32,10 +36,15 @@ internal class BlorpLspServerSupportProvider : LspServerSupportProvider {
     }
 }
 
-private class BlorpLspServerDescriptor(project: Project) :
+internal class BlorpLspServerDescriptor(project: Project) :
     ProjectWideLspServerDescriptor(project, "Blorp") {
 
     override fun isSupportedFile(file: VirtualFile) = file.isBlorpSourceFile()
+
+    override fun findFileByUri(fileUri: String): VirtualFile? =
+        super.findFileByUri(fileUri)
+            ?: VirtualFileManager.getInstance().findFileByUrl(fileUri)
+            ?: refreshLocalFileByUri(fileUri)
 
     override val clientCapabilities: ClientCapabilities
         get() {
@@ -81,6 +90,16 @@ private class BlorpLspServerDescriptor(project: Project) :
         }
 
         return "blorp"
+    }
+
+    private fun refreshLocalFileByUri(fileUri: String): VirtualFile? {
+        val uri = runCatching { URI(fileUri) }.getOrNull() ?: return null
+        if (uri.scheme != "file") {
+            return null
+        }
+
+        val path = runCatching { Paths.get(uri) }.getOrNull() ?: return null
+        return LocalFileSystem.getInstance().refreshAndFindFileByNioFile(path)
     }
 
     companion object {

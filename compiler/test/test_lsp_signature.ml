@@ -5,20 +5,7 @@ open Blorp
 let analyzed_state_unisolated source =
   let uri = "file:///tmp/lsp_signature_integration.brp" in
   let state = Lsp_state.create () in
-  let doc : Lsp_state.document =
-    {
-      uri;
-      version = 1;
-      text = source;
-      diagnostics = [];
-      parse_errors = [];
-      source_program = None;
-      program = None;
-      typed_program = None;
-      env = None;
-      module_aliases = [];
-    }
-  in
+  let doc = Lsp_state.create_document ~uri ~version:1 ~text:source () in
   Hashtbl.add state.documents uri doc;
   Lsp_state.analyze state doc;
   if doc.diagnostics <> [] then
@@ -178,19 +165,9 @@ let test_signature_help_ignores_punctuation_inside_string_argument () =
 
 let test_signature_help_text_fallback_for_incomplete_document () =
   let text = "    consume(1, " in
-  let doc : Lsp_state.document =
-    {
-      uri = "file:///tmp/lsp_signature_incomplete.brp";
-      version = 1;
-      text;
-      diagnostics = [];
-      parse_errors = [];
-      source_program = None;
-      program = None;
-      typed_program = None;
-      env = None;
-      module_aliases = [];
-    }
+  let doc =
+    Lsp_state.create_document ~uri:"file:///tmp/lsp_signature_incomplete.brp"
+      ~version:1 ~text ()
   in
   match
     Lsp_signature.find_enclosing_call doc
