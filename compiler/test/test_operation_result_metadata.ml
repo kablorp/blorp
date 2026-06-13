@@ -87,8 +87,8 @@ let public_direct_builtin_exposures builtin_name decls =
           List.filter_map
             (direct_builtin_func_exposure builtin_name)
             impl.impl_methods
-      | DType _ | DTypeAlias _ | DRecord _ | DVar _ | DTrait _ | DImport _
-      | DPrivate _ ->
+      | DType _ | DTypeAlias _ | DRecord _ | DVar _ | DCompileTimeBlock _
+      | DTrait _ | DImport _ | DPrivate _ ->
           [])
 
 let assert_public_direct_std_builtin ~source_module ~builtin_name =

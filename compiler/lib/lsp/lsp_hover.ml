@@ -223,4 +223,5 @@ let rec hover_info_for_typed_decl (d : Typed_ast.decl) : string option =
   | DeclRecord record -> hover_info_for_typed_record record
   | DeclTypeAlias alias -> hover_info_for_typed_type_alias alias
   | DeclPrivate inner -> hover_info_for_typed_decl inner
-  | DeclImpl _ | DeclOther -> hover_info_for_decl (Typed_ast.decl_ast d)
+  | DeclImpl _ | DeclCompileTimeBlock _ | DeclOther ->
+      hover_info_for_decl (Typed_ast.decl_ast d)

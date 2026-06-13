@@ -164,6 +164,37 @@ tuples, collections, arithmetic, and union constructors, but they cannot call
 functions or methods, use closure calls, or use subscripts that lower to runtime
 helper calls. Move runtime work into `main` or into a function called by `main`.
 
+### Compile-Time Values
+
+Use a top-level `compile_time:` block when a global value should be evaluated by
+the compiler and materialized as ordinary immutable data in the generated
+program.
+
+```blorp
+compile_time:
+    private X: Int = 1 + 2
+    Y: Int = X * 4
+
+func main(args: List[String]) -> Int:
+    Y
+```
+
+Visibility belongs on each binding inside the block. Do not write
+`private compile_time:`. Bindings are evaluated in source order, so later
+bindings can reference earlier bindings in the same block. Bindings declared
+directly inside the block are always immutable; local `var` mutation is allowed
+inside pure functions evaluated by the compiler.
+
+Compile-time initializers must be pure and must be evaluatable by the compiler.
+The initial evaluator supports literal data, arithmetic, comparisons, `if`,
+`match`, blocks with local bindings, local `var` mutation, `while`, `for` over
+ranges and lists, tuple destructuring, tuples, lists, dicts, records, record
+updates, field access, string interpolation with `String` expression parts,
+or `Int`/`Bool`/`Char` expression parts, union/enum constructors, direct local
+pure function calls, and recursion.
+Unsupported compile-time work is rejected during checking instead of being
+lowered to runtime startup code.
+
 ### Control Flow
 
 ```blorp
@@ -3894,5 +3925,5 @@ type       alias      private    import     as         implements Self       bui
 match      while      for        in         if         else       and        or
 not        True       False      void       break      continue   debug      foreign
 concurrent concurrently detach   select     from       after      sealed     with
-resource   where        into
+resource   where      into       compile_time
 ```

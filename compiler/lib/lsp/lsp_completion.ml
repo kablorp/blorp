@@ -257,6 +257,12 @@ let completions_from_typed_program ?file (program : Typed_ast.program)
             | DeclFunction func -> add_typed_function_completion add func
             | DeclVar var -> add_typed_var_completion add var
             | _ -> ())
+        | DeclCompileTimeBlock bindings ->
+            List.iter
+              (fun binding ->
+                add_typed_var_completion add
+                  (Typed_ast.compile_time_binding_var binding))
+              bindings
         | DeclImpl _ | DeclOther -> ());
   (List.rev !items, names)
 
@@ -498,7 +504,8 @@ let completions_from_module (module_path : string) (prefix : string) : json list
                 (Printf.sprintf "alias %s = %s" name
                    (Types.type_to_string ad.alias_target))
           | DImpl _ -> item name kind_method (Printf.sprintf "impl %s" name)
-          | DImport _ | DPrivate _ -> item name kind_variable name)
+          | DCompileTimeBlock _ | DImport _ | DPrivate _ ->
+              item name kind_variable name)
         m.exports
 
 (* ============================================================================

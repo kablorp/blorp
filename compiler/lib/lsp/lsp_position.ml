@@ -115,6 +115,8 @@ let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
         | Some b -> walk_expr b
         | None -> ())
     | DVar vd -> walk_expr vd.var_value
+    | DCompileTimeBlock bindings ->
+        List.iter (fun binding -> walk_expr binding.ctb_var.var_value) bindings
     | DImpl impl ->
         List.iter
           (fun fd ->
@@ -227,7 +229,9 @@ let find_typed_param_at ?file (program : Typed_ast.program) ~(line : int)
             | DeclFunction func ->
                 find_typed_param_in_func ?file func ~line ~col
             | _ -> None)
-        | DeclVar _ | DeclRecord _ | DeclTypeAlias _ | DeclOther -> None)
+        | DeclVar _ | DeclRecord _ | DeclTypeAlias _ | DeclCompileTimeBlock _
+        | DeclOther ->
+            None)
 
 (* ============================================================================
    Definition lookup — for go-to-definition

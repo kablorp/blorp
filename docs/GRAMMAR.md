@@ -38,7 +38,7 @@ while  for    in    if      else   and      or       not
 break  continue    match   import   as       private
 debug  resource     implements   trait   Self   type   alias   opaque
 builtin    foreign      concurrent    concurrently    detach      where
-select     from         after         sealed         into
+select     from         after         sealed         into        compile_time
 True   False
 ```
 
@@ -99,6 +99,7 @@ decl = [ docstring ] ( func_decl
                       | record_decl
                       | struct_decl
                       | var_decl
+                      | compile_time_block
                       | trait_decl
                       | impl_decl
                       | type_alias_decl
@@ -201,6 +202,24 @@ var_decl = "var" IDENT [ ":" type_expr ] "=" expr    (* mutable *)
   Union constructors are data construction and are allowed.
 - A top-level variable initializer cannot use a subscript expression, because
   subscripts lower to runtime helper calls during startup initialization.
+
+### Compile-Time Block
+
+```ebnf
+compile_time_block = "compile_time" ":" NEWLINE INDENT compile_time_binding_list DEDENT ;
+
+compile_time_binding_list = compile_time_binding { NEWLINE compile_time_binding } ;
+
+compile_time_binding = [ docstring ] [ "private" ] IDENT [ ":" type_expr ] "=" expr ;
+```
+
+**Semantic constraints:**
+- `compile_time:` is only allowed at module top level.
+- `private compile_time:` is invalid. Visibility belongs on each binding.
+- A compile-time block can only contain immutable value bindings.
+- Bindings evaluate in source order. Later bindings can reference earlier
+  bindings in the same block.
+- Initializers must be pure and evaluatable by the compiler.
 
 ### Type Declarations
 
