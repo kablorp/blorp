@@ -730,11 +730,11 @@ let test_prepared_list_bridge_emits_expected_c () =
   in
   Alcotest.(check string)
     "inline list get bridge output"
-    "({ blorp_List* __lg_list_0 = (blorp_List*)xs; long __lg_idx_1 = 1L; \
-     (__builtin_expect(!__lg_list_0 || __lg_idx_1 < 0 || __lg_idx_1 >= \
-     __lg_list_0->len, 0) ? NULL : ({ uintptr_t __lg_bits_2 = 0; \
-     memcpy(&__lg_bits_2, (char*)__lg_list_0->data + __lg_idx_1 * 8, 8); \
-     (void*)__lg_bits_2; })); })"
+    "({ blorp_List* __lg_list_0 = (blorp_List*)xs; long __lg_idx_0 = 1L; \
+     (__builtin_expect(!__lg_list_0 || __lg_idx_0 < 0 || __lg_idx_0 >= \
+     __lg_list_0->len, 0) ? NULL : ({ uintptr_t __lg_bits_0 = 0; \
+     memcpy(&__lg_bits_0, (char*)__lg_list_0->data + __lg_idx_0 * 8, 8); \
+     (void*)__lg_bits_0; })); })"
     rendered;
   Alcotest.(check string)
     "inline bits load bridge output"
@@ -742,10 +742,10 @@ let test_prepared_list_bridge_emits_expected_c () =
     inline_bits_load;
   Alcotest.(check string)
     "inline bits store bridge output"
-    "({ blorp_List* __list_store_0 = (blorp_List*)xs; long __list_store_idx_1 \
-     = 1L; uintptr_t __list_store_bits_2 = (uintptr_t)(void*)(long)(42L); \
-     memcpy((char*)__list_store_0->data + __list_store_idx_1 * 8, \
-     &__list_store_bits_2, 8); })"
+    "({ blorp_List* __list_store_0 = (blorp_List*)xs; long __list_store_idx_0 \
+     = 1L; uintptr_t __list_store_bits_0 = (uintptr_t)(void*)(long)(42L); \
+     memcpy((char*)__list_store_0->data + __list_store_idx_0 * 8, \
+     &__list_store_bits_0, 8); })"
     inline_bits_store;
   Alcotest.(check string)
     "inline struct store bridge output"

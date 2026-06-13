@@ -1,8 +1,8 @@
 -- Blorp-authored renderer for prepared string Core nodes.
 --
 -- OCaml still owns Core traversal, child expression emission, and fresh temp
--- allocation. This module owns only the final C snippet shape for prepared
--- proof-carrying string byte operations.
+-- seeds. This module owns the final C snippet shape for prepared proof-carrying
+-- string byte operations, including local temp-name conventions.
 enum CompilerCommand:
 	RenderPreparedStringCommand
 	RenderManifestCommand
@@ -24,15 +24,13 @@ record PreparedStringTemplateInfo {
 }
 
 
--- These payloads carry rendered C snippets and temp names. They are records
--- because Blorp structs cannot contain String fields.
+-- These payloads carry rendered C snippets. Complex operations also carry a
+-- temp seed so this renderer, not OCaml, owns the local C temp-name shape.
 record FindByteFromArgs {
 	source: String,
 	byte: String,
 	start: String,
-	source_tmp: String,
-	byte_tmp: String,
-	start_tmp: String
+	temp_seed: String
 }
 
 
@@ -42,19 +40,7 @@ record ByteCopyArgs {
 	src: String,
 	src_pos: String,
 	len: String,
-	dst_tmp: String,
-	dst_pos_tmp: String,
-	src_tmp: String,
-	src_pos_tmp: String,
-	len_tmp: String
-}
-
-
-record SetLenArgs {
-	target: String,
-	len: String,
-	target_tmp: String,
-	len_tmp: String
+	temp_seed: String
 }
 
 
@@ -63,7 +49,7 @@ union PreparedStringOp:
 	ByteRead(String, String)
 	ByteWrite(String, String, String)
 	ByteCopy(ByteCopyArgs)
-	SetLen(SetLenArgs)
+	SetLen(String, String)
 
 
 union RenderError:
@@ -74,7 +60,7 @@ union RenderError:
 ALL_TEMPLATES: List[PreparedStringTemplateInfo] = [{
 		template = StringFindByteFromTemplate,
 		name = "string_find_byte_from",
-		arity = 6
+		arity = 4
 	}, {
 		template = StringByteReadTemplate,
 		name = "string_byte_read",
@@ -86,11 +72,11 @@ ALL_TEMPLATES: List[PreparedStringTemplateInfo] = [{
 	}, {
 		template = StringByteCopyTemplate,
 		name = "string_byte_copy",
-		arity = 10
+		arity = 6
 	}, {
 		template = StringSetLenTemplate,
 		name = "string_set_len",
-		arity = 4
+		arity = 2
 	}]
 
 USAGE: String = (
@@ -155,14 +141,12 @@ private pure func parse_byte_read_op(args: List[String]) -> Option[PreparedStrin
 
 private pure func parse_find_byte_from_args(args: List[String]) -> Option[FindByteFromArgs]:
 	match args:
-		[source, byte, start, source_tmp, byte_tmp, start_tmp]:
+		[source, byte, start, temp_seed]:
 			Some({
 				source = source,
 				byte = byte,
 				start = start,
-				source_tmp = source_tmp,
-				byte_tmp = byte_tmp,
-				start_tmp = start_tmp,
+				temp_seed = temp_seed,
 			})
 		_: None
 
@@ -175,31 +159,21 @@ private pure func parse_byte_write_op(args: List[String]) -> Option[PreparedStri
 
 private pure func parse_byte_copy_args(args: List[String]) -> Option[ByteCopyArgs]:
 	match args:
-		[dst, dst_pos, src, src_pos, len, dst_tmp, dst_pos_tmp, src_tmp, src_pos_tmp, len_tmp]:
+		[dst, dst_pos, src, src_pos, len, temp_seed]:
 			Some({
 				dst = dst,
 				dst_pos = dst_pos,
 				src = src,
 				src_pos = src_pos,
 				len = len,
-				dst_tmp = dst_tmp,
-				dst_pos_tmp = dst_pos_tmp,
-				src_tmp = src_tmp,
-				src_pos_tmp = src_pos_tmp,
-				len_tmp = len_tmp,
+				temp_seed = temp_seed,
 			})
 		_: None
 
 
-private pure func parse_set_len_args(args: List[String]) -> Option[SetLenArgs]:
+private pure func parse_set_len_op(args: List[String]) -> Option[PreparedStringOp]:
 	match args:
-		[target, len, target_tmp, len_tmp]:
-			Some({
-				target = target,
-				len = len,
-				target_tmp = target_tmp,
-				len_tmp = len_tmp,
-			})
+		[target, len]: Some(SetLen(target, len))
 		_: None
 
 
@@ -215,10 +189,11 @@ pure func render_string_find_byte_from(
 	source: String,
 	byte: String,
 	start: String,
-	source_tmp: String,
-	byte_tmp: String,
-	start_tmp: String,
+	temp_seed: String,
 ) -> String:
+	source_tmp: String = "__string_find_src_${temp_seed}"
+	byte_tmp: String = "__string_find_byte_${temp_seed}"
+	start_tmp: String = "__string_find_start_${temp_seed}"
 	bind_source: String = "blorp_String* ${source_tmp} = (blorp_String*)${source};"
 	bind_byte: String = "long ${byte_tmp} = ${byte};"
 	bind_start: String = "long ${start_tmp} = ${start};"
@@ -233,12 +208,13 @@ pure func render_string_byte_copy(
 	src: String,
 	src_pos: String,
 	len: String,
-	dst_tmp: String,
-	dst_pos_tmp: String,
-	src_tmp: String,
-	src_pos_tmp: String,
-	len_tmp: String,
+	temp_seed: String,
 ) -> String:
+	dst_tmp: String = "__string_copy_dst_${temp_seed}"
+	dst_pos_tmp: String = "__string_copy_dst_pos_${temp_seed}"
+	src_tmp: String = "__string_copy_src_${temp_seed}"
+	src_pos_tmp: String = "__string_copy_src_pos_${temp_seed}"
+	len_tmp: String = "__string_copy_len_${temp_seed}"
 	bind_dst: String = "blorp_String* ${dst_tmp} = (blorp_String*)${dst};"
 	bind_dst_pos: String = "long ${dst_pos_tmp} = ${dst_pos};"
 	bind_src: String = "blorp_String* ${src_tmp} = (blorp_String*)${src};"
@@ -249,27 +225,15 @@ pure func render_string_byte_copy(
 	c_statement_expr(body)
 
 
-pure func render_string_set_len(
-	target: String,
-	len: String,
-	target_tmp: String,
-	len_tmp: String,
-) -> String:
-	body: String = "blorp_String* ${target_tmp} = (blorp_String*)${target}; long ${len_tmp} = ${len}; ${target_tmp}->len = ${len_tmp}; ${target_tmp}->data[${len_tmp}] = '\\0'; (void)0;"
+pure func render_string_set_len(target: String, len: String) -> String:
+	body: String = "blorp_String* __sl = (blorp_String*)${target}; long __sn = ${len}; __sl->len = __sn; __sl->data[__sn] = '\\0'; (void)0;"
 	c_statement_expr(body)
 
 
 pure func render_prepared_string_op(op: PreparedStringOp) -> String:
 	match op:
 		FindByteFrom(args):
-			render_string_find_byte_from(
-				args.source,
-				args.byte,
-				args.start,
-				args.source_tmp,
-				args.byte_tmp,
-				args.start_tmp,
-			)
+			render_string_find_byte_from(args.source, args.byte, args.start, args.temp_seed)
 		ByteRead(source, index): render_string_byte_read(source, index)
 		ByteWrite(target, index, byte): render_string_byte_write(target, index, byte)
 		ByteCopy(args):
@@ -279,14 +243,9 @@ pure func render_prepared_string_op(op: PreparedStringOp) -> String:
 				args.src,
 				args.src_pos,
 				args.len,
-				args.dst_tmp,
-				args.dst_pos_tmp,
-				args.src_tmp,
-				args.src_pos_tmp,
-				args.len_tmp,
+				args.temp_seed,
 			)
-		SetLen(args):
-			render_string_set_len(args.target, args.len, args.target_tmp, args.len_tmp)
+		SetLen(target, len): render_string_set_len(target, len)
 
 
 pure func build_prepared_string_op(
@@ -307,8 +266,8 @@ pure func build_prepared_string_op(
 			parsed ?= parse_byte_copy_args(args).to_result(wrong_arity_for_args(info, args))
 			Ok(ByteCopy(parsed))
 		StringSetLenTemplate:
-			parsed ?= parse_set_len_args(args).to_result(wrong_arity_for_args(info, args))
-			Ok(SetLen(parsed))
+			op ?= parse_set_len_op(args).to_result(wrong_arity_for_args(info, args))
+			Ok(op)
 
 
 pure func render_prepared_string(name: String, args: List[String]) -> Result[String, RenderError]:
@@ -324,9 +283,7 @@ private PLACEHOLDER_FIND_BYTE_FROM_ARGS: FindByteFromArgs = {
 	source = "@0@",
 	byte = "@1@",
 	start = "@2@",
-	source_tmp = "@3@",
-	byte_tmp = "@4@",
-	start_tmp = "@5@"
+	temp_seed = "@3@"
 }
 
 private PLACEHOLDER_BYTE_COPY_ARGS: ByteCopyArgs = {
@@ -335,18 +292,7 @@ private PLACEHOLDER_BYTE_COPY_ARGS: ByteCopyArgs = {
 	src = "@2@",
 	src_pos = "@3@",
 	len = "@4@",
-	dst_tmp = "@5@",
-	dst_pos_tmp = "@6@",
-	src_tmp = "@7@",
-	src_pos_tmp = "@8@",
-	len_tmp = "@9@"
-}
-
-private PLACEHOLDER_SET_LEN_ARGS: SetLenArgs = {
-	target = "@0@",
-	len = "@1@",
-	target_tmp = "@2@",
-	len_tmp = "@3@"
+	temp_seed = "@5@"
 }
 
 
@@ -358,7 +304,7 @@ private pure func placeholder_prepared_string_op(
 		StringByteReadTemplate: ByteRead("@0@", "@1@")
 		StringByteWriteTemplate: ByteWrite("@0@", "@1@", "@2@")
 		StringByteCopyTemplate: ByteCopy(PLACEHOLDER_BYTE_COPY_ARGS)
-		StringSetLenTemplate: SetLen(PLACEHOLDER_SET_LEN_ARGS)
+		StringSetLenTemplate: SetLen("@0@", "@1@")
 
 
 pure func render_manifest_line(info: PreparedStringTemplateInfo) -> String:

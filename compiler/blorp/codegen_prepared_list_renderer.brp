@@ -1,8 +1,8 @@
 -- Blorp-authored renderer for prepared list Core nodes.
 --
 -- OCaml still owns Core traversal, child expression emission, layout metadata,
--- and fresh temp allocation. This module owns only the final C snippet shape
--- for prepared list operations.
+-- and fresh temp seeds/names. This module owns the final C snippet shape for
+-- prepared list operations.
 enum CompilerCommand:
 	RenderPreparedListCommand
 	RenderManifestCommand
@@ -59,9 +59,7 @@ private union StoreRuntime:
 record InlineGetArgs {
 	list: String,
 	index: String,
-	list_tmp: String,
-	index_tmp: String,
-	bits_tmp: String,
+	temp_seed: String,
 	width_bytes: String
 }
 
@@ -87,9 +85,7 @@ record InlineBitsStoreArgs {
 	list: String,
 	index: String,
 	value: String,
-	list_tmp: String,
-	index_tmp: String,
-	bits_tmp: String,
+	temp_seed: String,
 	width_bytes: String
 }
 
@@ -172,15 +168,14 @@ record CopySpanUninitArgs {
 
 record EnsureUniqueArgs {
 	list: String,
-	list_tmp: String
+	temp_seed: String
 }
 
 
 record EnsureCapacityArgs {
 	list: String,
 	capacity: String,
-	list_tmp: String,
-	capacity_tmp: String
+	temp_seed: String
 }
 
 
@@ -193,7 +188,7 @@ record ReuseAllocArgs {
 record ReuseAllocWithReleaseArgs {
 	list: String,
 	capacity: String,
-	result_tmp: String
+	temp_seed: String
 }
 
 
@@ -275,11 +270,11 @@ ALL_TEMPLATES: List[PreparedListTemplateInfo] = [{
 	}, {
 		template = ListGetInlineCheckedTemplate,
 		name = "list_get_inline_checked",
-		arity = 6
+		arity = 4
 	}, {
 		template = ListGetInlineProvenTemplate,
 		name = "list_get_inline_proven",
-		arity = 6
+		arity = 4
 	}, {
 		template = ListInlineBitsLoadTemplate,
 		name = "list_inline_bits_load",
@@ -287,7 +282,7 @@ ALL_TEMPLATES: List[PreparedListTemplateInfo] = [{
 	}, {
 		template = ListInlineBitsStoreTemplate,
 		name = "list_inline_bits_store",
-		arity = 7
+		arity = 5
 	}, {
 		template = ListPointerSetRawStoreTemplate,
 		name = "list_pointer_set_raw_store",
@@ -339,7 +334,7 @@ ALL_TEMPLATES: List[PreparedListTemplateInfo] = [{
 	}, {
 		template = ListEnsureCapacityTemplate,
 		name = "list_ensure_capacity",
-		arity = 4
+		arity = 3
 	}, {
 		template = ListReuseAllocTemplate,
 		name = "list_reuse_alloc",
@@ -452,13 +447,11 @@ private pure func parse_pointer_get_op(args: List[String]) -> Option[PreparedLis
 
 private pure func parse_inline_get_args(args: List[String]) -> Option[InlineGetArgs]:
 	match args:
-		[list, index, list_tmp, index_tmp, bits_tmp, width_bytes]:
+		[list, index, temp_seed, width_bytes]:
 			Some({
 				list = list,
 				index = index,
-				list_tmp = list_tmp,
-				index_tmp = index_tmp,
-				bits_tmp = bits_tmp,
+				temp_seed = temp_seed,
 				width_bytes = width_bytes,
 			})
 		_: None
@@ -491,14 +484,12 @@ private pure func parse_inline_bits_load_args(args: List[String]) -> Option[Inli
 
 private pure func parse_inline_bits_store_args(args: List[String]) -> Option[InlineBitsStoreArgs]:
 	match args:
-		[list, index, value, list_tmp, index_tmp, bits_tmp, width_bytes]:
+		[list, index, value, temp_seed, width_bytes]:
 			Some({
 				list = list,
 				index = index,
 				value = value,
-				list_tmp = list_tmp,
-				index_tmp = index_tmp,
-				bits_tmp = bits_tmp,
+				temp_seed = temp_seed,
 				width_bytes = width_bytes,
 			})
 		_: None
@@ -614,22 +605,21 @@ private pure func parse_copy_span_uninit_args(args: List[String]) -> Option[Copy
 
 private pure func parse_ensure_unique_args(args: List[String]) -> Option[EnsureUniqueArgs]:
 	match args:
-		[list, list_tmp]:
+		[list, temp_seed]:
 			Some({
 				list = list,
-				list_tmp = list_tmp,
+				temp_seed = temp_seed,
 			})
 		_: None
 
 
 private pure func parse_ensure_capacity_args(args: List[String]) -> Option[EnsureCapacityArgs]:
 	match args:
-		[list, capacity, list_tmp, capacity_tmp]:
+		[list, capacity, temp_seed]:
 			Some({
 				list = list,
 				capacity = capacity,
-				list_tmp = list_tmp,
-				capacity_tmp = capacity_tmp,
+				temp_seed = temp_seed,
 			})
 		_: None
 
@@ -648,11 +638,11 @@ private pure func parse_reuse_alloc_with_release_args(
 	args: List[String],
 ) -> Option[ReuseAllocWithReleaseArgs]:
 	match args:
-		[list, capacity, result_tmp]:
+		[list, capacity, temp_seed]:
 			Some({
 				list = list,
 				capacity = capacity,
-				result_tmp = result_tmp,
+				temp_seed = temp_seed,
 			})
 		_: None
 
@@ -760,14 +750,53 @@ private pure func render_inline_load(
 	c_statement_expr(body)
 
 
-private pure func render_inline_checked_get(
-	list: String,
-	index: String,
-	list_tmp: String,
-	index_tmp: String,
-	bits_tmp: String,
-	width_bytes: String,
-) -> String:
+private pure func inline_get_list_tmp(temp_seed: String) -> String:
+	"__lg_list_${temp_seed}"
+
+
+private pure func inline_get_index_tmp(temp_seed: String) -> String:
+	"__lg_idx_${temp_seed}"
+
+
+private pure func inline_get_bits_tmp(temp_seed: String) -> String:
+	"__lg_bits_${temp_seed}"
+
+
+private pure func inline_store_list_tmp(temp_seed: String) -> String:
+	"__list_store_${temp_seed}"
+
+
+private pure func inline_store_index_tmp(temp_seed: String) -> String:
+	"__list_store_idx_${temp_seed}"
+
+
+private pure func inline_store_bits_tmp(temp_seed: String) -> String:
+	"__list_store_bits_${temp_seed}"
+
+
+private pure func ensure_unique_list_tmp(temp_seed: String) -> String:
+	"__list_unique_${temp_seed}"
+
+
+private pure func ensure_capacity_list_tmp(temp_seed: String) -> String:
+	"__list_cap_${temp_seed}"
+
+
+private pure func ensure_capacity_min_tmp(temp_seed: String) -> String:
+	"__list_cap_min_${temp_seed}"
+
+
+private pure func reuse_alloc_result_tmp(temp_seed: String) -> String:
+	"__lst_${temp_seed}"
+
+
+private pure func render_inline_checked_get(args: InlineGetArgs) -> String:
+	list: String = args.list
+	index: String = args.index
+	list_tmp: String = inline_get_list_tmp(args.temp_seed)
+	index_tmp: String = inline_get_index_tmp(args.temp_seed)
+	bits_tmp: String = inline_get_bits_tmp(args.temp_seed)
+	width_bytes: String = args.width_bytes
 	list_bind: String = "blorp_List* ${list_tmp} = (blorp_List*)${list};"
 	index_bind: String = "long ${index_tmp} = ${index};"
 	bounds: String = "(__builtin_expect(!${list_tmp} || ${index_tmp} < 0 || ${index_tmp} >= ${list_tmp}->len, 0) ? NULL : "
@@ -780,14 +809,13 @@ private pure func render_inline_checked_get(
 	c_statement_expr(body)
 
 
-private pure func render_inline_proven_get(
-	list: String,
-	index: String,
-	list_tmp: String,
-	index_tmp: String,
-	bits_tmp: String,
-	width_bytes: String,
-) -> String:
+private pure func render_inline_proven_get(args: InlineGetArgs) -> String:
+	list: String = args.list
+	index: String = args.index
+	list_tmp: String = inline_get_list_tmp(args.temp_seed)
+	index_tmp: String = inline_get_index_tmp(args.temp_seed)
+	bits_tmp: String = inline_get_bits_tmp(args.temp_seed)
+	width_bytes: String = args.width_bytes
 	list_bind: String = "blorp_List* ${list_tmp} = (blorp_List*)${list};"
 	index_bind: String = "long ${index_tmp} = ${index};"
 	body: String = list_bind + " " + index_bind + " " + render_inline_load(
@@ -814,9 +842,9 @@ private pure func render_inline_bits_store(args: InlineBitsStoreArgs) -> String:
 	list: String = args.list
 	index: String = args.index
 	value: String = args.value
-	list_tmp: String = args.list_tmp
-	index_tmp: String = args.index_tmp
-	bits_tmp: String = args.bits_tmp
+	list_tmp: String = inline_store_list_tmp(args.temp_seed)
+	index_tmp: String = inline_store_index_tmp(args.temp_seed)
+	bits_tmp: String = inline_store_bits_tmp(args.temp_seed)
 	width_bytes: String = args.width_bytes
 	list_bind: String = "blorp_List* ${list_tmp} = (blorp_List*)${list};"
 	index_bind: String = "long ${index_tmp} = ${index};"
@@ -866,18 +894,21 @@ private pure func render_copy_span_uninit(args: CopySpanUninitArgs) -> String:
 
 
 private pure func render_ensure_unique(args: EnsureUniqueArgs) -> String:
-	list_bind: String = "blorp_List* ${args.list_tmp} = (blorp_List*)${args.list};"
-	condition: String = "__builtin_expect(${args.list_tmp} && blorp_is_unique(${args.list_tmp}), 1)"
-	expression: String = "(${condition} ? ${args.list_tmp} : blorp_list_cow(${args.list_tmp}));"
+	list_tmp: String = ensure_unique_list_tmp(args.temp_seed)
+	list_bind: String = "blorp_List* ${list_tmp} = (blorp_List*)${args.list};"
+	condition: String = "__builtin_expect(${list_tmp} && blorp_is_unique(${list_tmp}), 1)"
+	expression: String = "(${condition} ? ${list_tmp} : blorp_list_cow(${list_tmp}));"
 
 	c_statement_expr(list_bind + " " + expression)
 
 
 private pure func render_ensure_capacity(args: EnsureCapacityArgs) -> String:
-	list_bind: String = "blorp_List* ${args.list_tmp} = (blorp_List*)${args.list};"
-	capacity_bind: String = "long ${args.capacity_tmp} = ${args.capacity};"
-	condition: String = "__builtin_expect(${args.list_tmp} && blorp_is_unique(${args.list_tmp}) && ${args.list_tmp}->capacity >= ${args.capacity_tmp}, 1)"
-	expression: String = "(${condition} ? ${args.list_tmp} : blorp_list_ensure_capacity(${args.list_tmp}, ${args.capacity_tmp}));"
+	list_tmp: String = ensure_capacity_list_tmp(args.temp_seed)
+	capacity_tmp: String = ensure_capacity_min_tmp(args.temp_seed)
+	list_bind: String = "blorp_List* ${list_tmp} = (blorp_List*)${args.list};"
+	capacity_bind: String = "long ${capacity_tmp} = ${args.capacity};"
+	condition: String = "__builtin_expect(${list_tmp} && blorp_is_unique(${list_tmp}) && ${list_tmp}->capacity >= ${capacity_tmp}, 1)"
+	expression: String = "(${condition} ? ${list_tmp} : blorp_list_ensure_capacity(${list_tmp}, ${capacity_tmp}));"
 
 	c_statement_expr(list_bind + " " + capacity_bind + " " + expression)
 
@@ -887,10 +918,11 @@ private pure func render_reuse_alloc(args: ReuseAllocArgs) -> String:
 
 
 private pure func render_reuse_alloc_with_release(args: ReuseAllocWithReleaseArgs) -> String:
-	list_bind: String = "blorp_List* ${args.result_tmp} = blorp_list_reuse_alloc(${args.list}, ${args.capacity});"
-	init_release: String = "blorp_list_init_elem_release(${args.result_tmp}, blorp_elem_release_fn);"
+	result_tmp: String = reuse_alloc_result_tmp(args.temp_seed)
+	list_bind: String = "blorp_List* ${result_tmp} = blorp_list_reuse_alloc(${args.list}, ${args.capacity});"
+	init_release: String = "blorp_list_init_elem_release(${result_tmp}, blorp_elem_release_fn);"
 
-	c_statement_expr(list_bind + " " + init_release + " " + args.result_tmp + ";")
+	c_statement_expr(list_bind + " " + init_release + " " + result_tmp + ";")
 
 
 private pure func render_list_alloc_pointer(capacity: String) -> String:
@@ -1096,24 +1128,8 @@ private pure func render_inline_struct_checked_load(args: InlineStructLoadArgs) 
 pure func render_prepared_list_op(op: PreparedListOp) -> String:
 	match op:
 		PointerGet(list, index): render_runtime_get(list, index)
-		InlineCheckedGet(args):
-			render_inline_checked_get(
-				args.list,
-				args.index,
-				args.list_tmp,
-				args.index_tmp,
-				args.bits_tmp,
-				args.width_bytes,
-			)
-		InlineProvenGet(args):
-			render_inline_proven_get(
-				args.list,
-				args.index,
-				args.list_tmp,
-				args.index_tmp,
-				args.bits_tmp,
-				args.width_bytes,
-			)
+		InlineCheckedGet(args): render_inline_checked_get(args)
+		InlineProvenGet(args): render_inline_proven_get(args)
 		InlineBitsLoad(args): render_inline_bits_load(args)
 		InlineBitsStore(args): render_inline_bits_store(args)
 		PointerSetRawStore(args): render_pointer_store(args, SetRawStoreRuntime)
@@ -1284,10 +1300,8 @@ pure func render_prepared_list(name: String, args: List[String]) -> Result[Strin
 private PLACEHOLDER_INLINE_GET_ARGS: InlineGetArgs = {
 	list = "@0@",
 	index = "@1@",
-	list_tmp = "@2@",
-	index_tmp = "@3@",
-	bits_tmp = "@4@",
-	width_bytes = "@5@"
+	temp_seed = "@2@",
+	width_bytes = "@3@"
 }
 
 
@@ -1308,10 +1322,8 @@ private pure func placeholder_prepared_list_op(info: PreparedListTemplateInfo) -
 				list = "@0@",
 				index = "@1@",
 				value = "@2@",
-				list_tmp = "@3@",
-				index_tmp = "@4@",
-				bits_tmp = "@5@",
-				width_bytes = "@6@",
+				temp_seed = "@3@",
+				width_bytes = "@4@",
 			})
 		ListPointerSetRawStoreTemplate:
 			PointerSetRawStore({
@@ -1410,14 +1422,13 @@ private pure func placeholder_prepared_list_op(info: PreparedListTemplateInfo) -
 		ListEnsureUniqueTemplate:
 			EnsureUnique({
 				list = "@0@",
-				list_tmp = "@1@",
+				temp_seed = "@1@",
 			})
 		ListEnsureCapacityTemplate:
 			EnsureCapacity({
 				list = "@0@",
 				capacity = "@1@",
-				list_tmp = "@2@",
-				capacity_tmp = "@3@",
+				temp_seed = "@2@",
 			})
 		ListReuseAllocTemplate:
 			ReuseAlloc({
@@ -1428,7 +1439,7 @@ private pure func placeholder_prepared_list_op(info: PreparedListTemplateInfo) -
 			ReuseAllocWithRelease({
 				list = "@0@",
 				capacity = "@1@",
-				result_tmp = "@2@",
+				temp_seed = "@2@",
 			})
 		ListAllocPointerTemplate:
 			ListAllocPointer("@0@")
