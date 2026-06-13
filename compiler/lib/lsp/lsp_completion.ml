@@ -242,7 +242,7 @@ let rec add_source_type_decl_completion add label decl =
   | DTypeAlias alias_decl ->
       add label kind_class (type_alias_detail label alias_decl) "0"
   | DPrivate inner -> add_source_type_decl_completion add label inner
-  | DFunc _ | DVar _ | DImport _ | DImpl _ -> ()
+  | DFunc _ | DVar _ | DImport _ | DImpl _ | DCompileTimeBlock _ -> ()
 
 let rec source_type_label decl =
   match decl.decl_desc with
@@ -251,7 +251,7 @@ let rec source_type_label decl =
   | DTrait trait_decl -> Some trait_decl.trait_name
   | DTypeAlias alias_decl -> Some alias_decl.alias_name
   | DPrivate inner -> source_type_label inner
-  | DFunc _ | DVar _ | DImport _ | DImpl _ -> None
+  | DFunc _ | DVar _ | DImport _ | DImpl _ | DCompileTimeBlock _ -> None
 
 let completions_from_source_types ?file ?(skip = fun _ -> false)
     (program : program) (prefix : string) : json list * (string, unit) Hashtbl.t
