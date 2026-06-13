@@ -45,6 +45,38 @@ tests: TestSuite = {
     "comment main ignored" false
     (Blorp.Test_runner.has_top_level_main_source source)
 
+let test_sanitizer_mode_parsing () =
+  let open Blorp.Test_runner in
+  let check label input expected =
+    Alcotest.(check bool)
+      label true
+      (sanitizer_mode_of_string input = Some expected)
+  in
+  check "off" "off" SanitizerOff;
+  check "enabled bool spelling" "1" SanitizerAddressUndefined;
+  check "asan alias" "asan" SanitizerAddressUndefined;
+  check "undefined alias" "ubsan" SanitizerUndefinedOnly;
+  Alcotest.(check bool)
+    "rejects unknown sanitizer mode" true
+    (sanitizer_mode_of_string "thread" = None)
+
+let test_sanitizer_mode_cc_args () =
+  let open Blorp.Test_runner in
+  let has arg args = List.exists (( = ) arg) args in
+  let off_args = sanitizer_cc_args SanitizerOff in
+  let address_args = sanitizer_cc_args SanitizerAddressUndefined in
+  let undefined_args = sanitizer_cc_args SanitizerUndefinedOnly in
+  Alcotest.(check (list string)) "off args" [] off_args;
+  Alcotest.(check bool)
+    "address mode includes ASan and UBSan" true
+    (has "-fsanitize=address,undefined" address_args);
+  Alcotest.(check bool)
+    "undefined mode includes UBSan" true
+    (has "-fsanitize=undefined" undefined_args);
+  Alcotest.(check bool)
+    "undefined mode excludes ASan" false
+    (has "-fsanitize=address,undefined" undefined_args)
+
 let test_capture_timeout_does_not_wait_for_inherited_pipe () =
   let start = Unix.gettimeofday () in
   let code, _ =
@@ -905,6 +937,11 @@ let suite =
           test_compilation_dirs_are_run_scoped;
         Alcotest.test_case "compilation_dirs_are_fork_safe" `Quick
           test_compilation_dirs_are_fork_safe;
+      ] );
+    ( "sanitizers",
+      [
+        Alcotest.test_case "mode_parsing" `Quick test_sanitizer_mode_parsing;
+        Alcotest.test_case "mode_cc_args" `Quick test_sanitizer_mode_cc_args;
       ] );
     ( "precompiled_runtime",
       [

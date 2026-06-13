@@ -138,8 +138,8 @@ let test_formatter_does_not_insert_blank_before_first_block_comment () =
   in
   let expected =
     "func main(args: List[String]) -> Int:\n" ^ "\t-- explain the setup\n"
-    ^ "\tx: Int = 1\n" ^ "\twhile x < 3:\n" ^ "\t\t-- explain the loop\n"
-    ^ "\t\tx += 1\n" ^ "\tx\n"
+    ^ "\tx: Int = 1\n\n" ^ "\twhile x < 3:\n" ^ "\t\t-- explain the loop\n"
+    ^ "\t\tx += 1\n\n" ^ "\tx\n"
   in
   check_string "formatted source" expected (format_ok source)
 

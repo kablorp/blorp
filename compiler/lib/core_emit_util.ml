@@ -224,7 +224,8 @@ let collect_free_vars (e : core) : (string * Ast.type_expr) list =
     | CVar v ->
         if StringSet.mem v.vname bound then StringMap.empty
         else StringMap.singleton v.vname e.ty
-    | CLit _ | CVoid | CBreak | CContinue -> StringMap.empty
+    | CLit _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint ->
+        StringMap.empty
     | CLet (b, body) ->
         let rhs = go bound b.bind_rhs in
         let body = go (StringSet.add b.bind_var.vname bound) body in

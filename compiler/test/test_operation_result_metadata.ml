@@ -1047,8 +1047,7 @@ let test_parking_metadata_is_explicit () =
     "parking operation-result bridges" expected_parking_operations
     (result_bridges
     |> List.filter_map (fun (bridge : result_bridge) ->
-        if bridge_is_cancellation_point bridge then Some bridge.builtin_name
-        else None));
+        if bridge_parks_fiber bridge then Some bridge.builtin_name else None));
   Alcotest.(check (list (pair string string)))
     "OS-worker-blocking operation-result bridges"
     expected_os_worker_blocking_operations
@@ -1067,6 +1066,10 @@ let test_parking_metadata_is_explicit () =
         (bridge.builtin_name ^ " cancellation-point metadata")
         (bridge_is_cancellation_point bridge)
         (Blorp.Builtin_metadata.is_cancellation_point bridge.builtin_name);
+      Alcotest.(check bool)
+        (bridge.builtin_name ^ " fiber-parking metadata")
+        (bridge_parks_fiber bridge)
+        (Blorp.Builtin_metadata.may_park_fiber bridge.builtin_name);
       Alcotest.(check bool)
         (bridge.builtin_name ^ " OS-worker-blocking metadata")
         (bridge_blocks_os_worker bridge)
@@ -1145,6 +1148,10 @@ let test_fallible_stream_sources_are_manifested () =
             false
             (Blorp.Builtin_metadata.is_cancellation_point name);
           Alcotest.(check bool)
+            (name ^ " constructor does not park a fiber")
+            false
+            (Blorp.Builtin_metadata.may_park_fiber name);
+          Alcotest.(check bool)
             (name ^ " constructor does not block an OS worker")
             false
             (Blorp.Builtin_metadata.is_os_worker_blocking name))
@@ -1181,9 +1188,17 @@ let test_fallible_stream_terminals_are_manifested () =
             true
             (terminal_is_cancellation_point terminal);
           Alcotest.(check bool)
+            (name ^ " terminal fiber-parking metadata")
+            true
+            (terminal_parks_fiber terminal);
+          Alcotest.(check bool)
             (name ^ " builtin cancellation-point metadata")
             true
             (Blorp.Builtin_metadata.is_cancellation_point name);
+          Alcotest.(check bool)
+            (name ^ " builtin fiber-parking metadata")
+            true
+            (Blorp.Builtin_metadata.may_park_fiber name);
           Alcotest.(check bool)
             (name ^ " terminal does not block an OS worker")
             false

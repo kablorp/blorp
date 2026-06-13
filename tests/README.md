@@ -151,7 +151,50 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`
    - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
    - CLI/LSP behavior → `tests/test_cli.sh` and `tests/test_lsp.sh`
+   - LSP feature fixtures → `tests/lsp/fixtures/`, using `-- ^name`
+     marker comments and a neighboring JSON spec
    - Standard library examples → doctests in `std/`
 2. Add positive and negative compiler cases when both sides describe meaningful
    behavior. Do not add mirrored fixtures just to satisfy ceremony.
 3. Use descriptive file names: `test_feature_name.brp`
+
+### LSP Feature Fixtures
+
+`tests/lsp/run_lsp_fixtures.py` starts `blorp lsp`, opens each fixture through
+the Language Server Protocol, and checks the requests listed in the fixture's
+JSON spec. Marker comment lines are removed before the document is sent to the
+server, and the caret column points at the previous emitted source line:
+
+```blorp
+func add(a: Int, b: Int) -> Int:
+-- ^add_decl
+    a + b
+
+func main(args: List[String]) -> Int:
+    add(1, 2)
+--  ^add_use
+```
+
+Run just the fixture suite with:
+
+```bash
+python3 tests/lsp/run_lsp_fixtures.py ./blorp tests/lsp/fixtures
+```
+
+### VS Code Extension E2E
+
+The VS Code extension has a slower end-to-end harness under `editor/vscode/`.
+It launches a real VS Code extension host with the local extension installed,
+opens `.brp` files, and verifies that the extension starts `./blorp lsp` and
+routes diagnostics, hover, definition, completion, and references through VS
+Code commands.
+
+```bash
+cd editor/vscode
+npm install
+npm run test:e2e
+```
+
+This gate downloads a VS Code test build into `editor/vscode/.vscode-test/` on
+first run, so it is intentionally separate from the default local `scripts/test`
+gates.

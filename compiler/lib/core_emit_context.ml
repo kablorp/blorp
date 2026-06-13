@@ -32,6 +32,10 @@ type t = {
   mutable string_literals_buffer : Buffer.t;
   mutable collected_lambdas : collected_lambda list;
   mutable lambda_counter : int;
+  global_immortalizer_helpers : (string, string) Hashtbl.t;
+      (** Concrete element type key → generated helper function that recursively
+        immortalizes one value stored in a runtime container slot. *)
+  mutable global_immortalizer_helper_counter : int;
   constructor_names : (string, unit) Hashtbl.t;
   constructor_c_names : (string, string) Hashtbl.t;
       (** Best-effort source constructor name → emitted C symbol map.
@@ -81,6 +85,8 @@ let create ?(profile = false) ?(reg = Codegen_types.create_registry ()) () =
     string_literals_buffer = Buffer.create 512;
     collected_lambdas = [];
     lambda_counter = 0;
+    global_immortalizer_helpers = Hashtbl.create 16;
+    global_immortalizer_helper_counter = 0;
     constructor_names = Hashtbl.create 32;
     constructor_c_names = Hashtbl.create 32;
     constructor_c_names_by_type = Hashtbl.create 64;
@@ -104,6 +110,8 @@ let reset ctx =
   Buffer.clear ctx.string_literals_buffer;
   ctx.collected_lambdas <- [];
   ctx.lambda_counter <- 0;
+  Hashtbl.clear ctx.global_immortalizer_helpers;
+  ctx.global_immortalizer_helper_counter <- 0;
   Hashtbl.clear ctx.constructor_names;
   Hashtbl.clear ctx.constructor_c_names;
   Hashtbl.clear ctx.constructor_c_names_by_type;

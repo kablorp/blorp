@@ -1,8 +1,29 @@
--- Time - Date and time operations ( POSIX-time-centric)
+import:
+	string: length, repeat
+	units:
+		Duration,
+		microseconds as make_duration_microseconds,
+		to_microseconds as duration_microsecond_count,
+
+
+-- Time - Date and time operations (POSIX-time-centric)
 --
 -- Time is represented as an Int (POSIX microseconds since epoch).
--- Pure functions extract calendar parts. No DateTime record needed.
+-- Pure functions extract calendar parts. Typed Instant wrappers are stack structs.
 -- All extraction and formatting functions assume UTC.
+-- ============================================================================
+-- Types
+-- ============================================================================
+---
+An exact instant represented as POSIX microseconds since the epoch.
+This is a stack struct wrapper over the raw timestamp used by low-level
+interop helpers.
+---
+struct Instant {
+	microseconds_since_posix_epoch: Int
+}
+
+
 -- ============================================================================
 -- Current Time (impure — non-deterministic)
 -- ============================================================================
@@ -14,55 +35,63 @@ func now() -> Int:
 	builtin("blorp_time_now")
 
 
+---
+Get current wall-clock time as a typed Instant.
+Impure: returns a different value each time it's called.
+---
+func now_instant() -> Instant:
+	instant_from_posix_microseconds(now())
+
+
 -- ============================================================================
 -- Calendar Part Extraction (all pure, all UTC)
 -- ============================================================================
 ---
 Extract year from POSIX microseconds (e.g. 2026).
 ---
-pure func to_year(us: Int) -> Int:
+pure func to_year(microseconds: Int) -> Int:
 	builtin("blorp_time_to_year")
 
 
 ---
 Extract month from POSIX microseconds (1-12).
 ---
-pure func to_month(us: Int) -> Int:
+pure func to_month(microseconds: Int) -> Int:
 	builtin("blorp_time_to_month")
 
 
 ---
 Extract day of month from POSIX microseconds (1-31).
 ---
-pure func to_day(us: Int) -> Int:
+pure func to_day(microseconds: Int) -> Int:
 	builtin("blorp_time_to_day")
 
 
 ---
 Extract hour from POSIX microseconds (0-23).
 ---
-pure func to_hour(us: Int) -> Int:
+pure func to_hour(microseconds: Int) -> Int:
 	builtin("blorp_time_to_hour")
 
 
 ---
 Extract minute from POSIX microseconds (0-59).
 ---
-pure func to_minute(us: Int) -> Int:
+pure func to_minute(microseconds: Int) -> Int:
 	builtin("blorp_time_to_minute")
 
 
 ---
 Extract second from POSIX microseconds (0-59).
 ---
-pure func to_second(us: Int) -> Int:
+pure func to_second(microseconds: Int) -> Int:
 	builtin("blorp_time_to_second")
 
 
 ---
 Extract day of week from POSIX microseconds (0=Sun, 1=Mon, ..., 6=Sat).
 ---
-pure func to_weekday(us: Int) -> Int:
+pure func to_weekday(microseconds: Int) -> Int:
 	builtin("blorp_time_to_weekday")
 
 
@@ -71,9 +100,29 @@ pure func to_weekday(us: Int) -> Int:
 -- ============================================================================
 ---
 Construct POSIX microseconds from calendar parts (UTC).
+Invalid fields are normalized by the underlying POSIX conversion; prefer
+try_from_parts when invalid civil dates should remain explicit.
 ---
 pure func from_parts(year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int) -> Int:
 	builtin("blorp_time_from_parts")
+
+
+---
+Construct POSIX microseconds from UTC calendar parts, returning None when the
+fields do not describe a valid Gregorian date-time.
+---
+pure func try_from_parts(
+	year: Int,
+	month: Int,
+	day: Int,
+	hour: Int,
+	minute: Int,
+	second: Int,
+) -> Option[Int]:
+	if is_valid_date_time(year, month, day, hour, minute, second):
+		Some(from_parts(year, month, day, hour, minute, second))
+	else:
+		None
 
 
 ---
@@ -84,13 +133,14 @@ doctests:
     t: Int = from_parts(2026, 1, 15, 10, 30, 0)
     format_time(t, "%Y-%m-%d") == "2026-01-15"
 ---
-pure func format_time(us: Int, fmt: String) -> String:
+pure func format_time(microseconds: Int, fmt: String) -> String:
 	builtin("blorp_time_format")
 
 
 ---
 Parse date string using strptime codes.
-Returns Some(microseconds) on success, None on failure.
+Returns Some(microseconds) on success, None on failure. Numeric Gregorian
+date/time fields are validated before accepting host C library normalization.
 
 doctests:
     :: Parse valid date
@@ -142,15 +192,15 @@ pure func hours(n: Int) -> Int:
 -- Convenience Formatting
 -- ============================================================================
 ---
-Format as ISO 8601 string (UTC).
+Format as a whole-second RFC3339-compatible UTC string.
 
 doctests:
-    :: Format as ISO 8601
+    :: Format UTC timestamp
     t: Int = from_parts(2026, 6, 15, 12, 0, 0)
     to_iso(t) == "2026-06-15T12:00:00Z"
 ---
-pure func to_iso(us: Int) -> String:
-	format_time(us, "%Y-%m-%dT%H:%M:%SZ")
+pure func to_iso(microseconds: Int) -> String:
+	format_time(microseconds, "%Y-%m-%dT%H:%M:%SZ")
 
 
 -- ============================================================================
@@ -194,8 +244,13 @@ doctests:
     :: Convert
     to_unix_seconds(1000000) == 1
 ---
-pure func to_unix_seconds(us: Int) -> Int:
-	us / 1000000
+pure func to_unix_seconds(microseconds: Int) -> Int:
+	quotient: Int = microseconds / 1000000
+
+	if microseconds >= 0 or microseconds % 1000000 == 0:
+		quotient
+	else:
+		quotient - 1
 
 
 ---
@@ -216,8 +271,13 @@ doctests:
     :: Convert
     to_unix_millis(1000000) == 1000
 ---
-pure func to_unix_millis(us: Int) -> Int:
-	us / 1000
+pure func to_unix_millis(microseconds: Int) -> Int:
+	quotient: Int = microseconds / 1000
+
+	if microseconds >= 0 or microseconds % 1000 == 0:
+		quotient
+	else:
+		quotient - 1
 
 
 ---
@@ -232,10 +292,10 @@ pure func from_unix_millis(ms: Int) -> Int:
 
 
 -- ============================================================================
--- ISO 8601 Parsing
+-- ISO / RFC3339 Parsing
 -- ============================================================================
 ---
-Parse an ISO 8601 / RFC 3339 date string to POSIX microseconds.
+Parse an ISO calendar date or RFC3339 date-time to POSIX microseconds.
 Handles: "2024-01-15T10:30:00Z", "2024-01-15T10:30:00+05:30",
 "2024-01-15T10:30:00.123Z", "2024-01-15" (date-only, midnight UTC).
 Returns None on invalid input.
@@ -260,6 +320,119 @@ pure func from_iso(s: String) -> Option[Int]:
 	builtin("blorp_time_from_iso")
 
 
+---
+Parse a strict RFC3339 date-time into a typed Instant.
+Date-only strings are rejected; use from_iso for the current date-only
+compatibility helper.
+---
+pure func parse_rfc3339(s: String) -> Option[Instant]:
+	match parse_rfc3339_posix(s):
+		Some(microseconds): Some(instant_from_posix_microseconds(microseconds))
+		None: None
+
+
+private pure func parse_rfc3339_posix(s: String) -> Option[Int]:
+	builtin("blorp_time_parse_rfc3339")
+
+
+---
+Format a typed Instant as a UTC RFC3339 string, preserving nonzero microseconds.
+---
+pure func format_rfc3339(instant: Instant) -> String:
+	microseconds: Int = instant.microseconds_since_posix_epoch
+	base: String = format_time(microseconds, "%Y-%m-%dT%H:%M:%S")
+	fraction: Int = subsecond_microseconds(microseconds)
+
+	if fraction == 0:
+		base + "Z"
+	else:
+		base + "." + pad_microseconds(fraction) + "Z"
+
+
+private pure func subsecond_microseconds(microseconds: Int) -> Int:
+	remainder: Int = microseconds % 1000000
+
+	if remainder < 0:
+		remainder + 1000000
+	else:
+		remainder
+
+
+private pure func pad_microseconds(value: Int) -> String:
+	raw: String = value.to_string()
+	"0".repeat(6 - raw.length()) + raw
+
+
+-- ============================================================================
+-- Typed Instant / Duration Interop
+-- ============================================================================
+---
+Wrap raw POSIX microseconds in a typed Instant.
+---
+pure func instant_from_posix_microseconds(microseconds: Int) -> Instant:
+	{microseconds_since_posix_epoch = microseconds}
+
+
+---
+Return raw POSIX microseconds from a typed Instant.
+---
+pure func instant_to_posix_microseconds(instant: Instant) -> Int:
+	instant.microseconds_since_posix_epoch
+
+
+---
+Create a typed Instant from Unix seconds.
+---
+pure func instant_from_unix_seconds(seconds_value: Int) -> Instant:
+	instant_from_posix_microseconds(from_unix_seconds(seconds_value))
+
+
+---
+Convert a typed Instant to Unix seconds using POSIX floor semantics.
+---
+pure func instant_to_unix_seconds(instant: Instant) -> Int:
+	to_unix_seconds(instant.microseconds_since_posix_epoch)
+
+
+---
+Create a typed Duration from microseconds.
+---
+pure func duration_from_microseconds(microseconds: Int) -> Duration:
+	make_duration_microseconds(microseconds)
+
+
+---
+Return raw microseconds from a typed Duration.
+---
+pure func duration_to_microseconds(duration: Duration) -> Int:
+	duration_microsecond_count(duration)
+
+
+---
+Add an exact elapsed Duration to an Instant.
+---
+pure func add_duration(instant: Instant, duration: Duration) -> Instant:
+	instant_from_posix_microseconds(
+		instant.microseconds_since_posix_epoch + duration_microsecond_count(duration),
+	)
+
+
+---
+Subtract an exact elapsed Duration from an Instant.
+---
+pure func subtract_duration(instant: Instant, duration: Duration) -> Instant:
+	instant_from_posix_microseconds(
+		instant.microseconds_since_posix_epoch - duration_microsecond_count(duration),
+	)
+
+
+---
+Return a - b as an exact elapsed Duration.
+---
+pure func duration_between(a: Instant, b: Instant) -> Duration:
+	make_duration_microseconds(a.microseconds_since_posix_epoch - b.microseconds_since_posix_epoch)
+
+
 -- ============================================================================
 -- Truncation Functions
 -- ============================================================================
@@ -271,8 +444,8 @@ doctests:
     t: Int = from_parts(2026, 3, 15, 14, 30, 45)
     to_hour(start_of_day(t)) == 0 and to_minute(start_of_day(t)) == 0
 ---
-pure func start_of_day(us: Int) -> Int:
-	from_parts(to_year(us), to_month(us), to_day(us), 0, 0, 0)
+pure func start_of_day(microseconds: Int) -> Int:
+	from_parts(to_year(microseconds), to_month(microseconds), to_day(microseconds), 0, 0, 0)
 
 
 ---
@@ -283,8 +456,8 @@ doctests:
     t: Int = from_parts(2026, 7, 22, 14, 30, 0)
     to_day(start_of_month(t)) == 1 and to_hour(start_of_month(t)) == 0
 ---
-pure func start_of_month(us: Int) -> Int:
-	from_parts(to_year(us), to_month(us), 1, 0, 0, 0)
+pure func start_of_month(microseconds: Int) -> Int:
+	from_parts(to_year(microseconds), to_month(microseconds), 1, 0, 0, 0)
 
 
 ---
@@ -295,8 +468,8 @@ doctests:
     t: Int = from_parts(2026, 11, 22, 14, 30, 0)
     to_month(start_of_year(t)) == 1 and to_day(start_of_year(t)) == 1
 ---
-pure func start_of_year(us: Int) -> Int:
-	from_parts(to_year(us), 1, 1, 0, 0, 0)
+pure func start_of_year(microseconds: Int) -> Int:
+	from_parts(to_year(microseconds), 1, 1, 0, 0, 0)
 
 
 -- ============================================================================
@@ -309,8 +482,9 @@ doctests:
     :: Known day
     weekday_name(from_parts(2024, 1, 8, 0, 0, 0)) == "Monday"
 ---
-pure func weekday_name(us: Int) -> String:
-	wd: Int = to_weekday(us)
+pure func weekday_name(microseconds: Int) -> String:
+	wd: Int = to_weekday(microseconds)
+
 	match wd:
 		0: "Sunday"
 		1: "Monday"
@@ -333,60 +507,64 @@ doctests:
     t2: Int = add_days(t, 1)
     to_day(t2) == 2
 ---
-pure func add_days(us: Int, n: Int) -> Int:
-	us + n * 86400000000
+pure func add_days(microseconds: Int, n: Int) -> Int:
+	microseconds + n * 86400000000
 
 
 ---
 Add n hours to a timestamp.
 ---
-pure func add_hours(us: Int, n: Int) -> Int:
-	us + n * 3600000000
+pure func add_hours(microseconds: Int, n: Int) -> Int:
+	microseconds + n * 3600000000
 
 
 ---
 Add n minutes to a timestamp.
 ---
-pure func add_minutes(us: Int, n: Int) -> Int:
-	us + n * 60000000
+pure func add_minutes(microseconds: Int, n: Int) -> Int:
+	microseconds + n * 60000000
 
 
 ---
 Add n seconds to a timestamp.
 ---
-pure func add_seconds(us: Int, n: Int) -> Int:
-	us + n * 1000000
+pure func add_seconds(microseconds: Int, n: Int) -> Int:
+	microseconds + n * 1000000
 
 
 ---
 Add n months to a timestamp. Clamps day if target month is shorter.
 ---
-pure func add_months(us: Int, n: Int) -> Int:
-	y: Int = to_year(us)
-	m: Int = to_month(us)
-	d: Int = to_day(us)
-	h: Int = to_hour(us)
-	mi: Int = to_minute(us)
-	s: Int = to_second(us)
+pure func add_months(microseconds: Int, n: Int) -> Int:
+	y: Int = to_year(microseconds)
+	m: Int = to_month(microseconds)
+	d: Int = to_day(microseconds)
+	h: Int = to_hour(microseconds)
+	mi: Int = to_minute(microseconds)
+	s: Int = to_second(microseconds)
 	total_months: Int = y * 12 + m - 1 + n
 	var new_year: Int = total_months / 12
 	var new_month: Int = total_months % 12 + 1
+
 	if new_month <= 0:
 		new_month += 12
 		new_year -= 1
+
 	max_day: Int = days_in_month(new_year, new_month)
+
 	new_day: Int = if d > max_day:
 		max_day
 	else:
 		d
+
 	from_parts(new_year, new_month, new_day, h, mi, s)
 
 
 ---
 Add n years to a timestamp.
 ---
-pure func add_years(us: Int, n: Int) -> Int:
-	add_months(us, n * 12)
+pure func add_years(microseconds: Int, n: Int) -> Int:
+	add_months(microseconds, n * 12)
 
 
 ---
@@ -413,6 +591,32 @@ pure func is_leap_year(year: Int) -> Bool:
 		False
 	else:
 		year % 4 == 0
+
+
+private pure func is_valid_date(year: Int, month: Int, day: Int) -> Bool:
+	if (
+		month < 1
+		or month > 12
+		or day < 1
+	):
+		False
+	else:
+		day <= days_in_month(year, month)
+
+
+private pure func is_valid_time(hour: Int, minute: Int, second: Int) -> Bool:
+	hour >= 0 and hour <= 23 and minute >= 0 and minute <= 59 and second >= 0 and second <= 59
+
+
+private pure func is_valid_date_time(
+	year: Int,
+	month: Int,
+	day: Int,
+	hour: Int,
+	minute: Int,
+	second: Int,
+) -> Bool:
+	is_valid_date(year, month, day) and is_valid_time(hour, minute, second)
 
 
 ---

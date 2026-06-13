@@ -173,7 +173,7 @@ let collect_free_vars_filtered (state : state) ~(capturable : StringSet.t)
         else if Hashtbl.mem state.constructor_names v.vname then SM.empty
         else if Option.is_some (function_ref_target state v) then SM.empty
         else SM.singleton v.vname e.ty
-    | CLit _ | CVoid | CBreak | CContinue -> SM.empty
+    | CLit _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint -> SM.empty
     | CLambda lam ->
         let inner =
           List.fold_left (fun s (v, _) -> SS.add v.vname s) bound lam.lam_params

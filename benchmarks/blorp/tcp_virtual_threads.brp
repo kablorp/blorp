@@ -1,5 +1,5 @@
 import:
-	./support/benchmark: format_duration
+	./support/benchmark: format_microseconds
 	instrumentation: SchedulerStats, black_box_int, get_scheduler_stats, reset_scheduler_stats
 	net/tcp as Tcp: IpFamily(IPv4), TcpError
 	system: now_microseconds
@@ -12,16 +12,20 @@ private func format_sched(stats: SchedulerStats) -> String:
 private func collect_channel(results: Channel[Int], count: Int) -> Int:
 	var checksum: Int = 0
 	var received: Int = 0
+
 	while received < count:
 		match recv_timeout(results, 5000):
 			Some(value): checksum += value
 			None: checksum -= 1000000
+
 		received += 1
+
 	black_box_int(checksum)
 
 
 private func connect_and_close_result(port: Int) -> Result[Int, TcpError]:
 	remote ?= Tcp.port(port)
+
 	with _ ?= Tcp.connect_loopback(IPv4, remote):
 		Ok(1)
 
@@ -30,12 +34,14 @@ private func connect_and_close_report(port: Int, results: Channel[Int]) -> Bool:
 	status: Int = match connect_and_close_result(port):
 		Ok(value): value
 		Err(_): -1
+
 	_ = send(results, status)
 	status > 0
 
 
 private func connect_hold_close_result(port: Int, hold_ms: Int) -> Result[Int, TcpError]:
 	remote ?= Tcp.port(port)
+
 	with _ ?= Tcp.connect_loopback(IPv4, remote):
 		sleep(hold_ms)
 		Ok(1)
@@ -45,12 +51,14 @@ private func connect_hold_close_report(port: Int, hold_ms: Int, results: Channel
 	status: Int = match connect_hold_close_result(port, hold_ms):
 		Ok(value): value
 		Err(_): -1
+
 	_ = send(results, status)
 	status > 0
 
 
 private func client_read_one_result(port: Int) -> Result[Int, TcpError]:
 	remote ?= Tcp.port(port)
+
 	with stream ?= Tcp.connect_loopback(IPv4, remote):
 		match Tcp.read(stream, 1):
 			Ok(data): Ok(data.length())
@@ -61,15 +69,18 @@ private func client_read_one_report(port: Int, results: Channel[Int]) -> Bool:
 	status: Int = match client_read_one_result(port):
 		Ok(value): value
 		Err(_): -1
+
 	_ = send(results, status)
 	status > 0
 
 
 private func client_read_chunks_result(port: Int, chunks: Int) -> Result[Int, TcpError]:
 	remote ?= Tcp.port(port)
+
 	with stream ?= Tcp.connect_loopback(IPv4, remote):
 		var total: Int = 0
 		var ok: Bool = True
+
 		for i in 0..chunks:
 			if ok:
 				match Tcp.read(stream, 1):
@@ -77,6 +88,7 @@ private func client_read_chunks_result(port: Int, chunks: Int) -> Result[Int, Tc
 					Err(_):
 						ok = False
 						total -= 1000000
+
 		Ok(total)
 
 
@@ -84,6 +96,7 @@ private func client_read_chunks_report(port: Int, chunks: Int, results: Channel[
 	status: Int = match client_read_chunks_result(port, chunks):
 		Ok(value): value
 		Err(_): -1
+
 	_ = send(results, status)
 	status > 0
 
@@ -127,15 +140,18 @@ private func run_accept_connect_case_result(count: Int) -> Result[Int, TcpError]
 		start: Int = now_microseconds()
 		spawn_connect_clients(port, count, client_results)
 		var accepted: Int = 0
+
 		for peer in Tcp.connections_stop_on_error(listener):
 			accepted += 1
+
 			if accepted >= count:
 				break
+
 		clients: Int = collect_channel(client_results, count)
 		elapsed: Int = now_microseconds() - start
 		stats: SchedulerStats = get_scheduler_stats()
 		print(
-			"  accept/connect " + count.to_string() + " loopback connections: " + format_duration(
+			"  accept/connect " + count.to_string() + " loopback connections: " + format_microseconds(
 				elapsed,
 			) + format_sched(stats),
 		)
@@ -157,14 +173,16 @@ private func run_connect_storm_case_result(count: Int) -> Result[Int, TcpError]:
 		start: Int = now_microseconds()
 		spawn_connect_clients(port, count, client_results)
 		accepted_results: Channel[Int] = channel(count)
+
 		for peer in Tcp.connections_stop_on_error(listener) concurrently(limit: 512):
 			_ = send(accepted_results, 1)
+
 		accepted: Int = collect_channel(accepted_results, count)
 		clients: Int = collect_channel(client_results, count)
 		elapsed: Int = now_microseconds() - start
 		stats: SchedulerStats = get_scheduler_stats()
 		print(
-			"  connect storm " + count.to_string() + " loopback clients: " + format_duration(
+			"  connect storm " + count.to_string() + " loopback clients: " + format_microseconds(
 				elapsed,
 			) + format_sched(stats),
 		)
@@ -186,15 +204,17 @@ private func run_idle_connection_case_result(count: Int, hold_ms: Int) -> Result
 		reset_scheduler_stats()
 		start: Int = now_microseconds()
 		spawn_hold_clients(port, count, hold_ms, client_results)
+
 		for peer in Tcp.connections_stop_on_error(listener) concurrently(limit: 512):
 			_ = send(accepted_results, 1)
 			sleep(hold_ms)
+
 		accepted: Int = collect_channel(accepted_results, count)
 		clients: Int = collect_channel(client_results, count)
 		elapsed: Int = now_microseconds() - start
 		stats: SchedulerStats = get_scheduler_stats()
 		print(
-			"  " + count.to_string() + " idle loopback connections held for " + hold_ms.to_string() + "ms: " + format_duration(
+			"  " + count.to_string() + " idle loopback connections held for " + hold_ms.to_string() + "ms: " + format_microseconds(
 				elapsed,
 			) + format_sched(stats),
 		)
@@ -216,18 +236,21 @@ private func run_parked_read_fanout_case_result(count: Int, delay_ms: Int) -> Re
 		reset_scheduler_stats()
 		start: Int = now_microseconds()
 		spawn_read_clients(port, count, client_results)
+
 		for peer in Tcp.connections_stop_on_error(listener) concurrently(limit: 512):
 			sleep(delay_ms)
 			payload: Bytes = "x".to_bytes()
+
 			match Tcp.write_all(peer, payload):
 				Ok(_): _ = send(server_results, 1)
 				Err(_): _ = send(server_results, -1000000)
+
 		server: Int = collect_channel(server_results, count)
 		clients: Int = collect_channel(client_results, count)
 		elapsed: Int = now_microseconds() - start
 		stats: SchedulerStats = get_scheduler_stats()
 		print(
-			"  " + count.to_string() + " parked TCP readers with " + delay_ms.to_string() + "ms delayed writes: " + format_duration(
+			"  " + count.to_string() + " parked TCP readers with " + delay_ms.to_string() + "ms delayed writes: " + format_microseconds(
 				elapsed,
 			) + format_sched(stats),
 		)
@@ -253,21 +276,26 @@ private func run_slow_writer_case_result(
 		reset_scheduler_stats()
 		start: Int = now_microseconds()
 		spawn_chunk_read_clients(port, count, chunks, client_results)
+
 		for peer in Tcp.connections_stop_on_error(listener) concurrently(limit: 512):
 			payload: Bytes = "x".to_bytes()
 			var written: Int = 0
+
 			for i in 0..chunks:
 				sleep(delay_ms)
+
 				match Tcp.write_all(peer, payload):
 					Ok(_): written += 1
 					Err(_): written -= 1000000
+
 			_ = send(server_results, written)
+
 		server: Int = collect_channel(server_results, count)
 		clients: Int = collect_channel(client_results, count)
 		elapsed: Int = now_microseconds() - start
 		stats: SchedulerStats = get_scheduler_stats()
 		print(
-			"  " + count.to_string() + " slow TCP readers, " + chunks.to_string() + " chunks every " + delay_ms.to_string() + "ms: " + format_duration(
+			"  " + count.to_string() + " slow TCP readers, " + chunks.to_string() + " chunks every " + delay_ms.to_string() + "ms: " + format_microseconds(
 				elapsed,
 			) + format_sched(stats),
 		)

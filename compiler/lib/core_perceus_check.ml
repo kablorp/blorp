@@ -53,7 +53,7 @@ let fail_msg state msg = state.errors <- msg :: state.errors
 let rec simulate (target : string) (state : state) (e : core) : unit =
   match e.desc with
   (* ---- Leaves / non-references ---- *)
-  | CLit _ | CVoid | CBreak | CContinue -> ()
+  | CLit _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint -> ()
   | CResourceCleanupExit exit ->
       List.iter (simulate target state) exit.rce_cleanups
   (* ---- Variable reference: if it's our target, consume one ref ---- *)
@@ -386,7 +386,7 @@ and collect_tree_leaves (target : string) (tree : ctree) : core list =
 and uses_free (name : string) (e : core) : bool =
   match e.desc with
   | CVar v -> v.vname = name
-  | CLit _ | CVoid | CBreak | CContinue -> false
+  | CLit _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint -> false
   | CLet (b, body) ->
       uses_free name b.bind_rhs
       || (b.bind_var.vname <> name && uses_free name body)

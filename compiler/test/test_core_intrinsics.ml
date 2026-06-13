@@ -598,10 +598,10 @@ let test_std_synthesis_rejects_malformed_signatures () =
     ]
     ty_int;
   expect_no_synthesis ~module_path:"std/time" "format_time"
-    [ param "us" ty_int; param "fmt" ty_int ]
+    [ param "microseconds" ty_int; param "fmt" ty_int ]
     ty_string;
   expect_no_synthesis ~module_path:"std/time" "to_year"
-    [ param "us" ty_string ]
+    [ param "microseconds" ty_string ]
     ty_int;
   expect_no_synthesis ~module_path:"std/system" "now_microseconds"
     [ param "extra" ty_int ]
@@ -678,7 +678,7 @@ let test_time_and_system_wrappers_synthesize_from_specs () =
   let time_cases =
     [
       ("now", [], ty_int, "blorp_time_now");
-      ("to_year", [ param "us" ty_int ], ty_int, "blorp_time_to_year");
+      ("to_year", [ param "microseconds" ty_int ], ty_int, "blorp_time_to_year");
       ( "from_parts",
         [
           param "year" ty_int;
@@ -691,7 +691,7 @@ let test_time_and_system_wrappers_synthesize_from_specs () =
         ty_int,
         "blorp_time_from_parts" );
       ( "format_time",
-        [ param "us" ty_int; param "fmt" ty_string ],
+        [ param "microseconds" ty_int; param "fmt" ty_string ],
         ty_string,
         "blorp_time_format" );
       ( "parse_time",

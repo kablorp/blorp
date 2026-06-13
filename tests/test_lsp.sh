@@ -87,6 +87,11 @@ RESP=$(read_response)
 check "returns capabilities" "$RESP" '"capabilities"'
 check "has textDocumentSync" "$RESP" '"textDocumentSync"'
 check "has hoverProvider" "$RESP" '"hoverProvider":true'
+check "has referencesProvider" "$RESP" '"referencesProvider":true'
+check "has declarationProvider" "$RESP" '"declarationProvider":true'
+check "has typeDefinitionProvider" "$RESP" '"typeDefinitionProvider":true'
+check "has documentHighlightProvider" "$RESP" '"documentHighlightProvider":true'
+check "has inlayHintProvider" "$RESP" '"inlayHintProvider"'
 check "does not advertise formattingProvider" "$RESP" '"documentFormattingProvider":false'
 
 # Send initialized notification
@@ -135,6 +140,15 @@ check "definition has URI" "$RESP" '"uri"'
 check "definition has range" "$RESP" '"range"'
 check "definition points to line 0" "$RESP" '"line":0'
 
+# Some clients expose their primary click action as declaration rather than
+# definition. Blorp currently has one source declaration per symbol, so the same
+# call-site lookup should work for textDocument/declaration.
+send_msg '{"jsonrpc":"2.0","id":20,"method":"textDocument/declaration","params":{"textDocument":{"uri":"file:///tmp/test_lsp_def.brp"},"position":{"line":4,"character":4}}}'
+RESP=$(read_response)
+check "declaration returns result" "$RESP" '"result"'
+check "declaration has URI" "$RESP" '"uri"'
+check "declaration points to line 0" "$RESP" '"line":0'
+
 # Go to definition on a type name in a type annotation
 # Source: "record Point {x: Int, y: Int}\n\nfunc main(args: List[String]) -> Int:\n    p: Point = {x = 1, y = 2}\n    0\n"
 # Click on 'Point' at line 3 character 8 — should jump to record declaration on line 0
@@ -147,8 +161,13 @@ RESP=$(read_response)
 check "definition on type annotation returns URI" "$RESP" '"uri"'
 check "definition on type annotation points to record" "$RESP" '"line":0'
 
-# Go to definition on a union variant name in a pattern
-# Source: union Shape on line 0-2, func on line 4+, 'Circle' pattern on line 6
+send_msg '{"jsonrpc":"2.0","id":21,"method":"textDocument/typeDefinition","params":{"textDocument":{"uri":"file:///tmp/test_lsp_def_type.brp"},"position":{"line":3,"character":8}}}'
+RESP=$(read_response)
+check "type definition on type annotation returns URI" "$RESP" '"uri"'
+check "type definition on type annotation points to record" "$RESP" '"line":0'
+
+# Go to definition on a union variant name in a pattern.
+# Source: union Shape on line 0-2, Circle variant on line 1, func on line 4+.
 VARIANT_URI="file:///tmp/test_lsp_def_variant.brp"
 send_msg '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///tmp/test_lsp_def_variant.brp","languageId":"blorp","version":1,"text":"union Shape:\n    Circle(Float)\n    Square(Float)\n\nfunc area(s: Shape) -> Float:\n    match s:\n        Circle(r): r * r\n        Square(s): s * s\n\nfunc main(args: List[String]) -> Int:\n    _ = area(Circle(1.0))\n    0\n"}}}'
 read_response > /dev/null  # consume diagnostics
@@ -156,7 +175,7 @@ read_response > /dev/null  # consume diagnostics
 send_msg '{"jsonrpc":"2.0","id":12,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///tmp/test_lsp_def_variant.brp"},"position":{"line":6,"character":10}}}'
 RESP=$(read_response)
 check "definition on pattern constructor returns URI" "$RESP" '"uri"'
-check "definition on pattern constructor points to union" "$RESP" '"line":0'
+check "definition on pattern constructor points to variant" "$RESP" '"line":1'
 
 # Go to definition on a top-level constant
 # Source: MAX: Int = 100 on line 0, reference on line 3
@@ -180,6 +199,74 @@ send_msg "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"textDocument/definition\",
 RESP=$(read_response)
 check "definition on imported name returns URI" "$RESP" '"uri"'
 check "definition on imported name points to std/option" "$RESP" 'std/option\.brp'
+
+# Cross-module: click through a user-defined module path, selective import item,
+# and imported call site.
+USER_MOD_DIR="$TMPDIR_LSP/helpers"
+mkdir -p "$USER_MOD_DIR"
+USER_MOD_FILE="$USER_MOD_DIR/math.brp"
+cat > "$USER_MOD_FILE" <<'BRP'
+func triple(x: Int) -> Int:
+    x * 3
+BRP
+USER_MAIN_URI="file://${TMPDIR_LSP}/main.brp"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${USER_MAIN_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    ./helpers/math: triple\\n\\nfunc main(args: List[String]) -> Int:\\n    triple(3)\\n\"}}}"
+read_response > /dev/null
+
+# Cursor on `/` inside `./helpers/math` at line 1 character 5
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${USER_MAIN_URI}\"},\"position\":{\"line\":1,\"character\":5}}}"
+RESP=$(read_response)
+check "definition on user module path returns URI" "$RESP" '"uri"'
+check "definition on user module path points to module file" "$RESP" 'helpers/math\.brp'
+
+# Cursor on imported `triple` at line 1 character 22
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${USER_MAIN_URI}\"},\"position\":{\"line\":1,\"character\":22}}}"
+RESP=$(read_response)
+check "definition on user imported item returns URI" "$RESP" '"uri"'
+check "definition on user imported item points to function" "$RESP" 'helpers/math\.brp'
+check "definition on user imported item points to line 0" "$RESP" '"line":0'
+
+# Cursor on call-site `triple` at line 4 character 6
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${USER_MAIN_URI}\"},\"position\":{\"line\":4,\"character\":6}}}"
+RESP=$(read_response)
+check "definition on user imported call returns URI" "$RESP" '"uri"'
+check "definition on user imported call points to function" "$RESP" 'helpers/math\.brp'
+
+# Cross-module: multiline relative import items should keep the import line's
+# module origin, even when another imported module exports the same source name.
+mkdir -p "$TMPDIR_LSP/left" "$TMPDIR_LSP/right"
+cat > "$TMPDIR_LSP/left/maker.brp" <<'BRP'
+func make() -> Int:
+    1
+BRP
+cat > "$TMPDIR_LSP/right/maker.brp" <<'BRP'
+func make() -> Int:
+    2
+BRP
+MULTILINE_IMPORT_URI="file://${TMPDIR_LSP}/multiline_import.brp"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${MULTILINE_IMPORT_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    ./left/maker:\\n        make as make_left\\n    ./right/maker:\\n        make\\n\\nfunc main(args: List[String]) -> Int:\\n    make_left() + make()\\n\"}}}"
+read_response > /dev/null
+
+# Cursor on the original `make` in the first multiline import item.
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${MULTILINE_IMPORT_URI}\"},\"position\":{\"line\":2,\"character\":10}}}"
+RESP=$(read_response)
+check "definition on multiline relative import item returns URI" "$RESP" '"uri"'
+check "definition on multiline relative import item keeps origin" "$RESP" 'left/maker\.brp'
+
+# Std selective imports used by formatter sources.
+JSON_IMPORT_URI="${WORKSPACE_URI}/tests/.lsp_scratch_json_import.brp"
+send_msg "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"${JSON_IMPORT_URI}\",\"languageId\":\"blorp\",\"version\":1,\"text\":\"import:\\n    json: JsonValue, parse_json\\n\\nfunc main(args: List[String]) -> Int:\\n    0\\n\"}}}"
+read_response > /dev/null
+
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${JSON_IMPORT_URI}\"},\"position\":{\"line\":1,\"character\":11}}}"
+RESP=$(read_response)
+check "definition on JsonValue import item returns URI" "$RESP" '"uri"'
+check "definition on JsonValue import item points to std/json" "$RESP" 'std/json\.brp'
+
+send_msg "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":\"${JSON_IMPORT_URI}\"},\"position\":{\"line\":1,\"character\":22}}}"
+RESP=$(read_response)
+check "definition on parse_json import item returns URI" "$RESP" '"uri"'
+check "definition on parse_json import item points to std/json" "$RESP" 'std/json\.brp'
 
 # Click on the module path INSIDE an import block — should jump to the module file.
 IMPORT_MOD_URI="${WORKSPACE_URI}/tests/.lsp_scratch_import_mod.brp"
@@ -274,6 +361,22 @@ else
     FAIL=$((FAIL + 1))
     ERRORS="$ERRORS  FAIL: clean exit (exit code $EXIT_CODE)\n"
     echo "  FAIL: clean exit (code $EXIT_CODE)"
+fi
+
+# ── 8. Marker-based fixture suite ───────────────────────────────────
+
+echo "== Fixture suite =="
+if ! command -v python3 >/dev/null 2>&1; then
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS  FAIL: fixture suite (python3 is required)\n"
+    echo "  FAIL: fixture suite (python3 is required)"
+elif python3 tests/lsp/run_lsp_fixtures.py "$BLORP" tests/lsp/fixtures; then
+    PASS=$((PASS + 1))
+    echo "  PASS: fixture suite"
+else
+    FAIL=$((FAIL + 1))
+    ERRORS="$ERRORS  FAIL: fixture suite\n"
+    echo "  FAIL: fixture suite"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────

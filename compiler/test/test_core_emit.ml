@@ -28,6 +28,8 @@ let ty_channel_int = TyNamed ("Channel", [ ty_int ])
 let ty_list_string = TyNamed ("List", [ ty_string ])
 let ty_set_string = TyNamed ("Set", [ ty_string ])
 let ty_dict_string_string = TyNamed ("Dict", [ ty_string; ty_string ])
+let ty_slice = TyNamed ("StringSlice", [])
+let ty_vector_float = TyNamed ("Vector", [ ty_float ])
 let ty_expr = TyNamed ("Expr", [])
 let ty_opt_string = TyNamed ("Option", [ ty_string ])
 let ty_result_int_bool = TyNamed ("Result", [ ty_int; ty_bool ])
@@ -59,16 +61,6 @@ let cvar n t = mk (CVar (Var.named n)) t
 let lower_expr = Test_helpers.lower_valid_expr
 let compile_program = Test_helpers.compile_valid_program
 
-let clist ?(layout = list_pointer_storage ()) elems =
-  CList { ll_layout = layout; ll_elems = elems }
-
-let clist_for ty elems =
-  CList
-    {
-      ll_layout = Blorp.Core_list_layout.layout_of_type ty loc;
-      ll_elems = elems;
-    }
-
 let boxed_int_storage value =
   {
     bsv_box = { box_value = value; box_source_ty = ty_int; box_kind = BoxPrim };
@@ -97,6 +89,18 @@ let contains_sub output sub =
   let m = String.length output in
   let rec go i = i + n <= m && (String.sub output i n = sub || go (i + 1)) in
   go 0
+
+let count_sub output sub =
+  let n = String.length sub in
+  let m = String.length output in
+  if n = 0 then 0
+  else
+    let rec go i count =
+      if i + n > m then count
+      else if String.sub output i n = sub then go (i + n) (count + 1)
+      else go (i + 1) count
+    in
+    go 0 0
 
 (** Emit a Core expression and return the resulting C string. *)
 let emit_to_string (e : core) : string =
@@ -1211,15 +1215,7 @@ let test_emit_dict_empty () =
 let test_emit_dict_managed_values_set_release () =
   let list_int_ty = TyNamed ("List", [ ty_int ]) in
   let dict_ty = TyNamed ("Dict", [ ty_string; list_int_ty ]) in
-  let e =
-    mk
-      (CDict
-         [
-           ( cstr "nums",
-             mk (clist_for list_int_ty [ cint 1; cint 2 ]) list_int_ty );
-         ])
-      dict_ty
-  in
+  let e = mk (CDict [ (cstr "nums", cvar "nums" list_int_ty) ]) dict_ty in
   let s = emit_to_string e in
   Alcotest.(check bool)
     "sets dict value release" true
@@ -1428,226 +1424,6 @@ let test_emit_void_let_stmt () =
    Allocating constructors
    ============================================================================ *)
 
-let test_emit_tuple_primitives () =
-  (* Tuple of ints — primitives boxed via a (void* )(long) cast *)
-  let e =
-    mk (CTuple [ cint 1; cint 2; cint 3 ]) (TyTuple [ ty_int; ty_int; ty_int ])
-  in
-  Alcotest.(check string)
-    "tuple"
-    "blorp_tuple_new(3, (void*)(long)(1L), (void*)(long)(2L), \
-     (void*)(long)(3L))"
-    (emit_to_string e)
-
-let test_emit_tuple_int128 () =
-  (* Int128 needs a dedicated blorp_box_int128 helper — the generic
-     (void* )(long) cast silently truncates. The heap box is ARC-managed, so
-     tuples must mark the slot releasable. *)
-  let ty_i128 = TyNamed ("Int128", []) in
-  let x = mk (CLit (LitInt 42L)) ty_i128 in
-  let e = mk (CTuple [ x ]) (TyTuple [ ty_i128 ]) in
-  Alcotest.(check string)
-    "int128 boxed"
-    "({ blorp_Tuple* __tup_0 = blorp_tuple_new(1, blorp_box_int128(42L)); \
-     blorp_tuple_set_rc(__tup_0, 1UL); __tup_0; })"
-    (emit_to_string e)
-
-let test_emit_tuple_tyvar_is_pointer () =
-  (* Generic type vars are treated as potentially managed pointers during
-     generic code, so tuples must install a release mask until
-     monomorphization resolves them to concrete types. The field itself is an
-     owned value being moved into the tuple; Perceus inserts CDup before
-     emission when a borrowed value must be retained. *)
-  let ty_var = TyVar "T" in
-  let x = cvar "x" ty_var in
-  let e = mk (CTuple [ x ]) (TyTuple [ ty_var ]) in
-  Alcotest.(check string)
-    "tyvar release-tracked"
-    "({ blorp_Tuple* __tup_0 = blorp_tuple_new(1, x); \
-     blorp_tuple_set_rc(__tup_0, 1UL); __tup_0; })"
-    (emit_to_string e)
-
-let test_emit_tuple_dim_op_raises () =
-  (* Dimension values retain their type-level identity for specialization, but
-     erase to Int-compatible scalar values when they reach runtime value slots. *)
-  let bad_ty = TyDimOp (DimAdd, TyConstInt 1, TyConstInt 2) in
-  let x = mk (CLit (LitInt 42L)) bad_ty in
-  let e = mk (CTuple [ x ]) (TyTuple [ bad_ty ]) in
-  Alcotest.(check string)
-    "dim scalar boxed" "blorp_tuple_new(1, (void*)(long)(42L))"
-    (emit_to_string e)
-
-let test_emit_tuple_float () =
-  let ty_float = TyNamed ("Float", []) in
-  let f1 = mk (CLit (LitFloat 1.5)) ty_float in
-  let f2 = mk (CLit (LitFloat 2.5)) ty_float in
-  let e = mk (CTuple [ f1; f2 ]) (TyTuple [ ty_float; ty_float ]) in
-  let s = emit_to_string e in
-  (* Should start with blorp_tuple_new(2, blorp_box_float(...) *)
-  Alcotest.(check string)
-    "tuple of floats"
-    "blorp_tuple_new(2, blorp_box_float(1.5), blorp_box_float(2.5))" s
-
-let test_emit_tuple_owned_var_sets_release_mask_without_retain () =
-  let name = cvar "name" ty_string in
-  let e = mk (CTuple [ cint 1; name ]) (TyTuple [ ty_int; ty_string ]) in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "wraps tuple construction" true
-    (contains_sub s "blorp_Tuple* __tup_0 = blorp_tuple_new(2");
-  Alcotest.(check bool)
-    "does not retain owned var" false
-    (contains_sub s "blorp_retain(__tup_0->elem[1])");
-  Alcotest.(check bool)
-    "sets tuple release mask" true
-    (contains_sub s "blorp_tuple_set_rc(__tup_0, 2UL);")
-
-let test_emit_tuple_borrowed_unbox_retains_and_sets_release_mask () =
-  let raw = cvar "raw" ty_ptr in
-  let name = mk (CUnbox (raw, ty_string)) ty_string in
-  let e = mk (CTuple [ cint 1; name ]) (TyTuple [ ty_int; ty_string ]) in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "retains borrowed unboxed managed field" true
-    (contains_sub s "if (__tup_0->elem[1]) blorp_retain(__tup_0->elem[1]);");
-  Alcotest.(check bool)
-    "sets tuple release mask" true
-    (contains_sub s "blorp_tuple_set_rc(__tup_0, 2UL);")
-
-let test_emit_list_primitives () =
-  let list_ty = TyNamed ("List", [ ty_int ]) in
-  let e = mk (clist_for list_ty [ cint 10; cint 20 ]) list_ty in
-  (* Fresh ctx → expr_temp_counter starts at 0 → __lst_0 *)
-  Alcotest.(check string)
-    "list of ints"
-    "({ blorp_List* __lst_0 = blorp_list_new_inline(2, 8); __lst_0 = \
-     blorp_list_append(__lst_0, (void*)(long)(10L)); __lst_0 = \
-     blorp_list_append(__lst_0, (void*)(long)(20L)); __lst_0; })"
-    (emit_to_string e)
-
-let test_emit_list_sized_primitives_use_packed_layout () =
-  let ty_i32 = TyNamed ("Int32", []) in
-  let i32 n = mk (CLit (LitInt (Int64.of_int n))) ty_i32 in
-  let list_ty = TyNamed ("List", [ ty_i32 ]) in
-  let e = mk (clist_for list_ty [ i32 10; i32 20 ]) list_ty in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "uses 4-byte inline storage" true
-    (contains_sub s "blorp_list_new_inline(2, 4)");
-  Alcotest.(check bool)
-    "does not set release" false
-    (contains_sub s "blorp_list_init_elem_release")
-
-let test_emit_list_enum_uses_registry_layout () =
-  let ctx = Blorp.Core_emit_context.create () in
-  let color_ty = TyNamed ("Color", []) in
-  Blorp.Codegen_types.register_enum_type ctx.reg "Color"
-    [
-      {
-        variant_name = "Red";
-        variant_fields = [];
-        variant_tag = 0;
-        variant_loc = loc;
-        variant_def_id = None;
-      };
-      {
-        variant_name = "Green";
-        variant_fields = [];
-        variant_tag = 1;
-        variant_loc = loc;
-        variant_def_id = None;
-      };
-      {
-        variant_name = "Blue";
-        variant_fields = [];
-        variant_tag = 2;
-        variant_loc = loc;
-        variant_def_id = None;
-      };
-    ];
-  let red = mk (CVar (Var.named "Red")) color_ty in
-  let blue = mk (CVar (Var.named "Blue")) color_ty in
-  let e =
-    mk
-      (clist ~layout:(list_inline_storage InlineBytes1) [ red; blue ])
-      (TyNamed ("List", [ color_ty ]))
-  in
-  Blorp.Core_emit.emit_expr ctx e;
-  let s = Buffer.contents ctx.output in
-  Alcotest.(check bool)
-    "enum uses byte-sized inline storage" true
-    (contains_sub s "blorp_list_new_inline(2, 1)");
-  Alcotest.(check bool)
-    "enum is not retained" false
-    (contains_sub s "blorp_list_init_elem_release")
-
-let test_emit_list_managed_elements_set_release () =
-  let list_ty = TyNamed ("List", [ ty_string ]) in
-  let e = mk (clist_for list_ty [ cstr "a"; cstr "b" ]) list_ty in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "sets elem release" true
-    (contains_sub s
-       "blorp_list_init_elem_release(__lst_0, blorp_elem_release_fn)");
-  Alcotest.(check bool)
-    "appends first element" true
-    (contains_sub s "__lst_0 = blorp_list_append(__lst_0, __blorp_get_sl_0()")
-
-let test_emit_list_float_elements_do_not_set_release () =
-  let list_ty = TyNamed ("List", [ ty_float ]) in
-  let e = mk (clist_for list_ty [ cfloat 1.5; cfloat 2.5 ]) list_ty in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "uses 8-byte inline storage" true
-    (contains_sub s "blorp_list_new_inline(2, 8)");
-  Alcotest.(check bool)
-    "does not set elem release" false
-    (contains_sub s
-       "blorp_list_init_elem_release(__lst_0, blorp_elem_release_fn)");
-  Alcotest.(check bool)
-    "boxes first float as immediate" true
-    (contains_sub s "__lst_0 = blorp_list_append(__lst_0, blorp_box_float(1.5))")
-
-let test_emit_list_int128_elements_set_release () =
-  let ty_i128 = TyNamed ("Int128", []) in
-  let list_ty = TyNamed ("List", [ ty_i128 ]) in
-  let e =
-    mk
-      (clist_for list_ty
-         [ mk (CLit (LitInt 1L)) ty_i128; mk (CLit (LitInt 2L)) ty_i128 ])
-      list_ty
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "sets elem release" true
-    (contains_sub s
-       "blorp_list_init_elem_release(__lst_0, blorp_elem_release_fn)");
-  Alcotest.(check bool)
-    "transfers fresh boxes" true
-    (contains_sub s
-       "__lst_0 = blorp_list_append_owned(__lst_0, blorp_box_int128(1L))")
-
-let test_emit_list_option_int_elements_use_inline_stack_storage () =
-  let list_ty = TyNamed ("List", [ option_int ]) in
-  let e =
-    mk
-      (clist_for list_ty [ stack_option_int_some 1; stack_option_int_none ])
-      list_ty
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "allocates inline stack-option slots" true
-    (contains_sub s "blorp_list_new_inline(2, sizeof(blorp_StackOption_Int))");
-  Alcotest.(check bool)
-    "copies first stack option by address" true
-    (contains_sub s "blorp_list_set_raw_copy(__lst_0, 0, &__lst_elem_");
-  Alcotest.(check bool)
-    "does not install ARC element release" false
-    (contains_sub s "blorp_list_init_elem_release");
-  Alcotest.(check bool)
-    "does not box stack options for list storage" false
-    (contains_sub s "blorp_box_struct")
-
 let test_emit_list_inline_int_set_uses_direct_inline_storage () =
   let list_ty = TyNamed ("List", [ ty_int ]) in
   let e =
@@ -1773,6 +1549,41 @@ let test_emit_list_inline_struct_get_unknown_storage_reads_inline_slot_directly
   Alcotest.(check bool)
     "does not memcpy from raw value returned by blorp_list_get" false
     memcpys_from_raw
+
+let test_emit_blorp_template_intrinsics () =
+  let intrinsic name args ty = mk (CCall (CKIntrinsic name, cvoid, args)) ty in
+  let check name expected expr =
+    Alcotest.(check string) name expected (emit_to_string expr)
+  in
+  check "math sqrt" "sqrt(x)"
+    (intrinsic "math_sqrt" [ cvar "x" ty_float ] ty_float);
+  check "math pow" "pow(x, y)"
+    (intrinsic "math_pow" [ cvar "x" ty_float; cvar "y" ty_float ] ty_float);
+  check "bit and" "(1L & 2L)" (intrinsic "bit_and" [ cint 1; cint 2 ] ty_int);
+  check "shift left" "((long)(1L << (8L & 63)))"
+    (intrinsic "shift_left" [ cint 1; cint 8 ] ty_int);
+  check "list len" "((blorp_List*)xs)->len"
+    (intrinsic "list_len" [ cvar "xs" ty_list_string ] ty_int);
+  check "string len" "((blorp_String*)s)->len"
+    (intrinsic "string_len" [ cvar "s" ty_string ] ty_int);
+  check "bytes len" "((blorp_Bytes*)b)->len"
+    (intrinsic "bytes_len" [ cvar "b" (TyNamed ("Bytes", [])) ] ty_int);
+  check "dict len" "((blorp_Dict*)d)->size"
+    (intrinsic "dict_len" [ cvar "d" ty_dict_string_string ] ty_int);
+  check "set bucket" "((void*)((blorp_Set*)s)->buckets[3L])"
+    (intrinsic "set_bucket" [ cvar "s" ty_set_string; cint 3 ] ty_ptr);
+  check "dict meta get" "((long)((blorp_Dict*)d)->meta[2L])"
+    (intrinsic "dict_meta_get"
+       [ cvar "d" ty_dict_string_string; cint 2 ]
+       ty_int);
+  check "slice source" "((void*)((blorp_StringSlice*)slice)->source)"
+    (intrinsic "slice_source" [ cvar "slice" ty_slice ] ty_string);
+  check "slice len" "((blorp_StringSlice*)slice)->len"
+    (intrinsic "slice_len" [ cvar "slice" ty_slice ] ty_int);
+  check "tensor capacity" "((blorp_Vector*)vec)->capacity"
+    (intrinsic "tensor_capacity" [ cvar "vec" ty_vector_float ] ty_int);
+  check "fixed scale" "(long)((blorp_Fixed*)fx)->scale"
+    (intrinsic "fixed_scale" [ cvar "fx" ty_fixed ] ty_int)
 
 let test_emit_list_ensure_intrinsics_use_common_fast_paths () =
   let list_ty = TyNamed ("List", [ ty_int ]) in
@@ -1942,54 +1753,6 @@ let test_escape_unicode_before_hex_digit () =
 (* ============================================================================
    Deferred variants raise clearly
    ============================================================================ *)
-
-let test_emit_vector () =
-  let ty_float = TyNamed ("Float", []) in
-  let f n = mk (CLit (LitFloat n)) ty_float in
-  let e =
-    mk
-      (CVector [ f 1.0; f 2.0; f 3.0 ])
-      (TyNamed ("Tensor", [ ty_float; TyConstInt 3 ]))
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "has vector_new_f64" true
-    (contains_sub s "blorp_vector_new_f64(3)");
-  Alcotest.(check bool)
-    "float stored raw" true
-    (contains_sub s "((double*)__vec_0->data)[0] = 1");
-  Alcotest.(check bool)
-    "has data[2]" true
-    (contains_sub s "((double*)__vec_0->data)[2]")
-
-let test_emit_vector_int () =
-  let e =
-    mk
-      (CVector [ cint 1; cint 2 ])
-      (TyNamed ("Tensor", [ ty_int; TyConstInt 2 ]))
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "has vector_new_i64" true
-    (contains_sub s "blorp_vector_new_i64(2)");
-  Alcotest.(check bool)
-    "int stored raw" true
-    (contains_sub s "((long*)__vec_0->data)[0] = 1L")
-
-let test_emit_vector_alias_uses_expanded_element_layout () =
-  let ctx = Blorp.Core_emit_context.create () in
-  Hashtbl.replace ctx.reg.type_aliases "Meters" ([], TyNamed ("Float", []));
-  Hashtbl.replace ctx.reg.type_aliases "Positions"
-    ([], TyNamed ("Vector", [ TyNamed ("Meters", []); TyConstInt 2 ]));
-  let f n = mk (CLit (LitFloat n)) ty_float in
-  let e = mk (CVector [ f 1.0; f 2.0 ]) (TyNamed ("Positions", [])) in
-  let s = emit_to_string_with_ctx ctx e in
-  Alcotest.(check bool)
-    "alias uses f64 constructor" true
-    (contains_sub s "blorp_vector_new_f64(2)");
-  Alcotest.(check bool)
-    "alias stores f64 raw values" true
-    (contains_sub s "((double*)__vec_0->data)[0] = 1")
 
 let test_emit_nullable_vector_set_cow_releases_value_record_box () =
   let ctx = Blorp.Core_emit_context.create () in
@@ -2242,6 +2005,11 @@ let test_stmt_break_continue () =
   Alcotest.(check string)
     "continue" "continue;\n"
     (emit_stmt_to_string (mk CContinue ty_void))
+
+let test_stmt_cooperative_checkpoint () =
+  Alcotest.(check string)
+    "cooperative checkpoint" "blorp_cooperative_checkpoint();\n"
+    (emit_stmt_to_string (mk CCooperativeCheckpoint ty_void))
 
 let test_stmt_assign () =
   let e = mk (CAssign (Var.named "i", cint 5)) ty_void in
@@ -2596,6 +2364,31 @@ let test_escape_nul_string_literal_keeps_explicit_length () =
     "literal includes explicit byte length" true
     (contains_sub output "blorp_string_literal_len(\"a\\000b\", 3L)")
 
+let test_emit_global_managed_dict_constant_immortalized () =
+  let v : core_var =
+    {
+      cv_name = Var.named "NAMES";
+      cv_module = None;
+      cv_ty = ty_dict_string_string;
+      cv_init =
+        mk (CDict [ (cstr "Ada", cstr "Lovelace") ]) ty_dict_string_string;
+      cv_is_mutable = false;
+      cv_is_const = true;
+      cv_def_id = 0;
+    }
+  in
+  let prog = [ { cd_desc = CDVar v; cd_loc = loc; cd_doc = None } ] in
+  let output = emit_program_to_string prog in
+  Alcotest.(check bool)
+    "makes dict root immortal" true
+    (contains_sub output "blorp_make_immortal_constant(NAMES);");
+  Alcotest.(check bool)
+    "walks managed dict entries" true
+    (contains_sub output "blorp_make_immortal_dict_constant(NAMES,");
+  Alcotest.(check bool)
+    "uses string element immortalizer" true
+    (contains_sub output "blorp_make_immortal_constant(((blorp_String*)value));")
+
 let test_emit_impl_methods () =
   let point_ty = TyNamed ("Point", []) in
   let point_decl : record_decl =
@@ -2877,29 +2670,120 @@ let test_emit_concurrent_block () =
       [ { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None } ]
   in
   Alcotest.(check bool)
-    "has batch init" true
+    "ensures thread pool without operation width" true
+    (contains_sub output "blorp_thread_pool_ensure_initialized();");
+  Alcotest.(check bool)
+    "uses runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_");
+  Alcotest.(check bool)
+    "zero-initializes runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_"
+    && contains_sub output " = {0};");
+  Alcotest.(check bool)
+    "begins protected task window through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_begin");
+  Alcotest.(check bool)
+    "spawns through task window slots" true
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned");
+  Alcotest.(check bool)
+    "joins through task window slots" true
+    (contains_sub output "blorp_concurrent_task_window_join_release");
+  Alcotest.(check bool)
+    "finishes task window through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_end");
+  Alcotest.(check bool)
+    "does not open-code fixed task batch init" false
     (contains_sub output "blorp_task_batch_init(&__conc_batch_");
   Alcotest.(check bool)
-    "has owned batched task_spawn" true
-    (contains_sub output "blorp_task_spawn_owned_in_batch(&__conc_batch_");
-  Alcotest.(check bool)
-    "flushes batch before join" true
+    "does not open-code fixed task batch flush" false
     (contains_sub output "blorp_task_batch_flush(&__conc_batch_");
   Alcotest.(check bool)
-    "has concurrent_join" true
-    (contains_sub output "blorp_concurrent_join");
+    "does not use batch-level fixed spawn helper" false
+    (contains_sub output
+       "blorp_concurrent_spawn_owned_cleanup_in_batch(&__conc_batch_");
   Alcotest.(check bool)
-    "registers task cleanup" true
+    "does not declare raw fixed task handles" false
+    (contains_sub output "blorp_Task* __conc_task_");
+  Alcotest.(check bool)
+    "does not declare raw fixed task cleanup frames" false
+    (contains_sub output "blorp_CancelCleanupFrame __blorp_task_cleanup_");
+  Alcotest.(check bool)
+    "does not emit task cleanup registration separately" false
     (contains_sub output "blorp_task_cleanup_push_task");
   Alcotest.(check bool)
-    "pops task cleanup before normal release" true
+    "does not pop task cleanup directly after join" false
     (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_task_");
   Alcotest.(check bool)
-    "has task release" true
-    (contains_sub output "blorp_release((blorp_Object*)");
+    "does not release task directly after join" false
+    (contains_sub output "blorp_release((blorp_Object*)__conc_task_");
   Alcotest.(check bool)
-    "has two tasks" true
-    (contains_sub output "__conc_task_")
+    "uses periodic task-window flush mode" true
+    (contains_sub output "BLORP_CONCURRENT_TASK_FLUSH_PERIODIC")
+
+let test_emit_concurrent_block_max_threads_limits_window () =
+  let fty = TyFunc { params = []; return = ty_int; is_pure = true } in
+  let bind name =
+    {
+      cb_var = Var.named name;
+      cb_ty = ty_int;
+      cb_rhs = mk (CCall (CKUser (name, None), cvar name fty, [])) ty_int;
+      cb_task_scope = synthetic_concurrent_task_scope;
+      cb_task = None;
+    }
+  in
+  let tail =
+    mk
+      (CBin
+         ( Add,
+           mk (CBin (Add, cvar "a" ty_int, cvar "b" ty_int)) ty_int,
+           cvar "c" ty_int ))
+      ty_int
+  in
+  let e =
+    mk
+      (CConcurrent
+         {
+           conc_bindings = [ bind "a"; bind "b"; bind "c" ];
+           conc_body = tail;
+           conc_timeout = None;
+           conc_max_threads = Some 2;
+         })
+      ty_int
+  in
+  let func : core_func =
+    {
+      cf_name = "run_three";
+      cf_type_params = [];
+      cf_params = [];
+      cf_module = None;
+      cf_return_ty = ty_int;
+      cf_body = Some e;
+      cf_is_pure = false;
+      cf_kind = CFUser;
+      cf_def_id = 0;
+    }
+  in
+  let output =
+    emit_program_to_string
+      [ { cd_desc = CDFunc func; cd_loc = loc; cd_doc = None } ]
+  in
+  Alcotest.(check bool)
+    "max_threads initializes pool with runtime default capacity" true
+    (contains_sub output "blorp_thread_pool_ensure_initialized();");
+  Alcotest.(check bool)
+    "max_threads does not become process-wide thread pool size" false
+    (contains_sub output "blorp_thread_pool_init(2);");
+  Alcotest.(check bool)
+    "max_threads caps fixed concurrent task window" true
+    (contains_sub output
+       "blorp_concurrent_task_window_begin(&__conc_task_window_"
+    && contains_sub output ", 2);");
+  Alcotest.(check int)
+    "spawns all fixed bindings" 3
+    (count_sub output "blorp_concurrent_task_window_spawn_owned(");
+  Alcotest.(check int)
+    "joins all fixed bindings" 3
+    (count_sub output "blorp_concurrent_task_window_join_release(")
 
 let test_emit_concurrent_program () =
   let fty = TyFunc { params = []; return = ty_int; is_pure = true } in
@@ -2943,8 +2827,8 @@ let test_emit_concurrent_program () =
     "has lambda body" true
     (contains_sub output "_blorp_task_0(void* __env)");
   Alcotest.(check bool)
-    "has spawn" true
-    (contains_sub output "blorp_task_spawn")
+    "has spawn cleanup helper" true
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned")
 
 let test_emit_concurrent_capture_release_mask () =
   let result_ty =
@@ -3000,7 +2884,7 @@ let test_emit_concurrent_capture_release_mask () =
         blorp_cleanup_release_arc_only_value);");
   Alcotest.(check bool)
     "transfers emitter's closure ref to task spawn" true
-    (contains_sub output "blorp_task_spawn_owned");
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned_rc");
   Alcotest.(check bool)
     "does not release transferred task closure in caller" false
     (contains_sub output "blorp_release((blorp_Object*)__conc_fn_")
@@ -3047,7 +2931,7 @@ let test_emit_concurrent_stack_result_join_conversion () =
     "converts boxed join Result to stack Result" true
     (contains_sub output
        "blorp_StackResult r = \
-        blorp_stack_result_from_boxed((blorp_Result*)blorp_concurrent_join(");
+        blorp_stack_result_from_boxed((blorp_Result*)blorp_concurrent_task_window_join_release(");
   Alcotest.(check bool)
     "does not cast boxed join Result to stack Result" false
     (contains_sub output
@@ -3093,25 +2977,74 @@ let test_emit_concurrently_loop_rc_result_uses_spawn_rc () =
   in
   Alcotest.(check bool)
     "rc task result uses owned spawn_rc" true
-    (contains_sub output "blorp_task_spawn_owned_rc_in_batch");
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned_rc");
   Alcotest.(check bool)
-    "for ... concurrently uses batch init" true
+    "for ... concurrently initializes carrier pool independently of limit" true
+    (contains_sub output "blorp_thread_pool_ensure_initialized();");
+  Alcotest.(check bool)
+    "for ... concurrently does not use limit as process-wide pool size" false
+    (contains_sub output "blorp_thread_pool_init((int)__conc_limit_");
+  Alcotest.(check bool)
+    "for ... concurrently uses runtime-owned task window batch" false
+    (contains_sub output "blorp_TaskBatch __conc_batch_");
+  Alcotest.(check bool)
+    "for ... concurrently does not open-code task batch init" false
     (contains_sub output "blorp_task_batch_init(&__conc_batch_");
   Alcotest.(check bool)
-    "for ... concurrently flushes spawn batches" true
+    "for ... concurrently does not open-code task batch flushing" false
+    (contains_sub output "blorp_task_batch_flush");
+  Alcotest.(check bool)
+    "for ... concurrently uses periodic task-window flush mode" true
+    (contains_sub output "BLORP_CONCURRENT_TASK_FLUSH_PERIODIC");
+  Alcotest.(check bool)
+    "for ... concurrently does not open-code batch interval policy" false
     (contains_sub output "% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0");
   Alcotest.(check bool)
-    "for ... concurrently schedules batch before joins" true
-    (contains_sub output "blorp_task_batch_flush(&__conc_batch_");
+    "for ... concurrently schedules before joins through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_join_release");
   Alcotest.(check bool)
-    "for ... concurrently allocates cleanup frames" true
+    "for ... concurrently uses one runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_");
+  Alcotest.(check bool)
+    "for ... concurrently zero-initializes runtime task window" true
+    (contains_sub output "blorp_ConcurrentTaskWindow __conc_task_window_"
+    && contains_sub output " = {0};");
+  Alcotest.(check bool)
+    "for ... concurrently begins protected task window through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_begin");
+  Alcotest.(check bool)
+    "for ... concurrently finishes task window through runtime" true
+    (contains_sub output "blorp_concurrent_task_window_end");
+  Alcotest.(check bool)
+    "for ... concurrently does not allocate separate task arrays" false
+    (contains_sub output "blorp_Task** __conc_tasks_");
+  Alcotest.(check bool)
+    "for ... concurrently does not allocate separate cleanup frame arrays" false
     (contains_sub output "blorp_CancelCleanupFrame* __conc_task_cleanups_");
   Alcotest.(check bool)
-    "for ... concurrently registers task cleanup" true
+    "for ... concurrently does not emit task cleanup registration separately"
+    false
     (contains_sub output "blorp_task_cleanup_push_task");
   Alcotest.(check bool)
-    "for ... concurrently pops task cleanup" true
-    (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_tasks_");
+    "for ... concurrently joins through runtime cleanup helper" true
+    (contains_sub output "blorp_concurrent_task_window_join_release");
+  Alcotest.(check bool)
+    "for ... concurrently spawns through task window slots" true
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned_rc");
+  Alcotest.(check bool)
+    "for ... concurrently does not index task window task slots directly" false
+    (contains_sub output ".tasks[");
+  Alcotest.(check bool)
+    "for ... concurrently does not index task window cleanup slots directly"
+    false
+    (contains_sub output ".cleanups[");
+  Alcotest.(check bool)
+    "for ... concurrently does not open-code task window cleanup pop" false
+    (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_task_window_");
+  Alcotest.(check bool)
+    "for ... concurrently does not open-code task window cleanup release" false
+    (contains_sub output
+       "blorp_concurrent_task_window_cleanup(&__conc_task_window_");
   Alcotest.(check bool)
     "for ... concurrently protects collected result list on cancellation" true
     (contains_sub output "blorp_cleanup_release_arc_value)");
@@ -3121,6 +3054,81 @@ let test_emit_concurrently_loop_rc_result_uses_spawn_rc () =
   Alcotest.(check bool)
     "for ... concurrently transfers collected result list ownership" true
     (contains_sub output "blorp_task_cleanup_pop_slot(&__conc_results_")
+
+let test_emit_resource_source_concurrently_flushes_each_spawn () =
+  let resource_ty = TyNamed ("TcpStream", []) in
+  let error_ty = TyNamed ("TcpError", []) in
+  let source_ty = TyNamed ("ResourceSource", [ resource_ty; error_ty ]) in
+  let task =
+    {
+      tc_func = "handle_conn";
+      tc_def_id = 4242;
+      tc_captures =
+        [
+          {
+            task_capture_name = "conn";
+            task_capture_ty = resource_ty;
+            task_capture_kind = TaskMoveResourceItem;
+          };
+        ];
+      tc_return_ty = ty_void;
+    }
+  in
+  let e =
+    mk
+      (CConcurrentlyLoop
+         {
+           cf_var = Var.named "conn";
+           cf_iter = cvar "source" source_ty;
+           cf_body = cvoid;
+           cf_timeout = None;
+           cf_width = ConcurrentlyLoopLimit (cint 8192);
+           cf_output = ConcurrentlyLoopDiscard;
+           cf_item_mode =
+             ConcurrentlyLoopMoveResourceItem
+               { clmi_resource_ty = resource_ty; clmi_error_ty = error_ty };
+           cf_task_scope = synthetic_concurrent_task_scope;
+           cf_task = Some task;
+         })
+      ty_void
+  in
+  let output = emit_stmt_to_string e in
+  Alcotest.(check bool)
+    "resource-source fan-out pulls resources" true
+    (contains_sub output "blorp_resource_source_next_raw(");
+  Alcotest.(check bool)
+    "resource-source fan-out initializes carrier pool independently of limit"
+    true
+    (contains_sub output "blorp_thread_pool_ensure_initialized();");
+  Alcotest.(check bool)
+    "resource-source fan-out does not use limit as process-wide pool size" false
+    (contains_sub output "blorp_thread_pool_init((int)__conc_limit_");
+  Alcotest.(check bool)
+    "resource-source fan-out spawns and registers cleanup together" true
+    (contains_sub output "blorp_concurrent_task_window_spawn_owned(");
+  Alcotest.(check bool)
+    "resource-source fan-out flushes each spawn through runtime" true
+    (contains_sub output "BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE");
+  Alcotest.(check bool)
+    "resource-source fan-out joins through task window slots" true
+    (contains_sub output "blorp_concurrent_task_window_join_release");
+  Alcotest.(check bool)
+    "resource-source fan-out does not index task window task slots directly"
+    false
+    (contains_sub output ".tasks[");
+  Alcotest.(check bool)
+    "resource-source fan-out does not index task window cleanup slots directly"
+    false
+    (contains_sub output ".cleanups[");
+  Alcotest.(check bool)
+    "resource-source moved resource has pre-entry fallback release" true
+    (contains_sub output "->env_release_mask = 1UL;");
+  Alcotest.(check bool)
+    "resource-source fan-out does not wait for batch interval" false
+    (contains_sub output "% BLORP_TASK_BATCH_FLUSH_INTERVAL");
+  Alcotest.(check bool)
+    "resource-source fan-out does not open-code task batch flushing" false
+    (contains_sub output "blorp_task_batch_flush")
 
 let test_emit_detach () =
   let fty = TyFunc { params = []; return = ty_void; is_pure = false } in
@@ -5938,28 +5946,6 @@ let suite =
       ] );
     ( "alloc",
       [
-        Alcotest.test_case "tuple_primitives" `Quick test_emit_tuple_primitives;
-        Alcotest.test_case "tuple_int128" `Quick test_emit_tuple_int128;
-        Alcotest.test_case "tuple_tyvar" `Quick test_emit_tuple_tyvar_is_pointer;
-        Alcotest.test_case "tuple_dim_op" `Quick test_emit_tuple_dim_op_raises;
-        Alcotest.test_case "tuple_float" `Quick test_emit_tuple_float;
-        Alcotest.test_case "tuple_owned_var_release_mask" `Quick
-          test_emit_tuple_owned_var_sets_release_mask_without_retain;
-        Alcotest.test_case "tuple_borrowed_unbox_release_mask" `Quick
-          test_emit_tuple_borrowed_unbox_retains_and_sets_release_mask;
-        Alcotest.test_case "list_primitives" `Quick test_emit_list_primitives;
-        Alcotest.test_case "list_sized_primitives_packed" `Quick
-          test_emit_list_sized_primitives_use_packed_layout;
-        Alcotest.test_case "list_enum_packed" `Quick
-          test_emit_list_enum_uses_registry_layout;
-        Alcotest.test_case "list_managed_release" `Quick
-          test_emit_list_managed_elements_set_release;
-        Alcotest.test_case "list_float_no_release" `Quick
-          test_emit_list_float_elements_do_not_set_release;
-        Alcotest.test_case "list_int128_release" `Quick
-          test_emit_list_int128_elements_set_release;
-        Alcotest.test_case "list_option_int_inline_stack_storage" `Quick
-          test_emit_list_option_int_elements_use_inline_stack_storage;
         Alcotest.test_case "list_inline_int_set_direct" `Quick
           test_emit_list_inline_int_set_uses_direct_inline_storage;
         Alcotest.test_case "list_managed_string_set_pointer_path" `Quick
@@ -5970,6 +5956,8 @@ let suite =
           test_emit_list_inline_struct_set_unknown_storage_branches_safely;
         Alcotest.test_case "list_inline_struct_get_unknown_safe" `Quick
           test_emit_list_inline_struct_get_unknown_storage_reads_inline_slot_directly;
+        Alcotest.test_case "blorp_template_intrinsics" `Quick
+          test_emit_blorp_template_intrinsics;
         Alcotest.test_case "list_ensure_common_fast_paths" `Quick
           test_emit_list_ensure_intrinsics_use_common_fast_paths;
         Alcotest.test_case "list_new_managed_release" `Quick
@@ -6024,10 +6012,6 @@ let suite =
       ] );
     ( "vector",
       [
-        Alcotest.test_case "float" `Quick test_emit_vector;
-        Alcotest.test_case "int" `Quick test_emit_vector_int;
-        Alcotest.test_case "alias_expanded_layout" `Quick
-          test_emit_vector_alias_uses_expanded_element_layout;
         Alcotest.test_case "tensor_literal_layout_payload_mismatch" `Quick
           test_emit_invariant_tensor_literal_layout_payload_mismatch;
         Alcotest.test_case "tensor_literal_layout_release_policy" `Quick
@@ -6045,6 +6029,8 @@ let suite =
     ( "concurrency",
       [
         Alcotest.test_case "concurrent_block" `Quick test_emit_concurrent_block;
+        Alcotest.test_case "concurrent_block_max_threads_limits_window" `Quick
+          test_emit_concurrent_block_max_threads_limits_window;
         Alcotest.test_case "concurrent_program" `Quick
           test_emit_concurrent_program;
         Alcotest.test_case "concurrent_capture_release_mask" `Quick
@@ -6053,6 +6039,8 @@ let suite =
           test_emit_concurrent_stack_result_join_conversion;
         Alcotest.test_case "concurrently_loop_rc_result_uses_spawn_rc" `Quick
           test_emit_concurrently_loop_rc_result_uses_spawn_rc;
+        Alcotest.test_case "resource_source_concurrently_flushes_each_spawn"
+          `Quick test_emit_resource_source_concurrently_flushes_each_spawn;
         Alcotest.test_case "detach" `Quick test_emit_detach;
         Alcotest.test_case "detach_void_task_abi" `Quick
           test_emit_detach_void_task_abi;
@@ -6081,6 +6069,8 @@ let suite =
         Alcotest.test_case "if_else" `Quick test_stmt_if_else;
         Alcotest.test_case "while" `Quick test_stmt_while;
         Alcotest.test_case "break_continue" `Quick test_stmt_break_continue;
+        Alcotest.test_case "cooperative_checkpoint" `Quick
+          test_stmt_cooperative_checkpoint;
         Alcotest.test_case "assign" `Quick test_stmt_assign;
         Alcotest.test_case "discard_managed_var" `Quick
           test_stmt_discard_managed_var_releases;
@@ -6145,6 +6135,8 @@ let suite =
           test_emit_global_var_non_const;
         Alcotest.test_case "global_string_literal_deferred" `Quick
           test_emit_global_var_string_literal_deferred;
+        Alcotest.test_case "global managed dict constant immortalized" `Quick
+          test_emit_global_managed_dict_constant_immortalized;
         Alcotest.test_case "impl_methods" `Quick test_emit_impl_methods;
       ] );
     ( "pipeline",

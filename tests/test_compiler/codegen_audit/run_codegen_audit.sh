@@ -50,15 +50,19 @@ case "$NJOBS" in
         ;;
 esac
 
+# The audit validates generated C syntax and frontend warnings only. Linking is
+# covered by runtime tests and would make this suite pay avoidable linker cost.
+CC_SYNTAX_ONLY_FLAGS=(-fsyntax-only)
+
 if cc --version 2>/dev/null | grep -qi clang; then
     CC_WARNING_FLAGS=(
-        -fsyntax-only
+        "${CC_SYNTAX_ONLY_FLAGS[@]}"
         -Werror=unsequenced
         -Werror=incompatible-pointer-types
         -Wno-parentheses-equality
     )
 else
-    CC_WARNING_FLAGS=(-fsyntax-only)
+    CC_WARNING_FLAGS=("${CC_SYNTAX_ONLY_FLAGS[@]}")
 fi
 
 list_child_pids() {

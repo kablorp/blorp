@@ -129,12 +129,6 @@ let cancellation_cleanup_pop_slot_stmt (v : var) : string =
   Printf.sprintf "blorp_task_cleanup_pop_slot(&%s)"
     (escape_c_ident (Var.to_c_name v))
 
-let task_cleanup_pop_slot_stmt task_c : string =
-  Printf.sprintf "blorp_task_cleanup_pop_slot(&%s)" task_c
-
-let task_array_cleanup_pop_slot_stmt tasks_c slot_c : string =
-  Printf.sprintf "blorp_task_cleanup_pop_slot(&%s[%s])" tasks_c slot_c
-
 let cleanup_release_fn_for_call_kind = function
   | CKUser (name, def_id) ->
       Some (escape_c_ident (user_call_c_name name def_id))
@@ -205,21 +199,6 @@ let emit_cancellation_cleanup_push (ctx : Core_emit_context.t) (v : var)
       emit_line ctx
         (Printf.sprintf "blorp_task_cleanup_push(&%s, &%s, %s, %s);" frame_c
            var_c value_arg release_fn)
-
-let emit_task_cancellation_cleanup_push (ctx : Core_emit_context.t) task_c :
-    unit =
-  let frame_c = Printf.sprintf "__blorp_task_cleanup_%d" (fresh_temp ctx) in
-  emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" frame_c);
-  emit_line ctx
-    (Printf.sprintf "blorp_task_cleanup_push_task(&%s, &%s, (void*)%s);" frame_c
-       task_c task_c)
-
-let emit_task_array_cancellation_cleanup_push (ctx : Core_emit_context.t)
-    cleanups_c slot_c tasks_c : unit =
-  emit_line ctx
-    (Printf.sprintf
-       "blorp_task_cleanup_push_task(&%s[%s], &%s[%s], (void*)%s[%s]);"
-       cleanups_c slot_c tasks_c slot_c tasks_c slot_c)
 
 let emit_heap_pointer_cleanup_push (ctx : Core_emit_context.t) pointer_c : unit
     =
@@ -386,6 +365,665 @@ let is_c_static_literal = function
   | Ast.LitChar _ ->
       true
   | Ast.LitString _ -> false
+
+type global_constant_immortalization =
+  | NoImmortalizationNeeded
+  | ImmortalizeConstantGraph of global_constant_immortal_plan
+  | UnsupportedManagedConstant of string
+
+and global_constant_immortal_plan =
+  | ImmortalRootOnly of Ast.type_expr
+  | ImmortalRecord of {
+      record_ty : Ast.type_expr;
+      record_fields : global_constant_record_field_plan list;
+    }
+  | ImmortalUnion of {
+      union_ty : Ast.type_expr;
+      union_type_name : string;
+      union_variants : global_constant_union_variant_plan list;
+    }
+  | ImmortalTuple of {
+      tuple_ty : Ast.type_expr;
+      tuple_elements : global_constant_tuple_element_plan list;
+    }
+  | ImmortalStackResult of {
+      result_ty : Ast.type_expr;
+      ok_payload : global_constant_payload_plan option;
+      err_payload : global_constant_payload_plan option;
+    }
+  | ImmortalList of {
+      list_ty : Ast.type_expr;
+      list_elem_plan : global_constant_immortal_plan option;
+    }
+  | ImmortalDict of {
+      dict_ty : Ast.type_expr;
+      dict_key_plan : global_constant_immortal_plan option;
+      dict_value_plan : global_constant_immortal_plan option;
+    }
+
+and global_constant_record_field_plan = {
+  gc_field_name : string;
+  gc_field_plan : global_constant_immortal_plan;
+}
+
+and global_constant_tuple_element_plan = {
+  gc_tuple_index : int;
+  gc_tuple_plan : global_constant_immortal_plan;
+}
+
+and global_constant_union_variant_plan = {
+  gc_variant : Ast.variant;
+  gc_variant_fields : global_constant_union_field_plan list;
+}
+
+and global_constant_union_field_plan = {
+  gc_union_field_index : int;
+  gc_union_field_plan : global_constant_immortal_plan;
+}
+
+and global_constant_payload_plan = {
+  gc_payload_plan : global_constant_immortal_plan;
+}
+
+type checked_global_constant_immortalization =
+  | CheckedNoImmortalizationNeeded
+  | CheckedImmortalizeConstantGraph of global_constant_immortal_plan
+
+type global_constant_storage = DirectTypedStorage | VoidPointerPayload
+
+let global_constant_unsupported_hint =
+  "Use a function to construct this value at runtime, or reduce the constant \
+   to supported shapes: strings, heap records, heap unions, tuples, stack \
+   Result payloads, Lists, and Dicts with supported element types."
+
+let type_param_subst params args =
+  let names = Ast.type_param_names params in
+  if List.length names = List.length args then Some (List.combine names args)
+  else None
+
+let apply_type_param_subst_or_original params args ty =
+  match type_param_subst params args with
+  | Some subst -> Codegen_types.apply_codegen_subst subst ty
+  | None -> ty
+
+let global_constant_type_string ty = Types.type_to_string (normalize_type ty)
+
+let global_constant_list_element_type = function
+  | Ast.TyNamed (("List" | "ParallelList"), [ elem ]) -> Some elem
+  | _ -> None
+
+let global_constant_dict_entry_types = function
+  | Ast.TyNamed ("Dict", [ key; value ]) -> Some (key, value)
+  | _ -> None
+
+let managed_container_nested_release (ctx : Core_emit_context.t)
+    (ty : Ast.type_expr) : (bool, string) result option =
+  let release ty =
+    try Ok (type_requires_release ctx ty)
+    with Core_error.Core_error err -> Error err.msg
+  in
+  let boxed_release ty =
+    try Ok (boxed_value_needs_release ctx ty Ast.dummy_loc)
+    with Core_error.Core_error err -> Error err.msg
+  in
+  let named_container name checks =
+    let rec combine = function
+      | [] -> Ok false
+      | check :: rest -> (
+          match check with
+          | Error msg -> Error msg
+          | Ok true -> Ok true
+          | Ok false -> combine rest)
+    in
+    Some (combine checks |> Result.map_error (fun msg -> name ^ ": " ^ msg))
+  in
+  match normalize_type ty with
+  | Ast.TyNamed ("Dict", [ key; value ]) ->
+      named_container "Dict" [ boxed_release key; boxed_release value ]
+  | Ast.TyNamed ("Set", [ elem ]) ->
+      named_container "Set" [ boxed_release elem ]
+  | Ast.TyNamed ("Tensor", elem :: _) | Ast.TyArray (elem, _) ->
+      named_container "Tensor" [ boxed_release elem ]
+  | Ast.TyNamed
+      ( ( "Channel" | "Task" | "Stream" | "FallibleStream" | "ResourceSource"
+        | "OneShotStream" ),
+        _ ) ->
+      Some (Ok true)
+  | Ast.TyNamed (name, _) when Type_name_metadata.is_one_shot_stream_name name
+    ->
+      Some (Ok true)
+  | Ast.TyNamed (name, _) when Type_name_metadata.is_resource_source_name name
+    ->
+      Some (Ok true)
+  | _ -> (
+      match normalize_type ty with
+      | Ast.TyNamed ("Slice", [ elem ]) ->
+          named_container "Slice" [ release elem ]
+      | _ -> None)
+
+let simple_arc_global_constant_root = function
+  | Ast.TyFunc _ -> true
+  | Ast.TyNamed (("String" | "LiteralString" | "Bytes" | "Fixed"), _) -> true
+  | _ -> false
+
+let global_constant_plan_type = function
+  | ImmortalRootOnly ty -> ty
+  | ImmortalRecord { record_ty; _ } -> record_ty
+  | ImmortalUnion { union_ty; _ } -> union_ty
+  | ImmortalTuple { tuple_ty; _ } -> tuple_ty
+  | ImmortalStackResult { result_ty; _ } -> result_ty
+  | ImmortalList { list_ty; _ } -> list_ty
+  | ImmortalDict { dict_ty; _ } -> dict_ty
+
+let union_variants_for_type (ctx : Core_emit_context.t) type_name =
+  match Hashtbl.find_opt ctx.reg.union_variants type_name with
+  | None -> []
+  | Some variants ->
+      Hashtbl.fold (fun _ variant acc -> variant :: acc) variants []
+
+let global_constant_nullary_union_singleton (ctx : Core_emit_context.t)
+    (v : core_var) : bool =
+  match (normalize_type v.cv_ty, v.cv_init.desc) with
+  | Ast.TyNamed (type_name, _), CVar ctor_var -> (
+      match Codegen_types.managed_type_info ctx.reg type_name with
+      | Some { managed_kind = ManagedUnion; _ } ->
+          union_variants_for_type ctx type_name
+          |> List.exists (fun (variant : Ast.variant) ->
+              variant.variant_fields = []
+              && String.equal variant.variant_name ctor_var.vname)
+      | _ -> false)
+  | _ -> false
+
+let rec build_global_constant_plan (ctx : Core_emit_context.t)
+    ~(storage : global_constant_storage) ~(path : string) ~(seen : string list)
+    (ty : Ast.type_expr) : (global_constant_immortal_plan, string) result =
+  let ty = normalize_type ty in
+  let ty_key = Types.type_to_string ty in
+  if List.mem ty_key seen then
+    Error
+      (Printf.sprintf "%s has recursive managed type `%s`" path
+         (global_constant_type_string ty))
+  else if not (type_requires_release ctx ty) then
+    Error
+      (Printf.sprintf "%s has type `%s`, which does not need immortalization"
+         path
+         (global_constant_type_string ty))
+  else
+    match global_constant_list_element_type ty with
+    | Some elem_ty -> (
+        match
+          build_optional_child_plan ctx ~storage:VoidPointerPayload
+            ~path:(path ^ "[]") ~seen:(ty_key :: seen) elem_ty
+        with
+        | Error _ as err -> err
+        | Ok list_elem_plan ->
+            Ok (ImmortalList { list_ty = ty; list_elem_plan }))
+    | None -> (
+        match global_constant_dict_entry_types ty with
+        | Some (key_ty, value_ty) ->
+            build_dict_plan ctx ~path ~seen:(ty_key :: seen) ty key_ty value_ty
+        | None -> (
+            match managed_container_nested_release ctx ty with
+            | Some (Ok false) -> Ok (ImmortalRootOnly ty)
+            | Some (Ok true) ->
+                Error
+                  (Printf.sprintf
+                     "%s has unsupported container type `%s` with managed \
+                      contents"
+                     path
+                     (global_constant_type_string ty))
+            | Some (Error reason) ->
+                Error
+                  (Printf.sprintf "could not classify container in %s: %s" path
+                     reason)
+            | None -> (
+                match storage with
+                | VoidPointerPayload when not (is_pointer_type ctx ty) ->
+                    Error
+                      (Printf.sprintf
+                         "%s has boxed by-value payload type `%s`; this \
+                          constant layout cannot be traversed safely yet"
+                         path
+                         (global_constant_type_string ty))
+                | DirectTypedStorage | VoidPointerPayload -> (
+                    match ty with
+                    | ty when is_stack_result_type ctx ty -> (
+                        match (storage, ty) with
+                        | ( DirectTypedStorage,
+                            Ast.TyNamed ("Result", [ ok_ty; err_ty ]) ) ->
+                            build_result_plan ctx ~path ~seen:(ty_key :: seen)
+                              ty ok_ty err_ty
+                        | VoidPointerPayload, _ ->
+                            Error
+                              (Printf.sprintf
+                                 "%s has boxed stack Result payload type `%s`; \
+                                  this constant layout cannot be traversed \
+                                  safely yet"
+                                 path
+                                 (global_constant_type_string ty))
+                        | DirectTypedStorage, _ ->
+                            Error
+                              (Printf.sprintf
+                                 "%s has unsupported Result spelling `%s`" path
+                                 (global_constant_type_string ty)))
+                    | Ast.TyTuple elems ->
+                        build_tuple_plan ctx ~path ~seen:(ty_key :: seen) ty
+                          elems
+                    | Ast.TyNamed (type_name, args) -> (
+                        match Hashtbl.find_opt ctx.record_decls type_name with
+                        | Some record_decl when not record_decl.record_is_value
+                          ->
+                            build_record_plan ctx ~path ~seen:(ty_key :: seen)
+                              ty record_decl args
+                        | _ -> (
+                            match
+                              Codegen_types.managed_type_info ctx.reg type_name
+                            with
+                            | Some { managed_kind = ManagedUnion; _ } ->
+                                build_union_plan ctx ~path
+                                  ~seen:(ty_key :: seen) ty type_name
+                            | Some { managed_kind = ManagedHeapRecord; _ } ->
+                                Error
+                                  (Printf.sprintf
+                                     "%s has heap record type `%s` but no \
+                                      record declaration is available for \
+                                      traversal"
+                                     path type_name)
+                            | _ when simple_arc_global_constant_root ty ->
+                                Ok (ImmortalRootOnly ty)
+                            | _ when is_pointer_type ctx ty ->
+                                Error
+                                  (Printf.sprintf
+                                     "%s has managed pointer type `%s` without \
+                                      a supported constant traversal contract"
+                                     path
+                                     (global_constant_type_string ty))
+                            | _ ->
+                                Error
+                                  (Printf.sprintf
+                                     "%s has unsupported managed type `%s`" path
+                                     (global_constant_type_string ty))))
+                    | _ when simple_arc_global_constant_root ty ->
+                        Ok (ImmortalRootOnly ty)
+                    | _ when is_pointer_type ctx ty ->
+                        Error
+                          (Printf.sprintf
+                             "%s has managed pointer type `%s` without a \
+                              supported constant traversal contract"
+                             path
+                             (global_constant_type_string ty))
+                    | _ ->
+                        Error
+                          (Printf.sprintf "%s has unsupported managed type `%s`"
+                             path
+                             (global_constant_type_string ty))))))
+
+and build_optional_child_plan ctx ~storage ~path ~seen ty =
+  if type_requires_release ctx ty then
+    build_global_constant_plan ctx ~storage ~path ~seen ty
+    |> Result.map Option.some
+  else Ok None
+
+and build_result_plan ctx ~path ~seen result_ty ok_ty err_ty =
+  let build_payload label payload_ty =
+    build_optional_child_plan ctx ~storage:VoidPointerPayload
+      ~path:(path ^ "." ^ label)
+      ~seen payload_ty
+    |> Result.map (Option.map (fun gc_payload_plan -> { gc_payload_plan }))
+  in
+  match build_payload "Ok" ok_ty with
+  | Error _ as err -> err
+  | Ok ok_payload -> (
+      match build_payload "Err" err_ty with
+      | Error _ as err -> err
+      | Ok err_payload ->
+          Ok (ImmortalStackResult { result_ty; ok_payload; err_payload }))
+
+and build_dict_plan ctx ~path ~seen dict_ty key_ty value_ty =
+  let build_entry label entry_ty =
+    build_optional_child_plan ctx ~storage:VoidPointerPayload
+      ~path:(path ^ "." ^ label ^ "[]")
+      ~seen entry_ty
+  in
+  match build_entry "key" key_ty with
+  | Error _ as err -> err
+  | Ok dict_key_plan -> (
+      match build_entry "value" value_ty with
+      | Error _ as err -> err
+      | Ok dict_value_plan ->
+          Ok (ImmortalDict { dict_ty; dict_key_plan; dict_value_plan }))
+
+and build_tuple_plan ctx ~path ~seen tuple_ty elems =
+  let rec go i = function
+    | [] -> Ok []
+    | elem_ty :: rest ->
+        if type_requires_release ctx elem_ty then
+          match
+            build_global_constant_plan ctx ~storage:VoidPointerPayload
+              ~path:(Printf.sprintf "%s[%d]" path i)
+              ~seen elem_ty
+          with
+          | Error _ as err -> err
+          | Ok gc_tuple_plan -> (
+              match go (i + 1) rest with
+              | Error _ as err -> err
+              | Ok tail -> Ok ({ gc_tuple_index = i; gc_tuple_plan } :: tail))
+        else go (i + 1) rest
+  in
+  go 0 elems
+  |> Result.map (fun tuple_elements ->
+      ImmortalTuple { tuple_ty; tuple_elements })
+
+and build_record_plan ctx ~path ~seen record_ty record_decl args =
+  let rec go = function
+    | [] -> Ok []
+    | (fd : Ast.field_decl) :: rest ->
+        let field_ty =
+          apply_type_param_subst_or_original record_decl.record_type_params args
+            fd.field_type
+        in
+        if type_requires_release ctx field_ty then
+          if
+            Core_layout_type.record_field_uses_erased_storage ~reg:ctx.reg
+              fd.field_type
+          then
+            Error
+              (Printf.sprintf
+                 "%s.%s has erased generic storage for managed type `%s`; this \
+                  constant layout cannot be traversed safely yet"
+                 path fd.field_name
+                 (global_constant_type_string field_ty))
+          else
+            match
+              build_global_constant_plan ctx ~storage:DirectTypedStorage
+                ~path:(path ^ "." ^ fd.field_name)
+                ~seen field_ty
+            with
+            | Error _ as err -> err
+            | Ok gc_field_plan -> (
+                match go rest with
+                | Error _ as err -> err
+                | Ok tail ->
+                    Ok ({ gc_field_name = fd.field_name; gc_field_plan } :: tail)
+                )
+        else go rest
+  in
+  go record_decl.record_fields
+  |> Result.map (fun record_fields ->
+      ImmortalRecord { record_ty; record_fields })
+
+and build_union_plan ctx ~path ~seen union_ty type_name =
+  let build_variant (variant : Ast.variant) =
+    let rec go i = function
+      | [] -> Ok []
+      | field_ty :: rest ->
+          if Codegen_types.has_type_vars field_ty then
+            Error
+              (Printf.sprintf
+                 "%s.%s field %d has generic payload type `%s`; generic union \
+                  constants cannot be traversed safely yet"
+                 path variant.variant_name i
+                 (global_constant_type_string field_ty))
+          else if type_requires_release ctx field_ty then
+            match
+              build_global_constant_plan ctx ~storage:VoidPointerPayload
+                ~path:
+                  (Printf.sprintf "%s.%s.field%d" path variant.variant_name i)
+                ~seen field_ty
+            with
+            | Error _ as err -> err
+            | Ok gc_union_field_plan -> (
+                match go (i + 1) rest with
+                | Error _ as err -> err
+                | Ok tail ->
+                    Ok
+                      ({ gc_union_field_index = i; gc_union_field_plan } :: tail)
+                )
+          else go (i + 1) rest
+    in
+    go 0 variant.variant_fields
+    |> Result.map (fun gc_variant_fields ->
+        { gc_variant = variant; gc_variant_fields })
+  in
+  let rec build_all = function
+    | [] -> Ok []
+    | variant :: rest -> (
+        match build_variant variant with
+        | Error _ as err -> err
+        | Ok planned -> (
+            match build_all rest with
+            | Error _ as err -> err
+            | Ok tail -> Ok (planned :: tail)))
+  in
+  build_all (union_variants_for_type ctx type_name)
+  |> Result.map (fun union_variants ->
+      ImmortalUnion { union_ty; union_type_name = type_name; union_variants })
+
+let global_constant_immortalization (ctx : Core_emit_context.t) (v : core_var) :
+    global_constant_immortalization =
+  if (not v.cv_is_const) || not (type_requires_release ctx v.cv_ty) then
+    NoImmortalizationNeeded
+  else if global_constant_nullary_union_singleton ctx v then
+    ImmortalizeConstantGraph (ImmortalRootOnly (normalize_type v.cv_ty))
+  else
+    match
+      build_global_constant_plan ctx ~storage:DirectTypedStorage
+        ~path:(Var.to_string v.cv_name) ~seen:[] v.cv_ty
+    with
+    | Error reason -> UnsupportedManagedConstant reason
+    | Ok plan -> ImmortalizeConstantGraph plan
+
+let emit_make_immortal_root (ctx : Core_emit_context.t) c_expr =
+  emit_line ctx (Printf.sprintf "blorp_make_immortal_constant(%s);" c_expr)
+
+let cast_void_payload_for_type (ctx : Core_emit_context.t) ty c_expr =
+  if is_pointer_type ctx ty then
+    Printf.sprintf "((%s)%s)" (type_to_c ctx ty) c_expr
+  else c_expr
+
+let rec emit_immortalize_plan (ctx : Core_emit_context.t) c_expr plan : unit =
+  match plan with
+  | ImmortalRootOnly _ -> emit_make_immortal_root ctx c_expr
+  | ImmortalRecord { record_fields; _ } ->
+      emit_immortalize_record ctx c_expr record_fields
+  | ImmortalUnion { union_type_name; union_variants; _ } ->
+      emit_immortalize_union ctx c_expr union_type_name union_variants
+  | ImmortalTuple { tuple_elements; _ } ->
+      emit_immortalize_tuple ctx c_expr tuple_elements
+  | ImmortalStackResult { ok_payload; err_payload; _ } ->
+      emit_immortalize_stack_result ctx c_expr ok_payload err_payload
+  | ImmortalList { list_elem_plan; _ } ->
+      emit_immortalize_list ctx c_expr list_elem_plan
+  | ImmortalDict { dict_key_plan; dict_value_plan; _ } ->
+      emit_immortalize_dict ctx c_expr dict_key_plan dict_value_plan
+
+and emit_immortalize_record ctx c_expr record_fields =
+  emit_make_immortal_root ctx c_expr;
+  List.iter
+    (fun { gc_field_name; gc_field_plan } ->
+      emit_immortalize_plan ctx
+        (Printf.sprintf "%s->%s" c_expr (escape_c_ident gc_field_name))
+        gc_field_plan)
+    record_fields
+
+and emit_immortalize_list ctx c_expr elem_plan =
+  emit_make_immortal_root ctx c_expr;
+  match elem_plan with
+  | None -> ()
+  | Some elem_plan ->
+      let helper = global_container_element_immortalizer ctx elem_plan in
+      emit_line ctx
+        (Printf.sprintf "blorp_make_immortal_list_constant(%s, %s);" c_expr
+           helper)
+
+and emit_immortalize_dict ctx c_expr key_plan value_plan =
+  emit_make_immortal_root ctx c_expr;
+  let helper_or_null = function
+    | None -> "NULL"
+    | Some plan -> global_container_element_immortalizer ctx plan
+  in
+  match (key_plan, value_plan) with
+  | None, None -> ()
+  | _ ->
+      emit_line ctx
+        (Printf.sprintf "blorp_make_immortal_dict_constant(%s, %s, %s);" c_expr
+           (helper_or_null key_plan)
+           (helper_or_null value_plan))
+
+and emit_immortalize_tuple ctx c_expr tuple_elements =
+  emit_make_immortal_root ctx c_expr;
+  List.iter
+    (fun { gc_tuple_index; gc_tuple_plan } ->
+      let bit = 1 lsl gc_tuple_index in
+      let slot = Printf.sprintf "%s->elem[%d]" c_expr gc_tuple_index in
+      emit_line ctx
+        (Printf.sprintf "if ((%s->release_mask & %dUL) && %s) {" c_expr bit slot);
+      ctx.indent <- ctx.indent + 1;
+      emit_immortalize_plan ctx
+        (cast_void_payload_for_type ctx
+           (global_constant_plan_type gc_tuple_plan)
+           slot)
+        gc_tuple_plan;
+      ctx.indent <- ctx.indent - 1;
+      emit_line ctx "}")
+    tuple_elements
+
+and emit_immortalize_union ctx c_expr type_name union_variants =
+  emit_make_immortal_root ctx c_expr;
+  if
+    List.exists
+      (fun { gc_variant_fields; _ } -> gc_variant_fields <> [])
+      union_variants
+  then begin
+    emit_line ctx (Printf.sprintf "switch (%s->tag) {" c_expr);
+    ctx.indent <- ctx.indent + 1;
+    List.iter
+      (fun { gc_variant = variant; gc_variant_fields } ->
+        match gc_variant_fields with
+        | [] -> ()
+        | fields ->
+            emit_line ctx
+              (Printf.sprintf "case %s:" (variant_tag_c_name type_name variant));
+            ctx.indent <- ctx.indent + 1;
+            List.iter
+              (fun { gc_union_field_index; gc_union_field_plan } ->
+                let bit = 1 lsl gc_union_field_index in
+                let slot =
+                  Printf.sprintf "%s->data.%s.field%d" c_expr
+                    variant.variant_name gc_union_field_index
+                in
+                emit_line ctx
+                  (Printf.sprintf "if ((%s->release_mask & %dUL) && %s) {"
+                     c_expr bit slot);
+                ctx.indent <- ctx.indent + 1;
+                emit_immortalize_plan ctx
+                  (cast_void_payload_for_type ctx
+                     (global_constant_plan_type gc_union_field_plan)
+                     slot)
+                  gc_union_field_plan;
+                ctx.indent <- ctx.indent - 1;
+                emit_line ctx "}")
+              fields;
+            emit_line ctx "break;";
+            ctx.indent <- ctx.indent - 1)
+      union_variants;
+    emit_line ctx "default:";
+    ctx.indent <- ctx.indent + 1;
+    emit_line ctx "break;";
+    ctx.indent <- ctx.indent - 1;
+    ctx.indent <- ctx.indent - 1;
+    emit_line ctx "}"
+  end
+
+and emit_immortalize_stack_result ctx c_expr ok_payload err_payload =
+  let emit_payload tag field = function
+    | None -> ()
+    | Some { gc_payload_plan } ->
+        let slot = Printf.sprintf "%s.data.%s.field0" c_expr field in
+        emit_line ctx
+          (Printf.sprintf "if ((%s.release_mask & 1UL) && %s.tag == %s && %s) {"
+             c_expr c_expr tag slot);
+        ctx.indent <- ctx.indent + 1;
+        emit_immortalize_plan ctx
+          (cast_void_payload_for_type ctx
+             (global_constant_plan_type gc_payload_plan)
+             slot)
+          gc_payload_plan;
+        ctx.indent <- ctx.indent - 1;
+        emit_line ctx "}"
+  in
+  emit_payload "BLORP_TAG_OK" "Ok" ok_payload;
+  emit_payload "BLORP_TAG_ERR" "Err" err_payload
+
+and global_container_element_immortalizer ctx elem_plan =
+  let elem_ty = normalize_type (global_constant_plan_type elem_plan) in
+  let key = Types.type_to_string elem_ty in
+  match Hashtbl.find_opt ctx.global_immortalizer_helpers key with
+  | Some name -> name
+  | None ->
+      let id = ctx.global_immortalizer_helper_counter in
+      ctx.global_immortalizer_helper_counter <- id + 1;
+      let name = Printf.sprintf "__blorp_immortalize_global_elem_%d" id in
+      Hashtbl.add ctx.global_immortalizer_helpers key name;
+      prepare_global_constant_immortal_helpers ctx elem_plan;
+      emitln ctx (Printf.sprintf "static void %s(void* value) {" name);
+      ctx.indent <- ctx.indent + 1;
+      emit_line ctx "if (!value) return;";
+      emit_immortalize_plan ctx
+        (cast_void_payload_for_type ctx elem_ty "value")
+        elem_plan;
+      ctx.indent <- ctx.indent - 1;
+      emitln ctx "}";
+      emit ctx "\n";
+      name
+
+and prepare_global_constant_immortal_helpers (ctx : Core_emit_context.t)
+    (plan : global_constant_immortal_plan) : unit =
+  match plan with
+  | ImmortalRootOnly _ -> ()
+  | ImmortalRecord { record_fields; _ } ->
+      List.iter
+        (fun { gc_field_plan; _ } ->
+          prepare_global_constant_immortal_helpers ctx gc_field_plan)
+        record_fields
+  | ImmortalUnion { union_variants; _ } ->
+      List.iter
+        (fun { gc_variant_fields; _ } ->
+          List.iter
+            (fun { gc_union_field_plan; _ } ->
+              prepare_global_constant_immortal_helpers ctx gc_union_field_plan)
+            gc_variant_fields)
+        union_variants
+  | ImmortalTuple { tuple_elements; _ } ->
+      List.iter
+        (fun { gc_tuple_plan; _ } ->
+          prepare_global_constant_immortal_helpers ctx gc_tuple_plan)
+        tuple_elements
+  | ImmortalStackResult { ok_payload; err_payload; _ } ->
+      List.iter
+        (function
+          | None -> ()
+          | Some { gc_payload_plan } ->
+              prepare_global_constant_immortal_helpers ctx gc_payload_plan)
+        [ ok_payload; err_payload ]
+  | ImmortalList { list_elem_plan; _ } -> (
+      match list_elem_plan with
+      | None -> ()
+      | Some elem_plan ->
+          ignore (global_container_element_immortalizer ctx elem_plan))
+  | ImmortalDict { dict_key_plan; dict_value_plan; _ } ->
+      List.iter
+        (function
+          | None -> ()
+          | Some plan -> ignore (global_container_element_immortalizer ctx plan))
+        [ dict_key_plan; dict_value_plan ]
+
+let emit_global_constant_immortal_init (ctx : Core_emit_context.t)
+    (plan : checked_global_constant_immortalization) (v : core_var) : unit =
+  let name = escape_c_ident (Var.to_c_name v.cv_name) in
+  match plan with
+  | CheckedNoImmortalizationNeeded -> ()
+  | CheckedImmortalizeConstantGraph plan -> emit_immortalize_plan ctx name plan
 
 let float_modulo_emission (ty : Ast.type_expr) =
   match normalize_type ty with
@@ -576,16 +1214,6 @@ let emit_void_as_type ctx target_ty emit_source =
       emit_source ();
       emit ctx ")"
 
-let tuple_field_needs_release ctx field =
-  boxed_value_needs_release ctx field.ty field.loc
-
-let tuple_field_needs_retain ctx field =
-  tuple_field_needs_release ctx field
-  &&
-  match field.desc with
-  | CField _ | CUnbox _ | CUnboxTyped _ | CLit (Ast.LitString _) -> true
-  | _ -> false
-
 let dict_value_needs_release ctx dict_ty loc =
   match normalize_type dict_ty with
   | Ast.TyNamed ("Dict", [ _key_ty; value_ty ]) ->
@@ -692,6 +1320,22 @@ let emit_closure_env_release_mask_stmt (ctx : Core_emit_context.t)
   let mask = closure_env_release_mask ctx captures in
   emit_line ctx (Printf.sprintf "%s->env_release_mask = %dUL;" tmp mask)
 
+let task_closure_env_release_mask (ctx : Core_emit_context.t)
+    (captures : task_capture list) : int =
+  captures
+  |> List.mapi (fun i capture ->
+      match capture.task_capture_kind with
+      | (TaskCopyCapture | TaskMoveResourceItem)
+        when capture_slot_needs_release ctx capture.task_capture_ty ->
+          1 lsl i
+      | TaskCopyCapture | TaskMoveResourceItem | TaskStructuredTaskBorrow -> 0)
+  |> List.fold_left ( lor ) 0
+
+let emit_task_closure_env_release_mask_stmt (ctx : Core_emit_context.t)
+    (tmp : string) (captures : task_capture list) : unit =
+  let mask = task_closure_env_release_mask ctx captures in
+  emit_line ctx (Printf.sprintf "%s->env_release_mask = %dUL;" tmp mask)
+
 let direct_returned_capture (ctx : Core_emit_context.t)
     (captures : (string * Ast.type_expr) list) (body : core) : string option =
   match body.desc with
@@ -757,21 +1401,34 @@ let rec match_scrutinee_needs_release (ctx : Core_emit_context.t) (scrut : core)
 
 (* --- §1. emit_intrinsic ----------------------------------------------------- *)
 
+let render_emitted_fragment (ctx : Core_emit_context.t)
+    (emit_fragment : unit -> unit) : string =
+  let original_output = ctx.output in
+  let fragment_output = Buffer.create 64 in
+  ctx.output <- fragment_output;
+  Fun.protect
+    ~finally:(fun () -> ctx.output <- original_output)
+    (fun () ->
+      emit_fragment ();
+      Buffer.contents fragment_output)
+
+let render_list_alloc_call (ctx : Core_emit_context.t)
+    (layout : list_storage_layout) (emit_cap : unit -> unit) : string =
+  let capacity_arg = render_emitted_fragment ctx emit_cap in
+  Core_emit_blorp_prepared_list.render_alloc_call layout capacity_arg
+
 let emit_list_alloc_call (ctx : Core_emit_context.t)
     (layout : list_storage_layout) (emit_cap : unit -> unit) : unit =
-  match layout.lsl_slots with
-  | ListPointerStorage ->
-      emit ctx "blorp_list_new(";
-      emit_cap ();
-      emit ctx ")"
-  | ListInlineStorage width ->
-      emit ctx "blorp_list_new_inline(";
-      emit_cap ();
-      emit ctx (Printf.sprintf ", %d)" (inline_storage_width_bytes width))
-  | ListInlineStructStorage c_ty ->
-      emit ctx "blorp_list_new_inline(";
-      emit_cap ();
-      emit ctx (Printf.sprintf ", sizeof(%s))" c_ty)
+  let capacity_arg = render_emitted_fragment ctx emit_cap in
+  Core_emit_blorp_prepared_list.emit_alloc_call ctx layout capacity_arg
+
+let emit_list_alloc_with_release (ctx : Core_emit_context.t)
+    (layout : list_storage_layout) ~result_tmp (emit_cap : unit -> unit) : unit
+    =
+  let alloc_expr = render_list_alloc_call ctx layout emit_cap in
+  emit ctx
+    (Core_emit_blorp_prepared_list.render_alloc_with_release ~alloc_expr
+       ~result_tmp)
 
 let list_storage_runtime_args (layout : list_storage_layout) : string * string =
   match layout.lsl_slots with
@@ -879,112 +1536,26 @@ let rec emit_intrinsic (ctx : Core_emit_context.t) (e : core) (name : string)
 
 and emit_tensor_raw_view_decl (ctx : Core_emit_context.t)
     (b : tensor_raw_view_binding) : unit =
-  let c_ty =
-    (Core_layout_type.tensor_raw_scalar_abi b.trv_kind).tras_pointer_c_type
-  in
-  emit ctx c_ty;
-  emit ctx " ";
-  emit ctx (escape_c_ident (Var.to_c_name b.trv_var));
-  emit ctx " = (";
-  emit ctx c_ty;
-  emit ctx ")((blorp_Vector*)";
-  emit_expr ctx b.trv_source;
-  emit ctx ")->data"
+  Core_emit_blorp_prepared_tensor.emit_raw_view_decl ~emit_expr ctx b
 
 and emit_list_get (ctx : Core_emit_context.t) (get : list_get) : unit =
-  match get.lg_layout.lsl_slots with
-  | ListPointerStorage ->
-      emit ctx "blorp_list_get((blorp_List*)";
-      emit_expr ctx get.lg_list;
-      emit ctx ", ";
-      emit_expr ctx get.lg_index;
-      emit ctx ")"
-  | ListInlineStorage width ->
-      let list_tmp = Printf.sprintf "__lg_list_%d" (fresh_temp ctx) in
-      let idx_tmp = Printf.sprintf "__lg_idx_%d" (fresh_temp ctx) in
-      let bits_tmp = Printf.sprintf "__lg_bits_%d" (fresh_temp ctx) in
-      let width_bytes = inline_storage_width_bytes width in
-      emit ctx (Printf.sprintf "({\nblorp_List* %s = (blorp_List*)" list_tmp);
-      emit_expr ctx get.lg_list;
-      emit ctx (Printf.sprintf ";\nlong %s = " idx_tmp);
-      emit_expr ctx get.lg_index;
-      emit ctx ";\n";
-      (match get.lg_bounds with
-      | ListBoundsChecked ->
-          emit ctx
-            (Printf.sprintf
-               "(__builtin_expect(!%s || %s < 0 || %s >= %s->len, 0) ? NULL : "
-               list_tmp idx_tmp idx_tmp list_tmp)
-      | ListBoundsProven -> ());
-      (* [CListGet] carries the concrete monomorphized list storage layout.
-         Re-checking [storage_mode]/[elem_size] here turns an impossible Core
-         state into a hot runtime branch. Generic pointer storage still uses the
-         runtime helper above; inline storage can load the slot directly. *)
-      emit ctx
-        (Printf.sprintf
-           "({ uintptr_t %s = 0; memcpy(&%s, (char*)%s->data + %s * %d, %d); \
-            (void*)%s; })"
-           bits_tmp bits_tmp list_tmp idx_tmp width_bytes width_bytes bits_tmp);
-      (match get.lg_bounds with
-      | ListBoundsChecked -> emit ctx ")"
-      | ListBoundsProven -> ());
-      emit ctx ";\n})"
-  | ListInlineStructStorage _ ->
-      emit ctx "blorp_list_get((blorp_List*)";
-      emit_expr ctx get.lg_list;
-      emit ctx ", ";
-      emit_expr ctx get.lg_index;
-      emit ctx ")"
+  Core_emit_blorp_prepared_list.emit_get ~emit_expr ctx get
 
 and emit_string_byte_read (ctx : Core_emit_context.t) (read : string_byte_read)
     : unit =
-  emit ctx "(long)(unsigned char)((blorp_String*)";
-  emit_expr ctx read.sbr_source;
-  emit ctx ")->data[";
-  emit_expr ctx read.sbr_index;
-  emit ctx "]"
+  Core_emit_blorp_prepared_string.emit_byte_read ~emit_expr ctx read
 
 and emit_string_byte_write (ctx : Core_emit_context.t)
     (write : string_byte_write) : unit =
-  emit ctx "(((blorp_String*)";
-  emit_expr ctx write.sbw_target;
-  emit ctx ")->data[";
-  emit_expr ctx write.sbw_index;
-  emit ctx "] = (char)";
-  emit_expr ctx write.sbw_byte;
-  emit ctx ")"
+  Core_emit_blorp_prepared_string.emit_byte_write ~emit_expr ctx write
 
 and emit_string_byte_copy (ctx : Core_emit_context.t) (copy : string_byte_copy)
     : unit =
-  let id = fresh_temp ctx in
-  let dst_tmp = Printf.sprintf "__string_copy_dst_%d" id in
-  let dst_pos_tmp = Printf.sprintf "__string_copy_dst_pos_%d" id in
-  let src_tmp = Printf.sprintf "__string_copy_src_%d" id in
-  let src_pos_tmp = Printf.sprintf "__string_copy_src_pos_%d" id in
-  let len_tmp = Printf.sprintf "__string_copy_len_%d" id in
-  emit ctx (Printf.sprintf "({ blorp_String* %s = (blorp_String*)" dst_tmp);
-  emit_expr ctx copy.sbc_dst;
-  emit ctx (Printf.sprintf "; long %s = " dst_pos_tmp);
-  emit_expr ctx copy.sbc_dst_pos;
-  emit ctx (Printf.sprintf "; blorp_String* %s = (blorp_String*)" src_tmp);
-  emit_expr ctx copy.sbc_src;
-  emit ctx (Printf.sprintf "; long %s = " src_pos_tmp);
-  emit_expr ctx copy.sbc_src_pos;
-  emit ctx (Printf.sprintf "; long %s = " len_tmp);
-  emit_expr ctx copy.sbc_len;
-  emit ctx
-    (Printf.sprintf
-       "; if (%s > 0) { memcpy(%s->data + %s, %s->data + %s, (size_t)%s); } \
-        (void)0; })"
-       len_tmp dst_tmp dst_pos_tmp src_tmp src_pos_tmp len_tmp)
+  Core_emit_blorp_prepared_string.emit_byte_copy ~emit_expr ctx copy
 
 and emit_string_set_len (ctx : Core_emit_context.t) (set_len : string_set_len) :
     unit =
-  emit ctx "({ blorp_String* __sl = (blorp_String*)";
-  emit_expr ctx set_len.ssl_target;
-  emit ctx "; long __sn = ";
-  emit_expr ctx set_len.ssl_len;
-  emit ctx "; __sl->len = __sn; __sl->data[__sn] = '\\0'; (void)0; })"
+  Core_emit_blorp_prepared_string.emit_set_len ~emit_expr ctx set_len
 
 and emit_box_op (ctx : Core_emit_context.t) (b : box_op) : unit =
   match b.box_kind with
@@ -1021,28 +1592,6 @@ and emit_boxed_storage (ctx : Core_emit_context.t) (value : boxed_storage_value)
     : unit =
   emit_box_op ctx value.bsv_box
 
-and emit_list_inline_struct_dynamic_load ctx ~list_tmp ~idx_tmp ~out_tmp
-    ~struct_ty ~bounds =
-  let raw_tmp = Printf.sprintf "__lg_raw_%d" (fresh_temp ctx) in
-  (match bounds with
-  | ListBoundsChecked ->
-      emit ctx
-        (Printf.sprintf
-           "if (__builtin_expect(!%s || %s < 0 || %s >= %s->len, 0)) { \
-            memset(&%s, 0, sizeof(%s)); } else "
-           list_tmp idx_tmp idx_tmp list_tmp out_tmp struct_ty)
-  | ListBoundsProven -> ());
-  emit ctx
-    (Printf.sprintf
-       "if (%s->storage_mode == BLORP_LIST_STORAGE_INLINE && %s->elem_size == \
-        (int16_t)sizeof(%s)) { memcpy(&%s, (char*)%s->data + %s * sizeof(%s), \
-        sizeof(%s)); } else { void* %s = blorp_list_get(%s, %s); if (!%s) { \
-        memset(&%s, 0, sizeof(%s)); } else { %s = blorp_unbox_struct(%s, %s); \
-        } }"
-       list_tmp list_tmp struct_ty out_tmp list_tmp idx_tmp struct_ty struct_ty
-       raw_tmp list_tmp idx_tmp raw_tmp out_tmp struct_ty out_tmp raw_tmp
-       struct_ty)
-
 and emit_unbox_op (ctx : Core_emit_context.t) (u : unbox_op) : unit =
   let c_ty = type_to_c ctx u.unbox_target_ty in
   match (u.unbox_kind, u.unbox_value.desc) with
@@ -1056,8 +1605,8 @@ and emit_unbox_op (ctx : Core_emit_context.t) (u : unbox_op) : unit =
       emit ctx (Printf.sprintf "; long %s = " idx_tmp);
       emit_expr ctx get.lg_index;
       emit ctx (Printf.sprintf "; %s %s; " struct_ty out_tmp);
-      emit_list_inline_struct_dynamic_load ctx ~list_tmp ~idx_tmp ~out_tmp
-        ~struct_ty ~bounds:get.lg_bounds;
+      Core_emit_blorp_prepared_list.emit_inline_struct_dynamic_load ctx
+        ~list_tmp ~idx_tmp ~out_tmp ~struct_ty ~bounds:get.lg_bounds;
       emit ctx (Printf.sprintf " %s; })" out_tmp)
   | UnboxStruct struct_ty, CCall (CKBuiltin "blorp_checked_get", _, [ arr; idx ])
     ->
@@ -1260,29 +1809,26 @@ and emit_list_construct ctx lc =
   | ListInlineStructStorage c_ty ->
       List.iteri
         (fun i value ->
-          let elem_tmp = Printf.sprintf "__lst_elem_%d" (fresh_temp ctx) in
-          emit ctx (Printf.sprintf " { %s %s = " c_ty elem_tmp);
-          emit_expr ctx value.bsv_box.box_value;
-          emit ctx
-            (Printf.sprintf "; blorp_list_set_raw_copy(%s, %d, &%s); }" tmp i
-               elem_tmp))
+          emit ctx " ";
+          Core_emit_blorp_prepared_list.emit_construct_inline_struct_set
+            ~emit_expr ctx ~list_tmp:tmp ~index:i ~struct_ty:c_ty
+            value.bsv_box.box_value)
         lc.lc_elems;
-      emit ctx (Printf.sprintf " %s->len = %d;" tmp (List.length lc.lc_elems))
+      emit ctx " ";
+      Core_emit_blorp_prepared_list.emit_construct_set_len ctx ~list_tmp:tmp
+        ~len:(List.length lc.lc_elems)
   | ListPointerStorage | ListInlineStorage _ ->
-      if lc.lc_elem_needs_release then
-        emit ctx
-          (Printf.sprintf
-             " blorp_list_init_elem_release(%s, blorp_elem_release_fn);" tmp);
+      if lc.lc_elem_needs_release then (
+        emit ctx " ";
+        Core_emit_blorp_prepared_list.emit_construct_init_elem_release ctx
+          ~list_tmp:tmp);
       List.iter
         (fun value ->
-          let append_fn =
-            if lc.lc_elem_needs_release && value.bsv_transfers_ownership then
-              "blorp_list_append_owned"
-            else "blorp_list_append"
-          in
-          emit ctx (Printf.sprintf " %s = %s(%s, " tmp append_fn tmp);
-          emit_boxed_storage ctx value;
-          emit ctx ");")
+          emit ctx " ";
+          Core_emit_blorp_prepared_list.emit_construct_append
+            ~emit_boxed:emit_boxed_storage ctx ~list_tmp:tmp
+            ~owned:(lc.lc_elem_needs_release && value.bsv_transfers_ownership)
+            value)
         lc.lc_elems);
   emit ctx (Printf.sprintf " %s; })" tmp)
 
@@ -1317,117 +1863,62 @@ and emit_tensor_literal ctx loc tl =
       "tensor literal layout `%s` does not match payload storage `%s`" expected
       actual
   else ();
-  let vector_ctor, tensor_ctor =
-    match tl.tl_layout.tsl_slots with
-    | TensorRawScalarStorage TensorFloat32Elements ->
-        ("blorp_vector_new_f32", "blorp_tensor_new_f32")
-    | TensorRawScalarStorage TensorFloat64Elements ->
-        ("blorp_vector_new_f64", "blorp_tensor_new_f64")
-    | TensorRawScalarStorage TensorInt64Elements ->
-        ("blorp_vector_new_i64", "blorp_tensor_new_i64")
-    | TensorWordStorage -> ("blorp_vector_new", "blorp_tensor_new")
-    | TensorPackedStorage _ ->
-        ("blorp_vector_new_packed", "blorp_tensor_new_packed")
-    | TensorInlineStructStorage _ ->
-        ("blorp_vector_new_sized", "blorp_tensor_new_sized")
-    | TensorBoxedStorage -> ("blorp_vector_new", "blorp_tensor_new")
-  in
-  let packed_width_arg = function
-    | InlineBytes1 -> "1"
-    | InlineBytes2 -> "2"
-    | InlineBytes4 -> "4"
-    | InlineBytes8 -> "8"
-  in
-  let ctor, first_dim, total =
-    match tl.tl_shape with
-    | TensorStaticShape (first :: _ as dims) ->
-        (tensor_ctor, first, List.fold_left ( * ) 1 dims)
-    | TensorStaticShape [] -> (vector_ctor, 0, 0)
-    | TensorVectorLength n -> (vector_ctor, n, n)
-  in
   let tmp = Printf.sprintf "__ten_%d" (fresh_temp ctx) in
-  (match tl.tl_shape with
-  | TensorStaticShape (_ :: _) -> (
-      match tl.tl_layout.tsl_slots with
-      | TensorPackedStorage width ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %d, %s);" tmp ctor
-               first_dim total (packed_width_arg width))
-      | TensorInlineStructStorage c_ty ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %d, sizeof(%s));" tmp
-               ctor first_dim total c_ty)
-      | _ ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %d);" tmp ctor
-               first_dim total))
-  | TensorStaticShape [] | TensorVectorLength _ -> (
-      match tl.tl_layout.tsl_slots with
-      | TensorPackedStorage width ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %s);" tmp ctor
-               first_dim (packed_width_arg width))
-      | TensorInlineStructStorage c_ty ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, sizeof(%s));" tmp ctor
-               first_dim c_ty)
-      | _ ->
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d);" tmp ctor first_dim)));
+  let alloc_call =
+    Core_emit_blorp_prepared_tensor.render_literal_alloc_call tl.tl_layout
+      tl.tl_shape
+  in
+  emit ctx (Printf.sprintf "({ blorp_Vector* %s = %s;" tmp alloc_call);
   let elem_needs_release =
     tensor_storage_layout_requires_release_or_error ~phase:Core_error.Emit ~loc
       tl.tl_layout
   in
-  if elem_needs_release then
-    emit ctx
-      (Printf.sprintf
-         " blorp_vector_init_elem_release(%s, blorp_elem_release_fn);" tmp);
+  if elem_needs_release then (
+    emit ctx " ";
+    Core_emit_blorp_prepared_tensor.emit_literal_init_elem_release ctx
+      ~tensor_tmp:tmp);
   (match tl.tl_payload with
   | TensorRawElements (TensorFloat32Elements, elems) ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " ((float*)%s->data)[%d] = " tmp i);
-          emit_expr ctx el;
-          emit ctx ";")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_f32_write ~emit_expr ctx
+            ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorRawElements (TensorFloat64Elements, elems) ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " blorp_vector_write_f64(%s, %d, " tmp i);
-          emit_expr ctx el;
-          emit ctx ");")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_f64_write ~emit_expr ctx
+            ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorRawElements (TensorInt64Elements, elems) ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " ((long*)%s->data)[%d] = " tmp i);
-          emit_expr ctx el;
-          emit ctx ";")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_i64_write ~emit_expr ctx
+            ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorWordElements elems ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " %s->data[%d] = (void*)(intptr_t)(" tmp i);
-          emit_expr ctx el;
-          emit ctx ");")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_word_write ~emit_expr ctx
+            ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorPackedElements (_, elems) ->
       List.iteri
         (fun i el ->
-          emit ctx (Printf.sprintf " blorp_packed_set(%s, %d, (long)(" tmp i);
-          emit_expr ctx el;
-          emit ctx "));")
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_packed_write ~emit_expr
+            ctx ~tensor_tmp:tmp ~index:i el)
         elems
   | TensorInlineStructElements (c_ty, elems) ->
       List.iteri
         (fun i el ->
-          let elem_tmp = Printf.sprintf "__ten_elem_%d" (fresh_temp ctx) in
-          emit ctx (Printf.sprintf " { %s %s = " c_ty elem_tmp);
-          emit_expr ctx el;
-          emit ctx
-            (Printf.sprintf
-               "; memcpy((char*)%s->data + %d * sizeof(%s), &%s, sizeof(%s)); }"
-               tmp i c_ty elem_tmp c_ty))
+          emit ctx " ";
+          Core_emit_blorp_prepared_tensor.emit_literal_inline_struct_write
+            ~emit_expr ctx ~tensor_tmp:tmp ~index:i ~struct_ty:c_ty el)
         elems
   | TensorBoxedElements elems ->
       List.iteri
@@ -1436,15 +1927,18 @@ and emit_tensor_literal ctx loc tl =
             let elem_tmp = Printf.sprintf "__elem_%d" (fresh_temp ctx) in
             emit ctx (Printf.sprintf " void* %s = " elem_tmp);
             emit_boxed_storage ctx value;
-            emit ctx (Printf.sprintf "; %s->data[%d] = %s;" tmp i elem_tmp);
-            if not value.bsv_transfers_ownership then
-              emit ctx
-                (Printf.sprintf " if (%s) blorp_retain(%s);" elem_tmp elem_tmp)
+            emit ctx "; ";
+            Core_emit_blorp_prepared_tensor.emit_literal_boxed_write_rendered
+              ctx ~tensor_tmp:tmp ~index:i ~value_arg:elem_tmp;
+            if not value.bsv_transfers_ownership then (
+              emit ctx " ";
+              Core_emit_blorp_prepared_tensor.emit_literal_boxed_retain ctx
+                elem_tmp)
           end
           else begin
-            emit ctx (Printf.sprintf " %s->data[%d] = " tmp i);
-            emit_boxed_storage ctx value;
-            emit ctx ";"
+            emit ctx " ";
+            Core_emit_blorp_prepared_tensor.emit_literal_boxed_write
+              ~emit_boxed:emit_boxed_storage ctx ~tensor_tmp:tmp ~index:i value
           end)
         elems);
   emit ctx (Printf.sprintf " %s; })" tmp)
@@ -1461,36 +1955,6 @@ and emit_tensor_fill_total_expr ctx dim_tmps =
         emit ctx ")"
   in
   emit_product dim_tmps
-
-and emit_tensor_fill_alloc_call ctx loc layout first_dim total_dim =
-  match layout.tsl_slots with
-  | TensorRawScalarStorage TensorInt64Elements ->
-      emit ctx "blorp_tensor_new_i64(";
-      emit ctx first_dim;
-      emit ctx ", ";
-      emit ctx total_dim;
-      emit ctx ")"
-  | TensorRawScalarStorage TensorFloat64Elements ->
-      emit ctx "blorp_tensor_new_f64(";
-      emit ctx first_dim;
-      emit ctx ", ";
-      emit ctx total_dim;
-      emit ctx ")"
-  | TensorRawScalarStorage TensorFloat32Elements ->
-      emit ctx "blorp_tensor_new_f32(";
-      emit ctx first_dim;
-      emit ctx ", ";
-      emit ctx total_dim;
-      emit ctx ")"
-  | TensorPackedStorage width ->
-      emit ctx "blorp_tensor_new_packed(";
-      emit ctx first_dim;
-      emit ctx ", ";
-      emit ctx total_dim;
-      emit ctx (Printf.sprintf ", %d)" (inline_storage_width_bytes width))
-  | _ ->
-      Core_error.errorf Core_error.Emit loc
-        "unsupported tensor fill allocation layout"
 
 and emit_tensor_fill_factory ctx loc ty value dims =
   let layout =
@@ -1570,8 +2034,8 @@ and emit_tensor_fill_factory ctx loc ty value dims =
           emit_expr ctx value;
           emit ctx "; ";
           emit ctx (Printf.sprintf "blorp_Vector* %s = " vec_tmp);
-          emit_tensor_fill_alloc_call ctx loc layout (List.hd dim_tmps)
-            total_tmp;
+          Core_emit_blorp_prepared_tensor.emit_fill_alloc_call ctx loc layout
+            ~first_dim:(List.hd dim_tmps) ~total_dim:total_tmp;
           emit ctx "; ";
           emit_store ();
           emit ctx (Printf.sprintf " %s; })" vec_tmp))
@@ -1923,6 +2387,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
          codegen uses [(void)0] when a void value needs to sit inside an
          expression slot. *)
       emit ctx "(void)0"
+  | CCooperativeCheckpoint -> emit ctx "blorp_cooperative_checkpoint()"
   | CListHandoff h -> emit_list_handoff ctx e h
   (* ---- Operators ---- *)
   | CBin (op, l, r) -> (
@@ -2439,12 +2904,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
       in
       if list_element_needs_release ctx e.ty e.loc then begin
         let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-        emit ctx (Printf.sprintf "({ blorp_List* %s = " tmp);
-        emit_list_alloc_call ctx layout (fun () -> emit_expr ctx cap);
-        emit ctx
-          (Printf.sprintf
-             "; blorp_list_init_elem_release(%s, blorp_elem_release_fn); %s; })"
-             tmp tmp)
+        emit_list_alloc_with_release ctx layout ~result_tmp:tmp (fun () ->
+            emit_expr ctx cap)
       end
       else emit_list_alloc_call ctx layout (fun () -> emit_expr ctx cap)
   | CCall (CKBuiltin "blorp_channel_new", _, [ cap ])
@@ -4025,18 +4486,9 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                       then emit ctx ")"
                 end))
   | CTensorRawRead r ->
-      emit ctx (escape_c_ident (Var.to_c_name r.trr_view));
-      emit ctx "[";
-      emit_expr ctx r.trr_index;
-      emit ctx "]"
+      Core_emit_blorp_prepared_tensor.emit_raw_read ~emit_expr ctx r
   | CTensorRawWrite w ->
-      emit ctx "({ ";
-      emit ctx (escape_c_ident (Var.to_c_name w.trw_view));
-      emit ctx "[";
-      emit_expr ctx w.trw_index;
-      emit ctx "] = ";
-      emit_expr ctx w.trw_value;
-      emit ctx "; (void)0; })"
+      Core_emit_blorp_prepared_tensor.emit_raw_write_expr ~emit_expr ctx w
   | CStringByteRead read -> emit_string_byte_read ctx read
   | CStringByteWrite write -> emit_string_byte_write ctx write
   | CStringByteCopy copy -> emit_string_byte_copy ctx copy
@@ -4150,98 +4602,27 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
   (* ---- Allocating: tuple / list ---- *)
   | CTupleConstruct tc -> emit_tuple_construct ctx tc
   | CListConstruct lc -> emit_list_construct ctx lc
-  | CTuple elems ->
-      let release_mask =
-        List.mapi
-          (fun i el -> if tuple_field_needs_release ctx el then 1 lsl i else 0)
-          elems
-        |> List.fold_left ( lor ) 0
-      in
-      if release_mask = 0 then begin
-        emit ctx (Printf.sprintf "blorp_tuple_new(%d" (List.length elems));
-        List.iter
-          (fun el ->
-            emit ctx ", ";
-            emit_boxed ctx el)
-          elems;
-        emit ctx ")"
-      end
-      else begin
-        let tmp = Printf.sprintf "__tup_%d" (fresh_temp ctx) in
-        emit ctx
-          (Printf.sprintf "({ blorp_Tuple* %s = blorp_tuple_new(%d" tmp
-             (List.length elems));
-        List.iter
-          (fun el ->
-            emit ctx ", ";
-            emit_boxed ctx el)
-          elems;
-        emit ctx ");";
-        List.iteri
-          (fun i el ->
-            if tuple_field_needs_retain ctx el then
-              emit ctx
-                (Printf.sprintf " if (%s->elem[%d]) blorp_retain(%s->elem[%d]);"
-                   tmp i tmp i))
-          elems;
-        emit ctx
-          (Printf.sprintf " blorp_tuple_set_rc(%s, %dUL); %s; })" tmp
-             release_mask tmp)
-      end
-  | CList lit ->
-      let elems = lit.ll_elems in
-      let n = List.length elems in
-      let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_List* %s = " tmp);
-      emit_list_alloc_call ctx lit.ll_layout (fun () ->
-          emit ctx (string_of_int n));
-      emit ctx ";";
-      (match lit.ll_layout.lsl_slots with
-      | ListInlineStructStorage c_ty ->
-          List.iteri
-            (fun i el ->
-              let elem_tmp = Printf.sprintf "__lst_elem_%d" (fresh_temp ctx) in
-              emit ctx (Printf.sprintf " { %s %s = " c_ty elem_tmp);
-              emit_expr ctx el;
-              emit ctx
-                (Printf.sprintf "; blorp_list_set_raw_copy(%s, %d, &%s); }" tmp
-                   i elem_tmp))
-            elems;
-          emit ctx (Printf.sprintf " %s->len = %d;" tmp n)
-      | ListPointerStorage | ListInlineStorage _ ->
-          let elem_needs_release =
-            list_storage_layout_requires_release_or_error ~phase:Core_error.Emit
-              ~loc:e.loc lit.ll_layout
-          in
-          if elem_needs_release then
-            emit ctx
-              (Printf.sprintf
-                 " blorp_list_init_elem_release(%s, blorp_elem_release_fn);" tmp);
-          List.iter
-            (fun el ->
-              let append_fn =
-                if elem_needs_release && boxed_expr_transfers_ownership ctx el
-                then "blorp_list_append_owned"
-                else "blorp_list_append"
-              in
-              emit ctx (Printf.sprintf " %s = %s(%s, " tmp append_fn tmp);
-              emit_boxed ctx el;
-              emit ctx ");")
-            elems);
-      emit ctx (Printf.sprintf " %s; })" tmp)
+  | CTuple _ ->
+      Core_error.errorf Core_error.Emit e.loc
+        ~hint:
+          "Core_codegen_prepare should rewrite CTuple into CTupleConstruct, \
+           which carries explicit boxed storage and release-mask decisions."
+        "unprepared CTuple reached emission"
+  | CList _ ->
+      Core_error.errorf Core_error.Emit e.loc
+        ~hint:
+          "Core_codegen_prepare should rewrite CList into CListConstruct, \
+           which carries explicit list storage layout and element ownership \
+           decisions."
+        "unprepared CList reached emission"
   | CListAlloc alloc ->
       if
         list_storage_layout_requires_release_or_error ~phase:Core_error.Emit
           ~loc:e.loc alloc.la_layout
       then begin
         let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-        emit ctx (Printf.sprintf "({ blorp_List* %s = " tmp);
-        emit_list_alloc_call ctx alloc.la_layout (fun () ->
-            emit_expr ctx alloc.la_capacity);
-        emit ctx
-          (Printf.sprintf
-             "; blorp_list_init_elem_release(%s, blorp_elem_release_fn); %s; })"
-             tmp tmp)
+        emit_list_alloc_with_release ctx alloc.la_layout ~result_tmp:tmp
+          (fun () -> emit_expr ctx alloc.la_capacity)
       end
       else
         emit_list_alloc_call ctx alloc.la_layout (fun () ->
@@ -4279,13 +4660,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           in
           if list_element_needs_release ctx e.ty e.loc then begin
             let tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
-            emit ctx (Printf.sprintf "({ blorp_List* %s = " tmp);
-            emit_list_alloc_call ctx layout (fun () -> emit ctx "0");
-            emit ctx
-              (Printf.sprintf
-                 "; blorp_list_init_elem_release(%s, blorp_elem_release_fn); \
-                  %s; })"
-                 tmp tmp)
+            emit_list_alloc_with_release ctx layout ~result_tmp:tmp (fun () ->
+                emit ctx "0")
           end
           else emit_list_alloc_call ctx layout (fun () -> emit ctx "0")
       | ty, _ ->
@@ -4411,153 +4787,13 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           emit ctx ");")
         kvs;
       emit ctx (Printf.sprintf " %s; })" tmp)
-  | CVector elems -> (
-      (* Multi-dimensional tensor literal (e.g. {{1,2,3},{4,5,6}} typed
-         as Int[#2, #3]) must flatten into row-major storage so
-         subscript peeling ([blorp_tensor_slice_row]) reads the right
-         bytes. A naive per-level [blorp_vector_new] produces a
-         vector-of-vectors whose outer [data[i]] holds a pointer to an
-         inner vector — incompatible with flat-storage peel/set
-         primitives. Detect T[d0, d1, ...] types and flatten. *)
-      let tensor_ty =
-        match tensor_type_of_expr ctx e with
-        | Some tensor_ty -> tensor_ty
-        | None ->
-            Core_error.errorf Core_error.Emit e.loc
-              ~hint:
-                "CVector nodes should only reach emission with a tensor, \
-                 vector, or matrix semantic type carrying at least one \
-                 dimension"
-              "CVector emission requires a ranked tensor type, got %s"
-              (Types.type_to_string e.ty)
-      in
-      let elem_ty = tensor_ty.elem_ty in
-      let is_float32_literal =
-        match elem_ty with Ast.TyNamed ("Float32", _) -> true | _ -> false
-      in
-      let is_float64_literal =
-        match elem_ty with Ast.TyNamed ("Float", _) -> true | _ -> false
-      in
-      let is_i64_literal =
-        match elem_ty with Ast.TyNamed ("Int", _) -> true | _ -> false
-      in
-      let elem_needs_release = boxed_value_needs_release ctx elem_ty e.loc in
-      let tensor_dims =
-        match tensor_ty.dims with
-        | dims when List.length dims >= 2 ->
-            (* Require all dims to be constant for flat allocation. *)
-            let all_const =
-              List.for_all
-                (function Ast.TyConstInt _ -> true | _ -> false)
-                dims
-            in
-            if all_const then
-              Some (List.map (function Ast.TyConstInt n -> n | _ -> 0) dims)
-            else None
-        | _ -> None
-      in
-      match tensor_dims with
-      | Some dims ->
-          (* Flatten nested CVectors in row-major order. Inner elements
-              are scalars (or nested CVectors one level deep per dim). *)
-          let first_dim = List.hd dims in
-          let total = List.fold_left ( * ) 1 dims in
-          let rec collect_leaves acc e =
-            match e.desc with
-            | CVector inner -> List.fold_left collect_leaves acc inner
-            | _ -> e :: acc
-          in
-          let flat = List.rev (List.fold_left collect_leaves [] elems) in
-          let tmp = Printf.sprintf "__ten_%d" (fresh_temp ctx) in
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d, %d);" tmp
-               (if is_i64_literal then "blorp_tensor_new_i64"
-                else if is_float64_literal then "blorp_tensor_new_f64"
-                else if is_float32_literal then "blorp_tensor_new_f32"
-                else "blorp_tensor_new")
-               first_dim total);
-          if elem_needs_release then
-            emit ctx
-              (Printf.sprintf
-                 " blorp_vector_init_elem_release(%s, blorp_elem_release_fn);"
-                 tmp);
-          List.iteri
-            (fun i el ->
-              if is_i64_literal then begin
-                emit ctx (Printf.sprintf " ((long*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if is_float64_literal then begin
-                emit ctx (Printf.sprintf " ((double*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if is_float32_literal then begin
-                emit ctx (Printf.sprintf " ((float*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if elem_needs_release then begin
-                let elem_tmp = Printf.sprintf "__elem_%d" (fresh_temp ctx) in
-                emit ctx (Printf.sprintf " void* %s = " elem_tmp);
-                emit_boxed ctx el;
-                emit ctx (Printf.sprintf "; %s->data[%d] = %s;" tmp i elem_tmp);
-                if not (boxed_expr_transfers_ownership ctx el) then
-                  emit ctx
-                    (Printf.sprintf " if (%s) blorp_retain(%s);" elem_tmp
-                       elem_tmp)
-              end
-              else begin
-                emit ctx (Printf.sprintf " %s->data[%d] = " tmp i);
-                emit_boxed ctx el
-              end;
-              emit ctx ";")
-            flat;
-          emit ctx (Printf.sprintf " %s; })" tmp)
-      | None ->
-          let n = List.length elems in
-          let tmp = Printf.sprintf "__vec_%d" (fresh_temp ctx) in
-          emit ctx
-            (Printf.sprintf "({ blorp_Vector* %s = %s(%d);" tmp
-               (if is_i64_literal then "blorp_vector_new_i64"
-                else if is_float64_literal then "blorp_vector_new_f64"
-                else if is_float32_literal then "blorp_vector_new_f32"
-                else "blorp_vector_new")
-               n);
-          if elem_needs_release then
-            emit ctx
-              (Printf.sprintf
-                 " blorp_vector_init_elem_release(%s, blorp_elem_release_fn);"
-                 tmp);
-          List.iteri
-            (fun i el ->
-              if is_i64_literal then begin
-                emit ctx (Printf.sprintf " ((long*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if is_float64_literal then begin
-                emit ctx (Printf.sprintf " ((double*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if is_float32_literal then begin
-                emit ctx (Printf.sprintf " ((float*)%s->data)[%d] = " tmp i);
-                emit_expr ctx el
-              end
-              else if elem_needs_release then begin
-                let elem_tmp = Printf.sprintf "__elem_%d" (fresh_temp ctx) in
-                emit ctx (Printf.sprintf " void* %s = " elem_tmp);
-                emit_boxed ctx el;
-                emit ctx (Printf.sprintf "; %s->data[%d] = %s;" tmp i elem_tmp);
-                if not (boxed_expr_transfers_ownership ctx el) then
-                  emit ctx
-                    (Printf.sprintf " if (%s) blorp_retain(%s);" elem_tmp
-                       elem_tmp)
-              end
-              else begin
-                emit ctx (Printf.sprintf " %s->data[%d] = " tmp i);
-                emit_boxed ctx el
-              end;
-              emit ctx ";")
-            elems;
-          emit ctx (Printf.sprintf " %s; })" tmp))
+  | CVector _ ->
+      Core_error.errorf Core_error.Emit e.loc
+        ~hint:
+          "Core_codegen_prepare should rewrite CVector into CTensorLiteral, \
+           which carries the explicit tensor shape, storage layout, and \
+           payload representation required by emission."
+        "unprepared CVector reached emission"
   | CRecordUpdate _ ->
       (* Phase 2.4: Core_desugar.desugar_record_update rewrites every
          record update (value or heap) into CLet + CRecord. Reaching
@@ -5045,6 +5281,7 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
       emit_indent ctx;
       emitln ctx "}"
   | CFor (binder, iter, body) -> emit_for_loop ctx binder iter body
+  | CCooperativeCheckpoint -> emit_line ctx "blorp_cooperative_checkpoint();"
   | CResourceScope scope ->
       let resource_ty_c = type_to_c ctx scope.rs_ty in
       let resource_c = escape_c_ident (Var.to_c_name scope.rs_var) in
@@ -5143,12 +5380,8 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
   | CSelect select -> emit_select ctx select
   | CTensorRawWrite w ->
       emit_indent ctx;
-      emit ctx (escape_c_ident (Var.to_c_name w.trw_view));
-      emit ctx "[";
-      emit_expr ctx w.trw_index;
-      emit ctx "] = ";
-      emit_expr ctx w.trw_value;
-      emitln ctx ";"
+      Core_emit_blorp_prepared_tensor.emit_raw_write_stmt ~emit_expr ctx w;
+      emitln ctx ""
   (* ---- Everything else: evaluate and discard the result ---- *)
   | CLit _ | CVar _ | CBin _ | CUn _ | CLog _ | CCall _ | CTensorRawRead _
   | CStringByteRead _ | CStringByteWrite _ | CStringByteCopy _ | CStringSetLen _
@@ -6473,16 +6706,16 @@ and emit_for_list_flat (ctx : Core_emit_context.t) (binder : loop_binder)
     | ListInlineStructStorage c_ty ->
         emit_indent ctx;
         emit ctx (Printf.sprintf "%s %s; " c_ty var_c);
-        emit_list_inline_struct_dynamic_load ctx ~list_tmp:iter_c ~idx_tmp:idx_c
-          ~out_tmp:var_c ~struct_ty:c_ty ~bounds:ListBoundsProven;
+        Core_emit_blorp_prepared_list.emit_inline_struct_dynamic_load ctx
+          ~list_tmp:iter_c ~idx_tmp:idx_c ~out_tmp:var_c ~struct_ty:c_ty
+          ~bounds:ListBoundsProven;
         emitln ctx ""
     | ListInlineStorage width ->
-        let width_bytes = inline_storage_width_bytes width in
         let bits_tmp = Printf.sprintf "__iter_bits_%d" (fresh_temp ctx) in
-        emit_line ctx
-          (Printf.sprintf
-             "uintptr_t %s = 0; memcpy(&%s, (char*)%s->data + %s * %d, %d);"
-             bits_tmp bits_tmp iter_c idx_c width_bytes width_bytes);
+        emit_indent ctx;
+        Core_emit_blorp_prepared_list.emit_inline_bits_load ctx ~list_tmp:iter_c
+          ~idx_tmp:idx_c ~bits_tmp ~width;
+        emitln ctx "";
         emit_unbox_decl ctx var_c (Printf.sprintf "(void*)%s" bits_tmp) elem_ty
     | ListPointerStorage ->
         emit_unbox_decl ctx var_c
@@ -7120,18 +7353,17 @@ and emit_tailrec_list_binding (ctx : Core_emit_context.t)
       let layout = list_storage_layout_of_type ctx list_ty loc in
       match layout.lsl_slots with
       | ListInlineStorage width ->
-          let width_bytes = inline_storage_width_bytes width in
           let bits_tmp = Printf.sprintf "__tailrec_bits_%d" (fresh_temp ctx) in
-          emit_line ctx
-            (Printf.sprintf
-               "uintptr_t %s = 0; memcpy(&%s, (char*)((blorp_List*)%s)->data + \
-                %s * %d, %d);"
-               bits_tmp bits_tmp list_name idx_c width_bytes width_bytes);
+          emit_indent ctx;
+          Core_emit_blorp_prepared_list.emit_inline_bits_load ctx
+            ~list_tmp:(Printf.sprintf "((blorp_List*)%s)" list_name)
+            ~idx_tmp:idx_c ~bits_tmp ~width;
+          emitln ctx "";
           emit_line ctx (unbox_decl_str ctx var_c ("(void*)" ^ bits_tmp) var_ty)
       | ListInlineStructStorage c_ty ->
           emit_indent ctx;
           emit ctx (Printf.sprintf "%s %s; " c_ty var_c);
-          emit_list_inline_struct_dynamic_load ctx
+          Core_emit_blorp_prepared_list.emit_inline_struct_dynamic_load ctx
             ~list_tmp:(Printf.sprintf "((blorp_List*)%s)" list_name)
             ~idx_tmp:idx_c ~out_tmp:var_c ~struct_ty:c_ty
             ~bounds:ListBoundsProven;
@@ -7775,7 +8007,6 @@ and emit_task_closure (ctx : Core_emit_context.t) ~(loc : Ast.loc)
     ~(context : string) (lambda_name : string) (captures : task_capture list) :
     string =
   let fn_tmp = Printf.sprintf "__conc_fn_%d" (fresh_temp ctx) in
-  let capture_bindings = task_capture_bindings captures in
   emit_indent ctx;
   if captures = [] then
     emitln ctx
@@ -7809,7 +8040,7 @@ and emit_task_closure (ctx : Core_emit_context.t) ~(loc : Ast.loc)
               (Types.type_to_string capture.task_capture_ty));
         emitln ctx ";")
       captures;
-    emit_closure_env_release_mask_stmt ctx fn_tmp capture_bindings
+    emit_task_closure_env_release_mask_stmt ctx fn_tmp captures
   end;
   fn_tmp
 
@@ -7858,59 +8089,34 @@ and emit_concurrent_limit_init (ctx : Core_emit_context.t) limit_c limit_expr :
     [block.conc_bindings] carries the explicit (var, user-type, rhs)
     triples; [block.conc_body] is the tail that uses the bindings.
     [cb_ty] is [Result[T, ConcurrencyError]] — the type of the C variable
-    after [blorp_concurrent_join]. [cb_rhs.ty] is [T] (the task body's raw
-    return type), which drives the spawned lambda's return type and the
-    RC classification of what the task stores. *)
+    after the task-window join helper returns the boxed task result. [cb_rhs.ty]
+    is [T] (the task body's raw return type), which drives the spawned lambda's
+    return type and the RC classification of what the task stores. *)
 and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
     ~(emit_tail : Core_emit_context.t -> core -> unit) : unit =
-  (match block.conc_max_threads with
-  | Some n -> emit_line ctx (Printf.sprintf "blorp_thread_pool_init(%d);" n)
-  | None -> ());
-  let batch_tmp = Printf.sprintf "__conc_batch_%d" (fresh_temp ctx) in
-  emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_tmp);
-  emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_tmp);
-  (* Spawn phase *)
-  let task_infos =
-    List.map
-      (fun (cb : conc_binding) ->
-        let task_ret_ty, lambda_name, captures =
-          match cb.cb_task with
-          | Some task ->
-              let c_name =
-                Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func
-                |> escape_c_ident
-              in
-              ( task.tc_return_ty,
-                c_name,
-                task_copy_capture_bindings_for_emit ~loc:cb.cb_rhs.loc
-                  ~context:"concurrent binding" task.tc_captures )
-          | None ->
-              Core_error.errorf Core_error.Emit cb.cb_rhs.loc
-                ~hint:
-                  "Core_closure should attach task metadata to every \
-                   concurrent binding before emission"
-                "concurrent binding reached emit without task closure metadata"
-        in
-        let fn_tmp = emit_conc_closure ctx lambda_name captures in
-        let task_tmp = Printf.sprintf "__conc_task_%d" (fresh_temp ctx) in
-        let use_rc = type_requires_release ctx task_ret_ty in
-        let spawn_fn =
-          if use_rc then "blorp_task_spawn_owned_rc_in_batch"
-          else "blorp_task_spawn_owned_in_batch"
-        in
-        emit_line ctx
-          (Printf.sprintf "blorp_Task* %s = (blorp_Task*)%s(&%s, %s);" task_tmp
-             spawn_fn batch_tmp fn_tmp);
-        emit_task_cancellation_cleanup_push ctx task_tmp;
-        (cb, task_tmp))
-      block.conc_bindings
+  emit_line ctx "blorp_thread_pool_ensure_initialized();";
+  let window_id = fresh_temp ctx in
+  let window_c = Printf.sprintf "__conc_task_window_%d" window_id in
+  let window_cleanup_c =
+    Printf.sprintf "__blorp_task_window_cleanup_%d" window_id
   in
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_tmp);
-  let emit_join_binding (cb : conc_binding) task_tmp timeout_c =
+  let binding_count = List.length block.conc_bindings in
+  let window_capacity =
+    match block.conc_max_threads with
+    | Some n -> max 1 (min n binding_count)
+    | None -> binding_count
+  in
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s = {0};" window_c);
+  emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
+  emit_line ctx
+    (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %d);" window_c
+       window_cleanup_c window_capacity);
+  let emit_join_binding (cb : conc_binding) slot timeout_c =
     let var_c = escape_c_ident (Var.to_c_name cb.cb_var) in
     let ty_c = type_to_c ctx cb.cb_ty in
     let join_call =
-      Printf.sprintf "blorp_concurrent_join(%s, %s)" task_tmp timeout_c
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %d, %s)"
+        window_c slot timeout_c
     in
     let rhs_c =
       if Core_layout_type.is_stack_result_type ~reg:ctx.reg cb.cb_ty then
@@ -7923,29 +8129,79 @@ and emit_concurrent_block (ctx : Core_emit_context.t) (block : concurrent_block)
   (* Join phase — compute deadline from timeout if specified *)
   let has_timeout = block.conc_timeout <> None in
   let conc_id = fresh_temp ctx in
-  if has_timeout then begin
-    let deadline = Printf.sprintf "__conc_deadline_%d" conc_id in
-    (match block.conc_timeout with
-    | Some timeout -> emit_concurrent_deadline_init ctx deadline timeout
-    | None -> ());
-    List.iter
-      (fun ((cb : conc_binding), task_tmp) ->
+  let deadline =
+    if has_timeout then begin
+      let deadline = Printf.sprintf "__conc_deadline_%d" conc_id in
+      (match block.conc_timeout with
+      | Some timeout -> emit_concurrent_deadline_init ctx deadline timeout
+      | None -> ());
+      Some deadline
+    end
+    else None
+  in
+  let emit_timeout_arg () =
+    match deadline with
+    | Some deadline ->
         let rem = Printf.sprintf "__conc_rem_%d" (fresh_temp ctx) in
         emit_concurrent_remaining_init ctx rem deadline;
-        emit_join_binding cb task_tmp rem;
-        emit_line ctx (task_cleanup_pop_slot_stmt task_tmp ^ ";");
-        emit_line ctx
-          (Printf.sprintf "blorp_release((blorp_Object*)%s);" task_tmp))
-      task_infos
-  end
-  else
+        rem
+    | None -> "-1"
+  in
+  let rec take n acc rest =
+    if n <= 0 then (List.rev acc, rest)
+    else
+      match rest with
+      | [] -> (List.rev acc, [])
+      | x :: xs -> take (n - 1) (x :: acc) xs
+  in
+  let rec chunks acc rest =
+    match rest with
+    | [] -> List.rev acc
+    | _ ->
+        let chunk, rest' = take window_capacity [] rest in
+        chunks (chunk :: acc) rest'
+  in
+  let emit_spawn slot (cb : conc_binding) =
+    let task_ret_ty, lambda_name, captures =
+      match cb.cb_task with
+      | Some task ->
+          let c_name =
+            Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func
+            |> escape_c_ident
+          in
+          ( task.tc_return_ty,
+            c_name,
+            task_copy_capture_bindings_for_emit ~loc:cb.cb_rhs.loc
+              ~context:"concurrent binding" task.tc_captures )
+      | None ->
+          Core_error.errorf Core_error.Emit cb.cb_rhs.loc
+            ~hint:
+              "Core_closure should attach task metadata to every concurrent \
+               binding before emission"
+            "concurrent binding reached emit without task closure metadata"
+    in
+    let fn_tmp = emit_conc_closure ctx lambda_name captures in
+    let use_rc = type_requires_release ctx task_ret_ty in
+    let spawn_helper =
+      if use_rc then "blorp_concurrent_task_window_spawn_owned_rc"
+      else "blorp_concurrent_task_window_spawn_owned"
+    in
+    emit_line ctx
+      (Printf.sprintf "%s(&%s, %d, %s, BLORP_CONCURRENT_TASK_FLUSH_PERIODIC);"
+         spawn_helper window_c slot fn_tmp);
+    (cb, slot)
+  in
+  let emit_chunk chunk =
+    let task_infos = List.mapi emit_spawn chunk in
     List.iter
-      (fun ((cb : conc_binding), task_tmp) ->
-        emit_join_binding cb task_tmp "-1";
-        emit_line ctx (task_cleanup_pop_slot_stmt task_tmp ^ ";");
-        emit_line ctx
-          (Printf.sprintf "blorp_release((blorp_Object*)%s);" task_tmp))
-      task_infos;
+      (fun ((cb : conc_binding), slot) ->
+        let timeout_c = emit_timeout_arg () in
+        emit_join_binding cb slot timeout_c)
+      task_infos
+  in
+  List.iter emit_chunk (chunks [] block.conc_bindings);
+  emit_line ctx
+    (Printf.sprintf "blorp_concurrent_task_window_end(&%s);" window_c);
   (* Expression-position concurrent blocks must leave the tail value as the
      GNU statement-expression result; statement-position concurrent blocks
      intentionally discard it. *)
@@ -8039,14 +8295,13 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
   let list_c = Printf.sprintf "__conc_list_%d" id in
   let len_c = Printf.sprintf "__conc_len_%d" id in
   let limit_c = Printf.sprintf "__conc_limit_%d" id in
-  let tasks_c = Printf.sprintf "__conc_tasks_%d" id in
-  let cleanups_c = Printf.sprintf "__conc_task_cleanups_%d" id in
+  let window_c = Printf.sprintf "__conc_task_window_%d" id in
+  let window_cleanup_c = Printf.sprintf "__blorp_task_window_cleanup_%d" id in
   let start_c = Printf.sprintf "__conc_start_%d" id in
   let window_end_c = Printf.sprintf "__conc_window_end_%d" id in
   let idx_c = Printf.sprintf "__conc_i_%d" id in
   let slot_c = Printf.sprintf "__conc_slot_%d" id in
   let results_c = Printf.sprintf "__conc_results_%d" id in
-  let batch_c = Printf.sprintf "__conc_batch_%d" id in
   let var_c = escape_c_ident (Var.to_c_name cf.cf_var) in
   let elem_ty, task_ret_ty, lambda_name, captures =
     concurrently_loop_emit_plan ctx cf
@@ -8055,7 +8310,7 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
     boxed_expr_transfers_ownership ctx cf.cf_iter
   in
   emit_concurrent_limit_init ctx limit_c limit_expr;
-  emit_line ctx (Printf.sprintf "blorp_thread_pool_init((int)%s);" limit_c);
+  emit_line ctx "blorp_thread_pool_ensure_initialized();";
   emit_indent ctx;
   emit ctx (Printf.sprintf "blorp_List* %s = (blorp_List*)" list_c);
   emit_expr ctx cf.cf_iter;
@@ -8066,19 +8321,11 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
          ~value_c:list_c ~ty:cf.cf_iter.ty
   in
   emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c list_c);
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s = {0};" window_c);
+  emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
   emit_line ctx
-    (Printf.sprintf
-       "blorp_Task** %s = blorp_malloc_checked((%s > 0 ? %s : 1) * \
-        sizeof(blorp_Task*));"
-       tasks_c limit_c limit_c);
-  emit_heap_pointer_cleanup_push ctx tasks_c;
-  emit_line ctx
-    (Printf.sprintf
-       "blorp_CancelCleanupFrame* %s = blorp_malloc_checked((%s > 0 ? %s : 1) \
-        * sizeof(blorp_CancelCleanupFrame));"
-       cleanups_c limit_c limit_c);
-  emit_heap_pointer_cleanup_push ctx cleanups_c;
-  emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_c);
+    (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %s);" window_c
+       window_cleanup_c limit_c);
   if collect then begin
     emit_line ctx
       (Printf.sprintf "blorp_List* %s = blorp_list_new(%s);" results_c len_c);
@@ -8095,9 +8342,9 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
     | None -> ()
     end;
   let use_rc = type_requires_release ctx task_ret_ty in
-  let spawn_fn =
-    if use_rc then "blorp_task_spawn_owned_rc_in_batch"
-    else "blorp_task_spawn_owned_in_batch"
+  let spawn_helper =
+    if use_rc then "blorp_concurrent_task_window_spawn_owned_rc"
+    else "blorp_concurrent_task_window_spawn_owned"
   in
   emit_indent ctx;
   emitln ctx
@@ -8109,7 +8356,6 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
   emit_line ctx
     (Printf.sprintf "if (%s > %s) %s = %s;" window_end_c len_c window_end_c
        len_c);
-  emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_c);
   emit_indent ctx;
   emitln ctx
     (Printf.sprintf "for (long %s = %s; %s < %s; %s++) {" idx_c start_c idx_c
@@ -8121,20 +8367,11 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
     elem_ty;
   let fn_tmp = emit_conc_closure ctx lambda_name captures in
   emit_line ctx
-    (Printf.sprintf "%s[%s] = (blorp_Task*)%s(&%s, %s);" tasks_c slot_c spawn_fn
-       batch_c fn_tmp);
-  emit_task_array_cancellation_cleanup_push ctx cleanups_c slot_c tasks_c;
-  emit_line ctx
-    (Printf.sprintf "if (((%s + 1) %% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0) {"
-       slot_c);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
+    (Printf.sprintf "%s(&%s, %s, %s, BLORP_CONCURRENT_TASK_FLUSH_PERIODIC);"
+       spawn_helper window_c slot_c fn_tmp);
   ctx.indent <- ctx.indent - 1;
   emit_indent ctx;
   emitln ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
   emit_indent ctx;
   emitln ctx
     (Printf.sprintf "for (long %s = %s; %s < %s; %s++) {" idx_c start_c idx_c
@@ -8145,9 +8382,12 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
     if has_timeout then begin
       let rem = Printf.sprintf "__cf_rem_%d" (fresh_temp ctx) in
       emit_concurrent_remaining_init ctx rem deadline_c;
-      Printf.sprintf "blorp_concurrent_join(%s[%s], %s)" tasks_c slot_c rem
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %s, %s)"
+        window_c slot_c rem
     end
-    else Printf.sprintf "blorp_concurrent_join(%s[%s], -1)" tasks_c slot_c
+    else
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %s, -1)"
+        window_c slot_c
   in
   if collect then begin
     emit_line ctx
@@ -8158,19 +8398,14 @@ and emit_concurrently_loop_collecting_limited ~(collect : bool)
   else
     emit_line ctx
       (Printf.sprintf "blorp_release((blorp_Object*)(%s));" join_call);
-  emit_line ctx (task_array_cleanup_pop_slot_stmt tasks_c slot_c ^ ";");
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
+  ctx.indent <- ctx.indent - 1;
+  emit_indent ctx;
+  emitln ctx "}";
   emit_line ctx
-    (Printf.sprintf "blorp_release((blorp_Object*)%s[%s]);" tasks_c slot_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_indent ctx;
-  emitln ctx "}";
-  ctx.indent <- ctx.indent - 1;
-  emit_indent ctx;
-  emitln ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" cleanups_c);
-  emit_line ctx (Printf.sprintf "free(%s);" cleanups_c);
-  emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" tasks_c);
-  emit_line ctx (Printf.sprintf "free(%s);" tasks_c);
+    (Printf.sprintf "blorp_concurrent_task_window_end(&%s);" window_c);
   if collect then begin
     emit_line ctx (Printf.sprintf "%s->len = %s;" results_c len_c);
     emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" results_c)
@@ -8194,13 +8429,12 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
   let id = fresh_temp ctx in
   let source_c = Printf.sprintf "__conc_resource_source_%d" id in
   let limit_c = Printf.sprintf "__conc_limit_%d" id in
-  let tasks_c = Printf.sprintf "__conc_tasks_%d" id in
-  let cleanups_c = Printf.sprintf "__conc_task_cleanups_%d" id in
+  let window_c = Printf.sprintf "__conc_task_window_%d" id in
+  let window_cleanup_c = Printf.sprintf "__blorp_task_window_cleanup_%d" id in
   let raw_c = Printf.sprintf "__conc_resource_raw_%d" id in
   let count_c = Printf.sprintf "__conc_count_%d" id in
   let slot_c = Printf.sprintf "__conc_slot_%d" id in
   let done_c = Printf.sprintf "__conc_source_done_%d" id in
-  let batch_c = Printf.sprintf "__conc_batch_%d" id in
   let var_c = escape_c_ident (Var.to_c_name cf.cf_var) in
   let task_ret_ty, lambda_name, task_captures =
     concurrently_loop_task_emit_plan cf
@@ -8209,7 +8443,7 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
     boxed_expr_transfers_ownership ctx cf.cf_iter
   in
   emit_concurrent_limit_init ctx limit_c limit_expr;
-  emit_line ctx (Printf.sprintf "blorp_thread_pool_init((int)%s);" limit_c);
+  emit_line ctx "blorp_thread_pool_ensure_initialized();";
   emit_indent ctx;
   emit ctx (Printf.sprintf "blorp_ResourceSource* %s = " source_c);
   emit_expr ctx cf.cf_iter;
@@ -8219,18 +8453,11 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
     && emit_owned_temp_cancellation_cleanup_push ctx ~slot_c:source_c
          ~value_c:source_c ~ty:cf.cf_iter.ty
   in
+  emit_line ctx (Printf.sprintf "blorp_ConcurrentTaskWindow %s = {0};" window_c);
+  emit_line ctx (Printf.sprintf "blorp_CancelCleanupFrame %s;" window_cleanup_c);
   emit_line ctx
-    (Printf.sprintf
-       "blorp_Task** %s = blorp_malloc_checked((%s > 0 ? %s : 1) * \
-        sizeof(blorp_Task*));"
-       tasks_c limit_c limit_c);
-  emit_heap_pointer_cleanup_push ctx tasks_c;
-  emit_line ctx
-    (Printf.sprintf
-       "blorp_CancelCleanupFrame* %s = blorp_malloc_checked((%s > 0 ? %s : 1) \
-        * sizeof(blorp_CancelCleanupFrame));"
-       cleanups_c limit_c limit_c);
-  emit_heap_pointer_cleanup_push ctx cleanups_c;
+    (Printf.sprintf "blorp_concurrent_task_window_begin(&%s, &%s, %s);" window_c
+       window_cleanup_c limit_c);
   let has_timeout = cf.cf_timeout <> None in
   let deadline_c = Printf.sprintf "__conc_deadline_%d" (fresh_temp ctx) in
   if has_timeout then
@@ -8243,8 +8470,6 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
   emitln ctx (Printf.sprintf "while (!%s) {" done_c);
   ctx.indent <- ctx.indent + 1;
   emit_line ctx (Printf.sprintf "long %s = 0;" count_c);
-  emit_line ctx (Printf.sprintf "blorp_TaskBatch %s;" batch_c);
-  emit_line ctx (Printf.sprintf "blorp_task_batch_init(&%s);" batch_c);
   emit_indent ctx;
   emitln ctx (Printf.sprintf "while (%s < %s) {" count_c limit_c);
   ctx.indent <- ctx.indent + 1;
@@ -8270,25 +8495,16 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
       ~context:"resource-source for ... concurrently" lambda_name task_captures
   in
   let use_rc = type_requires_release ctx task_ret_ty in
-  let spawn_fn =
-    if use_rc then "blorp_task_spawn_owned_rc_in_batch"
-    else "blorp_task_spawn_owned_in_batch"
+  let spawn_helper =
+    if use_rc then "blorp_concurrent_task_window_spawn_owned_rc"
+    else "blorp_concurrent_task_window_spawn_owned"
   in
   emit_line ctx
-    (Printf.sprintf "%s[%s] = (blorp_Task*)%s(&%s, %s);" tasks_c slot_c spawn_fn
-       batch_c fn_tmp);
-  emit_task_array_cancellation_cleanup_push ctx cleanups_c slot_c tasks_c;
+    (Printf.sprintf "%s(&%s, %s, %s, BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE);"
+       spawn_helper window_c slot_c fn_tmp);
   emit_line ctx (Printf.sprintf "%s++;" count_c);
-  emit_line ctx
-    (Printf.sprintf "if ((%s %% BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0) {"
-       count_c);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
   ctx.indent <- ctx.indent - 1;
   emit_line ctx "}";
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_batch_flush(&%s);" batch_c);
   emit_indent ctx;
   emitln ctx
     (Printf.sprintf "for (long %s = 0; %s < %s; %s++) {" slot_c slot_c count_c
@@ -8298,22 +8514,20 @@ and emit_concurrently_resource_source_loop_limited ~(collect : bool)
     if has_timeout then begin
       let rem = Printf.sprintf "__cf_rem_%d" (fresh_temp ctx) in
       emit_concurrent_remaining_init ctx rem deadline_c;
-      Printf.sprintf "blorp_concurrent_join(%s[%s], %s)" tasks_c slot_c rem
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %s, %s)"
+        window_c slot_c rem
     end
-    else Printf.sprintf "blorp_concurrent_join(%s[%s], -1)" tasks_c slot_c
+    else
+      Printf.sprintf "blorp_concurrent_task_window_join_release(&%s, %s, -1)"
+        window_c slot_c
   in
   emit_line ctx (Printf.sprintf "blorp_release((blorp_Object*)(%s));" join_call);
-  emit_line ctx (task_array_cleanup_pop_slot_stmt tasks_c slot_c ^ ";");
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "}";
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "}";
   emit_line ctx
-    (Printf.sprintf "blorp_release((blorp_Object*)%s[%s]);" tasks_c slot_c);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
-  emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" cleanups_c);
-  emit_line ctx (Printf.sprintf "free(%s);" cleanups_c);
-  emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" tasks_c);
-  emit_line ctx (Printf.sprintf "free(%s);" tasks_c);
+    (Printf.sprintf "blorp_concurrent_task_window_end(&%s);" window_c);
   if iter_cleanup_registered then
     emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" source_c);
   if iter_transfers_ownership then
@@ -8377,19 +8591,40 @@ and emit_collected_lambdas (ctx : Core_emit_context.t) : unit =
 and emit_global_init (ctx : Core_emit_context.t) (prog : core_program) : unit =
   let rec collect acc = function
     | [] -> List.rev acc
-    | { cd_desc = CDVar v; _ } :: rest -> (
+    | { cd_desc = CDVar v; cd_loc; _ } :: rest -> (
         match v.cv_init.desc with
         | CLit lit when is_c_static_literal lit -> collect acc rest
-        | _ ->
-            collect ((v.cv_name, v.cv_def_id, v.cv_ty, v.cv_init) :: acc) rest)
-    | { cd_desc = CDPrivate { cd_desc = CDVar v; _ }; _ } :: rest -> (
+        | _ -> collect ((v, cd_loc) :: acc) rest)
+    | { cd_desc = CDPrivate { cd_desc = CDVar v; cd_loc; _ }; _ } :: rest -> (
         match v.cv_init.desc with
         | CLit lit when is_c_static_literal lit -> collect acc rest
-        | _ ->
-            collect ((v.cv_name, v.cv_def_id, v.cv_ty, v.cv_init) :: acc) rest)
+        | _ -> collect ((v, cd_loc) :: acc) rest)
     | _ :: rest -> collect acc rest
   in
   let deferred = collect [] prog in
+  let planned =
+    List.map
+      (fun (v, loc) ->
+        let plan = global_constant_immortalization ctx v in
+        match plan with
+        | UnsupportedManagedConstant reason ->
+            Core_error.errorf Core_error.Emit loc
+              ~hint:global_constant_unsupported_hint
+              "managed global constant layout cannot yet be made safely \
+               immortal: %s"
+              reason
+        | NoImmortalizationNeeded -> (v, CheckedNoImmortalizationNeeded)
+        | ImmortalizeConstantGraph plan ->
+            (v, CheckedImmortalizeConstantGraph plan))
+      deferred
+  in
+  List.iter
+    (fun (_, plan) ->
+      match plan with
+      | CheckedImmortalizeConstantGraph plan ->
+          prepare_global_constant_immortal_helpers ctx plan
+      | CheckedNoImmortalizationNeeded -> ())
+    planned;
   emit ctx "\n";
   emitln ctx "void __blorp_init_globals(void) {";
   ctx.indent <- ctx.indent + 1;
@@ -8411,15 +8646,17 @@ and emit_global_init (ctx : Core_emit_context.t) (prog : core_program) : unit =
   if deferred <> [] then begin
     ctx.indent <- ctx.indent + 1;
     List.iter
-      (fun (var, _def_id, ty, init) ->
-        let init = expr_with_expected_type_for_constructors ctx init ty in
+      (fun (v, plan) ->
+        let ty = v.cv_ty in
+        let init = expr_with_expected_type_for_constructors ctx v.cv_init ty in
         emit_indent ctx;
         (* Global bare name — matches [emit_global_var]'s bare decl. *)
-        emit ctx (escape_c_ident (Var.to_c_name var));
+        emit ctx (escape_c_ident (Var.to_c_name v.cv_name));
         emit ctx " = ";
         emit_expr ctx init;
-        emitln ctx ";")
-      deferred;
+        emitln ctx ";";
+        emit_global_constant_immortal_init ctx plan v)
+      planned;
     ctx.indent <- ctx.indent - 1
   end;
   emitln ctx "}"

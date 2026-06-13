@@ -1,5 +1,6 @@
 import:
-	test: TestSuite
+	instrumentation: SchedulerStats, get_scheduler_stats, reset_scheduler_stats
+	test: TestSuite, cooperative_checkpoint_probe_for_test
 
 
 func yielding_value(value: Int) -> Int:
@@ -7,22 +8,70 @@ func yielding_value(value: Int) -> Int:
 	value
 
 
-func test_yield_now_outside_fiber_returns() -> Bool:
+func cooperative_spin_until_signal(signal: Channel[Int], iterations: Int) -> Bool:
+	var i: Int = 0
+	var checksum: Int = 0
+	var observed: Bool = False
+	while i < iterations and not observed:
+		checksum += i % 17
+		match try_recv(signal):
+			Some(_): observed = True
+			None: void
+		yield_now()
+		i += 1
+	observed and checksum >= 0
+
+
+func delayed_signal(signal: Channel[Int]) -> Bool:
 	yield_now()
-	True
+	send(signal, 1)
+
+
+func test_yield_now_outside_fiber_returns() -> Bool:
+	reset_scheduler_stats()
+	yield_now()
+	stats: SchedulerStats = get_scheduler_stats()
+	stats.cooperative_yields >= 1
 
 
 func test_yield_now_inside_fiber_returns() -> Bool:
+	reset_scheduler_stats()
 	concurrent(max_threads: 1):
 		first = yielding_value(1)
 		second = yielding_value(2)
+	stats: SchedulerStats = get_scheduler_stats()
 	first_ok: Bool = match first:
 		Ok(value): value == 1
 		Err(_): False
 	second_ok: Bool = match second:
 		Ok(value): value == 2
 		Err(_): False
-	first_ok and second_ok
+	first_ok and second_ok and stats.cooperative_yields >= 2
+
+
+func test_yield_now_allows_cpu_mixed_progress() -> Bool:
+	reset_scheduler_stats()
+	signal: Channel[Int] = channel(1)
+	concurrent(max_threads: 2, timeout: 1000):
+		spin_observed = cooperative_spin_until_signal(signal, 500)
+		signal_sent = delayed_signal(signal)
+	stats: SchedulerStats = get_scheduler_stats()
+	observed_ok: Bool = match spin_observed:
+		Ok(value): value
+		Err(_): False
+	sent_ok: Bool = match signal_sent:
+		Ok(value): value
+		Err(_): False
+	observed_ok and sent_ok and stats.cooperative_yields >= 2
+
+
+func test_cooperative_checkpoint_probe_yields_from_fiber() -> Bool:
+	reset_scheduler_stats()
+	concurrent(max_threads: 1, timeout: 1000):
+		probed = cooperative_checkpoint_probe_for_test()
+	match probed:
+		Ok(value): value
+		Err(_): False
 
 
 tests: TestSuite = {
@@ -30,5 +79,10 @@ tests: TestSuite = {
 	tests = [
 		("yield_now outside fiber returns", test_yield_now_outside_fiber_returns),
 		("yield_now inside fiber returns", test_yield_now_inside_fiber_returns),
+		("yield_now allows CPU mixed progress", test_yield_now_allows_cpu_mixed_progress),
+		(
+			"cooperative checkpoint probe yields from fiber",
+			test_cooperative_checkpoint_probe_yields_from_fiber,
+		),
 	]
 }

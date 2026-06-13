@@ -24,10 +24,14 @@ pure func cancellation_completion_budget_ms() -> Int:
 	2000
 
 
-func delayed_write_after_timeout() -> Int:
-	sleep(80)
-	_ = write_file("/tmp/blorp_timeout_cancel_probe.txt", "late")
+func delayed_write_after_timeout(path: String) -> Int:
+	sleep(500)
+	_ = write_file(path, "late")
 	7
+
+
+func cancellation_probe_path() -> String:
+	"/tmp/blorp_timeout_cancel_probe_" + now_microseconds().to_string() + ".txt"
 
 
 func cancelled_task_with_managed_locals() -> Int:
@@ -48,6 +52,28 @@ func cancelled_task_with_managed_locals() -> Int:
 
 func count_infinite_stream() -> Int:
 	count(repeat(1))
+
+
+func yield_until_cancelled() -> Int:
+	var iterations: Int = 0
+	var done: Bool = False
+	while not done:
+		iterations += 1
+		yield_now()
+	iterations
+
+
+func cpu_loop_until_compiler_checkpoint_cancelled() -> Int:
+	var iterations: Int = 0
+	var done: Bool = False
+	while not done:
+		iterations += 1
+	iterations
+
+
+@tail_recursive
+func tailrec_cpu_loop_until_compiler_checkpoint_cancelled(iterations: Int) -> Int:
+	tailrec_cpu_loop_until_compiler_checkpoint_cancelled(iterations + 1)
 
 
 func test_timeout_cancels_quickly() -> Bool:
@@ -179,15 +205,16 @@ func test_fast_and_slow() -> Bool:
 
 
 func test_timeout_cancels_late_side_effect() -> Bool:
-	_ = remove_file("/tmp/blorp_timeout_cancel_probe.txt")
-	concurrent(timeout: 10):
-		a = delayed_write_after_timeout()
+	path: String = cancellation_probe_path()
+	_ = remove_file(path)
+	concurrent(timeout: cancellation_timeout_ms()):
+		a = delayed_write_after_timeout(path)
 	timed_out: Bool = match a:
 		Ok(_): False
 		Err(_): True
-	sleep(120)
-	no_late_write: Bool = not file_exists("/tmp/blorp_timeout_cancel_probe.txt")
-	_ = remove_file("/tmp/blorp_timeout_cancel_probe.txt")
+	sleep(700)
+	no_late_write: Bool = not file_exists(path)
+	_ = remove_file(path)
 	timed_out and no_late_write
 
 
@@ -206,6 +233,39 @@ func test_timeout_cancels_stream_count() -> Bool:
 	start: Int = now_microseconds()
 	concurrent(timeout: cancellation_timeout_ms()):
 		a = count_infinite_stream()
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	timed_out: Bool = match a:
+		Ok(_): False
+		Err(_): True
+	timed_out and elapsed_ms < cancellation_completion_budget_ms()
+
+
+func test_timeout_cancels_yield_loop() -> Bool:
+	start: Int = now_microseconds()
+	concurrent(timeout: cancellation_timeout_ms()):
+		a = yield_until_cancelled()
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	timed_out: Bool = match a:
+		Ok(_): False
+		Err(_): True
+	timed_out and elapsed_ms < cancellation_completion_budget_ms()
+
+
+func test_timeout_cancels_cpu_loop_without_source_yield() -> Bool:
+	start: Int = now_microseconds()
+	concurrent(timeout: cancellation_timeout_ms()):
+		a = cpu_loop_until_compiler_checkpoint_cancelled()
+	elapsed_ms: Int = (now_microseconds() - start) / 1000
+	timed_out: Bool = match a:
+		Ok(_): False
+		Err(_): True
+	timed_out and elapsed_ms < cancellation_completion_budget_ms()
+
+
+func test_timeout_cancels_tailrec_cpu_loop_without_source_yield() -> Bool:
+	start: Int = now_microseconds()
+	concurrent(timeout: cancellation_timeout_ms()):
+		a = tailrec_cpu_loop_until_compiler_checkpoint_cancelled(0)
 	elapsed_ms: Int = (now_microseconds() - start) / 1000
 	timed_out: Bool = match a:
 		Ok(_): False
@@ -252,6 +312,15 @@ tests: TestSuite = {
 		("timeout cancels late side effect", test_timeout_cancels_late_side_effect),
 		("timeout releases cancelled locals", test_timeout_releases_cancelled_locals),
 		("timeout cancels stream count", test_timeout_cancels_stream_count),
+		("timeout cancels yield loop", test_timeout_cancels_yield_loop),
+		(
+			"timeout cancels CPU loop without source yield",
+			test_timeout_cancels_cpu_loop_without_source_yield,
+		),
+		(
+			"timeout cancels tailrec CPU loop without source yield",
+			test_timeout_cancels_tailrec_cpu_loop_without_source_yield,
+		),
 		("zero timeout", test_zero_timeout),
 		("cancelled variant exists", test_cancelled_variant_exists),
 	]

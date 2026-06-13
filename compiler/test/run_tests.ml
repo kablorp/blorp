@@ -91,6 +91,9 @@ let () =
         (fun (name, cases) -> ("FmtEmbedding." ^ name, cases))
         Test_fmt_embedding.suite
     @ List.map
+        (fun (name, cases) -> ("CompilerBlorp." ^ name, cases))
+        Test_compiler_blorp.suite
+    @ List.map
         (fun (name, cases) -> ("TraitObligationArchitecture." ^ name, cases))
         Test_trait_obligation_architecture.suite
     @ List.map (fun (name, cases) -> ("Infer." ^ name, cases)) Test_infer.suite
@@ -207,6 +210,9 @@ let () =
     @ List.map
         (fun (name, cases) -> ("CoreResource." ^ name, cases))
         Test_core_resource.suite
+    @ List.map
+        (fun (name, cases) -> ("CoreFairness." ^ name, cases))
+        Test_core_fairness.suite
     @ List.map
         (fun (name, cases) -> ("OperationResultMetadata." ^ name, cases))
         Test_operation_result_metadata.suite

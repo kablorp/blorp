@@ -8,63 +8,32 @@ import:
 -- Provides a Logger record with level filtering, context fields,
 -- and optional JSON output. All output goes to stderr.
 --
--- Levels: DEBUG=0, INFO=1, WARN=2, ERROR=3, OFF=4
+-- Levels: Debug, Info, Warn, Error
 --
 -- Usage:
 -- logger: Logger = logger()
--- info(logger, "server started")
--- info_f(logger, "request", [("method", "GET"), ("path", "/api")])
+-- log(logger, Info, "server started", [])
+-- log(logger, Info, "request", [("method", "GET"), ("path", "/api")])
 --
 -- json_logger: Logger = with_json(logger())
--- warn(json_logger, "slow query")
+-- log(json_logger, Warn, "slow query", [])
 -- ============================================================================
 -- Types
 -- ============================================================================
+enum LogLevel:
+	Debug
+	Info
+	Warn
+	Error
+
+
 -- Logger stores pre-formatted context strings to avoid List RC issues
 record Logger {
-	level: Int,
+	level: LogLevel,
 	context_text: String,
 	context_json: String,
 	json: Bool
 }
-
-
--- ============================================================================
--- Level Constants
--- ============================================================================
----
-Debug log level (0). Most verbose.
----
-pure func DEBUG() -> Int:
-	0
-
-
----
-Info log level (1). Default level.
----
-pure func INFO() -> Int:
-	1
-
-
----
-Warning log level (2).
----
-pure func WARN() -> Int:
-	2
-
-
----
-Error log level (3). Least verbose.
----
-pure func ERROR() -> Int:
-	3
-
-
----
-Off log level (4). Disables all logging.
----
-pure func OFF() -> Int:
-	4
 
 
 -- ============================================================================
@@ -76,11 +45,11 @@ Create a new logger with INFO level, text format, no context fields.
 doctests:
     :: Default logger
     l: Logger = logger()
-    l.level == 1
+    l.level == Info
 ---
 pure func logger() -> Logger:
 	{
-		level = 1,
+		level = Info,
 		context_text = "",
 		context_json = "",
 		json = False
@@ -92,10 +61,10 @@ Create a logger with a specific level.
 
 doctests:
     :: Set debug level
-    l: Logger = with_level(logger(), 0)
-    l.level == 0
+    l: Logger = with_level(logger(), Debug)
+    l.level == Debug
 ---
-pure func with_level(logger: Logger, level: Int) -> Logger:
+pure func with_level(logger: Logger, level: LogLevel) -> Logger:
 	{
 		level = level,
 		context_text = logger.context_text,
@@ -146,59 +115,15 @@ pure func with_fields(logger: Logger, fields: List[(String, String)]) -> Logger:
 -- Logging Functions
 -- ============================================================================
 ---
-Log a debug-level message.
+Log a message at the supplied level with structured fields.
 ---
-func debug(logger: Logger, msg: String) -> Void:
-	log_at(logger, 0, msg, [])
-
-
----
-Log an info-level message.
----
-func info(logger: Logger, msg: String) -> Void:
-	log_at(logger, 1, msg, [])
-
-
----
-Log a warning-level message.
----
-func warn(logger: Logger, msg: String) -> Void:
-	log_at(logger, 2, msg, [])
-
-
----
-Log an error-level message.
----
-func error(logger: Logger, msg: String) -> Void:
-	log_at(logger, 3, msg, [])
-
-
----
-Log a debug-level message with extra fields.
----
-func debug_f(logger: Logger, msg: String, fields: List[(String, String)]) -> Void:
-	log_at(logger, 0, msg, fields)
-
-
----
-Log an info-level message with extra fields.
----
-func info_f(logger: Logger, msg: String, fields: List[(String, String)]) -> Void:
-	log_at(logger, 1, msg, fields)
-
-
----
-Log a warning-level message with extra fields.
----
-func warn_f(logger: Logger, msg: String, fields: List[(String, String)]) -> Void:
-	log_at(logger, 2, msg, fields)
-
-
----
-Log an error-level message with extra fields.
----
-func error_f(logger: Logger, msg: String, fields: List[(String, String)]) -> Void:
-	log_at(logger, 3, msg, fields)
+func log(
+	logger: Logger,
+	level: LogLevel,
+	msg: String,
+	fields: List[(String, String)],
+) -> Void:
+	write_log(logger, level, msg, fields)
 
 
 -- ============================================================================
@@ -209,14 +134,15 @@ Format a log entry as text.
 
 doctests:
     :: Simple text format
-    format_text("INFO", "hello", []) == "INFO  hello"
+    format_text(Info, "hello", []) == "INFO  hello"
 
     :: Text with fields
-    format_text("WARN", "slow", [("ms", "500")]) == "WARN  slow  ms=500"
+    format_text(Warn, "slow", [("ms", "500")]) == "WARN  slow  ms=500"
 ---
-pure func format_text(level: String, msg: String, fields: List[(String, String)]) -> String:
-	base: String = level + "  " + msg
+pure func format_text(level: LogLevel, msg: String, fields: List[(String, String)]) -> String:
+	base: String = level_name(level) + "  " + msg
 	extra: String = build_fields_text(fields)
+
 	if extra.length() == 0:
 		base
 	else:
@@ -228,14 +154,15 @@ Format a log entry as JSON.
 
 doctests:
     :: Simple JSON format
-    result: String = format_json("INFO", "hello", [])
+    result: String = format_json(Info, "hello", [])
     result == "{\"level\":\"INFO\",\"msg\":\"hello\"}"
 ---
-pure func format_json(level: String, msg: String, fields: List[(String, String)]) -> String:
+pure func format_json(level: LogLevel, msg: String, fields: List[(String, String)]) -> String:
 	base: String = "{\"level\":\"" + escape_json_str(
-		level,
+		level_name(level),
 	) + "\",\"msg\":\"" + escape_json_str(msg) + "\""
 	extra: String = build_fields_json(fields)
+
 	if extra.length() == 0:
 		base + "}"
 	else:
@@ -245,44 +172,56 @@ pure func format_json(level: String, msg: String, fields: List[(String, String)]
 -- ============================================================================
 -- Internal
 -- ============================================================================
-private func log_at(
+private func write_log(
 	logger: Logger,
-	level: Int,
+	level: LogLevel,
 	msg: String,
 	extra_fields: List[(String, String)],
 ) -> Void:
-	if level >= logger.level:
+	if level_rank(level) >= level_rank(logger.level):
 		level_str: String = level_name(level)
 		both: (String, String) = build_both_fields(extra_fields)
+
 		if logger.json:
 			ts: String = now().to_iso()
 			all_json: String = merge_json_fields(logger.context_json, both[1])
 			base: String = "{\"time\":\"" + ts + "\",\"level\":\"" + level_str + "\",\"msg\":\"" + escape_json_str(
 				msg,
 			) + "\""
+
 			line: String = if all_json.length() == 0:
 				base + "}"
 			else:
 				base + "," + all_json + "}"
+
 			print_error(line)
 		else:
 			ts: String = now().format_time("%Y-%m-%d %H:%M:%S")
 			all_text: String = merge_text_fields(logger.context_text, both[0])
 			base: String = "[" + ts + "] " + level_str + "  " + msg
+
 			line: String = if all_text.length() == 0:
 				base
 			else:
 				base + "  " + all_text
+
 			print_error(line)
 
 
-private pure func level_name(level: Int) -> String:
+private pure func level_rank(level: LogLevel) -> Int:
 	match level:
-		0: "DEBUG"
-		1: "INFO"
-		2: "WARN"
-		3: "ERROR"
-		_: "UNKNOWN"
+		Debug: 0
+		Info: 1
+		Warn: 2
+		Error: 3
+
+
+private pure func level_name(level: LogLevel) -> String:
+	match level:
+		Debug: "DEBUG"
+		Info: "INFO"
+		Warn: "WARN"
+		Error: "ERROR"
 
 
 private pure func merge_text_fields(a: String, b: String) -> String:
@@ -308,6 +247,7 @@ private pure func build_both_fields(fields: List[(String, String)]) -> (String, 
 	var json_result: String = ""
 	var remaining: List[(String, String)] = fields
 	var done: Bool = False
+
 	while not done:
 		match remaining:
 			[]:
@@ -317,14 +257,18 @@ private pure func build_both_fields(fields: List[(String, String)]) -> (String, 
 					k + "=" + v
 				else:
 					text_result + " " + k + "=" + v
+
 				entry: String = "\"" + escape_json_str(k) + "\":\"" + escape_json_str(v) + "\""
+
 				json_result = if json_result.length() == 0:
 					entry
 				else:
 					json_result + "," + entry
+
 				remaining = rest
 			_:
 				done = True
+
 	(text_result, json_result)
 
 
@@ -332,6 +276,7 @@ private pure func build_fields_text(fields: List[(String, String)]) -> String:
 	var result: String = ""
 	var remaining: List[(String, String)] = fields
 	var done: Bool = False
+
 	while not done:
 		match remaining:
 			[]:
@@ -341,9 +286,11 @@ private pure func build_fields_text(fields: List[(String, String)]) -> String:
 					k + "=" + v
 				else:
 					result + " " + k + "=" + v
+
 				remaining = rest
 			_:
 				done = True
+
 	result
 
 
@@ -351,19 +298,23 @@ private pure func build_fields_json(fields: List[(String, String)]) -> String:
 	var result: String = ""
 	var remaining: List[(String, String)] = fields
 	var done: Bool = False
+
 	while not done:
 		match remaining:
 			[]:
 				done = True
 			[(k, v), ...rest]:
 				entry: String = "\"" + escape_json_str(k) + "\":\"" + escape_json_str(v) + "\""
+
 				result = if result.length() == 0:
 					entry
 				else:
 					result + "," + entry
+
 				remaining = rest
 			_:
 				done = True
+
 	result
 
 
@@ -376,6 +327,7 @@ private @tail_recursive pure func escape_loop(s: String, i: Int, acc: String) ->
 		acc
 	else:
 		ch: String = s.substring(i, 1)
+
 		if ch == "\"":
 			escape_loop(s, i + 1, acc + "\\\"")
 		else if ch == "\\":

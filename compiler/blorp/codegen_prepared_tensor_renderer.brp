@@ -1,0 +1,1158 @@
+-- Blorp-authored renderer for prepared tensor Core nodes.
+--
+-- OCaml still owns Core traversal, child expression emission, ABI strings, and
+-- variable naming. This module owns only the final C snippet shape for prepared
+-- tensor raw-view access and allocation helpers.
+enum CompilerCommand:
+	RenderPreparedTensorCommand
+	RenderManifestCommand
+	UnknownCommand
+
+
+enum PreparedTensorTemplate:
+	TensorRawViewDeclTemplate
+	TensorRawReadTemplate
+	TensorRawWriteExprTemplate
+	TensorRawWriteStmtTemplate
+	TensorWordStorageCheckTemplate
+	TensorF64StorageCheckTemplate
+	TensorF32StorageCheckTemplate
+	TensorI64StorageCheckTemplate
+	TensorDataPointerGetUncheckedTemplate
+	TensorInlineStructGetUncheckedTemplate
+	TensorF64RawGetUncheckedTemplate
+	TensorF32RawGetUncheckedTemplate
+	TensorAllocPointerTemplate
+	TensorAllocI64Template
+	TensorAllocF64Template
+	TensorAllocF32Template
+	TensorAllocPackedTemplate
+	TensorAllocSizedTemplate
+	TensorAllocWithReleaseTemplate
+	TensorInitElemReleaseTemplate
+	TensorRankedAllocPointerTemplate
+	TensorRankedAllocI64Template
+	TensorRankedAllocF64Template
+	TensorRankedAllocF32Template
+	TensorRankedAllocPackedTemplate
+	TensorRankedAllocSizedTemplate
+	TensorLiteralF32WriteTemplate
+	TensorLiteralF64WriteTemplate
+	TensorLiteralI64WriteTemplate
+	TensorLiteralWordWriteTemplate
+	TensorLiteralPackedWriteTemplate
+	TensorLiteralInlineStructWriteTemplate
+	TensorLiteralBoxedWriteTemplate
+	TensorLiteralBoxedRetainTemplate
+
+
+record PreparedTensorTemplateInfo {
+	template: PreparedTensorTemplate,
+	name: String,
+	arity: Int
+}
+
+
+private union StorageCheckKind:
+	WordStorageKind
+	F64StorageKind
+	F32StorageKind
+	I64StorageKind
+
+
+private union RawScalarKind:
+	F64RawScalarKind
+	F32RawScalarKind
+
+
+-- These payloads carry rendered C snippets and ABI strings. They are records
+-- because Blorp structs cannot contain String fields.
+record RawViewDeclArgs {
+	pointer_c_type: String,
+	view: String,
+	source: String
+}
+
+
+record RawWriteArgs {
+	view: String,
+	index: String,
+	value: String
+}
+
+
+record StorageCheckArgs {
+	tensor: String,
+	vector_tmp: String
+}
+
+
+record TensorIndexArgs {
+	tensor: String,
+	index: String
+}
+
+
+record InlineStructGetUncheckedArgs {
+	tensor: String,
+	index: String,
+	vector_tmp: String,
+	index_tmp: String,
+	out_tmp: String,
+	raw_tmp: String,
+	struct_ty: String
+}
+
+
+record RawScalarGetUncheckedArgs {
+	tensor: String,
+	index: String,
+	vector_tmp: String,
+	index_tmp: String,
+	out_tmp: String
+}
+
+
+record TensorAllocPackedArgs {
+	size: String,
+	elem_size: String
+}
+
+
+record TensorAllocSizedArgs {
+	size: String,
+	struct_ty: String
+}
+
+
+record TensorAllocWithReleaseArgs {
+	alloc_expr: String,
+	result_tmp: String
+}
+
+
+record TensorRankedAllocArgs {
+	first_dim: String,
+	total_dim: String
+}
+
+
+record TensorRankedAllocPackedArgs {
+	first_dim: String,
+	total_dim: String,
+	elem_size: String
+}
+
+
+record TensorRankedAllocSizedArgs {
+	first_dim: String,
+	total_dim: String,
+	struct_ty: String
+}
+
+
+record TensorLiteralWriteArgs {
+	tensor: String,
+	index: String,
+	value: String
+}
+
+
+record TensorLiteralInlineStructWriteArgs {
+	tensor: String,
+	index: String,
+	value: String,
+	elem_tmp: String,
+	struct_ty: String
+}
+
+
+union PreparedTensorOp:
+	RawViewDecl(RawViewDeclArgs)
+	RawRead(String, String)
+	RawWriteExpr(RawWriteArgs)
+	RawWriteStmt(RawWriteArgs)
+	WordStorageCheck(StorageCheckArgs)
+	F64StorageCheck(StorageCheckArgs)
+	F32StorageCheck(StorageCheckArgs)
+	I64StorageCheck(StorageCheckArgs)
+	DataPointerGetUnchecked(TensorIndexArgs)
+	InlineStructGetUnchecked(InlineStructGetUncheckedArgs)
+	F64RawGetUnchecked(RawScalarGetUncheckedArgs)
+	F32RawGetUnchecked(RawScalarGetUncheckedArgs)
+	TensorAllocPointer(String)
+	TensorAllocI64(String)
+	TensorAllocF64(String)
+	TensorAllocF32(String)
+	TensorAllocPacked(TensorAllocPackedArgs)
+	TensorAllocSized(TensorAllocSizedArgs)
+	TensorAllocWithRelease(TensorAllocWithReleaseArgs)
+	TensorInitElemRelease(String)
+	TensorRankedAllocPointer(TensorRankedAllocArgs)
+	TensorRankedAllocI64(TensorRankedAllocArgs)
+	TensorRankedAllocF64(TensorRankedAllocArgs)
+	TensorRankedAllocF32(TensorRankedAllocArgs)
+	TensorRankedAllocPacked(TensorRankedAllocPackedArgs)
+	TensorRankedAllocSized(TensorRankedAllocSizedArgs)
+	TensorLiteralF32Write(TensorLiteralWriteArgs)
+	TensorLiteralF64Write(TensorLiteralWriteArgs)
+	TensorLiteralI64Write(TensorLiteralWriteArgs)
+	TensorLiteralWordWrite(TensorLiteralWriteArgs)
+	TensorLiteralPackedWrite(TensorLiteralWriteArgs)
+	TensorLiteralInlineStructWrite(TensorLiteralInlineStructWriteArgs)
+	TensorLiteralBoxedWrite(TensorLiteralWriteArgs)
+	TensorLiteralBoxedRetain(String)
+
+
+union RenderError:
+	WrongArity(PreparedTensorTemplateInfo, Int)
+	UnsupportedPreparedTensorOp(String)
+
+
+ALL_TEMPLATES: List[PreparedTensorTemplateInfo] = [{
+		template = TensorRawViewDeclTemplate,
+		name = "tensor_raw_view_decl",
+		arity = 3
+	}, {
+		template = TensorRawReadTemplate,
+		name = "tensor_raw_read",
+		arity = 2
+	}, {
+		template = TensorRawWriteExprTemplate,
+		name = "tensor_raw_write_expr",
+		arity = 3
+	}, {
+		template = TensorRawWriteStmtTemplate,
+		name = "tensor_raw_write_stmt",
+		arity = 3
+	}, {
+		template = TensorWordStorageCheckTemplate,
+		name = "tensor_is_word_storage",
+		arity = 2
+	}, {
+		template = TensorF64StorageCheckTemplate,
+		name = "tensor_is_f64_storage",
+		arity = 2
+	}, {
+		template = TensorF32StorageCheckTemplate,
+		name = "tensor_is_f32_storage",
+		arity = 2
+	}, {
+		template = TensorI64StorageCheckTemplate,
+		name = "tensor_is_i64_storage",
+		arity = 2
+	}, {
+		template = TensorDataPointerGetUncheckedTemplate,
+		name = "tensor_data_pointer_get_unchecked",
+		arity = 2
+	}, {
+		template = TensorInlineStructGetUncheckedTemplate,
+		name = "tensor_inline_struct_get_unchecked",
+		arity = 7
+	}, {
+		template = TensorF64RawGetUncheckedTemplate,
+		name = "tensor_get_f64_raw_unchecked",
+		arity = 5
+	}, {
+		template = TensorF32RawGetUncheckedTemplate,
+		name = "tensor_get_f32_raw_unchecked",
+		arity = 5
+	}, {
+		template = TensorAllocPointerTemplate,
+		name = "tensor_alloc_pointer",
+		arity = 1
+	}, {
+		template = TensorAllocI64Template,
+		name = "tensor_alloc_i64",
+		arity = 1
+	}, {
+		template = TensorAllocF64Template,
+		name = "tensor_alloc_f64",
+		arity = 1
+	}, {
+		template = TensorAllocF32Template,
+		name = "tensor_alloc_f32",
+		arity = 1
+	}, {
+		template = TensorAllocPackedTemplate,
+		name = "tensor_alloc_packed",
+		arity = 2
+	}, {
+		template = TensorAllocSizedTemplate,
+		name = "tensor_alloc_sized",
+		arity = 2
+	}, {
+		template = TensorAllocWithReleaseTemplate,
+		name = "tensor_alloc_with_release",
+		arity = 2
+	}, {
+		template = TensorInitElemReleaseTemplate,
+		name = "tensor_init_elem_release",
+		arity = 1
+	}, {
+		template = TensorRankedAllocPointerTemplate,
+		name = "tensor_ranked_alloc_pointer",
+		arity = 2
+	}, {
+		template = TensorRankedAllocI64Template,
+		name = "tensor_ranked_alloc_i64",
+		arity = 2
+	}, {
+		template = TensorRankedAllocF64Template,
+		name = "tensor_ranked_alloc_f64",
+		arity = 2
+	}, {
+		template = TensorRankedAllocF32Template,
+		name = "tensor_ranked_alloc_f32",
+		arity = 2
+	}, {
+		template = TensorRankedAllocPackedTemplate,
+		name = "tensor_ranked_alloc_packed",
+		arity = 3
+	}, {
+		template = TensorRankedAllocSizedTemplate,
+		name = "tensor_ranked_alloc_sized",
+		arity = 3
+	}, {
+		template = TensorLiteralF32WriteTemplate,
+		name = "tensor_literal_write_f32",
+		arity = 3
+	}, {
+		template = TensorLiteralF64WriteTemplate,
+		name = "tensor_literal_write_f64",
+		arity = 3
+	}, {
+		template = TensorLiteralI64WriteTemplate,
+		name = "tensor_literal_write_i64",
+		arity = 3
+	}, {
+		template = TensorLiteralWordWriteTemplate,
+		name = "tensor_literal_write_word",
+		arity = 3
+	}, {
+		template = TensorLiteralPackedWriteTemplate,
+		name = "tensor_literal_write_packed",
+		arity = 3
+	}, {
+		template = TensorLiteralInlineStructWriteTemplate,
+		name = "tensor_literal_write_inline_struct",
+		arity = 5
+	}, {
+		template = TensorLiteralBoxedWriteTemplate,
+		name = "tensor_literal_write_boxed",
+		arity = 3
+	}, {
+		template = TensorLiteralBoxedRetainTemplate,
+		name = "tensor_literal_boxed_retain",
+		arity = 1
+	}]
+
+USAGE: String = (
+	"Usage: codegen_prepared_tensor_renderer prepared-tensor <name> [rendered-arg..."
+	+ "] | manifest"
+)
+
+private OPEN_BRACE: String = "{"
+
+private CLOSE_BRACE: String = "}"
+
+
+private pure func c_block(body: String) -> String:
+	OPEN_BRACE + " " + body + " " + CLOSE_BRACE
+
+
+private pure func c_statement_expr(body: String) -> String:
+	"(" + c_block(body) + ")"
+
+
+pure func parse_command(command: String) -> CompilerCommand:
+	match command:
+		"prepared-tensor": RenderPreparedTensorCommand
+		"manifest": RenderManifestCommand
+		_: UnknownCommand
+
+
+pure func prepared_tensor_template_name(info: PreparedTensorTemplateInfo) -> String:
+	info.name
+
+
+pure func prepared_tensor_template_arity(info: PreparedTensorTemplateInfo) -> Int:
+	info.arity
+
+
+pure func parse_prepared_tensor_template(name: String) -> Option[PreparedTensorTemplateInfo]:
+	var found: Option[PreparedTensorTemplateInfo] = None
+
+	for info in ALL_TEMPLATES:
+		if found.is_none() and info.name == name:
+			found = Some(info)
+
+	found
+
+
+pure func render_error_to_string(error: RenderError) -> String:
+	match error:
+		WrongArity(info, got):
+			"prepared tensor op ${info.name} expected ${info.arity} arg(s), got ${got}"
+		UnsupportedPreparedTensorOp(name): "unsupported prepared tensor op: ${name}"
+
+
+pure func wrong_arity_for_args(info: PreparedTensorTemplateInfo, args: List[String]) -> RenderError:
+	WrongArity(info, args.length())
+
+
+private pure func parse_raw_view_decl_args(args: List[String]) -> Option[RawViewDeclArgs]:
+	match args:
+		[pointer_c_type, view, source]:
+			Some({
+				pointer_c_type = pointer_c_type,
+				view = view,
+				source = source,
+			})
+		_: None
+
+
+private pure func parse_raw_read_op(args: List[String]) -> Option[PreparedTensorOp]:
+	match args:
+		[view, index]: Some(RawRead(view, index))
+		_: None
+
+
+private pure func parse_raw_write_args(args: List[String]) -> Option[RawWriteArgs]:
+	match args:
+		[view, index, value]:
+			Some({
+				view = view,
+				index = index,
+				value = value,
+			})
+		_: None
+
+
+private pure func parse_storage_check_args(args: List[String]) -> Option[StorageCheckArgs]:
+	match args:
+		[tensor, vector_tmp]:
+			Some({
+				tensor = tensor,
+				vector_tmp = vector_tmp,
+			})
+		_: None
+
+
+private pure func parse_tensor_index_args(args: List[String]) -> Option[TensorIndexArgs]:
+	match args:
+		[tensor, index]:
+			Some({
+				tensor = tensor,
+				index = index,
+			})
+		_: None
+
+
+private pure func parse_inline_struct_get_unchecked_args(
+	args: List[String],
+) -> Option[InlineStructGetUncheckedArgs]:
+	match args:
+		[tensor, index, vector_tmp, index_tmp, out_tmp, raw_tmp, struct_ty]:
+			Some({
+				tensor = tensor,
+				index = index,
+				vector_tmp = vector_tmp,
+				index_tmp = index_tmp,
+				out_tmp = out_tmp,
+				raw_tmp = raw_tmp,
+				struct_ty = struct_ty,
+			})
+		_: None
+
+
+private pure func parse_raw_scalar_get_unchecked_args(
+	args: List[String],
+) -> Option[RawScalarGetUncheckedArgs]:
+	match args:
+		[tensor, index, vector_tmp, index_tmp, out_tmp]:
+			Some({
+				tensor = tensor,
+				index = index,
+				vector_tmp = vector_tmp,
+				index_tmp = index_tmp,
+				out_tmp = out_tmp,
+			})
+		_: None
+
+
+private pure func parse_single_arg(args: List[String]) -> Option[String]:
+	match args:
+		[value]: Some(value)
+		_: None
+
+
+private pure func parse_tensor_alloc_packed_args(
+	args: List[String],
+) -> Option[TensorAllocPackedArgs]:
+	match args:
+		[size, elem_size]:
+			Some({
+				size = size,
+				elem_size = elem_size,
+			})
+		_: None
+
+
+private pure func parse_tensor_alloc_sized_args(args: List[String]) -> Option[TensorAllocSizedArgs]:
+	match args:
+		[size, struct_ty]:
+			Some({
+				size = size,
+				struct_ty = struct_ty,
+			})
+		_: None
+
+
+private pure func parse_tensor_alloc_with_release_args(
+	args: List[String],
+) -> Option[TensorAllocWithReleaseArgs]:
+	match args:
+		[alloc_expr, result_tmp]:
+			Some({
+				alloc_expr = alloc_expr,
+				result_tmp = result_tmp,
+			})
+		_: None
+
+
+private pure func parse_tensor_ranked_alloc_args(
+	args: List[String],
+) -> Option[TensorRankedAllocArgs]:
+	match args:
+		[first_dim, total_dim]:
+			Some({
+				first_dim = first_dim,
+				total_dim = total_dim,
+			})
+		_: None
+
+
+private pure func parse_tensor_ranked_alloc_packed_args(
+	args: List[String],
+) -> Option[TensorRankedAllocPackedArgs]:
+	match args:
+		[first_dim, total_dim, elem_size]:
+			Some({
+				first_dim = first_dim,
+				total_dim = total_dim,
+				elem_size = elem_size,
+			})
+		_: None
+
+
+private pure func parse_tensor_ranked_alloc_sized_args(
+	args: List[String],
+) -> Option[TensorRankedAllocSizedArgs]:
+	match args:
+		[first_dim, total_dim, struct_ty]:
+			Some({
+				first_dim = first_dim,
+				total_dim = total_dim,
+				struct_ty = struct_ty,
+			})
+		_: None
+
+
+private pure func parse_tensor_literal_write_args(
+	args: List[String],
+) -> Option[TensorLiteralWriteArgs]:
+	match args:
+		[tensor, index, value]:
+			Some({
+				tensor = tensor,
+				index = index,
+				value = value,
+			})
+		_: None
+
+
+private pure func parse_tensor_literal_inline_struct_write_args(
+	args: List[String],
+) -> Option[TensorLiteralInlineStructWriteArgs]:
+	match args:
+		[tensor, index, value, elem_tmp, struct_ty]:
+			Some({
+				tensor = tensor,
+				index = index,
+				value = value,
+				elem_tmp = elem_tmp,
+				struct_ty = struct_ty,
+			})
+		_: None
+
+
+pure func render_tensor_raw_view_decl(
+	pointer_c_type: String,
+	view: String,
+	source: String,
+) -> String:
+	"${pointer_c_type} ${view} = (${pointer_c_type})((blorp_Vector*)${source})->data"
+
+
+pure func render_tensor_raw_read(view: String, index: String) -> String:
+	"${view}[${index}]"
+
+
+pure func render_tensor_raw_write_expr(view: String, index: String, value: String) -> String:
+	c_statement_expr("${view}[${index}] = ${value}; (void)0;")
+
+
+pure func render_tensor_raw_write_stmt(view: String, index: String, value: String) -> String:
+	"${view}[${index}] = ${value};"
+
+
+private pure func storage_check_mode(kind: StorageCheckKind) -> String:
+	match kind:
+		WordStorageKind: "BLORP_VECTOR_STORAGE_POINTER"
+		F64StorageKind: "BLORP_VECTOR_STORAGE_F64"
+		F32StorageKind: "BLORP_VECTOR_STORAGE_F32"
+		I64StorageKind: "BLORP_VECTOR_STORAGE_I64"
+
+
+private pure func storage_check_elem_size(kind: StorageCheckKind) -> String:
+	match kind:
+		WordStorageKind: "sizeof(void*)"
+		F64StorageKind: "sizeof(double)"
+		F32StorageKind: "sizeof(float)"
+		I64StorageKind: "sizeof(long)"
+
+
+private pure func storage_check_extra_condition(
+	kind: StorageCheckKind,
+	vector_tmp: String,
+) -> String:
+	match kind:
+		WordStorageKind: " && ${vector_tmp}->elem_release == NULL"
+		F64StorageKind: ""
+		F32StorageKind: ""
+		I64StorageKind: ""
+
+
+private pure func render_storage_check(args: StorageCheckArgs, kind: StorageCheckKind) -> String:
+	vector_tmp: String = args.vector_tmp
+	mode: String = storage_check_mode(kind)
+	elem_size: String = storage_check_elem_size(kind)
+	extra_condition: String = storage_check_extra_condition(kind, vector_tmp)
+	vector_bind: String = "blorp_Vector* ${vector_tmp} = (blorp_Vector*)${args.tensor};"
+	check: String = "${vector_tmp} && ${vector_tmp}->storage_mode == ${mode} && ${vector_tmp}->elem_size == (int16_t)${elem_size}${extra_condition};"
+
+	c_statement_expr(vector_bind + " " + check)
+
+
+private pure func render_data_pointer_get_unchecked(args: TensorIndexArgs) -> String:
+	"((blorp_Vector*)${args.tensor})->data[${args.index}]"
+
+
+private pure func render_inline_struct_get_unchecked(args: InlineStructGetUncheckedArgs) -> String:
+	vector_tmp: String = args.vector_tmp
+	index_tmp: String = args.index_tmp
+	out_tmp: String = args.out_tmp
+	raw_tmp: String = args.raw_tmp
+	struct_ty: String = args.struct_ty
+	vector_bind: String = "blorp_Vector* ${vector_tmp} = (blorp_Vector*)${args.tensor};"
+	index_bind: String = "long ${index_tmp} = ${args.index};"
+	out_decl: String = "${struct_ty} ${out_tmp};"
+	inline_condition: String = "if (__builtin_expect(${vector_tmp}->storage_mode == BLORP_VECTOR_STORAGE_INLINE && ${vector_tmp}->elem_size == sizeof(${struct_ty}), 1)) "
+	inline_copy: String = "memcpy(&${out_tmp}, (char*)${vector_tmp}->data + ${index_tmp} * sizeof(${struct_ty}), sizeof(${struct_ty}));"
+	fallback_get: String = "void* ${raw_tmp} = ${vector_tmp}->data[${index_tmp}];"
+	fallback_unbox: String = "${out_tmp} = blorp_unbox_struct(${raw_tmp}, ${struct_ty});"
+	inline_branch: String = c_block(inline_copy)
+	fallback_branch: String = c_block(fallback_get + " " + fallback_unbox)
+
+	c_statement_expr(
+		vector_bind + " " + index_bind + " " + out_decl + " " + inline_condition + inline_branch + " else " + fallback_branch + " " + out_tmp + ";",
+	)
+
+
+private pure func raw_scalar_c_type(kind: RawScalarKind) -> String:
+	match kind:
+		F64RawScalarKind: "double"
+		F32RawScalarKind: "float"
+
+
+private pure func render_raw_scalar_get_unchecked(
+	args: RawScalarGetUncheckedArgs,
+	kind: RawScalarKind,
+) -> String:
+	vector_tmp: String = args.vector_tmp
+	index_tmp: String = args.index_tmp
+	out_tmp: String = args.out_tmp
+	c_type: String = raw_scalar_c_type(kind)
+	vector_bind: String = "blorp_Vector* ${vector_tmp} = (blorp_Vector*)${args.tensor};"
+	index_bind: String = "long ${index_tmp} = ${args.index};"
+	out_decl: String = "${c_type} ${out_tmp};"
+	load: String = "memcpy(&${out_tmp}, (char*)${vector_tmp}->data + ${index_tmp} * sizeof(${c_type}), sizeof(${c_type}));"
+
+	c_statement_expr(
+		vector_bind + " " + index_bind + " " + out_decl + " " + load + " " + out_tmp + ";",
+	)
+
+
+private pure func render_tensor_alloc_call(function_name: String, size: String) -> String:
+	"${function_name}(${size})"
+
+
+private pure func render_tensor_alloc_packed(args: TensorAllocPackedArgs) -> String:
+	"blorp_vector_new_packed(${args.size}, ${args.elem_size})"
+
+
+private pure func render_tensor_alloc_sized(args: TensorAllocSizedArgs) -> String:
+	"blorp_vector_new_sized(${args.size}, sizeof(${args.struct_ty}))"
+
+
+private pure func render_tensor_alloc_with_release(args: TensorAllocWithReleaseArgs) -> String:
+	result_tmp: String = args.result_tmp
+	bind_result: String = "blorp_Vector* ${result_tmp} = ${args.alloc_expr};"
+	init_release: String = "blorp_vector_init_elem_release(${result_tmp}, blorp_elem_release_fn);"
+	c_statement_expr(bind_result + " " + init_release + " " + result_tmp + ";")
+
+
+private pure func render_tensor_ranked_alloc(
+	function_name: String,
+	args: TensorRankedAllocArgs,
+) -> String:
+	"${function_name}(${args.first_dim}, ${args.total_dim})"
+
+
+private pure func render_tensor_ranked_alloc_packed(args: TensorRankedAllocPackedArgs) -> String:
+	"blorp_tensor_new_packed(${args.first_dim}, ${args.total_dim}, ${args.elem_size})"
+
+
+private pure func render_tensor_ranked_alloc_sized(args: TensorRankedAllocSizedArgs) -> String:
+	"blorp_tensor_new_sized(${args.first_dim}, ${args.total_dim}, sizeof(${args.struct_ty}))"
+
+
+private pure func render_tensor_init_elem_release(tensor: String) -> String:
+	"blorp_vector_init_elem_release(${tensor}, blorp_elem_release_fn);"
+
+
+private pure func render_tensor_literal_f32_write(args: TensorLiteralWriteArgs) -> String:
+	"((float*)${args.tensor}->data)[${args.index}] = ${args.value};"
+
+
+private pure func render_tensor_literal_f64_write(args: TensorLiteralWriteArgs) -> String:
+	"blorp_vector_write_f64(${args.tensor}, ${args.index}, ${args.value});"
+
+
+private pure func render_tensor_literal_i64_write(args: TensorLiteralWriteArgs) -> String:
+	"((long*)${args.tensor}->data)[${args.index}] = ${args.value};"
+
+
+private pure func render_tensor_literal_word_write(args: TensorLiteralWriteArgs) -> String:
+	"${args.tensor}->data[${args.index}] = (void*)(intptr_t)(${args.value});"
+
+
+private pure func render_tensor_literal_packed_write(args: TensorLiteralWriteArgs) -> String:
+	"blorp_packed_set(${args.tensor}, ${args.index}, (long)(${args.value}));"
+
+
+private pure func render_tensor_literal_inline_struct_write(
+	args: TensorLiteralInlineStructWriteArgs,
+) -> String:
+	c_block(
+		"${args.struct_ty} ${args.elem_tmp} = ${args.value}; memcpy((char*)${args.tensor}->data + ${args.index} * sizeof(${args.struct_ty}), &${args.elem_tmp}, sizeof(${args.struct_ty}));",
+	)
+
+
+private pure func render_tensor_literal_boxed_write(args: TensorLiteralWriteArgs) -> String:
+	"${args.tensor}->data[${args.index}] = ${args.value};"
+
+
+private pure func render_tensor_literal_boxed_retain(value: String) -> String:
+	"if (${value}) blorp_retain(${value});"
+
+
+pure func render_prepared_tensor_op(op: PreparedTensorOp) -> String:
+	match op:
+		RawViewDecl(args):
+			render_tensor_raw_view_decl(args.pointer_c_type, args.view, args.source)
+		RawRead(view, index): render_tensor_raw_read(view, index)
+		RawWriteExpr(args): render_tensor_raw_write_expr(args.view, args.index, args.value)
+		RawWriteStmt(args): render_tensor_raw_write_stmt(args.view, args.index, args.value)
+		WordStorageCheck(args): render_storage_check(args, WordStorageKind)
+		F64StorageCheck(args): render_storage_check(args, F64StorageKind)
+		F32StorageCheck(args): render_storage_check(args, F32StorageKind)
+		I64StorageCheck(args): render_storage_check(args, I64StorageKind)
+		DataPointerGetUnchecked(args): render_data_pointer_get_unchecked(args)
+		InlineStructGetUnchecked(args): render_inline_struct_get_unchecked(args)
+		F64RawGetUnchecked(args): render_raw_scalar_get_unchecked(args, F64RawScalarKind)
+		F32RawGetUnchecked(args): render_raw_scalar_get_unchecked(args, F32RawScalarKind)
+		TensorAllocPointer(size): render_tensor_alloc_call("blorp_vector_new", size)
+		TensorAllocI64(size): render_tensor_alloc_call("blorp_vector_new_i64", size)
+		TensorAllocF64(size): render_tensor_alloc_call("blorp_vector_new_f64", size)
+		TensorAllocF32(size): render_tensor_alloc_call("blorp_vector_new_f32", size)
+		TensorAllocPacked(args): render_tensor_alloc_packed(args)
+		TensorAllocSized(args): render_tensor_alloc_sized(args)
+		TensorAllocWithRelease(args): render_tensor_alloc_with_release(args)
+		TensorInitElemRelease(tensor): render_tensor_init_elem_release(tensor)
+		TensorRankedAllocPointer(args): render_tensor_ranked_alloc("blorp_tensor_new", args)
+		TensorRankedAllocI64(args): render_tensor_ranked_alloc("blorp_tensor_new_i64", args)
+		TensorRankedAllocF64(args): render_tensor_ranked_alloc("blorp_tensor_new_f64", args)
+		TensorRankedAllocF32(args): render_tensor_ranked_alloc("blorp_tensor_new_f32", args)
+		TensorRankedAllocPacked(args): render_tensor_ranked_alloc_packed(args)
+		TensorRankedAllocSized(args): render_tensor_ranked_alloc_sized(args)
+		TensorLiteralF32Write(args): render_tensor_literal_f32_write(args)
+		TensorLiteralF64Write(args): render_tensor_literal_f64_write(args)
+		TensorLiteralI64Write(args): render_tensor_literal_i64_write(args)
+		TensorLiteralWordWrite(args): render_tensor_literal_word_write(args)
+		TensorLiteralPackedWrite(args): render_tensor_literal_packed_write(args)
+		TensorLiteralInlineStructWrite(args): render_tensor_literal_inline_struct_write(args)
+		TensorLiteralBoxedWrite(args): render_tensor_literal_boxed_write(args)
+		TensorLiteralBoxedRetain(value): render_tensor_literal_boxed_retain(value)
+
+
+pure func build_prepared_tensor_op(
+	info: PreparedTensorTemplateInfo,
+	args: List[String],
+) -> Result[PreparedTensorOp, RenderError]:
+	match info.template:
+		TensorRawViewDeclTemplate:
+			parsed ?= parse_raw_view_decl_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(RawViewDecl(parsed))
+		TensorRawReadTemplate:
+			op ?= parse_raw_read_op(args).to_result(wrong_arity_for_args(info, args))
+			Ok(op)
+		TensorRawWriteExprTemplate:
+			parsed ?= parse_raw_write_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(RawWriteExpr(parsed))
+		TensorRawWriteStmtTemplate:
+			parsed ?= parse_raw_write_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(RawWriteStmt(parsed))
+		TensorWordStorageCheckTemplate:
+			parsed ?= parse_storage_check_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(WordStorageCheck(parsed))
+		TensorF64StorageCheckTemplate:
+			parsed ?= parse_storage_check_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(F64StorageCheck(parsed))
+		TensorF32StorageCheckTemplate:
+			parsed ?= parse_storage_check_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(F32StorageCheck(parsed))
+		TensorI64StorageCheckTemplate:
+			parsed ?= parse_storage_check_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(I64StorageCheck(parsed))
+		TensorDataPointerGetUncheckedTemplate:
+			parsed ?= parse_tensor_index_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(DataPointerGetUnchecked(parsed))
+		TensorInlineStructGetUncheckedTemplate:
+			parsed ?= parse_inline_struct_get_unchecked_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(InlineStructGetUnchecked(parsed))
+		TensorF64RawGetUncheckedTemplate:
+			parsed ?= parse_raw_scalar_get_unchecked_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(F64RawGetUnchecked(parsed))
+		TensorF32RawGetUncheckedTemplate:
+			parsed ?= parse_raw_scalar_get_unchecked_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(F32RawGetUnchecked(parsed))
+		TensorAllocPointerTemplate:
+			size ?= parse_single_arg(args).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorAllocPointer(size))
+		TensorAllocI64Template:
+			size ?= parse_single_arg(args).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorAllocI64(size))
+		TensorAllocF64Template:
+			size ?= parse_single_arg(args).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorAllocF64(size))
+		TensorAllocF32Template:
+			size ?= parse_single_arg(args).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorAllocF32(size))
+		TensorAllocPackedTemplate:
+			parsed ?= parse_tensor_alloc_packed_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorAllocPacked(parsed))
+		TensorAllocSizedTemplate:
+			parsed ?= parse_tensor_alloc_sized_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorAllocSized(parsed))
+		TensorAllocWithReleaseTemplate:
+			parsed ?= parse_tensor_alloc_with_release_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorAllocWithRelease(parsed))
+		TensorInitElemReleaseTemplate:
+			tensor ?= parse_single_arg(args).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorInitElemRelease(tensor))
+		TensorRankedAllocPointerTemplate:
+			parsed ?= parse_tensor_ranked_alloc_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorRankedAllocPointer(parsed))
+		TensorRankedAllocI64Template:
+			parsed ?= parse_tensor_ranked_alloc_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorRankedAllocI64(parsed))
+		TensorRankedAllocF64Template:
+			parsed ?= parse_tensor_ranked_alloc_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorRankedAllocF64(parsed))
+		TensorRankedAllocF32Template:
+			parsed ?= parse_tensor_ranked_alloc_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorRankedAllocF32(parsed))
+		TensorRankedAllocPackedTemplate:
+			parsed ?= parse_tensor_ranked_alloc_packed_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorRankedAllocPacked(parsed))
+		TensorRankedAllocSizedTemplate:
+			parsed ?= parse_tensor_ranked_alloc_sized_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorRankedAllocSized(parsed))
+		TensorLiteralF32WriteTemplate:
+			parsed ?= parse_tensor_literal_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralF32Write(parsed))
+		TensorLiteralF64WriteTemplate:
+			parsed ?= parse_tensor_literal_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralF64Write(parsed))
+		TensorLiteralI64WriteTemplate:
+			parsed ?= parse_tensor_literal_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralI64Write(parsed))
+		TensorLiteralWordWriteTemplate:
+			parsed ?= parse_tensor_literal_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralWordWrite(parsed))
+		TensorLiteralPackedWriteTemplate:
+			parsed ?= parse_tensor_literal_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralPackedWrite(parsed))
+		TensorLiteralInlineStructWriteTemplate:
+			parsed ?= parse_tensor_literal_inline_struct_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralInlineStructWrite(parsed))
+		TensorLiteralBoxedWriteTemplate:
+			parsed ?= parse_tensor_literal_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralBoxedWrite(parsed))
+		TensorLiteralBoxedRetainTemplate:
+			value ?= parse_single_arg(args).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralBoxedRetain(value))
+
+
+pure func render_prepared_tensor(name: String, args: List[String]) -> Result[String, RenderError]:
+	match parse_prepared_tensor_template(name):
+		Some(info):
+			match build_prepared_tensor_op(info, args):
+				Ok(op): Ok(render_prepared_tensor_op(op))
+				Err(error): Err(error)
+		None: Err(UnsupportedPreparedTensorOp(name))
+
+
+private PLACEHOLDER_RAW_VIEW_DECL_ARGS: RawViewDeclArgs = {
+	pointer_c_type = "@0@",
+	view = "@1@",
+	source = "@2@"
+}
+
+private PLACEHOLDER_RAW_WRITE_ARGS: RawWriteArgs = {
+	view = "@0@",
+	index = "@1@",
+	value = "@2@"
+}
+
+private PLACEHOLDER_STORAGE_CHECK_ARGS: StorageCheckArgs = {
+	tensor = "@0@",
+	vector_tmp = "@1@"
+}
+
+private PLACEHOLDER_TENSOR_INDEX_ARGS: TensorIndexArgs = {
+	tensor = "@0@",
+	index = "@1@"
+}
+
+private PLACEHOLDER_INLINE_STRUCT_GET_UNCHECKED_ARGS: InlineStructGetUncheckedArgs = {
+	tensor = "@0@",
+	index = "@1@",
+	vector_tmp = "@2@",
+	index_tmp = "@3@",
+	out_tmp = "@4@",
+	raw_tmp = "@5@",
+	struct_ty = "@6@"
+}
+
+private PLACEHOLDER_RAW_SCALAR_GET_UNCHECKED_ARGS: RawScalarGetUncheckedArgs = {
+	tensor = "@0@",
+	index = "@1@",
+	vector_tmp = "@2@",
+	index_tmp = "@3@",
+	out_tmp = "@4@"
+}
+
+private PLACEHOLDER_TENSOR_ALLOC_PACKED_ARGS: TensorAllocPackedArgs = {
+	size = "@0@",
+	elem_size = "@1@"
+}
+
+private PLACEHOLDER_TENSOR_ALLOC_SIZED_ARGS: TensorAllocSizedArgs = {
+	size = "@0@",
+	struct_ty = "@1@"
+}
+
+private PLACEHOLDER_TENSOR_ALLOC_WITH_RELEASE_ARGS: TensorAllocWithReleaseArgs = {
+	alloc_expr = "@0@",
+	result_tmp = "@1@"
+}
+
+private PLACEHOLDER_TENSOR_RANKED_ALLOC_ARGS: TensorRankedAllocArgs = {
+	first_dim = "@0@",
+	total_dim = "@1@"
+}
+
+private PLACEHOLDER_TENSOR_RANKED_ALLOC_PACKED_ARGS: TensorRankedAllocPackedArgs = {
+	first_dim = "@0@",
+	total_dim = "@1@",
+	elem_size = "@2@"
+}
+
+private PLACEHOLDER_TENSOR_RANKED_ALLOC_SIZED_ARGS: TensorRankedAllocSizedArgs = {
+	first_dim = "@0@",
+	total_dim = "@1@",
+	struct_ty = "@2@"
+}
+
+private PLACEHOLDER_TENSOR_LITERAL_WRITE_ARGS: TensorLiteralWriteArgs = {
+	tensor = "@0@",
+	index = "@1@",
+	value = "@2@"
+}
+
+private PLACEHOLDER_TENSOR_LITERAL_INLINE_STRUCT_WRITE_ARGS: TensorLiteralInlineStructWriteArgs = {
+	tensor = "@0@",
+	index = "@1@",
+	value = "@2@",
+	elem_tmp = "@3@",
+	struct_ty = "@4@"
+}
+
+
+private pure func placeholder_prepared_tensor_op(
+	info: PreparedTensorTemplateInfo,
+) -> PreparedTensorOp:
+	match info.template:
+		TensorRawViewDeclTemplate: RawViewDecl(PLACEHOLDER_RAW_VIEW_DECL_ARGS)
+		TensorRawReadTemplate: RawRead("@0@", "@1@")
+		TensorRawWriteExprTemplate: RawWriteExpr(PLACEHOLDER_RAW_WRITE_ARGS)
+		TensorRawWriteStmtTemplate: RawWriteStmt(PLACEHOLDER_RAW_WRITE_ARGS)
+		TensorWordStorageCheckTemplate: WordStorageCheck(PLACEHOLDER_STORAGE_CHECK_ARGS)
+		TensorF64StorageCheckTemplate: F64StorageCheck(PLACEHOLDER_STORAGE_CHECK_ARGS)
+		TensorF32StorageCheckTemplate: F32StorageCheck(PLACEHOLDER_STORAGE_CHECK_ARGS)
+		TensorI64StorageCheckTemplate: I64StorageCheck(PLACEHOLDER_STORAGE_CHECK_ARGS)
+		TensorDataPointerGetUncheckedTemplate:
+			DataPointerGetUnchecked(PLACEHOLDER_TENSOR_INDEX_ARGS)
+		TensorInlineStructGetUncheckedTemplate:
+			InlineStructGetUnchecked(PLACEHOLDER_INLINE_STRUCT_GET_UNCHECKED_ARGS)
+		TensorF64RawGetUncheckedTemplate:
+			F64RawGetUnchecked(PLACEHOLDER_RAW_SCALAR_GET_UNCHECKED_ARGS)
+		TensorF32RawGetUncheckedTemplate:
+			F32RawGetUnchecked(PLACEHOLDER_RAW_SCALAR_GET_UNCHECKED_ARGS)
+		TensorAllocPointerTemplate: TensorAllocPointer("@0@")
+		TensorAllocI64Template: TensorAllocI64("@0@")
+		TensorAllocF64Template: TensorAllocF64("@0@")
+		TensorAllocF32Template: TensorAllocF32("@0@")
+		TensorAllocPackedTemplate: TensorAllocPacked(PLACEHOLDER_TENSOR_ALLOC_PACKED_ARGS)
+		TensorAllocSizedTemplate: TensorAllocSized(PLACEHOLDER_TENSOR_ALLOC_SIZED_ARGS)
+		TensorAllocWithReleaseTemplate:
+			TensorAllocWithRelease(PLACEHOLDER_TENSOR_ALLOC_WITH_RELEASE_ARGS)
+		TensorInitElemReleaseTemplate: TensorInitElemRelease("@0@")
+		TensorRankedAllocPointerTemplate:
+			TensorRankedAllocPointer(PLACEHOLDER_TENSOR_RANKED_ALLOC_ARGS)
+		TensorRankedAllocI64Template: TensorRankedAllocI64(PLACEHOLDER_TENSOR_RANKED_ALLOC_ARGS)
+		TensorRankedAllocF64Template: TensorRankedAllocF64(PLACEHOLDER_TENSOR_RANKED_ALLOC_ARGS)
+		TensorRankedAllocF32Template: TensorRankedAllocF32(PLACEHOLDER_TENSOR_RANKED_ALLOC_ARGS)
+		TensorRankedAllocPackedTemplate:
+			TensorRankedAllocPacked(PLACEHOLDER_TENSOR_RANKED_ALLOC_PACKED_ARGS)
+		TensorRankedAllocSizedTemplate:
+			TensorRankedAllocSized(PLACEHOLDER_TENSOR_RANKED_ALLOC_SIZED_ARGS)
+		TensorLiteralF32WriteTemplate: TensorLiteralF32Write(PLACEHOLDER_TENSOR_LITERAL_WRITE_ARGS)
+		TensorLiteralF64WriteTemplate: TensorLiteralF64Write(PLACEHOLDER_TENSOR_LITERAL_WRITE_ARGS)
+		TensorLiteralI64WriteTemplate: TensorLiteralI64Write(PLACEHOLDER_TENSOR_LITERAL_WRITE_ARGS)
+		TensorLiteralWordWriteTemplate: TensorLiteralWordWrite(
+			PLACEHOLDER_TENSOR_LITERAL_WRITE_ARGS,
+		)
+		TensorLiteralPackedWriteTemplate:
+			TensorLiteralPackedWrite(PLACEHOLDER_TENSOR_LITERAL_WRITE_ARGS)
+		TensorLiteralInlineStructWriteTemplate:
+			TensorLiteralInlineStructWrite(PLACEHOLDER_TENSOR_LITERAL_INLINE_STRUCT_WRITE_ARGS)
+		TensorLiteralBoxedWriteTemplate:
+			TensorLiteralBoxedWrite(PLACEHOLDER_TENSOR_LITERAL_WRITE_ARGS)
+		TensorLiteralBoxedRetainTemplate: TensorLiteralBoxedRetain("@0@")
+
+
+pure func render_manifest_line(info: PreparedTensorTemplateInfo) -> String:
+	name: String = prepared_tensor_template_name(info)
+	arity: Int = prepared_tensor_template_arity(info)
+	body: String = render_prepared_tensor_op(placeholder_prepared_tensor_op(info))
+	"${name}\t${arity}\t${body}"
+
+
+pure func render_manifest_lines() -> List[String]:
+	ALL_TEMPLATES.map(render_manifest_line)
+
+
+func print_manifest() -> Void:
+	for line in render_manifest_lines():
+		print(line)
+
+
+func print_result(result: Result[String, RenderError]) -> Int:
+	match result:
+		Ok(rendered):
+			puts(rendered)
+			0
+		Err(error):
+			print(render_error_to_string(error))
+			1
+
+
+func main(args: List[String]) -> Int:
+	match args:
+		[program_name, command_name, ...command_args]:
+			match parse_command(command_name):
+				RenderPreparedTensorCommand:
+					match command_args:
+						[name, ...rendered_args]: print_result(
+							render_prepared_tensor(
+								name,
+								rendered_args,
+							),
+						)
+						[]:
+							print(USAGE)
+							1
+				RenderManifestCommand:
+					print_manifest()
+					0
+				UnknownCommand:
+					print(USAGE)
+					1
+		[]:
+			print(USAGE)
+			1
+		[program_name]:
+			print(USAGE)
+			1

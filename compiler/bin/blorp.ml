@@ -117,8 +117,30 @@ let resolve_timeout cli_timeout =
 let resolve_test_timeout cli_timeout =
   resolve_timeout_from_env [ "BLORP_TEST_TIMEOUT"; "BLORP_TIMEOUT" ] cli_timeout
 
-let resolve_sanitize cli_sanitize =
-  cli_sanitize || Sys.getenv_opt "BLORP_SANITIZE" = Some "1"
+let parse_sanitizer_mode_source source value =
+  match Test_runner.sanitizer_mode_of_string value with
+  | Some mode -> mode
+  | None ->
+      Printf.eprintf
+        "Error: %s must be one of: 0, 1, off, address, asan, undefined, ubsan\n"
+        source;
+      exit 1
+
+let parse_sanitizer_option arg =
+  match String.split_on_char '=' arg with
+  | [ "--sanitize" ] -> Some Test_runner.SanitizerAddressUndefined
+  | [ "--sanitize"; value ] -> Some (parse_sanitizer_mode_source arg value)
+  | _ ->
+      Printf.eprintf "Error: %s must be --sanitize or --sanitize=<mode>\n" arg;
+      exit 1
+
+let resolve_sanitizer_mode cli_sanitizer_mode =
+  match cli_sanitizer_mode with
+  | Some mode -> mode
+  | None -> (
+      match Sys.getenv_opt "BLORP_SANITIZE" with
+      | Some value -> parse_sanitizer_mode_source "BLORP_SANITIZE" value
+      | None -> Test_runner.SanitizerOff)
 
 let resolve_leak_check cli_leak_check =
   cli_leak_check || Sys.getenv_opt "BLORP_LEAK_CHECK" = Some "1"
@@ -663,14 +685,24 @@ let compile_file_with_opts opts filename =
 
 (** Compile and run a blorp file *)
 let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
-    ?(leak_check = false) ?(run_mode = Compile_profile.Fast) ~timeout
-    ?(no_format = false) ?(user_args = []) filename =
+    ?sanitizer_mode ?(leak_check = false) ?(run_mode = Compile_profile.Fast)
+    ~timeout ?(no_format = false) ?(user_args = []) filename =
   Test_runner.with_run_artifacts (fun () ->
+      let sanitizer_mode =
+        match sanitizer_mode with
+        | Some mode -> mode
+        | None ->
+            if sanitize then Test_runner.SanitizerAddressUndefined
+            else Test_runner.SanitizerOff
+      in
+      let sanitize = Test_runner.sanitizer_enabled sanitizer_mode in
       if not no_format then auto_format_user_file filename;
       let source = read_file filename in
       init_module_paths (extract_directory filename);
       let opt = Compile_profile.opt_level_for_run ~sanitize run_mode in
-      let precompiled = Test_runner.precompile_runtime ~sanitize ~opt () in
+      let precompiled =
+        Test_runner.precompile_runtime ~sanitizer_mode ~opt ()
+      in
       let embed_runtime = precompiled = None in
       match
         Pipeline.compile ~profile ~debug ~embed_runtime ~require_main:true
@@ -728,7 +760,7 @@ let run_file ?(profile = false) ?(debug = false) ?(sanitize = false)
               | Some p -> [ p.Test_runner.runtime_obj ]
               | None -> [])
             @ [ "-lm"; "-lpthread" ]
-            @ (if sanitize then Test_runner.sanitize_cc_args else [])
+            @ Test_runner.sanitizer_cc_args sanitizer_mode
             @ Test_runner.tls_backend_link_cc_args tls_backend
             @ (if raylib_flags = "" then []
                else String.split_on_char ' ' (String.trim raylib_flags))
@@ -797,7 +829,9 @@ let usage () =
   print_endline "  BLORP_TIMEOUT=N       Default timeout (CLI flag overrides)";
   print_endline
     "  BLORP_TEST_TIMEOUT=N  Default test timeout (test --timeout overrides)";
-  print_endline "  BLORP_SANITIZE=1      Enable sanitizers (CLI flag overrides)";
+  print_endline "  BLORP_SANITIZE=1|address|undefined";
+  print_endline
+    "                         Enable sanitizers (CLI flag overrides)";
   print_endline
     "  BLORP_LEAK_CHECK=1    Enable leak reporting (CLI flag overrides)";
   print_endline "  BLORP_TLS_BACKEND=unsupported|openssl";
@@ -974,6 +1008,7 @@ let () =
     | [ "--version" ] | [ "-v" ] ->
         Printf.printf "%s\n" (Version.describe ());
         exit 0
+    | "__compiler-tests" :: rest -> exit (Compiler_test_runner.run_cli rest)
     | "lsp" :: rest -> (
         match parse_lsp_cli_args rest with
         | LspHelp ->
@@ -1284,13 +1319,13 @@ let () =
             prerr_endline "Error: Multiple input files not supported";
             exit 1)
     | "run" :: rest -> (
-        let rec parse_run_args args profile debug sanitize leak_check release
-            no_format timeout threads std_dir files user_args =
+        let rec parse_run_args args profile debug sanitizer_mode leak_check
+            release no_format timeout threads std_dir files user_args =
           match args with
           | [] ->
               ( profile,
                 debug,
-                sanitize,
+                sanitizer_mode,
                 leak_check,
                 release,
                 no_format,
@@ -1308,6 +1343,10 @@ let () =
               print_endline "  --debug        Enable debug functions";
               print_endline
                 "  --sanitize     Compile with AddressSanitizer + UBSan";
+              print_endline "  --sanitize=undefined";
+              print_endline
+                "                 Compile with UBSan only (useful for \
+                 fiber-heavy runs on Darwin)";
               print_endline "  --leak-check   Report leaked objects on exit";
               print_endline "  --no-format    Skip auto-formatting";
               print_endline "  --timeout N    Kill after N seconds";
@@ -1317,7 +1356,7 @@ let () =
           | "--" :: rest ->
               ( profile,
                 debug,
-                sanitize,
+                sanitizer_mode,
                 leak_check,
                 release,
                 no_format,
@@ -1327,49 +1366,56 @@ let () =
                 List.rev files,
                 rest )
           | "--profile" :: rest ->
-              parse_run_args rest true debug sanitize leak_check release
+              parse_run_args rest true debug sanitizer_mode leak_check release
                 no_format timeout threads std_dir files user_args
           | "--release" :: rest ->
-              parse_run_args rest profile debug sanitize leak_check true
+              parse_run_args rest profile debug sanitizer_mode leak_check true
                 no_format timeout threads std_dir files user_args
           | "--debug" :: rest ->
-              parse_run_args rest profile true sanitize leak_check release
+              parse_run_args rest profile true sanitizer_mode leak_check release
                 no_format timeout threads std_dir files user_args
           | "--sanitize" :: rest ->
-              parse_run_args rest profile debug true leak_check release
+              parse_run_args rest profile debug
+                (Some Test_runner.SanitizerAddressUndefined) leak_check release
                 no_format timeout threads std_dir files user_args
+          | arg :: rest when String.starts_with ~prefix:"--sanitize=" arg ->
+              parse_run_args rest profile debug
+                (parse_sanitizer_option arg)
+                leak_check release no_format timeout threads std_dir files
+                user_args
           | "--leak-check" :: rest ->
-              parse_run_args rest profile debug sanitize true release no_format
-                timeout threads std_dir files user_args
+              parse_run_args rest profile debug sanitizer_mode true release
+                no_format timeout threads std_dir files user_args
           | "--no-format" :: rest ->
-              parse_run_args rest profile debug sanitize leak_check release true
-                timeout threads std_dir files user_args
+              parse_run_args rest profile debug sanitizer_mode leak_check
+                release true timeout threads std_dir files user_args
           | "--std-dir" :: dir :: rest ->
-              parse_run_args rest profile debug sanitize leak_check release
-                no_format timeout threads (Some dir) files user_args
+              parse_run_args rest profile debug sanitizer_mode leak_check
+                release no_format timeout threads (Some dir) files user_args
           | "--timeout" :: n :: rest -> (
               match int_of_string_opt n with
               | Some v ->
-                  parse_run_args rest profile debug sanitize leak_check release
-                    no_format (Some v) threads std_dir files user_args
+                  parse_run_args rest profile debug sanitizer_mode leak_check
+                    release no_format (Some v) threads std_dir files user_args
               | None ->
                   prerr_endline "Error: --timeout requires an integer";
                   exit 1)
           | "--threads" :: n :: rest -> (
               match int_of_string_opt n with
               | Some v ->
-                  parse_run_args rest profile debug sanitize leak_check release
-                    no_format timeout (Some v) std_dir files user_args
+                  parse_run_args rest profile debug sanitizer_mode leak_check
+                    release no_format timeout (Some v) std_dir files user_args
               | None ->
                   prerr_endline "Error: --threads requires an integer";
                   exit 1)
           | file :: rest ->
-              parse_run_args rest profile debug sanitize leak_check release
-                no_format timeout threads std_dir (file :: files) user_args
+              parse_run_args rest profile debug sanitizer_mode leak_check
+                release no_format timeout threads std_dir (file :: files)
+                user_args
         in
         let ( profile,
               debug,
-              cli_sanitize,
+              cli_sanitizer_mode,
               cli_leak_check,
               cli_release,
               cli_no_format,
@@ -1378,11 +1424,11 @@ let () =
               std_dir,
               files,
               user_args ) =
-          parse_run_args rest false false false false false false None None None
+          parse_run_args rest false false None false false false None None None
             [] []
         in
         let timeout = resolve_timeout cli_timeout in
-        let sanitize = resolve_sanitize cli_sanitize in
+        let sanitizer_mode = resolve_sanitizer_mode cli_sanitizer_mode in
         let leak_check = resolve_leak_check cli_leak_check in
         let no_format = resolve_no_format cli_no_format in
         let run_mode =
@@ -1397,8 +1443,8 @@ let () =
         match files with
         | [ file ] ->
             exit
-              (run_file ~profile ~debug ~sanitize ~leak_check ~timeout ~run_mode
-                 ~no_format ~user_args file)
+              (run_file ~profile ~debug ~sanitizer_mode ~leak_check ~timeout
+                 ~run_mode ~no_format ~user_args file)
         | [] ->
             prerr_endline "Error: No input file specified";
             exit 1
@@ -1406,13 +1452,13 @@ let () =
             prerr_endline "Error: Multiple input files not supported";
             exit 1)
     | "test" :: rest -> (
-        let rec parse_test_args args profile debug sanitize leak_check no_format
-            timeout jobs repeat mode cache std_dir paths =
+        let rec parse_test_args args profile debug sanitizer_mode leak_check
+            no_format timeout jobs repeat mode cache std_dir paths =
           match args with
           | [] ->
               ( profile,
                 debug,
-                sanitize,
+                sanitizer_mode,
                 leak_check,
                 no_format,
                 timeout,
@@ -1430,6 +1476,10 @@ let () =
               print_endline "  --profile      Run with profiling";
               print_endline "  --debug        Enable debug functions";
               print_endline "  --sanitize     Run with AddressSanitizer + UBSan";
+              print_endline "  --sanitize=undefined";
+              print_endline
+                "                 Run with UBSan only (useful for fiber-heavy \
+                 tests on Darwin)";
               print_endline "  --leak-check   Report leaked objects on exit";
               print_endline
                 "  --timeout N    Kill each test after N seconds (default: \
@@ -1445,22 +1495,28 @@ let () =
               print_endline "  --std-dir <d>  Use std library from directory";
               exit 0
           | "--profile" :: rest ->
-              parse_test_args rest true debug sanitize leak_check no_format
-                timeout jobs repeat mode cache std_dir paths
+              parse_test_args rest true debug sanitizer_mode leak_check
+                no_format timeout jobs repeat mode cache std_dir paths
           | "--debug" :: rest ->
-              parse_test_args rest profile true sanitize leak_check no_format
-                timeout jobs repeat mode cache std_dir paths
+              parse_test_args rest profile true sanitizer_mode leak_check
+                no_format timeout jobs repeat mode cache std_dir paths
           | "--sanitize" :: rest ->
-              parse_test_args rest profile debug true leak_check no_format
-                timeout jobs repeat mode cache std_dir paths
+              parse_test_args rest profile debug
+                (Some Test_runner.SanitizerAddressUndefined) leak_check
+                no_format timeout jobs repeat mode cache std_dir paths
+          | arg :: rest when String.starts_with ~prefix:"--sanitize=" arg ->
+              parse_test_args rest profile debug
+                (parse_sanitizer_option arg)
+                leak_check no_format timeout jobs repeat mode cache std_dir
+                paths
           | "--leak-check" :: rest ->
-              parse_test_args rest profile debug sanitize true no_format timeout
-                jobs repeat mode cache std_dir paths
+              parse_test_args rest profile debug sanitizer_mode true no_format
+                timeout jobs repeat mode cache std_dir paths
           | "--no-cache" :: rest ->
-              parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs repeat mode false std_dir paths
+              parse_test_args rest profile debug sanitizer_mode leak_check
+                no_format timeout jobs repeat mode false std_dir paths
           | "--no-format" :: rest ->
-              parse_test_args rest profile debug sanitize leak_check true
+              parse_test_args rest profile debug sanitizer_mode leak_check true
                 timeout jobs repeat mode cache std_dir paths
           | "--warmup-only" :: _ ->
               (* Pre-warm the precompiled runtime cache, then exit *)
@@ -1468,18 +1524,20 @@ let () =
                   ignore (Test_runner.precompile_runtime ()));
               exit 0
           | "--doc" :: rest ->
-              parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs repeat Test_runner.DocOnly cache std_dir paths
+              parse_test_args rest profile debug sanitizer_mode leak_check
+                no_format timeout jobs repeat Test_runner.DocOnly cache std_dir
+                paths
           | "--suite" :: rest ->
-              parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs repeat Test_runner.SuiteOnly cache std_dir paths
+              parse_test_args rest profile debug sanitizer_mode leak_check
+                no_format timeout jobs repeat Test_runner.SuiteOnly cache
+                std_dir paths
           | "--std-dir" :: dir :: rest ->
-              parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs repeat mode cache (Some dir) paths
+              parse_test_args rest profile debug sanitizer_mode leak_check
+                no_format timeout jobs repeat mode cache (Some dir) paths
           | "--timeout" :: n :: rest -> (
               match int_of_string_opt n with
               | Some v ->
-                  parse_test_args rest profile debug sanitize leak_check
+                  parse_test_args rest profile debug sanitizer_mode leak_check
                     no_format (Some v) jobs repeat mode cache std_dir paths
               | None ->
                   prerr_endline "Error: --timeout requires an integer";
@@ -1490,7 +1548,7 @@ let () =
           | "--repeat" :: n :: rest -> (
               match int_of_string_opt n with
               | Some v when v > 0 ->
-                  parse_test_args rest profile debug sanitize leak_check
+                  parse_test_args rest profile debug sanitizer_mode leak_check
                     no_format timeout jobs v mode cache std_dir paths
               | _ ->
                   prerr_endline "Error: --repeat requires a positive integer";
@@ -1501,7 +1559,7 @@ let () =
           | "-j" :: n :: rest -> (
               match int_of_string_opt n with
               | Some v ->
-                  parse_test_args rest profile debug sanitize leak_check
+                  parse_test_args rest profile debug sanitizer_mode leak_check
                     no_format timeout v repeat mode cache std_dir paths
               | None ->
                   prerr_endline "Error: -j requires an integer";
@@ -1510,12 +1568,12 @@ let () =
               prerr_endline ("Error: unknown test option: " ^ arg);
               exit 1
           | path :: rest ->
-              parse_test_args rest profile debug sanitize leak_check no_format
-                timeout jobs repeat mode cache std_dir (path :: paths)
+              parse_test_args rest profile debug sanitizer_mode leak_check
+                no_format timeout jobs repeat mode cache std_dir (path :: paths)
         in
         let ( profile,
               debug,
-              cli_sanitize,
+              cli_sanitizer_mode,
               cli_leak_check,
               cli_no_format,
               cli_timeout,
@@ -1525,7 +1583,7 @@ let () =
               cache,
               std_dir,
               paths ) =
-          parse_test_args rest false false false false false None 0 1
+          parse_test_args rest false false None false false None 0 1
             Test_runner.TestAll true None []
         in
         let timeout =
@@ -1533,7 +1591,7 @@ let () =
           | Some _ as timeout -> timeout
           | None -> Some 30
         in
-        let sanitize = resolve_sanitize cli_sanitize in
+        let sanitizer_mode = resolve_sanitizer_mode cli_sanitizer_mode in
         let leak_check = resolve_leak_check cli_leak_check in
         let no_format = resolve_no_format cli_no_format in
         (* Auto-format test files before running *)
@@ -1554,15 +1612,15 @@ let () =
         match paths with
         | [ path ] ->
             exit
-              (Test_runner.run_tests ~profile ~debug ~sanitize ~leak_check ~mode
-                 ~timeout ~jobs ~cache ~repeat path)
+              (Test_runner.run_tests ~profile ~debug ~sanitizer_mode ~leak_check
+                 ~mode ~timeout ~jobs ~cache ~repeat path)
         | [] ->
             prerr_endline "Error: No test path specified";
             exit 1
         | _ ->
             exit
-              (Test_runner.run_tests_paths ~profile ~debug ~sanitize ~leak_check
-                 ~mode ~timeout ~jobs ~cache ~repeat paths))
+              (Test_runner.run_tests_paths ~profile ~debug ~sanitizer_mode
+                 ~leak_check ~mode ~timeout ~jobs ~cache ~repeat paths))
     | "purify" :: rest -> (
         let rec parse_purify_args args dry_run verbose files =
           match args with

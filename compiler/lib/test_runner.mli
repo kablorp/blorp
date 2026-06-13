@@ -16,10 +16,25 @@ type test_result = {
 (** Test mode for --doc / --suite filtering *)
 type test_mode = TestAll | DocOnly | SuiteOnly
 
+type sanitizer_mode =
+  | SanitizerOff
+  | SanitizerAddressUndefined
+  | SanitizerUndefinedOnly
+
+val sanitizer_mode_of_string : string -> sanitizer_mode option
+(** Parse CLI/env sanitizer mode values. *)
+
+val sanitizer_mode_to_string : sanitizer_mode -> string
+(** Stable display/cache string for a sanitizer mode. *)
+
+val sanitizer_enabled : sanitizer_mode -> bool
+(** Whether the mode emits any sanitizer instrumentation. *)
+
 val run_tests :
   ?profile:bool ->
   ?debug:bool ->
   ?sanitize:bool ->
+  ?sanitizer_mode:sanitizer_mode ->
   ?leak_check:bool ->
   ?mode:test_mode ->
   timeout:int option ->
@@ -38,6 +53,7 @@ val run_tests_paths :
   ?profile:bool ->
   ?debug:bool ->
   ?sanitize:bool ->
+  ?sanitizer_mode:sanitizer_mode ->
   ?leak_check:bool ->
   ?mode:test_mode ->
   timeout:int option ->
@@ -80,7 +96,10 @@ val run_compilation_dir : unit -> string
 (** Allocate a per-run directory for one compile/link/run lifecycle. *)
 
 val sanitize_cc_args : string list
-(** Sanitizer compiler flags (list form) *)
+(** AddressSanitizer + UBSan compiler flags (list form). *)
+
+val sanitizer_cc_args : sanitizer_mode -> string list
+(** Compiler flags for the selected sanitizer mode. *)
 
 val cc_is_clang : bool Lazy.t
 (** Whether the system C compiler is Clang (vs GCC). Lazy-evaluated. *)
@@ -216,7 +235,11 @@ type precompiled = {
 (** Precompiled artifacts for fast compilation *)
 
 val precompile_runtime :
-  ?sanitize:bool -> ?opt:string -> unit -> precompiled option
+  ?sanitize:bool ->
+  ?sanitizer_mode:sanitizer_mode ->
+  ?opt:string ->
+  unit ->
+  precompiled option
 (** Precompile runtime.o and header to a persistent content-addressed cache.
     Returns cached artifacts only after verifying their manifest hashes.
     @param opt Optimization level string (default "O0", use "O2" for release) *)

@@ -76,6 +76,11 @@ val load_imports :
 val get_all_modules : ?sess:Session.t -> unit -> loaded_module list
 (** Get all loaded modules in dependency order. *)
 
+val prune_parse_cache_to_loaded_modules : ?sess:Session.t -> unit -> unit
+(** Remove non-stdlib parse-cache entries that are not part of the currently
+    loaded module graph. LSP uses this after rebuilding a document graph so
+    import edits do not leave old user modules resident. *)
+
 val find_cached : ?sess:Session.t -> string -> loaded_module option
 (** Look up a module in the cache by name. *)
 
@@ -105,8 +110,8 @@ val reset : ?sess:Session.t -> unit -> unit
     Prefer [Session.create ()] for full isolation. *)
 
 val full_reset : ?sess:Session.t -> unit -> unit
-(** Full reset including parse cache.
-    Use in the LSP server where source files may have changed since last parse. *)
+(** Full reset including parse cache. Use when reusing a session would be
+    incorrect, or when a caller explicitly wants to release parsed modules. *)
 
 val read_file : string -> string
 (** Read a file's contents. *)

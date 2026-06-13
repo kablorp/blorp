@@ -211,6 +211,7 @@ typedef struct {
     long fiber_resumes;
     long fiber_parks;
     long fiber_schedule_transitions;
+    long cooperative_yields;
     long channel_send_parks;
     long channel_recv_parks;
     long runnable_enqueues;
@@ -518,6 +519,7 @@ typedef struct {
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT 2
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT32 3
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_List;
+typedef void (*blorp_ImmortalizeElementFn)(void*);
 
 typedef enum {
     BLORP_DNS_ERROR_NONE = 0,
@@ -681,7 +683,8 @@ typedef void (*blorp_CancelCleanupFn)(void*);
 
 typedef enum {
     BLORP_CANCEL_CLEANUP_GENERIC = 0,
-    BLORP_CANCEL_CLEANUP_TASK = 1
+    BLORP_CANCEL_CLEANUP_TASK = 1,
+    BLORP_CANCEL_CLEANUP_TASK_WINDOW = 2
 } blorp_CancelCleanupKind;
 
 typedef struct blorp_CancelCleanupFrame {
@@ -694,6 +697,26 @@ typedef struct blorp_CancelCleanupFrame {
 } blorp_CancelCleanupFrame;
 
 typedef struct blorp_Task_s blorp_Task;
+
+typedef enum {
+    BLORP_CONCURRENT_TASK_FLUSH_PERIODIC = 0,
+    BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE = 1
+} blorp_ConcurrentTaskFlushMode;
+
+typedef enum {
+    BLORP_CONCURRENT_TASK_WINDOW_UNINITIALIZED = 0,
+    BLORP_CONCURRENT_TASK_WINDOW_ACTIVE = 1,
+    BLORP_CONCURRENT_TASK_WINDOW_ENDED = 2
+} blorp_ConcurrentTaskWindowState;
+
+typedef struct {
+    blorp_Task** tasks;
+    blorp_CancelCleanupFrame* cleanups;
+    blorp_TaskBatch batch;
+    long capacity;
+    long batch_spawn_count;
+    blorp_ConcurrentTaskWindowState state;
+} blorp_ConcurrentTaskWindow;
 
 typedef struct {
     blorp_Object header;
@@ -893,6 +916,13 @@ extern _Thread_local void* __blorp_current_task;
 
 // ARC / Memory Management
 void* blorp_alloc(size_t size);
+void* blorp_make_immortal_constant(void* obj);
+void blorp_make_immortal_list_constant(blorp_List* list, blorp_ImmortalizeElementFn immortalize_elem);
+void blorp_make_immortal_dict_constant(
+    blorp_Dict* dict,
+    blorp_ImmortalizeElementFn immortalize_key,
+    blorp_ImmortalizeElementFn immortalize_value
+);
 void blorp_move_ref(void* obj);
 void blorp_set_type_tag(void* obj, const char* tag);
 uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);
@@ -1730,20 +1760,29 @@ void blorp_dict_resize_to(blorp_Dict* dict, long new_cap);
 
 // Thread Pool / Concurrency
 void blorp_thread_pool_init(long max_threads);
+void blorp_thread_pool_ensure_initialized(void);
 void blorp_thread_pool_shutdown(void);
 void* blorp_task_spawn(blorp_Closure* func);
 void* blorp_task_spawn_owned(blorp_Closure* func);
 void* blorp_task_spawn_rc(blorp_Closure* func);
 void* blorp_task_spawn_owned_rc(blorp_Closure* func);
-void blorp_task_batch_init(blorp_TaskBatch* batch);
-void blorp_task_batch_flush(blorp_TaskBatch* batch);
-void* blorp_task_spawn_owned_in_batch(
-    blorp_TaskBatch* batch,
-    blorp_Closure* func
+void blorp_concurrent_task_window_begin(
+    blorp_ConcurrentTaskWindow* window,
+    blorp_CancelCleanupFrame* cleanup,
+    long capacity
 );
-void* blorp_task_spawn_owned_rc_in_batch(
-    blorp_TaskBatch* batch,
-    blorp_Closure* func
+void blorp_concurrent_task_window_end(blorp_ConcurrentTaskWindow* window);
+void blorp_concurrent_task_window_spawn_owned(
+    blorp_ConcurrentTaskWindow* window,
+    long slot,
+    blorp_Closure* func,
+    blorp_ConcurrentTaskFlushMode flush_mode
+);
+void blorp_concurrent_task_window_spawn_owned_rc(
+    blorp_ConcurrentTaskWindow* window,
+    long slot,
+    blorp_Closure* func,
+    blorp_ConcurrentTaskFlushMode flush_mode
 );
 void blorp_task_init_result_rc(void* t);
 void blorp_detach(void* fn);
@@ -1751,16 +1790,33 @@ void blorp_detach_rc(void* fn);
 void* blorp_task_join(void* t);
 void* blorp_task_try_join(void* t);
 void* blorp_concurrent_join(void* t, long timeout_ms);
+void* blorp_concurrent_join_cleanup_release(void** task_slot, long timeout_ms);
+void* blorp_concurrent_task_window_join_release(
+    blorp_ConcurrentTaskWindow* window,
+    long slot,
+    long timeout_ms
+);
 long blorp_concurrent_deadline_us(long timeout_ms);
 long blorp_concurrent_remaining_ms(long deadline_us);
 long blorp_concurrent_normalize_limit(long requested);
 void blorp_task_cancel(void* t);
 void blorp_task_cancel_join_release(void* t);
 long blorp_test_cancel_after_parked(blorp_Closure* func);
+long blorp_test_task_window_pending_cleanup_probe(void);
+long blorp_test_task_join_slot_probe(void);
+long blorp_test_fiber_created_schedule_probe(void);
+long blorp_test_timer_waiter_identity_probe(void);
+long blorp_test_wait_ready_to_park_probe(void);
+long blorp_test_fiber_lifecycle_ready_to_park_probe(void);
+long blorp_test_fiber_cancel_before_park_probe(void);
+long blorp_test_current_timer_wait_install_probe(void);
+long blorp_test_timeout_arithmetic_probe(void);
+long blorp_test_cooperative_checkpoint_probe(void);
 long blorp_test_tls_state_probe(void);
 long blorp_test_websocket_state_probe(void);
 void blorp_sleep(long ms);
 void blorp_yield_now(void);
+void blorp_cooperative_checkpoint(void);
 long blorp_max_threads(void);
 
 // Channels
@@ -2063,17 +2119,18 @@ long blorp_now_us(void);
 long blorp_black_box_int(long value);
 double blorp_black_box_float(double value);
 long blorp_time_now(void);
-long blorp_time_to_year(long us);
-long blorp_time_to_month(long us);
-long blorp_time_to_day(long us);
-long blorp_time_to_hour(long us);
-long blorp_time_to_minute(long us);
-long blorp_time_to_second(long us);
-long blorp_time_to_weekday(long us);
+long blorp_time_to_year(long microseconds);
+long blorp_time_to_month(long microseconds);
+long blorp_time_to_day(long microseconds);
+long blorp_time_to_hour(long microseconds);
+long blorp_time_to_minute(long microseconds);
+long blorp_time_to_second(long microseconds);
+long blorp_time_to_weekday(long microseconds);
 long blorp_time_from_parts(long year, long month, long day, long hour, long minute, long second);
-blorp_String* blorp_time_format(long us, const blorp_String* fmt);
+blorp_String* blorp_time_format(long microseconds, const blorp_String* fmt);
 blorp_StackOption_Int blorp_time_parse(const blorp_String* s, const blorp_String* fmt);
 blorp_StackOption_Int blorp_time_from_iso(const blorp_String* s);
+blorp_StackOption_Int blorp_time_parse_rfc3339(const blorp_String* s);
 
 // Tuple / Closure
 blorp_Tuple* blorp_tuple_new(long arity, ...);
@@ -2253,7 +2310,6 @@ void blorp_debug_log_msg(blorp_String* s);
 void blorp_debug_info(blorp_String* s);
 void blorp_debug_warn(blorp_String* s);
 void blorp_debug_error(blorp_String* s);
-void blorp_debug_set_log_level(long level);
 
 // System / Filesystem Ops
 blorp_String* blorp_getcwd(void);
@@ -2339,6 +2395,11 @@ blorp_String* blorp_result_to_string_string_string(void* r);
 void blorp_tuple_destructor(void* obj);
 
 // Signal handling
+long blorp_signal_hangup(void);
+long blorp_signal_interrupt(void);
+long blorp_signal_terminate(void);
+long blorp_signal_user1(void);
+long blorp_signal_user2(void);
 void blorp_signal_on(long signum, blorp_Closure* handler);
 long blorp_signal_received(long signum);
 void blorp_signal_raise(long signum);

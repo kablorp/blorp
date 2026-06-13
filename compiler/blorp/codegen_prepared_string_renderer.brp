@@ -1,0 +1,416 @@
+-- Blorp-authored renderer for prepared string Core nodes.
+--
+-- OCaml still owns Core traversal, child expression emission, and fresh temp
+-- allocation. This module owns only the final C snippet shape for prepared
+-- proof-carrying string byte operations.
+enum CompilerCommand:
+	RenderPreparedStringCommand
+	RenderManifestCommand
+	UnknownCommand
+
+
+enum PreparedStringTemplate:
+	StringFindByteFromTemplate
+	StringByteReadTemplate
+	StringByteWriteTemplate
+	StringByteCopyTemplate
+	StringSetLenTemplate
+
+
+record PreparedStringTemplateInfo {
+	template: PreparedStringTemplate,
+	name: String,
+	arity: Int
+}
+
+
+-- These payloads carry rendered C snippets and temp names. They are records
+-- because Blorp structs cannot contain String fields.
+record FindByteFromArgs {
+	source: String,
+	byte: String,
+	start: String,
+	source_tmp: String,
+	byte_tmp: String,
+	start_tmp: String
+}
+
+
+record ByteCopyArgs {
+	dst: String,
+	dst_pos: String,
+	src: String,
+	src_pos: String,
+	len: String,
+	dst_tmp: String,
+	dst_pos_tmp: String,
+	src_tmp: String,
+	src_pos_tmp: String,
+	len_tmp: String
+}
+
+
+record SetLenArgs {
+	target: String,
+	len: String,
+	target_tmp: String,
+	len_tmp: String
+}
+
+
+union PreparedStringOp:
+	FindByteFrom(FindByteFromArgs)
+	ByteRead(String, String)
+	ByteWrite(String, String, String)
+	ByteCopy(ByteCopyArgs)
+	SetLen(SetLenArgs)
+
+
+union RenderError:
+	WrongArity(PreparedStringTemplateInfo, Int)
+	UnsupportedPreparedStringOp(String)
+
+
+ALL_TEMPLATES: List[PreparedStringTemplateInfo] = [{
+		template = StringFindByteFromTemplate,
+		name = "string_find_byte_from",
+		arity = 6
+	}, {
+		template = StringByteReadTemplate,
+		name = "string_byte_read",
+		arity = 2
+	}, {
+		template = StringByteWriteTemplate,
+		name = "string_byte_write",
+		arity = 3
+	}, {
+		template = StringByteCopyTemplate,
+		name = "string_byte_copy",
+		arity = 10
+	}, {
+		template = StringSetLenTemplate,
+		name = "string_set_len",
+		arity = 4
+	}]
+
+USAGE: String = (
+	"Usage: codegen_prepared_string_renderer prepared-string <name> [rendered-arg..."
+	+ "] | manifest"
+)
+
+private OPEN_BRACE: String = "{"
+
+private CLOSE_BRACE: String = "}"
+
+
+private pure func c_block(body: String) -> String:
+	OPEN_BRACE + " " + body + " " + CLOSE_BRACE
+
+
+private pure func c_statement_expr(body: String) -> String:
+	"(" + c_block(body) + ")"
+
+
+pure func parse_command(command: String) -> CompilerCommand:
+	match command:
+		"prepared-string": RenderPreparedStringCommand
+		"manifest": RenderManifestCommand
+		_: UnknownCommand
+
+
+pure func prepared_string_template_name(info: PreparedStringTemplateInfo) -> String:
+	info.name
+
+
+pure func prepared_string_template_arity(info: PreparedStringTemplateInfo) -> Int:
+	info.arity
+
+
+pure func parse_prepared_string_template(name: String) -> Option[PreparedStringTemplateInfo]:
+	var found: Option[PreparedStringTemplateInfo] = None
+
+	for info in ALL_TEMPLATES:
+		if found.is_none() and info.name == name:
+			found = Some(info)
+
+	found
+
+
+pure func render_error_to_string(error: RenderError) -> String:
+	match error:
+		WrongArity(info, got):
+			"prepared string op ${info.name} expected ${info.arity} arg(s), got ${got}"
+		UnsupportedPreparedStringOp(name): "unsupported prepared string op: ${name}"
+
+
+pure func wrong_arity_for_args(info: PreparedStringTemplateInfo, args: List[String]) -> RenderError:
+	WrongArity(info, args.length())
+
+
+private pure func parse_byte_read_op(args: List[String]) -> Option[PreparedStringOp]:
+	match args:
+		[source, index]: Some(ByteRead(source, index))
+		_: None
+
+
+private pure func parse_find_byte_from_args(args: List[String]) -> Option[FindByteFromArgs]:
+	match args:
+		[source, byte, start, source_tmp, byte_tmp, start_tmp]:
+			Some({
+				source = source,
+				byte = byte,
+				start = start,
+				source_tmp = source_tmp,
+				byte_tmp = byte_tmp,
+				start_tmp = start_tmp,
+			})
+		_: None
+
+
+private pure func parse_byte_write_op(args: List[String]) -> Option[PreparedStringOp]:
+	match args:
+		[target, index, byte]: Some(ByteWrite(target, index, byte))
+		_: None
+
+
+private pure func parse_byte_copy_args(args: List[String]) -> Option[ByteCopyArgs]:
+	match args:
+		[dst, dst_pos, src, src_pos, len, dst_tmp, dst_pos_tmp, src_tmp, src_pos_tmp, len_tmp]:
+			Some({
+				dst = dst,
+				dst_pos = dst_pos,
+				src = src,
+				src_pos = src_pos,
+				len = len,
+				dst_tmp = dst_tmp,
+				dst_pos_tmp = dst_pos_tmp,
+				src_tmp = src_tmp,
+				src_pos_tmp = src_pos_tmp,
+				len_tmp = len_tmp,
+			})
+		_: None
+
+
+private pure func parse_set_len_args(args: List[String]) -> Option[SetLenArgs]:
+	match args:
+		[target, len, target_tmp, len_tmp]:
+			Some({
+				target = target,
+				len = len,
+				target_tmp = target_tmp,
+				len_tmp = len_tmp,
+			})
+		_: None
+
+
+pure func render_string_byte_read(source: String, index: String) -> String:
+	"(long)(unsigned char)((blorp_String*)${source})->data[${index}]"
+
+
+pure func render_string_byte_write(target: String, index: String, byte: String) -> String:
+	"(((blorp_String*)${target})->data[${index}] = (char)${byte})"
+
+
+pure func render_string_find_byte_from(
+	source: String,
+	byte: String,
+	start: String,
+	source_tmp: String,
+	byte_tmp: String,
+	start_tmp: String,
+) -> String:
+	bind_source: String = "blorp_String* ${source_tmp} = (blorp_String*)${source};"
+	bind_byte: String = "long ${byte_tmp} = ${byte};"
+	bind_start: String = "long ${start_tmp} = ${start};"
+	call: String = "blorp_string_find_byte_from(${source_tmp}, ${byte_tmp}, ${start_tmp});"
+	body: String = bind_source + " " + bind_byte + " " + bind_start + " " + call
+	c_statement_expr(body)
+
+
+pure func render_string_byte_copy(
+	dst: String,
+	dst_pos: String,
+	src: String,
+	src_pos: String,
+	len: String,
+	dst_tmp: String,
+	dst_pos_tmp: String,
+	src_tmp: String,
+	src_pos_tmp: String,
+	len_tmp: String,
+) -> String:
+	bind_dst: String = "blorp_String* ${dst_tmp} = (blorp_String*)${dst};"
+	bind_dst_pos: String = "long ${dst_pos_tmp} = ${dst_pos};"
+	bind_src: String = "blorp_String* ${src_tmp} = (blorp_String*)${src};"
+	bind_src_pos: String = "long ${src_pos_tmp} = ${src_pos};"
+	bind_len: String = "long ${len_tmp} = ${len};"
+	copy: String = "if (${len_tmp} > 0) { memcpy(${dst_tmp}->data + ${dst_pos_tmp}, ${src_tmp}->data + ${src_pos_tmp}, (size_t)${len_tmp}); }"
+	body: String = bind_dst + " " + bind_dst_pos + " " + bind_src + " " + bind_src_pos + " " + bind_len + " " + copy + " (void)0;"
+	c_statement_expr(body)
+
+
+pure func render_string_set_len(
+	target: String,
+	len: String,
+	target_tmp: String,
+	len_tmp: String,
+) -> String:
+	body: String = "blorp_String* ${target_tmp} = (blorp_String*)${target}; long ${len_tmp} = ${len}; ${target_tmp}->len = ${len_tmp}; ${target_tmp}->data[${len_tmp}] = '\\0'; (void)0;"
+	c_statement_expr(body)
+
+
+pure func render_prepared_string_op(op: PreparedStringOp) -> String:
+	match op:
+		FindByteFrom(args):
+			render_string_find_byte_from(
+				args.source,
+				args.byte,
+				args.start,
+				args.source_tmp,
+				args.byte_tmp,
+				args.start_tmp,
+			)
+		ByteRead(source, index): render_string_byte_read(source, index)
+		ByteWrite(target, index, byte): render_string_byte_write(target, index, byte)
+		ByteCopy(args):
+			render_string_byte_copy(
+				args.dst,
+				args.dst_pos,
+				args.src,
+				args.src_pos,
+				args.len,
+				args.dst_tmp,
+				args.dst_pos_tmp,
+				args.src_tmp,
+				args.src_pos_tmp,
+				args.len_tmp,
+			)
+		SetLen(args):
+			render_string_set_len(args.target, args.len, args.target_tmp, args.len_tmp)
+
+
+pure func build_prepared_string_op(
+	info: PreparedStringTemplateInfo,
+	args: List[String],
+) -> Result[PreparedStringOp, RenderError]:
+	match info.template:
+		StringFindByteFromTemplate:
+			parsed ?= parse_find_byte_from_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(FindByteFrom(parsed))
+		StringByteReadTemplate:
+			op ?= parse_byte_read_op(args).to_result(wrong_arity_for_args(info, args))
+			Ok(op)
+		StringByteWriteTemplate:
+			op ?= parse_byte_write_op(args).to_result(wrong_arity_for_args(info, args))
+			Ok(op)
+		StringByteCopyTemplate:
+			parsed ?= parse_byte_copy_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(ByteCopy(parsed))
+		StringSetLenTemplate:
+			parsed ?= parse_set_len_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(SetLen(parsed))
+
+
+pure func render_prepared_string(name: String, args: List[String]) -> Result[String, RenderError]:
+	match parse_prepared_string_template(name):
+		Some(info):
+			match build_prepared_string_op(info, args):
+				Ok(op): Ok(render_prepared_string_op(op))
+				Err(error): Err(error)
+		None: Err(UnsupportedPreparedStringOp(name))
+
+
+private PLACEHOLDER_FIND_BYTE_FROM_ARGS: FindByteFromArgs = {
+	source = "@0@",
+	byte = "@1@",
+	start = "@2@",
+	source_tmp = "@3@",
+	byte_tmp = "@4@",
+	start_tmp = "@5@"
+}
+
+private PLACEHOLDER_BYTE_COPY_ARGS: ByteCopyArgs = {
+	dst = "@0@",
+	dst_pos = "@1@",
+	src = "@2@",
+	src_pos = "@3@",
+	len = "@4@",
+	dst_tmp = "@5@",
+	dst_pos_tmp = "@6@",
+	src_tmp = "@7@",
+	src_pos_tmp = "@8@",
+	len_tmp = "@9@"
+}
+
+private PLACEHOLDER_SET_LEN_ARGS: SetLenArgs = {
+	target = "@0@",
+	len = "@1@",
+	target_tmp = "@2@",
+	len_tmp = "@3@"
+}
+
+
+private pure func placeholder_prepared_string_op(
+	info: PreparedStringTemplateInfo,
+) -> PreparedStringOp:
+	match info.template:
+		StringFindByteFromTemplate: FindByteFrom(PLACEHOLDER_FIND_BYTE_FROM_ARGS)
+		StringByteReadTemplate: ByteRead("@0@", "@1@")
+		StringByteWriteTemplate: ByteWrite("@0@", "@1@", "@2@")
+		StringByteCopyTemplate: ByteCopy(PLACEHOLDER_BYTE_COPY_ARGS)
+		StringSetLenTemplate: SetLen(PLACEHOLDER_SET_LEN_ARGS)
+
+
+pure func render_manifest_line(info: PreparedStringTemplateInfo) -> String:
+	name: String = prepared_string_template_name(info)
+	arity: Int = prepared_string_template_arity(info)
+	body: String = render_prepared_string_op(placeholder_prepared_string_op(info))
+	"${name}\t${arity}\t${body}"
+
+
+pure func render_manifest_lines() -> List[String]:
+	ALL_TEMPLATES.map(render_manifest_line)
+
+
+func print_manifest() -> Void:
+	for line in render_manifest_lines():
+		print(line)
+
+
+func print_result(result: Result[String, RenderError]) -> Int:
+	match result:
+		Ok(rendered):
+			puts(rendered)
+			0
+		Err(error):
+			print(render_error_to_string(error))
+			1
+
+
+func main(args: List[String]) -> Int:
+	match args:
+		[program_name, command_name, ...command_args]:
+			match parse_command(command_name):
+				RenderPreparedStringCommand:
+					match command_args:
+						[name, ...rendered_args]: print_result(
+							render_prepared_string(
+								name,
+								rendered_args,
+							),
+						)
+						[]:
+							print(USAGE)
+							1
+				RenderManifestCommand:
+					print_manifest()
+					0
+				UnknownCommand:
+					print(USAGE)
+					1
+		[]:
+			print(USAGE)
+			1
+		[program_name]:
+			print(USAGE)
+			1

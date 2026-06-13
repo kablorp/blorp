@@ -691,6 +691,13 @@ and desc =
   | CFor of loop_binder * core * core  (** [for v: ty in iter { body }] *)
   | CBreak  (** loop exit *)
   | CContinue  (** loop continue *)
+  | CCooperativeCheckpoint
+      (** Compiler-owned cooperative scheduling checkpoint.
+
+          This is not a source-level impure call. It is an implementation
+          boundary for future fairness insertion passes: runtime cancellation
+          is observed here, and the scheduler may yield according to its
+          internal budget. *)
   | CAssign of var * core  (** mutation of a [var]-declared binding *)
   | CTailrecLoop of tailrec_loop
       (** Explicit tail-recursive self-loop. Produced by [Core_tailrec]
@@ -1238,7 +1245,8 @@ let rec map_children (f : core -> core) (e : core) : core =
   in
   let d =
     match e.desc with
-    | CLit _ | CVar _ | CVoid | CBreak | CContinue -> e.desc
+    | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint ->
+        e.desc
     | CTuple xs -> CTuple (List.map f xs)
     | CList lit -> CList { lit with ll_elems = List.map f lit.ll_elems }
     | CListAlloc alloc ->
@@ -1848,6 +1856,7 @@ let rec pp_to_string (e : core) : string =
   | CLit l -> lit_str l
   | CVar v -> Var.to_string v
   | CVoid -> "void"
+  | CCooperativeCheckpoint -> "cooperative-checkpoint"
   | CTuple xs -> Printf.sprintf "(%s)" (pp_list xs)
   | CList lit -> Printf.sprintf "[%s]" (pp_list lit.ll_elems)
   | CListAlloc alloc ->
@@ -2282,16 +2291,17 @@ let pp_to_string_indented (e : core) : string =
     let p = pad i in
     match e.desc with
     (* Leaves and simple expressions: one line, flat *)
-    | CLit _ | CVar _ | CVoid | CBreak | CContinue | CBin _ | CUn _ | CLog _
-    | CCall _ | CTensorRawRead _ | CTensorRawWrite _ | CField _ | CTuple _
-    | CList _ | CListAlloc _ | CListGet _ | CTupleConstruct _ | CListConstruct _
-    | CStringByteRead _ | CStringByteWrite _ | CStringByteCopy _
-    | CStringSetLen _ | CVector _ | CTensorLiteral _ | CDict _
-    | CDictConstruct _ | CSetAlloc _ | CRecord _ | CRecordConstruct _
-    | CRecordUpdate _ | CRange _ | CStringInterp _ | CAssign _ | CConcurrent _
-    | CConcurrentlyLoop _ | CDetach _ | CSelect _ | CCast _ | CUnbox _
-    | CUnboxTyped _ | CBox _ | CBoxTyped _ | CUnionConstruct _
-    | CUnionReuseConstruct _ | CResourceCleanupExit _ | CTailrecRecur _ ->
+    | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint
+    | CBin _ | CUn _ | CLog _ | CCall _ | CTensorRawRead _ | CTensorRawWrite _
+    | CField _ | CTuple _ | CList _ | CListAlloc _ | CListGet _
+    | CTupleConstruct _ | CListConstruct _ | CStringByteRead _
+    | CStringByteWrite _ | CStringByteCopy _ | CStringSetLen _ | CVector _
+    | CTensorLiteral _ | CDict _ | CDictConstruct _ | CSetAlloc _ | CRecord _
+    | CRecordConstruct _ | CRecordUpdate _ | CRange _ | CStringInterp _
+    | CAssign _ | CConcurrent _ | CConcurrentlyLoop _ | CDetach _ | CSelect _
+    | CCast _ | CUnbox _ | CUnboxTyped _ | CBox _ | CBoxTyped _
+    | CUnionConstruct _ | CUnionReuseConstruct _ | CResourceCleanupExit _
+    | CTailrecRecur _ ->
         p ^ pp_to_string e
     | CTailrecLoop (TailrecUnmanagedLoop l) ->
         Printf.sprintf "%stailrec-loop[unmanaged] {\n%s\n%s}" p
@@ -3108,6 +3118,7 @@ module Build = struct
     mk ~loc ~ty:(Ast.TyNamed ("Char", [])) (CLit (Ast.LitChar c))
 
   let void ~loc = mk ~loc ~ty:ty_void CVoid
+  let cooperative_checkpoint ~loc = mk ~loc ~ty:ty_void CCooperativeCheckpoint
   let var ~loc ~ty name = mk ~loc ~ty (CVar (Var.named name))
 
   (* ---- Arithmetic (type = lhs.ty, loc = lhs.loc) ---- *)

@@ -1522,11 +1522,18 @@ let process_record_decl ?(imported = false) (state : check_state)
                     decl.record_name))
           else state
         in
-        let is_valid_struct_field_type ty =
+        let rec is_valid_struct_field_type ?(seen = []) ty =
           Type_metadata.is_struct_scalar_field_type ty
           ||
           match ty with
-          | TyNamed (name, []) -> is_value_record state.env name
+          | TyNamed (name, []) when List.mem name seen -> false
+          | TyNamed (name, []) -> (
+              is_value_record state.env name
+              ||
+              match Env.get_opaque_alias state.env name with
+              | Some ([], target, _) ->
+                  is_valid_struct_field_type ~seen:(name :: seen) target
+              | _ -> false)
           | _ -> false
         in
         List.fold_left

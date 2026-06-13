@@ -22,6 +22,33 @@ let document_text state uri =
   | Some doc -> doc.text
   | None -> Alcotest.fail "expected document to be tracked"
 
+let test_initialize_records_location_link_capabilities () =
+  let state = Lsp_state.create () in
+  let params =
+    Lsp_json.Object
+      [
+        ( "capabilities",
+          Object
+            [
+              ( "textDocument",
+                Object
+                  [
+                    ("definition", Object [ ("linkSupport", Bool true) ]);
+                    ("declaration", Object [ ("linkSupport", Bool true) ]);
+                    ("typeDefinition", Object [ ("linkSupport", Bool true) ]);
+                  ] );
+            ] );
+      ]
+  in
+  let _ = Lsp_server.handle_initialize state params in
+  Alcotest.(check bool)
+    "definition links" true state.client_capabilities.definition_link_support;
+  Alcotest.(check bool)
+    "declaration links" true state.client_capabilities.declaration_link_support;
+  Alcotest.(check bool)
+    "type definition links" true
+    state.client_capabilities.type_definition_link_support
+
 let test_did_change_opens_untracked_document_with_change_text () =
   Test_helpers.with_isolated_env (fun () ->
       let state = Lsp_state.create () in
@@ -41,6 +68,8 @@ let suite =
   [
     ( "handlers",
       [
+        Alcotest.test_case "initialize records location link capabilities"
+          `Quick test_initialize_records_location_link_capabilities;
         Alcotest.test_case
           "didChange opens untracked document with contentChanges text" `Quick
           test_did_change_opens_untracked_document_with_change_text;

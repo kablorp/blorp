@@ -310,7 +310,7 @@ let rec pattern_binds (name : string) (pat : Ast.pattern) : bool =
 let rec count_uses (name : string) (e : core) : int =
   match e.desc with
   | CVar v when v.vname = name -> 1
-  | CLit _ | CVar _ | CVoid | CBreak | CContinue -> 0
+  | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint -> 0
   | CResourceCleanupExit exit ->
       List.fold_left
         (fun acc cleanup -> acc + count_uses name cleanup)
@@ -673,7 +673,8 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
     (e : core) : ownership_uses =
   match e.desc with
   | CVar v when v.vname = name -> consume_ownership_use
-  | CLit _ | CVar _ | CVoid | CBreak | CContinue -> no_ownership_uses
+  | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint ->
+      no_ownership_uses
   | CResourceCleanupExit exit ->
       List.fold_left
         (fun acc cleanup ->
@@ -1381,7 +1382,8 @@ let rec is_linear (e : core) : bool =
      linear for binding-lifetime insertion. *)
   | CLambda _ | CClosureCreate _ | CDetach _ -> true
   (* Leaves: linear *)
-  | CLit _ | CVar _ | CVoid | CBreak | CContinue -> true
+  | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint ->
+      true
   (* Compound: linear iff every child is linear *)
   | _ -> fold_immediate_children (fun acc c -> acc && is_linear c) true e
 
@@ -1589,7 +1591,7 @@ let lambda_has_runtime_captures (env : type_env) (lam : lambda) : bool =
   let rec has_core bound e =
     match e.desc with
     | CVar v -> is_free_name bound v.vname
-    | CLit _ | CVoid | CBreak | CContinue -> false
+    | CLit _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint -> false
     | CLambda nested ->
         let inner_bound = List.fold_left add_var bound nested.lam_params in
         has_core inner_bound nested.lam_body
@@ -2315,7 +2317,9 @@ let rec expr_consumes_var_owner (env : type_env) (name : string) (e : core) :
     | _ -> expr_consumes_var_owner env name arg
   in
   match e.desc with
-  | CVar _ | CLit _ | CVoid | CBreak | CContinue | CClosureCreate _ -> false
+  | CVar _ | CLit _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint
+  | CClosureCreate _ ->
+      false
   | CBin (((Ast.Eq | Ast.Ne) as op), l, r)
     when binop_consumes_collection_args op l r ->
       consuming_arg l || consuming_arg r

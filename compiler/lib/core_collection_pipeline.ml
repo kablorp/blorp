@@ -251,7 +251,7 @@ let rec ctree_has_runtime_free_var bound = function
 and expr_has_runtime_free_var bound e =
   match e.desc with
   | CVar v -> not (StringSet.mem v.vname bound)
-  | CLit _ | CVoid | CBreak | CContinue -> false
+  | CLit _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint -> false
   | CLambda lam ->
       expr_has_runtime_free_var
         (add_typed_vars bound lam.lam_params)

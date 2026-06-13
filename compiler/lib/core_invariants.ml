@@ -29,6 +29,7 @@
     - [check_no_raw_top_level_function_refs] — ENABLED (Final)
     - [check_no_resource_capture_metadata_at] — ENABLED (Closure and Final)
     - [check_concurrent_semantics_at] — ENABLED (Final)
+    - [check_cooperative_checkpoints_at] — ENABLED (Final)
 
     Add new checks only after verifying no false positives across [std/]
     and [tests/]. *)
@@ -1560,6 +1561,58 @@ let check_concurrent_semantics_at (stage : Core_stage.t)
   |> List.rev
 
 (* ============================================================================
+   Final Core: cooperative checkpoints are compiler-owned loop-entry markers
+   ============================================================================ *)
+
+let check_cooperative_checkpoints_at (stage : Core_stage.t)
+    (prog : Core.core_program) : Core_error.t list =
+  let violation e acc =
+    violation_at stage e.Core.loc
+      ~hint:
+        "Core_fairness is the only pass that should create \
+         CCooperativeCheckpoint, and it may appear only as the first \
+         expression in a loop body. Use source-level yield_now() for explicit \
+         user handoff."
+      "cooperative checkpoint reached final Core outside a loop-entry position"
+    :: acc
+  in
+  let rec visit acc (e : Core.core) =
+    match e.desc with
+    | Core.CCooperativeCheckpoint -> violation e acc
+    | Core.CWhile (cond, body) ->
+        let acc = visit acc cond in
+        visit_loop_body acc body
+    | Core.CFor (_, iter, body) ->
+        let acc = visit acc iter in
+        visit_loop_body acc body
+    | Core.CTailrecLoop (Core.TailrecUnmanagedLoop loop) ->
+        visit_loop_body acc loop.tul_body
+    | Core.CTailrecLoop (Core.TailrecListSpreadLoop loop) ->
+        visit_loop_body acc loop.tls_body
+    | _ -> Core.fold_immediate_children visit acc e
+  and visit_loop_body acc (body : Core.core) =
+    match body.desc with
+    | Core.CCooperativeCheckpoint -> acc
+    | Core.CSeq ({ desc = Core.CCooperativeCheckpoint; _ }, rest) ->
+        visit acc rest
+    | _ -> visit acc body
+  in
+  let visit_func acc (f : Core.core_func) =
+    match f.cf_body with Some body -> visit acc body | None -> acc
+  in
+  let rec visit_decl acc (d : Core.core_decl) =
+    match d.cd_desc with
+    | Core.CDFunc f -> visit_func acc f
+    | Core.CDVar v -> visit acc v.cv_init
+    | Core.CDImpl i -> List.fold_left visit_func acc i.ci_methods
+    | Core.CDPrivate inner -> visit_decl acc inner
+    | Core.CDTrait _ | Core.CDType _ | Core.CDRecord _ | Core.CDImport _
+    | Core.CDTypeAlias _ ->
+        acc
+  in
+  List.fold_left visit_decl [] prog |> List.rev
+
+(* ============================================================================
    Post-specialize: raw tensor views are scoped, typed, and kind-consistent
    ============================================================================ *)
 
@@ -2140,6 +2193,7 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_resource_scope_nonlocal_exits_at stage prog
       @ check_resource_cleanup_exits_at stage prog
       @ check_concurrent_semantics_at stage prog
+      @ check_cooperative_checkpoints_at stage prog
   (* No invariants drafted for these stages yet: *)
   | Core_stage.Lower | Core_stage.Synth | Core_stage.TraitResolve
   | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec

@@ -81,18 +81,12 @@ let hover_for_alias_symbol name ~type_params ~target =
     (Printf.sprintf "```blorp\nalias %s%s = %s\n```" name params_str
        (Types.type_to_string target))
 
-let hover_info_for_symbol name expr (symbol : Env.symbol) =
+let hover_info_for_type_like_symbol name (symbol : Env.symbol) =
   match symbol.kind with
-  | Env.FuncSymbol { func_type; purity; _ } ->
-      hover_for_func_symbol name expr ~func_type ~purity
-  | Env.VarSymbol { var_type; source_type; mutability; _ } ->
-      hover_for_var_symbol name expr ~var_type ~source_type ~mutability
   | Env.TypeSymbol { type_params; variants; _ } ->
       hover_for_type_symbol name ~type_params ~variants
   | Env.RecordSymbol { type_params; fields; is_value; _ } ->
       hover_for_record_symbol name ~type_params ~fields ~is_value
-  | Env.ConstructorSymbol { parent_type; field_types; _ } ->
-      hover_for_constructor_symbol name ~parent_type ~field_types
   | Env.AliasSymbol { type_params; target } ->
       hover_for_alias_symbol name ~type_params ~target
   | Env.OpaqueAliasSymbol { type_params; target; _ } ->
@@ -101,6 +95,20 @@ let hover_info_for_symbol name expr (symbol : Env.symbol) =
         (hover_code
            (Printf.sprintf "opaque type %s%s = %s" name params_str
               (Types.type_to_string target)))
+  | Env.FuncSymbol _ | Env.VarSymbol _ | Env.ConstructorSymbol _ -> None
+
+let hover_info_for_symbol name expr (symbol : Env.symbol) =
+  match symbol.kind with
+  | Env.FuncSymbol { func_type; purity; _ } ->
+      hover_for_func_symbol name expr ~func_type ~purity
+  | Env.VarSymbol { var_type; source_type; mutability; _ } ->
+      hover_for_var_symbol name expr ~var_type ~source_type ~mutability
+  | Env.TypeSymbol _ | Env.RecordSymbol _ ->
+      hover_info_for_type_like_symbol name symbol
+  | Env.ConstructorSymbol { parent_type; field_types; _ } ->
+      hover_for_constructor_symbol name ~parent_type ~field_types
+  | Env.AliasSymbol _ | Env.OpaqueAliasSymbol _ ->
+      hover_info_for_type_like_symbol name symbol
 
 (** Get hover info for an expression using the environment *)
 let hover_info_for_expr (env : Env.env) (e : expr) : string option =
@@ -188,6 +196,23 @@ let hover_info_for_typed_record (record : Typed_ast.record_decl) =
   Some
     (hover_code ~details
        (Printf.sprintf "%s %s%s {%s}" keyword ast.record_name params_str fields))
+
+let hover_info_for_typed_record_field (field : Typed_ast.record_field_info) =
+  let details =
+    detail_if_different
+      ~label:(field.field_name ^ " canonical type")
+      ~source:field.source_field_ty ~semantic:field.semantic_field_ty
+  in
+  Some
+    (hover_code ~details
+       (Printf.sprintf "%s: %s" field.field_name
+          (type_to_string field.source_field_ty)))
+
+let hover_info_for_record_field_assignment ~(name : string)
+    ~(field_type : Ast.type_expr) =
+  Some (hover_code (Printf.sprintf "%s: %s" name (type_to_string field_type)))
+
+let hover_info_for_type_param ~(label : string) = Some (hover_code label)
 
 let hover_info_for_typed_type_alias (alias : Typed_ast.type_alias_decl) =
   let ast = Typed_ast.type_alias_ast alias in

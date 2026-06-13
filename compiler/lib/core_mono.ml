@@ -1358,7 +1358,8 @@ let scan_and_rewrite ?(initial_scope = StringSet.empty) (state : mono_state)
     in
     let desc =
       match e.desc with
-      | CLit _ | CVar _ | CVoid | CBreak | CContinue -> e.desc
+      | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint ->
+          e.desc
       | CResourceCleanupExit exit ->
           CResourceCleanupExit
             {
@@ -1881,7 +1882,9 @@ let check_unrewritten_generic_calls (state : mono_state) (prog : core_program) :
         scan_expr scope value.bsv_box.box_value
       in
       match e.desc with
-      | CLit _ | CVar _ | CVoid | CBreak | CContinue | CClosureCreate _ -> ()
+      | CLit _ | CVar _ | CVoid | CBreak | CContinue | CCooperativeCheckpoint
+      | CClosureCreate _ ->
+          ()
       | CResourceCleanupExit exit ->
           List.iter (scan_expr scope) exit.rce_cleanups
       | CTuple xs | CVector xs -> List.iter (scan_expr scope) xs

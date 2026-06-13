@@ -65,6 +65,10 @@
 #define BLORP_PROCESS_DEFAULT_TIMEOUT_MS (30L * 1000L)
 #define BLORP_PROCESS_KILL_GRACE_MS 100L
 #define BLORP_PROCESS_DEFAULT_MAX_OUTPUT_BYTES (16L * 1024L * 1024L)
+#define BLORP_NSEC_PER_MSEC 1000000ULL
+#define BLORP_NSEC_PER_SEC 1000000000ULL
+#define BLORP_USEC_PER_MSEC 1000ULL
+#define BLORP_COOPERATIVE_CHECKPOINT_INTERVAL 64L
 
 // ============================================================================
 // SIMD Platform Detection and Abstractions
@@ -378,6 +382,7 @@ typedef struct {
     long fiber_resumes;
     long fiber_parks;
     long fiber_schedule_transitions;
+    long cooperative_yields;
     long channel_send_parks;
     long channel_recv_parks;
     long runnable_enqueues;
@@ -485,6 +490,7 @@ typedef struct blorp_IoWaiter {
 typedef struct {
     blorp_IoWaiter* head;
     blorp_IoWaiter* tail;
+    long count;
 } blorp_IoWaiterList;
 
 typedef struct {
@@ -748,6 +754,7 @@ static struct {
     _Atomic long fiber_resumes;
     _Atomic long fiber_parks;
     _Atomic long fiber_schedule_transitions;
+    _Atomic long cooperative_yields;
     _Atomic long channel_send_parks;
     _Atomic long channel_recv_parks;
     _Atomic long runnable_enqueues;
@@ -2207,6 +2214,7 @@ typedef struct { blorp_Object header; long len; long capacity; char data[]; } bl
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT 2
 #define BLORP_VECTOR_CALLBACK_BOXED_FLOAT32 3
 typedef struct { blorp_Object header; long len; long capacity; void (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char __pad[5]; void* data[]; } blorp_List;
+typedef void (*blorp_ImmortalizeElementFn)(void*);
 void* blorp_list_get(blorp_List* list, long index);
 
 // Memory statistics — struct defined above (before SIMD section)
@@ -2506,6 +2514,15 @@ static long blorp_io_deadline_queue_count(void);
 static uint64_t blorp_io_deadline_queue_drain(void);
 static void blorp_io_deadline_queue_clear(void);
 static int blorp_io_reactor_unregister_fd_generation(int fd, uint64_t generation);
+static uint64_t blorp_monotonic_now_ns(void);
+static uint64_t blorp_timeout_ms_to_ns_saturated(long timeout_ms);
+static uint64_t blorp_deadline_ns_from_start_ms(
+    uint64_t start_ns,
+    long timeout_ms
+);
+static uint64_t blorp_deadline_ns_from_now_ms(long timeout_ms);
+static struct timespec blorp_realtime_after_ns(uint64_t delta_ns);
+static struct timespec blorp_realtime_deadline_from_now_ms(long timeout_ms);
 static inline int __blorp_is_cancelled(void);
 static int __blorp_cancel_current_task_if_requested(void);
 static int blorp_io_reactor_register_owner(
@@ -2530,7 +2547,8 @@ typedef void (*blorp_CancelCleanupFn)(void*);
 
 typedef enum {
     BLORP_CANCEL_CLEANUP_GENERIC = 0,
-    BLORP_CANCEL_CLEANUP_TASK = 1
+    BLORP_CANCEL_CLEANUP_TASK = 1,
+    BLORP_CANCEL_CLEANUP_TASK_WINDOW = 2
 } blorp_CancelCleanupKind;
 
 typedef struct blorp_CancelCleanupFrame {
@@ -2657,7 +2675,7 @@ static void blorp_io_waiter_release(blorp_IoWaiter* waiter) {
 }
 
 static blorp_IoWaiterList blorp_io_waiter_list_empty(void) {
-    return (blorp_IoWaiterList){ .head = NULL, .tail = NULL };
+    return (blorp_IoWaiterList){ .head = NULL, .tail = NULL, .count = 0 };
 }
 
 static void blorp_io_waiter_list_push(
@@ -2665,6 +2683,10 @@ static void blorp_io_waiter_list_push(
     blorp_IoWaiter* waiter
 ) {
     if (!list || !waiter) return;
+    // Ready lists cross from the reactor/deadline path back to the parked
+    // fiber. Hold a list reference so the fiber cannot free the waiter while
+    // the reactor is still counting or walking the ready list.
+    blorp_io_waiter_retain(waiter);
     waiter->next = NULL;
     if (list->tail) {
         list->tail->next = waiter;
@@ -2672,6 +2694,7 @@ static void blorp_io_waiter_list_push(
         list->head = waiter;
     }
     list->tail = waiter;
+    list->count++;
 }
 
 static void blorp_io_waiter_list_append(
@@ -2685,17 +2708,15 @@ static void blorp_io_waiter_list_append(
         list->head = extra->head;
     }
     list->tail = extra->tail;
+    list->count += extra->count;
     extra->head = NULL;
     extra->tail = NULL;
+    extra->count = 0;
 }
 
 static long blorp_io_waiter_list_count(const blorp_IoWaiterList* list) {
-    long count = 0;
     if (!list) return 0;
-    for (blorp_IoWaiter* waiter = list->head; waiter; waiter = waiter->next) {
-        count++;
-    }
-    return count;
+    return list->count;
 }
 
 static blorp_IoWaiter** blorp_tcp_inner_waiter_slot(
@@ -2743,6 +2764,7 @@ static blorp_IoInstallWaiterResult blorp_tcp_inner_install_waiter(
         return BLORP_IO_INSTALL_WAITER_BUSY;
     }
     *slot = waiter;
+    blorp_io_waiter_retain(waiter);
     waiter->installed = true;
     waiter->installed_owner = blorp_io_wait_owner_tcp(inner);
     waiter->next = NULL;
@@ -2767,6 +2789,7 @@ static int blorp_tcp_inner_remove_waiter(
     waiter->next = NULL;
     pthread_mutex_unlock(&inner->mutex);
     blorp_io_deadline_queue_remove(waiter);
+    blorp_io_waiter_release(waiter);
     return 1;
 }
 
@@ -2837,6 +2860,7 @@ static void blorp_tcp_inner_extract_waiter_slot_locked(
     if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
     blorp_io_deadline_queue_remove(waiter);
     blorp_io_waiter_list_push(waiters, waiter);
+    blorp_io_waiter_release(waiter);
 }
 
 static blorp_IoWaiterList blorp_tcp_inner_extract_waiters_locked(
@@ -3990,13 +4014,7 @@ static void blorp_io_reactor_deadline_from_now(
     long timeout_ms,
     struct timespec* out
 ) {
-    clock_gettime(CLOCK_REALTIME, out);
-    out->tv_sec += timeout_ms / 1000;
-    out->tv_nsec += (timeout_ms % 1000) * 1000000L;
-    if (out->tv_nsec >= 1000000000L) {
-        out->tv_sec++;
-        out->tv_nsec -= 1000000000L;
-    }
+    *out = blorp_realtime_deadline_from_now_ms(timeout_ms);
 }
 
 static int blorp_io_reactor_wait_ready(
@@ -4094,6 +4112,18 @@ cleanup:
 
 // Sentinel refcount for immortal singleton objects (nullary constructors like None)
 #define BLORP_IMMORTAL_REFCOUNT LONG_MAX
+
+void* blorp_make_immortal_constant(void* obj) {
+    if (!obj) return NULL;
+    blorp_Object* header = (blorp_Object*)obj;
+#ifdef BLORP_SINGLE_THREADED
+    header->refcount = BLORP_IMMORTAL_REFCOUNT;
+#else
+    atomic_store_explicit(&header->refcount, BLORP_IMMORTAL_REFCOUNT, memory_order_relaxed);
+#endif
+    blorp_untrack_allocated_object(obj);
+    return obj;
+}
 
 // Slow path for release — called when refcount reaches zero.
 // Separated so the fast path (decrement + check) can be inlined.
@@ -4256,6 +4286,15 @@ void blorp_list_set_elem_release(blorp_List* list, void (*release_fn)(void*)) {
 void blorp_list_init_elem_release(blorp_List* list, void (*release_fn)(void*)) {
     if (!list || list->storage_mode != BLORP_LIST_STORAGE_POINTER || list->elem_release) return;  // already set or null list
     list->elem_release = release_fn;
+}
+
+void blorp_make_immortal_list_constant(blorp_List* list, blorp_ImmortalizeElementFn immortalize_elem) {
+    if (!list) return;
+    blorp_make_immortal_constant(list);
+    if (!immortalize_elem || list->storage_mode != BLORP_LIST_STORAGE_POINTER) return;
+    for (long i = 0; i < list->len; i++) {
+        if (list->data[i]) immortalize_elem(list->data[i]);
+    }
 }
 
 // Vector destructor — releases elements if elem_release is set
@@ -12951,7 +12990,7 @@ blorp_Result* blorp_tcp_local_port_stream(blorp_TcpStream* stream) {
 }
 
 static bool blorp_tcp_timeout_ms_is_valid(long ms) {
-    return ms >= 0 && (uint64_t)ms <= UINT64_MAX / 1000000ULL;
+    return ms >= 0 && blorp_timeout_ms_to_ns_saturated(ms) != UINT64_MAX;
 }
 
 static blorp_Result* blorp_tcp_set_timeout_inner(
@@ -18583,6 +18622,7 @@ static blorp_IoInstallWaiterResult blorp_udp_socket_install_waiter(
         return BLORP_IO_INSTALL_WAITER_BUSY;
     }
     *slot = waiter;
+    blorp_io_waiter_retain(waiter);
     waiter->installed = true;
     waiter->installed_owner = blorp_io_wait_owner_udp(socket);
     waiter->next = NULL;
@@ -18608,6 +18648,7 @@ static int blorp_udp_socket_remove_waiter(
     waiter->next = NULL;
     pthread_mutex_unlock(&socket->mutex);
     blorp_io_deadline_queue_remove(waiter);
+    blorp_io_waiter_release(waiter);
     return 1;
 }
 
@@ -18625,6 +18666,7 @@ static void blorp_udp_socket_extract_waiter_slot_locked(
     if (reason == BLORP_IO_WAKE_CANCELLED) waiter->cancelled = true;
     blorp_io_deadline_queue_remove(waiter);
     blorp_io_waiter_list_push(waiters, waiter);
+    blorp_io_waiter_release(waiter);
 }
 
 static blorp_IoWaiterList blorp_udp_socket_extract_waiter(
@@ -19757,6 +19799,26 @@ static void blorp_dict_destroy(void* obj) {
     free(dict->order_index);
 }
 
+void blorp_make_immortal_dict_constant(
+    blorp_Dict* dict,
+    blorp_ImmortalizeElementFn immortalize_key,
+    blorp_ImmortalizeElementFn immortalize_value
+) {
+    if (!dict) return;
+    blorp_make_immortal_constant(dict);
+    if (!immortalize_key && !immortalize_value) return;
+    for (long i = 0; i < dict->order_len; i++) {
+        long slot = dict->order[i];
+        if (slot < 0) continue;
+        if (immortalize_key && dict->keys[slot]) {
+            immortalize_key(dict->keys[slot]);
+        }
+        if (immortalize_value && dict->values[slot]) {
+            immortalize_value(dict->values[slot]);
+        }
+    }
+}
+
 blorp_Dict* blorp_dict_new(void) {
     long initial_capacity = 16;
     blorp_Dict* dict = (blorp_Dict*)blorp_alloc(sizeof(blorp_Dict));
@@ -20775,6 +20837,8 @@ typedef struct blorp_Closure_s {
     unsigned long env_release_mask;
 } blorp_Closure;
 
+blorp_Closure* blorp_closure_new(void* func, void* env);
+
 // Helper: call a closure with one argument
 static inline void* blorp_call1(blorp_Closure* closure, void* arg) {
     typedef void* (*fn1_t)(void*, void*);
@@ -20811,23 +20875,686 @@ static inline void* blorp_call4(blorp_Closure* closure, void* arg1, void* arg2, 
 
 // --- Virtual Threads: types and globals (before worker for visibility) ---
 
-typedef struct blorp_Fiber {
+typedef enum {
+    BLORP_CHANNEL_WAIT_NONE = 0,
+    BLORP_CHANNEL_WAIT_SEND = 1,
+    BLORP_CHANNEL_WAIT_RECV = 2
+} blorp_ChannelWaitKind;
+
+typedef enum {
+    BLORP_CHANNEL_WAKE_PENDING = 0,
+    BLORP_CHANNEL_WAKE_READY = 1,
+    BLORP_CHANNEL_WAKE_TIMED_OUT = 2
+} blorp_ChannelWakeReason;
+
+typedef enum blorp_FiberState {
+    BLORP_FIBER_FREE = 0,
+    BLORP_FIBER_CREATED = 1,
+    BLORP_FIBER_QUEUED = 2,
+    BLORP_FIBER_DISPATCHED = 3,
+    BLORP_FIBER_RUNNING = 4,
+    BLORP_FIBER_READY_TO_PARK = 5,
+    BLORP_FIBER_PARKED = 6,
+    BLORP_FIBER_COMPLETED = 7
+} blorp_FiberState;
+
+typedef enum blorp_FiberWakeCause {
+    BLORP_WAKE_READY = 0,
+    BLORP_WAKE_TIMEOUT = 1,
+    BLORP_WAKE_CANCELLED = 2,
+    BLORP_WAKE_CLOSED = 3,
+    BLORP_WAKE_SEALED = 4
+} blorp_FiberWakeCause;
+
+typedef enum blorp_FiberWaitOwnerKind {
+    BLORP_WAIT_OWNER_NONE = 0,
+    BLORP_WAIT_OWNER_SLEEP = 1,
+    BLORP_WAIT_OWNER_TASK_JOIN = 2,
+    BLORP_WAIT_OWNER_CHANNEL_SEND = 3,
+    BLORP_WAIT_OWNER_CHANNEL_RECV = 4,
+    BLORP_WAIT_OWNER_SELECT = 5,
+    BLORP_WAIT_OWNER_IO = 6
+} blorp_FiberWaitOwnerKind;
+
+typedef struct blorp_Fiber blorp_Fiber;
+
+typedef struct blorp_FiberWaitOperation {
+    blorp_Fiber* fiber;
+    blorp_FiberWaitOwnerKind owner;
+    uint64_t id;
+} blorp_FiberWaitOperation;
+
+typedef struct blorp_TimerWaiter {
+    blorp_Fiber* fiber;
+    blorp_FiberWaitOperation wait;
+    uint64_t deadline_ns;
+    long heap_index;
+    blorp_FiberWakeCause wake_cause;
+} blorp_TimerWaiter;
+
+struct blorp_Fiber {
     mco_coro* coro;              // minicoro coroutine
     struct blorp_Fiber* run_next;  // run queues, protected by that queue's lock
-    struct blorp_Fiber* wait_next; // channel wait queues, protected by ch->mutex
     struct blorp_Fiber* pool_next; // dead fiber object cache
-    struct blorp_Fiber* timer_drain_next; // transient expired-timer drain batch
     void* wake_data;             // result pointer for join wakeups
-    uint64_t wake_time_ns;       // for timer queue (CLOCK_MONOTONIC)
-    long timer_index;            // index in timer heap, -1 when not queued
+    blorp_TimerWaiter timer_waiter; // stable timer entry for the current wait
     int parked;                  // 1 = parked, 0 = runnable (CAS-guarded)
     int queued;                  // 1 while present in the runnable queue
     int running;                 // 1 while a worker is inside mco_resume
     int wake_pending;            // waker arrived before the running fiber yielded
-} blorp_Fiber;
+    int state_lock;              // guards running/wake_pending handoff
+    _Atomic int lifecycle_state; // blorp_FiberState, transitional source of truth
+    _Atomic int wake_cause;      // blorp_FiberWakeCause, last dynamic wake source
+    _Atomic int wait_owner_kind; // blorp_FiberWaitOwnerKind, current park owner
+    _Atomic uint64_t wait_operation_id; // unique id for the current wait operation
+    int owner_worker_id;         // carrier queue this fiber must resume on
+    blorp_ChannelWaitKind channel_wait_kind;
+    blorp_ChannelWakeReason channel_wake_reason;
+    uint64_t channel_wait_deadline_ns; // 0 means this channel wait has no timeout
+};
 
 static _Thread_local blorp_Fiber* __blorp_current_fiber = NULL;
 _Thread_local void* __blorp_current_task = NULL;  // current blorp_Task* (for cancellation checks)
+static _Thread_local long __blorp_cooperative_checkpoint_budget =
+    BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
+void blorp_cooperative_checkpoint(void);
+static _Atomic int __blorp_scheduler_debug_cache = -1;
+static _Atomic uint64_t __blorp_next_wait_operation_id = 1;
+
+static bool blorp_scheduler_debug_enabled(void) {
+    int cached =
+        atomic_load_explicit(&__blorp_scheduler_debug_cache, memory_order_acquire);
+    if (cached >= 0) return cached != 0;
+
+    const char* env = getenv("BLORP_SCHEDULER_DEBUG");
+    int enabled =
+        env && env[0] != '\0' &&
+        strcmp(env, "0") != 0 &&
+        strcmp(env, "false") != 0 &&
+        strcmp(env, "False") != 0 &&
+        strcmp(env, "FALSE") != 0 &&
+        strcmp(env, "off") != 0 &&
+        strcmp(env, "OFF") != 0;
+
+    int expected = -1;
+    atomic_compare_exchange_strong_explicit(
+        &__blorp_scheduler_debug_cache,
+        &expected,
+        enabled,
+        memory_order_acq_rel,
+        memory_order_acquire);
+    return atomic_load_explicit(
+               &__blorp_scheduler_debug_cache, memory_order_acquire) != 0;
+}
+
+static const char* blorp_channel_wait_kind_debug_name(
+    blorp_ChannelWaitKind kind
+) {
+    switch (kind) {
+        case BLORP_CHANNEL_WAIT_NONE:
+            return "none";
+        case BLORP_CHANNEL_WAIT_SEND:
+            return "send";
+        case BLORP_CHANNEL_WAIT_RECV:
+            return "recv";
+        default:
+            return "unknown";
+    }
+}
+
+static const char* blorp_channel_wake_reason_debug_name(
+    blorp_ChannelWakeReason reason
+) {
+    switch (reason) {
+        case BLORP_CHANNEL_WAKE_PENDING:
+            return "pending";
+        case BLORP_CHANNEL_WAKE_READY:
+            return "ready";
+        case BLORP_CHANNEL_WAKE_TIMED_OUT:
+            return "timed_out";
+        default:
+            return "unknown";
+    }
+}
+
+static const char* blorp_mco_status_debug_name(mco_state status) {
+    switch (status) {
+        case MCO_DEAD:
+            return "dead";
+        case MCO_NORMAL:
+            return "normal";
+        case MCO_RUNNING:
+            return "running";
+        case MCO_SUSPENDED:
+            return "suspended";
+        default:
+            return "unknown";
+    }
+}
+
+static const char* blorp_fiber_state_debug_name(blorp_FiberState state) {
+    switch (state) {
+        case BLORP_FIBER_FREE:
+            return "free";
+        case BLORP_FIBER_CREATED:
+            return "created";
+        case BLORP_FIBER_QUEUED:
+            return "queued";
+        case BLORP_FIBER_DISPATCHED:
+            return "dispatched";
+        case BLORP_FIBER_RUNNING:
+            return "running";
+        case BLORP_FIBER_READY_TO_PARK:
+            return "ready_to_park";
+        case BLORP_FIBER_PARKED:
+            return "parked";
+        case BLORP_FIBER_COMPLETED:
+            return "completed";
+        default:
+            return "unknown";
+    }
+}
+
+static const char* blorp_fiber_wake_cause_debug_name(
+    blorp_FiberWakeCause cause
+) {
+    switch (cause) {
+        case BLORP_WAKE_READY:
+            return "ready";
+        case BLORP_WAKE_TIMEOUT:
+            return "timeout";
+        case BLORP_WAKE_CANCELLED:
+            return "cancelled";
+        case BLORP_WAKE_CLOSED:
+            return "closed";
+        case BLORP_WAKE_SEALED:
+            return "sealed";
+        default:
+            return "unknown";
+    }
+}
+
+static const char* blorp_fiber_wait_owner_debug_name(
+    blorp_FiberWaitOwnerKind kind
+) {
+    switch (kind) {
+        case BLORP_WAIT_OWNER_NONE:
+            return "none";
+        case BLORP_WAIT_OWNER_SLEEP:
+            return "sleep";
+        case BLORP_WAIT_OWNER_TASK_JOIN:
+            return "task_join";
+        case BLORP_WAIT_OWNER_CHANNEL_SEND:
+            return "channel_send";
+        case BLORP_WAIT_OWNER_CHANNEL_RECV:
+            return "channel_recv";
+        case BLORP_WAIT_OWNER_SELECT:
+            return "select";
+        case BLORP_WAIT_OWNER_IO:
+            return "io";
+        default:
+            return "unknown";
+    }
+}
+
+static blorp_FiberState blorp_fiber_current_state(blorp_Fiber* f) {
+    if (!f) return BLORP_FIBER_FREE;
+    return (blorp_FiberState)atomic_load_explicit(
+        &f->lifecycle_state, memory_order_acquire);
+}
+
+static blorp_FiberWakeCause blorp_fiber_current_wake_cause(blorp_Fiber* f) {
+    if (!f) return BLORP_WAKE_READY;
+    return (blorp_FiberWakeCause)atomic_load_explicit(
+        &f->wake_cause, memory_order_acquire);
+}
+
+static blorp_FiberWaitOwnerKind blorp_fiber_current_wait_owner(
+    blorp_Fiber* f
+) {
+    if (!f) return BLORP_WAIT_OWNER_NONE;
+    return (blorp_FiberWaitOwnerKind)atomic_load_explicit(
+        &f->wait_owner_kind, memory_order_acquire);
+}
+
+static uint64_t blorp_fiber_current_wait_operation_id(blorp_Fiber* f) {
+    if (!f) return 0;
+    return atomic_load_explicit(
+        &f->wait_operation_id, memory_order_acquire);
+}
+
+static uint64_t blorp_fiber_current_timer_wait_operation_id(blorp_Fiber* f) {
+    if (!f) return 0;
+    return f->timer_waiter.wait.id;
+}
+
+static void blorp_fiber_debug_snapshot(
+    char* buf,
+    size_t len,
+    blorp_Fiber* f
+) {
+    if (!buf || len == 0) return;
+    if (!f) {
+        snprintf(buf, len, "fiber=(null)");
+        return;
+    }
+
+    int parked = __atomic_load_n(&f->parked, __ATOMIC_ACQUIRE);
+    int queued = __atomic_load_n(&f->queued, __ATOMIC_ACQUIRE);
+    int running = __atomic_load_n(&f->running, __ATOMIC_ACQUIRE);
+    int wake_pending =
+        __atomic_load_n(&f->wake_pending, __ATOMIC_ACQUIRE);
+    mco_state status = f->coro ? mco_status(f->coro) : MCO_DEAD;
+    blorp_FiberState lifecycle_state = blorp_fiber_current_state(f);
+    blorp_FiberWakeCause wake_cause = blorp_fiber_current_wake_cause(f);
+    blorp_FiberWaitOwnerKind wait_owner =
+        blorp_fiber_current_wait_owner(f);
+    uint64_t wait_operation_id =
+        blorp_fiber_current_wait_operation_id(f);
+    uint64_t timer_wait_operation_id =
+        blorp_fiber_current_timer_wait_operation_id(f);
+
+    snprintf(
+        buf,
+        len,
+        "fiber=%p lifecycle_state=%s coro_status=%s parked=%d queued=%d running=%d "
+        "wake_pending=%d wake_cause=%s wait_owner=%s owner_worker_id=%d "
+        "wait_operation_id=%llu timer_wait_operation_id=%llu "
+        "timer_heap_index=%ld timer_deadline_ns=%llu "
+        "channel_wait=%s channel_wake=%s task=%p",
+        (void*)f,
+        blorp_fiber_state_debug_name(lifecycle_state),
+        blorp_mco_status_debug_name(status),
+        parked,
+        queued,
+        running,
+        wake_pending,
+        blorp_fiber_wake_cause_debug_name(wake_cause),
+        blorp_fiber_wait_owner_debug_name(wait_owner),
+        f->owner_worker_id,
+        (unsigned long long)wait_operation_id,
+        (unsigned long long)timer_wait_operation_id,
+        f->timer_waiter.heap_index,
+        (unsigned long long)f->timer_waiter.deadline_ns,
+        blorp_channel_wait_kind_debug_name(f->channel_wait_kind),
+        blorp_channel_wake_reason_debug_name(f->channel_wake_reason),
+        f->coro ? mco_get_user_data(f->coro) : NULL);
+}
+
+static void blorp_scheduler_debug_abort_fiber(
+    const char* where,
+    const char* reason,
+    blorp_Fiber* f
+) {
+    char snapshot[1024];
+    blorp_fiber_debug_snapshot(snapshot, sizeof(snapshot), f);
+    fprintf(
+        stderr,
+        "\nblorp: scheduler debug invariant failed at %s: %s\n  %s\n",
+        where ? where : "(unknown)",
+        reason ? reason : "(unknown)",
+        snapshot);
+    abort();
+}
+
+static bool blorp_fiber_state_transition_allowed(
+    blorp_FiberState from,
+    blorp_FiberState to
+) {
+    if (from == to) return true;
+    switch (from) {
+        case BLORP_FIBER_FREE:
+            return to == BLORP_FIBER_CREATED || to == BLORP_FIBER_FREE;
+        case BLORP_FIBER_CREATED:
+            return to == BLORP_FIBER_QUEUED || to == BLORP_FIBER_FREE;
+        case BLORP_FIBER_QUEUED:
+            return to == BLORP_FIBER_DISPATCHED || to == BLORP_FIBER_FREE;
+        case BLORP_FIBER_DISPATCHED:
+            return to == BLORP_FIBER_RUNNING || to == BLORP_FIBER_FREE;
+        case BLORP_FIBER_RUNNING:
+            return to == BLORP_FIBER_READY_TO_PARK ||
+                   to == BLORP_FIBER_QUEUED ||
+                   to == BLORP_FIBER_COMPLETED ||
+                   to == BLORP_FIBER_FREE;
+        case BLORP_FIBER_READY_TO_PARK:
+            return to == BLORP_FIBER_RUNNING ||
+                   to == BLORP_FIBER_PARKED ||
+                   to == BLORP_FIBER_QUEUED ||
+                   to == BLORP_FIBER_FREE;
+        case BLORP_FIBER_PARKED:
+            return to == BLORP_FIBER_QUEUED || to == BLORP_FIBER_FREE;
+        case BLORP_FIBER_COMPLETED:
+            return to == BLORP_FIBER_FREE;
+        default:
+            return false;
+    }
+}
+
+static void blorp_fiber_transition_state(
+    blorp_Fiber* f,
+    blorp_FiberState next,
+    const char* where
+) {
+    if (!f) return;
+    blorp_FiberState prev = (blorp_FiberState)atomic_exchange_explicit(
+        &f->lifecycle_state, (int)next, memory_order_acq_rel);
+    if (blorp_scheduler_debug_enabled() &&
+        !blorp_fiber_state_transition_allowed(prev, next)) {
+        char reason[160];
+        snprintf(
+            reason,
+            sizeof(reason),
+            "invalid lifecycle transition %s -> %s",
+            blorp_fiber_state_debug_name(prev),
+            blorp_fiber_state_debug_name(next));
+        blorp_scheduler_debug_abort_fiber(where, reason, f);
+    }
+}
+
+static void blorp_fiber_mark_created(blorp_Fiber* f, const char* where) {
+    if (!f) return;
+    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->queued, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->running, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->wake_pending, 0, __ATOMIC_RELEASE);
+    blorp_fiber_transition_state(f, BLORP_FIBER_CREATED, where);
+}
+
+static void blorp_fiber_mark_queued(blorp_Fiber* f, const char* where) {
+    if (!f) return;
+    __atomic_store_n(&f->queued, 1, __ATOMIC_RELEASE);
+    blorp_fiber_transition_state(f, BLORP_FIBER_QUEUED, where);
+}
+
+static void blorp_fiber_mark_dispatched(
+    blorp_Fiber* f,
+    const char* where
+) {
+    if (!f) return;
+    __atomic_store_n(&f->queued, 0, __ATOMIC_RELEASE);
+    blorp_fiber_transition_state(f, BLORP_FIBER_DISPATCHED, where);
+}
+
+static void blorp_fiber_mark_running(blorp_Fiber* f, const char* where) {
+    if (!f) return;
+    __atomic_store_n(&f->running, 1, __ATOMIC_RELEASE);
+    blorp_fiber_transition_state(f, BLORP_FIBER_RUNNING, where);
+}
+
+static void blorp_fiber_mark_ready_to_park(
+    blorp_Fiber* f,
+    const char* where
+) {
+    if (!f) return;
+    __atomic_store_n(&f->parked, 1, __ATOMIC_RELEASE);
+    blorp_fiber_transition_state(f, BLORP_FIBER_READY_TO_PARK, where);
+}
+
+static void blorp_fiber_mark_parked(blorp_Fiber* f, const char* where) {
+    blorp_fiber_transition_state(f, BLORP_FIBER_PARKED, where);
+}
+
+static void blorp_fiber_mark_completed(blorp_Fiber* f, const char* where) {
+    if (!f) return;
+    __atomic_store_n(&f->running, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->wake_pending, 0, __ATOMIC_RELEASE);
+    blorp_fiber_transition_state(f, BLORP_FIBER_COMPLETED, where);
+}
+
+static void blorp_fiber_mark_free(blorp_Fiber* f, const char* where) {
+    if (!f) return;
+    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->queued, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->running, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->wake_pending, 0, __ATOMIC_RELEASE);
+    blorp_fiber_transition_state(f, BLORP_FIBER_FREE, where);
+}
+
+static void blorp_fiber_record_wake_cause(
+    blorp_Fiber* f,
+    blorp_FiberWakeCause cause
+) {
+    if (!f) return;
+    atomic_store_explicit(&f->wake_cause, (int)cause, memory_order_release);
+}
+
+static void blorp_scheduler_debug_assert_fiber(
+    const char* where,
+    blorp_Fiber* f
+);
+
+static void blorp_fiber_record_pending_wake_locked(
+    blorp_Fiber* f,
+    blorp_FiberWakeCause cause,
+    const char* where
+) {
+    if (!f) return;
+    if (blorp_scheduler_debug_enabled() &&
+        !__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
+        blorp_scheduler_debug_abort_fiber(
+            where, "pending wake recorded for non-running fiber", f);
+    }
+    blorp_fiber_record_wake_cause(f, cause);
+    __atomic_store_n(&f->wake_pending, 1, __ATOMIC_RELEASE);
+    blorp_scheduler_debug_assert_fiber(where, f);
+}
+
+static uint64_t blorp_next_wait_operation_id(void) {
+    uint64_t id = atomic_fetch_add_explicit(
+        &__blorp_next_wait_operation_id, 1, memory_order_relaxed);
+    if (id != 0) return id;
+    return atomic_fetch_add_explicit(
+        &__blorp_next_wait_operation_id, 1, memory_order_relaxed);
+}
+
+static blorp_FiberWaitOperation blorp_fiber_no_wait_operation(void) {
+    return (blorp_FiberWaitOperation) {
+        .fiber = NULL,
+        .owner = BLORP_WAIT_OWNER_NONE,
+        .id = 0
+    };
+}
+
+static bool blorp_fiber_wait_operation_is_current(
+    blorp_FiberWaitOperation wait
+) {
+    return wait.fiber &&
+           wait.owner != BLORP_WAIT_OWNER_NONE &&
+           wait.id != 0 &&
+           blorp_fiber_current_wait_owner(wait.fiber) == wait.owner &&
+           blorp_fiber_current_wait_operation_id(wait.fiber) == wait.id;
+}
+
+static bool blorp_fiber_wait_operation_has_owner(
+    blorp_FiberWaitOperation wait,
+    blorp_FiberWaitOwnerKind expected_owner
+) {
+    if (expected_owner == BLORP_WAIT_OWNER_NONE) {
+        return wait.owner != BLORP_WAIT_OWNER_NONE;
+    }
+    return wait.owner == expected_owner;
+}
+
+static void blorp_fiber_debug_assert_current_wait_operation(
+    blorp_FiberWaitOperation wait,
+    blorp_FiberWaitOwnerKind expected_owner,
+    const char* where,
+    const char* missing_reason,
+    const char* stale_reason
+) {
+    if (!blorp_scheduler_debug_enabled() || !wait.fiber) return;
+    if (!blorp_fiber_wait_operation_has_owner(wait, expected_owner) ||
+        wait.id == 0) {
+        blorp_scheduler_debug_abort_fiber(
+            where,
+            missing_reason ? missing_reason : "missing wait operation",
+            wait.fiber);
+    }
+    if (!blorp_fiber_wait_operation_is_current(wait)) {
+        blorp_scheduler_debug_abort_fiber(
+            where,
+            stale_reason ? stale_reason : "stale wait operation",
+            wait.fiber);
+    }
+}
+
+static blorp_FiberWaitOperation blorp_fiber_begin_wait(
+    blorp_Fiber* f,
+    blorp_FiberWaitOwnerKind kind,
+    const char* where
+) {
+    if (!f) return blorp_fiber_no_wait_operation();
+    uint64_t wait_id = blorp_next_wait_operation_id();
+    atomic_store_explicit(
+        &f->wait_operation_id, wait_id, memory_order_release);
+    f->timer_waiter.wait = blorp_fiber_no_wait_operation();
+    blorp_FiberWaitOwnerKind prev =
+        (blorp_FiberWaitOwnerKind)atomic_exchange_explicit(
+            &f->wait_owner_kind, (int)kind, memory_order_acq_rel);
+    if (blorp_scheduler_debug_enabled() &&
+        prev != BLORP_WAIT_OWNER_NONE &&
+        prev != kind) {
+        char reason[192];
+        snprintf(
+            reason,
+            sizeof(reason),
+            "wait owner overwritten %s -> %s",
+            blorp_fiber_wait_owner_debug_name(prev),
+            blorp_fiber_wait_owner_debug_name(kind));
+        blorp_scheduler_debug_abort_fiber(where, reason, f);
+    }
+    return (blorp_FiberWaitOperation) {
+        .fiber = f,
+        .owner = kind,
+        .id = wait_id
+    };
+}
+
+static void blorp_fiber_clear_wait(blorp_Fiber* f, const char* where) {
+    if (!f) return;
+    (void)where;
+    f->timer_waiter.wait = blorp_fiber_no_wait_operation();
+    atomic_store_explicit(
+        &f->wait_operation_id, 0, memory_order_release);
+    atomic_store_explicit(
+        &f->wait_owner_kind,
+        (int)BLORP_WAIT_OWNER_NONE,
+        memory_order_release);
+}
+
+static void blorp_scheduler_debug_assert_fiber(
+    const char* where,
+    blorp_Fiber* f
+) {
+    if (!blorp_scheduler_debug_enabled() || !f) return;
+
+    int parked = __atomic_load_n(&f->parked, __ATOMIC_ACQUIRE);
+    int queued = __atomic_load_n(&f->queued, __ATOMIC_ACQUIRE);
+    int running = __atomic_load_n(&f->running, __ATOMIC_ACQUIRE);
+    int wake_pending =
+        __atomic_load_n(&f->wake_pending, __ATOMIC_ACQUIRE);
+    blorp_FiberState lifecycle_state = blorp_fiber_current_state(f);
+    blorp_FiberWaitOwnerKind wait_owner =
+        blorp_fiber_current_wait_owner(f);
+
+    if (queued && parked) {
+        blorp_scheduler_debug_abort_fiber(where, "queued and parked", f);
+    }
+    if (running && queued) {
+        blorp_scheduler_debug_abort_fiber(where, "running and queued", f);
+    }
+    if (lifecycle_state == BLORP_FIBER_CREATED) {
+        if (parked || queued || running) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "created fiber is already scheduled or parked", f);
+        }
+        if (wait_owner != BLORP_WAIT_OWNER_NONE) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "created fiber has wait owner", f);
+        }
+    }
+    if (lifecycle_state == BLORP_FIBER_QUEUED) {
+        if (!queued || parked || running) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "queued fiber mirror state is inconsistent", f);
+        }
+    }
+    if (lifecycle_state == BLORP_FIBER_DISPATCHED) {
+        if (parked || queued || running) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "dispatched fiber still queued, parked, or running", f);
+        }
+    }
+    if (lifecycle_state == BLORP_FIBER_RUNNING && !running) {
+        blorp_scheduler_debug_abort_fiber(
+            where, "running fiber mirror state is inconsistent", f);
+    }
+    if (lifecycle_state == BLORP_FIBER_READY_TO_PARK) {
+        if (wait_owner == BLORP_WAIT_OWNER_NONE) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "ready to park without wait owner", f);
+        }
+        if (!running) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "ready to park but not running", f);
+        }
+        if (!parked && !wake_pending) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "ready to park without parked bit or pending wake", f);
+        }
+    }
+    if (f->coro && mco_status(f->coro) == MCO_DEAD &&
+        (queued || running || parked || f->timer_waiter.heap_index >= 0 ||
+         f->channel_wait_kind != BLORP_CHANNEL_WAIT_NONE)) {
+        blorp_scheduler_debug_abort_fiber(
+            where, "dead fiber still scheduled or parked", f);
+    }
+    if (lifecycle_state == BLORP_FIBER_PARKED &&
+        wait_owner == BLORP_WAIT_OWNER_NONE) {
+        blorp_scheduler_debug_abort_fiber(
+            where, "parked without wait owner", f);
+    }
+    if (lifecycle_state == BLORP_FIBER_PARKED &&
+        !parked && !wake_pending) {
+        blorp_scheduler_debug_abort_fiber(
+            where, "parked fiber has no parked bit or pending wake", f);
+    }
+}
+
+static void blorp_fiber_prepare_wait_to_park(
+    blorp_FiberWaitOperation wait,
+    const char* where
+) {
+    blorp_Fiber* f = wait.fiber;
+    if (!f) return;
+    blorp_fiber_debug_assert_current_wait_operation(
+        wait,
+        BLORP_WAIT_OWNER_NONE,
+        where,
+        "wait ready to park without owner",
+        "wait ready to park with stale operation");
+    blorp_fiber_mark_ready_to_park(f, where);
+    blorp_scheduler_debug_assert_fiber(where, f);
+}
+
+static void blorp_fiber_abandon_wait_before_park(
+    blorp_FiberWaitOperation wait,
+    const char* where
+) {
+    blorp_Fiber* f = wait.fiber;
+    if (!f) return;
+    blorp_fiber_debug_assert_current_wait_operation(
+        wait,
+        BLORP_WAIT_OWNER_NONE,
+        where,
+        "abandoning wait without operation",
+        "abandoning stale wait operation");
+    __atomic_store_n(&f->wake_pending, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
+    blorp_fiber_mark_running(f, where);
+    blorp_fiber_clear_wait(f, where);
+    blorp_scheduler_debug_assert_fiber(where, f);
+}
 
 typedef struct {
     blorp_Fiber* head;
@@ -20849,6 +21576,26 @@ typedef struct {
 } blorp_TaskBatch;
 
 typedef enum {
+    BLORP_CONCURRENT_TASK_WINDOW_UNINITIALIZED = 0,
+    BLORP_CONCURRENT_TASK_WINDOW_ACTIVE = 1,
+    BLORP_CONCURRENT_TASK_WINDOW_ENDED = 2
+} blorp_ConcurrentTaskWindowState;
+
+typedef struct {
+    struct blorp_Task_s** tasks;
+    blorp_CancelCleanupFrame* cleanups;
+    blorp_TaskBatch batch;
+    long capacity;
+    long batch_spawn_count;
+    blorp_ConcurrentTaskWindowState state;
+} blorp_ConcurrentTaskWindow;
+
+typedef enum {
+    BLORP_CONCURRENT_TASK_FLUSH_PERIODIC = 0,
+    BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE = 1
+} blorp_ConcurrentTaskFlushMode;
+
+typedef enum {
     BLORP_TASK_SCHEDULE_IMMEDIATE,
     BLORP_TASK_SCHEDULE_BATCH,
 } blorp_TaskScheduleKind;
@@ -20859,10 +21606,9 @@ typedef struct {
 } blorp_TaskScheduleTarget;
 
 #define BLORP_TASK_BATCH_FLUSH_INTERVAL 256L
-#define BLORP_FIBER_WAKE_HANDOFF_SPINS 1024
 
 typedef struct {
-    blorp_Fiber** items;         // binary min-heap by wake_time_ns
+    blorp_TimerWaiter** items;   // binary min-heap by deadline_ns
     size_t len;
     size_t cap;
     pthread_mutex_t lock;
@@ -21073,7 +21819,13 @@ static void __blorp_install_stack_overflow_handler(void) {
 static void blorp_fiber_init(void);
 static uint64_t blorp_timer_queue_drain(void);
 static blorp_Fiber* blorp_fiber_pop(void);
-static void blorp_fiber_schedule(blorp_Fiber* f);
+static void blorp_fiber_state_lock(blorp_Fiber* f);
+static void blorp_fiber_state_unlock(blorp_Fiber* f);
+static void blorp_fiber_wake(
+    blorp_Fiber* f,
+    blorp_FiberWakeCause cause,
+    const char* where
+);
 static void blorp_fiber_enqueue_runnable(blorp_Fiber* f);
 static void blorp_fiber_enqueue_runnable_batch(
     blorp_Fiber* head,
@@ -21120,6 +21872,7 @@ typedef struct blorp_WorkerArg_s {
 static blorp_ThreadPool* __blorp_pool = NULL;
 static pthread_once_t __blorp_pool_once = PTHREAD_ONCE_INIT;
 static long __blorp_max_threads_value = 0;  // 0 = auto-detect
+static void __blorp_pool_init_default(void);
 
 // Worker thread function — hybrid fiber scheduler + work item processor
 static void* __blorp_worker(void* arg) {
@@ -21157,23 +21910,6 @@ static void* __blorp_worker(void* arg) {
                     &global_scheduler_stats.run_queue_lock_contentions);
                 fiber = blorp_fiber_run_queue_pop(local_queue);
                 pthread_mutex_unlock(&local_queue->lock);
-                if (!fiber) {
-                    for (long offset = 1; offset < pool->num_threads; offset++) {
-                        long victim_id = (worker_id + offset) % pool->num_threads;
-                        blorp_FiberRunQueue* victim_queue =
-                            &pool->fiber_queues[victim_id];
-                        __blorp_scheduler_stat_lock(
-                            &victim_queue->lock,
-                            &global_scheduler_stats.run_queue_lock_contentions);
-                        fiber = blorp_fiber_run_queue_pop(victim_queue);
-                        pthread_mutex_unlock(&victim_queue->lock);
-                        if (fiber) {
-                            __blorp_scheduler_stat_inc(
-                                &global_scheduler_stats.work_steals);
-                            break;
-                        }
-                    }
-                }
             }
             if (!fiber) {
                 __blorp_scheduler_stat_lock(
@@ -21185,7 +21921,9 @@ static void* __blorp_worker(void* arg) {
         }
 
         if (fiber) {
-            // (mco_status wait is in blorp_fiber_schedule)
+            if (fiber->owner_worker_id < 0 && worker_id >= 0) {
+                fiber->owner_worker_id = worker_id;
+            }
             // Resume the fiber on this worker thread. The active task is
             // fiber-scoped, not OS-thread-scoped: a worker can run many
             // different fibers over time, and each fiber may yield at channel
@@ -21195,9 +21933,30 @@ static void* __blorp_worker(void* arg) {
             void* previous_task = __blorp_current_task;
             __blorp_current_fiber = fiber;
             __blorp_current_task = mco_get_user_data(fiber->coro);
-            __atomic_store_n(&fiber->running, 1, __ATOMIC_RELEASE);
+            blorp_fiber_state_lock(fiber);
+            mco_state before_resume_status = mco_status(fiber->coro);
+            if (before_resume_status != MCO_SUSPENDED) {
+                fprintf(stderr,
+                    "blorp: scheduler tried to resume non-suspended fiber "
+                    "(status=%d parked=%d queued=%d running=%d wake_pending=%d)\n",
+                    (int)before_resume_status,
+                    __atomic_load_n(&fiber->parked, __ATOMIC_ACQUIRE),
+                    __atomic_load_n(&fiber->queued, __ATOMIC_ACQUIRE),
+                    __atomic_load_n(&fiber->running, __ATOMIC_ACQUIRE),
+                    __atomic_load_n(&fiber->wake_pending, __ATOMIC_ACQUIRE));
+                abort();
+            }
+            blorp_fiber_mark_running(fiber, "worker mark running");
+            blorp_scheduler_debug_assert_fiber("worker before resume", fiber);
+            blorp_fiber_state_unlock(fiber);
             __blorp_scheduler_stat_inc(&global_scheduler_stats.fiber_resumes);
             mco_result resume_res = mco_resume(fiber->coro);
+            blorp_fiber_state_lock(fiber);
+            mco_state fiber_status = mco_status(fiber->coro);
+            // Keep ownership of the coroutine state until after mco_status.
+            // Wakers that arrive while this flag is set use wake_pending, so no
+            // other carrier can resume this fiber while the current carrier is
+            // still reading minicoro state after mco_resume returns.
             __atomic_store_n(&fiber->running, 0, __ATOMIC_RELEASE);
             __blorp_current_task = previous_task;
             __blorp_current_fiber = NULL;
@@ -21209,11 +21968,14 @@ static void* __blorp_worker(void* arg) {
                 abort();
             }
 
-            if (mco_status(fiber->coro) == MCO_DEAD) {
+            if (fiber_status == MCO_DEAD) {
                 // Fiber completed — clean up
                 __blorp_scheduler_stat_inc(
                     &global_scheduler_stats.fibers_completed);
+                blorp_fiber_mark_completed(fiber, "worker mark completed");
+                blorp_fiber_state_unlock(fiber);
                 mco_destroy(fiber->coro);
+                fiber->coro = NULL;
                 blorp_fiber_object_recycle(fiber);
             } else if (__atomic_exchange_n(&fiber->wake_pending, 0, __ATOMIC_ACQ_REL)) {
                 // A waker found this fiber after it had marked itself parked
@@ -21224,6 +21986,9 @@ static void* __blorp_worker(void* arg) {
                 // mco_yield.
                 __atomic_store_n(&fiber->parked, 0, __ATOMIC_RELEASE);
                 blorp_fiber_enqueue_runnable(fiber);
+                blorp_fiber_state_unlock(fiber);
+            } else {
+                blorp_fiber_state_unlock(fiber);
             }
             // If fiber is parked (yielded), it's been placed in a wait queue
             // by the park point code. Don't touch it.
@@ -21268,20 +22033,14 @@ static void* __blorp_worker(void* arg) {
         //   - shutdown: broadcast
         if (next_expiry > 0) {
             // Timer pending — wait until its expiry time
-            struct timespec now_mono;
-            clock_gettime(CLOCK_MONOTONIC, &now_mono);
-            uint64_t now_ns = (uint64_t)now_mono.tv_sec * 1000000000ULL + (uint64_t)now_mono.tv_nsec;
+            uint64_t now_ns = blorp_monotonic_now_ns();
             if (next_expiry <= now_ns) {
                 // Already expired, loop immediately
                 pthread_mutex_unlock(&pool->queue_lock);
                 continue;
             }
             uint64_t delta_ns = next_expiry - now_ns;
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += (long)(delta_ns % 1000000000ULL);
-            ts.tv_sec += (time_t)(delta_ns / 1000000000ULL);
-            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            struct timespec ts = blorp_realtime_after_ns(delta_ns);
             pthread_cond_timedwait(&pool->queue_cond, &pool->queue_lock, &ts);
         } else {
             // No timers pending — wait indefinitely until signaled
@@ -21340,8 +22099,116 @@ static bool __blorp_pool_submit_scoped(
 // Forward declarations for fiber functions defined after thread pool shutdown
 static void blorp_fiber_init(void);
 static uint64_t blorp_timer_queue_drain(void);
-static void blorp_timer_queue_insert(blorp_Fiber* f);
-static void blorp_timer_queue_remove(blorp_Fiber* f);
+static void blorp_timer_queue_insert(blorp_TimerWaiter* waiter);
+static void blorp_timer_queue_remove(blorp_TimerWaiter* waiter);
+
+static void blorp_timer_waiter_reset(
+    blorp_TimerWaiter* waiter,
+    blorp_Fiber* fiber
+) {
+    if (!waiter) return;
+    waiter->fiber = fiber;
+    waiter->wait = blorp_fiber_no_wait_operation();
+    waiter->deadline_ns = 0;
+    waiter->heap_index = -1;
+    waiter->wake_cause = BLORP_WAKE_READY;
+}
+
+static void blorp_timer_waiter_prepare(
+    blorp_TimerWaiter* waiter,
+    blorp_FiberWaitOperation wait,
+    uint64_t deadline_ns,
+    blorp_FiberWakeCause wake_cause,
+    const char* where
+) {
+    if (!waiter) return;
+    if (blorp_scheduler_debug_enabled() && waiter->heap_index >= 0) {
+        blorp_scheduler_debug_abort_fiber(
+            where,
+            "timer waiter prepared while still queued",
+            waiter->fiber ? waiter->fiber : wait.fiber);
+    }
+    waiter->fiber = wait.fiber;
+    waiter->wait = wait;
+    waiter->deadline_ns = deadline_ns;
+    waiter->wake_cause = wake_cause;
+    blorp_fiber_debug_assert_current_wait_operation(
+        wait,
+        BLORP_WAIT_OWNER_NONE,
+        where,
+        "timer waiter prepared without wait operation",
+        "timer waiter prepared for stale wait operation");
+}
+
+static bool blorp_timer_waiter_current(blorp_TimerWaiter* waiter) {
+    if (!waiter || !waiter->fiber) {
+        return false;
+    }
+    return blorp_fiber_wait_operation_is_current(waiter->wait);
+}
+
+static bool blorp_timer_waiter_wake(
+    blorp_TimerWaiter* waiter,
+    blorp_FiberWakeCause cause,
+    const char* where
+) {
+    if (!waiter) return false;
+    waiter->wake_cause = cause;
+    if (!blorp_timer_waiter_current(waiter)) {
+        // A stale timer wait operation can be left behind if another wake
+        // source resumes the fiber before the deadline queue drains. The wait
+        // operation id prevents the old deadline from waking a later wait.
+        return false;
+    }
+    blorp_fiber_wake(waiter->fiber, cause, where);
+    return true;
+}
+
+static void blorp_fiber_install_timer_wait(
+    blorp_FiberWaitOperation wait,
+    uint64_t deadline_ns,
+    blorp_FiberWakeCause wake_cause,
+    const char* where
+) {
+    blorp_Fiber* f = wait.fiber;
+    if (!f) return;
+    blorp_fiber_debug_assert_current_wait_operation(
+        wait,
+        BLORP_WAIT_OWNER_NONE,
+        where,
+        "timer wait installed without wait owner",
+        "timer wait installed for stale wait operation");
+    blorp_timer_waiter_prepare(
+        &f->timer_waiter,
+        wait,
+        deadline_ns,
+        wake_cause,
+        where);
+    blorp_timer_queue_insert(&f->timer_waiter);
+}
+
+static void blorp_fiber_remove_timer_wait(
+    blorp_FiberWaitOperation wait,
+    const char* where
+) {
+    blorp_Fiber* f = wait.fiber;
+    if (!f) return;
+    if (blorp_scheduler_debug_enabled()) {
+        if (wait.owner == BLORP_WAIT_OWNER_NONE || wait.id == 0) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "timer wait removed without wait operation", f);
+        }
+        if (f->timer_waiter.heap_index >= 0 &&
+            f->timer_waiter.wait.id != 0 &&
+            f->timer_waiter.wait.id != wait.id) {
+            blorp_scheduler_debug_abort_fiber(
+                where,
+                "timer wait removed for different wait operation",
+                f);
+        }
+    }
+    blorp_timer_queue_remove(&f->timer_waiter);
+}
 
 // Initialize the thread pool
 void blorp_thread_pool_init(long max_threads) {
@@ -21386,6 +22253,10 @@ void blorp_thread_pool_init(long max_threads) {
     }
 }
 
+void blorp_thread_pool_ensure_initialized(void) {
+    pthread_once(&__blorp_pool_once, __blorp_pool_init_default);
+}
+
 // Default init for pthread_once (auto-detect thread count)
 static void __blorp_pool_init_default(void) {
     blorp_thread_pool_init(0);
@@ -21412,17 +22283,22 @@ void blorp_thread_pool_shutdown(void) {
     // Drain timer queue — free fibers that were sleeping at shutdown
     if (__fibers_initialized) {
         pthread_mutex_lock(&__fiber_timer_queue.lock);
-        blorp_Fiber** timer_items = __fiber_timer_queue.items;
+        blorp_TimerWaiter** timer_items = __fiber_timer_queue.items;
         size_t timer_len = __fiber_timer_queue.len;
         __fiber_timer_queue.items = NULL;
         __fiber_timer_queue.len = 0;
         __fiber_timer_queue.cap = 0;
         pthread_mutex_unlock(&__fiber_timer_queue.lock);
         for (size_t i = 0; i < timer_len; i++) {
-            blorp_Fiber* tf = timer_items[i];
+            blorp_TimerWaiter* waiter = timer_items[i];
+            if (!waiter) continue;
+            blorp_Fiber* tf = waiter->fiber;
             if (!tf) continue;
-            tf->timer_index = -1;
-            if (tf->coro) { mco_destroy(tf->coro); }
+            blorp_timer_waiter_reset(waiter, tf);
+            if (tf->coro) {
+                mco_destroy(tf->coro);
+                tf->coro = NULL;
+            }
             blorp_fiber_object_recycle(tf);
         }
         free(timer_items);
@@ -21517,10 +22393,16 @@ static blorp_Fiber* blorp_fiber_object_alloc(void) {
 
 static void blorp_fiber_object_recycle(blorp_Fiber* f) {
     if (!f) return;
+    f->coro = NULL;
+    blorp_fiber_record_wake_cause(f, BLORP_WAKE_READY);
+    blorp_fiber_clear_wait(f, "fiber object recycle");
+    blorp_fiber_mark_free(f, "fiber object recycle");
     f->run_next = NULL;
-    f->wait_next = NULL;
     f->pool_next = NULL;
-    f->timer_drain_next = NULL;
+    blorp_timer_waiter_reset(&f->timer_waiter, f);
+    f->channel_wait_kind = BLORP_CHANNEL_WAIT_NONE;
+    f->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    f->channel_wait_deadline_ns = 0;
     size_t limit = blorp_fiber_object_pool_limit();
     if (limit > 0) {
         pthread_mutex_lock(&__fiber_object_pool_lock);
@@ -21550,20 +22432,55 @@ static void blorp_fiber_object_pool_clear(void) {
     }
 }
 
+static void blorp_fiber_state_lock(blorp_Fiber* f) {
+    if (!f) return;
+    int expected = 0;
+    while (!__atomic_compare_exchange_n(
+        &f->state_lock,
+        &expected,
+        1,
+        0,
+        __ATOMIC_ACQUIRE,
+        __ATOMIC_RELAXED
+    )) {
+        expected = 0;
+        sched_yield();
+    }
+}
+
+static void blorp_fiber_state_unlock(blorp_Fiber* f) {
+    if (!f) return;
+    __atomic_store_n(&f->state_lock, 0, __ATOMIC_RELEASE);
+}
+
 // Create a new fiber wrapping a coroutine
 static blorp_Fiber* blorp_fiber_create(void (*func)(mco_coro*), void* user_data) {
     blorp_Fiber* f = blorp_fiber_object_alloc();
+    f->coro = NULL;
     f->run_next = NULL;
-    f->wait_next = NULL;
     f->pool_next = NULL;
-    f->timer_drain_next = NULL;
     f->wake_data = NULL;
-    f->wake_time_ns = 0;
-    f->timer_index = -1;
-    f->parked = 1;  // Start as "parked" so first blorp_fiber_schedule CAS succeeds
+    blorp_timer_waiter_reset(&f->timer_waiter, f);
+    atomic_store_explicit(
+        &f->lifecycle_state, (int)BLORP_FIBER_FREE, memory_order_relaxed);
+    atomic_store_explicit(
+        &f->wake_cause, (int)BLORP_WAKE_READY, memory_order_relaxed);
+    atomic_store_explicit(
+        &f->wait_owner_kind,
+        (int)BLORP_WAIT_OWNER_NONE,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &f->wait_operation_id, 0, memory_order_relaxed);
+    f->parked = 0;
     f->queued = 0;
     f->running = 0;
     f->wake_pending = 0;
+    f->state_lock = 0;
+    f->owner_worker_id = -1;
+    f->channel_wait_kind = BLORP_CHANNEL_WAIT_NONE;
+    f->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    f->channel_wait_deadline_ns = 0;
+    blorp_fiber_mark_created(f, "fiber create");
     mco_desc desc = mco_desc_init(func, __blorp_fiber_stack_size);
     desc.user_data = user_data;
     // Use guard-page allocator for stack overflow protection
@@ -21571,39 +22488,48 @@ static blorp_Fiber* blorp_fiber_create(void (*func)(mco_coro*), void* user_data)
     desc.dealloc_cb = blorp_fiber_stack_dealloc;
     mco_result res = mco_create(&f->coro, &desc);
     if (res != MCO_SUCCESS) {
+        blorp_fiber_mark_free(f, "fiber create failed");
         blorp_fiber_object_recycle(f);
         return NULL;
     }
     return f;
 }
 
-// Push a known-runnable fiber to the run queue tail, signal workers.
-// Caller is responsible for transitioning parked 1 -> 0 before calling.
-static blorp_FiberRunQueue* blorp_fiber_select_run_queue(void) {
+static long blorp_fiber_choose_worker_id(blorp_ThreadPool* pool) {
+    if (!pool || !pool->fiber_queues || pool->num_threads <= 0) return -1;
+    // This path assigns the first owner for a newly runnable fiber. Resumed
+    // fibers keep their existing owner queue, but new task fibers have no
+    // coroutine thread affinity yet and should be spread across carriers now
+    // that owner pinning prevents later work stealing.
+    long ticket =
+        atomic_fetch_add_explicit(
+            &pool->fiber_enqueue_cursor, 1, memory_order_relaxed);
+    long idx = ticket % pool->num_threads;
+    if (idx < 0) idx += pool->num_threads;
+    return idx;
+}
+
+// Choose the run queue that owns the next resume for this fiber.
+static blorp_FiberRunQueue* blorp_fiber_select_run_queue(blorp_Fiber* f) {
     blorp_ThreadPool* pool = __blorp_pool;
     if (pool && pool->fiber_queues && pool->num_threads > 0) {
-        if (__blorp_current_worker_id >= 0 &&
-            __blorp_current_worker_id < pool->num_threads) {
-            return &pool->fiber_queues[__blorp_current_worker_id];
+        long idx = f ? f->owner_worker_id : -1;
+        if (idx < 0 || idx >= pool->num_threads) {
+            idx = blorp_fiber_choose_worker_id(pool);
+            if (f) f->owner_worker_id = (int)idx;
         }
-        long ticket =
-            atomic_fetch_add_explicit(
-                &pool->fiber_enqueue_cursor, 1, memory_order_relaxed);
-        long idx = ticket % pool->num_threads;
-        if (idx < 0) idx += pool->num_threads;
         return &pool->fiber_queues[idx];
     }
     return &__fiber_run_queue;
 }
 
-static void blorp_fiber_enqueue_runnable(blorp_Fiber* f) {
-    if (f->coro && mco_status(f->coro) == MCO_DEAD) return;
-    int expected = 0;
-    if (!__atomic_compare_exchange_n(&f->queued, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        return;
-    }
+static void blorp_fiber_publish_queued_runnable(
+    blorp_Fiber* f,
+    const char* where
+) {
+    // The caller owns the lifecycle/mirror transition into QUEUED.
     f->run_next = NULL;
-    blorp_FiberRunQueue* queue = blorp_fiber_select_run_queue();
+    blorp_FiberRunQueue* queue = blorp_fiber_select_run_queue(f);
     __blorp_scheduler_stat_lock(
         &queue->lock, &global_scheduler_stats.run_queue_lock_contentions);
     if (queue->tail) {
@@ -21617,16 +22543,70 @@ static void blorp_fiber_enqueue_runnable(blorp_Fiber* f) {
     __blorp_scheduler_stat_inc(&global_scheduler_stats.runnable_enqueues);
     atomic_fetch_add_explicit(
         &__fiber_runnable_count, 1, memory_order_release);
+    blorp_scheduler_debug_assert_fiber(where, f);
     pthread_mutex_unlock(&queue->lock);
-    // Wake workers on a queue's empty->nonempty transition. Round-robin
-    // external injection spreads large bursts across queues, so one signal per
-    // newly active queue is enough to wake available carriers without creating
-    // a condition-variable storm.
+    // Wake workers on a queue's empty->nonempty transition. Fibers are pinned
+    // to their owner queue so a single condition-variable signal can wake the
+    // wrong carrier; broadcast lets the owner observe its queue.
     if (__blorp_pool && queued_count == 1) {
         pthread_mutex_lock(&__blorp_pool->queue_lock);
-        pthread_cond_signal(&__blorp_pool->queue_cond);
+        pthread_cond_broadcast(&__blorp_pool->queue_cond);
         pthread_mutex_unlock(&__blorp_pool->queue_lock);
     }
+}
+
+static bool blorp_fiber_prepare_created_for_queue(
+    blorp_Fiber* f,
+    const char* where
+) {
+    if (!f) return false;
+    if (f->coro && mco_status(f->coro) == MCO_DEAD) return false;
+    if (blorp_scheduler_debug_enabled()) {
+        if (blorp_fiber_current_state(f) != BLORP_FIBER_CREATED) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "new fiber schedule requires created lifecycle", f);
+        }
+        if (__atomic_load_n(&f->parked, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&f->running, __ATOMIC_ACQUIRE) ||
+            blorp_fiber_current_wait_owner(f) != BLORP_WAIT_OWNER_NONE) {
+            blorp_scheduler_debug_abort_fiber(
+                where, "created fiber is not exclusively owned by scheduler", f);
+        }
+    }
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(
+            &f->queued,
+            &expected,
+            1,
+            0,
+            __ATOMIC_ACQ_REL,
+            __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    blorp_fiber_mark_queued(f, where);
+    __blorp_scheduler_stat_inc(
+        &global_scheduler_stats.fiber_schedule_transitions);
+    blorp_scheduler_debug_assert_fiber(where, f);
+    return true;
+}
+
+static void blorp_fiber_enqueue_created_runnable(blorp_Fiber* f) {
+    if (!blorp_fiber_prepare_created_for_queue(
+            f, "fiber enqueue created runnable")) {
+        return;
+    }
+    blorp_fiber_publish_queued_runnable(
+        f, "fiber enqueue created runnable");
+}
+
+static void blorp_fiber_enqueue_runnable(blorp_Fiber* f) {
+    if (f->coro && mco_status(f->coro) == MCO_DEAD) return;
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&f->queued, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    blorp_fiber_mark_queued(f, "fiber enqueue runnable");
+    blorp_fiber_publish_queued_runnable(f, "fiber enqueue runnable");
 }
 
 static void blorp_fiber_batch_list_append(blorp_FiberBatchList* list, blorp_Fiber* f) {
@@ -21660,24 +22640,13 @@ static bool blorp_fiber_run_queue_append_locked(
 #define BLORP_STACK_BATCH_QUEUES 64
 
 static long blorp_fiber_batch_queue_index(blorp_ThreadPool* pool) {
-    if (__blorp_current_worker_id >= 0 &&
-        __blorp_current_worker_id < pool->num_threads) {
-        return __blorp_current_worker_id;
-    }
-    long ticket =
-        atomic_fetch_add_explicit(
-            &pool->fiber_enqueue_cursor, 1, memory_order_relaxed);
-    long idx = ticket % pool->num_threads;
-    if (idx < 0) idx += pool->num_threads;
-    return idx;
+    return blorp_fiber_choose_worker_id(pool);
 }
 
 static void blorp_signal_fiber_workers(long signals) {
     if (!__blorp_pool || signals <= 0) return;
     pthread_mutex_lock(&__blorp_pool->queue_lock);
-    for (long i = 0; i < signals; i++) {
-        pthread_cond_signal(&__blorp_pool->queue_cond);
-    }
+    pthread_cond_broadcast(&__blorp_pool->queue_cond);
     pthread_mutex_unlock(&__blorp_pool->queue_lock);
 }
 
@@ -21704,6 +22673,7 @@ static void blorp_fiber_enqueue_runnable_batch(
         while (f) {
             blorp_Fiber* next = f->run_next;
             long idx = blorp_fiber_batch_queue_index(pool);
+            f->owner_worker_id = (int)idx;
             blorp_fiber_batch_list_append(&batches[idx], f);
             f = next;
         }
@@ -21756,10 +22726,10 @@ static blorp_TaskScheduleTarget blorp_task_schedule_batch(blorp_TaskBatch* batch
 static void blorp_task_batch_add_new_fiber(blorp_TaskBatch* batch, blorp_Fiber* f) {
     // The spawning thread exclusively owns a newly created fiber until this
     // batch is published to a run queue.
-    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&f->queued, 1, __ATOMIC_RELEASE);
-    __blorp_scheduler_stat_inc(
-        &global_scheduler_stats.fiber_schedule_transitions);
+    if (!blorp_fiber_prepare_created_for_queue(
+            f, "task batch add new fiber")) {
+        return;
+    }
     if (batch->runnable_tail) {
         batch->runnable_tail->run_next = f;
     } else {
@@ -21781,23 +22751,23 @@ static void blorp_task_schedule_new_fiber(
                 return;
             }
             // Defensive fallback for malformed internal callers.
-            blorp_fiber_schedule(fiber);
+            blorp_fiber_enqueue_created_runnable(fiber);
             return;
         case BLORP_TASK_SCHEDULE_IMMEDIATE:
         default:
-            blorp_fiber_schedule(fiber);
+            blorp_fiber_enqueue_created_runnable(fiber);
             return;
     }
 }
 
-void blorp_task_batch_init(blorp_TaskBatch* batch) {
+static void blorp_task_batch_init(blorp_TaskBatch* batch) {
     if (!batch) return;
     batch->runnable_head = NULL;
     batch->runnable_tail = NULL;
     batch->runnable_count = 0;
 }
 
-void blorp_task_batch_flush(blorp_TaskBatch* batch) {
+static void blorp_task_batch_flush(blorp_TaskBatch* batch) {
     if (!batch) return;
     blorp_Fiber* head = batch->runnable_head;
     blorp_Fiber* tail = batch->runnable_tail;
@@ -21806,99 +22776,250 @@ void blorp_task_batch_flush(blorp_TaskBatch* batch) {
     blorp_fiber_enqueue_runnable_batch(head, tail, count);
 }
 
-// Schedule a parked fiber.
-// Idempotent: if fiber is not parked (already scheduled/running), this is a no-op.
-static void blorp_fiber_schedule(blorp_Fiber* f) {
-    // Atomic CAS: only the first waker transitions parked 1 -> 0
-    int expected = 1;
-    if (!__atomic_compare_exchange_n(&f->parked, &expected, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        return;  // Already scheduled by another waker
+static void blorp_task_batch_flush_periodically(
+    blorp_TaskBatch* batch,
+    long scheduled_count
+) {
+    if (scheduled_count <= 0) return;
+    if ((scheduled_count % BLORP_TASK_BATCH_FLUSH_INTERVAL) == 0) {
+        blorp_task_batch_flush(batch);
     }
-    __blorp_scheduler_stat_inc(
-        &global_scheduler_stats.fiber_schedule_transitions);
-    // If the fiber is still inside mco_resume, it has marked itself parked
-    // but has not actually yielded yet. Do not poll minicoro state from this
-    // thread. Record the wake and let the running worker enqueue it after
-    // mco_resume returns from the yield.
-    if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
-        __atomic_store_n(&f->wake_pending, 1, __ATOMIC_RELEASE);
-        // The fiber sets parked immediately before yielding. If the owning
-        // worker clears running between our load and wake_pending store, it may
-        // have already passed its pending-wake check. Wait briefly for that
-        // handoff to settle; exactly one side claims wake_pending by exchange.
-        for (int i = 0; i < BLORP_FIBER_WAKE_HANDOFF_SPINS; i++) {
-            if (!__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
-                if (__atomic_exchange_n(&f->wake_pending, 0, __ATOMIC_ACQ_REL)) {
-                    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
-                    blorp_fiber_enqueue_runnable(f);
-                }
-                return;
-            }
-            sched_yield();
-        }
-        return;
-    }
-    blorp_fiber_enqueue_runnable(f);
 }
 
-static void blorp_fiber_enqueue_cancel_wake(blorp_Fiber* f) {
+static void blorp_concurrent_task_window_init(
+    blorp_ConcurrentTaskWindow* window,
+    long capacity
+) {
+    if (!window) return;
+    long actual_capacity = capacity > 0 ? capacity : 1;
+    memset(window, 0, sizeof(*window));
+    window->state = BLORP_CONCURRENT_TASK_WINDOW_UNINITIALIZED;
+    blorp_task_batch_init(&window->batch);
+    window->tasks = blorp_malloc_checked(
+        (size_t)actual_capacity * sizeof(*window->tasks));
+    window->cleanups = blorp_malloc_checked(
+        (size_t)actual_capacity * sizeof(*window->cleanups));
+    window->capacity = actual_capacity;
+    window->batch_spawn_count = 0;
+    blorp_task_batch_init(&window->batch);
+    memset(window->tasks, 0, (size_t)actual_capacity * sizeof(*window->tasks));
+    memset(
+        window->cleanups,
+        0,
+        (size_t)actual_capacity * sizeof(*window->cleanups));
+    window->state = BLORP_CONCURRENT_TASK_WINDOW_ACTIVE;
+}
+
+static bool blorp_concurrent_task_window_is_active(
+    blorp_ConcurrentTaskWindow* window
+) {
+    return window &&
+           window->state == BLORP_CONCURRENT_TASK_WINDOW_ACTIVE &&
+           window->tasks != NULL &&
+           window->cleanups != NULL &&
+           window->capacity > 0;
+}
+
+static void blorp_concurrent_task_window_check_active(
+    blorp_ConcurrentTaskWindow* window,
+    const char* where
+) {
+    if (blorp_concurrent_task_window_is_active(window)) return;
+    fprintf(
+        stderr,
+        "blorp: concurrent task window is not active at %s (bug)\n",
+        where ? where : "(unknown)");
+    abort();
+}
+
+static void blorp_concurrent_task_window_flush_pending(
+    blorp_ConcurrentTaskWindow* window
+) {
+    if (!blorp_concurrent_task_window_is_active(window)) return;
+    blorp_task_batch_flush(&window->batch);
+    window->batch_spawn_count = 0;
+}
+
+static void blorp_concurrent_task_window_cancel_join_active(
+    blorp_ConcurrentTaskWindow* window
+) {
+    if (!blorp_concurrent_task_window_is_active(window)) return;
+    blorp_concurrent_task_window_flush_pending(window);
+    for (long i = 0; i < window->capacity; i++) {
+        struct blorp_Task_s* task = window->tasks[i];
+        if (!task) continue;
+        __blorp_task_cleanup_pop_slot_slow(&window->tasks[i]);
+        blorp_task_cancel_join_release(task);
+        window->tasks[i] = NULL;
+    }
+}
+
+static void blorp_concurrent_task_window_cleanup_storage(void* value) {
+    blorp_ConcurrentTaskWindow* window =
+        (blorp_ConcurrentTaskWindow*)value;
+    if (!window) return;
+    free(window->cleanups);
+    free(window->tasks);
+    window->cleanups = NULL;
+    window->tasks = NULL;
+    window->capacity = 0;
+    window->batch_spawn_count = 0;
+    blorp_task_batch_init(&window->batch);
+    window->state = BLORP_CONCURRENT_TASK_WINDOW_ENDED;
+}
+
+static void blorp_concurrent_task_window_cleanup(void* value) {
+    blorp_ConcurrentTaskWindow* window =
+        (blorp_ConcurrentTaskWindow*)value;
+    if (!window) return;
+    blorp_concurrent_task_window_cancel_join_active(window);
+    blorp_concurrent_task_window_cleanup_storage(window);
+}
+
+void blorp_concurrent_task_window_begin(
+    blorp_ConcurrentTaskWindow* window,
+    blorp_CancelCleanupFrame* cleanup,
+    long capacity
+) {
+    if (!window || !cleanup) return;
+    blorp_concurrent_task_window_init(window, capacity);
+    __blorp_task_cleanup_push_slow(
+        cleanup,
+        window,
+        window,
+        blorp_concurrent_task_window_cleanup);
+    cleanup->kind = BLORP_CANCEL_CLEANUP_TASK_WINDOW;
+}
+
+void blorp_concurrent_task_window_end(blorp_ConcurrentTaskWindow* window) {
+    if (!window) return;
+    blorp_concurrent_task_window_check_active(window, "task window end");
+    __blorp_task_cleanup_pop_slot_slow(window);
+    blorp_concurrent_task_window_cleanup(window);
+}
+
+// Schedule a parked fiber.
+// Idempotent: if fiber is not parked (already scheduled/running), this is a no-op.
+static bool blorp_fiber_schedule_with_cause(
+    blorp_Fiber* f,
+    blorp_FiberWakeCause cause,
+    const char* where
+) {
+    // Atomic CAS: only the first waker transitions parked 1 -> 0
+    blorp_fiber_state_lock(f);
+    int expected = 1;
+    if (!__atomic_compare_exchange_n(&f->parked, &expected, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        blorp_fiber_state_unlock(f);
+        return false;  // Already scheduled by another waker
+    }
+    blorp_fiber_record_wake_cause(f, cause);
+    __blorp_scheduler_stat_inc(
+        &global_scheduler_stats.fiber_schedule_transitions);
+    // If the fiber is still inside mco_resume, it has marked itself parked but
+    // has not actually yielded yet. Record the wake and let the owning worker
+    // enqueue after it observes the coroutine's post-resume state.
+    if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
+        blorp_fiber_record_pending_wake_locked(f, cause, where);
+        blorp_fiber_state_unlock(f);
+        return true;
+    }
     blorp_fiber_enqueue_runnable(f);
+    blorp_scheduler_debug_assert_fiber(where, f);
+    blorp_fiber_state_unlock(f);
+    return true;
+}
+
+static void blorp_fiber_wake(
+    blorp_Fiber* f,
+    blorp_FiberWakeCause cause,
+    const char* where
+) {
+    if (!f) return;
+    if (blorp_fiber_schedule_with_cause(f, cause, where)) return;
+
+    if (cause != BLORP_WAKE_CANCELLED) return;
+    // Cancellation can arrive after a fiber checks the task flag but before it
+    // marks itself parked in a blocking operation. Leave a pending wake so the
+    // worker re-enqueues the fiber if that running task yields into the park.
+    blorp_fiber_state_lock(f);
+    if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
+        blorp_fiber_record_pending_wake_locked(
+            f,
+            BLORP_WAKE_CANCELLED,
+            "fiber cancel wake before park");
+        blorp_fiber_state_unlock(f);
+        return;
+    }
+    blorp_fiber_state_unlock(f);
     blorp_signal_fiber_workers(1);
+}
+
+static blorp_FiberWakeCause blorp_io_wake_reason_to_fiber_cause(
+    blorp_IoWakeReason reason
+) {
+    switch (reason) {
+        case BLORP_IO_WAKE_TIMEOUT:
+            return BLORP_WAKE_TIMEOUT;
+        case BLORP_IO_WAKE_CANCELLED:
+            return BLORP_WAKE_CANCELLED;
+        case BLORP_IO_WAKE_CLOSED:
+            return BLORP_WAKE_CLOSED;
+        case BLORP_IO_WAKE_READY:
+        case BLORP_IO_WAKE_BUSY:
+        case BLORP_IO_WAKE_NONE:
+        default:
+            return BLORP_WAKE_READY;
+    }
+}
+
+static blorp_FiberWakeCause blorp_channel_wake_reason_to_fiber_cause(
+    blorp_ChannelWakeReason reason,
+    blorp_FiberWakeCause default_cause
+) {
+    switch (reason) {
+        case BLORP_CHANNEL_WAKE_TIMED_OUT:
+            return BLORP_WAKE_TIMEOUT;
+        case BLORP_CHANNEL_WAKE_READY:
+            return default_cause == BLORP_WAKE_SEALED
+                ? BLORP_WAKE_SEALED
+                : BLORP_WAKE_READY;
+        case BLORP_CHANNEL_WAKE_PENDING:
+        default:
+            return default_cause;
+    }
 }
 
 static void blorp_fiber_request_cancel_wake(blorp_Fiber* f) {
     if (!f) return;
-    int expected = 1;
-    if (__atomic_compare_exchange_n(
-            &f->parked, &expected, 0, 0,
-            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        __blorp_scheduler_stat_inc(
-            &global_scheduler_stats.fiber_schedule_transitions);
-        if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
-            __atomic_store_n(&f->wake_pending, 1, __ATOMIC_RELEASE);
-            for (int i = 0; i < BLORP_FIBER_WAKE_HANDOFF_SPINS; i++) {
-                if (!__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
-                    if (__atomic_exchange_n(
-                            &f->wake_pending, 0, __ATOMIC_ACQ_REL)) {
-                        __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
-                        blorp_fiber_enqueue_cancel_wake(f);
-                    }
-                    return;
-                }
-                sched_yield();
-            }
-            return;
-        }
-        blorp_fiber_enqueue_cancel_wake(f);
-        return;
-    }
-
-    // Cancellation can arrive after a fiber checks the task flag but before it
-    // marks itself parked in a blocking operation. Leave a pending wake so the
-    // worker re-enqueues the fiber if that running task yields into the park.
-    if (__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
-        __atomic_store_n(&f->wake_pending, 1, __ATOMIC_RELEASE);
-        for (int i = 0; i < BLORP_FIBER_WAKE_HANDOFF_SPINS; i++) {
-            if (!__atomic_load_n(&f->running, __ATOMIC_ACQUIRE)) {
-                if (__atomic_exchange_n(&f->wake_pending, 0, __ATOMIC_ACQ_REL)) {
-                    __atomic_store_n(&f->parked, 0, __ATOMIC_RELEASE);
-                    blorp_fiber_enqueue_cancel_wake(f);
-                }
-                return;
-            }
-            sched_yield();
-        }
-        return;
-    }
-    blorp_signal_fiber_workers(1);
+    blorp_fiber_wake(f, BLORP_WAKE_CANCELLED, "fiber cancel wake");
 }
 
-// Park current fiber — yields back to scheduler.
+// Park current fiber for an explicit wait operation.
 // IMPORTANT: Caller must set parked=1 and set up wakeup mechanism BEFORE calling.
 // This ensures the fiber is visible to wakers before it yields.
-static void blorp_fiber_park(void) {
+static void blorp_fiber_park(blorp_FiberWaitOperation wait) {
     blorp_Fiber* f = __blorp_current_fiber;
     if (!f) return;  // Safety: not in a fiber
+    if (blorp_scheduler_debug_enabled()) {
+        if (wait.fiber != f) {
+            blorp_scheduler_debug_abort_fiber(
+                "fiber park entry",
+                "park wait operation does not belong to current fiber",
+                wait.fiber ? wait.fiber : f);
+        }
+        blorp_fiber_debug_assert_current_wait_operation(
+            wait,
+            BLORP_WAIT_OWNER_NONE,
+            "fiber park entry",
+            "park entered without wait operation",
+            "park entered with stale wait operation");
+        if (blorp_fiber_current_state(f) != BLORP_FIBER_READY_TO_PARK) {
+            blorp_scheduler_debug_abort_fiber(
+                "fiber park entry",
+                "park entered before ready-to-park lifecycle transition",
+                f);
+        }
+    }
     bool stats_active = __blorp_scheduler_stats_active();
     if (stats_active) {
         atomic_fetch_add_explicit(
@@ -21906,6 +23027,10 @@ static void blorp_fiber_park(void) {
         atomic_fetch_add_explicit(
             &global_scheduler_stats.tracked_parked_fibers, 1, memory_order_relaxed);
     }
+    blorp_fiber_state_lock(f);
+    blorp_fiber_mark_parked(f, "fiber park entry");
+    blorp_scheduler_debug_assert_fiber("fiber park entry", f);
+    blorp_fiber_state_unlock(f);
     mco_result yield_res = mco_yield(f->coro);
     if (stats_active) {
         atomic_fetch_sub_explicit(
@@ -21919,6 +23044,15 @@ static void blorp_fiber_park(void) {
         abort();
     }
     // Resumed here after wakeup
+    blorp_scheduler_debug_assert_fiber("fiber park resume", f);
+    if (blorp_scheduler_debug_enabled() &&
+        !blorp_fiber_wait_operation_is_current(wait)) {
+        blorp_scheduler_debug_abort_fiber(
+            "fiber park resume",
+            "park resumed with stale wait operation",
+            f);
+    }
+    blorp_fiber_clear_wait(f, "fiber park resume");
 }
 
 static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters) {
@@ -21926,10 +23060,17 @@ static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters) {
     blorp_IoWaiter* waiter = waiters->head;
     waiters->head = NULL;
     waiters->tail = NULL;
+    waiters->count = 0;
     while (waiter) {
         blorp_IoWaiter* next = waiter->next;
         waiter->next = NULL;
-        if (waiter->fiber) blorp_fiber_schedule(waiter->fiber);
+        if (waiter->fiber) {
+            blorp_fiber_wake(
+                waiter->fiber,
+                blorp_io_wake_reason_to_fiber_cause(waiter->wake_reason),
+                "io waiter wake");
+        }
+        blorp_io_waiter_release(waiter);
         waiter = next;
     }
 }
@@ -21946,7 +23087,62 @@ static void blorp_io_deadline_queue_ensure_init(void) {
 static uint64_t blorp_monotonic_now_ns(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    return (uint64_t)now.tv_sec * BLORP_NSEC_PER_SEC + (uint64_t)now.tv_nsec;
+}
+
+static uint64_t blorp_timeout_ms_to_ns_saturated(long timeout_ms) {
+    if (timeout_ms <= 0) return 0;
+    uint64_t timeout = (uint64_t)timeout_ms;
+    if (timeout > UINT64_MAX / BLORP_NSEC_PER_MSEC) return UINT64_MAX;
+    return timeout * BLORP_NSEC_PER_MSEC;
+}
+
+static uint64_t blorp_deadline_ns_from_start_ms(
+    uint64_t start_ns,
+    long timeout_ms
+) {
+    if (timeout_ms <= 0) return start_ns;
+    uint64_t timeout_ns = blorp_timeout_ms_to_ns_saturated(timeout_ms);
+    if (timeout_ns == UINT64_MAX || UINT64_MAX - start_ns < timeout_ns) {
+        return UINT64_MAX;
+    }
+    return start_ns + timeout_ns;
+}
+
+static uint64_t blorp_deadline_ns_from_now_ms(long timeout_ms) {
+    return blorp_deadline_ns_from_start_ms(
+        blorp_monotonic_now_ns(),
+        timeout_ms);
+}
+
+static struct timespec blorp_realtime_after_ns(uint64_t delta_ns) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    uint64_t add_sec = delta_ns / BLORP_NSEC_PER_SEC;
+    uint64_t add_nsec = delta_ns % BLORP_NSEC_PER_SEC;
+    if (add_sec > (uint64_t)LONG_MAX ||
+        deadline.tv_sec > (time_t)(LONG_MAX - (long)add_sec - 1)) {
+        deadline.tv_sec = (time_t)LONG_MAX;
+        deadline.tv_nsec = 999999999L;
+        return deadline;
+    }
+    deadline.tv_sec += (time_t)add_sec;
+    deadline.tv_nsec += (long)add_nsec;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return deadline;
+}
+
+static struct timespec blorp_realtime_deadline_from_now_ms(long timeout_ms) {
+    if (timeout_ms <= 0) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        return deadline;
+    }
+    return blorp_realtime_after_ns(
+        blorp_timeout_ms_to_ns_saturated(timeout_ms));
 }
 
 static void blorp_io_deadline_heap_swap(size_t a, size_t b) {
@@ -22301,10 +23497,7 @@ static blorp_IoWakeReason blorp_io_wait_owner_park_current_fiber(
 
     uint64_t deadline_ns = 0;
     if (timeout_ms >= 0) {
-        uint64_t now_ns = blorp_monotonic_now_ns();
-        uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
-        deadline_ns =
-            timeout_ns > UINT64_MAX - now_ns ? UINT64_MAX : now_ns + timeout_ns;
+        deadline_ns = blorp_deadline_ns_from_now_ms(timeout_ms);
     }
 
     blorp_IoWaiter* waiter =
@@ -22322,14 +23515,16 @@ static blorp_IoWakeReason blorp_io_wait_owner_park_current_fiber(
         blorp_io_waiter_cleanup_release);
     blorp_IoWakeReason result = BLORP_IO_WAKE_NONE;
 
-    __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
+    blorp_FiberWaitOperation wait =
+        blorp_fiber_begin_wait(self, BLORP_WAIT_OWNER_IO, "io wait begin");
+    blorp_fiber_prepare_wait_to_park(wait, "io wait ready to park");
     blorp_IoInstallWaiterResult install_result =
         blorp_io_wait_owner_install_waiter(owner, waiter);
     switch (install_result) {
         case BLORP_IO_INSTALL_WAITER_OK:
             break;
         case BLORP_IO_INSTALL_WAITER_BUSY:
-            __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+            blorp_fiber_abandon_wait_before_park(wait, "io wait busy");
             waiter_cleanup.active = false;
             __blorp_task_cleanup_pop_slot_slow(&waiter_cleanup);
             blorp_io_waiter_release(waiter);
@@ -22337,7 +23532,7 @@ static blorp_IoWakeReason blorp_io_wait_owner_park_current_fiber(
         case BLORP_IO_INSTALL_WAITER_INVALID:
         case BLORP_IO_INSTALL_WAITER_CLOSED:
         default:
-            __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+            blorp_fiber_abandon_wait_before_park(wait, "io wait closed");
             waiter_cleanup.active = false;
             __blorp_task_cleanup_pop_slot_slow(&waiter_cleanup);
             blorp_io_waiter_release(waiter);
@@ -22349,7 +23544,7 @@ static blorp_IoWakeReason blorp_io_wait_owner_park_current_fiber(
     // readiness suppression cannot lose a wake.
     if (blorp_io_reactor_take_ready(fd, generation, interest) > 0) {
         (void)blorp_io_wait_owner_remove_waiter(owner, waiter);
-        __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
+        blorp_fiber_abandon_wait_before_park(wait, "io wait ready before park");
         waiter_cleanup.active = false;
         __blorp_task_cleanup_pop_slot_slow(&waiter_cleanup);
         blorp_io_waiter_release(waiter);
@@ -22360,7 +23555,7 @@ static blorp_IoWakeReason blorp_io_wait_owner_park_current_fiber(
         blorp_io_deadline_queue_insert(waiter, owner);
     }
 
-    blorp_fiber_park();
+    blorp_fiber_park(wait);
 
     if (deadline_ns != 0) blorp_io_deadline_queue_remove(waiter);
 
@@ -22413,18 +23608,18 @@ static int blorp_udp_socket_wait_for_reactor(
 }
 
 static void blorp_timer_heap_swap(size_t a, size_t b) {
-    blorp_Fiber* tmp = __fiber_timer_queue.items[a];
+    blorp_TimerWaiter* tmp = __fiber_timer_queue.items[a];
     __fiber_timer_queue.items[a] = __fiber_timer_queue.items[b];
     __fiber_timer_queue.items[b] = tmp;
-    __fiber_timer_queue.items[a]->timer_index = (long)a;
-    __fiber_timer_queue.items[b]->timer_index = (long)b;
+    __fiber_timer_queue.items[a]->heap_index = (long)a;
+    __fiber_timer_queue.items[b]->heap_index = (long)b;
 }
 
 static void blorp_timer_heap_sift_up(size_t idx) {
     while (idx > 0) {
         size_t parent = (idx - 1) / 2;
-        if (__fiber_timer_queue.items[parent]->wake_time_ns <=
-            __fiber_timer_queue.items[idx]->wake_time_ns) {
+        if (__fiber_timer_queue.items[parent]->deadline_ns <=
+            __fiber_timer_queue.items[idx]->deadline_ns) {
             break;
         }
         blorp_timer_heap_swap(parent, idx);
@@ -22438,13 +23633,13 @@ static void blorp_timer_heap_sift_down(size_t idx) {
         size_t right = left + 1;
         size_t smallest = idx;
         if (left < __fiber_timer_queue.len &&
-            __fiber_timer_queue.items[left]->wake_time_ns <
-                __fiber_timer_queue.items[smallest]->wake_time_ns) {
+            __fiber_timer_queue.items[left]->deadline_ns <
+                __fiber_timer_queue.items[smallest]->deadline_ns) {
             smallest = left;
         }
         if (right < __fiber_timer_queue.len &&
-            __fiber_timer_queue.items[right]->wake_time_ns <
-                __fiber_timer_queue.items[smallest]->wake_time_ns) {
+            __fiber_timer_queue.items[right]->deadline_ns <
+                __fiber_timer_queue.items[smallest]->deadline_ns) {
             smallest = right;
         }
         if (smallest == idx) break;
@@ -22457,13 +23652,13 @@ static void blorp_timer_heap_reserve(size_t needed) {
     if (__fiber_timer_queue.cap >= needed) return;
     size_t new_cap = __fiber_timer_queue.cap ? __fiber_timer_queue.cap * 2 : 64;
     while (new_cap < needed) new_cap *= 2;
-    if (new_cap > SIZE_MAX / sizeof(blorp_Fiber*)) {
+    if (new_cap > SIZE_MAX / sizeof(blorp_TimerWaiter*)) {
         fprintf(stderr, "blorp: timer queue capacity overflow\n");
         exit(1);
     }
-    blorp_Fiber** new_items =
-        (blorp_Fiber**)realloc(__fiber_timer_queue.items,
-            new_cap * sizeof(blorp_Fiber*));
+    blorp_TimerWaiter** new_items =
+        (blorp_TimerWaiter**)realloc(__fiber_timer_queue.items,
+            new_cap * sizeof(blorp_TimerWaiter*));
     if (!new_items) {
         fprintf(stderr, "blorp: out of memory (timer queue %zu entries)\n",
             new_cap);
@@ -22473,15 +23668,15 @@ static void blorp_timer_heap_reserve(size_t needed) {
     __fiber_timer_queue.cap = new_cap;
 }
 
-static blorp_Fiber* blorp_timer_heap_pop_min(void) {
+static blorp_TimerWaiter* blorp_timer_heap_pop_min(void) {
     if (__fiber_timer_queue.len == 0) return NULL;
-    blorp_Fiber* min = __fiber_timer_queue.items[0];
-    min->timer_index = -1;
+    blorp_TimerWaiter* min = __fiber_timer_queue.items[0];
+    min->heap_index = -1;
     __fiber_timer_queue.len--;
     if (__fiber_timer_queue.len > 0) {
         __fiber_timer_queue.items[0] =
             __fiber_timer_queue.items[__fiber_timer_queue.len];
-        __fiber_timer_queue.items[0]->timer_index = 0;
+        __fiber_timer_queue.items[0]->heap_index = 0;
         blorp_timer_heap_sift_down(0);
     }
     return min;
@@ -22489,37 +23684,47 @@ static blorp_Fiber* blorp_timer_heap_pop_min(void) {
 
 static void blorp_timer_heap_remove_at(size_t idx) {
     if (idx >= __fiber_timer_queue.len) return;
-    blorp_Fiber* removed = __fiber_timer_queue.items[idx];
-    removed->timer_index = -1;
+    blorp_TimerWaiter* removed = __fiber_timer_queue.items[idx];
+    removed->heap_index = -1;
+    removed->wait = blorp_fiber_no_wait_operation();
     __fiber_timer_queue.len--;
     if (idx == __fiber_timer_queue.len) return;
     __fiber_timer_queue.items[idx] =
         __fiber_timer_queue.items[__fiber_timer_queue.len];
-    __fiber_timer_queue.items[idx]->timer_index = (long)idx;
+    __fiber_timer_queue.items[idx]->heap_index = (long)idx;
     blorp_timer_heap_sift_down(idx);
     blorp_timer_heap_sift_up(idx);
 }
 
-// Insert fiber into the timer min-heap.
-static void blorp_timer_queue_insert(blorp_Fiber* f) {
+// Insert waiter into the timer min-heap.
+static void blorp_timer_queue_insert(blorp_TimerWaiter* waiter) {
+    if (!waiter || !waiter->fiber) return;
+    blorp_Fiber* f = waiter->fiber;
+    blorp_scheduler_debug_assert_fiber("timer queue insert", f);
+    blorp_FiberWaitOperation wait = waiter->wait;
+    if (blorp_scheduler_debug_enabled() && wait.id == 0) {
+        blorp_scheduler_debug_abort_fiber(
+            "timer queue insert", "timer inserted without wait operation", f);
+    }
     __blorp_scheduler_stat_lock(
         &__fiber_timer_queue.lock,
         &global_scheduler_stats.timer_lock_contentions);
     bool changes_next_expiry =
         __fiber_timer_queue.len == 0 ||
-        f->wake_time_ns < __fiber_timer_queue.items[0]->wake_time_ns;
-    if (f->timer_index >= 0 &&
-        (size_t)f->timer_index < __fiber_timer_queue.len &&
-        __fiber_timer_queue.items[f->timer_index] == f) {
-        blorp_timer_heap_remove_at((size_t)f->timer_index);
+        waiter->deadline_ns < __fiber_timer_queue.items[0]->deadline_ns;
+    if (waiter->heap_index >= 0 &&
+        (size_t)waiter->heap_index < __fiber_timer_queue.len &&
+        __fiber_timer_queue.items[waiter->heap_index] == waiter) {
+        blorp_timer_heap_remove_at((size_t)waiter->heap_index);
+        waiter->wait = wait;
         changes_next_expiry =
             __fiber_timer_queue.len == 0 ||
-            f->wake_time_ns < __fiber_timer_queue.items[0]->wake_time_ns;
+            waiter->deadline_ns < __fiber_timer_queue.items[0]->deadline_ns;
     }
     blorp_timer_heap_reserve(__fiber_timer_queue.len + 1);
     size_t idx = __fiber_timer_queue.len++;
-    __fiber_timer_queue.items[idx] = f;
-    f->timer_index = (long)idx;
+    __fiber_timer_queue.items[idx] = waiter;
+    waiter->heap_index = (long)idx;
     blorp_timer_heap_sift_up(idx);
     __blorp_scheduler_stat_inc(&global_scheduler_stats.timer_inserts);
     pthread_mutex_unlock(&__fiber_timer_queue.lock);
@@ -22532,60 +23737,63 @@ static void blorp_timer_queue_insert(blorp_Fiber* f) {
     }
 }
 
-// Remove a specific fiber from the timer queue (if present).
-// Called when a fiber is woken by a non-timer mechanism (e.g., task completion)
-// while also having a pending timer entry.
-static void blorp_timer_queue_remove(blorp_Fiber* f) {
+// Remove a specific waiter from the timer queue (if present).
+// Called when a fiber is woken by a non-timer mechanism while also having a
+// pending timer entry.
+static void blorp_timer_queue_remove(blorp_TimerWaiter* waiter) {
+    if (!waiter) return;
     __blorp_scheduler_stat_lock(
         &__fiber_timer_queue.lock,
         &global_scheduler_stats.timer_lock_contentions);
-    if (f->timer_index >= 0) {
-        size_t idx = (size_t)f->timer_index;
-        if (idx < __fiber_timer_queue.len && __fiber_timer_queue.items[idx] == f) {
+    if (waiter->heap_index >= 0) {
+        size_t idx = (size_t)waiter->heap_index;
+        if (idx < __fiber_timer_queue.len &&
+            __fiber_timer_queue.items[idx] == waiter) {
             blorp_timer_heap_remove_at(idx);
         } else {
-            f->timer_index = -1;
+            waiter->heap_index = -1;
+            waiter->wait = blorp_fiber_no_wait_operation();
         }
+    } else {
+        waiter->wait = blorp_fiber_no_wait_operation();
     }
     pthread_mutex_unlock(&__fiber_timer_queue.lock);
 }
 
 // Move expired timers to run queue. Returns next expiry time (0 if none).
 static uint64_t blorp_timer_queue_drain(void) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
-    uint64_t next_expiry = 0;
+    uint64_t now_ns = blorp_monotonic_now_ns();
+    blorp_TimerWaiter* stack_expired[64];
+    size_t expired_cap = sizeof(stack_expired) / sizeof(stack_expired[0]);
 
-    __blorp_scheduler_stat_lock(
-        &__fiber_timer_queue.lock,
-        &global_scheduler_stats.timer_lock_contentions);
-    blorp_Fiber* expired_head = NULL;
-    blorp_Fiber* expired_tail = NULL;
-    while (__fiber_timer_queue.len > 0 &&
-           __fiber_timer_queue.items[0]->wake_time_ns <= now_ns) {
-        blorp_Fiber* f = blorp_timer_heap_pop_min();
-        __blorp_scheduler_stat_inc(&global_scheduler_stats.timer_expirations);
-        f->timer_drain_next = NULL;
-        if (expired_tail) {
-            expired_tail->timer_drain_next = f;
-        } else {
-            expired_head = f;
+    while (true) {
+        uint64_t next_expiry = 0;
+        size_t expired_count = 0;
+        bool more_expired = false;
+
+        __blorp_scheduler_stat_lock(
+            &__fiber_timer_queue.lock,
+            &global_scheduler_stats.timer_lock_contentions);
+        while (__fiber_timer_queue.len > 0 &&
+               __fiber_timer_queue.items[0]->deadline_ns <= now_ns &&
+               expired_count < expired_cap) {
+            blorp_TimerWaiter* waiter = blorp_timer_heap_pop_min();
+            stack_expired[expired_count++] = waiter;
+            __blorp_scheduler_stat_inc(
+                &global_scheduler_stats.timer_expirations);
         }
-        expired_tail = f;
-    }
-    if (__fiber_timer_queue.len > 0) {
-        next_expiry = __fiber_timer_queue.items[0]->wake_time_ns;
-    }
-    pthread_mutex_unlock(&__fiber_timer_queue.lock);
+        if (__fiber_timer_queue.len > 0) {
+            next_expiry = __fiber_timer_queue.items[0]->deadline_ns;
+            more_expired = next_expiry <= now_ns;
+        }
+        pthread_mutex_unlock(&__fiber_timer_queue.lock);
 
-    while (expired_head) {
-        blorp_Fiber* f = expired_head;
-        expired_head = f->timer_drain_next;
-        f->timer_drain_next = NULL;
-        blorp_fiber_schedule(f);
+        for (size_t i = 0; i < expired_count; i++) {
+            (void)blorp_timer_waiter_wake(
+                stack_expired[i], BLORP_WAKE_TIMEOUT, "timer queue drain");
+        }
+        if (!more_expired) return next_expiry;
     }
-    return next_expiry;
 }
 
 // Pop a fiber from a run queue (non-blocking). Caller must hold queue->lock.
@@ -22596,7 +23804,10 @@ static blorp_Fiber* blorp_fiber_run_queue_pop(blorp_FiberRunQueue* queue) {
         if (!queue->head) queue->tail = NULL;
         queue->fiber_count--;
         f->run_next = NULL;
-        __atomic_store_n(&f->queued, 0, __ATOMIC_RELEASE);
+        blorp_fiber_state_lock(f);
+        blorp_fiber_mark_dispatched(f, "fiber run queue pop");
+        blorp_scheduler_debug_assert_fiber("fiber run queue pop", f);
+        blorp_fiber_state_unlock(f);
         __blorp_scheduler_stat_inc(&global_scheduler_stats.run_queue_pops);
         atomic_fetch_sub_explicit(
             &__fiber_runnable_count, 1, memory_order_release);
@@ -22629,11 +23840,24 @@ static void blorp_fiber_destroy_list(blorp_Fiber* fibers) {
     while (fibers) {
         blorp_Fiber* next = fibers->run_next;
         fibers->run_next = NULL;
-        if (fibers->coro) { mco_destroy(fibers->coro); }
+        if (fibers->coro) {
+            mco_destroy(fibers->coro);
+            fibers->coro = NULL;
+        }
         blorp_fiber_object_recycle(fibers);
         fibers = next;
     }
 }
+
+typedef struct blorp_TaskJoinWaiter {
+    blorp_FiberWaitOperation wait;
+    blorp_FiberWakeCause wake_cause;
+} blorp_TaskJoinWaiter;
+
+typedef enum {
+    BLORP_TASK_JOIN_SLOT_EMPTY,
+    BLORP_TASK_JOIN_SLOT_WAITING
+} blorp_TaskJoinSlotState;
 
 // Task handle (ARC-managed)
 typedef struct blorp_Task_s {
@@ -22646,7 +23870,8 @@ typedef struct blorp_Task_s {
     blorp_Closure* func;    // The closure to execute (retained)
     bool result_is_rc;      // True if result is a refcounted heap object
     bool stats_active_counted;
-    blorp_Fiber* waiting_fiber;  // Fiber blocked on join (NULL if none)
+    blorp_TaskJoinSlotState join_slot_state;
+    blorp_TaskJoinWaiter* waiting_joiner;  // Fiber blocked on join (NULL if none)
     blorp_Fiber* task_fiber;     // Fiber executing the task, if any
     jmp_buf cancel_jmp;          // Escape point for cooperative cancellation
     bool cancel_jmp_ready;       // True while cancel_jmp is active
@@ -22789,10 +24014,73 @@ static inline void blorp_task_cleanup_pop_slot(const void* slot) {
 #endif
 }
 
+static void blorp_task_cleanup_deactivate_frame_keep_link(
+    blorp_CancelCleanupFrame* frame
+) {
+    if (!frame) return;
+    frame->slot = NULL;
+    frame->value = NULL;
+    frame->release_value = NULL;
+    frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
+    frame->active = false;
+}
+
+static void blorp_task_cleanup_deactivate_slot_in_frame_list(
+    blorp_CancelCleanupFrame* frames,
+    const void* slot
+) {
+    if (!slot) return;
+    for (blorp_CancelCleanupFrame* f = frames; f; f = f->prev) {
+        if (f->active && f->slot == slot) {
+            blorp_task_cleanup_deactivate_frame_keep_link(f);
+            return;
+        }
+    }
+}
+
+static void blorp_concurrent_task_window_cancel_active(
+    blorp_ConcurrentTaskWindow* window
+) {
+    if (!blorp_concurrent_task_window_is_active(window)) return;
+    blorp_concurrent_task_window_flush_pending(window);
+    for (long i = 0; i < window->capacity; i++) {
+        blorp_Task* task = (blorp_Task*)window->tasks[i];
+        if (task) blorp_task_cancel(task);
+    }
+}
+
+static void blorp_concurrent_task_window_cancel_join_active_from_cancel_frames(
+    blorp_ConcurrentTaskWindow* window,
+    blorp_CancelCleanupFrame* frames
+) {
+    if (!blorp_concurrent_task_window_is_active(window)) return;
+    blorp_concurrent_task_window_flush_pending(window);
+    for (long i = 0; i < window->capacity; i++) {
+        blorp_Task* task = (blorp_Task*)window->tasks[i];
+        if (!task) continue;
+        blorp_task_cleanup_deactivate_slot_in_frame_list(
+            frames,
+            &window->tasks[i]);
+        blorp_task_cancel_join_release(task);
+        window->tasks[i] = NULL;
+    }
+}
+
 static void __blorp_task_cleanup_drain(blorp_Task* task) {
     if (!task) return;
     blorp_CancelCleanupFrame* frame = task->cleanup_stack;
     task->cleanup_stack = NULL;
+
+    // Batched child fibers must be made runnable before any task cleanup waits
+    // for them. Otherwise cancellation can wait on a task still sitting in a
+    // task-window batch that no worker can observe.
+    for (blorp_CancelCleanupFrame* f = frame; f; f = f->prev) {
+        if (f->active && f->kind == BLORP_CANCEL_CLEANUP_TASK_WINDOW &&
+            f->value) {
+            blorp_concurrent_task_window_flush_pending(
+                (blorp_ConcurrentTaskWindow*)f->value);
+        }
+    }
 
     // Structured task scopes should be cancelled as a group before any cleanup
     // callback waits for one child. Otherwise a cancelled parent can block on
@@ -22801,6 +24089,27 @@ static void __blorp_task_cleanup_drain(blorp_Task* task) {
     for (blorp_CancelCleanupFrame* f = frame; f; f = f->prev) {
         if (f->active && f->kind == BLORP_CANCEL_CLEANUP_TASK && f->value) {
             blorp_task_cancel(f->value);
+        } else if (
+            f->active && f->kind == BLORP_CANCEL_CLEANUP_TASK_WINDOW &&
+            f->value) {
+            blorp_concurrent_task_window_cancel_active(
+                (blorp_ConcurrentTaskWindow*)f->value);
+        }
+    }
+
+    // Task-window cleanup owns any still-live task slots during cancellation.
+    // It also marks each matching slot cleanup frame inactive in the detached
+    // cleanup list so a child task is not joined and released twice.
+    for (blorp_CancelCleanupFrame* f = frame; f; f = f->prev) {
+        if (f->active && f->kind == BLORP_CANCEL_CLEANUP_TASK_WINDOW &&
+            f->value) {
+            blorp_concurrent_task_window_cancel_join_active_from_cancel_frames(
+                (blorp_ConcurrentTaskWindow*)f->value,
+                frame);
+            f->slot = NULL;
+            f->release_value =
+                blorp_concurrent_task_window_cleanup_storage;
+            f->kind = BLORP_CANCEL_CLEANUP_GENERIC;
         }
     }
 
@@ -22810,11 +24119,7 @@ static void __blorp_task_cleanup_drain(blorp_Task* task) {
             frame->release_value(frame->value);
         }
         frame->prev = NULL;
-        frame->slot = NULL;
-        frame->value = NULL;
-        frame->release_value = NULL;
-        frame->kind = BLORP_CANCEL_CLEANUP_GENERIC;
-        frame->active = false;
+        blorp_task_cleanup_deactivate_frame_keep_link(frame);
         frame = next;
     }
 }
@@ -22862,18 +24167,116 @@ static void __blorp_task_discard_result_locked(blorp_Task* task) {
     task->joined = true;
 }
 
+static void __blorp_task_join_waiter_init(
+    blorp_TaskJoinWaiter* waiter,
+    blorp_FiberWaitOperation wait
+) {
+    if (!waiter) return;
+    waiter->wait = wait;
+    waiter->wake_cause = BLORP_WAKE_READY;
+    blorp_fiber_debug_assert_current_wait_operation(
+        wait,
+        BLORP_WAIT_OWNER_TASK_JOIN,
+        "task join waiter init",
+        "task join waiter created without task join operation",
+        "task join waiter created for stale wait operation");
+}
+
+static bool __blorp_task_join_waiter_current(
+    blorp_TaskJoinWaiter* waiter
+) {
+    if (!waiter) {
+        return false;
+    }
+    return blorp_fiber_wait_operation_is_current(waiter->wait);
+}
+
+static void __blorp_task_join_slot_abort(
+    const char* where,
+    const char* reason
+) {
+    fprintf(
+        stderr,
+        "\nblorp: internal scheduler error at %s: %s\n",
+        where ? where : "task join slot",
+        reason ? reason : "invalid task join slot state");
+    abort();
+}
+
+static void __blorp_task_join_slot_clear_locked(blorp_Task* task) {
+    if (!task) return;
+    task->waiting_joiner = NULL;
+    task->join_slot_state = BLORP_TASK_JOIN_SLOT_EMPTY;
+}
+
+static void __blorp_task_join_waiter_install_locked(
+    blorp_Task* task,
+    blorp_TaskJoinWaiter* waiter,
+    const char* where
+) {
+    if (!task) return;
+    if (task->join_slot_state == BLORP_TASK_JOIN_SLOT_WAITING ||
+        task->waiting_joiner) {
+        if (task->waiting_joiner == waiter) {
+            return;
+        }
+        if (task->waiting_joiner &&
+            !__blorp_task_join_waiter_current(task->waiting_joiner)) {
+            __blorp_task_join_slot_clear_locked(task);
+        } else {
+            __blorp_task_join_slot_abort(
+                where,
+                "task already has a current join waiter");
+        }
+    }
+    task->waiting_joiner = waiter;
+    task->join_slot_state = BLORP_TASK_JOIN_SLOT_WAITING;
+}
+
+static void __blorp_task_join_waiter_remove_locked(
+    blorp_Task* task,
+    blorp_TaskJoinWaiter* waiter
+) {
+    if (!task || !waiter) return;
+    if (task->waiting_joiner == waiter) {
+        __blorp_task_join_slot_clear_locked(task);
+    }
+}
+
+static void __blorp_task_join_waiter_wake(
+    blorp_TaskJoinWaiter* waiter,
+    blorp_FiberWakeCause cause
+) {
+    if (!waiter) return;
+    waiter->wake_cause = cause;
+    if (!__blorp_task_join_waiter_current(waiter)) {
+        // A stale task join wait operation can be left behind if timeout or
+        // cancellation resumes the joiner before task completion drains the
+        // join slot. The operation id prevents completion from waking a later
+        // wait on the same fiber.
+        return;
+    }
+    blorp_fiber_wake(waiter->wait.fiber, cause, "task complete");
+}
+
 static void __blorp_task_wait_completed(blorp_Task* task) {
     blorp_Fiber* self = __blorp_current_fiber;
     pthread_mutex_lock(&task->mutex);
     while (!task->completed) {
         if (self) {
-            __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-            task->waiting_fiber = self;
+            blorp_TaskJoinWaiter waiter;
+            blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+                self, BLORP_WAIT_OWNER_TASK_JOIN, "task wait begin");
+            __blorp_task_join_waiter_init(&waiter, wait);
+            blorp_fiber_prepare_wait_to_park(
+                wait, "task wait ready to park");
+            __blorp_task_join_waiter_install_locked(
+                task, &waiter, "task wait begin");
             pthread_mutex_unlock(&task->mutex);
-            blorp_fiber_park();
+            blorp_fiber_park(wait);
             pthread_mutex_lock(&task->mutex);
+            __blorp_task_join_waiter_remove_locked(task, &waiter);
             if (!task->completed && __blorp_is_cancelled()) {
-                if (task->waiting_fiber == self) task->waiting_fiber = NULL;
                 pthread_mutex_unlock(&task->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
                 return;
@@ -22887,7 +24290,6 @@ static void __blorp_task_wait_completed(blorp_Task* task) {
             }
         }
     }
-    if (self && task->waiting_fiber == self) task->waiting_fiber = NULL;
     pthread_mutex_unlock(&task->mutex);
 }
 
@@ -22896,16 +24298,22 @@ static void __blorp_task_wait_completed_uncancellable(blorp_Task* task) {
     pthread_mutex_lock(&task->mutex);
     while (!task->completed) {
         if (self) {
-            __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-            task->waiting_fiber = self;
+            blorp_TaskJoinWaiter waiter;
+            blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+                self, BLORP_WAIT_OWNER_TASK_JOIN, "task wait begin");
+            __blorp_task_join_waiter_init(&waiter, wait);
+            blorp_fiber_prepare_wait_to_park(
+                wait, "task wait ready to park");
+            __blorp_task_join_waiter_install_locked(
+                task, &waiter, "task wait begin");
             pthread_mutex_unlock(&task->mutex);
-            blorp_fiber_park();
+            blorp_fiber_park(wait);
             pthread_mutex_lock(&task->mutex);
+            __blorp_task_join_waiter_remove_locked(task, &waiter);
         } else {
             pthread_cond_wait(&task->done_cond, &task->mutex);
         }
     }
-    if (self && task->waiting_fiber == self) task->waiting_fiber = NULL;
     pthread_mutex_unlock(&task->mutex);
 }
 
@@ -22921,12 +24329,12 @@ static void __blorp_task_complete(blorp_Task* task, void* result) {
     }
     task->task_fiber = NULL;
     task->cancel_jmp_ready = false;
-    blorp_Fiber* waiter = task->waiting_fiber;
-    task->waiting_fiber = NULL;
+    blorp_TaskJoinWaiter* waiter = task->waiting_joiner;
+    __blorp_task_join_slot_clear_locked(task);
     pthread_cond_broadcast(&task->done_cond);
+    // Keep the stack-scoped join waiter live until the wake decision is made.
+    __blorp_task_join_waiter_wake(waiter, BLORP_WAKE_READY);
     pthread_mutex_unlock(&task->mutex);
-    // Wake fiber waiter (outside lock — schedule is lock-safe)
-    if (waiter) blorp_fiber_schedule(waiter);
     // Release the task ref held by the worker/fiber
     blorp_release(task);
 }
@@ -22990,7 +24398,8 @@ static blorp_Task* __blorp_task_alloc(
         closure_ownership == BLORP_TASK_OWNS_CLOSURE
             ? func
             : (blorp_Closure*)blorp_retain(func);
-    task->waiting_fiber = NULL;
+    task->join_slot_state = BLORP_TASK_JOIN_SLOT_EMPTY;
+    task->waiting_joiner = NULL;
     task->task_fiber = NULL;
     task->cancel_jmp_ready = false;
     task->cleanup_stack = NULL;
@@ -23034,7 +24443,7 @@ void* blorp_task_spawn_owned(blorp_Closure* func) {
         func, BLORP_TASK_OWNS_CLOSURE, false, blorp_task_schedule_immediate());
 }
 
-void* blorp_task_spawn_owned_in_batch(
+static void* blorp_task_spawn_owned_in_batch(
     blorp_TaskBatch* batch,
     blorp_Closure* func
 ) {
@@ -23060,12 +24469,107 @@ void* blorp_task_spawn_owned_rc(blorp_Closure* func) {
         func, BLORP_TASK_OWNS_CLOSURE, true, blorp_task_schedule_immediate());
 }
 
-void* blorp_task_spawn_owned_rc_in_batch(
+static void* blorp_task_spawn_owned_rc_in_batch(
     blorp_TaskBatch* batch,
     blorp_Closure* func
 ) {
     return __blorp_task_spawn_impl(
         func, BLORP_TASK_OWNS_CLOSURE, true, blorp_task_schedule_batch(batch));
+}
+
+static void blorp_concurrent_spawn_owned_cleanup_in_batch(
+    blorp_TaskBatch* batch,
+    blorp_Closure* func,
+    blorp_CancelCleanupFrame* cleanup,
+    void** task_slot
+) {
+    blorp_Task* task = (blorp_Task*)blorp_task_spawn_owned_in_batch(batch, func);
+    if (task_slot) *task_slot = task;
+    blorp_task_cleanup_push_task(cleanup, task_slot, task);
+}
+
+static void blorp_concurrent_spawn_owned_rc_cleanup_in_batch(
+    blorp_TaskBatch* batch,
+    blorp_Closure* func,
+    blorp_CancelCleanupFrame* cleanup,
+    void** task_slot
+) {
+    blorp_Task* task =
+        (blorp_Task*)blorp_task_spawn_owned_rc_in_batch(batch, func);
+    if (task_slot) *task_slot = task;
+    blorp_task_cleanup_push_task(cleanup, task_slot, task);
+}
+
+static bool blorp_concurrent_task_window_slot_valid(
+    blorp_ConcurrentTaskWindow* window,
+    long slot
+) {
+    return blorp_concurrent_task_window_is_active(window) &&
+           slot >= 0 &&
+           slot < window->capacity;
+}
+
+static void blorp_concurrent_task_window_check_slot(
+    blorp_ConcurrentTaskWindow* window,
+    long slot
+) {
+    if (blorp_concurrent_task_window_slot_valid(window, slot)) return;
+    fprintf(stderr, "blorp: invalid concurrent task window slot (bug)\n");
+    abort();
+}
+
+static void blorp_concurrent_task_window_flush(
+    blorp_ConcurrentTaskWindow* window
+) {
+    if (!blorp_concurrent_task_window_is_active(window)) return;
+    blorp_task_batch_flush(&window->batch);
+}
+
+static void blorp_concurrent_task_window_after_spawn(
+    blorp_ConcurrentTaskWindow* window,
+    blorp_ConcurrentTaskFlushMode flush_mode
+) {
+    blorp_concurrent_task_window_check_active(
+        window,
+        "task window after spawn");
+    window->batch_spawn_count++;
+    if (flush_mode == BLORP_CONCURRENT_TASK_FLUSH_IMMEDIATE) {
+        blorp_concurrent_task_window_flush(window);
+        return;
+    }
+    blorp_task_batch_flush_periodically(
+        &window->batch,
+        window->batch_spawn_count);
+}
+
+void blorp_concurrent_task_window_spawn_owned(
+    blorp_ConcurrentTaskWindow* window,
+    long slot,
+    blorp_Closure* func,
+    blorp_ConcurrentTaskFlushMode flush_mode
+) {
+    blorp_concurrent_task_window_check_slot(window, slot);
+    blorp_concurrent_spawn_owned_cleanup_in_batch(
+        &window->batch,
+        func,
+        &window->cleanups[slot],
+        (void**)&window->tasks[slot]);
+    blorp_concurrent_task_window_after_spawn(window, flush_mode);
+}
+
+void blorp_concurrent_task_window_spawn_owned_rc(
+    blorp_ConcurrentTaskWindow* window,
+    long slot,
+    blorp_Closure* func,
+    blorp_ConcurrentTaskFlushMode flush_mode
+) {
+    blorp_concurrent_task_window_check_slot(window, slot);
+    blorp_concurrent_spawn_owned_rc_cleanup_in_batch(
+        &window->batch,
+        func,
+        &window->cleanups[slot],
+        (void**)&window->tasks[slot]);
+    blorp_concurrent_task_window_after_spawn(window, flush_mode);
 }
 
 // Cancel a task — sets the cancelled flag and wakes the task's fiber if parked.
@@ -23121,13 +24625,18 @@ void* blorp_task_join(void* t) {
         return blorp_result_err(blorp_string_literal("task already joined"));
     }
     if (!task->completed && self) {
-        // Fiber path: set parked BEFORE inserting into wakeup structure
-        __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-        task->waiting_fiber = self;
+        // Fiber path: prepare to park before inserting into wakeup structure.
+        blorp_TaskJoinWaiter waiter;
+        blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+            self, BLORP_WAIT_OWNER_TASK_JOIN, "task join begin");
+        __blorp_task_join_waiter_init(&waiter, wait);
+        blorp_fiber_prepare_wait_to_park(wait, "task join ready to park");
+        __blorp_task_join_waiter_install_locked(
+            task, &waiter, "task join begin");
         pthread_mutex_unlock(&task->mutex);
-        blorp_fiber_park();
+        blorp_fiber_park(wait);
         pthread_mutex_lock(&task->mutex);
-        if (task->waiting_fiber == self) task->waiting_fiber = NULL;
+        __blorp_task_join_waiter_remove_locked(task, &waiter);
         if (__blorp_is_cancelled()) {
             pthread_mutex_unlock(&task->mutex);
             if (__blorp_cancel_current_task_if_requested()) {
@@ -23182,58 +24691,28 @@ void* blorp_task_try_join(void* t) {
     return opt;
 }
 
-// concurrent_join(task, timeout_ms) -> Result[T, ConcurrencyError]
-// timeout_ms < 0 means no timeout (wait forever).
-// Returns Ok(result) on success, Err(Timeout) on timeout.
-// Same ownership transfer as task_join.
-static inline uint64_t __blorp_deadline_ns_from_timeout_ms(long timeout_ms) {
-    uint64_t now_ns = blorp_monotonic_now_ns();
-    if (timeout_ms <= 0) return now_ns;
-    uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
-    if (timeout_ns / 1000000ULL != (uint64_t)timeout_ms) return UINT64_MAX;
-    if (UINT64_MAX - now_ns < timeout_ns) return UINT64_MAX;
-    return now_ns + timeout_ns;
-}
-
-static inline struct timespec __blorp_realtime_deadline_from_timeout_ms(long timeout_ms) {
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    if (timeout_ms <= 0) return deadline;
-
-    long add_sec = timeout_ms / 1000;
-    long add_nsec = (timeout_ms % 1000) * 1000000L;
-    if (deadline.tv_sec > (time_t)(LONG_MAX - add_sec - 1)) {
-        deadline.tv_sec = (time_t)LONG_MAX;
-        deadline.tv_nsec = 999999999L;
-        return deadline;
-    }
-
-    deadline.tv_nsec += add_nsec;
-    deadline.tv_sec += add_sec + deadline.tv_nsec / 1000000000L;
-    deadline.tv_nsec %= 1000000000L;
-    return deadline;
-}
-
 long blorp_concurrent_deadline_us(long timeout_ms) {
-    uint64_t now_us = blorp_monotonic_now_ns() / 1000ULL;
+    uint64_t now_us = blorp_monotonic_now_ns() / BLORP_USEC_PER_MSEC;
     uint64_t max_long = (uint64_t)LONG_MAX;
     if (now_us > max_long) return LONG_MAX;
     if (timeout_ms <= 0) return (long)now_us;
 
-    uint64_t timeout_us = (uint64_t)timeout_ms * 1000ULL;
-    if (timeout_us / 1000ULL != (uint64_t)timeout_ms) return LONG_MAX;
+    uint64_t timeout = (uint64_t)timeout_ms;
+    if (timeout > max_long / BLORP_USEC_PER_MSEC) return LONG_MAX;
+    uint64_t timeout_us = timeout * BLORP_USEC_PER_MSEC;
     if (max_long - now_us < timeout_us) return LONG_MAX;
     return (long)(now_us + timeout_us);
 }
 
 long blorp_concurrent_remaining_ms(long deadline_us) {
     if (deadline_us <= 0) return 0;
-    uint64_t now_us = blorp_monotonic_now_ns() / 1000ULL;
+    uint64_t now_us = blorp_monotonic_now_ns() / BLORP_USEC_PER_MSEC;
     uint64_t deadline = (uint64_t)deadline_us;
     if (deadline <= now_us) return 0;
 
     uint64_t remaining_us = deadline - now_us;
-    uint64_t remaining_ms = (remaining_us + 999ULL) / 1000ULL;
+    uint64_t remaining_ms =
+        (remaining_us + BLORP_USEC_PER_MSEC - 1ULL) / BLORP_USEC_PER_MSEC;
     return remaining_ms > (uint64_t)LONG_MAX ? LONG_MAX : (long)remaining_ms;
 }
 
@@ -23293,6 +24772,473 @@ long blorp_test_cancel_after_parked(blorp_Closure* func) {
     return observed_parked ? 1 : 0;
 }
 
+static void* blorp_test_task_window_noop(void* env) {
+    (void)env;
+    return NULL;
+}
+
+long blorp_test_task_window_pending_cleanup_probe(void) {
+    blorp_thread_pool_ensure_initialized();
+
+    blorp_ConcurrentTaskWindow window = {0};
+    blorp_CancelCleanupFrame cleanup;
+    blorp_concurrent_task_window_begin(&window, &cleanup, 4);
+
+    bool initialized =
+        window.tasks != NULL &&
+        window.cleanups != NULL &&
+        window.capacity == 4 &&
+        window.batch.runnable_count == 0 &&
+        window.state == BLORP_CONCURRENT_TASK_WINDOW_ACTIVE;
+
+    for (long i = 0; i < 4; i++) {
+        blorp_Closure* closure =
+            blorp_closure_new((void*)blorp_test_task_window_noop, NULL);
+        blorp_concurrent_task_window_spawn_owned(
+            &window,
+            i,
+            closure,
+            BLORP_CONCURRENT_TASK_FLUSH_PERIODIC);
+    }
+
+    bool pending_batch =
+        window.batch_spawn_count == 4 &&
+        window.batch.runnable_count == 4;
+    bool slots_owned = true;
+    for (long i = 0; i < 4; i++) {
+        slots_owned = slots_owned && window.tasks[i] != NULL;
+    }
+
+    blorp_concurrent_task_window_end(&window);
+    bool cleaned =
+        window.tasks == NULL &&
+        window.cleanups == NULL &&
+        window.capacity == 0 &&
+        window.batch.runnable_count == 0 &&
+        window.batch_spawn_count == 0 &&
+        window.state == BLORP_CONCURRENT_TASK_WINDOW_ENDED;
+
+    return initialized && pending_batch && slots_owned && cleaned;
+}
+
+long blorp_test_task_join_slot_probe(void) {
+    blorp_Task task;
+    memset(&task, 0, sizeof(task));
+    task.join_slot_state = BLORP_TASK_JOIN_SLOT_WAITING;
+
+    blorp_TaskJoinWaiter stale;
+    stale.wait = blorp_fiber_no_wait_operation();
+    stale.wake_cause = BLORP_WAKE_READY;
+    task.waiting_joiner = &stale;
+
+    blorp_TaskJoinWaiter fresh;
+    fresh.wait = blorp_fiber_no_wait_operation();
+    fresh.wake_cause = BLORP_WAKE_READY;
+    __blorp_task_join_waiter_install_locked(
+        &task, &fresh, "task join slot probe");
+    bool replaced_stale =
+        task.join_slot_state == BLORP_TASK_JOIN_SLOT_WAITING &&
+        task.waiting_joiner == &fresh;
+
+    __blorp_task_join_waiter_remove_locked(&task, &fresh);
+    bool cleared =
+        task.join_slot_state == BLORP_TASK_JOIN_SLOT_EMPTY &&
+        task.waiting_joiner == NULL;
+
+    return replaced_stale && cleared;
+}
+
+static void blorp_test_timer_probe_fiber_init(blorp_Fiber* fiber) {
+    memset(fiber, 0, sizeof(*fiber));
+    atomic_store_explicit(
+        &fiber->lifecycle_state, (int)BLORP_FIBER_RUNNING,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &fiber->wake_cause, (int)BLORP_WAKE_READY, memory_order_relaxed);
+    atomic_store_explicit(
+        &fiber->wait_owner_kind, (int)BLORP_WAIT_OWNER_NONE,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &fiber->wait_operation_id, 0, memory_order_relaxed);
+    fiber->parked = 0;
+    fiber->queued = 0;
+    fiber->running = 1;
+    fiber->wake_pending = 0;
+    fiber->state_lock = 0;
+    fiber->owner_worker_id = -1;
+    fiber->channel_wait_kind = BLORP_CHANNEL_WAIT_NONE;
+    fiber->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    fiber->channel_wait_deadline_ns = 0;
+    blorp_timer_waiter_reset(&fiber->timer_waiter, fiber);
+}
+
+static void blorp_test_created_fiber_probe_init(blorp_Fiber* fiber) {
+    memset(fiber, 0, sizeof(*fiber));
+    atomic_store_explicit(
+        &fiber->lifecycle_state, (int)BLORP_FIBER_CREATED,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &fiber->wake_cause, (int)BLORP_WAKE_READY, memory_order_relaxed);
+    atomic_store_explicit(
+        &fiber->wait_owner_kind, (int)BLORP_WAIT_OWNER_NONE,
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &fiber->wait_operation_id, 0, memory_order_relaxed);
+    fiber->parked = 0;
+    fiber->queued = 0;
+    fiber->running = 0;
+    fiber->wake_pending = 0;
+    fiber->state_lock = 0;
+    fiber->owner_worker_id = -1;
+    fiber->channel_wait_kind = BLORP_CHANNEL_WAIT_NONE;
+    fiber->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    fiber->channel_wait_deadline_ns = 0;
+    blorp_timer_waiter_reset(&fiber->timer_waiter, fiber);
+}
+
+long blorp_test_fiber_created_schedule_probe(void) {
+    blorp_Fiber fiber;
+    blorp_test_created_fiber_probe_init(&fiber);
+
+    bool starts_created =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_CREATED &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.queued, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.running, __ATOMIC_ACQUIRE) == 0 &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_NONE;
+
+    bool prepared = blorp_fiber_prepare_created_for_queue(
+        &fiber, "fiber created schedule probe prepare");
+    bool queued =
+        prepared &&
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_QUEUED &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.queued, __ATOMIC_ACQUIRE) == 1 &&
+        __atomic_load_n(&fiber.running, __ATOMIC_ACQUIRE) == 0 &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_NONE;
+
+    blorp_fiber_mark_dispatched(
+        &fiber, "fiber created schedule probe dispatch");
+    bool dispatched =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_DISPATCHED &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.queued, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.running, __ATOMIC_ACQUIRE) == 0;
+
+    blorp_fiber_mark_running(
+        &fiber, "fiber created schedule probe running");
+    bool running =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_RUNNING &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.queued, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.running, __ATOMIC_ACQUIRE) == 1;
+
+    return starts_created && queued && dispatched && running;
+}
+
+long blorp_test_timer_waiter_identity_probe(void) {
+    blorp_Fiber fiber;
+    blorp_test_timer_probe_fiber_init(&fiber);
+
+    blorp_TimerWaiter first_waiter;
+    blorp_timer_waiter_reset(&first_waiter, &fiber);
+    blorp_FiberWaitOperation first_wait = blorp_fiber_begin_wait(
+        &fiber, BLORP_WAIT_OWNER_SLEEP, "timer identity probe first wait");
+    uint64_t first_wait_id = first_wait.id;
+    blorp_timer_waiter_prepare(
+        &first_waiter,
+        first_wait,
+        blorp_monotonic_now_ns(),
+        BLORP_WAKE_TIMEOUT,
+        "timer identity probe first timer");
+    bool first_current = blorp_timer_waiter_current(&first_waiter);
+
+    blorp_fiber_clear_wait(&fiber, "timer identity probe clear first wait");
+    blorp_FiberWaitOperation second_wait = blorp_fiber_begin_wait(
+        &fiber,
+        BLORP_WAIT_OWNER_CHANNEL_RECV,
+        "timer identity probe second wait");
+    uint64_t second_wait_id = second_wait.id;
+
+    bool ids_distinct =
+        first_wait_id != 0 &&
+        second_wait_id != 0 &&
+        first_wait_id != second_wait_id;
+    bool stale_not_current = !blorp_timer_waiter_current(&first_waiter);
+    bool stale_not_woken =
+        !blorp_timer_waiter_wake(
+            &first_waiter,
+            BLORP_WAKE_TIMEOUT,
+            "timer identity probe stale wake");
+
+    blorp_TimerWaiter current_waiter;
+    blorp_timer_waiter_reset(&current_waiter, &fiber);
+    blorp_timer_waiter_prepare(
+        &current_waiter,
+        second_wait,
+        blorp_monotonic_now_ns(),
+        BLORP_WAKE_TIMEOUT,
+        "timer identity probe current timer");
+    bool current_captured_second =
+        current_waiter.wait.id == second_wait_id &&
+        current_waiter.wait.owner == BLORP_WAIT_OWNER_CHANNEL_RECV &&
+        current_waiter.wait.fiber == &fiber;
+    bool current_is_current = blorp_timer_waiter_current(&current_waiter);
+
+    blorp_fiber_clear_wait(&fiber, "timer identity probe clear second wait");
+    return ids_distinct &&
+           first_current &&
+           stale_not_current &&
+           stale_not_woken &&
+           current_captured_second &&
+           current_is_current;
+}
+
+long blorp_test_wait_ready_to_park_probe(void) {
+    blorp_Fiber fiber;
+    blorp_test_timer_probe_fiber_init(&fiber);
+
+    bool started_running =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_RUNNING &&
+        __atomic_load_n(&fiber.running, __ATOMIC_ACQUIRE) == 1;
+    blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+        &fiber,
+        BLORP_WAIT_OWNER_CHANNEL_RECV,
+        "wait ready to park probe begin");
+    uint64_t wait_id = wait.id;
+    blorp_FiberWaitOwnerKind wait_owner = wait.owner;
+    bool started_wait =
+        wait_id != 0 && wait_owner == BLORP_WAIT_OWNER_CHANNEL_RECV;
+    bool started_unparked =
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0;
+
+    blorp_fiber_prepare_wait_to_park(
+        wait, "wait ready to park probe ready");
+    bool marked_parked =
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 1;
+    bool preserved_identity =
+        blorp_fiber_current_wait_operation_id(&fiber) == wait_id &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_CHANNEL_RECV;
+
+    blorp_fiber_abandon_wait_before_park(
+        wait, "wait ready to park probe clear");
+    bool cleared_wait =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_RUNNING &&
+        blorp_fiber_current_wait_operation_id(&fiber) == 0 &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_NONE;
+
+    return started_running &&
+           started_wait &&
+           started_unparked &&
+           marked_parked &&
+           preserved_identity &&
+           cleared_wait;
+}
+
+long blorp_test_fiber_lifecycle_ready_to_park_probe(void) {
+    blorp_Fiber fiber;
+    blorp_test_timer_probe_fiber_init(&fiber);
+
+    blorp_FiberWaitOperation abandoned_wait = blorp_fiber_begin_wait(
+        &fiber,
+        BLORP_WAIT_OWNER_CHANNEL_RECV,
+        "fiber lifecycle probe abandon begin");
+    blorp_fiber_prepare_wait_to_park(
+        abandoned_wait, "fiber lifecycle probe abandon ready");
+    bool ready_state =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_READY_TO_PARK &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 1 &&
+        __atomic_load_n(&fiber.running, __ATOMIC_ACQUIRE) == 1 &&
+        blorp_fiber_current_wait_owner(&fiber) ==
+            BLORP_WAIT_OWNER_CHANNEL_RECV &&
+        blorp_fiber_current_wait_operation_id(&fiber) == abandoned_wait.id;
+
+    blorp_fiber_abandon_wait_before_park(
+        abandoned_wait, "fiber lifecycle probe abandon");
+    bool abandoned_state =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_RUNNING &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.wake_pending, __ATOMIC_ACQUIRE) == 0 &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_NONE &&
+        blorp_fiber_current_wait_operation_id(&fiber) == 0;
+
+    blorp_FiberWaitOperation pending_wait = blorp_fiber_begin_wait(
+        &fiber,
+        BLORP_WAIT_OWNER_SLEEP,
+        "fiber lifecycle probe pending begin");
+    blorp_fiber_prepare_wait_to_park(
+        pending_wait, "fiber lifecycle probe pending ready");
+    bool scheduled_pending = blorp_fiber_schedule_with_cause(
+        &fiber,
+        BLORP_WAKE_CANCELLED,
+        "fiber lifecycle probe wake before yield");
+    bool pending_state =
+        scheduled_pending &&
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_READY_TO_PARK &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.wake_pending, __ATOMIC_ACQUIRE) == 1 &&
+        blorp_fiber_current_wake_cause(&fiber) == BLORP_WAKE_CANCELLED &&
+        blorp_fiber_current_wait_operation_id(&fiber) == pending_wait.id;
+
+    blorp_fiber_mark_parked(
+        &fiber, "fiber lifecycle probe yielded after pending wake");
+    bool parked_after_pending_wake =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_PARKED &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.wake_pending, __ATOMIC_ACQUIRE) == 1 &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_SLEEP;
+
+    __atomic_store_n(&fiber.running, 0, __ATOMIC_RELEASE);
+    blorp_fiber_mark_queued(
+        &fiber, "fiber lifecycle probe enqueue pending wake");
+    bool queued_after_pending_wake =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_QUEUED &&
+        __atomic_load_n(&fiber.queued, __ATOMIC_ACQUIRE) == 1;
+
+    __atomic_store_n(&fiber.queued, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&fiber.wake_pending, 0, __ATOMIC_RELEASE);
+    blorp_fiber_clear_wait(
+        &fiber, "fiber lifecycle probe clear pending wake");
+
+    return ready_state &&
+           abandoned_state &&
+           pending_state &&
+           parked_after_pending_wake &&
+           queued_after_pending_wake;
+}
+
+long blorp_test_fiber_cancel_before_park_probe(void) {
+    blorp_Fiber fiber;
+    blorp_test_timer_probe_fiber_init(&fiber);
+
+    bool starts_running =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_RUNNING &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.queued, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.running, __ATOMIC_ACQUIRE) == 1 &&
+        __atomic_load_n(&fiber.wake_pending, __ATOMIC_ACQUIRE) == 0 &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_NONE;
+
+    blorp_fiber_wake(
+        &fiber,
+        BLORP_WAKE_CANCELLED,
+        "fiber cancel before park probe");
+    bool cancellation_recorded =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_RUNNING &&
+        __atomic_load_n(&fiber.parked, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.queued, __ATOMIC_ACQUIRE) == 0 &&
+        __atomic_load_n(&fiber.running, __ATOMIC_ACQUIRE) == 1 &&
+        __atomic_load_n(&fiber.wake_pending, __ATOMIC_ACQUIRE) == 1 &&
+        blorp_fiber_current_wake_cause(&fiber) == BLORP_WAKE_CANCELLED &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_NONE;
+
+    return starts_running && cancellation_recorded;
+}
+
+long blorp_test_current_timer_wait_install_probe(void) {
+    blorp_Fiber fiber;
+    blorp_test_timer_probe_fiber_init(&fiber);
+
+    blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+        &fiber,
+        BLORP_WAIT_OWNER_SLEEP,
+        "current timer wait install probe begin");
+    uint64_t wait_id = wait.id;
+    blorp_fiber_prepare_wait_to_park(
+        wait, "current timer wait install probe ready");
+
+    uint64_t deadline_ns = blorp_deadline_ns_from_now_ms(1000);
+    blorp_fiber_install_timer_wait(
+        wait,
+        deadline_ns,
+        BLORP_WAKE_TIMEOUT,
+        "current timer wait install probe timer");
+    bool installed =
+        fiber.timer_waiter.heap_index >= 0 &&
+        fiber.timer_waiter.deadline_ns == deadline_ns &&
+        fiber.timer_waiter.wait.id == wait_id &&
+        fiber.timer_waiter.wait.owner == BLORP_WAIT_OWNER_SLEEP &&
+        fiber.timer_waiter.wait.fiber == &fiber &&
+        fiber.timer_waiter.wake_cause == BLORP_WAKE_TIMEOUT;
+
+    blorp_fiber_remove_timer_wait(
+        wait, "current timer wait install probe remove");
+    bool removed =
+        fiber.timer_waiter.heap_index < 0 &&
+        fiber.timer_waiter.wait.id == 0 &&
+        fiber.timer_waiter.wait.owner == BLORP_WAIT_OWNER_NONE;
+    bool wait_still_current =
+        blorp_fiber_current_wait_operation_id(&fiber) == wait_id &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_SLEEP;
+
+    blorp_fiber_abandon_wait_before_park(
+        wait, "current timer wait install probe clear");
+    bool cleared_wait =
+        blorp_fiber_current_state(&fiber) == BLORP_FIBER_RUNNING &&
+        blorp_fiber_current_wait_operation_id(&fiber) == 0 &&
+        blorp_fiber_current_wait_owner(&fiber) == BLORP_WAIT_OWNER_NONE;
+
+    return wait_id != 0 &&
+           installed &&
+           removed &&
+           wait_still_current &&
+           cleared_wait;
+}
+
+long blorp_test_timeout_arithmetic_probe(void) {
+    bool immediate_stays_at_start =
+        blorp_deadline_ns_from_start_ms(1234ULL, 0) == 1234ULL &&
+        blorp_deadline_ns_from_start_ms(1234ULL, -1) == 1234ULL;
+    bool normal_duration =
+        blorp_timeout_ms_to_ns_saturated(2) == 2ULL * BLORP_NSEC_PER_MSEC &&
+        blorp_deadline_ns_from_start_ms(100ULL, 2) ==
+            100ULL + 2ULL * BLORP_NSEC_PER_MSEC;
+    bool add_saturates =
+        blorp_deadline_ns_from_start_ms(UINT64_MAX - 10ULL, 1) == UINT64_MAX;
+
+    uint64_t max_safe_ms = UINT64_MAX / BLORP_NSEC_PER_MSEC;
+    bool multiply_saturates = true;
+    if (max_safe_ms < (uint64_t)LONG_MAX) {
+        multiply_saturates =
+            blorp_timeout_ms_to_ns_saturated((long)(max_safe_ms + 1ULL)) ==
+            UINT64_MAX;
+    }
+
+    struct timespec realtime = blorp_realtime_after_ns(UINT64_MAX);
+    bool realtime_is_normalized =
+        realtime.tv_nsec >= 0 && realtime.tv_nsec < 1000000000L;
+
+    return immediate_stays_at_start &&
+           normal_duration &&
+           add_saturates &&
+           multiply_saturates &&
+           realtime_is_normalized;
+}
+
+long blorp_test_cooperative_checkpoint_probe(void) {
+    if (!__blorp_current_fiber) return 0;
+    if (!__blorp_scheduler_stats_active()) return 0;
+
+    long saved_budget = __blorp_cooperative_checkpoint_budget;
+    long before =
+        atomic_load_explicit(&global_scheduler_stats.cooperative_yields,
+            memory_order_relaxed);
+
+    __blorp_cooperative_checkpoint_budget = 1;
+    blorp_cooperative_checkpoint();
+
+    long after =
+        atomic_load_explicit(&global_scheduler_stats.cooperative_yields,
+            memory_order_relaxed);
+    bool yielded = after > before;
+    bool budget_reset =
+        __blorp_cooperative_checkpoint_budget ==
+        BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
+
+    __blorp_cooperative_checkpoint_budget = saved_budget;
+    return yielded && budget_reset;
+}
+
 void* blorp_concurrent_join(void* t, long timeout_ms) {
     if (__blorp_cancel_current_task_if_requested()) {
         return blorp_result_err((void*)blorp_Cancelled);
@@ -23302,23 +25248,31 @@ void* blorp_concurrent_join(void* t, long timeout_ms) {
 
     pthread_mutex_lock(&task->mutex);
     if (!task->completed && self) {
-        // Fiber path: set parked BEFORE inserting into wakeup structures
-        __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-        task->waiting_fiber = self;
+        // Fiber path: prepare to park before inserting into wakeup structures.
+        blorp_TaskJoinWaiter waiter;
+        blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+            self, BLORP_WAIT_OWNER_TASK_JOIN, "concurrent join begin");
+        __blorp_task_join_waiter_init(&waiter, wait);
+        blorp_fiber_prepare_wait_to_park(
+            wait, "concurrent join ready to park");
+        __blorp_task_join_waiter_install_locked(
+            task, &waiter, "concurrent join begin");
         if (timeout_ms >= 0) {
-            // Timed join: also insert into timer queue as a deadline
-            self->wake_time_ns = __blorp_deadline_ns_from_timeout_ms(timeout_ms);
-            blorp_timer_queue_insert(self);
+            uint64_t deadline_ns = blorp_deadline_ns_from_now_ms(timeout_ms);
+            blorp_fiber_install_timer_wait(
+                wait,
+                deadline_ns,
+                BLORP_WAKE_TIMEOUT,
+                "concurrent join timer");
         }
         pthread_mutex_unlock(&task->mutex);
-        blorp_fiber_park();
-        // Resumed: either task completed or timer expired
+        blorp_fiber_park(wait);
         if (timeout_ms >= 0) {
-            // Remove from timer queue in case task completed before timer fired
-            blorp_timer_queue_remove(self);
+            blorp_fiber_remove_timer_wait(
+                wait, "concurrent join timer remove");
         }
         pthread_mutex_lock(&task->mutex);
-        task->waiting_fiber = NULL;
+        __blorp_task_join_waiter_remove_locked(task, &waiter);
         if (__blorp_is_cancelled()) {
             pthread_mutex_unlock(&task->mutex);
             (void)__blorp_cancel_current_task_if_requested();
@@ -23331,7 +25285,7 @@ void* blorp_concurrent_join(void* t, long timeout_ms) {
     } else if (!task->completed) {
         if (timeout_ms >= 0) {
             struct timespec ts =
-                __blorp_realtime_deadline_from_timeout_ms(timeout_ms);
+                blorp_realtime_deadline_from_now_ms(timeout_ms);
             int ret = 0;
             while (!task->completed && ret == 0) {
                 ret = pthread_cond_timedwait(&task->done_cond, &task->mutex, &ts);
@@ -23354,22 +25308,48 @@ void* blorp_concurrent_join(void* t, long timeout_ms) {
     return blorp_result_ok_with_release_mask(result, result_is_rc);
 }
 
+void* blorp_concurrent_join_cleanup_release(void** task_slot, long timeout_ms) {
+    blorp_Task* task =
+        task_slot ? (blorp_Task*)(*task_slot) : NULL;
+    if (!task) {
+        return blorp_result_err(
+            (void*)blorp_TaskFailed(
+                blorp_string_literal("concurrent task missing")));
+    }
+    void* result = blorp_concurrent_join(task, timeout_ms);
+    blorp_task_cleanup_pop_slot(task_slot);
+    blorp_release((blorp_Object*)task);
+    *task_slot = NULL;
+    return result;
+}
+
+void* blorp_concurrent_task_window_join_release(
+    blorp_ConcurrentTaskWindow* window,
+    long slot,
+    long timeout_ms
+) {
+    blorp_concurrent_task_window_check_slot(window, slot);
+    blorp_concurrent_task_window_flush(window);
+    return blorp_concurrent_join_cleanup_release(
+        (void**)&window->tasks[slot],
+        timeout_ms);
+}
+
 // sleep(ms) — fiber-aware: parks fiber with timer, or OS sleep as fallback
 void blorp_sleep(long ms) {
     if (__blorp_cancel_current_task_if_requested()) return;
     if (ms <= 0) return;
     blorp_Fiber* self = __blorp_current_fiber;
     if (self) {
-        // Fiber path: set parked BEFORE inserting into timer queue
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        self->wake_time_ns = (uint64_t)now.tv_sec * 1000000000ULL
-                           + (uint64_t)now.tv_nsec
-                           + (uint64_t)ms * 1000000ULL;
-        __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-        blorp_timer_queue_insert(self);
-        blorp_fiber_park();
-        blorp_timer_queue_remove(self);
+        // Fiber path: prepare to park before inserting into the timer queue.
+        uint64_t deadline_ns = blorp_deadline_ns_from_now_ms(ms);
+        blorp_FiberWaitOperation wait =
+            blorp_fiber_begin_wait(self, BLORP_WAIT_OWNER_SLEEP, "sleep begin");
+        blorp_fiber_prepare_wait_to_park(wait, "sleep ready to park");
+        blorp_fiber_install_timer_wait(
+            wait, deadline_ns, BLORP_WAKE_TIMEOUT, "sleep timer");
+        blorp_fiber_park(wait);
+        blorp_fiber_remove_timer_wait(wait, "sleep timer remove");
         (void)__blorp_cancel_current_task_if_requested();
         return;
     }
@@ -23386,12 +25366,18 @@ void blorp_sleep(long ms) {
 // another fiber runs before the current fiber resumes.
 void blorp_yield_now(void) {
     if (__blorp_cancel_current_task_if_requested()) return;
+    __blorp_scheduler_stat_inc(&global_scheduler_stats.cooperative_yields);
     blorp_Fiber* self = __blorp_current_fiber;
     if (self) {
         // Do not enqueue while still inside mco_resume; another worker could
         // pop the fiber before minicoro has actually yielded. Reuse the
         // pending-wake path so the current worker re-enqueues after yield.
-        __atomic_store_n(&self->wake_pending, 1, __ATOMIC_RELEASE);
+        blorp_fiber_state_lock(self);
+        blorp_fiber_record_pending_wake_locked(
+            self,
+            BLORP_WAKE_READY,
+            "yield_now pending wake");
+        blorp_fiber_state_unlock(self);
         mco_result yield_res = mco_yield(self->coro);
         if (yield_res == MCO_STACK_OVERFLOW) {
             fprintf(stderr,
@@ -23405,6 +25391,21 @@ void blorp_yield_now(void) {
     }
     (void)sched_yield();
     (void)__blorp_cancel_current_task_if_requested();
+}
+
+// Compiler-owned cooperative checkpoint.
+//
+// Unlike source-level yield_now(), this is intended for generated checkpoints
+// in CPU-heavy loops. It observes cancellation on every call, but only performs
+// a scheduler yield when the per-thread reduction budget expires.
+void blorp_cooperative_checkpoint(void) {
+    if (__blorp_cancel_current_task_if_requested()) return;
+    if (!__blorp_current_fiber) return;
+    __blorp_cooperative_checkpoint_budget--;
+    if (__blorp_cooperative_checkpoint_budget > 0) return;
+    __blorp_cooperative_checkpoint_budget =
+        BLORP_COOPERATIVE_CHECKPOINT_INTERVAL;
+    blorp_yield_now();
 }
 
 // max_threads() -> Int
@@ -23425,10 +25426,19 @@ typedef struct {
 } blorp_SelectNonfiberWake;
 
 typedef struct blorp_ChannelSelectWaiter {
-    blorp_Fiber* fiber;
+    blorp_FiberWaitOperation wait;
     blorp_SelectNonfiberWake* nonfiber_wake;
+    blorp_FiberWakeCause wake_cause;
     struct blorp_ChannelSelectWaiter* next;
 } blorp_ChannelSelectWaiter;
+
+typedef struct blorp_ChannelFiberWaiter {
+    blorp_FiberWaitOperation wait;
+    blorp_ChannelWaitKind kind;
+    uint64_t deadline_ns;
+    blorp_ChannelWakeReason wake_reason;
+    struct blorp_ChannelFiberWaiter* next;
+} blorp_ChannelFiberWaiter;
 
 typedef struct {
     blorp_Object header;
@@ -23440,10 +25450,10 @@ typedef struct {
     bool sealed;
     void (*elem_release)(void*);  // release function for refcounted element types
     // Fiber wait queues
-    blorp_Fiber* send_waiters_head;  // fibers blocked on full channel
-    blorp_Fiber* send_waiters_tail;
-    blorp_Fiber* recv_waiters_head;  // fibers blocked on empty channel
-    blorp_Fiber* recv_waiters_tail;
+    blorp_ChannelFiberWaiter* send_waiters_head;  // fibers blocked on full channel
+    blorp_ChannelFiberWaiter* send_waiters_tail;
+    blorp_ChannelFiberWaiter* recv_waiters_head;  // fibers blocked on empty channel
+    blorp_ChannelFiberWaiter* recv_waiters_tail;
     blorp_ChannelSelectWaiter* select_waiters_head;
     blorp_ChannelSelectWaiter* select_waiters_tail;
 } blorp_Channel;
@@ -23505,40 +25515,340 @@ void blorp_channel_init_elem_release(blorp_Channel* ch, void (*release_fn)(void*
     if (ch) ch->elem_release = release_fn;
 }
 
-// Helper: enqueue fiber to channel wait list (caller holds ch->mutex)
-static void __ch_fiber_enqueue(blorp_Fiber** head, blorp_Fiber** tail, blorp_Fiber* f) {
-    f->wait_next = NULL;
-    if (*tail) { (*tail)->wait_next = f; } else { *head = f; }
-    *tail = f;
+static inline void __ch_fiber_wait_begin(
+    blorp_Fiber* f,
+    blorp_ChannelWaitKind kind,
+    uint64_t deadline_ns
+) {
+    f->channel_wait_kind = kind;
+    f->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    f->channel_wait_deadline_ns = deadline_ns;
 }
 
-// Helper: dequeue one fiber from channel wait list (caller holds ch->mutex)
-static blorp_Fiber* __ch_fiber_dequeue(blorp_Fiber** head, blorp_Fiber** tail) {
-    blorp_Fiber* f = *head;
+static inline void __ch_fiber_wait_clear(blorp_Fiber* f) {
+    f->channel_wait_kind = BLORP_CHANNEL_WAIT_NONE;
+    f->channel_wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    f->channel_wait_deadline_ns = 0;
+}
+
+static void __ch_fiber_waiter_init(
+    blorp_ChannelFiberWaiter* waiter,
+    blorp_FiberWaitOperation wait,
+    blorp_ChannelWaitKind kind,
+    uint64_t deadline_ns
+) {
+    if (!waiter) return;
+    blorp_Fiber* f = wait.fiber;
+    waiter->wait = wait;
+    waiter->kind = kind;
+    waiter->deadline_ns = deadline_ns;
+    waiter->wake_reason = BLORP_CHANNEL_WAKE_PENDING;
+    waiter->next = NULL;
     if (f) {
-        *head = f->wait_next;
-        if (!*head) *tail = NULL;
-        f->wait_next = NULL;
+        __ch_fiber_wait_begin(f, kind, deadline_ns);
     }
-    return f;
+    blorp_FiberWaitOwnerKind expected_owner =
+        kind == BLORP_CHANNEL_WAIT_SEND
+            ? BLORP_WAIT_OWNER_CHANNEL_SEND
+            : BLORP_WAIT_OWNER_CHANNEL_RECV;
+    blorp_fiber_debug_assert_current_wait_operation(
+        wait,
+        expected_owner,
+        "channel waiter init",
+        "channel waiter created without matching wait operation",
+        "channel waiter created for stale wait operation");
 }
 
-// Helper: remove a specific fiber from a channel wait list (caller holds ch->mutex).
-// Used when a fiber wakes from timeout and must be removed from the wait queue
-// to prevent use-after-free when a future send/recv dequeues the stale pointer.
-static void __ch_fiber_remove(blorp_Fiber** head, blorp_Fiber** tail, blorp_Fiber* f) {
-    blorp_Fiber** pp = head;
-    blorp_Fiber* prev = NULL;
+static inline bool __ch_fiber_waiter_current(
+    blorp_ChannelFiberWaiter* waiter
+) {
+    if (!waiter) {
+        return false;
+    }
+    blorp_Fiber* f = waiter->wait.fiber;
+    return blorp_fiber_wait_operation_is_current(waiter->wait) &&
+           f->channel_wait_kind == waiter->kind;
+}
+
+static inline bool __ch_fiber_waiter_expired(
+    blorp_ChannelFiberWaiter* waiter,
+    uint64_t now_ns
+) {
+    return waiter &&
+           waiter->deadline_ns > 0 &&
+           now_ns >= waiter->deadline_ns;
+}
+
+// Helper: enqueue fiber waiter to channel wait list (caller holds ch->mutex)
+static void __ch_fiber_enqueue(
+    blorp_ChannelFiberWaiter** head,
+    blorp_ChannelFiberWaiter** tail,
+    blorp_ChannelFiberWaiter* waiter
+) {
+    if (!waiter) return;
+    blorp_scheduler_debug_assert_fiber("channel wait enqueue", waiter->wait.fiber);
+    waiter->next = NULL;
+    if (*tail) { (*tail)->next = waiter; } else { *head = waiter; }
+    *tail = waiter;
+}
+
+static void __ch_wake_channel_waiter(
+    blorp_ChannelFiberWaiter* waiter,
+    blorp_FiberWakeCause default_cause
+) {
+    if (!waiter) return;
+    blorp_Fiber* f = waiter->wait.fiber;
+    if (!__ch_fiber_waiter_current(waiter)) {
+        // A stale channel wait operation can remain briefly if another wake
+        // source resumed the fiber and cleared its wait before this queue was
+        // drained. The waiter record's operation id makes that stale entry
+        // non-authoritative for the fiber's current operation.
+        return;
+    }
+    f->channel_wake_reason = waiter->wake_reason;
+    blorp_fiber_wake(
+        f,
+        blorp_channel_wake_reason_to_fiber_cause(
+            waiter->wake_reason, default_cause),
+        "channel wait list wake");
+}
+
+static void __ch_schedule_fiber_wait_list(
+    blorp_ChannelFiberWaiter* waiters,
+    blorp_FiberWakeCause default_cause
+) {
+    while (waiters) {
+        blorp_ChannelFiberWaiter* waiter = waiters;
+        waiters = waiter->next;
+        waiter->next = NULL;
+        __ch_wake_channel_waiter(waiter, default_cause);
+    }
+}
+
+typedef enum {
+    BLORP_CHANNEL_DEQUEUE_EMPTY,
+    BLORP_CHANNEL_DEQUEUE_READY,
+    BLORP_CHANNEL_DEQUEUE_EXPIRED
+} blorp_ChannelFiberDequeueKind;
+
+typedef struct {
+    blorp_ChannelFiberDequeueKind kind;
+    blorp_ChannelFiberWaiter* waiter;
+} blorp_ChannelFiberDequeue;
+
+typedef struct {
+    blorp_ChannelFiberWaiter* ready;
+    blorp_ChannelFiberWaiter* expired_head;
+    blorp_ChannelFiberWaiter* expired_tail;
+} blorp_ChannelFiberWakeSet;
+
+static inline blorp_ChannelFiberDequeue __ch_dequeue_result(
+    blorp_ChannelFiberDequeueKind kind,
+    blorp_ChannelFiberWaiter* waiter
+) {
+    return (blorp_ChannelFiberDequeue) {
+        .kind = kind,
+        .waiter = waiter
+    };
+}
+
+static inline blorp_ChannelFiberWakeSet __ch_fiber_wake_set_none(void) {
+    return (blorp_ChannelFiberWakeSet) {
+        .ready = NULL,
+        .expired_head = NULL,
+        .expired_tail = NULL
+    };
+}
+
+static void __ch_fiber_wake_set_append_expired(
+    blorp_ChannelFiberWakeSet* set,
+    blorp_ChannelFiberWaiter* waiter
+) {
+    if (!set || !waiter) return;
+    waiter->next = NULL;
+    if (set->expired_tail) {
+        set->expired_tail->next = waiter;
+    } else {
+        set->expired_head = waiter;
+    }
+    set->expired_tail = waiter;
+}
+
+static void __ch_schedule_fiber_wake_set(
+    blorp_ChannelFiberWakeSet* set,
+    blorp_FiberWakeCause ready_cause
+) {
+    if (!set) return;
+    __ch_schedule_fiber_wait_list(set->expired_head, BLORP_WAKE_TIMEOUT);
+    __ch_wake_channel_waiter(set->ready, ready_cause);
+    set->ready = NULL;
+    set->expired_head = NULL;
+    set->expired_tail = NULL;
+}
+
+// Helper: dequeue one authoritative waiter from a channel wait list (caller
+// holds ch->mutex). Expired timed waiters are returned as a distinct result so
+// callers cannot accidentally treat timeout winners as ready waiters.
+static blorp_ChannelFiberDequeue __ch_fiber_dequeue_next(
+    blorp_ChannelFiberWaiter** head,
+    blorp_ChannelFiberWaiter** tail,
+    blorp_ChannelWaitKind kind
+) {
+    blorp_ChannelFiberWaiter** pp = head;
+    blorp_ChannelFiberWaiter* prev = NULL;
+    uint64_t now_ns = 0;
     while (*pp) {
-        if (*pp == f) {
-            *pp = f->wait_next;
-            if (*tail == f) *tail = prev;
+        blorp_ChannelFiberWaiter* waiter = *pp;
+        if (!__ch_fiber_waiter_current(waiter) || waiter->kind != kind) {
+            *pp = waiter->next;
+            if (*tail == waiter) *tail = prev;
             if (!*head) *tail = NULL;
-            f->wait_next = NULL;
+            waiter->next = NULL;
+            continue;
+        }
+
+        if (waiter->deadline_ns > 0) {
+            if (now_ns == 0) now_ns = blorp_monotonic_now_ns();
+            if (__ch_fiber_waiter_expired(waiter, now_ns)) {
+                *pp = waiter->next;
+                if (*tail == waiter) *tail = prev;
+                if (!*head) *tail = NULL;
+                waiter->next = NULL;
+                waiter->wake_reason = BLORP_CHANNEL_WAKE_TIMED_OUT;
+                return __ch_dequeue_result(
+                    BLORP_CHANNEL_DEQUEUE_EXPIRED, waiter);
+            }
+        }
+
+        *pp = waiter->next;
+        if (*tail == waiter) *tail = prev;
+        if (!*head) *tail = NULL;
+        waiter->next = NULL;
+        waiter->wake_reason = BLORP_CHANNEL_WAKE_READY;
+        return __ch_dequeue_result(BLORP_CHANNEL_DEQUEUE_READY, waiter);
+    }
+    return __ch_dequeue_result(BLORP_CHANNEL_DEQUEUE_EMPTY, NULL);
+}
+
+static void __ch_collect_one_ready_waiter(
+    blorp_ChannelFiberWaiter** head,
+    blorp_ChannelFiberWaiter** tail,
+    blorp_ChannelWaitKind kind,
+    blorp_ChannelFiberWakeSet* wake_set
+) {
+    if (!wake_set) return;
+    while (true) {
+        blorp_ChannelFiberDequeue result =
+            __ch_fiber_dequeue_next(head, tail, kind);
+        switch (result.kind) {
+        case BLORP_CHANNEL_DEQUEUE_EMPTY:
+            return;
+        case BLORP_CHANNEL_DEQUEUE_EXPIRED:
+            __ch_fiber_wake_set_append_expired(wake_set, result.waiter);
+            break;
+        case BLORP_CHANNEL_DEQUEUE_READY:
+            wake_set->ready = result.waiter;
+            return;
+        }
+    }
+}
+
+// Helper: remove a specific waiter from a channel wait list (caller holds
+// ch->mutex). Used when a fiber wakes from timeout/cancellation and must be
+// removed from the wait queue before its stack-scoped waiter goes out of scope.
+static void __ch_fiber_remove(
+    blorp_ChannelFiberWaiter** head,
+    blorp_ChannelFiberWaiter** tail,
+    blorp_ChannelFiberWaiter* waiter
+) {
+    blorp_ChannelFiberWaiter** pp = head;
+    blorp_ChannelFiberWaiter* prev = NULL;
+    while (*pp) {
+        if (*pp == waiter) {
+            *pp = waiter->next;
+            if (*tail == waiter) *tail = prev;
+            if (!*head) *tail = NULL;
+            waiter->next = NULL;
             return;
         }
         prev = *pp;
-        pp = &(*pp)->wait_next;
+        pp = &(*pp)->next;
+    }
+    if (waiter) waiter->next = NULL;
+}
+
+static void __ch_mark_detached_waiters(
+    blorp_ChannelFiberWaiter* waiters,
+    blorp_ChannelWaitKind kind
+) {
+    uint64_t now_ns = 0;
+    for (blorp_ChannelFiberWaiter* waiter = waiters;
+         waiter;
+         waiter = waiter->next) {
+        if (!__ch_fiber_waiter_current(waiter) || waiter->kind != kind) {
+            continue;
+        }
+        if (waiter->deadline_ns > 0) {
+            if (now_ns == 0) now_ns = blorp_monotonic_now_ns();
+            waiter->wake_reason =
+                __ch_fiber_waiter_expired(waiter, now_ns)
+                    ? BLORP_CHANNEL_WAKE_TIMED_OUT
+                    : BLORP_CHANNEL_WAKE_READY;
+        } else {
+            waiter->wake_reason = BLORP_CHANNEL_WAKE_READY;
+        }
+    }
+}
+
+static void __ch_select_waiter_init(
+    blorp_ChannelSelectWaiter* waiter,
+    blorp_FiberWaitOperation wait,
+    blorp_SelectNonfiberWake* nonfiber_wake
+) {
+    if (!waiter) return;
+    waiter->wait = wait;
+    waiter->nonfiber_wake = nonfiber_wake;
+    waiter->wake_cause = BLORP_WAKE_READY;
+    waiter->next = NULL;
+    blorp_fiber_debug_assert_current_wait_operation(
+        wait,
+        BLORP_WAIT_OWNER_SELECT,
+        "select waiter init",
+        "select waiter created without select wait operation",
+        "select waiter created for stale wait operation");
+}
+
+static bool __ch_select_waiter_current(
+    blorp_ChannelSelectWaiter* waiter
+) {
+    if (!waiter || !waiter->wait.fiber) {
+        return waiter && waiter->nonfiber_wake;
+    }
+    return blorp_fiber_wait_operation_is_current(waiter->wait);
+}
+
+static void __ch_select_waiter_wake(
+    blorp_ChannelSelectWaiter* waiter,
+    blorp_FiberWakeCause cause
+) {
+    if (!waiter) return;
+    waiter->wake_cause = cause;
+    if (waiter->wait.fiber) {
+        if (!__ch_select_waiter_current(waiter)) {
+            // A stale select wait operation can remain briefly on a second
+            // channel after another channel or timer has resumed the same
+            // select. The operation id prevents that stale waiter from waking
+            // a later operation on the same fiber.
+            return;
+        }
+        blorp_fiber_wake(waiter->wait.fiber, cause, "channel select wake");
+        return;
+    }
+    if (waiter->nonfiber_wake) {
+        pthread_mutex_lock(&waiter->nonfiber_wake->mutex);
+        waiter->nonfiber_wake->signaled = true;
+        pthread_cond_broadcast(&waiter->nonfiber_wake->cond);
+        pthread_mutex_unlock(&waiter->nonfiber_wake->mutex);
     }
 }
 
@@ -23574,20 +25884,17 @@ static void __ch_select_waiter_remove_locked(
     }
 }
 
-static void __ch_select_waiters_wake_all_locked(blorp_Channel* ch) {
+static void __ch_select_waiters_wake_all_locked(
+    blorp_Channel* ch,
+    blorp_FiberWakeCause cause
+) {
     blorp_ChannelSelectWaiter* waiter = ch->select_waiters_head;
     ch->select_waiters_head = NULL;
     ch->select_waiters_tail = NULL;
     while (waiter) {
         blorp_ChannelSelectWaiter* next = waiter->next;
         waiter->next = NULL;
-        if (waiter->fiber) blorp_fiber_schedule(waiter->fiber);
-        if (waiter->nonfiber_wake) {
-            pthread_mutex_lock(&waiter->nonfiber_wake->mutex);
-            waiter->nonfiber_wake->signaled = true;
-            pthread_cond_broadcast(&waiter->nonfiber_wake->cond);
-            pthread_mutex_unlock(&waiter->nonfiber_wake->mutex);
-        }
+        __ch_select_waiter_wake(waiter, cause);
         waiter = next;
     }
 }
@@ -23632,25 +25939,6 @@ long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms);
 long blorp_channel_try_recv_status_raw(blorp_Channel* ch, void** out);
 long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, void** out);
 
-static inline uint64_t __ch_monotonic_deadline_from_timeout_ms(long timeout_ms) {
-    uint64_t now_ns = blorp_monotonic_now_ns();
-    if (timeout_ms <= 0) return now_ns;
-    uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
-    if (timeout_ns / 1000000ULL != (uint64_t)timeout_ms) return UINT64_MAX;
-    if (UINT64_MAX - now_ns < timeout_ns) return UINT64_MAX;
-    return now_ns + timeout_ns;
-}
-
-static inline struct timespec __ch_realtime_deadline_from_timeout_ms(long timeout_ms) {
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    if (timeout_ms <= 0) return deadline;
-    deadline.tv_nsec += (timeout_ms % 1000) * 1000000L;
-    deadline.tv_sec += timeout_ms / 1000 + deadline.tv_nsec / 1000000000L;
-    deadline.tv_nsec %= 1000000000L;
-    return deadline;
-}
-
 static inline void __ch_store_value_locked(blorp_Channel* ch, void* value) {
     // Retain refcounted values — caller keeps its reference, channel gets its own
     if (ch->elem_release && value) blorp_retain(value);
@@ -23659,19 +25947,32 @@ static inline void __ch_store_value_locked(blorp_Channel* ch, void* value) {
     ch->count++;
 }
 
-static inline void __ch_wake_recv_after_send(blorp_Channel* ch, blorp_Fiber** recv_waiter) {
-    *recv_waiter = __ch_fiber_dequeue(&ch->recv_waiters_head, &ch->recv_waiters_tail);
+static inline void __ch_wake_recv_after_send(
+    blorp_Channel* ch,
+    blorp_ChannelFiberWakeSet* wake_set
+) {
+    __ch_collect_one_ready_waiter(
+        &ch->recv_waiters_head,
+        &ch->recv_waiters_tail,
+        BLORP_CHANNEL_WAIT_RECV,
+        wake_set);
     pthread_cond_signal(&ch->not_empty);
 }
 
-static inline blorp_Fiber* __ch_wake_after_recv_locked(blorp_Channel* ch) {
-    blorp_Fiber* send_waiter =
-        __ch_fiber_dequeue(&ch->send_waiters_head, &ch->send_waiters_tail);
+static inline blorp_ChannelFiberWakeSet __ch_wake_after_recv_locked(
+    blorp_Channel* ch
+) {
+    blorp_ChannelFiberWakeSet wake_set = __ch_fiber_wake_set_none();
+    __ch_collect_one_ready_waiter(
+        &ch->send_waiters_head,
+        &ch->send_waiters_tail,
+        BLORP_CHANNEL_WAIT_SEND,
+        &wake_set);
     pthread_cond_signal(&ch->not_full);
     if (ch->sealed && ch->count == 0) {
-        __ch_select_waiters_wake_all_locked(ch);
+        __ch_select_waiters_wake_all_locked(ch, BLORP_WAKE_SEALED);
     }
-    return send_waiter;
+    return wake_set;
 }
 
 // send(ch, value) -> Bool  (blocking, false if sealed)
@@ -23683,16 +25984,25 @@ long blorp_channel_send(void* c, void* value) {
 
     while (ch->count == ch->capacity && !ch->sealed) {
         if (self) {
-            // Fiber path: set parked before enqueueing, then unlock before
-            // parking. Wakers dequeue under the channel mutex and schedule
-            // after releasing it.
-            __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-            __ch_fiber_enqueue(&ch->send_waiters_head, &ch->send_waiters_tail, self);
+            // Fiber path: prepare to park before enqueueing, then unlock
+            // before parking. Wakers dequeue under the channel mutex and
+            // schedule after releasing it.
+            blorp_ChannelFiberWaiter waiter;
+            blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+                self, BLORP_WAIT_OWNER_CHANNEL_SEND, "channel send begin");
+            __ch_fiber_waiter_init(
+                &waiter, wait, BLORP_CHANNEL_WAIT_SEND, 0);
+            blorp_fiber_prepare_wait_to_park(
+                wait, "channel send ready to park");
+            __ch_fiber_enqueue(
+                &ch->send_waiters_head, &ch->send_waiters_tail, &waiter);
             __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_send_parks);
             pthread_mutex_unlock(&ch->mutex);
-            blorp_fiber_park();
+            blorp_fiber_park(wait);
             pthread_mutex_lock(&ch->mutex);
-            __ch_fiber_remove(&ch->send_waiters_head, &ch->send_waiters_tail, self);
+            __ch_fiber_remove(
+                &ch->send_waiters_head, &ch->send_waiters_tail, &waiter);
+            __ch_fiber_wait_clear(self);
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -23713,11 +26023,11 @@ long blorp_channel_send(void* c, void* value) {
     }
     __ch_store_value_locked(ch, value);
     // Wake one recv waiter (fiber or condvar)
-    blorp_Fiber* recv_waiter = NULL;
-    __ch_wake_recv_after_send(ch, &recv_waiter);
-    __ch_select_waiters_wake_all_locked(ch);
+    blorp_ChannelFiberWakeSet wake_set = __ch_fiber_wake_set_none();
+    __ch_wake_recv_after_send(ch, &wake_set);
+    __ch_select_waiters_wake_all_locked(ch, BLORP_WAKE_READY);
     pthread_mutex_unlock(&ch->mutex);
-    if (recv_waiter) blorp_fiber_schedule(recv_waiter);
+    __ch_schedule_fiber_wake_set(&wake_set, BLORP_WAKE_READY);
     return 1; // true
 }
 
@@ -23730,14 +26040,23 @@ void* blorp_channel_recv(void* c) {
 
     while (ch->count == 0 && !ch->sealed) {
         if (self) {
-            // Fiber path: set parked BEFORE enqueueing
-            __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-            __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            // Fiber path: prepare to park before enqueueing.
+            blorp_ChannelFiberWaiter waiter;
+            blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+                self, BLORP_WAIT_OWNER_CHANNEL_RECV, "channel recv begin");
+            __ch_fiber_waiter_init(
+                &waiter, wait, BLORP_CHANNEL_WAIT_RECV, 0);
+            blorp_fiber_prepare_wait_to_park(
+                wait, "channel recv ready to park");
+            __ch_fiber_enqueue(
+                &ch->recv_waiters_head, &ch->recv_waiters_tail, &waiter);
             __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_recv_parks);
             pthread_mutex_unlock(&ch->mutex);
-            blorp_fiber_park();
+            blorp_fiber_park(wait);
             pthread_mutex_lock(&ch->mutex);
-            __ch_fiber_remove(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            __ch_fiber_remove(
+                &ch->recv_waiters_head, &ch->recv_waiters_tail, &waiter);
+            __ch_fiber_wait_clear(self);
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -23760,9 +26079,9 @@ void* blorp_channel_recv(void* c) {
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
     // Wake one send waiter (fiber or condvar)
-    blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+    blorp_ChannelFiberWakeSet wake_set = __ch_wake_after_recv_locked(ch);
     pthread_mutex_unlock(&ch->mutex);
-    if (send_waiter) blorp_fiber_schedule(send_waiter);
+    __ch_schedule_fiber_wake_set(&wake_set, BLORP_WAKE_READY);
     blorp_Option* opt = blorp_option_some(value);
     if (ch->elem_release) opt->release_mask = 1UL;
     return opt;
@@ -23787,11 +26106,11 @@ long blorp_channel_try_send_status(void* c, void* value) {
         return BLORP_CHANNEL_SEND_WOULD_BLOCK;
     }
     __ch_store_value_locked(ch, value);
-    blorp_Fiber* recv_waiter = NULL;
-    __ch_wake_recv_after_send(ch, &recv_waiter);
-    __ch_select_waiters_wake_all_locked(ch);
+    blorp_ChannelFiberWakeSet wake_set = __ch_fiber_wake_set_none();
+    __ch_wake_recv_after_send(ch, &wake_set);
+    __ch_select_waiters_wake_all_locked(ch, BLORP_WAKE_READY);
     pthread_mutex_unlock(&ch->mutex);
-    if (recv_waiter) blorp_fiber_schedule(recv_waiter);
+    __ch_schedule_fiber_wake_set(&wake_set, BLORP_WAKE_READY);
     return BLORP_CHANNEL_SEND_ACCEPTED;
 }
 
@@ -23807,9 +26126,9 @@ long blorp_channel_try_recv_status_raw(blorp_Channel* ch, void** out) {
     *out = ch->buffer[ch->head];
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
-    blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+    blorp_ChannelFiberWakeSet wake_set = __ch_wake_after_recv_locked(ch);
     pthread_mutex_unlock(&ch->mutex);
-    if (send_waiter) blorp_fiber_schedule(send_waiter);
+    __ch_schedule_fiber_wake_set(&wake_set, BLORP_WAKE_READY);
     return BLORP_CHANNEL_RECV_VALUE;
 }
 
@@ -23834,7 +26153,7 @@ void* blorp_channel_try_recv(void* c) {
 long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, void** out) {
     if (__blorp_cancel_current_task_if_requested()) return BLORP_CHANNEL_RECV_TIMED_OUT;
     blorp_Fiber* self = __blorp_current_fiber;
-    uint64_t monotonic_deadline = __ch_monotonic_deadline_from_timeout_ms(timeout_ms);
+    uint64_t monotonic_deadline = blorp_deadline_ns_from_now_ms(timeout_ms);
     struct timespec realtime_deadline = {0, 0};
     bool have_realtime_deadline = false;
     pthread_mutex_lock(&ch->mutex);
@@ -23848,18 +26167,45 @@ long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, v
         if (self) {
             if (blorp_monotonic_now_ns() >= monotonic_deadline) break;
             // Fiber path: park with timer for wakeup on timeout
-            self->wake_time_ns = monotonic_deadline;
-            __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-            __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
-            blorp_timer_queue_insert(self);
+            blorp_ChannelFiberWaiter waiter;
+            blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+                self,
+                BLORP_WAIT_OWNER_CHANNEL_RECV,
+                "channel recv timeout begin");
+            __ch_fiber_waiter_init(
+                &waiter,
+                wait,
+                BLORP_CHANNEL_WAIT_RECV,
+                monotonic_deadline);
+            blorp_fiber_prepare_wait_to_park(
+                wait, "channel recv timeout ready to park");
+            __ch_fiber_enqueue(
+                &ch->recv_waiters_head, &ch->recv_waiters_tail, &waiter);
+            blorp_fiber_install_timer_wait(
+                wait,
+                monotonic_deadline,
+                BLORP_WAKE_TIMEOUT,
+                "channel recv timeout timer");
             __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_recv_parks);
             pthread_mutex_unlock(&ch->mutex);
-            blorp_fiber_park();
+            blorp_fiber_park(wait);
             // Woken by either: data arrived (sender dequeued us), seal, or timer
             // expiry. Remove from both queues; either remove may be a no-op.
-            blorp_timer_queue_remove(self);
+            blorp_fiber_remove_timer_wait(
+                wait, "channel recv timeout timer remove");
             pthread_mutex_lock(&ch->mutex);
-            __ch_fiber_remove(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            __ch_fiber_remove(
+                &ch->recv_waiters_head, &ch->recv_waiters_tail, &waiter);
+            blorp_ChannelWakeReason wake_reason = waiter.wake_reason;
+            bool timeout_won =
+                wake_reason == BLORP_CHANNEL_WAKE_TIMED_OUT ||
+                (wake_reason == BLORP_CHANNEL_WAKE_PENDING &&
+                 blorp_monotonic_now_ns() >= monotonic_deadline);
+            __ch_fiber_wait_clear(self);
+            if (timeout_won) {
+                pthread_mutex_unlock(&ch->mutex);
+                return BLORP_CHANNEL_RECV_TIMED_OUT;
+            }
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -23869,7 +26215,7 @@ long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, v
             // Thread path: timed condvar wait. Loop handles spurious wakeups.
             if (!have_realtime_deadline) {
                 realtime_deadline =
-                    __ch_realtime_deadline_from_timeout_ms(timeout_ms);
+                    blorp_realtime_deadline_from_now_ms(timeout_ms);
                 have_realtime_deadline = true;
             }
             int rc = pthread_cond_timedwait(&ch->not_empty, &ch->mutex, &realtime_deadline);
@@ -23889,9 +26235,9 @@ long blorp_channel_recv_timeout_status_raw(blorp_Channel* ch, long timeout_ms, v
     *out = ch->buffer[ch->head];
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
-    blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+    blorp_ChannelFiberWakeSet wake_set = __ch_wake_after_recv_locked(ch);
     pthread_mutex_unlock(&ch->mutex);
-    if (send_waiter) blorp_fiber_schedule(send_waiter);
+    __ch_schedule_fiber_wake_set(&wake_set, BLORP_WAKE_READY);
     return BLORP_CHANNEL_RECV_VALUE;
 }
 
@@ -23924,7 +26270,7 @@ long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms) {
     if (__blorp_cancel_current_task_if_requested()) return BLORP_CHANNEL_SEND_TIMED_OUT;
     blorp_Channel* ch = (blorp_Channel*)c;
     blorp_Fiber* self = __blorp_current_fiber;
-    uint64_t monotonic_deadline = __ch_monotonic_deadline_from_timeout_ms(timeout_ms);
+    uint64_t monotonic_deadline = blorp_deadline_ns_from_now_ms(timeout_ms);
     struct timespec realtime_deadline = {0, 0};
     bool have_realtime_deadline = false;
     pthread_mutex_lock(&ch->mutex);
@@ -23937,18 +26283,45 @@ long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms) {
 
         if (self) {
             if (blorp_monotonic_now_ns() >= monotonic_deadline) break;
-            self->wake_time_ns = monotonic_deadline;
-            __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-            __ch_fiber_enqueue(&ch->send_waiters_head, &ch->send_waiters_tail, self);
-            blorp_timer_queue_insert(self);
+            blorp_ChannelFiberWaiter waiter;
+            blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+                self,
+                BLORP_WAIT_OWNER_CHANNEL_SEND,
+                "channel send timeout begin");
+            __ch_fiber_waiter_init(
+                &waiter,
+                wait,
+                BLORP_CHANNEL_WAIT_SEND,
+                monotonic_deadline);
+            blorp_fiber_prepare_wait_to_park(
+                wait, "channel send timeout ready to park");
+            __ch_fiber_enqueue(
+                &ch->send_waiters_head, &ch->send_waiters_tail, &waiter);
+            blorp_fiber_install_timer_wait(
+                wait,
+                monotonic_deadline,
+                BLORP_WAKE_TIMEOUT,
+                "channel send timeout timer");
             __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_send_parks);
             pthread_mutex_unlock(&ch->mutex);
-            blorp_fiber_park();
+            blorp_fiber_park(wait);
             // Woken by either: space freed, seal, or timer expiry. Remove from
             // both queues; either remove may be a no-op.
-            blorp_timer_queue_remove(self);
+            blorp_fiber_remove_timer_wait(
+                wait, "channel send timeout timer remove");
             pthread_mutex_lock(&ch->mutex);
-            __ch_fiber_remove(&ch->send_waiters_head, &ch->send_waiters_tail, self);
+            __ch_fiber_remove(
+                &ch->send_waiters_head, &ch->send_waiters_tail, &waiter);
+            blorp_ChannelWakeReason wake_reason = waiter.wake_reason;
+            bool timeout_won =
+                wake_reason == BLORP_CHANNEL_WAKE_TIMED_OUT ||
+                (wake_reason == BLORP_CHANNEL_WAKE_PENDING &&
+                 blorp_monotonic_now_ns() >= monotonic_deadline);
+            __ch_fiber_wait_clear(self);
+            if (timeout_won) {
+                pthread_mutex_unlock(&ch->mutex);
+                return BLORP_CHANNEL_SEND_TIMED_OUT;
+            }
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -23957,7 +26330,7 @@ long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms) {
         } else {
             if (!have_realtime_deadline) {
                 realtime_deadline =
-                    __ch_realtime_deadline_from_timeout_ms(timeout_ms);
+                    blorp_realtime_deadline_from_now_ms(timeout_ms);
                 have_realtime_deadline = true;
             }
             int rc = pthread_cond_timedwait(&ch->not_full, &ch->mutex, &realtime_deadline);
@@ -23978,11 +26351,11 @@ long blorp_channel_send_timeout_status(void* c, void* value, long timeout_ms) {
         return BLORP_CHANNEL_SEND_TIMED_OUT;
     }
     __ch_store_value_locked(ch, value);
-    blorp_Fiber* recv_waiter = NULL;
-    __ch_wake_recv_after_send(ch, &recv_waiter);
-    __ch_select_waiters_wake_all_locked(ch);
+    blorp_ChannelFiberWakeSet wake_set = __ch_fiber_wake_set_none();
+    __ch_wake_recv_after_send(ch, &wake_set);
+    __ch_select_waiters_wake_all_locked(ch, BLORP_WAKE_READY);
     pthread_mutex_unlock(&ch->mutex);
-    if (recv_waiter) blorp_fiber_schedule(recv_waiter);
+    __ch_schedule_fiber_wake_set(&wake_set, BLORP_WAKE_READY);
     return BLORP_CHANNEL_SEND_ACCEPTED;
 }
 
@@ -23992,27 +26365,19 @@ void blorp_channel_seal(void* c) {
     pthread_mutex_lock(&ch->mutex);
     ch->sealed = true;
     // Collect fiber waiters under lock, then wake outside to avoid nested lock acquisition
-    blorp_Fiber* send_list = ch->send_waiters_head;
+    blorp_ChannelFiberWaiter* send_list = ch->send_waiters_head;
     ch->send_waiters_head = ch->send_waiters_tail = NULL;
-    blorp_Fiber* recv_list = ch->recv_waiters_head;
+    blorp_ChannelFiberWaiter* recv_list = ch->recv_waiters_head;
     ch->recv_waiters_head = ch->recv_waiters_tail = NULL;
+    __ch_mark_detached_waiters(send_list, BLORP_CHANNEL_WAIT_SEND);
+    __ch_mark_detached_waiters(recv_list, BLORP_CHANNEL_WAIT_RECV);
     pthread_cond_broadcast(&ch->not_empty);
     pthread_cond_broadcast(&ch->not_full);
-    __ch_select_waiters_wake_all_locked(ch);
+    __ch_select_waiters_wake_all_locked(ch, BLORP_WAKE_SEALED);
     pthread_mutex_unlock(&ch->mutex);
     // Schedule collected fibers outside ch->mutex
-    while (send_list) {
-        blorp_Fiber* f = send_list;
-        send_list = f->wait_next;
-        f->wait_next = NULL;
-        blorp_fiber_schedule(f);
-    }
-    while (recv_list) {
-        blorp_Fiber* f = recv_list;
-        recv_list = f->wait_next;
-        f->wait_next = NULL;
-        blorp_fiber_schedule(f);
-    }
+    __ch_schedule_fiber_wait_list(send_list, BLORP_WAKE_SEALED);
+    __ch_schedule_fiber_wait_list(recv_list, BLORP_WAKE_SEALED);
 }
 
 // Internal: blocking recv for for-in loop (avoids Option allocation overhead).
@@ -24023,13 +26388,22 @@ bool blorp_channel_recv_raw(blorp_Channel* ch, void** out) {
     pthread_mutex_lock(&ch->mutex);
     while (ch->count == 0 && !ch->sealed) {
         if (self) {
-            __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
-            __ch_fiber_enqueue(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            blorp_ChannelFiberWaiter waiter;
+            blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+                self, BLORP_WAIT_OWNER_CHANNEL_RECV, "channel raw recv begin");
+            __ch_fiber_waiter_init(
+                &waiter, wait, BLORP_CHANNEL_WAIT_RECV, 0);
+            blorp_fiber_prepare_wait_to_park(
+                wait, "channel raw recv ready to park");
+            __ch_fiber_enqueue(
+                &ch->recv_waiters_head, &ch->recv_waiters_tail, &waiter);
             __blorp_scheduler_stat_inc(&global_scheduler_stats.channel_recv_parks);
             pthread_mutex_unlock(&ch->mutex);
-            blorp_fiber_park();
+            blorp_fiber_park(wait);
             pthread_mutex_lock(&ch->mutex);
-            __ch_fiber_remove(&ch->recv_waiters_head, &ch->recv_waiters_tail, self);
+            __ch_fiber_remove(
+                &ch->recv_waiters_head, &ch->recv_waiters_tail, &waiter);
+            __ch_fiber_wait_clear(self);
             if (__blorp_is_cancelled()) {
                 pthread_mutex_unlock(&ch->mutex);
                 (void)__blorp_cancel_current_task_if_requested();
@@ -24051,9 +26425,9 @@ bool blorp_channel_recv_raw(blorp_Channel* ch, void** out) {
     *out = ch->buffer[ch->head];
     ch->head = (ch->head + 1) % ch->capacity;
     ch->count--;
-    blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+    blorp_ChannelFiberWakeSet wake_set = __ch_wake_after_recv_locked(ch);
     pthread_mutex_unlock(&ch->mutex);
-    if (send_waiter) blorp_fiber_schedule(send_waiter);
+    __ch_schedule_fiber_wake_set(&wake_set, BLORP_WAKE_READY);
     return true;
 }
 
@@ -24065,17 +26439,6 @@ static inline blorp_SelectResult blorp_select_no_result(void) {
     };
 }
 
-static inline uint64_t blorp_select_deadline_from_start(
-    uint64_t start_ns,
-    long timeout_ms
-) {
-    if (timeout_ms <= 0) return start_ns;
-    uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
-    if (timeout_ns / 1000000ULL != (uint64_t)timeout_ms) return UINT64_MAX;
-    if (UINT64_MAX - start_ns < timeout_ns) return UINT64_MAX;
-    return start_ns + timeout_ns;
-}
-
 static uint64_t blorp_select_next_deadline(
     blorp_SelectArm* arms,
     long arm_count,
@@ -24085,7 +26448,7 @@ static uint64_t blorp_select_next_deadline(
     for (long i = 0; i < arm_count; i++) {
         if (arms[i].kind != BLORP_SELECT_AFTER) continue;
         uint64_t deadline =
-            blorp_select_deadline_from_start(start_ns, arms[i].timeout_ms);
+            blorp_deadline_ns_from_start_ms(start_ns, arms[i].timeout_ms);
         if (deadline == UINT64_MAX) continue;
         if (next_deadline == 0 || deadline < next_deadline) next_deadline = deadline;
     }
@@ -24107,7 +26470,7 @@ static bool blorp_select_try_ready(
         blorp_SelectArm* arm = &arms[i];
         if (arm->kind == BLORP_SELECT_AFTER) {
             uint64_t deadline =
-                blorp_select_deadline_from_start(start_ns, arm->timeout_ms);
+                blorp_deadline_ns_from_start_ms(start_ns, arm->timeout_ms);
             if (now_ns >= deadline) {
                 *out = (blorp_SelectResult) {
                     .arm_index = i,
@@ -24126,9 +26489,10 @@ static bool blorp_select_try_ready(
             void* value = ch->buffer[ch->head];
             ch->head = (ch->head + 1) % ch->capacity;
             ch->count--;
-            blorp_Fiber* send_waiter = __ch_wake_after_recv_locked(ch);
+            blorp_ChannelFiberWakeSet wake_set =
+                __ch_wake_after_recv_locked(ch);
             pthread_mutex_unlock(&ch->mutex);
-            if (send_waiter) blorp_fiber_schedule(send_waiter);
+            __ch_schedule_fiber_wake_set(&wake_set, BLORP_WAKE_READY);
             *out = (blorp_SelectResult) {
                 .arm_index = i,
                 .kind = BLORP_SELECT_RECV,
@@ -24184,12 +26548,6 @@ static void blorp_select_remove_waiters(
     }
 }
 
-static void blorp_select_restore_running_fiber(blorp_Fiber* self) {
-    if (!self) return;
-    __atomic_store_n(&self->wake_pending, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&self->parked, 0, __ATOMIC_RELEASE);
-}
-
 static void blorp_select_nonfiber_wake_init(blorp_SelectNonfiberWake* wake) {
     pthread_mutex_init(&wake->mutex, NULL);
     pthread_cond_init(&wake->cond, NULL);
@@ -24199,26 +26557,6 @@ static void blorp_select_nonfiber_wake_init(blorp_SelectNonfiberWake* wake) {
 static void blorp_select_nonfiber_wake_destroy(blorp_SelectNonfiberWake* wake) {
     pthread_cond_destroy(&wake->cond);
     pthread_mutex_destroy(&wake->mutex);
-}
-
-static struct timespec blorp_realtime_after_ns(uint64_t delta_ns) {
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    uint64_t add_sec = delta_ns / 1000000000ULL;
-    uint64_t add_nsec = delta_ns % 1000000000ULL;
-    if (add_sec > (uint64_t)LONG_MAX ||
-        deadline.tv_sec > (time_t)(LONG_MAX - (long)add_sec - 1)) {
-        deadline.tv_sec = (time_t)LONG_MAX;
-        deadline.tv_nsec = 999999999L;
-        return deadline;
-    }
-    deadline.tv_sec += (time_t)add_sec;
-    deadline.tv_nsec += (long)add_nsec;
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec += 1;
-        deadline.tv_nsec -= 1000000000L;
-    }
-    return deadline;
 }
 
 static void blorp_select_nonfiber_wait_until_woken(
@@ -24253,8 +26591,8 @@ static void blorp_select_sleep_nonfiber_until(uint64_t deadline_ns) {
     if (deadline_ns <= now_ns) return;
     uint64_t delta_ns = deadline_ns - now_ns;
     struct timespec ts;
-    ts.tv_sec = delta_ns / 1000000000ULL;
-    ts.tv_nsec = (long)(delta_ns % 1000000000ULL);
+    ts.tv_sec = delta_ns / BLORP_NSEC_PER_SEC;
+    ts.tv_nsec = (long)(delta_ns % BLORP_NSEC_PER_SEC);
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
 }
 
@@ -24299,9 +26637,8 @@ blorp_SelectResult blorp_select_wait(blorp_SelectArm* arms, long arm_count) {
                 }
                 blorp_Channel* ch = arms[i].channel;
                 blorp_ChannelSelectWaiter* waiter = &waiters[waiter_index++];
-                waiter->fiber = NULL;
-                waiter->nonfiber_wake = &wake;
-                waiter->next = NULL;
+                __ch_select_waiter_init(
+                    waiter, blorp_fiber_no_wait_operation(), &wake);
                 if (!ch) continue;
                 pthread_mutex_lock(&ch->mutex);
                 __ch_select_waiter_enqueue_locked(ch, waiter);
@@ -24329,7 +26666,9 @@ blorp_SelectResult blorp_select_wait(blorp_SelectArm* arms, long arm_count) {
                 waiter_count, sizeof(blorp_ChannelSelectWaiter));
         }
 
-        __atomic_store_n(&self->parked, 1, __ATOMIC_RELEASE);
+        blorp_FiberWaitOperation wait = blorp_fiber_begin_wait(
+            self, BLORP_WAIT_OWNER_SELECT, "select wait begin");
+        blorp_fiber_prepare_wait_to_park(wait, "select ready to park");
         long waiter_index = 0;
         for (long i = 0; i < arm_count; i++) {
             if (arms[i].kind != BLORP_SELECT_RECV &&
@@ -24338,9 +26677,7 @@ blorp_SelectResult blorp_select_wait(blorp_SelectArm* arms, long arm_count) {
             }
             blorp_Channel* ch = arms[i].channel;
             blorp_ChannelSelectWaiter* waiter = &waiters[waiter_index++];
-            waiter->fiber = self;
-            waiter->nonfiber_wake = NULL;
-            waiter->next = NULL;
+            __ch_select_waiter_init(waiter, wait, NULL);
             if (!ch) continue;
             pthread_mutex_lock(&ch->mutex);
             __ch_select_waiter_enqueue_locked(ch, waiter);
@@ -24349,24 +26686,34 @@ blorp_SelectResult blorp_select_wait(blorp_SelectArm* arms, long arm_count) {
 
         bool timer_installed = false;
         if (next_deadline > 0 && next_deadline != UINT64_MAX) {
-            self->wake_time_ns = next_deadline;
-            blorp_timer_queue_insert(self);
+            blorp_fiber_install_timer_wait(
+                wait,
+                next_deadline,
+                BLORP_WAKE_TIMEOUT,
+                "select timer");
             timer_installed = true;
         }
 
         if (blorp_select_try_ready(arms, arm_count, start_ns, scan_start, &result)) {
-            if (timer_installed) blorp_timer_queue_remove(self);
+            if (timer_installed) {
+                blorp_fiber_remove_timer_wait(
+                    wait, "select timer ready remove");
+            }
             if (waiters) {
                 blorp_select_remove_waiters(arms, arm_count, waiters);
                 free(waiters);
             }
-            blorp_select_restore_running_fiber(self);
+            blorp_fiber_abandon_wait_before_park(
+                wait, "select ready before park");
             return result;
         }
 
-        blorp_fiber_park();
+        blorp_fiber_park(wait);
 
-        if (timer_installed) blorp_timer_queue_remove(self);
+        if (timer_installed) {
+            blorp_fiber_remove_timer_wait(
+                wait, "select timer remove");
+        }
         if (waiters) {
             blorp_select_remove_waiters(arms, arm_count, waiters);
             free(waiters);
@@ -26648,21 +28995,48 @@ long blorp_time_now(void) {
     return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L;
 }
 
+static time_t blorp_floor_microseconds_to_seconds(long microseconds) {
+    long secs = microseconds / 1000000L;
+    long rem = microseconds % 1000000L;
+    if (rem < 0) secs--;
+    return (time_t)secs;
+}
+
 // Helper: convert microseconds to struct tm (UTC)
-static struct tm blorp_us_to_tm(long us) {
-    time_t secs = us / 1000000L;
+static struct tm blorp_microseconds_to_tm(long microseconds) {
+    time_t secs = blorp_floor_microseconds_to_seconds(microseconds);
     struct tm result;
     gmtime_r(&secs, &result);
     return result;
 }
 
-long blorp_time_to_year(long us)    { return blorp_us_to_tm(us).tm_year + 1900; }
-long blorp_time_to_month(long us)   { return blorp_us_to_tm(us).tm_mon + 1; }
-long blorp_time_to_day(long us)     { return blorp_us_to_tm(us).tm_mday; }
-long blorp_time_to_hour(long us)    { return blorp_us_to_tm(us).tm_hour; }
-long blorp_time_to_minute(long us)  { return blorp_us_to_tm(us).tm_min; }
-long blorp_time_to_second(long us)  { return blorp_us_to_tm(us).tm_sec; }
-long blorp_time_to_weekday(long us) { return blorp_us_to_tm(us).tm_wday; }
+long blorp_time_to_year(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_year + 1900;
+}
+
+long blorp_time_to_month(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_mon + 1;
+}
+
+long blorp_time_to_day(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_mday;
+}
+
+long blorp_time_to_hour(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_hour;
+}
+
+long blorp_time_to_minute(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_min;
+}
+
+long blorp_time_to_second(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_sec;
+}
+
+long blorp_time_to_weekday(long microseconds) {
+    return blorp_microseconds_to_tm(microseconds).tm_wday;
+}
 
 // Construct POSIX microseconds from calendar parts (UTC)
 long blorp_time_from_parts(long year, long month, long day, long hour, long minute, long second) {
@@ -26677,12 +29051,237 @@ long blorp_time_from_parts(long year, long month, long day, long hour, long minu
     return (long)secs * 1000000L;
 }
 
+static bool blorp_time_is_leap_year(long year) {
+    if (year % 400 == 0) return true;
+    if (year % 100 == 0) return false;
+    return year % 4 == 0;
+}
+
+static int blorp_time_days_in_month(long year, long month) {
+    switch (month) {
+        case 1: return 31;
+        case 2: return blorp_time_is_leap_year(year) ? 29 : 28;
+        case 3: return 31;
+        case 4: return 30;
+        case 5: return 31;
+        case 6: return 30;
+        case 7: return 31;
+        case 8: return 31;
+        case 9: return 30;
+        case 10: return 31;
+        case 11: return 30;
+        case 12: return 31;
+        default: return 0;
+    }
+}
+
+static bool blorp_time_valid_date(long year, long month, long day) {
+    int days = blorp_time_days_in_month(year, month);
+    return days > 0 && day >= 1 && day <= days;
+}
+
+static bool blorp_time_valid_time(long hour, long minute, long second) {
+    return hour >= 0 && hour <= 23 &&
+           minute >= 0 && minute <= 59 &&
+           second >= 0 && second <= 59;
+}
+
+static bool blorp_time_tm_matches_utc_fields(
+    const struct tm* original,
+    const struct tm* normalized
+) {
+    return original->tm_year == normalized->tm_year &&
+           original->tm_mon == normalized->tm_mon &&
+           original->tm_mday == normalized->tm_mday &&
+           original->tm_hour == normalized->tm_hour &&
+           original->tm_min == normalized->tm_min &&
+           original->tm_sec == normalized->tm_sec;
+}
+
+static bool blorp_time_is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static bool blorp_time_is_ascii_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' ||
+           c == '\r' || c == '\f' || c == '\v';
+}
+
+typedef struct {
+    bool has_year;
+    bool has_month;
+    bool has_day;
+    bool has_hour;
+    bool has_minute;
+    bool has_second;
+    long year;
+    long month;
+    long day;
+    long hour;
+    long minute;
+    long second;
+} blorp_TimeParsedNumericFields;
+
+static bool blorp_time_read_number_width(
+    const char* input,
+    size_t* pos,
+    size_t min_width,
+    size_t max_width,
+    long* out
+) {
+    size_t start = *pos;
+    long value = 0;
+    size_t digits = 0;
+    while (digits < max_width && blorp_time_is_digit(input[*pos])) {
+        value = value * 10 + (input[*pos] - '0');
+        (*pos)++;
+        digits++;
+    }
+    if (digits < min_width) {
+        *pos = start;
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
+static bool blorp_time_record_numeric_directive(
+    blorp_TimeParsedNumericFields* fields,
+    char directive,
+    const char* input,
+    size_t* input_pos
+) {
+    long value = 0;
+    switch (directive) {
+        case 'Y':
+            if (!blorp_time_read_number_width(input, input_pos, 4, 4, &value)) return false;
+            fields->has_year = true;
+            fields->year = value;
+            return true;
+        case 'm':
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_month = true;
+            fields->month = value;
+            return true;
+        case 'd':
+        case 'e':
+            while (input[*input_pos] == ' ') (*input_pos)++;
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_day = true;
+            fields->day = value;
+            return true;
+        case 'H':
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_hour = true;
+            fields->hour = value;
+            return true;
+        case 'M':
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_minute = true;
+            fields->minute = value;
+            return true;
+        case 'S':
+            if (!blorp_time_read_number_width(input, input_pos, 1, 2, &value)) return false;
+            fields->has_second = true;
+            fields->second = value;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool blorp_time_scan_literal(const char* input, size_t* input_pos, char expected) {
+    if (input[*input_pos] != expected) return false;
+    (*input_pos)++;
+    return true;
+}
+
+static bool blorp_time_collected_numeric_fields_valid(
+    const blorp_TimeParsedNumericFields* fields
+) {
+    if (fields->has_month && (fields->month < 1 || fields->month > 12)) return false;
+    if (fields->has_day && (fields->day < 1 || fields->day > 31)) return false;
+    if (fields->has_hour && (fields->hour < 0 || fields->hour > 23)) return false;
+    if (fields->has_minute && (fields->minute < 0 || fields->minute > 59)) return false;
+    if (fields->has_second && (fields->second < 0 || fields->second > 59)) return false;
+    if (fields->has_year && fields->has_month && fields->has_day) {
+        return blorp_time_valid_date(fields->year, fields->month, fields->day);
+    }
+    return true;
+}
+
+static bool blorp_time_validate_numeric_fields_for_format(
+    const char* input,
+    const char* fmt
+) {
+    blorp_TimeParsedNumericFields fields = {0};
+    size_t input_pos = 0;
+    size_t fmt_pos = 0;
+
+    while (fmt[fmt_pos] != '\0') {
+        char fmt_char = fmt[fmt_pos];
+        if (blorp_time_is_ascii_space(fmt_char)) {
+            while (blorp_time_is_ascii_space(fmt[fmt_pos])) fmt_pos++;
+            while (blorp_time_is_ascii_space(input[input_pos])) input_pos++;
+            continue;
+        }
+        if (fmt_char != '%') {
+            if (!blorp_time_scan_literal(input, &input_pos, fmt_char)) {
+                return blorp_time_collected_numeric_fields_valid(&fields);
+            }
+            fmt_pos++;
+            continue;
+        }
+
+        fmt_pos++;
+        char directive = fmt[fmt_pos];
+        if (directive == '\0') {
+            return blorp_time_collected_numeric_fields_valid(&fields);
+        }
+        if (directive == '%') {
+            if (!blorp_time_scan_literal(input, &input_pos, '%')) {
+                return blorp_time_collected_numeric_fields_valid(&fields);
+            }
+            fmt_pos++;
+            continue;
+        }
+        if (directive == 'F') {
+            if (!blorp_time_record_numeric_directive(&fields, 'Y', input, &input_pos) ||
+                !blorp_time_scan_literal(input, &input_pos, '-') ||
+                !blorp_time_record_numeric_directive(&fields, 'm', input, &input_pos) ||
+                !blorp_time_scan_literal(input, &input_pos, '-') ||
+                !blorp_time_record_numeric_directive(&fields, 'd', input, &input_pos)) {
+                return blorp_time_collected_numeric_fields_valid(&fields);
+            }
+            fmt_pos++;
+            continue;
+        }
+        if (directive == 'T') {
+            if (!blorp_time_record_numeric_directive(&fields, 'H', input, &input_pos) ||
+                !blorp_time_scan_literal(input, &input_pos, ':') ||
+                !blorp_time_record_numeric_directive(&fields, 'M', input, &input_pos) ||
+                !blorp_time_scan_literal(input, &input_pos, ':') ||
+                !blorp_time_record_numeric_directive(&fields, 'S', input, &input_pos)) {
+                return blorp_time_collected_numeric_fields_valid(&fields);
+            }
+            fmt_pos++;
+            continue;
+        }
+        if (!blorp_time_record_numeric_directive(&fields, directive, input, &input_pos)) {
+            return blorp_time_collected_numeric_fields_valid(&fields);
+        }
+        fmt_pos++;
+    }
+
+    return blorp_time_collected_numeric_fields_valid(&fields);
+}
+
 // Format microsecond timestamp using strftime (256-byte output limit)
-blorp_String* blorp_time_format(long us, const blorp_String* fmt) {
+blorp_String* blorp_time_format(long microseconds, const blorp_String* fmt) {
     if (!fmt || blorp_string_contains_nul(fmt)) {
         return blorp_string_alloc_uninit(0, 0);
     }
-    struct tm t = blorp_us_to_tm(us);
+    struct tm t = blorp_microseconds_to_tm(microseconds);
     char* cfmt = (char*)blorp_malloc_checked(fmt->len + 1);
     memcpy(cfmt, fmt->data, fmt->len);
     cfmt[fmt->len] = '\0';
@@ -26720,59 +29319,131 @@ blorp_StackOption_Int blorp_time_parse(const blorp_String* s, const blorp_String
         free(cfmt);
         return blorp_stack_option_int_none();
     }
+    bool numeric_fields_valid = blorp_time_validate_numeric_fields_for_format(cs, cfmt);
     free(cs);
     free(cfmt);
 
+    if (!numeric_fields_valid) {
+        return blorp_stack_option_int_none();
+    }
+    if (t.tm_sec < 0 || t.tm_sec > 59) {
+        return blorp_stack_option_int_none();
+    }
     time_t secs = timegm(&t);
+    struct tm normalized;
+    gmtime_r(&secs, &normalized);
+    if (!blorp_time_tm_matches_utc_fields(&t, &normalized)) {
+        return blorp_stack_option_int_none();
+    }
     return blorp_stack_option_int_some(secs * 1000000L);
 }
 
-// from_iso: Parse ISO 8601 / RFC 3339 date string to POSIX microseconds.
-blorp_StackOption_Int blorp_time_from_iso(const blorp_String* s) {
+static bool blorp_time_parse_fixed_digits(
+    const char* p,
+    long len,
+    long pos,
+    long digits,
+    int* out
+) {
+    if (pos < 0 || digits < 1 || pos + digits > len) return false;
+    int value = 0;
+    for (long i = 0; i < digits; i++) {
+        char c = p[pos + i];
+        if (!blorp_time_is_digit(c)) return false;
+        value = value * 10 + (c - '0');
+    }
+    *out = value;
+    return true;
+}
+
+static blorp_StackOption_Int blorp_time_parse_iso_like(
+    const blorp_String* s,
+    bool allow_date_only
+) {
     if (!s || s->len < 10) return blorp_stack_option_int_none();
     const char* p = s->data;
     long len = s->len;
 
     int year = 0, month = 0, day = 0;
     if (p[4] != '-' || p[7] != '-') return blorp_stack_option_int_none();
-    for (int i = 0; i < 4; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); year = year * 10 + (p[i] - '0'); }
-    for (int i = 5; i < 7; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); month = month * 10 + (p[i] - '0'); }
-    for (int i = 8; i < 10; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); day = day * 10 + (p[i] - '0'); }
-    if (month < 1 || month > 12 || day < 1 || day > 31) return blorp_stack_option_int_none();
+    if (!blorp_time_parse_fixed_digits(p, len, 0, 4, &year) ||
+        !blorp_time_parse_fixed_digits(p, len, 5, 2, &month) ||
+        !blorp_time_parse_fixed_digits(p, len, 8, 2, &day)) {
+        return blorp_stack_option_int_none();
+    }
+    if (!blorp_time_valid_date(year, month, day)) {
+        return blorp_stack_option_int_none();
+    }
 
     int hour = 0, minute = 0, second = 0;
-    long frac_us = 0, offset_us = 0;
+    long fraction_microseconds = 0;
+    long offset_microseconds = 0;
 
-    if (len > 10) {
+    if (len == 10) {
+        if (!allow_date_only) return blorp_stack_option_int_none();
+    } else {
         if (p[10] != 'T' && p[10] != 't') return blorp_stack_option_int_none();
-        if (len < 19) return blorp_stack_option_int_none();
+        if (len < 20) return blorp_stack_option_int_none();
         if (p[13] != ':' || p[16] != ':') return blorp_stack_option_int_none();
-        for (int i = 11; i < 13; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); hour = hour * 10 + (p[i] - '0'); }
-        for (int i = 14; i < 16; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); minute = minute * 10 + (p[i] - '0'); }
-        for (int i = 17; i < 19; i++) { if (p[i] < '0' || p[i] > '9') return blorp_stack_option_int_none(); second = second * 10 + (p[i] - '0'); }
-        if (hour > 23 || minute > 59 || second > 59) return blorp_stack_option_int_none();
+        if (!blorp_time_parse_fixed_digits(p, len, 11, 2, &hour) ||
+            !blorp_time_parse_fixed_digits(p, len, 14, 2, &minute) ||
+            !blorp_time_parse_fixed_digits(p, len, 17, 2, &second)) {
+            return blorp_stack_option_int_none();
+        }
+        if (!blorp_time_valid_time(hour, minute, second)) {
+            return blorp_stack_option_int_none();
+        }
 
         long pos = 19;
         if (pos < len && p[pos] == '.') {
             pos++;
-            long frac_digits = 0, frac_val = 0;
-            while (pos < len && p[pos] >= '0' && p[pos] <= '9' && frac_digits < 6) {
-                frac_val = frac_val * 10 + (p[pos] - '0'); frac_digits++; pos++;
+            if (pos >= len || !blorp_time_is_digit(p[pos])) {
+                return blorp_stack_option_int_none();
             }
-            while (pos < len && p[pos] >= '0' && p[pos] <= '9') pos++;
-            while (frac_digits < 6) { frac_val *= 10; frac_digits++; }
-            frac_us = frac_val;
-        }
-        if (pos < len) {
-            if (p[pos] == 'Z' || p[pos] == 'z') { /* UTC */ }
-            else if (p[pos] == '+' || p[pos] == '-') {
-                int sign = (p[pos] == '+') ? 1 : -1;
+            long frac_digits = 0;
+            long frac_val = 0;
+            while (pos < len && blorp_time_is_digit(p[pos])) {
+                if (frac_digits < 6) {
+                    frac_val = frac_val * 10 + (p[pos] - '0');
+                    frac_digits++;
+                }
                 pos++;
-                if (pos + 5 > len || p[pos+2] != ':') return blorp_stack_option_int_none();
-                int oh = (p[pos] - '0') * 10 + (p[pos+1] - '0');
-                int om = (p[pos+3] - '0') * 10 + (p[pos+4] - '0');
-                offset_us = (long)sign * ((long)oh * 3600000000L + (long)om * 60000000L);
             }
+            while (frac_digits < 6) {
+                frac_val *= 10;
+                frac_digits++;
+            }
+            fraction_microseconds = frac_val;
+        }
+
+        if (pos >= len) return blorp_stack_option_int_none();
+        if (p[pos] == 'Z' || p[pos] == 'z') {
+            pos++;
+            if (pos != len) return blorp_stack_option_int_none();
+        } else if (p[pos] == '+' || p[pos] == '-') {
+            int sign = (p[pos] == '+') ? 1 : -1;
+            pos++;
+            if (pos + 5 != len || p[pos + 2] != ':') {
+                return blorp_stack_option_int_none();
+            }
+            int offset_hour = 0;
+            int offset_minute = 0;
+            if (!blorp_time_parse_fixed_digits(p, len, pos, 2, &offset_hour) ||
+                !blorp_time_parse_fixed_digits(p, len, pos + 3, 2, &offset_minute)) {
+                return blorp_stack_option_int_none();
+            }
+            if (offset_hour > 23 || offset_minute > 59) {
+                return blorp_stack_option_int_none();
+            }
+            if (sign < 0 && offset_hour == 0 && offset_minute == 0) {
+                return blorp_stack_option_int_none();
+            }
+            offset_microseconds =
+                (long)sign *
+                ((long)offset_hour * 3600000000L +
+                 (long)offset_minute * 60000000L);
+        } else {
+            return blorp_stack_option_int_none();
         }
     }
 
@@ -26780,9 +29451,19 @@ blorp_StackOption_Int blorp_time_from_iso(const blorp_String* s) {
     t.tm_year = year - 1900; t.tm_mon = month - 1; t.tm_mday = day;
     t.tm_hour = hour; t.tm_min = minute; t.tm_sec = second;
     time_t secs = timegm(&t);
-    if (secs == (time_t)-1 && year != 1969) return blorp_stack_option_int_none();
-    long us = secs * 1000000L + frac_us - offset_us;
-    return blorp_stack_option_int_some(us);
+    long microseconds =
+        secs * 1000000L + fraction_microseconds - offset_microseconds;
+    return blorp_stack_option_int_some(microseconds);
+}
+
+// from_iso: Parse ISO calendar date or RFC3339 date-time to POSIX microseconds.
+blorp_StackOption_Int blorp_time_from_iso(const blorp_String* s) {
+    return blorp_time_parse_iso_like(s, true);
+}
+
+// parse_rfc3339: Parse strict RFC3339 date-time to POSIX microseconds.
+blorp_StackOption_Int blorp_time_parse_rfc3339(const blorp_String* s) {
+    return blorp_time_parse_iso_like(s, false);
 }
 
 
@@ -33834,6 +36515,9 @@ blorp_SchedulerStats* blorp_get_scheduler_stats(void) {
         atomic_load_explicit(
             &global_scheduler_stats.fiber_schedule_transitions,
             memory_order_relaxed);
+    stats->cooperative_yields =
+        atomic_load_explicit(&global_scheduler_stats.cooperative_yields,
+            memory_order_relaxed);
     stats->channel_send_parks =
         atomic_load_explicit(&global_scheduler_stats.channel_send_parks,
             memory_order_relaxed);
@@ -33921,6 +36605,8 @@ void blorp_reset_scheduler_stats(void) {
         memory_order_relaxed);
     atomic_store_explicit(&global_scheduler_stats.fiber_schedule_transitions,
         0, memory_order_relaxed);
+    atomic_store_explicit(&global_scheduler_stats.cooperative_yields, 0,
+        memory_order_relaxed);
     atomic_store_explicit(&global_scheduler_stats.channel_send_parks, 0,
         memory_order_relaxed);
     atomic_store_explicit(&global_scheduler_stats.channel_recv_parks, 0,
@@ -34177,8 +36863,6 @@ static void blorp_profile_maybe_terminate(void) {
 // Debug Functions
 // ============================================================================
 
-static int blorp_debug_log_level = 0;
-
 void blorp_debug_log_msg(blorp_String* s) {
     if (s && s->len > 0) fwrite(s->data, 1, s->len, stderr);
     fputc('\n', stderr);
@@ -34196,10 +36880,15 @@ static void blorp_debug_log(const char* level, blorp_String* msg) {
     fputc('\n', stderr);
 }
 
-void blorp_debug_info(blorp_String* s)  { if (blorp_debug_log_level <= 1) blorp_debug_log("INFO", s); }
-void blorp_debug_warn(blorp_String* s)  { if (blorp_debug_log_level <= 2) blorp_debug_log("WARN", s); }
-void blorp_debug_error(blorp_String* s) { if (blorp_debug_log_level <= 3) blorp_debug_log("ERROR", s); }
-void blorp_debug_set_log_level(long level) { blorp_debug_log_level = (int)level; }
+void blorp_debug_info(blorp_String* s) {
+    blorp_debug_log("INFO", s);
+}
+void blorp_debug_warn(blorp_String* s) {
+    blorp_debug_log("WARN", s);
+}
+void blorp_debug_error(blorp_String* s) {
+    blorp_debug_log("ERROR", s);
+}
 
 // ============================================================================
 // Filesystem Operations
@@ -34431,12 +37120,6 @@ static long __process_env_long_or_default(
     return value;
 }
 
-static uint64_t __process_deadline_from_now_ms(long timeout_ms) {
-    uint64_t now = blorp_monotonic_now_ns();
-    uint64_t add = (uint64_t)timeout_ms * 1000000ULL;
-    return add > UINT64_MAX - now ? UINT64_MAX : now + add;
-}
-
 static int __process_poll_timeout_ms(
     uint64_t now_ns,
     bool has_deadline,
@@ -34450,7 +37133,7 @@ static int __process_poll_timeout_ms(
         next_ns = kill_deadline_ns;
     }
     if (next_ns <= now_ns) return 0;
-    uint64_t delta_ms = (next_ns - now_ns) / 1000000ULL;
+    uint64_t delta_ms = (next_ns - now_ns) / BLORP_NSEC_PER_MSEC;
     if (delta_ms > (uint64_t)INT_MAX) return INT_MAX;
     return (int)delta_ms;
 }
@@ -34556,7 +37239,7 @@ static void __drain_process_pipes(
     bool err_open = true;
     bool has_deadline = timeout_ms >= 0;
     uint64_t deadline_ns =
-        has_deadline ? __process_deadline_from_now_ms(timeout_ms) : 0;
+        has_deadline ? blorp_deadline_ns_from_now_ms(timeout_ms) : 0;
     bool termination_sent = false;
     bool kill_sent = false;
     bool has_kill_deadline = false;
@@ -34579,7 +37262,8 @@ static void __drain_process_pipes(
             state->timed_out = true;
             termination_sent = true;
             has_kill_deadline = true;
-            kill_deadline_ns = __process_deadline_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
+            kill_deadline_ns =
+                blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
             __process_signal(pid, use_process_group, SIGTERM);
         }
         if (state->timed_out) {
@@ -34589,7 +37273,8 @@ static void __drain_process_pipes(
         if (state->output_limit_exceeded && !termination_sent) {
             termination_sent = true;
             has_kill_deadline = true;
-            kill_deadline_ns = __process_deadline_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
+            kill_deadline_ns =
+                blorp_deadline_ns_from_now_ms(BLORP_PROCESS_KILL_GRACE_MS);
             __process_signal(pid, use_process_group, SIGTERM);
         }
         if (
@@ -35398,6 +38083,26 @@ static void __blorp_sig_init(void) {
 
 // Track which signals have handlers installed
 static _Atomic(int) __blorp_sig_installed[BLORP_MAX_SIGNAL];
+
+long blorp_signal_hangup(void) {
+    return (long)SIGHUP;
+}
+
+long blorp_signal_interrupt(void) {
+    return (long)SIGINT;
+}
+
+long blorp_signal_terminate(void) {
+    return (long)SIGTERM;
+}
+
+long blorp_signal_user1(void) {
+    return (long)SIGUSR1;
+}
+
+long blorp_signal_user2(void) {
+    return (long)SIGUSR2;
+}
 
 // Install the flag-setting handler for a signal (idempotent)
 static void __blorp_sig_install(int signum) {
