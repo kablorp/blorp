@@ -1694,6 +1694,17 @@ private pure func expression_list_should_use_nested_block_call_arguments(
 	)
 
 
+-- This bypasses forced call-complexity hardlines so nested call arguments keep
+-- a real flat alternative for parent group decisions.
+private pure func compact_call_expression_document(
+	callee: Expression,
+	args: List[Expression],
+) -> Doc:
+	callee
+		.expression_document()
+		.cat(args.grouped_call_arguments_document())
+
+
 private pure func call_argument_document(expr: Expression) -> Doc:
 	match expr:
 		CallExpression(callee, args):
@@ -1705,10 +1716,16 @@ private pure func call_argument_document(expr: Expression) -> Doc:
 					.expression_document()
 					.cat(args.block_call_arguments_document())
 			else if args.length() >= 2 and callee.is_breakable_call_callee():
-				flat_document: Doc = expr.expression_document()
+				flat_document: Doc = compact_call_expression_document(callee, args)
+
+				broken_arguments: Doc = if args.expression_list_has_nontrivial_call_argument():
+					args.outer_only_block_call_arguments_document()
+				else:
+					args.block_call_arguments_document()
+
 				broken_document: Doc = callee
 					.expression_document()
-					.cat(args.block_call_arguments_document())
+					.cat(broken_arguments)
 				broken_document.if_break(flat_document)
 			else:
 				expr.expression_document()
@@ -1936,6 +1953,40 @@ private pure func expression_list_prefers_multiline_call_argument(exprs: List[Ex
 			break
 
 	found
+
+
+private pure func expression_is_nontrivial_call_argument(expr: Expression) -> Bool:
+	match expr:
+		CallExpression(callee, args):
+			method_call_with_args: Bool = match callee:
+				FieldAccessExpression(_, _):
+					args.length() > 0
+				_:
+					False
+
+			args.length() > 1 or method_call_with_args or expr.expression_is_multistep_ufcs_chain()
+		AscriptionExpression(inner, _):
+			inner.expression_is_nontrivial_call_argument()
+		OpaqueIntoExpression(_, inner):
+			inner.expression_is_nontrivial_call_argument()
+		OpaqueFromExpression(_, inner):
+			inner.expression_is_nontrivial_call_argument()
+		_:
+			False
+
+
+private pure func expression_list_has_nontrivial_call_argument(exprs: List[Expression]) -> Bool:
+	if exprs.length() <= 1:
+		False
+	else:
+		var found: Bool = False
+
+		for expr in exprs:
+			if expr.expression_is_nontrivial_call_argument():
+				found = True
+				break
+
+		found
 
 
 private pure func record_update_prefers_multiline_call_argument(
@@ -2322,7 +2373,10 @@ private pure func expression_list_is_compact_collection_argument(
 		exprs.expression_list_is_compact_call_collection(open_text, close_text)
 
 
-private pure func block_call_argument_documents(args: List[Expression]) -> List[Doc]:
+private pure func block_call_argument_documents_with_nested_policy(
+	args: List[Expression],
+	expand_nested_calls: Bool,
+) -> List[Doc]:
 	var documents: List[Doc] = []
 	last_index: Int = args.length() - 1
 	var index: Int = 0
@@ -2340,12 +2394,20 @@ private pure func block_call_argument_documents(args: List[Expression]) -> List[
 						.cat(",".text()),
 				)
 		else:
-			arg_document: Doc = arg.call_argument_document()
+			arg_document: Doc = if expand_nested_calls:
+				arg.call_argument_document()
+			else:
+				arg.expression_document()
+
 			documents = documents.append(arg_document.cat(",".text()))
 
 		index += 1
 
 	documents
+
+
+private pure func block_call_argument_documents(args: List[Expression]) -> List[Doc]:
+	args.block_call_argument_documents_with_nested_policy(True)
 
 
 private pure func block_call_arguments_document(args: List[Expression]) -> Doc:
@@ -2356,6 +2418,22 @@ private pure func block_call_arguments_document(args: List[Expression]) -> Doc:
 				.cat(
 					args
 						.block_call_argument_documents()
+						.hardlines(),
+				)
+				.indent(),
+		)
+		.cat(hardline)
+		.cat(")".text())
+
+
+private pure func outer_only_block_call_arguments_document(args: List[Expression]) -> Doc:
+	"("
+		.text()
+		.cat(
+			hardline
+				.cat(
+					args
+						.block_call_argument_documents_with_nested_policy(False)
 						.hardlines(),
 				)
 				.indent(),
@@ -2786,6 +2864,8 @@ private pure func call_arguments_document(args: List[Expression]) -> Doc:
 					or args.expression_list_should_use_block_call_arguments()
 				):
 					args.block_call_arguments_document()
+				else if args.expression_list_has_nontrivial_call_argument():
+					args.outer_only_block_call_arguments_document()
 				else:
 					args.grouped_call_arguments_document()
 
