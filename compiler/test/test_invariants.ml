@@ -650,16 +650,20 @@ let test_final_rejects_malformed_raw_tensor_get_intrinsic () =
   in
   let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
   let violations = Core_invariants.run_for_stage Core_stage.Final prog in
-  Alcotest.(check int) "one violation" 1 (List.length violations);
-  match violations with
-  | [ v ] ->
+  let raw_violation =
+    List.find_opt
+      (fun v -> Modules.contains v.Core_error.msg "raw tensor intrinsic")
+      violations
+  in
+  match raw_violation with
+  | Some v ->
       Alcotest.(check bool)
         "mentions raw tensor intrinsic" true
         (Modules.contains v.Core_error.msg "raw tensor intrinsic");
       Alcotest.(check bool)
         "mentions arity" true
         (Modules.contains v.Core_error.msg "arity")
-  | _ -> Alcotest.fail "unreachable"
+  | None -> Alcotest.fail "expected raw tensor intrinsic violation"
 
 let test_final_rejects_raw_string_byte_intrinsic () =
   let source = mk (CVar (Var.named "s")) ty_string in
@@ -717,6 +721,44 @@ let test_perceus_rejects_builtin_without_ownership_contract () =
       Alcotest.(check bool)
         "mentions ownership contract" true
         (Modules.contains v.Core_error.msg "ownership contract")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_final_rejects_intrinsic_without_ownership_contract () =
+  let body =
+    mk_call (CKIntrinsic "missing_ownership_contract") (mk CVoid ty_void)
+      [ cint 1 ]
+      ty_int
+  in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions ownership contract" true
+        (Modules.contains v.Core_error.msg "ownership contract");
+      Alcotest.(check bool)
+        "phase tag is Final" true
+        (v.Core_error.phase = Core_error.Stage Core_stage.Final)
+  | _ -> Alcotest.fail "unreachable"
+
+let test_final_rejects_builtin_without_ownership_contract () =
+  let body =
+    mk_call (CKBuiltin "missing_ownership_contract") (mk CVoid ty_void)
+      [ cint 1 ]
+      ty_int
+  in
+  let prog = mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body) ] in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions ownership contract" true
+        (Modules.contains v.Core_error.msg "ownership contract");
+      Alcotest.(check bool)
+        "phase tag is Final" true
+        (v.Core_error.phase = Core_error.Stage Core_stage.Final)
   | _ -> Alcotest.fail "unreachable"
 
 let test_perceus_rejects_pre_perceus_sentinel_builtin () =
@@ -1996,6 +2038,62 @@ let test_resource_cleanup_exit_final_rejects_nonvoid_cleanup () =
         (Modules.contains v.Core_error.msg "non-Void cleanup action")
   | _ -> Alcotest.fail "unreachable"
 
+let test_resource_cleanup_exit_final_rejects_void_non_call_cleanup () =
+  let cleanup_exit =
+    mk
+      (CResourceCleanupExit
+         { rce_cleanups = [ mk CVoid ty_void ]; rce_exit = ResourceBreak })
+      ty_void
+  in
+  let prog =
+    mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:cleanup_exit) ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions direct finalizer call" true
+        (Modules.contains v.Core_error.msg "direct finalizer call")
+  | _ -> Alcotest.fail "unreachable"
+
+let test_resource_cleanup_exit_final_rejects_wrong_arity_cleanup_call () =
+  let close_ty =
+    TyFunc
+      {
+        params = [ ty_test_resource; ty_test_resource ];
+        return = ty_void;
+        is_pure = false;
+      }
+  in
+  let cleanup =
+    mk_call
+      (CKUser ("close_pair", None))
+      (mk (CVar (Var.named "close_pair")) close_ty)
+      [
+        mk (CVar (Var.named "resource")) ty_test_resource;
+        mk (CVar (Var.named "other_resource")) ty_test_resource;
+      ]
+      ty_void
+  in
+  let cleanup_exit =
+    mk
+      (CResourceCleanupExit
+         { rce_cleanups = [ cleanup ]; rce_exit = ResourceBreak })
+      ty_void
+  in
+  let prog =
+    mk_prog [ CDFunc (mk_simple_func ~name:"main" ~body:cleanup_exit) ]
+  in
+  let violations = Core_invariants.run_for_stage Core_stage.Final prog in
+  Alcotest.(check int) "one violation" 1 (List.length violations);
+  match violations with
+  | [ v ] ->
+      Alcotest.(check bool)
+        "mentions one resource argument" true
+        (Modules.contains v.Core_error.msg "one resource argument")
+  | _ -> Alcotest.fail "unreachable"
+
 let test_resource_scope_final_allows_loop_local_break_continue () =
   let loop_body =
     mk
@@ -2246,6 +2344,10 @@ let suite =
           test_perceus_rejects_intrinsic_without_ownership_contract;
         Alcotest.test_case "perceus rejects unknown builtin ownership" `Quick
           test_perceus_rejects_builtin_without_ownership_contract;
+        Alcotest.test_case "final rejects unknown intrinsic ownership" `Quick
+          test_final_rejects_intrinsic_without_ownership_contract;
+        Alcotest.test_case "final rejects unknown builtin ownership" `Quick
+          test_final_rejects_builtin_without_ownership_contract;
         Alcotest.test_case "perceus rejects pre-perceus builtin sentinel" `Quick
           test_perceus_rejects_pre_perceus_sentinel_builtin;
         Alcotest.test_case "final accepts guarded raw intrinsic" `Quick
@@ -2400,6 +2502,11 @@ let suite =
           `Quick test_resource_cleanup_exit_final_rejects_empty_cleanup_stack;
         Alcotest.test_case "resource cleanup exit rejects non-Void cleanup"
           `Quick test_resource_cleanup_exit_final_rejects_nonvoid_cleanup;
+        Alcotest.test_case "resource cleanup exit rejects Void non-call cleanup"
+          `Quick test_resource_cleanup_exit_final_rejects_void_non_call_cleanup;
+        Alcotest.test_case "resource cleanup exit rejects wrong-arity cleanup"
+          `Quick
+          test_resource_cleanup_exit_final_rejects_wrong_arity_cleanup_call;
         Alcotest.test_case "resource scope allows loop-local break/continue"
           `Quick test_resource_scope_final_allows_loop_local_break_continue;
         Alcotest.test_case "final rejects unboxed void-slot builtin arg" `Quick

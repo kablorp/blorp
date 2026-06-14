@@ -107,6 +107,41 @@ let test_live_owned_formatter_lock_is_not_stale () =
         "live owner lock is not stale" false
         (Blorp.Fmt.formatter_lock_is_stale_for_tests lock_dir))
 
+let test_temp_dir_creation_retries_after_collision () =
+  let base =
+    Filename.concat
+      (Filename.get_temp_dir_name ())
+      (Printf.sprintf "blorp-format-collision-%d" (Unix.getpid ()))
+  in
+  let first = base ^ "-first.tmp" in
+  let second = base ^ "-second.tmp" in
+  cleanup_dir first;
+  cleanup_dir second;
+  Unix.mkdir first 0o700;
+  let markers = ref [ first; second ] in
+  Fun.protect
+    ~finally:(fun () ->
+      cleanup_dir first;
+      cleanup_dir second)
+    (fun () ->
+      let next_marker () =
+        match !markers with
+        | marker :: rest ->
+            markers := rest;
+            marker
+        | [] -> Alcotest.fail "temp dir retry exhausted marker candidates"
+      in
+      let dir =
+        Blorp.Fmt.create_temp_dir_from_marker_source_for_tests next_marker
+      in
+      Fun.protect
+        ~finally:(fun () -> cleanup_dir dir)
+        (fun () ->
+          Alcotest.(check string) "retry uses next candidate" second dir;
+          Alcotest.(check bool)
+            "created retry candidate" true
+            (Sys.file_exists dir && Sys.is_directory dir)))
+
 let suite =
   [
     ( "embedding",
@@ -121,5 +156,7 @@ let suite =
           test_ownerless_old_formatter_lock_is_stale;
         Alcotest.test_case "live owned lock is not stale" `Quick
           test_live_owned_formatter_lock_is_not_stale;
+        Alcotest.test_case "temp dir creation retries after collision" `Quick
+          test_temp_dir_creation_retries_after_collision;
       ] );
   ]

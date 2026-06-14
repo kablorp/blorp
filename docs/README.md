@@ -17,6 +17,8 @@ for history.
   ARC, and copy-on-write behavior.
 - [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) defines the compiler/runtime
   ownership ABI for managed values.
+- [0.1_MEMORY_HARDENING.md](0.1_MEMORY_HARDENING.md) tracks the release-blocking
+  memory leak hardening and gate expansion plan.
 
 ## Compiler
 

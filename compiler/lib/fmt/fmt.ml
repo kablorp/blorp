@@ -161,12 +161,36 @@ let rec cleanup_path_noerr path =
   with _ -> ()
 
 let cleanup_temp_dir dir = cleanup_path_noerr dir
+let temp_dir_retry_limit = 32
+
+(* Filename.temp_file reserves a path by creating a file. The formatter needs a
+   directory, so there is an unlink/mkdir window where another process or stale
+   artifact can claim the path. Retry EEXIST instead of surfacing a compiler
+   error from that race. *)
+let rec create_temp_dir_from_marker_source next_marker attempts_left =
+  let marker = next_marker () in
+  remove_file_noerr marker;
+  try
+    Unix.mkdir marker 0o700;
+    marker
+  with
+  | Unix.Unix_error (Unix.EEXIST, _, _) when attempts_left > 0 ->
+      create_temp_dir_from_marker_source next_marker (attempts_left - 1)
+  | exn ->
+      remove_file_noerr marker;
+      raise exn
+
+let create_temp_dir prefix =
+  create_temp_dir_from_marker_source
+    (fun () -> Filename.temp_file prefix ".tmp")
+    temp_dir_retry_limit
 
 let with_temp_dir prefix f =
-  let marker = Filename.temp_file prefix ".tmp" in
-  remove_file_noerr marker;
-  Unix.mkdir marker 0o700;
-  Fun.protect ~finally:(fun () -> cleanup_temp_dir marker) (fun () -> f marker)
+  let dir = create_temp_dir prefix in
+  Fun.protect ~finally:(fun () -> cleanup_temp_dir dir) (fun () -> f dir)
+
+let create_temp_dir_from_marker_source_for_tests next_marker =
+  create_temp_dir_from_marker_source next_marker temp_dir_retry_limit
 
 let sleep_seconds seconds = ignore (Unix.select [] [] [] seconds)
 let formatter_tool_name = "tools/formatter/formatter.brp"

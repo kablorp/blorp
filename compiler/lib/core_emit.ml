@@ -6673,6 +6673,7 @@ and emit_for_list_flat (ctx : Core_emit_context.t) (binder : loop_binder)
   let idx_c = Printf.sprintf "__i_%d" id in
   let var_c = escape_c_ident (Var.to_c_name binder.loop_var) in
   let elem_ty = binder.loop_ty in
+  let iter_needs_release = boxed_expr_transfers_ownership ctx iter in
   (* [blorp_Vector] and [blorp_List] have distinct struct layouts — Vector
      carries [elem_size] + [storage_mode] + padding between [elem_release]
      and [data[]], so [data[]] sits 8 bytes further in. Declaring a Vector
@@ -6686,6 +6687,11 @@ and emit_for_list_flat (ctx : Core_emit_context.t) (binder : loop_binder)
   emit ctx (Printf.sprintf "%s %s = " iter_c_type iter_c);
   emit_expr ctx iter;
   emitln ctx ";";
+  let iter_cleanup_registered =
+    iter_needs_release
+    && emit_owned_temp_cancellation_cleanup_push ctx ~slot_c:iter_c
+         ~value_c:iter_c ~ty:iter.ty
+  in
   emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c iter_c);
   let emit_loop emit_element_decl =
     emit_indent ctx;
@@ -6739,7 +6745,11 @@ and emit_for_list_flat (ctx : Core_emit_context.t) (binder : loop_binder)
     | None ->
         emit_loop (fun () ->
             emit_for_tensor_element_decl ctx var_c iter_c idx_c elem_ty)
-  else emit_loop emit_list_element_decl
+  else emit_loop emit_list_element_decl;
+  if iter_cleanup_registered then
+    emit_line ctx (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" iter_c);
+  if iter_needs_release then
+    emit_line ctx (Printf.sprintf "%s;" (release_value_call ctx iter.ty iter_c))
 
 (** Emit [for row in m:] where m is a 2D+ Tensor. Each iteration binds
     [row] to a freshly-allocated copy of the flat row-range via

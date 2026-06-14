@@ -3747,6 +3747,8 @@ scripts/test leak
 reset_mem_stats()          -- Reset allocation counters
 stats = get_mem_stats()    -- Snapshot allocations/releases/live objects
                            -- The MemStats snapshot object is not counted.
+print_live_object_summary()
+                           -- Print leak-check type buckets for live objects.
 
 # Scheduler stats builtins (in blorp code, from instrumentation)
 reset_scheduler_stats()    -- Enable and reset scheduler counters

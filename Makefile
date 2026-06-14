@@ -102,6 +102,7 @@ hygiene-check:
 	fi
 	@scripts/check-editor-drift
 	@scripts/check-std-builtins
+	@scripts/check-memory-hardening-drift
 	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
 		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \
 		echo "Run 'cd compiler && dune build @check' and inspect the conflict report."; \
@@ -161,9 +162,9 @@ security-check: all c-static-analysis
 # stronger ASan + UBSan combination.
 test-asan: all
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
-		./blorp test --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
+		./blorp test --no-format --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
 	else \
-		./blorp test --sanitize $(RUNTIME_TEST_ROOTS); \
+		./blorp test --no-format --sanitize $(RUNTIME_TEST_ROOTS); \
 	fi
 
 # Docker targets

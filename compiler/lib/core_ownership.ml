@@ -495,11 +495,74 @@ let builtin_contract_table =
       builtins
         [ "__blorp_option_eq_layout" ]
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins
+        [ "blorp_option_div_int"; "blorp_option_mod_int" ]
+        (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      (* Scalar math calls operate only on immediate primitive values. Some
+         source-level std/float builtins intentionally remain direct C
+         passthroughs at Final, so they need ordinary builtin contracts in
+         addition to the IR intrinsic math contracts above. *)
+      builtins
+        [
+          "sqrt";
+          "sin";
+          "cos";
+          "tan";
+          "floor";
+          "ceil";
+          "asin";
+          "acos";
+          "atan";
+          "sinh";
+          "cosh";
+          "tanh";
+          "asinh";
+          "acosh";
+          "atanh";
+          "exp";
+          "exp2";
+          "log";
+          "log2";
+          "log10";
+          "log1p";
+          "expm1";
+          "cbrt";
+          "trunc";
+        ]
+        (bfixed [ Borrow ] ReturnPrimitive);
+      builtins
+        [ "pow"; "atan2"; "hypot"; "fmod"; "copysign" ]
+        (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins [ "fma" ] (bfixed [ Borrow; Borrow; Borrow ] ReturnPrimitive);
+      builtins
+        [
+          "blorp_abs";
+          "blorp_float_abs";
+          "blorp_round";
+          "blorp_is_nan";
+          "blorp_is_inf";
+          "blorp_is_finite";
+          "blorp_black_box_int";
+          "blorp_black_box_float";
+        ]
+        (bfixed [ Borrow ] ReturnPrimitive);
+      builtins
+        [ "blorp_min"; "blorp_max"; "blorp_float_min"; "blorp_float_max" ]
+        (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins
+        [ "blorp_infinity"; "blorp_neg_infinity"; "blorp_nan_value" ]
+        (bfixed [] ReturnPrimitive);
       (* OS-boundary helpers borrow caller-owned Blorp values. The runtime may
          copy them into C strings, but it does not take ownership of the source
          String/List/Bytes objects. *)
       builtins
         [ "blorp_read_file"; "blorp_read_bytes" ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_read_all"; "blorp_read_line"; "blorp_read_line_or_empty" ]
+        (bfixed [] ReturnOwned);
+      builtins
+        [ "blorp_input"; "blorp_input_or_empty" ]
         (bfixed [ Borrow ] ReturnOwned);
       builtins
         [ "blorp_write_file"; "blorp_write_bytes" ]
@@ -529,6 +592,92 @@ let builtin_contract_table =
       builtins [ "blorp_exec" ] (bfixed [ Borrow ] ReturnPrimitive);
       builtins [ "blorp_exec_output" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_setenv" ] (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins
+        [
+          "blorp_signal_hangup";
+          "blorp_signal_interrupt";
+          "blorp_signal_terminate";
+          "blorp_signal_user1";
+          "blorp_signal_user2";
+        ]
+        (bfixed [] ReturnPrimitive);
+      builtins [ "blorp_signal_on" ] (bfixed [ Borrow; Retain ] ReturnVoid);
+      builtins [ "blorp_signal_received" ] (bfixed [ Borrow ] ReturnPrimitive);
+      builtins [ "blorp_signal_raise" ] (bfixed [ Borrow ] ReturnVoid);
+      builtins [ "blorp_seed_random" ] (bfixed [ Borrow ] ReturnVoid);
+      builtins [ "blorp_random_int" ]
+        (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins [ "blorp_random_float" ] (bfixed [] ReturnPrimitive);
+      builtins [ "blorp_crypto_random_bytes" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_sleep" ] (bfixed [ Borrow ] ReturnVoid);
+      builtins [ "blorp_yield_now" ] (bfixed [] ReturnVoid);
+      builtins [ "blorp_now_us"; "blorp_time_now" ] (bfixed [] ReturnPrimitive);
+      builtins
+        [
+          "blorp_time_to_year";
+          "blorp_time_to_month";
+          "blorp_time_to_day";
+          "blorp_time_to_hour";
+          "blorp_time_to_minute";
+          "blorp_time_to_second";
+          "blorp_time_to_weekday";
+        ]
+        (bfixed [ Borrow ] ReturnPrimitive);
+      builtins
+        [ "blorp_time_from_parts" ]
+        (bfixed
+           [ Borrow; Borrow; Borrow; Borrow; Borrow; Borrow ]
+           ReturnPrimitive);
+      builtins [ "blorp_time_format" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_time_parse" ]
+        (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins
+        [ "blorp_time_from_iso"; "blorp_time_parse_rfc3339" ]
+        (bfixed [ Borrow ] ReturnPrimitive);
+      builtins [ "blorp_get_mem_stats" ] (bfixed [] ReturnOwned);
+      builtins
+        [ "blorp_reset_mem_stats"; "blorp_print_live_object_summary" ]
+        (bfixed [] ReturnVoid);
+      builtins
+        [
+          "blorp_debug_log_msg";
+          "blorp_debug_info";
+          "blorp_debug_warn";
+          "blorp_debug_error";
+        ]
+        (bfixed [ Borrow ] ReturnVoid);
+      builtins
+        [
+          "blorp_hash";
+          "blorp_hash_int";
+          "blorp_hash_string";
+          "blorp_hash_float";
+          "blorp_hash_bytes";
+          "blorp_crc32";
+          "blorp_crc32_bytes";
+        ]
+        (bfixed [ Borrow ] ReturnPrimitive);
+      builtins [ "blorp_hash_combine" ]
+        (bfixed [ Borrow; Borrow ] ReturnPrimitive);
+      builtins
+        [
+          "blorp_sha256";
+          "blorp_md5";
+          "blorp_sha1";
+          "blorp_sha512";
+          "blorp_sha256_bytes";
+          "blorp_md5_bytes";
+          "blorp_sha1_bytes";
+          "blorp_sha512_bytes";
+        ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_hmac_sha256" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_regex_test"; "blorp_regex_find"; "blorp_regex_find_all" ]
+        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_regex_replace_all" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
       (* List runtime functions that consume/reuse the list owner. *)
       builtins [ "blorp_list_new" ] (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_channel_new" ] (bfixed [ Borrow ] ReturnOwned);
@@ -599,22 +748,18 @@ let builtin_contract_table =
         [ "blorp_test_cancel_after_parked" ]
         (bfixed [ Borrow ] ReturnPrimitive);
       builtins
-        [ "blorp_test_cooperative_checkpoint_probe" ]
-        (bfixed [] ReturnPrimitive);
-      builtins
-        [ "blorp_test_fiber_created_schedule_probe" ]
-        (bfixed [] ReturnPrimitive);
-      builtins
-        [ "blorp_test_wait_ready_to_park_probe" ]
-        (bfixed [] ReturnPrimitive);
-      builtins
-        [ "blorp_test_fiber_lifecycle_ready_to_park_probe" ]
-        (bfixed [] ReturnPrimitive);
-      builtins
-        [ "blorp_test_fiber_cancel_before_park_probe" ]
-        (bfixed [] ReturnPrimitive);
-      builtins
-        [ "blorp_test_current_timer_wait_install_probe" ]
+        [
+          "blorp_test_task_window_pending_cleanup_probe";
+          "blorp_test_task_join_slot_probe";
+          "blorp_test_fiber_created_schedule_probe";
+          "blorp_test_timer_waiter_identity_probe";
+          "blorp_test_wait_ready_to_park_probe";
+          "blorp_test_fiber_lifecycle_ready_to_park_probe";
+          "blorp_test_fiber_cancel_before_park_probe";
+          "blorp_test_current_timer_wait_install_probe";
+          "blorp_test_timeout_arithmetic_probe";
+          "blorp_test_cooperative_checkpoint_probe";
+        ]
         (bfixed [] ReturnPrimitive);
       builtins [ "blorp_test_tls_state_probe" ] (bfixed [] ReturnPrimitive);
       builtins
@@ -633,9 +778,7 @@ let builtin_contract_table =
           "blorp_dict_with_capacity_custom";
         ]
         (bfixed [ Borrow ] ReturnOwned);
-      builtins
-        [ "blorp_dict_new_custom" ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_dict_new_custom" ] (bfixed [] ReturnOwned);
       builtins ~void_boxed_args:[ 1 ]
         [ "blorp_dict_get"; "blorp_dict_get_nullable" ]
         (bfixed [ Borrow; Borrow ] ReturnOwned);
@@ -648,8 +791,7 @@ let builtin_contract_table =
       builtins
         [ "blorp_set_new"; "blorp_set_new_string"; "blorp_set_new_float" ]
         (bfixed [] ReturnOwned);
-      builtins [ "blorp_set_new_custom" ]
-        (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_set_new_custom" ] (bfixed [] ReturnOwned);
       builtins ~void_boxed_args:[ 1 ] [ "blorp_set_add" ]
         (bfixed [ CowConsume; Retain ] ReturnOwned);
       builtins ~void_boxed_args:[ 1 ] [ "blorp_set_remove" ]
@@ -795,6 +937,7 @@ let builtin_contract_table =
       builtins
         [ "blorp_fixed_new"; "blorp_fixed_from_int" ]
         (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_fixed_to_string" ] (bfixed [ Borrow ] ReturnOwned);
       (* String concatenation variants. *)
       builtins
         [ "blorp_print"; "blorp_puts"; "blorp_print_error" ]
@@ -808,6 +951,22 @@ let builtin_contract_table =
       builtins
         [ "blorp_tcp_close_listener"; "blorp_tcp_close_stream" ]
         (bfixed [ Consume ] ReturnVoid);
+      builtins [ "blorp_tcp_ipv4_raw" ]
+        (bfixed [ Borrow; Borrow; Borrow; Borrow ] ReturnOwned);
+      builtins
+        [
+          "blorp_tcp_parse_ip_raw";
+          "blorp_tcp_dns_name_raw";
+          "blorp_tcp_interface_scope_raw";
+          "blorp_tcp_ip_text_raw";
+          "blorp_tcp_dns_name_text_raw";
+          "blorp_tcp_interface_scope_text_raw";
+        ]
+        (bfixed [ Borrow ] ReturnOwned);
+      builtins [ "blorp_tcp_port_raw" ] (bfixed [ Borrow ] ReturnOwned);
+      builtins
+        [ "blorp_tcp_port_value_raw" ]
+        (bfixed [ Borrow ] ReturnPrimitive);
       builtins
         [
           "blorp_tcp_set_reuse_addr";
@@ -830,11 +989,18 @@ let builtin_contract_table =
           "blorp_websocket_native_available_raw";
         ]
         (bfixed [] ReturnPrimitive);
-      builtins [ "blorp_tls_close_session" ] (bfixed [ Borrow ] ReturnVoid);
+      (* Resource finalizers consume the scoped capability. For unmanaged
+         handles such as files, directories, and UDP sockets this is resource
+         ownership rather than ARC ownership: the finalizer closes/frees the
+         native handle, and no separate ARC drop exists. For managed handles
+         such as TCP, TLS, and websocket sessions, the finalizer also releases
+         the ARC owner. *)
+      builtins [ "blorp_tls_close_session" ] (bfixed [ Consume ] ReturnVoid);
       builtins
         [ "blorp_websocket_close_session" ]
-        (bfixed [ Borrow ] ReturnVoid);
-      builtins [ "blorp_udp_close_socket" ] (bfixed [ Borrow ] ReturnVoid);
+        (bfixed [ Consume ] ReturnVoid);
+      builtins [ "blorp_udp_close_socket" ] (bfixed [ Consume ] ReturnVoid);
+      builtins [ "blorp_dir_close" ] (bfixed [ Consume ] ReturnVoid);
       builtins
         [
           "blorp_file_close_reader";
@@ -843,7 +1009,7 @@ let builtin_contract_table =
           "blorp_file_close_read_writer";
           "blorp_file_close_read_appender";
         ]
-        (bfixed [ Borrow ] ReturnVoid);
+        (bfixed [ Consume ] ReturnVoid);
       operation_result_bridge_builtin_contracts;
       fallible_stream_source_builtin_contracts;
       fallible_stream_terminal_builtin_contracts;
@@ -862,6 +1028,14 @@ let builtin_contract_table =
       builtins [ "blorp_string_eq" ] (bfixed [ Borrow; Borrow ] ReturnPrimitive);
       builtins
         [
+          "blorp_to_string";
+          "blorp_int128_to_string";
+          "blorp_uint128_to_string";
+          "blorp_float_to_string";
+          "blorp_float32_to_string";
+          "blorp_float16_to_string";
+          "blorp_bool_to_string";
+          "blorp_bool_to_string_long";
           "blorp_from_char";
           "blorp_from_chars";
           "blorp_bytes_from_string";
@@ -871,6 +1045,7 @@ let builtin_contract_table =
           "blorp_lower";
           "blorp_base64_encode";
           "blorp_bytes_to_string";
+          "blorp_encode_utf8";
           "blorp_decode_utf8";
           "blorp_decode_utf8_nullable";
           "blorp_base64_decode";
@@ -886,8 +1061,24 @@ let builtin_contract_table =
         ]
         (bfixed [ Borrow ] ReturnOwned);
       builtins [ "blorp_string_lcs" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
+      builtins [ "blorp_format_float" ] (bfixed [ Borrow; Borrow ] ReturnOwned);
       builtins
-        [ "blorp_parse_int"; "blorp_parse_float"; "blorp_codepoint_length" ]
+        [
+          "blorp_to_int";
+          "blorp_to_float";
+          "blorp_to_int8";
+          "blorp_to_int16";
+          "blorp_to_int32";
+          "blorp_to_int128";
+          "blorp_to_uint8";
+          "blorp_to_uint16";
+          "blorp_to_uint32";
+          "blorp_to_uint64";
+          "blorp_to_uint128";
+          "blorp_parse_int";
+          "blorp_parse_float";
+          "blorp_codepoint_length";
+        ]
         (bfixed [ Borrow ] ReturnPrimitive);
       builtins [ "blorp_string_get_opt" ]
         (bfixed [ Borrow; Borrow ] ReturnPrimitive);
@@ -960,6 +1151,8 @@ let builtin_contract_table =
         (bfixed [ Borrow; Borrow; Borrow ] ReturnPrimitive);
       builtins [ "blorp_checked_get" ]
         (bfixed [ Borrow; Borrow ] (ReturnAliasOfArg 0));
+      builtins [ "blorp_checked_slice" ]
+        (bfixed [ Borrow; Borrow; Borrow ] ReturnOwned);
       builtins
         [ "blorp_matrix_checked_get" ]
         (bfixed [ Borrow; Borrow; Borrow ] (ReturnAliasOfArg 0));
@@ -1167,6 +1360,7 @@ let builtin_contract_table =
       builtins
         [
           "blorp_tensor_matrix_multiply_float";
+          "blorp_tensor_matrix_multiply_float16";
           "blorp_tensor_matrix_multiply_float32";
           "blorp_tensor_matrix_multiply_int";
         ]
@@ -1174,10 +1368,15 @@ let builtin_contract_table =
       builtins
         [
           "blorp_tensor_matrix_vector_multiply_float";
+          "blorp_tensor_matrix_vector_multiply_float16";
           "blorp_tensor_matrix_vector_multiply_float32";
           "blorp_tensor_matrix_vector_multiply_int";
           "blorp_tensor_transposed_matrix_vector_multiply_float";
+          "blorp_tensor_transposed_matrix_vector_multiply_float16";
+          "blorp_tensor_transposed_matrix_vector_multiply_float32";
+          "blorp_tensor_transposed_matrix_vector_multiply_int";
           "blorp_tensor_outer_float";
+          "blorp_tensor_outer_float16";
           "blorp_tensor_outer_float32";
           "blorp_tensor_outer_int";
         ]
@@ -1257,6 +1456,18 @@ let contract_of_builtin_spec spec arity =
   | Builtin_variadic { min_arity; arg_at; result } ->
       variadic min_arity arg_at result arity
 
+let string_has_prefix ~prefix value =
+  let prefix_len = String.length prefix in
+  String.length value >= prefix_len && String.sub value 0 prefix_len = prefix
+
+let generated_builtin_contract name arity =
+  (* Enum vector stringifiers are emitted from type declarations with a
+     type-suffixed C name by Core_specialize/Core_emit. They share the runtime
+     vector-to-string ABI: borrow the vector and return a new String. *)
+  if string_has_prefix ~prefix:"blorp_vector_to_string_" name then
+    fixed arity [ Borrow ] ReturnOwned
+  else None
+
 let builtin_contract name arity =
   match
     List.find_opt
@@ -1264,7 +1475,7 @@ let builtin_contract name arity =
       builtin_contract_table
   with
   | Some entry -> contract_of_builtin_spec entry.builtin_spec arity
-  | None -> None
+  | None -> generated_builtin_contract name arity
 
 let builtin_contract_entry name =
   List.find_opt (fun entry -> entry.builtin_name = name) builtin_contract_table
@@ -1284,10 +1495,6 @@ let builtin_ownership_coverage name =
           Some
             (Pre_perceus_sentinel
                "generic tensor dispatch is specialized before Perceus")
-      | "blorp_to_string" ->
-          Some
-            (Pre_perceus_sentinel
-               "generic string conversion is rewritten before Perceus")
       | _ -> None)
 
 let contract_for_call_kind (kind : Core.call_kind) ~(arg_count : int) =

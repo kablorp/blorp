@@ -1,6 +1,6 @@
 # Compiler Roadmap
 
-Status: active roadmap.
+Status: active roadmap, reviewed 2026-06-12.
 
 Use [ARCHITECTURE.md](ARCHITECTURE.md) for the live compiler pipeline and
 [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) for the ownership ABI. This file tracks
@@ -18,12 +18,47 @@ the next compiler work that is still valuable enough to keep visible.
 - Keep native boundaries auditable: runtime ABI, FFI metadata, generated C
   escaping, ownership contracts, and security gates should be explicit.
 
+## Review Notes
+
+No objection to the overall direction. The important correction from reviewing
+the current code is that several roadmap concepts are already partially
+implemented:
+
+- Source-level call metadata exists in `Ast.resolved_call` and typed expression
+  metadata.
+- Core call identity already crosses lowering through `CKSelectedDirect` and
+  `CKUser (name, def_id option)`.
+- Final Core already rejects `CKUnknown` and `CKSelectedDirect`; the remaining
+  work is to remove earlier fallback paths and make diagnostics/tools consume
+  the resolved facts consistently.
+- List producer handoff is already explicit in Core as `CListHandoff` with
+  `BorrowFresh` and `ConsumeReuse`, and the runtime has matching handoff
+  helpers. Reuse work should extend and measure this path, not rediscover reuse
+  from arbitrary loops.
+- The self-hosting path is active in `compiler/blorp`, especially the
+  Blorp-authored emission renderers. Further migration should keep this small
+  bridge-and-test pattern.
+
 ## Active Workstreams
 
 ### Semantic Call Identity
 
-Current behavior still has transitional layers where the source AST, typed AST,
-Core, and tooling can ask similar questions in different forms:
+Current state:
+
+- Typecheck/inference mints callable ids and attaches `resolved_call` metadata
+  to calls when the source target is known.
+- `Core_lower` lowers direct resolved calls as `CKSelectedDirect <id>` so Core
+  can use the source-selected target before the canonical post-flatten name is
+  available.
+- `Core_resolve` promotes selected and name-based calls to `CKUser (name,
+  Some def_id)` when it can prove the concrete target.
+- `Core_emit` already prefers DefId-based C names, but still has a
+  compatibility fallback for `CKUser (_, None)`.
+- Purity analysis and `purify` already know how to read resolved call metadata,
+  but still keep parse/env-based fallbacks for unresolved cases.
+
+The transitional layers still let the source AST, typed AST, Core, and tooling
+ask similar questions in different forms:
 
 - Which callable does this bare, qualified, UFCS, trait, operator, or
   first-class call target?
@@ -41,15 +76,33 @@ Direction:
 - Move `purify`, diagnostics, and Core lowering toward consuming typed
   resolution facts instead of re-resolving names.
 - Shrink backend name lookup to cases that truly require backend knowledge.
+- Treat `CKUser (_, None)`, UFCS `#<def_id>` suffix parsing, and name-only
+  resolution as migration paths, not the desired steady state.
 
-High-value next checks:
+Implementation order:
 
-- A direct source call that has been resolved in typed AST should not be
-  lowered as an unknown Core call target.
+1. Add focused compiler-unit coverage that counts or rejects newly introduced
+   `CKUser (_, None)` in resolver paths that should have DefIds.
+2. Tighten source-call coverage for bare, qualified, UFCS, overload-selected,
+   constructor, trait, and closure calls so each case documents whether a
+   concrete callable id should exist.
+3. Move remaining diagnostic and `purify` call classification toward
+   `resolved_call` first, with documented parse-only fallbacks for files that
+   cannot be typed.
+4. Remove legacy UFCS DefId suffix handoff once resolved-call metadata covers
+   the same call shapes.
+5. Remove `CKUser (_, None)` emission fallback when tests prove all user calls
+   reaching emit carry a DefId, except deliberately hand-built test Core.
+
+Required checks:
+
+- `Core_invariants` must keep rejecting `CKUnknown` and `CKSelectedDirect`
+  after specialization and at the final emission boundary.
+- A direct source call with typed `resolved_call` metadata must never lower as a
+  purely unknown call target.
 - UFCS and pure/impure overload resolution should select by callable identity,
   not by generated-name suffixes.
 - Purity errors should cite the resolved target when one is known.
-- Semantic tools should keep parse-only fallbacks isolated and documented.
 
 ### Core Pipeline Maintainability
 
@@ -73,11 +126,37 @@ Current priorities:
   emission: unresolved calls, unconverted closure/concurrency forms, invalid
   ownership crossings, and unprepared erased storage.
 
+Implementation order:
+
+1. Measure pass-group time before splitting a stage. `Core_profile` can already
+   report observed Core stages; use it before optimizing aggregate stages.
+2. Split the `Fusion` observed stage only if measurements show that string,
+   collection, tensor, or tuple SROA work needs independent visibility.
+3. Keep non-observed safety/finalization passes (`Core_resource`,
+   `Core_fairness`, `Core_codegen_prepare`, prepared reuse) out of
+   `Core_stage` unless user-facing dump/stop/profile behavior genuinely needs
+   them.
+4. When adding new IR checks, prefer a named invariant in
+   `core_invariants.ml` over local assertions in emit.
+
 ### Ownership And Reuse Performance
 
 Self-hosting will stress compiler-shaped data: AST construction, traversal,
 rewriting, and destruction. The important performance gap is structural
 allocation churn, not only atomic reference count overhead.
+
+Current state:
+
+- Perceus inserts explicit `CDup` and `CDrop` ownership operations before
+  reuse.
+- `Core_reuse` already upgrades explicit list producer handoffs from
+  `BorrowFresh` to `ConsumeReuse` when it can consume the matching
+  post-Perceus drop.
+- `CListHandoff` carries the source/result variables, capacity, layout, result
+  type, and forward-compacting write policy. Runtime helpers preserve source
+  reads while allowing storage reuse when uniqueness and layout checks pass.
+- Compiler benchmarks now include `compiler_ast`, `compiler_symbols`, and
+  `compiler_emit`, which are the right pressure tests for self-hosting.
 
 Most promising path:
 
@@ -100,6 +179,60 @@ Rules:
   barriers unless a later pass has explicit facts that make reuse safe.
 - Every ownership optimization needs leak-check and generated-C inspection for
   success, early return, and error paths.
+
+Implementation order:
+
+1. Establish baseline numbers for `compiler_ast`, `compiler_symbols`, and
+   `compiler_emit` with `BENCH_RUNS` high enough to smooth noise, plus Blorp
+   allocation counters where applicable.
+2. Use generated Core and generated C inspection to identify which allocations
+   are still unavoidable versus missing reuse facts.
+3. Extend explicit producer handoff only where the Core node can state the
+   collection family, layout, source/result element ownership, capacity bound,
+   and write-order policy.
+4. Prefer targeted handoffs for common compiler-shaped operations over a
+   general loop-reuse recognizer.
+5. Add regression tests at the ownership boundary: no reuse with later source
+   use, no reuse across closures/tasks/resources, no wrong destructor reuse,
+   and no leak on early return or branchy producer bodies.
+
+Do not optimize by making public borrow-preserving APIs secretly consume their
+receiver. Public API semantics stay simple; compiler-selected reuse remains an
+explicit internal Core boundary.
+
+### Self-Hosting Slices
+
+Current state:
+
+- `compiler/blorp` contains Blorp-authored renderer programs for several
+  emission-template families.
+- OCaml still owns Core traversal, C escaping, and backend context management.
+  The Blorp programs own narrow template/manifest generation slices with tests.
+- `compiler/test/test_compiler_blorp.ml` checks renderer compilation,
+  generated-template drift, and `compiler/blorp` TestSuite files.
+
+Direction:
+
+- Migrate small compiler leaves first: pure rendering, manifest generation,
+  source-to-source helpers, and deterministic transformations with compact
+  input/output contracts.
+- Keep bridges explicit. A migrated slice should have a stable CLI or function
+  boundary, golden output, and a narrow OCaml integration point.
+- Avoid moving semantic compiler decisions into Blorp code before the
+  corresponding typed/Core facts are explicit enough for generated code to use
+  correctly.
+
+Implementation order:
+
+1. Continue with emission-template and prepared-Core rendering slices because
+   they have small boundaries and strong output tests.
+2. Move helper logic only after there is a direct drift test proving the Blorp
+   output matches the current OCaml-owned artifact.
+3. Use the compiler benchmarks to track whether each migration increases AST,
+   symbol-table, or output-construction pressure.
+4. Treat any self-hosted code that needs workarounds for missing language
+   features as feedback for language/runtime priorities, not as an excuse to
+   encode compiler hacks.
 
 ### Native Boundary And Security
 
@@ -134,14 +267,22 @@ invariants.
   describe invariants the type system could carry.
 - Re-measure performance claims with `benchmarks/bench.sh`, `--profile`,
   allocation/release counts, or generated C size as appropriate.
+- For compiler-performance work, report the benchmark command, the machine
+  controls that matter (`BENCH_RUNS`, `BENCH_ALLOC_STATS`, thread counts), and
+  at least one before/after number.
 
 ## Near-Term Queue
 
-1. Continue reducing unresolved Core call targets by carrying typed callable
-   identity farther into lowering and resolution.
-2. Measure the largest Core pass groups before adding broad compile-time
-   optimizations.
-3. Advance managed allocation/reuse facts for AST-like union/record workloads.
-4. Keep native-boundary hardening inside the existing security gate.
-5. Delete compatibility helpers once production callers no longer need them,
+1. Add resolver/emitter tests that make accidental `CKUser (_, None)` fallback
+   visible for ordinary source calls.
+2. Audit remaining UFCS DefId suffix paths and decide which source-call shapes
+   still rely on them.
+3. Baseline `compiler_ast`, `compiler_symbols`, and `compiler_emit` with timing
+   and allocation counters before the next ownership optimization.
+4. Inspect list-handoff generated Core/C for compiler-shaped list pipelines and
+   identify the next narrow reuse case.
+5. Continue self-hosting by migrating one more emission-template slice behind
+   the existing generated-artifact drift tests.
+6. Keep native-boundary hardening inside the existing security gate.
+7. Delete compatibility helpers once production callers no longer need them,
    and keep hygiene tests narrow enough that they catch real regressions.

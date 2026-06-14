@@ -2221,32 +2221,86 @@ void* blorp_list_get(blorp_List* list, long index);
 
 // Per-type leak accumulator
 #define LEAK_TYPE_SLOTS 64
-static struct { const char* tag; long count; size_t bytes; } __leak_type_table[LEAK_TYPE_SLOTS];
+typedef struct {
+    const char* tag;
+    long count;
+    size_t bytes;
+} blorp_LeakTypeBucket;
 
-static void __leak_type_record(const char* tag, size_t bytes) {
+static void __leak_type_record(blorp_LeakTypeBucket buckets[LEAK_TYPE_SLOTS],
+                               const char* tag, size_t bytes) {
     if (!tag) tag = "(unknown)";
     // Linear probe — small table, few types expected
     for (int i = 0; i < LEAK_TYPE_SLOTS; i++) {
-        if (__leak_type_table[i].tag == NULL) {
-            __leak_type_table[i].tag = tag;
-            __leak_type_table[i].count = 1;
-            __leak_type_table[i].bytes = bytes;
+        if (buckets[i].tag == NULL) {
+            buckets[i].tag = tag;
+            buckets[i].count = 1;
+            buckets[i].bytes = bytes;
             return;
         }
         // Pointer comparison (tags are string literals)
-        if (__leak_type_table[i].tag == tag ||
-            strcmp(__leak_type_table[i].tag, tag) == 0) {
-            __leak_type_table[i].count++;
-            __leak_type_table[i].bytes += bytes;
+        if (buckets[i].tag == tag ||
+            strcmp(buckets[i].tag, tag) == 0) {
+            buckets[i].count++;
+            buckets[i].bytes += bytes;
             return;
         }
     }
 }
 
 static int __leak_type_cmp(const void* a, const void* b) {
-    long ca = ((const struct { const char* tag; long count; size_t bytes; }*)a)->count;
-    long cb = ((const struct { const char* tag; long count; size_t bytes; }*)b)->count;
+    long ca = ((const blorp_LeakTypeBucket*)a)->count;
+    long cb = ((const blorp_LeakTypeBucket*)b)->count;
     return (cb > ca) - (cb < ca);
+}
+
+static long __blorp_collect_live_object_types(FILE* out,
+                                             unsigned long current_epoch,
+                                             int verbose,
+                                             blorp_LeakTypeBucket buckets[LEAK_TYPE_SLOTS]) {
+    memset(buckets, 0, sizeof(blorp_LeakTypeBucket) * LEAK_TYPE_SLOTS);
+    long counted = 0;
+    pthread_mutex_lock(&__alloc_meta_mutex);
+    blorp_AllocMeta* meta = __alloc_live_sentinel.live_next;
+    if (verbose) fprintf(out, "\nLeaked objects:\n");
+    while (meta && counted < 10000) {
+        blorp_Object* obj = meta->object;
+        long rc = (long)atomic_load(&obj->refcount);
+        if (rc != LONG_MAX && meta->stats_tracked &&
+            meta->stats_epoch == current_epoch) {
+            __leak_type_record(buckets, meta->type_tag, meta->alloc_size);
+            if (verbose) {
+                fprintf(out, "  #%ld  %s  %zu bytes  rc=%ld\n",
+                        counted + 1,
+                        meta->type_tag ? meta->type_tag : "(unknown)",
+                        meta->alloc_size, rc);
+            }
+            counted++;
+        }
+        meta = meta->live_next;
+    }
+    pthread_mutex_unlock(&__alloc_meta_mutex);
+    return counted;
+}
+
+static void __blorp_print_live_object_type_summary(FILE* out,
+                                                   unsigned long current_epoch,
+                                                   int verbose) {
+    blorp_LeakTypeBucket buckets[LEAK_TYPE_SLOTS];
+    long counted =
+        __blorp_collect_live_object_types(out, current_epoch, verbose, buckets);
+    qsort(buckets, LEAK_TYPE_SLOTS, sizeof(buckets[0]), __leak_type_cmp);
+    fprintf(out, "\nLeaked by type:\n");
+    fprintf(out, "  %-20s %8s %10s\n", "TYPE", "COUNT", "BYTES");
+    for (int i = 0; i < LEAK_TYPE_SLOTS && buckets[i].count > 0; i++) {
+        fprintf(out, "  %-20s %8ld %10zu\n",
+                buckets[i].tag,
+                buckets[i].count,
+                buckets[i].bytes);
+    }
+    if (counted == 0) {
+        fprintf(out, "  %-20s %8ld %10d\n", "(untracked)", 0L, 0);
+    }
 }
 
 static void __blorp_leak_report(void) {
@@ -2266,40 +2320,8 @@ static void __blorp_leak_report(void) {
 
     // Walk live-object list for per-type breakdown
     if (leaked > 0 && __leak_tracking_enabled) {
-        memset(__leak_type_table, 0, sizeof(__leak_type_table));
-        long counted = 0;
-        pthread_mutex_lock(&__alloc_meta_mutex);
-        blorp_AllocMeta* meta = __alloc_live_sentinel.live_next;
         int verbose = (strcmp(mode, "verbose") == 0);
-        if (verbose) fprintf(stderr, "\nLeaked objects:\n");
-        while (meta && counted < 10000) {  // cap to prevent infinite walk
-            blorp_Object* obj = meta->object;
-            // Skip immortal singletons (None, True, False, etc.)
-            long rc = (long)atomic_load(&obj->refcount);
-            if (rc != LONG_MAX && meta->stats_tracked && meta->stats_epoch == current_epoch) {
-                __leak_type_record(meta->type_tag, meta->alloc_size);
-                if (verbose) {
-                    fprintf(stderr, "  #%ld  %s  %zu bytes  rc=%ld\n",
-                            counted + 1,
-                            meta->type_tag ? meta->type_tag : "(unknown)",
-                            meta->alloc_size, rc);
-                }
-                counted++;
-            }
-            meta = meta->live_next;
-        }
-        pthread_mutex_unlock(&__alloc_meta_mutex);
-        // Print per-type summary
-        qsort(__leak_type_table, LEAK_TYPE_SLOTS,
-              sizeof(__leak_type_table[0]), __leak_type_cmp);
-        fprintf(stderr, "\nLeaked by type:\n");
-        fprintf(stderr, "  %-20s %8s %10s\n", "TYPE", "COUNT", "BYTES");
-        for (int i = 0; i < LEAK_TYPE_SLOTS && __leak_type_table[i].count > 0; i++) {
-            fprintf(stderr, "  %-20s %8ld %10zu\n",
-                    __leak_type_table[i].tag,
-                    __leak_type_table[i].count,
-                    __leak_type_table[i].bytes);
-        }
+        __blorp_print_live_object_type_summary(stderr, current_epoch, verbose);
     }
     // Strict mode: exit non-zero when leaks detected
     if (leaked > 0 && strcmp(mode, "strict") == 0) {
@@ -36479,6 +36501,21 @@ void blorp_reset_mem_stats(void) {
     atomic_store(&global_mem_stats.total_releases, 0);
     atomic_store(&global_mem_stats.current_objects, 0);
     atomic_store(&global_mem_stats.bytes_allocated, 0);
+}
+
+void blorp_print_live_object_summary(void) {
+    __blorp_stats_enabled = true;
+    long leaked = atomic_load(&global_mem_stats.current_objects);
+    if (leaked <= 0) return;
+    if (!__leak_tracking_enabled) {
+        printf("\nLeaked by type:\n");
+        printf("  (unavailable; run with --leak-check)\n");
+        fflush(stdout);
+        return;
+    }
+    unsigned long current_epoch = atomic_load(&global_mem_stats.epoch);
+    __blorp_print_live_object_type_summary(stdout, current_epoch, 0);
+    fflush(stdout);
 }
 
 blorp_SchedulerStats* blorp_get_scheduler_stats(void) {

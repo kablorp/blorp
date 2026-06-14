@@ -22,6 +22,7 @@
     - [check_no_desugarable_mutation] — ENABLED (post-desugar)
     - [check_no_cmatcharms] — ENABLED (post-match, bookended at Perceus and Final)
     - [check_no_codegen_unprepared_forms] — ENABLED (Final)
+    - [check_call_ownership_contracts_at] — ENABLED (Perceus and Final)
     - [check_resource_scope_contracts_at] — ENABLED (Perceus and Final)
     - [check_resource_scope_nonlocal_exits_at] — ENABLED (Final)
     - [check_resource_cleanup_exits_at] — ENABLED (Final)
@@ -591,14 +592,36 @@ let check_resource_cleanup_exits_at (stage : Core_stage.t)
           in
           List.fold_left
             (fun acc cleanup ->
-              if Types.types_equal cleanup.Core.ty ty_void then acc
-              else
+              if not (Types.types_equal cleanup.Core.ty ty_void) then
                 violation_at stage cleanup.loc
                   ~hint:
                     "Cleanup actions must be explicit Void-returning finalizer \
                      calls."
                   "resource cleanup exit contains non-Void cleanup action"
-                :: acc)
+                :: acc
+              else
+                match cleanup.Core.desc with
+                | Core.CCall (_, _, [ _ ]) -> acc
+                | Core.CCall (_, _, args) ->
+                    violation_at stage cleanup.loc
+                      ~hint:
+                        "Resource cleanup exits are synthesized from active \
+                         resource scopes. Each cleanup action should finalize \
+                         exactly one resource."
+                      (Printf.sprintf
+                         "resource cleanup exit finalizer call should take \
+                          exactly one resource argument, got %d"
+                         (List.length args))
+                    :: acc
+                | _ ->
+                    violation_at stage cleanup.loc
+                      ~hint:
+                        "Keep cleanup actions as explicit finalizer calls so \
+                         final codegen does not silently skip resource \
+                         cleanup."
+                      "resource cleanup exit action must be a direct finalizer \
+                       call"
+                    :: acc)
             acc exit.rce_cleanups
       | _ -> acc)
     [] prog
@@ -2189,6 +2212,7 @@ let run_for_stage (stage : Core_stage.t) (prog : Core.core_program) :
       @ check_no_raw_string_byte_intrinsics_at stage prog
       @ check_tensor_literal_layouts_at stage prog
       @ check_tensor_loop_storage_provenance_at stage prog
+      @ check_call_ownership_contracts_at stage prog
       @ check_resource_scope_contracts_at stage prog
       @ check_resource_scope_nonlocal_exits_at stage prog
       @ check_resource_cleanup_exits_at stage prog

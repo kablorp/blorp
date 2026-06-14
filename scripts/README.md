@@ -13,7 +13,7 @@ scripts/test                    # all gates
 scripts/test compiler-unit      # compiler-internal OCaml/Alcotest tests
 scripts/test compiler           # compiler fixtures and codegen audit
 scripts/test runtime            # runtime .brp tests
-scripts/test leak               # focused leak-check baselines
+scripts/test leak               # focused leak-check baselines and leak diagnostics
 scripts/test doctest            # std doctests
 scripts/test cli                # public CLI, REPL, and LSP smoke tests
 scripts/test compiler-unit compiler  # multiple selected gates
@@ -73,6 +73,10 @@ scripts/premerge-gate --dry-run
 Use `--quick` for fast local confidence. Use the full default gate before
 claiming a preview/release-sensitive change is ready.
 
+The preview smoke step is guarded as non-mutating: it snapshots Git status plus
+tracked and staged diffs before and after the step, and fails if validation
+rewrites the working tree.
+
 ## Docker Gate
 
 `scripts/docker-gate` runs validation inside an Ubuntu 24.04 container.
@@ -129,6 +133,11 @@ plugin zip before checking; pass a zip path to inspect an existing package.
 bodies use explicit identities matching their source declaration, for example
 `builtin("std/list.__unsafe_list_get")`. Bare `builtin` function bodies are not
 allowed in `std/`.
+
+`scripts/check-memory-hardening-drift` verifies that the Phase 5 memory risk
+matrix in `docs/0.1_MEMORY_HARDENING.md` stays synchronized with the
+`scripts/test leak` roots. Matrix rows must name leak-gated coverage, and
+explicit leak roots must be represented in the matrix.
 
 ## Release Helpers
 
