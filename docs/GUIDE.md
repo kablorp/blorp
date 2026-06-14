@@ -173,7 +173,8 @@ program.
 ```blorp
 compile_time:
     private X: Int = 1 + 2
-    Y: Int = X * 4
+    Y: Int =
+        X * 4
 
 func main(args: List[String]) -> Int:
     Y
@@ -186,12 +187,18 @@ directly inside the block are always immutable; local `var` mutation is allowed
 inside pure functions evaluated by the compiler.
 
 Compile-time initializers must be pure and must be evaluatable by the compiler.
-The initial evaluator supports literal data, arithmetic, comparisons, `if`,
-`match`, blocks with local bindings, local `var` mutation, `while`, `for` over
-ranges and lists, tuple destructuring, tuples, lists, dicts, records, record
-updates, field access, string interpolation with `String` expression parts,
-or `Int`/`Bool`/`Char` expression parts, union/enum constructors, direct local
-pure function calls, and recursion.
+The initial evaluator supports literal data, `Int` and `Float` arithmetic,
+comparisons, `if`/`else`, statement-style `if` without `else`, `match`, blocks
+with local bindings, local `var` mutation, `while`, `for` over ranges and lists,
+tuple destructuring, tuples, lists, dicts, records, record updates, record field
+access, tuple field access, string interpolation with `String` expression parts,
+or `Int`/`Float`/`Bool`/`Char` expression parts, union/enum constructors, direct
+local pure function calls including tuple-pattern parameters, recursion, pure
+lambda and named-function callbacks, pure `List` construction, lookup, and
+callback helpers, pure `Dict` construction and lookup helpers, plus simple
+`Option` and `Result` query/conversion/callback helpers such as `get_or`,
+`is_some`, `is_ok`, `map`, `and_then`, `to_result`, `from_option`, `to_option`,
+and `?=` propagation, and primitive `to_string` calls.
 Unsupported compile-time work is rejected during checking instead of being
 lowered to runtime startup code.
 

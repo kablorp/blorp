@@ -813,12 +813,16 @@ field_decl:
 
 (* Variable declaration *)
 var_decl:
-  | VAR name = binding_ident ty = type_annotation_opt EQUALS e = expr
+  | VAR name = binding_ident ty = type_annotation_opt e = var_initializer
     { { var_name = Some name; var_pattern = None;
         var_type = ty; var_value = e; var_is_mutable = true; var_is_const = false } }
-  | name = binding_ident ty = type_annotation_opt EQUALS e = expr
+  | name = binding_ident ty = type_annotation_opt e = var_initializer
     { { var_name = Some name; var_pattern = None;
         var_type = ty; var_value = e; var_is_mutable = false; var_is_const = false } }
+
+var_initializer:
+  | EQUALS e = expr { e }
+  | EQUALS NEWLINE INDENT e = expr DEDENT { e }
 
 (* Import block: import: NEWLINE INDENT items... DEDENT *)
 import_block:

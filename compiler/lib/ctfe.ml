@@ -5,260 +5,17 @@
     deliberately explicit about unsupported expression forms so CTFE grows by
     adding named cases instead of guessing from runtime lowering behavior. *)
 
-type value_desc =
-  | VInt of int64
-  | VFloat of float
-  | VBool of bool
-  | VChar of int
-  | VString of string * Ast.string_flags
-  | VTuple of value list
-  | VList of value list
-  | VDict of (value * value) list
-  | VRecord of (string * value) list
-  | VRange of value * value
-  | VVoid
-  | VConstructor of {
-      name : string;
-      args : value list;
-      callee : Ast.expr option;
-      resolved_call : Ast.resolved_call option;
-    }
-
-and value = { ty : Ast.type_expr; desc : value_desc; loc : Ast.loc }
-
-type binding = { mutable_binding : bool; cell : value ref }
-type env = (string * binding) list
-type function_table = (int * Typed_ast.func_decl) list
-type constructor_table = (string * int) list
-
-type ctx = {
-  functions : function_table;
-  constructor_arity : string -> int option;
-  call_stack : int list;
-}
+include Ctfe_value
+include Ctfe_error
+include Ctfe_env
+include Ctfe_context
+include Ctfe_value_ops
+include Ctfe_operator
+module Std_call = Ctfe_intrinsic.Source
+module Intrinsic = Ctfe_intrinsic
 
 let ( >>= ) = Result.bind
 let ( let* ) = Result.bind
-
-let error ?(notes = []) ?help loc message =
-  {
-    Ast.message;
-    loc;
-    phase = Ast.TypeCheck;
-    kind = Ast.OtherError;
-    notes;
-    help;
-  }
-
-let typed_ast_error_to_error (err : Typed_ast.error) =
-  let loc, message =
-    match err with
-    | MissingExprType { loc; context } ->
-        ( loc,
-          Printf.sprintf "internal CTFE error: %s missing expression type"
-            context )
-    | MissingExprTypeInfo { loc; context } ->
-        ( loc,
-          Printf.sprintf
-            "internal CTFE error: %s missing structured expression type \
-             metadata"
-            context )
-    | UnfinalizedExprType { loc; context; ty } ->
-        ( loc,
-          Printf.sprintf
-            "internal CTFE error: %s still contains inference metavariables: %s"
-            context (Types.type_to_string ty) )
-    | MissingRequiredType { loc; context } ->
-        (loc, Printf.sprintf "internal CTFE error: %s missing type" context)
-    | UnfinalizedType { loc; context; ty } ->
-        ( loc,
-          Printf.sprintf
-            "internal CTFE error: %s still contains inference metavariables: %s"
-            context (Types.type_to_string ty) )
-    | InvalidTypeInfo { loc; context; message } ->
-        ( loc,
-          Printf.sprintf "internal CTFE error: invalid %s: %s" context message
-        )
-  in
-  error loc message
-
-let unsupported loc form =
-  Error
-    [
-      error
-        ~help:
-          "Use supported pure compile-time constructs here, or move this \
-           computation back to runtime code."
-        loc
-        (Printf.sprintf "compile_time evaluator does not support %s yet" form);
-    ]
-
-let type_name ty = Types.type_to_string ty
-let value_type expr = Typed_ast.value_type expr
-let value_loc expr = Typed_ast.loc expr
-
-let scalar_value expr desc =
-  Ok { ty = value_type expr; desc; loc = value_loc expr }
-
-let void_value loc = { ty = Ast.TyNamed ("Void", []); desc = VVoid; loc }
-
-let string_flags_for_interp is_multiline =
-  { Ast.sf_multiline = is_multiline; sf_raw = false }
-
-let string_of_char_code loc code =
-  match Uchar.of_int code with
-  | uchar ->
-      let buffer = Buffer.create 4 in
-      Buffer.add_utf_8_uchar buffer uchar;
-      Ok (Buffer.contents buffer)
-  | exception Invalid_argument _ ->
-      Error
-        [
-          error loc
-            (Printf.sprintf "compile_time invalid Char codepoint: %d" code);
-        ]
-
-let bind_value ?(mutable_binding = false) name value env =
-  if name = "_" then env
-  else (name, { mutable_binding; cell = ref value }) :: env
-
-let bind_values bindings env =
-  List.fold_left
-    (fun env (name, value) -> bind_value name value env)
-    env bindings
-
-let lookup_binding env loc name =
-  match List.assoc_opt name env with
-  | Some binding -> Ok binding
-  | None ->
-      Error
-        [
-          error
-            ~help:
-              "Only earlier bindings in the same compile_time block are \
-               available during compile-time evaluation."
-            loc
-            (Printf.sprintf
-               "compile_time initializer cannot reference '%s' before it is \
-                evaluated"
-               name);
-        ]
-
-let lookup env loc name =
-  lookup_binding env loc name >>= fun binding -> Ok !(binding.cell)
-
-let assign env loc name value =
-  lookup_binding env loc name >>= fun binding ->
-  if binding.mutable_binding then (
-    binding.cell := value;
-    Ok (void_value loc))
-  else
-    Error
-      [
-        error loc
-          (Printf.sprintf "compile_time assignment target '%s' is immutable"
-             name);
-      ]
-
-let constructor_arity ctx name = ctx.constructor_arity name
-let constructor_is_nullary ctx name = constructor_arity ctx name = Some 0
-
-let expect_int loc = function
-  | { desc = VInt n; _ } -> Ok n
-  | value ->
-      Error
-        [
-          error loc
-            (Printf.sprintf "compile_time expected Int, found %s"
-               (type_name value.ty));
-        ]
-
-let expect_bool loc = function
-  | { desc = VBool b; _ } -> Ok b
-  | value ->
-      Error
-        [
-          error loc
-            (Printf.sprintf "compile_time expected Bool, found %s"
-               (type_name value.ty));
-        ]
-
-let eval_int_binop loc op left right =
-  expect_int loc left >>= fun l ->
-  expect_int loc right >>= fun r ->
-  let result =
-    match op with
-    | Ast.Add -> Int64.add l r
-    | Ast.Sub -> Int64.sub l r
-    | Ast.Mul -> Int64.mul l r
-    | Ast.Div -> if r = 0L then 0L else Int64.div l r
-    | Ast.Mod -> if r = 0L then 0L else Int64.rem l r
-    | Ast.Lt | Ast.Gt | Ast.Le | Ast.Ge | Ast.Eq | Ast.Ne ->
-        invalid_arg "comparison op"
-  in
-  Ok (VInt result)
-
-let rec value_equal left right =
-  match (left.desc, right.desc) with
-  | VInt a, VInt b -> a = b
-  | VFloat a, VFloat b -> a = b
-  | VBool a, VBool b -> a = b
-  | VChar a, VChar b -> a = b
-  | VString (a, _), VString (b, _) -> a = b
-  | VTuple a, VTuple b | VList a, VList b ->
-      List.length a = List.length b && List.for_all2 value_equal a b
-  | VRecord a, VRecord b ->
-      List.length a = List.length b
-      && List.for_all2
-           (fun (an, av) (bn, bv) -> an = bn && value_equal av bv)
-           a b
-  | VDict a, VDict b ->
-      List.length a = List.length b
-      && List.for_all2
-           (fun (ak, av) (bk, bv) -> value_equal ak bk && value_equal av bv)
-           a b
-  | VRange (a_start, a_end), VRange (b_start, b_end) ->
-      value_equal a_start b_start && value_equal a_end b_end
-  | VVoid, VVoid -> true
-  | VConstructor a, VConstructor b ->
-      a.name = b.name
-      && List.length a.args = List.length b.args
-      && List.for_all2 value_equal a.args b.args
-  | _ -> false
-
-let eval_compare_binop loc op left right =
-  match op with
-  | Ast.Eq -> Ok (VBool (value_equal left right))
-  | Ast.Ne -> Ok (VBool (not (value_equal left right)))
-  | Ast.Lt | Ast.Gt | Ast.Le | Ast.Ge ->
-      expect_int loc left >>= fun l ->
-      expect_int loc right >>= fun r ->
-      let result =
-        match op with
-        | Ast.Lt -> l < r
-        | Ast.Gt -> l > r
-        | Ast.Le -> l <= r
-        | Ast.Ge -> l >= r
-        | _ -> false
-      in
-      Ok (VBool result)
-  | Ast.Add | Ast.Sub | Ast.Mul | Ast.Div | Ast.Mod ->
-      invalid_arg "arithmetic op"
-
-let eval_string_add loc left right =
-  match (left.desc, right.desc) with
-  | VString (l, flags), VString (r, _) -> Ok (VString (l ^ r, flags))
-  | _ -> unsupported loc "non-Int/non-String binary addition"
-
-let eval_binary_desc loc op left right =
-  match op with
-  | Ast.Add -> (
-      match (left.desc, right.desc) with
-      | VString _, VString _ -> eval_string_add loc left right
-      | _ -> eval_int_binop loc op left right)
-  | Ast.Sub | Ast.Mul | Ast.Div | Ast.Mod -> eval_int_binop loc op left right
-  | Ast.Lt | Ast.Gt | Ast.Le | Ast.Ge | Ast.Eq | Ast.Ne ->
-      eval_compare_binop loc op left right
 
 let rec eval_expr ctx env expr =
   let loc = value_loc expr in
@@ -277,19 +34,37 @@ let rec eval_expr ctx env expr =
       | Typed_ast.EIdent name -> (
           match lookup env loc name with
           | Ok value -> Ok value
-          | Error _ when constructor_is_nullary ctx name ->
-              scalar_value expr
-                (VConstructor
-                   { name; args = []; callee = None; resolved_call = None })
-          | Error _ as err -> err)
+          | Error _ as lookup_error -> (
+              match eval_function_reference ctx expr with
+              | Ok (Some value) -> Ok value
+              | Ok None when constructor_is_nullary ctx name ->
+                  scalar_value expr
+                    (VConstructor
+                       {
+                         name;
+                         args = [];
+                         callee = None;
+                         resolved_call = None;
+                         constructor_info = constructor_info ctx name;
+                       })
+              | Ok None -> lookup_error
+              | Error _ as err -> err))
       | Typed_ast.EAscription (inner, _)
       | Typed_ast.EOpaqueInto (_, inner)
       | Typed_ast.EOpaqueFrom (_, inner) ->
           eval_expr ctx env inner
-      | Typed_ast.EUnary (Ast.Neg, inner) ->
+      | Typed_ast.EUnary (Ast.Neg, inner) -> (
           eval_expr ctx env inner >>= fun value ->
-          expect_int loc value >>= fun n ->
-          scalar_value expr (VInt (Int64.neg n))
+          match value.desc with
+          | VInt n -> scalar_value expr (VInt (Int64.neg n))
+          | VFloat n -> scalar_value expr (VFloat (-.n))
+          | _ ->
+              Error
+                [
+                  error loc
+                    (Printf.sprintf "compile_time cannot negate %s"
+                       (type_name value.ty));
+                ])
       | Typed_ast.EUnary (Ast.Not, inner) ->
           eval_expr ctx env inner >>= fun value ->
           expect_bool loc value >>= fun b -> scalar_value expr (VBool (not b))
@@ -318,14 +93,17 @@ let rec eval_expr ctx env expr =
           else
             match else_expr with
             | Some else_expr -> eval_expr ctx env else_expr
-            | None -> unsupported loc "if without else")
-      | Typed_ast.EBlock exprs -> eval_block ctx env exprs
+            | None -> scalar_value expr VVoid)
+      | Typed_ast.EBlock exprs -> eval_block ctx env expr exprs
       | Typed_ast.ETuple values ->
           eval_exprs ctx env values >>= fun values ->
           scalar_value expr (VTuple values)
       | Typed_ast.EList values ->
           eval_exprs ctx env values >>= fun values ->
           scalar_value expr (VList values)
+      | Typed_ast.ERecord []
+        when is_named_type Std_call.dict_type (value_type expr) ->
+          scalar_value expr (VDict [])
       | Typed_ast.ERecord fields ->
           eval_fields ctx env fields >>= fun fields ->
           scalar_value expr (VRecord fields)
@@ -345,11 +123,25 @@ let rec eval_expr ctx env expr =
                         (Printf.sprintf "compile_time record has no field '%s'"
                            field);
                     ])
-          | _ -> unsupported loc "field access on non-record values")
+          | VTuple values -> (
+              match int_of_string_opt field with
+              | Some index when index >= 0 -> (
+                  match List.nth_opt values index with
+                  | Some value -> Ok value
+                  | None ->
+                      Error
+                        [
+                          error loc
+                            (Printf.sprintf
+                               "compile_time tuple has no field '%s'" field);
+                        ])
+              | _ -> unsupported loc "non-numeric tuple field access")
+          | _ -> unsupported loc "field access on non-record/non-tuple values")
       | Typed_ast.ERecordUpdate (base, fields) ->
           eval_record_update ctx env expr base fields
       | Typed_ast.EStringInterp (parts, is_multiline) ->
           eval_string_interp ctx env expr parts is_multiline
+      | Typed_ast.ELambda func -> eval_lambda env expr func
       | Typed_ast.ECall (callee, args) -> eval_call ctx env expr callee args
       | Typed_ast.EMatch (scrutinee, cases) ->
           eval_match ctx env loc scrutinee cases
@@ -374,7 +166,6 @@ let rec eval_expr ctx env expr =
           let updated = { current with desc; loc } in
           assign env loc name updated
       | Typed_ast.EVector _ -> unsupported loc "vector literals"
-      | Typed_ast.ELambda _ -> unsupported loc "lambdas"
       | Typed_ast.EVarDecl _ | Typed_ast.ETupleDestruct _ | Typed_ast.EBreak
       | Typed_ast.EContinue | Typed_ast.ESubscript _
       | Typed_ast.ESubscriptMulti _ | Typed_ast.ESubscriptAssign _
@@ -448,21 +239,75 @@ and apply_record_updates loc fields updates =
   in
   loop fields updates
 
+and eval_lambda env expr func =
+  let ast_func = Typed_ast.func_ast func in
+  if ast_func.func_is_pure then
+    scalar_value expr
+      (VClosure { closure_func = func; closure_env = Ctfe_env.snapshot env })
+  else unsupported (Typed_ast.loc expr) "impure lambdas"
+
+and eval_function_reference ctx expr =
+  let loc = Typed_ast.loc expr in
+  match Typed_ast.expr_resolved_call expr with
+  | Some
+      {
+        Ast.call_target =
+          Ast.CallDirect
+            { callable_id; source_name; call_pure; origin = Ast.CallableLocal };
+        _;
+      } -> (
+      if not call_pure then unsupported loc "impure function references"
+      else
+        match function_by_callable_id ctx callable_id with
+        | Some func ->
+            scalar_value expr
+              (VClosure { closure_func = func; closure_env = [] })
+            >>= fun value -> Ok (Some value)
+        | None ->
+            Error
+              [
+                error loc
+                  (Printf.sprintf
+                     "internal CTFE error: local function reference '%s' has \
+                      unknown callable id %d"
+                     (Call_resolution.strip_callable_id_suffix source_name)
+                     callable_id);
+              ])
+  | Some
+      {
+        Ast.call_target =
+          Ast.CallDirect
+            {
+              source_name;
+              call_pure = true;
+              origin =
+                ( Ast.CallableImported _ | Ast.CallableBuiltin
+                | Ast.CallableForeign | Ast.CallableConstructor _
+                | Ast.CallableImplMethod );
+              _;
+            };
+        _;
+      } ->
+      unsupported loc
+        (Printf.sprintf "function reference '%s'"
+           (Call_resolution.strip_callable_id_suffix source_name))
+  | Some { Ast.call_target = Ast.CallDirect { call_pure = false; _ }; _ } ->
+      unsupported loc "impure function references"
+  | Some { Ast.call_target = Ast.CallTraitMethod _ | Ast.CallClosure _; _ }
+  | None ->
+      Ok None
+
 and eval_string_interp ctx env expr parts is_multiline =
   let string_of_value part_expr value =
-    match value.desc with
-    | VString (text, _) -> Ok text
-    | VInt n -> Ok (Int64.to_string n)
-    | VBool true -> Ok "True"
-    | VBool false -> Ok "False"
-    | VChar code -> string_of_char_code (Typed_ast.loc part_expr) code
-    | _ ->
+    match string_text_of_value (Typed_ast.loc part_expr) value with
+    | Ok text -> Ok text
+    | Error _ ->
         Error
           [
             error (Typed_ast.loc part_expr)
               (Printf.sprintf
                  "compile_time string interpolation currently supports String, \
-                  Int, Bool, and Char expressions, found %s"
+                  Int, Float, Bool, and Char expressions, found %s"
                  (type_name value.ty));
           ]
   in
@@ -477,7 +322,7 @@ and eval_string_interp ctx env expr parts is_multiline =
   in
   loop [] parts
 
-and eval_block ctx env exprs =
+and eval_block ctx env block_expr exprs =
   let rec loop env = function
     | [] -> unsupported Ast.dummy_loc "empty blocks"
     | [ expr ] -> eval_expr ctx env expr
@@ -505,12 +350,32 @@ and eval_block ctx env exprs =
                          (List.length names) (type_name value.ty));
                   ]
             | Error _ as err -> err)
+        | Ok (Typed_ast.EQuestionBind (name, _, rhs)) -> (
+            match eval_question_bind ctx env block_expr name rhs with
+            | Ok (`Continue env) -> loop env rest
+            | Ok (`Return value) -> Ok value
+            | Error _ as err -> err)
         | _ -> (
             match eval_expr ctx env expr with
             | Ok _ -> loop env rest
             | Error _ as err -> err))
   in
   loop env exprs
+
+and eval_question_bind ctx env block_expr name rhs =
+  let loc = Typed_ast.loc rhs in
+  eval_expr ctx env rhs >>= fun carrier ->
+  match option_state loc carrier with
+  | Ok (OptionSome value) -> Ok (`Continue (bind_value name value env))
+  | Ok OptionNone ->
+      option_value ctx block_expr None >>= fun value -> Ok (`Return value)
+  | Error _ -> (
+      match result_state loc carrier with
+      | Ok (ResultOk value) -> Ok (`Continue (bind_value name value env))
+      | Ok (ResultErr value) ->
+          result_err_value ctx block_expr value >>= fun value ->
+          Ok (`Return value)
+      | Error _ -> unsupported loc "?= on non-Option/non-Result values")
 
 and eval_while ctx env expr cond body =
   let rec loop () =
@@ -584,13 +449,13 @@ and eval_call ctx env call_expr callee args =
             eval_exprs ctx env args >>= fun arg_values ->
             eval_local_function_call ctx env call_expr ~callable_id ~source_name
               arg_values
-        | Ast.CallableImported _ ->
-            unsupported (Typed_ast.loc call_expr) "imported function calls"
+        | Ast.CallableImported module_path ->
+            eval_imported_call ctx env call_expr ~module_path ~source_name args
         | Ast.CallableBuiltin ->
-            unsupported (Typed_ast.loc call_expr) "builtin function calls"
+            eval_builtin_call ctx env call_expr ~source_name args
         | Ast.CallableForeign ->
             unsupported (Typed_ast.loc call_expr) "foreign function calls"
-        | Ast.CallableConstructor _ ->
+        | Ast.CallableConstructor parent_type ->
             eval_exprs ctx env args >>= fun arg_values ->
             let name = Call_resolution.strip_callable_id_suffix source_name in
             Ok
@@ -603,15 +468,91 @@ and eval_call ctx env call_expr callee args =
                       args = arg_values;
                       callee = Some (Typed_ast.ast callee);
                       resolved_call = Typed_ast.expr_resolved_call call_expr;
+                      constructor_info =
+                        Some
+                          {
+                            constructor_parent_type = parent_type;
+                            constructor_arity = List.length arg_values;
+                            constructor_callable_id = Some callable_id;
+                          };
                     };
                 loc = Typed_ast.loc call_expr;
               }
         | Ast.CallableImplMethod ->
             unsupported (Typed_ast.loc call_expr) "impl method calls")
-  | Some { Ast.call_target = Ast.CallTraitMethod _; _ } ->
-      unsupported (Typed_ast.loc call_expr) "trait method calls"
-  | Some { Ast.call_target = Ast.CallClosure _; _ } ->
-      unsupported (Typed_ast.loc call_expr) "closure calls"
+  | Some
+      {
+        Ast.call_target =
+          Ast.CallTraitMethod { trait_name; method_name; call_pure; _ };
+        _;
+      } ->
+      eval_trait_call ctx env call_expr ~trait_name ~method_name ~call_pure args
+  | Some { Ast.call_target = Ast.CallClosure { call_pure }; _ } ->
+      if call_pure then eval_closure_call ctx env call_expr callee args
+      else unsupported (Typed_ast.loc call_expr) "impure closure calls"
+
+and eval_imported_call ctx env call_expr ~module_path ~source_name args =
+  let source_name = Call_resolution.strip_callable_id_suffix source_name in
+  eval_exprs ctx env args >>= fun arg_values ->
+  Ctfe_std_eval.eval_imported_call ~eval_callback_call ctx call_expr
+    ~module_path ~source_name arg_values
+
+and eval_builtin_call ctx env call_expr ~source_name args =
+  let loc = Typed_ast.loc call_expr in
+  let source_name = Call_resolution.strip_callable_id_suffix source_name in
+  eval_exprs ctx env args >>= fun arg_values ->
+  match (Intrinsic.builtin_call_of_source_name source_name, arg_values) with
+  | Some Intrinsic.BuiltinToString, [ receiver ] ->
+      string_text_of_value loc receiver >>= string_value call_expr
+  | Some Intrinsic.BuiltinLength, [ receiver ] -> (
+      match receiver.desc with
+      | VList values -> int_value call_expr (List.length values)
+      | VDict pairs -> int_value call_expr (List.length pairs)
+      | _ -> unsupported loc "length builtin on this value")
+  | _ -> unsupported loc (Intrinsic.builtin_unsupported_form source_name)
+
+and eval_trait_call ctx env call_expr ~trait_name ~method_name ~call_pure args =
+  let loc = Typed_ast.loc call_expr in
+  if not call_pure then unsupported loc "impure trait method calls"
+  else
+    eval_exprs ctx env args >>= fun arg_values ->
+    match
+      (Intrinsic.trait_call_of_source ~trait_name ~method_name, arg_values)
+    with
+    | Some Intrinsic.TraitStringableToString, [ receiver ] ->
+        string_text_of_value loc receiver >>= string_value call_expr
+    | Some Intrinsic.TraitHasLengthLength, [ receiver ] -> (
+        match receiver.desc with
+        | VList values -> int_value call_expr (List.length values)
+        | VDict pairs -> int_value call_expr (List.length pairs)
+        | _ -> unsupported loc "HasLength.length on this value")
+    | _ -> unsupported loc "trait method calls"
+
+and eval_closure_call ctx env call_expr callee args =
+  eval_expr ctx env callee >>= fun callee_value ->
+  match callee_value.desc with
+  | VClosure closure ->
+      eval_exprs ctx env args >>= fun arg_values ->
+      eval_closure_function_call ctx call_expr closure arg_values
+  | _ -> unsupported (Typed_ast.loc callee) "closure calls on non-lambda values"
+
+and eval_callback_call ctx call_expr callback arg_values =
+  expect_closure (Typed_ast.loc call_expr) callback >>= fun closure ->
+  eval_closure_function_call ctx call_expr closure arg_values
+
+and eval_closure_function_call ctx call_expr closure arg_values =
+  let func = closure.closure_func in
+  let ast_func = Typed_ast.func_ast func in
+  if not ast_func.func_is_pure then
+    unsupported (Typed_ast.loc call_expr) "impure closure calls"
+  else
+    bind_function_params ctx ast_func.func_params arg_values
+    >>= fun param_env ->
+    let function_env = param_env @ closure.closure_env in
+    match Typed_ast.func_body_expr func with
+    | Error err -> Error [ typed_ast_error_to_error err ]
+    | Ok None -> unsupported (Typed_ast.loc call_expr) "lambdas without bodies"
+    | Ok (Some body) -> eval_expr ctx function_env body
 
 and eval_local_function_call ctx caller_env call_expr ~callable_id ~source_name
     arg_values =
@@ -629,7 +570,7 @@ and eval_local_function_call ctx caller_env call_expr ~callable_id ~source_name
       if not ast_func.func_is_pure then
         unsupported (Typed_ast.loc call_expr) "impure function calls"
       else
-        bind_function_params ast_func.func_params arg_values
+        bind_function_params ctx ast_func.func_params arg_values
         >>= fun param_env ->
         let function_env = param_env @ caller_env in
         match Typed_ast.func_body_expr func with
@@ -637,11 +578,9 @@ and eval_local_function_call ctx caller_env call_expr ~callable_id ~source_name
         | Ok None ->
             unsupported (Typed_ast.loc call_expr)
               "function declarations without bodies"
-        | Ok (Some body) ->
-            let ctx = { ctx with call_stack = callable_id :: ctx.call_stack } in
-            eval_expr ctx function_env body)
+        | Ok (Some body) -> eval_expr ctx function_env body)
 
-and bind_function_params params arg_values =
+and bind_function_params ctx params arg_values =
   let rec loop env params arg_values =
     match (params, arg_values) with
     | [], [] -> Ok env
@@ -650,7 +589,31 @@ and bind_function_params params arg_values =
         | Some "_", None -> loop env rest_params rest_values
         | Some name, None ->
             loop (bind_value name value env) rest_params rest_values
-        | _ -> unsupported param.param_loc "pattern parameters")
+        | None, Some pattern -> (
+            Ctfe_pattern.bind ctx pattern value >>= function
+            | Some bindings ->
+                loop (bind_values bindings env) rest_params rest_values
+            | None ->
+                Error
+                  [
+                    error param.param_loc
+                      "compile_time function argument did not match parameter \
+                       pattern";
+                  ])
+        | Some _, Some _ ->
+            Error
+              [
+                error param.param_loc
+                  "internal CTFE error: function parameter has both a name and \
+                   a pattern";
+              ]
+        | None, None ->
+            Error
+              [
+                error param.param_loc
+                  "internal CTFE error: function parameter has neither a name \
+                   nor a pattern";
+              ])
     | _ ->
         Error
           [
@@ -665,7 +628,9 @@ and eval_match ctx env loc scrutinee cases =
   let rec loop = function
     | [] -> unsupported loc "non-exhaustive match expressions"
     | case :: rest -> (
-        match bind_pattern ctx case.Typed_ast.case_pattern scrutinee_value with
+        match
+          Ctfe_pattern.bind ctx case.Typed_ast.case_pattern scrutinee_value
+        with
         | Error _ as err -> err
         | Ok None -> loop rest
         | Ok (Some bindings) ->
@@ -673,218 +638,10 @@ and eval_match ctx env loc scrutinee cases =
   in
   loop cases
 
-and bind_pattern ctx pattern value =
-  match pattern with
-  | Ast.PatWildcard -> Ok (Some [])
-  | Ast.PatVar name when constructor_is_nullary ctx name -> (
-      match value.desc with
-      | VConstructor { name = value_name; args = []; _ } when name = value_name
-        ->
-          Ok (Some [])
-      | _ -> Ok None)
-  | Ast.PatVar name -> Ok (Some [ (name, value) ])
-  | Ast.PatLiteral lit ->
-      if pattern_literal_matches lit value then Ok (Some []) else Ok None
-  | Ast.PatTuple patterns -> (
-      match value.desc with
-      | VTuple values -> bind_pattern_list ctx patterns values
-      | _ -> Ok None)
-  | Ast.PatConstructor (name, patterns) | Ast.PatQualified (_, name, patterns)
-    -> (
-      match value.desc with
-      | VConstructor { name = value_name; args; _ }
-        when name = value_name && List.length patterns = List.length args ->
-          bind_pattern_list ctx patterns args
-      | _ -> Ok None)
-  | Ast.PatList (patterns, spread) -> (
-      match value.desc with
-      | VList values -> bind_list_pattern ctx patterns spread value values
-      | _ -> Ok None)
-  | Ast.PatOr patterns -> bind_or_pattern ctx patterns value
-
-and bind_pattern_list ctx patterns values =
-  if List.length patterns <> List.length values then Ok None
-  else
-    let rec loop acc patterns values =
-      match (patterns, values) with
-      | [], [] -> Ok (Some (List.rev acc))
-      | pattern :: rest_patterns, value :: rest_values -> (
-          match bind_pattern ctx pattern value with
-          | Error _ as err -> err
-          | Ok None -> Ok None
-          | Ok (Some bindings) ->
-              loop (List.rev_append bindings acc) rest_patterns rest_values)
-      | _ -> Ok None
-    in
-    loop [] patterns values
-
-and bind_list_pattern ctx patterns spread original values =
-  let prefix_count = List.length patterns in
-  if List.length values < prefix_count then Ok None
-  else
-    let rec take n acc rest =
-      if n = 0 then (List.rev acc, rest)
-      else
-        match rest with
-        | [] -> (List.rev acc, [])
-        | value :: rest -> take (n - 1) (value :: acc) rest
-    in
-    let prefix_values, remaining_values = take prefix_count [] values in
-    bind_pattern_list ctx patterns prefix_values >>= function
-    | None -> Ok None
-    | Some prefix_bindings -> (
-        match spread with
-        | None ->
-            if remaining_values = [] then Ok (Some prefix_bindings) else Ok None
-        | Some spread_pattern -> (
-            let remaining =
-              {
-                original with
-                desc = VList remaining_values;
-                loc = original.loc;
-              }
-            in
-            bind_pattern ctx spread_pattern remaining >>= function
-            | None -> Ok None
-            | Some spread_bindings ->
-                Ok (Some (prefix_bindings @ spread_bindings))))
-
-and bind_or_pattern ctx patterns value =
-  let rec loop = function
-    | [] -> Ok None
-    | pattern :: rest -> (
-        match bind_pattern ctx pattern value with
-        | Error _ as err -> err
-        | Ok None -> loop rest
-        | Ok (Some _) as matched -> matched)
-  in
-  loop patterns
-
-and pattern_literal_matches lit value =
-  match (lit, value.desc) with
-  | Ast.LitInt left, VInt right -> left = right
-  | Ast.LitFloat left, VFloat right -> left = right
-  | Ast.LitBool left, VBool right -> left = right
-  | Ast.LitChar left, VChar right -> left = right
-  | Ast.LitString (left, _), VString (right, _) -> left = right
-  | Ast.LitInt128 _, _ -> false
-  | _, _ -> false
-
-let make_expr ?resolved_call loc ty desc =
-  let ast = Ast.untyped_expr ~loc desc in
-  match
-    Typed_ast.of_ast_expr_with_type_info
-      ~context:"compile_time materialized initializer" ?resolved_call
-      ~semantic_ty:ty ~value_ty:ty ~widening:(Type_widening_metadata.Keep ty)
-      ast
-  with
-  | Ok typed -> Ok (Typed_ast.ast typed)
-  | Error err -> Error [ typed_ast_error_to_error err ]
-
-let rec value_to_expr value =
-  match value.desc with
-  | VInt n -> make_expr value.loc value.ty (Ast.ELiteral (Ast.LitInt n))
-  | VFloat n -> make_expr value.loc value.ty (Ast.ELiteral (Ast.LitFloat n))
-  | VBool b -> make_expr value.loc value.ty (Ast.ELiteral (Ast.LitBool b))
-  | VChar c -> make_expr value.loc value.ty (Ast.ELiteral (Ast.LitChar c))
-  | VString (s, flags) ->
-      make_expr value.loc value.ty (Ast.ELiteral (Ast.LitString (s, flags)))
-  | VTuple values ->
-      value_to_exprs values >>= fun values ->
-      make_expr value.loc value.ty (Ast.ETuple values)
-  | VList values ->
-      value_to_exprs values >>= fun values ->
-      make_expr value.loc value.ty (Ast.EList values)
-  | VDict pairs ->
-      value_pairs_to_exprs pairs >>= fun pairs ->
-      make_expr value.loc value.ty (Ast.EDict pairs)
-  | VRecord fields ->
-      value_fields_to_exprs fields >>= fun fields ->
-      make_expr value.loc value.ty (Ast.ERecord fields)
-  | VRange (start_value, end_value) ->
-      value_to_expr start_value >>= fun start_expr ->
-      value_to_expr end_value >>= fun end_expr ->
-      make_expr value.loc value.ty (Ast.ERange (start_expr, end_expr))
-  | VVoid -> make_expr value.loc value.ty Ast.EVoid
-  | VConstructor { name; args; callee; resolved_call } -> (
-      value_to_exprs args >>= fun args ->
-      match (callee, args) with
-      | Some callee, _ ->
-          make_expr ?resolved_call value.loc value.ty (Ast.ECall (callee, args))
-      | None, [] -> make_expr value.loc value.ty (Ast.EIdent name)
-      | None, _ ->
-          Error
-            [
-              error value.loc
-                (Printf.sprintf
-                   "internal CTFE error: constructor '%s' has payload but no \
-                    callee"
-                   name);
-            ])
-
-and value_to_exprs values =
-  let rec loop acc = function
-    | [] -> Ok (List.rev acc)
-    | value :: rest -> (
-        match value_to_expr value with
-        | Ok expr -> loop (expr :: acc) rest
-        | Error _ as err -> err)
-  in
-  loop [] values
-
-and value_fields_to_exprs fields =
-  let rec loop acc = function
-    | [] -> Ok (List.rev acc)
-    | (name, value) :: rest -> (
-        match value_to_expr value with
-        | Ok expr -> loop ((name, expr) :: acc) rest
-        | Error _ as err -> err)
-  in
-  loop [] fields
-
-and value_pairs_to_exprs pairs =
-  let rec loop acc = function
-    | [] -> Ok (List.rev acc)
-    | (key, value) :: rest -> (
-        match (value_to_expr key, value_to_expr value) with
-        | Ok key, Ok value -> loop ((key, value) :: acc) rest
-        | Error errors, _ | _, Error errors -> Error errors)
-  in
-  loop [] pairs
-
-let materialized_binding_decl binding value =
-  let typed_var = Typed_ast.compile_time_binding_var binding in
-  let ast_binding = Typed_ast.compile_time_binding_ast binding in
-  let* value_expr = value_to_expr value in
-  let ast_var =
-    {
-      (Typed_ast.var_ast typed_var) with
-      Ast.var_value = value_expr;
-      var_is_mutable = false;
-      var_is_const = true;
-    }
-  in
-  let typed_var = Typed_ast.with_var_ast typed_var ast_var in
-  let inner_ast_decl =
-    {
-      Ast.decl_desc = Ast.DVar ast_var;
-      decl_loc = ast_binding.ctb_loc;
-      decl_doc = ast_binding.ctb_doc;
-    }
-  in
-  let inner_typed_decl = Typed_ast.make_var_decl inner_ast_decl typed_var in
-  if ast_binding.ctb_private then
-    let ast_decl =
-      {
-        Ast.decl_desc = Ast.DPrivate inner_ast_decl;
-        decl_loc = ast_binding.ctb_loc;
-        decl_doc = None;
-      }
-    in
-    Ok (Typed_ast.make_private_decl ast_decl inner_typed_decl)
-  else Ok inner_typed_decl
-
 let evaluate_binding ctx env binding =
+  let Typed_ast.CompileTimeRequired =
+    Typed_ast.compile_time_binding_evaluation binding
+  in
   let typed_var = Typed_ast.compile_time_binding_var binding in
   let ast_var = Typed_ast.var_ast typed_var in
   match ast_var.var_name with
@@ -900,7 +657,7 @@ let evaluate_binding ctx env binding =
       | Ok init -> (
           match eval_expr ctx env init with
           | Ok value ->
-              materialized_binding_decl binding value >>= fun typed_decl ->
+              Ctfe_materialize.binding_decl binding value >>= fun typed_decl ->
               Ok (bind_value name value env, typed_decl)
           | Error _ as err -> err))
 
@@ -914,45 +671,11 @@ let evaluate_compile_time_block ctx env bindings =
   in
   loop env [] bindings
 
-let rec collect_functions acc decl =
-  match Typed_ast.decl_view decl with
-  | Typed_ast.DeclFunction func -> (
-      match Typed_ast.func_callable_id func with
-      | Some callable_id -> (callable_id, func) :: acc
-      | None -> acc)
-  | Typed_ast.DeclPrivate inner -> collect_functions acc inner
-  | _ -> acc
-
-let collect_constructor_decls acc decl =
-  let collect_type acc type_decl =
-    List.fold_left
-      (fun acc variant ->
-        (variant.Ast.variant_name, List.length variant.variant_fields) :: acc)
-      acc type_decl.Ast.type_variants
-  in
-  match (Typed_ast.decl_ast decl).Ast.decl_desc with
-  | Ast.DType type_decl -> collect_type acc type_decl
-  | Ast.DPrivate inner -> (
-      match inner.Ast.decl_desc with
-      | Ast.DType type_decl -> collect_type acc type_decl
-      | _ -> acc)
-  | _ -> acc
-
-let evaluate_program ?(constructor_arity = fun _ -> None)
+let evaluate_program ?(constructor_info = fun _ -> None)
     (program : Typed_ast.program) =
-  let functions =
-    List.fold_left collect_functions [] (Typed_ast.program_decls program)
+  let ctx =
+    Ctfe_context.of_program ~fallback_constructor_info:constructor_info program
   in
-  let constructors =
-    List.fold_left collect_constructor_decls []
-      (Typed_ast.program_decls program)
-  in
-  let constructor_arity name =
-    match List.assoc_opt name constructors with
-    | Some arity -> Some arity
-    | None -> constructor_arity name
-  in
-  let ctx = { functions; constructor_arity; call_stack = [] } in
   let rec loop acc = function
     | [] ->
         let typed_decls = List.rev acc in

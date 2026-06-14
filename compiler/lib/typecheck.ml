@@ -4098,6 +4098,41 @@ let check_exhaustiveness (env : env) (scrutinee_ty : type_expr)
    Function Body Checking - Second Pass
    ============================================================================ *)
 
+let rec bind_parameter_pattern_vars state env pattern ty =
+  let bind_name env name ty =
+    if name = "_" then env
+    else
+      add_var env name
+        (canonical_type_annotation_in_env state env ty)
+        ~origin:FuncParam ()
+  in
+  match (pattern, Types.head_resolve ty) with
+  | PatWildcard, _ -> env
+  | PatVar name, _ -> bind_name env name ty
+  | PatTuple patterns, (TyTuple elem_tys | TyNamed ("Tuple", elem_tys))
+    when List.length patterns = List.length elem_tys ->
+      List.fold_left2
+        (fun env pattern ty -> bind_parameter_pattern_vars state env pattern ty)
+        env patterns elem_tys
+  | _ -> env
+
+let bind_parameter_vars state env (param : Ast.param) =
+  match (param.param_name, param.param_pattern, param.param_type) with
+  | Some name, None, Some ty ->
+      if name = "_" then env
+      else
+        add_var env name
+          (canonical_type_annotation_in_env state env ty)
+          ~origin:FuncParam ()
+  | None, Some pattern, Some ty ->
+      bind_parameter_pattern_vars state env pattern ty
+  | _ -> env
+
+let parameter_binds_name name (param : Ast.param) =
+  match param.param_pattern with
+  | Some pattern -> List.mem name (Ast.collect_pattern_vars pattern)
+  | None -> param.param_name = Some name
+
 (** Create a type-checking environment scoped to a function's parameters.
     [source_func] preserves the parser-level parameter spelling when [func] has
     already had annotations canonicalized for semantic checking. *)
@@ -4124,8 +4159,13 @@ let setup_function_scope ?(source_func : func_decl option) (state : check_state)
   in
   List.fold_left2
     (fun env (source_param : Ast.param) (param : Ast.param) ->
-      match (param.param_name, source_param.param_type, param.param_type) with
-      | Some name, source_ty_opt, Some ty ->
+      match
+        ( param.param_name,
+          param.param_pattern,
+          source_param.param_type,
+          param.param_type )
+      with
+      | Some name, None, source_ty_opt, Some ty ->
           let source_type =
             Option.map
               (fun source_ty ->
@@ -4137,6 +4177,8 @@ let setup_function_scope ?(source_func : func_decl option) (state : check_state)
           add_var env name
             (canonical_type_annotation_in_env state env ty)
             ?source_type ~origin:FuncParam ()
+      | None, Some pattern, _, Some ty ->
+          bind_parameter_pattern_vars state env pattern ty
       | _ -> env)
     env source_params func.func_params
 
@@ -4554,10 +4596,7 @@ let rec check_nested_pure_lambdas (state : check_state) (expr : expr) :
           | Some body ->
               let purity_env =
                 List.fold_left
-                  (fun env (p : param) ->
-                    match (p.param_name, p.param_type) with
-                    | Some name, Some ty -> add_var env name ty ()
-                    | _ -> env)
+                  (bind_parameter_vars state)
                   state.env func.func_params
               in
               let impure_calls =
@@ -4610,12 +4649,7 @@ let check_purity (state : check_state) (func : func_decl)
             state func.func_params
         in
         let purity_env =
-          List.fold_left
-            (fun env (p : param) ->
-              match (p.param_name, p.param_type) with
-              | Some name, Some ty -> add_var env name ty ()
-              | _ -> env)
-            state.env func.func_params
+          List.fold_left (bind_parameter_vars state) state.env func.func_params
         in
         let impure_calls =
           collect_impure_calls ~strict:true purity_env state.module_aliases body
@@ -4636,7 +4670,7 @@ let check_purity (state : check_state) (func : func_decl)
               | Some { kind = Env.VarSymbol { mutability = Env.Mutable; _ }; _ }
                 when not
                        (List.exists
-                          (fun (p : param) -> p.param_name = Some name)
+                          (parameter_binds_name name)
                           func.func_params) ->
                   add_error st
                     (error_at e.expr_loc
@@ -4814,15 +4848,7 @@ let rec check_matches_in_expr (state : check_state) (expr : expr) : check_state
       | Some body ->
           let env = push_scope state.env in
           let env =
-            List.fold_left
-              (fun env (p : Ast.param) ->
-                match (p.param_name, p.param_type) with
-                | Some name, Some ty ->
-                    add_var env name
-                      (canonical_type_annotation_in_env state env ty)
-                      ()
-                | _ -> env)
-              env func.func_params
+            List.fold_left (bind_parameter_vars state) env func.func_params
           in
           check_matches_in_expr { state with env } body
       | None -> state)
@@ -5194,9 +5220,15 @@ let typecheck_compile_time_binding state binding =
   in
   (state, { binding with ctb_var = typed_var })
 
-let compile_time_constructor_arity env name =
+let compile_time_constructor_info env name =
   match Env.get_constructor env name with
-  | Some (_, _, field_types, _) -> Some (List.length field_types)
+  | Some (parent_type, _, field_types, _) ->
+      Some
+        {
+          Ctfe.constructor_parent_type = parent_type;
+          constructor_arity = List.length field_types;
+          constructor_callable_id = Env.get_constructor_callable_id env name;
+        }
   | None -> None
 
 let rec second_pass (state : check_state) (decls : program) :
@@ -5942,7 +5974,7 @@ let typecheck_with_state_typed ?module_origin ?(module_name = "")
       | Error errors -> Error errors
       | Ok typed ->
           Ctfe.evaluate_program
-            ~constructor_arity:(compile_time_constructor_arity state.env)
+            ~constructor_info:(compile_time_constructor_info state.env)
             typed
           |> Result.map (fun typed -> (state, typed)))
 
@@ -5972,7 +6004,7 @@ let typecheck_with_env_typed ?module_origin ?(module_name = "")
       | Ok typed -> (
           match
             Ctfe.evaluate_program
-              ~constructor_arity:(compile_time_constructor_arity state.env)
+              ~constructor_info:(compile_time_constructor_info state.env)
               typed
           with
           | Ok typed -> Ok (typed, state.env)
@@ -6126,7 +6158,7 @@ let typecheck_module_with_state_typed ?module_origin ?(module_name = "")
       | Ok typed -> (
           match
             Ctfe.evaluate_program
-              ~constructor_arity:(compile_time_constructor_arity state.env)
+              ~constructor_info:(compile_time_constructor_info state.env)
               typed
           with
           | Ok typed -> Ok (state, typed)

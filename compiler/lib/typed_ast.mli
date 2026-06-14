@@ -14,6 +14,7 @@ type impl_decl
 type compile_time_binding
 type decl
 type program
+type compile_time_evaluation = CompileTimeRequired
 
 type type_origin = Ast.expr_type_origin =
   | ExplicitAnnotation of Ast.type_expr
@@ -226,6 +227,10 @@ val impl_ast : impl_decl -> Ast.impl_decl
 val impl_methods : impl_decl -> func_decl list
 val compile_time_binding_ast : compile_time_binding -> Ast.compile_time_binding
 val compile_time_binding_var : compile_time_binding -> var_decl
+
+val compile_time_binding_evaluation :
+  compile_time_binding -> compile_time_evaluation
+
 val make_var_decl : Ast.decl -> var_decl -> decl
 val make_private_decl : Ast.decl -> decl -> decl
 val make_program : decl list -> program

@@ -617,6 +617,33 @@ let test_decl_rejects_cleanup_metadata_on_non_resource_type () =
   | Ok _ -> Alcotest.fail "expected invalid type metadata"
   | Error _ -> Alcotest.fail "expected invalid type metadata"
 
+let test_compile_time_binding_marks_required_evaluation () =
+  let var =
+    {
+      var_name = Some "X";
+      var_pattern = None;
+      var_type = Some ty_int;
+      var_value = expr_with_type ty_int;
+      var_is_mutable = false;
+      var_is_const = true;
+    }
+  in
+  let binding =
+    { ctb_private = false; ctb_var = var; ctb_loc = dummy_loc; ctb_doc = None }
+  in
+  match Blorp.Typed_ast.of_ast_decl (decl (DCompileTimeBlock [ binding ])) with
+  | Ok typed -> (
+      match Blorp.Typed_ast.decl_view typed with
+      | Blorp.Typed_ast.DeclCompileTimeBlock [ typed_binding ] ->
+          Alcotest.(check bool)
+            "required" true
+            (match
+               Blorp.Typed_ast.compile_time_binding_evaluation typed_binding
+             with
+            | Blorp.Typed_ast.CompileTimeRequired -> true)
+      | _ -> Alcotest.fail "expected one typed compile_time binding")
+  | Error _ -> Alcotest.fail "expected finalized compile_time declaration"
+
 let test_expr_rejects_meta_loop_view_element_type () =
   let source = expr_with_type (TyArray (ty_int, [ TyConstInt 4 ])) in
   let loop_view =
@@ -741,6 +768,8 @@ let suite =
           test_decl_rejects_meta_global_annotation;
         Alcotest.test_case "rejects resource cleanup on non-resource type"
           `Quick test_decl_rejects_cleanup_metadata_on_non_resource_type;
+        Alcotest.test_case "compile_time binding marks required evaluation"
+          `Quick test_compile_time_binding_marks_required_evaluation;
         Alcotest.test_case "rejects meta loop view element type" `Quick
           test_expr_rejects_meta_loop_view_element_type;
       ] );

@@ -73,6 +73,44 @@ Current priorities:
   emission: unresolved calls, unconverted closure/concurrency forms, invalid
   ownership crossings, and unprepared erased storage.
 
+### Compile-Time Evaluation Architecture
+
+`compile_time:` is an explicit request to evaluate already-validated pure Blorp
+code in a restricted compiler execution environment, then serialize the result
+as ordinary immutable global data. The feature should not grow into a second
+frontend, typechecker, standard library, or backend.
+
+Direction:
+
+- Keep the surface narrow: top-level `compile_time:` blocks, immutable value
+  bindings only, source-order dependencies, purity required, no type generation,
+  no macros, and no expression-level form until the architecture is stable.
+- Reuse the normal parser, name resolution, type inference, purity checks, and
+  runtime materialization path. CTFE should consume those facts, not recompute
+  them from source names or expression shapes.
+- Move toward evaluating a shared lowered representation. If full Core is too
+  broad initially, use a small CTFE IR derived mechanically from typed AST/Core
+  instead of duplicating semantic decisions inside the evaluator.
+- Put compiler-owned std/builtin behavior behind a CTFE intrinsic registry. Each
+  supported operation should have one narrow entry describing the runtime
+  builtin/source identity, determinism requirement, evaluator, and unsupported
+  reason when relevant.
+- Keep evaluator code responsible for control flow, local bindings, function
+  calls, closures, pattern decisions, and constructed values. It should not
+  keep accumulating one-off std module semantics.
+- Dogfood after the architecture boundary is in place. The intrinsic renderer is
+  a useful acceptance test, but it should not force ad hoc CTFE support.
+
+Near-term cleanup:
+
+1. Centralize CTFE intrinsic classification and dispatch before adding more std
+   helpers.
+2. Make compile-time-required bindings explicit in the typed representation, or
+   document why the existing block representation is enough for the current
+   phase boundary.
+3. Decide whether the next evaluator target is Core or a smaller CTFE IR, based
+   on which option reuses more existing compiler facts with less special casing.
+
 ### Ownership And Reuse Performance
 
 Self-hosting will stress compiler-shaped data: AST construction, traversal,

@@ -57,10 +57,12 @@ type type_alias_decl = {
 }
 
 type impl_decl = { ast_impl : Ast.impl_decl; typed_methods : func_decl list }
+type compile_time_evaluation = CompileTimeRequired
 
 type compile_time_binding = {
   ast_binding : Ast.compile_time_binding;
   typed_var : var_decl;
+  evaluation : compile_time_evaluation;
 }
 
 type decl_info =
@@ -238,6 +240,7 @@ let impl_ast (impl : impl_decl) = impl.ast_impl
 let impl_methods (impl : impl_decl) = impl.typed_methods
 let compile_time_binding_ast binding = binding.ast_binding
 let compile_time_binding_var binding = binding.typed_var
+let compile_time_binding_evaluation binding = binding.evaluation
 let make_var_decl ast_decl var = { ast_decl; decl_info = VarDecl var }
 
 let make_private_decl ast_decl inner =
@@ -1155,7 +1158,13 @@ let rec of_ast_decl_with_source ?source_decl ?callable_id_of_func ast_decl =
                 of_ast_var_decl_with_source ?source_var binding.Ast.ctb_var
               in
               let* typed_rest = typed_bindings (idx + 1) rest in
-              Ok ({ ast_binding = binding; typed_var } :: typed_rest)
+              Ok
+                ({
+                   ast_binding = binding;
+                   typed_var;
+                   evaluation = CompileTimeRequired;
+                 }
+                :: typed_rest)
         in
         let* typed_bindings = typed_bindings 0 bindings in
         Ok (CompileTimeBlockDecl typed_bindings)

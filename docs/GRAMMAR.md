@@ -193,8 +193,11 @@ destruct_id  = IDENT | "_" ;
 ### Variable Declaration
 
 ```ebnf
-var_decl = "var" IDENT [ ":" type_expr ] "=" expr    (* mutable *)
-         | IDENT [ ":" type_expr ] "=" expr ;         (* immutable *)
+var_decl = "var" IDENT [ ":" type_expr ] var_initializer    (* mutable *)
+         | IDENT [ ":" type_expr ] var_initializer ;         (* immutable *)
+
+var_initializer = "=" expr
+                | "=" NEWLINE INDENT expr DEDENT ;
 ```
 
 **Semantic constraints:**
@@ -210,7 +213,7 @@ compile_time_block = "compile_time" ":" NEWLINE INDENT compile_time_binding_list
 
 compile_time_binding_list = compile_time_binding { NEWLINE compile_time_binding } ;
 
-compile_time_binding = [ docstring ] [ "private" ] IDENT [ ":" type_expr ] "=" expr ;
+compile_time_binding = [ docstring ] [ "private" ] IDENT [ ":" type_expr ] var_initializer ;
 ```
 
 **Semantic constraints:**
