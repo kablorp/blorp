@@ -24,7 +24,6 @@
 
 open Core
 open Core_emit_util
-module List_emit = Core_emit_list_intrinsic
 
 let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
     ~(emit_stmt : Core_emit_context.t -> core -> unit)
@@ -38,17 +37,17 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
   (* ---- List primitives ---- *)
   | "list_set", [ lst; idx; val_ ] ->
       (* Layout-aware unchecked store. Mutates in place, returns void. *)
-      List_emit.emit_store ~emit_expr ~emit_boxed ctx List_emit.ListSetRaw lst
-        idx val_
+      Core_emit_blorp_prepared_list.emit_store ~emit_expr ~emit_boxed ctx
+        Core_emit_blorp_prepared_list.ListSetRaw lst idx val_
   | "list_set_owned", [ lst; idx; val_ ] ->
       (* Layout-aware unchecked transfer into initialized storage. *)
-      List_emit.emit_store ~emit_expr ~emit_boxed ctx List_emit.ListSetRaw lst
-        idx val_
+      Core_emit_blorp_prepared_list.emit_store ~emit_expr ~emit_boxed ctx
+        Core_emit_blorp_prepared_list.ListSetRaw lst idx val_
   | "list_handoff_set_owned", [ lst; idx; val_ ] ->
       (* Handoff write: transfer a freshly owned value into [idx]. The runtime
          helper releases old reused slots and leaves fresh builder writes alone. *)
-      List_emit.emit_store ~emit_expr ~emit_boxed ctx
-        List_emit.ListHandoffSetOwned lst idx val_
+      Core_emit_blorp_prepared_list.emit_store ~emit_expr ~emit_boxed ctx
+        Core_emit_blorp_prepared_list.ListHandoffSetOwned lst idx val_
   | "list_handoff_set_source_slot", [ result; out_idx; source; source_idx ] ->
       (* Handoff write from an existing source slot. The runtime moves the slot
          when handoff reuse succeeds and retains it when writing to a fresh
@@ -63,7 +62,7 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
   | "list_swap_slots", [ lst; i; j ] ->
       (* Layout-aware unchecked swap. The operation only rearranges initialized
          slots, so it does not retain or release elements. *)
-      List_emit.emit_swap_slots ~emit_expr ctx lst i j
+      Core_emit_blorp_prepared_list.emit_swap_slots ~emit_expr ctx lst i j
   | "list_alloc", [ _ ] ->
       Core_error.errorf Core_error.Emit e.loc
         ~hint:

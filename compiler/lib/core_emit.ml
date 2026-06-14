@@ -1924,16 +1924,15 @@ and emit_tensor_literal ctx loc tl =
       List.iteri
         (fun i value ->
           if elem_needs_release then begin
-            let elem_tmp = Printf.sprintf "__elem_%d" (fresh_temp ctx) in
-            emit ctx (Printf.sprintf " void* %s = " elem_tmp);
-            emit_boxed_storage ctx value;
-            emit ctx "; ";
-            Core_emit_blorp_prepared_tensor.emit_literal_boxed_write_rendered
-              ctx ~tensor_tmp:tmp ~index:i ~value_arg:elem_tmp;
-            if not value.bsv_transfers_ownership then (
-              emit ctx " ";
-              Core_emit_blorp_prepared_tensor.emit_literal_boxed_retain ctx
-                elem_tmp)
+            emit ctx " ";
+            if value.bsv_transfers_ownership then
+              Core_emit_blorp_prepared_tensor.emit_literal_boxed_owned_write
+                ~emit_boxed:emit_boxed_storage ctx ~tensor_tmp:tmp ~index:i
+                value
+            else
+              Core_emit_blorp_prepared_tensor.emit_literal_boxed_borrowed_write
+                ~emit_boxed:emit_boxed_storage ctx ~tensor_tmp:tmp ~index:i
+                value
           end
           else begin
             emit ctx " ";

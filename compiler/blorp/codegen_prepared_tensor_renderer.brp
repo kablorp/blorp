@@ -1,8 +1,9 @@
 -- Blorp-authored renderer for prepared tensor Core nodes.
 --
 -- OCaml still owns Core traversal, child expression emission, ABI strings, and
--- variable naming. This module owns only the final C snippet shape for prepared
--- tensor raw-view access and allocation helpers.
+-- fresh temp seeds. This module owns the final C snippet shape and local
+-- temp-name conventions for prepared tensor raw-view access and allocation
+-- helpers.
 enum CompilerCommand:
 	RenderPreparedTensorCommand
 	RenderManifestCommand
@@ -43,7 +44,8 @@ enum PreparedTensorTemplate:
 	TensorLiteralPackedWriteTemplate
 	TensorLiteralInlineStructWriteTemplate
 	TensorLiteralBoxedWriteTemplate
-	TensorLiteralBoxedRetainTemplate
+	TensorLiteralBoxedOwnedWriteTemplate
+	TensorLiteralBoxedBorrowedWriteTemplate
 
 
 record PreparedTensorTemplateInfo {
@@ -83,7 +85,7 @@ record RawWriteArgs {
 
 record StorageCheckArgs {
 	tensor: String,
-	vector_tmp: String
+	temp_seed: String
 }
 
 
@@ -96,10 +98,7 @@ record TensorIndexArgs {
 record InlineStructGetUncheckedArgs {
 	tensor: String,
 	index: String,
-	vector_tmp: String,
-	index_tmp: String,
-	out_tmp: String,
-	raw_tmp: String,
+	temp_seed: String,
 	struct_ty: String
 }
 
@@ -107,9 +106,7 @@ record InlineStructGetUncheckedArgs {
 record RawScalarGetUncheckedArgs {
 	tensor: String,
 	index: String,
-	vector_tmp: String,
-	index_tmp: String,
-	out_tmp: String
+	temp_seed: String
 }
 
 
@@ -127,7 +124,7 @@ record TensorAllocSizedArgs {
 
 record TensorAllocWithReleaseArgs {
 	alloc_expr: String,
-	result_tmp: String
+	temp_seed: String
 }
 
 
@@ -162,8 +159,16 @@ record TensorLiteralInlineStructWriteArgs {
 	tensor: String,
 	index: String,
 	value: String,
-	elem_tmp: String,
+	temp_seed: String,
 	struct_ty: String
+}
+
+
+record TensorLiteralBoxedSeededWriteArgs {
+	tensor: String,
+	index: String,
+	value: String,
+	temp_seed: String
 }
 
 
@@ -201,7 +206,8 @@ union PreparedTensorOp:
 	TensorLiteralPackedWrite(TensorLiteralWriteArgs)
 	TensorLiteralInlineStructWrite(TensorLiteralInlineStructWriteArgs)
 	TensorLiteralBoxedWrite(TensorLiteralWriteArgs)
-	TensorLiteralBoxedRetain(String)
+	TensorLiteralBoxedOwnedWrite(TensorLiteralBoxedSeededWriteArgs)
+	TensorLiteralBoxedBorrowedWrite(TensorLiteralBoxedSeededWriteArgs)
 
 
 union RenderError:
@@ -248,15 +254,15 @@ ALL_TEMPLATES: List[PreparedTensorTemplateInfo] = [{
 	}, {
 		template = TensorInlineStructGetUncheckedTemplate,
 		name = "tensor_inline_struct_get_unchecked",
-		arity = 7
+		arity = 4
 	}, {
 		template = TensorF64RawGetUncheckedTemplate,
 		name = "tensor_get_f64_raw_unchecked",
-		arity = 5
+		arity = 3
 	}, {
 		template = TensorF32RawGetUncheckedTemplate,
 		name = "tensor_get_f32_raw_unchecked",
-		arity = 5
+		arity = 3
 	}, {
 		template = TensorAllocPointerTemplate,
 		name = "tensor_alloc_pointer",
@@ -342,9 +348,13 @@ ALL_TEMPLATES: List[PreparedTensorTemplateInfo] = [{
 		name = "tensor_literal_write_boxed",
 		arity = 3
 	}, {
-		template = TensorLiteralBoxedRetainTemplate,
-		name = "tensor_literal_boxed_retain",
-		arity = 1
+		template = TensorLiteralBoxedOwnedWriteTemplate,
+		name = "tensor_literal_write_boxed_owned",
+		arity = 4
+	}, {
+		template = TensorLiteralBoxedBorrowedWriteTemplate,
+		name = "tensor_literal_write_boxed_borrowed",
+		arity = 4
 	}]
 
 USAGE: String = (
@@ -439,10 +449,10 @@ private pure func parse_raw_write_args(args: List[String]) -> Option[RawWriteArg
 
 private pure func parse_storage_check_args(args: List[String]) -> Option[StorageCheckArgs]:
 	match args:
-		[tensor, vector_tmp]:
+		[tensor, temp_seed]:
 			Some({
 				tensor = tensor,
-				vector_tmp = vector_tmp,
+				temp_seed = temp_seed,
 			})
 		_:
 			None
@@ -463,14 +473,11 @@ private pure func parse_inline_struct_get_unchecked_args(
 	args: List[String],
 ) -> Option[InlineStructGetUncheckedArgs]:
 	match args:
-		[tensor, index, vector_tmp, index_tmp, out_tmp, raw_tmp, struct_ty]:
+		[tensor, index, temp_seed, struct_ty]:
 			Some({
 				tensor = tensor,
 				index = index,
-				vector_tmp = vector_tmp,
-				index_tmp = index_tmp,
-				out_tmp = out_tmp,
-				raw_tmp = raw_tmp,
+				temp_seed = temp_seed,
 				struct_ty = struct_ty,
 			})
 		_:
@@ -481,13 +488,11 @@ private pure func parse_raw_scalar_get_unchecked_args(
 	args: List[String],
 ) -> Option[RawScalarGetUncheckedArgs]:
 	match args:
-		[tensor, index, vector_tmp, index_tmp, out_tmp]:
+		[tensor, index, temp_seed]:
 			Some({
 				tensor = tensor,
 				index = index,
-				vector_tmp = vector_tmp,
-				index_tmp = index_tmp,
-				out_tmp = out_tmp,
+				temp_seed = temp_seed,
 			})
 		_:
 			None
@@ -529,10 +534,10 @@ private pure func parse_tensor_alloc_with_release_args(
 	args: List[String],
 ) -> Option[TensorAllocWithReleaseArgs]:
 	match args:
-		[alloc_expr, result_tmp]:
+		[alloc_expr, temp_seed]:
 			Some({
 				alloc_expr = alloc_expr,
-				result_tmp = result_tmp,
+				temp_seed = temp_seed,
 			})
 		_:
 			None
@@ -597,13 +602,28 @@ private pure func parse_tensor_literal_inline_struct_write_args(
 	args: List[String],
 ) -> Option[TensorLiteralInlineStructWriteArgs]:
 	match args:
-		[tensor, index, value, elem_tmp, struct_ty]:
+		[tensor, index, value, temp_seed, struct_ty]:
 			Some({
 				tensor = tensor,
 				index = index,
 				value = value,
-				elem_tmp = elem_tmp,
+				temp_seed = temp_seed,
 				struct_ty = struct_ty,
+			})
+		_:
+			None
+
+
+private pure func parse_tensor_literal_boxed_seeded_write_args(
+	args: List[String],
+) -> Option[TensorLiteralBoxedSeededWriteArgs]:
+	match args:
+		[tensor, index, value, temp_seed]:
+			Some({
+				tensor = tensor,
+				index = index,
+				value = value,
+				temp_seed = temp_seed,
 			})
 		_:
 			None
@@ -668,8 +688,12 @@ private pure func storage_check_extra_condition(
 			""
 
 
+private pure func storage_check_vector_tmp(temp_seed: String) -> String:
+	"__tensor_layout_${temp_seed}"
+
+
 private pure func render_storage_check(args: StorageCheckArgs, kind: StorageCheckKind) -> String:
-	vector_tmp: String = args.vector_tmp
+	vector_tmp: String = storage_check_vector_tmp(args.temp_seed)
 	mode: String = storage_check_mode(kind)
 	elem_size: String = storage_check_elem_size(kind)
 	extra_condition: String = storage_check_extra_condition(kind, vector_tmp)
@@ -683,11 +707,27 @@ private pure func render_data_pointer_get_unchecked(args: TensorIndexArgs) -> St
 	"((blorp_Vector*)${args.tensor})->data[${args.index}]"
 
 
+private pure func inline_struct_get_vector_tmp(temp_seed: String) -> String:
+	"__tgu_vec_${temp_seed}"
+
+
+private pure func inline_struct_get_index_tmp(temp_seed: String) -> String:
+	"__tgu_idx_${temp_seed}"
+
+
+private pure func inline_struct_get_out_tmp(temp_seed: String) -> String:
+	"__tgu_out_${temp_seed}"
+
+
+private pure func inline_struct_get_raw_tmp(temp_seed: String) -> String:
+	"__tgu_raw_${temp_seed}"
+
+
 private pure func render_inline_struct_get_unchecked(args: InlineStructGetUncheckedArgs) -> String:
-	vector_tmp: String = args.vector_tmp
-	index_tmp: String = args.index_tmp
-	out_tmp: String = args.out_tmp
-	raw_tmp: String = args.raw_tmp
+	vector_tmp: String = inline_struct_get_vector_tmp(args.temp_seed)
+	index_tmp: String = inline_struct_get_index_tmp(args.temp_seed)
+	out_tmp: String = inline_struct_get_out_tmp(args.temp_seed)
+	raw_tmp: String = inline_struct_get_raw_tmp(args.temp_seed)
 	struct_ty: String = args.struct_ty
 	vector_bind: String = "blorp_Vector* ${vector_tmp} = (blorp_Vector*)${args.tensor};"
 	index_bind: String = "long ${index_tmp} = ${args.index};"
@@ -712,13 +752,25 @@ private pure func raw_scalar_c_type(kind: RawScalarKind) -> String:
 			"float"
 
 
+private pure func raw_scalar_get_vector_tmp(temp_seed: String) -> String:
+	"__tensor_raw_vec_${temp_seed}"
+
+
+private pure func raw_scalar_get_index_tmp(temp_seed: String) -> String:
+	"__tensor_raw_idx_${temp_seed}"
+
+
+private pure func raw_scalar_get_out_tmp(temp_seed: String) -> String:
+	"__tensor_raw_${temp_seed}"
+
+
 private pure func render_raw_scalar_get_unchecked(
 	args: RawScalarGetUncheckedArgs,
 	kind: RawScalarKind,
 ) -> String:
-	vector_tmp: String = args.vector_tmp
-	index_tmp: String = args.index_tmp
-	out_tmp: String = args.out_tmp
+	vector_tmp: String = raw_scalar_get_vector_tmp(args.temp_seed)
+	index_tmp: String = raw_scalar_get_index_tmp(args.temp_seed)
+	out_tmp: String = raw_scalar_get_out_tmp(args.temp_seed)
 	c_type: String = raw_scalar_c_type(kind)
 	vector_bind: String = "blorp_Vector* ${vector_tmp} = (blorp_Vector*)${args.tensor};"
 	index_bind: String = "long ${index_tmp} = ${args.index};"
@@ -742,8 +794,12 @@ private pure func render_tensor_alloc_sized(args: TensorAllocSizedArgs) -> Strin
 	"blorp_vector_new_sized(${args.size}, sizeof(${args.struct_ty}))"
 
 
+private pure func tensor_alloc_result_tmp(temp_seed: String) -> String:
+	"__tensor_alloc_${temp_seed}"
+
+
 private pure func render_tensor_alloc_with_release(args: TensorAllocWithReleaseArgs) -> String:
-	result_tmp: String = args.result_tmp
+	result_tmp: String = tensor_alloc_result_tmp(args.temp_seed)
 	bind_result: String = "blorp_Vector* ${result_tmp} = ${args.alloc_expr};"
 	init_release: String = "blorp_vector_init_elem_release(${result_tmp}, blorp_elem_release_fn);"
 	c_statement_expr(bind_result + " " + init_release + " " + result_tmp + ";")
@@ -788,11 +844,16 @@ private pure func render_tensor_literal_packed_write(args: TensorLiteralWriteArg
 	"blorp_packed_set(${args.tensor}, ${args.index}, (long)(${args.value}));"
 
 
+private pure func tensor_literal_inline_struct_elem_tmp(temp_seed: String) -> String:
+	"__ten_elem_${temp_seed}"
+
+
 private pure func render_tensor_literal_inline_struct_write(
 	args: TensorLiteralInlineStructWriteArgs,
 ) -> String:
+	elem_tmp: String = tensor_literal_inline_struct_elem_tmp(args.temp_seed)
 	c_block(
-		"${args.struct_ty} ${args.elem_tmp} = ${args.value}; memcpy((char*)${args.tensor}->data + ${args.index} * sizeof(${args.struct_ty}), &${args.elem_tmp}, sizeof(${args.struct_ty}));",
+		"${args.struct_ty} ${elem_tmp} = ${args.value}; memcpy((char*)${args.tensor}->data + ${args.index} * sizeof(${args.struct_ty}), &${elem_tmp}, sizeof(${args.struct_ty}));",
 	)
 
 
@@ -800,8 +861,26 @@ private pure func render_tensor_literal_boxed_write(args: TensorLiteralWriteArgs
 	"${args.tensor}->data[${args.index}] = ${args.value};"
 
 
-private pure func render_tensor_literal_boxed_retain(value: String) -> String:
-	"if (${value}) blorp_retain(${value});"
+private pure func tensor_literal_boxed_tmp(temp_seed: String) -> String:
+	"__ten_boxed_${temp_seed}"
+
+
+private pure func render_tensor_literal_boxed_owned_write(
+	args: TensorLiteralBoxedSeededWriteArgs,
+) -> String:
+	value_tmp: String = tensor_literal_boxed_tmp(args.temp_seed)
+	c_block(
+		"void* ${value_tmp} = ${args.value}; ${args.tensor}->data[${args.index}] = ${value_tmp};",
+	)
+
+
+private pure func render_tensor_literal_boxed_borrowed_write(
+	args: TensorLiteralBoxedSeededWriteArgs,
+) -> String:
+	value_tmp: String = tensor_literal_boxed_tmp(args.temp_seed)
+	c_block(
+		"void* ${value_tmp} = ${args.value}; ${args.tensor}->data[${args.index}] = ${value_tmp}; if (${value_tmp}) blorp_retain(${value_tmp});",
+	)
 
 
 pure func render_prepared_tensor_op(op: PreparedTensorOp) -> String:
@@ -872,8 +951,10 @@ pure func render_prepared_tensor_op(op: PreparedTensorOp) -> String:
 			render_tensor_literal_inline_struct_write(args)
 		TensorLiteralBoxedWrite(args):
 			render_tensor_literal_boxed_write(args)
-		TensorLiteralBoxedRetain(value):
-			render_tensor_literal_boxed_retain(value)
+		TensorLiteralBoxedOwnedWrite(args):
+			render_tensor_literal_boxed_owned_write(args)
+		TensorLiteralBoxedBorrowedWrite(args):
+			render_tensor_literal_boxed_borrowed_write(args)
 
 
 pure func build_prepared_tensor_op(
@@ -1018,9 +1099,16 @@ pure func build_prepared_tensor_op(
 				args,
 			).to_result(wrong_arity_for_args(info, args))
 			Ok(TensorLiteralBoxedWrite(parsed))
-		TensorLiteralBoxedRetainTemplate:
-			value ?= parse_single_arg(args).to_result(wrong_arity_for_args(info, args))
-			Ok(TensorLiteralBoxedRetain(value))
+		TensorLiteralBoxedOwnedWriteTemplate:
+			parsed ?= parse_tensor_literal_boxed_seeded_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralBoxedOwnedWrite(parsed))
+		TensorLiteralBoxedBorrowedWriteTemplate:
+			parsed ?= parse_tensor_literal_boxed_seeded_write_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(TensorLiteralBoxedBorrowedWrite(parsed))
 
 
 pure func render_prepared_tensor(name: String, args: List[String]) -> Result[String, RenderError]:
@@ -1049,7 +1137,7 @@ private PLACEHOLDER_RAW_WRITE_ARGS: RawWriteArgs = {
 
 private PLACEHOLDER_STORAGE_CHECK_ARGS: StorageCheckArgs = {
 	tensor = "@0@",
-	vector_tmp = "@1@"
+	temp_seed = "@1@"
 }
 
 private PLACEHOLDER_TENSOR_INDEX_ARGS: TensorIndexArgs = {
@@ -1060,19 +1148,14 @@ private PLACEHOLDER_TENSOR_INDEX_ARGS: TensorIndexArgs = {
 private PLACEHOLDER_INLINE_STRUCT_GET_UNCHECKED_ARGS: InlineStructGetUncheckedArgs = {
 	tensor = "@0@",
 	index = "@1@",
-	vector_tmp = "@2@",
-	index_tmp = "@3@",
-	out_tmp = "@4@",
-	raw_tmp = "@5@",
-	struct_ty = "@6@"
+	temp_seed = "@2@",
+	struct_ty = "@3@"
 }
 
 private PLACEHOLDER_RAW_SCALAR_GET_UNCHECKED_ARGS: RawScalarGetUncheckedArgs = {
 	tensor = "@0@",
 	index = "@1@",
-	vector_tmp = "@2@",
-	index_tmp = "@3@",
-	out_tmp = "@4@"
+	temp_seed = "@2@"
 }
 
 private PLACEHOLDER_TENSOR_ALLOC_PACKED_ARGS: TensorAllocPackedArgs = {
@@ -1087,7 +1170,7 @@ private PLACEHOLDER_TENSOR_ALLOC_SIZED_ARGS: TensorAllocSizedArgs = {
 
 private PLACEHOLDER_TENSOR_ALLOC_WITH_RELEASE_ARGS: TensorAllocWithReleaseArgs = {
 	alloc_expr = "@0@",
-	result_tmp = "@1@"
+	temp_seed = "@1@"
 }
 
 private PLACEHOLDER_TENSOR_RANKED_ALLOC_ARGS: TensorRankedAllocArgs = {
@@ -1117,7 +1200,7 @@ private PLACEHOLDER_TENSOR_LITERAL_INLINE_STRUCT_WRITE_ARGS: TensorLiteralInline
 	tensor = "@0@",
 	index = "@1@",
 	value = "@2@",
-	elem_tmp = "@3@",
+	temp_seed = "@3@",
 	struct_ty = "@4@"
 }
 
@@ -1192,8 +1275,20 @@ private pure func placeholder_prepared_tensor_op(
 			TensorLiteralInlineStructWrite(PLACEHOLDER_TENSOR_LITERAL_INLINE_STRUCT_WRITE_ARGS)
 		TensorLiteralBoxedWriteTemplate:
 			TensorLiteralBoxedWrite(PLACEHOLDER_TENSOR_LITERAL_WRITE_ARGS)
-		TensorLiteralBoxedRetainTemplate:
-			TensorLiteralBoxedRetain("@0@")
+		TensorLiteralBoxedOwnedWriteTemplate:
+			TensorLiteralBoxedOwnedWrite({
+				tensor = "@0@",
+				index = "@1@",
+				value = "@2@",
+				temp_seed = "@3@",
+			})
+		TensorLiteralBoxedBorrowedWriteTemplate:
+			TensorLiteralBoxedBorrowedWrite({
+				tensor = "@0@",
+				index = "@1@",
+				value = "@2@",
+				temp_seed = "@3@",
+			})
 
 
 pure func render_manifest_line(info: PreparedTensorTemplateInfo) -> String:
