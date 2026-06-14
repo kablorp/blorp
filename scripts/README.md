@@ -134,10 +134,6 @@ bodies use explicit identities matching their source declaration, for example
 `builtin("std/list.__unsafe_list_get")`. Bare `builtin` function bodies are not
 allowed in `std/`.
 
-`scripts/check-memory-hardening-drift` verifies that the Phase 5 memory risk
-matrix in `docs/0.1_MEMORY_HARDENING.md` stays synchronized with the
-`scripts/test leak` roots. Matrix rows must name leak-gated coverage, and
-explicit leak roots must be represented in the matrix.
 
 ## Release Helpers
 
