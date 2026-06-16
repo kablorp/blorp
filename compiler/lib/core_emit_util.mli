@@ -129,6 +129,21 @@ val list_storage_layout_of_type :
     supported primitive widths, making invalid element widths
     unrepresentable in the emitter. *)
 
+val tensor_element_storage :
+  Core_emit_context.t ->
+  Ast.type_expr ->
+  Core_layout_type.tensor_element_storage
+(** Runtime storage layout for a tensor element type. This is the emitter's
+    explicit boundary for late tensor storage fallback queries. *)
+
+val tensor_storage_layout_of_type :
+  Core_emit_context.t -> Ast.type_expr -> Ast.loc -> Core.tensor_storage_layout
+(** Runtime storage layout for [Tensor]-like values at emission boundaries. *)
+
+val tensor_storage_layout_of_elem :
+  Core_emit_context.t -> Ast.type_expr -> Ast.loc -> Core.tensor_storage_layout
+(** Runtime storage layout for tensor elements at emission boundaries. *)
+
 module StringSet : Set.S with type elt = string
 (** Internal string-keyed collections used by the free-variable
     collection pass below. Exposed so other passes can share the
@@ -222,10 +237,6 @@ val boxed_value_needs_release :
   Core_emit_context.t -> Ast.type_expr -> Ast.loc -> bool
 (** Does a boxed value of this type need release ownership when stored
     in containers or variant fields? *)
-
-val list_element_needs_release :
-  Core_emit_context.t -> Ast.type_expr -> Ast.loc -> bool
-(** Does a List[T] need elem_release metadata for boxed T elements? *)
 
 val render_accessor : Core_emit_context.t -> string -> Core.accessor -> string
 (** Resolve an [accessor] path to a C expression string rooted at

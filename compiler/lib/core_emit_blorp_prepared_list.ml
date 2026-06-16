@@ -48,6 +48,22 @@ let alloc_template_of_layout (layout : list_storage_layout) =
   | ListInlineStructStorage c_ty ->
       InlineAllocTemplate (Printf.sprintf "sizeof(%s)" c_ty)
 
+let runtime_storage_args (layout : list_storage_layout) : string * string =
+  match layout.lsl_slots with
+  | ListPointerStorage -> ("BLORP_LIST_STORAGE_POINTER", "sizeof(void*)")
+  | ListInlineStorage width ->
+      ( "BLORP_LIST_STORAGE_INLINE",
+        string_of_int (inline_storage_width_bytes width) )
+  | ListInlineStructStorage c_ty ->
+      ("BLORP_LIST_STORAGE_INLINE", "sizeof(" ^ c_ty ^ ")")
+
+let elem_release_arg ~loc layout =
+  if
+    list_storage_layout_requires_release_or_error ~phase:Core_error.Emit ~loc
+      layout
+  then "blorp_elem_release_fn"
+  else "NULL"
+
 let render_alloc_call layout capacity_arg =
   match alloc_template_of_layout layout with
   | PointerAllocTemplate ->
@@ -55,11 +71,33 @@ let render_alloc_call layout capacity_arg =
   | InlineAllocTemplate elem_size ->
       render_template "list_alloc_inline" [ capacity_arg; elem_size ]
 
-let emit_alloc_call ctx layout capacity_arg =
-  emit ctx (render_alloc_call layout capacity_arg)
-
 let render_alloc_with_release ~alloc_expr ~result_tmp =
   render_template "list_alloc_with_release" [ alloc_expr; result_tmp ]
+
+let render_alloc_for_layout_capacity_arg ctx layout ~loc capacity_arg =
+  let alloc_expr = render_alloc_call layout capacity_arg in
+  if
+    list_storage_layout_requires_release_or_error ~phase:Core_error.Emit ~loc
+      layout
+  then
+    let result_tmp = Printf.sprintf "__lst_%d" (fresh_temp ctx) in
+    render_alloc_with_release ~alloc_expr ~result_tmp
+  else alloc_expr
+
+let emit_alloc_for_layout_capacity_arg ctx layout ~loc capacity_arg =
+  emit ctx (render_alloc_for_layout_capacity_arg ctx layout ~loc capacity_arg)
+
+let emit_alloc_for_layout ~emit_expr ctx layout ~loc capacity =
+  let capacity_arg = render_arg ~emit_expr ctx capacity in
+  emit_alloc_for_layout_capacity_arg ctx layout ~loc capacity_arg
+
+let emit_alloc_for_type_capacity_arg ctx list_ty ~loc capacity_arg =
+  let layout = Core_emit_layout.list_storage_layout_of_type ctx list_ty loc in
+  emit_alloc_for_layout_capacity_arg ctx layout ~loc capacity_arg
+
+let emit_alloc_for_type ~emit_expr ctx list_ty ~loc capacity =
+  let capacity_arg = render_arg ~emit_expr ctx capacity in
+  emit_alloc_for_type_capacity_arg ctx list_ty ~loc capacity_arg
 
 let emit_runtime_get ~emit_expr ctx ~template_name list index =
   let list_arg = render_arg ~emit_expr ctx list in
@@ -90,6 +128,38 @@ let emit_inline_struct_dynamic_load ctx ~list_tmp ~idx_tmp ~out_tmp ~struct_ty
   emit_template ctx template_name
     [ list_tmp; idx_tmp; out_tmp; temp_seed; struct_ty ]
 
+let render_inline_struct_unbox_list_name temp_seed =
+  render_template "list_inline_struct_unbox_list_name" [ temp_seed ]
+
+let render_inline_struct_unbox_index_name temp_seed =
+  render_template "list_inline_struct_unbox_index_name" [ temp_seed ]
+
+let render_inline_struct_unbox_out_name temp_seed =
+  render_template "list_inline_struct_unbox_out_name" [ temp_seed ]
+
+let emit_inline_struct_unbox_open ~emit_expr ctx ~list_tmp ~idx_tmp ~out_tmp
+    ~struct_ty get =
+  let list_arg = render_arg ~emit_expr ctx get.lg_list in
+  let index_arg = render_arg ~emit_expr ctx get.lg_index in
+  emit_template ctx "list_inline_struct_unbox_open"
+    [ list_tmp; list_arg; idx_tmp; index_arg; struct_ty; out_tmp ];
+  emit ctx " "
+
+let emit_inline_struct_unbox_close ctx ~out_tmp =
+  emit_template ctx "list_inline_struct_unbox_close" [ out_tmp ]
+
+let emit_inline_struct_unbox_get ~emit_expr ctx get ~struct_ty =
+  let temp_seed = string_of_int (fresh_temp ctx) in
+  let list_tmp = render_inline_struct_unbox_list_name temp_seed in
+  let idx_tmp = render_inline_struct_unbox_index_name temp_seed in
+  let out_tmp = render_inline_struct_unbox_out_name temp_seed in
+  emit_inline_struct_unbox_open ~emit_expr ctx ~list_tmp ~idx_tmp ~out_tmp
+    ~struct_ty get;
+  emit_inline_struct_dynamic_load ctx ~list_tmp ~idx_tmp ~out_tmp ~struct_ty
+    ~bounds:get.lg_bounds;
+  emit ctx " ";
+  emit_inline_struct_unbox_close ctx ~out_tmp
+
 let emit_inline_bits_load ctx ~list_tmp ~idx_tmp ~bits_tmp ~width =
   let width_bytes = string_of_int (inline_storage_width_bytes width) in
   emit_template ctx "list_inline_bits_load"
@@ -111,15 +181,6 @@ let emit_pointer_store ~emit_expr ~emit_boxed ctx ~template lst idx val_ =
   let template_name = pointer_store_template_name template in
   emit_template ctx template_name [ list_arg; index_arg; value_arg ]
 
-let emit_pointer_set_raw_store ~emit_expr ~emit_boxed ctx lst idx val_ =
-  emit_pointer_store ~emit_expr ~emit_boxed ctx ~template:SetRawStoreTemplate
-    lst idx val_
-
-let emit_pointer_handoff_set_owned_store ~emit_expr ~emit_boxed ctx lst idx val_
-    =
-  emit_pointer_store ~emit_expr ~emit_boxed ctx
-    ~template:HandoffSetOwnedStoreTemplate lst idx val_
-
 let emit_inline_struct_store_template ~emit_expr ctx ~template lst idx val_
     ~struct_ty =
   let temp_seed = string_of_int (fresh_temp ctx) in
@@ -133,18 +194,9 @@ let emit_inline_struct_store_template ~emit_expr ctx ~template lst idx val_
   emit_template ctx template_name
     [ list_arg; index_arg; value_arg; temp_seed; struct_ty ]
 
-let emit_inline_struct_set_raw_store ~emit_expr ctx lst idx val_ ~struct_ty =
-  emit_inline_struct_store_template ~emit_expr ctx ~template:SetRawStoreTemplate
-    lst idx val_ ~struct_ty
-
-let emit_inline_struct_handoff_set_owned_store ~emit_expr ctx lst idx val_
-    ~struct_ty =
-  emit_inline_struct_store_template ~emit_expr ctx
-    ~template:HandoffSetOwnedStoreTemplate lst idx val_ ~struct_ty
-
 let emit_store ~emit_expr ~emit_boxed ctx store_runtime lst idx val_ =
   let layout =
-    Core_layout_type.list_storage_layout_of_type ~reg:ctx.reg lst.ty lst.loc
+    Core_emit_layout.list_storage_layout_of_type ctx lst.ty lst.loc
   in
   match layout.lsl_slots with
   | ListInlineStructStorage c_ty ->
@@ -189,7 +241,7 @@ let emit_inline_struct_swap ~emit_expr ctx lst left_index right_index =
 
 let emit_swap_slots ~emit_expr ctx lst left_index right_index =
   let layout =
-    Core_layout_type.list_storage_layout_of_type ~reg:ctx.reg lst.ty lst.loc
+    Core_emit_layout.list_storage_layout_of_type ctx lst.ty lst.loc
   in
   match layout.lsl_slots with
   | ListInlineStructStorage _ ->
@@ -240,6 +292,16 @@ let emit_reuse_alloc_with_release ~emit_expr ctx lst cap =
   emit_template ctx "list_reuse_alloc_with_release"
     [ list_arg; cap_arg; temp_seed ]
 
+let emit_reuse_alloc_for_result ~emit_expr ctx result lst cap =
+  let layout =
+    Core_emit_layout.list_storage_layout_of_type ctx result.ty result.loc
+  in
+  if
+    list_storage_layout_requires_release_or_error ~phase:Core_error.Emit
+      ~loc:result.loc layout
+  then emit_reuse_alloc_with_release ~emit_expr ctx lst cap
+  else emit_reuse_alloc ~emit_expr ctx lst cap
+
 let emit_retain_for ~emit_expr ~emit_boxed ctx lst value =
   let list_arg = render_arg ~emit_expr ctx lst in
   let value_arg = render_arg ~emit_expr:emit_boxed ctx value in
@@ -247,25 +309,142 @@ let emit_retain_for ~emit_expr ~emit_boxed ctx lst value =
 
 let emit_retain_for_noop ctx = emit_template ctx "list_retain_for_noop" []
 
-let emit_construct_init_elem_release ctx ~list_tmp =
-  emit_template ctx "list_construct_init_elem_release" [ list_tmp ]
+let emit_retain_for_storage ~emit_expr ~emit_boxed ctx lst value =
+  let layout =
+    Core_emit_layout.list_storage_layout_of_type ctx lst.ty lst.loc
+  in
+  if
+    list_storage_layout_requires_retain_or_error ~phase:Core_error.Emit
+      ~loc:lst.loc layout
+  then emit_retain_for ~emit_expr ~emit_boxed ctx lst value
+  else emit_retain_for_noop ctx
 
-let emit_construct_inline_struct_set ~emit_expr ctx ~list_tmp ~index ~struct_ty
-    value =
+let render_construct_init_elem_release ~list_tmp =
+  render_template "list_construct_init_elem_release" [ list_tmp ]
+
+let render_construct_name temp_seed =
+  render_template "list_construct_name" [ temp_seed ]
+
+let render_construct ~list_tmp ~alloc_call ~statements =
+  render_template "list_construct"
+    [ list_tmp; alloc_call; String.concat " " statements ]
+
+let emit_construct ctx ~list_tmp ~alloc_call ~statements =
+  emit ctx (render_construct ~list_tmp ~alloc_call ~statements)
+
+let render_construct_inline_struct_set ~emit_expr ctx ~list_tmp ~index
+    ~struct_ty value =
   let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   let value_arg = render_arg ~emit_expr ctx value in
-  emit_template ctx "list_construct_inline_struct_set"
+  render_template "list_construct_inline_struct_set"
     [ list_tmp; string_of_int index; value_arg; temp_seed; struct_ty ]
 
-let emit_construct_set_len ctx ~list_tmp ~len =
-  emit_template ctx "list_construct_set_len" [ list_tmp; string_of_int len ]
+let render_construct_set_len ~list_tmp ~len =
+  render_template "list_construct_set_len" [ list_tmp; string_of_int len ]
 
-let emit_construct_append ~emit_boxed ctx ~list_tmp ~owned value =
+let render_construct_append ~emit_boxed ctx ~list_tmp ~owned value =
   let value_arg = render_arg ~emit_expr:emit_boxed ctx value in
   let template_name =
     if owned then "list_construct_append_owned" else "list_construct_append"
   in
-  emit_template ctx template_name [ list_tmp; value_arg ]
+  render_template template_name [ list_tmp; value_arg ]
+
+let render_handoff_capacity_name temp_seed =
+  render_template "list_handoff_capacity_name" [ temp_seed ]
+
+let render_handoff_reuse_name temp_seed =
+  render_template "list_handoff_reuse_name" [ temp_seed ]
+
+let render_handoff_release_name temp_seed =
+  render_template "list_handoff_release_name" [ temp_seed ]
+
+let emit_handoff_open ~emit_expr ctx ~source_ty_c ~source_c source ~capacity_c
+    capacity ~length_c ~release_c ~release_fn_c =
+  let source_arg = render_arg ~emit_expr ctx source in
+  let capacity_arg = render_arg ~emit_expr ctx capacity in
+  emit_template ctx "list_handoff_open"
+    [
+      source_ty_c;
+      source_c;
+      source_arg;
+      capacity_c;
+      capacity_arg;
+      length_c;
+      release_c;
+      release_fn_c;
+    ];
+  emit ctx " "
+
+let emit_handoff_begin_borrow ctx ~result_ty_c ~result_c ~capacity_c ~release_c
+    ~storage_mode_c ~elem_size_c ~out_c =
+  emit_template ctx "list_handoff_begin_borrow"
+    [
+      result_ty_c;
+      result_c;
+      capacity_c;
+      release_c;
+      storage_mode_c;
+      elem_size_c;
+      out_c;
+    ];
+  emit ctx " "
+
+let emit_handoff_begin_reuse ctx ~result_ty_c ~result_c ~source_c ~capacity_c
+    ~release_c ~storage_mode_c ~elem_size_c ~reuse_c ~out_c =
+  emit_template ctx "list_handoff_begin_reuse"
+    [
+      result_ty_c;
+      result_c;
+      source_c;
+      capacity_c;
+      release_c;
+      storage_mode_c;
+      elem_size_c;
+      reuse_c;
+      out_c;
+    ];
+  emit ctx " "
+
+let emit_handoff_finish_borrow ctx ~result_c ~out_c ~length_c =
+  emit_template ctx "list_handoff_finish_borrow" [ result_c; out_c; length_c ];
+  emit ctx " "
+
+let emit_handoff_finish_reuse ctx ~result_c ~out_c ~length_c ~reuse_c ~source_c
+    =
+  emit_template ctx "list_handoff_finish_reuse"
+    [ result_c; out_c; length_c; reuse_c; source_c ];
+  emit ctx " "
+
+let emit_handoff_close ctx ~result_c =
+  emit_template ctx "list_handoff_close" [ result_c ]
+
+let render_construct_statements ~emit_expr ~emit_boxed ctx layout ~list_tmp
+    ~elem_needs_release elems =
+  match layout.lsl_slots with
+  | ListInlineStructStorage c_ty ->
+      let writes =
+        List.mapi
+          (fun i value ->
+            render_construct_inline_struct_set ~emit_expr ctx ~list_tmp ~index:i
+              ~struct_ty:c_ty value.bsv_box.box_value)
+          elems
+      in
+      writes @ [ render_construct_set_len ~list_tmp ~len:(List.length elems) ]
+  | ListPointerStorage | ListInlineStorage _ ->
+      let init =
+        if elem_needs_release then
+          [ render_construct_init_elem_release ~list_tmp ]
+        else []
+      in
+      let appends =
+        List.map
+          (fun value ->
+            render_construct_append ~emit_boxed ctx ~list_tmp
+              ~owned:(elem_needs_release && value.bsv_transfers_ownership)
+              value)
+          elems
+      in
+      init @ appends
 
 let emit_get ~emit_expr (ctx : Core_emit_context.t) (get : list_get) : unit =
   match get.lg_layout.lsl_slots with

@@ -17,6 +17,8 @@ let render_template = Core_emit_blorp_template.render_exn manifest
 let emit_template = Core_emit_blorp_template.emit manifest
 let tensor_view_c_name v = Codegen_types.escape_c_ident (Var.to_c_name v)
 
+type fill_value_policy = KeepFillValue | ReleaseFillValue
+
 type storage_check_template =
   | WordStorageCheckTemplate
   | F64StorageCheckTemplate
@@ -74,6 +76,30 @@ let alloc_template_of_layout (layout : tensor_storage_layout) =
       PackedAllocTemplate (Core.inline_storage_width_bytes width)
   | TensorInlineStructStorage c_ty -> SizedAllocTemplate c_ty
   | TensorWordStorage | TensorBoxedStorage -> PointerAllocTemplate
+
+let runtime_storage_args (layout : tensor_storage_layout) : string * string =
+  match layout.tsl_slots with
+  | TensorRawScalarStorage TensorFloat64Elements ->
+      ("BLORP_VECTOR_STORAGE_F64", "sizeof(double)")
+  | TensorRawScalarStorage TensorFloat32Elements ->
+      ("BLORP_VECTOR_STORAGE_F32", "sizeof(float)")
+  | TensorRawScalarStorage TensorInt64Elements ->
+      ("BLORP_VECTOR_STORAGE_I64", "sizeof(long)")
+  | TensorInlineStructStorage c_ty ->
+      ("BLORP_VECTOR_STORAGE_INLINE", "sizeof(" ^ c_ty ^ ")")
+  | TensorPackedStorage _ | TensorWordStorage | TensorBoxedStorage ->
+      ("BLORP_VECTOR_STORAGE_POINTER", "sizeof(void*)")
+
+let callback_result_encoding_arg (layout : tensor_storage_layout) : string =
+  match layout.tsl_slots with
+  | TensorInlineStructStorage _ -> "BLORP_VECTOR_CALLBACK_BOXED_STRUCT"
+  | TensorRawScalarStorage TensorFloat64Elements ->
+      "BLORP_VECTOR_CALLBACK_BOXED_FLOAT"
+  | TensorRawScalarStorage TensorFloat32Elements ->
+      "BLORP_VECTOR_CALLBACK_BOXED_FLOAT32"
+  | TensorRawScalarStorage TensorInt64Elements
+  | TensorPackedStorage _ | TensorWordStorage | TensorBoxedStorage ->
+      "BLORP_VECTOR_CALLBACK_BITS"
 
 let render_alloc_template template size_arg =
   match template with
@@ -145,73 +171,242 @@ let render_literal_alloc_call layout shape =
   | TensorVectorLength n ->
       render_alloc_template (alloc_template_of_layout layout) (string_of_int n)
 
-let emit_literal_init_elem_release ctx ~tensor_tmp =
-  emit_template ctx "tensor_init_elem_release" [ tensor_tmp ]
+let render_literal_name temp_seed =
+  render_template "tensor_literal_name" [ temp_seed ]
 
-let emit_literal_write ~emit_expr ctx template ~tensor_tmp ~index value =
+let render_literal_construct ~tensor_tmp ~alloc_call ~statements =
+  render_template "tensor_literal_construct"
+    [ tensor_tmp; alloc_call; String.concat " " statements ]
+
+let emit_literal_construct ctx ~tensor_tmp ~alloc_call ~statements =
+  Core_emit_context.emit ctx
+    (render_literal_construct ~tensor_tmp ~alloc_call ~statements)
+
+let render_literal_init_elem_release ~tensor_tmp =
+  render_template "tensor_init_elem_release" [ tensor_tmp ]
+
+let render_literal_write ~emit_expr ctx template ~tensor_tmp ~index value =
   let value_arg = render_arg ~emit_expr ctx value in
-  emit_template ctx
+  render_template
     (literal_write_template_name template)
     [ tensor_tmp; string_of_int index; value_arg ]
 
-let emit_literal_f32_write ~emit_expr ctx ~tensor_tmp ~index value =
-  emit_literal_write ~emit_expr ctx LiteralF32WriteTemplate ~tensor_tmp ~index
+let render_literal_f32_write ~emit_expr ctx ~tensor_tmp ~index value =
+  render_literal_write ~emit_expr ctx LiteralF32WriteTemplate ~tensor_tmp ~index
     value
 
-let emit_literal_f64_write ~emit_expr ctx ~tensor_tmp ~index value =
-  emit_literal_write ~emit_expr ctx LiteralF64WriteTemplate ~tensor_tmp ~index
+let render_literal_f64_write ~emit_expr ctx ~tensor_tmp ~index value =
+  render_literal_write ~emit_expr ctx LiteralF64WriteTemplate ~tensor_tmp ~index
     value
 
-let emit_literal_i64_write ~emit_expr ctx ~tensor_tmp ~index value =
-  emit_literal_write ~emit_expr ctx LiteralI64WriteTemplate ~tensor_tmp ~index
+let render_literal_i64_write ~emit_expr ctx ~tensor_tmp ~index value =
+  render_literal_write ~emit_expr ctx LiteralI64WriteTemplate ~tensor_tmp ~index
     value
 
-let emit_literal_word_write ~emit_expr ctx ~tensor_tmp ~index value =
-  emit_literal_write ~emit_expr ctx LiteralWordWriteTemplate ~tensor_tmp ~index
-    value
-
-let emit_literal_packed_write ~emit_expr ctx ~tensor_tmp ~index value =
-  emit_literal_write ~emit_expr ctx LiteralPackedWriteTemplate ~tensor_tmp
+let render_literal_word_write ~emit_expr ctx ~tensor_tmp ~index value =
+  render_literal_write ~emit_expr ctx LiteralWordWriteTemplate ~tensor_tmp
     ~index value
 
-let emit_literal_inline_struct_write ~emit_expr ctx ~tensor_tmp ~index
+let render_literal_packed_write ~emit_expr ctx ~tensor_tmp ~index value =
+  render_literal_write ~emit_expr ctx LiteralPackedWriteTemplate ~tensor_tmp
+    ~index value
+
+let render_literal_inline_struct_write ~emit_expr ctx ~tensor_tmp ~index
     ~struct_ty value =
   let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   let value_arg = render_arg ~emit_expr ctx value in
-  emit_template ctx "tensor_literal_write_inline_struct"
+  render_template "tensor_literal_write_inline_struct"
     [ tensor_tmp; string_of_int index; value_arg; temp_seed; struct_ty ]
 
-let emit_literal_boxed_write_rendered ctx ~tensor_tmp ~index ~value_arg =
-  emit_template ctx "tensor_literal_write_boxed"
+let render_literal_boxed_write_rendered ~tensor_tmp ~index ~value_arg =
+  render_template "tensor_literal_write_boxed"
     [ tensor_tmp; string_of_int index; value_arg ]
 
-let emit_literal_boxed_write ~emit_boxed ctx ~tensor_tmp ~index value =
+let render_literal_boxed_write ~emit_boxed ctx ~tensor_tmp ~index value =
   let value_arg = render_arg ~emit_expr:emit_boxed ctx value in
-  emit_literal_boxed_write_rendered ctx ~tensor_tmp ~index ~value_arg
+  render_literal_boxed_write_rendered ~tensor_tmp ~index ~value_arg
 
-let emit_literal_boxed_seeded_write ~emit_boxed ctx template_name ~tensor_tmp
+let render_literal_boxed_seeded_write ~emit_boxed ctx template_name ~tensor_tmp
     ~index value =
   let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   let value_arg = render_arg ~emit_expr:emit_boxed ctx value in
-  emit_template ctx template_name
+  render_template template_name
     [ tensor_tmp; string_of_int index; value_arg; temp_seed ]
 
-let emit_literal_boxed_owned_write ~emit_boxed ctx ~tensor_tmp ~index value =
-  emit_literal_boxed_seeded_write ~emit_boxed ctx
+let render_literal_boxed_owned_write ~emit_boxed ctx ~tensor_tmp ~index value =
+  render_literal_boxed_seeded_write ~emit_boxed ctx
     "tensor_literal_write_boxed_owned" ~tensor_tmp ~index value
 
-let emit_literal_boxed_borrowed_write ~emit_boxed ctx ~tensor_tmp ~index value =
-  emit_literal_boxed_seeded_write ~emit_boxed ctx
+let render_literal_boxed_borrowed_write ~emit_boxed ctx ~tensor_tmp ~index value
+    =
+  render_literal_boxed_seeded_write ~emit_boxed ctx
     "tensor_literal_write_boxed_borrowed" ~tensor_tmp ~index value
 
-let emit_fill_alloc_call ctx loc layout ~first_dim ~total_dim =
-  Core_emit_context.emit ctx
-    (render_fill_alloc_call layout ~first_dim ~total_dim loc)
+let render_literal_statements ~emit_expr ~emit_boxed ctx ~tensor_tmp
+    ~elem_needs_release payload =
+  match payload with
+  | TensorRawElements (TensorFloat32Elements, elems) ->
+      List.mapi
+        (fun i el ->
+          render_literal_f32_write ~emit_expr ctx ~tensor_tmp ~index:i el)
+        elems
+  | TensorRawElements (TensorFloat64Elements, elems) ->
+      List.mapi
+        (fun i el ->
+          render_literal_f64_write ~emit_expr ctx ~tensor_tmp ~index:i el)
+        elems
+  | TensorRawElements (TensorInt64Elements, elems) ->
+      List.mapi
+        (fun i el ->
+          render_literal_i64_write ~emit_expr ctx ~tensor_tmp ~index:i el)
+        elems
+  | TensorWordElements elems ->
+      List.mapi
+        (fun i el ->
+          render_literal_word_write ~emit_expr ctx ~tensor_tmp ~index:i el)
+        elems
+  | TensorPackedElements (_width, elems) ->
+      List.mapi
+        (fun i el ->
+          render_literal_packed_write ~emit_expr ctx ~tensor_tmp ~index:i el)
+        elems
+  | TensorInlineStructElements (c_ty, elems) ->
+      List.mapi
+        (fun i el ->
+          render_literal_inline_struct_write ~emit_expr ctx ~tensor_tmp ~index:i
+            ~struct_ty:c_ty el)
+        elems
+  | TensorBoxedElements elems ->
+      List.mapi
+        (fun i value ->
+          if elem_needs_release then
+            if value.bsv_transfers_ownership then
+              render_literal_boxed_owned_write ~emit_boxed ctx ~tensor_tmp
+                ~index:i value
+            else
+              render_literal_boxed_borrowed_write ~emit_boxed ctx ~tensor_tmp
+                ~index:i value
+          else
+            render_literal_boxed_write ~emit_boxed ctx ~tensor_tmp ~index:i
+              value)
+        elems
+
+let fill_inline_struct_value_source value =
+  match value.desc with
+  | CBoxTyped b -> b.box_value
+  | CBox (inner, _) -> inner
+  | _ -> value
+
+let render_dim_args ~emit_expr ctx dims =
+  dims
+  |> List.map (fun dim -> ", " ^ render_arg ~emit_expr ctx dim)
+  |> String.concat ""
+
+let emit_fill_inline_struct ~emit_expr ctx function_name value dims ~struct_ty =
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+  let value_arg =
+    render_arg ~emit_expr ctx (fill_inline_struct_value_source value)
+  in
+  let dim_args = render_dim_args ~emit_expr ctx dims in
+  emit_template ctx "tensor_fill_inline_struct"
+    [ function_name; value_arg; dim_args; temp_seed; struct_ty ]
+
+let emit_fill_boxed ~emit_expr ~emit_boxed ctx function_name value dims
+    ~fill_value_policy =
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+  let value_arg = render_arg ~emit_expr:emit_boxed ctx value in
+  let dim_args = render_dim_args ~emit_expr ctx dims in
+  let template_name =
+    match fill_value_policy with
+    | KeepFillValue -> "tensor_fill_boxed"
+    | ReleaseFillValue -> "tensor_fill_boxed_release_value"
+  in
+  emit_template ctx template_name
+    [ function_name; value_arg; dim_args; temp_seed ]
+
+let render_fill_dim_name temp_seed index =
+  render_template "tensor_fill_dim_name" [ temp_seed; string_of_int index ]
+
+let render_fill_total_name temp_seed =
+  render_template "tensor_fill_total_name" [ temp_seed ]
+
+let render_fill_dim_bind ~emit_expr ctx temp_seed index dim =
+  let dim_arg = render_arg ~emit_expr ctx dim in
+  render_template "tensor_fill_dim_bind"
+    [ temp_seed; string_of_int index; dim_arg ]
+
+let render_fill_total_expr dim_tmps =
+  let rec product = function
+    | [] -> "0"
+    | [ dim ] -> dim
+    | dim :: rest -> Printf.sprintf "(%s * %s)" dim (product rest)
+  in
+  product dim_tmps
+
+let emit_direct_fill_factory ~emit_expr ctx loc (layout : tensor_storage_layout)
+    value dims =
+  match (layout.tsl_slots, dims) with
+  | (TensorRawScalarStorage _ | TensorPackedStorage _), [] ->
+      Core_error.errorf Core_error.Emit loc
+        ~hint:
+          "tensor fill factories should carry at least the first dimension by \
+           the time they reach C emission"
+        "malformed tensor fill factory call"
+  | (TensorRawScalarStorage _ | TensorPackedStorage _), _ :: _ -> (
+      let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+      let dim_bindings =
+        dims
+        |> List.mapi (render_fill_dim_bind ~emit_expr ctx temp_seed)
+        |> String.concat " "
+      in
+      let dim_tmps =
+        List.mapi (fun i _ -> render_fill_dim_name temp_seed i) dims
+      in
+      let total_expr = render_fill_total_expr dim_tmps in
+      let total_tmp = render_fill_total_name temp_seed in
+      let first_dim = render_fill_dim_name temp_seed 0 in
+      let value_arg =
+        render_arg ~emit_expr ctx (fill_inline_struct_value_source value)
+      in
+      let alloc_expr =
+        render_fill_alloc_call layout ~first_dim ~total_dim:total_tmp loc
+      in
+      match layout.tsl_slots with
+      | TensorRawScalarStorage raw_kind ->
+          let value_c_type =
+            (Core_layout_type.tensor_raw_scalar_abi raw_kind).tras_c_type
+          in
+          emit_template ctx "tensor_fill_raw_scalar"
+            [
+              dim_bindings;
+              total_expr;
+              value_c_type;
+              value_arg;
+              alloc_expr;
+              temp_seed;
+            ]
+      | TensorPackedStorage _ ->
+          emit_template ctx "tensor_fill_packed"
+            [ dim_bindings; total_expr; value_arg; alloc_expr; temp_seed ]
+      | TensorInlineStructStorage _ | TensorWordStorage | TensorBoxedStorage ->
+          Core_error.errorf Core_error.Emit loc
+            ~hint:
+              "Only raw numeric and packed tensor fill factories are emitted \
+               by this path; boxed and inline-struct tensors use their \
+               dedicated ownership-aware emitters."
+            "unsupported tensor fill storage layout: %s"
+            (tensor_storage_slot_layout_str layout.tsl_slots))
+  | (TensorInlineStructStorage _ | TensorWordStorage | TensorBoxedStorage), _ ->
+      Core_error.errorf Core_error.Emit loc
+        ~hint:
+          "Only raw numeric and packed tensor fill factories are emitted by \
+           this path; boxed and inline-struct tensors use their dedicated \
+           ownership-aware emitters."
+        "unsupported tensor fill storage layout: %s"
+        (tensor_storage_slot_layout_str layout.tsl_slots)
 
 let emit_alloc ~emit_expr (ctx : Core_emit_context.t) (e : core) size : unit =
-  let layout =
-    Core_layout_type.tensor_storage_layout_of_type ~reg:ctx.reg e.ty e.loc
-  in
+  let layout = Core_emit_layout.tensor_storage_layout_of_type ctx e.ty e.loc in
   let requires_release =
     tensor_storage_layout_requires_release_or_error ~phase:Core_error.Emit
       ~loc:e.loc layout
@@ -285,12 +480,144 @@ let emit_data_pointer_get_unchecked ~emit_expr ctx tensor index =
   emit_template ctx "tensor_data_pointer_get_unchecked"
     [ tensor_arg; index_arg ]
 
+let render_inline_struct_get_unchecked ctx ~tensor_arg ~index_arg ~struct_ty =
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+  render_template "tensor_inline_struct_get_unchecked"
+    [ tensor_arg; index_arg; temp_seed; struct_ty ]
+
 let emit_inline_struct_get_unchecked ~emit_expr ctx tensor index ~struct_ty =
   let tensor_arg = render_arg ~emit_expr ctx tensor in
   let index_arg = render_arg ~emit_expr ctx index in
+  Core_emit_context.emit ctx
+    (render_inline_struct_get_unchecked ctx ~tensor_arg ~index_arg ~struct_ty)
+
+let emit_inline_struct_get_checked ~emit_expr ctx tensor index ~struct_ty =
+  let tensor_arg = render_arg ~emit_expr ctx tensor in
+  let index_arg = render_arg ~emit_expr ctx index in
   let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  emit_template ctx "tensor_inline_struct_get_unchecked"
+  emit_template ctx "tensor_inline_struct_get_checked"
     [ tensor_arg; index_arg; temp_seed; struct_ty ]
+
+let emit_inline_struct_matrix_get_checked ~emit_expr ctx tensor row col
+    ~struct_ty =
+  let tensor_arg = render_arg ~emit_expr ctx tensor in
+  let row_arg = render_arg ~emit_expr ctx row in
+  let col_arg = render_arg ~emit_expr ctx col in
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+  emit_template ctx "tensor_inline_struct_matrix_get_checked"
+    [ tensor_arg; row_arg; col_arg; temp_seed; struct_ty ]
+
+let emit_stack_option_vector_get ~emit_expr ctx
+    (abi : Core_layout_type.generated_stack_option_get_abi) tensor index =
+  let tensor_arg = render_arg ~emit_expr ctx tensor in
+  let index_arg = render_arg ~emit_expr ctx index in
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+  match abi.gsog_payload_storage with
+  | Core_layout_type.GeneratedStackOptionValueRecord payload_c_type ->
+      emit_template ctx "tensor_stack_option_vector_get_value_record"
+        [
+          tensor_arg;
+          index_arg;
+          temp_seed;
+          abi.gsog_option_c_type;
+          payload_c_type;
+          abi.gsog_none_value;
+        ]
+  | Core_layout_type.GeneratedStackOptionLong ->
+      emit_template ctx "tensor_stack_option_vector_get_long"
+        [
+          tensor_arg;
+          index_arg;
+          temp_seed;
+          abi.gsog_option_c_type;
+          abi.gsog_none_value;
+        ]
+  | Core_layout_type.GeneratedStackOptionInt128 ->
+      emit_template ctx "tensor_stack_option_vector_get_int128"
+        [
+          tensor_arg;
+          index_arg;
+          temp_seed;
+          abi.gsog_option_c_type;
+          abi.gsog_none_value;
+        ]
+  | Core_layout_type.GeneratedStackOptionUInt128 ->
+      emit_template ctx "tensor_stack_option_vector_get_uint128"
+        [
+          tensor_arg;
+          index_arg;
+          temp_seed;
+          abi.gsog_option_c_type;
+          abi.gsog_none_value;
+        ]
+
+let emit_stack_option_matrix_get ~emit_expr ctx
+    (abi : Core_layout_type.generated_stack_option_get_abi) tensor row col =
+  let tensor_arg = render_arg ~emit_expr ctx tensor in
+  let row_arg = render_arg ~emit_expr ctx row in
+  let col_arg = render_arg ~emit_expr ctx col in
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+  match abi.gsog_payload_storage with
+  | Core_layout_type.GeneratedStackOptionValueRecord payload_c_type ->
+      emit_template ctx "tensor_stack_option_matrix_get_value_record"
+        [
+          tensor_arg;
+          row_arg;
+          col_arg;
+          temp_seed;
+          abi.gsog_option_c_type;
+          payload_c_type;
+          abi.gsog_none_value;
+        ]
+  | Core_layout_type.GeneratedStackOptionLong ->
+      emit_template ctx "tensor_stack_option_matrix_get_long"
+        [
+          tensor_arg;
+          row_arg;
+          col_arg;
+          temp_seed;
+          abi.gsog_option_c_type;
+          abi.gsog_none_value;
+        ]
+  | Core_layout_type.GeneratedStackOptionInt128 ->
+      emit_template ctx "tensor_stack_option_matrix_get_int128"
+        [
+          tensor_arg;
+          row_arg;
+          col_arg;
+          temp_seed;
+          abi.gsog_option_c_type;
+          abi.gsog_none_value;
+        ]
+  | Core_layout_type.GeneratedStackOptionUInt128 ->
+      emit_template ctx "tensor_stack_option_matrix_get_uint128"
+        [
+          tensor_arg;
+          row_arg;
+          col_arg;
+          temp_seed;
+          abi.gsog_option_c_type;
+          abi.gsog_none_value;
+        ]
+
+let emit_inline_struct_element_decl ctx ~var_c ~tensor_c ~index_c ~struct_ty =
+  let value =
+    render_inline_struct_get_unchecked ctx ~tensor_arg:tensor_c
+      ~index_arg:index_c ~struct_ty
+  in
+  Core_emit_context.emit_line ctx
+    (Printf.sprintf "%s %s = %s;" struct_ty var_c value)
+
+let emit_get_unchecked ~emit_expr (ctx : Core_emit_context.t) result tensor
+    index =
+  match Core_emit_layout.tensor_element_storage ctx result.ty with
+  | Core_layout_type.TensorElementInlineStruct c_ty ->
+      emit_inline_struct_get_unchecked ~emit_expr ctx tensor index
+        ~struct_ty:c_ty
+  | Core_layout_type.TensorElementRawScalar _
+  | Core_layout_type.TensorElementPackedBits _
+  | Core_layout_type.TensorElementBoxed ->
+      emit_data_pointer_get_unchecked ~emit_expr ctx tensor index
 
 let emit_raw_scalar_get_unchecked ~emit_expr ctx template tensor index =
   let tensor_arg = render_arg ~emit_expr ctx tensor in

@@ -1,0 +1,22 @@
+(** Leaf layout helpers shared by Core emit utilities and Blorp-owned prepared
+    renderers.
+
+    This module intentionally depends only on layout/type facts, not on
+    [Core_emit_util] or backend emission modules. Keeping it low in the
+    dependency graph lets the single Blorp backend facade depend on prepared
+    renderers without creating cycles through shared emitter utilities. *)
+
+let list_storage_layout_of_type (ctx : Core_emit_context.t)
+    (list_ty : Ast.type_expr) (loc : Ast.loc) : Core.list_storage_layout =
+  Core_layout_type.list_storage_layout_of_type ~reg:ctx.reg list_ty loc
+
+let tensor_element_storage (ctx : Core_emit_context.t) elem_ty =
+  Core_layout_type.tensor_element_storage ~reg:ctx.reg elem_ty
+
+let tensor_storage_layout_of_type (ctx : Core_emit_context.t)
+    (tensor_ty : Ast.type_expr) (loc : Ast.loc) : Core.tensor_storage_layout =
+  Core_layout_type.tensor_storage_layout_of_type ~reg:ctx.reg tensor_ty loc
+
+let tensor_storage_layout_of_elem (ctx : Core_emit_context.t)
+    (elem_ty : Ast.type_expr) (loc : Ast.loc) : Core.tensor_storage_layout =
+  Core_layout_type.tensor_storage_layout_of_elem ~reg:ctx.reg elem_ty loc

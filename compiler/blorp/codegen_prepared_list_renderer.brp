@@ -1,8 +1,8 @@
 -- Blorp-authored renderer for prepared list Core nodes.
 --
 -- OCaml still owns Core traversal, child expression emission, layout metadata,
--- and fresh temp seeds/names. This module owns the final C snippet shape for
--- prepared list operations.
+-- and fresh temp seeds. This module owns the final C snippet shape and temp
+-- names for prepared list operations.
 enum CompilerCommand:
 	RenderPreparedListCommand
 	RenderManifestCommand
@@ -26,6 +26,11 @@ enum PreparedListTemplate:
 	ListInlineStructSwapTemplate
 	ListInlineStructLoadCheckedTemplate
 	ListInlineStructLoadProvenTemplate
+	ListInlineStructUnboxListNameTemplate
+	ListInlineStructUnboxIndexNameTemplate
+	ListInlineStructUnboxOutNameTemplate
+	ListInlineStructUnboxOpenTemplate
+	ListInlineStructUnboxCloseTemplate
 	ListHandoffSetSourceSlotTemplate
 	ListCopySpanUninitTemplate
 	ListEnsureUniqueTemplate
@@ -37,11 +42,22 @@ enum PreparedListTemplate:
 	ListAllocWithReleaseTemplate
 	ListRetainForTemplate
 	ListRetainForNoopTemplate
+	ListConstructNameTemplate
+	ListConstructTemplate
 	ListConstructInitElemReleaseTemplate
 	ListConstructInlineStructSetTemplate
 	ListConstructSetLenTemplate
 	ListConstructAppendTemplate
 	ListConstructAppendOwnedTemplate
+	ListHandoffCapacityNameTemplate
+	ListHandoffReuseNameTemplate
+	ListHandoffReleaseNameTemplate
+	ListHandoffOpenTemplate
+	ListHandoffBeginBorrowTemplate
+	ListHandoffBeginReuseTemplate
+	ListHandoffFinishBorrowTemplate
+	ListHandoffFinishReuseTemplate
+	ListHandoffCloseTemplate
 
 
 record PreparedListTemplateInfo {
@@ -209,9 +225,78 @@ record ListConstructInlineStructSetArgs {
 }
 
 
+record ListConstructArgs {
+	list: String,
+	alloc_expr: String,
+	statements: String
+}
+
+
 record ListConstructAppendArgs {
 	list: String,
 	value: String
+}
+
+
+record ListHandoffOpenArgs {
+	source_ty: String,
+	source: String,
+	source_expr: String,
+	capacity: String,
+	capacity_expr: String,
+	length: String,
+	release: String,
+	release_fn: String
+}
+
+
+record ListHandoffBeginBorrowArgs {
+	result_ty: String,
+	result: String,
+	capacity: String,
+	release: String,
+	storage_mode: String,
+	elem_size: String,
+	out: String
+}
+
+
+record ListHandoffBeginReuseArgs {
+	result_ty: String,
+	result: String,
+	source: String,
+	capacity: String,
+	release: String,
+	storage_mode: String,
+	elem_size: String,
+	reuse: String,
+	out: String
+}
+
+
+record ListHandoffFinishBorrowArgs {
+	result: String,
+	out: String,
+	length: String
+}
+
+
+record ListHandoffFinishReuseArgs {
+	result: String,
+	out: String,
+	length: String,
+	reuse: String,
+	source: String
+}
+
+
+record ListInlineStructUnboxOpenArgs {
+	list: String,
+	list_expr: String,
+	index: String,
+	index_expr: String,
+	struct_ty: String,
+	out: String
 }
 
 
@@ -230,6 +315,11 @@ union PreparedListOp:
 	InlineStructSwap(InlineStructSwapArgs)
 	InlineStructLoadChecked(InlineStructLoadArgs)
 	InlineStructLoadProven(InlineStructLoadArgs)
+	ListInlineStructUnboxListName(String)
+	ListInlineStructUnboxIndexName(String)
+	ListInlineStructUnboxOutName(String)
+	ListInlineStructUnboxOpen(ListInlineStructUnboxOpenArgs)
+	ListInlineStructUnboxClose(String)
 	HandoffSetSourceSlot(SourceSlotHandoffArgs)
 	CopySpanUninit(CopySpanUninitArgs)
 	EnsureUnique(EnsureUniqueArgs)
@@ -241,11 +331,22 @@ union PreparedListOp:
 	ListAllocWithRelease(ListAllocWithReleaseArgs)
 	RetainFor(RetainForArgs)
 	RetainForNoop
+	ListConstructName(String)
+	ListConstruct(ListConstructArgs)
 	ListConstructInitElemRelease(String)
 	ListConstructInlineStructSet(ListConstructInlineStructSetArgs)
 	ListConstructSetLen(String, String)
 	ListConstructAppend(ListConstructAppendArgs)
 	ListConstructAppendOwned(ListConstructAppendArgs)
+	ListHandoffCapacityName(String)
+	ListHandoffReuseName(String)
+	ListHandoffReleaseName(String)
+	ListHandoffOpen(ListHandoffOpenArgs)
+	ListHandoffBeginBorrow(ListHandoffBeginBorrowArgs)
+	ListHandoffBeginReuse(ListHandoffBeginReuseArgs)
+	ListHandoffFinishBorrow(ListHandoffFinishBorrowArgs)
+	ListHandoffFinishReuse(ListHandoffFinishReuseArgs)
+	ListHandoffClose(String)
 
 
 union RenderError:
@@ -318,6 +419,26 @@ ALL_TEMPLATES: List[PreparedListTemplateInfo] = [{
 		name = "list_inline_struct_load_proven",
 		arity = 5
 	}, {
+		template = ListInlineStructUnboxListNameTemplate,
+		name = "list_inline_struct_unbox_list_name",
+		arity = 1
+	}, {
+		template = ListInlineStructUnboxIndexNameTemplate,
+		name = "list_inline_struct_unbox_index_name",
+		arity = 1
+	}, {
+		template = ListInlineStructUnboxOutNameTemplate,
+		name = "list_inline_struct_unbox_out_name",
+		arity = 1
+	}, {
+		template = ListInlineStructUnboxOpenTemplate,
+		name = "list_inline_struct_unbox_open",
+		arity = 6
+	}, {
+		template = ListInlineStructUnboxCloseTemplate,
+		name = "list_inline_struct_unbox_close",
+		arity = 1
+	}, {
 		template = ListHandoffSetSourceSlotTemplate,
 		name = "list_handoff_set_source_slot",
 		arity = 4
@@ -362,6 +483,14 @@ ALL_TEMPLATES: List[PreparedListTemplateInfo] = [{
 		name = "list_retain_for_noop",
 		arity = 0
 	}, {
+		template = ListConstructNameTemplate,
+		name = "list_construct_name",
+		arity = 1
+	}, {
+		template = ListConstructTemplate,
+		name = "list_construct",
+		arity = 3
+	}, {
 		template = ListConstructInitElemReleaseTemplate,
 		name = "list_construct_init_elem_release",
 		arity = 1
@@ -381,6 +510,42 @@ ALL_TEMPLATES: List[PreparedListTemplateInfo] = [{
 		template = ListConstructAppendOwnedTemplate,
 		name = "list_construct_append_owned",
 		arity = 2
+	}, {
+		template = ListHandoffCapacityNameTemplate,
+		name = "list_handoff_capacity_name",
+		arity = 1
+	}, {
+		template = ListHandoffReuseNameTemplate,
+		name = "list_handoff_reuse_name",
+		arity = 1
+	}, {
+		template = ListHandoffReleaseNameTemplate,
+		name = "list_handoff_release_name",
+		arity = 1
+	}, {
+		template = ListHandoffOpenTemplate,
+		name = "list_handoff_open",
+		arity = 8
+	}, {
+		template = ListHandoffBeginBorrowTemplate,
+		name = "list_handoff_begin_borrow",
+		arity = 7
+	}, {
+		template = ListHandoffBeginReuseTemplate,
+		name = "list_handoff_begin_reuse",
+		arity = 9
+	}, {
+		template = ListHandoffFinishBorrowTemplate,
+		name = "list_handoff_finish_borrow",
+		arity = 3
+	}, {
+		template = ListHandoffFinishReuseTemplate,
+		name = "list_handoff_finish_reuse",
+		arity = 5
+	}, {
+		template = ListHandoffCloseTemplate,
+		name = "list_handoff_close",
+		arity = 1
 	}]
 
 USAGE: String = (
@@ -701,6 +866,26 @@ private pure func parse_retain_for_noop(args: List[String]) -> Option[PreparedLi
 			None
 
 
+private pure func parse_list_construct_args(args: List[String]) -> Option[ListConstructArgs]:
+	match args:
+		[list, alloc_expr, statements]:
+			Some({
+				list = list,
+				alloc_expr = alloc_expr,
+				statements = statements,
+			})
+		_:
+			None
+
+
+private pure func parse_list_construct_name_arg(args: List[String]) -> Option[String]:
+	match args:
+		[temp_seed]:
+			Some(temp_seed)
+		_:
+			None
+
+
 private pure func parse_list_construct_init_elem_release_arg(args: List[String]) -> Option[String]:
 	match args:
 		[list]:
@@ -741,6 +926,124 @@ private pure func parse_list_construct_append_args(
 			Some({
 				list = list,
 				value = value,
+			})
+		_:
+			None
+
+
+private pure func parse_list_handoff_name_arg(args: List[String]) -> Option[String]:
+	match args:
+		[temp_seed]:
+			Some(temp_seed)
+		_:
+			None
+
+
+private pure func parse_list_inline_struct_unbox_name_arg(args: List[String]) -> Option[String]:
+	match args:
+		[temp_seed]:
+			Some(temp_seed)
+		_:
+			None
+
+
+private pure func parse_list_inline_struct_unbox_open_args(
+	args: List[String],
+) -> Option[ListInlineStructUnboxOpenArgs]:
+	match args:
+		[list, list_expr, index, index_expr, struct_ty, out]:
+			Some({
+				list = list,
+				list_expr = list_expr,
+				index = index,
+				index_expr = index_expr,
+				struct_ty = struct_ty,
+				out = out,
+			})
+		_:
+			None
+
+
+private pure func parse_list_handoff_open_args(args: List[String]) -> Option[ListHandoffOpenArgs]:
+	match args:
+		[source_ty, source, source_expr, capacity, capacity_expr, length, release, release_fn]:
+			Some({
+				source_ty = source_ty,
+				source = source,
+				source_expr = source_expr,
+				capacity = capacity,
+				capacity_expr = capacity_expr,
+				length = length,
+				release = release,
+				release_fn = release_fn,
+			})
+		_:
+			None
+
+
+private pure func parse_list_handoff_begin_borrow_args(
+	args: List[String],
+) -> Option[ListHandoffBeginBorrowArgs]:
+	match args:
+		[result_ty, result, capacity, release, storage_mode, elem_size, out]:
+			Some({
+				result_ty = result_ty,
+				result = result,
+				capacity = capacity,
+				release = release,
+				storage_mode = storage_mode,
+				elem_size = elem_size,
+				out = out,
+			})
+		_:
+			None
+
+
+private pure func parse_list_handoff_begin_reuse_args(
+	args: List[String],
+) -> Option[ListHandoffBeginReuseArgs]:
+	match args:
+		[result_ty, result, source, capacity, release, storage_mode, elem_size, reuse, out]:
+			Some({
+				result_ty = result_ty,
+				result = result,
+				source = source,
+				capacity = capacity,
+				release = release,
+				storage_mode = storage_mode,
+				elem_size = elem_size,
+				reuse = reuse,
+				out = out,
+			})
+		_:
+			None
+
+
+private pure func parse_list_handoff_finish_borrow_args(
+	args: List[String],
+) -> Option[ListHandoffFinishBorrowArgs]:
+	match args:
+		[result, out, length]:
+			Some({
+				result = result,
+				out = out,
+				length = length,
+			})
+		_:
+			None
+
+
+private pure func parse_list_handoff_finish_reuse_args(
+	args: List[String],
+) -> Option[ListHandoffFinishReuseArgs]:
+	match args:
+		[result, out, length, reuse, source]:
+			Some({
+				result = result,
+				out = out,
+				length = length,
+				reuse = reuse,
+				source = source,
 			})
 		_:
 			None
@@ -813,6 +1116,10 @@ private pure func ensure_capacity_min_tmp(temp_seed: String) -> String:
 
 
 private pure func reuse_alloc_result_tmp(temp_seed: String) -> String:
+	"__lst_${temp_seed}"
+
+
+private pure func list_construct_tmp(temp_seed: String) -> String:
 	"__lst_${temp_seed}"
 
 
@@ -1030,6 +1337,22 @@ private pure func render_retain_for(args: RetainForArgs) -> String:
 private RETAIN_FOR_NOOP_RENDERED: String = "((void)0)"
 
 
+private pure func render_list_construct_name(temp_seed: String) -> String:
+	list_construct_tmp(temp_seed)
+
+
+private pure func list_construct_statements_with_separator(statements: String) -> String:
+	if statements == "":
+		""
+	else:
+		statements + " "
+
+
+private pure func render_list_construct(args: ListConstructArgs) -> String:
+	statements: String = list_construct_statements_with_separator(args.statements)
+	c_statement_expr("blorp_List* ${args.list} = ${args.alloc_expr}; ${statements}${args.list};")
+
+
 private pure func render_list_construct_init_elem_release(list: String) -> String:
 	"blorp_list_init_elem_release(${list}, blorp_elem_release_fn);"
 
@@ -1052,6 +1375,92 @@ private pure func render_list_construct_append(args: ListConstructAppendArgs) ->
 
 private pure func render_list_construct_append_owned(args: ListConstructAppendArgs) -> String:
 	"${args.list} = blorp_list_append_owned(${args.list}, ${args.value});"
+
+
+private pure func render_list_handoff_capacity_name(temp_seed: String) -> String:
+	"__lh_cap_${temp_seed}"
+
+
+private pure func render_list_handoff_reuse_name(temp_seed: String) -> String:
+	"__lh_reuse_${temp_seed}"
+
+
+private pure func render_list_handoff_release_name(temp_seed: String) -> String:
+	"__lh_release_${temp_seed}"
+
+
+private pure func render_list_handoff_open(args: ListHandoffOpenArgs) -> String:
+	(
+		"({ " + args.source_ty + " " + args.source + " = " + args.source_expr
+		+ "; long " + args.capacity + " = " + args.capacity_expr + "; "
+		+ "long " + args.length + " = " + args.source + " ? ((blorp_List*)" + args.source
+		+ ")->len : 0L; "
+		+ "void (*" + args.release + ")(void*) = " + args.release_fn + ";"
+	)
+
+
+private pure func render_list_handoff_begin_borrow(args: ListHandoffBeginBorrowArgs) -> String:
+	(
+		args.result_ty + " " + args.result + " = (" + args.result_ty
+		+ ")blorp_list_handoff_begin_borrow(" + args.capacity + ", " + args.release
+		+ ", " + args.storage_mode + ", " + args.elem_size + "); long " + args.out + " = 0L;"
+	)
+
+
+private pure func render_list_handoff_begin_reuse(args: ListHandoffBeginReuseArgs) -> String:
+	(
+		"bool " + args.reuse + " = false; " + args.result_ty + " " + args.result
+		+ " = (" + args.result_ty + ")blorp_list_handoff_begin_reuse((blorp_List*)"
+		+ args.source + ", " + args.capacity + ", " + args.release + ", "
+		+ args.storage_mode + ", " + args.elem_size + ", &" + args.reuse
+		+ "); long " + args.out + " = 0L;"
+	)
+
+
+private pure func render_list_handoff_finish_borrow(args: ListHandoffFinishBorrowArgs) -> String:
+	(
+		"blorp_list_handoff_finish((blorp_List*)" + args.result + ", " + args.out
+		+ ", " + args.length + ", false, NULL);"
+	)
+
+
+private pure func render_list_handoff_finish_reuse(args: ListHandoffFinishReuseArgs) -> String:
+	(
+		"blorp_list_handoff_finish((blorp_List*)" + args.result
+		+ ", " + args.out + ", " + args.length + ", " + args.reuse + ", (blorp_List*)"
+		+ args.source
+		+ ");"
+	)
+
+
+private pure func render_list_handoff_close(result: String) -> String:
+	"${result}; })"
+
+
+private pure func render_list_inline_struct_unbox_list_name(temp_seed: String) -> String:
+	"__lg_list_${temp_seed}"
+
+
+private pure func render_list_inline_struct_unbox_index_name(temp_seed: String) -> String:
+	"__lg_idx_${temp_seed}"
+
+
+private pure func render_list_inline_struct_unbox_out_name(temp_seed: String) -> String:
+	"__lg_out_${temp_seed}"
+
+
+private pure func render_list_inline_struct_unbox_open(
+	args: ListInlineStructUnboxOpenArgs,
+) -> String:
+	(
+		"({ blorp_List* " + args.list + " = (blorp_List*)" + args.list_expr
+		+ "; long " + args.index + " = " + args.index_expr + "; "
+		+ args.struct_ty + " " + args.out + ";"
+	)
+
+
+private pure func render_list_inline_struct_unbox_close(out: String) -> String:
+	"${out}; })"
 
 
 private pure func render_pointer_swap_body(
@@ -1238,6 +1647,16 @@ pure func render_prepared_list_op(op: PreparedListOp) -> String:
 			render_inline_struct_checked_load(args)
 		InlineStructLoadProven(args):
 			render_inline_struct_load_body(args)
+		ListInlineStructUnboxListName(temp_seed):
+			render_list_inline_struct_unbox_list_name(temp_seed)
+		ListInlineStructUnboxIndexName(temp_seed):
+			render_list_inline_struct_unbox_index_name(temp_seed)
+		ListInlineStructUnboxOutName(temp_seed):
+			render_list_inline_struct_unbox_out_name(temp_seed)
+		ListInlineStructUnboxOpen(args):
+			render_list_inline_struct_unbox_open(args)
+		ListInlineStructUnboxClose(out):
+			render_list_inline_struct_unbox_close(out)
 		HandoffSetSourceSlot(args):
 			render_handoff_source_slot(args)
 		CopySpanUninit(args):
@@ -1260,6 +1679,10 @@ pure func render_prepared_list_op(op: PreparedListOp) -> String:
 			render_retain_for(args)
 		RetainForNoop:
 			RETAIN_FOR_NOOP_RENDERED
+		ListConstructName(temp_seed):
+			render_list_construct_name(temp_seed)
+		ListConstruct(args):
+			render_list_construct(args)
 		ListConstructInitElemRelease(list):
 			render_list_construct_init_elem_release(list)
 		ListConstructInlineStructSet(args):
@@ -1270,6 +1693,24 @@ pure func render_prepared_list_op(op: PreparedListOp) -> String:
 			render_list_construct_append(args)
 		ListConstructAppendOwned(args):
 			render_list_construct_append_owned(args)
+		ListHandoffCapacityName(temp_seed):
+			render_list_handoff_capacity_name(temp_seed)
+		ListHandoffReuseName(temp_seed):
+			render_list_handoff_reuse_name(temp_seed)
+		ListHandoffReleaseName(temp_seed):
+			render_list_handoff_release_name(temp_seed)
+		ListHandoffOpen(args):
+			render_list_handoff_open(args)
+		ListHandoffBeginBorrow(args):
+			render_list_handoff_begin_borrow(args)
+		ListHandoffBeginReuse(args):
+			render_list_handoff_begin_reuse(args)
+		ListHandoffFinishBorrow(args):
+			render_list_handoff_finish_borrow(args)
+		ListHandoffFinishReuse(args):
+			render_list_handoff_finish_reuse(args)
+		ListHandoffClose(result):
+			render_list_handoff_close(result)
 
 
 pure func build_prepared_list_op(
@@ -1343,6 +1784,31 @@ pure func build_prepared_list_op(
 				args,
 			).to_result(wrong_arity_for_args(info, args))
 			Ok(InlineStructLoadProven(parsed))
+		ListInlineStructUnboxListNameTemplate:
+			temp_seed ?= parse_list_inline_struct_unbox_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListInlineStructUnboxListName(temp_seed))
+		ListInlineStructUnboxIndexNameTemplate:
+			temp_seed ?= parse_list_inline_struct_unbox_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListInlineStructUnboxIndexName(temp_seed))
+		ListInlineStructUnboxOutNameTemplate:
+			temp_seed ?= parse_list_inline_struct_unbox_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListInlineStructUnboxOutName(temp_seed))
+		ListInlineStructUnboxOpenTemplate:
+			parsed ?= parse_list_inline_struct_unbox_open_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListInlineStructUnboxOpen(parsed))
+		ListInlineStructUnboxCloseTemplate:
+			out ?= parse_list_inline_struct_unbox_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListInlineStructUnboxClose(out))
 		ListHandoffSetSourceSlotTemplate:
 			parsed ?= parse_source_slot_handoff_args(
 				args,
@@ -1384,6 +1850,14 @@ pure func build_prepared_list_op(
 		ListRetainForNoopTemplate:
 			op ?= parse_retain_for_noop(args).to_result(wrong_arity_for_args(info, args))
 			Ok(op)
+		ListConstructNameTemplate:
+			temp_seed ?= parse_list_construct_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListConstructName(temp_seed))
+		ListConstructTemplate:
+			parsed ?= parse_list_construct_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(ListConstruct(parsed))
 		ListConstructInitElemReleaseTemplate:
 			list ?= parse_list_construct_init_elem_release_arg(
 				args,
@@ -1409,6 +1883,49 @@ pure func build_prepared_list_op(
 				args,
 			).to_result(wrong_arity_for_args(info, args))
 			Ok(ListConstructAppendOwned(parsed))
+		ListHandoffCapacityNameTemplate:
+			temp_seed ?= parse_list_handoff_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffCapacityName(temp_seed))
+		ListHandoffReuseNameTemplate:
+			temp_seed ?= parse_list_handoff_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffReuseName(temp_seed))
+		ListHandoffReleaseNameTemplate:
+			temp_seed ?= parse_list_handoff_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffReleaseName(temp_seed))
+		ListHandoffOpenTemplate:
+			parsed ?= parse_list_handoff_open_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffOpen(parsed))
+		ListHandoffBeginBorrowTemplate:
+			parsed ?= parse_list_handoff_begin_borrow_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffBeginBorrow(parsed))
+		ListHandoffBeginReuseTemplate:
+			parsed ?= parse_list_handoff_begin_reuse_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffBeginReuse(parsed))
+		ListHandoffFinishBorrowTemplate:
+			parsed ?= parse_list_handoff_finish_borrow_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffFinishBorrow(parsed))
+		ListHandoffFinishReuseTemplate:
+			parsed ?= parse_list_handoff_finish_reuse_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffFinishReuse(parsed))
+		ListHandoffCloseTemplate:
+			result ?= parse_list_handoff_name_arg(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(ListHandoffClose(result))
 
 
 pure func render_prepared_list(name: String, args: List[String]) -> Result[String, RenderError]:
@@ -1532,6 +2049,23 @@ private pure func placeholder_prepared_list_op(info: PreparedListTemplateInfo) -
 				temp_seed = "@3@",
 				struct_ty = "@4@",
 			})
+		ListInlineStructUnboxListNameTemplate:
+			ListInlineStructUnboxListName("@0@")
+		ListInlineStructUnboxIndexNameTemplate:
+			ListInlineStructUnboxIndexName("@0@")
+		ListInlineStructUnboxOutNameTemplate:
+			ListInlineStructUnboxOutName("@0@")
+		ListInlineStructUnboxOpenTemplate:
+			ListInlineStructUnboxOpen({
+				list = "@0@",
+				list_expr = "@1@",
+				index = "@2@",
+				index_expr = "@3@",
+				struct_ty = "@4@",
+				out = "@5@",
+			})
+		ListInlineStructUnboxCloseTemplate:
+			ListInlineStructUnboxClose("@0@")
 		ListHandoffSetSourceSlotTemplate:
 			HandoffSetSourceSlot({
 				result = "@0@",
@@ -1588,6 +2122,14 @@ private pure func placeholder_prepared_list_op(info: PreparedListTemplateInfo) -
 			})
 		ListRetainForNoopTemplate:
 			RetainForNoop
+		ListConstructNameTemplate:
+			ListConstructName("@0@")
+		ListConstructTemplate:
+			ListConstruct({
+				list = "@0@",
+				alloc_expr = "@1@",
+				statements = "@2@",
+			})
 		ListConstructInitElemReleaseTemplate:
 			ListConstructInitElemRelease("@0@")
 		ListConstructInlineStructSetTemplate:
@@ -1610,6 +2152,61 @@ private pure func placeholder_prepared_list_op(info: PreparedListTemplateInfo) -
 				list = "@0@",
 				value = "@1@",
 			})
+		ListHandoffCapacityNameTemplate:
+			ListHandoffCapacityName("@0@")
+		ListHandoffReuseNameTemplate:
+			ListHandoffReuseName("@0@")
+		ListHandoffReleaseNameTemplate:
+			ListHandoffReleaseName("@0@")
+		ListHandoffOpenTemplate:
+			ListHandoffOpen({
+				source_ty = "@0@",
+				source = "@1@",
+				source_expr = "@2@",
+				capacity = "@3@",
+				capacity_expr = "@4@",
+				length = "@5@",
+				release = "@6@",
+				release_fn = "@7@",
+			})
+		ListHandoffBeginBorrowTemplate:
+			ListHandoffBeginBorrow({
+				result_ty = "@0@",
+				result = "@1@",
+				capacity = "@2@",
+				release = "@3@",
+				storage_mode = "@4@",
+				elem_size = "@5@",
+				out = "@6@",
+			})
+		ListHandoffBeginReuseTemplate:
+			ListHandoffBeginReuse({
+				result_ty = "@0@",
+				result = "@1@",
+				source = "@2@",
+				capacity = "@3@",
+				release = "@4@",
+				storage_mode = "@5@",
+				elem_size = "@6@",
+				reuse = "@7@",
+				out = "@8@",
+			})
+		ListHandoffFinishBorrowTemplate:
+			ListHandoffFinishBorrow({
+				result = "@0@",
+				out = "@1@",
+				length = "@2@",
+			})
+		ListHandoffFinishReuseTemplate:
+			ListHandoffFinishReuse({
+				result = "@0@",
+				out = "@1@",
+				length = "@2@",
+				reuse = "@3@",
+				source = "@4@",
+			})
+		ListHandoffCloseTemplate:
+			ListHandoffClose("@0@")
 		ListInlineStructLoadProvenTemplate:
 			InlineStructLoadProven({
 				list_tmp = "@0@",

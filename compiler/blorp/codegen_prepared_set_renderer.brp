@@ -1,0 +1,298 @@
+-- Blorp-authored renderer for prepared set Core nodes.
+--
+-- OCaml still owns Core traversal, child expression emission, type-directed
+-- element unboxing, and fresh temp seeds. This module owns final C snippet
+-- shape for prepared set templates.
+enum CompilerCommand:
+	RenderPreparedSetCommand
+	RenderManifestCommand
+	UnknownCommand
+
+
+enum PreparedSetTemplate:
+	SetIterSourceBindingTemplate
+	SetIterRetainTemplate
+	SetIterLoopOpenTemplate
+	SetIterEntryKeyTemplate
+	SetIterReleaseTemplate
+
+
+record PreparedSetTemplateInfo {
+	template: PreparedSetTemplate,
+	name: String,
+	arity: Int
+}
+
+
+record SetIterSourceBindingArgs {
+	set: String,
+	source: String
+}
+
+
+record SetIterLoopOpenArgs {
+	entry: String,
+	set: String
+}
+
+
+union PreparedSetOp:
+	SetIterSourceBinding(SetIterSourceBindingArgs)
+	SetIterRetain(String)
+	SetIterLoopOpen(SetIterLoopOpenArgs)
+	SetIterEntryKey(String)
+	SetIterRelease(String)
+
+
+union RenderError:
+	WrongArity(PreparedSetTemplateInfo, Int)
+	UnsupportedPreparedSetOp(String)
+
+
+ALL_TEMPLATES: List[PreparedSetTemplateInfo] = [{
+		template = SetIterSourceBindingTemplate,
+		name = "set_iter_source_binding",
+		arity = 2
+	}, {
+		template = SetIterRetainTemplate,
+		name = "set_iter_retain",
+		arity = 1
+	}, {
+		template = SetIterLoopOpenTemplate,
+		name = "set_iter_loop_open",
+		arity = 2
+	}, {
+		template = SetIterEntryKeyTemplate,
+		name = "set_iter_entry_key",
+		arity = 1
+	}, {
+		template = SetIterReleaseTemplate,
+		name = "set_iter_release",
+		arity = 1
+	}]
+
+USAGE: String = (
+	"Usage: codegen_prepared_set_renderer prepared-set <name> [rendered-arg...] | "
+	+ "manifest"
+)
+
+
+pure func parse_command(command: String) -> CompilerCommand:
+	match command:
+		"prepared-set":
+			RenderPreparedSetCommand
+		"manifest":
+			RenderManifestCommand
+		_:
+			UnknownCommand
+
+
+pure func prepared_set_template_name(info: PreparedSetTemplateInfo) -> String:
+	info.name
+
+
+pure func prepared_set_template_arity(info: PreparedSetTemplateInfo) -> Int:
+	info.arity
+
+
+pure func parse_prepared_set_template(name: String) -> Option[PreparedSetTemplateInfo]:
+	var found: Option[PreparedSetTemplateInfo] = None
+
+	for info in ALL_TEMPLATES:
+		if found.is_none() and info.name == name:
+			found = Some(info)
+
+	found
+
+
+pure func render_error_to_string(error: RenderError) -> String:
+	match error:
+		WrongArity(info, got):
+			"prepared set op ${info.name} expected ${info.arity} arg(s), got ${got}"
+		UnsupportedPreparedSetOp(name):
+			"unsupported prepared set op: ${name}"
+
+
+pure func wrong_arity_for_args(info: PreparedSetTemplateInfo, args: List[String]) -> RenderError:
+	WrongArity(info, args.length())
+
+
+private pure func parse_set_iter_source_binding_args(
+	args: List[String],
+) -> Option[SetIterSourceBindingArgs]:
+	match args:
+		[set, source]:
+			Some({
+				set = set,
+				source = source,
+			})
+		_:
+			None
+
+
+private pure func parse_set_iter_loop_open_args(args: List[String]) -> Option[SetIterLoopOpenArgs]:
+	match args:
+		[entry, set]:
+			Some({
+				entry = entry,
+				set = set,
+			})
+		_:
+			None
+
+
+private pure func render_set_iter_source_binding(args: SetIterSourceBindingArgs) -> String:
+	"blorp_Set* ${args.set} = (blorp_Set*)${args.source};"
+
+
+private pure func render_set_iter_retain(set: String) -> String:
+	"blorp_retain(${set});"
+
+
+private pure func render_set_iter_loop_open(args: SetIterLoopOpenArgs) -> String:
+	"for (blorp_SetEntry* ${args.entry} = ${args.set}->first; " + "${args.entry} != NULL; ${args.entry} = ${args.entry}->next_order) {"
+
+
+private pure func render_set_iter_entry_key(entry: String) -> String:
+	"${entry}->key"
+
+
+private pure func render_set_iter_release(set: String) -> String:
+	"blorp_release(${set});"
+
+
+pure func render_prepared_set_op(op: PreparedSetOp) -> String:
+	match op:
+		SetIterSourceBinding(args):
+			render_set_iter_source_binding(args)
+		SetIterRetain(set):
+			render_set_iter_retain(set)
+		SetIterLoopOpen(args):
+			render_set_iter_loop_open(args)
+		SetIterEntryKey(entry):
+			render_set_iter_entry_key(entry)
+		SetIterRelease(set):
+			render_set_iter_release(set)
+
+
+pure func build_prepared_set_op(
+	info: PreparedSetTemplateInfo,
+	args: List[String],
+) -> Result[PreparedSetOp, RenderError]:
+	match info.template:
+		SetIterSourceBindingTemplate:
+			parsed ?= parse_set_iter_source_binding_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(SetIterSourceBinding(parsed))
+		SetIterRetainTemplate:
+			match args:
+				[set]:
+					Ok(SetIterRetain(set))
+				_:
+					Err(wrong_arity_for_args(info, args))
+		SetIterLoopOpenTemplate:
+			parsed ?= parse_set_iter_loop_open_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(SetIterLoopOpen(parsed))
+		SetIterEntryKeyTemplate:
+			match args:
+				[entry]:
+					Ok(SetIterEntryKey(entry))
+				_:
+					Err(wrong_arity_for_args(info, args))
+		SetIterReleaseTemplate:
+			match args:
+				[set]:
+					Ok(SetIterRelease(set))
+				_:
+					Err(wrong_arity_for_args(info, args))
+
+
+pure func render_prepared_set(name: String, args: List[String]) -> Result[String, RenderError]:
+	match parse_prepared_set_template(name):
+		Some(info):
+			match build_prepared_set_op(info, args):
+				Ok(op):
+					Ok(render_prepared_set_op(op))
+				Err(error):
+					Err(error)
+		None:
+			Err(UnsupportedPreparedSetOp(name))
+
+
+private PLACEHOLDER_SET_ITER_SOURCE_BINDING_ARGS: SetIterSourceBindingArgs = {
+	set = "@0@",
+	source = "@1@"
+}
+
+private PLACEHOLDER_SET_ITER_LOOP_OPEN_ARGS: SetIterLoopOpenArgs = {
+	entry = "@0@",
+	set = "@1@"
+}
+
+
+private pure func placeholder_prepared_set_op(info: PreparedSetTemplateInfo) -> PreparedSetOp:
+	match info.template:
+		SetIterSourceBindingTemplate:
+			SetIterSourceBinding(PLACEHOLDER_SET_ITER_SOURCE_BINDING_ARGS)
+		SetIterRetainTemplate:
+			SetIterRetain("@0@")
+		SetIterLoopOpenTemplate:
+			SetIterLoopOpen(PLACEHOLDER_SET_ITER_LOOP_OPEN_ARGS)
+		SetIterEntryKeyTemplate:
+			SetIterEntryKey("@0@")
+		SetIterReleaseTemplate:
+			SetIterRelease("@0@")
+
+
+pure func render_manifest_line(info: PreparedSetTemplateInfo) -> String:
+	name: String = prepared_set_template_name(info)
+	arity: Int = prepared_set_template_arity(info)
+	body: String = render_prepared_set_op(placeholder_prepared_set_op(info))
+	"${name}\t${arity}\t${body}"
+
+
+pure func render_manifest_lines() -> List[String]:
+	ALL_TEMPLATES.map(render_manifest_line)
+
+
+func print_manifest() -> Void:
+	for line in render_manifest_lines():
+		print(line)
+
+
+func print_result(result: Result[String, RenderError]) -> Int:
+	match result:
+		Ok(rendered):
+			puts(rendered)
+			0
+		Err(error):
+			print(render_error_to_string(error))
+			1
+
+
+func main(args: List[String]) -> Int:
+	match args:
+		[program_name, command_name, ...command_args]:
+			match parse_command(command_name):
+				RenderPreparedSetCommand:
+					match command_args:
+						[name, ...rendered_args]:
+							print_result(render_prepared_set(name, rendered_args))
+						[]:
+							print(USAGE)
+							1
+				RenderManifestCommand:
+					print_manifest()
+					0
+				UnknownCommand:
+					print(USAGE)
+					1
+		[]:
+			print(USAGE)
+			1
+		[program_name]:
+			print(USAGE)
+			1
