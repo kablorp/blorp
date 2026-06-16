@@ -161,9 +161,9 @@ security-check: all c-static-analysis
 # stronger ASan + UBSan combination.
 test-asan: all
 	@if [ "$$(uname -s)" = "Darwin" ]; then \
-		./blorp test --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
+		./blorp test --no-format --sanitize=undefined $(RUNTIME_TEST_ROOTS); \
 	else \
-		./blorp test --sanitize $(RUNTIME_TEST_ROOTS); \
+		./blorp test --no-format --sanitize $(RUNTIME_TEST_ROOTS); \
 	fi
 
 # Docker targets

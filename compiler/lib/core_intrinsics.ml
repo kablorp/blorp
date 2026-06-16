@@ -1488,6 +1488,32 @@ let value_as_ptr ?reg ?as_ty (value : core) : core =
   Core_layout_type.boxed_storage_value_pointer_argument ?reg value_ty
   |> fun layout -> pointer_argument_as_ptr layout value value_ty
 
+let boxed_value_pointer_temp_requires_release ?reg value_ty loc =
+  match Core_layout_type.boxed_storage_value_pointer_argument ?reg value_ty with
+  | Core_layout_type.PointerArgumentBox -> (
+      match
+        Core_layout_type.box_kind_of_type
+          ~phase:(Core_error.Other "core_intrinsics.boxed_value_pointer_temp")
+          ~reg:(tensor_reg reg) value_ty loc
+      with
+      | Core.BoxInt128 | Core.BoxUInt128 | Core.BoxStruct _ -> true
+      | Core.BoxFloat | Core.BoxFloat32 | Core.BoxFloat16 | Core.BoxVoid
+      | Core.BoxPointer | Core.BoxPrim ->
+          false)
+  | Core_layout_type.PointerArgumentIdentity
+  | Core_layout_type.PointerArgumentCast ->
+      false
+
+let boxed_value_unbox_temp_requires_release ?reg value_ty loc =
+  match Core_layout_type.inline_struct_storage ?reg value_ty with
+  | Core_layout_type.InlineStruct
+      { inline_struct_kind = Core_layout_type.InlineStackOption; _ } ->
+      false
+  | Core_layout_type.InlineStruct
+      { inline_struct_kind = Core_layout_type.InlineValueRecord; _ }
+  | Core_layout_type.NotInlineStruct ->
+      boxed_value_pointer_temp_requires_release ?reg value_ty loc
+
 let list_collection_strategy func_name =
   match
     Core_ownership.collection_strategy ~module_path:"std/list" ~func_name
@@ -5378,12 +5404,19 @@ let dict_get_or ?reg dict_ty self key default =
   let strategy = dict_probe_strategy_for_key ?reg key_ty in
   let slot = vr "__dict_get_or_slot" ty_int in
   let value = vr "__dict_get_or_value" ty_ptr in
+  let unboxed_value = mk value_ty (CUnbox (value, value_ty)) in
+  let found_result =
+    if boxed_value_unbox_temp_requires_release ?reg value_ty default.loc then
+      lett "__dict_get_or_unboxed" unboxed_value
+        (seq
+           (intr "dict_release_value_for" [ self; value ] ty_void)
+           (vr "__dict_get_or_unboxed" value_ty))
+    else unboxed_value
+  in
   let found_value =
     lett "__dict_get_or_value"
       (intr "dict_value_at" [ self; slot ] ty_ptr)
-      (seq
-         (intr "dict_retain_value_for" [ self; value ] ty_void)
-         (mk value_ty (CUnbox (value, value_ty))))
+      (seq (intr "dict_retain_value_for" [ self; value ] ty_void) found_result)
   in
   lett "__dict_get_or_slot"
     (dict_find_slot strategy self (key_as_ptr ?reg ~as_ty:key_ty key))
@@ -5531,7 +5564,7 @@ let dict_contains ?reg dict_ty self key =
              (lettm "__dict_contains_probes" (lit_int 0)
                 (lettm "__dict_contains_found" (lit_bool false) (seq scan found))))))
 
-let dict_insert_retained ?reg dict key value =
+let dict_insert_retained ?reg ?(release_value_temp = false) dict key value =
   let strategy = dict_probe_strategy_for_dict ?reg dict in
   let insert_key = vr "__dict_insert_key" ty_ptr in
   let insert_value = vr "__dict_insert_value" ty_ptr in
@@ -5685,6 +5718,11 @@ let dict_insert_retained ?reg dict key value =
                                           ty_void)
                                        resize_if_needed)))))))))))
   in
+  let release_insert_value_temp =
+    if release_value_temp then
+      intr "dict_release_value_for" [ dict; insert_value ] ty_void
+    else void
+  in
   lett "__dict_insert_key" key
     (lett "__dict_insert_value" value
        (lett "__dict_insert_hash"
@@ -5703,19 +5741,28 @@ let dict_insert_retained ?reg dict key value =
                          (lettm "__dict_insert_probes" (lit_int 0)
                             (seq scan
                                (seq finalize_insert_slot
-                                  (if_
-                                     (bin Ast.Ge found_slot (lit_int 0) ty_bool)
-                                     update_existing insert_new ty_void)))))))))))
+                                  (seq
+                                     (if_
+                                        (bin Ast.Ge found_slot (lit_int 0)
+                                           ty_bool)
+                                        update_existing insert_new ty_void)
+                                     release_insert_value_temp)))))))))))
 
 let dict_set ?reg dict_ty self key value =
   let key_ty, value_ty = dict_key_value_tys ?reg dict_ty in
+  let value_ptr_layout =
+    Core_layout_type.boxed_storage_value_pointer_argument ?reg value_ty
+  in
+  let release_value_temp =
+    boxed_value_pointer_temp_requires_release ?reg value_ty value.loc
+  in
   let result = vr "__result" dict_ty in
   lettm "__result"
     (intr (dict_reuse_boundary "set") [ self ] dict_ty)
     (seq
-       (dict_insert_retained ?reg result
+       (dict_insert_retained ?reg ~release_value_temp result
           (key_as_ptr ?reg ~as_ty:key_ty key)
-          (value_as_ptr ?reg ~as_ty:value_ty value))
+          (pointer_argument_as_ptr value_ptr_layout value value_ty))
        result)
 
 (* ================================================================

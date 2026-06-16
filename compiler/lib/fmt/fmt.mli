@@ -61,3 +61,7 @@ val formatter_source_kind_for_tests : unit -> (string, string) result
 
 val formatter_lock_is_stale_for_tests : string -> bool
 (** Internal test hook for formatter cache lock recovery. *)
+
+val create_temp_dir_from_marker_source_for_tests : (unit -> string) -> string
+(** Internal test hook for deterministic formatter temp directory collision
+    recovery. The caller owns cleanup of the returned directory. *)

@@ -5,6 +5,7 @@
 
 BLORP=./blorp
 FIXTURE=tests/fixtures/leak_string_deliberate.brp
+SUITE_FIXTURE=tests/fixtures/leak_suite_deliberate.brp
 PASS=0
 FAIL=0
 
@@ -53,6 +54,20 @@ if echo "$verbose_output" | grep -qE "Leaked object|leaked:.*String|  #[0-9]"; t
 else
     echo "FAIL (no per-object details in verbose mode)"
     echo "  Got: $(echo "$verbose_output" | grep -i leak)"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 5: Suite leak-check failure includes type/bucket details before reset.
+echo -n "Test 5: suite leak failure shows type bucket... "
+suite_output=$($BLORP test --no-format --leak-check --suite "$SUITE_FIXTURE" 2>&1 || true)
+if echo "$suite_output" | grep -qE "\\[LEAK: [0-9]+ objects\\]" \
+    && echo "$suite_output" | grep -qE "Leaked by type:" \
+    && echo "$suite_output" | grep -qiE "String|List|Channel|Closure|\\(unknown\\)"; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL (no suite type bucket)"
+    echo "  Got: $(echo "$suite_output" | grep -iE 'LEAK|Leaked by type|String|List|Channel|Closure|unknown')"
     FAIL=$((FAIL + 1))
 fi
 

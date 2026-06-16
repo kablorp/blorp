@@ -196,6 +196,81 @@ let is_managed_type (env : type_env) (ty : Ast.type_expr) : bool =
     ~phase:(Core_error.Stage Core_stage.Perceus) (type_layout_metadata env) ty
   |> Core_layout_type.source_value_requires_release
 
+let boxed_storage_requires_release (env : type_env) (ty : Ast.type_expr) loc =
+  match
+    Core_layout_type.box_kind_of_type
+      ~phase:(Core_error.Stage Core_stage.Perceus) ~reg:env.type_registry ty loc
+  with
+  | BoxInt128 | BoxUInt128 | BoxStruct _ -> true
+  | BoxFloat | BoxFloat32 | BoxFloat16 | BoxVoid | BoxPointer | BoxPrim -> false
+
+let boxed_expr_transfers_ownership (env : type_env) (expr : core) : bool =
+  match expr.desc with
+  | CBox (_, source_ty) -> boxed_storage_requires_release env source_ty expr.loc
+  | CBoxTyped b -> boxed_storage_requires_release env b.box_source_ty expr.loc
+  | CVar _ | CField _ | CUnbox _ | CUnboxTyped _ | CLit (Ast.LitString _) -> (
+      match
+        Core_layout_type.box_kind_of_type
+          ~phase:(Core_error.Stage Core_stage.Perceus) ~reg:env.type_registry
+          expr.ty expr.loc
+      with
+      | BoxStruct _ -> true
+      | _ -> false)
+  | _ -> boxed_storage_requires_release env expr.ty expr.loc
+
+let normalize_accessed_type (env : type_env) ty =
+  Core_layout_type.canonical_type ~reg:env.type_registry ty
+
+let variant_field_type (env : type_env) parent_ty ctor idx =
+  match normalize_accessed_type env parent_ty with
+  | Ast.TyNamed ("Option", [ payload ]) when ctor = "Some" && idx = 0 ->
+      Some payload
+  | Ast.TyNamed ("Result", [ ok_ty; _ ]) when ctor = "Ok" && idx = 0 ->
+      Some ok_ty
+  | Ast.TyNamed ("Result", [ _; err_ty ]) when ctor = "Err" && idx = 0 ->
+      Some err_ty
+  | Ast.TyNamed (type_name, []) -> (
+      match
+        Codegen_types.lookup_union_variant env.type_registry type_name ctor
+      with
+      | Some variant -> List.nth_opt variant.variant_fields idx
+      | None -> None)
+  | Ast.TyNamed (type_name, _args) -> (
+      match
+        Codegen_types.lookup_union_variant env.type_registry type_name ctor
+      with
+      | Some variant -> (
+          match List.nth_opt variant.variant_fields idx with
+          | Some field_ty when not (Codegen_types.has_type_vars field_ty) ->
+              Some field_ty
+          | _ -> None)
+      | None -> None)
+  | _ -> None
+
+let rec accessor_type (env : type_env) (scrut_ty : Ast.type_expr)
+    (acc : accessor) : Ast.type_expr option =
+  match acc with
+  | AccRoot -> Some (normalize_accessed_type env scrut_ty)
+  | AccTupleField (parent, idx) -> (
+      match accessor_type env scrut_ty parent with
+      | Some parent_ty -> (
+          match normalize_accessed_type env parent_ty with
+          | Ast.TyTuple elems -> List.nth_opt elems idx
+          | _ -> None)
+      | None -> None)
+  | AccListElem (parent, _) -> (
+      match accessor_type env scrut_ty parent with
+      | Some parent_ty -> (
+          match normalize_accessed_type env parent_ty with
+          | Ast.TyNamed ("List", [ elem_ty ]) -> Some elem_ty
+          | _ -> None)
+      | None -> None)
+  | AccListSpread (parent, _) -> accessor_type env scrut_ty parent
+  | AccVariantField (parent, ctor, idx) -> (
+      match accessor_type env scrut_ty parent with
+      | Some parent_ty -> variant_field_type env parent_ty ctor idx
+      | None -> None)
+
 let result_mode_for_type (env : type_env) (ty : Ast.type_expr) :
     Core_ownership.result_mode =
   match ty with
@@ -708,8 +783,12 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
       aggregate_ownership_uses
         (List.map (summarize_boxed_storage_uses env name) tc.tc_elems)
   | CList lit ->
-      aggregate_ownership_uses
-        (List.map (summarize_linear_ownership_uses env name) lit.ll_elems)
+      let summarize_elem elem =
+        if boxed_expr_transfers_ownership env elem then
+          summarize_linear_ownership_uses env name elem
+        else summarize_linear_borrow env name elem
+      in
+      aggregate_ownership_uses (List.map summarize_elem lit.ll_elems)
   | CListConstruct lc ->
       aggregate_ownership_uses
         (List.map (summarize_boxed_storage_uses env name) lc.lc_elems)
@@ -995,8 +1074,18 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
       if cond_uses.consumed_refs > 0 || body_uses.consumed_refs > 0 then
         ownership_uses_from_legacy_count (count_uses name e)
       else seq_ownership_uses cond_uses { body_uses with returns_alias = false }
-  | CTailrecLoop _ | CTailrecRecur _ ->
-      ownership_uses_from_legacy_count (count_uses name e)
+  | CTailrecLoop (TailrecUnmanagedLoop l) ->
+      summarize_linear_ownership_uses env name l.tul_body
+  | CTailrecLoop (TailrecListSpreadLoop l) ->
+      summarize_linear_ownership_uses env name l.tls_body
+  | CTailrecRecur (TailrecRecur r) ->
+      sum_ownership_uses
+        (List.map (summarize_linear_ownership_uses env name) r.tr_args)
+  | CTailrecRecur (TailrecListSpreadRecur r) ->
+      sum_ownership_uses
+        (List.map
+           (fun (_, arg) -> summarize_linear_ownership_uses env name arg)
+           r.tr_rebinds)
   | CDebugBlock body -> summarize_linear_ownership_uses env name body
   | CConcurrent cb ->
       let timeout_uses =
@@ -1035,7 +1124,9 @@ let rec summarize_linear_ownership_uses (env : type_env) (name : string)
       seq_ownership_uses timeout_uses (seq_ownership_uses iter_uses task_uses)
 
 and summarize_boxed_storage_uses env name value =
-  summarize_linear_ownership_uses env name value.bsv_box.box_value
+  if value.bsv_transfers_ownership then
+    summarize_linear_ownership_uses env name value.bsv_box.box_value
+  else summarize_linear_borrow env name value.bsv_box.box_value
 
 and summarize_ctree_ownership_uses (env : type_env) (name : string)
     (tree : ctree) : ownership_uses =
@@ -1467,6 +1558,21 @@ let result_starts_with_dup_of (name : string) (body : core) : bool =
   | CSeq ({ desc = CDup (v, _, _); _ }, _) -> v.vname = name
   | _ -> false
 
+let dropped_vars_before_returning (returned_name : string) (body : core) :
+    StringSet.t option =
+  let rec go dropped body =
+    match body.desc with
+    | CVar v when v.vname = returned_name -> Some dropped
+    | CDrop (v, _, tail) -> go (StringSet.add v.vname dropped) tail
+    | CSeq (head, tail) -> (
+        match head.desc with
+        | CDrop (v, _, { desc = CVoid; _ }) ->
+            go (StringSet.add v.vname dropped) tail
+        | _ -> None)
+    | _ -> None
+  in
+  go StringSet.empty body
+
 (** A binding initialized from a borrowed managed value creates a second
     logical owner. Retain before the binding body can mutate either alias,
     otherwise COW sees a false "unique" refcount and mutates shared data.
@@ -1499,7 +1605,15 @@ let rec alias_source_of_rhs (env : type_env) (b : binding) (rhs : core) :
 let retain_alias_source (env : type_env) (b : binding) (body : core) : core =
   match alias_source_of_rhs env b b.bind_rhs with
   | Some (AliasVar source) ->
-      { body with desc = CDup (source, b.bind_ty, body) }
+      let body_needs_source_retain =
+        match dropped_vars_before_returning b.bind_var.vname body with
+        | Some dropped ->
+            StringSet.is_empty dropped || StringSet.mem source.vname dropped
+        | None -> true
+      in
+      if body_needs_source_retain then
+        { body with desc = CDup (source, b.bind_ty, body) }
+      else body
   | Some AliasBinding ->
       if result_starts_with_dup_of b.bind_var.vname body then body
       else { body with desc = CDup (b.bind_var, b.bind_ty, body) }
@@ -1669,6 +1783,19 @@ let lambda_has_runtime_captures (env : type_env) (lam : lambda) : bool =
 
 let is_owned_temporary_expr (env : type_env) (e : core) : bool =
   let module Owned = Set.Make (String) in
+  let retain_for_intrinsic_name = function
+    | "list_retain_for" | "dict_retain_key_for" | "dict_retain_value_for"
+    | "set_retain_key_for" ->
+        true
+    | _ -> false
+  in
+  let retained_var_from_effect e =
+    match e.desc with
+    | CCall (CKIntrinsic name, _, [ _owner; ({ desc = CVar v; _ } as value) ])
+      when retain_for_intrinsic_name name && is_managed_type env value.ty ->
+        Some v.vname
+    | _ -> None
+  in
   let rec go owned (e : core) =
     if not (is_managed_type env e.ty) then false
     else
@@ -1676,22 +1803,31 @@ let is_owned_temporary_expr (env : type_env) (e : core) : bool =
       | CVar v -> Owned.mem v.vname owned
       | CField _ -> false
       | CLit (Ast.LitString (_, _)) -> false
+      | CCast (inner, _) | CUnbox (inner, _) -> (
+          match inner.desc with
+          | CCall (kind, _, args) ->
+              call_result_is_owned env kind ~arg_count:(List.length args)
+                ~return_ty:e.ty
+              || go owned inner
+          | _ -> go owned inner)
       | CCall (kind, _, args) ->
           call_result_is_owned env kind ~arg_count:(List.length args)
             ~return_ty:e.ty
       | CLet (b, body) ->
-          let rhs_is_owned =
-            (not b.bind_mut)
-            && is_managed_type env b.bind_ty
-            && go owned b.bind_rhs
-          in
           let owned' =
-            if rhs_is_owned then Owned.add b.bind_var.vname owned
+            if (not b.bind_mut) && is_managed_type env b.bind_ty then
+              Owned.add b.bind_var.vname owned
             else Owned.remove b.bind_var.vname owned
           in
           go owned' body
       | CBorrowLet (b, body) -> go (Owned.remove b.borrow_var.vname owned) body
-      | CSeq (_, body) -> go owned body
+      | CSeq (head, body) ->
+          let owned' =
+            match retained_var_from_effect head with
+            | Some name -> Owned.add name owned
+            | None -> owned
+          in
+          go owned' body
       | CIf (_, then_e, else_e) -> go owned then_e && go owned else_e
       | CDup (v, ty, body) ->
           let owned' =
@@ -1738,6 +1874,40 @@ let bind_borrowed_owned_temporary_args (env : type_env) (e : core) : core =
         { body with desc = CLet (bind, body) })
       bindings body
   in
+  let raw_owned_call_awaits_value_wrapper kind args return_ty =
+    is_void_type return_ty
+    && call_result_is_owned env kind ~arg_count:(List.length args) ~return_ty
+  in
+  let rewrite_call_with_return_ty node kind fn args return_ty wrap_call =
+    match
+      contract_for_call env kind ~arg_count:(List.length args) ~return_ty
+    with
+    | Some contract when List.length contract.args = List.length args ->
+        let bindings = ref [] in
+        let fn' =
+          if kind = CKClosure && is_owned_temporary_expr env fn then (
+            let tmp = next_tmp "callee" in
+            bindings := !bindings @ [ (tmp, fn.ty, fn) ];
+            { fn with desc = CVar tmp })
+          else fn
+        in
+        let args' =
+          List.map2
+            (fun mode arg ->
+              if
+                borrowed_mode_needs_owned_temp_binding mode
+                && is_owned_temporary_expr env arg
+              then (
+                let tmp = next_tmp "arg" in
+                bindings := !bindings @ [ (tmp, arg.ty, arg) ];
+                { arg with desc = CVar tmp })
+              else arg)
+            contract.args args
+        in
+        let call = wrap_call fn' args' in
+        bind_all !bindings call
+    | _ -> node
+  in
   let rewrite_call node =
     match node.desc with
     | CBin (((Ast.Eq | Ast.Ne) as op), l, r) ->
@@ -1752,36 +1922,42 @@ let bind_borrowed_owned_temporary_args (env : type_env) (e : core) : core =
         let l' = bind_if_owned "bin_l" l in
         let r' = bind_if_owned "bin_r" r in
         bind_all !bindings { node with desc = CBin (op, l', r') }
+    | CCast (({ desc = CCall (kind, fn, args); _ } as inner), target_ty) ->
+        rewrite_call_with_return_ty node kind fn args target_ty
+          (fun fn' args' ->
+            {
+              node with
+              desc =
+                CCast ({ inner with desc = CCall (kind, fn', args') }, target_ty);
+            })
+    | CUnbox (({ desc = CCall (kind, fn, args); _ } as inner), target_ty) ->
+        rewrite_call_with_return_ty node kind fn args target_ty
+          (fun fn' args' ->
+            {
+              node with
+              desc =
+                CUnbox
+                  ({ inner with desc = CCall (kind, fn', args') }, target_ty);
+            })
+    | CTensorRawViewLet (b, body) when is_owned_temporary_expr env b.trv_source
+      ->
+        let tmp = next_tmp "tensor_view" in
+        let source_ref = { b.trv_source with desc = CVar tmp } in
+        let b' = { b with trv_source = source_ref } in
+        bind_all
+          [ (tmp, b.trv_source.ty, b.trv_source) ]
+          { node with desc = CTensorRawViewLet (b', body) }
     | CCall (kind, fn, args) -> (
-        match
-          contract_for_call env kind ~arg_count:(List.length args)
-            ~return_ty:node.ty
-        with
-        | Some contract when List.length contract.args = List.length args ->
-            let bindings = ref [] in
-            let fn' =
-              if kind = CKClosure && is_owned_temporary_expr env fn then (
-                let tmp = next_tmp "callee" in
-                bindings := !bindings @ [ (tmp, fn.ty, fn) ];
-                { fn with desc = CVar tmp })
-              else fn
-            in
-            let args' =
-              List.map2
-                (fun mode arg ->
-                  if
-                    borrowed_mode_needs_owned_temp_binding mode
-                    && is_owned_temporary_expr env arg
-                  then (
-                    let tmp = next_tmp "arg" in
-                    bindings := !bindings @ [ (tmp, arg.ty, arg) ];
-                    { arg with desc = CVar tmp })
-                  else arg)
-                contract.args args
-            in
-            let call = { node with desc = CCall (kind, fn', args') } in
-            bind_all !bindings call
-        | _ -> node)
+        if raw_owned_call_awaits_value_wrapper kind args node.ty then node
+        else
+          match
+            contract_for_call env kind ~arg_count:(List.length args)
+              ~return_ty:node.ty
+          with
+          | Some _ ->
+              rewrite_call_with_return_ty node kind fn args node.ty
+                (fun fn' args' -> { node with desc = CCall (kind, fn', args') })
+          | _ -> node)
     | _ -> node
   in
   transform_bottom_up rewrite_call e
@@ -4530,6 +4706,108 @@ let transform_let_match_tree_body (env : type_env) (b : binding) (scrut : core)
       let body = prepend_dups dups_count v ty new_mt in
       { outer with desc = CLet (b, body) }
 
+let balance_match_list_spread_body (env : type_env) (v : var)
+    (ty : Ast.type_expr) (body : core) : core =
+  let body = protect_loop_consumes_for_var env v ty body in
+  let uses = summarize_linear_ownership_uses env v.vname body in
+  let owned_refs = max 1 uses.required_refs in
+  let dups_count = owned_refs - 1 in
+  let balanced =
+    balance_branch_body env v ty ~available_refs:owned_refs uses body
+  in
+  prepend_dups dups_count v ty balanced
+
+let body_is_explicit_list_spread_recur (body : core) : bool =
+  match body.desc with
+  | CTailrecRecur (TailrecListSpreadRecur _) -> true
+  | _ -> false
+
+let balance_match_list_spread_bindings (env : type_env)
+    ~(scrut_ty : Ast.type_expr) (bindings : match_binding list) (body : core) :
+    core =
+  let explicit_list_recur = body_is_explicit_list_spread_recur body in
+  List.fold_left
+    (fun body binding ->
+      match binding.mb_accessor with
+      | AccListSpread (AccRoot, _) when explicit_list_recur -> body
+      | AccListSpread _ -> (
+          match accessor_type env scrut_ty binding.mb_accessor with
+          | Some ty when is_managed_type env ty ->
+              balance_match_list_spread_body env binding.mb_var ty body
+          | _ -> body)
+      | _ -> body)
+    body bindings
+
+let rec balance_match_list_spreads_in_ctree (env : type_env)
+    ~(scrut_ty : Ast.type_expr) (tree : ctree) : ctree =
+  match tree with
+  | CTLeaf { ct_bindings; ct_body } ->
+      CTLeaf
+        {
+          ct_bindings;
+          ct_body =
+            balance_match_list_spread_bindings env ~scrut_ty ct_bindings ct_body;
+        }
+  | CTFail -> CTFail
+  | CTSwitchTag { cts_scrut; cts_cases; cts_default } ->
+      CTSwitchTag
+        {
+          cts_scrut;
+          cts_cases =
+            List.map
+              (fun (name, sub) ->
+                (name, balance_match_list_spreads_in_ctree env ~scrut_ty sub))
+              cts_cases;
+          cts_default =
+            Option.map
+              (balance_match_list_spreads_in_ctree env ~scrut_ty)
+              cts_default;
+        }
+  | CTSwitchLit { ctl_scrut; ctl_cases; ctl_default } ->
+      CTSwitchLit
+        {
+          ctl_scrut;
+          ctl_cases =
+            List.map
+              (fun (lit, sub) ->
+                (lit, balance_match_list_spreads_in_ctree env ~scrut_ty sub))
+              ctl_cases;
+          ctl_default =
+            balance_match_list_spreads_in_ctree env ~scrut_ty ctl_default;
+        }
+  | CTSwitchLen { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default }
+    ->
+      CTSwitchLen
+        {
+          ctl_len_scrut;
+          ctl_len_cases =
+            List.map
+              (fun (len, sub) ->
+                (len, balance_match_list_spreads_in_ctree env ~scrut_ty sub))
+              ctl_len_cases;
+          ctl_len_geq =
+            Option.map
+              (fun (len, sub) ->
+                (len, balance_match_list_spreads_in_ctree env ~scrut_ty sub))
+              ctl_len_geq;
+          ctl_len_default =
+            Option.map
+              (balance_match_list_spreads_in_ctree env ~scrut_ty)
+              ctl_len_default;
+        }
+
+let balance_match_list_spreads (env : type_env) (e : core) : core =
+  match e.desc with
+  | CMatch (scrut, tree) ->
+      {
+        e with
+        desc =
+          CMatch
+            ( scrut,
+              balance_match_list_spreads_in_ctree env ~scrut_ty:scrut.ty tree );
+      }
+  | _ -> e
+
 (** Transform a [CConcurrent] node by inserting [CDup]/[CDrop] for each
     managed concurrent binding. Analogous to [transform_let] but applied
     N times — one per binding in [cb.conc_bindings] — since all bindings
@@ -4735,19 +5013,15 @@ let transform_let (env : type_env) (e : core) : core =
 
 let balance_consumed_param_body (env : type_env) (p : core_param) (body : core)
     : core =
-  let void_rhs = { desc = CVoid; ty = p.cp_ty; loc = body.loc } in
-  let fake_binding =
-    {
-      bind_var = p.cp_name;
-      bind_mut = false;
-      bind_ty = p.cp_ty;
-      bind_rhs = void_rhs;
-    }
+  let body = protect_loop_consumes_for_var env p.cp_name p.cp_ty body in
+  let uses = summarize_linear_ownership_uses env p.cp_name.vname body in
+  let owned_refs = max 1 uses.required_refs in
+  let dups_count = owned_refs - 1 in
+  let balanced =
+    balance_branch_body env p.cp_name p.cp_ty ~available_refs:owned_refs uses
+      body
   in
-  let wrapped = { body with desc = CLet (fake_binding, body) } in
-  match transform_let env wrapped with
-  | { desc = CLet (_, balanced_body); _ } -> balanced_body
-  | balanced -> balanced
+  prepend_dups dups_count p.cp_name p.cp_ty balanced
 
 let balance_consumed_params_body (env : type_env) (f : core_func) (body : core)
     : core =
@@ -4793,6 +5067,7 @@ let retain_alias_sources_expr (env : type_env) (e : core) : core =
 let insert_drops_expr_with_env (env : type_env) (e : core) : core =
   let combined node =
     node |> transform_let env |> transform_concurrent env
+    |> balance_match_list_spreads env
     |> retain_borrowed_aggregate_members_in_matches env
     |> retain_borrowed_owned_call_args_in_matches env
     |> retain_borrowed_result_vars_in_matches env

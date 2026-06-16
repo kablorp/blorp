@@ -160,7 +160,18 @@ let classify_for_unboxing (ctx : Core_emit_context.t) (ty : Ast.type_expr)
 
 let list_storage_layout_of_type (ctx : Core_emit_context.t)
     (list_ty : Ast.type_expr) (loc : Ast.loc) : list_storage_layout =
-  Core_layout_type.list_storage_layout_of_type ~reg:ctx.reg list_ty loc
+  Core_emit_layout.list_storage_layout_of_type ctx list_ty loc
+
+let tensor_element_storage (ctx : Core_emit_context.t) elem_ty =
+  Core_emit_layout.tensor_element_storage ctx elem_ty
+
+let tensor_storage_layout_of_type (ctx : Core_emit_context.t)
+    (tensor_ty : Ast.type_expr) (loc : Ast.loc) : tensor_storage_layout =
+  Core_emit_layout.tensor_storage_layout_of_type ctx tensor_ty loc
+
+let tensor_storage_layout_of_elem (ctx : Core_emit_context.t)
+    (elem_ty : Ast.type_expr) (loc : Ast.loc) : tensor_storage_layout =
+  Core_emit_layout.tensor_storage_layout_of_elem ctx elem_ty loc
 
 module StringSet = Set.Make (String)
 module StringMap = Map.Make (String)
@@ -658,12 +669,6 @@ let boxed_value_needs_release (ctx : Core_emit_context.t) (ty : Ast.type_expr)
   Core_layout_type.boxed_storage_requires_release_or_error
     ~phase:Core_error.Emit ~reg:ctx.reg ty loc
 
-let list_element_needs_release (ctx : Core_emit_context.t)
-    (list_ty : Ast.type_expr) (loc : Ast.loc) : bool =
-  match normalize_type list_ty with
-  | Ast.TyNamed ("List", [ elem ]) -> boxed_value_needs_release ctx elem loc
-  | _ -> false
-
 (** Resolve an [accessor] path to a C expression string, using
     [scrut_name] as the root variable name. Casts intermediate
     void* values to the correct union type when accessing nested
@@ -686,7 +691,8 @@ let render_accessor (ctx : Core_emit_context.t) (scrut_name : string)
         in
         Printf.sprintf "%s->data.%s.field%d" cast_parent ctor idx
     | AccTupleField (parent, idx) ->
-        Printf.sprintf "((blorp_Tuple*)%s)->elem[%d]" (go parent) idx
+        Core_emit_blorp_backend.render_tuple_field_element_at
+          ~tuple_tmp:(go parent) ~index:idx
     | AccListElem (parent, idx) ->
         Printf.sprintf "blorp_list_get((blorp_List*)%s, %d)" (go parent) idx
     | AccListSpread (parent, idx) ->
@@ -792,7 +798,9 @@ let render_accessor_typed (ctx : Core_emit_context.t) (scrut_name : string)
                 "match or bind Some(payload) before accessing fields of the \
                  payload"
               "invalid field accessor on nullable managed Option"
-        | _ -> Printf.sprintf "((blorp_Tuple*)%s)->elem[%d]" (go parent) idx)
+        | _ ->
+            Core_emit_blorp_backend.render_tuple_field_element_at
+              ~tuple_tmp:(go parent) ~index:idx)
     | AccListElem (parent, idx) -> (
         match accessor_type ctx scrut_ty parent with
         | Some parent_ty when is_nullable_managed_option ctx parent_ty ->

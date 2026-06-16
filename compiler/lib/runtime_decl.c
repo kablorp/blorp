@@ -2298,6 +2298,7 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value);
 // Memory Stats / Profiling
 blorp_MemStats* blorp_get_mem_stats(void);
 void blorp_reset_mem_stats(void);
+void blorp_print_live_object_summary(void);
 blorp_SchedulerStats* blorp_get_scheduler_stats(void);
 void blorp_reset_scheduler_stats(void);
 void blorp_profile_enable(void);

@@ -388,11 +388,27 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
   guard
     [
       "compiler/lib/core_codegen_prepare.ml";
-      "compiler/lib/core_emit.ml";
-      "compiler/lib/core_emit_intrinsic.ml";
+      "compiler/lib/core_emit_layout.ml";
+      "compiler/lib/core_emit_layout.mli";
+      "compiler/lib/core_emit_util.ml";
+      "compiler/lib/core_emit_util.mli";
       "compiler/lib/core_specialize.ml";
     ]
     "Core_layout_type.tensor_element_storage";
+  guard
+    [
+      "compiler/lib/core_codegen_prepare.ml";
+      "compiler/lib/core_emit_layout.ml";
+      "compiler/lib/core_emit_util.ml";
+    ]
+    "Core_layout_type.tensor_storage_layout_of_type";
+  guard
+    [
+      "compiler/lib/core_codegen_prepare.ml";
+      "compiler/lib/core_emit_layout.ml";
+      "compiler/lib/core_emit_util.ml";
+    ]
+    "Core_layout_type.tensor_storage_layout_of_elem";
   guard [] "let tensor_for_in_raw_storage ";
   guard [] "let tensor_for_in_raw_storage_of_layout";
   guard [] "let tensor_producer_builtin_storage_rule ";

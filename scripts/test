@@ -6,7 +6,7 @@
 #   scripts/test compiler-unit      # Compiler-internal OCaml/Alcotest tests only
 #   scripts/test compiler           # Compiler tests plus codegen audit
 #   scripts/test runtime            # Runtime .brp tests (language features)
-#   scripts/test leak               # Focused --leak-check ownership baselines
+#   scripts/test leak               # Focused --leak-check suites and leak diagnostics
 #   scripts/test doctest            # Doctests only (std/ library)
 #   scripts/test cli                # Public CLI, REPL, and LSP smoke checks
 #   scripts/test compiler-unit compiler  # Multiple gates
@@ -189,6 +189,32 @@ for root in tests/test_blorp/ tests/test_std/ tests/test_pkg/; do
         runtime_roots+=("$root")
     fi
 done
+
+leak_roots=(
+    tests/test_blorp/memory/leak_check_baselines/
+    tests/test_blorp/memory/*.brp
+    tests/test_std/list/test_list_of_vectors.brp
+    tests/test_std/list/test_list_pattern.brp
+    tests/test_std/list/test_tailrec_list_pattern.brp
+    tests/test_std/list/test_list_pipeline_fusion.brp
+    tests/test_std/list/test_list_get_or_set_ir.brp
+    tests/test_std/dict/test_dict_fold.brp
+    tests/test_std/dict/test_dict_increment.brp
+    tests/test_std/dict/test_dict_return_local_after_entries.brp
+    tests/test_std/heap/test_heap_cow.brp
+    tests/test_std/set/
+    tests/test_blorp/text/test_string_ops.brp
+    tests/test_blorp/text/test_string_ir.brp
+    tests/test_blorp/numeric/test_vector_cow.brp
+    tests/test_blorp/numeric/test_tensor_raw_view_cow.brp
+    tests/test_blorp/numeric/test_matrix_builtins_alloc.brp
+    tests/test_blorp/numeric/test_tensor_chained.brp
+    tests/test_blorp/numeric/test_tensor_nested_loop.brp
+    tests/test_blorp/concurrency/test_detached_channel_fanout_regression.brp
+    tests/test_blorp/concurrency/test_task_result_alias.brp
+    tests/test_blorp/sys/test_directory_resource.brp
+    tests/test_blorp/sys/test_file_resource.brp
+)
 
 parallel_default_timeout() {
     local base_timeout="$1"
@@ -448,6 +474,72 @@ parse_blorp_output() {
     fi
 }
 
+emit_combined_leak_result() {
+    local suite_output="$1"
+    local diag_output="$2"
+    local suite_exit="$3"
+    local diag_exit="$4"
+    local suite_line diag_summary
+    local suite_status suite_passed suite_failed suite_tests
+    local diag_passed diag_failed diag_tests
+    local passed failed tests status
+
+    suite_line=$(printf '%s\n' "$suite_output" | grep "^BLORP_GATE_RESULT gate=leak " | tail -1)
+    if [ -n "$suite_line" ]; then
+        suite_status=$(result_field "$suite_line" status)
+        suite_passed=$(result_field "$suite_line" passed)
+        suite_failed=$(result_field "$suite_line" failed)
+        suite_tests=$(result_field "$suite_line" tests)
+    fi
+    case "${suite_status:-}:${suite_passed:-}:${suite_failed:-}:${suite_tests:-}" in
+        PASS:[0-9]*:[0-9]*:[0-9]*|FAIL:[0-9]*:[0-9]*:[0-9]*) ;;
+        *)
+            suite_status="FAIL"
+            suite_passed=0
+            suite_failed=1
+            suite_tests=1
+            ;;
+    esac
+
+    if [ "$suite_exit" -ne 0 ]; then
+        suite_status="FAIL"
+        if [ "$suite_failed" -eq 0 ]; then
+            suite_failed=1
+            suite_tests=$((suite_passed + suite_failed))
+        fi
+    fi
+
+    diag_summary=$(printf '%s\n' "$diag_output" | grep '^Results: [0-9][0-9]* passed, [0-9][0-9]* failed$' | tail -1)
+    if [ -n "$diag_summary" ]; then
+        diag_passed=$(printf '%s\n' "$diag_summary" | sed -n 's/^Results: \([0-9][0-9]*\) passed, \([0-9][0-9]*\) failed$/\1/p')
+        diag_failed=$(printf '%s\n' "$diag_summary" | sed -n 's/^Results: \([0-9][0-9]*\) passed, \([0-9][0-9]*\) failed$/\2/p')
+        diag_tests=$((diag_passed + diag_failed))
+    fi
+    case "${diag_passed:-}:${diag_failed:-}:${diag_tests:-}" in
+        [0-9]*:[0-9]*:[0-9]*) ;;
+        *)
+            diag_passed=0
+            diag_failed=1
+            diag_tests=1
+            ;;
+    esac
+
+    if [ "$diag_exit" -ne 0 ] && [ "$diag_failed" -eq 0 ]; then
+        diag_failed=1
+        diag_tests=$((diag_passed + diag_failed))
+    fi
+
+    passed=$((suite_passed + diag_passed))
+    failed=$((suite_failed + diag_failed))
+    tests=$((suite_tests + diag_tests))
+    status="PASS"
+    if [ "$suite_status" != "PASS" ] || [ "$failed" -ne 0 ]; then
+        status="FAIL"
+    fi
+
+    printf 'BLORP_GATE_RESULT gate=leak status=%s passed=%s failed=%s tests=%s\n' "$status" "$passed" "$failed" "$tests"
+}
+
 parse_cli() {
     local output="$1"
     if parse_structured_gate_result "$output" "cli"; then
@@ -667,17 +759,43 @@ run_runtime() {
 }
 
 run_leak() {
-    echo "═══ Leak-Check Baselines (.brp) ═══"
+    echo "═══ Leak-Check Ownership Suites + Diagnostics ═══"
     echo ""
-    local output exit_code output_file start_seconds
+    local output exit_code output_file diag_output_file start_seconds
+    local suite_exit diag_exit suite_output diag_output
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_leak.XXXXXX") || exit 1
-    capture_stream "$output_file" env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$test_timeout" tests/test_blorp/memory/leak_check_baselines/
-    exit_code=$?
+    diag_output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_leak_diag.XXXXXX") || {
+        rm -f "$output_file"
+        exit 1
+    }
+    if $verbose; then
+        env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$test_timeout" "${leak_roots[@]}" 2>&1 | tee "$output_file"
+        suite_exit=${PIPESTATUS[0]}
+        suite_output=$(cat "$output_file")
+        tests/test_leak_report.sh 2>&1 | tee "$diag_output_file"
+        diag_exit=${PIPESTATUS[0]}
+        diag_output=$(cat "$diag_output_file")
+        cat "$diag_output_file" >> "$output_file"
+    else
+        env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$test_timeout" "${leak_roots[@]}" > "$output_file" 2>&1
+        suite_exit=$?
+        suite_output=$(cat "$output_file")
+        tests/test_leak_report.sh > "$diag_output_file" 2>&1
+        diag_exit=$?
+        diag_output=$(cat "$diag_output_file")
+        cat "$diag_output_file" >> "$output_file"
+    fi
+    emit_combined_leak_result "$suite_output" "$diag_output" "$suite_exit" "$diag_exit" >> "$output_file"
+    if [ "$suite_exit" -eq 0 ] && [ "$diag_exit" -eq 0 ]; then
+        exit_code=0
+    else
+        exit_code=1
+    fi
     output=$(cat "$output_file")
     record_gate_log "leak" "$output_file"
     maybe_print_failure_excerpt "leak" "$output_file" "$exit_code"
-    rm -f "$output_file"
+    rm -f "$output_file" "$diag_output_file"
     leak_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_blorp_output "$output" "leak"
@@ -778,7 +896,7 @@ else
                 ;;
             leak)
                 {
-                    echo "═══ Leak-Check Baselines (.brp) ═══"
+                    echo "═══ Leak-Check Ownership Suites + Diagnostics ═══"
                     echo ""
                 } > "$outfile"
                 ;;
@@ -816,7 +934,20 @@ else
                     env BLORP_GATE_RESULT=runtime ./blorp test --no-format --timeout "$test_timeout" "${runtime_roots[@]}" >> "$outfile" 2>&1
                     ;;
                 leak)
-                    env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$parallel_leak_timeout" tests/test_blorp/memory/leak_check_baselines/ >> "$outfile" 2>&1
+                    env BLORP_GATE_RESULT=leak ./blorp test --no-format --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1
+                    leak_suite_exit=$?
+                    leak_suite_output=$(cat "$outfile")
+                    leak_diag_outfile="$gate_tmpdir/${gate}_diag_output"
+                    tests/test_leak_report.sh > "$leak_diag_outfile" 2>&1
+                    leak_diag_exit=$?
+                    leak_diag_output=$(cat "$leak_diag_outfile")
+                    cat "$leak_diag_outfile" >> "$outfile"
+                    emit_combined_leak_result "$leak_suite_output" "$leak_diag_output" "$leak_suite_exit" "$leak_diag_exit" >> "$outfile"
+                    if [ "$leak_suite_exit" -ne 0 ] || [ "$leak_diag_exit" -ne 0 ]; then
+                        false
+                    else
+                        true
+                    fi
                     ;;
                 doctest)
                     env BLORP_GATE_RESULT=doctest ./blorp test --no-format --doc --timeout "$test_timeout" std/ >> "$outfile" 2>&1

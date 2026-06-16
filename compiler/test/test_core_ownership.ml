@@ -149,12 +149,35 @@ let test_channel_recv_timeout_attempt_borrows_channel () =
     { args = [ Borrow; Borrow ]; result = ReturnOwned }
     (builtin_contract "blorp_channel_recv_timeout_attempt" 2)
 
+let check_consuming_finalizer name =
+  check_contract name
+    { args = [ Consume ]; result = ReturnVoid }
+    (builtin_contract name 1)
+
+let test_file_close_finalizers_consume_handles () =
+  List.iter check_consuming_finalizer
+    [
+      "blorp_file_close_reader";
+      "blorp_file_close_writer";
+      "blorp_file_close_appender";
+      "blorp_file_close_read_writer";
+      "blorp_file_close_read_appender";
+    ]
+
 let test_tcp_close_finalizers_consume_handles () =
-  let expected = { args = [ Consume ]; result = ReturnVoid } in
-  check_contract "blorp_tcp_close_listener" expected
-    (builtin_contract "blorp_tcp_close_listener" 1);
-  check_contract "blorp_tcp_close_stream" expected
-    (builtin_contract "blorp_tcp_close_stream" 1)
+  List.iter check_consuming_finalizer
+    [ "blorp_tcp_close_listener"; "blorp_tcp_close_stream" ]
+
+let test_directory_close_finalizer_consumes_handle () =
+  check_consuming_finalizer "blorp_dir_close"
+
+let test_network_close_finalizers_consume_handles () =
+  List.iter check_consuming_finalizer
+    [
+      "blorp_tls_close_session";
+      "blorp_websocket_close_session";
+      "blorp_udp_close_socket";
+    ]
 
 let test_tcp_connection_sources_borrow_listener () =
   let expected = { args = [ Borrow ]; result = ReturnOwned } in
@@ -163,12 +186,288 @@ let test_tcp_connection_sources_borrow_listener () =
   check_contract "blorp_tcp_connections_continue_on_error_raw" expected
     (builtin_contract "blorp_tcp_connections_continue_on_error_raw" 1)
 
+let test_tcp_value_helpers_have_runtime_contracts () =
+  check_contract "blorp_tcp_ipv4_raw"
+    { args = [ Borrow; Borrow; Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_tcp_ipv4_raw" 4);
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnOwned }
+        (builtin_contract name 1))
+    [
+      "blorp_tcp_parse_ip_raw";
+      "blorp_tcp_dns_name_raw";
+      "blorp_tcp_interface_scope_raw";
+      "blorp_tcp_port_raw";
+      "blorp_tcp_ip_text_raw";
+      "blorp_tcp_dns_name_text_raw";
+      "blorp_tcp_interface_scope_text_raw";
+    ];
+  check_contract "blorp_tcp_port_value_raw"
+    { args = [ Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_tcp_port_value_raw" 1)
+
 let test_network_capability_queries_return_primitives () =
   let expected = { args = []; result = ReturnPrimitive } in
   check_contract "blorp_tls_native_available_raw" expected
     (builtin_contract "blorp_tls_native_available_raw" 0);
   check_contract "blorp_websocket_native_available_raw" expected
     (builtin_contract "blorp_websocket_native_available_raw" 0)
+
+let test_scheduler_runtime_builtins_have_contracts () =
+  check_contract "blorp_sleep"
+    { args = [ Borrow ]; result = ReturnVoid }
+    (builtin_contract "blorp_sleep" 1);
+  check_contract "blorp_yield_now"
+    { args = []; result = ReturnVoid }
+    (builtin_contract "blorp_yield_now" 0);
+  check_contract "blorp_test_cancel_after_parked"
+    { args = [ Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_test_cancel_after_parked" 1);
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = []; result = ReturnPrimitive }
+        (builtin_contract name 0))
+    [
+      "blorp_test_task_window_pending_cleanup_probe";
+      "blorp_test_task_join_slot_probe";
+      "blorp_test_fiber_created_schedule_probe";
+      "blorp_test_timer_waiter_identity_probe";
+      "blorp_test_wait_ready_to_park_probe";
+      "blorp_test_fiber_lifecycle_ready_to_park_probe";
+      "blorp_test_fiber_cancel_before_park_probe";
+      "blorp_test_current_timer_wait_install_probe";
+      "blorp_test_timeout_arithmetic_probe";
+      "blorp_test_cooperative_checkpoint_probe";
+      "blorp_test_tls_state_probe";
+      "blorp_test_websocket_state_probe";
+    ]
+
+let test_time_runtime_builtins_have_contracts () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = []; result = ReturnPrimitive }
+        (builtin_contract name 0))
+    [ "blorp_now_us"; "blorp_time_now" ];
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 1))
+    [
+      "blorp_time_to_year";
+      "blorp_time_to_month";
+      "blorp_time_to_day";
+      "blorp_time_to_hour";
+      "blorp_time_to_minute";
+      "blorp_time_to_second";
+      "blorp_time_to_weekday";
+      "blorp_time_from_iso";
+      "blorp_time_parse_rfc3339";
+    ];
+  check_contract "blorp_time_from_parts"
+    {
+      args = [ Borrow; Borrow; Borrow; Borrow; Borrow; Borrow ];
+      result = ReturnPrimitive;
+    }
+    (builtin_contract "blorp_time_from_parts" 6);
+  check_contract "blorp_time_format"
+    { args = [ Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_time_format" 2);
+  check_contract "blorp_time_parse"
+    { args = [ Borrow; Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_time_parse" 2)
+
+let test_memory_runtime_builtins_have_contracts () =
+  check_contract "blorp_get_mem_stats"
+    { args = []; result = ReturnOwned }
+    (builtin_contract "blorp_get_mem_stats" 0);
+  check_contract "blorp_reset_mem_stats"
+    { args = []; result = ReturnVoid }
+    (builtin_contract "blorp_reset_mem_stats" 0);
+  check_contract "blorp_print_live_object_summary"
+    { args = []; result = ReturnVoid }
+    (builtin_contract "blorp_print_live_object_summary" 0)
+
+let test_process_signal_runtime_builtins_have_contracts () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = []; result = ReturnPrimitive }
+        (builtin_contract name 0))
+    [
+      "blorp_signal_hangup";
+      "blorp_signal_interrupt";
+      "blorp_signal_terminate";
+      "blorp_signal_user1";
+      "blorp_signal_user2";
+    ];
+  check_contract "blorp_signal_on"
+    { args = [ Borrow; Retain ]; result = ReturnVoid }
+    (builtin_contract "blorp_signal_on" 2);
+  check_contract "blorp_signal_received"
+    { args = [ Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_signal_received" 1);
+  check_contract "blorp_signal_raise"
+    { args = [ Borrow ]; result = ReturnVoid }
+    (builtin_contract "blorp_signal_raise" 1)
+
+let test_random_runtime_builtins_have_contracts () =
+  check_contract "blorp_seed_random"
+    { args = [ Borrow ]; result = ReturnVoid }
+    (builtin_contract "blorp_seed_random" 1);
+  check_contract "blorp_random_int"
+    { args = [ Borrow; Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_random_int" 2);
+  check_contract "blorp_random_float"
+    { args = []; result = ReturnPrimitive }
+    (builtin_contract "blorp_random_float" 0);
+  check_contract "blorp_crypto_random_bytes"
+    { args = [ Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_crypto_random_bytes" 1)
+
+let test_hash_runtime_builtins_have_contracts () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 1))
+    [
+      "blorp_hash";
+      "blorp_hash_int";
+      "blorp_hash_string";
+      "blorp_hash_float";
+      "blorp_hash_bytes";
+      "blorp_crc32";
+      "blorp_crc32_bytes";
+    ];
+  check_contract "blorp_hash_combine"
+    { args = [ Borrow; Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "blorp_hash_combine" 2);
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnOwned }
+        (builtin_contract name 1))
+    [
+      "blorp_sha256";
+      "blorp_md5";
+      "blorp_sha1";
+      "blorp_sha512";
+      "blorp_sha256_bytes";
+      "blorp_md5_bytes";
+      "blorp_sha1_bytes";
+      "blorp_sha512_bytes";
+    ];
+  check_contract "blorp_hmac_sha256"
+    { args = [ Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_hmac_sha256" 2)
+
+let test_regex_runtime_builtins_have_contracts () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow; Borrow ]; result = ReturnOwned }
+        (builtin_contract name 2))
+    [ "blorp_regex_test"; "blorp_regex_find"; "blorp_regex_find_all" ];
+  check_contract "blorp_regex_replace_all"
+    { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_regex_replace_all" 3)
+
+let test_checked_numeric_option_builtins_return_stack_options () =
+  let expected = { args = [ Borrow; Borrow ]; result = ReturnPrimitive } in
+  check_contract "blorp_option_div_int" expected
+    (builtin_contract "blorp_option_div_int" 2);
+  check_contract "blorp_option_mod_int" expected
+    (builtin_contract "blorp_option_mod_int" 2)
+
+let test_console_io_runtime_builtins_return_owned_strings () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = []; result = ReturnOwned }
+        (builtin_contract name 0))
+    [ "blorp_read_all"; "blorp_read_line"; "blorp_read_line_or_empty" ];
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnOwned }
+        (builtin_contract name 1))
+    [ "blorp_input"; "blorp_input_or_empty" ]
+
+let test_scalar_math_passthrough_builtins_return_primitives () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 1))
+    [
+      "sqrt";
+      "sin";
+      "cos";
+      "tan";
+      "floor";
+      "ceil";
+      "asin";
+      "acos";
+      "atan";
+      "sinh";
+      "cosh";
+      "tanh";
+      "asinh";
+      "acosh";
+      "atanh";
+      "exp";
+      "exp2";
+      "log";
+      "log2";
+      "log10";
+      "log1p";
+      "expm1";
+      "cbrt";
+      "trunc";
+    ];
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow; Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 2))
+    [ "pow"; "atan2"; "hypot"; "fmod"; "copysign" ];
+  check_contract "fma"
+    { args = [ Borrow; Borrow; Borrow ]; result = ReturnPrimitive }
+    (builtin_contract "fma" 3)
+
+let test_scalar_runtime_builtins_return_primitives () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 1))
+    [
+      "blorp_abs";
+      "blorp_float_abs";
+      "blorp_round";
+      "blorp_is_nan";
+      "blorp_is_inf";
+      "blorp_is_finite";
+      "blorp_black_box_int";
+      "blorp_black_box_float";
+    ];
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow; Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 2))
+    [ "blorp_min"; "blorp_max"; "blorp_float_min"; "blorp_float_max" ];
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = []; result = ReturnPrimitive }
+        (builtin_contract name 0))
+    [ "blorp_infinity"; "blorp_neg_infinity"; "blorp_nan_value" ]
 
 let test_operation_result_bridges_use_manifested_ownership () =
   let arg_mode_of_runtime_ownership = function
@@ -245,15 +544,18 @@ let test_fixed_constructors_allocate_owned_fixed () =
   check_contract "blorp_fixed_new" expected
     (builtin_contract "blorp_fixed_new" 3);
   check_contract "blorp_fixed_from_int" expected
-    (builtin_contract "blorp_fixed_from_int" 3)
+    (builtin_contract "blorp_fixed_from_int" 3);
+  check_contract "blorp_fixed_to_string"
+    { args = [ Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_fixed_to_string" 1)
 
-let test_custom_dict_set_constructors_borrow_callbacks () =
+let test_custom_dict_set_constructors_synthesize_callbacks_in_codegen () =
   check_contract "blorp_dict_new_custom"
-    { args = [ Borrow; Borrow ]; result = ReturnOwned }
-    (builtin_contract "blorp_dict_new_custom" 2);
+    { args = []; result = ReturnOwned }
+    (builtin_contract "blorp_dict_new_custom" 0);
   check_contract "blorp_set_new_custom"
-    { args = [ Borrow; Borrow ]; result = ReturnOwned }
-    (builtin_contract "blorp_set_new_custom" 2)
+    { args = []; result = ReturnOwned }
+    (builtin_contract "blorp_set_new_custom" 0)
 
 let test_dict_with_capacity_allocates_owned_dict () =
   let expected = { args = [ Borrow ]; result = ReturnOwned } in
@@ -375,6 +677,15 @@ let test_unicode_case_borrows_and_returns_owned () =
   check_contract "blorp_upper" expected (builtin_contract "blorp_upper" 1);
   check_contract "blorp_lower" expected (builtin_contract "blorp_lower" 1)
 
+let test_utf8_runtime_builtins_borrow_inputs_and_return_owned () =
+  let expected = { args = [ Borrow ]; result = ReturnOwned } in
+  check_contract "blorp_encode_utf8" expected
+    (builtin_contract "blorp_encode_utf8" 1);
+  check_contract "blorp_decode_utf8" expected
+    (builtin_contract "blorp_decode_utf8" 1);
+  check_contract "blorp_decode_utf8_nullable" expected
+    (builtin_contract "blorp_decode_utf8_nullable" 1)
+
 let test_string_find_byte_from_borrows () =
   check_contract "string_find_byte_from"
     { args = [ Borrow; Borrow; Borrow ]; result = ReturnPrimitive }
@@ -388,7 +699,10 @@ let test_string_copy_bytes_borrows () =
 let test_checked_get_borrows_and_aliases () =
   check_contract "blorp_checked_get"
     { args = [ Borrow; Borrow ]; result = ReturnAliasOfArg 0 }
-    (builtin_contract "blorp_checked_get" 2)
+    (builtin_contract "blorp_checked_get" 2);
+  check_contract "blorp_checked_slice"
+    { args = [ Borrow; Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_checked_slice" 3)
 
 let test_checked_set_cow_consumes_collection () =
   check_contract "blorp_checked_set"
@@ -442,16 +756,22 @@ let test_tensor_linear_algebra_borrows_inputs () =
     [
       "blorp_tensor_matrix_multiply_int";
       "blorp_tensor_matrix_multiply_float";
+      "blorp_tensor_matrix_multiply_float16";
       "blorp_tensor_matrix_multiply_float32";
     ];
   owned_binary
     [
       "blorp_tensor_matrix_vector_multiply_int";
       "blorp_tensor_matrix_vector_multiply_float";
+      "blorp_tensor_matrix_vector_multiply_float16";
       "blorp_tensor_matrix_vector_multiply_float32";
       "blorp_tensor_transposed_matrix_vector_multiply_float";
+      "blorp_tensor_transposed_matrix_vector_multiply_float16";
+      "blorp_tensor_transposed_matrix_vector_multiply_float32";
+      "blorp_tensor_transposed_matrix_vector_multiply_int";
       "blorp_tensor_outer_int";
       "blorp_tensor_outer_float";
+      "blorp_tensor_outer_float16";
       "blorp_tensor_outer_float32";
     ];
   check_contract "blorp_tensor_transpose"
@@ -514,6 +834,14 @@ let test_to_string_runtime_builtins_borrow_inputs () =
         { args = [ Borrow ]; result = ReturnOwned }
         (builtin_contract name 1))
     [
+      "blorp_to_string";
+      "blorp_int128_to_string";
+      "blorp_uint128_to_string";
+      "blorp_float_to_string";
+      "blorp_float16_to_string";
+      "blorp_float32_to_string";
+      "blorp_bool_to_string";
+      "blorp_bool_to_string_long";
       "blorp_bytes_to_string";
       "blorp_list_to_string_bool";
       "blorp_list_to_string_cb";
@@ -527,6 +855,52 @@ let test_to_string_runtime_builtins_borrow_inputs () =
       "blorp_vector_to_string_float16";
       "blorp_vector_to_string_float32";
       "blorp_vector_to_string_int";
+    ]
+
+let test_generated_enum_vector_to_string_contract () =
+  check_contract "blorp_vector_to_string___tests__Base"
+    { args = [ Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_vector_to_string___tests__Base" 1);
+  Alcotest.(check bool)
+    "generated vector to_string rejects wrong arity" true
+    (Option.is_none (builtin_contract "blorp_vector_to_string___tests__Base" 2))
+
+let test_format_float_borrows_inputs_and_returns_owned () =
+  check_contract "blorp_format_float"
+    { args = [ Borrow; Borrow ]; result = ReturnOwned }
+    (builtin_contract "blorp_format_float" 2)
+
+let test_conversion_runtime_builtins_return_primitives () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnPrimitive }
+        (builtin_contract name 1))
+    [
+      "blorp_to_int";
+      "blorp_to_float";
+      "blorp_to_int8";
+      "blorp_to_int16";
+      "blorp_to_int32";
+      "blorp_to_int128";
+      "blorp_to_uint8";
+      "blorp_to_uint16";
+      "blorp_to_uint32";
+      "blorp_to_uint64";
+      "blorp_to_uint128";
+    ]
+
+let test_debug_log_runtime_builtins_borrow_messages () =
+  List.iter
+    (fun name ->
+      check_contract name
+        { args = [ Borrow ]; result = ReturnVoid }
+        (builtin_contract name 1))
+    [
+      "blorp_debug_log_msg";
+      "blorp_debug_info";
+      "blorp_debug_warn";
+      "blorp_debug_error";
     ]
 
 let test_vmap_parallel_borrows_with_result_ownership_flag () =
@@ -1003,12 +1377,43 @@ let suite =
           test_channel_try_recv_attempt_borrows_channel;
         Alcotest.test_case "channel_recv_timeout_attempt_borrows_channel" `Quick
           test_channel_recv_timeout_attempt_borrows_channel;
+        Alcotest.test_case "file_close_finalizers_consume_handles" `Quick
+          test_file_close_finalizers_consume_handles;
         Alcotest.test_case "tcp_close_finalizers_consume_handles" `Quick
           test_tcp_close_finalizers_consume_handles;
+        Alcotest.test_case "directory_close_finalizer_consumes_handle" `Quick
+          test_directory_close_finalizer_consumes_handle;
+        Alcotest.test_case "network_close_finalizers_consume_handles" `Quick
+          test_network_close_finalizers_consume_handles;
         Alcotest.test_case "tcp_connection_sources_borrow_listener" `Quick
           test_tcp_connection_sources_borrow_listener;
+        Alcotest.test_case "tcp_value_helpers_have_runtime_contracts" `Quick
+          test_tcp_value_helpers_have_runtime_contracts;
         Alcotest.test_case "network_capability_queries_return_primitives" `Quick
           test_network_capability_queries_return_primitives;
+        Alcotest.test_case "scheduler_runtime_builtins_have_contracts" `Quick
+          test_scheduler_runtime_builtins_have_contracts;
+        Alcotest.test_case "time_runtime_builtins_have_contracts" `Quick
+          test_time_runtime_builtins_have_contracts;
+        Alcotest.test_case "memory_runtime_builtins_have_contracts" `Quick
+          test_memory_runtime_builtins_have_contracts;
+        Alcotest.test_case "process_signal_runtime_builtins_have_contracts"
+          `Quick test_process_signal_runtime_builtins_have_contracts;
+        Alcotest.test_case "random_runtime_builtins_have_contracts" `Quick
+          test_random_runtime_builtins_have_contracts;
+        Alcotest.test_case "hash_runtime_builtins_have_contracts" `Quick
+          test_hash_runtime_builtins_have_contracts;
+        Alcotest.test_case "regex_runtime_builtins_have_contracts" `Quick
+          test_regex_runtime_builtins_have_contracts;
+        Alcotest.test_case
+          "checked_numeric_option_builtins_return_stack_options" `Quick
+          test_checked_numeric_option_builtins_return_stack_options;
+        Alcotest.test_case "console_io_runtime_builtins_return_owned_strings"
+          `Quick test_console_io_runtime_builtins_return_owned_strings;
+        Alcotest.test_case "scalar_math_passthrough_builtins_return_primitives"
+          `Quick test_scalar_math_passthrough_builtins_return_primitives;
+        Alcotest.test_case "scalar_runtime_builtins_return_primitives" `Quick
+          test_scalar_runtime_builtins_return_primitives;
         Alcotest.test_case "operation_result_bridges_use_manifested_ownership"
           `Quick test_operation_result_bridges_use_manifested_ownership;
         Alcotest.test_case "fallible_stream_sources_use_manifested_ownership"
@@ -1017,8 +1422,9 @@ let suite =
           `Quick test_fallible_stream_terminals_use_manifested_ownership;
         Alcotest.test_case "fixed_constructors_allocate_owned_fixed" `Quick
           test_fixed_constructors_allocate_owned_fixed;
-        Alcotest.test_case "custom_dict_set_constructors_borrow_callbacks"
-          `Quick test_custom_dict_set_constructors_borrow_callbacks;
+        Alcotest.test_case
+          "custom_dict_set_constructors_synthesize_callbacks_in_codegen" `Quick
+          test_custom_dict_set_constructors_synthesize_callbacks_in_codegen;
         Alcotest.test_case "dict_with_capacity_allocates_owned_dict" `Quick
           test_dict_with_capacity_allocates_owned_dict;
         Alcotest.test_case "dict_remove_cow_consumes_dict" `Quick
@@ -1059,6 +1465,9 @@ let suite =
         Alcotest.test_case "string_eq_borrows" `Quick test_string_eq_borrows;
         Alcotest.test_case "unicode_case_borrows_and_returns_owned" `Quick
           test_unicode_case_borrows_and_returns_owned;
+        Alcotest.test_case
+          "utf8_runtime_builtins_borrow_inputs_and_return_owned" `Quick
+          test_utf8_runtime_builtins_borrow_inputs_and_return_owned;
         Alcotest.test_case "string_find_byte_from_borrows" `Quick
           test_string_find_byte_from_borrows;
         Alcotest.test_case "string_copy_bytes_borrows" `Quick
@@ -1077,6 +1486,14 @@ let suite =
           test_vector_specialized_reads_borrow_inputs;
         Alcotest.test_case "to_string_runtime_builtins_borrow_inputs" `Quick
           test_to_string_runtime_builtins_borrow_inputs;
+        Alcotest.test_case "generated_enum_vector_to_string_contract" `Quick
+          test_generated_enum_vector_to_string_contract;
+        Alcotest.test_case "format_float_borrows_inputs_and_returns_owned"
+          `Quick test_format_float_borrows_inputs_and_returns_owned;
+        Alcotest.test_case "conversion_runtime_builtins_return_primitives"
+          `Quick test_conversion_runtime_builtins_return_primitives;
+        Alcotest.test_case "debug_log_runtime_builtins_borrow_messages" `Quick
+          test_debug_log_runtime_builtins_borrow_messages;
         Alcotest.test_case "vmap_parallel_borrows_with_result_ownership_flag"
           `Quick test_vmap_parallel_borrows_with_result_ownership_flag;
         Alcotest.test_case "list_parallel_borrows_with_result_ownership_flag"

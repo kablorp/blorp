@@ -189,6 +189,78 @@ run_step_fn() {
     echo "Completed in $(elapsed_since "$started")."
 }
 
+snapshot_git_state() {
+    local output_file="$1"
+    {
+        git status --porcelain=v1 --untracked-files=all
+        printf '\n-- tracked diff --\n'
+        git diff --binary --no-ext-diff
+        printf '\n-- staged diff --\n'
+        git diff --cached --binary --no-ext-diff
+    } > "$output_file"
+}
+
+run_non_mutating_step_fn() {
+    local name="$1"
+    shift
+    local started before after status snapshot_status changed
+    print_header "$name"
+    started=$(date +%s)
+
+    if [ "$dry_run" -eq 1 ]; then
+        "$@"
+        echo "Completed in $(elapsed_since "$started")."
+        return 0
+    fi
+
+    before=$(mktemp "${TMPDIR:-/tmp}/blorp-premerge-before.XXXXXX") || return 1
+    after=$(mktemp "${TMPDIR:-/tmp}/blorp-premerge-after.XXXXXX") || {
+        rm -f "$before"
+        return 1
+    }
+
+    if ! snapshot_git_state "$before"; then
+        rm -f "$before" "$after"
+        return 1
+    fi
+
+    set +e
+    (
+        set -euo pipefail
+        "$@"
+    )
+    status=$?
+    snapshot_git_state "$after"
+    snapshot_status=$?
+    set -e
+
+    if [ "$snapshot_status" -ne 0 ]; then
+        rm -f "$before" "$after"
+        return "$snapshot_status"
+    fi
+
+    changed=0
+    if ! cmp -s "$before" "$after"; then
+        echo "$name changed the working tree; premerge validation must be non-mutating." >&2
+        echo "Current git status:" >&2
+        git status --short >&2
+        echo "Run git diff to inspect the mutation." >&2
+        changed=1
+    fi
+
+    rm -f "$before" "$after"
+
+    if [ "$status" -ne 0 ]; then
+        return "$status"
+    fi
+
+    if [ "$changed" -ne 0 ]; then
+        return 1
+    fi
+
+    echo "Completed in $(elapsed_since "$started")."
+}
+
 fail_if_unmerged() {
     local unmerged
     unmerged=$(git diff --name-only --diff-filter=U)
@@ -244,43 +316,46 @@ run_preview_smoke_gate() {
     fi
 
     tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-preview.XXXXXX")
-    smoke="$tmpdir/preview.brp"
-    tmpc="$tmpdir/preview.c"
-    repl_out="$tmpdir/repl.out"
-    lsp_out="$tmpdir/lsp.out"
+    (
+        set -euo pipefail
+        trap 'rm -rf "$tmpdir"' EXIT
 
-    cat > "$smoke" <<'BRP'
+        smoke="$tmpdir/preview.brp"
+        tmpc="$tmpdir/preview.c"
+        repl_out="$tmpdir/repl.out"
+        lsp_out="$tmpdir/lsp.out"
+
+        cat > "$smoke" <<'BRP'
 func main(args: List[String]) -> Int:
 	print("preview smoke")
 	0
 BRP
 
-    run_cmd ./blorp check --no-format "$smoke"
-    run_cmd ./blorp compile --no-format -o "$tmpc" "$smoke"
-    run_cmd ./blorp run --timeout 5 --no-format "$smoke"
-    run_cmd ./blorp test --no-cache --timeout 5 tests/test_blorp/types/test_bool.brp
-    run_cmd ./blorp test --warmup-only
-    run_cmd ./blorp test --leak-check --suite --timeout 5 \
-        tests/test_blorp/memory/leak_check_baselines/empty_main.brp
+        run_cmd ./blorp check --no-format "$smoke"
+        run_cmd ./blorp compile --no-format -o "$tmpc" "$smoke"
+        run_cmd ./blorp run --timeout 5 --no-format "$smoke"
+        run_cmd ./blorp test --no-format --no-cache --timeout 5 tests/test_blorp/types/test_bool.brp
+        run_cmd ./blorp test --warmup-only
+        run_cmd ./blorp test --no-format --leak-check --suite --timeout 5 \
+            tests/test_blorp/memory/leak_check_baselines/empty_main.brp
 
-    if [ "$run_sanitize" -eq 1 ]; then
-        run_cmd ./blorp test --sanitize --timeout 5 tests/test_blorp/types/test_bool.brp
-    else
-        echo "Skipping preview sanitizer smoke."
-    fi
+        if [ "$run_sanitize" -eq 1 ]; then
+            run_cmd ./blorp test --no-format --sanitize --timeout 5 tests/test_blorp/types/test_bool.brp
+        else
+            echo "Skipping preview sanitizer smoke."
+        fi
 
-    run_preview_repl_smoke "$repl_out"
-    run_preview_lsp_smoke "$lsp_out"
-    run_cmd env BLORP_TIMEOUT=5 ./blorp test tests/test_blorp/types/test_bool.brp
-    run_cmd env BLORP_STD=std BLORP_NO_FORMAT=1 ./blorp check \
-        tests/test_blorp/types/test_bool.brp
-
-    if [ "$run_sanitize" -eq 1 ]; then
-        run_cmd env BLORP_SANITIZE=1 ./blorp test --timeout 5 \
+        run_preview_repl_smoke "$repl_out"
+        run_preview_lsp_smoke "$lsp_out"
+        run_cmd env BLORP_TIMEOUT=5 ./blorp test --no-format tests/test_blorp/types/test_bool.brp
+        run_cmd env BLORP_STD=std BLORP_NO_FORMAT=1 ./blorp check \
             tests/test_blorp/types/test_bool.brp
-    fi
 
-    rm -rf "$tmpdir"
+        if [ "$run_sanitize" -eq 1 ]; then
+            run_cmd env BLORP_SANITIZE=1 ./blorp test --no-format --timeout 5 \
+                tests/test_blorp/types/test_bool.brp
+        fi
+    )
 }
 
 run_example_checks() {
@@ -426,7 +501,7 @@ run_step_fn "Preflight" fail_if_unmerged
 run_step_fn "Build" run_clean_build
 run_step_fn "Quality" run_quality_gate
 run_step_fn "Tests" run_test_suites
-run_step_fn "Preview smoke" run_preview_smoke_gate
+run_non_mutating_step_fn "Preview smoke" run_preview_smoke_gate
 run_step_fn "Example checks" run_example_checks
 run_step_fn "Example smoke runs" run_example_smokes
 run_step_fn "Sanitizers" run_sanitizer_gate
