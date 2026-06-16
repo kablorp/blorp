@@ -11,6 +11,7 @@ open Lsp_json
    ============================================================================ *)
 
 let kind_class = 5
+let kind_namespace = 3
 let kind_method = 6
 let kind_property = 7
 let kind_interface = 8
@@ -92,6 +93,21 @@ let rec decl_to_symbol (d : decl) : json option =
   | DVar vd ->
       let name = match vd.var_name with Some n -> n | None -> "_" in
       Some (symbol_at ~name ~kind:kind_variable d.decl_loc)
+  | DCompileTimeBlock bindings ->
+      let children =
+        List.filter_map
+          (fun binding ->
+            if binding.ctb_private then None
+            else
+              let name =
+                match binding.ctb_var.var_name with Some n -> n | None -> "_"
+              in
+              Some (symbol_at ~name ~kind:kind_variable binding.ctb_loc))
+          bindings
+      in
+      Some
+        (symbol_at ~name:"compile_time" ~kind:kind_namespace ~children
+           d.decl_loc)
   | DTrait td ->
       let children =
         List.map

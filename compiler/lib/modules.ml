@@ -375,6 +375,21 @@ let extract_export_names _decl inner_decl =
       match f.func_name with Some n -> [ (n, inner_decl) ] | None -> [])
   | DVar v -> (
       match v.var_name with Some n -> [ (n, inner_decl) ] | None -> [])
+  | DCompileTimeBlock bindings ->
+      List.filter_map
+        (fun binding ->
+          if binding.ctb_private then None
+          else
+            Option.map
+              (fun name ->
+                ( name,
+                  {
+                    decl_desc = DVar binding.ctb_var;
+                    decl_loc = binding.ctb_loc;
+                    decl_doc = binding.ctb_doc;
+                  } ))
+              binding.ctb_var.var_name)
+        bindings
   | DType t -> [ (t.type_name, inner_decl) ]
   | DRecord r -> [ (r.record_name, inner_decl) ]
   | DTypeAlias a -> [ (a.alias_name, inner_decl) ]

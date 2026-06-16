@@ -242,7 +242,7 @@ let rec add_source_type_decl_completion add label decl =
   | DTypeAlias alias_decl ->
       add label kind_class (type_alias_detail label alias_decl) "0"
   | DPrivate inner -> add_source_type_decl_completion add label inner
-  | DFunc _ | DVar _ | DImport _ | DImpl _ -> ()
+  | DFunc _ | DVar _ | DImport _ | DImpl _ | DCompileTimeBlock _ -> ()
 
 let rec source_type_label decl =
   match decl.decl_desc with
@@ -251,7 +251,7 @@ let rec source_type_label decl =
   | DTrait trait_decl -> Some trait_decl.trait_name
   | DTypeAlias alias_decl -> Some alias_decl.alias_name
   | DPrivate inner -> source_type_label inner
-  | DFunc _ | DVar _ | DImport _ | DImpl _ -> None
+  | DFunc _ | DVar _ | DImport _ | DImpl _ | DCompileTimeBlock _ -> None
 
 let completions_from_source_types ?file ?(skip = fun _ -> false)
     (program : program) (prefix : string) : json list * (string, unit) Hashtbl.t
@@ -478,6 +478,12 @@ let completions_from_typed_program ?file (program : Typed_ast.program)
             | DeclFunction func -> add_typed_function_completion add func
             | DeclVar var -> add_typed_var_completion add var
             | _ -> ())
+        | DeclCompileTimeBlock bindings ->
+            List.iter
+              (fun binding ->
+                add_typed_var_completion add
+                  (Typed_ast.compile_time_binding_var binding))
+              bindings
         | DeclImpl _ | DeclOther -> ());
   (List.rev !items, names)
 
@@ -912,7 +918,8 @@ let completions_from_module (module_path : string) (prefix : string) : json list
                 (Printf.sprintf "alias %s = %s" name
                    (Types.type_to_string ad.alias_target))
           | DImpl _ -> item name kind_method (Printf.sprintf "impl %s" name)
-          | DImport _ | DPrivate _ -> item name kind_variable name)
+          | DCompileTimeBlock _ | DImport _ | DPrivate _ ->
+              item name kind_variable name)
         m.exports
 
 let completions_from_module_types (module_path : string) (prefix : string) :

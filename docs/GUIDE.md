@@ -164,6 +164,63 @@ tuples, collections, arithmetic, and union constructors, but they cannot call
 functions or methods, use closure calls, or use subscripts that lower to runtime
 helper calls. Move runtime work into `main` or into a function called by `main`.
 
+### Compile-Time Values
+
+Use a top-level `compile_time:` block when a global value should be evaluated by
+the compiler and materialized as ordinary immutable data in the generated
+program. Private bindings used only by later bindings in the same
+`compile_time:` block are treated as compiler scratch values; they are still
+evaluated and validated, but they may be omitted from generated runtime data.
+
+```blorp
+compile_time:
+    private X: Int = 1 + 2
+    Y: Int =
+        X * 4
+
+func main(args: List[String]) -> Int:
+    Y
+```
+
+Visibility belongs on each binding inside the block. Do not write
+`private compile_time:`. Bindings are evaluated in source order, so later
+bindings can reference earlier bindings in the same block. Bindings declared
+directly inside the block are always immutable; local `var` mutation is allowed
+inside pure functions evaluated by the compiler.
+
+Compile-time initializers must be pure and must be evaluatable by the compiler.
+The evaluator is intentionally smaller than runtime Blorp. It supports literal
+data, `Int` and `Float` arithmetic, comparisons, `if`/`else`,
+statement-style `if` without `else`, `match`, blocks with local bindings, local
+`var` mutation, `void` no-op expressions, `while`, `for` over ranges and lists,
+tuple destructuring, tuples, lists, dicts, records, record updates, record field
+access, tuple field access, range `start`/`end` field access, and string
+interpolation with `String`/`Int`/`Float`/`Bool`/`Char` expression parts. It
+also supports union and enum constructors, direct local pure function calls
+including tuple-pattern parameters, recursion, pure lambda and named-function
+callbacks, pure `List` construction, lookup, and callback helpers, pure `Dict`
+construction and lookup helpers, simple `Option` and `Result`
+query/conversion/callback helpers such as `get_or`, `is_some`, `is_ok`, `map`,
+`and_then`, `to_result`, `from_option`, `to_option`, and `?=` propagation,
+primitive `to_string` calls, and deterministic byte-string helpers such as
+`String.length()`, `substring`, `starts_with`, `ends_with`, `contains`,
+`raw_index_of`, `index_of`, `get`, `get_or`, `drop_left`, `take_left`, `trim`,
+`trim_left`, `trim_right`, `reverse`, `count`, `split`, `replace`, `repeat`,
+`from_char`, `chars`, and `from_chars`.
+
+Unsupported compile-time work is rejected during checking instead of being
+lowered to runtime startup code. The current compile-time evaluator does not
+support materializing function values as globals, pure foreign calls, vector
+literals, collection/tensor subscript expressions that lower to runtime
+helpers, resource `with` expressions, `select`, `concurrent:`,
+`for ... concurrently`, `detach`, `debug:` blocks, raw
+system/IO/time/randomness, or impure calls of any kind. Tuple index access is
+supported through tuple field access. Use ordinary runtime code for unsupported
+operations, or make the compile-time result with the supported pure data subset.
+Runtime purity is required but not sufficient: pure std helpers outside the
+listed compile-time subset are rejected until the compiler gives them explicit
+CTFE support.
+
 ### Control Flow
 
 ```blorp
@@ -3945,5 +4002,5 @@ type       alias      private    import     as         implements Self       bui
 match      while      for        in         if         else       and        or
 not        True       False      void       break      continue   debug      foreign
 concurrent concurrently detach   select     from       after      sealed     with
-resource   where        into
+resource   where      into       compile_time
 ```

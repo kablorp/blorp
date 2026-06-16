@@ -1030,6 +1030,11 @@ let rec collect_expr_cases_from_decl acc decl =
   match decl.Ast.decl_desc with
   | Ast.DFunc func -> collect_expr_cases_from_func acc func
   | Ast.DVar var -> collect_expr_cases_from_expr var.Ast.var_value @ acc
+  | Ast.DCompileTimeBlock bindings ->
+      List.fold_left
+        (fun acc binding ->
+          collect_expr_cases_from_expr binding.Ast.ctb_var.var_value @ acc)
+        acc bindings
   | Ast.DPrivate inner -> collect_expr_cases_from_decl acc inner
   | Ast.DTrait trait_decl ->
       List.fold_left

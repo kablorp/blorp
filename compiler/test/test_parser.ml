@@ -103,6 +103,13 @@ let test_leading_dot_chain_continuation () =
   in
   ignore (parse_ok source)
 
+let test_multiline_var_initializer_after_equals () =
+  let source =
+    "compile_time:\n" ^ "\tprivate X: Int = 1\n" ^ "\tY: Int =\n"
+    ^ "\t\tX + 1\n\n\n" ^ "func main(args: List[String]) -> Int:\n" ^ "\tY\n"
+  in
+  ignore (parse_ok source)
+
 let test_formatter_preserves_match_call_arg_parseability () =
   let source =
     "func id_char(c: Char) -> Char:\n" ^ "\tc\n\n\n"
@@ -291,6 +298,8 @@ let suite =
       [
         Alcotest.test_case "leading-dot method chains continue expression"
           `Quick test_leading_dot_chain_continuation;
+        Alcotest.test_case "multiline var initializer after equals" `Quick
+          test_multiline_var_initializer_after_equals;
       ] );
     ( "formatter",
       [

@@ -232,6 +232,21 @@ let rec transform_decl (decl : decl) : decl =
         decl with
         decl_desc = DVar { var with var_value = transform_expr var.var_value };
       }
+  | DCompileTimeBlock bindings ->
+      let transform_binding binding =
+        {
+          binding with
+          ctb_var =
+            {
+              binding.ctb_var with
+              var_value = transform_expr binding.ctb_var.var_value;
+            };
+        }
+      in
+      {
+        decl with
+        decl_desc = DCompileTimeBlock (List.map transform_binding bindings);
+      }
   | DPrivate inner -> { decl with decl_desc = DPrivate (transform_decl inner) }
   | DImpl impl ->
       {

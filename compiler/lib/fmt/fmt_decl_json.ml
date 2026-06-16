@@ -143,6 +143,20 @@ let var_to_json ~is_private var =
            @ optional_field "type"
                (Option.map Fmt_expr_json.type_expr_to_json var.Ast.var_type)))
 
+let compile_time_binding_to_json binding =
+  var_to_json ~is_private:binding.Ast.ctb_private binding.Ast.ctb_var
+
+let compile_time_block_to_json bindings =
+  match Fmt_expr_json.option_map_all compile_time_binding_to_json bindings with
+  | None -> None
+  | Some binding_jsons ->
+      Some
+        (obj
+           [
+             field "tag" (string "CompileTime");
+             field "bindings" (array binding_jsons);
+           ])
+
 let builtin_body_fields = function
   | Ast.BuiltinIntrinsic -> [ field "body_kind" (string "builtin") ]
   | Ast.BuiltinStdIntrinsic identity ->
@@ -309,6 +323,8 @@ let rec decl_to_json ?(is_private = false) decl =
       Some (with_supported_doc decl (record_to_json ~is_private record_decl))
   | Ast.DVar var ->
       Option.map (with_supported_doc decl) (var_to_json ~is_private var)
+  | Ast.DCompileTimeBlock bindings ->
+      Option.map (with_supported_doc decl) (compile_time_block_to_json bindings)
   | Ast.DFunc func ->
       Option.map (with_supported_doc decl) (func_to_json ~is_private func)
   | Ast.DPrivate inner -> decl_to_json ~is_private:true inner
@@ -344,6 +360,11 @@ let rec decl_source_end_line decl =
 and decl_desc_source_end_line = function
   | Ast.DFunc func -> Span.func_source_end_line func
   | Ast.DVar var -> Span.expr_source_end_line var.Ast.var_value
+  | Ast.DCompileTimeBlock bindings ->
+      List.fold_left
+        (fun acc binding ->
+          max acc (Span.expr_source_end_line binding.Ast.ctb_var.var_value))
+        0 bindings
   | Ast.DPrivate inner -> decl_source_end_line inner
   | Ast.DTrait trait_decl ->
       List.fold_left
