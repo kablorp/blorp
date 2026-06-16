@@ -72,24 +72,16 @@ let rec value_to_expr value =
           Ctfe_error.error value.loc
             "compile_time cannot materialize function values as global data";
         ]
-  | VConstructor { name; args; callee; resolved_call; constructor_info } -> (
+  | VConstructor { name; args; constructor_info; constructor_origin } -> (
       value_to_exprs args >>= fun arg_exprs ->
-      match (callee, arg_exprs, constructor_info) with
-      | Some callee, _, _ ->
+      match (constructor_origin, arg_exprs) with
+      | ConstructorSourceCall { callee; resolved_call }, _ ->
           make_expr ?resolved_call value.loc value.ty
             (Ast.ECall (callee, arg_exprs))
-      | None, [], _ -> make_expr value.loc value.ty (Ast.EIdent name)
-      | None, _, Some info ->
-          synthetic_constructor_call value name args arg_exprs info
-      | None, _, None ->
-          Error
-            [
-              Ctfe_error.error value.loc
-                (Printf.sprintf
-                   "internal CTFE error: constructor '%s' has payload but no \
-                    callee"
-                   name);
-            ])
+      | ConstructorSynthesized, [] ->
+          make_expr value.loc value.ty (Ast.EIdent name)
+      | ConstructorSynthesized, _ ->
+          synthetic_constructor_call value name args arg_exprs constructor_info)
 
 and value_to_exprs values =
   let rec loop acc = function

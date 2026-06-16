@@ -8,8 +8,8 @@ open Ctfe_value
 
 let ( >>= ) = Result.bind
 let type_name ty = Types.type_to_string ty
-let value_type expr = Typed_ast.value_type expr
-let value_loc expr = Typed_ast.loc expr
+let value_type (expr : Ctfe_ir.expr) = expr.ty
+let value_loc (expr : Ctfe_ir.expr) = expr.loc
 
 let is_named_type name ty =
   match Types.head_resolve ty with
@@ -64,6 +64,26 @@ let expect_bool loc = function
         [
           Ctfe_error.error loc
             (Printf.sprintf "compile_time expected Bool, found %s"
+               (type_name value.ty));
+        ]
+
+let expect_char loc = function
+  | { desc = VChar c; _ } -> Ok c
+  | value ->
+      Error
+        [
+          Ctfe_error.error loc
+            (Printf.sprintf "compile_time expected Char, found %s"
+               (type_name value.ty));
+        ]
+
+let expect_string loc = function
+  | { desc = VString (text, _); _ } -> Ok text
+  | value ->
+      Error
+        [
+          Ctfe_error.error loc
+            (Printf.sprintf "compile_time expected String, found %s"
                (type_name value.ty));
         ]
 
@@ -122,11 +142,21 @@ let bool_value expr b = scalar_value expr (VBool b)
 let int_arg_value loc n =
   { ty = Ast.TyNamed ("Int", []); desc = VInt (Int64.of_int n); loc }
 
+let char_arg_value loc c =
+  { ty = Ast.TyNamed ("Char", []); desc = VChar c; loc }
+
 let string_value expr text =
   scalar_value expr (VString (text, plain_string_flags))
 
+let string_arg_value loc text =
+  {
+    ty = Ast.TyNamed ("String", []);
+    desc = VString (text, plain_string_flags);
+    loc;
+  }
+
 let call_result_value call_expr value =
-  Ok { value with ty = value_type call_expr; loc = Typed_ast.loc call_expr }
+  Ok { value with ty = value_type call_expr; loc = value_loc call_expr }
 
 let index_upper_bound = Int64.of_int max_int
 
@@ -179,9 +209,8 @@ let construct_value ctx call_expr name args =
            {
              name;
              args;
-             callee = None;
-             resolved_call = None;
-             constructor_info = Some info;
+             constructor_info = info;
+             constructor_origin = ConstructorSynthesized;
            })
   | Some info ->
       Error
@@ -219,12 +248,7 @@ let classified_constructor_value = function
   | {
       desc =
         VConstructor
-          {
-            name;
-            args;
-            constructor_info = Some { constructor_parent_type; _ };
-            _;
-          };
+          { name; args; constructor_info = { constructor_parent_type; _ }; _ };
       _;
     } ->
       Option.map

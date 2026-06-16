@@ -5224,11 +5224,9 @@ let compile_time_constructor_info env name =
   match Env.get_constructor env name with
   | Some (parent_type, _, field_types, _) ->
       Some
-        {
-          Ctfe.constructor_parent_type = parent_type;
-          constructor_arity = List.length field_types;
-          constructor_callable_id = Env.get_constructor_callable_id env name;
-        }
+        (Ctfe.make_constructor_info ~parent_type
+           ~arity:(List.length field_types)
+           ~callable_id:(Env.get_constructor_callable_id env name))
   | None -> None
 
 let rec second_pass (state : check_state) (decls : program) :

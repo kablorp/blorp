@@ -223,6 +223,11 @@ compile_time_binding = [ docstring ] [ "private" ] IDENT [ ":" type_expr ] var_i
 - Bindings evaluate in source order. Later bindings can reference earlier
   bindings in the same block.
 - Initializers must be pure and evaluatable by the compiler.
+- The evaluator is a restricted pure subset. Unsupported forms are rejected
+  during checking rather than lowered to runtime startup code; this currently
+  includes function values as materialized globals, foreign calls, vector
+  literals, collection/tensor subscripts, resources, concurrency, debug blocks,
+  system APIs, IO, time, randomness, and impure calls.
 
 ### Type Declarations
 

@@ -88,9 +88,10 @@ Direction:
 - Reuse the normal parser, name resolution, type inference, purity checks, and
   runtime materialization path. CTFE should consume those facts, not recompute
   them from source names or expression shapes.
-- Move toward evaluating a shared lowered representation. If full Core is too
-  broad initially, use a small CTFE IR derived mechanically from typed AST/Core
-  instead of duplicating semantic decisions inside the evaluator.
+- Evaluate a small CTFE IR derived mechanically from typed AST. Full Core is
+  still broader than CTFE needs today, but the evaluator should consume a
+  lowered, explicit representation instead of matching directly on typed AST
+  expression shapes.
 - Put compiler-owned std/builtin behavior behind a CTFE intrinsic registry. Each
   supported operation should have one narrow entry describing the runtime
   builtin/source identity, determinism requirement, evaluator, and unsupported
@@ -101,15 +102,67 @@ Direction:
 - Dogfood after the architecture boundary is in place. The intrinsic renderer is
   a useful acceptance test, but it should not force ad hoc CTFE support.
 
-Near-term cleanup:
+Current checkpoint:
 
-1. Centralize CTFE intrinsic classification and dispatch before adding more std
-   helpers.
-2. Make compile-time-required bindings explicit in the typed representation, or
-   document why the existing block representation is enough for the current
-   phase boundary.
-3. Decide whether the next evaluator target is Core or a smaller CTFE IR, based
-   on which option reuses more existing compiler facts with less special casing.
+- CTFE has a narrow public boundary in `compiler/lib/ctfe.mli`: external
+  compiler phases provide constructor metadata and call `evaluate_program`.
+- Compile-time-required bindings are explicit in the typed representation.
+- `Ctfe_ir` is the chosen evaluator boundary for expression execution. Top-level
+  compile-time binding initializers and called function bodies are translated
+  into this smaller representation before evaluation.
+- CTFE function values wrap typed functions with lazy cached IR bodies, so
+  unsupported function bodies are still rejected only when compile-time
+  evaluation actually calls them.
+- Intrinsic source classification is centralized in `Ctfe_intrinsic`; supported
+  imported, builtin, and trait std behavior is isolated in `Ctfe_std_eval`
+  instead of mixed into the main evaluator.
+- CTFE value-construction helpers and std evaluators consume `Ctfe_ir` call
+  sites, keeping typed-expression location/type access inside the IR translator.
+- `Ctfe_ir` classifies resolved calls into CTFE call kinds, including local,
+  imported, builtin, constructor, trait, closure, and unresolved calls. The
+  evaluator dispatches on those explicit variants instead of re-decoding raw
+  call-resolution metadata.
+- `Ctfe_ir` also classifies identifier function references, so named callbacks
+  are explicit local-function references, unsupported references, impure
+  references, or ordinary value identifiers before evaluation.
+- `Ctfe_ir` classifies nullary constructor identifiers with constructor
+  metadata before evaluation; the evaluator still checks local bindings first,
+  preserving normal shadowing while avoiding name-based constructor guessing in
+  the execution loop.
+- Empty dict literals are normalized to `Ctfe_ir.Dict []` during translation
+  using the typed expression type, rather than making the evaluator treat an
+  empty record-shaped literal as a possible dictionary.
+- Field access is classified in `Ctfe_ir` as record, tuple-index, range-start,
+  range-end, or explicit invalid tuple/range access, so the evaluator no longer
+  parses tuple indexes or decodes range field names while executing values.
+- `Ctfe_ir` stores source AST only where materialization still needs it:
+  constructor calls retain the callee AST narrowly so evaluated constructors can
+  be rewritten as ordinary source-level constructor initializers.
+- Raw call-resolution metadata is not carried on every CTFE expression;
+  constructor calls retain the resolved-call payload narrowly because
+  materialization uses it to rebuild ordinary constructor initializers.
+- CTFE constructor values carry explicit constructor identity and
+  materialization origin, rather than optional callee/resolved-call/constructor
+  metadata with hidden coupling.
+- The main evaluator consumes `Ctfe_ir` for expression/control-flow/call
+  evaluation and keeps top-level compile-time block expansion separate.
+- Codegen audit coverage now checks that CTFE-only builder functions are absent
+  from generated C for both scalar constants and heap-shaped list/dict/record/
+  union materialized data.
+- Private compile-time-only intermediate bindings are evaluated and validated
+  for materializability, but omitted from generated runtime globals unless
+  ordinary code references them.
+- CTFE supports the core deterministic byte-string helpers used by std/string,
+  including slicing, trimming, search, byte access, reversal, counting, repeat,
+  split, replace, and Char/list conversion helpers.
+
+Next steps:
+
+- Keep moving semantic normalization out of the evaluator and into `Ctfe_ir`
+  translation where it can be represented explicitly.
+- Add new CTFE surface area only after deciding the IR node and intrinsic
+  contract it belongs to.
+- Avoid broad Core reuse unless a later CTFE feature needs a Core-only fact.
 
 ### Ownership And Reuse Performance
 

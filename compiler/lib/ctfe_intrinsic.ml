@@ -8,9 +8,13 @@ module Source = struct
   let dict_type = "Dict"
   let option_type = "Option"
   let result_type = "Result"
+  let range_type = "Range"
   let dict_module = "std/dict"
   let list_module = "std/list"
+  let string_module = "std/string"
   let dict_length_builtin = "std/dict.length"
+  let range_start_field = "start"
+  let range_end_field = "end"
   let option_module = "std/option"
   let result_module = "std/result"
   let list_length_builtin = "std/list.length"
@@ -38,6 +42,7 @@ module Source = struct
   let ok_constructor = "Ok"
   let set = "set"
   let some_constructor = "Some"
+  let substring = "substring"
   let append = "append"
   let and_then = "and_then"
   let any = "any"
@@ -47,14 +52,39 @@ module Source = struct
   let fold_left = "fold_left"
   let fold_right = "fold_right"
   let all = "all"
+  let ends_with = "ends_with"
+  let chars = "chars"
+  let count = "count"
+  let drop_left = "drop_left"
+  let from_char = "from_char"
+  let from_chars = "from_chars"
+  let index_of = "index_of"
+  let raw_index_of = "raw_index_of"
+  let replace = "replace"
+  let repeat = "repeat"
+  let reverse = "reverse"
+  let split = "split"
+  let starts_with = "starts_with"
   let to_option = "to_option"
   let to_result = "to_result"
   let to_string = "to_string"
+  let take_left = "take_left"
+  let trim = "trim"
+  let trim_left = "trim_left"
+  let trim_right = "trim_right"
   let with_capacity = "with_capacity"
 end
 
-type imported_module = List | Dict | Option | Result
-type builtin_call = BuiltinToString | BuiltinLength
+type imported_module = List | Dict | Option | Result | String
+
+type builtin_call =
+  | BuiltinToString
+  | BuiltinLength
+  | BuiltinGet
+  | BuiltinStringFromChar
+  | BuiltinStringChars
+  | BuiltinStringFromChars
+
 type trait_call = TraitStringableToString | TraitHasLengthLength
 
 type constructor =
@@ -113,23 +143,50 @@ type result_op =
   | ResultIsErr
   | ResultToOption
 
+type string_op =
+  | StringLength
+  | StringSubstring
+  | StringStartsWith
+  | StringEndsWith
+  | StringContains
+  | StringRawIndexOf
+  | StringIndexOf
+  | StringRepeat
+  | StringSplit
+  | StringReplace
+  | StringDropLeft
+  | StringTakeLeft
+  | StringTrim
+  | StringTrimLeft
+  | StringTrimRight
+  | StringReverse
+  | StringCount
+  | StringGet
+  | StringGetOr
+  | StringFromChar
+  | StringChars
+  | StringFromChars
+
 type imported_call =
   | ImportedList of list_op
   | ImportedDict of dict_op
   | ImportedOption of option_op
   | ImportedResult of result_op
+  | ImportedString of string_op
 
 let module_path_of_imported_call = function
   | ImportedList _ -> Source.list_module
   | ImportedDict _ -> Source.dict_module
   | ImportedOption _ -> Source.option_module
   | ImportedResult _ -> Source.result_module
+  | ImportedString _ -> Source.string_module
 
 let imported_module_of_path = function
   | path when path = Source.list_module -> Some List
   | path when path = Source.dict_module -> Some Dict
   | path when path = Source.option_module -> Some Option
   | path when path = Source.result_module -> Some Result
+  | path when path = Source.string_module -> Some String
   | _ -> None
 
 let list_op_of_source_name = function
@@ -186,6 +243,31 @@ let result_op_of_source_name = function
   | name when name = Source.to_option -> Some ResultToOption
   | _ -> None
 
+let string_op_of_source_name = function
+  | name when name = Source.length -> Some StringLength
+  | name when name = Source.substring -> Some StringSubstring
+  | name when name = Source.starts_with -> Some StringStartsWith
+  | name when name = Source.ends_with -> Some StringEndsWith
+  | name when name = Source.contains -> Some StringContains
+  | name when name = Source.raw_index_of -> Some StringRawIndexOf
+  | name when name = Source.index_of -> Some StringIndexOf
+  | name when name = Source.repeat -> Some StringRepeat
+  | name when name = Source.split -> Some StringSplit
+  | name when name = Source.replace -> Some StringReplace
+  | name when name = Source.drop_left -> Some StringDropLeft
+  | name when name = Source.take_left -> Some StringTakeLeft
+  | name when name = Source.trim -> Some StringTrim
+  | name when name = Source.trim_left -> Some StringTrimLeft
+  | name when name = Source.trim_right -> Some StringTrimRight
+  | name when name = Source.reverse -> Some StringReverse
+  | name when name = Source.count -> Some StringCount
+  | name when name = Source.get -> Some StringGet
+  | name when name = Source.get_or -> Some StringGetOr
+  | name when name = Source.from_char -> Some StringFromChar
+  | name when name = Source.chars -> Some StringChars
+  | name when name = Source.from_chars -> Some StringFromChars
+  | _ -> None
+
 let imported_call_of_source ~module_path ~source_name =
   match imported_module_of_path module_path with
   | Some List ->
@@ -204,10 +286,20 @@ let imported_call_of_source ~module_path ~source_name =
       Option.map
         (fun op -> ImportedResult op)
         (result_op_of_source_name source_name)
+  | Some String ->
+      Option.map
+        (fun op -> ImportedString op)
+        (string_op_of_source_name source_name)
   | None -> None
 
 let builtin_call_of_source_name source_name =
   if String.equal source_name Source.to_string then Some BuiltinToString
+  else if String.equal source_name Source.get then Some BuiltinGet
+  else if String.equal source_name Source.from_char then
+    Some BuiltinStringFromChar
+  else if String.equal source_name Source.chars then Some BuiltinStringChars
+  else if String.equal source_name Source.from_chars then
+    Some BuiltinStringFromChars
   else
     match source_name with
     | name

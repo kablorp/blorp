@@ -12,6 +12,12 @@ let () =
         (fun (name, cases) -> ("CtfeIntrinsic." ^ name, cases))
         Test_ctfe_intrinsic.suite
     @ List.map
+        (fun (name, cases) -> ("CtfeIr." ^ name, cases))
+        Test_ctfe_ir.suite
+    @ List.map
+        (fun (name, cases) -> ("CtfeMaterialize." ^ name, cases))
+        Test_ctfe_materialize.suite
+    @ List.map
         (fun (name, cases) -> ("TypedAstDebug." ^ name, cases))
         Test_typed_ast_debug.suite
     @ List.map

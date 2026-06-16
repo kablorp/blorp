@@ -10,7 +10,24 @@ type constructor_info = {
   constructor_callable_id : int option;
 }
 
-type closure = { closure_func : Typed_ast.func_decl; closure_env : env }
+type function_body_result =
+  (Ctfe_ir.expr option, Ctfe_ir.translate_error) result
+
+type ctfe_function = {
+  function_decl : Typed_ast.func_decl;
+  function_ast : Ast.func_decl;
+  function_constructor_info : string -> constructor_info option;
+  function_body_cache : function_body_result option ref;
+}
+
+type closure = { closure_func : ctfe_function; closure_env : env }
+
+and constructor_origin =
+  | ConstructorSourceCall of {
+      callee : Ast.expr;
+      resolved_call : Ast.resolved_call option;
+    }
+  | ConstructorSynthesized
 
 and value_desc =
   | VInt of int64
@@ -28,9 +45,8 @@ and value_desc =
   | VConstructor of {
       name : string;
       args : value list;
-      callee : Ast.expr option;
-      resolved_call : Ast.resolved_call option;
-      constructor_info : constructor_info option;
+      constructor_info : constructor_info;
+      constructor_origin : constructor_origin;
     }
 
 and value = { ty : Ast.type_expr; desc : value_desc; loc : Ast.loc }
@@ -39,7 +55,7 @@ and env = (string * binding) list
 
 type option_state = OptionSome of value | OptionNone
 type result_state = ResultOk of value | ResultErr of value
-type function_table = (int * Typed_ast.func_decl) list
+type function_table = (int * ctfe_function) list
 
 type ctx = {
   functions : function_table;
