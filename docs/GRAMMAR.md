@@ -38,7 +38,7 @@ while  for    in    if      else   and      or       not
 break  continue    match   import   as       private
 debug  resource     implements   trait   Self   type   alias   opaque
 builtin    foreign      concurrent    concurrently    detach      where
-select     from         after         sealed         into        compile_time
+select     from         after         sealed         into
 True   False
 ```
 
@@ -99,7 +99,6 @@ decl = [ docstring ] ( func_decl
                       | record_decl
                       | struct_decl
                       | var_decl
-                      | compile_time_block
                       | trait_decl
                       | impl_decl
                       | type_alias_decl
@@ -201,33 +200,15 @@ var_initializer = "=" expr
 ```
 
 **Semantic constraints:**
-- A top-level variable initializer cannot call a function, method, or closure.
-  Union constructors are data construction and are allowed.
-- A top-level variable initializer cannot use a subscript expression, because
-  subscripts lower to runtime helper calls during startup initialization.
-
-### Compile-Time Block
-
-```ebnf
-compile_time_block = "compile_time" ":" NEWLINE INDENT compile_time_binding_list DEDENT ;
-
-compile_time_binding_list = compile_time_binding { NEWLINE compile_time_binding } ;
-
-compile_time_binding = [ docstring ] [ "private" ] IDENT [ ":" type_expr ] var_initializer ;
-```
-
-**Semantic constraints:**
-- `compile_time:` is only allowed at module top level.
-- `private compile_time:` is invalid. Visibility belongs on each binding.
-- A compile-time block can only contain immutable value bindings.
-- Bindings evaluate in source order. Later bindings can reference earlier
-  bindings in the same block.
-- Initializers must be pure and evaluatable by the compiler.
-- The evaluator is a restricted pure subset. Unsupported forms are rejected
-  during checking rather than lowered to runtime startup code; this currently
-  includes function values as materialized globals, foreign calls, vector
-  literals, collection/tensor subscripts, resources, concurrency, debug blocks,
-  system APIs, IO, time, randomness, and impure calls.
+- Immutable top-level bindings are constants. Function, method, and closure
+  calls in immutable global initializers must be pure and evaluatable by the
+  compile-time evaluator. Union constructors are data construction and are
+  allowed.
+- Mutable top-level `var` initializers cannot call a function, method, or
+  closure, because mutable globals are not constants and calls there would
+  create hidden startup work.
+- Subscript expressions in top-level initializers are accepted only when the
+  checker can prove or lower them without unsupported runtime helper work.
 
 ### Type Declarations
 

@@ -128,17 +128,6 @@ let rec collect_decl occurrences ?file (decl : decl) =
           collect_pattern_bindings occurrences ?file pat decl.decl_loc)
         var.var_pattern;
       collect_expr occurrences ?file var.var_value
-  | DCompileTimeBlock bindings ->
-      List.iter
-        (fun binding ->
-          let var = binding.ctb_var in
-          Option.iter (fun name -> add name binding.ctb_loc) var.var_name;
-          Option.iter
-            (fun pat ->
-              collect_pattern_bindings occurrences ?file pat binding.ctb_loc)
-            var.var_pattern;
-          collect_expr occurrences ?file var.var_value)
-        bindings
   | DType type_decl ->
       add type_decl.type_name decl.decl_loc;
       List.iter
@@ -261,10 +250,6 @@ let collect_field_occurrences doc env program target =
           record.record_fields
     | DFunc func -> collect_func func
     | DVar var -> collect_expr var.var_value
-    | DCompileTimeBlock bindings ->
-        List.iter
-          (fun binding -> collect_expr binding.ctb_var.var_value)
-          bindings
     | DImpl impl -> List.iter collect_func impl.impl_methods
     | DPrivate inner -> collect_decl inner
     | DType _ | DImport _ | DTrait _ | DTypeAlias _ -> ()

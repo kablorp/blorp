@@ -126,96 +126,94 @@ Current priorities:
   emission: unresolved calls, unconverted closure/concurrency forms, invalid
   ownership crossings, and unprepared erased storage.
 
-### Compile-Time Evaluation Architecture
+### Compile-Time Constants And CTFE
 
-`compile_time:` is an explicit request to evaluate already-validated pure Blorp
-code in a restricted compiler execution environment, then serialize the result
-as ordinary immutable global data. The feature should not grow into a second
-frontend, typechecker, standard library, or backend.
+Desired end state:
 
-Direction:
+- Immutable top-level bindings are constants. `NAME = expr` means the compiler
+  evaluates `expr` at compile time and materializes the result as ordinary
+  immutable global data.
+- There is no special `compile_time:` declaration form. The ordinary constant
+  syntax is the CTFE surface.
+- Mutable top-level `var` bindings are not constants. They must not hide runtime
+  startup work before `main`.
+- There is no expression-level CTFE form, no macros, no type generation, and no
+  second compile-time standard library.
 
-- Keep the surface narrow: top-level `compile_time:` blocks, immutable value
-  bindings only, source-order dependencies, purity required, no type generation,
-  no macros, and no expression-level form until the architecture is stable.
-- Reuse the normal parser, name resolution, type inference, purity checks, and
-  runtime materialization path. CTFE should consume those facts, not recompute
-  them from source names or expression shapes.
-- Evaluate a small CTFE IR derived mechanically from typed AST. Full Core is
-  still broader than CTFE needs today, but the evaluator should consume a
-  lowered, explicit representation instead of matching directly on typed AST
-  expression shapes.
-- Put compiler-owned std/builtin behavior behind a CTFE intrinsic registry. Each
-  supported operation should have one narrow entry describing the runtime
-  builtin/source identity, determinism requirement, evaluator, and unsupported
-  reason when relevant.
-- Keep evaluator code responsible for control flow, local bindings, function
-  calls, closures, pattern decisions, and constructed values. It should not
-  keep accumulating one-off std module semantics.
-- Dogfood after the architecture boundary is in place. The intrinsic renderer is
-  a useful acceptance test, but it should not force ad hoc CTFE support.
+Source semantics:
+
+- Top-level constants evaluate in source order.
+- A constant may reference earlier constants and pure functions.
+- A constant may not reference itself or a later constant. Report this as a
+  dependency error, not as an evaluator accident.
+- Constant initializers must be pure and CTFE-compatible. Unsupported pure
+  operations are compile errors for constants, not runtime fallbacks.
+- Called pure functions may use local mutation, loops, recursion, pattern
+  matching, closures, and deterministic collection/tensor operations supported
+  by CTFE.
+- Visibility remains ordinary declaration visibility: `private NAME = expr`.
+  There is no special block-level visibility.
+
+Architecture:
+
+- Reuse the normal parser, import loading, name resolution, type inference,
+  purity checks, and runtime materialization path. CTFE consumes typed facts; it
+  must not recover semantics from source spelling, generated names, or backend
+  conventions.
+- Run CTFE after typecheck/purity and before Core lowering. Core and codegen
+  should see ordinary immutable global initializers after rewrite.
+- Keep `compiler/lib/ctfe_ir.ml` as the evaluator boundary. Typed AST is still
+  too broad for execution, while full Core is broader than CTFE currently
+  needs.
+- Keep compiler-owned std/builtin behavior behind `Ctfe_intrinsic` and
+  `Ctfe_std_eval`. Each supported operation should have a named intrinsic
+  identity and one evaluator entry.
+- Keep top-level initializer policy centralized in
+  `Top_level_initializer`: immutable constants require CTFE; mutable globals
+  reject hidden startup calls.
+- Prefer explicit CTFE value variants and IR call kinds over optional metadata
+  with hidden coupling.
 
 Current checkpoint:
 
-- CTFE has a narrow public boundary in `compiler/lib/ctfe.mli`: external
-  compiler phases provide constructor metadata and call `evaluate_program`.
-- Compile-time-required bindings are explicit in the typed representation.
-- `Ctfe_ir` is the chosen evaluator boundary for expression execution. Top-level
-  compile-time binding initializers and called function bodies are translated
-  into this smaller representation before evaluation.
+- `Ctfe.evaluate_program` rewrites source-order immutable globals through one
+  shared CTFE environment.
+- Immutable globals are semantically required CTFE now; unsupported pure
+  operations are compile errors instead of best-effort runtime fallbacks.
+- Private constants referenced only by later constants are treated as CTFE
+  scratch and can be omitted from generated runtime data.
+- `Ctfe_ir` classifies expressions, function references, call kinds,
+  constructors, field access, tuple/range access, vectors, lists, dicts,
+  records, and control flow before evaluation.
 - CTFE function values wrap typed functions with lazy cached IR bodies, so
-  unsupported function bodies are still rejected only when compile-time
-  evaluation actually calls them.
-- Intrinsic source classification is centralized in `Ctfe_intrinsic`; supported
-  imported, builtin, and trait std behavior is isolated in `Ctfe_std_eval`
-  instead of mixed into the main evaluator.
-- CTFE value-construction helpers and std evaluators consume `Ctfe_ir` call
-  sites, keeping typed-expression location/type access inside the IR translator.
-- `Ctfe_ir` classifies resolved calls into CTFE call kinds, including local,
-  imported, builtin, constructor, trait, closure, and unresolved calls. The
-  evaluator dispatches on those explicit variants instead of re-decoding raw
-  call-resolution metadata.
-- `Ctfe_ir` also classifies identifier function references, so named callbacks
-  are explicit local-function references, unsupported references, impure
-  references, or ordinary value identifiers before evaluation.
-- `Ctfe_ir` classifies nullary constructor identifiers with constructor
-  metadata before evaluation; the evaluator still checks local bindings first,
-  preserving normal shadowing while avoiding name-based constructor guessing in
-  the execution loop.
-- Empty dict literals are normalized to `Ctfe_ir.Dict []` during translation
-  using the typed expression type, rather than making the evaluator treat an
-  empty record-shaped literal as a possible dictionary.
-- Field access is classified in `Ctfe_ir` as record, tuple-index, range-start,
-  range-end, or explicit invalid tuple/range access, so the evaluator no longer
-  parses tuple indexes or decodes range field names while executing values.
-- `Ctfe_ir` stores source AST only where materialization still needs it:
-  constructor calls retain the callee AST narrowly so evaluated constructors can
-  be rewritten as ordinary source-level constructor initializers.
-- Raw call-resolution metadata is not carried on every CTFE expression;
-  constructor calls retain the resolved-call payload narrowly because
-  materialization uses it to rebuild ordinary constructor initializers.
-- CTFE constructor values carry explicit constructor identity and
-  materialization origin, rather than optional callee/resolved-call/constructor
-  metadata with hidden coupling.
-- The main evaluator consumes `Ctfe_ir` for expression/control-flow/call
-  evaluation and keeps top-level compile-time block expansion separate.
-- Codegen audit coverage now checks that CTFE-only builder functions are absent
-  from generated C for both scalar constants and heap-shaped list/dict/record/
-  union materialized data.
-- Private compile-time-only intermediate bindings are evaluated and validated
-  for materializability, but omitted from generated runtime globals unless
-  ordinary code references them.
-- CTFE supports the core deterministic byte-string helpers used by std/string,
-  including slicing, trimming, search, byte access, reversal, counting, repeat,
-  split, replace, and Char/list conversion helpers.
+  unsupported function bodies are rejected only when compile-time evaluation
+  calls them.
+- Materialization rewrites evaluated scalar, string, tuple, list, vector, dict,
+  record, range, and constructor values back into ordinary typed initializer
+  expressions.
+- CTFE supports enough deterministic std/builtin behavior for useful constants:
+  string byte helpers, list/dict/option/result helpers, vector/tensor literals,
+  tensor constructors, tensor subscript reads, tensor length, and matrix shape
+  counts.
+- Codegen audit coverage checks that CTFE-only builder functions are absent from
+  generated C for materialized constants.
+- `compiler/blorp/codegen_intrinsic_renderer.brp` now dogfoods ordinary
+  top-level constants for derived intrinsic lookup/manifest data.
+- The old `compile_time:` parser, AST, formatter, LSP, typed AST, and CTFE
+  block expansion paths have been removed.
 
-Next steps:
+Next implementation slices:
 
+- Tighten diagnostics for forward/self references among constants.
+- Tighten user-facing wording in CTFE diagnostics so ordinary global constants
+  do not talk about `compile_time` blocks.
+- Audit std, `compiler/blorp`, examples, and scratch programs for constants
+  that still need CTFE support. Add narrow intrinsics or rewrite the constants;
+  do not reintroduce best-effort runtime fallback.
 - Keep moving semantic normalization out of the evaluator and into `Ctfe_ir`
   translation where it can be represented explicitly.
-- Add new CTFE surface area only after deciding the IR node and intrinsic
-  contract it belongs to.
-- Avoid broad Core reuse unless a later CTFE feature needs a Core-only fact.
+- Dogfood compiler-owned tables in `compiler/blorp` once ordinary constants can
+  express the required data without a special block.
 
 ### Core Pipeline Profiling And Invariants
 

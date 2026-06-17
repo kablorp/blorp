@@ -8,6 +8,8 @@ module IR = Ctfe_ir
 let ( >>= ) = Result.bind
 let ( let* ) = Result.bind
 let string_not_found_index = -1
+let ascii_max_codepoint = 0x7f
+let list_join_buffer_initial_capacity = 16
 
 (* These helpers mirror the current std/string Core intrinsics, which operate
    on byte offsets for indexing, slicing, splitting, replacement, and chars().
@@ -109,6 +111,27 @@ let string_replace text old_text new_text =
     in
     loop 0 0
 
+let string_is_ascii text =
+  let rec loop index =
+    if index >= String.length text then true
+    else if Char.code text.[index] > ascii_max_codepoint then false
+    else loop (index + 1)
+  in
+  loop 0
+
+let string_ascii_case_map loc text ~uppercase =
+  if string_is_ascii text then
+    Ok
+      ((if uppercase then String.uppercase_ascii else String.lowercase_ascii)
+         text)
+  else
+    Error
+      [
+        Ctfe_error.error loc
+          "compile-time string case conversion currently supports ASCII input \
+           only";
+      ]
+
 let string_slice text start length = String.sub text start length
 
 let string_drop_left text count =
@@ -201,7 +224,7 @@ let repeat_string loc text repetitions =
     if repetitions > Int64.div max_output_length (Int64.of_int text_length) then
       Error
         [
-          Ctfe_error.error loc "compile_time string repeat result is too large";
+          Ctfe_error.error loc "compile-time string repeat result is too large";
         ]
     else
       let output_length =
@@ -213,6 +236,130 @@ let repeat_string loc text repetitions =
       done;
       Ok (Buffer.contents buffer)
 
+let list_join_strings loc values separator =
+  let buffer = Buffer.create list_join_buffer_initial_capacity in
+  let rec loop first = function
+    | [] -> Ok (Buffer.contents buffer)
+    | value :: rest ->
+        expect_string loc value >>= fun text ->
+        if not first then Buffer.add_string buffer separator;
+        Buffer.add_string buffer text;
+        loop false rest
+  in
+  loop true values
+
+let tensor_checked_get_oob_message =
+  "compile-time tensor index was not proven in bounds"
+
+let vector_checked_get loc values index =
+  match index_of_int64 index with
+  | Some index -> (
+      match List.nth_opt values index with
+      | Some value -> Ok value
+      | None -> Error [ Ctfe_error.error loc tensor_checked_get_oob_message ])
+  | None -> Error [ Ctfe_error.error loc tensor_checked_get_oob_message ]
+
+let rec tensor_checked_get loc receiver indices =
+  match indices with
+  | [] -> Ok receiver
+  | index :: rest -> (
+      match receiver.desc with
+      | VVector values ->
+          vector_checked_get loc values index >>= fun value ->
+          tensor_checked_get loc value rest
+      | _ -> Ctfe_error.unsupported loc "tensor checked_get on this value")
+
+let tensor_checked_get_builtin call_expr receiver indices =
+  let loc = call_expr.IR.loc in
+  let rec expect_indices acc = function
+    | [] -> Ok (List.rev acc)
+    | index :: rest ->
+        expect_int loc index >>= fun index -> expect_indices (index :: acc) rest
+  in
+  expect_indices [] indices >>= fun indices ->
+  tensor_checked_get loc receiver indices >>= call_result_value call_expr
+
+let tensor_fill_size_error =
+  "compile-time tensor constructor size must be non-negative and fit the host \
+   index range"
+
+let tensor_type elem_ty dims =
+  match dims with [] -> elem_ty | _ -> Ast.TyArray (elem_ty, dims)
+
+let tensor_fill_size loc value =
+  expect_int loc value >>= fun size ->
+  match index_of_int64 size with
+  | Some size -> Ok size
+  | None -> Error [ Ctfe_error.error loc tensor_fill_size_error ]
+
+let rec tensor_fill_value loc elem_value elem_ty dims sizes =
+  match (dims, sizes) with
+  | [], [] -> Ok { elem_value with ty = elem_ty; loc }
+  | dim :: rest_dims, size :: rest_sizes ->
+      tensor_fill_value loc elem_value elem_ty rest_dims rest_sizes
+      >>= fun child ->
+      let values = List.init size (fun _ -> child) in
+      Ok
+        {
+          ty = tensor_type elem_ty (dim :: rest_dims);
+          desc = VVector values;
+          loc;
+        }
+  | [], _ :: _ | _ :: _, [] ->
+      Ctfe_error.unsupported loc "tensor constructor rank mismatch"
+
+let tensor_fill_builtin call_expr elem_value size_values =
+  let loc = call_expr.IR.loc in
+  match Types.array_parts call_expr.IR.ty with
+  | Some (elem_ty, dims) ->
+      let rec collect_sizes acc = function
+        | [] -> Ok (List.rev acc)
+        | size_value :: rest ->
+            tensor_fill_size loc size_value >>= fun size ->
+            collect_sizes (size :: acc) rest
+      in
+      collect_sizes [] size_values >>= fun sizes ->
+      tensor_fill_value loc elem_value elem_ty dims sizes
+      >>= call_result_value call_expr
+  | None -> Ctfe_error.unsupported loc "tensor constructor return type"
+
+let rec concrete_dim_value = function
+  | Ast.TyConstInt n -> Some n
+  | Ast.TyDimOp (op, left, right) -> (
+      match (concrete_dim_value left, concrete_dim_value right) with
+      | Some left, Some right -> (
+          match op with
+          | Ast.DimAdd -> Some (left + right)
+          | Ast.DimSub -> Some (left - right)
+          | Ast.DimMul -> Some (left * right)
+          | Ast.DimDiv when right > 0 && left mod right = 0 ->
+              Some (left / right)
+          | Ast.DimDiv -> None)
+      | _ -> None)
+  | _ -> None
+
+let dim_to_int loc dim =
+  match concrete_dim_value dim with
+  | Some n when n >= 0 -> Ok n
+  | _ -> Ctfe_error.unsupported loc "non-concrete tensor dimension"
+
+let matrix_row_count loc receiver =
+  match Types.array_parts receiver.ty with
+  | Some (_, row_dim :: _ :: _) -> dim_to_int loc row_dim
+  | _ -> (
+      match receiver.desc with
+      | VVector rows -> Ok (List.length rows)
+      | _ -> Ctfe_error.unsupported loc "matrix row_count on this value")
+
+let matrix_column_count loc receiver =
+  match Types.array_parts receiver.ty with
+  | Some (_, _ :: column_dim :: _) -> dim_to_int loc column_dim
+  | _ -> (
+      match receiver.desc with
+      | VVector ({ desc = VVector columns; _ } :: _) -> Ok (List.length columns)
+      | VVector [] -> Ok 0
+      | _ -> Ctfe_error.unsupported loc "matrix column_count on this value")
+
 let eval_builtin_call ctx call_expr ~source_name ~builtin_intrinsic arg_values =
   let loc = call_expr.IR.loc in
   match (builtin_intrinsic, arg_values) with
@@ -221,6 +368,7 @@ let eval_builtin_call ctx call_expr ~source_name ~builtin_intrinsic arg_values =
   | Some Intrinsic.BuiltinLength, [ receiver ] -> (
       match receiver.desc with
       | VList values -> int_value call_expr (List.length values)
+      | VVector values -> int_value call_expr (List.length values)
       | VDict pairs -> int_value call_expr (List.length pairs)
       | VString (text, _) -> int_value call_expr (String.length text)
       | _ -> Ctfe_error.unsupported loc "length builtin on this value")
@@ -247,6 +395,32 @@ let eval_builtin_call ctx call_expr ~source_name ~builtin_intrinsic arg_values =
           in
           option_value ctx call_expr result
       | _ -> Ctfe_error.unsupported loc "get builtin on this value")
+  | Some Intrinsic.BuiltinCheckedGet, [ receiver; index ] -> (
+      expect_int loc index >>= fun index ->
+      match receiver.desc with
+      | VVector values ->
+          vector_checked_get loc values index >>= call_result_value call_expr
+      | _ -> Ctfe_error.unsupported loc "checked_get builtin on this value")
+  | Some Intrinsic.BuiltinTensorPeel, [ receiver; index ] ->
+      tensor_checked_get_builtin call_expr receiver [ index ]
+  | Some Intrinsic.BuiltinMatrixCheckedGet, [ receiver; row; col ] ->
+      tensor_checked_get_builtin call_expr receiver [ row; col ]
+  | Some Intrinsic.BuiltinTensor3CheckedGet, [ receiver; i; j; k ] ->
+      tensor_checked_get_builtin call_expr receiver [ i; j; k ]
+  | Some Intrinsic.BuiltinTensor4CheckedGet, [ receiver; i; j; k; l ] ->
+      tensor_checked_get_builtin call_expr receiver [ i; j; k; l ]
+  | Some Intrinsic.BuiltinTensor5CheckedGet, [ receiver; i; j; k; l; m ] ->
+      tensor_checked_get_builtin call_expr receiver [ i; j; k; l; m ]
+  | Some Intrinsic.BuiltinVector, [ value; size ] ->
+      tensor_fill_builtin call_expr value [ size ]
+  | Some Intrinsic.BuiltinMatrix, [ value; rows; cols ] ->
+      tensor_fill_builtin call_expr value [ rows; cols ]
+  | Some Intrinsic.BuiltinTensor3, [ value; x; y; z ] ->
+      tensor_fill_builtin call_expr value [ x; y; z ]
+  | Some Intrinsic.BuiltinTensor4, [ value; a; b; c; d ] ->
+      tensor_fill_builtin call_expr value [ a; b; c; d ]
+  | Some Intrinsic.BuiltinTensor5, [ value; a; b; c; d; e ] ->
+      tensor_fill_builtin call_expr value [ a; b; c; d; e ]
   | Some Intrinsic.BuiltinStringFromChar, [ char ] ->
       expect_char loc char >>= string_of_char_code loc
       >>= string_value call_expr
@@ -268,6 +442,7 @@ let eval_trait_call call_expr ~trait_intrinsic arg_values =
   | Some Intrinsic.TraitHasLengthLength, [ receiver ] -> (
       match receiver.desc with
       | VList values -> int_value call_expr (List.length values)
+      | VVector values -> int_value call_expr (List.length values)
       | VDict pairs -> int_value call_expr (List.length pairs)
       | VString (text, _) -> int_value call_expr (String.length text)
       | _ -> Ctfe_error.unsupported loc "HasLength.length on this value")
@@ -282,6 +457,8 @@ let rec eval_imported_call ~eval_callback_call ctx call_expr ~module_path
         ~imported_call op arg_values
   | Some (Intrinsic.ImportedDict op as imported_call) ->
       eval_dict_call ctx call_expr ~source_name ~imported_call op arg_values
+  | Some (Intrinsic.ImportedMatrix op as imported_call) ->
+      eval_matrix_call call_expr ~source_name ~imported_call op arg_values
   | Some (Intrinsic.ImportedOption op as imported_call) ->
       eval_option_call ~eval_callback_call ctx call_expr ~source_name
         ~imported_call op arg_values
@@ -373,6 +550,10 @@ and eval_list_call ~eval_callback_call ctx call_expr ~source_name ~imported_call
   | Intrinsic.ListLength, [ receiver ] ->
       expect_list loc receiver >>= fun values ->
       int_value call_expr (List.length values)
+  | Intrinsic.ListJoin, [ receiver; separator ] ->
+      expect_list loc receiver >>= fun values ->
+      expect_string loc separator >>= fun separator ->
+      list_join_strings loc values separator >>= string_value call_expr
   | _ ->
       Ctfe_error.unsupported loc
         (Intrinsic.imported_call_unsupported_form imported_call ~source_name)
@@ -472,6 +653,17 @@ and eval_list_any ~eval_callback_call ctx call_expr callback values =
         if result then bool_value call_expr true else loop rest
   in
   loop values
+
+and eval_matrix_call call_expr ~source_name ~imported_call op arg_values =
+  let loc = call_expr.IR.loc in
+  match (op, arg_values) with
+  | Intrinsic.MatrixRowCount, [ receiver ] ->
+      matrix_row_count loc receiver >>= int_value call_expr
+  | Intrinsic.MatrixColumnCount, [ receiver ] ->
+      matrix_column_count loc receiver >>= int_value call_expr
+  | _ ->
+      Ctfe_error.unsupported loc
+        (Intrinsic.imported_call_unsupported_form imported_call ~source_name)
 
 and eval_dict_call ctx call_expr ~source_name ~imported_call op arg_values =
   let loc = call_expr.IR.loc in
@@ -615,6 +807,12 @@ and eval_string_call ctx call_expr ~source_name ~imported_call op arg_values =
   | Intrinsic.StringFromChars, [ chars ] ->
       expect_list loc chars >>= fun chars ->
       string_of_chars loc chars >>= string_value call_expr
+  | Intrinsic.StringUpper, [ receiver ] ->
+      expect_string loc receiver >>= fun text ->
+      string_ascii_case_map loc text ~uppercase:true >>= string_value call_expr
+  | Intrinsic.StringLower, [ receiver ] ->
+      expect_string loc receiver >>= fun text ->
+      string_ascii_case_map loc text ~uppercase:false >>= string_value call_expr
   | _ ->
       Ctfe_error.unsupported loc
         (Intrinsic.imported_call_unsupported_form imported_call ~source_name)

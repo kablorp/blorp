@@ -59,14 +59,6 @@ let exported_foreign_block_only_error pos =
     "foreign declarations must use a foreign: block; declarations are public \
      by default, so omit `export` and write `foreign:`"
 
-let private_compile_time_error pos =
-  parse_fail_at pos
-    "visibility belongs on bindings inside compile_time blocks; write \
-     `compile_time:` and mark individual bindings private"
-
-let compile_time_value_bindings_only_error pos =
-  parse_fail_at pos "compile_time blocks can only contain value bindings"
-
 let is_dim_type_arg = function
   | TyConstInt _ | TyVarDims _ | TyDimOp _ -> true
   | TyVar name -> String.length name > 0 && name.[0] = '#'
@@ -248,7 +240,7 @@ let apply_concurrently_loop_param params (name, value) =
 %}
 
 (* Tokens *)
-%token FUNC PURE VAR UNION ENUM RECORD STRUCT VOID_KW FOREIGN COMPILE_TIME DETACH WHERE
+%token FUNC PURE VAR UNION ENUM RECORD STRUCT VOID_KW FOREIGN DETACH WHERE
 %token WHILE FOR IN IF ELSE AND OR NOT BREAK CONTINUE
 %token IMPLEMENTS TRAIT SELF_TYPE TYPE ALIAS OPAQUE BUILTIN INTO
 %token IMPORT AS PRIVATE EXPORT MATCH
@@ -311,7 +303,6 @@ decl_list:
   | (* empty *) { [] }
   | d = decl newlines ds = decl_list { d :: ds }
   | ds = import_block newlines rest = decl_list { ds @ rest }
-  | d = compile_time_block newlines ds = decl_list { d :: ds }
   | FOREIGN ds = foreign_dispatch newlines rest = decl_list { ds @ rest }
 
 newlines:
@@ -337,7 +328,6 @@ name:
   | WHILE { "while" }
   | WITH { "with" }
   | FOREIGN { "foreign" }
-  | COMPILE_TIME { "compile_time" }
   | RESOURCE { "resource" }
   | CONCURRENT { "concurrent" }
   | SELECT { "select" }
@@ -349,7 +339,6 @@ identifier:
   | n = IDENT { n }
   | DEBUG { "debug" }
   | WITH { "with" }
-  | COMPILE_TIME { "compile_time" }
   | CONCURRENT { "concurrent" }
   | SELECT { "select" }
   | AFTER { "after" }
@@ -390,8 +379,6 @@ decl:
     { let inner = if doc <> None && d.decl_doc = None
                   then { d with decl_doc = doc } else d in
       make_decl_at $symbolstartpos (DPrivate inner) }
-  | docstring PRIVATE COMPILE_TIME
-    { private_compile_time_error $symbolstartpos }
   | doc = docstring d = trait_decl
     { make_decl_doc_at $symbolstartpos doc (DTrait d) }
   | doc = docstring d = impl_decl
@@ -422,7 +409,6 @@ unsupported_export_decl_start:
   | VAR { () }
   | TRAIT { () }
   | IMPLEMENTS { () }
-  | COMPILE_TIME { () }
   | IDENT { () }
 
 (* Inline helpers for purity/return-type cross-product *)
@@ -522,50 +508,6 @@ private_inner_decl:
     { foreign_block_only_error $symbolstartpos }
   | docstring FOREIGN PURE FUNC
     { foreign_block_only_error $symbolstartpos }
-
-compile_time_block:
-  | COMPILE_TIME COLON NEWLINE INDENT newlines items = compile_time_block_body DEDENT
-    { make_decl_at $symbolstartpos (DCompileTimeBlock items) }
-
-compile_time_block_body:
-  | (* empty *) { [] }
-  | item = compile_time_block_item newlines rest = compile_time_block_body
-    { item :: rest }
-
-compile_time_block_item:
-  | doc = docstring is_private = compile_time_private_opt d = var_decl
-    { { ctb_private = is_private;
-        ctb_var = { d with var_is_const = not d.var_is_mutable };
-        ctb_loc = loc_of_pos $symbolstartpos;
-        ctb_doc = doc } }
-  | docstring FUNC
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring PURE FUNC
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring TYPE
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring UNION
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring ENUM
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring RECORD
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring STRUCT
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring TRAIT
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring IMPLEMENTS
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring IMPORT
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring FOREIGN
-    { compile_time_value_bindings_only_error $symbolstartpos }
-  | docstring COMPILE_TIME
-    { parse_fail_at $symbolstartpos "compile_time blocks are only allowed at module top level" }
-
-compile_time_private_opt:
-  | PRIVATE { true }
-  | { false }
 
 type_params_opt:
   | (* empty *) { [] }

@@ -2399,12 +2399,6 @@ and lower_decl_ast (d : Ast.decl) : Core.core_decl =
     | DImport i -> Core.CDImport i (* pass-through *)
     | DTypeAlias a -> Core.CDTypeAlias a (* pass-through *)
     | DPrivate inner -> Core.CDPrivate (lower_decl_ast inner)
-    | DCompileTimeBlock _ ->
-        Core_error.errorf (Core_error.Stage Core_stage.Lower) d.decl_loc
-          ~hint:
-            "compile_time blocks must be evaluated and rewritten to ordinary \
-             globals before Core lowering."
-          "compile_time block reached Core lowering"
   in
   { cd_desc = desc; cd_loc = d.decl_loc; cd_doc = d.decl_doc }
 
@@ -2418,12 +2412,6 @@ and lower_typed_decl_core (typed : Typed_ast.decl) : Core.core_decl =
     | Typed_ast.DeclTypeAlias alias ->
         Core.CDTypeAlias (Typed_ast.type_alias_ast alias)
     | Typed_ast.DeclImpl impl -> Core.CDImpl (lower_typed_impl impl)
-    | Typed_ast.DeclCompileTimeBlock _ ->
-        Core_error.errorf (Core_error.Stage Core_stage.Lower) ast_decl.decl_loc
-          ~hint:
-            "compile_time blocks must be evaluated and rewritten to ordinary \
-             globals before Core lowering."
-          "compile_time block reached Core lowering"
     | Typed_ast.DeclPrivate inner ->
         Core.CDPrivate (lower_typed_decl_core inner)
     | Typed_ast.DeclOther -> (lower_decl_ast ast_decl).cd_desc
@@ -2434,7 +2422,6 @@ and decl_label d =
   match d.Ast.decl_desc with
   | Ast.DFunc f -> "func " ^ Option.value f.func_name ~default:"?"
   | Ast.DVar v -> "var " ^ Option.value v.var_name ~default:"?"
-  | Ast.DCompileTimeBlock _ -> "compile_time"
   | Ast.DType t -> "type " ^ t.type_name
   | _ -> "decl"
 

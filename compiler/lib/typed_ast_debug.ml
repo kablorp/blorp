@@ -249,7 +249,6 @@ let decl_label decl =
   | Ast.DTrait t -> "trait " ^ t.trait_name
   | Ast.DImpl i -> "impl " ^ i.impl_trait
   | Ast.DTypeAlias a -> "type_alias " ^ a.alias_name
-  | Ast.DCompileTimeBlock _ -> "compile_time"
   | Ast.DPrivate _ | Ast.DFunc _ | Ast.DVar _ -> "decl"
 
 let rec format_decl depth decl =
@@ -270,15 +269,6 @@ let rec format_decl depth decl =
         |> String.concat "\n"
       in
       if methods = "" then header else header ^ "\n" ^ methods
-  | DeclCompileTimeBlock bindings ->
-      let body =
-        bindings
-        |> List.map (fun binding ->
-            format_var (depth + 1) (Typed_ast.compile_time_binding_var binding))
-        |> String.concat "\n"
-      in
-      if body = "" then Printf.sprintf "%scompile_time" (indent depth)
-      else Printf.sprintf "%scompile_time\n%s" (indent depth) body
   | DeclPrivate inner ->
       Printf.sprintf "%sprivate\n%s" (indent depth)
         (format_decl (depth + 1) inner)

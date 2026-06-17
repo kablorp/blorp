@@ -11,5 +11,6 @@ val make_constructor_info :
 
 val evaluate_program :
   ?constructor_info:(string -> constructor_info option) ->
+  ?import_bindings:Session.import_binding list ->
   Typed_ast.program ->
   (Typed_ast.program, Ast.compiler_error list) result

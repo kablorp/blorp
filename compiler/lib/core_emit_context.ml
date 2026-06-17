@@ -238,13 +238,20 @@ let gen_literal ctx = function
       in
       emit ctx expr
   | Ast.LitFloat f ->
-      let s = Printf.sprintf "%.17g" f in
+      let s =
+        match classify_float f with
+        | FP_nan -> "NAN"
+        | FP_infinite -> if f < 0.0 then "-INFINITY" else "INFINITY"
+        | FP_normal | FP_subnormal | FP_zero -> Printf.sprintf "%.17g" f
+      in
       emit ctx s;
-      (* Ensure C sees a floating-point literal, not an integer *)
+      (* Ensure C sees a floating-point literal, not an integer. *)
       if
         not
-          (String.contains s '.' || String.contains s 'e'
-         || String.contains s 'E')
+          (String.equal s "NAN"
+          || String.ends_with ~suffix:"INFINITY" s
+          || String.contains s '.' || String.contains s 'e'
+          || String.contains s 'E')
       then emit ctx ".0"
   | Ast.LitString (s, _) -> emit_string_literal ctx s
   | Ast.LitBool true -> emit ctx "true"

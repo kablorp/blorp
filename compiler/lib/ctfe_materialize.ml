@@ -9,7 +9,7 @@ let make_expr ?resolved_call loc ty desc =
   let ast = Ast.untyped_expr ~loc desc in
   match
     Typed_ast.of_ast_expr_with_type_info
-      ~context:"compile_time materialized initializer" ?resolved_call
+      ~context:"compile-time materialized initializer" ?resolved_call
       ~semantic_ty:ty ~value_ty:ty ~widening:(Type_widening_metadata.Keep ty)
       ast
   with
@@ -55,6 +55,9 @@ let rec value_to_expr value =
   | VList values ->
       value_to_exprs values >>= fun values ->
       make_expr value.loc value.ty (Ast.EList values)
+  | VVector values ->
+      value_to_exprs values >>= fun values ->
+      make_expr value.loc value.ty (Ast.EVector values)
   | VDict pairs ->
       value_pairs_to_exprs pairs >>= fun pairs ->
       make_expr value.loc value.ty (Ast.EDict pairs)
@@ -66,11 +69,30 @@ let rec value_to_expr value =
       value_to_expr end_value >>= fun end_expr ->
       make_expr value.loc value.ty (Ast.ERange (start_expr, end_expr))
   | VVoid -> make_expr value.loc value.ty Ast.EVoid
+  | VClosure
+      {
+        closure_env = [];
+        closure_origin =
+          ClosureLocalFunctionReference { reference_name; reference_call };
+        _;
+      } ->
+      make_expr ?resolved_call:reference_call value.loc value.ty
+        (Ast.EIdent reference_name)
+  | VClosure { closure_func; closure_env; closure_origin = ClosureLambda } ->
+      if Ctfe_env.has_local_bindings closure_env then
+        Error
+          [
+            Ctfe_error.error value.loc
+              "compile-time function values that capture local bindings cannot \
+               be materialized as global data";
+          ]
+      else make_expr value.loc value.ty (Ast.ELambda closure_func.function_ast)
   | VClosure _ ->
       Error
         [
           Ctfe_error.error value.loc
-            "compile_time cannot materialize function values as global data";
+            "compile-time constant evaluation cannot materialize function \
+             values as global data";
         ]
   | VConstructor { name; args; constructor_info; constructor_origin } -> (
       value_to_exprs args >>= fun arg_exprs ->
@@ -113,9 +135,7 @@ and value_pairs_to_exprs pairs =
   in
   loop [] pairs
 
-let binding_decl binding value =
-  let typed_var = Typed_ast.compile_time_binding_var binding in
-  let ast_binding = Typed_ast.compile_time_binding_ast binding in
+let global_var_decl ?(private_ = false) ?doc ~loc typed_var value =
   let* value_expr = value_to_expr value in
   let ast_var =
     {
@@ -127,18 +147,14 @@ let binding_decl binding value =
   in
   let typed_var = Typed_ast.with_var_ast typed_var ast_var in
   let inner_ast_decl =
-    {
-      Ast.decl_desc = Ast.DVar ast_var;
-      decl_loc = ast_binding.ctb_loc;
-      decl_doc = ast_binding.ctb_doc;
-    }
+    { Ast.decl_desc = Ast.DVar ast_var; decl_loc = loc; decl_doc = doc }
   in
   let inner_typed_decl = Typed_ast.make_var_decl inner_ast_decl typed_var in
-  if ast_binding.ctb_private then
+  if private_ then
     let ast_decl =
       {
         Ast.decl_desc = Ast.DPrivate inner_ast_decl;
-        decl_loc = ast_binding.ctb_loc;
+        decl_loc = loc;
         decl_doc = None;
       }
     in

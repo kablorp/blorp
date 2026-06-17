@@ -142,36 +142,26 @@ let direct_call ?(callable_id = 7) ?(source_name = "target#7")
     ?(call_pure = true) origin =
   A.CallDirect { callable_id; source_name; call_pure; origin }
 
-let compile_time_binding name ty value =
-  let ast_binding =
+let typed_global_constant name ty value =
+  let ast_var =
     {
-      A.ctb_private = false;
-      ctb_var =
-        {
-          A.var_name = Some name;
-          var_pattern = None;
-          var_type = Some ty;
-          var_value = value;
-          var_is_mutable = false;
-          var_is_const = true;
-        };
-      ctb_loc = A.dummy_loc;
-      ctb_doc = None;
+      A.var_name = Some name;
+      var_pattern = None;
+      var_type = Some ty;
+      var_value = value;
+      var_is_mutable = false;
+      var_is_const = true;
     }
   in
   match
     TA.of_ast_decl
-      {
-        A.decl_desc = A.DCompileTimeBlock [ ast_binding ];
-        decl_loc = A.dummy_loc;
-        decl_doc = None;
-      }
+      { A.decl_desc = A.DVar ast_var; decl_loc = A.dummy_loc; decl_doc = None }
   with
   | Ok typed -> (
       match TA.decl_view typed with
-      | TA.DeclCompileTimeBlock [ binding ] -> binding
-      | _ -> Alcotest.fail "expected one typed compile_time binding")
-  | Error _ -> Alcotest.fail "expected finalized compile_time declaration"
+      | TA.DeclVar var -> var
+      | _ -> Alcotest.fail "expected typed global constant")
+  | Error _ -> Alcotest.fail "expected finalized global constant"
 
 let require_ctfe_ir expr =
   match IR.of_typed_expr expr with
@@ -229,23 +219,22 @@ let test_compile_time_initializer_translates_to_ir () =
   let value =
     typed_expr ty_int (A.EBinary (A.Add, typed_int 40, typed_int 2))
   in
-  let binding = compile_time_binding "X" ty_int value in
-  match IR.of_compile_time_binding_initializer binding with
+  let binding = typed_global_constant "X" ty_int value in
+  match IR.of_typed_var_initializer binding with
   | Ok { IR.desc = IR.Binary (Blorp.Ast.Add, _, _); _ } -> ()
-  | Ok _ -> Alcotest.fail "expected compile_time initializer binary IR"
-  | Error _ -> Alcotest.fail "expected compile_time initializer to translate"
+  | Ok _ -> Alcotest.fail "expected global initializer binary IR"
+  | Error _ -> Alcotest.fail "expected global initializer to translate"
 
-let test_compile_time_initializer_rejects_unsupported_form () =
+let test_compile_time_initializer_translates_vector_literal () =
   let vector_ty = A.TyArray (ty_int, [ A.TyConstInt 3 ]) in
   let value =
     typed_expr vector_ty (A.EVector [ typed_int 1; typed_int 2; typed_int 3 ])
   in
-  let binding = compile_time_binding "VECTOR" vector_ty value in
-  match IR.of_compile_time_binding_initializer binding with
-  | Error (IR.Unsupported (_, form)) ->
-      check_string "unsupported form" "vector literals" form
-  | Error (IR.TypedAstError _) -> Alcotest.fail "expected unsupported IR form"
-  | Ok _ -> Alcotest.fail "expected unsupported vector initializer"
+  let binding = typed_global_constant "VECTOR" vector_ty value in
+  match IR.of_typed_var_initializer binding with
+  | Ok { IR.desc = IR.Vector [ _; _; _ ]; _ } -> ()
+  | Ok _ -> Alcotest.fail "expected global initializer vector IR"
+  | Error _ -> Alcotest.fail "expected vector initializer to translate"
 
 let test_void_expression_translates_to_ir () =
   let value = typed_expr ty_void A.EVoid in
@@ -445,10 +434,11 @@ let suite =
       [
         Alcotest.test_case "block bindings are normalized" `Quick
           test_block_bindings_are_normalized;
-        Alcotest.test_case "compile_time initializer translates to IR" `Quick
+        Alcotest.test_case "global constant initializer translates to IR" `Quick
           test_compile_time_initializer_translates_to_ir;
-        Alcotest.test_case "compile_time initializer rejects unsupported form"
-          `Quick test_compile_time_initializer_rejects_unsupported_form;
+        Alcotest.test_case
+          "global constant initializer translates vector literal" `Quick
+          test_compile_time_initializer_translates_vector_literal;
         Alcotest.test_case "void expression translates to IR" `Quick
           test_void_expression_translates_to_ir;
         Alcotest.test_case "unsupported forms have specific labels" `Quick

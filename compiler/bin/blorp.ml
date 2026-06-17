@@ -90,8 +90,6 @@ let decl_to_string d =
       let name = match v.Ast.var_name with Some n -> n | None -> "_" in
       let prefix = if v.Ast.var_is_mutable then "var " else "" in
       Printf.sprintf "%s%s" prefix name
-  | Ast.DCompileTimeBlock bindings ->
-      Printf.sprintf "CompileTime block with %d bindings" (List.length bindings)
   | Ast.DImport i -> Printf.sprintf "Import %s" i.Ast.import_module
   | Ast.DPrivate _ -> "Private"
   | Ast.DTrait t -> Printf.sprintf "Trait %s" t.Ast.trait_name
