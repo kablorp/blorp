@@ -8,11 +8,46 @@ backend_dict_ctor_string	0	blorp_dict_new_string()
 backend_dict_ctor_float	0	blorp_dict_new_float()
 backend_dict_ctor_custom_no_release	2	blorp_dict_new_custom((unsigned long (*)(void*))@0@, (bool (*)(void*, void*))@1@, NULL)
 backend_dict_ctor_custom_elem_release	2	blorp_dict_new_custom((unsigned long (*)(void*))@0@, (bool (*)(void*, void*))@1@, blorp_elem_release_fn)
+backend_dict_stack_option_get_value_record	6	({ blorp_Dict* __gso_dict_@2@ = (blorp_Dict*)@0@; void* __gso_key_@2@ = @1@; void* __gso_raw_@2@ = NULL; bool __gso_found_@2@ = blorp_dict_get_raw(__gso_dict_@2@, __gso_key_@2@, &__gso_raw_@2@); @3@ __gso_result_@2@; if (__gso_found_@2@) { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_SOME, .value = blorp_unbox_struct(__gso_raw_@2@, @4@) }); } else { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_NONE, .value = @5@ }); } __gso_result_@2@; })
+backend_dict_stack_option_get_value_record_release_key	6	({ blorp_Dict* __gso_dict_@2@ = (blorp_Dict*)@0@; void* __gso_key_@2@ = @1@; void* __gso_raw_@2@ = NULL; bool __gso_found_@2@ = blorp_dict_get_raw(__gso_dict_@2@, __gso_key_@2@, &__gso_raw_@2@); @3@ __gso_result_@2@; if (__gso_found_@2@) { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_SOME, .value = blorp_unbox_struct(__gso_raw_@2@, @4@) }); } else { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_NONE, .value = @5@ }); } blorp_release(__gso_key_@2@); __gso_result_@2@; })
+backend_dict_stack_option_get_long	5	({ blorp_Dict* __gso_dict_@2@ = (blorp_Dict*)@0@; void* __gso_key_@2@ = @1@; void* __gso_raw_@2@ = NULL; bool __gso_found_@2@ = blorp_dict_get_raw(__gso_dict_@2@, __gso_key_@2@, &__gso_raw_@2@); @3@ __gso_result_@2@; if (__gso_found_@2@) { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_SOME, .value = (long)__gso_raw_@2@ }); } else { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_NONE, .value = @4@ }); } __gso_result_@2@; })
+backend_dict_stack_option_get_long_release_key	5	({ blorp_Dict* __gso_dict_@2@ = (blorp_Dict*)@0@; void* __gso_key_@2@ = @1@; void* __gso_raw_@2@ = NULL; bool __gso_found_@2@ = blorp_dict_get_raw(__gso_dict_@2@, __gso_key_@2@, &__gso_raw_@2@); @3@ __gso_result_@2@; if (__gso_found_@2@) { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_SOME, .value = (long)__gso_raw_@2@ }); } else { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_NONE, .value = @4@ }); } blorp_release(__gso_key_@2@); __gso_result_@2@; })
+backend_dict_stack_option_get_int128	5	({ blorp_Dict* __gso_dict_@2@ = (blorp_Dict*)@0@; void* __gso_key_@2@ = @1@; void* __gso_raw_@2@ = NULL; bool __gso_found_@2@ = blorp_dict_get_raw(__gso_dict_@2@, __gso_key_@2@, &__gso_raw_@2@); @3@ __gso_result_@2@; if (__gso_found_@2@) { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_SOME, .value = blorp_unbox_int128(__gso_raw_@2@) }); } else { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_NONE, .value = @4@ }); } __gso_result_@2@; })
+backend_dict_stack_option_get_int128_release_key	5	({ blorp_Dict* __gso_dict_@2@ = (blorp_Dict*)@0@; void* __gso_key_@2@ = @1@; void* __gso_raw_@2@ = NULL; bool __gso_found_@2@ = blorp_dict_get_raw(__gso_dict_@2@, __gso_key_@2@, &__gso_raw_@2@); @3@ __gso_result_@2@; if (__gso_found_@2@) { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_SOME, .value = blorp_unbox_int128(__gso_raw_@2@) }); } else { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_NONE, .value = @4@ }); } blorp_release(__gso_key_@2@); __gso_result_@2@; })
+backend_dict_stack_option_get_uint128	5	({ blorp_Dict* __gso_dict_@2@ = (blorp_Dict*)@0@; void* __gso_key_@2@ = @1@; void* __gso_raw_@2@ = NULL; bool __gso_found_@2@ = blorp_dict_get_raw(__gso_dict_@2@, __gso_key_@2@, &__gso_raw_@2@); @3@ __gso_result_@2@; if (__gso_found_@2@) { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_SOME, .value = blorp_unbox_uint128(__gso_raw_@2@) }); } else { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_NONE, .value = @4@ }); } __gso_result_@2@; })
+backend_dict_stack_option_get_uint128_release_key	5	({ blorp_Dict* __gso_dict_@2@ = (blorp_Dict*)@0@; void* __gso_key_@2@ = @1@; void* __gso_raw_@2@ = NULL; bool __gso_found_@2@ = blorp_dict_get_raw(__gso_dict_@2@, __gso_key_@2@, &__gso_raw_@2@); @3@ __gso_result_@2@; if (__gso_found_@2@) { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_SOME, .value = blorp_unbox_uint128(__gso_raw_@2@) }); } else { __gso_result_@2@ = ((@3@){ .tag = BLORP_TAG_NONE, .value = @4@ }); } blorp_release(__gso_key_@2@); __gso_result_@2@; })
+backend_dict_construct_empty	1	@0@
+backend_dict_value_release_init	1	 blorp_dict_set_value_release(__dict_@0@, blorp_elem_release_fn);
+backend_dict_insert	3	 __dict_@0@ = blorp_dict_insert(__dict_@0@, @1@, @2@);
+backend_dict_iter_source_binding	2	blorp_Dict* @0@ = (blorp_Dict*)@1@;
+backend_dict_iter_loop_open	2	for (long @0@ = 0; @0@ < @1@->order_len; @0@++) {
+backend_dict_iter_slot_binding	3	long @0@ = @1@->order[@2@];
+backend_dict_iter_deleted_slot_guard	1	if (@0@ < 0) continue;
+backend_dict_iter_key_binding	4	@0@ @1@ = (@0@)@2@->keys[@3@];
+backend_dict_iter_pair_binding	3	blorp_Tuple* @0@ = blorp_tuple_new(2, @1@->keys[@2@], @1@->values[@2@]);
+backend_dict_construct_with_body	4	({ blorp_Dict* __dict_@1@ = @0@;@2@@3@ __dict_@1@; })
 backend_set_ctor_generic	0	blorp_set_new()
 backend_set_ctor_string	0	blorp_set_new_string()
 backend_set_ctor_float	0	blorp_set_new_float()
 backend_set_ctor_custom_no_release	2	blorp_set_new_custom((unsigned long (*)(void*))@0@, (bool (*)(void*, void*))@1@, NULL)
 backend_set_ctor_custom_elem_release	2	blorp_set_new_custom((unsigned long (*)(void*))@0@, (bool (*)(void*, void*))@1@, blorp_elem_release_fn)
+backend_set_iter_source_binding	2	blorp_Set* @0@ = (blorp_Set*)@1@;
+backend_set_iter_retain	1	blorp_retain(@0@);
+backend_set_iter_loop_open	2	for (blorp_SetEntry* @0@ = @1@->first; @0@ != NULL; @0@ = @0@->next_order) {
+backend_set_iter_entry_key	1	@0@->key
+backend_set_iter_release	1	blorp_release(@0@);
+backend_tuple_name	1	__tup_@0@
+backend_tuple_arg	1	, @0@
+backend_tuple_construct	2	blorp_tuple_new(@0@@1@)
+backend_tuple_retain_elem	2	if (@0@->elem[@1@]) blorp_retain(@0@->elem[@1@]);
+backend_tuple_construct_with_rc	5	({ blorp_Tuple* @0@ = blorp_tuple_new(@1@@2@); @3@ blorp_tuple_set_rc(@0@, @4@UL); @0@; })
+backend_tuple_field_element	2	((blorp_Tuple*)@0@)->elem[@1@]
+backend_tuple_field_access	3	({ void* @0@ = (void*)@1@; @2@; })
+backend_string_find_byte_from	4	({ blorp_String* __string_find_src_@3@ = (blorp_String*)@0@; long __string_find_byte_@3@ = @1@; long __string_find_start_@3@ = @2@; blorp_string_find_byte_from(__string_find_src_@3@, __string_find_byte_@3@, __string_find_start_@3@); })
+backend_string_byte_read	2	(long)(unsigned char)((blorp_String*)@0@)->data[@1@]
+backend_string_byte_write	3	(((blorp_String*)@0@)->data[@1@] = (char)@2@)
+backend_string_byte_copy	6	({ blorp_String* __string_copy_dst_@5@ = (blorp_String*)@0@; long __string_copy_dst_pos_@5@ = @1@; blorp_String* __string_copy_src_@5@ = (blorp_String*)@2@; long __string_copy_src_pos_@5@ = @3@; long __string_copy_len_@5@ = @4@; if (__string_copy_len_@5@ > 0) { memcpy(__string_copy_dst_@5@->data + __string_copy_dst_pos_@5@, __string_copy_src_@5@->data + __string_copy_src_pos_@5@, (size_t)__string_copy_len_@5@); } (void)0; })
+backend_string_set_len	2	({ blorp_String* __sl = (blorp_String*)@0@; long __sn = @1@; __sl->len = __sn; __sl->data[__sn] = '\0'; (void)0; })
 backend_dict_with_capacity_generic	1	blorp_dict_with_capacity(@0@)
 backend_dict_with_capacity_string	1	blorp_dict_with_capacity_string(@0@)
 backend_dict_with_capacity_float	1	blorp_dict_with_capacity_float(@0@)
