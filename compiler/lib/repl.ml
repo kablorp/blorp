@@ -175,7 +175,6 @@ let describe_decl (d : Ast.decl) =
   | Ast.DVar v ->
       let name = match v.Ast.var_name with Some n -> n | None -> "_" in
       Printf.sprintf "%s defined" name
-  | Ast.DCompileTimeBlock _ -> "compile_time block"
   | Ast.DImport i -> Printf.sprintf "import %s" i.Ast.import_module
   | Ast.DTrait t -> Printf.sprintf "trait %s" t.Ast.trait_name
   | Ast.DImpl i ->

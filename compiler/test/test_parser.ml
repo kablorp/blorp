@@ -105,8 +105,8 @@ let test_leading_dot_chain_continuation () =
 
 let test_multiline_var_initializer_after_equals () =
   let source =
-    "compile_time:\n" ^ "\tprivate X: Int = 1\n" ^ "\tY: Int =\n"
-    ^ "\t\tX + 1\n\n\n" ^ "func main(args: List[String]) -> Int:\n" ^ "\tY\n"
+    "private X: Int = 1\n" ^ "Y: Int =\n" ^ "\tX + 1\n\n\n"
+    ^ "func main(args: List[String]) -> Int:\n" ^ "\tY\n"
   in
   ignore (parse_ok source)
 

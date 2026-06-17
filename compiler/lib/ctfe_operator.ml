@@ -56,7 +56,8 @@ let eval_compare_binop loc op left right =
           Error
             [
               Ctfe_error.error loc
-                (Printf.sprintf "compile_time cannot compare %s and %s"
+                (Printf.sprintf
+                   "compile-time constant evaluation cannot compare %s and %s"
                    (type_name left.ty) (type_name right.ty));
             ])
   | Ast.Add | Ast.Sub | Ast.Mul | Ast.Div | Ast.Mod ->

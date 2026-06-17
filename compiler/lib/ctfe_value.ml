@@ -16,11 +16,24 @@ type function_body_result =
 type ctfe_function = {
   function_decl : Typed_ast.func_decl;
   function_ast : Ast.func_decl;
+  function_module_path : string option;
+  function_module_alias : string -> string option;
   function_constructor_info : string -> constructor_info option;
   function_body_cache : function_body_result option ref;
 }
 
-type closure = { closure_func : ctfe_function; closure_env : env }
+type closure_origin =
+  | ClosureLambda
+  | ClosureLocalFunctionReference of {
+      reference_name : string;
+      reference_call : Ast.resolved_call option;
+    }
+
+type closure = {
+  closure_func : ctfe_function;
+  closure_env : env;
+  closure_origin : closure_origin;
+}
 
 and constructor_origin =
   | ConstructorSourceCall of {
@@ -37,6 +50,7 @@ and value_desc =
   | VString of string * Ast.string_flags
   | VTuple of value list
   | VList of value list
+  | VVector of value list
   | VDict of (value * value) list
   | VRecord of (string * value) list
   | VRange of value * value
@@ -50,7 +64,14 @@ and value_desc =
     }
 
 and value = { ty : Ast.type_expr; desc : value_desc; loc : Ast.loc }
-and binding = { mutable_binding : bool; cell : value ref }
+and binding_scope = GlobalBinding | LocalBinding
+
+and binding = {
+  binding_scope : binding_scope;
+  mutable_binding : bool;
+  cell : value ref;
+}
+
 and env = (string * binding) list
 
 type option_state = OptionSome of value | OptionNone
@@ -59,5 +80,8 @@ type function_table = (int * ctfe_function) list
 
 type ctx = {
   functions : function_table;
+  imported_functions : ((string * string) * ctfe_function list) list;
+  module_global_envs : (string * env) list;
+  module_alias : string -> string option;
   constructor_info : string -> constructor_info option;
 }

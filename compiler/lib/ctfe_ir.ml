@@ -20,8 +20,10 @@ and expr_desc =
   | Block of block
   | Tuple of expr list
   | List of expr list
+  | Vector of expr list
   | Record of (string * expr) list
   | Dict of (expr * expr) list
+  | ImportedGlobal of imported_global
   | FieldAccess of field_access
   | RecordUpdate of expr * (string * expr) list
   | StringInterp of interp_part list * bool
@@ -74,6 +76,8 @@ and imported_call = {
   imported_intrinsic : Intrinsic.imported_call option;
 }
 
+and imported_global = { global_module_path : string; global_name : string }
+
 and builtin_call = {
   builtin_direct : direct_call;
   builtin_intrinsic : Intrinsic.builtin_call option;
@@ -121,6 +125,7 @@ type translate_error =
 
 type translate_context = {
   nullary_constructor : string -> nullary_constructor option;
+  module_alias : string -> string option;
 }
 
 let ( let* ) = Result.bind
@@ -211,15 +216,10 @@ let reference_kind_of_resolved_call ctx ident_name = function
       {
         Ast.call_target =
           Ast.CallDirect
-            {
-              callable_id;
-              source_name;
-              call_pure = true;
-              origin = Ast.CallableLocal;
-            };
+            { callable_id; source_name; call_pure; origin = Ast.CallableLocal };
         _;
       } ->
-      LocalFunctionReference (direct_call callable_id source_name true)
+      LocalFunctionReference (direct_call callable_id source_name call_pure)
   | Some { Ast.call_target = Ast.CallDirect { call_pure = false; _ }; _ } ->
       ImpureFunctionReference
   | Some
@@ -279,7 +279,11 @@ let pair_list_map f values =
   loop [] values
 
 let default_nullary_constructor _ = None
-let translate_context nullary_constructor = { nullary_constructor }
+let default_module_alias _ = None
+
+let translate_context ?(module_alias = default_module_alias) nullary_constructor
+    =
+  { nullary_constructor; module_alias }
 
 let rec of_typed_expr_with ctx expr =
   match Typed_ast.expr_desc expr with
@@ -328,6 +332,9 @@ and of_desc ctx expr = function
   | Typed_ast.EList values ->
       let* values = list_map (of_typed_expr_with ctx) values in
       Ok (make expr (List values))
+  | Typed_ast.EVector values ->
+      let* values = list_map (of_typed_expr_with ctx) values in
+      Ok (make expr (Vector values))
   | Typed_ast.ERecord []
     when is_named_type Intrinsic.Source.dict_type (Typed_ast.value_type expr) ->
       Ok (make expr (Dict []))
@@ -338,9 +345,33 @@ and of_desc ctx expr = function
       let* pairs = pair_list_map (of_typed_expr_with ctx) pairs in
       Ok (make expr (Dict pairs))
   | Typed_ast.EFieldAccess (receiver, field) ->
-      let* receiver = of_typed_expr_with ctx receiver in
-      let field_kind = field_access_kind receiver.ty field in
-      Ok (make expr (FieldAccess { field_receiver = receiver; field_kind }))
+      let qualified_module =
+        match (Typed_ast.ast receiver).Ast.expr_desc with
+        | Ast.EIdent alias -> ctx.module_alias alias
+        | _ -> None
+      in
+      begin match qualified_module with
+      | Some module_path -> (
+          match ctx.nullary_constructor field with
+          | Some constructor ->
+              Ok
+                (make expr
+                   (Ident
+                      {
+                        ident_name = field;
+                        reference_kind = NullaryConstructorReference constructor;
+                      }))
+          | None ->
+              Ok
+                (make expr
+                   (ImportedGlobal
+                      { global_module_path = module_path; global_name = field }))
+          )
+      | None ->
+          let* receiver = of_typed_expr_with ctx receiver in
+          let field_kind = field_access_kind receiver.ty field in
+          Ok (make expr (FieldAccess { field_receiver = receiver; field_kind }))
+      end
   | Typed_ast.ERecordUpdate (base, fields) ->
       let* base = of_typed_expr_with ctx base in
       let* fields = named_list_map (of_typed_expr_with ctx) fields in
@@ -389,7 +420,6 @@ and of_desc ctx expr = function
   | Typed_ast.EVarDecl _ | Typed_ast.ETupleDestruct _
   | Typed_ast.EQuestionBind _ ->
       unsupported (Typed_ast.loc expr) "block binding as a value"
-  | Typed_ast.EVector _ -> unsupported (Typed_ast.loc expr) "vector literals"
   | Typed_ast.ESubscript _ | Typed_ast.ESubscriptMulti _ ->
       unsupported (Typed_ast.loc expr) "subscript expressions"
   | Typed_ast.ESubscriptAssign _ ->
@@ -450,11 +480,13 @@ and match_case ctx case =
   let* body = of_typed_expr_with ctx case.Typed_ast.case_body in
   Ok { pattern = case.case_pattern; body }
 
-let of_typed_expr ?(nullary_constructor = default_nullary_constructor) expr =
-  of_typed_expr_with (translate_context nullary_constructor) expr
+let of_typed_expr ?(nullary_constructor = default_nullary_constructor)
+    ?(module_alias = default_module_alias) expr =
+  of_typed_expr_with (translate_context ~module_alias nullary_constructor) expr
 
-let of_function_body ?(nullary_constructor = default_nullary_constructor) func =
-  let ctx = translate_context nullary_constructor in
+let of_function_body ?(nullary_constructor = default_nullary_constructor)
+    ?(module_alias = default_module_alias) func =
+  let ctx = translate_context ~module_alias nullary_constructor in
   match Typed_ast.func_body_expr func with
   | Error err -> Error (TypedAstError err)
   | Ok None -> Ok None
@@ -462,10 +494,10 @@ let of_function_body ?(nullary_constructor = default_nullary_constructor) func =
       let* body = of_typed_expr_with ctx body in
       Ok (Some body)
 
-let of_compile_time_binding_initializer
-    ?(nullary_constructor = default_nullary_constructor) binding =
-  let ctx = translate_context nullary_constructor in
-  let typed_var = Typed_ast.compile_time_binding_var binding in
+let of_typed_var_initializer
+    ?(nullary_constructor = default_nullary_constructor)
+    ?(module_alias = default_module_alias) typed_var =
+  let ctx = translate_context ~module_alias nullary_constructor in
   match Typed_ast.var_value_expr typed_var with
   | Error err -> Error (TypedAstError err)
   | Ok init -> of_typed_expr_with ctx init

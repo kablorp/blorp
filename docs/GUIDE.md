@@ -158,35 +158,42 @@ func variable_examples() -> Int:
     0
 ```
 
-Top-level variable initializers are for data that can be set up without
-running user code before `main`. They may use literals, records, structs,
-tuples, collections, arithmetic, and union constructors, but they cannot call
-functions or methods, use closure calls, or use subscripts that lower to runtime
-helper calls. Move runtime work into `main` or into a function called by `main`.
+Immutable top-level bindings are constants. Their initializers may use literal
+data, records, structs, tuples, collections, arithmetic, union constructors, and
+pure computations that the compile-time evaluator supports. When an immutable
+global calls a pure function or method, the compiler evaluates that computation
+before Core lowering and materializes the result as ordinary global data.
+Unsupported pure compile-time work is a compile error rather than hidden startup
+work before `main`.
+
+Mutable top-level `var` bindings are not constants. Their initializers cannot
+call functions or methods, use closure calls, or use subscripts that lower to
+runtime helper calls, because that would create hidden startup work. Move
+runtime work into `main` or into a function called by `main`.
 
 ### Compile-Time Values
 
-Use a top-level `compile_time:` block when a global value should be evaluated by
-the compiler and materialized as ordinary immutable data in the generated
-program. Private bindings used only by later bindings in the same
-`compile_time:` block are treated as compiler scratch values; they are still
+Write immutable top-level bindings for compile-time data. A binding such as
+`Y: Int = X * 4` is evaluated by the compiler in source order and then
+materialized as ordinary immutable global data. Private constants used only by
+later constant evaluation are treated as compiler scratch values; they are still
 evaluated and validated, but they may be omitted from generated runtime data.
 
 ```blorp
-compile_time:
-    private X: Int = 1 + 2
-    Y: Int =
-        X * 4
+private X: Int = 1 + 2
+
+Y: Int =
+    X * 4
 
 func main(args: List[String]) -> Int:
     Y
 ```
 
-Visibility belongs on each binding inside the block. Do not write
-`private compile_time:`. Bindings are evaluated in source order, so later
-bindings can reference earlier bindings in the same block. Bindings declared
-directly inside the block are always immutable; local `var` mutation is allowed
-inside pure functions evaluated by the compiler.
+Compile-time evaluation follows source order, so later constants can reference
+earlier evaluated constants. A constant may not reference itself or a later
+constant. Top-level `var` bindings are mutable runtime globals, not constants.
+Local `var` mutation is allowed inside pure functions evaluated by the
+compiler.
 
 Compile-time initializers must be pure and must be evaluatable by the compiler.
 The evaluator is intentionally smaller than runtime Blorp. It supports literal
@@ -198,7 +205,9 @@ access, tuple field access, range `start`/`end` field access, and string
 interpolation with `String`/`Int`/`Float`/`Bool`/`Char` expression parts. It
 also supports union and enum constructors, direct local pure function calls
 including tuple-pattern parameters, recursion, pure lambda and named-function
-callbacks, pure `List` construction, lookup, and callback helpers, pure `Dict`
+callbacks, vector/tensor literals, tensor constructors, tensor subscripts,
+tensor length and matrix shape helpers, pure `List` construction, lookup,
+`join`, and callback helpers, pure `Dict`
 construction and lookup helpers, simple `Option` and `Result`
 query/conversion/callback helpers such as `get_or`, `is_some`, `is_ok`, `map`,
 `and_then`, `to_result`, `from_option`, `to_option`, and `?=` propagation,
@@ -206,7 +215,7 @@ primitive `to_string` calls, and deterministic byte-string helpers such as
 `String.length()`, `substring`, `starts_with`, `ends_with`, `contains`,
 `raw_index_of`, `index_of`, `get`, `get_or`, `drop_left`, `take_left`, `trim`,
 `trim_left`, `trim_right`, `reverse`, `count`, `split`, `replace`, `repeat`,
-`from_char`, `chars`, and `from_chars`.
+ASCII `upper`/`lower`, `from_char`, `chars`, and `from_chars`.
 
 Unsupported compile-time work is rejected during checking instead of being
 lowered to runtime startup code. The current compile-time evaluator does not
@@ -4002,5 +4011,5 @@ type       alias      private    import     as         implements Self       bui
 match      while      for        in         if         else       and        or
 not        True       False      void       break      continue   debug      foreign
 concurrent concurrently detach   select     from       after      sealed     with
-resource   where      into       compile_time
+resource   where      into
 ```

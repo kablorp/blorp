@@ -47,8 +47,9 @@ let unsupported loc form =
     [
       error
         ~help:
-          "Use supported pure compile-time constructs here, or move this \
-           computation back to runtime code."
+          "Use supported pure operations in this global constant initializer, \
+           or move this computation back to runtime code."
         loc
-        (Printf.sprintf "compile_time evaluator does not support %s yet" form);
+        (Printf.sprintf
+           "compile-time constant evaluation does not support %s yet" form);
     ]

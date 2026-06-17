@@ -500,15 +500,6 @@ type var_decl = {
 }
 (** Variable declaration *)
 
-type compile_time_binding = {
-  ctb_private : bool;
-  ctb_var : var_decl;
-  ctb_loc : loc;
-  ctb_doc : string option;
-}
-(** A single value binding inside a [compile_time:] block. Visibility belongs
-    to each binding so the block itself never carries export state. *)
-
 (** Constructor import mode for union types *)
 type ctor_import =
   | CtorNone  (** No constructors (qualified access only: Type.Ctor) *)
@@ -568,7 +559,6 @@ type decl_desc =
   | DType of type_decl
   | DRecord of record_decl
   | DVar of var_decl
-  | DCompileTimeBlock of compile_time_binding list
   | DImport of import_decl
   | DPrivate of decl
   | DTrait of trait_decl

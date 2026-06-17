@@ -944,15 +944,6 @@ let rec validate_source_type_decl state (decl : Ast.decl) =
         validate_source_type_syntax_opt state decl.decl_loc var_decl.var_type
       in
       validate_source_type_expr state var_decl.var_value
-  | DCompileTimeBlock bindings ->
-      List.fold_left
-        (fun state binding ->
-          let state =
-            validate_source_type_syntax_opt state binding.ctb_loc
-              binding.ctb_var.var_type
-          in
-          validate_source_type_expr state binding.ctb_var.var_value)
-        state bindings
   | DTrait trait ->
       List.fold_left
         (fun state meth ->
@@ -2333,12 +2324,6 @@ let rec process_imported_decl ~(module_path : string option) state decl =
   | DFunc func_decl ->
       process_func_signature ?module_path ~loc:decl.decl_loc state func_decl
   | DVar var_decl -> process_var_decl state var_decl
-  | DCompileTimeBlock bindings ->
-      List.fold_left
-        (fun state binding ->
-          if binding.ctb_private then state
-          else process_var_decl state binding.ctb_var)
-        state bindings
   | DImpl impl ->
       List.fold_left
         (fun state func ->
@@ -2365,11 +2350,6 @@ and process_imported_decl_as ~(module_path : string option) state decl alias =
   | DVar var_decl ->
       let renamed = { var_decl with var_name = Some alias } in
       process_var_decl state renamed
-  | DCompileTimeBlock _ ->
-      add_error state
-        (error_at decl.decl_loc
-           "compile_time block imports cannot be aliased; import an individual \
-            binding by name")
   | DTrait _ ->
       add_error state
         (error_at decl.decl_loc
@@ -2839,24 +2819,6 @@ let rec semantic_export_decl (decl : Typed_ast.decl) : decl =
         List.map semantic_func_export (Typed_ast.impl_methods impl)
       in
       { ast_decl with decl_desc = DImpl { ast_impl with impl_methods } }
-  | Typed_ast.DeclCompileTimeBlock bindings ->
-      let bindings =
-        List.map
-          (fun binding ->
-            let ast_binding = Typed_ast.compile_time_binding_ast binding in
-            let ast_var =
-              Typed_ast.var_ast (Typed_ast.compile_time_binding_var binding)
-            in
-            let info =
-              Typed_ast.var_info (Typed_ast.compile_time_binding_var binding)
-            in
-            {
-              ast_binding with
-              ctb_var = { ast_var with var_type = Some info.binding_ty };
-            })
-          bindings
-      in
-      { ast_decl with decl_desc = DCompileTimeBlock bindings }
   | Typed_ast.DeclPrivate inner ->
       { ast_decl with decl_desc = DPrivate (semantic_export_decl inner) }
   | Typed_ast.DeclOther -> ast_decl
@@ -3501,13 +3463,6 @@ let rec first_pass (state : check_state) (decls : program) : check_state =
         Option.iter (fun name -> remember_top_level name "function") f.func_name
     | DVar v ->
         Option.iter (fun name -> remember_top_level name "variable") v.var_name
-    | DCompileTimeBlock bindings ->
-        List.iter
-          (fun binding ->
-            Option.iter
-              (fun name -> remember_top_level name "variable")
-              binding.ctb_var.var_name)
-          bindings
     | DTrait t -> remember_top_level t.trait_name "trait"
     | DPrivate inner -> collect_decl_names inner
     | _ -> ()
@@ -3581,10 +3536,6 @@ let rec first_pass (state : check_state) (decls : program) : check_state =
           in
           process_func_signature ~loc:decl.decl_loc state func_decl
       | DVar var_decl -> process_var_decl state var_decl
-      | DCompileTimeBlock bindings ->
-          List.fold_left
-            (fun state binding -> process_var_decl state binding.ctb_var)
-            state bindings
       | DImport import_decl -> process_import state decl.decl_loc import_decl
       | DPrivate inner -> (
           match inner.decl_desc with
@@ -4469,92 +4420,18 @@ let report_impure_calls state ~func_name ~help_msg impure_calls =
               func_name called_name)))
     state impure_calls
 
-type top_level_initializer_startup_work =
-  | TopLevelInitializerCall of {
-      startup_call_name : string;
-      startup_call_loc : loc;
-    }
-  | TopLevelInitializerSubscript of { startup_subscript_loc : loc }
-
-let resolved_call_is_constructor = function
-  | Some { call_target = CallDirect { origin = CallableConstructor _; _ }; _ }
-    ->
-      true
-  | _ -> false
-
-let source_call_name_for_diagnostic callee resolved =
-  match resolved with
-  | Some { call_target = CallDirect { source_name; _ }; _ } ->
-      Purity_analysis.source_call_name source_name
-  | Some { call_target = CallTraitMethod { method_name; _ }; _ } ->
-      Purity_analysis.source_call_name method_name
-  | Some { call_target = CallClosure _; _ } -> (
-      match callee.expr_desc with
-      | EIdent name -> Purity_analysis.source_call_name name
-      | EFieldAccess (_, name) -> name
-      | _ -> "<expression>")
-  | None -> (
-      match callee.expr_desc with
-      | EIdent name -> Purity_analysis.source_call_name name
-      | EFieldAccess (_, name) -> name
-      | _ -> "<expression>")
-
-(* Subscript_desugar runs before typecheck and currently rewrites source
-   subscripts to ordinary helper calls without preserving a source-syntax tag.
-   Keep these helper names isolated so the top-level startup-call rule can
-   report source-level subscript diagnostics instead of exposing them. *)
-let is_subscript_desugar_call_name = function
-  | "checked_get" | "checked_slice" | "tensor_peel" | "matrix_checked_get"
-  | "tensor3_checked_get" | "tensor4_checked_get" | "tensor5_checked_get" ->
-      true
-  | _ -> false
-
-let resolved_call_is_subscript_desugar resolved =
-  match resolved with
-  | Some { call_target = CallDirect { source_name; _ }; _ } ->
-      is_subscript_desugar_call_name
-        (Purity_analysis.source_call_name source_name)
-  | Some { call_target = CallTraitMethod { method_name; _ }; _ } ->
-      is_subscript_desugar_call_name
-        (Purity_analysis.source_call_name method_name)
-  | Some { call_target = CallClosure _; _ } | None -> false
-
-let collect_top_level_initializer_startup_work (expr : expr) :
-    top_level_initializer_startup_work list =
-  let rec walk expr =
-    match expr.expr_desc with
-    | ELambda _ | EFuncDecl _ -> []
-    | ECall (callee, args) ->
-        let resolved = Ast.expr_resolved_call expr in
-        let nested = List.concat_map walk (callee :: args) in
-        if resolved_call_is_constructor resolved then nested
-        else if resolved_call_is_subscript_desugar resolved then
-          TopLevelInitializerSubscript { startup_subscript_loc = expr.expr_loc }
-          :: nested
-        else
-          TopLevelInitializerCall
-            {
-              startup_call_name =
-                source_call_name_for_diagnostic callee resolved;
-              startup_call_loc = expr.expr_loc;
-            }
-          :: nested
-    | _ -> List.concat_map walk (Ast.expr_children expr)
-  in
-  walk expr
-
 let validate_top_level_initializer_has_no_calls state var_name init =
   let binding_name = Option.value var_name ~default:"_" in
-  let startup_work = collect_top_level_initializer_startup_work init in
+  let startup_work = Top_level_initializer.collect_startup_work init in
   List.fold_left
     (fun st work ->
       match work with
-      | TopLevelInitializerCall { startup_call_name; startup_call_loc } ->
+      | Top_level_initializer.StartupCall { call_name; call_loc } ->
           add_error st
-            (error_with startup_call_loc
+            (error_with call_loc
                (Printf.sprintf
                   "top-level initializer '%s' cannot call function '%s'"
-                  binding_name startup_call_name)
+                  binding_name call_name)
                ~notes:
                  [
                    "Top-level values are initialized before main. Function \
@@ -4565,9 +4442,9 @@ let validate_top_level_initializer_has_no_calls state var_name init =
                     "Move the call into main or another function, then \
                      initialize the top-level value with data that does not \
                      run code at startup"))
-      | TopLevelInitializerSubscript { startup_subscript_loc } ->
+      | Top_level_initializer.StartupSubscript { subscript_loc } ->
           add_error st
-            (error_with startup_subscript_loc
+            (error_with subscript_loc
                (Printf.sprintf
                   "top-level initializer '%s' cannot use a subscript expression"
                   binding_name)
@@ -5013,6 +4890,25 @@ let validate_main_signature state func loc =
       else state
   | _ -> state
 
+let report_ctfe_impure_initializer state ~message ~binding_name expr =
+  let impure_calls =
+    collect_impure_calls ~strict:true state.env state.module_aliases expr
+  in
+  List.fold_left
+    (fun st call ->
+      add_error st
+        (error_with call.call_loc message
+           ~notes:
+             [
+               Printf.sprintf "Initializer for '%s' calls impure function '%s'."
+                 binding_name call.called_name;
+             ]
+           ~help:
+             (Some
+                "Move impure work to runtime code, or build the value from \
+                 pure functions and data only.")))
+    state impure_calls
+
 let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
     =
   let state =
@@ -5089,9 +4985,21 @@ let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
     | None -> state
   in
   let state =
-    match (validate_startup_work, typed_value) with
+    (* Immutable top-level bindings are constants: calls in their initializers
+       are handled by CTFE after typecheck. Mutable globals are not constants,
+       so keep rejecting hidden runtime startup work here. *)
+    match (validate_startup_work && var_decl.var_is_mutable, typed_value) with
     | true, Some tv ->
         validate_top_level_initializer_has_no_calls state var_decl.var_name tv
+    | _ -> state
+  in
+  let state =
+    match typed_value with
+    | Some tv when (not var_decl.var_is_mutable) && var_decl.var_is_const ->
+        report_ctfe_impure_initializer state
+          ~message:"global constant initializer must be pure"
+          ~binding_name:(Option.value var_decl.var_name ~default:"_")
+          tv
     | _ -> state
   in
   match typed_value with
@@ -5183,43 +5091,6 @@ let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
       (state, typed_var)
   | None -> (state, var_decl)
 
-let report_compile_time_impure_initializer state binding_name expr =
-  let impure_calls =
-    collect_impure_calls ~strict:true state.env state.module_aliases expr
-  in
-  List.fold_left
-    (fun st call ->
-      add_error st
-        (error_with call.call_loc "compile_time initializer must be pure"
-           ~notes:
-             [
-               Printf.sprintf "Initializer for '%s' calls impure function '%s'."
-                 binding_name call.called_name;
-             ]
-           ~help:
-             (Some
-                "Move impure work to runtime code, or build the value from \
-                 pure functions and data only.")))
-    state impure_calls
-
-let typecheck_compile_time_binding state binding =
-  let binding_name = Option.value binding.ctb_var.var_name ~default:"_" in
-  let state =
-    if binding.ctb_var.var_is_mutable then
-      add_error state
-        (error_at binding.ctb_loc "compile_time binding cannot be mutable")
-    else state
-  in
-  let state, typed_var =
-    typecheck_global_var_decl ~validate_startup_work:false state binding.ctb_loc
-      { binding.ctb_var with var_is_mutable = false; var_is_const = true }
-  in
-  let state =
-    report_compile_time_impure_initializer state binding_name
-      typed_var.var_value
-  in
-  (state, { binding with ctb_var = typed_var })
-
 let compile_time_constructor_info env name =
   match Env.get_constructor env name with
   | Some (parent_type, _, field_types, _) ->
@@ -5295,22 +5166,6 @@ let rec second_pass (state : check_state) (decls : program) :
               typecheck_global_var_decl state loc var_decl
             in
             (state, { decl with decl_desc = DVar typed_var } :: acc)
-        | DCompileTimeBlock bindings ->
-            let state, typed_bindings =
-              List.fold_left
-                (fun (state, acc) binding ->
-                  let state, typed_binding =
-                    typecheck_compile_time_binding state binding
-                  in
-                  (state, typed_binding :: acc))
-                (state, []) bindings
-            in
-            ( state,
-              {
-                decl with
-                decl_desc = DCompileTimeBlock (List.rev typed_bindings);
-              }
-              :: acc )
         | DPrivate inner -> (
             match inner.decl_desc with
             | DImpl impl ->
@@ -5727,13 +5582,6 @@ let prepend_prelude_imports ?(current_module = "") (program : program) : program
               | None -> acc)
           | Ast.DVar v -> (
               match v.Ast.var_name with Some name -> name :: acc | None -> acc)
-          | Ast.DCompileTimeBlock bindings ->
-              List.fold_left
-                (fun acc binding ->
-                  match binding.Ast.ctb_var.var_name with
-                  | Some name -> name :: acc
-                  | None -> acc)
-                acc bindings
           | Ast.DTrait t -> t.Ast.trait_name :: acc
           | Ast.DPrivate inner -> collect_top_level_names acc inner
           | Ast.DImport _ | Ast.DImpl _ -> acc
@@ -5973,6 +5821,7 @@ let typecheck_with_state_typed ?module_origin ?(module_name = "")
       | Ok typed ->
           Ctfe.evaluate_program
             ~constructor_info:(compile_time_constructor_info state.env)
+            ~import_bindings:(List.rev state.import_bindings)
             typed
           |> Result.map (fun typed -> (state, typed)))
 
@@ -6003,6 +5852,7 @@ let typecheck_with_env_typed ?module_origin ?(module_name = "")
           match
             Ctfe.evaluate_program
               ~constructor_info:(compile_time_constructor_info state.env)
+              ~import_bindings:(List.rev state.import_bindings)
               typed
           with
           | Ok typed -> Ok (typed, state.env)
@@ -6157,6 +6007,7 @@ let typecheck_module_with_state_typed ?module_origin ?(module_name = "")
           match
             Ctfe.evaluate_program
               ~constructor_info:(compile_time_constructor_info state.env)
+              ~import_bindings:(List.rev state.import_bindings)
               typed
           with
           | Ok typed -> Ok (state, typed)

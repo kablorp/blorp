@@ -134,8 +134,8 @@ let import_items (program : program) : import_item list =
                   ])
         in
         List.rev_append alias_items (List.rev_append symbol_items acc)
-    | DFunc _ | DType _ | DRecord _ | DVar _ | DCompileTimeBlock _ | DTrait _
-    | DImpl _ | DTypeAlias _ ->
+    | DFunc _ | DType _ | DRecord _ | DVar _ | DTrait _ | DImpl _ | DTypeAlias _
+      ->
         acc
   in
   List.fold_left collect_decl [] program |> List.rev
@@ -162,13 +162,6 @@ let rec collect_top_level_bindings scope decl =
           match v.var_pattern with
           | Some pat -> add_term_bindings scope (Ast.collect_pattern_vars pat)
           | None -> scope))
-  | DCompileTimeBlock bindings ->
-      List.fold_left
-        (fun scope binding ->
-          match binding.ctb_var.var_name with
-          | Some name -> add_term_binding name scope
-          | None -> scope)
-        scope bindings
   | DType t -> add_type_binding t.type_name scope
   | DRecord r -> add_type_binding r.record_name scope
   | DTypeAlias a -> add_type_binding a.alias_name scope
@@ -483,12 +476,6 @@ let rec scan_decl scope refs decl =
         | None -> refs
       in
       scan_expr scope refs v.var_value
-  | DCompileTimeBlock bindings ->
-      List.fold_left
-        (fun refs binding ->
-          let refs = scan_type_opt scope refs binding.ctb_var.var_type in
-          scan_expr scope refs binding.ctb_var.var_value)
-        refs bindings
   | DType t ->
       let refs = scan_type_param_bounds refs t.type_params in
       let scope = add_type_params (Ast.type_param_names t.type_params) scope in

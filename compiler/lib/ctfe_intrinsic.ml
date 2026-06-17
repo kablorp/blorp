@@ -11,6 +11,7 @@ module Source = struct
   let range_type = "Range"
   let dict_module = "std/dict"
   let list_module = "std/list"
+  let matrix_module = "std/matrix"
   let string_module = "std/string"
   let dict_length_builtin = "std/dict.length"
   let range_start_field = "start"
@@ -20,6 +21,17 @@ module Source = struct
   let list_length_builtin = "std/list.length"
   let has_length_trait = "HasLength"
   let stringable_trait = "Stringable"
+  let checked_get = "checked_get"
+  let tensor_peel = "tensor_peel"
+  let matrix_checked_get = "matrix_checked_get"
+  let tensor3_checked_get = "tensor3_checked_get"
+  let tensor4_checked_get = "tensor4_checked_get"
+  let tensor5_checked_get = "tensor5_checked_get"
+  let vector = "vector"
+  let matrix = "matrix"
+  let tensor3 = "tensor3"
+  let tensor4 = "tensor4"
+  let tensor5 = "tensor5"
   let contains = "contains"
   let concat = "concat"
   let dict = "dict"
@@ -32,8 +44,10 @@ module Source = struct
   let is_none = "is_none"
   let is_ok = "is_ok"
   let is_some = "is_some"
+  let join = "join"
   let length = "length"
   let list = "list"
+  let lower = "lower"
   let map = "map"
   let map_indexed = "map_indexed"
   let map_err = "map_err"
@@ -54,6 +68,7 @@ module Source = struct
   let all = "all"
   let ends_with = "ends_with"
   let chars = "chars"
+  let column_count = "column_count"
   let count = "count"
   let drop_left = "drop_left"
   let from_char = "from_char"
@@ -63,6 +78,7 @@ module Source = struct
   let replace = "replace"
   let repeat = "repeat"
   let reverse = "reverse"
+  let row_count = "row_count"
   let split = "split"
   let starts_with = "starts_with"
   let to_option = "to_option"
@@ -72,15 +88,27 @@ module Source = struct
   let trim = "trim"
   let trim_left = "trim_left"
   let trim_right = "trim_right"
+  let upper = "upper"
   let with_capacity = "with_capacity"
 end
 
-type imported_module = List | Dict | Option | Result | String
+type imported_module = List | Dict | Matrix | Option | Result | String
 
 type builtin_call =
   | BuiltinToString
   | BuiltinLength
   | BuiltinGet
+  | BuiltinCheckedGet
+  | BuiltinTensorPeel
+  | BuiltinMatrixCheckedGet
+  | BuiltinTensor3CheckedGet
+  | BuiltinTensor4CheckedGet
+  | BuiltinTensor5CheckedGet
+  | BuiltinVector
+  | BuiltinMatrix
+  | BuiltinTensor3
+  | BuiltinTensor4
+  | BuiltinTensor5
   | BuiltinStringFromChar
   | BuiltinStringChars
   | BuiltinStringFromChars
@@ -111,6 +139,7 @@ type list_op =
   | ListGetOr
   | ListContains
   | ListLength
+  | ListJoin
 
 type dict_op =
   | DictMake
@@ -121,6 +150,8 @@ type dict_op =
   | DictGetOr
   | DictContains
   | DictLength
+
+type matrix_op = MatrixRowCount | MatrixColumnCount
 
 type option_op =
   | OptionGetOr
@@ -166,10 +197,13 @@ type string_op =
   | StringFromChar
   | StringChars
   | StringFromChars
+  | StringUpper
+  | StringLower
 
 type imported_call =
   | ImportedList of list_op
   | ImportedDict of dict_op
+  | ImportedMatrix of matrix_op
   | ImportedOption of option_op
   | ImportedResult of result_op
   | ImportedString of string_op
@@ -177,6 +211,7 @@ type imported_call =
 let module_path_of_imported_call = function
   | ImportedList _ -> Source.list_module
   | ImportedDict _ -> Source.dict_module
+  | ImportedMatrix _ -> Source.matrix_module
   | ImportedOption _ -> Source.option_module
   | ImportedResult _ -> Source.result_module
   | ImportedString _ -> Source.string_module
@@ -184,6 +219,7 @@ let module_path_of_imported_call = function
 let imported_module_of_path = function
   | path when path = Source.list_module -> Some List
   | path when path = Source.dict_module -> Some Dict
+  | path when path = Source.matrix_module -> Some Matrix
   | path when path = Source.option_module -> Some Option
   | path when path = Source.result_module -> Some Result
   | path when path = Source.string_module -> Some String
@@ -207,6 +243,7 @@ let list_op_of_source_name = function
   | name when name = Source.get_or -> Some ListGetOr
   | name when name = Source.contains -> Some ListContains
   | name when name = Source.length -> Some ListLength
+  | name when name = Source.join -> Some ListJoin
   | _ -> None
 
 let dict_op_of_source_name = function
@@ -218,6 +255,11 @@ let dict_op_of_source_name = function
   | name when name = Source.get_or -> Some DictGetOr
   | name when name = Source.contains -> Some DictContains
   | name when name = Source.length -> Some DictLength
+  | _ -> None
+
+let matrix_op_of_source_name = function
+  | name when name = Source.row_count -> Some MatrixRowCount
+  | name when name = Source.column_count -> Some MatrixColumnCount
   | _ -> None
 
 let option_op_of_source_name = function
@@ -266,6 +308,8 @@ let string_op_of_source_name = function
   | name when name = Source.from_char -> Some StringFromChar
   | name when name = Source.chars -> Some StringChars
   | name when name = Source.from_chars -> Some StringFromChars
+  | name when name = Source.upper -> Some StringUpper
+  | name when name = Source.lower -> Some StringLower
   | _ -> None
 
 let imported_call_of_source ~module_path ~source_name =
@@ -278,6 +322,10 @@ let imported_call_of_source ~module_path ~source_name =
       Option.map
         (fun op -> ImportedDict op)
         (dict_op_of_source_name source_name)
+  | Some Matrix ->
+      Option.map
+        (fun op -> ImportedMatrix op)
+        (matrix_op_of_source_name source_name)
   | Some Option ->
       Option.map
         (fun op -> ImportedOption op)
@@ -294,6 +342,23 @@ let imported_call_of_source ~module_path ~source_name =
 
 let builtin_call_of_source_name source_name =
   if String.equal source_name Source.to_string then Some BuiltinToString
+  else if String.equal source_name Source.checked_get then
+    Some BuiltinCheckedGet
+  else if String.equal source_name Source.tensor_peel then
+    Some BuiltinTensorPeel
+  else if String.equal source_name Source.matrix_checked_get then
+    Some BuiltinMatrixCheckedGet
+  else if String.equal source_name Source.tensor3_checked_get then
+    Some BuiltinTensor3CheckedGet
+  else if String.equal source_name Source.tensor4_checked_get then
+    Some BuiltinTensor4CheckedGet
+  else if String.equal source_name Source.tensor5_checked_get then
+    Some BuiltinTensor5CheckedGet
+  else if String.equal source_name Source.vector then Some BuiltinVector
+  else if String.equal source_name Source.matrix then Some BuiltinMatrix
+  else if String.equal source_name Source.tensor3 then Some BuiltinTensor3
+  else if String.equal source_name Source.tensor4 then Some BuiltinTensor4
+  else if String.equal source_name Source.tensor5 then Some BuiltinTensor5
   else if String.equal source_name Source.get then Some BuiltinGet
   else if String.equal source_name Source.from_char then
     Some BuiltinStringFromChar

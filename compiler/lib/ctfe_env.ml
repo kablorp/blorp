@@ -5,9 +5,13 @@ open Ctfe_value
 let ( >>= ) = Result.bind
 let void_value loc = { ty = Ast.TyNamed ("Void", []); desc = VVoid; loc }
 
-let bind_value ?(mutable_binding = false) name value env =
+let bind_value ?(binding_scope = LocalBinding) ?(mutable_binding = false) name
+    value env =
   if name = "_" then env
-  else (name, { mutable_binding; cell = ref value }) :: env
+  else (name, { binding_scope; mutable_binding; cell = ref value }) :: env
+
+let bind_global_value name value env =
+  bind_value ~binding_scope:GlobalBinding name value env
 
 let bind_values bindings env =
   List.fold_left
@@ -20,9 +24,16 @@ let snapshot env =
       ( name,
         {
           mutable_binding = binding.mutable_binding;
+          binding_scope = binding.binding_scope;
           cell = ref !(binding.cell);
         } ))
     env
+
+let global_bindings env =
+  List.filter (fun (_, binding) -> binding.binding_scope = GlobalBinding) env
+
+let has_local_bindings env =
+  List.exists (fun (_, binding) -> binding.binding_scope = LocalBinding) env
 
 let lookup_binding env loc name =
   match List.assoc_opt name env with
@@ -32,11 +43,11 @@ let lookup_binding env loc name =
         [
           Ctfe_error.error
             ~help:
-              "Only earlier bindings in the same compile_time block are \
-               available during compile-time evaluation."
+              "Only earlier global constants that have already been evaluated \
+               are available during compile-time constant evaluation."
             loc
             (Printf.sprintf
-               "compile_time initializer cannot reference '%s' before it is \
+               "global constant initializer cannot reference '%s' before it is \
                 evaluated"
                name);
         ]
@@ -53,6 +64,6 @@ let assign env loc name value =
     Error
       [
         Ctfe_error.error loc
-          (Printf.sprintf "compile_time assignment target '%s' is immutable"
+          (Printf.sprintf "compile-time assignment target '%s' is immutable"
              name);
       ]

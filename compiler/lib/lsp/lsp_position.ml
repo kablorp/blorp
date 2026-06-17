@@ -205,8 +205,6 @@ let find_expr_at (program : program) ~(line : int) ~(col : int) : expr option =
         | Some b -> walk_expr b
         | None -> ())
     | DVar vd -> walk_expr vd.var_value
-    | DCompileTimeBlock bindings ->
-        List.iter (fun binding -> walk_expr binding.ctb_var.var_value) bindings
     | DImpl impl ->
         List.iter
           (fun fd ->
@@ -331,9 +329,7 @@ let find_typed_param_at ?file (program : Typed_ast.program) ~(line : int)
             | DeclFunction func ->
                 find_typed_param_in_func ?file func ~line ~col
             | _ -> None)
-        | DeclVar _ | DeclRecord _ | DeclTypeAlias _ | DeclCompileTimeBlock _
-        | DeclOther ->
-            None)
+        | DeclVar _ | DeclRecord _ | DeclTypeAlias _ | DeclOther -> None)
 
 (* ============================================================================
    Record field lookup
@@ -515,8 +511,6 @@ let find_record_field_assignment_hit ?(module_aliases = []) ?file
     match decl.decl_desc with
     | DFunc fd -> fd.func_body |> func_body_expr_opt |> Option.iter walk_expr
     | DVar vd -> walk_expr vd.var_value
-    | DCompileTimeBlock bindings ->
-        List.iter (fun binding -> walk_expr binding.ctb_var.var_value) bindings
     | DImpl impl ->
         List.iter
           (fun fd ->
@@ -562,8 +556,6 @@ let find_record_field_definition (env : Env.env) (program : program)
     match decl.decl_desc with
     | DFunc fd -> fd.func_body |> func_body_expr_opt |> Option.iter walk_expr
     | DVar vd -> walk_expr vd.var_value
-    | DCompileTimeBlock bindings ->
-        List.iter (fun binding -> walk_expr binding.ctb_var.var_value) bindings
     | DImpl impl ->
         List.iter
           (fun fd ->
@@ -755,8 +747,7 @@ let find_function_type_param_at ?file (program : program) ~(text : string)
         | DImpl impl ->
             List.find_map (check_func decl.decl_loc) impl.impl_methods
         | DPrivate inner -> check_decl inner
-        | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ | DVar _
-        | DCompileTimeBlock _ ->
+        | DType _ | DRecord _ | DImport _ | DTrait _ | DTypeAlias _ | DVar _ ->
             None
       in
       List.find_map check_decl program
@@ -847,7 +838,7 @@ let collect_function_type_param_occurrences ?file (program : program)
         | None -> [])
     | DPrivate inner -> collect_decl inner
     | DFunc _ | DVar _ | DType _ | DRecord _ | DImport _ | DTrait _
-    | DTypeAlias _ | DCompileTimeBlock _ ->
+    | DTypeAlias _ ->
         []
   in
   List.find_map
@@ -1368,14 +1359,6 @@ let find_resolved_call_at (program : Typed_ast.program) ~(name : string)
         | Error _ -> ())
     | DeclImpl impl -> List.iter walk_func (Typed_ast.impl_methods impl)
     | DeclPrivate inner -> walk_decl inner
-    | DeclCompileTimeBlock bindings ->
-        List.iter
-          (fun binding ->
-            let var = Typed_ast.compile_time_binding_var binding in
-            match Typed_ast.var_value_expr var with
-            | Ok expr -> walk_expr expr
-            | Error _ -> ())
-          bindings
     | DeclRecord _ | DeclTypeAlias _ | DeclOther -> ()
   in
   program |> Typed_ast.program_decls |> List.iter walk_decl;
@@ -1391,7 +1374,7 @@ let find_callable_definition_in_program (program : Typed_ast.program)
         Some (func_decl_name_loc ast_decl.decl_loc (Typed_ast.func_ast func))
     | DeclPrivate inner -> find_decl inner
     | DeclFunction _ | DeclVar _ | DeclRecord _ | DeclTypeAlias _ | DeclImpl _
-    | DeclCompileTimeBlock _ | DeclOther ->
+    | DeclOther ->
         None
   in
   program |> Typed_ast.program_decls |> List.find_map find_decl

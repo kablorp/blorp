@@ -57,13 +57,6 @@ type type_alias_decl = {
 }
 
 type impl_decl = { ast_impl : Ast.impl_decl; typed_methods : func_decl list }
-type compile_time_evaluation = CompileTimeRequired
-
-type compile_time_binding = {
-  ast_binding : Ast.compile_time_binding;
-  typed_var : var_decl;
-  evaluation : compile_time_evaluation;
-}
 
 type decl_info =
   | FunctionDecl of func_decl
@@ -71,7 +64,6 @@ type decl_info =
   | RecordDecl of record_decl
   | TypeAliasDecl of type_alias_decl
   | ImplDecl of impl_decl
-  | CompileTimeBlockDecl of compile_time_binding list
   | PrivateDecl of decl
   | NonFunctionDecl
 
@@ -85,7 +77,6 @@ type decl_view =
   | DeclRecord of record_decl
   | DeclTypeAlias of type_alias_decl
   | DeclImpl of impl_decl
-  | DeclCompileTimeBlock of compile_time_binding list
   | DeclPrivate of decl
   | DeclOther
 
@@ -217,7 +208,6 @@ let decl_view decl =
   | RecordDecl record -> DeclRecord record
   | TypeAliasDecl alias -> DeclTypeAlias alias
   | ImplDecl impl -> DeclImpl impl
-  | CompileTimeBlockDecl bindings -> DeclCompileTimeBlock bindings
   | PrivateDecl inner -> DeclPrivate inner
   | NonFunctionDecl -> DeclOther
 
@@ -228,7 +218,6 @@ let rec decl_func decl =
   | RecordDecl _ -> None
   | TypeAliasDecl _ -> None
   | ImplDecl _ -> None
-  | CompileTimeBlockDecl _ -> None
   | PrivateDecl inner -> decl_func inner
   | NonFunctionDecl -> None
 
@@ -238,9 +227,6 @@ let loc (expr : expr) = expr.ast.expr_loc
 let type_info (expr : expr) = expr.info
 let impl_ast (impl : impl_decl) = impl.ast_impl
 let impl_methods (impl : impl_decl) = impl.typed_methods
-let compile_time_binding_ast binding = binding.ast_binding
-let compile_time_binding_var binding = binding.typed_var
-let compile_time_binding_evaluation binding = binding.evaluation
 let make_var_decl ast_decl var = { ast_decl; decl_info = VarDecl var }
 
 let make_private_decl ast_decl inner =
@@ -1066,15 +1052,6 @@ let source_impl_decl ~loc = function
       invalid_info ~loc ~context:"impl declaration source metadata"
         "source declaration kind does not match canonical impl declaration"
 
-let source_compile_time_bindings ~loc = function
-  | None -> Ok None
-  | Some { Ast.decl_desc = Ast.DCompileTimeBlock bindings; _ } ->
-      Ok (Some bindings)
-  | Some _ ->
-      invalid_info ~loc ~context:"compile_time declaration source metadata"
-        "source declaration kind does not match canonical compile_time \
-         declaration"
-
 let source_private_decl = function
   | Some { Ast.decl_desc = Ast.DPrivate inner; _ } -> Some inner
   | _ -> None
@@ -1140,34 +1117,6 @@ let rec of_ast_decl_with_source ?source_decl ?callable_id_of_func ast_decl =
         in
         let* typed_methods = typed_methods impl.impl_methods in
         Ok (ImplDecl { ast_impl = impl; typed_methods })
-    | Ast.DCompileTimeBlock bindings ->
-        let* source_bindings =
-          source_compile_time_bindings ~loc:ast_decl.decl_loc source_decl
-        in
-        let source_binding_at idx =
-          Option.bind source_bindings (fun bindings ->
-              List.nth_opt bindings idx)
-        in
-        let rec typed_bindings idx = function
-          | [] -> Ok []
-          | binding :: rest ->
-              let source_var =
-                Option.map (fun b -> b.Ast.ctb_var) (source_binding_at idx)
-              in
-              let* typed_var =
-                of_ast_var_decl_with_source ?source_var binding.Ast.ctb_var
-              in
-              let* typed_rest = typed_bindings (idx + 1) rest in
-              Ok
-                ({
-                   ast_binding = binding;
-                   typed_var;
-                   evaluation = CompileTimeRequired;
-                 }
-                :: typed_rest)
-        in
-        let* typed_bindings = typed_bindings 0 bindings in
-        Ok (CompileTimeBlockDecl typed_bindings)
     | Ast.DTrait trait ->
         let* () = validate_trait_methods trait.trait_methods in
         Ok NonFunctionDecl

@@ -34,7 +34,10 @@ let string_of_char_code loc code =
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time invalid Char codepoint: %d" code);
+            (Printf.sprintf
+               "compile-time constant evaluation found invalid Char codepoint: \
+                %d"
+               code);
         ]
 
 let expect_int loc = function
@@ -43,7 +46,8 @@ let expect_int loc = function
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time expected Int, found %s"
+            (Printf.sprintf
+               "compile-time constant evaluation expected Int, found %s"
                (type_name value.ty));
         ]
 
@@ -53,7 +57,8 @@ let expect_float loc = function
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time expected Float, found %s"
+            (Printf.sprintf
+               "compile-time constant evaluation expected Float, found %s"
                (type_name value.ty));
         ]
 
@@ -63,7 +68,8 @@ let expect_bool loc = function
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time expected Bool, found %s"
+            (Printf.sprintf
+               "compile-time constant evaluation expected Bool, found %s"
                (type_name value.ty));
         ]
 
@@ -73,7 +79,8 @@ let expect_char loc = function
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time expected Char, found %s"
+            (Printf.sprintf
+               "compile-time constant evaluation expected Char, found %s"
                (type_name value.ty));
         ]
 
@@ -83,7 +90,8 @@ let expect_string loc = function
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time expected String, found %s"
+            (Printf.sprintf
+               "compile-time constant evaluation expected String, found %s"
                (type_name value.ty));
         ]
 
@@ -93,7 +101,8 @@ let expect_list loc = function
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time expected List, found %s"
+            (Printf.sprintf
+               "compile-time constant evaluation expected List, found %s"
                (type_name value.ty));
         ]
 
@@ -103,7 +112,8 @@ let expect_dict loc = function
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time expected Dict, found %s"
+            (Printf.sprintf
+               "compile-time constant evaluation expected Dict, found %s"
                (type_name value.ty));
         ]
 
@@ -114,7 +124,7 @@ let rec value_equal left right =
   | VBool a, VBool b -> a = b
   | VChar a, VChar b -> a = b
   | VString (a, _), VString (b, _) -> a = b
-  | VTuple a, VTuple b | VList a, VList b ->
+  | VTuple a, VTuple b | VList a, VList b | VVector a, VVector b ->
       List.length a = List.length b && List.for_all2 value_equal a b
   | VRecord a, VRecord b ->
       List.length a = List.length b
@@ -194,7 +204,8 @@ let dict_from_list_entries loc entries =
               [
                 Ctfe_error.error loc
                   (Printf.sprintf
-                     "compile_time expected Dict entry tuple, found %s"
+                     "compile-time constant evaluation expected Dict entry \
+                      tuple, found %s"
                      (type_name entry.ty));
               ])
   in
@@ -287,7 +298,9 @@ let expect_closure loc = function
       Error
         [
           Ctfe_error.error loc
-            (Printf.sprintf "compile_time expected pure callback, found %s"
+            (Printf.sprintf
+               "compile-time constant evaluation expected pure callback, found \
+                %s"
                (type_name value.ty));
         ]
 
@@ -304,7 +317,7 @@ let string_text_of_value loc value =
         [
           Ctfe_error.error loc
             (Printf.sprintf
-               "compile_time to_string currently supports String, Int, Float, \
+               "compile-time to_string currently supports String, Int, Float, \
                 Bool, and Char values, found %s"
                (type_name value.ty));
         ]

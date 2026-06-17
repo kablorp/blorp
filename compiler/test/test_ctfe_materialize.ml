@@ -29,7 +29,7 @@ let typed_expr ty desc =
 
 let int_value value = { V.ty = ty_int; desc = V.VInt (Int64.of_int value); loc }
 
-let typed_compile_time_binding ?(private_ = false) ?doc name ty init =
+let typed_global_constant name ty init =
   let ast_var =
     {
       A.var_name = Some name;
@@ -40,27 +40,15 @@ let typed_compile_time_binding ?(private_ = false) ?doc name ty init =
       var_is_const = true;
     }
   in
-  let ast_binding =
-    {
-      A.ctb_private = private_;
-      ctb_var = ast_var;
-      ctb_loc = loc;
-      ctb_doc = doc;
-    }
-  in
   let ast_decl =
-    {
-      A.decl_desc = A.DCompileTimeBlock [ ast_binding ];
-      decl_loc = loc;
-      decl_doc = None;
-    }
+    { A.decl_desc = A.DVar ast_var; decl_loc = loc; decl_doc = None }
   in
   match Blorp.Typed_ast.of_ast_decl ast_decl with
   | Ok typed_decl -> (
       match Blorp.Typed_ast.decl_view typed_decl with
-      | Blorp.Typed_ast.DeclCompileTimeBlock [ binding ] -> binding
-      | _ -> Alcotest.fail "expected one typed compile_time binding")
-  | Error _ -> Alcotest.fail "expected finalized compile_time declaration"
+      | Blorp.Typed_ast.DeclVar var -> var
+      | _ -> Alcotest.fail "expected typed global constant")
+  | Error _ -> Alcotest.fail "expected finalized global constant"
 
 let constructor_info ?(arity = 1) ?(callable_id = Some 42) parent_type =
   {
@@ -106,11 +94,11 @@ let require_identifier expr =
   | A.EIdent name -> name
   | _ -> Alcotest.fail "expected materialized identifier"
 
-let require_binding_decl binding value =
-  match M.binding_decl binding value with
+let require_global_var_decl ?private_ ?doc typed_var value =
+  match M.global_var_decl ?private_ ?doc ~loc typed_var value with
   | Ok decl -> decl
   | Error errors ->
-      Alcotest.failf "expected binding to materialize, got %d error(s)"
+      Alcotest.failf "expected global to materialize, got %d error(s)"
         (List.length errors)
 
 let require_var_decl decl =
@@ -195,8 +183,8 @@ let test_synthesized_nullary_constructor_materializes_identifier () =
 
 let test_public_binding_materializes_immutable_global () =
   let init = typed_expr ty_int (A.ELiteral (A.LitInt 0L)) in
-  let binding = typed_compile_time_binding "ANSWER" ty_int init in
-  let decl = require_binding_decl binding (int_value 42) in
+  let binding = typed_global_constant "ANSWER" ty_int init in
+  let decl = require_global_var_decl binding (int_value 42) in
   let var = require_var_decl decl in
   let ast_var = Blorp.Typed_ast.var_ast var in
   check_bool "global is immutable" false ast_var.var_is_mutable;
@@ -209,10 +197,10 @@ let test_public_binding_materializes_immutable_global () =
 let test_private_binding_preserves_inner_doc () =
   let doc = "Materialized private value." in
   let init = typed_expr ty_int (A.ELiteral (A.LitInt 0L)) in
-  let binding =
-    typed_compile_time_binding ~private_:true ~doc "PRIVATE_ANSWER" ty_int init
+  let binding = typed_global_constant "PRIVATE_ANSWER" ty_int init in
+  let decl =
+    require_global_var_decl ~private_:true ~doc binding (int_value 7)
   in
-  let decl = require_binding_decl binding (int_value 7) in
   let var = require_private_var_decl decl in
   let inner_ast_var = Blorp.Typed_ast.var_ast var in
   check_string "private global name" "PRIVATE_ANSWER"
