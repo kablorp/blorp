@@ -28,7 +28,8 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
     ~(type_to_c : Core_emit_context.t -> Ast.type_expr -> string)
     (ctx : Core_emit_context.t) (e : core) (name : string) (args : core list) :
     unit =
-  if Core_emit_blorp_intrinsic.emit ~emit_expr ctx name args then ()
+  if Core_emit_blorp_backend.emit_simple_intrinsic ~emit_expr ctx name args then
+    ()
   else
     let emit_backend node =
       Core_emit_blorp_backend.emit
