@@ -850,7 +850,7 @@ let test_emit_stack_result_int_builtin_ok_call () =
   Alcotest.(check string)
     "builtin Ok(Int) uses stack ABI"
     "((blorp_StackResult){ .tag = BLORP_TAG_OK, .release_mask = 0UL, \
-     .data.Ok.field0 = ({ long __box_0 = 7L; (void*)(long)(__box_0); }) })"
+     .data.Ok.field0 = (void*)(long)(7L) })"
     (emit_to_string e)
 
 let test_emit_managed_stack_result_rc_ops () =

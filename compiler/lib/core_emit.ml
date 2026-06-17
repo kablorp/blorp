@@ -1205,6 +1205,16 @@ let boxed_value_release_arg ctx ty loc =
     Core_emit_blorp_backend.ElemReleaseFn
   else Core_emit_blorp_backend.NoElemRelease
 
+let hash_container_constructor_parts ctx loc key_ty =
+  let hash_fn =
+    trait_method_c_name_for_type ctx ~loc "Hashable" "hash" key_ty
+  in
+  let equals_fn =
+    trait_method_c_name_for_type ctx ~loc "Equatable" "equals" key_ty
+  in
+  let release_arg = boxed_value_release_arg ctx key_ty loc in
+  (hash_fn, equals_fn, release_arg)
+
 let tensor_type_of_type ctx ty = Core_tensor_type.of_type ~reg:ctx.reg ty
 let tensor_type_of_expr ctx expr = Core_tensor_type.of_core ~reg:ctx.reg expr
 let is_tensor_type ctx ty = Core_tensor_type.is_type ~reg:ctx.reg ty
@@ -1443,6 +1453,14 @@ and blorp_backend_emitters () =
 and emit_blorp_backend ctx node =
   Core_emit_blorp_backend.emit (blorp_backend_emitters ()) ctx node
 
+and emit_dict_construct_result ctx e ctor_arg =
+  emit_blorp_backend ctx
+    (DictConstructResult
+       {
+         ctor_arg;
+         value_needs_release = dict_value_needs_release ctx e.ty e.loc;
+       })
+
 and emit_tensor_raw_view_decl (ctx : Core_emit_context.t)
     (b : tensor_raw_view_binding) : unit =
   emit_blorp_backend ctx (TensorRawViewDecl b)
@@ -1561,15 +1579,11 @@ and render_dict_ctor_for_kind ctx loc = function
   | DictString -> Core_emit_blorp_backend.render_dict_constructor DictCtorString
   | DictFloat -> Core_emit_blorp_backend.render_dict_constructor DictCtorFloat
   | DictCustom key_ty ->
-      let hash_c =
-        trait_method_c_name_for_type ctx ~loc "Hashable" "hash" key_ty
+      let hash_fn, equals_fn, key_release =
+        hash_container_constructor_parts ctx loc key_ty
       in
-      let eq_c =
-        trait_method_c_name_for_type ctx ~loc "Equatable" "equals" key_ty
-      in
-      let key_release = boxed_value_release_arg ctx key_ty loc in
       Core_emit_blorp_backend.render_dict_constructor
-        (DictCtorCustom { hash_fn = hash_c; equals_fn = eq_c; key_release })
+        (DictCtorCustom { hash_fn; equals_fn; key_release })
 
 and emit_dict_construct ctx e dc =
   let ctor_arg = render_dict_ctor_for_kind ctx e.loc dc.dc_constructor in
@@ -1587,15 +1601,10 @@ and set_ctor_for_kind ctx loc = function
   | SetString -> Core_emit_blorp_backend.SetCtorString
   | SetFloat -> Core_emit_blorp_backend.SetCtorFloat
   | SetCustom elem_ty ->
-      let hash_c =
-        trait_method_c_name_for_type ctx ~loc "Hashable" "hash" elem_ty
+      let hash_fn, equals_fn, elem_release =
+        hash_container_constructor_parts ctx loc elem_ty
       in
-      let eq_c =
-        trait_method_c_name_for_type ctx ~loc "Equatable" "equals" elem_ty
-      in
-      let elem_release = boxed_value_release_arg ctx elem_ty loc in
-      Core_emit_blorp_backend.SetCtorCustom
-        { hash_fn = hash_c; equals_fn = eq_c; elem_release }
+      Core_emit_blorp_backend.SetCtorCustom { hash_fn; equals_fn; elem_release }
 
 and emit_set_alloc ctx loc kind =
   emit_blorp_backend ctx
@@ -1644,13 +1653,16 @@ and emit_union_construct ctx uc =
       let abi =
         Core_layout_type.stack_result_constructor_abi_of_layout result_layout
       in
-      emit ctx
-        (Printf.sprintf
-           "((%s){ .tag = %d, .release_mask = %dUL, .data.%s.field0 = "
-           abi.src_result_c_type uc.uc_tag uc.uc_release_mask
-           uc.uc_constructor_name);
-      emit_boxed_storage ctx arg;
-      emit ctx " })"
+      emit_blorp_backend ctx
+        (Core_emit_blorp_backend.StackResultConstruct
+           (Core_emit_blorp_backend.StackResultTaggedPayload
+              {
+                result_type = abi.src_result_c_type;
+                tag = uc.uc_tag;
+                field = uc.uc_constructor_name;
+                payload = arg;
+                release_mask = uc.uc_release_mask;
+              }))
   | ResultUnion _, _ ->
       Core_error.errorf Core_error.Emit Ast.dummy_loc
         ~hint:"stack Result constructors are represented as tag + one payload"
@@ -1669,22 +1681,33 @@ and emit_union_construct ctx uc =
             "invalid nullable managed Option constructor arity for %s"
             uc.uc_constructor_name
       | Some (Core_layout_type.OptionConstructorStackInline abi), [] ->
-          emit ctx
-            (Printf.sprintf "((%s){ .tag = %d, .value = %s })" abi.soe_c_type
-               uc.uc_tag abi.soe_none_value)
+          emit_blorp_backend ctx
+            (Core_emit_blorp_backend.StackOptionConstruct
+               (Core_emit_blorp_backend.StackOptionTaggedNone
+                  {
+                    option_type = abi.soe_c_type;
+                    tag = uc.uc_tag;
+                    none_value = abi.soe_none_value;
+                  }))
       | Some (Core_layout_type.OptionConstructorStackInline abi), [ arg ]
         when is_void_ty arg.bsv_box.box_value.ty ->
-          emit ctx "({ ";
-          emit_stmt ctx arg.bsv_box.box_value;
-          emit ctx
-            (Printf.sprintf "((%s){ .tag = %d, .value = 0 }); })" abi.soe_c_type
-               uc.uc_tag)
+          emit_blorp_backend ctx
+            (Core_emit_blorp_backend.StackOptionConstruct
+               (Core_emit_blorp_backend.StackOptionTaggedVoidStatement
+                  {
+                    option_type = abi.soe_c_type;
+                    tag = uc.uc_tag;
+                    statement = arg.bsv_box.box_value;
+                  }))
       | Some (Core_layout_type.OptionConstructorStackInline abi), [ arg ] ->
-          emit ctx
-            (Printf.sprintf "((%s){ .tag = %d, .value = " abi.soe_c_type
-               uc.uc_tag);
-          emit_expr ctx arg.bsv_box.box_value;
-          emit ctx " })"
+          emit_blorp_backend ctx
+            (Core_emit_blorp_backend.StackOptionConstruct
+               (Core_emit_blorp_backend.StackOptionTaggedValue
+                  {
+                    option_type = abi.soe_c_type;
+                    tag = uc.uc_tag;
+                    value = arg.bsv_box.box_value;
+                  }))
       | Some (Core_layout_type.OptionConstructorStackInline _), _ ->
           Core_error.errorf Core_error.Emit Ast.dummy_loc
             ~hint:
@@ -2275,10 +2298,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
       emit ctx
         (Printf.sprintf ", (blorp_String* (*)(void*))%s)"
            (escape_c_ident elem_to_str))
-  | CCall (kind, _, _)
-    when match kind with
-         | CKBuiltin ("blorp_dict_new_custom" | "blorp_set_new_custom") -> true
-         | _ -> false ->
+  | CCall (CKBuiltin "blorp_dict_new_custom", _, _) ->
       (* User-key Dict/Set construction. The specialize pass routes
          [Dict[UserType, V]] / [Set[UserType]] creation here; we emit
          the full call inline with function-pointer casts to the
@@ -2292,58 +2312,41 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
          for pointer-arg + word-return — true on every platform
          blorp targets today. If CFI ever lands, this call site
          needs per-type wrapper functions instead. *)
-      let fn_name, key_type =
-        match kind with
-        | CKBuiltin "blorp_dict_new_custom" ->
-            let kty =
-              match normalize_type e.ty with
-              | TyNamed ("Dict", k :: _) -> k
-              | _ ->
-                  Core_error.errorf Core_error.Emit e.loc
-                    "blorp_dict_new_custom on non-Dict type"
-            in
-            ("blorp_dict_new_custom", kty)
-        | CKBuiltin "blorp_set_new_custom" ->
-            let kty =
-              match normalize_type e.ty with
-              | TyNamed ("Set", [ elem ]) -> elem
-              | _ ->
-                  Core_error.errorf Core_error.Emit e.loc
-                    "blorp_set_new_custom on non-Set type"
-            in
-            ("blorp_set_new_custom", kty)
-        | _ -> assert false
+      let key_type =
+        match normalize_type e.ty with
+        | TyNamed ("Dict", k :: _) -> k
+        | _ ->
+            Core_error.errorf Core_error.Emit e.loc
+              "blorp_dict_new_custom on non-Dict type"
       in
       (* A4.2: mangle the trait-method fn-ptrs to match their
          [__def_N_] decl. [ctx.trait_impl_def_ids] is populated by
          [emit_impl] as it walks each trait method. *)
-      let trait_method_c_name trait method_name =
-        trait_method_c_name_for_type ctx ~loc:e.loc trait method_name key_type
+      let hash_fn, equals_fn, key_release =
+        hash_container_constructor_parts ctx e.loc key_type
       in
-      let key_release = boxed_value_release_arg ctx key_type e.loc in
       let ctor_arg =
-        match fn_name with
-        | "blorp_dict_new_custom" ->
-            Core_emit_blorp_backend.render_dict_constructor
-              (DictCtorCustom
-                 {
-                   hash_fn = trait_method_c_name "Hashable" "hash";
-                   equals_fn = trait_method_c_name "Equatable" "equals";
-                   key_release;
-                 })
-        | "blorp_set_new_custom" ->
-            Core_emit_blorp_backend.render_custom_constructor fn_name
-              ~hash_fn:(trait_method_c_name "Hashable" "hash")
-              ~equals_fn:(trait_method_c_name "Equatable" "equals")
-              ~key_release
-        | _ -> assert false
+        Core_emit_blorp_backend.render_dict_constructor
+          (DictCtorCustom { hash_fn; equals_fn; key_release })
+      in
+      emit_dict_construct_result ctx e ctor_arg
+  | CCall (CKBuiltin "blorp_set_new_custom", _, _) ->
+      let elem_type =
+        match normalize_type e.ty with
+        | TyNamed ("Set", [ elem ]) -> elem
+        | _ ->
+            Core_error.errorf Core_error.Emit e.loc
+              "blorp_set_new_custom on non-Set type"
+      in
+      let hash_fn, equals_fn, elem_release =
+        hash_container_constructor_parts ctx e.loc elem_type
+      in
+      let ctor_arg =
+        Core_emit_blorp_backend.render_set_constructor
+          (SetCtorCustom { hash_fn; equals_fn; elem_release })
       in
       emit_blorp_backend ctx
-        (DictConstructResult
-           {
-             ctor_arg;
-             value_needs_release = dict_value_needs_release ctx e.ty e.loc;
-           })
+        (DictConstructResult { ctor_arg; value_needs_release = false })
   | CCall (CKBuiltin "blorp_dict_with_capacity_custom", _, [ cap ]) ->
       let key_type =
         match normalize_type e.ty with
@@ -2352,83 +2355,47 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
             Core_error.errorf Core_error.Emit e.loc
               "blorp_dict_with_capacity_custom on non-Dict type"
       in
-      let trait_method_c_name trait method_name =
-        trait_method_c_name_for_type ctx ~loc:e.loc trait method_name key_type
+      let hash_fn, equals_fn, key_release =
+        hash_container_constructor_parts ctx e.loc key_type
       in
-      let key_release = boxed_value_release_arg ctx key_type e.loc in
       let ctor_arg =
         Core_emit_blorp_backend.render_dict_capacity_constructor
           (blorp_backend_emitters ())
           ctx
           (DictWithCapacityCustom
-             {
-               capacity = cap;
-               hash_fn = trait_method_c_name "Hashable" "hash";
-               equals_fn = trait_method_c_name "Equatable" "equals";
-               key_release;
-             })
+             { capacity = cap; hash_fn; equals_fn; key_release })
       in
-      emit_blorp_backend ctx
-        (DictConstructResult
-           {
-             ctor_arg;
-             value_needs_release = dict_value_needs_release ctx e.ty e.loc;
-           })
-  | CCall
-      ( CKBuiltin
-          (("blorp_dict_new" | "blorp_dict_new_string" | "blorp_dict_new_float")
-           as ctor),
-        _,
-        [] ) ->
-      let ctor_arg =
-        Core_emit_blorp_backend.render_dict_constructor
-          (match ctor with
-          | "blorp_dict_new" -> DictCtorGeneric
-          | "blorp_dict_new_string" -> DictCtorString
-          | "blorp_dict_new_float" -> DictCtorFloat
-          | _ -> assert false)
-      in
-      emit_blorp_backend ctx
-        (DictConstructResult
-           {
-             ctor_arg;
-             value_needs_release = dict_value_needs_release ctx e.ty e.loc;
-           })
-  | CCall
-      ( CKBuiltin
-          (( "blorp_dict_with_capacity" | "blorp_dict_with_capacity_string"
-           | "blorp_dict_with_capacity_float" ) as ctor),
-        _,
-        [ cap ] ) ->
-      let ctor_arg =
-        Core_emit_blorp_backend.render_dict_capacity_constructor
-          (blorp_backend_emitters ())
-          ctx
-          (match ctor with
-          | "blorp_dict_with_capacity" -> DictWithCapacityGeneric cap
-          | "blorp_dict_with_capacity_string" -> DictWithCapacityString cap
-          | "blorp_dict_with_capacity_float" -> DictWithCapacityFloat cap
-          | _ -> assert false)
-      in
-      emit_blorp_backend ctx
-        (DictConstructResult
-           {
-             ctor_arg;
-             value_needs_release = dict_value_needs_release ctx e.ty e.loc;
-           })
+      emit_dict_construct_result ctx e ctor_arg
+  | CCall (CKBuiltin "blorp_dict_new", _, []) ->
+      emit_dict_construct_result ctx e
+        (Core_emit_blorp_backend.render_dict_constructor DictCtorGeneric)
+  | CCall (CKBuiltin "blorp_dict_new_string", _, []) ->
+      emit_dict_construct_result ctx e
+        (Core_emit_blorp_backend.render_dict_constructor DictCtorString)
+  | CCall (CKBuiltin "blorp_dict_new_float", _, []) ->
+      emit_dict_construct_result ctx e
+        (Core_emit_blorp_backend.render_dict_constructor DictCtorFloat)
+  | CCall (CKBuiltin "blorp_dict_with_capacity", _, [ cap ]) ->
+      emit_dict_construct_result ctx e
+        (Core_emit_blorp_backend.render_dict_capacity_constructor
+           (blorp_backend_emitters ())
+           ctx (DictWithCapacityGeneric cap))
+  | CCall (CKBuiltin "blorp_dict_with_capacity_string", _, [ cap ]) ->
+      emit_dict_construct_result ctx e
+        (Core_emit_blorp_backend.render_dict_capacity_constructor
+           (blorp_backend_emitters ())
+           ctx (DictWithCapacityString cap))
+  | CCall (CKBuiltin "blorp_dict_with_capacity_float", _, [ cap ]) ->
+      emit_dict_construct_result ctx e
+        (Core_emit_blorp_backend.render_dict_capacity_constructor
+           (blorp_backend_emitters ())
+           ctx (DictWithCapacityFloat cap))
   | CCall (CKBuiltin "blorp_list_new", _, [ cap ]) ->
       emit_blorp_backend ctx
         (ListAllocForType { ty = e.ty; loc = e.loc; capacity = cap })
   | CCall (CKBuiltin "blorp_channel_new", _, [ cap ])
     when channel_element_needs_release ctx e.ty e.loc ->
-      let tmp = Printf.sprintf "__ch_%d" (fresh_temp ctx) in
-      emit ctx (Printf.sprintf "({ blorp_Channel* %s = blorp_channel_new(" tmp);
-      emit_expr ctx cap;
-      emit ctx
-        (Printf.sprintf
-           "); blorp_channel_init_elem_release(%s, blorp_elem_release_fn); %s; \
-            })"
-           tmp tmp)
+      emit_blorp_backend ctx (ChannelAllocWithElemRelease cap)
   | CCall
       ( CKBuiltin
           ("blorp_tensor3_new" | "blorp_tensor4_new" | "blorp_tensor5_new"),
@@ -2552,223 +2519,163 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
             in
             find candidates
           in
+          let callee_is_registered_constructor ctor_name =
+            match callee.desc with
+            | CVar v -> Hashtbl.mem ctx.constructor_names v.vname
+            | CField (_, field) -> Hashtbl.mem ctx.constructor_names field
+            | _ -> Hashtbl.mem ctx.constructor_names ctor_name
+          in
           let try_emit_channel_send_with_boxed_temp_cleanup () =
-            let channel_send_names =
-              [
-                "blorp_channel_send";
-                "blorp_channel_try_send";
-                "blorp_channel_try_send_status";
-                "blorp_channel_send_timeout";
-                "blorp_channel_send_timeout_status";
-              ]
+            let emit_retaining_send_no_timeout runtime ch value =
+              let result_type = type_to_c ctx e.ty in
+              emit_blorp_backend ctx
+                (ChannelRetainingSend
+                   (Core_emit_blorp_backend.ChannelRetainingSendNoTimeout
+                      { runtime; result_type; channel = ch; value }))
             in
-            let emit_retaining_send c_name ch value timeout =
-              let value_tmp =
-                Printf.sprintf "__chan_send_value_%d" (fresh_temp ctx)
-              in
-              let cleanup_tmp =
-                Printf.sprintf "__chan_send_cleanup_%d" (fresh_temp ctx)
-              in
-              let result_tmp =
-                Printf.sprintf "__chan_send_result_%d" (fresh_temp ctx)
-              in
-              emit ctx (Printf.sprintf "({ void* %s = " value_tmp);
-              emit_expr ctx value;
-              emit ctx
-                (Printf.sprintf
-                   "; blorp_CancelCleanupFrame %s; \
-                    blorp_task_cleanup_push(&%s, &%s, (void*)%s, \
-                    blorp_cleanup_release_arc_value); %s %s = %s("
-                   cleanup_tmp cleanup_tmp value_tmp value_tmp
-                   (type_to_c ctx e.ty) result_tmp c_name);
-              emit_expr ctx ch;
-              emit ctx (Printf.sprintf ", %s" value_tmp);
-              Option.iter
-                (fun timeout ->
-                  emit ctx ", ";
-                  emit_expr ctx timeout)
-                timeout;
-              emit ctx
-                (Printf.sprintf
-                   "); blorp_task_cleanup_pop_slot(&%s); blorp_release(%s); \
-                    %s; })"
-                   value_tmp value_tmp result_tmp)
+            let emit_retaining_send_with_timeout runtime ch value timeout =
+              let result_type = type_to_c ctx e.ty in
+              emit_blorp_backend ctx
+                (ChannelRetainingSend
+                   (Core_emit_blorp_backend.ChannelRetainingSendWithTimeout
+                      { runtime; result_type; channel = ch; value; timeout }))
             in
             match (kind, args) with
-            | CKBuiltin c_name, [ ch; value ]
-              when List.mem c_name channel_send_names
-                   && boxed_expr_temp_needs_release ctx value ->
-                emit_retaining_send c_name ch value None;
+            | CKBuiltin "blorp_channel_send", [ ch; value ]
+              when boxed_expr_temp_needs_release ctx value ->
+                emit_retaining_send_no_timeout
+                  Core_emit_blorp_backend.ChannelSendRuntime ch value;
                 true
-            | CKBuiltin c_name, [ ch; value; timeout ]
-              when List.mem c_name channel_send_names
-                   && boxed_expr_temp_needs_release ctx value ->
-                emit_retaining_send c_name ch value (Some timeout);
+            | CKBuiltin "blorp_channel_try_send", [ ch; value ]
+              when boxed_expr_temp_needs_release ctx value ->
+                emit_retaining_send_no_timeout
+                  Core_emit_blorp_backend.ChannelTrySendRuntime ch value;
+                true
+            | CKBuiltin "blorp_channel_try_send_status", [ ch; value ]
+              when boxed_expr_temp_needs_release ctx value ->
+                emit_retaining_send_no_timeout
+                  Core_emit_blorp_backend.ChannelTrySendStatusRuntime ch value;
+                true
+            | CKBuiltin "blorp_channel_send_timeout", [ ch; value; timeout ]
+              when boxed_expr_temp_needs_release ctx value ->
+                emit_retaining_send_with_timeout
+                  Core_emit_blorp_backend.ChannelSendTimeoutRuntime ch value
+                  timeout;
+                true
+            | ( CKBuiltin "blorp_channel_send_timeout_status",
+                [ ch; value; timeout ] )
+              when boxed_expr_temp_needs_release ctx value ->
+                emit_retaining_send_with_timeout
+                  Core_emit_blorp_backend.ChannelSendTimeoutStatusRuntime ch
+                  value timeout;
                 true
             | _ -> false
           in
           let try_emit_channel_send_attempt () =
-            let emit_attempt_from_status value emit_status_call =
-              let status_tmp =
-                Printf.sprintf "__chan_send_status_%d" (fresh_temp ctx)
-              in
-              let result_tmp =
-                Printf.sprintf "__chan_send_result_%d" (fresh_temp ctx)
-              in
+            let send_attempt_value value =
+              if boxed_expr_temp_needs_release ctx value then
+                Core_emit_blorp_backend.ChannelSendAttemptRetainedValue value
+              else Core_emit_blorp_backend.ChannelSendAttemptDirectValue value
+            in
+            let send_attempt_constructors () =
               let constructor_c_name =
                 constructor_c_name_for_return ~contract:"send attempt"
               in
-              let send_accepted_ctor = constructor_c_name "SendAccepted" in
-              let send_would_block_ctor = constructor_c_name "SendWouldBlock" in
-              let send_sealed_ctor = constructor_c_name "SendSealed" in
-              let send_timed_out_ctor = constructor_c_name "SendTimedOut" in
-              let value_tmp =
-                if boxed_expr_temp_needs_release ctx value then
-                  Some (Printf.sprintf "__chan_send_value_%d" (fresh_temp ctx))
-                else None
-              in
-              emit ctx "({ ";
-              Option.iter
-                (fun tmp ->
-                  let cleanup_tmp =
-                    Printf.sprintf "__chan_send_cleanup_%d" (fresh_temp ctx)
-                  in
-                  emit ctx (Printf.sprintf "void* %s = " tmp);
-                  emit_expr ctx value;
-                  emit ctx
-                    (Printf.sprintf
-                       "; blorp_CancelCleanupFrame %s; \
-                        blorp_task_cleanup_push(&%s, &%s, (void*)%s, \
-                        blorp_cleanup_release_arc_value); "
-                       cleanup_tmp cleanup_tmp tmp tmp))
-                value_tmp;
-              emit ctx (Printf.sprintf "long %s = " status_tmp);
-              emit_status_call value_tmp;
-              Option.iter
-                (fun tmp ->
-                  emit ctx
-                    (Printf.sprintf
-                       "; blorp_task_cleanup_pop_slot(&%s); blorp_release(%s)"
-                       tmp tmp))
-                value_tmp;
-              emit ctx
-                (Printf.sprintf
-                   "; %s %s; if (%s == BLORP_CHANNEL_SEND_ACCEPTED) { %s = %s; \
-                    } else if (%s == BLORP_CHANNEL_SEND_WOULD_BLOCK) { %s = \
-                    %s; } else if (%s == BLORP_CHANNEL_SEND_SEALED) { %s = %s; \
-                    } else { %s = %s; } %s; })"
-                   (type_to_c ctx e.ty) result_tmp status_tmp result_tmp
-                   send_accepted_ctor status_tmp result_tmp
-                   send_would_block_ctor status_tmp result_tmp send_sealed_ctor
-                   result_tmp send_timed_out_ctor result_tmp)
+              {
+                Core_emit_blorp_backend.accepted =
+                  constructor_c_name "SendAccepted";
+                would_block = constructor_c_name "SendWouldBlock";
+                sealed = constructor_c_name "SendSealed";
+                timed_out = constructor_c_name "SendTimedOut";
+              }
             in
             match (kind, args, normalize_type e.ty) with
             | CKBuiltin "blorp_channel_try_send_attempt", [ ch; value ], _ ->
-                emit_attempt_from_status value (fun value_tmp ->
-                    emit ctx "blorp_channel_try_send_status(";
-                    emit_expr ctx ch;
-                    emit ctx ", ";
-                    (match value_tmp with
-                    | Some tmp -> emit ctx tmp
-                    | None -> emit_expr ctx value);
-                    emit ctx ")");
+                emit_blorp_backend ctx
+                  (ChannelSendAttempt
+                     (ChannelTrySendAttempt
+                        {
+                          result_type = type_to_c ctx e.ty;
+                          channel = ch;
+                          value = send_attempt_value value;
+                          constructors = send_attempt_constructors ();
+                        }));
                 true
             | ( CKBuiltin "blorp_channel_send_timeout_attempt",
                 [ ch; value; timeout_ms ],
                 _ ) ->
-                emit_attempt_from_status value (fun value_tmp ->
-                    emit ctx "blorp_channel_send_timeout_status(";
-                    emit_expr ctx ch;
-                    emit ctx ", ";
-                    (match value_tmp with
-                    | Some tmp -> emit ctx tmp
-                    | None -> emit_expr ctx value);
-                    emit ctx ", ";
-                    emit_expr ctx timeout_ms;
-                    emit ctx ")");
+                emit_blorp_backend ctx
+                  (ChannelSendAttempt
+                     (ChannelSendTimeoutAttempt
+                        {
+                          result_type = type_to_c ctx e.ty;
+                          channel = ch;
+                          value = send_attempt_value value;
+                          timeout = timeout_ms;
+                          constructors = send_attempt_constructors ();
+                        }));
                 true
             | _ -> false
           in
           let try_emit_channel_recv_attempt () =
-            let emit_attempt_from_status elem_ty empty_ctor_name
-                emit_status_call =
-              let value_tmp =
-                Printf.sprintf "__chan_recv_value_%d" (fresh_temp ctx)
-              in
-              let status_tmp =
-                Printf.sprintf "__chan_recv_status_%d" (fresh_temp ctx)
-              in
-              let result_tmp =
-                Printf.sprintf "__chan_recv_result_%d" (fresh_temp ctx)
-              in
+            let recv_attempt_release_policy elem_ty =
+              if boxed_value_needs_release ctx elem_ty e.loc then
+                Core_emit_blorp_backend.ReleaseRecvValue
+              else Core_emit_blorp_backend.KeepRecvValue
+            in
+            let recv_attempt_constructors empty_ctor_name =
               let constructor_c_name =
                 constructor_c_name_for_return ~contract:"recv attempt"
               in
-              let recv_value_ctor = constructor_c_name "RecvValue" in
-              let recv_sealed_ctor = constructor_c_name "RecvSealed" in
-              let recv_empty_ctor = constructor_c_name empty_ctor_name in
-              let release_mask =
-                if boxed_value_needs_release ctx elem_ty e.loc then 1 else 0
-              in
-              emit ctx
-                (Printf.sprintf "({ void* %s = NULL; long %s = " value_tmp
-                   status_tmp);
-              emit_status_call value_tmp;
-              emit ctx
-                (Printf.sprintf
-                   "; %s %s; if (%s == BLORP_CHANNEL_RECV_VALUE) { %s = %s(%s, \
-                    %dUL); } else if (%s == BLORP_CHANNEL_RECV_SEALED) { %s = \
-                    %s; } else { %s = %s; } %s; })"
-                   (type_to_c ctx e.ty) result_tmp status_tmp result_tmp
-                   recv_value_ctor value_tmp release_mask status_tmp result_tmp
-                   recv_sealed_ctor result_tmp recv_empty_ctor result_tmp)
+              {
+                Core_emit_blorp_backend.value = constructor_c_name "RecvValue";
+                sealed = constructor_c_name "RecvSealed";
+                empty = constructor_c_name empty_ctor_name;
+              }
             in
             match (kind, args, normalize_type e.ty) with
             | ( CKBuiltin "blorp_channel_try_recv_attempt",
                 [ ch ],
                 Ast.TyNamed (_, [ elem_ty ]) ) ->
-                emit_attempt_from_status elem_ty "RecvWouldBlock"
-                  (fun value_tmp ->
-                    emit ctx
-                      "blorp_channel_try_recv_status_raw((blorp_Channel*)";
-                    emit_expr ctx ch;
-                    emit ctx (Printf.sprintf ", &%s)" value_tmp));
+                emit_blorp_backend ctx
+                  (ChannelRecvAttempt
+                     (ChannelTryRecvAttempt
+                        {
+                          result_type = type_to_c ctx e.ty;
+                          channel = ch;
+                          release_policy = recv_attempt_release_policy elem_ty;
+                          constructors =
+                            recv_attempt_constructors "RecvWouldBlock";
+                        }));
                 true
             | ( CKBuiltin "blorp_channel_recv_timeout_attempt",
                 [ ch; timeout_ms ],
                 Ast.TyNamed (_, [ elem_ty ]) ) ->
-                emit_attempt_from_status elem_ty "RecvTimedOut"
-                  (fun value_tmp ->
-                    emit ctx
-                      "blorp_channel_recv_timeout_status_raw((blorp_Channel*)";
-                    emit_expr ctx ch;
-                    emit ctx ", ";
-                    emit_expr ctx timeout_ms;
-                    emit ctx (Printf.sprintf ", &%s)" value_tmp));
+                emit_blorp_backend ctx
+                  (ChannelRecvAttempt
+                     (ChannelRecvTimeoutAttempt
+                        {
+                          result_type = type_to_c ctx e.ty;
+                          channel = ch;
+                          timeout = timeout_ms;
+                          release_policy = recv_attempt_release_policy elem_ty;
+                          constructors =
+                            recv_attempt_constructors "RecvTimedOut";
+                        }));
                 true
             | _ -> false
           in
           let try_emit_stack_option_ctor () =
-            let callee_is_registered_constructor ctor_name =
-              match callee.desc with
-              | CVar v -> Hashtbl.mem ctx.constructor_names v.vname
-              | CField (_, field) -> Hashtbl.mem ctx.constructor_names field
-              | _ -> Hashtbl.mem ctx.constructor_names ctor_name
-            in
             let emit_some c_ty arg =
-              if is_void_ty arg.ty then begin
-                emit ctx "({ ";
-                emit_stmt ctx arg;
-                emit ctx
-                  (Printf.sprintf
-                     "((%s){ .tag = BLORP_TAG_SOME, .value = 0 }); })" c_ty)
-              end
-              else begin
-                emit ctx
-                  (Printf.sprintf "((%s){ .tag = BLORP_TAG_SOME, .value = " c_ty);
-                emit_expr ctx arg;
-                emit ctx " })"
-              end
+              let constructor =
+                if is_void_ty arg.ty then
+                  Core_emit_blorp_backend.StackOptionSomeVoidStatement
+                    { option_type = c_ty; statement = arg }
+                else
+                  Core_emit_blorp_backend.StackOptionSomeValue
+                    { option_type = c_ty; value = arg }
+              in
+              emit_blorp_backend ctx (StackOptionConstruct constructor)
             in
             match
               ( kind,
@@ -2783,38 +2690,42 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 emit_some c_ty arg;
                 true
             | CKBuiltin "blorp_option_none", Some c_ty, [] ->
-                emit ctx
-                  (Printf.sprintf "((%s){ .tag = BLORP_TAG_NONE, .value = %s })"
-                     c_ty
-                     (Core_layout_type.stack_option_none_value_for_type
-                        ~reg:ctx.reg e.ty));
+                emit_blorp_backend ctx
+                  (StackOptionConstruct
+                     (Core_emit_blorp_backend.StackOptionNone
+                        {
+                          option_type = c_ty;
+                          none_value =
+                            Core_layout_type.stack_option_none_value_for_type
+                              ~reg:ctx.reg e.ty;
+                        }));
                 true
             | _ -> false
           in
           let try_emit_stack_result_ctor () =
-            let callee_is_registered_constructor ctor_name =
-              match callee.desc with
-              | CVar v -> Hashtbl.mem ctx.constructor_names v.vname
-              | CField (_, field) -> Hashtbl.mem ctx.constructor_names field
-              | _ -> Hashtbl.mem ctx.constructor_names ctor_name
+            let result_payload_release_policy arg =
+              if boxed_value_needs_release ctx arg.ty arg.loc then
+                Core_emit_blorp_backend.ReleaseResultPayload
+              else Core_emit_blorp_backend.KeepResultPayload
             in
-            let emit_stack_result_ctor c_ty tag field arg =
-              let release_mask =
-                if boxed_value_needs_release ctx arg.ty arg.loc then 1 else 0
-              in
-              let box =
+            let emit_stack_result_ctor constructor =
+              emit_blorp_backend ctx (StackResultConstruct constructor)
+            in
+            let stack_result_ok_payload c_ty arg =
+              Core_emit_blorp_backend.StackResultOkPayload
                 {
-                  box_value = arg;
-                  box_source_ty = arg.ty;
-                  box_kind = classify_for_boxing ctx arg.ty arg.loc;
+                  result_type = c_ty;
+                  payload = arg;
+                  release_policy = result_payload_release_policy arg;
                 }
-              in
-              emit ctx
-                (Printf.sprintf
-                   "((%s){ .tag = %s, .release_mask = %dUL, .data.%s.field0 = "
-                   c_ty tag release_mask field);
-              emit_box_op ctx box;
-              emit ctx " })"
+            in
+            let stack_result_err_payload c_ty arg =
+              Core_emit_blorp_backend.StackResultErrPayload
+                {
+                  result_type = c_ty;
+                  payload = arg;
+                  release_policy = result_payload_release_policy arg;
+                }
             in
             match
               ( kind,
@@ -2822,28 +2733,22 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 args )
             with
             | CKBuiltin "blorp_result_ok", Some c_ty, [ arg ] ->
-                emit_stack_result_ctor c_ty "BLORP_TAG_OK" "Ok" arg;
+                emit_stack_result_ctor (stack_result_ok_payload c_ty arg);
                 true
             | CKBuiltin "blorp_result_err", Some c_ty, [ arg ] ->
-                emit_stack_result_ctor c_ty "BLORP_TAG_ERR" "Err" arg;
+                emit_stack_result_ctor (stack_result_err_payload c_ty arg);
                 true
             | CKUser ("Ok", _), Some c_ty, [ arg ]
               when callee_is_registered_constructor "Ok" ->
-                emit_stack_result_ctor c_ty "BLORP_TAG_OK" "Ok" arg;
+                emit_stack_result_ctor (stack_result_ok_payload c_ty arg);
                 true
             | CKUser ("Err", _), Some c_ty, [ arg ]
               when callee_is_registered_constructor "Err" ->
-                emit_stack_result_ctor c_ty "BLORP_TAG_ERR" "Err" arg;
+                emit_stack_result_ctor (stack_result_err_payload c_ty arg);
                 true
             | _ -> false
           in
           let try_emit_nullable_managed_option_ctor () =
-            let callee_is_registered_constructor ctor_name =
-              match callee.desc with
-              | CVar v -> Hashtbl.mem ctx.constructor_names v.vname
-              | CField (_, field) -> Hashtbl.mem ctx.constructor_names field
-              | _ -> Hashtbl.mem ctx.constructor_names ctor_name
-            in
             let emit_payload arg =
               match normalize_type arg.ty with
               | Ast.TyFunc _ -> emit_boxed ctx arg

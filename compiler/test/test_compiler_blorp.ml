@@ -45,16 +45,6 @@ let intrinsic_renderer =
     embedded_tsv = Blorp.Core_emit_blorp_intrinsic_templates.tsv;
   }
 
-let prepared_string_renderer =
-  {
-    name = "prepared string";
-    tool_rel = compiler_blorp_rel "codegen_prepared_string_renderer.brp";
-    artifact_prefix = "codegen-prepared-string-renderer";
-    manifest_rel =
-      compiler_lib_rel "core_emit_blorp_prepared_string_templates.tsv";
-    embedded_tsv = Blorp.Core_emit_blorp_prepared_string_templates.tsv;
-  }
-
 let prepared_list_renderer =
   {
     name = "prepared list";
@@ -75,33 +65,14 @@ let prepared_tensor_renderer =
     embedded_tsv = Blorp.Core_emit_blorp_prepared_tensor_templates.tsv;
   }
 
-let prepared_dict_renderer =
+let prepared_backend_renderer =
   {
-    name = "prepared dict";
-    tool_rel = compiler_blorp_rel "codegen_prepared_dict_renderer.brp";
-    artifact_prefix = "codegen-prepared-dict-renderer";
+    name = "prepared backend";
+    tool_rel = compiler_blorp_rel "codegen_prepared_backend_renderer.brp";
+    artifact_prefix = "codegen-prepared-backend-renderer";
     manifest_rel =
-      compiler_lib_rel "core_emit_blorp_prepared_dict_templates.tsv";
-    embedded_tsv = Blorp.Core_emit_blorp_prepared_dict_templates.tsv;
-  }
-
-let prepared_set_renderer =
-  {
-    name = "prepared set";
-    tool_rel = compiler_blorp_rel "codegen_prepared_set_renderer.brp";
-    artifact_prefix = "codegen-prepared-set-renderer";
-    manifest_rel = compiler_lib_rel "core_emit_blorp_prepared_set_templates.tsv";
-    embedded_tsv = Blorp.Core_emit_blorp_prepared_set_templates.tsv;
-  }
-
-let prepared_tuple_renderer =
-  {
-    name = "prepared tuple";
-    tool_rel = compiler_blorp_rel "codegen_prepared_tuple_renderer.brp";
-    artifact_prefix = "codegen-prepared-tuple-renderer";
-    manifest_rel =
-      compiler_lib_rel "core_emit_blorp_prepared_tuple_templates.tsv";
-    embedded_tsv = Blorp.Core_emit_blorp_prepared_tuple_templates.tsv;
+      compiler_lib_rel "core_emit_blorp_prepared_backend_templates.tsv";
+    embedded_tsv = Blorp.Core_emit_blorp_prepared_backend_templates.tsv;
   }
 
 let find_project_file rel =
@@ -238,12 +209,9 @@ let test_renderer_manifest_matches_checked_in_templates renderer =
 
 let blorp_prepared_backend_modules =
   [
-    "Core_emit_blorp_prepared_string.";
     "Core_emit_blorp_prepared_list.";
     "Core_emit_blorp_prepared_tensor.";
-    "Core_emit_blorp_prepared_dict.";
-    "Core_emit_blorp_prepared_set.";
-    "Core_emit_blorp_prepared_tuple.";
+    "Core_emit_blorp_prepared_backend.";
   ]
 
 let assert_source_omits_fragments source label fragments =
@@ -725,9 +693,13 @@ let test_blorp_backend_boundary_emits_expected_c () =
       Blorp.Core_emit_blorp_backend.DictCtorString
   in
   let custom_ctor_c =
-    Blorp.Core_emit_blorp_backend.render_custom_constructor
-      "blorp_set_new_custom" ~hash_fn:"hash_key" ~equals_fn:"equals_key"
-      ~key_release:Blorp.Core_emit_blorp_backend.ElemReleaseFn
+    Blorp.Core_emit_blorp_backend.render_set_constructor
+      (Blorp.Core_emit_blorp_backend.SetCtorCustom
+         {
+           hash_fn = "hash_key";
+           equals_fn = "equals_key";
+           elem_release = Blorp.Core_emit_blorp_backend.ElemReleaseFn;
+         })
   in
   let set_generic_c =
     emit_bridge (fun ctx ->
@@ -1088,48 +1060,6 @@ let test_blorp_backend_boundary_emits_expected_c () =
      blorp_dict_insert(__dict_0, (void*)(long)(1L), (void*)(long)(2L)); \
      __dict_0; })"
     dict_construct_core_c
-
-let test_prepared_string_bridge_emits_expected_c () =
-  let read =
-    {
-      Core.sbr_source = cvar "s" ty_string;
-      sbr_index = cint 2;
-      sbr_proof = Core.StringReadBoundsProven;
-    }
-  in
-  let copy =
-    {
-      Core.sbc_dst = cvar "dst" ty_string;
-      sbc_dst_pos = cint 0;
-      sbc_src = cvar "src" ty_string;
-      sbc_src_pos = cint 1;
-      sbc_len = cint 3;
-      sbc_proof = Core.StringCopyBoundsProven;
-    }
-  in
-  let read_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_string.emit_byte_read
-          ~emit_expr:Blorp.Core_emit.emit_expr ctx read)
-  in
-  let copy_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_string.emit_byte_copy
-          ~emit_expr:Blorp.Core_emit.emit_expr ctx copy)
-  in
-  Alcotest.(check string)
-    "string byte read bridge output"
-    "(long)(unsigned char)((blorp_String*)s)->data[2L]" read_c;
-  Alcotest.(check string)
-    "string byte copy bridge output"
-    "({ blorp_String* __string_copy_dst_0 = (blorp_String*)dst; long \
-     __string_copy_dst_pos_0 = 0L; blorp_String* __string_copy_src_0 = \
-     (blorp_String*)src; long __string_copy_src_pos_0 = 1L; long \
-     __string_copy_len_0 = 3L; if (__string_copy_len_0 > 0) { \
-     memcpy(__string_copy_dst_0->data + __string_copy_dst_pos_0, \
-     __string_copy_src_0->data + __string_copy_src_pos_0, \
-     (size_t)__string_copy_len_0); } (void)0; })"
-    copy_c
 
 let test_prepared_list_bridge_emits_expected_c () =
   let small_ty = Ast.TyNamed ("Small", []) in
@@ -1527,266 +1457,6 @@ let test_prepared_list_bridge_emits_expected_c () =
     "__lst = blorp_list_append_owned(__lst, ({ long __box_0 = 7L; \
      (void*)(long)(__box_0); }));"
     construct_append_owned
-
-let test_prepared_dict_bridge_emits_expected_c () =
-  let ty_small = Ast.TyNamed ("Small", []) in
-  let ty_uint128 = Ast.TyNamed ("UInt128", []) in
-  let ty_dict = Ast.TyNamed ("Dict", [ ty_string; ty_int ]) in
-  let option_ty payload = Ast.TyNamed ("Option", [ payload ]) in
-  let reg = Blorp.Codegen_types.create_registry () in
-  Hashtbl.replace reg.value_records "Small" ();
-  let stack_option_abi label ty =
-    match Blorp.Core_layout_type.generated_stack_option_get_abi ~reg ty with
-    | Some abi -> abi
-    | None -> Alcotest.fail (label ^ " should have generated stack Option ABI")
-  in
-  let value_record_get_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_dict.emit_stack_option_get
-          ~emit_expr:Blorp.Core_emit.emit_expr
-          ~emit_boxed:Blorp.Core_emit.emit_expr ctx
-          (stack_option_abi "Small" (option_ty ty_small))
-          (cvar "dict" ty_dict) (cvar "key" ty_string)
-          ~key_release_policy:Blorp.Core_emit_blorp_prepared_dict.KeepKey)
-  in
-  let uint128_release_get_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_dict.emit_stack_option_get
-          ~emit_expr:Blorp.Core_emit.emit_expr
-          ~emit_boxed:Blorp.Core_emit.emit_expr ctx
-          (stack_option_abi "UInt128" (option_ty ty_uint128))
-          (cvar "dict" ty_dict) (cvar "key" ty_string)
-          ~key_release_policy:Blorp.Core_emit_blorp_prepared_dict.ReleaseKey)
-  in
-  let iter_pair_binding_c =
-    Blorp.Core_emit_blorp_prepared_dict.render_iter_pair_binding ~entry:"entry"
-      ~dict:"__dict_iter_0" ~slot:"__dslot_0"
-  in
-  let emitted_iter_pair_binding_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_dict.emit_iter_pair_binding ctx
-          ~entry:"entry" ~dict:"__dict_iter_0" ~slot:"__dslot_0")
-  in
-  let emitted_iter_source_binding_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_dict.emit_iter_source_binding
-          ~emit_expr:Blorp.Core_emit.emit_expr ctx ~dict:"__dict_iter_0"
-          (cvar "items" ty_dict))
-  in
-  let emitted_iter_loop_open_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_dict.emit_iter_loop_open ctx
-          ~index:"__di_0" ~dict:"__dict_iter_0")
-  in
-  let emitted_iter_slot_binding_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_dict.emit_iter_slot_binding ctx
-          ~slot:"__dslot_0" ~dict:"__dict_iter_0" ~index:"__di_0")
-  in
-  let emitted_iter_deleted_slot_guard_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_dict.emit_iter_deleted_slot_guard ctx
-          ~slot:"__dslot_0")
-  in
-  let emitted_iter_key_binding_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_dict.emit_iter_key_binding ctx
-          ~key_c_type:"long" ~binding:"key" ~dict:"__dict_iter_0"
-          ~slot:"__dslot_0")
-  in
-  Alcotest.(check string)
-    "dict stack Option value-record get bridge output"
-    "({ blorp_Dict* __gso_dict_0 = (blorp_Dict*)dict; void* __gso_key_0 = key; \
-     void* __gso_raw_0 = NULL; bool __gso_found_0 = \
-     blorp_dict_get_raw(__gso_dict_0, __gso_key_0, &__gso_raw_0); \
-     blorp_StackOption_Small __gso_result_0; if (__gso_found_0) { \
-     __gso_result_0 = ((blorp_StackOption_Small){ .tag = BLORP_TAG_SOME, \
-     .value = blorp_unbox_struct(__gso_raw_0, Small) }); } else { \
-     __gso_result_0 = ((blorp_StackOption_Small){ .tag = BLORP_TAG_NONE, \
-     .value = {0} }); } __gso_result_0; })"
-    value_record_get_c;
-  Alcotest.(check string)
-    "dict stack Option UInt128 release-key get bridge output"
-    "({ blorp_Dict* __gso_dict_0 = (blorp_Dict*)dict; void* __gso_key_0 = key; \
-     void* __gso_raw_0 = NULL; bool __gso_found_0 = \
-     blorp_dict_get_raw(__gso_dict_0, __gso_key_0, &__gso_raw_0); \
-     blorp_StackOption_UInt128 __gso_result_0; if (__gso_found_0) { \
-     __gso_result_0 = ((blorp_StackOption_UInt128){ .tag = BLORP_TAG_SOME, \
-     .value = blorp_unbox_uint128(__gso_raw_0) }); } else { __gso_result_0 = \
-     ((blorp_StackOption_UInt128){ .tag = BLORP_TAG_NONE, .value = 0 }); } \
-     blorp_release(__gso_key_0); __gso_result_0; })"
-    uint128_release_get_c;
-  Alcotest.(check string)
-    "dict iter pair binding bridge output"
-    "blorp_Tuple* entry = blorp_tuple_new(2, __dict_iter_0->keys[__dslot_0], \
-     __dict_iter_0->values[__dslot_0]);"
-    iter_pair_binding_c;
-  Alcotest.(check string)
-    "dict emitted iter pair binding bridge output"
-    "blorp_Tuple* entry = blorp_tuple_new(2, __dict_iter_0->keys[__dslot_0], \
-     __dict_iter_0->values[__dslot_0]);\n"
-    emitted_iter_pair_binding_c;
-  Alcotest.(check string)
-    "dict emitted iter source binding bridge output"
-    "blorp_Dict* __dict_iter_0 = (blorp_Dict*)items;\n"
-    emitted_iter_source_binding_c;
-  Alcotest.(check string)
-    "dict emitted iter loop open bridge output"
-    "for (long __di_0 = 0; __di_0 < __dict_iter_0->order_len; __di_0++) {\n"
-    emitted_iter_loop_open_c;
-  Alcotest.(check string)
-    "dict emitted iter slot binding bridge output"
-    "long __dslot_0 = __dict_iter_0->order[__di_0];\n"
-    emitted_iter_slot_binding_c;
-  Alcotest.(check string)
-    "dict emitted iter deleted-slot guard bridge output"
-    "if (__dslot_0 < 0) continue;\n" emitted_iter_deleted_slot_guard_c;
-  Alcotest.(check string)
-    "dict emitted iter key binding bridge output"
-    "long key = (long)__dict_iter_0->keys[__dslot_0];\n"
-    emitted_iter_key_binding_c
-
-let test_prepared_set_bridge_emits_expected_c () =
-  let ty_set = Ast.TyNamed ("Set", [ ty_int ]) in
-  let emitted_iter_source_binding_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_set.emit_iter_source_binding
-          ~emit_expr:Blorp.Core_emit.emit_expr ctx ~set:"__set_iter_0"
-          (cvar "items" ty_set))
-  in
-  let emitted_iter_retain_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_set.emit_iter_retain ctx
-          ~set:"__set_iter_0")
-  in
-  let emitted_iter_loop_open_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_set.emit_iter_loop_open ctx
-          ~entry:"__set_entry_0" ~set:"__set_iter_0")
-  in
-  let iter_entry_key_c =
-    Blorp.Core_emit_blorp_prepared_set.render_iter_entry_key
-      ~entry:"__set_entry_0"
-  in
-  let emitted_iter_release_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_set.emit_iter_release ctx
-          ~set:"__set_iter_0")
-  in
-  Alcotest.(check string)
-    "set emitted iter source binding bridge output"
-    "blorp_Set* __set_iter_0 = (blorp_Set*)items;\n"
-    emitted_iter_source_binding_c;
-  Alcotest.(check string)
-    "set emitted iter retain bridge output" "blorp_retain(__set_iter_0);\n"
-    emitted_iter_retain_c;
-  Alcotest.(check string)
-    "set emitted iter loop open bridge output"
-    "for (blorp_SetEntry* __set_entry_0 = __set_iter_0->first; __set_entry_0 \
-     != NULL; __set_entry_0 = __set_entry_0->next_order) {\n"
-    emitted_iter_loop_open_c;
-  Alcotest.(check string)
-    "set iter entry key bridge output" "__set_entry_0->key" iter_entry_key_c;
-  Alcotest.(check string)
-    "set emitted iter release bridge output" "blorp_release(__set_iter_0);\n"
-    emitted_iter_release_c
-
-let test_prepared_tuple_bridge_emits_expected_c () =
-  let reg = Blorp.Codegen_types.create_registry () in
-  let boxed_int =
-    Blorp.Core_codegen_prepare.boxed_storage_value ~reg (cint 7)
-  in
-  let ty_tuple_int = Ast.TyTuple [ ty_int ] in
-  let tuple_args_c =
-    emit_bridge (fun ctx ->
-        let args =
-          Blorp.Core_emit_blorp_prepared_tuple.render_tuple_args
-            ~emit_boxed:Blorp.Core_emit.emit_boxed_storage ctx [ boxed_int ]
-        in
-        Blorp.Core_emit_context.emit ctx args)
-  in
-  let tuple_name_c =
-    Blorp.Core_emit_blorp_prepared_tuple.render_tuple_name "0"
-  in
-  let tuple_arg_c =
-    Blorp.Core_emit_blorp_prepared_tuple.render_tuple_arg "value"
-  in
-  let tuple_construct_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_tuple.emit_tuple_construct ctx ~arity:"1"
-          ~args:", value")
-  in
-  let tuple_retain_c =
-    Blorp.Core_emit_blorp_prepared_tuple.render_tuple_retain_elem
-      ~tuple_tmp:"__tup_0" ~index:0
-  in
-  let tuple_construct_with_rc_c =
-    Blorp.Core_emit_blorp_prepared_tuple.render_tuple_construct_with_rc
-      ~tuple_tmp:"__tup_0" ~arity:"1" ~args:", value"
-      ~retain_statements:tuple_retain_c ~release_mask:1
-  in
-  let tuple_field_element_c =
-    Blorp.Core_emit_blorp_prepared_tuple.render_tuple_field_element
-      ~tuple_tmp:"__tup_0" ~field:"0"
-  in
-  let tuple_field_access_c =
-    Blorp.Core_emit_blorp_prepared_tuple.render_tuple_field_access
-      ~tuple_tmp:"__tup_0" ~source:"tuple"
-      ~read:"(long)((blorp_Tuple*)__tup_0)->elem[0]"
-  in
-  let tuple_no_rc_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_tuple.emit_construct
-          ~emit_boxed:Blorp.Core_emit.emit_boxed_storage ctx
-          {
-            Core.tc_elems = [ boxed_int ];
-            tc_release_mask = 0;
-            tc_retain_mask = 0;
-          })
-  in
-  let tuple_field_c =
-    emit_bridge (fun ctx ->
-        Blorp.Core_emit_blorp_prepared_tuple.emit_field_access
-          ~emit_expr:Blorp.Core_emit.emit_expr
-          ~render_read:(fun element -> Printf.sprintf "(long)%s" element)
-          ctx
-          (cvar "tuple" ty_tuple_int)
-          "0")
-  in
-  Alcotest.(check string)
-    "tuple rendered args bridge output"
-    ", ({ long __box_0 = 7L; (void*)(long)(__box_0); })" tuple_args_c;
-  Alcotest.(check string) "tuple name bridge output" "__tup_0" tuple_name_c;
-  Alcotest.(check string) "tuple arg bridge output" ", value" tuple_arg_c;
-  Alcotest.(check string)
-    "tuple construct bridge output" "blorp_tuple_new(1, value)"
-    tuple_construct_c;
-  Alcotest.(check string)
-    "tuple retain bridge output"
-    "if (__tup_0->elem[0]) blorp_retain(__tup_0->elem[0]);" tuple_retain_c;
-  Alcotest.(check string)
-    "tuple construct with rc bridge output"
-    "({ blorp_Tuple* __tup_0 = blorp_tuple_new(1, value); if \
-     (__tup_0->elem[0]) blorp_retain(__tup_0->elem[0]); \
-     blorp_tuple_set_rc(__tup_0, 1UL); __tup_0; })"
-    tuple_construct_with_rc_c;
-  Alcotest.(check string)
-    "tuple field element bridge output" "((blorp_Tuple*)__tup_0)->elem[0]"
-    tuple_field_element_c;
-  Alcotest.(check string)
-    "tuple field access bridge output"
-    "({ void* __tup_0 = (void*)tuple; (long)((blorp_Tuple*)__tup_0)->elem[0]; \
-     })"
-    tuple_field_access_c;
-  Alcotest.(check string)
-    "tuple construct without rc bridge output"
-    "blorp_tuple_new(1, ({ long __box_0 = 7L; (void*)(long)(__box_0); }))"
-    tuple_no_rc_c;
-  Alcotest.(check string)
-    "tuple emitted field access bridge output"
-    "({ void* __tup_0 = (void*)tuple; (long)((blorp_Tuple*)__tup_0)->elem[0]; \
-     })"
-    tuple_field_c
 
 let test_prepared_tensor_bridge_emits_expected_c () =
   let ty_small = Ast.TyNamed ("Small", []) in
@@ -2357,15 +2027,6 @@ let suite =
         Alcotest.test_case "compiler/blorp TestSuites pass" `Slow
           test_compiler_blorp_test_suites;
       ] );
-    ( "codegen_prepared_string_renderer",
-      [
-        Alcotest.test_case "manifest matches checked-in templates" `Slow
-          (fun () ->
-            test_renderer_manifest_matches_checked_in_templates
-              prepared_string_renderer);
-        Alcotest.test_case "prepared string bridge emits expected C" `Quick
-          test_prepared_string_bridge_emits_expected_c;
-      ] );
     ( "codegen_prepared_list_renderer",
       [
         Alcotest.test_case "manifest matches checked-in templates" `Slow
@@ -2375,32 +2036,12 @@ let suite =
         Alcotest.test_case "prepared list bridge emits expected C" `Quick
           test_prepared_list_bridge_emits_expected_c;
       ] );
-    ( "codegen_prepared_dict_renderer",
+    ( "codegen_prepared_backend_renderer",
       [
         Alcotest.test_case "manifest matches checked-in templates" `Slow
           (fun () ->
             test_renderer_manifest_matches_checked_in_templates
-              prepared_dict_renderer);
-        Alcotest.test_case "prepared dict bridge emits expected C" `Quick
-          test_prepared_dict_bridge_emits_expected_c;
-      ] );
-    ( "codegen_prepared_set_renderer",
-      [
-        Alcotest.test_case "manifest matches checked-in templates" `Slow
-          (fun () ->
-            test_renderer_manifest_matches_checked_in_templates
-              prepared_set_renderer);
-        Alcotest.test_case "prepared set bridge emits expected C" `Quick
-          test_prepared_set_bridge_emits_expected_c;
-      ] );
-    ( "codegen_prepared_tuple_renderer",
-      [
-        Alcotest.test_case "manifest matches checked-in templates" `Slow
-          (fun () ->
-            test_renderer_manifest_matches_checked_in_templates
-              prepared_tuple_renderer);
-        Alcotest.test_case "prepared tuple bridge emits expected C" `Quick
-          test_prepared_tuple_bridge_emits_expected_c;
+              prepared_backend_renderer);
       ] );
     ( "codegen_prepared_tensor_renderer",
       [
