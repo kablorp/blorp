@@ -66,10 +66,23 @@ and value_desc =
 and value = { ty : Ast.type_expr; desc : value_desc; loc : Ast.loc }
 and binding_scope = GlobalBinding | LocalBinding
 
+and unavailable_global_reason =
+  | CurrentGlobal
+  | LaterGlobal
+  | RuntimeInitializedGlobal
+  | ImportedRuntimeInitializedGlobal of {
+      module_path : string;
+      original_name : string;
+    }
+
+and binding_value =
+  | AvailableValue of value ref
+  | UnavailableGlobal of unavailable_global_reason
+
 and binding = {
   binding_scope : binding_scope;
   mutable_binding : bool;
-  cell : value ref;
+  binding_value : binding_value;
 }
 
 and env = (string * binding) list

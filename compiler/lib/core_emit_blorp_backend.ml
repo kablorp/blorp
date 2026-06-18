@@ -145,6 +145,7 @@ type channel_recv_attempt =
       result_type : string;
       channel : core;
       release_policy : channel_recv_value_release_policy;
+      value_constructor_takes_release_mask : bool;
       constructors : channel_recv_attempt_constructors;
     }
   | ChannelRecvTimeoutAttempt of {
@@ -152,6 +153,7 @@ type channel_recv_attempt =
       channel : core;
       timeout : core;
       release_policy : channel_recv_value_release_policy;
+      value_constructor_takes_release_mask : bool;
       constructors : channel_recv_attempt_constructors;
     }
 

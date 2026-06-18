@@ -366,6 +366,16 @@ let union_representation env expr type_name =
   | _ -> GenericUnion
 
 let prepare_union_construct env expr type_name ctor_name def_id args variant =
+  let args =
+    try
+      List.map2
+        (fun field_ty arg ->
+          match arg.desc with
+          | CRecord [] -> { arg with ty = field_ty }
+          | _ -> arg)
+        variant.Ast.variant_fields args
+    with Invalid_argument _ -> args
+  in
   let uc_args = List.map (boxed_storage_value ~reg:env.reg) args in
   CUnionConstruct
     {

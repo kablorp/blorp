@@ -188,6 +188,10 @@ Current checkpoint:
 - CTFE function values wrap typed functions with lazy cached IR bodies, so
   unsupported function bodies are rejected only when compile-time evaluation
   calls them.
+- CTFE environments explicitly distinguish evaluated globals from the current
+  global, later globals, runtime-initialized globals, and imported globals that
+  are not compile-time constants. Dependency diagnostics are no longer lookup
+  misses.
 - Materialization rewrites evaluated scalar, string, tuple, list, vector, dict,
   record, range, and constructor values back into ordinary typed initializer
   expressions.
@@ -199,17 +203,29 @@ Current checkpoint:
   generated C for materialized constants.
 - `compiler/blorp/codegen_intrinsic_renderer.brp` now dogfoods ordinary
   top-level constants for derived intrinsic lookup/manifest data.
+- Static emission currently supports strings, pointer-storage lists whose
+  elements are supported static values, integer-like inline primitive literal
+  lists, `List[Float]`, `List[Float32]`, `List[Float16]`, non-generic records,
+  ordinary generic record/struct instantiations, and ordinary concrete generic
+  union constants whose payloads are in the supported static-value subset. It
+  also supports tuple constants whose pointer, primitive literal,
+  floating-point literal, and void erased slots can be emitted as C static
+  initializers.
+  Ordinary generic unions now get concrete instantiated type identities, typed
+  ordinary payload storage, source template pruning, and static emission for
+  supported constant payloads.
 - The old `compile_time:` parser, AST, formatter, LSP, typed AST, and CTFE
   block expansion paths have been removed.
 
 Next implementation slices:
 
-- Tighten diagnostics for forward/self references among constants.
-- Tighten user-facing wording in CTFE diagnostics so ordinary global constants
-  do not talk about `compile_time` blocks.
 - Audit std, `compiler/blorp`, examples, and scratch programs for constants
   that still need CTFE support. Add narrow intrinsics or rewrite the constants;
   do not reintroduce best-effort runtime fallback.
+- Extend static emission beyond the current string/list/tuple/record/union
+  subset: inline-struct lists, tuple slots that require heap boxes,
+  dicts/sets, tensors, and erased dynamic-boundary values where there is an
+  explicit typed bridge.
 - Keep moving semantic normalization out of the evaluator and into `Ctfe_ir`
   translation where it can be represented explicitly.
 - Dogfood compiler-owned tables in `compiler/blorp` once ordinary constants can

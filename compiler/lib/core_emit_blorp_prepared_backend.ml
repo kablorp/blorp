@@ -112,6 +112,7 @@ type channel_recv_attempt =
       result_type : string;
       channel : core;
       release_policy : channel_recv_value_release_policy;
+      value_constructor_takes_release_mask : bool;
       constructors : channel_recv_attempt_constructors;
     }
   | ChannelRecvTimeoutAttempt of {
@@ -119,6 +120,7 @@ type channel_recv_attempt =
       channel : core;
       timeout : core;
       release_policy : channel_recv_value_release_policy;
+      value_constructor_takes_release_mask : bool;
       constructors : channel_recv_attempt_constructors;
     }
 
@@ -622,50 +624,82 @@ let channel_recv_attempt_constructor_args constructors =
   [ constructors.value; constructors.sealed; constructors.empty ]
 
 let render_channel_try_recv_attempt ~emit_expr ctx ~result_type ~channel
-    ~release_policy ~constructors =
+    ~release_policy ~value_constructor_takes_release_mask ~constructors =
   let value_seed, status_seed, result_seed =
     channel_recv_attempt_temp_seeds ctx
   in
   let channel_arg = render_arg ~emit_expr ctx channel in
-  render_template "backend_channel_try_recv_attempt"
-    ([
-       result_type;
-       channel_arg;
-       value_seed;
-       status_seed;
-       result_seed;
-       channel_recv_value_release_mask release_policy;
-     ]
-    @ channel_recv_attempt_constructor_args constructors)
+  if value_constructor_takes_release_mask then
+    render_template "backend_channel_try_recv_attempt"
+      ([
+         result_type;
+         channel_arg;
+         value_seed;
+         status_seed;
+         result_seed;
+         channel_recv_value_release_mask release_policy;
+       ]
+      @ channel_recv_attempt_constructor_args constructors)
+  else
+    render_template "backend_channel_try_recv_attempt_no_release_mask"
+      ([ result_type; channel_arg; value_seed; status_seed; result_seed ]
+      @ channel_recv_attempt_constructor_args constructors)
 
 let render_channel_recv_timeout_attempt ~emit_expr ctx ~result_type ~channel
-    ~timeout ~release_policy ~constructors =
+    ~timeout ~release_policy ~value_constructor_takes_release_mask ~constructors
+    =
   let value_seed, status_seed, result_seed =
     channel_recv_attempt_temp_seeds ctx
   in
   let channel_arg = render_arg ~emit_expr ctx channel in
   let timeout_arg = render_arg ~emit_expr ctx timeout in
-  render_template "backend_channel_recv_timeout_attempt"
-    ([
-       result_type;
-       channel_arg;
-       timeout_arg;
-       value_seed;
-       status_seed;
-       result_seed;
-       channel_recv_value_release_mask release_policy;
-     ]
-    @ channel_recv_attempt_constructor_args constructors)
+  if value_constructor_takes_release_mask then
+    render_template "backend_channel_recv_timeout_attempt"
+      ([
+         result_type;
+         channel_arg;
+         timeout_arg;
+         value_seed;
+         status_seed;
+         result_seed;
+         channel_recv_value_release_mask release_policy;
+       ]
+      @ channel_recv_attempt_constructor_args constructors)
+  else
+    render_template "backend_channel_recv_timeout_attempt_no_release_mask"
+      ([
+         result_type;
+         channel_arg;
+         timeout_arg;
+         value_seed;
+         status_seed;
+         result_seed;
+       ]
+      @ channel_recv_attempt_constructor_args constructors)
 
 let render_channel_recv_attempt ~emit_expr ctx = function
-  | ChannelTryRecvAttempt { result_type; channel; release_policy; constructors }
-    ->
+  | ChannelTryRecvAttempt
+      {
+        result_type;
+        channel;
+        release_policy;
+        value_constructor_takes_release_mask;
+        constructors;
+      } ->
       render_channel_try_recv_attempt ~emit_expr ctx ~result_type ~channel
-        ~release_policy ~constructors
+        ~release_policy ~value_constructor_takes_release_mask ~constructors
   | ChannelRecvTimeoutAttempt
-      { result_type; channel; timeout; release_policy; constructors } ->
+      {
+        result_type;
+        channel;
+        timeout;
+        release_policy;
+        value_constructor_takes_release_mask;
+        constructors;
+      } ->
       render_channel_recv_timeout_attempt ~emit_expr ctx ~result_type ~channel
-        ~timeout ~release_policy ~constructors
+        ~timeout ~release_policy ~value_constructor_takes_release_mask
+        ~constructors
 
 let render_stack_option_constructor ~emit_expr ~emit_stmt ctx = function
   | StackOptionSomeValue { option_type; value } ->

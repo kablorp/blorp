@@ -225,6 +225,7 @@ val record_destructor_policy :
 
 val union_destructor_policy :
   ?phase:Core_error.phase_tag ->
+  ?payload_storage:Codegen_types.union_payload_storage ->
   reg:Codegen_types.registry ->
   Ast.type_decl ->
   Codegen_types.managed_destructor

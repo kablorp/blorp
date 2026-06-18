@@ -67,6 +67,9 @@ let () =
         Test_type_metadata_format.suite
     @ List.map (fun (name, cases) -> ("Types." ^ name, cases)) Test_types.suite
     @ List.map
+        (fun (name, cases) -> ("FloatBitPattern." ^ name, cases))
+        Test_float_bit_pattern.suite
+    @ List.map
         (fun (name, cases) -> ("TypeResolution." ^ name, cases))
         Test_type_resolution.suite
     @ List.map

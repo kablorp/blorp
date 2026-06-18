@@ -541,6 +541,15 @@ let rec accessor_type (ctx : Core_emit_context.t) (scrut_ty : Ast.type_expr)
           match normalize_accessed_type ctx parent_ty with
           | Ast.TyNamed ("Result", [ _; err_ty ]) -> Some err_ty
           | _ -> None)
+      | Some parent_ty, ctor, idx -> (
+          match normalize_accessed_type ctx parent_ty with
+          | Ast.TyNamed (type_name, _) -> (
+              match
+                Codegen_types.lookup_union_variant ctx.reg type_name ctor
+              with
+              | Some variant -> List.nth_opt variant.variant_fields idx
+              | None -> None)
+          | _ -> None)
       | _ -> None)
 
 let accessor_parent_type (ctx : Core_emit_context.t) (scrut_ty : Ast.type_expr)
@@ -618,6 +627,28 @@ let accessor_reads_nullable_option_payload (ctx : Core_emit_context.t)
       accessor_parent_is_nullable_option ctx scrut_ty acc
   | _ -> false
 
+let accessor_reads_typed_union_payload (ctx : Core_emit_context.t)
+    (scrut_ty : Ast.type_expr) (acc : accessor) : bool =
+  match acc with
+  | AccVariantField (parent, _, _) -> (
+      match accessor_type ctx scrut_ty parent with
+      | Some parent_ty -> (
+          match normalize_accessed_type ctx parent_ty with
+          | Ast.TyNamed (type_name, _) ->
+              Codegen_types.union_uses_typed_payload_storage ctx.reg type_name
+          | _ -> false)
+      | None -> false)
+  | _ -> false
+
+let typed_payload_decl_str (ctx : Core_emit_context.t) var_name source ty =
+  let ty_c = type_to_c ctx ty in
+  if
+    is_value_record_type ctx ty
+    || Core_layout_type.stack_option_c_type ~reg:ctx.reg ty <> None
+    || Core_layout_type.stack_result_c_type ~reg:ctx.reg ty <> None
+  then Printf.sprintf "%s %s = %s;" ty_c var_name source
+  else Printf.sprintf "%s %s = (%s)%s;" ty_c var_name ty_c source
+
 (** Generate an unbox declaration for a pattern accessor. Most accessors read
     erased [void*] storage and use [unbox_decl_str]. Primitive stack
     [Option[T]] payload access is already a direct scalar field, so treating it
@@ -647,6 +678,8 @@ let unbox_decl_for_accessor_str (ctx : Core_emit_context.t) (var_name : string)
     in
     let ty_c = type_to_c ctx payload_ty in
     Printf.sprintf "%s %s = (%s)%s;" ty_c var_name ty_c source
+  else if accessor_reads_typed_union_payload ctx scrut_ty accessor then
+    typed_payload_decl_str ctx var_name source ty
   else unbox_decl_str ctx var_name source ty
 
 (** Emit as an indented line. *)

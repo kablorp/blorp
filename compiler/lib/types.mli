@@ -242,6 +242,11 @@ val is_global_abi_type_name : string -> bool
     Stdlib modules may declare these without receiving a module-qualified
     identity; all other std types remain module-owned. *)
 
+val is_runtime_erased_payload_union_type_name : string -> bool
+(** True for union types whose payloads are constructed from runtime-erased
+    [void*] slots and therefore must keep erased payload storage until a
+    dedicated typed bridge exists. *)
+
 val canonical_module_type_name : module_path:string -> string -> string
 (** Canonical frontend identity for a type owned by a module. Stdlib ABI
     types intentionally remain bare; other std-local types are owner-qualified
