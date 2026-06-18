@@ -196,18 +196,22 @@ C string
 
 **Design principles:**
 - **No implicit type erasure as the target** — generic functions are
-  monomorphized at call sites. Some runtime storage and closure boundaries still
-  use explicit `void*` shims. Those boundaries must carry explicit layout and
-  ownership metadata in Core.
+  monomorphized at call sites, and ordinary user generic records/structs are
+  rewritten toward concrete instantiated layouts before codegen. Ordinary user
+  generic unions now get concrete instantiated type identities and typed
+  payload fields before codegen, which lets supported global constants over
+  those layouts emit as static objects. Runtime storage, channel receive
+  attempts, and closure boundaries still use explicit `void*` shims. Those
+  boundaries must carry explicit layout and ownership metadata in Core.
 - **Phase discipline** — each pass reads Core and produces Core. No pass needs
   information from a later pass.
 - **Flat namespace** — module functions are prefixed (`std_list__map`) early.
   After prefixing, no downstream pass needs module awareness.
-- **Explicit erased-storage boundaries** — generic runtime slots use `void*`,
-  but the choice of how a typed value crosses that boundary is centralized in
-  `core_erased_storage_layout.ml`. `Core_codegen_prepare` rewrites final Core to
-  explicit `CBoxTyped` / `CUnboxTyped` nodes before emission, and final
-  invariants reject unresolved fallback boxing.
+- **Explicit erased-storage boundaries** — intentionally dynamic runtime slots
+  use `void*`, but the choice of how a typed value crosses that boundary is
+  centralized in `core_erased_storage_layout.ml`. `Core_codegen_prepare`
+  rewrites final Core to explicit `CBoxTyped` / `CUnboxTyped` nodes before
+  emission, and final invariants reject unresolved fallback boxing.
 
 The emitter contract follows from those principles: backend-specific emission
 must consume explicit Core nodes and metadata rather than recovering layout,

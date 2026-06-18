@@ -29,8 +29,14 @@ let module_global_value ctx ~module_path ~name =
   | None -> None
   | Some env -> (
       match List.assoc_opt name env with
-      | Some binding -> Some !(binding.cell)
+      | Some { binding_value = AvailableValue cell; _ } -> Some !cell
+      | Some { binding_value = UnavailableGlobal _; _ } -> None
       | None -> None)
+
+let module_has_global_binding ctx ~module_path ~name =
+  match List.assoc_opt module_path ctx.module_global_envs with
+  | None -> false
+  | Some env -> List.mem_assoc name env
 
 let with_module_global_envs ctx module_global_envs =
   { ctx with module_global_envs }

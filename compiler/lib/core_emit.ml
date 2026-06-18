@@ -336,15 +336,862 @@ let is_global_func_var (ctx : Core_emit_context.t) (v : Core.var) : bool =
   | Some id -> Hashtbl.mem ctx.global_def_ids id
   | None -> false
 
-(** True when a literal can legally appear in a C static initializer.
-    String literals lower to a lazy [blorp_string_literal(...)] expression,
-    so global strings must be initialized at runtime in
-    [__blorp_init_globals]. *)
+(** True when a literal can legally appear directly in a scalar C static
+    initializer. String literals use a separate static Blorp object shape
+    because [blorp_String] has a flexible array member and runtime code expects
+    a [blorp_String*]. *)
 let is_c_static_literal = function
   | Ast.LitInt _ | Ast.LitInt128 _ | Ast.LitFloat _ | Ast.LitBool _
   | Ast.LitChar _ ->
       true
   | Ast.LitString _ -> false
+
+let is_string_global_type ty =
+  match normalize_type ty with
+  | Ast.TyNamed (("String" | "LiteralString"), _) -> true
+  | _ -> false
+
+let static_string_global_storage_name name_c =
+  Printf.sprintf "__blorp_static_string_%s" name_c
+
+let static_list_global_storage_name name_c =
+  Printf.sprintf "__blorp_static_list_%s" name_c
+
+let static_tuple_global_storage_name name_c =
+  Printf.sprintf "__blorp_static_tuple_%s" name_c
+
+let static_record_global_storage_name name_c =
+  Printf.sprintf "__blorp_static_record_%s" name_c
+
+let static_union_global_storage_name name_c =
+  Printf.sprintf "__blorp_static_union_%s" name_c
+
+let static_child_path ~parent_path field_name =
+  Printf.sprintf "%s_%s" parent_path (escape_c_ident field_name)
+
+let static_list_child_path ~parent_path index =
+  Printf.sprintf "%s_elem_%d" parent_path index
+
+let static_union_child_path ~parent_path variant_name index =
+  Printf.sprintf "%s_%s_%d" parent_path (escape_c_ident variant_name) index
+
+let static_tuple_child_path ~parent_path index =
+  Printf.sprintf "%s_%d" parent_path index
+
+let c_string_trailing_nul_bytes = 1
+let static_list_min_capacity = 1
+let static_tuple_min_storage_slots = 1
+
+(** Mirrors [blorp_List.__pad] in [runtime.c]/[runtime_decl.c]. The static
+    wrapper must be layout-compatible with [blorp_List] before casting through
+    the flexible-array pointer type. *)
+let static_list_runtime_padding_bytes = 5
+
+type static_inline_list_storage =
+  | StaticInlineIntegerBits of inline_storage_width
+  | StaticInlineFloat64
+  | StaticInlineFloat32
+  | StaticInlineFloat16
+
+let static_inline_integer_storage_c_type = function
+  | InlineBytes1 -> "uint8_t"
+  | InlineBytes2 -> "uint16_t"
+  | InlineBytes4 -> "uint32_t"
+  | InlineBytes8 -> "uintptr_t"
+
+let static_inline_list_storage_c_type = function
+  | StaticInlineIntegerBits width -> static_inline_integer_storage_c_type width
+  | StaticInlineFloat64 -> "double"
+  | StaticInlineFloat32 -> "float"
+  | StaticInlineFloat16 -> "_Float16"
+
+let static_inline_list_storage_elem_size = function
+  | StaticInlineIntegerBits width -> inline_storage_width_bytes width
+  | StaticInlineFloat64 -> inline_storage_width_bytes InlineBytes8
+  | StaticInlineFloat32 -> inline_storage_width_bytes InlineBytes4
+  | StaticInlineFloat16 -> inline_storage_width_bytes InlineBytes2
+
+let static_inline_list_storage_for_layout (layout : list_storage_layout) =
+  match layout.lsl_slots with
+  | ListInlineStorage width -> (
+      match Option.map normalize_type layout.lsl_elem_ty with
+      | Some (Ast.TyNamed ("Float", [])) when width = InlineBytes8 ->
+          Some StaticInlineFloat64
+      | Some (Ast.TyNamed ("Float32", [])) when width = InlineBytes4 ->
+          Some StaticInlineFloat32
+      | Some (Ast.TyNamed ("Float16", [])) when width = InlineBytes2 ->
+          Some StaticInlineFloat16
+      | _ -> Some (StaticInlineIntegerBits width))
+  | ListPointerStorage | ListInlineStructStorage _ -> None
+
+let can_emit_static_string_global (v : core_var) =
+  match v.cv_init.desc with
+  | CLit (Ast.LitString _) when v.cv_is_const && is_string_global_type v.cv_ty
+    ->
+      true
+  | _ -> false
+
+let c_static_literal_initializer = function
+  | Ast.LitInt n -> Some (Printf.sprintf "%LdL" n)
+  | Ast.LitInt128 digits ->
+      let base = "1000000000000000000" in
+      let len = String.length digits in
+      let rec chunks acc end_idx =
+        if end_idx <= 0 then acc
+        else
+          let start = max 0 (end_idx - 18) in
+          let chunk = String.sub digits start (end_idx - start) in
+          chunks (chunk :: acc) start
+      in
+      let expr =
+        match chunks [] len with
+        | [] -> "((__int128)0)"
+        | first :: rest ->
+            List.fold_left
+              (fun acc chunk ->
+                Printf.sprintf "((%s) * (__int128)%s + (__int128)%s)" acc base
+                  chunk)
+              (Printf.sprintf "(__int128)%s" first)
+              rest
+      in
+      Some expr
+  | Ast.LitFloat f ->
+      let s =
+        match classify_float f with
+        | FP_nan -> "NAN"
+        | FP_infinite -> if f < 0.0 then "-INFINITY" else "INFINITY"
+        | FP_normal | FP_subnormal | FP_zero -> Printf.sprintf "%.17g" f
+      in
+      if
+        String.equal s "NAN"
+        || String.ends_with ~suffix:"INFINITY" s
+        || String.contains s '.' || String.contains s 'e'
+        || String.contains s 'E'
+      then Some s
+      else Some (s ^ ".0")
+  | Ast.LitBool true -> Some "true"
+  | Ast.LitBool false -> Some "false"
+  | Ast.LitChar c -> Some (Printf.sprintf "%d" c)
+  | Ast.LitString _ -> None
+
+let uint32_bits_as_int64 bits = Int64.logand (Int64.of_int32 bits) 0xffffffffL
+
+let c_static_float_box_initializer box_kind value =
+  match (box_kind, value.desc) with
+  | BoxFloat, CLit (Ast.LitFloat f) ->
+      Some
+        (Printf.sprintf "(void*)(uintptr_t)0x%016LxULL"
+           (Float_bit_pattern.float64_bits f))
+  | BoxFloat32, CLit (Ast.LitFloat f) ->
+      Some
+        (Printf.sprintf "(void*)(uintptr_t)0x%08LxUL"
+           (uint32_bits_as_int64 (Float_bit_pattern.float32_bits f)))
+  | BoxFloat16, CLit (Ast.LitFloat f) ->
+      Some
+        (Printf.sprintf "(void*)(uintptr_t)0x%04xUL"
+           (Float_bit_pattern.float16_bits f))
+  | _ -> None
+
+let static_heap_record_decl_for_type (ctx : Core_emit_context.t) ty =
+  match normalize_type ty with
+  | Ast.TyNamed (type_name, []) -> (
+      match Hashtbl.find_opt ctx.record_decls type_name with
+      | Some record_decl
+        when (not record_decl.record_is_value)
+             && (not record_decl.record_is_builtin)
+             && record_decl.record_type_params = [] ->
+          Some (type_name, record_decl)
+      | _ -> None)
+  | _ -> None
+
+let record_construct_raw_field rc field_name =
+  List.find_map
+    (function
+      | RecordRawField (name, value) when String.equal name field_name ->
+          Some value
+      | RecordRawField _ | RecordErasedField _ -> None)
+    rc.rc_fields
+
+let record_construct_has_erased_field rc =
+  List.exists
+    (function RecordErasedField _ -> true | RecordRawField _ -> false)
+    rc.rc_fields
+
+let record_decl_has_erased_static_field (ctx : Core_emit_context.t)
+    (record_decl : Ast.record_decl) =
+  List.exists
+    (fun (fd : Ast.field_decl) ->
+      Core_layout_type.record_field_uses_erased_storage ~reg:ctx.reg
+        fd.field_type)
+    record_decl.record_fields
+
+let static_union_variant_for_construct (ctx : Core_emit_context.t)
+    (uc : union_construct) =
+  Codegen_types.lookup_union_variant ctx.reg uc.uc_type_name
+    uc.uc_constructor_name
+
+let rec static_value_supported (ctx : Core_emit_context.t) ~ty (expr : core) =
+  match expr.desc with
+  | CLit (Ast.LitString _) -> is_string_global_type ty
+  | CLit lit -> Option.is_some (c_static_literal_initializer lit)
+  | CListConstruct lc -> static_list_construct_supported ctx lc
+  | CTupleConstruct tc -> static_tuple_construct_supported ctx tc
+  | CRecordConstruct rc -> static_record_construct_supported ctx ~ty rc
+  | CUnionConstruct uc -> static_union_construct_supported ctx uc
+  | _ -> false
+
+and static_pointer_list_slot_supported (ctx : Core_emit_context.t)
+    (value : boxed_storage_value) =
+  match value.bsv_box.box_kind with
+  | BoxPointer ->
+      static_value_supported ctx ~ty:value.bsv_box.box_source_ty
+        value.bsv_box.box_value
+  | BoxVoid -> true
+  | BoxPrim | BoxFloat | BoxFloat32 | BoxFloat16 | BoxInt128 | BoxUInt128
+  | BoxStruct _ ->
+      false
+
+and static_inline_list_slot_supported storage (value : boxed_storage_value) =
+  match (storage, value.bsv_box.box_kind, value.bsv_box.box_value.desc) with
+  | StaticInlineIntegerBits _, BoxPrim, CLit lit ->
+      Option.is_some (c_static_literal_initializer lit)
+  | StaticInlineFloat64, BoxFloat, CLit (Ast.LitFloat _) -> true
+  | StaticInlineFloat32, BoxFloat32, CLit (Ast.LitFloat _) -> true
+  | StaticInlineFloat16, BoxFloat16, CLit (Ast.LitFloat _) -> true
+  | _ -> false
+
+and static_list_construct_supported (ctx : Core_emit_context.t)
+    (lc : list_construct) =
+  match lc.lc_layout.lsl_slots with
+  | ListPointerStorage ->
+      List.for_all (static_pointer_list_slot_supported ctx) lc.lc_elems
+  | ListInlineStorage _ -> (
+      match static_inline_list_storage_for_layout lc.lc_layout with
+      | Some storage ->
+          List.for_all (static_inline_list_slot_supported storage) lc.lc_elems
+      | None -> false)
+  | ListInlineStructStorage _ -> false
+
+and static_tuple_slot_supported (ctx : Core_emit_context.t)
+    (value : boxed_storage_value) =
+  match (value.bsv_box.box_kind, value.bsv_box.box_value.desc) with
+  | BoxPrim, CLit lit -> Option.is_some (c_static_literal_initializer lit)
+  | BoxPrim, _ -> false
+  | BoxPointer, _ ->
+      static_value_supported ctx ~ty:value.bsv_box.box_source_ty
+        value.bsv_box.box_value
+  | BoxVoid, _ -> true
+  | (BoxFloat | BoxFloat32 | BoxFloat16), _ ->
+      Option.is_some
+        (c_static_float_box_initializer value.bsv_box.box_kind
+           value.bsv_box.box_value)
+  | (BoxInt128 | BoxUInt128 | BoxStruct _), _ -> false
+
+and static_tuple_construct_supported (ctx : Core_emit_context.t)
+    (tc : tuple_construct) =
+  List.for_all (static_tuple_slot_supported ctx) tc.tc_elems
+
+and static_record_construct_supported (ctx : Core_emit_context.t) ~ty
+    (rc : record_construct) =
+  match static_heap_record_decl_for_type ctx ty with
+  | None -> false
+  | Some (_, record_decl) ->
+      (not (record_construct_has_erased_field rc))
+      && (not (record_decl_has_erased_static_field ctx record_decl))
+      && List.for_all
+           (fun (fd : Ast.field_decl) ->
+             match record_construct_raw_field rc fd.field_name with
+             | None -> false
+             | Some value -> static_value_supported ctx ~ty:fd.field_type value)
+           record_decl.record_fields
+
+and static_union_construct_supported (ctx : Core_emit_context.t)
+    (uc : union_construct) =
+  match uc.uc_representation with
+  | OptionUnion _ -> false
+  | ResultUnion _ -> static_stack_result_construct_supported ctx uc
+  | GenericUnion -> (
+      Codegen_types.union_uses_typed_payload_storage ctx.reg uc.uc_type_name
+      &&
+      match static_union_variant_for_construct ctx uc with
+      | None -> false
+      | Some variant ->
+          List.length variant.variant_fields = List.length uc.uc_args
+          && List.for_all2
+               (fun field_ty arg ->
+                 static_value_supported ctx ~ty:field_ty arg.bsv_box.box_value)
+               variant.variant_fields uc.uc_args)
+
+and static_stack_result_construct_supported (ctx : Core_emit_context.t)
+    (uc : union_construct) =
+  match (uc.uc_constructor_name, uc.uc_args) with
+  | ("Ok" | "Err"), [ arg ] ->
+      static_result_payload_slot_supported ctx arg.bsv_box.box_source_ty arg
+  | _ -> false
+
+and static_result_payload_slot_supported (ctx : Core_emit_context.t) payload_ty
+    (value : boxed_storage_value) =
+  match value.bsv_box.box_kind with
+  | BoxPointer ->
+      static_value_supported ctx ~ty:payload_ty value.bsv_box.box_value
+  | BoxVoid -> true
+  | BoxPrim -> (
+      match value.bsv_box.box_value.desc with
+      | CLit lit -> Option.is_some (c_static_literal_initializer lit)
+      | _ -> false)
+  | BoxFloat | BoxFloat32 | BoxFloat16 ->
+      Option.is_some
+        (c_static_float_box_initializer value.bsv_box.box_kind
+           value.bsv_box.box_value)
+  | BoxInt128 | BoxUInt128 | BoxStruct _ -> false
+
+let can_emit_static_record_global (ctx : Core_emit_context.t) (v : core_var) =
+  match v.cv_init.desc with
+  | CRecordConstruct rc when v.cv_is_const ->
+      static_record_construct_supported ctx ~ty:v.cv_ty rc
+  | _ -> false
+
+let can_emit_static_union_global (ctx : Core_emit_context.t) (v : core_var) =
+  match v.cv_init.desc with
+  | CUnionConstruct uc when v.cv_is_const ->
+      static_union_construct_supported ctx uc
+  | _ -> false
+
+let can_emit_static_tuple_global (ctx : Core_emit_context.t) (v : core_var) =
+  match v.cv_init.desc with
+  | CTupleConstruct tc when v.cv_is_const ->
+      static_tuple_construct_supported ctx tc
+  | _ -> false
+
+let can_emit_static_list_global (ctx : Core_emit_context.t) (v : core_var) =
+  match v.cv_init.desc with
+  | CListConstruct lc when v.cv_is_const ->
+      static_list_construct_supported ctx lc
+  | _ -> false
+
+let emit_static_string_object (ctx : Core_emit_context.t) ~storage_name text =
+  let escaped = c_escape_string text in
+  let byte_len = String.length text in
+  let data_len = byte_len + c_string_trailing_nul_bytes in
+  emit_line ctx
+    (Printf.sprintf
+       "static struct { blorp_Object header; long len; long capacity; char \
+        data[%d]; } %s = {"
+       data_len storage_name);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx "{ BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
+  emit_line ctx (Printf.sprintf "%dL," byte_len);
+  emit_line ctx (Printf.sprintf "%dL," byte_len);
+  emit_line ctx (Printf.sprintf "\"%s\"" escaped);
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "};"
+
+let emit_static_string_global (ctx : Core_emit_context.t) ~name_c text =
+  let storage_name = static_string_global_storage_name name_c in
+  emit_static_string_object ctx ~storage_name text;
+  emit_line ctx
+    (Printf.sprintf "static blorp_String* %s = (blorp_String*)&%s;" name_c
+       storage_name);
+  emit ctx "\n"
+
+let static_record_literal_field_error loc =
+  Core_error.errorf Core_error.Emit loc
+    ~hint:
+      "Only primitive literals and string literals can currently appear inside \
+       static record constants."
+    "cannot emit literal as a static record field"
+
+let rec emit_static_value_initializer (ctx : Core_emit_context.t) ~path_c ~ty
+    (expr : core) : string =
+  match expr.desc with
+  | CLit (Ast.LitString (text, _)) when is_string_global_type ty -> begin
+      let storage_name = static_string_global_storage_name path_c in
+      emit_static_string_object ctx ~storage_name text;
+      emit ctx "\n";
+      Printf.sprintf "(blorp_String*)&%s" storage_name
+    end
+  | CLit lit -> (
+      match c_static_literal_initializer lit with
+      | None -> static_record_literal_field_error expr.loc
+      | Some init_expr -> init_expr)
+  | CListConstruct lc ->
+      let storage_name = emit_static_list_object ctx ~path_c lc in
+      Printf.sprintf "(blorp_List*)&%s" storage_name
+  | CTupleConstruct tc ->
+      let storage_name = emit_static_tuple_object ctx ~path_c tc in
+      Printf.sprintf "(blorp_Tuple*)&%s" storage_name
+  | CRecordConstruct rc ->
+      let storage_name = emit_static_record_object ctx ~path_c ~ty rc in
+      Printf.sprintf "(%s)&%s" (type_to_c ctx ty) storage_name
+  | CUnionConstruct uc -> (
+      match uc.uc_representation with
+      | ResultUnion _ -> emit_static_stack_result_initializer ctx ~path_c uc
+      | GenericUnion | OptionUnion _ ->
+          let storage_name = emit_static_union_object ctx ~path_c uc in
+          Printf.sprintf "(%s)&%s" (type_to_c ctx ty) storage_name)
+  | _ ->
+      Core_error.errorf Core_error.Emit expr.loc
+        ~hint:
+          "Static constants currently support primitive literals, string \
+           literals, nested supported list constants, nested supported tuple \
+           constants, nested supported record constants, and nested supported \
+           union constants."
+        "cannot emit expression as a static constant field"
+
+and emit_static_stack_result_initializer (ctx : Core_emit_context.t) ~path_c
+    (uc : union_construct) : string =
+  if not (static_stack_result_construct_supported ctx uc) then
+    Core_error.errorf Core_error.Emit Ast.dummy_loc
+      ~hint:
+        "Static Result emission currently supports Ok/Err constructors whose \
+         single payload can be represented as a static boxed slot."
+      "cannot emit `%s.%s` as a static Result" uc.uc_type_name
+      uc.uc_constructor_name;
+  match (uc.uc_constructor_name, uc.uc_args) with
+  | (("Ok" | "Err") as field_name), [ arg ] ->
+      let payload_path_c =
+        static_union_child_path ~parent_path:path_c field_name 0
+      in
+      let payload_initializer =
+        emit_static_result_payload_slot_initializer ctx ~path_c:payload_path_c
+          arg
+      in
+      Printf.sprintf "{ .tag = %d, .release_mask = %dUL, .data.%s.field0 = %s }"
+        uc.uc_tag uc.uc_release_mask field_name payload_initializer
+  | _ ->
+      Core_error.errorf Core_error.Emit Ast.dummy_loc
+        ~hint:"stack Result constructors are represented as tag + one payload"
+        "invalid static Result constructor shape for %s" uc.uc_constructor_name
+
+and emit_static_result_payload_slot_initializer (ctx : Core_emit_context.t)
+    ~path_c (value : boxed_storage_value) : string =
+  match value.bsv_box.box_kind with
+  | BoxPointer ->
+      let init_expr =
+        emit_static_value_initializer ctx ~path_c
+          ~ty:value.bsv_box.box_source_ty value.bsv_box.box_value
+      in
+      Printf.sprintf "(void*)%s" init_expr
+  | BoxVoid -> "(void*)0"
+  | BoxPrim -> (
+      match value.bsv_box.box_value.desc with
+      | CLit lit -> (
+          match c_static_literal_initializer lit with
+          | Some init_expr -> Printf.sprintf "(void*)(long)(%s)" init_expr
+          | None ->
+              static_record_literal_field_error value.bsv_box.box_value.loc)
+      | _ ->
+          Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
+            ~hint:
+              "Static Result primitive payloads must be compile-time literal \
+               values so they can be represented as C static initializers."
+            "cannot emit primitive Result payload as a static constant")
+  | BoxFloat | BoxFloat32 | BoxFloat16 -> (
+      match
+        c_static_float_box_initializer value.bsv_box.box_kind
+          value.bsv_box.box_value
+      with
+      | Some init_expr -> init_expr
+      | None ->
+          Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
+            ~hint:
+              "Static Result floating-point payloads must be compile-time \
+               literals so they can be represented as runtime box bit \
+               patterns."
+            "cannot emit floating-point Result payload as a static constant")
+  | BoxInt128 | BoxUInt128 | BoxStruct _ ->
+      Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
+        ~hint:
+          "This Result payload would need a runtime box. Static Result \
+           emission currently supports pointer slots, primitive literal slots, \
+           floating-point literal slots, and void slots only."
+        "cannot emit Result payload as a static constant"
+
+and emit_static_pointer_list_slot_initializer (ctx : Core_emit_context.t)
+    ~path_c (value : boxed_storage_value) : string =
+  match value.bsv_box.box_kind with
+  | BoxPointer ->
+      let init_expr =
+        emit_static_value_initializer ctx ~path_c
+          ~ty:value.bsv_box.box_source_ty value.bsv_box.box_value
+      in
+      Printf.sprintf "(void*)%s" init_expr
+  | BoxVoid -> "(void*)0"
+  | BoxPrim | BoxFloat | BoxFloat32 | BoxFloat16 | BoxInt128 | BoxUInt128
+  | BoxStruct _ ->
+      Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
+        ~hint:
+          "Static list emission currently supports pointer-storage list slots \
+           whose nested values are supported static constants."
+        "cannot emit list slot as a static constant"
+
+and emit_static_inline_list_slot_initializer storage
+    (value : boxed_storage_value) : string =
+  match (storage, value.bsv_box.box_kind, value.bsv_box.box_value.desc) with
+  | StaticInlineIntegerBits _, BoxPrim, CLit lit -> (
+      match c_static_literal_initializer lit with
+      | Some init_expr -> init_expr
+      | None -> static_record_literal_field_error value.bsv_box.box_value.loc)
+  | StaticInlineFloat64, BoxFloat, CLit (Ast.LitFloat f) -> (
+      match c_static_literal_initializer (Ast.LitFloat f) with
+      | Some init_expr -> init_expr
+      | None -> static_record_literal_field_error value.bsv_box.box_value.loc)
+  | StaticInlineFloat32, BoxFloat32, CLit (Ast.LitFloat f) -> (
+      match c_static_literal_initializer (Ast.LitFloat f) with
+      | Some init_expr -> init_expr
+      | None -> static_record_literal_field_error value.bsv_box.box_value.loc)
+  | StaticInlineFloat16, BoxFloat16, CLit (Ast.LitFloat f) -> (
+      match c_static_literal_initializer (Ast.LitFloat f) with
+      | Some init_expr -> init_expr
+      | None -> static_record_literal_field_error value.bsv_box.box_value.loc)
+  | _ ->
+      Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
+        ~hint:
+          "Static inline list emission currently supports integer-like \
+           primitive literals, Float literals, Float32 literals, and Float16 \
+           literals."
+        "cannot emit inline list slot as a static constant"
+
+and emit_static_pointer_list_object (ctx : Core_emit_context.t) ~path_c
+    (lc : list_construct) : string =
+  let elem_initializers =
+    List.mapi
+      (fun index elem ->
+        emit_static_pointer_list_slot_initializer ctx
+          ~path_c:(static_list_child_path ~parent_path:path_c index)
+          elem)
+      lc.lc_elems
+  in
+  let storage_name = static_list_global_storage_name path_c in
+  let elem_count = List.length lc.lc_elems in
+  let capacity = max static_list_min_capacity elem_count in
+  emit_line ctx
+    (Printf.sprintf
+       "static struct { blorp_Object header; long len; long capacity; void \
+        (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char \
+        __pad[%d]; void* data[%d]; } %s = {"
+       static_list_runtime_padding_bytes capacity storage_name);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx "{ BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
+  emit_line ctx (Printf.sprintf "%dL," elem_count);
+  emit_line ctx (Printf.sprintf "%dL," capacity);
+  emit_line ctx
+    (if lc.lc_elem_needs_release then "blorp_elem_release_fn," else "NULL,");
+  emit_line ctx "(int16_t)sizeof(void*),";
+  emit_line ctx "BLORP_LIST_STORAGE_POINTER,";
+  emit_line ctx "{ 0 },";
+  emit_line ctx "{";
+  ctx.indent <- ctx.indent + 1;
+  (match elem_initializers with
+  | [] -> emit_line ctx "NULL"
+  | _ ->
+      List.iter
+        (fun init_expr -> emit_line ctx (init_expr ^ ","))
+        elem_initializers);
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "}";
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "};";
+  emit ctx "\n";
+  storage_name
+
+and emit_static_inline_list_object (ctx : Core_emit_context.t) ~path_c
+    (lc : list_construct) : string =
+  let storage =
+    match static_inline_list_storage_for_layout lc.lc_layout with
+    | Some storage -> storage
+    | None ->
+        Core_error.errorf Core_error.Emit Ast.dummy_loc
+          ~hint:
+            "Static inline list emission needs a concrete list storage \
+             descriptor from Core list layout."
+          "cannot emit inline list as a static constant"
+  in
+  let elem_initializers =
+    List.map (emit_static_inline_list_slot_initializer storage) lc.lc_elems
+  in
+  let storage_name = static_list_global_storage_name path_c in
+  let elem_count = List.length lc.lc_elems in
+  let capacity = max static_list_min_capacity elem_count in
+  let storage_c_type = static_inline_list_storage_c_type storage in
+  let elem_size = static_inline_list_storage_elem_size storage in
+  emit_line ctx
+    (Printf.sprintf
+       "static struct { blorp_Object header; long len; long capacity; void \
+        (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char \
+        __pad[%d]; %s data[%d]; } %s = {"
+       static_list_runtime_padding_bytes storage_c_type capacity storage_name);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx "{ BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
+  emit_line ctx (Printf.sprintf "%dL," elem_count);
+  emit_line ctx (Printf.sprintf "%dL," capacity);
+  emit_line ctx "NULL,";
+  emit_line ctx (Printf.sprintf "(int16_t)%d," elem_size);
+  emit_line ctx "BLORP_LIST_STORAGE_INLINE,";
+  emit_line ctx "{ 0 },";
+  emit_line ctx "{";
+  ctx.indent <- ctx.indent + 1;
+  (match elem_initializers with
+  | [] -> emit_line ctx "0"
+  | _ ->
+      List.iter
+        (fun init_expr ->
+          emit_line ctx (Printf.sprintf "((%s)(%s))," storage_c_type init_expr))
+        elem_initializers);
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "}";
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "};";
+  emit ctx "\n";
+  storage_name
+
+and emit_static_list_object (ctx : Core_emit_context.t) ~path_c
+    (lc : list_construct) : string =
+  if not (static_list_construct_supported ctx lc) then
+    Core_error.errorf Core_error.Emit Ast.dummy_loc
+      ~hint:
+        "Static list emission currently supports pointer-storage lists whose \
+         elements are supported static constants and inline primitive literal \
+         lists."
+      "cannot emit list as a static constant";
+  match lc.lc_layout.lsl_slots with
+  | ListPointerStorage -> emit_static_pointer_list_object ctx ~path_c lc
+  | ListInlineStorage _ -> emit_static_inline_list_object ctx ~path_c lc
+  | ListInlineStructStorage _ ->
+      Core_error.errorf Core_error.Emit Ast.dummy_loc
+        ~hint:
+          "Inline struct list static emission needs typed byte initializers \
+           and is intentionally not enabled by this path."
+        "cannot emit inline struct list as a static constant"
+
+and emit_static_tuple_slot_initializer (ctx : Core_emit_context.t) ~path_c
+    (value : boxed_storage_value) : string =
+  match value.bsv_box.box_kind with
+  | BoxPrim -> (
+      match value.bsv_box.box_value.desc with
+      | CLit lit -> (
+          match c_static_literal_initializer lit with
+          | Some init_expr -> Printf.sprintf "(void*)(long)(%s)" init_expr
+          | None ->
+              static_record_literal_field_error value.bsv_box.box_value.loc)
+      | _ ->
+          Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
+            ~hint:
+              "Static tuple primitive slots must be compile-time literal \
+               values so they can be represented as C static initializers."
+            "cannot emit primitive tuple slot as a static constant")
+  | BoxPointer ->
+      let init_expr =
+        emit_static_value_initializer ctx ~path_c
+          ~ty:value.bsv_box.box_source_ty value.bsv_box.box_value
+      in
+      Printf.sprintf "(void*)%s" init_expr
+  | BoxVoid -> "(void*)0"
+  | BoxFloat | BoxFloat32 | BoxFloat16 -> (
+      match
+        c_static_float_box_initializer value.bsv_box.box_kind
+          value.bsv_box.box_value
+      with
+      | Some init_expr -> init_expr
+      | None ->
+          Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
+            ~hint:
+              "Static tuple floating-point slots must be compile-time literals \
+               so they can be represented as runtime box bit patterns."
+            "cannot emit floating-point tuple slot as a static constant")
+  | BoxInt128 | BoxUInt128 | BoxStruct _ ->
+      Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
+        ~hint:
+          "This tuple element would need a runtime box. Static tuple emission \
+           currently supports pointer slots, primitive literal slots, \
+           floating-point literal slots, and void slots only."
+        "cannot emit tuple slot as a static constant"
+
+and emit_static_tuple_object (ctx : Core_emit_context.t) ~path_c
+    (tc : tuple_construct) : string =
+  if not (static_tuple_construct_supported ctx tc) then
+    Core_error.errorf Core_error.Emit Ast.dummy_loc
+      ~hint:
+        "Static tuple emission currently supports pointer slots, primitive \
+         literal slots, floating-point literal slots, and void slots whose \
+         nested values are supported static constants."
+      "cannot emit tuple as a static constant";
+  let field_initializers =
+    List.mapi
+      (fun index value ->
+        emit_static_tuple_slot_initializer ctx
+          ~path_c:(static_tuple_child_path ~parent_path:path_c index)
+          value)
+      tc.tc_elems
+  in
+  let storage_name = static_tuple_global_storage_name path_c in
+  let arity = List.length tc.tc_elems in
+  let storage_slots = max static_tuple_min_storage_slots arity in
+  emit_line ctx
+    (Printf.sprintf
+       "static struct { blorp_Object header; long arity; long release_mask; \
+        void* elem[%d]; } %s = {"
+       storage_slots storage_name);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx
+    ".header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
+  emit_line ctx (Printf.sprintf ".arity = %dL," arity);
+  emit_line ctx (Printf.sprintf ".release_mask = %dUL," tc.tc_release_mask);
+  emit_line ctx
+    (Printf.sprintf ".elem = { %s }" (String.concat ", " field_initializers));
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "};";
+  emit ctx "\n";
+  storage_name
+
+and emit_static_record_object (ctx : Core_emit_context.t) ~path_c ~ty
+    (rc : record_construct) : string =
+  let type_name, record_decl =
+    match static_heap_record_decl_for_type ctx ty with
+    | Some record -> record
+    | None ->
+        Core_error.errorf Core_error.Emit Ast.dummy_loc
+          ~hint:
+            "Static record emission currently supports non-generic heap record \
+             declarations only."
+          "cannot emit `%s` as a static record" (Types.type_to_string ty)
+  in
+  if
+    record_construct_has_erased_field rc
+    || record_decl_has_erased_static_field ctx record_decl
+  then
+    Core_error.errorf Core_error.Emit Ast.dummy_loc
+      ~hint:
+        "Records with erased generic fields need release-mask-aware static \
+         emission and are not enabled yet."
+      "cannot emit `%s` as a static record because it has erased fields"
+      type_name;
+  let field_initializers =
+    List.map
+      (fun (fd : Ast.field_decl) ->
+        let value =
+          match record_construct_raw_field rc fd.field_name with
+          | Some value -> value
+          | None ->
+              Core_error.errorf Core_error.Emit Ast.dummy_loc
+                ~hint:
+                  "Record construction should be validated and ordered before \
+                   static emission."
+                "record `%s` is missing field `%s`" type_name fd.field_name
+        in
+        let field_path_c =
+          static_child_path ~parent_path:path_c fd.field_name
+        in
+        emit_static_value_initializer ctx ~path_c:field_path_c ~ty:fd.field_type
+          value)
+      record_decl.record_fields
+  in
+  let storage_name = static_record_global_storage_name path_c in
+  emit_line ctx (Printf.sprintf "static %s %s = {" type_name storage_name);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx "{ BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
+  List.iteri
+    (fun index init_expr ->
+      let suffix =
+        if index = List.length field_initializers - 1 then "" else ","
+      in
+      emit_line ctx (init_expr ^ suffix))
+    field_initializers;
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "};";
+  emit ctx "\n";
+  storage_name
+
+and emit_static_union_object (ctx : Core_emit_context.t) ~path_c
+    (uc : union_construct) : string =
+  if not (static_union_construct_supported ctx uc) then
+    Core_error.errorf Core_error.Emit Ast.dummy_loc
+      ~hint:
+        "Static union emission currently supports heap union constructors with \
+         concrete typed payload fields whose values are themselves static \
+         constants."
+      "cannot emit `%s.%s` as a static union" uc.uc_type_name
+      uc.uc_constructor_name;
+  let variant =
+    match static_union_variant_for_construct ctx uc with
+    | Some variant -> variant
+    | None ->
+        Core_error.errorf Core_error.Emit Ast.dummy_loc
+          ~hint:
+            "Union constructor lookup should be registered before static \
+             emission."
+          "union `%s` has no constructor `%s`" uc.uc_type_name
+          uc.uc_constructor_name
+  in
+  let field_initializers =
+    List.mapi
+      (fun index field_ty ->
+        let arg = List.nth uc.uc_args index in
+        let field_path_c =
+          static_union_child_path ~parent_path:path_c variant.variant_name index
+        in
+        emit_static_value_initializer ctx ~path_c:field_path_c ~ty:field_ty
+          arg.bsv_box.box_value)
+      variant.variant_fields
+  in
+  let storage_name = static_union_global_storage_name path_c in
+  emit_line ctx (Printf.sprintf "static %s %s = {" uc.uc_type_name storage_name);
+  ctx.indent <- ctx.indent + 1;
+  emit_line ctx
+    ".header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
+  emit_line ctx
+    (Printf.sprintf ".tag = %s," (variant_tag_c_name uc.uc_type_name variant));
+  emit_line ctx
+    (Printf.sprintf ".data.%s = { %s }" variant.variant_name
+       (String.concat ", " field_initializers));
+  ctx.indent <- ctx.indent - 1;
+  emit_line ctx "};";
+  emit ctx "\n";
+  storage_name
+
+let emit_static_record_global (ctx : Core_emit_context.t) (v : core_var) ~name_c
+    (rc : record_construct) =
+  let storage_name =
+    emit_static_record_object ctx ~path_c:name_c ~ty:v.cv_ty rc
+  in
+  emit_line ctx
+    (Printf.sprintf "static %s %s = (%s)&%s;" (type_to_c ctx v.cv_ty) name_c
+       (type_to_c ctx v.cv_ty) storage_name);
+  emit ctx "\n"
+
+let emit_static_union_global (ctx : Core_emit_context.t) (v : core_var) ~name_c
+    (uc : union_construct) =
+  match uc.uc_representation with
+  | ResultUnion _ ->
+      let init_expr =
+        emit_static_stack_result_initializer ctx ~path_c:name_c uc
+      in
+      emit_line ctx
+        (Printf.sprintf "static %s %s = %s;" (type_to_c ctx v.cv_ty) name_c
+           init_expr);
+      emit ctx "\n"
+  | GenericUnion | OptionUnion _ ->
+      let storage_name = emit_static_union_object ctx ~path_c:name_c uc in
+      emit_line ctx
+        (Printf.sprintf "static %s %s = (%s)&%s;" (type_to_c ctx v.cv_ty) name_c
+           (type_to_c ctx v.cv_ty) storage_name);
+      emit ctx "\n"
+
+let emit_static_tuple_global (ctx : Core_emit_context.t) ~name_c
+    (tc : tuple_construct) =
+  let storage_name = emit_static_tuple_object ctx ~path_c:name_c tc in
+  emit_line ctx
+    (Printf.sprintf "static blorp_Tuple* %s = (blorp_Tuple*)&%s;" name_c
+       storage_name);
+  emit ctx "\n"
+
+let emit_static_list_global (ctx : Core_emit_context.t) ~name_c
+    (lc : list_construct) =
+  let storage_name = emit_static_list_object ctx ~path_c:name_c lc in
+  emit_line ctx
+    (Printf.sprintf "static blorp_List* %s = (blorp_List*)&%s;" name_c
+       storage_name);
+  emit ctx "\n"
 
 type global_constant_immortalization =
   | NoImmortalizationNeeded
@@ -733,6 +1580,11 @@ and build_record_plan ctx ~path ~seen record_ty record_decl args =
       ImmortalRecord { record_ty; record_fields })
 
 and build_union_plan ctx ~path ~seen union_ty type_name =
+  let field_storage =
+    if Codegen_types.union_uses_typed_payload_storage ctx.reg type_name then
+      DirectTypedStorage
+    else VoidPointerPayload
+  in
   let build_variant (variant : Ast.variant) =
     let rec go i = function
       | [] -> Ok []
@@ -746,7 +1598,7 @@ and build_union_plan ctx ~path ~seen union_ty type_name =
                  (global_constant_type_string field_ty))
           else if type_requires_release ctx field_ty then
             match
-              build_global_constant_plan ctx ~storage:VoidPointerPayload
+              build_global_constant_plan ctx ~storage:field_storage
                 ~path:
                   (Printf.sprintf "%s.%s.field%d" path variant.variant_name i)
                 ~seen field_ty
@@ -870,6 +1722,11 @@ and emit_immortalize_tuple ctx c_expr tuple_elements =
 
 and emit_immortalize_union ctx c_expr type_name union_variants =
   emit_make_immortal_root ctx c_expr;
+  let field_storage =
+    if Codegen_types.union_uses_typed_payload_storage ctx.reg type_name then
+      DirectTypedStorage
+    else VoidPointerPayload
+  in
   if
     List.exists
       (fun { gc_variant_fields; _ } -> gc_variant_fields <> [])
@@ -892,17 +1749,25 @@ and emit_immortalize_union ctx c_expr type_name union_variants =
                   Printf.sprintf "%s->data.%s.field%d" c_expr
                     variant.variant_name gc_union_field_index
                 in
-                emit_line ctx
-                  (Printf.sprintf "if ((%s->release_mask & %dUL) && %s) {"
-                     c_expr bit slot);
-                ctx.indent <- ctx.indent + 1;
-                emit_immortalize_plan ctx
-                  (cast_void_payload_for_type ctx
-                     (global_constant_plan_type gc_union_field_plan)
-                     slot)
-                  gc_union_field_plan;
-                ctx.indent <- ctx.indent - 1;
-                emit_line ctx "}")
+                let payload_expr =
+                  match field_storage with
+                  | DirectTypedStorage -> slot
+                  | VoidPointerPayload ->
+                      cast_void_payload_for_type ctx
+                        (global_constant_plan_type gc_union_field_plan)
+                        slot
+                in
+                match field_storage with
+                | DirectTypedStorage ->
+                    emit_immortalize_plan ctx payload_expr gc_union_field_plan
+                | VoidPointerPayload ->
+                    emit_line ctx
+                      (Printf.sprintf "if ((%s->release_mask & %dUL) && %s) {"
+                         c_expr bit slot);
+                    ctx.indent <- ctx.indent + 1;
+                    emit_immortalize_plan ctx payload_expr gc_union_field_plan;
+                    ctx.indent <- ctx.indent - 1;
+                    emit_line ctx "}")
               fields;
             emit_line ctx "break;";
             ctx.indent <- ctx.indent - 1)
@@ -1117,20 +1982,34 @@ let union_field_may_need_release (ctx : Core_emit_context.t)
   if Codegen_types.has_type_vars field_ty then true
   else boxed_value_needs_release ctx field_ty loc
 
-let union_variant_needs_release_mask (ctx : Core_emit_context.t)
+let union_uses_typed_payload_storage (ctx : Core_emit_context.t) type_name =
+  Codegen_types.union_uses_typed_payload_storage ctx.reg type_name
+
+let union_field_storage_c_type (ctx : Core_emit_context.t) type_name field_ty =
+  if union_uses_typed_payload_storage ctx type_name then type_to_c ctx field_ty
+  else "void*"
+
+let union_field_requires_destructor_release (ctx : Core_emit_context.t)
+    type_name field_ty loc =
+  if union_uses_typed_payload_storage ctx type_name then
+    type_requires_release ctx field_ty
+  else union_field_may_need_release ctx field_ty loc
+
+let union_variant_needs_release_mask (ctx : Core_emit_context.t) type_name
     (v : Ast.variant) : bool =
-  List.exists
-    (fun field_ty -> union_field_may_need_release ctx field_ty v.variant_loc)
-    v.variant_fields
+  (not (union_uses_typed_payload_storage ctx type_name))
+  && List.exists
+       (fun field_ty -> union_field_may_need_release ctx field_ty v.variant_loc)
+       v.variant_fields
 
 let union_type_has_release_mask (ctx : Core_emit_context.t) (t : Ast.type_decl)
     : bool =
-  List.exists (union_variant_needs_release_mask ctx) t.type_variants
+  List.exists (union_variant_needs_release_mask ctx t.type_name) t.type_variants
 
 let union_constructor_needs_release_mask (ctx : Core_emit_context.t) type_name
     ctor_name : bool =
   match Codegen_types.lookup_union_variant ctx.reg type_name ctor_name with
-  | Some variant -> union_variant_needs_release_mask ctx variant
+  | Some variant -> union_variant_needs_release_mask ctx type_name variant
   | None -> true
 
 let union_constructor_needs_release_mask_for_type (ctx : Core_emit_context.t)
@@ -1246,10 +2125,18 @@ let tensor_arg_element_needs_release ctx args loc =
   | arr :: _ -> tensor_element_needs_release ctx arr.ty loc
   | [] -> false
 
+let channel_element_type ctx ty =
+  match Core_layout_type.canonical_type ~reg:ctx.reg ty with
+  | Ast.TyNamed
+      (("Channel" | "std/channel::Channel" | "std_channel__Channel"), [ elem ])
+    ->
+      Some elem
+  | _ -> None
+
 let channel_element_needs_release ctx ty loc =
-  match normalize_type ty with
-  | Ast.TyNamed ("Channel", [ elem ]) -> boxed_value_needs_release ctx elem loc
-  | _ -> false
+  match channel_element_type ctx ty with
+  | Some elem -> boxed_value_needs_release ctx elem loc
+  | None -> false
 
 let boxed_expr_transfers_ownership ctx (el : core) =
   match el.desc with
@@ -1692,6 +2579,16 @@ and emit_tensor_fill_factory ctx loc ty value dims =
   let layout = Core_emit_util.tensor_storage_layout_of_type ctx ty loc in
   emit_blorp_backend ctx (TensorDirectFillFactory { loc; layout; value; dims })
 
+and emit_union_constructor_arg ctx type_name arg =
+  if union_uses_typed_payload_storage ctx type_name then
+    emit_expr ctx arg.bsv_box.box_value
+  else emit_boxed_storage ctx arg
+
+and render_union_constructor_arg ctx type_name arg =
+  if union_uses_typed_payload_storage ctx type_name then
+    render_expr_arg ctx arg.bsv_box.box_value
+  else render_boxed_storage_arg ctx arg
+
 and emit_union_construct ctx uc =
   let option_constructor_abi =
     match uc.uc_representation with
@@ -1774,7 +2671,9 @@ and emit_union_construct ctx uc =
             union_constructor_needs_release_mask ctx uc.uc_type_name
               uc.uc_constructor_name
           in
-          let arg_strings = List.map (render_boxed_storage_arg ctx) args in
+          let arg_strings =
+            List.map (render_union_constructor_arg ctx uc.uc_type_name) args
+          in
           let release_args =
             if needs_release_mask then
               [ Printf.sprintf "%dUL" uc.uc_release_mask ]
@@ -1793,7 +2692,11 @@ and emit_union_reuse_construct ctx urc =
           urc.urc_constructor_name
       in
       let source_arg = render_expr_arg ctx urc.urc_source in
-      let arg_strings = List.map (render_boxed_storage_arg ctx) urc.urc_args in
+      let arg_strings =
+        List.map
+          (render_union_constructor_arg ctx urc.urc_type_name)
+          urc.urc_args
+      in
       let release_args =
         if needs_release_mask then
           [ Printf.sprintf "%dUL" urc.urc_release_mask ]
@@ -2678,36 +3581,48 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 empty = constructor_c_name empty_ctor_name;
               }
             in
-            match (kind, args, normalize_type e.ty) with
-            | ( CKBuiltin "blorp_channel_try_recv_attempt",
-                [ ch ],
-                Ast.TyNamed (_, [ elem_ty ]) ) ->
-                emit_blorp_backend ctx
-                  (ChannelRecvAttempt
-                     (ChannelTryRecvAttempt
-                        {
-                          result_type = type_to_c ctx e.ty;
-                          channel = ch;
-                          release_policy = recv_attempt_release_policy elem_ty;
-                          constructors =
-                            recv_attempt_constructors "RecvWouldBlock";
-                        }));
-                true
-            | ( CKBuiltin "blorp_channel_recv_timeout_attempt",
-                [ ch; timeout_ms ],
-                Ast.TyNamed (_, [ elem_ty ]) ) ->
-                emit_blorp_backend ctx
-                  (ChannelRecvAttempt
-                     (ChannelRecvTimeoutAttempt
-                        {
-                          result_type = type_to_c ctx e.ty;
-                          channel = ch;
-                          timeout = timeout_ms;
-                          release_policy = recv_attempt_release_policy elem_ty;
-                          constructors =
-                            recv_attempt_constructors "RecvTimedOut";
-                        }));
-                true
+            let recv_value_constructor_takes_release_mask () =
+              union_constructor_needs_release_mask_for_type ctx e.ty "RecvValue"
+            in
+            match (kind, args) with
+            | CKBuiltin "blorp_channel_try_recv_attempt", [ ch ] -> (
+                match channel_element_type ctx ch.ty with
+                | None -> false
+                | Some elem_ty ->
+                    emit_blorp_backend ctx
+                      (ChannelRecvAttempt
+                         (ChannelTryRecvAttempt
+                            {
+                              result_type = type_to_c ctx e.ty;
+                              channel = ch;
+                              release_policy =
+                                recv_attempt_release_policy elem_ty;
+                              value_constructor_takes_release_mask =
+                                recv_value_constructor_takes_release_mask ();
+                              constructors =
+                                recv_attempt_constructors "RecvWouldBlock";
+                            }));
+                    true)
+            | CKBuiltin "blorp_channel_recv_timeout_attempt", [ ch; timeout_ms ]
+              -> (
+                match channel_element_type ctx ch.ty with
+                | None -> false
+                | Some elem_ty ->
+                    emit_blorp_backend ctx
+                      (ChannelRecvAttempt
+                         (ChannelRecvTimeoutAttempt
+                            {
+                              result_type = type_to_c ctx e.ty;
+                              channel = ch;
+                              timeout = timeout_ms;
+                              release_policy =
+                                recv_attempt_release_policy elem_ty;
+                              value_constructor_takes_release_mask =
+                                recv_value_constructor_takes_release_mask ();
+                              constructors =
+                                recv_attempt_constructors "RecvTimedOut";
+                            }));
+                    true)
             | _ -> false
           in
           let try_emit_stack_option_ctor () =
@@ -5069,7 +5984,11 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
         emit_indent ctx;
         emit ctx "struct { ";
         List.iteri
-          (fun i _ft -> emit ctx (Printf.sprintf "void* field%d; " i))
+          (fun i ft ->
+            emit ctx
+              (Printf.sprintf "%s field%d; "
+                 (union_field_storage_c_type ctx n ft)
+                 i))
           v.variant_fields;
         emitln ctx (Printf.sprintf "} %s;" v.variant_name)
       end
@@ -5097,7 +6016,7 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
             let rc_indices =
               List.mapi (fun i ft -> (i, ft)) v.variant_fields
               |> List.filter (fun (_, ft) ->
-                  union_field_may_need_release ctx ft v.variant_loc)
+                  union_field_requires_destructor_release ctx n ft v.variant_loc)
             in
             (v, rc_indices))
           t.type_variants
@@ -5121,12 +6040,21 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
               ctx.indent <- ctx.indent + 1;
               List.iter
                 (fun (i, _) ->
-                  emit_line ctx
-                    (Printf.sprintf
-                       "if ((self->release_mask & %dUL) && \
-                        self->data.%s.field%d) \
-                        blorp_release(self->data.%s.field%d);"
-                       (1 lsl i) v.variant_name i v.variant_name i))
+                  let field_c =
+                    Printf.sprintf "self->data.%s.field%d" v.variant_name i
+                  in
+                  if union_uses_typed_payload_storage ctx n then
+                    emit_line ctx
+                      (Printf.sprintf "%s;"
+                         (release_value_call ctx
+                            (List.nth v.variant_fields i)
+                            field_c))
+                  else
+                    emit_line ctx
+                      (Printf.sprintf
+                         "if ((self->release_mask & %dUL) && %s) \
+                          blorp_release(%s);"
+                         (1 lsl i) field_c field_c))
                 rc_indices;
               emit_line ctx "break;";
               ctx.indent <- ctx.indent - 1
@@ -5166,12 +6094,15 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
           | Some id -> Codegen_names.mangle_by_def_id id v.variant_name
           | None -> v.variant_name
         in
-        let needs_release_mask = union_variant_needs_release_mask ctx v in
+        let needs_release_mask = union_variant_needs_release_mask ctx n v in
         emit ctx (Printf.sprintf "%s* %s(" n ctor_c);
         List.iteri
-          (fun i _ft ->
+          (fun i ft ->
             if i > 0 then emit ctx ", ";
-            emit ctx (Printf.sprintf "void* field%d" i))
+            emit ctx
+              (Printf.sprintf "%s field%d"
+                 (union_field_storage_c_type ctx n ft)
+                 i))
           v.variant_fields;
         if needs_release_mask then begin
           if v.variant_fields <> [] then emit ctx ", ";
@@ -5208,7 +6139,11 @@ and emit_union_type (ctx : Core_emit_context.t) (t : Ast.type_decl) : unit =
         in
         emit ctx (Printf.sprintf "static inline %s* %s(%s* __old" n reuse_c n);
         List.iteri
-          (fun i _ft -> emit ctx (Printf.sprintf ", void* field%d" i))
+          (fun i ft ->
+            emit ctx
+              (Printf.sprintf ", %s field%d"
+                 (union_field_storage_c_type ctx n ft)
+                 i))
           v.variant_fields;
         if needs_release_mask then emit ctx ", unsigned long release_mask";
         emitln ctx ") {";
@@ -5288,10 +6223,20 @@ and emit_global_var (ctx : Core_emit_context.t) (v : core_var) : unit =
      and [CVar] references to them stay bare as well. A5 can switch
      both sides together once scope tracking is in place. *)
   let name_c = escape_c_ident (Var.to_c_name v.cv_name) in
-  (* Only primitive literals are C static initializers. String literals
-     expand to a lazy [blorp_string_literal(...)] expression, so route
-     those through [__blorp_init_globals]. *)
+  (* Primitive literals are scalar C static initializers. Immutable string
+     literal globals use static Blorp string objects instead of startup
+     materialization. *)
   match v.cv_init.desc with
+  | CLit (Ast.LitString (text, _)) when can_emit_static_string_global v ->
+      emit_static_string_global ctx ~name_c text
+  | CListConstruct lc when can_emit_static_list_global ctx v ->
+      emit_static_list_global ctx ~name_c lc
+  | CTupleConstruct tc when can_emit_static_tuple_global ctx v ->
+      emit_static_tuple_global ctx ~name_c tc
+  | CRecordConstruct rc when can_emit_static_record_global ctx v ->
+      emit_static_record_global ctx v ~name_c rc
+  | CUnionConstruct uc when can_emit_static_union_global ctx v ->
+      emit_static_union_global ctx v ~name_c uc
   | CLit lit when is_c_static_literal lit ->
       emit_indent ctx;
       emit ctx (Printf.sprintf "static %s %s = " ty_c name_c);
@@ -6660,12 +7605,16 @@ and emit_tailrec_list_binding (ctx : Core_emit_context.t)
           let acc_c =
             render_tailrec_list_accessor ctx ~list_name ~cursor_name acc
           in
-          emit_line ctx (unbox_decl_str ctx var_c acc_c var_ty))
+          emit_line ctx
+            (unbox_decl_for_accessor_str ctx var_c ~scrut_ty:list_ty
+               ~accessor:acc ~source:acc_c var_ty))
   | _ ->
       let acc_c =
         render_tailrec_list_accessor ctx ~list_name ~cursor_name acc
       in
-      emit_line ctx (unbox_decl_str ctx var_c acc_c var_ty)
+      emit_line ctx
+        (unbox_decl_for_accessor_str ctx var_c ~scrut_ty:list_ty ~accessor:acc
+           ~source:acc_c var_ty)
 
 and emit_list_tailrec_rebind (ctx : Core_emit_context.t) (f : core_func)
     ~(list_index : int) ~(cursor_name : string) ~(offset : int)
@@ -7881,10 +8830,20 @@ and emit_global_init (ctx : Core_emit_context.t) (prog : core_program) : unit =
     | [] -> List.rev acc
     | { cd_desc = CDVar v; cd_loc; _ } :: rest -> (
         match v.cv_init.desc with
+        | _ when can_emit_static_string_global v -> collect acc rest
+        | _ when can_emit_static_list_global ctx v -> collect acc rest
+        | _ when can_emit_static_tuple_global ctx v -> collect acc rest
+        | _ when can_emit_static_record_global ctx v -> collect acc rest
+        | _ when can_emit_static_union_global ctx v -> collect acc rest
         | CLit lit when is_c_static_literal lit -> collect acc rest
         | _ -> collect ((v, cd_loc) :: acc) rest)
     | { cd_desc = CDPrivate { cd_desc = CDVar v; cd_loc; _ }; _ } :: rest -> (
         match v.cv_init.desc with
+        | _ when can_emit_static_string_global v -> collect acc rest
+        | _ when can_emit_static_list_global ctx v -> collect acc rest
+        | _ when can_emit_static_tuple_global ctx v -> collect acc rest
+        | _ when can_emit_static_record_global ctx v -> collect acc rest
+        | _ when can_emit_static_union_global ctx v -> collect acc rest
         | CLit lit when is_c_static_literal lit -> collect acc rest
         | _ -> collect ((v, cd_loc) :: acc) rest)
     | _ :: rest -> collect acc rest

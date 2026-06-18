@@ -360,11 +360,41 @@ let matrix_column_count loc receiver =
       | VVector [] -> Ok 0
       | _ -> Ctfe_error.unsupported loc "matrix column_count on this value")
 
+let to_float32_value call_expr value =
+  let loc = call_expr.IR.loc in
+  let converted =
+    match value.desc with
+    | VFloat n -> Some (Float_bit_pattern.round_to_float32 n)
+    | VInt n -> Some (Float_bit_pattern.round_to_float32 (Int64.to_float n))
+    | VBool b -> Some (if b then 1.0 else 0.0)
+    | _ -> None
+  in
+  match converted with
+  | Some n -> scalar_value call_expr (VFloat n)
+  | None -> Ctfe_error.unsupported loc "to_float32 builtin on this value"
+
+let to_float16_value call_expr value =
+  let loc = call_expr.IR.loc in
+  let converted =
+    match value.desc with
+    | VFloat n -> Some (Float_bit_pattern.round_to_float16 n)
+    | VInt n -> Some (Float_bit_pattern.round_to_float16 (Int64.to_float n))
+    | VBool b -> Some (if b then 1.0 else 0.0)
+    | _ -> None
+  in
+  match converted with
+  | Some n -> scalar_value call_expr (VFloat n)
+  | None -> Ctfe_error.unsupported loc "to_float16 builtin on this value"
+
 let eval_builtin_call ctx call_expr ~source_name ~builtin_intrinsic arg_values =
   let loc = call_expr.IR.loc in
   match (builtin_intrinsic, arg_values) with
   | Some Intrinsic.BuiltinToString, [ receiver ] ->
       string_text_of_value loc receiver >>= string_value call_expr
+  | Some Intrinsic.BuiltinToFloat32, [ value ] ->
+      to_float32_value call_expr value
+  | Some Intrinsic.BuiltinToFloat16, [ value ] ->
+      to_float16_value call_expr value
   | Some Intrinsic.BuiltinLength, [ receiver ] -> (
       match receiver.desc with
       | VList values -> int_value call_expr (List.length values)

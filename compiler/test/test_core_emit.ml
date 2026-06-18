@@ -25,6 +25,7 @@ let ty_string = TyNamed ("String", [])
 let ty_ptr = TyNamed ("Ptr", [])
 let ty_void = TyNamed ("Void", [])
 let ty_channel_int = TyNamed ("Channel", [ ty_int ])
+let ty_recv_attempt_mono_int = TyNamed ("std_channel__RecvAttempt__mono_Int", [])
 let ty_list_string = TyNamed ("List", [ ty_string ])
 let ty_set_string = TyNamed ("Set", [ ty_string ])
 let ty_dict_string_string = TyNamed ("Dict", [ ty_string; ty_string ])
@@ -449,6 +450,108 @@ let test_emit_call_with_args () =
       ty_int
   in
   Alcotest.(check string) "add(1,2)" "add(1L, 2L)" (emit_to_string e)
+
+let register_recv_attempt_constructors (ctx : Blorp.Core_emit_context.t) =
+  Blorp.Codegen_types.register_union_variants ctx.reg
+    "std_channel__RecvAttempt__mono_Int"
+    [
+      {
+        variant_name = "RecvValue";
+        variant_fields = [ ty_int ];
+        variant_tag = 0;
+        variant_loc = loc;
+        variant_def_id = None;
+      };
+      {
+        variant_name = "RecvWouldBlock";
+        variant_fields = [];
+        variant_tag = 1;
+        variant_loc = loc;
+        variant_def_id = None;
+      };
+      {
+        variant_name = "RecvSealed";
+        variant_fields = [];
+        variant_tag = 2;
+        variant_loc = loc;
+        variant_def_id = None;
+      };
+      {
+        variant_name = "RecvTimedOut";
+        variant_fields = [];
+        variant_tag = 3;
+        variant_loc = loc;
+        variant_def_id = None;
+      };
+    ];
+  List.iter
+    (fun ctor ->
+      Hashtbl.replace ctx.constructor_c_names_by_type
+        ("std_channel__RecvAttempt__mono_Int", ctor)
+        ("__def_" ^ ctor))
+    [ "RecvValue"; "RecvSealed"; "RecvWouldBlock"; "RecvTimedOut" ]
+
+let test_emit_channel_try_recv_attempt_uses_channel_elem_type () =
+  let ctx = Blorp.Core_emit_context.create () in
+  register_recv_attempt_constructors ctx;
+  let callee_ty =
+    TyFunc
+      {
+        params = [ ty_channel_int ];
+        return = ty_recv_attempt_mono_int;
+        is_pure = false;
+      }
+  in
+  let e =
+    mk
+      (CCall
+         ( CKBuiltin "blorp_channel_try_recv_attempt",
+           cvar "blorp_channel_try_recv_attempt" callee_ty,
+           [ cvar "ch" ty_channel_int ] ))
+      ty_recv_attempt_mono_int
+  in
+  Blorp.Core_emit.emit_expr ctx e;
+  let output = Buffer.contents ctx.output in
+  Alcotest.(check bool)
+    "uses status raw runtime" true
+    (contains_sub output "blorp_channel_try_recv_status_raw");
+  Alcotest.(check bool)
+    "does not pass release mask to unmanaged concrete constructor" false
+    (contains_sub output ", 0UL)");
+  Alcotest.(check bool)
+    "does not fall back to raw attempt runtime" false
+    (contains_sub output "blorp_channel_try_recv_attempt(")
+
+let test_emit_channel_recv_timeout_attempt_uses_channel_elem_type () =
+  let ctx = Blorp.Core_emit_context.create () in
+  register_recv_attempt_constructors ctx;
+  let callee_ty =
+    TyFunc
+      {
+        params = [ ty_channel_int; ty_int ];
+        return = ty_recv_attempt_mono_int;
+        is_pure = false;
+      }
+  in
+  let e =
+    mk
+      (CCall
+         ( CKBuiltin "blorp_channel_recv_timeout_attempt",
+           cvar "blorp_channel_recv_timeout_attempt" callee_ty,
+           [ cvar "ch" ty_channel_int; cint 5 ] ))
+      ty_recv_attempt_mono_int
+  in
+  Blorp.Core_emit.emit_expr ctx e;
+  let output = Buffer.contents ctx.output in
+  Alcotest.(check bool)
+    "uses timeout status raw runtime" true
+    (contains_sub output "blorp_channel_recv_timeout_status_raw");
+  Alcotest.(check bool)
+    "does not pass release mask to unmanaged concrete constructor" false
+    (contains_sub output ", 0UL)");
+  Alcotest.(check bool)
+    "does not fall back to raw timeout attempt runtime" false
+    (contains_sub output "blorp_channel_recv_timeout_attempt(")
 
 let test_emit_union_constructor_sized_int_uses_stack_option () =
   (* Sized-int payloads use the primitive stack Option ABI, not the generic
@@ -2334,13 +2437,17 @@ let test_emit_global_var_string_literal_deferred () =
   let prog = [ { cd_desc = CDVar v; cd_loc = loc; cd_doc = None } ] in
   let output = emit_program_to_string prog in
   Alcotest.(check bool)
-    "has static string decl" true
-    (contains_sub output "static blorp_String* GREETING;");
+    "has static string object" true
+    (contains_sub output
+       "static struct { blorp_Object header; long len; long capacity; char \
+        data[6]; } __blorp_static_string_GREETING =");
   Alcotest.(check bool)
-    "has deferred string assignment" true
-    (contains_sub output "GREETING = ");
+    "has static string pointer" true
+    (contains_sub output
+       "static blorp_String* GREETING = \
+        (blorp_String*)&__blorp_static_string_GREETING;");
   Alcotest.(check bool)
-    "assignment constructs string literal" true
+    "does not construct literal at startup" false
     (contains_sub output "blorp_string_literal_len(\"hello\", 5L)")
 
 let test_escape_nul_string_literal_keeps_explicit_length () =
@@ -2362,7 +2469,12 @@ let test_escape_nul_string_literal_keeps_explicit_length () =
   let output = emit_program_to_string prog in
   Alcotest.(check bool)
     "literal includes explicit byte length" true
-    (contains_sub output "blorp_string_literal_len(\"a\\000b\", 3L)")
+    (contains_sub output
+       "static struct { blorp_Object header; long len; long capacity; char \
+        data[4]; } __blorp_static_string_NUL_TEXT =");
+  Alcotest.(check bool)
+    "static literal stores byte length not strlen" true
+    (contains_sub output "3L,\n    3L,\n    \"a\\000b\"")
 
 let test_emit_global_managed_dict_constant_immortalized () =
   let v : core_var =
@@ -5843,6 +5955,10 @@ let suite =
       [
         Alcotest.test_case "no_args" `Quick test_emit_call_no_args;
         Alcotest.test_case "with_args" `Quick test_emit_call_with_args;
+        Alcotest.test_case "channel_try_recv_attempt_mono_result" `Quick
+          test_emit_channel_try_recv_attempt_uses_channel_elem_type;
+        Alcotest.test_case "channel_recv_timeout_attempt_mono_result" `Quick
+          test_emit_channel_recv_timeout_attempt_uses_channel_elem_type;
         Alcotest.test_case "ctor_sized_int_stack" `Quick
           test_emit_union_constructor_sized_int_uses_stack_option;
         Alcotest.test_case "ctor_int_mask" `Quick

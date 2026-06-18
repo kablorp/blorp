@@ -97,6 +97,10 @@ let test_imported_call_metadata () =
 let test_builtin_call_classification () =
   check_opt "builtin to_string" (Some I.BuiltinToString)
     (I.builtin_call_of_source_name I.Source.to_string);
+  check_opt "builtin to_float32" (Some I.BuiltinToFloat32)
+    (I.builtin_call_of_source_name I.Source.to_float32);
+  check_opt "builtin to_float16" (Some I.BuiltinToFloat16)
+    (I.builtin_call_of_source_name I.Source.to_float16);
   check_opt "builtin length" (Some I.BuiltinLength)
     (I.builtin_call_of_source_name I.Source.length);
   check_opt "builtin get" (Some I.BuiltinGet)

@@ -84,6 +84,8 @@ module Source = struct
   let to_option = "to_option"
   let to_result = "to_result"
   let to_string = "to_string"
+  let to_float32 = "to_float32"
+  let to_float16 = "to_float16"
   let take_left = "take_left"
   let trim = "trim"
   let trim_left = "trim_left"
@@ -96,6 +98,8 @@ type imported_module = List | Dict | Matrix | Option | Result | String
 
 type builtin_call =
   | BuiltinToString
+  | BuiltinToFloat32
+  | BuiltinToFloat16
   | BuiltinLength
   | BuiltinGet
   | BuiltinCheckedGet
@@ -342,6 +346,8 @@ let imported_call_of_source ~module_path ~source_name =
 
 let builtin_call_of_source_name source_name =
   if String.equal source_name Source.to_string then Some BuiltinToString
+  else if String.equal source_name Source.to_float32 then Some BuiltinToFloat32
+  else if String.equal source_name Source.to_float16 then Some BuiltinToFloat16
   else if String.equal source_name Source.checked_get then
     Some BuiltinCheckedGet
   else if String.equal source_name Source.tensor_peel then

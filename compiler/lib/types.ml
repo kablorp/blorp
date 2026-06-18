@@ -223,6 +223,13 @@ let global_abi_type_names =
   ]
 
 let is_global_abi_type_name name = List.mem name global_abi_type_names
+
+let runtime_erased_payload_union_type_names =
+  [ "RecvAttempt"; "std/channel::RecvAttempt"; "std_channel__RecvAttempt" ]
+
+let is_runtime_erased_payload_union_type_name name =
+  List.mem name runtime_erased_payload_union_type_names
+
 let canonical_module_type_separator = "::"
 
 let canonical_module_type_name ~(module_path : string) (type_name : string) :

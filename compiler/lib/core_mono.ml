@@ -409,6 +409,17 @@ let mangle_name (func_name : string) (subst : mono_subst) : string option =
     Some (func_name ^ "__mono_" ^ String.concat "_" encoded)
   else None
 
+let generic_data_mono_separator = "__mono_"
+
+let concrete_generic_data_name (source_name : string)
+    (args : Ast.type_expr list) : string option =
+  let encoded = List.filter_map encode_type args in
+  if List.length encoded = List.length args then
+    Some
+      (Codegen_names.sanitize_c_ident
+         (source_name ^ generic_data_mono_separator ^ String.concat "_" encoded))
+  else None
+
 (* ============================================================================
    Core tree type substitution
    ============================================================================ *)
@@ -597,14 +608,22 @@ type mono_state = {
   generic_bodies : (string, core_func) Hashtbl.t;
   generic_bodies_by_id : (int, core_func) Hashtbl.t;
   ambiguous_generic_body_ids : (int, unit) Hashtbl.t;
+  generic_records : (string, Ast.record_decl) Hashtbl.t;
+  generic_types : (string, Ast.type_decl) Hashtbl.t;
   generic_impls_by_method : (string, core_impl list) Hashtbl.t;
   generic_impls_by_trait : (string, core_impl list) Hashtbl.t;
   generated : (string, unit) Hashtbl.t;
   generated_impls : (string, unit) Hashtbl.t;
+  generated_record_names : (string, unit) Hashtbl.t;
+  in_progress_record_names : (string, unit) Hashtbl.t;
+  generated_type_names : (string, unit) Hashtbl.t;
+  in_progress_type_names : (string, unit) Hashtbl.t;
   mutable worklist : (string * mono_subst) list;
   mutable impl_worklist : (core_impl * mono_subst) list;
   mutable specialized : core_decl list;
   mutable specialized_impls : core_decl list;
+  mutable specialized_records : core_decl list;
+  mutable specialized_types : core_decl list;
   import_aliases : (string, string * string) Hashtbl.t;
   module_imports : (string, (string, string * string) Hashtbl.t) Hashtbl.t;
   mutable option_fusion_counter : int;
@@ -620,14 +639,22 @@ let create_state ~reg ~import_aliases ?(module_imports = Hashtbl.create 0) () =
     generic_bodies = Hashtbl.create 16;
     generic_bodies_by_id = Hashtbl.create 16;
     ambiguous_generic_body_ids = Hashtbl.create 8;
+    generic_records = Hashtbl.create 16;
+    generic_types = Hashtbl.create 16;
     generic_impls_by_method = Hashtbl.create 16;
     generic_impls_by_trait = Hashtbl.create 16;
     generated = Hashtbl.create 64;
     generated_impls = Hashtbl.create 64;
+    generated_record_names = Hashtbl.create 32;
+    in_progress_record_names = Hashtbl.create 8;
+    generated_type_names = Hashtbl.create 32;
+    in_progress_type_names = Hashtbl.create 8;
     worklist = [];
     impl_worklist = [];
     specialized = [];
     specialized_impls = [];
+    specialized_records = [];
+    specialized_types = [];
     import_aliases;
     module_imports;
     option_fusion_counter = 0;
@@ -905,6 +932,16 @@ let collect_generic_bodies (state : mono_state) (prog : core_program) : unit =
         if Codegen_types.has_type_vars i.ci_for_type then add_generic_impl i
         else remember_concrete_impl i;
         walk rest
+    | { cd_desc = CDRecord r; _ } :: rest ->
+        if r.record_type_params <> [] && not r.record_is_builtin then
+          Hashtbl.replace state.generic_records r.record_name r;
+        walk rest
+    | { cd_desc = CDType t; _ } :: rest ->
+        if
+          t.type_params <> [] && (not t.type_is_builtin) && (not t.type_is_enum)
+          && not (Types.is_global_abi_type_name t.type_name)
+        then Hashtbl.replace state.generic_types t.type_name t;
+        walk rest
     | { cd_desc = CDPrivate inner; _ } :: rest ->
         walk [ inner ];
         walk rest
@@ -912,6 +949,170 @@ let collect_generic_bodies (state : mono_state) (prog : core_program) : unit =
     | [] -> ()
   in
   walk prog
+
+let register_concrete_record_type (state : mono_state)
+    (record_decl : Ast.record_decl) : unit =
+  if record_decl.record_is_builtin then ()
+  else if record_decl.record_is_value then
+    Hashtbl.replace state.reg.value_records record_decl.record_name ()
+  else
+    Codegen_types.register_heap_record_type state.reg record_decl.record_name
+      ~destructor:
+        (Core_layout_type.record_destructor_policy ~reg:state.reg record_decl)
+
+let register_concrete_union_type ?payload_storage (state : mono_state)
+    (type_decl : Ast.type_decl) : unit =
+  if type_decl.type_is_builtin then ()
+  else if type_decl.type_is_enum then
+    Codegen_types.register_enum_type state.reg type_decl.type_name
+      type_decl.type_variants
+  else begin
+    Codegen_types.register_union_variants state.reg type_decl.type_name
+      type_decl.type_variants;
+    Codegen_types.register_union_type ?payload_storage state.reg
+      type_decl.type_name
+      ~destructor:
+        (Core_layout_type.union_destructor_policy ?payload_storage
+           ~reg:state.reg type_decl)
+  end
+
+let concrete_type_args params args =
+  List.length params = List.length args
+  && args <> []
+  && List.for_all (fun arg -> not (Codegen_types.has_type_vars arg)) args
+
+let type_param_subst params args =
+  List.map2
+    (fun param arg -> (param, SubstType arg))
+    (Ast.type_param_names params)
+    args
+
+let monomorphize_generic_data (state : mono_state) (prog : core_program) :
+    core_program =
+  let has_generic_data =
+    Hashtbl.length state.generic_records > 0
+    || Hashtbl.length state.generic_types > 0
+  in
+  if not has_generic_data then prog
+  else
+    let rec rewrite_type ty =
+      match Codegen_types.normalize_type ty with
+      | Ast.TyNamed (name, args) -> (
+          let args = List.map rewrite_type args in
+          match Hashtbl.find_opt state.generic_records name with
+          | Some record_decl
+            when concrete_type_args record_decl.record_type_params args -> (
+              match concrete_generic_data_name name args with
+              | Some concrete_name ->
+                  ensure_concrete_record record_decl concrete_name args;
+                  Ast.TyNamed (concrete_name, [])
+              | None -> Ast.TyNamed (name, args))
+          | _ -> (
+              match Hashtbl.find_opt state.generic_types name with
+              | Some type_decl
+                when concrete_type_args type_decl.type_params args -> (
+                  match concrete_generic_data_name name args with
+                  | Some concrete_name ->
+                      ensure_concrete_type type_decl concrete_name args;
+                      Ast.TyNamed (concrete_name, [])
+                  | None -> Ast.TyNamed (name, args))
+              | _ -> Ast.TyNamed (name, args)))
+      | Ast.TyArray (elem, dims) ->
+          Ast.TyArray (rewrite_type elem, List.map rewrite_type dims)
+      | Ast.TyFunc f ->
+          Ast.TyFunc
+            {
+              f with
+              params = List.map rewrite_type f.params;
+              return = rewrite_type f.return;
+            }
+      | Ast.TyTuple elems -> Ast.TyTuple (List.map rewrite_type elems)
+      | Ast.TyRange inner -> Ast.TyRange (rewrite_type inner)
+      | Ast.TyDimOp (op, a, b) ->
+          Ast.TyDimOp (op, rewrite_type a, rewrite_type b)
+      | other -> other
+    and ensure_concrete_record record_decl concrete_name args =
+      if Hashtbl.mem state.generated_record_names concrete_name then ()
+      else if Hashtbl.mem state.in_progress_record_names concrete_name then ()
+      else begin
+        Hashtbl.replace state.in_progress_record_names concrete_name ();
+        let subst = type_param_subst record_decl.record_type_params args in
+        let concrete_fields =
+          List.map
+            (fun (field : Ast.field_decl) ->
+              {
+                field with
+                field_type = rewrite_type (apply_subst subst field.field_type);
+              })
+            record_decl.record_fields
+        in
+        let concrete_record =
+          {
+            record_decl with
+            record_name = concrete_name;
+            record_type_params = [];
+            record_fields = concrete_fields;
+          }
+        in
+        Hashtbl.remove state.in_progress_record_names concrete_name;
+        Hashtbl.replace state.generated_record_names concrete_name ();
+        register_concrete_record_type state concrete_record;
+        state.specialized_records <-
+          {
+            cd_desc = CDRecord concrete_record;
+            cd_loc = Ast.dummy_loc;
+            cd_doc = None;
+          }
+          :: state.specialized_records
+      end
+    and ensure_concrete_type type_decl concrete_name args =
+      if Hashtbl.mem state.generated_type_names concrete_name then ()
+      else if Hashtbl.mem state.in_progress_type_names concrete_name then ()
+      else begin
+        Hashtbl.replace state.in_progress_type_names concrete_name ();
+        let subst = type_param_subst type_decl.type_params args in
+        let concrete_variants =
+          List.map
+            (fun (variant : Ast.variant) ->
+              {
+                variant with
+                variant_fields =
+                  List.map
+                    (fun field_ty -> rewrite_type (apply_subst subst field_ty))
+                    variant.variant_fields;
+                variant_def_id = Some (Session.mint_def_id (Session.current ()));
+              })
+            type_decl.type_variants
+        in
+        let concrete_type =
+          {
+            type_decl with
+            type_name = concrete_name;
+            type_params = [];
+            type_variants = concrete_variants;
+          }
+        in
+        Hashtbl.remove state.in_progress_type_names concrete_name;
+        Hashtbl.replace state.generated_type_names concrete_name ();
+        let payload_storage =
+          if Types.is_runtime_erased_payload_union_type_name type_decl.type_name
+          then Codegen_types.ErasedUnionPayloadStorage
+          else Codegen_types.TypedUnionPayloadStorage
+        in
+        register_concrete_union_type ~payload_storage state concrete_type;
+        state.specialized_types <-
+          {
+            cd_desc = CDType concrete_type;
+            cd_loc = Ast.dummy_loc;
+            cd_doc = None;
+          }
+          :: state.specialized_types
+      end
+    in
+    let rewritten = Core.map_types_in_program rewrite_type prog in
+    rewritten
+    @ List.rev state.specialized_records
+    @ List.rev state.specialized_types
 
 let try_enqueue (state : mono_state) (func_name : string) (subst : mono_subst) :
     string option =
@@ -2108,16 +2309,31 @@ let monomorphize_program ?(reg = Codegen_types.create_registry ())
   let state = create_state ~reg ~import_aliases ~module_imports () in
   let loc = Ast.dummy_loc in
   collect_generic_bodies state prog;
+  let prog =
+    if
+      Hashtbl.length state.generic_bodies = 0
+      && Hashtbl.length state.generic_impls_by_method = 0
+    then prog
+    else begin
+      let prog = List.map (rewrite_decl state) prog in
+      drain_worklist state loc;
+      let final =
+        prog @ List.rev state.specialized @ List.rev state.specialized_impls
+      in
+      check_unrewritten_generic_calls state final;
+      final
+    end
+  in
   if
-    Hashtbl.length state.generic_bodies = 0
-    && Hashtbl.length state.generic_impls_by_method = 0
+    Hashtbl.length state.generic_records = 0
+    && Hashtbl.length state.generic_types = 0
   then prog
   else begin
-    let prog = List.map (rewrite_decl state) prog in
-    drain_worklist state loc;
-    let final =
-      prog @ List.rev state.specialized @ List.rev state.specialized_impls
-    in
-    check_unrewritten_generic_calls state final;
-    final
+    state.specialized_records <- [];
+    state.specialized_types <- [];
+    Hashtbl.clear state.generated_record_names;
+    Hashtbl.clear state.in_progress_record_names;
+    Hashtbl.clear state.generated_type_names;
+    Hashtbl.clear state.in_progress_type_names;
+    monomorphize_generic_data state prog
   end

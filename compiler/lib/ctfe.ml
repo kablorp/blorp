@@ -92,6 +92,36 @@ let collect_var_materialized_lambda_references refs var =
 let var_initializer_runs_at_runtime var =
   var.Ast.var_is_mutable || not var.Ast.var_is_const
 
+let unavailable_global_reason_for_var var =
+  if var_initializer_runs_at_runtime var then RuntimeInitializedGlobal
+  else LaterGlobal
+
+let bind_unavailable_global_var env var =
+  match var.Ast.var_name with
+  | None -> env
+  | Some name ->
+      bind_unavailable_global (unavailable_global_reason_for_var var) name env
+
+let bind_unavailable_decl_globals env decl =
+  match Typed_ast.decl_view decl with
+  | Typed_ast.DeclVar var ->
+      bind_unavailable_global_var env (Typed_ast.var_ast var)
+  | Typed_ast.DeclPrivate inner -> (
+      match Typed_ast.decl_view inner with
+      | Typed_ast.DeclVar var ->
+          bind_unavailable_global_var env (Typed_ast.var_ast var)
+      | Typed_ast.DeclFunction _ | Typed_ast.DeclRecord _
+      | Typed_ast.DeclTypeAlias _ | Typed_ast.DeclImpl _
+      | Typed_ast.DeclPrivate _ | Typed_ast.DeclOther ->
+          env)
+  | Typed_ast.DeclFunction _ | Typed_ast.DeclRecord _
+  | Typed_ast.DeclTypeAlias _ | Typed_ast.DeclImpl _ | Typed_ast.DeclOther ->
+      env
+
+let bind_unavailable_program_globals env program =
+  List.fold_left bind_unavailable_decl_globals env
+    (Typed_ast.program_decls program)
+
 let collect_trait_method_references refs method_ =
   match method_.Ast.method_default_body with
   | Some body -> collect_expr_references refs body
@@ -927,7 +957,8 @@ let evaluate_global_var_decl ctx env ~private_ ~loc ?doc ?module_alias
           with
           | Error err -> translate_error err
           | Ok init -> (
-              match eval_ir ctx env init with
+              let eval_env = bind_unavailable_global CurrentGlobal name env in
+              match eval_ir ctx eval_env init with
               | Error _ as err -> err
               | Ok value ->
                   if materialize then
@@ -972,7 +1003,9 @@ let evaluate_module_global_env ctx (program : Typed_ast.program) =
           ->
             loop env rest)
   in
-  loop [] (Typed_ast.program_decls program)
+  loop
+    (bind_unavailable_program_globals [] program)
+    (Typed_ast.program_decls program)
 
 let build_module_global_envs ctx imported_programs =
   let rec loop acc = function
@@ -992,6 +1025,13 @@ let bind_imported_global ctx env (binding : Session.import_binding) =
           ~name:original_name
       with
       | Some value -> bind_global_value binding.local_name value env
+      | None
+        when Ctfe_context.module_has_global_binding ctx
+               ~module_path:binding.module_path ~name:original_name ->
+          bind_unavailable_global
+            (ImportedRuntimeInitializedGlobal
+               { module_path = binding.module_path; original_name })
+            binding.local_name env
       | None -> env)
 
 let imported_global_env ctx import_bindings =
@@ -1007,7 +1047,10 @@ let evaluate_program ?(constructor_info = fun _ -> None) ?(import_bindings = [])
   in
   build_module_global_envs ctx imported_programs >>= fun module_global_envs ->
   let ctx = Ctfe_context.with_module_global_envs ctx module_global_envs in
-  let initial_env = imported_global_env ctx import_bindings in
+  let initial_env =
+    imported_global_env ctx import_bindings |> fun env ->
+    bind_unavailable_program_globals env program
+  in
   let runtime_refs = conservative_runtime_reference_names program in
   let rec loop env acc = function
     | [] ->

@@ -717,14 +717,29 @@ let record_destructor_policy ?(phase = Core_error.Other "layout_type") ~reg r =
     Codegen_types.GeneratedDestructor (generated_destructor_name r.record_name)
   else Codegen_types.ArcReleaseOnly
 
-let union_destructor_policy ?(phase = Core_error.Other "layout_type") ~reg t =
+let union_field_requires_destructor_release
+    ?(phase = Core_error.Other "layout_type") ~reg payload_storage field_ty loc
+    =
+  match payload_storage with
+  | Codegen_types.TypedUnionPayloadStorage ->
+      source_value_requires_release_or_error ~phase ~reg field_ty loc
+  | Codegen_types.ErasedUnionPayloadStorage ->
+      boxed_storage_requires_release_or_error ~phase ~reg field_ty loc
+
+let union_destructor_policy ?(phase = Core_error.Other "layout_type")
+    ?payload_storage ~reg t =
+  let payload_storage =
+    match payload_storage with
+    | Some storage -> storage
+    | None -> Codegen_types.union_payload_storage reg t.Ast.type_name
+  in
   let needs_destructor =
     List.exists
       (fun (v : Ast.variant) ->
         List.exists
           (fun field_ty ->
-            boxed_storage_requires_release_or_error ~phase ~reg field_ty
-              v.variant_loc)
+            union_field_requires_destructor_release ~phase ~reg payload_storage
+              field_ty v.variant_loc)
           v.variant_fields)
       t.Ast.type_variants
   in
