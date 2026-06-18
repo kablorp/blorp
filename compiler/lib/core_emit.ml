@@ -1519,6 +1519,44 @@ and emit_boxed_storage (ctx : Core_emit_context.t) (value : boxed_storage_value)
     : unit =
   emit_box_op ctx value.bsv_box
 
+and render_expr_arg ctx value =
+  Core_emit_blorp_template.render_arg ~emit_expr ctx value
+
+and render_stmt_arg ctx value =
+  Core_emit_blorp_template.render_arg ~emit_expr:emit_stmt ctx value
+
+and render_boxed_arg ctx value =
+  Core_emit_blorp_template.render_arg ~emit_expr:emit_boxed ctx value
+
+and render_boxed_storage_arg ctx value =
+  Core_emit_blorp_template.render_arg ~emit_expr:emit_boxed_storage ctx value
+
+and emit_prepared_emit_json ctx json =
+  emit_blorp_backend ctx (PreparedEmitJson json)
+
+and constructor_argument_list args = String.concat ", " args
+
+and constructor_mask_arg = function
+  | Some mask -> [ Printf.sprintf "%dUL" mask ]
+  | None -> []
+
+and render_tuple_args ctx elems =
+  elems
+  |> List.map (fun value ->
+      Core_emit_blorp_backend.render_tuple_arg
+        (render_boxed_storage_arg ctx value))
+  |> String.concat ""
+
+and render_tuple_retain_statements ~tuple_tmp ~retain_mask elems =
+  elems
+  |> List.mapi (fun i _ ->
+      if retain_mask land (1 lsl i) <> 0 then
+        Some
+          (Core_emit_blorp_backend.render_tuple_retain_elem ~tuple:tuple_tmp
+             ~index:i)
+      else None)
+  |> List.filter_map Fun.id |> String.concat " "
+
 and emit_unbox_op (ctx : Core_emit_context.t) (u : unbox_op) : unit =
   let c_ty = type_to_c ctx u.unbox_target_ty in
   match (u.unbox_kind, u.unbox_value.desc) with
@@ -1610,24 +1648,42 @@ and emit_set_alloc ctx loc kind =
   emit_blorp_backend ctx
     (Core_emit_blorp_backend.SetAlloc (set_ctor_for_kind ctx loc kind))
 
-and emit_tuple_construct ctx tc = emit_blorp_backend ctx (TupleConstruct tc)
+and emit_tuple_construct ctx tc =
+  let arity = string_of_int (List.length tc.tc_elems) in
+  let args = render_tuple_args ctx tc.tc_elems in
+  if tc.tc_release_mask = 0 then
+    emit_prepared_emit_json ctx
+      (Core_emit_blorp_backend.tuple_construct_json ~arity ~args)
+  else
+    let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+    let tuple = Core_emit_blorp_backend.render_tuple_name temp_seed in
+    let retain_statements =
+      render_tuple_retain_statements ~tuple_tmp:tuple
+        ~retain_mask:tc.tc_retain_mask tc.tc_elems
+    in
+    emit_prepared_emit_json ctx
+      (Core_emit_blorp_backend.tuple_construct_with_rc_json ~tuple ~arity ~args
+         ~retain_statements
+         ~release_mask:(string_of_int tc.tc_release_mask))
+
 and emit_list_construct ctx lc = emit_blorp_backend ctx (ListConstruct lc)
 
 and emit_record_construct ctx rc =
-  emit ctx (Printf.sprintf "%s_make(" rc.rc_type_name);
-  List.iteri
-    (fun i field ->
-      if i > 0 then emit ctx ", ";
-      match field with
-      | RecordRawField (_, value) -> emit_expr ctx value
-      | RecordErasedField (_, value) -> emit_boxed_storage ctx value)
-    rc.rc_fields;
-  (match rc.rc_erased_release_mask with
-  | Some mask ->
-      if rc.rc_fields <> [] then emit ctx ", ";
-      emit ctx (Printf.sprintf "%dUL" mask)
-  | None -> ());
-  emit ctx ")"
+  let field_args =
+    List.map
+      (function
+        | RecordRawField (_, value) -> render_expr_arg ctx value
+        | RecordErasedField (_, value) -> render_boxed_storage_arg ctx value)
+      rc.rc_fields
+  in
+  let argument_list =
+    constructor_argument_list
+      (field_args @ constructor_mask_arg rc.rc_erased_release_mask)
+  in
+  emit_prepared_emit_json ctx
+    (Core_emit_blorp_backend.constructor_call_json
+       ~callee:(Printf.sprintf "%s_make" rc.rc_type_name)
+       ~argument_list)
 
 and emit_tensor_literal ctx loc tl =
   emit_blorp_backend ctx (TensorLiteral { loc; literal = tl })
@@ -1643,26 +1699,22 @@ and emit_union_construct ctx uc =
         Some (Core_layout_type.option_constructor_abi_of_layout layout)
     | GenericUnion | ResultUnion _ -> None
   in
-  let emit_nullable_managed_payload arg =
+  let render_nullable_managed_payload arg =
     match normalize_type arg.bsv_box.box_source_ty with
-    | Ast.TyFunc _ -> emit_boxed ctx arg.bsv_box.box_value
-    | _ -> emit_expr ctx arg.bsv_box.box_value
+    | Ast.TyFunc _ -> render_boxed_arg ctx arg.bsv_box.box_value
+    | _ -> render_expr_arg ctx arg.bsv_box.box_value
   in
   match (uc.uc_representation, uc.uc_args) with
   | ResultUnion result_layout, [ arg ] ->
       let abi =
         Core_layout_type.stack_result_constructor_abi_of_layout result_layout
       in
-      emit_blorp_backend ctx
-        (Core_emit_blorp_backend.StackResultConstruct
-           (Core_emit_blorp_backend.StackResultTaggedPayload
-              {
-                result_type = abi.src_result_c_type;
-                tag = uc.uc_tag;
-                field = uc.uc_constructor_name;
-                payload = arg;
-                release_mask = uc.uc_release_mask;
-              }))
+      emit_prepared_emit_json ctx
+        (Core_emit_blorp_backend.stack_result_payload_json
+           ~result_type:abi.src_result_c_type ~tag:(string_of_int uc.uc_tag)
+           ~field:uc.uc_constructor_name
+           ~payload:(render_boxed_storage_arg ctx arg)
+           ~release_mask:(string_of_int uc.uc_release_mask))
   | ResultUnion _, _ ->
       Core_error.errorf Core_error.Emit Ast.dummy_loc
         ~hint:"stack Result constructors are represented as tag + one payload"
@@ -1670,9 +1722,12 @@ and emit_union_construct ctx uc =
   | _ -> (
       match (option_constructor_abi, uc.uc_args) with
       | Some Core_layout_type.OptionConstructorNullableManaged, [] ->
-          emit ctx "NULL"
+          emit_prepared_emit_json ctx
+            (Core_emit_blorp_backend.constructor_nullable_none_json ())
       | Some Core_layout_type.OptionConstructorNullableManaged, [ arg ] ->
-          emit_nullable_managed_payload arg
+          emit_prepared_emit_json ctx
+            (Core_emit_blorp_backend.constructor_nullable_payload_json
+               ~payload:(render_nullable_managed_payload arg))
       | Some Core_layout_type.OptionConstructorNullableManaged, _ ->
           Core_error.errorf Core_error.Emit Ast.dummy_loc
             ~hint:
@@ -1681,33 +1736,21 @@ and emit_union_construct ctx uc =
             "invalid nullable managed Option constructor arity for %s"
             uc.uc_constructor_name
       | Some (Core_layout_type.OptionConstructorStackInline abi), [] ->
-          emit_blorp_backend ctx
-            (Core_emit_blorp_backend.StackOptionConstruct
-               (Core_emit_blorp_backend.StackOptionTaggedNone
-                  {
-                    option_type = abi.soe_c_type;
-                    tag = uc.uc_tag;
-                    none_value = abi.soe_none_value;
-                  }))
+          emit_prepared_emit_json ctx
+            (Core_emit_blorp_backend.stack_option_none_json
+               ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
+               ~none_value:abi.soe_none_value)
       | Some (Core_layout_type.OptionConstructorStackInline abi), [ arg ]
         when is_void_ty arg.bsv_box.box_value.ty ->
-          emit_blorp_backend ctx
-            (Core_emit_blorp_backend.StackOptionConstruct
-               (Core_emit_blorp_backend.StackOptionTaggedVoidStatement
-                  {
-                    option_type = abi.soe_c_type;
-                    tag = uc.uc_tag;
-                    statement = arg.bsv_box.box_value;
-                  }))
+          emit_prepared_emit_json ctx
+            (Core_emit_blorp_backend.stack_option_void_statement_json
+               ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
+               ~statement:(render_stmt_arg ctx arg.bsv_box.box_value))
       | Some (Core_layout_type.OptionConstructorStackInline abi), [ arg ] ->
-          emit_blorp_backend ctx
-            (Core_emit_blorp_backend.StackOptionConstruct
-               (Core_emit_blorp_backend.StackOptionTaggedValue
-                  {
-                    option_type = abi.soe_c_type;
-                    tag = uc.uc_tag;
-                    value = arg.bsv_box.box_value;
-                  }))
+          emit_prepared_emit_json ctx
+            (Core_emit_blorp_backend.stack_option_value_json
+               ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
+               ~value:(render_expr_arg ctx arg.bsv_box.box_value))
       | Some (Core_layout_type.OptionConstructorStackInline _), _ ->
           Core_error.errorf Core_error.Emit Ast.dummy_loc
             ~hint:
@@ -1723,24 +1766,24 @@ and emit_union_construct ctx uc =
             "unsupported Option constructor layout for %s: %s"
             uc.uc_constructor_name reason
       | (Some Core_layout_type.OptionConstructorBoxedUnion | None), [] ->
-          emit ctx (escape_c_ident uc.uc_c_name)
+          emit_prepared_emit_json ctx
+            (Core_emit_blorp_backend.constructor_symbol_json
+               ~name:(escape_c_ident uc.uc_c_name))
       | (Some Core_layout_type.OptionConstructorBoxedUnion | None), args ->
           let needs_release_mask =
             union_constructor_needs_release_mask ctx uc.uc_type_name
               uc.uc_constructor_name
           in
-          emit ctx uc.uc_c_name;
-          emit ctx "(";
-          List.iteri
-            (fun i arg ->
-              if i > 0 then emit ctx ", ";
-              emit_boxed_storage ctx arg)
-            args;
-          if needs_release_mask then begin
-            if args <> [] then emit ctx ", ";
-            emit ctx (Printf.sprintf "%dUL" uc.uc_release_mask)
-          end;
-          emit ctx ")")
+          let arg_strings = List.map (render_boxed_storage_arg ctx) args in
+          let release_args =
+            if needs_release_mask then
+              [ Printf.sprintf "%dUL" uc.uc_release_mask ]
+            else []
+          in
+          emit_prepared_emit_json ctx
+            (Core_emit_blorp_backend.constructor_call_json ~callee:uc.uc_c_name
+               ~argument_list:
+                 (constructor_argument_list (arg_strings @ release_args))))
 
 and emit_union_reuse_construct ctx urc =
   match urc.urc_representation with
@@ -1749,17 +1792,19 @@ and emit_union_reuse_construct ctx urc =
         union_constructor_needs_release_mask ctx urc.urc_type_name
           urc.urc_constructor_name
       in
-      emit ctx urc.urc_reuse_c_name;
-      emit ctx "(";
-      emit_expr ctx urc.urc_source;
-      List.iter
-        (fun arg ->
-          emit ctx ", ";
-          emit_boxed_storage ctx arg)
-        urc.urc_args;
-      if needs_release_mask then
-        emit ctx (Printf.sprintf ", %dUL" urc.urc_release_mask);
-      emit ctx ")"
+      let source_arg = render_expr_arg ctx urc.urc_source in
+      let arg_strings = List.map (render_boxed_storage_arg ctx) urc.urc_args in
+      let release_args =
+        if needs_release_mask then
+          [ Printf.sprintf "%dUL" urc.urc_release_mask ]
+        else []
+      in
+      emit_prepared_emit_json ctx
+        (Core_emit_blorp_backend.constructor_call_json
+           ~callee:urc.urc_reuse_c_name
+           ~argument_list:
+             (constructor_argument_list
+                ((source_arg :: arg_strings) @ release_args)))
   | OptionUnion _ | ResultUnion _ ->
       Core_error.errorf Core_error.Emit Ast.dummy_loc
         ~hint:"union reuse is only supported for heap-allocated generic unions"
@@ -2667,15 +2712,17 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           in
           let try_emit_stack_option_ctor () =
             let emit_some c_ty arg =
-              let constructor =
+              let json =
                 if is_void_ty arg.ty then
-                  Core_emit_blorp_backend.StackOptionSomeVoidStatement
-                    { option_type = c_ty; statement = arg }
+                  Core_emit_blorp_backend.stack_option_void_statement_json
+                    ~option_type:c_ty ~tag:"BLORP_TAG_SOME"
+                    ~statement:(render_stmt_arg ctx arg)
                 else
-                  Core_emit_blorp_backend.StackOptionSomeValue
-                    { option_type = c_ty; value = arg }
+                  Core_emit_blorp_backend.stack_option_value_json
+                    ~option_type:c_ty ~tag:"BLORP_TAG_SOME"
+                    ~value:(render_expr_arg ctx arg)
               in
-              emit_blorp_backend ctx (StackOptionConstruct constructor)
+              emit_prepared_emit_json ctx json
             in
             match
               ( kind,
@@ -2690,42 +2737,25 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 emit_some c_ty arg;
                 true
             | CKBuiltin "blorp_option_none", Some c_ty, [] ->
-                emit_blorp_backend ctx
-                  (StackOptionConstruct
-                     (Core_emit_blorp_backend.StackOptionNone
-                        {
-                          option_type = c_ty;
-                          none_value =
-                            Core_layout_type.stack_option_none_value_for_type
-                              ~reg:ctx.reg e.ty;
-                        }));
+                emit_prepared_emit_json ctx
+                  (Core_emit_blorp_backend.stack_option_none_json
+                     ~option_type:c_ty ~tag:"BLORP_TAG_NONE"
+                     ~none_value:
+                       (Core_layout_type.stack_option_none_value_for_type
+                          ~reg:ctx.reg e.ty));
                 true
             | _ -> false
           in
           let try_emit_stack_result_ctor () =
-            let result_payload_release_policy arg =
-              if boxed_value_needs_release ctx arg.ty arg.loc then
-                Core_emit_blorp_backend.ReleaseResultPayload
-              else Core_emit_blorp_backend.KeepResultPayload
+            let result_payload_release_mask arg =
+              if boxed_value_needs_release ctx arg.ty arg.loc then "1" else "0"
             in
-            let emit_stack_result_ctor constructor =
-              emit_blorp_backend ctx (StackResultConstruct constructor)
-            in
-            let stack_result_ok_payload c_ty arg =
-              Core_emit_blorp_backend.StackResultOkPayload
-                {
-                  result_type = c_ty;
-                  payload = arg;
-                  release_policy = result_payload_release_policy arg;
-                }
-            in
-            let stack_result_err_payload c_ty arg =
-              Core_emit_blorp_backend.StackResultErrPayload
-                {
-                  result_type = c_ty;
-                  payload = arg;
-                  release_policy = result_payload_release_policy arg;
-                }
+            let emit_stack_result_ctor c_ty tag field arg =
+              emit_prepared_emit_json ctx
+                (Core_emit_blorp_backend.stack_result_payload_json
+                   ~result_type:c_ty ~tag ~field
+                   ~payload:(render_boxed_arg ctx arg)
+                   ~release_mask:(result_payload_release_mask arg))
             in
             match
               ( kind,
@@ -2733,18 +2763,18 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 args )
             with
             | CKBuiltin "blorp_result_ok", Some c_ty, [ arg ] ->
-                emit_stack_result_ctor (stack_result_ok_payload c_ty arg);
+                emit_stack_result_ctor c_ty "BLORP_TAG_OK" "Ok" arg;
                 true
             | CKBuiltin "blorp_result_err", Some c_ty, [ arg ] ->
-                emit_stack_result_ctor (stack_result_err_payload c_ty arg);
+                emit_stack_result_ctor c_ty "BLORP_TAG_ERR" "Err" arg;
                 true
             | CKUser ("Ok", _), Some c_ty, [ arg ]
               when callee_is_registered_constructor "Ok" ->
-                emit_stack_result_ctor (stack_result_ok_payload c_ty arg);
+                emit_stack_result_ctor c_ty "BLORP_TAG_OK" "Ok" arg;
                 true
             | CKUser ("Err", _), Some c_ty, [ arg ]
               when callee_is_registered_constructor "Err" ->
-                emit_stack_result_ctor (stack_result_err_payload c_ty arg);
+                emit_stack_result_ctor c_ty "BLORP_TAG_ERR" "Err" arg;
                 true
             | _ -> false
           in
@@ -3924,8 +3954,17 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                   (value_record_storage_c_type ctx ty)
             | _ -> Printf.sprintf "(%s)%s" (type_to_c ctx e.ty) elem_access
           in
-          emit_blorp_backend ctx
-            (TupleFieldAccess { obj; field = name; render_read })
+          let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
+          let tuple = Core_emit_blorp_backend.render_tuple_name temp_seed in
+          let source = render_expr_arg ctx obj in
+          let element =
+            Core_emit_blorp_backend.render_tuple_field_element ~tuple
+              ~field:name
+          in
+          let read = render_read element in
+          emit_prepared_emit_json ctx
+            (Core_emit_blorp_backend.tuple_field_access_json ~tuple ~source
+               ~read)
       | TyNamed (_, _) when is_value_record_type ctx obj.ty -> (
           match value_record_layout ctx obj.ty with
           | Some layout ->

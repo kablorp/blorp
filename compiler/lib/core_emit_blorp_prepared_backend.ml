@@ -28,6 +28,125 @@ let tensor_manifest =
 let render_tensor_template = Core_emit_blorp_template.render_exn tensor_manifest
 let emit_tensor_template = Core_emit_blorp_template.emit tensor_manifest
 
+let constructor_manifest =
+  Core_emit_blorp_template.create ~label:"codegen prepared constructor"
+    Core_emit_blorp_prepared_constructor_templates.tsv
+
+let render_constructor_template =
+  Core_emit_blorp_template.render_exn constructor_manifest
+
+let tuple_manifest =
+  Core_emit_blorp_template.create ~label:"codegen prepared tuple"
+    Core_emit_blorp_prepared_tuple_templates.tsv
+
+let render_tuple_template = Core_emit_blorp_template.render_exn tuple_manifest
+
+let prepared_emit_json_error msg =
+  invalid_arg ("invalid prepared emit JSON: " ^ msg)
+
+let prepared_emit_string_field fields field =
+  match List.assoc_opt field fields with
+  | Some (Lsp_json.String value) -> value
+  | Some _ | None -> prepared_emit_json_error ("missing string field: " ^ field)
+
+let render_prepared_emit_fields fields =
+  match prepared_emit_string_field fields "op" with
+  | "constructor_call" ->
+      render_constructor_template "backend_constructor_call"
+        [
+          prepared_emit_string_field fields "callee";
+          prepared_emit_string_field fields "argument_list";
+        ]
+  | "constructor_symbol" ->
+      render_constructor_template "backend_constructor_symbol"
+        [ prepared_emit_string_field fields "name" ]
+  | "constructor_nullable_none" ->
+      render_constructor_template "backend_constructor_nullable_none" []
+  | "constructor_nullable_payload" ->
+      render_constructor_template "backend_constructor_nullable_payload"
+        [ prepared_emit_string_field fields "payload" ]
+  | "stack_option_value" ->
+      render_constructor_template "backend_constructor_stack_option_value"
+        [
+          prepared_emit_string_field fields "option_type";
+          prepared_emit_string_field fields "tag";
+          prepared_emit_string_field fields "value";
+        ]
+  | "stack_option_void_statement" ->
+      render_constructor_template
+        "backend_constructor_stack_option_void_statement"
+        [
+          prepared_emit_string_field fields "option_type";
+          prepared_emit_string_field fields "tag";
+          prepared_emit_string_field fields "statement";
+        ]
+  | "stack_option_none" ->
+      render_constructor_template "backend_constructor_stack_option_none"
+        [
+          prepared_emit_string_field fields "option_type";
+          prepared_emit_string_field fields "tag";
+          prepared_emit_string_field fields "none_value";
+        ]
+  | "stack_result_payload" ->
+      render_constructor_template "backend_constructor_stack_result_payload"
+        [
+          prepared_emit_string_field fields "result_type";
+          prepared_emit_string_field fields "tag";
+          prepared_emit_string_field fields "field";
+          prepared_emit_string_field fields "payload";
+          prepared_emit_string_field fields "release_mask";
+        ]
+  | "tuple_name" ->
+      render_tuple_template "backend_tuple_name"
+        [ prepared_emit_string_field fields "temp_seed" ]
+  | "tuple_arg" ->
+      render_tuple_template "backend_tuple_arg"
+        [ prepared_emit_string_field fields "value" ]
+  | "tuple_construct" ->
+      render_tuple_template "backend_tuple_construct"
+        [
+          prepared_emit_string_field fields "arity";
+          prepared_emit_string_field fields "args";
+        ]
+  | "tuple_retain_elem" ->
+      render_tuple_template "backend_tuple_retain_elem"
+        [
+          prepared_emit_string_field fields "tuple";
+          prepared_emit_string_field fields "index";
+        ]
+  | "tuple_construct_with_rc" ->
+      render_tuple_template "backend_tuple_construct_with_rc"
+        [
+          prepared_emit_string_field fields "tuple";
+          prepared_emit_string_field fields "arity";
+          prepared_emit_string_field fields "args";
+          prepared_emit_string_field fields "retain_statements";
+          prepared_emit_string_field fields "release_mask";
+        ]
+  | "tuple_field_element" ->
+      render_tuple_template "backend_tuple_field_element"
+        [
+          prepared_emit_string_field fields "tuple";
+          prepared_emit_string_field fields "field";
+        ]
+  | "tuple_field_access" ->
+      render_tuple_template "backend_tuple_field_access"
+        [
+          prepared_emit_string_field fields "tuple";
+          prepared_emit_string_field fields "source";
+          prepared_emit_string_field fields "read";
+        ]
+  | other -> prepared_emit_json_error ("unknown prepared emit op: " ^ other)
+
+let render_prepared_emit_json json =
+  let value =
+    try Lsp_json.parse json
+    with Lsp_json.Parse_error msg -> prepared_emit_json_error msg
+  in
+  match value with
+  | Lsp_json.Object fields -> render_prepared_emit_fields fields
+  | _ -> prepared_emit_json_error "expected object"
+
 type elem_release_arg = NoElemRelease | ElemReleaseFn
 type key_release_policy = KeepKey | ReleaseKey
 
@@ -133,45 +252,6 @@ type channel_recv_attempt =
       timeout : core;
       release_policy : channel_recv_value_release_policy;
       constructors : channel_recv_attempt_constructors;
-    }
-
-type stack_option_constructor =
-  | StackOptionSomeValue of { option_type : string; value : core }
-  | StackOptionSomeVoidStatement of { option_type : string; statement : core }
-  | StackOptionNone of { option_type : string; none_value : string }
-  | StackOptionTaggedValue of { option_type : string; tag : int; value : core }
-  | StackOptionTaggedVoidStatement of {
-      option_type : string;
-      tag : int;
-      statement : core;
-    }
-  | StackOptionTaggedNone of {
-      option_type : string;
-      tag : int;
-      none_value : string;
-    }
-
-type stack_result_payload_release_policy =
-  | KeepResultPayload
-  | ReleaseResultPayload
-
-type stack_result_constructor =
-  | StackResultOkPayload of {
-      result_type : string;
-      payload : core;
-      release_policy : stack_result_payload_release_policy;
-    }
-  | StackResultErrPayload of {
-      result_type : string;
-      payload : core;
-      release_policy : stack_result_payload_release_policy;
-    }
-  | StackResultTaggedPayload of {
-      result_type : string;
-      tag : int;
-      field : string;
-      payload : boxed_storage_value;
-      release_mask : int;
     }
 
 type list_store_runtime_template =
@@ -1306,76 +1386,6 @@ let emit_set_iter_release ctx ~set =
   Core_emit_context.emit_line ctx
     (render_template "backend_set_iter_release" [ set ])
 
-let render_tuple_name temp_seed =
-  render_template "backend_tuple_name" [ temp_seed ]
-
-let render_tuple_arg value_arg =
-  render_template "backend_tuple_arg" [ value_arg ]
-
-let render_tuple_args ~emit_boxed ctx elems =
-  elems
-  |> List.map (fun value ->
-      render_tuple_arg (render_arg ~emit_expr:emit_boxed ctx value))
-  |> String.concat ""
-
-let emit_tuple_construct ctx ~arity ~args =
-  Core_emit_context.emit ctx
-    (render_template "backend_tuple_construct" [ arity; args ])
-
-let render_tuple_retain_elem ~tuple_tmp ~index =
-  render_template "backend_tuple_retain_elem" [ tuple_tmp; string_of_int index ]
-
-let render_tuple_retain_statements ~tuple_tmp ~retain_mask elems =
-  elems
-  |> List.mapi (fun i _ ->
-      if retain_mask land (1 lsl i) <> 0 then
-        Some (render_tuple_retain_elem ~tuple_tmp ~index:i)
-      else None)
-  |> List.filter_map Fun.id |> String.concat " "
-
-let render_tuple_construct_with_rc ~tuple_tmp ~arity ~args ~retain_statements
-    ~release_mask =
-  render_template "backend_tuple_construct_with_rc"
-    [ tuple_tmp; arity; args; retain_statements; string_of_int release_mask ]
-
-let emit_tuple_construct_with_rc ctx ~tuple_tmp ~arity ~args ~retain_statements
-    ~release_mask =
-  Core_emit_context.emit ctx
-    (render_tuple_construct_with_rc ~tuple_tmp ~arity ~args ~retain_statements
-       ~release_mask)
-
-let render_tuple_field_element ~tuple_tmp ~field =
-  render_template "backend_tuple_field_element" [ tuple_tmp; field ]
-
-let render_tuple_field_element_at ~tuple_tmp ~index =
-  render_tuple_field_element ~tuple_tmp ~field:(string_of_int index)
-
-let render_tuple_field_access ~tuple_tmp ~source ~read =
-  render_template "backend_tuple_field_access" [ tuple_tmp; source; read ]
-
-let emit_tuple_field_access ~emit_expr ~render_read ctx obj field =
-  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  let tuple_tmp = render_tuple_name temp_seed in
-  let source = render_arg ~emit_expr ctx obj in
-  let element = render_tuple_field_element ~tuple_tmp ~field in
-  let read = render_read element in
-  Core_emit_context.emit ctx
-    (render_tuple_field_access ~tuple_tmp ~source ~read)
-
-let emit_tuple_construct_value ~emit_boxed ctx tc =
-  let arity = string_of_int (List.length tc.tc_elems) in
-  let args = render_tuple_args ~emit_boxed ctx tc.tc_elems in
-  if tc.tc_release_mask = 0 then emit_tuple_construct ctx ~arity ~args
-  else
-    let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-    let tuple_tmp = render_tuple_name temp_seed in
-    let retain_statements =
-      render_tuple_retain_statements ~tuple_tmp ~retain_mask:tc.tc_retain_mask
-        tc.tc_elems
-    in
-    emit_tuple_construct_with_rc ctx ~tuple_tmp ~arity ~args ~retain_statements
-      ~release_mask:tc.tc_release_mask
-
 let emit_string_find_byte_from ~emit_expr ctx source byte start =
   let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   let source_arg = render_arg ~emit_expr ctx source in
@@ -1862,58 +1872,3 @@ let emit_select_cleanup_pop ctx ~value_slot =
 let emit_select_received_value_binding ctx ~binding ~result =
   Core_emit_context.emit_line ctx
     (render_template "backend_select_received_value_binding" [ binding; result ])
-
-let render_stack_option_constructor ~emit_expr ~emit_stmt ctx = function
-  | StackOptionSomeValue { option_type; value } ->
-      render_template "backend_stack_option_some_value"
-        [ option_type; render_arg ~emit_expr ctx value ]
-  | StackOptionSomeVoidStatement { option_type; statement } ->
-      render_template "backend_stack_option_some_void_statement"
-        [ option_type; render_arg ~emit_expr:emit_stmt ctx statement ]
-  | StackOptionNone { option_type; none_value } ->
-      render_template "backend_stack_option_none" [ option_type; none_value ]
-  | StackOptionTaggedValue { option_type; tag; value } ->
-      render_template "backend_stack_option_tagged_value"
-        [ option_type; string_of_int tag; render_arg ~emit_expr ctx value ]
-  | StackOptionTaggedVoidStatement { option_type; tag; statement } ->
-      render_template "backend_stack_option_tagged_void_statement"
-        [
-          option_type;
-          string_of_int tag;
-          render_arg ~emit_expr:emit_stmt ctx statement;
-        ]
-  | StackOptionTaggedNone { option_type; tag; none_value } ->
-      render_template "backend_stack_option_tagged_none"
-        [ option_type; string_of_int tag; none_value ]
-
-let stack_result_payload_release_mask = function
-  | KeepResultPayload -> "0"
-  | ReleaseResultPayload -> "1"
-
-let render_stack_result_payload_constructor ~emit_boxed ctx template_name
-    ~result_type ~payload ~release_policy =
-  render_template template_name
-    [
-      result_type;
-      render_arg ~emit_expr:emit_boxed ctx payload;
-      stack_result_payload_release_mask release_policy;
-    ]
-
-let render_stack_result_constructor ~emit_boxed ~emit_boxed_storage ctx =
-  function
-  | StackResultOkPayload { result_type; payload; release_policy } ->
-      render_stack_result_payload_constructor ~emit_boxed ctx
-        "backend_stack_result_ok" ~result_type ~payload ~release_policy
-  | StackResultErrPayload { result_type; payload; release_policy } ->
-      render_stack_result_payload_constructor ~emit_boxed ctx
-        "backend_stack_result_err" ~result_type ~payload ~release_policy
-  | StackResultTaggedPayload { result_type; tag; field; payload; release_mask }
-    ->
-      render_template "backend_stack_result_tagged_payload"
-        [
-          result_type;
-          string_of_int tag;
-          field;
-          render_arg ~emit_expr:emit_boxed_storage ctx payload;
-          string_of_int release_mask;
-        ]

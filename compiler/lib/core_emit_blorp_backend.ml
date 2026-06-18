@@ -171,55 +171,101 @@ type channel_recv_attempt =
       constructors : channel_recv_attempt_constructors;
     }
 
-type stack_option_constructor =
-      Core_emit_blorp_prepared_backend.stack_option_constructor =
-  | StackOptionSomeValue of { option_type : string; value : core }
-  | StackOptionSomeVoidStatement of { option_type : string; statement : core }
-  | StackOptionNone of { option_type : string; none_value : string }
-  | StackOptionTaggedValue of { option_type : string; tag : int; value : core }
-  | StackOptionTaggedVoidStatement of {
-      option_type : string;
-      tag : int;
-      statement : core;
-    }
-  | StackOptionTaggedNone of {
-      option_type : string;
-      tag : int;
-      none_value : string;
-    }
+let prepared_json ~op fields =
+  Lsp_json.to_string
+    (Lsp_json.Object
+       (("op", Lsp_json.String op)
+       :: List.map (fun (key, value) -> (key, Lsp_json.String value)) fields))
 
-type stack_result_payload_release_policy =
-      Core_emit_blorp_prepared_backend.stack_result_payload_release_policy =
-  | KeepResultPayload
-  | ReleaseResultPayload
+let prepared_emit_json ~op fields = prepared_json ~op fields
 
-type stack_result_constructor =
-      Core_emit_blorp_prepared_backend.stack_result_constructor =
-  | StackResultOkPayload of {
-      result_type : string;
-      payload : core;
-      release_policy : stack_result_payload_release_policy;
-    }
-  | StackResultErrPayload of {
-      result_type : string;
-      payload : core;
-      release_policy : stack_result_payload_release_policy;
-    }
-  | StackResultTaggedPayload of {
-      result_type : string;
-      tag : int;
-      field : string;
-      payload : boxed_storage_value;
-      release_mask : int;
-    }
+let constructor_call_json ~callee ~argument_list =
+  prepared_emit_json ~op:"constructor_call"
+    [ ("callee", callee); ("argument_list", argument_list) ]
+
+let constructor_symbol_json ~name =
+  prepared_emit_json ~op:"constructor_symbol" [ ("name", name) ]
+
+let constructor_nullable_none_json () =
+  prepared_emit_json ~op:"constructor_nullable_none" []
+
+let constructor_nullable_payload_json ~payload =
+  prepared_emit_json ~op:"constructor_nullable_payload" [ ("payload", payload) ]
+
+let stack_option_value_json ~option_type ~tag ~value =
+  prepared_emit_json ~op:"stack_option_value"
+    [ ("option_type", option_type); ("tag", tag); ("value", value) ]
+
+let stack_option_void_statement_json ~option_type ~tag ~statement =
+  prepared_emit_json ~op:"stack_option_void_statement"
+    [ ("option_type", option_type); ("tag", tag); ("statement", statement) ]
+
+let stack_option_none_json ~option_type ~tag ~none_value =
+  prepared_emit_json ~op:"stack_option_none"
+    [ ("option_type", option_type); ("tag", tag); ("none_value", none_value) ]
+
+let stack_result_payload_json ~result_type ~tag ~field ~payload ~release_mask =
+  prepared_emit_json ~op:"stack_result_payload"
+    [
+      ("result_type", result_type);
+      ("tag", tag);
+      ("field", field);
+      ("payload", payload);
+      ("release_mask", release_mask);
+    ]
+
+let tuple_name_json ~temp_seed =
+  prepared_emit_json ~op:"tuple_name" [ ("temp_seed", temp_seed) ]
+
+let tuple_arg_json ~value =
+  prepared_emit_json ~op:"tuple_arg" [ ("value", value) ]
+
+let tuple_construct_json ~arity ~args =
+  prepared_emit_json ~op:"tuple_construct" [ ("arity", arity); ("args", args) ]
+
+let tuple_retain_elem_json ~tuple ~index =
+  prepared_emit_json ~op:"tuple_retain_elem"
+    [ ("tuple", tuple); ("index", index) ]
+
+let tuple_construct_with_rc_json ~tuple ~arity ~args ~retain_statements
+    ~release_mask =
+  prepared_emit_json ~op:"tuple_construct_with_rc"
+    [
+      ("tuple", tuple);
+      ("arity", arity);
+      ("args", args);
+      ("retain_statements", retain_statements);
+      ("release_mask", release_mask);
+    ]
+
+let tuple_field_element_json ~tuple ~field =
+  prepared_emit_json ~op:"tuple_field_element"
+    [ ("tuple", tuple); ("field", field) ]
+
+let tuple_field_access_json ~tuple ~source ~read =
+  prepared_emit_json ~op:"tuple_field_access"
+    [ ("tuple", tuple); ("source", source); ("read", read) ]
+
+let render_prepared_emit_json =
+  Core_emit_blorp_prepared_backend.render_prepared_emit_json
+
+let render_tuple_name temp_seed =
+  render_prepared_emit_json (tuple_name_json ~temp_seed)
+
+let render_tuple_arg value = render_prepared_emit_json (tuple_arg_json ~value)
+
+let render_tuple_retain_elem ~tuple ~index =
+  render_prepared_emit_json
+    (tuple_retain_elem_json ~tuple ~index:(string_of_int index))
+
+let render_tuple_field_element ~tuple ~field =
+  render_prepared_emit_json (tuple_field_element_json ~tuple ~field)
+
+let render_tuple_field_element_at ~tuple_tmp ~index =
+  render_tuple_field_element ~tuple:tuple_tmp ~field:(string_of_int index)
 
 type emit_node =
-  | TupleConstruct of tuple_construct
-  | TupleFieldAccess of {
-      obj : core;
-      field : string;
-      render_read : string -> string;
-    }
+  | PreparedEmitJson of string
   | DictIterHeader of { dict : string; source : core; index : string }
   | DictIterSlotBinding of { slot : string; dict : string; index : string }
   | DictIterDeletedSlotGuard of { slot : string }
@@ -420,15 +466,9 @@ type emit_node =
     }
   | SelectCleanupPop of { value_slot : string }
   | SelectReceivedValueBinding of { binding : string; result : string }
-  | StackOptionConstruct of stack_option_constructor
-  | StackResultConstruct of stack_result_constructor
   | SetAlloc of set_constructor_call
   | SetIterHeader of { set : string; source : core; entry : string }
   | SetIterRelease of { set : string }
-
-let render_tuple_field_element_at ~tuple_tmp ~index =
-  Core_emit_blorp_prepared_backend.render_tuple_field_element_at ~tuple_tmp
-    ~index
 
 let render_set_iter_entry_key ~entry =
   Core_emit_blorp_prepared_backend.render_set_iter_entry_key ~entry
@@ -510,12 +550,8 @@ let emit_list_handoff emitters ctx result handoff =
   Core_emit_blorp_prepared_backend.emit_list_handoff_close ctx ~result_c
 
 let emit emitters ctx = function
-  | TupleConstruct tuple ->
-      Core_emit_blorp_prepared_backend.emit_tuple_construct_value
-        ~emit_boxed:emitters.emit_boxed_storage ctx tuple
-  | TupleFieldAccess { obj; field; render_read } ->
-      Core_emit_blorp_prepared_backend.emit_tuple_field_access
-        ~emit_expr:emitters.emit_expr ~render_read ctx obj field
+  | PreparedEmitJson json ->
+      Core_emit_context.emit ctx (render_prepared_emit_json json)
   | DictIterHeader { dict; source; index } ->
       Core_emit_blorp_prepared_backend.emit_dict_iter_header
         ~emit_expr:emitters.emit_expr ctx ~dict ~index source
@@ -827,16 +863,6 @@ let emit emitters ctx = function
   | SelectReceivedValueBinding { binding; result } ->
       Core_emit_blorp_prepared_backend.emit_select_received_value_binding ctx
         ~binding ~result
-  | StackOptionConstruct constructor ->
-      Core_emit_context.emit ctx
-        (Core_emit_blorp_prepared_backend.render_stack_option_constructor
-           ~emit_expr:emitters.emit_expr ~emit_stmt:emitters.emit_stmt ctx
-           constructor)
-  | StackResultConstruct constructor ->
-      Core_emit_context.emit ctx
-        (Core_emit_blorp_prepared_backend.render_stack_result_constructor
-           ~emit_boxed:emitters.emit_boxed_core
-           ~emit_boxed_storage:emitters.emit_boxed_storage ctx constructor)
   | SetAlloc ctor -> Core_emit_context.emit ctx (render_set_constructor ctor)
   | SetIterHeader { set; source; entry } ->
       Core_emit_blorp_prepared_backend.emit_set_iter_header
