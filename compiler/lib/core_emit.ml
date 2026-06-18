@@ -5979,22 +5979,18 @@ and emit_for_list_flat (ctx : Core_emit_context.t) (binder : loop_binder)
     if is_tensor_type ctx iter.ty then "blorp_Vector*" else "blorp_List*"
   in
   let is_array_iter = is_tensor_type ctx iter.ty in
-  emit_indent ctx;
-  emit ctx (Printf.sprintf "%s %s = " iter_c_type iter_c);
-  emit_expr ctx iter;
-  emitln ctx ";";
+  emit_blorp_backend ctx
+    (Core_emit_blorp_backend.FlatIterSourceBinding
+       { iter_c_type; iter_tmp = iter_c; source = iter });
   let iter_cleanup_registered =
     iter_needs_release
     && emit_owned_temp_cancellation_cleanup_push ctx ~slot_c:iter_c
          ~value_c:iter_c ~ty:iter.ty
   in
-  emit_line ctx (Printf.sprintf "long %s = %s->len;" len_c iter_c);
   let emit_loop emit_element_decl =
-    emit_indent ctx;
-    emit ctx
-      (Printf.sprintf "for (long %s = 0; %s < %s; %s++) {" idx_c idx_c len_c
-         idx_c);
-    emitln ctx "";
+    emit_blorp_backend ctx
+      (Core_emit_blorp_backend.FlatIterLoopHeader
+         { length = len_c; iter_tmp = iter_c; index = idx_c });
     ctx.indent <- ctx.indent + 1;
     emit_element_decl ();
     emit_stmt ctx body;
@@ -6038,13 +6034,18 @@ and emit_for_list_flat (ctx : Core_emit_context.t) (binder : loop_binder)
     with
     | Some raw ->
         let raw_c = Printf.sprintf "__iter_raw_%d" (fresh_temp ctx) in
-        emit_line ctx
-          (Printf.sprintf "%s %s = (%s)%s->data;" raw.tras_pointer_c_type raw_c
-             raw.tras_pointer_c_type iter_c);
+        emit_blorp_backend ctx
+          (Core_emit_blorp_backend.FlatIterRawDataBinding
+             {
+               pointer_c_type = raw.tras_pointer_c_type;
+               raw = raw_c;
+               iter_tmp = iter_c;
+             });
         emit_loop (fun () ->
-            emit_line ctx
-              (Printf.sprintf "%s %s = (%s)%s[%s];" (type_to_c ctx elem_ty)
-                 var_c (type_to_c ctx elem_ty) raw_c idx_c))
+            let value_c_type = type_to_c ctx elem_ty in
+            emit_blorp_backend ctx
+              (Core_emit_blorp_backend.FlatIterRawValueBinding
+                 { value_c_type; binding = var_c; raw = raw_c; index = idx_c }))
     | None ->
         emit_loop (fun () ->
             emit_for_tensor_element_decl ctx var_c iter_c idx_c elem_ty)
@@ -6165,18 +6166,13 @@ and emit_for_string (ctx : Core_emit_context.t) (binder : loop_binder)
   let iter_c = Printf.sprintf "__str_iter_%d" id in
   let idx_c = Printf.sprintf "__si_%d" id in
   let var_c = escape_c_ident (Var.to_c_name binder.loop_var) in
-  emit_indent ctx;
-  emit ctx (Printf.sprintf "blorp_String* %s = (blorp_String*)" iter_c);
-  emit_expr ctx iter;
-  emitln ctx ";";
-  emit_indent ctx;
-  emit ctx
-    (Printf.sprintf "for (long %s = 0; %s < %s->len; ) {" idx_c idx_c iter_c);
-  emitln ctx "";
+  emit_blorp_backend ctx
+    (Core_emit_blorp_backend.StringIterHeader
+       { iter = iter_c; source = iter; index = idx_c });
   ctx.indent <- ctx.indent + 1;
-  emit_line ctx
-    (Printf.sprintf "int32_t %s = blorp_string_next_codepoint(%s, &%s);" var_c
-       iter_c idx_c);
+  emit_blorp_backend ctx
+    (Core_emit_blorp_backend.StringIterCodepointBinding
+       { binding = var_c; iter = iter_c; index = idx_c });
   emit_stmt ctx body;
   ctx.indent <- ctx.indent - 1;
   emit_indent ctx;
@@ -6202,8 +6198,7 @@ and emit_for_dict (ctx : Core_emit_context.t) (binder : loop_binder)
   let key_c = type_to_c ctx key_ty in
   let binder_ty = normalize_type binder.loop_ty in
   emit_blorp_backend ctx
-    (DictIterSourceBinding { dict = iter_c; source = iter });
-  emit_blorp_backend ctx (DictIterLoopOpen { index = idx_c; dict = iter_c });
+    (DictIterHeader { dict = iter_c; source = iter; index = idx_c });
   ctx.indent <- ctx.indent + 1;
   emit_blorp_backend ctx
     (DictIterSlotBinding { slot = slot_c; dict = iter_c; index = idx_c });
@@ -6234,14 +6229,8 @@ and emit_for_channel (ctx : Core_emit_context.t) (binder : loop_binder)
   let raw_c = Printf.sprintf "__chan_val_%d" id in
   let var_c = escape_c_ident (Var.to_c_name binder.loop_var) in
   let elem_ty = binder.loop_ty in
-  emit_indent ctx;
-  emit ctx (Printf.sprintf "blorp_Channel* %s = (blorp_Channel*)" iter_c);
-  emit_expr ctx iter;
-  emitln ctx ";";
-  emit_line ctx (Printf.sprintf "void* %s = NULL;" raw_c);
-  emit_indent ctx;
-  emitln ctx
-    (Printf.sprintf "while (blorp_channel_recv_raw(%s, &%s)) {" iter_c raw_c);
+  emit_blorp_backend ctx
+    (ChannelIterHeader { channel = iter_c; source = iter; value = raw_c });
   ctx.indent <- ctx.indent + 1;
   emit_owned_erased_value_unbox_decl ctx var_c raw_c elem_ty;
   emit_stmt ctx body;
@@ -6249,9 +6238,7 @@ and emit_for_channel (ctx : Core_emit_context.t) (binder : loop_binder)
     if is_stack_result_type ctx elem_ty then
       emit_line ctx
         (Printf.sprintf "%s;" (release_value_call ctx elem_ty var_c))
-    else
-      emit_line ctx
-        (Printf.sprintf "if (%s) blorp_release((blorp_Object*)%s);" var_c var_c);
+    else emit_blorp_backend ctx (ChannelIterReleaseObject { value = var_c });
   ctx.indent <- ctx.indent - 1;
   emit_indent ctx;
   emitln ctx "}"
@@ -6263,49 +6250,28 @@ and emit_select (ctx : Core_emit_context.t) (select : select_expr) : unit =
   let arm_count = List.length select.select_arms in
   emit_line ctx "{";
   ctx.indent <- ctx.indent + 1;
-  emit_line ctx (Printf.sprintf "blorp_SelectArm %s[%d];" arms_c arm_count);
+  emit_blorp_backend ctx (SelectArmsDecl { arms = arms_c; arm_count });
   List.iteri
     (fun i arm ->
       match arm.select_arm_kind with
       | SelectRecv r ->
-          emit_indent ctx;
-          emit ctx
-            (Printf.sprintf
-               "%s[%d] = (blorp_SelectArm){ .kind = BLORP_SELECT_RECV, \
-                .channel = (blorp_Channel*)"
-               arms_c i);
-          emit_expr ctx r.select_channel;
-          emitln ctx ", .timeout_ms = 0L };"
+          emit_blorp_backend ctx
+            (SelectRecvArm
+               { arms = arms_c; index = i; channel = r.select_channel })
       | SelectSealed channel ->
-          emit_indent ctx;
-          emit ctx
-            (Printf.sprintf
-               "%s[%d] = (blorp_SelectArm){ .kind = BLORP_SELECT_SEALED, \
-                .channel = (blorp_Channel*)"
-               arms_c i);
-          emit_expr ctx channel;
-          emitln ctx ", .timeout_ms = 0L };"
+          emit_blorp_backend ctx
+            (SelectSealedArm { arms = arms_c; index = i; channel })
       | SelectAfter timeout ->
-          emit_indent ctx;
-          emit ctx
-            (Printf.sprintf
-               "%s[%d] = (blorp_SelectArm){ .kind = BLORP_SELECT_AFTER, \
-                .channel = NULL, .timeout_ms = "
-               arms_c i);
-          emit_expr ctx timeout;
-          emitln ctx " };")
+          emit_blorp_backend ctx
+            (SelectAfterArm { arms = arms_c; index = i; timeout }))
     select.select_arms;
-  emit_line ctx
-    (Printf.sprintf "blorp_SelectResult %s = blorp_select_wait(%s, %dL);"
-       result_c arms_c arm_count);
+  emit_blorp_backend ctx
+    (SelectWait { result = result_c; arms = arms_c; arm_count });
   List.iteri
     (fun i arm ->
-      emit_indent ctx;
-      emit ctx
-        (Printf.sprintf "%s (%s.arm_index == %dL) {"
-           (if i = 0 then "if" else "else if")
-           result_c i);
-      emitln ctx "";
+      emit_blorp_backend ctx
+        (if i = 0 then SelectFirstBranchOpen { result = result_c; index = i }
+         else SelectNextBranchOpen { result = result_c; index = i });
       ctx.indent <- ctx.indent + 1;
       (match arm.select_arm_kind with
       | SelectRecv r ->
@@ -6322,18 +6288,23 @@ and emit_select (ctx : Core_emit_context.t) (select : select_expr) : unit =
                   cancellation_cleanup_value_arg ctx r.select_elem_ty
                     ~slot_c:value_c ~value_c
                 in
-                emit_line ctx
-                  (Printf.sprintf "blorp_CancelCleanupFrame %s;" frame_c);
-                emit_line ctx
-                  (Printf.sprintf "blorp_task_cleanup_push(&%s, &%s, %s, %s);"
-                     frame_c value_c value_arg fn)
+                emit_blorp_backend ctx
+                  (SelectCleanupFrameDecl { frame = frame_c });
+                emit_blorp_backend ctx
+                  (SelectCleanupPush
+                     {
+                       cleanup_frame = frame_c;
+                       value_slot = value_c;
+                       cleanup_value = value_arg;
+                       release_fn = fn;
+                     })
           in
           let pop_cleanup value_c =
             match release_fn with
             | None -> ()
             | Some _ ->
-                emit_line ctx
-                  (Printf.sprintf "blorp_task_cleanup_pop_slot(&%s);" value_c)
+                emit_blorp_backend ctx
+                  (SelectCleanupPop { value_slot = value_c })
           in
           let received_value_c =
             if bind_name = "_" then Printf.sprintf "__select_ignored_%d_%d" id i
@@ -6348,8 +6319,9 @@ and emit_select (ctx : Core_emit_context.t) (select : select_expr) : unit =
               (Printf.sprintf "%s.value" result_c)
               r.select_elem_ty
           else if type_requires_release ctx r.select_elem_ty then
-            emit_line ctx
-              (Printf.sprintf "void* %s = %s.value;" received_value_c result_c);
+            emit_blorp_backend ctx
+              (SelectReceivedValueBinding
+                 { binding = received_value_c; result = result_c });
           if type_requires_release ctx r.select_elem_ty then
             push_cleanup received_value_c;
           emit_stmt ctx arm.select_arm_body;
@@ -6401,9 +6373,8 @@ and emit_for_set (ctx : Core_emit_context.t) (binder : loop_binder)
   let entry_c = Printf.sprintf "__set_entry_%d" id in
   let var_c = escape_c_ident (Var.to_c_name binder.loop_var) in
   let elem_ty = binder.loop_ty in
-  emit_blorp_backend ctx (SetIterSourceBinding { set = iter_c; source = iter });
-  emit_blorp_backend ctx (SetIterRetain { set = iter_c });
-  emit_blorp_backend ctx (SetIterLoopOpen { entry = entry_c; set = iter_c });
+  emit_blorp_backend ctx
+    (SetIterHeader { set = iter_c; source = iter; entry = entry_c });
   ctx.indent <- ctx.indent + 1;
   emit_unbox_decl ctx var_c
     (Core_emit_blorp_backend.render_set_iter_entry_key ~entry:entry_c)

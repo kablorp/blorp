@@ -220,8 +220,7 @@ type emit_node =
       field : string;
       render_read : string -> string;
     }
-  | DictIterSourceBinding of { dict : string; source : core }
-  | DictIterLoopOpen of { index : string; dict : string }
+  | DictIterHeader of { dict : string; source : core; index : string }
   | DictIterSlotBinding of { slot : string; dict : string; index : string }
   | DictIterDeletedSlotGuard of { slot : string }
   | DictIterKeyBinding of {
@@ -244,6 +243,29 @@ type emit_node =
     }
   | StringSetLen of string_set_len
   | StringSetLenIntrinsic of { target : core; len : core }
+  | StringIterCodepointBinding of {
+      binding : string;
+      iter : string;
+      index : string;
+    }
+  | StringIterHeader of { iter : string; source : core; index : string }
+  | FlatIterSourceBinding of {
+      iter_c_type : string;
+      iter_tmp : string;
+      source : core;
+    }
+  | FlatIterLoopHeader of { length : string; iter_tmp : string; index : string }
+  | FlatIterRawDataBinding of {
+      pointer_c_type : string;
+      raw : string;
+      iter_tmp : string;
+    }
+  | FlatIterRawValueBinding of {
+      value_c_type : string;
+      binding : string;
+      raw : string;
+      index : string;
+    }
   | ListGet of list_get
   | ListHandoff of { result : core; handoff : list_handoff }
   | ListConstruct of list_construct
@@ -380,12 +402,28 @@ type emit_node =
   | ChannelRetainingSend of channel_retaining_send
   | ChannelSendAttempt of channel_send_attempt
   | ChannelRecvAttempt of channel_recv_attempt
+  | ChannelIterReleaseObject of { value : string }
+  | ChannelIterHeader of { channel : string; source : core; value : string }
+  | SelectArmsDecl of { arms : string; arm_count : int }
+  | SelectRecvArm of { arms : string; index : int; channel : core }
+  | SelectSealedArm of { arms : string; index : int; channel : core }
+  | SelectAfterArm of { arms : string; index : int; timeout : core }
+  | SelectWait of { result : string; arms : string; arm_count : int }
+  | SelectFirstBranchOpen of { result : string; index : int }
+  | SelectNextBranchOpen of { result : string; index : int }
+  | SelectCleanupFrameDecl of { frame : string }
+  | SelectCleanupPush of {
+      cleanup_frame : string;
+      value_slot : string;
+      cleanup_value : string;
+      release_fn : string;
+    }
+  | SelectCleanupPop of { value_slot : string }
+  | SelectReceivedValueBinding of { binding : string; result : string }
   | StackOptionConstruct of stack_option_constructor
   | StackResultConstruct of stack_result_constructor
   | SetAlloc of set_constructor_call
-  | SetIterSourceBinding of { set : string; source : core }
-  | SetIterRetain of { set : string }
-  | SetIterLoopOpen of { entry : string; set : string }
+  | SetIterHeader of { set : string; source : core; entry : string }
   | SetIterRelease of { set : string }
 
 let render_tuple_field_element_at ~tuple_tmp ~index =
@@ -478,11 +516,9 @@ let emit emitters ctx = function
   | TupleFieldAccess { obj; field; render_read } ->
       Core_emit_blorp_prepared_backend.emit_tuple_field_access
         ~emit_expr:emitters.emit_expr ~render_read ctx obj field
-  | DictIterSourceBinding { dict; source } ->
-      Core_emit_blorp_prepared_backend.emit_dict_iter_source_binding
-        ~emit_expr:emitters.emit_expr ctx ~dict source
-  | DictIterLoopOpen { index; dict } ->
-      Core_emit_blorp_prepared_backend.emit_dict_iter_loop_open ctx ~index ~dict
+  | DictIterHeader { dict; source; index } ->
+      Core_emit_blorp_prepared_backend.emit_dict_iter_header
+        ~emit_expr:emitters.emit_expr ctx ~dict ~index source
   | DictIterSlotBinding { slot; dict; index } ->
       Core_emit_blorp_prepared_backend.emit_dict_iter_slot_binding ctx ~slot
         ~dict ~index
@@ -516,6 +552,24 @@ let emit emitters ctx = function
   | StringSetLenIntrinsic { target; len } ->
       Core_emit_blorp_prepared_backend.emit_string_set_len_intrinsic
         ~emit_expr:emitters.emit_expr ctx target len
+  | StringIterCodepointBinding { binding; iter; index } ->
+      Core_emit_blorp_prepared_backend.emit_string_iter_codepoint_binding ctx
+        ~binding ~iter ~index
+  | StringIterHeader { iter; source; index } ->
+      Core_emit_blorp_prepared_backend.emit_string_iter_header
+        ~emit_expr:emitters.emit_expr ctx ~iter ~index source
+  | FlatIterSourceBinding { iter_c_type; iter_tmp; source } ->
+      Core_emit_blorp_prepared_backend.emit_flat_iter_source_binding
+        ~emit_expr:emitters.emit_expr ctx ~iter_c_type ~iter_tmp source
+  | FlatIterLoopHeader { length; iter_tmp; index } ->
+      Core_emit_blorp_prepared_backend.emit_flat_iter_loop_header ctx ~length
+        ~iter_tmp ~index
+  | FlatIterRawDataBinding { pointer_c_type; raw; iter_tmp } ->
+      Core_emit_blorp_prepared_backend.emit_flat_iter_raw_data_binding ctx
+        ~pointer_c_type ~raw ~iter_tmp
+  | FlatIterRawValueBinding { value_c_type; binding; raw; index } ->
+      Core_emit_blorp_prepared_backend.emit_flat_iter_raw_value_binding ctx
+        ~value_c_type ~binding ~raw ~index
   | ListGet get ->
       Core_emit_blorp_prepared_backend.emit_list_get
         ~emit_expr:emitters.emit_expr ctx get
@@ -735,6 +789,44 @@ let emit emitters ctx = function
       Core_emit_context.emit ctx
         (Core_emit_blorp_prepared_backend.render_channel_recv_attempt
            ~emit_expr:emitters.emit_expr ctx attempt)
+  | ChannelIterReleaseObject { value } ->
+      Core_emit_blorp_prepared_backend.emit_channel_iter_release_object ctx
+        ~value
+  | ChannelIterHeader { channel; source; value } ->
+      Core_emit_blorp_prepared_backend.emit_channel_iter_header
+        ~emit_expr:emitters.emit_expr ctx ~channel ~value source
+  | SelectArmsDecl { arms; arm_count } ->
+      Core_emit_blorp_prepared_backend.emit_select_arms_decl ctx ~arms
+        ~arm_count
+  | SelectRecvArm { arms; index; channel } ->
+      Core_emit_blorp_prepared_backend.emit_select_recv_arm
+        ~emit_expr:emitters.emit_expr ctx ~arms ~index channel
+  | SelectSealedArm { arms; index; channel } ->
+      Core_emit_blorp_prepared_backend.emit_select_sealed_arm
+        ~emit_expr:emitters.emit_expr ctx ~arms ~index channel
+  | SelectAfterArm { arms; index; timeout } ->
+      Core_emit_blorp_prepared_backend.emit_select_after_arm
+        ~emit_expr:emitters.emit_expr ctx ~arms ~index timeout
+  | SelectWait { result; arms; arm_count } ->
+      Core_emit_blorp_prepared_backend.emit_select_wait ctx ~result ~arms
+        ~arm_count
+  | SelectFirstBranchOpen { result; index } ->
+      Core_emit_blorp_prepared_backend.emit_select_first_branch_open ctx ~result
+        ~index
+  | SelectNextBranchOpen { result; index } ->
+      Core_emit_blorp_prepared_backend.emit_select_next_branch_open ctx ~result
+        ~index
+  | SelectCleanupFrameDecl { frame } ->
+      Core_emit_blorp_prepared_backend.emit_select_cleanup_frame_decl ctx ~frame
+  | SelectCleanupPush { cleanup_frame; value_slot; cleanup_value; release_fn }
+    ->
+      Core_emit_blorp_prepared_backend.emit_select_cleanup_push ctx
+        ~cleanup_frame ~value_slot ~cleanup_value ~release_fn
+  | SelectCleanupPop { value_slot } ->
+      Core_emit_blorp_prepared_backend.emit_select_cleanup_pop ctx ~value_slot
+  | SelectReceivedValueBinding { binding; result } ->
+      Core_emit_blorp_prepared_backend.emit_select_received_value_binding ctx
+        ~binding ~result
   | StackOptionConstruct constructor ->
       Core_emit_context.emit ctx
         (Core_emit_blorp_prepared_backend.render_stack_option_constructor
@@ -746,12 +838,8 @@ let emit emitters ctx = function
            ~emit_boxed:emitters.emit_boxed_core
            ~emit_boxed_storage:emitters.emit_boxed_storage ctx constructor)
   | SetAlloc ctor -> Core_emit_context.emit ctx (render_set_constructor ctor)
-  | SetIterSourceBinding { set; source } ->
-      Core_emit_blorp_prepared_backend.emit_set_iter_source_binding
-        ~emit_expr:emitters.emit_expr ctx ~set source
-  | SetIterRetain { set } ->
-      Core_emit_blorp_prepared_backend.emit_set_iter_retain ctx ~set
-  | SetIterLoopOpen { entry; set } ->
-      Core_emit_blorp_prepared_backend.emit_set_iter_loop_open ctx ~entry ~set
+  | SetIterHeader { set; source; entry } ->
+      Core_emit_blorp_prepared_backend.emit_set_iter_header
+        ~emit_expr:emitters.emit_expr ctx ~set ~entry source
   | SetIterRelease { set } ->
       Core_emit_blorp_prepared_backend.emit_set_iter_release ctx ~set

@@ -1297,18 +1297,10 @@ let render_set_constructor = function
 let render_set_iter_entry_key ~entry =
   render_template "backend_set_iter_entry_key" [ entry ]
 
-let emit_set_iter_source_binding ~emit_expr ctx ~set source =
+let emit_set_iter_header ~emit_expr ctx ~set ~entry source =
   let source_arg = render_arg ~emit_expr ctx source in
   Core_emit_context.emit_line ctx
-    (render_template "backend_set_iter_source_binding" [ set; source_arg ])
-
-let emit_set_iter_retain ctx ~set =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_set_iter_retain" [ set ])
-
-let emit_set_iter_loop_open ctx ~entry ~set =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_set_iter_loop_open" [ entry; set ])
+    (render_template "backend_set_iter_header" [ set; source_arg; entry ])
 
 let emit_set_iter_release ctx ~set =
   Core_emit_context.emit_line ctx
@@ -1432,6 +1424,37 @@ let emit_string_set_len ~emit_expr ctx set_len =
   emit_string_set_len_intrinsic ~emit_expr ctx set_len.ssl_target
     set_len.ssl_len
 
+let emit_string_iter_codepoint_binding ctx ~binding ~iter ~index =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_string_iter_codepoint_binding"
+       [ binding; iter; index ])
+
+let emit_string_iter_header ~emit_expr ctx ~iter ~index source =
+  let source_arg = render_arg ~emit_expr ctx source in
+  Core_emit_context.emit_line ctx
+    (render_template "backend_string_iter_header" [ iter; source_arg; index ])
+
+let emit_flat_iter_source_binding ~emit_expr ctx ~iter_c_type ~iter_tmp source =
+  let source_arg = render_arg ~emit_expr ctx source in
+  Core_emit_context.emit_line ctx
+    (render_template "backend_flat_iter_source_binding"
+       [ iter_c_type; iter_tmp; source_arg ])
+
+let emit_flat_iter_loop_header ctx ~length ~iter_tmp ~index =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_flat_iter_loop_header"
+       [ length; iter_tmp; index ])
+
+let emit_flat_iter_raw_data_binding ctx ~pointer_c_type ~raw ~iter_tmp =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_flat_iter_raw_data_binding"
+       [ pointer_c_type; raw; iter_tmp ])
+
+let emit_flat_iter_raw_value_binding ctx ~value_c_type ~binding ~raw ~index =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_flat_iter_raw_value_binding"
+       [ value_c_type; binding; raw; index ])
+
 let render_dict_capacity_constructor ~emit_expr ctx = function
   | DictWithCapacityGeneric capacity ->
       render_template "backend_dict_with_capacity_generic"
@@ -1454,14 +1477,10 @@ let render_dict_value_release_init temp_seed =
 let render_dict_insert temp_seed ~key_arg ~value_arg =
   render_template "backend_dict_insert" [ temp_seed; key_arg; value_arg ]
 
-let emit_dict_iter_source_binding ~emit_expr ctx ~dict source =
+let emit_dict_iter_header ~emit_expr ctx ~dict ~index source =
   let source_arg = render_arg ~emit_expr ctx source in
   Core_emit_context.emit_line ctx
-    (render_template "backend_dict_iter_source_binding" [ dict; source_arg ])
-
-let emit_dict_iter_loop_open ctx ~index ~dict =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_dict_iter_loop_open" [ index; dict ])
+    (render_template "backend_dict_iter_header" [ dict; source_arg; index ])
 
 let emit_dict_iter_slot_binding ctx ~slot ~dict ~index =
   Core_emit_context.emit_line ctx
@@ -1777,6 +1796,72 @@ let render_channel_recv_attempt ~emit_expr ctx = function
       { result_type; channel; timeout; release_policy; constructors } ->
       render_channel_recv_timeout_attempt ~emit_expr ctx ~result_type ~channel
         ~timeout ~release_policy ~constructors
+
+let emit_channel_iter_release_object ctx ~value =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_channel_iter_release_object" [ value ])
+
+let emit_channel_iter_header ~emit_expr ctx ~channel ~value source =
+  let source_arg = render_arg ~emit_expr ctx source in
+  Core_emit_context.emit_line ctx
+    (render_template "backend_channel_iter_header"
+       [ channel; source_arg; value ])
+
+let emit_select_arms_decl ctx ~arms ~arm_count =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_arms_decl"
+       [ arms; string_of_int arm_count ])
+
+let emit_select_recv_arm ~emit_expr ctx ~arms ~index channel =
+  let channel_arg = render_arg ~emit_expr ctx channel in
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_recv_arm"
+       [ arms; string_of_int index; channel_arg ])
+
+let emit_select_sealed_arm ~emit_expr ctx ~arms ~index channel =
+  let channel_arg = render_arg ~emit_expr ctx channel in
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_sealed_arm"
+       [ arms; string_of_int index; channel_arg ])
+
+let emit_select_after_arm ~emit_expr ctx ~arms ~index timeout =
+  let timeout_arg = render_arg ~emit_expr ctx timeout in
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_after_arm"
+       [ arms; string_of_int index; timeout_arg ])
+
+let emit_select_wait ctx ~result ~arms ~arm_count =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_wait"
+       [ result; arms; string_of_int arm_count ])
+
+let emit_select_first_branch_open ctx ~result ~index =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_first_branch_open"
+       [ result; string_of_int index ])
+
+let emit_select_next_branch_open ctx ~result ~index =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_next_branch_open"
+       [ result; string_of_int index ])
+
+let emit_select_cleanup_frame_decl ctx ~frame =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_cleanup_frame_decl" [ frame ])
+
+let emit_select_cleanup_push ctx ~cleanup_frame ~value_slot ~cleanup_value
+    ~release_fn =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_cleanup_push"
+       [ cleanup_frame; value_slot; cleanup_value; release_fn ])
+
+let emit_select_cleanup_pop ctx ~value_slot =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_cleanup_pop" [ value_slot ])
+
+let emit_select_received_value_binding ctx ~binding ~result =
+  Core_emit_context.emit_line ctx
+    (render_template "backend_select_received_value_binding" [ binding; result ])
 
 let render_stack_option_constructor ~emit_expr ~emit_stmt ctx = function
   | StackOptionSomeValue { option_type; value } ->
