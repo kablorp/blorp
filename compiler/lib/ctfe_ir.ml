@@ -126,6 +126,7 @@ type translate_error =
 type translate_context = {
   nullary_constructor : string -> nullary_constructor option;
   module_alias : string -> string option;
+  module_has_global : module_path:string -> name:string -> bool;
 }
 
 let ( let* ) = Result.bind
@@ -280,10 +281,12 @@ let pair_list_map f values =
 
 let default_nullary_constructor _ = None
 let default_module_alias _ = None
+let default_module_has_global ~module_path:_ ~name:_ = false
 
-let translate_context ?(module_alias = default_module_alias) nullary_constructor
+let translate_context ?(module_alias = default_module_alias)
+    ?(module_has_global = default_module_has_global) nullary_constructor
     =
-  { nullary_constructor; module_alias }
+  { nullary_constructor; module_alias; module_has_global }
 
 let rec of_typed_expr_with ctx expr =
   match Typed_ast.expr_desc expr with
@@ -350,9 +353,16 @@ and of_desc ctx expr = function
         | Ast.EIdent alias -> ctx.module_alias alias
         | _ -> None
       in
-      begin match qualified_module with
-      | Some module_path -> (
-          match ctx.nullary_constructor field with
+      begin
+        match qualified_module with
+        | Some module_path
+          when ctx.module_has_global ~module_path ~name:field ->
+            Ok
+              (make expr
+                 (ImportedGlobal
+                    { global_module_path = module_path; global_name = field }))
+        | Some module_path -> (
+            match ctx.nullary_constructor field with
           | Some constructor ->
               Ok
                 (make expr
@@ -367,7 +377,7 @@ and of_desc ctx expr = function
                    (ImportedGlobal
                       { global_module_path = module_path; global_name = field }))
           )
-      | None ->
+        | None ->
           let* receiver = of_typed_expr_with ctx receiver in
           let field_kind = field_access_kind receiver.ty field in
           Ok (make expr (FieldAccess { field_receiver = receiver; field_kind }))
@@ -481,12 +491,18 @@ and match_case ctx case =
   Ok { pattern = case.case_pattern; body }
 
 let of_typed_expr ?(nullary_constructor = default_nullary_constructor)
-    ?(module_alias = default_module_alias) expr =
-  of_typed_expr_with (translate_context ~module_alias nullary_constructor) expr
+    ?(module_alias = default_module_alias)
+    ?(module_has_global = default_module_has_global) expr =
+  of_typed_expr_with
+    (translate_context ~module_alias ~module_has_global nullary_constructor)
+    expr
 
 let of_function_body ?(nullary_constructor = default_nullary_constructor)
-    ?(module_alias = default_module_alias) func =
-  let ctx = translate_context ~module_alias nullary_constructor in
+    ?(module_alias = default_module_alias)
+    ?(module_has_global = default_module_has_global) func =
+  let ctx =
+    translate_context ~module_alias ~module_has_global nullary_constructor
+  in
   match Typed_ast.func_body_expr func with
   | Error err -> Error (TypedAstError err)
   | Ok None -> Ok None
@@ -496,8 +512,11 @@ let of_function_body ?(nullary_constructor = default_nullary_constructor)
 
 let of_typed_var_initializer
     ?(nullary_constructor = default_nullary_constructor)
-    ?(module_alias = default_module_alias) typed_var =
-  let ctx = translate_context ~module_alias nullary_constructor in
+    ?(module_alias = default_module_alias)
+    ?(module_has_global = default_module_has_global) typed_var =
+  let ctx =
+    translate_context ~module_alias ~module_has_global nullary_constructor
+  in
   match Typed_ast.var_value_expr typed_var with
   | Error err -> Error (TypedAstError err)
   | Ok init -> of_typed_expr_with ctx init

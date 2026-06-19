@@ -138,3 +138,6 @@ let render_exn manifest name args =
   | Some template -> substitute template args
   | None ->
       invalid_arg (Printf.sprintf "missing %s template %S" manifest.label name)
+
+let emit manifest ctx name args =
+  Core_emit_context.emit ctx (render_exn manifest name args)

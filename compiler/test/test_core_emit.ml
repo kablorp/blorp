@@ -2474,9 +2474,7 @@ let test_escape_nul_string_literal_keeps_explicit_length () =
         data[4]; } __blorp_static_string_NUL_TEXT =");
   Alcotest.(check bool)
     "static literal stores byte length not strlen" true
-    (contains_sub output
-       "{ { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 }, 3L, 3L, \
-        \"a\\000b\" }")
+    (contains_sub output "3L,\n    3L,\n    \"a\\000b\"")
 
 let test_emit_global_managed_dict_constant_immortalized () =
   let v : core_var =
