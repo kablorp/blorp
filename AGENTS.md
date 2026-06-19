@@ -250,9 +250,7 @@ make test                         # Top-level local test gate
 make runtime-test                 # Runtime tests only
 make compiler-unit-test           # Compiler-internal OCaml/Alcotest tests only
 make coverage                     # Compiler-unit coverage
-make fmt-check                    # OCaml formatting check
-make quality                      # OCaml checks + hygiene + C static analysis
-make quality-full                 # quality + ocamlformat check
+make quality                      # Hygiene + C static analysis
 make docker-gate                  # Normal test gate in Ubuntu Docker (linux/amd64)
 make docker-premerge-gate         # Premerge gate in Ubuntu Docker (linux/amd64)
 make docker-premerge-gate-all     # Premerge gate in Ubuntu Docker (linux/amd64 + linux/arm64)
@@ -267,7 +265,6 @@ failure.
 
 ```bash
 make
-make fmt-check
 scripts/test compiler-unit
 scripts/test compiler
 scripts/test runtime

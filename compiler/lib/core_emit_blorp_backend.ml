@@ -1,26 +1,26 @@
-(** Single OCaml transfer point for Blorp-owned backend emission.
+(** Typed facade for Blorp-owned backend emission.
 
-    This is the production boundary from the OCaml compiler pipeline into
-    Blorp-authored C emission. Domain-specific bridge modules remain
-    implementation details while we migrate incrementally. OCaml still owns Core
-    traversal, semantic/layout decisions, and child expression rendering; this
-    module owns dispatching emission-ready operations to Blorp-owned renderers. *)
+    OCaml still owns Core traversal, semantic/layout decisions, and child
+    expression rendering. JSON transfer to Blorp-owned template data goes
+    through [Compiler_blorp_bridge]. *)
 
 open Core
 
-let intrinsic_manifest =
-  Core_emit_blorp_template.create ~initial_size:64 ~label:"codegen intrinsic"
-    Core_emit_blorp_intrinsic_templates.tsv
-
-let intrinsic_names () = Core_emit_blorp_template.names intrinsic_manifest
+let intrinsic_names () =
+  Compiler_blorp_bridge.names
+    ~renderer:Compiler_blorp_bridge.intrinsic_renderer
 
 let emit_simple_intrinsic ~emit_expr (ctx : Core_emit_context.t) name args =
-  match Core_emit_blorp_template.find intrinsic_manifest name with
-  | Some template when List.length args = template.arity ->
+  match
+    Compiler_blorp_bridge.arity
+      ~renderer:Compiler_blorp_bridge.intrinsic_renderer ~op:name
+  with
+  | Some arity when List.length args = arity ->
       let rendered_args =
         Core_emit_blorp_template.render_args ~emit_expr ctx args
       in
-      Core_emit_blorp_template.emit intrinsic_manifest ctx name rendered_args;
+      Compiler_blorp_bridge.emit ctx
+        ~renderer:Compiler_blorp_bridge.intrinsic_renderer ~op:name rendered_args;
       true
   | Some _ | None -> false
 
@@ -173,101 +173,74 @@ type channel_recv_attempt =
       constructors : channel_recv_attempt_constructors;
     }
 
-let prepared_json ~op fields =
-  Lsp_json.to_string
-    (Lsp_json.Object
-       (("op", Lsp_json.String op)
-       :: List.map (fun (key, value) -> (key, Lsp_json.String value)) fields))
+let render_constructor_call ~callee ~argument_list =
+  Core_emit_blorp_prepared_backend.render_constructor_template
+    "backend_constructor_call" [ callee; argument_list ]
 
-let prepared_emit_json ~op fields = prepared_json ~op fields
+let render_constructor_symbol ~name =
+  Core_emit_blorp_prepared_backend.render_constructor_template
+    "backend_constructor_symbol" [ name ]
 
-let constructor_call_json ~callee ~argument_list =
-  prepared_emit_json ~op:"constructor_call"
-    [ ("callee", callee); ("argument_list", argument_list) ]
+let render_constructor_nullable_none () =
+  Core_emit_blorp_prepared_backend.render_constructor_template
+    "backend_constructor_nullable_none" []
 
-let constructor_symbol_json ~name =
-  prepared_emit_json ~op:"constructor_symbol" [ ("name", name) ]
+let render_constructor_nullable_payload ~payload =
+  Core_emit_blorp_prepared_backend.render_constructor_template
+    "backend_constructor_nullable_payload" [ payload ]
 
-let constructor_nullable_none_json () =
-  prepared_emit_json ~op:"constructor_nullable_none" []
+let render_stack_option_value ~option_type ~tag ~value =
+  Core_emit_blorp_prepared_backend.render_constructor_template
+    "backend_constructor_stack_option_value" [ option_type; tag; value ]
 
-let constructor_nullable_payload_json ~payload =
-  prepared_emit_json ~op:"constructor_nullable_payload" [ ("payload", payload) ]
+let render_stack_option_void_statement ~option_type ~tag ~statement =
+  Core_emit_blorp_prepared_backend.render_constructor_template
+    "backend_constructor_stack_option_void_statement"
+    [ option_type; tag; statement ]
 
-let stack_option_value_json ~option_type ~tag ~value =
-  prepared_emit_json ~op:"stack_option_value"
-    [ ("option_type", option_type); ("tag", tag); ("value", value) ]
+let render_stack_option_none ~option_type ~tag ~none_value =
+  Core_emit_blorp_prepared_backend.render_constructor_template
+    "backend_constructor_stack_option_none" [ option_type; tag; none_value ]
 
-let stack_option_void_statement_json ~option_type ~tag ~statement =
-  prepared_emit_json ~op:"stack_option_void_statement"
-    [ ("option_type", option_type); ("tag", tag); ("statement", statement) ]
-
-let stack_option_none_json ~option_type ~tag ~none_value =
-  prepared_emit_json ~op:"stack_option_none"
-    [ ("option_type", option_type); ("tag", tag); ("none_value", none_value) ]
-
-let stack_result_payload_json ~result_type ~tag ~field ~payload ~release_mask =
-  prepared_emit_json ~op:"stack_result_payload"
-    [
-      ("result_type", result_type);
-      ("tag", tag);
-      ("field", field);
-      ("payload", payload);
-      ("release_mask", release_mask);
-    ]
-
-let tuple_name_json ~temp_seed =
-  prepared_emit_json ~op:"tuple_name" [ ("temp_seed", temp_seed) ]
-
-let tuple_arg_json ~value =
-  prepared_emit_json ~op:"tuple_arg" [ ("value", value) ]
-
-let tuple_construct_json ~arity ~args =
-  prepared_emit_json ~op:"tuple_construct" [ ("arity", arity); ("args", args) ]
-
-let tuple_retain_elem_json ~tuple ~index =
-  prepared_emit_json ~op:"tuple_retain_elem"
-    [ ("tuple", tuple); ("index", index) ]
-
-let tuple_construct_with_rc_json ~tuple ~arity ~args ~retain_statements
-    ~release_mask =
-  prepared_emit_json ~op:"tuple_construct_with_rc"
-    [
-      ("tuple", tuple);
-      ("arity", arity);
-      ("args", args);
-      ("retain_statements", retain_statements);
-      ("release_mask", release_mask);
-    ]
-
-let tuple_field_element_json ~tuple ~field =
-  prepared_emit_json ~op:"tuple_field_element"
-    [ ("tuple", tuple); ("field", field) ]
-
-let tuple_field_access_json ~tuple ~source ~read =
-  prepared_emit_json ~op:"tuple_field_access"
-    [ ("tuple", tuple); ("source", source); ("read", read) ]
-
-let render_prepared_emit_json =
-  Core_emit_blorp_prepared_backend.render_prepared_emit_json
+let render_stack_result_payload ~result_type ~tag ~field ~payload ~release_mask =
+  Core_emit_blorp_prepared_backend.render_constructor_template
+    "backend_constructor_stack_result_payload"
+    [ result_type; tag; field; payload; release_mask ]
 
 let render_tuple_name temp_seed =
-  render_prepared_emit_json (tuple_name_json ~temp_seed)
+  Core_emit_blorp_prepared_backend.render_tuple_template "backend_tuple_name"
+    [ temp_seed ]
 
-let render_tuple_arg value = render_prepared_emit_json (tuple_arg_json ~value)
+let render_tuple_arg value =
+  Core_emit_blorp_prepared_backend.render_tuple_template "backend_tuple_arg"
+    [ value ]
+
+let render_tuple_construct ~arity ~args =
+  Core_emit_blorp_prepared_backend.render_tuple_template
+    "backend_tuple_construct" [ arity; args ]
 
 let render_tuple_retain_elem ~tuple ~index =
-  render_prepared_emit_json
-    (tuple_retain_elem_json ~tuple ~index:(string_of_int index))
+  Core_emit_blorp_prepared_backend.render_tuple_template
+    "backend_tuple_retain_elem" [ tuple; string_of_int index ]
+
+let render_tuple_construct_with_rc ~tuple ~arity ~args ~retain_statements
+    ~release_mask =
+  Core_emit_blorp_prepared_backend.render_tuple_template
+    "backend_tuple_construct_with_rc"
+    [ tuple; arity; args; retain_statements; release_mask ]
 
 let render_tuple_field_element ~tuple ~field =
-  render_prepared_emit_json (tuple_field_element_json ~tuple ~field)
+  Core_emit_blorp_prepared_backend.render_tuple_template
+    "backend_tuple_field_element" [ tuple; field ]
+
+let render_tuple_field_access ~tuple ~source ~read =
+  Core_emit_blorp_prepared_backend.render_tuple_template
+    "backend_tuple_field_access" [ tuple; source; read ]
 
 let render_tuple_field_element_at ~tuple_tmp ~index =
   render_tuple_field_element ~tuple:tuple_tmp ~field:(string_of_int index)
 
 type emit_node =
-  | PreparedEmitJson of string
   | DictIterHeader of { dict : string; source : core; index : string }
   | DictIterSlotBinding of { slot : string; dict : string; index : string }
   | DictIterDeletedSlotGuard of { slot : string }
@@ -552,8 +525,6 @@ let emit_list_handoff emitters ctx result handoff =
   Core_emit_blorp_prepared_backend.emit_list_handoff_close ctx ~result_c
 
 let emit emitters ctx = function
-  | PreparedEmitJson json ->
-      Core_emit_context.emit ctx (render_prepared_emit_json json)
   | DictIterHeader { dict; source; index } ->
       Core_emit_blorp_prepared_backend.emit_dict_iter_header
         ~emit_expr:emitters.emit_expr ctx ~dict ~index source

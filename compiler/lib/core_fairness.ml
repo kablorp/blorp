@@ -9,11 +9,14 @@ open Core
 
 let checkpoint_at loc = Build.cooperative_checkpoint ~loc
 
-let body_starts_with_checkpoint (body : core) : bool =
+let body_start_kind (body : core) : Core_fairness_blorp_policy.body_start =
   match body.desc with
-  | CCooperativeCheckpoint -> true
-  | CSeq ({ desc = CCooperativeCheckpoint; _ }, _) -> true
-  | _ -> false
+  | CCooperativeCheckpoint -> BodyCheckpoint
+  | CSeq ({ desc = CCooperativeCheckpoint; _ }, _) -> BodySeqCheckpoint
+  | _ -> BodyOther
+
+let body_starts_with_checkpoint (body : core) : bool =
+  Core_fairness_blorp_policy.body_starts_with_checkpoint (body_start_kind body)
 
 let add_loop_checkpoint (loop_loc : Ast.loc) (body : core) : core =
   if body_starts_with_checkpoint body then body

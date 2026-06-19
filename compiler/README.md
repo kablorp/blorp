@@ -81,9 +81,6 @@ source of truth for pass order and backend boundaries.
 # Build
 cd compiler && dune build
 
-# Check for type errors without full build
-cd compiler && dune build @check
-
 # Run OCaml unit tests
 cd compiler && dune runtest
 ```

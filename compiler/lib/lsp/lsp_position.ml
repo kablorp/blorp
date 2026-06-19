@@ -1107,7 +1107,7 @@ let find_definition (program : program) ~(name : string) ~(line : int)
 
 (** Modules whose exports are available as UFCS methods on prelude types
     without an explicit import. *)
-let prelude_ufcs_modules = Language_surface.prelude_ufcs_modules
+let prelude_ufcs_modules () = Language_surface.prelude_ufcs_modules ()
 
 (* Core trait names are accepted in bounds without an explicit source import.
    Navigation should expose only trait declarations from these modules, not every
@@ -1714,7 +1714,7 @@ let find_cross_module_definition ?base_dir (program : Ast.program)
           match
             List.find_map
               (fun mod_name -> try_module mod_name name)
-              prelude_ufcs_modules
+              (prelude_ufcs_modules ())
           with
           | Some _ as r -> r
           | None ->

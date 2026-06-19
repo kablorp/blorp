@@ -6,6 +6,11 @@ Use [ARCHITECTURE.md](ARCHITECTURE.md) for the live compiler pipeline and
 [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) for the ownership ABI. This file tracks
 the next compiler work that is still valuable enough to keep visible.
 
+Use [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) for the
+detailed OCaml-to-Blorp port plan, including the single JSON transfer point,
+incremental deletion merge points, and the expectation that compiler stage logic
+is implemented as pure functions wherever possible.
+
 ## Goals
 
 - Represent semantic facts directly instead of recovering them from names,

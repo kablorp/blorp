@@ -87,7 +87,7 @@ let kind_type_parameter = 25
    Keyword list
    ============================================================================ *)
 
-let keywords = Language_surface.lsp_completion_keywords
+let keywords () = Language_surface.lsp_completion_keywords ()
 
 (* ============================================================================
    Completion sources
@@ -844,7 +844,7 @@ let completions_from_keywords (prefix : string) : json list =
           (completion_item ~label:kw ~kind:kind_keyword ~detail:"keyword"
              ~sort_text:("3_" ^ kw))
       else None)
-    keywords
+    (keywords ())
 
 (** Build completion items from module exports *)
 let find_cached_module module_path =

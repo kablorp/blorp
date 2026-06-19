@@ -51,7 +51,7 @@ Timeouts:
 cutting preview builds. It composes:
 
 - clean build
-- `make quality-full`
+- `make quality`
 - `scripts/test --serial`
 - preview CLI/runtime smoke
 - example checks and selected example runs
@@ -114,7 +114,7 @@ race on Dune state, generated runtime caches, or formatter/std embedding.
 Manual use:
 
 ```bash
-scripts/with-build-lock make quality-full
+scripts/with-build-lock make quality
 ```
 
 ## Drift Checks

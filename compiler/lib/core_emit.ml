@@ -352,31 +352,35 @@ let is_string_global_type ty =
   | _ -> false
 
 let static_string_global_storage_name name_c =
-  Printf.sprintf "__blorp_static_string_%s" name_c
+  Core_emit_blorp_static_constant.render_string_storage_name ~name:name_c
 
 let static_list_global_storage_name name_c =
-  Printf.sprintf "__blorp_static_list_%s" name_c
+  Core_emit_blorp_static_constant.render_list_storage_name ~name:name_c
 
 let static_tuple_global_storage_name name_c =
-  Printf.sprintf "__blorp_static_tuple_%s" name_c
+  Core_emit_blorp_static_constant.render_tuple_storage_name ~name:name_c
 
 let static_record_global_storage_name name_c =
-  Printf.sprintf "__blorp_static_record_%s" name_c
+  Core_emit_blorp_static_constant.render_record_storage_name ~name:name_c
 
 let static_union_global_storage_name name_c =
-  Printf.sprintf "__blorp_static_union_%s" name_c
+  Core_emit_blorp_static_constant.render_union_storage_name ~name:name_c
 
 let static_child_path ~parent_path field_name =
-  Printf.sprintf "%s_%s" parent_path (escape_c_ident field_name)
+  Core_emit_blorp_static_constant.render_child_path ~parent:parent_path
+    ~child:(escape_c_ident field_name)
 
 let static_list_child_path ~parent_path index =
-  Printf.sprintf "%s_elem_%d" parent_path index
+  Core_emit_blorp_static_constant.render_list_child_path ~parent:parent_path
+    ~index:(string_of_int index)
 
 let static_union_child_path ~parent_path variant_name index =
-  Printf.sprintf "%s_%s_%d" parent_path (escape_c_ident variant_name) index
+  Core_emit_blorp_static_constant.render_union_child_path ~parent:parent_path
+    ~variant:(escape_c_ident variant_name) ~index:(string_of_int index)
 
 let static_tuple_child_path ~parent_path index =
-  Printf.sprintf "%s_%d" parent_path index
+  Core_emit_blorp_static_constant.render_tuple_child_path ~parent:parent_path
+    ~index:(string_of_int index)
 
 let c_string_trailing_nul_bytes = 1
 let static_list_min_capacity = 1
@@ -670,28 +674,20 @@ let can_emit_static_list_global (ctx : Core_emit_context.t) (v : core_var) =
   | _ -> false
 
 let emit_static_string_object (ctx : Core_emit_context.t) ~storage_name text =
-  let escaped = c_escape_string text in
+  let escaped_text = c_escape_string text in
   let byte_len = String.length text in
   let data_len = byte_len + c_string_trailing_nul_bytes in
   emit_line ctx
-    (Printf.sprintf
-       "static struct { blorp_Object header; long len; long capacity; char \
-        data[%d]; } %s = {"
-       data_len storage_name);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx "{ BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
-  emit_line ctx (Printf.sprintf "%dL," byte_len);
-  emit_line ctx (Printf.sprintf "%dL," byte_len);
-  emit_line ctx (Printf.sprintf "\"%s\"" escaped);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "};"
+    (Core_emit_blorp_static_constant.render_string_object
+       ~storage:storage_name ~data_len:(string_of_int data_len)
+       ~byte_len:(string_of_int byte_len) ~escaped_text)
 
 let emit_static_string_global (ctx : Core_emit_context.t) ~name_c text =
   let storage_name = static_string_global_storage_name name_c in
   emit_static_string_object ctx ~storage_name text;
   emit_line ctx
-    (Printf.sprintf "static blorp_String* %s = (blorp_String*)&%s;" name_c
-       storage_name);
+    (Core_emit_blorp_static_constant.render_string_global_pointer ~name:name_c
+       ~storage:storage_name);
   emit ctx "\n"
 
 let static_record_literal_field_error loc =
@@ -708,7 +704,8 @@ let rec emit_static_value_initializer (ctx : Core_emit_context.t) ~path_c ~ty
       let storage_name = static_string_global_storage_name path_c in
       emit_static_string_object ctx ~storage_name text;
       emit ctx "\n";
-      Printf.sprintf "(blorp_String*)&%s" storage_name
+      Core_emit_blorp_static_constant.render_string_pointer_initializer
+        ~storage:storage_name
     end
   | CLit lit -> (
       match c_static_literal_initializer lit with
@@ -716,19 +713,23 @@ let rec emit_static_value_initializer (ctx : Core_emit_context.t) ~path_c ~ty
       | Some init_expr -> init_expr)
   | CListConstruct lc ->
       let storage_name = emit_static_list_object ctx ~path_c lc in
-      Printf.sprintf "(blorp_List*)&%s" storage_name
+      Core_emit_blorp_static_constant.render_list_pointer_initializer
+        ~storage:storage_name
   | CTupleConstruct tc ->
       let storage_name = emit_static_tuple_object ctx ~path_c tc in
-      Printf.sprintf "(blorp_Tuple*)&%s" storage_name
+      Core_emit_blorp_static_constant.render_tuple_pointer_initializer
+        ~storage:storage_name
   | CRecordConstruct rc ->
       let storage_name = emit_static_record_object ctx ~path_c ~ty rc in
-      Printf.sprintf "(%s)&%s" (type_to_c ctx ty) storage_name
+      Core_emit_blorp_static_constant.render_typed_pointer_initializer
+        ~c_type:(type_to_c ctx ty) ~storage:storage_name
   | CUnionConstruct uc -> (
       match uc.uc_representation with
       | ResultUnion _ -> emit_static_stack_result_initializer ctx ~path_c uc
       | GenericUnion | OptionUnion _ ->
           let storage_name = emit_static_union_object ctx ~path_c uc in
-          Printf.sprintf "(%s)&%s" (type_to_c ctx ty) storage_name)
+          Core_emit_blorp_static_constant.render_typed_pointer_initializer
+            ~c_type:(type_to_c ctx ty) ~storage:storage_name)
   | _ ->
       Core_error.errorf Core_error.Emit expr.loc
         ~hint:
@@ -756,8 +757,10 @@ and emit_static_stack_result_initializer (ctx : Core_emit_context.t) ~path_c
         emit_static_result_payload_slot_initializer ctx ~path_c:payload_path_c
           arg
       in
-      Printf.sprintf "{ .tag = %d, .release_mask = %dUL, .data.%s.field0 = %s }"
-        uc.uc_tag uc.uc_release_mask field_name payload_initializer
+      Core_emit_blorp_static_constant.render_stack_result_initializer
+        ~tag:(string_of_int uc.uc_tag)
+        ~release_mask:(string_of_int uc.uc_release_mask)
+        ~field:field_name ~payload:payload_initializer
   | _ ->
       Core_error.errorf Core_error.Emit Ast.dummy_loc
         ~hint:"stack Result constructors are represented as tag + one payload"
@@ -771,13 +774,16 @@ and emit_static_result_payload_slot_initializer (ctx : Core_emit_context.t)
         emit_static_value_initializer ctx ~path_c
           ~ty:value.bsv_box.box_source_ty value.bsv_box.box_value
       in
-      Printf.sprintf "(void*)%s" init_expr
-  | BoxVoid -> "(void*)0"
+      Core_emit_blorp_static_constant.render_pointer_slot_initializer
+        ~expression:init_expr
+  | BoxVoid -> Core_emit_blorp_static_constant.render_void_slot_initializer ()
   | BoxPrim -> (
       match value.bsv_box.box_value.desc with
       | CLit lit -> (
           match c_static_literal_initializer lit with
-          | Some init_expr -> Printf.sprintf "(void*)(long)(%s)" init_expr
+          | Some init_expr ->
+              Core_emit_blorp_static_constant.render_primitive_slot_initializer
+                ~expression:init_expr
           | None ->
               static_record_literal_field_error value.bsv_box.box_value.loc)
       | _ ->
@@ -815,8 +821,9 @@ and emit_static_pointer_list_slot_initializer (ctx : Core_emit_context.t)
         emit_static_value_initializer ctx ~path_c
           ~ty:value.bsv_box.box_source_ty value.bsv_box.box_value
       in
-      Printf.sprintf "(void*)%s" init_expr
-  | BoxVoid -> "(void*)0"
+      Core_emit_blorp_static_constant.render_pointer_slot_initializer
+        ~expression:init_expr
+  | BoxVoid -> Core_emit_blorp_static_constant.render_void_slot_initializer ()
   | BoxPrim | BoxFloat | BoxFloat32 | BoxFloat16 | BoxInt128 | BoxUInt128
   | BoxStruct _ ->
       Core_error.errorf Core_error.Emit value.bsv_box.box_value.loc
@@ -865,33 +872,20 @@ and emit_static_pointer_list_object (ctx : Core_emit_context.t) ~path_c
   let storage_name = static_list_global_storage_name path_c in
   let elem_count = List.length lc.lc_elems in
   let capacity = max static_list_min_capacity elem_count in
+  let element_initializers =
+    match elem_initializers with
+    | [] -> "NULL"
+    | _ -> String.concat ", " elem_initializers ^ ","
+  in
+  let elem_release =
+    if lc.lc_elem_needs_release then "blorp_elem_release_fn" else "NULL"
+  in
   emit_line ctx
-    (Printf.sprintf
-       "static struct { blorp_Object header; long len; long capacity; void \
-        (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char \
-        __pad[%d]; void* data[%d]; } %s = {"
-       static_list_runtime_padding_bytes capacity storage_name);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx "{ BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
-  emit_line ctx (Printf.sprintf "%dL," elem_count);
-  emit_line ctx (Printf.sprintf "%dL," capacity);
-  emit_line ctx
-    (if lc.lc_elem_needs_release then "blorp_elem_release_fn," else "NULL,");
-  emit_line ctx "(int16_t)sizeof(void*),";
-  emit_line ctx "BLORP_LIST_STORAGE_POINTER,";
-  emit_line ctx "{ 0 },";
-  emit_line ctx "{";
-  ctx.indent <- ctx.indent + 1;
-  (match elem_initializers with
-  | [] -> emit_line ctx "NULL"
-  | _ ->
-      List.iter
-        (fun init_expr -> emit_line ctx (init_expr ^ ","))
-        elem_initializers);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "};";
+    (Core_emit_blorp_static_constant.render_pointer_list_object
+       ~storage:storage_name
+       ~padding_bytes:(string_of_int static_list_runtime_padding_bytes)
+       ~capacity:(string_of_int capacity) ~elem_count:(string_of_int elem_count)
+       ~elem_release ~element_initializers);
   emit ctx "\n";
   storage_name
 
@@ -915,33 +909,27 @@ and emit_static_inline_list_object (ctx : Core_emit_context.t) ~path_c
   let capacity = max static_list_min_capacity elem_count in
   let storage_c_type = static_inline_list_storage_c_type storage in
   let elem_size = static_inline_list_storage_elem_size storage in
+  let element_initializers =
+    match elem_initializers with
+    | [] -> "0"
+    | _ ->
+        let render_inline_initializer init_expr =
+          Core_emit_blorp_static_constant.render_inline_element_cast_initializer
+            ~c_type:storage_c_type ~expression:init_expr
+        in
+        let initializers =
+          elem_initializers |> List.map render_inline_initializer
+          |> String.concat ", "
+        in
+        initializers ^ ","
+  in
   emit_line ctx
-    (Printf.sprintf
-       "static struct { blorp_Object header; long len; long capacity; void \
-        (*elem_release)(void*); int16_t elem_size; uint8_t storage_mode; char \
-        __pad[%d]; %s data[%d]; } %s = {"
-       static_list_runtime_padding_bytes storage_c_type capacity storage_name);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx "{ BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
-  emit_line ctx (Printf.sprintf "%dL," elem_count);
-  emit_line ctx (Printf.sprintf "%dL," capacity);
-  emit_line ctx "NULL,";
-  emit_line ctx (Printf.sprintf "(int16_t)%d," elem_size);
-  emit_line ctx "BLORP_LIST_STORAGE_INLINE,";
-  emit_line ctx "{ 0 },";
-  emit_line ctx "{";
-  ctx.indent <- ctx.indent + 1;
-  (match elem_initializers with
-  | [] -> emit_line ctx "0"
-  | _ ->
-      List.iter
-        (fun init_expr ->
-          emit_line ctx (Printf.sprintf "((%s)(%s))," storage_c_type init_expr))
-        elem_initializers);
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "}";
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "};";
+    (Core_emit_blorp_static_constant.render_inline_list_object
+       ~storage:storage_name
+       ~padding_bytes:(string_of_int static_list_runtime_padding_bytes)
+       ~storage_c_type ~capacity:(string_of_int capacity)
+       ~elem_count:(string_of_int elem_count) ~elem_size:(string_of_int elem_size)
+       ~element_initializers);
   emit ctx "\n";
   storage_name
 
@@ -971,7 +959,9 @@ and emit_static_tuple_slot_initializer (ctx : Core_emit_context.t) ~path_c
       match value.bsv_box.box_value.desc with
       | CLit lit -> (
           match c_static_literal_initializer lit with
-          | Some init_expr -> Printf.sprintf "(void*)(long)(%s)" init_expr
+          | Some init_expr ->
+              Core_emit_blorp_static_constant.render_primitive_slot_initializer
+                ~expression:init_expr
           | None ->
               static_record_literal_field_error value.bsv_box.box_value.loc)
       | _ ->
@@ -985,8 +975,9 @@ and emit_static_tuple_slot_initializer (ctx : Core_emit_context.t) ~path_c
         emit_static_value_initializer ctx ~path_c
           ~ty:value.bsv_box.box_source_ty value.bsv_box.box_value
       in
-      Printf.sprintf "(void*)%s" init_expr
-  | BoxVoid -> "(void*)0"
+      Core_emit_blorp_static_constant.render_pointer_slot_initializer
+        ~expression:init_expr
+  | BoxVoid -> Core_emit_blorp_static_constant.render_void_slot_initializer ()
   | BoxFloat | BoxFloat32 | BoxFloat16 -> (
       match
         c_static_float_box_initializer value.bsv_box.box_kind
@@ -1028,19 +1019,11 @@ and emit_static_tuple_object (ctx : Core_emit_context.t) ~path_c
   let arity = List.length tc.tc_elems in
   let storage_slots = max static_tuple_min_storage_slots arity in
   emit_line ctx
-    (Printf.sprintf
-       "static struct { blorp_Object header; long arity; long release_mask; \
-        void* elem[%d]; } %s = {"
-       storage_slots storage_name);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx
-    ".header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
-  emit_line ctx (Printf.sprintf ".arity = %dL," arity);
-  emit_line ctx (Printf.sprintf ".release_mask = %dUL," tc.tc_release_mask);
-  emit_line ctx
-    (Printf.sprintf ".elem = { %s }" (String.concat ", " field_initializers));
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "};";
+    (Core_emit_blorp_static_constant.render_tuple_object
+       ~storage:storage_name ~storage_slots:(string_of_int storage_slots)
+       ~arity:(string_of_int arity)
+       ~release_mask:(string_of_int tc.tc_release_mask)
+       ~element_initializers:(String.concat ", " field_initializers));
   emit ctx "\n";
   storage_name
 
@@ -1087,18 +1070,14 @@ and emit_static_record_object (ctx : Core_emit_context.t) ~path_c ~ty
       record_decl.record_fields
   in
   let storage_name = static_record_global_storage_name path_c in
-  emit_line ctx (Printf.sprintf "static %s %s = {" type_name storage_name);
-  ctx.indent <- ctx.indent + 1;
-  emit_line ctx "{ BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
-  List.iteri
-    (fun index init_expr ->
-      let suffix =
-        if index = List.length field_initializers - 1 then "" else ","
-      in
-      emit_line ctx (init_expr ^ suffix))
-    field_initializers;
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "};";
+  let field_initializer_tail =
+    match field_initializers with
+    | [] -> ""
+    | _ -> ", " ^ String.concat ", " field_initializers
+  in
+  emit_line ctx
+    (Core_emit_blorp_static_constant.render_record_object ~c_type:type_name
+       ~storage:storage_name ~field_initializer_tail);
   emit ctx "\n";
   storage_name
 
@@ -1135,17 +1114,12 @@ and emit_static_union_object (ctx : Core_emit_context.t) ~path_c
       variant.variant_fields
   in
   let storage_name = static_union_global_storage_name path_c in
-  emit_line ctx (Printf.sprintf "static %s %s = {" uc.uc_type_name storage_name);
-  ctx.indent <- ctx.indent + 1;
   emit_line ctx
-    ".header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },";
-  emit_line ctx
-    (Printf.sprintf ".tag = %s," (variant_tag_c_name uc.uc_type_name variant));
-  emit_line ctx
-    (Printf.sprintf ".data.%s = { %s }" variant.variant_name
-       (String.concat ", " field_initializers));
-  ctx.indent <- ctx.indent - 1;
-  emit_line ctx "};";
+    (Core_emit_blorp_static_constant.render_union_object
+       ~c_type:uc.uc_type_name ~storage:storage_name
+       ~tag:(variant_tag_c_name uc.uc_type_name variant)
+       ~variant:variant.variant_name
+       ~field_initializers:(String.concat ", " field_initializers));
   emit ctx "\n";
   storage_name
 
@@ -1154,9 +1128,10 @@ let emit_static_record_global (ctx : Core_emit_context.t) (v : core_var) ~name_c
   let storage_name =
     emit_static_record_object ctx ~path_c:name_c ~ty:v.cv_ty rc
   in
+  let ty_c = type_to_c ctx v.cv_ty in
   emit_line ctx
-    (Printf.sprintf "static %s %s = (%s)&%s;" (type_to_c ctx v.cv_ty) name_c
-       (type_to_c ctx v.cv_ty) storage_name);
+    (Core_emit_blorp_static_constant.render_typed_pointer_global ~c_type:ty_c
+       ~name:name_c ~storage:storage_name);
   emit ctx "\n"
 
 let emit_static_union_global (ctx : Core_emit_context.t) (v : core_var) ~name_c
@@ -1166,31 +1141,33 @@ let emit_static_union_global (ctx : Core_emit_context.t) (v : core_var) ~name_c
       let init_expr =
         emit_static_stack_result_initializer ctx ~path_c:name_c uc
       in
+      let ty_c = type_to_c ctx v.cv_ty in
       emit_line ctx
-        (Printf.sprintf "static %s %s = %s;" (type_to_c ctx v.cv_ty) name_c
-           init_expr);
+        (Core_emit_blorp_static_constant.render_stack_value_global ~c_type:ty_c
+           ~name:name_c ~init_expr);
       emit ctx "\n"
   | GenericUnion | OptionUnion _ ->
       let storage_name = emit_static_union_object ctx ~path_c:name_c uc in
+      let ty_c = type_to_c ctx v.cv_ty in
       emit_line ctx
-        (Printf.sprintf "static %s %s = (%s)&%s;" (type_to_c ctx v.cv_ty) name_c
-           (type_to_c ctx v.cv_ty) storage_name);
+        (Core_emit_blorp_static_constant.render_typed_pointer_global
+           ~c_type:ty_c ~name:name_c ~storage:storage_name);
       emit ctx "\n"
 
 let emit_static_tuple_global (ctx : Core_emit_context.t) ~name_c
     (tc : tuple_construct) =
   let storage_name = emit_static_tuple_object ctx ~path_c:name_c tc in
   emit_line ctx
-    (Printf.sprintf "static blorp_Tuple* %s = (blorp_Tuple*)&%s;" name_c
-       storage_name);
+    (Core_emit_blorp_static_constant.render_tuple_global_pointer ~name:name_c
+       ~storage:storage_name);
   emit ctx "\n"
 
 let emit_static_list_global (ctx : Core_emit_context.t) ~name_c
     (lc : list_construct) =
   let storage_name = emit_static_list_object ctx ~path_c:name_c lc in
   emit_line ctx
-    (Printf.sprintf "static blorp_List* %s = (blorp_List*)&%s;" name_c
-       storage_name);
+    (Core_emit_blorp_static_constant.render_list_global_pointer ~name:name_c
+       ~storage:storage_name);
   emit ctx "\n"
 
 type global_constant_immortalization =
@@ -2418,9 +2395,6 @@ and render_boxed_arg ctx value =
 and render_boxed_storage_arg ctx value =
   Core_emit_blorp_template.render_arg ~emit_expr:emit_boxed_storage ctx value
 
-and emit_prepared_emit_json ctx json =
-  emit_blorp_backend ctx (PreparedEmitJson json)
-
 and constructor_argument_list args = String.concat ", " args
 
 and constructor_mask_arg = function
@@ -2539,8 +2513,7 @@ and emit_tuple_construct ctx tc =
   let arity = string_of_int (List.length tc.tc_elems) in
   let args = render_tuple_args ctx tc.tc_elems in
   if tc.tc_release_mask = 0 then
-    emit_prepared_emit_json ctx
-      (Core_emit_blorp_backend.tuple_construct_json ~arity ~args)
+    emit ctx (Core_emit_blorp_backend.render_tuple_construct ~arity ~args)
   else
     let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
     let tuple = Core_emit_blorp_backend.render_tuple_name temp_seed in
@@ -2548,9 +2521,9 @@ and emit_tuple_construct ctx tc =
       render_tuple_retain_statements ~tuple_tmp:tuple
         ~retain_mask:tc.tc_retain_mask tc.tc_elems
     in
-    emit_prepared_emit_json ctx
-      (Core_emit_blorp_backend.tuple_construct_with_rc_json ~tuple ~arity ~args
-         ~retain_statements
+    emit ctx
+      (Core_emit_blorp_backend.render_tuple_construct_with_rc ~tuple ~arity
+         ~args ~retain_statements
          ~release_mask:(string_of_int tc.tc_release_mask))
 
 and emit_list_construct ctx lc = emit_blorp_backend ctx (ListConstruct lc)
@@ -2567,8 +2540,8 @@ and emit_record_construct ctx rc =
     constructor_argument_list
       (field_args @ constructor_mask_arg rc.rc_erased_release_mask)
   in
-  emit_prepared_emit_json ctx
-    (Core_emit_blorp_backend.constructor_call_json
+  emit ctx
+    (Core_emit_blorp_backend.render_constructor_call
        ~callee:(Printf.sprintf "%s_make" rc.rc_type_name)
        ~argument_list)
 
@@ -2606,8 +2579,8 @@ and emit_union_construct ctx uc =
       let abi =
         Core_layout_type.stack_result_constructor_abi_of_layout result_layout
       in
-      emit_prepared_emit_json ctx
-        (Core_emit_blorp_backend.stack_result_payload_json
+      emit ctx
+        (Core_emit_blorp_backend.render_stack_result_payload
            ~result_type:abi.src_result_c_type ~tag:(string_of_int uc.uc_tag)
            ~field:uc.uc_constructor_name
            ~payload:(render_boxed_storage_arg ctx arg)
@@ -2619,11 +2592,10 @@ and emit_union_construct ctx uc =
   | _ -> (
       match (option_constructor_abi, uc.uc_args) with
       | Some Core_layout_type.OptionConstructorNullableManaged, [] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.constructor_nullable_none_json ())
+          emit ctx (Core_emit_blorp_backend.render_constructor_nullable_none ())
       | Some Core_layout_type.OptionConstructorNullableManaged, [ arg ] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.constructor_nullable_payload_json
+          emit ctx
+            (Core_emit_blorp_backend.render_constructor_nullable_payload
                ~payload:(render_nullable_managed_payload arg))
       | Some Core_layout_type.OptionConstructorNullableManaged, _ ->
           Core_error.errorf Core_error.Emit Ast.dummy_loc
@@ -2633,19 +2605,19 @@ and emit_union_construct ctx uc =
             "invalid nullable managed Option constructor arity for %s"
             uc.uc_constructor_name
       | Some (Core_layout_type.OptionConstructorStackInline abi), [] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.stack_option_none_json
+          emit ctx
+            (Core_emit_blorp_backend.render_stack_option_none
                ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
                ~none_value:abi.soe_none_value)
       | Some (Core_layout_type.OptionConstructorStackInline abi), [ arg ]
         when is_void_ty arg.bsv_box.box_value.ty ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.stack_option_void_statement_json
+          emit ctx
+            (Core_emit_blorp_backend.render_stack_option_void_statement
                ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
                ~statement:(render_stmt_arg ctx arg.bsv_box.box_value))
       | Some (Core_layout_type.OptionConstructorStackInline abi), [ arg ] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.stack_option_value_json
+          emit ctx
+            (Core_emit_blorp_backend.render_stack_option_value
                ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
                ~value:(render_expr_arg ctx arg.bsv_box.box_value))
       | Some (Core_layout_type.OptionConstructorStackInline _), _ ->
@@ -2663,8 +2635,8 @@ and emit_union_construct ctx uc =
             "unsupported Option constructor layout for %s: %s"
             uc.uc_constructor_name reason
       | (Some Core_layout_type.OptionConstructorBoxedUnion | None), [] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.constructor_symbol_json
+          emit ctx
+            (Core_emit_blorp_backend.render_constructor_symbol
                ~name:(escape_c_ident uc.uc_c_name))
       | (Some Core_layout_type.OptionConstructorBoxedUnion | None), args ->
           let needs_release_mask =
@@ -2679,8 +2651,9 @@ and emit_union_construct ctx uc =
               [ Printf.sprintf "%dUL" uc.uc_release_mask ]
             else []
           in
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.constructor_call_json ~callee:uc.uc_c_name
+          emit ctx
+            (Core_emit_blorp_backend.render_constructor_call
+               ~callee:uc.uc_c_name
                ~argument_list:
                  (constructor_argument_list (arg_strings @ release_args))))
 
@@ -2702,8 +2675,8 @@ and emit_union_reuse_construct ctx urc =
           [ Printf.sprintf "%dUL" urc.urc_release_mask ]
         else []
       in
-      emit_prepared_emit_json ctx
-        (Core_emit_blorp_backend.constructor_call_json
+      emit ctx
+        (Core_emit_blorp_backend.render_constructor_call
            ~callee:urc.urc_reuse_c_name
            ~argument_list:
              (constructor_argument_list
@@ -3627,17 +3600,17 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           in
           let try_emit_stack_option_ctor () =
             let emit_some c_ty arg =
-              let json =
+              let rendered =
                 if is_void_ty arg.ty then
-                  Core_emit_blorp_backend.stack_option_void_statement_json
+                  Core_emit_blorp_backend.render_stack_option_void_statement
                     ~option_type:c_ty ~tag:"BLORP_TAG_SOME"
                     ~statement:(render_stmt_arg ctx arg)
                 else
-                  Core_emit_blorp_backend.stack_option_value_json
+                  Core_emit_blorp_backend.render_stack_option_value
                     ~option_type:c_ty ~tag:"BLORP_TAG_SOME"
                     ~value:(render_expr_arg ctx arg)
               in
-              emit_prepared_emit_json ctx json
+              emit ctx rendered
             in
             match
               ( kind,
@@ -3652,8 +3625,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 emit_some c_ty arg;
                 true
             | CKBuiltin "blorp_option_none", Some c_ty, [] ->
-                emit_prepared_emit_json ctx
-                  (Core_emit_blorp_backend.stack_option_none_json
+                emit ctx
+                  (Core_emit_blorp_backend.render_stack_option_none
                      ~option_type:c_ty ~tag:"BLORP_TAG_NONE"
                      ~none_value:
                        (Core_layout_type.stack_option_none_value_for_type
@@ -3666,8 +3639,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
               if boxed_value_needs_release ctx arg.ty arg.loc then "1" else "0"
             in
             let emit_stack_result_ctor c_ty tag field arg =
-              emit_prepared_emit_json ctx
-                (Core_emit_blorp_backend.stack_result_payload_json
+              emit ctx
+                (Core_emit_blorp_backend.render_stack_result_payload
                    ~result_type:c_ty ~tag ~field
                    ~payload:(render_boxed_arg ctx arg)
                    ~release_mask:(result_payload_release_mask arg))
@@ -4877,8 +4850,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
               ~field:name
           in
           let read = render_read element in
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.tuple_field_access_json ~tuple ~source
+          emit ctx
+            (Core_emit_blorp_backend.render_tuple_field_access ~tuple ~source
                ~read)
       | TyNamed (_, _) when is_value_record_type ctx obj.ty -> (
           match value_record_layout ctx obj.ty with
@@ -6238,13 +6211,24 @@ and emit_global_var (ctx : Core_emit_context.t) (v : core_var) : unit =
   | CUnionConstruct uc when can_emit_static_union_global ctx v ->
       emit_static_union_global ctx v ~name_c uc
   | CLit lit when is_c_static_literal lit ->
-      emit_indent ctx;
-      emit ctx (Printf.sprintf "static %s %s = " ty_c name_c);
-      gen_literal ctx lit;
-      emitln ctx ";";
+      let init_expr =
+        match c_static_literal_initializer lit with
+        | Some init_expr -> init_expr
+        | None ->
+            Core_error.errorf Core_error.Emit v.cv_init.loc
+              ~hint:
+                "Only primitive literals are accepted on this scalar static \
+                 global path."
+              "cannot emit global `%s` as a scalar static initializer" name_c
+      in
+      emit_line ctx
+        (Core_emit_blorp_static_constant.render_scalar_global ~c_type:ty_c
+           ~name:name_c ~init_expr);
       emit ctx "\n"
   | _ ->
-      emit_line ctx (Printf.sprintf "static %s %s;" ty_c name_c);
+      emit_line ctx
+        (Core_emit_blorp_static_constant.render_uninitialized_global
+           ~c_type:ty_c ~name:name_c);
       emit ctx "\n"
 
 (** Emit an impl block: each method as a function with a mangled

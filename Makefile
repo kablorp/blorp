@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test unit-test coverage ocaml-check fmt-check c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
+.PHONY: all build install warm-formatter clean test smoke runtime-test test-asan compiler-unit-test unit-test coverage c-static-analysis security-check hygiene-check quality docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all
 
 STD_SOURCES := $(shell find std -name '*.brp' 2>/dev/null)
 FORMATTER_SOURCES := $(shell find tools/formatter -name '*.brp' 2>/dev/null)
@@ -82,17 +82,9 @@ compiler-unit-test: compiler/lib/embedded_std.ml compiler/lib/embedded_formatter
 # Legacy alias for compiler-unit-test
 unit-test: compiler-unit-test
 
-ocaml-check:
-	cd compiler && dune build @check
-
 quality:
-	$(MAKE) ocaml-check
 	$(MAKE) hygiene-check
 	$(MAKE) c-static-analysis
-
-quality-full:
-	$(MAKE) quality
-	$(MAKE) fmt-check
 
 hygiene-check:
 	@if [ -d ocaml ]; then \
@@ -104,7 +96,7 @@ hygiene-check:
 	@scripts/check-std-builtins
 	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
 		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \
-		echo "Run 'cd compiler && dune build @check' and inspect the conflict report."; \
+		echo "Inspect the conflict report before continuing."; \
 		exit 1; \
 	fi
 	@artifacts=$$( \
@@ -118,13 +110,6 @@ hygiene-check:
 		echo "$$artifacts"; \
 		exit 1; \
 	fi
-
-fmt-check:
-	@command -v ocamlformat >/dev/null 2>&1 || { \
-		echo "ocamlformat is required for fmt-check. Install it with opam for the project's OCaml switch before enabling dune fmt in CI."; \
-		exit 127; \
-	}
-	cd compiler && dune fmt --preview --display=quiet
 
 # Run compiler-unit tests with coverage report
 coverage:

@@ -1,0 +1,224 @@
+-- Blorp-owned source-language surface tables shared by parser-adjacent
+-- tooling, typecheck, and LSP.
+import:
+	codegen_template_registry:
+		render_template_arity_error,
+		render_template_manifest_line,
+		render_unsupported_template_error,
+
+
+enum LanguageSurfaceTemplate:
+	CompletionKeywordsTemplate
+	PreludeMethodTypeImportsTemplate
+
+
+record LanguageSurfaceTemplateInfo {
+	template: LanguageSurfaceTemplate,
+	name: String,
+	arity: Int
+}
+
+
+union LanguageSurfaceOp:
+	CompletionKeywords
+	PreludeMethodTypeImports
+
+
+union RenderError:
+	WrongArity(LanguageSurfaceTemplateInfo, Int)
+	UnsupportedLanguageSurfaceOp(String)
+
+
+COMPLETION_KEYWORDS: List[String] = [
+	"func",
+	"pure",
+	"var",
+	"union",
+	"record",
+	"void",
+	"while",
+	"for",
+	"in",
+	"if",
+	"else",
+	"and",
+	"or",
+	"not",
+	"match",
+	"True",
+	"False",
+	"break",
+	"continue",
+	"debug",
+	"struct",
+	"enum",
+	"with",
+	"resource",
+	"foreign",
+	"private",
+	"builtin",
+	"concurrent",
+	"concurrently",
+	"detach",
+	"select",
+	"into",
+	"from",
+	"after",
+	"sealed",
+	"import",
+	"as",
+	"trait",
+	"implements",
+	"Self",
+	"type",
+	"alias",
+	"where",
+]
+
+-- Serialized as module:type pairs because this table crosses to OCaml through
+-- the JSON template bridge as one string.
+PRELUDE_METHOD_TYPE_IMPORTS: List[String] = [
+	"option:Option",
+	"result:Result",
+	"bool:Bool",
+	"char:Char",
+	"bytes:Bytes",
+	"string:String",
+	"list:List",
+	"list:ParallelList",
+	"parallel_list:ParallelList",
+	"vector:ParallelVector",
+	"parallel_vector:ParallelVector",
+	"matrix:ParallelMatrix",
+	"parallel_matrix:ParallelMatrix",
+	"range:Range",
+	"dict:Dict",
+	"set:Set",
+	"file:FileReader",
+	"file:FileWriter",
+	"file:FileAppender",
+	"file:FileReadWriter",
+	"file:FileReadAppender",
+]
+
+
+private pure func templates_by_name(
+	templates: List[LanguageSurfaceTemplateInfo],
+) -> Dict[String, LanguageSurfaceTemplateInfo]:
+	var dict: Dict[String, LanguageSurfaceTemplateInfo] = {}
+
+	for info in templates:
+		dict = dict.set(info.name, info)
+
+	dict
+
+
+ALL_TEMPLATES: List[LanguageSurfaceTemplateInfo] = [{
+		template = CompletionKeywordsTemplate,
+		name = "language_lsp_completion_keywords",
+		arity = 0
+	}, {
+		template = PreludeMethodTypeImportsTemplate,
+		name = "language_prelude_method_type_imports",
+		arity = 0
+	}]
+
+private TEMPLATES_BY_NAME: Dict[String, LanguageSurfaceTemplateInfo] = templates_by_name(
+	ALL_TEMPLATES,
+)
+
+
+pure func language_surface_template_name(info: LanguageSurfaceTemplateInfo) -> String:
+	info.name
+
+
+pure func language_surface_template_arity(info: LanguageSurfaceTemplateInfo) -> Int:
+	info.arity
+
+
+pure func parse_language_surface_template(name: String) -> Option[LanguageSurfaceTemplateInfo]:
+	TEMPLATES_BY_NAME.get(name)
+
+
+private pure func wrong_arity_for_args(
+	info: LanguageSurfaceTemplateInfo,
+	args: List[String],
+) -> RenderError:
+	WrongArity(info, args.length())
+
+
+pure func render_error_to_string(error: RenderError) -> String:
+	match error:
+		WrongArity(info, actual):
+			render_template_arity_error(
+				"language surface op",
+				language_surface_template_name(info),
+				language_surface_template_arity(info),
+				actual,
+			)
+		UnsupportedLanguageSurfaceOp(name):
+			render_unsupported_template_error("language surface op", name)
+
+
+private pure func parse_zero_arg_op(
+	info: LanguageSurfaceTemplateInfo,
+	args: List[String],
+	op: LanguageSurfaceOp,
+) -> Result[LanguageSurfaceOp, RenderError]:
+	match args:
+		[]:
+			Ok(op)
+		_:
+			Err(wrong_arity_for_args(info, args))
+
+
+pure func render_language_surface_op(op: LanguageSurfaceOp) -> String:
+	match op:
+		CompletionKeywords:
+			COMPLETION_KEYWORDS.join(";")
+		PreludeMethodTypeImports:
+			PRELUDE_METHOD_TYPE_IMPORTS.join(";")
+
+
+pure func build_language_surface_op(
+	info: LanguageSurfaceTemplateInfo,
+	args: List[String],
+) -> Result[LanguageSurfaceOp, RenderError]:
+	match info.template:
+		CompletionKeywordsTemplate:
+			parse_zero_arg_op(info, args, CompletionKeywords)
+		PreludeMethodTypeImportsTemplate:
+			parse_zero_arg_op(info, args, PreludeMethodTypeImports)
+
+
+pure func render_language_surface(name: String, args: List[String]) -> Result[String, RenderError]:
+	match parse_language_surface_template(name):
+		Some(info):
+			match build_language_surface_op(info, args):
+				Ok(op):
+					Ok(render_language_surface_op(op))
+				Err(error):
+					Err(error)
+		None:
+			Err(UnsupportedLanguageSurfaceOp(name))
+
+
+private pure func placeholder_language_surface_op(
+	info: LanguageSurfaceTemplateInfo,
+) -> LanguageSurfaceOp:
+	match info.template:
+		CompletionKeywordsTemplate:
+			CompletionKeywords
+		PreludeMethodTypeImportsTemplate:
+			PreludeMethodTypeImports
+
+
+pure func render_manifest_line(info: LanguageSurfaceTemplateInfo) -> String:
+	name: String = language_surface_template_name(info)
+	arity: Int = language_surface_template_arity(info)
+	body: String = render_language_surface_op(placeholder_language_surface_op(info))
+	render_template_manifest_line(name, arity, body)
+
+
+pure func render_manifest_lines() -> List[String]:
+	ALL_TEMPLATES.map(render_manifest_line)

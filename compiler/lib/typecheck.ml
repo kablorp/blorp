@@ -3611,7 +3611,9 @@ let () =
             | _ -> env)
           env m.decls
       in
-      let prelude_type_imports = Language_surface.prelude_method_type_imports in
+      let prelude_type_imports =
+        Language_surface.prelude_method_type_imports ()
+      in
       let env =
         List.fold_left
           (fun env (mod_name, type_name) ->
