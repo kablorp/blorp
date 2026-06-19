@@ -2579,11 +2579,6 @@ and emit_tensor_fill_factory ctx loc ty value dims =
   let layout = Core_emit_util.tensor_storage_layout_of_type ctx ty loc in
   emit_blorp_backend ctx (TensorDirectFillFactory { loc; layout; value; dims })
 
-and emit_union_constructor_arg ctx type_name arg =
-  if union_uses_typed_payload_storage ctx type_name then
-    emit_expr ctx arg.bsv_box.box_value
-  else emit_boxed_storage ctx arg
-
 and render_union_constructor_arg ctx type_name arg =
   if union_uses_typed_payload_storage ctx type_name then
     render_expr_arg ctx arg.bsv_box.box_value
@@ -2693,8 +2688,7 @@ and emit_union_reuse_construct ctx urc =
       in
       let source_arg = render_expr_arg ctx urc.urc_source in
       let arg_strings =
-        List.map
-          (render_union_constructor_arg ctx urc.urc_type_name)
+        List.map (render_union_constructor_arg ctx urc.urc_type_name)
           urc.urc_args
       in
       let release_args =
