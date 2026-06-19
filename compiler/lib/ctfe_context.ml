@@ -57,14 +57,16 @@ let nullary_constructor_reference ctx name =
   nullary_constructor_reference_of_lookup ctx.constructor_info name
 
 let default_module_alias _ = None
+let default_module_has_global ~module_path:_ ~name:_ = false
 
 let make_function ?module_path ?(module_alias = default_module_alias)
-    ~constructor_info func =
+    ?(module_has_global = default_module_has_global) ~constructor_info func =
   {
     function_decl = func;
     function_ast = Typed_ast.func_ast func;
     function_module_path = module_path;
     function_module_alias = module_alias;
+    function_module_has_global = module_has_global;
     function_constructor_info = constructor_info;
     function_body_cache = ref None;
   }
@@ -80,33 +82,38 @@ let function_body_ir func =
           ~nullary_constructor:
             (nullary_constructor_reference_of_lookup
                func.function_constructor_info)
-          ~module_alias:func.function_module_alias func.function_decl
+          ~module_alias:func.function_module_alias
+          ~module_has_global:func.function_module_has_global func.function_decl
       in
       func.function_body_cache := Some result;
       result
 
 let rec collect_functions ?module_path ?(module_alias = default_module_alias)
-    constructor_info acc decl =
+    ?(module_has_global = default_module_has_global) constructor_info acc decl =
   match Typed_ast.decl_view decl with
   | Typed_ast.DeclFunction func -> (
       match Typed_ast.func_callable_id func with
       | Some callable_id ->
           ( callable_id,
-            make_function ?module_path ~module_alias ~constructor_info func )
+            make_function ?module_path ~module_alias ~module_has_global
+              ~constructor_info func )
           :: acc
       | None -> acc)
   | Typed_ast.DeclPrivate inner ->
-      collect_functions ?module_path ~module_alias constructor_info acc inner
+      collect_functions ?module_path ~module_alias ~module_has_global
+        constructor_info acc inner
   | _ -> acc
 
 let collect_imported_function ?module_path
-    ?(module_alias = default_module_alias) constructor_info acc decl =
+    ?(module_alias = default_module_alias)
+    ?(module_has_global = default_module_has_global) constructor_info acc decl =
   match (module_path, Typed_ast.decl_view decl) with
   | Some module_path, Typed_ast.DeclFunction func -> (
       match (Typed_ast.func_ast func).Ast.func_name with
       | Some source_name ->
           let func =
-            make_function ~module_path ~module_alias ~constructor_info func
+            make_function ~module_path ~module_alias ~module_has_global
+              ~constructor_info func
           in
           let key = (module_path, source_name) in
           let existing =
@@ -141,23 +148,29 @@ let program_constructor_decls program =
   List.fold_left collect_constructor_decls [] (Typed_ast.program_decls program)
 
 let collect_program_functions ?module_path
-    ?(module_alias = default_module_alias) constructor_info program acc =
+    ?(module_alias = default_module_alias)
+    ?(module_has_global = default_module_has_global) constructor_info program
+    acc =
   List.fold_left
-    (collect_functions ?module_path ~module_alias constructor_info)
+    (collect_functions ?module_path ~module_alias ~module_has_global
+       constructor_info)
     acc
     (Typed_ast.program_decls program)
 
-let collect_imported_program_functions constructor_info imported_programs =
+let collect_imported_program_functions ?(module_has_global = default_module_has_global)
+    constructor_info imported_programs =
   List.fold_left
     (fun acc (module_path, program, module_alias) ->
       List.fold_left
-        (collect_imported_function ~module_path ~module_alias constructor_info)
+        (collect_imported_function ~module_path ~module_alias
+           ~module_has_global constructor_info)
         acc
         (Typed_ast.program_decls program))
     [] imported_programs
 
 let of_program ?(fallback_constructor_info = fun _ -> None)
-    ?(module_alias = default_module_alias) ?(imported_programs = [])
+    ?(module_alias = default_module_alias)
+    ?(module_has_global = default_module_has_global) ?(imported_programs = [])
     (program : Typed_ast.program) =
   let constructors =
     List.fold_left
@@ -176,19 +189,23 @@ let of_program ?(fallback_constructor_info = fun _ -> None)
       List.fold_left
         (fun acc (module_path, imported_program, imported_module_alias) ->
           collect_program_functions ~module_path
-            ~module_alias:imported_module_alias constructor_info
+            ~module_alias:imported_module_alias ~module_has_global
+            constructor_info
             imported_program acc)
         [] imported_programs
     in
-    collect_program_functions ~module_alias constructor_info program imported
+    collect_program_functions ~module_alias ~module_has_global constructor_info
+      program imported
   in
   let imported_functions =
-    collect_imported_program_functions constructor_info imported_programs
+    collect_imported_program_functions ~module_has_global constructor_info
+      imported_programs
   in
   {
     functions;
     imported_functions;
     module_global_envs = [];
     module_alias;
+    module_has_global;
     constructor_info;
   }

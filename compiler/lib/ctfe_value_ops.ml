@@ -16,8 +16,17 @@ let is_named_type name ty =
   | Ast.TyNamed (actual, _) -> actual = name
   | _ -> false
 
+let normalize_desc_for_type ty desc =
+  match desc with
+  | VFloat value when is_named_type "Float32" ty ->
+      VFloat (Float_bit_pattern.round_to_float32 value)
+  | VFloat value when is_named_type "Float16" ty ->
+      VFloat (Float_bit_pattern.round_to_float16 value)
+  | _ -> desc
+
 let scalar_value expr desc =
-  Ok { ty = value_type expr; desc; loc = value_loc expr }
+  let ty = value_type expr in
+  Ok { ty; desc = normalize_desc_for_type ty desc; loc = value_loc expr }
 
 let string_flags_for_interp is_multiline =
   { Ast.sf_multiline = is_multiline; sf_raw = false }
@@ -166,7 +175,13 @@ let string_arg_value loc text =
   }
 
 let call_result_value call_expr value =
-  Ok { value with ty = value_type call_expr; loc = value_loc call_expr }
+  let ty = value_type call_expr in
+  Ok
+    {
+      ty;
+      desc = normalize_desc_for_type ty value.desc;
+      loc = value_loc call_expr;
+    }
 
 let index_upper_bound = Int64.of_int max_int
 

@@ -61,6 +61,32 @@ let typed_modules_for_ctfe () =
           Some (m.name, typed, module_alias_path import_bindings)
       | None -> None)
 
+let typed_decl_declares_global name decl =
+  match Typed_ast.decl_view decl with
+  | Typed_ast.DeclVar var -> (Typed_ast.var_ast var).Ast.var_name = Some name
+  | Typed_ast.DeclPrivate inner -> (
+      match Typed_ast.decl_view inner with
+      | Typed_ast.DeclVar var -> (Typed_ast.var_ast var).Ast.var_name = Some name
+      | Typed_ast.DeclFunction _ | Typed_ast.DeclRecord _
+      | Typed_ast.DeclTypeAlias _ | Typed_ast.DeclImpl _
+      | Typed_ast.DeclPrivate _ | Typed_ast.DeclOther ->
+          false)
+  | Typed_ast.DeclFunction _ | Typed_ast.DeclRecord _
+  | Typed_ast.DeclTypeAlias _ | Typed_ast.DeclImpl _ | Typed_ast.DeclOther ->
+      false
+
+let module_has_global_from_programs imported_programs ~module_path ~name =
+  match
+    List.find_opt
+      (fun (candidate_path, _, _) -> String.equal candidate_path module_path)
+      imported_programs
+  with
+  | Some (_, program, _) ->
+      List.exists
+        (typed_decl_declares_global name)
+        (Typed_ast.program_decls program)
+  | None -> false
+
 let rec collect_expr_references refs expr =
   let refs =
     match expr.Ast.expr_desc with
@@ -187,7 +213,9 @@ let resolved_call_for_local_function_reference expr direct =
   | _ -> None
 
 let rec negate_value loc result_ty value =
-  let ok desc = Ok { ty = result_ty; desc; loc } in
+  let ok desc =
+    Ok { ty = result_ty; desc = normalize_desc_for_type result_ty desc; loc }
+  in
   match value.desc with
   | VInt n -> ok (VInt (Int64.neg n))
   | VFloat n -> ok (VFloat (-.n))
@@ -314,7 +342,9 @@ let rec eval_ir ctx env expr =
       eval_ir ctx env rhs >>= fun value ->
       eval_binary_desc loc (Ast.binop_of_assign_op op) current value
       >>= fun desc ->
-      let updated = { current with desc; loc } in
+      let updated =
+        { current with desc = normalize_desc_for_type current.ty desc; loc }
+      in
       assign env loc name updated
   | IR.Void -> scalar_value expr VVoid
   | IR.Break | IR.Continue -> unsupported loc "this expression form"
@@ -953,7 +983,7 @@ let evaluate_global_var_decl ctx env ~private_ ~loc ?doc ?module_alias
             IR.of_typed_var_initializer
               ~nullary_constructor:
                 (Ctfe_context.nullary_constructor_reference ctx)
-              ?module_alias typed_var
+              ~module_has_global:ctx.module_has_global ?module_alias typed_var
           with
           | Error err -> translate_error err
           | Ok init -> (
@@ -1041,9 +1071,12 @@ let evaluate_program ?(constructor_info = fun _ -> None) ?(import_bindings = [])
     (program : Typed_ast.program) =
   let imported_programs = typed_modules_for_ctfe () in
   let module_alias = module_alias_path import_bindings in
+  let module_has_global =
+    module_has_global_from_programs imported_programs
+  in
   let ctx =
     Ctfe_context.of_program ~fallback_constructor_info:constructor_info
-      ~module_alias ~imported_programs program
+      ~module_alias ~module_has_global ~imported_programs program
   in
   build_module_global_envs ctx imported_programs >>= fun module_global_envs ->
   let ctx = Ctfe_context.with_module_global_envs ctx module_global_envs in

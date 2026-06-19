@@ -18,6 +18,7 @@ type ctfe_function = {
   function_ast : Ast.func_decl;
   function_module_path : string option;
   function_module_alias : string -> string option;
+  function_module_has_global : module_path:string -> name:string -> bool;
   function_constructor_info : string -> constructor_info option;
   function_body_cache : function_body_result option ref;
 }
@@ -96,5 +97,6 @@ type ctx = {
   imported_functions : ((string * string) * ctfe_function list) list;
   module_global_envs : (string * env) list;
   module_alias : string -> string option;
+  module_has_global : module_path:string -> name:string -> bool;
   constructor_info : string -> constructor_info option;
 }
