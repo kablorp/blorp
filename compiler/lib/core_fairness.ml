@@ -9,14 +9,44 @@ open Core
 
 let checkpoint_at loc = Build.cooperative_checkpoint ~loc
 
-let body_start_kind (body : core) : Core_fairness_blorp_policy.body_start =
+type body_start =
+  | BodyCheckpoint
+  | BodySeqCheckpoint
+  | BodyOther
+
+let op_of_body_start = function
+  | BodyCheckpoint -> "fairness_body_checkpoint"
+  | BodySeqCheckpoint -> "fairness_body_seq_checkpoint"
+  | BodyOther -> "fairness_body_other"
+
+let bool_of_policy_text = function
+  | "true" -> true
+  | "false" -> false
+  | text -> invalid_arg ("invalid Core fairness policy boolean: " ^ text)
+
+let policy_rows =
+  lazy
+    (Compiler_blorp_bridge.render_many_via_command_exn
+       ~renderer:Compiler_blorp_bridge.core_fairness_renderer
+       [
+         ("fairness_body_checkpoint", []);
+         ("fairness_body_seq_checkpoint", []);
+         ("fairness_body_other", []);
+       ])
+
+let render_policy op =
+  match List.assoc_opt op (Lazy.force policy_rows) with
+  | Some text -> text
+  | None -> invalid_arg ("missing Core fairness policy row: " ^ op)
+
+let body_start_kind (body : core) : body_start =
   match body.desc with
   | CCooperativeCheckpoint -> BodyCheckpoint
   | CSeq ({ desc = CCooperativeCheckpoint; _ }, _) -> BodySeqCheckpoint
   | _ -> BodyOther
 
 let body_starts_with_checkpoint (body : core) : bool =
-  Core_fairness_blorp_policy.body_starts_with_checkpoint (body_start_kind body)
+  body_start_kind body |> op_of_body_start |> render_policy |> bool_of_policy_text
 
 let add_loop_checkpoint (loop_loc : Ast.loc) (body : core) : core =
   if body_starts_with_checkpoint body then body

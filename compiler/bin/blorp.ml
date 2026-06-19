@@ -196,7 +196,7 @@ let run_compiler_bridge_command args =
     | Some action
       when String.equal action Compiler_blorp_bridge.compile_source_action ->
         render_compile_source_request_json request_json
-    | _ -> Compiler_blorp_bridge.render_request_json request_json
+    | _ -> Compiler_blorp_bridge.run_renderer_request_via_blorp request_json
   in
   print_endline response_json;
   0

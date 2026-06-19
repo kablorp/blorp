@@ -1,0 +1,212 @@
+import:
+	../compiler_bridge_protocol:
+		BRIDGE_DOMAIN,
+		BRIDGE_SCHEMA_VERSION,
+		BridgeAction(
+			CompileSourceAction,
+			EmitCAction,
+			RenderAction,
+			RunCorePipelineAction,
+			TypecheckAndCompileAction,
+		),
+		BridgeProtocolError(
+			ExpectedField,
+			InvalidJson,
+			MissingField,
+			UnsupportedAction,
+			UnsupportedDomain,
+			UnsupportedSchema,
+		),
+		bridge_action_name,
+		bridge_error_json,
+		bridge_error_response,
+		bridge_protocol_error_code,
+		bridge_protocol_error_message,
+		bridge_success_json,
+		bridge_success_response,
+		decode_bridge_envelope,
+		parse_bridge_action,
+	json: JsonValue(JsonBool, JsonNumber, JsonObject, JsonString), as_bool, as_string, get_field
+	test: TestSuite
+
+
+func action_round_trip(name: String, action: BridgeAction) -> Bool:
+	match parse_bridge_action(name):
+		Ok(parsed):
+			parsed == action and bridge_action_name(parsed) == name
+		Err(_):
+			False
+
+
+func test_action_names_are_stable() -> Bool:
+	(
+		action_round_trip("render", RenderAction)
+		and action_round_trip("emit_c", EmitCAction)
+		and action_round_trip("run_core_pipeline", RunCorePipelineAction)
+		and action_round_trip("typecheck_and_compile", TypecheckAndCompileAction)
+		and action_round_trip("compile_source", CompileSourceAction)
+	)
+
+
+func test_decode_current_compile_source_envelope() -> Bool:
+	source: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"compile_source\"," + "\"filename\":\"main.brp\",\"source\":\"func main(args: List[String]):\\n\\t0\"}"
+
+	match decode_bridge_envelope(source):
+		Ok(envelope):
+			(
+				envelope.schema == BRIDGE_SCHEMA_VERSION
+				and envelope.domain == BRIDGE_DOMAIN
+				and envelope.action == CompileSourceAction
+				and envelope.action_name == "compile_source"
+			)
+		Err(_):
+			False
+
+
+func test_decode_future_payload_envelope() -> Bool:
+	source: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"emit_c\"," + "\"payload\":{\"core\":\"final-core-json\"}}"
+
+	match decode_bridge_envelope(source):
+		Ok(envelope):
+			match get_field(envelope.payload, "core"):
+				Some(value):
+					match as_string(value):
+						Some(core):
+							envelope.action == EmitCAction and core == "final-core-json"
+						None:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+func test_decode_errors_are_typed() -> Bool:
+	missing_schema_ok: Bool = match decode_bridge_envelope(
+		"{\"domain\":\"compiler\",\"action\":\"compile_source\"}",
+	):
+		Err(MissingField(field_name)):
+			field_name == "schema"
+		_:
+			False
+
+	wrong_schema_ok: Bool = match decode_bridge_envelope(
+		"{\"schema\":2,\"domain\":\"compiler\",\"action\":\"compile_source\"}",
+	):
+		Err(UnsupportedSchema(schema)):
+			schema == 2
+		_:
+			False
+
+	wrong_domain_ok: Bool = match decode_bridge_envelope(
+		"{\"schema\":1,\"domain\":\"fmt\",\"action\":\"compile_source\"}",
+	):
+		Err(UnsupportedDomain(domain)):
+			domain == "fmt"
+		_:
+			False
+
+	wrong_action_ok: Bool = match decode_bridge_envelope(
+		"{\"schema\":1,\"domain\":\"compiler\",\"action\":\"missing\"}",
+	):
+		Err(UnsupportedAction(action)):
+			action == "missing"
+		_:
+			False
+
+	invalid_json_ok: Bool = match decode_bridge_envelope("{not json"):
+		Err(InvalidJson(message)):
+			message.length() > 0
+		_:
+			False
+
+	wrong_type_ok: Bool = match decode_bridge_envelope(
+		"{\"schema\":\"1\",\"domain\":\"compiler\",\"action\":\"compile_source\"}",
+	):
+		Err(ExpectedField(field_name, expected)):
+			field_name == "schema" and expected == "a number"
+		_:
+			False
+
+	all_ok: Bool = (
+		missing_schema_ok
+		and wrong_schema_ok
+		and wrong_domain_ok
+		and wrong_action_ok
+		and invalid_json_ok
+		and wrong_type_ok
+	)
+
+	all_ok
+
+
+func test_error_code_and_message() -> Bool:
+	action_error: BridgeProtocolError = UnsupportedAction("missing")
+	schema_error: BridgeProtocolError = UnsupportedSchema(9)
+	field_error: BridgeProtocolError = ExpectedField("schema", "a number")
+
+	(
+		bridge_protocol_error_code(action_error) == "unsupported_action"
+		and bridge_protocol_error_message(
+			action_error,
+		) == "unsupported Blorp bridge action: missing"
+		and bridge_protocol_error_code(schema_error) == "unsupported_schema"
+		and bridge_protocol_error_message(schema_error) == "unsupported Blorp bridge schema: 9"
+		and bridge_protocol_error_code(field_error) == "invalid_request"
+		and bridge_protocol_error_message(field_error) == "bridge field `schema` must be a number"
+	)
+
+
+func test_response_json_shapes() -> Bool:
+	success = bridge_success_json(JsonObject([("c_code", JsonString("int main(void){}"))]))
+	success_text: String = bridge_success_response(
+		JsonObject([("c_code", JsonString("int main(void){}"))]),
+	)
+	error = bridge_error_json(UnsupportedAction("missing"))
+	error_text: String = bridge_error_response(UnsupportedAction("missing"))
+
+	success_ok: Bool = match get_field(success, "ok"):
+		Some(value):
+			match as_bool(value):
+				Some(ok):
+					ok
+				None:
+					False
+		None:
+			False
+
+	error_ok: Bool = match get_field(error, "error"):
+		Some(error_value):
+			match get_field(error_value, "code"):
+				Some(code_value):
+					match as_string(code_value):
+						Some(code):
+							code == "unsupported_action"
+						None:
+							False
+				None:
+					False
+		None:
+			False
+
+	responses_ok: Bool = (
+		success_ok
+		and error_ok
+		and success_text.contains("\"ok\":true")
+		and error_text.contains("\"code\":\"unsupported_action\"")
+	)
+
+	responses_ok
+
+
+tests: TestSuite = {
+	description = "Blorp compiler bridge protocol",
+	tests = [
+		("action names are stable", test_action_names_are_stable),
+		("decode current compile_source envelope", test_decode_current_compile_source_envelope),
+		("decode future payload envelope", test_decode_future_payload_envelope),
+		("decode errors are typed", test_decode_errors_are_typed),
+		("error code and message", test_error_code_and_message),
+		("response JSON shapes", test_response_json_shapes),
+	]
+}

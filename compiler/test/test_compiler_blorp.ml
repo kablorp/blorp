@@ -36,6 +36,16 @@ let contains_sub haystack needle =
   in
   needle_len = 0 || loop 0
 
+let with_env_value name value f =
+  let previous = Sys.getenv_opt name in
+  Unix.putenv name value;
+  Fun.protect
+    ~finally:(fun () ->
+      match previous with
+      | Some old_value -> Unix.putenv name old_value
+      | None -> Unix.putenv name "")
+    f
+
 let rec collect_ml_files dir =
   Sys.readdir dir |> Array.to_list
   |> List.concat_map (fun entry ->
@@ -71,28 +81,36 @@ let test_template_substitution_supports_multi_digit_placeholders () =
     "multi-digit placeholder output" "arg10:arg0:arg9" rendered
 
 let test_json_bridge_renders_static_constant () =
-  let request =
-    Blorp.Compiler_blorp_bridge.request_json ~action:"render"
+  let rendered =
+    Blorp.Compiler_blorp_bridge.render_exn
       ~renderer:"static_constant" ~op:"static_string_global_pointer"
-      ~args:[ "GREETING"; "__blorp_static_string_GREETING" ] ()
+      [ "GREETING"; "__blorp_static_string_GREETING" ]
   in
-  let response =
-    Blorp.Compiler_blorp_bridge.render_request_json request |> Blorp.Lsp_json.parse
-  in
-  Alcotest.(check (option string))
+  Alcotest.(check string)
     "rendered text"
-    (Some
-       "static blorp_String* GREETING = \
-        (blorp_String*)&__blorp_static_string_GREETING;")
-    (Blorp.Lsp_json.get_string "text" response)
+    "static blorp_String* GREETING = \
+     (blorp_String*)&__blorp_static_string_GREETING;"
+    rendered
 
 let test_json_bridge_reports_errors_as_json () =
+  let repo_root = Filename.dirname (find_project_file "Makefile") in
+  let blorp = Filename.concat repo_root "blorp" in
   let request =
-    Blorp.Compiler_blorp_bridge.request_json ~action:"render"
-      ~renderer:"missing" ~op:"anything" ()
+    Blorp.Lsp_json.to_string
+      (Blorp.Lsp_json.Object
+         [
+           ("schema", Blorp.Lsp_json.Int 1);
+           ("domain", Blorp.Lsp_json.String "compiler");
+           ("action", Blorp.Lsp_json.String "render");
+           ("renderer", Blorp.Lsp_json.String "missing");
+           ("op", Blorp.Lsp_json.String "anything");
+           ("args", Blorp.Lsp_json.Array []);
+         ])
   in
   let response =
-    Blorp.Compiler_blorp_bridge.render_request_json request |> Blorp.Lsp_json.parse
+    Blorp.Compiler_blorp_bridge.run_renderer_request_via_blorp ~program:blorp
+      request
+    |> Blorp.Lsp_json.parse
   in
   let message =
     match Blorp.Lsp_json.get "error" response with
@@ -103,36 +121,46 @@ let test_json_bridge_reports_errors_as_json () =
     "error message" (Some "unsupported Blorp renderer: missing") message
 
 let test_json_bridge_renders_core_fairness_policy () =
-  let request =
-    Blorp.Compiler_blorp_bridge.request_json ~action:"render"
+  let rendered =
+    Blorp.Compiler_blorp_bridge.render_many_via_command_exn
       ~renderer:Blorp.Compiler_blorp_bridge.core_fairness_renderer
-      ~op:"fairness_body_other" ()
-  in
-  let response =
-    Blorp.Compiler_blorp_bridge.render_request_json request |> Blorp.Lsp_json.parse
+      [ ("fairness_body_other", []) ]
   in
   Alcotest.(check (option string))
     "rendered policy" (Some "false")
-    (Blorp.Lsp_json.get_string "text" response)
+    (List.assoc_opt "fairness_body_other" rendered)
 
 let test_json_bridge_renders_language_surface_table () =
+  let repo_root = Filename.dirname (find_project_file "Makefile") in
+  let blorp = Filename.concat repo_root "blorp" in
   let request =
-    Blorp.Compiler_blorp_bridge.request_json ~action:"render"
-      ~renderer:Blorp.Compiler_blorp_bridge.language_surface_renderer
-      ~op:"language_lsp_completion_keywords" ()
+    Blorp.Lsp_json.to_string
+      (Blorp.Lsp_json.Object
+         [
+           ("schema", Blorp.Lsp_json.Int 1);
+           ("domain", Blorp.Lsp_json.String "compiler");
+           ("action", Blorp.Lsp_json.String "render");
+           ( "renderer",
+             Blorp.Lsp_json.String
+               Blorp.Compiler_blorp_bridge.language_surface_renderer );
+           ( "op",
+             Blorp.Lsp_json.String "language_lsp_completion_keywords" );
+           ("args", Blorp.Lsp_json.Array []);
+         ])
   in
   let response =
-    Blorp.Compiler_blorp_bridge.render_request_json request |> Blorp.Lsp_json.parse
+    Blorp.Compiler_blorp_bridge.run_renderer_request_via_blorp ~program:blorp
+      request
+    |> Blorp.Lsp_json.parse
   in
-  Alcotest.(check (option string))
+  Alcotest.(check string)
     "rendered table"
-    (Some
-       "func;pure;var;union;record;void;while;for;in;if;else;and;or;not;match;True;False;break;continue;debug;struct;enum;with;resource;foreign;private;builtin;concurrent;concurrently;detach;select;into;from;after;sealed;import;as;trait;implements;Self;type;alias;where")
-    (Blorp.Lsp_json.get_string "text" response)
+    "func;pure;var;union;record;void;while;for;in;if;else;and;or;not;match;True;False;break;continue;debug;struct;enum;with;resource;foreign;private;builtin;concurrent;concurrently;detach;select;into;from;after;sealed;import;as;trait;implements;Self;type;alias;where"
+    (Option.value (Blorp.Lsp_json.get_string "text" response) ~default:"")
 
 let test_json_bridge_renders_language_surface_batch () =
   let rendered =
-    Blorp.Compiler_blorp_bridge.render_many_exn
+    Blorp.Compiler_blorp_bridge.render_many_via_command_exn
       ~renderer:Blorp.Compiler_blorp_bridge.language_surface_renderer
       [
         ("language_lsp_completion_keywords", []);
@@ -181,6 +209,49 @@ let test_compiler_bridge_command_renders_batch () =
     (Some
        "func;pure;var;union;record;void;while;for;in;if;else;and;or;not;match;True;False;break;continue;debug;struct;enum;with;resource;foreign;private;builtin;concurrent;concurrently;detach;select;into;from;after;sealed;import;as;trait;implements;Self;type;alias;where")
     (List.assoc_opt "language_lsp_completion_keywords" rendered)
+
+let test_compiler_bridge_command_uses_blorp_payload_dispatch () =
+  let repo_root = Filename.dirname (find_project_file "Makefile") in
+  let blorp = Filename.concat repo_root "blorp" in
+  let request =
+    Blorp.Lsp_json.to_string
+      (Blorp.Lsp_json.Object
+         [
+           ("schema", Blorp.Lsp_json.Int 1);
+           ("domain", Blorp.Lsp_json.String "compiler");
+           ("action", Blorp.Lsp_json.String "render");
+           ( "payload",
+             Blorp.Lsp_json.Object
+               [
+                 ("renderer", Blorp.Lsp_json.String "prepared_tuple");
+                 ("op", Blorp.Lsp_json.String "backend_tuple_name");
+                 ("args", Blorp.Lsp_json.Array [ Blorp.Lsp_json.String "12" ]);
+               ] );
+         ])
+  in
+  let response =
+    Blorp.Compiler_blorp_bridge.run_request_via_command ~program:blorp request
+    |> Blorp.Lsp_json.parse
+  in
+  Alcotest.(check (option string))
+    "payload-rendered text" (Some "__tup_12")
+    (Blorp.Lsp_json.get_string "text" response)
+
+let test_renderer_helper_env_uses_manifest_bootstrap () =
+  with_env_value Blorp.Compiler_blorp_bridge.renderer_bridge_helper_env "1"
+    (fun () ->
+      with_env_value Blorp.Compiler_blorp_bridge.renderer_bridge_source_env
+        "/tmp/blorp-missing-renderer-helper.brp" (fun () ->
+          let rendered =
+            Blorp.Compiler_blorp_bridge.render_many_via_command_exn
+              ~renderer:Blorp.Compiler_blorp_bridge.language_surface_renderer
+              [ ("language_lsp_completion_keywords", []) ]
+          in
+          Alcotest.(check (option string))
+            "bootstrap keywords"
+            (Some
+               "func;pure;var;union;record;void;while;for;in;if;else;and;or;not;match;True;False;break;continue;debug;struct;enum;with;resource;foreign;private;builtin;concurrent;concurrently;detach;select;into;from;after;sealed;import;as;trait;implements;Self;type;alias;where")
+            (List.assoc_opt "language_lsp_completion_keywords" rendered)))
 
 let test_compiler_bridge_command_compiles_source () =
   let repo_root = Filename.dirname (find_project_file "Makefile") in
@@ -302,6 +373,10 @@ let suite =
           `Quick test_json_bridge_renders_language_surface_batch;
         Alcotest.test_case "renders batch through compiler bridge command"
           `Quick test_compiler_bridge_command_renders_batch;
+        Alcotest.test_case "uses Blorp payload dispatch through bridge command"
+          `Quick test_compiler_bridge_command_uses_blorp_payload_dispatch;
+        Alcotest.test_case "renderer helper env uses manifest bootstrap"
+          `Quick test_renderer_helper_env_uses_manifest_bootstrap;
         Alcotest.test_case "compiles source through compiler bridge command"
           `Quick test_compiler_bridge_command_compiles_source;
         Alcotest.test_case "language surface uses command handoff" `Quick

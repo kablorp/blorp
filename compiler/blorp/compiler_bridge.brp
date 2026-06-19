@@ -1,0 +1,488 @@
+-- Pure compiler bridge dispatcher for Blorp-owned compiler slices.
+--
+-- This module deliberately keeps command I/O out. The public handlers accept
+-- JSON values/strings and return JSON response values/strings so the eventual
+-- command wrapper is a thin stdin/stdout perimeter around pure compiler code.
+import:
+	codegen_intrinsic_renderer as Intrinsic
+	codegen_prepared_backend_renderer as PreparedBackend
+	codegen_prepared_constructor_renderer as PreparedConstructor
+	codegen_prepared_list_renderer as PreparedList
+	codegen_prepared_tensor_renderer as PreparedTensor
+	codegen_prepared_tuple_renderer as PreparedTuple
+	codegen_static_constant_renderer as StaticConstant
+	compiler_bridge_protocol:
+		BRIDGE_SCHEMA_VERSION,
+		BridgeAction(ListOpsAction, RenderAction, RenderManyAction, TemplateArityAction),
+		BridgeEnvelope,
+		BridgeProtocolError(InvalidJson),
+		bridge_action_name,
+		bridge_error_json,
+		decode_bridge_envelope_value,
+	core_fairness_policy as CoreFairness
+	json:
+		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
+		as_array,
+		as_string,
+		get_field,
+		parse_json,
+	language_surface_manifest as LanguageSurface
+
+
+enum BridgeRenderer:
+	StaticConstantRenderer
+	IntrinsicRenderer
+	PreparedBackendRenderer
+	PreparedListRenderer
+	PreparedTensorRenderer
+	PreparedConstructorRenderer
+	PreparedTupleRenderer
+	CoreFairnessRenderer
+	LanguageSurfaceRenderer
+
+
+record RenderItem {
+	op: String,
+	args: List[String]
+}
+
+
+union BridgeDispatchError:
+	ProtocolError(BridgeProtocolError)
+	MissingStringField(String)
+	ExpectedRequestField(String, String)
+	UnsupportedRenderer(String)
+	UnsupportedBridgeAction(BridgeAction)
+	UnsupportedOp(String)
+	RenderFailure(String)
+
+
+private pure func schema_json() -> JsonValue:
+	JsonNumber(to_float(BRIDGE_SCHEMA_VERSION))
+
+
+private pure func success_json(fields: List[(String, JsonValue)]) -> JsonValue:
+	JsonObject([("schema", schema_json()), ("ok", JsonBool(True))].concat(fields))
+
+
+private pure func dispatch_error_code(error: BridgeDispatchError) -> String:
+	match error:
+		ProtocolError(_):
+			"invalid_request"
+		MissingStringField(_):
+			"invalid_request"
+		ExpectedRequestField(_, _):
+			"invalid_request"
+		UnsupportedRenderer(_):
+			"unsupported_renderer"
+		UnsupportedBridgeAction(_):
+			"unsupported_action"
+		UnsupportedOp(_):
+			"unsupported_op"
+		RenderFailure(_):
+			"render_error"
+
+
+private pure func dispatch_error_message(error: BridgeDispatchError) -> String:
+	match error:
+		ProtocolError(_):
+			"invalid bridge request"
+		MissingStringField(field_name):
+			"missing string field `" + field_name + "`"
+		ExpectedRequestField(field_name, expected):
+			"field `" + field_name + "` must be " + expected
+		UnsupportedRenderer(renderer):
+			"unsupported Blorp renderer: " + renderer
+		UnsupportedBridgeAction(action):
+			"unsupported Blorp bridge renderer action: " + bridge_action_name(action)
+		UnsupportedOp(op):
+			"unsupported Blorp renderer op: " + op
+		RenderFailure(message):
+			message
+
+
+private pure func dispatch_error_json(error: BridgeDispatchError) -> JsonValue:
+	match error:
+		ProtocolError(protocol_error):
+			bridge_error_json(protocol_error)
+		_:
+			JsonObject([("schema", schema_json()), ("ok", JsonBool(False)), ("error", JsonObject([
+						("code", JsonString(dispatch_error_code(error))),
+						("message", JsonString(dispatch_error_message(error))),
+					]))])
+
+
+private pure func parse_renderer(name: String) -> Result[BridgeRenderer, BridgeDispatchError]:
+	match name:
+		"static_constant":
+			Ok(StaticConstantRenderer)
+		"intrinsic":
+			Ok(IntrinsicRenderer)
+		"prepared_backend":
+			Ok(PreparedBackendRenderer)
+		"prepared_list":
+			Ok(PreparedListRenderer)
+		"prepared_tensor":
+			Ok(PreparedTensorRenderer)
+		"prepared_constructor":
+			Ok(PreparedConstructorRenderer)
+		"prepared_tuple":
+			Ok(PreparedTupleRenderer)
+		"core_fairness":
+			Ok(CoreFairnessRenderer)
+		"language_surface":
+			Ok(LanguageSurfaceRenderer)
+		_:
+			Err(UnsupportedRenderer(name))
+
+
+private pure func request_body(root: JsonValue, envelope: BridgeEnvelope) -> JsonValue:
+	match get_field(root, "payload"):
+		Some(_):
+			envelope.payload
+		None:
+			root
+
+
+private pure func string_field(
+	value: JsonValue,
+	field_name: String,
+) -> Result[String, BridgeDispatchError]:
+	match get_field(value, field_name):
+		Some(field):
+			match as_string(field):
+				Some(text):
+					Ok(text)
+				None:
+					Err(ExpectedRequestField(field_name, "a string"))
+		None:
+			Err(MissingStringField(field_name))
+
+
+private pure func string_array_field(
+	value: JsonValue,
+	field_name: String,
+) -> Result[List[String], BridgeDispatchError]:
+	match get_field(value, field_name):
+		Some(field):
+			match as_array(field):
+				Some(items):
+					var result: List[String] = []
+					var error: Option[BridgeDispatchError] = None
+
+					for item in items:
+						match error:
+							Some(_):
+								void
+							None:
+								match as_string(item):
+									Some(text):
+										result = result.append(text)
+									None:
+										error = Some(
+											ExpectedRequestField(
+												field_name,
+												"an array of strings",
+											),
+										)
+
+					match error:
+						Some(err):
+							Err(err)
+						None:
+							Ok(result)
+				None:
+					Err(ExpectedRequestField(field_name, "an array"))
+		None:
+			Ok([])
+
+
+private pure func render_item_value(value: JsonValue) -> Result[RenderItem, BridgeDispatchError]:
+	op ?= string_field(value, "op")
+	args ?= string_array_field(value, "args")
+
+	Ok({
+		op = op,
+		args = args,
+	})
+
+
+private pure func render_items_field(
+	value: JsonValue,
+	field_name: String,
+) -> Result[List[RenderItem], BridgeDispatchError]:
+	match get_field(value, field_name):
+		Some(field):
+			match as_array(field):
+				Some(items):
+					var result: List[RenderItem] = []
+					var error: Option[BridgeDispatchError] = None
+
+					for item in items:
+						match error:
+							Some(_):
+								void
+							None:
+								match render_item_value(item):
+									Ok(render_item):
+										result = result.append(render_item)
+									Err(err):
+										error = Some(err)
+
+					match error:
+						Some(err):
+							Err(err)
+						None:
+							Ok(result)
+				None:
+					Err(ExpectedRequestField(field_name, "an array"))
+		None:
+			Ok([])
+
+
+private pure func renderer_from_request(
+	body: JsonValue,
+) -> Result[BridgeRenderer, BridgeDispatchError]:
+	renderer_name ?= string_field(body, "renderer")
+	parse_renderer(renderer_name)
+
+
+private pure func render_with(
+	renderer: BridgeRenderer,
+	op: String,
+	args: List[String],
+) -> Result[String, BridgeDispatchError]:
+	match renderer:
+		StaticConstantRenderer:
+			match StaticConstant.render_static_constant(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(StaticConstant.render_error_to_string(error)))
+		IntrinsicRenderer:
+			match Intrinsic.render_intrinsic(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(Intrinsic.render_error_to_string(error)))
+		PreparedBackendRenderer:
+			match PreparedBackend.render_prepared_backend(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(PreparedBackend.render_error_to_string(error)))
+		PreparedListRenderer:
+			match PreparedList.render_prepared_list(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(PreparedList.render_error_to_string(error)))
+		PreparedTensorRenderer:
+			match PreparedTensor.render_prepared_tensor(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(PreparedTensor.render_error_to_string(error)))
+		PreparedConstructorRenderer:
+			match PreparedConstructor.render_prepared_constructor(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(PreparedConstructor.render_error_to_string(error)))
+		PreparedTupleRenderer:
+			match PreparedTuple.render_prepared_tuple(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(PreparedTuple.render_error_to_string(error)))
+		CoreFairnessRenderer:
+			match CoreFairness.render_fairness(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(CoreFairness.render_error_to_string(error)))
+		LanguageSurfaceRenderer:
+			match LanguageSurface.render_language_surface(op, args):
+				Ok(text):
+					Ok(text)
+				Err(error):
+					Err(RenderFailure(LanguageSurface.render_error_to_string(error)))
+
+
+private pure func renderer_names(renderer: BridgeRenderer) -> List[String]:
+	match renderer:
+		StaticConstantRenderer:
+			StaticConstant.static_constant_template_names()
+		IntrinsicRenderer:
+			Intrinsic.intrinsic_names()
+		PreparedBackendRenderer:
+			PreparedBackend.prepared_backend_template_names()
+		PreparedListRenderer:
+			PreparedList.prepared_list_template_names()
+		PreparedTensorRenderer:
+			PreparedTensor.prepared_tensor_template_names()
+		PreparedConstructorRenderer:
+			PreparedConstructor.prepared_constructor_template_names()
+		PreparedTupleRenderer:
+			PreparedTuple.prepared_tuple_template_names()
+		CoreFairnessRenderer:
+			CoreFairness.fairness_template_names()
+		LanguageSurfaceRenderer:
+			LanguageSurface.language_surface_template_names()
+
+
+private pure func renderer_arity(
+	renderer: BridgeRenderer,
+	op: String,
+) -> Result[Int, BridgeDispatchError]:
+	match renderer:
+		StaticConstantRenderer:
+			match StaticConstant.parse_static_constant_template(op):
+				Some(info):
+					Ok(StaticConstant.static_constant_template_arity(info))
+				None:
+					Err(UnsupportedOp(op))
+		IntrinsicRenderer:
+			match Intrinsic.parse_intrinsic(op):
+				Some(intrinsic):
+					Ok(Intrinsic.intrinsic_arity(intrinsic))
+				None:
+					Err(UnsupportedOp(op))
+		PreparedBackendRenderer:
+			match PreparedBackend.parse_prepared_backend_template(op):
+				Some(info):
+					Ok(PreparedBackend.prepared_backend_template_arity(info))
+				None:
+					Err(UnsupportedOp(op))
+		PreparedListRenderer:
+			match PreparedList.parse_prepared_list_template(op):
+				Some(info):
+					Ok(PreparedList.prepared_list_template_arity(info))
+				None:
+					Err(UnsupportedOp(op))
+		PreparedTensorRenderer:
+			match PreparedTensor.parse_prepared_tensor_template(op):
+				Some(info):
+					Ok(PreparedTensor.prepared_tensor_template_arity(info))
+				None:
+					Err(UnsupportedOp(op))
+		PreparedConstructorRenderer:
+			match PreparedConstructor.parse_prepared_constructor_template(op):
+				Some(info):
+					Ok(PreparedConstructor.prepared_constructor_template_arity(info))
+				None:
+					Err(UnsupportedOp(op))
+		PreparedTupleRenderer:
+			match PreparedTuple.parse_prepared_tuple_template(op):
+				Some(info):
+					Ok(PreparedTuple.prepared_tuple_template_arity(info))
+				None:
+					Err(UnsupportedOp(op))
+		CoreFairnessRenderer:
+			match CoreFairness.parse_fairness_template(op):
+				Some(info):
+					Ok(CoreFairness.fairness_template_arity(info))
+				None:
+					Err(UnsupportedOp(op))
+		LanguageSurfaceRenderer:
+			match LanguageSurface.parse_language_surface_template(op):
+				Some(info):
+					Ok(LanguageSurface.language_surface_template_arity(info))
+				None:
+					Err(UnsupportedOp(op))
+
+
+private pure func handle_render(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
+	renderer ?= renderer_from_request(body)
+	op ?= string_field(body, "op")
+	args ?= string_array_field(body, "args")
+	text ?= render_with(renderer, op, args)
+
+	Ok(success_json([("text", JsonString(text))]))
+
+
+private pure func rendered_item_json(
+	renderer: BridgeRenderer,
+	item: RenderItem,
+) -> Result[JsonValue, BridgeDispatchError]:
+	text ?= render_with(renderer, item.op, item.args)
+
+	Ok(JsonObject([("op", JsonString(item.op)), ("text", JsonString(text))]))
+
+
+private pure func handle_render_many(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
+	renderer ?= renderer_from_request(body)
+	items ?= render_items_field(body, "items")
+	var rendered: List[JsonValue] = []
+	var error: Option[BridgeDispatchError] = None
+
+	for item in items:
+		match error:
+			Some(_):
+				void
+			None:
+				match rendered_item_json(renderer, item):
+					Ok(rendered_item):
+						rendered = rendered.append(rendered_item)
+					Err(err):
+						error = Some(err)
+
+	match error:
+		Some(err):
+			Err(err)
+		None:
+			Ok(success_json([("items", JsonVector(rendered))]))
+
+
+private pure func handle_list_ops(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
+	renderer ?= renderer_from_request(body)
+	names: List[JsonValue] = renderer_names(renderer).map(func(name: String): JsonString(name))
+
+	Ok(success_json([("names", JsonVector(names))]))
+
+
+private pure func handle_template_arity(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
+	renderer ?= renderer_from_request(body)
+	op ?= string_field(body, "op")
+	arity ?= renderer_arity(renderer, op)
+
+	Ok(success_json([("arity", JsonNumber(to_float(arity)))]))
+
+
+private pure func handle_envelope(
+	root: JsonValue,
+	envelope: BridgeEnvelope,
+) -> Result[JsonValue, BridgeDispatchError]:
+	body: JsonValue = request_body(root, envelope)
+
+	match envelope.action:
+		RenderAction:
+			handle_render(body)
+		RenderManyAction:
+			handle_render_many(body)
+		ListOpsAction:
+			handle_list_ops(body)
+		TemplateArityAction:
+			handle_template_arity(body)
+		_:
+			Err(UnsupportedBridgeAction(envelope.action))
+
+
+pure func handle_request_value(root: JsonValue) -> JsonValue:
+	match decode_bridge_envelope_value(root):
+		Ok(envelope):
+			match handle_envelope(root, envelope):
+				Ok(response):
+					response
+				Err(error):
+					dispatch_error_json(error)
+		Err(error):
+			bridge_error_json(error)
+
+
+pure func handle_request(source: String) -> String:
+	match parse_json(source):
+		Ok(root):
+			handle_request_value(root).to_string()
+		Err(message):
+			bridge_error_json(InvalidJson(message)).to_string()
