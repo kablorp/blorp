@@ -12,7 +12,6 @@ artifacts into the local cache, and vendors cached packages:
 blorp package check path/to/package
 blorp package hash path/to/package
 blorp package pack path/to/package -o json-1.2.0.blorpkg
-blorp package status
 blorp package fetch
 blorp package fetch blake3:8f4e2c1a9b0d7e6f json-1.2.0.blorpkg
 blorp package fetch json
@@ -20,6 +19,22 @@ blorp package vendor
 blorp package vendor blake3:8f4e2c1a9b0d7e6f vendor/json
 blorp package vendor json
 ```
+
+The intended lifecycle is explicit and content-addressed:
+
+1. Author a package directory with `package.toml` and `src/`.
+2. Run `blorp package check path/to/package`.
+3. Run `blorp package hash path/to/package` and review the content hash.
+4. Run `blorp package pack path/to/package -o package.blorpkg`.
+5. Paste or keep a `[packages]` entry with `hash` and `from`.
+6. Run `blorp package fetch` to populate the local cache.
+7. Import the package alias from root-project code.
+8. Optionally run `blorp package vendor` and switch the entry to
+   `path = "vendor/<alias>"` when checked-in dependency source is preferred.
+
+Build, check, and test commands do not fetch from the network. If a cache-backed
+package is missing, compilation fails with a `blorp package fetch <alias>` help
+message.
 
 Root projects can make a checked local source package available under an import
 alias from `blorp.toml`:
@@ -40,7 +55,8 @@ hash = "8f4e2c1a9b0d7e6f"
 from = ["https://example.com/json-1.2.0.blorpkg", "artifacts/json-1.2.0.blorpkg"]
 ```
 
-The path is relative to the `blorp.toml` file. A package alias must define
+The path is relative to the `blorp.toml` file. A package alias must be a Blorp
+identifier and cannot be the reserved roots `std` or `pkg`. It must define
 `path`, `hash`, or both. A `path` alias reads that local package directory. A
 hash-only alias reads the verified package from the local package cache. In
 both cases, the package directory must contain `package.toml` and `src/`, and
@@ -89,7 +105,8 @@ package cannot declare dependencies of its own.
 `blorp package check` enforces the portable-source boundary:
 
 - `package.toml` must declare a package name, `std` compatibility, and at
-  least one exported module.
+  least one exported module. The package name must be a Blorp identifier and
+  cannot be the reserved roots `std` or `pkg`.
 - Exported modules must be valid module paths inside the package namespace.
   For package `json`, exported modules must be `json` or `json/...`.
 - Exported module files must exist under `src/`.
@@ -126,11 +143,6 @@ are verified before the package alias is registered.
 `blorp package pack` writes a deterministic `.blorpkg` artifact. The artifact is
 a Blorp-owned source archive, not tar or zip, so no external archive metadata can
 change the package identity.
-
-`blorp package status` reads the nearest `blorp.toml` from the current working
-directory and reports whether each package alias is local, cached, missing, or
-invalid. It exits successfully only when all declared package aliases are usable
-from local source paths or the verified cache.
 
 `blorp package fetch` reads the nearest `blorp.toml` from the current working
 directory and fetches every package alias that has both `hash` and `from`.

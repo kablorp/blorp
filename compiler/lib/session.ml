@@ -81,6 +81,7 @@ type package_id = Package_id of string
 
 type module_origin =
   | Stdlib_module
+  | Native_package_module of package_id
   | Package_module of package_id
   | User_module
 
@@ -92,24 +93,28 @@ let package_id name =
   else Package_id name
 
 let package_origin name = Package_module (package_id name)
+let native_package_origin name = Native_package_module (package_id name)
 let module_origin_is_std = function Stdlib_module -> true | _ -> false
 
 let module_origin_is_package = function
-  | Package_module _ -> true
+  | Native_package_module _ | Package_module _ -> true
   | Stdlib_module | User_module -> false
 
 let module_origin_allows_builtin = function
   | Stdlib_module -> true
-  | Package_module _ | User_module -> false
+  | Native_package_module _ | Package_module _ | User_module -> false
 
 let module_origin_allows_foreign = function
+  | Native_package_module _ | User_module -> true
   | Stdlib_module | Package_module _ -> false
-  | User_module -> true
 
 let module_origin_label = function
   | Stdlib_module -> "standard library"
   | User_module -> "user module"
-  | Package_module id -> Printf.sprintf "package '%s'" (package_id_name id)
+  | Native_package_module id ->
+      Printf.sprintf "native package '%s'" (package_id_name id)
+  | Package_module id ->
+      Printf.sprintf "source package '%s'" (package_id_name id)
 
 type loaded_module = {
   name : string;  (** Canonical name: "std/list", "./utils". *)
@@ -149,8 +154,8 @@ type t = {
       (** Directories to search for [import] resolution. *)
   mutable package_roots : string list;
       (** Explicit local package roots. A [pkg/foo/bar] import resolves to
-      [<root>/foo/bar.brp] and receives [Package_module foo] origin. Bare
-      imports never consult these roots. *)
+      [<root>/foo/bar.brp] and receives [Native_package_module foo] origin.
+      Bare imports never consult these roots. *)
   mutable source_packages : source_package list;
       (** Root-project source package aliases from [blorp.toml]. These are the
       default package ecosystem aliases, distinct from the compiler-distributed

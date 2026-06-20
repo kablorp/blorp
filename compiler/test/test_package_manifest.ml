@@ -72,6 +72,48 @@ modules = ["other"]
 |}
     "must be inside package"
 
+let test_rejects_reserved_package_name () =
+  expect_error
+    {|
+[package]
+name = "std"
+
+[compat]
+std = "preview-1"
+
+[exports]
+modules = ["std"]
+|}
+    "reserved"
+
+let test_rejects_reserved_export_root () =
+  expect_error
+    {|
+[package]
+name = "json_tools"
+
+[compat]
+std = "preview-1"
+
+[exports]
+modules = ["std/json"]
+|}
+    "not a valid module path"
+
+let test_rejects_duplicate_exports () =
+  expect_error
+    {|
+[package]
+name = "json_tools"
+
+[compat]
+std = "preview-1"
+
+[exports]
+modules = ["json_tools", "json_tools"]
+|}
+    "duplicate exported module"
+
 let suite =
   [
     ( "parse",
@@ -82,5 +124,11 @@ let suite =
           test_rejects_dependency_section;
         Alcotest.test_case "rejects export outside package" `Quick
           test_rejects_export_outside_package;
+        Alcotest.test_case "rejects reserved package name" `Quick
+          test_rejects_reserved_package_name;
+        Alcotest.test_case "rejects reserved export root" `Quick
+          test_rejects_reserved_export_root;
+        Alcotest.test_case "rejects duplicate exports" `Quick
+          test_rejects_duplicate_exports;
       ] );
   ]

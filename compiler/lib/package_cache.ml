@@ -55,6 +55,19 @@ let ensure_dir path =
   in
   loop path
 
+let ensure_dir_result path =
+  try
+    ensure_dir path;
+    Ok ()
+  with
+  | Sys_error msg -> Error [ make_error ~path msg ]
+  | Unix.Unix_error (err, fn, arg) ->
+      Error
+        [
+          make_error ~path
+            (Printf.sprintf "%s(%s): %s" fn arg (Unix.error_message err));
+        ]
+
 let rec remove_tree path =
   if Sys.file_exists path then
     if Sys.is_directory path then begin
@@ -115,32 +128,124 @@ let fresh_stage_dir () =
 
 let read_cached_hash = Package_cache_layout.read_cached_hash
 
+type existing_cache_entry =
+  | ExistingUsable
+  | ExistingReplaceable
+  | ExistingCollision of string
+
+let existing_cache_entry ~dir ~hash =
+  match read_cached_hash dir with
+  | Ok existing_hash when existing_hash = hash -> (
+      if not (Sys.file_exists (ready_file dir)) then ExistingReplaceable
+      else
+        match package_check dir with
+        | Ok checked -> (
+            match package_hash dir checked.Package_check.source_files with
+            | Ok actual_hash when actual_hash = hash -> ExistingUsable
+            | Ok _ | Error _ -> ExistingReplaceable)
+        | Error _ -> ExistingReplaceable)
+  | Ok existing_hash -> ExistingCollision existing_hash
+  | Error _ -> ExistingReplaceable
+
+let remove_tree_result path =
+  try
+    remove_tree path;
+    Ok ()
+  with
+  | Sys_error msg -> Error [ make_error ~path msg ]
+  | Unix.Unix_error (err, fn, arg) ->
+      Error
+        [
+          make_error ~path
+            (Printf.sprintf "%s(%s): %s" fn arg (Unix.error_message err));
+        ]
+
+let rename_stage_result ~stage ~final =
+  try
+    Unix.rename stage final;
+    Ok final
+  with
+  | Unix.Unix_error ((Unix.EEXIST | Unix.ENOTEMPTY), _, _) ->
+      Error `DestinationExists
+  | Unix.Unix_error (err, fn, arg) ->
+      Error
+        (`RenameError
+           [
+             make_error ~path:final
+               (Printf.sprintf "%s(%s): %s" fn arg (Unix.error_message err));
+           ])
+
+let fresh_sibling_stage_dir ~parent ~basename =
+  let stage_basename =
+    match basename with "" | "." | "/" -> "vendor" | value -> value
+  in
+  match ensure_dir_result parent with
+  | Error _ as err -> err
+  | Ok () ->
+      let rec loop attempt =
+        let name =
+          Printf.sprintf ".%s.tmp.%d.%06d.%d" stage_basename (Unix.getpid ())
+            (Random.int 1_000_000) attempt
+        in
+        let path = Filename.concat parent name in
+        if Sys.file_exists path then loop (attempt + 1)
+        else
+          try
+            Unix.mkdir path 0o755;
+            Ok path
+          with
+          | Sys_error msg -> Error [ make_error ~path msg ]
+          | Unix.Unix_error (err, fn, arg) ->
+              Error
+                [
+                  make_error ~path
+                    (Printf.sprintf "%s(%s): %s" fn arg (Unix.error_message err));
+                ]
+      in
+      loop 0
+
 let finalize_stage ~stage ~hash =
   ensure_dir (algorithm_dir ());
   let final = cache_dir_for_hash hash in
-  if Sys.file_exists final then (
-    match read_cached_hash final with
-    | Ok existing_hash when existing_hash = hash ->
-        remove_tree stage;
-        Ok final
-    | Ok existing_hash ->
-        remove_tree stage;
-        Error
-          [
-            make_error ~path:final
-              (Printf.sprintf
-                 "package cache prefix collision: existing hash %s conflicts \
-                  with %s"
-                 existing_hash hash);
-          ]
-    | Error _ ->
-        remove_tree final;
-        Unix.rename stage final;
-        Ok final)
-  else begin
-    Unix.rename stage final;
-    Ok final
-  end
+  let collision_error existing_hash =
+    Error
+      [
+        make_error ~path:final
+          (Printf.sprintf
+             "package cache prefix collision: existing hash %s conflicts with \
+              %s"
+             existing_hash hash);
+      ]
+  in
+  let rec install attempt =
+    if attempt > 5 then
+      Error
+        [
+          make_error ~path:final
+            "package cache changed repeatedly while finalizing package";
+        ]
+    else if Sys.file_exists final then handle_existing attempt
+    else
+      match rename_stage_result ~stage ~final with
+      | Ok _ as ok -> ok
+      | Error `DestinationExists -> handle_existing (attempt + 1)
+      | Error (`RenameError errors) -> Error errors
+  and handle_existing attempt =
+    match existing_cache_entry ~dir:final ~hash with
+    | ExistingUsable -> (
+        match remove_tree_result stage with
+        | Ok () -> Ok final
+        | Error _ as err -> err)
+    | ExistingCollision existing_hash -> (
+        match remove_tree_result stage with
+        | Ok () -> collision_error existing_hash
+        | Error _ as err -> err)
+    | ExistingReplaceable -> (
+        match remove_tree_result final with
+        | Error _ as err -> err
+        | Ok () -> install (attempt + 1))
+  in
+  install 0
 
 let install_entries ?expected_pin entries =
   let stage = fresh_stage_dir () in
@@ -302,43 +407,74 @@ let fetch ?expected_pin locations =
   | [] -> Error [ make_error "package fetch requires at least one location" ]
   | _ -> loop [] locations
 
+let checked_cache_contents ~dir ~claimed_hash =
+  match package_check dir with
+  | Error errors -> Error errors
+  | Ok checked -> (
+      match package_hash dir checked.Package_check.source_files with
+      | Error errors -> Error errors
+      | Ok actual_hash ->
+          if actual_hash = claimed_hash then
+            Ok
+              {
+                hash = actual_hash;
+                path = dir;
+                manifest = checked.Package_check.manifest;
+              }
+          else
+            Error
+              [
+                make_error ~path:dir
+                  (Printf.sprintf
+                     "cached package content hash mismatch: cache metadata \
+                      says %s, but package contents hash to %s"
+                     claimed_hash actual_hash);
+              ])
+
 let find_cached pin =
   match Package_cache_layout.find_cached_path pin with
   | Error _ as err -> err
-  | Ok (dir, actual_hash) -> (
-      match package_check dir with
-      | Error errors -> Error errors
-      | Ok checked ->
-          Ok
-            {
-              hash = actual_hash;
-              path = dir;
-              manifest = checked.Package_check.manifest;
-            })
+  | Ok (dir, claimed_hash) -> checked_cache_contents ~dir ~claimed_hash
 
 let copy_file ~src ~dst =
   match read_file src with
   | Error err -> Error [ err ]
   | Ok contents -> (
-      ensure_dir (Filename.dirname dst);
-      match write_file dst contents with
-      | Ok () -> Ok ()
-      | Error err -> Error [ err ])
+      match ensure_dir_result (Filename.dirname dst) with
+      | Error _ as err -> err
+      | Ok () -> (
+          match write_file dst contents with
+          | Ok () -> Ok ()
+          | Error err -> Error [ err ]))
+
+let read_dir_entries path =
+  try Ok (Sys.readdir path |> Array.to_list |> List.sort String.compare)
+  with Sys_error msg -> Error [ make_error ~path msg ]
 
 let rec copy_tree ~src ~dst =
-  if is_directory src then begin
-    ensure_dir dst;
-    Sys.readdir src |> Array.to_list |> List.sort String.compare
-    |> List.fold_left
-         (fun acc name ->
-           match acc with
-           | Error _ as err -> err
-           | Ok () ->
-               copy_tree ~src:(Filename.concat src name)
-                 ~dst:(Filename.concat dst name))
-         (Ok ())
-  end
+  if is_directory src then
+    match ensure_dir_result dst with
+    | Error _ as err -> err
+    | Ok () -> (
+        match read_dir_entries src with
+        | Error _ as err -> err
+        | Ok entries ->
+            List.fold_left
+              (fun acc name ->
+                match acc with
+                | Error _ as err -> err
+                | Ok () ->
+                    copy_tree ~src:(Filename.concat src name)
+                      ~dst:(Filename.concat dst name))
+              (Ok ()) entries)
   else copy_file ~src ~dst
+
+let rename_vendor_stage ~stage ~dest =
+  match rename_stage_result ~stage ~final:dest with
+  | Ok _ -> Ok ()
+  | Error `DestinationExists ->
+      Error [ make_error ~path:dest "vendor destination already exists" ]
+  | Error (`RenameError errors) -> Error errors
 
 let vendor ~pin ~dest =
   if Sys.file_exists dest then
@@ -347,19 +483,37 @@ let vendor ~pin ~dest =
     match find_cached pin with
     | Error _ as err -> err
     | Ok cached -> (
-        ensure_dir dest;
         match
-          copy_file
-            ~src:
-              (Filename.concat cached.path Package_manifest.manifest_filename)
-            ~dst:(Filename.concat dest Package_manifest.manifest_filename)
+          fresh_sibling_stage_dir ~parent:(Filename.dirname dest)
+            ~basename:(Filename.basename dest)
         with
         | Error _ as err -> err
-        | Ok () -> (
-            match
-              copy_tree
-                ~src:(Filename.concat cached.path "src")
-                ~dst:(Filename.concat dest "src")
-            with
-            | Error _ as err -> err
-            | Ok () -> Ok cached))
+        | Ok stage ->
+            let bind result f =
+              match result with Ok value -> f value | Error _ as err -> err
+            in
+            let cleanup_on_error result =
+              match result with
+              | Ok _ as ok -> ok
+              | Error _ as err ->
+                  (try remove_tree stage with _ -> ());
+                  err
+            in
+            let result =
+              bind
+                (copy_file
+                   ~src:
+                     (Filename.concat cached.path
+                        Package_manifest.manifest_filename)
+                   ~dst:
+                     (Filename.concat stage Package_manifest.manifest_filename))
+                (fun () ->
+                  bind
+                    (copy_tree
+                       ~src:(Filename.concat cached.path "src")
+                       ~dst:(Filename.concat stage "src"))
+                    (fun () ->
+                      bind (rename_vendor_stage ~stage ~dest) (fun () ->
+                          Ok cached)))
+            in
+            cleanup_on_error result)

@@ -18,6 +18,7 @@ type inline_package_config =
       from : string list option;
     }
   | InlinePackageConfigInvalid
+  | InlinePackageConfigInvalidString of string
   | InlinePackageConfigUnsupportedKey of string
 
 type pending_package_config = {
@@ -30,6 +31,21 @@ type pending_package_config = {
 let has_prefix prefix s =
   String.length s >= String.length prefix
   && String.sub s 0 (String.length prefix) = prefix
+
+let strip_comment line =
+  let len = String.length line in
+  let rec loop i quote escaped =
+    if i >= len then len
+    else
+      match (quote, line.[i]) with
+      | None, '#' -> i
+      | None, (('"' | '\'') as q) -> loop (i + 1) (Some q) false
+      | Some '"', '\\' when not escaped -> loop (i + 1) quote true
+      | Some q, c when c = q && not escaped -> loop (i + 1) None false
+      | Some _, _ -> loop (i + 1) quote false
+      | None, _ -> loop (i + 1) None false
+  in
+  String.sub line 0 (loop 0 None false)
 
 let strip_prefix prefix s =
   String.sub s (String.length prefix) (String.length s - String.length prefix)
@@ -75,7 +91,8 @@ let parse_toml_string_value value =
           else find_end (i + 1) false
       in
       match find_end 1 false with
-      | Some i -> Some (String.sub value 1 (i - 1))
+      | Some i when i = len - 1 -> Some (String.sub value 1 (i - 1))
+      | Some _ -> None
       | None -> None
 
 let parse_toml_string_list value =
@@ -132,7 +149,7 @@ let parse_inline_table_path value =
                   | Some values -> from := Some values
                   | None -> error := Some InlinePackageConfigInvalid)
               | ("path" | "hash"), None ->
-                  error := Some InlinePackageConfigInvalid
+                  error := Some (InlinePackageConfigInvalidString key)
               | _ -> error := Some (InlinePackageConfigUnsupportedKey key)));
     match !error with
     | Some error -> error
@@ -203,6 +220,10 @@ let parse_package_paths contents =
         (Printf.sprintf
            "package alias %S must be a Blorp identifier such as json or \
             json_legacy"
+           alias)
+    else if Package_manifest.is_reserved_package_root alias then
+      add_error entry.pending_line
+        (Printf.sprintf "package alias %S is reserved by the module system"
            alias)
     else if Hashtbl.mem seen_aliases alias then
       add_error entry.pending_line
@@ -319,6 +340,11 @@ let parse_package_paths contents =
                        "package alias %S supports only path, hash, and from in \
                         this source-package preview; unsupported key %S"
                        key unsupported)
+              | InlinePackageConfigInvalidString invalid_key ->
+                  add_error line_no
+                    (Printf.sprintf
+                       "package alias %S %s must be a quoted string" key
+                       invalid_key)
               | InlinePackageConfigInvalid ->
                   add_error line_no
                     (Printf.sprintf
@@ -362,7 +388,7 @@ let parse_package_paths contents =
   List.iteri
     (fun idx raw ->
       let line_no = idx + 1 in
-      let line = String.trim raw in
+      let line = raw |> strip_comment |> String.trim in
       if line = "" || line.[0] = '#' then ()
       else if line.[0] = '[' then
         match String.index_opt line ']' with
@@ -377,6 +403,10 @@ let parse_package_paths contents =
                      "package alias %S must be a Blorp identifier such as json \
                       or json_legacy"
                      alias)
+              else if Package_manifest.is_reserved_package_root alias then
+                add_error line_no
+                  (Printf.sprintf
+                     "package alias %S is reserved by the module system" alias)
               else ignore (pending_entry alias line_no)
         | _ -> ()
       else parse_key_value line_no line)

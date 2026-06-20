@@ -97,7 +97,9 @@ let should_check_unused_imports = function
   | Explicit_target { module_name; source_kind = User_source } ->
       not (is_prelude_reexport_module module_name)
   | Loaded_dependency Session.User_module -> true
-  | Loaded_dependency (Session.Stdlib_module | Session.Package_module _) ->
+  | Loaded_dependency
+      ( Session.Stdlib_module | Session.Package_module _
+      | Session.Native_package_module _ ) ->
       false
 
 let unused_import_errors ~scope program =

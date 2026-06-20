@@ -78,7 +78,9 @@ let read_decimal path bytes start stop =
         match bytes.[i] with
         | '0' .. '9' as c ->
             let digit = Char.code c - Char.code '0' in
-            loop (i + 1) ((acc * 10) + digit)
+            if acc > (max_int - digit) / 10 then
+              Error (make_error ~path "artifact length is too large")
+            else loop (i + 1) ((acc * 10) + digit)
         | _ -> Error (make_error ~path "invalid artifact length")
     in
     loop start 0
@@ -92,12 +94,13 @@ let read_len_value path bytes offset =
       | Error _ as err -> err
       | Ok value_len ->
           let value_start = sep + 1 in
-          let value_end = value_start + value_len in
-          if value_len < 0 || value_end >= len then
+          if value_len < 0 || value_len > len - value_start - 1 then
             Error (make_error ~path "truncated artifact value")
-          else if bytes.[value_end] <> '\000' then
-            Error (make_error ~path "artifact value missing terminator")
-          else Ok (String.sub bytes value_start value_len, value_end + 1))
+          else
+            let value_end = value_start + value_len in
+            if bytes.[value_end] <> '\000' then
+              Error (make_error ~path "artifact value missing terminator")
+            else Ok (String.sub bytes value_start value_len, value_end + 1))
 
 let parse_entries path bytes =
   let len = String.length bytes in
@@ -160,16 +163,45 @@ let ensure_dir path =
   in
   loop path
 
+let validate_entries ~path entries =
+  let seen = Hashtbl.create 16 in
+  let rec loop = function
+    | [] -> Ok ()
+    | (entry : Package_hash.entry) :: rest ->
+        if not (rel_path_is_safe entry.rel_path) then
+          Error
+            [
+              make_error ~path
+                (Printf.sprintf "package artifact contains unsafe path %S"
+                   entry.rel_path);
+            ]
+        else if Hashtbl.mem seen entry.rel_path then
+          Error
+            [
+              make_error ~path
+                (Printf.sprintf "package artifact contains duplicate path %S"
+                   entry.rel_path);
+            ]
+        else begin
+          Hashtbl.add seen entry.rel_path ();
+          loop rest
+        end
+  in
+  loop entries
+
 let unpack_entries ~target entries =
-  try
-    ensure_dir target;
-    List.iter
-      (fun (entry : Package_hash.entry) ->
-        let path = Filename.concat target entry.rel_path in
-        ensure_dir (Filename.dirname path);
-        match write_file path entry.contents with
-        | Ok () -> ()
-        | Error errors -> raise (Sys_error (render_errors errors)))
-      entries;
-    Ok ()
-  with Sys_error msg -> Error [ make_error ~path:target msg ]
+  match validate_entries ~path:target entries with
+  | Error _ as err -> err
+  | Ok () -> (
+      try
+        ensure_dir target;
+        List.iter
+          (fun (entry : Package_hash.entry) ->
+            let path = Filename.concat target entry.rel_path in
+            ensure_dir (Filename.dirname path);
+            match write_file path entry.contents with
+            | Ok () -> ()
+            | Error errors -> raise (Sys_error (render_errors errors)))
+          entries;
+        Ok ()
+      with Sys_error msg -> Error [ make_error ~path:target msg ])

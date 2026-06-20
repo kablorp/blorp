@@ -3803,7 +3803,6 @@ Portable source packages can be validated with:
 blorp package check path/to/package
 blorp package hash path/to/package
 blorp package pack path/to/package -o package.blorpkg
-blorp package status
 blorp package fetch
 blorp package fetch blake3:8f4e2c1a9b0d7e6f package.blorpkg
 blorp package fetch json
@@ -3818,6 +3817,9 @@ it must typecheck, and it may not use `foreign` declarations or `builtin`. See
 [PACKAGES.md](PACKAGES.md) for the manifest shape, content hash rules, and exact
 validation rules.
 
+Build, check, and test commands do not download dependencies. Use
+`blorp package fetch` explicitly for hash-pinned cache-backed packages.
+
 Root projects can import local source packages by declaring aliases in
 `blorp.toml`:
 
@@ -3826,6 +3828,9 @@ Root projects can import local source packages by declaring aliases in
 json = { path = "vendor/json", hash = "blake3:8f4e2c1a9b0d7e6f", from = ["https://example.com/json.blorpkg", "artifacts/json.blorpkg"] }
 json_cached = { hash = "blake3:8f4e2c1a9b0d7e6f", from = ["https://example.com/json.blorpkg", "artifacts/json.blorpkg"] }
 ```
+
+Package aliases must be Blorp identifiers and cannot be the reserved roots
+`std` or `pkg`.
 
 Then source imports the alias:
 

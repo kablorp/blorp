@@ -118,6 +118,9 @@ let () =
         (fun (name, cases) -> ("PackageHash." ^ name, cases))
         Test_package_hash.suite
     @ List.map
+        (fun (name, cases) -> ("PackageArtifact." ^ name, cases))
+        Test_package_artifact.suite
+    @ List.map
         (fun (name, cases) -> ("PackageConfig." ^ name, cases))
         Test_package_config.suite
     @ List.map

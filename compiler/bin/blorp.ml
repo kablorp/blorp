@@ -905,9 +905,7 @@ let package_usage () =
   print_endline
     "  fetch [hash-or-alias [from ...]] Cache verified package artifacts";
   print_endline
-    "  status                 Show configured package cache/local status";
-  print_endline
-    "  vendor <hash> <path>  Copy a cached package to a vendor directory";
+    "  vendor [hash-or-alias [path]] Copy cached packages into vendor dirs";
   print_endline "";
   print_endline "A source package contains package.toml plus src/*.brp files.";
   print_endline
@@ -955,14 +953,8 @@ let package_vendor_usage () =
   print_endline
     "Without arguments, vendors cached packages from blorp.toml to \
      vendor/<alias>.";
-  print_endline "With an alias or hash, copies one cached package."
-
-let package_status_usage () =
-  print_endline "Usage: blorp package status";
-  print_endline "";
-  print_endline
-    "Reads the nearest blorp.toml and reports whether each dependency is local,";
-  print_endline "cached, missing, or invalid."
+  print_endline "With an alias, reads the nearest blorp.toml.";
+  print_endline "With a hash, pass an explicit destination path."
 
 let parse_package_pack_args args =
   let rec loop path output = function
@@ -1040,23 +1032,62 @@ let package_config_hash entry =
            "package alias %S must define hash to use package fetch or vendor"
            entry.Package_config.package_alias)
 
+type package_fetch_result =
+  | PackageFetched of Package_cache.cached_package
+  | PackageAlreadyCached of Package_cache.cached_package
+
+let print_package_fetch_result alias = function
+  | PackageFetched cached_package ->
+      Printf.printf "Fetched %s\nHash %s\nCache %s\n" alias
+        cached_package.Package_cache.hash cached_package.Package_cache.path
+  | PackageAlreadyCached cached_package ->
+      Printf.printf "Already cached %s\nHash %s\nCache %s\n" alias
+        cached_package.Package_cache.hash cached_package.Package_cache.path
+
 let package_fetch_config_entry entry =
   match (package_config_hash entry, entry.Package_config.package_from) with
   | Error msg, _ -> Error msg
-  | Ok _, [] ->
-      Error
-        (Printf.sprintf
-           "package alias %S has no from locations; pass locations explicitly"
-           entry.Package_config.package_alias)
-  | Ok hash, from -> (
-      match Package_cache.fetch ~expected_pin:hash from with
-      | Ok cached -> Ok cached
-      | Error errors -> Error (Package_cache.render_errors errors))
+  | Ok hash, _ -> (
+      match Package_cache.find_cached hash with
+      | Ok cached -> Ok (PackageAlreadyCached cached)
+      | Error _ -> (
+          match entry.Package_config.package_from with
+          | [] ->
+              Error
+                (Printf.sprintf
+                   "package alias %S has no from locations; pass locations \
+                    explicitly"
+                   entry.Package_config.package_alias)
+          | from -> (
+              match Package_cache.fetch ~expected_pin:hash from with
+              | Ok cached -> Ok (PackageFetched cached)
+              | Error errors -> Error (Package_cache.render_errors errors))))
 
 let package_fetch_from_config target =
   match package_config_lookup target with
   | Error _ as err -> err
-  | Ok (_, entry) -> package_fetch_config_entry entry
+  | Ok (_, entry) -> (
+      match package_fetch_config_entry entry with
+      | Ok result -> Ok (entry.Package_config.package_alias, result)
+      | Error _ as err -> err)
+
+let package_fetch_explicit target from =
+  match Package_hash.validate_hash_pin target with
+  | Error message ->
+      Error (Printf.sprintf "package hash %S is invalid: %s" target message)
+  | Ok pin -> (
+      match Package_cache.find_cached pin with
+      | Ok cached ->
+          Ok
+            ( cached.Package_cache.manifest.Package_manifest.name,
+              PackageAlreadyCached cached )
+      | Error _ -> (
+          match Package_cache.fetch ~expected_pin:pin from with
+          | Ok cached ->
+              Ok
+                ( cached.Package_cache.manifest.Package_manifest.name,
+                  PackageFetched cached )
+          | Error errors -> Error (Package_cache.render_errors errors)))
 
 let package_fetch_all_from_config () =
   let base_dir = Sys.getcwd () in
@@ -1114,103 +1145,8 @@ let package_fetch_all_from_config () =
               Ok (List.rev !fetched, List.rev !cached, List.rev !skipped_local))
       )
 
-let package_status_config_error config_path (line, message) =
+let package_config_command_error config_path (line, message) =
   Error (Printf.sprintf "%s:%d: %s" config_path line message)
-
-let package_status_local entry path =
-  let alias = entry.Package_config.package_alias in
-  match Package_check.check path with
-  | Error errors ->
-      ( false,
-        [
-          Printf.sprintf "Invalid local package %s" alias;
-          Package_check.render_errors errors;
-        ] )
-  | Ok checked -> (
-      match entry.Package_config.package_hash_pin with
-      | None ->
-          ( true,
-            [ Printf.sprintf "Local %s" alias; Printf.sprintf "Path %s" path ]
-          )
-      | Some pin -> (
-          match
-            Package_hash.hash_checked_package ~root:path
-              ~source_files:checked.Package_check.source_files
-          with
-          | Error errors ->
-              ( false,
-                [
-                  Printf.sprintf "Invalid local package %s" alias;
-                  Package_hash.render_errors errors;
-                ] )
-          | Ok actual ->
-              if Package_hash.hash_matches_pin ~pin actual then
-                ( true,
-                  [
-                    Printf.sprintf "Local %s" alias;
-                    Printf.sprintf "Hash %s" actual;
-                    Printf.sprintf "Path %s" path;
-                  ] )
-              else
-                ( false,
-                  [
-                    Printf.sprintf "Hash mismatch %s" alias;
-                    Printf.sprintf "Expected %s" pin;
-                    Printf.sprintf "Found %s" actual;
-                    Printf.sprintf "Path %s" path;
-                  ] )))
-
-let package_status_cached_or_missing entry pin =
-  let alias = entry.Package_config.package_alias in
-  match Package_cache.find_cached pin with
-  | Ok cached ->
-      ( true,
-        [
-          Printf.sprintf "Cached %s" alias;
-          Printf.sprintf "Hash %s" cached.Package_cache.hash;
-          Printf.sprintf "Cache %s" cached.Package_cache.path;
-        ] )
-  | Error _ ->
-      let lines =
-        [ Printf.sprintf "Missing %s" alias; Printf.sprintf "Hash %s" pin ]
-        @
-        if entry.Package_config.package_from = [] then
-          [ "No from locations configured" ]
-        else [ Printf.sprintf "Fetch blorp package fetch %s" alias ]
-      in
-      (false, lines)
-
-let package_status_entry entry =
-  match entry.Package_config.package_path with
-  | Some path -> package_status_local entry path
-  | None -> (
-      match entry.Package_config.package_hash_pin with
-      | Some pin -> package_status_cached_or_missing entry pin
-      | None ->
-          ( false,
-            [
-              Printf.sprintf "Invalid package %s"
-                entry.Package_config.package_alias;
-              "Package must define path or hash";
-            ] ))
-
-let package_status_from_config () =
-  let base_dir = Sys.getcwd () in
-  match Package_config.package_paths_from base_dir with
-  | None -> Error "no blorp.toml found for package status"
-  | Some (config_path, parsed) -> (
-      match parsed.Package_config.package_errors with
-      | err :: _ -> package_status_config_error config_path err
-      | [] ->
-          let statuses =
-            List.map package_status_entry parsed.Package_config.package_paths
-          in
-          let ok = List.for_all fst statuses in
-          let body = statuses |> List.map snd |> List.concat in
-          let body =
-            match body with [] -> [ "No packages declared" ] | _ -> body
-          in
-          Ok (ok, Printf.sprintf "Package status from %s" config_path :: body))
 
 type package_vendor_result =
   | PackageVendored of { name : string; hash : string; path : string }
@@ -1276,31 +1212,37 @@ let print_package_vendor_result = function
   | PackageAlreadyVendored { name; hash; path } ->
       Printf.printf "Already vendored %s\nHash %s\nPath %s\n" name hash path
 
+let package_vendor_hash_target target dest =
+  match Package_cache.vendor ~pin:target ~dest with
+  | Ok cached ->
+      Ok
+        (PackageVendored
+           {
+             name = cached.Package_cache.manifest.Package_manifest.name;
+             hash = cached.Package_cache.hash;
+             path = dest;
+           })
+  | Error errors -> Error (Package_cache.render_errors errors)
+
 let package_vendor_target target dest =
-  match package_config_lookup target with
-  | Ok (config_path, entry) -> (
-      match dest with
-      | None -> package_vendor_configured_alias ~config_path entry
-      | Some dest -> (
-          match package_config_hash entry with
-          | Error msg -> Error msg
-          | Ok hash ->
-              package_vendor_cached ~name:entry.Package_config.package_alias
-                ~pin:hash ~dest))
-  | Error lookup_error -> (
-      match dest with
-      | None -> Error lookup_error
-      | Some dest -> (
-          match Package_cache.vendor ~pin:target ~dest with
-          | Ok cached ->
-              Ok
-                (PackageVendored
-                   {
-                     name = cached.Package_cache.manifest.Package_manifest.name;
-                     hash = cached.Package_cache.hash;
-                     path = dest;
-                   })
-          | Error errors -> Error (Package_cache.render_errors errors)))
+  match dest with
+  | Some dest when Result.is_ok (Package_hash.validate_hash_pin target) ->
+      package_vendor_hash_target target dest
+  | _ -> (
+      match package_config_lookup target with
+      | Ok (config_path, entry) -> (
+          match dest with
+          | None -> package_vendor_configured_alias ~config_path entry
+          | Some dest -> (
+              match package_config_hash entry with
+              | Error msg -> Error msg
+              | Ok hash ->
+                  package_vendor_cached ~name:entry.Package_config.package_alias
+                    ~pin:hash ~dest))
+      | Error lookup_error -> (
+          match dest with
+          | None -> Error lookup_error
+          | Some dest -> package_vendor_hash_target target dest))
 
 let package_vendor_all_from_config () =
   let base_dir = Sys.getcwd () in
@@ -1308,7 +1250,7 @@ let package_vendor_all_from_config () =
   | None -> Error "no blorp.toml found for package vendor"
   | Some (config_path, parsed) -> (
       match parsed.Package_config.package_errors with
-      | err :: _ -> package_status_config_error config_path err
+      | err :: _ -> package_config_command_error config_path err
       | [] -> (
           let vendored = ref [] in
           let skipped_local = ref [] in
@@ -1608,9 +1550,6 @@ let () =
         | [ "fetch"; "--help" ] | [ "fetch"; "-h" ] ->
             package_fetch_usage ();
             exit 0
-        | [ "status"; "--help" ] | [ "status"; "-h" ] ->
-            package_status_usage ();
-            exit 0
         | [ "fetch" ] -> (
             match package_fetch_all_from_config () with
             | Ok (fetched, cached, skipped_local) ->
@@ -1636,28 +1575,15 @@ let () =
             | Error message ->
                 prerr_endline message;
                 exit 1)
-        | [ "status" ] -> (
-            match package_status_from_config () with
-            | Ok (ok, lines) ->
-                List.iter print_endline lines;
-                exit (if ok then 0 else 1)
-            | Error message ->
-                prerr_endline message;
-                exit 1)
         | "fetch" :: target :: from -> (
             let result =
               match from with
               | [] -> package_fetch_from_config target
-              | _ -> (
-                  match Package_cache.fetch ~expected_pin:target from with
-                  | Ok cached -> Ok cached
-                  | Error errors -> Error (Package_cache.render_errors errors))
+              | _ -> package_fetch_explicit target from
             in
             match result with
-            | Ok cached ->
-                Printf.printf "Fetched %s\nHash %s\nCache %s\n"
-                  cached.Package_cache.manifest.Package_manifest.name
-                  cached.Package_cache.hash cached.Package_cache.path;
+            | Ok (alias, fetch_result) ->
+                print_package_fetch_result alias fetch_result;
                 exit 0
             | Error message ->
                 prerr_endline message;

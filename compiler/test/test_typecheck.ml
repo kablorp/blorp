@@ -75,6 +75,22 @@ let expect_origin_error src ~module_origin ~message =
             Alcotest.failf "no error contains %S\nActual errors:\n%s" message
               (Test_helpers.format_errors errors))
 
+let expect_origin_ok src ~module_origin =
+  Test_helpers.with_isolated_env (fun () ->
+      let sess = Blorp.Session.current () in
+      Blorp.Modules.init_module_paths ~sess (Sys.getcwd ());
+      match
+        Blorp.Modules.parse_source ~sess ~filename:"origin_policy.brp" src
+      with
+      | Error err -> Alcotest.failf "parse failed: %s" err.message
+      | Ok program ->
+          let _typed, errors =
+            Blorp.Typecheck.typecheck ~module_origin program
+          in
+          if errors <> [] then
+            Alcotest.failf "expected typecheck success, got:\n%s"
+              (Test_helpers.format_errors errors))
+
 let test_package_origin_rejects_builtin_body () =
   expect_origin_error
     {|
@@ -92,6 +108,23 @@ foreign(include: "math.h"):
 |}
     ~module_origin:(Blorp.Session.package_origin "sqlite")
     ~message:"'foreign' declarations cannot be used in source packages"
+
+let test_native_package_origin_rejects_builtin_body () =
+  expect_origin_error
+    {|
+func native_helper(x: Int) -> Int:
+    builtin
+|}
+    ~module_origin:(Blorp.Session.native_package_origin "sqlite")
+    ~message:"'builtin' can only be used in the standard library"
+
+let test_native_package_origin_allows_foreign_decl () =
+  expect_origin_ok
+    {|
+foreign(include: "math.h"):
+    func c_abs(x: Int) -> Int = "abs"
+|}
+    ~module_origin:(Blorp.Session.native_package_origin "sqlite")
 
 let test_std_origin_rejects_foreign_decl () =
   expect_origin_error
@@ -2023,6 +2056,10 @@ let suite =
           test_package_origin_rejects_builtin_body;
         Alcotest.test_case "package rejects foreign decl" `Quick
           test_package_origin_rejects_foreign_decl;
+        Alcotest.test_case "native package rejects builtin body" `Quick
+          test_native_package_origin_rejects_builtin_body;
+        Alcotest.test_case "native package allows foreign decl" `Quick
+          test_native_package_origin_allows_foreign_decl;
         Alcotest.test_case "std rejects foreign decl" `Quick
           test_std_origin_rejects_foreign_decl;
       ] );

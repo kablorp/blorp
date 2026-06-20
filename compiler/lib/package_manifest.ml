@@ -160,6 +160,8 @@ let is_identifier value =
   in
   loop 1
 
+let is_reserved_package_root = function "std" | "pkg" -> true | _ -> false
+
 let is_module_path value =
   let parts = String.split_on_char '/' value in
   parts <> []
@@ -281,8 +283,13 @@ let parse ?path source =
       if not (is_identifier name) then
         add_validation
           "package name must be a Blorp identifier such as json or json_tools";
+      if is_reserved_package_root name then
+        add_validation
+          (Printf.sprintf "package name %S is reserved by the module system"
+             name);
       if exports = [] then
         add_validation "package must export at least one module";
+      let seen_exports = Hashtbl.create (max 8 (List.length exports)) in
       List.iter
         (fun module_name ->
           if not (is_module_path module_name) then
@@ -294,7 +301,11 @@ let parse ?path source =
           then
             add_validation
               (Printf.sprintf "exported module %S must be inside package %S"
-                 module_name name))
+                 module_name name);
+          if Hashtbl.mem seen_exports module_name then
+            add_validation
+              (Printf.sprintf "duplicate exported module %S" module_name)
+          else Hashtbl.add seen_exports module_name ())
         exports;
       if !errors <> [] || !validation_errors <> [] then
         Error (List.rev (!validation_errors @ !errors))

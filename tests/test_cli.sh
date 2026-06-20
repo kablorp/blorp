@@ -198,19 +198,26 @@ check_dir_bad="$TMPDIR_CLI/check_dir_bad"
 package_ok="$TMPDIR_CLI/package_ok"
 package_bad="$TMPDIR_CLI/package_bad"
 package_project="$TMPDIR_CLI/package_project"
+package_alias_project="$TMPDIR_CLI/package_alias_project"
 package_cache_project="$TMPDIR_CLI/package_cache_project"
+package_cache_alias_project="$TMPDIR_CLI/package_cache_alias_project"
 package_ambiguous_project="$TMPDIR_CLI/package_ambiguous_project"
 package_vendor_all_project="$TMPDIR_CLI/package_vendor_all_project"
 package_cache="$TMPDIR_CLI/package_cache"
+package_alias_cache="$TMPDIR_CLI/package_alias_cache"
 package_fetch_all_cache="$TMPDIR_CLI/package_fetch_all_cache"
-package_status_missing_cache="$TMPDIR_CLI/package_status_missing_cache"
+package_missing_cache="$TMPDIR_CLI/package_missing_cache"
 package_artifact="$TMPDIR_CLI/sample.blorpkg"
 package_vendor="$TMPDIR_CLI/vendor_sample"
 
 mkdir -p "$check_dir_ok/nested" "$check_dir_bad/nested"
 mkdir -p "$package_ok/src/sample" "$package_bad/src"
 mkdir -p "$package_project/app" "$package_project/vendor"
-mkdir -p "$package_cache_project/app" "$package_ambiguous_project" "$package_vendor_all_project" "$package_cache" "$package_fetch_all_cache" "$package_status_missing_cache"
+mkdir -p "$package_alias_project/app" "$package_alias_project/vendor"
+mkdir -p "$package_cache_project/app" "$package_cache_alias_project/app"
+mkdir -p "$package_ambiguous_project" "$package_vendor_all_project"
+mkdir -p "$package_cache" "$package_alias_cache" "$package_fetch_all_cache"
+mkdir -p "$package_missing_cache"
 
 cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
@@ -278,6 +285,12 @@ cat > "$package_project/blorp.toml" <<'TOML'
 sample = { path = "vendor/sample" }
 TOML
 
+cp -R "$package_ok" "$package_alias_project/vendor/sample"
+cat > "$package_alias_project/blorp.toml" <<'TOML'
+[packages]
+sample_v1 = { path = "vendor/sample" }
+TOML
+
 cat > "$package_project/app/main.brp" <<'BRP'
 import:
 	sample: answer
@@ -286,9 +299,25 @@ func main(args: List[String]) -> Int:
 	answer()
 BRP
 
+cat > "$package_alias_project/app/main.brp" <<'BRP'
+import:
+	sample_v1: answer
+
+func main(args: List[String]) -> Int:
+	answer()
+BRP
+
 cat > "$package_cache_project/app/main.brp" <<'BRP'
 import:
 	sample: answer
+
+func main(args: List[String]) -> Int:
+	answer()
+BRP
+
+cat > "$package_cache_alias_project/app/main.brp" <<'BRP'
+import:
+	sample_v1: answer
 
 func main(args: List[String]) -> Int:
 	answer()
@@ -366,14 +395,20 @@ if [ -n "$package_hash" ]; then
 [packages]
 sample = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
 TOML
+    cat > "$package_cache_alias_project/blorp.toml" <<TOML
+[packages]
+sample_v1 = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
+TOML
     expect_output_contains "package fetch success" 0 "Hash $package_hash" \
         env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
-    expect_output_contains "package fetch alias success" 0 "Hash $package_hash" \
+    expect_output_contains "package fetch explicit uses cache" 0 "Already cached sample" \
+        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
+    expect_output_contains "package fetch alias uses cache" 0 "Already cached sample" \
         env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
-    expect_output_contains "package status cached success" 0 "Cached sample" \
-        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package status' bash "$package_cache_project" "$BLORP_BIN_ABS"
-    expect_output_contains "package status missing fails" 1 "Missing sample" \
-        env BLORP_PACKAGE_CACHE="$package_status_missing_cache" bash -c 'cd "$1" && "$2" package status' bash "$package_cache_project" "$BLORP_BIN_ABS"
+    expect_output_contains "package fetch renamed alias success" 0 "Hash $package_hash" \
+        env BLORP_PACKAGE_CACHE="$package_alias_cache" bash -c 'cd "$1" && "$2" package fetch sample_v1' bash "$package_cache_alias_project" "$BLORP_BIN_ABS"
+    expect_output_contains "check cached package alias missing cache suggests fetch" 1 "blorp package fetch sample" \
+        env BLORP_PACKAGE_CACHE="$package_missing_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
     expect_output_contains "package fetch all success" 0 "Fetched sample" \
         env BLORP_PACKAGE_CACHE="$package_fetch_all_cache" bash -c 'cd "$1" && "$2" package fetch' bash "$package_cache_project" "$BLORP_BIN_ABS"
     cat > "$package_ambiguous_project/blorp.toml" <<TOML
@@ -399,6 +434,8 @@ TOML
     fi
     expect_output_contains "package fetch hash ambiguity" 1 "matches multiple aliases" \
         env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch "$3"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}"
+    expect_output_contains "package vendor explicit hash ignores config ambiguity" 0 "Vendored sample" \
+        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor "$3" "$4"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}" "$TMPDIR_CLI/package_vendor_hash_explicit"
     if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
         package_http_dir="$TMPDIR_CLI/package_http"
         package_http_port_file="$TMPDIR_CLI/package_http_port"
@@ -445,6 +482,8 @@ PY
     fi
     expect_exit "check cached package alias project" 0 \
         env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
+    expect_exit "check cached package renamed alias project" 0 \
+        env BLORP_PACKAGE_CACHE="$package_alias_cache" "$BLORP_BIN" check --no-format "$package_cache_alias_project/app/main.brp"
     expect_output_contains "package vendor success" 0 "Hash $package_hash" \
         env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_vendor"
     expect_output_contains "package vendor alias success" 0 "Hash $package_hash" \
@@ -470,8 +509,7 @@ fi
 expect_output_contains "package check rejects external import" 1 "may import only std modules" \
     "$BLORP_BIN" package check "$package_bad"
 expect_exit "check package alias project" 0 "$BLORP_BIN" check --no-format "$package_project/app/main.brp"
-expect_output_contains "package status local success" 0 "Local sample" \
-    bash -c 'cd "$1" && "$2" package status' bash "$package_project" "$BLORP_BIN_ABS"
+expect_exit "check package renamed alias project" 0 "$BLORP_BIN" check --no-format "$package_alias_project/app/main.brp"
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
 if [ -f "$compiled_c" ]; then

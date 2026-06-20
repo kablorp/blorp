@@ -94,7 +94,8 @@ let test_load_errors_independent () =
     (List.length (Modules.get_load_errors ~sess:s2 ()))
 
 let test_module_origin_policy_helpers () =
-  let pkg = Session.package_origin "sqlite" in
+  let source_pkg = Session.package_origin "sqlite" in
+  let native_pkg = Session.native_package_origin "sqlite" in
   Alcotest.(check bool)
     "std allows builtin" true
     (Session.module_origin_allows_builtin Session.Stdlib_module);
@@ -102,8 +103,11 @@ let test_module_origin_policy_helpers () =
     "user rejects builtin" false
     (Session.module_origin_allows_builtin Session.User_module);
   Alcotest.(check bool)
-    "pkg rejects builtin" false
-    (Session.module_origin_allows_builtin pkg);
+    "source pkg rejects builtin" false
+    (Session.module_origin_allows_builtin source_pkg);
+  Alcotest.(check bool)
+    "native pkg rejects builtin" false
+    (Session.module_origin_allows_builtin native_pkg);
   Alcotest.(check bool)
     "std rejects foreign" false
     (Session.module_origin_allows_foreign Session.Stdlib_module);
@@ -111,11 +115,17 @@ let test_module_origin_policy_helpers () =
     "user allows foreign" true
     (Session.module_origin_allows_foreign Session.User_module);
   Alcotest.(check bool)
-    "pkg rejects foreign" false
-    (Session.module_origin_allows_foreign pkg);
+    "source pkg rejects foreign" false
+    (Session.module_origin_allows_foreign source_pkg);
   Alcotest.(check string)
-    "pkg label" "package 'sqlite'"
-    (Session.module_origin_label pkg)
+    "source pkg label" "source package 'sqlite'"
+    (Session.module_origin_label source_pkg);
+  Alcotest.(check bool)
+    "native pkg allows foreign" true
+    (Session.module_origin_allows_foreign native_pkg);
+  Alcotest.(check string)
+    "native pkg label" "native package 'sqlite'"
+    (Session.module_origin_label native_pkg)
 
 let test_search_paths_independent () =
   let s1 = Session.create () in
@@ -378,6 +388,7 @@ let test_source_origin_uses_configured_std_root () =
         = Session.User_module))
 
 let package_name_of_origin = function
+  | Session.Native_package_module id -> Some (Session.package_id_name id)
   | Session.Package_module id -> Some (Session.package_id_name id)
   | Session.Stdlib_module | Session.User_module -> None
 
@@ -628,6 +639,42 @@ let test_blorp_toml_package_alias_rejects_hash_mismatch () =
       | Some _ ->
           Alcotest.fail "mismatched package hash pin unexpectedly resolved")
 
+let test_blorp_toml_hash_only_missing_cache_suggests_fetch () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_source_package_missing_cache" (fun dir ->
+          let app_dir = Filename.concat dir "app" in
+          let cache_dir = Filename.concat dir "cache" in
+          Unix.mkdir app_dir 0o700;
+          Unix.mkdir cache_dir 0o700;
+          with_env "BLORP_PACKAGE_CACHE" cache_dir (fun () ->
+              write_file
+                (Filename.concat dir "blorp.toml")
+                "[packages]\n\
+                 sample = { hash = \"0123456789abcdef\", from = \
+                 [\"artifacts/sample.blorpkg\"] }\n";
+              let sess = Session.create () in
+              Modules.init_module_paths ~sess app_dir;
+              let errors = Modules.get_load_errors ~sess () in
+              let messages =
+                errors
+                |> List.map (fun e -> e.Ast.message)
+                |> String.concat "\n"
+              in
+              let helps =
+                errors
+                |> List.filter_map (fun e -> e.Ast.help)
+                |> String.concat "\n"
+              in
+              Alcotest.(check bool)
+                "missing cache diagnostic names alias" true
+                (mentions messages "package alias \"sample\"");
+              Alcotest.(check bool)
+                "missing cache diagnostic names cache" true
+                (mentions messages "local package cache");
+              Alcotest.(check bool)
+                "missing cache diagnostic suggests fetch alias" true
+                (mentions helps "blorp package fetch sample"))))
+
 let test_source_package_alias_reports_unexported_module () =
   with_temp_dir "blorp_source_package_unexported" (fun dir ->
       let app_dir = Filename.concat dir "app" in
@@ -687,6 +734,101 @@ let test_source_package_rejects_pkg_import () =
       Alcotest.(check bool)
         "source package rejects pkg import" true
         (mentions errors "source packages cannot import pkg/... modules"))
+
+let test_source_package_rejects_root_project_import () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_source_package_reject_root_import" (fun dir ->
+          let app_dir = Filename.concat dir "app" in
+          let vendor_dir = Filename.concat dir "vendor" in
+          let package_dir = Filename.concat vendor_dir "sample" in
+          Unix.mkdir app_dir 0o700;
+          Unix.mkdir vendor_dir 0o700;
+          Unix.mkdir package_dir 0o700;
+          write_file
+            (Filename.concat dir "blorp.toml")
+            "[packages]\nsample = { path = \"vendor/sample\" }\n";
+          write_file
+            (Filename.concat app_dir "root_helper.brp")
+            "pure func answer() -> Int:\n    41\n";
+          write_source_package package_dir ~name:"sample" ~exports:[ "sample" ]
+            [
+              ( "sample.brp",
+                "import:\n\
+                \    root_helper: answer\n\n\
+                 pure func package_answer() -> Int:\n\
+                \    answer()\n" );
+            ];
+          let main_path = Filename.concat app_dir "main.brp" in
+          let source =
+            "import:\n\
+            \    sample: package_answer\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    package_answer()\n"
+          in
+          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          | Ok _ ->
+              Alcotest.fail
+                "expected package source importing root module to fail"
+          | Error errors ->
+              let text =
+                errors
+                |> List.map (fun e -> e.Ast.message)
+                |> String.concat "\n"
+              in
+              Alcotest.(check bool)
+                "source package rejects root import" true
+                (mentions text
+                   "source packages may import only std modules or modules \
+                    inside their own package")))
+
+let test_source_package_rejects_other_package_alias_import () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_source_package_reject_other_alias" (fun dir ->
+          let app_dir = Filename.concat dir "app" in
+          let vendor_dir = Filename.concat dir "vendor" in
+          let sample_dir = Filename.concat vendor_dir "sample" in
+          let other_dir = Filename.concat vendor_dir "other" in
+          Unix.mkdir app_dir 0o700;
+          Unix.mkdir vendor_dir 0o700;
+          Unix.mkdir sample_dir 0o700;
+          Unix.mkdir other_dir 0o700;
+          write_file
+            (Filename.concat dir "blorp.toml")
+            "[packages]\n\
+             sample = { path = \"vendor/sample\" }\n\
+             other = { path = \"vendor/other\" }\n";
+          write_source_package other_dir ~name:"other" ~exports:[ "other" ]
+            [ ("other.brp", "pure func answer() -> Int:\n    41\n") ];
+          write_source_package sample_dir ~name:"sample" ~exports:[ "sample" ]
+            [
+              ( "sample.brp",
+                "import:\n\
+                \    other: answer\n\n\
+                 pure func package_answer() -> Int:\n\
+                \    answer()\n" );
+            ];
+          let main_path = Filename.concat app_dir "main.brp" in
+          let source =
+            "import:\n\
+            \    sample: package_answer\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    package_answer()\n"
+          in
+          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          | Ok _ ->
+              Alcotest.fail
+                "expected package source importing another package alias to \
+                 fail"
+          | Error errors ->
+              let text =
+                errors
+                |> List.map (fun e -> e.Ast.message)
+                |> String.concat "\n"
+              in
+              Alcotest.(check bool)
+                "source package rejects other package alias" true
+                (mentions text
+                   "source packages cannot import other package aliases")))
 
 let test_source_package_relative_import_keeps_package_origin () =
   Test_helpers.with_isolated_env (fun () ->
@@ -1133,10 +1275,16 @@ let suite =
           test_blorp_toml_package_alias_accepts_matching_hash_pin;
         Alcotest.test_case "package alias rejects hash mismatch" `Quick
           test_blorp_toml_package_alias_rejects_hash_mismatch;
+        Alcotest.test_case "hash-only package missing cache suggests fetch"
+          `Quick test_blorp_toml_hash_only_missing_cache_suggests_fetch;
         Alcotest.test_case "package alias reports unexported module" `Quick
           test_source_package_alias_reports_unexported_module;
         Alcotest.test_case "source package rejects pkg import" `Quick
           test_source_package_rejects_pkg_import;
+        Alcotest.test_case "source package rejects root project import" `Quick
+          test_source_package_rejects_root_project_import;
+        Alcotest.test_case "source package rejects other package alias import"
+          `Quick test_source_package_rejects_other_package_alias_import;
         Alcotest.test_case "source package relative import origin" `Quick
           test_source_package_relative_import_keeps_package_origin;
         Alcotest.test_case "pkg root discovered from base dir" `Quick

@@ -95,6 +95,81 @@ let test_package_config_rejects_sources_key () =
            (String.concat "\n" (List.map snd package_errors))
            "unsupported key \"sources\"")
 
+let test_package_config_rejects_reserved_alias () =
+  match
+    Blorp.Package_config.parse_package_paths
+      "[packages]\nstd = { hash = \"0123456789abcdef\" }\n"
+  with
+  | { Blorp.Package_config.package_errors = []; _ } ->
+      Alcotest.fail "reserved package alias was accepted"
+  | { Blorp.Package_config.package_errors; package_paths } ->
+      Alcotest.(check int)
+        "no package paths registered" 0
+        (List.length package_paths);
+      Alcotest.(check bool)
+        "reserved alias message" true
+        (Blorp.Modules.contains
+           (String.concat "\n" (List.map snd package_errors))
+           "reserved")
+
+let test_package_config_accepts_inline_comments () =
+  match
+    Blorp.Package_config.parse_package_paths
+      "[packages] # dependency aliases\n\
+       sample = { hash = \"0123456789abcdef\", from = \
+       [\"https://example.com/pkg#fragment.blorpkg\"] } # remote source\n\n\
+       [packages.local] # local package\n\
+       path = \"vendor/local#name\" # keep # inside strings\n"
+  with
+  | { Blorp.Package_config.package_errors = error :: _; _ } ->
+      Alcotest.failf
+        "expected package config comments to parse, got line %d: %s" (fst error)
+        (snd error)
+  | { Blorp.Package_config.package_paths; _ } -> (
+      let package_paths =
+        List.sort
+          (fun left right ->
+            String.compare left.Blorp.Package_config.package_alias
+              right.Blorp.Package_config.package_alias)
+          package_paths
+      in
+      match package_paths with
+      | [ local; sample ] ->
+          Alcotest.(check string)
+            "local alias" "local" local.Blorp.Package_config.package_alias;
+          Alcotest.(check (option string))
+            "path keeps hash" (Some "vendor/local#name")
+            local.Blorp.Package_config.package_path;
+          Alcotest.(check string)
+            "sample alias" "sample" sample.Blorp.Package_config.package_alias;
+          Alcotest.(check (list string))
+            "from keeps fragment"
+            [ "https://example.com/pkg#fragment.blorpkg" ]
+            sample.Blorp.Package_config.package_from
+      | _ -> Alcotest.fail "expected two package aliases")
+
+let test_package_config_rejects_trailing_string_content () =
+  let assert_rejects label source =
+    match Blorp.Package_config.parse_package_paths source with
+    | { Blorp.Package_config.package_errors = []; _ } ->
+        Alcotest.failf "%s accepted trailing content" label
+    | { Blorp.Package_config.package_errors; package_paths } ->
+        Alcotest.(check int)
+          (label ^ " registered paths")
+          0
+          (List.length package_paths);
+        Alcotest.(check bool)
+          (label ^ " mentions quoted string")
+          true
+          (Blorp.Modules.contains
+             (String.concat "\n" (List.map snd package_errors))
+             "quoted string")
+  in
+  assert_rejects "table form"
+    "[packages.sample]\npath = \"vendor/sample\" trailing\n";
+  assert_rejects "inline form"
+    "[packages]\nsample = { path = \"vendor/sample\" trailing }\n"
+
 let test_package_paths_from_uses_nearest_config () =
   with_temp_dir "blorp_package_config_nearest" (fun dir ->
       let nested = Filename.concat dir "examples/tool/src" in
@@ -131,6 +206,12 @@ let suite =
           test_package_config_rejects_unsupported_keys;
         Alcotest.test_case "rejects sources key" `Quick
           test_package_config_rejects_sources_key;
+        Alcotest.test_case "rejects reserved alias" `Quick
+          test_package_config_rejects_reserved_alias;
+        Alcotest.test_case "accepts inline comments" `Quick
+          test_package_config_accepts_inline_comments;
+        Alcotest.test_case "rejects trailing string content" `Quick
+          test_package_config_rejects_trailing_string_content;
         Alcotest.test_case "uses nearest blorp.toml" `Quick
           test_package_paths_from_uses_nearest_config;
       ] );

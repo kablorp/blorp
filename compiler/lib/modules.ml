@@ -473,7 +473,8 @@ and resolve_non_source_package_module ~sess base_dir module_name =
                 Some
                   {
                     resolved_path = candidate;
-                    resolved_origin = Session.package_origin pkg.package_id;
+                    resolved_origin =
+                      Session.native_package_origin pkg.package_id;
                   }
               else None)
             s.package_roots
@@ -535,10 +536,13 @@ let resolved_origin_equal left right =
   match (left, right) with
   | Session.Stdlib_module, Session.Stdlib_module -> true
   | Session.User_module, Session.User_module -> true
-  | Session.Package_module left_id, Session.Package_module right_id ->
+  | Session.Package_module left_id, Session.Package_module right_id
+  | ( Session.Native_package_module left_id,
+      Session.Native_package_module right_id ) ->
       Session.package_id_name left_id = Session.package_id_name right_id
-  | (Session.Stdlib_module | Session.User_module | Session.Package_module _), _
-    ->
+  | ( ( Session.Stdlib_module | Session.User_module | Session.Package_module _
+      | Session.Native_package_module _ ),
+      _ ) ->
       false
 
 type cached_parse_result =
@@ -930,22 +934,46 @@ and load_module_inner ~(sess : Session.t) module_name base_dir =
                         \  Package roots: %s"
                         module_name module_name roots
                   else
-                    match source_package_alias_load_error sess module_name with
-                    | Some msg -> msg
-                    | None ->
-                        let suggestion =
-                          let lower = String.lowercase_ascii module_name in
-                          if lower <> module_name then
-                            match resolve_module_path ~sess base_dir lower with
-                            | Some _ ->
-                                Printf.sprintf " (did you mean '%s'?)" lower
-                            | None -> ""
-                          else ""
-                        in
-                        Printf.sprintf
-                          "Could not find module '%s'%s\n  Search paths: %s"
-                          module_name suggestion
-                          (String.concat ", " sess.search_paths)
+                    match source_package_for_base_dir sess base_dir with
+                    | Some current_pkg -> (
+                        match
+                          source_package_alias_for_module sess module_name
+                        with
+                        | Some other_pkg
+                          when other_pkg.source_package_alias
+                               <> current_pkg.source_package_alias ->
+                            Printf.sprintf
+                              "source packages cannot import other package \
+                               aliases; package %S tried to import alias %S"
+                              current_pkg.source_package_alias
+                              other_pkg.source_package_alias
+                        | _ ->
+                            Printf.sprintf
+                              "source packages may import only std modules or \
+                               modules inside their own package; package %S \
+                               tried to import %S"
+                              current_pkg.source_package_alias module_name)
+                    | None -> (
+                        match
+                          source_package_alias_load_error sess module_name
+                        with
+                        | Some msg -> msg
+                        | None ->
+                            let suggestion =
+                              let lower = String.lowercase_ascii module_name in
+                              if lower <> module_name then
+                                match
+                                  resolve_module_path ~sess base_dir lower
+                                with
+                                | Some _ ->
+                                    Printf.sprintf " (did you mean '%s'?)" lower
+                                | None -> ""
+                              else ""
+                            in
+                            Printf.sprintf
+                              "Could not find module '%s'%s\n  Search paths: %s"
+                              module_name suggestion
+                              (String.concat ", " sess.search_paths))
                 in
                 let err =
                   {
@@ -1194,14 +1222,14 @@ let blorp_config_std_path_from base_dir =
             Some (Filename.concat (Filename.dirname config) dir)
           else Some dir)
 
-let config_error ~config_path ~line message =
+let config_error ?help ~config_path ~line message =
   {
     Ast.message;
     loc = Ast.point_loc_in ~file:config_path ~line ~column:1;
     phase = Ast.ModuleLoad;
     kind = Ast.OtherError;
     notes = [];
-    help = None;
+    help;
   }
 
 let package_manifest_error ~alias err =
@@ -1250,6 +1278,10 @@ let package_hash_pin_error (entry : Package_config.package_path) package_root
                  "package alias %S hash mismatch: expected %s, found %s"
                  entry.package_alias pin actual))
 
+type package_alias_root_error =
+  | PackageAliasRootError of string
+  | PackageAliasCacheUnavailable of { pin : string; detail : string }
+
 let package_alias_root_error (entry : Package_config.package_path) =
   let open Package_config in
   match entry.package_path with
@@ -1258,24 +1290,49 @@ let package_alias_root_error (entry : Package_config.package_path) =
       match entry.package_hash_pin with
       | None ->
           Error
-            (Printf.sprintf
-               "package alias %S must define path or hash in this \
-                source-package preview"
-               entry.package_alias)
+            (PackageAliasRootError
+               (Printf.sprintf
+                  "package alias %S must define path or hash in this \
+                   source-package preview"
+                  entry.package_alias))
       | Some pin -> (
           match Package_cache_layout.find_cached_path pin with
           | Ok (path, _) -> Ok path
-          | Error errors -> Error (Package_cache_layout.render_errors errors)))
+          | Error errors ->
+              Error
+                (PackageAliasCacheUnavailable
+                   { pin; detail = Package_cache_layout.render_errors errors }))
+      )
+
+let package_cache_fetch_help (entry : Package_config.package_path) =
+  if entry.Package_config.package_from = [] then
+    Printf.sprintf
+      "Add from = [...] for package %S and run `blorp package fetch %s`, or \
+       configure a local path."
+      entry.Package_config.package_alias entry.Package_config.package_alias
+  else
+    Printf.sprintf
+      "Run `blorp package fetch %s` from the project directory before \
+       compiling."
+      entry.Package_config.package_alias
 
 let configure_source_package_alias ~(sess : Session.t) ~config_path
     (entry : Package_config.package_path) =
   let open Package_config in
-  let add_error line message =
+  let add_error ?help line message =
     sess.load_errors <-
-      config_error ~config_path ~line message :: sess.load_errors
+      config_error ?help ~config_path ~line message :: sess.load_errors
   in
   match package_alias_root_error entry with
-  | Error message -> add_error entry.package_line message
+  | Error (PackageAliasRootError message) ->
+      add_error entry.package_line message
+  | Error (PackageAliasCacheUnavailable { pin; detail }) ->
+      add_error entry.package_line
+        ~help:(package_cache_fetch_help entry)
+        (Printf.sprintf
+           "package alias %S cannot use hash %s from the local package cache: \
+            %s"
+           entry.package_alias pin detail)
   | Ok package_root -> (
       let manifest_path =
         Filename.concat package_root Package_manifest.manifest_filename
