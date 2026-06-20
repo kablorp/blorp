@@ -66,7 +66,8 @@ let typed_decl_declares_global name decl =
   | Typed_ast.DeclVar var -> (Typed_ast.var_ast var).Ast.var_name = Some name
   | Typed_ast.DeclPrivate inner -> (
       match Typed_ast.decl_view inner with
-      | Typed_ast.DeclVar var -> (Typed_ast.var_ast var).Ast.var_name = Some name
+      | Typed_ast.DeclVar var ->
+          (Typed_ast.var_ast var).Ast.var_name = Some name
       | Typed_ast.DeclFunction _ | Typed_ast.DeclRecord _
       | Typed_ast.DeclTypeAlias _ | Typed_ast.DeclImpl _
       | Typed_ast.DeclPrivate _ | Typed_ast.DeclOther ->
@@ -1071,9 +1072,7 @@ let evaluate_program ?(constructor_info = fun _ -> None) ?(import_bindings = [])
     (program : Typed_ast.program) =
   let imported_programs = typed_modules_for_ctfe () in
   let module_alias = module_alias_path import_bindings in
-  let module_has_global =
-    module_has_global_from_programs imported_programs
-  in
+  let module_has_global = module_has_global_from_programs imported_programs in
   let ctx =
     Ctfe_context.of_program ~fallback_constructor_info:constructor_info
       ~module_alias ~module_has_global ~imported_programs program

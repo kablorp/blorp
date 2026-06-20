@@ -284,8 +284,7 @@ let default_module_alias _ = None
 let default_module_has_global ~module_path:_ ~name:_ = false
 
 let translate_context ?(module_alias = default_module_alias)
-    ?(module_has_global = default_module_has_global) nullary_constructor
-    =
+    ?(module_has_global = default_module_has_global) nullary_constructor =
   { nullary_constructor; module_alias; module_has_global }
 
 let rec of_typed_expr_with ctx expr =
@@ -353,16 +352,14 @@ and of_desc ctx expr = function
         | Ast.EIdent alias -> ctx.module_alias alias
         | _ -> None
       in
-      begin
-        match qualified_module with
-        | Some module_path
-          when ctx.module_has_global ~module_path ~name:field ->
-            Ok
-              (make expr
-                 (ImportedGlobal
-                    { global_module_path = module_path; global_name = field }))
-        | Some module_path -> (
-            match ctx.nullary_constructor field with
+      begin match qualified_module with
+      | Some module_path when ctx.module_has_global ~module_path ~name:field ->
+          Ok
+            (make expr
+               (ImportedGlobal
+                  { global_module_path = module_path; global_name = field }))
+      | Some module_path -> (
+          match ctx.nullary_constructor field with
           | Some constructor ->
               Ok
                 (make expr
@@ -377,7 +374,7 @@ and of_desc ctx expr = function
                    (ImportedGlobal
                       { global_module_path = module_path; global_name = field }))
           )
-        | None ->
+      | None ->
           let* receiver = of_typed_expr_with ctx receiver in
           let field_kind = field_access_kind receiver.ty field in
           Ok (make expr (FieldAccess { field_receiver = receiver; field_kind }))
