@@ -258,15 +258,6 @@ let emit_list_handoff emitters ctx result handoff =
   in
   let out_c = Codegen_types.escape_c_ident (Var.to_c_name handoff.lh_out_var) in
   let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  let capacity_c =
-    Core_emit_blorp_prepared_backend.render_list_handoff_capacity_name temp_seed
-  in
-  let reuse_c =
-    Core_emit_blorp_prepared_backend.render_list_handoff_reuse_name temp_seed
-  in
-  let release_c =
-    Core_emit_blorp_prepared_backend.render_list_handoff_release_name temp_seed
-  in
   let source_ty_c = emitters.type_to_c ctx handoff.lh_source_ty in
   let result_ty_c = emitters.type_to_c ctx handoff.lh_result_ty in
   let storage_mode_c, elem_size_c =
@@ -276,27 +267,25 @@ let emit_list_handoff emitters ctx result handoff =
     Core_emit_blorp_prepared_backend.list_elem_release_arg ~loc:result.loc
       handoff.lh_layout
   in
-  Core_emit_blorp_prepared_backend.emit_list_handoff_open
-    ~emit_expr:emitters.emit_expr ctx ~source_ty_c ~source_c handoff.lh_source
-    ~capacity_c handoff.lh_capacity ~length_c ~release_c ~release_fn_c;
   (match handoff.lh_mode with
   | BorrowFresh ->
-      Core_emit_blorp_prepared_backend.emit_list_handoff_begin_borrow ctx
-        ~result_ty_c ~result_c ~capacity_c ~release_c ~storage_mode_c
-        ~elem_size_c ~out_c
+      Core_emit_blorp_prepared_backend.emit_list_handoff_borrow_prefix
+        ~emit_expr:emitters.emit_expr ctx ~source_ty_c ~source_c
+        handoff.lh_source handoff.lh_capacity ~length_c ~release_fn_c
+        ~result_ty_c ~result_c ~storage_mode_c ~elem_size_c ~out_c ~temp_seed
   | ConsumeReuse ->
-      Core_emit_blorp_prepared_backend.emit_list_handoff_begin_reuse ctx
-        ~result_ty_c ~result_c ~source_c ~capacity_c ~release_c ~storage_mode_c
-        ~elem_size_c ~reuse_c ~out_c);
+      Core_emit_blorp_prepared_backend.emit_list_handoff_reuse_prefix
+        ~emit_expr:emitters.emit_expr ctx ~source_ty_c ~source_c
+        handoff.lh_source handoff.lh_capacity ~length_c ~release_fn_c
+        ~result_ty_c ~result_c ~storage_mode_c ~elem_size_c ~out_c ~temp_seed);
   emitters.emit_stmt ctx handoff.lh_body;
-  (match handoff.lh_mode with
+  match handoff.lh_mode with
   | BorrowFresh ->
-      Core_emit_blorp_prepared_backend.emit_list_handoff_finish_borrow ctx
+      Core_emit_blorp_prepared_backend.emit_list_handoff_borrow_suffix ctx
         ~result_c ~out_c ~length_c
   | ConsumeReuse ->
-      Core_emit_blorp_prepared_backend.emit_list_handoff_finish_reuse ctx
-        ~result_c ~out_c ~length_c ~reuse_c ~source_c);
-  Core_emit_blorp_prepared_backend.emit_list_handoff_close ctx ~result_c
+      Core_emit_blorp_prepared_backend.emit_list_handoff_reuse_suffix ctx
+        ~result_c ~out_c ~length_c ~source_c ~temp_seed
 
 let emit emitters ctx = function
   | DictIterHeader { dict; source; index } ->

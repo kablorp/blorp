@@ -520,75 +520,58 @@ let render_list_construct_append ~emit_boxed ctx ~list_tmp ~owned value =
   in
   render_list_template template_name [ list_tmp; value_arg ]
 
-let render_list_handoff_capacity_name temp_seed =
-  render_list_template "list_handoff_capacity_name" [ temp_seed ]
-
-let render_list_handoff_reuse_name temp_seed =
-  render_list_template "list_handoff_reuse_name" [ temp_seed ]
-
-let render_list_handoff_release_name temp_seed =
-  render_list_template "list_handoff_release_name" [ temp_seed ]
-
-let emit_list_handoff_open ~emit_expr ctx ~source_ty_c ~source_c source
-    ~capacity_c capacity ~length_c ~release_c ~release_fn_c =
+let emit_list_handoff_borrow_prefix ~emit_expr ctx ~source_ty_c ~source_c source
+    capacity ~length_c ~release_fn_c ~result_ty_c ~result_c ~storage_mode_c
+    ~elem_size_c ~out_c ~temp_seed =
   let source_arg = render_arg ~emit_expr ctx source in
   let capacity_arg = render_arg ~emit_expr ctx capacity in
-  emit_list_template ctx "list_handoff_open"
+  emit_list_template ctx "list_handoff_borrow_prefix"
     [
       source_ty_c;
       source_c;
       source_arg;
-      capacity_c;
       capacity_arg;
       length_c;
-      release_c;
       release_fn_c;
-    ];
-  emit ctx " "
-
-let emit_list_handoff_begin_borrow ctx ~result_ty_c ~result_c ~capacity_c
-    ~release_c ~storage_mode_c ~elem_size_c ~out_c =
-  emit_list_template ctx "list_handoff_begin_borrow"
-    [
       result_ty_c;
       result_c;
-      capacity_c;
-      release_c;
       storage_mode_c;
       elem_size_c;
       out_c;
+      temp_seed;
     ];
   emit ctx " "
 
-let emit_list_handoff_begin_reuse ctx ~result_ty_c ~result_c ~source_c
-    ~capacity_c ~release_c ~storage_mode_c ~elem_size_c ~reuse_c ~out_c =
-  emit_list_template ctx "list_handoff_begin_reuse"
+let emit_list_handoff_reuse_prefix ~emit_expr ctx ~source_ty_c ~source_c source
+    capacity ~length_c ~release_fn_c ~result_ty_c ~result_c ~storage_mode_c
+    ~elem_size_c ~out_c ~temp_seed =
+  let source_arg = render_arg ~emit_expr ctx source in
+  let capacity_arg = render_arg ~emit_expr ctx capacity in
+  emit_list_template ctx "list_handoff_reuse_prefix"
     [
-      result_ty_c;
-      result_c;
+      source_ty_c;
       source_c;
-      capacity_c;
-      release_c;
+      source_arg;
+      capacity_arg;
+      length_c;
+      release_fn_c;
+      result_ty_c;
+      result_c;
       storage_mode_c;
       elem_size_c;
-      reuse_c;
       out_c;
+      temp_seed;
     ];
   emit ctx " "
 
-let emit_list_handoff_finish_borrow ctx ~result_c ~out_c ~length_c =
-  emit_list_template ctx "list_handoff_finish_borrow"
-    [ result_c; out_c; length_c ];
-  emit ctx " "
+let emit_list_handoff_borrow_suffix ctx ~result_c ~out_c ~length_c =
+  emit_list_template ctx "list_handoff_borrow_suffix"
+    [ result_c; out_c; length_c ]
 
-let emit_list_handoff_finish_reuse ctx ~result_c ~out_c ~length_c ~reuse_c
-    ~source_c =
-  emit_list_template ctx "list_handoff_finish_reuse"
-    [ result_c; out_c; length_c; reuse_c; source_c ];
-  emit ctx " "
-
-let emit_list_handoff_close ctx ~result_c =
-  emit_list_template ctx "list_handoff_close" [ result_c ]
+let emit_list_handoff_reuse_suffix ctx ~result_c ~out_c ~length_c ~source_c
+    ~temp_seed =
+  emit_list_template ctx "list_handoff_reuse_suffix"
+    [ result_c; out_c; length_c; source_c; temp_seed ]
 
 let render_list_construct_statements ~emit_expr ~emit_boxed ctx layout ~list_tmp
     ~elem_needs_release elems =
