@@ -1,0 +1,426 @@
+(** Source identities admitted to compile-time evaluation.
+
+    The evaluator owns control flow and value execution. This module owns the
+    narrow admission table for compiler-known std/builtin operations so CTFE
+    support does not grow through scattered source-name checks. *)
+
+module Source = struct
+  let dict_type = "Dict"
+  let option_type = "Option"
+  let result_type = "Result"
+  let range_type = "Range"
+  let dict_module = "std/dict"
+  let list_module = "std/list"
+  let matrix_module = "std/matrix"
+  let string_module = "std/string"
+  let dict_length_builtin = "std/dict.length"
+  let range_start_field = "start"
+  let range_end_field = "end"
+  let option_module = "std/option"
+  let result_module = "std/result"
+  let list_length_builtin = "std/list.length"
+  let has_length_trait = "HasLength"
+  let stringable_trait = "Stringable"
+  let checked_get = "checked_get"
+  let tensor_peel = "tensor_peel"
+  let matrix_checked_get = "matrix_checked_get"
+  let tensor3_checked_get = "tensor3_checked_get"
+  let tensor4_checked_get = "tensor4_checked_get"
+  let tensor5_checked_get = "tensor5_checked_get"
+  let vector = "vector"
+  let matrix = "matrix"
+  let tensor3 = "tensor3"
+  let tensor4 = "tensor4"
+  let tensor5 = "tensor5"
+  let contains = "contains"
+  let concat = "concat"
+  let dict = "dict"
+  let from_option = "from_option"
+  let from_list = "from_list"
+  let get = "get"
+  let get_or = "get_or"
+  let get_or_else = "get_or_else"
+  let is_err = "is_err"
+  let is_none = "is_none"
+  let is_ok = "is_ok"
+  let is_some = "is_some"
+  let join = "join"
+  let length = "length"
+  let list = "list"
+  let lower = "lower"
+  let map = "map"
+  let map_indexed = "map_indexed"
+  let map_err = "map_err"
+  let none_constructor = "None"
+  let err_constructor = "Err"
+  let ok_constructor = "Ok"
+  let set = "set"
+  let some_constructor = "Some"
+  let substring = "substring"
+  let append = "append"
+  let and_then = "and_then"
+  let any = "any"
+  let filter = "filter"
+  let filter_map = "filter_map"
+  let flat_map = "flat_map"
+  let fold_left = "fold_left"
+  let fold_right = "fold_right"
+  let all = "all"
+  let ends_with = "ends_with"
+  let chars = "chars"
+  let column_count = "column_count"
+  let count = "count"
+  let drop_left = "drop_left"
+  let from_char = "from_char"
+  let from_chars = "from_chars"
+  let index_of = "index_of"
+  let raw_index_of = "raw_index_of"
+  let replace = "replace"
+  let repeat = "repeat"
+  let reverse = "reverse"
+  let row_count = "row_count"
+  let split = "split"
+  let starts_with = "starts_with"
+  let to_option = "to_option"
+  let to_result = "to_result"
+  let to_string = "to_string"
+  let to_float32 = "to_float32"
+  let to_float16 = "to_float16"
+  let take_left = "take_left"
+  let trim = "trim"
+  let trim_left = "trim_left"
+  let trim_right = "trim_right"
+  let upper = "upper"
+  let with_capacity = "with_capacity"
+end
+
+type imported_module = List | Dict | Matrix | Option | Result | String
+
+type builtin_call =
+  | BuiltinToString
+  | BuiltinToFloat32
+  | BuiltinToFloat16
+  | BuiltinLength
+  | BuiltinGet
+  | BuiltinCheckedGet
+  | BuiltinTensorPeel
+  | BuiltinMatrixCheckedGet
+  | BuiltinTensor3CheckedGet
+  | BuiltinTensor4CheckedGet
+  | BuiltinTensor5CheckedGet
+  | BuiltinVector
+  | BuiltinMatrix
+  | BuiltinTensor3
+  | BuiltinTensor4
+  | BuiltinTensor5
+  | BuiltinStringFromChar
+  | BuiltinStringChars
+  | BuiltinStringFromChars
+
+type trait_call = TraitStringableToString | TraitHasLengthLength
+
+type constructor =
+  | OptionSomeConstructor
+  | OptionNoneConstructor
+  | ResultOkConstructor
+  | ResultErrConstructor
+
+type list_op =
+  | ListMake
+  | ListMap
+  | ListFilter
+  | ListFilterMap
+  | ListFlatMap
+  | ListMapIndexed
+  | ListFoldLeft
+  | ListFoldRight
+  | ListAll
+  | ListAny
+  | ListAppend
+  | ListConcat
+  | ListSet
+  | ListGet
+  | ListGetOr
+  | ListContains
+  | ListLength
+  | ListJoin
+
+type dict_op =
+  | DictMake
+  | DictWithCapacity
+  | DictFromList
+  | DictSet
+  | DictGet
+  | DictGetOr
+  | DictContains
+  | DictLength
+
+type matrix_op = MatrixRowCount | MatrixColumnCount
+
+type option_op =
+  | OptionGetOr
+  | OptionGetOrElse
+  | OptionMap
+  | OptionAndThen
+  | OptionFilter
+  | OptionIsSome
+  | OptionIsNone
+  | OptionToResult
+
+type result_op =
+  | ResultFromOption
+  | ResultGetOr
+  | ResultGetOrElse
+  | ResultMap
+  | ResultMapErr
+  | ResultAndThen
+  | ResultIsOk
+  | ResultIsErr
+  | ResultToOption
+
+type string_op =
+  | StringLength
+  | StringSubstring
+  | StringStartsWith
+  | StringEndsWith
+  | StringContains
+  | StringRawIndexOf
+  | StringIndexOf
+  | StringRepeat
+  | StringSplit
+  | StringReplace
+  | StringDropLeft
+  | StringTakeLeft
+  | StringTrim
+  | StringTrimLeft
+  | StringTrimRight
+  | StringReverse
+  | StringCount
+  | StringGet
+  | StringGetOr
+  | StringFromChar
+  | StringChars
+  | StringFromChars
+  | StringUpper
+  | StringLower
+
+type imported_call =
+  | ImportedList of list_op
+  | ImportedDict of dict_op
+  | ImportedMatrix of matrix_op
+  | ImportedOption of option_op
+  | ImportedResult of result_op
+  | ImportedString of string_op
+
+let module_path_of_imported_call = function
+  | ImportedList _ -> Source.list_module
+  | ImportedDict _ -> Source.dict_module
+  | ImportedMatrix _ -> Source.matrix_module
+  | ImportedOption _ -> Source.option_module
+  | ImportedResult _ -> Source.result_module
+  | ImportedString _ -> Source.string_module
+
+let imported_module_of_path = function
+  | path when path = Source.list_module -> Some List
+  | path when path = Source.dict_module -> Some Dict
+  | path when path = Source.matrix_module -> Some Matrix
+  | path when path = Source.option_module -> Some Option
+  | path when path = Source.result_module -> Some Result
+  | path when path = Source.string_module -> Some String
+  | _ -> None
+
+let list_op_of_source_name = function
+  | name when name = Source.list -> Some ListMake
+  | name when name = Source.map -> Some ListMap
+  | name when name = Source.filter -> Some ListFilter
+  | name when name = Source.filter_map -> Some ListFilterMap
+  | name when name = Source.flat_map -> Some ListFlatMap
+  | name when name = Source.map_indexed -> Some ListMapIndexed
+  | name when name = Source.fold_left -> Some ListFoldLeft
+  | name when name = Source.fold_right -> Some ListFoldRight
+  | name when name = Source.all -> Some ListAll
+  | name when name = Source.any -> Some ListAny
+  | name when name = Source.append -> Some ListAppend
+  | name when name = Source.concat -> Some ListConcat
+  | name when name = Source.set -> Some ListSet
+  | name when name = Source.get -> Some ListGet
+  | name when name = Source.get_or -> Some ListGetOr
+  | name when name = Source.contains -> Some ListContains
+  | name when name = Source.length -> Some ListLength
+  | name when name = Source.join -> Some ListJoin
+  | _ -> None
+
+let dict_op_of_source_name = function
+  | name when name = Source.dict -> Some DictMake
+  | name when name = Source.with_capacity -> Some DictWithCapacity
+  | name when name = Source.from_list -> Some DictFromList
+  | name when name = Source.set -> Some DictSet
+  | name when name = Source.get -> Some DictGet
+  | name when name = Source.get_or -> Some DictGetOr
+  | name when name = Source.contains -> Some DictContains
+  | name when name = Source.length -> Some DictLength
+  | _ -> None
+
+let matrix_op_of_source_name = function
+  | name when name = Source.row_count -> Some MatrixRowCount
+  | name when name = Source.column_count -> Some MatrixColumnCount
+  | _ -> None
+
+let option_op_of_source_name = function
+  | name when name = Source.get_or -> Some OptionGetOr
+  | name when name = Source.get_or_else -> Some OptionGetOrElse
+  | name when name = Source.map -> Some OptionMap
+  | name when name = Source.and_then -> Some OptionAndThen
+  | name when name = Source.filter -> Some OptionFilter
+  | name when name = Source.is_some -> Some OptionIsSome
+  | name when name = Source.is_none -> Some OptionIsNone
+  | name when name = Source.to_result -> Some OptionToResult
+  | _ -> None
+
+let result_op_of_source_name = function
+  | name when name = Source.from_option -> Some ResultFromOption
+  | name when name = Source.get_or -> Some ResultGetOr
+  | name when name = Source.get_or_else -> Some ResultGetOrElse
+  | name when name = Source.map -> Some ResultMap
+  | name when name = Source.map_err -> Some ResultMapErr
+  | name when name = Source.and_then -> Some ResultAndThen
+  | name when name = Source.is_ok -> Some ResultIsOk
+  | name when name = Source.is_err -> Some ResultIsErr
+  | name when name = Source.to_option -> Some ResultToOption
+  | _ -> None
+
+let string_op_of_source_name = function
+  | name when name = Source.length -> Some StringLength
+  | name when name = Source.substring -> Some StringSubstring
+  | name when name = Source.starts_with -> Some StringStartsWith
+  | name when name = Source.ends_with -> Some StringEndsWith
+  | name when name = Source.contains -> Some StringContains
+  | name when name = Source.raw_index_of -> Some StringRawIndexOf
+  | name when name = Source.index_of -> Some StringIndexOf
+  | name when name = Source.repeat -> Some StringRepeat
+  | name when name = Source.split -> Some StringSplit
+  | name when name = Source.replace -> Some StringReplace
+  | name when name = Source.drop_left -> Some StringDropLeft
+  | name when name = Source.take_left -> Some StringTakeLeft
+  | name when name = Source.trim -> Some StringTrim
+  | name when name = Source.trim_left -> Some StringTrimLeft
+  | name when name = Source.trim_right -> Some StringTrimRight
+  | name when name = Source.reverse -> Some StringReverse
+  | name when name = Source.count -> Some StringCount
+  | name when name = Source.get -> Some StringGet
+  | name when name = Source.get_or -> Some StringGetOr
+  | name when name = Source.from_char -> Some StringFromChar
+  | name when name = Source.chars -> Some StringChars
+  | name when name = Source.from_chars -> Some StringFromChars
+  | name when name = Source.upper -> Some StringUpper
+  | name when name = Source.lower -> Some StringLower
+  | _ -> None
+
+let imported_call_of_source ~module_path ~source_name =
+  match imported_module_of_path module_path with
+  | Some List ->
+      Option.map
+        (fun op -> ImportedList op)
+        (list_op_of_source_name source_name)
+  | Some Dict ->
+      Option.map
+        (fun op -> ImportedDict op)
+        (dict_op_of_source_name source_name)
+  | Some Matrix ->
+      Option.map
+        (fun op -> ImportedMatrix op)
+        (matrix_op_of_source_name source_name)
+  | Some Option ->
+      Option.map
+        (fun op -> ImportedOption op)
+        (option_op_of_source_name source_name)
+  | Some Result ->
+      Option.map
+        (fun op -> ImportedResult op)
+        (result_op_of_source_name source_name)
+  | Some String ->
+      Option.map
+        (fun op -> ImportedString op)
+        (string_op_of_source_name source_name)
+  | None -> None
+
+let builtin_call_of_source_name source_name =
+  if String.equal source_name Source.to_string then Some BuiltinToString
+  else if String.equal source_name Source.to_float32 then Some BuiltinToFloat32
+  else if String.equal source_name Source.to_float16 then Some BuiltinToFloat16
+  else if String.equal source_name Source.checked_get then
+    Some BuiltinCheckedGet
+  else if String.equal source_name Source.tensor_peel then
+    Some BuiltinTensorPeel
+  else if String.equal source_name Source.matrix_checked_get then
+    Some BuiltinMatrixCheckedGet
+  else if String.equal source_name Source.tensor3_checked_get then
+    Some BuiltinTensor3CheckedGet
+  else if String.equal source_name Source.tensor4_checked_get then
+    Some BuiltinTensor4CheckedGet
+  else if String.equal source_name Source.tensor5_checked_get then
+    Some BuiltinTensor5CheckedGet
+  else if String.equal source_name Source.vector then Some BuiltinVector
+  else if String.equal source_name Source.matrix then Some BuiltinMatrix
+  else if String.equal source_name Source.tensor3 then Some BuiltinTensor3
+  else if String.equal source_name Source.tensor4 then Some BuiltinTensor4
+  else if String.equal source_name Source.tensor5 then Some BuiltinTensor5
+  else if String.equal source_name Source.get then Some BuiltinGet
+  else if String.equal source_name Source.from_char then
+    Some BuiltinStringFromChar
+  else if String.equal source_name Source.chars then Some BuiltinStringChars
+  else if String.equal source_name Source.from_chars then
+    Some BuiltinStringFromChars
+  else
+    match source_name with
+    | name
+      when List.exists (String.equal name)
+             [
+               Source.length;
+               Source.list_length_builtin;
+               Source.dict_length_builtin;
+             ] ->
+        Some BuiltinLength
+    | _ -> None
+
+let trait_call_of_source ~trait_name ~method_name =
+  if
+    String.equal trait_name Source.stringable_trait
+    && String.equal method_name Source.to_string
+  then Some TraitStringableToString
+  else if
+    String.equal trait_name Source.has_length_trait
+    && String.equal method_name Source.length
+  then Some TraitHasLengthLength
+  else None
+
+let constructor_of_source ~parent_type ~constructor_name =
+  match (parent_type, constructor_name) with
+  | parent, name
+    when String.equal parent Source.option_type
+         && String.equal name Source.some_constructor ->
+      Some OptionSomeConstructor
+  | parent, name
+    when String.equal parent Source.option_type
+         && String.equal name Source.none_constructor ->
+      Some OptionNoneConstructor
+  | parent, name
+    when String.equal parent Source.result_type
+         && String.equal name Source.ok_constructor ->
+      Some ResultOkConstructor
+  | parent, name
+    when String.equal parent Source.result_type
+         && String.equal name Source.err_constructor ->
+      Some ResultErrConstructor
+  | _ -> None
+
+let imported_unsupported_form ~module_path ~source_name =
+  Printf.sprintf "imported function call '%s.%s'" module_path source_name
+
+let imported_call_unsupported_form imported_call ~source_name =
+  imported_unsupported_form
+    ~module_path:(module_path_of_imported_call imported_call)
+    ~source_name
+
+let builtin_unsupported_form source_name =
+  Printf.sprintf "builtin function call '%s'" source_name

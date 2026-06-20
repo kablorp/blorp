@@ -4069,6 +4069,36 @@ let strip_callable_id_suffix = Call_resolution.strip_callable_id_suffix
 let resolved_target_from_overload =
   Call_resolution.resolved_target_from_overload
 
+let resolved_call_for_function_identifier name func_type callable_id purity
+    origin module_path =
+  match func_type with
+  | TyFunc { params; return; _ } ->
+      Some
+        {
+          call_syntax = CallBare;
+          call_target =
+            CallDirect
+              {
+                callable_id;
+                source_name = strip_callable_id_suffix name;
+                call_pure = purity = Env.Pure;
+                origin =
+                  Call_resolution.callable_origin_of_env ~module_path origin;
+              };
+          instantiated_params = params;
+          instantiated_return = return;
+        }
+  | _ -> None
+
+let annotate_function_identifier name func_type callable_id purity origin
+    module_path expr =
+  match
+    resolved_call_for_function_identifier name func_type callable_id purity
+      origin module_path
+  with
+  | Some call -> Ast.with_expr_resolved_call expr call
+  | None -> expr
+
 let resolved_target_from_module_func module_path func_name
     (info : module_func_resolution) =
   Option.map
@@ -4664,8 +4694,19 @@ let rec infer_expr (ctx : infer_ctx) (expr : expr) :
       | Some { kind = Env.VarSymbol { var_type = ty; source_type; _ }; _ } ->
           let proofs = expr_proofs_for_identifier ctx.env name ty in
           Ok (ty, with_inferred_type ?source_ty:source_type ~proofs expr ty)
-      | Some { kind = Env.FuncSymbol { func_type; _ }; _ } ->
-          Ok (func_type, with_inferred_type expr func_type)
+      | Some
+          {
+            kind =
+              Env.FuncSymbol
+                { callable_id; func_type; purity; origin; module_path; _ };
+            _;
+          } ->
+          let expr = with_inferred_type expr func_type in
+          let expr =
+            annotate_function_identifier name func_type callable_id purity
+              origin module_path expr
+          in
+          Ok (func_type, expr)
       | _ -> (
           (* Could be a constructor *)
           match get_constructor ctx.env name with

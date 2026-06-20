@@ -1,0 +1,478 @@
+-- Blorp-authored renderer for prepared constructor emission.
+--
+-- OCaml still decides representation and renders child Core expressions. This
+-- module owns the final C shape once the constructor callee and argument list
+-- are known.
+import:
+	codegen_template_registry:
+		render_template_arity_error,
+		render_template_manifest_line,
+		render_unsupported_template_error,
+	json: JsonValue, as_string, get_field, parse_json
+
+
+enum PreparedConstructorTemplate:
+	ConstructorCallTemplate
+	ConstructorSymbolTemplate
+	ConstructorNullableNoneTemplate
+	ConstructorNullablePayloadTemplate
+	StackOptionValueTemplate
+	StackOptionVoidStatementTemplate
+	StackOptionNoneTemplate
+	StackResultPayloadTemplate
+
+
+record PreparedConstructorTemplateInfo {
+	template: PreparedConstructorTemplate,
+	name: String
+}
+
+
+record ConstructorCallArgs {
+	callee: String,
+	argument_list: String
+}
+
+
+record StackOptionValueArgs {
+	option_type: String,
+	tag: String,
+	value: String
+}
+
+
+record StackOptionVoidStatementArgs {
+	option_type: String,
+	tag: String,
+	statement: String
+}
+
+
+record StackOptionNoneArgs {
+	option_type: String,
+	tag: String,
+	none_value: String
+}
+
+
+record StackResultPayloadArgs {
+	result_type: String,
+	tag: String,
+	field: String,
+	payload: String,
+	release_mask: String
+}
+
+
+union PreparedConstructorOp:
+	ConstructorCall(ConstructorCallArgs)
+	ConstructorSymbol(String)
+	ConstructorNullableNone
+	ConstructorNullablePayload(String)
+	StackOptionValue(StackOptionValueArgs)
+	StackOptionVoidStatement(StackOptionVoidStatementArgs)
+	StackOptionNone(StackOptionNoneArgs)
+	StackResultPayload(StackResultPayloadArgs)
+
+
+union RenderError:
+	WrongArity(PreparedConstructorTemplateInfo, Int)
+	UnsupportedPreparedConstructorOp(String)
+	InvalidPreparedConstructorJson(String)
+
+
+private pure func templates_by_name(
+	templates: List[PreparedConstructorTemplateInfo],
+) -> Dict[String, PreparedConstructorTemplateInfo]:
+	var dict: Dict[String, PreparedConstructorTemplateInfo] = {}
+
+	for info in templates:
+		dict = dict.set(info.name, info)
+
+	dict
+
+
+ALL_TEMPLATES: List[PreparedConstructorTemplateInfo] = [{
+		template = ConstructorCallTemplate,
+		name = "backend_constructor_call"
+	}, {
+		template = ConstructorSymbolTemplate,
+		name = "backend_constructor_symbol"
+	}, {
+		template = ConstructorNullableNoneTemplate,
+		name = "backend_constructor_nullable_none"
+	}, {
+		template = ConstructorNullablePayloadTemplate,
+		name = "backend_constructor_nullable_payload"
+	}, {
+		template = StackOptionValueTemplate,
+		name = "backend_constructor_stack_option_value"
+	}, {
+		template = StackOptionVoidStatementTemplate,
+		name = "backend_constructor_stack_option_void_statement"
+	}, {
+		template = StackOptionNoneTemplate,
+		name = "backend_constructor_stack_option_none"
+	}, {
+		template = StackResultPayloadTemplate,
+		name = "backend_constructor_stack_result_payload"
+	}]
+
+private TEMPLATES_BY_NAME: Dict[String, PreparedConstructorTemplateInfo] = templates_by_name(
+	ALL_TEMPLATES,
+)
+
+
+pure func prepared_constructor_template_name(info: PreparedConstructorTemplateInfo) -> String:
+	info.name
+
+
+pure func prepared_constructor_template_arity(info: PreparedConstructorTemplateInfo) -> Int:
+	match info.template:
+		ConstructorCallTemplate:
+			2
+		ConstructorSymbolTemplate:
+			1
+		ConstructorNullableNoneTemplate:
+			0
+		ConstructorNullablePayloadTemplate:
+			1
+		StackOptionValueTemplate:
+			3
+		StackOptionVoidStatementTemplate:
+			3
+		StackOptionNoneTemplate:
+			3
+		StackResultPayloadTemplate:
+			5
+
+
+pure func parse_prepared_constructor_template(
+	name: String,
+) -> Option[PreparedConstructorTemplateInfo]:
+	TEMPLATES_BY_NAME.get(name)
+
+
+private pure func wrong_arity_for_args(
+	info: PreparedConstructorTemplateInfo,
+	args: List[String],
+) -> RenderError:
+	WrongArity(info, args.length())
+
+
+pure func render_error_to_string(error: RenderError) -> String:
+	match error:
+		WrongArity(info, actual):
+			render_template_arity_error(
+				"prepared constructor op",
+				prepared_constructor_template_name(info),
+				prepared_constructor_template_arity(info),
+				actual,
+			)
+		UnsupportedPreparedConstructorOp(name):
+			render_unsupported_template_error("prepared constructor op", name)
+		InvalidPreparedConstructorJson(message):
+			"invalid prepared constructor JSON: " + message
+
+
+private pure func missing_field_message(field: String) -> String:
+	"missing string field: " + field
+
+
+private pure func string_field(value: JsonValue, field: String) -> Result[String, RenderError]:
+	field_value ?= get_field(
+		value,
+		field,
+	).to_result(InvalidPreparedConstructorJson(missing_field_message(field)))
+	as_string(field_value).to_result(InvalidPreparedConstructorJson(missing_field_message(field)))
+
+
+private pure func parse_constructor_call_args(args: List[String]) -> Option[ConstructorCallArgs]:
+	match args:
+		[callee, argument_list]:
+			Some({
+				callee = callee,
+				argument_list = argument_list,
+			})
+		_:
+			None
+
+
+private pure func parse_stack_option_value_args(args: List[String]) -> Option[StackOptionValueArgs]:
+	match args:
+		[option_type, tag, value]:
+			Some({
+				option_type = option_type,
+				tag = tag,
+				value = value,
+			})
+		_:
+			None
+
+
+private pure func parse_stack_option_void_statement_args(
+	args: List[String],
+) -> Option[StackOptionVoidStatementArgs]:
+	match args:
+		[option_type, tag, statement]:
+			Some({
+				option_type = option_type,
+				tag = tag,
+				statement = statement,
+			})
+		_:
+			None
+
+
+private pure func parse_stack_option_none_args(args: List[String]) -> Option[StackOptionNoneArgs]:
+	match args:
+		[option_type, tag, none_value]:
+			Some({
+				option_type = option_type,
+				tag = tag,
+				none_value = none_value,
+			})
+		_:
+			None
+
+
+private pure func parse_stack_result_payload_args(
+	args: List[String],
+) -> Option[StackResultPayloadArgs]:
+	match args:
+		[result_type, tag, field, payload, release_mask]:
+			Some({
+				result_type = result_type,
+				tag = tag,
+				field = field,
+				payload = payload,
+				release_mask = release_mask,
+			})
+		_:
+			None
+
+
+pure func render_constructor_call(args: ConstructorCallArgs) -> String:
+	args.callee + "(" + args.argument_list + ")"
+
+
+pure func render_stack_option_value(args: StackOptionValueArgs) -> String:
+	"((" + args.option_type + "){ .tag = " + args.tag + ", .value = " + args.value + " })"
+
+
+pure func render_stack_option_void_statement(args: StackOptionVoidStatementArgs) -> String:
+	"({ " + args.statement + " ((" + args.option_type + "){ .tag = " + args.tag + ", .value = 0 }); })"
+
+
+pure func render_stack_option_none(args: StackOptionNoneArgs) -> String:
+	"((" + args.option_type + "){ .tag = " + args.tag + ", .value = " + args.none_value + " })"
+
+
+pure func render_stack_result_payload(args: StackResultPayloadArgs) -> String:
+	"((" + args.result_type + "){ .tag = " + args.tag + ", .release_mask = " + args.release_mask + "UL, .data." + args.field + ".field0 = " + args.payload + " })"
+
+
+pure func render_prepared_constructor_op(op: PreparedConstructorOp) -> String:
+	match op:
+		ConstructorCall(args):
+			render_constructor_call(args)
+		ConstructorSymbol(name):
+			name
+		ConstructorNullableNone:
+			"NULL"
+		ConstructorNullablePayload(payload):
+			payload
+		StackOptionValue(args):
+			render_stack_option_value(args)
+		StackOptionVoidStatement(args):
+			render_stack_option_void_statement(args)
+		StackOptionNone(args):
+			render_stack_option_none(args)
+		StackResultPayload(args):
+			render_stack_result_payload(args)
+
+
+pure func decode_prepared_constructor_json_value(
+	value: JsonValue,
+) -> Result[PreparedConstructorOp, RenderError]:
+	op ?= string_field(value, "op")
+
+	match op:
+		"constructor_call":
+			callee ?= string_field(value, "callee")
+			argument_list ?= string_field(value, "argument_list")
+			Ok(ConstructorCall({
+				callee = callee,
+				argument_list = argument_list,
+			}))
+		"constructor_symbol":
+			name ?= string_field(value, "name")
+			Ok(ConstructorSymbol(name))
+		"constructor_nullable_none":
+			Ok(ConstructorNullableNone)
+		"constructor_nullable_payload":
+			payload ?= string_field(value, "payload")
+			Ok(ConstructorNullablePayload(payload))
+		"stack_option_value":
+			option_type ?= string_field(value, "option_type")
+			tag ?= string_field(value, "tag")
+			payload ?= string_field(value, "value")
+			Ok(StackOptionValue({
+				option_type = option_type,
+				tag = tag,
+				value = payload,
+			}))
+		"stack_option_void_statement":
+			option_type ?= string_field(value, "option_type")
+			tag ?= string_field(value, "tag")
+			statement ?= string_field(value, "statement")
+			Ok(StackOptionVoidStatement({
+				option_type = option_type,
+				tag = tag,
+				statement = statement,
+			}))
+		"stack_option_none":
+			option_type ?= string_field(value, "option_type")
+			tag ?= string_field(value, "tag")
+			none_value ?= string_field(value, "none_value")
+			Ok(StackOptionNone({
+				option_type = option_type,
+				tag = tag,
+				none_value = none_value,
+			}))
+		"stack_result_payload":
+			result_type ?= string_field(value, "result_type")
+			tag ?= string_field(value, "tag")
+			field ?= string_field(value, "field")
+			payload ?= string_field(value, "payload")
+			release_mask ?= string_field(value, "release_mask")
+			Ok(StackResultPayload({
+				result_type = result_type,
+				tag = tag,
+				field = field,
+				payload = payload,
+				release_mask = release_mask,
+			}))
+		other:
+			Err(InvalidPreparedConstructorJson("unknown constructor op: " + other))
+
+
+pure func render_prepared_constructor_json(source: String) -> Result[String, RenderError]:
+	value ?= parse_json(source).map_err(func(message): InvalidPreparedConstructorJson(message))
+	op ?= decode_prepared_constructor_json_value(value)
+	Ok(render_prepared_constructor_op(op))
+
+
+pure func build_prepared_constructor_op(
+	info: PreparedConstructorTemplateInfo,
+	args: List[String],
+) -> Result[PreparedConstructorOp, RenderError]:
+	match info.template:
+		ConstructorCallTemplate:
+			parsed ?= parse_constructor_call_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(ConstructorCall(parsed))
+		ConstructorSymbolTemplate:
+			match args:
+				[name]:
+					Ok(ConstructorSymbol(name))
+				_:
+					Err(wrong_arity_for_args(info, args))
+		ConstructorNullableNoneTemplate:
+			match args:
+				[]:
+					Ok(ConstructorNullableNone)
+				_:
+					Err(wrong_arity_for_args(info, args))
+		ConstructorNullablePayloadTemplate:
+			match args:
+				[payload]:
+					Ok(ConstructorNullablePayload(payload))
+				_:
+					Err(wrong_arity_for_args(info, args))
+		StackOptionValueTemplate:
+			parsed ?= parse_stack_option_value_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(StackOptionValue(parsed))
+		StackOptionVoidStatementTemplate:
+			parsed ?= parse_stack_option_void_statement_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(StackOptionVoidStatement(parsed))
+		StackOptionNoneTemplate:
+			parsed ?= parse_stack_option_none_args(args).to_result(wrong_arity_for_args(info, args))
+			Ok(StackOptionNone(parsed))
+		StackResultPayloadTemplate:
+			parsed ?= parse_stack_result_payload_args(
+				args,
+			).to_result(wrong_arity_for_args(info, args))
+			Ok(StackResultPayload(parsed))
+
+
+pure func render_prepared_constructor(
+	name: String,
+	args: List[String],
+) -> Result[String, RenderError]:
+	match parse_prepared_constructor_template(name):
+		Some(info):
+			match build_prepared_constructor_op(info, args):
+				Ok(op):
+					Ok(render_prepared_constructor_op(op))
+				Err(error):
+					Err(error)
+		None:
+			Err(UnsupportedPreparedConstructorOp(name))
+
+
+private pure func placeholder_prepared_constructor_op(
+	info: PreparedConstructorTemplateInfo,
+) -> PreparedConstructorOp:
+	match info.template:
+		ConstructorCallTemplate:
+			ConstructorCall({
+				callee = "@0@",
+				argument_list = "@1@",
+			})
+		ConstructorSymbolTemplate:
+			ConstructorSymbol("@0@")
+		ConstructorNullableNoneTemplate:
+			ConstructorNullableNone
+		ConstructorNullablePayloadTemplate:
+			ConstructorNullablePayload("@0@")
+		StackOptionValueTemplate:
+			StackOptionValue({
+				option_type = "@0@",
+				tag = "@1@",
+				value = "@2@",
+			})
+		StackOptionVoidStatementTemplate:
+			StackOptionVoidStatement({
+				option_type = "@0@",
+				tag = "@1@",
+				statement = "@2@",
+			})
+		StackOptionNoneTemplate:
+			StackOptionNone({
+				option_type = "@0@",
+				tag = "@1@",
+				none_value = "@2@",
+			})
+		StackResultPayloadTemplate:
+			StackResultPayload({
+				result_type = "@0@",
+				tag = "@1@",
+				field = "@2@",
+				payload = "@3@",
+				release_mask = "@4@",
+			})
+
+
+pure func render_manifest_line(info: PreparedConstructorTemplateInfo) -> String:
+	name: String = prepared_constructor_template_name(info)
+	arity: Int = prepared_constructor_template_arity(info)
+	body: String = render_prepared_constructor_op(placeholder_prepared_constructor_op(info))
+	render_template_manifest_line(name, arity, body)
+
+
+pure func render_manifest_lines() -> List[String]:
+	ALL_TEMPLATES.map(render_manifest_line)

@@ -132,21 +132,21 @@ let test_typecheck_module_only_typed_returns_typed_program () =
             ("expected successful typed module typecheck, got:\n"
            ^ format_errors errors))
 
-let test_typecheck_only_zonks_global_lambda_initializer () =
+let test_typecheck_only_zonks_global_function_reference_initializer () =
   Test_helpers.with_isolated_env (fun () ->
       let source =
         "import:\n\
         \    list: zip\n\
         \    test: TestSuite\n\n\
+         func zip_empty() -> Bool:\n\
+        \    a: List[Int] = []\n\
+        \    a\n\
+        \        .zip([1, 2, 3])\n\
+        \        .length() == 0\n\n\
          tests: TestSuite = {\n\
-        \    description = \"global lambda inference\",\n\
+        \    description = \"global function reference inference\",\n\
         \    tests = [\n\
-        \        (\"zip empty\", func():\n\
-        \            a: List[Int] = []\n\
-        \            a\n\
-        \                .zip([1, 2, 3])\n\
-        \                .length() == 0\n\
-        \        )\n\
+        \        (\"zip empty\", zip_empty)\n\
         \    ]\n\
          }\n"
       in
@@ -160,7 +160,7 @@ let test_typecheck_only_zonks_global_lambda_initializer () =
             (program_has_typed_expr program)
       | Error errors ->
           Alcotest.fail
-            ("expected global lambda initializer to typecheck, got:\n"
+            ("expected global function reference initializer to typecheck, got:\n"
            ^ format_errors errors))
 
 let test_direct_std_source_check_does_not_conflict_with_embedded_std () =
@@ -996,8 +996,9 @@ let suite =
           test_typecheck_module_only_returns_typed_program;
         Alcotest.test_case "typecheck_module_only_typed returns typed program"
           `Quick test_typecheck_module_only_typed_returns_typed_program;
-        Alcotest.test_case "typecheck_only zonks global lambda initializer"
-          `Quick test_typecheck_only_zonks_global_lambda_initializer;
+        Alcotest.test_case
+          "typecheck_only zonks global function reference initializer" `Quick
+          test_typecheck_only_zonks_global_function_reference_initializer;
         Alcotest.test_case "explicit std source reports unused import" `Quick
           test_explicit_std_source_check_reports_unused_import_error;
         Alcotest.test_case "std prelude re-export skips unused imports" `Quick

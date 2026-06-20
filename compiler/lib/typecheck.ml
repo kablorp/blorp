@@ -4059,6 +4059,41 @@ let check_exhaustiveness (env : env) (scrutinee_ty : type_expr)
    Function Body Checking - Second Pass
    ============================================================================ *)
 
+let rec bind_parameter_pattern_vars state env pattern ty =
+  let bind_name env name ty =
+    if name = "_" then env
+    else
+      add_var env name
+        (canonical_type_annotation_in_env state env ty)
+        ~origin:FuncParam ()
+  in
+  match (pattern, Types.head_resolve ty) with
+  | PatWildcard, _ -> env
+  | PatVar name, _ -> bind_name env name ty
+  | PatTuple patterns, (TyTuple elem_tys | TyNamed ("Tuple", elem_tys))
+    when List.length patterns = List.length elem_tys ->
+      List.fold_left2
+        (fun env pattern ty -> bind_parameter_pattern_vars state env pattern ty)
+        env patterns elem_tys
+  | _ -> env
+
+let bind_parameter_vars state env (param : Ast.param) =
+  match (param.param_name, param.param_pattern, param.param_type) with
+  | Some name, None, Some ty ->
+      if name = "_" then env
+      else
+        add_var env name
+          (canonical_type_annotation_in_env state env ty)
+          ~origin:FuncParam ()
+  | None, Some pattern, Some ty ->
+      bind_parameter_pattern_vars state env pattern ty
+  | _ -> env
+
+let parameter_binds_name name (param : Ast.param) =
+  match param.param_pattern with
+  | Some pattern -> List.mem name (Ast.collect_pattern_vars pattern)
+  | None -> param.param_name = Some name
+
 (** Create a type-checking environment scoped to a function's parameters.
     [source_func] preserves the parser-level parameter spelling when [func] has
     already had annotations canonicalized for semantic checking. *)
@@ -4085,8 +4120,13 @@ let setup_function_scope ?(source_func : func_decl option) (state : check_state)
   in
   List.fold_left2
     (fun env (source_param : Ast.param) (param : Ast.param) ->
-      match (param.param_name, source_param.param_type, param.param_type) with
-      | Some name, source_ty_opt, Some ty ->
+      match
+        ( param.param_name,
+          param.param_pattern,
+          source_param.param_type,
+          param.param_type )
+      with
+      | Some name, None, source_ty_opt, Some ty ->
           let source_type =
             Option.map
               (fun source_ty ->
@@ -4098,6 +4138,8 @@ let setup_function_scope ?(source_func : func_decl option) (state : check_state)
           add_var env name
             (canonical_type_annotation_in_env state env ty)
             ?source_type ~origin:FuncParam ()
+      | None, Some pattern, _, Some ty ->
+          bind_parameter_pattern_vars state env pattern ty
       | _ -> env)
     env source_params func.func_params
 
@@ -4388,92 +4430,18 @@ let report_impure_calls state ~func_name ~help_msg impure_calls =
               func_name called_name)))
     state impure_calls
 
-type top_level_initializer_startup_work =
-  | TopLevelInitializerCall of {
-      startup_call_name : string;
-      startup_call_loc : loc;
-    }
-  | TopLevelInitializerSubscript of { startup_subscript_loc : loc }
-
-let resolved_call_is_constructor = function
-  | Some { call_target = CallDirect { origin = CallableConstructor _; _ }; _ }
-    ->
-      true
-  | _ -> false
-
-let source_call_name_for_diagnostic callee resolved =
-  match resolved with
-  | Some { call_target = CallDirect { source_name; _ }; _ } ->
-      Purity_analysis.source_call_name source_name
-  | Some { call_target = CallTraitMethod { method_name; _ }; _ } ->
-      Purity_analysis.source_call_name method_name
-  | Some { call_target = CallClosure _; _ } -> (
-      match callee.expr_desc with
-      | EIdent name -> Purity_analysis.source_call_name name
-      | EFieldAccess (_, name) -> name
-      | _ -> "<expression>")
-  | None -> (
-      match callee.expr_desc with
-      | EIdent name -> Purity_analysis.source_call_name name
-      | EFieldAccess (_, name) -> name
-      | _ -> "<expression>")
-
-(* Subscript_desugar runs before typecheck and currently rewrites source
-   subscripts to ordinary helper calls without preserving a source-syntax tag.
-   Keep these helper names isolated so the top-level startup-call rule can
-   report source-level subscript diagnostics instead of exposing them. *)
-let is_subscript_desugar_call_name = function
-  | "checked_get" | "checked_slice" | "tensor_peel" | "matrix_checked_get"
-  | "tensor3_checked_get" | "tensor4_checked_get" | "tensor5_checked_get" ->
-      true
-  | _ -> false
-
-let resolved_call_is_subscript_desugar resolved =
-  match resolved with
-  | Some { call_target = CallDirect { source_name; _ }; _ } ->
-      is_subscript_desugar_call_name
-        (Purity_analysis.source_call_name source_name)
-  | Some { call_target = CallTraitMethod { method_name; _ }; _ } ->
-      is_subscript_desugar_call_name
-        (Purity_analysis.source_call_name method_name)
-  | Some { call_target = CallClosure _; _ } | None -> false
-
-let collect_top_level_initializer_startup_work (expr : expr) :
-    top_level_initializer_startup_work list =
-  let rec walk expr =
-    match expr.expr_desc with
-    | ELambda _ | EFuncDecl _ -> []
-    | ECall (callee, args) ->
-        let resolved = Ast.expr_resolved_call expr in
-        let nested = List.concat_map walk (callee :: args) in
-        if resolved_call_is_constructor resolved then nested
-        else if resolved_call_is_subscript_desugar resolved then
-          TopLevelInitializerSubscript { startup_subscript_loc = expr.expr_loc }
-          :: nested
-        else
-          TopLevelInitializerCall
-            {
-              startup_call_name =
-                source_call_name_for_diagnostic callee resolved;
-              startup_call_loc = expr.expr_loc;
-            }
-          :: nested
-    | _ -> List.concat_map walk (Ast.expr_children expr)
-  in
-  walk expr
-
 let validate_top_level_initializer_has_no_calls state var_name init =
   let binding_name = Option.value var_name ~default:"_" in
-  let startup_work = collect_top_level_initializer_startup_work init in
+  let startup_work = Top_level_initializer.collect_startup_work init in
   List.fold_left
     (fun st work ->
       match work with
-      | TopLevelInitializerCall { startup_call_name; startup_call_loc } ->
+      | Top_level_initializer.StartupCall { call_name; call_loc } ->
           add_error st
-            (error_with startup_call_loc
+            (error_with call_loc
                (Printf.sprintf
                   "top-level initializer '%s' cannot call function '%s'"
-                  binding_name startup_call_name)
+                  binding_name call_name)
                ~notes:
                  [
                    "Top-level values are initialized before main. Function \
@@ -4484,9 +4452,9 @@ let validate_top_level_initializer_has_no_calls state var_name init =
                     "Move the call into main or another function, then \
                      initialize the top-level value with data that does not \
                      run code at startup"))
-      | TopLevelInitializerSubscript { startup_subscript_loc } ->
+      | Top_level_initializer.StartupSubscript { subscript_loc } ->
           add_error st
-            (error_with startup_subscript_loc
+            (error_with subscript_loc
                (Printf.sprintf
                   "top-level initializer '%s' cannot use a subscript expression"
                   binding_name)
@@ -4515,10 +4483,7 @@ let rec check_nested_pure_lambdas (state : check_state) (expr : expr) :
           | Some body ->
               let purity_env =
                 List.fold_left
-                  (fun env (p : param) ->
-                    match (p.param_name, p.param_type) with
-                    | Some name, Some ty -> add_var env name ty ()
-                    | _ -> env)
+                  (bind_parameter_vars state)
                   state.env func.func_params
               in
               let impure_calls =
@@ -4571,12 +4536,7 @@ let check_purity (state : check_state) (func : func_decl)
             state func.func_params
         in
         let purity_env =
-          List.fold_left
-            (fun env (p : param) ->
-              match (p.param_name, p.param_type) with
-              | Some name, Some ty -> add_var env name ty ()
-              | _ -> env)
-            state.env func.func_params
+          List.fold_left (bind_parameter_vars state) state.env func.func_params
         in
         let impure_calls =
           collect_impure_calls ~strict:true purity_env state.module_aliases body
@@ -4597,7 +4557,7 @@ let check_purity (state : check_state) (func : func_decl)
               | Some { kind = Env.VarSymbol { mutability = Env.Mutable; _ }; _ }
                 when not
                        (List.exists
-                          (fun (p : param) -> p.param_name = Some name)
+                          (parameter_binds_name name)
                           func.func_params) ->
                   add_error st
                     (error_at e.expr_loc
@@ -4775,15 +4735,7 @@ let rec check_matches_in_expr (state : check_state) (expr : expr) : check_state
       | Some body ->
           let env = push_scope state.env in
           let env =
-            List.fold_left
-              (fun env (p : Ast.param) ->
-                match (p.param_name, p.param_type) with
-                | Some name, Some ty ->
-                    add_var env name
-                      (canonical_type_annotation_in_env state env ty)
-                      ()
-                | _ -> env)
-              env func.func_params
+            List.fold_left (bind_parameter_vars state) env func.func_params
           in
           check_matches_in_expr { state with env } body
       | None -> state)
@@ -4948,6 +4900,216 @@ let validate_main_signature state func loc =
       else state
   | _ -> state
 
+let report_ctfe_impure_initializer state ~message ~binding_name expr =
+  let impure_calls =
+    collect_impure_calls ~strict:true state.env state.module_aliases expr
+  in
+  List.fold_left
+    (fun st call ->
+      add_error st
+        (error_with call.call_loc message
+           ~notes:
+             [
+               Printf.sprintf "Initializer for '%s' calls impure function '%s'."
+                 binding_name call.called_name;
+             ]
+           ~help:
+             (Some
+                "Move impure work to runtime code, or build the value from \
+                 pure functions and data only.")))
+    state impure_calls
+
+let typecheck_global_var_decl ?(validate_startup_work = true) state loc var_decl
+    =
+  let state =
+    match var_decl.var_type with
+    | Some ty -> (
+        match Types.validate_tensor_dims (Env.get_type_params state.env) ty with
+        | Some msg -> add_error state (error_at loc msg)
+        | None -> state)
+    | None -> state
+  in
+  let state, typed_value =
+    match var_decl.var_type with
+    | Some declared_ty -> (
+        let declared_ty = canonical_type_annotation state declared_ty in
+        match
+          Infer.infer_expr_with_annotated_expected (ctx_of_state state)
+            declared_ty var_decl.var_value
+        with
+        | Ok (actual_ty, typed_val) ->
+            if
+              types_compatible
+                ~type_params:(Env.get_type_params state.env)
+                declared_ty actual_ty
+            then (state, Some typed_val)
+            else
+              let name_str =
+                match var_decl.var_name with
+                | Some n -> Printf.sprintf " '%s'" n
+                | None -> ""
+              in
+              ( add_error state
+                  (error_at loc
+                     (Printf.sprintf
+                        "Type mismatch in variable%s\n\
+                        \    expected: %s\n\
+                        \       found: %s"
+                        name_str
+                        (type_to_string declared_ty)
+                        (type_to_string actual_ty))),
+                Some typed_val )
+        | Error err -> (add_error state err, None))
+    | None -> (
+        let ctx = ctx_of_state state in
+        match infer_expr ctx var_decl.var_value with
+        | Ok (ty, typed_val) ->
+            let bind_ty =
+              inferred_binding_type ~is_mutable:var_decl.var_is_mutable ty
+            in
+            let typed_val =
+              Infer.annotate_inferred_binding_value
+                ~is_mutable:var_decl.var_is_mutable typed_val ty
+            in
+            let state =
+              match var_decl.var_name with
+              | Some name ->
+                  {
+                    state with
+                    env =
+                      add_var state.env name bind_ty
+                        ~mutability:
+                          (if var_decl.var_is_mutable then Mutable
+                           else Immutable)
+                        ();
+                  }
+              | None -> state
+            in
+            (state, Some typed_val)
+        | Error err -> (add_error state err, None))
+  in
+  let typed_value = Option.map Infer.zonk_expr typed_value in
+  let state =
+    match typed_value with
+    | Some tv -> check_matches_in_expr state tv
+    | None -> state
+  in
+  let state =
+    (* Immutable top-level bindings are constants: calls in their initializers
+       are handled by CTFE after typecheck. Mutable globals are not constants,
+       so keep rejecting hidden runtime startup work here. *)
+    match (validate_startup_work && var_decl.var_is_mutable, typed_value) with
+    | true, Some tv ->
+        validate_top_level_initializer_has_no_calls state var_decl.var_name tv
+    | _ -> state
+  in
+  let state =
+    match typed_value with
+    | Some tv when (not var_decl.var_is_mutable) && var_decl.var_is_const ->
+        report_ctfe_impure_initializer state
+          ~message:"global constant initializer must be pure"
+          ~binding_name:(Option.value var_decl.var_name ~default:"_")
+          tv
+    | _ -> state
+  in
+  match typed_value with
+  | Some tv ->
+      let state, inferred_ty =
+        match
+          typed_expr_value_type_for_typecheck
+            ~context:"global variable finalization" tv
+        with
+        | Ok ty -> (state, Some ty)
+        | Error err -> (add_error state err, None)
+      in
+      let typed_var =
+        {
+          var_decl with
+          var_type =
+            (match var_decl.var_type with
+            | Some ty -> Some (canonical_type_annotation state ty)
+            | None -> inferred_ty);
+          var_value = tv;
+        }
+      in
+      let state =
+        match (typed_var.var_name, inferred_ty) with
+        | Some name, Some ty
+          when Infer.type_contains_resource (ctx_of_state state) ty ->
+            add_error state
+              (error_at loc
+                 (Printf.sprintf
+                    "resource value '%s' cannot be bound to a global" name))
+        | Some name, Some ty
+          when Infer.type_contains_one_shot_stream_function_carrier
+                 ~memo:state.type_shape_memo state.env ty ->
+            add_error state
+              (one_shot_stream_function_carrier_error loc
+                 (Printf.sprintf
+                    "function value '%s' cannot accept or return a one-shot \
+                     stream carrier"
+                    name))
+        | Some name, Some ty
+          when Infer.type_contains_one_shot_stream ~memo:state.type_shape_memo
+                 state.env ty ->
+            add_error state
+              (error_with loc
+                 (Printf.sprintf
+                    "one-shot stream value '%s' cannot be bound to a global"
+                    name)
+                 ~notes:
+                   [
+                     "Global bindings are shared program state. A stream \
+                      cursor has mutable pull state and must stay local to the \
+                      code that consumes it.";
+                   ]
+                 ~help:
+                   (Some
+                      "Create the stream inside a function, keep it in a \
+                       direct local binding while building the pipeline, and \
+                       consume it with a terminal stream operation."))
+        | Some name, Some ty
+          when Infer.type_contains_resource_source_function_carrier
+                 ~memo:state.type_shape_memo state.env ty ->
+            add_error state
+              (resource_source_function_carrier_error loc
+                 (Printf.sprintf
+                    "function value '%s' cannot accept or return a resource \
+                     source carrier"
+                    name))
+        | Some name, Some ty
+          when Infer.type_contains_resource_source ~memo:state.type_shape_memo
+                 state.env ty ->
+            add_error state
+              (error_with loc
+                 (Printf.sprintf
+                    "resource source value '%s' cannot be bound to a global"
+                    name)
+                 ~notes:
+                   [
+                     "Global bindings are shared program state. A resource \
+                      source carries one-shot ownership transfer state and \
+                      must stay local to the code that consumes it.";
+                   ]
+                 ~help:
+                   (Some
+                      "Create resource sources inside the function that \
+                       consumes them, or expose a function that creates a \
+                       fresh source each time."))
+        | _ -> state
+      in
+      (state, typed_var)
+  | None -> (state, var_decl)
+
+let compile_time_constructor_info env name =
+  match Env.get_constructor env name with
+  | Some (parent_type, _, field_types, _) ->
+      Some
+        (Ctfe.make_constructor_info ~parent_type
+           ~arity:(List.length field_types)
+           ~callable_id:(Env.get_constructor_callable_id env name))
+  | None -> None
+
 let rec second_pass (state : check_state) (decls : program) :
     check_state * program =
   let state, rev_decls =
@@ -5010,196 +5172,8 @@ let rec second_pass (state : check_state) (decls : program) :
             in
             (state, { decl with decl_desc = DFunc typed_func } :: acc)
         | DVar var_decl ->
-            (* Validate tensor dimension types in annotation *)
-            let state =
-              match var_decl.var_type with
-              | Some ty -> (
-                  match
-                    Types.validate_tensor_dims
-                      (Env.get_type_params state.env)
-                      ty
-                  with
-                  | Some msg -> add_error state (error_at loc msg)
-                  | None -> state)
-              | None -> state
-            in
-            (* Check that initializer type matches declared type *)
-            let state, typed_value =
-              match var_decl.var_type with
-              | Some declared_ty -> (
-                  let declared_ty =
-                    canonical_type_annotation state declared_ty
-                  in
-                  match
-                    Infer.infer_expr_with_annotated_expected
-                      (ctx_of_state state) declared_ty var_decl.var_value
-                  with
-                  | Ok (actual_ty, typed_val) ->
-                      if
-                        types_compatible
-                          ~type_params:(Env.get_type_params state.env)
-                          declared_ty actual_ty
-                      then (state, Some typed_val)
-                      else
-                        let name_str =
-                          match var_decl.var_name with
-                          | Some n -> Printf.sprintf " '%s'" n
-                          | None -> ""
-                        in
-                        ( add_error state
-                            (error_at loc
-                               (Printf.sprintf
-                                  "Type mismatch in variable%s\n\
-                                  \    expected: %s\n\
-                                  \       found: %s"
-                                  name_str
-                                  (type_to_string declared_ty)
-                                  (type_to_string actual_ty))),
-                          Some typed_val )
-                  | Error err -> (add_error state err, None))
-              | None -> (
-                  (* Re-infer untyped var declarations to catch errors.
-                 First pass typed these as Void on failure, but now all
-                 signatures are available so forward refs resolve. *)
-                  let ctx = ctx_of_state state in
-                  match infer_expr ctx var_decl.var_value with
-                  | Ok (ty, typed_val) ->
-                      let bind_ty =
-                        inferred_binding_type
-                          ~is_mutable:var_decl.var_is_mutable ty
-                      in
-                      let typed_val =
-                        Infer.annotate_inferred_binding_value
-                          ~is_mutable:var_decl.var_is_mutable typed_val ty
-                      in
-                      (* Update env so downstream vars see the resolved type *)
-                      let state =
-                        match var_decl.var_name with
-                        | Some name ->
-                            {
-                              state with
-                              env =
-                                add_var state.env name bind_ty
-                                  ~mutability:
-                                    (if var_decl.var_is_mutable then Mutable
-                                     else Immutable)
-                                  ();
-                            }
-                        | None -> state
-                      in
-                      (state, Some typed_val)
-                  | Error err -> (add_error state err, None))
-            in
-            let typed_value = Option.map Infer.zonk_expr typed_value in
-            let state =
-              match typed_value with
-              | Some tv -> check_matches_in_expr state tv
-              | None -> state
-            in
-            let state =
-              match typed_value with
-              | Some tv ->
-                  validate_top_level_initializer_has_no_calls state
-                    var_decl.var_name tv
-              | None -> state
-            in
             let state, typed_var =
-              match typed_value with
-              | Some tv ->
-                  let state, inferred_ty =
-                    match
-                      typed_expr_value_type_for_typecheck
-                        ~context:"global variable finalization" tv
-                    with
-                    | Ok ty -> (state, Some ty)
-                    | Error err -> (add_error state err, None)
-                  in
-                  let typed_var =
-                    {
-                      var_decl with
-                      var_type =
-                        (match var_decl.var_type with
-                        | Some ty -> Some (canonical_type_annotation state ty)
-                        | None -> inferred_ty);
-                      var_value = tv;
-                    }
-                  in
-                  let state =
-                    match (typed_var.var_name, inferred_ty) with
-                    | Some name, Some ty
-                      when Infer.type_contains_resource (ctx_of_state state) ty
-                      ->
-                        add_error state
-                          (error_at loc
-                             (Printf.sprintf
-                                "resource value '%s' cannot be bound to a \
-                                 global"
-                                name))
-                    | Some name, Some ty
-                      when Infer.type_contains_one_shot_stream_function_carrier
-                             ~memo:state.type_shape_memo state.env ty ->
-                        add_error state
-                          (one_shot_stream_function_carrier_error loc
-                             (Printf.sprintf
-                                "function value '%s' cannot accept or return a \
-                                 one-shot stream carrier"
-                                name))
-                    | Some name, Some ty
-                      when Infer.type_contains_one_shot_stream
-                             ~memo:state.type_shape_memo state.env ty ->
-                        add_error state
-                          (error_with loc
-                             (Printf.sprintf
-                                "one-shot stream value '%s' cannot be bound to \
-                                 a global"
-                                name)
-                             ~notes:
-                               [
-                                 "Global bindings are shared program state. A \
-                                  stream cursor has mutable pull state and \
-                                  must stay local to the code that consumes \
-                                  it.";
-                               ]
-                             ~help:
-                               (Some
-                                  "Create the stream inside a function, keep \
-                                   it in a direct local binding while building \
-                                   the pipeline, and consume it with a \
-                                   terminal stream operation."))
-                    | Some name, Some ty
-                      when Infer.type_contains_resource_source_function_carrier
-                             ~memo:state.type_shape_memo state.env ty ->
-                        add_error state
-                          (resource_source_function_carrier_error loc
-                             (Printf.sprintf
-                                "function value '%s' cannot accept or return a \
-                                 resource source carrier"
-                                name))
-                    | Some name, Some ty
-                      when Infer.type_contains_resource_source
-                             ~memo:state.type_shape_memo state.env ty ->
-                        add_error state
-                          (error_with loc
-                             (Printf.sprintf
-                                "resource source value '%s' cannot be bound to \
-                                 a global"
-                                name)
-                             ~notes:
-                               [
-                                 "Global bindings are shared program state. A \
-                                  resource source carries one-shot ownership \
-                                  transfer state and must stay local to the \
-                                  code that consumes it.";
-                               ]
-                             ~help:
-                               (Some
-                                  "Create resource sources inside the function \
-                                   that consumes them, or expose a function \
-                                   that creates a fresh source each time."))
-                    | _ -> state
-                  in
-                  (state, typed_var)
-              | None -> (state, var_decl)
+              typecheck_global_var_decl state loc var_decl
             in
             (state, { decl with decl_desc = DVar typed_var } :: acc)
         | DPrivate inner -> (
@@ -5849,9 +5823,17 @@ let typecheck_with_state_typed ?module_origin ?(module_name = "")
   in
   match List.rev state.errors with
   | _ :: _ as errors -> Error errors
-  | [] ->
-      require_typed_program_for_typecheck ~source_program ~state typed_program
-      |> Result.map (fun typed -> (state, typed))
+  | [] -> (
+      match
+        require_typed_program_for_typecheck ~source_program ~state typed_program
+      with
+      | Error errors -> Error errors
+      | Ok typed ->
+          Ctfe.evaluate_program
+            ~constructor_info:(compile_time_constructor_info state.env)
+            ~import_bindings:(List.rev state.import_bindings)
+            typed
+          |> Result.map (fun typed -> (state, typed)))
 
 let typecheck_typed ?module_origin ?(module_name = "")
     ?(allow_debug_only_calls = false) (program : program) :
@@ -5876,7 +5858,15 @@ let typecheck_with_env_typed ?module_origin ?(module_name = "")
       match
         require_typed_program_for_typecheck ~source_program ~state typed_program
       with
-      | Ok typed -> Ok (typed, state.env)
+      | Ok typed -> (
+          match
+            Ctfe.evaluate_program
+              ~constructor_info:(compile_time_constructor_info state.env)
+              ~import_bindings:(List.rev state.import_bindings)
+              typed
+          with
+          | Ok typed -> Ok (typed, state.env)
+          | Error errors -> Error (errors, state.env))
       | Error errors -> Error (errors, state.env))
 
 let typecheck_with_env ?module_origin ?(module_name = "")
@@ -6023,5 +6013,13 @@ let typecheck_module_with_state_typed ?module_origin ?(module_name = "")
         require_typed_program_for_typecheck ~source_program:source_decls ~state
           typed_decls
       with
-      | Ok typed -> Ok (state, typed)
+      | Ok typed -> (
+          match
+            Ctfe.evaluate_program
+              ~constructor_info:(compile_time_constructor_info state.env)
+              ~import_bindings:(List.rev state.import_bindings)
+              typed
+          with
+          | Ok typed -> Ok (state, typed)
+          | Error errors -> Error (state, errors))
       | Error errors -> Error (state, errors))

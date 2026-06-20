@@ -320,6 +320,10 @@ type managed_type_kind =
   | ManagedUnion
   | ManagedRuntimeBuiltin
 
+type union_payload_storage =
+  | ErasedUnionPayloadStorage
+  | TypedUnionPayloadStorage
+
 type managed_destructor =
   | ArcReleaseOnly
       (** The value has a blorp ARC header, but no type-specific nested
@@ -350,6 +354,11 @@ type registry = {
         unions both have constructors, but only managed unions allocate ARC
         objects. Earlier Core passes use this table to recognize constructor
         calls without guessing from source names. *)
+  union_payload_storage : (string, union_payload_storage) Hashtbl.t;
+      (** C storage policy for non-enum union payload fields. Source unions
+        default to erased [void*] payload slots. Monomorphized concrete generic
+        unions can opt into typed payload slots once their variant field types
+        are fully concrete. *)
   managed_types : (string, managed_type_info) Hashtbl.t;
       (** Heap-allocated user types with ARC headers: records and non-enum
         unions. The value records the type's release/destructor policy, so
@@ -374,6 +383,7 @@ let create_registry () : registry =
     value_records = Hashtbl.create 16;
     enum_types = Hashtbl.create 8;
     union_variants = Hashtbl.create 16;
+    union_payload_storage = Hashtbl.create 16;
     managed_types = Hashtbl.create 32;
     type_aliases = Hashtbl.create 16;
   }
@@ -383,6 +393,7 @@ let reset_registry (reg : registry) : unit =
   Hashtbl.clear reg.value_records;
   Hashtbl.clear reg.enum_types;
   Hashtbl.clear reg.union_variants;
+  Hashtbl.clear reg.union_payload_storage;
   Hashtbl.clear reg.managed_types;
   Hashtbl.clear reg.type_aliases
 
@@ -405,7 +416,16 @@ let register_heap_record_type reg name ~destructor =
   register_managed_type reg name
     { managed_kind = ManagedHeapRecord; destructor }
 
-let register_union_type reg name ~destructor =
+let register_union_type ?payload_storage reg name ~destructor =
+  let payload_storage =
+    match payload_storage with
+    | Some storage -> storage
+    | None -> (
+        match Hashtbl.find_opt reg.union_payload_storage name with
+        | Some storage -> storage
+        | None -> ErasedUnionPayloadStorage)
+  in
+  Hashtbl.replace reg.union_payload_storage name payload_storage;
   register_managed_type reg name { managed_kind = ManagedUnion; destructor }
 
 let enum_info_of_variants variants =
@@ -425,6 +445,16 @@ let lookup_union_variant reg type_name variant_name =
   match Hashtbl.find_opt reg.union_variants type_name with
   | None -> None
   | Some variants -> Hashtbl.find_opt variants variant_name
+
+let union_payload_storage reg name =
+  match Hashtbl.find_opt reg.union_payload_storage name with
+  | Some storage -> storage
+  | None -> ErasedUnionPayloadStorage
+
+let union_uses_typed_payload_storage reg name =
+  match union_payload_storage reg name with
+  | TypedUnionPayloadStorage -> true
+  | ErasedUnionPayloadStorage -> false
 
 let managed_type_info reg name = Hashtbl.find_opt reg.managed_types name
 let is_managed_type reg name = Hashtbl.mem reg.managed_types name

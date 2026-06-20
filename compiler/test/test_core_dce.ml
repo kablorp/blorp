@@ -142,6 +142,23 @@ let decl_type name variants =
     cd_doc = None;
   }
 
+let decl_generic_type name type_params variants =
+  {
+    cd_desc =
+      CDType
+        {
+          type_name = name;
+          type_params;
+          type_variants = variants;
+          type_is_enum = false;
+          type_is_builtin = false;
+          type_is_resource = false;
+          type_resource_cleanup = None;
+        };
+    cd_loc = loc;
+    cd_doc = None;
+  }
+
 let decl_enum name variants =
   {
     cd_desc =
@@ -514,7 +531,7 @@ let test_prunes_unreachable_monomorphic_type_declarations () =
     [ "record Widget"; "type UsedUnion" ]
     (kept_type_decl_names pruned)
 
-let test_retains_generic_type_templates () =
+let test_prunes_unused_generic_record_templates () =
   let main = func 1 "main" in
   let pruned =
     prune
@@ -526,8 +543,62 @@ let test_retains_generic_type_templates () =
       ]
   in
   Alcotest.(check (list string))
-    "generic record template retained until monomorphic identity is modeled"
-    [ "record GenericBox" ]
+    "unused generic record templates are source-only after data \
+     monomorphization"
+    []
+    (kept_type_decl_names pruned)
+
+let test_prunes_unused_generic_union_templates () =
+  let main = func 1 "main" in
+  let pruned =
+    prune
+      [
+        decl_generic_type "GenericChoice"
+          [ make_type_param "T" [] ]
+          [ variant "Picked" [ ty_t ]; variant "Empty" [] ];
+        decl_func main;
+      ]
+  in
+  Alcotest.(check (list string))
+    "unused generic union templates are source-only after data monomorphization"
+    []
+    (kept_type_decl_names pruned)
+
+let test_constructor_callee_type_does_not_retain_generic_union_template () =
+  let choice_generic_ty = TyNamed ("Choice", [ ty_t ]) in
+  let choice_string_ty = TyNamed ("Choice__mono_String", []) in
+  let picked_callee_ty =
+    TyFunc
+      { params = [ ty_string ]; return = choice_generic_ty; is_pure = true }
+  in
+  let picked_call =
+    mk
+      (CCall
+         ( CKUser ("Picked", Some 100),
+           mk (CVar (Var.named "Picked")) picked_callee_ty,
+           [ cstr "hello" ] ))
+      choice_string_ty
+  in
+  let main =
+    func 1 "main" ~body:(Some (mk (CSeq (picked_call, cint 0)) ty_int))
+  in
+  let pruned =
+    prune
+      [
+        decl_generic_type "Choice"
+          [ make_type_param "T" [] ]
+          [ variant "Picked" [ ty_t ]; variant "Empty" [] ];
+        decl_type "Choice__mono_String"
+          [
+            variant ~def_id:100 "Picked" [ ty_string ];
+            variant ~def_id:101 "Empty" [];
+          ];
+        decl_func main;
+      ]
+  in
+  Alcotest.(check (list string))
+    "generic union constructor callee type is not a runtime layout dependency"
+    [ "type Choice__mono_String" ]
     (kept_type_decl_names pruned)
 
 let test_retains_global_abi_type_layout_anchors () =
@@ -1134,8 +1205,14 @@ let suite =
           test_list_to_string_roots_stringable_callback;
         Alcotest.test_case "prunes unreachable monomorphic type declarations"
           `Quick test_prunes_unreachable_monomorphic_type_declarations;
-        Alcotest.test_case "retains generic type templates" `Quick
-          test_retains_generic_type_templates;
+        Alcotest.test_case "prunes unused generic record templates" `Quick
+          test_prunes_unused_generic_record_templates;
+        Alcotest.test_case "prunes unused generic union templates" `Quick
+          test_prunes_unused_generic_union_templates;
+        Alcotest.test_case
+          "constructor callee type does not retain generic union template"
+          `Quick
+          test_constructor_callee_type_does_not_retain_generic_union_template;
         Alcotest.test_case "retains global ABI type layout anchors" `Quick
           test_retains_global_abi_type_layout_anchors;
         Alcotest.test_case "dependency graph records roots and edges" `Quick

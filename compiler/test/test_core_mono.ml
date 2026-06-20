@@ -61,6 +61,53 @@ let mk_func ?(type_params = []) ?(type_param_decls = []) ?(module_path = None)
 
 let mk_decl f = { cd_desc = CDFunc f; cd_loc = loc; cd_doc = None }
 
+let mk_record_decl ?(type_params = []) ?(is_value = false) name fields :
+    core_decl =
+  {
+    cd_desc =
+      CDRecord
+        {
+          record_name = name;
+          record_type_params = tparams type_params;
+          record_fields =
+            List.map
+              (fun (field_name, field_type) ->
+                { field_name; field_type; field_loc = loc })
+              fields;
+          record_is_value = is_value;
+          record_is_builtin = false;
+        };
+    cd_loc = loc;
+    cd_doc = None;
+  }
+
+let mk_type_decl ?(type_params = []) name variants : core_decl =
+  {
+    cd_desc =
+      CDType
+        {
+          type_name = name;
+          type_params = tparams type_params;
+          type_variants =
+            List.mapi
+              (fun tag (variant_name, variant_fields) ->
+                {
+                  variant_name;
+                  variant_fields;
+                  variant_tag = tag;
+                  variant_loc = loc;
+                  variant_def_id = Some (1000 + tag);
+                })
+              variants;
+          type_is_enum = false;
+          type_is_builtin = false;
+          type_is_resource = false;
+          type_resource_cleanup = None;
+        };
+    cd_loc = loc;
+    cd_doc = None;
+  }
+
 let mk_impl trait_name for_type methods =
   {
     cd_desc =
@@ -390,6 +437,154 @@ let test_mono_no_generics_unchanged () =
   let prog = [ mk_decl f ] in
   let result = Blorp.Core_mono.monomorphize_program prog in
   Alcotest.(check int) "unchanged" 1 (List.length result)
+
+let test_mono_materializes_generic_record_layout_without_generic_functions () =
+  let box_string_ty = TyNamed ("Box", [ ty_string ]) in
+  let read_body = mk (CField (cvar "box" box_string_ty, "value")) ty_string in
+  let read_fn = mk_func "read" [ ("box", box_string_ty) ] ty_string read_body in
+  let result =
+    Blorp.Core_mono.monomorphize_program
+      [
+        mk_record_decl ~type_params:[ "T" ] "Box" [ ("value", TyVar "T") ];
+        mk_decl read_fn;
+      ]
+  in
+  let concrete_record =
+    List.find_opt
+      (function
+        | { cd_desc = CDRecord r; _ } -> r.record_name = "Box__mono_String"
+        | _ -> false)
+      result
+  in
+  let read_decl =
+    List.find
+      (function { cd_desc = CDFunc f; _ } -> f.cf_name = "read" | _ -> false)
+      result
+  in
+  (match concrete_record with
+  | Some { cd_desc = CDRecord r; _ } -> (
+      Alcotest.(check bool)
+        "concrete record has no type params" true
+        (r.record_type_params = []);
+      match r.record_fields with
+      | [ { field_name = "value"; field_type; _ } ] ->
+          Alcotest.(check bool)
+            "field type is concrete" true (field_type = ty_string)
+      | _ -> Alcotest.fail "expected one value field")
+  | _ -> Alcotest.fail "expected generated concrete record");
+  match read_decl.cd_desc with
+  | CDFunc { cf_params = [ param ]; cf_body = Some body; _ } -> (
+      Alcotest.(check bool)
+        "function param uses concrete record type" true
+        (param.cp_ty = TyNamed ("Box__mono_String", []));
+      match body.desc with
+      | CField (owner, "value") ->
+          Alcotest.(check bool)
+            "field owner uses concrete record type" true
+            (owner.ty = TyNamed ("Box__mono_String", []))
+      | _ -> Alcotest.fail "expected field access")
+  | _ -> Alcotest.fail "expected read function"
+
+let test_mono_materializes_generic_union_layout_without_generic_functions () =
+  let choice_string_ty = TyNamed ("Choice", [ ty_string ]) in
+  let body = cvar "choice" choice_string_ty in
+  let pass_fn =
+    mk_func "pass_choice" [ ("choice", choice_string_ty) ] choice_string_ty body
+  in
+  let reg = empty_reg () in
+  let result =
+    Blorp.Core_mono.monomorphize_program ~reg
+      [
+        mk_type_decl ~type_params:[ "T" ] "Choice"
+          [ ("Picked", [ TyVar "T" ]); ("Empty", []) ];
+        mk_decl pass_fn;
+      ]
+  in
+  let concrete_type =
+    List.find_opt
+      (function
+        | { cd_desc = CDType t; _ } -> t.type_name = "Choice__mono_String"
+        | _ -> false)
+      result
+  in
+  let pass_decl =
+    List.find
+      (function
+        | { cd_desc = CDFunc f; _ } -> f.cf_name = "pass_choice" | _ -> false)
+      result
+  in
+  (match concrete_type with
+  | Some { cd_desc = CDType t; _ } -> (
+      Alcotest.(check bool)
+        "concrete union has no type params" true (t.type_params = []);
+      Alcotest.(check bool)
+        "ordinary concrete union uses typed payload storage" true
+        (Blorp.Codegen_types.union_uses_typed_payload_storage reg
+           "Choice__mono_String");
+      match t.type_variants with
+      | [
+       {
+         variant_name = "Picked";
+         variant_fields = [ field_ty ];
+         variant_def_id;
+         _;
+       };
+       { variant_name = "Empty"; variant_fields = []; _ };
+      ] ->
+          Alcotest.(check bool)
+            "payload type is concrete" true (field_ty = ty_string);
+          Alcotest.(check bool)
+            "concrete variant gets fresh identity" true
+            (variant_def_id <> Some 1000)
+      | _ -> Alcotest.fail "expected Picked(String) and Empty variants")
+  | _ -> Alcotest.fail "expected generated concrete union");
+  match pass_decl.cd_desc with
+  | CDFunc { cf_params = [ param ]; cf_return_ty; cf_body = Some body; _ } ->
+      Alcotest.(check bool)
+        "function param uses concrete union type" true
+        (param.cp_ty = TyNamed ("Choice__mono_String", []));
+      Alcotest.(check bool)
+        "function return uses concrete union type" true
+        (cf_return_ty = TyNamed ("Choice__mono_String", []));
+      Alcotest.(check bool)
+        "body uses concrete union type" true
+        (body.ty = TyNamed ("Choice__mono_String", []))
+  | _ -> Alcotest.fail "expected pass_choice function"
+
+let test_mono_keeps_runtime_erased_bridge_union_payload_storage () =
+  let attempt_int_ty = TyNamed ("std_channel__RecvAttempt", [ ty_int ]) in
+  let body = cvar "attempt" attempt_int_ty in
+  let pass_fn =
+    mk_func "pass_recv_attempt"
+      [ ("attempt", attempt_int_ty) ]
+      attempt_int_ty body
+  in
+  let reg = empty_reg () in
+  let result =
+    Blorp.Core_mono.monomorphize_program ~reg
+      [
+        mk_type_decl ~type_params:[ "T" ] "std_channel__RecvAttempt"
+          [
+            ("RecvValue", [ TyVar "T" ]);
+            ("RecvWouldBlock", []);
+            ("RecvSealed", []);
+          ];
+        mk_decl pass_fn;
+      ]
+  in
+  let concrete_name = "std_channel__RecvAttempt__mono_Int" in
+  let concrete_type =
+    List.find_opt
+      (function
+        | { cd_desc = CDType t; _ } -> t.type_name = concrete_name | _ -> false)
+      result
+  in
+  match concrete_type with
+  | Some { cd_desc = CDType _; _ } ->
+      Alcotest.(check bool)
+        "runtime bridge union keeps erased payload storage" false
+        (Blorp.Codegen_types.union_uses_typed_payload_storage reg concrete_name)
+  | _ -> Alcotest.fail "expected generated concrete RecvAttempt union"
 
 let test_mono_two_instantiations () =
   let identity =
@@ -1788,6 +1983,12 @@ let suite =
         Alcotest.test_case "types_specialized" `Quick
           test_mono_specialized_types;
         Alcotest.test_case "no_generics" `Quick test_mono_no_generics_unchanged;
+        Alcotest.test_case "generic_record_data_layout" `Quick
+          test_mono_materializes_generic_record_layout_without_generic_functions;
+        Alcotest.test_case "generic_union_data_layout" `Quick
+          test_mono_materializes_generic_union_layout_without_generic_functions;
+        Alcotest.test_case "runtime_erased_bridge_union_data_layout" `Quick
+          test_mono_keeps_runtime_erased_bridge_union_payload_storage;
         Alcotest.test_case "two_instances" `Quick test_mono_two_instantiations;
         Alcotest.test_case "repeated_type_param_consistent_call_ok" `Quick
           test_mono_repeated_type_param_consistent_call_ok;

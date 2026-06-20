@@ -213,6 +213,7 @@ val var_ast : var_decl -> Ast.var_decl
 val var_info : var_decl -> var_info
 val var_value_expr : var_decl -> (expr, error) result
 val var_binding_type : var_decl -> Ast.type_expr
+val with_var_ast : var_decl -> Ast.var_decl -> var_decl
 val record_ast : record_decl -> Ast.record_decl
 val record_info : record_decl -> record_info
 val record_field_infos : record_decl -> record_field_info list
@@ -221,6 +222,9 @@ val type_alias_info : type_alias_decl -> type_alias_info
 val type_alias_semantic_target_type : type_alias_decl -> Ast.type_expr
 val impl_ast : impl_decl -> Ast.impl_decl
 val impl_methods : impl_decl -> func_decl list
+val make_var_decl : Ast.decl -> var_decl -> decl
+val make_private_decl : Ast.decl -> decl -> decl
+val make_program : decl list -> program
 val decl_ast : decl -> Ast.decl
 val decl_view : decl -> decl_view
 val decl_func : decl -> func_decl option

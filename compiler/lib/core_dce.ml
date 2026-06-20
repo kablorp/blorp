@@ -3,9 +3,8 @@
     This pass prunes only declaration classes whose reachability can be proven
     from explicit Core identities. It currently removes unreachable concrete
     function bodies, concrete impl methods and now-empty concrete impl blocks,
-    compile-time generic templates, and monomorphic non-ABI source type
-    declarations. Other declarations stay retained until their dependency
-    models are explicit. *)
+    compile-time generic templates, and non-ABI source type declarations. Other
+    declarations stay retained until their dependency models are explicit. *)
 
 open Core
 
@@ -201,12 +200,10 @@ let is_global_abi_type_anchor name = Types.is_global_abi_type_name name
 
 let is_prunable_type_decl (type_decl : Ast.type_decl) : bool =
   (not type_decl.type_is_builtin)
-  && monomorphic_type_decl type_decl
   && not (is_global_abi_type_anchor type_decl.type_name)
 
 let is_prunable_record_decl (record_decl : Ast.record_decl) : bool =
   (not record_decl.record_is_builtin)
-  && monomorphic_record_decl record_decl
   && not (is_global_abi_type_anchor record_decl.record_name)
 
 let prunable_declaration_ref = function
@@ -602,6 +599,17 @@ let mark_task (state : reachability) (task : task_closure option) : unit =
   | None -> ()
   | Some task -> mark_function_dependency state TaskClosure task.tc_def_id
 
+let union_constructor_call_result (state : reachability) (expr : core)
+    (ctor_name : string) : bool =
+  match Core_layout_type.canonical_type ~reg:state.reg expr.ty with
+  | Ast.TyNamed (type_name, _) -> (
+      match
+        Codegen_types.lookup_union_variant state.reg type_name ctor_name
+      with
+      | Some _ -> true
+      | None -> false)
+  | _ -> false
+
 let dict_key_type (state : reachability) (ty : Ast.type_expr) :
     Ast.type_expr option =
   match Core_layout_type.canonical_type ~reg:state.reg ty with
@@ -647,13 +655,15 @@ let scan_expr (state : reachability) (expr : core) : unit =
         () e
     in
     match e.desc with
-    | CCall (CKUser (_, Some def_id), callee, args) ->
+    | CCall (CKUser (name, Some def_id), callee, args) ->
         mark_function_dependency state DirectCall def_id;
-        visit callee;
+        if not (union_constructor_call_result state e name) then visit callee;
         List.iter visit args
-    | CCall (CKUser (_, None), callee, args) ->
-        state.fail_closed <- true;
-        visit callee;
+    | CCall (CKUser (name, None), callee, args) ->
+        if not (union_constructor_call_result state e name) then begin
+          state.fail_closed <- true;
+          visit callee
+        end;
         List.iter visit args
     | CCall ((CKUnknown | CKSelectedDirect _), callee, args) ->
         state.fail_closed <- true;

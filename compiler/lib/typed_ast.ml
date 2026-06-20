@@ -192,6 +192,7 @@ let func_callable_id (func : func_decl) = func.info.callable_id
 let var_ast (var : var_decl) = var.ast_var
 let var_info (var : var_decl) = var.info
 let var_binding_type (var : var_decl) = var.info.binding_ty
+let with_var_ast (var : var_decl) ast_var = { var with ast_var }
 let record_ast (record : record_decl) = record.ast_record
 let record_info (record : record_decl) = record.info
 let record_field_infos (record : record_decl) = record.info.field_infos
@@ -226,6 +227,16 @@ let loc (expr : expr) = expr.ast.expr_loc
 let type_info (expr : expr) = expr.info
 let impl_ast (impl : impl_decl) = impl.ast_impl
 let impl_methods (impl : impl_decl) = impl.typed_methods
+let make_var_decl ast_decl var = { ast_decl; decl_info = VarDecl var }
+
+let make_private_decl ast_decl inner =
+  { ast_decl; decl_info = PrivateDecl inner }
+
+let make_program typed_decls =
+  {
+    ast_program = List.map (fun decl -> decl.ast_decl) typed_decls;
+    typed_decls;
+  }
 
 let type_info_to_ast (info : type_info) : Ast.expr_type_info =
   {

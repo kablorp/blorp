@@ -192,15 +192,23 @@ destruct_id  = IDENT | "_" ;
 ### Variable Declaration
 
 ```ebnf
-var_decl = "var" IDENT [ ":" type_expr ] "=" expr    (* mutable *)
-         | IDENT [ ":" type_expr ] "=" expr ;         (* immutable *)
+var_decl = "var" IDENT [ ":" type_expr ] var_initializer    (* mutable *)
+         | IDENT [ ":" type_expr ] var_initializer ;         (* immutable *)
+
+var_initializer = "=" expr
+                | "=" NEWLINE INDENT expr DEDENT ;
 ```
 
 **Semantic constraints:**
-- A top-level variable initializer cannot call a function, method, or closure.
-  Union constructors are data construction and are allowed.
-- A top-level variable initializer cannot use a subscript expression, because
-  subscripts lower to runtime helper calls during startup initialization.
+- Immutable top-level bindings are constants. Function, method, and closure
+  calls in immutable global initializers must be pure and evaluatable by the
+  compile-time evaluator. Union constructors are data construction and are
+  allowed.
+- Mutable top-level `var` initializers cannot call a function, method, or
+  closure, because mutable globals are not constants and calls there would
+  create hidden startup work.
+- Subscript expressions in top-level initializers are accepted only when the
+  checker can prove or lower them without unsupported runtime helper work.
 
 ### Type Declarations
 

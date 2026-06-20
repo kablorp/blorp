@@ -9,6 +9,15 @@ let () =
         (fun (name, cases) -> ("TypedAst." ^ name, cases))
         Test_typed_ast.suite
     @ List.map
+        (fun (name, cases) -> ("CtfeIntrinsic." ^ name, cases))
+        Test_ctfe_intrinsic.suite
+    @ List.map
+        (fun (name, cases) -> ("CtfeIr." ^ name, cases))
+        Test_ctfe_ir.suite
+    @ List.map
+        (fun (name, cases) -> ("CtfeMaterialize." ^ name, cases))
+        Test_ctfe_materialize.suite
+    @ List.map
         (fun (name, cases) -> ("TypedAstDebug." ^ name, cases))
         Test_typed_ast_debug.suite
     @ List.map
@@ -57,6 +66,9 @@ let () =
         (fun (name, cases) -> ("TypeMetadataFormat." ^ name, cases))
         Test_type_metadata_format.suite
     @ List.map (fun (name, cases) -> ("Types." ^ name, cases)) Test_types.suite
+    @ List.map
+        (fun (name, cases) -> ("FloatBitPattern." ^ name, cases))
+        Test_float_bit_pattern.suite
     @ List.map
         (fun (name, cases) -> ("TypeResolution." ^ name, cases))
         Test_type_resolution.suite

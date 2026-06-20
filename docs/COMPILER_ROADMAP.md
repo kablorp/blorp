@@ -126,6 +126,114 @@ Current priorities:
   emission: unresolved calls, unconverted closure/concurrency forms, invalid
   ownership crossings, and unprepared erased storage.
 
+### Compile-Time Constants And CTFE
+
+Desired end state:
+
+- Immutable top-level bindings are constants. `NAME = expr` means the compiler
+  evaluates `expr` at compile time and materializes the result as ordinary
+  immutable global data.
+- There is no special `compile_time:` declaration form. The ordinary constant
+  syntax is the CTFE surface.
+- Mutable top-level `var` bindings are not constants. They must not hide runtime
+  startup work before `main`.
+- There is no expression-level CTFE form, no macros, no type generation, and no
+  second compile-time standard library.
+
+Source semantics:
+
+- Top-level constants evaluate in source order.
+- A constant may reference earlier constants and pure functions.
+- A constant may not reference itself or a later constant. Report this as a
+  dependency error, not as an evaluator accident.
+- Constant initializers must be pure and CTFE-compatible. Unsupported pure
+  operations are compile errors for constants, not runtime fallbacks.
+- Called pure functions may use local mutation, loops, recursion, pattern
+  matching, closures, and deterministic collection/tensor operations supported
+  by CTFE.
+- Visibility remains ordinary declaration visibility: `private NAME = expr`.
+  There is no special block-level visibility.
+
+Architecture:
+
+- Reuse the normal parser, import loading, name resolution, type inference,
+  purity checks, and runtime materialization path. CTFE consumes typed facts; it
+  must not recover semantics from source spelling, generated names, or backend
+  conventions.
+- Run CTFE after typecheck/purity and before Core lowering. Core and codegen
+  should see ordinary immutable global initializers after rewrite.
+- Keep `compiler/lib/ctfe_ir.ml` as the evaluator boundary. Typed AST is still
+  too broad for execution, while full Core is broader than CTFE currently
+  needs.
+- Keep compiler-owned std/builtin behavior behind `Ctfe_intrinsic` and
+  `Ctfe_std_eval`. Each supported operation should have a named intrinsic
+  identity and one evaluator entry.
+- Keep top-level initializer policy centralized in
+  `Top_level_initializer`: immutable constants require CTFE; mutable globals
+  reject hidden startup calls.
+- Prefer explicit CTFE value variants and IR call kinds over optional metadata
+  with hidden coupling.
+
+Current checkpoint:
+
+- `Ctfe.evaluate_program` rewrites source-order immutable globals through one
+  shared CTFE environment.
+- Immutable globals are semantically required CTFE now; unsupported pure
+  operations are compile errors instead of best-effort runtime fallbacks.
+- Private constants referenced only by later constants are treated as CTFE
+  scratch and can be omitted from generated runtime data.
+- `Ctfe_ir` classifies expressions, function references, call kinds,
+  constructors, field access, tuple/range access, vectors, lists, dicts,
+  records, and control flow before evaluation.
+- CTFE function values wrap typed functions with lazy cached IR bodies, so
+  unsupported function bodies are rejected only when compile-time evaluation
+  calls them.
+- CTFE environments explicitly distinguish evaluated globals from the current
+  global, later globals, runtime-initialized globals, and imported globals that
+  are not compile-time constants. Dependency diagnostics are no longer lookup
+  misses.
+- Materialization rewrites evaluated scalar, string, tuple, list, vector, dict,
+  record, range, and constructor values back into ordinary typed initializer
+  expressions.
+- CTFE supports enough deterministic std/builtin behavior for useful constants:
+  string byte helpers, list/dict/option/result helpers, vector/tensor literals,
+  tensor constructors, tensor subscript reads, tensor length, and matrix shape
+  counts.
+- Codegen audit coverage checks that CTFE-only builder functions are absent from
+  generated C for materialized constants.
+- `compiler/blorp/codegen_intrinsic_renderer.brp` now dogfoods ordinary
+  top-level constants for derived intrinsic lookup/manifest data.
+- Static emission currently supports strings, pointer-storage lists whose
+  elements are supported static values, integer-like inline primitive literal
+  lists, `List[Float]`, `List[Float32]`, `List[Float16]`, non-generic records,
+  ordinary generic record/struct instantiations, and ordinary concrete generic
+  union constants whose payloads are in the supported static-value subset. It
+  also supports tuple constants whose pointer, primitive literal,
+  floating-point literal, and void erased slots can be emitted as C static
+  initializers, plus stack `Result` constants whose Ok/Err payload slot can use
+  the same static boxed-slot subset.
+  Ordinary generic unions now get concrete instantiated type identities, typed
+  ordinary payload storage, source template pruning, and static emission for
+  supported constant payloads.
+- The old `compile_time:` parser, AST, formatter, LSP, typed AST, and CTFE
+  block expansion paths have been removed.
+
+Next implementation slices:
+
+- Audit std, `compiler/blorp`, examples, and scratch programs for constants
+  that still need CTFE support. Add narrow intrinsics or rewrite the constants;
+  do not reintroduce best-effort runtime fallback.
+- Extend static emission beyond the current string/list/tuple/record/union
+  subset: inline-struct lists, tuple slots that require heap boxes,
+  dicts/sets, tensors, and erased dynamic-boundary values where there is an
+  explicit typed bridge.
+- Keep moving semantic normalization out of the evaluator and into `Ctfe_ir`
+  translation where it can be represented explicitly.
+- Dogfood compiler-owned tables in `compiler/blorp` once ordinary constants can
+  express the required data without a special block.
+
+### Core Pipeline Profiling And Invariants
+
 Implementation order:
 
 1. Measure pass-group time before splitting a stage. `Core_profile` can already

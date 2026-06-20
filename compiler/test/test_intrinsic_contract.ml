@@ -120,7 +120,8 @@ let emit_intrinsic_names () : string list =
     else scan (i + 1)
   in
   scan 0;
-  List.sort_uniq String.compare (!names @ Core_emit_blorp_intrinsic.names ())
+  List.sort_uniq String.compare
+    (!names @ Core_emit_blorp_backend.intrinsic_names ())
 
 (* ============================================================================
    Tests
