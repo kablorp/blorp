@@ -38,23 +38,41 @@ That is the correct architectural direction, but it is still transitional:
 - `blorp __compiler-bridge` accepts JSON for Blorp-owned renderer actions. Stage
   actions such as `compile_source` are reserved in the Blorp protocol but remain
   unsupported until Blorp owns those stages.
-- Renderer requests use the Blorp bridge command. Checked-in TSV manifests now
-  remain only as a bootstrap fallback while compiling that bridge helper.
+- Renderer requests use the Blorp bridge command. Checked-in TSV manifests are
+  no longer the production rendering path, but they still remain as temporary
+  migration debt for helper bootstrap. Renderer metadata lookups now go through
+  the Blorp bridge in production. This debt lives in
+  `compiler/lib/compiler_blorp_bridge.ml` and should be deleted before Merge
+  Point 1 is considered closed.
 - The compiled renderer bridge helper is content-addressed by production
   `compiler/blorp` source, the compiler binary, the C compiler identity, and
   the OS.
+- `emit_c` exists as a bridge action, but it currently validates and echoes
+  `CArtifact` JSON. It does not yet accept final Core JSON or own C emission.
 
-Approximate current source shape, measured from the worktree on 2026-06-19:
+Approximate current source shape, measured from this worktree on 2026-06-20:
 
 | Area | Ownership today | Approximate size |
 | --- | --- | ---: |
-| Core IR, Core passes, C emission | Mostly OCaml | 62.9k OCaml lines |
-| Parser, modules, inference, typecheck | OCaml | 27.7k OCaml lines |
-| CLI | OCaml | 1.9k OCaml lines |
+| Core IR, Core passes, C emission | Mostly OCaml | 61.9k OCaml lines |
+| Parser, modules, inference, typecheck | OCaml | 28.4k OCaml lines |
+| CLI | OCaml | 1.7k OCaml lines |
 | LSP | OCaml | 6.0k OCaml lines |
 | Formatter facade/projection | OCaml facade, Blorp renderer | 2.6k OCaml lines |
-| Compiler Blorp production code | Blorp | 30.7k Blorp lines |
-| Compiler Blorp tests | Blorp | 6.3k Blorp lines |
+| Compiler Blorp production code | Blorp | 12.4k Blorp lines |
+| Compiler Blorp tests | Blorp | 6.8k Blorp lines |
+
+Current branch migration accounting against `main`, including the active
+worktree, is roughly:
+
+| Area | Added | Deleted | Net |
+| --- | ---: | ---: | ---: |
+| `compiler/blorp/**/*.brp` | 4.6k | 1.1k | +3.6k Blorp lines |
+| `compiler/lib/**/*.ml` | 1.5k | 1.6k | -0.1k OCaml lines |
+
+That ratio is acceptable only as temporary bridge scaffolding. The next merge
+checkpoint should reduce OCaml ownership more aggressively than it expands
+snippet-level Blorp renderer code.
 
 ## Non-Negotiable Invariants
 
@@ -72,7 +90,9 @@ OCaml caller
 
 Do not add side channels for compiler stages. No extra manifest-specific
 interfaces, ad hoc subprocess protocols, direct generated-template access, or
-parallel tools that production compilation does not use.
+parallel tools that production compilation does not use. The current
+`compiler_blorp_bridge.ml` manifest fallback is an explicit temporary exception
+for helper bootstrap; do not add new callers to that path.
 
 As Blorp moves earlier in the pipeline, the transfer point moves earlier too:
 
@@ -291,6 +311,18 @@ Implementation:
 - Replace production TSV-manifest calls with Blorp bridge actions. **Done.**
 - Cache the compiled renderer bridge helper behind a content-derived key so
   compiler/test workers do not repeatedly compile the same Blorp helper.
+
+Remaining debt before this merge point is closed:
+
+- Delete the helper bootstrap dependency on checked-in TSV manifests. Production
+  renderer metadata/arity lookup now comes from the `renderer_templates` Blorp
+  bridge action.
+- Reduce `compiler_blorp_bridge.ml` to bridge request/response handling plus
+  helper-cache process management. Hard-coded bootstrap rows and direct
+  `Core_emit_blorp_template.render_exn` fallback should disappear with the TSV
+  bootstrap path.
+- Keep `core_emit_blorp_template.ml` only while the helper bootstrap path needs
+  it.
 
 Deletion:
 
@@ -723,8 +755,14 @@ For every merge point:
 5. Keep only the narrow JSON bridge shim if OCaml still needs to call later
    Blorp-owned stages.
 6. Update docs and architecture diagrams.
+7. Record migration accounting for the slice: Blorp lines added/deleted, OCaml
+   lines added/deleted, any remaining OCaml bridge exceptions, and why those
+   exceptions cannot be deleted yet.
 
 A migrated slice is incomplete if OCaml and Blorp both remain authoritative.
+Large net Blorp additions with little or no OCaml deletion are only acceptable
+for explicitly named bridge scaffolding, and the next adjacent slice should pay
+that scaffolding down.
 
 ## Purity Design Rules
 
@@ -786,7 +824,8 @@ compiler-library test suite.
 
 ## Near-Term Queue
 
-1. Lock the bridge schema and add remaining bridge hygiene tests.
+1. Close the remaining Merge Point 1 debt by deleting the helper bootstrap TSV
+   fallback.
 2. Shrink the remaining TSV bootstrap path so `core_emit_blorp_template.ml`
    contains only the temporary helper-build fallback or disappears entirely.
 3. Add final Core JSON fixtures and Blorp codecs for the subset needed by C

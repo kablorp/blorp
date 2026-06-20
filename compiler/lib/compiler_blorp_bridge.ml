@@ -3,7 +3,8 @@
 
     Renderer JSON requests are served by [compiler/blorp/compiler_bridge.brp]
     through the hidden bridge command. The manifest helpers left in this module
-    are only for bootstrapping the compiled bridge helper itself. *)
+    are temporary migration debt: the compiled helper still needs a fallback
+    while it bootstraps itself. *)
 
 let schema_version = 1
 let domain = "compiler"
@@ -20,6 +21,11 @@ let ( let* ) result f =
   match result with Ok value -> f value | Error _ as error -> error
 
 type render_item = { item_op : string; item_args : string list }
+
+type renderer_template_info = {
+  renderer_template_name : string;
+  renderer_template_arity : int;
+}
 
 let rec find_upwards start name =
   let candidate = Filename.concat start name in
@@ -170,13 +176,6 @@ let manifest_for_renderer = function
   | renderer ->
       Error ("unsupported_renderer", "unsupported Blorp renderer: " ^ renderer)
 
-let renderer_template_arity_opt_exn ~renderer ~op =
-  match manifest_for_renderer renderer with
-  | Ok manifest ->
-      Core_emit_blorp_template.find manifest op
-      |> Option.map (fun template -> template.Core_emit_blorp_template.arity)
-  | Error (_, message) -> invalid_arg message
-
 let json_string s = Lsp_json.String s
 
 let error_response code message =
@@ -264,6 +263,16 @@ let render_many_request_json ~renderer items =
              ] );
        ])
 
+let renderer_templates_request_json ~renderer =
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "renderer_templates");
+         ("payload", Lsp_json.Object [ ("renderer", Lsp_json.String renderer) ]);
+       ])
+
 let parse_response_json response_json =
   try Ok (Lsp_json.parse response_json)
   with Lsp_json.Parse_error message -> Error ("invalid_response", message)
@@ -277,6 +286,69 @@ let response_result response_json success =
     Error ("bridge_error", message)
 
 let render_response_field response = string_response_field "text" response
+
+let int_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | Some (Lsp_json.Int value) -> Ok value
+      | Some (Lsp_json.Float value) ->
+          if not (Float.is_finite value) then
+            Error
+              ( "invalid_response",
+                "field `" ^ name ^ "` must be an exact integer" )
+          else
+            let truncated = int_of_float value in
+            if Float.equal value (float_of_int truncated) then Ok truncated
+            else
+              Error
+                ( "invalid_response",
+                  "field `" ^ name ^ "` must be an exact integer" )
+      | Some _ ->
+          Error ("invalid_response", "field `" ^ name ^ "` must be an integer")
+      | None ->
+          Error ("invalid_response", "missing integer field `" ^ name ^ "`"))
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+let renderer_templates_response_field = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt "items" fields with
+      | Some (Lsp_json.Array values) ->
+          let parse_item = function
+            | Lsp_json.Object item_fields as item ->
+                let* op =
+                  match List.assoc_opt "op" item_fields with
+                  | Some (Lsp_json.String op) -> Ok op
+                  | _ ->
+                      Error
+                        ( "invalid_response",
+                          "renderer template items must contain string op" )
+                in
+                let* arity = int_response_field "arity" item in
+                if arity < 0 then
+                  Error
+                    ( "invalid_response",
+                      "renderer template arity must be non-negative" )
+                else
+                  Ok
+                    {
+                      renderer_template_name = op;
+                      renderer_template_arity = arity;
+                    }
+            | _ ->
+                Error
+                  ( "invalid_response",
+                    "renderer template items must be JSON objects" )
+          in
+          let rec collect acc = function
+            | [] -> Ok (List.rev acc)
+            | value :: rest ->
+                let* item = parse_item value in
+                collect (item :: acc) rest
+          in
+          collect [] values
+      | Some _ -> Error ("invalid_response", "field `items` must be an array")
+      | None -> Error ("invalid_response", "missing array field `items`"))
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let render_many_response_field = function
   | Lsp_json.Object fields -> (
@@ -335,6 +407,28 @@ let core_fairness_bootstrap_rows =
     ("fairness_body_other", "false");
   ]
 
+let zero_arg_bootstrap_template_infos rows =
+  List.map
+    (fun (name, _text) ->
+      { renderer_template_name = name; renderer_template_arity = 0 })
+    rows
+
+let renderer_template_infos_for_helper_exn ~renderer =
+  if String.equal renderer language_surface_renderer then
+    zero_arg_bootstrap_template_infos language_surface_bootstrap_rows
+  else if String.equal renderer core_fairness_renderer then
+    zero_arg_bootstrap_template_infos core_fairness_bootstrap_rows
+  else
+    match manifest_for_renderer renderer with
+    | Ok manifest ->
+        Lazy.force manifest.Core_emit_blorp_template.templates
+        |> List.map (fun template ->
+            {
+              renderer_template_name = template.Core_emit_blorp_template.name;
+              renderer_template_arity = template.Core_emit_blorp_template.arity;
+            })
+    | Error (_, message) -> invalid_arg message
+
 let render_zero_arg_bootstrap_item ~label ~rows op args =
   if args <> [] then
     invalid_arg
@@ -369,11 +463,17 @@ let renderer_bridge_cache :
   ref None
 
 let render_command_cache : (string, string) Hashtbl.t = Hashtbl.create 512
+
+let renderer_template_infos_cache :
+    (string, renderer_template_info list) Hashtbl.t =
+  Hashtbl.create 16
+
 let bridge_temp_retry_limit = 32
 
 let clear_renderer_bridge_process_cache_for_test () =
   renderer_bridge_cache := None;
-  Hashtbl.clear render_command_cache
+  Hashtbl.clear render_command_cache;
+  Hashtbl.clear renderer_template_infos_cache
 
 let running_inside_renderer_bridge_helper () =
   match Sys.getenv_opt renderer_bridge_helper_env with
@@ -755,6 +855,34 @@ let render_cache_key ~renderer ~op args =
   add_part op;
   List.iter add_part args;
   Buffer.contents buf
+
+let renderer_template_infos_exn ~renderer =
+  if running_inside_renderer_bridge_helper () then
+    renderer_template_infos_for_helper_exn ~renderer
+  else
+    match Hashtbl.find_opt renderer_template_infos_cache renderer with
+    | Some infos -> infos
+    | None -> (
+        let response_json =
+          run_renderer_request_via_blorp
+            (renderer_templates_request_json ~renderer)
+        in
+        match
+          response_result response_json renderer_templates_response_field
+        with
+        | Ok infos ->
+            Hashtbl.replace renderer_template_infos_cache renderer infos;
+            infos
+        | Error (_, message) -> invalid_arg message)
+
+let renderer_template_arity_opt_exn ~renderer ~op =
+  renderer_template_infos_exn ~renderer
+  |> List.find_opt (fun info -> String.equal info.renderer_template_name op)
+  |> Option.map (fun info -> info.renderer_template_arity)
+
+let renderer_template_names_exn ~renderer =
+  renderer_template_infos_exn ~renderer
+  |> List.map (fun info -> info.renderer_template_name)
 
 let render_via_command_exn ?program ~renderer ~op args =
   if running_inside_renderer_bridge_helper () then

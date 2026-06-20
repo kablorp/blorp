@@ -1423,12 +1423,6 @@ let render_channel_with_elem_release ~emit_expr ctx capacity =
   render_template "backend_channel_with_elem_release"
     [ capacity_arg; temp_seed ]
 
-let channel_retaining_send_temp_seeds ctx =
-  let value_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  let cleanup_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  let result_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  (value_seed, cleanup_seed, result_seed)
-
 let channel_retaining_send_template_name = function
   | ChannelSendRuntime -> "backend_channel_send_retaining"
   | ChannelTrySendRuntime -> "backend_channel_try_send_retaining"
@@ -1441,50 +1435,21 @@ let channel_retaining_send_timeout_template_name = function
 
 let render_channel_retaining_send ~emit_expr ctx = function
   | ChannelRetainingSendNoTimeout { runtime; result_type; channel; value } ->
-      let value_seed, cleanup_seed, result_seed =
-        channel_retaining_send_temp_seeds ctx
-      in
+      let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
       let value_arg = render_arg ~emit_expr ctx value in
       let channel_arg = render_arg ~emit_expr ctx channel in
       render_template
         (channel_retaining_send_template_name runtime)
-        [
-          result_type;
-          channel_arg;
-          value_arg;
-          value_seed;
-          cleanup_seed;
-          result_seed;
-        ]
+        [ result_type; channel_arg; value_arg; temp_seed ]
   | ChannelRetainingSendWithTimeout
       { runtime; result_type; channel; value; timeout } ->
-      let value_seed, cleanup_seed, result_seed =
-        channel_retaining_send_temp_seeds ctx
-      in
+      let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
       let value_arg = render_arg ~emit_expr ctx value in
       let channel_arg = render_arg ~emit_expr ctx channel in
       let timeout_arg = render_arg ~emit_expr ctx timeout in
       render_template
         (channel_retaining_send_timeout_template_name runtime)
-        [
-          result_type;
-          channel_arg;
-          value_arg;
-          timeout_arg;
-          value_seed;
-          cleanup_seed;
-          result_seed;
-        ]
-
-let channel_send_attempt_temp_seeds ctx =
-  let status_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  let result_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  (status_seed, result_seed)
-
-let channel_send_attempt_retained_value_temp_seeds ctx =
-  let value_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  let cleanup_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  (value_seed, cleanup_seed)
+        [ result_type; channel_arg; value_arg; timeout_arg; temp_seed ]
 
 let channel_send_attempt_constructor_args constructors =
   [
@@ -1496,68 +1461,38 @@ let channel_send_attempt_constructor_args constructors =
 
 let render_channel_try_send_attempt ~emit_expr ctx ~result_type ~channel ~value
     ~constructors =
-  let status_seed, result_seed = channel_send_attempt_temp_seeds ctx in
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   match value with
   | ChannelSendAttemptDirectValue value ->
       let channel_arg = render_arg ~emit_expr ctx channel in
       let value_arg = render_arg ~emit_expr ctx value in
       render_template "backend_channel_try_send_attempt"
-        ([ result_type; channel_arg; value_arg; status_seed; result_seed ]
+        ([ result_type; channel_arg; value_arg; temp_seed ]
         @ channel_send_attempt_constructor_args constructors)
   | ChannelSendAttemptRetainedValue value ->
-      let value_seed, cleanup_seed =
-        channel_send_attempt_retained_value_temp_seeds ctx
-      in
       let value_arg = render_arg ~emit_expr ctx value in
       let channel_arg = render_arg ~emit_expr ctx channel in
       render_template "backend_channel_try_send_attempt_retained_value"
-        ([
-           result_type;
-           channel_arg;
-           value_arg;
-           status_seed;
-           result_seed;
-           value_seed;
-           cleanup_seed;
-         ]
+        ([ result_type; channel_arg; value_arg; temp_seed ]
         @ channel_send_attempt_constructor_args constructors)
 
 let render_channel_send_timeout_attempt ~emit_expr ctx ~result_type ~channel
     ~value ~timeout ~constructors =
-  let status_seed, result_seed = channel_send_attempt_temp_seeds ctx in
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   match value with
   | ChannelSendAttemptDirectValue value ->
       let channel_arg = render_arg ~emit_expr ctx channel in
       let value_arg = render_arg ~emit_expr ctx value in
       let timeout_arg = render_arg ~emit_expr ctx timeout in
       render_template "backend_channel_send_timeout_attempt"
-        ([
-           result_type;
-           channel_arg;
-           value_arg;
-           timeout_arg;
-           status_seed;
-           result_seed;
-         ]
+        ([ result_type; channel_arg; value_arg; timeout_arg; temp_seed ]
         @ channel_send_attempt_constructor_args constructors)
   | ChannelSendAttemptRetainedValue value ->
-      let value_seed, cleanup_seed =
-        channel_send_attempt_retained_value_temp_seeds ctx
-      in
       let value_arg = render_arg ~emit_expr ctx value in
       let channel_arg = render_arg ~emit_expr ctx channel in
       let timeout_arg = render_arg ~emit_expr ctx timeout in
       render_template "backend_channel_send_timeout_attempt_retained_value"
-        ([
-           result_type;
-           channel_arg;
-           value_arg;
-           timeout_arg;
-           status_seed;
-           result_seed;
-           value_seed;
-           cleanup_seed;
-         ]
+        ([ result_type; channel_arg; value_arg; timeout_arg; temp_seed ]
         @ channel_send_attempt_constructor_args constructors)
 
 let render_channel_send_attempt ~emit_expr ctx = function
@@ -1568,12 +1503,6 @@ let render_channel_send_attempt ~emit_expr ctx = function
       { result_type; channel; value; timeout; constructors } ->
       render_channel_send_timeout_attempt ~emit_expr ctx ~result_type ~channel
         ~value ~timeout ~constructors
-
-let channel_recv_attempt_temp_seeds ctx =
-  let value_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  let status_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  let result_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-  (value_seed, status_seed, result_seed)
 
 let channel_try_recv_attempt_template_name = function
   | KeepRecvValue -> "backend_channel_try_recv_attempt_keep_value"
@@ -1588,50 +1517,32 @@ let channel_recv_attempt_constructor_args constructors =
 
 let render_channel_try_recv_attempt ~emit_expr ctx ~result_type ~channel
     ~release_policy ~value_constructor_takes_release_mask ~constructors =
-  let value_seed, status_seed, result_seed =
-    channel_recv_attempt_temp_seeds ctx
-  in
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   let channel_arg = render_arg ~emit_expr ctx channel in
   if value_constructor_takes_release_mask then
     render_template
       (channel_try_recv_attempt_template_name release_policy)
-      ([ result_type; channel_arg; value_seed; status_seed; result_seed ]
+      ([ result_type; channel_arg; temp_seed ]
       @ channel_recv_attempt_constructor_args constructors)
   else
     render_template "backend_channel_try_recv_attempt_no_release_mask"
-      ([ result_type; channel_arg; value_seed; status_seed; result_seed ]
+      ([ result_type; channel_arg; temp_seed ]
       @ channel_recv_attempt_constructor_args constructors)
 
 let render_channel_recv_timeout_attempt ~emit_expr ctx ~result_type ~channel
     ~timeout ~release_policy ~value_constructor_takes_release_mask ~constructors
     =
-  let value_seed, status_seed, result_seed =
-    channel_recv_attempt_temp_seeds ctx
-  in
+  let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   let channel_arg = render_arg ~emit_expr ctx channel in
   let timeout_arg = render_arg ~emit_expr ctx timeout in
   if value_constructor_takes_release_mask then
     render_template
       (channel_recv_timeout_attempt_template_name release_policy)
-      ([
-         result_type;
-         channel_arg;
-         timeout_arg;
-         value_seed;
-         status_seed;
-         result_seed;
-       ]
+      ([ result_type; channel_arg; timeout_arg; temp_seed ]
       @ channel_recv_attempt_constructor_args constructors)
   else
     render_template "backend_channel_recv_timeout_attempt_no_release_mask"
-      ([
-         result_type;
-         channel_arg;
-         timeout_arg;
-         value_seed;
-         status_seed;
-         result_seed;
-       ]
+      ([ result_type; channel_arg; timeout_arg; temp_seed ]
       @ channel_recv_attempt_constructor_args constructors)
 
 let render_channel_recv_attempt ~emit_expr ctx = function

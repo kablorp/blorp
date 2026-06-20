@@ -13,15 +13,14 @@
 
 open Blorp
 
-(** Extract intrinsic names that appear in emit_intrinsic match clauses or in
-    the Blorp-owned template manifest consumed by the emitter.
-    Reads [core_emit_intrinsic.ml] (Phase 5.1 step 3 moved the match
-    body there; prior to that it lived in [core_emit.ml]) and
-    regex-matches the patterns used by the dispatcher. Handles both
-    single-name and grouped ``("a" | "b" | "c")`` match arms.
+(** Extract intrinsic names that appear in OCaml emit_intrinsic match clauses.
+    Reads [core_emit_intrinsic.ml] (Phase 5.1 step 3 moved the match body
+    there; prior to that it lived in [core_emit.ml]) and regex-matches the
+    patterns used by the dispatcher. Handles both single-name and grouped
+    ``("a" | "b" | "c")`` match arms.
 
     Returns a sorted, deduplicated list. *)
-let emit_intrinsic_names () : string list =
+let ocaml_emit_intrinsic_names () : string list =
   (* The source file may be inspected from the repo root, from [compiler/],
      or from dune's sandbox. Walk upward from [Sys.getcwd ()] and check
      both repo-root and compiler-root layouts so this contract does not depend
@@ -120,17 +119,7 @@ let emit_intrinsic_names () : string list =
     else scan (i + 1)
   in
   scan 0;
-  let blorp_template_names =
-    match
-      Compiler_blorp_bridge.manifest_for_renderer
-        Compiler_blorp_bridge.intrinsic_renderer
-    with
-    | Ok manifest ->
-        Lazy.force manifest.Core_emit_blorp_template.templates
-        |> List.map (fun template -> template.Core_emit_blorp_template.name)
-    | Error (_, message) -> Alcotest.fail message
-  in
-  List.sort_uniq String.compare (!names @ blorp_template_names)
+  List.sort_uniq String.compare !names
 
 (* ============================================================================
    Tests
@@ -149,6 +138,11 @@ let registry_implemented_names () =
     Core_intrinsic_registry.all
   |> List.sort_uniq String.compare
 
+let blorp_renderer_intrinsic_names () =
+  Compiler_blorp_bridge.renderer_template_names_exn
+    ~renderer:Compiler_blorp_bridge.intrinsic_renderer
+  |> List.sort_uniq String.compare
+
 (** The position-based scan is already strict enough that no non-intrinsic
     string literal leaks through (verified during Phase 2.6.6 review:
     scanner returns 131 unique names, all valid intrinsics). A prefix
@@ -156,17 +150,22 @@ let registry_implemented_names () =
     every captured name and trust the scan. *)
 
 let test_every_implemented_registered_appears_in_emit () =
-  let emit = emit_intrinsic_names () in
+  let emit = ocaml_emit_intrinsic_names () in
+  let blorp_emit = blorp_renderer_intrinsic_names () in
   let impl = registry_implemented_names () in
-  let missing = List.filter (fun n -> not (List.mem n emit)) impl in
+  let missing =
+    List.filter
+      (fun n -> (not (List.mem n emit)) && not (List.mem n blorp_emit))
+      impl
+  in
   if missing <> [] then
     Alcotest.failf
       "Registry entries marked implemented but with no emit_intrinsic match \
-       clause: [%s]"
+       clause or Blorp renderer: [%s]"
       (String.concat "; " missing)
 
 let test_every_emit_clause_is_registered () =
-  let emit = emit_intrinsic_names () in
+  let emit = ocaml_emit_intrinsic_names () in
   let registered = registry_names () in
   let orphan = List.filter (fun n -> not (List.mem n registered)) emit in
   if orphan <> [] then
@@ -186,8 +185,8 @@ let test_emit_scan_found_something () =
   (* Sanity: the source-inspection regex actually found match arms.
      If a refactor renames emit_intrinsic or changes formatting, the
      scan might return [] and silently pass. *)
-  let emit = emit_intrinsic_names () in
-  Alcotest.(check bool) "emit scan non-empty" true (List.length emit > 50)
+  let emit = ocaml_emit_intrinsic_names () in
+  Alcotest.(check bool) "emit scan non-empty" true (List.length emit > 10)
 
 (* ============================================================================
    Schema tests (Phase 2.6.6 extension fields)
