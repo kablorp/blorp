@@ -56,129 +56,6 @@ let read_all_channel channel =
   in
   loop ()
 
-let ( let* ) result f =
-  match result with Ok value -> f value | Error _ as error -> error
-
-let bridge_request_optional_bool_field name ~default json =
-  match Blorp.Lsp_json.get name json with
-  | None -> Ok default
-  | Some (Blorp.Lsp_json.Bool value) -> Ok value
-  | Some _ ->
-      Error ("invalid_request", "field `" ^ name ^ "` must be a boolean")
-
-let bridge_error_phase_to_string = function
-  | Ast.Parse -> "parse"
-  | Ast.ModuleLoad -> "module_load"
-  | Ast.TypeCheck -> "typecheck"
-  | Ast.Codegen -> "codegen"
-
-let bridge_loc_json (loc : Ast.loc) =
-  Blorp.Lsp_json.Object
-    [
-      ( "file",
-        match loc.loc_file with
-        | Some file -> Blorp.Lsp_json.String file
-        | None -> Blorp.Lsp_json.Null );
-      ("line", Blorp.Lsp_json.Int loc.line);
-      ("column", Blorp.Lsp_json.Int loc.column);
-      ("end_line", Blorp.Lsp_json.Int loc.end_line);
-      ("end_column", Blorp.Lsp_json.Int loc.end_column);
-    ]
-
-let bridge_diagnostic_json (error : Ast.compiler_error) =
-  let fields =
-    [
-      ("message", Blorp.Lsp_json.String error.message);
-      ("phase", Blorp.Lsp_json.String (bridge_error_phase_to_string error.phase));
-      ("loc", bridge_loc_json error.loc);
-      ( "notes",
-        Blorp.Lsp_json.Array
-          (List.map (fun note -> Blorp.Lsp_json.String note) error.notes) );
-    ]
-  in
-  let fields =
-    match error.help with
-    | Some help -> ("help", Blorp.Lsp_json.String help) :: fields
-    | None -> fields
-  in
-  Blorp.Lsp_json.Object fields
-
-let render_compile_source_request_json request_json =
-  let parsed =
-    try Ok (Blorp.Lsp_json.parse request_json)
-    with Blorp.Lsp_json.Parse_error message -> Error ("invalid_json", message)
-  in
-  let result =
-    let* json = parsed in
-    let* schema = Compiler_blorp_bridge.int_field "schema" json in
-    if schema <> Compiler_blorp_bridge.schema_version then
-      Error
-        ( "unsupported_schema",
-          Printf.sprintf "unsupported Blorp bridge schema: %d" schema )
-    else
-      let* domain = Compiler_blorp_bridge.string_field "domain" json in
-      if domain <> Compiler_blorp_bridge.domain then
-        Error ("unsupported_domain", "unsupported Blorp bridge domain: " ^ domain)
-      else
-        let* filename = Compiler_blorp_bridge.string_field "filename" json in
-        let* source = Compiler_blorp_bridge.string_field "source" json in
-        let* debug = bridge_request_optional_bool_field "debug" ~default:false json in
-        let* embed_runtime =
-          bridge_request_optional_bool_field "embed_runtime" ~default:true json
-        in
-        let* require_main =
-          bridge_request_optional_bool_field "require_main" ~default:false json
-        in
-        let* profile =
-          bridge_request_optional_bool_field "profile" ~default:false json
-        in
-        let* check_invariants =
-          bridge_request_optional_bool_field "check_invariants" ~default:false json
-        in
-        Ok (filename, source, debug, embed_runtime, require_main, profile, check_invariants)
-  in
-  match result with
-  | Error (code, message) -> Compiler_blorp_bridge.error_response code message
-  | Ok
-      ( filename,
-        source,
-        debug,
-        embed_runtime,
-        require_main,
-        profile,
-        check_invariants ) -> (
-      init_module_paths (extract_directory filename);
-      match
-        Pipeline.compile ~debug ~embed_runtime ~require_main ~profile
-          ~check_invariants ~filename ~source ()
-      with
-      | Error errors ->
-          Compiler_blorp_bridge.error_response_with_fields "compile_errors"
-            (Diagnostics.format_errors ~file:filename errors)
-            [
-              ( "diagnostics",
-                Blorp.Lsp_json.Array (List.map bridge_diagnostic_json errors) );
-            ]
-      | Ok (Pipeline.Stopped_at stage) ->
-          Compiler_blorp_bridge.error_response "unexpected_stop"
-            ("compiler bridge stopped after "
-            ^ Blorp.Core_stage.to_string stage)
-      | Ok (Pipeline.Compiled { c_code; link_flags; include_dirs; _ }) ->
-          Compiler_blorp_bridge.success_response
-            [
-              ("artifact", Blorp.Lsp_json.String "compiled_source");
-              ("c_code", Blorp.Lsp_json.String c_code);
-              ( "link_flags",
-                Blorp.Lsp_json.Array
-                  (List.map (fun flag -> Blorp.Lsp_json.String flag) link_flags)
-              );
-              ( "include_dirs",
-                Blorp.Lsp_json.Array
-                  (List.map
-                     (fun dir -> Blorp.Lsp_json.String dir)
-                     include_dirs) );
-            ])
-
 let run_compiler_bridge_command args =
   let request_json =
     match args with
@@ -189,14 +66,7 @@ let run_compiler_bridge_command args =
         exit 1
   in
   let response_json =
-    match
-      try Blorp.Lsp_json.parse request_json |> Blorp.Lsp_json.get_string "action"
-      with Blorp.Lsp_json.Parse_error _ -> None
-    with
-    | Some action
-      when String.equal action Compiler_blorp_bridge.compile_source_action ->
-        render_compile_source_request_json request_json
-    | _ -> Compiler_blorp_bridge.run_renderer_request_via_blorp request_json
+    Compiler_blorp_bridge.run_renderer_request_via_blorp request_json
   in
   print_endline response_json;
   0
@@ -774,10 +644,6 @@ let check_file_with_opts opts filename =
           print_endline "Type checking succeeded.";
           0
 
-let compile_file_can_use_command_bridge opts =
-  opts.dump_core_after = [] && Option.is_none opts.stop_after
-  && (not opts.dump_typed_ast) && not opts.time_phases
-
 let write_compile_output opts filename c_code =
   let base = Filename.remove_extension filename in
   let c_file = match opts.output with Some o -> o | None -> base ^ ".c" in
@@ -813,47 +679,34 @@ let compile_file_with_opts opts filename =
         | Error msg -> prerr_endline msg
         | Ok (program, _) -> print_endline (program_to_string program)
         end;
-      if compile_file_can_use_command_bridge opts then
-        match
-          Compiler_blorp_bridge.compile_source_via_command ~filename ~source
-            ~debug:opts.debug ~embed_runtime:opts.embed_runtime
-            ~require_main:false ~profile:false
-            ~check_invariants:opts.check_invariants ()
-        with
-        | Ok result ->
-            write_compile_output opts filename result.command_c_code
-        | Error (_, message) ->
-            prerr_endline message;
-            1
-      else
-        let obs = build_on_stage ~source_file:filename opts in
-        let print_profile () =
-          match obs.profiler with
-          | Some p -> prerr_string (Blorp.Core_profile.format p)
-          | None -> ()
-        in
-        Fun.protect ~finally:obs.cleanup (fun () ->
-            let result =
-              match
-                Pipeline.compile ~debug:opts.debug ?on_stage:obs.callback
-                  ~check_invariants:opts.check_invariants
-                  ~embed_runtime:opts.embed_runtime
-                  ?on_frontend_phase:obs.frontend_callback ~filename ~source ()
-              with
-              | Error errors ->
-                  prerr_endline (format_pipeline_errors ~file:filename errors);
-                  1
-              | Ok (Pipeline.Stopped_at s) ->
-                  Printf.eprintf "stopped after %s\n"
-                    (Blorp.Core_stage.to_string s);
-                  0
-              | Ok (Pipeline.Compiled { typed_program; c_code; _ }) ->
-                  if opts.dump_typed_ast then
-                    print_endline (Typed_ast_debug.format_program typed_program);
-                  write_compile_output opts filename c_code
-            in
-            print_profile ();
-            result)
+      let obs = build_on_stage ~source_file:filename opts in
+      let print_profile () =
+        match obs.profiler with
+        | Some p -> prerr_string (Blorp.Core_profile.format p)
+        | None -> ()
+      in
+      Fun.protect ~finally:obs.cleanup (fun () ->
+          let result =
+            match
+              Pipeline.compile ~debug:opts.debug ?on_stage:obs.callback
+                ~check_invariants:opts.check_invariants
+                ~embed_runtime:opts.embed_runtime
+                ?on_frontend_phase:obs.frontend_callback ~filename ~source ()
+            with
+            | Error errors ->
+                prerr_endline (format_pipeline_errors ~file:filename errors);
+                1
+            | Ok (Pipeline.Stopped_at s) ->
+                Printf.eprintf "stopped after %s\n"
+                  (Blorp.Core_stage.to_string s);
+                0
+            | Ok (Pipeline.Compiled { typed_program; c_code; _ }) ->
+                if opts.dump_typed_ast then
+                  print_endline (Typed_ast_debug.format_program typed_program);
+                write_compile_output opts filename c_code
+          in
+          print_profile ();
+          result)
   end
 
 (** Compile and run a blorp file *)

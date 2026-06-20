@@ -49,7 +49,7 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
         emit_backend
           (ListStore
              {
-               runtime = ListSetRawStore;
+               runtime = Core_emit_blorp_prepared_backend.ListSetRaw;
                list = lst;
                index = idx;
                value = val_;
@@ -59,7 +59,7 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
         emit_backend
           (ListStore
              {
-               runtime = ListSetRawStore;
+               runtime = Core_emit_blorp_prepared_backend.ListSetRaw;
                list = lst;
                index = idx;
                value = val_;
@@ -70,7 +70,7 @@ let emit ~(emit_expr : Core_emit_context.t -> core -> unit)
         emit_backend
           (ListStore
              {
-               runtime = ListHandoffSetOwnedStore;
+               runtime = Core_emit_blorp_prepared_backend.ListHandoffSetOwned;
                list = lst;
                index = idx;
                value = val_;

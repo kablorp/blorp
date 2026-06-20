@@ -56,6 +56,7 @@
 open Core
 open Core_emit_context
 open Codegen_types
+module Blorp_prepared = Core_emit_blorp_prepared_backend
 
 (* Non-recursive helpers (Phase 5.1 step 1) — is_pointer_type,
    type_to_c, emit_binop/logop, box_kind/classify_for_boxing,
@@ -2080,9 +2081,8 @@ let dict_value_needs_release ctx dict_ty loc =
   | _ -> false
 
 let boxed_value_release_arg ctx ty loc =
-  if boxed_value_needs_release ctx ty loc then
-    Core_emit_blorp_backend.ElemReleaseFn
-  else Core_emit_blorp_backend.NoElemRelease
+  if boxed_value_needs_release ctx ty loc then Blorp_prepared.ElemReleaseFn
+  else Blorp_prepared.NoElemRelease
 
 let hash_container_constructor_parts ctx loc key_ty =
   let hash_fn =
@@ -2348,29 +2348,6 @@ and emit_dict_construct_result ctx e ctor_arg =
          value_needs_release = dict_value_needs_release ctx e.ty e.loc;
        })
 
-and emit_tensor_raw_view_decl (ctx : Core_emit_context.t)
-    (b : tensor_raw_view_binding) : unit =
-  emit_blorp_backend ctx (TensorRawViewDecl b)
-
-and emit_list_get (ctx : Core_emit_context.t) (get : list_get) : unit =
-  emit_blorp_backend ctx (ListGet get)
-
-and emit_string_byte_read (ctx : Core_emit_context.t) (read : string_byte_read)
-    : unit =
-  emit_blorp_backend ctx (StringByteRead read)
-
-and emit_string_byte_write (ctx : Core_emit_context.t)
-    (write : string_byte_write) : unit =
-  emit_blorp_backend ctx (StringByteWrite write)
-
-and emit_string_byte_copy (ctx : Core_emit_context.t) (copy : string_byte_copy)
-    : unit =
-  emit_blorp_backend ctx (StringByteCopy copy)
-
-and emit_string_set_len (ctx : Core_emit_context.t) (set_len : string_set_len) :
-    unit =
-  emit_blorp_backend ctx (StringSetLen set_len)
-
 and emit_box_op (ctx : Core_emit_context.t) (b : box_op) : unit =
   match b.box_kind with
   | BoxVoid ->
@@ -2418,9 +2395,6 @@ and render_boxed_arg ctx value =
 and render_boxed_storage_arg ctx value =
   Core_emit_blorp_template.render_arg ~emit_expr:emit_boxed_storage ctx value
 
-and emit_prepared_emit_json ctx json =
-  emit_blorp_backend ctx (PreparedEmitJson json)
-
 and constructor_argument_list args = String.concat ", " args
 
 and constructor_mask_arg = function
@@ -2430,8 +2404,7 @@ and constructor_mask_arg = function
 and render_tuple_args ctx elems =
   elems
   |> List.map (fun value ->
-      Core_emit_blorp_backend.render_tuple_arg
-        (render_boxed_storage_arg ctx value))
+      Blorp_prepared.render_tuple_arg (render_boxed_storage_arg ctx value))
   |> String.concat ""
 
 and render_tuple_retain_statements ~tuple_tmp ~retain_mask elems =
@@ -2439,8 +2412,8 @@ and render_tuple_retain_statements ~tuple_tmp ~retain_mask elems =
   |> List.mapi (fun i _ ->
       if retain_mask land (1 lsl i) <> 0 then
         Some
-          (Core_emit_blorp_backend.render_tuple_retain_elem ~tuple:tuple_tmp
-             ~index:i)
+          (Blorp_prepared.render_tuple_retain_elem ~tuple:tuple_tmp
+             ~index:(string_of_int i))
       else None)
   |> List.filter_map Fun.id |> String.concat " "
 
@@ -2500,15 +2473,17 @@ and emit_unbox_op (ctx : Core_emit_context.t) (u : unbox_op) : unit =
 
 and render_dict_ctor_for_kind ctx loc = function
   | DictGeneric ->
-      Core_emit_blorp_backend.render_dict_constructor DictCtorGeneric
-  | DictString -> Core_emit_blorp_backend.render_dict_constructor DictCtorString
-  | DictFloat -> Core_emit_blorp_backend.render_dict_constructor DictCtorFloat
+      Blorp_prepared.render_dict_constructor Blorp_prepared.DictCtorGeneric
+  | DictString ->
+      Blorp_prepared.render_dict_constructor Blorp_prepared.DictCtorString
+  | DictFloat ->
+      Blorp_prepared.render_dict_constructor Blorp_prepared.DictCtorFloat
   | DictCustom key_ty ->
       let hash_fn, equals_fn, key_release =
         hash_container_constructor_parts ctx loc key_ty
       in
-      Core_emit_blorp_backend.render_dict_constructor
-        (DictCtorCustom { hash_fn; equals_fn; key_release })
+      Blorp_prepared.render_dict_constructor
+        (Blorp_prepared.DictCtorCustom { hash_fn; equals_fn; key_release })
 
 and emit_dict_construct ctx e dc =
   let ctor_arg = render_dict_ctor_for_kind ctx e.loc dc.dc_constructor in
@@ -2522,14 +2497,14 @@ and emit_dict_construct ctx e dc =
        })
 
 and set_ctor_for_kind ctx loc = function
-  | SetGeneric -> Core_emit_blorp_backend.SetCtorGeneric
-  | SetString -> Core_emit_blorp_backend.SetCtorString
-  | SetFloat -> Core_emit_blorp_backend.SetCtorFloat
+  | SetGeneric -> Blorp_prepared.SetCtorGeneric
+  | SetString -> Blorp_prepared.SetCtorString
+  | SetFloat -> Blorp_prepared.SetCtorFloat
   | SetCustom elem_ty ->
       let hash_fn, equals_fn, elem_release =
         hash_container_constructor_parts ctx loc elem_ty
       in
-      Core_emit_blorp_backend.SetCtorCustom { hash_fn; equals_fn; elem_release }
+      Blorp_prepared.SetCtorCustom { hash_fn; equals_fn; elem_release }
 
 and emit_set_alloc ctx loc kind =
   emit_blorp_backend ctx
@@ -2539,21 +2514,18 @@ and emit_tuple_construct ctx tc =
   let arity = string_of_int (List.length tc.tc_elems) in
   let args = render_tuple_args ctx tc.tc_elems in
   if tc.tc_release_mask = 0 then
-    emit_prepared_emit_json ctx
-      (Core_emit_blorp_backend.tuple_construct_json ~arity ~args)
+    emit ctx (Blorp_prepared.render_tuple_construct ~arity ~args)
   else
     let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-    let tuple = Core_emit_blorp_backend.render_tuple_name temp_seed in
+    let tuple = Blorp_prepared.render_tuple_name temp_seed in
     let retain_statements =
       render_tuple_retain_statements ~tuple_tmp:tuple
         ~retain_mask:tc.tc_retain_mask tc.tc_elems
     in
-    emit_prepared_emit_json ctx
-      (Core_emit_blorp_backend.tuple_construct_with_rc_json ~tuple ~arity ~args
+    emit ctx
+      (Blorp_prepared.render_tuple_construct_with_rc ~tuple ~arity ~args
          ~retain_statements
          ~release_mask:(string_of_int tc.tc_release_mask))
-
-and emit_list_construct ctx lc = emit_blorp_backend ctx (ListConstruct lc)
 
 and emit_record_construct ctx rc =
   let field_args =
@@ -2567,17 +2539,10 @@ and emit_record_construct ctx rc =
     constructor_argument_list
       (field_args @ constructor_mask_arg rc.rc_erased_release_mask)
   in
-  emit_prepared_emit_json ctx
-    (Core_emit_blorp_backend.constructor_call_json
+  emit ctx
+    (Blorp_prepared.render_constructor_call
        ~callee:(Printf.sprintf "%s_make" rc.rc_type_name)
        ~argument_list)
-
-and emit_tensor_literal ctx loc tl =
-  emit_blorp_backend ctx (TensorLiteral { loc; literal = tl })
-
-and emit_tensor_fill_factory ctx loc ty value dims =
-  let layout = Core_emit_util.tensor_storage_layout_of_type ctx ty loc in
-  emit_blorp_backend ctx (TensorDirectFillFactory { loc; layout; value; dims })
 
 and render_union_constructor_arg ctx type_name arg =
   if union_uses_typed_payload_storage ctx type_name then
@@ -2601,8 +2566,8 @@ and emit_union_construct ctx uc =
       let abi =
         Core_layout_type.stack_result_constructor_abi_of_layout result_layout
       in
-      emit_prepared_emit_json ctx
-        (Core_emit_blorp_backend.stack_result_payload_json
+      emit ctx
+        (Blorp_prepared.render_stack_result_payload
            ~result_type:abi.src_result_c_type ~tag:(string_of_int uc.uc_tag)
            ~field:uc.uc_constructor_name
            ~payload:(render_boxed_storage_arg ctx arg)
@@ -2614,11 +2579,10 @@ and emit_union_construct ctx uc =
   | _ -> (
       match (option_constructor_abi, uc.uc_args) with
       | Some Core_layout_type.OptionConstructorNullableManaged, [] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.constructor_nullable_none_json ())
+          emit ctx (Blorp_prepared.render_constructor_nullable_none ())
       | Some Core_layout_type.OptionConstructorNullableManaged, [ arg ] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.constructor_nullable_payload_json
+          emit ctx
+            (Blorp_prepared.render_constructor_nullable_payload
                ~payload:(render_nullable_managed_payload arg))
       | Some Core_layout_type.OptionConstructorNullableManaged, _ ->
           Core_error.errorf Core_error.Emit Ast.dummy_loc
@@ -2628,19 +2592,18 @@ and emit_union_construct ctx uc =
             "invalid nullable managed Option constructor arity for %s"
             uc.uc_constructor_name
       | Some (Core_layout_type.OptionConstructorStackInline abi), [] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.stack_option_none_json
-               ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
-               ~none_value:abi.soe_none_value)
+          emit ctx
+            (Blorp_prepared.render_stack_option_none ~option_type:abi.soe_c_type
+               ~tag:(string_of_int uc.uc_tag) ~none_value:abi.soe_none_value)
       | Some (Core_layout_type.OptionConstructorStackInline abi), [ arg ]
         when is_void_ty arg.bsv_box.box_value.ty ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.stack_option_void_statement_json
+          emit ctx
+            (Blorp_prepared.render_stack_option_void_statement
                ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
                ~statement:(render_stmt_arg ctx arg.bsv_box.box_value))
       | Some (Core_layout_type.OptionConstructorStackInline abi), [ arg ] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.stack_option_value_json
+          emit ctx
+            (Blorp_prepared.render_stack_option_value
                ~option_type:abi.soe_c_type ~tag:(string_of_int uc.uc_tag)
                ~value:(render_expr_arg ctx arg.bsv_box.box_value))
       | Some (Core_layout_type.OptionConstructorStackInline _), _ ->
@@ -2658,8 +2621,8 @@ and emit_union_construct ctx uc =
             "unsupported Option constructor layout for %s: %s"
             uc.uc_constructor_name reason
       | (Some Core_layout_type.OptionConstructorBoxedUnion | None), [] ->
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.constructor_symbol_json
+          emit ctx
+            (Blorp_prepared.render_constructor_symbol
                ~name:(escape_c_ident uc.uc_c_name))
       | (Some Core_layout_type.OptionConstructorBoxedUnion | None), args ->
           let needs_release_mask =
@@ -2674,8 +2637,8 @@ and emit_union_construct ctx uc =
               [ Printf.sprintf "%dUL" uc.uc_release_mask ]
             else []
           in
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.constructor_call_json ~callee:uc.uc_c_name
+          emit ctx
+            (Blorp_prepared.render_constructor_call ~callee:uc.uc_c_name
                ~argument_list:
                  (constructor_argument_list (arg_strings @ release_args))))
 
@@ -2688,7 +2651,8 @@ and emit_union_reuse_construct ctx urc =
       in
       let source_arg = render_expr_arg ctx urc.urc_source in
       let arg_strings =
-        List.map (render_union_constructor_arg ctx urc.urc_type_name)
+        List.map
+          (render_union_constructor_arg ctx urc.urc_type_name)
           urc.urc_args
       in
       let release_args =
@@ -2696,9 +2660,8 @@ and emit_union_reuse_construct ctx urc =
           [ Printf.sprintf "%dUL" urc.urc_release_mask ]
         else []
       in
-      emit_prepared_emit_json ctx
-        (Core_emit_blorp_backend.constructor_call_json
-           ~callee:urc.urc_reuse_c_name
+      emit ctx
+        (Blorp_prepared.render_constructor_call ~callee:urc.urc_reuse_c_name
            ~argument_list:
              (constructor_argument_list
                 ((source_arg :: arg_strings) @ release_args)))
@@ -2707,23 +2670,6 @@ and emit_union_reuse_construct ctx urc =
         ~hint:"union reuse is only supported for heap-allocated generic unions"
         "unsupported union reuse constructor for %s.%s" urc.urc_type_name
         urc.urc_constructor_name
-
-and emit_generated_stack_option_vector_get ctx abi arr idx =
-  emit_blorp_backend ctx
-    (TensorStackOptionVectorGet { abi; tensor = arr; index = idx })
-
-and emit_generated_stack_option_matrix_get ctx abi arr row col =
-  emit_blorp_backend ctx
-    (TensorStackOptionMatrixGet { abi; tensor = arr; row; col })
-
-and emit_generated_stack_option_dict_get ctx abi dict key =
-  let key_release_policy =
-    if boxed_expr_transfers_ownership ctx key then
-      Core_emit_blorp_backend.ReleaseKey
-    else Core_emit_blorp_backend.KeepKey
-  in
-  emit_blorp_backend ctx
-    (DictStackOptionGet { abi; dict; key; key_release_policy })
 
 and emit_option_equality ctx e l r =
   let option_ty =
@@ -3211,7 +3157,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
       emit ctx "; })"
   | CTensorRawViewLet (b, body) ->
       emit ctx "({ ";
-      emit_tensor_raw_view_decl ctx b;
+      emit_blorp_backend ctx (TensorRawViewDecl b);
       emit ctx "; ";
       emit_expr ctx body;
       emit ctx "; })"
@@ -3268,8 +3214,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
         hash_container_constructor_parts ctx e.loc key_type
       in
       let ctor_arg =
-        Core_emit_blorp_backend.render_dict_constructor
-          (DictCtorCustom { hash_fn; equals_fn; key_release })
+        Blorp_prepared.render_dict_constructor
+          (Blorp_prepared.DictCtorCustom { hash_fn; equals_fn; key_release })
       in
       emit_dict_construct_result ctx e ctor_arg
   | CCall (CKBuiltin "blorp_set_new_custom", _, _) ->
@@ -3284,8 +3230,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
         hash_container_constructor_parts ctx e.loc elem_type
       in
       let ctor_arg =
-        Core_emit_blorp_backend.render_set_constructor
-          (SetCtorCustom { hash_fn; equals_fn; elem_release })
+        Blorp_prepared.render_set_constructor
+          (Blorp_prepared.SetCtorCustom { hash_fn; equals_fn; elem_release })
       in
       emit_blorp_backend ctx
         (DictConstructResult { ctor_arg; value_needs_release = false })
@@ -3301,37 +3247,32 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
         hash_container_constructor_parts ctx e.loc key_type
       in
       let ctor_arg =
-        Core_emit_blorp_backend.render_dict_capacity_constructor
-          (blorp_backend_emitters ())
-          ctx
-          (DictWithCapacityCustom
+        Blorp_prepared.render_dict_capacity_constructor ~emit_expr ctx
+          (Blorp_prepared.DictWithCapacityCustom
              { capacity = cap; hash_fn; equals_fn; key_release })
       in
       emit_dict_construct_result ctx e ctor_arg
   | CCall (CKBuiltin "blorp_dict_new", _, []) ->
       emit_dict_construct_result ctx e
-        (Core_emit_blorp_backend.render_dict_constructor DictCtorGeneric)
+        (Blorp_prepared.render_dict_constructor Blorp_prepared.DictCtorGeneric)
   | CCall (CKBuiltin "blorp_dict_new_string", _, []) ->
       emit_dict_construct_result ctx e
-        (Core_emit_blorp_backend.render_dict_constructor DictCtorString)
+        (Blorp_prepared.render_dict_constructor Blorp_prepared.DictCtorString)
   | CCall (CKBuiltin "blorp_dict_new_float", _, []) ->
       emit_dict_construct_result ctx e
-        (Core_emit_blorp_backend.render_dict_constructor DictCtorFloat)
+        (Blorp_prepared.render_dict_constructor Blorp_prepared.DictCtorFloat)
   | CCall (CKBuiltin "blorp_dict_with_capacity", _, [ cap ]) ->
       emit_dict_construct_result ctx e
-        (Core_emit_blorp_backend.render_dict_capacity_constructor
-           (blorp_backend_emitters ())
-           ctx (DictWithCapacityGeneric cap))
+        (Blorp_prepared.render_dict_capacity_constructor ~emit_expr ctx
+           (Blorp_prepared.DictWithCapacityGeneric cap))
   | CCall (CKBuiltin "blorp_dict_with_capacity_string", _, [ cap ]) ->
       emit_dict_construct_result ctx e
-        (Core_emit_blorp_backend.render_dict_capacity_constructor
-           (blorp_backend_emitters ())
-           ctx (DictWithCapacityString cap))
+        (Blorp_prepared.render_dict_capacity_constructor ~emit_expr ctx
+           (Blorp_prepared.DictWithCapacityString cap))
   | CCall (CKBuiltin "blorp_dict_with_capacity_float", _, [ cap ]) ->
       emit_dict_construct_result ctx e
-        (Core_emit_blorp_backend.render_dict_capacity_constructor
-           (blorp_backend_emitters ())
-           ctx (DictWithCapacityFloat cap))
+        (Blorp_prepared.render_dict_capacity_constructor ~emit_expr ctx
+           (Blorp_prepared.DictWithCapacityFloat cap))
   | CCall (CKBuiltin "blorp_list_new", _, [ cap ]) ->
       emit_blorp_backend ctx
         (ListAllocForType { ty = e.ty; loc = e.loc; capacity = cap })
@@ -3344,7 +3285,11 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
         _,
         value :: dims )
     when tensor_fill_factory_uses_direct_layout ctx e.ty e.loc ->
-      emit_tensor_fill_factory ctx e.loc e.ty value dims
+      let layout =
+        Core_emit_util.tensor_storage_layout_of_type ctx e.ty e.loc
+      in
+      emit_blorp_backend ctx
+        (TensorDirectFillFactory { loc = e.loc; layout; value; dims })
   | CCall
       ( CKBuiltin
           (( "blorp_vector_new_fill" | "blorp_matrix_new_fill"
@@ -3371,8 +3316,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
     when tensor_element_needs_release ctx e.ty e.loc ->
       let fill_value_policy =
         if boxed_expr_transfers_ownership ctx value then
-          Core_emit_blorp_backend.ReleaseFillValue
-        else Core_emit_blorp_backend.KeepFillValue
+          Blorp_prepared.ReleaseFillValue
+        else Blorp_prepared.KeepFillValue
       in
       emit_blorp_backend ctx
         (TensorFillBoxed
@@ -3472,60 +3417,58 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
               let result_type = type_to_c ctx e.ty in
               emit_blorp_backend ctx
                 (ChannelRetainingSend
-                   (Core_emit_blorp_backend.ChannelRetainingSendNoTimeout
+                   (Blorp_prepared.ChannelRetainingSendNoTimeout
                       { runtime; result_type; channel = ch; value }))
             in
             let emit_retaining_send_with_timeout runtime ch value timeout =
               let result_type = type_to_c ctx e.ty in
               emit_blorp_backend ctx
                 (ChannelRetainingSend
-                   (Core_emit_blorp_backend.ChannelRetainingSendWithTimeout
+                   (Blorp_prepared.ChannelRetainingSendWithTimeout
                       { runtime; result_type; channel = ch; value; timeout }))
             in
             match (kind, args) with
             | CKBuiltin "blorp_channel_send", [ ch; value ]
               when boxed_expr_temp_needs_release ctx value ->
-                emit_retaining_send_no_timeout
-                  Core_emit_blorp_backend.ChannelSendRuntime ch value;
+                emit_retaining_send_no_timeout Blorp_prepared.ChannelSendRuntime
+                  ch value;
                 true
             | CKBuiltin "blorp_channel_try_send", [ ch; value ]
               when boxed_expr_temp_needs_release ctx value ->
                 emit_retaining_send_no_timeout
-                  Core_emit_blorp_backend.ChannelTrySendRuntime ch value;
+                  Blorp_prepared.ChannelTrySendRuntime ch value;
                 true
             | CKBuiltin "blorp_channel_try_send_status", [ ch; value ]
               when boxed_expr_temp_needs_release ctx value ->
                 emit_retaining_send_no_timeout
-                  Core_emit_blorp_backend.ChannelTrySendStatusRuntime ch value;
+                  Blorp_prepared.ChannelTrySendStatusRuntime ch value;
                 true
             | CKBuiltin "blorp_channel_send_timeout", [ ch; value; timeout ]
               when boxed_expr_temp_needs_release ctx value ->
                 emit_retaining_send_with_timeout
-                  Core_emit_blorp_backend.ChannelSendTimeoutRuntime ch value
-                  timeout;
+                  Blorp_prepared.ChannelSendTimeoutRuntime ch value timeout;
                 true
             | ( CKBuiltin "blorp_channel_send_timeout_status",
                 [ ch; value; timeout ] )
               when boxed_expr_temp_needs_release ctx value ->
                 emit_retaining_send_with_timeout
-                  Core_emit_blorp_backend.ChannelSendTimeoutStatusRuntime ch
-                  value timeout;
+                  Blorp_prepared.ChannelSendTimeoutStatusRuntime ch value
+                  timeout;
                 true
             | _ -> false
           in
           let try_emit_channel_send_attempt () =
             let send_attempt_value value =
               if boxed_expr_temp_needs_release ctx value then
-                Core_emit_blorp_backend.ChannelSendAttemptRetainedValue value
-              else Core_emit_blorp_backend.ChannelSendAttemptDirectValue value
+                Blorp_prepared.ChannelSendAttemptRetainedValue value
+              else Blorp_prepared.ChannelSendAttemptDirectValue value
             in
             let send_attempt_constructors () =
               let constructor_c_name =
                 constructor_c_name_for_return ~contract:"send attempt"
               in
               {
-                Core_emit_blorp_backend.accepted =
-                  constructor_c_name "SendAccepted";
+                Blorp_prepared.accepted = constructor_c_name "SendAccepted";
                 would_block = constructor_c_name "SendWouldBlock";
                 sealed = constructor_c_name "SendSealed";
                 timed_out = constructor_c_name "SendTimedOut";
@@ -3535,7 +3478,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
             | CKBuiltin "blorp_channel_try_send_attempt", [ ch; value ], _ ->
                 emit_blorp_backend ctx
                   (ChannelSendAttempt
-                     (ChannelTrySendAttempt
+                     (Blorp_prepared.ChannelTrySendAttempt
                         {
                           result_type = type_to_c ctx e.ty;
                           channel = ch;
@@ -3548,7 +3491,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 _ ) ->
                 emit_blorp_backend ctx
                   (ChannelSendAttempt
-                     (ChannelSendTimeoutAttempt
+                     (Blorp_prepared.ChannelSendTimeoutAttempt
                         {
                           result_type = type_to_c ctx e.ty;
                           channel = ch;
@@ -3562,15 +3505,15 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           let try_emit_channel_recv_attempt () =
             let recv_attempt_release_policy elem_ty =
               if boxed_value_needs_release ctx elem_ty e.loc then
-                Core_emit_blorp_backend.ReleaseRecvValue
-              else Core_emit_blorp_backend.KeepRecvValue
+                Blorp_prepared.ReleaseRecvValue
+              else Blorp_prepared.KeepRecvValue
             in
             let recv_attempt_constructors empty_ctor_name =
               let constructor_c_name =
                 constructor_c_name_for_return ~contract:"recv attempt"
               in
               {
-                Core_emit_blorp_backend.value = constructor_c_name "RecvValue";
+                Blorp_prepared.value = constructor_c_name "RecvValue";
                 sealed = constructor_c_name "RecvSealed";
                 empty = constructor_c_name empty_ctor_name;
               }
@@ -3585,7 +3528,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 | Some elem_ty ->
                     emit_blorp_backend ctx
                       (ChannelRecvAttempt
-                         (ChannelTryRecvAttempt
+                         (Blorp_prepared.ChannelTryRecvAttempt
                             {
                               result_type = type_to_c ctx e.ty;
                               channel = ch;
@@ -3604,7 +3547,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 | Some elem_ty ->
                     emit_blorp_backend ctx
                       (ChannelRecvAttempt
-                         (ChannelRecvTimeoutAttempt
+                         (Blorp_prepared.ChannelRecvTimeoutAttempt
                             {
                               result_type = type_to_c ctx e.ty;
                               channel = ch;
@@ -3621,17 +3564,16 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
           in
           let try_emit_stack_option_ctor () =
             let emit_some c_ty arg =
-              let json =
+              let rendered =
                 if is_void_ty arg.ty then
-                  Core_emit_blorp_backend.stack_option_void_statement_json
+                  Blorp_prepared.render_stack_option_void_statement
                     ~option_type:c_ty ~tag:"BLORP_TAG_SOME"
                     ~statement:(render_stmt_arg ctx arg)
                 else
-                  Core_emit_blorp_backend.stack_option_value_json
-                    ~option_type:c_ty ~tag:"BLORP_TAG_SOME"
-                    ~value:(render_expr_arg ctx arg)
+                  Blorp_prepared.render_stack_option_value ~option_type:c_ty
+                    ~tag:"BLORP_TAG_SOME" ~value:(render_expr_arg ctx arg)
               in
-              emit_prepared_emit_json ctx json
+              emit ctx rendered
             in
             match
               ( kind,
@@ -3646,9 +3588,9 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 emit_some c_ty arg;
                 true
             | CKBuiltin "blorp_option_none", Some c_ty, [] ->
-                emit_prepared_emit_json ctx
-                  (Core_emit_blorp_backend.stack_option_none_json
-                     ~option_type:c_ty ~tag:"BLORP_TAG_NONE"
+                emit ctx
+                  (Blorp_prepared.render_stack_option_none ~option_type:c_ty
+                     ~tag:"BLORP_TAG_NONE"
                      ~none_value:
                        (Core_layout_type.stack_option_none_value_for_type
                           ~reg:ctx.reg e.ty));
@@ -3660,10 +3602,9 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
               if boxed_value_needs_release ctx arg.ty arg.loc then "1" else "0"
             in
             let emit_stack_result_ctor c_ty tag field arg =
-              emit_prepared_emit_json ctx
-                (Core_emit_blorp_backend.stack_result_payload_json
-                   ~result_type:c_ty ~tag ~field
-                   ~payload:(render_boxed_arg ctx arg)
+              emit ctx
+                (Blorp_prepared.render_stack_result_payload ~result_type:c_ty
+                   ~tag ~field ~payload:(render_boxed_arg ctx arg)
                    ~release_mask:(result_payload_release_mask arg))
             in
             match
@@ -3728,13 +3669,21 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                   e.ty )
             with
             | CKBuiltin "blorp_vector_get_opt", [ arr; idx ], Some abi ->
-                emit_generated_stack_option_vector_get ctx abi arr idx;
+                emit_blorp_backend ctx
+                  (TensorStackOptionVectorGet { abi; tensor = arr; index = idx });
                 true
             | CKBuiltin "blorp_matrix_get_opt", [ arr; row; col ], Some abi ->
-                emit_generated_stack_option_matrix_get ctx abi arr row col;
+                emit_blorp_backend ctx
+                  (TensorStackOptionMatrixGet { abi; tensor = arr; row; col });
                 true
             | CKBuiltin "blorp_dict_get", [ dict; key ], Some abi ->
-                emit_generated_stack_option_dict_get ctx abi dict key;
+                let key_release_policy =
+                  if boxed_expr_transfers_ownership ctx key then
+                    Blorp_prepared.ReleaseKey
+                  else Blorp_prepared.KeepKey
+                in
+                emit_blorp_backend ctx
+                  (DictStackOptionGet { abi; dict; key; key_release_policy });
                 true
             | _ -> false
           in
@@ -3913,8 +3862,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                             e.loc
                         in
                         let storage_mode, elem_size =
-                          Core_emit_blorp_backend.list_runtime_storage_args
-                            layout
+                          Blorp_prepared.list_runtime_storage_args layout
                         in
                         emit ctx
                           (Printf.sprintf ", %s, %s" storage_mode elem_size)
@@ -4788,8 +4736,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                               e.loc
                           in
                           let storage_mode_c, elem_size_c =
-                            Core_emit_blorp_backend.list_runtime_storage_args
-                              layout
+                            Blorp_prepared.list_runtime_storage_args layout
                           in
                           if args <> [] then emit ctx ", ";
                           emit ctx storage_mode_c;
@@ -4804,8 +4751,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                               e.ty e.loc
                           in
                           let storage_mode_c, elem_size_c =
-                            Core_emit_blorp_backend.tensor_runtime_storage_args
-                              layout
+                            Blorp_prepared.tensor_runtime_storage_args layout
                           in
                           if args <> [] then emit ctx ", ";
                           emit ctx storage_mode_c;
@@ -4813,8 +4759,8 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                           emit ctx elem_size_c;
                           emit ctx ", ";
                           emit ctx
-                            (Core_emit_blorp_backend
-                             .tensor_callback_result_encoding_arg layout)
+                            (Blorp_prepared.tensor_callback_result_encoding_arg
+                               layout)
                       | _ -> ());
                       emit ctx ")";
                       if
@@ -4824,10 +4770,10 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
                 end))
   | CTensorRawRead r -> emit_blorp_backend ctx (TensorRawRead r)
   | CTensorRawWrite w -> emit_blorp_backend ctx (TensorRawWriteExpr w)
-  | CStringByteRead read -> emit_string_byte_read ctx read
-  | CStringByteWrite write -> emit_string_byte_write ctx write
-  | CStringByteCopy copy -> emit_string_byte_copy ctx copy
-  | CStringSetLen set_len -> emit_string_set_len ctx set_len
+  | CStringByteRead read -> emit_blorp_backend ctx (StringByteRead read)
+  | CStringByteWrite write -> emit_blorp_backend ctx (StringByteWrite write)
+  | CStringByteCopy copy -> emit_blorp_backend ctx (StringByteCopy copy)
+  | CStringSetLen set_len -> emit_blorp_backend ctx (StringSetLen set_len)
   | CField (obj, name) -> (
       match normalize_type obj.ty with
       | TyTuple _ ->
@@ -4864,16 +4810,14 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
             | _ -> Printf.sprintf "(%s)%s" (type_to_c ctx e.ty) elem_access
           in
           let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-          let tuple = Core_emit_blorp_backend.render_tuple_name temp_seed in
+          let tuple = Blorp_prepared.render_tuple_name temp_seed in
           let source = render_expr_arg ctx obj in
           let element =
-            Core_emit_blorp_backend.render_tuple_field_element ~tuple
-              ~field:name
+            Blorp_prepared.render_tuple_field_element ~tuple ~field:name
           in
           let read = render_read element in
-          emit_prepared_emit_json ctx
-            (Core_emit_blorp_backend.tuple_field_access_json ~tuple ~source
-               ~read)
+          emit ctx
+            (Blorp_prepared.render_tuple_field_access ~tuple ~source ~read)
       | TyNamed (_, _) when is_value_record_type ctx obj.ty -> (
           match value_record_layout ctx obj.ty with
           | Some layout ->
@@ -4935,7 +4879,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
       emit ctx (Printf.sprintf " }; %s; })" tmp)
   (* ---- Allocating: tuple / list ---- *)
   | CTupleConstruct tc -> emit_tuple_construct ctx tc
-  | CListConstruct lc -> emit_list_construct ctx lc
+  | CListConstruct lc -> emit_blorp_backend ctx (ListConstruct lc)
   | CTuple _ ->
       Core_error.errorf Core_error.Emit e.loc
         ~hint:
@@ -4957,11 +4901,12 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
              loc = e.loc;
              capacity = alloc.la_capacity;
            })
-  | CListGet get -> emit_list_get ctx get
+  | CListGet get -> emit_blorp_backend ctx (ListGet get)
   | CRecordConstruct rc -> emit_record_construct ctx rc
   | CDictConstruct dc -> emit_dict_construct ctx e dc
   | CSetAlloc sa -> emit_set_alloc ctx e.loc sa.sa_constructor
-  | CTensorLiteral tl -> emit_tensor_literal ctx e.loc tl
+  | CTensorLiteral tl ->
+      emit_blorp_backend ctx (TensorLiteral { loc = e.loc; literal = tl })
   | CUnionConstruct uc -> emit_union_construct ctx uc
   | CUnionReuseConstruct urc -> emit_union_reuse_construct ctx urc
   (* ---- Record construction: [TypeName_make(field0, field1, ...)] ----
@@ -5492,7 +5437,7 @@ and emit_stmt (ctx : Core_emit_context.t) (e : core) : unit =
       emit_stmt ctx body
   | CTensorRawViewLet (b, body) ->
       emit_indent ctx;
-      emit_tensor_raw_view_decl ctx b;
+      emit_blorp_backend ctx (TensorRawViewDecl b);
       emitln ctx ";";
       emit_stmt ctx body
   | CSeq (a, b) ->
@@ -7355,7 +7300,7 @@ and emit_for_set (ctx : Core_emit_context.t) (binder : loop_binder)
     (SetIterHeader { set = iter_c; source = iter; entry = entry_c });
   ctx.indent <- ctx.indent + 1;
   emit_unbox_decl ctx var_c
-    (Core_emit_blorp_backend.render_set_iter_entry_key ~entry:entry_c)
+    (Blorp_prepared.render_set_iter_entry_key ~entry:entry_c)
     elem_ty;
   emit_stmt ctx body;
   ctx.indent <- ctx.indent - 1;
@@ -7550,8 +7495,8 @@ and render_tailrec_list_accessor (ctx : Core_emit_context.t)
         in
         Printf.sprintf "%s->data.%s.field%d" cast_parent ctor idx
     | AccTupleField (parent, idx) ->
-        Core_emit_blorp_backend.render_tuple_field_element_at
-          ~tuple_tmp:(go parent) ~index:idx
+        Blorp_prepared.render_tuple_field_element ~tuple:(go parent)
+          ~field:(string_of_int idx)
     | AccListElem (parent, idx) ->
         Printf.sprintf "blorp_list_get((blorp_List*)%s, %d)" (go parent) idx
     | AccListSpread (parent, idx) ->

@@ -24,8 +24,19 @@ let split_semicolon_table text =
   if String.equal text "" then [] else String.split_on_char ';' text
 
 let split_pair entry =
-  Compiler_blorp_bridge.parse_colon_pair_exn
-    ~label:"language-surface prelude method import" entry
+  try
+    let index = String.index entry ':' in
+    let left = String.sub entry 0 index in
+    let right =
+      String.sub entry (index + 1) (String.length entry - index - 1)
+    in
+    if String.equal left "" || String.equal right "" then
+      invalid_arg
+        ("invalid language-surface prelude method import entry: " ^ entry)
+    else (left, right)
+  with Not_found ->
+    invalid_arg
+      ("invalid language-surface prelude method import entry: " ^ entry)
 
 (** User-facing keywords worth suggesting in editor completions.
 

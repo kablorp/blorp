@@ -8,19 +8,20 @@
 
 open Core
 
-let intrinsic_manifest =
-  Core_emit_blorp_template.create ~initial_size:64 ~label:"codegen intrinsic"
-    Core_emit_blorp_intrinsic_templates.tsv
-
-let intrinsic_names () = Core_emit_blorp_template.names intrinsic_manifest
+let intrinsic_template_arity name =
+  Compiler_blorp_bridge.renderer_template_arity_opt_exn
+    ~renderer:Compiler_blorp_bridge.intrinsic_renderer ~op:name
 
 let emit_simple_intrinsic ~emit_expr (ctx : Core_emit_context.t) name args =
-  match Core_emit_blorp_template.find intrinsic_manifest name with
-  | Some template when List.length args = template.arity ->
+  match intrinsic_template_arity name with
+  | Some arity when List.length args = arity ->
       let rendered_args =
         Core_emit_blorp_template.render_args ~emit_expr ctx args
       in
-      Core_emit_blorp_template.emit intrinsic_manifest ctx name rendered_args;
+      Core_emit_context.emit ctx
+        (Compiler_blorp_bridge.render_via_command_exn
+           ~renderer:Compiler_blorp_bridge.intrinsic_renderer ~op:name
+           rendered_args);
       true
   | Some _ | None -> false
 
@@ -32,242 +33,13 @@ type emitters = {
   type_to_c : Core_emit_context.t -> Ast.type_expr -> string;
 }
 
-type list_store_runtime = ListSetRawStore | ListHandoffSetOwnedStore
-
-type key_release_policy = Core_emit_blorp_prepared_backend.key_release_policy =
-  | KeepKey
-  | ReleaseKey
-
-type tensor_fill_value_policy =
-      Core_emit_blorp_prepared_backend.tensor_fill_value_policy =
-  | KeepFillValue
-  | ReleaseFillValue
-
-type elem_release_arg = Core_emit_blorp_prepared_backend.elem_release_arg =
-  | NoElemRelease
-  | ElemReleaseFn
-
 type tensor_storage_check =
   | TensorWordStorageCheck
   | TensorF64StorageCheck
   | TensorF32StorageCheck
   | TensorI64StorageCheck
 
-type dict_constructor_call =
-      Core_emit_blorp_prepared_backend.dict_constructor_call =
-  | DictCtorGeneric
-  | DictCtorString
-  | DictCtorFloat
-  | DictCtorCustom of {
-      hash_fn : string;
-      equals_fn : string;
-      key_release : elem_release_arg;
-    }
-
-type dict_capacity_constructor_call =
-      Core_emit_blorp_prepared_backend.dict_capacity_constructor_call =
-  | DictWithCapacityGeneric of core
-  | DictWithCapacityString of core
-  | DictWithCapacityFloat of core
-  | DictWithCapacityCustom of {
-      capacity : core;
-      hash_fn : string;
-      equals_fn : string;
-      key_release : elem_release_arg;
-    }
-
-type set_constructor_call =
-      Core_emit_blorp_prepared_backend.set_constructor_call =
-  | SetCtorGeneric
-  | SetCtorString
-  | SetCtorFloat
-  | SetCtorCustom of {
-      hash_fn : string;
-      equals_fn : string;
-      elem_release : elem_release_arg;
-    }
-
-type channel_retaining_send_runtime =
-      Core_emit_blorp_prepared_backend.channel_retaining_send_runtime =
-  | ChannelSendRuntime
-  | ChannelTrySendRuntime
-  | ChannelTrySendStatusRuntime
-
-type channel_retaining_send_timeout_runtime =
-      Core_emit_blorp_prepared_backend.channel_retaining_send_timeout_runtime =
-  | ChannelSendTimeoutRuntime
-  | ChannelSendTimeoutStatusRuntime
-
-type channel_retaining_send =
-      Core_emit_blorp_prepared_backend.channel_retaining_send =
-  | ChannelRetainingSendNoTimeout of {
-      runtime : channel_retaining_send_runtime;
-      result_type : string;
-      channel : core;
-      value : core;
-    }
-  | ChannelRetainingSendWithTimeout of {
-      runtime : channel_retaining_send_timeout_runtime;
-      result_type : string;
-      channel : core;
-      value : core;
-      timeout : core;
-    }
-
-type channel_send_attempt_constructors =
-      Core_emit_blorp_prepared_backend.channel_send_attempt_constructors = {
-  accepted : string;
-  would_block : string;
-  sealed : string;
-  timed_out : string;
-}
-
-type channel_send_attempt_value =
-      Core_emit_blorp_prepared_backend.channel_send_attempt_value =
-  | ChannelSendAttemptDirectValue of core
-  | ChannelSendAttemptRetainedValue of core
-
-type channel_send_attempt =
-      Core_emit_blorp_prepared_backend.channel_send_attempt =
-  | ChannelTrySendAttempt of {
-      result_type : string;
-      channel : core;
-      value : channel_send_attempt_value;
-      constructors : channel_send_attempt_constructors;
-    }
-  | ChannelSendTimeoutAttempt of {
-      result_type : string;
-      channel : core;
-      value : channel_send_attempt_value;
-      timeout : core;
-      constructors : channel_send_attempt_constructors;
-    }
-
-type channel_recv_value_release_policy =
-      Core_emit_blorp_prepared_backend.channel_recv_value_release_policy =
-  | KeepRecvValue
-  | ReleaseRecvValue
-
-type channel_recv_attempt_constructors =
-      Core_emit_blorp_prepared_backend.channel_recv_attempt_constructors = {
-  value : string;
-  sealed : string;
-  empty : string;
-}
-
-type channel_recv_attempt =
-      Core_emit_blorp_prepared_backend.channel_recv_attempt =
-  | ChannelTryRecvAttempt of {
-      result_type : string;
-      channel : core;
-      release_policy : channel_recv_value_release_policy;
-      value_constructor_takes_release_mask : bool;
-      constructors : channel_recv_attempt_constructors;
-    }
-  | ChannelRecvTimeoutAttempt of {
-      result_type : string;
-      channel : core;
-      timeout : core;
-      release_policy : channel_recv_value_release_policy;
-      value_constructor_takes_release_mask : bool;
-      constructors : channel_recv_attempt_constructors;
-    }
-
-let prepared_json ~op fields =
-  Lsp_json.to_string
-    (Lsp_json.Object
-       (("op", Lsp_json.String op)
-       :: List.map (fun (key, value) -> (key, Lsp_json.String value)) fields))
-
-let prepared_emit_json ~op fields = prepared_json ~op fields
-
-let constructor_call_json ~callee ~argument_list =
-  prepared_emit_json ~op:"constructor_call"
-    [ ("callee", callee); ("argument_list", argument_list) ]
-
-let constructor_symbol_json ~name =
-  prepared_emit_json ~op:"constructor_symbol" [ ("name", name) ]
-
-let constructor_nullable_none_json () =
-  prepared_emit_json ~op:"constructor_nullable_none" []
-
-let constructor_nullable_payload_json ~payload =
-  prepared_emit_json ~op:"constructor_nullable_payload" [ ("payload", payload) ]
-
-let stack_option_value_json ~option_type ~tag ~value =
-  prepared_emit_json ~op:"stack_option_value"
-    [ ("option_type", option_type); ("tag", tag); ("value", value) ]
-
-let stack_option_void_statement_json ~option_type ~tag ~statement =
-  prepared_emit_json ~op:"stack_option_void_statement"
-    [ ("option_type", option_type); ("tag", tag); ("statement", statement) ]
-
-let stack_option_none_json ~option_type ~tag ~none_value =
-  prepared_emit_json ~op:"stack_option_none"
-    [ ("option_type", option_type); ("tag", tag); ("none_value", none_value) ]
-
-let stack_result_payload_json ~result_type ~tag ~field ~payload ~release_mask =
-  prepared_emit_json ~op:"stack_result_payload"
-    [
-      ("result_type", result_type);
-      ("tag", tag);
-      ("field", field);
-      ("payload", payload);
-      ("release_mask", release_mask);
-    ]
-
-let tuple_name_json ~temp_seed =
-  prepared_emit_json ~op:"tuple_name" [ ("temp_seed", temp_seed) ]
-
-let tuple_arg_json ~value =
-  prepared_emit_json ~op:"tuple_arg" [ ("value", value) ]
-
-let tuple_construct_json ~arity ~args =
-  prepared_emit_json ~op:"tuple_construct" [ ("arity", arity); ("args", args) ]
-
-let tuple_retain_elem_json ~tuple ~index =
-  prepared_emit_json ~op:"tuple_retain_elem"
-    [ ("tuple", tuple); ("index", index) ]
-
-let tuple_construct_with_rc_json ~tuple ~arity ~args ~retain_statements
-    ~release_mask =
-  prepared_emit_json ~op:"tuple_construct_with_rc"
-    [
-      ("tuple", tuple);
-      ("arity", arity);
-      ("args", args);
-      ("retain_statements", retain_statements);
-      ("release_mask", release_mask);
-    ]
-
-let tuple_field_element_json ~tuple ~field =
-  prepared_emit_json ~op:"tuple_field_element"
-    [ ("tuple", tuple); ("field", field) ]
-
-let tuple_field_access_json ~tuple ~source ~read =
-  prepared_emit_json ~op:"tuple_field_access"
-    [ ("tuple", tuple); ("source", source); ("read", read) ]
-
-let render_prepared_emit_json =
-  Core_emit_blorp_prepared_backend.render_prepared_emit_json
-
-let render_tuple_name temp_seed =
-  render_prepared_emit_json (tuple_name_json ~temp_seed)
-
-let render_tuple_arg value = render_prepared_emit_json (tuple_arg_json ~value)
-
-let render_tuple_retain_elem ~tuple ~index =
-  render_prepared_emit_json
-    (tuple_retain_elem_json ~tuple ~index:(string_of_int index))
-
-let render_tuple_field_element ~tuple ~field =
-  render_prepared_emit_json (tuple_field_element_json ~tuple ~field)
-
-let render_tuple_field_element_at ~tuple_tmp ~index =
-  render_tuple_field_element ~tuple:tuple_tmp ~field:(string_of_int index)
-
 type emit_node =
-  | PreparedEmitJson of string
   | DictIterHeader of { dict : string; source : core; index : string }
   | DictIterSlotBinding of { slot : string; dict : string; index : string }
   | DictIterDeletedSlotGuard of { slot : string }
@@ -318,7 +90,7 @@ type emit_node =
   | ListHandoff of { result : core; handoff : list_handoff }
   | ListConstruct of list_construct
   | ListStore of {
-      runtime : list_store_runtime;
+      runtime : Core_emit_blorp_prepared_backend.list_store_runtime;
       list : core;
       index : core;
       value : core;
@@ -384,7 +156,8 @@ type emit_node =
       function_name : string;
       value : core;
       dims : core list;
-      fill_value_policy : tensor_fill_value_policy;
+      fill_value_policy :
+        Core_emit_blorp_prepared_backend.tensor_fill_value_policy;
     }
   | TensorRawRead of tensor_raw_read
   | TensorRawWriteExpr of tensor_raw_write
@@ -431,7 +204,7 @@ type emit_node =
       abi : Core_layout_type.generated_stack_option_get_abi;
       dict : core;
       key : core;
-      key_release_policy : key_release_policy;
+      key_release_policy : Core_emit_blorp_prepared_backend.key_release_policy;
     }
   | DictConstructStorage of {
       ctor_arg : string;
@@ -447,9 +220,10 @@ type emit_node =
     }
   | DictConstructResult of { ctor_arg : string; value_needs_release : bool }
   | ChannelAllocWithElemRelease of core
-  | ChannelRetainingSend of channel_retaining_send
-  | ChannelSendAttempt of channel_send_attempt
-  | ChannelRecvAttempt of channel_recv_attempt
+  | ChannelRetainingSend of
+      Core_emit_blorp_prepared_backend.channel_retaining_send
+  | ChannelSendAttempt of Core_emit_blorp_prepared_backend.channel_send_attempt
+  | ChannelRecvAttempt of Core_emit_blorp_prepared_backend.channel_recv_attempt
   | ChannelIterReleaseObject of { value : string }
   | ChannelIterHeader of { channel : string; source : core; value : string }
   | SelectArmsDecl of { arms : string; arm_count : int }
@@ -468,39 +242,9 @@ type emit_node =
     }
   | SelectCleanupPop of { value_slot : string }
   | SelectReceivedValueBinding of { binding : string; result : string }
-  | SetAlloc of set_constructor_call
+  | SetAlloc of Core_emit_blorp_prepared_backend.set_constructor_call
   | SetIterHeader of { set : string; source : core; entry : string }
   | SetIterRelease of { set : string }
-
-let render_set_iter_entry_key ~entry =
-  Core_emit_blorp_prepared_backend.render_set_iter_entry_key ~entry
-
-let prepared_list_store_runtime = function
-  | ListSetRawStore -> Core_emit_blorp_prepared_backend.ListSetRaw
-  | ListHandoffSetOwnedStore ->
-      Core_emit_blorp_prepared_backend.ListHandoffSetOwned
-
-let render_dict_constructor =
-  Core_emit_blorp_prepared_backend.render_dict_constructor
-
-let render_set_constructor =
-  Core_emit_blorp_prepared_backend.render_set_constructor
-
-let render_dict_capacity_constructor emitters ctx ctor =
-  Core_emit_blorp_prepared_backend.render_dict_capacity_constructor
-    ~emit_expr:emitters.emit_expr ctx ctor
-
-let list_runtime_storage_args layout =
-  Core_emit_blorp_prepared_backend.list_runtime_storage_args layout
-
-let list_elem_release_arg ~loc layout =
-  Core_emit_blorp_prepared_backend.list_elem_release_arg ~loc layout
-
-let tensor_runtime_storage_args layout =
-  Core_emit_blorp_prepared_backend.tensor_runtime_storage_args layout
-
-let tensor_callback_result_encoding_arg layout =
-  Core_emit_blorp_prepared_backend.tensor_callback_result_encoding_arg layout
 
 let emit_list_handoff emitters ctx result handoff =
   let source_c =
@@ -526,9 +270,12 @@ let emit_list_handoff emitters ctx result handoff =
   let source_ty_c = emitters.type_to_c ctx handoff.lh_source_ty in
   let result_ty_c = emitters.type_to_c ctx handoff.lh_result_ty in
   let storage_mode_c, elem_size_c =
-    list_runtime_storage_args handoff.lh_layout
+    Core_emit_blorp_prepared_backend.list_runtime_storage_args handoff.lh_layout
   in
-  let release_fn_c = list_elem_release_arg ~loc:result.loc handoff.lh_layout in
+  let release_fn_c =
+    Core_emit_blorp_prepared_backend.list_elem_release_arg ~loc:result.loc
+      handoff.lh_layout
+  in
   Core_emit_blorp_prepared_backend.emit_list_handoff_open
     ~emit_expr:emitters.emit_expr ctx ~source_ty_c ~source_c handoff.lh_source
     ~capacity_c handoff.lh_capacity ~length_c ~release_c ~release_fn_c;
@@ -552,8 +299,6 @@ let emit_list_handoff emitters ctx result handoff =
   Core_emit_blorp_prepared_backend.emit_list_handoff_close ctx ~result_c
 
 let emit emitters ctx = function
-  | PreparedEmitJson json ->
-      Core_emit_context.emit ctx (render_prepared_emit_json json)
   | DictIterHeader { dict; source; index } ->
       Core_emit_blorp_prepared_backend.emit_dict_iter_header
         ~emit_expr:emitters.emit_expr ctx ~dict ~index source
@@ -634,8 +379,7 @@ let emit emitters ctx = function
   | ListStore { runtime; list; index; value } ->
       Core_emit_blorp_prepared_backend.emit_list_store
         ~emit_expr:emitters.emit_expr ~emit_boxed:emitters.emit_boxed_core ctx
-        (prepared_list_store_runtime runtime)
-        list index value
+        runtime list index value
   | ListHandoffSetSourceSlot { result; out_index; source; source_index } ->
       Core_emit_blorp_prepared_backend.emit_list_handoff_set_source_slot
         ~emit_expr:emitters.emit_expr ctx result out_index source source_index
@@ -865,7 +609,9 @@ let emit emitters ctx = function
   | SelectReceivedValueBinding { binding; result } ->
       Core_emit_blorp_prepared_backend.emit_select_received_value_binding ctx
         ~binding ~result
-  | SetAlloc ctor -> Core_emit_context.emit ctx (render_set_constructor ctor)
+  | SetAlloc ctor ->
+      Core_emit_context.emit ctx
+        (Core_emit_blorp_prepared_backend.render_set_constructor ctor)
   | SetIterHeader { set; source; entry } ->
       Core_emit_blorp_prepared_backend.emit_set_iter_header
         ~emit_expr:emitters.emit_expr ctx ~set ~entry source

@@ -5,7 +5,10 @@ import:
 		BridgeAction(
 			CompileSourceAction,
 			EmitCAction,
+			LowerAndCompileAction,
+			PrepareAndEmitCAction,
 			RenderAction,
+			RenderManyAction,
 			RunCorePipelineAction,
 			TypecheckAndCompileAction,
 		),
@@ -26,7 +29,7 @@ import:
 		bridge_success_response,
 		decode_bridge_envelope,
 		parse_bridge_action,
-	json: JsonValue(JsonBool, JsonNumber, JsonObject, JsonString), as_bool, as_string, get_field
+	json: JsonValue(JsonBool, JsonObject, JsonString), as_bool, as_string, get_field
 	test: TestSuite
 
 
@@ -41,25 +44,56 @@ func action_round_trip(name: String, action: BridgeAction) -> Bool:
 func test_action_names_are_stable() -> Bool:
 	(
 		action_round_trip("render", RenderAction)
+		and action_round_trip("render_many", RenderManyAction)
 		and action_round_trip("emit_c", EmitCAction)
+		and action_round_trip("prepare_and_emit_c", PrepareAndEmitCAction)
 		and action_round_trip("run_core_pipeline", RunCorePipelineAction)
+		and action_round_trip("lower_and_compile", LowerAndCompileAction)
 		and action_round_trip("typecheck_and_compile", TypecheckAndCompileAction)
 		and action_round_trip("compile_source", CompileSourceAction)
 	)
 
 
 func test_decode_current_compile_source_envelope() -> Bool:
-	source: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"compile_source\"," + "\"filename\":\"main.brp\",\"source\":\"func main(args: List[String]):\\n\\t0\"}"
+	source: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"compile_source\"," + "\"payload\":{\"filename\":\"main.brp\",\"source\":\"func main(args: List[String]):\\n\\t0\"}}"
 
 	match decode_bridge_envelope(source):
 		Ok(envelope):
-			(
-				envelope.schema == BRIDGE_SCHEMA_VERSION
-				and envelope.domain == BRIDGE_DOMAIN
-				and envelope.action == CompileSourceAction
-				and envelope.action_name == "compile_source"
-			)
-		Err(_):
+			match get_field(envelope.payload, "filename"):
+				Some(filename_value):
+					match as_string(filename_value):
+						Some(filename):
+							match get_field(envelope.payload, "source"):
+								Some(source_value):
+									match as_string(source_value):
+										Some(source_text):
+											(
+												envelope.schema == BRIDGE_SCHEMA_VERSION
+												and envelope.domain == BRIDGE_DOMAIN
+												and envelope.action == CompileSourceAction
+												and envelope.action_name == "compile_source"
+												and filename == "main.brp"
+												and source_text.contains("func main")
+											)
+										None:
+											False
+								None:
+									False
+						None:
+							False
+				None:
+					False
+		Err(InvalidJson(message)):
+			False
+		Err(MissingField(field_name)):
+			False
+		Err(ExpectedField(field_name, expected)):
+			False
+		Err(UnsupportedSchema(schema)):
+			False
+		Err(UnsupportedDomain(domain)):
+			False
+		Err(UnsupportedAction(action)):
 			False
 
 
@@ -114,6 +148,22 @@ func test_decode_errors_are_typed() -> Bool:
 		_:
 			False
 
+	missing_payload_ok: Bool = match decode_bridge_envelope(
+		"{\"schema\":1,\"domain\":\"compiler\",\"action\":\"compile_source\"}",
+	):
+		Err(MissingField(field_name)):
+			field_name == "payload"
+		_:
+			False
+
+	wrong_payload_type_ok: Bool = match decode_bridge_envelope(
+		"{\"schema\":1,\"domain\":\"compiler\",\"action\":\"compile_source\",\"payload\":true}",
+	):
+		Err(ExpectedField(field_name, expected)):
+			field_name == "payload" and expected == "an object"
+		_:
+			False
+
 	invalid_json_ok: Bool = match decode_bridge_envelope("{not json"):
 		Err(InvalidJson(message)):
 			message.length() > 0
@@ -133,6 +183,8 @@ func test_decode_errors_are_typed() -> Bool:
 		and wrong_schema_ok
 		and wrong_domain_ok
 		and wrong_action_ok
+		and missing_payload_ok
+		and wrong_payload_type_ok
 		and invalid_json_ok
 		and wrong_type_ok
 	)

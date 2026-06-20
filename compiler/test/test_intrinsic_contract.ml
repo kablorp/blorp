@@ -120,8 +120,17 @@ let emit_intrinsic_names () : string list =
     else scan (i + 1)
   in
   scan 0;
-  List.sort_uniq String.compare
-    (!names @ Core_emit_blorp_backend.intrinsic_names ())
+  let blorp_template_names =
+    match
+      Compiler_blorp_bridge.manifest_for_renderer
+        Compiler_blorp_bridge.intrinsic_renderer
+    with
+    | Ok manifest ->
+        Lazy.force manifest.Core_emit_blorp_template.templates
+        |> List.map (fun template -> template.Core_emit_blorp_template.name)
+    | Error (_, message) -> Alcotest.fail message
+  in
+  List.sort_uniq String.compare (!names @ blorp_template_names)
 
 (* ============================================================================
    Tests

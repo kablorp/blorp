@@ -10,27 +10,37 @@ import:
 	codegen_prepared_list_renderer as PreparedList
 	codegen_prepared_tensor_renderer as PreparedTensor
 	codegen_prepared_tuple_renderer as PreparedTuple
-	codegen_static_constant_renderer as StaticConstant
+	compiler_artifact_json: c_artifact_error_to_string, c_artifact_to_json, decode_c_artifact_json
 	compiler_bridge_protocol:
 		BRIDGE_SCHEMA_VERSION,
-		BridgeAction(ListOpsAction, RenderAction, RenderManyAction, TemplateArityAction),
+		BridgeAction(
+			CompileSourceAction,
+			EmitCAction,
+			LowerAndCompileAction,
+			PrepareAndEmitCAction,
+			RenderAction,
+			RenderManyAction,
+			RunCorePipelineAction,
+			TypecheckAndCompileAction,
+		),
 		BridgeEnvelope,
 		BridgeProtocolError(InvalidJson),
 		bridge_action_name,
 		bridge_error_json,
+		bridge_success_json,
 		decode_bridge_envelope_value,
 	core_fairness_policy as CoreFairness
 	json:
-		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
+		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
 		as_string,
 		get_field,
 		parse_json,
 	language_surface_manifest as LanguageSurface
+	string: string as make_string
 
 
 enum BridgeRenderer:
-	StaticConstantRenderer
 	IntrinsicRenderer
 	PreparedBackendRenderer
 	PreparedListRenderer
@@ -53,8 +63,50 @@ union BridgeDispatchError:
 	ExpectedRequestField(String, String)
 	UnsupportedRenderer(String)
 	UnsupportedBridgeAction(BridgeAction)
-	UnsupportedOp(String)
+	ArtifactJsonFailure(String)
 	RenderFailure(String)
+
+
+private pure func owned_string(text: String) -> String:
+	var result: String = make_string(text.length())
+	var i: Int = 0
+
+	while i < text.length():
+		match text.get(i):
+			Some(c):
+				result = result.append_char(c)
+			None:
+				void
+
+		i += 1
+
+	result
+
+
+private pure func owned_json(value: JsonValue) -> JsonValue:
+	match value:
+		JsonNull:
+			JsonNull
+		JsonBool(flag):
+			JsonBool(flag)
+		JsonNumber(number):
+			JsonNumber(number)
+		JsonString(text):
+			JsonString(owned_string(text))
+		JsonVector(items):
+			var owned_items: List[JsonValue] = []
+
+			for item in items:
+				owned_items = owned_items.append(owned_json(item))
+
+			JsonVector(owned_items)
+		JsonObject(fields):
+			var owned_fields: List[(String, JsonValue)] = []
+
+			for field in fields:
+				owned_fields = owned_fields.append((owned_string(field[0]), owned_json(field[1])))
+
+			JsonObject(owned_fields)
 
 
 private pure func schema_json() -> JsonValue:
@@ -62,7 +114,12 @@ private pure func schema_json() -> JsonValue:
 
 
 private pure func success_json(fields: List[(String, JsonValue)]) -> JsonValue:
-	JsonObject([("schema", schema_json()), ("ok", JsonBool(True))].concat(fields))
+	var result: List[(String, JsonValue)] = [("schema", schema_json()), ("ok", JsonBool(True))]
+
+	for field in fields:
+		result = result.append((owned_string(field[0]), owned_json(field[1])))
+
+	JsonObject(result)
 
 
 private pure func dispatch_error_code(error: BridgeDispatchError) -> String:
@@ -77,8 +134,8 @@ private pure func dispatch_error_code(error: BridgeDispatchError) -> String:
 			"unsupported_renderer"
 		UnsupportedBridgeAction(_):
 			"unsupported_action"
-		UnsupportedOp(_):
-			"unsupported_op"
+		ArtifactJsonFailure(_):
+			"invalid_request"
 		RenderFailure(_):
 			"render_error"
 
@@ -95,8 +152,8 @@ private pure func dispatch_error_message(error: BridgeDispatchError) -> String:
 			"unsupported Blorp renderer: " + renderer
 		UnsupportedBridgeAction(action):
 			"unsupported Blorp bridge renderer action: " + bridge_action_name(action)
-		UnsupportedOp(op):
-			"unsupported Blorp renderer op: " + op
+		ArtifactJsonFailure(message):
+			message
 		RenderFailure(message):
 			message
 
@@ -114,8 +171,6 @@ private pure func dispatch_error_json(error: BridgeDispatchError) -> JsonValue:
 
 private pure func parse_renderer(name: String) -> Result[BridgeRenderer, BridgeDispatchError]:
 	match name:
-		"static_constant":
-			Ok(StaticConstantRenderer)
 		"intrinsic":
 			Ok(IntrinsicRenderer)
 		"prepared_backend":
@@ -136,12 +191,8 @@ private pure func parse_renderer(name: String) -> Result[BridgeRenderer, BridgeD
 			Err(UnsupportedRenderer(name))
 
 
-private pure func request_body(root: JsonValue, envelope: BridgeEnvelope) -> JsonValue:
-	match get_field(root, "payload"):
-		Some(_):
-			envelope.payload
-		None:
-			root
+private pure func request_body(envelope: BridgeEnvelope) -> JsonValue:
+	envelope.payload
 
 
 private pure func string_field(
@@ -152,7 +203,7 @@ private pure func string_field(
 		Some(field):
 			match as_string(field):
 				Some(text):
-					Ok(text)
+					Ok(owned_string(text))
 				None:
 					Err(ExpectedRequestField(field_name, "a string"))
 		None:
@@ -177,7 +228,7 @@ private pure func string_array_field(
 							None:
 								match as_string(item):
 									Some(text):
-										result = result.append(text)
+										result = result.append(owned_string(text))
 									None:
 										error = Some(
 											ExpectedRequestField(
@@ -253,12 +304,6 @@ private pure func render_with(
 	args: List[String],
 ) -> Result[String, BridgeDispatchError]:
 	match renderer:
-		StaticConstantRenderer:
-			match StaticConstant.render_static_constant(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(StaticConstant.render_error_to_string(error)))
 		IntrinsicRenderer:
 			match Intrinsic.render_intrinsic(op, args):
 				Ok(text):
@@ -309,96 +354,13 @@ private pure func render_with(
 					Err(RenderFailure(LanguageSurface.render_error_to_string(error)))
 
 
-private pure func renderer_names(renderer: BridgeRenderer) -> List[String]:
-	match renderer:
-		StaticConstantRenderer:
-			StaticConstant.TEMPLATE_NAMES
-		IntrinsicRenderer:
-			Intrinsic.INTRINSIC_NAMES
-		PreparedBackendRenderer:
-			PreparedBackend.TEMPLATE_NAMES
-		PreparedListRenderer:
-			PreparedList.TEMPLATE_NAMES
-		PreparedTensorRenderer:
-			PreparedTensor.TEMPLATE_NAMES
-		PreparedConstructorRenderer:
-			PreparedConstructor.TEMPLATE_NAMES
-		PreparedTupleRenderer:
-			PreparedTuple.TEMPLATE_NAMES
-		CoreFairnessRenderer:
-			CoreFairness.TEMPLATE_NAMES
-		LanguageSurfaceRenderer:
-			LanguageSurface.TEMPLATE_NAMES
-
-
-private pure func renderer_arity(
-	renderer: BridgeRenderer,
-	op: String,
-) -> Result[Int, BridgeDispatchError]:
-	match renderer:
-		StaticConstantRenderer:
-			match StaticConstant.parse_static_constant_template(op):
-				Some(info):
-					Ok(StaticConstant.static_constant_template_arity(info))
-				None:
-					Err(UnsupportedOp(op))
-		IntrinsicRenderer:
-			match Intrinsic.parse_intrinsic(op):
-				Some(intrinsic):
-					Ok(Intrinsic.intrinsic_arity(intrinsic))
-				None:
-					Err(UnsupportedOp(op))
-		PreparedBackendRenderer:
-			match PreparedBackend.parse_prepared_backend_template(op):
-				Some(info):
-					Ok(PreparedBackend.prepared_backend_template_arity(info))
-				None:
-					Err(UnsupportedOp(op))
-		PreparedListRenderer:
-			match PreparedList.parse_prepared_list_template(op):
-				Some(info):
-					Ok(PreparedList.prepared_list_template_arity(info))
-				None:
-					Err(UnsupportedOp(op))
-		PreparedTensorRenderer:
-			match PreparedTensor.parse_prepared_tensor_template(op):
-				Some(info):
-					Ok(PreparedTensor.prepared_tensor_template_arity(info))
-				None:
-					Err(UnsupportedOp(op))
-		PreparedConstructorRenderer:
-			match PreparedConstructor.parse_prepared_constructor_template(op):
-				Some(info):
-					Ok(PreparedConstructor.prepared_constructor_template_arity(info))
-				None:
-					Err(UnsupportedOp(op))
-		PreparedTupleRenderer:
-			match PreparedTuple.parse_prepared_tuple_template(op):
-				Some(info):
-					Ok(PreparedTuple.prepared_tuple_template_arity(info))
-				None:
-					Err(UnsupportedOp(op))
-		CoreFairnessRenderer:
-			match CoreFairness.parse_fairness_template(op):
-				Some(info):
-					Ok(CoreFairness.fairness_template_arity(info))
-				None:
-					Err(UnsupportedOp(op))
-		LanguageSurfaceRenderer:
-			match LanguageSurface.parse_language_surface_template(op):
-				Some(info):
-					Ok(LanguageSurface.language_surface_template_arity(info))
-				None:
-					Err(UnsupportedOp(op))
-
-
 private pure func handle_render(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
 	renderer ?= renderer_from_request(body)
 	op ?= string_field(body, "op")
 	args ?= string_array_field(body, "args")
 	text ?= render_with(renderer, op, args)
 
-	Ok(success_json([("text", JsonString(text))]))
+	Ok(success_json([("text", JsonString(owned_string(text)))]))
 
 
 private pure func rendered_item_json(
@@ -407,7 +369,10 @@ private pure func rendered_item_json(
 ) -> Result[JsonValue, BridgeDispatchError]:
 	text ?= render_with(renderer, item.op, item.args)
 
-	Ok(JsonObject([("op", JsonString(item.op)), ("text", JsonString(text))]))
+	Ok(JsonObject([
+		("op", JsonString(owned_string(item.op))),
+		("text", JsonString(owned_string(text))),
+	]))
 
 
 private pure func handle_render_many(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
@@ -434,44 +399,42 @@ private pure func handle_render_many(body: JsonValue) -> Result[JsonValue, Bridg
 			Ok(success_json([("items", JsonVector(rendered))]))
 
 
-private pure func handle_list_ops(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
-	renderer ?= renderer_from_request(body)
-	names: List[JsonValue] = renderer_names(renderer).map(func(name: String): JsonString(name))
-
-	Ok(success_json([("names", JsonVector(names))]))
-
-
-private pure func handle_template_arity(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
-	renderer ?= renderer_from_request(body)
-	op ?= string_field(body, "op")
-	arity ?= renderer_arity(renderer, op)
-
-	Ok(success_json([("arity", JsonNumber(to_float(arity)))]))
+private pure func handle_emit_c(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
+	match decode_c_artifact_json(body):
+		Ok(artifact):
+			Ok(bridge_success_json(c_artifact_to_json(artifact)))
+		Err(error):
+			Err(ArtifactJsonFailure(c_artifact_error_to_string(error)))
 
 
 private pure func handle_envelope(
-	root: JsonValue,
 	envelope: BridgeEnvelope,
 ) -> Result[JsonValue, BridgeDispatchError]:
-	body: JsonValue = request_body(root, envelope)
+	body: JsonValue = request_body(envelope)
 
 	match envelope.action:
 		RenderAction:
 			handle_render(body)
 		RenderManyAction:
 			handle_render_many(body)
-		ListOpsAction:
-			handle_list_ops(body)
-		TemplateArityAction:
-			handle_template_arity(body)
-		_:
+		EmitCAction:
+			handle_emit_c(body)
+		PrepareAndEmitCAction:
+			Err(UnsupportedBridgeAction(envelope.action))
+		RunCorePipelineAction:
+			Err(UnsupportedBridgeAction(envelope.action))
+		LowerAndCompileAction:
+			Err(UnsupportedBridgeAction(envelope.action))
+		TypecheckAndCompileAction:
+			Err(UnsupportedBridgeAction(envelope.action))
+		CompileSourceAction:
 			Err(UnsupportedBridgeAction(envelope.action))
 
 
 pure func handle_request_value(root: JsonValue) -> JsonValue:
 	match decode_bridge_envelope_value(root):
 		Ok(envelope):
-			match handle_envelope(root, envelope):
+			match handle_envelope(envelope):
 				Ok(response):
 					response
 				Err(error):

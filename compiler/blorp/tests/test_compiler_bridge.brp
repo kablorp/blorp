@@ -1,10 +1,9 @@
 import:
 	../compiler_bridge: handle_request
 	json:
-		JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector),
+		JsonValue(JsonBool, JsonObject, JsonString, JsonVector),
 		as_array,
 		as_bool,
-		as_number,
 		as_string,
 		get_field,
 		parse_json,
@@ -43,46 +42,12 @@ func string_field(value: JsonValue, name: String) -> String:
 			""
 
 
-func int_field(value: JsonValue, name: String) -> Int:
-	match get_field(value, name):
-		Some(field):
-			match as_number(field):
-				Some(number):
-					to_int(number)
-				None:
-					0
-		None:
-			0
-
-
 func error_code(value: JsonValue) -> String:
 	match get_field(value, "error"):
 		Some(error):
 			string_field(error, "code")
 		None:
 			""
-
-
-func names_contain(value: JsonValue, expected: String) -> Bool:
-	match get_field(value, "names"):
-		Some(names_value):
-			match as_array(names_value):
-				Some(names):
-					var found: Bool = False
-
-					for item in names:
-						match as_string(item):
-							Some(name):
-								if name == expected:
-									found = True
-							None:
-								void
-
-					found
-				None:
-					False
-		None:
-			False
 
 
 func first_rendered_item_text(value: JsonValue) -> String:
@@ -101,20 +66,28 @@ func first_rendered_item_text(value: JsonValue) -> String:
 			""
 
 
-func test_render_static_constant_request() -> Bool:
-	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"render\"," + "\"renderer\":\"static_constant\",\"op\":\"static_string_global_pointer\"," + "\"args\":[\"GREETING\",\"__blorp_static_string_GREETING\"]}"
-
-	match response_value(request):
-		Some(response):
-			(
-				bool_field(response, "ok")
-				and string_field(
-					response,
-					"text",
-				) == "static blorp_String* GREETING = (blorp_String*)&__blorp_static_string_GREETING;"
-			)
+func artifact_string_field(value: JsonValue, name: String) -> String:
+	match get_field(value, "artifact"):
+		Some(artifact):
+			string_field(artifact, name)
 		None:
-			False
+			""
+
+
+func artifact_array_length(value: JsonValue, name: String) -> Int:
+	match get_field(value, "artifact"):
+		Some(artifact):
+			match get_field(artifact, name):
+				Some(field):
+					match as_array(field):
+						Some(items):
+							items.length()
+						None:
+							-1
+				None:
+					-1
+		None:
+			-1
 
 
 func test_render_payload_request() -> Bool:
@@ -128,7 +101,7 @@ func test_render_payload_request() -> Bool:
 
 
 func test_render_many_request() -> Bool:
-	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"render_many\"," + "\"renderer\":\"prepared_tuple\",\"items\":[" + "{\"op\":\"backend_tuple_name\",\"args\":[\"2\"]}," + "{\"op\":\"backend_tuple_arg\",\"args\":[\"value\"]}]}"
+	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"render_many\"," + "\"payload\":{\"renderer\":\"prepared_tuple\",\"items\":[" + "{\"op\":\"backend_tuple_name\",\"args\":[\"2\"]}," + "{\"op\":\"backend_tuple_arg\",\"args\":[\"value\"]}]}}"
 
 	match response_value(request):
 		Some(response):
@@ -137,33 +110,53 @@ func test_render_many_request() -> Bool:
 			False
 
 
-func test_list_ops_request() -> Bool:
-	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"list_ops\"," + "\"renderer\":\"language_surface\"}"
+func test_render_prepared_list_checked_load_request() -> Bool:
+	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"render\"," + "\"payload\":{\"renderer\":\"prepared_list\",\"op\":\"list_inline_struct_load_checked\"," + "\"args\":[\"__list\",\"__idx\",\"__out\",\"0\",\"Small\"]}}"
 
 	match response_value(request):
 		Some(response):
-			(
-				bool_field(response, "ok")
-				and names_contain(response, "language_lsp_completion_keywords")
+			bool_field(response, "ok") and string_field(response, "text") == (
+				"if (__builtin_expect(!__list || __idx < 0 || __idx >= __list->len, 0)) { "
+				+ "memset(&__out, 0, sizeof(Small)); } else if (__list->storage_mode == "
+				+ "BLORP_LIST_STORAGE_INLINE && __list->elem_size == (int16_t)sizeof(Small)) { "
+				+ "memcpy(&__out, (char*)__list->data + __idx * sizeof(Small), sizeof(Small)); } "
+				+ "else { void* __lg_raw_0 = blorp_list_get(__list, __idx); if (!__lg_raw_0) { "
+				+ "memset(&__out, 0, sizeof(Small)); } else { __out = "
+				+ "blorp_unbox_struct(__lg_raw_0, Small); } }"
 			)
 		None:
 			False
 
 
-func test_template_arity_request() -> Bool:
-	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"template_arity\"," + "\"renderer\":\"prepared_tuple\",\"op\":\"backend_tuple_construct\"}"
+func test_emit_c_artifact_payload_request() -> Bool:
+	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"emit_c\"," + "\"payload\":{\"c_code\":\"int main(void) { return 0; }\\n\"," + "\"link_flags\":[\"-lm\"],\"include_dirs\":[\"runtime/include\"]}}"
 
 	match response_value(request):
 		Some(response):
-			bool_field(response, "ok") and int_field(response, "arity") == 2
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "c_code").contains("return 0")
+				and artifact_array_length(response, "link_flags") == 1
+				and artifact_array_length(response, "include_dirs") == 1
+			)
+		None:
+			False
+
+
+func test_emit_c_rejects_invalid_artifact_payload() -> Bool:
+	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"emit_c\"," + "\"payload\":{\"c_code\":false,\"link_flags\":[],\"include_dirs\":[]}}"
+
+	match response_value(request):
+		Some(response):
+			not bool_field(response, "ok") and error_code(response) == "invalid_request"
 		None:
 			False
 
 
 func test_dispatch_errors_are_structured() -> Bool:
-	bad_renderer: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"list_ops\"," + "\"renderer\":\"missing\"}"
+	bad_renderer: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"render\"," + "\"payload\":{\"renderer\":\"missing\",\"op\":\"whatever\",\"args\":[]}}"
 
-	bad_op: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"template_arity\"," + "\"renderer\":\"prepared_tuple\",\"op\":\"missing\"}"
+	bad_op: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"render\"," + "\"payload\":{\"renderer\":\"prepared_tuple\",\"op\":\"missing\",\"args\":[]}}"
 
 	bad_renderer_ok: Bool = match response_value(bad_renderer):
 		Some(response):
@@ -173,21 +166,62 @@ func test_dispatch_errors_are_structured() -> Bool:
 
 	bad_op_ok: Bool = match response_value(bad_op):
 		Some(response):
-			not bool_field(response, "ok") and error_code(response) == "unsupported_op"
+			not bool_field(response, "ok") and error_code(response) == "render_error"
 		None:
 			False
 
 	bad_renderer_ok and bad_op_ok
 
 
+func test_legacy_top_level_renderer_fields_are_rejected() -> Bool:
+	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"render\"," + "\"renderer\":\"prepared_tuple\",\"op\":\"backend_tuple_name\",\"args\":[\"2\"]}"
+
+	match response_value(request):
+		Some(response):
+			not bool_field(response, "ok") and error_code(response) == "invalid_request"
+		None:
+			False
+
+
+func test_future_stage_actions_are_explicitly_unsupported() -> Bool:
+	(
+		unsupported_action_ok("prepare_and_emit_c")
+		and unsupported_action_ok("run_core_pipeline")
+		and unsupported_action_ok("lower_and_compile")
+		and unsupported_action_ok("typecheck_and_compile")
+		and unsupported_action_ok("compile_source")
+	)
+
+
+func unsupported_action_ok(action: String) -> Bool:
+	request: String = "{\"schema\":1,\"domain\":\"compiler\",\"action\":\"" + action + "\"," + "\"payload\":{\"core\":\"{}\"}}"
+
+	match response_value(request):
+		Some(response):
+			not bool_field(response, "ok") and error_code(response) == "unsupported_action"
+		None:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler bridge dispatcher",
 	tests = [
-		("render static constant request", test_render_static_constant_request),
 		("render payload request", test_render_payload_request),
 		("render many request", test_render_many_request),
-		("list ops request", test_list_ops_request),
-		("template arity request", test_template_arity_request),
+		(
+			"render prepared list checked load request",
+			test_render_prepared_list_checked_load_request,
+		),
+		("emit_c artifact payload request", test_emit_c_artifact_payload_request),
+		("emit_c rejects invalid artifact payload", test_emit_c_rejects_invalid_artifact_payload),
 		("dispatch errors are structured", test_dispatch_errors_are_structured),
+		(
+			"legacy top level renderer fields are rejected",
+			test_legacy_top_level_renderer_fields_are_rejected,
+		),
+		(
+			"future stage actions are explicitly unsupported",
+			test_future_stage_actions_are_explicitly_unsupported,
+		),
 	]
 }

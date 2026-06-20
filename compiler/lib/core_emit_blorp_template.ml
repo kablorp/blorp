@@ -56,11 +56,6 @@ let create ?(initial_size = 8) ~label manifest_tsv =
   in
   { label; templates; table }
 
-let names manifest =
-  Lazy.force manifest.templates
-  |> List.map (fun template -> template.name)
-  |> List.sort_uniq String.compare
-
 let find manifest name = Hashtbl.find_opt (Lazy.force manifest.table) name
 
 let render_arg ~emit_expr (ctx : Core_emit_context.t) arg =
@@ -138,6 +133,3 @@ let render_exn manifest name args =
   | Some template -> substitute template args
   | None ->
       invalid_arg (Printf.sprintf "missing %s template %S" manifest.label name)
-
-let emit manifest ctx name args =
-  Core_emit_context.emit ctx (render_exn manifest name args)

@@ -721,7 +721,7 @@ run_unit() {
 run_compiler() {
     echo "═══ Compiler Tests (should_pass/should_fail + codegen audit) ═══"
     echo ""
-    local output exit_code output_file start_seconds
+    local output exit_code output_file blorp_output_file blorp_exit_code start_seconds
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler.XXXXXX") || exit 1
     if $verbose || [ -n "$log_dir" ]; then
@@ -730,6 +730,21 @@ run_compiler() {
         capture_stream "$output_file" tests/test_compiler/run_compiler_tests.sh --quiet
     fi
     exit_code=$?
+    if [ $exit_code -eq 0 ] && [ -d compiler/blorp/tests ]; then
+        {
+            echo ""
+            echo "═══ Compiler Blorp TestSuites (.brp) ═══"
+            echo ""
+        } >> "$output_file"
+        blorp_output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler_blorp.XXXXXX") || exit 1
+        capture_stream "$blorp_output_file" env BLORP_GATE_RESULT=compiler_blorp ./blorp test --no-format --timeout "$test_timeout" compiler/blorp/tests/
+        blorp_exit_code=$?
+        cat "$blorp_output_file" >> "$output_file"
+        rm -f "$blorp_output_file"
+        if [ $blorp_exit_code -ne 0 ]; then
+            exit_code=$blorp_exit_code
+        fi
+    fi
     output=$(cat "$output_file")
     record_gate_log "compiler" "$output_file"
     maybe_print_failure_excerpt "compiler" "$output_file" "$exit_code"
@@ -737,6 +752,26 @@ run_compiler() {
     compiler_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_compiler "$output"
+    if echo "$output" | grep -q '^BLORP_GATE_RESULT gate=compiler_blorp '; then
+        compiler_blorp_status="SKIP"
+        compiler_blorp_passed=0
+        compiler_blorp_failed=0
+        compiler_blorp_tests=0
+        compiler_blorp_failures=""
+        parse_blorp_output "$output" "compiler_blorp"
+        compiler_passed=$((compiler_passed + compiler_blorp_passed))
+        compiler_failed=$((compiler_failed + compiler_blorp_failed))
+        compiler_tests=$((compiler_tests + compiler_blorp_tests))
+        if [ "$compiler_blorp_status" = "FAIL" ]; then
+            compiler_status="FAIL"
+            if [ -n "$compiler_failures" ] && [ -n "$compiler_blorp_failures" ]; then
+                compiler_failures="${compiler_failures}
+${compiler_blorp_failures}"
+            elif [ -n "$compiler_blorp_failures" ]; then
+                compiler_failures="$compiler_blorp_failures"
+            fi
+        fi
+    fi
     return $exit_code
 }
 

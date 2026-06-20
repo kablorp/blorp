@@ -9,10 +9,7 @@ open Core
 
 let checkpoint_at loc = Build.cooperative_checkpoint ~loc
 
-type body_start =
-  | BodyCheckpoint
-  | BodySeqCheckpoint
-  | BodyOther
+type body_start = BodyCheckpoint | BodySeqCheckpoint | BodyOther
 
 let op_of_body_start = function
   | BodyCheckpoint -> "fairness_body_checkpoint"
@@ -46,7 +43,8 @@ let body_start_kind (body : core) : body_start =
   | _ -> BodyOther
 
 let body_starts_with_checkpoint (body : core) : bool =
-  body_start_kind body |> op_of_body_start |> render_policy |> bool_of_policy_text
+  body_start_kind body |> op_of_body_start |> render_policy
+  |> bool_of_policy_text
 
 let add_loop_checkpoint (loop_loc : Ast.loc) (body : core) : core =
   if body_starts_with_checkpoint body then body

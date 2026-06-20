@@ -94,6 +94,7 @@ hygiene-check:
 	fi
 	@scripts/check-editor-drift
 	@scripts/check-std-builtins
+	@scripts/check-compiler-port-inventory
 	@if [ -e compiler/_build/default/lib/parser.conflicts ] && [ -s compiler/_build/default/lib/parser.conflicts ]; then \
 		echo "Menhir conflicts found in compiler/_build/default/lib/parser.conflicts."; \
 		echo "Inspect the conflict report before continuing."; \

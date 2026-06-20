@@ -11,7 +11,7 @@ lower-level test runners directly.
 ```bash
 scripts/test                    # all gates
 scripts/test compiler-unit      # compiler-internal OCaml/Alcotest tests
-scripts/test compiler           # compiler fixtures and codegen audit
+scripts/test compiler           # compiler fixtures, codegen audit, compiler/blorp TestSuites
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # focused leak-check baselines and leak diagnostics
 scripts/test doctest            # std doctests
@@ -117,6 +117,14 @@ Manual use:
 scripts/with-build-lock make quality
 ```
 
+## Compiler Bridge Cache
+
+Renderer requests use a compiled `compiler/blorp/compiler_bridge_cli.brp`
+helper. The helper binary is cached under `$HOME/.cache/blorp/compiler-bridge`,
+or `BLORP_COMPILER_BRIDGE_CACHE_DIR` when set. The cache key is derived from the
+production `compiler/blorp` source tree, the compiler binary, the C compiler
+identity, and the OS.
+
 ## Drift Checks
 
 `scripts/check-editor-drift` verifies that shared VSCode and IntelliJ TextMate
@@ -133,6 +141,10 @@ plugin zip before checking; pass a zip path to inspect an existing package.
 bodies use explicit identities matching their source declaration, for example
 `builtin("std/list.__unsafe_list_get")`. Bare `builtin` function bodies are not
 allowed in `std/`.
+
+`scripts/check-compiler-port-inventory` verifies the OCaml-to-Blorp compiler
+port inventory, the single hidden bridge command boundary, and the current
+direct-template access allowlist. `make hygiene-check` runs it automatically.
 
 
 ## Release Helpers

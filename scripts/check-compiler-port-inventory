@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd -P)"
+repo_root="$(cd "$script_dir/.." && pwd -P)"
+cd "$repo_root"
+
+inventory="compiler/blorp/ocaml_port_inventory.tsv"
+
+if [ ! -f "$inventory" ]; then
+    echo "Missing compiler port inventory: $inventory" >&2
+    exit 1
+fi
+
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-port-inventory.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT
+
+tracked_sources="$tmp_dir/tracked"
+inventory_paths="$tmp_dir/inventory-paths"
+
+git ls-files \
+    'compiler/lib/*.ml' \
+    'compiler/lib/*.mli' \
+    'compiler/lib/*.mll' \
+    'compiler/lib/*.mly' \
+    'compiler/bin/*.ml' \
+    'compiler/tools/*.ml' |
+    while IFS= read -r path; do
+        [ -e "$path" ] && printf '%s\n' "$path"
+    done |
+    LC_ALL=C sort > "$tracked_sources"
+
+awk -F '\t' '
+    /^#/ || NF == 0 { next }
+    NF != 2 {
+        printf "%s:%d: expected path<TAB>migration_group\n", FILENAME, FNR > "/dev/stderr"
+        bad = 1
+        next
+    }
+    $1 == "" || $2 == "" {
+        printf "%s:%d: inventory fields cannot be empty\n", FILENAME, FNR > "/dev/stderr"
+        bad = 1
+        next
+    }
+    $2 !~ /^(bridge|backend|final_core|ownership|middle_core|lowering|ctfe|type_system|parser|tools)$/ {
+        printf "%s:%d: unknown migration group `%s`\n", FILENAME, FNR, $2 > "/dev/stderr"
+        bad = 1
+    }
+    { print $1 }
+    END { if (bad) exit 1 }
+' "$inventory" | LC_ALL=C sort > "$inventory_paths"
+
+duplicates=$(awk -F '\t' '/^#/ || NF == 0 { next } { print $1 }' "$inventory" | LC_ALL=C sort | uniq -d)
+if [ -n "$duplicates" ]; then
+    echo "Duplicate paths in compiler port inventory:" >&2
+    echo "$duplicates" >&2
+    exit 1
+fi
+
+if ! diff -u "$tracked_sources" "$inventory_paths" > "$tmp_dir/inventory.diff"; then
+    echo "Compiler port inventory is out of sync." >&2
+    echo "Every tracked production OCaml source must be classified before it is merged." >&2
+    cat "$tmp_dir/inventory.diff" >&2
+    exit 1
+fi
+
+check_grep_allowlist() {
+    local label="$1"
+    local pattern="$2"
+    shift 2
+    local allowed_path line file bad
+    bad=0
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        file=${line%%:*}
+        for allowed_path in "$@"; do
+            if [ "$file" = "$allowed_path" ]; then
+                continue 2
+            fi
+        done
+        if [ "$bad" -eq 0 ]; then
+            echo "$label is outside the allowed migration boundary:" >&2
+        fi
+        echo "$line" >&2
+        bad=1
+    done < <(git grep -n -E "$pattern" -- compiler/bin compiler/lib compiler/tools || true)
+
+    if [ "$bad" -ne 0 ]; then
+        exit 1
+    fi
+}
+
+check_grep_allowlist \
+    "Hidden compiler bridge command reference" \
+    '__compiler-bridge|BLORP_COMPILER_BRIDGE_BIN|BLORP_COMPILER_RENDERER_HELPER|BLORP_COMPILER_BRIDGE_RENDERER_SOURCE|compiler_bridge_cli\.brp' \
+    compiler/bin/blorp.ml \
+    compiler/lib/compiler_blorp_bridge.ml
+
+check_grep_allowlist \
+    "Direct Blorp template manifest access" \
+    'Core_emit_blorp_[A-Za-z0-9_]*_templates|core_emit_blorp_[A-Za-z0-9_]*_templates\.tsv|Core_emit_blorp_template\.(create|render_exn|emit|find)' \
+    compiler/lib/compiler_blorp_bridge.ml \
+    compiler/lib/core_emit_blorp_template.ml \
+    compiler/lib/core_intrinsic_registry.ml
+
+echo "Compiler port inventory check passed."

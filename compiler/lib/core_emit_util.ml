@@ -724,8 +724,8 @@ let render_accessor (ctx : Core_emit_context.t) (scrut_name : string)
         in
         Printf.sprintf "%s->data.%s.field%d" cast_parent ctor idx
     | AccTupleField (parent, idx) ->
-        Core_emit_blorp_backend.render_tuple_field_element_at
-          ~tuple_tmp:(go parent) ~index:idx
+        Core_emit_blorp_prepared_backend.render_tuple_field_element
+          ~tuple:(go parent) ~field:(string_of_int idx)
     | AccListElem (parent, idx) ->
         Printf.sprintf "blorp_list_get((blorp_List*)%s, %d)" (go parent) idx
     | AccListSpread (parent, idx) ->
@@ -832,8 +832,8 @@ let render_accessor_typed (ctx : Core_emit_context.t) (scrut_name : string)
                  payload"
               "invalid field accessor on nullable managed Option"
         | _ ->
-            Core_emit_blorp_backend.render_tuple_field_element_at
-              ~tuple_tmp:(go parent) ~index:idx)
+            Core_emit_blorp_prepared_backend.render_tuple_field_element
+              ~tuple:(go parent) ~field:(string_of_int idx))
     | AccListElem (parent, idx) -> (
         match accessor_type ctx scrut_ty parent with
         | Some parent_ty when is_nullable_managed_option ctx parent_ty ->

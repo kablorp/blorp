@@ -35,9 +35,14 @@ That is the correct architectural direction, but it is still transitional:
 - OCaml still owns Core traversal, Core stage semantics, type/layout decisions,
   source parsing, module loading, inference, typecheck, diagnostics, and the
   CLI/test/LSP orchestration.
-- `blorp __compiler-bridge` accepts JSON, but `compile_source` still calls back
-  into OCaml `Pipeline.compile`.
-- Checked-in Blorp-generated manifests are still served by OCaml helper modules.
+- `blorp __compiler-bridge` accepts JSON for Blorp-owned renderer actions. Stage
+  actions such as `compile_source` are reserved in the Blorp protocol but remain
+  unsupported until Blorp owns those stages.
+- Renderer requests use the Blorp bridge command. Checked-in TSV manifests now
+  remain only as a bootstrap fallback while compiling that bridge helper.
+- The compiled renderer bridge helper is content-addressed by production
+  `compiler/blorp` source, the compiler binary, the C compiler identity, and
+  the OS.
 
 Approximate current source shape, measured from the worktree on 2026-06-19:
 
@@ -261,24 +266,36 @@ Done when:
 - `compiler_blorp_bridge` is the only cross-language compiler entry.
 - The repo has a machine-checkable inventory of remaining OCaml slices.
 
+Current guard:
+
+- `compiler/blorp/ocaml_port_inventory.tsv` classifies every tracked production
+  OCaml compiler source into a migration group.
+- `scripts/check-compiler-port-inventory` verifies that inventory, checks the
+  hidden bridge command boundary, and makes temporary direct-template access
+  exceptions explicit.
+- `make hygiene-check` runs the guard so premerge validation catches unplanned
+  OCaml compiler additions.
+
 ### Merge Point 1: Blorp-Owned Bridge Command
 
 Goal: stop serving Blorp compiler code through OCaml-generated manifests.
 
 Implementation:
 
-- Add `compiler/blorp/compiler_bridge.brp`.
+- Add `compiler/blorp/compiler_bridge.brp`. **Done.**
 - Implement JSON request decoding and response encoding in Blorp using
   `std/json.brp`.
-- Move renderer dispatch from OCaml to Blorp bridge code.
+- Move renderer dispatch from OCaml to Blorp bridge code. **Done.**
 - Keep OCaml `compiler_blorp_bridge.ml` only as subprocess client and response
   decoder.
-- Replace TSV-manifest calls with Blorp bridge actions.
+- Replace production TSV-manifest calls with Blorp bridge actions. **Done.**
+- Cache the compiled renderer bridge helper behind a content-derived key so
+  compiler/test workers do not repeatedly compile the same Blorp helper.
 
 Deletion:
 
 - Delete `*_templates.ml` files once the bridge no longer needs checked-in TSV
-  manifests.
+  manifests. **Partially done; renderer wrapper modules are gone.**
 - Delete most of `core_emit_blorp_template.ml`.
 - Delete OCaml tests that only validate TSV substitution after equivalent Blorp
   tests exist.
@@ -309,7 +326,10 @@ Implementation:
   - type expressions;
   - typed AST subset needed by Core lowering;
   - Core IR;
-  - C artifact metadata.
+  - C artifact metadata. The Blorp `CArtifact` JSON codec exists in
+    `compiler/blorp/compiler_artifact_json.brp`, and the `emit_c` bridge action
+    now validates and returns that artifact shape. The next step is to feed it
+    final Core JSON instead of a minimal artifact payload.
 - Add JSON codecs in Blorp for these types.
 - Add OCaml JSON projection only at the active transfer point.
 - Add round-trip tests for representative and edge-case values.
@@ -767,13 +787,13 @@ compiler-library test suite.
 ## Near-Term Queue
 
 1. Lock the bridge schema and add remaining bridge hygiene tests.
-2. Implement the bridge command in Blorp instead of serving Blorp-owned
-   renderer manifests from OCaml.
+2. Shrink the remaining TSV bootstrap path so `core_emit_blorp_template.ml`
+   contains only the temporary helper-build fallback or disappears entirely.
 3. Add final Core JSON fixtures and Blorp codecs for the subset needed by C
    emission.
 4. Replace snippet-level renderer calls with one `emit_c` action.
-5. Delete manifest/template OCaml once Blorp bridge dispatch is authoritative.
+5. Delete remaining manifest/template OCaml once helper bootstrap no longer
+   needs TSV manifests.
 6. Complete C emission in Blorp and delete the OCaml emitter.
 7. Move the transfer point backward to final Core preparation, then through the
    ownership tail.
-
