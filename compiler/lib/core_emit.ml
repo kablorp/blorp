@@ -2688,7 +2688,8 @@ and emit_union_reuse_construct ctx urc =
       in
       let source_arg = render_expr_arg ctx urc.urc_source in
       let arg_strings =
-        List.map (render_union_constructor_arg ctx urc.urc_type_name)
+        List.map
+          (render_union_constructor_arg ctx urc.urc_type_name)
           urc.urc_args
       in
       let release_args =

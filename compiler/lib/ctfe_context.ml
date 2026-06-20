@@ -157,13 +157,14 @@ let collect_program_functions ?module_path
     acc
     (Typed_ast.program_decls program)
 
-let collect_imported_program_functions ?(module_has_global = default_module_has_global)
-    constructor_info imported_programs =
+let collect_imported_program_functions
+    ?(module_has_global = default_module_has_global) constructor_info
+    imported_programs =
   List.fold_left
     (fun acc (module_path, program, module_alias) ->
       List.fold_left
-        (collect_imported_function ~module_path ~module_alias
-           ~module_has_global constructor_info)
+        (collect_imported_function ~module_path ~module_alias ~module_has_global
+           constructor_info)
         acc
         (Typed_ast.program_decls program))
     [] imported_programs
@@ -190,8 +191,7 @@ let of_program ?(fallback_constructor_info = fun _ -> None)
         (fun acc (module_path, imported_program, imported_module_alias) ->
           collect_program_functions ~module_path
             ~module_alias:imported_module_alias ~module_has_global
-            constructor_info
-            imported_program acc)
+            constructor_info imported_program acc)
         [] imported_programs
     in
     collect_program_functions ~module_alias ~module_has_global constructor_info
