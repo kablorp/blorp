@@ -84,6 +84,15 @@ func native_helper(x: Int) -> Int:
     ~module_origin:(Blorp.Session.package_origin "sqlite")
     ~message:"'builtin' can only be used in the standard library"
 
+let test_package_origin_rejects_foreign_decl () =
+  expect_origin_error
+    {|
+foreign(include: "math.h"):
+    func c_abs(x: Int) -> Int = "abs"
+|}
+    ~module_origin:(Blorp.Session.package_origin "sqlite")
+    ~message:"'foreign' declarations cannot be used in source packages"
+
 let test_std_origin_rejects_foreign_decl () =
   expect_origin_error
     {|
@@ -2012,6 +2021,8 @@ let suite =
       [
         Alcotest.test_case "package rejects builtin body" `Quick
           test_package_origin_rejects_builtin_body;
+        Alcotest.test_case "package rejects foreign decl" `Quick
+          test_package_origin_rejects_foreign_decl;
         Alcotest.test_case "std rejects foreign decl" `Quick
           test_std_origin_rejects_foreign_decl;
       ] );

@@ -103,8 +103,8 @@ let module_origin_allows_builtin = function
   | Package_module _ | User_module -> false
 
 let module_origin_allows_foreign = function
-  | Stdlib_module -> false
-  | Package_module _ | User_module -> true
+  | Stdlib_module | Package_module _ -> false
+  | User_module -> true
 
 let module_origin_label = function
   | Stdlib_module -> "standard library"
@@ -129,6 +129,14 @@ type parsed_module_cache_entry = {
   parsed_exports : (string * decl) list;
 }
 
+type source_package = {
+  source_package_alias : string;
+  source_package_name : string;
+  source_package_root : string;
+  source_package_source_dir : string;
+  source_package_exports : string list;
+}
+
 type type_home = UniqueTypeHome of string | AmbiguousTypeHome of string list
 
 (* ============================================================================
@@ -143,6 +151,10 @@ type t = {
       (** Explicit local package roots. A [pkg/foo/bar] import resolves to
       [<root>/foo/bar.brp] and receives [Package_module foo] origin. Bare
       imports never consult these roots. *)
+  mutable source_packages : source_package list;
+      (** Root-project source package aliases from [blorp.toml]. These are the
+      default package ecosystem aliases, distinct from the compiler-distributed
+      internal [pkg/...] roots above. *)
   module_cache : (string, loaded_module) Hashtbl.t;
       (** Canonical module name → loaded module. *)
   parse_cache : (string, parsed_module_cache_entry) Hashtbl.t;
@@ -291,6 +303,7 @@ let create () : t =
   {
     search_paths = [];
     package_roots = [];
+    source_packages = [];
     module_cache = Hashtbl.create 16;
     parse_cache = Hashtbl.create 16;
     type_index = Hashtbl.create 32;

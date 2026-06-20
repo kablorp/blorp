@@ -3482,20 +3482,30 @@ let rec first_pass (state : check_state) (decls : program) : check_state =
           let state =
             if func_is_foreign func_decl && not (state_allows_foreign state)
             then
+              let is_std = state_is_stdlib_module state in
+              let message =
+                if is_std then
+                  "'foreign' declarations cannot be used in the standard \
+                   library"
+                else "'foreign' declarations cannot be used in source packages"
+              in
+              let help =
+                if is_std then
+                  "Move optional native bindings to a pkg/ module, or \
+                   implement std functionality with Blorp source or \
+                   compiler/runtime builtins"
+                else
+                  "Source packages must be portable Blorp source; move native \
+                   bindings outside the normal package system"
+              in
               add_error state
                 {
-                  message =
-                    "'foreign' declarations cannot be used in the standard \
-                     library";
+                  message;
                   loc = decl.decl_loc;
                   phase = TypeCheck;
                   kind = OtherError;
                   notes = [];
-                  help =
-                    Some
-                      "Move optional native bindings to a pkg/ module, or \
-                       implement std functionality with Blorp source or \
-                       compiler/runtime builtins";
+                  help = Some help;
                 }
             else state
           in

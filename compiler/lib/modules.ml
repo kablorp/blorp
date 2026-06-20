@@ -63,6 +63,25 @@ let is_path_under_dir ~dir path =
   String.length path > String.length prefix
   && String.sub path 0 (String.length prefix) = prefix
 
+let relative_path_under_dir ~dir path =
+  let dir = canonical_dir dir in
+  let path = canonical_file path in
+  let prefix = dir ^ Filename.dir_sep in
+  if
+    String.length path > String.length prefix
+    && String.sub path 0 (String.length prefix) = prefix
+  then
+    Some
+      (String.sub path (String.length prefix)
+         (String.length path - String.length prefix))
+  else None
+
+let source_package_for_path (s : Session.t) path =
+  List.find_opt
+    (fun (pkg : Session.source_package) ->
+      is_path_under_dir ~dir:pkg.source_package_source_dir path)
+    s.source_packages
+
 let is_package_loaded_module (m : loaded_module) =
   Session.module_origin_is_package m.origin
 
@@ -73,10 +92,6 @@ let is_std_source_file ?sess path =
     match s.std_source_dir with
     | Some dir -> is_path_under_dir ~dir path
     | None -> false
-
-let module_origin_for_source_file ?sess path =
-  if is_std_source_file ?sess path then Session.Stdlib_module
-  else Session.User_module
 
 let normalize_module_path path =
   String.map (function '\\' -> '/' | c -> c) path
@@ -110,6 +125,30 @@ let std_module_name_for_source_file ?sess path =
               let without_ext = String.sub rel 0 (String.length rel - 4) in
               Some ("std/" ^ normalize_module_path without_ext)
 
+let source_package_module_name_for_source_file (s : Session.t) path =
+  match source_package_for_path s path with
+  | None -> None
+  | Some pkg -> (
+      match relative_path_under_dir ~dir:pkg.source_package_source_dir path with
+      | None -> None
+      | Some rel ->
+          if not (Filename.check_suffix rel ".brp") then None
+          else
+            let without_ext = String.sub rel 0 (String.length rel - 4) in
+            Some (normalize_module_path without_ext))
+
+let module_name_for_source_file ?sess path =
+  match std_module_name_for_source_file ?sess path with
+  | Some _ as name -> name
+  | None -> source_package_module_name_for_source_file (sess_of ?sess ()) path
+
+let module_origin_for_source_file ?sess path =
+  if is_std_source_file ?sess path then Session.Stdlib_module
+  else
+    match source_package_for_path (sess_of ?sess ()) path with
+    | Some pkg -> Session.package_origin pkg.source_package_alias
+    | None -> Session.User_module
+
 let is_directory path =
   try Sys.file_exists path && Sys.is_directory path with _ -> false
 
@@ -130,6 +169,23 @@ let add_package_root ?sess dir =
 
 (** Package roots configured for this session, in lookup order. *)
 let package_roots ?sess () = (sess_of ?sess ()).package_roots
+
+type source_package = Session.source_package = {
+  source_package_alias : string;
+  source_package_name : string;
+  source_package_root : string;
+  source_package_source_dir : string;
+  source_package_exports : string list;
+}
+
+let add_source_package ?sess (pkg : source_package) =
+  let s = sess_of ?sess () in
+  s.source_packages <-
+    pkg
+    :: List.filter
+         (fun existing ->
+           existing.source_package_alias <> pkg.source_package_alias)
+         s.source_packages
 
 (** Look up typed AST for a module from the module cache. *)
 let get_typed_decls ?sess name =
@@ -245,7 +301,125 @@ let package_ref_of_module_name module_name =
         Some { package_id; package_path = rest }
     | _ -> None
 
-let resolve_module_file ?sess base_dir module_name =
+let split_module_ref module_name =
+  match String.split_on_char '/' module_name with
+  | [] | [ "" ] -> None
+  | head :: rest when head <> "" -> Some (head, String.concat "/" rest)
+  | _ -> None
+
+let source_package_for_base_dir (s : Session.t) base_dir =
+  source_package_for_path s base_dir
+
+let source_package_origin_for_relative_target (s : Session.t) base_dir candidate
+    =
+  match source_package_for_base_dir s base_dir with
+  | None -> Some Session.User_module
+  | Some pkg ->
+      if is_path_under_dir ~dir:pkg.source_package_source_dir candidate then
+        Some (Session.package_origin pkg.source_package_alias)
+      else None
+
+let source_package_module_file source_dir module_path =
+  let with_ext name =
+    if Filename.check_suffix name ".brp" then name else name ^ ".brp"
+  in
+  with_ext (Filename.concat source_dir (normalize_module_path module_path))
+
+let resolve_source_package_internal_import (s : Session.t) base_dir module_name
+    =
+  match source_package_for_base_dir s base_dir with
+  | None -> None
+  | Some pkg ->
+      if
+        module_name = pkg.source_package_name
+        || has_prefix (pkg.source_package_name ^ "/") module_name
+      then
+        let candidate =
+          source_package_module_file pkg.source_package_source_dir module_name
+        in
+        if file_exists candidate then
+          Some
+            {
+              resolved_path = candidate;
+              resolved_origin = Session.package_origin pkg.source_package_alias;
+            }
+        else None
+      else None
+
+let source_package_export_for_alias pkg module_name =
+  match split_module_ref module_name with
+  | None -> None
+  | Some (head, rest) when head = pkg.source_package_alias ->
+      let package_module =
+        if rest = "" then pkg.source_package_name
+        else pkg.source_package_name ^ "/" ^ rest
+      in
+      if List.mem package_module pkg.source_package_exports then
+        Some package_module
+      else None
+  | Some _ -> None
+
+let resolve_source_package_alias (s : Session.t) module_name =
+  List.find_map
+    (fun pkg ->
+      match source_package_export_for_alias pkg module_name with
+      | None -> None
+      | Some package_module ->
+          let candidate =
+            source_package_module_file pkg.source_package_source_dir
+              package_module
+          in
+          if file_exists candidate then
+            Some
+              {
+                resolved_path = candidate;
+                resolved_origin =
+                  Session.package_origin pkg.source_package_alias;
+              }
+          else None)
+    s.source_packages
+
+let source_package_alias_for_module (s : Session.t) module_name =
+  match split_module_ref module_name with
+  | None -> None
+  | Some (head, _) ->
+      List.find_opt
+        (fun (pkg : Session.source_package) -> pkg.source_package_alias = head)
+        s.source_packages
+
+let source_package_alias_module_name pkg module_name =
+  match split_module_ref module_name with
+  | Some (head, rest) when head = pkg.source_package_alias ->
+      if rest = "" then Some pkg.source_package_name
+      else Some (pkg.source_package_name ^ "/" ^ rest)
+  | _ -> None
+
+let source_package_alias_load_error (s : Session.t) module_name =
+  match source_package_alias_for_module s module_name with
+  | None -> None
+  | Some pkg -> (
+      match source_package_alias_module_name pkg module_name with
+      | None -> None
+      | Some package_module ->
+          if List.mem package_module pkg.source_package_exports then
+            let path =
+              source_package_module_file pkg.source_package_source_dir
+                package_module
+            in
+            Some
+              (Printf.sprintf
+                 "package alias %S exports module %S as %S, but %s was not \
+                  found"
+                 pkg.source_package_alias module_name package_module path)
+          else
+            let exports = String.concat ", " pkg.source_package_exports in
+            Some
+              (Printf.sprintf
+                 "package alias %S does not export module %S\n\
+                 \  = help: Import one of the package's exported modules: %s"
+                 pkg.source_package_alias module_name exports))
+
+let rec resolve_module_file ?sess base_dir module_name =
   let s = sess_of ?sess () in
   let with_ext name =
     if Filename.check_suffix name ".brp" then name else name ^ ".brp"
@@ -264,26 +438,52 @@ let resolve_module_file ?sess base_dir module_name =
             }
         else None
     | None -> None
-  else if has_prefix "pkg/" module_name then
-    match package_ref_of_module_name module_name with
-    | None -> None
-    | Some pkg ->
-        List.find_map
-          (fun root ->
-            let candidate = with_ext (Filename.concat root pkg.package_path) in
-            if file_exists candidate then
-              Some
-                {
-                  resolved_path = candidate;
-                  resolved_origin = Session.package_origin pkg.package_id;
-                }
-            else None)
-          s.package_roots
+  else
+    match resolve_source_package_internal_import s base_dir module_name with
+    | Some resolved -> Some resolved
+    | None when Option.is_none (source_package_for_base_dir s base_dir) -> (
+        match resolve_source_package_alias s module_name with
+        | Some resolved -> Some resolved
+        | None -> resolve_non_source_package_module ~sess:s base_dir module_name
+        )
+    | None -> resolve_non_source_package_module ~sess:s base_dir module_name
+
+and resolve_non_source_package_module ~sess base_dir module_name =
+  let s = sess in
+  let with_ext name =
+    if Filename.check_suffix name ".brp" then name else name ^ ".brp"
+  in
+  if has_prefix "pkg/" module_name then
+    if
+      (match s.std_source_dir with
+        | Some std_dir -> is_path_under_dir ~dir:std_dir base_dir
+        | None -> false)
+      || Option.is_some (source_package_for_base_dir s base_dir)
+    then None
+    else
+      match package_ref_of_module_name module_name with
+      | None -> None
+      | Some pkg ->
+          List.find_map
+            (fun root ->
+              let candidate =
+                with_ext (Filename.concat root pkg.package_path)
+              in
+              if file_exists candidate then
+                Some
+                  {
+                    resolved_path = candidate;
+                    resolved_origin = Session.package_origin pkg.package_id;
+                  }
+              else None)
+            s.package_roots
   else if has_prefix "./" module_name then
     let rest = strip_prefix "./" module_name in
     let candidate = with_ext (Filename.concat base_dir rest) in
     if file_exists candidate then
-      Some { resolved_path = candidate; resolved_origin = Session.User_module }
+      Option.map
+        (fun origin -> { resolved_path = candidate; resolved_origin = origin })
+        (source_package_origin_for_relative_target s base_dir candidate)
     else None
   else if has_prefix "../" module_name then
     (* Walk up one directory per ../ prefix *)
@@ -295,12 +495,17 @@ let resolve_module_file ?sess base_dir module_name =
     let resolved_dir, rest = resolve_dotdots base_dir module_name in
     let candidate = with_ext (Filename.concat resolved_dir rest) in
     if file_exists candidate then
-      Some { resolved_path = candidate; resolved_origin = Session.User_module }
+      Option.map
+        (fun origin -> { resolved_path = candidate; resolved_origin = origin })
+        (source_package_origin_for_relative_target s base_dir candidate)
     else None
   (* Default: try as-is relative to base_dir *)
     else
     let candidate = with_ext (Filename.concat base_dir module_name) in
-    if file_exists candidate then
+    if
+      file_exists candidate
+      && Option.is_none (source_package_for_base_dir s base_dir)
+    then
       Some { resolved_path = candidate; resolved_origin = Session.User_module }
     else None
 
@@ -702,31 +907,45 @@ and load_module_inner ~(sess : Session.t) module_name base_dir =
                         module_name available
                     end
                   else if has_prefix "pkg/" module_name then
-                    let roots =
-                      match List.rev sess.package_roots with
-                      | [] -> "<none>"
-                      | roots -> String.concat ", " roots
-                    in
-                    Printf.sprintf
-                      "Could not find package module '%s'\n\
-                      \  = help: Package imports resolve only from local \
-                       package roots. Create %s.brp under a local pkg/ \
-                       directory or add a package root.\n\
-                      \  Package roots: %s"
-                      module_name module_name roots
+                    if
+                      match sess.std_source_dir with
+                      | Some std_dir -> is_path_under_dir ~dir:std_dir base_dir
+                      | None -> false
+                    then
+                      "standard library modules cannot import package modules"
+                    else if
+                      Option.is_some (source_package_for_base_dir sess base_dir)
+                    then "source packages cannot import pkg/... modules"
+                    else
+                      let roots =
+                        match List.rev sess.package_roots with
+                        | [] -> "<none>"
+                        | roots -> String.concat ", " roots
+                      in
+                      Printf.sprintf
+                        "Could not find package module '%s'\n\
+                        \  = help: Package imports resolve only from local \
+                         package roots. Create %s.brp under a local pkg/ \
+                         directory or add a package root.\n\
+                        \  Package roots: %s"
+                        module_name module_name roots
                   else
-                    let suggestion =
-                      let lower = String.lowercase_ascii module_name in
-                      if lower <> module_name then
-                        match resolve_module_path ~sess base_dir lower with
-                        | Some _ -> Printf.sprintf " (did you mean '%s'?)" lower
-                        | None -> ""
-                      else ""
-                    in
-                    Printf.sprintf
-                      "Could not find module '%s'%s\n  Search paths: %s"
-                      module_name suggestion
-                      (String.concat ", " sess.search_paths)
+                    match source_package_alias_load_error sess module_name with
+                    | Some msg -> msg
+                    | None ->
+                        let suggestion =
+                          let lower = String.lowercase_ascii module_name in
+                          if lower <> module_name then
+                            match resolve_module_path ~sess base_dir lower with
+                            | Some _ ->
+                                Printf.sprintf " (did you mean '%s'?)" lower
+                            | None -> ""
+                          else ""
+                        in
+                        Printf.sprintf
+                          "Could not find module '%s'%s\n  Search paths: %s"
+                          module_name suggestion
+                          (String.concat ", " sess.search_paths)
                 in
                 let err =
                   {
@@ -975,6 +1194,139 @@ let blorp_config_std_path_from base_dir =
             Some (Filename.concat (Filename.dirname config) dir)
           else Some dir)
 
+let config_error ~config_path ~line message =
+  {
+    Ast.message;
+    loc = Ast.point_loc_in ~file:config_path ~line ~column:1;
+    phase = Ast.ModuleLoad;
+    kind = Ast.OtherError;
+    notes = [];
+    help = None;
+  }
+
+let package_manifest_error ~alias err =
+  let location =
+    match (err.Package_manifest.path, err.line) with
+    | Some path, Some line -> Printf.sprintf "%s:%d" path line
+    | Some path, None -> path
+    | None, Some line -> Printf.sprintf "line %d" line
+    | None, None -> "package manifest"
+  in
+  Printf.sprintf "package alias %S is invalid: %s: %s" alias location
+    err.message
+
+let source_package_missing_exports source_dir manifest =
+  List.filter
+    (fun module_name ->
+      not (file_exists (source_package_module_file source_dir module_name)))
+    manifest.Package_manifest.exports
+
+let collect_package_source_files source_dir =
+  let rec walk path =
+    if is_directory path then
+      Sys.readdir path |> Array.to_list |> List.sort String.compare
+      |> List.concat_map (fun name -> walk (Filename.concat path name))
+    else if Filename.check_suffix path ".brp" then [ path ]
+    else []
+  in
+  walk source_dir
+
+let package_hash_pin_error (entry : Package_config.package_path) package_root
+    source_dir =
+  let open Package_config in
+  match entry.package_hash_pin with
+  | None -> None
+  | Some pin -> (
+      match
+        Package_hash.hash_checked_package ~root:package_root
+          ~source_files:(collect_package_source_files source_dir)
+      with
+      | Error errors -> Some (Package_hash.render_errors errors)
+      | Ok actual ->
+          if Package_hash.hash_matches_pin ~pin actual then None
+          else
+            Some
+              (Printf.sprintf
+                 "package alias %S hash mismatch: expected %s, found %s"
+                 entry.package_alias pin actual))
+
+let package_alias_root_error (entry : Package_config.package_path) =
+  let open Package_config in
+  match entry.package_path with
+  | Some path -> Ok path
+  | None -> (
+      match entry.package_hash_pin with
+      | None ->
+          Error
+            (Printf.sprintf
+               "package alias %S must define path or hash in this \
+                source-package preview"
+               entry.package_alias)
+      | Some pin -> (
+          match Package_cache_layout.find_cached_path pin with
+          | Ok (path, _) -> Ok path
+          | Error errors -> Error (Package_cache_layout.render_errors errors)))
+
+let configure_source_package_alias ~(sess : Session.t) ~config_path
+    (entry : Package_config.package_path) =
+  let open Package_config in
+  let add_error line message =
+    sess.load_errors <-
+      config_error ~config_path ~line message :: sess.load_errors
+  in
+  match package_alias_root_error entry with
+  | Error message -> add_error entry.package_line message
+  | Ok package_root -> (
+      let manifest_path =
+        Filename.concat package_root Package_manifest.manifest_filename
+      in
+      match Package_manifest.read manifest_path with
+      | Error errors ->
+          List.iter
+            (fun err ->
+              add_error entry.package_line
+                (package_manifest_error ~alias:entry.package_alias err))
+            errors
+      | Ok manifest -> (
+          if manifest.std_compat <> Package_manifest.current_std_compat then
+            add_error entry.package_line
+              (Printf.sprintf
+                 "package alias %S requires std compat %S, but this compiler \
+                  supports %S"
+                 entry.package_alias manifest.std_compat
+                 Package_manifest.current_std_compat)
+          else
+            let source_dir = Filename.concat package_root "src" in
+            if not (is_directory source_dir) then
+              add_error entry.package_line
+                (Printf.sprintf
+                   "package alias %S must point to a source package with a \
+                    src/ directory"
+                   entry.package_alias)
+            else
+              match source_package_missing_exports source_dir manifest with
+              | missing :: _ ->
+                  add_error entry.package_line
+                    (Printf.sprintf
+                       "package alias %S exports module %S, but %s does not \
+                        exist"
+                       entry.package_alias missing
+                       (source_package_module_file source_dir missing))
+              | [] -> (
+                  match
+                    package_hash_pin_error entry package_root source_dir
+                  with
+                  | Some message -> add_error entry.package_line message
+                  | None ->
+                      add_source_package ~sess
+                        {
+                          source_package_alias = entry.package_alias;
+                          source_package_name = manifest.name;
+                          source_package_root = canonical_dir package_root;
+                          source_package_source_dir = canonical_dir source_dir;
+                          source_package_exports = manifest.exports;
+                        })))
+
 (** Initialize module paths for a given base directory.
     Filesystem std is used only when configured explicitly through
     [--std-dir], [BLORP_STD], or [blorp.toml]. Otherwise std imports use
@@ -994,6 +1346,17 @@ let init_module_paths ?sess base_dir =
          match blorp_config_std_path_from abs_base_dir with
          | Some dir -> set_std_override ~sess dir
          | None -> ()));
+  (match Package_config.package_paths_from abs_base_dir with
+  | None -> ()
+  | Some (config_path, parsed) ->
+      List.iter
+        (fun (line, message) ->
+          sess.load_errors <-
+            config_error ~config_path ~line message :: sess.load_errors)
+        parsed.Package_config.package_errors;
+      List.iter
+        (configure_source_package_alias ~sess ~config_path)
+        parsed.Package_config.package_paths);
   let cwd_pkg = Filename.concat cwd "pkg" in
   if is_directory cwd_pkg then add_package_root ~sess cwd_pkg;
   Option.iter (add_package_root ~sess) (find_pkg_root_from abs_base_dir 0);

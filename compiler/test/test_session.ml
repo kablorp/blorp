@@ -111,7 +111,7 @@ let test_module_origin_policy_helpers () =
     "user allows foreign" true
     (Session.module_origin_allows_foreign Session.User_module);
   Alcotest.(check bool)
-    "pkg allows foreign" true
+    "pkg rejects foreign" false
     (Session.module_origin_allows_foreign pkg);
   Alcotest.(check string)
     "pkg label" "package 'sqlite'"
@@ -380,6 +380,360 @@ let test_source_origin_uses_configured_std_root () =
 let package_name_of_origin = function
   | Session.Package_module id -> Some (Session.package_id_name id)
   | Session.Stdlib_module | Session.User_module -> None
+
+let write_source_package root ~name ~exports files =
+  write_file
+    (Filename.concat root "package.toml")
+    (Printf.sprintf
+       "[package]\n\
+        name = %S\n\n\
+        [compat]\n\
+        std = \"preview-1\"\n\n\
+        [exports]\n\
+        modules = [%s]\n"
+       name
+       (String.concat ", " (List.map (Printf.sprintf "%S") exports)));
+  let src = Filename.concat root "src" in
+  Unix.mkdir src 0o700;
+  List.iter
+    (fun (rel, contents) ->
+      let path = Filename.concat src rel in
+      let dir = Filename.dirname path in
+      if not (Sys.file_exists dir) then Unix.mkdir dir 0o700;
+      write_file path contents)
+    files
+
+let test_blorp_toml_source_package_alias_resolves () =
+  with_temp_dir "blorp_source_package_alias" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      let vendor_dir = Filename.concat dir "vendor" in
+      let package_dir = Filename.concat vendor_dir "sample" in
+      Unix.mkdir app_dir 0o700;
+      Unix.mkdir vendor_dir 0o700;
+      Unix.mkdir package_dir 0o700;
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[packages]\nsample = { path = \"vendor/sample\" }\n";
+      write_source_package package_dir ~name:"sample"
+        ~exports:[ "sample"; "sample/internal" ]
+        [
+          ("sample.brp", "import:\n    sample/internal as Internal\n");
+          ("sample/internal.brp", "pure func answer() -> Int:\n    42\n");
+        ];
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess app_dir;
+      match Modules.load_module ~sess "sample" app_dir with
+      | None -> Alcotest.fail "expected package alias sample to resolve"
+      | Some m -> (
+          Alcotest.(check string)
+            "package alias path"
+            (Unix.realpath (Filename.concat package_dir "src/sample.brp"))
+            m.path;
+          Alcotest.(check (option string))
+            "package origin alias" (Some "sample")
+            (package_name_of_origin m.origin);
+          match Modules.load_module ~sess "sample/internal" app_dir with
+          | None ->
+              Alcotest.fail "expected exported package submodule to resolve"
+          | Some internal ->
+              Alcotest.(check string)
+                "package submodule path"
+                (Unix.realpath
+                   (Filename.concat package_dir "src/sample/internal.brp"))
+                internal.path))
+
+let test_blorp_toml_source_package_alias_can_differ_from_package_name () =
+  with_temp_dir "blorp_source_package_alias_name" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      let vendor_dir = Filename.concat dir "vendor" in
+      let package_dir = Filename.concat vendor_dir "sample" in
+      Unix.mkdir app_dir 0o700;
+      Unix.mkdir vendor_dir 0o700;
+      Unix.mkdir package_dir 0o700;
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[packages.sample_v1]\npath = \"vendor/sample\"\n";
+      write_source_package package_dir ~name:"sample" ~exports:[ "sample" ]
+        [ ("sample.brp", "pure func answer() -> Int:\n    42\n") ];
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess app_dir;
+      match Modules.load_module ~sess "sample_v1" app_dir with
+      | None -> Alcotest.fail "expected package alias sample_v1 to resolve"
+      | Some m -> (
+          Alcotest.(check string)
+            "package alias path"
+            (Unix.realpath (Filename.concat package_dir "src/sample.brp"))
+            m.path;
+          Alcotest.(check (option string))
+            "package origin alias" (Some "sample_v1")
+            (package_name_of_origin m.origin);
+          match Modules.load_module ~sess "sample" app_dir with
+          | None -> Alcotest.(check pass) "package name is not root alias" () ()
+          | Some _ ->
+              Alcotest.fail
+                "package manifest name unexpectedly resolved as root alias"))
+
+let package_config_errors config =
+  with_temp_dir "blorp_source_package_config_error" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      Unix.mkdir app_dir 0o700;
+      write_file (Filename.concat dir "blorp.toml") config;
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess app_dir;
+      Modules.get_load_errors ~sess ()
+      |> List.map (fun e -> e.Ast.message)
+      |> String.concat "\n")
+
+let source_package_hash root =
+  match Package_check.check root with
+  | Error errors ->
+      Alcotest.failf "package check failed:\n%s"
+        (Package_check.render_errors errors)
+  | Ok checked -> (
+      match
+        Package_hash.hash_checked_package ~root
+          ~source_files:checked.Package_check.source_files
+      with
+      | Ok hash -> hash
+      | Error errors ->
+          Alcotest.failf "package hash failed:\n%s"
+            (Package_hash.render_errors errors))
+
+let test_blorp_toml_package_table_requires_path_or_hash () =
+  let errors = package_config_errors "[packages.sample]\n" in
+  Alcotest.(check bool)
+    "package table requires path or hash" true
+    (mentions errors "must define path or hash")
+
+let test_blorp_toml_package_table_rejects_extra_keys () =
+  let errors =
+    package_config_errors "[packages.sample]\nurl = \"https://example\"\n"
+  in
+  Alcotest.(check bool)
+    "package table rejects extra keys" true
+    (mentions errors "unsupported key \"url\"")
+
+let test_blorp_toml_inline_package_rejects_extra_keys () =
+  let errors =
+    package_config_errors
+      "[packages]\n\
+       sample = { path = \"vendor/sample\", url = \"https://example\" }\n"
+  in
+  Alcotest.(check bool)
+    "inline package rejects extra keys" true
+    (mentions errors "unsupported key \"url\"")
+
+let test_blorp_toml_package_alias_parses_from () =
+  with_temp_dir "blorp_source_package_from" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      Unix.mkdir app_dir 0o700;
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[packages]\n\
+         sample = { hash = \"0123456789abcdef\", from = \
+         [\"artifacts/sample.blorpkg\"] }\n";
+      match Package_config.package_paths_from app_dir with
+      | None -> Alcotest.fail "expected blorp.toml to be discovered"
+      | Some (_, parsed) -> (
+          Alcotest.(check int)
+            "no package config errors" 0
+            (List.length parsed.Package_config.package_errors);
+          match parsed.Package_config.package_paths with
+          | [ entry ] ->
+              Alcotest.(check string)
+                "alias" "sample" entry.Package_config.package_alias;
+              Alcotest.(check (list string))
+                "from"
+                [ Filename.concat dir "artifacts/sample.blorpkg" ]
+                entry.Package_config.package_from
+          | _ -> Alcotest.fail "expected one package entry"))
+
+let test_blorp_toml_package_alias_rejects_missing_export () =
+  with_temp_dir "blorp_source_package_missing_export" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      let vendor_dir = Filename.concat dir "vendor" in
+      let package_dir = Filename.concat vendor_dir "sample" in
+      Unix.mkdir app_dir 0o700;
+      Unix.mkdir vendor_dir 0o700;
+      Unix.mkdir package_dir 0o700;
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[packages]\nsample = { path = \"vendor/sample\" }\n";
+      write_source_package package_dir ~name:"sample"
+        ~exports:[ "sample"; "sample/missing" ]
+        [ ("sample.brp", "pure func answer() -> Int:\n    42\n") ];
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess app_dir;
+      let errors =
+        Modules.get_load_errors ~sess ()
+        |> List.map (fun e -> e.Ast.message)
+        |> String.concat "\n"
+      in
+      Alcotest.(check bool)
+        "package alias rejects missing export" true
+        (mentions errors "exports module \"sample/missing\"");
+      match Modules.load_module ~sess "sample" app_dir with
+      | None ->
+          Alcotest.(check pass) "invalid package alias not registered" () ()
+      | Some _ -> Alcotest.fail "invalid package alias unexpectedly resolved")
+
+let test_blorp_toml_package_alias_accepts_matching_hash_pin () =
+  with_temp_dir "blorp_source_package_hash_pin" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      let vendor_dir = Filename.concat dir "vendor" in
+      let package_dir = Filename.concat vendor_dir "sample" in
+      Unix.mkdir app_dir 0o700;
+      Unix.mkdir vendor_dir 0o700;
+      Unix.mkdir package_dir 0o700;
+      write_source_package package_dir ~name:"sample" ~exports:[ "sample" ]
+        [ ("sample.brp", "pure func answer() -> Int:\n    42\n") ];
+      let hash_pin = String.sub (source_package_hash package_dir) 0 16 in
+      write_file
+        (Filename.concat dir "blorp.toml")
+        (Printf.sprintf
+           "[packages]\nsample = { path = \"vendor/sample\", hash = %S }\n"
+           hash_pin);
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess app_dir;
+      match Modules.load_module ~sess "sample" app_dir with
+      | Some _ -> Alcotest.(check pass) "matching hash pin resolves" () ()
+      | None -> Alcotest.fail "matching package hash pin did not resolve")
+
+let test_blorp_toml_package_alias_rejects_hash_mismatch () =
+  with_temp_dir "blorp_source_package_hash_mismatch" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      let vendor_dir = Filename.concat dir "vendor" in
+      let package_dir = Filename.concat vendor_dir "sample" in
+      Unix.mkdir app_dir 0o700;
+      Unix.mkdir vendor_dir 0o700;
+      Unix.mkdir package_dir 0o700;
+      write_source_package package_dir ~name:"sample" ~exports:[ "sample" ]
+        [ ("sample.brp", "pure func answer() -> Int:\n    42\n") ];
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[packages]\n\
+         sample = { path = \"vendor/sample\", hash = \"ffffffffffffffff\" }\n";
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess app_dir;
+      let errors =
+        Modules.get_load_errors ~sess ()
+        |> List.map (fun e -> e.Ast.message)
+        |> String.concat "\n"
+      in
+      Alcotest.(check bool)
+        "hash mismatch diagnostic" true
+        (mentions errors "hash mismatch");
+      match Modules.load_module ~sess "sample" app_dir with
+      | None -> Alcotest.(check pass) "mismatched hash pin not registered" () ()
+      | Some _ ->
+          Alcotest.fail "mismatched package hash pin unexpectedly resolved")
+
+let test_source_package_alias_reports_unexported_module () =
+  with_temp_dir "blorp_source_package_unexported" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      let vendor_dir = Filename.concat dir "vendor" in
+      let package_dir = Filename.concat vendor_dir "sample" in
+      Unix.mkdir app_dir 0o700;
+      Unix.mkdir vendor_dir 0o700;
+      Unix.mkdir package_dir 0o700;
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[packages]\nsample = { path = \"vendor/sample\" }\n";
+      write_source_package package_dir ~name:"sample" ~exports:[ "sample" ]
+        [
+          ("sample.brp", "pure func answer() -> Int:\n    42\n");
+          ("sample/internal.brp", "pure func hidden() -> Int:\n    7\n");
+        ];
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess app_dir;
+      ignore (Modules.load_module ~sess "sample/internal" app_dir);
+      let errors =
+        Modules.get_load_errors ~sess ()
+        |> List.map (fun e -> e.Ast.message)
+        |> String.concat "\n"
+      in
+      Alcotest.(check bool)
+        "unexported package submodule diagnostic" true
+        (mentions errors
+           "package alias \"sample\" does not export module \"sample/internal\""))
+
+let test_source_package_rejects_pkg_import () =
+  with_temp_dir "blorp_source_package_reject_pkg" (fun dir ->
+      let app_dir = Filename.concat dir "app" in
+      let vendor_dir = Filename.concat dir "vendor" in
+      let package_dir = Filename.concat vendor_dir "sample" in
+      Unix.mkdir app_dir 0o700;
+      Unix.mkdir vendor_dir 0o700;
+      Unix.mkdir package_dir 0o700;
+      write_file
+        (Filename.concat dir "blorp.toml")
+        "[packages]\nsample = { path = \"vendor/sample\" }\n";
+      write_source_package package_dir ~name:"sample" ~exports:[ "sample" ]
+        [
+          ( "sample.brp",
+            "import:\n\
+            \    pkg/crypto as Crypto\n\n\
+             pure func answer() -> Int:\n\
+            \    0\n" );
+        ];
+      let sess = Session.create () in
+      Modules.init_module_paths ~sess app_dir;
+      ignore (Modules.load_module ~sess "sample" app_dir);
+      let errors =
+        Modules.get_load_errors ~sess ()
+        |> List.map (fun e -> e.Ast.message)
+        |> String.concat "\n"
+      in
+      Alcotest.(check bool)
+        "source package rejects pkg import" true
+        (mentions errors "source packages cannot import pkg/... modules"))
+
+let test_source_package_relative_import_keeps_package_origin () =
+  Test_helpers.with_isolated_env (fun () ->
+      with_temp_dir "blorp_source_package_relative_origin" (fun dir ->
+          let app_dir = Filename.concat dir "app" in
+          let vendor_dir = Filename.concat dir "vendor" in
+          let package_dir = Filename.concat vendor_dir "sample" in
+          Unix.mkdir app_dir 0o700;
+          Unix.mkdir vendor_dir 0o700;
+          Unix.mkdir package_dir 0o700;
+          write_file
+            (Filename.concat dir "blorp.toml")
+            "[packages]\nsample = { path = \"vendor/sample\" }\n";
+          write_source_package package_dir ~name:"sample" ~exports:[ "sample" ]
+            [
+              ( "sample.brp",
+                "import:\n\
+                \    ./helper as Helper\n\n\
+                 pure func answer() -> Int:\n\
+                \    Helper.answer()\n" );
+              ( "helper.brp",
+                "foreign(include: \"math.h\"):\n\
+                \    func c_abs(x: Int) -> Int = \"abs\"\n\n\
+                 pure func answer() -> Int:\n\
+                \    1\n" );
+            ];
+          let main_path = Filename.concat app_dir "main.brp" in
+          let source =
+            "import:\n\
+            \    sample: answer\n\n\
+             func main(args: List[String]) -> Int:\n\
+            \    answer()\n"
+          in
+          match Pipeline.typecheck_module_only ~filename:main_path ~source with
+          | Error errors ->
+              let text =
+                errors
+                |> List.map (fun e -> e.Ast.message)
+                |> String.concat "\n"
+              in
+              Alcotest.(check bool)
+                "relative helper keeps package origin" true
+                (mentions text
+                   "'foreign' declarations cannot be used in source packages")
+          | Ok _ ->
+              Alcotest.fail
+                "expected package-relative helper foreign declaration to fail"))
 
 let test_pkg_root_discovered_from_base_dir () =
   with_temp_dir "blorp_pkg_root" (fun dir ->
@@ -761,6 +1115,30 @@ let suite =
           test_std_dir_is_not_guessed_without_explicit_config;
         Alcotest.test_case "source origin uses configured std root" `Quick
           test_source_origin_uses_configured_std_root;
+        Alcotest.test_case "source package alias resolves" `Quick
+          test_blorp_toml_source_package_alias_resolves;
+        Alcotest.test_case "source package alias can differ from name" `Quick
+          test_blorp_toml_source_package_alias_can_differ_from_package_name;
+        Alcotest.test_case "package table requires path or hash" `Quick
+          test_blorp_toml_package_table_requires_path_or_hash;
+        Alcotest.test_case "package table rejects extra keys" `Quick
+          test_blorp_toml_package_table_rejects_extra_keys;
+        Alcotest.test_case "inline package rejects extra keys" `Quick
+          test_blorp_toml_inline_package_rejects_extra_keys;
+        Alcotest.test_case "package alias parses from" `Quick
+          test_blorp_toml_package_alias_parses_from;
+        Alcotest.test_case "package alias rejects missing export" `Quick
+          test_blorp_toml_package_alias_rejects_missing_export;
+        Alcotest.test_case "package alias accepts matching hash pin" `Quick
+          test_blorp_toml_package_alias_accepts_matching_hash_pin;
+        Alcotest.test_case "package alias rejects hash mismatch" `Quick
+          test_blorp_toml_package_alias_rejects_hash_mismatch;
+        Alcotest.test_case "package alias reports unexported module" `Quick
+          test_source_package_alias_reports_unexported_module;
+        Alcotest.test_case "source package rejects pkg import" `Quick
+          test_source_package_rejects_pkg_import;
+        Alcotest.test_case "source package relative import origin" `Quick
+          test_source_package_relative_import_keeps_package_origin;
         Alcotest.test_case "pkg root discovered from base dir" `Quick
           test_pkg_root_discovered_from_base_dir;
         Alcotest.test_case "pkg import resolves with package origin" `Quick

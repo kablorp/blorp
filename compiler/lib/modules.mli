@@ -38,11 +38,27 @@ val is_path_under_dir : dir:string -> string -> bool
 (** True iff [path] is [dir] or a descendant of [dir], using canonical
     filesystem paths and directory boundaries rather than string prefixes. *)
 
+type source_package = Session.source_package = {
+  source_package_alias : string;
+  source_package_name : string;
+  source_package_root : string;
+  source_package_source_dir : string;
+  source_package_exports : string list;
+}
+(** A root-project source package alias. These are configured from
+    [blorp.toml] or directly by package tooling. *)
+
+val add_source_package : ?sess:Session.t -> source_package -> unit
+(** Add or replace a source package alias in the active session. *)
+
 val module_origin_for_source_file :
   ?sess:Session.t -> string -> Session.module_origin
-(** Classify a source file for compiler policy when only a path is available.
-    This deliberately recognizes configured std files only. Package origin is
-    assigned by explicit [pkg/...] import resolution, not by path guessing. *)
+(** Classify a source file for compiler policy when only a path is available. *)
+
+val module_name_for_source_file : ?sess:Session.t -> string -> string option
+(** Return the canonical std or source-package module name for [path] when the
+    active session knows one. User files without canonical package/std identity
+    return [None]. *)
 
 val std_module_name_for_source_file : ?sess:Session.t -> string -> string option
 (** Return the canonical std module name for a filesystem std source path,
