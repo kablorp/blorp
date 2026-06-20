@@ -81,54 +81,29 @@ let to_string = function
   | Final -> "final"
 
 let stage_names = List.map (fun stage -> (to_string stage, stage)) all
-let valid_stage_names = List.map fst stage_names
 
-(* Small local Levenshtein — Core_stage intentionally has no deps beyond
-   stdlib. Duplication with [Env.levenshtein] is acceptable; a shared
-   helper module would require a new layer to avoid cycles. *)
-let edit_distance s1 s2 =
-  let len1 = String.length s1 and len2 = String.length s2 in
-  if len1 = 0 then len2
-  else if len2 = 0 then len1
-  else
-    let prev = Array.init (len2 + 1) (fun j -> j) in
-    let curr = Array.make (len2 + 1) 0 in
-    for i = 1 to len1 do
-      curr.(0) <- i;
-      for j = 1 to len2 do
-        let cost = if s1.[i - 1] = s2.[j - 1] then 0 else 1 in
-        curr.(j) <-
-          min (min (prev.(j) + 1) (curr.(j - 1) + 1)) (prev.(j - 1) + cost)
-      done;
-      Array.blit curr 0 prev 0 (len2 + 1)
-    done;
-    prev.(len2)
+let fallback_valid_stage_names () =
+  List.map fst stage_names |> String.concat ", "
 
-(** Closest stage name to [s] by edit distance, or [None] if nothing is
-    within a useful threshold. Threshold scales with input length so a
-    2-char typo in "monot" gets matched to "mono". *)
-let closest_stage s =
-  let max_dist = max 1 ((String.length s / 3) + 1) in
-  let scored =
-    List.filter_map
-      (fun name ->
-        let d = edit_distance s name in
-        if d <= max_dist then Some (name, d) else None)
-      valid_stage_names
-  in
-  match List.sort (fun (_, a) (_, b) -> compare a b) scored with
-  | (best, _) :: _ -> Some best
-  | [] -> None
+let unknown_stage_error_renderer : (string -> string -> string) option ref =
+  ref None
+
+let set_unknown_stage_error_renderer renderer =
+  unknown_stage_error_renderer := Some renderer
 
 let unknown_stage_error original normalized =
-  let suggestion =
-    match closest_stage normalized with
-    | Some name -> Printf.sprintf " (did you mean %S?)" name
-    | None -> ""
+  let fallback_message =
+    Printf.sprintf "unknown stage %S (valid: %s)" original
+      (fallback_valid_stage_names ())
   in
-  let valid = String.concat ", " valid_stage_names in
-  Error
-    (Printf.sprintf "unknown stage %S%s (valid: %s)" original suggestion valid)
+  let message =
+    match !unknown_stage_error_renderer with
+    | Some render -> (
+        try render original normalized
+        with Invalid_argument _ -> fallback_message)
+    | None -> fallback_message
+  in
+  Error message
 
 let of_string s =
   let normalized = String.lowercase_ascii (String.trim s) in

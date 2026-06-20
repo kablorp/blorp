@@ -14,7 +14,11 @@ let prepared_list_renderer = "prepared_list"
 let prepared_tensor_renderer = "prepared_tensor"
 let prepared_constructor_renderer = "prepared_constructor"
 let prepared_tuple_renderer = "prepared_tuple"
+let core_error_renderer = "core_error"
 let core_fairness_renderer = "core_fairness"
+let core_profile_renderer = "core_profile"
+let core_stage_renderer = "core_stage"
+let core_trait_resolve_renderer = "core_trait_resolve"
 let language_surface_renderer = "language_surface"
 
 let ( let* ) result f =
@@ -397,6 +401,9 @@ let language_surface_bootstrap_rows =
     );
     ( "language_prelude_method_type_imports",
       "option:Option;result:Result;bool:Bool;char:Char;bytes:Bytes;string:String;list:List;list:ParallelList;parallel_list:ParallelList;vector:ParallelVector;parallel_vector:ParallelVector;matrix:ParallelMatrix;parallel_matrix:ParallelMatrix;range:Range;dict:Dict;set:Set;file:FileReader;file:FileWriter;file:FileAppender;file:FileReadWriter;file:FileReadAppender"
+    );
+    ( "language_prelude_ufcs_modules",
+      "option;result;bool;char;bytes;string;list;parallel_list;vector;parallel_vector;matrix;parallel_matrix;range;dict;set;file"
     );
   ]
 
@@ -917,3 +924,34 @@ let render_many_via_command_exn ?program ~renderer items =
     match response_result response_json render_many_response_field with
     | Ok rendered -> rendered
     | Error (_, message) -> invalid_arg message
+
+let render_core_stage_unknown_error original normalized =
+  render_via_command_exn ~renderer:core_stage_renderer
+    ~op:"core_stage_unknown_error" [ original; normalized ]
+
+let render_core_trait_resolve_no_impl_hint ~method_name ~type_name ~candidates =
+  render_via_command_exn ~renderer:core_trait_resolve_renderer
+    ~op:"core_trait_resolve_no_impl_hint"
+    [ method_name; type_name; String.concat ";" candidates ]
+
+let render_core_profile_format serialized_entries =
+  render_via_command_exn ~renderer:core_profile_renderer
+    ~op:"core_profile_format" [ serialized_entries ]
+
+let render_core_error_format ~phase ~message ~line ~column ~hint =
+  let hint_kind, hint_text =
+    match hint with Some text -> ("some", text) | None -> ("none", "")
+  in
+  render_via_command_exn ~renderer:core_error_renderer ~op:"core_error_format"
+    [
+      phase;
+      message;
+      string_of_int line;
+      string_of_int column;
+      hint_kind;
+      hint_text;
+    ]
+
+let () =
+  Core_stage.set_unknown_stage_error_renderer render_core_stage_unknown_error;
+  Core_error.set_formatter render_core_error_format

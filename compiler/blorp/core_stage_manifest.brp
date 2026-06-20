@@ -1,0 +1,287 @@
+-- Blorp-owned user-facing Core stage surface.
+--
+-- OCaml still owns the Core_stage enum while the pipeline is being migrated.
+-- This module owns the rendered stage-name manifest and typo diagnostics used
+-- by the CLI through the single JSON bridge.
+import:
+	codegen_template_registry:
+		render_template_arity_error,
+		render_template_manifest_line,
+		render_unsupported_template_error,
+	string: levenshtein, string as make_string
+
+
+enum CoreStageTemplate:
+	ValidNamesTemplate
+	UnknownErrorTemplate
+
+
+record CoreStageTemplateInfo {
+	template: CoreStageTemplate,
+	name: String,
+	arity: Int
+}
+
+
+record CoreStageUnknownErrorArgs {
+	original: String,
+	normalized: String
+}
+
+
+union CoreStageOp:
+	ValidNames
+	UnknownError(CoreStageUnknownErrorArgs)
+
+
+union CoreStageRenderError:
+	WrongArity(CoreStageTemplateInfo, Int)
+	UnsupportedCoreStageOp(String)
+
+
+private pure func templates_by_name(
+	templates: List[CoreStageTemplateInfo],
+) -> Dict[String, CoreStageTemplateInfo]:
+	var dict: Dict[String, CoreStageTemplateInfo] = {}
+
+	for info in templates:
+		dict = dict.set(info.name, info)
+
+	dict
+
+
+CORE_STAGE_NAMES: List[String] = [
+	"lower",
+	"debug",
+	"desugar",
+	"mono",
+	"synth",
+	"match",
+	"trait_resolve",
+	"resolve",
+	"std_inline",
+	"tailrec",
+	"fusion",
+	"specialize",
+	"dce",
+	"consume_specialize",
+	"perceus",
+	"reuse",
+	"closure",
+	"final",
+]
+
+private CORE_STAGE_NAMES_TEXT: String = CORE_STAGE_NAMES.join(", ")
+
+ALL_TEMPLATES: List[CoreStageTemplateInfo] = [{
+		template = ValidNamesTemplate,
+		name = "core_stage_valid_names",
+		arity = 0
+	}, {
+		template = UnknownErrorTemplate,
+		name = "core_stage_unknown_error",
+		arity = 2
+	}]
+
+private TEMPLATES_BY_NAME: Dict[String, CoreStageTemplateInfo] = templates_by_name(ALL_TEMPLATES)
+
+
+pure func core_stage_template_name(info: CoreStageTemplateInfo) -> String:
+	info.name
+
+
+pure func core_stage_template_arity(info: CoreStageTemplateInfo) -> Int:
+	info.arity
+
+
+pure func parse_core_stage_template(name: String) -> Option[CoreStageTemplateInfo]:
+	TEMPLATES_BY_NAME.get(name)
+
+
+private pure func wrong_arity_for_args(
+	info: CoreStageTemplateInfo,
+	args: List[String],
+) -> CoreStageRenderError:
+	WrongArity(info, args.length())
+
+
+pure func render_error_to_string(error: CoreStageRenderError) -> String:
+	match error:
+		WrongArity(info, actual):
+			render_template_arity_error(
+				"core stage op",
+				core_stage_template_name(info),
+				core_stage_template_arity(info),
+				actual,
+			)
+		UnsupportedCoreStageOp(name):
+			render_unsupported_template_error("core stage op", name)
+
+
+private pure func parse_zero_arg_op(
+	info: CoreStageTemplateInfo,
+	args: List[String],
+	op: CoreStageOp,
+) -> Result[CoreStageOp, CoreStageRenderError]:
+	match args:
+		[]:
+			Ok(op)
+		[first]:
+			Err(wrong_arity_for_args(info, args))
+		[first, second]:
+			Err(wrong_arity_for_args(info, args))
+		[first, second, third]:
+			Err(wrong_arity_for_args(info, args))
+		[first, second, third, ...rest]:
+			Err(wrong_arity_for_args(info, args))
+
+
+private pure func parse_unknown_error_op(
+	info: CoreStageTemplateInfo,
+	args: List[String],
+) -> Result[CoreStageOp, CoreStageRenderError]:
+	match args:
+		[]:
+			Err(wrong_arity_for_args(info, args))
+		[original]:
+			Err(wrong_arity_for_args(info, args))
+		[original, normalized]:
+			Ok(UnknownError({
+				original = original,
+				normalized = normalized,
+			}))
+		[original, normalized, third]:
+			Err(wrong_arity_for_args(info, args))
+		[original, normalized, third, ...rest]:
+			Err(wrong_arity_for_args(info, args))
+
+
+pure func build_core_stage_op(
+	info: CoreStageTemplateInfo,
+	args: List[String],
+) -> Result[CoreStageOp, CoreStageRenderError]:
+	match info.template:
+		ValidNamesTemplate:
+			parse_zero_arg_op(info, args, ValidNames)
+		UnknownErrorTemplate:
+			parse_unknown_error_op(info, args)
+
+
+private pure func suggestion_threshold(name: String) -> Int:
+	threshold: Int = name.length() / 3 + 1
+
+	if threshold > 1:
+		threshold
+	else:
+		1
+
+
+private pure func closest_stage(name: String) -> Option[String]:
+	var best_name: String = ""
+	var best_distance: Int = 0
+	var found: Bool = False
+	threshold: Int = suggestion_threshold(name)
+
+	for stage_name in CORE_STAGE_NAMES:
+		distance: Int = levenshtein(name, stage_name)
+
+		if distance <= threshold and (not found or distance < best_distance):
+			best_name = stage_name
+			best_distance = distance
+			found = True
+
+	if found:
+		Some(best_name)
+	else:
+		None
+
+
+private pure func quoted(text: String) -> String:
+	var result: String = make_string(text.length() + 2)
+	result = result.append_char('\"')
+	var index: Int = 0
+
+	while index < text.length():
+		match text.get(index):
+			Some(ch):
+				code: Int = to_int(ch)
+
+				if code == 34:
+					result = result.append_char('\\')
+					result = result.append_char('\"')
+				else if code == 92:
+					result = result.append_char('\\')
+					result = result.append_char('\\')
+				else if code == 10:
+					result = result.append_char('\\')
+					result = result.append_char('n')
+				else if code == 13:
+					result = result.append_char('\\')
+					result = result.append_char('r')
+				else if code == 9:
+					result = result.append_char('\\')
+					result = result.append_char('t')
+				else:
+					result = result.append_char(ch)
+			None:
+				void
+
+		index += 1
+
+	result.append_char('\"')
+
+
+private pure func render_unknown_stage_error(args: CoreStageUnknownErrorArgs) -> String:
+	quoted_original: String = quoted(args.original)
+
+	match closest_stage(args.normalized):
+		Some(suggestion):
+			quoted_suggestion: String = quoted(suggestion)
+			"unknown stage ${quoted_original} (did you mean ${quoted_suggestion}?) (valid: ${CORE_STAGE_NAMES_TEXT})"
+		None:
+			"unknown stage ${quoted_original} (valid: ${CORE_STAGE_NAMES_TEXT})"
+
+
+pure func render_core_stage_op(op: CoreStageOp) -> String:
+	match op:
+		ValidNames:
+			CORE_STAGE_NAMES_TEXT
+		UnknownError(args):
+			render_unknown_stage_error(args)
+
+
+pure func render_core_stage(
+	name: String,
+	args: List[String],
+) -> Result[String, CoreStageRenderError]:
+	match parse_core_stage_template(name):
+		Some(info):
+			match build_core_stage_op(info, args):
+				Ok(op):
+					Ok(render_core_stage_op(op))
+				Err(error):
+					Err(error)
+		None:
+			Err(UnsupportedCoreStageOp(name))
+
+
+private pure func placeholder_core_stage_op(info: CoreStageTemplateInfo) -> CoreStageOp:
+	match info.template:
+		ValidNamesTemplate:
+			ValidNames
+		UnknownErrorTemplate:
+			UnknownError({
+				original = "@0@",
+				normalized = "@1@",
+			})
+
+
+pure func render_manifest_line(info: CoreStageTemplateInfo) -> String:
+	name: String = core_stage_template_name(info)
+	arity: Int = core_stage_template_arity(info)
+	body: String = render_core_stage_op(placeholder_core_stage_op(info))
+	render_template_manifest_line(name, arity, body)
+
+
+pure func render_manifest_lines() -> List[String]:
+	ALL_TEMPLATES.map(render_manifest_line)

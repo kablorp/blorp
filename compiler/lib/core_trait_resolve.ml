@@ -359,29 +359,6 @@ let is_direct_ufcs_function (reg : registry) (module_path : string)
         candidates
   | None -> Codegen_builtins.lookup module_path name <> None
 
-(** Pick the closest candidate type (by edit distance) from [candidates]
-    relative to [target], within a threshold that scales with the length
-    of [target]. Threshold matches [Core_stage.closest_stage]'s
-    [max 1 (len / 3 + 1)] convention to avoid wild suggestions on short
-    type names. Returns [None] when nothing is close enough.
-
-    Sorts [candidates] lexicographically before scoring so ties break
-    deterministically (Hashtbl iteration order is otherwise free-form). *)
-let closest_candidate (target : string) (candidates : string list) :
-    string option =
-  let threshold = max 1 ((String.length target / 3) + 1) in
-  let sorted = List.sort compare candidates in
-  let scored =
-    List.filter_map
-      (fun c ->
-        let d = Core_stage.edit_distance target c in
-        if d <= threshold then Some (c, d) else None)
-      sorted
-  in
-  match List.sort (fun (_, a) (_, b) -> compare a b) scored with
-  | (best, _) :: _ -> Some best
-  | [] -> None
-
 (** Bare method name for each overloadable binary operator. [None] for
     [Ast.binop] shapes not routed through traits (there are none today —
     every [binop] variant is overloadable — but the [option] return
@@ -437,34 +414,37 @@ let static_self_return_type_name (reg : registry) (method_name : string)
     type_name_of_ty return_ty
   else None
 
-(** Emit a structured "no impl of X for Y in scope" error. Includes a
-    Levenshtein suggestion when the registry has impls for nearby type
-    names under the same method. Raises via [Core_error.errorf]. *)
+let fallback_no_impl_hint method_name type_name candidates =
+  match candidates with
+  | [] ->
+      Printf.sprintf
+        "no type in scope implements `%s`. Define an `implements <trait> for \
+         %s:` block with a `%s` method."
+        method_name type_name method_name
+  | _ ->
+      Printf.sprintf
+        "types with an `%s` impl in scope: %s. Add `implements <trait> for \
+         %s:` to extend it."
+        method_name
+        (String.concat ", " (List.sort compare candidates))
+        type_name
+
+let no_impl_hint method_name type_name candidates =
+  try
+    Compiler_blorp_bridge.render_core_trait_resolve_no_impl_hint ~method_name
+      ~type_name ~candidates
+  with Invalid_argument _ ->
+    fallback_no_impl_hint method_name type_name candidates
+
+(** Emit a structured "no impl of X for Y in scope" error. Hint text is
+    rendered by Blorp so the pipeline's user-facing diagnostic policy moves
+    with the self-hosted compiler surface. Raises via [Core_error.errorf]. *)
 let error_no_impl (reg : registry) (loc : Ast.loc) (method_name : string)
     (type_name : string) : 'a =
   let candidates =
     try Hashtbl.find reg.impls_by_method method_name with Not_found -> []
   in
-  let hint =
-    match closest_candidate type_name candidates with
-    | Some suggestion ->
-        Printf.sprintf
-          "did you mean to call it on a %s? Or add `implements <trait> for \
-           %s:` defining `%s`."
-          suggestion type_name method_name
-    | None when candidates <> [] ->
-        Printf.sprintf
-          "types with an `%s` impl in scope: %s. Add `implements <trait> for \
-           %s:` to extend it."
-          method_name
-          (String.concat ", " (List.sort compare candidates))
-          type_name
-    | None ->
-        Printf.sprintf
-          "no type in scope implements `%s`. Define an `implements <trait> for \
-           %s:` block with a `%s` method."
-          method_name type_name method_name
-  in
+  let hint = no_impl_hint method_name type_name candidates in
   Core_error.errorf (Core_error.Stage Core_stage.TraitResolve) loc ~hint
     "no impl of `%s` for type `%s` in scope" method_name type_name
 

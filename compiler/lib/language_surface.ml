@@ -13,6 +13,7 @@ let surface_rows =
        [
          ("language_lsp_completion_keywords", []);
          ("language_prelude_method_type_imports", []);
+         ("language_prelude_ufcs_modules", []);
        ])
 
 let render_surface op =
@@ -51,10 +52,4 @@ let prelude_method_type_imports () =
   |> split_semicolon_table |> List.map split_pair
 
 let prelude_ufcs_modules () =
-  let rec add_seen seen acc = function
-    | [] -> List.rev acc
-    | (module_name, _) :: rest ->
-        if List.mem module_name seen then add_seen seen acc rest
-        else add_seen (module_name :: seen) (module_name :: acc) rest
-  in
-  add_seen [] [] (prelude_method_type_imports ())
+  render_surface "language_prelude_ufcs_modules" |> split_semicolon_table

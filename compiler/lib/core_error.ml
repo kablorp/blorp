@@ -67,14 +67,37 @@ exception Core_error of t
 let errorf ?hint phase loc fmt =
   Printf.ksprintf (fun msg -> raise (Core_error { phase; msg; loc; hint })) fmt
 
-(** Render a [Core_error.t] as a multi-line string for display. *)
-let to_string (e : t) : string =
+let fallback_to_string (e : t) : string =
   let base =
     Printf.sprintf "%s: %s at %d:%d"
       (phase_tag_to_string e.phase)
       e.msg e.loc.line e.loc.column
   in
   match e.hint with Some h -> base ^ "\n  hint: " ^ h | None -> base
+
+let formatter :
+    (phase:string ->
+    message:string ->
+    line:int ->
+    column:int ->
+    hint:string option ->
+    string)
+    option
+    ref =
+  ref None
+
+let set_formatter render = formatter := Some render
+
+(** Render a [Core_error.t] as a multi-line string for display. *)
+let to_string (e : t) : string =
+  match !formatter with
+  | Some render -> (
+      try
+        render
+          ~phase:(phase_tag_to_string e.phase)
+          ~message:e.msg ~line:e.loc.line ~column:e.loc.column ~hint:e.hint
+      with Invalid_argument _ -> fallback_to_string e)
+  | None -> fallback_to_string e
 
 let contains_substring haystack needle =
   let needle_len = String.length needle in
