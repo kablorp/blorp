@@ -321,8 +321,8 @@ Current state:
   emission-template families.
 - OCaml still owns Core traversal, C escaping, and backend context management.
   The Blorp programs own narrow template/manifest generation slices with tests.
-- `compiler/test/test_compiler_blorp.ml` checks renderer compilation,
-  generated-template drift, and `compiler/blorp` TestSuite files.
+- `compiler/blorp/tests` checks renderer compilation, generated-template drift,
+  and compiler Blorp behavior directly.
 
 Direction:
 

@@ -152,7 +152,7 @@ let test_desugar_unknown_record_type_raises () =
     mk (CRecordUpdate (cvar "u" unknown_ty, [ ("x", cint 1) ])) unknown_ty
   in
   let prog = [ wrap_in_func update ] in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Desugar)
     ~msg_contains:"record update for unknown record type" (fun () ->
       ignore (Blorp.Core_desugar.desugar_program prog))
@@ -163,7 +163,7 @@ let test_desugar_non_named_record_update_type_raises () =
     mk (CRecordUpdate (cvar "u" tuple_ty, [ ("x", cint 1) ])) tuple_ty
   in
   let prog = [ wrap_in_func update ] in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Desugar)
     ~msg_contains:"record update target has non-record type" (fun () ->
       ignore (Blorp.Core_desugar.desugar_program prog))

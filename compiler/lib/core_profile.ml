@@ -10,9 +10,6 @@
     time) rather than [Sys.time] (CPU time), so phases that block on
     module loading or disk reads show their real cost. *)
 
-type entry = Core_stage.t * float
-(** Core stage × elapsed milliseconds *)
-
 type phase = Core of Core_stage.t | Label of string
 type timed_entry = phase * float
 
@@ -24,12 +21,6 @@ type t = {
 let now_ms () = Unix.gettimeofday () *. 1000.0
 let create () = { start = now_ms (); entries = ref [] }
 let record_phase t phase ms = t.entries := (phase, ms) :: !(t.entries)
-
-(** Record a pre-computed duration (ms) for a stage. Primarily for tests. *)
-let record t stage ms = record_phase t (Core stage) ms
-
-(** Record a pre-computed duration (ms) for a non-Core phase. *)
-let record_label t label ms = record_phase t (Label label) ms
 
 let record_elapsed t phase =
   let now = now_ms () in
@@ -46,29 +37,18 @@ let on_label (t : t) label = record_elapsed t (Label label)
 let on_stage (t : t) : Core_stage.t -> Core.core_program -> unit =
  fun stage _prog -> record_elapsed t (Core stage)
 
-let all_entries t : timed_entry list = List.rev !(t.entries)
-
-let entries t : entry list =
-  all_entries t
-  |> List.filter_map (function Core stage, ms -> Some (stage, ms) | _ -> None)
-
-let phase_label = function
-  | Core stage -> Core_stage.to_string stage
-  | Label s -> s
-
-let phase_kind = function Core _ -> "core" | Label _ -> "label"
-
 let serialize_entry (phase, ms) =
-  String.concat "\t"
-    [ phase_kind phase; phase_label phase; Printf.sprintf "%.17g" ms ]
-
-let serialize_entries entries =
-  entries |> List.map serialize_entry |> String.concat "\n"
+  let kind, label =
+    match phase with
+    | Core stage -> ("core", Core_stage.to_string stage)
+    | Label label -> ("label", label)
+  in
+  String.concat "\t" [ kind; label; Printf.sprintf "%.17g" ms ]
 
 (** Format the profile as a readable table. Phases appear in the order
     they fired. If only Core stages were recorded, the first stage is annotated
     with [*] because the profiler cannot see work that happened before the
     first stage callback. *)
 let format (t : t) : string =
-  t |> all_entries |> serialize_entries
+  !(t.entries) |> List.rev |> List.map serialize_entry |> String.concat "\n"
   |> Compiler_blorp_bridge.render_core_profile_format

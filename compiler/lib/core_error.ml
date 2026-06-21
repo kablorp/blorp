@@ -67,14 +67,6 @@ exception Core_error of t
 let errorf ?hint phase loc fmt =
   Printf.ksprintf (fun msg -> raise (Core_error { phase; msg; loc; hint })) fmt
 
-let fallback_to_string (e : t) : string =
-  let base =
-    Printf.sprintf "%s: %s at %d:%d"
-      (phase_tag_to_string e.phase)
-      e.msg e.loc.line e.loc.column
-  in
-  match e.hint with Some h -> base ^ "\n  hint: " ^ h | None -> base
-
 let formatter :
     (phase:string ->
     message:string ->
@@ -90,47 +82,19 @@ let set_formatter render = formatter := Some render
 
 (** Render a [Core_error.t] as a multi-line string for display. *)
 let to_string (e : t) : string =
+  let fallback_to_string () =
+    let base =
+      Printf.sprintf "%s: %s at %d:%d"
+        (phase_tag_to_string e.phase)
+        e.msg e.loc.line e.loc.column
+    in
+    match e.hint with Some h -> base ^ "\n  hint: " ^ h | None -> base
+  in
   match !formatter with
   | Some render -> (
       try
         render
           ~phase:(phase_tag_to_string e.phase)
           ~message:e.msg ~line:e.loc.line ~column:e.loc.column ~hint:e.hint
-      with Invalid_argument _ -> fallback_to_string e)
-  | None -> fallback_to_string e
-
-let contains_substring haystack needle =
-  let needle_len = String.length needle in
-  let haystack_len = String.length haystack in
-  let rec search haystack_index =
-    if haystack_index + needle_len > haystack_len then false
-    else if String.sub haystack haystack_index needle_len = needle then true
-    else search (haystack_index + 1)
-  in
-  search 0
-
-(** Test helper: run [f] and assert it raised [Core_error] whose
-    [phase] equals [~phase] and whose [msg] contains [~msg_contains]
-    as a substring. Raises [Alcotest.Test_error] on mismatch. *)
-let check_raises ~(phase : phase_tag) ~msg_contains f =
-  let found = ref None in
-  (try f () with Core_error e -> found := Some e);
-  match !found with
-  | None ->
-      failwith
-        (Printf.sprintf
-           "expected Core_error %s containing %S — no exception raised"
-           (phase_tag_to_string phase)
-           msg_contains)
-  | Some e ->
-      if e.phase <> phase then
-        failwith
-          (Printf.sprintf
-             "Core_error phase mismatch: expected %S, got %S (msg=%S)"
-             (phase_tag_to_string phase)
-             (phase_tag_to_string e.phase)
-             e.msg);
-      if not (contains_substring e.msg msg_contains) then
-        failwith
-          (Printf.sprintf "Core_error msg %S does not contain %S" e.msg
-             msg_contains)
+      with Invalid_argument _ -> fallback_to_string ())
+  | None -> fallback_to_string ()

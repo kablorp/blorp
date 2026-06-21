@@ -385,7 +385,8 @@ let test_core_pipeline_rejects_untyped_loaded_module () =
       let sess = Session.current () in
       let raw_module = mk_loaded_module ~name:"test/raw" ~decls:[] in
       Hashtbl.add sess.module_cache raw_module.name raw_module;
-      Core_error.check_raises ~phase:(Core_error.Stage Core_stage.Lower)
+      Test_helpers.check_core_error_raises
+        ~phase:(Core_error.Stage Core_stage.Lower)
         ~msg_contains:"without typed declarations" (fun () ->
           ignore
             (Core_pipeline.compile_typed_with_modules

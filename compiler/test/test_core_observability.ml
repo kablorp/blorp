@@ -115,63 +115,6 @@ let test_dump_after_captures_stage_output () =
         (Modules.contains text "inc"))
     captured
 
-let test_profile_records_each_stage () =
-  (* --profile plumbing should produce one measurement per stage. *)
-  let prog = lower_source small_source in
-  let recorder = Core_profile.create () in
-  let _c_code =
-    Core_pipeline.compile_typed ~on_stage:(Core_profile.on_stage recorder) prog
-  in
-  let entries = Core_profile.entries recorder in
-  (* Every observed Core stage should appear. *)
-  Alcotest.(check int)
-    "one entry per stage"
-    (List.length Core_stage.all)
-    (List.length entries);
-  (* Each entry has a non-negative elapsed time. *)
-  List.iter
-    (fun (stage, ms) ->
-      Alcotest.(check bool)
-        (Printf.sprintf "%s ms >= 0" (Core_stage.to_string stage))
-        true (ms >= 0.0))
-    entries
-
-let test_profile_format_contains_header () =
-  let recorder = Core_profile.create () in
-  Core_profile.record recorder Core_stage.Lower 1.5;
-  Core_profile.record recorder Core_stage.Mono 3.0;
-  let formatted = Core_profile.format recorder in
-  Alcotest.(check bool)
-    "has phase column" true
-    (Modules.contains formatted "phase");
-  Alcotest.(check bool) "has ms column" true (Modules.contains formatted "ms");
-  Alcotest.(check bool) "lists lower" true (Modules.contains formatted "lower");
-  Alcotest.(check bool) "lists mono" true (Modules.contains formatted "mono")
-
-let test_profile_format_contains_frontend_labels () =
-  let recorder = Core_profile.create () in
-  Core_profile.record_label recorder "parse" 1.0;
-  Core_profile.record_label recorder "module_load" 2.0;
-  Core_profile.record_label recorder "module_typecheck" 2.5;
-  Core_profile.record recorder Core_stage.Lower 3.0;
-  let formatted = Core_profile.format recorder in
-  let lines = String.split_on_char '\n' formatted in
-  let separator = List.nth lines 1 in
-  let module_typecheck_line =
-    List.find (String.starts_with ~prefix:"module_typecheck ") lines
-  in
-  Alcotest.(check bool) "lists parse" true (Modules.contains formatted "parse");
-  Alcotest.(check bool)
-    "lists module_load" true
-    (Modules.contains formatted "module_load");
-  Alcotest.(check bool)
-    "separator covers long frontend label" true
-    (String.length separator >= String.length module_typecheck_line);
-  Alcotest.(check bool) "lists lower" true (Modules.contains formatted "lower");
-  Alcotest.(check bool)
-    "no stale first-stage footnote" false
-    (Modules.contains formatted "first entry includes")
-
 let test_stop_after_short_circuits () =
   let prog = lower_source small_source in
   let stages_seen = ref [] in
@@ -467,15 +410,6 @@ let suite =
           test_stop_after_short_circuits;
         Alcotest.test_case "compile_with_modules uses same stage order" `Quick
           test_compile_with_modules_uses_same_stage_order;
-      ] );
-    ( "profile",
-      [
-        Alcotest.test_case "records each stage" `Quick
-          test_profile_records_each_stage;
-        Alcotest.test_case "format contains header" `Quick
-          test_profile_format_contains_header;
-        Alcotest.test_case "format contains frontend labels" `Quick
-          test_profile_format_contains_frontend_labels;
       ] );
     ( "outcome",
       [

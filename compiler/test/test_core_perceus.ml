@@ -194,7 +194,7 @@ let test_dimension_value_refinements_are_not_managed () =
     cases
 
 let test_variadic_dimension_pack_still_invalid_as_value () =
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Perceus)
     ~msg_contains:
       "variadic dimension pack reached ownership classifier in value position"
@@ -414,7 +414,7 @@ let test_not_managed_enum () =
     (Blorp.Core_perceus.is_managed_type env (TyNamed ("Color", [])))
 
 let test_unknown_named_type_raises () =
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Perceus)
     ~msg_contains:"ownership classifier has no layout for type Mystery"
     (fun () ->

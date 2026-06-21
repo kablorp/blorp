@@ -1083,14 +1083,14 @@ let test_tensor_peel_nonconstant_dims_raise_core_error () =
   let e =
     call_builtin "blorp_tensor_peel" [ coll; idx ] (tensor ty_int [ 3 ])
   in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
     ~msg_contains:"tensor_peel" (fun () -> ignore (specialize e))
 
 let test_vector_norm_non_tensor_raises_core_error () =
   let x = cvar "x" ty_int in
   let e = call_builtin "blorp_vector_norm" [ x ] ty_float in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
     ~msg_contains:"vector_norm requires a tensor argument" (fun () ->
       ignore (specialize e))
@@ -1102,7 +1102,7 @@ let test_matrix_multiply_non_tensor_operand_raises_core_error () =
     call_builtin "blorp_tensor_matrix_multiply" [ a; b ]
       (tensor ty_float [ 2; 4 ])
   in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
     ~msg_contains:"multiply requires tensor operands" (fun () ->
       ignore (specialize e))
@@ -1114,7 +1114,7 @@ let test_matrix_multiply_non_tensor_right_operand_raises_core_error () =
     call_builtin "blorp_tensor_matrix_multiply" [ a; b ]
       (tensor ty_float [ 2; 4 ])
   in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
     ~msg_contains:"multiply requires tensor operands" (fun () ->
       ignore (specialize e))
@@ -1125,7 +1125,7 @@ let test_vector_map_non_tensor_result_raises_core_error () =
     cvar "f" (TyFunc { params = [ ty_int ]; return = ty_int; is_pure = true })
   in
   let e = call_builtin "blorp_vector_map" [ v; f ] ty_list_int in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Specialize)
     ~msg_contains:"tensor map result must be a tensor" (fun () ->
       ignore (specialize e))

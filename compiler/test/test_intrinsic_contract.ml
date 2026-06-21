@@ -139,8 +139,9 @@ let registry_implemented_names () =
   |> List.sort_uniq String.compare
 
 let blorp_renderer_intrinsic_names () =
-  Compiler_blorp_bridge.renderer_template_names_exn
+  Compiler_blorp_bridge.renderer_template_infos_exn
     ~renderer:Compiler_blorp_bridge.intrinsic_renderer
+  |> List.map (fun info -> info.Compiler_blorp_bridge.renderer_template_name)
   |> List.sort_uniq String.compare
 
 (** The position-based scan is already strict enough that no non-intrinsic

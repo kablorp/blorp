@@ -24,8 +24,6 @@ let language_surface_renderer = "language_surface"
 let ( let* ) result f =
   match result with Ok value -> f value | Error _ as error -> error
 
-type render_item = { item_op : string; item_args : string list }
-
 type renderer_template_info = {
   renderer_template_name : string;
   renderer_template_arity : int;
@@ -477,11 +475,6 @@ let renderer_template_infos_cache :
 
 let bridge_temp_retry_limit = 32
 
-let clear_renderer_bridge_process_cache_for_test () =
-  renderer_bridge_cache := None;
-  Hashtbl.clear render_command_cache;
-  Hashtbl.clear renderer_template_infos_cache
-
 let running_inside_renderer_bridge_helper () =
   match Sys.getenv_opt renderer_bridge_helper_env with
   | Some "1" -> true
@@ -808,8 +801,8 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root parts =
             publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir
           end)
 
-let renderer_bridge_binary ?program () =
-  let program = Option.value program ~default:(default_command_program ()) in
+let renderer_bridge_binary () =
+  let program = default_command_program () in
   let source_path = renderer_bridge_source_path () in
   let cache_root = renderer_bridge_cache_root () in
   match !renderer_bridge_cache with
@@ -832,8 +825,8 @@ let renderer_bridge_binary ?program () =
           Ok binary
       | Error _ as error -> error)
 
-let run_renderer_request_via_blorp ?program request_json =
-  match renderer_bridge_binary ?program () with
+let run_renderer_request_via_blorp request_json =
+  match renderer_bridge_binary () with
   | Error message -> error_response "bridge_command_failed" message
   | Ok bridge_binary ->
       let request_path = write_temp_request request_json in
@@ -887,11 +880,7 @@ let renderer_template_arity_opt_exn ~renderer ~op =
   |> List.find_opt (fun info -> String.equal info.renderer_template_name op)
   |> Option.map (fun info -> info.renderer_template_arity)
 
-let renderer_template_names_exn ~renderer =
-  renderer_template_infos_exn ~renderer
-  |> List.map (fun info -> info.renderer_template_name)
-
-let render_via_command_exn ?program ~renderer ~op args =
+let render_via_command_exn ~renderer ~op args =
   if running_inside_renderer_bridge_helper () then
     match render_many_for_renderer_helper_exn ~renderer [ (op, args) ] with
     | [ (_, text) ] -> text
@@ -904,7 +893,7 @@ let render_via_command_exn ?program ~renderer ~op args =
     | Some text -> text
     | None -> (
         let response_json =
-          run_renderer_request_via_blorp ?program
+          run_renderer_request_via_blorp
             (render_request_json ~renderer ~op args)
         in
         match response_result response_json render_response_field with
@@ -913,13 +902,12 @@ let render_via_command_exn ?program ~renderer ~op args =
             text
         | Error (_, message) -> invalid_arg message)
 
-let render_many_via_command_exn ?program ~renderer items =
+let render_many_via_command_exn ~renderer items =
   if running_inside_renderer_bridge_helper () then
     render_many_for_renderer_helper_exn ~renderer items
   else
     let response_json =
-      run_renderer_request_via_blorp ?program
-        (render_many_request_json ~renderer items)
+      run_renderer_request_via_blorp (render_many_request_json ~renderer items)
     in
     match response_result response_json render_many_response_field with
     | Ok rendered -> rendered

@@ -116,7 +116,7 @@ let test_lower_builtin_raises () =
   (* EBuiltin is a placeholder for compiler-provided bodies. It should
      never reach lowering — if it does, something upstream is wrong
      and we raise loudly rather than silently producing CVoid. *)
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"EBuiltin reached lowering" (fun () ->
       let _ = lower_expr (mk_ast (EBuiltin None) ty_void) in
@@ -238,7 +238,7 @@ let test_lower_for () =
 let test_lower_for_unsupported_iterable_raises () =
   let iter = ast_var "not_iterable" ty_bool in
   let ast = mk_ast (EFor ("x", iter, ast_void)) ty_void in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"unsupported for-loop iterable type" (fun () ->
       ignore (lower_expr ast))
@@ -246,7 +246,7 @@ let test_lower_for_unsupported_iterable_raises () =
 let test_lower_for_tuple_unsupported_iterable_raises () =
   let iter = ast_var "not_iterable" ty_bool in
   let ast = mk_ast (EForTuple ([ "a"; "b" ], iter, ast_void)) ty_void in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"unsupported for-loop iterable type" (fun () ->
       ignore (lower_expr ast))
@@ -306,7 +306,7 @@ let test_lower_enumerate_nonconstant_tensor_inner_dims_raises () =
       (TyTuple [ ty_int; row_ty ])
   in
   let ast = mk_ast (EFor ("pair", iter, ast_void)) ty_void in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"enumerate over a 2D+ tensor with non-literal inner dims"
     (fun () -> ignore (lower_expr ast))
@@ -317,7 +317,7 @@ let test_lower_enumerate_non_array_raises () =
       (TyTuple [ ty_int; ty_bool ])
   in
   let ast = mk_ast (EFor ("pair", iter, ast_void)) ty_void in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"enumerate requires an array" (fun () ->
       ignore (lower_expr ast))
@@ -326,7 +326,7 @@ let test_lower_loop_view_outside_for_raises () =
   let vector_ty = TyNamed ("Tensor", [ ty_int; TyConstInt 8 ]) in
   let elem_ty = TyTuple [ TyRange (TyConstInt 8); ty_int ] in
   let ast = ast_loop_view LoopEnumerate (ast_var "xs" vector_ty) elem_ty in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"loop view reached core lowering outside a for-loop"
     (fun () -> ignore (lower_expr ast))
@@ -337,7 +337,7 @@ let test_lower_windows_non_array_raises () =
       (TyNamed ("Tensor", [ ty_bool; TyConstInt 2 ]))
   in
   let ast = mk_ast (EFor ("w", iter, ast_void)) ty_void in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"windows requires an array" (fun () ->
       ignore (lower_expr ast))
@@ -510,7 +510,7 @@ let test_lower_lambda_missing_body_raises () =
     }
   in
   let fty = TyFunc { params = []; return = ty_int; is_pure = true } in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"lambda has no body" (fun () ->
       ignore (lower_expr (mk_ast (ELambda func) fty)))
@@ -674,7 +674,7 @@ let test_lower_string_interp () =
   | _ -> Alcotest.fail "expected CStringInterp"
 
 let test_lower_raw_string_interp_raises () =
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"EStringInterpRaw reached lowering" (fun () ->
       ignore
@@ -984,7 +984,7 @@ let test_lower_concurrent () =
 
 let test_lower_concurrent_rejects_non_bindings () =
   let ast = mk_ast (EConcurrent ([ ast_void ], None, None)) ty_void in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"non-binding statement reached concurrent lowering" (fun () ->
       ignore (lower_expr ast))
@@ -1248,7 +1248,7 @@ let test_param_without_name_or_pattern_raises () =
       func_dim_constraints = [];
     }
   in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"param has neither name nor pattern" (fun () ->
       ignore
@@ -1270,7 +1270,7 @@ let test_function_without_name_raises () =
       func_dim_constraints = [];
     }
   in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"function has no name" (fun () ->
       ignore
@@ -1303,7 +1303,7 @@ let test_param_with_name_and_pattern_raises () =
     }
   in
   let decl = { decl_desc = DFunc func; decl_loc = loc; decl_doc = None } in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"param has both a name and a pattern" (fun () ->
       let _ = lower_decl decl in
@@ -1318,7 +1318,7 @@ let test_tuple_destruct_shape_mismatch_raises () =
   let destruct = mk_ast (ETupleDestruct ([ "a"; "b"; "c" ], pair)) ty_void in
   let body = ast_int 0 in
   let blk = ast_block [ destruct; body ] ty_int in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"tuple destructure has 3 names but tuple type has 2 fields"
     (fun () ->
@@ -1339,7 +1339,7 @@ let test_lower_program_propagates_decl_errors () =
     }
   in
   let decl = { decl_desc = DVar bad_global; decl_loc = loc; decl_doc = None } in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"global var with pattern binding" (fun () ->
       let _ = lower_program [ decl ] in
@@ -1358,7 +1358,7 @@ let test_global_pattern_var_direct_raises () =
       var_is_const = true;
     }
   in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Lower)
     ~msg_contains:"global var with pattern binding" (fun () ->
       ignore

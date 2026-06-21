@@ -114,7 +114,7 @@ let rec contains_call_to name expr =
 let test_removed_tuple_binding_guard_rejects_leftover_root_reference () =
   let root_var = Var.named "pair" in
   let body = field (mk ty_pair (CVar root_var)) "0" ty_int in
-  Blorp.Core_error.check_raises
+  Test_helpers.check_core_error_raises
     ~phase:(Blorp.Core_error.Stage Blorp.Core_stage.Fusion)
     ~msg_contains:"tuple SROA removed binding" (fun () ->
       Sroa.assert_removed_tuple_binding_unreferenced ~loc ~root_var body)

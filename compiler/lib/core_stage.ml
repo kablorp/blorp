@@ -82,9 +82,6 @@ let to_string = function
 
 let stage_names = List.map (fun stage -> (to_string stage, stage)) all
 
-let fallback_valid_stage_names () =
-  List.map fst stage_names |> String.concat ", "
-
 let unknown_stage_error_renderer : (string -> string -> string) option ref =
   ref None
 
@@ -94,7 +91,7 @@ let set_unknown_stage_error_renderer renderer =
 let unknown_stage_error original normalized =
   let fallback_message =
     Printf.sprintf "unknown stage %S (valid: %s)" original
-      (fallback_valid_stage_names ())
+      (List.map fst stage_names |> String.concat ", ")
   in
   let message =
     match !unknown_stage_error_renderer with

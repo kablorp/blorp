@@ -47,8 +47,16 @@ That is the correct architectural direction, but it is still transitional:
 - The compiled renderer bridge helper is content-addressed by production
   `compiler/blorp` source, the compiler binary, the C compiler identity, and
   the OS.
-- `emit_c` exists as a bridge action, but it currently validates and echoes
-  `CArtifact` JSON. It does not yet accept final Core JSON or own C emission.
+- `emit_c` exists as a bridge action and now accepts a typed final-Core JSON
+  envelope under the `core` payload field. Blorp validates that Core subset and
+  returns a `CArtifact`. It can emit a tiny valid-C subset for user functions
+  with typed parameters, simple literal/variable/void/string bodies with C
+  string escaping, unary operators, binary-operator bodies, short-circuit
+  logical expressions, assignment statements, ternary `if`, simple named calls
+  whose arguments are in the supported expression subset, basic `let`/sequence
+  statement bodies including void/discard let cases, and statement-shaped
+  `if/else` lowering with explicit result temporaries; most production C
+  emission still lives in OCaml.
 
 Approximate current source shape, measured from this worktree on 2026-06-20:
 
@@ -362,9 +370,12 @@ Implementation:
     `compiler/blorp/compiler_artifact_json.brp`, and the `emit_c` bridge action
     now validates and returns that artifact shape. The next step is to feed it
     final Core JSON instead of a minimal artifact payload.
-- Add JSON codecs in Blorp for these types.
+- Add JSON codecs in Blorp for these types. **Started for final-Core source
+  locations, types, variables, literals, call kinds, expressions, function
+  declarations, and programs.**
 - Add OCaml JSON projection only at the active transfer point.
-- Add round-trip tests for representative and edge-case values.
+- Add round-trip tests for representative and edge-case values. **Started for
+  the current final-Core JSON subset.**
 - Add golden JSON fixtures for final Core programs used by emission tests.
 
 Deletion:
@@ -397,6 +408,13 @@ Implementation:
   constants, intrinsic emission, prepared list/tensor/tuple/constructor/backend
   emission, closure emission, pattern emission, and profiling hooks.
 - Replace snippet-level bridge calls with one final-Core-to-C bridge request.
+  **Started at the protocol level: `emit_c` now consumes CoreProgram JSON and
+  returns a CArtifact, including a first real C function-emission subset for
+  parameters, simple expressions, escaped string literals, unary operators,
+  binary operators, short-circuit logical expressions, assignment statements,
+  ternary `if`, simple named calls, basic `let`/sequence statement bodies
+  including void/discard let cases, and statement-shaped `if/else` lowering with
+  explicit result temporaries.**
 - Keep C artifact output structured: C text, link flags, include dirs, runtime
   feature metadata.
 

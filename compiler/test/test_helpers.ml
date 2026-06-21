@@ -14,6 +14,23 @@ open Blorp.Types
 
 let contains_substring haystack needle = Blorp.Modules.contains haystack needle
 
+let check_core_error_raises ~(phase : Blorp.Core_error.phase_tag) ~msg_contains
+    f =
+  match f () with
+  | exception Blorp.Core_error.Core_error e ->
+      if e.phase <> phase then
+        Alcotest.failf "Core_error phase mismatch: expected %S, got %S (msg=%S)"
+          (Blorp.Core_error.phase_tag_to_string phase)
+          (Blorp.Core_error.phase_tag_to_string e.phase)
+          e.msg;
+      if not (contains_substring e.msg msg_contains) then
+        Alcotest.failf "Core_error msg %S does not contain %S" e.msg
+          msg_contains
+  | _ ->
+      Alcotest.failf "expected Core_error %s containing %S; no exception raised"
+        (Blorp.Core_error.phase_tag_to_string phase)
+        msg_contains
+
 (* ============================================================================
    Env isolation — run the test inside its own [Session.t]
 
