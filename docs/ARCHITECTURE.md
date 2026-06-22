@@ -29,12 +29,12 @@ Source (.brp)
     v
 +------------+
 | Core IR    |  Lowering → 16 observed transform stages → final preparation
-| pipeline   |  → final snapshot → default C backend (see "Core IR Pipeline")
+| pipeline   |  → final snapshot → C emission (see "Core IR Pipeline")
 +------------+
     |
     v
 +------------+
-| C Backend  |  core_emit_c.ml + runtime glue
+| C Emission |  Blorp artifact path, then OCaml fallback while migration continues
 +------------+
     |
     v
@@ -187,7 +187,7 @@ Typed AST
     |
     v
 +-------------------+
-| Core_emit_c.Backend |  Generate C from the final Core IR
+| C emission path   |  Generate C from the final Core IR
 +-------------------+
     |
     v
@@ -259,7 +259,8 @@ boxing, or ownership behavior from source spelling.
 | `core_reuse.ml` | Post-Perceus allocation reuse analysis and prepared-Core union-node reuse rewrites |
 | `core_closure.ml` | Closure conversion / lambda hoisting |
 | `core_perceus_check.ml` | RC balance simulator for testing |
-| `core_emit.ml`, `core_emit_c.ml` | Core → C emission and default C backend |
+| `core_emit_blorp_c.ml` | Core JSON projection for the Blorp-owned tail C path, preferring post-resource/pre-fairness Core and falling back to final Core for the supported subset |
+| `core_emit.ml` | OCaml Core → C fallback emission while Blorp backend coverage expands |
 | `core_emit_context.ml` | Emission state (buffers, lambda collection) |
 | `core_emit_intrinsic.ml`, `core_emit_list_intrinsic.ml` | Intrinsic and list-helper emission |
 | `core_emit_pattern.ml`, `core_emit_util.ml` | Pattern-emission and shared backend utilities |
@@ -344,8 +345,7 @@ compiler/
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
 │   ├── core_layout_type.ml  # Shared layout metadata types
 │   ├── core_perceus_check.ml # RC balance simulator (testing)
-│   ├── core_emit.ml       # Core IR → C emission
-│   ├── core_emit_c.ml     # Default C backend wrapper
+│   ├── core_emit.ml       # OCaml Core IR → C fallback emission
 │   ├── core_emit_context.ml # Core emission state
 │   ├── core_emit_intrinsic.ml # Intrinsic emission helpers
 │   ├── core_emit_list_intrinsic.ml # List intrinsic emission helpers

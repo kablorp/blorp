@@ -25,7 +25,6 @@ val compile_typed :
   ?debug:bool ->
   ?on_stage:on_stage_callback ->
   ?check_invariants:bool ->
-  ?backend:(module Backend.S) ->
   Typed_ast.program ->
   string
 (** Compile a typed single-file program to backend output. *)
@@ -37,7 +36,6 @@ val compile_typed_with_modules :
   ?debug:bool ->
   ?on_stage:on_stage_callback ->
   ?check_invariants:bool ->
-  ?backend:(module Backend.S) ->
   Typed_ast.program ->
   string * string list * string list
 (** Compile a typed main program plus loaded typed modules. Returns generated

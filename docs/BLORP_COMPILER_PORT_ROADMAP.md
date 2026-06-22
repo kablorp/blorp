@@ -47,21 +47,30 @@ That is the correct architectural direction, but it is still transitional:
 - The compiled renderer bridge helper is content-addressed by production
   `compiler/blorp` source, the compiler binary, the C compiler identity, and
   the OS.
-- `emit_c` exists as a bridge action and now accepts a typed final-Core JSON
-  envelope under the `core` payload field. Blorp validates that Core subset and
-  returns a `CArtifact`. It can emit a tiny valid-C subset for user functions
-  with typed parameters, simple literal/variable/void/string bodies with C
-  string escaping, unary operators, simple casts, binary-operator bodies
+- `emit_c` exists as a bridge action and now accepts a typed Core JSON envelope
+  under the `core` payload field. For the supported production path, OCaml first
+  hands Blorp post-resource/pre-fairness Core; Blorp inserts cooperative
+  checkpoints for loops before emitting C. If that earlier tail shape is
+  unsupported, OCaml falls back to the older final-Core handoff and then to the
+  OCaml backend. Blorp validates that Core subset and returns a `CArtifact`. It
+  can emit a tiny valid-C subset for user functions
+  with typed parameters, simple literal/variable/void/string/float/char bodies
+  with C string escaping, unary operators, simple casts, binary-operator bodies
   including safe integer divide/modulo lowering, short-circuit logical
-  expressions, assignment statements, ternary `if`, simple named calls whose
-  arguments are in the
-  supported expression subset, basic `let`/sequence statement bodies including
-  void/discard let cases, simple `while` loops with cooperative checkpoints,
+  expressions, explicit C type names for sized integer and float scalars,
+  assignment statements, ternary `if`, simple named calls and renderable
+  intrinsic calls whose arguments are in the supported expression subset, basic
+  `let`/sequence statement bodies including void/discard let cases, simple
+  `while` loops with Blorp-inserted cooperative checkpoints,
   `break`/`continue`, and statement-shaped `if/else` lowering with explicit
-  result temporaries. The default pipeline now attempts this Blorp path first,
-  including embedded-runtime compile requests; unsupported final Core and
-  profiling builds still fall back to the OCaml backend while the Blorp subset
-  expands.
+  result temporaries. It also owns range `for` loops over final-Core `CRange`
+  values and unmanaged `@tail_recursive` final-Core loops with explicit recur
+  parameter rebinding, plus payloadless enum declarations, enum-typed scalar
+  references/equality, payloadless enum constructor matches, and immutable
+  scalar literal globals. The default pipeline now attempts this Blorp path
+  first from the earlier tail boundary, including embedded-runtime compile requests;
+  unsupported final Core and profiling builds still fall back to the OCaml
+  backend while the Blorp subset expands.
 
 Approximate current source shape, measured from this worktree on 2026-06-20:
 
@@ -415,21 +424,33 @@ Implementation:
 - Replace snippet-level bridge calls with one final-Core-to-C bridge request.
   **Started at the protocol level: `emit_c` now consumes CoreProgram JSON and
   returns a CArtifact, including a first real C function-emission subset for
-  parameters, simple expressions, escaped string literals, unary operators,
-  binary operators, simple casts, short-circuit logical expressions, assignment
-  statements, ternary `if`, simple named calls, basic `let`/sequence statement
-  bodies including void/discard let cases, simple `while` loops with
+  parameters, simple expressions, escaped string/float/char literals, unary
+  operators, binary operators, simple casts, short-circuit logical expressions,
+  assignment statements, ternary `if`, simple named calls, basic `let`/sequence
+  statement bodies including void/discard let cases, simple `while` loops with
   cooperative checkpoints, `break`/`continue`, and statement-shaped `if/else`
-  lowering with explicit result temporaries. The default C backend now attempts
-  this Blorp backend first, including embedded-runtime compile requests, and
-  falls back to OCaml for unsupported final-Core shapes and profiling builds.**
+  lowering with explicit result temporaries, range `for` loops over final-Core
+  `CRange` values, scalar literal `match` decision trees over root
+  scrutinees including explicit fail fallbacks for exhaustive literal matches,
+  payloadless enum declarations with typed constructor references/equality and
+  payloadless enum constructor matches, immutable scalar literal globals, plus
+  unmanaged tail-recursive loops with explicit recur argument rebinding.
+  The single C emission path now attempts this Blorp backend first from
+  post-resource/pre-fairness Core, including embedded-runtime compile requests,
+  Blorp-owned cooperative checkpoint insertion, and intrinsic calls rendered by
+  the Blorp intrinsic renderer. It falls back to the final-Core handoff and then
+  to OCaml for unsupported tail shapes and profiling builds. The old generic
+  `Backend.S` wrapper
+  and `core_emit_c.ml` have been deleted. The OCaml backend unit suite has been
+  replaced with a source-level codegen audit that asserts the Blorp artifact path
+  is used by default for the supported final-Core subset.**
 - Keep C artifact output structured: C text, link flags, include dirs, runtime
   feature metadata.
 
 Deletion:
 
 - Delete `core_emit.ml`.
-- Delete `core_emit_c.ml`.
+- Delete `core_emit_c.ml`. **Done.**
 - Delete `core_emit_intrinsic.ml`.
 - Delete `core_emit_context.ml`.
 - Delete `core_emit_pattern.ml` if fully absorbed.

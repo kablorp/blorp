@@ -20,6 +20,10 @@ private PROGRAM_TAG: String = "program"
 
 private FUNCTION_TAG: String = "function"
 
+private GLOBAL_TAG: String = "global"
+
+private ENUM_DECL_TAG: String = "enum"
+
 private KNOWN_LOC_TAG: String = "known"
 
 private SYNTHETIC_LOC_TAG: String = "synthetic"
@@ -28,11 +32,17 @@ private VOID_TYPE_TAG: String = "void"
 
 private NAMED_TYPE_TAG: String = "named"
 
+private ENUM_TYPE_TAG: String = "enum"
+
 private TUPLE_TYPE_TAG: String = "tuple"
 
 private INT_LITERAL_TAG: String = "int"
 
+private FLOAT_LITERAL_TAG: String = "float"
+
 private BOOL_LITERAL_TAG: String = "bool"
+
+private CHAR_LITERAL_TAG: String = "char"
 
 private STRING_LITERAL_TAG: String = "string"
 
@@ -78,6 +88,20 @@ private BREAK_EXPR_TAG: String = "break"
 
 private CONTINUE_EXPR_TAG: String = "continue"
 
+private TAILREC_LOOP_EXPR_TAG: String = "tailrec_loop"
+
+private TAILREC_RECUR_EXPR_TAG: String = "tailrec_recur"
+
+private FOR_RANGE_EXPR_TAG: String = "for_range"
+
+private LITERAL_MATCH_EXPR_TAG: String = "literal_match"
+
+private CONSTRUCTOR_MATCH_EXPR_TAG: String = "constructor_match"
+
+private LITERAL_MATCH_FALLBACK_BODY_TAG: String = "body"
+
+private LITERAL_MATCH_FALLBACK_FAIL_TAG: String = "fail"
+
 private ADD_OP_TAG: String = "add"
 
 private SUBTRACT_OP_TAG: String = "subtract"
@@ -108,6 +132,10 @@ private AND_OP_TAG: String = "and"
 
 private OR_OP_TAG: String = "or"
 
+private RANGE_MAY_RUN_BACKWARD_TAG: String = "may_run_backward"
+
+private RANGE_FORWARD_ONLY_TAG: String = "forward_only"
+
 
 record CoreSourceSpan {
 	file: String,
@@ -133,12 +161,15 @@ record CoreVar {
 union CoreType:
 	VoidType
 	NamedType(String, List[CoreType])
+	EnumType(String)
 	TupleType(List[CoreType])
 
 
 union CoreLiteral:
 	IntLiteral(Int)
+	FloatLiteral(Float)
 	BoolLiteral(Bool)
+	CharLiteral(Int)
 	StringLiteral(String)
 
 
@@ -174,6 +205,18 @@ enum CoreLogicalOp:
 	OrOp
 
 
+enum CoreLoopRangeDirection:
+	RangeMayRunBackward
+	RangeForwardOnly
+
+
+record CoreLoopBinder {
+	variable: CoreVar,
+	typ: CoreType,
+	range_direction: CoreLoopRangeDirection
+}
+
+
 union CoreExpr:
 	LiteralExpr(CoreLiteral, CoreType, CoreSourceLoc)
 	VarExpr(CoreVar, CoreType, CoreSourceLoc)
@@ -184,13 +227,41 @@ union CoreExpr:
 	UnaryExpr(CoreUnaryOp, CoreExpr, CoreType, CoreSourceLoc)
 	LogicalExpr(CoreLogicalOp, CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
 	AssignExpr(CoreVar, CoreExpr, CoreType, CoreSourceLoc)
-	CastExpr(CoreExpr, CoreType, CoreType, CoreSourceLoc)
+	CastExpr(CoreExpr, CoreType, CoreSourceLoc)
 	LetExpr(CoreVar, Bool, CoreType, CoreExpr, CoreExpr)
 	SeqExpr(CoreExpr, CoreExpr)
 	WhileExpr(CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
 	BreakExpr(CoreType, CoreSourceLoc)
 	ContinueExpr(CoreType, CoreSourceLoc)
+	TailrecLoopExpr(List[CoreParam], CoreType, CoreExpr, CoreSourceLoc)
+	TailrecRecurExpr(List[CoreExpr], CoreType, CoreSourceLoc)
+	ForRangeExpr(CoreLoopBinder, CoreExpr, CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
+	LiteralMatchExpr(CoreExpr, List[CoreLiteralMatchCase], CoreLiteralMatchFallback, CoreType, CoreSourceLoc)
+	ConstructorMatchExpr(CoreExpr, List[CoreConstructorMatchCase], CoreConstructorMatchFallback, CoreType, CoreSourceLoc)
 	IfExpr(CoreExpr, CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
+
+
+record CoreLiteralMatchCase {
+	literal: CoreLiteral,
+	body: CoreExpr
+}
+
+
+union CoreLiteralMatchFallback:
+	LiteralMatchFallbackBody(CoreExpr)
+	LiteralMatchFallbackFail
+
+
+record CoreConstructorMatchCase {
+	constructor: String,
+	constructor_c_name: String,
+	body: CoreExpr
+}
+
+
+union CoreConstructorMatchFallback:
+	ConstructorMatchFallbackBody(CoreExpr)
+	ConstructorMatchFallbackFail
 
 
 record CoreParam {
@@ -221,8 +292,36 @@ record CoreFunction {
 }
 
 
+record CoreGlobal {
+	name: CoreVar,
+	typ: CoreType,
+	init: CoreExpr,
+	is_mutable: Bool,
+	is_const: Bool,
+	def_id: Int,
+	loc: CoreSourceLoc
+}
+
+
+record CoreEnumVariant {
+	name: String,
+	c_name: String,
+	tag: Int,
+	def_id: Option[Int]
+}
+
+
+record CoreEnumDecl {
+	name: String,
+	variants: List[CoreEnumVariant],
+	loc: CoreSourceLoc
+}
+
+
 union CoreDecl:
 	FunctionDecl(CoreFunction)
+	GlobalDecl(CoreGlobal)
+	EnumDecl(CoreEnumDecl)
 
 
 record CoreProgram {
@@ -236,6 +335,7 @@ union CoreJsonError:
 	CoreExpectedObjectField(String, String)
 	CoreExpectedStringField(String, String)
 	CoreExpectedIntField(String, String)
+	CoreExpectedNumberField(String, String)
 	CoreExpectedBoolField(String, String)
 	CoreExpectedArrayField(String, String)
 	CoreUnsupportedTag(String, String)
@@ -340,6 +440,20 @@ private pure func int_field(
 			Ok(to_int(number))
 		None:
 			Err(CoreExpectedIntField(path, field_name))
+
+
+private pure func number_field(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[Float, CoreJsonError]:
+	field ?= required_field(value, path, field_name)
+
+	match as_number(field):
+		Some(number):
+			Ok(number)
+		None:
+			Err(CoreExpectedNumberField(path, field_name))
 
 
 private pure func bool_field(
@@ -557,6 +671,11 @@ pure func core_type_to_json(typ: CoreType) -> JsonValue:
 				("name", JsonString(name)),
 				("args", core_type_list_to_json(args)),
 			])
+		EnumType(name):
+			JsonObject([
+				(KIND_FIELD, JsonString(ENUM_TYPE_TAG)),
+				("name", JsonString(name)),
+			])
 		TupleType(items):
 			JsonObject([
 				(KIND_FIELD, JsonString(TUPLE_TYPE_TAG)),
@@ -609,6 +728,9 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 		name ?= string_field(value, path, "name")
 		args ?= decode_core_type_list(value, path, "args")
 		Ok(NamedType(name, args))
+	else if tag == ENUM_TYPE_TAG:
+		name ?= string_field(value, path, "name")
+		Ok(EnumType(name))
 	else if tag == TUPLE_TYPE_TAG:
 		items ?= decode_core_type_list(value, path, "items")
 		Ok(TupleType(items))
@@ -623,10 +745,20 @@ pure func core_literal_to_json(literal: CoreLiteral) -> JsonValue:
 				(KIND_FIELD, JsonString(INT_LITERAL_TAG)),
 				("value", json_int(value)),
 			])
+		FloatLiteral(value):
+			JsonObject([
+				(KIND_FIELD, JsonString(FLOAT_LITERAL_TAG)),
+				("value", JsonNumber(value)),
+			])
 		BoolLiteral(value):
 			JsonObject([
 				(KIND_FIELD, JsonString(BOOL_LITERAL_TAG)),
 				("value", JsonBool(value)),
+			])
+		CharLiteral(value):
+			JsonObject([
+				(KIND_FIELD, JsonString(CHAR_LITERAL_TAG)),
+				("value", json_int(value)),
 			])
 		StringLiteral(value):
 			JsonObject([
@@ -644,9 +776,15 @@ pure func decode_core_literal_json(
 	if tag == INT_LITERAL_TAG:
 		n ?= int_field(value, path, "value")
 		Ok(IntLiteral(n))
+	else if tag == FLOAT_LITERAL_TAG:
+		number ?= number_field(value, path, "value")
+		Ok(FloatLiteral(number))
 	else if tag == BOOL_LITERAL_TAG:
 		flag ?= bool_field(value, path, "value")
 		Ok(BoolLiteral(flag))
+	else if tag == CHAR_LITERAL_TAG:
+		codepoint ?= int_field(value, path, "value")
+		Ok(CharLiteral(codepoint))
 	else if tag == STRING_LITERAL_TAG:
 		text ?= string_field(value, path, "value")
 		Ok(StringLiteral(text))
@@ -793,6 +931,273 @@ pure func parse_core_logical_op(tag: String, path: String) -> Result[CoreLogical
 		Err(CoreUnsupportedTag(path, tag))
 
 
+pure func core_loop_range_direction_to_string(direction: CoreLoopRangeDirection) -> String:
+	match direction:
+		RangeMayRunBackward:
+			RANGE_MAY_RUN_BACKWARD_TAG
+		RangeForwardOnly:
+			RANGE_FORWARD_ONLY_TAG
+
+
+pure func parse_core_loop_range_direction(
+	tag: String,
+	path: String,
+) -> Result[CoreLoopRangeDirection, CoreJsonError]:
+	if tag == RANGE_MAY_RUN_BACKWARD_TAG:
+		Ok(RangeMayRunBackward)
+	else if tag == RANGE_FORWARD_ONLY_TAG:
+		Ok(RangeForwardOnly)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+pure func core_loop_binder_to_json(binder: CoreLoopBinder) -> JsonValue:
+	JsonObject([
+		("var", core_var_to_json(binder.variable)),
+		("type", core_type_to_json(binder.typ)),
+		(
+			"range_direction",
+			JsonString(core_loop_range_direction_to_string(binder.range_direction)),
+		),
+	])
+
+
+pure func decode_core_loop_binder_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreLoopBinder, CoreJsonError]:
+	var_json ?= object_field(value, path, "var")
+	variable ?= decode_core_var_json(
+		var_json,
+		path_field(path, "var"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	range_direction_tag ?= string_field(value, path, "range_direction")
+	range_direction ?= parse_core_loop_range_direction(
+		range_direction_tag,
+		path_field(path, "range_direction"),
+	)
+
+	Ok({
+		variable = variable,
+		typ = typ,
+		range_direction = range_direction,
+	})
+
+
+pure func core_literal_match_case_to_json(match_case: CoreLiteralMatchCase) -> JsonValue:
+	JsonObject([
+		("literal", core_literal_to_json(match_case.literal)),
+		("body", core_expr_to_json(match_case.body)),
+	])
+
+
+private pure func core_literal_match_cases_to_json(cases: List[CoreLiteralMatchCase]) -> JsonValue:
+	var values: List[JsonValue] = []
+
+	for match_case in cases:
+		values = values.append(core_literal_match_case_to_json(match_case))
+
+	JsonVector(values)
+
+
+pure func core_literal_match_fallback_to_json(fallback: CoreLiteralMatchFallback) -> JsonValue:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			JsonObject([
+				(KIND_FIELD, JsonString(LITERAL_MATCH_FALLBACK_BODY_TAG)),
+				("body", core_expr_to_json(body)),
+			])
+		LiteralMatchFallbackFail:
+			JsonObject([(KIND_FIELD, JsonString(LITERAL_MATCH_FALLBACK_FAIL_TAG))])
+
+
+pure func decode_core_literal_match_case_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreLiteralMatchCase, CoreJsonError]:
+	literal_json ?= object_field(value, path, "literal")
+	literal ?= decode_core_literal_json(
+		literal_json,
+		path_field(path, "literal"),
+	)
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_expr_json(
+		body_json,
+		path_field(path, "body"),
+	)
+
+	Ok({
+		literal = literal,
+		body = body,
+	})
+
+
+private pure func decode_core_literal_match_cases(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[List[CoreLiteralMatchCase], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: List[CoreLiteralMatchCase] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		match error:
+			Some(existing_error):
+				void
+			None:
+				match decode_core_literal_match_case_json(
+					item,
+					path_index(
+						path_field(path, field_name),
+						index,
+					),
+				):
+					Ok(match_case):
+						result = result.append(match_case)
+					Err(err):
+						error = Some(err)
+
+		index += 1
+
+	match error:
+		Some(existing_error):
+			Err(existing_error)
+		None:
+			Ok(result)
+
+
+pure func decode_core_literal_match_fallback_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreLiteralMatchFallback, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == LITERAL_MATCH_FALLBACK_BODY_TAG:
+		body_json ?= object_field(value, path, "body")
+		body ?= decode_core_expr_json(
+			body_json,
+			path_field(path, "body"),
+		)
+		Ok(LiteralMatchFallbackBody(body))
+	else if tag == LITERAL_MATCH_FALLBACK_FAIL_TAG:
+		Ok(LiteralMatchFallbackFail)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+pure func core_constructor_match_case_to_json(match_case: CoreConstructorMatchCase) -> JsonValue:
+	JsonObject([
+		("constructor", JsonString(match_case.constructor)),
+		("constructor_c_name", JsonString(match_case.constructor_c_name)),
+		("body", core_expr_to_json(match_case.body)),
+	])
+
+
+private pure func core_constructor_match_cases_to_json(
+	cases: List[CoreConstructorMatchCase],
+) -> JsonValue:
+	var values: List[JsonValue] = []
+
+	for match_case in cases:
+		values = values.append(core_constructor_match_case_to_json(match_case))
+
+	JsonVector(values)
+
+
+pure func core_constructor_match_fallback_to_json(
+	fallback: CoreConstructorMatchFallback,
+) -> JsonValue:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			JsonObject([
+				(KIND_FIELD, JsonString(LITERAL_MATCH_FALLBACK_BODY_TAG)),
+				("body", core_expr_to_json(body)),
+			])
+		ConstructorMatchFallbackFail:
+			JsonObject([(KIND_FIELD, JsonString(LITERAL_MATCH_FALLBACK_FAIL_TAG))])
+
+
+pure func decode_core_constructor_match_case_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreConstructorMatchCase, CoreJsonError]:
+	constructor ?= string_field(value, path, "constructor")
+	constructor_c_name ?= string_field(value, path, "constructor_c_name")
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_expr_json(
+		body_json,
+		path_field(path, "body"),
+	)
+
+	Ok({
+		constructor = constructor,
+		constructor_c_name = constructor_c_name,
+		body = body,
+	})
+
+
+private pure func decode_core_constructor_match_cases(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[List[CoreConstructorMatchCase], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: List[CoreConstructorMatchCase] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		match error:
+			Some(existing_error):
+				void
+			None:
+				match decode_core_constructor_match_case_json(
+					item,
+					path_index(
+						path_field(path, field_name),
+						index,
+					),
+				):
+					Ok(match_case):
+						result = result.append(match_case)
+					Err(err):
+						error = Some(err)
+
+		index += 1
+
+	match error:
+		Some(existing_error):
+			Err(existing_error)
+		None:
+			Ok(result)
+
+
+pure func decode_core_constructor_match_fallback_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreConstructorMatchFallback, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == LITERAL_MATCH_FALLBACK_BODY_TAG:
+		body_json ?= object_field(value, path, "body")
+		body ?= decode_core_expr_json(
+			body_json,
+			path_field(path, "body"),
+		)
+		Ok(ConstructorMatchFallbackBody(body))
+	else if tag == LITERAL_MATCH_FALLBACK_FAIL_TAG:
+		Ok(ConstructorMatchFallbackFail)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
 private pure func core_expr_list_to_json(items: List[CoreExpr]) -> JsonValue:
 	var values: List[JsonValue] = []
 
@@ -873,11 +1278,10 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 				("type", core_type_to_json(typ)),
 				("loc", source_loc_to_json(loc)),
 			])
-		CastExpr(expr_value, target_type, typ, loc):
+		CastExpr(expr_value, typ, loc):
 			JsonObject([
 				(KIND_FIELD, JsonString(CAST_EXPR_TAG)),
 				("expr", core_expr_to_json(expr_value)),
-				("target_type", core_type_to_json(target_type)),
 				("type", core_type_to_json(typ)),
 				("loc", source_loc_to_json(loc)),
 			])
@@ -913,6 +1317,49 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 		ContinueExpr(typ, loc):
 			JsonObject([
 				(KIND_FIELD, JsonString(CONTINUE_EXPR_TAG)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
+		TailrecLoopExpr(params, return_type, body, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(TAILREC_LOOP_EXPR_TAG)),
+				("params", core_params_to_json(params)),
+				("return_type", core_type_to_json(return_type)),
+				("body", core_expr_to_json(body)),
+				("loc", source_loc_to_json(loc)),
+			])
+		TailrecRecurExpr(args, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(TAILREC_RECUR_EXPR_TAG)),
+				("args", core_expr_list_to_json(args)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(FOR_RANGE_EXPR_TAG)),
+				("binder", core_loop_binder_to_json(binder)),
+				("start", core_expr_to_json(start)),
+				("end", core_expr_to_json(end_value)),
+				("body", core_expr_to_json(body)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(LITERAL_MATCH_EXPR_TAG)),
+				("scrutinee", core_expr_to_json(scrutinee)),
+				("cases", core_literal_match_cases_to_json(cases)),
+				("fallback", core_literal_match_fallback_to_json(fallback)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
+		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(CONSTRUCTOR_MATCH_EXPR_TAG)),
+				("scrutinee", core_expr_to_json(scrutinee)),
+				("cases", core_constructor_match_cases_to_json(cases)),
+				("fallback", core_constructor_match_fallback_to_json(fallback)),
 				("type", core_type_to_json(typ)),
 				("loc", source_loc_to_json(loc)),
 			])
@@ -1151,11 +1598,6 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 			expr_json,
 			path_field(path, "expr"),
 		)
-		target_type_json ?= object_field(value, path, "target_type")
-		target_type ?= decode_core_type_json(
-			target_type_json,
-			path_field(path, "target_type"),
-		)
 		type_json ?= object_field(value, path, "type")
 		typ ?= decode_core_type_json(
 			type_json,
@@ -1166,7 +1608,7 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 			loc_json,
 			path_field(path, "loc"),
 		)
-		Ok(CastExpr(expr_value, target_type, typ, loc))
+		Ok(CastExpr(expr_value, typ, loc))
 	else if tag == LET_EXPR_TAG:
 		name_json ?= object_field(value, path, "name")
 		name ?= decode_core_var_json(
@@ -1248,6 +1690,115 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 			path_field(path, "loc"),
 		)
 		Ok(ContinueExpr(typ, loc))
+	else if tag == TAILREC_LOOP_EXPR_TAG:
+		params ?= decode_core_params(value, path, "params")
+		return_type_json ?= object_field(value, path, "return_type")
+		return_type ?= decode_core_type_json(
+			return_type_json,
+			path_field(path, "return_type"),
+		)
+		body_json ?= object_field(value, path, "body")
+		body ?= decode_core_expr_json(
+			body_json,
+			path_field(path, "body"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(TailrecLoopExpr(params, return_type, body, loc))
+	else if tag == TAILREC_RECUR_EXPR_TAG:
+		args ?= decode_core_expr_list(value, path, "args")
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(TailrecRecurExpr(args, typ, loc))
+	else if tag == FOR_RANGE_EXPR_TAG:
+		binder_json ?= object_field(value, path, "binder")
+		binder ?= decode_core_loop_binder_json(
+			binder_json,
+			path_field(path, "binder"),
+		)
+		start_json ?= object_field(value, path, "start")
+		start ?= decode_core_expr_json(
+			start_json,
+			path_field(path, "start"),
+		)
+		end_json ?= object_field(value, path, "end")
+		end_value ?= decode_core_expr_json(
+			end_json,
+			path_field(path, "end"),
+		)
+		body_json ?= object_field(value, path, "body")
+		body ?= decode_core_expr_json(
+			body_json,
+			path_field(path, "body"),
+		)
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(ForRangeExpr(binder, start, end_value, body, typ, loc))
+	else if tag == LITERAL_MATCH_EXPR_TAG:
+		scrutinee_json ?= object_field(value, path, "scrutinee")
+		scrutinee ?= decode_core_expr_json(
+			scrutinee_json,
+			path_field(path, "scrutinee"),
+		)
+		cases ?= decode_core_literal_match_cases(value, path, "cases")
+		fallback_json ?= object_field(value, path, "fallback")
+		fallback ?= decode_core_literal_match_fallback_json(
+			fallback_json,
+			path_field(path, "fallback"),
+		)
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(LiteralMatchExpr(scrutinee, cases, fallback, typ, loc))
+	else if tag == CONSTRUCTOR_MATCH_EXPR_TAG:
+		scrutinee_json ?= object_field(value, path, "scrutinee")
+		scrutinee ?= decode_core_expr_json(
+			scrutinee_json,
+			path_field(path, "scrutinee"),
+		)
+		cases ?= decode_core_constructor_match_cases(value, path, "cases")
+		fallback_json ?= object_field(value, path, "fallback")
+		fallback ?= decode_core_constructor_match_fallback_json(
+			fallback_json,
+			path_field(path, "fallback"),
+		)
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc))
 	else if tag == IF_EXPR_TAG:
 		cond_json ?= object_field(value, path, "cond")
 		cond ?= decode_core_expr_json(
@@ -1478,10 +2029,165 @@ pure func decode_core_function_json(
 		})
 
 
+pure func core_global_to_json(global: CoreGlobal) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(GLOBAL_TAG)),
+		("name", core_var_to_json(global.name)),
+		("type", core_type_to_json(global.typ)),
+		("init", core_expr_to_json(global.init)),
+		("mutable", JsonBool(global.is_mutable)),
+		("const", JsonBool(global.is_const)),
+		("def_id", json_int(global.def_id)),
+		("loc", source_loc_to_json(global.loc)),
+	])
+
+
+pure func decode_core_global_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreGlobal, CoreJsonError]:
+	name_json ?= object_field(value, path, "name")
+	name ?= decode_core_var_json(
+		name_json,
+		path_field(path, "name"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	init_json ?= object_field(value, path, "init")
+	init ?= decode_core_expr_json(
+		init_json,
+		path_field(path, "init"),
+	)
+	is_mutable ?= bool_field(value, path, "mutable")
+	is_const ?= bool_field(value, path, "const")
+	def_id ?= int_field(value, path, "def_id")
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	Ok({
+		name = name,
+		typ = typ,
+		init = init,
+		is_mutable = is_mutable,
+		is_const = is_const,
+		def_id = def_id,
+		loc = loc,
+	})
+
+
+pure func core_enum_variant_to_json(variant: CoreEnumVariant) -> JsonValue:
+	JsonObject([
+		("name", JsonString(variant.name)),
+		("c_name", JsonString(variant.c_name)),
+		("tag", json_int(variant.tag)),
+		("def_id", option_int_to_json(variant.def_id)),
+	])
+
+
+private pure func core_enum_variants_to_json(variants: List[CoreEnumVariant]) -> JsonValue:
+	var values: List[JsonValue] = []
+
+	for variant in variants:
+		values = values.append(core_enum_variant_to_json(variant))
+
+	JsonVector(values)
+
+
+pure func decode_core_enum_variant_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreEnumVariant, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	c_name ?= string_field(value, path, "c_name")
+	tag ?= int_field(value, path, "tag")
+	def_id ?= decode_optional_int(value, path, "def_id")
+
+	Ok({
+		name = name,
+		c_name = c_name,
+		tag = tag,
+		def_id = def_id,
+	})
+
+
+private pure func decode_core_enum_variants(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[List[CoreEnumVariant], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: List[CoreEnumVariant] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		match error:
+			Some(existing_error):
+				void
+			None:
+				match decode_core_enum_variant_json(
+					item,
+					path_index(
+						path_field(path, field_name),
+						index,
+					),
+				):
+					Ok(variant):
+						result = result.append(variant)
+					Err(err):
+						error = Some(err)
+
+		index += 1
+
+	match error:
+		Some(existing_error):
+			Err(existing_error)
+		None:
+			Ok(result)
+
+
+pure func core_enum_decl_to_json(enum_decl: CoreEnumDecl) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(ENUM_DECL_TAG)),
+		("name", JsonString(enum_decl.name)),
+		("variants", core_enum_variants_to_json(enum_decl.variants)),
+		("loc", source_loc_to_json(enum_decl.loc)),
+	])
+
+
+pure func decode_core_enum_decl_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreEnumDecl, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	variants ?= decode_core_enum_variants(value, path, "variants")
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	Ok({
+		name = name,
+		variants = variants,
+		loc = loc,
+	})
+
+
 pure func core_decl_to_json(decl: CoreDecl) -> JsonValue:
 	match decl:
 		FunctionDecl(core_func):
 			core_function_to_json(core_func)
+		GlobalDecl(global):
+			core_global_to_json(global)
+		EnumDecl(enum_decl):
+			core_enum_decl_to_json(enum_decl)
 
 
 pure func decode_core_decl_json(value: JsonValue, path: String) -> Result[CoreDecl, CoreJsonError]:
@@ -1490,6 +2196,12 @@ pure func decode_core_decl_json(value: JsonValue, path: String) -> Result[CoreDe
 	if tag == FUNCTION_TAG:
 		core_func ?= decode_core_function_json(value, path)
 		Ok(FunctionDecl(core_func))
+	else if tag == GLOBAL_TAG:
+		global ?= decode_core_global_json(value, path)
+		Ok(GlobalDecl(global))
+	else if tag == ENUM_DECL_TAG:
+		enum_decl ?= decode_core_enum_decl_json(value, path)
+		Ok(EnumDecl(enum_decl))
 	else:
 		Err(CoreUnsupportedTag(path, tag))
 
@@ -1569,6 +2281,8 @@ pure func core_json_error_to_string(error: CoreJsonError) -> String:
 			"Core JSON field at " + path + " must be a string: " + field_name
 		CoreExpectedIntField(path, field_name):
 			"Core JSON field at " + path + " must be an integer: " + field_name
+		CoreExpectedNumberField(path, field_name):
+			"Core JSON field at " + path + " must be a number: " + field_name
 		CoreExpectedBoolField(path, field_name):
 			"Core JSON field at " + path + " must be a boolean: " + field_name
 		CoreExpectedArrayField(path, field_name):

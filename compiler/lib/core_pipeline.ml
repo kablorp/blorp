@@ -32,7 +32,7 @@
     20. [Core_codegen_prepare] — make final representation/layout facts explicit
     21. [Core_reuse] prepared union reuse — reuse source-owned union nodes after
        constructors and box/unbox storage have explicit final-Core shapes
-    22. [Core_emit_c] — Core IR → C string via the default backend
+    22. backend emit — final Core → C string, preferring Blorp-owned emission
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -124,109 +124,99 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
     on_stage_callback =
  fun stage prog -> fire_stage ~check_invariants ~user stage prog
 
-(** Run emission through the default C backend, honoring the
-    C-specific [embed_runtime] flag. Used by [compile] and
-    [compile_with_modules] when no custom backend is selected. *)
-let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
+(** Run tail Core emission through the single C path. Supported tail subsets are
+    emitted by Blorp, preferring the earlier post-resource/pre-fairness Core so
+    Blorp owns cooperative checkpoint insertion for that path. Unsupported shapes
+    fall back to the final-Core handoff and then to the older OCaml emitter until
+    Blorp owns the complete backend. *)
+let emit_via_c_backend ?tail_prog ~(embed_runtime : bool) ~(profile : bool)
     ~(reg : Codegen_types.registry) (prog : Core.core_program) : string =
   let emit_with_ocaml_backend () =
-    let cfg =
-      Core_emit_c.Backend.config_with_embed ~embed_runtime ~profile ()
-    in
-    let ctx = Core_emit_c.Backend.create_ctx ~reg cfg in
-    Core_emit_c.Backend.emit_program ctx prog;
-    Core_emit_c.Backend.finalize ctx
+    let ctx = Core_emit_context.create ~profile ~reg () in
+    Core_emit.emit_program ~embed_runtime ctx prog;
+    Buffer.contents ctx.output
   in
-  let cfg =
-    Core_emit_blorp_c.Backend.config_with_embed ~embed_runtime ~profile ()
+  let cfg = Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile () in
+  let rec try_blorp_programs = function
+    | [] -> emit_with_ocaml_backend ()
+    | candidate :: rest -> (
+        match Core_emit_blorp_c.try_emit_program_string cfg candidate with
+        | Ok c_code -> c_code
+        | Error _ -> try_blorp_programs rest)
   in
-  match Core_emit_blorp_c.try_emit_program_string cfg prog with
-  | Ok c_code -> c_code
-  | Error _ -> emit_with_ocaml_backend ()
+  match tail_prog with
+  | Some tail_prog -> try_blorp_programs [ tail_prog; prog ]
+  | None -> try_blorp_programs [ prog ]
 
-(** Run emission through a caller-supplied backend using its default
-    config. C-specific options ([embed_runtime]) are deliberately NOT
-    in this function's signature — a non-C backend has no concept of
-    embedding the C runtime, and silently accepting a [~embed_runtime]
-    arg would be a foot-gun: the caller thinks they're configuring
-    the backend, the backend ignores the flag, and the resulting
-    output mysteriously differs from the C-backend path.
-
-    When a future non-C backend needs per-call configuration
-    ([optimization_level] for LLVM, [wasm_simd_enabled] for WASM,
-    …), extend [Backend.S] with a config builder or expose
-    backend-specific entry points — don't plumb more flags through
-    this function. *)
-let emit_via_custom_backend (module B : Backend.S)
-    ~(reg : Codegen_types.registry) (prog : Core.core_program) : string =
-  let ctx = B.create_ctx ~reg B.default_config in
-  B.emit_program ctx prog;
-  B.finalize ctx
-
-(** Dispatch between the default C backend and a caller-supplied one. *)
-let emit_via_backend ?(backend : (module Backend.S) option)
-    ~(embed_runtime : bool) ~(profile : bool) ~(reg : Codegen_types.registry)
-    (prog : Core.core_program) : string =
-  match backend with
-  | Some b -> emit_via_custom_backend b ~reg prog
-  | None -> emit_via_c_backend ~embed_runtime ~profile ~reg prog
+type core_tail_programs = {
+  pre_fairness : Core.core_program;
+      (** Post-resource Core before cooperative fairness and final preparation.
+          The supported Blorp backend tries this first so the JSON handoff moves
+          left for tail emission without changing final-stage observability. *)
+  final : Core.core_program;
+}
 
 (** Run the shared Core-to-Core pass chain starting from an already-lowered
     [core_program]. [compile] and [compile_with_modules] differ in how they
     assemble that initial program (single file vs. loaded modules), but the
     pass ordering after lowering is identical. Keeping the sequence in one
     place prevents stage drift between the two entry points. *)
-let run_core_passes ?(import_aliases = Hashtbl.create 0)
+let run_core_passes_with_tail ?(import_aliases = Hashtbl.create 0)
     ?(module_imports = Hashtbl.create 0) ~(on_stage : on_stage_callback)
     ~(reg : Codegen_types.registry) ?(debug = false) (prog : Core.core_program)
-    : Core.core_program =
+    : core_tail_programs =
   let observe stage prog =
     on_stage stage prog;
     prog
   in
   let run_stage stage pass prog = pass prog |> observe stage in
-  prog |> observe Core_stage.Lower
-  |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
-  |> run_stage Core_stage.Desugar (fun p ->
-      p |> Core_desugar.desugar_program |> Core_ssa.desugar_mut_program)
-  |> run_stage Core_stage.Mono (fun p ->
-      p
-      |> Core_mono.monomorphize_program ~reg ~import_aliases ~module_imports
-      |> Core_list_layout.annotate_program ~reg)
-  |> run_stage Core_stage.Synth (Core_synth.synthesize_program ~reg)
-  |> run_stage Core_stage.Match Core_match.compile_program
-  |> run_stage Core_stage.TraitResolve
-       (Core_trait_resolve.resolve_program ~import_aliases ~module_imports)
-  |> run_stage Core_stage.Resolve
-       (Core_resolve.resolve_program ~import_aliases ~module_imports)
-  |> run_stage Core_stage.StdInline Core_std_inline.rewrite_program
-  |> run_stage Core_stage.Tailrec (Core_tailrec.lower_program ~reg)
-  |> run_stage Core_stage.Fusion (fun p ->
-      p
-      |> Core_string_pipeline.fuse_program ~reg
-      |> Core_collection_pipeline.fuse_program ~reg
-      |> Core_parallel_tensor_pipeline.fuse_program ~reg
-      |> Core_tensor_fusion.fuse_program ~reg
-      |> Core_tuple_sroa.rewrite_program ~reg)
-  |> run_stage Core_stage.Specialize (fun p ->
-      p
-      |> Core_specialize.specialize_program ~reg
-      |> Core_closure.adapt_function_refs_program)
-  |> run_stage Core_stage.Dce (Core_dce.prune_unreachable_declarations ~reg)
-  |> run_stage Core_stage.ConsumeSpecialize
-       (Core_consume_specialize.rewrite_program ~reg)
-  |> run_stage Core_stage.Perceus Core_perceus.insert_drops_program
-  |> run_stage Core_stage.Reuse (Core_reuse.rewrite_program ~reg)
-  |> run_stage Core_stage.Closure
-       (Core_closure.convert_program ~wrap_function_refs:false)
-  |> Core_resource.rewrite_nonlocal_exits_program
-  |> Core_fairness.insert_program_checkpoints
-  |> Core_codegen_prepare.prepare_program ~reg
-  |> Core_reuse.rewrite_prepared_program ~reg
-  |> observe Core_stage.Final
+  let pre_fairness =
+    prog |> observe Core_stage.Lower
+    |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
+    |> run_stage Core_stage.Desugar (fun p ->
+        p |> Core_desugar.desugar_program |> Core_ssa.desugar_mut_program)
+    |> run_stage Core_stage.Mono (fun p ->
+        p
+        |> Core_mono.monomorphize_program ~reg ~import_aliases ~module_imports
+        |> Core_list_layout.annotate_program ~reg)
+    |> run_stage Core_stage.Synth (Core_synth.synthesize_program ~reg)
+    |> run_stage Core_stage.Match Core_match.compile_program
+    |> run_stage Core_stage.TraitResolve
+         (Core_trait_resolve.resolve_program ~import_aliases ~module_imports)
+    |> run_stage Core_stage.Resolve
+         (Core_resolve.resolve_program ~import_aliases ~module_imports)
+    |> run_stage Core_stage.StdInline Core_std_inline.rewrite_program
+    |> run_stage Core_stage.Tailrec (Core_tailrec.lower_program ~reg)
+    |> run_stage Core_stage.Fusion (fun p ->
+        p
+        |> Core_string_pipeline.fuse_program ~reg
+        |> Core_collection_pipeline.fuse_program ~reg
+        |> Core_parallel_tensor_pipeline.fuse_program ~reg
+        |> Core_tensor_fusion.fuse_program ~reg
+        |> Core_tuple_sroa.rewrite_program ~reg)
+    |> run_stage Core_stage.Specialize (fun p ->
+        p
+        |> Core_specialize.specialize_program ~reg
+        |> Core_closure.adapt_function_refs_program)
+    |> run_stage Core_stage.Dce (Core_dce.prune_unreachable_declarations ~reg)
+    |> run_stage Core_stage.ConsumeSpecialize
+         (Core_consume_specialize.rewrite_program ~reg)
+    |> run_stage Core_stage.Perceus Core_perceus.insert_drops_program
+    |> run_stage Core_stage.Reuse (Core_reuse.rewrite_program ~reg)
+    |> run_stage Core_stage.Closure
+         (Core_closure.convert_program ~wrap_function_refs:false)
+    |> Core_resource.rewrite_nonlocal_exits_program
+  in
+  let final =
+    pre_fairness |> Core_fairness.insert_program_checkpoints
+    |> Core_codegen_prepare.prepare_program ~reg
+    |> Core_reuse.rewrite_prepared_program ~reg
+    |> observe Core_stage.Final
+  in
+  { pre_fairness; final }
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
-    ?(on_stage = no_op_on_stage) ?(check_invariants = false) ?backend
+    ?(on_stage = no_op_on_stage) ?(check_invariants = false)
     (typed_program : Typed_ast.program) : string =
   let on_stage = make_stage_hook ~check_invariants ~user:on_stage in
   Session.reset_core_counters (Session.current ());
@@ -239,8 +229,9 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
   Core_flatten.register_types reg core_prog;
   let core_prog = Core_ffi_boundary.annotate_program ~reg core_prog in
   let core_prog = Core_list_layout.annotate_program ~reg core_prog in
-  let final_prog = run_core_passes ~on_stage ~reg ~debug core_prog in
-  emit_via_backend ?backend ~embed_runtime ~profile ~reg final_prog
+  let tail = run_core_passes_with_tail ~on_stage ~reg ~debug core_prog in
+  emit_via_c_backend ~tail_prog:tail.pre_fairness ~embed_runtime ~profile ~reg
+    tail.final
 
 (** Compile a typed AST program with module support.
 
@@ -252,7 +243,7 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     Returns [(c_code, link_flags, include_dirs)]. *)
 let compile_typed_with_modules ?(main_import_bindings = [])
     ?(embed_runtime = true) ?(profile = false) ?(debug = false)
-    ?(on_stage = no_op_on_stage) ?(check_invariants = false) ?backend
+    ?(on_stage = no_op_on_stage) ?(check_invariants = false)
     (typed_main : Typed_ast.program) : string * string list * string list =
   let on_stage = make_stage_hook ~check_invariants ~user:on_stage in
   let program = Typed_ast.program_ast typed_main in
@@ -327,11 +318,13 @@ let compile_typed_with_modules ?(main_import_bindings = [])
   Core_flatten.register_types reg full;
   let full = Core_ffi_boundary.annotate_program ~reg full in
   let full = Core_list_layout.annotate_program ~reg full in
-  let final_prog =
-    run_core_passes ~on_stage ~reg ~import_aliases ~module_imports ~debug full
+  let tail =
+    run_core_passes_with_tail ~on_stage ~reg ~import_aliases ~module_imports
+      ~debug full
   in
   let output =
-    emit_via_backend ?backend ~embed_runtime ~profile ~reg final_prog
+    emit_via_c_backend ~tail_prog:tail.pre_fairness ~embed_runtime ~profile ~reg
+      tail.final
   in
   (* Foreign metadata is pulled from the lowered program rather than the
      loaded-module AST so main-program FFI declarations are included too. *)

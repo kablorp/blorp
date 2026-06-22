@@ -152,9 +152,9 @@ let lower_valid_program program =
   Blorp.Core_lower.lower_typed_program (expect_valid_typed_program program)
 
 let compile_valid_program ?embed_runtime ?profile ?debug ?on_stage
-    ?check_invariants ?backend program =
+    ?check_invariants program =
   Blorp.Core_pipeline.compile_typed ?embed_runtime ?profile ?debug ?on_stage
-    ?check_invariants ?backend
+    ?check_invariants
     (expect_valid_typed_program program)
 
 (** Assert source produces at least one error whose message contains [message]. *)

@@ -247,9 +247,6 @@ let () =
         (fun (name, cases) -> ("IntrinsicContract." ^ name, cases))
         Test_intrinsic_contract.suite
     @ List.map
-        (fun (name, cases) -> ("Backend." ^ name, cases))
-        Test_backend.suite
-    @ List.map
         (fun (name, cases) -> ("TestRunner." ^ name, cases))
         Test_test_runner.suite
     @ List.map

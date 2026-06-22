@@ -334,8 +334,7 @@ let reset_core_counters (s : t) : unit =
   s.ssa_mut_counter <- 0;
   (* Reset [def_id_counter] too so repeated compiles of the same source yield
      identical mangled symbols. Without the reset, a second compile produces
-     shifted DefIds and different
-     C output, breaking [Test_backend.explicit_backend_roundtrips]
+     shifted DefIds and different C output, breaking stable generated-C audits
      and any future output-cache checks. Typecheck-time DefIds
      ([ol_def_id] / [ii_def_id] / [td_def_id]) are not affected —
      those are minted during module load, which happens before
