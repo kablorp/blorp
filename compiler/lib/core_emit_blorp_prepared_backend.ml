@@ -1195,18 +1195,6 @@ let render_set_constructor = function
         (custom_ctor_template_name ~prefix:"backend_set_ctor" elem_release)
         [ hash_fn; equals_fn ]
 
-let render_set_iter_entry_key ~entry =
-  render_template "backend_set_iter_entry_key" [ entry ]
-
-let emit_set_iter_header ~emit_expr ctx ~set ~entry source =
-  let source_arg = render_arg ~emit_expr ctx source in
-  Core_emit_context.emit_line ctx
-    (render_template "backend_set_iter_header" [ set; source_arg; entry ])
-
-let emit_set_iter_release ctx ~set =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_set_iter_release" [ set ])
-
 let emit_string_find_byte_from ~emit_expr ctx source byte start =
   let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
   let source_arg = render_arg ~emit_expr ctx source in
@@ -1307,28 +1295,6 @@ let render_dict_value_release_init temp_seed =
 
 let render_dict_insert temp_seed ~key_arg ~value_arg =
   render_template "backend_dict_insert" [ temp_seed; key_arg; value_arg ]
-
-let emit_dict_iter_header ~emit_expr ctx ~dict ~index source =
-  let source_arg = render_arg ~emit_expr ctx source in
-  Core_emit_context.emit_line ctx
-    (render_template "backend_dict_iter_header" [ dict; source_arg; index ])
-
-let emit_dict_iter_slot_binding ctx ~slot ~dict ~index =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_dict_iter_slot_binding" [ slot; dict; index ])
-
-let emit_dict_iter_deleted_slot_guard ctx ~slot =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_dict_iter_deleted_slot_guard" [ slot ])
-
-let emit_dict_iter_key_binding ctx ~key_c_type ~binding ~dict ~slot =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_dict_iter_key_binding"
-       [ key_c_type; binding; dict; slot ])
-
-let emit_dict_iter_pair_binding ctx ~entry ~dict ~slot =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_dict_iter_pair_binding" [ entry; dict; slot ])
 
 let emit_dict_construct_result ctx ~ctor_arg ~value_needs_release =
   if value_needs_release then
@@ -1568,69 +1534,3 @@ let render_channel_recv_attempt ~emit_expr ctx = function
       render_channel_recv_timeout_attempt ~emit_expr ctx ~result_type ~channel
         ~timeout ~release_policy ~value_constructor_takes_release_mask
         ~constructors
-
-let emit_channel_iter_release_object ctx ~value =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_channel_iter_release_object" [ value ])
-
-let emit_channel_iter_header ~emit_expr ctx ~channel ~value source =
-  let source_arg = render_arg ~emit_expr ctx source in
-  Core_emit_context.emit_line ctx
-    (render_template "backend_channel_iter_header"
-       [ channel; source_arg; value ])
-
-let emit_select_arms_decl ctx ~arms ~arm_count =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_arms_decl"
-       [ arms; string_of_int arm_count ])
-
-let emit_select_recv_arm ~emit_expr ctx ~arms ~index channel =
-  let channel_arg = render_arg ~emit_expr ctx channel in
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_recv_arm"
-       [ arms; string_of_int index; channel_arg ])
-
-let emit_select_sealed_arm ~emit_expr ctx ~arms ~index channel =
-  let channel_arg = render_arg ~emit_expr ctx channel in
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_sealed_arm"
-       [ arms; string_of_int index; channel_arg ])
-
-let emit_select_after_arm ~emit_expr ctx ~arms ~index timeout =
-  let timeout_arg = render_arg ~emit_expr ctx timeout in
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_after_arm"
-       [ arms; string_of_int index; timeout_arg ])
-
-let emit_select_wait ctx ~result ~arms ~arm_count =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_wait"
-       [ result; arms; string_of_int arm_count ])
-
-let emit_select_first_branch_open ctx ~result ~index =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_first_branch_open"
-       [ result; string_of_int index ])
-
-let emit_select_next_branch_open ctx ~result ~index =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_next_branch_open"
-       [ result; string_of_int index ])
-
-let emit_select_cleanup_frame_decl ctx ~frame =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_cleanup_frame_decl" [ frame ])
-
-let emit_select_cleanup_push ctx ~cleanup_frame ~value_slot ~cleanup_value
-    ~release_fn =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_cleanup_push"
-       [ cleanup_frame; value_slot; cleanup_value; release_fn ])
-
-let emit_select_cleanup_pop ctx ~value_slot =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_cleanup_pop" [ value_slot ])
-
-let emit_select_received_value_binding ctx ~binding ~result =
-  Core_emit_context.emit_line ctx
-    (render_template "backend_select_received_value_binding" [ binding; result ])

@@ -3384,17 +3384,15 @@ let test_core_pipeline_simple () =
     [ { decl_desc = DFunc func; decl_loc = loc; decl_doc = None } ]
   in
   let c_code = compile_program program in
-  (* A4.2: the pipeline mints a fresh [cf_def_id]; we can't predict
-     the exact id number, so just check the mangled suffix. *)
+  Alcotest.(check bool)
+    "uses Blorp default backend" true
+    (contains_sub c_code "/* Blorp final Core C artifact */");
   Alcotest.(check bool)
     "has function" true
-    (contains_sub c_code "_compute(void)");
+    (contains_sub c_code "long compute(void)");
   Alcotest.(check bool)
     "has return" true
-    (contains_sub c_code "return (40L + 2L);");
-  Alcotest.(check bool)
-    "has preamble" true
-    (contains_sub c_code "#include <stdbool.h>")
+    (contains_sub c_code "return (40 + 2);")
 
 let test_core_pipeline_profile_flag () =
   let mk_ast desc ty =

@@ -25,6 +25,15 @@ let emit_simple_intrinsic ~emit_expr (ctx : Core_emit_context.t) name args =
       true
   | Some _ | None -> false
 
+let render_prepared op args =
+  Core_emit_blorp_prepared_backend.render_template op args
+
+let emit_prepared ctx op args =
+  Core_emit_context.emit ctx (render_prepared op args)
+
+let emit_prepared_line ctx op args =
+  Core_emit_context.emit_line ctx (render_prepared op args)
+
 type emitters = {
   emit_expr : Core_emit_context.t -> core -> unit;
   emit_stmt : Core_emit_context.t -> core -> unit;
@@ -32,6 +41,10 @@ type emitters = {
   emit_boxed_storage : Core_emit_context.t -> boxed_storage_value -> unit;
   type_to_c : Core_emit_context.t -> Ast.type_expr -> string;
 }
+
+let render_expr_arg emitters ctx expr =
+  Core_emit_blorp_prepared_backend.render_arg ~emit_expr:emitters.emit_expr ctx
+    expr
 
 type tensor_storage_check =
   | TensorWordStorageCheck
@@ -289,20 +302,20 @@ let emit_list_handoff emitters ctx result handoff =
 
 let emit emitters ctx = function
   | DictIterHeader { dict; source; index } ->
-      Core_emit_blorp_prepared_backend.emit_dict_iter_header
-        ~emit_expr:emitters.emit_expr ctx ~dict ~index source
+      let source_arg = render_expr_arg emitters ctx source in
+      emit_prepared_line ctx "backend_dict_iter_header"
+        [ dict; source_arg; index ]
   | DictIterSlotBinding { slot; dict; index } ->
-      Core_emit_blorp_prepared_backend.emit_dict_iter_slot_binding ctx ~slot
-        ~dict ~index
+      emit_prepared_line ctx "backend_dict_iter_slot_binding"
+        [ slot; dict; index ]
   | DictIterDeletedSlotGuard { slot } ->
-      Core_emit_blorp_prepared_backend.emit_dict_iter_deleted_slot_guard ctx
-        ~slot
+      emit_prepared_line ctx "backend_dict_iter_deleted_slot_guard" [ slot ]
   | DictIterKeyBinding { key_c_type; binding; dict; slot } ->
-      Core_emit_blorp_prepared_backend.emit_dict_iter_key_binding ctx
-        ~key_c_type ~binding ~dict ~slot
+      emit_prepared_line ctx "backend_dict_iter_key_binding"
+        [ key_c_type; binding; dict; slot ]
   | DictIterPairBinding { entry; dict; slot } ->
-      Core_emit_blorp_prepared_backend.emit_dict_iter_pair_binding ctx ~entry
-        ~dict ~slot
+      emit_prepared_line ctx "backend_dict_iter_pair_binding"
+        [ entry; dict; slot ]
   | StringFindByteFrom { source; byte; start } ->
       Core_emit_blorp_prepared_backend.emit_string_find_byte_from
         ~emit_expr:emitters.emit_expr ctx source byte start
@@ -561,48 +574,52 @@ let emit emitters ctx = function
         (Core_emit_blorp_prepared_backend.render_channel_recv_attempt
            ~emit_expr:emitters.emit_expr ctx attempt)
   | ChannelIterReleaseObject { value } ->
-      Core_emit_blorp_prepared_backend.emit_channel_iter_release_object ctx
-        ~value
+      emit_prepared_line ctx "backend_channel_iter_release_object" [ value ]
   | ChannelIterHeader { channel; source; value } ->
-      Core_emit_blorp_prepared_backend.emit_channel_iter_header
-        ~emit_expr:emitters.emit_expr ctx ~channel ~value source
+      let source_arg = render_expr_arg emitters ctx source in
+      emit_prepared_line ctx "backend_channel_iter_header"
+        [ channel; source_arg; value ]
   | SelectArmsDecl { arms; arm_count } ->
-      Core_emit_blorp_prepared_backend.emit_select_arms_decl ctx ~arms
-        ~arm_count
+      emit_prepared_line ctx "backend_select_arms_decl"
+        [ arms; string_of_int arm_count ]
   | SelectRecvArm { arms; index; channel } ->
-      Core_emit_blorp_prepared_backend.emit_select_recv_arm
-        ~emit_expr:emitters.emit_expr ctx ~arms ~index channel
+      let channel_arg = render_expr_arg emitters ctx channel in
+      emit_prepared_line ctx "backend_select_recv_arm"
+        [ arms; string_of_int index; channel_arg ]
   | SelectSealedArm { arms; index; channel } ->
-      Core_emit_blorp_prepared_backend.emit_select_sealed_arm
-        ~emit_expr:emitters.emit_expr ctx ~arms ~index channel
+      let channel_arg = render_expr_arg emitters ctx channel in
+      emit_prepared_line ctx "backend_select_sealed_arm"
+        [ arms; string_of_int index; channel_arg ]
   | SelectAfterArm { arms; index; timeout } ->
-      Core_emit_blorp_prepared_backend.emit_select_after_arm
-        ~emit_expr:emitters.emit_expr ctx ~arms ~index timeout
+      let timeout_arg = render_expr_arg emitters ctx timeout in
+      emit_prepared_line ctx "backend_select_after_arm"
+        [ arms; string_of_int index; timeout_arg ]
   | SelectWait { result; arms; arm_count } ->
-      Core_emit_blorp_prepared_backend.emit_select_wait ctx ~result ~arms
-        ~arm_count
+      emit_prepared_line ctx "backend_select_wait"
+        [ result; arms; string_of_int arm_count ]
   | SelectFirstBranchOpen { result; index } ->
-      Core_emit_blorp_prepared_backend.emit_select_first_branch_open ctx ~result
-        ~index
+      emit_prepared_line ctx "backend_select_first_branch_open"
+        [ result; string_of_int index ]
   | SelectNextBranchOpen { result; index } ->
-      Core_emit_blorp_prepared_backend.emit_select_next_branch_open ctx ~result
-        ~index
+      emit_prepared_line ctx "backend_select_next_branch_open"
+        [ result; string_of_int index ]
   | SelectCleanupFrameDecl { frame } ->
-      Core_emit_blorp_prepared_backend.emit_select_cleanup_frame_decl ctx ~frame
+      emit_prepared_line ctx "backend_select_cleanup_frame_decl" [ frame ]
   | SelectCleanupPush { cleanup_frame; value_slot; cleanup_value; release_fn }
     ->
-      Core_emit_blorp_prepared_backend.emit_select_cleanup_push ctx
-        ~cleanup_frame ~value_slot ~cleanup_value ~release_fn
+      emit_prepared_line ctx "backend_select_cleanup_push"
+        [ cleanup_frame; value_slot; cleanup_value; release_fn ]
   | SelectCleanupPop { value_slot } ->
-      Core_emit_blorp_prepared_backend.emit_select_cleanup_pop ctx ~value_slot
+      emit_prepared_line ctx "backend_select_cleanup_pop" [ value_slot ]
   | SelectReceivedValueBinding { binding; result } ->
-      Core_emit_blorp_prepared_backend.emit_select_received_value_binding ctx
-        ~binding ~result
+      emit_prepared_line ctx "backend_select_received_value_binding"
+        [ binding; result ]
   | SetAlloc ctor ->
       Core_emit_context.emit ctx
         (Core_emit_blorp_prepared_backend.render_set_constructor ctor)
   | SetIterHeader { set; source; entry } ->
-      Core_emit_blorp_prepared_backend.emit_set_iter_header
-        ~emit_expr:emitters.emit_expr ctx ~set ~entry source
+      let source_arg = render_expr_arg emitters ctx source in
+      emit_prepared_line ctx "backend_set_iter_header"
+        [ set; source_arg; entry ]
   | SetIterRelease { set } ->
-      Core_emit_blorp_prepared_backend.emit_set_iter_release ctx ~set
+      emit_prepared_line ctx "backend_set_iter_release" [ set ]

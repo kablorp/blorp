@@ -129,10 +129,20 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
     [compile_with_modules] when no custom backend is selected. *)
 let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
     ~(reg : Codegen_types.registry) (prog : Core.core_program) : string =
-  let cfg = Core_emit_c.Backend.config_with_embed ~embed_runtime ~profile () in
-  let ctx = Core_emit_c.Backend.create_ctx ~reg cfg in
-  Core_emit_c.Backend.emit_program ctx prog;
-  Core_emit_c.Backend.finalize ctx
+  let emit_with_ocaml_backend () =
+    let cfg =
+      Core_emit_c.Backend.config_with_embed ~embed_runtime ~profile ()
+    in
+    let ctx = Core_emit_c.Backend.create_ctx ~reg cfg in
+    Core_emit_c.Backend.emit_program ctx prog;
+    Core_emit_c.Backend.finalize ctx
+  in
+  let cfg =
+    Core_emit_blorp_c.Backend.config_with_embed ~embed_runtime ~profile ()
+  in
+  match Core_emit_blorp_c.try_emit_program_string cfg prog with
+  | Ok c_code -> c_code
+  | Error _ -> emit_with_ocaml_backend ()
 
 (** Run emission through a caller-supplied backend using its default
     config. C-specific options ([embed_runtime]) are deliberately NOT

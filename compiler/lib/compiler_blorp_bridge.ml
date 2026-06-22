@@ -265,6 +265,16 @@ let render_many_request_json ~renderer items =
              ] );
        ])
 
+let emit_c_request_json core_json =
+  Lsp_json.to_string
+    (Lsp_json.Object
+       [
+         ("schema", Lsp_json.Int schema_version);
+         ("domain", Lsp_json.String domain);
+         ("action", Lsp_json.String "emit_c");
+         ("payload", Lsp_json.Object [ ("core", core_json) ]);
+       ])
+
 let renderer_templates_request_json ~renderer =
   Lsp_json.to_string
     (Lsp_json.Object
@@ -288,6 +298,13 @@ let response_result response_json success =
     Error ("bridge_error", message)
 
 let render_response_field response = string_response_field "text" response
+
+let json_response_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | Some value -> Ok value
+      | None -> Error ("invalid_response", "missing JSON field `" ^ name ^ "`"))
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let int_response_field name = function
   | Lsp_json.Object fields -> (
@@ -382,6 +399,40 @@ let render_many_response_field = function
       | Some _ -> Error ("invalid_response", "field `items` must be an array")
       | None -> Error ("invalid_response", "missing array field `items`"))
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+type c_artifact = {
+  c_code : string;
+  link_flags : string list;
+  include_dirs : string list;
+}
+
+let string_array_field name = function
+  | Lsp_json.Object fields -> (
+      match List.assoc_opt name fields with
+      | Some (Lsp_json.Array values) ->
+          let rec collect acc = function
+            | [] -> Ok (List.rev acc)
+            | Lsp_json.String value :: rest -> collect (value :: acc) rest
+            | _ ->
+                Error
+                  ( "invalid_response",
+                    "field `" ^ name ^ "` must be an array of strings" )
+          in
+          collect [] values
+      | Some _ ->
+          Error
+            ( "invalid_response",
+              "field `" ^ name ^ "` must be an array of strings" )
+      | None -> Error ("invalid_response", "missing array field `" ^ name ^ "`")
+      )
+  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
+
+let c_artifact_response_field response =
+  let* artifact = json_response_field "artifact" response in
+  let* c_code = string_response_field "c_code" artifact in
+  let* link_flags = string_array_field "link_flags" artifact in
+  let* include_dirs = string_array_field "include_dirs" artifact in
+  Ok { c_code; link_flags; include_dirs }
 
 let render_many_exn ~renderer items =
   match manifest_for_renderer renderer with
@@ -912,6 +963,14 @@ let render_many_via_command_exn ~renderer items =
     match response_result response_json render_many_response_field with
     | Ok rendered -> rendered
     | Error (_, message) -> invalid_arg message
+
+let emit_c_artifact_exn core_json =
+  let response_json =
+    run_renderer_request_via_blorp (emit_c_request_json core_json)
+  in
+  match response_result response_json c_artifact_response_field with
+  | Ok artifact -> artifact
+  | Error (_, message) -> invalid_arg message
 
 let render_core_stage_unknown_error original normalized =
   render_via_command_exn ~renderer:core_stage_renderer

@@ -807,8 +807,7 @@ let test_mono_e2e_pipeline () =
   Alcotest.(check bool)
     "has specialized func" true
     (contains "identity__mono_Int");
-  (* A4.2: the pipeline mints a cf_def_id; check the mangled suffix. *)
-  Alcotest.(check bool) "has compute" true (contains "_compute(void)")
+  Alcotest.(check bool) "has compute" true (contains "long compute(void)")
 
 (* ============================================================================
    Call-site resolution: UFCS-mangled and module-scoped imports

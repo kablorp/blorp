@@ -7300,7 +7300,7 @@ and emit_for_set (ctx : Core_emit_context.t) (binder : loop_binder)
     (SetIterHeader { set = iter_c; source = iter; entry = entry_c });
   ctx.indent <- ctx.indent + 1;
   emit_unbox_decl ctx var_c
-    (Blorp_prepared.render_set_iter_entry_key ~entry:entry_c)
+    (Blorp_prepared.render_template "backend_set_iter_entry_key" [ entry_c ])
     elem_ty;
   emit_stmt ctx body;
   ctx.indent <- ctx.indent - 1;

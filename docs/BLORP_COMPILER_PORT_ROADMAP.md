@@ -51,12 +51,17 @@ That is the correct architectural direction, but it is still transitional:
   envelope under the `core` payload field. Blorp validates that Core subset and
   returns a `CArtifact`. It can emit a tiny valid-C subset for user functions
   with typed parameters, simple literal/variable/void/string bodies with C
-  string escaping, unary operators, binary-operator bodies, short-circuit
-  logical expressions, assignment statements, ternary `if`, simple named calls
-  whose arguments are in the supported expression subset, basic `let`/sequence
-  statement bodies including void/discard let cases, and statement-shaped
-  `if/else` lowering with explicit result temporaries; most production C
-  emission still lives in OCaml.
+  string escaping, unary operators, simple casts, binary-operator bodies
+  including safe integer divide/modulo lowering, short-circuit logical
+  expressions, assignment statements, ternary `if`, simple named calls whose
+  arguments are in the
+  supported expression subset, basic `let`/sequence statement bodies including
+  void/discard let cases, simple `while` loops with cooperative checkpoints,
+  `break`/`continue`, and statement-shaped `if/else` lowering with explicit
+  result temporaries. The default pipeline now attempts this Blorp path first,
+  including embedded-runtime compile requests; unsupported final Core and
+  profiling builds still fall back to the OCaml backend while the Blorp subset
+  expands.
 
 Approximate current source shape, measured from this worktree on 2026-06-20:
 
@@ -411,10 +416,13 @@ Implementation:
   **Started at the protocol level: `emit_c` now consumes CoreProgram JSON and
   returns a CArtifact, including a first real C function-emission subset for
   parameters, simple expressions, escaped string literals, unary operators,
-  binary operators, short-circuit logical expressions, assignment statements,
-  ternary `if`, simple named calls, basic `let`/sequence statement bodies
-  including void/discard let cases, and statement-shaped `if/else` lowering with
-  explicit result temporaries.**
+  binary operators, simple casts, short-circuit logical expressions, assignment
+  statements, ternary `if`, simple named calls, basic `let`/sequence statement
+  bodies including void/discard let cases, simple `while` loops with
+  cooperative checkpoints, `break`/`continue`, and statement-shaped `if/else`
+  lowering with explicit result temporaries. The default C backend now attempts
+  this Blorp backend first, including embedded-runtime compile requests, and
+  falls back to OCaml for unsupported final-Core shapes and profiling builds.**
 - Keep C artifact output structured: C text, link flags, include dirs, runtime
   feature metadata.
 

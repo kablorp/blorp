@@ -12,8 +12,9 @@ import:
 			EqualOp,
 			GreaterEqualOp,
 			GreaterOp,
-			LessEqualOp,
 			LessOp,
+			LessEqualOp,
+			ModuloOp,
 			MultiplyOp,
 			NotEqualOp,
 			SubtractOp,
@@ -23,7 +24,11 @@ import:
 		CoreExpr(
 			AssignExpr,
 			BinaryExpr,
+			BreakExpr,
+			CastExpr,
 			CallExpr,
+			CooperativeCheckpointExpr,
+			ContinueExpr,
 			IfExpr,
 			LetExpr,
 			LiteralExpr,
@@ -32,6 +37,7 @@ import:
 			UnaryExpr,
 			VarExpr,
 			VoidExpr,
+			WhileExpr,
 		),
 		CoreFunction,
 		CoreFunctionKind(BuiltinFunction, ClosureBodyFunction, ForeignFunction, UserFunction),
@@ -84,10 +90,18 @@ private pure func c_type_name(typ: CoreType) -> String:
 		NamedType(name, args):
 			if name == "Int":
 				"long"
+			else if name == "Float":
+				"double"
+			else if name == "Float32":
+				"float"
+			else if name == "Float16":
+				"_Float16"
 			else if name == "Bool":
 				"int"
 			else if name == "String":
 				"const char*"
+			else if name == "Closure":
+				"blorp_Closure*"
 			else:
 				"void*"
 		TupleType(items):
@@ -99,6 +113,22 @@ private pure func c_return_type(func_info: CoreFunction) -> String:
 		"int"
 	else:
 		c_type_name(func_info.return_type)
+
+
+private pure func c_function_signature(func_info: CoreFunction) -> String:
+	if is_entrypoint(func_info) and func_info.params.length() > 0:
+		c_return_type(func_info) + " " + c_function_name(func_info) + "(int argc, char** argv)"
+	else:
+		c_return_type(
+			func_info,
+		) + " " + c_function_name(func_info) + "(" + c_param_list(func_info.params) + ")"
+
+
+private pure func entrypoint_arg_prelude(func_info: CoreFunction) -> String:
+	if is_entrypoint(func_info) and func_info.params.length() > 0:
+		"  (void)argc;\n  (void)argv;\n"
+	else:
+		""
 
 
 private pure func c_param(param: CoreParam) -> String:
@@ -132,6 +162,42 @@ private pure func is_void_type(typ: CoreType) -> Bool:
 			False
 
 
+private pure func is_void_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		LiteralExpr(literal, typ, loc):
+			False
+		VarExpr(variable, typ, loc):
+			False
+		VoidExpr(typ, loc):
+			True
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		CallExpr(kind, callee, args, typ, loc):
+			False
+		BinaryExpr(op, left, right, typ, loc):
+			False
+		UnaryExpr(op, expr_value, typ, loc):
+			False
+		LogicalExpr(op, left, right, typ, loc):
+			False
+		AssignExpr(variable, rhs, typ, loc):
+			False
+		CastExpr(expr_value, target_type, typ, loc):
+			False
+		LetExpr(name, is_mutable, typ, rhs, body):
+			False
+		SeqExpr(first, second):
+			False
+		WhileExpr(cond, body, typ, loc):
+			False
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			False
+
+
 private pure func body_value(value: String, next_temp: Int) -> FunctionBodyC:
 	{
 		statements = "",
@@ -145,6 +211,20 @@ private pure func discard_body(body: FunctionBodyC) -> String:
 		body.statements
 	else:
 		body.statements + "  " + body.value + ";\n"
+
+
+private pure func statement_body(expr: CoreExpr, body: FunctionBodyC) -> String:
+	if is_void_expr(expr):
+		body.statements
+	else:
+		discard_body(body)
+
+
+private pure func required_body_value(body: FunctionBodyC) -> Option[String]:
+	if body.value == "":
+		None
+	else:
+		Some(body.value)
 
 
 private pure func indent_statements(statements: String) -> String:
@@ -212,28 +292,42 @@ private pure func emit_literal_expr(literal: CoreLiteral) -> Option[String]:
 			Some(c_string_literal(value))
 
 
-private pure func c_binary_operator(op: CoreBinaryOp) -> String:
+private pure func c_infix_expr(left_c: String, operator: String, right_c: String) -> String:
+	"(" + left_c + " " + operator + " " + right_c + ")"
+
+
+private pure func c_zero_guarded_arithmetic_expr(
+	left_c: String,
+	operator: String,
+	right_c: String,
+) -> String:
+	"((" + right_c + ") == 0 ? 0 : (" + left_c + " " + operator + " " + right_c + "))"
+
+
+private pure func c_binary_expr(op: CoreBinaryOp, left_c: String, right_c: String) -> String:
 	match op:
 		AddOp:
-			"+"
+			c_infix_expr(left_c, "+", right_c)
 		SubtractOp:
-			"-"
+			c_infix_expr(left_c, "-", right_c)
 		MultiplyOp:
-			"*"
+			c_infix_expr(left_c, "*", right_c)
 		DivideOp:
-			"/"
+			c_zero_guarded_arithmetic_expr(left_c, "/", right_c)
+		ModuloOp:
+			c_zero_guarded_arithmetic_expr(left_c, "%", right_c)
 		EqualOp:
-			"=="
+			c_infix_expr(left_c, "==", right_c)
 		NotEqualOp:
-			"!="
+			c_infix_expr(left_c, "!=", right_c)
 		LessOp:
-			"<"
+			c_infix_expr(left_c, "<", right_c)
 		LessEqualOp:
-			"<="
+			c_infix_expr(left_c, "<=", right_c)
 		GreaterOp:
-			">"
+			c_infix_expr(left_c, ">", right_c)
 		GreaterEqualOp:
-			">="
+			c_infix_expr(left_c, ">=", right_c)
 
 
 private pure func c_unary_operator(op: CoreUnaryOp) -> String:
@@ -297,6 +391,8 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 			Some(variable.name)
 		VoidExpr(typ, loc):
 			Some("0")
+		CooperativeCheckpointExpr(typ, loc):
+			None
 		CallExpr(kind, callee, args, typ, loc):
 			name ?= c_call_name(kind, callee)
 			args_c ?= emit_simple_expr_args(args)
@@ -304,7 +400,7 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 		BinaryExpr(op, left, right, typ, loc):
 			left_c ?= emit_simple_expr(left)
 			right_c ?= emit_simple_expr(right)
-			Some("(" + left_c + " " + c_binary_operator(op) + " " + right_c + ")")
+			Some(c_binary_expr(op, left_c, right_c))
 		UnaryExpr(op, expr_value, typ, loc):
 			expr_c ?= emit_simple_expr(expr_value)
 			Some("(" + c_unary_operator(op) + expr_c + ")")
@@ -314,9 +410,18 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 			Some("(" + left_c + " " + c_logical_operator(op) + " " + right_c + ")")
 		AssignExpr(variable, rhs, typ, loc):
 			None
+		CastExpr(expr_value, target_type, typ, loc):
+			expr_c ?= emit_simple_expr(expr_value)
+			Some("((" + c_type_name(target_type) + ")" + expr_c + ")")
 		LetExpr(name, is_mutable, typ, rhs, body):
 			None
 		SeqExpr(first, second):
+			None
+		WhileExpr(cond, body, typ, loc):
+			None
+		BreakExpr(typ, loc):
+			None
+		ContinueExpr(typ, loc):
 			None
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			cond_c ?= emit_simple_expr(cond)
@@ -363,6 +468,12 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 		VoidExpr(typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
+		CooperativeCheckpointExpr(typ, loc):
+			Some({
+				statements = "  blorp_cooperative_checkpoint();\n",
+				value = "",
+				next_temp = next_temp,
+			})
 		CallExpr(kind, callee, args, typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
@@ -382,6 +493,9 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				value = "",
 				next_temp = rhs_c.next_temp,
 			})
+		CastExpr(expr_value, target_type, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
 		SeqExpr(first, second):
 			first_c ?= emit_function_body(first, next_temp)
 			second_c ?= emit_function_body(second, first_c.next_temp)
@@ -390,26 +504,79 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				value = second_c.value,
 				next_temp = second_c.next_temp,
 			})
+		WhileExpr(cond, body, typ, loc):
+			cond_c ?= emit_simple_expr(cond)
+			body_c ?= emit_function_body(body, next_temp)
+			Some({
+				statements = "  while (" + cond_c + ") {\n" + indent_statements(
+					discard_body(body_c),
+				) + "  }\n",
+				value = "",
+				next_temp = body_c.next_temp,
+			})
+		BreakExpr(typ, loc):
+			Some({
+				statements = "  break;\n",
+				value = "",
+				next_temp = next_temp,
+			})
+		ContinueExpr(typ, loc):
+			Some({
+				statements = "  continue;\n",
+				value = "",
+				next_temp = next_temp,
+			})
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			match emit_simple_expr(expr):
 				Some(value):
 					Some(body_value(value, next_temp))
 				None:
 					cond_c ?= emit_simple_expr(cond)
-					temp: String = temp_name("if_result", next_temp)
-					then_c ?= emit_function_body(then_expr, next_temp + 1)
-					else_c ?= emit_function_body(else_expr, then_c.next_temp)
-					Some({
-						statements = "  " + c_type_name(
-							typ,
-						) + " " + temp + ";\n  if (" + cond_c + ") {\n" + indent_statements(
-							then_c.statements,
-						) + "    " + temp + " = " + then_c.value + ";\n  } else {\n" + indent_statements(
-							else_c.statements,
-						) + "    " + temp + " = " + else_c.value + ";\n  }\n",
-						value = temp,
-						next_temp = else_c.next_temp,
-					})
+
+					if is_void_type(typ):
+						then_c ?= emit_function_body(then_expr, next_temp)
+						else_c ?= emit_function_body(else_expr, then_c.next_temp)
+						else_statements: String = statement_body(else_expr, else_c)
+
+						if else_statements == "":
+							Some({
+								statements = "  if (" + cond_c + ") {\n" + indent_statements(
+									statement_body(
+										then_expr,
+										then_c,
+									),
+								) + "  }\n",
+								value = "",
+								next_temp = else_c.next_temp,
+							})
+						else:
+							Some({
+								statements = "  if (" + cond_c + ") {\n" + indent_statements(
+									statement_body(
+										then_expr,
+										then_c,
+									),
+								) + "  } else {\n" + indent_statements(else_statements) + "  }\n",
+								value = "",
+								next_temp = else_c.next_temp,
+							})
+					else:
+						temp: String = temp_name("if_result", next_temp)
+						then_c ?= emit_function_body(then_expr, next_temp + 1)
+						else_c ?= emit_function_body(else_expr, then_c.next_temp)
+						then_value ?= required_body_value(then_c)
+						else_value ?= required_body_value(else_c)
+						Some({
+							statements = "  " + c_type_name(
+								typ,
+							) + " " + temp + ";\n  if (" + cond_c + ") {\n" + indent_statements(
+								then_c.statements,
+							) + "    " + temp + " = " + then_value + ";\n  } else {\n" + indent_statements(
+								else_c.statements,
+							) + "    " + temp + " = " + else_value + ";\n  }\n",
+							value = temp,
+							next_temp = else_c.next_temp,
+						})
 
 
 private pure func emit_supported_user_function(func_info: CoreFunction) -> Option[String]:
@@ -417,16 +584,16 @@ private pure func emit_supported_user_function(func_info: CoreFunction) -> Optio
 		Some(body):
 			match emit_function_body(body, 0):
 				Some(body_c):
-					prefix: String = c_return_type(
-						func_info,
-					) + " " + c_function_name(
-						func_info,
-					) + "(" + c_param_list(func_info.params) + ") {\n"
+					prefix: String = c_function_signature(func_info) + " {\n"
+					body_prelude: String = entrypoint_arg_prelude(func_info)
 
 					if is_void_type(func_info.return_type):
-						Some(prefix + discard_body(body_c) + "}\n")
+						Some(prefix + body_prelude + discard_body(body_c) + "}\n")
 					else:
-						Some(prefix + body_c.statements + "  return " + body_c.value + ";\n}\n")
+						return_value ?= required_body_value(body_c)
+						Some(
+							prefix + body_prelude + body_c.statements + "  return " + return_value + ";\n}\n",
+						)
 				None:
 					None
 		None:
