@@ -23,7 +23,7 @@ import:
 		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UserCall),
 		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ValueRecordDecl),
 		CoreEnumDecl,
 		CoreEnumVariant,
 		CoreExpr(
@@ -35,12 +35,16 @@ import:
 			ConstructorMatchExpr,
 			CooperativeCheckpointExpr,
 			ContinueExpr,
+			FieldExpr,
 			ForRangeExpr,
 			IfExpr,
 			LetExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
+			RangeExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
 			SeqExpr,
 			TailrecLoopExpr,
 			TailrecRecurExpr,
@@ -61,8 +65,11 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreSourceLoc,
-		CoreType(EnumType, NamedType, TupleType, VoidType),
+		CoreType(EnumType, NamedType, TupleType, ValueRecordType, VoidType),
 		CoreUnaryOp(NegateOp, NotOp),
+		CoreValueRecordDecl,
+		CoreValueRecordField,
+	compiler_core_resource: rewrite_resource_program
 	string: string as make_string
 
 
@@ -121,6 +128,8 @@ private pure func is_checkpoint_expr(expr: CoreExpr) -> Bool:
 			False
 		CastExpr(expr_value, typ, loc):
 			False
+		FieldExpr(expr_value, field_name, typ, loc):
+			False
 		LetExpr(name, is_mutable, typ, rhs, body):
 			False
 		SeqExpr(first, second):
@@ -131,11 +140,17 @@ private pure func is_checkpoint_expr(expr: CoreExpr) -> Bool:
 			False
 		ContinueExpr(typ, loc):
 			False
+		ResourceScopeExpr(scope, typ, loc):
+			False
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			False
 		TailrecLoopExpr(params, return_type, body, loc):
 			False
 		TailrecRecurExpr(args, typ, loc):
 			False
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			False
+		RangeExpr(start, end_value, typ, loc):
 			False
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			False
@@ -169,6 +184,8 @@ private pure func body_starts_with_checkpoint(body: CoreExpr) -> Bool:
 			False
 		CastExpr(expr_value, typ, loc):
 			False
+		FieldExpr(expr_value, field_name, typ, loc):
+			False
 		LetExpr(name, is_mutable, typ, rhs, body):
 			False
 		WhileExpr(cond, body, typ, loc):
@@ -177,11 +194,17 @@ private pure func body_starts_with_checkpoint(body: CoreExpr) -> Bool:
 			False
 		ContinueExpr(typ, loc):
 			False
+		ResourceScopeExpr(scope, typ, loc):
+			False
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			False
 		TailrecLoopExpr(params, return_type, body, loc):
 			False
 		TailrecRecurExpr(args, typ, loc):
 			False
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			False
+		RangeExpr(start, end_value, typ, loc):
 			False
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			False
@@ -220,6 +243,8 @@ private pure func add_expr_checkpoints(expr: CoreExpr) -> CoreExpr:
 			AssignExpr(variable, add_expr_checkpoints(rhs), typ, loc)
 		CastExpr(expr_value, typ, loc):
 			CastExpr(add_expr_checkpoints(expr_value), typ, loc)
+		FieldExpr(expr_value, field_name, typ, loc):
+			FieldExpr(add_expr_checkpoints(expr_value), field_name, typ, loc)
 		LetExpr(name, is_mutable, typ, rhs, body):
 			LetExpr(name, is_mutable, typ, add_expr_checkpoints(rhs), add_expr_checkpoints(body))
 		SeqExpr(first, second):
@@ -231,6 +256,27 @@ private pure func add_expr_checkpoints(expr: CoreExpr) -> CoreExpr:
 			expr
 		ContinueExpr(typ, loc):
 			expr
+		ResourceScopeExpr(scope, typ, loc):
+			ResourceScopeExpr(
+				{
+					variable = scope.variable,
+					typ = scope.typ,
+					acquire = add_expr_checkpoints(scope.acquire),
+					body = add_expr_checkpoints(scope.body),
+					cleanup = add_expr_checkpoints(scope.cleanup)
+				},
+				typ,
+				loc,
+			)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			ResourceCleanupExitExpr(
+				{
+					cleanups = add_expr_list_checkpoints(cleanup_exit.cleanups),
+					exit = cleanup_exit.exit
+				},
+				typ,
+				loc,
+			)
 		TailrecLoopExpr(params, return_type, body, loc):
 			checked_body: CoreExpr = add_loop_checkpoint(loc, add_expr_checkpoints(body))
 			TailrecLoopExpr(params, return_type, checked_body, loc)
@@ -246,6 +292,8 @@ private pure func add_expr_checkpoints(expr: CoreExpr) -> CoreExpr:
 				typ,
 				loc,
 			)
+		RangeExpr(start, end_value, typ, loc):
+			RangeExpr(add_expr_checkpoints(start), add_expr_checkpoints(end_value), typ, loc)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
 				add_expr_checkpoints(scrutinee),
@@ -350,6 +398,8 @@ private pure func add_decl_checkpoints(decl: CoreDecl) -> CoreDecl:
 			GlobalDecl(add_global_checkpoints(global))
 		EnumDecl(enum_decl):
 			decl
+		ValueRecordDecl(record_decl):
+			decl
 
 
 private pure func add_program_checkpoints(program: CoreProgram) -> CoreProgram:
@@ -414,6 +464,8 @@ private pure func c_type_name(typ: CoreType) -> String:
 				"void*"
 		EnumType(name):
 			"long"
+		ValueRecordType(name):
+			name
 		TupleType(items):
 			"void*"
 
@@ -470,6 +522,8 @@ private pure func is_void_type(typ: CoreType) -> Bool:
 			False
 		EnumType(name):
 			False
+		ValueRecordType(name):
+			False
 		TupleType(items):
 			False
 
@@ -496,6 +550,8 @@ private pure func is_void_expr(expr: CoreExpr) -> Bool:
 			False
 		CastExpr(expr_value, typ, loc):
 			False
+		FieldExpr(expr_value, field_name, typ, loc):
+			False
 		LetExpr(name, is_mutable, typ, rhs, body):
 			False
 		SeqExpr(first, second):
@@ -506,11 +562,17 @@ private pure func is_void_expr(expr: CoreExpr) -> Bool:
 			False
 		ContinueExpr(typ, loc):
 			False
+		ResourceScopeExpr(scope, typ, loc):
+			False
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			False
 		TailrecLoopExpr(params, return_type, body, loc):
 			False
 		TailrecRecurExpr(args, typ, loc):
 			False
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			False
+		RangeExpr(start, end_value, typ, loc):
 			False
 		LiteralMatchExpr(scrutinee, cases, default_body, typ, loc):
 			False
@@ -760,6 +822,9 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 		CastExpr(expr_value, typ, loc):
 			expr_c ?= emit_simple_expr(expr_value)
 			Some("((" + c_type_name(typ) + ")" + expr_c + ")")
+		FieldExpr(expr_value, field_name, typ, loc):
+			expr_c ?= emit_simple_expr(expr_value)
+			Some(expr_c + "." + field_name)
 		LetExpr(name, is_mutable, typ, rhs, body):
 			None
 		SeqExpr(first, second):
@@ -770,12 +835,23 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 			None
 		ContinueExpr(typ, loc):
 			None
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			None
 		TailrecLoopExpr(params, return_type, body, loc):
 			None
 		TailrecRecurExpr(args, typ, loc):
 			None
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			None
+		RangeExpr(start, end_value, typ, loc):
+			start_c ?= emit_simple_expr(start)
+			end_c ?= emit_simple_expr(end_value)
+			range_type: String = c_type_name(typ)
+			Some(
+				"({ " + range_type + " __range_value = { " + start_c + ", " + end_c + " }; __range_value; })",
+			)
 		LiteralMatchExpr(scrutinee, cases, default_body, typ, loc):
 			None
 		ConstructorMatchExpr(scrutinee, cases, default_body, typ, loc):
@@ -908,15 +984,23 @@ private pure func emit_tailrec_tail(
 			emit_tailrec_return(return_type, expr, next_temp)
 		CastExpr(expr_value, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
+		FieldExpr(expr_value, field_name, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
 		WhileExpr(cond, body, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		BreakExpr(typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		ContinueExpr(typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
+		ResourceScopeExpr(scope, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
 		TailrecLoopExpr(loop_params, loop_return_type, body, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		RangeExpr(start, end_value, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		LiteralMatchExpr(scrutinee, cases, default_body, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
@@ -990,6 +1074,8 @@ private pure func static_int_literal(expr: CoreExpr) -> Option[Int]:
 			None
 		CastExpr(expr_value, typ, loc):
 			None
+		FieldExpr(expr_value, field_name, typ, loc):
+			None
 		LetExpr(name, is_mutable, typ, rhs, body):
 			None
 		SeqExpr(first, second):
@@ -1000,11 +1086,17 @@ private pure func static_int_literal(expr: CoreExpr) -> Option[Int]:
 			None
 		ContinueExpr(typ, loc):
 			None
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			None
 		TailrecLoopExpr(params, return_type, body, loc):
 			None
 		TailrecRecurExpr(args, typ, loc):
 			None
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			None
+		RangeExpr(start, end_value, typ, loc):
 			None
 		LiteralMatchExpr(scrutinee, cases, default_body, typ, loc):
 			None
@@ -1092,6 +1184,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		CastExpr(expr_value, typ, loc):
 			typ
+		FieldExpr(expr_value, field_name, typ, loc):
+			typ
 		LetExpr(name, is_mutable, typ, rhs, body):
 			core_expr_type(body)
 		SeqExpr(first, second):
@@ -1102,11 +1196,17 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		ContinueExpr(typ, loc):
 			typ
+		ResourceScopeExpr(scope, typ, loc):
+			typ
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			typ
 		TailrecLoopExpr(params, return_type, body, loc):
 			return_type
 		TailrecRecurExpr(args, typ, loc):
 			typ
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			typ
+		RangeExpr(start, end_value, typ, loc):
 			typ
 		LiteralMatchExpr(scrutinee, cases, default_body, typ, loc):
 			typ
@@ -1413,6 +1513,9 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 		CastExpr(expr_value, typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
+		FieldExpr(expr_value, field_name, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
 		SeqExpr(first, second):
 			first_c ?= emit_function_body(first, next_temp)
 			second_c ?= emit_function_body(second, first_c.next_temp)
@@ -1447,12 +1550,19 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				next_temp = next_temp,
 				returns = False,
 			})
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			None
 		TailrecLoopExpr(params, return_type, body, loc):
 			emit_tailrec_loop(params, return_type, body, next_temp)
 		TailrecRecurExpr(args, typ, loc):
 			None
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			emit_for_range(binder, start, end_value, body, next_temp)
+		RangeExpr(start, end_value, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			emit_literal_match(scrutinee, cases, fallback, typ, next_temp)
 		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
@@ -1556,6 +1666,25 @@ private pure func emit_function(func_info: CoreFunction) -> String:
 			emit_function_inventory(func_info)
 
 
+private pure func emit_function_forward_decl(func_info: CoreFunction) -> String:
+	match func_info.function_kind:
+		UserFunction:
+			match func_info.body:
+				Some(body):
+					if is_entrypoint(func_info):
+						""
+					else:
+						c_function_signature(func_info) + ";\n"
+				None:
+					""
+		BuiltinFunction:
+			""
+		ForeignFunction:
+			""
+		ClosureBodyFunction:
+			""
+
+
 private pure func emit_enum_variant(variant: CoreEnumVariant) -> String:
 	"#define " + variant.c_name + " " + variant.tag.to_string() + "L\n"
 
@@ -1601,6 +1730,8 @@ private pure func emit_static_global_init_expr(init: CoreExpr) -> Option[String]
 			emit_simple_expr(init)
 		CastExpr(expr_value, typ, loc):
 			emit_simple_expr(init)
+		FieldExpr(expr_value, field_name, typ, loc):
+			emit_simple_expr(init)
 		LetExpr(name, is_mutable, typ, rhs, body):
 			emit_simple_expr(init)
 		SeqExpr(first, second):
@@ -1611,11 +1742,17 @@ private pure func emit_static_global_init_expr(init: CoreExpr) -> Option[String]
 			emit_simple_expr(init)
 		ContinueExpr(typ, loc):
 			emit_simple_expr(init)
+		ResourceScopeExpr(scope, typ, loc):
+			emit_simple_expr(init)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			emit_simple_expr(init)
 		TailrecLoopExpr(params, return_type, body, loc):
 			emit_simple_expr(init)
 		TailrecRecurExpr(args, typ, loc):
 			emit_simple_expr(init)
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			emit_simple_expr(init)
+		RangeExpr(start, end_value, typ, loc):
 			emit_simple_expr(init)
 		LiteralMatchExpr(scrutinee, cases, default_body, typ, loc):
 			emit_simple_expr(init)
@@ -1633,6 +1770,51 @@ private pure func emit_global_decl(global: CoreGlobal) -> String:
 			"/* unsupported global " + global.name.name + " */\n"
 
 
+private pure func c_value_record_field_decl(field: CoreValueRecordField) -> String:
+	c_type_name(field.typ) + " " + field.name + "; "
+
+
+private pure func c_value_record_make_param(field: CoreValueRecordField) -> String:
+	c_type_name(field.typ) + " " + field.name
+
+
+private pure func emit_value_record_decl(record_decl: CoreValueRecordDecl) -> String:
+	var fields_c: String = ""
+	var params: List[String] = []
+	var init_fields: List[String] = []
+
+	for field in record_decl.fields:
+		fields_c += c_value_record_field_decl(field)
+		params = params.append(c_value_record_make_param(field))
+		init_fields = init_fields.append(field.name)
+
+	param_c: String = if params.length() == 0:
+		"void"
+	else:
+		params.join(", ")
+
+	"typedef struct { " + fields_c + "} " + record_decl.name + ";\nstatic inline " + record_decl.name + " " + record_decl.name + "_make(" + param_c + ") { " + record_decl.name + " __r = { " + init_fields.join(
+		", ",
+	) + " }; return __r; }\n\n"
+
+
+private pure func emit_value_record_decls(decls: List[CoreDecl]) -> String:
+	var c_code: String = ""
+
+	for decl in decls:
+		match decl:
+			ValueRecordDecl(record_decl):
+				c_code += emit_value_record_decl(record_decl)
+			EnumDecl(enum_decl):
+				void
+			FunctionDecl(func_info):
+				void
+			GlobalDecl(global):
+				void
+
+	c_code
+
+
 private pure func emit_enum_decls(decls: List[CoreDecl]) -> String:
 	var c_code: String = ""
 
@@ -1640,6 +1822,8 @@ private pure func emit_enum_decls(decls: List[CoreDecl]) -> String:
 		match decl:
 			EnumDecl(enum_decl):
 				c_code += emit_enum_decl(enum_decl)
+			ValueRecordDecl(record_decl):
+				void
 			FunctionDecl(func_info):
 				void
 			GlobalDecl(global):
@@ -1657,6 +1841,8 @@ private pure func emit_global_decls(decls: List[CoreDecl]) -> String:
 				c_code += emit_global_decl(global)
 			EnumDecl(enum_decl):
 				void
+			ValueRecordDecl(record_decl):
+				void
 			FunctionDecl(func_info):
 				void
 
@@ -1672,18 +1858,45 @@ private pure func emit_function_decls(decls: List[CoreDecl]) -> String:
 				c_code += emit_function(func_info)
 			EnumDecl(enum_decl):
 				void
+			ValueRecordDecl(record_decl):
+				void
 			GlobalDecl(global):
 				void
 
 	c_code
 
 
+private pure func emit_function_forward_decls(decls: List[CoreDecl]) -> String:
+	var c_code: String = ""
+
+	for decl in decls:
+		match decl:
+			FunctionDecl(func_info):
+				c_code += emit_function_forward_decl(func_info)
+			EnumDecl(enum_decl):
+				void
+			ValueRecordDecl(record_decl):
+				void
+			GlobalDecl(global):
+				void
+
+	if c_code == "":
+		""
+	else:
+		c_code + "\n"
+
+
 private pure func emit_decls(decls: List[CoreDecl]) -> String:
-	emit_enum_decls(decls) + emit_global_decls(decls) + emit_function_decls(decls)
+	emit_value_record_decls(
+		decls,
+	) + emit_enum_decls(
+		decls,
+	) + emit_global_decls(decls) + emit_function_forward_decls(decls) + emit_function_decls(decls)
 
 
 pure func emit_core_program_c_artifact(program: CoreProgram) -> CArtifact:
-	checked_program: CoreProgram = add_program_checkpoints(program)
+	resource_program: CoreProgram = rewrite_resource_program(program)
+	checked_program: CoreProgram = add_program_checkpoints(resource_program)
 	{
 		c_code = C_ARTIFACT_HEADER + emit_decls(checked_program.decls),
 		link_flags = [],

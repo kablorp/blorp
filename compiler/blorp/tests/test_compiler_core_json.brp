@@ -1,10 +1,10 @@
 import:
 	../compiler_core_json:
 		CoreBinaryOp(AddOp, EqualOp, LessOp, ModuloOp, SubtractOp),
-		CoreCallKind(BuiltinCall, IntrinsicCall),
+		CoreCallKind(BuiltinCall, IntrinsicCall, UserCall),
 		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ValueRecordDecl),
 		CoreEnumDecl,
 		CoreExpr(
 			AssignExpr,
@@ -15,12 +15,16 @@ import:
 			ConstructorMatchExpr,
 			CooperativeCheckpointExpr,
 			ContinueExpr,
+			FieldExpr,
 			ForRangeExpr,
 			IfExpr,
 			LetExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
+			RangeExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
 			SeqExpr,
 			TailrecLoopExpr,
 			TailrecRecurExpr,
@@ -51,9 +55,11 @@ import:
 		CoreLoopRangeDirection(RangeMayRunBackward),
 		CoreParam,
 		CoreProgram,
+		CoreResourceExit(ResourceBreakExit),
 		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
-		CoreType(EnumType, NamedType, VoidType),
+		CoreType(EnumType, NamedType, ValueRecordType, VoidType),
 		CoreUnaryOp(NotOp),
+		CoreValueRecordDecl,
 		CoreVar,
 		core_json_error_to_string,
 		core_program_to_json,
@@ -94,6 +100,10 @@ pure func char_type() -> CoreType:
 
 pure func color_type() -> CoreType:
 	EnumType("Color")
+
+
+pure func range_type() -> CoreType:
+	ValueRecordType("Range")
 
 
 pure func sample_var() -> CoreVar:
@@ -181,6 +191,20 @@ pure func range_loop_binder() -> CoreLoopBinder:
 		variable = range_index_var(),
 		typ = int_type(),
 		range_direction = RangeMayRunBackward
+	}
+
+
+pure func range_record_decl() -> CoreValueRecordDecl:
+	{
+		name = "Range",
+		fields = [{
+				name = "start",
+				typ = int_type()
+			}, {
+				name = "end",
+				typ = int_type()
+			}],
+		loc = sample_loc()
 	}
 
 
@@ -829,6 +853,100 @@ pure func constructor_match_program() -> CoreProgram:
 	{decls = [EnumDecl(color_enum_decl()), FunctionDecl(func_info)]}
 
 
+pure func resource_type() -> CoreType:
+	NamedType("TestResource", [])
+
+
+pure func closure_type() -> CoreType:
+	NamedType("Closure", [])
+
+
+pure func resource_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 0,
+		def_id = None
+	}
+
+
+pure func resource_func_var(name: String) -> CoreVar:
+	{
+		name = name,
+		uniq = 1,
+		def_id = None
+	}
+
+
+pure func resource_cleanup_call(name: String) -> CoreExpr:
+	CallExpr(
+		UserCall("close_" + name, None),
+		VarExpr(resource_func_var("close_" + name), closure_type(), sample_loc()),
+		[VarExpr(resource_var(name), resource_type(), sample_loc())],
+		VoidType,
+		sample_loc(),
+	)
+
+
+pure func resource_program() -> CoreProgram:
+	body: CoreExpr = ResourceCleanupExitExpr(
+		{
+			cleanups = [resource_cleanup_call("handle")],
+			exit = ResourceBreakExit
+		},
+		VoidType,
+		sample_loc(),
+	)
+	resource_body: CoreExpr = ResourceScopeExpr(
+		{
+			variable = resource_var("handle"),
+			typ = resource_type(),
+			acquire = VarExpr(resource_func_var("open_handle"), resource_type(), sample_loc()),
+			body = body,
+			cleanup = resource_cleanup_call("handle")
+		},
+		VoidType,
+		sample_loc(),
+	)
+	func_info: CoreFunction = {
+		name = "with_resource",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = VoidType,
+		body = Some(resource_body),
+		is_pure = False,
+		function_kind = UserFunction,
+		def_id = 25,
+		loc = sample_loc()
+	}
+
+	{decls = [FunctionDecl(func_info)]}
+
+
+pure func value_record_range_program() -> CoreProgram:
+	range_expr: CoreExpr = RangeExpr(
+		LiteralExpr(IntLiteral(1), int_type(), sample_loc()),
+		LiteralExpr(IntLiteral(4), int_type(), sample_loc()),
+		range_type(),
+		sample_loc(),
+	)
+	body: CoreExpr = FieldExpr(range_expr, "start", int_type(), sample_loc())
+	func_info: CoreFunction = {
+		name = "range_start",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 26,
+		loc = sample_loc()
+	}
+
+	{decls = [ValueRecordDecl(range_record_decl()), FunctionDecl(func_info)]}
+
+
 pure func json_values_equal(left: JsonValue, right: JsonValue) -> Bool:
 	left.to_string() == right.to_string()
 
@@ -857,6 +975,10 @@ pure func test_core_program_json_preserves_empty_program() -> Bool:
 
 pure func test_core_program_json_round_trips_global_declaration() -> Bool:
 	program_round_trips(global_program())
+
+
+pure func test_core_program_json_round_trips_value_record_range() -> Bool:
+	program_round_trips(value_record_range_program())
 
 
 pure func test_core_program_json_round_trips_let_expression() -> Bool:
@@ -934,6 +1056,10 @@ pure func test_core_program_json_round_trips_enum_declaration() -> Bool:
 
 pure func test_core_program_json_round_trips_constructor_match() -> Bool:
 	program_round_trips(constructor_match_program())
+
+
+pure func test_core_program_json_round_trips_resource_nodes() -> Bool:
+	program_round_trips(resource_program())
 
 
 pure func test_core_program_json_preserves_foreign_declaration_shape() -> Bool:
@@ -1062,6 +1188,10 @@ tests: TestSuite = {
 			test_core_program_json_round_trips_global_declaration,
 		),
 		(
+			"Core program JSON round trips value record range",
+			test_core_program_json_round_trips_value_record_range,
+		),
+		(
 			"Core program JSON round trips let expression",
 			test_core_program_json_round_trips_let_expression,
 		),
@@ -1112,6 +1242,10 @@ tests: TestSuite = {
 		(
 			"Core program JSON round trips constructor match",
 			test_core_program_json_round_trips_constructor_match,
+		),
+		(
+			"Core program JSON round trips resource nodes",
+			test_core_program_json_round_trips_resource_nodes,
 		),
 		(
 			"Core program JSON preserves foreign declaration shape",

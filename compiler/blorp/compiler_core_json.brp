@@ -24,6 +24,8 @@ private GLOBAL_TAG: String = "global"
 
 private ENUM_DECL_TAG: String = "enum"
 
+private VALUE_RECORD_DECL_TAG: String = "value_record"
+
 private KNOWN_LOC_TAG: String = "known"
 
 private SYNTHETIC_LOC_TAG: String = "synthetic"
@@ -33,6 +35,8 @@ private VOID_TYPE_TAG: String = "void"
 private NAMED_TYPE_TAG: String = "named"
 
 private ENUM_TYPE_TAG: String = "enum"
+
+private VALUE_RECORD_TYPE_TAG: String = "value_record"
 
 private TUPLE_TYPE_TAG: String = "tuple"
 
@@ -80,6 +84,8 @@ private ASSIGN_EXPR_TAG: String = "assign"
 
 private CAST_EXPR_TAG: String = "cast"
 
+private FIELD_EXPR_TAG: String = "field"
+
 private LET_EXPR_TAG: String = "let"
 
 private WHILE_EXPR_TAG: String = "while"
@@ -88,11 +94,21 @@ private BREAK_EXPR_TAG: String = "break"
 
 private CONTINUE_EXPR_TAG: String = "continue"
 
+private RESOURCE_SCOPE_EXPR_TAG: String = "resource_scope"
+
+private RESOURCE_CLEANUP_EXIT_EXPR_TAG: String = "resource_cleanup_exit"
+
+private RESOURCE_BREAK_EXIT_TAG: String = "break"
+
+private RESOURCE_CONTINUE_EXIT_TAG: String = "continue"
+
 private TAILREC_LOOP_EXPR_TAG: String = "tailrec_loop"
 
 private TAILREC_RECUR_EXPR_TAG: String = "tailrec_recur"
 
 private FOR_RANGE_EXPR_TAG: String = "for_range"
+
+private RANGE_EXPR_TAG: String = "range"
 
 private LITERAL_MATCH_EXPR_TAG: String = "literal_match"
 
@@ -162,6 +178,7 @@ union CoreType:
 	VoidType
 	NamedType(String, List[CoreType])
 	EnumType(String)
+	ValueRecordType(String)
 	TupleType(List[CoreType])
 
 
@@ -228,17 +245,41 @@ union CoreExpr:
 	LogicalExpr(CoreLogicalOp, CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
 	AssignExpr(CoreVar, CoreExpr, CoreType, CoreSourceLoc)
 	CastExpr(CoreExpr, CoreType, CoreSourceLoc)
+	FieldExpr(CoreExpr, String, CoreType, CoreSourceLoc)
 	LetExpr(CoreVar, Bool, CoreType, CoreExpr, CoreExpr)
 	SeqExpr(CoreExpr, CoreExpr)
 	WhileExpr(CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
 	BreakExpr(CoreType, CoreSourceLoc)
 	ContinueExpr(CoreType, CoreSourceLoc)
+	ResourceScopeExpr(CoreResourceScope, CoreType, CoreSourceLoc)
+	ResourceCleanupExitExpr(CoreResourceCleanupExit, CoreType, CoreSourceLoc)
 	TailrecLoopExpr(List[CoreParam], CoreType, CoreExpr, CoreSourceLoc)
 	TailrecRecurExpr(List[CoreExpr], CoreType, CoreSourceLoc)
 	ForRangeExpr(CoreLoopBinder, CoreExpr, CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
+	RangeExpr(CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
 	LiteralMatchExpr(CoreExpr, List[CoreLiteralMatchCase], CoreLiteralMatchFallback, CoreType, CoreSourceLoc)
 	ConstructorMatchExpr(CoreExpr, List[CoreConstructorMatchCase], CoreConstructorMatchFallback, CoreType, CoreSourceLoc)
 	IfExpr(CoreExpr, CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
+
+
+enum CoreResourceExit:
+	ResourceBreakExit
+	ResourceContinueExit
+
+
+record CoreResourceScope {
+	variable: CoreVar,
+	typ: CoreType,
+	acquire: CoreExpr,
+	body: CoreExpr,
+	cleanup: CoreExpr
+}
+
+
+record CoreResourceCleanupExit {
+	cleanups: List[CoreExpr],
+	exit: CoreResourceExit
+}
 
 
 record CoreLiteralMatchCase {
@@ -318,10 +359,24 @@ record CoreEnumDecl {
 }
 
 
+record CoreValueRecordField {
+	name: String,
+	typ: CoreType
+}
+
+
+record CoreValueRecordDecl {
+	name: String,
+	fields: List[CoreValueRecordField],
+	loc: CoreSourceLoc
+}
+
+
 union CoreDecl:
 	FunctionDecl(CoreFunction)
 	GlobalDecl(CoreGlobal)
 	EnumDecl(CoreEnumDecl)
+	ValueRecordDecl(CoreValueRecordDecl)
 
 
 record CoreProgram {
@@ -676,6 +731,11 @@ pure func core_type_to_json(typ: CoreType) -> JsonValue:
 				(KIND_FIELD, JsonString(ENUM_TYPE_TAG)),
 				("name", JsonString(name)),
 			])
+		ValueRecordType(name):
+			JsonObject([
+				(KIND_FIELD, JsonString(VALUE_RECORD_TYPE_TAG)),
+				("name", JsonString(name)),
+			])
 		TupleType(items):
 			JsonObject([
 				(KIND_FIELD, JsonString(TUPLE_TYPE_TAG)),
@@ -731,6 +791,9 @@ pure func decode_core_type_json(value: JsonValue, path: String) -> Result[CoreTy
 	else if tag == ENUM_TYPE_TAG:
 		name ?= string_field(value, path, "name")
 		Ok(EnumType(name))
+	else if tag == VALUE_RECORD_TYPE_TAG:
+		name ?= string_field(value, path, "name")
+		Ok(ValueRecordType(name))
 	else if tag == TUPLE_TYPE_TAG:
 		items ?= decode_core_type_list(value, path, "items")
 		Ok(TupleType(items))
@@ -986,6 +1049,99 @@ pure func decode_core_loop_binder_json(
 		variable = variable,
 		typ = typ,
 		range_direction = range_direction,
+	})
+
+
+pure func core_resource_exit_to_string(exit: CoreResourceExit) -> String:
+	match exit:
+		ResourceBreakExit:
+			RESOURCE_BREAK_EXIT_TAG
+		ResourceContinueExit:
+			RESOURCE_CONTINUE_EXIT_TAG
+
+
+pure func parse_core_resource_exit(
+	tag: String,
+	path: String,
+) -> Result[CoreResourceExit, CoreJsonError]:
+	if tag == RESOURCE_BREAK_EXIT_TAG:
+		Ok(ResourceBreakExit)
+	else if tag == RESOURCE_CONTINUE_EXIT_TAG:
+		Ok(ResourceContinueExit)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+pure func core_resource_scope_to_json(scope: CoreResourceScope) -> JsonValue:
+	JsonObject([
+		("var", core_var_to_json(scope.variable)),
+		("type", core_type_to_json(scope.typ)),
+		("acquire", core_expr_to_json(scope.acquire)),
+		("body", core_expr_to_json(scope.body)),
+		("cleanup", core_expr_to_json(scope.cleanup)),
+	])
+
+
+pure func decode_core_resource_scope_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreResourceScope, CoreJsonError]:
+	var_json ?= object_field(value, path, "var")
+	variable ?= decode_core_var_json(
+		var_json,
+		path_field(path, "var"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	acquire_json ?= object_field(value, path, "acquire")
+	acquire ?= decode_core_expr_json(
+		acquire_json,
+		path_field(path, "acquire"),
+	)
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_expr_json(
+		body_json,
+		path_field(path, "body"),
+	)
+	cleanup_json ?= object_field(value, path, "cleanup")
+	cleanup ?= decode_core_expr_json(
+		cleanup_json,
+		path_field(path, "cleanup"),
+	)
+
+	Ok({
+		variable = variable,
+		typ = typ,
+		acquire = acquire,
+		body = body,
+		cleanup = cleanup,
+	})
+
+
+pure func core_resource_cleanup_exit_to_json(exit: CoreResourceCleanupExit) -> JsonValue:
+	JsonObject([
+		("cleanups", core_expr_list_to_json(exit.cleanups)),
+		("exit", JsonString(core_resource_exit_to_string(exit.exit))),
+	])
+
+
+pure func decode_core_resource_cleanup_exit_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreResourceCleanupExit, CoreJsonError]:
+	cleanups ?= decode_core_expr_list(value, path, "cleanups")
+	exit_tag ?= string_field(value, path, "exit")
+	exit ?= parse_core_resource_exit(
+		exit_tag,
+		path_field(path, "exit"),
+	)
+
+	Ok({
+		cleanups = cleanups,
+		exit = exit,
 	})
 
 
@@ -1285,6 +1441,14 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 				("type", core_type_to_json(typ)),
 				("loc", source_loc_to_json(loc)),
 			])
+		FieldExpr(expr_value, field_name, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(FIELD_EXPR_TAG)),
+				("expr", core_expr_to_json(expr_value)),
+				("field", JsonString(field_name)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
 		LetExpr(name, is_mutable, typ, rhs, body):
 			JsonObject([
 				(KIND_FIELD, JsonString(LET_EXPR_TAG)),
@@ -1320,6 +1484,20 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 				("type", core_type_to_json(typ)),
 				("loc", source_loc_to_json(loc)),
 			])
+		ResourceScopeExpr(scope, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(RESOURCE_SCOPE_EXPR_TAG)),
+				("scope", core_resource_scope_to_json(scope)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
+		ResourceCleanupExitExpr(exit, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(RESOURCE_CLEANUP_EXIT_EXPR_TAG)),
+				("cleanup_exit", core_resource_cleanup_exit_to_json(exit)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
 		TailrecLoopExpr(params, return_type, body, loc):
 			JsonObject([
 				(KIND_FIELD, JsonString(TAILREC_LOOP_EXPR_TAG)),
@@ -1342,6 +1520,14 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 				("start", core_expr_to_json(start)),
 				("end", core_expr_to_json(end_value)),
 				("body", core_expr_to_json(body)),
+				("type", core_type_to_json(typ)),
+				("loc", source_loc_to_json(loc)),
+			])
+		RangeExpr(start, end_value, typ, loc):
+			JsonObject([
+				(KIND_FIELD, JsonString(RANGE_EXPR_TAG)),
+				("start", core_expr_to_json(start)),
+				("end", core_expr_to_json(end_value)),
 				("type", core_type_to_json(typ)),
 				("loc", source_loc_to_json(loc)),
 			])
@@ -1609,6 +1795,24 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 			path_field(path, "loc"),
 		)
 		Ok(CastExpr(expr_value, typ, loc))
+	else if tag == FIELD_EXPR_TAG:
+		expr_json ?= object_field(value, path, "expr")
+		expr_value ?= decode_core_expr_json(
+			expr_json,
+			path_field(path, "expr"),
+		)
+		field_name ?= string_field(value, path, "field")
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(FieldExpr(expr_value, field_name, typ, loc))
 	else if tag == LET_EXPR_TAG:
 		name_json ?= object_field(value, path, "name")
 		name ?= decode_core_var_json(
@@ -1690,6 +1894,40 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 			path_field(path, "loc"),
 		)
 		Ok(ContinueExpr(typ, loc))
+	else if tag == RESOURCE_SCOPE_EXPR_TAG:
+		scope_json ?= object_field(value, path, "scope")
+		scope ?= decode_core_resource_scope_json(
+			scope_json,
+			path_field(path, "scope"),
+		)
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(ResourceScopeExpr(scope, typ, loc))
+	else if tag == RESOURCE_CLEANUP_EXIT_EXPR_TAG:
+		cleanup_exit_json ?= object_field(value, path, "cleanup_exit")
+		cleanup_exit ?= decode_core_resource_cleanup_exit_json(
+			cleanup_exit_json,
+			path_field(path, "cleanup_exit"),
+		)
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(ResourceCleanupExitExpr(cleanup_exit, typ, loc))
 	else if tag == TAILREC_LOOP_EXPR_TAG:
 		params ?= decode_core_params(value, path, "params")
 		return_type_json ?= object_field(value, path, "return_type")
@@ -1753,6 +1991,28 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 			path_field(path, "loc"),
 		)
 		Ok(ForRangeExpr(binder, start, end_value, body, typ, loc))
+	else if tag == RANGE_EXPR_TAG:
+		start_json ?= object_field(value, path, "start")
+		start ?= decode_core_expr_json(
+			start_json,
+			path_field(path, "start"),
+		)
+		end_json ?= object_field(value, path, "end")
+		end_value ?= decode_core_expr_json(
+			end_json,
+			path_field(path, "end"),
+		)
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		loc_json ?= object_field(value, path, "loc")
+		loc ?= decode_source_loc_json(
+			loc_json,
+			path_field(path, "loc"),
+		)
+		Ok(RangeExpr(start, end_value, typ, loc))
 	else if tag == LITERAL_MATCH_EXPR_TAG:
 		scrutinee_json ?= object_field(value, path, "scrutinee")
 		scrutinee ?= decode_core_expr_json(
@@ -2180,6 +2440,103 @@ pure func decode_core_enum_decl_json(
 	})
 
 
+pure func core_value_record_field_to_json(field: CoreValueRecordField) -> JsonValue:
+	JsonObject([
+		("name", JsonString(field.name)),
+		("type", core_type_to_json(field.typ)),
+	])
+
+
+private pure func core_value_record_fields_to_json(fields: List[CoreValueRecordField]) -> JsonValue:
+	var values: List[JsonValue] = []
+
+	for field in fields:
+		values = values.append(core_value_record_field_to_json(field))
+
+	JsonVector(values)
+
+
+pure func decode_core_value_record_field_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreValueRecordField, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+
+	Ok({
+		name = name,
+		typ = typ,
+	})
+
+
+private pure func decode_core_value_record_fields(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[List[CoreValueRecordField], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: List[CoreValueRecordField] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		match error:
+			Some(existing_error):
+				void
+			None:
+				match decode_core_value_record_field_json(
+					item,
+					path_index(
+						path_field(path, field_name),
+						index,
+					),
+				):
+					Ok(field):
+						result = result.append(field)
+					Err(err):
+						error = Some(err)
+
+		index += 1
+
+	match error:
+		Some(existing_error):
+			Err(existing_error)
+		None:
+			Ok(result)
+
+
+pure func core_value_record_decl_to_json(record_decl: CoreValueRecordDecl) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(VALUE_RECORD_DECL_TAG)),
+		("name", JsonString(record_decl.name)),
+		("fields", core_value_record_fields_to_json(record_decl.fields)),
+		("loc", source_loc_to_json(record_decl.loc)),
+	])
+
+
+pure func decode_core_value_record_decl_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreValueRecordDecl, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	fields ?= decode_core_value_record_fields(value, path, "fields")
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+
+	Ok({
+		name = name,
+		fields = fields,
+		loc = loc,
+	})
+
+
 pure func core_decl_to_json(decl: CoreDecl) -> JsonValue:
 	match decl:
 		FunctionDecl(core_func):
@@ -2188,6 +2545,8 @@ pure func core_decl_to_json(decl: CoreDecl) -> JsonValue:
 			core_global_to_json(global)
 		EnumDecl(enum_decl):
 			core_enum_decl_to_json(enum_decl)
+		ValueRecordDecl(record_decl):
+			core_value_record_decl_to_json(record_decl)
 
 
 pure func decode_core_decl_json(value: JsonValue, path: String) -> Result[CoreDecl, CoreJsonError]:
@@ -2202,6 +2561,9 @@ pure func decode_core_decl_json(value: JsonValue, path: String) -> Result[CoreDe
 	else if tag == ENUM_DECL_TAG:
 		enum_decl ?= decode_core_enum_decl_json(value, path)
 		Ok(EnumDecl(enum_decl))
+	else if tag == VALUE_RECORD_DECL_TAG:
+		record_decl ?= decode_core_value_record_decl_json(value, path)
+		Ok(ValueRecordDecl(record_decl))
 	else:
 		Err(CoreUnsupportedTag(path, tag))
 

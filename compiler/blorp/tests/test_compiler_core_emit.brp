@@ -3,10 +3,10 @@ import:
 	../compiler_core_emit: emit_core_program_c_artifact
 	../compiler_core_json:
 		CoreBinaryOp(AddOp, DivideOp, EqualOp, LessOp, ModuloOp, SubtractOp),
-		CoreCallKind(IntrinsicCall, UserCall),
+		CoreCallKind(BuiltinCall, IntrinsicCall, UserCall),
 		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ValueRecordDecl),
 		CoreEnumDecl,
 		CoreExpr(
 			AssignExpr,
@@ -17,12 +17,14 @@ import:
 			ConstructorMatchExpr,
 			CooperativeCheckpointExpr,
 			ContinueExpr,
+			FieldExpr,
 			ForRangeExpr,
 			IfExpr,
 			LetExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
+			RangeExpr,
 			SeqExpr,
 			TailrecLoopExpr,
 			TailrecRecurExpr,
@@ -43,8 +45,9 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(EnumType, NamedType, VoidType),
+		CoreType(EnumType, NamedType, ValueRecordType, VoidType),
 		CoreUnaryOp(NegateOp, NotOp),
+		CoreValueRecordDecl,
 		CoreVar,
 	test: TestSuite
 
@@ -72,6 +75,10 @@ pure func int_type() -> CoreType:
 	NamedType("Int", [])
 
 
+pure func int8_type() -> CoreType:
+	NamedType("Int8", [])
+
+
 pure func int32_type() -> CoreType:
 	NamedType("Int32", [])
 
@@ -82,6 +89,10 @@ pure func uint8_type() -> CoreType:
 
 pure func string_type() -> CoreType:
 	NamedType("String", [])
+
+
+pure func range_type() -> CoreType:
+	ValueRecordType("Range")
 
 
 pure func bool_type() -> CoreType:
@@ -120,6 +131,20 @@ pure func answer_global() -> CoreGlobal:
 		is_mutable = False,
 		is_const = True,
 		def_id = 70,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func range_record_decl() -> CoreValueRecordDecl:
+	{
+		name = "Range",
+		fields = [{
+				name = "start",
+				typ = int_type()
+			}, {
+				name = "end",
+				typ = int_type()
+			}],
 		loc = SyntheticSourceLoc
 	}
 
@@ -707,6 +732,28 @@ pure func return_answer_function() -> CoreFunction:
 		is_pure = True,
 		function_kind = UserFunction,
 		def_id = 32,
+		loc = SyntheticSourceLoc
+	}
+
+
+pure func range_start_function() -> CoreFunction:
+	range_expr: CoreExpr = RangeExpr(
+		LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+		LiteralExpr(IntLiteral(4), int_type(), SyntheticSourceLoc),
+		range_type(),
+		SyntheticSourceLoc,
+	)
+
+	{
+		name = "range_start",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(FieldExpr(range_expr, "start", int_type(), SyntheticSourceLoc)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 33,
 		loc = SyntheticSourceLoc
 	}
 
@@ -1333,6 +1380,43 @@ pure func call_then_return_function() -> CoreFunction:
 	}
 
 
+pure func to_int8_builtin_function() -> CoreFunction:
+	param: CoreParam = {
+		name = param_x(),
+		typ = int_type(),
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		name = "to_int8_builtin",
+		source_module = None,
+		type_params = [],
+		params = [param],
+		return_type = int8_type(),
+		body = Some(
+			CallExpr(
+				BuiltinCall("blorp_to_int8"),
+				VarExpr(
+					{
+						name = "blorp_to_int8",
+						uniq = 0,
+						def_id = None
+					},
+					int8_type(),
+					SyntheticSourceLoc,
+				),
+				[VarExpr(param_x(), int_type(), SyntheticSourceLoc)],
+				int8_type(),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 21,
+		loc = SyntheticSourceLoc
+	}
+
+
 pure func main_return_if_function() -> CoreFunction:
 	{
 		name = "main",
@@ -1745,6 +1829,22 @@ pure func test_emit_simple_user_call_expression() -> Bool:
 	)
 
 
+pure func test_emit_function_forward_declarations() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(main_call_identity_function()), FunctionDecl(identity_function())],
+	}
+	artifact: CArtifact = emit_core_program_c_artifact(program)
+	prototype_index: Option[Int] = artifact.c_code.index_of("long id(long x);")
+	main_index: Option[Int] = artifact.c_code.index_of("int main(void)")
+	definition_index: Option[Int] = artifact.c_code.index_of("long id(long x) {")
+
+	(
+		artifact.c_code.contains("return id(41);")
+		and option_int_less_than(prototype_index, main_index)
+		and option_int_less_than(main_index, definition_index)
+	)
+
+
 pure func test_emit_intrinsic_call_expression() -> Bool:
 	program: CoreProgram = {decls = [FunctionDecl(shift_left_intrinsic_function())]}
 	artifact: CArtifact = emit_core_program_c_artifact(program)
@@ -1753,6 +1853,16 @@ pure func test_emit_intrinsic_call_expression() -> Bool:
 		artifact.c_code.contains("long shift_left_intrinsic(void)")
 		and artifact.c_code.contains("return ((long)(8 << (1 & 63)));")
 		and not artifact.c_code.contains("return shift_left(8, 1);")
+	)
+
+
+pure func test_emit_scalar_builtin_call_expression() -> Bool:
+	program: CoreProgram = {decls = [FunctionDecl(to_int8_builtin_function())]}
+	artifact: CArtifact = emit_core_program_c_artifact(program)
+
+	(
+		artifact.c_code.contains("int8_t to_int8_builtin(long x)")
+		and artifact.c_code.contains("return blorp_to_int8(x);")
 	)
 
 
@@ -1770,6 +1880,26 @@ pure func test_emit_static_scalar_global() -> Bool:
 		and artifact.c_code.contains("long return_answer(void)")
 		and artifact.c_code.contains("return ANSWER;")
 		and global_before_function
+	)
+
+
+pure func test_emit_value_record_range_expression() -> Bool:
+	program: CoreProgram = {
+		decls = [ValueRecordDecl(range_record_decl()), FunctionDecl(range_start_function())],
+	}
+	artifact: CArtifact = emit_core_program_c_artifact(program)
+	record_index: Option[Int] = artifact.c_code.index_of(
+		"typedef struct { long start; long end; } Range;",
+	)
+	function_index: Option[Int] = artifact.c_code.index_of("long range_start(void)")
+
+	(
+		artifact.c_code.contains("static inline Range Range_make(long start, long end)")
+		and artifact.c_code.contains("Range __range_value = { 1, 4 };")
+		and artifact.c_code.contains(
+			"return ({ Range __range_value = { 1, 4 }; __range_value; }).start;",
+		)
+		and option_int_less_than(record_index, function_index)
 	)
 
 
@@ -1968,8 +2098,11 @@ tests: TestSuite = {
 		("emit logical or expression", test_emit_logical_or_expression),
 		("emit escaped string literal", test_emit_escaped_string_literal),
 		("emit simple user call expression", test_emit_simple_user_call_expression),
+		("emit function forward declarations", test_emit_function_forward_declarations),
 		("emit intrinsic call expression", test_emit_intrinsic_call_expression),
+		("emit scalar builtin call expression", test_emit_scalar_builtin_call_expression),
 		("emit static scalar global", test_emit_static_scalar_global),
+		("emit value record range expression", test_emit_value_record_range_expression),
 		("emit enum declaration and typed function", test_emit_enum_declaration_and_typed_function),
 		("emit constructor match expression", test_emit_constructor_match_expression),
 		("emit let binding statement", test_emit_let_binding_statement),

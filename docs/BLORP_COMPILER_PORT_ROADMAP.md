@@ -49,28 +49,35 @@ That is the correct architectural direction, but it is still transitional:
   the OS.
 - `emit_c` exists as a bridge action and now accepts a typed Core JSON envelope
   under the `core` payload field. For the supported production path, OCaml first
-  hands Blorp post-resource/pre-fairness Core; Blorp inserts cooperative
-  checkpoints for loops before emitting C. If that earlier tail shape is
-  unsupported, OCaml falls back to the older final-Core handoff and then to the
-  OCaml backend. Blorp validates that Core subset and returns a `CArtifact`. It
-  can emit a tiny valid-C subset for user functions
+  hands Blorp post-closure/pre-resource Core; Blorp rewrites resource cleanup
+  edges and inserts cooperative checkpoints for loops before emitting C. If that
+  earlier tail shape is unsupported, OCaml falls back to the older final-Core
+  handoff and then to the OCaml backend. Blorp validates that Core subset and
+  returns a `CArtifact`. It can emit a tiny valid-C subset for user functions
   with typed parameters, simple literal/variable/void/string/float/char bodies
   with C string escaping, unary operators, simple casts, binary-operator bodies
   including safe integer divide/modulo lowering, short-circuit logical
   expressions, explicit C type names for sized integer and float scalars,
   assignment statements, ternary `if`, simple named calls and renderable
-  intrinsic calls whose arguments are in the supported expression subset, basic
-  `let`/sequence statement bodies including void/discard let cases, simple
+  intrinsic calls whose arguments are in the supported expression subset, a
+  narrow set of scalar runtime builtin calls for sized integer conversions,
+  basic `let`/sequence statement bodies including void/discard let cases, simple
   `while` loops with Blorp-inserted cooperative checkpoints,
   `break`/`continue`, and statement-shaped `if/else` lowering with explicit
   result temporaries. It also owns range `for` loops over final-Core `CRange`
   values and unmanaged `@tail_recursive` final-Core loops with explicit recur
   parameter rebinding, plus payloadless enum declarations, enum-typed scalar
-  references/equality, payloadless enum constructor matches, and immutable
-  scalar literal globals. The default pipeline now attempts this Blorp path
-  first from the earlier tail boundary, including embedded-runtime compile requests;
-  unsupported final Core and profiling builds still fall back to the OCaml
-  backend while the Blorp subset expands.
+  references/equality, payloadless enum constructor matches, immutable scalar
+  literal globals, and function forward declarations for supported user
+  functions. The default pipeline now attempts this Blorp path first from the
+  earlier tail boundary, including embedded-runtime compile requests. On the
+  supported route, Blorp performs resource cleanup-edge rewriting and
+  cooperative checkpoint insertion itself; the OCaml final tail is forced only
+  for explicit final-stage observation, invariant checking, unsupported Blorp
+  subsets, profiling builds, or the OCaml fallback backend.
+  Concrete impl declarations are projected as ordinary method functions at the
+  JSON boundary, matching the existing backend naming convention, so Blorp does
+  not need to model impl blocks as C declarations.
 
 Approximate current source shape, measured from this worktree on 2026-06-20:
 
@@ -436,14 +443,22 @@ Implementation:
   payloadless enum constructor matches, immutable scalar literal globals, plus
   unmanaged tail-recursive loops with explicit recur argument rebinding.
   The single C emission path now attempts this Blorp backend first from
-  post-resource/pre-fairness Core, including embedded-runtime compile requests,
-  Blorp-owned cooperative checkpoint insertion, and intrinsic calls rendered by
-  the Blorp intrinsic renderer. It falls back to the final-Core handoff and then
-  to OCaml for unsupported tail shapes and profiling builds. The old generic
-  `Backend.S` wrapper
-  and `core_emit_c.ml` have been deleted. The OCaml backend unit suite has been
-  replaced with a source-level codegen audit that asserts the Blorp artifact path
-  is used by default for the supported final-Core subset.**
+  post-closure/pre-resource Core, including embedded-runtime compile requests,
+  Blorp-owned resource cleanup-edge rewriting, cooperative checkpoint
+  insertion, and intrinsic calls rendered by the Blorp intrinsic renderer. The
+  supported call subset now also includes scalar sized-integer runtime
+  conversions such as `blorp_to_int8`, plus concrete impl declarations flattened
+  to ordinary method functions at the JSON transfer boundary. Blorp also emits
+  function forward declarations for supported user functions so source-order
+  calls to later functions compile without relying on OCaml emission. The
+  older OCaml resource/fairness/final-preparation tail is now lazy: normal
+  supported Blorp emission does not run those duplicate OCaml passes, while
+  explicit final-stage observation, invariant checks, unsupported tail shapes,
+  profiling builds, and fallback emission still force that compatibility path.
+  The old generic `Backend.S` wrapper and `core_emit_c.ml` have been deleted.
+  The OCaml backend unit suite has been replaced with a source-level codegen
+  audit that asserts the Blorp artifact path is used by default for the
+  supported final-Core subset.**
 - Keep C artifact output structured: C text, link flags, include dirs, runtime
   feature metadata.
 

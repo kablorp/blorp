@@ -259,7 +259,7 @@ boxing, or ownership behavior from source spelling.
 | `core_reuse.ml` | Post-Perceus allocation reuse analysis and prepared-Core union-node reuse rewrites |
 | `core_closure.ml` | Closure conversion / lambda hoisting |
 | `core_perceus_check.ml` | RC balance simulator for testing |
-| `core_emit_blorp_c.ml` | Core JSON projection for the Blorp-owned tail C path, preferring post-resource/pre-fairness Core and falling back to final Core for the supported subset |
+| `core_emit_blorp_c.ml` | Core JSON projection for the Blorp-owned tail C path, preferring post-closure/pre-resource Core and forcing final Core only for observation, invariants, unsupported subsets, or fallback |
 | `core_emit.ml` | OCaml Core → C fallback emission while Blorp backend coverage expands |
 | `core_emit_context.ml` | Emission state (buffers, lambda collection) |
 | `core_emit_intrinsic.ml`, `core_emit_list_intrinsic.ml` | Intrinsic and list-helper emission |

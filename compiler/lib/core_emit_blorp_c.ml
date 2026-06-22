@@ -32,6 +32,23 @@ let option_int_json = function Some value -> int value | None -> null
 let option_string_json = function Some value -> str value | None -> null
 let string_list_json values = arr (List.map str values)
 
+let supported_sized_integer_conversion_builtins =
+  StringSet.of_list
+    [
+      "blorp_to_int8";
+      "blorp_to_int16";
+      "blorp_to_int32";
+      "blorp_to_int128";
+      "blorp_to_uint8";
+      "blorp_to_uint16";
+      "blorp_to_uint32";
+      "blorp_to_uint64";
+      "blorp_to_uint128";
+    ]
+
+let sized_integer_conversion_builtin_supported name =
+  StringSet.mem name supported_sized_integer_conversion_builtins
+
 let result_list values f =
   let rec collect acc index = function
     | [] -> Ok (arr (List.rev acc))
@@ -88,17 +105,23 @@ let var_json_for_expr enum_constructors ty (variable : Core.var) =
       ("def_id", option_int_json variable.vdef_id);
     ]
 
-let rec type_json enum_names path (ty : Ast.type_expr) =
+let rec type_json enum_names value_record_names path (ty : Ast.type_expr) =
   match ty with
   | Ast.TyNamed ("Void", []) -> Ok (kind "void" [])
   | Ast.TyNamed (name, []) when StringSet.mem name enum_names ->
       Ok (kind "enum" [ ("name", str name) ])
   | Ast.TyNamed (name, _ :: _) when StringSet.mem name enum_names ->
       unsupported path ("generic enum type " ^ name)
+  | Ast.TyNamed (name, []) when StringSet.mem name value_record_names ->
+      Ok (kind "value_record" [ ("name", str name) ])
+  | Ast.TyNamed (name, _ :: _) when StringSet.mem name value_record_names ->
+      unsupported path ("generic value record type " ^ name)
   | Ast.TyNamed (name, args) ->
       let* arg_values =
         result_list args (fun index arg ->
-            type_json enum_names (Printf.sprintf "%s.args[%d]" path index) arg)
+            type_json enum_names value_record_names
+              (Printf.sprintf "%s.args[%d]" path index)
+              arg)
       in
       Ok (kind "named" [ ("name", str name); ("args", arg_values) ])
   | Ast.TyConstInt _ ->
@@ -106,7 +129,9 @@ let rec type_json enum_names path (ty : Ast.type_expr) =
   | Ast.TyTuple items ->
       let* item_values =
         result_list items (fun index item ->
-            type_json enum_names (Printf.sprintf "%s.items[%d]" path index) item)
+            type_json enum_names value_record_names
+              (Printf.sprintf "%s.items[%d]" path index)
+              item)
       in
       Ok (kind "tuple" [ ("items", item_values) ])
   | Ast.TyArray _ -> unsupported path "array/tensor type"
@@ -182,8 +207,10 @@ let enum_constructor_c_name_for_match enum_constructors path scrut_ty ctor =
       | None -> unsupported path ("unknown enum constructor " ^ ctor))
   | _ -> unsupported path "constructor match on non-enum type"
 
-let param_json enum_names path (param : Core.core_param) =
-  let* typ = type_json enum_names (path ^ ".type") param.cp_ty in
+let param_json enum_names value_record_names path (param : Core.core_param) =
+  let* typ =
+    type_json enum_names value_record_names (path ^ ".type") param.cp_ty
+  in
   Ok
     (obj
        [
@@ -196,8 +223,11 @@ let loop_range_direction_json = function
   | Core.RangeMayRunBackward -> str "may_run_backward"
   | Core.RangeForwardOnly -> str "forward_only"
 
-let loop_binder_json enum_names path (binder : Core.loop_binder) =
-  let* typ = type_json enum_names (path ^ ".type") binder.loop_ty in
+let loop_binder_json enum_names value_record_names path
+    (binder : Core.loop_binder) =
+  let* typ =
+    type_json enum_names value_record_names (path ^ ".type") binder.loop_ty
+  in
   Ok
     (obj
        [
@@ -213,6 +243,8 @@ let call_kind_json path (call_kind : Core.call_kind) =
       Ok
         (kind "user" [ ("name", str name); ("def_id", option_int_json def_id) ])
   | Core.CKForeign _ -> unsupported path "foreign call"
+  | Core.CKBuiltin name when sized_integer_conversion_builtin_supported name ->
+      Ok (kind "builtin" [ ("name", str name) ])
   | Core.CKBuiltin name -> unsupported path ("builtin call " ^ name)
   | Core.CKIntrinsic name -> Ok (kind "intrinsic" [ ("name", str name) ])
   | Core.CKClosure -> unsupported path "closure call"
@@ -235,16 +267,20 @@ let binop_tag = function
 let unop_tag = function Ast.Neg -> "negate" | Ast.Not -> "not"
 let logop_tag = function Ast.And -> "and" | Ast.Or -> "or"
 
-let rec expr_json enum_names enum_constructors path (expr : Core.core) =
+let rec expr_json enum_names value_record_names enum_constructors path
+    (expr : Core.core) =
   let loc = source_loc_json expr.loc in
   let typed fields =
-    let* typ = type_json enum_names (path ^ ".type") expr.ty in
+    let* typ =
+      type_json enum_names value_record_names (path ^ ".type") expr.ty
+    in
     Ok (fields @ [ ("type", typ); ("loc", loc) ])
   in
   let literal_match_fallback_json path = function
     | Core.CTLeaf { ct_bindings = []; ct_body } ->
         let* body =
-          expr_json enum_names enum_constructors (path ^ ".body") ct_body
+          expr_json enum_names value_record_names enum_constructors
+            (path ^ ".body") ct_body
         in
         Ok (kind "body" [ ("body", body) ])
     | Core.CTLeaf { ct_bindings = _ :: _; _ } ->
@@ -273,11 +309,12 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
   | Core.CCall (call_kind, callee, args) ->
       let* call_kind_value = call_kind_json (path ^ ".call_kind") call_kind in
       let* callee_value =
-        expr_json enum_names enum_constructors (path ^ ".callee") callee
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".callee") callee
       in
       let* args_value =
         result_list args (fun index arg ->
-            expr_json enum_names enum_constructors
+            expr_json enum_names value_record_names enum_constructors
               (Printf.sprintf "%s.args[%d]" path index)
               arg)
       in
@@ -295,10 +332,12 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
       | Error reason -> unsupported path reason
       | Ok op_tag ->
           let* left_value =
-            expr_json enum_names enum_constructors (path ^ ".left") left
+            expr_json enum_names value_record_names enum_constructors
+              (path ^ ".left") left
           in
           let* right_value =
-            expr_json enum_names enum_constructors (path ^ ".right") right
+            expr_json enum_names value_record_names enum_constructors
+              (path ^ ".right") right
           in
           let* fields =
             typed
@@ -309,7 +348,8 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
           Ok (kind "binary" fields))
   | Core.CUn (op, inner) ->
       let* inner_value =
-        expr_json enum_names enum_constructors (path ^ ".expr") inner
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".expr") inner
       in
       let* fields =
         typed [ ("op", str (unop_tag op)); ("expr", inner_value) ]
@@ -317,10 +357,12 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
       Ok (kind "unary" fields)
   | Core.CLog (op, left, right) ->
       let* left_value =
-        expr_json enum_names enum_constructors (path ^ ".left") left
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".left") left
       in
       let* right_value =
-        expr_json enum_names enum_constructors (path ^ ".right") right
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".right") right
       in
       let* fields =
         typed
@@ -333,15 +375,19 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
       Ok (kind "logical" fields)
   | Core.CAssign (variable, rhs) ->
       let* rhs_value =
-        expr_json enum_names enum_constructors (path ^ ".rhs") rhs
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".rhs") rhs
       in
       let* fields = typed [ ("var", var_json variable); ("rhs", rhs_value) ] in
       Ok (kind "assign" fields)
   | Core.CCast (inner, target_ty) ->
       let* inner_value =
-        expr_json enum_names enum_constructors (path ^ ".expr") inner
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".expr") inner
       in
-      let* typ = type_json enum_names (path ^ ".type") target_ty in
+      let* typ =
+        type_json enum_names value_record_names (path ^ ".type") target_ty
+      in
       Ok
         (kind "cast"
            [
@@ -349,13 +395,29 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
              ("type", typ);
              ("loc", source_loc_json expr.loc);
            ])
+  | Core.CField (inner, field_name) -> (
+      match inner.ty with
+      | Ast.TyNamed (name, []) when StringSet.mem name value_record_names ->
+          let* inner_value =
+            expr_json enum_names value_record_names enum_constructors
+              (path ^ ".expr") inner
+          in
+          let* fields =
+            typed [ ("expr", inner_value); ("field", str field_name) ]
+          in
+          Ok (kind "field" fields)
+      | _ -> unsupported path "field access on non-value record")
   | Core.CLet (binding, body) ->
-      let* typ = type_json enum_names (path ^ ".type") binding.bind_ty in
+      let* typ =
+        type_json enum_names value_record_names (path ^ ".type") binding.bind_ty
+      in
       let* rhs =
-        expr_json enum_names enum_constructors (path ^ ".rhs") binding.bind_rhs
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".rhs") binding.bind_rhs
       in
       let* body =
-        expr_json enum_names enum_constructors (path ^ ".body") body
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".body") body
       in
       Ok
         (kind "let"
@@ -368,21 +430,26 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
            ])
   | Core.CSeq (first, second) ->
       let* first_value =
-        expr_json enum_names enum_constructors (path ^ ".first") first
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".first") first
       in
       let* second_value =
-        expr_json enum_names enum_constructors (path ^ ".second") second
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".second") second
       in
       Ok (kind "seq" [ ("first", first_value); ("second", second_value) ])
   | Core.CIf (cond, then_expr, else_expr) ->
       let* cond_value =
-        expr_json enum_names enum_constructors (path ^ ".cond") cond
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".cond") cond
       in
       let* then_value =
-        expr_json enum_names enum_constructors (path ^ ".then") then_expr
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".then") then_expr
       in
       let* else_value =
-        expr_json enum_names enum_constructors (path ^ ".else") else_expr
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".else") else_expr
       in
       let* fields =
         typed
@@ -391,25 +458,30 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
       Ok (kind "if" fields)
   | Core.CWhile (cond, body) ->
       let* cond_value =
-        expr_json enum_names enum_constructors (path ^ ".cond") cond
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".cond") cond
       in
       let* body_value =
-        expr_json enum_names enum_constructors (path ^ ".body") body
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".body") body
       in
       let* fields = typed [ ("cond", cond_value); ("body", body_value) ] in
       Ok (kind "while" fields)
   | Core.CFor (binder, { desc = Core.CRange (lo, hi); _ }, body) ->
       let* binder_value =
-        loop_binder_json enum_names (path ^ ".binder") binder
+        loop_binder_json enum_names value_record_names (path ^ ".binder") binder
       in
       let* start_value =
-        expr_json enum_names enum_constructors (path ^ ".start") lo
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".start") lo
       in
       let* end_value =
-        expr_json enum_names enum_constructors (path ^ ".end") hi
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".end") hi
       in
       let* body_value =
-        expr_json enum_names enum_constructors (path ^ ".body") body
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".body") body
       in
       let* fields =
         typed
@@ -422,12 +494,27 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
       in
       Ok (kind "for_range" fields)
   | Core.CFor _ -> unsupported path "non-range for loop"
+  | Core.CRange (lo, hi) -> (
+      match expr.ty with
+      | Ast.TyNamed (name, []) when StringSet.mem name value_record_names ->
+          let* start_value =
+            expr_json enum_names value_record_names enum_constructors
+              (path ^ ".start") lo
+          in
+          let* end_value =
+            expr_json enum_names value_record_names enum_constructors
+              (path ^ ".end") hi
+          in
+          let* fields = typed [ ("start", start_value); ("end", end_value) ] in
+          Ok (kind "range" fields)
+      | _ -> unsupported path "range expression with non-value-record type")
   | Core.CMatch
       ( scrutinee,
         Core.CTSwitchLit { ctl_scrut = Core.AccRoot; ctl_cases; ctl_default } )
     ->
       let* scrutinee_value =
-        expr_json enum_names enum_constructors (path ^ ".scrutinee") scrutinee
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".scrutinee") scrutinee
       in
       let* cases_value =
         result_list ctl_cases (fun index (literal, subtree) ->
@@ -437,7 +524,8 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
             in
             let* body = literal_match_leaf_body (case_path ^ ".body") subtree in
             let* body_value =
-              expr_json enum_names enum_constructors (case_path ^ ".body") body
+              expr_json enum_names value_record_names enum_constructors
+                (case_path ^ ".body") body
             in
             Ok (obj [ ("literal", literal_value); ("body", body_value) ]))
       in
@@ -462,7 +550,8 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
         | Some Core.CTFail -> Ok (kind "fail" [])
         | Some (Core.CTLeaf { ct_bindings = []; ct_body }) ->
             let* body =
-              expr_json enum_names enum_constructors (path ^ ".body") ct_body
+              expr_json enum_names value_record_names enum_constructors
+                (path ^ ".body") ct_body
             in
             Ok (kind "body" [ ("body", body) ])
         | Some (Core.CTLeaf { ct_bindings = _ :: _; _ }) ->
@@ -475,7 +564,8 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
             unsupported path "nested length match fallback"
       in
       let* scrutinee_value =
-        expr_json enum_names enum_constructors (path ^ ".scrutinee") scrutinee
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".scrutinee") scrutinee
       in
       let* cases_value =
         result_list cts_cases (fun index (ctor, subtree) ->
@@ -489,7 +579,8 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
               constructor_match_leaf_body (case_path ^ ".body") subtree
             in
             let* body_value =
-              expr_json enum_names enum_constructors (case_path ^ ".body") body
+              expr_json enum_names value_record_names enum_constructors
+                (case_path ^ ".body") body
             in
             Ok
               (obj
@@ -521,15 +612,17 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
       (Core.TailrecUnmanagedLoop { tul_params; tul_return_ty; tul_body }) ->
       let* params =
         result_list tul_params (fun index param ->
-            param_json enum_names
+            param_json enum_names value_record_names
               (Printf.sprintf "%s.params[%d]" path index)
               param)
       in
       let* return_type =
-        type_json enum_names (path ^ ".return_type") tul_return_ty
+        type_json enum_names value_record_names (path ^ ".return_type")
+          tul_return_ty
       in
       let* body_value =
-        expr_json enum_names enum_constructors (path ^ ".body") tul_body
+        expr_json enum_names value_record_names enum_constructors
+          (path ^ ".body") tul_body
       in
       Ok
         (kind "tailrec_loop"
@@ -544,7 +637,7 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
   | Core.CTailrecRecur (Core.TailrecRecur { tr_args }) ->
       let* args_value =
         result_list tr_args (fun index arg ->
-            expr_json enum_names enum_constructors
+            expr_json enum_names value_record_names enum_constructors
               (Printf.sprintf "%s.args[%d]" path index)
               arg)
       in
@@ -570,12 +663,10 @@ let rec expr_json enum_names enum_constructors path (expr : Core.core) =
   | Core.CRecord _ -> unsupported path "record literal"
   | Core.CRecordConstruct _ -> unsupported path "record construction"
   | Core.CRecordUpdate _ -> unsupported path "record update"
-  | Core.CRange _ -> unsupported path "range expression"
   | Core.CLambda _ -> unsupported path "lambda"
   | Core.CClosureCreate _ -> unsupported path "closure creation"
   | Core.CTensorRawRead _ -> unsupported path "tensor raw read"
   | Core.CTensorRawWrite _ -> unsupported path "tensor raw write"
-  | Core.CField _ -> unsupported path "field access"
   | Core.CStringInterp _ -> unsupported path "string interpolation"
   | Core.CBorrowLet _ -> unsupported path "borrow let"
   | Core.CTensorRawViewLet _ -> unsupported path "tensor raw view"
@@ -635,6 +726,8 @@ let require_simple_call_kind path call_kind args =
   match call_kind with
   | Core.CKUser _ -> Ok ()
   | Core.CKForeign _ -> unsupported path "foreign call"
+  | Core.CKBuiltin name when sized_integer_conversion_builtin_supported name ->
+      Ok ()
   | Core.CKBuiltin name -> unsupported path ("builtin call " ^ name)
   | Core.CKIntrinsic name -> require_intrinsic_renderable path name args
   | Core.CKClosure -> unsupported path "closure call"
@@ -658,6 +751,11 @@ let rec require_simple_expr path (expr : Core.core) =
       let* () = require_simple_expr (path ^ ".left") left in
       require_simple_expr (path ^ ".right") right
   | Core.CCast (inner, _target_ty) -> require_simple_expr (path ^ ".expr") inner
+  | Core.CField (inner, _field_name) ->
+      require_simple_expr (path ^ ".expr") inner
+  | Core.CRange (lo, hi) ->
+      let* () = require_simple_expr (path ^ ".start") lo in
+      require_simple_expr (path ^ ".end") hi
   | Core.CIf (cond, then_expr, else_expr) ->
       let* () = require_simple_expr (path ^ ".cond") cond in
       let* () = require_simple_expr (path ^ ".then") then_expr in
@@ -829,14 +927,17 @@ and require_constructor_match_cases path cases =
   in
   check 0 cases
 
-let function_json ~enum_names ~enum_constructors ~global_def_ids ~global_names
-    path loc (func : Core.core_func) =
+let function_json ~enum_names ~value_record_names ~enum_constructors
+    ~global_def_ids ~global_names path loc (func : Core.core_func) =
   let* params =
     result_list func.cf_params (fun index param ->
-        param_json enum_names (Printf.sprintf "%s.params[%d]" path index) param)
+        param_json enum_names value_record_names
+          (Printf.sprintf "%s.params[%d]" path index)
+          param)
   in
   let* return_type =
-    type_json enum_names (path ^ ".return_type") func.cf_return_ty
+    type_json enum_names value_record_names (path ^ ".return_type")
+      func.cf_return_ty
   in
   let* body =
     match func.cf_body with
@@ -845,7 +946,8 @@ let function_json ~enum_names ~enum_constructors ~global_def_ids ~global_names
           unsupported (path ^ ".body") "global variable reference"
         else
           let* () = require_function_body (path ^ ".body") body in
-          expr_json enum_names enum_constructors (path ^ ".body") body
+          expr_json enum_names value_record_names enum_constructors
+            (path ^ ".body") body
     | None -> Ok null
   in
   Ok
@@ -875,7 +977,8 @@ let static_scalar_global_supported (global : Core.core_var) =
       true
   | _ -> false
 
-let global_json enum_names path loc (global : Core.core_var) =
+let global_json enum_names value_record_names path loc (global : Core.core_var)
+    =
   if not (static_scalar_global_supported global) then
     unsupported path "non-static scalar global declaration"
   else
@@ -884,9 +987,12 @@ let global_json enum_names path loc (global : Core.core_var) =
         let* init_literal =
           static_scalar_global_literal_json (path ^ ".init.literal") literal
         in
-        let* typ = type_json enum_names (path ^ ".type") global.cv_ty in
+        let* typ =
+          type_json enum_names value_record_names (path ^ ".type") global.cv_ty
+        in
         let* init_typ =
-          type_json enum_names (path ^ ".init.type") global.cv_init.ty
+          type_json enum_names value_record_names (path ^ ".init.type")
+            global.cv_init.ty
         in
         let init =
           kind "literal"
@@ -948,35 +1054,102 @@ let enum_decl_json path loc (type_decl : Ast.type_decl) =
            ("loc", source_loc_json loc);
          ])
 
-let rec decl_json enum_names enum_constructors global_def_ids global_names index
-    (decl : Core.core_decl) =
+let value_record_field_json enum_names value_record_names path
+    (field : Ast.field_decl) =
+  let* typ =
+    type_json enum_names value_record_names (path ^ ".type") field.field_type
+  in
+  Ok (obj [ ("name", str field.field_name); ("type", typ) ])
+
+let value_record_decl_json enum_names value_record_names path loc
+    (record_decl : Ast.record_decl) =
+  if record_decl.record_type_params <> [] then
+    unsupported path "generic value record declaration"
+  else
+    let* fields =
+      result_list record_decl.record_fields (fun index field ->
+          value_record_field_json enum_names value_record_names
+            (Printf.sprintf "%s.fields[%d]" path index)
+            field)
+    in
+    Ok
+      (kind "value_record"
+         [
+           ("name", str record_decl.record_name);
+           ("fields", fields);
+           ("loc", source_loc_json loc);
+         ])
+
+let impl_method_c_name (impl : Core.core_impl) (method_func : Core.core_func) =
+  let type_name =
+    match Codegen_types.type_key_for_impl impl.ci_for_type with
+    | Some name -> name
+    | None -> "Unknown"
+  in
+  Printf.sprintf "%s_%s_%s" impl.ci_trait method_func.cf_name type_name
+
+let impl_method_jsons ~enum_names ~value_record_names ~enum_constructors
+    ~global_def_ids ~global_names path loc (impl : Core.core_impl) =
+  if Codegen_types.has_type_vars impl.ci_for_type then Ok []
+  else
+    let rec collect acc index = function
+      | [] -> Ok (List.rev acc)
+      | (method_func : Core.core_func) :: rest ->
+          let method_path = Printf.sprintf "%s.methods[%d]" path index in
+          let method_func =
+            { method_func with cf_name = impl_method_c_name impl method_func }
+          in
+          if method_func.cf_body = None || method_func.cf_type_params <> [] then
+            collect acc (index + 1) rest
+          else
+            let* json =
+              function_json ~enum_names ~value_record_names ~enum_constructors
+                ~global_def_ids ~global_names method_path loc method_func
+            in
+            collect (json :: acc) (index + 1) rest
+    in
+    collect [] 0 impl.ci_methods
+
+let rec decl_jsons enum_names value_record_names enum_constructors
+    global_def_ids global_names index (decl : Core.core_decl) =
   let path = Printf.sprintf "program.decls[%d]" index in
   match decl.cd_desc with
   | Core.CDFunc func when func.cf_body = None || func.cf_type_params <> [] ->
-      Ok None
+      Ok []
   | Core.CDFunc func ->
       let* json =
-        function_json ~enum_names ~enum_constructors ~global_def_ids
-          ~global_names path decl.cd_loc func
+        function_json ~enum_names ~value_record_names ~enum_constructors
+          ~global_def_ids ~global_names path decl.cd_loc func
       in
-      Ok (Some json)
+      Ok [ json ]
   | Core.CDType type_decl
     when type_decl.type_is_enum && not type_decl.type_is_builtin ->
       let* json = enum_decl_json path decl.cd_loc type_decl in
-      Ok (Some json)
+      Ok [ json ]
+  | Core.CDRecord record_decl
+    when record_decl.record_is_value && not record_decl.record_is_builtin ->
+      let* json =
+        value_record_decl_json enum_names value_record_names path decl.cd_loc
+          record_decl
+      in
+      Ok [ json ]
   | Core.CDImport _ | Core.CDTrait _ | Core.CDType _ | Core.CDTypeAlias _
   | Core.CDRecord _ ->
-      Ok None
+      Ok []
   | Core.CDPrivate inner ->
-      decl_json enum_names enum_constructors global_def_ids global_names index
-        inner
+      decl_jsons enum_names value_record_names enum_constructors global_def_ids
+        global_names index inner
   | Core.CDVar global -> (
       match global.cv_module with
-      | Some _ -> Ok None
+      | Some _ -> Ok []
       | None ->
-          let* json = global_json enum_names path decl.cd_loc global in
-          Ok (Some json))
-  | Core.CDImpl _ -> unsupported path "impl declaration"
+          let* json =
+            global_json enum_names value_record_names path decl.cd_loc global
+          in
+          Ok [ json ])
+  | Core.CDImpl impl ->
+      impl_method_jsons ~enum_names ~value_record_names ~enum_constructors
+        ~global_def_ids ~global_names path decl.cd_loc impl
 
 let program_json (program : Core.core_program) =
   let rec collect_enum_names names (decl : Core.core_decl) =
@@ -985,6 +1158,14 @@ let program_json (program : Core.core_program) =
       when type_decl.type_is_enum && not type_decl.type_is_builtin ->
         StringSet.add type_decl.type_name names
     | Core.CDPrivate inner -> collect_enum_names names inner
+    | _ -> names
+  in
+  let rec collect_value_record_names names (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDRecord record_decl
+      when record_decl.record_is_value && not record_decl.record_is_builtin ->
+        StringSet.add record_decl.record_name names
+    | Core.CDPrivate inner -> collect_value_record_names names inner
     | _ -> names
   in
   let add_enum_constructor type_name constructors (variant : Ast.variant) =
@@ -1033,6 +1214,9 @@ let program_json (program : Core.core_program) =
     | _ -> names
   in
   let enum_names = List.fold_left collect_enum_names StringSet.empty program in
+  let value_record_names =
+    List.fold_left collect_value_record_names StringSet.empty program
+  in
   let enum_constructors =
     List.fold_left collect_enum_constructors StringMap.empty program
   in
@@ -1058,11 +1242,10 @@ let program_json (program : Core.core_program) =
     | [] -> Ok (arr (List.rev acc))
     | decl :: rest -> (
         match
-          decl_json enum_names enum_constructors unsupported_global_def_ids
-            unsupported_global_names index decl
+          decl_jsons enum_names value_record_names enum_constructors
+            unsupported_global_def_ids unsupported_global_names index decl
         with
-        | Ok (Some json) -> collect (json :: acc) (index + 1) rest
-        | Ok None -> collect acc (index + 1) rest
+        | Ok jsons -> collect (List.rev_append jsons acc) (index + 1) rest
         | Error _ as error -> error)
   in
   let* decls = collect [] 0 program in

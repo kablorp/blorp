@@ -1,0 +1,351 @@
+-- Resource-scope cleanup edge rewriting for the Blorp-owned Core tail.
+--
+-- A break or continue that exits an active resource scope must run the
+-- scope's cleanup before transferring control. Nested loop bodies reset the
+-- active cleanup stack because their break/continue targets are local to that
+-- loop.
+import:
+	compiler_core_json:
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ValueRecordDecl),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BreakExpr,
+			CastExpr,
+			CallExpr,
+			ConstructorMatchExpr,
+			ContinueExpr,
+			CooperativeCheckpointExpr,
+			FieldExpr,
+			ForRangeExpr,
+			IfExpr,
+			LetExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			RangeExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SeqExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			UnaryExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreGlobal,
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(LiteralMatchFallbackBody, LiteralMatchFallbackFail),
+		CoreProgram,
+		CoreResourceExit(ResourceBreakExit, ResourceContinueExit),
+		CoreSourceLoc,
+		CoreType,
+
+
+private pure func prepend_cleanup(cleanup: CoreExpr, cleanups: List[CoreExpr]) -> List[CoreExpr]:
+	var result: List[CoreExpr] = [cleanup]
+
+	for existing_cleanup in cleanups:
+		result = result.append(existing_cleanup)
+
+	result
+
+
+private pure func break_or_cleanup_exit(
+	cleanups: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if cleanups.length() == 0:
+		BreakExpr(typ, loc)
+	else:
+		ResourceCleanupExitExpr(
+			{
+				cleanups = cleanups,
+				exit = ResourceBreakExit
+			},
+			typ,
+			loc,
+		)
+
+
+private pure func continue_or_cleanup_exit(
+	cleanups: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if cleanups.length() == 0:
+		ContinueExpr(typ, loc)
+	else:
+		ResourceCleanupExitExpr(
+			{
+				cleanups = cleanups,
+				exit = ResourceContinueExit
+			},
+			typ,
+			loc,
+		)
+
+
+private pure func rewrite_resource_expr_list_with_cleanups(
+	exprs: List[CoreExpr],
+	cleanups: List[CoreExpr],
+) -> List[CoreExpr]:
+	var result: List[CoreExpr] = []
+
+	for expr in exprs:
+		result = result.append(rewrite_resource_expr_with_cleanups(expr, cleanups))
+
+	result
+
+
+private pure func rewrite_literal_match_cases_with_cleanups(
+	cases: List[CoreLiteralMatchCase],
+	cleanups: List[CoreExpr],
+) -> List[CoreLiteralMatchCase]:
+	var result: List[CoreLiteralMatchCase] = []
+
+	for match_case in cases:
+		result = result.append({
+			literal = match_case.literal,
+			body = rewrite_resource_expr_with_cleanups(match_case.body, cleanups),
+		})
+
+	result
+
+
+private pure func rewrite_literal_match_fallback_with_cleanups(
+	fallback: CoreLiteralMatchFallback,
+	cleanups: List[CoreExpr],
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(rewrite_resource_expr_with_cleanups(body, cleanups))
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func rewrite_constructor_match_cases_with_cleanups(
+	cases: List[CoreConstructorMatchCase],
+	cleanups: List[CoreExpr],
+) -> List[CoreConstructorMatchCase]:
+	var result: List[CoreConstructorMatchCase] = []
+
+	for match_case in cases:
+		result = result.append({
+			constructor = match_case.constructor,
+			constructor_c_name = match_case.constructor_c_name,
+			body = rewrite_resource_expr_with_cleanups(match_case.body, cleanups),
+		})
+
+	result
+
+
+private pure func rewrite_constructor_match_fallback_with_cleanups(
+	fallback: CoreConstructorMatchFallback,
+	cleanups: List[CoreExpr],
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(rewrite_resource_expr_with_cleanups(body, cleanups))
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+private pure func rewrite_resource_expr_with_cleanups(
+	expr: CoreExpr,
+	cleanups: List[CoreExpr],
+) -> CoreExpr:
+	match expr:
+		BreakExpr(typ, loc):
+			break_or_cleanup_exit(cleanups, typ, loc)
+		ContinueExpr(typ, loc):
+			continue_or_cleanup_exit(cleanups, typ, loc)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			expr
+		ResourceScopeExpr(scope, typ, loc):
+			active_cleanups: List[CoreExpr] = prepend_cleanup(scope.cleanup, cleanups)
+			ResourceScopeExpr(
+				{
+					variable = scope.variable,
+					typ = scope.typ,
+					acquire = rewrite_resource_expr_with_cleanups(scope.acquire, cleanups),
+					body = rewrite_resource_expr_with_cleanups(scope.body, active_cleanups),
+					cleanup = rewrite_resource_expr_with_cleanups(scope.cleanup, cleanups)
+				},
+				typ,
+				loc,
+			)
+		WhileExpr(cond, body, typ, loc):
+			WhileExpr(
+				rewrite_resource_expr_with_cleanups(cond, cleanups),
+				rewrite_resource_expr_with_cleanups(body, []),
+				typ,
+				loc,
+			)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				rewrite_resource_expr_with_cleanups(start, cleanups),
+				rewrite_resource_expr_with_cleanups(end_value, cleanups),
+				rewrite_resource_expr_with_cleanups(body, []),
+				typ,
+				loc,
+			)
+		TailrecLoopExpr(params, return_type, body, loc):
+			TailrecLoopExpr(
+				params,
+				return_type,
+				rewrite_resource_expr_with_cleanups(body, []),
+				loc,
+			)
+		CallExpr(kind, callee, args, typ, loc):
+			CallExpr(
+				kind,
+				rewrite_resource_expr_with_cleanups(callee, cleanups),
+				rewrite_resource_expr_list_with_cleanups(args, cleanups),
+				typ,
+				loc,
+			)
+		BinaryExpr(op, left, right, typ, loc):
+			BinaryExpr(
+				op,
+				rewrite_resource_expr_with_cleanups(left, cleanups),
+				rewrite_resource_expr_with_cleanups(right, cleanups),
+				typ,
+				loc,
+			)
+		UnaryExpr(op, expr_value, typ, loc):
+			UnaryExpr(
+				op,
+				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
+				typ,
+				loc,
+			)
+		LogicalExpr(op, left, right, typ, loc):
+			LogicalExpr(
+				op,
+				rewrite_resource_expr_with_cleanups(left, cleanups),
+				rewrite_resource_expr_with_cleanups(right, cleanups),
+				typ,
+				loc,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			AssignExpr(
+				variable,
+				rewrite_resource_expr_with_cleanups(rhs, cleanups),
+				typ,
+				loc,
+			)
+		CastExpr(expr_value, typ, loc):
+			CastExpr(
+				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
+				typ,
+				loc,
+			)
+		FieldExpr(expr_value, field_name, typ, loc):
+			FieldExpr(
+				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
+				field_name,
+				typ,
+				loc,
+			)
+		LetExpr(name, is_mutable, typ, rhs, body):
+			LetExpr(
+				name,
+				is_mutable,
+				typ,
+				rewrite_resource_expr_with_cleanups(rhs, cleanups),
+				rewrite_resource_expr_with_cleanups(body, cleanups),
+			)
+		SeqExpr(first, second):
+			SeqExpr(
+				rewrite_resource_expr_with_cleanups(first, cleanups),
+				rewrite_resource_expr_with_cleanups(second, cleanups),
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
+				rewrite_literal_match_cases_with_cleanups(cases, cleanups),
+				rewrite_literal_match_fallback_with_cleanups(fallback, cleanups),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
+				rewrite_constructor_match_cases_with_cleanups(cases, cleanups),
+				rewrite_constructor_match_fallback_with_cleanups(fallback, cleanups),
+				typ,
+				loc,
+			)
+		RangeExpr(start, end_value, typ, loc):
+			RangeExpr(
+				rewrite_resource_expr_with_cleanups(start, cleanups),
+				rewrite_resource_expr_with_cleanups(end_value, cleanups),
+				typ,
+				loc,
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				rewrite_resource_expr_with_cleanups(cond, cleanups),
+				rewrite_resource_expr_with_cleanups(then_expr, cleanups),
+				rewrite_resource_expr_with_cleanups(else_expr, cleanups),
+				typ,
+				loc,
+			)
+		LiteralExpr(literal, typ, loc):
+			expr
+		VarExpr(variable, typ, loc):
+			expr
+		VoidExpr(typ, loc):
+			expr
+		CooperativeCheckpointExpr(typ, loc):
+			expr
+		TailrecRecurExpr(args, typ, loc):
+			TailrecRecurExpr(
+				rewrite_resource_expr_list_with_cleanups(args, cleanups),
+				typ,
+				loc,
+			)
+
+
+pure func rewrite_resource_expr(expr: CoreExpr) -> CoreExpr:
+	rewrite_resource_expr_with_cleanups(expr, [])
+
+
+pure func rewrite_resource_function(func_info: CoreFunction) -> CoreFunction:
+	match func_info.body:
+		Some(body):
+			{ func_info | body = Some(rewrite_resource_expr(body)) }
+		None:
+			func_info
+
+
+pure func rewrite_resource_global(global: CoreGlobal) -> CoreGlobal:
+	{ global | init = rewrite_resource_expr(global.init) }
+
+
+pure func rewrite_resource_decl(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(func_info):
+			FunctionDecl(rewrite_resource_function(func_info))
+		GlobalDecl(global):
+			GlobalDecl(rewrite_resource_global(global))
+		EnumDecl(enum_decl):
+			decl
+		ValueRecordDecl(record_decl):
+			decl
+
+
+pure func rewrite_resource_program(program: CoreProgram) -> CoreProgram:
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		decls = decls.append(rewrite_resource_decl(decl))
+
+	{decls = decls}
