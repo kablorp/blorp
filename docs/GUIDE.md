@@ -3781,6 +3781,7 @@ tests/
 | `BLORP_TLS_BACKEND=unsupported/openssl` | Select the runtime TLS backend profile. `unsupported` is the portable default; `openssl` builds and links the native OpenSSL backend. |
 | `BLORP_OPENSSL_CFLAGS` | Compiler arguments for the OpenSSL TLS backend; if unset, `pkg-config --cflags openssl` is used. |
 | `BLORP_OPENSSL_LIBS` | Linker arguments for the OpenSSL TLS backend; if unset, `pkg-config --libs openssl` is used. |
+| `BLORP_PACKAGE_CACHE=path` | Use a custom source-package cache root instead of `~/.cache/blorp/packages` |
 | `BLORP_NO_FORMAT=1` | Skip auto-formatting before command execution |
 
 ### Project Configuration
@@ -3793,6 +3794,50 @@ path = "std"
 ```
 
 Standard library selection precedence is: `--std-dir`, `BLORP_STD`, `blorp.toml`, then the embedded standard library. Filesystem `std/` directories are not guessed; use `blorp.toml` for project-local std source.
+
+### Source Packages
+
+Portable source packages can be validated with:
+
+```bash
+blorp package check path/to/package
+blorp package hash path/to/package
+blorp package pack path/to/package -o package.blorpkg
+blorp package fetch
+blorp package fetch blake3:8f4e2c1a9b0d7e6f package.blorpkg
+blorp package fetch json
+blorp package vendor
+blorp package vendor blake3:8f4e2c1a9b0d7e6f vendor/json
+blorp package vendor json
+```
+
+A source package contains `package.toml` and Blorp files under `src/`. Package
+source may import only current `std` modules and modules from the same package,
+it must typecheck, and it may not use `foreign` declarations or `builtin`. See
+[PACKAGES.md](PACKAGES.md) for the manifest shape, content hash rules, and exact
+validation rules.
+
+Build, check, and test commands do not download dependencies. Use
+`blorp package fetch` explicitly for hash-pinned cache-backed packages.
+
+Root projects can import local source packages by declaring aliases in
+`blorp.toml`:
+
+```toml
+[packages]
+json = { path = "vendor/json", hash = "blake3:8f4e2c1a9b0d7e6f", from = ["https://example.com/json.blorpkg", "artifacts/json.blorpkg"] }
+json_cached = { hash = "blake3:8f4e2c1a9b0d7e6f", from = ["https://example.com/json.blorpkg", "artifacts/json.blorpkg"] }
+```
+
+Package aliases must be Blorp identifiers and cannot be the reserved roots
+`std` or `pkg`.
+
+Then source imports the alias:
+
+```blorp
+import:
+	json: parse
+```
 
 ### Memory Debugging
 

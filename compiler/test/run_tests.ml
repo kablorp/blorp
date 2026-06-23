@@ -99,6 +99,36 @@ let () =
     @ List.map
         (fun (name, cases) -> ("FmtDeclDoc." ^ name, cases))
         Test_fmt_decl_doc.suite
+    @ List.map
+        (fun (name, cases) -> ("FmtEmbedding." ^ name, cases))
+        Test_fmt_embedding.suite
+    @ List.map
+        (fun (name, cases) -> ("CompilerBlorp." ^ name, cases))
+        Test_compiler_blorp.suite
+    @ List.map
+        (fun (name, cases) -> ("Blake3." ^ name, cases))
+        Test_blake3.suite
+    @ List.map
+        (fun (name, cases) -> ("PackageManifest." ^ name, cases))
+        Test_package_manifest.suite
+    @ List.map
+        (fun (name, cases) -> ("PackageCheck." ^ name, cases))
+        Test_package_check.suite
+    @ List.map
+        (fun (name, cases) -> ("PackageHash." ^ name, cases))
+        Test_package_hash.suite
+    @ List.map
+        (fun (name, cases) -> ("PackageArtifact." ^ name, cases))
+        Test_package_artifact.suite
+    @ List.map
+        (fun (name, cases) -> ("PackageConfig." ^ name, cases))
+        Test_package_config.suite
+    @ List.map
+        (fun (name, cases) -> ("PackageCache." ^ name, cases))
+        Test_package_cache.suite
+    @ List.map
+        (fun (name, cases) -> ("TraitObligationArchitecture." ^ name, cases))
+        Test_trait_obligation_architecture.suite
     @ List.map (fun (name, cases) -> ("Infer." ^ name, cases)) Test_infer.suite
     @ List.map
         (fun (name, cases) -> ("PurityAnalysis." ^ name, cases))

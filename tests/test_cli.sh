@@ -6,6 +6,11 @@ set -u
 cd "$(dirname "$0")/.."
 
 BLORP_BIN="${BLORP_BIN:-./blorp}"
+if [[ "$BLORP_BIN" = /* ]]; then
+    BLORP_BIN_ABS="$BLORP_BIN"
+else
+    BLORP_BIN_ABS="$PWD/${BLORP_BIN#./}"
+fi
 # Cold self-hosted formatter startup may need to compile the embedded Blorp
 # formatter before the format checks can run.
 CLI_TIMEOUT="${BLORP_CLI_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}"
@@ -15,6 +20,7 @@ FAIL=0
 TOTAL=0
 RUN_OUTPUT=""
 RUN_CODE=0
+CHILD_PIDS=()
 
 case "$CLI_TIMEOUT" in
     ''|*[!0-9]*)
@@ -24,6 +30,11 @@ case "$CLI_TIMEOUT" in
 esac
 
 cleanup() {
+    local pid
+    for pid in "${CHILD_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
     rm -rf "$TMPDIR_CLI"
 }
 trap cleanup EXIT
@@ -184,8 +195,29 @@ repeat_marker="$TMPDIR_CLI/repeat_marker.txt"
 compiled_c="$TMPDIR_CLI/valid.c"
 check_dir_ok="$TMPDIR_CLI/check_dir_ok"
 check_dir_bad="$TMPDIR_CLI/check_dir_bad"
+package_ok="$TMPDIR_CLI/package_ok"
+package_bad="$TMPDIR_CLI/package_bad"
+package_project="$TMPDIR_CLI/package_project"
+package_alias_project="$TMPDIR_CLI/package_alias_project"
+package_cache_project="$TMPDIR_CLI/package_cache_project"
+package_cache_alias_project="$TMPDIR_CLI/package_cache_alias_project"
+package_ambiguous_project="$TMPDIR_CLI/package_ambiguous_project"
+package_vendor_all_project="$TMPDIR_CLI/package_vendor_all_project"
+package_cache="$TMPDIR_CLI/package_cache"
+package_alias_cache="$TMPDIR_CLI/package_alias_cache"
+package_fetch_all_cache="$TMPDIR_CLI/package_fetch_all_cache"
+package_missing_cache="$TMPDIR_CLI/package_missing_cache"
+package_artifact="$TMPDIR_CLI/sample.blorpkg"
+package_vendor="$TMPDIR_CLI/vendor_sample"
 
 mkdir -p "$check_dir_ok/nested" "$check_dir_bad/nested"
+mkdir -p "$package_ok/src/sample" "$package_bad/src"
+mkdir -p "$package_project/app" "$package_project/vendor"
+mkdir -p "$package_alias_project/app" "$package_alias_project/vendor"
+mkdir -p "$package_cache_project/app" "$package_cache_alias_project/app"
+mkdir -p "$package_ambiguous_project" "$package_vendor_all_project"
+mkdir -p "$package_cache" "$package_alias_cache" "$package_fetch_all_cache"
+mkdir -p "$package_missing_cache"
 
 cat > "$valid_prog" <<'BRP'
 func main(args: List[String]) -> Int:
@@ -203,6 +235,93 @@ cp "$valid_prog" "$check_dir_ok/root.brp"
 cp "$valid_prog" "$check_dir_ok/nested/child.brp"
 cp "$valid_prog" "$check_dir_bad/root.brp"
 cp "$invalid_prog" "$check_dir_bad/nested/child.brp"
+
+cat > "$package_ok/package.toml" <<'TOML'
+[package]
+name = "sample"
+
+[compat]
+std = "preview-1"
+
+[exports]
+modules = ["sample", "sample/internal"]
+TOML
+
+cat > "$package_ok/src/sample.brp" <<'BRP'
+import:
+	sample/internal as Internal
+
+pure func answer() -> Int:
+	Internal.answer()
+BRP
+
+cat > "$package_ok/src/sample/internal.brp" <<'BRP'
+pure func answer() -> Int:
+	42
+BRP
+
+cat > "$package_bad/package.toml" <<'TOML'
+[package]
+name = "sample"
+
+[compat]
+std = "preview-1"
+
+[exports]
+modules = ["sample"]
+TOML
+
+cat > "$package_bad/src/sample.brp" <<'BRP'
+import:
+	local_helper
+
+pure func answer() -> Int:
+	0
+BRP
+
+cp -R "$package_ok" "$package_project/vendor/sample"
+cat > "$package_project/blorp.toml" <<'TOML'
+[packages]
+sample = { path = "vendor/sample" }
+TOML
+
+cp -R "$package_ok" "$package_alias_project/vendor/sample"
+cat > "$package_alias_project/blorp.toml" <<'TOML'
+[packages]
+sample_v1 = { path = "vendor/sample" }
+TOML
+
+cat > "$package_project/app/main.brp" <<'BRP'
+import:
+	sample: answer
+
+func main(args: List[String]) -> Int:
+	answer()
+BRP
+
+cat > "$package_alias_project/app/main.brp" <<'BRP'
+import:
+	sample_v1: answer
+
+func main(args: List[String]) -> Int:
+	answer()
+BRP
+
+cat > "$package_cache_project/app/main.brp" <<'BRP'
+import:
+	sample: answer
+
+func main(args: List[String]) -> Int:
+	answer()
+BRP
+
+cat > "$package_cache_alias_project/app/main.brp" <<'BRP'
+import:
+	sample_v1: answer
+
+func main(args: List[String]) -> Int:
+	answer()
+BRP
 
 cat > "$failing_test" <<'BRP'
 import:
@@ -255,6 +374,142 @@ expect_exit "check directory success" 0 "$BLORP_BIN" check --no-format "$check_d
 expect_exit "check directory failure" 1 "$BLORP_BIN" check --no-format "$check_dir_bad"
 expect_exit "check type failure" 1 "$BLORP_BIN" check --no-format "$invalid_prog"
 expect_exit "check missing file arg" 1 "$BLORP_BIN" check
+expect_output_contains "package help" 0 "Usage: blorp package" \
+    "$BLORP_BIN" package --help
+expect_output_contains "package check success" 0 "Package sample: ok" \
+    "$BLORP_BIN" package check "$package_ok"
+TOTAL=$((TOTAL + 1))
+if run_capture "" "$BLORP_BIN" package hash "$package_ok" \
+    && [[ "$RUN_OUTPUT" =~ ^[0-9a-f]{64}$ ]]; then
+    record_pass "package hash success"
+    package_hash="$RUN_OUTPUT"
+else
+    record_fail "package hash success" \
+        "expected 64 lowercase hex characters, got: $RUN_OUTPUT"
+    package_hash=""
+fi
+if [ -n "$package_hash" ]; then
+    expect_output_contains "package pack success" 0 "Hash $package_hash" \
+        "$BLORP_BIN" package pack "$package_ok" -o "$package_artifact"
+    cat > "$package_cache_project/blorp.toml" <<TOML
+[packages]
+sample = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
+TOML
+    cat > "$package_cache_alias_project/blorp.toml" <<TOML
+[packages]
+sample_v1 = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
+TOML
+    expect_output_contains "package fetch success" 0 "Hash $package_hash" \
+        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
+    expect_output_contains "package fetch explicit uses cache" 0 "Already cached sample" \
+        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package fetch "$package_hash" "$package_artifact"
+    expect_output_contains "package fetch alias uses cache" 0 "Already cached sample" \
+        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
+    expect_output_contains "package fetch renamed alias success" 0 "Hash $package_hash" \
+        env BLORP_PACKAGE_CACHE="$package_alias_cache" bash -c 'cd "$1" && "$2" package fetch sample_v1' bash "$package_cache_alias_project" "$BLORP_BIN_ABS"
+    expect_output_contains "check cached package alias missing cache suggests fetch" 1 "blorp package fetch sample" \
+        env BLORP_PACKAGE_CACHE="$package_missing_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
+    expect_output_contains "package fetch all success" 0 "Fetched sample" \
+        env BLORP_PACKAGE_CACHE="$package_fetch_all_cache" bash -c 'cd "$1" && "$2" package fetch' bash "$package_cache_project" "$BLORP_BIN_ABS"
+    cat > "$package_ambiguous_project/blorp.toml" <<TOML
+[packages]
+sample_a = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
+sample_b = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
+TOML
+    cat > "$package_vendor_all_project/blorp.toml" <<TOML
+[packages]
+sample = { hash = "${package_hash:0:16}", from = ["../sample.blorpkg"] }
+TOML
+    expect_output_contains "package vendor all success" 0 "Vendored sample" \
+        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
+    expect_output_contains "package vendor all idempotent" 0 "Already vendored sample" \
+        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor' bash "$package_vendor_all_project" "$BLORP_BIN_ABS"
+    if [ -f "$package_vendor_all_project/vendor/sample/src/sample.brp" ]; then
+        TOTAL=$((TOTAL + 1))
+        record_pass "package vendor all writes source"
+    else
+        TOTAL=$((TOTAL + 1))
+        record_fail "package vendor all writes source" \
+            "missing $package_vendor_all_project/vendor/sample/src/sample.brp"
+    fi
+    expect_output_contains "package fetch hash ambiguity" 1 "matches multiple aliases" \
+        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package fetch "$3"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}"
+    expect_output_contains "package vendor explicit hash ignores config ambiguity" 0 "Vendored sample" \
+        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor "$3" "$4"' bash "$package_ambiguous_project" "$BLORP_BIN_ABS" "${package_hash:0:16}" "$TMPDIR_CLI/package_vendor_hash_explicit"
+    if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+        package_http_dir="$TMPDIR_CLI/package_http"
+        package_http_port_file="$TMPDIR_CLI/package_http_port"
+        package_http_cache="$TMPDIR_CLI/package_http_cache"
+        mkdir -p "$package_http_dir" "$package_http_cache"
+        cp "$package_artifact" "$package_http_dir/sample.blorpkg"
+        python3 - "$package_http_dir" "$package_http_port_file" <<'PY' &
+import http.server
+import socketserver
+import sys
+
+directory = sys.argv[1]
+port_file = sys.argv[2]
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=directory, **kwargs)
+
+    def log_message(self, format, *args):
+        pass
+
+class QuietTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+with QuietTCPServer(("127.0.0.1", 0), QuietHandler) as httpd:
+    with open(port_file, "w", encoding="utf-8") as f:
+        f.write(str(httpd.server_address[1]))
+    httpd.serve_forever()
+PY
+        package_http_pid=$!
+        CHILD_PIDS+=("$package_http_pid")
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ -f "$package_http_port_file" ] && break
+            sleep 0.1
+        done
+        if [ -f "$package_http_port_file" ]; then
+            package_http_port=$(cat "$package_http_port_file")
+            expect_output_contains "package fetch http success" 0 "Hash $package_hash" \
+                env BLORP_PACKAGE_CACHE="$package_http_cache" "$BLORP_BIN" package fetch "$package_hash" "http://127.0.0.1:$package_http_port/sample.blorpkg"
+        else
+            TOTAL=$((TOTAL + 1))
+            record_fail "package fetch http success" "local http server did not start"
+        fi
+    fi
+    expect_exit "check cached package alias project" 0 \
+        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" check --no-format "$package_cache_project/app/main.brp"
+    expect_exit "check cached package renamed alias project" 0 \
+        env BLORP_PACKAGE_CACHE="$package_alias_cache" "$BLORP_BIN" check --no-format "$package_cache_alias_project/app/main.brp"
+    expect_output_contains "package vendor success" 0 "Hash $package_hash" \
+        env BLORP_PACKAGE_CACHE="$package_cache" "$BLORP_BIN" package vendor "$package_hash" "$package_vendor"
+    expect_output_contains "package vendor alias success" 0 "Hash $package_hash" \
+        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
+    expect_output_contains "package vendor alias idempotent" 0 "Already vendored sample" \
+        env BLORP_PACKAGE_CACHE="$package_cache" bash -c 'cd "$1" && "$2" package vendor sample' bash "$package_cache_project" "$BLORP_BIN_ABS"
+    if [ -f "$package_vendor/src/sample.brp" ]; then
+        TOTAL=$((TOTAL + 1))
+        record_pass "package vendor writes source"
+    else
+        TOTAL=$((TOTAL + 1))
+        record_fail "package vendor writes source" "missing $package_vendor/src/sample.brp"
+    fi
+    if [ -f "$package_cache_project/vendor/sample/src/sample.brp" ]; then
+        TOTAL=$((TOTAL + 1))
+        record_pass "package vendor alias writes source"
+    else
+        TOTAL=$((TOTAL + 1))
+        record_fail "package vendor alias writes source" \
+            "missing $package_cache_project/vendor/sample/src/sample.brp"
+    fi
+fi
+expect_output_contains "package check rejects external import" 1 "may import only std modules" \
+    "$BLORP_BIN" package check "$package_bad"
+expect_exit "check package alias project" 0 "$BLORP_BIN" check --no-format "$package_project/app/main.brp"
+expect_exit "check package renamed alias project" 0 "$BLORP_BIN" check --no-format "$package_alias_project/app/main.brp"
 
 expect_exit "compile success" 0 "$BLORP_BIN" compile --no-format -o "$compiled_c" "$valid_prog"
 if [ -f "$compiled_c" ]; then

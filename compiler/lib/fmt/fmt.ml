@@ -189,6 +189,9 @@ let with_temp_dir prefix f =
   let dir = create_temp_dir prefix in
   Fun.protect ~finally:(fun () -> cleanup_temp_dir dir) (fun () -> f dir)
 
+let create_temp_dir_from_marker_source_for_tests next_marker =
+  create_temp_dir_from_marker_source next_marker temp_dir_retry_limit
+
 let sleep_seconds seconds = ignore (Unix.select [] [] [] seconds)
 let formatter_tool_name = "tools/formatter/formatter.brp"
 
@@ -252,6 +255,12 @@ let formatter_source () =
     | Ok source -> Ok source
     | Error _ -> embedded_or_filesystem ()
   else embedded_or_filesystem ()
+
+let formatter_source_kind_for_tests () =
+  match formatter_source () with
+  | Ok (EmbeddedSource _) -> Ok "embedded"
+  | Ok (FilesystemSource _) -> Ok "filesystem"
+  | Error _ as err -> err
 
 let formatter_source_files formatter_tool =
   let dir = Filename.dirname formatter_tool in
@@ -462,6 +471,8 @@ let formatter_lock_is_stale lock_dir =
       (* Old lock directories did not record an owner. Give a just-created lock
          a small grace period so waiters cannot race the owner file write. *)
       formatter_lock_age_seconds lock_dir > 1.0
+
+let formatter_lock_is_stale_for_tests = formatter_lock_is_stale
 
 let formatter_lock_timeout_error bin_path =
   Error

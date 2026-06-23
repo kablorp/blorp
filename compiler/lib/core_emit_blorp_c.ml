@@ -2268,17 +2268,29 @@ let require_emittable_list_store_layout path (layout : Core.list_storage_layout)
   | Core.ListInlineStorage _ ->
       unsupported (path ^ ".layout") inline_scalar_reason
 
+let prepared_list_intrinsic_core_arity = function
+  | "list_ensure_unique" -> Some 1
+  | "list_ensure_capacity" -> Some 2
+  | _ -> None
+
+let require_core_arity path name expected args =
+  let actual = List.length args in
+  if actual = expected then Ok ()
+  else
+    unsupported path
+      (Printf.sprintf "intrinsic call %s expected %d arg(s), got %d" name
+         expected actual)
+
 let require_intrinsic_renderable path name args =
   match
     Compiler_blorp_bridge.renderer_template_arity_opt_exn
       ~renderer:Compiler_blorp_bridge.intrinsic_renderer ~op:name
   with
-  | Some arity when List.length args = arity -> Ok ()
-  | Some arity ->
-      unsupported path
-        (Printf.sprintf "intrinsic call %s expected %d arg(s), got %d" name
-           arity (List.length args))
-  | None -> unsupported path ("unsupported intrinsic call " ^ name)
+  | Some arity -> require_core_arity path name arity args
+  | None -> (
+      match prepared_list_intrinsic_core_arity name with
+      | Some arity -> require_core_arity path name arity args
+      | None -> unsupported path ("unsupported intrinsic call " ^ name))
 
 let require_simple_call_kind path call_kind args =
   match call_kind with

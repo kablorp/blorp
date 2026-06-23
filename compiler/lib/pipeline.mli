@@ -66,6 +66,15 @@ val typecheck_module_only_typed :
 (** Parse and type-check a module, returning the final state and a validated
     typed program. *)
 
+val typecheck_source_package_module_only_typed :
+  source_package:Session.source_package ->
+  filename:string ->
+  source:string ->
+  (Typecheck.check_state * Typed_ast.program, Ast.compiler_error list) result
+(** Parse and type-check a source-package module after registering the checked
+    package in the fresh pipeline session. Package ownership is then available
+    to module resolution and policy checks without relying on global state. *)
+
 val check_modules :
   ?debug:bool -> ?allow_debug_only_calls:bool -> unit -> Ast.compiler_error list
 (** Type-check all currently loaded modules in the active {!Session.t}, caching

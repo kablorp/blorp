@@ -38,7 +38,7 @@ type source_kind = User_source | Generated_test_harness
 let module_load_errors () = List.rev (Modules.get_load_errors ())
 
 let target_module_name filename =
-  Option.value ~default:"" (Modules.std_module_name_for_source_file filename)
+  Option.value ~default:"" (Modules.module_name_for_source_file filename)
 
 let program_has_top_level_main (program : Ast.program) : bool =
   List.exists
@@ -97,7 +97,9 @@ let should_check_unused_imports = function
   | Explicit_target { module_name; source_kind = User_source } ->
       not (is_prelude_reexport_module module_name)
   | Loaded_dependency Session.User_module -> true
-  | Loaded_dependency (Session.Stdlib_module | Session.Package_module _) ->
+  | Loaded_dependency
+      ( Session.Stdlib_module | Session.Package_module _
+      | Session.Native_package_module _ ) ->
       false
 
 let unused_import_errors ~scope program =
@@ -408,7 +410,8 @@ let check_modules ?(debug = false) ?(allow_debug_only_calls = false) () =
     fresh-name counters) into each other. The CLI's pre-call
     [init_module_paths] writes to the long-lived process-default
     session and is harmless (the new session re-inits its own paths). *)
-let with_fresh_session (filename : string) (k : unit -> 'a) : 'a =
+let with_fresh_session ?configure_session (filename : string) (k : unit -> 'a) :
+    'a =
   let parent = Session.current () in
   let sess = Session.create () in
   (match (parent.Session.std_override_active, parent.std_override_dir) with
@@ -416,6 +419,7 @@ let with_fresh_session (filename : string) (k : unit -> 'a) : 'a =
   | _ -> ());
   Session.with_current sess (fun () ->
       Modules.init_module_paths (Modules.extract_directory filename);
+      Option.iter (fun configure -> configure sess) configure_session;
       k ())
 
 let typecheck_only_typed_impl ~source_kind ~filename ~source ?(debug = false) ()
@@ -457,8 +461,8 @@ let typecheck_only ~filename ~source ?(debug = false) () =
   | Error _ as e -> e
 
 (** Parse and type-check a module, returning the final state and typed program. *)
-let typecheck_module_only_typed ~filename ~source =
-  with_fresh_session filename (fun () ->
+let typecheck_module_only_typed_impl ?configure_session ~filename ~source () =
+  with_fresh_session ?configure_session filename (fun () ->
       match parse_and_load_modules ~filename source with
       | Error _ as e -> e
       | Ok (program, _base_dir) -> (
@@ -486,6 +490,16 @@ let typecheck_module_only_typed ~filename ~source =
                 in
                 if import_errors <> [] then Error import_errors
                 else Ok (state, typed_program)))
+
+let typecheck_module_only_typed ~filename ~source =
+  typecheck_module_only_typed_impl ~filename ~source ()
+
+let typecheck_source_package_module_only_typed ~source_package ~filename ~source
+    =
+  let configure_session sess =
+    Modules.add_source_package ~sess source_package
+  in
+  typecheck_module_only_typed_impl ~configure_session ~filename ~source ()
 
 let typecheck_module_only ~filename ~source =
   match typecheck_module_only_typed ~filename ~source with

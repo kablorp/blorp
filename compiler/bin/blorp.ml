@@ -11,6 +11,9 @@
       blorp test tests/test.brp          # Run a single test
       blorp test tests/                  # Run all tests in directory
       blorp purify program.brp           # Automatically mark pure functions
+      blorp package check path/          # Validate a source package
+      blorp package hash path/           # Print a source package content hash
+      blorp package pack path/ -o pkg    # Write a deterministic source package artifact
 *)
 
 open Blorp
@@ -832,6 +835,7 @@ let usage () =
   print_endline "  run        Compile and run a .brp file";
   print_endline "  test       Run tests (file or directory)";
   print_endline "  format     Format source files";
+  print_endline "  package    Validate source packages";
   print_endline "  lsp        Start LSP server";
   print_endline "  repl       Interactive REPL";
   print_endline "  purify     Automatically mark pure functions";
@@ -915,6 +919,391 @@ let format_usage () =
      (internal)";
   print_endline "";
   print_endline "Accepts files or directories (recursively finds .brp files)."
+
+let package_usage () =
+  print_endline "Usage: blorp package <command> [args]";
+  print_endline "";
+  print_endline "Commands:";
+  print_endline
+    "  check <path>          Validate a portable source package directory";
+  print_endline
+    "  hash <path>           Print a portable source package BLAKE3 hash";
+  print_endline
+    "  pack <path> -o <file> Write a deterministic .blorpkg artifact";
+  print_endline
+    "  fetch [hash-or-alias [from ...]] Cache verified package artifacts";
+  print_endline
+    "  vendor [hash-or-alias [path]] Copy cached packages into vendor dirs";
+  print_endline "";
+  print_endline "A source package contains package.toml plus src/*.brp files.";
+  print_endline
+    "Package code may import only std modules and modules from the same \
+     package."
+
+let package_check_usage () =
+  print_endline "Usage: blorp package check <path>";
+  print_endline "";
+  print_endline
+    "Validates package.toml, exported source files, imports, and the";
+  print_endline
+    "portable-source policy: no foreign declarations and no builtin use."
+
+let package_hash_usage () =
+  print_endline "Usage: blorp package hash <path>";
+  print_endline "";
+  print_endline
+    "Validates a source package and prints its canonical BLAKE3 content hash."
+
+let package_pack_usage () =
+  print_endline "Usage: blorp package pack <path> -o <file>";
+  print_endline "";
+  print_endline
+    "Validates a source package and writes a deterministic source artifact."
+
+let package_fetch_usage () =
+  print_endline "Usage: blorp package fetch";
+  print_endline "       blorp package fetch <alias>";
+  print_endline "       blorp package fetch <hash> <from>...";
+  print_endline "";
+  print_endline
+    "Without arguments, fetches all downloadable packages from blorp.toml.";
+  print_endline "With explicit locations, installs the first matching artifact.";
+  print_endline
+    "With an alias, reads hash and from from the nearest blorp.toml.";
+  print_endline
+    "Locations may be local paths, file:// URLs, or HTTP(S) artifact URLs."
+
+let package_vendor_usage () =
+  print_endline "Usage: blorp package vendor";
+  print_endline "       blorp package vendor <hash> <path>";
+  print_endline "       blorp package vendor <alias> [path]";
+  print_endline "";
+  print_endline
+    "Without arguments, vendors cached packages from blorp.toml to \
+     vendor/<alias>.";
+  print_endline "With an alias, reads the nearest blorp.toml.";
+  print_endline "With a hash, pass an explicit destination path."
+
+let parse_package_pack_args args =
+  let rec loop path output = function
+    | [] -> (path, output)
+    | ("--output" | "-o") :: value :: rest -> loop path (Some value) rest
+    | ("--output" | "-o") :: [] -> (path, None)
+    | arg :: rest when String.starts_with ~prefix:"-" arg ->
+        loop path output rest
+    | arg :: rest -> loop (Some arg) output rest
+  in
+  loop None None args
+
+let package_pin_overlap left right =
+  match
+    (Package_hash.validate_hash_pin left, Package_hash.validate_hash_pin right)
+  with
+  | Ok left, Ok right ->
+      let left_len = String.length left in
+      let right_len = String.length right in
+      if left_len <= right_len then String.sub right 0 left_len = left
+      else String.sub left 0 right_len = right
+  | _ -> false
+
+let package_config_lookup target =
+  let base_dir = Sys.getcwd () in
+  match Package_config.package_paths_from base_dir with
+  | None -> Error "no blorp.toml found for package command"
+  | Some (config_path, parsed) -> (
+      match parsed.Package_config.package_errors with
+      | (line, message) :: _ ->
+          Error (Printf.sprintf "%s:%d: %s" config_path line message)
+      | [] -> (
+          let entries = parsed.Package_config.package_paths in
+          match
+            List.find_opt
+              (fun entry -> entry.Package_config.package_alias = target)
+              entries
+          with
+          | Some entry -> Ok (config_path, entry)
+          | None -> (
+              let hash_matches =
+                List.filter
+                  (fun entry ->
+                    match entry.Package_config.package_hash_pin with
+                    | Some pin -> package_pin_overlap pin target
+                    | None -> false)
+                  entries
+              in
+              match hash_matches with
+              | [ entry ] -> Ok (config_path, entry)
+              | [] ->
+                  Error
+                    (Printf.sprintf
+                       "package %S is not declared in the nearest blorp.toml"
+                       target)
+              | matches ->
+                  let aliases =
+                    matches
+                    |> List.map (fun entry ->
+                        entry.Package_config.package_alias)
+                    |> String.concat ", "
+                  in
+                  Error
+                    (Printf.sprintf
+                       "package hash %S matches multiple aliases in the \
+                        nearest blorp.toml: %s"
+                       target aliases))))
+
+let package_config_hash entry =
+  match entry.Package_config.package_hash_pin with
+  | Some hash -> Ok hash
+  | None ->
+      Error
+        (Printf.sprintf
+           "package alias %S must define hash to use package fetch or vendor"
+           entry.Package_config.package_alias)
+
+type package_fetch_result =
+  | PackageFetched of Package_cache.cached_package
+  | PackageAlreadyCached of Package_cache.cached_package
+
+let print_package_fetch_result alias = function
+  | PackageFetched cached_package ->
+      Printf.printf "Fetched %s\nHash %s\nCache %s\n" alias
+        cached_package.Package_cache.hash cached_package.Package_cache.path
+  | PackageAlreadyCached cached_package ->
+      Printf.printf "Already cached %s\nHash %s\nCache %s\n" alias
+        cached_package.Package_cache.hash cached_package.Package_cache.path
+
+let package_fetch_config_entry entry =
+  match (package_config_hash entry, entry.Package_config.package_from) with
+  | Error msg, _ -> Error msg
+  | Ok hash, _ -> (
+      match Package_cache.find_cached hash with
+      | Ok cached -> Ok (PackageAlreadyCached cached)
+      | Error _ -> (
+          match entry.Package_config.package_from with
+          | [] ->
+              Error
+                (Printf.sprintf
+                   "package alias %S has no from locations; pass locations \
+                    explicitly"
+                   entry.Package_config.package_alias)
+          | from -> (
+              match Package_cache.fetch ~expected_pin:hash from with
+              | Ok cached -> Ok (PackageFetched cached)
+              | Error errors -> Error (Package_cache.render_errors errors))))
+
+let package_fetch_from_config target =
+  match package_config_lookup target with
+  | Error _ as err -> err
+  | Ok (_, entry) -> (
+      match package_fetch_config_entry entry with
+      | Ok result -> Ok (entry.Package_config.package_alias, result)
+      | Error _ as err -> err)
+
+let package_fetch_explicit target from =
+  match Package_hash.validate_hash_pin target with
+  | Error message ->
+      Error (Printf.sprintf "package hash %S is invalid: %s" target message)
+  | Ok pin -> (
+      match Package_cache.find_cached pin with
+      | Ok cached ->
+          Ok
+            ( cached.Package_cache.manifest.Package_manifest.name,
+              PackageAlreadyCached cached )
+      | Error _ -> (
+          match Package_cache.fetch ~expected_pin:pin from with
+          | Ok cached ->
+              Ok
+                ( cached.Package_cache.manifest.Package_manifest.name,
+                  PackageFetched cached )
+          | Error errors -> Error (Package_cache.render_errors errors)))
+
+let package_fetch_all_from_config () =
+  let base_dir = Sys.getcwd () in
+  match Package_config.package_paths_from base_dir with
+  | None -> Error "no blorp.toml found for package fetch"
+  | Some (config_path, parsed) -> (
+      match parsed.Package_config.package_errors with
+      | (line, message) :: _ ->
+          Error (Printf.sprintf "%s:%d: %s" config_path line message)
+      | [] -> (
+          let fetched = ref [] in
+          let cached = ref [] in
+          let skipped_local = ref [] in
+          let errors = ref [] in
+          List.iter
+            (fun entry ->
+              match entry.Package_config.package_hash_pin with
+              | None ->
+                  skipped_local :=
+                    entry.Package_config.package_alias :: !skipped_local
+              | Some hash -> (
+                  match Package_cache.find_cached hash with
+                  | Ok cached_package ->
+                      cached :=
+                        (entry.Package_config.package_alias, cached_package)
+                        :: !cached
+                  | Error _ -> (
+                      match entry.Package_config.package_from with
+                      | [] ->
+                          if entry.Package_config.package_path <> None then
+                            skipped_local :=
+                              entry.Package_config.package_alias
+                              :: !skipped_local
+                          else
+                            errors :=
+                              Printf.sprintf
+                                "package alias %S has no from locations"
+                                entry.Package_config.package_alias
+                              :: !errors
+                      | from -> (
+                          match Package_cache.fetch ~expected_pin:hash from with
+                          | Ok cached_package ->
+                              fetched :=
+                                ( entry.Package_config.package_alias,
+                                  cached_package )
+                                :: !fetched
+                          | Error fetch_errors ->
+                              errors :=
+                                Package_cache.render_errors fetch_errors
+                                :: !errors))))
+            parsed.Package_config.package_paths;
+          match List.rev !errors with
+          | error :: rest -> Error (String.concat "\n" (error :: rest))
+          | [] ->
+              Ok (List.rev !fetched, List.rev !cached, List.rev !skipped_local))
+      )
+
+let package_config_command_error config_path (line, message) =
+  Error (Printf.sprintf "%s:%d: %s" config_path line message)
+
+type package_vendor_result =
+  | PackageVendored of { name : string; hash : string; path : string }
+  | PackageAlreadyVendored of { name : string; hash : string; path : string }
+
+let package_local_hash path =
+  match Package_check.check path with
+  | Error errors -> Error (Package_check.render_errors errors)
+  | Ok checked -> (
+      match
+        Package_hash.hash_checked_package ~root:path
+          ~source_files:checked.Package_check.source_files
+      with
+      | Ok hash -> Ok hash
+      | Error errors -> Error (Package_hash.render_errors errors))
+
+let package_existing_vendor ~pin ~dest =
+  if not (Sys.file_exists dest) then Ok None
+  else
+    match package_local_hash dest with
+    | Error message ->
+        Error
+          (Printf.sprintf
+             "vendor destination %S already exists but is not a valid package:\n\
+              %s"
+             dest message)
+    | Ok actual ->
+        if Package_hash.hash_matches_pin ~pin actual then Ok (Some actual)
+        else
+          Error
+            (Printf.sprintf
+               "vendor destination %S already exists but has the wrong hash\n\
+                Expected %s\n\
+                Found %s"
+               dest pin actual)
+
+let package_vendor_cached ~name ~pin ~dest =
+  match Package_cache.vendor ~pin ~dest with
+  | Ok cached ->
+      Ok
+        (PackageVendored { name; hash = cached.Package_cache.hash; path = dest })
+  | Error errors -> Error (Package_cache.render_errors errors)
+
+let package_vendor_configured_alias ~config_path entry =
+  match package_config_hash entry with
+  | Error msg -> Error msg
+  | Ok hash -> (
+      let name = entry.Package_config.package_alias in
+      let dest =
+        Filename.concat
+          (Filename.concat (Filename.dirname config_path) "vendor")
+          name
+      in
+      match package_existing_vendor ~pin:hash ~dest with
+      | Error _ as err -> err
+      | Ok (Some actual) ->
+          Ok (PackageAlreadyVendored { name; hash = actual; path = dest })
+      | Ok None -> package_vendor_cached ~name ~pin:hash ~dest)
+
+let print_package_vendor_result = function
+  | PackageVendored { name; hash; path } ->
+      Printf.printf "Vendored %s\nHash %s\nPath %s\n" name hash path
+  | PackageAlreadyVendored { name; hash; path } ->
+      Printf.printf "Already vendored %s\nHash %s\nPath %s\n" name hash path
+
+let package_vendor_hash_target target dest =
+  match Package_cache.vendor ~pin:target ~dest with
+  | Ok cached ->
+      Ok
+        (PackageVendored
+           {
+             name = cached.Package_cache.manifest.Package_manifest.name;
+             hash = cached.Package_cache.hash;
+             path = dest;
+           })
+  | Error errors -> Error (Package_cache.render_errors errors)
+
+let package_vendor_target target dest =
+  match dest with
+  | Some dest when Result.is_ok (Package_hash.validate_hash_pin target) ->
+      package_vendor_hash_target target dest
+  | _ -> (
+      match package_config_lookup target with
+      | Ok (config_path, entry) -> (
+          match dest with
+          | None -> package_vendor_configured_alias ~config_path entry
+          | Some dest -> (
+              match package_config_hash entry with
+              | Error msg -> Error msg
+              | Ok hash ->
+                  package_vendor_cached ~name:entry.Package_config.package_alias
+                    ~pin:hash ~dest))
+      | Error lookup_error -> (
+          match dest with
+          | None -> Error lookup_error
+          | Some dest -> package_vendor_hash_target target dest))
+
+let package_vendor_all_from_config () =
+  let base_dir = Sys.getcwd () in
+  match Package_config.package_paths_from base_dir with
+  | None -> Error "no blorp.toml found for package vendor"
+  | Some (config_path, parsed) -> (
+      match parsed.Package_config.package_errors with
+      | err :: _ -> package_config_command_error config_path err
+      | [] -> (
+          let vendored = ref [] in
+          let skipped_local = ref [] in
+          let errors = ref [] in
+          List.iter
+            (fun entry ->
+              match
+                ( entry.Package_config.package_path,
+                  entry.Package_config.package_hash_pin )
+              with
+              | Some _, _ | None, None ->
+                  skipped_local :=
+                    entry.Package_config.package_alias :: !skipped_local
+              | None, Some _ -> (
+                  match package_vendor_configured_alias ~config_path entry with
+                  | Ok result -> vendored := result :: !vendored
+                  | Error message ->
+                      errors :=
+                        Printf.sprintf "package alias %S:\n%s"
+                          entry.Package_config.package_alias message
+                        :: !errors))
+            parsed.Package_config.package_paths;
+          match List.rev !errors with
+          | error :: rest -> Error (String.concat "\n" (error :: rest))
+          | [] -> Ok (List.rev !vendored, List.rev !skipped_local)))
 
 let parse_repl_cli_args args =
   let rec loop debug = function
@@ -1108,6 +1497,167 @@ let () =
                 if !had_error then exit 1
             end
         end
+    | "package" :: rest -> (
+        match rest with
+        | [] | [ "--help" ] | [ "-h" ] ->
+            package_usage ();
+            exit 0
+        | [ "check"; "--help" ] | [ "check"; "-h" ] ->
+            package_check_usage ();
+            exit 0
+        | [ "check"; path ] -> (
+            match Package_check.check path with
+            | Ok result ->
+                Printf.printf "Package %s: ok (%d source files checked)\n"
+                  result.Package_check.manifest.Package_manifest.name
+                  (List.length result.Package_check.source_files);
+                exit 0
+            | Error errors ->
+                prerr_endline (Package_check.render_errors errors);
+                exit 1)
+        | "check" :: [] ->
+            prerr_endline "Error: package check requires a path";
+            package_check_usage ();
+            exit 1
+        | "check" :: _ ->
+            prerr_endline "Error: package check accepts exactly one path";
+            package_check_usage ();
+            exit 1
+        | [ "hash"; "--help" ] | [ "hash"; "-h" ] ->
+            package_hash_usage ();
+            exit 0
+        | [ "hash"; path ] -> (
+            match Package_check.check path with
+            | Error errors ->
+                prerr_endline (Package_check.render_errors errors);
+                exit 1
+            | Ok result -> (
+                match
+                  Package_hash.hash_checked_package ~root:path
+                    ~source_files:result.Package_check.source_files
+                with
+                | Ok hash ->
+                    print_endline hash;
+                    exit 0
+                | Error errors ->
+                    prerr_endline (Package_hash.render_errors errors);
+                    exit 1))
+        | "hash" :: [] ->
+            prerr_endline "Error: package hash requires a path";
+            package_hash_usage ();
+            exit 1
+        | "hash" :: _ ->
+            prerr_endline "Error: package hash accepts exactly one path";
+            package_hash_usage ();
+            exit 1
+        | [ "pack"; "--help" ] | [ "pack"; "-h" ] ->
+            package_pack_usage ();
+            exit 0
+        | "pack" :: args -> (
+            match parse_package_pack_args args with
+            | Some path, Some output -> (
+                match Package_check.check path with
+                | Error errors ->
+                    prerr_endline (Package_check.render_errors errors);
+                    exit 1
+                | Ok result -> (
+                    match
+                      Package_artifact.write_checked_package ~root:path
+                        ~source_files:result.Package_check.source_files ~output
+                    with
+                    | Ok hash ->
+                        Printf.printf "Wrote %s\nHash %s\n" output hash;
+                        exit 0
+                    | Error errors ->
+                        prerr_endline (Package_artifact.render_errors errors);
+                        exit 1))
+            | _ ->
+                prerr_endline
+                  "Error: package pack requires a package path and -o <file>";
+                package_pack_usage ();
+                exit 1)
+        | [ "fetch"; "--help" ] | [ "fetch"; "-h" ] ->
+            package_fetch_usage ();
+            exit 0
+        | [ "fetch" ] -> (
+            match package_fetch_all_from_config () with
+            | Ok (fetched, cached, skipped_local) ->
+                List.iter
+                  (fun (alias, cached_package) ->
+                    Printf.printf "Fetched %s\nHash %s\nCache %s\n" alias
+                      cached_package.Package_cache.hash
+                      cached_package.Package_cache.path)
+                  fetched;
+                List.iter
+                  (fun (alias, cached_package) ->
+                    Printf.printf "Already cached %s\nHash %s\nCache %s\n" alias
+                      cached_package.Package_cache.hash
+                      cached_package.Package_cache.path)
+                  cached;
+                List.iter
+                  (fun alias ->
+                    Printf.printf "Skipped local package %s\n" alias)
+                  skipped_local;
+                if fetched = [] && cached = [] && skipped_local = [] then
+                  print_endline "No packages declared";
+                exit 0
+            | Error message ->
+                prerr_endline message;
+                exit 1)
+        | "fetch" :: target :: from -> (
+            let result =
+              match from with
+              | [] -> package_fetch_from_config target
+              | _ -> package_fetch_explicit target from
+            in
+            match result with
+            | Ok (alias, fetch_result) ->
+                print_package_fetch_result alias fetch_result;
+                exit 0
+            | Error message ->
+                prerr_endline message;
+                exit 1)
+        | [ "vendor"; "--help" ] | [ "vendor"; "-h" ] ->
+            package_vendor_usage ();
+            exit 0
+        | [ "vendor" ] -> (
+            match package_vendor_all_from_config () with
+            | Ok (vendored, skipped_local) ->
+                List.iter print_package_vendor_result vendored;
+                List.iter
+                  (fun alias ->
+                    Printf.printf "Skipped local package %s\n" alias)
+                  skipped_local;
+                if vendored = [] && skipped_local = [] then
+                  print_endline "No packages declared";
+                exit 0
+            | Error message ->
+                prerr_endline message;
+                exit 1)
+        | [ "vendor"; target ] -> (
+            match package_vendor_target target None with
+            | Ok result ->
+                print_package_vendor_result result;
+                exit 0
+            | Error message ->
+                prerr_endline message;
+                exit 1)
+        | [ "vendor"; target; dest ] -> (
+            match package_vendor_target target (Some dest) with
+            | Ok result ->
+                print_package_vendor_result result;
+                exit 0
+            | Error message ->
+                prerr_endline message;
+                exit 1)
+        | "vendor" :: _ ->
+            prerr_endline "Error: package vendor requires a hash and path";
+            package_vendor_usage ();
+            exit 1
+        | command :: _ ->
+            Printf.eprintf "Error: unknown package command: %s\n" command;
+            package_usage ();
+            exit 1)
     | "check" :: rest -> (
         let rec parse_check_args args opts std_dir files =
           match args with

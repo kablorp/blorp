@@ -10,6 +10,8 @@ for history.
   tour for new users and agents.
 - [GUIDE.md](GUIDE.md) is the full language and standard-library reference.
 - [GRAMMAR.md](GRAMMAR.md) is the parser-level EBNF reference.
+- [PACKAGES.md](PACKAGES.md) documents portable source-package layout and
+  validation.
 
 ## Semantics
 
