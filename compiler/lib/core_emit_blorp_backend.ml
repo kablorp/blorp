@@ -25,14 +25,9 @@ let emit_simple_intrinsic ~emit_expr (ctx : Core_emit_context.t) name args =
       true
   | Some _ | None -> false
 
-let render_prepared op args =
-  Core_emit_blorp_prepared_backend.render_template op args
-
-let emit_prepared ctx op args =
-  Core_emit_context.emit ctx (render_prepared op args)
-
 let emit_prepared_line ctx op args =
-  Core_emit_context.emit_line ctx (render_prepared op args)
+  Core_emit_context.emit_line ctx
+    (Core_emit_blorp_prepared_backend.render_template op args)
 
 type emitters = {
   emit_expr : Core_emit_context.t -> core -> unit;

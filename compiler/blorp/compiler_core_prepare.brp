@@ -1,0 +1,717 @@
+-- Core representation preparation for the Blorp-owned compiler tail.
+--
+-- This pass keeps backend-specific shape normalization out of C emission.
+-- The emitter should consume prepared Core instead of discovering source-level
+-- constructs such as record literals and primitive tuple literals itself.
+import:
+	compiler_core_json:
+		CoreBoxedStorageValue,
+		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UserCall),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, UnionDecl, ValueRecordDecl),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BreakExpr,
+			CastExpr,
+			CallExpr,
+			ConstructorMatchExpr,
+			ContinueExpr,
+			CooperativeCheckpointExpr,
+			DupExpr,
+			DropExpr,
+			FieldExpr,
+			ForRangeExpr,
+			IfExpr,
+			LetExpr,
+			ListConstructExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			RangeExpr,
+			RecordExpr,
+			RecordConstructExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SeqExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TupleExpr,
+			TupleConstructExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			UnionConstructExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreGlobal,
+		CoreListConstruct,
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(LiteralMatchFallbackBody, LiteralMatchFallbackFail),
+		CoreProgram,
+		CoreRecordFieldValue,
+		CoreSourceLoc,
+		CoreTupleElement(TuplePointerElement, TuplePrimElement, TupleVoidElement),
+		CoreType(EnumType, NamedType, RangeType, TupleType, UnionType, ValueRecordType, VoidType),
+		CoreUnionConstruct,
+		CoreUnionDecl,
+		CoreUnionRepresentation(GenericUnionRepresentation),
+		CoreUnionVariant,
+		CoreValueRecordDecl,
+
+
+private pure func find_value_record_decl(
+	decls: List[CoreDecl],
+	name: String,
+) -> Option[CoreValueRecordDecl]:
+	var result: Option[CoreValueRecordDecl] = None
+
+	for decl in decls:
+		match decl:
+			ValueRecordDecl(record_decl):
+				if record_decl.name == name:
+					result = Some(record_decl)
+			FunctionDecl(func_info):
+				void
+			GlobalDecl(global):
+				void
+			EnumDecl(enum_decl):
+				void
+			UnionDecl(union_decl):
+				void
+
+	result
+
+
+private pure func find_union_decl(decls: List[CoreDecl], name: String) -> Option[CoreUnionDecl]:
+	var result: Option[CoreUnionDecl] = None
+
+	for decl in decls:
+		match decl:
+			UnionDecl(union_decl):
+				if union_decl.name == name:
+					result = Some(union_decl)
+			ValueRecordDecl(record_decl):
+				void
+			FunctionDecl(func_info):
+				void
+			GlobalDecl(global):
+				void
+			EnumDecl(enum_decl):
+				void
+
+	result
+
+
+private pure func find_union_variant(
+	union_decl: CoreUnionDecl,
+	constructor_name: String,
+) -> Option[CoreUnionVariant]:
+	var result: Option[CoreUnionVariant] = None
+
+	for variant in union_decl.variants:
+		if variant.name == constructor_name:
+			result = Some(variant)
+
+	result
+
+
+private pure func find_record_field(
+	fields: List[CoreRecordFieldValue],
+	name: String,
+) -> Option[CoreRecordFieldValue]:
+	var result: Option[CoreRecordFieldValue] = None
+
+	for field in fields:
+		if field.name == name:
+			result = Some(field)
+
+	result
+
+
+private pure func order_value_record_fields(
+	record_decl: CoreValueRecordDecl,
+	fields: List[CoreRecordFieldValue],
+) -> Option[List[CoreRecordFieldValue]]:
+	var ordered: List[CoreRecordFieldValue] = []
+	var found_all_fields: Bool = True
+
+	for field_decl in record_decl.fields:
+		match find_record_field(fields, field_decl.name):
+			Some(field):
+				ordered = ordered.append(field)
+			None:
+				found_all_fields = False
+
+	if found_all_fields and ordered.length() == fields.length():
+		Some(ordered)
+	else:
+		None
+
+
+private pure func prepare_exprs(decls: List[CoreDecl], exprs: List[CoreExpr]) -> List[CoreExpr]:
+	var prepared: List[CoreExpr] = []
+
+	for expr in exprs:
+		prepared = prepared.append(prepare_expr(decls, expr))
+
+	prepared
+
+
+private pure func prepare_tuple_elements(
+	decls: List[CoreDecl],
+	elements: List[CoreTupleElement],
+) -> List[CoreTupleElement]:
+	var prepared: List[CoreTupleElement] = []
+
+	for element in elements:
+		match element:
+			TuplePrimElement(value):
+				prepared = prepared.append(TuplePrimElement(prepare_expr(decls, value)))
+			TuplePointerElement(value):
+				prepared = prepared.append(TuplePointerElement(prepare_expr(decls, value)))
+			TupleVoidElement:
+				prepared = prepared.append(TupleVoidElement)
+
+	prepared
+
+
+private pure func prepare_boxed_storage_value(
+	decls: List[CoreDecl],
+	value: CoreBoxedStorageValue,
+) -> CoreBoxedStorageValue:
+	{
+		kind = value.kind,
+		value = prepare_expr(decls, value.value),
+		needs_release = value.needs_release,
+		transfers_ownership = value.transfers_ownership
+	}
+
+
+private pure func prepare_boxed_storage_values(
+	decls: List[CoreDecl],
+	values: List[CoreBoxedStorageValue],
+) -> List[CoreBoxedStorageValue]:
+	var prepared: List[CoreBoxedStorageValue] = []
+
+	for value in values:
+		prepared = prepared.append(prepare_boxed_storage_value(decls, value))
+
+	prepared
+
+
+private pure func prepare_list_construct(
+	decls: List[CoreDecl],
+	construct: CoreListConstruct,
+) -> CoreListConstruct:
+	{
+		layout = construct.layout,
+		elements = prepare_boxed_storage_values(decls, construct.elements),
+		elem_needs_release = construct.elem_needs_release
+	}
+
+
+pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			if name == "Int":
+				True
+			else if name == "Int8":
+				True
+			else if name == "Int16":
+				True
+			else if name == "Int32":
+				True
+			else if name == "Int64":
+				True
+			else if name == "UInt8":
+				True
+			else if name == "UInt16":
+				True
+			else if name == "UInt32":
+				True
+			else if name == "UInt64":
+				True
+			else if name == "Bool":
+				True
+			else:
+				name == "Char"
+		VoidType:
+			False
+		EnumType(name):
+			False
+		ValueRecordType(name):
+			False
+		UnionType(name):
+			False
+		RangeType:
+			False
+		TupleType(items):
+			False
+
+
+private pure func primitive_tuple_elements(
+	items: List[CoreExpr],
+	item_types: List[CoreType],
+) -> Option[List[CoreTupleElement]]:
+	var elements: List[CoreTupleElement] = []
+	var failed: Bool = False
+	var index: Int = 0
+
+	for item in items:
+		if not failed:
+			match item_types.get(index):
+				Some(item_type):
+					if is_primitive_tuple_slot_type(item_type):
+						elements = elements.append(TuplePrimElement(item))
+					else:
+						failed = True
+				None:
+					failed = True
+
+		index += 1
+
+	if failed or index != item_types.length():
+		None
+	else:
+		Some(elements)
+
+
+private pure func prepare_tuple_expr(
+	decls: List[CoreDecl],
+	items: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	prepared_items: List[CoreExpr] = prepare_exprs(decls, items)
+
+	match typ:
+		TupleType(item_types):
+			match primitive_tuple_elements(prepared_items, item_types):
+				Some(elements):
+					TupleConstructExpr(elements, typ, loc)
+				None:
+					TupleExpr(prepared_items, typ, loc)
+		NamedType(name, args):
+			TupleExpr(prepared_items, typ, loc)
+		EnumType(name):
+			TupleExpr(prepared_items, typ, loc)
+		ValueRecordType(name):
+			TupleExpr(prepared_items, typ, loc)
+		UnionType(name):
+			TupleExpr(prepared_items, typ, loc)
+		RangeType:
+			TupleExpr(prepared_items, typ, loc)
+		VoidType:
+			TupleExpr(prepared_items, typ, loc)
+
+
+private pure func prepare_record_fields(
+	decls: List[CoreDecl],
+	fields: List[CoreRecordFieldValue],
+) -> List[CoreRecordFieldValue]:
+	var prepared: List[CoreRecordFieldValue] = []
+
+	for field in fields:
+		prepared = prepared.append({
+			name = field.name,
+			value = prepare_expr(decls, field.value),
+		})
+
+	prepared
+
+
+private pure func prepare_record_expr(
+	decls: List[CoreDecl],
+	fields: List[CoreRecordFieldValue],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	prepared_fields: List[CoreRecordFieldValue] = prepare_record_fields(decls, fields)
+
+	match typ:
+		ValueRecordType(name):
+			match find_value_record_decl(decls, name):
+				Some(record_decl):
+					match order_value_record_fields(record_decl, prepared_fields):
+						Some(ordered_fields):
+							RecordConstructExpr(name, ordered_fields, typ, loc)
+						None:
+							RecordExpr(prepared_fields, typ, loc)
+				None:
+					RecordExpr(prepared_fields, typ, loc)
+		NamedType(name, args):
+			RecordExpr(prepared_fields, typ, loc)
+		EnumType(name):
+			RecordExpr(prepared_fields, typ, loc)
+		UnionType(name):
+			RecordExpr(prepared_fields, typ, loc)
+		RangeType:
+			RecordExpr(prepared_fields, typ, loc)
+		VoidType:
+			RecordExpr(prepared_fields, typ, loc)
+		TupleType(items):
+			RecordExpr(prepared_fields, typ, loc)
+
+
+private pure func prepare_union_construct(
+	decls: List[CoreDecl],
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	typ: CoreType,
+) -> Option[CoreUnionConstruct]:
+	match typ:
+		UnionType(type_name):
+			match kind:
+				UserCall(constructor_name, def_id):
+					match find_union_decl(decls, type_name):
+						Some(union_decl):
+							match find_union_variant(union_decl, constructor_name):
+								Some(variant):
+									if variant.fields.length() == args.length():
+										Some({
+											type_name = type_name,
+											constructor_name = constructor_name,
+											constructor_c_name = variant.c_name,
+											representation = GenericUnionRepresentation,
+											args = args,
+										})
+									else:
+										None
+								None:
+									None
+						None:
+							None
+				ForeignCall(name):
+					None
+				BuiltinCall(name):
+					None
+				IntrinsicCall(name):
+					None
+				ClosureCall:
+					None
+		NamedType(name, type_args):
+			None
+		EnumType(name):
+			None
+		ValueRecordType(name):
+			None
+		RangeType:
+			None
+		TupleType(items):
+			None
+		VoidType:
+			None
+
+
+private pure func prepare_literal_match_cases(
+	decls: List[CoreDecl],
+	cases: List[CoreLiteralMatchCase],
+) -> List[CoreLiteralMatchCase]:
+	var prepared: List[CoreLiteralMatchCase] = []
+
+	for match_case in cases:
+		prepared = prepared.append({
+			literal = match_case.literal,
+			body = prepare_expr(decls, match_case.body),
+		})
+
+	prepared
+
+
+private pure func prepare_literal_match_fallback(
+	decls: List[CoreDecl],
+	fallback: CoreLiteralMatchFallback,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(prepare_expr(decls, body))
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func prepare_constructor_match_cases(
+	decls: List[CoreDecl],
+	cases: List[CoreConstructorMatchCase],
+) -> List[CoreConstructorMatchCase]:
+	var prepared: List[CoreConstructorMatchCase] = []
+
+	for match_case in cases:
+		prepared = prepared.append({
+			constructor = match_case.constructor,
+			constructor_c_name = match_case.constructor_c_name,
+			body = prepare_expr(decls, match_case.body),
+		})
+
+	prepared
+
+
+private pure func prepare_constructor_match_fallback(
+	decls: List[CoreDecl],
+	fallback: CoreConstructorMatchFallback,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(prepare_expr(decls, body))
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExpr:
+	match expr:
+		LiteralExpr(literal, typ, loc):
+			expr
+		VarExpr(variable, typ, loc):
+			expr
+		VoidExpr(typ, loc):
+			expr
+		CooperativeCheckpointExpr(typ, loc):
+			expr
+		CallExpr(kind, callee, args, typ, loc):
+			prepared_callee: CoreExpr = prepare_expr(decls, callee)
+			prepared_args: List[CoreExpr] = prepare_exprs(decls, args)
+
+			match prepare_union_construct(decls, kind, prepared_args, typ):
+				Some(construct):
+					UnionConstructExpr(construct, typ, loc)
+				None:
+					CallExpr(kind, prepared_callee, prepared_args, typ, loc)
+		BinaryExpr(op, left, right, typ, loc):
+			BinaryExpr(
+				op,
+				prepare_expr(decls, left),
+				prepare_expr(decls, right),
+				typ,
+				loc,
+			)
+		UnaryExpr(op, expr_value, typ, loc):
+			UnaryExpr(
+				op,
+				prepare_expr(decls, expr_value),
+				typ,
+				loc,
+			)
+		LogicalExpr(op, left, right, typ, loc):
+			LogicalExpr(
+				op,
+				prepare_expr(decls, left),
+				prepare_expr(decls, right),
+				typ,
+				loc,
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			AssignExpr(
+				variable,
+				prepare_expr(decls, rhs),
+				typ,
+				loc,
+			)
+		CastExpr(expr_value, typ, loc):
+			CastExpr(
+				prepare_expr(decls, expr_value),
+				typ,
+				loc,
+			)
+		FieldExpr(expr_value, field_name, typ, loc):
+			FieldExpr(
+				prepare_expr(decls, expr_value),
+				field_name,
+				typ,
+				loc,
+			)
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			TupleFieldExpr(
+				prepare_expr(decls, expr_value),
+				field_index,
+				typ,
+				loc,
+			)
+		TupleExpr(items, typ, loc):
+			prepare_tuple_expr(decls, items, typ, loc)
+		TupleConstructExpr(elements, typ, loc):
+			TupleConstructExpr(
+				prepare_tuple_elements(decls, elements),
+				typ,
+				loc,
+			)
+		ListConstructExpr(construct, typ, loc):
+			ListConstructExpr(
+				prepare_list_construct(decls, construct),
+				typ,
+				loc,
+			)
+		RecordExpr(fields, typ, loc):
+			prepare_record_expr(decls, fields, typ, loc)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			RecordConstructExpr(
+				type_name,
+				prepare_record_fields(decls, fields),
+				typ,
+				loc,
+			)
+		UnionConstructExpr(construct, typ, loc):
+			UnionConstructExpr(
+				{
+					type_name = construct.type_name,
+					constructor_name = construct.constructor_name,
+					constructor_c_name = construct.constructor_c_name,
+					representation = construct.representation,
+					args = prepare_exprs(decls, construct.args)
+				},
+				typ,
+				loc,
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				variable,
+				value_type,
+				retain_policy,
+				prepare_expr(decls, body),
+				typ,
+				loc,
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				release_policy,
+				prepare_expr(decls, body),
+				typ,
+				loc,
+			)
+		LetExpr(name, is_mutable, typ, rhs, body):
+			LetExpr(
+				name,
+				is_mutable,
+				typ,
+				prepare_expr(decls, rhs),
+				prepare_expr(decls, body),
+			)
+		SeqExpr(first, second):
+			SeqExpr(
+				prepare_expr(decls, first),
+				prepare_expr(decls, second),
+			)
+		WhileExpr(cond, body, typ, loc):
+			WhileExpr(
+				prepare_expr(decls, cond),
+				prepare_expr(decls, body),
+				typ,
+				loc,
+			)
+		BreakExpr(typ, loc):
+			expr
+		ContinueExpr(typ, loc):
+			expr
+		ResourceScopeExpr(scope, typ, loc):
+			ResourceScopeExpr(
+				{
+					variable = scope.variable,
+					typ = scope.typ,
+					acquire = prepare_expr(decls, scope.acquire),
+					body = prepare_expr(decls, scope.body),
+					cleanup = prepare_expr(decls, scope.cleanup)
+				},
+				typ,
+				loc,
+			)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			ResourceCleanupExitExpr(
+				{
+					cleanups = prepare_exprs(decls, cleanup_exit.cleanups),
+					exit = cleanup_exit.exit
+				},
+				typ,
+				loc,
+			)
+		TailrecLoopExpr(params, return_type, body, loc):
+			TailrecLoopExpr(
+				params,
+				return_type,
+				prepare_expr(decls, body),
+				loc,
+			)
+		TailrecRecurExpr(args, typ, loc):
+			TailrecRecurExpr(
+				prepare_exprs(decls, args),
+				typ,
+				loc,
+			)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				prepare_expr(decls, start),
+				prepare_expr(decls, end_value),
+				prepare_expr(decls, body),
+				typ,
+				loc,
+			)
+		RangeExpr(start, end_value, typ, loc):
+			RangeExpr(
+				prepare_expr(decls, start),
+				prepare_expr(decls, end_value),
+				typ,
+				loc,
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			LiteralMatchExpr(
+				prepare_expr(decls, scrutinee),
+				prepare_literal_match_cases(decls, cases),
+				prepare_literal_match_fallback(decls, fallback),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				prepare_expr(decls, scrutinee),
+				prepare_constructor_match_cases(decls, cases),
+				prepare_constructor_match_fallback(decls, fallback),
+				typ,
+				loc,
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				prepare_expr(decls, cond),
+				prepare_expr(decls, then_expr),
+				prepare_expr(decls, else_expr),
+				typ,
+				loc,
+			)
+
+
+private pure func prepare_function(decls: List[CoreDecl], func_info: CoreFunction) -> CoreFunction:
+	match func_info.body:
+		Some(body):
+			{ func_info | body = Some(prepare_expr(decls, body)) }
+		None:
+			func_info
+
+
+private pure func prepare_global(decls: List[CoreDecl], global: CoreGlobal) -> CoreGlobal:
+	{ global | init = prepare_expr(decls, global.init) }
+
+
+private pure func prepare_decl(decls: List[CoreDecl], decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(func_info):
+			FunctionDecl(prepare_function(decls, func_info))
+		GlobalDecl(global):
+			GlobalDecl(prepare_global(decls, global))
+		EnumDecl(enum_decl):
+			EnumDecl(enum_decl)
+		UnionDecl(union_decl):
+			UnionDecl(union_decl)
+		ValueRecordDecl(record_decl):
+			ValueRecordDecl(record_decl)
+
+
+pure func prepare_program(program: CoreProgram) -> CoreProgram:
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		decls = decls.append(prepare_decl(program.decls, decl))
+
+	{decls = decls}

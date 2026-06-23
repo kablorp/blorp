@@ -6,9 +6,10 @@
 -- loop.
 import:
 	compiler_core_json:
+		CoreBoxedStorageValue,
 		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ValueRecordDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, UnionDecl, ValueRecordDecl),
 		CoreExpr(
 			AssignExpr,
 			BinaryExpr,
@@ -18,31 +19,43 @@ import:
 			ConstructorMatchExpr,
 			ContinueExpr,
 			CooperativeCheckpointExpr,
+			DupExpr,
+			DropExpr,
 			FieldExpr,
 			ForRangeExpr,
 			IfExpr,
 			LetExpr,
+			ListConstructExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
 			RangeExpr,
+			RecordExpr,
+			RecordConstructExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SeqExpr,
 			TailrecLoopExpr,
 			TailrecRecurExpr,
+			TupleExpr,
+			TupleConstructExpr,
+			TupleFieldExpr,
 			UnaryExpr,
+			UnionConstructExpr,
 			VarExpr,
 			VoidExpr,
 			WhileExpr,
 		),
 		CoreFunction,
 		CoreGlobal,
+		CoreListConstruct,
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(LiteralMatchFallbackBody, LiteralMatchFallbackFail),
 		CoreProgram,
+		CoreRecordFieldValue,
 		CoreResourceExit(ResourceBreakExit, ResourceContinueExit),
 		CoreSourceLoc,
+		CoreTupleElement(TuplePointerElement, TuplePrimElement, TupleVoidElement),
 		CoreType,
 
 
@@ -99,6 +112,78 @@ private pure func rewrite_resource_expr_list_with_cleanups(
 
 	for expr in exprs:
 		result = result.append(rewrite_resource_expr_with_cleanups(expr, cleanups))
+
+	result
+
+
+private pure func rewrite_tuple_elements_with_cleanups(
+	elements: List[CoreTupleElement],
+	cleanups: List[CoreExpr],
+) -> List[CoreTupleElement]:
+	var result: List[CoreTupleElement] = []
+
+	for element in elements:
+		match element:
+			TuplePrimElement(value):
+				result = result.append(
+					TuplePrimElement(rewrite_resource_expr_with_cleanups(value, cleanups)),
+				)
+			TuplePointerElement(value):
+				result = result.append(
+					TuplePointerElement(rewrite_resource_expr_with_cleanups(value, cleanups)),
+				)
+			TupleVoidElement:
+				result = result.append(TupleVoidElement)
+
+	result
+
+
+private pure func rewrite_boxed_storage_value_with_cleanups(
+	value: CoreBoxedStorageValue,
+	cleanups: List[CoreExpr],
+) -> CoreBoxedStorageValue:
+	{
+		kind = value.kind,
+		value = rewrite_resource_expr_with_cleanups(value.value, cleanups),
+		needs_release = value.needs_release,
+		transfers_ownership = value.transfers_ownership
+	}
+
+
+private pure func rewrite_boxed_storage_values_with_cleanups(
+	values: List[CoreBoxedStorageValue],
+	cleanups: List[CoreExpr],
+) -> List[CoreBoxedStorageValue]:
+	var result: List[CoreBoxedStorageValue] = []
+
+	for value in values:
+		result = result.append(rewrite_boxed_storage_value_with_cleanups(value, cleanups))
+
+	result
+
+
+private pure func rewrite_list_construct_with_cleanups(
+	construct: CoreListConstruct,
+	cleanups: List[CoreExpr],
+) -> CoreListConstruct:
+	{
+		layout = construct.layout,
+		elements = rewrite_boxed_storage_values_with_cleanups(construct.elements, cleanups),
+		elem_needs_release = construct.elem_needs_release
+	}
+
+
+private pure func rewrite_record_fields_with_cleanups(
+	fields: List[CoreRecordFieldValue],
+	cleanups: List[CoreExpr],
+) -> List[CoreRecordFieldValue]:
+	var result: List[CoreRecordFieldValue] = []
+
+	for field in fields:
+		result = result.append({
+			name = field.name,
+			value = rewrite_resource_expr_with_cleanups(field.value, cleanups),
+		})
 
 	result
 
@@ -254,6 +339,74 @@ private pure func rewrite_resource_expr_with_cleanups(
 				typ,
 				loc,
 			)
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			TupleFieldExpr(
+				rewrite_resource_expr_with_cleanups(expr_value, cleanups),
+				field_index,
+				typ,
+				loc,
+			)
+		TupleExpr(items, typ, loc):
+			TupleExpr(
+				rewrite_resource_expr_list_with_cleanups(items, cleanups),
+				typ,
+				loc,
+			)
+		TupleConstructExpr(elements, typ, loc):
+			TupleConstructExpr(
+				rewrite_tuple_elements_with_cleanups(elements, cleanups),
+				typ,
+				loc,
+			)
+		ListConstructExpr(construct, typ, loc):
+			ListConstructExpr(
+				rewrite_list_construct_with_cleanups(construct, cleanups),
+				typ,
+				loc,
+			)
+		RecordExpr(fields, typ, loc):
+			RecordExpr(
+				rewrite_record_fields_with_cleanups(fields, cleanups),
+				typ,
+				loc,
+			)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			RecordConstructExpr(
+				type_name,
+				rewrite_record_fields_with_cleanups(fields, cleanups),
+				typ,
+				loc,
+			)
+		UnionConstructExpr(construct, typ, loc):
+			UnionConstructExpr(
+				{
+					type_name = construct.type_name,
+					constructor_name = construct.constructor_name,
+					constructor_c_name = construct.constructor_c_name,
+					representation = construct.representation,
+					args = rewrite_resource_expr_list_with_cleanups(construct.args, cleanups)
+				},
+				typ,
+				loc,
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				variable,
+				value_type,
+				retain_policy,
+				rewrite_resource_expr_with_cleanups(body, cleanups),
+				typ,
+				loc,
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				release_policy,
+				rewrite_resource_expr_with_cleanups(body, cleanups),
+				typ,
+				loc,
+			)
 		LetExpr(name, is_mutable, typ, rhs, body):
 			LetExpr(
 				name,
@@ -337,6 +490,8 @@ pure func rewrite_resource_decl(decl: CoreDecl) -> CoreDecl:
 		GlobalDecl(global):
 			GlobalDecl(rewrite_resource_global(global))
 		EnumDecl(enum_decl):
+			decl
+		UnionDecl(union_decl):
 			decl
 		ValueRecordDecl(record_decl):
 			decl

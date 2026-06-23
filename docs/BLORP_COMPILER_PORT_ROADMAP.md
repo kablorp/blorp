@@ -14,7 +14,13 @@ This file is specifically about the OCaml-to-Blorp port.
 
 ## Current State
 
-The production compiler is still structurally OCaml-owned:
+The production compiler is still structurally OCaml-owned, but the tail of the
+default C-emission path is no longer only a collection of snippet renderers.
+For the supported subset, OCaml now first tries to hand post-reuse/pre-closure
+Core JSON to Blorp. Closure-heavy programs that are not yet in the JSON model
+fall through to the existing post-closure/pre-resource handoff. From that
+handoff, Blorp owns the contiguous tail from resource cleanup rewriting through
+C artifact emission:
 
 ```text
 source
@@ -23,21 +29,36 @@ source
   -> OCaml inference/typecheck
   -> OCaml Typed AST
   -> OCaml Core lowering
-  -> OCaml Core-to-Core pipeline
-  -> OCaml C backend, with some Blorp-owned renderers
+  -> OCaml Core-to-Core pipeline through reuse
+  -> Core JSON transfer for closure-free supported subsets
+  -> otherwise OCaml closure conversion
+  -> Core JSON transfer
+  -> Blorp resource cleanup rewrite
+  -> Blorp fairness checkpoint insertion
+  -> Blorp final Core preparation subset
+  -> Blorp C artifact emission subset
   -> generated C
 ```
+
+Unsupported Core shapes, explicit final-stage observation, invariant checking,
+profiling builds, and fallback emission still force the older OCaml tail and
+OCaml backend. That fallback is migration debt, not a second desired compiler.
 
 The active handoff is centralized in `compiler/lib/compiler_blorp_bridge.ml`.
 That is the correct architectural direction, but it is still transitional:
 
-- `compiler/blorp` owns several renderer and policy modules.
-- OCaml still owns Core traversal, Core stage semantics, type/layout decisions,
-  source parsing, module loading, inference, typecheck, diagnostics, and the
-  CLI/test/LSP orchestration.
-- `blorp __compiler-bridge` accepts JSON for Blorp-owned renderer actions. Stage
-  actions such as `compile_source` are reserved in the Blorp protocol but remain
-  unsupported until Blorp owns those stages.
+- `compiler/blorp` owns the bridge dispatcher, typed Core JSON codecs, C
+  artifact JSON, resource cleanup rewriting, cooperative fairness checkpoint
+  insertion, a narrow final-Core preparation pass, and a supported C-emission
+  subset.
+- OCaml still owns source parsing, module loading, inference, typecheck,
+  diagnostics, most Core stages, most representation/layout decisions, most C
+  emission, and the CLI/test/LSP orchestration.
+- `blorp __compiler-bridge` accepts JSON for renderer actions,
+  `emit_c`/`prepare_and_emit_c`, and the first `run_core_pipeline` slice:
+  `tail_resource_fairness_prepare`. Broader actions such as
+  `compile_source`, `lower_and_compile`, and `typecheck_and_compile` remain
+  reserved until Blorp owns those stages.
 - Renderer requests use the Blorp bridge command. Checked-in TSV manifests are
   no longer the production rendering path, but they still remain as temporary
   migration debt for helper bootstrap. Renderer metadata lookups now go through
@@ -47,39 +68,46 @@ That is the correct architectural direction, but it is still transitional:
 - The compiled renderer bridge helper is content-addressed by production
   `compiler/blorp` source, the compiler binary, the C compiler identity, and
   the OS.
-- `emit_c` exists as a bridge action and now accepts a typed Core JSON envelope
-  under the `core` payload field. For the supported production path, OCaml first
-  hands Blorp post-closure/pre-resource Core; Blorp rewrites resource cleanup
-  edges and inserts cooperative checkpoints for loops before emitting C. If that
-  earlier tail shape is unsupported, OCaml falls back to the older final-Core
-  handoff and then to the OCaml backend. Blorp validates that Core subset and
-  returns a `CArtifact`. It can emit a tiny valid-C subset for user functions
+- `prepare_and_emit_c` accepts Core JSON under the `core` payload field. The
+  production path now tries post-reuse/pre-closure Core first for closure-free
+  supported subsets, then post-closure/pre-resource Core. Blorp rewrites
+  resource cleanup edges, inserts cooperative checkpoints for loops, prepares
+  final Core representation shapes, and emits C. The lower-level `emit_c`
+  action now means "emit already-prepared Core" and is kept as an
+  implementation-level bridge action. If the earlier tail shapes are
+  unsupported, OCaml falls back to the older final-Core handoff and then to the
+  OCaml backend. Blorp validates that Core subset and returns a `CArtifact`. It
+  can emit a tiny valid-C subset for user functions
   with typed parameters, simple literal/variable/void/string/float/char bodies
   with C string escaping, unary operators, simple casts, binary-operator bodies
   including safe integer divide/modulo lowering, short-circuit logical
   expressions, explicit C type names for sized integer and float scalars,
   assignment statements, ternary `if`, simple named calls and renderable
   intrinsic calls whose arguments are in the supported expression subset, a
-  narrow set of scalar runtime builtin calls for sized integer conversions,
+  narrow set of direct primitive runtime builtin calls for sized integer
+  conversions, benchmark black-box helpers, and scalar time helpers,
   basic `let`/sequence statement bodies including void/discard let cases, simple
   `while` loops with Blorp-inserted cooperative checkpoints,
   `break`/`continue`, and statement-shaped `if/else` lowering with explicit
-  result temporaries. It also owns range `for` loops over final-Core `CRange`
-  values and unmanaged `@tail_recursive` final-Core loops with explicit recur
-  parameter rebinding, plus payloadless enum declarations, enum-typed scalar
-  references/equality, payloadless enum constructor matches, immutable scalar
-  literal globals, and function forward declarations for supported user
-  functions. The default pipeline now attempts this Blorp path first from the
+  result temporaries. It also owns explicitly typed range values and range
+  `for` loops over final-Core `CRange` values, plus unmanaged
+  `@tail_recursive` final-Core loops with explicit recur parameter rebinding,
+  payloadless enum declarations, enum-typed scalar references/equality,
+  payloadless enum constructor matches, primitive-payload union declarations and
+  constructor calls, immutable scalar literal globals including imported module
+  constants when they fit the JSON bridge representation, and function forward
+  declarations for supported user functions. The default pipeline now attempts
+  this Blorp path first from the
   earlier tail boundary, including embedded-runtime compile requests. On the
-  supported route, Blorp performs resource cleanup-edge rewriting and
-  cooperative checkpoint insertion itself; the OCaml final tail is forced only
-  for explicit final-stage observation, invariant checking, unsupported Blorp
-  subsets, profiling builds, or the OCaml fallback backend.
+  supported route, Blorp performs resource cleanup-edge rewriting, cooperative
+  checkpoint insertion, and final Core shape preparation itself; the OCaml final
+  tail is forced only for explicit final-stage observation, invariant checking,
+  unsupported Blorp subsets, profiling builds, or the OCaml fallback backend.
   Concrete impl declarations are projected as ordinary method functions at the
   JSON boundary, matching the existing backend naming convention, so Blorp does
   not need to model impl blocks as C declarations.
 
-Approximate current source shape, measured from this worktree on 2026-06-20:
+Approximate current source shape, measured from this worktree on 2026-06-22:
 
 | Area | Ownership today | Approximate size |
 | --- | --- | ---: |
@@ -88,20 +116,22 @@ Approximate current source shape, measured from this worktree on 2026-06-20:
 | CLI | OCaml | 1.7k OCaml lines |
 | LSP | OCaml | 6.0k OCaml lines |
 | Formatter facade/projection | OCaml facade, Blorp renderer | 2.6k OCaml lines |
-| Compiler Blorp production code | Blorp | 12.4k Blorp lines |
-| Compiler Blorp tests | Blorp | 6.8k Blorp lines |
+| Compiler Blorp production code | Blorp | 19.9k Blorp lines |
+| Compiler Blorp tests | Blorp | 12.2k Blorp lines |
 
 Current branch migration accounting against `main`, including the active
 worktree, is roughly:
 
 | Area | Added | Deleted | Net |
 | --- | ---: | ---: | ---: |
-| `compiler/blorp/**/*.brp` | 4.6k | 1.1k | +3.6k Blorp lines |
-| `compiler/lib/**/*.ml` | 1.5k | 1.6k | -0.1k OCaml lines |
+| `compiler/blorp/*.brp` | 16.5k | 0.9k | +15.6k Blorp lines |
+| `compiler/blorp/tests/*.brp` | 7.2k | 0.2k | +6.9k Blorp test lines |
+| `compiler/lib/**/*.ml` | 3.2k | 2.0k | +1.2k OCaml lines |
 
-That ratio is acceptable only as temporary bridge scaffolding. The next merge
-checkpoint should reduce OCaml ownership more aggressively than it expands
-snippet-level Blorp renderer code.
+That ratio is no longer acceptable as the steady migration pattern. The current
+branch has built necessary bridge and Core-tail scaffolding; the next slices
+must spend that scaffolding down by deleting OCaml implementations and making
+Blorp the only production path for each migrated responsibility.
 
 ## Non-Negotiable Invariants
 
@@ -203,6 +233,39 @@ prove both behavior and deletion safety:
 - benchmark baselines for compiler-shaped workloads when performance risk is
   plausible.
 
+## Aggressive Porting Mode
+
+The current checkpoint has enough bridge scaffolding to stop treating Blorp
+compiler code as optional helper code. New work should be deletion-first:
+
+1. Choose an adjacent OCaml responsibility that is already represented in the
+   active JSON/Core-tail boundary.
+2. Add or strengthen Blorp tests for that responsibility.
+3. Route the default production path through Blorp.
+4. Delete or shrink the corresponding OCaml implementation in the same slice.
+5. Leave only a narrow fallback shim when unsupported Core shapes still require
+   it, and name the exact unsupported shapes that keep the shim alive.
+
+Good next slices should remove meaningful OCaml, not merely add Blorp coverage.
+If a slice adds more Blorp without deleting OCaml, it needs a short written
+reason in this roadmap and the following slice should pay that debt down.
+
+Preferred order while the backend is still split:
+
+- Finish removing manifest/template bootstrap debt so renderer bridge support
+  does not keep template-specific OCaml alive.
+- Expand Blorp C emission only where it lets us delete OCaml emitter code or
+  turn fallback branches into hard unsupported diagnostics.
+- Finish the Blorp final-preparation subset by moving emit-only representation
+  decisions out of `core_codegen_prepare.ml` and deleting the duplicated OCaml
+  final-preparation path for supported shapes.
+- Treat `core_resource.ml` and `core_fairness.ml` as compatibility paths now
+  that Blorp owns those transforms on the supported default route; delete them
+  once final-stage observation and unsupported fallback no longer require them.
+- Move into the ownership tail (`core_closure`, `core_reuse`, `core_perceus`)
+  before starting broad parser/typechecker work, because it is adjacent to the
+  current JSON handoff and gives the most direct OCaml deletion path.
+
 ## Target Architecture
 
 The end state is a Blorp compiler with a small impure perimeter and pure
@@ -273,9 +336,9 @@ Bridge actions should evolve toward phase ownership:
 | Action | Input | Output | Owner after migration |
 | --- | --- | --- | --- |
 | `render` / `render_many` | Renderer op | Text | Temporary, deleted after full emit |
-| `emit_c` | Final Core JSON | C artifact JSON | Blorp |
+| `emit_c` | Prepared Core JSON | C artifact JSON | Blorp |
 | `prepare_and_emit_c` | Pre-final Core JSON | C artifact JSON | Blorp |
-| `run_core_pipeline` | Lowered Core JSON | Final Core or C artifact JSON | Blorp |
+| `run_core_pipeline` | Core JSON plus `stage`; currently `tail_resource_fairness_prepare` | Core JSON | Blorp |
 | `lower_and_compile` | Typed AST JSON | C artifact JSON | Blorp |
 | `typecheck_and_compile` | Parsed source graph JSON | C artifact JSON | Blorp |
 | `compile_source` | Source graph or single source JSON | C artifact JSON | Blorp |
@@ -388,9 +451,9 @@ Implementation:
   - typed AST subset needed by Core lowering;
   - Core IR;
   - C artifact metadata. The Blorp `CArtifact` JSON codec exists in
-    `compiler/blorp/compiler_artifact_json.brp`, and the `emit_c` bridge action
-    now validates and returns that artifact shape. The next step is to feed it
-    final Core JSON instead of a minimal artifact payload.
+    `compiler/blorp/compiler_artifact_json.brp`, and the `emit_c` /
+    `prepare_and_emit_c` bridge actions validate typed Core JSON and return that
+    artifact shape.
 - Add JSON codecs in Blorp for these types. **Started for final-Core source
   locations, types, variables, literals, call kinds, expressions, function
   declarations, and programs.**
@@ -419,7 +482,8 @@ Validation:
 
 ### Merge Point 3: Complete C Emission In Blorp
 
-Goal: make `emit_c(final_core_json)` the production backend.
+Goal: make Blorp C artifact emission the production backend for supported Core,
+then delete the OCaml emitter as coverage reaches completion.
 
 Implementation:
 
@@ -433,22 +497,30 @@ Implementation:
   returns a CArtifact, including a first real C function-emission subset for
   parameters, simple expressions, escaped string/float/char literals, unary
   operators, binary operators, simple casts, short-circuit logical expressions,
-  assignment statements, ternary `if`, simple named calls, basic `let`/sequence
-  statement bodies including void/discard let cases, simple `while` loops with
+  assignment statements, ternary `if`, simple named calls, direct primitive
+  runtime builtin calls for integer conversions, benchmark black-box helpers,
+  and scalar time helpers, basic `let`/sequence statement bodies including
+  void/discard let cases, simple `while` loops with
   cooperative checkpoints, `break`/`continue`, and statement-shaped `if/else`
-  lowering with explicit result temporaries, range `for` loops over final-Core
-  `CRange` values, scalar literal `match` decision trees over root
-  scrutinees including explicit fail fallbacks for exhaustive literal matches,
-  payloadless enum declarations with typed constructor references/equality and
-  payloadless enum constructor matches, immutable scalar literal globals, plus
-  unmanaged tail-recursive loops with explicit recur argument rebinding.
+  lowering with explicit result temporaries, explicitly typed range values and
+  range `for` loops over final-Core `CRange` values, scalar literal `match`
+  decision trees over root scrutinees including explicit fail fallbacks for
+  exhaustive literal matches, payloadless enum declarations with typed
+  constructor references/equality, payloadless enum constructor matches,
+  primitive-payload union declarations and constructor calls, immutable scalar
+  literal globals including imported module constants when they fit the JSON
+  bridge representation, plus unmanaged tail-recursive loops with explicit
+  recur argument rebinding.
   The single C emission path now attempts this Blorp backend first from
-  post-closure/pre-resource Core, including embedded-runtime compile requests,
-  Blorp-owned resource cleanup-edge rewriting, cooperative checkpoint
-  insertion, and intrinsic calls rendered by the Blorp intrinsic renderer. The
-  supported call subset now also includes scalar sized-integer runtime
-  conversions such as `blorp_to_int8`, plus concrete impl declarations flattened
-  to ordinary method functions at the JSON transfer boundary. Blorp also emits
+  post-reuse/pre-closure Core when the JSON subset can prove closure conversion
+  is unnecessary, then from post-closure/pre-resource Core, including
+  embedded-runtime compile requests, Blorp-owned resource cleanup-edge
+  rewriting, cooperative checkpoint insertion, final Core shape preparation,
+  and intrinsic calls rendered by the Blorp intrinsic renderer. The supported
+  call subset now also includes scalar
+  sized-integer runtime conversions such as `blorp_to_int8`, plus concrete impl
+  declarations flattened to ordinary method functions at the JSON transfer
+  boundary. Blorp also emits
   function forward declarations for supported user functions so source-order
   calls to later functions compile without relying on OCaml emission. The
   older OCaml resource/fairness/final-preparation tail is now lazy: normal
@@ -461,6 +533,20 @@ Implementation:
   supported final-Core subset.**
 - Keep C artifact output structured: C text, link flags, include dirs, runtime
   feature metadata.
+
+Current status:
+
+- `compiler/blorp/compiler_core_emit.brp` is the default C artifact path for the
+  supported tail Core subset. The production handoff tries supported
+  post-reuse/pre-closure Core first, then supported post-closure/pre-resource
+  Core.
+- `compiler/lib/core_emit_blorp_c.ml` is the active OCaml-to-JSON projector and
+  subset gate. It is acceptable bridge code for now, but every unsupported-shape
+  fallback should be treated as a porting target.
+- OCaml `core_emit.ml`, `core_emit_context.ml`, `core_emit_pattern.ml`, and
+  remaining prepared-renderer wrappers are still live for fallback emission and
+  unsupported shapes. The next backend slices should be chosen by how much of
+  that OCaml they let us delete.
 
 Deletion:
 
@@ -493,11 +579,17 @@ Goal: move the transfer point from final Core to pre-final Core.
 
 Implementation:
 
-- Port `core_codegen_prepare`.
+- Port `core_codegen_prepare`. **Started:** `compiler_core_prepare.brp`
+  currently owns value-record literal field ordering and primitive tuple literal
+  lowering for the supported Blorp backend subset.
 - Port erased-storage, option/result, hash-container, list/tensor layout, and
   representation classification needed only for final Core.
 - Move final invariant checks that protect emission into Blorp.
-- Make prepared Core JSON the input to `prepare_and_emit_c`.
+- Make pre-final Core JSON the input to `prepare_and_emit_c`, with Blorp owning
+  final Core preparation before emission. **Done for the supported
+  post-closure/pre-resource tail via `compiler_core_pipeline.brp`; the
+  production path now also tries a post-reuse/pre-closure handoff first when
+  closure conversion is unnecessary.**
 
 Deletion:
 
@@ -533,7 +625,10 @@ Implementation:
 - Port Core traversal helpers needed by these stages.
 - Port Perceus last-use/drop insertion with explicit ownership facts.
 - Port reuse analysis without relying on names or emitted C shape.
-- Expand the existing Blorp fairness policy into full fairness traversal.
+- Port resource cleanup-exit rewriting. **Started:** `compiler_core_resource.brp`
+  is used by the supported Blorp backend route.
+- Port cooperative checkpoint insertion. **Started:**
+  `compiler_core_fairness.brp` is used by the supported Blorp backend route.
 - Add stage-by-stage JSON dumps for parity.
 
 Deletion:
@@ -887,14 +982,33 @@ compiler-library test suite.
 ## Near-Term Queue
 
 1. Close the remaining Merge Point 1 debt by deleting the helper bootstrap TSV
-   fallback.
-2. Shrink the remaining TSV bootstrap path so `core_emit_blorp_template.ml`
-   contains only the temporary helper-build fallback or disappears entirely.
-3. Add final Core JSON fixtures and Blorp codecs for the subset needed by C
-   emission.
-4. Replace snippet-level renderer calls with one `emit_c` action.
-5. Delete remaining manifest/template OCaml once helper bootstrap no longer
-   needs TSV manifests.
-6. Complete C emission in Blorp and delete the OCaml emitter.
-7. Move the transfer point backward to final Core preparation, then through the
-   ownership tail.
+   fallback, then delete `core_emit_blorp_template.ml` or reduce it to a tiny
+   bridge-cache helper with no renderer-specific behavior.
+2. Audit `core_emit_blorp_c.ml` unsupported reasons by frequency in
+   `scripts/test compiler`; choose the highest-value unsupported backend shapes
+   that let us delete OCaml emitter branches rather than adding another narrow
+   parallel renderer.
+3. Expand `compiler_core_emit.brp` until complete supported backend families
+   move from OCaml to Blorp: list/tensor/string helper emission, pattern
+   emission, closure emission, and runtime feature metadata. Delete the matching
+   OCaml helpers as each family becomes authoritative.
+4. Finish `compiler_core_prepare.brp` for emit-only representation decisions,
+   then delete the duplicated supported-shape logic from
+   `core_codegen_prepare.ml` and keep OCaml only for unsupported fallback until
+   the fallback disappears.
+5. Make Blorp-owned `compiler_core_resource.brp` and
+   `compiler_core_fairness.brp` observable through stage dumps or parity tests.
+   **Started:** `run_core_pipeline` now exposes
+   `tail_resource_fairness_prepare` as Core JSON -> Core JSON, and duplicated
+   OCaml unit tests for resource/fairness were deleted in favor of Blorp
+   TestSuites. Delete the OCaml `core_resource.ml` and `core_fairness.ml`
+   compatibility paths when explicit final-stage observation no longer needs
+   them.
+6. Move the JSON boundary left through the ownership tail in this order:
+   `core_closure`, `core_reuse`, `core_perceus`, `core_consume_specialize`.
+   Each port should remove the corresponding OCaml stage file or a clearly
+   named, measured subset of it.
+7. Only after the late Core/ownership tail is mostly Blorp-owned, start the
+   middle-Core orchestration port. The target is `run_core_pipeline(lowered_core)
+   -> CoreProgram/CArtifact` through the same bridge, followed by deletion of
+   individual OCaml Core stage files.

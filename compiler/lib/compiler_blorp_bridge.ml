@@ -265,13 +265,13 @@ let render_many_request_json ~renderer items =
              ] );
        ])
 
-let emit_c_request_json core_json =
+let prepare_and_emit_c_request_json core_json =
   Lsp_json.to_string
     (Lsp_json.Object
        [
          ("schema", Lsp_json.Int schema_version);
          ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "emit_c");
+         ("action", Lsp_json.String "prepare_and_emit_c");
          ("payload", Lsp_json.Object [ ("core", core_json) ]);
        ])
 
@@ -964,9 +964,9 @@ let render_many_via_command_exn ~renderer items =
     | Ok rendered -> rendered
     | Error (_, message) -> invalid_arg message
 
-let emit_c_artifact_exn core_json =
+let prepare_and_emit_c_artifact_exn core_json =
   let response_json =
-    run_renderer_request_via_blorp (emit_c_request_json core_json)
+    run_renderer_request_via_blorp (prepare_and_emit_c_request_json core_json)
   in
   match response_result response_json c_artifact_response_field with
   | Ok artifact -> artifact

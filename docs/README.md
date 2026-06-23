@@ -17,8 +17,6 @@ for history.
   ARC, and copy-on-write behavior.
 - [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) defines the compiler/runtime
   ownership ABI for managed values.
-- [0.1_MEMORY_HARDENING.md](0.1_MEMORY_HARDENING.md) tracks the release-blocking
-  memory leak hardening and gate expansion plan.
 
 ## Compiler
 
@@ -26,6 +24,10 @@ for history.
   structure, Core pass order, and backend boundaries.
 - [COMPILER_ROADMAP.md](COMPILER_ROADMAP.md) tracks active compiler cleanup,
   call-resolution, performance, and native-boundary work.
+- [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md) tracks the
+  aggressive OCaml-to-Blorp compiler migration, including the single JSON
+  transfer point, current Blorp-owned Core tail, and deletion-first merge
+  points.
 
 ## Runtime And Resources
 

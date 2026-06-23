@@ -28,13 +28,13 @@ Source (.brp)
     |
     v
 +------------+
-| Core IR    |  Lowering → 16 observed transform stages → final preparation
-| pipeline   |  → final snapshot → C emission (see "Core IR Pipeline")
+| Core IR    |  Lowering → observed transform stages → JSON handoff for
+| pipeline   |  supported Blorp tail, with OCaml fallback while migration continues
 +------------+
     |
     v
 +------------+
-| C Emission |  Blorp artifact path, then OCaml fallback while migration continues
+| C Emission |  Blorp C artifact path for supported Core; OCaml fallback otherwise
 +------------+
     |
     v
@@ -50,8 +50,17 @@ Native Binary
 
 Codegen is a pipeline over a typed intermediate representation (`core.ml`).
 Most stages read Core IR and produce Core IR; final codegen preparation makes
-late representation choices explicit in Core before the default C backend emits
-C. The Core path is the compiler's codegen path.
+late representation choices explicit in Core before C artifact emission. The
+Core path is the compiler's codegen path.
+
+During the OCaml-to-Blorp port, the supported default backend route crosses the
+single JSON bridge after closure conversion and before resource/fairness/final
+preparation. On that route, `compiler/blorp/compiler_core_resource.brp`,
+`compiler_core_fairness.brp`, `compiler_core_prepare.brp`, and
+`compiler_core_emit.brp` own the contiguous tail through C artifact generation.
+The OCaml `core_resource.ml`, `core_fairness.ml`, `core_codegen_prepare.ml`, and
+`core_emit.ml` paths remain for explicit final-stage observation, invariant
+checking, profiling builds, unsupported Core shapes, and fallback emission.
 
 ```
 Typed AST
@@ -156,9 +165,45 @@ Typed AST
 +------------+  (core_reuse.ml)
     |
     v
++--------------------------+
+| JSON handoff (supported) |  Supported post-reuse/pre-closure Core enters
++--------------------------+  Blorp first when closure conversion is unnecessary
+    |                       otherwise
+    v
 +--------------+
 | Core_closure |  Hoist lambdas and build closure values (core_closure.ml)
 +--------------+
+    |
+    v
++--------------------------+
+| JSON handoff (supported) |  Supported post-closure/pre-resource Core enters
++--------------------------+  the Blorp-owned tail; unsupported shapes stay on
+    |                       the OCaml compatibility path
+    v
++---------------------+
+| Blorp Core_resource |  Resource-scope break/continue cleanup exits
++---------------------+  (compiler_core_resource.brp)
+    |
+    v
++---------------------+
+| Blorp Core_fairness |  Cooperative checkpoints at loop boundaries
++---------------------+  (compiler_core_fairness.brp)
+    |
+    v
++--------------------+
+| Blorp Core_prepare |  Supported final Core representation preparation
++--------------------+  (compiler_core_prepare.brp)
+    |
+    v
++-------------------+
+| Blorp C emission  |  C artifact generation for the supported subset
++-------------------+  (compiler_core_emit.brp)
+```
+
+OCaml compatibility/fallback route:
+
+```
+Core_closure
     |
     v
 +---------------+
@@ -247,9 +292,9 @@ boxing, or ownership behavior from source spelling.
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
 | `core_dce.ml` | Conservative Core declaration dead-code elimination before ownership insertion |
 | `core_consume_specialize.ml` | Pre-Perceus consuming-call clones for safe source-owned self-replacement |
-| `core_resource.ml` | Explicit resource cleanup exits for nonlocal loop control |
-| `core_fairness.ml` | Compiler-owned cooperative checkpoint insertion for ordinary and tailrec loops |
-| `core_codegen_prepare.ml` | Final Core preparation: explicit constructors, box/unbox, and release/layout facts |
+| `core_resource.ml` | OCaml compatibility path for explicit resource cleanup exits; supported Blorp backend route uses `compiler_core_resource.brp` |
+| `core_fairness.ml` | OCaml compatibility path for cooperative checkpoints; supported Blorp backend route uses `compiler_core_fairness.brp` |
+| `core_codegen_prepare.ml` | OCaml compatibility path for final Core preparation; supported Blorp backend route uses `compiler_core_prepare.brp` |
 | `core_erased_storage_layout.ml` | Late-Core classification for typed values crossing erased `void*` storage |
 | `core_erasure_inventory.ml` | Observational inventory of typed values crossing erased storage boundaries |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
@@ -259,7 +304,7 @@ boxing, or ownership behavior from source spelling.
 | `core_reuse.ml` | Post-Perceus allocation reuse analysis and prepared-Core union-node reuse rewrites |
 | `core_closure.ml` | Closure conversion / lambda hoisting |
 | `core_perceus_check.ml` | RC balance simulator for testing |
-| `core_emit_blorp_c.ml` | Core JSON projection for the Blorp-owned tail C path, preferring post-closure/pre-resource Core and forcing final Core only for observation, invariants, unsupported subsets, or fallback |
+| `core_emit_blorp_c.ml` | Core JSON projection for the Blorp-owned tail C path, preferring post-reuse/pre-closure Core when closure conversion is unnecessary, then post-closure/pre-resource Core, and forcing final Core only for observation, invariants, unsupported subsets, or fallback |
 | `core_emit.ml` | OCaml Core → C fallback emission while Blorp backend coverage expands |
 | `core_emit_context.ml` | Emission state (buffers, lambda collection) |
 | `core_emit_intrinsic.ml`, `core_emit_list_intrinsic.ml` | Intrinsic and list-helper emission |
@@ -270,6 +315,18 @@ boxing, or ownership behavior from source spelling.
 | `core_error.ml` | Structured errors with phase/location/hint |
 | `dim_solver.ml` | Canonical dimension arithmetic solver |
 | `subscript_desugar.ml` | Frontend desugaring for subscript syntax |
+
+**Blorp compiler key files:**
+
+| File | Purpose |
+|------|---------|
+| `compiler/blorp/compiler_bridge.brp` | Pure bridge dispatcher for compiler JSON actions |
+| `compiler/blorp/compiler_core_json.brp` | Typed Core JSON model at the current OCaml-to-Blorp boundary |
+| `compiler/blorp/compiler_core_resource.brp` | Supported-route resource cleanup-exit rewriting |
+| `compiler/blorp/compiler_core_fairness.brp` | Supported-route cooperative checkpoint insertion |
+| `compiler/blorp/compiler_core_prepare.brp` | Supported-route final Core representation preparation subset |
+| `compiler/blorp/compiler_core_emit.brp` | Supported-route C artifact emission subset |
+| `compiler/blorp/compiler_artifact_json.brp` | Structured C artifact JSON codec |
 
 ### Inspecting the Pipeline
 
@@ -335,9 +392,9 @@ compiler/
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
 │   ├── core_reuse.ml      # Post-Perceus allocation reuse rewrites
 │   ├── core_closure.ml    # Closure conversion / lambda hoisting
-│   ├── core_resource.ml   # Resource-scope cleanup-exit lowering
-│   ├── core_fairness.ml   # Cooperative loop checkpoint insertion
-│   ├── core_codegen_prepare.ml # Final Core representation preparation
+│   ├── core_resource.ml   # OCaml compatibility cleanup-exit lowering
+│   ├── core_fairness.ml   # OCaml compatibility checkpoint insertion
+│   ├── core_codegen_prepare.ml # OCaml compatibility final Core preparation
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
 │   ├── core_erased_storage_layout.ml # Typed values crossing erased storage
 │   ├── core_option_layout.ml # Option representation selection
@@ -388,6 +445,15 @@ compiler/
 │       ├── lsp_json.ml        # JSON parsing
 │       └── lsp_position.ml    # Source position utilities
 └── dune                   # Build configuration
+
+compiler/blorp/            # Blorp-authored compiler implementation slices
+├── compiler_bridge.brp    # Single JSON bridge dispatcher
+├── compiler_core_json.brp # Current Core JSON transfer model
+├── compiler_core_resource.brp # Blorp-owned supported resource cleanup pass
+├── compiler_core_fairness.brp # Blorp-owned supported fairness pass
+├── compiler_core_prepare.brp # Blorp-owned supported final-preparation pass
+├── compiler_core_emit.brp # Blorp-owned supported C artifact emitter
+└── tests/                 # Blorp TestSuite coverage for compiler slices
 
 std/                       # Portable standard library (.brp files)
 ├── prelude.brp            # Auto-imported declarations

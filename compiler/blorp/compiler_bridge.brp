@@ -31,7 +31,11 @@ import:
 		bridge_success_json,
 		decode_bridge_envelope_value,
 	compiler_core_emit as CoreEmit
-	compiler_core_json as CoreJson
+	compiler_core_json:
+		core_json_error_to_string,
+		core_program_to_json,
+		decode_core_program_json,
+	compiler_core_pipeline as CorePipeline
 	core_error_format as CoreError
 	core_fairness_policy as CoreFairness
 	core_profile_format as CoreProfile
@@ -575,12 +579,46 @@ private pure func handle_render_many(body: JsonValue) -> Result[JsonValue, Bridg
 private pure func handle_emit_c(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
 	core_json ?= json_field(body, "core", "Core program JSON")
 
-	match CoreJson.decode_core_program_json(core_json):
+	match decode_core_program_json(core_json):
 		Ok(program):
-			artifact = CoreEmit.emit_core_program_c_artifact(program)
+			artifact = CoreEmit.emit_prepared_core_program_c_artifact(program)
 			Ok(bridge_success_json(c_artifact_to_json(artifact)))
 		Err(error):
-			Err(CoreJsonFailure(CoreJson.core_json_error_to_string(error)))
+			Err(CoreJsonFailure(core_json_error_to_string(error)))
+
+
+private pure func handle_prepare_and_emit_c(
+	body: JsonValue,
+) -> Result[JsonValue, BridgeDispatchError]:
+	core_json ?= json_field(body, "core", "Core program JSON")
+
+	match decode_core_program_json(core_json):
+		Ok(program):
+			artifact = CoreEmit.prepare_and_emit_core_program_c_artifact(program)
+			Ok(bridge_success_json(c_artifact_to_json(artifact)))
+		Err(error):
+			Err(CoreJsonFailure(core_json_error_to_string(error)))
+
+
+private pure func handle_run_core_pipeline(
+	body: JsonValue,
+) -> Result[JsonValue, BridgeDispatchError]:
+	stage_name ?= string_field(body, "stage")
+	core_json ?= json_field(body, "core", "Core program JSON")
+
+	match CorePipeline.parse_core_pipeline_stage(stage_name):
+		Some(stage):
+			match decode_core_program_json(core_json):
+				Ok(program):
+					transformed = CorePipeline.run_core_pipeline_stage(
+						stage,
+						program,
+					)
+					Ok(success_json([("core", core_program_to_json(transformed))]))
+				Err(error):
+					Err(CoreJsonFailure(core_json_error_to_string(error)))
+		None:
+			Err(ExpectedRequestField("stage", "a supported Core pipeline stage"))
 
 
 private pure func handle_envelope(
@@ -598,9 +636,9 @@ private pure func handle_envelope(
 		EmitCAction:
 			handle_emit_c(body)
 		PrepareAndEmitCAction:
-			Err(UnsupportedBridgeAction(envelope.action))
+			handle_prepare_and_emit_c(body)
 		RunCorePipelineAction:
-			Err(UnsupportedBridgeAction(envelope.action))
+			handle_run_core_pipeline(body)
 		LowerAndCompileAction:
 			Err(UnsupportedBridgeAction(envelope.action))
 		TypecheckAndCompileAction:

@@ -40,9 +40,12 @@ implemented:
   `BorrowFresh` and `ConsumeReuse`, and the runtime has matching handoff
   helpers. Reuse work should extend and measure this path, not rediscover reuse
   from arbitrary loops.
-- The self-hosting path is active in `compiler/blorp`, especially the
-  Blorp-authored emission renderers. Further migration should keep this small
-  bridge-and-test pattern.
+- The self-hosting path is active in `compiler/blorp`: the supported backend
+  route now owns a contiguous Core tail through resource cleanup rewriting,
+  fairness checkpoint insertion, final-preparation subset, and C artifact
+  emission subset. Further migration should expand that production path and
+  delete the matching OCaml implementation, not add more optional renderer-only
+  scaffolding.
 
 ## Active Workstreams
 
@@ -317,35 +320,39 @@ explicit internal Core boundary.
 
 Current state:
 
-- `compiler/blorp` contains Blorp-authored renderer programs for several
-  emission-template families.
-- OCaml still owns Core traversal, C escaping, and backend context management.
-  The Blorp programs own narrow template/manifest generation slices with tests.
-- `compiler/blorp/tests` checks renderer compilation, generated-template drift,
-  and compiler Blorp behavior directly.
+- `compiler/blorp` now contains the active bridge dispatcher, typed Core JSON
+  codecs, renderer modules, and a supported Core-tail path: resource cleanup
+  rewriting, cooperative checkpoint insertion, final Core preparation subset,
+  and C artifact emission subset.
+- OCaml still owns the frontend, most Core stages, most representation/layout
+  decisions, most C emission, and fallback paths for unsupported Core shapes.
+- `compiler/blorp/tests` checks renderer behavior and direct compiler-slice
+  behavior. The detailed deletion-first port plan lives in
+  [BLORP_COMPILER_PORT_ROADMAP.md](BLORP_COMPILER_PORT_ROADMAP.md).
 
 Direction:
 
-- Migrate small compiler leaves first: pure rendering, manifest generation,
-  source-to-source helpers, and deterministic transformations with compact
-  input/output contracts.
-- Keep bridges explicit. A migrated slice should have a stable CLI or function
-  boundary, golden output, and a narrow OCaml integration point.
-- Avoid moving semantic compiler decisions into Blorp code before the
-  corresponding typed/Core facts are explicit enough for generated code to use
-  correctly.
+- Stop treating Blorp compiler code as optional helper code. New slices should
+  expand a contiguous production pipeline region and delete the corresponding
+  OCaml implementation where practical.
+- Keep one JSON transfer point. Moving the boundary left is preferred over
+  adding new bridge side channels or renderer-specific protocols.
+- Prefer adjacent late-Core work before broad frontend ports, because the
+  current handoff already carries Core facts and the deletion path is clearer.
+- Choose slices by OCaml deletion potential, not by ease of adding more Blorp
+  scaffolding.
 
 Implementation order:
 
-1. Continue with emission-template and prepared-Core rendering slices because
-   they have small boundaries and strong output tests.
-2. Move helper logic only after there is a direct drift test proving the Blorp
-   output matches the current OCaml-owned artifact.
-3. Use the compiler benchmarks to track whether each migration increases AST,
-   symbol-table, or output-construction pressure.
-4. Treat any self-hosted code that needs workarounds for missing language
-   features as feedback for language/runtime priorities, not as an excuse to
-   encode compiler hacks.
+1. Delete remaining manifest/template bootstrap debt from the bridge.
+2. Expand the Blorp C artifact path by backend family, deleting matching OCaml
+   helpers as each family becomes authoritative.
+3. Finish the supported final-preparation subset in Blorp, then shrink or
+   delete matching `core_codegen_prepare.ml` logic.
+4. Make Blorp-owned resource/fairness passes observable enough to delete the
+   OCaml compatibility path when final-stage observation no longer requires it.
+5. Move the JSON boundary left through the ownership tail before starting broad
+   parser/typechecker migration.
 
 ### Native Boundary And Security
 
@@ -386,16 +393,17 @@ invariants.
 
 ## Near-Term Queue
 
-1. Add resolver/emitter tests that make accidental `CKUser (_, None)` fallback
+1. Continue self-hosting by expanding the contiguous Blorp Core-tail path and
+   deleting matching OCaml code in the same slice.
+2. Delete remaining bridge/manifest/template compatibility helpers once
+   production callers no longer need them; keep hygiene tests narrow enough that
+   they catch real regressions.
+3. Move the JSON boundary left through final preparation and the ownership tail
+   before starting broad parser/typechecker migration.
+4. Baseline `compiler_ast`, `compiler_symbols`, and `compiler_emit` with timing
+   and allocation counters before large Core-tail ports.
+5. Add resolver/emitter tests that make accidental `CKUser (_, None)` fallback
    visible for ordinary source calls.
-2. Audit remaining UFCS DefId suffix paths and decide which source-call shapes
+6. Audit remaining UFCS DefId suffix paths and decide which source-call shapes
    still rely on them.
-3. Baseline `compiler_ast`, `compiler_symbols`, and `compiler_emit` with timing
-   and allocation counters before the next ownership optimization.
-4. Inspect list-handoff generated Core/C for compiler-shaped list pipelines and
-   identify the next narrow reuse case.
-5. Continue self-hosting by migrating one more emission-template slice behind
-   the existing generated-artifact drift tests.
-6. Keep native-boundary hardening inside the existing security gate.
-7. Delete compatibility helpers once production callers no longer need them,
-   and keep hygiene tests narrow enough that they catch real regressions.
+7. Keep native-boundary hardening inside the existing security gate.

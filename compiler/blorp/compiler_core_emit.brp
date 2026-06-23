@@ -6,6 +6,7 @@
 import:
 	codegen_intrinsic_renderer as Intrinsic
 	compiler_artifact_json: CArtifact
+	compiler_core_fairness as CoreFairness
 	compiler_core_json:
 		CoreBinaryOp(
 			AddOp,
@@ -20,10 +21,12 @@ import:
 			NotEqualOp,
 			SubtractOp,
 		),
+		CoreBoxKind(PointerBox, PrimBox, StructBox, VoidBox),
+		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UserCall),
 		CoreConstructorMatchCase,
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ValueRecordDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, UnionDecl, ValueRecordDecl),
 		CoreEnumDecl,
 		CoreEnumVariant,
 		CoreExpr(
@@ -35,20 +38,29 @@ import:
 			ConstructorMatchExpr,
 			CooperativeCheckpointExpr,
 			ContinueExpr,
+			DupExpr,
+			DropExpr,
 			FieldExpr,
 			ForRangeExpr,
 			IfExpr,
 			LetExpr,
+			ListConstructExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
 			RangeExpr,
+			RecordExpr,
+			RecordConstructExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SeqExpr,
 			TailrecLoopExpr,
 			TailrecRecurExpr,
+			TupleExpr,
+			TupleConstructExpr,
+			TupleFieldExpr,
 			UnaryExpr,
+			UnionConstructExpr,
 			VarExpr,
 			VoidExpr,
 			WhileExpr,
@@ -56,6 +68,8 @@ import:
 		CoreFunction,
 		CoreFunctionKind(BuiltinFunction, ClosureBodyFunction, ForeignFunction, UserFunction),
 		CoreGlobal,
+		CoreListConstruct,
+		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
 		CoreLiteral(BoolLiteral, CharLiteral, FloatLiteral, IntLiteral, StringLiteral),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(LiteralMatchFallbackBody, LiteralMatchFallbackFail),
@@ -64,12 +78,25 @@ import:
 		CoreLoopRangeDirection(RangeForwardOnly, RangeMayRunBackward),
 		CoreParam,
 		CoreProgram,
-		CoreSourceLoc,
-		CoreType(EnumType, NamedType, TupleType, ValueRecordType, VoidType),
+		CoreRecordFieldValue,
+		CoreReleasePolicy(
+			ArcReleaseOnlyPolicy,
+			ArcReleasePolicy,
+			NoReleasePolicy,
+			StackResultReleasePolicy,
+		),
+		CoreRetainPolicy(ArcRetainPolicy, NoRetainPolicy, StackResultRetainPolicy),
+		CoreTupleElement(TuplePointerElement, TuplePrimElement, TupleVoidElement),
+		CoreType(EnumType, NamedType, RangeType, TupleType, UnionType, ValueRecordType, VoidType),
 		CoreUnaryOp(NegateOp, NotOp),
+		CoreUnionConstruct,
+		CoreUnionDecl,
+		CoreUnionRepresentation(GenericUnionRepresentation, StackOptionRepresentation),
+		CoreUnionVariant,
 		CoreValueRecordDecl,
 		CoreValueRecordField,
-	compiler_core_resource: rewrite_resource_program
+	compiler_core_prepare as CorePrepare
+	compiler_core_resource as CoreResource
 	string: string as make_string
 
 
@@ -100,315 +127,6 @@ private pure func emit_function_inventory(func_info: CoreFunction) -> String:
 	"/* function " + func_info.name + " kind=" + function_kind_label(
 		func_info.function_kind,
 	) + " def_id=" + func_info.def_id.to_string() + " */\n"
-
-
-private pure func fairness_checkpoint(loc: CoreSourceLoc) -> CoreExpr:
-	CooperativeCheckpointExpr(VoidType, loc)
-
-
-private pure func is_checkpoint_expr(expr: CoreExpr) -> Bool:
-	match expr:
-		CooperativeCheckpointExpr(typ, loc):
-			True
-		LiteralExpr(literal, typ, loc):
-			False
-		VarExpr(variable, typ, loc):
-			False
-		VoidExpr(typ, loc):
-			False
-		CallExpr(kind, callee, args, typ, loc):
-			False
-		BinaryExpr(op, left, right, typ, loc):
-			False
-		UnaryExpr(op, expr_value, typ, loc):
-			False
-		LogicalExpr(op, left, right, typ, loc):
-			False
-		AssignExpr(variable, rhs, typ, loc):
-			False
-		CastExpr(expr_value, typ, loc):
-			False
-		FieldExpr(expr_value, field_name, typ, loc):
-			False
-		LetExpr(name, is_mutable, typ, rhs, body):
-			False
-		SeqExpr(first, second):
-			False
-		WhileExpr(cond, body, typ, loc):
-			False
-		BreakExpr(typ, loc):
-			False
-		ContinueExpr(typ, loc):
-			False
-		ResourceScopeExpr(scope, typ, loc):
-			False
-		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
-			False
-		TailrecLoopExpr(params, return_type, body, loc):
-			False
-		TailrecRecurExpr(args, typ, loc):
-			False
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			False
-		RangeExpr(start, end_value, typ, loc):
-			False
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			False
-		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
-			False
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			False
-
-
-private pure func body_starts_with_checkpoint(body: CoreExpr) -> Bool:
-	match body:
-		CooperativeCheckpointExpr(typ, loc):
-			True
-		SeqExpr(first, second):
-			is_checkpoint_expr(first)
-		LiteralExpr(literal, typ, loc):
-			False
-		VarExpr(variable, typ, loc):
-			False
-		VoidExpr(typ, loc):
-			False
-		CallExpr(kind, callee, args, typ, loc):
-			False
-		BinaryExpr(op, left, right, typ, loc):
-			False
-		UnaryExpr(op, expr_value, typ, loc):
-			False
-		LogicalExpr(op, left, right, typ, loc):
-			False
-		AssignExpr(variable, rhs, typ, loc):
-			False
-		CastExpr(expr_value, typ, loc):
-			False
-		FieldExpr(expr_value, field_name, typ, loc):
-			False
-		LetExpr(name, is_mutable, typ, rhs, body):
-			False
-		WhileExpr(cond, body, typ, loc):
-			False
-		BreakExpr(typ, loc):
-			False
-		ContinueExpr(typ, loc):
-			False
-		ResourceScopeExpr(scope, typ, loc):
-			False
-		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
-			False
-		TailrecLoopExpr(params, return_type, body, loc):
-			False
-		TailrecRecurExpr(args, typ, loc):
-			False
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			False
-		RangeExpr(start, end_value, typ, loc):
-			False
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			False
-		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
-			False
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			False
-
-
-private pure func add_loop_checkpoint(loop_loc: CoreSourceLoc, body: CoreExpr) -> CoreExpr:
-	if body_starts_with_checkpoint(body):
-		body
-	else:
-		SeqExpr(fairness_checkpoint(loop_loc), body)
-
-
-private pure func add_expr_checkpoints(expr: CoreExpr) -> CoreExpr:
-	match expr:
-		LiteralExpr(literal, typ, loc):
-			expr
-		VarExpr(variable, typ, loc):
-			expr
-		VoidExpr(typ, loc):
-			expr
-		CooperativeCheckpointExpr(typ, loc):
-			expr
-		CallExpr(kind, callee, args, typ, loc):
-			CallExpr(kind, add_expr_checkpoints(callee), add_expr_list_checkpoints(args), typ, loc)
-		BinaryExpr(op, left, right, typ, loc):
-			BinaryExpr(op, add_expr_checkpoints(left), add_expr_checkpoints(right), typ, loc)
-		UnaryExpr(op, expr_value, typ, loc):
-			UnaryExpr(op, add_expr_checkpoints(expr_value), typ, loc)
-		LogicalExpr(op, left, right, typ, loc):
-			LogicalExpr(op, add_expr_checkpoints(left), add_expr_checkpoints(right), typ, loc)
-		AssignExpr(variable, rhs, typ, loc):
-			AssignExpr(variable, add_expr_checkpoints(rhs), typ, loc)
-		CastExpr(expr_value, typ, loc):
-			CastExpr(add_expr_checkpoints(expr_value), typ, loc)
-		FieldExpr(expr_value, field_name, typ, loc):
-			FieldExpr(add_expr_checkpoints(expr_value), field_name, typ, loc)
-		LetExpr(name, is_mutable, typ, rhs, body):
-			LetExpr(name, is_mutable, typ, add_expr_checkpoints(rhs), add_expr_checkpoints(body))
-		SeqExpr(first, second):
-			SeqExpr(add_expr_checkpoints(first), add_expr_checkpoints(second))
-		WhileExpr(cond, body, typ, loc):
-			checked_body: CoreExpr = add_loop_checkpoint(loc, add_expr_checkpoints(body))
-			WhileExpr(add_expr_checkpoints(cond), checked_body, typ, loc)
-		BreakExpr(typ, loc):
-			expr
-		ContinueExpr(typ, loc):
-			expr
-		ResourceScopeExpr(scope, typ, loc):
-			ResourceScopeExpr(
-				{
-					variable = scope.variable,
-					typ = scope.typ,
-					acquire = add_expr_checkpoints(scope.acquire),
-					body = add_expr_checkpoints(scope.body),
-					cleanup = add_expr_checkpoints(scope.cleanup)
-				},
-				typ,
-				loc,
-			)
-		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
-			ResourceCleanupExitExpr(
-				{
-					cleanups = add_expr_list_checkpoints(cleanup_exit.cleanups),
-					exit = cleanup_exit.exit
-				},
-				typ,
-				loc,
-			)
-		TailrecLoopExpr(params, return_type, body, loc):
-			checked_body: CoreExpr = add_loop_checkpoint(loc, add_expr_checkpoints(body))
-			TailrecLoopExpr(params, return_type, checked_body, loc)
-		TailrecRecurExpr(args, typ, loc):
-			TailrecRecurExpr(add_expr_list_checkpoints(args), typ, loc)
-		ForRangeExpr(binder, start, end_value, body, typ, loc):
-			checked_body: CoreExpr = add_loop_checkpoint(loc, add_expr_checkpoints(body))
-			ForRangeExpr(
-				binder,
-				add_expr_checkpoints(start),
-				add_expr_checkpoints(end_value),
-				checked_body,
-				typ,
-				loc,
-			)
-		RangeExpr(start, end_value, typ, loc):
-			RangeExpr(add_expr_checkpoints(start), add_expr_checkpoints(end_value), typ, loc)
-		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-			LiteralMatchExpr(
-				add_expr_checkpoints(scrutinee),
-				add_literal_match_case_checkpoints(cases),
-				add_literal_match_fallback_checkpoints(fallback),
-				typ,
-				loc,
-			)
-		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
-			ConstructorMatchExpr(
-				add_expr_checkpoints(scrutinee),
-				add_constructor_match_case_checkpoints(cases),
-				add_constructor_match_fallback_checkpoints(fallback),
-				typ,
-				loc,
-			)
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			IfExpr(
-				add_expr_checkpoints(cond),
-				add_expr_checkpoints(then_expr),
-				add_expr_checkpoints(else_expr),
-				typ,
-				loc,
-			)
-
-
-private pure func add_expr_list_checkpoints(exprs: List[CoreExpr]) -> List[CoreExpr]:
-	var result: List[CoreExpr] = []
-
-	for expr in exprs:
-		result = result.append(add_expr_checkpoints(expr))
-
-	result
-
-
-private pure func add_literal_match_case_checkpoints(
-	cases: List[CoreLiteralMatchCase],
-) -> List[CoreLiteralMatchCase]:
-	var result: List[CoreLiteralMatchCase] = []
-
-	for match_case in cases:
-		result = result.append({
-			literal = match_case.literal,
-			body = add_expr_checkpoints(match_case.body),
-		})
-
-	result
-
-
-private pure func add_literal_match_fallback_checkpoints(
-	fallback: CoreLiteralMatchFallback,
-) -> CoreLiteralMatchFallback:
-	match fallback:
-		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(add_expr_checkpoints(body))
-		LiteralMatchFallbackFail:
-			LiteralMatchFallbackFail
-
-
-private pure func add_constructor_match_case_checkpoints(
-	cases: List[CoreConstructorMatchCase],
-) -> List[CoreConstructorMatchCase]:
-	var result: List[CoreConstructorMatchCase] = []
-
-	for match_case in cases:
-		result = result.append({
-			constructor = match_case.constructor,
-			constructor_c_name = match_case.constructor_c_name,
-			body = add_expr_checkpoints(match_case.body),
-		})
-
-	result
-
-
-private pure func add_constructor_match_fallback_checkpoints(
-	fallback: CoreConstructorMatchFallback,
-) -> CoreConstructorMatchFallback:
-	match fallback:
-		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(add_expr_checkpoints(body))
-		ConstructorMatchFallbackFail:
-			ConstructorMatchFallbackFail
-
-
-private pure func add_function_checkpoints(func_info: CoreFunction) -> CoreFunction:
-	match func_info.body:
-		Some(body):
-			{ func_info | body = Some(add_expr_checkpoints(body)) }
-		None:
-			func_info
-
-
-private pure func add_global_checkpoints(global: CoreGlobal) -> CoreGlobal:
-	{ global | init = add_expr_checkpoints(global.init) }
-
-
-private pure func add_decl_checkpoints(decl: CoreDecl) -> CoreDecl:
-	match decl:
-		FunctionDecl(func_info):
-			FunctionDecl(add_function_checkpoints(func_info))
-		GlobalDecl(global):
-			GlobalDecl(add_global_checkpoints(global))
-		EnumDecl(enum_decl):
-			decl
-		ValueRecordDecl(record_decl):
-			decl
-
-
-private pure func add_program_checkpoints(program: CoreProgram) -> CoreProgram:
-	var decls: List[CoreDecl] = []
-
-	for decl in program.decls:
-		decls = decls.append(add_decl_checkpoints(decl))
-
-	{decls = decls}
 
 
 private pure func c_function_name(func_info: CoreFunction) -> String:
@@ -457,17 +175,23 @@ private pure func c_type_name(typ: CoreType) -> String:
 			else if name == "Char":
 				"int32_t"
 			else if name == "String":
-				"const char*"
+				"blorp_String*"
 			else if name == "Closure":
 				"blorp_Closure*"
+			else if name == "List":
+				"blorp_List*"
 			else:
 				"void*"
 		EnumType(name):
 			"long"
 		ValueRecordType(name):
 			name
+		UnionType(name):
+			name + "*"
+		RangeType:
+			"Range"
 		TupleType(items):
-			"void*"
+			"blorp_Tuple*"
 
 
 private pure func c_return_type(func_info: CoreFunction) -> String:
@@ -486,9 +210,30 @@ private pure func c_function_signature(func_info: CoreFunction) -> String:
 		) + " " + c_function_name(func_info) + "(" + c_param_list(func_info.params) + ")"
 
 
+private pure func entrypoint_has_source_args(func_info: CoreFunction) -> Bool:
+	is_entrypoint(func_info) and func_info.params.length() > 0
+
+
+private pure func entrypoint_arg_name(func_info: CoreFunction) -> String:
+	match func_info.params:
+		[]:
+			"args"
+		[param, ...rest]:
+			param.name.name
+
+
 private pure func entrypoint_arg_prelude(func_info: CoreFunction) -> String:
-	if is_entrypoint(func_info) and func_info.params.length() > 0:
-		"  (void)argc;\n  (void)argv;\n"
+	if entrypoint_has_source_args(func_info):
+		arg_name: String = entrypoint_arg_name(func_info)
+
+		"  blorp_List* " + arg_name + " = blorp_list_new(argc);\n" + "  blorp_list_init_elem_release(" + arg_name + ", blorp_elem_release_fn);\n" + "  for (int __i = 0; __i < argc; __i++) " + arg_name + " = blorp_list_append_owned(" + arg_name + ", (void*)blorp_string_create(argv[__i]));\n"
+	else:
+		""
+
+
+private pure func entrypoint_arg_cleanup(func_info: CoreFunction) -> String:
+	if entrypoint_has_source_args(func_info):
+		"  blorp_release(" + entrypoint_arg_name(func_info) + ");\n"
 	else:
 		""
 
@@ -524,6 +269,10 @@ private pure func is_void_type(typ: CoreType) -> Bool:
 			False
 		ValueRecordType(name):
 			False
+		UnionType(name):
+			False
+		RangeType:
+			False
 		TupleType(items):
 			False
 
@@ -551,6 +300,24 @@ private pure func is_void_expr(expr: CoreExpr) -> Bool:
 		CastExpr(expr_value, typ, loc):
 			False
 		FieldExpr(expr_value, field_name, typ, loc):
+			False
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			False
+		TupleExpr(items, typ, loc):
+			False
+		TupleConstructExpr(elements, typ, loc):
+			False
+		ListConstructExpr(construct, typ, loc):
+			False
+		RecordExpr(fields, typ, loc):
+			False
+		RecordConstructExpr(type_name, fields, typ, loc):
+			False
+		UnionConstructExpr(construct, typ, loc):
+			False
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			False
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			False
 		LetExpr(name, is_mutable, typ, rhs, body):
 			False
@@ -598,11 +365,38 @@ private pure func discard_body(body: FunctionBodyC) -> String:
 		body.statements + "  " + body.value + ";\n"
 
 
+private pure func type_requires_release(typ: CoreType) -> Bool:
+	match typ:
+		TupleType(items):
+			True
+		UnionType(name):
+			True
+		VoidType:
+			False
+		NamedType(name, args):
+			False
+		EnumType(name):
+			False
+		ValueRecordType(name):
+			False
+		RangeType:
+			False
+
+
+private pure func discard_expr_body(expr: CoreExpr, body: FunctionBodyC) -> String:
+	if body.value == "":
+		body.statements
+	else if type_requires_release(core_expr_type(expr)):
+		body.statements + "  blorp_release(" + body.value + ");\n"
+	else:
+		discard_body(body)
+
+
 private pure func statement_body(expr: CoreExpr, body: FunctionBodyC) -> String:
 	if is_void_expr(expr):
 		body.statements
 	else:
-		discard_body(body)
+		discard_expr_body(expr, body)
 
 
 private pure func required_body_value(body: FunctionBodyC) -> Option[String]:
@@ -639,7 +433,12 @@ private pure func c_string_literal(text: String) -> String:
 			Some(ch):
 				code: Int = to_int(ch)
 
-				if code == 34:
+				if code == 0:
+					result = result.append_char('\\')
+					result = result.append_char('0')
+					result = result.append_char('0')
+					result = result.append_char('0')
+				else if code == 34:
 					result = result.append_char('\\')
 					result = result.append_char('\"')
 				else if code == 92:
@@ -662,6 +461,37 @@ private pure func c_string_literal(text: String) -> String:
 		index += 1
 
 	result.append_char('\"')
+
+
+private pure func string_contains_nul(text: String) -> Bool:
+	var found: Bool = False
+	var index: Int = 0
+
+	while index < text.length():
+		if not found:
+			match text.get(index):
+				Some(ch):
+					if to_int(ch) == 0:
+						found = True
+					else:
+						void
+				None:
+					void
+
+		index += 1
+
+	found
+
+
+private pure func emit_string_literal_expr(value: String) -> String:
+	literal_c: String = c_string_literal(value)
+
+	if string_contains_nul(value):
+		"blorp_string_literal_len(" + literal_c + ", " + value
+			.length()
+			.to_string() + "L)"
+	else:
+		"blorp_string_literal(" + literal_c + ")"
 
 
 private pure func c_float_literal(value: Float) -> String:
@@ -691,7 +521,7 @@ private pure func emit_literal_expr(literal: CoreLiteral) -> Option[String]:
 		CharLiteral(value):
 			Some(value.to_string())
 		StringLiteral(value):
-			Some(c_string_literal(value))
+			Some(emit_string_literal_expr(value))
 
 
 private pure func c_infix_expr(left_c: String, operator: String, right_c: String) -> String:
@@ -781,6 +611,238 @@ private pure func emit_intrinsic_call(name: String, args: List[CoreExpr]) -> Opt
 			None
 
 
+private pure func emit_tuple_element_box(element: CoreTupleElement) -> Option[String]:
+	match element:
+		TuplePrimElement(value):
+			value_c ?= emit_simple_expr(value)
+			Some("(void*)(long)(" + value_c + ")")
+		TuplePointerElement(value):
+			value_c ?= emit_simple_expr(value)
+			Some("(void*)" + value_c)
+		TupleVoidElement:
+			Some("(void*)0")
+
+
+private pure func emit_tuple_construct(elements: List[CoreTupleElement]) -> Option[String]:
+	var values: List[String] = []
+	var failed: Bool = False
+
+	for element in elements:
+		if not failed:
+			match emit_tuple_element_box(element):
+				Some(value):
+					values = values.append(value)
+				None:
+					failed = True
+
+	if failed:
+		None
+	else:
+		args_c: String = if values.length() == 0:
+			""
+		else:
+			", " + values.join(", ")
+
+		Some("blorp_tuple_new(" + values
+				.length()
+				.to_string() + args_c + ")")
+
+
+private pure func list_construct_alloc(layout: CoreListStorageLayout, len: Int) -> String:
+	match layout:
+		PointerListStorage:
+			"blorp_list_new(" + len.to_string() + ")"
+		InlineListStorage(width_bytes):
+			"blorp_list_new_inline(" + len.to_string() + ", " + width_bytes.to_string() + ")"
+		InlineStructListStorage(c_type):
+			"blorp_list_new_inline(" + len.to_string() + ", sizeof(" + c_type + "))"
+
+
+private pure func emit_boxed_pointer_value(value: CoreBoxedStorageValue) -> Option[String]:
+	value_c ?= emit_simple_expr(value.value)
+
+	match value.kind:
+		PrimBox:
+			Some("(void*)(long)(" + value_c + ")")
+		PointerBox:
+			Some("(void*)" + value_c)
+		VoidBox:
+			Some("(void*)0")
+		StructBox(c_type):
+			Some("blorp_box_struct(&(" + c_type + "){" + value_c + "}, sizeof(" + c_type + "))")
+
+
+private pure func render_list_construct_append_statement(
+	list_name: String,
+	value: CoreBoxedStorageValue,
+) -> Option[String]:
+	value_c ?= emit_boxed_pointer_value(value)
+
+	if value.transfers_ownership:
+		Some("  " + list_name + " = blorp_list_append_owned(" + list_name + ", " + value_c + ");\n")
+	else:
+		Some("  " + list_name + " = blorp_list_append(" + list_name + ", " + value_c + ");\n")
+
+
+private pure func render_inline_struct_list_write(
+	list_name: String,
+	index: Int,
+	c_type: String,
+	value: CoreBoxedStorageValue,
+) -> Option[String]:
+	value_c ?= emit_simple_expr(value.value)
+	elem_name: String = "__lst_elem_" + index.to_string()
+
+	Some(
+		"  { " + c_type + " " + elem_name + " = " + value_c + "; blorp_list_set_raw_copy(" + list_name + ", " + index.to_string() + ", &" + elem_name + "); }\n",
+	)
+
+
+private pure func emit_list_construct(construct: CoreListConstruct) -> Option[String]:
+	list_name: String = "__lst"
+	len: Int = construct.elements.length()
+	var statements: String = "({\n  blorp_List* " + list_name + " = " + list_construct_alloc(
+		construct.layout,
+		len,
+	) + ";\n"
+	var failed: Bool = False
+	var index: Int = 0
+
+	if construct.elem_needs_release:
+		statements += "  blorp_list_init_elem_release(" + list_name + ", blorp_elem_release_fn);\n"
+
+	match construct.layout:
+		InlineStructListStorage(c_type):
+			for value in construct.elements:
+				if not failed:
+					match render_inline_struct_list_write(list_name, index, c_type, value):
+						Some(statement):
+							statements += statement
+						None:
+							failed = True
+
+				index += 1
+		PointerListStorage:
+			for value in construct.elements:
+				if not failed:
+					match render_list_construct_append_statement(list_name, value):
+						Some(statement):
+							statements += statement
+						None:
+							failed = True
+		InlineListStorage(width_bytes):
+			for value in construct.elements:
+				if not failed:
+					match render_list_construct_append_statement(list_name, value):
+						Some(statement):
+							statements += statement
+						None:
+							failed = True
+
+	if failed:
+		None
+	else:
+		statements += "  " + list_name + "->len = " + len.to_string() + ";\n  " + list_name + ";\n})"
+		Some(statements)
+
+
+private pure func emit_record_construct(
+	type_name: String,
+	fields: List[CoreRecordFieldValue],
+) -> Option[String]:
+	var values: List[String] = []
+	var failed: Bool = False
+
+	for field in fields:
+		if not failed:
+			match emit_simple_expr(field.value):
+				Some(value):
+					values = values.append(value)
+				None:
+					failed = True
+
+	if failed:
+		None
+	else:
+		Some(type_name + "_make(" + values.join(", ") + ")")
+
+
+private pure func emit_union_construct(construct: CoreUnionConstruct) -> Option[String]:
+	var args: List[String] = []
+	var failed: Bool = False
+
+	for arg in construct.args:
+		if not failed:
+			match emit_simple_expr(arg):
+				Some(arg_c):
+					args = args.append(arg_c)
+				None:
+					failed = True
+
+	if failed:
+		None
+	else:
+		match construct.representation:
+			GenericUnionRepresentation:
+				Some(construct.constructor_c_name + "(" + args.join(", ") + ")")
+			StackOptionRepresentation(info):
+				match args:
+					[]:
+						Some(
+							"((" + info.option_type + "){ .tag = " + info.tag.to_string() + ", .value = " + info.none_value + " })",
+						)
+					[payload]:
+						Some(
+							"((" + info.option_type + "){ .tag = " + info.tag.to_string() + ", .value = " + payload + " })",
+						)
+					[first, second, ...rest]:
+						None
+
+
+private pure func emit_tuple_field_access(
+	expr_value: CoreExpr,
+	field_index: Int,
+	typ: CoreType,
+) -> Option[String]:
+	tuple_c ?= emit_simple_expr(expr_value)
+	element_c: String = "((blorp_Tuple*)" + tuple_c + ")->elem[" + field_index.to_string() + "]"
+
+	if CorePrepare.is_primitive_tuple_slot_type(typ):
+		field_type: String = c_type_name(typ)
+
+		if field_type == "long":
+			Some("((long)" + element_c + ")")
+		else:
+			Some("((" + field_type + ")(long)" + element_c + ")")
+	else:
+		None
+
+
+private pure func emit_drop_statement(
+	variable: CoreVar,
+	release_policy: CoreReleasePolicy,
+) -> String:
+	match release_policy:
+		NoReleasePolicy:
+			""
+		ArcReleasePolicy:
+			"  blorp_release(" + variable.name + ");\n"
+		ArcReleaseOnlyPolicy:
+			"  blorp_release_arc_only(" + variable.name + ");\n"
+		StackResultReleasePolicy:
+			"  blorp_stack_result_release(" + variable.name + ");\n"
+
+
+private pure func emit_dup_statement(variable: CoreVar, retain_policy: CoreRetainPolicy) -> String:
+	match retain_policy:
+		NoRetainPolicy:
+			""
+		ArcRetainPolicy:
+			"  blorp_retain(" + variable.name + ");\n"
+		StackResultRetainPolicy:
+			"  blorp_stack_result_retain(" + variable.name + ");\n"
+
+
 private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 	match expr:
 		LiteralExpr(literal, typ, loc):
@@ -825,6 +887,24 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 		FieldExpr(expr_value, field_name, typ, loc):
 			expr_c ?= emit_simple_expr(expr_value)
 			Some(expr_c + "." + field_name)
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			emit_tuple_field_access(expr_value, field_index, typ)
+		TupleExpr(items, typ, loc):
+			None
+		TupleConstructExpr(elements, typ, loc):
+			emit_tuple_construct(elements)
+		ListConstructExpr(construct, typ, loc):
+			emit_list_construct(construct)
+		RecordExpr(fields, typ, loc):
+			None
+		RecordConstructExpr(type_name, fields, typ, loc):
+			emit_record_construct(type_name, fields)
+		UnionConstructExpr(construct, typ, loc):
+			emit_union_construct(construct)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			None
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			None
 		LetExpr(name, is_mutable, typ, rhs, body):
 			None
 		SeqExpr(first, second):
@@ -927,13 +1007,18 @@ private pure func emit_tailrec_tail(
 			if is_void_type(typ):
 				rhs_c ?= emit_function_body(rhs, next_temp)
 				body_c ?= emit_tailrec_tail(params, return_type, body, rhs_c.next_temp)
-				Some(terminal_body(discard_body(rhs_c) + body_c.statements, body_c.next_temp))
+				Some(
+					terminal_body(
+						discard_expr_body(rhs, rhs_c) + body_c.statements,
+						body_c.next_temp,
+					),
+				)
 			else if name.name == "_":
 				rhs_c ?= emit_function_body(rhs, next_temp)
 				body_c ?= emit_tailrec_tail(params, return_type, body, rhs_c.next_temp)
 				Some(
 					terminal_body(
-						rhs_c.statements + "  (void)(" + rhs_c.value + ");\n" + body_c.statements,
+						discard_expr_body(rhs, rhs_c) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -951,7 +1036,12 @@ private pure func emit_tailrec_tail(
 		SeqExpr(first, second):
 			first_c ?= emit_function_body(first, next_temp)
 			second_c ?= emit_tailrec_tail(params, return_type, second, first_c.next_temp)
-			Some(terminal_body(discard_body(first_c) + second_c.statements, second_c.next_temp))
+			Some(
+				terminal_body(
+					discard_expr_body(first, first_c) + second_c.statements,
+					second_c.next_temp,
+				),
+			)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			cond_c ?= emit_simple_expr(cond)
 			then_c ?= emit_tailrec_tail(params, return_type, then_expr, next_temp)
@@ -986,6 +1076,28 @@ private pure func emit_tailrec_tail(
 			emit_tailrec_return(return_type, expr, next_temp)
 		FieldExpr(expr_value, field_name, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		TupleExpr(items, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		TupleConstructExpr(elements, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		ListConstructExpr(construct, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		RecordExpr(fields, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		UnionConstructExpr(construct, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			retain_statement: String = emit_dup_statement(variable, retain_policy)
+			body_c ?= emit_tailrec_tail(params, return_type, body, next_temp)
+			Some(terminal_body(retain_statement + body_c.statements, body_c.next_temp))
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			drop_statement: String = emit_drop_statement(variable, release_policy)
+			body_c ?= emit_tailrec_tail(params, return_type, body, next_temp)
+			Some(terminal_body(drop_statement + body_c.statements, body_c.next_temp))
 		WhileExpr(cond, body, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		BreakExpr(typ, loc):
@@ -1016,7 +1128,7 @@ private pure func emit_tailrec_return(
 	body_c ?= emit_function_body(expr, next_temp)
 
 	if is_void_type(return_type):
-		Some(terminal_body(discard_body(body_c) + "  return;\n", body_c.next_temp))
+		Some(terminal_body(discard_expr_body(expr, body_c) + "  return;\n", body_c.next_temp))
 	else:
 		return_value ?= required_body_value(body_c)
 		Some(
@@ -1075,6 +1187,24 @@ private pure func static_int_literal(expr: CoreExpr) -> Option[Int]:
 		CastExpr(expr_value, typ, loc):
 			None
 		FieldExpr(expr_value, field_name, typ, loc):
+			None
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			None
+		TupleExpr(items, typ, loc):
+			None
+		TupleConstructExpr(elements, typ, loc):
+			None
+		ListConstructExpr(construct, typ, loc):
+			None
+		RecordExpr(fields, typ, loc):
+			None
+		RecordConstructExpr(type_name, fields, typ, loc):
+			None
+		UnionConstructExpr(construct, typ, loc):
+			None
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			None
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			None
 		LetExpr(name, is_mutable, typ, rhs, body):
 			None
@@ -1145,7 +1275,10 @@ private pure func emit_for_range(
 	if range_is_forward_proven(binder.range_direction, start, end_value):
 		Some({
 			statements = prefix + "  for (" + loop_type + " " + binder.variable.name + " = " + start_tmp + "; " + binder.variable.name + " < " + end_tmp + "; " + binder.variable.name + "++) {\n" + indent_statements(
-				discard_body(body_c),
+				statement_body(
+					body,
+					body_c,
+				),
 			) + "  }\n",
 			value = "",
 			next_temp = body_c.next_temp,
@@ -1154,7 +1287,10 @@ private pure func emit_for_range(
 	else:
 		Some({
 			statements = prefix + "  " + loop_type + " " + step_tmp + " = (" + start_tmp + " <= " + end_tmp + ") ? 1 : -1;\n  for (" + loop_type + " " + binder.variable.name + " = " + start_tmp + "; " + binder.variable.name + " != " + end_tmp + "; " + binder.variable.name + " += " + step_tmp + ") {\n" + indent_statements(
-				discard_body(body_c),
+				statement_body(
+					body,
+					body_c,
+				),
 			) + "  }\n",
 			value = "",
 			next_temp = body_c.next_temp,
@@ -1185,6 +1321,24 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 		CastExpr(expr_value, typ, loc):
 			typ
 		FieldExpr(expr_value, field_name, typ, loc):
+			typ
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			typ
+		TupleExpr(items, typ, loc):
+			typ
+		TupleConstructExpr(elements, typ, loc):
+			typ
+		ListConstructExpr(construct, typ, loc):
+			typ
+		RecordExpr(fields, typ, loc):
+			typ
+		RecordConstructExpr(type_name, fields, typ, loc):
+			typ
+		UnionConstructExpr(construct, typ, loc):
+			typ
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			typ
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			typ
 		LetExpr(name, is_mutable, typ, rhs, body):
 			core_expr_type(body)
@@ -1449,7 +1603,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				rhs_c ?= emit_function_body(rhs, next_temp)
 				body_c ?= emit_function_body(body, rhs_c.next_temp)
 				Some({
-					statements = discard_body(rhs_c) + body_c.statements,
+					statements = discard_expr_body(rhs, rhs_c) + body_c.statements,
 					value = body_c.value,
 					next_temp = body_c.next_temp,
 					returns = body_c.returns,
@@ -1458,7 +1612,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				rhs_c ?= emit_function_body(rhs, next_temp)
 				body_c ?= emit_function_body(body, rhs_c.next_temp)
 				Some({
-					statements = rhs_c.statements + "  (void)(" + rhs_c.value + ");\n" + body_c.statements,
+					statements = discard_expr_body(rhs, rhs_c) + body_c.statements,
 					value = body_c.value,
 					next_temp = body_c.next_temp,
 					returns = body_c.returns,
@@ -1504,23 +1658,71 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			Some(body_value(value, next_temp))
 		AssignExpr(variable, rhs, typ, loc):
 			rhs_c ?= emit_function_body(rhs, next_temp)
-			Some({
-				statements = rhs_c.statements + "  " + variable.name + " = " + rhs_c.value + ";\n",
-				value = "",
-				next_temp = rhs_c.next_temp,
-				returns = False,
-			})
+
+			if variable.name == "_":
+				Some({
+					statements = discard_expr_body(rhs, rhs_c),
+					value = "",
+					next_temp = rhs_c.next_temp,
+					returns = False,
+				})
+			else:
+				Some({
+					statements = rhs_c.statements + "  " + variable.name + " = " + rhs_c.value + ";\n",
+					value = "",
+					next_temp = rhs_c.next_temp,
+					returns = False,
+				})
 		CastExpr(expr_value, typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
 		FieldExpr(expr_value, field_name, typ, loc):
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
+		TupleExpr(items, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
+		TupleConstructExpr(elements, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
+		ListConstructExpr(construct, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
+		RecordExpr(fields, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
+		RecordConstructExpr(type_name, fields, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
+		UnionConstructExpr(construct, typ, loc):
+			value ?= emit_simple_expr(expr)
+			Some(body_value(value, next_temp))
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			retain_statement: String = emit_dup_statement(variable, retain_policy)
+			body_c ?= emit_function_body(body, next_temp)
+			Some({
+				statements = retain_statement + body_c.statements,
+				value = body_c.value,
+				next_temp = body_c.next_temp,
+				returns = body_c.returns,
+			})
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			drop_statement: String = emit_drop_statement(variable, release_policy)
+			body_c ?= emit_function_body(body, next_temp)
+			Some({
+				statements = drop_statement + body_c.statements,
+				value = body_c.value,
+				next_temp = body_c.next_temp,
+				returns = body_c.returns,
+			})
 		SeqExpr(first, second):
 			first_c ?= emit_function_body(first, next_temp)
 			second_c ?= emit_function_body(second, first_c.next_temp)
 			Some({
-				statements = discard_body(first_c) + second_c.statements,
+				statements = discard_expr_body(first, first_c) + second_c.statements,
 				value = second_c.value,
 				next_temp = second_c.next_temp,
 				returns = second_c.returns,
@@ -1530,7 +1732,10 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			body_c ?= emit_function_body(body, next_temp)
 			Some({
 				statements = "  while (" + cond_c + ") {\n" + indent_statements(
-					discard_body(body_c),
+					statement_body(
+						body,
+						body_c,
+					),
 				) + "  }\n",
 				value = "",
 				next_temp = body_c.next_temp,
@@ -1630,15 +1835,28 @@ private pure func emit_supported_user_function(func_info: CoreFunction) -> Optio
 				Some(body_c):
 					prefix: String = c_function_signature(func_info) + " {\n"
 					body_prelude: String = entrypoint_arg_prelude(func_info)
+					body_cleanup: String = entrypoint_arg_cleanup(func_info)
 
 					if is_void_type(func_info.return_type):
-						Some(prefix + body_prelude + discard_body(body_c) + "}\n")
+						if is_entrypoint(func_info):
+							Some(
+								prefix + body_prelude + discard_body(
+									body_c,
+								) + body_cleanup + "  return 0;\n}\n",
+							)
+						else:
+							Some(prefix + body_prelude + discard_body(body_c) + "}\n")
 					else:
 						match required_body_value(body_c):
 							Some(return_value):
-								Some(
-									prefix + body_prelude + body_c.statements + "  return " + return_value + ";\n}\n",
-								)
+								if entrypoint_has_source_args(func_info):
+									Some(
+										prefix + body_prelude + body_c.statements + "  long __blorp_main_result = (long)" + return_value + ";\n" + body_cleanup + "  return (int)__blorp_main_result;\n}\n",
+									)
+								else:
+									Some(
+										prefix + body_prelude + body_c.statements + "  return " + return_value + ";\n}\n",
+									)
 							None:
 								if body_c.returns:
 									Some(prefix + body_prelude + body_c.statements + "}\n")
@@ -1732,6 +1950,24 @@ private pure func emit_static_global_init_expr(init: CoreExpr) -> Option[String]
 			emit_simple_expr(init)
 		FieldExpr(expr_value, field_name, typ, loc):
 			emit_simple_expr(init)
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			emit_simple_expr(init)
+		TupleExpr(items, typ, loc):
+			emit_simple_expr(init)
+		TupleConstructExpr(elements, typ, loc):
+			emit_simple_expr(init)
+		ListConstructExpr(construct, typ, loc):
+			None
+		RecordExpr(fields, typ, loc):
+			emit_simple_expr(init)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			emit_simple_expr(init)
+		UnionConstructExpr(construct, typ, loc):
+			None
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			emit_simple_expr(init)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			emit_simple_expr(init)
 		LetExpr(name, is_mutable, typ, rhs, body):
 			emit_simple_expr(init)
 		SeqExpr(first, second):
@@ -1798,6 +2034,66 @@ private pure func emit_value_record_decl(record_decl: CoreValueRecordDecl) -> St
 	) + " }; return __r; }\n\n"
 
 
+private pure func c_union_variant_field_decl(field_type: CoreType, index: Int) -> String:
+	c_type_name(field_type) + " field" + index.to_string() + "; "
+
+
+private pure func emit_union_variant_storage(variant: CoreUnionVariant) -> String:
+	if variant.fields.length() == 0:
+		"    char " + variant.name + ";\n"
+	else:
+		var fields_c: String = ""
+		var index: Int = 0
+
+		for field_type in variant.fields:
+			fields_c += c_union_variant_field_decl(field_type, index)
+			index += 1
+
+		"    struct { " + fields_c + "} " + variant.name + ";\n"
+
+
+private pure func emit_union_variant_tag(variant: CoreUnionVariant) -> String:
+	"#define " + variant.tag_c_name + " " + variant.tag.to_string() + "\n"
+
+
+private pure func emit_union_constructor_param(field_type: CoreType, index: Int) -> String:
+	c_type_name(field_type) + " field" + index.to_string()
+
+
+private pure func emit_union_constructor(
+	union_decl: CoreUnionDecl,
+	variant: CoreUnionVariant,
+) -> String:
+	if variant.fields.length() == 0:
+		""
+	else:
+		var params: List[String] = []
+		var assignments: String = ""
+		var index: Int = 0
+
+		for field_type in variant.fields:
+			params = params.append(emit_union_constructor_param(field_type, index))
+			assignments += "  __vc->data." + variant.name + ".field" + index.to_string() + " = field" + index.to_string() + ";\n"
+			index += 1
+
+		union_decl.name + "* " + variant.c_name + "(" + params.join(
+			", ",
+		) + ") {\n" + "  " + union_decl.name + "* __vc = (" + union_decl.name + "*)blorp_alloc(sizeof(" + union_decl.name + "));\n" + "  BLORP_TAG(__vc, \"" + union_decl.name + "\");\n" + "  __vc->tag = " + variant.tag_c_name + ";\n" + assignments + "  return __vc;\n}\n\n"
+
+
+private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
+	var storage_c: String = ""
+	var tags_c: String = ""
+	var constructors_c: String = ""
+
+	for variant in union_decl.variants:
+		storage_c += emit_union_variant_storage(variant)
+		tags_c += emit_union_variant_tag(variant)
+		constructors_c += emit_union_constructor(union_decl, variant)
+
+	"typedef struct " + union_decl.name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + "  union {\n" + storage_c + "  } data;\n" + "} " + union_decl.name + ";\n\n" + tags_c + "\n" + constructors_c
+
+
 private pure func emit_value_record_decls(decls: List[CoreDecl]) -> String:
 	var c_code: String = ""
 
@@ -1805,6 +2101,27 @@ private pure func emit_value_record_decls(decls: List[CoreDecl]) -> String:
 		match decl:
 			ValueRecordDecl(record_decl):
 				c_code += emit_value_record_decl(record_decl)
+			EnumDecl(enum_decl):
+				void
+			UnionDecl(union_decl):
+				void
+			FunctionDecl(func_info):
+				void
+			GlobalDecl(global):
+				void
+
+	c_code
+
+
+private pure func emit_union_decls(decls: List[CoreDecl]) -> String:
+	var c_code: String = ""
+
+	for decl in decls:
+		match decl:
+			UnionDecl(union_decl):
+				c_code += emit_union_decl(union_decl)
+			ValueRecordDecl(record_decl):
+				void
 			EnumDecl(enum_decl):
 				void
 			FunctionDecl(func_info):
@@ -1823,6 +2140,8 @@ private pure func emit_enum_decls(decls: List[CoreDecl]) -> String:
 			EnumDecl(enum_decl):
 				c_code += emit_enum_decl(enum_decl)
 			ValueRecordDecl(record_decl):
+				void
+			UnionDecl(union_decl):
 				void
 			FunctionDecl(func_info):
 				void
@@ -1843,6 +2162,8 @@ private pure func emit_global_decls(decls: List[CoreDecl]) -> String:
 				void
 			ValueRecordDecl(record_decl):
 				void
+			UnionDecl(union_decl):
+				void
 			FunctionDecl(func_info):
 				void
 
@@ -1859,6 +2180,8 @@ private pure func emit_function_decls(decls: List[CoreDecl]) -> String:
 			EnumDecl(enum_decl):
 				void
 			ValueRecordDecl(record_decl):
+				void
+			UnionDecl(union_decl):
 				void
 			GlobalDecl(global):
 				void
@@ -1877,6 +2200,8 @@ private pure func emit_function_forward_decls(decls: List[CoreDecl]) -> String:
 				void
 			ValueRecordDecl(record_decl):
 				void
+			UnionDecl(union_decl):
+				void
 			GlobalDecl(global):
 				void
 
@@ -1891,14 +2216,26 @@ private pure func emit_decls(decls: List[CoreDecl]) -> String:
 		decls,
 	) + emit_enum_decls(
 		decls,
+	) + emit_union_decls(
+		decls,
 	) + emit_global_decls(decls) + emit_function_forward_decls(decls) + emit_function_decls(decls)
 
 
-pure func emit_core_program_c_artifact(program: CoreProgram) -> CArtifact:
-	resource_program: CoreProgram = rewrite_resource_program(program)
-	checked_program: CoreProgram = add_program_checkpoints(resource_program)
+pure func emit_prepared_core_program_c_artifact(program: CoreProgram) -> CArtifact:
 	{
-		c_code = C_ARTIFACT_HEADER + emit_decls(checked_program.decls),
+		c_code = C_ARTIFACT_HEADER + emit_decls(program.decls),
 		link_flags = [],
 		include_dirs = []
 	}
+
+
+pure func prepare_and_emit_core_program_c_artifact(program: CoreProgram) -> CArtifact:
+	resource_program: CoreProgram = CoreResource.rewrite_resource_program(program)
+	fair_program: CoreProgram = CoreFairness.insert_cooperative_checkpoints(resource_program)
+	prepared_program: CoreProgram = CorePrepare.prepare_program(fair_program)
+
+	emit_prepared_core_program_c_artifact(prepared_program)
+
+
+pure func emit_core_program_c_artifact(program: CoreProgram) -> CArtifact:
+	prepare_and_emit_core_program_c_artifact(program)

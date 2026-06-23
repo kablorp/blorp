@@ -4,16 +4,26 @@ import:
 		CoreBinaryOp(AddOp),
 		CoreCallKind(UserCall),
 		CoreDecl(FunctionDecl),
-		CoreExpr(BinaryExpr, CallExpr, LiteralExpr, VarExpr),
+		CoreExpr(
+			BinaryExpr,
+			CallExpr,
+			CooperativeCheckpointExpr,
+			LiteralExpr,
+			SeqExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
-		CoreLiteral(IntLiteral),
+		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreParam,
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
-		CoreType(NamedType),
+		CoreType(NamedType, VoidType),
 		CoreVar,
 		core_program_to_json,
+		decode_core_program_json,
 	json:
 		JsonValue(JsonBool, JsonNull, JsonNumber, JsonObject, JsonString, JsonVector),
 		as_array,
@@ -124,6 +134,22 @@ pure func artifact_array_length(value: JsonValue, name: String) -> Int:
 			-1
 
 
+pure func core_response(value: JsonValue) -> Option[CoreProgram]:
+	match get_field(value, "core"):
+		Some(core_json):
+			match decode_core_program_json(core_json):
+				Ok(program):
+					Some(program)
+				Err(error):
+					None
+		None:
+			None
+
+
+pure func core_programs_equal(left: CoreProgram, right: CoreProgram) -> Bool:
+	core_program_to_json(left).to_string() == core_program_to_json(right).to_string()
+
+
 pure func request_json(action: String, payload: JsonValue) -> String:
 	JsonObject([
 		("schema", JsonNumber(1.0)),
@@ -217,6 +243,59 @@ pure func bridge_call_program() -> CoreProgram:
 	}
 
 	{decls = [FunctionDecl(bridge_identity_func(int_type)), FunctionDecl(main_func)]}
+
+
+pure func bridge_loop_program() -> CoreProgram:
+	bool_type = NamedType("Bool", [])
+	main_func: CoreFunction = {
+		name = "main",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = VoidType,
+		body = Some(
+			WhileExpr(
+				LiteralExpr(BoolLiteral(True), bool_type, SyntheticSourceLoc),
+				VoidExpr(VoidType, SyntheticSourceLoc),
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = False,
+		function_kind = UserFunction,
+		def_id = 4,
+		loc = SyntheticSourceLoc
+	}
+
+	{decls = [FunctionDecl(main_func)]}
+
+
+pure func expected_bridge_loop_program_after_tail_pipeline() -> CoreProgram:
+	bool_type = NamedType("Bool", [])
+	main_func: CoreFunction = {
+		name = "main",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = VoidType,
+		body = Some(
+			WhileExpr(
+				LiteralExpr(BoolLiteral(True), bool_type, SyntheticSourceLoc),
+				SeqExpr(
+					CooperativeCheckpointExpr(VoidType, SyntheticSourceLoc),
+					VoidExpr(VoidType, SyntheticSourceLoc),
+				),
+				VoidType,
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = False,
+		function_kind = UserFunction,
+		def_id = 4,
+		loc = SyntheticSourceLoc
+	}
+
+	{decls = [FunctionDecl(main_func)]}
 
 
 pure func test_render_payload_request() -> Bool:
@@ -395,6 +474,46 @@ pure func test_emit_c_core_call_payload_request() -> Bool:
 			False
 
 
+pure func test_prepare_and_emit_c_core_payload_request() -> Bool:
+	request: String = request_json(
+		"prepare_and_emit_c",
+		JsonObject([("core", core_program_to_json(bridge_emit_program()))]),
+	)
+
+	match response_value(request):
+		Some(response):
+			(
+				bool_field(response, "ok")
+				and artifact_string_field(response, "c_code").contains("int main(void)")
+				and artifact_string_field(response, "c_code").contains("return (39 + 3);")
+			)
+		None:
+			False
+
+
+pure func test_run_core_pipeline_tail_stage_returns_core_payload() -> Bool:
+	request: String = request_json("run_core_pipeline", JsonObject([
+			("stage", JsonString("tail_resource_fairness_prepare")),
+			("core", core_program_to_json(bridge_loop_program())),
+		]))
+
+	match response_value(request):
+		Some(response):
+			if bool_field(response, "ok"):
+				match core_response(response):
+					Some(program):
+						core_programs_equal(
+							program,
+							expected_bridge_loop_program_after_tail_pipeline(),
+						)
+					None:
+						False
+			else:
+				False
+		None:
+			False
+
+
 pure func test_emit_c_rejects_invalid_core_payload() -> Bool:
 	request: String = request_json(
 		"emit_c",
@@ -450,9 +569,7 @@ pure func test_legacy_top_level_renderer_fields_are_rejected() -> Bool:
 
 pure func test_future_stage_actions_are_explicitly_unsupported() -> Bool:
 	(
-		unsupported_action_ok("prepare_and_emit_c")
-		and unsupported_action_ok("run_core_pipeline")
-		and unsupported_action_ok("lower_and_compile")
+		unsupported_action_ok("lower_and_compile")
 		and unsupported_action_ok("typecheck_and_compile")
 		and unsupported_action_ok("compile_source")
 	)
@@ -484,6 +601,11 @@ tests: TestSuite = {
 		),
 		("emit_c Core payload request", test_emit_c_core_payload_request),
 		("emit_c Core call payload request", test_emit_c_core_call_payload_request),
+		("prepare_and_emit_c Core payload request", test_prepare_and_emit_c_core_payload_request),
+		(
+			"run_core_pipeline tail stage returns Core payload",
+			test_run_core_pipeline_tail_stage_returns_core_payload,
+		),
 		("emit_c rejects invalid Core payload", test_emit_c_rejects_invalid_core_payload),
 		("emit_c rejects legacy artifact payload", test_emit_c_rejects_legacy_artifact_payload),
 		("dispatch errors are structured", test_dispatch_errors_are_structured),

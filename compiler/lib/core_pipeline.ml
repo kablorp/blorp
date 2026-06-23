@@ -125,48 +125,57 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
  fun stage prog -> fire_stage ~check_invariants ~user stage prog
 
 (** Run tail Core emission through the single C path. Supported tail subsets are
-    emitted by Blorp, preferring the earlier post-closure/pre-resource Core so
-    Blorp owns resource cleanup-edge rewriting and cooperative checkpoint
-    insertion for that path. The final OCaml tail is forced only when a caller
-    needs final-stage observability/invariants, the earlier Blorp handoff is
-    unsupported, or the older OCaml emitter is needed as a fallback. *)
-let emit_via_c_backend ?tail_prog ?(force_final = false) ~(embed_runtime : bool)
-    ~(profile : bool) ~(reg : Codegen_types.registry)
+    emitted by Blorp, preferring the earliest supplied tail snapshot. The
+    default pipeline tries post-reuse/pre-closure Core first for closure-free
+    supported subsets, then post-closure/pre-resource Core. The final OCaml tail
+    is forced only when a caller needs final-stage observability/invariants, the
+    earlier Blorp handoff is unsupported, or the older OCaml emitter is needed
+    as a fallback. *)
+let emit_via_c_backend ?(tail_progs = []) ?(force_final = false)
+    ~(embed_runtime : bool) ~(profile : bool) ~(reg : Codegen_types.registry)
     (final_prog : Core.core_program Lazy.t) : string =
+  let trace_blorp_fallback =
+    Sys.getenv_opt "BLORP_TRACE_BACKEND_FALLBACK" = Some "1"
+  in
   let final () = Lazy.force final_prog in
   let emit_with_ocaml_backend () =
     let ctx = Core_emit_context.create ~profile ~reg () in
     Core_emit.emit_program ~embed_runtime ctx (final ());
     Buffer.contents ctx.output
   in
-  let cfg = Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile () in
+  let cfg =
+    Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile ~reg ()
+  in
   let rec try_blorp_programs candidates =
     match candidates with
     | [] -> emit_with_ocaml_backend ()
     | candidate :: rest -> (
         match Core_emit_blorp_c.try_emit_program_string cfg (candidate ()) with
         | Ok c_code -> c_code
-        | Error _ -> try_blorp_programs rest)
+        | Error reason ->
+            if trace_blorp_fallback then prerr_endline reason;
+            try_blorp_programs rest)
   in
   let final_candidate = final in
   if force_final then
     let observed_final = final () in
-    match tail_prog with
-    | Some tail_prog ->
-        try_blorp_programs [ (fun () -> tail_prog); (fun () -> observed_final) ]
-    | None -> try_blorp_programs [ (fun () -> observed_final) ]
+    try_blorp_programs
+      (List.map (fun prog () -> prog) tail_progs
+      @ [ (fun () -> observed_final) ])
   else
-    match tail_prog with
-    | Some tail_prog ->
-        try_blorp_programs [ (fun () -> tail_prog); final_candidate ]
-    | None -> try_blorp_programs [ final_candidate ]
+    try_blorp_programs
+      (List.map (fun prog () -> prog) tail_progs @ [ final_candidate ])
 
 type core_tail_programs = {
+  pre_closure : Core.core_program;
+      (** Post-reuse Core before closure conversion. The Blorp backend tries
+          this first for closure-free supported subsets, moving the JSON handoff
+          one stage left without pretending Blorp owns closure conversion yet. *)
   pre_resource : Core.core_program;
       (** Post-closure Core before resource cleanup-edge rewriting, cooperative
           fairness, and final preparation.
-          The supported Blorp backend tries this first so the JSON handoff moves
-          left for tail emission without changing final-stage observability. *)
+          The supported Blorp backend tries this after [pre_closure] so closure
+          conversion remains available for programs that need it. *)
   final : Core.core_program Lazy.t;
 }
 
@@ -184,7 +193,7 @@ let run_core_passes_with_tail ?(import_aliases = Hashtbl.create 0)
     prog
   in
   let run_stage stage pass prog = pass prog |> observe stage in
-  let pre_resource =
+  let pre_closure =
     prog |> observe Core_stage.Lower
     |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
     |> run_stage Core_stage.Desugar (fun p ->
@@ -217,6 +226,9 @@ let run_core_passes_with_tail ?(import_aliases = Hashtbl.create 0)
          (Core_consume_specialize.rewrite_program ~reg)
     |> run_stage Core_stage.Perceus Core_perceus.insert_drops_program
     |> run_stage Core_stage.Reuse (Core_reuse.rewrite_program ~reg)
+  in
+  let pre_resource =
+    pre_closure
     |> run_stage Core_stage.Closure
          (Core_closure.convert_program ~wrap_function_refs:false)
   in
@@ -230,7 +242,7 @@ let run_core_passes_with_tail ?(import_aliases = Hashtbl.create 0)
        |> Core_reuse.rewrite_prepared_program ~reg
        |> observe Core_stage.Final)
   in
-  { pre_resource; final }
+  { pre_closure; pre_resource; final }
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     ?on_stage ?(check_invariants = false) (typed_program : Typed_ast.program) :
@@ -249,8 +261,9 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
   let core_prog = Core_ffi_boundary.annotate_program ~reg core_prog in
   let core_prog = Core_list_layout.annotate_program ~reg core_prog in
   let tail = run_core_passes_with_tail ~on_stage ~reg ~debug core_prog in
-  emit_via_c_backend ~tail_prog:tail.pre_resource ~force_final:force_final_tail
-    ~embed_runtime ~profile ~reg tail.final
+  emit_via_c_backend
+    ~tail_progs:[ tail.pre_closure; tail.pre_resource ]
+    ~force_final:force_final_tail ~embed_runtime ~profile ~reg tail.final
 
 (** Compile a typed AST program with module support.
 
@@ -344,7 +357,8 @@ let compile_typed_with_modules ?(main_import_bindings = [])
       ~debug full
   in
   let output =
-    emit_via_c_backend ~tail_prog:tail.pre_resource
+    emit_via_c_backend
+      ~tail_progs:[ tail.pre_closure; tail.pre_resource ]
       ~force_final:force_final_tail ~embed_runtime ~profile ~reg tail.final
   in
   (* Foreign metadata is pulled from the lowered program rather than the
