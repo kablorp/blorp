@@ -1713,10 +1713,10 @@ let test_emit_list_ensure_intrinsics_use_common_fast_paths () =
     (contains_sub unique_c "blorp_list_cow(__list_unique_");
   Alcotest.(check bool)
     "capacity check avoids runtime helper on common path" true
-    (contains_sub capacity_c "->capacity >= __list_cap_min_");
+    (contains_sub capacity_c "->capacity >= __list_cap_min");
   Alcotest.(check bool)
     "capacity check keeps growth fallback" true
-    (contains_sub capacity_c "blorp_list_ensure_capacity(__list_cap_")
+    (contains_sub capacity_c "blorp_list_ensure_capacity(__list_cap")
 
 let test_emit_list_new_managed_elements_set_release () =
   let e =

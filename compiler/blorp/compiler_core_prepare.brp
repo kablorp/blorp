@@ -5,27 +5,41 @@
 -- constructs such as record literals and primitive tuple literals itself.
 import:
 	compiler_core_json:
+		CoreBoxOp,
 		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UserCall),
-		CoreConstructorMatchCase,
-		CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, UnionDecl, ValueRecordDecl),
+        CoreConstructorMatchCase,
+        CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
+        CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
+        CoreDictConstruct,
+		CoreDictEntry,
 		CoreExpr(
 			AssignExpr,
 			BinaryExpr,
+			BoxExpr,
 			BreakExpr,
 			CastExpr,
 			CallExpr,
+			ClosureCreateExpr,
 			ConstructorMatchExpr,
 			ContinueExpr,
 			CooperativeCheckpointExpr,
+			DictConstructExpr,
 			DupExpr,
 			DropExpr,
 			FieldExpr,
+			ForListExpr,
 			ForRangeExpr,
 			IfExpr,
 			LetExpr,
+			ListAllocExpr,
 			ListConstructExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
@@ -35,8 +49,16 @@ import:
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SeqExpr,
+			SetAllocExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
 			TailrecLoopExpr,
 			TailrecRecurExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
 			TupleExpr,
 			TupleConstructExpr,
 			TupleFieldExpr,
@@ -48,19 +70,48 @@ import:
 		),
 		CoreFunction,
 		CoreGlobal,
+		CoreHeapRecordDecl,
+		CoreListAlloc,
 		CoreListConstruct,
+		CoreListGet,
+		CoreListHandoff,
+		CoreListHandoffSetSourceSlot,
+		CoreListRetain,
+		CoreListSet,
+		CoreLiteral(BoolLiteral, CharLiteral, FloatLiteral, IntLiteral, StringLiteral),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(LiteralMatchFallbackBody, LiteralMatchFallbackFail),
 		CoreProgram,
 		CoreRecordFieldValue,
+		CoreSetAlloc,
 		CoreSourceLoc,
+		CoreStackOptionRepresentation,
+		CoreStringByteCopy,
+		CoreStringByteRead,
+		CoreStringByteWrite,
+		CoreStringSetLen,
+		CoreTensorRawRead,
+		CoreTensorRawViewBinding,
+		CoreTensorRawWrite,
 		CoreTupleElement(TuplePointerElement, TuplePrimElement, TupleVoidElement),
-		CoreType(EnumType, NamedType, RangeType, TupleType, UnionType, ValueRecordType, VoidType),
+        CoreType(EnumType, HeapRecordType, NamedType, RangeType, TupleType, UnionType, ValueRecordType, VoidType),
 		CoreUnionConstruct,
 		CoreUnionDecl,
-		CoreUnionRepresentation(GenericUnionRepresentation),
+		CoreUnionRepresentation(GenericUnionRepresentation, StackOptionRepresentation),
 		CoreUnionVariant,
 		CoreValueRecordDecl,
+
+
+record PreparedTupleLiteral {
+	elements: List[CoreTupleElement],
+	release_mask: Int,
+	retain_mask: Int
+}
+
+
+private STACK_OPTION_SOME_TAG: Int = 0
+
+private STACK_OPTION_NONE_TAG: Int = 1
 
 
 private pure func find_value_record_decl(
@@ -74,6 +125,33 @@ private pure func find_value_record_decl(
 			ValueRecordDecl(record_decl):
 				if record_decl.name == name:
 					result = Some(record_decl)
+			FunctionDecl(func_info):
+				void
+			GlobalDecl(global):
+				void
+			HeapRecordDecl(record_decl):
+				void
+			EnumDecl(enum_decl):
+				void
+			UnionDecl(union_decl):
+				void
+
+	result
+
+
+private pure func find_heap_record_decl(
+	decls: List[CoreDecl],
+	name: String,
+) -> Option[CoreHeapRecordDecl]:
+	var result: Option[CoreHeapRecordDecl] = None
+
+	for decl in decls:
+		match decl:
+			HeapRecordDecl(record_decl):
+				if record_decl.name == name:
+					result = Some(record_decl)
+			ValueRecordDecl(record_decl):
+				void
 			FunctionDecl(func_info):
 				void
 			GlobalDecl(global):
@@ -94,6 +172,8 @@ private pure func find_union_decl(decls: List[CoreDecl], name: String) -> Option
 			UnionDecl(union_decl):
 				if union_decl.name == name:
 					result = Some(union_decl)
+			HeapRecordDecl(record_decl):
+				void
 			ValueRecordDecl(record_decl):
 				void
 			FunctionDecl(func_info):
@@ -152,6 +232,26 @@ private pure func order_value_record_fields(
 		None
 
 
+private pure func order_heap_record_fields(
+	record_decl: CoreHeapRecordDecl,
+	fields: List[CoreRecordFieldValue],
+) -> Option[List[CoreRecordFieldValue]]:
+	var ordered: List[CoreRecordFieldValue] = []
+	var found_all_fields: Bool = True
+
+	for field_decl in record_decl.fields:
+		match find_record_field(fields, field_decl.name):
+			Some(field):
+				ordered = ordered.append(field)
+			None:
+				found_all_fields = False
+
+	if found_all_fields and ordered.length() == fields.length():
+		Some(ordered)
+	else:
+		None
+
+
 private pure func prepare_exprs(decls: List[CoreDecl], exprs: List[CoreExpr]) -> List[CoreExpr]:
 	var prepared: List[CoreExpr] = []
 
@@ -191,6 +291,14 @@ private pure func prepare_boxed_storage_value(
 	}
 
 
+private pure func prepare_box_op(decls: List[CoreDecl], box: CoreBoxOp) -> CoreBoxOp:
+	{
+		kind = box.kind,
+		value = prepare_expr(decls, box.value),
+		source_type = box.source_type
+	}
+
+
 private pure func prepare_boxed_storage_values(
 	decls: List[CoreDecl],
 	values: List[CoreBoxedStorageValue],
@@ -201,6 +309,40 @@ private pure func prepare_boxed_storage_values(
 		prepared = prepared.append(prepare_boxed_storage_value(decls, value))
 
 	prepared
+
+
+private pure func prepare_dict_entry(decls: List[CoreDecl], entry: CoreDictEntry) -> CoreDictEntry:
+	{
+		key = prepare_boxed_storage_value(decls, entry.key),
+		value = prepare_boxed_storage_value(decls, entry.value)
+	}
+
+
+private pure func prepare_dict_entries(
+	decls: List[CoreDecl],
+	entries: List[CoreDictEntry],
+) -> List[CoreDictEntry]:
+	var prepared: List[CoreDictEntry] = []
+
+	for entry in entries:
+		prepared = prepared.append(prepare_dict_entry(decls, entry))
+
+	prepared
+
+
+private pure func prepare_dict_construct(
+	decls: List[CoreDecl],
+	construct: CoreDictConstruct,
+) -> CoreDictConstruct:
+	{
+		constructor = construct.constructor,
+		entries = prepare_dict_entries(decls, construct.entries),
+		value_needs_release = construct.value_needs_release
+	}
+
+
+private pure func prepare_set_alloc(alloc: CoreSetAlloc) -> CoreSetAlloc:
+	alloc
 
 
 private pure func prepare_list_construct(
@@ -214,10 +356,160 @@ private pure func prepare_list_construct(
 	}
 
 
+private pure func prepare_list_alloc(decls: List[CoreDecl], alloc: CoreListAlloc) -> CoreListAlloc:
+	{
+		layout = alloc.layout,
+		capacity = prepare_expr(decls, alloc.capacity),
+		elem_needs_release = alloc.elem_needs_release
+	}
+
+
+private pure func prepare_list_get(decls: List[CoreDecl], get: CoreListGet) -> CoreListGet:
+	{
+		layout = get.layout,
+		list = prepare_expr(decls, get.list),
+		index = prepare_expr(decls, get.index),
+		bounds = get.bounds
+	}
+
+
+private pure func prepare_list_handoff(
+	decls: List[CoreDecl],
+	handoff: CoreListHandoff,
+) -> CoreListHandoff:
+	{
+		mode = handoff.mode,
+		layout = handoff.layout,
+		elem_needs_release = handoff.elem_needs_release,
+		source = prepare_expr(decls, handoff.source),
+		source_var = handoff.source_var,
+		source_type = handoff.source_type,
+		result_type = handoff.result_type,
+		capacity = prepare_expr(decls, handoff.capacity),
+		result_var = handoff.result_var,
+		len_var = handoff.len_var,
+		out_var = handoff.out_var,
+		body = prepare_expr(decls, handoff.body),
+		write_order = handoff.write_order
+	}
+
+
+private pure func prepare_list_handoff_set_source_slot(
+	decls: List[CoreDecl],
+	slot: CoreListHandoffSetSourceSlot,
+) -> CoreListHandoffSetSourceSlot:
+	{
+		result = prepare_expr(decls, slot.result),
+		out_index = prepare_expr(decls, slot.out_index),
+		source = prepare_expr(decls, slot.source),
+		source_index = prepare_expr(decls, slot.source_index)
+	}
+
+
+private pure func prepare_string_byte_read(
+	decls: List[CoreDecl],
+	read: CoreStringByteRead,
+) -> CoreStringByteRead:
+	{
+		source = prepare_expr(decls, read.source),
+		index = prepare_expr(decls, read.index)
+	}
+
+
+private pure func prepare_string_byte_write(
+	decls: List[CoreDecl],
+	write: CoreStringByteWrite,
+) -> CoreStringByteWrite:
+	{
+		target = prepare_expr(decls, write.target),
+		index = prepare_expr(decls, write.index),
+		byte = prepare_expr(decls, write.byte)
+	}
+
+
+private pure func prepare_string_byte_copy(
+	decls: List[CoreDecl],
+	copy: CoreStringByteCopy,
+) -> CoreStringByteCopy:
+	{
+		dst = prepare_expr(decls, copy.dst),
+		dst_pos = prepare_expr(decls, copy.dst_pos),
+		src = prepare_expr(decls, copy.src),
+		src_pos = prepare_expr(decls, copy.src_pos),
+		len = prepare_expr(decls, copy.len)
+	}
+
+
+private pure func prepare_tensor_raw_read(
+	decls: List[CoreDecl],
+	read: CoreTensorRawRead,
+) -> CoreTensorRawRead:
+	{
+		view = read.view,
+		kind = read.kind,
+		index = prepare_expr(decls, read.index)
+	}
+
+
+private pure func prepare_tensor_raw_write(
+	decls: List[CoreDecl],
+	write: CoreTensorRawWrite,
+) -> CoreTensorRawWrite:
+	{
+		view = write.view,
+		kind = write.kind,
+		index = prepare_expr(decls, write.index),
+		value = prepare_expr(decls, write.value)
+	}
+
+
+private pure func prepare_tensor_raw_view_binding(
+	decls: List[CoreDecl],
+	binding: CoreTensorRawViewBinding,
+) -> CoreTensorRawViewBinding:
+	{
+		variable = binding.variable,
+		kind = binding.kind,
+		source = prepare_expr(decls, binding.source)
+	}
+
+
+private pure func prepare_string_set_len(
+	decls: List[CoreDecl],
+	set_len: CoreStringSetLen,
+) -> CoreStringSetLen:
+	{
+		target = prepare_expr(decls, set_len.target),
+		len = prepare_expr(decls, set_len.len)
+	}
+
+
+private pure func prepare_list_set(decls: List[CoreDecl], set: CoreListSet) -> CoreListSet:
+	{
+		layout = set.layout,
+		list = prepare_expr(decls, set.list),
+		index = prepare_expr(decls, set.index),
+		value = prepare_boxed_storage_value(decls, set.value),
+		value_is_stack_result = set.value_is_stack_result
+	}
+
+
+private pure func prepare_list_retain(
+	decls: List[CoreDecl],
+	retain: CoreListRetain,
+) -> CoreListRetain:
+	{
+		list = prepare_expr(decls, retain.list),
+		value = prepare_boxed_storage_value(decls, retain.value)
+	}
+
+
 pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
-			if name == "Int":
+			if args.length() != 0:
+				False
+			else if name == "Int":
 				True
 			else if name == "Int8":
 				True
@@ -245,6 +537,8 @@ pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 		ValueRecordType(name):
 			False
+		HeapRecordType(name):
+			False
 		UnionType(name):
 			False
 		RangeType:
@@ -253,11 +547,183 @@ pure func is_primitive_tuple_slot_type(typ: CoreType) -> Bool:
 			False
 
 
-private pure func primitive_tuple_elements(
+private pure func is_managed_pointer_tuple_slot_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			if name == "String" and args.length() == 0:
+				True
+			else if name == "Bytes" and args.length() == 0:
+				True
+			else if name == "Fixed" and args.length() == 0:
+				True
+			else if name == "Closure" and args.length() == 0:
+				True
+			else if name == "List" and args.length() == 1:
+				True
+			else if name == "Dict" and args.length() == 2:
+				True
+			else:
+				name == "Set" and args.length() == 1
+		HeapRecordType(name):
+			False
+		UnionType(name):
+			False
+		TupleType(items):
+			True
+		VoidType:
+			False
+		EnumType(name):
+			False
+		ValueRecordType(name):
+			False
+		RangeType:
+			False
+
+
+private pure func tuple_slot_needs_release(typ: CoreType) -> Bool:
+	is_managed_pointer_tuple_slot_type(typ)
+
+
+private pure func int_power_of_two(exponent: Int) -> Int:
+	var result: Int = 1
+	var index: Int = 0
+
+	while index < exponent:
+		result = result * 2
+		index += 1
+
+	result
+
+
+private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
+	match expr:
+		LiteralExpr(literal, typ, loc):
+			match literal:
+				StringLiteral(value):
+					True
+				IntLiteral(value):
+					False
+				FloatLiteral(value):
+					False
+				BoolLiteral(value):
+					False
+				CharLiteral(value):
+					False
+		VarExpr(variable, typ, loc):
+			True
+		FieldExpr(expr_value, field_name, typ, loc):
+			True
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			True
+		UnboxExpr(unbox_kind, expr_value, typ, loc):
+			True
+		ListGetExpr(get, typ, loc):
+			True
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		VoidExpr(typ, loc):
+			False
+		CallExpr(kind, callee, args, typ, loc):
+			False
+		BinaryExpr(op, left, right, typ, loc):
+			False
+		UnaryExpr(op, expr_value, typ, loc):
+			False
+		LogicalExpr(op, left, right, typ, loc):
+			False
+		AssignExpr(variable, rhs, typ, loc):
+			False
+		CastExpr(expr_value, typ, loc):
+			False
+		BoxExpr(box, typ, loc):
+			False
+		TupleExpr(items, typ, loc):
+			False
+		TupleConstructExpr(tuple_construct, typ, loc):
+			False
+		ClosureCreateExpr(closure, typ, loc):
+			False
+		ListConstructExpr(construct, typ, loc):
+			False
+		ListAllocExpr(alloc, typ, loc):
+			False
+		ListHandoffExpr(handoff, typ, loc):
+			False
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			False
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			False
+		ListRetainExpr(retain, typ, loc):
+			False
+		ListSetExpr(set, typ, loc):
+			False
+		StringByteReadExpr(read, typ, loc):
+			False
+		StringByteWriteExpr(write, typ, loc):
+			False
+		StringByteCopyExpr(copy, typ, loc):
+			False
+		StringSetLenExpr(set_len, typ, loc):
+			False
+		TensorRawReadExpr(read, typ, loc):
+			False
+		TensorRawWriteExpr(write, typ, loc):
+			False
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			False
+		DictConstructExpr(construct, typ, loc):
+			False
+		SetAllocExpr(alloc, typ, loc):
+			False
+		RecordExpr(fields, typ, loc):
+			False
+		RecordConstructExpr(type_name, fields, typ, loc):
+			False
+		UnionConstructExpr(construct, typ, loc):
+			False
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			False
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			False
+		LetExpr(name, is_mutable, typ, rhs, body):
+			False
+		SeqExpr(first, second):
+			False
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			False
+		WhileExpr(cond, body, typ, loc):
+			False
+		ForRangeExpr(binder, start, end, body, typ, loc):
+			False
+		ForListExpr(loop, typ, loc):
+			False
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		RangeExpr(start, end, typ, loc):
+			False
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			False
+		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
+			False
+		ResourceScopeExpr(scope, typ, loc):
+			False
+		ResourceCleanupExitExpr(exit, typ, loc):
+			False
+		TailrecLoopExpr(params, return_type, body, loc):
+			False
+		TailrecRecurExpr(args, typ, loc):
+			False
+
+
+private pure func prepared_tuple_literal(
 	items: List[CoreExpr],
 	item_types: List[CoreType],
-) -> Option[List[CoreTupleElement]]:
+) -> Option[PreparedTupleLiteral]:
 	var elements: List[CoreTupleElement] = []
+	var release_mask: Int = 0
+	var retain_mask: Int = 0
 	var failed: Bool = False
 	var index: Int = 0
 
@@ -265,10 +731,38 @@ private pure func primitive_tuple_elements(
 		if not failed:
 			match item_types.get(index):
 				Some(item_type):
-					if is_primitive_tuple_slot_type(item_type):
-						elements = elements.append(TuplePrimElement(item))
-					else:
-						failed = True
+					match item_type:
+						VoidType:
+							elements = elements.append(TupleVoidElement)
+						NamedType(name, args):
+							if is_primitive_tuple_slot_type(item_type):
+								elements = elements.append(TuplePrimElement(item))
+							else if is_managed_pointer_tuple_slot_type(item_type):
+								elements = elements.append(TuplePointerElement(item))
+								if tuple_slot_needs_release(item_type):
+									release_mask += int_power_of_two(index)
+								if tuple_pointer_expr_needs_retain(item):
+									retain_mask += int_power_of_two(index)
+							else:
+								failed = True
+						TupleType(items):
+							if is_managed_pointer_tuple_slot_type(item_type):
+								elements = elements.append(TuplePointerElement(item))
+								release_mask += int_power_of_two(index)
+								if tuple_pointer_expr_needs_retain(item):
+									retain_mask += int_power_of_two(index)
+							else:
+								failed = True
+						HeapRecordType(name):
+							failed = True
+						UnionType(name):
+							failed = True
+						EnumType(name):
+							failed = True
+						ValueRecordType(name):
+							failed = True
+						RangeType:
+							failed = True
 				None:
 					failed = True
 
@@ -277,7 +771,11 @@ private pure func primitive_tuple_elements(
 	if failed or index != item_types.length():
 		None
 	else:
-		Some(elements)
+		Some({
+			elements = elements,
+			release_mask = release_mask,
+			retain_mask = retain_mask
+		})
 
 
 private pure func prepare_tuple_expr(
@@ -290,16 +788,26 @@ private pure func prepare_tuple_expr(
 
 	match typ:
 		TupleType(item_types):
-			match primitive_tuple_elements(prepared_items, item_types):
-				Some(elements):
-					TupleConstructExpr(elements, typ, loc)
-				None:
-					TupleExpr(prepared_items, typ, loc)
+				match prepared_tuple_literal(prepared_items, item_types):
+					Some(prepared):
+						TupleConstructExpr(
+							{
+								elements = prepared.elements,
+								release_mask = prepared.release_mask,
+								retain_mask = prepared.retain_mask
+							},
+							typ,
+							loc,
+						)
+					None:
+						TupleExpr(prepared_items, typ, loc)
 		NamedType(name, args):
 			TupleExpr(prepared_items, typ, loc)
 		EnumType(name):
 			TupleExpr(prepared_items, typ, loc)
 		ValueRecordType(name):
+			TupleExpr(prepared_items, typ, loc)
+		HeapRecordType(name):
 			TupleExpr(prepared_items, typ, loc)
 		UnionType(name):
 			TupleExpr(prepared_items, typ, loc)
@@ -345,6 +853,16 @@ private pure func prepare_record_expr(
 					RecordExpr(prepared_fields, typ, loc)
 		NamedType(name, args):
 			RecordExpr(prepared_fields, typ, loc)
+		HeapRecordType(name):
+			match find_heap_record_decl(decls, name):
+				Some(record_decl):
+					match order_heap_record_fields(record_decl, prepared_fields):
+						Some(ordered_fields):
+							RecordConstructExpr(name, ordered_fields, typ, loc)
+						None:
+							RecordExpr(prepared_fields, typ, loc)
+				None:
+					RecordExpr(prepared_fields, typ, loc)
 		EnumType(name):
 			RecordExpr(prepared_fields, typ, loc)
 		UnionType(name):
@@ -357,54 +875,203 @@ private pure func prepare_record_expr(
 			RecordExpr(prepared_fields, typ, loc)
 
 
+private pure func stack_option_c_type(payload: CoreType) -> Option[String]:
+	match payload:
+		VoidType:
+			Some("blorp_StackOption_Void")
+		NamedType(name, args):
+			match args:
+				[]:
+					if name == "Int":
+						Some("blorp_StackOption_Int")
+					else if name == "Int8":
+						Some("blorp_StackOption_Int8")
+					else if name == "Int16":
+						Some("blorp_StackOption_Int16")
+					else if name == "Int32":
+						Some("blorp_StackOption_Int32")
+					else if name == "Int64":
+						Some("blorp_StackOption_Int64")
+					else if name == "UInt8":
+						Some("blorp_StackOption_UInt8")
+					else if name == "UInt16":
+						Some("blorp_StackOption_UInt16")
+					else if name == "UInt32":
+						Some("blorp_StackOption_UInt32")
+					else if name == "UInt64":
+						Some("blorp_StackOption_UInt64")
+					else if name == "Float":
+						Some("blorp_StackOption_Float")
+					else if name == "Float32":
+						Some("blorp_StackOption_Float32")
+					else if name == "Float16":
+						Some("blorp_StackOption_Float16")
+					else if name == "Bool":
+						Some("blorp_StackOption_Bool")
+					else if name == "Char":
+						Some("blorp_StackOption_Char")
+					else:
+						None
+				[first, ...rest]:
+					None
+		EnumType(name):
+			None
+		ValueRecordType(name):
+			None
+		HeapRecordType(name):
+			None
+		UnionType(name):
+			None
+		RangeType:
+			None
+		TupleType(items):
+			None
+
+
+private pure func stack_option_none_value(payload: CoreType) -> String:
+	match payload:
+		NamedType(name, args):
+			match args:
+				[]:
+					if name == "Int":
+						"0L"
+					else:
+						"0"
+				[first, ...rest]:
+					"0"
+		VoidType:
+			"0"
+		EnumType(name):
+			"0"
+		ValueRecordType(name):
+			"0"
+		HeapRecordType(name):
+			"0"
+		UnionType(name):
+			"0"
+		RangeType:
+			"0"
+		TupleType(items):
+			"0"
+
+
+private pure func stack_option_representation(
+	payload: CoreType,
+	tag: Int,
+) -> Option[CoreStackOptionRepresentation]:
+	match stack_option_c_type(payload):
+		Some(option_type):
+			Some({
+				option_type = option_type,
+				tag = tag,
+				none_value = stack_option_none_value(payload),
+			})
+		None:
+			None
+
+
+private pure func prepare_stack_option_construct(
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	payload: CoreType,
+) -> Option[CoreUnionConstruct]:
+	match kind:
+		UserCall(constructor_name, def_id):
+			if constructor_name == "Some" and args.length() == 1:
+				match stack_option_representation(payload, STACK_OPTION_SOME_TAG):
+					Some(representation):
+						Some({
+							type_name = "Option",
+							constructor_name = "Some",
+							constructor_c_name = "Some",
+							representation = StackOptionRepresentation(representation),
+							args = args,
+						})
+					None:
+						None
+			else if constructor_name == "None" and args.length() == 0:
+				match stack_option_representation(payload, STACK_OPTION_NONE_TAG):
+					Some(representation):
+						Some({
+							type_name = "Option",
+							constructor_name = "None",
+							constructor_c_name = "None",
+							representation = StackOptionRepresentation(representation),
+							args = [],
+						})
+					None:
+						None
+			else:
+				None
+		ForeignCall(name):
+			None
+		BuiltinCall(name):
+			None
+		IntrinsicCall(name):
+			None
+		ClosureCall:
+			None
+
+
 private pure func prepare_union_construct(
 	decls: List[CoreDecl],
 	kind: CoreCallKind,
 	args: List[CoreExpr],
 	typ: CoreType,
 ) -> Option[CoreUnionConstruct]:
-	match typ:
-		UnionType(type_name):
-			match kind:
-				UserCall(constructor_name, def_id):
-					match find_union_decl(decls, type_name):
-						Some(union_decl):
-							match find_union_variant(union_decl, constructor_name):
-								Some(variant):
-									if variant.fields.length() == args.length():
-										Some({
-											type_name = type_name,
-											constructor_name = constructor_name,
-											constructor_c_name = variant.c_name,
-											representation = GenericUnionRepresentation,
-											args = args,
-										})
-									else:
-										None
-								None:
-									None
-						None:
-							None
-				ForeignCall(name):
-					None
-				BuiltinCall(name):
-					None
-				IntrinsicCall(name):
-					None
-				ClosureCall:
-					None
-		NamedType(name, type_args):
-			None
-		EnumType(name):
-			None
-		ValueRecordType(name):
-			None
-		RangeType:
-			None
-		TupleType(items):
-			None
-		VoidType:
-			None
+    match typ:
+        UnionType(type_name):
+            match kind:
+                UserCall(constructor_name, def_id):
+                    match find_union_decl(decls, type_name):
+                        Some(union_decl):
+                            match find_union_variant(union_decl, constructor_name):
+                                Some(variant):
+                                    if variant.fields.length() == args.length():
+                                        Some({
+                                            type_name = type_name,
+                                            constructor_name = constructor_name,
+                                            constructor_c_name = variant.c_name,
+                                            representation = GenericUnionRepresentation,
+                                            args = args,
+                                        })
+                                    else:
+                                        None
+                                None:
+                                    None
+                        None:
+                            None
+                ForeignCall(name):
+                    None
+                BuiltinCall(name):
+                    None
+                IntrinsicCall(name):
+                    None
+                ClosureCall:
+                    None
+        NamedType(name, type_args):
+            if name == "Option":
+                match type_args:
+                    [payload]:
+                        prepare_stack_option_construct(kind, args, payload)
+                    []:
+                        None
+                    [first, second, ...rest]:
+                        None
+            else:
+                None
+        EnumType(name):
+            None
+        ValueRecordType(name):
+            None
+        HeapRecordType(name):
+            None
+        RangeType:
+            None
+        TupleType(items):
+            None
+        VoidType:
+            None
 
 
 private pure func prepare_literal_match_cases(
@@ -442,7 +1109,8 @@ private pure func prepare_constructor_match_cases(
 	for match_case in cases:
 		prepared = prepared.append({
 			constructor = match_case.constructor,
-			constructor_c_name = match_case.constructor_c_name,
+			test = match_case.test,
+			bindings = match_case.bindings,
 			body = prepare_expr(decls, match_case.body),
 		})
 
@@ -515,6 +1183,19 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				typ,
 				loc,
 			)
+		BoxExpr(box, typ, loc):
+			BoxExpr(
+				prepare_box_op(decls, box),
+				typ,
+				loc,
+			)
+		UnboxExpr(unbox_kind, expr_value, typ, loc):
+			UnboxExpr(
+				unbox_kind,
+				prepare_expr(decls, expr_value),
+				typ,
+				loc,
+			)
 		FieldExpr(expr_value, field_name, typ, loc):
 			FieldExpr(
 				prepare_expr(decls, expr_value),
@@ -531,15 +1212,114 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 			)
 		TupleExpr(items, typ, loc):
 			prepare_tuple_expr(decls, items, typ, loc)
-		TupleConstructExpr(elements, typ, loc):
+		TupleConstructExpr(tuple_construct, typ, loc):
 			TupleConstructExpr(
-				prepare_tuple_elements(decls, elements),
+				{
+					elements = prepare_tuple_elements(decls, tuple_construct.elements),
+					release_mask = tuple_construct.release_mask,
+					retain_mask = tuple_construct.retain_mask
+				},
 				typ,
 				loc,
 			)
+		ClosureCreateExpr(closure, typ, loc):
+			ClosureCreateExpr(closure, typ, loc)
 		ListConstructExpr(construct, typ, loc):
 			ListConstructExpr(
 				prepare_list_construct(decls, construct),
+				typ,
+				loc,
+			)
+		ListAllocExpr(alloc, typ, loc):
+			ListAllocExpr(
+				prepare_list_alloc(decls, alloc),
+				typ,
+				loc,
+			)
+		ListGetExpr(get, typ, loc):
+			ListGetExpr(
+				prepare_list_get(decls, get),
+				typ,
+				loc,
+			)
+		ListHandoffExpr(handoff, typ, loc):
+			ListHandoffExpr(
+				prepare_list_handoff(decls, handoff),
+				typ,
+				loc,
+			)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			ListHandoffSetOwnedExpr(
+				prepare_list_set(decls, set),
+				typ,
+				loc,
+			)
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			ListHandoffSetSourceSlotExpr(
+				prepare_list_handoff_set_source_slot(decls, slot),
+				typ,
+				loc,
+			)
+		StringByteReadExpr(read, typ, loc):
+			StringByteReadExpr(
+				prepare_string_byte_read(decls, read),
+				typ,
+				loc,
+			)
+		StringByteWriteExpr(write, typ, loc):
+			StringByteWriteExpr(
+				prepare_string_byte_write(decls, write),
+				typ,
+				loc,
+			)
+		StringByteCopyExpr(copy, typ, loc):
+			StringByteCopyExpr(
+				prepare_string_byte_copy(decls, copy),
+				typ,
+				loc,
+			)
+		StringSetLenExpr(set_len, typ, loc):
+			StringSetLenExpr(
+				prepare_string_set_len(decls, set_len),
+				typ,
+				loc,
+			)
+		TensorRawReadExpr(read, typ, loc):
+			TensorRawReadExpr(
+				prepare_tensor_raw_read(decls, read),
+				typ,
+				loc,
+			)
+		TensorRawWriteExpr(write, typ, loc):
+			TensorRawWriteExpr(
+				prepare_tensor_raw_write(decls, write),
+				typ,
+				loc,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			TensorRawViewLetExpr(
+				prepare_tensor_raw_view_binding(decls, binding),
+				prepare_expr(decls, body),
+				typ,
+				loc,
+			)
+		DictConstructExpr(construct, typ, loc):
+			DictConstructExpr(
+				prepare_dict_construct(decls, construct),
+				typ,
+				loc,
+			)
+		SetAllocExpr(alloc, typ, loc):
+			SetAllocExpr(prepare_set_alloc(alloc), typ, loc)
+		ListRetainExpr(retain, typ, loc):
+			ListRetainExpr(
+				prepare_list_retain(decls, retain),
+				typ,
+				loc,
+			)
+		ListSetExpr(set, typ, loc):
+			ListSetExpr(
+				prepare_list_set(decls, set),
 				typ,
 				loc,
 			)
@@ -649,6 +1429,17 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				typ,
 				loc,
 			)
+		ForListExpr(for_list, typ, loc):
+			ForListExpr(
+				{
+					binder = for_list.binder,
+					layout = for_list.layout,
+					iterable = prepare_expr(decls, for_list.iterable),
+					body = prepare_expr(decls, for_list.body)
+				},
+				typ,
+				loc,
+			)
 		RangeExpr(start, end_value, typ, loc):
 			RangeExpr(
 				prepare_expr(decls, start),
@@ -706,6 +1497,8 @@ private pure func prepare_decl(decls: List[CoreDecl], decl: CoreDecl) -> CoreDec
 			UnionDecl(union_decl)
 		ValueRecordDecl(record_decl):
 			ValueRecordDecl(record_decl)
+		HeapRecordDecl(record_decl):
+			HeapRecordDecl(record_decl)
 
 
 pure func prepare_program(program: CoreProgram) -> CoreProgram:
