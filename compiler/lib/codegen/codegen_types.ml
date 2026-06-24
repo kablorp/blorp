@@ -324,6 +324,33 @@ type union_payload_storage =
   | ErasedUnionPayloadStorage
   | TypedUnionPayloadStorage
 
+let source_union_typed_payload_field_supported ty =
+  match normalize_type ty with
+  | TyNamed
+      ( ( "Int" | "Int8" | "Int16" | "Int32" | "Int64" | "Int128" | "UInt8"
+        | "UInt16" | "UInt32" | "UInt64" | "UInt128" | "Float" | "Float32"
+        | "Float16" | "Bool" | "Char" ),
+        [] ) ->
+      true
+  | TyNamed ("Fixed", []) -> true
+  | TyNamed ("Range", []) -> true
+  | _ -> false
+
+let source_union_typed_payload_supported (decl : type_decl) =
+  List.for_all
+    (fun (variant : variant) ->
+      List.for_all source_union_typed_payload_field_supported
+        variant.variant_fields)
+    decl.type_variants
+
+let source_union_payload_storage (decl : type_decl) =
+  if
+    decl.type_params = []
+    && not (Types.is_runtime_erased_payload_union_type_name decl.type_name)
+    && source_union_typed_payload_supported decl
+  then TypedUnionPayloadStorage
+  else ErasedUnionPayloadStorage
+
 type managed_destructor =
   | ArcReleaseOnly
       (** The value has a blorp ARC header, but no type-specific nested
@@ -355,10 +382,10 @@ type registry = {
         objects. Earlier Core passes use this table to recognize constructor
         calls without guessing from source names. *)
   union_payload_storage : (string, union_payload_storage) Hashtbl.t;
-      (** C storage policy for non-enum union payload fields. Source unions
-        default to erased [void*] payload slots. Monomorphized concrete generic
-        unions can opt into typed payload slots once their variant field types
-        are fully concrete. *)
+      (** C storage policy for non-enum union payload fields. Concrete source
+        unions and monomorphized concrete generic unions use typed payload
+        slots. Generic declarations and explicitly runtime-erased unions keep
+        erased [void*] payload slots. *)
   managed_types : (string, managed_type_info) Hashtbl.t;
       (** Heap-allocated user types with ARC headers: records and non-enum
         unions. The value records the type's release/destructor policy, so

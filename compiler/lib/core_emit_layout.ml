@@ -13,9 +13,17 @@ let list_storage_layout_of_type (ctx : Core_emit_context.t)
 let tensor_element_storage (ctx : Core_emit_context.t) elem_ty =
   Core_layout_type.tensor_element_storage ~reg:ctx.reg elem_ty
 
+let tensor_element_storage_for_reg ~reg elem_ty =
+  Core_layout_type.tensor_element_storage ~reg elem_ty
+
 let tensor_storage_layout_of_type (ctx : Core_emit_context.t)
     (tensor_ty : Ast.type_expr) (loc : Ast.loc) : Core.tensor_storage_layout =
   Core_layout_type.tensor_storage_layout_of_type ~reg:ctx.reg tensor_ty loc
+
+let tensor_storage_layout_of_type_for_reg ~reg tensor_ty loc =
+  Core_layout_type.tensor_storage_layout_of_type ~reg tensor_ty loc
+
+let c_type_for_reg ~reg ty = Core_layout_type.c_type ~reg ty
 
 let tensor_storage_layout_of_elem (ctx : Core_emit_context.t)
     (elem_ty : Ast.type_expr) (loc : Ast.loc) : Core.tensor_storage_layout =

@@ -96,6 +96,24 @@ let supported_channel_attempt_builtins =
 let supported_tensor_runtime_builtins =
   StringSet.of_list
     [
+      "blorp_tensor_add_scaled_f32_cow";
+      "blorp_tensor_add_scaled_f64_cow";
+      "blorp_tensor_matrix_vector_multiply_float";
+      "blorp_tensor_matrix_vector_multiply_float16";
+      "blorp_tensor_matrix_vector_multiply_float32";
+      "blorp_tensor_matrix_vector_multiply_int";
+      "blorp_tensor_outer_float";
+      "blorp_tensor_outer_float16";
+      "blorp_tensor_outer_float32";
+      "blorp_tensor_outer_int";
+      "blorp_tensor_transposed_matrix_vector_multiply_float";
+      "blorp_tensor_transposed_matrix_vector_multiply_float16";
+      "blorp_tensor_transposed_matrix_vector_multiply_float32";
+      "blorp_tensor_transposed_matrix_vector_multiply_int";
+      "blorp_vector_new";
+      "blorp_vector_new_f32";
+      "blorp_vector_new_f64";
+      "blorp_vector_new_i64";
       "blorp_simd_vector_add_f32";
       "blorp_simd_vector_add_f64";
       "blorp_simd_vector_div_f32";
@@ -464,10 +482,12 @@ let supported_primitive_runtime_builtins =
       "blorp_stream_for_each";
       "blorp_stream_from_list";
       "blorp_stream_from_range";
+      "blorp_stream_find_nullable";
       "blorp_stream_map";
       "blorp_stream_repeat";
       "blorp_stream_take";
       "blorp_stream_take_while";
+      "blorp_stream_unfold";
       "blorp_test_cancel_after_parked";
       "blorp_test_cooperative_checkpoint_probe";
       "blorp_test_current_timer_wait_install_probe";
@@ -484,6 +504,7 @@ let supported_primitive_runtime_builtins =
       "blorp_string_concat";
       "blorp_string_eq";
       "blorp_vector_get_nullable";
+      "blorp_tls_close_session";
       "blorp_tcp_close_listener";
       "blorp_tcp_close_stream";
       "blorp_tcp_connections_continue_on_error_raw";
@@ -509,6 +530,7 @@ let supported_primitive_runtime_builtins =
       "blorp_udp_close_socket";
       "blorp_url_decode";
       "blorp_url_encode";
+      "blorp_websocket_close_session";
       "blorp_write_bytes";
       "blorp_write_file";
       "blorp_yield_now";
@@ -516,6 +538,22 @@ let supported_primitive_runtime_builtins =
 
 let sized_integer_conversion_builtin_supported name =
   StringSet.mem name supported_sized_integer_conversion_builtins
+
+let list_parallel_runtime_builtin_supported name =
+  match name with
+  | "blorp_map_parallel" | "blorp_map_parallel_with" | "blorp_zip_parallel"
+  | "blorp_zip_parallel_with" ->
+      true
+  | _ -> String.starts_with ~prefix:"blorp_filter_map_parallel" name
+
+let tensor_parallel_runtime_builtin_supported = function
+  | "blorp_matrix_map" | "blorp_matrix_map_indexed" | "blorp_matrix_zip_map"
+  | "blorp_mmap_flat_indexed_parallel" | "blorp_mmap_indexed_parallel"
+  | "blorp_mmap_parallel" | "blorp_mzip_indexed_parallel"
+  | "blorp_mzip_parallel" | "blorp_vmap_parallel"
+  | "blorp_vmap_indexed_parallel" | "blorp_vzip_parallel" ->
+      true
+  | _ -> false
 
 let primitive_runtime_builtin_supported name =
   StringSet.mem name supported_primitive_runtime_builtins
@@ -530,6 +568,7 @@ let direct_builtin_supported name =
   || StringSet.mem name supported_tensor_runtime_builtins
   || StringSet.mem name supported_raw_tensor_fill_builtins
   || StringSet.mem name supported_raw_tensor_access_builtins
+  || list_parallel_runtime_builtin_supported name
   || generated_enum_vector_to_string_builtin_supported name
   || primitive_runtime_builtin_supported name
   || Option.is_some (Operation_result_metadata.find_fallible_stream_source name)
@@ -563,6 +602,34 @@ let release_policy_tag ~reg (ty : Ast.type_expr) =
 
 let release_policy_json ~reg ty = str (release_policy_tag ~reg ty)
 
+let trait_method_c_name_for_type path trait_name method_name ty =
+  match Codegen_types.type_key_for_impl ty with
+  | Some type_name ->
+      Ok (Printf.sprintf "%s_%s_%s" trait_name method_name type_name)
+  | None ->
+      unsupported path
+        (Printf.sprintf "trait method %s.%s for type %s" trait_name
+           method_name (Types.type_to_string ty))
+
+let custom_hash_container_constructor_json ~reg path loc key_ty =
+  let* hash_fn =
+    trait_method_c_name_for_type (path ^ ".hash_fn") "Hashable" "hash" key_ty
+  in
+  let* equals_fn =
+    trait_method_c_name_for_type (path ^ ".equals_fn") "Equatable" "equals"
+      key_ty
+  in
+  Ok
+    (kind "custom"
+       [
+         ("hash_fn", str hash_fn);
+         ("equals_fn", str equals_fn);
+         ( "elem_needs_release",
+           bool
+             (Core_codegen_prepare.boxed_storage_needs_release ~reg key_ty loc)
+         );
+       ])
+
 let union_payload_storage_json storage =
   match storage with
   | Codegen_types.TypedUnionPayloadStorage -> str "typed"
@@ -579,10 +646,7 @@ let union_field_release_policy_tag ~reg payload_storage field_ty loc =
     ->
       "arc"
   | Codegen_types.ErasedUnionPayloadStorage ->
-      if
-        Core_layout_type.boxed_storage_requires_release_or_error
-          ~phase:Core_error.Emit ~reg field_ty loc
-      then "arc"
+      if Core_codegen_prepare.boxed_storage_needs_release ~reg field_ty loc then "arc"
       else "none"
 
 let union_field_release_policy_json ~reg payload_storage field_ty loc =
@@ -1571,6 +1635,126 @@ let operation_result_bridge_json ~reg path ~result_ty
                ("error", error);
              ])
 
+let fallible_stream_payload_accepts_type ~reg
+    (payload : Operation_result_metadata.fallible_stream_terminal_payload) ok_ty
+    =
+  match (payload, normalized_type ~reg ok_ty) with
+  | Operation_result_metadata.StreamPayloadList, Ast.TyNamed ("List", _) -> true
+  | Operation_result_metadata.StreamPayloadInt, Ast.TyNamed ("Int", []) -> true
+  | Operation_result_metadata.StreamPayloadBool, Ast.TyNamed ("Bool", []) -> true
+  | Operation_result_metadata.StreamPayloadOption, Ast.TyNamed ("Option", [ _ ])
+    ->
+      true
+  | Operation_result_metadata.StreamPayloadErased, _ -> true
+  | _ -> false
+
+let fallible_stream_terminal_payload_json ~reg loc ok_ty
+    (payload : Operation_result_metadata.fallible_stream_terminal_payload) =
+  match payload with
+  | Operation_result_metadata.StreamPayloadList ->
+      let layout =
+        Core_layout_type.list_storage_layout_of_type ~reg ok_ty loc
+      in
+      let storage_mode, elem_size =
+        Core_emit_blorp_prepared_backend.list_runtime_storage_args layout
+      in
+      Ok (kind "list" [ ("storage_mode", str storage_mode); ("elem_size", str elem_size) ])
+  | Operation_result_metadata.StreamPayloadErased -> Ok (kind "erased" [])
+  | Operation_result_metadata.StreamPayloadInt -> Ok (kind "int" [])
+  | Operation_result_metadata.StreamPayloadOption -> Ok (kind "option" [])
+  | Operation_result_metadata.StreamPayloadBool -> Ok (kind "bool" [])
+
+let fallible_stream_error_mapping_for_type path ~reg ~builtin_name err_ty =
+  match normalized_type ~reg err_ty with
+  | Ast.TyNamed (name, [])
+    when List.mem name
+           Operation_result_metadata.file_error_mapping.accepted_type_names ->
+      Ok
+        ( "BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE",
+          Operation_result_metadata.file_error_mapping,
+          name )
+  | Ast.TyNamed (name, [])
+    when List.mem name
+           Operation_result_metadata.udp_error_mapping.accepted_type_names ->
+      Ok
+        ( "BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_UDP",
+          Operation_result_metadata.udp_error_mapping,
+          name )
+  | Ast.TyNamed (name, [])
+    when List.mem name
+           Operation_result_metadata.tcp_error_mapping.accepted_type_names ->
+      Ok
+        ( "BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TCP",
+          Operation_result_metadata.tcp_error_mapping,
+          name )
+  | Ast.TyNamed (name, [])
+    when List.mem name
+           Operation_result_metadata.tls_error_mapping.accepted_type_names ->
+      Ok
+        ( "BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_TLS",
+          Operation_result_metadata.tls_error_mapping,
+          name )
+  | Ast.TyNamed (name, []) ->
+      unsupported path
+        (Printf.sprintf
+           "fallible stream terminal `%s` error payload has unsupported type `%s`"
+           builtin_name name)
+  | other ->
+      unsupported path
+        (Printf.sprintf
+           "fallible stream terminal `%s` error payload has unsupported type `%s`"
+           builtin_name (Types.type_to_string other))
+
+let fallible_stream_error_domain_json ~reg path ~builtin_name err_ty =
+  let* domain_tag, mapping, err_name =
+    fallible_stream_error_mapping_for_type path ~reg ~builtin_name err_ty
+  in
+  let* other_constructor_c_name =
+    constructor_c_name_for_operation_type ~reg (path ^ ".other_constructor")
+      ~builtin_name ~role:"fallible-stream error" err_name
+      mapping.Operation_result_metadata.other_constructor
+  in
+  let* cases =
+    operation_error_cases_json ~reg (path ^ ".cases") ~builtin_name ~err_name
+      mapping.Operation_result_metadata.cases
+  in
+  Ok
+    (obj
+       [
+         ("domain_tag", str domain_tag);
+         ( "other_constructor",
+           str mapping.Operation_result_metadata.other_constructor );
+         ("other_constructor_c_name", str other_constructor_c_name);
+         ("cases", cases);
+       ])
+
+let fallible_stream_terminal_bridge_json ~reg path ~result_ty ~loc
+    (terminal : Operation_result_metadata.fallible_stream_terminal) =
+  let* ok_ty, err_ty = result_payload_types path ~reg result_ty in
+  if not (fallible_stream_payload_accepts_type ~reg terminal.payload ok_ty) then
+    unsupported path
+      (Printf.sprintf
+         "fallible stream terminal `%s` success payload has unsupported type `%s`"
+         terminal.builtin_name
+         (Types.type_to_string (normalized_type ~reg ok_ty)))
+  else
+    let* payload =
+      fallible_stream_terminal_payload_json ~reg loc ok_ty terminal.payload
+    in
+    let* error_domain =
+      fallible_stream_error_domain_json ~reg (path ^ ".error_domain")
+        ~builtin_name:terminal.builtin_name err_ty
+    in
+    Ok
+      (obj
+         [
+           ("builtin_name", str terminal.builtin_name);
+           ("runtime_c_name", str terminal.runtime_c_name);
+           ("runtime_result_c_type", str terminal.runtime_result_c_type);
+           ("payload", payload);
+           ("error_domain", error_domain);
+         ])
+
 let is_option_type = function
   | Ast.TyNamed ("Option", [ _ ]) -> true
   | _ -> false
@@ -1611,12 +1795,79 @@ let list_to_string_callback_name function_names path list_ty =
         (Printf.sprintf "blorp_list_to_string_cb on non-List type %s"
            (Types.type_to_string other))
 
-let call_kind_json ~reg path ~result_ty (call_kind : Core.call_kind) =
+let foreign_copy_kind_json = function
+  | Core.ForeignStringCopy -> str "string"
+  | Core.ForeignBytesCopy -> str "bytes"
+
+let foreign_default_arg_policy_json = function
+  | Core.ForeignScalarByValue -> kind "scalar_by_value" []
+  | Core.ForeignDefensiveCopy copy_kind ->
+      kind "defensive_copy"
+        [ ("copy_kind", foreign_copy_kind_json copy_kind) ]
+
+let foreign_arg_passing_json = function
+  | Core.ForeignDefaultArgs policies ->
+      kind "default"
+        [ ("policies", arr (List.map foreign_default_arg_policy_json policies)) ]
+  | Core.ForeignBorrowArgs -> kind "borrow" []
+
+let tensor_alloc_runtime_builtin ~reg path (expr : Core.core) =
+  let layout =
+    Core_emit_layout.tensor_storage_layout_of_type_for_reg ~reg expr.ty expr.loc
+  in
+  if
+    Core.tensor_storage_layout_requires_release_or_error ~phase:Core_error.Emit
+      ~loc:expr.loc layout
+  then
+    unsupported path
+      "tensor_alloc for releasing tensor element layouts needs the typed Blorp \
+       tensor allocation JSON node"
+  else
+    match layout.tsl_slots with
+    | Core.TensorRawScalarStorage Core.TensorInt64Elements ->
+        Ok "blorp_vector_new_i64"
+    | Core.TensorRawScalarStorage Core.TensorFloat64Elements ->
+        Ok "blorp_vector_new_f64"
+    | Core.TensorRawScalarStorage Core.TensorFloat32Elements ->
+        Ok "blorp_vector_new_f32"
+    | Core.TensorWordStorage -> Ok "blorp_vector_new"
+    | Core.TensorPackedStorage _ | Core.TensorInlineStructStorage _
+    | Core.TensorBoxedStorage ->
+      unsupported path
+        "tensor_alloc for this tensor layout needs the typed Blorp tensor \
+         allocation JSON node"
+
+let tensor_parallel_raw_scalar_kind_json = function
+  | Core.TensorFloat64Elements -> str "float64"
+  | Core.TensorFloat32Elements -> str "float32"
+  | Core.TensorInt64Elements -> str "int64"
+
+let tensor_parallel_layout_json ~reg ~loc ty =
+  let layout =
+    Core_emit_layout.tensor_storage_layout_of_type_for_reg ~reg ty loc
+  in
+  match layout.tsl_slots with
+  | Core.TensorRawScalarStorage raw_kind ->
+      kind "raw_scalar"
+        [ ("raw_kind", tensor_parallel_raw_scalar_kind_json raw_kind) ]
+  | Core.TensorInlineStructStorage c_ty ->
+      kind "inline_struct" [ ("c_type", str c_ty) ]
+  | Core.TensorPackedStorage _ | Core.TensorWordStorage | Core.TensorBoxedStorage
+    ->
+      kind "pointer" []
+
+let call_kind_json ~reg path ~result_ty ~loc (call_kind : Core.call_kind) =
   match call_kind with
   | Core.CKUser (name, def_id) ->
       Ok
         (kind "user" [ ("name", str name); ("def_id", option_int_json def_id) ])
-  | Core.CKForeign foreign -> Ok (kind "foreign" [ ("name", str foreign.fc_c_name) ])
+  | Core.CKForeign foreign ->
+      Ok
+        (kind "foreign"
+           [
+             ("name", str foreign.fc_c_name);
+             ("arg_passing", foreign_arg_passing_json foreign.fc_arg_passing);
+           ])
   | Core.CKBuiltin name -> (
       match Operation_result_metadata.find_result_bridge name with
       | Some bridge ->
@@ -1624,25 +1875,42 @@ let call_kind_json ~reg path ~result_ty (call_kind : Core.call_kind) =
             operation_result_bridge_json ~reg (path ^ ".bridge") ~result_ty bridge
           in
           Ok (kind "operation_result" [ ("bridge", bridge_json) ])
-      | None when String.equal name "blorp_dict_get" && is_option_type result_ty
-        ->
-          Ok (kind "builtin" [ ("name", str name) ])
-      | None
-        when (String.equal name "blorp_vector_get_opt"
-             || String.equal name "blorp_matrix_get_opt")
-             && generated_stack_option_get_supported ~reg result_ty ->
-          Ok (kind "builtin" [ ("name", str name) ])
-      | None when channel_attempt_builtin_supported name ->
-          Ok (kind "builtin" [ ("name", str name) ])
-      | None when direct_builtin_supported name ->
-          Ok (kind "builtin" [ ("name", str name) ])
-      | None -> unsupported path ("builtin call " ^ name))
+      | None -> (
+          match Operation_result_metadata.find_fallible_stream_terminal name with
+          | Some terminal ->
+              let* bridge_json =
+                fallible_stream_terminal_bridge_json ~reg (path ^ ".bridge")
+                  ~result_ty ~loc terminal
+              in
+              Ok (kind "fallible_stream_terminal" [ ("bridge", bridge_json) ])
+          | None when String.equal name "blorp_dict_get" && is_option_type result_ty
+            ->
+              Ok (kind "builtin" [ ("name", str name) ])
+          | None
+            when (String.equal name "blorp_vector_get_opt"
+                 || String.equal name "blorp_matrix_get_opt")
+                 && generated_stack_option_get_supported ~reg result_ty ->
+              Ok (kind "builtin" [ ("name", str name) ])
+          | None when tensor_parallel_runtime_builtin_supported name ->
+              Ok
+                (kind "tensor_parallel"
+                   [
+                     ("name", str name);
+                     ( "layout",
+                       tensor_parallel_layout_json ~reg ~loc result_ty );
+                   ])
+          | None when channel_attempt_builtin_supported name ->
+              Ok (kind "builtin" [ ("name", str name) ])
+          | None when direct_builtin_supported name ->
+              Ok (kind "builtin" [ ("name", str name) ])
+          | None -> unsupported path ("builtin call " ^ name))
+      )
   | Core.CKIntrinsic name -> Ok (kind "intrinsic" [ ("name", str name) ])
   | Core.CKClosure -> Ok (kind "closure" [])
   | Core.CKUnknown -> unsupported path "unresolved call kind"
   | Core.CKSelectedDirect _ -> unsupported path "selected direct call kind"
 
-let call_kind_json_for_call ~function_names ~reg path ~result_ty call_kind
+let call_kind_json_for_call ~function_names ~reg path ~result_ty ~loc call_kind
     (args : Core.core list) =
   match (call_kind, args) with
   | Core.CKBuiltin "blorp_list_to_string_cb", [ list_arg ] ->
@@ -1651,7 +1919,7 @@ let call_kind_json_for_call ~function_names ~reg path ~result_ty call_kind
           list_arg.ty
       in
       Ok (kind "list_to_string" [ ("callback_name", str callback_name) ])
-  | _ -> call_kind_json ~reg path ~result_ty call_kind
+  | _ -> call_kind_json ~reg path ~result_ty ~loc call_kind
 
 let require_closure_create ~reg path (closure : Core.closure_create) =
   require_supported_closure_captures ~reg (path ^ ".captures") 0
@@ -1854,7 +2122,8 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
   | Core.CCall (Core.CKBuiltin name, _callee, value :: dims)
     when is_ranked_tensor_fill_factory_name name -> (
       let layout =
-        Core_layout_type.tensor_storage_layout_of_type ~reg expr.ty expr.loc
+        Core_emit_layout.tensor_storage_layout_of_type_for_reg ~reg expr.ty
+          expr.loc
       in
       match layout.tsl_slots with
       | Core.TensorRawScalarStorage raw_kind ->
@@ -1870,10 +2139,63 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
       | Core.TensorWordStorage | Core.TensorInlineStructStorage _
       | Core.TensorBoxedStorage ->
           unsupported path "non-raw tensor fill factory")
+  | Core.CCall (Core.CKIntrinsic "tensor_alloc", callee, [ size ]) ->
+      let* builtin_name = tensor_alloc_runtime_builtin ~reg path expr in
+      let* callee_json =
+        expr_json ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".callee") callee
+      in
+      let* size_json =
+        expr_json ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".args[0]") size
+      in
+      let* fields =
+        typed
+          [
+            ("call_kind", kind "builtin" [ ("name", str builtin_name) ]);
+            ("callee", callee_json);
+            ("args", arr [ size_json ]);
+          ]
+      in
+      Ok (kind "call" fields)
+  | Core.CCall (Core.CKBuiltin "blorp_dict_new_custom", _callee, _args) -> (
+      match Core_codegen_prepare.canonical_type ~reg expr.ty with
+      | Ast.TyNamed ("Dict", [ key_ty; _value_ty ]) ->
+          let construct =
+            {
+              Core.dc_constructor = Core.DictCustom key_ty;
+              dc_entries = [];
+              dc_value_needs_release =
+                Core_codegen_prepare.dict_value_needs_release ~reg expr.ty
+                  expr.loc;
+            }
+          in
+          let* construct_json =
+            dict_construct_json ~reg enum_names value_record_names
+              heap_record_names union_names enum_constructors
+              (path ^ ".construct") expr.loc construct
+          in
+          let* fields = typed [ ("construct", construct_json) ] in
+          Ok (kind "dict_construct" fields)
+      | other ->
+          unsupported path
+            (Printf.sprintf "blorp_dict_new_custom on non-Dict type %s"
+               (Types.type_to_string other)))
+  | Core.CCall (Core.CKBuiltin "blorp_set_new_custom", _callee, _args) -> (
+      match Core_codegen_prepare.canonical_type ~reg expr.ty with
+      | Ast.TyNamed ("Set", [ elem_ty ]) ->
+          let alloc = { Core.sa_constructor = Core.SetCustom elem_ty } in
+          let* alloc_json = set_alloc_json ~reg (path ^ ".alloc") expr.loc alloc in
+          let* fields = typed [ ("alloc", alloc_json) ] in
+          Ok (kind "set_alloc" fields)
+      | other ->
+          unsupported path
+            (Printf.sprintf "blorp_set_new_custom on non-Set type %s"
+               (Types.type_to_string other)))
   | Core.CCall (call_kind, callee, args) ->
       let* call_kind_value =
         call_kind_json_for_call ~function_names ~reg (path ^ ".call_kind")
-          ~result_ty:expr.ty call_kind args
+          ~result_ty:expr.ty ~loc:expr.loc call_kind args
       in
       let* callee_value =
         expr_json ~reg enum_names value_record_names heap_record_names union_names
@@ -2157,6 +2479,14 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
       Ok (kind "for_range" fields)
   | Core.CFor (binder, iter, body) -> (
       match Codegen_types.normalize_type iter.ty with
+      | Ast.TyNamed ("Channel", _) ->
+          let* for_channel =
+            for_channel_json ~reg enum_names value_record_names heap_record_names
+              union_names enum_constructors (path ^ ".for_channel") binder iter
+              body
+          in
+          let* fields = typed [ ("for_channel", for_channel) ] in
+          Ok (kind "for_channel" fields)
       | Ast.TyNamed ("List", _) ->
           let layout =
             Core_layout_type.list_storage_layout_of_type ~reg iter.ty iter.loc
@@ -2201,6 +2531,25 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
               ]
           in
           Ok (kind "for_range" fields)
+      | Ast.TyNamed (name, _) when Type_name_metadata.is_stream_name name ->
+          let* for_stream =
+            for_stream_json ~reg enum_names value_record_names heap_record_names
+              union_names enum_constructors (path ^ ".for_stream") binder iter
+              body
+          in
+          let* fields = typed [ ("for_stream", for_stream) ] in
+          Ok (kind "for_stream" fields)
+      | Ast.TyNamed (name, [ _resource_ty; _error_ty ])
+        when Type_name_metadata.is_resource_source_name name ->
+          let* for_resource_source =
+            for_resource_source_json ~reg enum_names value_record_names
+              heap_record_names union_names enum_constructors
+              (path ^ ".for_resource_source") binder iter body
+          in
+          let* fields =
+            typed [ ("for_resource_source", for_resource_source) ]
+          in
+          Ok (kind "for_resource_source" fields)
       | ty when Core_tensor_type.is_type ~reg ty ->
           let* for_tensor =
             for_tensor_json ~reg enum_names value_record_names heap_record_names
@@ -3342,12 +3691,12 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
   | Core.CDictConstruct dc ->
       let* construct =
         dict_construct_json ~reg enum_names value_record_names heap_record_names union_names
-          enum_constructors (path ^ ".construct") dc
+          enum_constructors (path ^ ".construct") expr.loc dc
       in
       let* fields = typed [ ("construct", construct) ] in
       Ok (kind "dict_construct" fields)
   | Core.CSetAlloc alloc ->
-      let* alloc_json = set_alloc_json (path ^ ".alloc") alloc in
+      let* alloc_json = set_alloc_json ~reg (path ^ ".alloc") expr.loc alloc in
       let* fields = typed [ ("alloc", alloc_json) ] in
       Ok (kind "set_alloc" fields)
   | Core.CRecordUpdate _ -> unsupported path "record update"
@@ -3519,17 +3868,19 @@ and boxed_storage_values_json ~reg enum_names value_record_names heap_record_nam
         (Printf.sprintf "%s[%d]" path index)
         value)
 
-and dict_constructor_json path = function
+and dict_constructor_json ~reg path loc = function
   | Core.DictGeneric -> Ok (kind "generic" [])
   | Core.DictString -> Ok (kind "string" [])
   | Core.DictFloat -> Ok (kind "float" [])
-  | Core.DictCustom _ -> unsupported path "custom dict constructor"
+  | Core.DictCustom key_ty ->
+      custom_hash_container_constructor_json ~reg path loc key_ty
 
-and set_constructor_json path = function
+and set_constructor_json ~reg path loc = function
   | Core.SetGeneric -> Ok (kind "generic" [])
   | Core.SetString -> Ok (kind "string" [])
   | Core.SetFloat -> Ok (kind "float" [])
-  | Core.SetCustom _ -> unsupported path "custom set constructor"
+  | Core.SetCustom elem_ty ->
+      custom_hash_container_constructor_json ~reg path loc elem_ty
 
 and dict_entry_json ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path
@@ -3553,9 +3904,9 @@ and dict_entries_json ~reg enum_names value_record_names heap_record_names union
         entry)
 
 and dict_construct_json ~reg enum_names value_record_names heap_record_names union_names
-    enum_constructors path (construct : Core.dict_construct) =
+    enum_constructors path loc (construct : Core.dict_construct) =
   let* constructor =
-    dict_constructor_json (path ^ ".constructor") construct.dc_constructor
+    dict_constructor_json ~reg (path ^ ".constructor") loc construct.dc_constructor
   in
   let* entries =
     dict_entries_json ~reg enum_names value_record_names heap_record_names union_names
@@ -3569,9 +3920,9 @@ and dict_construct_json ~reg enum_names value_record_names heap_record_names uni
          ("value_needs_release", bool construct.dc_value_needs_release);
        ])
 
-and set_alloc_json path (alloc : Core.set_alloc) =
+and set_alloc_json ~reg path loc (alloc : Core.set_alloc) =
   let* constructor =
-    set_constructor_json (path ^ ".constructor") alloc.sa_constructor
+    set_constructor_json ~reg (path ^ ".constructor") loc alloc.sa_constructor
   in
   Ok (obj [ ("constructor", constructor) ])
 
@@ -3632,6 +3983,28 @@ and require_supported_list_loop_layout _path (layout : Core.list_storage_layout)
   | Core.ListInlineStorage _ -> Ok ()
   | Core.ListInlineStructStorage _ -> Ok ()
 
+and for_channel_json ~reg enum_names value_record_names heap_record_names union_names
+    enum_constructors path binder iter body =
+  let* binder_json =
+    loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
+      (path ^ ".binder") binder
+  in
+  let* iterable_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".iterable") iter
+  in
+  let* body_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".body") body
+  in
+  Ok
+    (obj
+       [
+         ("binder", binder_json);
+         ("iterable", iterable_json);
+         ("body", body_json);
+       ])
+
 and for_list_json ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path binder layout iter body =
   let* () = require_supported_list_loop_layout (path ^ ".layout") layout in
@@ -3654,6 +4027,54 @@ and for_list_json ~reg enum_names value_record_names heap_record_names union_nam
        [
          ("binder", binder_json);
          ("layout", layout_json);
+         ("iterable", iterable_json);
+         ("iterable_release_policy", iterable_release_policy);
+         ("body", body_json);
+       ])
+
+and for_stream_json ~reg enum_names value_record_names heap_record_names union_names
+    enum_constructors path binder iter body =
+  let* binder_json =
+    loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
+      (path ^ ".binder") binder
+  in
+  let* iterable_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".iterable") iter
+  in
+  let iterable_release_policy = iterable_release_policy_json ~reg iter in
+  let* body_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".body") body
+  in
+  Ok
+    (obj
+       [
+         ("binder", binder_json);
+         ("iterable", iterable_json);
+         ("iterable_release_policy", iterable_release_policy);
+         ("body", body_json);
+       ])
+
+and for_resource_source_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path binder iter body =
+  let* binder_json =
+    loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
+      (path ^ ".binder") binder
+  in
+  let* iterable_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".iterable") iter
+  in
+  let iterable_release_policy = iterable_release_policy_json ~reg iter in
+  let* body_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".body") body
+  in
+  Ok
+    (obj
+       [
+         ("binder", binder_json);
          ("iterable", iterable_json);
          ("iterable_release_policy", iterable_release_policy);
          ("body", body_json);
@@ -3707,41 +4128,58 @@ and for_list_json ~reg enum_names value_record_names heap_record_names union_nam
 	  | Some _ -> unsupported path "1D tensor row-slice loop"
 	  | None -> unsupported path "non-tensor row-slice loop"
 
-	and tensor_for_element_storage_json ~reg path (binder : Core.loop_binder) =
-	  match
-	    Core_layout_type.tensor_runtime_read_helper_of_type ~reg binder.loop_ty
-  with
-  | Some helper ->
-      let* helper_tag =
-        tensor_runtime_read_helper_tag (path ^ ".helper") helper.trrh_c_helper
-      in
-      Ok
-        (kind "runtime_read"
-           [
-             ( "value_c_type",
-               str
-                 (Codegen_types.type_to_c ~reg
-                    (Core_layout_type.canonical_type ~reg binder.loop_ty)) );
-             ("helper", str helper_tag);
-           ])
+and tensor_for_proven_raw_scalar_storage_json ~reg path
+    (binder : Core.loop_binder) =
+  match binder.loop_source_storage with
+  | Core.TensorStorageProven
+      { tsp_layout = { Core.tsl_slots = Core.TensorRawScalarStorage raw_kind; _ }; _ }
+    -> (
+      match Core_layout_type.tensor_raw_scalar_kind_of_type ~reg binder.loop_ty with
+      | Some expected_kind when expected_kind = raw_kind ->
+          Ok (Some (kind "raw_scalar" [ ("raw_kind", tensor_raw_scalar_kind_json raw_kind) ]))
+      | Some _ ->
+          unsupported path
+            "raw scalar tensor for-loop storage proof does not match element type"
+      | None -> Ok None)
+  | Core.TensorStorageProven _ | Core.TensorStorageUnknown _ -> Ok None
+
+and tensor_for_element_storage_json ~reg path (binder : Core.loop_binder) =
+  let* raw_storage =
+    tensor_for_proven_raw_scalar_storage_json ~reg path binder
+  in
+  match raw_storage with
+  | Some storage -> Ok storage
   | None -> (
-      match Core_layout_type.tensor_element_storage ~reg binder.loop_ty with
-      | Core_layout_type.TensorElementInlineStruct c_type ->
-          Ok (kind "inline_struct" [ ("c_type", str c_type) ])
-	      | Core_layout_type.TensorElementRawScalar _ ->
-	          unsupported path "raw scalar tensor for-loop"
-	      | Core_layout_type.TensorElementPackedBits _ ->
-	          unsupported path "packed tensor for-loop"
-	      | Core_layout_type.TensorElementBoxed ->
-	          Ok
-	            (kind "boxed"
-	               [
-	                 ( "value_c_type",
-	                   str
-	                     (Codegen_types.type_to_c ~reg
-	                        (Core_layout_type.canonical_type ~reg binder.loop_ty))
-	                 );
-	               ]))
+      match
+        Core_layout_type.tensor_runtime_read_helper_of_type ~reg binder.loop_ty
+      with
+      | Some helper ->
+          let* helper_tag =
+            tensor_runtime_read_helper_tag (path ^ ".helper") helper.trrh_c_helper
+          in
+          Ok
+            (kind "runtime_read"
+               [
+                 ( "value_c_type",
+                   str (Core_emit_layout.c_type_for_reg ~reg binder.loop_ty) );
+                 ("helper", str helper_tag);
+               ])
+      | None -> (
+          match Core_emit_layout.tensor_element_storage_for_reg ~reg binder.loop_ty with
+          | Core_layout_type.TensorElementInlineStruct c_type ->
+              Ok (kind "inline_struct" [ ("c_type", str c_type) ])
+          | Core_layout_type.TensorElementRawScalar _ ->
+              unsupported path "raw scalar tensor for-loop"
+          | Core_layout_type.TensorElementPackedBits _ ->
+              unsupported path "packed tensor for-loop"
+          | Core_layout_type.TensorElementBoxed ->
+              Ok
+                (kind "boxed"
+                   [
+                     ( "value_c_type",
+                       str (Core_emit_layout.c_type_for_reg ~reg binder.loop_ty)
+                     );
+                   ])))
 
 and require_tensor_for_element_storage ~reg path (binder : Core.loop_binder) =
   match tensor_for_element_storage_json ~reg path binder with
@@ -4375,8 +4813,8 @@ and union_construct_json ~reg enum_names value_record_names heap_record_names un
         (not (Codegen_types.union_uses_typed_payload_storage reg uc.uc_type_name))
         && List.exists
              (fun field_ty ->
-               Core_layout_type.boxed_storage_requires_release_or_error
-                 ~phase:Core_error.Emit ~reg field_ty variant.variant_loc)
+               Core_codegen_prepare.boxed_storage_needs_release ~reg field_ty
+                 variant.variant_loc)
              variant.variant_fields
     | None -> uc.uc_release_mask <> 0)
   in
@@ -4407,6 +4845,27 @@ let function_kind_json ~reg enum_names value_record_names heap_record_names unio
           union_names (path ^ ".abi") c_name abi
       in
       Ok (kind "closure_body" [ ("abi", abi_json) ])
+
+let collect_foreign_includes (program : Core.core_program) =
+  let seen = Hashtbl.create 8 in
+  let ordered = ref [] in
+  let remember header =
+    if not (Hashtbl.mem seen header) then begin
+      Hashtbl.add seen header ();
+      ordered := header :: !ordered
+    end
+  in
+  let rec visit_decl (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDFunc func -> (
+        match func.cf_kind with
+        | Core.CFForeign { includes; _ } -> List.iter remember includes
+        | Core.CFUser | Core.CFBuiltin | Core.CFClosureBody _ -> ())
+    | Core.CDPrivate inner -> visit_decl inner
+    | _ -> ()
+  in
+  List.iter visit_decl program;
+  List.rev !ordered
 
 let var_is_global global_def_ids global_names (variable : Core.var) =
   match variable.vdef_id with
@@ -4493,21 +4952,23 @@ let require_core_arity path name expected args =
          expected actual)
 
 let require_intrinsic_renderable path name args =
-  match
-    Compiler_blorp_bridge.renderer_template_arity_opt_exn
-      ~renderer:Compiler_blorp_bridge.intrinsic_renderer ~op:name
-  with
-  | Some arity -> require_core_arity path name arity args
-  | None -> (
-      match prepared_list_intrinsic_core_arity name with
-      | Some arity -> require_core_arity path name arity args
-      | None -> (
-          match prepared_tensor_intrinsic_core_arity name with
-          | Some arity -> require_core_arity path name arity args
-          | None -> (
-              match final_backend_intrinsic_core_arity name with
-              | Some arity -> require_core_arity path name arity args
-              | None -> unsupported path ("unsupported intrinsic call " ^ name))))
+  if String.equal name "tensor_alloc" then require_core_arity path name 1 args
+  else
+    match
+      Compiler_blorp_bridge.renderer_template_arity_opt_exn
+        ~renderer:Compiler_blorp_bridge.intrinsic_renderer ~op:name
+    with
+    | Some arity -> require_core_arity path name arity args
+    | None -> (
+        match prepared_list_intrinsic_core_arity name with
+        | Some arity -> require_core_arity path name arity args
+        | None -> (
+            match prepared_tensor_intrinsic_core_arity name with
+            | Some arity -> require_core_arity path name arity args
+            | None -> (
+                match final_backend_intrinsic_core_arity name with
+                | Some arity -> require_core_arity path name arity args
+                | None -> unsupported path ("unsupported intrinsic call " ^ name))))
 
 let is_result_type = function
   | Ast.TyNamed ("Result", [ _; _ ]) -> true
@@ -4529,20 +4990,28 @@ let require_simple_call_kind path ~result_ty call_kind args =
   | Core.CKBuiltin name
     when Option.is_some (Operation_result_metadata.find_result_bridge name) ->
       Ok ()
-  | Core.CKBuiltin "blorp_dict_get" when is_option_type result_ty ->
-      require_core_arity path "blorp_dict_get" 2 args
-  | Core.CKBuiltin "blorp_vector_get_opt" ->
-      require_core_arity path "blorp_vector_get_opt" 2 args
-  | Core.CKBuiltin "blorp_matrix_get_opt" ->
-      require_core_arity path "blorp_matrix_get_opt" 3 args
-  | Core.CKBuiltin "blorp_list_to_string_cb" ->
-      require_core_arity path "blorp_list_to_string_cb" 1 args
-  | Core.CKBuiltin name when channel_attempt_builtin_supported name -> (
-      match channel_attempt_builtin_arity name with
-      | Some arity -> require_core_arity path name arity args
-      | None -> unsupported path ("builtin call " ^ name))
-  | Core.CKBuiltin name when direct_builtin_supported name -> Ok ()
-  | Core.CKBuiltin name -> unsupported path ("builtin call " ^ name)
+  | Core.CKBuiltin name -> (
+      match Operation_result_metadata.find_fallible_stream_terminal name with
+      | Some terminal ->
+          require_core_arity path name
+            (List.length terminal.Operation_result_metadata.arguments)
+            args
+      | None -> (
+          match name with
+          | "blorp_dict_get" when is_option_type result_ty ->
+              require_core_arity path "blorp_dict_get" 2 args
+          | "blorp_vector_get_opt" ->
+              require_core_arity path "blorp_vector_get_opt" 2 args
+          | "blorp_matrix_get_opt" ->
+              require_core_arity path "blorp_matrix_get_opt" 3 args
+          | "blorp_list_to_string_cb" ->
+              require_core_arity path "blorp_list_to_string_cb" 1 args
+          | _ when channel_attempt_builtin_supported name -> (
+              match channel_attempt_builtin_arity name with
+              | Some arity -> require_core_arity path name arity args
+              | None -> unsupported path ("builtin call " ^ name))
+          | _ when direct_builtin_supported name -> Ok ()
+          | _ -> unsupported path ("builtin call " ^ name)))
   | Core.CKIntrinsic name -> require_intrinsic_renderable path name args
   | Core.CKClosure -> Ok ()
   | Core.CKUnknown -> unsupported path "unresolved call kind"
@@ -4576,7 +5045,7 @@ let rec require_simple_expr path (expr : Core.core) =
       let* () =
         require_emittable_list_store_layout path layout
           ~inline_scalar_reason:"inline scalar list handoff set"
-          ~allow_inline_scalar:false
+          ~allow_inline_scalar:true
       in
       let* () = require_simple_expr (path ^ ".list") lst in
       let* () = require_simple_expr (path ^ ".index") index in
@@ -4604,6 +5073,12 @@ let rec require_simple_expr path (expr : Core.core) =
     when is_ranked_tensor_fill_factory_name name ->
       let* () = require_simple_expr (path ^ ".value") value in
       require_simple_args (path ^ ".dims") dims
+  | Core.CCall
+      ( ( Core.CKBuiltin "blorp_dict_new_custom"
+        | Core.CKBuiltin "blorp_set_new_custom" ),
+        _callee,
+        _args ) ->
+      Ok ()
   | Core.CCall (call_kind, _callee, args) ->
       let* () =
         require_simple_call_kind (path ^ ".call_kind") ~result_ty:expr.ty
@@ -4635,7 +5110,7 @@ let rec require_simple_expr path (expr : Core.core) =
   | Core.CList lit -> require_list_literal path lit
   | Core.CListAlloc alloc -> require_list_alloc path alloc
   | Core.CListGet get -> require_list_get path get
-  | Core.CListHandoff handoff -> require_list_handoff path handoff
+  | Core.CListHandoff handoff -> require_list_handoff_simple path handoff
   | Core.CStringByteRead read -> require_string_byte_read path read
   | Core.CStringByteWrite write -> require_string_byte_write path write
   | Core.CStringByteCopy copy -> require_string_byte_copy path copy
@@ -4939,13 +5414,13 @@ and require_list_literal_body ~reg union_names path (lit : Core.list_literal) =
       in
       check 0 elems
 
-and require_dict_constructor path = function
+and require_dict_constructor _path = function
   | Core.DictGeneric | Core.DictString | Core.DictFloat -> Ok ()
-  | Core.DictCustom _ -> unsupported path "custom dict constructor"
+  | Core.DictCustom _ -> Ok ()
 
-and require_set_constructor path = function
+and require_set_constructor _path = function
   | Core.SetGeneric | Core.SetString | Core.SetFloat -> Ok ()
-  | Core.SetCustom _ -> unsupported path "custom set constructor"
+  | Core.SetCustom _ -> Ok ()
 
 and require_dict_entry path
     ((key, value) : Core.boxed_storage_value * Core.boxed_storage_value) =
@@ -4990,11 +5465,18 @@ and require_list_get path (get : Core.list_get) =
   let* () = require_simple_expr (path ^ ".list") get.lg_list in
   require_simple_expr (path ^ ".index") get.lg_index
 
-and require_list_handoff path (handoff : Core.list_handoff) =
+and require_list_handoff_simple path (handoff : Core.list_handoff) =
   let* _ = list_storage_layout_json handoff.lh_layout in
   let* () = require_simple_expr (path ^ ".source") handoff.lh_source in
   let* () = require_simple_expr (path ^ ".capacity") handoff.lh_capacity in
   require_simple_expr (path ^ ".body") handoff.lh_body
+
+and require_list_handoff_body ~reg union_names path (handoff : Core.list_handoff)
+    =
+  let* _ = list_storage_layout_json handoff.lh_layout in
+  let* () = require_simple_expr (path ^ ".source") handoff.lh_source in
+  let* () = require_simple_expr (path ^ ".capacity") handoff.lh_capacity in
+  require_function_body ~reg union_names (path ^ ".body") handoff.lh_body
 
 and require_string_byte_read path (read : Core.string_byte_read) =
   match read.sbr_proof with
@@ -5256,6 +5738,8 @@ and require_function_body ~reg union_names path (expr : Core.core) =
   | Core.CTupleConstruct tc ->
       require_tuple_construct_body ~reg union_names path tc
   | Core.CList lit -> require_list_literal_body ~reg union_names path lit
+  | Core.CListHandoff handoff ->
+      require_list_handoff_body ~reg union_names path handoff
   | Core.CListConstruct lc ->
       require_list_construct_body ~reg union_names path lc
   | Core.CRecordConstruct rc ->
@@ -5299,7 +5783,7 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       let* () =
         require_emittable_list_store_layout path layout
           ~inline_scalar_reason:"inline scalar list handoff set"
-          ~allow_inline_scalar:false
+          ~allow_inline_scalar:true
       in
       let* () = require_simple_expr (path ^ ".list") lst in
       let* () = require_simple_expr (path ^ ".index") index in
@@ -5316,6 +5800,16 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       require_simple_expr path expr
   | Core.CCall (Core.CKBuiltin name, _callee, _args)
     when Option.is_some (Operation_result_metadata.find_result_bridge name) ->
+      require_simple_expr path expr
+  | Core.CCall (Core.CKBuiltin name, _callee, _args)
+    when Option.is_some
+           (Operation_result_metadata.find_fallible_stream_terminal name) ->
+      require_simple_expr path expr
+  | Core.CCall
+      ( ( Core.CKBuiltin "blorp_dict_new_custom"
+        | Core.CKBuiltin "blorp_set_new_custom" ),
+        _callee,
+        _args ) ->
       require_simple_expr path expr
   | Core.CCall (call_kind, _callee, args) ->
       let* () =
@@ -5363,6 +5857,11 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       require_function_body ~reg union_names (path ^ ".body") body
   | Core.CFor (binder, iter, body) -> (
       match Codegen_types.normalize_type iter.ty with
+      | Ast.TyNamed ("Channel", _) ->
+          let* () =
+            require_function_body ~reg union_names (path ^ ".iterable") iter
+          in
+          require_function_body ~reg union_names (path ^ ".body") body
       | Ast.TyNamed ("List", _) ->
           let layout = list_layout_for_expr iter in
           let* () =
@@ -5372,12 +5871,23 @@ and require_function_body ~reg union_names path (expr : Core.core) =
             require_function_body ~reg union_names (path ^ ".iterable") iter
           in
           require_function_body ~reg union_names (path ^ ".body") body
-	      | Ast.TyNamed ("Range", []) ->
-	          let* () = require_simple_expr (path ^ ".iterable") iter in
-	          require_function_body ~reg union_names (path ^ ".body") body
-	      | ty when Core_tensor_type.is_type ~reg ty ->
-	          let* () =
-	            tensor_for_loop_element_storage_json ~reg
+      | Ast.TyNamed ("Range", []) ->
+          let* () = require_simple_expr (path ^ ".iterable") iter in
+          require_function_body ~reg union_names (path ^ ".body") body
+      | Ast.TyNamed (name, _) when Type_name_metadata.is_stream_name name ->
+          let* () =
+            require_function_body ~reg union_names (path ^ ".iterable") iter
+          in
+          require_function_body ~reg union_names (path ^ ".body") body
+      | Ast.TyNamed (name, [ _resource_ty; _error_ty ])
+        when Type_name_metadata.is_resource_source_name name ->
+          let* () =
+            require_function_body ~reg union_names (path ^ ".iterable") iter
+          in
+          require_function_body ~reg union_names (path ^ ".body") body
+      | ty when Core_tensor_type.is_type ~reg ty ->
+          let* () =
+            tensor_for_loop_element_storage_json ~reg
 	              (path ^ ".element_storage") binder iter
 	            |> Result.map ignore
 	          in
@@ -5500,8 +6010,8 @@ and require_tailrec_tail ~reg union_names path return_ty (expr : Core.core) =
       ( scrutinee,
         Core.CTSwitchLit { ctl_scrut; ctl_cases; ctl_default } )
     ->
-      require_literal_match_expr ~reg union_names path scrutinee ctl_scrut
-        ctl_cases ctl_default
+      require_tailrec_literal_match_expr ~reg union_names path return_ty
+        scrutinee ctl_scrut ctl_cases ctl_default
   | Core.CMatch
       ( scrutinee,
         Core.CTSwitchTag { cts_scrut; cts_cases; cts_default } )
@@ -5550,6 +6060,25 @@ and require_literal_match_expr ~reg union_names path scrutinee ctl_scrut cases
   require_literal_match_fallback ~reg union_names ~reusable_match_scrutinee
     ~scrut_ty:(scrutinee.ty) (path ^ ".fallback") fallback
 
+and require_tailrec_literal_match_expr ~reg union_names path return_ty scrutinee
+    ctl_scrut cases fallback =
+  let* () =
+    require_function_body ~reg union_names (path ^ ".scrutinee") scrutinee
+  in
+  let* () =
+    match_accessor_json ~reg scrutinee.ty (path ^ ".accessor") ctl_scrut
+    |> Result.map ignore
+  in
+  let reusable_match_scrutinee = true in
+  let* () =
+    require_tailrec_literal_match_cases ~reg union_names
+      ~reusable_match_scrutinee ~scrut_ty:(scrutinee.ty)
+      (path ^ ".cases") return_ty cases
+  in
+  require_tailrec_literal_match_fallback ~reg union_names
+    ~reusable_match_scrutinee ~scrut_ty:(scrutinee.ty)
+    (path ^ ".fallback") return_ty fallback
+
 and require_literal_match_fallback ~reg union_names ~reusable_match_scrutinee
     ~scrut_ty path = function
   | Core.CTLeaf { ct_bindings = []; ct_body } ->
@@ -5577,6 +6106,11 @@ and require_literal_match_fallback ~reg union_names ~reusable_match_scrutinee
   | Core.CTSwitchLen _ as subtree ->
       require_constructor_match_tree ~reg union_names scrut_ty path subtree
 
+and require_tailrec_literal_match_fallback ~reg union_names
+    ~reusable_match_scrutinee ~scrut_ty path return_ty subtree =
+  require_tailrec_literal_match_tree ~reg union_names
+    ~reusable_match_scrutinee ~scrut_ty path return_ty subtree
+
 and require_literal_match_tree ~reg union_names ~reusable_match_scrutinee
     ~scrut_ty path = function
   | Core.CTLeaf { ct_bindings = []; ct_body } ->
@@ -5603,6 +6137,34 @@ and require_literal_match_tree ~reg union_names ~reusable_match_scrutinee
   | Core.CTSwitchTag _ -> unsupported path "nested constructor match"
   | Core.CTSwitchLen _ -> unsupported path "nested length match"
 
+and require_tailrec_literal_match_tree ~reg union_names
+    ~reusable_match_scrutinee ~scrut_ty path return_ty = function
+  | Core.CTLeaf { ct_bindings = []; ct_body } ->
+      require_tailrec_tail ~reg union_names (path ^ ".body") return_ty ct_body
+  | Core.CTLeaf { ct_bindings; ct_body } ->
+      let* () =
+        require_match_bindings ~reg scrut_ty (path ^ ".bindings") ct_bindings
+      in
+      require_tailrec_tail ~reg union_names (path ^ ".body") return_ty ct_body
+  | Core.CTFail -> Ok ()
+  | Core.CTSwitchLit { ctl_scrut; ctl_cases; ctl_default }
+    when reusable_match_scrutinee ->
+      let* () =
+        match_accessor_json ~reg scrut_ty (path ^ ".accessor") ctl_scrut
+        |> Result.map ignore
+      in
+      let* () =
+        require_tailrec_literal_match_cases ~reg union_names
+          ~reusable_match_scrutinee ~scrut_ty (path ^ ".cases") return_ty
+          ctl_cases
+      in
+      require_tailrec_literal_match_fallback ~reg union_names
+        ~reusable_match_scrutinee ~scrut_ty (path ^ ".fallback") return_ty
+        ctl_default
+  | Core.CTSwitchLit _ -> unsupported path "nested literal match"
+  | Core.CTSwitchTag _ -> unsupported path "nested constructor match"
+  | Core.CTSwitchLen _ -> unsupported path "nested length match"
+
 and require_literal_match_cases ~reg union_names ~reusable_match_scrutinee
     ~scrut_ty path cases =
   let rec check index = function
@@ -5616,6 +6178,25 @@ and require_literal_match_cases ~reg union_names ~reusable_match_scrutinee
         let* () =
           require_literal_match_tree ~reg union_names ~reusable_match_scrutinee
             ~scrut_ty (case_path ^ ".body") subtree
+        in
+        check (index + 1) rest
+  in
+  check 0 cases
+
+and require_tailrec_literal_match_cases ~reg union_names
+    ~reusable_match_scrutinee ~scrut_ty path return_ty cases =
+  let rec check index = function
+    | [] -> Ok ()
+    | (literal, subtree) :: rest ->
+        let case_path = Printf.sprintf "%s[%d]" path index in
+        let* () =
+          literal_match_literal_json (case_path ^ ".literal") literal
+          |> Result.map ignore
+        in
+        let* () =
+          require_tailrec_literal_match_tree ~reg union_names
+            ~reusable_match_scrutinee ~scrut_ty (case_path ^ ".body")
+            return_ty subtree
         in
         check (index + 1) rest
   in
@@ -6284,20 +6865,20 @@ let program_json ~reg (program : Core.core_program) =
       (constructor_c_name variant.variant_name variant.variant_def_id)
       constructors
   in
-	  let rec collect_enum_constructors constructors (decl : Core.core_decl) =
-	    match decl.cd_desc with
-	    | Core.CDType type_decl
-	      when type_decl.type_is_enum && not type_decl.type_is_builtin ->
-	        List.fold_left
-	          (add_enum_constructor type_decl.type_name)
-	          constructors type_decl.type_variants
-	    | Core.CDType type_decl when supported_union_decl type_decl ->
-	        List.fold_left
-	          (add_enum_constructor type_decl.type_name)
-	          constructors type_decl.type_variants
-	    | Core.CDPrivate inner -> collect_enum_constructors constructors inner
-	    | _ -> constructors
-	  in
+  let rec collect_enum_constructors constructors (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDType type_decl
+      when type_decl.type_is_enum && not type_decl.type_is_builtin ->
+        List.fold_left
+          (add_enum_constructor type_decl.type_name)
+          constructors type_decl.type_variants
+    | Core.CDType type_decl when supported_union_decl type_decl ->
+        List.fold_left
+          (add_enum_constructor type_decl.type_name)
+          constructors type_decl.type_variants
+    | Core.CDPrivate inner -> collect_enum_constructors constructors inner
+    | _ -> constructors
+  in
   let rec collect_global_def_ids ids (decl : Core.core_decl) =
     match decl.cd_desc with
     | Core.CDVar global -> IntSet.add global.cv_def_id ids
@@ -6390,7 +6971,12 @@ let program_json ~reg (program : Core.core_program) =
         | Error _ as error -> error)
   in
   let* decls = collect [] 0 program in
-  Ok (kind "program" [ ("decls", decls) ])
+  Ok
+    (kind "program"
+       [
+         ("decls", decls);
+         ("foreign_includes", string_list_json (collect_foreign_includes program));
+       ])
 
 type config = {
   embed_runtime : bool;

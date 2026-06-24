@@ -6423,6 +6423,7 @@ and emit_program ?(embed_runtime = false) (ctx : Core_emit_context.t)
             Codegen_types.register_union_variants ctx.reg t.type_name
               t.type_variants;
             Codegen_types.register_union_type ctx.reg t.type_name
+              ~payload_storage:(Codegen_types.source_union_payload_storage t)
               ~destructor:
                 (Codegen_types.GeneratedDestructor (t.type_name ^ "_destroy"))
         | CDTypeAlias a ->
@@ -6444,6 +6445,7 @@ and emit_program ?(embed_runtime = false) (ctx : Core_emit_context.t)
                    ~phase:Core_error.Emit ~reg:ctx.reg r)
         | CDType t when (not t.type_is_enum) && not t.type_is_builtin ->
             Codegen_types.register_union_type ctx.reg t.type_name
+              ~payload_storage:(Codegen_types.source_union_payload_storage t)
               ~destructor:
                 (Core_layout_type.union_destructor_policy ~phase:Core_error.Emit
                    ~reg:ctx.reg t)
