@@ -124,18 +124,15 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
     on_stage_callback =
  fun stage prog -> fire_stage ~check_invariants ~user stage prog
 
-(** Run tail Core emission through the single C path. Supported tail subsets are
-    emitted by Blorp, preferring the earliest supplied tail snapshot. The
-    default pipeline tries post-reuse/pre-closure Core first for closure-free
-    supported subsets, then post-closure/pre-resource Core. The final OCaml tail
-    is forced only when a caller needs final-stage observability/invariants, the
-    earlier Blorp handoff is unsupported, or the older OCaml emitter is needed
-    as a fallback. *)
-let emit_via_c_backend ?(tail_progs = []) ?(force_final = false)
-    ~(embed_runtime : bool) ~(profile : bool) ~(reg : Codegen_types.registry)
-    (final_prog : Core.core_program Lazy.t) : string =
-  let trace_blorp_fallback =
-    Sys.getenv_opt "BLORP_TRACE_BACKEND_FALLBACK" = Some "1"
+(** Run final prepared Core emission through the single C backend path. Blorp
+    owns the current final-Core emission contract; earlier handoff points should
+    be reintroduced only after those Core shapes are represented and tested in
+    the Blorp emitter. *)
+let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
+    ~(reg : Codegen_types.registry) (final_prog : Core.core_program Lazy.t) :
+    string =
+  let building_blorp_renderer_bridge =
+    Sys.getenv_opt "BLORP_COMPILER_RENDERER_HELPER" = Some "1"
   in
   let final () = Lazy.force final_prog in
   let emit_with_ocaml_backend () =
@@ -143,51 +140,24 @@ let emit_via_c_backend ?(tail_progs = []) ?(force_final = false)
     Core_emit.emit_program ~embed_runtime ctx (final ());
     Buffer.contents ctx.output
   in
-  let cfg =
-    Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile ~reg ()
-  in
-  let rec try_blorp_programs candidates =
-    match candidates with
-    | [] -> emit_with_ocaml_backend ()
-    | candidate :: rest -> (
-        match Core_emit_blorp_c.try_emit_program_string cfg (candidate ()) with
-        | Ok c_code -> c_code
-        | Error reason ->
-            if trace_blorp_fallback then prerr_endline reason;
-            try_blorp_programs rest)
-  in
-  let final_candidate = final in
-  if force_final then
-    let observed_final = final () in
-    try_blorp_programs
-      (List.map (fun prog () -> prog) tail_progs
-      @ [ (fun () -> observed_final) ])
+  if building_blorp_renderer_bridge then emit_with_ocaml_backend ()
   else
-    try_blorp_programs
-      (List.map (fun prog () -> prog) tail_progs @ [ final_candidate ])
-
-type core_tail_programs = {
-  pre_closure : Core.core_program;
-      (** Post-reuse Core before closure conversion. The Blorp backend tries
-          this first for closure-free supported subsets, moving the JSON handoff
-          one stage left without pretending Blorp owns closure conversion yet. *)
-  pre_resource : Core.core_program;
-      (** Post-closure Core before resource cleanup-edge rewriting, cooperative
-          fairness, and final preparation.
-          The supported Blorp backend tries this after [pre_closure] so closure
-          conversion remains available for programs that need it. *)
-  final : Core.core_program Lazy.t;
-}
+    let cfg =
+      Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile ~reg ()
+    in
+    match Core_emit_blorp_c.try_emit_program_string cfg (final ()) with
+    | Ok c_code -> c_code
+    | Error reason -> failwith reason
 
 (** Run the shared Core-to-Core pass chain starting from an already-lowered
     [core_program]. [compile] and [compile_with_modules] differ in how they
     assemble that initial program (single file vs. loaded modules), but the
     pass ordering after lowering is identical. Keeping the sequence in one
     place prevents stage drift between the two entry points. *)
-let run_core_passes_with_tail ?(import_aliases = Hashtbl.create 0)
+let run_core_passes ?(import_aliases = Hashtbl.create 0)
     ?(module_imports = Hashtbl.create 0) ~(on_stage : on_stage_callback)
     ~(reg : Codegen_types.registry) ?(debug = false) (prog : Core.core_program)
-    : core_tail_programs =
+    : Core.core_program Lazy.t =
   let observe stage prog =
     on_stage stage prog;
     prog
@@ -242,12 +212,11 @@ let run_core_passes_with_tail ?(import_aliases = Hashtbl.create 0)
        |> Core_reuse.rewrite_prepared_program ~reg
        |> observe Core_stage.Final)
   in
-  { pre_closure; pre_resource; final }
+  final
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     ?on_stage ?(check_invariants = false) (typed_program : Typed_ast.program) :
     string =
-  let force_final_tail = check_invariants || Option.is_some on_stage in
   let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
   let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
   Session.reset_core_counters (Session.current ());
@@ -260,10 +229,8 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
   Core_flatten.register_types reg core_prog;
   let core_prog = Core_ffi_boundary.annotate_program ~reg core_prog in
   let core_prog = Core_list_layout.annotate_program ~reg core_prog in
-  let tail = run_core_passes_with_tail ~on_stage ~reg ~debug core_prog in
-  emit_via_c_backend
-    ~tail_progs:[ tail.pre_closure; tail.pre_resource ]
-    ~force_final:force_final_tail ~embed_runtime ~profile ~reg tail.final
+  let final_prog = run_core_passes ~on_stage ~reg ~debug core_prog in
+  emit_via_c_backend ~embed_runtime ~profile ~reg final_prog
 
 (** Compile a typed AST program with module support.
 
@@ -277,7 +244,6 @@ let compile_typed_with_modules ?(main_import_bindings = [])
     ?(embed_runtime = true) ?(profile = false) ?(debug = false) ?on_stage
     ?(check_invariants = false) (typed_main : Typed_ast.program) :
     string * string list * string list =
-  let force_final_tail = check_invariants || Option.is_some on_stage in
   let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
   let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
   let program = Typed_ast.program_ast typed_main in
@@ -352,15 +318,10 @@ let compile_typed_with_modules ?(main_import_bindings = [])
   Core_flatten.register_types reg full;
   let full = Core_ffi_boundary.annotate_program ~reg full in
   let full = Core_list_layout.annotate_program ~reg full in
-  let tail =
-    run_core_passes_with_tail ~on_stage ~reg ~import_aliases ~module_imports
-      ~debug full
+  let final_prog =
+    run_core_passes ~on_stage ~reg ~import_aliases ~module_imports ~debug full
   in
-  let output =
-    emit_via_c_backend
-      ~tail_progs:[ tail.pre_closure; tail.pre_resource ]
-      ~force_final:force_final_tail ~embed_runtime ~profile ~reg tail.final
-  in
+  let output = emit_via_c_backend ~embed_runtime ~profile ~reg final_prog in
   (* Foreign metadata is pulled from the lowered program rather than the
      loaded-module AST so main-program FFI declarations are included too. *)
   let host = Platform.current () in

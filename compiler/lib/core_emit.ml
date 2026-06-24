@@ -2103,27 +2103,18 @@ let tensor_element_needs_release ctx ty loc =
   | Some tensor_ty -> boxed_value_needs_release ctx tensor_ty.elem_ty loc
   | None -> false
 
-let tensor_inline_struct_c_type ctx ty =
-  match tensor_type_of_type ctx ty with
-  | Some tensor_ty -> (
-      match Core_emit_util.tensor_element_storage ctx tensor_ty.elem_ty with
-      | Core_layout_type.TensorElementInlineStruct c_ty -> Some c_ty
-      | Core_layout_type.TensorElementRawScalar _
-      | Core_layout_type.TensorElementPackedBits _
-      | Core_layout_type.TensorElementBoxed ->
-          None)
-  | None -> None
-
-let tensor_fill_factory_uses_direct_layout ctx ty loc =
-  let layout = Core_emit_util.tensor_storage_layout_of_type ctx ty loc in
-  match layout.tsl_slots with
-  | TensorRawScalarStorage _ | TensorPackedStorage _ -> true
-  | _ -> false
-
 let tensor_arg_element_needs_release ctx args loc =
   match args with
   | arr :: _ -> tensor_element_needs_release ctx arr.ty loc
   | [] -> false
+
+let migrated_to_blorp_backend loc feature =
+  Core_error.errorf Core_error.Emit loc
+    ~hint:
+      "This final-Core case is emitted by the Blorp C backend. If legacy \
+       fallback reaches this path, port the earlier unsupported backend case \
+       to Blorp instead of reintroducing OCaml emission."
+    "legacy OCaml emission for %s has been removed" feature
 
 let channel_element_type ctx ty =
   match Core_layout_type.canonical_type ~reg:ctx.reg ty with
@@ -3281,47 +3272,13 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
       emit_blorp_backend ctx (ChannelAllocWithElemRelease cap)
   | CCall
       ( CKBuiltin
-          ("blorp_tensor3_new" | "blorp_tensor4_new" | "blorp_tensor5_new"),
-        _,
-        value :: dims )
-    when tensor_fill_factory_uses_direct_layout ctx e.ty e.loc ->
-      let layout =
-        Core_emit_util.tensor_storage_layout_of_type ctx e.ty e.loc
-      in
-      emit_blorp_backend ctx
-        (TensorDirectFillFactory { loc = e.loc; layout; value; dims })
-  | CCall
-      ( CKBuiltin
           (( "blorp_vector_new_fill" | "blorp_matrix_new_fill"
            | "blorp_tensor3_new" | "blorp_tensor4_new" | "blorp_tensor5_new" )
            as ctor),
         _,
-        value :: dims )
-    when Option.is_some (tensor_inline_struct_c_type ctx e.ty) ->
-      let c_ty =
-        match tensor_inline_struct_c_type ctx e.ty with
-        | Some c_ty -> c_ty
-        | None -> assert false
-      in
-      emit_blorp_backend ctx
-        (TensorFillInlineStruct
-           { function_name = ctor; value; dims; struct_ty = c_ty })
-  | CCall
-      ( CKBuiltin
-          (( "blorp_vector_new_fill" | "blorp_matrix_new_fill"
-           | "blorp_tensor3_new" | "blorp_tensor4_new" | "blorp_tensor5_new" )
-           as ctor),
-        _,
-        value :: dims )
-    when tensor_element_needs_release ctx e.ty e.loc ->
-      let fill_value_policy =
-        if boxed_expr_transfers_ownership ctx value then
-          Blorp_prepared.ReleaseFillValue
-        else Blorp_prepared.KeepFillValue
-      in
-      emit_blorp_backend ctx
-        (TensorFillBoxed
-           { function_name = ctor; value; dims; fill_value_policy })
+        _ :: _ ) ->
+      migrated_to_blorp_backend e.loc
+        (Printf.sprintf "tensor fill constructor `%s`" ctor)
   | CCall
       ( CKBuiltin
           (( "blorp_vector_set_cow" | "blorp_checked_set"
@@ -4905,8 +4862,7 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
   | CRecordConstruct rc -> emit_record_construct ctx rc
   | CDictConstruct dc -> emit_dict_construct ctx e dc
   | CSetAlloc sa -> emit_set_alloc ctx e.loc sa.sa_constructor
-  | CTensorLiteral tl ->
-      emit_blorp_backend ctx (TensorLiteral { loc = e.loc; literal = tl })
+  | CTensorLiteral _ -> migrated_to_blorp_backend e.loc "tensor literal"
   | CUnionConstruct uc -> emit_union_construct ctx uc
   | CUnionReuseConstruct urc -> emit_union_reuse_construct ctx urc
   (* ---- Record construction: [TypeName_make(field0, field1, ...)] ----

@@ -61,6 +61,15 @@ let write_file path contents =
     ~finally:(fun () -> close_out channel)
     (fun () -> output_string channel contents)
 
+let bridge_error_excerpt_limit = 4096
+
+let bridge_error_excerpt text =
+  if String.length text <= bridge_error_excerpt_limit then text
+  else
+    String.sub text 0 bridge_error_excerpt_limit
+    ^ Printf.sprintf "... <truncated %d bytes>"
+        (String.length text - bridge_error_excerpt_limit)
+
 let rec ensure_dir path =
   if path = "" || path = Filename.current_dir_name then ()
   else if Sys.file_exists path then
@@ -603,7 +612,59 @@ let write_temp_request request_json =
     (fun () -> output_string channel request_json);
   path
 
-let run_process_capture ?(env = []) prog args =
+let env_binding_name binding =
+  match String.index_opt binding '=' with
+  | Some index -> String.sub binding 0 index
+  | None -> binding
+
+let child_environment ~env ~unset_env =
+  let removed =
+    List.fold_left (fun acc name -> name :: acc) [] unset_env
+    |> List.sort_uniq String.compare
+  in
+  let replaced =
+    List.map fst env |> List.sort_uniq String.compare
+  in
+  let should_keep binding =
+    let name = env_binding_name binding in
+    (not (List.mem name removed)) && not (List.mem name replaced)
+  in
+  let inherited = Unix.environment () |> Array.to_list |> List.filter should_keep in
+  let added = List.map (fun (name, value) -> name ^ "=" ^ value) env in
+  Array.of_list (inherited @ added)
+
+let split_path value =
+  let rec collect acc start index =
+    if index = String.length value then
+      List.rev (String.sub value start (index - start) :: acc)
+    else if value.[index] = ':' then
+      collect (String.sub value start (index - start) :: acc) (index + 1)
+        (index + 1)
+    else collect acc start (index + 1)
+  in
+  collect [] 0 0
+
+let executable_candidates prog =
+  if String.contains prog '/' then [ prog ]
+  else
+    let path = match Sys.getenv_opt "PATH" with Some value -> value | None -> "" in
+    split_path path
+    |> List.map (fun dir ->
+           let dir = if String.equal dir "" then "." else dir in
+           Filename.concat dir prog)
+
+let exec_program prog args envp =
+  let argv = Array.of_list (prog :: args) in
+  let rec try_candidates = function
+    | [] -> Unix.execve prog argv envp
+    | candidate :: rest -> (
+        try Unix.execve candidate argv envp
+        with Unix.Unix_error ((Unix.ENOENT | Unix.ENOTDIR | Unix.EACCES), _, _) ->
+          try_candidates rest)
+  in
+  try_candidates (executable_candidates prog)
+
+let run_process_capture ?(env = []) ?(unset_env = []) prog args =
   let read_fd, write_fd = Unix.pipe () in
   let stderr_path, stderr_fd =
     create_bridge_temp_file "blorp-compiler-bridge-stderr-" ".log"
@@ -617,8 +678,7 @@ let run_process_capture ?(env = []) prog args =
         Unix.close read_fd;
         Unix.close write_fd;
         Unix.close stderr_fd;
-        List.iter (fun (name, value) -> Unix.putenv name value) env;
-        Unix.execvp prog (Array.of_list (prog :: args))
+        exec_program prog args (child_environment ~env ~unset_env)
       with _ -> Unix._exit 127)
   | pid ->
       Unix.close write_fd;
@@ -663,11 +723,17 @@ let renderer_bridge_source_path () =
 
 let renderer_bridge_temp_dir_retry_limit = 32
 
+let renderer_bridge_stack_link_args () =
+  if String.equal (Platform.current ()) "macos" then
+    [ "-Wl,-stack_size,0x4000000" ]
+  else []
+
 type renderer_bridge_cache_parts = {
   bridge_key : string;
   bridge_source_digest : string;
   bridge_program_digest : string;
   bridge_cc_digest : string;
+  bridge_link_args_digest : string;
   bridge_os : string;
 }
 
@@ -695,6 +761,9 @@ let renderer_bridge_cache_parts ~program ~source_path =
   let source_digest = bridge_source_tree_digest source_path in
   let program_digest = file_digest program in
   let cc_digest = string_digest (Lazy.force renderer_bridge_cc_identity) in
+  let link_args_digest =
+    renderer_bridge_stack_link_args () |> String.concat "\000" |> string_digest
+  in
   let os = Sys.os_type in
   let bridge_key =
     string_digest
@@ -704,6 +773,7 @@ let renderer_bridge_cache_parts ~program ~source_path =
            source_digest;
            program_digest;
            cc_digest;
+           link_args_digest;
            os;
          ])
   in
@@ -712,6 +782,7 @@ let renderer_bridge_cache_parts ~program ~source_path =
     bridge_source_digest = source_digest;
     bridge_program_digest = program_digest;
     bridge_cc_digest = cc_digest;
+    bridge_link_args_digest = link_args_digest;
     bridge_os = os;
   }
 
@@ -731,6 +802,7 @@ let renderer_bridge_manifest parts ~binary_path =
       "source=" ^ parts.bridge_source_digest;
       "program=" ^ parts.bridge_program_digest;
       "cc=" ^ parts.bridge_cc_digest;
+      "link_args=" ^ parts.bridge_link_args_digest;
       "os=" ^ parts.bridge_os;
       "bridge.bin=" ^ file_digest binary_path;
       "";
@@ -826,19 +898,22 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root parts =
                (String.trim (compile_output ^ compile_stderr)))
         end
         else
-          let cc_code, cc_output, cc_stderr =
-            run_process_capture "cc"
-              [
-                "-O0";
-                "-fwrapv";
-                "-pipe";
-                "-w";
-                c_path;
-                "-lm";
-                "-lpthread";
-                "-o";
-                bin_path;
-              ]
+	          let cc_code, cc_output, cc_stderr =
+	            run_process_capture "cc"
+	              ([
+	                 "-O0";
+	                 "-fwrapv";
+	                 "-pipe";
+	                 "-w";
+	                 c_path;
+	               ]
+	              @ renderer_bridge_stack_link_args ()
+	              @ [
+	                  "-lm";
+	                  "-lpthread";
+	                  "-o";
+	                  bin_path;
+	                ])
           in
           if cc_code <> 0 then begin
             remove_path_noerr stage_dir;
@@ -885,14 +960,26 @@ let run_renderer_request_via_blorp request_json =
         ~finally:(fun () -> try Sys.remove request_path with _ -> ())
         (fun () ->
           let exit_code, output, stderr_output =
-            run_process_capture bridge_binary [ request_path ]
+            run_process_capture bridge_binary ~unset_env:[ "BLORP_LEAK_CHECK" ]
+              [ request_path ]
           in
           if exit_code = 0 then output
           else
+            let kept_request =
+              match Sys.getenv_opt "BLORP_KEEP_FAILED_BRIDGE_REQUEST" with
+              | Some "1" ->
+                  let kept_path = request_path ^ ".failed" in
+                  write_file kept_path request_json;
+                  "\nkept request: " ^ kept_path
+              | _ -> ""
+            in
             error_response "bridge_command_failed"
-              (Printf.sprintf "Blorp renderer bridge command exited %d: %s"
+              (Printf.sprintf
+                 "Blorp renderer bridge command exited %d: %s%s\nrequest: %s"
                  exit_code
-                 (String.trim (output ^ stderr_output))))
+                 (String.trim (output ^ stderr_output))
+                 kept_request
+                 (bridge_error_excerpt request_json)))
 
 let render_cache_key ~renderer ~op args =
   let buf = Buffer.create 128 in

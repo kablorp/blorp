@@ -8,12 +8,27 @@ import:
 	compiler_core_json:
 		CoreBoxOp,
 		CoreBoxedStorageValue,
-        CoreConstructorMatchCase,
-        CoreConstructorMatchFallback(ConstructorMatchFallbackBody, ConstructorMatchFallbackFail),
-        CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
-        CoreDictConstruct,
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
+		CoreDictConstruct,
 		CoreDictEntry,
 		CoreExpr(
+			AccessorLiteralMatchExpr,
 			AssignExpr,
 			BinaryExpr,
 			BoxExpr,
@@ -30,6 +45,7 @@ import:
 			FieldExpr,
 			ForListExpr,
 			ForRangeExpr,
+			ForTensorExpr,
 			IfExpr,
 			LetExpr,
 			ListAllocExpr,
@@ -40,6 +56,7 @@ import:
 			ListHandoffSetSourceSlotExpr,
 			ListRetainExpr,
 			ListSetExpr,
+			LengthMatchExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
@@ -56,6 +73,10 @@ import:
 			StringSetLenExpr,
 			TailrecLoopExpr,
 			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorLiteralExpr,
+			TensorPackedLiteralExpr,
+			TensorRawFillExpr,
 			TensorRawReadExpr,
 			TensorRawViewLetExpr,
 			TensorRawWriteExpr,
@@ -78,7 +99,11 @@ import:
 		CoreListRetain,
 		CoreListSet,
 		CoreLiteralMatchCase,
-		CoreLiteralMatchFallback(LiteralMatchFallbackBody, LiteralMatchFallbackFail),
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
 		CoreProgram,
 		CoreRecordFieldValue,
 		CoreResourceExit(ResourceBreakExit, ResourceContinueExit),
@@ -88,10 +113,23 @@ import:
 		CoreStringByteRead,
 		CoreStringByteWrite,
 		CoreStringSetLen,
+		CoreTensorBoxedLiteral,
+		CoreTensorLiteral,
+		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
+		CoreTensorPackedLiteral,
+		CoreTensorRawFill,
 		CoreTensorRawRead,
 		CoreTensorRawViewBinding,
 		CoreTensorRawWrite,
-		CoreTupleElement(TuplePointerElement, TuplePrimElement, TupleVoidElement),
+		CoreTupleElement(
+			TupleFloat32Element,
+			TupleFloat16Element,
+			TupleFloatElement,
+			TuplePointerElement,
+			TuplePrimElement,
+			TupleStructElement,
+			TupleVoidElement,
+		),
 		CoreType,
 
 
@@ -168,8 +206,27 @@ private pure func rewrite_tuple_elements_with_cleanups(
 				result = result.append(
 					TuplePointerElement(rewrite_resource_expr_with_cleanups(value, cleanups)),
 				)
+			TupleStructElement(value, c_type):
+				result = result.append(
+					TupleStructElement(
+						rewrite_resource_expr_with_cleanups(value, cleanups),
+						c_type,
+					),
+				)
 			TupleVoidElement:
 				result = result.append(TupleVoidElement)
+			TupleFloatElement(value):
+				result = result.append(
+					TupleFloatElement(rewrite_resource_expr_with_cleanups(value, cleanups)),
+				)
+			TupleFloat32Element(value):
+				result = result.append(
+					TupleFloat32Element(rewrite_resource_expr_with_cleanups(value, cleanups)),
+				)
+			TupleFloat16Element(value):
+				result = result.append(
+					TupleFloat16Element(rewrite_resource_expr_with_cleanups(value, cleanups)),
+				)
 
 	result
 
@@ -384,6 +441,69 @@ private pure func rewrite_tensor_raw_view_binding_with_cleanups(
 	}
 
 
+private pure func rewrite_tensor_literal_with_cleanups(
+	literal: CoreTensorLiteral,
+	cleanups: List[CoreExpr],
+) -> CoreTensorLiteral:
+	{
+		shape = literal.shape,
+		payload = rewrite_tensor_literal_payload_with_cleanups(literal.payload, cleanups)
+	}
+
+
+private pure func rewrite_tensor_literal_payload_with_cleanups(
+	payload: CoreTensorLiteralPayload,
+	cleanups: List[CoreExpr],
+) -> CoreTensorLiteralPayload:
+	match payload:
+		TensorRawLiteralPayload(raw):
+			TensorRawLiteralPayload({
+				raw_kind = raw.raw_kind,
+				elements = rewrite_resource_expr_list_with_cleanups(raw.elements, cleanups),
+			})
+		TensorInlineStructLiteralPayload(inline_struct):
+			TensorInlineStructLiteralPayload({
+				struct_c_type = inline_struct.struct_c_type,
+				elements = rewrite_resource_expr_list_with_cleanups(
+					inline_struct.elements,
+					cleanups,
+				),
+			})
+
+
+private pure func rewrite_tensor_boxed_literal_with_cleanups(
+	literal: CoreTensorBoxedLiteral,
+	cleanups: List[CoreExpr],
+) -> CoreTensorBoxedLiteral:
+	{
+		shape = literal.shape,
+		elements = rewrite_boxed_storage_values_with_cleanups(literal.elements, cleanups),
+		elem_needs_release = literal.elem_needs_release
+	}
+
+
+private pure func rewrite_tensor_packed_literal_with_cleanups(
+	literal: CoreTensorPackedLiteral,
+	cleanups: List[CoreExpr],
+) -> CoreTensorPackedLiteral:
+	{
+		shape = literal.shape,
+		elem_size = literal.elem_size,
+		elements = rewrite_resource_expr_list_with_cleanups(literal.elements, cleanups)
+	}
+
+
+private pure func rewrite_tensor_raw_fill_with_cleanups(
+	fill: CoreTensorRawFill,
+	cleanups: List[CoreExpr],
+) -> CoreTensorRawFill:
+	{
+		raw_kind = fill.raw_kind,
+		value = rewrite_resource_expr_with_cleanups(fill.value, cleanups),
+		dims = rewrite_resource_expr_list_with_cleanups(fill.dims, cleanups)
+	}
+
+
 private pure func rewrite_string_set_len_with_cleanups(
 	set_len: CoreStringSetLen,
 	cleanups: List[CoreExpr],
@@ -441,6 +561,7 @@ private pure func rewrite_literal_match_cases_with_cleanups(
 	for match_case in cases:
 		result = result.append({
 			literal = match_case.literal,
+			bindings = match_case.bindings,
 			body = rewrite_resource_expr_with_cleanups(match_case.body, cleanups),
 		})
 
@@ -454,8 +575,123 @@ private pure func rewrite_literal_match_fallback_with_cleanups(
 	match fallback:
 		LiteralMatchFallbackBody(body):
 			LiteralMatchFallbackBody(rewrite_resource_expr_with_cleanups(body, cleanups))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				rewrite_resource_expr_with_cleanups(body, cleanups),
+			)
 		LiteralMatchFallbackFail:
 			LiteralMatchFallbackFail
+
+
+private pure func rewrite_constructor_literal_match_with_cleanups(
+	match_expr: CoreConstructorLiteralMatch,
+	cleanups: List[CoreExpr],
+) -> CoreConstructorLiteralMatch:
+	{
+		accessor = match_expr.accessor,
+		scrutinee_type = match_expr.scrutinee_type,
+		cases = rewrite_literal_match_cases_with_cleanups(match_expr.cases, cleanups),
+		fallback = rewrite_literal_match_fallback_with_cleanups(match_expr.fallback, cleanups),
+		result_type = match_expr.result_type,
+		loc = match_expr.loc
+	}
+
+
+private pure func rewrite_constructor_length_match_branch_with_cleanups(
+	branch: CoreConstructorLengthMatchBranch,
+	cleanups: List[CoreExpr],
+) -> CoreConstructorLengthMatchBranch:
+	{
+		bindings = branch.bindings,
+		body = rewrite_constructor_match_body_with_cleanups(branch.body, cleanups)
+	}
+
+
+private pure func rewrite_constructor_length_match_cases_with_cleanups(
+	cases: List[CoreConstructorLengthMatchCase],
+	cleanups: List[CoreExpr],
+) -> List[CoreConstructorLengthMatchCase]:
+	var result: List[CoreConstructorLengthMatchCase] = []
+
+	for match_case in cases:
+		result = result.append({
+			length = match_case.length,
+			branch = rewrite_constructor_length_match_branch_with_cleanups(
+				match_case.branch,
+				cleanups,
+			),
+		})
+
+	result
+
+
+private pure func rewrite_constructor_length_match_geq_with_cleanups(
+	geq_case: Option[CoreConstructorLengthMatchGeq],
+	cleanups: List[CoreExpr],
+) -> Option[CoreConstructorLengthMatchGeq]:
+	match geq_case:
+		Some(existing_case):
+			Some({
+				minimum_length = existing_case.minimum_length,
+				branch = rewrite_constructor_length_match_branch_with_cleanups(
+					existing_case.branch,
+					cleanups,
+				),
+			})
+		None:
+			None
+
+
+private pure func rewrite_constructor_length_match_fallback_with_cleanups(
+	fallback: Option[CoreConstructorLengthMatchBranch],
+	cleanups: List[CoreExpr],
+) -> Option[CoreConstructorLengthMatchBranch]:
+	match fallback:
+		Some(branch):
+			Some(rewrite_constructor_length_match_branch_with_cleanups(branch, cleanups))
+		None:
+			None
+
+
+private pure func rewrite_constructor_length_match_with_cleanups(
+	match_expr: CoreConstructorLengthMatch,
+	cleanups: List[CoreExpr],
+) -> CoreConstructorLengthMatch:
+	{
+		accessor = match_expr.accessor,
+		cases = rewrite_constructor_length_match_cases_with_cleanups(match_expr.cases, cleanups),
+		geq = rewrite_constructor_length_match_geq_with_cleanups(match_expr.geq, cleanups),
+		fallback = rewrite_constructor_length_match_fallback_with_cleanups(
+			match_expr.fallback,
+			cleanups,
+		),
+		result_type = match_expr.result_type,
+		loc = match_expr.loc
+	}
+
+
+private pure func rewrite_constructor_match_body_with_cleanups(
+	body: CoreConstructorMatchBody,
+	cleanups: List[CoreExpr],
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(rewrite_resource_expr_with_cleanups(expr, cleanups))
+		ConstructorMatchBodyLiteral(match_expr):
+			ConstructorMatchBodyLiteral(
+				rewrite_constructor_literal_match_with_cleanups(
+					match_expr,
+					cleanups,
+				),
+			)
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength(
+				rewrite_constructor_length_match_with_cleanups(
+					match_expr,
+					cleanups,
+				),
+			)
 
 
 private pure func rewrite_constructor_match_cases_with_cleanups(
@@ -467,9 +703,10 @@ private pure func rewrite_constructor_match_cases_with_cleanups(
 	for match_case in cases:
 		result = result.append({
 			constructor = match_case.constructor,
+			accessor = match_case.accessor,
 			test = match_case.test,
 			bindings = match_case.bindings,
-			body = rewrite_resource_expr_with_cleanups(match_case.body, cleanups),
+			body = rewrite_constructor_match_body_with_cleanups(match_case.body, cleanups),
 		})
 
 	result
@@ -482,6 +719,11 @@ private pure func rewrite_constructor_match_fallback_with_cleanups(
 	match fallback:
 		ConstructorMatchFallbackBody(body):
 			ConstructorMatchFallbackBody(rewrite_resource_expr_with_cleanups(body, cleanups))
+		ConstructorMatchFallbackBindings(bindings, body):
+			ConstructorMatchFallbackBindings(
+				bindings,
+				rewrite_resource_expr_with_cleanups(body, cleanups),
+			)
 		ConstructorMatchFallbackFail:
 			ConstructorMatchFallbackFail
 
@@ -532,7 +774,20 @@ private pure func rewrite_resource_expr_with_cleanups(
 					binder = for_list.binder,
 					layout = for_list.layout,
 					iterable = rewrite_resource_expr_with_cleanups(for_list.iterable, cleanups),
+					iterable_release_policy = for_list.iterable_release_policy,
 					body = rewrite_resource_expr_with_cleanups(for_list.body, [])
+				},
+				typ,
+				loc,
+			)
+		ForTensorExpr(for_tensor, typ, loc):
+			ForTensorExpr(
+				{
+					binder = for_tensor.binder,
+					element_storage = for_tensor.element_storage,
+					iterable = rewrite_resource_expr_with_cleanups(for_tensor.iterable, cleanups),
+					iterable_release_policy = for_tensor.iterable_release_policy,
+					body = rewrite_resource_expr_with_cleanups(for_tensor.body, [])
 				},
 				typ,
 				loc,
@@ -624,7 +879,10 @@ private pure func rewrite_resource_expr_with_cleanups(
 		TupleConstructExpr(tuple_construct, typ, loc):
 			TupleConstructExpr(
 				{
-					elements = rewrite_tuple_elements_with_cleanups(tuple_construct.elements, cleanups),
+					elements = rewrite_tuple_elements_with_cleanups(
+						tuple_construct.elements,
+						cleanups,
+					),
 					release_mask = tuple_construct.release_mask,
 					retain_mask = tuple_construct.retain_mask
 				},
@@ -693,6 +951,30 @@ private pure func rewrite_resource_expr_with_cleanups(
 				typ,
 				loc,
 			)
+		TensorLiteralExpr(literal, typ, loc):
+			TensorLiteralExpr(
+				rewrite_tensor_literal_with_cleanups(literal, cleanups),
+				typ,
+				loc,
+			)
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			TensorBoxedLiteralExpr(
+				rewrite_tensor_boxed_literal_with_cleanups(literal, cleanups),
+				typ,
+				loc,
+			)
+		TensorPackedLiteralExpr(literal, typ, loc):
+			TensorPackedLiteralExpr(
+				rewrite_tensor_packed_literal_with_cleanups(literal, cleanups),
+				typ,
+				loc,
+			)
+		TensorRawFillExpr(fill, typ, loc):
+			TensorRawFillExpr(
+				rewrite_tensor_raw_fill_with_cleanups(fill, cleanups),
+				typ,
+				loc,
+			)
 		TensorRawReadExpr(read, typ, loc):
 			TensorRawReadExpr(
 				rewrite_tensor_raw_read_with_cleanups(read, cleanups),
@@ -756,7 +1038,10 @@ private pure func rewrite_resource_expr_with_cleanups(
 					constructor_name = construct.constructor_name,
 					constructor_c_name = construct.constructor_c_name,
 					representation = construct.representation,
-					args = rewrite_resource_expr_list_with_cleanups(construct.args, cleanups)
+					payload_storage = construct.payload_storage,
+					uses_release_mask = construct.uses_release_mask,
+					release_mask = construct.release_mask,
+					args = rewrite_boxed_storage_values_with_cleanups(construct.args, cleanups)
 				},
 				typ,
 				loc,
@@ -792,6 +1077,22 @@ private pure func rewrite_resource_expr_with_cleanups(
 				rewrite_resource_expr_with_cleanups(first, cleanups),
 				rewrite_resource_expr_with_cleanups(second, cleanups),
 			)
+		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			AccessorLiteralMatchExpr(
+				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
+				scrutinee_release_policy,
+				rewrite_constructor_literal_match_with_cleanups(match_expr, cleanups),
+				typ,
+				loc,
+			)
+		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			LengthMatchExpr(
+				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
+				scrutinee_release_policy,
+				rewrite_constructor_length_match_with_cleanups(match_expr, cleanups),
+				typ,
+				loc,
+			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
 				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
@@ -800,9 +1101,10 @@ private pure func rewrite_resource_expr_with_cleanups(
 				typ,
 				loc,
 			)
-		ConstructorMatchExpr(scrutinee, cases, fallback, typ, loc):
+		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
 			ConstructorMatchExpr(
 				rewrite_resource_expr_with_cleanups(scrutinee, cleanups),
+				scrutinee_release_policy,
 				rewrite_constructor_match_cases_with_cleanups(cases, cleanups),
 				rewrite_constructor_match_fallback_with_cleanups(fallback, cleanups),
 				typ,

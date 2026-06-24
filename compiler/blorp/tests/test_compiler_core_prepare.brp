@@ -1,5 +1,7 @@
 import:
 	../compiler_core_json:
+		CoreBoxKind(PrimBox),
+		CoreBoxedStorageValue,
 		CoreCallKind(UserCall),
 		CoreDecl(FunctionDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
 		CoreExpr(
@@ -23,7 +25,13 @@ import:
 		CoreTupleElement(TuplePointerElement, TuplePrimElement, TupleVoidElement),
 		CoreType(HeapRecordType, NamedType, TupleType, UnionType, ValueRecordType, VoidType),
 		CoreUnionDecl,
-		CoreUnionRepresentation(GenericUnionRepresentation, StackOptionRepresentation),
+		CoreUnionField,
+		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+		CoreUnionRepresentation(
+			GenericUnionRepresentation,
+			StackOptionRepresentation,
+			StackResultRepresentation,
+		),
 		CoreValueRecordDecl,
 		core_program_to_json,
 	../compiler_core_prepare: is_primitive_tuple_slot_type, prepare_program
@@ -34,8 +42,24 @@ pure func int_type() -> CoreType:
 	NamedType("Int", [])
 
 
+pure func int_boxed_value(value: CoreExpr) -> CoreBoxedStorageValue:
+	{
+		kind = PrimBox,
+		value = value,
+		needs_release = False,
+		transfers_ownership = False
+	}
+
+
 pure func string_type() -> CoreType:
 	NamedType("String", [])
+
+
+pure func no_release_union_field(typ: CoreType) -> CoreUnionField:
+	{
+		typ = typ,
+		release_policy = NoReleasePolicy
+	}
 
 
 pure func closure_type() -> CoreType:
@@ -60,6 +84,13 @@ pure func choice_type() -> CoreType:
 
 pure func option_int_type() -> CoreType:
 	NamedType("Option", [int_type()])
+
+
+pure func result_int_string_type() -> CoreType:
+	NamedType(
+		"Result",
+		[int_type(), string_type()],
+	)
 
 
 pure func int_pair_type() -> CoreType:
@@ -122,12 +153,13 @@ pure func box_heap_record_decl() -> CoreHeapRecordDecl:
 pure func choice_union_decl() -> CoreUnionDecl:
 	{
 		name = "Choice",
+		payload_storage = TypedUnionPayloadStorage,
 		variants = [{
 				name = "Picked",
 				c_name = "__def_44_Picked",
 				tag_c_name = "TAG_Choice_Picked",
 				tag = 0,
-				fields = [int_type()],
+				fields = [no_release_union_field(int_type())],
 				def_id = Some(44)
 			}],
 		loc = SyntheticSourceLoc
@@ -379,10 +411,13 @@ pure func prepared_choice_constructor() -> CoreExpr:
 	UnionConstructExpr(
 		{
 			type_name = "Choice",
-			constructor_name = "Picked",
-			constructor_c_name = "__def_44_Picked",
-			representation = GenericUnionRepresentation,
-			args = [int_literal(7)]
+				constructor_name = "Picked",
+				constructor_c_name = "__def_44_Picked",
+				representation = GenericUnionRepresentation,
+				payload_storage = TypedUnionPayloadStorage,
+				uses_release_mask = False,
+				release_mask = 0,
+				args = [int_boxed_value(int_literal(7))]
 		},
 		choice_type(),
 		SyntheticSourceLoc,
@@ -416,14 +451,59 @@ pure func prepared_stack_option_some() -> CoreExpr:
 			type_name = "Option",
 			constructor_name = "Some",
 			constructor_c_name = "Some",
-			representation = StackOptionRepresentation({
-				option_type = "blorp_StackOption_Int",
-				tag = 0,
-				none_value = "0L",
-			}),
-			args = [int_literal(7)]
+				representation = StackOptionRepresentation({
+					option_type = "blorp_StackOption_Int",
+					tag = 0,
+					none_value = "0L",
+				}),
+				payload_storage = TypedUnionPayloadStorage,
+				uses_release_mask = False,
+				release_mask = 0,
+				args = [int_boxed_value(int_literal(7))]
 		},
 		option_int_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func stack_result_ok_call() -> CoreExpr:
+	CallExpr(
+		UserCall(
+			"Ok",
+			None,
+		),
+		VarExpr(
+			{
+				name = "Ok",
+				uniq = 0,
+				def_id = None
+			},
+			result_int_string_type(),
+			SyntheticSourceLoc,
+		),
+		[int_literal(7)],
+		result_int_string_type(),
+		SyntheticSourceLoc,
+	)
+
+
+pure func prepared_stack_result_ok() -> CoreExpr:
+	UnionConstructExpr(
+		{
+			type_name = "Result",
+			constructor_name = "Ok",
+			constructor_c_name = "Ok",
+				representation = StackResultRepresentation({
+					result_type = "blorp_StackResult",
+					tag = 0,
+					release_mask = 0,
+				}),
+				payload_storage = TypedUnionPayloadStorage,
+				uses_release_mask = False,
+				release_mask = 0,
+				args = [int_boxed_value(int_literal(7))]
+		},
+		result_int_string_type(),
 		SyntheticSourceLoc,
 	)
 
@@ -529,6 +609,18 @@ pure func test_prepare_converts_stack_option_some_call() -> Bool:
 	programs_equal(actual, expected)
 
 
+pure func test_prepare_converts_stack_result_ok_call() -> Bool:
+	actual: CoreProgram = prepare_program(
+		program_with_body(
+			stack_result_ok_call(),
+			result_int_string_type(),
+		),
+	)
+	expected: CoreProgram = program_with_body(prepared_stack_result_ok(), result_int_string_type())
+
+	programs_equal(actual, expected)
+
+
 pure func test_primitive_tuple_slot_type_is_narrow() -> Bool:
 	(
 		is_primitive_tuple_slot_type(int_type())
@@ -560,6 +652,7 @@ tests: TestSuite = {
 		("prepare recurses into call arguments", test_prepare_recurses_into_call_arguments),
 		("prepare converts union constructor call", test_prepare_converts_union_constructor_call),
 		("prepare converts stack Option Some call", test_prepare_converts_stack_option_some_call),
+		("prepare converts stack Result Ok call", test_prepare_converts_stack_result_ok_call),
 		("primitive tuple slot type is narrow", test_primitive_tuple_slot_type_is_narrow),
 	]
 }

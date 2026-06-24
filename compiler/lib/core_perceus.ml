@@ -1518,7 +1518,7 @@ let drop_after_body (n : int) (v : var) (ty : Ast.type_expr) (body : core) :
     let drop = prepend_drops n v ty void_node in
     { body with desc = CSeq (body, drop) }
   else
-    let tmp_name = Printf.sprintf "__cdrop_%s" v.vname in
+    let tmp_name = Printf.sprintf "__cdrop_%s" (Core.Var.to_c_name v) in
     let tmp_var = Core.Var.named tmp_name in
     let tmp_ty = body.ty in
     let tmp_ref = { desc = CVar tmp_var; ty = tmp_ty; loc = body.loc } in
@@ -4852,7 +4852,9 @@ let transform_concurrent (env : type_env) (e : core) : core =
               (* Value-returning tail: bind to a temp, drop, return the temp.
                  [CLet] + [CDrop] sequence: evaluate tail into [__cdrop_X],
                  then drop [b], then read back [__cdrop_X]. *)
-              let tmp_name = Printf.sprintf "__cdrop_%s" b.cb_var.vname in
+              let tmp_name =
+                Printf.sprintf "__cdrop_%s" (Core.Var.to_c_name b.cb_var)
+              in
               let tmp_var = Core.Var.named tmp_name in
               let tmp_ty = tail.ty in
               let tmp_ref =

@@ -147,26 +147,6 @@ type emit_node =
   | ListReuseAllocForResult of { result : core; list : core; capacity : core }
   | ListRetainForStorage of { list : core; value : core }
   | TensorRawViewDecl of tensor_raw_view_binding
-  | TensorLiteral of { loc : Ast.loc; literal : tensor_literal }
-  | TensorDirectFillFactory of {
-      loc : Ast.loc;
-      layout : tensor_storage_layout;
-      value : core;
-      dims : core list;
-    }
-  | TensorFillInlineStruct of {
-      function_name : string;
-      value : core;
-      dims : core list;
-      struct_ty : string;
-    }
-  | TensorFillBoxed of {
-      function_name : string;
-      value : core;
-      dims : core list;
-      fill_value_policy :
-        Core_emit_blorp_prepared_backend.tensor_fill_value_policy;
-    }
   | TensorRawRead of tensor_raw_read
   | TensorRawWriteExpr of tensor_raw_write
   | TensorRawWriteStmt of tensor_raw_write
@@ -421,65 +401,6 @@ let emit emitters ctx = function
   | TensorRawViewDecl binding ->
       Core_emit_blorp_prepared_backend.emit_tensor_raw_view_decl
         ~emit_expr:emitters.emit_expr ctx binding
-  | TensorLiteral { loc; literal } ->
-      if
-        not
-          (tensor_literal_layout_matches_payload literal.tl_layout
-             literal.tl_payload)
-      then
-        let expected =
-          tensor_storage_slot_layout_str literal.tl_layout.tsl_slots
-        in
-        let actual =
-          tensor_storage_slot_layout_str
-            (tensor_literal_payload_slot_layout literal.tl_payload)
-        in
-        Core_error.errorf Core_error.Emit loc
-          ~hint:
-            "Run with --check-invariants to catch malformed final Core before \
-             emission. Tensor literal storage layout and payload \
-             representation must be selected together in Core_codegen_prepare."
-          "tensor literal layout `%s` does not match payload storage `%s`"
-          expected actual
-      else ();
-      let temp_seed = string_of_int (Core_emit_context.fresh_temp ctx) in
-      let tensor_tmp =
-        Core_emit_blorp_prepared_backend.render_tensor_literal_name temp_seed
-      in
-      let alloc_call =
-        Core_emit_blorp_prepared_backend.render_tensor_literal_alloc_call
-          literal.tl_layout literal.tl_shape
-      in
-      let elem_needs_release =
-        tensor_storage_layout_requires_release_or_error ~phase:Core_error.Emit
-          ~loc literal.tl_layout
-      in
-      let init_statements =
-        if elem_needs_release then
-          [
-            Core_emit_blorp_prepared_backend
-            .render_tensor_literal_init_elem_release ~tensor_tmp;
-          ]
-        else []
-      in
-      let element_statements =
-        Core_emit_blorp_prepared_backend.render_tensor_literal_statements
-          ~emit_expr:emitters.emit_expr ~emit_boxed:emitters.emit_boxed_storage
-          ctx ~tensor_tmp ~elem_needs_release literal.tl_payload
-      in
-      Core_emit_blorp_prepared_backend.emit_tensor_literal_construct ctx
-        ~tensor_tmp ~alloc_call
-        ~statements:(init_statements @ element_statements)
-  | TensorDirectFillFactory { loc; layout; value; dims } ->
-      Core_emit_blorp_prepared_backend.emit_tensor_direct_fill_factory
-        ~emit_expr:emitters.emit_expr ctx loc layout value dims
-  | TensorFillInlineStruct { function_name; value; dims; struct_ty } ->
-      Core_emit_blorp_prepared_backend.emit_tensor_fill_inline_struct
-        ~emit_expr:emitters.emit_expr ctx function_name value dims ~struct_ty
-  | TensorFillBoxed { function_name; value; dims; fill_value_policy } ->
-      Core_emit_blorp_prepared_backend.emit_tensor_fill_boxed
-        ~emit_expr:emitters.emit_expr ~emit_boxed:emitters.emit_boxed_core ctx
-        function_name value dims ~fill_value_policy
   | TensorRawRead read ->
       Core_emit_blorp_prepared_backend.emit_tensor_raw_read
         ~emit_expr:emitters.emit_expr ctx read
