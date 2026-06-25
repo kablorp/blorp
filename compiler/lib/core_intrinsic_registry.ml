@@ -12,8 +12,8 @@
     {1 Contract}
 
     Every intrinsic listed here MUST have:
-    - An emitter in [core_emit_intrinsic.ml] or a Blorp-owned template entry in
-      [core_emit_blorp_intrinsic_templates.tsv]
+    - A Blorp-owned renderer entry in
+      [compiler/blorp/codegen_intrinsic_renderer.brp]
     - Documentation of its semantics (what it does, not how)
 
     IR bodies in [core_intrinsics.ml] compose these primitives into
@@ -23,10 +23,14 @@
     {1 Adding new intrinsics}
 
     1. Add the entry here with name, arg types, return type, and semantics.
-    2. Add the emitter case in [core_emit_intrinsic.ml], or add a simple
-       expression template through [compiler/blorp/codegen_intrinsic_renderer.brp]
-       and regenerate [core_emit_blorp_intrinsic_templates.tsv].
+    2. Add the Blorp renderer case in
+       [compiler/blorp/codegen_intrinsic_renderer.brp].
     3. Use it in [core_intrinsics.ml] IR bodies via [intr "name" args ty].
+
+    [core_emit_intrinsic.ml] is retained only for the temporary OCaml bootstrap
+    emitter used while building the Blorp compiler bridge. Do not add new
+    production emission behavior there unless the bridge bootstrap path needs
+    a matching compatibility case.
 
     {1 How builtin works}
 

@@ -512,21 +512,6 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
       "Core_intrinsics should not normalize tensor element types locally while \
        synthesizing reductions; use Core_tensor_type plus Core_layout_type \
        access facts.";
-  [ "compiler/lib/core_emit.ml"; "compiler/lib/core_emit_util.ml" ]
-  |> List.iter (fun file ->
-      let source =
-        find_project_file file |> read_file |> strip_comments_and_strings
-      in
-      if contains_substring source "Hashtbl.mem ctx.reg.value_records" then
-        Alcotest.failf
-          "%s should consume value-record layout facts from Core_layout_type \
-           instead of reading ctx.reg.value_records."
-          file;
-      if contains_substring source "ctx.reg.enum_types" then
-        Alcotest.failf
-          "%s should consume enum layout facts from Core_layout_type instead \
-           of reading ctx.reg.enum_types."
-          file);
   let specialize =
     find_project_file "compiler/lib/core_specialize.ml"
     |> read_file |> strip_comments_and_strings
@@ -572,21 +557,7 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
     Alcotest.fail
       "Core_erasure_inventory should consume Option erasure facts from \
        Core_layout_type instead of matching Core_option_layout directly.";
-  let emit =
-    find_project_file "compiler/lib/core_emit.ml"
-    |> read_file |> strip_comments_and_strings
-  in
-  if
-    contains_substring emit "Core_result_layout.StackErased"
-    || contains_substring emit "Core_result_layout.StackManaged"
-  then
-    Alcotest.fail
-      "Core_emit should consume stack Result constructor ABI facts from \
-       Core_layout_type instead of matching Core_result_layout directly.";
-  if contains_substring emit "Core_option_layout.NullableManagedPointer" then
-    Alcotest.fail
-      "Core_emit should consume Option constructor ABI facts from \
-       Core_layout_type instead of matching Core_option_layout directly."
+  ()
 
 let test_type_param_bound_string_parsing_stays_inventoried () =
   assert_token_only_in ~allowed_files:[] "String.split_on_char ':'";

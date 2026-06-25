@@ -45,13 +45,10 @@
       triad is this module's only runtime dependency in the
       [compiler/lib/codegen/] directory.
 
-    {1 Decomposition}
-
-    At ~1800 LOC this file is the single largest module in the
-    compiler. It should be split into
-    [core_emit_intrinsic.ml] / [core_emit_pattern.ml] /
-    [core_emit_concurrent.ml] / [core_emit_lambda.ml], leaving
-    [core_emit.ml] as a slim top-level dispatcher. *)
+    This OCaml emitter is now a bootstrap compatibility path for compiling the
+    Blorp compiler bridge. Production C emission should be added to the Blorp
+    backend under [compiler/blorp/], not here, unless the bridge bootstrap path
+    explicitly needs matching support. *)
 
 open Core
 open Core_emit_context

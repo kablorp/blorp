@@ -104,6 +104,36 @@ let rec head_resolve ?sess (ty : type_expr) : type_expr =
       | None -> ty)
   | _ -> ty
 
+(** Recursively follow bound metas while preserving unbound metas. Expected-type
+    propagation uses this during inference: unbound metas are live constraints,
+    not output-ready type variables. *)
+let rec resolve_bound_metas ?sess (ty : type_expr) : type_expr =
+  let sess = sess_of ?sess () in
+  match ty with
+  | TyMeta n -> (
+      match lookup_meta ~sess n with
+      | Some inner -> resolve_bound_metas ~sess inner
+      | None -> ty)
+  | TyNamed (name, args) ->
+      TyNamed (name, List.map (resolve_bound_metas ~sess) args)
+  | TyArray (elem, dims) ->
+      TyArray
+        ( resolve_bound_metas ~sess elem,
+          List.map (resolve_bound_metas ~sess) dims )
+  | TyFunc { params; return; is_pure } ->
+      TyFunc
+        {
+          params = List.map (resolve_bound_metas ~sess) params;
+          return = resolve_bound_metas ~sess return;
+          is_pure;
+        }
+  | TyTuple elems -> TyTuple (List.map (resolve_bound_metas ~sess) elems)
+  | TyRange inner -> TyRange (resolve_bound_metas ~sess inner)
+  | TyDimOp (op, a, b) ->
+      TyDimOp
+        (op, resolve_bound_metas ~sess a, resolve_bound_metas ~sess b)
+  | _ -> ty
+
 (** Recursively resolve a type: follow every [TyMeta] through the env to
     its final binding, then recurse structurally. Idempotent.
 

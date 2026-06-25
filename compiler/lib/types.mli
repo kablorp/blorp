@@ -162,6 +162,10 @@ val head_resolve : ?sess:Session.t -> type_expr -> type_expr
 (** Head-resolve a type: follow [TyMeta] chains through the session one
     hop at a time, without recursing into arguments. *)
 
+val resolve_bound_metas : ?sess:Session.t -> type_expr -> type_expr
+(** Resolve every bound [TyMeta] through the env while preserving unbound metas
+    as inference constraints. *)
+
 val ty_int : type_expr
 (** Built-in type constructors *)
 

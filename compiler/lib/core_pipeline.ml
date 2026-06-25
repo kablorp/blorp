@@ -27,12 +27,13 @@
     15. [Core_perceus] — insert CDup/CDrop for reference counting
     16. [Core_reuse] — analyze post-Perceus reuse candidates
     17. [Core_closure] — hoist lambdas and create closure values
-    18. [Core_resource] — make resource cleanup before nonlocal loop exits explicit
-    19. [Core_fairness] — insert compiler-owned cooperative loop checkpoints
-    20. [Core_codegen_prepare] — make final representation/layout facts explicit
-    21. [Core_reuse] prepared union reuse — reuse source-owned union nodes after
-       constructors and box/unbox storage have explicit final-Core shapes
-    22. backend emit — final Core → C string, preferring Blorp-owned emission
+    18. backend handoff — default compilation gives post-closure Core to Blorp
+    19. Blorp-owned final tail — resource cleanup lowering, fairness
+       checkpoints, codegen preparation, and C artifact emission
+
+    OCaml can still materialize the old final tail for observability paths
+    ([--dump-core-after=final], [--check-invariants], profiling) because those
+    hooks operate on OCaml [Core.core_program] values.
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -117,24 +118,33 @@ let fire_stage ~(check_invariants : bool) ~(user : on_stage_callback)
     identical before and after the check — the check is a pure fold.
 
     If invariants fire, the user callback never runs. Development checks run
-    only when [check_invariants] is true; the final safety boundary always
-    rejects unresolved calls and unconverted closure/concurrency forms before
-    emission. *)
+    only when [check_invariants] is true. Default emission hands off before the
+    final tail; the Blorp backend boundary rejects unsupported or unresolved
+    shapes before producing C. *)
 let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
     on_stage_callback =
  fun stage prog -> fire_stage ~check_invariants ~user stage prog
 
-(** Run final prepared Core emission through the single C backend path. Blorp
-    owns the current final-Core emission contract; earlier handoff points should
-    be reintroduced only after those Core shapes are represented and tested in
-    the Blorp emitter. *)
+type backend_core_input = {
+  blorp_tail_input : Core.core_program;
+      (** Post-closure Core handed to Blorp for resource/fairness/prepare and
+          emission on the default path. *)
+  ocaml_final_for_observability : Core.core_program Lazy.t;
+      (** Lazy OCaml-final Core kept only for final-stage dumps, invariant
+          checks, profiling, and renderer-helper bootstrap. *)
+}
+
+(** Run C emission through the single Blorp backend path. Normal compilation
+    hands off before the final tail so Blorp owns resource/fairness/prepare.
+    Observability paths can still materialize OCaml-final Core because stage
+    hooks operate on [Core.core_program] values inside OCaml. *)
 let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
-    ~(reg : Codegen_types.registry) (final_prog : Core.core_program Lazy.t) :
-    string =
+    ~(reg : Codegen_types.registry) ~(needs_ocaml_final : bool)
+    (backend_input : backend_core_input) : string =
   let building_blorp_renderer_bridge =
     Sys.getenv_opt "BLORP_COMPILER_RENDERER_HELPER" = Some "1"
   in
-  let final () = Lazy.force final_prog in
+  let final () = Lazy.force backend_input.ocaml_final_for_observability in
   let emit_with_ocaml_backend () =
     let ctx = Core_emit_context.create ~profile ~reg () in
     Core_emit.emit_program ~embed_runtime ctx (final ());
@@ -145,7 +155,14 @@ let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
     let cfg =
       Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile ~reg ()
     in
-    match Core_emit_blorp_c.try_emit_program_string cfg (final ()) with
+    let result =
+      if needs_ocaml_final then
+        Core_emit_blorp_c.try_emit_prepared_program_string cfg (final ())
+      else
+        Core_emit_blorp_c.try_prepare_and_emit_program_string cfg
+          backend_input.blorp_tail_input
+    in
+    match result with
     | Ok c_code -> c_code
     | Error reason -> failwith reason
 
@@ -157,7 +174,7 @@ let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
 let run_core_passes ?(import_aliases = Hashtbl.create 0)
     ?(module_imports = Hashtbl.create 0) ~(on_stage : on_stage_callback)
     ~(reg : Codegen_types.registry) ?(debug = false) (prog : Core.core_program)
-    : Core.core_program Lazy.t =
+    : backend_core_input =
   let observe stage prog =
     on_stage stage prog;
     prog
@@ -212,12 +229,13 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
        |> Core_reuse.rewrite_prepared_program ~reg
        |> observe Core_stage.Final)
   in
-  final
+  { blorp_tail_input = pre_resource; ocaml_final_for_observability = final }
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     ?on_stage ?(check_invariants = false) (typed_program : Typed_ast.program) :
     string =
   let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
+  let needs_ocaml_final = Option.is_some on_stage || check_invariants in
   let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
   Session.reset_core_counters (Session.current ());
   let core_prog = Core_lower.lower_typed_program typed_program in
@@ -229,8 +247,9 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
   Core_flatten.register_types reg core_prog;
   let core_prog = Core_ffi_boundary.annotate_program ~reg core_prog in
   let core_prog = Core_list_layout.annotate_program ~reg core_prog in
-  let final_prog = run_core_passes ~on_stage ~reg ~debug core_prog in
-  emit_via_c_backend ~embed_runtime ~profile ~reg final_prog
+  let backend_input = run_core_passes ~on_stage ~reg ~debug core_prog in
+  emit_via_c_backend ~embed_runtime ~profile ~reg ~needs_ocaml_final
+    backend_input
 
 (** Compile a typed AST program with module support.
 
@@ -245,6 +264,7 @@ let compile_typed_with_modules ?(main_import_bindings = [])
     ?(check_invariants = false) (typed_main : Typed_ast.program) :
     string * string list * string list =
   let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
+  let needs_ocaml_final = Option.is_some on_stage || check_invariants in
   let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
   let program = Typed_ast.program_ast typed_main in
   Session.reset_core_counters (Session.current ());
@@ -318,10 +338,13 @@ let compile_typed_with_modules ?(main_import_bindings = [])
   Core_flatten.register_types reg full;
   let full = Core_ffi_boundary.annotate_program ~reg full in
   let full = Core_list_layout.annotate_program ~reg full in
-  let final_prog =
+  let backend_input =
     run_core_passes ~on_stage ~reg ~import_aliases ~module_imports ~debug full
   in
-  let output = emit_via_c_backend ~embed_runtime ~profile ~reg final_prog in
+  let output =
+    emit_via_c_backend ~embed_runtime ~profile ~reg ~needs_ocaml_final
+      backend_input
+  in
   (* Foreign metadata is pulled from the lowered program rather than the
      loaded-module AST so main-program FFI declarations are included too. *)
   let host = Platform.current () in

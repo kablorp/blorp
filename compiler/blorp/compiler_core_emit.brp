@@ -654,6 +654,33 @@ private TENSOR_FILL_TEMP_SEED: String = "tensor_fill"
 
 private TENSOR_PACKED_FILL_TEMP_SEED: String = "tensor_packed_fill"
 
+private TENSOR_RECEIVER_CONSUMING_RUNTIME_CALLS: List[String] = [
+	"blorp_vector_set_cow",
+	"blorp_vector_set_cow_nullable",
+	"blorp_checked_set",
+	"blorp_vector_set_inplace",
+	"blorp_vector_set_cow_f32",
+	"blorp_vector_set_cow_nullable_f32",
+	"blorp_vector_set_cow_i64",
+	"blorp_vector_set_cow_nullable_i64",
+	"blorp_vector_set_inplace_packed",
+	"blorp_vector_set_inplace_f32",
+	"blorp_vector_set_inplace_f64",
+	"blorp_vector_set_inplace_i64",
+	"blorp_vector_set_inplace_f16",
+	"blorp_matrix_checked_set",
+	"blorp_matrix_set_opt",
+	"blorp_matrix_set_opt_nullable",
+	"blorp_matrix_checked_set_f64",
+	"blorp_matrix_checked_set_f32",
+	"blorp_matrix_checked_set_i64",
+	"blorp_matrix_set_opt_i64",
+	"blorp_matrix_set_opt_nullable_i64",
+	"blorp_tensor3_checked_set",
+	"blorp_tensor4_checked_set",
+	"blorp_tensor5_checked_set",
+]
+
 private DICT_CONSTRUCT_TEMP_SEED: String = "dict"
 
 private DICT_GET_TEMP_SEED: String = "dict_get"
@@ -665,13 +692,9 @@ private CHANNEL_SEND_TEMP_SEED: String = "channel_send"
 private TUPLE_RC_TEMP_SEED: String = "tuple"
 
 
-private union ListHandoffEmitMode:
+private enum ListHandoffEmitMode:
 	EmitBorrowFreshHandoff
 	EmitConsumeReuseHandoff
-
-
-private union ListHandoffEmitWriteOrder:
-	EmitForwardCompactingHandoff
 
 
 private union FixedBinaryRuntime:
@@ -789,7 +812,6 @@ pure func core_emit_error_to_string(error: CoreEmitError) -> String:
 
 private DEFAULT_CORE_EMIT_OPTIONS: CoreEmitOptions = {profile = False}
 
-
 private MANGLED_DEF_ID_PREFIX: String = "__def_"
 
 
@@ -798,6 +820,18 @@ private record FunctionBodyC {
 	value: String,
 	next_temp: Int,
 	returns: Bool
+}
+
+
+private enum CallArgOwnership:
+	CallBorrowsArg
+	CallConsumesArg
+
+
+private record CallArgCleanupSlot {
+	slot_name: String,
+	policy: CoreReleasePolicy,
+	call_ownership: CallArgOwnership
 }
 
 
@@ -810,6 +844,7 @@ private record TailrecBindingC {
 private record CallArgsBody {
 	statements: String,
 	args: List[String],
+	cleanup_slots: List[CallArgCleanupSlot],
 	next_temp: Int
 }
 
@@ -1075,6 +1110,14 @@ private pure func closure_abi_value_for_type(typ: CoreType) -> Option[ClosureAbi
 			Some(ClosureAbiPointer)
 
 
+private pure func is_resource_source_type_name(name: String) -> Bool:
+	(
+		name == "ResourceSource"
+		or name == "std/stream::ResourceSource"
+		or name == "std_stream__ResourceSource"
+	)
+
+
 private pure func c_type_name(typ: CoreType) -> String:
 	match typ:
 		VoidType:
@@ -1144,7 +1187,7 @@ private pure func c_type_name(typ: CoreType) -> String:
 				"blorp_Closure*"
 			else if name == "Channel":
 				"blorp_Channel*"
-			else if name == "ResourceSource":
+			else if is_resource_source_type_name(name):
 				"blorp_ResourceSource*"
 			else if (
 				name == "Stream"
@@ -1605,7 +1648,21 @@ private pure func boxed_value_needs_release_type(typ: CoreType) -> Bool:
 				True
 			else if name == "Channel" and args.length() == 1:
 				True
-			else if name == "ResourceSource" and args.length() == 1:
+			else if is_resource_source_type_name(name):
+				True
+			else if (
+				(name == "Stream" or name == "std/stream::Stream" or name == "std_stream__Stream")
+				and args.length() == 1
+			):
+				True
+			else if (
+				((
+					name == "FallibleStream"
+					or name == "std/stream::FallibleStream"
+					or name == "std_stream__FallibleStream"
+				))
+				and args.length() == 2
+			):
 				True
 			else if name == "TcpListener" and args.length() == 0:
 				True
@@ -1617,10 +1674,12 @@ private pure func boxed_value_needs_release_type(typ: CoreType) -> Bool:
 				True
 			else if name == "UdpSocket" and args.length() == 0:
 				True
+			else if name == "Result" and args.length() == 2:
+				True
 			else:
 				False
 		StackResultType(ok_type, err_type):
-			False
+			True
 		BoxedResultType(ok_type, err_type):
 			True
 		HeapRecordType(name):
@@ -1641,13 +1700,39 @@ private pure func boxed_value_needs_release_type(typ: CoreType) -> Bool:
 			False
 
 
+private pure func dict_stored_value_needs_release_type(typ: CoreType) -> Bool:
+	match typ:
+		ValueRecordType(name):
+			True
+		StackResultType(ok_type, err_type):
+			True
+		NamedType(name, args):
+			boxed_value_needs_release_type(typ)
+		BoxedResultType(ok_type, err_type):
+			boxed_value_needs_release_type(typ)
+		HeapRecordType(name):
+			boxed_value_needs_release_type(typ)
+		UnionType(name):
+			boxed_value_needs_release_type(typ)
+		TupleType(items):
+			boxed_value_needs_release_type(typ)
+		TensorType:
+			boxed_value_needs_release_type(typ)
+		VoidType:
+			False
+		EnumType(name):
+			False
+		RangeType:
+			False
+
+
 private pure func dict_value_needs_release_type(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
 			if name == "Dict":
 				match args:
 					[key_type, value_type]:
-						boxed_value_needs_release_type(value_type)
+						dict_stored_value_needs_release_type(value_type)
 					[]:
 						False
 					[first]:
@@ -2186,19 +2271,7 @@ private pure func cleanup_release_fn(kind: CoreCallKind) -> Option[String]:
 private pure func resource_cleanup_hook(cleanup: CoreExpr) -> Option[ResourceCleanupHook]:
 	match cleanup:
 		CallExpr(kind, callee, args, typ, loc):
-			match args:
-				[VarExpr(variable, var_type, var_loc)]:
-					release_fn ?= cleanup_release_fn(kind)
-					Some({
-						variable = variable,
-						release_fn = release_fn,
-					})
-				[]:
-					None
-				[first]:
-					None
-				[first, second, ...rest]:
-					None
+			resource_cleanup_hook_for_args(kind, args)
 		LiteralExpr(literal, typ, loc):
 			None
 		VarExpr(variable, typ, loc):
@@ -2346,6 +2419,25 @@ private pure func resource_cleanup_hook(cleanup: CoreExpr) -> Option[ResourceCle
 		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
 			None
 		IfExpr(cond, then_expr, else_expr, typ, loc):
+			None
+
+
+private pure func resource_cleanup_hook_for_args(
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+) -> Option[ResourceCleanupHook]:
+	match args:
+		[VarExpr(variable, var_type, var_loc)]:
+			release_fn ?= cleanup_release_fn(kind)
+			Some({
+				variable = variable,
+				release_fn = release_fn,
+			})
+		[]:
+			None
+		[first]:
+			None
+		[first, second, ...rest]:
 			None
 
 
@@ -2644,11 +2736,7 @@ private pure func is_float_type(typ: CoreType) -> Bool:
 private pure func is_ieee_float_type(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
-			(
-				name == "Float"
-				or name == "Float32"
-				or name == "Float16"
-			) and args.length() == 0
+			(name == "Float" or name == "Float32" or name == "Float16") and args.length() == 0
 		StackResultType(ok_type, err_type):
 			False
 		BoxedResultType(ok_type, err_type):
@@ -3186,12 +3274,11 @@ private pure func is_binary_tensor_parallel_layout_builtin(name: String) -> Bool
 	)
 
 
-private pure func tensor_parallel_default_layout_metadata_args() -> List[String]:
-	[
-		render_prepared_tensor_op(TensorStorageModePointer),
-		render_prepared_tensor_op(TensorElementSizePointer),
-		render_prepared_tensor_op(TensorCallbackResultBits),
-	]
+private TENSOR_PARALLEL_DEFAULT_LAYOUT_METADATA_ARGS: List[String] = [
+	render_prepared_tensor_op(TensorStorageModePointer),
+	render_prepared_tensor_op(TensorElementSizePointer),
+	render_prepared_tensor_op(TensorCallbackResultBits),
+]
 
 
 private pure func tensor_parallel_raw_scalar_metadata_args(
@@ -3223,7 +3310,7 @@ private pure func tensor_parallel_layout_metadata_args(
 ) -> List[String]:
 	match layout:
 		TensorParallelPointerLayout:
-			tensor_parallel_default_layout_metadata_args()
+			TENSOR_PARALLEL_DEFAULT_LAYOUT_METADATA_ARGS
 		TensorParallelRawScalarLayout(raw_kind):
 			tensor_parallel_raw_scalar_metadata_args(raw_kind)
 		TensorParallelInlineStructLayout(c_type):
@@ -3237,7 +3324,7 @@ private pure func tensor_parallel_layout_metadata_args(
 private pure func with_tensor_parallel_layout_metadata(args: List[String]) -> List[String]:
 	var result: List[String] = args
 
-	for metadata_arg in tensor_parallel_default_layout_metadata_args():
+	for metadata_arg in TENSOR_PARALLEL_DEFAULT_LAYOUT_METADATA_ARGS:
 		result = result.append(metadata_arg)
 
 	result
@@ -4820,8 +4907,177 @@ private pure func emit_call_args_body(args: List[CoreExpr], next_temp: Int) -> O
 		Some({
 			statements = statements,
 			args = values,
+			cleanup_slots = [],
 			next_temp = temp_index,
 		})
+
+
+private pure func runtime_call_consumes_tensor_receiver(name: String) -> Bool:
+	TENSOR_RECEIVER_CONSUMING_RUNTIME_CALLS.contains(name)
+
+
+private pure func direct_runtime_call_arg_ownership(name: String, index: Int) -> CallArgOwnership:
+	if index == 0 and runtime_call_consumes_tensor_receiver(name):
+		CallConsumesArg
+	else if name == "blorp_stream_fold" and index == 1:
+		CallConsumesArg
+	else:
+		CallBorrowsArg
+
+
+private pure func call_arg_needs_cleanup(arg: CoreExpr) -> Bool:
+	policy: CoreReleasePolicy = cleanup_release_policy_for_type(core_expr_type(arg))
+	expr_transfers_ownership(arg) and release_policy_requires_cleanup(policy)
+
+
+private pure func materialized_call_arg_value(arg: CoreExpr, body: FunctionBodyC) -> FunctionBodyC:
+	if call_arg_needs_cleanup(arg):
+		result_name: String = temp_name("call_arg", body.next_temp)
+		{
+			statements = body.statements + "  " + c_type_name(
+				core_expr_type(arg),
+			) + " " + result_name + " = " + body.value + ";\n",
+			value = result_name,
+			next_temp = body.next_temp + 1,
+			returns = False
+		}
+	else:
+		scoped_body_value("call_arg", core_expr_type(arg), body)
+
+
+private pure func emit_direct_runtime_call_args_body(
+	call: CoreDirectRuntimeCall,
+	args: List[CoreExpr],
+	next_temp: Int,
+) -> Option[CallArgsBody]:
+	var statements: String = ""
+	var values: List[String] = []
+	var cleanup_slots: List[CallArgCleanupSlot] = []
+	var failed: Bool = False
+	var temp_index: Int = next_temp
+	var index: Int = 0
+
+	for arg in args:
+		if not failed:
+			match emit_function_body(arg, temp_index):
+				Some(arg_body):
+					if arg_body.returns:
+						failed = True
+					else:
+						match required_body_value(arg_body):
+							Some(arg_value):
+								scoped_arg: FunctionBodyC = materialized_call_arg_value(
+									arg,
+									arg_body,
+								)
+								ownership: CallArgOwnership = direct_runtime_call_arg_ownership(
+									call.name,
+									index,
+								)
+								policy: CoreReleasePolicy = cleanup_release_policy_for_type(
+									core_expr_type(arg),
+								)
+								needs_cleanup: Bool = call_arg_needs_cleanup(arg)
+								statements += scoped_arg.statements
+
+								if needs_cleanup:
+									statements += owned_temp_cleanup_push_statement(
+										scoped_arg.value,
+										policy,
+									)
+									cleanup_slots = cleanup_slots.append({
+										slot_name = scoped_arg.value,
+										policy = policy,
+										call_ownership = ownership,
+									})
+
+								values = values.append(scoped_arg.value)
+								temp_index = scoped_arg.next_temp
+							None:
+								failed = True
+				None:
+					failed = True
+
+		index += 1
+
+	if failed:
+		None
+	else:
+		Some({
+			statements = statements,
+			args = values,
+			cleanup_slots = cleanup_slots,
+			next_temp = temp_index,
+		})
+
+
+private pure func call_arg_cleanup_pop_statement(cleanup: CallArgCleanupSlot) -> String:
+	owned_temp_cleanup_pop_statement(cleanup.slot_name, cleanup.policy)
+
+
+private pure func call_arg_cleanup_before_call(cleanup_slots: List[CallArgCleanupSlot]) -> String:
+	var statements: String = ""
+
+	for cleanup in cleanup_slots:
+		match cleanup.call_ownership:
+			CallConsumesArg:
+				statements += call_arg_cleanup_pop_statement(cleanup)
+			CallBorrowsArg:
+				void
+
+	statements
+
+
+private pure func call_arg_cleanup_after_call(cleanup_slots: List[CallArgCleanupSlot]) -> String:
+	var statements: String = ""
+
+	for cleanup in cleanup_slots:
+		match cleanup.call_ownership:
+			CallBorrowsArg:
+				statements += call_arg_cleanup_pop_statement(
+					cleanup,
+				) + emit_release_statement(cleanup.slot_name, cleanup.policy)
+			CallConsumesArg:
+				void
+
+	statements
+
+
+private pure func call_body_from_value(
+	args_body: CallArgsBody,
+	before_call: String,
+	value: String,
+	typ: CoreType,
+) -> FunctionBodyC:
+	call_prefix: String = args_body.statements + before_call + call_arg_cleanup_before_call(
+		args_body.cleanup_slots,
+	)
+	call_suffix: String = call_arg_cleanup_after_call(args_body.cleanup_slots)
+
+	if call_suffix == "":
+		{
+			statements = call_prefix,
+			value = value,
+			next_temp = args_body.next_temp,
+			returns = False
+		}
+	else if is_void_type(typ):
+		{
+			statements = call_prefix + "  " + value + ";\n" + call_suffix,
+			value = "",
+			next_temp = args_body.next_temp,
+			returns = False
+		}
+	else:
+		result_name: String = temp_name("call_result", args_body.next_temp)
+		{
+			statements = call_prefix + "  " + c_type_name(
+				typ,
+			) + " " + result_name + " = " + value + ";\n" + call_suffix,
+			value = result_name,
+			next_temp = args_body.next_temp + 1,
+			returns = False
+		}
 
 
 private pure func foreign_copy_c_type(copy_kind: CoreForeignCopyKind) -> String:
@@ -5555,6 +5811,95 @@ private pure func emit_retaining_channel_timeout_send_value(
 		None
 
 
+private pure func emit_channel_send_retained_value_for_rendered_args(
+	name: String,
+	rendered_args: List[String],
+	typ: CoreType,
+) -> Option[String]:
+	match rendered_args:
+		[channel, value]:
+			args: ChannelRetainingSendArgs = {
+				result_type = c_type_name(typ),
+				channel = channel,
+				value = value,
+				temp_seed = CHANNEL_SEND_TEMP_SEED
+			}
+			emit_retaining_channel_send_value(name, args)
+		[]:
+			None
+		[first]:
+			None
+		[first, second, third, ...rest]:
+			None
+
+
+private pure func emit_channel_send_retained_value_for_source_args(
+	name: String,
+	rendered_args: List[String],
+	source_args: List[CoreExpr],
+	typ: CoreType,
+) -> Option[String]:
+	match source_args:
+		[channel_source, value_source]:
+			if boxed_expr_temp_needs_release(value_source):
+				emit_channel_send_retained_value_for_rendered_args(name, rendered_args, typ)
+			else:
+				None
+		[]:
+			None
+		[first]:
+			None
+		[first, second, third, ...rest]:
+			None
+
+
+private pure func emit_channel_send_timeout_retained_value_for_rendered_args(
+	name: String,
+	rendered_args: List[String],
+	typ: CoreType,
+) -> Option[String]:
+	match rendered_args:
+		[channel, value, timeout]:
+			args: ChannelRetainingSendWithTimeoutArgs = {
+				result_type = c_type_name(typ),
+				channel = channel,
+				value = value,
+				timeout = timeout,
+				temp_seed = CHANNEL_SEND_TEMP_SEED
+			}
+			emit_retaining_channel_timeout_send_value(name, args)
+		[]:
+			None
+		[first]:
+			None
+		[first, second]:
+			None
+		[first, second, third, fourth, ...rest]:
+			None
+
+
+private pure func emit_channel_send_timeout_retained_value_for_source_args(
+	name: String,
+	rendered_args: List[String],
+	source_args: List[CoreExpr],
+	typ: CoreType,
+) -> Option[String]:
+	match source_args:
+		[channel_source, value_source, timeout_source]:
+			if boxed_expr_temp_needs_release(value_source):
+				emit_channel_send_timeout_retained_value_for_rendered_args(name, rendered_args, typ)
+			else:
+				None
+		[]:
+			None
+		[first]:
+			None
+		[first, second]:
+			None
+		[first, second, third, fourth, ...rest]:
+			None
+
+
 private pure func emit_channel_send_call_with_retained_temp(
 	name: String,
 	rendered_args: List[String],
@@ -5566,64 +5911,14 @@ private pure func emit_channel_send_call_with_retained_temp(
 		or name == "blorp_channel_try_send"
 		or name == "blorp_channel_try_send_status"
 	):
-		match rendered_args:
-			[channel, value]:
-				match source_args:
-					[channel_source, value_source]:
-						if boxed_expr_temp_needs_release(value_source):
-							args: ChannelRetainingSendArgs = {
-								result_type = c_type_name(typ),
-								channel = channel,
-								value = value,
-								temp_seed = CHANNEL_SEND_TEMP_SEED
-							}
-							emit_retaining_channel_send_value(name, args)
-						else:
-							None
-					[]:
-						None
-					[first]:
-						None
-					[first, second, third, ...rest]:
-						None
-			[]:
-				None
-			[first]:
-				None
-			[first, second, third, ...rest]:
-				None
+		emit_channel_send_retained_value_for_source_args(name, rendered_args, source_args, typ)
 	else if name == "blorp_channel_send_timeout" or name == "blorp_channel_send_timeout_status":
-		match rendered_args:
-			[channel, value, timeout]:
-				match source_args:
-					[channel_source, value_source, timeout_source]:
-						if boxed_expr_temp_needs_release(value_source):
-							args: ChannelRetainingSendWithTimeoutArgs = {
-								result_type = c_type_name(typ),
-								channel = channel,
-								value = value,
-								timeout = timeout,
-								temp_seed = CHANNEL_SEND_TEMP_SEED
-							}
-							emit_retaining_channel_timeout_send_value(name, args)
-						else:
-							None
-					[]:
-						None
-					[first]:
-						None
-					[first, second]:
-						None
-					[first, second, third, fourth, ...rest]:
-						None
-			[]:
-				None
-			[first]:
-				None
-			[first, second]:
-				None
-			[first, second, third, fourth, ...rest]:
-				None
+		emit_channel_send_timeout_retained_value_for_source_args(
+			name,
+			rendered_args,
+			source_args,
+			typ,
+		)
 	else:
 		None
 
@@ -5658,6 +5953,17 @@ private pure func emit_release_aware_direct_dict_constructor_call(
 	if dict_value_needs_release_type(typ) and direct_runtime_call_is_dict_constructor(call.name):
 		ctor_c ?= emit_direct_runtime_call(call, args)
 		Some(emit_dict_construct_result(ctor_c, typ))
+	else:
+		None
+
+
+private pure func emit_release_aware_builtin_dict_constructor_call(
+	name: String,
+	args: List[String],
+	typ: CoreType,
+) -> Option[String]:
+	if dict_value_needs_release_type(typ) and direct_runtime_call_is_dict_constructor(name):
+		Some(emit_dict_construct_result(name + "(" + args.join(", ") + ")", typ))
 	else:
 		None
 
@@ -5704,19 +6010,27 @@ private pure func emit_call_value_from_args(
 				Some(rendered):
 					Some(rendered)
 				None:
-					match emit_tensor_fill_packed_from_values(name, args):
+					match emit_release_aware_builtin_dict_constructor_call(name, args, typ):
 						Some(rendered):
 							Some(rendered)
 						None:
-							match emit_prepared_dict_builtin_call(name, args, typ):
+							match emit_tensor_fill_packed_from_values(name, args):
 								Some(rendered):
 									Some(rendered)
 								None:
-									match emit_prepared_channel_builtin_call(name, args, typ):
+									match emit_prepared_dict_builtin_call(name, args, typ):
 										Some(rendered):
 											Some(rendered)
 										None:
-											emit_channel_semantic_runtime_call(name, args)
+											match emit_prepared_channel_builtin_call(
+												name,
+												args,
+												typ,
+											):
+												Some(rendered):
+													Some(rendered)
+												None:
+													emit_channel_semantic_runtime_call(name, args)
 		OperationResultCall(bridge):
 			None
 		FallibleStreamTerminalCall(bridge):
@@ -5740,100 +6054,96 @@ private pure func emit_call_body(
 			args_body ?= emit_call_args_body(args, next_temp)
 			value ?= emit_call_value_from_args(kind, args_body.args, typ)
 			transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(kind, args)
-			Some({
-				statements = args_body.statements + transfer_cleanup_pop,
-				value = value,
-				next_temp = args_body.next_temp,
-				returns = False,
-			})
+			Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
 		DirectRuntimeCall(call):
+			transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(kind, args)
+
 			match emit_typed_direct_tensor_call(call, args, typ):
 				Some(value):
 					Some({
-						statements = "",
+						statements = transfer_cleanup_pop,
+						value = value,
+						next_temp = next_temp,
+						returns = False,
+					})
+				None:
+					args_body ?= emit_direct_runtime_call_args_body(call, args, next_temp)
+
+					match emit_direct_runtime_tensor_call_from_values(
+						call,
+						args,
+						args_body.args,
+						typ,
+					):
+						Some(value):
+							Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
+						None:
+							value ?= emit_call_value_from_args(kind, args_body.args, typ)
+							Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
+		BuiltinCall(name):
+			transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(kind, args)
+
+			match emit_boxed_tensor_set_call(name, args, typ):
+				Some(value):
+					Some({
+						statements = transfer_cleanup_pop,
 						value = value,
 						next_temp = next_temp,
 						returns = False,
 					})
 				None:
 					args_body ?= emit_call_args_body(args, next_temp)
-					match emit_direct_runtime_tensor_call_from_values(call, args, args_body.args, typ):
-						Some(value):
-							Some({
-								statements = args_body.statements,
-								value = value,
-								next_temp = args_body.next_temp,
-								returns = False,
-							})
-						None:
-							value ?= emit_call_value_from_args(kind, args_body.args, typ)
-							Some({
-								statements = args_body.statements,
-								value = value,
-								next_temp = args_body.next_temp,
-								returns = False,
-							})
-		BuiltinCall(name):
-			args_body ?= emit_call_args_body(args, next_temp)
 
-			match emit_channel_send_call_with_retained_temp(name, args_body.args, args, typ):
-				Some(value):
-					Some({
-						statements = args_body.statements,
-						value = value,
-						next_temp = args_body.next_temp,
-						returns = False,
-					})
-				None:
-					match emit_direct_nonboxed_tensor_call_from_values(
+					match emit_channel_send_call_with_retained_temp(
 						name,
-						args,
 						args_body.args,
+						args,
 						typ,
 					):
 						Some(value):
-							Some({
-								statements = args_body.statements,
-								value = value,
-								next_temp = args_body.next_temp,
-								returns = False,
-							})
+							Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
 						None:
-							value ?= emit_call_value_from_args(kind, args_body.args, typ)
-							Some({
-								statements = args_body.statements,
-								value = value,
-								next_temp = args_body.next_temp,
-								returns = False,
-							})
+							match emit_direct_nonboxed_tensor_call_from_values(
+								name,
+								args,
+								args_body.args,
+								typ,
+							):
+								Some(value):
+									Some(
+										call_body_from_value(
+											args_body,
+											transfer_cleanup_pop,
+											value,
+											typ,
+										),
+									)
+								None:
+									value ?= emit_call_value_from_args(kind, args_body.args, typ)
+									Some(
+										call_body_from_value(
+											args_body,
+											transfer_cleanup_pop,
+											value,
+											typ,
+										),
+									)
 		TensorParallelCall(name, layout):
 			args_body ?= emit_call_args_body(args, next_temp)
 			value ?= emit_call_value_from_args(kind, args_body.args, typ)
-			Some({
-				statements = args_body.statements,
-				value = value,
-				next_temp = args_body.next_temp,
-				returns = False,
-			})
+			Some(call_body_from_value(args_body, "", value, typ))
 		DictWithCapacityCall(constructor):
 			args_body ?= emit_call_args_body(args, next_temp)
 			value ?= emit_call_value_from_args(kind, args_body.args, typ)
-			Some({
-				statements = args_body.statements,
-				value = value,
-				next_temp = args_body.next_temp,
-				returns = False,
-			})
+			Some(call_body_from_value(args_body, "", value, typ))
 		IntrinsicCall(name):
-			args_body ?= emit_call_args_body(args, next_temp)
-			value ?= emit_call_value_from_args(kind, args_body.args, typ)
-			transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(kind, args)
-			Some({
-				statements = args_body.statements + transfer_cleanup_pop,
-				value = value,
-				next_temp = args_body.next_temp,
-				returns = False,
-			})
+			if name == "list_retain_for":
+				emit_list_retain_intrinsic_body(args, next_temp)
+			else:
+				args_body ?= emit_call_args_body(args, next_temp)
+				value ?= emit_call_value_from_args(kind, args_body.args, typ)
+				transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(kind, args)
+				Some(call_body_from_value(args_body, transfer_cleanup_pop, value, typ))
 		OperationResultCall(bridge):
 			None
 		FallibleStreamTerminalCall(bridge):
@@ -5841,12 +6151,7 @@ private pure func emit_call_body(
 		ListToStringCall(callback_name):
 			args_body ?= emit_call_args_body(args, next_temp)
 			value ?= emit_call_value_from_args(kind, args_body.args, typ)
-			Some({
-				statements = args_body.statements,
-				value = value,
-				next_temp = args_body.next_temp,
-				returns = False,
-			})
+			Some(call_body_from_value(args_body, "", value, typ))
 		ClosureCall:
 			None
 
@@ -6095,6 +6400,7 @@ private pure func emit_tuple_construct_args_body(
 		Some({
 			statements = statements,
 			args = values,
+			cleanup_slots = [],
 			next_temp = temp_index,
 		})
 
@@ -6695,13 +7001,8 @@ private pure func list_handoff_emit_mode(mode: CoreListHandoffMode) -> Option[Li
 		None
 
 
-private pure func list_handoff_emit_write_order(
-	order: CoreListHandoffWriteOrder,
-) -> Option[ListHandoffEmitWriteOrder]:
-	if order == ForwardCompactingHandoff:
-		Some(EmitForwardCompactingHandoff)
-	else:
-		None
+private pure func list_handoff_write_order_is_supported(order: CoreListHandoffWriteOrder) -> Bool:
+	order == ForwardCompactingHandoff
 
 
 private pure func list_handoff_prefix(
@@ -6757,23 +7058,23 @@ private pure func list_handoff_suffix(
 
 private pure func emit_list_handoff(handoff: CoreListHandoff) -> Option[String]:
 	mode ?= list_handoff_emit_mode(handoff.mode)
-	write_order ?= list_handoff_emit_write_order(handoff.write_order)
 
-	match write_order:
-		EmitForwardCompactingHandoff:
-			source_c ?= emit_simple_expr(handoff.source)
-			capacity_c ?= emit_simple_expr(handoff.capacity)
-			body_c ?= emit_function_body(handoff.body, 0)
-			body_statements: String = statement_body(handoff.body, body_c)
+	if list_handoff_write_order_is_supported(handoff.write_order):
+		source_c ?= emit_simple_expr(handoff.source)
+		capacity_c ?= emit_simple_expr(handoff.capacity)
+		body_c ?= emit_function_body(handoff.body, 0)
+		body_statements: String = statement_body(handoff.body, body_c)
 
-			Some(
-				list_handoff_prefix(
-					handoff,
-					mode,
-					source_c,
-					capacity_c,
-				) + "\n" + body_statements + list_handoff_suffix(handoff, mode),
-			)
+		Some(
+			list_handoff_prefix(
+				handoff,
+				mode,
+				source_c,
+				capacity_c,
+			) + "\n" + body_statements + list_handoff_suffix(handoff, mode),
+		)
+	else:
+		None
 
 
 private pure func emit_string_byte_read(read: CoreStringByteRead) -> Option[String]:
@@ -7509,7 +7810,12 @@ private pure func emit_dict_with_capacity_call(
 ) -> Option[String]:
 	match args:
 		[capacity]:
-			Some(emit_dict_construct_result(emit_dict_with_capacity_constructor(constructor, capacity), typ))
+			Some(
+				emit_dict_construct_result(
+					emit_dict_with_capacity_constructor(constructor, capacity),
+					typ,
+				),
+			)
 		[]:
 			None
 		[first, second, ...rest]:
@@ -7839,9 +8145,101 @@ private pure func emit_list_retain(retain: CoreListRetain) -> Option[String]:
 		Some("(void)0")
 	else:
 		list_c ?= emit_simple_expr(retain.list)
-		value_c ?= emit_boxed_pointer_value(retain.value)
 
-		Some("blorp_list_retain_for((blorp_List*)" + list_c + ", " + value_c + ")")
+		if is_stack_result_type(core_expr_type(retain.value.value)):
+			value_c ?= emit_simple_expr(retain.value.value)
+			Some("blorp_stack_result_retain(" + value_c + ")")
+		else:
+			value_c ?= emit_boxed_pointer_value(retain.value)
+
+			Some("blorp_list_retain_for((blorp_List*)" + list_c + ", " + value_c + ")")
+
+
+private pure func boxed_storage_kind_for_retain_value(typ: CoreType) -> CoreBoxKind:
+	if is_stack_result_type(typ):
+		StructBox("blorp_StackResult")
+	else:
+		match closure_abi_value_for_type(typ):
+			Some(ClosureAbiVoid):
+				VoidBox
+			Some(ClosureAbiPointer):
+				PointerBox
+			Some(ClosureAbiPrim):
+				PrimBox
+			Some(ClosureAbiFloat):
+				FloatBox
+			Some(ClosureAbiFloat32):
+				Float32Box
+			Some(ClosureAbiFloat16):
+				Float16Box
+			Some(ClosureAbiInt128):
+				Int128Box
+			Some(ClosureAbiUInt128):
+				UInt128Box
+			Some(ClosureAbiStruct(c_type)):
+				StructBox(c_type)
+			None:
+				PointerBox
+
+
+private pure func boxed_storage_value_for_retain_expr(value: CoreExpr) -> CoreBoxedStorageValue:
+	value_type: CoreType = core_expr_type(value)
+	{
+		kind = boxed_storage_kind_for_retain_value(value_type),
+		value = value,
+		needs_release = boxed_value_needs_release_type(value_type),
+		transfers_ownership = False
+	}
+
+
+private pure func emit_list_retain_body(
+	retain: CoreListRetain,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	if not list_element_needs_retain_type(core_expr_type(retain.list)):
+		Some(body_value("(void)0", next_temp))
+	else:
+		list_c ?= emit_simple_expr(retain.list)
+
+		if is_stack_result_type(core_expr_type(retain.value.value)):
+			value_body ?= emit_function_body(retain.value.value, next_temp)
+			value_c ?= required_body_value(value_body)
+			Some({
+				statements = value_body.statements,
+				value = "blorp_stack_result_retain(" + value_c + ")",
+				next_temp = value_body.next_temp,
+				returns = False,
+			})
+		else:
+			value_body ?= emit_boxed_pointer_body(retain.value, next_temp)
+			value_c ?= required_body_value(value_body)
+			Some({
+				statements = value_body.statements,
+				value = "blorp_list_retain_for((blorp_List*)" + list_c + ", " + value_c + ")",
+				next_temp = value_body.next_temp,
+				returns = False,
+			})
+
+
+private pure func emit_list_retain_intrinsic_body(
+	args: List[CoreExpr],
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match args:
+		[list_expr, value_expr]:
+			emit_list_retain_body(
+				{
+					list = list_expr,
+					value = boxed_storage_value_for_retain_expr(value_expr)
+				},
+				next_temp,
+			)
+		[]:
+			None
+		[first]:
+			None
+		[first, second, third, ...rest]:
+			None
 
 
 private pure func emit_record_construct(
@@ -7902,6 +8300,7 @@ private pure func emit_record_construct_args_body(
 		Some({
 			statements = statements,
 			args = values,
+			cleanup_slots = [],
 			next_temp = temp_index,
 		})
 
@@ -7972,12 +8371,22 @@ private pure func emit_stack_option_args(construct: CoreUnionConstruct) -> Optio
 		Some(args)
 
 
+private pure func stack_option_payload_expr(payload: CoreBoxedStorageValue) -> CoreExpr:
+	match payload.value:
+		BoxExpr(box, typ, loc):
+			box.value
+		_:
+			payload.value
+
+
 private pure func emit_stack_option_value(
 	info: CoreStackOptionRepresentation,
 	payload: CoreBoxedStorageValue,
 ) -> Option[String]:
-	if is_void_type(core_expr_type(payload.value)):
-		statement ?= emit_simple_expr(payload.value)
+	value_expr: CoreExpr = stack_option_payload_expr(payload)
+
+	if is_void_type(core_expr_type(value_expr)):
+		statement ?= emit_simple_expr(value_expr)
 		args: StackOptionVoidStatementArgs = {
 			option_type = info.option_type,
 			tag = info.tag.to_string(),
@@ -7985,7 +8394,7 @@ private pure func emit_stack_option_value(
 		}
 		Some(render_prepared_constructor_op(StackOptionVoidStatement(args)))
 	else:
-		value ?= emit_simple_expr(payload.value)
+		value ?= emit_simple_expr(value_expr)
 		args: StackOptionValueArgs = {
 			option_type = info.option_type,
 			tag = info.tag.to_string(),
@@ -8001,6 +8410,53 @@ private pure func emit_stack_option_none(info: CoreStackOptionRepresentation) ->
 		none_value = info.none_value
 	}
 	render_prepared_constructor_op(StackOptionNone(args))
+
+
+private pure func emit_stack_option_construct(
+	info: CoreStackOptionRepresentation,
+	args: List[CoreBoxedStorageValue],
+) -> Option[String]:
+	match args:
+		[]:
+			Some(emit_stack_option_none(info))
+		[payload]:
+			emit_stack_option_value(info, payload)
+		[first, second, ...rest]:
+			None
+
+
+private pure func emit_stack_result_construct(
+	construct: CoreUnionConstruct,
+	info: CoreStackResultRepresentation,
+) -> Option[String]:
+	match construct.args:
+		[payload]:
+			payload_c ?= emit_boxed_pointer_value(payload)
+			render_args: StackResultTaggedPayloadArgs = {
+				result_type = info.result_type,
+				tag = info.tag.to_string(),
+				field = construct.constructor_name,
+				payload = payload_c,
+				release_mask = info.release_mask.to_string()
+			}
+
+			Some(render_prepared_backend_op(BackendStackResultTaggedPayload(render_args)))
+		[]:
+			None
+		[first, second, ...rest]:
+			None
+
+
+private pure func emit_nullable_option_construct(construct: CoreUnionConstruct) -> Option[String]:
+	args ?= emit_stack_option_args(construct)
+
+	match args:
+		[]:
+			Some("NULL")
+		[payload]:
+			Some(payload)
+		[first, second, ...rest]:
+			None
 
 
 private pure func emit_union_construct(construct: CoreUnionConstruct) -> Option[String]:
@@ -8028,40 +8484,11 @@ private pure func emit_union_construct(construct: CoreUnionConstruct) -> Option[
 
 				Some(construct.constructor_c_name + "(" + args.join(", ") + ")")
 		StackOptionRepresentation(info):
-			match construct.args:
-				[]:
-					Some(emit_stack_option_none(info))
-				[payload]:
-					emit_stack_option_value(info, payload)
-				[first, second, ...rest]:
-					None
+			emit_stack_option_construct(info, construct.args)
 		StackResultRepresentation(info):
-			match construct.args:
-				[payload]:
-					payload_c ?= emit_boxed_pointer_value(payload)
-					render_args: StackResultTaggedPayloadArgs = {
-						result_type = info.result_type,
-						tag = info.tag.to_string(),
-						field = construct.constructor_name,
-						payload = payload_c,
-						release_mask = info.release_mask.to_string()
-					}
-
-					Some(render_prepared_backend_op(BackendStackResultTaggedPayload(render_args)))
-				[]:
-					None
-				[first, second, ...rest]:
-					None
+			emit_stack_result_construct(construct, info)
 		NullableOptionRepresentation:
-			args ?= emit_stack_option_args(construct)
-
-			match args:
-				[]:
-					Some("NULL")
-				[payload]:
-					Some(payload)
-				[first, second, ...rest]:
-					None
+			emit_nullable_option_construct(construct)
 
 
 private pure func emit_generic_union_construct_body(
@@ -8153,6 +8580,49 @@ private pure func emit_stack_result_construct_body(
 			None
 
 
+private pure func emit_stack_option_construct_body(
+	info: CoreStackOptionRepresentation,
+	args: List[CoreBoxedStorageValue],
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match args:
+		[]:
+			Some(body_value(emit_stack_option_none(info), next_temp))
+		[payload]:
+			value_expr: CoreExpr = stack_option_payload_expr(payload)
+			payload_body ?= emit_function_body(value_expr, next_temp)
+
+			if payload_body.returns:
+				None
+			else if is_void_type(core_expr_type(value_expr)):
+				render_args: StackOptionVoidStatementArgs = {
+					option_type = info.option_type,
+					tag = info.tag.to_string(),
+					statement = payload_body.statements
+				}
+				Some({
+					statements = "",
+					value = render_prepared_constructor_op(StackOptionVoidStatement(render_args)),
+					next_temp = payload_body.next_temp,
+					returns = False,
+				})
+			else:
+				payload_c ?= required_body_value(payload_body)
+				render_args: StackOptionValueArgs = {
+					option_type = info.option_type,
+					tag = info.tag.to_string(),
+					value = payload_c
+				}
+				Some({
+					statements = payload_body.statements,
+					value = render_prepared_constructor_op(StackOptionValue(render_args)),
+					next_temp = payload_body.next_temp,
+					returns = False,
+				})
+		[first, second, ...rest]:
+			None
+
+
 private pure func emit_nullable_option_construct_body(
 	construct: CoreUnionConstruct,
 	next_temp: Int,
@@ -8176,41 +8646,7 @@ private pure func emit_union_construct_body(
 		GenericUnionRepresentation:
 			emit_generic_union_construct_body(construct, next_temp)
 		StackOptionRepresentation(info):
-			match construct.args:
-				[]:
-					Some(body_value(emit_stack_option_none(info), next_temp))
-				[payload]:
-					payload_body ?= emit_function_body(payload.value, next_temp)
-
-					if payload_body.returns:
-						None
-					else if is_void_type(core_expr_type(payload.value)):
-						args: StackOptionVoidStatementArgs = {
-							option_type = info.option_type,
-							tag = info.tag.to_string(),
-							statement = payload_body.statements
-						}
-						Some({
-							statements = "",
-							value = render_prepared_constructor_op(StackOptionVoidStatement(args)),
-							next_temp = payload_body.next_temp,
-							returns = False,
-						})
-					else:
-						payload_c ?= required_body_value(payload_body)
-						args: StackOptionValueArgs = {
-							option_type = info.option_type,
-							tag = info.tag.to_string(),
-							value = payload_c
-						}
-						Some({
-							statements = payload_body.statements,
-							value = render_prepared_constructor_op(StackOptionValue(args)),
-							next_temp = payload_body.next_temp,
-							returns = False,
-						})
-				[first, second, ...rest]:
-					None
+			emit_stack_option_construct_body(info, construct.args, next_temp)
 		StackResultRepresentation(info):
 			emit_stack_result_construct_body(construct, info, next_temp)
 		NullableOptionRepresentation:
@@ -8828,9 +9264,17 @@ private pure func closure_return_unbox_prelude(
 				"; unsigned __int128 __cl_unboxed = blorp_unbox_uint128(" + result_name + "); blorp_release(" + result_name + ")",
 			)
 		ClosureAbiStruct(c_type):
-			Some(
-				"; " + c_type + " __cl_unboxed = (*(" + c_type + "*)((char*)" + result_name + " + sizeof(blorp_Object))); blorp_release(" + result_name + ")",
-			)
+			if is_stack_result_type(return_type):
+				Some(
+					"; " + c_type + " __cl_unboxed = (*(" + c_type + "*)((char*)" + result_name + ((
+						" + sizeof(blorp_Object))); blorp_stack_result_retain(__cl_unboxed); "
+						+ "blorp_release("
+					)) + result_name + ")",
+				)
+			else:
+				Some(
+					"; " + c_type + " __cl_unboxed = (*(" + c_type + "*)((char*)" + result_name + " + sizeof(blorp_Object))); blorp_release(" + result_name + ")",
+				)
 
 
 private pure func emit_closure_call(
@@ -9116,9 +9560,14 @@ private pure func closure_return_value(return_type: CoreType, value_c: String) -
 		ClosureAbiUInt128:
 			Some("blorp_box_uint128(" + value_c + ")")
 		ClosureAbiStruct(c_type):
-			Some(
-				"({ " + c_type + " __cl_ret = " + value_c + "; blorp_box_struct(&__cl_ret, sizeof(" + c_type + ")); })",
-			)
+			if is_stack_result_type(return_type):
+				Some(
+					"({ " + c_type + " __cl_ret = " + value_c + "; blorp_box_stack_result(__cl_ret); })",
+				)
+			else:
+				Some(
+					"({ " + c_type + " __cl_ret = " + value_c + "; blorp_box_struct(&__cl_ret, sizeof(" + c_type + ")); })",
+				)
 
 
 private pure func closure_body_return_type(abi: CoreClosureAbi, return_type: CoreType) -> String:
@@ -9208,6 +9657,65 @@ private pure func emit_release_statement(
 			"  blorp_stack_result_release(" + value + ");\n"
 
 
+private pure func is_generated_temp_value(value: String) -> Bool:
+	if not value.starts_with("__"):
+		False
+	else if value.contains(" "):
+		False
+	else if value.contains("("):
+		False
+	else if value.contains(")"):
+		False
+	else if value.contains("["):
+		False
+	else if value.contains("]"):
+		False
+	else if value.contains("."):
+		False
+	else if value.contains("->"):
+		False
+	else:
+		True
+
+
+private pure func body_value_can_be_cleanup_slot(body: FunctionBodyC) -> Bool:
+	body.statements != "" and body.value != "" and is_generated_temp_value(body.value)
+
+
+private pure func owned_body_value_cleanup(body: FunctionBodyC, typ: CoreType) -> String:
+	if not body_value_can_be_cleanup_slot(body):
+		""
+	else:
+		policy: CoreReleasePolicy = cleanup_release_policy_for_type(typ)
+		owned_temp_cleanup_pop_statement(
+			body.value,
+			policy,
+		) + emit_release_statement(body.value, policy)
+
+
+private pure func transferred_body_value_cleanup_pop(body: FunctionBodyC, typ: CoreType) -> String:
+	if not body_value_can_be_cleanup_slot(body):
+		""
+	else:
+		owned_temp_cleanup_pop_statement(body.value, cleanup_release_policy_for_type(typ))
+
+
+private pure func transferred_body_value_release_after_match(
+	body: FunctionBodyC,
+	typ: CoreType,
+	scrutinee_temp: String,
+	scrutinee_release_policy: CoreReleasePolicy,
+) -> String:
+	if not body_value_can_be_cleanup_slot(body):
+		""
+	else:
+		match owned_temp_cleanup_release_fn(scrutinee_release_policy):
+			Some(release_fn):
+				""
+			None:
+				emit_release_statement(scrutinee_temp, cleanup_release_policy_for_type(typ))
+
+
 private pure func owned_temp_cleanup_frame_name(slot: String) -> String:
 	"__blorp_owned_cleanup_" + slot
 
@@ -9282,7 +9790,25 @@ private pure func cleanup_release_policy_for_type(typ: CoreType) -> CoreReleaseP
 					ArcReleasePolicy
 				else if name == "Channel" and args.length() == 1:
 					ArcReleasePolicy
-				else if name == "ResourceSource" and args.length() == 1:
+				else if is_resource_source_type_name(name):
+					ArcReleasePolicy
+				else if (
+					((
+						name == "Stream"
+						or name == "std/stream::Stream"
+						or name == "std_stream__Stream"
+					))
+					and args.length() == 1
+				):
+					ArcReleasePolicy
+				else if (
+					((
+						name == "FallibleStream"
+						or name == "std/stream::FallibleStream"
+						or name == "std_stream__FallibleStream"
+					))
+					and args.length() == 2
+				):
 					ArcReleasePolicy
 				else if name == "TcpListener" and args.length() == 0:
 					ArcReleasePolicy
@@ -9334,9 +9860,10 @@ private pure func let_tracks_cleanup(
 	body: CoreExpr,
 	variable: CoreVar,
 ) -> Bool:
-	release_policy_requires_cleanup(
-		cleanup_policy,
-	) and not let_body_takes_cleanup_ownership(body, variable)
+	(
+		release_policy_requires_cleanup(cleanup_policy)
+		and not let_body_takes_cleanup_ownership(body, variable)
+	)
 
 
 private pure func cancellation_cleanup_push_statement(
@@ -9552,11 +10079,7 @@ private pure func handoff_source_cleanup_pop_statement(rhs: CoreExpr) -> String:
 
 
 private pure func intrinsic_call_is_non_suspending_transfer(name: String) -> Bool:
-	(
-		name == "list_retain_for"
-		or name == "list_set"
-		or name == "list_set_len"
-	)
+	name == "list_retain_for" or name == "list_set" or name == "list_set_len"
 
 
 private pure func call_kind_is_non_suspending_transfer(kind: CoreCallKind) -> Bool:
@@ -9566,9 +10089,9 @@ private pure func call_kind_is_non_suspending_transfer(kind: CoreCallKind) -> Bo
 		UserCall(name, def_id, consumed_args):
 			False
 		BuiltinCall(name):
-			False
+			runtime_call_consumes_tensor_receiver(name)
 		DirectRuntimeCall(call):
-			False
+			runtime_call_consumes_tensor_receiver(call.name)
 		TensorParallelCall(name, layout):
 			False
 		DictWithCapacityCall(constructor):
@@ -9834,6 +10357,8 @@ private pure func expr_is_var_reference(expr: CoreExpr, variable: CoreVar) -> Bo
 			False
 		UnionConstructExpr(construct, typ, loc):
 			False
+		DetachExpr(detached, typ, loc):
+			False
 		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
 			False
 		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
@@ -9902,69 +10427,48 @@ private pure func expr_is_var_reference(expr: CoreExpr, variable: CoreVar) -> Bo
 			False
 
 
+private pure func first_arg_consumes_var(args: List[CoreExpr], variable: CoreVar) -> Bool:
+	match args:
+		[VarExpr(source, source_type, source_loc), ...rest]:
+			core_vars_equal(source, variable)
+		[]:
+			False
+		[first, ...rest]:
+			False
+
+
+private pure func call_kind_consumes_first_arg(kind: CoreCallKind) -> Bool:
+	match kind:
+		IntrinsicCall(name):
+			consuming_handoff_intrinsic(name)
+		UserCall(name, def_id, consumed_args):
+			False
+		BuiltinCall(name):
+			runtime_call_consumes_tensor_receiver(name)
+		DirectRuntimeCall(call):
+			runtime_call_consumes_tensor_receiver(call.name)
+		TensorParallelCall(name, layout):
+			False
+		DictWithCapacityCall(constructor):
+			False
+		ForeignCall(name, arg_passing):
+			False
+		OperationResultCall(bridge):
+			False
+		FallibleStreamTerminalCall(bridge):
+			False
+		ListToStringCall(callback_name):
+			False
+		ClosureCall:
+			False
+
+
 private pure func call_consumes_first_arg_var(
 	kind: CoreCallKind,
 	args: List[CoreExpr],
 	variable: CoreVar,
 ) -> Bool:
-	match kind:
-		IntrinsicCall(name):
-			if consuming_handoff_intrinsic(name):
-				match args:
-					[VarExpr(source, source_type, source_loc), ...rest]:
-						core_vars_equal(source, variable)
-					[]:
-						False
-					[first, ...rest]:
-						False
-			else:
-				False
-		UserCall(name, def_id, consumed_args):
-			False
-		BuiltinCall(name):
-			False
-		DirectRuntimeCall(call):
-			False
-		TensorParallelCall(name, layout):
-			False
-		DictWithCapacityCall(constructor):
-			False
-		ForeignCall(name, arg_passing):
-			False
-		OperationResultCall(bridge):
-			False
-		FallibleStreamTerminalCall(bridge):
-			False
-		ListToStringCall(callback_name):
-			False
-		ClosureCall:
-			False
-
-
-private pure func call_kind_consumes_owned_args(kind: CoreCallKind) -> Bool:
-	match kind:
-		UserCall(name, def_id, consumed_args):
-			consumed_args.length() > 0
-		IntrinsicCall(name):
-			False
-		BuiltinCall(name):
-			False
-		DirectRuntimeCall(call):
-			False
-		TensorParallelCall(name, layout):
-			False
-		DictWithCapacityCall(constructor):
-			False
-		ForeignCall(name, arg_passing):
-			False
-		OperationResultCall(bridge):
-			False
-		FallibleStreamTerminalCall(bridge):
-			False
-		ListToStringCall(callback_name):
-			False
-		ClosureCall:
-			False
+	call_kind_consumes_first_arg(kind) and first_arg_consumes_var(args, variable)
 
 
 private pure func call_args_consume_var_before_suspension(
@@ -9985,9 +10489,11 @@ private pure func call_args_consume_var_before_suspension(
 			):
 				found = True
 			else:
-				prefix_is_non_suspending = prefix_is_non_suspending and transfer_prefix_is_non_suspending(
-					arg,
+				prefix_is_non_suspending = (
+					prefix_is_non_suspending
+					and transfer_prefix_is_non_suspending(arg)
 				)
+
 		index += 1
 
 	found
@@ -10004,6 +10510,48 @@ private pure func call_consumes_var_before_suspension(
 		match kind:
 			UserCall(name, def_id, consumed_args):
 				call_args_consume_var_before_suspension(consumed_args, args, variable)
+			IntrinsicCall(name):
+				False
+			BuiltinCall(name):
+				False
+			DirectRuntimeCall(call):
+				False
+			TensorParallelCall(name, layout):
+				False
+			DictWithCapacityCall(constructor):
+				False
+			ForeignCall(name, arg_passing):
+				False
+			OperationResultCall(bridge):
+				False
+			FallibleStreamTerminalCall(bridge):
+				False
+			ListToStringCall(callback_name):
+				False
+			ClosureCall:
+				False
+
+
+private pure func call_consumes_var(
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	variable: CoreVar,
+) -> Bool:
+	if call_consumes_first_arg_var(kind, args, variable):
+		True
+	else:
+		match kind:
+			UserCall(name, def_id, consumed_args):
+				var found: Bool = False
+				var index: Int = 0
+
+				for arg in args:
+					if consumed_args.contains(index) and expr_is_var_reference(arg, variable):
+						found = True
+
+					index += 1
+
+				found
 			IntrinsicCall(name):
 				False
 			BuiltinCall(name):
@@ -10206,9 +10754,18 @@ private pure func call_args_transfer_cleanup_pop_statements(
 	for arg in args:
 		if consumed_args.contains(index):
 			statements += call_arg_transfer_cleanup_pop_statement(arg)
+
 		index += 1
 
 	statements
+
+
+private pure func first_arg_transfer_cleanup_pop_statement(args: List[CoreExpr]) -> String:
+	match args:
+		[first, ...rest]:
+			call_arg_transfer_cleanup_pop_statement(first)
+		[]:
+			""
 
 
 private pure func call_transfer_cleanup_pop_statements(
@@ -10222,18 +10779,20 @@ private pure func call_transfer_cleanup_pop_statements(
 			else:
 				call_args_transfer_cleanup_pop_statements(consumed_args, args)
 		IntrinsicCall(name):
-			if consuming_handoff_intrinsic(name):
-				match args:
-					[first, ...rest]:
-						call_arg_transfer_cleanup_pop_statement(first)
-					[]:
-						""
+			if call_kind_consumes_first_arg(kind):
+				first_arg_transfer_cleanup_pop_statement(args)
 			else:
 				""
 		BuiltinCall(name):
-			""
+			if call_kind_consumes_first_arg(kind):
+				first_arg_transfer_cleanup_pop_statement(args)
+			else:
+				""
 		DirectRuntimeCall(call):
-			""
+			if call_kind_consumes_first_arg(kind):
+				first_arg_transfer_cleanup_pop_statement(args)
+			else:
+				""
 		TensorParallelCall(name, layout):
 			""
 		DictWithCapacityCall(constructor):
@@ -10258,10 +10817,7 @@ private pure func match_scrutinee_consumes_var(
 	release_policy_requires_cleanup(release_policy) and expr_is_var_reference(scrutinee, variable)
 
 
-private pure func body_consumes_var_before_suspension(
-	expr: CoreExpr,
-	variable: CoreVar,
-) -> Bool:
+private pure func body_consumes_var_before_suspension(expr: CoreExpr, variable: CoreVar) -> Bool:
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
 			call_consumes_var_before_suspension(kind, args, variable)
@@ -10276,9 +10832,9 @@ private pure func body_consumes_var_before_suspension(
 			if body_consumes_var_before_suspension(rhs, variable):
 				True
 			else:
-				transfer_prefix_is_non_suspending(rhs) and body_consumes_var_before_suspension(
-					body,
-					variable,
+				(
+					transfer_prefix_is_non_suspending(rhs)
+					and body_consumes_var_before_suspension(body, variable)
 				)
 		BorrowLetExpr(name, typ, rhs, body):
 			if body_consumes_var_before_suspension(rhs, variable):
@@ -10286,17 +10842,17 @@ private pure func body_consumes_var_before_suspension(
 			else if core_vars_equal(name, variable):
 				False
 			else:
-				transfer_prefix_is_non_suspending(rhs) and body_consumes_var_before_suspension(
-					body,
-					variable,
+				(
+					transfer_prefix_is_non_suspending(rhs)
+					and body_consumes_var_before_suspension(body, variable)
 				)
 		SeqExpr(first, second):
 			if body_consumes_var_before_suspension(first, variable):
 				True
 			else:
-				transfer_prefix_is_non_suspending(first) and body_consumes_var_before_suspension(
-					second,
-					variable,
+				(
+					transfer_prefix_is_non_suspending(first)
+					and body_consumes_var_before_suspension(second, variable)
 				)
 		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
 			match_scrutinee_consumes_var(scrutinee, scrutinee_release_policy, variable)
@@ -10319,7 +10875,395 @@ private pure func body_consumes_var_before_suspension(
 		LogicalExpr(op, left, right, typ, loc):
 			False
 		AssignExpr(assign_var, rhs, typ, loc):
-			assign_var.name == "_" and expr_is_var_reference(rhs, variable)
+			expr_is_var_reference(rhs, variable)
+		CastExpr(expr_value, typ, loc):
+			False
+		BoxExpr(box, typ, loc):
+			False
+		UnboxExpr(unbox_kind, expr_value, typ, loc):
+			False
+		FieldExpr(expr_value, field_name, typ, loc):
+			False
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			False
+		TupleExpr(items, typ, loc):
+			False
+		TupleConstructExpr(tuple_construct, typ, loc):
+			False
+		ClosureCreateExpr(closure, typ, loc):
+			False
+		ListConstructExpr(construct, typ, loc):
+			False
+		ListAllocExpr(alloc, typ, loc):
+			False
+		ListGetExpr(get, typ, loc):
+			False
+		ListHandoffExpr(handoff, typ, loc):
+			False
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			False
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			False
+		ListRetainExpr(retain, typ, loc):
+			False
+		ListSetExpr(set, typ, loc):
+			False
+		ListSwapExpr(swap, typ, loc):
+			False
+		StringByteReadExpr(read, typ, loc):
+			False
+		StringByteWriteExpr(write, typ, loc):
+			False
+		StringByteCopyExpr(copy, typ, loc):
+			False
+		StringSetLenExpr(set_len, typ, loc):
+			False
+		TensorLiteralExpr(literal, typ, loc):
+			False
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			False
+		TensorPackedLiteralExpr(literal, typ, loc):
+			False
+		TensorRawFillExpr(fill, typ, loc):
+			False
+		TensorRawReadExpr(read, typ, loc):
+			False
+		TensorRawWriteExpr(write, typ, loc):
+			False
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			False
+		DictConstructExpr(construct, typ, loc):
+			False
+		SetAllocExpr(alloc, typ, loc):
+			False
+		RecordExpr(fields, typ, loc):
+			False
+		RecordConstructExpr(type_name, fields, typ, loc):
+			False
+		UnionConstructExpr(construct, typ, loc):
+			False
+		WhileExpr(cond, body, typ, loc):
+			False
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		ResourceScopeExpr(scope, typ, loc):
+			False
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			False
+		TailrecLoopExpr(params, return_type, body, loc):
+			False
+		TailrecRecurExpr(args, typ, loc):
+			False
+		TailrecListSpreadLoopExpr(loop, loc):
+			False
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			False
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			False
+		ForChannelExpr(for_channel, typ, loc):
+			False
+		ForListExpr(for_list, typ, loc):
+			False
+		ForStringExpr(for_string, typ, loc):
+			False
+		ForDictExpr(for_dict, typ, loc):
+			False
+		ForSetExpr(for_set, typ, loc):
+			False
+		ForResourceSourceExpr(for_resource_source, typ, loc):
+			False
+		ForStreamExpr(for_stream, typ, loc):
+			False
+		ForTensorExpr(for_tensor, typ, loc):
+			False
+		DetachExpr(detached, typ, loc):
+			False
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			False
+		ConcurrentExpr(block, typ, loc):
+			False
+		SelectExpr(select_expr, typ, loc):
+			False
+		RangeExpr(start, end_value, typ, loc):
+			False
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			False
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			if body_consumes_var(cond, variable):
+				True
+			else if body_consumes_var(then_expr, variable):
+				True
+			else:
+				body_consumes_var(else_expr, variable)
+
+
+private pure func let_body_takes_cleanup_ownership(body: CoreExpr, variable: CoreVar) -> Bool:
+	directly_returns_var(body, variable) or body_consumes_var_before_suspension(body, variable)
+
+
+private pure func body_takes_value_ownership(body: CoreExpr, variable: CoreVar) -> Bool:
+	directly_returns_var(body, variable) or body_consumes_var(body, variable)
+
+
+private GENERATED_MATCH_SCRUTINEE_PREFIX: String = "__blorp_match_scrut_"
+
+
+private pure func is_generated_owned_match_scrutinee(variable: CoreVar) -> Bool:
+	variable.name.starts_with(GENERATED_MATCH_SCRUTINEE_PREFIX)
+
+
+private pure func is_list_construct_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		ListConstructExpr(construct, typ, loc):
+			True
+		LiteralExpr(literal, typ, loc):
+			False
+		VarExpr(variable, typ, loc):
+			False
+		VoidExpr(typ, loc):
+			False
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		CallExpr(kind, callee, args, typ, loc):
+			False
+		BinaryExpr(op, left, right, typ, loc):
+			False
+		UnaryExpr(op, expr_value, typ, loc):
+			False
+		LogicalExpr(op, left, right, typ, loc):
+			False
+		AssignExpr(assign_var, rhs, typ, loc):
+			False
+		CastExpr(expr_value, typ, loc):
+			False
+		BoxExpr(box, typ, loc):
+			False
+		UnboxExpr(unbox_kind, expr_value, typ, loc):
+			False
+		FieldExpr(expr_value, field_name, typ, loc):
+			False
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			False
+		TupleExpr(items, typ, loc):
+			False
+		TupleConstructExpr(tuple_construct, typ, loc):
+			False
+		ClosureCreateExpr(closure, typ, loc):
+			False
+		ListAllocExpr(alloc, typ, loc):
+			False
+		ListGetExpr(get, typ, loc):
+			False
+		ListHandoffExpr(handoff, typ, loc):
+			False
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			False
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			False
+		ListRetainExpr(retain, typ, loc):
+			False
+		ListSetExpr(set, typ, loc):
+			False
+		ListSwapExpr(swap, typ, loc):
+			False
+		StringByteReadExpr(read, typ, loc):
+			False
+		StringByteWriteExpr(write, typ, loc):
+			False
+		StringByteCopyExpr(copy, typ, loc):
+			False
+		StringSetLenExpr(set_len, typ, loc):
+			False
+		TensorLiteralExpr(literal, typ, loc):
+			False
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			False
+		TensorPackedLiteralExpr(literal, typ, loc):
+			False
+		TensorRawFillExpr(fill, typ, loc):
+			False
+		TensorRawReadExpr(read, typ, loc):
+			False
+		TensorRawWriteExpr(write, typ, loc):
+			False
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			False
+		DictConstructExpr(construct, typ, loc):
+			False
+		SetAllocExpr(alloc, typ, loc):
+			False
+		RecordExpr(fields, typ, loc):
+			False
+		RecordConstructExpr(type_name, fields, typ, loc):
+			False
+		UnionConstructExpr(construct, typ, loc):
+			False
+		DetachExpr(detached, typ, loc):
+			False
+		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
+			False
+		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
+			False
+		LetExpr(name, is_mutable, typ, rhs, body):
+			False
+		BorrowLetExpr(name, typ, rhs, body):
+			False
+		SeqExpr(first, second):
+			False
+		WhileExpr(cond, body, typ, loc):
+			False
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		ResourceScopeExpr(scope, typ, loc):
+			False
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			False
+		TailrecLoopExpr(params, return_type, body, loc):
+			False
+		TailrecRecurExpr(args, typ, loc):
+			False
+		TailrecListSpreadLoopExpr(loop, loc):
+			False
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			False
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			False
+		ForChannelExpr(for_channel, typ, loc):
+			False
+		ForListExpr(for_list, typ, loc):
+			False
+		ForStringExpr(for_string, typ, loc):
+			False
+		ForDictExpr(for_dict, typ, loc):
+			False
+		ForSetExpr(for_set, typ, loc):
+			False
+		ForResourceSourceExpr(for_resource_source, typ, loc):
+			False
+		ForStreamExpr(for_stream, typ, loc):
+			False
+		ForTensorExpr(for_tensor, typ, loc):
+			False
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			False
+		ConcurrentExpr(block, typ, loc):
+			False
+		SelectExpr(select_expr, typ, loc):
+			False
+		RangeExpr(start, end_value, typ, loc):
+			False
+		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			False
+		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			False
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			False
+		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
+			False
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			False
+
+
+private pure func let_normal_cleanup_statement(
+	variable: CoreVar,
+	cleanup_policy: CoreReleasePolicy,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> String:
+	if is_generated_owned_match_scrutinee(variable) and is_list_construct_expr(rhs):
+		emit_drop_statement(variable, cleanup_policy)
+	else:
+		cancellation_cleanup_pop_statement(variable)
+
+
+private pure func apply_let_cleanup_to_body(
+	body_expr: CoreExpr,
+	body_c: FunctionBodyC,
+	cleanup: String,
+) -> FunctionBodyC:
+	if cleanup == "":
+		body_c
+	else if is_void_type(core_expr_type(body_expr)):
+		{
+			statements = body_c.statements + cleanup,
+			value = body_c.value,
+			next_temp = body_c.next_temp,
+			returns = body_c.returns
+		}
+	else if body_c.value == "" or body_c.returns:
+		{
+			statements = body_c.statements + cleanup,
+			value = body_c.value,
+			next_temp = body_c.next_temp,
+			returns = body_c.returns
+		}
+	else:
+		result_name: String = temp_name("let_result", body_c.next_temp)
+		{
+			statements = body_c.statements + "  " + c_type_name(
+				core_expr_type(
+					body_expr,
+				),
+			) + " " + result_name + " = " + body_c.value + ";\n" + cleanup,
+			value = result_name,
+			next_temp = body_c.next_temp + 1,
+			returns = False
+		}
+
+
+private pure func body_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			call_consumes_var(kind, args, variable)
+		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
+			body_consumes_var(body, variable)
+		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
+			if core_vars_equal(drop_var, variable):
+				True
+			else:
+				body_consumes_var(body, variable)
+		LetExpr(name, is_mutable, typ, rhs, body):
+			if body_consumes_var(rhs, variable):
+				True
+			else if core_vars_equal(name, variable):
+				False
+			else:
+				body_consumes_var(body, variable)
+		BorrowLetExpr(name, typ, rhs, body):
+			if body_consumes_var(rhs, variable):
+				True
+			else if core_vars_equal(name, variable):
+				False
+			else:
+				body_consumes_var(body, variable)
+		SeqExpr(first, second):
+			body_consumes_var(first, variable) or body_consumes_var(second, variable)
+		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			match_scrutinee_consumes_var(scrutinee, scrutinee_release_policy, variable)
+		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			match_scrutinee_consumes_var(scrutinee, scrutinee_release_policy, variable)
+		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
+			match_scrutinee_consumes_var(scrutinee, scrutinee_release_policy, variable)
+		AssignExpr(assign_var, rhs, typ, loc):
+			expr_is_var_reference(rhs, variable)
+		VarExpr(returned, typ, loc):
+			False
+		LiteralExpr(literal, typ, loc):
+			False
+		VoidExpr(typ, loc):
+			False
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		BinaryExpr(op, left, right, typ, loc):
+			False
+		UnaryExpr(op, expr_value, typ, loc):
+			False
+		LogicalExpr(op, left, right, typ, loc):
+			False
 		CastExpr(expr_value, typ, loc):
 			False
 		BoxExpr(box, typ, loc):
@@ -10436,10 +11380,6 @@ private pure func body_consumes_var_before_suspension(
 			False
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			False
-
-
-private pure func let_body_takes_cleanup_ownership(body: CoreExpr, variable: CoreVar) -> Bool:
-	directly_returns_var(body, variable) or body_consumes_var_before_suspension(body, variable)
 
 
 private pure func directly_returns_var(expr: CoreExpr, variable: CoreVar) -> Bool:
@@ -10669,7 +11609,9 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 													Some(rendered):
 														Some(rendered)
 													None:
-														arg_values ?= emit_simple_expr_arg_values(args)
+														arg_values ?= emit_simple_expr_arg_values(
+															args,
+														)
 
 														match emit_direct_nonboxed_tensor_call_from_values(
 															name,
@@ -10710,7 +11652,13 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 								Some(rendered)
 							None:
 								arg_values ?= emit_simple_expr_arg_values(args)
-								match emit_direct_runtime_tensor_call_from_values(call, args, arg_values, typ):
+
+								match emit_direct_runtime_tensor_call_from_values(
+									call,
+									args,
+									arg_values,
+									typ,
+								):
 									Some(rendered):
 										Some(rendered)
 									None:
@@ -13347,12 +14295,7 @@ private pure func emit_select(select_expr: CoreSelect, next_temp: Int) -> Option
 private pure func channel_loop_value_release(binder: CoreLoopBinder) -> String:
 	binding_name: String = c_var_name(binder.variable)
 
-	if is_stack_result_type(binder.typ):
-		emit_release_statement(binding_name, StackResultReleasePolicy)
-	else if type_requires_release(binder.typ):
-		"  " + render_prepared_backend_op(BackendChannelIterReleaseObject(binding_name)) + "\n"
-	else:
-		""
+	emit_release_statement(binding_name, cleanup_release_policy_for_type(binder.typ))
 
 
 private pure func emit_for_channel(
@@ -13580,19 +14523,7 @@ private pure func dict_loop_binding(
 
 	match for_dict.binder.typ:
 		TupleType(items):
-			match items:
-				[]:
-					None
-				[first]:
-					None
-				[key_type, value_type]:
-					Some(render_prepared_backend_op(BackendDictIterPairBinding({
-						entry = binding_name,
-						dict = iter_tmp,
-						slot = slot_tmp,
-					})) + "\n")
-				[first, second, third, ...rest]:
-					None
+			dict_tuple_loop_binding(binding_name, iter_tmp, slot_tmp, items)
 		VoidType:
 			None
 		NamedType(name, args):
@@ -13642,6 +14573,27 @@ private pure func dict_loop_binding(
 				slot = slot_tmp,
 			})) + "\n")
 		TensorType:
+			None
+
+
+private pure func dict_tuple_loop_binding(
+	binding_name: String,
+	iter_tmp: String,
+	slot_tmp: String,
+	items: List[CoreType],
+) -> Option[String]:
+	match items:
+		[]:
+			None
+		[first]:
+			None
+		[key_type, value_type]:
+			Some(render_prepared_backend_op(BackendDictIterPairBinding({
+				entry = binding_name,
+				dict = iter_tmp,
+				slot = slot_tmp,
+			})) + "\n")
+		[first, second, third, ...rest]:
 			None
 
 
@@ -15031,10 +15983,14 @@ private pure func stack_result_match_source(
 	accessor: CoreAccessor,
 	result_type: String,
 ) -> String:
-	if accessor_reads_boxed_struct_value(accessor):
-		boxed_struct_value_source(result_type, source_c)
-	else:
-		source_c + ""
+	match accessor:
+		VariantFieldAccessor(parent, union_c_type, constructor, field_index):
+			boxed_struct_value_source(result_type, source_c)
+		_:
+			if accessor_reads_boxed_struct_value(accessor):
+				boxed_struct_value_source(result_type, source_c)
+			else:
+				source_c + ""
 
 
 private pure func constructor_case_parent_source(
@@ -15262,12 +16218,12 @@ private pure func emit_constructor_literal_match_body(
 	)
 	scrutinee_temp: String = temp_name("match_scrut", next_temp)
 
-	emit_literal_match_statement(
+	emit_constructor_literal_match_statement(
 		"",
+		outer_scrutinee_temp,
 		scrutinee_temp,
 		scrutinee_value,
 		match_expr.scrutinee_type,
-		Some(outer_scrutinee_temp),
 		result_name,
 		match_expr.cases,
 		match_expr.fallback,
@@ -15295,12 +16251,12 @@ private pure func emit_constructor_case_literal_match_body(
 	)
 	scrutinee_temp: String = temp_name("match_scrut", next_temp)
 
-	emit_literal_match_statement(
+	emit_constructor_literal_match_statement(
 		"",
+		outer_scrutinee_temp,
 		scrutinee_temp,
 		scrutinee_value,
 		match_expr.scrutinee_type,
-		Some(outer_scrutinee_temp),
 		result_name,
 		match_expr.cases,
 		match_expr.fallback,
@@ -15308,14 +16264,305 @@ private pure func emit_constructor_case_literal_match_body(
 	)
 
 
-private pure func emit_constructor_length_match_branch(
+private pure func emit_constructor_literal_match_fallback(
 	outer_scrutinee_temp: String,
+	result_name: Option[String],
+	fallback: CoreLiteralMatchFallback,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match fallback:
+		LiteralMatchFallbackBody(AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc)):
+			emit_constructor_literal_match_body(
+				outer_scrutinee_temp,
+				result_name,
+				match_expr,
+				next_temp,
+			)
+		LiteralMatchFallbackBody(LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc)):
+			emit_constructor_length_match_body(
+				outer_scrutinee_temp,
+				result_name,
+				match_expr,
+				next_temp,
+			)
+		LiteralMatchFallbackBody(body):
+			emit_literal_match_branch_body(result_name, body, next_temp)
+		LiteralMatchFallbackBindings(bindings, AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc)):
+			bindings_c ?= emit_match_bindings(outer_scrutinee_temp, bindings)
+			body_c ?= emit_constructor_literal_match_body(
+				outer_scrutinee_temp,
+				result_name,
+				match_expr,
+				next_temp,
+			)
+			Some({
+				statements = bindings_c + body_c.statements,
+				value = body_c.value,
+				next_temp = body_c.next_temp,
+				returns = body_c.returns,
+			})
+		LiteralMatchFallbackBindings(bindings, LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc)):
+			bindings_c ?= emit_match_bindings(outer_scrutinee_temp, bindings)
+			body_c ?= emit_constructor_length_match_body(
+				outer_scrutinee_temp,
+				result_name,
+				match_expr,
+				next_temp,
+			)
+			Some({
+				statements = bindings_c + body_c.statements,
+				value = body_c.value,
+				next_temp = body_c.next_temp,
+				returns = body_c.returns,
+			})
+		LiteralMatchFallbackBindings(bindings, body):
+			bindings_c ?= emit_match_bindings(outer_scrutinee_temp, bindings)
+			body_c ?= emit_literal_match_branch_body(result_name, body, next_temp)
+			Some({
+				statements = bindings_c + body_c.statements,
+				value = body_c.value,
+				next_temp = body_c.next_temp,
+				returns = body_c.returns,
+			})
+		LiteralMatchFallbackFail:
+			Some(emit_literal_match_failure(next_temp))
+
+
+private pure func emit_constructor_literal_match_statement(
+	prefix_statements: String,
+	outer_scrutinee_temp: String,
+	scrutinee_temp: String,
+	scrutinee_value: String,
+	scrutinee_type: CoreType,
+	result_name: Option[String],
+	cases: List[CoreLiteralMatchCase],
+	fallback: CoreLiteralMatchFallback,
+	branch_next_temp_start: Int,
+) -> Option[FunctionBodyC]:
+	var branch_next_temp: Int = branch_next_temp_start
+	var branch_statements: String = ""
+	var failed: Bool = False
+	var has_case: Bool = False
+
+	for match_case in cases:
+		if not failed:
+			match c_literal_match_test(scrutinee_temp, match_case.literal):
+				Some(test):
+					match emit_literal_match_case_body(
+						outer_scrutinee_temp,
+						result_name,
+						match_case,
+						branch_next_temp,
+					):
+						Some(case_c):
+							if has_case:
+								branch_statements += "  } else if (" + test + ") {\n"
+							else:
+								branch_statements += "  if (" + test + ") {\n"
+
+							branch_statements += indent_statements(case_c.statements)
+							branch_next_temp = case_c.next_temp
+							has_case = True
+						None:
+							failed = True
+				None:
+					failed = True
+
+	if failed:
+		None
+	else:
+		fallback_c ?= emit_constructor_literal_match_fallback(
+			outer_scrutinee_temp,
+			result_name,
+			fallback,
+			branch_next_temp,
+		)
+		prefix: String = prefix_statements + "  " + c_type_name(
+			scrutinee_type,
+		) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n"
+
+		var match_statements: String = fallback_c.statements
+
+		if has_case:
+			match_statements = branch_statements + "  } else {\n" + indent_statements(
+				fallback_c.statements,
+			) + "  }\n"
+
+		Some({
+			statements = prefix + match_statements,
+			value = "",
+			next_temp = fallback_c.next_temp,
+			returns = False,
+		})
+
+
+private pure func emit_constructor_expr_match_body(
+	outer_scrutinee_temp: String,
+	result_name: Option[String],
+	expr: CoreExpr,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match expr:
+		AccessorLiteralMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		LengthMatchExpr(scrutinee, scrutinee_release_policy, match_expr, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		LiteralExpr(literal, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		VarExpr(variable, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		VoidExpr(typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		CooperativeCheckpointExpr(typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		CallExpr(kind, callee, args, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		BinaryExpr(op, left, right, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		UnaryExpr(op, expr_value, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		LogicalExpr(op, left, right, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		AssignExpr(variable, rhs, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		CastExpr(expr_value, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		BoxExpr(box, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		UnboxExpr(unbox_kind, expr_value, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		FieldExpr(expr_value, field_name, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TupleFieldExpr(expr_value, field_index, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TupleExpr(items, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TupleConstructExpr(tuple_construct, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ClosureCreateExpr(closure, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListConstructExpr(construct, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListAllocExpr(alloc, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListGetExpr(get, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListHandoffExpr(handoff, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListHandoffSetSourceSlotExpr(slot, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		StringByteReadExpr(read, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		StringByteWriteExpr(write, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		StringByteCopyExpr(copy, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		StringSetLenExpr(set_len, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TensorLiteralExpr(literal, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TensorPackedLiteralExpr(literal, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TensorRawFillExpr(fill, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TensorRawReadExpr(read, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TensorRawWriteExpr(write, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		DictConstructExpr(construct, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		SetAllocExpr(alloc, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListRetainExpr(retain, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListSetExpr(set, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ListSwapExpr(swap, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		RecordExpr(fields, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		UnionConstructExpr(construct, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		DetachExpr(detached, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		LetExpr(name, is_mutable, typ, rhs, body):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		BorrowLetExpr(name, typ, rhs, body):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		SeqExpr(first, second):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		WhileExpr(cond, body, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		BreakExpr(typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ContinueExpr(typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ResourceScopeExpr(scope, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ResourceCleanupExitExpr(cleanup_exit, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TailrecLoopExpr(params, return_type, body, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TailrecRecurExpr(args, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TailrecListSpreadLoopExpr(loop, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForChannelExpr(for_channel, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForListExpr(for_list, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForStringExpr(for_string, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForDictExpr(for_dict, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForSetExpr(for_set, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForResourceSourceExpr(for_resource_source, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForStreamExpr(for_stream, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ForTensorExpr(for_tensor, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ConcurrentExpr(block, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		SelectExpr(select_expr, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		RangeExpr(start, end_value, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+
+
+private pure func emit_constructor_length_match_branch(
+	match_root_value: String,
 	result_name: Option[String],
 	branch: CoreConstructorLengthMatchBranch,
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
-	bindings_c ?= emit_match_bindings(outer_scrutinee_temp, branch.bindings)
-	body_c ?= emit_constructor_match_body(outer_scrutinee_temp, result_name, branch.body, next_temp)
+	bindings_c ?= emit_match_bindings(match_root_value, branch.bindings)
+	body_c ?= emit_constructor_match_body(match_root_value, result_name, branch.body, next_temp)
 
 	Some({
 		statements = bindings_c + body_c.statements,
@@ -15326,30 +16573,25 @@ private pure func emit_constructor_length_match_branch(
 
 
 private pure func emit_constructor_length_match_fallback(
-	outer_scrutinee_temp: String,
+	match_root_value: String,
 	result_name: Option[String],
 	fallback: Option[CoreConstructorLengthMatchBranch],
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
 	match fallback:
 		Some(branch):
-			emit_constructor_length_match_branch(
-				outer_scrutinee_temp,
-				result_name,
-				branch,
-				next_temp,
-			)
+			emit_constructor_length_match_branch(match_root_value, result_name, branch, next_temp)
 		None:
 			Some(emit_literal_match_failure(next_temp))
 
 
-private pure func emit_constructor_length_match_body(
+private pure func emit_constructor_length_match_body_from_list_value(
 	outer_scrutinee_temp: String,
+	list_value: String,
 	result_name: Option[String],
 	match_expr: CoreConstructorLengthMatch,
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
-	list_value ?= emit_match_accessor(outer_scrutinee_temp, match_expr.accessor)
 	len_temp: String = temp_name("match_len", next_temp)
 	var branch_next_temp: Int = next_temp + 1
 	var branch_statements: String = ""
@@ -15359,7 +16601,7 @@ private pure func emit_constructor_length_match_body(
 	for match_case in match_expr.cases:
 		if not failed:
 			match emit_constructor_length_match_branch(
-				outer_scrutinee_temp,
+				list_value,
 				result_name,
 				match_case.branch,
 				branch_next_temp,
@@ -15382,7 +16624,7 @@ private pure func emit_constructor_length_match_body(
 		Some(geq_case):
 			if not failed:
 				match emit_constructor_length_match_branch(
-					outer_scrutinee_temp,
+					list_value,
 					result_name,
 					geq_case.branch,
 					branch_next_temp,
@@ -15407,7 +16649,7 @@ private pure func emit_constructor_length_match_body(
 		None
 	else:
 		fallback_c ?= emit_constructor_length_match_fallback(
-			outer_scrutinee_temp,
+			list_value,
 			result_name,
 			match_expr.fallback,
 			branch_next_temp,
@@ -15429,6 +16671,113 @@ private pure func emit_constructor_length_match_body(
 		})
 
 
+private pure func emit_constructor_length_match_body(
+	outer_scrutinee_temp: String,
+	result_name: Option[String],
+	match_expr: CoreConstructorLengthMatch,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	list_value ?= emit_match_accessor(outer_scrutinee_temp, match_expr.accessor)
+	emit_constructor_length_match_body_from_list_value(
+		outer_scrutinee_temp,
+		list_value,
+		result_name,
+		match_expr,
+		next_temp,
+	)
+
+
+private pure func emit_constructor_case_length_match_body(
+	outer_scrutinee_temp: String,
+	result_name: Option[String],
+	match_case: CoreConstructorMatchCase,
+	match_expr: CoreConstructorLengthMatch,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	list_value ?= constructor_case_length_match_list_value(
+		outer_scrutinee_temp,
+		match_case,
+		match_expr,
+	)
+	emit_constructor_length_match_body_from_list_value(
+		outer_scrutinee_temp,
+		list_value,
+		result_name,
+		match_expr,
+		next_temp,
+	)
+
+
+private pure func list_payload_binding(binding: CoreMatchBinding) -> Option[CoreMatchBinding]:
+	match binding.typ:
+		NamedType(name, args):
+			if name == "List" and args.length() == 1:
+				Some(binding)
+			else:
+				None
+		VoidType:
+			None
+		StackResultType(ok_type, err_type):
+			None
+		BoxedResultType(ok_type, err_type):
+			None
+		EnumType(name):
+			None
+		ValueRecordType(name):
+			None
+		HeapRecordType(name):
+			None
+		UnionType(name):
+			None
+		RangeType:
+			None
+		TensorType:
+			None
+		TupleType(items):
+			None
+
+
+private pure func constructor_case_root_list_binding(
+	match_case: CoreConstructorMatchCase,
+) -> Option[CoreMatchBinding]:
+	match match_case.bindings:
+		[]:
+			None
+		[binding]:
+			list_payload_binding(binding)
+		[first, second]:
+			None
+		[first, second, third]:
+			None
+		[first, second, third, ...rest]:
+			None
+
+
+private pure func constructor_case_length_match_list_value(
+	outer_scrutinee_temp: String,
+	match_case: CoreConstructorMatchCase,
+	match_expr: CoreConstructorLengthMatch,
+) -> Option[String]:
+	if accessors_equal(match_expr.accessor, RootAccessor):
+		match constructor_case_root_list_binding(match_case):
+			Some(binding):
+				Some(c_var_name(binding.variable))
+			None:
+				emit_match_accessor_for_constructor_case(
+					outer_scrutinee_temp,
+					match_case.accessor,
+					match_case.test,
+					match_expr.accessor,
+				)
+	else:
+		emit_match_accessor_for_constructor_case(
+			outer_scrutinee_temp,
+			match_case.accessor,
+			match_case.test,
+			match_expr.accessor,
+		)
+
+
 private pure func emit_constructor_match_body(
 	outer_scrutinee_temp: String,
 	result_name: Option[String],
@@ -15437,7 +16786,7 @@ private pure func emit_constructor_match_body(
 ) -> Option[FunctionBodyC]:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			emit_literal_match_branch_body(result_name, expr, next_temp)
+			emit_constructor_expr_match_body(outer_scrutinee_temp, result_name, expr, next_temp)
 		ConstructorMatchBodyLiteral(match_expr):
 			emit_constructor_literal_match_body(
 				outer_scrutinee_temp,
@@ -15464,7 +16813,7 @@ private pure func emit_constructor_match_branch_body(
 
 	body_c ?= match match_case.body:
 		ConstructorMatchBodyExpr(expr):
-			emit_literal_match_branch_body(result_name, expr, next_temp)
+			emit_constructor_expr_match_body(scrutinee_temp, result_name, expr, next_temp)
 		ConstructorMatchBodyLiteral(match_expr):
 			emit_constructor_case_literal_match_body(
 				scrutinee_temp,
@@ -15474,7 +16823,13 @@ private pure func emit_constructor_match_branch_body(
 				next_temp,
 			)
 		ConstructorMatchBodyLength(match_expr):
-			emit_constructor_length_match_body(scrutinee_temp, result_name, match_expr, next_temp)
+			emit_constructor_case_length_match_body(
+				scrutinee_temp,
+				result_name,
+				match_case,
+				match_expr,
+				next_temp,
+			)
 
 	Some({
 		statements = bindings_c + body_c.statements,
@@ -15712,7 +17067,10 @@ private pure func emit_literal_match(
 	)
 
 	Some({
-		statements = match_c.statements,
+		statements = match_c.statements + owned_body_value_cleanup(
+			scrutinee_c,
+			core_expr_type(scrutinee),
+		),
 		value = result_value,
 		next_temp = match_c.next_temp,
 		returns = False,
@@ -15780,16 +17138,26 @@ private pure func emit_accessor_literal_match(
 		core_expr_type(
 			scrutinee,
 		),
-	) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + owned_temp_cleanup_push_statement(
-		scrutinee_temp,
-		scrutinee_release_policy,
-	) + result_decl
+	) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+		scrutinee_c,
+		core_expr_type(
+			scrutinee,
+		),
+	) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy) + result_decl
 
 	Some({
 		statements = prefix + match_c.statements + owned_temp_cleanup_pop_statement(
 			scrutinee_temp,
 			scrutinee_release_policy,
-		) + emit_release_statement(scrutinee_temp, scrutinee_release_policy),
+		) + emit_release_statement(
+			scrutinee_temp,
+			scrutinee_release_policy,
+		) + transferred_body_value_release_after_match(
+			scrutinee_c,
+			core_expr_type(scrutinee),
+			scrutinee_temp,
+			scrutinee_release_policy,
+		),
 		value = result_value,
 		next_temp = match_c.next_temp,
 		returns = False,
@@ -15831,16 +17199,26 @@ private pure func emit_length_match(
 		core_expr_type(
 			scrutinee,
 		),
-	) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + owned_temp_cleanup_push_statement(
-		scrutinee_temp,
-		scrutinee_release_policy,
-	) + result_decl
+	) + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+		scrutinee_c,
+		core_expr_type(
+			scrutinee,
+		),
+	) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy) + result_decl
 
 	Some({
 		statements = prefix + match_c.statements + owned_temp_cleanup_pop_statement(
 			scrutinee_temp,
 			scrutinee_release_policy,
-		) + emit_release_statement(scrutinee_temp, scrutinee_release_policy),
+		) + emit_release_statement(
+			scrutinee_temp,
+			scrutinee_release_policy,
+		) + transferred_body_value_release_after_match(
+			scrutinee_c,
+			core_expr_type(scrutinee),
+			scrutinee_temp,
+			scrutinee_release_policy,
+		),
 		value = result_value,
 		next_temp = match_c.next_temp,
 		returns = False,
@@ -15937,10 +17315,12 @@ private pure func emit_constructor_match(
 			branch_next_temp,
 		)
 		scrutinee_type: String = constructor_match_scrutinee_c_type(scrutinee, cases)
-		prefix: String = scrutinee_c.statements + "  " + scrutinee_type + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + owned_temp_cleanup_push_statement(
-			scrutinee_temp,
-			scrutinee_release_policy,
-		)
+		prefix: String = scrutinee_c.statements + "  " + scrutinee_type + " " + scrutinee_temp + " = " + scrutinee_value + ";\n" + transferred_body_value_cleanup_pop(
+			scrutinee_c,
+			core_expr_type(
+				scrutinee,
+			),
+		) + owned_temp_cleanup_push_statement(scrutinee_temp, scrutinee_release_policy)
 		var result_decl: String = ""
 
 		if has_result:
@@ -15962,7 +17342,15 @@ private pure func emit_constructor_match(
 			statements = prefix + result_decl + match_statements + owned_temp_cleanup_pop_statement(
 				scrutinee_temp,
 				scrutinee_release_policy,
-			) + emit_release_statement(scrutinee_temp, scrutinee_release_policy),
+			) + emit_release_statement(
+				scrutinee_temp,
+				scrutinee_release_policy,
+			) + transferred_body_value_release_after_match(
+				scrutinee_c,
+				core_expr_type(scrutinee),
+				scrutinee_temp,
+				scrutinee_release_policy,
+			),
 			value = result_value,
 			next_temp = fallback_c.next_temp,
 			returns = False,
@@ -16101,32 +17489,33 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 							is_mutable,
 							typ,
 						)
-						tracks_cleanup: Bool = let_tracks_cleanup(
-							cleanup_policy,
-							body,
-							name,
-						)
+						tracks_cleanup: Bool = let_tracks_cleanup(cleanup_policy, body, name)
+
 						cleanup_push: String = if tracks_cleanup:
-							cancellation_cleanup_push_statement(
-								name,
-								cleanup_policy,
-							)
+							cancellation_cleanup_push_statement(name, cleanup_policy)
 						else:
 							""
+
 						cleanup_pop: String = if tracks_cleanup:
-							cancellation_cleanup_pop_statement(name)
+							let_normal_cleanup_statement(name, cleanup_policy, rhs, body)
 						else:
 							""
+
 						handoff_pop: String = handoff_source_cleanup_pop_statement(rhs)
+						cleaned_body: FunctionBodyC = apply_let_cleanup_to_body(
+							body,
+							body_c,
+							cleanup_pop,
+						)
 						Some({
 							statements = "  " + c_type_name(
 								typ,
 							) + " " + c_var_name(
 								name,
-							) + " = " + rhs_c + ";\n" + handoff_pop + cleanup_push + body_c.statements + cleanup_pop,
-							value = body_c.value,
-							next_temp = body_c.next_temp,
-							returns = body_c.returns,
+							) + " = " + rhs_c + ";\n" + handoff_pop + cleanup_push + cleaned_body.statements,
+							value = cleaned_body.value,
+							next_temp = cleaned_body.next_temp,
+							returns = cleaned_body.returns,
 						})
 					None:
 						rhs_body ?= emit_function_body(rhs, next_temp)
@@ -16141,32 +17530,33 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 							is_mutable,
 							typ,
 						)
-						tracks_cleanup: Bool = let_tracks_cleanup(
-							cleanup_policy,
-							body,
-							name,
-						)
+						tracks_cleanup: Bool = let_tracks_cleanup(cleanup_policy, body, name)
+
 						cleanup_push: String = if tracks_cleanup:
-							cancellation_cleanup_push_statement(
-								name,
-								cleanup_policy,
-							)
+							cancellation_cleanup_push_statement(name, cleanup_policy)
 						else:
 							""
+
 						cleanup_pop: String = if tracks_cleanup:
-							cancellation_cleanup_pop_statement(name)
+							let_normal_cleanup_statement(name, cleanup_policy, rhs, body)
 						else:
 							""
+
 						handoff_pop: String = handoff_source_cleanup_pop_statement(rhs)
+						cleaned_body: FunctionBodyC = apply_let_cleanup_to_body(
+							body,
+							body_c,
+							cleanup_pop,
+						)
 						Some({
 							statements = "  " + c_type_name(
 								typ,
 							) + " " + c_var_name(
 								name,
-							) + " = " + rhs_statement_expr + ";\n" + handoff_pop + cleanup_push + body_c.statements + cleanup_pop,
-							value = body_c.value,
-							next_temp = body_c.next_temp,
-							returns = body_c.returns,
+							) + " = " + rhs_statement_expr + ";\n" + handoff_pop + cleanup_push + cleaned_body.statements,
+							value = cleaned_body.value,
+							next_temp = cleaned_body.next_temp,
+							returns = cleaned_body.returns,
 						})
 		BorrowLetExpr(name, typ, rhs, body):
 			if is_void_type(typ):
@@ -16194,9 +17584,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 						Some({
 							statements = "  " + c_type_name(
 								typ,
-							) + " " + c_var_name(
-								name,
-							) + " = " + rhs_c + ";\n" + body_c.statements,
+							) + " " + c_var_name(name) + " = " + rhs_c + ";\n" + body_c.statements,
 							value = body_c.value,
 							next_temp = body_c.next_temp,
 							returns = body_c.returns,
@@ -16287,7 +17675,9 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 						None:
 							emit_call_body(kind, args, typ, next_temp)
 				IntrinsicCall(name):
-					if call_transfer_cleanup_pop_statements(kind, args) == "":
+					if name == "list_retain_for":
+						emit_call_body(kind, args, typ, next_temp)
+					else if call_transfer_cleanup_pop_statements(kind, args) == "":
 						match emit_simple_expr(expr):
 							Some(value):
 								Some(body_value(value, next_temp))
@@ -16342,8 +17732,19 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 				None:
 					emit_cast_body(expr_value, typ, next_temp)
 		BoxExpr(box, typ, loc):
-			value ?= emit_simple_expr(expr)
-			Some(body_value(value, next_temp))
+			match emit_simple_expr(expr):
+				Some(value):
+					Some(body_value(value, next_temp))
+				None:
+					emit_boxed_pointer_body(
+						{
+							kind = box.kind,
+							value = box.value,
+							needs_release = boxed_value_needs_release_type(box.source_type),
+							transfers_ownership = False
+						},
+						next_temp,
+					)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):
 			match emit_simple_expr(expr):
 				Some(value):
@@ -16437,8 +17838,7 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 			value ?= emit_simple_expr(expr)
 			Some(body_value(value, next_temp))
 		ListRetainExpr(retain, typ, loc):
-			value ?= emit_simple_expr(expr)
-			Some(body_value(value, next_temp))
+			emit_list_retain_body(retain, next_temp)
 		ListSetExpr(set, typ, loc):
 			match emit_simple_expr(expr):
 				Some(value):
@@ -16899,6 +18299,138 @@ private pure func emit_channel_attempt_return_function(
 	c_function_signature(func_info) + " {\n  return " + value + ";\n}\n"
 
 
+private pure func emit_channel_send_timeout_attempt_for_values(
+	func_info: CoreFunction,
+	constructors: ChannelAttemptConstructors,
+	temp_seed: String,
+	value_expr: CoreExpr,
+	arg_values: List[String],
+) -> Option[String]:
+	match arg_values:
+		[channel, value, timeout]:
+			send_constructors ?= channel_send_attempt_constructors(constructors)
+			rendered: String = emit_channel_send_attempt_value(
+				c_type_name(func_info.return_type),
+				channel,
+				value,
+				Some(timeout),
+				temp_seed,
+				send_constructors,
+				boxed_expr_temp_needs_release(value_expr),
+			)
+			Some(emit_channel_attempt_return_function(func_info, rendered))
+		[]:
+			None
+		[first]:
+			None
+		[first, second]:
+			None
+		[first, second, third, fourth, ...rest]:
+			None
+
+
+private pure func emit_channel_try_send_attempt_for_values(
+	func_info: CoreFunction,
+	constructors: ChannelAttemptConstructors,
+	temp_seed: String,
+	value_expr: CoreExpr,
+	arg_values: List[String],
+) -> Option[String]:
+	match arg_values:
+		[channel, value]:
+			send_constructors ?= channel_send_attempt_constructors(constructors)
+			rendered: String = emit_channel_send_attempt_value(
+				c_type_name(func_info.return_type),
+				channel,
+				value,
+				None,
+				temp_seed,
+				send_constructors,
+				boxed_expr_temp_needs_release(value_expr),
+			)
+			Some(emit_channel_attempt_return_function(func_info, rendered))
+		[]:
+			None
+		[first]:
+			None
+		[first, second, third, ...rest]:
+			None
+
+
+private pure func emit_channel_recv_timeout_attempt_for_values(
+	func_info: CoreFunction,
+	constructors: ChannelAttemptConstructors,
+	temp_seed: String,
+	channel_expr: CoreExpr,
+	arg_values: List[String],
+) -> Option[String]:
+	match arg_values:
+		[channel, timeout]:
+			elem_type ?= channel_element_type(core_expr_type(channel_expr))
+			recv_constructors ?= channel_recv_attempt_constructors(
+				constructors,
+				constructors.recv_timed_out,
+			)
+
+			release_policy: ChannelRecvReleasePolicy = if boxed_value_needs_release_type(elem_type):
+				ReleaseChannelRecvValue
+			else:
+				KeepChannelRecvValue
+
+			rendered: String = emit_channel_recv_attempt_value(
+				c_type_name(func_info.return_type),
+				channel,
+				Some(timeout),
+				temp_seed,
+				release_policy,
+				recv_constructors,
+				constructors.recv_value_uses_release_mask,
+			)
+			Some(emit_channel_attempt_return_function(func_info, rendered))
+		[]:
+			None
+		[first]:
+			None
+		[first, second, third, ...rest]:
+			None
+
+
+private pure func emit_channel_try_recv_attempt_for_values(
+	func_info: CoreFunction,
+	constructors: ChannelAttemptConstructors,
+	temp_seed: String,
+	channel_expr: CoreExpr,
+	arg_values: List[String],
+) -> Option[String]:
+	match arg_values:
+		[channel]:
+			elem_type ?= channel_element_type(core_expr_type(channel_expr))
+			recv_constructors ?= channel_recv_attempt_constructors(
+				constructors,
+				constructors.recv_would_block,
+			)
+
+			release_policy: ChannelRecvReleasePolicy = if boxed_value_needs_release_type(elem_type):
+				ReleaseChannelRecvValue
+			else:
+				KeepChannelRecvValue
+
+			rendered: String = emit_channel_recv_attempt_value(
+				c_type_name(func_info.return_type),
+				channel,
+				None,
+				temp_seed,
+				release_policy,
+				recv_constructors,
+				constructors.recv_value_uses_release_mask,
+			)
+			Some(emit_channel_attempt_return_function(func_info, rendered))
+		[]:
+			None
+		[first, second, ...rest]:
+			None
+
+
 private pure func emit_channel_attempt_user_function(
 	decls: List[CoreDecl],
 	func_info: CoreFunction,
@@ -16914,29 +18446,15 @@ private pure func emit_channel_attempt_user_function(
 			arg_values ?= emit_simple_expr_arg_values(args)
 
 			if name == "blorp_channel_send_timeout_attempt":
-				match arg_values:
-					[channel, value, timeout]:
-						match args:
-							[channel_expr, value_expr, timeout_expr]:
-								send_constructors ?= channel_send_attempt_constructors(constructors)
-								rendered: String = emit_channel_send_attempt_value(
-									c_type_name(func_info.return_type),
-									channel,
-									value,
-									Some(timeout),
-									temp_seed,
-									send_constructors,
-									boxed_expr_temp_needs_release(value_expr),
-								)
-								Some(emit_channel_attempt_return_function(func_info, rendered))
-							[]:
-								None
-							[first]:
-								None
-							[first, second]:
-								None
-							[first, second, third, fourth, ...rest]:
-								None
+				match args:
+					[channel_expr, value_expr, timeout_expr]:
+						emit_channel_send_timeout_attempt_for_values(
+							func_info,
+							constructors,
+							temp_seed,
+							value_expr,
+							arg_values,
+						)
 					[]:
 						None
 					[first]:
@@ -16946,27 +18464,15 @@ private pure func emit_channel_attempt_user_function(
 					[first, second, third, fourth, ...rest]:
 						None
 			else if name == "blorp_channel_try_send_attempt":
-				match arg_values:
-					[channel, value]:
-						match args:
-							[channel_expr, value_expr]:
-								send_constructors ?= channel_send_attempt_constructors(constructors)
-								rendered: String = emit_channel_send_attempt_value(
-									c_type_name(func_info.return_type),
-									channel,
-									value,
-									None,
-									temp_seed,
-									send_constructors,
-									boxed_expr_temp_needs_release(value_expr),
-								)
-								Some(emit_channel_attempt_return_function(func_info, rendered))
-							[]:
-								None
-							[first]:
-								None
-							[first, second, third, ...rest]:
-								None
+				match args:
+					[channel_expr, value_expr]:
+						emit_channel_try_send_attempt_for_values(
+							func_info,
+							constructors,
+							temp_seed,
+							value_expr,
+							arg_values,
+						)
 					[]:
 						None
 					[first]:
@@ -16974,39 +18480,15 @@ private pure func emit_channel_attempt_user_function(
 					[first, second, third, ...rest]:
 						None
 			else if name == "blorp_channel_recv_timeout_attempt":
-				match arg_values:
-					[channel, timeout]:
-						match args:
-							[channel_expr, timeout_expr]:
-								elem_type ?= channel_element_type(core_expr_type(channel_expr))
-								recv_constructors ?= channel_recv_attempt_constructors(
-									constructors,
-									constructors.recv_timed_out,
-								)
-
-								release_policy: ChannelRecvReleasePolicy = if boxed_value_needs_release_type(
-									elem_type,
-								):
-									ReleaseChannelRecvValue
-								else:
-									KeepChannelRecvValue
-
-								rendered: String = emit_channel_recv_attempt_value(
-									c_type_name(func_info.return_type),
-									channel,
-									Some(timeout),
-									temp_seed,
-									release_policy,
-									recv_constructors,
-									constructors.recv_value_uses_release_mask,
-								)
-								Some(emit_channel_attempt_return_function(func_info, rendered))
-							[]:
-								None
-							[first]:
-								None
-							[first, second, third, ...rest]:
-								None
+				match args:
+					[channel_expr, timeout_expr]:
+						emit_channel_recv_timeout_attempt_for_values(
+							func_info,
+							constructors,
+							temp_seed,
+							channel_expr,
+							arg_values,
+						)
 					[]:
 						None
 					[first]:
@@ -17014,37 +18496,15 @@ private pure func emit_channel_attempt_user_function(
 					[first, second, third, ...rest]:
 						None
 			else if name == "blorp_channel_try_recv_attempt":
-				match arg_values:
-					[channel]:
-						match args:
-							[channel_expr]:
-								elem_type ?= channel_element_type(core_expr_type(channel_expr))
-								recv_constructors ?= channel_recv_attempt_constructors(
-									constructors,
-									constructors.recv_would_block,
-								)
-
-								release_policy: ChannelRecvReleasePolicy = if boxed_value_needs_release_type(
-									elem_type,
-								):
-									ReleaseChannelRecvValue
-								else:
-									KeepChannelRecvValue
-
-								rendered: String = emit_channel_recv_attempt_value(
-									c_type_name(func_info.return_type),
-									channel,
-									None,
-									temp_seed,
-									release_policy,
-									recv_constructors,
-									constructors.recv_value_uses_release_mask,
-								)
-								Some(emit_channel_attempt_return_function(func_info, rendered))
-							[]:
-								None
-							[first, second, ...rest]:
-								None
+				match args:
+					[channel_expr]:
+						emit_channel_try_recv_attempt_for_values(
+							func_info,
+							constructors,
+							temp_seed,
+							channel_expr,
+							arg_values,
+						)
 					[]:
 						None
 					[first, second, ...rest]:
@@ -17461,6 +18921,12 @@ record StaticInlineListStorage {
 }
 
 
+private struct PositiveBinaryFloat {
+	exponent: Int,
+	significand: Float
+}
+
+
 private pure func owned_static_fragment(text: String) -> String:
 	"" + text
 
@@ -17585,7 +19051,7 @@ private pure func round_positive_float_ties_to_even(value: Float) -> Int:
 		whole + 1
 
 
-private pure func normalize_positive_binary_float(value: Float) -> Option[(Int, Float)]:
+private pure func normalize_positive_binary_float(value: Float) -> Option[PositiveBinaryFloat]:
 	if value != value:
 		None
 	else if value <= 0.0:
@@ -17608,7 +19074,10 @@ private pure func normalize_positive_binary_float(value: Float) -> Option[(Int, 
 		if steps >= STATIC_FLOAT_NORMALIZE_MAX_STEPS:
 			None
 		else:
-			Some((exponent, significand))
+			Some({
+				exponent = exponent,
+				significand = significand,
+			})
 
 
 private pure func positive_normal_float_bits(
@@ -17618,15 +19087,13 @@ private pure func positive_normal_float_bits(
 	fraction_bits: Int,
 ) -> Option[Int]:
 	normalized ?= normalize_positive_binary_float(value)
-	exponent: Int = normalized[0]
-	significand: Float = normalized[1]
-	biased_exponent: Int = exponent + exponent_bias
+	biased_exponent: Int = normalized.exponent + exponent_bias
 
 	if biased_exponent <= 0 or biased_exponent > max_biased_exponent:
 		None
 	else:
 		fraction_scale: Int = int_power_of_two(fraction_bits)
-		fraction_float: Float = (significand - 1.0) * to_float(fraction_scale)
+		fraction_float: Float = (normalized.significand - 1.0) * to_float(fraction_scale)
 		var fraction: Int = round_positive_float_ties_to_even(fraction_float)
 		var adjusted_exponent: Int = biased_exponent
 
@@ -18134,23 +19601,30 @@ private pure func static_result_payload_slot_supported(value: CoreBoxedStorageVa
 			False
 
 
+private pure func static_stack_result_args_supported(
+	constructor_name: String,
+	args: List[CoreBoxedStorageValue],
+) -> Bool:
+	match args:
+		[arg]:
+			(
+				(constructor_name == "Ok" or constructor_name == "Err")
+				and static_result_payload_slot_supported(arg)
+			)
+		[]:
+			False
+		[first, second]:
+			False
+		[first, second, third]:
+			False
+		[first, second, third, ...rest]:
+			False
+
+
 private pure func static_stack_result_supported(construct: CoreUnionConstruct) -> Bool:
 	match construct.representation:
 		StackResultRepresentation(representation):
-			match construct.args:
-				[arg]:
-					(
-						(construct.constructor_name == "Ok" or construct.constructor_name == "Err")
-						and static_result_payload_slot_supported(arg)
-					)
-				[]:
-					False
-				[first, second]:
-					False
-				[first, second, third]:
-					False
-				[first, second, third, ...rest]:
-					False
+			static_stack_result_args_supported(construct.constructor_name, construct.args)
 		GenericUnionRepresentation:
 			False
 		BoxedOptionRepresentation:
@@ -18629,6 +20103,35 @@ private pure func static_tuple_slots(
 		})
 
 
+private pure func static_tuple_element_release_bit(index: Int, element: CoreTupleElement) -> Int:
+	match element:
+		TuplePointerElement(value):
+			int_power_of_two(index)
+		TuplePrimElement(value):
+			0
+		TupleVoidElement:
+			0
+		TupleStructElement(value, c_type):
+			0
+		TupleFloatElement(value):
+			0
+		TupleFloat32Element(value):
+			0
+		TupleFloat16Element(value):
+			0
+
+
+private pure func static_tuple_release_mask(elements: List[CoreTupleElement]) -> Int:
+	var release_mask: Int = 0
+	var index: Int = 0
+
+	for element in elements:
+		release_mask += static_tuple_element_release_bit(index, element)
+		index += 1
+
+	release_mask
+
+
 private pure func static_tuple_initializer(
 	path_c: String,
 	construct: CoreTupleConstruct,
@@ -18637,8 +20140,9 @@ private pure func static_tuple_initializer(
 	storage_name: String = static_tuple_storage_name(path_c)
 	arity: Int = construct.elements.length()
 	storage_slots: Int = static_tuple_storage_slots(arity)
+	release_mask: Int = static_tuple_release_mask(construct.elements)
 
-	definition: String = slots.definitions + "static struct { blorp_Object header; long arity; long release_mask; void* elem[" + storage_slots.to_string() + "]; } " + storage_name + " = {\n  .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n  .arity = " + arity.to_string() + "L,\n  .release_mask = " + construct.release_mask.to_string() + "UL,\n  .elem = { " + slots.value + " }\n};\n\n"
+	definition: String = slots.definitions + "static struct { blorp_Object header; long arity; long release_mask; void* elem[" + storage_slots.to_string() + "]; } " + storage_name + " = {\n  .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n  .arity = " + arity.to_string() + "L,\n  .release_mask = " + release_mask.to_string() + "UL,\n  .elem = { " + slots.value + " }\n};\n\n"
 
 	Some({
 		definitions = definition,
@@ -19003,8 +20507,7 @@ private pure func global_needs_string_elem_immortalizer(global: CoreGlobal) -> B
 				False
 
 
-private pure func emit_global_string_elem_immortalizer() -> String:
-	"static void " + GLOBAL_STRING_ELEM_IMMORTALIZER + "(void* value) {\n" + "  blorp_make_immortal_constant(((blorp_String*)value));\n" + "}\n\n"
+private GLOBAL_STRING_ELEM_IMMORTALIZER_C: String = "static void " + GLOBAL_STRING_ELEM_IMMORTALIZER + "(void* value) {\n" + "  blorp_make_immortal_constant(((blorp_String*)value));\n" + "}\n\n"
 
 
 private pure func emit_global_immortalizer_helpers(decls: List[CoreDecl]) -> String:
@@ -19027,7 +20530,7 @@ private pure func emit_global_immortalizer_helpers(decls: List[CoreDecl]) -> Str
 					void
 
 	if needs_string_helper:
-		emit_global_string_elem_immortalizer()
+		GLOBAL_STRING_ELEM_IMMORTALIZER_C
 	else:
 		""
 
@@ -19715,6 +21218,67 @@ private pure func union_decl_has_release_mask(union_decl: CoreUnionDecl) -> Bool
 	has_release_mask
 
 
+private pure func union_field_is_self_recursive(
+	union_decl: CoreUnionDecl,
+	field: CoreUnionField,
+) -> Bool:
+	match union_type_name(field.typ):
+		Some(name):
+			name == union_decl.name
+		None:
+			False
+
+
+private pure func union_field_uses_iterative_release(
+	union_decl: CoreUnionDecl,
+	field: CoreUnionField,
+) -> Bool:
+	match field.release_policy:
+		ArcReleasePolicy:
+			union_field_is_self_recursive(union_decl, field)
+		NoReleasePolicy:
+			False
+		ArcReleaseOnlyPolicy:
+			False
+		StackResultReleasePolicy:
+			False
+
+
+private pure func union_variant_uses_iterative_release(
+	union_decl: CoreUnionDecl,
+	variant: CoreUnionVariant,
+) -> Bool:
+	var uses_iterative_release: Bool = False
+
+	for field in variant.fields:
+		if union_field_uses_iterative_release(union_decl, field):
+			uses_iterative_release = True
+
+	uses_iterative_release
+
+
+private pure func union_decl_uses_iterative_destructor(union_decl: CoreUnionDecl) -> Bool:
+	var uses_iterative_destructor: Bool = False
+
+	for variant in union_decl.variants:
+		if union_variant_uses_iterative_release(union_decl, variant):
+			uses_iterative_destructor = True
+
+	uses_iterative_destructor
+
+
+private pure func union_destroy_stack_push_name(union_decl: CoreUnionDecl) -> String:
+	union_decl.name + "_destroy_stack_push"
+
+
+private pure func union_destroy_release_child_name(union_decl: CoreUnionDecl) -> String:
+	union_decl.name + "_destroy_release_child"
+
+
+private pure func union_destroy_fields_name(union_decl: CoreUnionDecl) -> String:
+	union_decl.name + "_destroy_fields"
+
+
 private pure func typed_union_field_release_statement(
 	field: CoreUnionField,
 	field_c: String,
@@ -19735,6 +21299,23 @@ private pure func erased_union_field_release_statement(index: Int, field_c: Stri
 	"        if ((self->release_mask & " + bit + "UL) && " + field_c + ") blorp_release(" + field_c + ");\n"
 
 
+private pure func iterative_union_field_release_statement(
+	union_decl: CoreUnionDecl,
+	index: Int,
+	field_c: String,
+) -> String:
+	release_call: String = union_destroy_release_child_name(
+		union_decl,
+	) + "(__destroy_stack, __destroy_count, __destroy_capacity, (" + union_decl.name + "*)" + field_c + ");\n"
+
+	match union_decl.payload_storage:
+		TypedUnionPayloadStorage:
+			"        if (" + field_c + ") " + release_call
+		ErasedUnionPayloadStorage:
+			bit: String = int_power_of_two(index).to_string()
+			"        if ((self->release_mask & " + bit + "UL) && " + field_c + ") " + release_call
+
+
 private pure func union_field_release_statement(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
@@ -19746,31 +21327,57 @@ private pure func union_field_release_statement(
 	else:
 		field_c: String = "self->data." + variant.name + ".field" + index.to_string()
 
-		match union_decl.payload_storage:
-			TypedUnionPayloadStorage:
-				typed_union_field_release_statement(field, field_c)
-			ErasedUnionPayloadStorage:
-				erased_union_field_release_statement(index, field_c)
+		if union_field_uses_iterative_release(union_decl, field):
+			iterative_union_field_release_statement(union_decl, index, field_c)
+		else:
+			match union_decl.payload_storage:
+				TypedUnionPayloadStorage:
+					typed_union_field_release_statement(field, field_c)
+				ErasedUnionPayloadStorage:
+					erased_union_field_release_statement(index, field_c)
+
+
+private pure func emit_union_destructor_cases(union_decl: CoreUnionDecl) -> String:
+	var cases_c: String = ""
+
+	for variant in union_decl.variants:
+		if union_variant_has_releasable_field(variant):
+			var releases_c: String = ""
+			var index: Int = 0
+
+			for field in variant.fields:
+				releases_c += union_field_release_statement(union_decl, variant, field, index)
+				index += 1
+
+			cases_c += "    case " + variant.tag_c_name + ":\n" + releases_c + "      break;\n"
+
+	cases_c
+
+
+private pure func emit_simple_union_destructor(union_decl: CoreUnionDecl) -> String:
+	"static void " + union_decl.name + "_destroy(void* obj) {\n" + "  " + union_decl.name + "* self = (" + union_decl.name + "*)obj;\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
+		union_decl,
+	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n"
+
+
+private pure func emit_iterative_union_destructor(union_decl: CoreUnionDecl) -> String:
+	type_name: String = union_decl.name
+	stack_push_name: String = union_destroy_stack_push_name(union_decl)
+	release_child_name: String = union_destroy_release_child_name(union_decl)
+	destroy_fields_name: String = union_destroy_fields_name(union_decl)
+
+	"static void " + stack_push_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (*count >= *capacity) {\n" + "    long next_capacity = (*capacity == 0) ? 64 : (*capacity * 2);\n" + "    " + type_name + "** grown = (" + type_name + "**)realloc(*stack, sizeof(" + type_name + "*) * (size_t)next_capacity);\n" + "    if (!grown) { fprintf(stderr, \"blorp: out of memory (" + type_name + " destroy stack)\\n\"); abort(); }\n" + "    *stack = grown;\n" + "    *capacity = next_capacity;\n" + "  }\n" + "  (*stack)[*count] = value;\n" + "  *count += 1;\n" + "}\n\n" + "static void " + release_child_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (!value) return;\n" + "  blorp_Object* header = (blorp_Object*)value;\n" + "  if (BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT) return;\n" + "  long previous_refcount = BLORP_RC_DEC_PREV(header->refcount);\n" + "  if (previous_refcount == 1) " + stack_push_name + "(stack, count, capacity, value);\n" + "}\n\n" + "static void " + destroy_fields_name + "(" + type_name + "* self, " + type_name + "*** __destroy_stack, long* __destroy_count, long* __destroy_capacity) {\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
+		union_decl,
+	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + "static void " + type_name + "_destroy(void* obj) {\n" + "  " + type_name + "** __destroy_stack = NULL;\n" + "  long __destroy_count = 0;\n" + "  long __destroy_capacity = 0;\n" + "  " + destroy_fields_name + "((" + type_name + "*)obj, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "  while (__destroy_count > 0) {\n" + "    " + type_name + "* self = __destroy_stack[--__destroy_count];\n" + "    " + destroy_fields_name + "(self, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "    blorp_release_arc_only_slow_extern(self);\n" + "  }\n" + "  free(__destroy_stack);\n" + "}\n\n"
 
 
 private pure func emit_union_destructor(union_decl: CoreUnionDecl) -> String:
 	if not union_decl_has_destructor(union_decl):
 		""
+	else if union_decl_uses_iterative_destructor(union_decl):
+		emit_iterative_union_destructor(union_decl)
 	else:
-		var cases_c: String = ""
-
-		for variant in union_decl.variants:
-			if union_variant_has_releasable_field(variant):
-				var releases_c: String = ""
-				var index: Int = 0
-
-				for field in variant.fields:
-					releases_c += union_field_release_statement(union_decl, variant, field, index)
-					index += 1
-
-				cases_c += "    case " + variant.tag_c_name + ":\n" + releases_c + "      break;\n"
-
-		"static void " + union_decl.name + "_destroy(void* obj) {\n" + "  " + union_decl.name + "* self = (" + union_decl.name + "*)obj;\n" + "  switch (self->tag) {\n" + cases_c + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n"
+		emit_simple_union_destructor(union_decl)
 
 
 private pure func emit_union_constructor(
@@ -19955,14 +21562,13 @@ private pure func emit_generated_stack_option_typedef(
 	"typedef struct { int tag; " + payload_c_type + " value; } " + option_c_type + ";\n"
 
 
-private pure func emit_builtin_generated_stack_option_typedefs() -> String:
-	emit_generated_stack_option_typedef(
-		"__int128",
-		"blorp_StackOption_Int128",
-	) + emit_generated_stack_option_typedef(
-		"unsigned __int128",
-		"blorp_StackOption_UInt128",
-	) + emit_generated_stack_option_typedef("long", "blorp_StackOption_Range")
+private BUILTIN_GENERATED_STACK_OPTION_TYPEDEFS: String = emit_generated_stack_option_typedef(
+	"__int128",
+	"blorp_StackOption_Int128",
+) + emit_generated_stack_option_typedef(
+	"unsigned __int128",
+	"blorp_StackOption_UInt128",
+) + emit_generated_stack_option_typedef("long", "blorp_StackOption_Range")
 
 
 private pure func emit_decl_generated_stack_option_typedef(decl: CoreDecl) -> String:
@@ -19994,7 +21600,7 @@ private pure func emit_decl_generated_stack_option_typedef(decl: CoreDecl) -> St
 
 
 private pure func emit_generated_stack_option_typedefs(decls: List[CoreDecl]) -> String:
-	var c_code: String = emit_builtin_generated_stack_option_typedefs()
+	var c_code: String = BUILTIN_GENERATED_STACK_OPTION_TYPEDEFS
 
 	for decl in decls:
 		c_code += emit_decl_generated_stack_option_typedef(decl)
@@ -20062,9 +21668,11 @@ private pure func emit_global_init_function(decls: List[CoreDecl]) -> Result[Str
 		Some(existing_error):
 			Err(existing_error)
 		None:
-			Ok(emit_global_immortalizer_helpers(
-				decls,
-			) + "void __blorp_init_globals(void) {\n" + statements + "}\n\n")
+			Ok(
+				emit_global_immortalizer_helpers(
+					decls,
+				) + "void __blorp_init_globals(void) {\n" + statements + "}\n\n",
+			)
 
 
 private pure func emit_function_decls(decls: List[CoreDecl], options: CoreEmitOptions) -> String:
@@ -20136,25 +21744,30 @@ private pure func emit_static_closure_forward_decls(decls: List[CoreDecl]) -> St
 		c_code + "\n"
 
 
-private pure func emit_decls(decls: List[CoreDecl], options: CoreEmitOptions) -> Result[String, CoreEmitError]:
+private pure func emit_decls(
+	decls: List[CoreDecl],
+	options: CoreEmitOptions,
+) -> Result[String, CoreEmitError]:
 	global_init ?= emit_global_init_function(decls)
-	Ok(emit_value_record_decls(
-		decls,
-	) + emit_heap_record_forward_decls(
-		decls,
-	) + emit_enum_decls(
-		decls,
-	) + emit_generated_stack_option_typedefs(
-		decls,
-	) + emit_union_decls(
-		decls,
-	) + emit_heap_record_decls(
-		decls,
-	) + emit_static_closure_forward_decls(
-		decls,
-	) + emit_global_decls(
-		decls,
-	) + global_init + emit_function_forward_decls(decls) + emit_function_decls(decls, options))
+	Ok(
+		emit_value_record_decls(
+			decls,
+		) + emit_heap_record_forward_decls(
+			decls,
+		) + emit_enum_decls(
+			decls,
+		) + emit_generated_stack_option_typedefs(
+			decls,
+		) + emit_union_decls(
+			decls,
+		) + emit_heap_record_decls(
+			decls,
+		) + emit_static_closure_forward_decls(
+			decls,
+		) + emit_global_decls(
+			decls,
+		) + global_init + emit_function_forward_decls(decls) + emit_function_decls(decls, options),
+	)
 
 
 private pure func error_artifact(error: CoreEmitError) -> CArtifact:
@@ -20173,15 +21786,15 @@ pure func try_emit_prepared_core_program_c_artifact_with_options(
 ) -> Result[CArtifact, CoreEmitError]:
 	decls_c ?= emit_decls(program.decls, options)
 	Ok({
-		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(
-			program.foreign_includes,
-		) + decls_c,
+		c_code = C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes) + decls_c,
 		link_flags = [],
-		include_dirs = []
+		include_dirs = [],
 	})
 
 
-pure func try_emit_prepared_core_program_c_artifact(program: CoreProgram) -> Result[CArtifact, CoreEmitError]:
+pure func try_emit_prepared_core_program_c_artifact(
+	program: CoreProgram,
+) -> Result[CArtifact, CoreEmitError]:
 	try_emit_prepared_core_program_c_artifact_with_options(program, DEFAULT_CORE_EMIT_OPTIONS)
 
 
@@ -20222,7 +21835,9 @@ pure func try_prepare_and_emit_core_program_c_artifact_with_options(
 	try_emit_prepared_core_program_c_artifact_with_options(prepared_program, options)
 
 
-pure func try_prepare_and_emit_core_program_c_artifact(program: CoreProgram) -> Result[CArtifact, CoreEmitError]:
+pure func try_prepare_and_emit_core_program_c_artifact(
+	program: CoreProgram,
+) -> Result[CArtifact, CoreEmitError]:
 	try_prepare_and_emit_core_program_c_artifact_with_options(program, DEFAULT_CORE_EMIT_OPTIONS)
 
 

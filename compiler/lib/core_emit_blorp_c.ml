@@ -1,8 +1,8 @@
-(** Blorp-owned C backend boundary for the supported final-Core subset.
+(** Blorp-owned C backend boundary for the supported Core subset.
 
     This module is deliberately narrow: OCaml projects a supported
-    final-Core subset to JSON, then Blorp owns C artifact emission through the
-    [emit_c_artifact] bridge action. Unsupported Core shapes are rejected before
+    Core subset to JSON, then Blorp owns the final tail and C artifact emission
+    through explicit bridge actions. Unsupported Core shapes are rejected before
     the bridge call so the subset boundary remains explicit. *)
 
 type unsupported = { path : string; reason : string }
@@ -1124,15 +1124,6 @@ let managed_pointer_tuple_field_type = function
   | Ast.TyArray _ -> true
   | _ -> false
 
-let supported_tuple_field_type ?reg ty =
-  match reg with
-  | Some reg ->
-      let ty = Codegen_types.expand_alias ~reg ty in
-      primitive_tuple_field_type ty
-      || managed_pointer_tuple_field_type ty
-      || Core_layout_type.is_stack_option_type ~reg ty
-  | None -> primitive_tuple_field_type ty || managed_pointer_tuple_field_type ty
-
 let floating_tuple_field_projection_type = function
   | Ast.TyNamed (("Float" | "Float32" | "Float16"), []) -> true
   | _ -> false
@@ -2024,6 +2015,13 @@ let is_option_type = function
   | Ast.TyNamed ("Option", [ _ ]) -> true
   | _ -> false
 
+let is_result_type ~reg ty =
+  Core_layout_type.is_stack_result_type ~reg ty
+  ||
+  match Core_codegen_prepare.canonical_type ~reg ty with
+  | Ast.TyNamed ("Result", [ _; _ ]) -> true
+  | _ -> false
+
 let generated_stack_option_get_supported ~reg result_ty =
   Option.is_some (Core_layout_type.generated_stack_option_get_abi ~reg result_ty)
 
@@ -2196,6 +2194,16 @@ let call_kind_json ~consumed_params ~reg path ~result_ty ~loc
               Ok (kind "fallible_stream_terminal" [ ("bridge", bridge_json) ])
           | None when String.equal name "blorp_dict_get" && is_option_type result_ty
             ->
+              Ok (kind "builtin" [ ("name", str name) ])
+          | None
+            when (String.equal name "blorp_option_some"
+                 || String.equal name "blorp_option_none")
+                 && is_option_type result_ty ->
+              Ok (kind "builtin" [ ("name", str name) ])
+          | None
+            when (String.equal name "blorp_result_ok"
+                 || String.equal name "blorp_result_err")
+                 && is_result_type ~reg result_ty ->
               Ok (kind "builtin" [ ("name", str name) ])
           | None
             when (String.equal name "blorp_vector_get_opt"
@@ -2407,6 +2415,72 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       in
       let* fields = typed [ ("slot", slot) ] in
       Ok (kind "list_handoff_set_source_slot" fields)
+  | Core.CCall (Core.CKIntrinsic "string_get_byte", _callee, [ source; index ])
+    ->
+      let read =
+        {
+          Core.sbr_source = source;
+          sbr_index = index;
+          sbr_proof = Core.StringReadBoundsProven;
+        }
+      in
+      let* read_json =
+        string_byte_read_json ~reg enum_names value_record_names
+          heap_record_names union_names enum_constructors (path ^ ".read") read
+      in
+      let* fields = typed [ ("read", read_json) ] in
+      Ok (kind "string_byte_read" fields)
+  | Core.CCall
+      (Core.CKIntrinsic "string_set_byte", _callee, [ target; index; byte ]) ->
+      let write =
+        {
+          Core.sbw_target = target;
+          sbw_index = index;
+          sbw_byte = byte;
+          sbw_proof = Core.StringWriteBoundsProven;
+        }
+      in
+      let* write_json =
+        string_byte_write_json ~reg enum_names value_record_names
+          heap_record_names union_names enum_constructors (path ^ ".write")
+          write
+      in
+      let* fields = typed [ ("write", write_json) ] in
+      Ok (kind "string_byte_write" fields)
+  | Core.CCall
+      ( Core.CKIntrinsic "string_copy_bytes",
+        _callee,
+        [ dst; dst_pos; src; src_pos; len ] ) ->
+      let copy =
+        {
+          Core.sbc_dst = dst;
+          sbc_dst_pos = dst_pos;
+          sbc_src = src;
+          sbc_src_pos = src_pos;
+          sbc_len = len;
+          sbc_proof = Core.StringCopyBoundsProven;
+        }
+      in
+      let* copy_json =
+        string_byte_copy_json ~reg enum_names value_record_names heap_record_names
+          union_names enum_constructors (path ^ ".copy") copy
+      in
+      let* fields = typed [ ("copy", copy_json) ] in
+      Ok (kind "string_byte_copy" fields)
+  | Core.CCall (Core.CKIntrinsic "string_set_len", _callee, [ target; len ]) ->
+      let set_len =
+        {
+          Core.ssl_target = target;
+          ssl_len = len;
+          ssl_proof = Core.StringSetLenBoundsProven;
+        }
+      in
+      let* set_len_json =
+        string_set_len_json ~reg enum_names value_record_names heap_record_names
+          union_names enum_constructors (path ^ ".set_len") set_len
+      in
+      let* fields = typed [ ("set_len", set_len_json) ] in
+      Ok (kind "string_set_len" fields)
   | Core.CCall
       ( (Core.CKBuiltin "blorp_list_new" | Core.CKIntrinsic "list_alloc"),
         _callee,
@@ -3971,8 +4045,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   | Core.CTuple items -> (
       match expr.ty with
       | Ast.TyTuple item_tys
-        when List.length items = List.length item_tys
-             && List.for_all (supported_tuple_field_type ~reg) item_tys ->
+        when List.length items = List.length item_tys ->
           let* items_value =
             result_list items (fun index item ->
                 expr_json ~reg enum_names value_record_names heap_record_names union_names
@@ -3984,7 +4057,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           Ok (kind "tuple" fields)
       | Ast.TyTuple _ ->
           unsupported path
-            "tuple literal outside primitive Blorp backend subset"
+            "tuple literal arity does not match tuple type"
       | _ -> unsupported path "tuple expression with non-tuple type")
   | Core.CRecord fields -> (
       match expr.ty with
@@ -4091,7 +4164,13 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       in
       let* fields = typed [ ("construct", construct) ] in
       Ok (kind "list_construct" fields)
-  | Core.CVector _ -> unsupported path "vector literal"
+  | Core.CVector _ -> (
+      match Core_codegen_prepare.prepare_expr ~reg expr with
+      | { Core.desc = Core.CVector _; _ } ->
+          unsupported path "vector literal"
+      | prepared ->
+          expr_json ~reg enum_names value_record_names heap_record_names union_names
+            enum_constructors path prepared)
   | Core.CTensorLiteral literal -> (
       match literal.tl_payload with
       | Core.TensorBoxedElements elements ->
@@ -4122,7 +4201,12 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           let* fields = typed [ ("literal", literal_json) ] in
           Ok (kind "tensor_literal" fields)
       | Core.TensorWordElements _ -> unsupported path "word tensor literal")
-  | Core.CDict _ -> unsupported path "dict literal"
+  | Core.CDict _ -> (
+      match Core_codegen_prepare.prepare_expr ~reg expr with
+      | { Core.desc = Core.CDict _; _ } -> unsupported path "dict literal"
+      | prepared ->
+          expr_json ~reg enum_names value_record_names heap_record_names union_names
+            enum_constructors path prepared)
   | Core.CDictConstruct dc ->
       let* construct =
         dict_construct_json ~reg enum_names value_record_names heap_record_names union_names
@@ -5764,10 +5848,6 @@ let require_intrinsic_renderable path name args =
                 | Some arity -> require_core_arity path name arity args
                 | None -> unsupported path ("unsupported intrinsic call " ^ name))))
 
-let is_result_type = function
-  | Ast.TyNamed ("Result", [ _; _ ]) -> true
-  | _ -> false
-
 let require_simple_call_kind path ~result_ty call_kind args =
   match call_kind with
   | Core.CKUser ("Some", _) when is_option_type result_ty ->
@@ -5776,8 +5856,11 @@ let require_simple_call_kind path ~result_ty call_kind args =
       require_core_arity path "None" 0 args
   | Core.CKUser (("Some" | "None"), _) ->
       unsupported path "unprepared Option constructor call"
-  | Core.CKBuiltin ("blorp_result_ok" | "blorp_result_err" as name)
-    when is_result_type result_ty ->
+  | Core.CKBuiltin "blorp_option_some" when is_option_type result_ty ->
+      require_core_arity path "blorp_option_some" 1 args
+  | Core.CKBuiltin "blorp_option_none" when is_option_type result_ty ->
+      require_core_arity path "blorp_option_none" 0 args
+  | Core.CKBuiltin ("blorp_result_ok" | "blorp_result_err" as name) ->
       require_core_arity path name 1 args
   | Core.CKUser _ -> Ok ()
   | Core.CKForeign _ -> Ok ()
@@ -5869,6 +5952,43 @@ let rec require_simple_expr path (expr : Core.core) =
         [ lst; index ] ) ->
       let* () = require_simple_expr (path ^ ".list") lst in
       require_simple_expr (path ^ ".index") index
+  | Core.CCall (Core.CKIntrinsic "string_get_byte", _callee, [ source; index ])
+    ->
+      require_string_byte_read path
+        {
+          Core.sbr_source = source;
+          sbr_index = index;
+          sbr_proof = Core.StringReadBoundsProven;
+        }
+  | Core.CCall
+      (Core.CKIntrinsic "string_set_byte", _callee, [ target; index; byte ]) ->
+      require_string_byte_write path
+        {
+          Core.sbw_target = target;
+          sbw_index = index;
+          sbw_byte = byte;
+          sbw_proof = Core.StringWriteBoundsProven;
+        }
+  | Core.CCall
+      ( Core.CKIntrinsic "string_copy_bytes",
+        _callee,
+        [ dst; dst_pos; src; src_pos; len ] ) ->
+      require_string_byte_copy path
+        {
+          Core.sbc_dst = dst;
+          sbc_dst_pos = dst_pos;
+          sbc_src = src;
+          sbc_src_pos = src_pos;
+          sbc_len = len;
+          sbc_proof = Core.StringCopyBoundsProven;
+        }
+  | Core.CCall (Core.CKIntrinsic "string_set_len", _callee, [ target; len ]) ->
+      require_string_set_len path
+        {
+          Core.ssl_target = target;
+          ssl_len = len;
+          ssl_proof = Core.StringSetLenBoundsProven;
+        }
   | Core.CCall (Core.CKBuiltin name, _callee, value :: dims)
     when is_ranked_tensor_fill_factory_name name ->
       let* () = require_simple_expr (path ^ ".value") value in
@@ -6043,11 +6163,10 @@ and require_tuple_construct_body ~reg union_names path
   in
   check 0 tc.tc_elems
 
-and require_tuple_literal ?reg path ty items =
+and require_tuple_literal path ty items =
   match ty with
       | Ast.TyTuple item_tys
-        when List.length items = List.length item_tys
-         && List.for_all (supported_tuple_field_type ?reg) item_tys ->
+        when List.length items = List.length item_tys ->
       let rec check index = function
         | [] -> Ok ()
         | item :: rest ->
@@ -6060,7 +6179,26 @@ and require_tuple_literal ?reg path ty items =
       in
       check 0 items
   | Ast.TyTuple _ ->
-      unsupported path "tuple literal outside primitive Blorp backend subset"
+      unsupported path "tuple literal arity does not match tuple type"
+  | _ -> unsupported path "tuple expression with non-tuple type"
+
+and require_tuple_literal_body ~reg union_names path ty items =
+  match ty with
+      | Ast.TyTuple item_tys
+        when List.length items = List.length item_tys ->
+      let rec check index = function
+        | [] -> Ok ()
+        | item :: rest ->
+            let* () =
+              require_function_body ~reg union_names
+                (Printf.sprintf "%s.items[%d]" path index)
+                item
+            in
+            check (index + 1) rest
+      in
+      check 0 items
+  | Ast.TyTuple _ ->
+      unsupported path "tuple literal arity does not match tuple type"
   | _ -> unsupported path "tuple expression with non-tuple type"
 
 and require_record_literal path ty fields =
@@ -6071,6 +6209,22 @@ and require_record_literal path ty fields =
         | (_name, value) :: rest ->
             let* () =
               require_simple_expr
+                (Printf.sprintf "%s.fields[%d].value" path index)
+                value
+            in
+            check (index + 1) rest
+      in
+      check 0 fields
+  | _ -> unsupported path "record literal on non-named type"
+
+and require_record_literal_body ~reg union_names path ty fields =
+  match ty with
+  | Ast.TyNamed _ ->
+      let rec check index = function
+        | [] -> Ok ()
+        | (_name, value) :: rest ->
+            let* () =
+              require_function_body ~reg union_names
                 (Printf.sprintf "%s.fields[%d].value" path index)
                 value
             in
@@ -6685,6 +6839,16 @@ and require_function_body ~reg union_names path (expr : Core.core) =
         tls_list_param.cp_ty tls_return_ty tls_body
   | Core.CTailrecRecur _ ->
       unsupported path "tail-recursive recur outside tail-recursive loop"
+  | Core.CVector _ -> (
+      match Core_codegen_prepare.prepare_expr ~reg expr with
+      | { Core.desc = Core.CVector _; _ } -> unsupported path "vector literal"
+      | prepared -> require_function_body ~reg union_names path prepared)
+  | Core.CDict _ -> (
+      match Core_codegen_prepare.prepare_expr ~reg expr with
+      | { Core.desc = Core.CDict _; _ } -> unsupported path "dict literal"
+      | prepared -> require_function_body ~reg union_names path prepared)
+  | Core.CTuple items ->
+      require_tuple_literal_body ~reg union_names path expr.ty items
   | Core.CTupleConstruct tc ->
       require_tuple_construct_body ~reg union_names path tc
   | Core.CList lit -> require_list_literal_body ~reg union_names path lit
@@ -6692,6 +6856,8 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       require_list_handoff_body ~reg union_names path handoff
   | Core.CListConstruct lc ->
       require_list_construct_body ~reg union_names path lc
+  | Core.CRecord fields ->
+      require_record_literal_body ~reg union_names path expr.ty fields
   | Core.CRecordConstruct rc ->
       require_record_construct_body ~reg union_names path rc
   | Core.CUnionConstruct uc ->
@@ -6716,6 +6882,11 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       ( (Core.CKIntrinsic "list_get" | Core.CKIntrinsic "list_get_unchecked"),
         _,
         [ _; _ ] ) ->
+      require_simple_expr path expr
+  | Core.CCall (Core.CKIntrinsic "string_get_byte", _, [ _; _ ])
+  | Core.CCall (Core.CKIntrinsic "string_set_byte", _, [ _; _; _ ])
+  | Core.CCall (Core.CKIntrinsic "string_copy_bytes", _, [ _; _; _; _; _ ])
+  | Core.CCall (Core.CKIntrinsic "string_set_len", _, [ _; _ ]) ->
       require_simple_expr path expr
   | Core.CCall
       ( (Core.CKIntrinsic "list_set" | Core.CKIntrinsic "list_set_owned"),
@@ -6749,7 +6920,6 @@ and require_function_body ~reg union_names path (expr : Core.core) =
           require_function_body ~reg union_names (path ^ ".value") value
       | Core.ListInlineStructStorage _ | Core.ListInlineStorage _ ->
           require_simple_expr (path ^ ".value") value)
-  | Core.CCall (Core.CKUser (("Some" | "None"), _), _callee, _args)
   | Core.CCall (Core.CKClosure, _callee, _args) ->
       require_simple_expr path expr
   | Core.CCall (Core.CKBuiltin name, _callee, _args)
@@ -8142,7 +8312,8 @@ let with_embedded_runtime (artifact : Compiler_blorp_bridge.c_artifact) =
       Runtime.runtime_code ^ "\n" ^ artifact.Compiler_blorp_bridge.c_code;
   }
 
-let emit_program_to_artifact (config : config) (program : Core.core_program) =
+let prepare_and_emit_program_to_artifact (config : config)
+    (program : Core.core_program) =
   let* core_json = program_json ~reg:config.reg program in
   let artifact =
     Compiler_blorp_bridge.prepare_and_emit_c_artifact_exn
@@ -8150,12 +8321,34 @@ let emit_program_to_artifact (config : config) (program : Core.core_program) =
   in
   Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
 
+let emit_prepared_program_to_artifact (config : config)
+    (program : Core.core_program) =
+  let* core_json = program_json ~reg:config.reg program in
+  let artifact =
+    Compiler_blorp_bridge.emit_c_artifact_exn ~profile:config.profile core_json
+  in
+  Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
+
+let emit_program_to_artifact = prepare_and_emit_program_to_artifact
+
 let emit_program_string config program =
-  match emit_program_to_artifact config program with
+  match prepare_and_emit_program_to_artifact config program with
+  | Ok artifact -> Ok artifact.Compiler_blorp_bridge.c_code
+  | Error _ as error -> error
+
+let emit_prepared_program_string config program =
+  match emit_prepared_program_to_artifact config program with
   | Ok artifact -> Ok artifact.Compiler_blorp_bridge.c_code
   | Error _ as error -> error
 
 let try_emit_program_string config program =
   match emit_program_string config program with
+  | Ok _ as ok -> ok
+  | Error error -> Error (unsupported_to_string error)
+
+let try_prepare_and_emit_program_string = try_emit_program_string
+
+let try_emit_prepared_program_string config program =
+  match emit_prepared_program_string config program with
   | Ok _ as ok -> ok
   | Error error -> Error (unsupported_to_string error)

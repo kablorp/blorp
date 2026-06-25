@@ -248,6 +248,10 @@ val render_accessor_typed :
 (** Like [render_accessor], but uses the root scrutinee type for
     representation-specific accessors such as primitive stack [Option[T]]. *)
 
+val accessor_type :
+  Core_emit_context.t -> Ast.type_expr -> Core.accessor -> Ast.type_expr option
+(** Type of the value reached by an accessor from the given root scrutinee type. *)
+
 val collect_var_types : Core.core -> (string, Ast.type_expr) Hashtbl.t
 (** Collect (variable name → type) pairs for every [CVar] in an
     expression. Used by pattern-match emission to recover the type of

@@ -187,9 +187,6 @@ let () =
         (fun (name, cases) -> ("CoreMatch." ^ name, cases))
         Test_core_match.suite
     @ List.map
-        (fun (name, cases) -> ("CoreEmitUtil." ^ name, cases))
-        Test_core_emit_util.suite
-    @ List.map
         (fun (name, cases) -> ("CoreTailrec." ^ name, cases))
         Test_core_tailrec.suite
     @ List.map

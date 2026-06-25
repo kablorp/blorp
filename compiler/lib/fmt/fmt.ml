@@ -17,12 +17,85 @@ let fmt_cache_dir () =
   (try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   dir
 
-(* Cache key includes the blorp binary's mtime so any rebuild invalidates all entries. *)
-let binary_mtime =
-  try (Unix.stat Sys.executable_name).Unix.st_mtime with _ -> 0.0
+let file_digest path =
+  try Digest.to_hex (Digest.file path)
+  with _ -> Digest.to_hex (Digest.string path)
+
+let string_digest text = Digest.to_hex (Digest.string text)
+
+let string_ends_with ~suffix value =
+  let suffix_len = String.length suffix in
+  let value_len = String.length value in
+  value_len >= suffix_len
+  && String.sub value (value_len - suffix_len) suffix_len = suffix
+
+let string_starts_with ~prefix value =
+  let prefix_len = String.length prefix in
+  String.length value >= prefix_len && String.sub value 0 prefix_len = prefix
+
+let relative_to ~root path =
+  let prefix = Filename.concat root "" in
+  if string_starts_with ~prefix path then
+    String.sub path (String.length prefix)
+      (String.length path - String.length prefix)
+  else Filename.basename path
+
+let is_directory path =
+  try Sys.is_directory path with Sys_error _ -> false
+
+let rec find_compiler_blorp_dir_from dir =
+  let candidate = Filename.concat (Filename.concat dir "compiler") "blorp" in
+  if is_directory candidate then Some candidate
+  else
+    let parent = Filename.dirname dir in
+    if parent = dir then None else find_compiler_blorp_dir_from parent
+
+let compiler_blorp_source_dir () =
+  let search_roots =
+    [ Sys.getcwd (); Filename.dirname Sys.executable_name ]
+    |> List.map (fun path ->
+           if Filename.is_relative path then
+             Filename.concat (Sys.getcwd ()) path
+           else path)
+  in
+  List.find_map find_compiler_blorp_dir_from search_roots
+
+let source_tree_digest root =
+  let rec collect dir =
+    Sys.readdir dir |> Array.to_list |> List.sort String.compare
+    |> List.fold_left
+         (fun acc name ->
+           let path = Filename.concat dir name in
+           if is_directory path then
+             if String.equal name "tests" then acc else collect path @ acc
+           else if string_ends_with ~suffix:".brp" name then path :: acc
+           else acc)
+         []
+  in
+  let files = collect root |> List.sort String.compare in
+  let buf = Buffer.create 4096 in
+  List.iter
+    (fun path ->
+      let rel = relative_to ~root path in
+      let contents = Modules.read_file path in
+      Buffer.add_string buf (string_of_int (String.length rel));
+      Buffer.add_char buf ':';
+      Buffer.add_string buf rel;
+      Buffer.add_char buf '\000';
+      Buffer.add_string buf (string_of_int (String.length contents));
+      Buffer.add_char buf ':';
+      Buffer.add_string buf contents;
+      Buffer.add_char buf '\000')
+    files;
+  string_digest (Buffer.contents buf)
+
+let compiler_backend_digest () =
+  match compiler_blorp_source_dir () with
+  | Some root -> "compiler-blorp-source:" ^ source_tree_digest root
+  | None -> "compiler-binary:" ^ file_digest Sys.executable_name
 
 let fmt_cache_key source =
-  Hashtbl.hash (Hashtbl.hash source, Hashtbl.hash binary_mtime)
+  Hashtbl.hash (Hashtbl.hash source, Hashtbl.hash (compiler_backend_digest ()))
 
 let is_cached_formatted source =
   try
@@ -270,7 +343,8 @@ let formatter_source_files formatter_tool =
 
 let formatter_binary_cache_key source =
   let buf = Buffer.create 4096 in
-  Buffer.add_string buf (Printf.sprintf "compiler-mtime:%f\n" binary_mtime);
+  Buffer.add_string buf (compiler_backend_digest ());
+  Buffer.add_char buf '\000';
   (match source with
   | EmbeddedSource { digest; files; _ } ->
       Buffer.add_string buf "embedded-formatter:";

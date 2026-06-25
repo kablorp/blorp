@@ -11572,7 +11572,8 @@ and infer_lambda ctx expr func loc =
         match expected_type_opt ctx with
         | Some ty -> (
             match
-              normalize_type ctx LambdaExpectedFunction (Types.zonk_type ty)
+              normalize_type ctx LambdaExpectedFunction
+                (Types.resolve_bound_metas ty)
             with
             | TyFunc { params; return; is_pure } ->
                 Some (params, return, is_pure)

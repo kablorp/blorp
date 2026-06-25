@@ -151,7 +151,24 @@ let assign ~(emit_expr : Core_emit_context.t -> core -> unit)
   | CTSwitchLen { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default }
     -> (
       let acc_c = render_accessor_typed ctx scrut_name scrut_ty ctl_len_scrut in
-      let list_c = Printf.sprintf "((blorp_List*)%s)" acc_c in
+      let branch_scrut_name, branch_scrut_ty, list_c =
+        match ctl_len_scrut with
+        | AccRoot -> (scrut_name, scrut_ty, Printf.sprintf "((blorp_List*)%s)" acc_c)
+        | _ -> (
+            match accessor_type ctx scrut_ty ctl_len_scrut with
+            | Some list_ty ->
+                let list_name =
+                  Printf.sprintf "__match_list_%d" (fresh_temp ctx)
+                in
+                emit ctx
+                  (Printf.sprintf "blorp_List* %s = ((blorp_List*)%s); "
+                     list_name acc_c);
+                (list_name, list_ty, list_name)
+            | None ->
+                Core_error.errorf Core_error.Emit Ast.dummy_loc
+                  ~hint:"length-match accessors must have a known List type"
+                  "length match accessor type unavailable")
+      in
       let all_cases =
         ctl_len_cases
         @ match ctl_len_geq with Some (n, t) -> [ (n, t) ] | None -> []
@@ -165,12 +182,13 @@ let assign ~(emit_expr : Core_emit_context.t -> core -> unit)
           else
             emit ctx
               (Printf.sprintf "} else if (%s->len %s %dL) { " list_c op len);
-          emit_ctree_assign ctx scrut_name scrut_ty result_name subtree)
+          emit_ctree_assign ctx branch_scrut_name branch_scrut_ty result_name
+            subtree)
         all_cases;
       match ctl_len_default with
       | Some d ->
           emit ctx "} else { ";
-          emit_ctree_assign ctx scrut_name scrut_ty result_name d;
+          emit_ctree_assign ctx branch_scrut_name branch_scrut_ty result_name d;
           emit ctx "} "
       | None -> emit ctx "} ")
 
@@ -255,7 +273,24 @@ let stmt ~(emit_stmt : Core_emit_context.t -> core -> unit)
   | CTSwitchLen { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default }
     -> (
       let acc_c = render_accessor_typed ctx scrut_name scrut_ty ctl_len_scrut in
-      let list_c = Printf.sprintf "((blorp_List*)%s)" acc_c in
+      let branch_scrut_name, branch_scrut_ty, list_c =
+        match ctl_len_scrut with
+        | AccRoot -> (scrut_name, scrut_ty, Printf.sprintf "((blorp_List*)%s)" acc_c)
+        | _ -> (
+            match accessor_type ctx scrut_ty ctl_len_scrut with
+            | Some list_ty ->
+                let list_name =
+                  Printf.sprintf "__match_list_%d" (fresh_temp ctx)
+                in
+                emit_line ctx
+                  (Printf.sprintf "blorp_List* %s = ((blorp_List*)%s);"
+                     list_name acc_c);
+                (list_name, list_ty, list_name)
+            | None ->
+                Core_error.errorf Core_error.Emit Ast.dummy_loc
+                  ~hint:"length-match accessors must have a known List type"
+                  "length match accessor type unavailable")
+      in
       let all_cases =
         ctl_len_cases
         @ match ctl_len_geq with Some (n, t) -> [ (n, t) ] | None -> []
@@ -271,7 +306,7 @@ let stmt ~(emit_stmt : Core_emit_context.t -> core -> unit)
             emitln ctx
               (Printf.sprintf "} else if (%s->len %s %dL) {" list_c op len);
           ctx.indent <- ctx.indent + 1;
-          emit_ctree_stmt ctx scrut_name scrut_ty subtree;
+          emit_ctree_stmt ctx branch_scrut_name branch_scrut_ty subtree;
           ctx.indent <- ctx.indent - 1)
         all_cases;
       match ctl_len_default with
@@ -279,7 +314,7 @@ let stmt ~(emit_stmt : Core_emit_context.t -> core -> unit)
           emit_indent ctx;
           emitln ctx "} else {";
           ctx.indent <- ctx.indent + 1;
-          emit_ctree_stmt ctx scrut_name scrut_ty d;
+          emit_ctree_stmt ctx branch_scrut_name branch_scrut_ty d;
           ctx.indent <- ctx.indent - 1;
           emit_indent ctx;
           emitln ctx "}"

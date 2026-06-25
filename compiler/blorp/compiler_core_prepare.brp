@@ -5,7 +5,17 @@
 -- constructs such as record literals and primitive tuple literals itself.
 import:
 	compiler_core_json:
-		CoreBoxKind(Float16Box, Float32Box, FloatBox, PointerBox, PrimBox, StructBox, VoidBox),
+		CoreBoxKind(
+			Float16Box,
+			Float32Box,
+			FloatBox,
+			Int128Box,
+			PointerBox,
+			PrimBox,
+			StructBox,
+			UInt128Box,
+			VoidBox,
+		),
 		CoreBoxOp,
 		CoreBoxedStorageValue,
 		CoreCallKind(
@@ -170,11 +180,13 @@ import:
 		CoreTailrecListSpreadLoop,
 		CoreTailrecListSpreadRebind,
 		CoreTensorBoxedLiteral,
+		CoreTensorForElementStorage(TensorForRawScalarElement),
 		CoreTensorLiteral,
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
 		CoreTensorPackedLiteral,
 		CoreTensorRawFill,
 		CoreTensorRawRead,
+		CoreTensorRawScalarKind(TensorFloat32Elements, TensorFloat64Elements, TensorInt64Elements),
 		CoreTensorRawViewBinding,
 		CoreTensorRawWrite,
 		CoreTupleElement(
@@ -204,6 +216,7 @@ import:
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionRepresentation(
+			BoxedOptionRepresentation,
 			GenericUnionRepresentation,
 			NullableOptionRepresentation,
 			StackOptionRepresentation,
@@ -211,6 +224,8 @@ import:
 		),
 		CoreUnionVariant,
 		CoreValueRecordDecl,
+		CoreVar,
+		clone_tensor_for_element_storage,
 
 
 record PreparedTupleLiteral {
@@ -625,7 +640,19 @@ private pure func boxed_kind_for_type(typ: CoreType) -> CoreBoxKind:
 		VoidType:
 			VoidBox
 		NamedType(name, args):
-			if name == "Float" and args.length() == 0:
+			if name == "Option":
+				match args:
+					[payload]:
+						match stack_option_c_type(payload):
+							Some(option_type):
+								StructBox(option_type)
+							None:
+								PointerBox
+					_:
+						PointerBox
+			else if name == "Result" and args.length() == 2:
+				StructBox("blorp_StackResult")
+			else if name == "Float" and args.length() == 0:
 				FloatBox
 			else if name == "Float32" and args.length() == 0:
 				Float32Box
@@ -637,6 +664,8 @@ private pure func boxed_kind_for_type(typ: CoreType) -> CoreBoxKind:
 				PointerBox
 		ValueRecordType(name):
 			StructBox(name)
+		StackResultType(ok_type, err_type):
+			StructBox("blorp_StackResult")
 		_:
 			if primitive_box_type(typ):
 				PrimBox
@@ -645,16 +674,109 @@ private pure func boxed_kind_for_type(typ: CoreType) -> CoreBoxKind:
 
 
 private pure func boxed_kind_for_expr(expr: CoreExpr) -> CoreBoxKind:
-	boxed_kind_for_type(expr_type(expr))
+	match expr:
+		UnionConstructExpr(construct, typ, loc):
+			match construct.representation:
+				StackOptionRepresentation(representation):
+					StructBox(representation.option_type)
+				StackResultRepresentation(representation):
+					StructBox(representation.result_type)
+				BoxedOptionRepresentation:
+					boxed_kind_for_type(typ)
+				NullableOptionRepresentation:
+					boxed_kind_for_type(typ)
+				GenericUnionRepresentation:
+					boxed_kind_for_type(typ)
+		_:
+			boxed_kind_for_type(expr_type(expr))
+
+
+private pure func pointer_box_storage_needs_release_type(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			if is_managed_pointer_tuple_slot_type(typ):
+				True
+			else if name == "Channel" and args.length() == 1:
+				True
+			else if name == "ResourceSource" and args.length() == 1:
+				True
+			else if name == "std/stream::ResourceSource" and args.length() == 1:
+				True
+			else if name == "std_stream__ResourceSource" and args.length() == 1:
+				True
+			else if name == "Stream" and args.length() == 1:
+				True
+			else if name == "std/stream::Stream" and args.length() == 1:
+				True
+			else if name == "std_stream__Stream" and args.length() == 1:
+				True
+			else if name == "FallibleStream" and args.length() == 2:
+				True
+			else if name == "std/stream::FallibleStream" and args.length() == 2:
+				True
+			else if name == "std_stream__FallibleStream" and args.length() == 2:
+				True
+			else if name == "TcpListener" and args.length() == 0:
+				True
+			else if name == "TcpStream" and args.length() == 0:
+				True
+			else if name == "TlsSession" and args.length() == 0:
+				True
+			else if name == "WebSocketSession" and args.length() == 0:
+				True
+			else:
+				name == "UdpSocket" and args.length() == 0
+		StackResultType(ok_type, err_type):
+			True
+		BoxedResultType(ok_type, err_type):
+			True
+		HeapRecordType(name):
+			True
+		UnionType(name):
+			True
+		TupleType(items):
+			True
+		TensorType:
+			True
+		VoidType:
+			False
+		EnumType(name):
+			False
+		ValueRecordType(name):
+			False
+		RangeType:
+			False
+
+
+private pure func boxed_storage_value_needs_release(expr: CoreExpr, kind: CoreBoxKind) -> Bool:
+	match kind:
+		StructBox(c_type):
+			True
+		Int128Box:
+			True
+		UInt128Box:
+			True
+		PointerBox:
+			pointer_box_storage_needs_release_type(expr_type(expr))
+		FloatBox:
+			False
+		Float32Box:
+			False
+		Float16Box:
+			False
+		PrimBox:
+			False
+		VoidBox:
+			False
 
 
 private pure func boxed_storage_value_for_expr(expr: CoreExpr) -> CoreBoxedStorageValue:
-	typ: CoreType = expr_type(expr)
+	kind: CoreBoxKind = boxed_kind_for_expr(expr)
 
 	{
-		kind = boxed_kind_for_type(typ),
+		kind = kind,
 		value = expr,
-		needs_release = is_managed_pointer_tuple_slot_type(typ),
+		needs_release = boxed_storage_value_needs_release(expr, kind),
 		transfers_ownership = False
 	}
 
@@ -1194,6 +1316,32 @@ private pure func tuple_slot_needs_release(typ: CoreType) -> Bool:
 	is_managed_pointer_tuple_slot_type(typ)
 
 
+private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
+	match payload:
+		NamedType(name, args):
+			pointer_box_storage_needs_release_type(payload)
+		BoxedResultType(ok_type, err_type):
+			True
+		HeapRecordType(name):
+			True
+		UnionType(name):
+			True
+		TupleType(items):
+			True
+		TensorType:
+			True
+		StackResultType(ok_type, err_type):
+			False
+		VoidType:
+			False
+		EnumType(name):
+			False
+		ValueRecordType(name):
+			False
+		RangeType:
+			False
+
+
 private pure func float_tuple_element(item: CoreExpr, typ: CoreType) -> Option[CoreTupleElement]:
 	match typ:
 		NamedType(name, args):
@@ -1284,6 +1432,324 @@ private pure func int_power_of_two(exponent: Int) -> Int:
 		index += 1
 
 	result
+
+
+private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq and left.def_id == right.def_id
+
+
+private pure func core_var_list_contains(variables: List[CoreVar], target: CoreVar) -> Bool:
+	var found: Bool = False
+
+	for variable in variables:
+		if core_vars_equal(variable, target):
+			found = True
+
+	found
+
+
+record TensorStorageBinding {
+	variable: CoreVar,
+	raw_kind: CoreTensorRawScalarKind
+}
+
+
+private pure func tensor_storage_env_without(
+	env: List[TensorStorageBinding],
+	variable: CoreVar,
+) -> List[TensorStorageBinding]:
+	var result: List[TensorStorageBinding] = []
+
+	for binding in env:
+		if not core_vars_equal(binding.variable, variable):
+			result = result.append(binding)
+
+	result
+
+
+private pure func tensor_storage_env_lookup(
+	env: List[TensorStorageBinding],
+	variable: CoreVar,
+) -> Option[CoreTensorRawScalarKind]:
+	var result: Option[CoreTensorRawScalarKind] = None
+
+	for binding in env:
+		if core_vars_equal(binding.variable, variable):
+			result = Some(binding.raw_kind)
+
+	result
+
+
+private pure func tensor_storage_env_add(
+	env: List[TensorStorageBinding],
+	variable: CoreVar,
+	raw_kind: CoreTensorRawScalarKind,
+) -> List[TensorStorageBinding]:
+	[{
+			variable = variable,
+			raw_kind = raw_kind
+		}] + tensor_storage_env_without(env, variable)
+
+
+private pure func tensor_fill_raw_kind(name: String) -> Option[CoreTensorRawScalarKind]:
+	if name == "blorp_vector_new_fill_f64":
+		Some(TensorFloat64Elements)
+	else if name == "blorp_vector_new_fill_f32":
+		Some(TensorFloat32Elements)
+	else if name == "blorp_vector_new_fill_i64":
+		Some(TensorInt64Elements)
+	else:
+		None
+
+
+private pure func tensor_expr_raw_kind(
+	env: List[TensorStorageBinding],
+	expr: CoreExpr,
+) -> Option[CoreTensorRawScalarKind]:
+	match expr:
+		VarExpr(variable, typ, loc):
+			tensor_storage_env_lookup(env, variable)
+		TensorLiteralExpr(literal, typ, loc):
+			match literal.payload:
+				TensorRawLiteralPayload(raw):
+					Some(raw.raw_kind)
+				TensorInlineStructLiteralPayload(inline_struct):
+					None
+		TensorRawFillExpr(fill, typ, loc):
+			Some(fill.raw_kind)
+		CallExpr(BuiltinCall(name), callee, args, typ, loc):
+			tensor_fill_raw_kind(name)
+		CallExpr(DirectRuntimeCall(call), callee, args, typ, loc):
+			tensor_fill_raw_kind(call.name)
+		_:
+			None
+
+
+private pure func tensor_storage_guard_matches(
+	intrinsic_name: String,
+	raw_kind: CoreTensorRawScalarKind,
+) -> Bool:
+	match raw_kind:
+		TensorFloat64Elements:
+			intrinsic_name == "tensor_is_f64_storage"
+		TensorFloat32Elements:
+			intrinsic_name == "tensor_is_f32_storage"
+		TensorInt64Elements:
+			intrinsic_name == "tensor_is_i64_storage"
+
+
+private pure func tensor_storage_guard_proven(
+	env: List[TensorStorageBinding],
+	cond: CoreExpr,
+) -> Bool:
+	match cond:
+		CallExpr(IntrinsicCall(intrinsic_name), callee, args, typ, loc):
+			match args:
+				[source]:
+					match tensor_expr_raw_kind(env, source):
+						Some(raw_kind):
+							tensor_storage_guard_matches(intrinsic_name, raw_kind)
+						None:
+							False
+				[]:
+					False
+				[first, second, ...rest]:
+					False
+		_:
+			False
+
+
+private pure func tensor_storage_env_after_binding(
+	env: List[TensorStorageBinding],
+	variable: CoreVar,
+	is_mutable: Bool,
+	value_type: CoreType,
+	rhs: CoreExpr,
+) -> List[TensorStorageBinding]:
+	if is_mutable:
+		tensor_storage_env_without(env, variable)
+	else:
+		match tensor_expr_raw_kind(env, rhs):
+			Some(raw_kind):
+				tensor_storage_env_add(env, variable, raw_kind)
+			None:
+				tensor_storage_env_without(env, variable)
+
+
+private pure func annotate_tensor_storage_expr(
+	env: List[TensorStorageBinding],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			annotated_rhs: CoreExpr = annotate_tensor_storage_expr(env, rhs)
+
+			match body:
+				IfExpr(guard, then_expr, else_expr, typ, loc):
+					match guard:
+						VarExpr(guard_var, guard_type, guard_loc):
+							if (
+								core_vars_equal(variable, guard_var)
+								and tensor_storage_guard_proven(env, annotated_rhs)
+							):
+								annotate_tensor_storage_expr(env, then_expr)
+							else:
+								next_env: List[TensorStorageBinding] = tensor_storage_env_after_binding(
+									env,
+									variable,
+									is_mutable,
+									value_type,
+									annotated_rhs,
+								)
+								LetExpr(
+									variable,
+									is_mutable,
+									value_type,
+									annotated_rhs,
+									annotate_tensor_storage_expr(next_env, body),
+								)
+						_:
+							next_env: List[TensorStorageBinding] = tensor_storage_env_after_binding(
+								env,
+								variable,
+								is_mutable,
+								value_type,
+								annotated_rhs,
+							)
+							LetExpr(
+								variable,
+								is_mutable,
+								value_type,
+								annotated_rhs,
+								annotate_tensor_storage_expr(next_env, body),
+							)
+				_:
+					next_env: List[TensorStorageBinding] = tensor_storage_env_after_binding(
+						env,
+						variable,
+						is_mutable,
+						value_type,
+						annotated_rhs,
+					)
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						annotated_rhs,
+						annotate_tensor_storage_expr(next_env, body),
+					)
+		BorrowLetExpr(variable, value_type, rhs, body):
+			annotated_rhs: CoreExpr = annotate_tensor_storage_expr(env, rhs)
+			next_env: List[TensorStorageBinding] = tensor_storage_env_after_binding(
+				env,
+				variable,
+				False,
+				value_type,
+				annotated_rhs,
+			)
+			BorrowLetExpr(
+				variable,
+				value_type,
+				annotated_rhs,
+				annotate_tensor_storage_expr(next_env, body),
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				release_policy,
+				annotate_tensor_storage_expr(
+					tensor_storage_env_without(env, variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				variable,
+				value_type,
+				retain_policy,
+				annotate_tensor_storage_expr(env, body),
+				typ,
+				loc,
+			)
+		SeqExpr(first, second):
+			SeqExpr(
+				annotate_tensor_storage_expr(env, first),
+				annotate_tensor_storage_expr(env, second),
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			annotated_cond: CoreExpr = annotate_tensor_storage_expr(env, cond)
+
+			if tensor_storage_guard_proven(env, annotated_cond):
+				annotate_tensor_storage_expr(env, then_expr)
+			else:
+				IfExpr(
+					annotated_cond,
+					annotate_tensor_storage_expr(env, then_expr),
+					annotate_tensor_storage_expr(env, else_expr),
+					typ,
+					loc,
+				)
+		ForRangeExpr(binder, start, end_value, body, typ, loc):
+			ForRangeExpr(
+				binder,
+				annotate_tensor_storage_expr(env, start),
+				annotate_tensor_storage_expr(env, end_value),
+				annotate_tensor_storage_expr(
+					tensor_storage_env_without(env, binder.variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		ForTensorExpr(for_tensor, typ, loc):
+			annotated_iterable: CoreExpr = annotate_tensor_storage_expr(env, for_tensor.iterable)
+
+			element_storage = match tensor_expr_raw_kind(env, annotated_iterable):
+				Some(raw_kind):
+					TensorForRawScalarElement(raw_kind)
+				None:
+					clone_tensor_for_element_storage(for_tensor.element_storage)
+
+			ForTensorExpr(
+				{
+					binder = for_tensor.binder,
+					element_storage = element_storage,
+					iterable = annotated_iterable,
+					iterable_release_policy = for_tensor.iterable_release_policy,
+					body = annotate_tensor_storage_expr(
+						tensor_storage_env_without(env, for_tensor.binder.variable),
+						for_tensor.body,
+					)
+				},
+				typ,
+				loc,
+			)
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			TensorRawViewLetExpr(
+				{
+					variable = binding.variable,
+					kind = binding.kind,
+					source = annotate_tensor_storage_expr(env, binding.source)
+				},
+				annotate_tensor_storage_expr(
+					tensor_storage_env_without(env, binding.variable),
+					body,
+				),
+				typ,
+				loc,
+			)
+		WhileExpr(cond, body, typ, loc):
+			WhileExpr(
+				annotate_tensor_storage_expr(env, cond),
+				annotate_tensor_storage_expr(env, body),
+				typ,
+				loc,
+			)
+		_:
+			expr
 
 
 private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
@@ -1462,9 +1928,21 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 			False
 
 
-private pure func prepared_tuple_literal(
+private pure func tuple_pointer_expr_needs_retain_with_retained_vars(
+	expr: CoreExpr,
+	retained_vars: List[CoreVar],
+) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			not core_var_list_contains(retained_vars, variable)
+		_:
+			tuple_pointer_expr_needs_retain(expr)
+
+
+private pure func prepared_tuple_literal_with_retained_vars(
 	items: List[CoreExpr],
 	item_types: List[CoreType],
+	retained_vars: List[CoreVar],
 ) -> Option[PreparedTupleLiteral]:
 	var elements: List[CoreTupleElement] = []
 	var release_mask: Int = 0
@@ -1494,7 +1972,10 @@ private pure func prepared_tuple_literal(
 											if tuple_slot_needs_release(item_type):
 												release_mask += int_power_of_two(index)
 
-											if tuple_pointer_expr_needs_retain(item):
+											if tuple_pointer_expr_needs_retain_with_retained_vars(
+												item,
+												retained_vars,
+											):
 												retain_mask += int_power_of_two(index)
 										else:
 											failed = True
@@ -1503,7 +1984,10 @@ private pure func prepared_tuple_literal(
 								elements = elements.append(TuplePointerElement(item))
 								release_mask += int_power_of_two(index)
 
-								if tuple_pointer_expr_needs_retain(item):
+								if tuple_pointer_expr_needs_retain_with_retained_vars(
+									item,
+									retained_vars,
+								):
 									retain_mask += int_power_of_two(index)
 							else:
 								failed = True
@@ -1511,26 +1995,47 @@ private pure func prepared_tuple_literal(
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
 
-							if tuple_pointer_expr_needs_retain(item):
+							if tuple_pointer_expr_needs_retain_with_retained_vars(
+								item,
+								retained_vars,
+							):
 								retain_mask += int_power_of_two(index)
 						TensorType:
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
 
-							if tuple_pointer_expr_needs_retain(item):
+							if tuple_pointer_expr_needs_retain_with_retained_vars(
+								item,
+								retained_vars,
+							):
 								retain_mask += int_power_of_two(index)
 						StackResultType(ok_type, err_type):
 							failed = True
 						HeapRecordType(name):
-							failed = True
+							elements = elements.append(TuplePointerElement(item))
+							release_mask += int_power_of_two(index)
+
+							if tuple_pointer_expr_needs_retain_with_retained_vars(
+								item,
+								retained_vars,
+							):
+								retain_mask += int_power_of_two(index)
 						UnionType(name):
-							failed = True
+							elements = elements.append(TuplePointerElement(item))
+							release_mask += int_power_of_two(index)
+
+							if tuple_pointer_expr_needs_retain_with_retained_vars(
+								item,
+								retained_vars,
+							):
+								retain_mask += int_power_of_two(index)
 						EnumType(name):
-							failed = True
+							elements = elements.append(TuplePrimElement(item))
 						ValueRecordType(name):
-							failed = True
+							elements = elements.append(TupleStructElement(item, name))
+							release_mask += int_power_of_two(index)
 						RangeType:
-							failed = True
+							elements = elements.append(TuplePrimElement(item))
 				None:
 					failed = True
 
@@ -1546,17 +2051,29 @@ private pure func prepared_tuple_literal(
 		})
 
 
-private pure func prepare_tuple_expr(
+private pure func prepared_tuple_literal(
+	items: List[CoreExpr],
+	item_types: List[CoreType],
+) -> Option[PreparedTupleLiteral]:
+	prepared_tuple_literal_with_retained_vars(items, item_types, [])
+
+
+private pure func prepare_tuple_expr_with_retained_vars(
 	decls: List[CoreDecl],
 	items: List[CoreExpr],
 	typ: CoreType,
 	loc: CoreSourceLoc,
+	retained_vars: List[CoreVar],
 ) -> CoreExpr:
 	prepared_items: List[CoreExpr] = prepare_exprs(decls, items)
 
 	match typ:
 		TupleType(item_types):
-			match prepared_tuple_literal(prepared_items, item_types):
+			match prepared_tuple_literal_with_retained_vars(
+				prepared_items,
+				item_types,
+				retained_vars,
+			):
 				Some(prepared):
 					TupleConstructExpr(
 						{
@@ -1589,6 +2106,27 @@ private pure func prepare_tuple_expr(
 			TupleExpr(prepared_items, typ, loc)
 		VoidType:
 			TupleExpr(prepared_items, typ, loc)
+
+
+private pure func prepare_tuple_expr(
+	decls: List[CoreDecl],
+	items: List[CoreExpr],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	prepare_tuple_expr_with_retained_vars(decls, items, typ, loc, [])
+
+
+private pure func prepare_dup_body_expr(
+	decls: List[CoreDecl],
+	variable: CoreVar,
+	body: CoreExpr,
+) -> CoreExpr:
+	match body:
+		TupleExpr(items, typ, loc):
+			prepare_tuple_expr_with_retained_vars(decls, items, typ, loc, [variable])
+		_:
+			prepare_expr(decls, body)
 
 
 private pure func prepare_record_fields(
@@ -1769,6 +2307,14 @@ private pure func stack_option_representation(
 			None
 
 
+private pure func constructor_c_name(name: String, def_id: Option[Int]) -> String:
+	match def_id:
+		Some(id):
+			"__def_" + id.to_string() + "_" + name
+		None:
+			name
+
+
 private pure func prepare_stack_option_construct(
 	kind: CoreCallKind,
 	args: List[CoreExpr],
@@ -1790,7 +2336,7 @@ private pure func prepare_stack_option_construct(
 							args = boxed_storage_values_for_exprs(args),
 						})
 					None:
-						if is_managed_pointer_tuple_slot_type(payload):
+						if is_nullable_option_payload_type(payload):
 							Some({
 								type_name = "Option",
 								constructor_name = "Some",
@@ -1802,7 +2348,20 @@ private pure func prepare_stack_option_construct(
 								args = boxed_storage_values_for_exprs(args),
 							})
 						else:
-							None
+							boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(
+								args,
+							)
+
+							Some({
+								type_name = "Option",
+								constructor_name = "Some",
+								constructor_c_name = constructor_c_name(constructor_name, def_id),
+								representation = BoxedOptionRepresentation,
+								payload_storage = ErasedUnionPayloadStorage,
+								uses_release_mask = True,
+								release_mask = release_mask_for_boxed_args(boxed_args),
+								args = boxed_args,
+							})
 			else if constructor_name == "None" and args.length() == 0:
 				match stack_option_representation(payload, STACK_OPTION_NONE_TAG):
 					Some(representation):
@@ -1817,7 +2376,7 @@ private pure func prepare_stack_option_construct(
 							args = [],
 						})
 					None:
-						if is_managed_pointer_tuple_slot_type(payload):
+						if is_nullable_option_payload_type(payload):
 							Some({
 								type_name = "Option",
 								constructor_name = "None",
@@ -1829,12 +2388,34 @@ private pure func prepare_stack_option_construct(
 								args = [],
 							})
 						else:
-							None
+							Some({
+								type_name = "Option",
+								constructor_name = "None",
+								constructor_c_name = constructor_c_name(constructor_name, def_id),
+								representation = BoxedOptionRepresentation,
+								payload_storage = TypedUnionPayloadStorage,
+								uses_release_mask = False,
+								release_mask = 0,
+								args = [],
+							})
+			else:
+				None
+		BuiltinCall(name):
+			if name == "blorp_option_some":
+				prepare_stack_option_construct(
+					UserCall("Some", None, []),
+					args,
+					payload,
+				)
+			else if name == "blorp_option_none":
+				prepare_stack_option_construct(
+					UserCall("None", None, []),
+					args,
+					payload,
+				)
 			else:
 				None
 		ForeignCall(name, arg_passing):
-			None
-		BuiltinCall(name):
 			None
 		DirectRuntimeCall(call):
 			None
@@ -1898,25 +2479,14 @@ private pure func stack_result_payload_type(
 			None
 
 
-private pure func stack_result_supported_payload_type(payload: CoreType) -> Bool:
+private pure func stack_result_payload_has_erased_storage(payload: CoreType) -> Bool:
 	match payload:
 		NamedType(name, args):
-			if args.length() != 0:
-				True
-			else if name == "Float":
-				False
-			else if name == "Float32":
-				False
-			else if name == "Float16":
-				False
-			else if name == "Int128":
-				False
-			else:
-				name != "UInt128"
+			True
 		ValueRecordType(name):
-			False
+			True
 		TupleType(items):
-			False
+			True
 		VoidType:
 			True
 		EnumType(name):
@@ -1945,7 +2515,7 @@ private pure func prepare_stack_result_construct(
 			tag ?= stack_result_tag(constructor_name)
 			payload_type ?= stack_result_payload_type(constructor_name, typ)
 
-			if args.length() == 1 and stack_result_supported_payload_type(payload_type):
+			if args.length() == 1 and stack_result_payload_has_erased_storage(payload_type):
 				boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(args)
 
 				release_mask: Int = match boxed_args:
@@ -2548,7 +3118,7 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				variable,
 				value_type,
 				retain_policy,
-				prepare_expr(decls, body),
+				prepare_dup_body_expr(decls, variable, body),
 				typ,
 				loc,
 			)
@@ -2728,7 +3298,7 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 			ForTensorExpr(
 				{
 					binder = for_tensor.binder,
-					element_storage = for_tensor.element_storage,
+					element_storage = clone_tensor_for_element_storage(for_tensor.element_storage),
 					iterable = prepare_expr(decls, for_tensor.iterable),
 					iterable_release_policy = for_tensor.iterable_release_policy,
 					body = prepare_expr(decls, for_tensor.body)
@@ -2809,13 +3379,15 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 private pure func prepare_function(decls: List[CoreDecl], func_info: CoreFunction) -> CoreFunction:
 	match func_info.body:
 		Some(body):
-			{ func_info | body = Some(prepare_expr(decls, body)) }
+			prepared_body: CoreExpr = prepare_expr(decls, body)
+			{ func_info | body = Some(annotate_tensor_storage_expr([], prepared_body)) }
 		None:
 			func_info
 
 
 private pure func prepare_global(decls: List[CoreDecl], global: CoreGlobal) -> CoreGlobal:
-	{ global | init = prepare_expr(decls, global.init) }
+	prepared_init: CoreExpr = prepare_expr(decls, global.init)
+	{ global | init = annotate_tensor_storage_expr([], prepared_init) }
 
 
 private pure func prepare_decl(decls: List[CoreDecl], decl: CoreDecl) -> CoreDecl:

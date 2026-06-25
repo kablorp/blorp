@@ -1,125 +1,11 @@
-(** Phase 2.6.6: parity contract between [Core_intrinsic_registry] and
-    [Core_emit]'s [emit_intrinsic] dispatcher.
+(** Contract checks for [Core_intrinsic_registry].
 
-    The registry is documented as the single source of truth for all
-    CKIntrinsic primitives. This test enforces that contract:
-
-    1. Every implemented registry entry has an emit clause.
-    2. Every emit clause name corresponds to a registry entry.
-    3. The registry's declared arity matches what emit accepts.
-
-    Drift between these two is caught at [make compiler-unit-test], not at
-    runtime-compile of user code. *)
+    The registry is the single source of truth for CKIntrinsic metadata.
+    Emission coverage now belongs to the Blorp backend TestSuites and
+    end-to-end compiler cases, so this OCaml suite only checks registry
+    metadata and ownership contracts that are still owned by OCaml passes. *)
 
 open Blorp
-
-(** Extract intrinsic names that appear in OCaml emit_intrinsic match clauses.
-    Reads [core_emit_intrinsic.ml] (Phase 5.1 step 3 moved the match body
-    there; prior to that it lived in [core_emit.ml]) and regex-matches the
-    patterns used by the dispatcher. Handles both single-name and grouped
-    ``("a" | "b" | "c")`` match arms.
-
-    Returns a sorted, deduplicated list. *)
-let ocaml_emit_intrinsic_names () : string list =
-  (* The source file may be inspected from the repo root, from [compiler/],
-     or from dune's sandbox. Walk upward from [Sys.getcwd ()] and check
-     both repo-root and compiler-root layouts so this contract does not depend
-     on the caller's working directory. *)
-  let rec ancestors dir =
-    let parent = Filename.dirname dir in
-    if parent = dir then [ dir ] else dir :: ancestors parent
-  in
-  let relative_candidates =
-    [
-      "compiler/lib/core_emit_intrinsic.ml";
-      "lib/core_emit_intrinsic.ml";
-      "../../../../lib/core_emit_intrinsic.ml";
-      "../../../../../lib/core_emit_intrinsic.ml";
-      "../../../../compiler/lib/core_emit_intrinsic.ml";
-      "../../../compiler/lib/core_emit_intrinsic.ml";
-    ]
-  in
-  let candidates =
-    relative_candidates
-    @ List.concat_map
-        (fun root ->
-          [
-            Filename.concat root "compiler/lib/core_emit_intrinsic.ml";
-            Filename.concat root "lib/core_emit_intrinsic.ml";
-          ])
-        (ancestors (Sys.getcwd ()))
-  in
-  let path =
-    match List.find_opt Sys.file_exists candidates with
-    | Some p -> p
-    | None ->
-        Alcotest.failf
-          "Cannot locate core_emit_intrinsic.ml from CWD=%s; tried %s"
-          (Sys.getcwd ())
-          (String.concat ", " candidates)
-  in
-  let ic = open_in path in
-  let content = really_input_string ic (in_channel_length ic) in
-  close_in ic;
-  (* Two regex-like scans: single-quoted names in match-arm position. *)
-  let names = ref [] in
-  let len = String.length content in
-  let scan_after i =
-    (* After finding an opening bracket or pipe at position i, collect
-       quoted names separated by pipes until hitting a comma or bracket. *)
-    let rec walk j =
-      if j >= len then ()
-      else
-        match content.[j] with
-        | '"' ->
-            let k =
-              try String.index_from content (j + 1) '"' with Not_found -> len
-            in
-            let name = String.sub content (j + 1) (k - j - 1) in
-            (* Filter: intrinsic names are snake_case alphanumeric. *)
-            let is_intrinsic =
-              String.length name > 0
-              && String.for_all
-                   (fun c ->
-                     (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c = '_')
-                   name
-            in
-            if is_intrinsic then names := name :: !names;
-            walk (k + 1)
-        | ',' | ']' | '=' | ';' | '(' -> () (* end of match-arm pattern *)
-        | '|' | ' ' | '\n' | '\t' -> walk (j + 1)
-        | _ -> () (* hit non-pipe non-string character — stop *)
-    in
-    walk i
-  in
-  (* Find match-arm patterns inside emit_intrinsic. Strategy: locate
-     each pipe-space-quote sequence and parse from there. Grouped arms
-     written as OR-pipes within parens are captured by the same walker. *)
-  let rec scan i =
-    if i >= len - 2 then ()
-    else if
-      content.[i] = '|'
-      && i + 1 < len
-      && (content.[i + 1] = ' ' || content.[i + 1] = '\n')
-    then begin
-      (* Skip whitespace and any grouping parentheses, then scan names. *)
-      let j = ref (i + 1) in
-      while
-        !j < len
-        && (content.[!j] = ' '
-           || content.[!j] = '\n'
-           || content.[!j] = '\t'
-           || content.[!j] = '(')
-      do
-        incr j
-      done;
-      if !j < len && content.[!j] = '"' then scan_after !j;
-      scan (i + 1)
-    end
-    else scan (i + 1)
-  in
-  scan 0;
-  List.sort_uniq String.compare !names
 
 (* ============================================================================
    Tests
@@ -130,64 +16,12 @@ let registry_names () =
   List.map (fun i -> i.Core_intrinsic_registry.name) Core_intrinsic_registry.all
   |> List.sort_uniq String.compare
 
-(** Names from registry marked implemented=true. *)
-let registry_implemented_names () =
-  List.filter_map
-    (fun i ->
-      if i.Core_intrinsic_registry.implemented then Some i.name else None)
-    Core_intrinsic_registry.all
-  |> List.sort_uniq String.compare
-
-let blorp_renderer_intrinsic_names () =
-  Compiler_blorp_bridge.renderer_template_infos_exn
-    ~renderer:Compiler_blorp_bridge.intrinsic_renderer
-  |> List.map (fun info -> info.Compiler_blorp_bridge.renderer_template_name)
-  |> List.sort_uniq String.compare
-
-(** The position-based scan is already strict enough that no non-intrinsic
-    string literal leaks through (verified during Phase 2.6.6 review:
-    scanner returns 131 unique names, all valid intrinsics). A prefix
-    allowlist would silently drop new intrinsic categories, so we keep
-    every captured name and trust the scan. *)
-
-let test_every_implemented_registered_appears_in_emit () =
-  let emit = ocaml_emit_intrinsic_names () in
-  let blorp_emit = blorp_renderer_intrinsic_names () in
-  let impl = registry_implemented_names () in
-  let missing =
-    List.filter
-      (fun n -> (not (List.mem n emit)) && not (List.mem n blorp_emit))
-      impl
-  in
-  if missing <> [] then
-    Alcotest.failf
-      "Registry entries marked implemented but with no emit_intrinsic match \
-       clause or Blorp renderer: [%s]"
-      (String.concat "; " missing)
-
-let test_every_emit_clause_is_registered () =
-  let emit = ocaml_emit_intrinsic_names () in
-  let registered = registry_names () in
-  let orphan = List.filter (fun n -> not (List.mem n registered)) emit in
-  if orphan <> [] then
-    Alcotest.failf
-      "Emit clauses for intrinsic names missing from registry: [%s]. Either \
-       add a registry entry or remove the emit clause."
-      (String.concat "; " orphan)
-
 let test_registry_has_entries () =
   (* Sanity: the all list is nonempty. If it ever drops to zero, the
      other tests would silently pass. *)
   Alcotest.(check bool)
     "registry non-empty" true
     (List.length (registry_names ()) > 50)
-
-let test_emit_scan_found_something () =
-  (* Sanity: the source-inspection regex actually found match arms.
-     If a refactor renames emit_intrinsic or changes formatting, the
-     scan might return [] and silently pass. *)
-  let emit = ocaml_emit_intrinsic_names () in
-  Alcotest.(check bool) "emit scan non-empty" true (List.length emit > 10)
 
 (* ============================================================================
    Schema tests (Phase 2.6.6 extension fields)
@@ -629,15 +463,8 @@ let test_ir_backed_std_functions_registered () =
 let suite =
   [
     ( "parity",
-      [
-        Alcotest.test_case "registry non-empty" `Quick test_registry_has_entries;
-        Alcotest.test_case "emit scan non-empty" `Quick
-          test_emit_scan_found_something;
-        Alcotest.test_case "registered → emit" `Quick
-          test_every_implemented_registered_appears_in_emit;
-        Alcotest.test_case "emit → registry" `Quick
-          test_every_emit_clause_is_registered;
-      ] );
+      [ Alcotest.test_case "registry non-empty" `Quick test_registry_has_entries ]
+    );
     ( "schema",
       [
         Alcotest.test_case "arity declared everywhere" `Quick
