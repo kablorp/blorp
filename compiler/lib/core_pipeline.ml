@@ -311,9 +311,9 @@ let compile_typed_with_modules ?(main_import_bindings = [])
      types structurally, so aliases like [Decoder[T] = pure (Value) -> Result[T, _]]
      must be expanded eagerly — otherwise a call site with a concrete
      [TyFunc] argument never matches a [TyNamed "Decoder"] parameter and
-     no specialization is enqueued. The same registry is passed to the
-     emission context so value-record and enum registrations (done during
-     [Core_emit.emit_program]) share the alias table. *)
+     no specialization is enqueued. The same registry is passed through
+     emission so the backend sees the exact type facts used by the Core
+     passes. *)
   let reg = Codegen_types.create_registry () in
   Core_flatten.register_types reg full;
   let full = Core_ffi_boundary.annotate_program ~reg full in

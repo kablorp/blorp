@@ -11,6 +11,7 @@ import:
 		CoreCallKind(
 			BuiltinCall,
 			ClosureCall,
+			DirectRuntimeCall,
 			DictWithCapacityCall,
 			FallibleStreamTerminalCall,
 			ForeignCall,
@@ -48,16 +49,17 @@ import:
 			BinaryExpr,
 			BoxExpr,
 			BreakExpr,
+			BorrowLetExpr,
 			CastExpr,
 			CallExpr,
 			ClosureCreateExpr,
 			ConcurrentlyLoopExpr,
 			ConcurrentExpr,
-				ConstructorMatchExpr,
-				ContinueExpr,
-				CooperativeCheckpointExpr,
-				DetachExpr,
-				DictConstructExpr,
+			ConstructorMatchExpr,
+			ContinueExpr,
+			CooperativeCheckpointExpr,
+			DetachExpr,
+			DictConstructExpr,
 			DupExpr,
 			DropExpr,
 			FieldExpr,
@@ -504,6 +506,8 @@ private pure func expr_type(expr: CoreExpr) -> CoreType:
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			typ
 		LetExpr(variable, is_mutable, value_type, rhs, body):
+			expr_type(body)
+		BorrowLetExpr(variable, value_type, rhs, body):
 			expr_type(body)
 		SeqExpr(first, second):
 			expr_type(second)
@@ -1396,6 +1400,8 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 			False
 		LetExpr(name, is_mutable, typ, rhs, body):
 			False
+		BorrowLetExpr(name, typ, rhs, body):
+			False
 		SeqExpr(first, second):
 			False
 		IfExpr(cond, then_expr, else_expr, typ, loc):
@@ -1769,7 +1775,7 @@ private pure func prepare_stack_option_construct(
 	payload: CoreType,
 ) -> Option[CoreUnionConstruct]:
 	match kind:
-		UserCall(constructor_name, def_id):
+		UserCall(constructor_name, def_id, consumed_args):
 			if constructor_name == "Some" and args.length() == 1:
 				match stack_option_representation(payload, STACK_OPTION_SOME_TAG):
 					Some(representation):
@@ -1829,6 +1835,8 @@ private pure func prepare_stack_option_construct(
 		ForeignCall(name, arg_passing):
 			None
 		BuiltinCall(name):
+			None
+		DirectRuntimeCall(call):
 			None
 		TensorParallelCall(name, layout):
 			None
@@ -1933,7 +1941,7 @@ private pure func prepare_stack_result_construct(
 	typ: CoreType,
 ) -> Option[CoreUnionConstruct]:
 	match kind:
-		UserCall(constructor_name, def_id):
+		UserCall(constructor_name, def_id, consumed_args):
 			tag ?= stack_result_tag(constructor_name)
 			payload_type ?= stack_result_payload_type(constructor_name, typ)
 
@@ -1968,19 +1976,21 @@ private pure func prepare_stack_result_construct(
 		BuiltinCall(name):
 			if name == "blorp_result_ok":
 				prepare_stack_result_construct(
-					UserCall("Ok", None),
+					UserCall("Ok", None, []),
 					args,
 					typ,
 				)
 			else if name == "blorp_result_err":
 				prepare_stack_result_construct(
-					UserCall("Err", None),
+					UserCall("Err", None, []),
 					args,
 					typ,
 				)
 			else:
 				None
 		ForeignCall(name, arg_passing):
+			None
+		DirectRuntimeCall(call):
 			None
 		TensorParallelCall(name, layout):
 			None
@@ -2007,7 +2017,7 @@ private pure func prepare_union_construct(
 	match typ:
 		UnionType(type_name):
 			match kind:
-				UserCall(constructor_name, def_id):
+				UserCall(constructor_name, def_id, consumed_args):
 					match find_union_decl(decls, type_name):
 						Some(union_decl):
 							match find_union_variant(union_decl, constructor_name):
@@ -2045,6 +2055,8 @@ private pure func prepare_union_construct(
 				ForeignCall(name, arg_passing):
 					None
 				BuiltinCall(name):
+					None
+				DirectRuntimeCall(call):
 					None
 				TensorParallelCall(name, layout):
 					None
@@ -2270,7 +2282,7 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 							[payload]:
 								if variable.name == "None":
 									match prepare_stack_option_construct(
-										UserCall("None", None),
+										UserCall("None", None, []),
 										[],
 										payload,
 									):
@@ -2557,6 +2569,13 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				prepare_expr(decls, rhs),
 				prepare_expr(decls, body),
 			)
+		BorrowLetExpr(name, typ, rhs, body):
+			BorrowLetExpr(
+				name,
+				typ,
+				prepare_expr(decls, rhs),
+				prepare_expr(decls, body),
+			)
 		SeqExpr(first, second):
 			SeqExpr(
 				prepare_expr(decls, first),
@@ -2713,10 +2732,10 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 					iterable = prepare_expr(decls, for_tensor.iterable),
 					iterable_release_policy = for_tensor.iterable_release_policy,
 					body = prepare_expr(decls, for_tensor.body)
-					},
-					typ,
-					loc,
-				)
+				},
+				typ,
+				loc,
+			)
 		DetachExpr(detached, typ, loc):
 			expr
 		ConcurrentlyLoopExpr(loop, typ, loc):

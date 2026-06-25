@@ -234,8 +234,12 @@ let emit_string_literal ctx s =
 (** Emit a blorp literal as a C expression. Byte-identical to the
     legacy [Codegen_emit.gen_literal] — duplicated here to keep
     Core_emit self-contained. *)
+let int64_c_literal n =
+  if Int64.equal n Int64.min_int then "(-9223372036854775807L - 1L)"
+  else Printf.sprintf "%LdL" n
+
 let gen_literal ctx = function
-  | Ast.LitInt n -> emit ctx (Printf.sprintf "%LdL" n)
+  | Ast.LitInt n -> emit ctx (int64_c_literal n)
   | Ast.LitInt128 digits ->
       let base = "1000000000000000000" in
       let len = String.length digits in

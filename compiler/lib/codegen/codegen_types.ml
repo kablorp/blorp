@@ -13,11 +13,10 @@
     compilation (and per pipeline invocation). No module-global mutable
     state — callers always pass a registry explicitly.
 
-    Population order: the core pipeline registers type aliases eagerly
-    before monomorphization (see [Core_pipeline.compile_typed_with_modules]);
-    [Core_emit.emit_program] registers value-record names and enum types
-    as it walks declarations. [collect_subst] in [Core_mono] consults
-    aliases via [expand_alias ~reg]. *)
+    Population order: the core pipeline registers aliases, value-record
+    names, and enum types eagerly before monomorphization (see
+    [Core_pipeline.compile_typed_with_modules]). [collect_subst] in
+    [Core_mono] consults aliases via [expand_alias ~reg]. *)
 
 open Ast
 

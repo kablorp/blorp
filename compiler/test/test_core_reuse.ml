@@ -173,12 +173,6 @@ let resource_scope ?(name = "r") body_ty body =
          rs_cleanup = void ();
        })
 
-let contains_sub output sub =
-  let n = String.length sub in
-  let m = String.length output in
-  let rec go i = i + n <= m && (String.sub output i n = sub || go (i + 1)) in
-  go 0
-
 let count_list_handoff mode body =
   fold_tree
     (fun acc node ->
@@ -187,12 +181,21 @@ let count_list_handoff mode body =
       | _ -> acc)
     0 body
 
-let emit_rewritten_program_to_string prog =
-  let rewritten = Blorp.Core_reuse.rewrite_program prog in
-  let converted = Blorp.Core_closure.convert_program rewritten in
-  let ctx = Blorp.Core_emit_context.create () in
-  Blorp.Core_emit.emit_program ctx converted;
-  Buffer.contents ctx.output
+let count_intrinsic_calls name body =
+  fold_tree
+    (fun acc node ->
+      match node.desc with
+      | CCall (CKIntrinsic got, _, _) when got = name -> acc + 1
+      | _ -> acc)
+    0 body
+
+let count_drops_of name body =
+  fold_tree
+    (fun acc node ->
+      match node.desc with
+      | CDrop (v, _, _) when v.vname = name -> acc + 1
+      | _ -> acc)
+    0 body
 
 let candidate_names candidates =
   List.map
@@ -1172,7 +1175,7 @@ let test_rewrite_prepared_program_rejects_source_alias_payload () =
   | CLet (_, { desc = CDrop ({ vname = "expr"; _ }, _, _); _ }) -> ()
   | _ -> Alcotest.fail "expected source alias payload to keep original drop"
 
-let test_rewrite_emits_reuse_boundary_without_extra_drop () =
+let test_rewrite_inserts_reuse_boundary_without_extra_drop () =
   let list_ty = ty_list ty_int in
   let body = drop "xs" list_ty (lett "ys" (list_alloc ()) (var "ys" list_ty)) in
   let fn =
@@ -1190,13 +1193,18 @@ let test_rewrite_emits_reuse_boundary_without_extra_drop () =
     }
   in
   let prog = [ { cd_desc = CDFunc fn; cd_loc = dummy_loc; cd_doc = None } ] in
-  let c = emit_rewritten_program_to_string prog in
-  Alcotest.(check bool)
-    "emits reuse boundary" true
-    (contains_sub c "blorp_list_reuse_alloc(xs, 4L)");
-  Alcotest.(check bool)
-    "does not emit separate drop for consumed owner" false
-    (contains_sub c "blorp_release(xs);")
+  let rewritten = Blorp.Core_reuse.rewrite_program prog in
+  let rewritten_body =
+    match rewritten with
+    | [ { cd_desc = CDFunc { cf_body = Some body; _ }; _ } ] -> body
+    | _ -> Alcotest.fail "expected rewritten function body"
+  in
+  Alcotest.(check int)
+    "inserts reuse boundary" 1
+    (count_intrinsic_calls "list_reuse_alloc" rewritten_body);
+  Alcotest.(check int)
+    "does not emit separate drop for consumed owner" 0
+    (count_drops_of "xs" rewritten_body)
 
 let suite =
   [
@@ -1286,7 +1294,7 @@ let suite =
         Alcotest.test_case
           "rewrite_prepared_program_rejects_source_alias_payload" `Quick
           test_rewrite_prepared_program_rejects_source_alias_payload;
-        Alcotest.test_case "rewrite_emits_reuse_boundary_without_extra_drop"
-          `Quick test_rewrite_emits_reuse_boundary_without_extra_drop;
+        Alcotest.test_case "rewrite_inserts_reuse_boundary_without_extra_drop"
+          `Quick test_rewrite_inserts_reuse_boundary_without_extra_drop;
       ] );
   ]

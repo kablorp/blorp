@@ -30,6 +30,7 @@ let null = Lsp_json.Null
 let kind tag fields = obj (("kind", str tag) :: fields)
 let option_int_json = function Some value -> int value | None -> null
 let option_string_json = function Some value -> str value | None -> null
+let int_list_json values = arr (List.map int values)
 let string_list_json values = arr (List.map str values)
 
 let supported_sized_integer_conversion_builtins =
@@ -394,6 +395,8 @@ let supported_primitive_runtime_builtins =
       "blorp_float16_to_string";
       "blorp_float32_to_string";
       "blorp_float_to_string";
+      "blorp_filter_parallel";
+      "blorp_filter_parallel_with";
       "blorp_format_float";
       "blorp_fixed_add";
       "blorp_fixed_div";
@@ -415,11 +418,14 @@ let supported_primitive_runtime_builtins =
       "blorp_getcwd";
       "blorp_getenv";
       "blorp_getenv_nullable";
+      "blorp_crc32";
+      "blorp_crc32_bytes";
       "blorp_hash_bytes";
       "blorp_hash_combine";
       "blorp_hash_float";
       "blorp_hash_int";
       "blorp_hash_string";
+      "blorp_hmac_sha256";
       "blorp_html_escape";
       "blorp_input";
       "blorp_input_or_empty";
@@ -474,7 +480,14 @@ let supported_primitive_runtime_builtins =
       "blorp_set_remove";
       "blorp_seed_random";
       "blorp_setenv";
+      "blorp_md5";
+      "blorp_md5_bytes";
       "blorp_sha1";
+      "blorp_sha1_bytes";
+      "blorp_sha256";
+      "blorp_sha256_bytes";
+      "blorp_sha512";
+      "blorp_sha512_bytes";
       "blorp_signal_hangup";
       "blorp_signal_interrupt";
       "blorp_signal_received";
@@ -569,6 +582,7 @@ let supported_primitive_runtime_builtins =
       "blorp_tcp_ip_text_raw";
       "blorp_tcp_parse_ip_raw";
       "blorp_tcp_port_raw";
+      "blorp_tcp_port_value_raw";
       "blorp_time_format";
       "blorp_time_from_iso";
       "blorp_time_from_parts";
@@ -601,10 +615,111 @@ let sized_integer_conversion_builtin_supported name =
 
 let list_parallel_runtime_builtin_supported name =
   match name with
+  | "blorp_filter_parallel" | "blorp_filter_parallel_with"
   | "blorp_map_parallel" | "blorp_map_parallel_with" | "blorp_zip_parallel"
   | "blorp_zip_parallel_with" ->
       true
   | _ -> String.starts_with ~prefix:"blorp_filter_map_parallel" name
+
+type direct_runtime_args_policy =
+  | DirectRuntimeArgsAsWritten
+  | DirectRuntimeArgsAppendListParallelLayout of {
+      semantic_arity : int;
+      runtime_arity : int;
+      storage_mode : string;
+      elem_size : string;
+      value_encoding : string;
+    }
+
+type direct_runtime_result_policy =
+  | DirectRuntimeResultAsWritten
+  | DirectRuntimeResultCast of string
+  | DirectRuntimeResultStackResultFromBoxed
+
+type direct_runtime_abi = {
+  direct_runtime_name : string;
+  direct_runtime_args : direct_runtime_args_policy;
+  direct_runtime_result : direct_runtime_result_policy;
+}
+
+let direct_runtime_args_policy_json = function
+  | DirectRuntimeArgsAsWritten -> kind "as_written" []
+  | DirectRuntimeArgsAppendListParallelLayout
+      { semantic_arity; runtime_arity; storage_mode; elem_size; value_encoding }
+    ->
+      kind "list_parallel_layout"
+        [
+          ("semantic_arity", int semantic_arity);
+          ("runtime_arity", int runtime_arity);
+          ("storage_mode", str storage_mode);
+          ("elem_size", str elem_size);
+          ("value_encoding", str value_encoding);
+        ]
+
+let direct_runtime_result_policy_json = function
+  | DirectRuntimeResultAsWritten -> kind "as_written" []
+  | DirectRuntimeResultCast c_type -> kind "cast" [ ("c_type", str c_type) ]
+  | DirectRuntimeResultStackResultFromBoxed ->
+      kind "stack_result_from_boxed" []
+
+let direct_runtime_call_kind_json abi =
+  kind "direct_runtime"
+    [
+      ( "call",
+        obj
+          [
+            ("name", str abi.direct_runtime_name);
+            ("args", direct_runtime_args_policy_json abi.direct_runtime_args);
+            ( "result",
+              direct_runtime_result_policy_json abi.direct_runtime_result );
+          ] );
+    ]
+
+let list_callback_result_encoding_arg (layout : Core.list_storage_layout) :
+    string =
+  match layout.Core.lsl_value_layout with
+  | Core.ListElementStackStruct _ -> "BLORP_LIST_CALLBACK_BOXED_STRUCT"
+  | Core.ListElementPointer | Core.ListElementInlineBits _
+  | Core.ListElementBoxedValue | Core.ListElementUnknownValue _ ->
+      "BLORP_LIST_CALLBACK_BITS"
+
+let list_parallel_runtime_layout_args ~reg ~result_ty ~loc =
+  let layout = Core_layout_type.list_storage_layout_of_type ~reg result_ty loc in
+  let storage_mode, elem_size =
+    Core_emit_blorp_prepared_backend.list_runtime_storage_args layout
+  in
+  (storage_mode, elem_size, list_callback_result_encoding_arg layout)
+
+let list_parallel_runtime_args_policy ~reg ~result_ty ~loc name =
+  let make semantic_arity runtime_arity =
+    let storage_mode, elem_size, value_encoding =
+      list_parallel_runtime_layout_args ~reg ~result_ty ~loc
+    in
+    DirectRuntimeArgsAppendListParallelLayout
+      { semantic_arity; runtime_arity; storage_mode; elem_size; value_encoding }
+  in
+  match name with
+  | "blorp_map_parallel" -> Some (make 3 6)
+  | "blorp_zip_parallel" -> Some (make 4 7)
+  | "blorp_map_parallel_with" -> Some (make 4 7)
+  | "blorp_zip_parallel_with" -> Some (make 5 8)
+  | _ when String.starts_with ~prefix:"blorp_filter_map_parallel" name ->
+      Some (make 3 6)
+  | _ -> None
+
+let list_parallel_runtime_result_cast_supported name =
+  list_parallel_runtime_builtin_supported name
+
+let direct_runtime_result_policy ~reg result_ty name =
+  if Core_layout_type.is_stack_result_type ~reg result_ty then
+    DirectRuntimeResultStackResultFromBoxed
+  else if list_parallel_runtime_result_cast_supported name then
+    DirectRuntimeResultCast "blorp_List*"
+  else
+    match name with
+    | "blorp_tensor_add_scaled_f64_cow" | "blorp_tensor_add_scaled_f32_cow" ->
+        DirectRuntimeResultCast "blorp_Vector*"
+    | _ -> DirectRuntimeResultAsWritten
 
 let tensor_parallel_runtime_builtin_supported = function
   | "blorp_matrix_map" | "blorp_matrix_map_indexed" | "blorp_matrix_zip_map"
@@ -633,6 +748,20 @@ let direct_builtin_supported name =
   || primitive_runtime_builtin_supported name
   || Option.is_some (Operation_result_metadata.find_fallible_stream_source name)
 
+let direct_runtime_abi ~reg ~loc result_ty name =
+  if not (direct_builtin_supported name) then None
+  else
+    Some
+      {
+        direct_runtime_name = name;
+        direct_runtime_args =
+          (match list_parallel_runtime_args_policy ~reg ~result_ty ~loc name with
+          | Some policy -> policy
+          | None -> DirectRuntimeArgsAsWritten);
+        direct_runtime_result =
+          direct_runtime_result_policy ~reg result_ty name;
+      }
+
 let channel_attempt_builtin_supported name =
   StringSet.mem name supported_channel_attempt_builtins
 
@@ -642,6 +771,13 @@ let channel_attempt_builtin_arity = function
   | "blorp_channel_try_recv_attempt" -> Some 1
   | "blorp_channel_recv_timeout_attempt" -> Some 2
   | _ -> None
+
+let channel_semantic_builtin_supported = function
+  | "blorp_channel_new" | "blorp_channel_send" | "blorp_channel_try_send"
+  | "blorp_channel_try_send_status" | "blorp_channel_send_timeout"
+  | "blorp_channel_send_timeout_status" ->
+      true
+  | name -> channel_attempt_builtin_supported name
 
 let release_policy_tag ~reg (ty : Ast.type_expr) =
   if
@@ -967,13 +1103,6 @@ let literal_match_literal_json path (literal : Ast.literal) =
       literal_json path literal
   | Ast.LitInt128 _ -> unsupported path "Int128 literal match"
 
-let static_scalar_global_literal_json path (literal : Ast.literal) =
-  match literal with
-  | Ast.LitInt _ | Ast.LitFloat _ | Ast.LitBool _ | Ast.LitChar _ ->
-      literal_json path literal
-  | Ast.LitString _ -> unsupported path "string global initializer"
-  | Ast.LitInt128 _ -> unsupported path "Int128 global initializer"
-
 let primitive_tuple_field_type = function
   | Ast.TyNamed
       ( ( "Int" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16"
@@ -1143,9 +1272,15 @@ let constructor_match_test_json ~reg enum_names union_names enum_constructors pa
       | _ -> unsupported path ("unknown boxed Option constructor " ^ ctor))
   | Ast.TyNamed ("Result", [ _; _ ])
     when Core_layout_type.is_stack_result_type ~reg scrut_ty -> (
+      let* result_type =
+        match Core_layout_type.stack_result_c_type ~reg scrut_ty with
+        | Some c_type -> Ok c_type
+        | None -> unsupported path "stack Result C type unavailable"
+      in
       match ctor with
-      | "Ok" -> Ok (kind "stack_result_ok" [])
-      | "Err" -> Ok (kind "stack_result_err" [])
+      | "Ok" -> Ok (kind "stack_result_ok" [ ("result_type", str result_type) ])
+      | "Err" ->
+          Ok (kind "stack_result_err" [ ("result_type", str result_type) ])
       | _ -> unsupported path ("unknown stack Result constructor " ^ ctor))
   | Ast.TyNamed ("Result", [ _; _ ]) -> (
       match ctor with
@@ -1219,7 +1354,20 @@ let rec match_accessor_json ~reg ?(enum_names = StringSet.empty)
         match_accessor_json ~reg ~enum_names ~value_record_names
           ~heap_record_names ~union_names scrut_ty (path ^ ".parent") parent_acc
       in
-      Ok (kind "stack_result_ok_payload" [ ("parent", parent) ])
+      let* result_type =
+        match match_accessor_type ~reg scrut_ty parent_acc with
+        | Some ty -> (
+            match Core_layout_type.stack_result_c_type ~reg ty with
+            | Some c_type -> Ok c_type
+            | None -> unsupported path "stack Result payload C type unavailable")
+        | None -> unsupported path "stack Result payload parent type unavailable"
+      in
+      if parent_acc = Core.AccRoot then
+        Ok (kind "stack_result_ok_payload" [ ("parent", parent) ])
+      else
+        Ok
+          (kind "boxed_stack_result_ok_payload"
+             [ ("parent", parent); ("result_type", str result_type) ])
   | Core.AccVariantField (parent_acc, "Err", 0)
     when Option.fold
            ~none:false
@@ -1230,7 +1378,20 @@ let rec match_accessor_json ~reg ?(enum_names = StringSet.empty)
         match_accessor_json ~reg ~enum_names ~value_record_names
           ~heap_record_names ~union_names scrut_ty (path ^ ".parent") parent_acc
       in
-      Ok (kind "stack_result_err_payload" [ ("parent", parent) ])
+      let* result_type =
+        match match_accessor_type ~reg scrut_ty parent_acc with
+        | Some ty -> (
+            match Core_layout_type.stack_result_c_type ~reg ty with
+            | Some c_type -> Ok c_type
+            | None -> unsupported path "stack Result payload C type unavailable")
+        | None -> unsupported path "stack Result payload parent type unavailable"
+      in
+      if parent_acc = Core.AccRoot then
+        Ok (kind "stack_result_err_payload" [ ("parent", parent) ])
+      else
+        Ok
+          (kind "boxed_stack_result_err_payload"
+             [ ("parent", parent); ("result_type", str result_type) ])
   | Core.AccVariantField (parent_acc, "Ok", 0)
     when Option.fold ~none:false
            ~some:(fun ty ->
@@ -1960,11 +2121,57 @@ let tensor_parallel_layout_json ~reg ~loc ty =
     ->
       kind "pointer" []
 
-let call_kind_json ~reg path ~result_ty ~loc (call_kind : Core.call_kind) =
+let function_param_is_dropped (body : Core.core) (param : Core.core_param) =
+  Core.exists_tree
+    (fun expr ->
+      match expr.Core.desc with
+      | Core.CDrop (dropped, _ty, _body) -> Core.Var.equal dropped param.cp_name
+      | _ -> false)
+    body
+
+let consumed_param_indices_for_function (func : Core.core_func) =
+  match func.cf_body with
+  | None -> []
+  | Some body ->
+      let rec collect index acc = function
+        | [] -> List.rev acc
+        | param :: rest ->
+            let acc =
+              if function_param_is_dropped body param then index :: acc else acc
+            in
+            collect (index + 1) acc rest
+      in
+      collect 0 [] func.cf_params
+
+let collect_consumed_param_indices program =
+  let rec collect_decl acc (decl : Core.core_decl) =
+    match decl.cd_desc with
+    | Core.CDFunc func ->
+        let consumed = consumed_param_indices_for_function func in
+        if List.is_empty consumed then acc else (func.cf_def_id, consumed) :: acc
+    | Core.CDPrivate inner -> collect_decl acc inner
+    | Core.CDVar _ | Core.CDImpl _ | Core.CDTrait _ | Core.CDType _
+    | Core.CDRecord _ | Core.CDImport _ | Core.CDTypeAlias _ ->
+        acc
+  in
+  List.fold_left collect_decl [] program
+
+let consumed_args_for_user_call consumed_params def_id =
+  match def_id with
+  | Some id -> Option.value ~default:[] (List.assoc_opt id consumed_params)
+  | None -> []
+
+let call_kind_json ~consumed_params ~reg path ~result_ty ~loc
+    (call_kind : Core.call_kind) =
   match call_kind with
   | Core.CKUser (name, def_id) ->
       Ok
-        (kind "user" [ ("name", str name); ("def_id", option_int_json def_id) ])
+        (kind "user"
+           [
+             ("name", str name);
+             ("def_id", option_int_json def_id);
+             ("consumed_args", int_list_json (consumed_args_for_user_call consumed_params def_id));
+           ])
   | Core.CKForeign foreign ->
       Ok
         (kind "foreign"
@@ -2003,19 +2210,21 @@ let call_kind_json ~reg path ~result_ty ~loc (call_kind : Core.call_kind) =
                      ( "layout",
                        tensor_parallel_layout_json ~reg ~loc result_ty );
                    ])
-          | None when channel_attempt_builtin_supported name ->
+          | None when channel_semantic_builtin_supported name ->
               Ok (kind "builtin" [ ("name", str name) ])
-          | None when direct_builtin_supported name ->
-              Ok (kind "builtin" [ ("name", str name) ])
+          | None -> (
+              match direct_runtime_abi ~reg ~loc result_ty name with
+              | Some abi -> Ok (direct_runtime_call_kind_json abi)
           | None -> unsupported path ("builtin call " ^ name))
+      )
       )
   | Core.CKIntrinsic name -> Ok (kind "intrinsic" [ ("name", str name) ])
   | Core.CKClosure -> Ok (kind "closure" [])
   | Core.CKUnknown -> unsupported path "unresolved call kind"
   | Core.CKSelectedDirect _ -> unsupported path "selected direct call kind"
 
-let call_kind_json_for_call ~function_names ~reg path ~result_ty ~loc call_kind
-    (args : Core.core list) =
+let call_kind_json_for_call ~function_names ~consumed_params ~reg path ~result_ty
+    ~loc call_kind (args : Core.core list) =
   match (call_kind, args) with
   | Core.CKBuiltin "blorp_list_to_string_cb", [ list_arg ] ->
       let* callback_name =
@@ -2035,7 +2244,7 @@ let call_kind_json_for_call ~function_names ~reg path ~result_ty ~loc call_kind
           unsupported path
             (Printf.sprintf "blorp_dict_with_capacity_custom on non-Dict type %s"
                (Types.type_to_string other)))
-  | _ -> call_kind_json ~reg path ~result_ty ~loc call_kind
+  | _ -> call_kind_json ~consumed_params ~reg path ~result_ty ~loc call_kind
 
 let require_closure_create ~reg path (closure : Core.closure_create) =
   require_supported_closure_captures ~reg (path ^ ".captures") 0
@@ -2077,10 +2286,10 @@ let binop_tag = function
 let unop_tag = function Ast.Neg -> "negate" | Ast.Not -> "not"
 let logop_tag = function Ast.And -> "and" | Ast.Or -> "or"
 
-let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
-    value_record_names heap_record_names union_names enum_constructors path
-    (expr : Core.core) =
-  let expr_json = expr_json ~function_names in
+let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
+    ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    path (expr : Core.core) =
+  let expr_json = expr_json ~function_names ~consumed_params in
   let loc = source_loc_json expr.loc in
   let typed fields =
     let* typ =
@@ -2278,7 +2487,13 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
       let* fields =
         typed
           [
-            ("call_kind", kind "builtin" [ ("name", str builtin_name) ]);
+            ( "call_kind",
+              direct_runtime_call_kind_json
+                {
+                  direct_runtime_name = builtin_name;
+                  direct_runtime_args = DirectRuntimeArgsAsWritten;
+                  direct_runtime_result = DirectRuntimeResultAsWritten;
+                } );
             ("callee", callee_json);
             ("args", arr [ size_json ]);
           ]
@@ -2320,8 +2535,9 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
                (Types.type_to_string other)))
   | Core.CCall (call_kind, callee, args) ->
       let* call_kind_value =
-        call_kind_json_for_call ~function_names ~reg (path ^ ".call_kind")
-          ~result_ty:expr.ty ~loc:expr.loc call_kind args
+        call_kind_json_for_call ~function_names ~consumed_params ~reg
+          (path ^ ".call_kind") ~result_ty:expr.ty ~loc:expr.loc call_kind
+          args
       in
       let* callee_value =
         expr_json ~reg enum_names value_record_names heap_record_names union_names
@@ -2529,10 +2745,9 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
           enum_constructors (path ^ ".body") body
       in
       Ok
-        (kind "let"
+        (kind "borrow_let"
            [
              ("name", var_json binding.borrow_var);
-             ("mutable", bool false);
              ("type", typ);
              ("rhs", rhs);
              ("body", body);
@@ -7310,9 +7525,9 @@ and require_constructor_match_tree ~reg union_names scrut_ty path = function
           require_constructor_match_tree ~reg union_names scrut_ty
             (path ^ ".fallback") subtree)
 
-let function_json ~function_names ~reg ~enum_names ~value_record_names
-    ~heap_record_names ~union_names ~enum_constructors ~global_def_ids
-    ~global_names path loc
+let function_json ~function_names ~consumed_params ~reg ~enum_names
+    ~value_record_names ~heap_record_names ~union_names ~enum_constructors
+    ~global_def_ids ~global_names path loc
     (func : Core.core_func) =
   let* params =
     result_list func.cf_params (fun index param ->
@@ -7334,9 +7549,9 @@ let function_json ~function_names ~reg ~enum_names ~value_record_names
           let* () =
             require_function_body ~reg union_names (path ^ ".body") body
           in
-          expr_json ~function_names ~reg enum_names value_record_names
-            heap_record_names union_names enum_constructors (path ^ ".body")
-            body
+          expr_json ~function_names ~consumed_params ~reg enum_names
+            value_record_names heap_record_names union_names enum_constructors
+            (path ^ ".body") body
     | None -> Ok null
   in
   let* function_kind =
@@ -7364,7 +7579,7 @@ let function_json ~function_names ~reg ~enum_names ~value_record_names
 
 let project_global_decl (_global : Core.core_var) = true
 
-let global_json ~function_names ~reg enum_names value_record_names
+let global_json ~function_names ~consumed_params ~reg enum_names value_record_names
     heap_record_names union_names enum_constructors path loc
     (global : Core.core_var) =
   let* () = require_function_body ~reg union_names (path ^ ".init") global.cv_init in
@@ -7373,8 +7588,9 @@ let global_json ~function_names ~reg enum_names value_record_names
       global.cv_ty
   in
   let* init =
-    expr_json ~function_names ~reg enum_names value_record_names heap_record_names
-      union_names enum_constructors (path ^ ".init") global.cv_init
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names
+      heap_record_names union_names enum_constructors (path ^ ".init")
+      global.cv_init
   in
   Ok
     (kind "global"
@@ -7674,9 +7890,9 @@ let impl_method_c_name (impl : Core.core_impl) (method_func : Core.core_func) =
   in
   Printf.sprintf "%s_%s_%s" impl.ci_trait method_func.cf_name type_name
 
-let impl_method_jsons ~function_names ~reg ~enum_names ~value_record_names
-    ~heap_record_names ~union_names ~enum_constructors ~global_def_ids
-    ~global_names path loc
+let impl_method_jsons ~function_names ~consumed_params ~reg ~enum_names
+    ~value_record_names ~heap_record_names ~union_names ~enum_constructors
+    ~global_def_ids ~global_names path loc
     (impl : Core.core_impl) =
   if Codegen_types.has_type_vars impl.ci_for_type then Ok []
   else
@@ -7691,16 +7907,16 @@ let impl_method_jsons ~function_names ~reg ~enum_names ~value_record_names
             collect acc (index + 1) rest
           else
             let* json =
-              function_json ~function_names ~reg ~enum_names
+              function_json ~function_names ~consumed_params ~reg ~enum_names
                 ~value_record_names ~heap_record_names ~union_names
-                ~enum_constructors ~global_def_ids ~global_names method_path
-                loc method_func
+                ~enum_constructors ~global_def_ids ~global_names method_path loc
+                method_func
             in
             collect (json :: acc) (index + 1) rest
     in
     collect [] 0 impl.ci_methods
 
-let rec decl_jsons ~function_names ~reg enum_names value_record_names
+let rec decl_jsons ~function_names ~consumed_params ~reg enum_names value_record_names
     heap_record_names union_names enum_constructors global_def_ids
     global_names index (decl : Core.core_decl) =
   let path = Printf.sprintf "program.decls[%d]" index in
@@ -7709,9 +7925,9 @@ let rec decl_jsons ~function_names ~reg enum_names value_record_names
       Ok []
   | Core.CDFunc func ->
       let* json =
-        function_json ~function_names ~reg ~enum_names ~value_record_names
-          ~heap_record_names ~union_names ~enum_constructors ~global_def_ids
-          ~global_names path decl.cd_loc func
+        function_json ~function_names ~consumed_params ~reg ~enum_names
+          ~value_record_names ~heap_record_names ~union_names ~enum_constructors
+          ~global_def_ids ~global_names path decl.cd_loc func
       in
       Ok [ json ]
   | Core.CDType type_decl
@@ -7742,21 +7958,21 @@ let rec decl_jsons ~function_names ~reg enum_names value_record_names
   | Core.CDRecord _ ->
       Ok []
   | Core.CDPrivate inner ->
-      decl_jsons ~function_names ~reg enum_names value_record_names
+      decl_jsons ~function_names ~consumed_params ~reg enum_names value_record_names
         heap_record_names union_names enum_constructors global_def_ids
         global_names index inner
   | Core.CDVar global when project_global_decl global ->
       let* json =
-        global_json ~function_names ~reg enum_names value_record_names
-          heap_record_names union_names enum_constructors path decl.cd_loc
-          global
+        global_json ~function_names ~consumed_params ~reg enum_names
+          value_record_names heap_record_names union_names enum_constructors path
+          decl.cd_loc global
       in
       Ok [ json ]
   | Core.CDVar _ -> Ok []
   | Core.CDImpl impl ->
-      impl_method_jsons ~function_names ~reg ~enum_names ~value_record_names
-        ~heap_record_names ~union_names ~enum_constructors ~global_def_ids
-        ~global_names path decl.cd_loc impl
+      impl_method_jsons ~function_names ~consumed_params ~reg ~enum_names
+        ~value_record_names ~heap_record_names ~union_names ~enum_constructors
+        ~global_def_ids ~global_names path decl.cd_loc impl
 
 let program_json ~reg (program : Core.core_program) =
   let rec collect_enum_names names (decl : Core.core_decl) =
@@ -7884,6 +8100,7 @@ let program_json ~reg (program : Core.core_program) =
   let function_names =
     List.fold_left collect_function_names StringSet.empty program
   in
+  let consumed_params = collect_consumed_param_indices program in
   let unsupported_global_def_ids =
     IntSet.diff all_global_def_ids projected_global_def_ids
   in
@@ -7894,8 +8111,8 @@ let program_json ~reg (program : Core.core_program) =
     | [] -> Ok (arr (List.rev acc))
     | decl :: rest -> (
         match
-          decl_jsons ~function_names ~reg enum_names value_record_names
-            heap_record_names union_names enum_constructors
+          decl_jsons ~function_names ~consumed_params ~reg enum_names
+            value_record_names heap_record_names union_names enum_constructors
             unsupported_global_def_ids unsupported_global_names index decl
         with
         | Ok jsons -> collect (List.rev_append jsons acc) (index + 1) rest

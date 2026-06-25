@@ -1058,6 +1058,21 @@ static inline blorp_StackResult blorp_stack_result_from_boxed(blorp_Result* res)
     return out;
 }
 
+static inline blorp_StackResult blorp_stack_result_borrow_from_boxed(const blorp_Result* res) {
+    if (!res) {
+        return (blorp_StackResult){ .tag = BLORP_TAG_ERR, .release_mask = 0UL, .data.Err.field0 = NULL };
+    }
+    blorp_StackResult out;
+    out.tag = res->tag;
+    out.release_mask = res->release_mask & 1UL;
+    if (res->tag == BLORP_TAG_OK) {
+        out.data.Ok.field0 = res->data.Ok.field0;
+    } else {
+        out.data.Err.field0 = res->data.Err.field0;
+    }
+    return out;
+}
+
 static inline bool blorp_is_unique(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return false;
     blorp_Object* header = (blorp_Object*)obj;
@@ -2339,11 +2354,11 @@ blorp_String* blorp_md5(blorp_String* s);
 blorp_String* blorp_sha1(blorp_String* s);
 blorp_String* blorp_sha512(blorp_String* s);
 long blorp_crc32(blorp_String* s);
-blorp_String* blorp_sha256_bytes(blorp_String* b);
-blorp_String* blorp_md5_bytes(blorp_String* b);
-blorp_String* blorp_sha1_bytes(blorp_String* b);
-blorp_String* blorp_sha512_bytes(blorp_String* b);
-long blorp_crc32_bytes(blorp_String* b);
+blorp_String* blorp_sha256_bytes(blorp_Bytes* b);
+blorp_String* blorp_md5_bytes(blorp_Bytes* b);
+blorp_String* blorp_sha1_bytes(blorp_Bytes* b);
+blorp_String* blorp_sha512_bytes(blorp_Bytes* b);
+long blorp_crc32_bytes(blorp_Bytes* b);
 blorp_String* blorp_hmac_sha256(blorp_String* key, blorp_String* msg);
 
 // SIMD Vector Operations (non-static in runtime.o)

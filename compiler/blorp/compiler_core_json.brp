@@ -98,6 +98,18 @@ private FOREIGN_BYTES_COPY_TAG: String = "bytes"
 
 private BUILTIN_CALL_TAG: String = "builtin"
 
+private DIRECT_RUNTIME_CALL_TAG: String = "direct_runtime"
+
+private DIRECT_RUNTIME_ARGS_AS_WRITTEN_TAG: String = "as_written"
+
+private DIRECT_RUNTIME_ARGS_LIST_PARALLEL_LAYOUT_TAG: String = "list_parallel_layout"
+
+private DIRECT_RUNTIME_RESULT_AS_WRITTEN_TAG: String = "as_written"
+
+private DIRECT_RUNTIME_RESULT_CAST_TAG: String = "cast"
+
+private DIRECT_RUNTIME_RESULT_STACK_RESULT_FROM_BOXED_TAG: String = "stack_result_from_boxed"
+
 private OPERATION_RESULT_CALL_TAG: String = "operation_result"
 
 private FALLIBLE_STREAM_TERMINAL_CALL_TAG: String = "fallible_stream_terminal"
@@ -215,6 +227,8 @@ private TENSOR_RAW_READ_EXPR_TAG: String = "tensor_raw_read"
 private TENSOR_RAW_WRITE_EXPR_TAG: String = "tensor_raw_write"
 
 private TENSOR_RAW_VIEW_LET_EXPR_TAG: String = "tensor_raw_view_let"
+
+private BORROW_LET_EXPR_TAG: String = "borrow_let"
 
 private TENSOR_LITERAL_EXPR_TAG: String = "tensor_literal"
 
@@ -502,6 +516,10 @@ private STACK_RESULT_OK_PAYLOAD_ACCESSOR_TAG: String = "stack_result_ok_payload"
 
 private STACK_RESULT_ERR_PAYLOAD_ACCESSOR_TAG: String = "stack_result_err_payload"
 
+private BOXED_STACK_RESULT_OK_PAYLOAD_ACCESSOR_TAG: String = "boxed_stack_result_ok_payload"
+
+private BOXED_STACK_RESULT_ERR_PAYLOAD_ACCESSOR_TAG: String = "boxed_stack_result_err_payload"
+
 private BOXED_RESULT_OK_PAYLOAD_ACCESSOR_TAG: String = "boxed_result_ok_payload"
 
 private BOXED_RESULT_ERR_PAYLOAD_ACCESSOR_TAG: String = "boxed_result_err_payload"
@@ -709,10 +727,38 @@ union CoreTensorParallelLayout:
 	TensorParallelInlineStructLayout(String)
 
 
+record CoreDirectRuntimeListLayoutArgs {
+	semantic_arity: Int,
+	runtime_arity: Int,
+	storage_mode: String,
+	elem_size: String,
+	value_encoding: String
+}
+
+
+union CoreDirectRuntimeArgs:
+	DirectRuntimeArgsAsWritten
+	DirectRuntimeArgsAppendListParallelLayout(CoreDirectRuntimeListLayoutArgs)
+
+
+union CoreDirectRuntimeResult:
+	DirectRuntimeResultAsWritten
+	DirectRuntimeResultCast(String)
+	DirectRuntimeResultStackResultFromBoxed
+
+
+record CoreDirectRuntimeCall {
+	name: String,
+	args: CoreDirectRuntimeArgs,
+	result: CoreDirectRuntimeResult
+}
+
+
 union CoreCallKind:
-	UserCall(String, Option[Int])
+	UserCall(String, Option[Int], List[Int])
 	ForeignCall(String, CoreForeignArgPassing)
 	BuiltinCall(String)
+	DirectRuntimeCall(CoreDirectRuntimeCall)
 	OperationResultCall(CoreOperationResultBridge)
 	FallibleStreamTerminalCall(CoreFallibleStreamTerminalBridge)
 	TensorParallelCall(String, CoreTensorParallelLayout)
@@ -890,6 +936,7 @@ union CoreExpr:
 	DupExpr(CoreVar, CoreType, CoreRetainPolicy, CoreExpr, CoreType, CoreSourceLoc)
 	DropExpr(CoreVar, CoreType, CoreReleasePolicy, CoreExpr, CoreType, CoreSourceLoc)
 	LetExpr(CoreVar, Bool, CoreType, CoreExpr, CoreExpr)
+	BorrowLetExpr(CoreVar, CoreType, CoreExpr, CoreExpr)
 	SeqExpr(CoreExpr, CoreExpr)
 	WhileExpr(CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
 	BreakExpr(CoreType, CoreSourceLoc)
@@ -1423,8 +1470,8 @@ union CoreConstructorMatchTest:
 	NullableOptionNoneConstructorTest
 	StackOptionSomeConstructorTest(String)
 	StackOptionNoneConstructorTest(String)
-	StackResultOkConstructorTest
-	StackResultErrConstructorTest
+	StackResultOkConstructorTest(String)
+	StackResultErrConstructorTest(String)
 	BoxedResultOkConstructorTest
 	BoxedResultErrConstructorTest
 	BoolTrueConstructorTest
@@ -1439,6 +1486,8 @@ union CoreAccessor:
 	StackOptionPayloadAccessor(CoreAccessor)
 	StackResultOkPayloadAccessor(CoreAccessor)
 	StackResultErrPayloadAccessor(CoreAccessor)
+	BoxedStackResultOkPayloadAccessor(CoreAccessor, String)
+	BoxedStackResultErrPayloadAccessor(CoreAccessor, String)
 	BoxedResultOkPayloadAccessor(CoreAccessor)
 	BoxedResultErrPayloadAccessor(CoreAccessor)
 	TupleFieldAccessor(CoreAccessor, Int, CoreType)
@@ -2923,13 +2972,117 @@ pure func decode_tensor_parallel_layout_json(
 		Err(CoreUnsupportedTag(path, tag))
 
 
+pure func direct_runtime_args_to_json(args: CoreDirectRuntimeArgs) -> JsonValue:
+	match args:
+		DirectRuntimeArgsAsWritten:
+			JsonObject([(KIND_FIELD, JsonString(DIRECT_RUNTIME_ARGS_AS_WRITTEN_TAG))])
+		DirectRuntimeArgsAppendListParallelLayout(layout):
+			JsonObject([
+				(KIND_FIELD, JsonString(DIRECT_RUNTIME_ARGS_LIST_PARALLEL_LAYOUT_TAG)),
+				("semantic_arity", JsonNumber(to_float(layout.semantic_arity))),
+				("runtime_arity", JsonNumber(to_float(layout.runtime_arity))),
+				("storage_mode", JsonString(layout.storage_mode)),
+				("elem_size", JsonString(layout.elem_size)),
+				("value_encoding", JsonString(layout.value_encoding)),
+			])
+
+
+pure func decode_direct_runtime_args_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreDirectRuntimeArgs, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == DIRECT_RUNTIME_ARGS_AS_WRITTEN_TAG:
+		Ok(DirectRuntimeArgsAsWritten)
+	else if tag == DIRECT_RUNTIME_ARGS_LIST_PARALLEL_LAYOUT_TAG:
+		semantic_arity ?= int_field(value, path, "semantic_arity")
+		runtime_arity ?= int_field(value, path, "runtime_arity")
+		storage_mode ?= string_field(value, path, "storage_mode")
+		elem_size ?= string_field(value, path, "elem_size")
+		value_encoding ?= string_field(value, path, "value_encoding")
+		Ok(DirectRuntimeArgsAppendListParallelLayout({
+			semantic_arity = semantic_arity,
+			runtime_arity = runtime_arity,
+			storage_mode = storage_mode,
+			elem_size = elem_size,
+			value_encoding = value_encoding,
+		}))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+pure func direct_runtime_result_to_json(result: CoreDirectRuntimeResult) -> JsonValue:
+	match result:
+		DirectRuntimeResultAsWritten:
+			JsonObject([(KIND_FIELD, JsonString(DIRECT_RUNTIME_RESULT_AS_WRITTEN_TAG))])
+		DirectRuntimeResultCast(c_type):
+			JsonObject([
+				(KIND_FIELD, JsonString(DIRECT_RUNTIME_RESULT_CAST_TAG)),
+				("c_type", JsonString(c_type)),
+			])
+		DirectRuntimeResultStackResultFromBoxed:
+			JsonObject(
+				[(KIND_FIELD, JsonString(DIRECT_RUNTIME_RESULT_STACK_RESULT_FROM_BOXED_TAG))],
+			)
+
+
+pure func decode_direct_runtime_result_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreDirectRuntimeResult, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == DIRECT_RUNTIME_RESULT_AS_WRITTEN_TAG:
+		Ok(DirectRuntimeResultAsWritten)
+	else if tag == DIRECT_RUNTIME_RESULT_CAST_TAG:
+		c_type ?= string_field(value, path, "c_type")
+		Ok(DirectRuntimeResultCast(c_type))
+	else if tag == DIRECT_RUNTIME_RESULT_STACK_RESULT_FROM_BOXED_TAG:
+		Ok(DirectRuntimeResultStackResultFromBoxed)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+pure func direct_runtime_call_to_json(call: CoreDirectRuntimeCall) -> JsonValue:
+	JsonObject([
+		("name", JsonString(call.name)),
+		("args", direct_runtime_args_to_json(call.args)),
+		("result", direct_runtime_result_to_json(call.result)),
+	])
+
+
+pure func decode_direct_runtime_call_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreDirectRuntimeCall, CoreJsonError]:
+	name ?= string_field(value, path, "name")
+	args_json ?= object_field(value, path, "args")
+	args ?= decode_direct_runtime_args_json(
+		args_json,
+		path_field(path, "args"),
+	)
+	result_json ?= object_field(value, path, "result")
+	result ?= decode_direct_runtime_result_json(
+		result_json,
+		path_field(path, "result"),
+	)
+
+	Ok({
+		name = name,
+		args = args,
+		result = result,
+	})
+
+
 pure func core_call_kind_to_json(kind: CoreCallKind) -> JsonValue:
 	match kind:
-		UserCall(name, def_id):
+		UserCall(name, def_id, consumed_args):
 			JsonObject([
 				(KIND_FIELD, JsonString(USER_CALL_TAG)),
 				("name", JsonString(name)),
 				("def_id", option_int_to_json(def_id)),
+				("consumed_args", ints_to_json(consumed_args)),
 			])
 		ForeignCall(name, arg_passing):
 			JsonObject([
@@ -2941,6 +3094,11 @@ pure func core_call_kind_to_json(kind: CoreCallKind) -> JsonValue:
 			JsonObject([
 				(KIND_FIELD, JsonString(BUILTIN_CALL_TAG)),
 				("name", JsonString(name)),
+			])
+		DirectRuntimeCall(call):
+			JsonObject([
+				(KIND_FIELD, JsonString(DIRECT_RUNTIME_CALL_TAG)),
+				("call", direct_runtime_call_to_json(call)),
 			])
 		OperationResultCall(bridge):
 			JsonObject([
@@ -2986,7 +3144,8 @@ pure func decode_core_call_kind_json(
 	if tag == USER_CALL_TAG:
 		name ?= string_field(value, path, "name")
 		def_id ?= decode_optional_int(value, path, "def_id")
-		Ok(UserCall(name, def_id))
+		consumed_args ?= decode_int_list(value, path, "consumed_args")
+		Ok(UserCall(name, def_id, consumed_args))
 	else if tag == FOREIGN_CALL_TAG:
 		name ?= string_field(value, path, "name")
 		arg_passing_json ?= object_field(value, path, "arg_passing")
@@ -2998,6 +3157,13 @@ pure func decode_core_call_kind_json(
 	else if tag == BUILTIN_CALL_TAG:
 		name ?= string_field(value, path, "name")
 		Ok(BuiltinCall(name))
+	else if tag == DIRECT_RUNTIME_CALL_TAG:
+		call_json ?= object_field(value, path, "call")
+		call ?= decode_direct_runtime_call_json(
+			call_json,
+			path_field(path, "call"),
+		)
+		Ok(DirectRuntimeCall(call))
 	else if tag == OPERATION_RESULT_CALL_TAG:
 		bridge_json ?= object_field(value, path, "bridge")
 		bridge ?= decode_operation_result_bridge_json(
@@ -6203,10 +6369,16 @@ pure func core_constructor_match_test_to_json(test: CoreConstructorMatchTest) ->
 				(KIND_FIELD, JsonString(STACK_OPTION_NONE_CONSTRUCTOR_TEST_TAG)),
 				("option_type", JsonString(option_type)),
 			])
-		StackResultOkConstructorTest:
-			JsonObject([(KIND_FIELD, JsonString(STACK_RESULT_OK_CONSTRUCTOR_TEST_TAG))])
-		StackResultErrConstructorTest:
-			JsonObject([(KIND_FIELD, JsonString(STACK_RESULT_ERR_CONSTRUCTOR_TEST_TAG))])
+		StackResultOkConstructorTest(result_type):
+			JsonObject([
+				(KIND_FIELD, JsonString(STACK_RESULT_OK_CONSTRUCTOR_TEST_TAG)),
+				("result_type", JsonString(result_type)),
+			])
+		StackResultErrConstructorTest(result_type):
+			JsonObject([
+				(KIND_FIELD, JsonString(STACK_RESULT_ERR_CONSTRUCTOR_TEST_TAG)),
+				("result_type", JsonString(result_type)),
+			])
 		BoxedResultOkConstructorTest:
 			JsonObject([(KIND_FIELD, JsonString(BOXED_RESULT_OK_CONSTRUCTOR_TEST_TAG))])
 		BoxedResultErrConstructorTest:
@@ -6241,9 +6413,11 @@ pure func decode_core_constructor_match_test_json(
 		option_type ?= string_field(value, path, "option_type")
 		Ok(StackOptionNoneConstructorTest(option_type))
 	else if tag == STACK_RESULT_OK_CONSTRUCTOR_TEST_TAG:
-		Ok(StackResultOkConstructorTest)
+		result_type ?= string_field(value, path, "result_type")
+		Ok(StackResultOkConstructorTest(result_type))
 	else if tag == STACK_RESULT_ERR_CONSTRUCTOR_TEST_TAG:
-		Ok(StackResultErrConstructorTest)
+		result_type ?= string_field(value, path, "result_type")
+		Ok(StackResultErrConstructorTest(result_type))
 	else if tag == BOXED_RESULT_OK_CONSTRUCTOR_TEST_TAG:
 		Ok(BoxedResultOkConstructorTest)
 	else if tag == BOXED_RESULT_ERR_CONSTRUCTOR_TEST_TAG:
@@ -6295,6 +6469,18 @@ pure func core_accessor_to_json(accessor: CoreAccessor) -> JsonValue:
 			JsonObject([
 				(KIND_FIELD, JsonString(STACK_RESULT_ERR_PAYLOAD_ACCESSOR_TAG)),
 				("parent", core_accessor_to_json(parent)),
+			])
+		BoxedStackResultOkPayloadAccessor(parent, result_type):
+			JsonObject([
+				(KIND_FIELD, JsonString(BOXED_STACK_RESULT_OK_PAYLOAD_ACCESSOR_TAG)),
+				("parent", core_accessor_to_json(parent)),
+				("result_type", JsonString(result_type)),
+			])
+		BoxedStackResultErrPayloadAccessor(parent, result_type):
+			JsonObject([
+				(KIND_FIELD, JsonString(BOXED_STACK_RESULT_ERR_PAYLOAD_ACCESSOR_TAG)),
+				("parent", core_accessor_to_json(parent)),
+				("result_type", JsonString(result_type)),
 			])
 		BoxedResultOkPayloadAccessor(parent):
 			JsonObject([
@@ -6383,6 +6569,22 @@ pure func decode_core_accessor_json(
 			path_field(path, "parent"),
 		)
 		Ok(StackResultErrPayloadAccessor(parent))
+	else if tag == BOXED_STACK_RESULT_OK_PAYLOAD_ACCESSOR_TAG:
+		parent_json ?= object_field(value, path, "parent")
+		parent ?= decode_core_accessor_json(
+			parent_json,
+			path_field(path, "parent"),
+		)
+		result_type ?= string_field(value, path, "result_type")
+		Ok(BoxedStackResultOkPayloadAccessor(parent, result_type))
+	else if tag == BOXED_STACK_RESULT_ERR_PAYLOAD_ACCESSOR_TAG:
+		parent_json ?= object_field(value, path, "parent")
+		parent ?= decode_core_accessor_json(
+			parent_json,
+			path_field(path, "parent"),
+		)
+		result_type ?= string_field(value, path, "result_type")
+		Ok(BoxedStackResultErrPayloadAccessor(parent, result_type))
 	else if tag == BOXED_RESULT_OK_PAYLOAD_ACCESSOR_TAG:
 		parent_json ?= object_field(value, path, "parent")
 		parent ?= decode_core_accessor_json(
@@ -7496,6 +7698,14 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 				("rhs", core_expr_to_json(rhs)),
 				("body", core_expr_to_json(body)),
 			])
+		BorrowLetExpr(name, typ, rhs, body):
+			JsonObject([
+				(KIND_FIELD, JsonString(BORROW_LET_EXPR_TAG)),
+				("name", core_var_to_json(name)),
+				("type", core_type_to_json(typ)),
+				("rhs", core_expr_to_json(rhs)),
+				("body", core_expr_to_json(body)),
+			])
 		SeqExpr(first, second):
 			JsonObject([
 				(KIND_FIELD, JsonString(SEQ_EXPR_TAG)),
@@ -8601,6 +8811,28 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 			path_field(path, "body"),
 		)
 		Ok(LetExpr(name, is_mutable, typ, rhs, body))
+	else if tag == BORROW_LET_EXPR_TAG:
+		name_json ?= object_field(value, path, "name")
+		name ?= decode_core_var_json(
+			name_json,
+			path_field(path, "name"),
+		)
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(
+			type_json,
+			path_field(path, "type"),
+		)
+		rhs_json ?= object_field(value, path, "rhs")
+		rhs ?= decode_core_expr_json(
+			rhs_json,
+			path_field(path, "rhs"),
+		)
+		body_json ?= object_field(value, path, "body")
+		body ?= decode_core_expr_json(
+			body_json,
+			path_field(path, "body"),
+		)
+		Ok(BorrowLetExpr(name, typ, rhs, body))
 	else if tag == SEQ_EXPR_TAG:
 		first_json ?= object_field(value, path, "first")
 		first ?= decode_core_expr_json(

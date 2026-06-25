@@ -433,7 +433,7 @@ let can_emit_static_string_global (v : core_var) =
   | _ -> false
 
 let c_static_literal_initializer = function
-  | Ast.LitInt n -> Some (Printf.sprintf "%LdL" n)
+  | Ast.LitInt n -> Some (int64_c_literal n)
   | Ast.LitInt128 digits ->
       let base = "1000000000000000000" in
       let len = String.length digits in

@@ -386,12 +386,17 @@ let test_desugar_interp_empty () =
 
 let emit_program_to_string (prog : core_program) : string =
   (* A4.2: resolve populates [vdef_id] on [CVar] references to
-     user-declared symbols, so the emit pass mangles call sites to
-     match their decl sites. *)
+     user-declared symbols before emission. *)
   let resolved = Blorp.Core_resolve.resolve_program prog in
-  let ctx = Blorp.Core_emit_context.create () in
-  Blorp.Core_emit.emit_program ctx resolved;
-  Buffer.contents ctx.output
+  let reg = Blorp.Codegen_types.create_registry () in
+  let cfg =
+    Blorp.Core_emit_blorp_c.config_with_embed ~embed_runtime:false ~reg ()
+  in
+  match Blorp.Core_emit_blorp_c.emit_program_string cfg resolved with
+  | Ok c_code -> c_code
+  | Error err ->
+      Alcotest.failf "Blorp C emission failed: %s"
+        (Blorp.Core_emit_blorp_c.unsupported_to_string err)
 
 let test_e2e_record_update () =
   (* struct Pair { a: Int, b: Int }
@@ -464,10 +469,8 @@ let test_e2e_record_update () =
   in
   let desugared = Blorp.Core_desugar.desugar_program prog in
   let c_body = emit_program_to_string desugared in
-  (* A4.2: entry symbol is mangled __def_0_compute (cf_def_id = 0). *)
   let c_program =
-    Printf.sprintf "%s\nint main(void) { return (int)__def_0_compute(); }\n"
-      c_body
+    Printf.sprintf "%s\nint main(void) { return (int)compute(); }\n" c_body
   in
   let base = Filename.temp_file "blorp_desugar_e2e" "" in
   let src = base ^ ".c" in

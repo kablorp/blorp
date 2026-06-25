@@ -7953,6 +7953,21 @@ static inline blorp_StackResult blorp_stack_result_from_boxed(blorp_Result* res)
     return out;
 }
 
+static inline blorp_StackResult blorp_stack_result_borrow_from_boxed(const blorp_Result* res) {
+    if (!res) {
+        return (blorp_StackResult){ .tag = BLORP_TAG_ERR, .release_mask = 0UL, .data.Err.field0 = NULL };
+    }
+    blorp_StackResult out;
+    out.tag = res->tag;
+    out.release_mask = res->release_mask & 1UL;
+    if (res->tag == BLORP_TAG_OK) {
+        out.data.Ok.field0 = res->data.Ok.field0;
+    } else {
+        out.data.Err.field0 = res->data.Err.field0;
+    }
+    return out;
+}
+
 blorp_Result* blorp_result_ok(void* value) {
     blorp_Result* res = (blorp_Result*)blorp_alloc(sizeof(blorp_Result));
     BLORP_TAG(res, "Result");
@@ -37664,14 +37679,14 @@ long blorp_hash_bytes(blorp_String* b) {
 // SHA-256
 static void blorp_sha256_transform(uint32_t state[8], const uint8_t block[64]) {
     static const uint32_t k[64] = {
-        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+        0x428a2f98U,0x71374491U,0xb5c0fbcfU,0xe9b5dba5U,0x3956c25bU,0x59f111f1U,0x923f82a4U,0xab1c5ed5U,
+        0xd807aa98U,0x12835b01U,0x243185beU,0x550c7dc3U,0x72be5d74U,0x80deb1feU,0x9bdc06a7U,0xc19bf174U,
+        0xe49b69c1U,0xefbe4786U,0x0fc19dc6U,0x240ca1ccU,0x2de92c6fU,0x4a7484aaU,0x5cb0a9dcU,0x76f988daU,
+        0x983e5152U,0xa831c66dU,0xb00327c8U,0xbf597fc7U,0xc6e00bf3U,0xd5a79147U,0x06ca6351U,0x14292967U,
+        0x27b70a85U,0x2e1b2138U,0x4d2c6dfcU,0x53380d13U,0x650a7354U,0x766a0abbU,0x81c2c92eU,0x92722c85U,
+        0xa2bfe8a1U,0xa81a664bU,0xc24b8b70U,0xc76c51a3U,0xd192e819U,0xd6990624U,0xf40e3585U,0x106aa070U,
+        0x19a4c116U,0x1e376c08U,0x2748774cU,0x34b0bcb5U,0x391c0cb3U,0x4ed8aa4aU,0x5b9cca4fU,0x682e6ff3U,
+        0x748f82eeU,0x78a5636fU,0x84c87814U,0x8cc70208U,0x90befffaU,0xa4506cebU,0xbef9a3f7U,0xc67178f2U
     };
     uint32_t w[64], a, b, c, d, e, f, g, h;
     for (int i = 0; i < 16; i++)
@@ -37698,8 +37713,8 @@ static void blorp_sha256_transform(uint32_t state[8], const uint8_t block[64]) {
 
 blorp_String* blorp_sha256(blorp_String* s) {
     uint32_t state[8] = {
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U
     };
     const uint8_t* data = s ? (const uint8_t*)s->data : NULL;
     uint64_t len = s ? (uint64_t)s->len : 0;
@@ -37739,14 +37754,14 @@ blorp_String* blorp_sha256(blorp_String* s) {
 // MD5
 static void blorp_md5_transform(uint32_t state[4], const uint8_t block[64]) {
     static const uint32_t k[64] = {
-        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
-        0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
-        0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
-        0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
-        0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
-        0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
-        0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
-        0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+        0xd76aa478U,0xe8c7b756U,0x242070dbU,0xc1bdceeeU,0xf57c0fafU,0x4787c62aU,0xa8304613U,0xfd469501U,
+        0x698098d8U,0x8b44f7afU,0xffff5bb1U,0x895cd7beU,0x6b901122U,0xfd987193U,0xa679438eU,0x49b40821U,
+        0xf61e2562U,0xc040b340U,0x265e5a51U,0xe9b6c7aaU,0xd62f105dU,0x02441453U,0xd8a1e681U,0xe7d3fbc8U,
+        0x21e1cde6U,0xc33707d6U,0xf4d50d87U,0x455a14edU,0xa9e3e905U,0xfcefa3f8U,0x676f02d9U,0x8d2a4c8aU,
+        0xfffa3942U,0x8771f681U,0x6d9d6122U,0xfde5380cU,0xa4beea44U,0x4bdecfa9U,0xf6bb4b60U,0xbebfbc70U,
+        0x289b7ec6U,0xeaa127faU,0xd4ef3085U,0x04881d05U,0xd9d4d039U,0xe6db99e5U,0x1fa27cf8U,0xc4ac5665U,
+        0xf4292244U,0x432aff97U,0xab9423a7U,0xfc93a039U,0x655b59c3U,0x8f0ccc92U,0xffeff47dU,0x85845dd1U,
+        0x6fa87e4fU,0xfe2ce6e0U,0xa3014314U,0x4e0811a1U,0xf7537e82U,0xbd3af235U,0x2ad7d2bbU,0xeb86d391U
     };
     static const int s[64] = {
         7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
@@ -37774,7 +37789,7 @@ static void blorp_md5_transform(uint32_t state[4], const uint8_t block[64]) {
 }
 
 blorp_String* blorp_md5(blorp_String* s) {
-    uint32_t state[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    uint32_t state[4] = { 0x67452301U, 0xefcdab89U, 0x98badcfeU, 0x10325476U };
     const uint8_t* data = s ? (const uint8_t*)s->data : NULL;
     uint64_t len = s ? (uint64_t)s->len : 0;
     uint64_t bits = len * 8;
@@ -37823,10 +37838,10 @@ static void blorp_sha1_transform(uint32_t state[5], const uint8_t block[64]) {
     a=state[0]; b=state[1]; c=state[2]; d=state[3]; e=state[4];
     for (int i = 0; i < 80; i++) {
         uint32_t f, k;
-        if (i < 20)      { f = (b & c) | (~b & d); k = 0x5a827999; }
-        else if (i < 40) { f = b ^ c ^ d;           k = 0x6ed9eba1; }
-        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdc; }
-        else              { f = b ^ c ^ d;           k = 0xca62c1d6; }
+        if (i < 20)      { f = (b & c) | (~b & d); k = 0x5a827999U; }
+        else if (i < 40) { f = b ^ c ^ d;           k = 0x6ed9eba1U; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8f1bbcdcU; }
+        else              { f = b ^ c ^ d;           k = 0xca62c1d6U; }
         uint32_t temp = ((a<<5)|(a>>27)) + f + e + k + w[i];
         e = d; d = c; c = (b<<30)|(b>>2); b = a; a = temp;
     }
@@ -37834,7 +37849,7 @@ static void blorp_sha1_transform(uint32_t state[5], const uint8_t block[64]) {
 }
 
 blorp_String* blorp_sha1(blorp_String* s) {
-    uint32_t state[5] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0 };
+    uint32_t state[5] = { 0x67452301U, 0xefcdab89U, 0x98badcfeU, 0x10325476U, 0xc3d2e1f0U };
     const uint8_t* data = s ? (const uint8_t*)s->data : NULL;
     uint64_t len = s ? (uint64_t)s->len : 0;
     uint64_t bits = len * 8;
@@ -37967,7 +37982,7 @@ static void blorp_crc32_init(void) {
     for (int i = 0; i < 256; i++) {
         uint32_t crc = (uint32_t)i;
         for (int j = 0; j < 8; j++)
-            crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+            crc = (crc >> 1) ^ (0xEDB88320U & (-(crc & 1)));
         blorp_crc32_table[i] = crc;
     }
     blorp_crc32_table_init = 1;
@@ -37975,27 +37990,28 @@ static void blorp_crc32_init(void) {
 
 long blorp_crc32(blorp_String* s) {
     blorp_crc32_init();
-    uint32_t crc = 0xffffffff;
+    uint32_t crc = 0xffffffffU;
     if (s) {
         for (long i = 0; i < s->len; i++)
             crc = blorp_crc32_table[(crc ^ (uint8_t)s->data[i]) & 0xff] ^ (crc >> 8);
     }
-    return (long)(crc ^ 0xffffffff);
+    return (long)(crc ^ 0xffffffffU);
 }
 
-// _bytes variants (Bytes is same struct as String)
-blorp_String* blorp_sha256_bytes(blorp_String* b) { return blorp_sha256(b); }
-blorp_String* blorp_md5_bytes(blorp_String* b)    { return blorp_md5(b); }
-blorp_String* blorp_sha1_bytes(blorp_String* b)   { return blorp_sha1(b); }
-blorp_String* blorp_sha512_bytes(blorp_String* b) { return blorp_sha512(b); }
-long blorp_crc32_bytes(blorp_String* b)            { return blorp_crc32(b); }
+// Bytes and String share storage layout, but they are distinct runtime types.
+// Keep the ABI honest and isolate the layout cast inside the runtime.
+blorp_String* blorp_sha256_bytes(blorp_Bytes* b) { return blorp_sha256((blorp_String*)b); }
+blorp_String* blorp_md5_bytes(blorp_Bytes* b)    { return blorp_md5((blorp_String*)b); }
+blorp_String* blorp_sha1_bytes(blorp_Bytes* b)   { return blorp_sha1((blorp_String*)b); }
+blorp_String* blorp_sha512_bytes(blorp_Bytes* b) { return blorp_sha512((blorp_String*)b); }
+long blorp_crc32_bytes(blorp_Bytes* b)            { return blorp_crc32((blorp_String*)b); }
 
 // HMAC-SHA256
 // Internal: raw SHA-256 that returns 32 bytes into caller buffer
 static void blorp_sha256_raw(const uint8_t* data, uint64_t len, uint8_t out[32]) {
     uint32_t state[8] = {
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U
     };
     uint64_t bits = len * 8;
     uint64_t pos = 0;

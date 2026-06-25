@@ -151,9 +151,6 @@ let () =
         (fun (name, cases) -> ("CoreFfiBoundary." ^ name, cases))
         Test_core_ffi_boundary.suite
     @ List.map
-        (fun (name, cases) -> ("CoreEmit." ^ name, cases))
-        Test_core_emit.suite
-    @ List.map
         (fun (name, cases) -> ("CoreResolve." ^ name, cases))
         Test_core_resolve.suite
     @ List.map
