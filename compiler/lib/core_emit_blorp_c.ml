@@ -96,8 +96,13 @@ let supported_channel_attempt_builtins =
 let supported_tensor_runtime_builtins =
   StringSet.of_list
     [
+      "blorp_assert_shape_nullable";
       "blorp_tensor_add_scaled_f32_cow";
       "blorp_tensor_add_scaled_f64_cow";
+      "blorp_tensor_matrix_multiply_float";
+      "blorp_tensor_matrix_multiply_float16";
+      "blorp_tensor_matrix_multiply_float32";
+      "blorp_tensor_matrix_multiply_int";
       "blorp_tensor_matrix_vector_multiply_float";
       "blorp_tensor_matrix_vector_multiply_float16";
       "blorp_tensor_matrix_vector_multiply_float32";
@@ -106,6 +111,7 @@ let supported_tensor_runtime_builtins =
       "blorp_tensor_outer_float16";
       "blorp_tensor_outer_float32";
       "blorp_tensor_outer_int";
+      "blorp_tensor_transpose";
       "blorp_tensor_transposed_matrix_vector_multiply_float";
       "blorp_tensor_transposed_matrix_vector_multiply_float16";
       "blorp_tensor_transposed_matrix_vector_multiply_float32";
@@ -114,6 +120,7 @@ let supported_tensor_runtime_builtins =
       "blorp_vector_new_f32";
       "blorp_vector_new_f64";
       "blorp_vector_new_i64";
+      "blorp_vector_op";
       "blorp_simd_vector_add_f32";
       "blorp_simd_vector_add_f64";
       "blorp_simd_vector_div_f32";
@@ -131,6 +138,7 @@ let supported_tensor_runtime_builtins =
       "blorp_mzip_indexed_parallel";
       "blorp_mzip_parallel";
       "blorp_vector_add_i64";
+      "blorp_vector_cross_float";
       "blorp_vector_div_i64";
       "blorp_vector_map";
       "blorp_vector_mod_i64";
@@ -147,6 +155,9 @@ let supported_tensor_runtime_builtins =
       "blorp_vector_scalar_mul_i64";
       "blorp_vector_scalar_op_rev_float";
       "blorp_vector_scalar_op_rev_int";
+      "blorp_vector_scalar_op_float16";
+      "blorp_vector_scalar_op_rev_float16";
+      "blorp_vector_scalar_op_rev_float32";
       "blorp_vector_scalar_rev_div_f32";
       "blorp_vector_scalar_rev_div_f64";
       "blorp_vector_scalar_rev_div_i64";
@@ -354,10 +365,17 @@ let supported_primitive_runtime_builtins =
       "blorp_dict_new";
       "blorp_dict_new_float";
       "blorp_dict_new_string";
+      "blorp_dict_with_capacity";
+      "blorp_dict_with_capacity_float";
+      "blorp_dict_with_capacity_string";
       "blorp_dict_remove";
       "blorp_dir_close";
       "blorp_decode_utf8";
       "blorp_decode_utf8_nullable";
+      "blorp_debug_error";
+      "blorp_debug_info";
+      "blorp_debug_log_msg";
+      "blorp_debug_warn";
       "blorp_encode_utf8";
       "blorp_exec";
       "blorp_exec_output";
@@ -393,6 +411,7 @@ let supported_primitive_runtime_builtins =
       "blorp_from_char";
       "blorp_from_chars";
       "blorp_get_mem_stats";
+      "blorp_get_scheduler_stats";
       "blorp_getcwd";
       "blorp_getenv";
       "blorp_getenv_nullable";
@@ -409,8 +428,13 @@ let supported_primitive_runtime_builtins =
       "blorp_is_finite";
       "blorp_is_inf";
       "blorp_is_nan";
+      "blorp_list_to_string_bool";
+      "blorp_list_to_string_float";
+      "blorp_list_to_string_int";
+      "blorp_list_to_string_string";
       "blorp_lower";
       "blorp_max_threads";
+      "blorp_matrix_get_nullable";
       "blorp_mkdir";
       "blorp_mkstemp_path";
       "blorp_now_us";
@@ -421,6 +445,8 @@ let supported_primitive_runtime_builtins =
       "blorp_print";
       "blorp_print_error";
       "blorp_print_live_object_summary";
+      "blorp_process_run";
+      "blorp_process_shell";
       "blorp_puts";
       "blorp_refcount";
       "blorp_read_all_lines";
@@ -439,6 +465,7 @@ let supported_primitive_runtime_builtins =
       "blorp_remove_file";
       "blorp_rename";
       "blorp_reset_mem_stats";
+      "blorp_reset_scheduler_stats";
       "blorp_round";
       "blorp_set_add";
       "blorp_set_new";
@@ -447,6 +474,14 @@ let supported_primitive_runtime_builtins =
       "blorp_set_remove";
       "blorp_seed_random";
       "blorp_setenv";
+      "blorp_sha1";
+      "blorp_signal_hangup";
+      "blorp_signal_interrupt";
+      "blorp_signal_received";
+      "blorp_signal_raise";
+      "blorp_signal_terminate";
+      "blorp_signal_user1";
+      "blorp_signal_user2";
       "blorp_size_of";
       "blorp_sleep";
       "blorp_string_append";
@@ -482,6 +517,22 @@ let supported_primitive_runtime_builtins =
       "blorp_stream_for_each";
       "blorp_stream_from_list";
       "blorp_stream_from_range";
+      "blorp_stream_enumerate";
+      "blorp_stream_find";
+      "blorp_stream_find_int";
+      "blorp_stream_find_int8";
+      "blorp_stream_find_int16";
+      "blorp_stream_find_int32";
+      "blorp_stream_find_int64";
+      "blorp_stream_find_uint8";
+      "blorp_stream_find_uint16";
+      "blorp_stream_find_uint32";
+      "blorp_stream_find_uint64";
+      "blorp_stream_find_float";
+      "blorp_stream_find_bool";
+      "blorp_stream_find_char";
+      "blorp_stream_find_f32";
+      "blorp_stream_find_f16";
       "blorp_stream_find_nullable";
       "blorp_stream_map";
       "blorp_stream_repeat";
@@ -505,10 +556,18 @@ let supported_primitive_runtime_builtins =
       "blorp_string_eq";
       "blorp_vector_get_nullable";
       "blorp_tls_close_session";
+      "blorp_tls_native_available_raw";
       "blorp_tcp_close_listener";
       "blorp_tcp_close_stream";
       "blorp_tcp_connections_continue_on_error_raw";
       "blorp_tcp_connections_stop_on_error_raw";
+      "blorp_tcp_dns_name_raw";
+      "blorp_tcp_dns_name_text_raw";
+      "blorp_tcp_ipv4_raw";
+      "blorp_tcp_interface_scope_raw";
+      "blorp_tcp_interface_scope_text_raw";
+      "blorp_tcp_ip_text_raw";
+      "blorp_tcp_parse_ip_raw";
       "blorp_tcp_port_raw";
       "blorp_time_format";
       "blorp_time_from_iso";
@@ -531,6 +590,7 @@ let supported_primitive_runtime_builtins =
       "blorp_url_decode";
       "blorp_url_encode";
       "blorp_websocket_close_session";
+      "blorp_websocket_native_available_raw";
       "blorp_write_bytes";
       "blorp_write_file";
       "blorp_yield_now";
@@ -843,13 +903,16 @@ let rec type_json ~reg enum_names value_record_names heap_record_names union_nam
   | Ast.TyArray _ -> Ok (kind "tensor" [])
   | Ast.TyFunc _ ->
       Ok (kind "named" [ ("name", str "Closure"); ("args", arr []) ])
+  | Ast.TyVar name when Types.Dim.is_var_name name ->
+      Ok (kind "named" [ ("name", str "Int"); ("args", arr []) ])
   | Ast.TyVar name -> unsupported path ("type variable " ^ name)
   | Ast.TyBoundVar param ->
       unsupported path ("bound type variable " ^ param.param_name)
   | Ast.TySelf -> unsupported path "Self type"
   | Ast.TyVarDims name -> unsupported path ("variadic dimension " ^ name)
   | Ast.TyRange _ -> Ok (kind "range" [])
-  | Ast.TyDimOp _ -> unsupported path "dimension operation"
+  | Ast.TyDimOp _ ->
+      Ok (kind "named" [ ("name", str "Int"); ("args", arr []) ])
   | Ast.TyMeta id ->
       unsupported path ("unresolved type meta " ^ string_of_int id)
 
@@ -914,9 +977,11 @@ let static_scalar_global_literal_json path (literal : Ast.literal) =
 let primitive_tuple_field_type = function
   | Ast.TyNamed
       ( ( "Int" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16"
-        | "UInt32" | "UInt64" | "Bool" | "Char" ),
+        | "UInt32" | "UInt64" | "Float" | "Float32" | "Float16" | "Bool"
+        | "Char" ),
         [] ) ->
       true
+  | Ast.TyRange _ -> true
   | _ -> false
 
 let managed_pointer_tuple_field_type = function
@@ -930,8 +995,14 @@ let managed_pointer_tuple_field_type = function
   | Ast.TyArray _ -> true
   | _ -> false
 
-let supported_tuple_field_type ty =
-  primitive_tuple_field_type ty || managed_pointer_tuple_field_type ty
+let supported_tuple_field_type ?reg ty =
+  match reg with
+  | Some reg ->
+      let ty = Codegen_types.expand_alias ~reg ty in
+      primitive_tuple_field_type ty
+      || managed_pointer_tuple_field_type ty
+      || Core_layout_type.is_stack_option_type ~reg ty
+  | None -> primitive_tuple_field_type ty || managed_pointer_tuple_field_type ty
 
 let floating_tuple_field_projection_type = function
   | Ast.TyNamed (("Float" | "Float32" | "Float16"), []) -> true
@@ -951,9 +1022,12 @@ let pointer_tuple_field_type value_record_names heap_record_names union_names = 
   | Ast.TyFunc _ | Ast.TyTuple _ | Ast.TyArray _ -> true
   | _ -> false
 
-let supported_tuple_field_projection_type value_record_names heap_record_names
+let supported_tuple_field_projection_type ~reg value_record_names heap_record_names
     union_names ty =
-  supported_tuple_field_type ty
+  let ty = Codegen_types.expand_alias ~reg ty in
+  primitive_tuple_field_type ty
+  || managed_pointer_tuple_field_type ty
+  || Core_layout_type.is_stack_option_type ~reg ty
   || floating_tuple_field_projection_type ty
   || pointer_tuple_field_type value_record_names heap_record_names union_names ty
 
@@ -1367,6 +1441,7 @@ let scalar_closure_capture_type ~reg = function
         | "UInt32" | "UInt64" | "Bool" | "Char" ),
         [] ) ->
       true
+  | ty when Types.is_any_float_type ty -> true
   | Ast.TyNamed (name, []) when Codegen_types.is_enum_type reg name -> true
   | _ -> false
 
@@ -1381,6 +1456,10 @@ let managed_pointer_closure_capture_type ~reg = function
   | Ast.TyNamed (name, []) when Codegen_types.is_managed_type reg name -> true
   | _ -> false
 
+let unmanaged_pointer_closure_capture_type = function
+  | Ast.TyNamed ("Ptr", []) -> true
+  | _ -> false
+
 let value_record_closure_capture_type ~reg = function
   | Ast.TyNamed (name, []) when Hashtbl.mem reg.Codegen_types.value_records name ->
       true
@@ -1390,7 +1469,13 @@ let supported_closure_capture_type ~reg ty =
   let ty = Codegen_types.expand_alias ~reg ty in
   scalar_closure_capture_type ~reg ty
   || managed_pointer_closure_capture_type ~reg ty
+  || unmanaged_pointer_closure_capture_type ty
   || value_record_closure_capture_type ~reg ty
+
+let supported_resource_task_capture_type ~reg ty =
+  let ty = Codegen_types.expand_alias ~reg ty in
+  supported_closure_capture_type ~reg ty
+  || Core_layout_type.is_pointer_type ~reg ty
 
 let rec require_supported_closure_captures ~reg path index captures =
   match captures with
@@ -1401,16 +1486,35 @@ let rec require_supported_closure_captures ~reg path index captures =
       else
         unsupported
           (Printf.sprintf "%s[%d]" path index)
-          "unsupported closure capture type"
+          (Printf.sprintf "unsupported closure capture type %s"
+             (Types.type_to_string capture_ty))
+
+let rec require_supported_task_abi_captures ~reg moved_captures path index
+    captures =
+  match captures with
+  | [] -> Ok ()
+  | (capture_name, capture_ty) :: rest ->
+      let supported =
+        if List.mem capture_name moved_captures then
+          supported_resource_task_capture_type ~reg capture_ty
+        else supported_closure_capture_type ~reg capture_ty
+      in
+      if supported then
+        require_supported_task_abi_captures ~reg moved_captures path (index + 1)
+          rest
+      else
+        unsupported
+          (Printf.sprintf "%s[%d]" path index)
+          (Printf.sprintf "unsupported closure capture type %s"
+             (Types.type_to_string capture_ty))
 
 let require_closure_body_abi ~reg path (abi : Core.closure_abi) =
   match (abi.ca_captures, abi.ca_moved_captures, abi.ca_task_abi) with
-  | captures, [], false ->
+  | captures, moved_captures, true ->
+      require_supported_task_abi_captures ~reg moved_captures
+        (path ^ ".captures") 0 captures
+  | captures, _, false ->
       require_supported_closure_captures ~reg (path ^ ".captures") 0 captures
-  | [], _ :: _, _ -> unsupported path "closure body moved captures"
-  | [], [], true -> unsupported path "task closure ABI"
-  | _ :: _, _ :: _, _ -> unsupported path "closure body moved captures"
-  | _ :: _, [], true -> unsupported path "task closure ABI"
 
 let loop_range_direction_json = function
   | Core.RangeMayRunBackward -> str "may_run_backward"
@@ -1919,6 +2023,18 @@ let call_kind_json_for_call ~function_names ~reg path ~result_ty ~loc call_kind
           list_arg.ty
       in
       Ok (kind "list_to_string" [ ("callback_name", str callback_name) ])
+  | Core.CKBuiltin "blorp_dict_with_capacity_custom", [ _capacity ] -> (
+      match Core_codegen_prepare.canonical_type ~reg result_ty with
+      | Ast.TyNamed ("Dict", [ key_ty; _value_ty ]) ->
+          let* constructor_json =
+            custom_hash_container_constructor_json ~reg
+              (path ^ ".constructor") loc key_ty
+          in
+          Ok (kind "dict_with_capacity" [ ("constructor", constructor_json) ])
+      | other ->
+          unsupported path
+            (Printf.sprintf "blorp_dict_with_capacity_custom on non-Dict type %s"
+               (Types.type_to_string other)))
   | _ -> call_kind_json ~reg path ~result_ty ~loc call_kind
 
 let require_closure_create ~reg path (closure : Core.closure_create) =
@@ -2061,6 +2177,16 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
       in
       let* fields = typed [ ("set", set) ] in
       Ok (kind "list_handoff_set_owned" fields)
+  | Core.CCall (Core.CKIntrinsic "list_swap_slots", _callee, [ lst; i; j ]) ->
+      let layout =
+        Core_layout_type.list_storage_layout_of_type ~reg lst.ty lst.loc
+      in
+      let* swap =
+        list_swap_json ~reg enum_names value_record_names heap_record_names
+          union_names enum_constructors (path ^ ".swap") layout lst i j
+      in
+      let* fields = typed [ ("swap", swap) ] in
+      Ok (kind "list_swap" fields)
   | Core.CCall
       ( Core.CKIntrinsic "list_handoff_set_source_slot",
         _callee,
@@ -2345,7 +2471,7 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
 	          in
 	          if
 	            not
-	              (supported_tuple_field_projection_type value_record_names
+	              (supported_tuple_field_projection_type ~reg value_record_names
 	                 heap_record_names union_names field_ty)
 	          then
 	            unsupported path
@@ -2497,6 +2623,28 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
           in
           let* fields = typed [ ("for_list", for_list) ] in
           Ok (kind "for_list" fields)
+      | Ast.TyNamed ("String", _) ->
+          let* for_string =
+            for_string_json ~reg enum_names value_record_names heap_record_names
+              union_names enum_constructors (path ^ ".for_string") binder iter
+              body
+          in
+          let* fields = typed [ ("for_string", for_string) ] in
+          Ok (kind "for_string" fields)
+      | Ast.TyNamed ("Dict", _) ->
+          let* for_dict =
+            for_dict_json ~reg enum_names value_record_names heap_record_names
+              union_names enum_constructors (path ^ ".for_dict") binder iter body
+          in
+          let* fields = typed [ ("for_dict", for_dict) ] in
+          Ok (kind "for_dict" fields)
+      | Ast.TyNamed ("Set", _) ->
+          let* for_set =
+            for_set_json ~reg enum_names value_record_names heap_record_names
+              union_names enum_constructors (path ^ ".for_set") binder iter body
+          in
+          let* fields = typed [ ("for_set", for_set) ] in
+          Ok (kind "for_set" fields)
       | Ast.TyNamed ("Range", []) ->
           let range_field field_name =
             {
@@ -2558,7 +2706,10 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
           in
           let* fields = typed [ ("for_tensor", for_tensor) ] in
           Ok (kind "for_tensor" fields)
-      | _ -> unsupported path "non-range for loop")
+      | ty ->
+          unsupported path
+            (Printf.sprintf "non-range for loop over %s"
+               (Types.type_to_string ty)))
   | Core.CRange (lo, hi) -> (
       match expr.ty with
       | Ast.TyRange _ ->
@@ -3487,8 +3638,55 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
              ("body", body_value);
              ("loc", loc);
            ])
-  | Core.CTailrecLoop (Core.TailrecListSpreadLoop _) ->
-      unsupported path "list-spread tail-recursive loop"
+  | Core.CTailrecLoop
+      (Core.TailrecListSpreadLoop
+         {
+           tls_params;
+           tls_return_ty;
+           tls_list_index;
+           tls_list_param;
+           tls_cursor_var;
+           tls_body;
+         }) ->
+      let* params =
+        result_list tls_params (fun index param ->
+            param_json ~reg enum_names value_record_names heap_record_names union_names
+              (Printf.sprintf "%s.loop.params[%d]" path index)
+              param)
+      in
+      let* return_type =
+        type_json ~reg enum_names value_record_names heap_record_names union_names
+          (path ^ ".loop.return_type") tls_return_ty
+      in
+      let* list_param =
+        param_json ~reg enum_names value_record_names heap_record_names union_names
+          (path ^ ".loop.list_param") tls_list_param
+      in
+      let list_layout =
+        Core_layout_type.list_storage_layout_of_type ~reg tls_list_param.cp_ty
+          tls_list_param.cp_loc
+      in
+      let* layout = list_storage_layout_json list_layout in
+      let* body_value =
+        expr_json ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".loop.body") tls_body
+      in
+      Ok
+        (kind "tailrec_list_spread_loop"
+           [
+             ( "loop",
+               obj
+                 [
+                   ("params", params);
+                   ("return_type", return_type);
+                   ("list_index", int tls_list_index);
+                   ("list_param", list_param);
+                   ("cursor", var_json tls_cursor_var);
+                   ("layout", layout);
+                   ("body", body_value);
+                 ] );
+             ("loc", loc);
+           ])
   | Core.CTailrecRecur (Core.TailrecRecur { tr_args }) ->
       let* args_value =
         result_list tr_args (fun index arg ->
@@ -3499,8 +3697,30 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
       in
       let* fields = typed [ ("args", args_value) ] in
       Ok (kind "tailrec_recur" fields)
-  | Core.CTailrecRecur (Core.TailrecListSpreadRecur _) ->
-      unsupported path "list-spread tail-recursive recur"
+  | Core.CTailrecRecur
+      (Core.TailrecListSpreadRecur { tr_rebinds; tr_cursor_advance }) ->
+	      let* rebinds =
+	        result_list tr_rebinds (fun index (param_index, value) ->
+	            let* value_json =
+	              expr_json ~reg enum_names value_record_names heap_record_names
+	                union_names enum_constructors
+	                (Printf.sprintf "%s.rebinds[%d].value" path index)
+	                value
+	            in
+            Ok (obj [ ("param_index", int param_index); ("value", value_json) ]))
+      in
+      let* typ =
+        type_json ~reg enum_names value_record_names heap_record_names union_names
+          (path ^ ".type") expr.ty
+      in
+      Ok
+        (kind "tailrec_list_spread_recur"
+           [
+             ("rebinds", rebinds);
+             ("cursor_advance", int tr_cursor_advance);
+             ("type", typ);
+             ("loc", loc);
+           ])
   | Core.CTupleConstruct tc ->
       let* elements =
         result_list tc.tc_elems (fun index element ->
@@ -3537,7 +3757,7 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
       match expr.ty with
       | Ast.TyTuple item_tys
         when List.length items = List.length item_tys
-             && List.for_all supported_tuple_field_type item_tys ->
+             && List.for_all (supported_tuple_field_type ~reg) item_tys ->
           let* items_value =
             result_list items (fun index item ->
                 expr_json ~reg enum_names value_record_names heap_record_names union_names
@@ -3753,10 +3973,35 @@ let rec expr_json ?(function_names = StringSet.empty) ~reg enum_names
   | Core.CDebugBlock _ -> unsupported path "debug block"
   | Core.CMatchArms _ -> unsupported path "match arms"
   | Core.CMatch _ -> unsupported path "compiled match"
-  | Core.CConcurrent _ -> unsupported path "concurrent block"
-  | Core.CConcurrentlyLoop _ -> unsupported path "concurrently loop"
-  | Core.CDetach _ -> unsupported path "detach"
-  | Core.CSelect _ -> unsupported path "select"
+  | Core.CConcurrent block ->
+      let* block_json =
+        concurrent_block_json ~reg enum_names value_record_names heap_record_names
+          union_names enum_constructors (path ^ ".concurrent") block
+      in
+      let* fields = typed [ ("concurrent", block_json) ] in
+      Ok (kind "concurrent" fields)
+  | Core.CConcurrentlyLoop loop ->
+      let* loop_json =
+        concurrently_loop_json ~reg enum_names value_record_names
+          heap_record_names union_names enum_constructors
+          (path ^ ".concurrently_loop") loop
+      in
+      let* fields = typed [ ("concurrently_loop", loop_json) ] in
+      Ok (kind "concurrently_loop" fields)
+  | Core.CDetach detach ->
+      let* detach_json =
+        detach_json ~reg enum_names value_record_names heap_record_names
+          union_names (path ^ ".detach") detach
+      in
+      let* fields = typed [ ("detach", detach_json) ] in
+      Ok (kind "detach" fields)
+  | Core.CSelect select ->
+      let* select_json =
+        select_json ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".select") select
+      in
+      let* fields = typed [ ("select", select_json) ] in
+      Ok (kind "select" fields)
   | Core.CBox (value, source_ty) ->
       let box = Core_codegen_prepare.make_box_op ~reg value source_ty in
       let* box_json =
@@ -4032,6 +4277,45 @@ and for_list_json ~reg enum_names value_record_names heap_record_names union_nam
          ("body", body_json);
        ])
 
+and for_iterable_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path binder iter body =
+  let* binder_json =
+    loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
+      (path ^ ".binder") binder
+  in
+  let* iterable_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".iterable") iter
+  in
+  let iterable_release_policy = iterable_release_policy_json ~reg iter in
+  let* body_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".body") body
+  in
+  Ok
+    (obj
+       [
+         ("binder", binder_json);
+         ("iterable", iterable_json);
+         ("iterable_release_policy", iterable_release_policy);
+         ("body", body_json);
+       ])
+
+and for_string_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path binder iter body =
+  for_iterable_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path binder iter body
+
+and for_dict_json ~reg enum_names value_record_names heap_record_names union_names
+    enum_constructors path binder iter body =
+  for_iterable_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path binder iter body
+
+and for_set_json ~reg enum_names value_record_names heap_record_names union_names
+    enum_constructors path binder iter body =
+  for_iterable_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path binder iter body
+
 and for_stream_json ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path binder iter body =
   let* binder_json =
@@ -4079,6 +4363,276 @@ and for_resource_source_json ~reg enum_names value_record_names heap_record_name
          ("iterable_release_policy", iterable_release_policy);
          ("body", body_json);
        ])
+
+and task_capture_kind_json = function
+  | Core.TaskCopyCapture -> str "copy"
+  | Core.TaskMoveResourceItem -> str "move_resource_item"
+  | Core.TaskStructuredTaskBorrow -> str "structured_task_borrow"
+
+and task_capture_json ~reg enum_names value_record_names heap_record_names
+    union_names path (capture : Core.task_capture) =
+  let* typ =
+    type_json ~reg enum_names value_record_names heap_record_names union_names
+      (path ^ ".type") capture.task_capture_ty
+  in
+  Ok
+    (obj
+       [
+         ("name", str capture.task_capture_name);
+         ("type", typ);
+         ("kind", task_capture_kind_json capture.task_capture_kind);
+       ])
+
+and task_captures_json ~reg enum_names value_record_names heap_record_names
+    union_names path captures =
+  result_list captures (fun index capture ->
+      task_capture_json ~reg enum_names value_record_names heap_record_names
+        union_names
+        (Printf.sprintf "%s[%d]" path index)
+        capture)
+
+and task_closure_json ~reg enum_names value_record_names heap_record_names
+    union_names path (task : Core.task_closure) =
+  let c_name = Codegen_names.mangle_by_def_id task.tc_def_id task.tc_func in
+  let* captures =
+    task_captures_json ~reg enum_names value_record_names heap_record_names
+      union_names (path ^ ".captures") task.tc_captures
+  in
+  let* return_type =
+    type_json ~reg enum_names value_record_names heap_record_names union_names
+      (path ^ ".return_type") task.tc_return_ty
+  in
+  Ok
+    (obj
+       [
+         ("function_name", str task.tc_func);
+         ("def_id", int task.tc_def_id);
+         ("c_name", str c_name);
+         ("static_name", str ("__sc_" ^ c_name));
+         ("captures", captures);
+         ("return_type", return_type);
+       ])
+
+and detach_json ~reg enum_names value_record_names heap_record_names union_names
+    path (detach : Core.detach_expr) =
+  match detach.detach_task with
+  | Some task ->
+      let* task_json =
+        task_closure_json ~reg enum_names value_record_names heap_record_names
+          union_names (path ^ ".task") task
+      in
+      Ok (obj [ ("task", task_json) ])
+  | None -> unsupported (path ^ ".task") "missing detach task closure"
+
+and concurrent_binding_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path index (binding : Core.conc_binding) =
+  let binding_path = Printf.sprintf "%s.bindings[%d]" path index in
+  let* binding_type =
+    type_json ~reg enum_names value_record_names heap_record_names union_names
+      (binding_path ^ ".type") binding.cb_ty
+  in
+  let* rhs =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names
+      enum_constructors (binding_path ^ ".rhs") binding.cb_rhs
+  in
+  let* task =
+    match binding.cb_task with
+    | Some task ->
+        task_closure_json ~reg enum_names value_record_names heap_record_names
+          union_names (binding_path ^ ".task") task
+    | None -> unsupported (binding_path ^ ".task") "missing concurrent task closure"
+  in
+  Ok
+    (obj
+       [
+         ("var", var_json binding.cb_var);
+         ("type", binding_type);
+         ("rhs", rhs);
+         ("task", task);
+       ])
+
+and concurrent_timeout_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path = function
+  | Some timeout ->
+      expr_json ~reg enum_names value_record_names heap_record_names union_names
+        enum_constructors path timeout
+  | None -> Ok null
+
+and concurrent_block_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path (block : Core.concurrent_block) =
+  let* bindings =
+    result_list block.conc_bindings
+      (concurrent_binding_json ~reg enum_names value_record_names
+         heap_record_names union_names enum_constructors path)
+  in
+  let* body =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names
+      enum_constructors (path ^ ".body") block.conc_body
+  in
+  let* timeout =
+    concurrent_timeout_json ~reg enum_names value_record_names heap_record_names
+      union_names enum_constructors (path ^ ".timeout") block.conc_timeout
+  in
+  Ok
+    (obj
+       [
+         ("bindings", bindings);
+         ("body", body);
+         ("timeout", timeout);
+         ("max_threads", option_int_json block.conc_max_threads);
+       ])
+
+and concurrently_loop_output_json = function
+  | Core.ConcurrentlyLoopCollect -> str "collect"
+  | Core.ConcurrentlyLoopDiscard -> str "discard"
+
+and concurrently_loop_item_type path (loop : Core.concurrently_loop) =
+  match (loop.cf_item_mode, Codegen_types.normalize_type loop.cf_iter.ty) with
+  | Core.ConcurrentlyLoopCopyItem, Ast.TyNamed ("List", [ item_ty ]) ->
+      Ok item_ty
+  | Core.ConcurrentlyLoopCopyItem, ty ->
+      unsupported path
+        (Printf.sprintf "copy-item concurrently loop requires List[T], got %s"
+           (Types.type_to_string ty))
+  | Core.ConcurrentlyLoopMoveResourceItem { clmi_resource_ty; _ }, _ ->
+      Ok clmi_resource_ty
+
+and concurrently_loop_item_mode_json ~reg enum_names value_record_names
+    heap_record_names union_names path = function
+  | Core.ConcurrentlyLoopCopyItem -> Ok (kind "copy" [])
+  | Core.ConcurrentlyLoopMoveResourceItem { clmi_resource_ty; clmi_error_ty } ->
+      let* resource_type =
+        type_json ~reg enum_names value_record_names heap_record_names union_names
+          (path ^ ".resource_type") clmi_resource_ty
+      in
+      let* error_type =
+        type_json ~reg enum_names value_record_names heap_record_names union_names
+          (path ^ ".error_type") clmi_error_ty
+      in
+      Ok
+        (kind "move_resource_item"
+           [ ("resource_type", resource_type); ("error_type", error_type) ])
+
+and concurrently_loop_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path (loop : Core.concurrently_loop) =
+  let* item_ty = concurrently_loop_item_type (path ^ ".item_type") loop in
+  let* item_type =
+    type_json ~reg enum_names value_record_names heap_record_names union_names
+      (path ^ ".item_type") item_ty
+  in
+  let* item_mode =
+    concurrently_loop_item_mode_json ~reg enum_names value_record_names
+      heap_record_names union_names (path ^ ".item_mode") loop.cf_item_mode
+  in
+  let* iterable =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names
+      enum_constructors (path ^ ".iterable") loop.cf_iter
+  in
+  let* body =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names
+      enum_constructors (path ^ ".body") loop.cf_body
+  in
+  let* timeout =
+    concurrent_timeout_json ~reg enum_names value_record_names heap_record_names
+      union_names enum_constructors (path ^ ".timeout") loop.cf_timeout
+  in
+  let* limit =
+    match loop.cf_width with
+    | Core.ConcurrentlyLoopLimit limit ->
+        expr_json ~reg enum_names value_record_names heap_record_names
+          union_names enum_constructors (path ^ ".limit") limit
+  in
+  let* task =
+    match loop.cf_task with
+    | Some task ->
+        task_closure_json ~reg enum_names value_record_names heap_record_names
+          union_names (path ^ ".task") task
+    | None -> unsupported (path ^ ".task") "missing concurrently loop task closure"
+  in
+  Ok
+    (obj
+       [
+         ("var", var_json loop.cf_var);
+         ("item_type", item_type);
+         ("item_mode", item_mode);
+         ("iterable", iterable);
+         ("body", body);
+         ("timeout", timeout);
+         ("limit", limit);
+         ("output", concurrently_loop_output_json loop.cf_output);
+         ("task", task);
+       ])
+
+and select_recv_arm_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path
+    (recv : [ `Recv of Core.var * Ast.type_expr * Core.core ]) =
+  match recv with
+  | `Recv (binder, elem_ty, channel) ->
+      let* elem_type =
+        type_json ~reg enum_names value_record_names heap_record_names
+          union_names (path ^ ".elem_type") elem_ty
+      in
+      let* channel_json =
+        expr_json ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".channel") channel
+      in
+      Ok
+        (obj
+           [
+             ("binder", var_json binder);
+             ("elem_type", elem_type);
+             ("channel", channel_json);
+           ])
+
+and select_arm_kind_json ~reg enum_names value_record_names heap_record_names
+    union_names enum_constructors path = function
+  | Core.SelectRecv { select_bind; select_elem_ty; select_channel } ->
+      let* recv =
+        select_recv_arm_json ~reg enum_names value_record_names heap_record_names
+          union_names enum_constructors (path ^ ".recv")
+          (`Recv (select_bind, select_elem_ty, select_channel))
+      in
+      Ok (kind "recv" [ ("recv", recv) ])
+  | Core.SelectSealed channel ->
+      let* channel_json =
+        expr_json ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".channel") channel
+      in
+      Ok (kind "sealed" [ ("channel", channel_json) ])
+  | Core.SelectAfter timeout ->
+      let* timeout_json =
+        expr_json ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".timeout") timeout
+      in
+      Ok (kind "after" [ ("timeout", timeout_json) ])
+
+and select_arm_json ~reg enum_names value_record_names heap_record_names union_names
+    enum_constructors path index (arm : Core.select_arm) =
+  let arm_path = Printf.sprintf "%s.arms[%d]" path index in
+  let* kind_json =
+    select_arm_kind_json ~reg enum_names value_record_names heap_record_names
+      union_names enum_constructors (arm_path ^ ".kind") arm.select_arm_kind
+  in
+  let* body_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names
+      enum_constructors (arm_path ^ ".body") arm.select_arm_body
+  in
+  Ok
+    (obj
+       [
+         ("kind", kind_json);
+         ("body", body_json);
+         ("loc", source_loc_json arm.select_arm_loc);
+       ])
+
+and select_json ~reg enum_names value_record_names heap_record_names union_names
+    enum_constructors path (select : Core.select_expr) =
+  let* arms =
+    result_list select.select_arms
+      (select_arm_json ~reg enum_names value_record_names heap_record_names
+         union_names enum_constructors path)
+  in
+  Ok (obj [ ("arms", arms) ])
 
 	and require_tensor_for_single_dimension path ~reg (iter : Core.core) =
 	  match Core_tensor_type.of_type ~reg iter.ty with
@@ -4665,6 +5219,31 @@ and list_set_json ~reg enum_names value_record_names heap_record_names union_nam
            bool (Core_layout_type.is_stack_result_type ~reg value.ty) );
        ])
 
+and list_swap_json ~reg enum_names value_record_names heap_record_names union_names
+    enum_constructors path (layout : Core.list_storage_layout) list left_index
+    right_index =
+  let* layout_json = list_storage_layout_json layout in
+  let* list_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names
+      enum_constructors (path ^ ".list") list
+  in
+  let* left_index_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names
+      enum_constructors (path ^ ".left_index") left_index
+  in
+  let* right_index_json =
+    expr_json ~reg enum_names value_record_names heap_record_names union_names
+      enum_constructors (path ^ ".right_index") right_index
+  in
+  Ok
+    (obj
+       [
+         ("layout", layout_json);
+         ("list", list_json);
+         ("left_index", left_index_json);
+         ("right_index", right_index_json);
+       ])
+
 and list_retain_json ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path list value =
   let boxed_value = Core_codegen_prepare.boxed_storage_value ~reg value in
@@ -5004,6 +5583,8 @@ let require_simple_call_kind path ~result_ty call_kind args =
               require_core_arity path "blorp_vector_get_opt" 2 args
           | "blorp_matrix_get_opt" ->
               require_core_arity path "blorp_matrix_get_opt" 3 args
+          | "blorp_dict_with_capacity_custom" ->
+              require_core_arity path "blorp_dict_with_capacity_custom" 1 args
           | "blorp_list_to_string_cb" ->
               require_core_arity path "blorp_list_to_string_cb" 1 args
           | _ when channel_attempt_builtin_supported name -> (
@@ -5058,6 +5639,10 @@ let rec require_simple_expr path (expr : Core.core) =
       let* () = require_simple_expr (path ^ ".out_index") out_index in
       let* () = require_simple_expr (path ^ ".source") source in
       require_simple_expr (path ^ ".source_index") source_index
+  | Core.CCall (Core.CKIntrinsic "list_swap_slots", _callee, [ lst; i; j ]) ->
+      let* () = require_simple_expr (path ^ ".list") lst in
+      let* () = require_simple_expr (path ^ ".left_index") i in
+      require_simple_expr (path ^ ".right_index") j
   | Core.CCall
       ( (Core.CKBuiltin "blorp_list_new" | Core.CKIntrinsic "list_alloc"),
         _callee,
@@ -5118,6 +5703,9 @@ let rec require_simple_expr path (expr : Core.core) =
   | Core.CTensorLiteral literal -> require_tensor_literal path literal
   | Core.CTensorRawRead read -> require_tensor_raw_read path read
   | Core.CTensorRawWrite write -> require_tensor_raw_write path write
+  | Core.CTensorRawViewLet (binding, body) ->
+      let* () = require_tensor_raw_view_binding (path ^ ".binding") binding in
+      require_simple_expr (path ^ ".body") body
   | Core.CDictConstruct construct -> require_dict_construct path construct
   | Core.CSetAlloc alloc -> require_set_alloc path alloc
   | Core.CListConstruct lc -> require_list_construct path lc
@@ -5155,7 +5743,17 @@ and require_simple_args path args =
   check 0 args
 
 and require_tensor_literal path (literal : Core.tensor_literal) =
-  match literal.tl_payload with
+  if not (Core.tensor_literal_layout_matches_payload literal.tl_layout literal.tl_payload)
+  then
+    unsupported path
+      (Printf.sprintf
+         "tensor literal layout %s does not match payload %s (emit invariant \
+          violated)"
+         (Core.tensor_storage_slot_layout_str literal.tl_layout.tsl_slots)
+         (Core.tensor_storage_slot_layout_str
+            (Core.tensor_literal_payload_slot_layout literal.tl_payload)))
+  else
+    match literal.tl_payload with
   | Core.TensorRawElements (_raw_kind, elements) ->
       require_simple_args (path ^ ".elements") elements
   | Core.TensorBoxedElements elements ->
@@ -5230,11 +5828,11 @@ and require_tuple_construct_body ~reg union_names path
   in
   check 0 tc.tc_elems
 
-and require_tuple_literal path ty items =
+and require_tuple_literal ?reg path ty items =
   match ty with
-  | Ast.TyTuple item_tys
-    when List.length items = List.length item_tys
-         && List.for_all supported_tuple_field_type item_tys ->
+      | Ast.TyTuple item_tys
+        when List.length items = List.length item_tys
+         && List.for_all (supported_tuple_field_type ?reg) item_tys ->
       let rec check index = function
         | [] -> Ok ()
         | item :: rest ->
@@ -5521,6 +6119,10 @@ and require_unbox_op path (unbox : Core.unbox_op) =
   let* _ = unbox_kind_json unbox.unbox_kind in
   require_simple_expr (path ^ ".expr") unbox.unbox_value
 
+and require_unbox_op_body ~reg union_names path (unbox : Core.unbox_op) =
+  let* _ = unbox_kind_json unbox.unbox_kind in
+  require_function_body ~reg union_names (path ^ ".expr") unbox.unbox_value
+
 and require_box_op path (box : Core.box_op) =
   let* _ = box_kind_json (path ^ ".kind") box.box_kind in
   match box.box_kind with
@@ -5576,6 +6178,136 @@ and require_resource_cleanup_exit ~reg union_names path
         check (index + 1) rest
   in
   check 0 cleanup_exit.rce_cleanups
+
+and require_task_copy_captures ~reg path index captures =
+  match captures with
+  | [] -> Ok ()
+  | (capture : Core.task_capture) :: rest -> (
+      match capture.task_capture_kind with
+      | Core.TaskCopyCapture ->
+          if supported_closure_capture_type ~reg capture.task_capture_ty then
+            require_task_copy_captures ~reg path (index + 1) rest
+          else
+            unsupported
+              (Printf.sprintf "%s[%d]" path index)
+              "unsupported concurrent task capture type"
+      | Core.TaskMoveResourceItem | Core.TaskStructuredTaskBorrow ->
+          unsupported
+            (Printf.sprintf "%s[%d]" path index)
+            "non-copy concurrent task capture")
+
+and require_resource_task_captures ~reg path index captures =
+  match captures with
+  | [] -> Ok ()
+  | (capture : Core.task_capture) :: rest -> (
+      match capture.task_capture_kind with
+      | Core.TaskCopyCapture ->
+          if supported_closure_capture_type ~reg capture.task_capture_ty then
+            require_resource_task_captures ~reg path (index + 1) rest
+          else
+            unsupported
+              (Printf.sprintf "%s[%d]" path index)
+              "unsupported concurrent task capture type"
+      | Core.TaskMoveResourceItem ->
+          if supported_resource_task_capture_type ~reg capture.task_capture_ty then
+            require_resource_task_captures ~reg path (index + 1) rest
+          else
+            unsupported
+              (Printf.sprintf "%s[%d]" path index)
+              "unsupported concurrent task capture type"
+      | Core.TaskStructuredTaskBorrow ->
+          unsupported
+            (Printf.sprintf "%s[%d]" path index)
+            "structured task borrow capture")
+
+and require_concurrent_binding ~reg union_names path index
+    (binding : Core.conc_binding) =
+  let binding_path = Printf.sprintf "%s.bindings[%d]" path index in
+  let* () =
+    match binding.cb_task with
+    | Some task ->
+        require_task_copy_captures ~reg (binding_path ^ ".task.captures") 0
+          task.tc_captures
+    | None ->
+        unsupported (binding_path ^ ".task") "missing concurrent task closure"
+  in
+  require_function_body ~reg union_names (binding_path ^ ".rhs") binding.cb_rhs
+
+and require_concurrent_block ~reg union_names path
+    (block : Core.concurrent_block) =
+  let rec check index = function
+    | [] -> Ok ()
+    | binding :: rest ->
+        let* () =
+          require_concurrent_binding ~reg union_names path index binding
+        in
+        check (index + 1) rest
+  in
+  let* () = check 0 block.conc_bindings in
+  let* () =
+    match block.conc_timeout with
+    | Some timeout ->
+        require_function_body ~reg union_names (path ^ ".timeout") timeout
+    | None -> Ok ()
+  in
+  require_function_body ~reg union_names (path ^ ".body") block.conc_body
+
+and require_concurrently_loop ~reg union_names path
+    (loop : Core.concurrently_loop) =
+  let* _ = concurrently_loop_item_type (path ^ ".item_type") loop in
+  let* () =
+    match loop.cf_task with
+    | Some task -> (
+        match loop.cf_item_mode with
+        | Core.ConcurrentlyLoopCopyItem ->
+            require_task_copy_captures ~reg (path ^ ".task.captures") 0
+              task.tc_captures
+        | Core.ConcurrentlyLoopMoveResourceItem _ ->
+            require_resource_task_captures ~reg (path ^ ".task.captures") 0
+              task.tc_captures)
+    | None -> unsupported (path ^ ".task") "missing concurrently loop task closure"
+  in
+  let* () =
+    require_function_body ~reg union_names (path ^ ".iterable") loop.cf_iter
+  in
+  let* () =
+    require_function_body ~reg union_names (path ^ ".body") loop.cf_body
+  in
+  let* () =
+    match loop.cf_timeout with
+    | Some timeout ->
+        require_function_body ~reg union_names (path ^ ".timeout") timeout
+    | None -> Ok ()
+  in
+  match loop.cf_width with
+  | Core.ConcurrentlyLoopLimit limit ->
+      require_function_body ~reg union_names (path ^ ".limit") limit
+
+and require_select_arm_kind ~reg union_names path = function
+  | Core.SelectRecv { select_channel; _ } ->
+      require_function_body ~reg union_names (path ^ ".channel") select_channel
+  | Core.SelectSealed channel ->
+      require_function_body ~reg union_names (path ^ ".channel") channel
+  | Core.SelectAfter timeout ->
+      require_function_body ~reg union_names (path ^ ".timeout") timeout
+
+and require_select_arm ~reg union_names path index (arm : Core.select_arm) =
+  let arm_path = Printf.sprintf "%s.arms[%d]" path index in
+  let* () =
+    require_select_arm_kind ~reg union_names (arm_path ^ ".kind")
+      arm.select_arm_kind
+  in
+  require_function_body ~reg union_names (arm_path ^ ".body")
+    arm.select_arm_body
+
+and require_select ~reg union_names path (select_expr : Core.select_expr) =
+  let rec check index = function
+    | [] -> Ok ()
+    | arm :: rest ->
+        let* () = require_select_arm ~reg union_names path index arm in
+        check (index + 1) rest
+  in
+  check 0 select_expr.select_arms
 
 and require_stack_option_arg path (value : Core.boxed_storage_value) =
   (* Stack Option payloads are emitted inline. The boxed-storage release flags
@@ -5731,8 +6463,11 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       (Core.TailrecUnmanagedLoop { tul_params = _; tul_return_ty; tul_body }) ->
       require_tailrec_tail ~reg union_names (path ^ ".body") tul_return_ty
         tul_body
-  | Core.CTailrecLoop (Core.TailrecListSpreadLoop _) ->
-      unsupported path "list-spread tail-recursive loop"
+  | Core.CTailrecLoop
+      (Core.TailrecListSpreadLoop { tls_list_param; tls_return_ty; tls_body; _ })
+    ->
+      require_tailrec_list_spread_body ~reg union_names (path ^ ".body")
+        tls_list_param.cp_ty tls_return_ty tls_body
   | Core.CTailrecRecur _ ->
       unsupported path "tail-recursive recur outside tail-recursive loop"
   | Core.CTupleConstruct tc ->
@@ -5746,11 +6481,18 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       require_record_construct_body ~reg union_names path rc
   | Core.CUnionConstruct uc ->
       require_union_construct_body ~reg union_names path uc
+  | Core.CDetach detach -> (
+      match detach.detach_task with
+      | Some task ->
+          require_task_copy_captures ~reg (path ^ ".task.captures") 0
+            task.tc_captures
+      | None -> unsupported (path ^ ".task") "missing detach task closure")
   | Core.CCall (Core.CKIntrinsic "list_retain_for", _, [ _; _ ])
   | Core.CCall
       ( Core.CKIntrinsic "list_handoff_set_source_slot",
         _,
         [ _; _; _; _ ] )
+  | Core.CCall (Core.CKIntrinsic "list_swap_slots", _, [ _; _; _ ])
   | Core.CCall
       ( (Core.CKBuiltin "blorp_list_new" | Core.CKIntrinsic "list_alloc"),
         _,
@@ -5798,13 +6540,21 @@ and require_function_body ~reg union_names path (expr : Core.core) =
   | Core.CCall (Core.CKBuiltin name, _callee, _args)
     when is_ranked_tensor_fill_factory_name name ->
       require_simple_expr path expr
-  | Core.CCall (Core.CKBuiltin name, _callee, _args)
+  | Core.CCall (Core.CKBuiltin name as call_kind, _callee, args)
     when Option.is_some (Operation_result_metadata.find_result_bridge name) ->
-      require_simple_expr path expr
-  | Core.CCall (Core.CKBuiltin name, _callee, _args)
+      let* () =
+        require_simple_call_kind (path ^ ".call_kind") ~result_ty:expr.ty
+          call_kind args
+      in
+      require_call_args_body ~reg union_names path args
+  | Core.CCall (Core.CKBuiltin name as call_kind, _callee, args)
     when Option.is_some
            (Operation_result_metadata.find_fallible_stream_terminal name) ->
-      require_simple_expr path expr
+      let* () =
+        require_simple_call_kind (path ^ ".call_kind") ~result_ty:expr.ty
+          call_kind args
+      in
+      require_call_args_body ~reg union_names path args
   | Core.CCall
       ( ( Core.CKBuiltin "blorp_dict_new_custom"
         | Core.CKBuiltin "blorp_set_new_custom" ),
@@ -5846,6 +6596,12 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       require_condition_expr ~reg union_names (path ^ ".right") right
   | Core.CCast (inner, _target_ty) ->
       require_function_body ~reg union_names (path ^ ".expr") inner
+  | Core.CUnbox (inner, _target_ty) ->
+      require_function_body ~reg union_names (path ^ ".expr") inner
+  | Core.CUnboxTyped unbox ->
+      require_unbox_op_body ~reg union_names path unbox
+  | Core.CField (inner, _field_name) ->
+      require_function_body ~reg union_names (path ^ ".expr") inner
   | Core.CWhile (cond, body) ->
       let* () =
         require_condition_expr ~reg union_names (path ^ ".cond") cond
@@ -5867,6 +6623,21 @@ and require_function_body ~reg union_names path (expr : Core.core) =
           let* () =
             require_supported_list_loop_layout (path ^ ".layout") layout
           in
+          let* () =
+            require_function_body ~reg union_names (path ^ ".iterable") iter
+          in
+          require_function_body ~reg union_names (path ^ ".body") body
+      | Ast.TyNamed ("String", _) ->
+          let* () =
+            require_function_body ~reg union_names (path ^ ".iterable") iter
+          in
+          require_function_body ~reg union_names (path ^ ".body") body
+      | Ast.TyNamed ("Dict", _) ->
+          let* () =
+            require_function_body ~reg union_names (path ^ ".iterable") iter
+          in
+          require_function_body ~reg union_names (path ^ ".body") body
+      | Ast.TyNamed ("Set", _) ->
           let* () =
             require_function_body ~reg union_names (path ^ ".iterable") iter
           in
@@ -5893,7 +6664,10 @@ and require_function_body ~reg union_names path (expr : Core.core) =
 	          in
 	          let* () = require_simple_expr (path ^ ".iterable") iter in
 	          require_function_body ~reg union_names (path ^ ".body") body
-      | _ -> unsupported path "non-range for loop")
+      | ty ->
+          unsupported path
+            (Printf.sprintf "non-range for loop over %s"
+               (Types.type_to_string ty)))
   | Core.CMatch (scrutinee, Core.CTLeaf { ct_bindings; ct_body }) ->
       let* () = require_function_body ~reg union_names (path ^ ".scrutinee") scrutinee in
       let* () =
@@ -5927,6 +6701,12 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       require_resource_scope ~reg union_names path scope
   | Core.CResourceCleanupExit cleanup_exit ->
       require_resource_cleanup_exit ~reg union_names path cleanup_exit
+  | Core.CConcurrent block ->
+      require_concurrent_block ~reg union_names path block
+  | Core.CConcurrentlyLoop loop ->
+      require_concurrently_loop ~reg union_names path loop
+  | Core.CSelect select_expr ->
+      require_select ~reg union_names path select_expr
   | Core.CTensorRawViewLet (binding, body) ->
       let* () = require_tensor_raw_view_binding (path ^ ".binding") binding in
       require_function_body ~reg union_names (path ^ ".body") body
@@ -6040,13 +6820,164 @@ and require_tailrec_tail ~reg union_names path return_ty (expr : Core.core) =
   | Core.CDrop (_variable, value_ty, body) ->
       let _release_policy = release_policy_tag ~reg value_ty in
       require_tailrec_tail ~reg union_names (path ^ ".body") return_ty body
-  | _ ->
-      if is_void_type return_ty then
-        require_function_body ~reg union_names path expr
-      else require_simple_expr path expr
+	  | _ ->
+	      if is_void_type return_ty then
+	        require_function_body ~reg union_names path expr
+	      else require_simple_expr path expr
 
-and require_literal_match_expr ~reg union_names path scrutinee ctl_scrut cases
-    fallback =
+	and require_tailrec_list_spread_rebinds path rebinds =
+	  let rec check index = function
+	    | [] -> Ok ()
+	    | (_param_index, value) :: rest ->
+	        let value_path = Printf.sprintf "%s[%d].value" path index in
+	        let* () = require_simple_expr value_path value in
+	        check (index + 1) rest
+	  in
+	  check 0 rebinds
+
+	and require_tailrec_list_spread_body ~reg union_names path list_ty return_ty
+	    (expr : Core.core) =
+	  require_tailrec_list_spread_tail ~reg union_names path list_ty return_ty expr
+
+	and require_tailrec_list_spread_tail ~reg union_names path list_ty return_ty
+	    (expr : Core.core) =
+	  match expr.desc with
+	  | Core.CTailrecRecur
+	      (Core.TailrecListSpreadRecur { tr_rebinds; tr_cursor_advance = _ }) ->
+	      require_tailrec_list_spread_rebinds (path ^ ".rebinds") tr_rebinds
+	  | Core.CTailrecRecur (Core.TailrecRecur _) ->
+	      unsupported path "unmanaged tail-recursive recur in list-spread loop"
+	  | Core.CLet (binding, body) ->
+	      let* () =
+	        require_function_body ~reg union_names (path ^ ".rhs")
+	          binding.bind_rhs
+	      in
+	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
+	        list_ty return_ty body
+	  | Core.CBorrowLet (binding, body) ->
+	      let* () =
+	        require_function_body ~reg union_names (path ^ ".rhs")
+	          binding.borrow_rhs
+	      in
+	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
+	        list_ty return_ty body
+	  | Core.CSeq (first, second) ->
+	      let* () =
+	        require_function_body ~reg union_names (path ^ ".first") first
+	      in
+	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".second")
+	        list_ty return_ty second
+	  | Core.CIf (cond, then_expr, else_expr) ->
+	      let* () = require_simple_expr (path ^ ".cond") cond in
+	      let* () =
+	        require_tailrec_list_spread_tail ~reg union_names (path ^ ".then")
+	          list_ty return_ty then_expr
+	      in
+	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".else")
+	        list_ty return_ty else_expr
+	  | Core.CMatch (_scrutinee, tree) ->
+	      require_tailrec_list_spread_tree ~reg union_names list_ty return_ty
+	        (path ^ ".match") tree
+	  | Core.CTailrecLoop _ -> unsupported path "nested tail-recursive loop"
+	  | Core.CResourceScope scope ->
+	      require_resource_scope ~reg union_names path scope
+	  | Core.CResourceCleanupExit cleanup_exit ->
+	      require_resource_cleanup_exit ~reg union_names path cleanup_exit
+	  | Core.CTensorRawViewLet (binding, body) ->
+	      let* () = require_tensor_raw_view_binding (path ^ ".binding") binding in
+	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
+	        list_ty return_ty body
+	  | Core.CDup (_variable, value_ty, body) ->
+	      let _retain_policy = retain_policy_tag ~reg value_ty in
+	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
+	        list_ty return_ty body
+	  | Core.CDrop (_variable, value_ty, body) ->
+	      let _release_policy = release_policy_tag ~reg value_ty in
+	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
+	        list_ty return_ty body
+	  | _ ->
+	      if is_void_type return_ty then
+	        require_function_body ~reg union_names path expr
+	      else require_simple_expr path expr
+
+	and require_tailrec_list_spread_tree ~reg union_names list_ty return_ty path =
+	  function
+	  | Core.CTLeaf { ct_bindings; ct_body } ->
+	      let* () = require_match_bindings ~reg list_ty (path ^ ".bindings") ct_bindings in
+	      require_tailrec_list_spread_tail ~reg union_names (path ^ ".body")
+	        list_ty return_ty ct_body
+	  | Core.CTFail -> Ok ()
+	  | Core.CTSwitchLen
+	      { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default } ->
+	      let* () =
+	        match_accessor_json ~reg list_ty (path ^ ".accessor") ctl_len_scrut
+	        |> Result.map ignore
+	      in
+	      let rec check_cases index = function
+	        | [] -> Ok ()
+	        | (_length, subtree) :: rest ->
+	            let case_path = Printf.sprintf "%s.cases[%d]" path index in
+	            let* () =
+	              require_tailrec_list_spread_tree ~reg union_names list_ty
+	                return_ty case_path subtree
+	            in
+	            check_cases (index + 1) rest
+	      in
+	      let* () = check_cases 0 ctl_len_cases in
+	      let* () =
+	        match ctl_len_geq with
+	        | None -> Ok ()
+	        | Some (_minimum_length, subtree) ->
+	            require_tailrec_list_spread_tree ~reg union_names list_ty return_ty
+	              (path ^ ".geq.branch") subtree
+	      in
+	      (match ctl_len_default with
+	      | None -> Ok ()
+	      | Some subtree ->
+	          require_tailrec_list_spread_tree ~reg union_names list_ty return_ty
+	            (path ^ ".fallback") subtree)
+	  | Core.CTSwitchLit { ctl_scrut; ctl_cases; ctl_default } ->
+	      let* () =
+	        match_accessor_json ~reg list_ty (path ^ ".accessor") ctl_scrut
+	        |> Result.map ignore
+	      in
+	      let rec check_cases index = function
+	        | [] -> Ok ()
+	        | (_literal, subtree) :: rest ->
+	            let case_path = Printf.sprintf "%s.cases[%d]" path index in
+	            let* () =
+	              require_tailrec_list_spread_tree ~reg union_names list_ty
+	                return_ty case_path subtree
+	            in
+	            check_cases (index + 1) rest
+	      in
+	      let* () = check_cases 0 ctl_cases in
+	      require_tailrec_list_spread_tree ~reg union_names list_ty return_ty
+	        (path ^ ".fallback") ctl_default
+	  | Core.CTSwitchTag { cts_scrut; cts_cases; cts_default } ->
+	      let* () =
+	        match_accessor_json ~reg list_ty (path ^ ".accessor") cts_scrut
+	        |> Result.map ignore
+	      in
+	      let rec check_cases index = function
+	        | [] -> Ok ()
+	        | (_ctor, subtree) :: rest ->
+	            let case_path = Printf.sprintf "%s.cases[%d]" path index in
+	            let* () =
+	              require_tailrec_list_spread_tree ~reg union_names list_ty
+	                return_ty case_path subtree
+	            in
+	            check_cases (index + 1) rest
+	      in
+	      let* () = check_cases 0 cts_cases in
+	      (match cts_default with
+	      | None -> Ok ()
+	      | Some subtree ->
+	          require_tailrec_list_spread_tree ~reg union_names list_ty return_ty
+	            (path ^ ".fallback") subtree)
+
+	and require_literal_match_expr ~reg union_names path scrutinee ctl_scrut cases
+	    fallback =
   let* () = require_function_body ~reg union_names (path ^ ".scrutinee") scrutinee in
   let* () =
     match_accessor_json ~reg scrutinee.ty (path ^ ".accessor") ctl_scrut
@@ -6995,14 +7926,12 @@ let with_embedded_runtime (artifact : Compiler_blorp_bridge.c_artifact) =
   }
 
 let emit_program_to_artifact (config : config) (program : Core.core_program) =
-  if config.profile then unsupported "config.profile" "profile emission"
-  else
-    let* core_json = program_json ~reg:config.reg program in
-    let artifact =
-      Compiler_blorp_bridge.prepare_and_emit_c_artifact_exn core_json
-    in
-    Ok
-      (if config.embed_runtime then with_embedded_runtime artifact else artifact)
+  let* core_json = program_json ~reg:config.reg program in
+  let artifact =
+    Compiler_blorp_bridge.prepare_and_emit_c_artifact_exn
+      ~profile:config.profile core_json
+  in
+  Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
 
 let emit_program_string config program =
   match emit_program_to_artifact config program with

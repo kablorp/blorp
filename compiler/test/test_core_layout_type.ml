@@ -201,8 +201,15 @@ let test_destructor_policy_is_layout_owned () =
        (union "FloatBox" [ ty_float ])
     = ArcReleaseOnly);
   Alcotest.(check bool)
-    "int128 union boxed storage needs destructor" true
+    "int128 typed union storage is ARC-only" true
     (Blorp.Core_layout_type.union_destructor_policy ~reg
+       ~payload_storage:TypedUnionPayloadStorage
+       (union "Wide" [ ty "Int128" [] ])
+    = ArcReleaseOnly);
+  Alcotest.(check bool)
+    "int128 erased union storage needs destructor" true
+    (Blorp.Core_layout_type.union_destructor_policy ~reg
+       ~payload_storage:ErasedUnionPayloadStorage
        (union "Wide" [ ty "Int128" [] ])
     = GeneratedDestructor "Wide_destroy")
 

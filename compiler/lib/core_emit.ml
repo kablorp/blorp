@@ -2116,6 +2116,18 @@ let migrated_to_blorp_backend loc feature =
        to Blorp instead of reintroducing OCaml emission."
     "legacy OCaml emission for %s has been removed" feature
 
+let ensure_tensor_literal_layout_matches_payload loc literal =
+  if not
+       (tensor_literal_layout_matches_payload literal.tl_layout
+          literal.tl_payload)
+  then
+    Core_error.errorf Core_error.Emit loc
+      "tensor literal layout %s does not match payload %s (emit invariant \
+       violated)"
+      (tensor_storage_slot_layout_str literal.tl_layout.tsl_slots)
+      (tensor_storage_slot_layout_str
+         (tensor_literal_payload_slot_layout literal.tl_payload))
+
 let channel_element_type ctx ty =
   match Core_layout_type.canonical_type ~reg:ctx.reg ty with
   | Ast.TyNamed
@@ -4862,7 +4874,9 @@ and emit_expr (ctx : Core_emit_context.t) (e : core) : unit =
   | CRecordConstruct rc -> emit_record_construct ctx rc
   | CDictConstruct dc -> emit_dict_construct ctx e dc
   | CSetAlloc sa -> emit_set_alloc ctx e.loc sa.sa_constructor
-  | CTensorLiteral _ -> migrated_to_blorp_backend e.loc "tensor literal"
+  | CTensorLiteral literal ->
+      ensure_tensor_literal_layout_matches_payload e.loc literal;
+      migrated_to_blorp_backend e.loc "tensor literal"
   | CUnionConstruct uc -> emit_union_construct ctx uc
   | CUnionReuseConstruct urc -> emit_union_reuse_construct ctx urc
   (* ---- Record construction: [TypeName_make(field0, field1, ...)] ----

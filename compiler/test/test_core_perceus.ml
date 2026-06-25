@@ -367,8 +367,7 @@ let test_user_union_destructor_policy_registered () =
   in
   let open Blorp.Codegen_types in
   expect_managed_type_info "FloatBox" env "FloatBox" ManagedUnion ArcReleaseOnly;
-  expect_managed_type_info "Wide" env "Wide" ManagedUnion
-    (GeneratedDestructor "Wide_destroy")
+  expect_managed_type_info "Wide" env "Wide" ManagedUnion ArcReleaseOnly
 
 (** Regression: [enum Color { Red; Green; Blue }] is integer-valued
     and NOT managed. *)

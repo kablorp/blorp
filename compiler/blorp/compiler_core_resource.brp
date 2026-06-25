@@ -8,6 +8,9 @@ import:
 	compiler_core_json:
 		CoreBoxOp,
 		CoreBoxedStorageValue,
+		CoreConcurrentBinding,
+		CoreConcurrentBlock,
+		CoreConcurrentlyLoop,
 		CoreConstructorLengthMatch,
 		CoreConstructorLengthMatchBranch,
 		CoreConstructorLengthMatchCase,
@@ -36,18 +39,24 @@ import:
 			CastExpr,
 			CallExpr,
 			ClosureCreateExpr,
-			ConstructorMatchExpr,
-			ContinueExpr,
-			CooperativeCheckpointExpr,
-			DictConstructExpr,
+			ConcurrentlyLoopExpr,
+			ConcurrentExpr,
+				ConstructorMatchExpr,
+				ContinueExpr,
+				CooperativeCheckpointExpr,
+				DetachExpr,
+				DictConstructExpr,
 			DupExpr,
 			DropExpr,
 			FieldExpr,
 			ForChannelExpr,
+			ForDictExpr,
 			ForListExpr,
 			ForRangeExpr,
 			ForResourceSourceExpr,
+			ForSetExpr,
 			ForStreamExpr,
+			ForStringExpr,
 			ForTensorExpr,
 			IfExpr,
 			LetExpr,
@@ -59,6 +68,7 @@ import:
 			ListHandoffSetSourceSlotExpr,
 			ListRetainExpr,
 			ListSetExpr,
+			ListSwapExpr,
 			LengthMatchExpr,
 			LiteralExpr,
 			LiteralMatchExpr,
@@ -68,12 +78,15 @@ import:
 			RecordConstructExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
+			SelectExpr,
 			SeqExpr,
 			SetAllocExpr,
 			StringByteCopyExpr,
 			StringByteReadExpr,
 			StringByteWriteExpr,
 			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
 			TailrecLoopExpr,
 			TailrecRecurExpr,
 			TensorBoxedLiteralExpr,
@@ -101,6 +114,7 @@ import:
 		CoreListHandoffSetSourceSlot,
 		CoreListRetain,
 		CoreListSet,
+		CoreListSwap,
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings,
@@ -110,12 +124,18 @@ import:
 		CoreProgram,
 		CoreRecordFieldValue,
 		CoreResourceExit(ResourceBreakExit, ResourceContinueExit),
+		CoreSelect,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
+		CoreSelectRecvArm,
 		CoreSetAlloc,
 		CoreSourceLoc,
 		CoreStringByteCopy,
 		CoreStringByteRead,
 		CoreStringByteWrite,
 		CoreStringSetLen,
+		CoreTailrecListSpreadLoop,
+		CoreTailrecListSpreadRebind,
 		CoreTensorBoxedLiteral,
 		CoreTensorLiteral,
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
@@ -232,6 +252,42 @@ private pure func rewrite_tuple_elements_with_cleanups(
 				)
 
 	result
+
+
+private pure func rewrite_tailrec_list_spread_rebind_with_cleanups(
+	rebind: CoreTailrecListSpreadRebind,
+	cleanups: List[CoreExpr],
+) -> CoreTailrecListSpreadRebind:
+	{
+		param_index = rebind.param_index,
+		value = rewrite_resource_expr_with_cleanups(rebind.value, cleanups)
+	}
+
+
+private pure func rewrite_tailrec_list_spread_rebinds_with_cleanups(
+	rebinds: List[CoreTailrecListSpreadRebind],
+	cleanups: List[CoreExpr],
+) -> List[CoreTailrecListSpreadRebind]:
+	var result: List[CoreTailrecListSpreadRebind] = []
+
+	for rebind in rebinds:
+		result = result.append(rewrite_tailrec_list_spread_rebind_with_cleanups(rebind, cleanups))
+
+	result
+
+
+private pure func rewrite_tailrec_list_spread_loop_with_cleanups(
+	loop: CoreTailrecListSpreadLoop,
+) -> CoreTailrecListSpreadLoop:
+	{
+		params = loop.params,
+		return_type = loop.return_type,
+		list_index = loop.list_index,
+		list_param = loop.list_param,
+		cursor = loop.cursor,
+		layout = loop.layout,
+		body = rewrite_resource_expr_with_cleanups(loop.body, [])
+	}
 
 
 private pure func rewrite_boxed_storage_value_with_cleanups(
@@ -530,6 +586,18 @@ private pure func rewrite_list_set_with_cleanups(
 	}
 
 
+private pure func rewrite_list_swap_with_cleanups(
+	swap: CoreListSwap,
+	cleanups: List[CoreExpr],
+) -> CoreListSwap:
+	{
+		layout = swap.layout,
+		list = rewrite_resource_expr_with_cleanups(swap.list, cleanups),
+		left_index = rewrite_resource_expr_with_cleanups(swap.left_index, cleanups),
+		right_index = rewrite_resource_expr_with_cleanups(swap.right_index, cleanups)
+	}
+
+
 private pure func rewrite_list_retain_with_cleanups(
 	retain: CoreListRetain,
 	cleanups: List[CoreExpr],
@@ -553,6 +621,124 @@ private pure func rewrite_record_fields_with_cleanups(
 		})
 
 	result
+
+
+private pure func rewrite_concurrent_binding_with_cleanups(
+	binding: CoreConcurrentBinding,
+	cleanups: List[CoreExpr],
+) -> CoreConcurrentBinding:
+	{
+		variable = binding.variable,
+		typ = binding.typ,
+		rhs = rewrite_resource_expr_with_cleanups(binding.rhs, []),
+		task = binding.task
+	}
+
+
+private pure func rewrite_concurrent_bindings_with_cleanups(
+	bindings: List[CoreConcurrentBinding],
+	cleanups: List[CoreExpr],
+) -> List[CoreConcurrentBinding]:
+	var result: List[CoreConcurrentBinding] = []
+
+	for binding in bindings:
+		result = result.append(rewrite_concurrent_binding_with_cleanups(binding, cleanups))
+
+	result
+
+
+private pure func rewrite_optional_expr_with_cleanups(
+	expr: Option[CoreExpr],
+	cleanups: List[CoreExpr],
+) -> Option[CoreExpr]:
+	match expr:
+		Some(value):
+			Some(rewrite_resource_expr_with_cleanups(value, cleanups))
+		None:
+			None
+
+
+private pure func rewrite_concurrently_loop_with_cleanups(
+	loop: CoreConcurrentlyLoop,
+	cleanups: List[CoreExpr],
+) -> CoreConcurrentlyLoop:
+	{
+		variable = loop.variable,
+		item_type = loop.item_type,
+		item_mode = loop.item_mode,
+		iterable = rewrite_resource_expr_with_cleanups(loop.iterable, cleanups),
+		body = rewrite_resource_expr_with_cleanups(loop.body, []),
+		timeout = rewrite_optional_expr_with_cleanups(loop.timeout, cleanups),
+		limit = rewrite_resource_expr_with_cleanups(loop.limit, cleanups),
+		output = loop.output,
+		task = loop.task
+	}
+
+
+private pure func rewrite_concurrent_with_cleanups(
+	block: CoreConcurrentBlock,
+	cleanups: List[CoreExpr],
+) -> CoreConcurrentBlock:
+	{
+		bindings = rewrite_concurrent_bindings_with_cleanups(block.bindings, cleanups),
+		body = rewrite_resource_expr_with_cleanups(block.body, cleanups),
+		timeout = rewrite_optional_expr_with_cleanups(block.timeout, cleanups),
+		max_threads = block.max_threads
+	}
+
+
+private pure func rewrite_select_recv_arm_with_cleanups(
+	recv: CoreSelectRecvArm,
+	cleanups: List[CoreExpr],
+) -> CoreSelectRecvArm:
+	{
+		binder = recv.binder,
+		elem_type = recv.elem_type,
+		channel = rewrite_resource_expr_with_cleanups(recv.channel, cleanups)
+	}
+
+
+private pure func rewrite_select_arm_kind_with_cleanups(
+	kind: CoreSelectArmKind,
+	cleanups: List[CoreExpr],
+) -> CoreSelectArmKind:
+	match kind:
+		SelectRecvArm(recv):
+			SelectRecvArm(rewrite_select_recv_arm_with_cleanups(recv, cleanups))
+		SelectSealedArm(channel):
+			SelectSealedArm(rewrite_resource_expr_with_cleanups(channel, cleanups))
+		SelectAfterArm(timeout):
+			SelectAfterArm(rewrite_resource_expr_with_cleanups(timeout, cleanups))
+
+
+private pure func rewrite_select_arm_with_cleanups(
+	arm: CoreSelectArm,
+	cleanups: List[CoreExpr],
+) -> CoreSelectArm:
+	{
+		kind = rewrite_select_arm_kind_with_cleanups(arm.kind, cleanups),
+		body = rewrite_resource_expr_with_cleanups(arm.body, []),
+		loc = arm.loc
+	}
+
+
+private pure func rewrite_select_arms_with_cleanups(
+	arms: List[CoreSelectArm],
+	cleanups: List[CoreExpr],
+) -> List[CoreSelectArm]:
+	var result: List[CoreSelectArm] = []
+
+	for arm in arms:
+		result = result.append(rewrite_select_arm_with_cleanups(arm, cleanups))
+
+	result
+
+
+private pure func rewrite_select_with_cleanups(
+	select_expr: CoreSelect,
+	cleanups: List[CoreExpr],
+) -> CoreSelect:
+	{arms = rewrite_select_arms_with_cleanups(select_expr.arms, cleanups)}
 
 
 private pure func rewrite_literal_match_cases_with_cleanups(
@@ -793,6 +979,39 @@ private pure func rewrite_resource_expr_with_cleanups(
 				typ,
 				loc,
 			)
+		ForStringExpr(for_string, typ, loc):
+			ForStringExpr(
+				{
+					binder = for_string.binder,
+					iterable = rewrite_resource_expr_with_cleanups(for_string.iterable, cleanups),
+					iterable_release_policy = for_string.iterable_release_policy,
+					body = rewrite_resource_expr_with_cleanups(for_string.body, [])
+				},
+				typ,
+				loc,
+			)
+		ForDictExpr(for_dict, typ, loc):
+			ForDictExpr(
+				{
+					binder = for_dict.binder,
+					iterable = rewrite_resource_expr_with_cleanups(for_dict.iterable, cleanups),
+					iterable_release_policy = for_dict.iterable_release_policy,
+					body = rewrite_resource_expr_with_cleanups(for_dict.body, [])
+				},
+				typ,
+				loc,
+			)
+		ForSetExpr(for_set, typ, loc):
+			ForSetExpr(
+				{
+					binder = for_set.binder,
+					iterable = rewrite_resource_expr_with_cleanups(for_set.iterable, cleanups),
+					iterable_release_policy = for_set.iterable_release_policy,
+					body = rewrite_resource_expr_with_cleanups(for_set.body, [])
+				},
+				typ,
+				loc,
+			)
 		ForResourceSourceExpr(for_resource_source, typ, loc):
 			ForResourceSourceExpr(
 				{
@@ -829,6 +1048,26 @@ private pure func rewrite_resource_expr_with_cleanups(
 				},
 				typ,
 				loc,
+				)
+		DetachExpr(detached, typ, loc):
+			expr
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			ConcurrentlyLoopExpr(
+				rewrite_concurrently_loop_with_cleanups(loop, cleanups),
+				typ,
+				loc,
+			)
+		ConcurrentExpr(block, typ, loc):
+			ConcurrentExpr(
+				rewrite_concurrent_with_cleanups(block, cleanups),
+				typ,
+				loc,
+			)
+		SelectExpr(select_expr, typ, loc):
+			SelectExpr(
+				rewrite_select_with_cleanups(select_expr, cleanups),
+				typ,
+				loc,
 			)
 		TailrecLoopExpr(params, return_type, body, loc):
 			TailrecLoopExpr(
@@ -837,6 +1076,8 @@ private pure func rewrite_resource_expr_with_cleanups(
 				rewrite_resource_expr_with_cleanups(body, []),
 				loc,
 			)
+		TailrecListSpreadLoopExpr(loop, loc):
+			TailrecListSpreadLoopExpr(rewrite_tailrec_list_spread_loop_with_cleanups(loop), loc)
 		CallExpr(kind, callee, args, typ, loc):
 			CallExpr(
 				kind,
@@ -1056,6 +1297,12 @@ private pure func rewrite_resource_expr_with_cleanups(
 				typ,
 				loc,
 			)
+		ListSwapExpr(swap, typ, loc):
+			ListSwapExpr(
+				rewrite_list_swap_with_cleanups(swap, cleanups),
+				typ,
+				loc,
+			)
 		RecordExpr(fields, typ, loc):
 			RecordExpr(
 				rewrite_record_fields_with_cleanups(fields, cleanups),
@@ -1084,6 +1331,8 @@ private pure func rewrite_resource_expr_with_cleanups(
 				typ,
 				loc,
 			)
+		DetachExpr(detached, typ, loc):
+			expr
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			DupExpr(
 				variable,
@@ -1174,6 +1423,13 @@ private pure func rewrite_resource_expr_with_cleanups(
 		TailrecRecurExpr(args, typ, loc):
 			TailrecRecurExpr(
 				rewrite_resource_expr_list_with_cleanups(args, cleanups),
+				typ,
+				loc,
+			)
+		TailrecListSpreadRecurExpr(rebinds, cursor_advance, typ, loc):
+			TailrecListSpreadRecurExpr(
+				rewrite_tailrec_list_spread_rebinds_with_cleanups(rebinds, cleanups),
+				cursor_advance,
 				typ,
 				loc,
 			)

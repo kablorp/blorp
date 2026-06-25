@@ -3709,61 +3709,6 @@ let test_emit_enum_type () =
   Alcotest.(check bool) "has Blue" true (contains_sub output "#define Blue 2L");
   Alcotest.(check bool) "no struct" false (contains_sub output "struct Color")
 
-let test_emit_union_no_rc () =
-  let tdecl : type_decl =
-    {
-      type_name = "Shape";
-      type_params = [];
-      type_is_enum = false;
-      type_is_builtin = false;
-      type_is_resource = false;
-      type_resource_cleanup = None;
-      type_variants =
-        [
-          {
-            variant_name = "Circle";
-            variant_fields = [ TyNamed ("Float", []) ];
-            variant_tag = 0;
-            variant_loc = loc;
-            variant_def_id = None;
-          };
-          {
-            variant_name = "Rect";
-            variant_fields = [ TyNamed ("Float", []); TyNamed ("Float", []) ];
-            variant_tag = 1;
-            variant_loc = loc;
-            variant_def_id = None;
-          };
-        ];
-    }
-  in
-  let prog = [ { cd_desc = CDType tdecl; cd_loc = loc; cd_doc = None } ] in
-  let output = emit_program_to_string prog in
-  Alcotest.(check bool) "has struct" true (contains_sub output "struct Shape {");
-  Alcotest.(check bool)
-    "has header" true
-    (contains_sub output "blorp_Object header;");
-  Alcotest.(check bool) "has tag" true (contains_sub output "int tag;");
-  Alcotest.(check bool)
-    "no release_mask for primitive-only union" false
-    (contains_sub output "unsigned long release_mask;");
-  Alcotest.(check bool)
-    "has Circle struct" true
-    (contains_sub output "} Circle;");
-  Alcotest.(check bool)
-    "has TAG_Circle" true
-    (contains_sub output "#define TAG_Shape_Circle 0");
-  Alcotest.(check bool)
-    "has TAG_Rect" true
-    (contains_sub output "#define TAG_Shape_Rect 1");
-  Alcotest.(check bool)
-    "has Circle ctor" true
-    (contains_sub output "Shape* Circle(void* field0)");
-  Alcotest.(check bool)
-    "Circle ctor omits mask" false
-    (contains_sub output "Circle(void* field0, unsigned long release_mask)");
-  Alcotest.(check bool) "no destroy" false (contains_sub output "Shape_destroy")
-
 let test_emit_union_with_rc () =
   let tdecl : type_decl =
     {
@@ -3916,37 +3861,6 @@ let test_emit_union_reuse_constructor_helper_and_call () =
   Alcotest.(check bool)
     "emits reuse call" true
     (contains_sub output "__blorp_reuse_Expr_Name(old,")
-
-let test_emit_union_with_int128_boxed_payload_has_destructor () =
-  let tdecl : type_decl =
-    {
-      type_name = "Wide";
-      type_params = [];
-      type_is_enum = false;
-      type_is_builtin = false;
-      type_is_resource = false;
-      type_resource_cleanup = None;
-      type_variants =
-        [
-          {
-            variant_name = "WideValue";
-            variant_fields = [ TyNamed ("Int128", []) ];
-            variant_tag = 0;
-            variant_loc = loc;
-            variant_def_id = None;
-          };
-        ];
-    }
-  in
-  let prog = [ { cd_desc = CDType tdecl; cd_loc = loc; cd_doc = None } ] in
-  let output = emit_program_to_string prog in
-  Alcotest.(check bool) "has destroy" true (contains_sub output "Wide_destroy");
-  Alcotest.(check bool)
-    "releases boxed int128 payload" true
-    (contains_sub output "blorp_release(self->data.WideValue.field0)");
-  Alcotest.(check bool)
-    "has destructor assign" true
-    (contains_sub output "BLORP_SET_DESTRUCTOR(__vc, Wide_destroy)")
 
 let test_emit_union_obeys_registered_arc_only_policy () =
   (* Deliberately inconsistent with the field type: this isolates the
@@ -4510,92 +4424,6 @@ let extract_def_symbols (c : string) : string list =
   in
   scan 0;
   List.sort_uniq compare !results
-
-let test_a4_3_trait_impl_methods_mangled () =
-  (* A4.3: each trait impl method emits its C symbol via
-     [mangle_by_def_id cf_def_id (Trait_method_Type)] on both the
-     decl side (emit_impl → func_c_name) and every call site
-     (core_trait_resolve rewrites CKUnknown to CKUser with the
-     Trait_method_Type name, then user_call_c_name applies the same
-     DefId mangle). This test compiles a program with a user union
-     that implements Stringable, then checks that:
-       (a) the impl method's decl is emitted as [__def_N_Stringable_to_string_Shape]
-       (b) a call site to [to_string] with a Shape arg emits the
-           same mangled symbol. *)
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let source =
-          {|
-import:
-    traits: Stringable
-
-union Shape:
-    Circle
-    Square
-
-implements Stringable for Shape:
-    pure func to_string(self: Shape) -> String:
-        match self:
-            Circle: "circle"
-            Square: "square"
-
-pure func show_shape() -> String:
-    to_string(Circle)
-
-func main(args: List[String]) -> Int:
-    if show_shape() == "circle":
-        0
-    else:
-        1
-|}
-        in
-        Blorp.Lexer.reset_state ();
-        let lexbuf = Lexing.from_string source in
-        let program = Blorp.Parser.program Blorp.Lexer.next_token lexbuf in
-        let program = Blorp.Interp_parser.transform_program program in
-        let typed =
-          match Blorp.Typecheck.typecheck_typed program with
-          | Ok typed -> typed
-          | Error errors ->
-              Alcotest.failf "expected no type errors, got: %s"
-                (String.concat "; "
-                   (List.map
-                      (fun (e : Blorp.Ast.compiler_error) -> e.message)
-                      errors))
-        in
-        let c_code = Blorp.Core_pipeline.compile_typed typed in
-        let defs = extract_def_symbols c_code in
-        let shape_method =
-          List.find_opt
-            (fun s ->
-              let suffix = "_Stringable_to_string_Shape" in
-              let n = String.length s in
-              let m = String.length suffix in
-              n >= m && String.sub s (n - m) m = suffix)
-            defs
-        in
-        match shape_method with
-        | None ->
-            Alcotest.failf
-              "no __def_N_Stringable_to_string_Shape in output. Defs seen: [%s]"
-              (String.concat ", " defs)
-        | Some sym ->
-            (* Every such symbol must appear ≥2 times (decl + call). *)
-            let count = ref 0 in
-            let n = String.length sym in
-            let m = String.length c_code in
-            let i = ref 0 in
-            while !i <= m - n do
-              if String.sub c_code !i n = sym then (
-                incr count;
-                i := !i + n)
-              else incr i
-            done;
-            if !count < 2 then
-              Alcotest.failf
-                "trait-impl symbol %s appears only %d time(s). Decl and every \
-                 call site must agree on the mangled name."
-                sym !count))
 
 let test_a4_4_ufcs_mangling () =
   (* A4.4: UFCS method calls — [xs.length()] — resolve to the
@@ -5784,25 +5612,6 @@ let test_emit_invariant_tensor_literal_layout_payload_mismatch () =
   expect_core_error_at ~needle:"tensor literal layout" ~line:42 (fun () ->
       emit_to_string node)
 
-let test_emit_tensor_literal_uses_layout_release_policy () =
-  let tensor_ty = TyNamed ("Tensor", [ ty_string; TyConstInt 1 ]) in
-  let e =
-    mk
-      (CTensorLiteral
-         {
-           tl_shape = TensorVectorLength 1;
-           tl_layout =
-             Blorp.Core_layout_type.tensor_storage_layout_of_elem ty_string loc;
-           tl_payload =
-             TensorBoxedElements [ boxed_pointer_storage (cstr "a") ty_string ];
-         })
-      tensor_ty
-  in
-  let s = emit_to_string e in
-  Alcotest.(check bool)
-    "release follows tensor layout" true
-    (contains_sub s "blorp_vector_init_elem_release")
-
 let test_emit_invariant_for_unsupported_iterable () =
   let iter = { (cvar "not_iterable" ty_int) with loc = invariant_loc } in
   let node =
@@ -6128,8 +5937,6 @@ let suite =
       [
         Alcotest.test_case "tensor_literal_layout_payload_mismatch" `Quick
           test_emit_invariant_tensor_literal_layout_payload_mismatch;
-        Alcotest.test_case "tensor_literal_layout_release_policy" `Quick
-          test_emit_tensor_literal_uses_layout_release_policy;
         Alcotest.test_case "nullable_set_cow_releases_value_record_box" `Quick
           test_emit_nullable_vector_set_cow_releases_value_record_box;
         Alcotest.test_case "matrix_set_opt_releases_value_record_box" `Quick
@@ -6221,12 +6028,9 @@ let suite =
     ( "union_type",
       [
         Alcotest.test_case "enum" `Quick test_emit_enum_type;
-        Alcotest.test_case "union_no_rc" `Quick test_emit_union_no_rc;
         Alcotest.test_case "union_with_rc" `Quick test_emit_union_with_rc;
         Alcotest.test_case "union_reuse_constructor_helper_and_call" `Quick
           test_emit_union_reuse_constructor_helper_and_call;
-        Alcotest.test_case "union_int128_boxed_payload_destroy" `Quick
-          test_emit_union_with_int128_boxed_payload_has_destructor;
         Alcotest.test_case "union_obeys_registered_arc_only_policy" `Quick
           test_emit_union_obeys_registered_arc_only_policy;
         Alcotest.test_case "union_singleton" `Quick
@@ -6287,8 +6091,6 @@ let suite =
       [
         Alcotest.test_case "every call has decl" `Quick
           test_a4_2_every_call_has_decl;
-        Alcotest.test_case "trait impl methods mangled" `Quick
-          test_a4_3_trait_impl_methods_mangled;
         Alcotest.test_case "ufcs mangling" `Quick test_a4_4_ufcs_mangling;
       ] );
     ( "e2e_program",

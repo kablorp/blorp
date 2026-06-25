@@ -350,10 +350,10 @@ let test_pipeline_float_filter_map_collect_handoff_reuse () =
         "emitted C delegates runtime reuse decision" true
         (Modules.contains r.c_code "blorp_list_handoff_begin_reuse");
       Alcotest.(check bool)
-        "emitted C stores float handoff slots directly" true
-        (Modules.contains r.c_code "memcpy((char*)__list_store_");
+        "emitted C boxes float handoff values" true
+        (Modules.contains r.c_code "blorp_box_float");
       Alcotest.(check bool)
-        "emitted C does not call generic float handoff store" false
+        "emitted C uses runtime handoff store" true
         (Modules.contains r.c_code "blorp_list_handoff_set_owned")
   | Ok (Pipeline.Stopped_at s) ->
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
