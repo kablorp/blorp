@@ -159,13 +159,13 @@ private pure func dispatch_error_message(error: BridgeDispatchError) -> String:
 		ProtocolError(_):
 			"invalid bridge request"
 		MissingStringField(field_name):
-			"missing string field `" + field_name + "`"
+			"missing string field `${field_name}`"
 		ExpectedRequestField(field_name, expected):
-			"field `" + field_name + "` must be " + expected
+			"field `${field_name}` must be ${expected}"
 		UnsupportedRenderer(renderer):
-			"unsupported Blorp renderer: " + renderer
+			"unsupported Blorp renderer: ${renderer}"
 		UnsupportedBridgeAction(action):
-			"unsupported Blorp bridge renderer action: " + bridge_action_name(action)
+			"unsupported Blorp bridge renderer action: ${bridge_action_name(action)}"
 		CoreJsonFailure(message):
 			message
 		RenderFailure(message):
@@ -221,15 +221,44 @@ private pure func string_field(
 	value: JsonValue,
 	field_name: String,
 ) -> Result[String, BridgeDispatchError]:
-	match get_field(value, field_name):
-		Some(field):
-			match as_string(field):
-				Some(text):
-					Ok(owned_string(text))
-				None:
-					Err(ExpectedRequestField(field_name, "a string"))
+	field ?= get_field(value, field_name).to_result(MissingStringField(field_name))
+	as_string(field)
+		.map(owned_string)
+		.to_result(ExpectedRequestField(field_name, "a string"))
+
+
+private pure func strings_from_json_array(
+	items: List[JsonValue],
+	field_name: String,
+) -> Result[List[String], BridgeDispatchError]:
+	strings_from_json_array_at(items, field_name, 0, [])
+
+
+private pure func string_from_json_array_item(
+	item: JsonValue,
+	field_name: String,
+) -> Result[String, BridgeDispatchError]:
+	text ?= as_string(item).to_result(ExpectedRequestField(field_name, "an array of strings"))
+	Ok(owned_string(text))
+
+
+private pure func strings_from_json_array_at(
+	items: List[JsonValue],
+	field_name: String,
+	index: Int,
+	result: List[String],
+) -> Result[List[String], BridgeDispatchError]:
+	match items.get(index):
+		Some(item):
+			text ?= string_from_json_array_item(item, field_name)
+			strings_from_json_array_at(
+				items,
+				field_name,
+				index + 1,
+				result.append(text),
+			)
 		None:
-			Err(MissingStringField(field_name))
+			Ok(result)
 
 
 private pure func string_array_field(
@@ -238,34 +267,8 @@ private pure func string_array_field(
 ) -> Result[List[String], BridgeDispatchError]:
 	match get_field(value, field_name):
 		Some(field):
-			match as_array(field):
-				Some(items):
-					var result: List[String] = []
-					var error: Option[BridgeDispatchError] = None
-
-					for item in items:
-						match error:
-							Some(_):
-								void
-							None:
-								match as_string(item):
-									Some(text):
-										result = result.append(owned_string(text))
-									None:
-										error = Some(
-											ExpectedRequestField(
-												field_name,
-												"an array of strings",
-											),
-										)
-
-					match error:
-						Some(err):
-							Err(err)
-						None:
-							Ok(result)
-				None:
-					Err(ExpectedRequestField(field_name, "an array"))
+			items ?= as_array(field).to_result(ExpectedRequestField(field_name, "an array"))
+			strings_from_json_array(items, field_name)
 		None:
 			Ok([])
 
@@ -299,11 +302,7 @@ private pure func json_field(
 	field_name: String,
 	expected: String,
 ) -> Result[JsonValue, BridgeDispatchError]:
-	match get_field(value, field_name):
-		Some(field):
-			Ok(field)
-		None:
-			Err(ExpectedRequestField(field_name, expected))
+	get_field(value, field_name).to_result(ExpectedRequestField(field_name, expected))
 
 
 private pure func render_item_value(value: JsonValue) -> Result[RenderItem, BridgeDispatchError]:
@@ -316,35 +315,37 @@ private pure func render_item_value(value: JsonValue) -> Result[RenderItem, Brid
 	})
 
 
+private pure func render_items_from_json_array(
+	items: List[JsonValue],
+) -> Result[List[RenderItem], BridgeDispatchError]:
+	render_items_from_json_array_at(items, 0, [])
+
+
+private pure func render_items_from_json_array_at(
+	items: List[JsonValue],
+	index: Int,
+	result: List[RenderItem],
+) -> Result[List[RenderItem], BridgeDispatchError]:
+	match items.get(index):
+		Some(item):
+			render_item ?= render_item_value(item)
+			render_items_from_json_array_at(
+				items,
+				index + 1,
+				result.append(render_item),
+			)
+		None:
+			Ok(result)
+
+
 private pure func render_items_field(
 	value: JsonValue,
 	field_name: String,
 ) -> Result[List[RenderItem], BridgeDispatchError]:
 	match get_field(value, field_name):
 		Some(field):
-			match as_array(field):
-				Some(items):
-					var result: List[RenderItem] = []
-					var error: Option[BridgeDispatchError] = None
-
-					for item in items:
-						match error:
-							Some(_):
-								void
-							None:
-								match render_item_value(item):
-									Ok(render_item):
-										result = result.append(render_item)
-									Err(err):
-										error = Some(err)
-
-					match error:
-						Some(err):
-							Err(err)
-						None:
-							Ok(result)
-				None:
-					Err(ExpectedRequestField(field_name, "an array"))
+			items ?= as_array(field).to_result(ExpectedRequestField(field_name, "an array"))
+			render_items_from_json_array(items)
 		None:
 			Ok([])
 
@@ -363,77 +364,55 @@ private pure func render_with(
 ) -> Result[String, BridgeDispatchError]:
 	match renderer:
 		IntrinsicRenderer:
-			match Intrinsic.render_intrinsic(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(Intrinsic.render_error_to_string(error)))
+			Intrinsic
+				.render_intrinsic(op, args)
+				.map_err(func(error): RenderFailure(Intrinsic.render_error_to_string(error)))
 		PreparedBackendRenderer:
-			match PreparedBackend.render_prepared_backend(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(PreparedBackend.render_error_to_string(error)))
+			PreparedBackend
+				.render_prepared_backend(op, args)
+				.map_err(func(error): RenderFailure(PreparedBackend.render_error_to_string(error)))
 		PreparedListRenderer:
-			match PreparedList.render_prepared_list(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(PreparedList.render_error_to_string(error)))
+			PreparedList
+				.render_prepared_list(op, args)
+				.map_err(func(error): RenderFailure(PreparedList.render_error_to_string(error)))
 		PreparedTensorRenderer:
-			match PreparedTensor.render_prepared_tensor(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(PreparedTensor.render_error_to_string(error)))
+			PreparedTensor
+				.render_prepared_tensor(op, args)
+				.map_err(func(error): RenderFailure(PreparedTensor.render_error_to_string(error)))
 		PreparedConstructorRenderer:
-			match PreparedConstructor.render_prepared_constructor(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(PreparedConstructor.render_error_to_string(error)))
+			PreparedConstructor
+				.render_prepared_constructor(op, args)
+				.map_err(
+					func(error): RenderFailure(PreparedConstructor.render_error_to_string(error)),
+				)
 		PreparedTupleRenderer:
-			match PreparedTuple.render_prepared_tuple(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(PreparedTuple.render_error_to_string(error)))
+			PreparedTuple
+				.render_prepared_tuple(op, args)
+				.map_err(func(error): RenderFailure(PreparedTuple.render_error_to_string(error)))
 		CoreErrorRenderer:
-			match CoreError.render_core_error(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(CoreError.render_error_to_string(error)))
+			CoreError
+				.render_core_error(op, args)
+				.map_err(func(error): RenderFailure(CoreError.render_error_to_string(error)))
 		CoreFairnessRenderer:
-			match CoreFairness.render_fairness(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(CoreFairness.render_error_to_string(error)))
+			CoreFairness
+				.render_fairness(op, args)
+				.map_err(func(error): RenderFailure(CoreFairness.render_error_to_string(error)))
 		CoreProfileRenderer:
-			match CoreProfile.render_core_profile(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(CoreProfile.render_error_to_string(error)))
+			CoreProfile
+				.render_core_profile(op, args)
+				.map_err(func(error): RenderFailure(CoreProfile.render_error_to_string(error)))
 		CoreStageRenderer:
-			match CoreStage.render_core_stage(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(CoreStage.render_error_to_string(error)))
+			CoreStage
+				.render_core_stage(op, args)
+				.map_err(func(error): RenderFailure(CoreStage.render_error_to_string(error)))
 		CoreTraitResolveRenderer:
-			match CoreTraitResolve.render_core_trait_resolve(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(CoreTraitResolve.render_error_to_string(error)))
+			CoreTraitResolve
+				.render_core_trait_resolve(op, args)
+				.map_err(func(error): RenderFailure(CoreTraitResolve.render_error_to_string(error)))
 		LanguageSurfaceRenderer:
-			match LanguageSurface.render_language_surface(op, args):
-				Ok(text):
-					Ok(text)
-				Err(error):
-					Err(RenderFailure(LanguageSurface.render_error_to_string(error)))
+			LanguageSurface
+				.render_language_surface(op, args)
+				.map_err(func(error): RenderFailure(LanguageSurface.render_error_to_string(error)))
 
 
 private pure func renderer_template_json(name: String, arity: Int) -> JsonValue:
@@ -575,43 +554,51 @@ private pure func rendered_item_json(
 	]))
 
 
+private pure func rendered_items_json_at(
+	renderer: BridgeRenderer,
+	items: List[RenderItem],
+	index: Int,
+	rendered: List[JsonValue],
+) -> Result[List[JsonValue], BridgeDispatchError]:
+	match items.get(index):
+		Some(item):
+			rendered_item ?= rendered_item_json(renderer, item)
+			rendered_items_json_at(
+				renderer,
+				items,
+				index + 1,
+				rendered.append(rendered_item),
+			)
+		None:
+			Ok(rendered)
+
+
+private pure func rendered_items_json(
+	renderer: BridgeRenderer,
+	items: List[RenderItem],
+) -> Result[List[JsonValue], BridgeDispatchError]:
+	rendered_items_json_at(renderer, items, 0, [])
+
+
 private pure func handle_render_many(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
 	renderer ?= renderer_from_request(body)
 	items ?= render_items_field(body, "items")
-	var rendered: List[JsonValue] = []
-	var error: Option[BridgeDispatchError] = None
+	rendered ?= rendered_items_json(renderer, items)
 
-	for item in items:
-		match error:
-			Some(_):
-				void
-			None:
-				match rendered_item_json(renderer, item):
-					Ok(rendered_item):
-						rendered = rendered.append(rendered_item)
-					Err(err):
-						error = Some(err)
-
-	match error:
-		Some(err):
-			Err(err)
-		None:
-			Ok(success_json([("items", JsonVector(rendered))]))
+	Ok(success_json([("items", JsonVector(rendered))]))
 
 
 private pure func handle_emit_c(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
 	core_json ?= json_field(body, "core", "Core program JSON")
 	profile ?= optional_bool_field(body, "profile", False)
+	program ?= decode_core_program_json(
+		core_json,
+	).map_err(
+		func(error): CoreJsonFailure(core_json_error_to_string(error)),
+	)
+	artifact = emit_prepared_core_program_c_artifact_with_options(program, {profile = profile})
 
-	match decode_core_program_json(core_json):
-		Ok(program):
-			artifact = emit_prepared_core_program_c_artifact_with_options(
-				program,
-				{profile = profile},
-			)
-			Ok(bridge_success_json(c_artifact_to_json(artifact)))
-		Err(error):
-			Err(CoreJsonFailure(core_json_error_to_string(error)))
+	Ok(bridge_success_json(c_artifact_to_json(artifact)))
 
 
 private pure func handle_prepare_and_emit_c(
@@ -619,16 +606,14 @@ private pure func handle_prepare_and_emit_c(
 ) -> Result[JsonValue, BridgeDispatchError]:
 	core_json ?= json_field(body, "core", "Core program JSON")
 	profile ?= optional_bool_field(body, "profile", False)
+	program ?= decode_core_program_json(
+		core_json,
+	).map_err(
+		func(error): CoreJsonFailure(core_json_error_to_string(error)),
+	)
+	artifact = prepare_and_emit_core_program_c_artifact_with_options(program, {profile = profile})
 
-	match decode_core_program_json(core_json):
-		Ok(program):
-			artifact = prepare_and_emit_core_program_c_artifact_with_options(
-				program,
-				{profile = profile},
-			)
-			Ok(bridge_success_json(c_artifact_to_json(artifact)))
-		Err(error):
-			Err(CoreJsonFailure(core_json_error_to_string(error)))
+	Ok(bridge_success_json(c_artifact_to_json(artifact)))
 
 
 private pure func handle_run_core_pipeline(
@@ -636,17 +621,17 @@ private pure func handle_run_core_pipeline(
 ) -> Result[JsonValue, BridgeDispatchError]:
 	stage_name ?= string_field(body, "stage")
 	core_json ?= json_field(body, "core", "Core program JSON")
+	stage ?= CorePipeline
+		.parse_core_pipeline_stage(stage_name)
+		.to_result(ExpectedRequestField("stage", "a supported Core pipeline stage"))
+	program ?= decode_core_program_json(
+		core_json,
+	).map_err(
+		func(error): CoreJsonFailure(core_json_error_to_string(error)),
+	)
+	transformed = CorePipeline.run_core_pipeline_stage(stage, program)
 
-	match CorePipeline.parse_core_pipeline_stage(stage_name):
-		Some(stage):
-			match decode_core_program_json(core_json):
-				Ok(program):
-					transformed = CorePipeline.run_core_pipeline_stage(stage, program)
-					Ok(success_json([("core", core_program_to_json(transformed))]))
-				Err(error):
-					Err(CoreJsonFailure(core_json_error_to_string(error)))
-		None:
-			Err(ExpectedRequestField("stage", "a supported Core pipeline stage"))
+	Ok(success_json([("core", core_program_to_json(transformed))]))
 
 
 private pure func handle_envelope(
@@ -678,18 +663,12 @@ private pure func handle_envelope(
 pure func handle_request_value(root: JsonValue) -> JsonValue:
 	match decode_bridge_envelope_value(root):
 		Ok(envelope):
-			match handle_envelope(envelope):
-				Ok(response):
-					response
-				Err(error):
-					dispatch_error_json(error)
+			handle_envelope(envelope).get_or_else(dispatch_error_json)
 		Err(error):
 			bridge_error_json(error)
 
 
 pure func handle_request(source: String) -> String:
-	match parse_json(source):
-		Ok(root):
-			handle_request_value(root).to_string()
-		Err(message):
-			bridge_error_json(InvalidJson(message)).to_string()
+	parse_json(source)
+		.map(func(root): handle_request_value(root).to_string())
+		.get_or_else(func(message): bridge_error_json(InvalidJson(message)).to_string())

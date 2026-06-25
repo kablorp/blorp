@@ -6,6 +6,7 @@
 import:
 	codegen_intrinsic_renderer as Intrinsic
 	codegen_prepared_backend_renderer:
+		CapacityCustomCtorArgs,
 		ChannelRecvAttemptConstructors,
 		ChannelRecvReleasePolicy(KeepChannelRecvValue, ReleaseChannelRecvValue),
 		ChannelRecvTimeoutAttemptArgs,
@@ -27,7 +28,6 @@ import:
 		ChannelTryRecvAttemptNoReleaseMaskArgs,
 		ChannelTrySendAttemptArgs,
 		ChannelWithElemReleaseArgs,
-		CapacityCustomCtorArgs,
 		CustomCtorArgs,
 		DictConstructWithBodyArgs,
 		DictKeyReleasePolicy(DictKeepKey),
@@ -111,18 +111,19 @@ import:
 		StackOptionVoidStatementArgs,
 		render_prepared_constructor_op,
 	codegen_prepared_list_renderer:
-		InlineBitsSwapArgs,
 		InlineBitsLoadArgs,
 		InlineBitsStoreArgs,
-		InlineStructSwapArgs,
+		InlineBitsSwapArgs,
 		InlineStructLoadArgs,
 		InlineStructStoreArgs,
 		InlineStructStoreBoxing(StackResultBoxing, StructAddressBoxing),
+		InlineStructSwapArgs,
 		ListHandoffBorrowSuffixArgs,
 		ListHandoffPrefixArgs,
 		ListHandoffReuseSuffixArgs,
 		ListInlineStructUnboxOpenArgs,
 		PointerStoreArgs,
+		PointerSwapArgs,
 		PreparedListOp(
 			CopySpanUninit,
 			EnsureCapacity,
@@ -152,7 +153,6 @@ import:
 			PointerHandoffSetOwnedStore,
 			PointerSwap,
 		),
-		PointerSwapArgs,
 		SourceSlotHandoffArgs,
 		render_prepared_list_op,
 	codegen_prepared_tensor_renderer:
@@ -361,9 +361,9 @@ import:
 			ConcurrentExpr,
 			ConstructorMatchExpr,
 			CooperativeCheckpointExpr,
-				ContinueExpr,
-				DetachExpr,
-				DictConstructExpr,
+			ContinueExpr,
+			DetachExpr,
+			DictConstructExpr,
 			DupExpr,
 			DropExpr,
 			FieldExpr,
@@ -465,8 +465,8 @@ import:
 		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
 		CoreListRetain,
 		CoreListSet,
-		CoreListSwap,
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
+		CoreListSwap,
 		CoreLiteral(
 			BoolLiteral,
 			CharLiteral,
@@ -672,7 +672,15 @@ private record FloatModuloRuntime {
 }
 
 
-private C_ARTIFACT_HEADER: String = "/* Blorp final Core C artifact */\n#include <math.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n"
+private C_ARTIFACT_HEADER_BODY: String =
+	|/* Blorp final Core C artifact */
+	|#include <math.h>
+	|#include <stdint.h>
+	|#include <stdio.h>
+	|#include <stdlib.h>
+	|#include <string.h>
+
+private C_ARTIFACT_HEADER: String = C_ARTIFACT_HEADER_BODY + "\n\n"
 
 
 private pure func emit_foreign_include(header: String) -> String:
@@ -2496,21 +2504,21 @@ private pure func float_modulo_runtime(typ: CoreType) -> Option[FloatModuloRunti
 					c_type = "double",
 					zero_value = "0.0",
 					function_name = "fmod",
-					cast_via_double = False
+					cast_via_double = False,
 				})
 			else if name == "Float32" and args.length() == 0:
 				Some({
 					c_type = "float",
 					zero_value = "0.0f",
 					function_name = "fmodf",
-					cast_via_double = False
+					cast_via_double = False,
 				})
 			else if name == "Float16" and args.length() == 0:
 				Some({
 					c_type = "_Float16",
 					zero_value = "(_Float16)0.0",
 					function_name = "fmod",
-					cast_via_double = True
+					cast_via_double = True,
 				})
 			else:
 				None
@@ -4154,74 +4162,96 @@ private pure func is_box_expr(expr: CoreExpr) -> Bool:
 			False
 
 
+private union DirectNonboxedTensorCall:
+	DirectVectorFillCall(CoreExpr, String, String)
+	DirectMatrixFillCall(CoreExpr, String, String, String)
+	DirectCheckedSetCall(CoreExpr, String, String, String)
+	DirectVectorSetCowNullableCall(CoreExpr, String, String, String)
+	DirectMatrixCheckedSetCall(CoreExpr, String, String, String, String)
+
+
+private pure func parse_direct_nonboxed_tensor_call(
+	name: String,
+	args: List[CoreExpr],
+	arg_values: List[String],
+) -> Option[DirectNonboxedTensorCall]:
+	match (name, args, arg_values):
+		("blorp_vector_new_fill", [value_expr, size_expr], [value_c, size_c]):
+			Some(DirectVectorFillCall(value_expr, value_c, size_c))
+		("blorp_matrix_new_fill", [value_expr, rows_expr, cols_expr], [value_c, rows_c, cols_c]):
+			Some(DirectMatrixFillCall(value_expr, value_c, rows_c, cols_c))
+		("blorp_checked_set", [tensor_expr, index_expr, value_expr], [tensor_c, index_c, value_c]):
+			Some(DirectCheckedSetCall(value_expr, tensor_c, index_c, value_c))
+		("blorp_vector_set_cow_nullable", [tensor_expr, index_expr, value_expr], [tensor_c, index_c, value_c]):
+			Some(DirectVectorSetCowNullableCall(value_expr, tensor_c, index_c, value_c))
+		("blorp_matrix_checked_set", [tensor_expr, row_expr, col_expr, value_expr], [tensor_c, row_c, col_c, value_c]):
+			Some(DirectMatrixCheckedSetCall(value_expr, tensor_c, row_c, col_c, value_c))
+		_:
+			None
+
+
+private pure func emit_direct_nonboxed_runtime_call(
+	value_expr: CoreExpr,
+	name: String,
+	args: List[String],
+	typ: CoreType,
+) -> Option[String]:
+	if is_box_expr(value_expr):
+		None
+	else:
+		emit_direct_runtime_call(name, args, typ)
+
+
+private pure func emit_direct_nonboxed_tensor_call(
+	call: DirectNonboxedTensorCall,
+	typ: CoreType,
+) -> Option[String]:
+	match call:
+		DirectVectorFillCall(value_expr, value_c, size_c):
+			emit_direct_nonboxed_runtime_call(
+				value_expr,
+				"blorp_vector_new_fill",
+				[value_c, size_c],
+				typ,
+			)
+		DirectMatrixFillCall(value_expr, value_c, rows_c, cols_c):
+			emit_direct_nonboxed_runtime_call(
+				value_expr,
+				"blorp_matrix_new_fill",
+				[value_c, rows_c, cols_c],
+				typ,
+			)
+		DirectCheckedSetCall(value_expr, tensor_c, index_c, value_c):
+			emit_direct_nonboxed_runtime_call(
+				value_expr,
+				"blorp_checked_set",
+				[tensor_c, index_c, value_c],
+				typ,
+			)
+		DirectVectorSetCowNullableCall(value_expr, tensor_c, index_c, value_c):
+			emit_direct_nonboxed_runtime_call(
+				value_expr,
+				"blorp_vector_set_cow_nullable",
+				[tensor_c, index_c, value_c],
+				typ,
+			)
+		DirectMatrixCheckedSetCall(value_expr, tensor_c, row_c, col_c, value_c):
+			emit_direct_nonboxed_runtime_call(
+				value_expr,
+				"blorp_matrix_checked_set",
+				[tensor_c, row_c, col_c, value_c],
+				typ,
+			)
+
+
 private pure func emit_direct_nonboxed_tensor_call_from_values(
 	name: String,
 	args: List[CoreExpr],
 	arg_values: List[String],
 	typ: CoreType,
 ) -> Option[String]:
-	if name == "blorp_vector_new_fill":
-		match args:
-			[value_expr, size_expr]:
-				if is_box_expr(value_expr):
-					None
-				else:
-					emit_direct_runtime_call(name, arg_values, typ)
-			[]:
-				None
-			[value_expr]:
-				None
-			[value_expr, size_expr, extra_expr, ...rest]:
-				None
-	else if name == "blorp_matrix_new_fill":
-		match args:
-			[value_expr, rows_expr, cols_expr]:
-				if is_box_expr(value_expr):
-					None
-				else:
-					emit_direct_runtime_call(name, arg_values, typ)
-			[]:
-				None
-			[value_expr]:
-				None
-			[value_expr, rows_expr]:
-				None
-			[value_expr, rows_expr, cols_expr, extra_expr, ...rest]:
-				None
-	else if name == "blorp_vector_set_cow_nullable" or name == "blorp_checked_set":
-		match args:
-			[tensor_expr, index_expr, value_expr]:
-				if is_box_expr(value_expr):
-					None
-				else:
-					emit_direct_runtime_call(name, arg_values, typ)
-			[]:
-				None
-			[tensor_expr]:
-				None
-			[tensor_expr, index_expr]:
-				None
-			[tensor_expr, index_expr, value_expr, extra_expr, ...rest]:
-				None
-	else if name == "blorp_matrix_checked_set":
-		match args:
-			[tensor_expr, row_expr, col_expr, value_expr]:
-				if is_box_expr(value_expr):
-					None
-				else:
-					emit_direct_runtime_call(name, arg_values, typ)
-			[]:
-				None
-			[tensor_expr]:
-				None
-			[tensor_expr, row_expr]:
-				None
-			[tensor_expr, row_expr, col_expr]:
-				None
-			[tensor_expr, row_expr, col_expr, value_expr, extra_expr, ...rest]:
-				None
-	else:
-		None
+	call ?= parse_direct_nonboxed_tensor_call(name, args, arg_values)
+	emit_direct_nonboxed_tensor_call(call, typ)
 
 
 private pure func emit_intrinsic_call(name: String, args: List[CoreExpr]) -> Option[String]:
@@ -7093,9 +7123,7 @@ private pure func emit_inline_list_swap(swap: CoreListSwap, width_bytes: Int) ->
 	Some(render_prepared_list_op(InlineBitsSwap(args)))
 
 
-private pure func emit_inline_struct_list_swap(
-	swap: CoreListSwap,
-) -> Option[String]:
+private pure func emit_inline_struct_list_swap(swap: CoreListSwap) -> Option[String]:
 	list_c ?= emit_simple_expr(swap.list)
 	left_index_c ?= emit_simple_expr(swap.left_index)
 	right_index_c ?= emit_simple_expr(swap.right_index)
@@ -7794,7 +7822,7 @@ private pure func emit_struct_unbox_from_pointer_expr(
 	c_type: String,
 ) -> Option[String]:
 	value_c ?= emit_simple_expr(expr_value)
-	Some("blorp_unbox_struct(" + value_c + ", " + c_type + ")")
+	Some("blorp_unbox_struct(${value_c}, ${c_type})")
 
 
 private pure func c_unbox_value(
@@ -7804,21 +7832,30 @@ private pure func c_unbox_value(
 ) -> String:
 	match unbox_kind:
 		FloatUnbox:
-			"blorp_unbox_float(" + value_c + ")"
+			"blorp_unbox_float(${value_c})"
 		Float32Unbox:
-			"blorp_unbox_float32(" + value_c + ")"
+			"blorp_unbox_float32(${value_c})"
 		Float16Unbox:
-			"blorp_unbox_float16(" + value_c + ")"
+			"blorp_unbox_float16(${value_c})"
 		Int128Unbox:
-			"blorp_unbox_int128(" + value_c + ")"
+			"blorp_unbox_int128(${value_c})"
 		UInt128Unbox:
-			"blorp_unbox_uint128(" + value_c + ")"
+			"blorp_unbox_uint128(${value_c})"
 		PrimUnbox:
-			"((" + c_type_name(typ) + ")(long)" + value_c + ")"
+			"((${c_type_name(typ)})(long)${value_c})"
 		PointerUnbox:
-			"((" + c_type_name(typ) + ")" + value_c + ")"
+			"((${c_type_name(typ)})${value_c})"
 		StructUnbox(c_type):
-			"blorp_unbox_struct(" + value_c + ", " + c_type + ")"
+			"blorp_unbox_struct(${value_c}, ${c_type})"
+
+
+private pure func emit_scalar_unbox_expr(
+	unbox_kind: CoreUnboxKind,
+	expr_value: CoreExpr,
+	typ: CoreType,
+) -> Option[String]:
+	value_c ?= emit_simple_expr(expr_value)
+	Some(c_unbox_value(unbox_kind, typ, value_c))
 
 
 private pure func emit_unbox_expr(
@@ -7828,26 +7865,19 @@ private pure func emit_unbox_expr(
 ) -> Option[String]:
 	match unbox_kind:
 		FloatUnbox:
-			value_c ?= emit_simple_expr(expr_value)
-			Some(c_unbox_value(unbox_kind, typ, value_c))
+			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		Float32Unbox:
-			value_c ?= emit_simple_expr(expr_value)
-			Some(c_unbox_value(unbox_kind, typ, value_c))
+			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		Float16Unbox:
-			value_c ?= emit_simple_expr(expr_value)
-			Some(c_unbox_value(unbox_kind, typ, value_c))
+			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		Int128Unbox:
-			value_c ?= emit_simple_expr(expr_value)
-			Some(c_unbox_value(unbox_kind, typ, value_c))
+			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		UInt128Unbox:
-			value_c ?= emit_simple_expr(expr_value)
-			Some(c_unbox_value(unbox_kind, typ, value_c))
+			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		PrimUnbox:
-			value_c ?= emit_simple_expr(expr_value)
-			Some(c_unbox_value(unbox_kind, typ, value_c))
+			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		PointerUnbox:
-			value_c ?= emit_simple_expr(expr_value)
-			Some(c_unbox_value(unbox_kind, typ, value_c))
+			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		StructUnbox(c_type):
 			match expr_value:
 				ListGetExpr(get, list_get_type, loc):
@@ -11551,7 +11581,10 @@ private pure func emit_for_list(for_list: CoreForList, next_temp: Int) -> Option
 			})
 
 
-private pure func emit_for_string(for_string: CoreForString, next_temp: Int) -> Option[FunctionBodyC]:
+private pure func emit_for_string(
+	for_string: CoreForString,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
 	iterable_body ?= emit_scoped_expr_value("string_iterable", for_string.iterable, next_temp)
 	iterable_c ?= required_body_value(iterable_body)
 	temp_index: Int = iterable_body.next_temp
@@ -11579,16 +11612,16 @@ private pure func emit_for_string(for_string: CoreForString, next_temp: Int) -> 
 		iter_tmp,
 		for_string.iterable_release_policy,
 	)
-	iterable_release: String = emit_release_statement(
-		iter_tmp,
-		for_string.iterable_release_policy,
-	)
+	iterable_release: String = emit_release_statement(iter_tmp, for_string.iterable_release_policy)
 
 	Some({
 		statements = iterable_body.statements + indent_statements(
 			source_binding + "\n" + cleanup_push + loop_header,
 		) + indent_statements(
-			loop_binding + "\n" + statement_body(for_string.body, body_c),
+			loop_binding + "\n" + statement_body(
+				for_string.body,
+				body_c,
+			),
 		) + "  }\n" + cleanup_pop + iterable_release,
 		value = "",
 		next_temp = body_c.next_temp,
@@ -11596,7 +11629,11 @@ private pure func emit_for_string(for_string: CoreForString, next_temp: Int) -> 
 	})
 
 
-private pure func dict_loop_binding(for_dict: CoreForDict, iter_tmp: String, slot_tmp: String) -> Option[String]:
+private pure func dict_loop_binding(
+	for_dict: CoreForDict,
+	iter_tmp: String,
+	slot_tmp: String,
+) -> Option[String]:
 	binding_name: String = c_var_name(for_dict.binder.variable)
 
 	match for_dict.binder.typ:
@@ -11757,7 +11794,10 @@ private pure func emit_for_set(for_set: CoreForSet, next_temp: Int) -> Option[Fu
 		statements = iterable_body.statements + indent_statements(
 			source_binding + "\n" + cleanup_push + retain_iterable + "\n" + loop_header,
 		) + indent_statements(
-			loop_binding + statement_body(for_set.body, body_c),
+			loop_binding + statement_body(
+				for_set.body,
+				body_c,
+			),
 		) + "  }\n" + indent_statements(iter_retain_release) + cleanup_pop + iterable_release,
 		value = "",
 		next_temp = body_c.next_temp,
