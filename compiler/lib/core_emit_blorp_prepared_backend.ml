@@ -8,7 +8,7 @@
 open Core
 open Core_emit_context
 
-let render_arg = Core_emit_blorp_template.render_arg
+let render_arg = Core_emit_context.render_arg
 
 let render_template op args =
   Compiler_blorp_bridge.render_via_command_exn

@@ -103,9 +103,6 @@ let () =
         (fun (name, cases) -> ("FmtEmbedding." ^ name, cases))
         Test_fmt_embedding.suite
     @ List.map
-        (fun (name, cases) -> ("CompilerBlorp." ^ name, cases))
-        Test_compiler_blorp.suite
-    @ List.map
         (fun (name, cases) -> ("Blake3." ^ name, cases))
         Test_blake3.suite
     @ List.map

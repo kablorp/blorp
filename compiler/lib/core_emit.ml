@@ -2387,16 +2387,16 @@ and emit_boxed_storage (ctx : Core_emit_context.t) (value : boxed_storage_value)
   emit_box_op ctx value.bsv_box
 
 and render_expr_arg ctx value =
-  Core_emit_blorp_template.render_arg ~emit_expr ctx value
+  Core_emit_context.render_arg ~emit_expr ctx value
 
 and render_stmt_arg ctx value =
-  Core_emit_blorp_template.render_arg ~emit_expr:emit_stmt ctx value
+  Core_emit_context.render_arg ~emit_expr:emit_stmt ctx value
 
 and render_boxed_arg ctx value =
-  Core_emit_blorp_template.render_arg ~emit_expr:emit_boxed ctx value
+  Core_emit_context.render_arg ~emit_expr:emit_boxed ctx value
 
 and render_boxed_storage_arg ctx value =
-  Core_emit_blorp_template.render_arg ~emit_expr:emit_boxed_storage ctx value
+  Core_emit_context.render_arg ~emit_expr:emit_boxed_storage ctx value
 
 and constructor_argument_list args = String.concat ", " args
 

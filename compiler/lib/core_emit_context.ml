@@ -145,6 +145,27 @@ let emit_line ctx s =
   emit_indent ctx;
   emitln ctx s
 
+(** Render a child emission into an isolated string without permanently
+    changing the caller's output buffer. *)
+let render_arg ~emit_expr ctx arg =
+  let original_output = ctx.output in
+  let arg_output = Buffer.create 128 in
+  ctx.output <- arg_output;
+  Fun.protect
+    ~finally:(fun () -> ctx.output <- original_output)
+    (fun () ->
+      emit_expr ctx arg;
+      Buffer.contents arg_output)
+
+let render_args ~emit_expr ctx args =
+  let rec go acc = function
+    | [] -> List.rev acc
+    | arg :: rest ->
+        let rendered = render_arg ~emit_expr ctx arg in
+        go (rendered :: acc) rest
+  in
+  go [] args
+
 (** Fresh numeric counter. Increments and returns the previous value. *)
 let fresh_temp ctx =
   let n = ctx.temp_counter in

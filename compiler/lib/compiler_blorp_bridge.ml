@@ -2,9 +2,8 @@
     downstream compile artifacts.
 
     Renderer JSON requests are served by [compiler/blorp/compiler_bridge.brp]
-    through the hidden bridge command. The manifest helpers left in this module
-    are temporary migration debt: the compiled helper still needs a fallback
-    while it bootstraps itself. *)
+    through the hidden bridge command. The private bootstrap manifest reader is
+    only used while compiling that helper from a cold cache. *)
 
 let schema_version = 1
 let domain = "compiler"
@@ -27,6 +26,13 @@ let ( let* ) result f =
 type renderer_template_info = {
   renderer_template_name : string;
   renderer_template_arity : int;
+}
+
+type bootstrap_template = { name : string; arity : int; body : string }
+
+type bootstrap_manifest = {
+  label : string;
+  templates : bootstrap_template list Lazy.t;
 }
 
 let rec find_upwards start name =
@@ -140,6 +146,113 @@ let bridge_source_tree_digest source_path =
 let compiler_lib_file name =
   Filename.concat (Filename.concat "compiler" "lib") name
 
+let strip_trailing_cr line =
+  let len = String.length line in
+  if len > 0 && line.[len - 1] = '\r' then String.sub line 0 (len - 1) else line
+
+let parse_bootstrap_manifest_line ~label line_no line =
+  let line = strip_trailing_cr line in
+  if String.trim line = "" || line.[0] = '#' then None
+  else
+    match String.split_on_char '\t' line with
+    | [ name; arity_text; body ] -> (
+        match int_of_string_opt arity_text with
+        | Some arity when arity >= 0 -> Some { name; arity; body }
+        | _ ->
+            invalid_arg
+              (Printf.sprintf "invalid %s bootstrap arity on line %d: %S"
+                 label line_no arity_text))
+    | fields ->
+        invalid_arg
+          (Printf.sprintf
+             "invalid %s bootstrap line %d: expected 3 TSV fields, got %d"
+             label line_no (List.length fields))
+
+let create_bootstrap_manifest ?(initial_size = 8) ~label manifest_tsv =
+  let templates =
+    lazy
+      (let parsed =
+         manifest_tsv |> String.split_on_char '\n'
+         |> List.mapi (fun i line ->
+                parse_bootstrap_manifest_line ~label (i + 1) line)
+         |> List.filter_map Fun.id
+       in
+       let tbl = Hashtbl.create initial_size in
+       List.iter
+         (fun template ->
+           if Hashtbl.mem tbl template.name then
+             invalid_arg
+               (Printf.sprintf "duplicate %s bootstrap template for %S" label
+                  template.name);
+           Hashtbl.add tbl template.name ())
+         parsed;
+       parsed)
+  in
+  { label; templates }
+
+let find_bootstrap_template manifest name =
+  List.find_opt (fun template -> String.equal template.name name)
+    (Lazy.force manifest.templates)
+
+let substitute_bootstrap_template template args =
+  if List.length args <> template.arity then
+    invalid_arg
+      (Printf.sprintf "bootstrap template %S expected %d args, got %d"
+         template.name template.arity (List.length args));
+  let rendered_args = Array.of_list args in
+  let body = template.body in
+  let len = String.length body in
+  let buf = Buffer.create (len + 32) in
+  let is_digit c = c >= '0' && c <= '9' in
+  let parse_placeholder start =
+    if body.[start] <> '@' then None
+    else
+      let rec scan_digits i =
+        if i < len && is_digit body.[i] then scan_digits (i + 1) else i
+      in
+      let digit_start = start + 1 in
+      let digit_end = scan_digits digit_start in
+      if digit_end = digit_start || digit_end >= len || body.[digit_end] <> '@'
+      then None
+      else
+        let digit_text =
+          String.sub body digit_start (digit_end - digit_start)
+        in
+        match int_of_string_opt digit_text with
+        | Some arg_index -> Some (arg_index, digit_end + 1)
+        | None ->
+            invalid_arg
+              (Printf.sprintf "bootstrap template %S has invalid placeholder @%s@"
+                 template.name digit_text)
+  in
+  let rec go i =
+    if i >= len then ()
+    else
+      match parse_placeholder i with
+      | Some (arg_index, next_i) ->
+          if arg_index >= Array.length rendered_args then
+            invalid_arg
+              (Printf.sprintf
+                 "bootstrap template %S references arg %d but only %d args are \
+                  available"
+                 template.name arg_index (Array.length rendered_args));
+          Buffer.add_string buf rendered_args.(arg_index);
+          go next_i
+      | None ->
+          Buffer.add_char buf body.[i];
+          go (i + 1)
+  in
+  go 0;
+  Buffer.contents buf
+
+let render_bootstrap_manifest_exn manifest name args =
+  match find_bootstrap_template manifest name with
+  | Some template -> substitute_bootstrap_template template args
+  | None ->
+      invalid_arg
+        (Printf.sprintf "missing %s bootstrap template %S"
+           manifest.label name)
+
 let template_manifest_tsv filename =
   let rel = compiler_lib_file filename in
   let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
@@ -150,27 +263,27 @@ let template_manifest_tsv filename =
         (Printf.sprintf "cannot locate Blorp template manifest %s" rel)
 
 let intrinsic_manifest =
-  Core_emit_blorp_template.create ~initial_size:64 ~label:"codegen intrinsic"
+  create_bootstrap_manifest ~initial_size:64 ~label:"codegen intrinsic"
     (template_manifest_tsv "core_emit_blorp_intrinsic_templates.tsv")
 
 let prepared_backend_manifest =
-  Core_emit_blorp_template.create ~label:"codegen prepared backend"
+  create_bootstrap_manifest ~label:"codegen prepared backend"
     (template_manifest_tsv "core_emit_blorp_prepared_backend_templates.tsv")
 
 let prepared_list_manifest =
-  Core_emit_blorp_template.create ~label:"codegen prepared list"
+  create_bootstrap_manifest ~label:"codegen prepared list"
     (template_manifest_tsv "core_emit_blorp_prepared_list_templates.tsv")
 
 let prepared_tensor_manifest =
-  Core_emit_blorp_template.create ~label:"codegen prepared tensor"
+  create_bootstrap_manifest ~label:"codegen prepared tensor"
     (template_manifest_tsv "core_emit_blorp_prepared_tensor_templates.tsv")
 
 let prepared_constructor_manifest =
-  Core_emit_blorp_template.create ~label:"codegen prepared constructor"
+  create_bootstrap_manifest ~label:"codegen prepared constructor"
     (template_manifest_tsv "core_emit_blorp_prepared_constructor_templates.tsv")
 
 let prepared_tuple_manifest =
-  Core_emit_blorp_template.create ~label:"codegen prepared tuple"
+  create_bootstrap_manifest ~label:"codegen prepared tuple"
     (template_manifest_tsv "core_emit_blorp_prepared_tuple_templates.tsv")
 
 let manifest_for_renderer = function
@@ -449,8 +562,7 @@ let render_many_exn ~renderer items =
   match manifest_for_renderer renderer with
   | Ok manifest ->
       List.map
-        (fun (op, args) ->
-          (op, Core_emit_blorp_template.render_exn manifest op args))
+        (fun (op, args) -> (op, render_bootstrap_manifest_exn manifest op args))
         items
   | Error (_, message) -> invalid_arg message
 
@@ -488,11 +600,11 @@ let renderer_template_infos_for_helper_exn ~renderer =
   else
     match manifest_for_renderer renderer with
     | Ok manifest ->
-        Lazy.force manifest.Core_emit_blorp_template.templates
+        Lazy.force manifest.templates
         |> List.map (fun template ->
             {
-              renderer_template_name = template.Core_emit_blorp_template.name;
-              renderer_template_arity = template.Core_emit_blorp_template.arity;
+              renderer_template_name = template.name;
+              renderer_template_arity = template.arity;
             })
     | Error (_, message) -> invalid_arg message
 

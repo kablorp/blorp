@@ -16,7 +16,7 @@ let emit_simple_intrinsic ~emit_expr (ctx : Core_emit_context.t) name args =
   match intrinsic_template_arity name with
   | Some arity when List.length args = arity ->
       let rendered_args =
-        Core_emit_blorp_template.render_args ~emit_expr ctx args
+        Core_emit_context.render_args ~emit_expr ctx args
       in
       Core_emit_context.emit ctx
         (Compiler_blorp_bridge.render_via_command_exn
