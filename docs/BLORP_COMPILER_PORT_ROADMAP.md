@@ -66,8 +66,8 @@ That is the correct architectural direction, but it is still transitional:
   `compiler/lib/compiler_blorp_bridge.ml` and should be deleted before Merge
   Point 1 is considered closed.
 - The compiled renderer bridge helper is content-addressed by production
-  `compiler/blorp` source, the compiler binary, the C compiler identity, and
-  the OS.
+  `compiler/blorp` source, the pinned compiler bootstrap command
+  (`scripts/blorp-compiler-bootstrap`), the C compiler identity, and the OS.
 - `prepare_and_emit_c` accepts Core JSON under the `core` payload field. The
   production path now tries post-reuse/pre-closure Core first for closure-free
   supported subsets, then post-closure/pre-resource Core. Blorp rewrites

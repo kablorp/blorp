@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# Resolve the pinned Blorp executable used to compile compiler-owned Blorp
+# sources. Keep this pin boring and explicit so self-hosted compiler changes do
+# not accidentally depend on the just-built workspace ./blorp.
+
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd "$script_dir/.." && pwd -P)
+
+repo="${BLORP_COMPILER_BOOTSTRAP_REPO:-kablorp/blorp}"
+tag="${BLORP_COMPILER_BOOTSTRAP_TAG:-dev-33e00c2b94df}"
+version="0.0.1-dev.33e00c2b94df"
+
+cache_root="${BLORP_COMPILER_BOOTSTRAP_CACHE_DIR:-}"
+if [ -z "$cache_root" ]; then
+	if [ -n "${XDG_CACHE_HOME:-}" ]; then
+		cache_root="$XDG_CACHE_HOME/blorp/compiler-bootstrap"
+	else
+		cache_root="${HOME:-/tmp}/.cache/blorp/compiler-bootstrap"
+	fi
+fi
+
+usage() {
+	cat <<'EOF'
+Usage: scripts/blorp-compiler-bootstrap [options] [blorp-args...]
+
+Resolve and run the pinned Blorp executable used for compiler-owned Blorp code.
+When running blorp, this wrapper uses the current repository root as the working
+directory so the pinned compiler can find compiler bootstrap manifests.
+
+Options:
+  --print-id    Print the pinned release id without running blorp
+  --print-path  Print the resolved executable path without running blorp
+  -h, --help    Show this help
+
+Environment:
+  BLORP_COMPILER_BOOTSTRAP_REPO       GitHub repo (default: kablorp/blorp)
+  BLORP_COMPILER_BOOTSTRAP_TAG        Release tag (default: dev-33e00c2b94df)
+  BLORP_COMPILER_BOOTSTRAP_CACHE_DIR  Cache directory for the downloaded binary
+EOF
+}
+
+target_triple() {
+	local arch os
+	arch=$(uname -m)
+	os=$(uname -s)
+
+	case "$os:$arch" in
+		Darwin:arm64) echo "aarch64-apple-darwin" ;;
+		Linux:x86_64) echo "x86_64-unknown-linux-gnu" ;;
+		Linux:aarch64 | Linux:arm64) echo "aarch64-unknown-linux-gnu" ;;
+		Darwin:x86_64)
+			echo "Pinned compiler bootstrap ${tag} has no x86_64-apple-darwin asset." >&2
+			exit 1
+			;;
+		*)
+			echo "Unsupported compiler bootstrap target: $os/$arch" >&2
+			exit 1
+			;;
+	esac
+}
+
+expected_archive_sha256() {
+	case "$1" in
+		aarch64-apple-darwin)
+			echo "69ce15c22d0b431eb0744e1f5cb821827fcfc00aa319258c0bb33d1427fec7bd"
+			;;
+		x86_64-unknown-linux-gnu)
+			echo "1f701a3ee5720dceb17beba4e71a7106ee854dc4266e85508fca0f3aa37e3bb4"
+			;;
+		aarch64-unknown-linux-gnu)
+			echo "e953eb4f40efb684d43fad76920f0704c197c1993f6989646483a7faaaa9565a"
+			;;
+		*)
+			echo "No pinned compiler bootstrap checksum for target $1" >&2
+			exit 1
+			;;
+	esac
+}
+
+download_file() {
+	local url="$1"
+	local output="$2"
+
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL "$url" -o "$output"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -q "$url" -O "$output"
+	else
+		echo "Compiler bootstrap download requires curl or wget." >&2
+		exit 1
+	fi
+}
+
+sha256_file() {
+	local path="$1"
+
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$path" | awk '{print $1}'
+	elif command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$path" | awk '{print $1}'
+	else
+		echo "Compiler bootstrap verification requires shasum or sha256sum." >&2
+		exit 1
+	fi
+}
+
+cache_marker_matches() {
+	local binary="$1"
+	local marker="$2"
+	local target="$3"
+	local archive_sha="$4"
+
+	if [ ! -x "$binary" ] || [ ! -f "$marker" ]; then
+		return 1
+	fi
+
+	local actual_binary_sha
+	actual_binary_sha=$(sha256_file "$binary")
+
+	grep -Fxq "repo=$repo" "$marker" &&
+		grep -Fxq "tag=$tag" "$marker" &&
+		grep -Fxq "version=$version" "$marker" &&
+		grep -Fxq "target=$target" "$marker" &&
+		grep -Fxq "archive_sha256=$archive_sha" "$marker" &&
+		grep -Fxq "binary_sha256=$actual_binary_sha" "$marker"
+}
+
+install_bootstrap() {
+	local target="$1"
+	local archive_sha="$2"
+	local install_dir="$3"
+	local binary="$4"
+	local marker="$5"
+	local asset archive checksum url expected_checksum actual_checksum binary_path stage_dir binary_sha
+
+	asset="blorp-${version}-${target}.tar.gz"
+	url="https://github.com/${repo}/releases/download/${tag}/${asset}"
+
+	stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-compiler-bootstrap.XXXXXX")
+	trap 'rm -rf "$stage_dir"' EXIT
+
+	archive="$stage_dir/$asset"
+	checksum="$archive.sha256"
+
+	download_file "$url" "$archive"
+	download_file "$url.sha256" "$checksum"
+
+	expected_checksum=$(awk '{print $1}' "$checksum")
+	if [ "$expected_checksum" != "$archive_sha" ]; then
+		echo "Pinned compiler bootstrap checksum mismatch for $asset" >&2
+		echo "expected pin: $archive_sha" >&2
+		echo "release file:  $expected_checksum" >&2
+		echo "Update scripts/blorp-compiler-bootstrap only if this pin change is intentional." >&2
+		exit 1
+	fi
+
+	actual_checksum=$(sha256_file "$archive")
+	if [ "$actual_checksum" != "$archive_sha" ]; then
+		echo "Downloaded compiler bootstrap archive failed checksum verification." >&2
+		echo "expected: $archive_sha" >&2
+		echo "actual:   $actual_checksum" >&2
+		exit 1
+	fi
+
+	tar -xzf "$archive" -C "$stage_dir"
+	binary_path=$(find "$stage_dir" -type f -name blorp -print -quit)
+	if [ -z "$binary_path" ]; then
+		echo "Downloaded compiler bootstrap archive did not contain a blorp binary." >&2
+		exit 1
+	fi
+
+	mkdir -p "$install_dir"
+	cp "$binary_path" "$binary"
+	chmod 0755 "$binary"
+	binary_sha=$(sha256_file "$binary")
+	{
+		echo "repo=$repo"
+		echo "tag=$tag"
+		echo "version=$version"
+		echo "target=$target"
+		echo "archive_sha256=$archive_sha"
+		echo "binary_sha256=$binary_sha"
+	} > "$marker"
+	rm -rf "$stage_dir"
+	trap - EXIT
+}
+
+resolve_bootstrap_path() {
+	local target archive_sha key install_dir binary marker
+
+	target=$(target_triple)
+	archive_sha=$(expected_archive_sha256 "$target")
+	key="${tag}/${target}/${archive_sha}"
+	install_dir="$cache_root/$key"
+	binary="$install_dir/blorp"
+	marker="$install_dir/MANIFEST"
+
+	if ! cache_marker_matches "$binary" "$marker" "$target" "$archive_sha"; then
+		install_bootstrap "$target" "$archive_sha" "$install_dir" "$binary" "$marker"
+	fi
+
+	printf '%s\n' "$binary"
+}
+
+case "${1:-}" in
+	--print-id)
+		printf '%s %s\n' "$tag" "$version"
+		exit 0
+		;;
+	--print-path)
+		resolve_bootstrap_path
+		exit 0
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+esac
+
+bootstrap_path=$(resolve_bootstrap_path)
+cd "$repo_root"
+exec "$bootstrap_path" "$@"

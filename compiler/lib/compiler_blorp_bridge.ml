@@ -790,6 +790,15 @@ let exec_program prog args envp =
   in
   try_candidates (executable_candidates prog)
 
+let compiler_bridge_bin_env = "BLORP_COMPILER_BRIDGE_BIN"
+let compiler_bootstrap_script_name = "scripts/blorp-compiler-bootstrap"
+
+let locate_default_command_program ?(bridge_bin = Sys.getenv_opt compiler_bridge_bin_env)
+    starts =
+  match bridge_bin with
+  | Some path when path <> "" -> Some path
+  | _ -> find_upwards_from starts compiler_bootstrap_script_name
+
 let run_process_capture ?(env = []) ?(unset_env = []) prog args =
   let read_fd, write_fd = Unix.pipe () in
   let stderr_path, stderr_fd =
@@ -817,23 +826,15 @@ let run_process_capture ?(env = []) ?(unset_env = []) prog args =
       (exit_code_of_status status, output, stderr_output)
 
 let default_command_program () =
-  match Sys.getenv_opt "BLORP_COMPILER_BRIDGE_BIN" with
-  | Some path when path <> "" -> path
-  | _ -> (
-      let exe = Sys.executable_name in
-      let exe_base = Filename.basename exe in
-      if
-        (String.equal exe_base "blorp" || String.equal exe_base "blorp.exe")
-        && Sys.file_exists exe
-      then exe
-      else
-        let starts = [ Sys.getcwd (); Filename.dirname exe ] in
-        match find_upwards_from starts "blorp" with
-        | Some path -> path
-        | None ->
-            invalid_arg
-              "cannot locate blorp compiler bridge binary; set \
-               BLORP_COMPILER_BRIDGE_BIN")
+  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
+  match locate_default_command_program starts with
+  | Some path -> path
+  | None ->
+      invalid_arg
+        (Printf.sprintf
+           "cannot locate pinned Blorp compiler bootstrap %s; set %s to an \
+            explicit blorp binary"
+           compiler_bootstrap_script_name compiler_bridge_bin_env)
 
 let renderer_bridge_source_path () =
   match Sys.getenv_opt renderer_bridge_source_env with

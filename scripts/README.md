@@ -122,8 +122,26 @@ scripts/with-build-lock make quality
 Renderer requests use a compiled `compiler/blorp/compiler_bridge_cli.brp`
 helper. The helper binary is cached under `$HOME/.cache/blorp/compiler-bridge`,
 or `BLORP_COMPILER_BRIDGE_CACHE_DIR` when set. The cache key is derived from the
-production `compiler/blorp` source tree, the compiler binary, the C compiler
-identity, and the OS.
+production `compiler/blorp` source tree, the pinned compiler bootstrap command,
+the C compiler identity, and the OS.
+
+Compiler-owned Blorp sources are compiled with `scripts/blorp-compiler-bootstrap`
+by default, not the just-built workspace `./blorp`. That wrapper downloads and
+verifies the pinned dev release `dev-33e00c2b94df` into
+`$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
+when set. Update the tag, version, and target checksums in that script together
+when intentionally moving the compiler bootstrap forward.
+
+Useful compiler bootstrap commands:
+
+```bash
+scripts/blorp-compiler-bootstrap --print-id
+scripts/blorp-compiler-bootstrap --print-path
+scripts/blorp-compiler-bootstrap compile --no-format compiler/blorp/compiler_bridge_cli.brp
+```
+
+`BLORP_COMPILER_BRIDGE_BIN` remains the explicit escape hatch for testing or
+bisecting with another Blorp executable.
 
 ## Drift Checks
 
