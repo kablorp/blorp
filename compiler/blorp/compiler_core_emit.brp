@@ -691,6 +691,18 @@ private CHANNEL_SEND_TEMP_SEED: String = "channel_send"
 
 private TUPLE_RC_TEMP_SEED: String = "tuple"
 
+private BOXED_RESULT_TYPE_NAME: String = "Result"
+
+private BOXED_RESULT_OK_CONSTRUCTOR_NAME: String = "Ok"
+
+private BOXED_RESULT_ERR_CONSTRUCTOR_NAME: String = "Err"
+
+private BOXED_RESULT_OK_RUNTIME_CONSTRUCTOR: String = "blorp_result_ok"
+
+private BOXED_RESULT_ERR_RUNTIME_CONSTRUCTOR: String = "blorp_result_err"
+
+private BOXED_RESULT_RELEASE_MASK_TEMP: String = "__boxed_result"
+
 
 private enum ListHandoffEmitMode:
 	EmitBorrowFreshHandoff
@@ -8459,30 +8471,74 @@ private pure func emit_nullable_option_construct(construct: CoreUnionConstruct) 
 			None
 
 
+private pure func is_boxed_result_construct(construct: CoreUnionConstruct) -> Bool:
+	construct.type_name == BOXED_RESULT_TYPE_NAME
+
+
+private pure func boxed_result_runtime_constructor(constructor_name: String) -> Option[String]:
+	if constructor_name == BOXED_RESULT_OK_CONSTRUCTOR_NAME:
+		Some(BOXED_RESULT_OK_RUNTIME_CONSTRUCTOR)
+	else if constructor_name == BOXED_RESULT_ERR_CONSTRUCTOR_NAME:
+		Some(BOXED_RESULT_ERR_RUNTIME_CONSTRUCTOR)
+	else:
+		None
+
+
+private pure func boxed_result_construct_value(
+	constructor_name: String,
+	payload_c: String,
+	release_mask: Int,
+) -> Option[String]:
+	runtime_constructor ?= boxed_result_runtime_constructor(constructor_name)
+	value: String = runtime_constructor + "(" + payload_c + ")"
+
+	if release_mask == 0:
+		Some(value)
+	else:
+		Some(
+			"({ blorp_Result* " + BOXED_RESULT_RELEASE_MASK_TEMP + " = " + value + "; " + BOXED_RESULT_RELEASE_MASK_TEMP + "->release_mask = " + release_mask.to_string() + "UL; " + BOXED_RESULT_RELEASE_MASK_TEMP + "; })",
+		)
+
+
+private pure func emit_boxed_result_construct(construct: CoreUnionConstruct) -> Option[String]:
+	match construct.args:
+		[payload]:
+			payload_c ?= emit_boxed_pointer_value(payload)
+			boxed_result_construct_value(
+				construct.constructor_name,
+				payload_c,
+				construct.release_mask,
+			)
+		[]:
+			None
+		[first, second, ...rest]:
+			None
+
+
+private pure func emit_generic_union_construct_call(
+	construct: CoreUnionConstruct,
+) -> Option[String]:
+	initial_args ?= emit_generic_union_args(construct)
+	var args: List[String] = initial_args
+
+	if args.length() == 0:
+		Some(construct.constructor_c_name)
+	else:
+		if construct.uses_release_mask:
+			args = args.append(construct.release_mask.to_string() + "UL")
+
+		Some(construct.constructor_c_name + "(" + args.join(", ") + ")")
+
+
 private pure func emit_union_construct(construct: CoreUnionConstruct) -> Option[String]:
 	match construct.representation:
 		BoxedOptionRepresentation:
-			initial_args ?= emit_generic_union_args(construct)
-			var args: List[String] = initial_args
-
-			if args.length() == 0:
-				Some(construct.constructor_c_name)
-			else:
-				if construct.uses_release_mask:
-					args = args.append(construct.release_mask.to_string() + "UL")
-
-				Some(construct.constructor_c_name + "(" + args.join(", ") + ")")
+			emit_generic_union_construct_call(construct)
 		GenericUnionRepresentation:
-			initial_args ?= emit_generic_union_args(construct)
-			var args: List[String] = initial_args
-
-			if args.length() == 0:
-				Some(construct.constructor_c_name)
+			if is_boxed_result_construct(construct):
+				emit_boxed_result_construct(construct)
 			else:
-				if construct.uses_release_mask:
-					args = args.append(construct.release_mask.to_string() + "UL")
-
-				Some(construct.constructor_c_name + "(" + args.join(", ") + ")")
+				emit_generic_union_construct_call(construct)
 		StackOptionRepresentation(info):
 			emit_stack_option_construct(info, construct.args)
 		StackResultRepresentation(info):
@@ -8636,6 +8692,31 @@ private pure func emit_nullable_option_construct_body(
 			None
 
 
+private pure func emit_boxed_result_construct_body(
+	construct: CoreUnionConstruct,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match construct.args:
+		[payload]:
+			payload_body ?= emit_boxed_pointer_body(payload, next_temp)
+			payload_c ?= required_body_value(payload_body)
+			value ?= boxed_result_construct_value(
+				construct.constructor_name,
+				payload_c,
+				construct.release_mask,
+			)
+			Some({
+				statements = payload_body.statements,
+				value = value,
+				next_temp = payload_body.next_temp,
+				returns = False,
+			})
+		[]:
+			None
+		[first, second, ...rest]:
+			None
+
+
 private pure func emit_union_construct_body(
 	construct: CoreUnionConstruct,
 	next_temp: Int,
@@ -8644,7 +8725,10 @@ private pure func emit_union_construct_body(
 		BoxedOptionRepresentation:
 			emit_generic_union_construct_body(construct, next_temp)
 		GenericUnionRepresentation:
-			emit_generic_union_construct_body(construct, next_temp)
+			if is_boxed_result_construct(construct):
+				emit_boxed_result_construct_body(construct, next_temp)
+			else:
+				emit_generic_union_construct_body(construct, next_temp)
 		StackOptionRepresentation(info):
 			emit_stack_option_construct_body(info, construct.args, next_temp)
 		StackResultRepresentation(info):

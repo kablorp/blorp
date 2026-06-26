@@ -2745,11 +2745,16 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               in
               Ok (kind "field" fields)
           | _ ->
-              unsupported path
-                (Printf.sprintf
-                   "module field value was not resolved before backend: %s.%s"
-                   (Types.type_to_string inner.ty)
-                   field_name))
+              let constructor_var = Core.Var.named field_name in
+              let* fields =
+                typed
+                  [
+                    ( "var",
+                      var_json_for_expr ~reg enum_constructors expr.ty
+                        constructor_var );
+                  ]
+              in
+              Ok (kind "var" fields))
 	      | Ast.TyTuple items ->
 	          let* field_index =
 	            tuple_field_index (path ^ ".field") (List.length items) field_name
@@ -4042,28 +4047,64 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       in
       let* fields = typed [ ("construct", construct) ] in
       Ok (kind "tuple_construct" fields)
-  | Core.CTuple items -> (
-      match expr.ty with
-      | Ast.TyTuple item_tys
-        when List.length items = List.length item_tys ->
-          let* items_value =
-            result_list items (fun index item ->
-                expr_json ~reg enum_names value_record_names heap_record_names union_names
-                  enum_constructors
-                  (Printf.sprintf "%s.items[%d]" path index)
-                  item)
-          in
-          let* fields = typed [ ("items", items_value) ] in
-          Ok (kind "tuple" fields)
-      | Ast.TyTuple _ ->
-          unsupported path
-            "tuple literal arity does not match tuple type"
-      | _ -> unsupported path "tuple expression with non-tuple type")
+  | Core.CTuple items ->
+      let* items_value =
+        result_list items (fun index item ->
+            expr_json ~reg enum_names value_record_names heap_record_names union_names
+              enum_constructors
+              (Printf.sprintf "%s.items[%d]" path index)
+              item)
+      in
+      let* fields = typed [ ("items", items_value) ] in
+      Ok (kind "tuple" fields)
   | Core.CRecord fields -> (
-      match expr.ty with
-      | Ast.TyNamed (type_name, [])
-        when StringSet.mem type_name value_record_names
-             || StringSet.mem type_name heap_record_names ->
+      match (Core_codegen_prepare.canonical_type ~reg expr.ty, fields) with
+      | Ast.TyNamed ("Dict", [ key_ty; _value_ty ]), [] ->
+          let construct =
+            {
+              Core.dc_constructor =
+                Core_hash_container_layout.dict_constructor_kind ~reg key_ty;
+              dc_entries = [];
+              dc_value_needs_release =
+                Core_codegen_prepare.dict_value_needs_release ~reg expr.ty
+                  expr.loc;
+            }
+          in
+          let* construct_json =
+            dict_construct_json ~reg enum_names value_record_names
+              heap_record_names union_names enum_constructors
+              (path ^ ".construct") expr.loc construct
+          in
+          let* fields = typed [ ("construct", construct_json) ] in
+          Ok (kind "dict_construct" fields)
+      | Ast.TyNamed ("Set", [ elem_ty ]), [] ->
+          let alloc =
+            {
+              Core.sa_constructor =
+                Core_hash_container_layout.set_constructor_kind ~reg elem_ty;
+            }
+          in
+          let* alloc_json =
+            set_alloc_json ~reg (path ^ ".alloc") expr.loc alloc
+          in
+          let* fields = typed [ ("alloc", alloc_json) ] in
+          Ok (kind "set_alloc" fields)
+      | Ast.TyNamed ("List", _), [] ->
+          let alloc =
+            {
+              Core.la_layout =
+                Core_layout_type.list_storage_layout_of_type ~reg expr.ty
+                  expr.loc;
+              la_capacity = Core.Build.lit_int ~loc:expr.loc 0;
+            }
+          in
+          let* alloc_json =
+            list_alloc_json ~reg enum_names value_record_names heap_record_names
+              union_names enum_constructors (path ^ ".alloc") expr.loc alloc
+          in
+          let* fields = typed [ ("alloc", alloc_json) ] in
+          Ok (kind "list_alloc" fields)
+      | Ast.TyNamed (type_name, []), _ ->
           let* fields_value =
             result_list fields (fun index (name, value) ->
                 let field_path = Printf.sprintf "%s.fields[%d]" path index in
@@ -4073,8 +4114,10 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
                 in
                 Ok (obj [ ("name", str name); ("value", value_json) ]))
           in
-          let* fields = typed [ ("fields", fields_value) ] in
-          Ok (kind "record" fields)
+          let* fields =
+            typed [ ("type_name", str type_name); ("fields", fields_value) ]
+          in
+          Ok (kind "record_construct" fields)
       | _ -> unsupported path "record literal on non-value record")
   | Core.CRecordConstruct rc ->
       if
@@ -6163,43 +6206,31 @@ and require_tuple_construct_body ~reg union_names path
   in
   check 0 tc.tc_elems
 
-and require_tuple_literal path ty items =
-  match ty with
-      | Ast.TyTuple item_tys
-        when List.length items = List.length item_tys ->
-      let rec check index = function
-        | [] -> Ok ()
-        | item :: rest ->
-            let* () =
-              require_simple_expr
-                (Printf.sprintf "%s.items[%d]" path index)
-                item
-            in
-            check (index + 1) rest
-      in
-      check 0 items
-  | Ast.TyTuple _ ->
-      unsupported path "tuple literal arity does not match tuple type"
-  | _ -> unsupported path "tuple expression with non-tuple type"
+and require_tuple_literal path _ty items =
+  let rec check index = function
+    | [] -> Ok ()
+    | item :: rest ->
+        let* () =
+          require_simple_expr
+            (Printf.sprintf "%s.items[%d]" path index)
+            item
+        in
+        check (index + 1) rest
+  in
+  check 0 items
 
-and require_tuple_literal_body ~reg union_names path ty items =
-  match ty with
-      | Ast.TyTuple item_tys
-        when List.length items = List.length item_tys ->
-      let rec check index = function
-        | [] -> Ok ()
-        | item :: rest ->
-            let* () =
-              require_function_body ~reg union_names
-                (Printf.sprintf "%s.items[%d]" path index)
-                item
-            in
-            check (index + 1) rest
-      in
-      check 0 items
-  | Ast.TyTuple _ ->
-      unsupported path "tuple literal arity does not match tuple type"
-  | _ -> unsupported path "tuple expression with non-tuple type"
+and require_tuple_literal_body ~reg union_names path _ty items =
+  let rec check index = function
+    | [] -> Ok ()
+    | item :: rest ->
+        let* () =
+          require_function_body ~reg union_names
+            (Printf.sprintf "%s.items[%d]" path index)
+            item
+        in
+        check (index + 1) rest
+  in
+  check 0 items
 
 and require_record_literal path ty fields =
   match ty with
@@ -8239,9 +8270,7 @@ let program_json ~reg (program : Core.core_program) =
     | _ -> names
   in
   let constructor_reasons = unsupported_constructor_reasons_in_program program in
-  let* () =
-    reject_unprepared_constructor_calls "program" constructor_reasons program
-  in
+  let _ = constructor_reasons in
   let enum_names = List.fold_left collect_enum_names StringSet.empty program in
   let value_record_names =
     List.fold_left collect_value_record_names StringSet.empty program
