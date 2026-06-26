@@ -2146,7 +2146,7 @@ let collect_consumed_param_indices program =
     match decl.cd_desc with
     | Core.CDFunc func ->
         let consumed = consumed_param_indices_for_function func in
-        if List.is_empty consumed then acc else (func.cf_def_id, consumed) :: acc
+        if consumed = [] then acc else (func.cf_def_id, consumed) :: acc
     | Core.CDPrivate inner -> collect_decl acc inner
     | Core.CDVar _ | Core.CDImpl _ | Core.CDTrait _ | Core.CDType _
     | Core.CDRecord _ | Core.CDImport _ | Core.CDTypeAlias _ ->
