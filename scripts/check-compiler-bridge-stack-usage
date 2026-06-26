@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Guard against recursive self-hosted bridge functions regressing into huge
+# generated-C stack frames. This catches the architectural issue directly
+# instead of depending on CI stack limits to expose it as a late crash.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if [ ! -x ./blorp ]; then
+	echo "FAIL: ./blorp is missing; run make before compiler bridge stack checks"
+	exit 1
+fi
+
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp_bridge_stack.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT
+
+c_file="$tmp_dir/compiler_bridge_cli.c"
+obj_file="$tmp_dir/compiler_bridge_cli.o"
+source_file="compiler/blorp/compiler_bridge_cli.brp"
+
+# This check is intentionally narrow: these two recursive CoreExpr JSON
+# dispatchers caused the CI-only stack overflow. Other self-hosted bridge
+# functions still have larger non-recursive frames and need separate policy if
+# they become a practical limit.
+stack_limit_bytes=16384
+
+BLORP_COMPILER_RENDERER_HELPER=1 ./blorp compile --no-format -o "$c_file" "$source_file" >/dev/null
+
+"${CC:-cc}" -O0 -fwrapv -pipe -w -fstack-usage -c "$c_file" -o "$obj_file" >/dev/null
+
+su_file=$(find "$tmp_dir" -name '*.su' -print -quit)
+if [ -z "$su_file" ]; then
+	echo "FAIL: C compiler did not produce stack-usage metadata"
+	exit 1
+fi
+
+python3 - "$su_file" "$stack_limit_bytes" <<'PY'
+from pathlib import Path
+import sys
+
+su_file = Path(sys.argv[1])
+stack_limit_bytes = int(sys.argv[2])
+
+targets = {
+    "core_expr_to_json": "compiler_core_json__core_expr_to_json",
+    "decode_core_expr_json": "compiler_core_json__decode_core_expr_json",
+}
+
+found = {name: [] for name in targets}
+for line in su_file.read_text().splitlines():
+    parts = line.split("\t")
+    if len(parts) < 2:
+        continue
+
+    loc_and_function = parts[0]
+    size_text = parts[1]
+    try:
+        size = int(size_text)
+    except ValueError:
+        continue
+
+    function_name = loc_and_function.split(":")[-1]
+    for target_name, needle in targets.items():
+        if needle in function_name:
+            found[target_name].append((size, function_name))
+
+failed = False
+for target_name, entries in sorted(found.items()):
+    if not entries:
+        print(f"FAIL: stack usage missing for {targets[target_name]}")
+        failed = True
+        continue
+
+    size, function_name = max(entries)
+    if size > stack_limit_bytes:
+        print(
+            "FAIL: "
+            f"{target_name} generated-C stack frame is {size} bytes "
+            f"(limit {stack_limit_bytes}); function={function_name}"
+        )
+        failed = True
+    else:
+        print(
+            "PASS: "
+            f"{target_name} generated-C stack frame is {size} bytes "
+            f"(limit {stack_limit_bytes})"
+        )
+
+sys.exit(1 if failed else 0)
+PY

@@ -2774,7 +2774,11 @@ let rec expr_final_consumes_var_owner (env : type_env) (name : string)
       if b.borrow_var.vname = name then false
       else if expr_touches_current_owner body then
         expr_final_consumes_var_owner env name body
-      else expr_final_consumes_var_owner env name b.borrow_rhs
+      else
+        (* A borrow binding can mention the mutable owner without spending the
+           scope-exit owner. Only suppress the final drop if constructing the
+           borrowed view required a real ownership-consuming operation. *)
+        expr_consumes_var_owner env name b.borrow_rhs
   | CSeq (head, tail) ->
       if expr_touches_current_owner tail then
         expr_final_consumes_var_owner env name tail
@@ -2865,24 +2869,12 @@ let release_reassigned_mutable_var (env : type_env)
     | CAssign (v, rhs) when v.vname = target.vname ->
         let rhs = rewrite ~skip_old_release:false rhs in
         if skip_old_release || expr_consumes_var_owner env target.vname rhs then
-          let assign = { e with desc = CAssign (v, rhs) } in
-          (* If a prior COW-consuming expression already consumed the old
-             alias owner, do not release it again. Alias RHS normalization may
-             add an extra retain to survive match-scrutinee teardown; balance
-             that retain after the assignment. *)
-          if skip_old_release && assignment_rhs_is_alias env rhs then
-            {
-              e with
-              desc =
-                CSeq
-                  ( assign,
-                    {
-                      desc = CDrop (v, target_ty, void_at e.loc);
-                      ty = Ast.TyNamed ("Void", []);
-                      loc = e.loc;
-                    } );
-            }
-          else assign
+          (* If a prior COW-consuming expression already consumed the old slot
+             owner, assignment must not drop the target again here. When the RHS
+             is a borrowed match payload, alias normalization retains it; that
+             retained reference is the mutable slot's new owner and must survive
+             the match-scrutinee cleanup. *)
+          { e with desc = CAssign (v, rhs) }
         else
           let tmp = next_tmp () in
           let tmp_ref = { rhs with desc = CVar tmp } in

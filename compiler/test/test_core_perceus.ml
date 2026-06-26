@@ -2996,6 +2996,26 @@ let test_mutable_protected_tail_consume_drops_scope_owner () =
     "mutable owner still drops at scope exit" 1
     (count_drops_for "result" transformed)
 
+let test_mutable_final_borrow_keeps_scope_drop () =
+  let borrow =
+    {
+      borrow_var = Var.named "borrowed";
+      borrow_ty = ty_list_int;
+      borrow_rhs = cvar "result" ty_list_int;
+    }
+  in
+  let expr =
+    mk
+      (CLet
+         ( bind_named ~mut:true "result" ty_list_int (mk (clist []) ty_list_int),
+           mk (CBorrowLet (borrow, cbool true)) ty_bool ))
+      ty_bool
+  in
+  let transformed = insert_drops_expr_for_test expr in
+  Alcotest.(check int)
+    "final borrow observes mutable owner without consuming it" 1
+    (count_drops_for "result" transformed)
+
 let test_mutable_assignment_match_scrutinee_consumes_target_skips_old_release ()
     =
   let option_list_ty = TyNamed ("Option", [ ty_list_int ]) in
@@ -3044,10 +3064,10 @@ let test_mutable_assignment_match_scrutinee_consumes_target_skips_old_release ()
       "COW-consuming match scrutinee released old owner before assignment:\n%s"
       (pp_to_string_indented transformed);
   let drops = count_drops_for "v" transformed in
-  if drops <> 2 then
+  if drops <> 1 then
     Alcotest.failf
-      "COW-consuming match scrutinee should keep one post-assignment balance \
-       drop and one scope-exit drop, got %d:\n\
+      "COW-consuming match scrutinee should keep only the scope-exit drop; the \
+       retained Some payload becomes the slot owner, got %d:\n\
        %s"
       drops
       (pp_to_string_indented transformed)
@@ -4687,6 +4707,8 @@ let suite =
           test_mutable_tail_consumes_after_assignment_without_final_drop;
         Alcotest.test_case "mutable_protected_tail_consume_scope_drop" `Quick
           test_mutable_protected_tail_consume_drops_scope_owner;
+        Alcotest.test_case "mutable_final_borrow_keeps_scope_drop" `Quick
+          test_mutable_final_borrow_keeps_scope_drop;
         Alcotest.test_case
           "mutable_assignment_match_scrutinee_consumes_no_old_release" `Quick
           test_mutable_assignment_match_scrutinee_consumes_target_skips_old_release;
