@@ -1069,11 +1069,6 @@ let int64_fits_json_int value =
   let as_int = Int64.to_int value in
   Int64.equal (Int64.of_int as_int) value
 
-let int64_to_json_int path value =
-  let as_int = Int64.to_int value in
-  if int64_fits_json_int value then Ok as_int
-  else unsupported path "integer literal out of Blorp bridge Int range"
-
 let int_literal_json value =
   if int64_fits_json_int value then
     let as_int = Int64.to_int value in
@@ -1170,13 +1165,6 @@ let tuple_element_tag path = function
   | Core.BoxInt128 -> unsupported path "Int128 tuple slot"
   | Core.BoxUInt128 -> unsupported path "UInt128 tuple slot"
   | Core.BoxStruct _ -> Ok "struct"
-
-let constructor_match_leaf_body path = function
-  | Core.CTLeaf { ct_bindings; ct_body } -> Ok (ct_bindings, ct_body)
-  | Core.CTFail -> unsupported path "constructor match fail case"
-  | Core.CTSwitchTag _ -> unsupported path "nested constructor match"
-  | Core.CTSwitchLit _ -> unsupported path "nested literal match"
-  | Core.CTSwitchLen _ -> unsupported path "nested length match"
 
 let union_constructor_tag_c_name type_name ctor =
   Printf.sprintf "TAG_%s_%s"
@@ -5077,11 +5065,6 @@ and tensor_for_element_storage_json ~reg path (binder : Core.loop_binder) =
                      );
                    ])))
 
-and require_tensor_for_element_storage ~reg path (binder : Core.loop_binder) =
-  match tensor_for_element_storage_json ~reg path binder with
-  | Ok _ -> Ok ()
-  | Error _ as error -> error
-
 and tensor_runtime_read_helper_tag path = function
   | "blorp_vector_read_i64" -> Ok "i64"
   | "blorp_vector_read_f64" -> Ok "f64"
@@ -7930,95 +7913,6 @@ let supported_union_decl (type_decl : Ast.type_decl) =
   && (type_decl.type_params = [] || supported_generic_erased_union_decl type_decl)
   && type_decl.type_variants <> []
 
-let unsupported_union_decl_reason (type_decl : Ast.type_decl) =
-  if type_decl.type_is_builtin || type_decl.type_is_enum then None
-  else if
-    String.equal type_decl.type_name "Option"
-    || String.equal type_decl.type_name "Result"
-  then None
-  else if supported_union_decl type_decl then None
-  else if type_decl.type_params <> [] then
-    Some ("generic union type " ^ type_decl.type_name)
-  else if type_decl.type_variants = [] then
-    Some ("empty union type " ^ type_decl.type_name)
-  else Some ("unsupported union type " ^ type_decl.type_name)
-
-let unsupported_constructor_reasons_in_program (program : Core.core_program) =
-  let rec collect_decl names (decl : Core.core_decl) =
-    match decl.cd_desc with
-    | Core.CDType type_decl -> (
-        match unsupported_union_decl_reason type_decl with
-        | None -> names
-        | Some reason ->
-            List.fold_left
-              (fun names (variant : Ast.variant) ->
-                let reason =
-                  Printf.sprintf "%s constructor %s: %s" type_decl.type_name
-                    variant.variant_name reason
-                in
-                StringMap.add variant.variant_name reason names)
-              names type_decl.type_variants)
-    | Core.CDPrivate inner -> collect_decl names inner
-    | _ -> names
-  in
-  List.fold_left collect_decl StringMap.empty program
-
-let expr_unprepared_constructor_reason constructor_reasons (expr : Core.core) =
-  Core.fold_tree
-    (fun found node ->
-      match found with
-      | Some _ -> found
-      | None -> (
-          match node.desc with
-      | Core.CCall (Core.CKUser (name, _), _, _)
-        when StringMap.mem name constructor_reasons ->
-          StringMap.find_opt name constructor_reasons
-      | Core.CCall (_, { desc = Core.CVar callee; _ }, _)
-        when StringMap.mem callee.vname constructor_reasons ->
-          StringMap.find_opt callee.vname constructor_reasons
-      | _ -> None))
-    None expr
-
-let reject_unprepared_constructor_calls path constructor_reasons
-    (program : Core.core_program) =
-  let rec decl_unprepared_constructor_reason (decl : Core.core_decl) =
-    match decl.cd_desc with
-    | Core.CDFunc func -> (
-        match func.cf_body with
-        | Some body -> expr_unprepared_constructor_reason constructor_reasons body
-        | None -> None)
-    | Core.CDVar global ->
-        expr_unprepared_constructor_reason constructor_reasons global.cv_init
-    | Core.CDImpl impl ->
-        let rec first_method_reason = function
-          | [] -> None
-          | (method_func : Core.core_func) :: rest -> (
-              match method_func.cf_body with
-              | Some body -> (
-                  match
-                    expr_unprepared_constructor_reason constructor_reasons body
-                  with
-                  | Some _ as reason -> reason
-                  | None -> first_method_reason rest)
-              | None -> first_method_reason rest)
-        in
-        first_method_reason impl.ci_methods
-    | Core.CDPrivate inner -> decl_unprepared_constructor_reason inner
-    | Core.CDTrait _ | Core.CDType _ | Core.CDRecord _ | Core.CDImport _
-    | Core.CDTypeAlias _ ->
-        None
-  in
-  let rec first_reason = function
-    | [] -> None
-    | decl :: rest -> (
-        match decl_unprepared_constructor_reason decl with
-        | Some _ as reason -> reason
-        | None -> first_reason rest)
-  in
-  match first_reason program with
-  | Some reason -> unsupported path ("unprepared constructor call: " ^ reason)
-  | None -> Ok ()
-
 let value_record_field_json ~reg enum_names value_record_names heap_record_names
     union_names path (field : Ast.field_decl) =
   let* typ =
@@ -8269,8 +8163,6 @@ let program_json ~reg (program : Core.core_program) =
     | Core.CDPrivate inner -> collect_function_names names inner
     | _ -> names
   in
-  let constructor_reasons = unsupported_constructor_reasons_in_program program in
-  let _ = constructor_reasons in
   let enum_names = List.fold_left collect_enum_names StringSet.empty program in
   let value_record_names =
     List.fold_left collect_value_record_names StringSet.empty program
@@ -8357,8 +8249,6 @@ let emit_prepared_program_to_artifact (config : config)
     Compiler_blorp_bridge.emit_c_artifact_exn ~profile:config.profile core_json
   in
   Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
-
-let emit_program_to_artifact = prepare_and_emit_program_to_artifact
 
 let emit_program_string config program =
   match prepare_and_emit_program_to_artifact config program with
