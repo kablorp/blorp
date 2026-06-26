@@ -3257,23 +3257,14 @@ let list_sort_by self_ty key_ty self key_fn compare_op =
          ty_ptr)
       (lett idx_name (mk ty_int (CUnbox (vr raw_name ty_ptr, ty_int))) body)
   in
-  let key_from_raw raw_name = mk key_ty (CUnbox (vr raw_name ty_ptr, key_ty)) in
-  let bind_key_raw idx_name raw_name body =
-    lett raw_name
-      (intr "list_get_unchecked"
-         [ vr "__keys" key_list_ty; vr idx_name ty_int ]
-         ty_ptr)
-      body
+  let key_value idx_name =
+    list_value (vr "__keys" key_list_ty) (vr idx_name ty_int) key_ty
   in
   let take_left source_list =
     bind_index source_list i "__left_idx_raw" "__left_idx"
       (bind_index source_list j "__right_idx_raw" "__right_idx"
-         (bind_key_raw "__left_idx" "__left_key_raw"
-            (bind_key_raw "__right_idx" "__right_key_raw"
-               (bin compare_op
-                  (key_from_raw "__left_key_raw")
-                  (key_from_raw "__right_key_raw")
-                  ty_bool))))
+         (bin compare_op (key_value "__left_idx") (key_value "__right_idx")
+            ty_bool))
   in
   let move_left source_list dest_list =
     seq

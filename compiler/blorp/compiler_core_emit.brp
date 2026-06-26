@@ -112,7 +112,6 @@ import:
 		render_prepared_constructor_op,
 	codegen_prepared_list_renderer:
 		InlineBitsLoadArgs,
-		InlineBitsStoreArgs,
 		InlineBitsSwapArgs,
 		InlineStructLoadArgs,
 		InlineStructStoreArgs,
@@ -130,7 +129,6 @@ import:
 			EnsureUnique,
 			HandoffSetSourceSlot,
 			InlineBitsLoad,
-			InlineBitsStore,
 			InlineStructLoadChecked,
 			InlineStructLoadProven,
 			InlineStructHandoffSetOwnedStore,
@@ -6746,6 +6744,31 @@ private pure func inline_list_load_result(bounds: CoreListAccessBounds, load_c: 
 			load_c
 
 
+private pure func emit_inline_scalar_list_unbox_get(
+	get: CoreListGet,
+	typ: CoreType,
+	width_bytes: Int,
+) -> Option[String]:
+	list_c ?= emit_simple_expr(get.list)
+	index_c ?= emit_simple_expr(get.index)
+	c_type: String = c_type_name(typ)
+	width_c: String = width_bytes.to_string()
+	load_c: String = "memcpy(&__lg_value, (char*)__lg_list->data + __lg_idx * " + width_c + ", " + width_c + ");"
+
+	bounds_c: String = match get.bounds:
+		CheckedListAccess:
+			(
+				"if (__builtin_expect(!__lg_list || __lg_idx < 0 || __lg_idx >= __lg_list->len, "
+				+ "0)) { } else { "
+			) + load_c + " } "
+		ProvenListAccess:
+			load_c + " "
+
+	Some(
+		"({ blorp_List* __lg_list = (blorp_List*)" + list_c + "; long __lg_idx = " + index_c + "; " + c_type + " __lg_value = 0; " + bounds_c + "__lg_value; })",
+	)
+
+
 private pure func emit_inline_list_get(get: CoreListGet, width_bytes: Int) -> Option[String]:
 	list_c ?= emit_simple_expr(get.list)
 	index_c ?= emit_simple_expr(get.index)
@@ -7958,16 +7981,17 @@ private pure func emit_pointer_list_set_body(
 private pure func emit_inline_list_set(set: CoreListSet, width_bytes: Int) -> Option[String]:
 	list_c ?= emit_simple_expr(set.list)
 	index_c ?= emit_simple_expr(set.index)
-	value_c ?= emit_boxed_pointer_value(set.value)
-	args: InlineBitsStoreArgs = {
-		list = list_c,
-		index = index_c,
-		value = value_c,
-		temp_seed = LIST_INLINE_STORE_TEMP_SEED,
-		width_bytes = width_bytes.to_string()
-	}
+	value_c ?= emit_simple_expr(set.value.value)
+	c_type: String = c_type_name(core_expr_type(set.value.value))
+	width_c: String = width_bytes.to_string()
 
-	Some(render_prepared_list_op(InlineBitsStore(args)))
+	Some(
+		"({ blorp_List* __list_store_inline_set = (blorp_List*)" + list_c + "; long __list_store_idx_inline_set = " + index_c + "; " + c_type + " __list_store_value_inline_set = " + value_c + ((
+			"; if (__list_store_inline_set && __list_store_idx_inline_set >= 0 && "
+			+ "__list_store_idx_inline_set < __list_store_inline_set->capacity) { "
+			+ "memcpy((char*)__list_store_inline_set->data + __list_store_idx_inline_set * "
+		)) + width_c + ", &__list_store_value_inline_set, " + width_c + "); } })",
+	)
 
 
 private pure func emit_list_set(set: CoreListSet) -> Option[String]:
@@ -8061,10 +8085,17 @@ private pure func emit_pointer_list_handoff_set_owned(set: CoreListSet) -> Optio
 private pure func emit_inline_list_handoff_set_owned(set: CoreListSet) -> Option[String]:
 	list_c ?= emit_simple_expr(set.list)
 	index_c ?= emit_simple_expr(set.index)
-	value_c ?= emit_boxed_pointer_value(set.value)
+	value_c ?= emit_simple_expr(set.value.value)
+	c_type: String = c_type_name(core_expr_type(set.value.value))
 
 	Some(
-		"blorp_list_handoff_set_owned((blorp_List*)" + list_c + ", " + index_c + ", " + value_c + ")",
+		"({ blorp_List* __list_store_inline_set = (blorp_List*)" + list_c + "; long __list_store_idx_inline_set = " + index_c + "; " + c_type + " __list_store_value_inline_set = " + value_c + ((
+			"; if (__list_store_inline_set && __list_store_idx_inline_set >= 0 && "
+			+ "__list_store_idx_inline_set < __list_store_inline_set->capacity) { "
+			+ "memcpy((char*)__list_store_inline_set->data + __list_store_idx_inline_set * "
+			+ "__list_store_inline_set->elem_size, &__list_store_value_inline_set, "
+			+ "__list_store_inline_set->elem_size); } })"
+		)),
 	)
 
 
@@ -8961,6 +8992,35 @@ private pure func emit_scalar_unbox_expr(
 	Some(c_unbox_value(unbox_kind, typ, value_c))
 
 
+private pure func emit_inline_scalar_list_unbox_expr(
+	expr_value: CoreExpr,
+	typ: CoreType,
+) -> Option[String]:
+	match expr_value:
+		ListGetExpr(get, list_get_type, loc):
+			match get.layout:
+				InlineListStorage(width_bytes):
+					emit_inline_scalar_list_unbox_get(get, typ, width_bytes)
+				PointerListStorage:
+					None
+				InlineStructListStorage(c_type):
+					None
+		_:
+			None
+
+
+private pure func emit_inline_scalar_or_erased_unbox_expr(
+	unbox_kind: CoreUnboxKind,
+	expr_value: CoreExpr,
+	typ: CoreType,
+) -> Option[String]:
+	match emit_inline_scalar_list_unbox_expr(expr_value, typ):
+		Some(value):
+			Some(value)
+		None:
+			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
+
+
 private pure func emit_unbox_expr(
 	unbox_kind: CoreUnboxKind,
 	expr_value: CoreExpr,
@@ -8968,17 +9028,17 @@ private pure func emit_unbox_expr(
 ) -> Option[String]:
 	match unbox_kind:
 		FloatUnbox:
-			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
+			emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
 		Float32Unbox:
-			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
+			emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
 		Float16Unbox:
-			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
+			emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
 		Int128Unbox:
 			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		UInt128Unbox:
 			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		PrimUnbox:
-			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
+			emit_inline_scalar_or_erased_unbox_expr(unbox_kind, expr_value, typ)
 		PointerUnbox:
 			emit_scalar_unbox_expr(unbox_kind, expr_value, typ)
 		StructUnbox(c_type):

@@ -1396,7 +1396,10 @@ private pure func stack_option_tuple_slot_c_type(typ: CoreType) -> Option[String
 private pure func is_nullable_option_payload_type(payload: CoreType) -> Bool:
 	match payload:
 		NamedType(name, args):
-			pointer_box_storage_needs_release_type(payload)
+			if name == "Option" and args.length() == 1:
+				False
+			else:
+				pointer_box_storage_needs_release_type(payload)
 		BoxedResultType(ok_type, err_type):
 			True
 		HeapRecordType(name):
@@ -1887,7 +1890,7 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 				CharLiteral(value):
 					False
 		VarExpr(variable, typ, loc):
-			True
+			False
 		FieldExpr(expr_value, field_name, typ, loc):
 			True
 		TupleFieldExpr(expr_value, field_index, typ, loc):
@@ -2038,21 +2041,9 @@ private pure func tuple_pointer_expr_needs_retain(expr: CoreExpr) -> Bool:
 			False
 
 
-private pure func tuple_pointer_expr_needs_retain_with_retained_vars(
-	expr: CoreExpr,
-	retained_vars: List[CoreVar],
-) -> Bool:
-	match expr:
-		VarExpr(variable, typ, loc):
-			not core_var_list_contains(retained_vars, variable)
-		_:
-			tuple_pointer_expr_needs_retain(expr)
-
-
-private pure func prepared_tuple_literal_with_retained_vars(
+private pure func prepared_tuple_literal(
 	items: List[CoreExpr],
 	item_types: List[CoreType],
-	retained_vars: List[CoreVar],
 ) -> Option[PreparedTupleLiteral]:
 	var elements: List[CoreTupleElement] = []
 	var release_mask: Int = 0
@@ -2079,7 +2070,6 @@ private pure func prepared_tuple_literal_with_retained_vars(
 										match float_tuple_element(item, item_type):
 											Some(tuple_element):
 												elements = elements.append(tuple_element)
-												release_mask += int_power_of_two(index)
 											None:
 												if is_pointer_tuple_slot_type(item_type):
 													elements = elements.append(
@@ -2089,14 +2079,8 @@ private pure func prepared_tuple_literal_with_retained_vars(
 													if tuple_slot_needs_release(item_type):
 														release_mask += int_power_of_two(index)
 
-													if (
-														tuple_slot_needs_release(item_type)
-														and tuple_pointer_expr_needs_retain_with_retained_vars(
-															item,
-															retained_vars,
-														)
-													):
-														retain_mask += int_power_of_two(index)
+														if tuple_pointer_expr_needs_retain(item):
+															retain_mask += int_power_of_two(index)
 												else:
 													failed = True
 						TupleType(items):
@@ -2106,33 +2090,21 @@ private pure func prepared_tuple_literal_with_retained_vars(
 								if tuple_slot_needs_release(item_type):
 									release_mask += int_power_of_two(index)
 
-								if (
-									tuple_slot_needs_release(item_type)
-									and tuple_pointer_expr_needs_retain_with_retained_vars(
-										item,
-										retained_vars,
-									)
-								):
-									retain_mask += int_power_of_two(index)
+									if tuple_pointer_expr_needs_retain(item):
+										retain_mask += int_power_of_two(index)
 							else:
 								failed = True
 						BoxedResultType(ok_type, err_type):
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
 
-							if tuple_pointer_expr_needs_retain_with_retained_vars(
-								item,
-								retained_vars,
-							):
+							if tuple_pointer_expr_needs_retain(item):
 								retain_mask += int_power_of_two(index)
 						TensorType:
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
 
-							if tuple_pointer_expr_needs_retain_with_retained_vars(
-								item,
-								retained_vars,
-							):
+							if tuple_pointer_expr_needs_retain(item):
 								retain_mask += int_power_of_two(index)
 						StackResultType(ok_type, err_type):
 							failed = True
@@ -2140,19 +2112,13 @@ private pure func prepared_tuple_literal_with_retained_vars(
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
 
-							if tuple_pointer_expr_needs_retain_with_retained_vars(
-								item,
-								retained_vars,
-							):
+							if tuple_pointer_expr_needs_retain(item):
 								retain_mask += int_power_of_two(index)
 						UnionType(name):
 							elements = elements.append(TuplePointerElement(item))
 							release_mask += int_power_of_two(index)
 
-							if tuple_pointer_expr_needs_retain_with_retained_vars(
-								item,
-								retained_vars,
-							):
+							if tuple_pointer_expr_needs_retain(item):
 								retain_mask += int_power_of_two(index)
 						EnumType(name):
 							elements = elements.append(TuplePrimElement(item))
@@ -2176,29 +2142,17 @@ private pure func prepared_tuple_literal_with_retained_vars(
 		})
 
 
-private pure func prepared_tuple_literal(
-	items: List[CoreExpr],
-	item_types: List[CoreType],
-) -> Option[PreparedTupleLiteral]:
-	prepared_tuple_literal_with_retained_vars(items, item_types, [])
-
-
-private pure func prepare_tuple_expr_with_retained_vars(
+private pure func prepare_tuple_expr(
 	decls: List[CoreDecl],
 	items: List[CoreExpr],
 	typ: CoreType,
 	loc: CoreSourceLoc,
-	retained_vars: List[CoreVar],
 ) -> CoreExpr:
 	prepared_items: List[CoreExpr] = prepare_exprs(decls, items)
 
 	match typ:
 		TupleType(item_types):
-			match prepared_tuple_literal_with_retained_vars(
-				prepared_items,
-				item_types,
-				retained_vars,
-			):
+			match prepared_tuple_literal(prepared_items, item_types):
 				Some(prepared):
 					TupleConstructExpr(
 						{
@@ -2231,27 +2185,6 @@ private pure func prepare_tuple_expr_with_retained_vars(
 			TupleExpr(prepared_items, typ, loc)
 		VoidType:
 			TupleExpr(prepared_items, typ, loc)
-
-
-private pure func prepare_tuple_expr(
-	decls: List[CoreDecl],
-	items: List[CoreExpr],
-	typ: CoreType,
-	loc: CoreSourceLoc,
-) -> CoreExpr:
-	prepare_tuple_expr_with_retained_vars(decls, items, typ, loc, [])
-
-
-private pure func prepare_dup_body_expr(
-	decls: List[CoreDecl],
-	variable: CoreVar,
-	body: CoreExpr,
-) -> CoreExpr:
-	match body:
-		TupleExpr(items, typ, loc):
-			prepare_tuple_expr_with_retained_vars(decls, items, typ, loc, [variable])
-		_:
-			prepare_expr(decls, body)
 
 
 private pure func prepare_record_fields(
@@ -3354,7 +3287,7 @@ private pure func prepare_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExp
 				variable,
 				value_type,
 				retain_policy,
-				prepare_dup_body_expr(decls, variable, body),
+				prepare_expr(decls, body),
 				typ,
 				loc,
 			)
