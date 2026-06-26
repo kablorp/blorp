@@ -1,0 +1,191 @@
+import:
+	test: TestSuite
+
+
+-- Regression shape for nested record payloads crossing generic parser closures,
+-- mutable cursor reassignment, union returns, and List accumulation.
+record Cursor {
+	offset: Int,
+	line: Int,
+	column: Int
+}
+
+
+record Span {
+	start: Cursor,
+	end: Cursor
+}
+
+
+record Source {
+	text: String
+}
+
+
+union ParseError:
+	Message(String)
+
+
+union ParseResult[T]:
+	Parsed(T, Cursor)
+	ParseFailed(ParseError)
+
+
+type alias Parser[T] = pure (Source, Cursor) -> ParseResult[T]
+
+
+pure func origin() -> Cursor:
+	{
+		offset = 0,
+		line = 1,
+		column = 1
+	}
+
+
+pure func advance(cursor: Cursor) -> Cursor:
+	{
+		offset = cursor.offset + 1,
+		line = cursor.line,
+		column = cursor.column + 1
+	}
+
+
+pure func is_digit_char(ch: Char) -> Bool:
+	ch >= '0' and ch <= '9'
+
+
+pure func source_text(text: String) -> Source:
+	{text = text}
+
+
+pure func number_span(source: Source, start: Cursor) -> ParseResult[Span]:
+	var current: Cursor = start
+	var seen: Bool = False
+	var done: Bool = False
+
+	while not done:
+		match source.text.get(current.offset):
+			Some(ch):
+				if is_digit_char(ch):
+					seen = True
+					current = advance(current)
+				else:
+					done = True
+			None:
+				done = True
+
+	if seen:
+		Parsed(
+			{
+				start = start,
+				end = current
+			},
+			current,
+		)
+	else:
+		ParseFailed(Message("expected number"))
+
+
+pure func comma(source: Source, start: Cursor) -> ParseResult[Int]:
+	match source.text.get(start.offset):
+		Some(ch):
+			if ch == ',':
+				end: Cursor = advance(start)
+				Parsed(0, end)
+			else:
+				ParseFailed(Message("expected comma"))
+		None:
+			ParseFailed(Message("expected comma"))
+
+
+pure func sep_by[A, S](item: Parser[A], sep: Parser[S]) -> Parser[List[A]]:
+	pure func(source: Source, start: Cursor):
+		match item(source, start):
+			ParseFailed(_):
+				empty: List[A] = []
+				Parsed(empty, start)
+			Parsed(first, rest):
+				var results: List[A] = [first]
+				var current: Cursor = rest
+				var done: Bool = False
+
+				while not done:
+					match sep(source, current):
+						Parsed(_, sep_rest):
+							match item(source, sep_rest):
+								Parsed(value, item_rest):
+									results = results.append(value)
+									current = item_rest
+								ParseFailed(_):
+									done = True
+						ParseFailed(_):
+							done = True
+
+				Parsed(results, current)
+
+
+pure func span_offsets_are(span: Span, start_offset: Int, end_offset: Int) -> Bool:
+	(
+		span.start.offset == start_offset
+		and span.end.offset == end_offset
+		and span.start.line == 1
+		and span.end.line == 1
+	)
+
+
+pure func spans_are_expected(spans: List[Span]) -> Bool:
+	match spans.get(0):
+		Some(first):
+			match spans.get(1):
+				Some(second):
+					match spans.get(2):
+						Some(third):
+							first_ok: Bool = span_offsets_are(first, 0, 1)
+							second_ok: Bool = span_offsets_are(second, 2, 4)
+							third_ok: Bool = span_offsets_are(third, 5, 8)
+
+							spans.length() == 3 and first_ok and second_ok and third_ok
+						None:
+							False
+				None:
+					False
+		None:
+			False
+
+
+func test_nested_record_span_parser_list_result() -> Bool:
+	item: Parser[Span] = number_span
+	parser: Parser[List[Span]] = sep_by(number_span, comma)
+	source: Source = source_text("1,22,333 rest")
+
+	match item(source, origin()):
+		Parsed(first_span, first_rest):
+			if not span_offsets_are(first_span, 0, 1) or first_rest.offset != 1:
+				False
+			else:
+				match parser(source, origin()):
+					Parsed(spans, rest):
+						rest.offset == 8 and spans_are_expected(spans)
+					ParseFailed(_):
+						False
+		ParseFailed(_):
+			False
+
+
+func test_nested_record_span_parser_direct_result() -> Bool:
+	item: Parser[Span] = number_span
+
+	match item(source_text("123"), origin()):
+		Parsed(span, rest):
+			rest.offset == 3 and span_offsets_are(span, 0, 3)
+		ParseFailed(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Parser nested record span closure list",
+	tests = [
+		("nested record span parser list result", test_nested_record_span_parser_list_result),
+		("nested record span parser direct result", test_nested_record_span_parser_direct_result),
+	]
+}

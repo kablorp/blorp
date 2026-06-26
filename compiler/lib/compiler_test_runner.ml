@@ -36,6 +36,14 @@ type case_kind =
 type test_case = { kind : case_kind; file : string }
 type command_result = { code : int; output : string }
 
+type codegen_audit_summary = {
+  codegen_passed : int;
+  codegen_failed : int;
+  codegen_total : int;
+  codegen_detail_lines : string list;
+  codegen_runner_failure : string list option;
+}
+
 let starts_with s prefix =
   let s_len = String.length s in
   let p_len = String.length prefix in
@@ -49,6 +57,57 @@ let drop_prefix s prefix =
   else None
 
 let split_lines s = String.split_on_char '\n' s
+
+let summarize_codegen_audit_output ~exit_code output =
+  let passed = ref 0 in
+  let failed = ref 0 in
+  let total = ref 0 in
+  let cases = ref 0 in
+  let detail_lines = ref [] in
+  output |> split_lines
+  |> List.iter (fun line ->
+         match drop_prefix line "PASS: " with
+         | Some _name ->
+             incr passed;
+             incr total;
+             incr cases
+         | None -> (
+             match drop_prefix line "FAIL: " with
+             | Some _name ->
+                 incr failed;
+                 incr total;
+                 incr cases
+             | None ->
+                 if line = "" || starts_with line "Results:" then ()
+                 else detail_lines := line :: !detail_lines));
+  let runner_failure =
+    if exit_code = 0 then None
+    else begin
+      incr failed;
+      incr total;
+      if !cases = 0 then
+        Some
+          ("runner failed before reporting test results"
+          :: (output |> split_lines
+             |> List.filter (( <> ) "")
+             |> List.filteri (fun i _ -> i < 10)))
+      else
+        Some
+          [
+            Printf.sprintf
+              "runner exited with status %d after reporting %d test result(s)"
+              exit_code !cases;
+          ]
+    end
+  in
+  {
+    codegen_passed = !passed;
+    codegen_failed = !failed;
+    codegen_total = !total;
+    codegen_detail_lines = List.rev !detail_lines;
+    codegen_runner_failure = runner_failure;
+  }
+
 let read_file = Modules.read_file
 
 let write_file path content =
@@ -502,35 +561,26 @@ let run_codegen_audit opts passed failed total =
       Test_runner.run_process_capture_timeout ~timeout:None script
         [ opts.blorp_bin ]
     in
-    let cases = ref 0 in
+    let summary = summarize_codegen_audit_output ~exit_code:code output in
+    passed := !passed + summary.codegen_passed;
+    failed := !failed + summary.codegen_failed;
+    total := !total + summary.codegen_total;
     output |> split_lines
     |> List.iter (fun line ->
         match drop_prefix line "PASS: " with
         | Some name ->
-            incr passed;
-            incr total;
-            incr cases;
             if opts.verbose then
               Printf.printf "PASS: [codegen_audit] %s\n%!" name
         | None -> (
             match drop_prefix line "FAIL: " with
             | Some name ->
-                incr failed;
-                incr total;
-                incr cases;
                 Printf.printf "FAIL: [codegen_audit] %s\n%!" name
             | None ->
                 if line = "" || starts_with line "Results:" then ()
                 else Printf.printf "DETAIL %s\n%!" line));
-    if code <> 0 && !cases = 0 then begin
-      emit_fail "codegen_audit" "runner"
-        ("runner failed before reporting test results"
-        :: (output |> split_lines
-           |> List.filter (( <> ) "")
-           |> List.filteri (fun i _ -> i < 10)));
-      incr failed;
-      incr total
-    end
+    match summary.codegen_runner_failure with
+    | None -> ()
+    | Some details -> emit_fail "codegen_audit" "runner" details
   end
 
 let rec collect_should_fail_files dir =

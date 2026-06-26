@@ -854,6 +854,81 @@ let renderer_bridge_stack_link_args () =
     [ "-Wl,-stack_size,0x4000000" ]
   else []
 
+(* The self-hosted bridge currently decodes and emits large Core JSON through
+   generated recursive functions with large C stack frames. Keep the bridge
+   stack explicit until those generated frames are made smaller; relying on the
+   platform default stack makes Linux CI crash on large compiler/blorp payloads. *)
+let renderer_bridge_stack_size_bytes = 256 * 1024 * 1024
+let renderer_bridge_user_main_symbol = "__blorp_renderer_bridge_user_main"
+
+let renderer_bridge_common_cc_flags = [ "-O0"; "-fwrapv"; "-pipe"; "-w" ]
+
+let renderer_bridge_wrapper_source () =
+  Printf.sprintf
+    {c|#include <pthread.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+extern int %s(int argc, char **argv);
+
+typedef struct {
+    int argc;
+    char **argv;
+    int result;
+} blorp_renderer_bridge_main_args;
+
+static void *blorp_renderer_bridge_main_entry(void *raw) {
+    blorp_renderer_bridge_main_args *args = (blorp_renderer_bridge_main_args *)raw;
+    args->result = %s(args->argc, args->argv);
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    pthread_attr_t attr;
+    pthread_t thread;
+    blorp_renderer_bridge_main_args args = { argc, argv, 1 };
+
+    if (pthread_attr_init(&attr) != 0) {
+        return %s(argc, argv);
+    }
+
+    if (pthread_attr_setstacksize(&attr, (size_t)%d) != 0) {
+        pthread_attr_destroy(&attr);
+        return %s(argc, argv);
+    }
+
+    if (pthread_create(&thread, &attr, blorp_renderer_bridge_main_entry, &args) != 0) {
+        pthread_attr_destroy(&attr);
+        return %s(argc, argv);
+    }
+
+    pthread_attr_destroy(&attr);
+    if (pthread_join(thread, NULL) != 0) {
+        return 1;
+    }
+    return args.result;
+}
+|c}
+    renderer_bridge_user_main_symbol renderer_bridge_user_main_symbol
+    renderer_bridge_user_main_symbol renderer_bridge_stack_size_bytes
+    renderer_bridge_user_main_symbol renderer_bridge_user_main_symbol
+
+let renderer_bridge_compile_object_args ~c_path ~obj_path =
+  renderer_bridge_common_cc_flags
+  @ [
+      "-Dmain=" ^ renderer_bridge_user_main_symbol;
+      "-c";
+      c_path;
+      "-o";
+      obj_path;
+    ]
+
+let renderer_bridge_link_args ~obj_path ~wrapper_path ~bin_path =
+  renderer_bridge_common_cc_flags
+  @ [ obj_path; wrapper_path ]
+  @ renderer_bridge_stack_link_args ()
+  @ [ "-lm"; "-lpthread"; "-o"; bin_path ]
+
 type renderer_bridge_cache_parts = {
   bridge_key : string;
   bridge_source_digest : string;
@@ -895,7 +970,7 @@ let renderer_bridge_cache_parts ~program ~source_path =
     string_digest
       (String.concat "\000"
          [
-           "compiler-renderer-bridge-cache-v1";
+           "compiler-renderer-bridge-cache-v2";
            source_digest;
            program_digest;
            cc_digest;
@@ -917,13 +992,15 @@ let renderer_bridge_cache_dir cache_root key =
 
 let renderer_bridge_bin_path dir = Filename.concat dir "bridge.bin"
 let renderer_bridge_c_path dir = Filename.concat dir "bridge.c"
+let renderer_bridge_obj_path dir = Filename.concat dir "bridge.o"
+let renderer_bridge_wrapper_path dir = Filename.concat dir "bridge_main.c"
 let renderer_bridge_manifest_path dir = Filename.concat dir "MANIFEST"
 let renderer_bridge_ready_path dir = Filename.concat dir "READY"
 
 let renderer_bridge_manifest parts ~binary_path =
   String.concat "\n"
     [
-      "compiler-renderer-bridge-cache-v1";
+      "compiler-renderer-bridge-cache-v2";
       "key=" ^ parts.bridge_key;
       "source=" ^ parts.bridge_source_digest;
       "program=" ^ parts.bridge_program_digest;
@@ -1008,9 +1085,14 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root parts =
         renderer_bridge_temp_dir_retry_limit
     in
     let c_path = renderer_bridge_c_path stage_dir in
+    let obj_path = renderer_bridge_obj_path stage_dir in
+    let wrapper_path = renderer_bridge_wrapper_path stage_dir in
     let bin_path = renderer_bridge_bin_path stage_dir in
     Fun.protect
-      ~finally:(fun () -> try Sys.remove c_path with _ -> ())
+      ~finally:(fun () ->
+        List.iter
+          (fun path -> try Sys.remove path with _ -> ())
+          [ c_path; obj_path; wrapper_path ])
       (fun () ->
         let compile_code, compile_output, compile_stderr =
           run_process_capture program
@@ -1024,34 +1106,37 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root parts =
                (String.trim (compile_output ^ compile_stderr)))
         end
         else
-	          let cc_code, cc_output, cc_stderr =
-	            run_process_capture "cc"
-	              ([
-	                 "-O0";
-	                 "-fwrapv";
-	                 "-pipe";
-	                 "-w";
-	                 c_path;
-	               ]
-	              @ renderer_bridge_stack_link_args ()
-	              @ [
-	                  "-lm";
-	                  "-lpthread";
-	                  "-o";
-	                  bin_path;
-	                ])
+          let () = write_file wrapper_path (renderer_bridge_wrapper_source ()) in
+          let obj_code, obj_output, obj_stderr =
+            run_process_capture "cc"
+              (renderer_bridge_compile_object_args ~c_path ~obj_path)
           in
-          if cc_code <> 0 then begin
+          if obj_code <> 0 then begin
             remove_path_noerr stage_dir;
             Error
-              (Printf.sprintf "failed to build Blorp renderer bridge binary: %s"
-                 (String.trim (cc_output ^ cc_stderr)))
+              (Printf.sprintf
+                 "failed to compile Blorp renderer bridge object: %s"
+                 (String.trim (obj_output ^ obj_stderr)))
           end
-          else begin
-            (try Sys.remove c_path with _ -> ());
-            write_renderer_bridge_cache_markers parts stage_dir;
-            publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir
-          end)
+          else
+            let cc_code, cc_output, cc_stderr =
+              run_process_capture "cc"
+                (renderer_bridge_link_args ~obj_path ~wrapper_path ~bin_path)
+            in
+            if cc_code <> 0 then begin
+              remove_path_noerr stage_dir;
+              Error
+                (Printf.sprintf
+                   "failed to build Blorp renderer bridge binary: %s"
+                   (String.trim (cc_output ^ cc_stderr)))
+            end
+            else begin
+              List.iter
+                (fun path -> try Sys.remove path with _ -> ())
+                [ c_path; obj_path; wrapper_path ];
+              write_renderer_bridge_cache_markers parts stage_dir;
+              publish_renderer_bridge_cache_dir parts ~stage_dir ~final_dir
+            end)
 
 let renderer_bridge_binary () =
   let program = default_command_program () in

@@ -1605,15 +1605,20 @@ let rec alias_source_of_rhs (env : type_env) (b : binding) (rhs : core) :
 let retain_alias_source (env : type_env) (b : binding) (body : core) : core =
   match alias_source_of_rhs env b b.bind_rhs with
   | Some (AliasVar source) ->
-      let body_needs_source_retain =
-        match dropped_vars_before_returning b.bind_var.vname body with
-        | Some dropped ->
-            StringSet.is_empty dropped || StringSet.mem source.vname dropped
-        | None -> true
-      in
-      if body_needs_source_retain then
-        { body with desc = CDup (source, b.bind_ty, body) }
-      else body
+      if result_starts_with_dup_of b.bind_var.vname body then body
+      else
+        let body_needs_source_retain =
+          match dropped_vars_before_returning b.bind_var.vname body with
+          | Some dropped ->
+              StringSet.is_empty dropped || StringSet.mem source.vname dropped
+          | None -> true
+        in
+        if body_needs_source_retain then
+          (* Retaining either the alias binding or the source pointer creates
+             the same logical owner. Avoid stacking both when an earlier pass
+             has already made the alias binding owned before returning it. *)
+          { body with desc = CDup (source, b.bind_ty, body) }
+        else body
   | Some AliasBinding ->
       if result_starts_with_dup_of b.bind_var.vname body then body
       else { body with desc = CDup (b.bind_var, b.bind_ty, body) }
@@ -2769,7 +2774,11 @@ let rec expr_final_consumes_var_owner (env : type_env) (name : string)
       if b.borrow_var.vname = name then false
       else if expr_touches_current_owner body then
         expr_final_consumes_var_owner env name body
-      else expr_final_consumes_var_owner env name b.borrow_rhs
+      else
+        (* A borrow binding can mention the mutable owner without spending the
+           scope-exit owner. Only suppress the final drop if constructing the
+           borrowed view required a real ownership-consuming operation. *)
+        expr_consumes_var_owner env name b.borrow_rhs
   | CSeq (head, tail) ->
       if expr_touches_current_owner tail then
         expr_final_consumes_var_owner env name tail
@@ -2800,7 +2809,14 @@ let rec expr_final_consumes_var_owner (env : type_env) (name : string)
       if List.exists Option.is_some leaf_states then
         List.for_all (function Some true -> true | _ -> false) leaf_states
       else expr_consumes_var_owner env name scrut
-  | _ -> expr_consumes_var_owner env name e && not (expr_assigns_var name e)
+  | _ ->
+      (* This predicate decides whether a mutable slot's scope-exit owner has
+         already been consumed by the final expression. Use the ownership
+         summary here rather than the older syntactic consume check: protective
+         CDup nodes inserted for consuming calls spend retained refs, not the
+         mutable slot's original owner. *)
+      let uses = summarize_linear_ownership_uses env name e in
+      uses.consumed_refs > 0 && not (expr_assigns_var name e)
 
 and ctree_final_consumes_var_owner (env : type_env) (name : string)
     (tree : ctree) : bool option list =
@@ -2848,69 +2864,17 @@ let release_reassigned_mutable_var (env : type_env)
     Var.named (Printf.sprintf "__assign_%s_%d" target.vname n)
   in
   let void_at loc = { desc = CVoid; ty = Ast.TyNamed ("Void", []); loc } in
-  let rec rhs_aliases_borrowed_name borrowed rhs =
-    match rhs.desc with
-    | CVar v -> List.mem v.vname borrowed
-    | CField (owner, _) -> rhs_aliases_borrowed_name borrowed owner
-    | CLet (b, _) -> rhs_aliases_borrowed_name borrowed b.bind_rhs
-    | CBorrowLet (b, _) -> rhs_aliases_borrowed_name borrowed b.borrow_rhs
-    | CSeq (_, tail) -> rhs_aliases_borrowed_name borrowed tail
-    | CDup (_, _, body) | CDrop (_, _, body) ->
-        rhs_aliases_borrowed_name borrowed body
-    | _ -> false
-  in
-  let rhs_result_is_nonborrowed_var_alias borrowed rhs =
-    let rec result_aliases local_aliases expr =
-      match expr.desc with
-      | CVar v -> (
-          match List.assoc_opt v.vname local_aliases with
-          | Some aliases_nonborrowed -> aliases_nonborrowed
-          | None ->
-              (not (List.mem v.vname borrowed))
-              && not (is_global_function_symbol env v))
-      | CLet (b, body) ->
-          let aliases_nonborrowed =
-            is_managed_type env b.bind_ty
-            && result_aliases local_aliases b.bind_rhs
-          in
-          result_aliases
-            ((b.bind_var.vname, aliases_nonborrowed) :: local_aliases)
-            body
-      | CBorrowLet (b, body) ->
-          result_aliases ((b.borrow_var.vname, false) :: local_aliases) body
-      | CSeq (_, tail)
-      | CDup (_, _, tail)
-      | CDrop (_, _, tail)
-      | CUnbox (tail, _)
-      | CCast (tail, _) ->
-          result_aliases local_aliases tail
-      | _ -> false
-    in
-    result_aliases [] rhs
-  in
-  let rec rewrite ?(skip_old_release = false) ?(borrowed_aliases = []) e =
+  let rec rewrite ?(skip_old_release = false) e =
     match e.desc with
     | CAssign (v, rhs) when v.vname = target.vname ->
-        let rhs = rewrite ~skip_old_release:false ~borrowed_aliases rhs in
+        let rhs = rewrite ~skip_old_release:false rhs in
         if skip_old_release || expr_consumes_var_owner env target.vname rhs then
-          let assign = { e with desc = CAssign (v, rhs) } in
-          (* If a prior COW-consuming expression already consumed the old
-             alias owner, do not release it again. Alias RHS normalization may
-             add an extra retain to survive match-scrutinee teardown; balance
-             that retain after the assignment. *)
-          if skip_old_release && assignment_rhs_is_alias env rhs then
-            {
-              e with
-              desc =
-                CSeq
-                  ( assign,
-                    {
-                      desc = CDrop (v, target_ty, void_at e.loc);
-                      ty = Ast.TyNamed ("Void", []);
-                      loc = e.loc;
-                    } );
-            }
-          else assign
+          (* If a prior COW-consuming expression already consumed the old slot
+             owner, assignment must not drop the target again here. When the RHS
+             is a borrowed match payload, alias normalization retains it; that
+             retained reference is the mutable slot's new owner and must survive
+             the match-scrutinee cleanup. *)
+          { e with desc = CAssign (v, rhs) }
         else
           let tmp = next_tmp () in
           let tmp_ref = { rhs with desc = CVar tmp } in
@@ -2928,21 +2892,12 @@ let release_reassigned_mutable_var (env : type_env)
               ty = Ast.TyNamed ("Void", []);
             }
           in
-          let assign_tail =
-            if rhs_result_is_nonborrowed_var_alias borrowed_aliases rhs then
-              {
-                e with
-                desc =
-                  CSeq
-                    ( assign_new,
-                      {
-                        desc = CDrop (v, target_ty, void_at e.loc);
-                        ty = Ast.TyNamed ("Void", []);
-                        loc = e.loc;
-                      } );
-              }
-            else assign_new
-          in
+          (* In the normal assignment path, any retain added to an alias RHS
+             becomes the mutable slot's new owner. Only the skip-old-release
+             path above emits a post-assignment balance drop, because that path
+             represents a prior consuming operation that already spent the old
+             slot owner before reassignment. *)
+          let assign_tail = assign_new in
           let seq = { e with desc = CSeq (drop_old, assign_tail) } in
           let bind =
             {
@@ -2955,56 +2910,38 @@ let release_reassigned_mutable_var (env : type_env)
           { e with desc = CLet (bind, seq) }
     | CLet (b, inner_body) ->
         let b' =
-          {
-            b with
-            bind_rhs =
-              rewrite ~skip_old_release:false ~borrowed_aliases b.bind_rhs;
-          }
+          { b with bind_rhs = rewrite ~skip_old_release:false b.bind_rhs }
         in
         let body' =
           if b.bind_var.vname = target.vname then inner_body
           else
-            let borrowed_aliases =
-              if rhs_aliases_borrowed_name borrowed_aliases b.bind_rhs then
-                b.bind_var.vname :: borrowed_aliases
-              else borrowed_aliases
-            in
             let skip_body =
               (skip_old_release
               || target_starts_as_alias
                  && expr_consumes_var_owner env target.vname b.bind_rhs)
               && not (expr_assigns_var target.vname b.bind_rhs)
             in
-            rewrite ~skip_old_release:skip_body ~borrowed_aliases inner_body
+            rewrite ~skip_old_release:skip_body inner_body
         in
         { e with desc = CLet (b', body') }
     | CBorrowLet (b, inner_body) ->
         let b' =
-          {
-            b with
-            borrow_rhs =
-              rewrite ~skip_old_release:false ~borrowed_aliases b.borrow_rhs;
-          }
+          { b with borrow_rhs = rewrite ~skip_old_release:false b.borrow_rhs }
         in
         let body' =
           if b.borrow_var.vname = target.vname then inner_body
           else
-            let borrowed_aliases =
-              if rhs_aliases_borrowed_name borrowed_aliases b.borrow_rhs then
-                b.borrow_var.vname :: borrowed_aliases
-              else borrowed_aliases
-            in
             let skip_body =
               (skip_old_release
               || target_starts_as_alias
                  && expr_consumes_var_owner env target.vname b.borrow_rhs)
               && not (expr_assigns_var target.vname b.borrow_rhs)
             in
-            rewrite ~skip_old_release:skip_body ~borrowed_aliases inner_body
+            rewrite ~skip_old_release:skip_body inner_body
         in
         { e with desc = CBorrowLet (b', body') }
     | CSeq (head, tail) ->
-        let head' = rewrite ~skip_old_release ~borrowed_aliases head in
+        let head' = rewrite ~skip_old_release head in
         let skip_tail =
           (skip_old_release && not (expr_assigns_var target.vname head))
           || expr_consumes_var_owner env target.vname head
@@ -3013,11 +2950,10 @@ let release_reassigned_mutable_var (env : type_env)
         {
           e with
           desc =
-            CSeq
-              (head', rewrite ~skip_old_release:skip_tail ~borrowed_aliases tail);
+            CSeq (head', rewrite ~skip_old_release:skip_tail tail);
         }
     | CMatchArms (scrut, arms) ->
-        let scrut' = rewrite ~skip_old_release:false ~borrowed_aliases scrut in
+        let scrut' = rewrite ~skip_old_release:false scrut in
         let arm_skip =
           skip_old_release || expr_consumes_var_owner env target.vname scrut
         in
@@ -3025,11 +2961,7 @@ let release_reassigned_mutable_var (env : type_env)
           List.map
             (fun (pat, arm) ->
               if pattern_binds target.vname pat then (pat, arm)
-              else
-                let borrowed_aliases =
-                  pattern_bound_names pat @ borrowed_aliases
-                in
-                (pat, rewrite ~skip_old_release:arm_skip ~borrowed_aliases arm))
+              else (pat, rewrite ~skip_old_release:arm_skip arm))
             arms
         in
         { e with desc = CMatchArms (scrut', arms') }
@@ -3041,21 +2973,20 @@ let release_reassigned_mutable_var (env : type_env)
           e with
           desc =
             CMatch
-              ( rewrite ~skip_old_release:false ~borrowed_aliases scrut,
-                rewrite_ctree ~skip_old_release:tree_skip ~borrowed_aliases tree
-              );
+              ( rewrite ~skip_old_release:false scrut,
+                rewrite_ctree ~skip_old_release:tree_skip tree );
         }
     | CFor (binder, iter, loop_body) ->
         let loop_body' =
           if binder.loop_var.vname = target.vname then loop_body
-          else rewrite ~skip_old_release ~borrowed_aliases loop_body
+          else rewrite ~skip_old_release loop_body
         in
         {
           e with
           desc =
             CFor
               ( binder,
-                rewrite ~skip_old_release:false ~borrowed_aliases iter,
+                rewrite ~skip_old_release:false iter,
                 loop_body' );
         }
     | CLambda lam ->
@@ -3068,8 +2999,7 @@ let release_reassigned_mutable_var (env : type_env)
               CLambda
                 {
                   lam with
-                  lam_body =
-                    rewrite ~skip_old_release ~borrowed_aliases lam.lam_body;
+                  lam_body = rewrite ~skip_old_release lam.lam_body;
                 };
           }
     | CConcurrent cb ->
@@ -3089,18 +3019,13 @@ let release_reassigned_mutable_var (env : type_env)
                     (fun b ->
                       {
                         b with
-                        cb_rhs =
-                          rewrite ~skip_old_release:false ~borrowed_aliases
-                            b.cb_rhs;
+                        cb_rhs = rewrite ~skip_old_release:false b.cb_rhs;
                       })
                     cb.conc_bindings;
                 conc_body =
                   (if shadowed then cb.conc_body
-                   else rewrite ~skip_old_release ~borrowed_aliases cb.conc_body);
-                conc_timeout =
-                  Option.map
-                    (rewrite ~skip_old_release ~borrowed_aliases)
-                    cb.conc_timeout;
+                   else rewrite ~skip_old_release cb.conc_body);
+                conc_timeout = Option.map (rewrite ~skip_old_release) cb.conc_timeout;
               };
         }
     | CConcurrentlyLoop cf ->
@@ -3110,28 +3035,20 @@ let release_reassigned_mutable_var (env : type_env)
             CConcurrentlyLoop
               {
                 cf with
-                cf_iter =
-                  rewrite ~skip_old_release:false ~borrowed_aliases cf.cf_iter;
+                cf_iter = rewrite ~skip_old_release:false cf.cf_iter;
                 cf_body =
                   (if cf.cf_var.vname = target.vname then cf.cf_body
-                   else rewrite ~skip_old_release ~borrowed_aliases cf.cf_body);
-                cf_timeout =
-                  Option.map
-                    (rewrite ~skip_old_release ~borrowed_aliases)
-                    cf.cf_timeout;
+                   else rewrite ~skip_old_release cf.cf_body);
+                cf_timeout = Option.map (rewrite ~skip_old_release) cf.cf_timeout;
               };
         }
-    | _ -> map_children (rewrite ~skip_old_release ~borrowed_aliases) e
-  and rewrite_ctree ?(skip_old_release = false) ?(borrowed_aliases = []) tree =
+    | _ -> map_children (rewrite ~skip_old_release) e
+  and rewrite_ctree ?(skip_old_release = false) tree =
     match tree with
     | CTLeaf { ct_bindings; ct_body } ->
         let ct_body =
           if match_bindings_shadow target.vname ct_bindings then ct_body
-          else
-            let borrowed_aliases =
-              match_binding_names ct_bindings @ borrowed_aliases
-            in
-            rewrite ~skip_old_release ~borrowed_aliases ct_body
+          else rewrite ~skip_old_release ct_body
         in
         CTLeaf { ct_bindings; ct_body }
     | CTFail -> CTFail
@@ -3141,13 +3058,9 @@ let release_reassigned_mutable_var (env : type_env)
             cts_scrut;
             cts_cases =
               List.map
-                (fun (n, sub) ->
-                  (n, rewrite_ctree ~skip_old_release ~borrowed_aliases sub))
+                (fun (n, sub) -> (n, rewrite_ctree ~skip_old_release sub))
                 cts_cases;
-            cts_default =
-              Option.map
-                (rewrite_ctree ~skip_old_release ~borrowed_aliases)
-                cts_default;
+            cts_default = Option.map (rewrite_ctree ~skip_old_release) cts_default;
           }
     | CTSwitchLit { ctl_scrut; ctl_cases; ctl_default } ->
         CTSwitchLit
@@ -3155,11 +3068,9 @@ let release_reassigned_mutable_var (env : type_env)
             ctl_scrut;
             ctl_cases =
               List.map
-                (fun (lit, sub) ->
-                  (lit, rewrite_ctree ~skip_old_release ~borrowed_aliases sub))
+                (fun (lit, sub) -> (lit, rewrite_ctree ~skip_old_release sub))
                 ctl_cases;
-            ctl_default =
-              rewrite_ctree ~skip_old_release ~borrowed_aliases ctl_default;
+            ctl_default = rewrite_ctree ~skip_old_release ctl_default;
           }
     | CTSwitchLen { ctl_len_scrut; ctl_len_cases; ctl_len_geq; ctl_len_default }
       ->
@@ -3168,18 +3079,14 @@ let release_reassigned_mutable_var (env : type_env)
             ctl_len_scrut;
             ctl_len_cases =
               List.map
-                (fun (n, sub) ->
-                  (n, rewrite_ctree ~skip_old_release ~borrowed_aliases sub))
+                (fun (n, sub) -> (n, rewrite_ctree ~skip_old_release sub))
                 ctl_len_cases;
             ctl_len_geq =
               Option.map
-                (fun (n, sub) ->
-                  (n, rewrite_ctree ~skip_old_release ~borrowed_aliases sub))
+                (fun (n, sub) -> (n, rewrite_ctree ~skip_old_release sub))
                 ctl_len_geq;
             ctl_len_default =
-              Option.map
-                (rewrite_ctree ~skip_old_release ~borrowed_aliases)
-                ctl_len_default;
+              Option.map (rewrite_ctree ~skip_old_release) ctl_len_default;
           }
   in
   rewrite body
