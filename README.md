@@ -26,6 +26,9 @@ curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-
 ~/.local/bin/blorp --version
 ```
 
+Set `BLORP_INSTALL_TAG=dev-<short-sha>` to install an immutable dev snapshot
+instead of the moving latest `dev` build.
+
 To remove the dev binary:
 
 ```bash

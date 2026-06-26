@@ -5,10 +5,12 @@ Blorp publishes binaries through GitHub Releases.
 ## Channels
 
 - `dev` is a moving prerelease produced after `CI` passes on `main`.
+- `dev-<short-sha>` is an immutable prerelease produced from the same successful
+  `main` build as `dev`.
 - `vX.Y.Z...` tags produce immutable versioned releases.
 
-Dev builds are for dogfooding and early testing. Link new users to tagged
-preview releases once a preview has been cut.
+Dev builds are for dogfooding, bisecting, and early testing. Link new users to
+versioned preview releases once a preview has been cut.
 
 ## Latest Dev Build
 
@@ -33,6 +35,14 @@ Manual downloads are available from:
 https://github.com/kablorp/blorp/releases/tag/dev
 ```
 
+To pin a specific successful `main` build, install from the immutable dev tag
+shown in the matching release notes:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-dev |
+  BLORP_INSTALL_TAG=dev-<short-sha> bash
+```
+
 ## Versioning
 
 Use SemVer-style versions while Blorp is pre-0.1.0:
@@ -40,6 +50,7 @@ Use SemVer-style versions while Blorp is pre-0.1.0:
 - Preview release: `v0.0.1-preview.1`
 - Patch release: `v0.0.2`
 - Main dev build: generated as `0.0.1-dev.<short-sha>`
+- Immutable dev tag: `dev-<short-sha>`
 
 The source fallback version lives in `compiler/lib/version.ml` as
 `source_version`. Release workflows override it at build time with
@@ -64,8 +75,9 @@ blorp-<version>-<target>.tar.gz
 blorp-<version>-<target>.tar.gz.sha256
 ```
 
-The moving `dev` release also publishes stable aliases for copy-paste download
-URLs:
+Dev releases publish stable asset aliases for copy-paste download URLs. The
+moving `dev` tag and each immutable `dev-<short-sha>` tag both include these
+aliases:
 
 ```text
 blorp-dev-<target>.tar.gz
@@ -96,7 +108,12 @@ Each archive contains:
 ## Operational Notes
 
 - Do not treat dev builds as stable preview releases.
-- Do not mutate tagged release assets after publishing; create a new tag instead.
+- `dev` is intentionally mutable and always points at the latest successful
+  `main` build.
+- Push `v*` release tags only after the target commit has passed the intended
+  CI/premerge gate; tag releases build directly from the pushed tag.
+- Do not mutate `dev-*` or `v*` release assets after publishing; create a new
+  tag instead.
 - Downloading `blorp` does not remove the need for a local C toolchain. `blorp
   run` and `blorp compile` still invoke the platform C compiler.
 - If macOS distribution starts warning users about unidentified binaries, add

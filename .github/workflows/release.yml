@@ -1,11 +1,15 @@
 name: Release Binaries
 
-# Publish artifacts only after CI succeeds for a push to main.
+# Publish dev artifacts after CI succeeds on main. Publish immutable tagged
+# releases directly from pushed v* tags.
 on:
   workflow_run:
     workflows: ['CI']
     branches: [main]
     types: [completed]
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
@@ -16,7 +20,19 @@ env:
 jobs:
   build:
     name: Build binary (${{ matrix.os }})
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' }}
+    if: >-
+      ${{
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main'
+        ) ||
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v')
+        )
+      }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -29,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Install system libraries
         if: runner.os == 'Linux'
@@ -47,14 +63,14 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
           set -euo pipefail
           target=$(scripts/target-triple)
-          short_sha=${SOURCE_SHA:0:12}
+          source_sha=$(git rev-parse HEAD)
+          short_sha=${source_sha:0:12}
           source_version=$(sed -n 's/^let source_version = "\(.*\)"/\1/p' compiler/lib/version.ml)
 
-          if [ "$EVENT_NAME" = "push" ]; then
+          if [ "$EVENT_NAME" = "push" ] && [[ "$REF_NAME" == v* ]]; then
             version="${REF_NAME#v}"
             if [[ "$version" == *-* ]]; then
               channel="preview"
@@ -68,7 +84,7 @@ jobs:
 
           {
             echo "target=$target"
-            echo "source_sha=$SOURCE_SHA"
+            echo "source_sha=$source_sha"
             echo "short_sha=$short_sha"
             echo "version=$version"
             echo "channel=$channel"
@@ -101,7 +117,19 @@ jobs:
   publish:
     name: Publish release
     needs: build
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' }}
+    if: >-
+      ${{
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main'
+        ) ||
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v')
+        )
+      }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -110,7 +138,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Download packaged binaries
         uses: actions/download-artifact@v4
@@ -125,16 +153,17 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
           set -euo pipefail
-          short_sha=${SOURCE_SHA:0:12}
+          source_sha=$(git rev-parse HEAD)
+          short_sha=${source_sha:0:12}
           source_version=$(sed -n 's/^let source_version = "\(.*\)"/\1/p' compiler/lib/version.ml)
 
-          if [ "$EVENT_NAME" = "push" ]; then
+          if [ "$EVENT_NAME" = "push" ] && [[ "$REF_NAME" == v* ]]; then
             version="${REF_NAME#v}"
             tag="$REF_NAME"
             title="Blorp ${version}"
+            snapshot_tag=""
             if [[ "$version" == *-* ]]; then
               prerelease="true"
             else
@@ -143,15 +172,17 @@ jobs:
           else
             version="${source_version}-dev.${short_sha}"
             tag="dev"
+            snapshot_tag="dev-${short_sha}"
             title="Blorp dev ${short_sha}"
             prerelease="true"
           fi
 
           {
-            echo "source_sha=$SOURCE_SHA"
+            echo "source_sha=$source_sha"
             echo "short_sha=$short_sha"
             echo "version=$version"
             echo "tag=$tag"
+            echo "snapshot_tag=$snapshot_tag"
             echo "title=$title"
             echo "prerelease=$prerelease"
           } >> "$GITHUB_OUTPUT"
@@ -191,8 +222,10 @@ jobs:
           Automated dev build from main.
 
           Commit: ${{ steps.meta.outputs.source_sha }}
+          Immutable dev tag: ${{ steps.meta.outputs.snapshot_tag }}
+          Moving latest tag: dev
 
-          This release is for dogfooding and early testing. Prefer tagged releases for stable preview downloads.
+          This release is for dogfooding and early testing. Prefer versioned releases for stable preview downloads.
           EOF
           else
             cat > release-notes.md <<EOF
@@ -202,10 +235,45 @@ jobs:
           EOF
           fi
 
-      - name: Publish dev release
+      - name: Publish immutable dev release
         if: ${{ steps.meta.outputs.tag == 'dev' }}
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          snapshot_tag="${{ steps.meta.outputs.snapshot_tag }}"
+          source_sha="${{ steps.meta.outputs.source_sha }}"
+
+          existing_tag_sha=$(git ls-remote --tags origin "refs/tags/${snapshot_tag}" | awk 'NR == 1 {print $1}')
+          if [ -n "$existing_tag_sha" ] && [ "$existing_tag_sha" != "$source_sha" ]; then
+            echo "Immutable dev tag exists at a different commit: $snapshot_tag" >&2
+            echo "expected: $source_sha" >&2
+            echo "actual:   $existing_tag_sha" >&2
+            exit 1
+          fi
+
+          if gh release view "$snapshot_tag" >/dev/null 2>&1; then
+            echo "Immutable dev release already exists; leaving it untouched: $snapshot_tag"
+            exit 0
+          fi
+
+          if [ -z "$existing_tag_sha" ]; then
+            git tag "$snapshot_tag" "$source_sha"
+            git push origin "$snapshot_tag"
+          fi
+
+          gh release create "$snapshot_tag" dist/* \
+            --prerelease \
+            --latest=false \
+            --title "${{ steps.meta.outputs.title }}" \
+            --notes-file release-notes.md
+
+      - name: Publish moving dev release
+        if: ${{ steps.meta.outputs.tag == 'dev' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
           gh release delete dev --yes --cleanup-tag || true
@@ -224,6 +292,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Release already exists: ${{ steps.meta.outputs.tag }}" >&2
+            exit 1
+          fi
+
           args=(
             release create "${{ steps.meta.outputs.tag }}"
             dist/*
