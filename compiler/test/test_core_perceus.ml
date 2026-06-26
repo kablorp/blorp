@@ -2757,6 +2757,47 @@ let test_assignment_field_alias_retains_rhs () =
       Alcotest.failf "assignment from field alias did not retain RHS:\n%s"
         (pp_to_string_indented transformed)
 
+let test_assignment_alias_result_temp_does_not_double_retain_source () =
+  let e =
+    mk (CAssign (Var.named "xs", cvar "borrowed" ty_list_int)) ty_void
+  in
+  let transformed = insert_drops_expr_for_test e in
+  Alcotest.(check int)
+    "owned result temp retains once" 1
+    (count_dups_for "__owned_result" transformed);
+  Alcotest.(check int)
+    "source alias does not get a redundant retain" 0
+    (count_dups_for "borrowed" transformed)
+
+let test_mutable_assignment_retained_alias_becomes_slot_owner () =
+  let assign =
+    mk (CAssign (Var.named "result_value", cvar "result_temp" ty_string)) ty_void
+  in
+  let body =
+    mk
+      (CLet
+         ( bind_named "result_temp" ty_string (cstr "match_result"),
+           mk (CSeq (assign, cvar "result_value" ty_string)) ty_string ))
+      ty_string
+  in
+  let expr =
+    mk
+      (CLet
+         ( bind_named ~mut:true "result_value" ty_string (cstr ""),
+           body ))
+      ty_string
+  in
+  let transformed = insert_drops_expr_for_test expr in
+  let drops = count_drops_for "result_value" transformed in
+  if drops = 1 then ()
+  else
+    Alcotest.failf
+      "mutable assignment from retained alias must release only the old slot, \
+       got %d drops:\n\
+       %s"
+      drops
+      (pp_to_string_indented transformed)
+
 let test_cow_consuming_field_arg_retains_alias () =
   let pair_bind =
     bind_named "pair" ty_pair_lists (mk (CTuple []) ty_pair_lists)
@@ -2928,6 +2969,31 @@ let test_mutable_tail_consumes_after_assignment_without_final_drop () =
   let transformed = insert_drops_expr_for_test expr in
   Alcotest.(check int)
     "tail equality consumes current owner after assignment without final drop" 0
+    (count_drops_for "result" transformed)
+
+let test_mutable_protected_tail_consume_drops_scope_owner () =
+  let consume_ty = func_ty [ ty_list_int ] ty_bool in
+  let tail =
+    mk
+      (CCall
+         ( CKUser ("consume", Some 700),
+           cvar "consume" consume_ty,
+           [ cvar "result" ty_list_int ] ))
+      ty_bool
+  in
+  let expr =
+    mk
+      (CLet
+         ( bind_named ~mut:true "result" ty_list_int (mk (clist []) ty_list_int),
+           tail ))
+      ty_bool
+  in
+  let transformed = insert_drops_expr_for_test expr in
+  Alcotest.(check int)
+    "protected tail call consumes a retained ref" 1
+    (count_dups_for "result" transformed);
+  Alcotest.(check int)
+    "mutable owner still drops at scope exit" 1
     (count_drops_for "result" transformed)
 
 let test_mutable_assignment_match_scrutinee_consumes_target_skips_old_release ()
@@ -4595,6 +4661,10 @@ let suite =
           test_field_alias_binding_retains_binding;
         Alcotest.test_case "assignment_field_alias_retains_rhs" `Quick
           test_assignment_field_alias_retains_rhs;
+        Alcotest.test_case "assignment_alias_result_temp_no_double_retain"
+          `Quick test_assignment_alias_result_temp_does_not_double_retain_source;
+        Alcotest.test_case "mutable_assignment_retained_alias_slot_owner"
+          `Quick test_mutable_assignment_retained_alias_becomes_slot_owner;
         Alcotest.test_case "mutable_assignment_releases_old_owner" `Quick
           test_mutable_assignment_releases_old_owner;
         Alcotest.test_case "mutable_assignment_cow_consume_skips_old_release"
@@ -4615,6 +4685,8 @@ let suite =
         Alcotest.test_case
           "mutable_tail_consumes_after_assignment_no_final_drop" `Quick
           test_mutable_tail_consumes_after_assignment_without_final_drop;
+        Alcotest.test_case "mutable_protected_tail_consume_scope_drop" `Quick
+          test_mutable_protected_tail_consume_drops_scope_owner;
         Alcotest.test_case
           "mutable_assignment_match_scrutinee_consumes_no_old_release" `Quick
           test_mutable_assignment_match_scrutinee_consumes_target_skips_old_release;

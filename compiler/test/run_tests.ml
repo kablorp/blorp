@@ -265,6 +265,12 @@ let () =
         (fun (name, cases) -> ("TestRunner." ^ name, cases))
         Test_test_runner.suite
     @ List.map
+        (fun (name, cases) -> ("CompilerTestRunner." ^ name, cases))
+        Test_compiler_test_runner.suite
+    @ List.map
+        (fun (name, cases) -> ("CompilerBlorpBridge." ^ name, cases))
+        Test_compiler_blorp_bridge.suite
+    @ List.map
         (fun (name, cases) -> ("DoctestRemap." ^ name, cases))
         Test_doctest_remap.suite
     @ List.map

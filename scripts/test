@@ -360,6 +360,47 @@ parse_structured_gate_result() {
     return 0
 }
 
+append_gate_failure() {
+    local key="$1"
+    local message="$2"
+    local current
+
+    eval "current=\${${key}_failures}"
+    if [ -n "$current" ]; then
+        current="${current}
+${message}"
+    else
+        current="$message"
+    fi
+    eval "${key}_failures=\$current"
+}
+
+mark_gate_process_failure() {
+    local key="$1"
+    local exit_code="$2"
+    local current_status current_failed current_tests
+
+    [ "$exit_code" = "0" ] && return 0
+
+    eval "current_status=\${${key}_status}"
+    eval "current_failed=\${${key}_failed}"
+    eval "current_tests=\${${key}_tests}"
+    current_status="${current_status:-unknown}"
+    current_failed="${current_failed:-0}"
+    current_tests="${current_tests:-0}"
+
+    # A gate can report a structured PASS summary and still return nonzero if
+    # the runner hits cleanup, timeout, or process-management trouble after
+    # counting tests. CI must surface that as the same gate failure that drives
+    # the final process exit, otherwise the table says PASS while Actions fails.
+    eval "${key}_status=FAIL"
+    if [ "$current_failed" -eq 0 ]; then
+        eval "${key}_failed=1"
+        eval "${key}_tests=$((current_tests + 1))"
+        append_gate_failure "$key" "$key gate process exited with status $exit_code after reporting $current_status"
+    fi
+}
+
 parse_unit() {
     local output="$1"
     # Alcotest:
@@ -708,13 +749,8 @@ run_unit() {
     rm -f "$output_file"
     unit_seconds=$(elapsed_since "$start_seconds")
     echo ""
-    if [ $exit_code -eq 0 ]; then
-        parse_unit "$output"
-    else
-        unit_status="FAIL"
-        parse_unit "$output"
-        unit_status="FAIL"
-    fi
+    parse_unit "$output"
+    mark_gate_process_failure "unit" "$exit_code"
     return $exit_code
 }
 
@@ -772,6 +808,7 @@ ${compiler_blorp_failures}"
             fi
         fi
     fi
+    mark_gate_process_failure "compiler" "$exit_code"
     return $exit_code
 }
 
@@ -790,6 +827,7 @@ run_runtime() {
     runtime_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_blorp_output "$output" "runtime"
+    mark_gate_process_failure "runtime" "$exit_code"
     return $exit_code
 }
 
@@ -834,6 +872,7 @@ run_leak() {
     leak_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_blorp_output "$output" "leak"
+    mark_gate_process_failure "leak" "$exit_code"
     return $exit_code
 }
 
@@ -852,6 +891,7 @@ run_doctest() {
     doctest_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_blorp_output "$output" "doctest"
+    mark_gate_process_failure "doctest" "$exit_code"
     return $exit_code
 }
 
@@ -870,6 +910,7 @@ run_cli() {
     cli_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_cli "$output"
+    mark_gate_process_failure "cli" "$exit_code"
     return $exit_code
 }
 
@@ -1036,13 +1077,14 @@ else
         local_output=""
         [ -f "$outfile" ] && local_output=$(cat "$outfile")
         case "$gate" in
-            unit)     parse_unit "$local_output"; [ "$local_exit" != "0" ] && unit_status="FAIL" ;;
+            unit)     parse_unit "$local_output" ;;
             compiler) parse_compiler "$local_output" ;;
             runtime)  parse_blorp_output "$local_output" "runtime" ;;
             leak)     parse_blorp_output "$local_output" "leak" ;;
             doctest)  parse_blorp_output "$local_output" "doctest" ;;
             cli)      parse_cli "$local_output" ;;
         esac
+        mark_gate_process_failure "$gate" "$local_exit"
         [ "$local_exit" != "0" ] && any_failed=true
     done
 fi
