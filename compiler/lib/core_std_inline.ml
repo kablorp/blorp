@@ -76,7 +76,7 @@ let list_append_arg_bindings = function
 
 let std_list_arg_bindings source_name params =
   match source_name with
-  | "length" | "get" | "__unsafe_list_get" ->
+  | "length" | "get" ->
       Some (readonly_arg_bindings params)
   | "get_or" -> (
       match params with

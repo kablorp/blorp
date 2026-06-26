@@ -182,8 +182,7 @@ let collection_strategy ~(module_path : string) ~(func_name : string) =
            RetainBorrowedElement)
   | ( "std/list",
       ( "fold_left" | "fold_right" | "all" | "any" | "for_each" | "find_index"
-      | "find" | "min_by" | "max_by" | "count" | "get_or" | "__unsafe_list_get"
-      | "length" ) ) ->
+      | "find" | "min_by" | "max_by" | "count" | "get_or" | "length" ) ) ->
       Some no_collection_result
   | "std/set", "add" -> Some (reuse_receiver "set_cow" RetainInputElement)
   | "std/set", "remove" ->

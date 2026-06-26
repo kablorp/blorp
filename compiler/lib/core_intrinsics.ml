@@ -479,9 +479,6 @@ let std_body_specs =
         "__unsafe_list_insert" 3;
       list_spec ~return_shape:(ReturnNamed "List")
         ~param_shapes:[ ParamNamed "List" ] "__unsafe_list_tail" 1;
-      list_spec
-        ~param_shapes:[ ParamNamed "List"; ParamNamed "Int" ]
-        "__unsafe_list_get" 2;
       list_spec ~return_shape:(ReturnNamed "List")
         ~param_shapes:[ ParamNamed "List" ] "reverse" 1;
       list_spec ~return_shape:(ReturnNamed "List")
@@ -5982,12 +5979,6 @@ let synthesize_body_impl_unsafe reg ~(func_name : string)
           list_insert self_p.cp_ty (param self_p) (param idx_p) (param elem_p))
   | "__unsafe_list_tail" when first_is_list () ->
       with_list1 (fun self_p -> list_tail self_p.cp_ty (param self_p))
-  | "__unsafe_list_get" when first_is_list () ->
-      with_list2 (fun self_p idx_p ->
-          let raw =
-            intr "list_get_unchecked" [ param self_p; param idx_p ] ty_ptr
-          in
-          mk return_ty (CUnbox (raw, return_ty)))
   | ("reverse" | "__unsafe_list_reverse") when first_is_list () ->
       with_list1 (fun self_p -> list_reverse self_p.cp_ty (param self_p))
   | "concat" when first_is_list () && return_is_list () ->

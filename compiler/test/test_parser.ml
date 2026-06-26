@@ -48,8 +48,8 @@ let test_builtin_direct_runtime_body () =
 
 let test_builtin_std_identity_body () =
   let source =
-    "private pure func __unsafe_list_get[T](self: List[T], index: Int) -> T:\n"
-    ^ "\tbuiltin(\"std/list.__unsafe_list_get\")\n"
+    "private pure func __unsafe_list_set_index[T](self: List[T], index: Int, elem: T) -> List[T]:\n"
+    ^ "\tbuiltin(\"std/list.__unsafe_list_set_index\")\n"
   in
   let program = parse_ok source in
   match program with
@@ -61,7 +61,7 @@ let test_builtin_std_identity_body () =
             ->
               check_string "std builtin module" "std/list"
                 identity.Blorp.Ast.std_builtin_module_path;
-              check_string "std builtin function" "__unsafe_list_get"
+              check_string "std builtin function" "__unsafe_list_set_index"
                 identity.Blorp.Ast.std_builtin_func_name
           | _ -> Alcotest.fail "expected std builtin identity body")
       | _ -> Alcotest.fail "expected private function declaration")

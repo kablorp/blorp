@@ -157,7 +157,7 @@ plugin zip before checking; pass a zip path to inspect an existing package.
 
 `scripts/check-std-builtins` verifies that standalone `std/` function builtin
 bodies use explicit identities matching their source declaration, for example
-`builtin("std/list.__unsafe_list_get")`. Bare `builtin` function bodies are not
+`builtin("std/list.__unsafe_list_set_index")`. Bare `builtin` function bodies are not
 allowed in `std/`.
 
 `scripts/check-compiler-port-inventory` verifies the OCaml-to-Blorp compiler
