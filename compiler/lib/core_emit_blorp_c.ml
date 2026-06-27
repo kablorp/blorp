@@ -1456,9 +1456,9 @@ let rec match_accessor_json ~reg ?(enum_names = StringSet.empty)
       Ok
         (kind "list_spread" [ ("parent", parent); ("offset", int offset) ])
 
-let match_binding_mode_json path = function
+let match_binding_mode_json _path = function
   | Core.MatchBorrow -> Ok (str "borrow")
-  | Core.MatchOwn -> unsupported path "owned match binding"
+  | Core.MatchOwn -> Ok (str "own")
 
 let match_binding_json ~reg enum_names value_record_names heap_record_names union_names
     scrut_ty var_types path (binding : Core.match_binding) =
@@ -7617,7 +7617,12 @@ and require_match_binding ~reg scrut_ty path (binding : Core.match_binding) =
   | Core.MatchBorrow ->
       require_match_binding_accessor ~reg scrut_ty (path ^ ".accessor")
         binding.mb_accessor
-  | Core.MatchOwn -> unsupported path "owned match binding"
+  | Core.MatchOwn -> (
+      match binding.mb_accessor with
+      | Core.AccVariantField (Core.AccRoot, _, _) ->
+          require_match_binding_accessor ~reg scrut_ty (path ^ ".accessor")
+            binding.mb_accessor
+      | _ -> unsupported path "owned match binding with non-root accessor")
 
 and require_match_bindings ~reg scrut_ty path bindings =
   let rec check index = function
@@ -8233,11 +8238,11 @@ let with_embedded_runtime (artifact : Compiler_blorp_bridge.c_artifact) =
       Runtime.runtime_code ^ "\n" ^ artifact.Compiler_blorp_bridge.c_code;
   }
 
-let prepare_and_emit_program_to_artifact (config : config)
+let emit_post_closure_program_to_artifact (config : config)
     (program : Core.core_program) =
   let* core_json = program_json ~reg:config.reg program in
   let artifact =
-    Compiler_blorp_bridge.prepare_and_emit_c_artifact_exn
+    Compiler_blorp_bridge.emit_post_closure_c_artifact_exn
       ~profile:config.profile core_json
   in
   Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
@@ -8251,7 +8256,7 @@ let emit_prepared_program_to_artifact (config : config)
   Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
 
 let emit_program_string config program =
-  match prepare_and_emit_program_to_artifact config program with
+  match emit_post_closure_program_to_artifact config program with
   | Ok artifact -> Ok artifact.Compiler_blorp_bridge.c_code
   | Error _ as error -> error
 
@@ -8265,7 +8270,7 @@ let try_emit_program_string config program =
   | Ok _ as ok -> ok
   | Error error -> Error (unsupported_to_string error)
 
-let try_prepare_and_emit_program_string = try_emit_program_string
+let try_emit_post_closure_program_string = try_emit_program_string
 
 let try_emit_prepared_program_string config program =
   match emit_prepared_program_string config program with

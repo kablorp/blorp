@@ -1,0 +1,2426 @@
+-- Prepared union reuse for the Blorp-owned Core tail.
+--
+-- This is a direct port of the prepared-union part of OCaml Core_reuse. It
+-- rewrites a prepared match result that immediately drops its source into a
+-- union reuse construct, but only when every managed source field has been
+-- moved out and the new payload cannot alias the source.
+import:
+	compiler_core_json:
+		CoreAccessor(
+			BoxedResultErrPayloadAccessor,
+			BoxedResultOkPayloadAccessor,
+			BoxedStackResultErrPayloadAccessor,
+			BoxedStackResultOkPayloadAccessor,
+			ErasedVariantFieldAccessor,
+			ListElementAccessor,
+			ListSpreadAccessor,
+			NullableOptionPayloadAccessor,
+			RootAccessor,
+			StackOptionPayloadAccessor,
+			StackResultErrPayloadAccessor,
+			StackResultOkPayloadAccessor,
+			TupleFieldAccessor,
+			VariantFieldAccessor,
+		),
+		CoreBoxedStorageValue,
+		CoreConstructorLengthMatch,
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorLiteralMatch,
+		CoreConstructorMatchBody(
+			ConstructorMatchBodyExpr,
+			ConstructorMatchBodyLength,
+			ConstructorMatchBodyLiteral,
+		),
+		CoreConstructorMatchCase,
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl, EnumDecl),
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			BreakExpr,
+			CastExpr,
+			CallExpr,
+			ClosureCreateExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			ContinueExpr,
+			CooperativeCheckpointExpr,
+			DetachExpr,
+			DictConstructExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			DropExpr,
+			DupExpr,
+			LetExpr,
+			LengthMatchExpr,
+			ListAllocExpr,
+			ListConstructExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
+			LogicalExpr,
+			RangeExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			SetAllocExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorLiteralExpr,
+			TensorPackedLiteralExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleFieldExpr,
+			TupleConstructExpr,
+			TupleExpr,
+			UnaryExpr,
+			UnionConstructExpr,
+			UnionReuseConstructExpr,
+			UnboxExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreFunction,
+		CoreGlobal,
+		CoreLiteralMatchCase,
+		CoreLiteralMatchFallback(
+			LiteralMatchFallbackBindings,
+			LiteralMatchFallbackBody,
+			LiteralMatchFallbackFail,
+		),
+		CoreMatchBinding,
+		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
+		CoreProgram,
+		CoreRecordFieldValue,
+		CoreReleasePolicy(
+			ArcReleaseOnlyPolicy,
+			ArcReleasePolicy,
+			NoReleasePolicy,
+			StackResultReleasePolicy,
+		),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+		CoreUnionConstruct,
+		CoreUnionDecl,
+		CoreUnionField,
+		CoreUnionRepresentation(
+			BoxedOptionRepresentation,
+			GenericUnionRepresentation,
+			NullableOptionRepresentation,
+			StackOptionRepresentation,
+			StackResultRepresentation,
+		),
+		CoreUnionReuseConstruct,
+		CoreUnionVariant,
+		CoreVar,
+
+
+record SourceAlias {
+	name: String,
+	aliases_source: Bool
+}
+
+
+pure func core_var_equal(left: CoreVar, right: CoreVar) -> Bool:
+	left.name == right.name and left.uniq == right.uniq
+
+
+pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			core_var_equal(variable, expected)
+		LiteralExpr(literal, typ, loc):
+			False
+		VoidExpr(typ, loc):
+			False
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		CallExpr(kind, callee, args, typ, loc):
+			False
+		BinaryExpr(op, left, right, typ, loc):
+			False
+		UnaryExpr(op, inner, typ, loc):
+			False
+		LogicalExpr(op, left, right, typ, loc):
+			False
+		AssignExpr(variable, rhs, typ, loc):
+			False
+		CastExpr(inner, typ, loc):
+			False
+		BoxExpr(box, typ, loc):
+			False
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			False
+		FieldExpr(inner, field, typ, loc):
+			False
+		TupleFieldExpr(inner, index, typ, loc):
+			False
+		TupleExpr(items, typ, loc):
+			False
+		TupleConstructExpr(construct, typ, loc):
+			False
+		ClosureCreateExpr(closure, typ, loc):
+			False
+		ListConstructExpr(construct, typ, loc):
+			False
+		ListAllocExpr(alloc, typ, loc):
+			False
+		ListGetExpr(get, typ, loc):
+			False
+		ListHandoffExpr(handoff, typ, loc):
+			False
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			False
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			False
+		StringByteReadExpr(read, typ, loc):
+			False
+		StringByteWriteExpr(write, typ, loc):
+			False
+		StringByteCopyExpr(copy, typ, loc):
+			False
+		StringSetLenExpr(set_len, typ, loc):
+			False
+		TensorLiteralExpr(literal, typ, loc):
+			False
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			False
+		TensorPackedLiteralExpr(literal, typ, loc):
+			False
+		TensorRawFillExpr(fill, typ, loc):
+			False
+		TensorRawReadExpr(read, typ, loc):
+			False
+		TensorRawWriteExpr(write, typ, loc):
+			False
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			False
+		DictConstructExpr(construct, typ, loc):
+			False
+		SetAllocExpr(alloc, typ, loc):
+			False
+		ListRetainExpr(retain, typ, loc):
+			False
+		ListSetExpr(set, typ, loc):
+			False
+		ListSwapExpr(swap, typ, loc):
+			False
+		RecordExpr(fields, typ, loc):
+			False
+		RecordConstructExpr(type_name, fields, typ, loc):
+			False
+		UnionConstructExpr(construct, typ, loc):
+			False
+		UnionReuseConstructExpr(construct, typ, loc):
+			False
+		DetachExpr(detached, typ, loc):
+			False
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			False
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			False
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			False
+		BorrowLetExpr(variable, value_type, rhs, body):
+			False
+		SeqExpr(first, second):
+			False
+		WhileExpr(cond, body, typ, loc):
+			False
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		ResourceScopeExpr(scope, typ, loc):
+			False
+		ResourceCleanupExitExpr(exit, typ, loc):
+			False
+		TailrecLoopExpr(params, return_type, body, loc):
+			False
+		TailrecRecurExpr(args, typ, loc):
+			False
+		TailrecListSpreadLoopExpr(loop, loc):
+			False
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			False
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			False
+		ForChannelExpr(loop, typ, loc):
+			False
+		ForListExpr(loop, typ, loc):
+			False
+		ForStringExpr(loop, typ, loc):
+			False
+		ForDictExpr(loop, typ, loc):
+			False
+		ForSetExpr(loop, typ, loc):
+			False
+		ForStreamExpr(loop, typ, loc):
+			False
+		ForResourceSourceExpr(loop, typ, loc):
+			False
+		ForTensorExpr(loop, typ, loc):
+			False
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			False
+		ConcurrentExpr(block, typ, loc):
+			False
+		SelectExpr(selection, typ, loc):
+			False
+		RangeExpr(start, end, typ, loc):
+			False
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			False
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			False
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			False
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			False
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			False
+
+
+pure func union_reuse_constructor_name(type_name: String, constructor_c_name: String) -> String:
+	"__blorp_reuse_" + type_name + "_" + constructor_c_name
+
+
+pure func find_union_decl(decls: List[CoreDecl], name: String) -> Option[CoreUnionDecl]:
+	var result: Option[CoreUnionDecl] = None
+
+	for decl in decls:
+		match decl:
+			UnionDecl(union_decl):
+				if union_decl.name == name:
+					result = Some(union_decl)
+			FunctionDecl(func_info):
+				void
+			GlobalDecl(global):
+				void
+			EnumDecl(enum_decl):
+				void
+			ValueRecordDecl(record_decl):
+				void
+			HeapRecordDecl(record_decl):
+				void
+
+	result
+
+
+pure func find_union_variant(
+	union_decl: CoreUnionDecl,
+	constructor_name: String,
+) -> Option[CoreUnionVariant]:
+	var result: Option[CoreUnionVariant] = None
+
+	for variant in union_decl.variants:
+		if variant.name == constructor_name:
+			result = Some(variant)
+
+	result
+
+
+pure func prepared_union_type_name(decls: List[CoreDecl], typ: CoreType) -> Option[String]:
+	match typ:
+		UnionType(name):
+			match find_union_decl(decls, name):
+				Some(union_decl):
+					Some(name)
+				None:
+					None
+		NamedType(name, args):
+			if args.length() == 0:
+				match find_union_decl(decls, name):
+					Some(union_decl):
+						Some(name)
+					None:
+						None
+			else:
+				None
+		VoidType:
+			None
+		StackResultType(ok_type, err_type):
+			None
+		BoxedResultType(ok_type, err_type):
+			None
+		EnumType(name):
+			None
+		ValueRecordType(name):
+			None
+		HeapRecordType(name):
+			None
+		RangeType:
+			None
+		TensorType:
+			None
+		TupleType(items):
+			None
+
+
+pure func release_policy_requires_release(policy: CoreReleasePolicy) -> Bool:
+	match policy:
+		NoReleasePolicy:
+			False
+		ArcReleasePolicy:
+			True
+		ArcReleaseOnlyPolicy:
+			True
+		StackResultReleasePolicy:
+			True
+
+
+pure func source_field_requires_release(field: CoreUnionField) -> Bool:
+	release_policy_requires_release(field.release_policy)
+
+
+pure func direct_owned_field_binding(
+	type_name: String,
+	constructor_name: String,
+	field_index: Int,
+	binding: CoreMatchBinding,
+) -> Bool:
+	mode: CoreMatchBindingMode = binding.mode
+
+	match mode:
+		MatchOwnBindingMode:
+			match binding.accessor:
+				VariantFieldAccessor(RootAccessor, accessor_type_name, accessor_constructor, accessor_index):
+					(
+						accessor_type_name == type_name
+						and accessor_constructor == constructor_name
+						and accessor_index == field_index
+					)
+				ErasedVariantFieldAccessor(RootAccessor, accessor_type_name, accessor_constructor, accessor_index):
+					(
+						accessor_type_name == type_name
+						and accessor_constructor == constructor_name
+						and accessor_index == field_index
+					)
+				RootAccessor:
+					False
+				VariantFieldAccessor(parent, accessor_type_name, accessor_constructor, accessor_index):
+					False
+				ErasedVariantFieldAccessor(parent, accessor_type_name, accessor_constructor, accessor_index):
+					False
+				NullableOptionPayloadAccessor(parent):
+					False
+				StackOptionPayloadAccessor(parent):
+					False
+				StackResultOkPayloadAccessor(parent):
+					False
+				StackResultErrPayloadAccessor(parent):
+					False
+				BoxedStackResultOkPayloadAccessor(parent, result_type):
+					False
+				BoxedStackResultErrPayloadAccessor(parent, result_type):
+					False
+				BoxedResultOkPayloadAccessor(parent):
+					False
+				BoxedResultErrPayloadAccessor(parent):
+					False
+				TupleFieldAccessor(parent, index, typ):
+					False
+				ListElementAccessor(parent, index):
+					False
+				ListSpreadAccessor(parent, index):
+					False
+		MatchBorrowBindingMode:
+			False
+
+
+pure func has_direct_owned_field_binding(
+	type_name: String,
+	constructor_name: String,
+	field_index: Int,
+	bindings: List[CoreMatchBinding],
+) -> Bool:
+	var found: Bool = False
+
+	for binding in bindings:
+		if direct_owned_field_binding(type_name, constructor_name, field_index, binding):
+			found = True
+
+	found
+
+
+pure func leaf_owns_managed_variant_fields(
+	decls: List[CoreDecl],
+	type_name: String,
+	constructor_name: String,
+	bindings: List[CoreMatchBinding],
+) -> Bool:
+	match find_union_decl(decls, type_name):
+		Some(union_decl):
+			match find_union_variant(union_decl, constructor_name):
+				Some(variant):
+					var owns_fields: Bool = True
+					var index: Int = 0
+
+					for field in variant.fields:
+						if (
+							source_field_requires_release(field)
+							and not has_direct_owned_field_binding(
+								type_name,
+								constructor_name,
+								index,
+								bindings,
+							)
+						):
+							owns_fields = False
+
+						index += 1
+
+					owns_fields
+				None:
+					False
+		None:
+			False
+
+
+pure func alias_lookup(name: String, aliases: List[SourceAlias]) -> Bool:
+	var result: Bool = False
+
+	for source_alias in aliases:
+		if source_alias.name == name:
+			result = source_alias.aliases_source
+
+	result
+
+
+pure func update_bool_assoc(
+	name: String,
+	value: Bool,
+	aliases: List[SourceAlias],
+) -> List[SourceAlias]:
+	var result: List[SourceAlias] = [{
+			name = name,
+			aliases_source = value
+		}]
+
+	for source_alias in aliases:
+		if source_alias.name != name:
+			result = result.append(source_alias)
+
+	result
+
+
+pure func append_bindings(
+	left: List[CoreMatchBinding],
+	right: List[CoreMatchBinding],
+) -> List[CoreMatchBinding]:
+	var result: List[CoreMatchBinding] = left
+
+	for binding in right:
+		result = result.append(binding)
+
+	result
+
+
+pure func boxed_value_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	value: CoreBoxedStorageValue,
+) -> Bool:
+	result_may_alias_source(source_name, aliases, value.value)
+
+
+pure func boxed_values_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	values: List[CoreBoxedStorageValue],
+) -> Bool:
+	var found: Bool = False
+
+	for value in values:
+		if boxed_value_may_alias_source(source_name, aliases, value):
+			found = True
+
+	found
+
+
+pure func record_fields_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	fields: List[CoreRecordFieldValue],
+) -> Bool:
+	var found: Bool = False
+
+	for field in fields:
+		if result_may_alias_source(source_name, aliases, field.value):
+			found = True
+
+	found
+
+
+pure func result_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		LiteralExpr(literal, typ, loc):
+			False
+		VarExpr(variable, typ, loc):
+			variable.name == source_name or alias_lookup(variable.name, aliases)
+		VoidExpr(typ, loc):
+			False
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		CallExpr(kind, callee, args, typ, loc):
+			(
+				result_may_alias_source(source_name, aliases, callee)
+				or exprs_may_alias_source(source_name, aliases, args)
+			)
+		BinaryExpr(op, left, right, typ, loc):
+			(
+				result_may_alias_source(source_name, aliases, left)
+				or result_may_alias_source(source_name, aliases, right)
+			)
+		UnaryExpr(op, inner, typ, loc):
+			result_may_alias_source(source_name, aliases, inner)
+		LogicalExpr(op, left, right, typ, loc):
+			(
+				result_may_alias_source(source_name, aliases, left)
+				or result_may_alias_source(source_name, aliases, right)
+			)
+		AssignExpr(variable, rhs, typ, loc):
+			result_may_alias_source(source_name, aliases, rhs)
+		CastExpr(inner, typ, loc):
+			result_may_alias_source(source_name, aliases, inner)
+		BoxExpr(box, typ, loc):
+			result_may_alias_source(source_name, aliases, box.value)
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			result_may_alias_source(source_name, aliases, inner)
+		FieldExpr(inner, field, typ, loc):
+			result_may_alias_source(source_name, aliases, inner)
+		TupleFieldExpr(inner, index, typ, loc):
+			result_may_alias_source(source_name, aliases, inner)
+		TupleExpr(items, typ, loc):
+			exprs_may_alias_source(source_name, aliases, items)
+		TupleConstructExpr(construct, typ, loc):
+			True
+		ClosureCreateExpr(closure, typ, loc):
+			True
+		ListConstructExpr(construct, typ, loc):
+			boxed_values_may_alias_source(source_name, aliases, construct.elements)
+		ListAllocExpr(alloc, typ, loc):
+			True
+		ListGetExpr(get, typ, loc):
+			True
+		ListHandoffExpr(handoff, typ, loc):
+			True
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			True
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			True
+		StringByteReadExpr(read, typ, loc):
+			False
+		StringByteWriteExpr(write, typ, loc):
+			False
+		StringByteCopyExpr(copy, typ, loc):
+			False
+		StringSetLenExpr(set_len, typ, loc):
+			False
+		TensorLiteralExpr(literal, typ, loc):
+			True
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			boxed_values_may_alias_source(source_name, aliases, literal.elements)
+		TensorPackedLiteralExpr(literal, typ, loc):
+			True
+		TensorRawFillExpr(fill, typ, loc):
+			True
+		TensorRawReadExpr(read, typ, loc):
+			True
+		TensorRawWriteExpr(write, typ, loc):
+			True
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			result_may_alias_source(source_name, aliases, body)
+		DictConstructExpr(construct, typ, loc):
+			True
+		SetAllocExpr(alloc, typ, loc):
+			True
+		ListRetainExpr(retain, typ, loc):
+			True
+		ListSetExpr(set, typ, loc):
+			True
+		ListSwapExpr(swap, typ, loc):
+			True
+		RecordExpr(fields, typ, loc):
+			record_fields_may_alias_source(source_name, aliases, fields)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			record_fields_may_alias_source(source_name, aliases, fields)
+		UnionConstructExpr(construct, typ, loc):
+			boxed_values_may_alias_source(source_name, aliases, construct.args)
+		UnionReuseConstructExpr(construct, typ, loc):
+			(
+				result_may_alias_source(source_name, aliases, construct.source)
+				or boxed_values_may_alias_source(source_name, aliases, construct.args)
+			)
+		DetachExpr(detached, typ, loc):
+			True
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			if variable.name == source_name:
+				True
+			else:
+				binding_aliases: Bool = result_may_alias_source(source_name, aliases, rhs)
+				result_may_alias_source(
+					source_name,
+					update_bool_assoc(variable.name, binding_aliases, aliases),
+					body,
+				)
+		BorrowLetExpr(variable, value_type, rhs, body):
+			if variable.name == source_name:
+				True
+			else:
+				binding_aliases: Bool = result_may_alias_source(source_name, aliases, rhs)
+				result_may_alias_source(
+					source_name,
+					update_bool_assoc(variable.name, binding_aliases, aliases),
+					body,
+				)
+		SeqExpr(first, second):
+			result_may_alias_source(source_name, aliases, second)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			result_may_alias_source(source_name, aliases, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			result_may_alias_source(source_name, aliases, body)
+		WhileExpr(cond, body, typ, loc):
+			False
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		ResourceScopeExpr(scope, typ, loc):
+			True
+		ResourceCleanupExitExpr(exit, typ, loc):
+			False
+		TailrecLoopExpr(params, return_type, body, loc):
+			True
+		TailrecRecurExpr(args, typ, loc):
+			exprs_may_alias_source(source_name, aliases, args)
+		TailrecListSpreadLoopExpr(loop, loc):
+			True
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			True
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			False
+		ForChannelExpr(loop, typ, loc):
+			True
+		ForListExpr(loop, typ, loc):
+			True
+		ForStringExpr(loop, typ, loc):
+			False
+		ForDictExpr(loop, typ, loc):
+			True
+		ForSetExpr(loop, typ, loc):
+			True
+		ForStreamExpr(loop, typ, loc):
+			True
+		ForResourceSourceExpr(loop, typ, loc):
+			True
+		ForTensorExpr(loop, typ, loc):
+			True
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			True
+		ConcurrentExpr(block, typ, loc):
+			True
+		SelectExpr(selection, typ, loc):
+			True
+		RangeExpr(start, end, typ, loc):
+			False
+		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
+			(
+				constructor_cases_may_alias_source(source_name, aliases, cases)
+				or constructor_fallback_may_alias_source(source_name, aliases, fallback)
+			)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			(
+				literal_cases_may_alias_source(source_name, aliases, cases)
+				or literal_fallback_may_alias_source(source_name, aliases, fallback)
+			)
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			(
+				literal_cases_may_alias_source(source_name, aliases, match_expr.cases)
+				or literal_fallback_may_alias_source(source_name, aliases, match_expr.fallback)
+			)
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			(
+				length_cases_may_alias_source(source_name, aliases, match_expr.cases)
+				or length_optional_geq_may_alias_source(source_name, aliases, match_expr.geq)
+				or length_optional_branch_may_alias_source(
+					source_name,
+					aliases,
+					match_expr.fallback,
+				)
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				result_may_alias_source(source_name, aliases, then_expr)
+				or result_may_alias_source(source_name, aliases, else_expr)
+			)
+
+
+pure func exprs_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	exprs: List[CoreExpr],
+) -> Bool:
+	var found: Bool = False
+
+	for expr in exprs:
+		if result_may_alias_source(source_name, aliases, expr):
+			found = True
+
+	found
+
+
+pure func constructor_body_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			result_may_alias_source(source_name, aliases, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			(
+				literal_cases_may_alias_source(source_name, aliases, match_expr.cases)
+				or literal_fallback_may_alias_source(source_name, aliases, match_expr.fallback)
+			)
+		ConstructorMatchBodyLength(match_expr):
+			(
+				length_cases_may_alias_source(source_name, aliases, match_expr.cases)
+				or length_optional_geq_may_alias_source(source_name, aliases, match_expr.geq)
+				or length_optional_branch_may_alias_source(
+					source_name,
+					aliases,
+					match_expr.fallback,
+				)
+			)
+
+
+pure func constructor_cases_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	cases: List[CoreConstructorMatchCase],
+) -> Bool:
+	var found: Bool = False
+
+	for match_case in cases:
+		if constructor_body_may_alias_source(source_name, aliases, match_case.body):
+			found = True
+
+	found
+
+
+pure func constructor_fallback_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			result_may_alias_source(source_name, aliases, body)
+		ConstructorMatchFallbackBindings(bindings, body):
+			result_may_alias_source(source_name, aliases, body)
+		ConstructorMatchFallbackFail:
+			False
+
+
+pure func literal_cases_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	cases: List[CoreLiteralMatchCase],
+) -> Bool:
+	var found: Bool = False
+
+	for match_case in cases:
+		if result_may_alias_source(source_name, aliases, match_case.body):
+			found = True
+
+	found
+
+
+pure func literal_fallback_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			result_may_alias_source(source_name, aliases, body)
+		LiteralMatchFallbackBindings(bindings, body):
+			result_may_alias_source(source_name, aliases, body)
+		LiteralMatchFallbackFail:
+			False
+
+
+pure func length_branch_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	constructor_body_may_alias_source(source_name, aliases, branch.body)
+
+
+pure func length_cases_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	cases: List[CoreConstructorLengthMatchCase],
+) -> Bool:
+	var found: Bool = False
+
+	for match_case in cases:
+		if length_branch_may_alias_source(source_name, aliases, match_case.branch):
+			found = True
+
+	found
+
+
+pure func length_optional_geq_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	geq: Option[CoreConstructorLengthMatchGeq],
+) -> Bool:
+	match geq:
+		Some(value):
+			length_branch_may_alias_source(source_name, aliases, value.branch)
+		None:
+			False
+
+
+pure func length_optional_branch_may_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	branch: Option[CoreConstructorLengthMatchBranch],
+) -> Bool:
+	match branch:
+		Some(value):
+			length_branch_may_alias_source(source_name, aliases, value)
+		None:
+			False
+
+
+pure func union_construct_args_alias_source(
+	source_name: String,
+	aliases: List[SourceAlias],
+	construct: CoreUnionConstruct,
+) -> Bool:
+	boxed_values_may_alias_source(source_name, aliases, construct.args)
+
+
+pure func union_reuse_construct(
+	source: CoreExpr,
+	construct: CoreUnionConstruct,
+) -> CoreUnionReuseConstruct:
+	{
+		source = source,
+		type_name = construct.type_name,
+		constructor_name = construct.constructor_name,
+		constructor_c_name = construct.constructor_c_name,
+		reuse_constructor_c_name = union_reuse_constructor_name(
+			construct.type_name,
+			construct.constructor_c_name,
+		),
+		representation = construct.representation,
+		payload_storage = construct.payload_storage,
+		uses_release_mask = construct.uses_release_mask,
+		release_mask = construct.release_mask,
+		args = construct.args
+	}
+
+
+pure func rewrite_prepared_union_result(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	aliases: List[SourceAlias],
+	type_name: String,
+	expr: CoreExpr,
+) -> Option[CoreExpr]:
+	match expr:
+		UnionConstructExpr(construct, typ, loc):
+			if (
+				construct.type_name == type_name
+				and construct.args.length() > 0
+				and not union_construct_args_alias_source(source_name, aliases, construct)
+			):
+				match construct.representation:
+					GenericUnionRepresentation:
+						Some(
+							UnionReuseConstructExpr(
+								union_reuse_construct(source, construct),
+								typ,
+								loc,
+							),
+						)
+					BoxedOptionRepresentation:
+						None
+					StackOptionRepresentation(info):
+						None
+					StackResultRepresentation(info):
+						None
+					NullableOptionRepresentation:
+						None
+			else:
+				None
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			then_rewritten ?= rewrite_prepared_union_result(
+				decls,
+				source,
+				source_name,
+				aliases,
+				type_name,
+				then_expr,
+			)
+			else_rewritten ?= rewrite_prepared_union_result(
+				decls,
+				source,
+				source_name,
+				aliases,
+				type_name,
+				else_expr,
+			)
+			Some(IfExpr(cond, then_rewritten, else_rewritten, typ, loc))
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			if variable.name == source_name:
+				None
+			else:
+				binding_aliases: Bool = result_may_alias_source(source_name, aliases, rhs)
+				body_rewritten ?= rewrite_prepared_union_result(
+					decls,
+					source,
+					source_name,
+					update_bool_assoc(variable.name, binding_aliases, aliases),
+					type_name,
+					body,
+				)
+				Some(LetExpr(variable, is_mutable, value_type, rhs, body_rewritten))
+		BorrowLetExpr(variable, value_type, rhs, body):
+			if variable.name == source_name:
+				None
+			else:
+				binding_aliases: Bool = result_may_alias_source(source_name, aliases, rhs)
+				body_rewritten ?= rewrite_prepared_union_result(
+					decls,
+					source,
+					source_name,
+					update_bool_assoc(variable.name, binding_aliases, aliases),
+					type_name,
+					body,
+				)
+				Some(BorrowLetExpr(variable, value_type, rhs, body_rewritten))
+		SeqExpr(head, tail):
+			tail_rewritten ?= rewrite_prepared_union_result(
+				decls,
+				source,
+				source_name,
+				aliases,
+				type_name,
+				tail,
+			)
+			Some(SeqExpr(head, tail_rewritten))
+		LiteralExpr(literal, typ, loc):
+			None
+		VarExpr(variable, typ, loc):
+			None
+		VoidExpr(typ, loc):
+			None
+		CooperativeCheckpointExpr(typ, loc):
+			None
+		CallExpr(kind, callee, args, typ, loc):
+			None
+		BinaryExpr(op, left, right, typ, loc):
+			None
+		UnaryExpr(op, inner, typ, loc):
+			None
+		LogicalExpr(op, left, right, typ, loc):
+			None
+		AssignExpr(variable, rhs, typ, loc):
+			None
+		CastExpr(inner, typ, loc):
+			None
+		BoxExpr(box, typ, loc):
+			None
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			None
+		FieldExpr(inner, field, typ, loc):
+			None
+		TupleFieldExpr(inner, index, typ, loc):
+			None
+		TupleExpr(items, typ, loc):
+			None
+		TupleConstructExpr(construct, typ, loc):
+			None
+		ClosureCreateExpr(closure, typ, loc):
+			None
+		ListConstructExpr(construct, typ, loc):
+			None
+		ListAllocExpr(alloc, typ, loc):
+			None
+		ListGetExpr(get, typ, loc):
+			None
+		ListHandoffExpr(handoff, typ, loc):
+			None
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			None
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			None
+		StringByteReadExpr(read, typ, loc):
+			None
+		StringByteWriteExpr(write, typ, loc):
+			None
+		StringByteCopyExpr(copy, typ, loc):
+			None
+		StringSetLenExpr(set_len, typ, loc):
+			None
+		TensorLiteralExpr(literal, typ, loc):
+			None
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			None
+		TensorPackedLiteralExpr(literal, typ, loc):
+			None
+		TensorRawFillExpr(fill, typ, loc):
+			None
+		TensorRawReadExpr(read, typ, loc):
+			None
+		TensorRawWriteExpr(write, typ, loc):
+			None
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			None
+		DictConstructExpr(construct, typ, loc):
+			None
+		SetAllocExpr(alloc, typ, loc):
+			None
+		ListRetainExpr(retain, typ, loc):
+			None
+		ListSetExpr(set, typ, loc):
+			None
+		ListSwapExpr(swap, typ, loc):
+			None
+		RecordExpr(fields, typ, loc):
+			None
+		RecordConstructExpr(record_type_name, fields, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
+			None
+		DetachExpr(detached, typ, loc):
+			None
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			None
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			None
+		WhileExpr(cond, body, typ, loc):
+			None
+		BreakExpr(typ, loc):
+			None
+		ContinueExpr(typ, loc):
+			None
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		ResourceCleanupExitExpr(exit, typ, loc):
+			None
+		TailrecLoopExpr(params, return_type, body, loc):
+			None
+		TailrecRecurExpr(args, typ, loc):
+			None
+		TailrecListSpreadLoopExpr(loop, loc):
+			None
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			None
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			None
+		ForChannelExpr(loop, typ, loc):
+			None
+		ForListExpr(loop, typ, loc):
+			None
+		ForStringExpr(loop, typ, loc):
+			None
+		ForDictExpr(loop, typ, loc):
+			None
+		ForSetExpr(loop, typ, loc):
+			None
+		ForStreamExpr(loop, typ, loc):
+			None
+		ForResourceSourceExpr(loop, typ, loc):
+			None
+		ForTensorExpr(loop, typ, loc):
+			None
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		ConcurrentExpr(block, typ, loc):
+			None
+		SelectExpr(selection, typ, loc):
+			None
+		RangeExpr(start, end, typ, loc):
+			None
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			None
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			None
+
+
+pure func rewrite_leaf_expr(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	bindings: List[CoreMatchBinding],
+	body: CoreExpr,
+) -> Option[CoreExpr]:
+	match current_constructor:
+		Some(constructor_name):
+			if leaf_owns_managed_variant_fields(decls, type_name, constructor_name, bindings):
+				rewrite_prepared_union_result(decls, source, source_name, [], type_name, body)
+			else:
+				None
+		None:
+			None
+
+
+pure func constructor_for_case(
+	current_constructor: Option[String],
+	match_case: CoreConstructorMatchCase,
+) -> Option[String]:
+	match match_case.accessor:
+		RootAccessor:
+			Some(match_case.constructor)
+		VariantFieldAccessor(parent, type_name, constructor, field_index):
+			current_constructor
+		ErasedVariantFieldAccessor(parent, type_name, constructor, field_index):
+			current_constructor
+		NullableOptionPayloadAccessor(parent):
+			current_constructor
+		StackOptionPayloadAccessor(parent):
+			current_constructor
+		StackResultOkPayloadAccessor(parent):
+			current_constructor
+		StackResultErrPayloadAccessor(parent):
+			current_constructor
+		BoxedStackResultOkPayloadAccessor(parent, result_type):
+			current_constructor
+		BoxedStackResultErrPayloadAccessor(parent, result_type):
+			current_constructor
+		BoxedResultOkPayloadAccessor(parent):
+			current_constructor
+		BoxedResultErrPayloadAccessor(parent):
+			current_constructor
+		TupleFieldAccessor(parent, index, typ):
+			current_constructor
+		ListElementAccessor(parent, index):
+			current_constructor
+		ListSpreadAccessor(parent, index):
+			current_constructor
+
+
+pure func rewrite_constructor_match_body(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	bindings: List[CoreMatchBinding],
+	body: CoreConstructorMatchBody,
+) -> Option[CoreConstructorMatchBody]:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			rewritten ?= rewrite_leaf_expr(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				bindings,
+				expr,
+			)
+			Some(ConstructorMatchBodyExpr(rewritten))
+		ConstructorMatchBodyLiteral(match_expr):
+			rewritten ?= rewrite_constructor_literal_match(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				bindings,
+				match_expr,
+			)
+			Some(ConstructorMatchBodyLiteral(rewritten))
+		ConstructorMatchBodyLength(match_expr):
+			rewritten ?= rewrite_constructor_length_match(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				bindings,
+				match_expr,
+			)
+			Some(ConstructorMatchBodyLength(rewritten))
+
+
+pure func rewrite_constructor_match_case(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	match_case: CoreConstructorMatchCase,
+) -> Option[CoreConstructorMatchCase]:
+	case_constructor: Option[String] = constructor_for_case(current_constructor, match_case)
+	body ?= rewrite_constructor_match_body(
+		decls,
+		source,
+		source_name,
+		type_name,
+		case_constructor,
+		match_case.bindings,
+		match_case.body,
+	)
+	Some({ match_case | body = body })
+
+
+pure func rewrite_constructor_match_cases(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	cases: List[CoreConstructorMatchCase],
+) -> Option[List[CoreConstructorMatchCase]]:
+	var rewritten: List[CoreConstructorMatchCase] = []
+	var failed: Bool = False
+
+	for match_case in cases:
+		match rewrite_constructor_match_case(
+			decls,
+			source,
+			source_name,
+			type_name,
+			current_constructor,
+			match_case,
+		):
+			Some(rewritten_case):
+				rewritten = rewritten.append(rewritten_case)
+			None:
+				failed = True
+
+	if failed:
+		None
+	else:
+		Some(rewritten)
+
+
+pure func rewrite_constructor_match_fallback(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	fallback: CoreConstructorMatchFallback,
+) -> Option[CoreConstructorMatchFallback]:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			rewritten ?= rewrite_leaf_expr(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				[],
+				body,
+			)
+			Some(ConstructorMatchFallbackBody(rewritten))
+		ConstructorMatchFallbackBindings(bindings, body):
+			rewritten ?= rewrite_leaf_expr(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				bindings,
+				body,
+			)
+			Some(ConstructorMatchFallbackBindings(bindings, rewritten))
+		ConstructorMatchFallbackFail:
+			Some(ConstructorMatchFallbackFail)
+
+
+pure func rewrite_literal_match_case(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	match_case: CoreLiteralMatchCase,
+) -> Option[CoreLiteralMatchCase]:
+	bindings: List[CoreMatchBinding] = append_bindings(parent_bindings, match_case.bindings)
+	body ?= rewrite_leaf_expr(
+		decls,
+		source,
+		source_name,
+		type_name,
+		current_constructor,
+		bindings,
+		match_case.body,
+	)
+	Some({ match_case | body = body })
+
+
+pure func rewrite_literal_match_cases(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	cases: List[CoreLiteralMatchCase],
+) -> Option[List[CoreLiteralMatchCase]]:
+	var rewritten: List[CoreLiteralMatchCase] = []
+	var failed: Bool = False
+
+	for match_case in cases:
+		match rewrite_literal_match_case(
+			decls,
+			source,
+			source_name,
+			type_name,
+			current_constructor,
+			parent_bindings,
+			match_case,
+		):
+			Some(rewritten_case):
+				rewritten = rewritten.append(rewritten_case)
+			None:
+				failed = True
+
+	if failed:
+		None
+	else:
+		Some(rewritten)
+
+
+pure func rewrite_literal_match_fallback(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	fallback: CoreLiteralMatchFallback,
+) -> Option[CoreLiteralMatchFallback]:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			rewritten ?= rewrite_leaf_expr(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				parent_bindings,
+				body,
+			)
+			Some(LiteralMatchFallbackBody(rewritten))
+		LiteralMatchFallbackBindings(bindings, body):
+			combined: List[CoreMatchBinding] = append_bindings(parent_bindings, bindings)
+			rewritten ?= rewrite_leaf_expr(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				combined,
+				body,
+			)
+			Some(LiteralMatchFallbackBindings(bindings, rewritten))
+		LiteralMatchFallbackFail:
+			Some(LiteralMatchFallbackFail)
+
+
+pure func rewrite_constructor_literal_match(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	match_expr: CoreConstructorLiteralMatch,
+) -> Option[CoreConstructorLiteralMatch]:
+	cases ?= rewrite_literal_match_cases(
+		decls,
+		source,
+		source_name,
+		type_name,
+		current_constructor,
+		parent_bindings,
+		match_expr.cases,
+	)
+	fallback ?= rewrite_literal_match_fallback(
+		decls,
+		source,
+		source_name,
+		type_name,
+		current_constructor,
+		parent_bindings,
+		match_expr.fallback,
+	)
+	Some({ match_expr |
+			cases = cases,
+			fallback = fallback
+		})
+
+
+pure func rewrite_constructor_length_branch(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	branch: CoreConstructorLengthMatchBranch,
+) -> Option[CoreConstructorLengthMatchBranch]:
+	bindings: List[CoreMatchBinding] = append_bindings(parent_bindings, branch.bindings)
+	body ?= rewrite_constructor_match_body(
+		decls,
+		source,
+		source_name,
+		type_name,
+		current_constructor,
+		bindings,
+		branch.body,
+	)
+	Some({ branch | body = body })
+
+
+pure func rewrite_constructor_length_case(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	match_case: CoreConstructorLengthMatchCase,
+) -> Option[CoreConstructorLengthMatchCase]:
+	branch ?= rewrite_constructor_length_branch(
+		decls,
+		source,
+		source_name,
+		type_name,
+		current_constructor,
+		parent_bindings,
+		match_case.branch,
+	)
+	Some({ match_case | branch = branch })
+
+
+pure func rewrite_constructor_length_cases(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	cases: List[CoreConstructorLengthMatchCase],
+) -> Option[List[CoreConstructorLengthMatchCase]]:
+	var rewritten: List[CoreConstructorLengthMatchCase] = []
+	var failed: Bool = False
+
+	for match_case in cases:
+		match rewrite_constructor_length_case(
+			decls,
+			source,
+			source_name,
+			type_name,
+			current_constructor,
+			parent_bindings,
+			match_case,
+		):
+			Some(rewritten_case):
+				rewritten = rewritten.append(rewritten_case)
+			None:
+				failed = True
+
+	if failed:
+		None
+	else:
+		Some(rewritten)
+
+
+pure func rewrite_constructor_length_geq(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	geq: Option[CoreConstructorLengthMatchGeq],
+) -> Option[Option[CoreConstructorLengthMatchGeq]]:
+	match geq:
+		Some(value):
+			match rewrite_constructor_length_branch(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				parent_bindings,
+				value.branch,
+			):
+				Some(branch):
+					Some(Some({ value | branch = branch }))
+				None:
+					None
+		None:
+			Some(None)
+
+
+pure func rewrite_constructor_length_fallback(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> Option[Option[CoreConstructorLengthMatchBranch]]:
+	match fallback:
+		Some(branch):
+			match rewrite_constructor_length_branch(
+				decls,
+				source,
+				source_name,
+				type_name,
+				current_constructor,
+				parent_bindings,
+				branch,
+			):
+				Some(rewritten):
+					Some(Some(rewritten))
+				None:
+					None
+		None:
+			Some(None)
+
+
+pure func rewrite_constructor_length_match(
+	decls: List[CoreDecl],
+	source: CoreExpr,
+	source_name: String,
+	type_name: String,
+	current_constructor: Option[String],
+	parent_bindings: List[CoreMatchBinding],
+	match_expr: CoreConstructorLengthMatch,
+) -> Option[CoreConstructorLengthMatch]:
+	cases ?= rewrite_constructor_length_cases(
+		decls,
+		source,
+		source_name,
+		type_name,
+		current_constructor,
+		parent_bindings,
+		match_expr.cases,
+	)
+	geq ?= rewrite_constructor_length_geq(
+		decls,
+		source,
+		source_name,
+		type_name,
+		current_constructor,
+		parent_bindings,
+		match_expr.geq,
+	)
+	fallback ?= rewrite_constructor_length_fallback(
+		decls,
+		source,
+		source_name,
+		type_name,
+		current_constructor,
+		parent_bindings,
+		match_expr.fallback,
+	)
+	Some({ match_expr |
+			cases = cases,
+			geq = geq,
+			fallback = fallback
+		})
+
+
+pure func rewrite_prepared_drop_result(
+	decls: List[CoreDecl],
+	binding_var: CoreVar,
+	binding_rhs: CoreExpr,
+	dropped_var: CoreVar,
+	dropped_type: CoreType,
+	result: CoreExpr,
+) -> Option[CoreExpr]:
+	if core_expr_is_var(result, binding_var):
+		type_name ?= prepared_union_type_name(decls, dropped_type)
+
+		match binding_rhs:
+			ConstructorMatchExpr(source, scrutinee_release_policy, cases, fallback, match_type, match_loc):
+				if core_expr_is_var(source, dropped_var):
+					rewritten_cases ?= rewrite_constructor_match_cases(
+						decls,
+						source,
+						dropped_var.name,
+						type_name,
+						None,
+						cases,
+					)
+					rewritten_fallback ?= rewrite_constructor_match_fallback(
+						decls,
+						source,
+						dropped_var.name,
+						type_name,
+						None,
+						fallback,
+					)
+					Some(
+						ConstructorMatchExpr(
+							source,
+							scrutinee_release_policy,
+							rewritten_cases,
+							rewritten_fallback,
+							match_type,
+							match_loc,
+						),
+					)
+				else:
+					None
+			LiteralExpr(literal, typ, loc):
+				None
+			VarExpr(variable, typ, loc):
+				None
+			VoidExpr(typ, loc):
+				None
+			CooperativeCheckpointExpr(typ, loc):
+				None
+			CallExpr(kind, callee, args, typ, loc):
+				None
+			BinaryExpr(op, left, right, typ, loc):
+				None
+			UnaryExpr(op, inner, typ, loc):
+				None
+			LogicalExpr(op, left, right, typ, loc):
+				None
+			AssignExpr(variable, rhs, typ, loc):
+				None
+			CastExpr(inner, typ, loc):
+				None
+			BoxExpr(box, typ, loc):
+				None
+			UnboxExpr(unbox_kind, inner, typ, loc):
+				None
+			FieldExpr(inner, field, typ, loc):
+				None
+			TupleFieldExpr(inner, index, typ, loc):
+				None
+			TupleExpr(items, typ, loc):
+				None
+			TupleConstructExpr(construct, typ, loc):
+				None
+			ClosureCreateExpr(closure, typ, loc):
+				None
+			ListConstructExpr(construct, typ, loc):
+				None
+			ListAllocExpr(alloc, typ, loc):
+				None
+			ListGetExpr(get, typ, loc):
+				None
+			ListHandoffExpr(handoff, typ, loc):
+				None
+			ListHandoffSetOwnedExpr(set, typ, loc):
+				None
+			ListHandoffSetSourceSlotExpr(set, typ, loc):
+				None
+			StringByteReadExpr(read, typ, loc):
+				None
+			StringByteWriteExpr(write, typ, loc):
+				None
+			StringByteCopyExpr(copy, typ, loc):
+				None
+			StringSetLenExpr(set_len, typ, loc):
+				None
+			TensorLiteralExpr(literal, typ, loc):
+				None
+			TensorBoxedLiteralExpr(literal, typ, loc):
+				None
+			TensorPackedLiteralExpr(literal, typ, loc):
+				None
+			TensorRawFillExpr(fill, typ, loc):
+				None
+			TensorRawReadExpr(read, typ, loc):
+				None
+			TensorRawWriteExpr(write, typ, loc):
+				None
+			TensorRawViewLetExpr(binding, body, typ, loc):
+				None
+			DictConstructExpr(construct, typ, loc):
+				None
+			SetAllocExpr(alloc, typ, loc):
+				None
+			ListRetainExpr(retain, typ, loc):
+				None
+			ListSetExpr(set, typ, loc):
+				None
+			ListSwapExpr(swap, typ, loc):
+				None
+			RecordExpr(fields, typ, loc):
+				None
+			RecordConstructExpr(type_name, fields, typ, loc):
+				None
+			UnionConstructExpr(construct, typ, loc):
+				None
+			UnionReuseConstructExpr(construct, typ, loc):
+				None
+			DetachExpr(detached, typ, loc):
+				None
+			DupExpr(variable, value_type, retain_policy, body, typ, loc):
+				None
+			DropExpr(variable, value_type, release_policy, body, typ, loc):
+				None
+			LetExpr(variable, is_mutable, value_type, rhs, body):
+				None
+			BorrowLetExpr(variable, value_type, rhs, body):
+				None
+			SeqExpr(first, second):
+				None
+			WhileExpr(cond, body, typ, loc):
+				None
+			BreakExpr(typ, loc):
+				None
+			ContinueExpr(typ, loc):
+				None
+			ResourceScopeExpr(scope, typ, loc):
+				None
+			ResourceCleanupExitExpr(exit, typ, loc):
+				None
+			TailrecLoopExpr(params, return_type, body, loc):
+				None
+			TailrecRecurExpr(args, typ, loc):
+				None
+			TailrecListSpreadLoopExpr(loop, loc):
+				None
+			TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+				None
+			ForRangeExpr(binder, start, end, step, typ, loc):
+				None
+			ForChannelExpr(loop, typ, loc):
+				None
+			ForListExpr(loop, typ, loc):
+				None
+			ForStringExpr(loop, typ, loc):
+				None
+			ForDictExpr(loop, typ, loc):
+				None
+			ForSetExpr(loop, typ, loc):
+				None
+			ForStreamExpr(loop, typ, loc):
+				None
+			ForResourceSourceExpr(loop, typ, loc):
+				None
+			ForTensorExpr(loop, typ, loc):
+				None
+			ConcurrentlyLoopExpr(loop, typ, loc):
+				None
+			ConcurrentExpr(block, typ, loc):
+				None
+			SelectExpr(selection, typ, loc):
+				None
+			RangeExpr(start, end, typ, loc):
+				None
+			LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+				None
+			AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+				None
+			LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+				None
+			IfExpr(cond, then_expr, else_expr, typ, loc):
+				None
+	else:
+		None
+
+
+private pure func rewrite_prepared_let_drop(
+	decls: List[CoreDecl],
+	binding_var: CoreVar,
+	binding_rhs: CoreExpr,
+	body: CoreExpr,
+) -> Option[CoreExpr]:
+	match body:
+		DropExpr(dropped_var, dropped_type, release_policy, result, drop_type, drop_loc):
+			rewrite_prepared_drop_result(
+				decls,
+				binding_var,
+				binding_rhs,
+				dropped_var,
+				dropped_type,
+				result,
+			)
+		LiteralExpr(literal, typ, loc):
+			None
+		VarExpr(body_var, typ, loc):
+			None
+		VoidExpr(typ, loc):
+			None
+		CooperativeCheckpointExpr(typ, loc):
+			None
+		CallExpr(kind, callee, args, typ, loc):
+			None
+		BinaryExpr(op, left, right, typ, loc):
+			None
+		UnaryExpr(op, inner, typ, loc):
+			None
+		LogicalExpr(op, left, right, typ, loc):
+			None
+		AssignExpr(assigned_var, assigned_rhs, typ, loc):
+			None
+		CastExpr(inner, typ, loc):
+			None
+		BoxExpr(box, typ, loc):
+			None
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			None
+		FieldExpr(inner, field, typ, loc):
+			None
+		TupleFieldExpr(inner, index, typ, loc):
+			None
+		TupleExpr(items, typ, loc):
+			None
+		TupleConstructExpr(construct, typ, loc):
+			None
+		ClosureCreateExpr(closure, typ, loc):
+			None
+		ListConstructExpr(construct, typ, loc):
+			None
+		ListAllocExpr(alloc, typ, loc):
+			None
+		ListGetExpr(get, typ, loc):
+			None
+		ListHandoffExpr(handoff, typ, loc):
+			None
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			None
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			None
+		StringByteReadExpr(read, typ, loc):
+			None
+		StringByteWriteExpr(write, typ, loc):
+			None
+		StringByteCopyExpr(copy, typ, loc):
+			None
+		StringSetLenExpr(set_len, typ, loc):
+			None
+		TensorLiteralExpr(literal, typ, loc):
+			None
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			None
+		TensorPackedLiteralExpr(literal, typ, loc):
+			None
+		TensorRawFillExpr(fill, typ, loc):
+			None
+		TensorRawReadExpr(read, typ, loc):
+			None
+		TensorRawWriteExpr(write, typ, loc):
+			None
+		TensorRawViewLetExpr(binding, tensor_body, typ, loc):
+			None
+		DictConstructExpr(construct, typ, loc):
+			None
+		SetAllocExpr(alloc, typ, loc):
+			None
+		ListRetainExpr(retain, typ, loc):
+			None
+		ListSetExpr(set, typ, loc):
+			None
+		ListSwapExpr(swap, typ, loc):
+			None
+		RecordExpr(fields, typ, loc):
+			None
+		RecordConstructExpr(type_name, fields, typ, loc):
+			None
+		UnionConstructExpr(construct, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
+			None
+		DetachExpr(detached, typ, loc):
+			None
+		DupExpr(dup_var, dup_type, retain_policy, dup_body, typ, loc):
+			None
+		LetExpr(inner_var, inner_mutable, inner_type, inner_rhs, inner_body):
+			None
+		BorrowLetExpr(inner_var, inner_type, inner_rhs, inner_body):
+			None
+		SeqExpr(first, second):
+			None
+		WhileExpr(cond, while_body, typ, loc):
+			None
+		BreakExpr(typ, loc):
+			None
+		ContinueExpr(typ, loc):
+			None
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		ResourceCleanupExitExpr(exit, typ, loc):
+			None
+		TailrecLoopExpr(params, return_type, tailrec_body, loc):
+			None
+		TailrecRecurExpr(args, typ, loc):
+			None
+		TailrecListSpreadLoopExpr(loop, loc):
+			None
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			None
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			None
+		ForChannelExpr(loop, typ, loc):
+			None
+		ForListExpr(loop, typ, loc):
+			None
+		ForStringExpr(loop, typ, loc):
+			None
+		ForDictExpr(loop, typ, loc):
+			None
+		ForSetExpr(loop, typ, loc):
+			None
+		ForStreamExpr(loop, typ, loc):
+			None
+		ForResourceSourceExpr(loop, typ, loc):
+			None
+		ForTensorExpr(loop, typ, loc):
+			None
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		ConcurrentExpr(block, typ, loc):
+			None
+		SelectExpr(selection, typ, loc):
+			None
+		RangeExpr(start, end, typ, loc):
+			None
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			None
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			None
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			None
+
+
+pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreExpr:
+	match expr:
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			rewritten_rhs: CoreExpr = rewrite_prepared_expr(decls, rhs)
+			rewritten_body: CoreExpr = rewrite_prepared_expr(decls, body)
+
+			match rewrite_prepared_let_drop(decls, variable, rewritten_rhs, rewritten_body):
+				Some(rewritten):
+					rewritten
+				None:
+					LetExpr(variable, is_mutable, value_type, rewritten_rhs, rewritten_body)
+		BorrowLetExpr(variable, value_type, rhs, body):
+			BorrowLetExpr(
+				variable,
+				value_type,
+				rewrite_prepared_expr(decls, rhs),
+				rewrite_prepared_expr(decls, body),
+			)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(
+				variable,
+				value_type,
+				release_policy,
+				rewrite_prepared_expr(decls, body),
+				typ,
+				loc,
+			)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(
+				variable,
+				value_type,
+				retain_policy,
+				rewrite_prepared_expr(decls, body),
+				typ,
+				loc,
+			)
+		SeqExpr(first, second):
+			SeqExpr(
+				rewrite_prepared_expr(decls, first),
+				rewrite_prepared_expr(decls, second),
+			)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				rewrite_prepared_expr(decls, cond),
+				rewrite_prepared_expr(decls, then_expr),
+				rewrite_prepared_expr(decls, else_expr),
+				typ,
+				loc,
+			)
+		ConstructorMatchExpr(scrutinee, scrutinee_release_policy, cases, fallback, typ, loc):
+			ConstructorMatchExpr(
+				rewrite_prepared_expr(decls, scrutinee),
+				scrutinee_release_policy,
+				rewrite_child_constructor_match_cases(decls, cases),
+				rewrite_child_constructor_match_fallback(decls, fallback),
+				typ,
+				loc,
+			)
+		LiteralExpr(literal, typ, loc):
+			expr
+		VarExpr(variable, typ, loc):
+			expr
+		VoidExpr(typ, loc):
+			expr
+		CooperativeCheckpointExpr(typ, loc):
+			expr
+		CallExpr(kind, callee, args, typ, loc):
+			expr
+		BinaryExpr(op, left, right, typ, loc):
+			expr
+		UnaryExpr(op, inner, typ, loc):
+			expr
+		LogicalExpr(op, left, right, typ, loc):
+			expr
+		AssignExpr(variable, rhs, typ, loc):
+			expr
+		CastExpr(inner, typ, loc):
+			expr
+		BoxExpr(box, typ, loc):
+			expr
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			expr
+		FieldExpr(inner, field, typ, loc):
+			expr
+		TupleFieldExpr(inner, index, typ, loc):
+			expr
+		TupleExpr(items, typ, loc):
+			expr
+		TupleConstructExpr(construct, typ, loc):
+			expr
+		ClosureCreateExpr(closure, typ, loc):
+			expr
+		ListConstructExpr(construct, typ, loc):
+			expr
+		ListAllocExpr(alloc, typ, loc):
+			expr
+		ListGetExpr(get, typ, loc):
+			expr
+		ListHandoffExpr(handoff, typ, loc):
+			expr
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			expr
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			expr
+		StringByteReadExpr(read, typ, loc):
+			expr
+		StringByteWriteExpr(write, typ, loc):
+			expr
+		StringByteCopyExpr(copy, typ, loc):
+			expr
+		StringSetLenExpr(set_len, typ, loc):
+			expr
+		TensorLiteralExpr(literal, typ, loc):
+			expr
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			expr
+		TensorPackedLiteralExpr(literal, typ, loc):
+			expr
+		TensorRawFillExpr(fill, typ, loc):
+			expr
+		TensorRawReadExpr(read, typ, loc):
+			expr
+		TensorRawWriteExpr(write, typ, loc):
+			expr
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			expr
+		DictConstructExpr(construct, typ, loc):
+			expr
+		SetAllocExpr(alloc, typ, loc):
+			expr
+		ListRetainExpr(retain, typ, loc):
+			expr
+		ListSetExpr(set, typ, loc):
+			expr
+		ListSwapExpr(swap, typ, loc):
+			expr
+		RecordExpr(fields, typ, loc):
+			expr
+		RecordConstructExpr(type_name, fields, typ, loc):
+			expr
+		UnionConstructExpr(construct, typ, loc):
+			expr
+		UnionReuseConstructExpr(construct, typ, loc):
+			expr
+		DetachExpr(detached, typ, loc):
+			expr
+		WhileExpr(cond, body, typ, loc):
+			expr
+		BreakExpr(typ, loc):
+			expr
+		ContinueExpr(typ, loc):
+			expr
+		ResourceScopeExpr(scope, typ, loc):
+			expr
+		ResourceCleanupExitExpr(exit, typ, loc):
+			expr
+		TailrecLoopExpr(params, return_type, body, loc):
+			expr
+		TailrecRecurExpr(args, typ, loc):
+			expr
+		TailrecListSpreadLoopExpr(loop, loc):
+			expr
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			expr
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			expr
+		ForChannelExpr(loop, typ, loc):
+			expr
+		ForListExpr(loop, typ, loc):
+			expr
+		ForStringExpr(loop, typ, loc):
+			expr
+		ForDictExpr(loop, typ, loc):
+			expr
+		ForSetExpr(loop, typ, loc):
+			expr
+		ForStreamExpr(loop, typ, loc):
+			expr
+		ForResourceSourceExpr(loop, typ, loc):
+			expr
+		ForTensorExpr(loop, typ, loc):
+			expr
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			expr
+		ConcurrentExpr(block, typ, loc):
+			expr
+		SelectExpr(selection, typ, loc):
+			expr
+		RangeExpr(start, end, typ, loc):
+			expr
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			expr
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			expr
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			expr
+
+
+pure func rewrite_child_constructor_match_body(
+	decls: List[CoreDecl],
+	body: CoreConstructorMatchBody,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			ConstructorMatchBodyExpr(rewrite_prepared_expr(decls, expr))
+		ConstructorMatchBodyLiteral(match_expr):
+			ConstructorMatchBodyLiteral({ match_expr |
+					cases = rewrite_child_literal_match_cases(decls, match_expr.cases),
+					fallback = rewrite_child_literal_match_fallback(decls, match_expr.fallback)
+				})
+		ConstructorMatchBodyLength(match_expr):
+			ConstructorMatchBodyLength({ match_expr |
+					cases = rewrite_child_length_match_cases(decls, match_expr.cases),
+					geq = rewrite_child_length_match_geq(decls, match_expr.geq),
+					fallback = rewrite_child_length_match_fallback(decls, match_expr.fallback)
+				})
+
+
+pure func rewrite_child_constructor_match_case(
+	decls: List[CoreDecl],
+	match_case: CoreConstructorMatchCase,
+) -> CoreConstructorMatchCase:
+	{ match_case | body = rewrite_child_constructor_match_body(decls, match_case.body) }
+
+
+pure func rewrite_child_constructor_match_cases(
+	decls: List[CoreDecl],
+	cases: List[CoreConstructorMatchCase],
+) -> List[CoreConstructorMatchCase]:
+	var rewritten: List[CoreConstructorMatchCase] = []
+
+	for match_case in cases:
+		rewritten = rewritten.append(rewrite_child_constructor_match_case(decls, match_case))
+
+	rewritten
+
+
+pure func rewrite_child_constructor_match_fallback(
+	decls: List[CoreDecl],
+	fallback: CoreConstructorMatchFallback,
+) -> CoreConstructorMatchFallback:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			ConstructorMatchFallbackBody(rewrite_prepared_expr(decls, body))
+		ConstructorMatchFallbackBindings(bindings, body):
+			ConstructorMatchFallbackBindings(
+				bindings,
+				rewrite_prepared_expr(decls, body),
+			)
+		ConstructorMatchFallbackFail:
+			ConstructorMatchFallbackFail
+
+
+pure func rewrite_child_literal_match_cases(
+	decls: List[CoreDecl],
+	cases: List[CoreLiteralMatchCase],
+) -> List[CoreLiteralMatchCase]:
+	var rewritten: List[CoreLiteralMatchCase] = []
+
+	for match_case in cases:
+		rewritten = rewritten.append(
+			{ match_case | body = rewrite_prepared_expr(decls, match_case.body) },
+		)
+
+	rewritten
+
+
+pure func rewrite_child_literal_match_fallback(
+	decls: List[CoreDecl],
+	fallback: CoreLiteralMatchFallback,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(rewrite_prepared_expr(decls, body))
+		LiteralMatchFallbackBindings(bindings, body):
+			LiteralMatchFallbackBindings(
+				bindings,
+				rewrite_prepared_expr(decls, body),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+pure func rewrite_child_length_branch(
+	decls: List[CoreDecl],
+	branch: CoreConstructorLengthMatchBranch,
+) -> CoreConstructorLengthMatchBranch:
+	{ branch | body = rewrite_child_constructor_match_body(decls, branch.body) }
+
+
+pure func rewrite_child_length_match_cases(
+	decls: List[CoreDecl],
+	cases: List[CoreConstructorLengthMatchCase],
+) -> List[CoreConstructorLengthMatchCase]:
+	var rewritten: List[CoreConstructorLengthMatchCase] = []
+
+	for match_case in cases:
+		rewritten = rewritten.append(
+			{ match_case | branch = rewrite_child_length_branch(decls, match_case.branch) },
+		)
+
+	rewritten
+
+
+pure func rewrite_child_length_match_geq(
+	decls: List[CoreDecl],
+	geq: Option[CoreConstructorLengthMatchGeq],
+) -> Option[CoreConstructorLengthMatchGeq]:
+	match geq:
+		Some(value):
+			Some({ value | branch = rewrite_child_length_branch(decls, value.branch) })
+		None:
+			None
+
+
+pure func rewrite_child_length_match_fallback(
+	decls: List[CoreDecl],
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> Option[CoreConstructorLengthMatchBranch]:
+	match fallback:
+		Some(branch):
+			Some(rewrite_child_length_branch(decls, branch))
+		None:
+			None
+
+
+pure func rewrite_prepared_function(decls: List[CoreDecl], func_info: CoreFunction) -> CoreFunction:
+	match func_info.body:
+		Some(body):
+			{ func_info | body = Some(rewrite_prepared_expr(decls, body)) }
+		None:
+			func_info
+
+
+pure func rewrite_prepared_global(decls: List[CoreDecl], global: CoreGlobal) -> CoreGlobal:
+	{ global | init = rewrite_prepared_expr(decls, global.init) }
+
+
+pure func rewrite_prepared_decl(decls: List[CoreDecl], decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(func_info):
+			FunctionDecl(rewrite_prepared_function(decls, func_info))
+		GlobalDecl(global):
+			GlobalDecl(rewrite_prepared_global(decls, global))
+		UnionDecl(union_decl):
+			decl
+		EnumDecl(enum_decl):
+			decl
+		ValueRecordDecl(record_decl):
+			decl
+		HeapRecordDecl(record_decl):
+			decl
+
+
+pure func rewrite_prepared_program(program: CoreProgram) -> CoreProgram:
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		decls = decls.append(rewrite_prepared_decl(program.decls, decl))
+
+	{ program | decls = decls }

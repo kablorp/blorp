@@ -10,14 +10,14 @@ import:
 	codegen_prepared_list_renderer as PreparedList
 	codegen_prepared_tensor_renderer as PreparedTensor
 	codegen_prepared_tuple_renderer as PreparedTuple
-	compiler_artifact_json: c_artifact_to_json
+	compiler_artifact_json: CArtifact, c_artifact_to_json
 	compiler_bridge_protocol:
 		BRIDGE_SCHEMA_VERSION,
 		BridgeAction(
 			CompileSourceAction,
+			EmitPostClosureCAction,
 			EmitCAction,
 			LowerAndCompileAction,
-			PrepareAndEmitCAction,
 			RendererTemplatesAction,
 			RenderAction,
 			RenderManyAction,
@@ -32,9 +32,13 @@ import:
 		decode_bridge_envelope_value,
 	compiler_core_emit:
 		core_emit_error_to_string,
+		try_emit_post_closure_core_program_c_artifact_with_options,
 		try_emit_prepared_core_program_c_artifact_with_options,
-		try_prepare_and_emit_core_program_c_artifact_with_options,
-	compiler_core_json: core_json_error_to_string, core_program_to_json, decode_core_program_json
+	compiler_core_json:
+		CoreProgram,
+		core_json_error_to_string,
+		core_program_to_json,
+		decode_core_program_json,
 	compiler_core_pipeline as CorePipeline
 	core_error_format as CoreError
 	core_fairness_policy as CoreFairness
@@ -594,40 +598,56 @@ private pure func handle_render_many(body: JsonValue) -> Result[JsonValue, Bridg
 	Ok(success_json([("items", JsonVector(rendered))]))
 
 
-private pure func handle_emit_c(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
-	core_json ?= json_field(body, "core", "Core program JSON")
-	profile ?= optional_bool_field(body, "profile", False)
-	program ?= decode_core_program_json(
+private pure func decode_core_program_for_bridge(
+	core_json: JsonValue,
+) -> Result[CoreProgram, BridgeDispatchError]:
+	decode_core_program_json(
 		core_json,
 	).map_err(
 		func(error): CoreJsonFailure(core_json_error_to_string(error)),
 	)
-	artifact ?= try_emit_prepared_core_program_c_artifact_with_options(
+
+
+private pure func emit_prepared_c_artifact_for_bridge(
+	program: CoreProgram,
+	profile: Bool,
+) -> Result[CArtifact, BridgeDispatchError]:
+	try_emit_prepared_core_program_c_artifact_with_options(
 		program,
 		{profile = profile},
 	).map_err(
 		func(error): EmitFailure(core_emit_error_to_string(error)),
 	)
+
+
+private pure func emit_post_closure_c_artifact_for_bridge(
+	program: CoreProgram,
+	profile: Bool,
+) -> Result[CArtifact, BridgeDispatchError]:
+	try_emit_post_closure_core_program_c_artifact_with_options(
+		program,
+		{profile = profile},
+	).map_err(
+		func(error): EmitFailure(core_emit_error_to_string(error)),
+	)
+
+
+private pure func handle_emit_c(body: JsonValue) -> Result[JsonValue, BridgeDispatchError]:
+	core_json ?= json_field(body, "core", "Core program JSON")
+	profile ?= optional_bool_field(body, "profile", False)
+	program ?= decode_core_program_for_bridge(core_json)
+	artifact ?= emit_prepared_c_artifact_for_bridge(program, profile)
 
 	Ok(bridge_success_json(c_artifact_to_json(artifact)))
 
 
-private pure func handle_prepare_and_emit_c(
+private pure func handle_emit_post_closure_c(
 	body: JsonValue,
 ) -> Result[JsonValue, BridgeDispatchError]:
 	core_json ?= json_field(body, "core", "Core program JSON")
 	profile ?= optional_bool_field(body, "profile", False)
-	program ?= decode_core_program_json(
-		core_json,
-	).map_err(
-		func(error): CoreJsonFailure(core_json_error_to_string(error)),
-	)
-	artifact ?= try_prepare_and_emit_core_program_c_artifact_with_options(
-		program,
-		{profile = profile},
-	).map_err(
-		func(error): EmitFailure(core_emit_error_to_string(error)),
-	)
+	program ?= decode_core_program_for_bridge(core_json)
+	artifact ?= emit_post_closure_c_artifact_for_bridge(program, profile)
 
 	Ok(bridge_success_json(c_artifact_to_json(artifact)))
 
@@ -664,8 +684,8 @@ private pure func handle_envelope(
 			handle_renderer_templates(body)
 		EmitCAction:
 			handle_emit_c(body)
-		PrepareAndEmitCAction:
-			handle_prepare_and_emit_c(body)
+		EmitPostClosureCAction:
+			handle_emit_post_closure_c(body)
 		RunCorePipelineAction:
 			handle_run_core_pipeline(body)
 		LowerAndCompileAction:

@@ -127,8 +127,8 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
 
 type backend_core_input = {
   blorp_tail_input : Core.core_program;
-      (** Post-closure Core handed to Blorp for resource/fairness/prepare and
-          emission on the default path. *)
+      (** Post-closure Core handed to Blorp for resource/fairness/prepare,
+          prepared reuse, and emission on the default path. *)
   ocaml_final_for_observability : Core.core_program Lazy.t;
       (** Lazy OCaml-final Core kept only for final-stage dumps, invariant
           checks, profiling, and renderer-helper bootstrap. *)
@@ -159,7 +159,7 @@ let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
       if needs_ocaml_final then
         Core_emit_blorp_c.try_emit_prepared_program_string cfg (final ())
       else
-        Core_emit_blorp_c.try_prepare_and_emit_program_string cfg
+        Core_emit_blorp_c.try_emit_post_closure_program_string cfg
           backend_input.blorp_tail_input
     in
     match result with

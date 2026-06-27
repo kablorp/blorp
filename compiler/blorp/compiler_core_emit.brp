@@ -250,7 +250,6 @@ import:
 		render_prepared_tuple_op,
 	compiler_artifact_json: CArtifact
 	compiler_core_emit_type_layout as TypeLayout
-	compiler_core_fairness as CoreFairness
 	compiler_core_json:
 		CoreAccessor(
 			BoxedStackResultErrPayloadAccessor,
@@ -434,6 +433,7 @@ import:
 			UnaryExpr,
 			UnboxExpr,
 			UnionConstructExpr,
+			UnionReuseConstructExpr,
 			VarExpr,
 			VoidExpr,
 			WhileExpr,
@@ -610,6 +610,7 @@ import:
 		CoreUnionConstruct,
 		CoreUnionDecl,
 		CoreUnionField,
+		CoreUnionReuseConstruct,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionRepresentation(
 			BoxedOptionRepresentation,
@@ -622,8 +623,8 @@ import:
 		CoreValueRecordDecl,
 		CoreValueRecordField,
 		CoreVar,
+	compiler_core_pipeline as CorePipeline
 	compiler_core_prepare as CorePrepare
-	compiler_core_resource as CoreResource
 	string: string as make_string
 
 
@@ -1221,6 +1222,8 @@ private pure func is_void_expr(expr: CoreExpr) -> Bool:
 			False
 		UnionConstructExpr(construct, typ, loc):
 			False
+		UnionReuseConstructExpr(construct, typ, loc):
+			False
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			False
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
@@ -1434,6 +1437,8 @@ private pure func expr_transfers_ownership(expr: CoreExpr) -> Bool:
 		RecordConstructExpr(type_name, fields, typ, loc):
 			boxed_value_needs_release_type(typ)
 		UnionConstructExpr(construct, typ, loc):
+			boxed_value_needs_release_type(typ)
+		UnionReuseConstructExpr(construct, typ, loc):
 			boxed_value_needs_release_type(typ)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			boxed_value_needs_release_type(typ)
@@ -1827,6 +1832,8 @@ private pure func resource_cleanup_hook(cleanup: CoreExpr) -> Option[ResourceCle
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
 			None
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			None
@@ -7852,6 +7859,47 @@ private pure func emit_generic_union_args(construct: CoreUnionConstruct) -> Opti
 		Some(args)
 
 
+private pure func emit_generic_union_reuse_args(
+	payload_storage: CoreUnionPayloadStorage,
+	args: List[CoreBoxedStorageValue],
+) -> Option[List[String]]:
+	var values: List[String] = []
+	var failed: Bool = False
+
+	for arg in args:
+		if not failed:
+			match emit_generic_union_arg(payload_storage, arg):
+				Some(arg_c):
+					values = values.append(arg_c)
+				None:
+					failed = True
+
+	if failed:
+		None
+	else:
+		Some(values)
+
+
+private pure func emit_union_payload_arg_body(
+	payload_storage: CoreUnionPayloadStorage,
+	arg: CoreBoxedStorageValue,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match payload_storage:
+		TypedUnionPayloadStorage:
+			body ?= emit_function_body(arg.value, next_temp)
+			if body.returns:
+				None
+			else:
+				Some(body)
+		ErasedUnionPayloadStorage:
+			body ?= emit_boxed_pointer_body(arg, next_temp)
+			if body.returns:
+				None
+			else:
+				Some(scoped_c_value("union_arg", "void*", body))
+
+
 private pure func emit_stack_option_args(construct: CoreUnionConstruct) -> Option[List[String]]:
 	var args: List[String] = []
 	var failed: Bool = False
@@ -8011,10 +8059,58 @@ private pure func emit_generic_union_construct_call(
 	if args.length() == 0:
 		Some(construct.constructor_c_name)
 	else:
-		if construct.uses_release_mask:
-			args = args.append(construct.release_mask.to_string() + "UL")
+		Some(
+			construct.constructor_c_name + "(" + call_args_text(
+				args,
+				construct.uses_release_mask,
+				construct.release_mask,
+			) + ")",
+		)
 
-		Some(construct.constructor_c_name + "(" + args.join(", ") + ")")
+
+private pure func call_args_text(
+	args: List[String],
+	uses_release_mask: Bool,
+	release_mask: Int,
+) -> String:
+	arg_text: String = args.join(", ")
+
+	if not uses_release_mask:
+		arg_text
+	else:
+		release_mask_arg: String = release_mask.to_string() + "UL"
+
+		if arg_text == "":
+			release_mask_arg
+		else:
+			arg_text + ", " + release_mask_arg
+
+
+private pure func emit_union_reuse_construct(construct: CoreUnionReuseConstruct) -> Option[String]:
+	match construct.representation:
+		GenericUnionRepresentation:
+			source_c ?= emit_simple_expr(construct.source)
+			payload_args ?= emit_generic_union_reuse_args(construct.payload_storage, construct.args)
+			var args: List[String] = [source_c]
+
+			for payload_arg in payload_args:
+				args = args.append(payload_arg)
+
+			Some(
+				construct.reuse_constructor_c_name + "(" + call_args_text(
+					args,
+					construct.uses_release_mask,
+					construct.release_mask,
+				) + ")",
+			)
+		BoxedOptionRepresentation:
+			None
+		StackOptionRepresentation(info):
+			None
+		StackResultRepresentation(info):
+			None
+		NullableOptionRepresentation:
+			None
 
 
 private pure func emit_union_construct(construct: CoreUnionConstruct) -> Option[String]:
@@ -8045,34 +8141,17 @@ private pure func emit_generic_union_construct_body(
 
 	for arg in construct.args:
 		if not failed:
-			match construct.payload_storage:
-				TypedUnionPayloadStorage:
-					match emit_function_body(arg.value, temp_index):
-						Some(arg_body):
-							if arg_body.returns:
-								failed = True
-							else:
-								match required_body_value(arg_body):
-									Some(arg_c):
-										statements += arg_body.statements
-										args = args.append(arg_c)
-										temp_index = arg_body.next_temp
-									None:
-										failed = True
+			match emit_union_payload_arg_body(construct.payload_storage, arg, temp_index):
+				Some(arg_body):
+					match required_body_value(arg_body):
+						Some(arg_c):
+							statements += arg_body.statements
+							args = args.append(arg_c)
+							temp_index = arg_body.next_temp
 						None:
 							failed = True
-				ErasedUnionPayloadStorage:
-					match emit_boxed_pointer_body(arg, temp_index):
-						Some(arg_body):
-							match required_body_value(arg_body):
-								Some(arg_c):
-									statements += arg_body.statements
-									args = args.append(arg_c)
-									temp_index = arg_body.next_temp
-								None:
-									failed = True
-						None:
-							failed = True
+				None:
+					failed = True
 
 	if failed:
 		None
@@ -8084,15 +8163,70 @@ private pure func emit_generic_union_construct_body(
 			returns = False,
 		})
 	else:
-		if construct.uses_release_mask:
-			args = args.append(construct.release_mask.to_string() + "UL")
+		constructor_value: String = construct.constructor_c_name + "(" + call_args_text(
+			args,
+			construct.uses_release_mask,
+			construct.release_mask,
+		) + ")"
 
-		Some({
-			statements = statements,
-			value = construct.constructor_c_name + "(" + args.join(", ") + ")",
-			next_temp = temp_index,
-			returns = False,
-		})
+		Some(
+			emit_temp_value_body(
+				"union_result",
+				UnionType(construct.type_name),
+				statements,
+				constructor_value,
+				temp_index,
+			),
+		)
+
+
+private pure func emit_generic_union_reuse_construct_body(
+	construct: CoreUnionReuseConstruct,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	source_body ?= emit_function_body(construct.source, next_temp)
+
+	if source_body.returns:
+		None
+	else:
+		source_c ?= required_body_value(source_body)
+		var statements: String = source_body.statements
+		var args: List[String] = [source_c]
+		var failed: Bool = False
+		var temp_index: Int = source_body.next_temp
+
+		for arg in construct.args:
+			if not failed:
+				match emit_union_payload_arg_body(construct.payload_storage, arg, temp_index):
+					Some(arg_body):
+						match required_body_value(arg_body):
+							Some(arg_c):
+								statements += arg_body.statements
+								args = args.append(arg_c)
+								temp_index = arg_body.next_temp
+							None:
+								failed = True
+					None:
+						failed = True
+
+		if failed:
+			None
+		else:
+			constructor_value: String = construct.reuse_constructor_c_name + "(" + call_args_text(
+				args,
+				construct.uses_release_mask,
+				construct.release_mask,
+			) + ")"
+
+			Some(
+				emit_temp_value_body(
+					"union_result",
+					UnionType(construct.type_name),
+					statements,
+					constructor_value,
+					temp_index,
+				),
+			)
 
 
 private pure func emit_stack_result_construct_body(
@@ -8222,6 +8356,23 @@ private pure func emit_union_construct_body(
 			emit_stack_result_construct_body(construct, info, next_temp)
 		NullableOptionRepresentation:
 			emit_nullable_option_construct_body(construct, next_temp)
+
+
+private pure func emit_union_reuse_construct_body(
+	construct: CoreUnionReuseConstruct,
+	next_temp: Int,
+) -> Option[FunctionBodyC]:
+	match construct.representation:
+		GenericUnionRepresentation:
+			emit_generic_union_reuse_construct_body(construct, next_temp)
+		BoxedOptionRepresentation:
+			None
+		StackOptionRepresentation(info):
+			None
+		StackResultRepresentation(info):
+			None
+		NullableOptionRepresentation:
+			None
 
 
 private pure func is_named_pointer_tuple_slot_type(name: String, args: List[CoreType]) -> Bool:
@@ -9540,6 +9691,8 @@ private pure func handoff_source_cleanup_pop_statement(rhs: CoreExpr) -> String:
 			""
 		UnionConstructExpr(construct, typ, loc):
 			""
+		UnionReuseConstructExpr(construct, typ, loc):
+			""
 		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
 			""
 		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
@@ -9733,6 +9886,8 @@ private pure func transfer_prefix_is_non_suspending(expr: CoreExpr) -> Bool:
 			False
 		UnionConstructExpr(construct, typ, loc):
 			False
+		UnionReuseConstructExpr(construct, typ, loc):
+			False
 		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
 			transfer_prefix_is_non_suspending(body)
 		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
@@ -9886,6 +10041,8 @@ private pure func expr_is_var_reference(expr: CoreExpr, variable: CoreVar) -> Bo
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
+			False
+		UnionReuseConstructExpr(construct, typ, loc):
 			False
 		DetachExpr(detached, typ, loc):
 			False
@@ -10206,6 +10363,8 @@ private pure func call_arg_transfer_cleanup_pop_statement(arg: CoreExpr) -> Stri
 			""
 		UnionConstructExpr(construct, typ, loc):
 			""
+		UnionReuseConstructExpr(construct, typ, loc):
+			""
 		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
 			""
 		DropExpr(drop_var, value_type, release_policy, body, typ, loc):
@@ -10472,6 +10631,8 @@ private pure func body_consumes_var_before_suspension(expr: CoreExpr, variable: 
 			False
 		UnionConstructExpr(construct, typ, loc):
 			False
+		UnionReuseConstructExpr(construct, typ, loc):
+			False
 		WhileExpr(cond, body, typ, loc):
 			False
 		BreakExpr(typ, loc):
@@ -10625,6 +10786,8 @@ private pure func is_list_construct_expr(expr: CoreExpr) -> Bool:
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
+			False
+		UnionReuseConstructExpr(construct, typ, loc):
 			False
 		DetachExpr(detached, typ, loc):
 			False
@@ -10856,6 +11019,8 @@ private pure func body_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			False
 		UnionConstructExpr(construct, typ, loc):
 			False
+		UnionReuseConstructExpr(construct, typ, loc):
+			False
 		WhileExpr(cond, body, typ, loc):
 			False
 		BreakExpr(typ, loc):
@@ -10993,6 +11158,8 @@ private pure func directly_returns_var(expr: CoreExpr, variable: CoreVar) -> Boo
 		RecordConstructExpr(type_name, fields, typ, loc):
 			False
 		UnionConstructExpr(construct, typ, loc):
+			False
+		UnionReuseConstructExpr(construct, typ, loc):
 			False
 		DupExpr(dup_var, value_type, retain_policy, body, typ, loc):
 			directly_returns_var(body, variable)
@@ -11286,6 +11453,8 @@ private pure func emit_simple_expr(expr: CoreExpr) -> Option[String]:
 			emit_record_construct(type_name, fields)
 		UnionConstructExpr(construct, typ, loc):
 			emit_union_construct(construct)
+		UnionReuseConstructExpr(construct, typ, loc):
+			emit_union_reuse_construct(construct)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			body_c ?= emit_simple_expr(body)
 			Some(statement_expr(emit_dup_statement(variable, retain_policy), body_c))
@@ -11589,6 +11758,8 @@ private pure func emit_tailrec_tail(
 		RecordConstructExpr(type_name, fields, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		UnionConstructExpr(construct, typ, loc):
+			emit_tailrec_return(return_type, expr, next_temp)
+		UnionReuseConstructExpr(construct, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			retain_statement: String = emit_dup_statement(variable, retain_policy)
@@ -12327,6 +12498,8 @@ private pure func emit_tailrec_list_spread_tail(
 			emit_tailrec_return(loop.return_type, expr, next_temp)
 		UnionConstructExpr(construct, typ, loc):
 			emit_tailrec_return(loop.return_type, expr, next_temp)
+		UnionReuseConstructExpr(construct, typ, loc):
+			emit_tailrec_return(loop.return_type, expr, next_temp)
 		WhileExpr(cond, body, typ, loc):
 			emit_tailrec_return(loop.return_type, expr, next_temp)
 		BreakExpr(typ, loc):
@@ -12495,6 +12668,8 @@ private pure func static_int_literal(expr: CoreExpr) -> Option[Int]:
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
 			None
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			None
@@ -14506,6 +14681,8 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		UnionConstructExpr(construct, typ, loc):
 			typ
+		UnionReuseConstructExpr(construct, typ, loc):
+			typ
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			typ
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
@@ -14914,7 +15091,62 @@ private pure func emit_borrow_match_binding_statement(
 	else:
 		"  " + c_type_name(
 			binding.typ,
-		) + " " + c_var_name(binding.variable) + " = " + source_c + ";\n"
+			) + " " + c_var_name(binding.variable) + " = " + source_c + ";\n"
+
+
+private pure func direct_owned_variant_field_index(accessor: CoreAccessor) -> Option[Int]:
+	match accessor:
+		VariantFieldAccessor(RootAccessor, union_c_type, constructor, field_index):
+			Some(field_index)
+		ErasedVariantFieldAccessor(RootAccessor, union_c_type, constructor, field_index):
+			Some(field_index)
+		RootAccessor:
+			None
+		VariantFieldAccessor(parent, union_c_type, constructor, field_index):
+			None
+		ErasedVariantFieldAccessor(parent, union_c_type, constructor, field_index):
+			None
+		NullableOptionPayloadAccessor(parent):
+			None
+		StackOptionPayloadAccessor(parent):
+			None
+		StackResultOkPayloadAccessor(parent):
+			None
+		StackResultErrPayloadAccessor(parent):
+			None
+		BoxedStackResultOkPayloadAccessor(parent, result_type):
+			None
+		BoxedStackResultErrPayloadAccessor(parent, result_type):
+			None
+		BoxedResultOkPayloadAccessor(parent):
+			None
+		BoxedResultErrPayloadAccessor(parent):
+			None
+		TupleFieldAccessor(parent, index, typ):
+			None
+		ListElementAccessor(parent, index):
+			None
+		ListSpreadAccessor(parent, offset):
+			None
+
+
+private pure func emit_owned_match_binding_statement(
+	scrutinee_temp: String,
+	unique_name: String,
+	binding: CoreMatchBinding,
+	source_c: String,
+) -> Option[String]:
+	decl: String = emit_borrow_match_binding_statement(binding, source_c)
+
+	if not type_requires_release(binding.typ):
+		Some(decl)
+	else:
+		field_index ?= direct_owned_variant_field_index(binding.accessor)
+		bit: String = "(1UL << " + field_index.to_string() + ")"
+		binding_name: String = c_var_name(binding.variable)
+		Some(
+			decl + "  if (" + binding_name + ") { if (" + unique_name + " && ((" + scrutinee_temp + "->release_mask & " + bit + ") != 0UL)) { " + scrutinee_temp + "->release_mask &= ~" + bit + "; } else { blorp_retain(" + binding_name + "); } }\n",
+		)
 
 
 private pure func emit_match_binding(
@@ -15649,6 +15881,7 @@ private pure func constructor_case_binding_source(
 private pure func emit_constructor_case_match_binding(
 	scrutinee_temp: String,
 	match_case: CoreConstructorMatchCase,
+	owned_unique_name: Option[String],
 	binding: CoreMatchBinding,
 ) -> Option[String]:
 	match binding.mode:
@@ -15656,19 +15889,44 @@ private pure func emit_constructor_case_match_binding(
 			source_c ?= constructor_case_binding_source(scrutinee_temp, match_case, binding)
 			Some(emit_borrow_match_binding_statement(binding, source_c))
 		MatchOwnBindingMode:
-			None
+			unique_name ?= owned_unique_name
+			source_c ?= constructor_case_binding_source(scrutinee_temp, match_case, binding)
+			emit_owned_match_binding_statement(scrutinee_temp, unique_name, binding, source_c)
+
+
+private pure func match_binding_is_owned(binding: CoreMatchBinding) -> Bool:
+	match binding.mode:
+		MatchBorrowBindingMode:
+			False
+		MatchOwnBindingMode:
+			True
+
+
+private pure func match_bindings_have_owned(bindings: List[CoreMatchBinding]) -> Bool:
+	var found: Bool = False
+	for binding in bindings:
+		if match_binding_is_owned(binding):
+			found = True
+
+	found
 
 
 private pure func emit_constructor_case_match_bindings(
 	scrutinee_temp: String,
 	match_case: CoreConstructorMatchCase,
+	owned_unique_name: Option[String],
 ) -> Option[String]:
 	var statements: String = ""
 	var failed: Bool = False
 
 	for binding in match_case.bindings:
 		if not failed:
-			match emit_constructor_case_match_binding(scrutinee_temp, match_case, binding):
+			match emit_constructor_case_match_binding(
+				scrutinee_temp,
+				match_case,
+				owned_unique_name,
+				binding,
+			):
 				Some(statement):
 					statements += statement
 				None:
@@ -15966,6 +16224,8 @@ private pure func emit_constructor_expr_match_body(
 		RecordConstructExpr(type_name, fields, typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		UnionConstructExpr(construct, typ, loc):
+			emit_literal_match_branch_body(result_name, expr, next_temp)
+		UnionReuseConstructExpr(construct, typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
 		DetachExpr(detached, typ, loc):
 			emit_literal_match_branch_body(result_name, expr, next_temp)
@@ -16285,18 +16545,31 @@ private pure func emit_constructor_match_branch_body(
 	match_case: CoreConstructorMatchCase,
 	next_temp: Int,
 ) -> Option[FunctionBodyC]:
-	bindings_c ?= emit_constructor_case_match_bindings(scrutinee_temp, match_case)
+	has_owned_binding: Bool = match_bindings_have_owned(match_case.bindings)
+	owned_unique_name: Option[String] = if has_owned_binding:
+		Some(temp_name("match_owned_unique", next_temp))
+	else:
+		None
+	body_next_temp: Int = if has_owned_binding:
+		next_temp + 1
+	else:
+		next_temp
+	bindings_c ?= emit_constructor_case_match_bindings(
+		scrutinee_temp,
+		match_case,
+		owned_unique_name,
+	)
 
 	body_c ?= match match_case.body:
 		ConstructorMatchBodyExpr(expr):
-			emit_constructor_expr_match_body(scrutinee_temp, result_name, expr, next_temp)
+			emit_constructor_expr_match_body(scrutinee_temp, result_name, expr, body_next_temp)
 		ConstructorMatchBodyLiteral(match_expr):
 			emit_constructor_case_literal_match_body(
 				scrutinee_temp,
 				result_name,
 				match_case,
 				match_expr,
-				next_temp,
+				body_next_temp,
 			)
 		ConstructorMatchBodyLength(match_expr):
 			emit_constructor_case_length_match_body(
@@ -16304,11 +16577,16 @@ private pure func emit_constructor_match_branch_body(
 				result_name,
 				match_case,
 				match_expr,
-				next_temp,
+				body_next_temp,
 			)
+	owned_unique_c: String = match owned_unique_name:
+		Some(name):
+			"  bool " + name + " = " + scrutinee_temp + " && blorp_is_unique(" + scrutinee_temp + ");\n"
+		None:
+			""
 
 	Some({
-		statements = bindings_c + body_c.statements,
+		statements = owned_unique_c + bindings_c + body_c.statements,
 		value = body_c.value,
 		next_temp = body_c.next_temp,
 		returns = body_c.returns,
@@ -17339,6 +17617,12 @@ private pure func emit_function_body(expr: CoreExpr, next_temp: Int) -> Option[F
 					Some(body_value(value, next_temp))
 				None:
 					emit_union_construct_body(construct, next_temp)
+		UnionReuseConstructExpr(construct, typ, loc):
+			match emit_simple_expr(expr):
+				Some(value):
+					Some(body_value(value, next_temp))
+				None:
+					emit_union_reuse_construct_body(construct, next_temp)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			retain_statement: String = emit_dup_statement(variable, retain_policy)
 			body_c ?= emit_function_body(body, next_temp)
@@ -18070,6 +18354,8 @@ private pure func emit_channel_attempt_user_function(
 		RecordConstructExpr(type_name, fields, typ, loc):
 			None
 		UnionConstructExpr(construct, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
 			None
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			None
@@ -19184,6 +19470,8 @@ private pure func static_value_supported(typ: CoreType, expr: CoreExpr) -> Bool:
 			static_tuple_supported(construct)
 		UnionConstructExpr(construct, union_type, loc):
 			static_union_supported(construct)
+		UnionReuseConstructExpr(construct, union_type, loc):
+			False
 		RecordConstructExpr(type_name, fields, record_type, loc):
 			match typ:
 				HeapRecordType(name):
@@ -19406,6 +19694,8 @@ private pure func static_value_initializer(
 			static_tuple_initializer(path_c, construct)
 		UnionConstructExpr(construct, union_type, loc):
 			static_union_initializer(path_c, construct)
+		UnionReuseConstructExpr(construct, union_type, loc):
+			None
 		RecordConstructExpr(type_name, fields, record_type, loc):
 			match typ:
 				HeapRecordType(name):
@@ -20193,6 +20483,8 @@ private pure func emit_global_static_init_expr(init: CoreExpr) -> Option[String]
 			None
 		UnionConstructExpr(construct, typ, loc):
 			None
+		UnionReuseConstructExpr(construct, typ, loc):
+			None
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			None
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
@@ -20730,10 +21022,62 @@ private pure func emit_union_constructor(
 		) + ") {\n" + "  " + union_decl.name + "* __vc = (" + union_decl.name + "*)blorp_alloc(sizeof(" + union_decl.name + "));\n" + "  BLORP_TAG(__vc, \"" + union_decl.name + "\");\n" + destructor_init + "  __vc->tag = " + variant.tag_c_name + ";\n" + release_mask_init + assignments + "  return __vc;\n}\n\n"
 
 
+private pure func emit_union_reuse_constructor(
+	union_decl: CoreUnionDecl,
+	variant: CoreUnionVariant,
+) -> String:
+	if variant.fields.length() == 0:
+		""
+	else:
+		var params: List[String] = [union_decl.name + "* __old"]
+		var assignments: String = ""
+		var fresh_args: List[String] = []
+		var index: Int = 0
+		uses_release_mask: Bool = union_variant_uses_release_mask(union_decl, variant)
+		has_release_mask: Bool = union_decl_has_release_mask(union_decl)
+		reuse_name: String = "__blorp_reuse_" + union_decl.name + "_" + variant.c_name
+
+		for field in variant.fields:
+			field_name: String = "field" + index.to_string()
+			params = params.append(
+				emit_union_constructor_param(
+					union_decl.payload_storage,
+					field,
+					index,
+				),
+			)
+			fresh_args = fresh_args.append(field_name)
+			assignments += "    __old->data." + variant.name + ".field" + index.to_string() + " = " + field_name + ";\n"
+			index += 1
+
+		if uses_release_mask:
+			params = params.append("unsigned long release_mask")
+			fresh_args = fresh_args.append("release_mask")
+
+		destroy_old_fields: String = if union_decl_has_destructor(union_decl):
+			"    " + union_decl.name + "_destroy(__old);\n"
+		else:
+			""
+
+		release_mask_update: String = if uses_release_mask:
+			"    __old->release_mask = release_mask;\n"
+		else if has_release_mask:
+			"    __old->release_mask = 0UL;\n"
+		else:
+			""
+
+		"static inline " + union_decl.name + "* " + reuse_name + "(" + params.join(
+			", ",
+		) + ") {\n" + "  if (__old && blorp_is_unique(__old)) {\n" + destroy_old_fields + "    __old->tag = " + variant.tag_c_name + ";\n" + release_mask_update + assignments + "    return __old;\n" + "  }\n" + "  " + union_decl.name + "* __fresh = " + variant.c_name + "(" + fresh_args.join(
+			", ",
+		) + ");\n" + "  if (__old) blorp_release(__old);\n" + "  return __fresh;\n}\n\n"
+
+
 private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
 	var storage_c: String = ""
 	var tags_c: String = ""
 	var constructors_c: String = ""
+	var reuse_constructors_c: String = ""
 
 	release_mask_field: String = if union_decl_has_release_mask(union_decl):
 		"  unsigned long release_mask;\n"
@@ -20744,10 +21088,11 @@ private pure func emit_union_decl(union_decl: CoreUnionDecl) -> String:
 		storage_c += emit_union_variant_storage(union_decl, variant)
 		tags_c += emit_union_variant_tag(variant)
 		constructors_c += emit_union_constructor(union_decl, variant)
+		reuse_constructors_c += emit_union_reuse_constructor(union_decl, variant)
 
 	"typedef struct " + union_decl.name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + release_mask_field + "  union {\n" + storage_c + "  } data;\n" + "} " + union_decl.name + ";\n\n" + tags_c + "\n" + emit_union_destructor(
 		union_decl,
-	) + constructors_c
+	) + constructors_c + reuse_constructors_c
 
 
 private pure func emit_value_record_decls(decls: List[CoreDecl]) -> String:
@@ -21095,24 +21440,22 @@ pure func try_emit_prepared_core_program_c_artifact_with_options(
 	})
 
 
-pure func prepare_and_emit_core_program_c_artifact_with_options(
+pure func emit_post_closure_core_program_c_artifact_with_options(
 	program: CoreProgram,
 	options: CoreEmitOptions,
 ) -> CArtifact:
-	match try_prepare_and_emit_core_program_c_artifact_with_options(program, options):
+	match try_emit_post_closure_core_program_c_artifact_with_options(program, options):
 		Ok(artifact):
 			artifact
 		Err(error):
 			error_artifact(error)
 
 
-pure func try_prepare_and_emit_core_program_c_artifact_with_options(
+pure func try_emit_post_closure_core_program_c_artifact_with_options(
 	program: CoreProgram,
 	options: CoreEmitOptions,
 ) -> Result[CArtifact, CoreEmitError]:
-	resource_program: CoreProgram = CoreResource.rewrite_resource_program(program)
-	fair_program: CoreProgram = CoreFairness.insert_cooperative_checkpoints(resource_program)
-	prepared_program: CoreProgram = CorePrepare.prepare_program(fair_program)
+	prepared_program: CoreProgram = CorePipeline.run_post_closure_tail(program)
 
 	try_emit_prepared_core_program_c_artifact_with_options(prepared_program, options)
 
@@ -21121,7 +21464,7 @@ pure func emit_core_program_c_artifact_with_options(
 	program: CoreProgram,
 	options: CoreEmitOptions,
 ) -> CArtifact:
-	prepare_and_emit_core_program_c_artifact_with_options(program, options)
+	emit_post_closure_core_program_c_artifact_with_options(program, options)
 
 
 pure func emit_core_program_c_artifact(program: CoreProgram) -> CArtifact:

@@ -387,13 +387,13 @@ let render_many_request_json ~renderer items =
              ] );
        ])
 
-let prepare_and_emit_c_request_json ?(profile = false) core_json =
+let emit_post_closure_c_request_json ?(profile = false) core_json =
   Lsp_json.to_string
     (Lsp_json.Object
        [
          ("schema", Lsp_json.Int schema_version);
          ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "prepare_and_emit_c");
+         ("action", Lsp_json.String "emit_post_closure_c");
          ( "payload",
            Lsp_json.Object
              [ ("core", core_json); ("profile", Lsp_json.Bool profile) ] );
@@ -1263,10 +1263,10 @@ let render_many_via_command_exn ~renderer items =
     | Ok rendered -> rendered
     | Error (_, message) -> invalid_arg message
 
-let prepare_and_emit_c_artifact_exn ?(profile = false) core_json =
+let emit_post_closure_c_artifact_exn ?(profile = false) core_json =
   let response_json =
     run_renderer_request_via_blorp
-      (prepare_and_emit_c_request_json ~profile core_json)
+      (emit_post_closure_c_request_json ~profile core_json)
   in
   match response_result response_json c_artifact_response_field with
   | Ok artifact -> artifact

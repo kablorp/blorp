@@ -282,6 +282,8 @@ private RECORD_CONSTRUCT_EXPR_TAG: String = "record_construct"
 
 private UNION_CONSTRUCT_EXPR_TAG: String = "union_construct"
 
+private UNION_REUSE_CONSTRUCT_EXPR_TAG: String = "union_reuse_construct"
+
 private DETACH_EXPR_TAG: String = "detach"
 
 private DROP_EXPR_TAG: String = "drop"
@@ -932,6 +934,7 @@ union CoreExpr:
 	RecordExpr(List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	RecordConstructExpr(String, List[CoreRecordFieldValue], CoreType, CoreSourceLoc)
 	UnionConstructExpr(CoreUnionConstruct, CoreType, CoreSourceLoc)
+	UnionReuseConstructExpr(CoreUnionReuseConstruct, CoreType, CoreSourceLoc)
 	DetachExpr(CoreDetach, CoreType, CoreSourceLoc)
 	DupExpr(CoreVar, CoreType, CoreRetainPolicy, CoreExpr, CoreType, CoreSourceLoc)
 	DropExpr(CoreVar, CoreType, CoreReleasePolicy, CoreExpr, CoreType, CoreSourceLoc)
@@ -1445,6 +1448,20 @@ record CoreUnionConstruct {
 	type_name: String,
 	constructor_name: String,
 	constructor_c_name: String,
+	representation: CoreUnionRepresentation,
+	payload_storage: CoreUnionPayloadStorage,
+	uses_release_mask: Bool,
+	release_mask: Int,
+	args: List[CoreBoxedStorageValue]
+}
+
+
+record CoreUnionReuseConstruct {
+	source: CoreExpr,
+	type_name: String,
+	constructor_name: String,
+	constructor_c_name: String,
+	reuse_constructor_c_name: String,
 	representation: CoreUnionRepresentation,
 	payload_storage: CoreUnionPayloadStorage,
 	uses_release_mask: Bool,
@@ -4894,6 +4911,59 @@ pure func decode_core_union_construct_json(
 	})
 
 
+pure func core_union_reuse_construct_to_json(construct: CoreUnionReuseConstruct) -> JsonValue:
+	JsonObject([
+		("source", core_expr_to_json(construct.source)),
+		("type_name", JsonString(construct.type_name)),
+		("constructor_name", JsonString(construct.constructor_name)),
+		("constructor_c_name", JsonString(construct.constructor_c_name)),
+		("reuse_constructor_c_name", JsonString(construct.reuse_constructor_c_name)),
+		("representation", core_union_representation_to_json(construct.representation)),
+		("payload_storage", core_union_payload_storage_to_json(construct.payload_storage)),
+		("uses_release_mask", JsonBool(construct.uses_release_mask)),
+		("release_mask", json_int(construct.release_mask)),
+		("args", core_boxed_storage_values_to_json(construct.args)),
+	])
+
+
+pure func decode_core_union_reuse_construct_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreUnionReuseConstruct, CoreJsonError]:
+	source_json ?= object_field(value, path, "source")
+	source ?= decode_core_expr_json(source_json, path_field(path, "source"))
+	type_name ?= string_field(value, path, "type_name")
+	constructor_name ?= string_field(value, path, "constructor_name")
+	constructor_c_name ?= string_field(value, path, "constructor_c_name")
+	reuse_constructor_c_name ?= string_field(value, path, "reuse_constructor_c_name")
+	representation_json ?= object_field(value, path, "representation")
+	representation ?= decode_core_union_representation_json(
+		representation_json,
+		path_field(path, "representation"),
+	)
+	payload_storage_value ?= required_field(value, path, "payload_storage")
+	payload_storage ?= decode_core_union_payload_storage_json(
+		payload_storage_value,
+		path_field(path, "payload_storage"),
+	)
+	uses_release_mask ?= bool_field(value, path, "uses_release_mask")
+	release_mask ?= int_field(value, path, "release_mask")
+	args ?= decode_core_boxed_storage_values(value, path, "args")
+
+	Ok({
+		source = source,
+		type_name = type_name,
+		constructor_name = constructor_name,
+		constructor_c_name = constructor_c_name,
+		reuse_constructor_c_name = reuse_constructor_c_name,
+		representation = representation,
+		payload_storage = payload_storage,
+		uses_release_mask = uses_release_mask,
+		release_mask = release_mask,
+		args = args,
+	})
+
+
 pure func core_binary_op_to_string(op: CoreBinaryOp) -> String:
 	match op:
 		AddOp:
@@ -7946,6 +8016,19 @@ private pure func core_expr_union_construct_to_json(
 	])
 
 
+private pure func core_expr_union_reuse_construct_to_json(
+	construct: CoreUnionReuseConstruct,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(UNION_REUSE_CONSTRUCT_EXPR_TAG)),
+		("construct", core_union_reuse_construct_to_json(construct)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_detach_to_json(
 	detached: CoreDetach,
 	typ: CoreType,
@@ -8507,6 +8590,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_record_construct_to_json(type_name, fields, typ, loc)
 		UnionConstructExpr(construct, typ, loc):
 			core_expr_union_construct_to_json(construct, typ, loc)
+		UnionReuseConstructExpr(construct, typ, loc):
+			core_expr_union_reuse_construct_to_json(construct, typ, loc)
 		DetachExpr(detached, typ, loc):
 			core_expr_detach_to_json(detached, typ, loc)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
@@ -9583,6 +9668,28 @@ private pure func decode_core_expr_union_construct_from_json(
 	Ok(UnionConstructExpr(construct, typ, loc))
 
 
+private pure func decode_core_expr_union_reuse_construct_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	construct_json ?= object_field(value, path, "construct")
+	construct ?= decode_core_union_reuse_construct_json(
+		construct_json,
+		path_field(path, "construct"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(UnionReuseConstructExpr(construct, typ, loc))
+
+
 private pure func decode_core_expr_detach_from_json(
 	value: JsonValue,
 	path: String,
@@ -10483,6 +10590,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_record_construct_from_json(value, path)
 	else if tag == UNION_CONSTRUCT_EXPR_TAG:
 		decode_core_expr_union_construct_from_json(value, path)
+	else if tag == UNION_REUSE_CONSTRUCT_EXPR_TAG:
+		decode_core_expr_union_reuse_construct_from_json(value, path)
 	else if tag == DETACH_EXPR_TAG:
 		decode_core_expr_detach_from_json(value, path)
 	else if tag == DUP_EXPR_TAG:
