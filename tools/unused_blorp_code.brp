@@ -1,0 +1,127 @@
+import:
+	./unused_blorp_code/analyzer: analyze_sources_with_usage, format_analysis, read_blorp_sources
+
+
+record CommandArgs {
+	root: String,
+	usage_root: String,
+	include_public: Bool,
+	fail_on_unused: Bool
+}
+
+
+union ParsedCommand:
+	CommandRun(CommandArgs)
+	CommandMessage(String, Int)
+
+
+HELP_TEXT: String =
+	|Usage: unused-blorp-code [OPTIONS] <directory>
+	|
+	|Find candidate unused Blorp definitions in a file or directory.
+	|
+	|Options:
+	|  --include-public      Also report public definitions. Public definitions require import+use evidence.
+	|  --usage-root PATH     Scan consumer imports/usages under PATH. Defaults to <directory>.
+	|  --fail-on-unused      Exit with status 1 when unused definitions are found.
+	|  -h, --help            Show this help message
+
+
+pure func parse_command(args: List[String]) -> ParsedCommand:
+	var include_public: Bool = False
+	var fail_on_unused: Bool = False
+	var usage_root: Option[String] = None
+	var root: Option[String] = None
+	var error: Option[String] = None
+	var idx: Int = 1
+
+	while idx < args.length():
+		arg: String = args.get_or(idx, "")
+
+		if arg == "--include-public":
+			include_public = True
+		else if arg == "--fail-on-unused":
+			fail_on_unused = True
+		else if arg == "--usage-root":
+			next_idx: Int = idx + 1
+
+			if next_idx >= args.length():
+				error = Some("missing value for: --usage-root")
+				idx = args.length()
+			else:
+				usage_root = Some(args.get_or(next_idx, ""))
+				idx = next_idx
+		else if arg.starts_with("--usage-root="):
+			usage_root = Some(arg.remove_prefix("--usage-root="))
+		else if arg == "--help" or arg == "-h":
+			error = Some(HELP_TEXT)
+			idx = args.length()
+		else if arg.starts_with("-"):
+			error = Some("unknown argument: " + arg)
+			idx = args.length()
+		else:
+			match root:
+				Some(_):
+					error = Some("unexpected argument: " + arg)
+					idx = args.length()
+				None:
+					root = Some(arg)
+
+		idx += 1
+
+	match error:
+		Some(message):
+			if message == HELP_TEXT:
+				CommandMessage(message, 0)
+			else:
+				CommandMessage(message, 1)
+		None:
+			match root:
+				Some(path):
+					CommandRun({
+						root = path,
+						usage_root = usage_root.get_or(path),
+						include_public = include_public,
+						fail_on_unused = fail_on_unused,
+					})
+				None:
+					CommandMessage(HELP_TEXT, 1)
+
+
+func run_command(command: CommandArgs) -> Int:
+	match command.root.read_blorp_sources():
+		Err(message):
+			print(message)
+			1
+		Ok(files):
+			match command.usage_root.read_blorp_sources():
+				Err(message):
+					print(message)
+					1
+				Ok(usage_files):
+					analysis = analyze_sources_with_usage(
+						files,
+						usage_files,
+						command.include_public,
+					)
+					print(command.root.format_analysis(analysis))
+
+					if command.fail_on_unused and analysis.unused.length() > 0:
+						1
+					else:
+						0
+
+
+func run_parsed_command(command: ParsedCommand) -> Int:
+	match command:
+		CommandRun(args):
+			args.run_command()
+		CommandMessage(message, status):
+			print(message)
+			status
+
+
+func main(args: List[String]) -> Int:
+	args
+		.parse_command()
+		.run_parsed_command()

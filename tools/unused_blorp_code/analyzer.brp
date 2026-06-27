@@ -1,0 +1,817 @@
+import:
+	dict: dict
+	string: string
+	system: file_exists, is_directory, read_file, walk_dir
+
+
+enum DefinitionKind:
+	FunctionDefinition
+	TypeDefinition
+	ConstantDefinition
+
+
+enum SymbolVisibility:
+	PublicSymbol
+	PrivateSymbol
+
+
+record BlorpSourceFile {
+	path: String,
+	source: String
+}
+
+
+record Definition {
+	kind: DefinitionKind,
+	visibility: SymbolVisibility,
+	name: String,
+	module_name: String,
+	path: String,
+	line: Int
+}
+
+
+record UnusedDefinition {
+	definition: Definition,
+	reference_count: Int
+}
+
+
+record AnalysisResult {
+	definitions: List[Definition],
+	unused: List[UnusedDefinition]
+}
+
+
+record SanitizedLines {
+	lines: List[String],
+	in_docstring: Bool
+}
+
+
+record ImportDirective {
+	module_ref: String,
+	module_alias: String,
+	symbols: List[String]
+}
+
+
+record CurrentImport {
+	module_ref: String,
+	module_alias: String,
+	indent: Int
+}
+
+
+record UsageFile {
+	path: String,
+	imports: List[ImportDirective],
+	code_identifiers: List[String],
+	code_text: String
+}
+
+
+private pure func is_identifier_start(ch: Char) -> Bool:
+	ch >= 'a' and ch <= 'z' or ch >= 'A' and ch <= 'Z' or ch == '_'
+
+
+private pure func is_identifier_continue(ch: Char) -> Bool:
+	is_identifier_start(ch) or ch >= '0' and ch <= '9'
+
+
+private pure func is_space(ch: Char) -> Bool:
+	ch == ' ' or ch == '\t'
+
+
+private pure func char_text(ch: Char) -> String:
+	ch.to_string()
+
+
+private pure func is_double_quote(ch: Char) -> Bool:
+	ch.char_text() == "\""
+
+
+private pure func is_single_quote(ch: Char) -> Bool:
+	ch.char_text() == "'"
+
+
+private pure func is_backslash(ch: Char) -> Bool:
+	ch.char_text() == "\\"
+
+
+private pure func line_starts_multiline_string(line: String) -> Bool:
+	line
+		.trim()
+		.starts_with("|")
+
+
+private pure func strip_comments_and_string_literals(line: String) -> String:
+	var result: String = string(line.length())
+	var idx: Int = 0
+	var in_double_string: Bool = False
+	var in_single_string: Bool = False
+	var escaped: Bool = False
+
+	while idx < line.length():
+		ch: Char = line.get_or(idx, ' ')
+		next: Char = line.get_or(idx + 1, ' ')
+
+		if in_double_string:
+			result = result.append_char(' ')
+
+			if escaped:
+				escaped = False
+			else if ch.is_backslash():
+				escaped = True
+			else if ch.is_double_quote():
+				in_double_string = False
+		else if in_single_string:
+			result = result.append_char(' ')
+
+			if escaped:
+				escaped = False
+			else if ch.is_backslash():
+				escaped = True
+			else if ch.is_single_quote():
+				in_single_string = False
+		else if ch == '-' and next == '-':
+			idx = line.length()
+		else if ch.is_double_quote():
+			result = result.append_char(' ')
+			in_double_string = True
+			escaped = False
+		else if ch.is_single_quote():
+			result = result.append_char(' ')
+			in_single_string = True
+			escaped = False
+		else:
+			result = result.append_char(ch)
+
+		idx += 1
+
+	result
+
+
+private pure func sanitize_source(source: String) -> List[String]:
+	var state: SanitizedLines = {
+		lines = [],
+		in_docstring = False
+	}
+
+	for line in source.lines():
+		trimmed: String = line.trim()
+
+		if trimmed.starts_with("---"):
+			state = {
+				lines = state.lines.append(""),
+				in_docstring = not state.in_docstring
+			}
+		else if state.in_docstring or line.line_starts_multiline_string():
+			state = { state | lines = state.lines.append("") }
+		else:
+			state = { state |
+				lines = state.lines.append(line.strip_comments_and_string_literals())
+			}
+
+	state.lines
+
+
+private pure func read_identifier_at(text: String, start: Int) -> Option[String]:
+	if start < 0 or start >= text.length():
+		None
+	else:
+		first: Char = text.get_or(start, ' ')
+
+		if not first.is_identifier_start():
+			None
+		else:
+			var idx: Int = start
+			var name: String = string(16)
+
+			while idx < text.length() and text
+				.get_or(idx, ' ')
+				.is_identifier_continue():
+				name = name.append_char(text.get_or(idx, ' '))
+				idx += 1
+
+			Some(name)
+
+
+private pure func identifiers_in_line(line: String) -> List[String]:
+	var identifiers: List[String] = []
+	var idx: Int = 0
+
+	while idx < line.length():
+		ch: Char = line.get_or(idx, ' ')
+
+		if ch.is_identifier_start():
+			match line.read_identifier_at(idx):
+				Some(name):
+					identifiers = identifiers.append(name)
+					idx += name.length()
+				None:
+					idx += 1
+		else:
+			idx += 1
+
+	identifiers
+
+
+private pure func count_identifier_references(lines: List[String]) -> Dict[String, Int]:
+	var counts: Dict[String, Int] = dict()
+
+	for line in lines:
+		for name in line.identifiers_in_line():
+			counts = counts.set(name, counts.get_or(name, 0) + 1)
+
+	counts
+
+
+private pure func strip_private_prefix(trimmed: String) -> String:
+	if trimmed.starts_with("private "):
+		trimmed
+			.remove_prefix("private ")
+			.trim()
+	else:
+		trimmed
+
+
+private pure func visibility_for_line(trimmed: String) -> SymbolVisibility:
+	if trimmed.starts_with("private "):
+		PrivateSymbol
+	else:
+		PublicSymbol
+
+
+private pure func definition(
+	kind: DefinitionKind,
+	visibility: SymbolVisibility,
+	name: String,
+	path: String,
+	line: Int,
+) -> Definition:
+	{
+		kind = kind,
+		visibility = visibility,
+		name = name,
+		module_name = module_name_for_path(path),
+		path = path,
+		line = line
+	}
+
+
+private pure func name_after_prefix(text: String, prefix: String) -> Option[String]:
+	if text.starts_with(prefix):
+		body: String = text
+			.remove_prefix(prefix)
+			.trim()
+		body.read_identifier_at(0)
+	else:
+		None
+
+
+private pure func parse_function_definition(
+	path: String,
+	line_no: Int,
+	trimmed: String,
+) -> Option[Definition]:
+	visibility: SymbolVisibility = trimmed.visibility_for_line()
+	body: String = trimmed.strip_private_prefix()
+
+	name: Option[String] = if body.starts_with("pure func "):
+		body.name_after_prefix("pure func ")
+	else:
+		body.name_after_prefix("func ")
+
+	match name:
+		Some(def_name):
+			Some(definition(FunctionDefinition, visibility, def_name, path, line_no))
+		None:
+			None
+
+
+private pure func parse_type_definition(
+	path: String,
+	line_no: Int,
+	trimmed: String,
+) -> Option[Definition]:
+	visibility: SymbolVisibility = trimmed.visibility_for_line()
+	body: String = trimmed.strip_private_prefix()
+
+	name: Option[String] = if body.starts_with("record "):
+		body.name_after_prefix("record ")
+	else if body.starts_with("struct "):
+		body.name_after_prefix("struct ")
+	else if body.starts_with("union "):
+		body.name_after_prefix("union ")
+	else if body.starts_with("enum "):
+		body.name_after_prefix("enum ")
+	else if body.starts_with("type alias "):
+		body.name_after_prefix("type alias ")
+	else if body.starts_with("type "):
+		body.name_after_prefix("type ")
+	else:
+		None
+
+	match name:
+		Some(def_name):
+			Some(definition(TypeDefinition, visibility, def_name, path, line_no))
+		None:
+			None
+
+
+private pure func starts_at_top_level(line: String) -> Bool:
+	if line.length() == 0:
+		False
+	else:
+		not line
+			.get_or(0, ' ')
+			.is_space()
+
+
+private pure func skip_spaces(text: String, start: Int) -> Int:
+	var idx: Int = start
+
+	while idx < text.length() and text
+		.get_or(idx, ' ')
+		.is_space():
+		idx += 1
+
+	idx
+
+
+private pure func has_constant_separator_after_name(text: String, name: String) -> Bool:
+	idx: Int = text.skip_spaces(name.length())
+	idx < text.length() and text.get_or(idx, ' ') == ':' and text.contains("=")
+
+
+private pure func parse_constant_definition(
+	path: String,
+	line_no: Int,
+	line: String,
+) -> Option[Definition]:
+	if not line.starts_at_top_level():
+		None
+	else:
+		trimmed: String = line.trim()
+		visibility: SymbolVisibility = trimmed.visibility_for_line()
+		body: String = trimmed.strip_private_prefix()
+
+		if (
+			body.starts_with("func ")
+			or body.starts_with("pure func ")
+			or body.starts_with("record ")
+			or body.starts_with("struct ")
+			or body.starts_with("union ")
+			or body.starts_with("enum ")
+			or body.starts_with("type ")
+			or body.starts_with("import:")
+		):
+			None
+		else:
+			match body.read_identifier_at(0):
+				Some(name):
+					if body.has_constant_separator_after_name(name):
+						Some(definition(ConstantDefinition, visibility, name, path, line_no))
+					else:
+						None
+				None:
+					None
+
+
+private pure func parse_definition(path: String, line_no: Int, line: String) -> Option[Definition]:
+	trimmed: String = line.trim()
+
+	match parse_function_definition(path, line_no, trimmed):
+		Some(defn):
+			Some(defn)
+		None:
+			match parse_type_definition(path, line_no, trimmed):
+				Some(defn):
+					Some(defn)
+				None:
+					parse_constant_definition(path, line_no, line)
+
+
+private pure func definitions_in_file(file: BlorpSourceFile) -> List[Definition]:
+	lines: List[String] = file.source.sanitize_source()
+	var definitions: List[Definition] = []
+	var line_no: Int = 1
+
+	for line in lines:
+		match parse_definition(file.path, line_no, line):
+			Some(defn):
+				definitions = definitions.append(defn)
+			None:
+				void
+
+		line_no += 1
+
+	definitions
+
+
+private pure func module_name_for_path(path: String) -> String:
+	path.remove_suffix(".brp")
+
+
+private pure func module_short_name(module_name: String) -> String:
+	parts: List[String] = module_name.split("/")
+	parts.get_or(parts.length() - 1, module_name)
+
+
+private pure func module_ref_matches(module_ref: String, module_name: String) -> Bool:
+	clean_ref: String = module_ref
+		.remove_prefix("./")
+		.remove_suffix(".brp")
+	short_name: String = module_name.module_short_name()
+
+	(
+		clean_ref == module_name
+		or clean_ref == short_name
+		or module_name.ends_with("/" + clean_ref)
+		or clean_ref.ends_with("/" + module_name)
+		or clean_ref.ends_with("/" + short_name)
+	)
+
+
+private pure func count_leading_indent(line: String) -> Int:
+	var count: Int = 0
+	var idx: Int = 0
+
+	while idx < line.length() and line
+		.get_or(idx, ' ')
+		.is_space():
+		count += 1
+		idx += 1
+
+	count
+
+
+private pure func before_first(text: String, needle: String) -> String:
+	match text.index_of(needle):
+		Some(idx):
+			text.take_left(idx)
+		None:
+			text
+
+
+private pure func after_first(text: String, needle: String) -> String:
+	match text.index_of(needle):
+		Some(idx):
+			text.drop_left(idx + needle.length())
+		None:
+			""
+
+
+private pure func module_ref_from_spec(spec: String) -> String:
+	spec
+		.before_first(" as ")
+		.trim()
+
+
+private pure func alias_from_spec(spec: String) -> String:
+	if spec.contains(" as "):
+		spec
+			.after_first(" as ")
+			.trim()
+	else:
+		""
+
+
+private pure func import_directive(
+	module_ref: String,
+	module_alias: String,
+	symbols: List[String],
+) -> ImportDirective:
+	{
+		module_ref = module_ref,
+		module_alias = module_alias,
+		symbols = symbols
+	}
+
+
+private pure func parse_imports(lines: List[String]) -> List[ImportDirective]:
+	var imports: List[ImportDirective] = []
+	var in_import_block: Bool = False
+	var current: Option[CurrentImport] = None
+
+	for line in lines:
+		trimmed: String = line.trim()
+
+		if trimmed == "import:":
+			in_import_block = True
+			current = None
+		else if in_import_block:
+			if trimmed == "":
+				void
+			else if not line.starts_at_top_level():
+				indent: Int = line.count_leading_indent()
+
+				if trimmed.contains(":"):
+					spec: String = trimmed.before_first(":")
+					module_ref: String = spec.module_ref_from_spec()
+					module_alias: String = spec.alias_from_spec()
+					symbols: List[String] = trimmed
+						.after_first(":")
+						.identifiers_in_line()
+					imports = imports.append(import_directive(module_ref, module_alias, symbols))
+					current = Some({
+						module_ref = module_ref,
+						module_alias = module_alias,
+						indent = indent,
+					})
+				else:
+					match current:
+						Some(active):
+							if indent > active.indent:
+								imports = imports.append(
+									import_directive(
+										active.module_ref,
+										active.module_alias,
+										trimmed.identifiers_in_line(),
+									),
+								)
+							else:
+								module_ref: String = trimmed.module_ref_from_spec()
+								module_alias: String = trimmed.alias_from_spec()
+								imports = imports.append(
+									import_directive(
+										module_ref,
+										module_alias,
+										[],
+									),
+								)
+								current = Some({
+									module_ref = module_ref,
+									module_alias = module_alias,
+									indent = indent,
+								})
+						None:
+							module_ref: String = trimmed.module_ref_from_spec()
+							module_alias: String = trimmed.alias_from_spec()
+							imports = imports.append(import_directive(module_ref, module_alias, []))
+							current = Some({
+								module_ref = module_ref,
+								module_alias = module_alias,
+								indent = indent,
+							})
+			else:
+				in_import_block = False
+				current = None
+
+	imports
+
+
+private pure func non_import_code_lines(lines: List[String]) -> List[String]:
+	var code_lines: List[String] = []
+	var in_import_block: Bool = False
+
+	for line in lines:
+		trimmed: String = line.trim()
+
+		if trimmed == "import:":
+			in_import_block = True
+			code_lines = code_lines.append("")
+		else if in_import_block:
+			if trimmed == "":
+				code_lines = code_lines.append("")
+			else if line.starts_at_top_level():
+				in_import_block = False
+				code_lines = code_lines.append(line)
+			else:
+				code_lines = code_lines.append("")
+		else:
+			code_lines = code_lines.append(line)
+
+	code_lines
+
+
+private pure func usage_file(file: BlorpSourceFile) -> UsageFile:
+	lines: List[String] = file.source.sanitize_source()
+	code_lines: List[String] = lines.non_import_code_lines()
+	var identifiers: List[String] = []
+
+	for line in code_lines:
+		identifiers = identifiers.concat(line.identifiers_in_line())
+
+	{
+		path = file.path,
+		imports = lines.parse_imports(),
+		code_identifiers = identifiers,
+		code_text = code_lines.join("\n")
+	}
+
+
+private pure func import_directive_uses_definition(
+	imported: ImportDirective,
+	usage: UsageFile,
+	defn: Definition,
+) -> Bool:
+	if not imported.module_ref.module_ref_matches(defn.module_name):
+		False
+	else:
+		selected_use: Bool = (
+			imported.symbols.contains(defn.name)
+			and usage.code_identifiers.contains(defn.name)
+		)
+
+		qualified_use: Bool = if imported.module_alias == "":
+			False
+		else:
+			qualified_name: String = imported.module_alias + "." + defn.name
+			usage.code_text.contains(qualified_name)
+
+		selected_use or qualified_use
+
+
+private pure func usage_file_uses_definition(usage: UsageFile, defn: Definition) -> Bool:
+	var used: Bool = False
+
+	for imported in usage.imports:
+		if not used and import_directive_uses_definition(imported, usage, defn):
+			used = True
+
+	used
+
+
+private pure func imported_use_count(defn: Definition, usage_files: List[UsageFile]) -> Int:
+	var count: Int = 0
+
+	for usage in usage_files:
+		if usage.usage_file_uses_definition(defn):
+			count += 1
+
+	count
+
+
+private pure func is_entry_definition(defn: Definition) -> Bool:
+	defn.name == "main" or defn.name == "tests"
+
+
+private pure func should_consider_definition(defn: Definition, include_public: Bool) -> Bool:
+	if defn.is_entry_definition():
+		False
+	else:
+		match defn.visibility:
+			PrivateSymbol:
+				True
+			PublicSymbol:
+				include_public
+
+
+private pure func unused_definition_if_any(
+	defn: Definition,
+	reference_counts: Dict[String, Int],
+	include_public: Bool,
+	usage_files: List[UsageFile],
+) -> Option[UnusedDefinition]:
+	if not should_consider_definition(defn, include_public):
+		None
+	else:
+		match defn.visibility:
+			PrivateSymbol:
+				reference_count: Int = reference_counts.get_or(defn.name, 0)
+
+				if reference_count <= 1:
+					Some({
+						definition = defn,
+						reference_count = reference_count,
+					})
+				else:
+					None
+			PublicSymbol:
+				imported_uses: Int = defn.imported_use_count(usage_files)
+
+				if imported_uses == 0:
+					Some({
+						definition = defn,
+						reference_count = imported_uses,
+					})
+				else:
+					None
+
+
+pure func analyze_sources(files: List[BlorpSourceFile], include_public: Bool) -> AnalysisResult:
+	analyze_sources_with_usage(files, files, include_public)
+
+
+pure func analyze_sources_with_usage(
+	files: List[BlorpSourceFile],
+	usage_sources: List[BlorpSourceFile],
+	include_public: Bool,
+) -> AnalysisResult:
+	var all_definitions: List[Definition] = []
+	var all_lines: List[String] = []
+
+	for file in files:
+		lines: List[String] = file.source.sanitize_source()
+		all_lines = all_lines.concat(lines)
+		all_definitions = all_definitions.concat(file.definitions_in_file())
+
+	reference_counts: Dict[String, Int] = all_lines.count_identifier_references()
+	var usage_files: List[UsageFile] = []
+
+	for usage_source in usage_sources:
+		usage_files = usage_files.append(usage_source.usage_file())
+
+	var unused: List[UnusedDefinition] = []
+
+	for defn in all_definitions:
+		match unused_definition_if_any(defn, reference_counts, include_public, usage_files):
+			Some(item):
+				unused = unused.append(item)
+			None:
+				void
+
+	{
+		definitions = all_definitions,
+		unused = unused.sort_by(
+			pure func(
+				item: UnusedDefinition,
+			): item.definition.path + ":" + item.definition.line.to_string(),
+		)
+	}
+
+
+private pure func definition_kind_text(kind: DefinitionKind) -> String:
+	match kind:
+		FunctionDefinition:
+			"function"
+		TypeDefinition:
+			"type"
+		ConstantDefinition:
+			"constant"
+
+
+private pure func visibility_text(visibility: SymbolVisibility) -> String:
+	match visibility:
+		PublicSymbol:
+			"public"
+		PrivateSymbol:
+			"private"
+
+
+pure func format_unused_definition(item: UnusedDefinition) -> String:
+	defn: Definition = item.definition
+
+	count_text: String = match defn.visibility:
+		PublicSymbol:
+			item.reference_count.to_string() + " imported uses"
+		PrivateSymbol:
+			item.reference_count.to_string() + " reference"
+
+	"${defn.path}:${defn.line}: ${defn.visibility.visibility_text()} ${defn.kind.definition_kind_text()} ${defn.name} (${count_text})"
+
+
+pure func format_analysis(root: String, analysis: AnalysisResult) -> String:
+	if analysis.unused.length() == 0:
+		"No unused Blorp definitions found in ${root}."
+	else:
+		var lines: List[String] = ["Unused Blorp definitions in ${root}:"]
+
+		for item in analysis.unused:
+			lines = lines.append(item.format_unused_definition())
+
+		lines.join("\n")
+
+
+private pure func is_blorp_path(path: String) -> Bool:
+	path.ends_with(".brp")
+
+
+func read_blorp_sources(root: String) -> Result[List[BlorpSourceFile], String]:
+	if not root.file_exists():
+		Err("path not found: ${root}")
+	else:
+		paths: List[String] = if root.is_directory():
+			root
+				.walk_dir()
+				.filter(pure func(path: String): path.is_blorp_path())
+				.sort()
+		else if root.is_blorp_path():
+			[root]
+		else:
+			[]
+
+		var files: List[BlorpSourceFile] = []
+		var error: Option[String] = None
+
+		for path in paths:
+			match error:
+				Some(_):
+					void
+				None:
+					match path.read_file():
+						Ok(source):
+							files = files.append({
+								path = path,
+								source = source,
+							})
+						Err(msg):
+							error = Some("failed to read ${path}: ${msg}")
+
+		match error:
+			Some(msg):
+				Err(msg)
+			None:
+				Ok(files)
