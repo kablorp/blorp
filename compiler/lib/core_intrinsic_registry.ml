@@ -27,10 +27,9 @@
        [compiler/blorp/codegen_intrinsic_renderer.brp].
     3. Use it in [core_intrinsics.ml] IR bodies via [intr "name" args ty].
 
-    [core_emit_intrinsic.ml] is retained only for the temporary OCaml bootstrap
-    emitter used while building the Blorp compiler bridge. Do not add new
-    production emission behavior there unless the bridge bootstrap path needs
-    a matching compatibility case.
+    C emission for these intrinsics is owned by the Blorp emitter through the
+    Blorp intrinsic renderer module. Do not add a parallel OCaml emission path
+    for new intrinsic behavior.
 
     {1 How builtin works}
 

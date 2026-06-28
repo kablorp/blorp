@@ -31,11 +31,11 @@ let record_elapsed t phase =
 (** Callback for non-Core compiler phases. *)
 let on_label (t : t) label = record_elapsed t (Label label)
 
-(** Callback compatible with [Core_pipeline.on_stage_callback]. Measures the
-    elapsed time since the previous fire (or [create]) and attributes it
-    to the stage that just completed. Ignores the program payload. *)
-let on_stage (t : t) : Core_stage.t -> Core.core_program -> unit =
- fun stage _prog -> record_elapsed t (Core stage)
+(** Callback compatible with [Core_pipeline.on_stage_event]. Measures the
+    elapsed time since the previous fire (or [create]) and attributes it to the
+    stage that just completed. *)
+let on_stage_event (t : t) : Core_stage.t -> unit =
+ fun stage -> record_elapsed t (Core stage)
 
 let serialize_entry (phase, ms) =
   let kind, label =

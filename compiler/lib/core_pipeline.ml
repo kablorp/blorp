@@ -25,15 +25,17 @@
     14. [Core_consume_specialize] — clone safe self-replacement callees with
        explicit consumed parameters
     15. [Core_perceus] — insert CDup/CDrop for reference counting
-    16. [Core_reuse] — analyze post-Perceus reuse candidates
-    17. [Core_closure] — hoist lambdas and create closure values
-    18. backend handoff — default compilation gives post-closure Core to Blorp
-    19. Blorp-owned final tail — resource cleanup lowering, fairness
-       checkpoints, codegen preparation, and C artifact emission
+    16. backend handoff — default compilation gives post-Perceus Core to Blorp
+    17. Blorp-owned final tail — normal reuse, closure conversion, resource
+       cleanup lowering, fairness checkpoints, codegen preparation, prepared
+       reuse, and C artifact emission
 
-    OCaml can still materialize the old final tail for observability paths
-    ([--dump-core-after=final], [--check-invariants], profiling) because those
-    hooks operate on OCaml [Core.core_program] values.
+    OCaml can still materialize the old final tail for invariant checking and
+    legacy all-stage [Core.core_program] callbacks. CLI late-stage dumps/stops
+    use Blorp Core JSON observation instead. Timing-only observation uses
+    lightweight stage events and does not force that duplicate tail. The OCaml
+    final snapshot does not feed C emission; normal C output always comes from
+    the Blorp post-Perceus handoff.
 
     This module is the single entry point for routing a typed program
     through the Core path instead of the legacy [Codegen.generate]. *)
@@ -62,6 +64,32 @@ type on_stage_callback = Core_stage.t -> Core.core_program -> unit
     caller in [Pipeline] / CLI layer catches the exception. *)
 
 let no_op_on_stage : on_stage_callback = fun _ _ -> ()
+
+type on_stage_event = Core_stage.t -> unit
+(** [on_stage_event] fires once per observed Core stage without a program
+    payload. It is for consumers such as timing/profiling that do not need to
+    force a Core snapshot. In particular, event-only observation should not
+    materialize the duplicate OCaml final tail while Blorp owns production
+    backend emission. *)
+
+let no_op_on_stage_event : on_stage_event = fun _ -> ()
+
+type on_stage_json_callback = Core_stage.t -> string -> unit
+(** [on_stage_json_callback] fires for Blorp-owned stages whose authoritative
+    state is only available as bridge JSON. This lets CLI dump/stop observe
+    late backend stages without decoding the JSON back into duplicate OCaml Core
+    values. *)
+
+let no_op_on_stage_json : on_stage_json_callback = fun _ _ -> ()
+
+type program_observation =
+  | ObserveAllProgramStages
+  | ObservePreBackendProgramStages
+(** Program-bearing observation scope. Full observation is the conservative
+    default for API callers. CLI paths that only dump or stop before the backend
+    handoff, or that observe late stages through [on_stage_json], can choose
+    [ObservePreBackendProgramStages] so they do not force the duplicate OCaml
+    final tail. *)
 
 (** Stages that transform Core after the initial lowering snapshot. [Lower]
     and [Final] are observations, not transformations, so they are kept out
@@ -92,6 +120,40 @@ let transform_stage_order =
 let observed_stage_order =
   (Core_stage.Lower :: transform_stage_order) @ [ Core_stage.Final ]
 
+let stage_requires_final_tail_program = function
+  | Core_stage.Reuse | Core_stage.Closure | Core_stage.Final -> true
+  | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
+  | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
+  | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
+  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce
+  | Core_stage.ConsumeSpecialize | Core_stage.Perceus ->
+      false
+
+let pre_backend_program_stage_order =
+  List.filter
+    (fun stage -> not (stage_requires_final_tail_program stage))
+    observed_stage_order
+
+(** Program-free stage events do not materialize the old OCaml final-tail
+    snapshots. Reuse and closure are inside the Blorp-owned backend tail on this
+    path, so they are represented by the single [Final] event instead of
+    separate OCaml program observations. *)
+let program_free_stage_event_order =
+  pre_backend_program_stage_order @ [ Core_stage.Final ]
+
+let blorp_tail_stage_name = function
+  | (Core_stage.Reuse | Core_stage.Closure | Core_stage.Final) as stage ->
+      Some (Core_stage.to_string stage)
+  | Core_stage.Lower | Core_stage.Debug | Core_stage.Desugar | Core_stage.Mono
+  | Core_stage.Synth | Core_stage.Match | Core_stage.TraitResolve
+  | Core_stage.Resolve | Core_stage.StdInline | Core_stage.Tailrec
+  | Core_stage.Fusion | Core_stage.Specialize | Core_stage.Dce
+  | Core_stage.ConsumeSpecialize | Core_stage.Perceus ->
+      None
+
+let core_stage_list_contains target =
+  List.exists (fun stage -> stage = target)
+
 (** Critical safety checks that should never be allowed to reach emission,
     even when development invariant checking is disabled. Keep this list
     deliberately small: broad invariant coverage still belongs behind
@@ -114,7 +176,7 @@ let fire_stage ~(check_invariants : bool) ~(user : on_stage_callback)
 (** Compose the user's [on_stage] with invariant checking. Invariant checks
     run {b before} the user callback so violations surface first — otherwise
     [--stop-after=STAGE] (raised from the user callback) would mask any
-    post-stage invariant failure. For dump/profile purposes the program is
+    post-stage invariant failure. For dump/stop purposes the program is
     identical before and after the check — the check is a pure fold.
 
     If invariants fire, the user callback never runs. Development checks run
@@ -125,46 +187,71 @@ let make_stage_hook ~(check_invariants : bool) ~(user : on_stage_callback) :
     on_stage_callback =
  fun stage prog -> fire_stage ~check_invariants ~user stage prog
 
+let post_perceus_program_json ~reg program =
+  match Core_emit_blorp_c.program_json ~reg program with
+  | Ok json -> json
+  | Error error -> failwith (Core_emit_blorp_c.unsupported_to_string error)
+
+let observe_blorp_tail_json ~reg ~(on_stage_event : on_stage_event)
+    ~(on_stage_json : on_stage_json_callback) ~(stages : Core_stage.t list)
+    (post_perceus : Core.core_program) =
+  match stages with
+  | [] -> ()
+  | _ :: _ ->
+      let core_json = post_perceus_program_json ~reg post_perceus in
+      List.iter
+        (fun stage ->
+          match blorp_tail_stage_name stage with
+          | Some stage_name ->
+              let transformed =
+                Compiler_blorp_bridge.run_core_pipeline_core_json_exn
+                  ~stage:stage_name core_json
+                |> Lsp_json.to_string
+              in
+              on_stage_event stage;
+              on_stage_json stage transformed
+          | None -> ())
+        stages
+
 type backend_core_input = {
   blorp_tail_input : Core.core_program;
-      (** Post-closure Core handed to Blorp for resource/fairness/prepare,
-          prepared reuse, and emission on the default path. *)
+      (** Post-Perceus Core handed to Blorp for reuse/closure/resource/fairness/
+          prepare/prepared-reuse/emission on the default path. *)
   ocaml_final_for_observability : Core.core_program Lazy.t;
-      (** Lazy OCaml-final Core kept only for final-stage dumps, invariant
-          checks, profiling, and renderer-helper bootstrap. *)
+      (** Lazy OCaml-final Core kept only for invariant checks and legacy
+          all-stage program-bearing observability. CLI late-stage dumps/stops
+          use Blorp JSON observation instead. *)
 }
 
 (** Run C emission through the single Blorp backend path. Normal compilation
-    hands off before the final tail so Blorp owns resource/fairness/prepare.
-    Observability paths can still materialize OCaml-final Core because stage
-    hooks operate on [Core.core_program] values inside OCaml. *)
+    hands off before the final tail so Blorp owns reuse/closure/resource/
+    fairness/prepare.
+    Legacy observability paths can still materialize OCaml-final Core because
+    stage hooks operate on [Core.core_program] values inside OCaml, but that
+    snapshot no longer selects a separate prepared-Core emission bridge action.
+    New late-stage CLI observation uses [on_stage_json] over the Blorp tail. *)
 let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
-    ~(reg : Codegen_types.registry) ~(needs_ocaml_final : bool)
+    ~(reg : Codegen_types.registry) ~(needs_final_program_observation : bool)
+    ~(on_stage_event : on_stage_event)
+    ~(on_stage_json : on_stage_json_callback)
+    ~(tail_observation_stages : Core_stage.t list)
     (backend_input : backend_core_input) : string =
-  let building_blorp_renderer_bridge =
-    Sys.getenv_opt "BLORP_COMPILER_RENDERER_HELPER" = Some "1"
-  in
   let final () = Lazy.force backend_input.ocaml_final_for_observability in
-  let emit_with_ocaml_backend () =
-    let ctx = Core_emit_context.create ~profile ~reg () in
-    Core_emit.emit_program ~embed_runtime ctx (final ());
-    Buffer.contents ctx.output
+  observe_blorp_tail_json ~reg ~on_stage_event ~on_stage_json
+    ~stages:tail_observation_stages backend_input.blorp_tail_input;
+  if needs_final_program_observation then ignore (final ());
+  let cfg =
+    Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile ~reg ()
   in
-  if building_blorp_renderer_bridge then emit_with_ocaml_backend ()
-  else
-    let cfg =
-      Core_emit_blorp_c.config_with_embed ~embed_runtime ~profile ~reg ()
-    in
-    let result =
-      if needs_ocaml_final then
-        Core_emit_blorp_c.try_emit_prepared_program_string cfg (final ())
-      else
-        Core_emit_blorp_c.try_emit_post_closure_program_string cfg
-          backend_input.blorp_tail_input
-    in
-    match result with
-    | Ok c_code -> c_code
-    | Error reason -> failwith reason
+  let result =
+    Core_emit_blorp_c.try_emit_post_closure_program_string cfg
+      backend_input.blorp_tail_input
+  in
+  if
+    (not needs_final_program_observation)
+    && not (core_stage_list_contains Core_stage.Final tail_observation_stages)
+  then on_stage_event Core_stage.Final;
+  match result with Ok c_code -> c_code | Error reason -> failwith reason
 
 (** Run the shared Core-to-Core pass chain starting from an already-lowered
     [core_program]. [compile] and [compile_with_modules] differ in how they
@@ -173,14 +260,15 @@ let emit_via_c_backend ~(embed_runtime : bool) ~(profile : bool)
     place prevents stage drift between the two entry points. *)
 let run_core_passes ?(import_aliases = Hashtbl.create 0)
     ?(module_imports = Hashtbl.create 0) ~(on_stage : on_stage_callback)
-    ~(reg : Codegen_types.registry) ?(debug = false) (prog : Core.core_program)
-    : backend_core_input =
+    ?(on_stage_event = no_op_on_stage_event) ~(reg : Codegen_types.registry)
+    ?(debug = false) (prog : Core.core_program) : backend_core_input =
   let observe stage prog =
+    on_stage_event stage;
     on_stage stage prog;
     prog
   in
   let run_stage stage pass prog = pass prog |> observe stage in
-  let pre_closure =
+  let post_perceus =
     prog |> observe Core_stage.Lower
     |> run_stage Core_stage.Debug (Core_debug.lower_program ~enabled:debug)
     |> run_stage Core_stage.Desugar (fun p ->
@@ -212,30 +300,43 @@ let run_core_passes ?(import_aliases = Hashtbl.create 0)
     |> run_stage Core_stage.ConsumeSpecialize
          (Core_consume_specialize.rewrite_program ~reg)
     |> run_stage Core_stage.Perceus Core_perceus.insert_drops_program
-    |> run_stage Core_stage.Reuse (Core_reuse.rewrite_program ~reg)
   in
-  let pre_resource =
-    pre_closure
-    |> run_stage Core_stage.Closure
-         (Core_closure.convert_program ~wrap_function_refs:false)
+  let pre_resource_for_observability =
+    lazy
+      (post_perceus
+       |> run_stage Core_stage.Reuse (Core_reuse.rewrite_program ~reg)
+       |> run_stage Core_stage.Closure
+            (Core_closure.convert_program ~wrap_function_refs:false))
   in
   let final =
     lazy
       (let pre_fairness =
-         Core_resource.rewrite_nonlocal_exits_program pre_resource
+         Core_resource.rewrite_nonlocal_exits_program
+           (Lazy.force pre_resource_for_observability)
        in
        pre_fairness |> Core_fairness.insert_program_checkpoints
        |> Core_codegen_prepare.prepare_program ~reg
        |> Core_reuse.rewrite_prepared_program ~reg
        |> observe Core_stage.Final)
   in
-  { blorp_tail_input = pre_resource; ocaml_final_for_observability = final }
+  { blorp_tail_input = post_perceus; ocaml_final_for_observability = final }
 
 let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
-    ?on_stage ?(check_invariants = false) (typed_program : Typed_ast.program) :
-    string =
+    ?on_stage ?(on_stage_event = no_op_on_stage_event)
+    ?(on_stage_json = no_op_on_stage_json) ?(tail_observation_stages = [])
+    ?(program_observation = ObserveAllProgramStages)
+    ?(check_invariants = false) (typed_program : Typed_ast.program) : string =
   let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
-  let needs_ocaml_final = Option.is_some on_stage || check_invariants in
+  let needs_final_program_observation =
+    check_invariants
+    ||
+    match on_stage with
+    | None -> false
+    | Some _ -> (
+        match program_observation with
+        | ObserveAllProgramStages -> true
+        | ObservePreBackendProgramStages -> false)
+  in
   let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
   Session.reset_core_counters (Session.current ());
   let core_prog = Core_lower.lower_typed_program typed_program in
@@ -247,9 +348,12 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
   Core_flatten.register_types reg core_prog;
   let core_prog = Core_ffi_boundary.annotate_program ~reg core_prog in
   let core_prog = Core_list_layout.annotate_program ~reg core_prog in
-  let backend_input = run_core_passes ~on_stage ~reg ~debug core_prog in
-  emit_via_c_backend ~embed_runtime ~profile ~reg ~needs_ocaml_final
-    backend_input
+  let backend_input =
+    run_core_passes ~on_stage ~on_stage_event ~reg ~debug core_prog
+  in
+  emit_via_c_backend ~embed_runtime ~profile ~reg
+    ~needs_final_program_observation ~on_stage_event ~on_stage_json
+    ~tail_observation_stages backend_input
 
 (** Compile a typed AST program with module support.
 
@@ -261,10 +365,22 @@ let compile_typed ?(embed_runtime = false) ?(profile = false) ?(debug = false)
     Returns [(c_code, link_flags, include_dirs)]. *)
 let compile_typed_with_modules ?(main_import_bindings = [])
     ?(embed_runtime = true) ?(profile = false) ?(debug = false) ?on_stage
+    ?(on_stage_event = no_op_on_stage_event)
+    ?(on_stage_json = no_op_on_stage_json) ?(tail_observation_stages = [])
+    ?(program_observation = ObserveAllProgramStages)
     ?(check_invariants = false) (typed_main : Typed_ast.program) :
     string * string list * string list =
   let user_on_stage = Option.value ~default:no_op_on_stage on_stage in
-  let needs_ocaml_final = Option.is_some on_stage || check_invariants in
+  let needs_final_program_observation =
+    check_invariants
+    ||
+    match on_stage with
+    | None -> false
+    | Some _ -> (
+        match program_observation with
+        | ObserveAllProgramStages -> true
+        | ObservePreBackendProgramStages -> false)
+  in
   let on_stage = make_stage_hook ~check_invariants ~user:user_on_stage in
   let program = Typed_ast.program_ast typed_main in
   Session.reset_core_counters (Session.current ());
@@ -339,11 +455,13 @@ let compile_typed_with_modules ?(main_import_bindings = [])
   let full = Core_ffi_boundary.annotate_program ~reg full in
   let full = Core_list_layout.annotate_program ~reg full in
   let backend_input =
-    run_core_passes ~on_stage ~reg ~import_aliases ~module_imports ~debug full
+    run_core_passes ~on_stage ~on_stage_event ~reg ~import_aliases
+      ~module_imports ~debug full
   in
   let output =
-    emit_via_c_backend ~embed_runtime ~profile ~reg ~needs_ocaml_final
-      backend_input
+    emit_via_c_backend ~embed_runtime ~profile ~reg
+      ~needs_final_program_observation ~on_stage_event ~on_stage_json
+      ~tail_observation_stages backend_input
   in
   (* Foreign metadata is pulled from the lowered program rather than the
      loaded-module AST so main-program FFI declarations are included too. *)

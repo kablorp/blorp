@@ -2,7 +2,7 @@
     replace use sites with [CClosureCreate] nodes.
 
     Runs after Perceus (which needs [CLambda] structure for capture
-    use counting) and before Core_emit.
+    use counting) and before backend handoff.
 
     Each [CLambda] is transformed into:
     1. A hoisted [CDFunc] with [cf_closure_abi = Some _] and a void*
@@ -109,8 +109,8 @@ let function_ref_target (state : state) (v : var) : function_ref_target option =
     constructor names and global function names. Returns a sorted
     list of (name, type) pairs.
 
-    This is the same logic as [Core_emit.collect_free_vars_filtered]
-    but operates on [core] directly without emission context. *)
+    This mirrors the remaining late-backend free-var helper but operates on
+    [core] directly without emission context. *)
 let collect_free_vars_filtered (state : state) ~(capturable : StringSet.t)
     (body : core) (params : (var * Ast.type_expr) list) :
     (string * Ast.type_expr) list =

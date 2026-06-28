@@ -5,8 +5,8 @@
     into [CCast] nodes or concrete builtin names based on the argument
     type.
 
-    This keeps [Core_emit] free of type dispatch — it just emits
-    [CCast] as a C cast and [CKBuiltin] calls by their resolved name. *)
+    This keeps the backend free of type dispatch: [CCast] reaches emission as
+    a C cast, and [CKBuiltin] calls already carry their resolved names. *)
 
 open Core
 

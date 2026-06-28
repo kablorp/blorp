@@ -1,7 +1,7 @@
 (** Final Core preparation.
 
-    This pass moves representation decisions that used to live in
-    [Core_emit] into explicit Core nodes. After this pass, collection
+    This pass moves representation decisions that used to live in the
+    legacy C emitter into explicit Core nodes. After this pass, collection
     constructors, record constructors, union constructors, and boxed storage
     operations carry the layout/ownership facts the C emitter needs. *)
 

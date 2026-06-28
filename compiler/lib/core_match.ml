@@ -26,10 +26,9 @@
 
     A source-level shape that reaches [AKUnsupported] leaves the original
     [CMatchArms] in the Core program. There is no raw-match emitter:
-    [Core_invariants.check_no_cmatcharms] fires at the Match stage and
-    [Core_emit] raises [Core_error.Emit] if a [CMatchArms] reaches it. A
-    fallthrough means [classify_arms]/[compile_arms] needs the missing arm
-    shape.
+    [Core_invariants.check_no_cmatcharms] fires at the Match stage before
+    backend handoff. A fallthrough means [classify_arms]/[compile_arms] needs
+    the missing arm shape.
 
     {1 Non-goals (current)}
 

@@ -514,8 +514,9 @@ let typecheck_module_only ~filename ~source =
     precompiled runtime object. *)
 let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
     ?retain_debug_blocks ?(embed_runtime = true) ?(require_main = false)
-    ?(profile = false) ?on_frontend_phase ?on_stage ?(check_invariants = false)
-    ~filename ~source () =
+    ?(profile = false) ?on_frontend_phase ?on_stage ?on_stage_event
+    ?on_stage_json ?tail_observation_stages ?program_observation
+    ?(check_invariants = false) ~filename ~source () =
   let allow_debug_only_calls =
     Option.value allow_debug_only_calls ~default:debug
   in
@@ -556,19 +557,14 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
                 else
                   try
                     let c_code, link_flags, include_dirs =
-                      match on_stage with
-                      | Some cb ->
-                          Core_pipeline.compile_typed_with_modules
-                            ~main_import_bindings:
-                              (List.rev main_state.Typecheck.import_bindings)
-                            ~embed_runtime ~profile ~debug:retain_debug_blocks
-                            ~on_stage:cb ~check_invariants typed_program
-                      | None ->
-                          Core_pipeline.compile_typed_with_modules
-                            ~main_import_bindings:
-                              (List.rev main_state.Typecheck.import_bindings)
-                            ~embed_runtime ~profile ~debug:retain_debug_blocks
-                            ~check_invariants typed_program
+                      Core_pipeline.compile_typed_with_modules
+                        ~main_import_bindings:
+                          (List.rev main_state.Typecheck.import_bindings)
+                        ~embed_runtime ~profile ~debug:retain_debug_blocks
+                        ?on_stage ?on_stage_event ?on_stage_json
+                        ?tail_observation_stages ?program_observation
+                        ~check_invariants
+                        typed_program
                     in
                     Ok
                       (Compiled
@@ -618,11 +614,14 @@ let compile_impl ~source_kind ?(debug = false) ?allow_debug_only_calls
                         ])))
 
 let compile ?debug ?allow_debug_only_calls ?retain_debug_blocks ?embed_runtime
-    ?require_main ?profile ?on_frontend_phase ?on_stage ?check_invariants
-    ~filename ~source () =
+    ?require_main ?profile ?on_frontend_phase ?on_stage ?on_stage_event
+    ?on_stage_json ?tail_observation_stages ?program_observation
+    ?check_invariants ~filename ~source () =
   compile_impl ~source_kind:User_source ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ?require_main ?profile
-    ?on_frontend_phase ?on_stage ?check_invariants ~filename ~source ()
+    ?on_frontend_phase ?on_stage ?on_stage_event ?on_stage_json
+    ?tail_observation_stages ?program_observation ?check_invariants ~filename
+    ~source ()
 
 let compile_generated_test_harness ?debug ?allow_debug_only_calls
     ?retain_debug_blocks ?embed_runtime ~filename ~source () =

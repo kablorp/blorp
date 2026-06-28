@@ -686,7 +686,7 @@ let list_callback_result_encoding_arg (layout : Core.list_storage_layout) :
 let list_parallel_runtime_layout_args ~reg ~result_ty ~loc =
   let layout = Core_layout_type.list_storage_layout_of_type ~reg result_ty loc in
   let storage_mode, elem_size =
-    Core_emit_blorp_prepared_backend.list_runtime_storage_args layout
+    Core_emit_layout.list_runtime_storage_args layout
   in
   (storage_mode, elem_size, list_callback_result_encoding_arg layout)
 
@@ -901,6 +901,31 @@ let constructor_c_name_for_type constructor_symbols ty (variable : Core.var) =
         constructor_symbols
   | _ -> None
 
+let is_option_none_constructor ty (variable : Core.var) =
+  match Codegen_types.normalize_type ty with
+  | Ast.TyNamed ("Option", [ _ ]) when String.equal variable.vname "None" ->
+      true
+  | _ -> false
+
+let is_stack_option_none_constructor ~reg ty variable =
+  is_option_none_constructor ty variable
+  && Core_layout_type.is_stack_option_type ~reg ty
+
+let is_singleton_constructor_value constructor_symbols ty variable =
+  if is_option_none_constructor ty variable then true
+  else
+    match constructor_c_name_for_type constructor_symbols ty variable with
+    | Some _ -> true
+    | None -> false
+
+let retain_policy_json_for_var ~reg constructor_symbols ty variable =
+  if is_singleton_constructor_value constructor_symbols ty variable then str "none"
+  else retain_policy_json ~reg ty
+
+let release_policy_json_for_var ~reg constructor_symbols ty variable =
+  if is_singleton_constructor_value constructor_symbols ty variable then str "none"
+  else release_policy_json ~reg ty
+
 let nullable_option_constructor_c_name ~reg ty (variable : Core.var) =
   match Codegen_types.normalize_type ty with
   | Ast.TyNamed ("Option", [ _ ])
@@ -909,31 +934,17 @@ let nullable_option_constructor_c_name ~reg ty (variable : Core.var) =
       Some "NULL"
   | _ -> None
 
-let stack_option_constructor_c_name ~reg ty (variable : Core.var) =
-  match Codegen_types.normalize_type ty with
-  | Ast.TyNamed ("Option", [ _ ])
-    when Core_layout_type.is_stack_option_type ~reg ty
-         && String.equal variable.vname "None" -> (
-      match Core_layout_type.stack_option_c_type ~reg ty with
-      | Some option_type ->
-          Some
-            (Printf.sprintf "((%s){ .tag = BLORP_TAG_NONE, .value = %s })"
-               option_type
-               (Core_layout_type.stack_option_none_value_for_type ~reg ty))
-      | None -> None)
-  | _ -> None
-
 let var_json_for_expr ~reg constructor_symbols ty (variable : Core.var) =
   let name =
-    match stack_option_constructor_c_name ~reg ty variable with
-    | Some c_name -> c_name
-    | None -> (
-        match nullable_option_constructor_c_name ~reg ty variable with
-        | Some c_name -> c_name
-        | None -> (
-            match constructor_c_name_for_type constructor_symbols ty variable with
-            | Some c_name -> c_name
-            | None -> Core.Var.to_c_name variable))
+    if is_stack_option_none_constructor ~reg ty variable then
+      Core.Var.to_c_name variable
+    else
+      match nullable_option_constructor_c_name ~reg ty variable with
+      | Some c_name -> c_name
+      | None -> (
+          match constructor_c_name_for_type constructor_symbols ty variable with
+          | Some c_name -> c_name
+          | None -> Core.Var.to_c_name variable)
   in
   obj
     [
@@ -1900,7 +1911,7 @@ let fallible_stream_terminal_payload_json ~reg loc ok_ty
         Core_layout_type.list_storage_layout_of_type ~reg ok_ty loc
       in
       let storage_mode, elem_size =
-        Core_emit_blorp_prepared_backend.list_runtime_storage_args layout
+        Core_emit_layout.list_runtime_storage_args layout
       in
       Ok (kind "list" [ ("storage_mode", str storage_mode); ("elem_size", str elem_size) ])
   | Operation_result_metadata.StreamPayloadErased -> Ok (kind "erased" [])
@@ -2107,15 +2118,44 @@ let tensor_parallel_layout_json ~reg ~loc ty =
     ->
       kind "pointer" []
 
-let function_param_is_dropped (body : Core.core) (param : Core.core_param) =
+let consumed_args_for_user_call consumed_params def_id =
+  match def_id with
+  | Some id -> Option.value ~default:[] (List.assoc_opt id consumed_params)
+  | None -> []
+
+let same_var_name (left : Core.var) (right : Core.var) =
+  String.equal left.vname right.vname
+
+let expr_is_param_ref (param : Core.core_param) (expr : Core.core) =
+  match expr.Core.desc with
+  | Core.CVar candidate -> same_var_name candidate param.cp_name
+  | _ -> false
+
+let call_consumes_param consumed_params (param : Core.core_param)
+    (kind : Core.call_kind) args =
+  match kind with
+  | Core.CKUser (_name, def_id) ->
+      consumed_args_for_user_call consumed_params def_id
+      |> List.exists (fun index ->
+             match List.nth_opt args index with
+             | Some arg -> expr_is_param_ref param arg
+             | None -> false)
+  | Core.CKUnknown | Core.CKSelectedDirect _ | Core.CKForeign _ | Core.CKBuiltin _
+  | Core.CKClosure | Core.CKIntrinsic _ ->
+      false
+
+let function_param_is_consumed consumed_params (body : Core.core)
+    (param : Core.core_param) =
   Core.exists_tree
     (fun expr ->
       match expr.Core.desc with
-      | Core.CDrop (dropped, _ty, _body) -> Core.Var.equal dropped param.cp_name
+      | Core.CDrop (dropped, _ty, _body) -> same_var_name dropped param.cp_name
+      | Core.CCall (kind, _callee, args) ->
+          call_consumes_param consumed_params param kind args
       | _ -> false)
     body
 
-let consumed_param_indices_for_function (func : Core.core_func) =
+let consumed_param_indices_for_function consumed_params (func : Core.core_func) =
   match func.cf_body with
   | None -> []
   | Some body ->
@@ -2123,17 +2163,19 @@ let consumed_param_indices_for_function (func : Core.core_func) =
         | [] -> List.rev acc
         | param :: rest ->
             let acc =
-              if function_param_is_dropped body param then index :: acc else acc
+              if function_param_is_consumed consumed_params body param then
+                index :: acc
+              else acc
             in
             collect (index + 1) acc rest
       in
       collect 0 [] func.cf_params
 
-let collect_consumed_param_indices program =
+let collect_consumed_param_indices_once consumed_params program =
   let rec collect_decl acc (decl : Core.core_decl) =
     match decl.cd_desc with
     | Core.CDFunc func ->
-        let consumed = consumed_param_indices_for_function func in
+        let consumed = consumed_param_indices_for_function consumed_params func in
         if consumed = [] then acc else (func.cf_def_id, consumed) :: acc
     | Core.CDPrivate inner -> collect_decl acc inner
     | Core.CDVar _ | Core.CDImpl _ | Core.CDTrait _ | Core.CDType _
@@ -2142,10 +2184,35 @@ let collect_consumed_param_indices program =
   in
   List.fold_left collect_decl [] program
 
-let consumed_args_for_user_call consumed_params def_id =
-  match def_id with
-  | Some id -> Option.value ~default:[] (List.assoc_opt id consumed_params)
-  | None -> []
+let normalize_consumed_param_indices consumed_params =
+  consumed_params
+  |> List.map (fun (def_id, indices) ->
+         (def_id, List.sort_uniq Int.compare indices))
+  |> List.sort (fun (left_id, _) (right_id, _) ->
+         Int.compare left_id right_id)
+
+let merge_consumed_param_indices existing discovered =
+  let add_entry acc (def_id, indices) =
+    let previous = Option.value ~default:[] (List.assoc_opt def_id acc) in
+    let merged_indices = previous @ indices |> List.sort_uniq Int.compare in
+    (def_id, merged_indices)
+    :: List.filter (fun (existing_id, _) -> existing_id <> def_id) acc
+  in
+  List.fold_left add_entry existing discovered
+  |> normalize_consumed_param_indices
+
+let collect_consumed_param_indices program =
+  let rec fixed_point remaining consumed_params =
+    if remaining <= 0 then consumed_params
+    else
+      let discovered =
+        collect_consumed_param_indices_once consumed_params program
+      in
+      let next = merge_consumed_param_indices consumed_params discovered in
+      if next = consumed_params then consumed_params
+      else fixed_point (remaining - 1) next
+  in
+  fixed_point (List.length program + 1) []
 
 let call_kind_json ~consumed_params ~reg path ~result_ty ~loc
     (call_kind : Core.call_kind) =
@@ -2282,10 +2349,9 @@ let binop_tag = function
 let unop_tag = function Ast.Neg -> "negate" | Ast.Not -> "not"
 let logop_tag = function Ast.And -> "and" | Ast.Or -> "or"
 
-let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
-    ~reg enum_names value_record_names heap_record_names union_names enum_constructors
-    path (expr : Core.core) =
-  let expr_json = expr_json ~function_names ~consumed_params in
+let rec expr_json ~function_names ~consumed_params ~reg enum_names
+    value_record_names heap_record_names union_names enum_constructors path
+    (expr : Core.core) =
   let loc = source_loc_json expr.loc in
   let typed fields =
     let* typ =
@@ -2297,13 +2363,13 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   let literal_match_fallback_json (match_scrutinee : Core.core) path = function
     | Core.CTLeaf { ct_bindings = []; ct_body } ->
         let* body =
-          expr_json ~reg enum_names value_record_names heap_record_names union_names
+          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
             enum_constructors (path ^ ".body") ct_body
         in
         Ok (kind "body" [ ("body", body) ])
     | Core.CTLeaf { ct_bindings; ct_body } ->
         let* body =
-          expr_json ~reg enum_names value_record_names heap_record_names union_names
+          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
             enum_constructors (path ^ ".body") ct_body
         in
         let var_types = Core_emit_util.collect_var_types ct_body in
@@ -2318,14 +2384,14 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
     | Core.CTSwitchLit _ as subtree ->
         let nested_match = { expr with desc = Core.CMatch (match_scrutinee, subtree) } in
         let* body =
-          expr_json ~reg enum_names value_record_names heap_record_names
+          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
             union_names enum_constructors path nested_match
         in
         Ok (kind "body" [ ("body", body) ])
     | Core.CTSwitchLen _ as subtree ->
         let nested_match = { expr with desc = Core.CMatch (match_scrutinee, subtree) } in
         let* body =
-          expr_json ~reg enum_names value_record_names heap_record_names
+          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
             union_names enum_constructors path nested_match
         in
         Ok (kind "body" [ ("body", body) ])
@@ -2352,7 +2418,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       Ok (kind "cooperative_checkpoint" fields)
   | Core.CCall (Core.CKIntrinsic "list_retain_for", _callee, [ lst; value ]) ->
       let* retain =
-        list_retain_json ~reg enum_names value_record_names heap_record_names union_names
+        list_retain_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".retain") lst value
       in
       let* fields = typed [ ("retain", retain) ] in
@@ -2365,7 +2431,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         Core_layout_type.list_storage_layout_of_type ~reg lst.ty lst.loc
       in
       let* set =
-        list_set_json ~reg enum_names value_record_names heap_record_names union_names
+        list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".set") layout lst index value
       in
       let* fields = typed [ ("set", set) ] in
@@ -2377,7 +2443,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         Core_layout_type.list_storage_layout_of_type ~reg lst.ty lst.loc
       in
       let* set =
-        list_set_json ~reg enum_names value_record_names heap_record_names union_names
+        list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".set") layout lst index value
       in
       let* fields = typed [ ("set", set) ] in
@@ -2387,7 +2453,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         Core_layout_type.list_storage_layout_of_type ~reg lst.ty lst.loc
       in
       let* swap =
-        list_swap_json ~reg enum_names value_record_names heap_record_names
+        list_swap_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
           union_names enum_constructors (path ^ ".swap") layout lst i j
       in
       let* fields = typed [ ("swap", swap) ] in
@@ -2397,7 +2463,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         _callee,
         [ result; out_index; source; source_index ] ) ->
       let* slot =
-        list_handoff_set_source_slot_json ~reg enum_names value_record_names
+        list_handoff_set_source_slot_json ~function_names ~consumed_params ~reg enum_names value_record_names
           heap_record_names union_names enum_constructors (path ^ ".slot")
           result out_index source source_index
       in
@@ -2413,7 +2479,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         }
       in
       let* read_json =
-        string_byte_read_json ~reg enum_names value_record_names
+        string_byte_read_json ~function_names ~consumed_params ~reg enum_names value_record_names
           heap_record_names union_names enum_constructors (path ^ ".read") read
       in
       let* fields = typed [ ("read", read_json) ] in
@@ -2429,7 +2495,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         }
       in
       let* write_json =
-        string_byte_write_json ~reg enum_names value_record_names
+        string_byte_write_json ~function_names ~consumed_params ~reg enum_names value_record_names
           heap_record_names union_names enum_constructors (path ^ ".write")
           write
       in
@@ -2450,7 +2516,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         }
       in
       let* copy_json =
-        string_byte_copy_json ~reg enum_names value_record_names heap_record_names
+        string_byte_copy_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
           union_names enum_constructors (path ^ ".copy") copy
       in
       let* fields = typed [ ("copy", copy_json) ] in
@@ -2464,7 +2530,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         }
       in
       let* set_len_json =
-        string_set_len_json ~reg enum_names value_record_names heap_record_names
+        string_set_len_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
           union_names enum_constructors (path ^ ".set_len") set_len
       in
       let* fields = typed [ ("set_len", set_len_json) ] in
@@ -2478,7 +2544,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       in
       let alloc = { Core.la_layout = layout; la_capacity = capacity } in
       let* alloc_json =
-        list_alloc_json ~reg enum_names value_record_names heap_record_names union_names
+        list_alloc_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".alloc") expr.loc alloc
       in
       let* fields = typed [ ("alloc", alloc_json) ] in
@@ -2494,7 +2560,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         }
       in
       let* get_json =
-        list_get_json ~reg enum_names value_record_names heap_record_names union_names
+        list_get_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".get") get
       in
       let* fields = typed [ ("get", get_json) ] in
@@ -2511,7 +2577,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         }
       in
       let* get_json =
-        list_get_json ~reg enum_names value_record_names heap_record_names union_names
+        list_get_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".get") get
       in
       let* fields = typed [ ("get", get_json) ] in
@@ -2525,7 +2591,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       match layout.tsl_slots with
       | Core.TensorRawScalarStorage raw_kind ->
           let* fill =
-            tensor_raw_fill_json ~reg enum_names value_record_names
+            tensor_raw_fill_json ~function_names ~consumed_params ~reg enum_names value_record_names
               heap_record_names union_names enum_constructors
               (path ^ ".fill") raw_kind value dims
           in
@@ -2539,11 +2605,11 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   | Core.CCall (Core.CKIntrinsic "tensor_alloc", callee, [ size ]) ->
       let* builtin_name = tensor_alloc_runtime_builtin ~reg path expr in
       let* callee_json =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".callee") callee
       in
       let* size_json =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".args[0]") size
       in
       let* fields =
@@ -2574,7 +2640,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
             }
           in
           let* construct_json =
-            dict_construct_json ~reg enum_names value_record_names
+            dict_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names
               heap_record_names union_names enum_constructors
               (path ^ ".construct") expr.loc construct
           in
@@ -2602,12 +2668,12 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           args
       in
       let* callee_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".callee") callee
       in
       let* args_value =
         result_list args (fun index arg ->
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors
               (Printf.sprintf "%s.args[%d]" path index)
               arg)
@@ -2626,11 +2692,11 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       | Error reason -> unsupported path reason
       | Ok op_tag ->
           let* left_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".left") left
           in
           let* right_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".right") right
           in
           let* fields =
@@ -2642,7 +2708,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           Ok (kind "binary" fields))
   | Core.CUn (op, inner) ->
       let* inner_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".expr") inner
       in
       let* fields =
@@ -2651,11 +2717,11 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       Ok (kind "unary" fields)
   | Core.CLog (op, left, right) ->
       let* left_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".left") left
       in
       let* right_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".right") right
       in
       let* fields =
@@ -2669,14 +2735,14 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       Ok (kind "logical" fields)
   | Core.CAssign (variable, rhs) ->
       let* rhs_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".rhs") rhs
       in
       let* fields = typed [ ("var", var_json variable); ("rhs", rhs_value) ] in
       Ok (kind "assign" fields)
   | Core.CCast (inner, target_ty) ->
       let* inner_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".expr") inner
       in
       let* typ =
@@ -2695,7 +2761,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       | Ast.TyRange _
         when String.equal field_name "start" || String.equal field_name "end" ->
           let* inner_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".expr") inner
           in
           let* fields =
@@ -2705,7 +2771,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       | Ast.TyRange _ -> unsupported path ("unknown range field " ^ field_name)
       | Ast.TyNamed (name, []) when StringSet.mem name value_record_names ->
           let* inner_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".expr") inner
           in
           let* fields =
@@ -2714,7 +2780,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           Ok (kind "field" fields)
       | Ast.TyNamed (name, []) when StringSet.mem name heap_record_names ->
           let* inner_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".expr") inner
           in
           let* fields =
@@ -2725,7 +2791,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           match expr.ty with
           | Ast.TyFunc _ ->
               let* inner_value =
-                expr_json ~reg enum_names value_record_names heap_record_names
+                expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                   union_names enum_constructors (path ^ ".expr") inner
               in
               let* fields =
@@ -2763,7 +2829,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
 	                 (Types.type_to_string field_ty))
 	          else
 	            let* inner_value =
-	              expr_json ~reg enum_names value_record_names heap_record_names union_names
+	              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
 	                enum_constructors (path ^ ".expr") inner
 	            in
 	            let* fields =
@@ -2782,11 +2848,11 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           binding.bind_ty
       in
       let* rhs =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".rhs") binding.bind_rhs
       in
       let* body =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") body
       in
       Ok
@@ -2804,11 +2870,11 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           binding.borrow_ty
       in
       let* rhs =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".rhs") binding.borrow_rhs
       in
       let* body =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") body
       in
       Ok
@@ -2821,25 +2887,25 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
            ])
   | Core.CSeq (first, second) ->
       let* first_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".first") first
       in
       let* second_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".second") second
       in
       Ok (kind "seq" [ ("first", first_value); ("second", second_value) ])
   | Core.CIf (cond, then_expr, else_expr) ->
       let* cond_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".cond") cond
       in
       let* then_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".then") then_expr
       in
       let* else_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".else") else_expr
       in
       let* fields =
@@ -2849,11 +2915,11 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       Ok (kind "if" fields)
   | Core.CWhile (cond, body) ->
       let* cond_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".cond") cond
       in
       let* body_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") body
       in
       let* fields = typed [ ("cond", cond_value); ("body", body_value) ] in
@@ -2864,15 +2930,15 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           (path ^ ".binder") binder
       in
       let* start_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".start") lo
       in
       let* end_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".end") hi
       in
       let* body_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") body
       in
       let* fields =
@@ -2889,7 +2955,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       match Codegen_types.normalize_type iter.ty with
       | Ast.TyNamed ("Channel", _) ->
           let* for_channel =
-            for_channel_json ~reg enum_names value_record_names heap_record_names
+            for_channel_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
               union_names enum_constructors (path ^ ".for_channel") binder iter
               body
           in
@@ -2900,14 +2966,14 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
             Core_layout_type.list_storage_layout_of_type ~reg iter.ty iter.loc
           in
           let* for_list =
-            for_list_json ~reg enum_names value_record_names heap_record_names union_names
+            for_list_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".for_list") binder layout iter body
           in
           let* fields = typed [ ("for_list", for_list) ] in
           Ok (kind "for_list" fields)
       | Ast.TyNamed ("String", _) ->
           let* for_string =
-            for_string_json ~reg enum_names value_record_names heap_record_names
+            for_string_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
               union_names enum_constructors (path ^ ".for_string") binder iter
               body
           in
@@ -2915,14 +2981,14 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           Ok (kind "for_string" fields)
       | Ast.TyNamed ("Dict", _) ->
           let* for_dict =
-            for_dict_json ~reg enum_names value_record_names heap_record_names
+            for_dict_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
               union_names enum_constructors (path ^ ".for_dict") binder iter body
           in
           let* fields = typed [ ("for_dict", for_dict) ] in
           Ok (kind "for_dict" fields)
       | Ast.TyNamed ("Set", _) ->
           let* for_set =
-            for_set_json ~reg enum_names value_record_names heap_record_names
+            for_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
               union_names enum_constructors (path ^ ".for_set") binder iter body
           in
           let* fields = typed [ ("for_set", for_set) ] in
@@ -2940,15 +3006,15 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               (path ^ ".binder") binder
           in
           let* start_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".start") (range_field "start")
           in
           let* end_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".end") (range_field "end")
           in
           let* body_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".body") body
           in
           let* fields =
@@ -2963,7 +3029,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           Ok (kind "for_range" fields)
       | Ast.TyNamed (name, _) when Type_name_metadata.is_stream_name name ->
           let* for_stream =
-            for_stream_json ~reg enum_names value_record_names heap_record_names
+            for_stream_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
               union_names enum_constructors (path ^ ".for_stream") binder iter
               body
           in
@@ -2972,7 +3038,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       | Ast.TyNamed (name, [ _resource_ty; _error_ty ])
         when Type_name_metadata.is_resource_source_name name ->
           let* for_resource_source =
-            for_resource_source_json ~reg enum_names value_record_names
+            for_resource_source_json ~function_names ~consumed_params ~reg enum_names value_record_names
               heap_record_names union_names enum_constructors
               (path ^ ".for_resource_source") binder iter body
           in
@@ -2982,7 +3048,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           Ok (kind "for_resource_source" fields)
       | ty when Core_tensor_type.is_type ~reg ty ->
           let* for_tensor =
-            for_tensor_json ~reg enum_names value_record_names heap_record_names
+            for_tensor_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
               union_names enum_constructors (path ^ ".for_tensor") binder iter
               body
           in
@@ -2996,22 +3062,22 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       match expr.ty with
       | Ast.TyRange _ ->
           let* start_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".start") lo
           in
           let* end_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".end") hi
           in
           let* fields = typed [ ("start", start_value); ("end", end_value) ] in
           Ok (kind "range" fields)
       | Ast.TyNamed (name, []) when StringSet.mem name value_record_names ->
           let* start_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".start") lo
           in
           let* end_value =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".end") hi
           in
           let* fields = typed [ ("start", start_value); ("end", end_value) ] in
@@ -3019,11 +3085,11 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       | _ -> unsupported path "range expression with non-range type")
   | Core.CMatch (scrutinee, Core.CTLeaf { ct_bindings; ct_body }) ->
       let* scrutinee_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".scrutinee") scrutinee
       in
       let* body_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".match.fallback.body") ct_body
       in
       let var_types = Core_emit_util.collect_var_types ct_body in
@@ -3072,7 +3138,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         { Core.desc = Core.CVar tmp_var; ty = scrutinee.ty; loc = scrutinee.loc }
       in
       let* rhs =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".scrutinee") scrutinee
       in
       let* scrutinee_type =
@@ -3081,7 +3147,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       in
       let nested_match = { expr with desc = Core.CMatch (tmp_scrutinee, tree) } in
       let* body =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") nested_match
       in
       Ok
@@ -3109,7 +3175,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         match subtree with
         | Core.CTLeaf { ct_bindings; ct_body } ->
             let* body_value =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (case_path ^ ".body") ct_body
             in
             let var_types = Core_emit_util.collect_var_types ct_body in
@@ -3129,7 +3195,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         | Core.CTSwitchLit _ when reusable_match_scrutinee ->
             let nested_match = { expr with desc = Core.CMatch (scrutinee, subtree) } in
             let* body_value =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (case_path ^ ".body") nested_match
             in
             Ok
@@ -3147,7 +3213,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
             unsupported (case_path ^ ".body") "nested length match"
       in
       let* scrutinee_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".scrutinee") scrutinee
       in
       let* cases_value =
@@ -3218,7 +3284,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       let rec constructor_match_switch_json (match_scrutinee : Core.core)
           release_policy path cts_scrut cts_cases cts_default =
         let* scrutinee_value =
-          expr_json ~reg enum_names value_record_names heap_record_names union_names
+          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
             enum_constructors (path ^ ".scrutinee") match_scrutinee
         in
         let* cases_value =
@@ -3246,13 +3312,13 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         | Some Core.CTFail -> Ok (kind "fail" [])
         | Some (Core.CTLeaf { ct_bindings = []; ct_body }) ->
             let* body =
-              expr_json ~reg enum_names value_record_names heap_record_names union_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
                 enum_constructors (path ^ ".body") ct_body
             in
             Ok (kind "body" [ ("body", body) ])
         | Some (Core.CTLeaf { ct_bindings; ct_body }) ->
             let* body =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (path ^ ".body") ct_body
             in
             let var_types = Core_emit_util.collect_var_types ct_body in
@@ -3289,14 +3355,14 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               { expr with desc = Core.CMatch (match_scrutinee, subtree) }
             in
             let* body =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors path nested_match
             in
             Ok (kind "body" [ ("body", body) ])
       and literal_match_switch_json (match_scrutinee : Core.core) path ctl_scrut
           ctl_cases ctl_default =
         let* scrutinee_value =
-          expr_json ~reg enum_names value_record_names heap_record_names
+          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
             union_names enum_constructors (path ^ ".scrutinee")
             match_scrutinee
         in
@@ -3364,13 +3430,13 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         function
         | Core.CTLeaf { ct_bindings = []; ct_body } ->
             let* body =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (path ^ ".body") ct_body
             in
             Ok (kind "body" [ ("body", body) ])
         | Core.CTLeaf { ct_bindings; ct_body } ->
             let* body =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (path ^ ".body") ct_body
             in
             let var_types = Core_emit_util.collect_var_types ct_body in
@@ -3399,7 +3465,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               { expr with desc = Core.CMatch (match_scrutinee, subtree) }
             in
             let* body =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors path nested_match
             in
             Ok (kind "body" [ ("body", body) ])
@@ -3411,7 +3477,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         match subtree with
         | Core.CTLeaf { ct_bindings; ct_body } ->
             let* body_value =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (case_path ^ ".body") ct_body
             in
             let var_types = Core_emit_util.collect_var_types ct_body in
@@ -3590,7 +3656,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           case_path = function
         | Core.CTLeaf { ct_bindings; ct_body } ->
             let* body_value =
-              expr_json ~reg enum_names value_record_names heap_record_names union_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
                 enum_constructors (case_path ^ ".body.expr") ct_body
             in
             Ok (ct_bindings, kind "expr" [ ("expr", body_value) ])
@@ -3681,7 +3747,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
             { Core.desc = Core.CVar tmp_var; ty = scrutinee.ty; loc = scrutinee.loc }
           in
           let* rhs =
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors (path ^ ".scrutinee") scrutinee
           in
           let* scrutinee_type =
@@ -3791,7 +3857,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         function
         | Core.CTLeaf { ct_bindings; ct_body } ->
             let* body_value =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (branch_path ^ ".body.expr")
                 ct_body
             in
@@ -3816,7 +3882,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               { expr with desc = Core.CMatch (match_scrutinee, subtree) }
             in
             let* body_value =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (branch_path ^ ".body.expr")
                 nested_match
             in
@@ -3826,14 +3892,14 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               { expr with desc = Core.CMatch (match_scrutinee, subtree) }
             in
             let* body_value =
-              expr_json ~reg enum_names value_record_names heap_record_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
                 union_names enum_constructors (branch_path ^ ".body.expr")
                 nested_match
             in
             Ok ([], kind "expr" [ ("expr", body_value) ])
       in
       let* scrutinee_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".scrutinee") scrutinee
       in
       let* match_value =
@@ -3861,15 +3927,17 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         type_json ~reg enum_names value_record_names heap_record_names union_names
           (path ^ ".value_type") value_ty
       in
-      let retain_policy = retain_policy_json ~reg value_ty in
+      let retain_policy =
+        retain_policy_json_for_var ~reg enum_constructors value_ty variable
+      in
       let* body_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") body
       in
       let* fields =
         typed
           [
-            ("var", var_json_for_expr ~reg enum_constructors value_ty variable);
+            ("var", var_json variable);
             ("value_type", value_type);
             ("retain_policy", retain_policy);
             ("body", body_value);
@@ -3881,15 +3949,17 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         type_json ~reg enum_names value_record_names heap_record_names union_names
           (path ^ ".value_type") value_ty
       in
-      let release_policy = release_policy_json ~reg value_ty in
+      let release_policy =
+        release_policy_json_for_var ~reg enum_constructors value_ty variable
+      in
       let* body_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") body
       in
       let* fields =
         typed
           [
-            ("var", var_json_for_expr ~reg enum_constructors value_ty variable);
+            ("var", var_json variable);
             ("value_type", value_type);
             ("release_policy", release_policy);
             ("body", body_value);
@@ -3909,7 +3979,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           (path ^ ".return_type") tul_return_ty
       in
       let* body_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") tul_body
       in
       Ok
@@ -3950,7 +4020,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       in
       let* layout = list_storage_layout_json list_layout in
       let* body_value =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".loop.body") tls_body
       in
       Ok
@@ -3972,7 +4042,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   | Core.CTailrecRecur (Core.TailrecRecur { tr_args }) ->
       let* args_value =
         result_list tr_args (fun index arg ->
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors
               (Printf.sprintf "%s.args[%d]" path index)
               arg)
@@ -3984,7 +4054,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
 	      let* rebinds =
 	        result_list tr_rebinds (fun index (param_index, value) ->
 	            let* value_json =
-	              expr_json ~reg enum_names value_record_names heap_record_names
+	              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
 	                union_names enum_constructors
 	                (Printf.sprintf "%s.rebinds[%d].value" path index)
 	                value
@@ -4013,7 +4083,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               tuple_element_tag (element_path ^ ".kind") element.bsv_box.box_kind
             in
             let* value =
-              expr_json ~reg enum_names value_record_names heap_record_names union_names
+              expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
                 enum_constructors (element_path ^ ".value")
                 element.bsv_box.box_value
             in
@@ -4038,7 +4108,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   | Core.CTuple items ->
       let* items_value =
         result_list items (fun index item ->
-            expr_json ~reg enum_names value_record_names heap_record_names union_names
+            expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
               enum_constructors
               (Printf.sprintf "%s.items[%d]" path index)
               item)
@@ -4059,7 +4129,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
             }
           in
           let* construct_json =
-            dict_construct_json ~reg enum_names value_record_names
+            dict_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names
               heap_record_names union_names enum_constructors
               (path ^ ".construct") expr.loc construct
           in
@@ -4087,7 +4157,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
             }
           in
           let* alloc_json =
-            list_alloc_json ~reg enum_names value_record_names heap_record_names
+            list_alloc_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
               union_names enum_constructors (path ^ ".alloc") expr.loc alloc
           in
           let* fields = typed [ ("alloc", alloc_json) ] in
@@ -4097,7 +4167,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
             result_list fields (fun index (name, value) ->
                 let field_path = Printf.sprintf "%s.fields[%d]" path index in
                 let* value_json =
-                  expr_json ~reg enum_names value_record_names heap_record_names union_names
+                  expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
                     enum_constructors (field_path ^ ".value") value
                 in
                 Ok (obj [ ("name", str name); ("value", value_json) ]))
@@ -4121,7 +4191,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               match field with
               | Core.RecordRawField (name, value) ->
                   let* value_json =
-                    expr_json ~reg enum_names value_record_names heap_record_names union_names
+                    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
                       enum_constructors (field_path ^ ".value") value
                   in
                   Ok (obj [ ("name", str name); ("value", value_json) ])
@@ -4134,63 +4204,63 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         Ok (kind "record_construct" fields)
   | Core.CList lit ->
       let* construct =
-        list_literal_json ~reg enum_names value_record_names heap_record_names union_names
+        list_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".construct") expr.loc lit
       in
       let* fields = typed [ ("construct", construct) ] in
       Ok (kind "list_construct" fields)
   | Core.CListAlloc alloc ->
       let* alloc_json =
-        list_alloc_json ~reg enum_names value_record_names heap_record_names union_names
+        list_alloc_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".alloc") expr.loc alloc
       in
       let* fields = typed [ ("alloc", alloc_json) ] in
       Ok (kind "list_alloc" fields)
   | Core.CListGet get ->
       let* get_json =
-        list_get_json ~reg enum_names value_record_names heap_record_names union_names
+        list_get_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".get") get
       in
       let* fields = typed [ ("get", get_json) ] in
       Ok (kind "list_get" fields)
   | Core.CListHandoff handoff ->
       let* handoff_json =
-        list_handoff_json ~reg enum_names value_record_names heap_record_names union_names
+        list_handoff_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".handoff") expr.loc handoff
       in
       let* fields = typed [ ("handoff", handoff_json) ] in
       Ok (kind "list_handoff" fields)
   | Core.CStringByteRead read ->
       let* read_json =
-        string_byte_read_json ~reg enum_names value_record_names heap_record_names union_names
+        string_byte_read_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".read") read
       in
       let* fields = typed [ ("read", read_json) ] in
       Ok (kind "string_byte_read" fields)
   | Core.CStringByteWrite write ->
       let* write_json =
-        string_byte_write_json ~reg enum_names value_record_names heap_record_names union_names
+        string_byte_write_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".write") write
       in
       let* fields = typed [ ("write", write_json) ] in
       Ok (kind "string_byte_write" fields)
   | Core.CStringByteCopy copy ->
       let* copy_json =
-        string_byte_copy_json ~reg enum_names value_record_names heap_record_names union_names
+        string_byte_copy_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".copy") copy
       in
       let* fields = typed [ ("copy", copy_json) ] in
       Ok (kind "string_byte_copy" fields)
   | Core.CStringSetLen set_len ->
       let* set_len_json =
-        string_set_len_json ~reg enum_names value_record_names heap_record_names union_names
+        string_set_len_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".set_len") set_len
       in
       let* fields = typed [ ("set_len", set_len_json) ] in
       Ok (kind "string_set_len" fields)
   | Core.CListConstruct lc ->
       let* construct =
-        list_construct_json ~reg enum_names value_record_names heap_record_names union_names
+        list_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".construct") lc
       in
       let* fields = typed [ ("construct", construct) ] in
@@ -4200,7 +4270,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       | { Core.desc = Core.CVector _; _ } ->
           unsupported path "vector literal"
       | prepared ->
-          expr_json ~reg enum_names value_record_names heap_record_names union_names
+          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
             enum_constructors path prepared)
   | Core.CTensorLiteral literal -> (
       match literal.tl_payload with
@@ -4210,7 +4280,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
               ~phase:Core_error.Emit ~loc:expr.loc literal.tl_layout
           in
           let* literal_json =
-            tensor_boxed_literal_json ~reg enum_names value_record_names
+            tensor_boxed_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names
               heap_record_names union_names enum_constructors
               (path ^ ".literal") literal.tl_shape elements elem_needs_release
           in
@@ -4218,7 +4288,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           Ok (kind "tensor_boxed_literal" fields)
       | Core.TensorPackedElements (width, elements) ->
           let* literal_json =
-            tensor_packed_literal_json ~reg enum_names value_record_names
+            tensor_packed_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names
               heap_record_names union_names enum_constructors
               (path ^ ".literal") literal.tl_shape width elements
           in
@@ -4226,7 +4296,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
           Ok (kind "tensor_packed_literal" fields)
       | Core.TensorRawElements _ | Core.TensorInlineStructElements _ ->
           let* literal_json =
-            tensor_literal_json ~reg enum_names value_record_names heap_record_names
+            tensor_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
               union_names enum_constructors (path ^ ".literal") literal
           in
           let* fields = typed [ ("literal", literal_json) ] in
@@ -4236,11 +4306,11 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       match Core_codegen_prepare.prepare_expr ~reg expr with
       | { Core.desc = Core.CDict _; _ } -> unsupported path "dict literal"
       | prepared ->
-          expr_json ~reg enum_names value_record_names heap_record_names union_names
+          expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
             enum_constructors path prepared)
   | Core.CDictConstruct dc ->
       let* construct =
-        dict_construct_json ~reg enum_names value_record_names heap_record_names union_names
+        dict_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".construct") expr.loc dc
       in
       let* fields = typed [ ("construct", construct) ] in
@@ -4250,7 +4320,29 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       let* fields = typed [ ("alloc", alloc_json) ] in
       Ok (kind "set_alloc" fields)
   | Core.CRecordUpdate _ -> unsupported path "record update"
-  | Core.CLambda _ -> unsupported path "lambda"
+  | Core.CLambda lambda ->
+      let* params =
+        closure_params_json ~reg enum_names value_record_names heap_record_names
+          union_names (path ^ ".params") lambda.lam_params
+      in
+      let* return_type =
+        type_json ~reg enum_names value_record_names heap_record_names union_names
+          (path ^ ".return_type") lambda.lam_return_ty
+      in
+      let* body =
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
+          enum_constructors (path ^ ".body") lambda.lam_body
+      in
+      let* fields =
+        typed
+          [
+            ("params", params);
+            ("return_type", return_type);
+            ("body", body);
+            ("pure", bool lambda.lam_is_pure);
+          ]
+      in
+      Ok (kind "lambda" fields)
   | Core.CClosureCreate closure ->
       let* closure_json =
         closure_create_json ~reg enum_names value_record_names heap_record_names
@@ -4260,26 +4352,26 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       Ok (kind "closure_create" fields)
   | Core.CTensorRawRead read ->
       let* read_json =
-        tensor_raw_read_json ~reg enum_names value_record_names heap_record_names union_names
+        tensor_raw_read_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".read") read
       in
       let* fields = typed [ ("read", read_json) ] in
       Ok (kind "tensor_raw_read" fields)
   | Core.CTensorRawWrite write ->
       let* write_json =
-        tensor_raw_write_json ~reg enum_names value_record_names heap_record_names union_names
+        tensor_raw_write_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".write") write
       in
       let* fields = typed [ ("write", write_json) ] in
       Ok (kind "tensor_raw_write" fields)
   | Core.CTensorRawViewLet (binding, body) ->
       let* binding_json =
-        tensor_raw_view_binding_json ~reg enum_names value_record_names
+        tensor_raw_view_binding_json ~function_names ~consumed_params ~reg enum_names value_record_names
           heap_record_names union_names enum_constructors (path ^ ".binding")
           binding
       in
       let* body_json =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".body") body
       in
       let* fields = typed [ ("binding", binding_json); ("body", body_json) ] in
@@ -4287,14 +4379,14 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   | Core.CStringInterp _ -> unsupported path "string interpolation"
   | Core.CResourceScope scope ->
       let* scope_json =
-        resource_scope_json ~reg enum_names value_record_names heap_record_names union_names
+        resource_scope_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".scope") scope
       in
       let* fields = typed [ ("scope", scope_json) ] in
       Ok (kind "resource_scope" fields)
   | Core.CResourceCleanupExit cleanup_exit ->
       let* cleanup_exit_json =
-        resource_cleanup_exit_json ~reg enum_names value_record_names
+        resource_cleanup_exit_json ~function_names ~consumed_params ~reg enum_names value_record_names
           heap_record_names union_names enum_constructors (path ^ ".cleanup_exit")
           cleanup_exit
       in
@@ -4304,30 +4396,70 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   | Core.CMatchArms _ -> unsupported path "match arms"
   | Core.CMatch _ -> unsupported path "compiled match"
   | Core.CConcurrent block ->
-      let* block_json =
-        concurrent_block_json ~reg enum_names value_record_names heap_record_names
-          union_names enum_constructors (path ^ ".concurrent") block
-      in
-      let* fields = typed [ ("concurrent", block_json) ] in
-      Ok (kind "concurrent" fields)
+      if List.for_all (fun (binding : Core.conc_binding) -> Option.is_some binding.cb_task) block.conc_bindings then
+        let* block_json =
+          concurrent_block_json ~function_names ~consumed_params ~reg enum_names
+            value_record_names heap_record_names union_names enum_constructors
+            (path ^ ".concurrent") block
+        in
+        let* fields = typed [ ("concurrent", block_json) ] in
+        Ok (kind "concurrent" fields)
+      else
+        let* block_json =
+          pre_closure_concurrent_block_json ~function_names ~consumed_params
+            ~reg enum_names value_record_names heap_record_names union_names
+            enum_constructors
+            (path ^ ".pre_closure_concurrent") block
+        in
+        let* fields = typed [ ("pre_closure_concurrent", block_json) ] in
+        Ok (kind "pre_closure_concurrent" fields)
   | Core.CConcurrentlyLoop loop ->
-      let* loop_json =
-        concurrently_loop_json ~reg enum_names value_record_names
-          heap_record_names union_names enum_constructors
-          (path ^ ".concurrently_loop") loop
-      in
-      let* fields = typed [ ("concurrently_loop", loop_json) ] in
-      Ok (kind "concurrently_loop" fields)
+      begin
+        match loop.cf_task with
+        | Some _ ->
+            let* loop_json =
+              concurrently_loop_json ~function_names ~consumed_params ~reg
+                enum_names value_record_names heap_record_names union_names
+                enum_constructors
+                (path ^ ".concurrently_loop") loop
+            in
+            let* fields = typed [ ("concurrently_loop", loop_json) ] in
+            Ok (kind "concurrently_loop" fields)
+        | None ->
+            let* loop_json =
+              pre_closure_concurrently_loop_json ~function_names
+                ~consumed_params ~reg enum_names value_record_names
+                heap_record_names union_names enum_constructors
+                (path ^ ".pre_closure_concurrently_loop") loop
+            in
+            let* fields =
+              typed [ ("pre_closure_concurrently_loop", loop_json) ]
+            in
+            Ok (kind "pre_closure_concurrently_loop" fields)
+      end
   | Core.CDetach detach ->
-      let* detach_json =
-        detach_json ~reg enum_names value_record_names heap_record_names
-          union_names (path ^ ".detach") detach
-      in
-      let* fields = typed [ ("detach", detach_json) ] in
-      Ok (kind "detach" fields)
+      begin
+        match detach.detach_task with
+        | Some _ ->
+            let* detach_json =
+              detach_json ~reg enum_names value_record_names heap_record_names
+                union_names (path ^ ".detach") detach
+            in
+            let* fields = typed [ ("detach", detach_json) ] in
+            Ok (kind "detach" fields)
+        | None ->
+            let* detach_json =
+              pre_closure_detach_json ~function_names ~consumed_params ~reg
+                enum_names value_record_names heap_record_names union_names
+                enum_constructors
+                (path ^ ".pre_closure_detach") detach
+            in
+            let* fields = typed [ ("pre_closure_detach", detach_json) ] in
+            Ok (kind "pre_closure_detach" fields)
+      end
   | Core.CSelect select ->
       let* select_json =
-        select_json ~reg enum_names value_record_names heap_record_names union_names
+        select_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".select") select
       in
       let* fields = typed [ ("select", select_json) ] in
@@ -4335,8 +4467,9 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   | Core.CBox (value, source_ty) ->
       let box = Core_codegen_prepare.make_box_op ~reg value source_ty in
       let* box_json =
-        box_op_json ~reg enum_names value_record_names heap_record_names union_names
-          enum_constructors (path ^ ".box") box
+        box_op_json ~function_names ~consumed_params ~reg enum_names
+          value_record_names heap_record_names union_names enum_constructors
+          (path ^ ".box") box
       in
       let* fields = typed [ ("box", box_json) ] in
       Ok (kind "box" fields)
@@ -4351,7 +4484,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
         }
       in
       let* unbox_kind, expr_value =
-        unbox_json ~reg enum_names value_record_names heap_record_names union_names
+        unbox_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors path unbox
       in
       let* fields =
@@ -4360,7 +4493,7 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
       Ok (kind "unbox" fields)
   | Core.CUnionConstruct uc ->
       let* construct =
-        union_construct_json ~reg enum_names value_record_names heap_record_names union_names
+        union_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".construct") uc
       in
       let* fields = typed [ ("construct", construct) ] in
@@ -4368,14 +4501,15 @@ let rec expr_json ?(function_names = StringSet.empty) ?(consumed_params = [])
   | Core.CUnionReuseConstruct _ -> unsupported path "union reuse construction"
   | Core.CBoxTyped box ->
       let* box_json =
-        box_op_json ~reg enum_names value_record_names heap_record_names union_names
-          enum_constructors (path ^ ".box") box
+        box_op_json ~function_names ~consumed_params ~reg enum_names
+          value_record_names heap_record_names union_names enum_constructors
+          (path ^ ".box") box
       in
       let* fields = typed [ ("box", box_json) ] in
       Ok (kind "box" fields)
   | Core.CUnboxTyped unbox ->
       let* unbox_kind, expr_value =
-        unbox_json ~reg enum_names value_record_names heap_record_names union_names
+        unbox_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors path unbox
       in
       let* fields =
@@ -4394,11 +4528,12 @@ and box_kind_json _path = function
   | Core.BoxInt128 -> Ok (kind "int128" [])
   | Core.BoxUInt128 -> Ok (kind "uint128" [])
 
-and box_op_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
-    path (box : Core.box_op) =
+and box_op_json ~function_names ~consumed_params ~reg enum_names
+    value_record_names heap_record_names union_names enum_constructors path
+    (box : Core.box_op) =
   let* kind_value = box_kind_json (path ^ ".kind") box.box_kind in
   let* value =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".value") box.box_value
   in
   let* source_type =
@@ -4419,11 +4554,11 @@ and unbox_kind_json = function
   | Core.UnboxPrim -> Ok (kind "prim" [])
   | Core.UnboxStruct c_type -> Ok (kind "struct" [ ("c_type", str c_type) ])
 
-and boxed_storage_value_json ~reg enum_names value_record_names heap_record_names union_names
+and boxed_storage_value_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (value : Core.boxed_storage_value) =
   let* kind_value = box_kind_json (path ^ ".kind") value.bsv_box.box_kind in
   let* value_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".value") value.bsv_box.box_value
   in
   Ok
@@ -4435,10 +4570,10 @@ and boxed_storage_value_json ~reg enum_names value_record_names heap_record_name
          ("transfers_ownership", bool value.bsv_transfers_ownership);
        ])
 
-and boxed_storage_values_json ~reg enum_names value_record_names heap_record_names union_names
+and boxed_storage_values_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path values =
   result_list values (fun index value ->
-      boxed_storage_value_json ~reg enum_names value_record_names heap_record_names union_names
+      boxed_storage_value_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
         enum_constructors
         (Printf.sprintf "%s[%d]" path index)
         value)
@@ -4457,34 +4592,34 @@ and set_constructor_json ~reg path loc = function
   | Core.SetCustom elem_ty ->
       custom_hash_container_constructor_json ~reg path loc elem_ty
 
-and dict_entry_json ~reg enum_names value_record_names heap_record_names union_names
+and dict_entry_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path
     ((key, value) : Core.boxed_storage_value * Core.boxed_storage_value) =
   let* key_json =
-    boxed_storage_value_json ~reg enum_names value_record_names heap_record_names union_names
+    boxed_storage_value_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".key") key
   in
   let* value_json =
-    boxed_storage_value_json ~reg enum_names value_record_names heap_record_names union_names
+    boxed_storage_value_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".value") value
   in
   Ok (obj [ ("key", key_json); ("value", value_json) ])
 
-and dict_entries_json ~reg enum_names value_record_names heap_record_names union_names
+and dict_entries_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path entries =
   result_list entries (fun index entry ->
-      dict_entry_json ~reg enum_names value_record_names heap_record_names union_names
+      dict_entry_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
         enum_constructors
         (Printf.sprintf "%s[%d]" path index)
         entry)
 
-and dict_construct_json ~reg enum_names value_record_names heap_record_names union_names
+and dict_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path loc (construct : Core.dict_construct) =
   let* constructor =
     dict_constructor_json ~reg (path ^ ".constructor") loc construct.dc_constructor
   in
   let* entries =
-    dict_entries_json ~reg enum_names value_record_names heap_record_names union_names
+    dict_entries_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".entries") construct.dc_entries
   in
   Ok
@@ -4558,18 +4693,18 @@ and require_supported_list_loop_layout _path (layout : Core.list_storage_layout)
   | Core.ListInlineStorage _ -> Ok ()
   | Core.ListInlineStructStorage _ -> Ok ()
 
-and for_channel_json ~reg enum_names value_record_names heap_record_names union_names
+and for_channel_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path binder iter body =
   let* binder_json =
     loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
       (path ^ ".binder") binder
   in
   let* iterable_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".iterable") iter
   in
   let* body_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".body") body
   in
   Ok
@@ -4580,7 +4715,7 @@ and for_channel_json ~reg enum_names value_record_names heap_record_names union_
          ("body", body_json);
        ])
 
-and for_list_json ~reg enum_names value_record_names heap_record_names union_names
+and for_list_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path binder layout iter body =
   let* () = require_supported_list_loop_layout (path ^ ".layout") layout in
   let* binder_json =
@@ -4589,12 +4724,12 @@ and for_list_json ~reg enum_names value_record_names heap_record_names union_nam
   in
   let* layout_json = list_storage_layout_json layout in
   let* iterable_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".iterable") iter
   in
   let iterable_release_policy = iterable_release_policy_json ~reg iter in
   let* body_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".body") body
   in
   Ok
@@ -4607,19 +4742,19 @@ and for_list_json ~reg enum_names value_record_names heap_record_names union_nam
          ("body", body_json);
        ])
 
-and for_iterable_json ~reg enum_names value_record_names heap_record_names
+and for_iterable_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path binder iter body =
   let* binder_json =
     loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
       (path ^ ".binder") binder
   in
   let* iterable_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".iterable") iter
   in
   let iterable_release_policy = iterable_release_policy_json ~reg iter in
   let* body_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".body") body
   in
   Ok
@@ -4631,34 +4766,34 @@ and for_iterable_json ~reg enum_names value_record_names heap_record_names
          ("body", body_json);
        ])
 
-and for_string_json ~reg enum_names value_record_names heap_record_names
+and for_string_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path binder iter body =
-  for_iterable_json ~reg enum_names value_record_names heap_record_names
+  for_iterable_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path binder iter body
 
-and for_dict_json ~reg enum_names value_record_names heap_record_names union_names
+and for_dict_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path binder iter body =
-  for_iterable_json ~reg enum_names value_record_names heap_record_names
+  for_iterable_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path binder iter body
 
-and for_set_json ~reg enum_names value_record_names heap_record_names union_names
+and for_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path binder iter body =
-  for_iterable_json ~reg enum_names value_record_names heap_record_names
+  for_iterable_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path binder iter body
 
-and for_stream_json ~reg enum_names value_record_names heap_record_names union_names
+and for_stream_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path binder iter body =
   let* binder_json =
     loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
       (path ^ ".binder") binder
   in
   let* iterable_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".iterable") iter
   in
   let iterable_release_policy = iterable_release_policy_json ~reg iter in
   let* body_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".body") body
   in
   Ok
@@ -4670,19 +4805,19 @@ and for_stream_json ~reg enum_names value_record_names heap_record_names union_n
          ("body", body_json);
        ])
 
-and for_resource_source_json ~reg enum_names value_record_names heap_record_names
+and for_resource_source_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path binder iter body =
   let* binder_json =
     loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
       (path ^ ".binder") binder
   in
   let* iterable_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".iterable") iter
   in
   let iterable_release_policy = iterable_release_policy_json ~reg iter in
   let* body_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".body") body
   in
   Ok
@@ -4754,16 +4889,28 @@ and detach_json ~reg enum_names value_record_names heap_record_names union_names
       Ok (obj [ ("task", task_json) ])
   | None -> unsupported (path ^ ".task") "missing detach task closure"
 
-and concurrent_binding_json ~reg enum_names value_record_names heap_record_names
-    union_names enum_constructors path index (binding : Core.conc_binding) =
+and pre_closure_detach_json ~function_names ~consumed_params ~reg enum_names
+    value_record_names heap_record_names union_names enum_constructors path
+    (detach : Core.detach_expr) =
+  let* body =
+    expr_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".body") detach.detach_body
+  in
+  Ok (obj [ ("body", body) ])
+
+and concurrent_binding_json ~function_names ~consumed_params ~reg enum_names
+    value_record_names heap_record_names union_names enum_constructors path index
+    (binding : Core.conc_binding) =
   let binding_path = Printf.sprintf "%s.bindings[%d]" path index in
   let* binding_type =
     type_json ~reg enum_names value_record_names heap_record_names union_names
       (binding_path ^ ".type") binding.cb_ty
   in
   let* rhs =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
-      enum_constructors (binding_path ^ ".rhs") binding.cb_rhs
+    expr_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (binding_path ^ ".rhs") binding.cb_rhs
   in
   let* task =
     match binding.cb_task with
@@ -4781,27 +4928,54 @@ and concurrent_binding_json ~reg enum_names value_record_names heap_record_names
          ("task", task);
        ])
 
-and concurrent_timeout_json ~reg enum_names value_record_names heap_record_names
-    union_names enum_constructors path = function
+and pre_closure_concurrent_binding_json ~function_names ~consumed_params ~reg
+    enum_names value_record_names heap_record_names union_names enum_constructors
+    path index
+    (binding : Core.conc_binding) =
+  let binding_path = Printf.sprintf "%s.bindings[%d]" path index in
+  let* binding_type =
+    type_json ~reg enum_names value_record_names heap_record_names union_names
+      (binding_path ^ ".type") binding.cb_ty
+  in
+  let* rhs =
+    expr_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (binding_path ^ ".rhs") binding.cb_rhs
+  in
+  Ok
+    (obj
+       [
+         ("var", var_json binding.cb_var);
+         ("type", binding_type);
+         ("rhs", rhs);
+       ])
+
+and concurrent_timeout_json ~function_names ~consumed_params ~reg enum_names
+    value_record_names heap_record_names union_names enum_constructors path =
+  function
   | Some timeout ->
-      expr_json ~reg enum_names value_record_names heap_record_names union_names
-        enum_constructors path timeout
+      expr_json ~function_names ~consumed_params ~reg enum_names
+        value_record_names heap_record_names union_names enum_constructors path
+        timeout
   | None -> Ok null
 
-and concurrent_block_json ~reg enum_names value_record_names heap_record_names
-    union_names enum_constructors path (block : Core.concurrent_block) =
+and concurrent_block_json ~function_names ~consumed_params ~reg enum_names
+    value_record_names heap_record_names union_names enum_constructors path
+    (block : Core.concurrent_block) =
   let* bindings =
     result_list block.conc_bindings
-      (concurrent_binding_json ~reg enum_names value_record_names
-         heap_record_names union_names enum_constructors path)
+      (concurrent_binding_json ~function_names ~consumed_params ~reg enum_names
+         value_record_names heap_record_names union_names enum_constructors path)
   in
   let* body =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
-      enum_constructors (path ^ ".body") block.conc_body
+    expr_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".body") block.conc_body
   in
   let* timeout =
-    concurrent_timeout_json ~reg enum_names value_record_names heap_record_names
-      union_names enum_constructors (path ^ ".timeout") block.conc_timeout
+    concurrent_timeout_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".timeout") block.conc_timeout
   in
   Ok
     (obj
@@ -4811,6 +4985,38 @@ and concurrent_block_json ~reg enum_names value_record_names heap_record_names
          ("timeout", timeout);
          ("max_threads", option_int_json block.conc_max_threads);
        ])
+
+and pre_closure_concurrent_block_json ~function_names ~consumed_params ~reg
+    enum_names value_record_names heap_record_names union_names enum_constructors
+    path
+    (block : Core.concurrent_block) =
+  if List.exists (fun (binding : Core.conc_binding) -> Option.is_some binding.cb_task) block.conc_bindings then
+    unsupported (path ^ ".bindings") "mixed pre-closure and post-closure concurrent bindings"
+  else
+    let* bindings =
+      result_list block.conc_bindings
+        (pre_closure_concurrent_binding_json ~function_names ~consumed_params
+           ~reg enum_names value_record_names heap_record_names union_names
+           enum_constructors path)
+    in
+    let* body =
+      expr_json ~function_names ~consumed_params ~reg enum_names
+        value_record_names heap_record_names union_names enum_constructors
+        (path ^ ".body") block.conc_body
+    in
+    let* timeout =
+      concurrent_timeout_json ~function_names ~consumed_params ~reg enum_names
+        value_record_names heap_record_names union_names enum_constructors
+        (path ^ ".timeout") block.conc_timeout
+    in
+    Ok
+      (obj
+         [
+           ("bindings", bindings);
+           ("body", body);
+           ("timeout", timeout);
+           ("max_threads", option_int_json block.conc_max_threads);
+         ])
 
 and concurrently_loop_output_json = function
   | Core.ConcurrentlyLoopCollect -> str "collect"
@@ -4843,8 +5049,9 @@ and concurrently_loop_item_mode_json ~reg enum_names value_record_names
         (kind "move_resource_item"
            [ ("resource_type", resource_type); ("error_type", error_type) ])
 
-and concurrently_loop_json ~reg enum_names value_record_names heap_record_names
-    union_names enum_constructors path (loop : Core.concurrently_loop) =
+and concurrently_loop_json ~function_names ~consumed_params ~reg enum_names
+    value_record_names heap_record_names union_names enum_constructors path
+    (loop : Core.concurrently_loop) =
   let* item_ty = concurrently_loop_item_type (path ^ ".item_type") loop in
   let* item_type =
     type_json ~reg enum_names value_record_names heap_record_names union_names
@@ -4855,22 +5062,26 @@ and concurrently_loop_json ~reg enum_names value_record_names heap_record_names
       heap_record_names union_names (path ^ ".item_mode") loop.cf_item_mode
   in
   let* iterable =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
-      enum_constructors (path ^ ".iterable") loop.cf_iter
+    expr_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".iterable") loop.cf_iter
   in
   let* body =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
-      enum_constructors (path ^ ".body") loop.cf_body
+    expr_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".body") loop.cf_body
   in
   let* timeout =
-    concurrent_timeout_json ~reg enum_names value_record_names heap_record_names
-      union_names enum_constructors (path ^ ".timeout") loop.cf_timeout
+    concurrent_timeout_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".timeout") loop.cf_timeout
   in
   let* limit =
     match loop.cf_width with
     | Core.ConcurrentlyLoopLimit limit ->
-        expr_json ~reg enum_names value_record_names heap_record_names
-          union_names enum_constructors (path ^ ".limit") limit
+        expr_json ~function_names ~consumed_params ~reg enum_names
+          value_record_names heap_record_names union_names enum_constructors
+          (path ^ ".limit") limit
   in
   let* task =
     match loop.cf_task with
@@ -4893,7 +5104,55 @@ and concurrently_loop_json ~reg enum_names value_record_names heap_record_names
          ("task", task);
        ])
 
-and select_recv_arm_json ~reg enum_names value_record_names heap_record_names
+and pre_closure_concurrently_loop_json ~function_names ~consumed_params ~reg
+    enum_names value_record_names heap_record_names union_names enum_constructors
+    path
+    (loop : Core.concurrently_loop) =
+  let* item_ty = concurrently_loop_item_type (path ^ ".item_type") loop in
+  let* item_type =
+    type_json ~reg enum_names value_record_names heap_record_names union_names
+      (path ^ ".item_type") item_ty
+  in
+  let* item_mode =
+    concurrently_loop_item_mode_json ~reg enum_names value_record_names
+      heap_record_names union_names (path ^ ".item_mode") loop.cf_item_mode
+  in
+  let* iterable =
+    expr_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".iterable") loop.cf_iter
+  in
+  let* body =
+    expr_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".body") loop.cf_body
+  in
+  let* timeout =
+    concurrent_timeout_json ~function_names ~consumed_params ~reg enum_names
+      value_record_names heap_record_names union_names enum_constructors
+      (path ^ ".timeout") loop.cf_timeout
+  in
+  let* limit =
+    match loop.cf_width with
+    | Core.ConcurrentlyLoopLimit limit ->
+        expr_json ~function_names ~consumed_params ~reg enum_names
+          value_record_names heap_record_names union_names enum_constructors
+          (path ^ ".limit") limit
+  in
+  Ok
+    (obj
+       [
+         ("var", var_json loop.cf_var);
+         ("item_type", item_type);
+         ("item_mode", item_mode);
+         ("iterable", iterable);
+         ("body", body);
+         ("timeout", timeout);
+         ("limit", limit);
+         ("output", concurrently_loop_output_json loop.cf_output);
+       ])
+
+and select_recv_arm_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path
     (recv : [ `Recv of Core.var * Ast.type_expr * Core.core ]) =
   match recv with
@@ -4903,7 +5162,7 @@ and select_recv_arm_json ~reg enum_names value_record_names heap_record_names
           union_names (path ^ ".elem_type") elem_ty
       in
       let* channel_json =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".channel") channel
       in
       Ok
@@ -4914,37 +5173,37 @@ and select_recv_arm_json ~reg enum_names value_record_names heap_record_names
              ("channel", channel_json);
            ])
 
-and select_arm_kind_json ~reg enum_names value_record_names heap_record_names
+and select_arm_kind_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path = function
   | Core.SelectRecv { select_bind; select_elem_ty; select_channel } ->
       let* recv =
-        select_recv_arm_json ~reg enum_names value_record_names heap_record_names
+        select_recv_arm_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
           union_names enum_constructors (path ^ ".recv")
           (`Recv (select_bind, select_elem_ty, select_channel))
       in
       Ok (kind "recv" [ ("recv", recv) ])
   | Core.SelectSealed channel ->
       let* channel_json =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".channel") channel
       in
       Ok (kind "sealed" [ ("channel", channel_json) ])
   | Core.SelectAfter timeout ->
       let* timeout_json =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".timeout") timeout
       in
       Ok (kind "after" [ ("timeout", timeout_json) ])
 
-and select_arm_json ~reg enum_names value_record_names heap_record_names union_names
+and select_arm_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path index (arm : Core.select_arm) =
   let arm_path = Printf.sprintf "%s.arms[%d]" path index in
   let* kind_json =
-    select_arm_kind_json ~reg enum_names value_record_names heap_record_names
+    select_arm_kind_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
       union_names enum_constructors (arm_path ^ ".kind") arm.select_arm_kind
   in
   let* body_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (arm_path ^ ".body") arm.select_arm_body
   in
   Ok
@@ -4955,11 +5214,11 @@ and select_arm_json ~reg enum_names value_record_names heap_record_names union_n
          ("loc", source_loc_json arm.select_arm_loc);
        ])
 
-and select_json ~reg enum_names value_record_names heap_record_names union_names
+and select_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (select : Core.select_expr) =
   let* arms =
     result_list select.select_arms
-      (select_arm_json ~reg enum_names value_record_names heap_record_names
+      (select_arm_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
          union_names enum_constructors path)
   in
   Ok (obj [ ("arms", arms) ])
@@ -5081,7 +5340,7 @@ and tensor_runtime_read_helper_tag path = function
 	  | Some _ -> unsupported path "tensor for-loop without dimensions"
 	  | None -> unsupported path "non-tensor for-loop"
 
-	and for_tensor_json ~reg enum_names value_record_names heap_record_names
+	and for_tensor_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
 	    union_names enum_constructors path binder iter body =
 	  let* binder_json =
 	    loop_binder_json ~reg enum_names value_record_names heap_record_names union_names
@@ -5091,12 +5350,12 @@ and tensor_runtime_read_helper_tag path = function
 	    tensor_for_loop_element_storage_json ~reg (path ^ ".element_storage") binder iter
 	  in
   let* iterable_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".iterable") iter
   in
   let iterable_release_policy = iterable_release_policy_json ~reg iter in
   let* body_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".body") body
   in
   Ok
@@ -5119,11 +5378,11 @@ and list_storage_layout_json (layout : Core.list_storage_layout) =
   | Core.ListInlineStructStorage c_type ->
       Ok (kind "inline_struct" [ ("c_type", str c_type) ])
 
-and list_construct_json ~reg enum_names value_record_names heap_record_names union_names
+and list_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (lc : Core.list_construct) =
   let* layout = list_storage_layout_json lc.lc_layout in
   let* elements =
-    boxed_storage_values_json ~reg enum_names value_record_names heap_record_names union_names
+    boxed_storage_values_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".elements") lc.lc_elems
   in
   Ok
@@ -5134,14 +5393,14 @@ and list_construct_json ~reg enum_names value_record_names heap_record_names uni
          ("elem_needs_release", bool lc.lc_elem_needs_release);
        ])
 
-and list_literal_json ~reg enum_names value_record_names heap_record_names union_names
+and list_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path loc (lit : Core.list_literal) =
   let* layout = list_storage_layout_json lit.ll_layout in
   let elems =
     List.map (Core_codegen_prepare.boxed_storage_value ~reg) lit.ll_elems
   in
   let* elements =
-    boxed_storage_values_json ~reg enum_names value_record_names heap_record_names union_names
+    boxed_storage_values_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".elements") elems
   in
   Ok
@@ -5155,11 +5414,11 @@ and list_literal_json ~reg enum_names value_record_names heap_record_names union
                 ~phase:Core_error.Emit ~loc lit.ll_layout) );
        ])
 
-and list_alloc_json ~reg enum_names value_record_names heap_record_names union_names
+and list_alloc_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path loc (alloc : Core.list_alloc) =
   let* layout = list_storage_layout_json alloc.la_layout in
   let* capacity =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".capacity") alloc.la_capacity
   in
   Ok
@@ -5177,15 +5436,15 @@ and list_bounds_json = function
   | Core.ListBoundsChecked -> str "checked"
   | Core.ListBoundsProven -> str "proven"
 
-and list_get_json ~reg enum_names value_record_names heap_record_names union_names
+and list_get_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (get : Core.list_get) =
   let* layout = list_storage_layout_json get.lg_layout in
   let* list =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".list") get.lg_list
   in
   let* index =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".index") get.lg_index
   in
   Ok
@@ -5208,11 +5467,11 @@ and tensor_literal_shape_json = function
   | Core.TensorStaticShape dims ->
       kind "static" [ ("dims", arr (List.map int dims)) ]
 
-and tensor_literal_json ~reg enum_names value_record_names heap_record_names
+and tensor_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path (literal : Core.tensor_literal) =
   let element_values elements =
     result_list elements (fun index element ->
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors
           (Printf.sprintf "%s.elements[%d]" path index)
           element)
@@ -5248,10 +5507,10 @@ and tensor_literal_json ~reg enum_names value_record_names heap_record_names
   | Core.TensorBoxedElements _ ->
       unsupported path "unsupported tensor literal payload"
 
-and tensor_boxed_literal_json ~reg enum_names value_record_names heap_record_names
+and tensor_boxed_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path shape elements elem_needs_release =
   let* element_values =
-    boxed_storage_values_json ~reg enum_names value_record_names heap_record_names
+    boxed_storage_values_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
       union_names enum_constructors (path ^ ".elements") elements
   in
   Ok
@@ -5262,11 +5521,11 @@ and tensor_boxed_literal_json ~reg enum_names value_record_names heap_record_nam
          ("elem_needs_release", bool elem_needs_release);
        ])
 
-and tensor_packed_literal_json ~reg enum_names value_record_names heap_record_names
+and tensor_packed_literal_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path shape width elements =
   let* element_values =
     result_list elements (fun index element ->
-        expr_json ~reg enum_names value_record_names heap_record_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
           union_names enum_constructors
           (Printf.sprintf "%s.elements[%d]" path index)
           element)
@@ -5279,15 +5538,15 @@ and tensor_packed_literal_json ~reg enum_names value_record_names heap_record_na
          ("elements", element_values);
        ])
 
-and tensor_raw_fill_json ~reg enum_names value_record_names heap_record_names
+and tensor_raw_fill_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
     union_names enum_constructors path raw_kind value dims =
   let* value_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".value") value
   in
   let* dim_values =
     result_list dims (fun index dim ->
-        expr_json ~reg enum_names value_record_names heap_record_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names
           union_names enum_constructors
           (Printf.sprintf "%s.dims[%d]" path index)
           dim)
@@ -5300,10 +5559,10 @@ and tensor_raw_fill_json ~reg enum_names value_record_names heap_record_names
            ("dims", dim_values);
          ])
 
-and tensor_raw_read_json ~reg enum_names value_record_names heap_record_names union_names
+and tensor_raw_read_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (read : Core.tensor_raw_read) =
   let* index =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".index") read.trr_index
   in
   Ok
@@ -5314,14 +5573,14 @@ and tensor_raw_read_json ~reg enum_names value_record_names heap_record_names un
          ("index", index);
        ])
 
-and tensor_raw_write_json ~reg enum_names value_record_names heap_record_names union_names
+and tensor_raw_write_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (write : Core.tensor_raw_write) =
   let* index =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".index") write.trw_index
   in
   let* value =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".value") write.trw_value
   in
   Ok
@@ -5333,10 +5592,10 @@ and tensor_raw_write_json ~reg enum_names value_record_names heap_record_names u
          ("value", value);
        ])
 
-and tensor_raw_view_binding_json ~reg enum_names value_record_names heap_record_names union_names
+and tensor_raw_view_binding_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (binding : Core.tensor_raw_view_binding) =
   let* source =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".source") binding.trv_source
   in
   Ok
@@ -5354,11 +5613,11 @@ and list_handoff_mode_json = function
 and list_handoff_write_order_json = function
   | Core.ForwardCompacting -> str "forward_compacting"
 
-and list_handoff_json ~reg enum_names value_record_names heap_record_names union_names
+and list_handoff_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path loc (handoff : Core.list_handoff) =
   let* layout = list_storage_layout_json handoff.lh_layout in
   let* source =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".source") handoff.lh_source
   in
   let* source_type =
@@ -5370,11 +5629,11 @@ and list_handoff_json ~reg enum_names value_record_names heap_record_names union
       handoff.lh_result_ty
   in
   let* capacity =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".capacity") handoff.lh_capacity
   in
   let* body =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".body") handoff.lh_body
   in
   Ok
@@ -5398,23 +5657,23 @@ and list_handoff_json ~reg enum_names value_record_names heap_record_names union
          ("write_order", list_handoff_write_order_json handoff.lh_write_order);
        ])
 
-and list_handoff_set_source_slot_json ~reg enum_names value_record_names
+and list_handoff_set_source_slot_json ~function_names ~consumed_params ~reg enum_names value_record_names
     heap_record_names union_names enum_constructors path result out_index source
     source_index =
   let* result_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".result") result
   in
   let* out_index_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".out_index") out_index
   in
   let* source_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".source") source
   in
   let* source_index_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".source_index") source_index
   in
   Ok
@@ -5426,60 +5685,60 @@ and list_handoff_set_source_slot_json ~reg enum_names value_record_names
          ("source_index", source_index_json);
        ])
 
-and string_byte_read_json ~reg enum_names value_record_names heap_record_names union_names
+and string_byte_read_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (read : Core.string_byte_read) =
   match read.sbr_proof with
   | Core.StringReadBoundsProven ->
       let* source =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".source") read.sbr_source
       in
       let* index =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".index") read.sbr_index
       in
       Ok (obj [ ("source", source); ("index", index) ])
 
-and string_byte_write_json ~reg enum_names value_record_names heap_record_names union_names
+and string_byte_write_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (write : Core.string_byte_write) =
   match write.sbw_proof with
   | Core.StringWriteBoundsProven ->
       let* target =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".target") write.sbw_target
       in
       let* index =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".index") write.sbw_index
       in
       let* byte =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".byte") write.sbw_byte
       in
       Ok (obj [ ("target", target); ("index", index); ("byte", byte) ])
 
-and string_byte_copy_json ~reg enum_names value_record_names heap_record_names union_names
+and string_byte_copy_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (copy : Core.string_byte_copy) =
   match copy.sbc_proof with
   | Core.StringCopyBoundsProven ->
       let* dst =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".dst") copy.sbc_dst
       in
       let* dst_pos =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".dst_pos") copy.sbc_dst_pos
       in
       let* src =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".src") copy.sbc_src
       in
       let* src_pos =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".src_pos") copy.sbc_src_pos
       in
       let* len =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".len") copy.sbc_len
       in
       Ok
@@ -5492,45 +5751,45 @@ and string_byte_copy_json ~reg enum_names value_record_names heap_record_names u
              ("len", len);
            ])
 
-and string_set_len_json ~reg enum_names value_record_names heap_record_names union_names
+and string_set_len_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (set_len : Core.string_set_len) =
   match set_len.ssl_proof with
   | Core.StringSetLenBoundsProven ->
       let* target =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".target") set_len.ssl_target
       in
       let* len =
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors (path ^ ".len") set_len.ssl_len
       in
       Ok (obj [ ("target", target); ("len", len) ])
 
-and unbox_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+and unbox_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
     path (u : Core.unbox_op) =
   let* kind_value = unbox_kind_json u.unbox_kind in
   let* expr_value =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".expr") u.unbox_value
   in
   Ok (kind_value, expr_value)
 
-and list_set_json ~reg enum_names value_record_names heap_record_names union_names
+and list_set_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (layout : Core.list_storage_layout) list index value
     =
   let boxed_value = Core_codegen_prepare.boxed_storage_value ~reg value in
   let* () = require_list_set_layout path layout boxed_value in
   let* layout_json = list_storage_layout_json layout in
   let* list_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".list") list
   in
   let* index_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".index") index
   in
   let* value_json =
-    boxed_storage_value_json ~reg enum_names value_record_names heap_record_names union_names
+    boxed_storage_value_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".value") boxed_value
   in
   Ok
@@ -5544,20 +5803,20 @@ and list_set_json ~reg enum_names value_record_names heap_record_names union_nam
            bool (Core_layout_type.is_stack_result_type ~reg value.ty) );
        ])
 
-and list_swap_json ~reg enum_names value_record_names heap_record_names union_names
+and list_swap_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (layout : Core.list_storage_layout) list left_index
     right_index =
   let* layout_json = list_storage_layout_json layout in
   let* list_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".list") list
   in
   let* left_index_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".left_index") left_index
   in
   let* right_index_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".right_index") right_index
   in
   Ok
@@ -5569,15 +5828,15 @@ and list_swap_json ~reg enum_names value_record_names heap_record_names union_na
          ("right_index", right_index_json);
        ])
 
-and list_retain_json ~reg enum_names value_record_names heap_record_names union_names
+and list_retain_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path list value =
   let boxed_value = Core_codegen_prepare.boxed_storage_value ~reg value in
   let* list_json =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".list") list
   in
   let* value_json =
-    boxed_storage_value_json ~reg enum_names value_record_names heap_record_names union_names
+    boxed_storage_value_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
       enum_constructors (path ^ ".value") boxed_value
   in
   Ok (obj [ ("list", list_json); ("value", value_json) ])
@@ -5586,22 +5845,22 @@ and resource_exit_json = function
   | Core.ResourceBreak -> str "break"
   | Core.ResourceContinue -> str "continue"
 
-and resource_scope_json ~reg enum_names value_record_names heap_record_names union_names
+and resource_scope_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (scope : Core.resource_scope) =
   let* typ =
     type_json ~reg enum_names value_record_names heap_record_names union_names (path ^ ".type")
       scope.rs_ty
   in
   let* acquire =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".acquire") scope.rs_acquire
   in
   let* body =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".body") scope.rs_body
   in
   let* cleanup =
-    expr_json ~reg enum_names value_record_names heap_record_names union_names enum_constructors
+    expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names enum_constructors
       (path ^ ".cleanup") scope.rs_cleanup
   in
   Ok
@@ -5614,11 +5873,11 @@ and resource_scope_json ~reg enum_names value_record_names heap_record_names uni
          ("cleanup", cleanup);
        ])
 
-and resource_cleanup_exit_json ~reg enum_names value_record_names heap_record_names union_names
+and resource_cleanup_exit_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (cleanup_exit : Core.resource_cleanup_exit) =
   let* cleanups =
     result_list cleanup_exit.rce_cleanups (fun index cleanup ->
-        expr_json ~reg enum_names value_record_names heap_record_names union_names
+        expr_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors
           (Printf.sprintf "%s.cleanups[%d]" path index)
           cleanup)
@@ -5686,14 +5945,14 @@ and union_representation_json path (uc : Core.union_construct) =
              ("release_mask", int uc.uc_release_mask);
            ])
 
-and union_construct_json ~reg enum_names value_record_names heap_record_names union_names
+and union_construct_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
     enum_constructors path (uc : Core.union_construct) =
   let* representation =
     union_representation_json (path ^ ".representation") uc
   in
   let* args_json =
     result_list uc.uc_args (fun index arg ->
-        boxed_storage_value_json ~reg enum_names value_record_names heap_record_names union_names
+        boxed_storage_value_json ~function_names ~consumed_params ~reg enum_names value_record_names heap_record_names union_names
           enum_constructors
           (Printf.sprintf "%s.args[%d]" path index)
           arg)
@@ -5830,23 +6089,6 @@ let require_emittable_list_store_layout path (layout : Core.list_storage_layout)
   | Core.ListInlineStorage _ ->
       unsupported (path ^ ".layout") inline_scalar_reason
 
-let prepared_list_intrinsic_core_arity = function
-  | "list_ensure_unique" -> Some 1
-  | "list_ensure_capacity" -> Some 2
-  | "list_copy_span_uninit" -> Some 5
-  | _ -> None
-
-let prepared_tensor_intrinsic_core_arity = function
-  | "tensor_get_unchecked" -> Some 2
-  | "tensor_is_word_storage" | "tensor_is_f64_storage"
-  | "tensor_is_f32_storage" | "tensor_is_i64_storage" ->
-      Some 1
-  | _ -> None
-
-let final_backend_intrinsic_core_arity = function
-  | "string_find_byte_from" -> Some 3
-  | _ -> None
-
 let require_core_arity path name expected args =
   let actual = List.length args in
   if actual = expected then Ok ()
@@ -5854,25 +6096,6 @@ let require_core_arity path name expected args =
     unsupported path
       (Printf.sprintf "intrinsic call %s expected %d arg(s), got %d" name
          expected actual)
-
-let require_intrinsic_renderable path name args =
-  if String.equal name "tensor_alloc" then require_core_arity path name 1 args
-  else
-    match
-      Compiler_blorp_bridge.renderer_template_arity_opt_exn
-        ~renderer:Compiler_blorp_bridge.intrinsic_renderer ~op:name
-    with
-    | Some arity -> require_core_arity path name arity args
-    | None -> (
-        match prepared_list_intrinsic_core_arity name with
-        | Some arity -> require_core_arity path name arity args
-        | None -> (
-            match prepared_tensor_intrinsic_core_arity name with
-            | Some arity -> require_core_arity path name arity args
-            | None -> (
-                match final_backend_intrinsic_core_arity name with
-                | Some arity -> require_core_arity path name arity args
-                | None -> unsupported path ("unsupported intrinsic call " ^ name))))
 
 let require_simple_call_kind path ~result_ty call_kind args =
   match call_kind with
@@ -5917,7 +6140,7 @@ let require_simple_call_kind path ~result_ty call_kind args =
               | None -> unsupported path ("builtin call " ^ name))
           | _ when direct_builtin_supported name -> Ok ()
           | _ -> unsupported path ("builtin call " ^ name)))
-  | Core.CKIntrinsic name -> require_intrinsic_renderable path name args
+  | Core.CKIntrinsic _ -> Ok ()
   | Core.CKClosure -> Ok ()
   | Core.CKUnknown -> unsupported path "unresolved call kind"
   | Core.CKSelectedDirect _ -> unsupported path "selected direct call kind"
@@ -6073,6 +6296,7 @@ let rec require_simple_expr path (expr : Core.core) =
   | Core.CRecord fields -> require_record_literal path expr.ty fields
   | Core.CRecordConstruct rc -> require_record_construct path rc
   | Core.CUnionConstruct uc -> require_union_construct path uc
+  | Core.CLambda _ -> Ok ()
   | Core.CClosureCreate _ -> Ok ()
   | Core.CRange (lo, hi) ->
       let* () = require_simple_expr (path ^ ".start") lo in
@@ -6618,22 +6842,51 @@ and require_concurrent_binding ~reg union_names path index
 
 and require_concurrent_block ~reg union_names path
     (block : Core.concurrent_block) =
-  let rec check index = function
-    | [] -> Ok ()
-    | binding :: rest ->
-        let* () =
-          require_concurrent_binding ~reg union_names path index binding
-        in
-        check (index + 1) rest
-  in
-  let* () = check 0 block.conc_bindings in
-  let* () =
-    match block.conc_timeout with
-    | Some timeout ->
-        require_function_body ~reg union_names (path ^ ".timeout") timeout
-    | None -> Ok ()
-  in
-  require_function_body ~reg union_names (path ^ ".body") block.conc_body
+  if
+    List.for_all
+      (fun (binding : Core.conc_binding) -> Option.is_some binding.cb_task)
+      block.conc_bindings
+  then
+    let rec check index = function
+      | [] -> Ok ()
+      | binding :: rest ->
+          let* () =
+            require_concurrent_binding ~reg union_names path index binding
+          in
+          check (index + 1) rest
+    in
+    let* () = check 0 block.conc_bindings in
+    let* () =
+      match block.conc_timeout with
+      | Some timeout ->
+          require_function_body ~reg union_names (path ^ ".timeout") timeout
+      | None -> Ok ()
+    in
+    require_function_body ~reg union_names (path ^ ".body") block.conc_body
+  else if
+    List.exists
+      (fun (binding : Core.conc_binding) -> Option.is_some binding.cb_task)
+      block.conc_bindings
+  then unsupported (path ^ ".bindings") "mixed pre-closure and post-closure concurrent bindings"
+  else
+    let rec check index = function
+      | [] -> Ok ()
+      | (binding : Core.conc_binding) :: rest ->
+          let binding_path = Printf.sprintf "%s.bindings[%d]" path index in
+          let* () =
+            require_function_body ~reg union_names (binding_path ^ ".rhs")
+              binding.cb_rhs
+          in
+          check (index + 1) rest
+    in
+    let* () = check 0 block.conc_bindings in
+    let* () =
+      match block.conc_timeout with
+      | Some timeout ->
+          require_function_body ~reg union_names (path ^ ".timeout") timeout
+      | None -> Ok ()
+    in
+    require_function_body ~reg union_names (path ^ ".body") block.conc_body
 
 and require_concurrently_loop ~reg union_names path
     (loop : Core.concurrently_loop) =
@@ -6648,7 +6901,7 @@ and require_concurrently_loop ~reg union_names path
         | Core.ConcurrentlyLoopMoveResourceItem _ ->
             require_resource_task_captures ~reg (path ^ ".task.captures") 0
               task.tc_captures)
-    | None -> unsupported (path ^ ".task") "missing concurrently loop task closure"
+    | None -> Ok ()
   in
   let* () =
     require_function_body ~reg union_names (path ^ ".iterable") loop.cf_iter
@@ -6881,7 +7134,9 @@ and require_function_body ~reg union_names path (expr : Core.core) =
       | Some task ->
           require_task_copy_captures ~reg (path ^ ".task.captures") 0
             task.tc_captures
-      | None -> unsupported (path ^ ".task") "missing detach task closure")
+      | None ->
+          require_function_body ~reg union_names (path ^ ".body")
+            detach.detach_body)
   | Core.CCall (Core.CKIntrinsic "list_retain_for", _, [ _; _ ])
   | Core.CCall
       ( Core.CKIntrinsic "list_handoff_set_source_slot",
@@ -8247,21 +8502,8 @@ let emit_post_closure_program_to_artifact (config : config)
   in
   Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
 
-let emit_prepared_program_to_artifact (config : config)
-    (program : Core.core_program) =
-  let* core_json = program_json ~reg:config.reg program in
-  let artifact =
-    Compiler_blorp_bridge.emit_c_artifact_exn ~profile:config.profile core_json
-  in
-  Ok (if config.embed_runtime then with_embedded_runtime artifact else artifact)
-
 let emit_program_string config program =
   match emit_post_closure_program_to_artifact config program with
-  | Ok artifact -> Ok artifact.Compiler_blorp_bridge.c_code
-  | Error _ as error -> error
-
-let emit_prepared_program_string config program =
-  match emit_prepared_program_to_artifact config program with
   | Ok artifact -> Ok artifact.Compiler_blorp_bridge.c_code
   | Error _ as error -> error
 
@@ -8271,8 +8513,3 @@ let try_emit_program_string config program =
   | Error error -> Error (unsupported_to_string error)
 
 let try_emit_post_closure_program_string = try_emit_program_string
-
-let try_emit_prepared_program_string config program =
-  match emit_prepared_program_string config program with
-  | Ok _ as ok -> ok
-  | Error error -> Error (unsupported_to_string error)

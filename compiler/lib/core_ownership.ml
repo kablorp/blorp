@@ -1461,8 +1461,8 @@ let string_has_prefix ~prefix value =
 
 let generated_builtin_contract name arity =
   (* Enum vector stringifiers are emitted from type declarations with a
-     type-suffixed C name by Core_specialize/Core_emit. They share the runtime
-     vector-to-string ABI: borrow the vector and return a new String. *)
+     type-suffixed C name by specialization/backend emission. They share the
+     runtime vector-to-string ABI: borrow the vector and return a new String. *)
   if string_has_prefix ~prefix:"blorp_vector_to_string_" name then
     fixed arity [ Borrow ] ReturnOwned
   else None

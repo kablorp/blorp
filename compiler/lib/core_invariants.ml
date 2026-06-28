@@ -665,7 +665,7 @@ let check_void_boxed_builtin_args_explicit_at (stage : Core_stage.t)
                             "Core_specialize should insert CBox for runtime \
                              void* arguments and Core_codegen_prepare should \
                              rewrite it to CBoxTyped before final Core. Do not \
-                             rely on Core_emit.emit_boxed as a fallback."
+                             rely on backend emission as a fallback."
                           (Printf.sprintf
                              "builtin `%s` argument %d reaches final Core \
                               without explicit CBoxTyped for its void* ABI \

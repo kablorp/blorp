@@ -4,6 +4,10 @@
 val list_storage_layout_of_type :
   Core_emit_context.t -> Ast.type_expr -> Ast.loc -> Core.list_storage_layout
 
+val list_runtime_storage_args : Core.list_storage_layout -> string * string
+(** C runtime storage-mode and element-size arguments for a prepared list
+    layout. This is data projection, not C statement/expression emission. *)
+
 val tensor_element_storage :
   Core_emit_context.t ->
   Ast.type_expr ->

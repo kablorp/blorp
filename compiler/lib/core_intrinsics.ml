@@ -9,7 +9,7 @@
 
     This is what makes [builtin] implementation-agnostic: the IR bodies
     are backend-independent; only the [CKIntrinsic] leaf operations need
-    a backend-specific emitter (e.g. [core_emit.ml] for the C backend). *)
+    backend-specific emission in [compiler_core_emit.brp]. *)
 
 open Core
 module B = Core.Build

@@ -1,10 +1,6 @@
-(** Non-recursive helpers used by the [Core_emit] mutual-recursion
-    block. Phase 5.1 step 1 extraction.
-
-    Every function here is a pure helper that neither takes nor calls
-    into the main [emit_expr]/[emit_stmt]/[emit_intrinsic] chain in
-    [core_emit.ml]. Adding a new helper that DOES call into that chain
-    means it belongs inside [core_emit.ml]'s rec block, not here. *)
+(** Shared late-backend helpers used by the Blorp JSON projector and remaining
+    bridge preparation code. These helpers should keep representing explicit
+    Core/layout facts; do not add a new OCaml C-emission path here. *)
 
 val is_pointer_type : Core_emit_context.t -> Ast.type_expr -> bool
 (** Is a type represented as a heap pointer (not a scalar)? *)

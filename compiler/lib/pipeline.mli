@@ -90,6 +90,10 @@ val compile :
   ?profile:bool ->
   ?on_frontend_phase:(frontend_phase -> unit) ->
   ?on_stage:Core_pipeline.on_stage_callback ->
+  ?on_stage_event:Core_pipeline.on_stage_event ->
+  ?on_stage_json:Core_pipeline.on_stage_json_callback ->
+  ?tail_observation_stages:Core_stage.t list ->
+  ?program_observation:Core_pipeline.program_observation ->
   ?check_invariants:bool ->
   filename:string ->
   source:string ->
@@ -116,6 +120,20 @@ val compile :
     intermediate IR and by [--stop-after] to terminate early. Callbacks
     that raise [Core_pipeline.Stopped_after] do not propagate the exception
     outward — [compile] catches it and returns [Ok (Stopped_at s)].
+
+    [on_stage_event] fires after every Core pipeline stage with only the stage
+    marker. Use it for timing or order observation that must not force Core
+    program snapshots.
+
+    [on_stage_json] fires for Blorp-owned late stages requested through
+    [tail_observation_stages]. These observations are bridge JSON because OCaml
+    no longer owns authoritative Core values after the post-Perceus handoff.
+
+    [program_observation] controls how far [on_stage] receives Core program
+    snapshots. The default preserves the legacy all-stage behavior. CLI paths
+    that only need earlier stages can use
+    [Core_pipeline.ObservePreBackendProgramStages] to avoid forcing the old
+    OCaml final-tail snapshot.
 
     [require_main] rejects user sources that do not declare a top-level
     [main] function before Core/codegen. It is intended for runnable entry

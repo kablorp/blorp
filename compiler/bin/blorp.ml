@@ -523,17 +523,26 @@ let open_dump_channel opts =
 
 type obs = {
   callback : Blorp.Core_pipeline.on_stage_callback option;
+  core_stage_event : Blorp.Core_pipeline.on_stage_event option;
+  tail_json_callback : Blorp.Core_pipeline.on_stage_json_callback option;
+  tail_observation_stages : Blorp.Core_stage.t list;
+  program_observation : Blorp.Core_pipeline.program_observation;
   frontend_callback : (Blorp.Pipeline.frontend_phase -> unit) option;
   profiler : Blorp.Core_profile.t option;
   cleanup : unit -> unit;  (** closes the dump channel if one was opened *)
 }
-(** Composite observability handle: the stage callback, optional profiler
-    for summary reporting, and a cleanup thunk that must run on every
-    exit path (success, stop, or error). *)
+(** Composite observability handle: the optional program-bearing stage callback,
+    optional lightweight stage event, optional profiler for summary reporting,
+    and a cleanup thunk that must run on every exit path (success, stop, or
+    error). *)
 
 let obs_none =
   {
     callback = None;
+    core_stage_event = None;
+    tail_json_callback = None;
+    tail_observation_stages = [];
+    program_observation = Blorp.Core_pipeline.ObservePreBackendProgramStages;
     frontend_callback = None;
     profiler = None;
     cleanup = (fun () -> ());
@@ -551,6 +560,30 @@ let dump_git_sha () =
     | _ -> "unknown"
   with _ -> "unknown"
 
+let stop_after_requests_stage opts stage =
+  match opts.stop_after with Some s -> s = stage | None -> false
+
+let compile_opts_requests_stage opts stage =
+  List.exists (fun s -> s = stage) opts.dump_core_after
+  || stop_after_requests_stage opts stage
+
+let tail_json_observation_stages opts =
+  if opts.check_invariants then []
+  else
+    List.filter
+      (fun stage ->
+        Blorp.Core_pipeline.stage_requires_final_tail_program stage
+        && compile_opts_requests_stage opts stage)
+      Blorp.Core_stage.all
+
+let program_callback_observation_stages opts =
+  List.filter
+    (fun stage ->
+      compile_opts_requests_stage opts stage
+      && ((not (Blorp.Core_pipeline.stage_requires_final_tail_program stage))
+         || opts.check_invariants))
+    Blorp.Core_stage.all
+
 (** Build a composite stage callback that may dump, stop, and/or profile.
     Returns [obs_none] if no observability options are active (so the
     pipeline skips the hook overhead entirely). [source_file] is the
@@ -562,6 +595,14 @@ let build_on_stage ?source_file opts : obs =
   let profiler =
     if opts.time_phases then Some (Blorp.Core_profile.create ()) else None
   in
+  let tail_observation_stages = tail_json_observation_stages opts in
+  let program_observation_stages = program_callback_observation_stages opts in
+  let needs_final_tail_program = opts.check_invariants in
+  let program_observation =
+    if needs_final_tail_program then
+      Blorp.Core_pipeline.ObserveAllProgramStages
+    else Blorp.Core_pipeline.ObservePreBackendProgramStages
+  in
   let frontend_callback =
     Option.map
       (fun p phase ->
@@ -569,9 +610,26 @@ let build_on_stage ?source_file opts : obs =
           (Blorp.Pipeline.frontend_phase_to_string phase))
       profiler
   in
-  match (opts.dump_core_after, opts.stop_after, profiler) with
-  | [], None, None -> obs_none
-  | _ ->
+  let core_stage_event = Option.map Blorp.Core_profile.on_stage_event profiler in
+  let needs_program_callback = program_observation_stages <> [] in
+  let needs_tail_json_callback = tail_observation_stages <> [] in
+  let needs_dump_or_stop_callback =
+    needs_program_callback || needs_tail_json_callback
+  in
+  match (needs_dump_or_stop_callback, profiler) with
+  | false, None -> obs_none
+  | false, Some _ ->
+      {
+        callback = None;
+        core_stage_event;
+        tail_json_callback = None;
+        tail_observation_stages = [];
+        program_observation;
+        frontend_callback;
+        profiler;
+        cleanup = (fun () -> ());
+      }
+  | true, _ ->
       let ch, should_close = open_dump_channel opts in
       let closed = ref false in
       let close_once () =
@@ -591,9 +649,6 @@ let build_on_stage ?source_file opts : obs =
         end
       in
       let cb stage prog =
-        (match profiler with
-        | Some p -> Blorp.Core_profile.on_stage p stage prog
-        | None -> ());
         if List.exists (fun s -> s = stage) opts.dump_core_after then begin
           emit_header_once ();
           Printf.fprintf ch "===== after %s =====\n%s"
@@ -606,7 +661,35 @@ let build_on_stage ?source_file opts : obs =
             raise (Blorp.Core_pipeline.Stopped_after stage)
         | _ -> ()
       in
-      { callback = Some cb; frontend_callback; profiler; cleanup = close_once }
+      let tail_cb stage json =
+        if List.exists (fun s -> s = stage) opts.dump_core_after then begin
+          emit_header_once ();
+          Printf.fprintf ch "===== after %s =====\n%s\n"
+            (Blorp.Core_stage.to_string stage)
+            json;
+          flush ch
+        end;
+        match opts.stop_after with
+        | Some s when s = stage ->
+            raise (Blorp.Core_pipeline.Stopped_after stage)
+        | _ -> ()
+      in
+      {
+        callback =
+          (match program_observation_stages with
+          | [] -> None
+          | _ :: _ -> Some cb);
+        core_stage_event;
+        tail_json_callback =
+          (match tail_observation_stages with
+          | [] -> None
+          | _ :: _ -> Some tail_cb);
+        tail_observation_stages;
+        program_observation;
+        frontend_callback;
+        profiler;
+        cleanup = close_once;
+      }
 
 let check_file_with_opts opts filename =
   if not opts.no_format then auto_format_user_file filename;
@@ -692,6 +775,10 @@ let compile_file_with_opts opts filename =
           let result =
             match
               Pipeline.compile ~debug:opts.debug ?on_stage:obs.callback
+                ?on_stage_event:obs.core_stage_event
+                ?on_stage_json:obs.tail_json_callback
+                ~tail_observation_stages:obs.tail_observation_stages
+                ~program_observation:obs.program_observation
                 ~check_invariants:opts.check_invariants
                 ~embed_runtime:opts.embed_runtime
                 ?on_frontend_phase:obs.frontend_callback ~filename ~source ()

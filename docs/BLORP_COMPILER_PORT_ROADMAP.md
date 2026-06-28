@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-06-26.
+Status checked against code on 2026-06-27.
 
 This roadmap is for replacing the OCaml compiler implementation with Blorp
 source. The guiding strategy is direct porting first: copy the OCaml call graph,
@@ -15,11 +15,14 @@ The current production compile path is mixed:
 ```text
 OCaml CLI / module loading / typecheck
   -> OCaml Core lowering and early Core setup
-  -> OCaml Core pipeline through closure conversion
+  -> OCaml Core pipeline through Perceus
   -> JSON handoff
+  -> Blorp normal reuse
+  -> Blorp closure conversion
   -> Blorp resource cleanup lowering
   -> Blorp fairness checkpoint insertion
   -> Blorp final Core preparation
+  -> Blorp prepared union reuse
   -> Blorp C artifact emission
   -> OCaml artifact writing / C compiler invocation
 ```
@@ -43,15 +46,15 @@ Specialize + function-ref adaptation
 Dce
 ConsumeSpecialize
 Perceus
-Reuse
-Closure
 ```
 
-The default backend handoff is the post-closure, pre-resource Core program.
+The default backend handoff is now the post-Perceus Core program.
 Normal emission then calls the Blorp bridge action `emit_post_closure_c`, which
-decodes Core JSON and runs the Blorp post-closure tail:
+decodes Core JSON and runs the Blorp post-Perceus tail:
 
 ```text
+compiler_core_reuse.rewrite_post_perceus_program
+compiler_core_closure.convert_program
 compiler_core_resource.rewrite_resource_program
 compiler_core_fairness.insert_cooperative_checkpoints
 compiler_core_prepare.prepare_program
@@ -62,13 +65,27 @@ compiler_core_emit.try_emit_prepared_core_program_c_artifact_with_options
 There are still important OCaml paths around that default:
 
 - `core_pipeline.ml` still materializes a lazy OCaml final Core program for
-  final-stage dumps, invariant checks, profiling-related observability, and the
-  renderer-helper bootstrap path.
-- That lazy OCaml final path runs `Core_resource`, `Core_fairness`,
-  `Core_codegen_prepare`, and then `Core_reuse.rewrite_prepared_program`.
-  The Blorp production tail now mirrors that final-tail pass sequence.
-- `BLORP_COMPILER_RENDERER_HELPER=1` still routes through the OCaml C emitter so
-  the bridge helper can bootstrap.
+  invariant checks and legacy direct OCaml callers that request all-stage Core
+  program callbacks.
+- That lazy OCaml final path still runs `Core_reuse.rewrite_program`,
+  `Core_closure.convert_program`, `Core_resource`, `Core_fairness`,
+  `Core_codegen_prepare`, and then `Core_reuse.rewrite_prepared_program` for
+  invariant/legacy observation only. Normal C emission uses the Blorp
+  post-Perceus handoff even when final observation is enabled; the OCaml final
+  snapshot no longer routes to a prepared-Core bridge action.
+- Timing-only stage observation now uses a lightweight event callback. It does
+  not force the duplicate OCaml final tail; the Blorp-owned backend tail is
+  reported as the single `final` event.
+- Program-bearing CLI dumps and `--stop-after` requests observe `reuse`,
+  `closure`, and `final` through `run_core_pipeline` Core JSON returned by the
+  Blorp tail. They do not require the lazy OCaml final snapshot unless
+  `--check-invariants` is also active.
+- `BLORP_COMPILER_RENDERER_HELPER=1` is now limited to static table bootstrap
+  for the remaining OCaml language-surface and fairness-policy callers while
+  compiling the bridge helper. It no longer routes C emission through the OCaml
+  emitter or reads emission-template TSV manifests in current source. The TSV
+  files remain temporarily because the pinned bootstrap compiler still needs
+  them to build the bridge helper during hygiene checks.
 - `compiler/lib/core_emit_blorp_c.ml` is still the OCaml Core-to-JSON projector,
   bridge client wrapper, and some validation/subset logic. It is bridge code,
   not the desired long-term compiler implementation.
@@ -78,10 +95,9 @@ The Blorp bridge currently supports these actions in
 
 | Action | Current purpose | Desired long-term status |
 | --- | --- | --- |
-| `emit_c` | Emit already-prepared Core JSON | Keep only while callers need prepared Core |
 | `emit_post_closure_c` | Current production tail handoff | Move left as more stages port |
 | `run_core_pipeline` | Core JSON -> Core JSON for one tail stage | Expand into the main stage parity mechanism |
-| `render` / `render_many` / `renderer_templates` | Temporary snippet/table requests | Delete from production compile path |
+| `render_many` | Temporary non-emission table/diagnostic requests | Delete from production compile path |
 | `lower_and_compile` | Declared, unsupported | Implement when Core lowering ports |
 | `typecheck_and_compile` | Declared, unsupported | Implement when typecheck ports |
 | `compile_source` | Declared, unsupported | Implement when parser/source loading ports |
@@ -92,13 +108,11 @@ Current OCaml-to-Blorp calls outside the main backend handoff are:
 | --- | --- | --- |
 | `compiler/bin/blorp.ml` | Hidden `__compiler-bridge` command | Keep as the command perimeter while OCaml is the outer shell |
 | `compiler/lib/core_pipeline.ml` | Default C backend handoff | Keep, but move the input boundary left over time |
-| `compiler/lib/core_emit_blorp_c.ml` | Core JSON projection, bridge request, intrinsic arity checks | Shrink to the single bridge shim; delete subset logic as stages move |
-| `compiler/lib/core_emit_blorp_backend.ml` | Old OCaml emitter helper using Blorp intrinsic snippets | Delete with OCaml emitter/bootstrap cleanup |
-| `compiler/lib/core_emit_blorp_prepared_backend.ml` | Old OCaml emitter helper using Blorp prepared snippets | Delete with OCaml emitter/bootstrap cleanup |
+| `compiler/lib/core_emit_blorp_c.ml` | Core JSON projection, bridge request, subset validation | Shrink to the single bridge shim; delete subset logic as stages move |
 | `compiler/lib/core_fairness.ml` | OCaml final-tail observability path reads Blorp policy rows | Delete when final tail is fully Blorp-observed |
 | `compiler/lib/language_surface.ml` | Typecheck/LSP/parser-adjacent tables live in Blorp | Remove as a runtime bridge call until typecheck is Blorp-owned |
 | `compiler/lib/core_trait_resolve.ml` | Diagnostic hint rendering | Subsumed when trait resolve ports |
-| `compiler/lib/core_profile.ml` | Profile text rendering | Subsumed when profiling/reporting ports or made static |
+| `compiler/lib/core_profile.ml` | Profile text rendering and lightweight stage-event timing | Subsumed when profiling/reporting ports or made static |
 | `compiler/lib/compiler_blorp_bridge.ml` | Stage/error renderers and bridge process management | Reduce to request/response and helper-cache plumbing |
 
 The earliest current Blorp call is the source-language surface table lookup from
@@ -124,9 +138,9 @@ The boundary should move left in this order:
 
 | Boundary | Blorp owns after handoff | Status |
 | --- | --- | --- |
-| Post-closure Core | resource, fairness, prepare, emit | Current default |
-| Post-reuse / pre-closure Core | closure, resource, fairness, prepare, emit | Next major boundary target |
-| Post-Perceus Core | reuse, closure, final tail, emit | After closure ports |
+| Post-closure Core | resource, fairness, prepare, emit | Completed as the first Blorp tail |
+| Post-reuse / pre-closure Core | closure, resource, fairness, prepare, emit | Completed for default emission |
+| Post-Perceus Core | reuse, closure, final tail, emit | Current default emission boundary |
 | Post-consume-specialize Core | Perceus, reuse, closure, final tail, emit | After ownership tests are mirrored |
 | Post-DCE / post-specialize Core | consume specialize onward | Late ownership checkpoint |
 | Lowered Core | all Core optimization/lowering passes after lowering | Middle-Core checkpoint |
@@ -252,10 +266,13 @@ Implementation:
 - Keep `compiler_core_pipeline.run_post_closure_tail` as the single Blorp-owned
   implementation of the post-closure tail used by both bridge testing and
   production C emission.
-- Expand `run_core_pipeline` so the Blorp tail can return final Core JSON for
-  observation, not only C artifacts.
-- Replace `needs_ocaml_final` in `core_pipeline.ml` with Blorp-backed final
-  observation or Blorp-owned invariant reporting.
+- Keep `emit_post_closure_c` as the only C artifact bridge action. Do not
+  reintroduce a prepared-Core `emit_c` bridge action; prepared emission remains
+  an internal helper behind the Blorp-owned post-closure tail.
+- Done: expanded `run_core_pipeline` so the Blorp tail can return `reuse`,
+  `closure`, and `final` Core JSON for CLI observation, not only C artifacts.
+- Replace the remaining OCaml final invariant snapshot in `core_pipeline.ml`
+  with Blorp-owned invariant reporting or a typed bridge JSON decoder.
 - Keep final-stage names and dump semantics stable.
 - Move any remaining emit-only representation helpers out of
   `core_emit_blorp_c.ml` and into Blorp data/model code when they are part of
@@ -263,8 +280,8 @@ Implementation:
 
 Deletion:
 
-- Delete or reduce `core_resource.ml` and `core_fairness.ml` once final dumps and
-  invariants no longer require their OCaml versions.
+- Delete or reduce `core_resource.ml` and `core_fairness.ml` once invariants and
+  legacy direct OCaml callbacks no longer require their OCaml versions.
 - Delete the prepared-reuse OCaml subgraph if Blorp owns it or tests prove it is
   unreachable/obsolete.
 - Shrink `core_codegen_prepare.ml` to only earlier-stage facts that still have
@@ -284,9 +301,6 @@ snippet renderers called from OCaml emission code.
 
 Direct OCaml slice to mirror:
 
-- `compiler/lib/core_emit_blorp_backend.ml`
-- `compiler/lib/core_emit_blorp_prepared_backend.ml`
-- `compiler/lib/core_emit_intrinsic.ml`
 - remaining bootstrap-only pieces of `core_emit_blorp_template.ml`
 - old OCaml emitter call sites that exist only to use these helpers
 
@@ -297,19 +311,27 @@ Implementation:
   emitter domain module with the same inputs and outputs.
 - Replace runtime arity lookup calls with Blorp-side validation or a generated
   static manifest used only at the bridge edge.
-- Keep renderer actions only for bridge-helper bootstrap and tests until the
-  helper can compile without them.
+- Keep bridge renderer actions only for non-emission table/diagnostic helpers
+  that still have OCaml callers.
 - Stop adding new OCaml emission helper code. New emission support should land
   in Blorp.
 
 Deletion:
 
-- Delete `core_emit_blorp_backend.ml` when no OCaml production emitter calls it.
-- Delete `core_emit_blorp_prepared_backend.ml` when prepared operations are
-  emitted in Blorp.
-- Delete `core_emit_intrinsic.ml` when the old OCaml emitter no longer needs it.
-- Delete renderer-template fallback code after the bridge helper bootstrap no
-  longer depends on it.
+- Done: deleted `core_emit.ml`, `core_emit_blorp_backend.ml`,
+  `core_emit_intrinsic.ml`, `core_emit_pattern.ml`, and
+  `core_emit_blorp_prepared_backend.ml` after Blorp emission became
+  unconditional and the remaining layout projections moved to narrow helpers.
+- Done: removed the OCaml production bridge query for renderer template arity;
+  intrinsic renderability is now validated by the Blorp emitter, while OCaml
+  only checks arity for Core shapes it rewrites before JSON projection.
+- Done: deleted the current OCaml renderer-template TSV fallback and its
+  manifest parser; helper-mode render bootstrap now serves only the two static
+  table families that still have OCaml callers. The TSV files themselves can be
+  deleted after the pinned bootstrap advances past the old manifest reader.
+- Done: removed the bridge-level intrinsic/prepared renderer commands. C
+  emission now uses those Blorp renderer modules internally instead of exposing
+  them as ad-hoc bridge snippet requests.
 
 Validation:
 
@@ -322,6 +344,11 @@ Validation:
 
 Goal: hand off post-reuse/pre-closure Core and let Blorp own closure conversion
 plus the whole tail.
+
+Status: default C emission now uses the Blorp closure conversion as part of the
+post-Perceus tail. OCaml closure conversion still exists for lazy
+`reuse`/`closure`/`final` observability and should not be treated as deleted
+until those dumps and invariant checks are Blorp-backed.
 
 Direct OCaml slice to mirror:
 
@@ -360,6 +387,11 @@ Validation:
 
 Goal: hand off post-Perceus Core and let Blorp own reuse, closure, final tail,
 and emission.
+
+Status: default C emission now hands off post-Perceus Core. The Blorp normal
+reuse pass covers the conservative collection allocation and producer-handoff
+rewrites needed to remove the default OCaml reuse dependency; broader reuse
+analysis parity and OCaml deletion remain.
 
 Direct OCaml slice to mirror:
 

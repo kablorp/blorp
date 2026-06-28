@@ -1,18 +1,13 @@
-(** Single JSON transfer point for Blorp-owned compiler snippets, policies, and
-    downstream compile artifacts.
+(** Single JSON transfer point for Blorp-owned compiler policies and downstream
+    compile artifacts.
 
     Renderer JSON requests are served by [compiler/blorp/compiler_bridge.brp]
-    through the hidden bridge command. The private bootstrap manifest reader is
-    only used while compiling that helper from a cold cache. *)
+    through the hidden bridge command. During a cold bridge-helper compile,
+    helper mode serves only the narrow OCaml callers that still need static
+    table rows before the helper binary exists. *)
 
 let schema_version = 1
 let domain = "compiler"
-let intrinsic_renderer = "intrinsic"
-let prepared_backend_renderer = "prepared_backend"
-let prepared_list_renderer = "prepared_list"
-let prepared_tensor_renderer = "prepared_tensor"
-let prepared_constructor_renderer = "prepared_constructor"
-let prepared_tuple_renderer = "prepared_tuple"
 let core_error_renderer = "core_error"
 let core_fairness_renderer = "core_fairness"
 let core_profile_renderer = "core_profile"
@@ -22,18 +17,6 @@ let language_surface_renderer = "language_surface"
 
 let ( let* ) result f =
   match result with Ok value -> f value | Error _ as error -> error
-
-type renderer_template_info = {
-  renderer_template_name : string;
-  renderer_template_arity : int;
-}
-
-type bootstrap_template = { name : string; arity : int; body : string }
-
-type bootstrap_manifest = {
-  label : string;
-  templates : bootstrap_template list Lazy.t;
-}
 
 let rec find_upwards start name =
   let candidate = Filename.concat start name in
@@ -143,163 +126,6 @@ let bridge_source_tree_digest source_path =
     files;
   string_digest (Buffer.contents buf)
 
-let compiler_lib_file name =
-  Filename.concat (Filename.concat "compiler" "lib") name
-
-let strip_trailing_cr line =
-  let len = String.length line in
-  if len > 0 && line.[len - 1] = '\r' then String.sub line 0 (len - 1) else line
-
-let parse_bootstrap_manifest_line ~label line_no line =
-  let line = strip_trailing_cr line in
-  if String.trim line = "" || line.[0] = '#' then None
-  else
-    match String.split_on_char '\t' line with
-    | [ name; arity_text; body ] -> (
-        match int_of_string_opt arity_text with
-        | Some arity when arity >= 0 -> Some { name; arity; body }
-        | _ ->
-            invalid_arg
-              (Printf.sprintf "invalid %s bootstrap arity on line %d: %S"
-                 label line_no arity_text))
-    | fields ->
-        invalid_arg
-          (Printf.sprintf
-             "invalid %s bootstrap line %d: expected 3 TSV fields, got %d"
-             label line_no (List.length fields))
-
-let create_bootstrap_manifest ?(initial_size = 8) ~label manifest_tsv =
-  let templates =
-    lazy
-      (let parsed =
-         manifest_tsv |> String.split_on_char '\n'
-         |> List.mapi (fun i line ->
-                parse_bootstrap_manifest_line ~label (i + 1) line)
-         |> List.filter_map Fun.id
-       in
-       let tbl = Hashtbl.create initial_size in
-       List.iter
-         (fun template ->
-           if Hashtbl.mem tbl template.name then
-             invalid_arg
-               (Printf.sprintf "duplicate %s bootstrap template for %S" label
-                  template.name);
-           Hashtbl.add tbl template.name ())
-         parsed;
-       parsed)
-  in
-  { label; templates }
-
-let find_bootstrap_template manifest name =
-  List.find_opt (fun template -> String.equal template.name name)
-    (Lazy.force manifest.templates)
-
-let substitute_bootstrap_template template args =
-  if List.length args <> template.arity then
-    invalid_arg
-      (Printf.sprintf "bootstrap template %S expected %d args, got %d"
-         template.name template.arity (List.length args));
-  let rendered_args = Array.of_list args in
-  let body = template.body in
-  let len = String.length body in
-  let buf = Buffer.create (len + 32) in
-  let is_digit c = c >= '0' && c <= '9' in
-  let parse_placeholder start =
-    if body.[start] <> '@' then None
-    else
-      let rec scan_digits i =
-        if i < len && is_digit body.[i] then scan_digits (i + 1) else i
-      in
-      let digit_start = start + 1 in
-      let digit_end = scan_digits digit_start in
-      if digit_end = digit_start || digit_end >= len || body.[digit_end] <> '@'
-      then None
-      else
-        let digit_text =
-          String.sub body digit_start (digit_end - digit_start)
-        in
-        match int_of_string_opt digit_text with
-        | Some arg_index -> Some (arg_index, digit_end + 1)
-        | None ->
-            invalid_arg
-              (Printf.sprintf "bootstrap template %S has invalid placeholder @%s@"
-                 template.name digit_text)
-  in
-  let rec go i =
-    if i >= len then ()
-    else
-      match parse_placeholder i with
-      | Some (arg_index, next_i) ->
-          if arg_index >= Array.length rendered_args then
-            invalid_arg
-              (Printf.sprintf
-                 "bootstrap template %S references arg %d but only %d args are \
-                  available"
-                 template.name arg_index (Array.length rendered_args));
-          Buffer.add_string buf rendered_args.(arg_index);
-          go next_i
-      | None ->
-          Buffer.add_char buf body.[i];
-          go (i + 1)
-  in
-  go 0;
-  Buffer.contents buf
-
-let render_bootstrap_manifest_exn manifest name args =
-  match find_bootstrap_template manifest name with
-  | Some template -> substitute_bootstrap_template template args
-  | None ->
-      invalid_arg
-        (Printf.sprintf "missing %s bootstrap template %S"
-           manifest.label name)
-
-let template_manifest_tsv filename =
-  let rel = compiler_lib_file filename in
-  let starts = [ Sys.getcwd (); Filename.dirname Sys.executable_name ] in
-  match find_upwards_from starts rel with
-  | Some path -> read_file path
-  | None ->
-      invalid_arg
-        (Printf.sprintf "cannot locate Blorp template manifest %s" rel)
-
-let intrinsic_manifest =
-  create_bootstrap_manifest ~initial_size:64 ~label:"codegen intrinsic"
-    (template_manifest_tsv "core_emit_blorp_intrinsic_templates.tsv")
-
-let prepared_backend_manifest =
-  create_bootstrap_manifest ~label:"codegen prepared backend"
-    (template_manifest_tsv "core_emit_blorp_prepared_backend_templates.tsv")
-
-let prepared_list_manifest =
-  create_bootstrap_manifest ~label:"codegen prepared list"
-    (template_manifest_tsv "core_emit_blorp_prepared_list_templates.tsv")
-
-let prepared_tensor_manifest =
-  create_bootstrap_manifest ~label:"codegen prepared tensor"
-    (template_manifest_tsv "core_emit_blorp_prepared_tensor_templates.tsv")
-
-let prepared_constructor_manifest =
-  create_bootstrap_manifest ~label:"codegen prepared constructor"
-    (template_manifest_tsv "core_emit_blorp_prepared_constructor_templates.tsv")
-
-let prepared_tuple_manifest =
-  create_bootstrap_manifest ~label:"codegen prepared tuple"
-    (template_manifest_tsv "core_emit_blorp_prepared_tuple_templates.tsv")
-
-let manifest_for_renderer = function
-  | renderer when renderer = intrinsic_renderer -> Ok intrinsic_manifest
-  | renderer when renderer = prepared_backend_renderer ->
-      Ok prepared_backend_manifest
-  | renderer when renderer = prepared_list_renderer -> Ok prepared_list_manifest
-  | renderer when renderer = prepared_tensor_renderer ->
-      Ok prepared_tensor_manifest
-  | renderer when renderer = prepared_constructor_renderer ->
-      Ok prepared_constructor_manifest
-  | renderer when renderer = prepared_tuple_renderer ->
-      Ok prepared_tuple_manifest
-  | renderer ->
-      Error ("unsupported_renderer", "unsupported Blorp renderer: " ^ renderer)
-
 let json_string s = Lsp_json.String s
 
 let error_response code message =
@@ -356,22 +182,6 @@ let render_item_json (op, args) =
       ("args", Lsp_json.Array (List.map json_string args));
     ]
 
-let render_request_json ~renderer ~op args =
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "render");
-         ( "payload",
-           Lsp_json.Object
-             [
-               ("renderer", Lsp_json.String renderer);
-               ("op", Lsp_json.String op);
-               ("args", Lsp_json.Array (List.map json_string args));
-             ] );
-       ])
-
 let render_many_request_json ~renderer items =
   Lsp_json.to_string
     (Lsp_json.Object
@@ -399,26 +209,16 @@ let emit_post_closure_c_request_json ?(profile = false) core_json =
              [ ("core", core_json); ("profile", Lsp_json.Bool profile) ] );
        ])
 
-let emit_c_request_json ?(profile = false) core_json =
+let run_core_pipeline_request_json ~stage core_json =
   Lsp_json.to_string
     (Lsp_json.Object
        [
          ("schema", Lsp_json.Int schema_version);
          ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "emit_c");
+         ("action", Lsp_json.String "run_core_pipeline");
          ( "payload",
            Lsp_json.Object
-             [ ("core", core_json); ("profile", Lsp_json.Bool profile) ] );
-       ])
-
-let renderer_templates_request_json ~renderer =
-  Lsp_json.to_string
-    (Lsp_json.Object
-       [
-         ("schema", Lsp_json.Int schema_version);
-         ("domain", Lsp_json.String domain);
-         ("action", Lsp_json.String "renderer_templates");
-         ("payload", Lsp_json.Object [ ("renderer", Lsp_json.String renderer) ]);
+             [ ("stage", Lsp_json.String stage); ("core", core_json) ] );
        ])
 
 let parse_response_json response_json =
@@ -433,76 +233,11 @@ let response_result response_json success =
     let* message = error_message_response_field response in
     Error ("bridge_error", message)
 
-let render_response_field response = string_response_field "text" response
-
 let json_response_field name = function
   | Lsp_json.Object fields -> (
       match List.assoc_opt name fields with
       | Some value -> Ok value
       | None -> Error ("invalid_response", "missing JSON field `" ^ name ^ "`"))
-  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
-
-let int_response_field name = function
-  | Lsp_json.Object fields -> (
-      match List.assoc_opt name fields with
-      | Some (Lsp_json.Int value) -> Ok value
-      | Some (Lsp_json.Float value) ->
-          if not (Float.is_finite value) then
-            Error
-              ( "invalid_response",
-                "field `" ^ name ^ "` must be an exact integer" )
-          else
-            let truncated = int_of_float value in
-            if Float.equal value (float_of_int truncated) then Ok truncated
-            else
-              Error
-                ( "invalid_response",
-                  "field `" ^ name ^ "` must be an exact integer" )
-      | Some _ ->
-          Error ("invalid_response", "field `" ^ name ^ "` must be an integer")
-      | None ->
-          Error ("invalid_response", "missing integer field `" ^ name ^ "`"))
-  | _ -> Error ("invalid_response", "bridge response must be a JSON object")
-
-let renderer_templates_response_field = function
-  | Lsp_json.Object fields -> (
-      match List.assoc_opt "items" fields with
-      | Some (Lsp_json.Array values) ->
-          let parse_item = function
-            | Lsp_json.Object item_fields as item ->
-                let* op =
-                  match List.assoc_opt "op" item_fields with
-                  | Some (Lsp_json.String op) -> Ok op
-                  | _ ->
-                      Error
-                        ( "invalid_response",
-                          "renderer template items must contain string op" )
-                in
-                let* arity = int_response_field "arity" item in
-                if arity < 0 then
-                  Error
-                    ( "invalid_response",
-                      "renderer template arity must be non-negative" )
-                else
-                  Ok
-                    {
-                      renderer_template_name = op;
-                      renderer_template_arity = arity;
-                    }
-            | _ ->
-                Error
-                  ( "invalid_response",
-                    "renderer template items must be JSON objects" )
-          in
-          let rec collect acc = function
-            | [] -> Ok (List.rev acc)
-            | value :: rest ->
-                let* item = parse_item value in
-                collect (item :: acc) rest
-          in
-          collect [] values
-      | Some _ -> Error ("invalid_response", "field `items` must be an array")
-      | None -> Error ("invalid_response", "missing array field `items`"))
   | _ -> Error ("invalid_response", "bridge response must be a JSON object")
 
 let render_many_response_field = function
@@ -570,14 +305,6 @@ let c_artifact_response_field response =
   let* include_dirs = string_array_field "include_dirs" artifact in
   Ok { c_code; link_flags; include_dirs }
 
-let render_many_exn ~renderer items =
-  match manifest_for_renderer renderer with
-  | Ok manifest ->
-      List.map
-        (fun (op, args) -> (op, render_bootstrap_manifest_exn manifest op args))
-        items
-  | Error (_, message) -> invalid_arg message
-
 let language_surface_bootstrap_rows =
   [
     ( "language_lsp_completion_keywords",
@@ -597,28 +324,6 @@ let core_fairness_bootstrap_rows =
     ("fairness_body_seq_checkpoint", "true");
     ("fairness_body_other", "false");
   ]
-
-let zero_arg_bootstrap_template_infos rows =
-  List.map
-    (fun (name, _text) ->
-      { renderer_template_name = name; renderer_template_arity = 0 })
-    rows
-
-let renderer_template_infos_for_helper_exn ~renderer =
-  if String.equal renderer language_surface_renderer then
-    zero_arg_bootstrap_template_infos language_surface_bootstrap_rows
-  else if String.equal renderer core_fairness_renderer then
-    zero_arg_bootstrap_template_infos core_fairness_bootstrap_rows
-  else
-    match manifest_for_renderer renderer with
-    | Ok manifest ->
-        Lazy.force manifest.templates
-        |> List.map (fun template ->
-            {
-              renderer_template_name = template.name;
-              renderer_template_arity = template.arity;
-            })
-    | Error (_, message) -> invalid_arg message
 
 let render_zero_arg_bootstrap_item ~label ~rows op args =
   if args <> [] then
@@ -642,7 +347,10 @@ let render_many_for_renderer_helper_exn ~renderer items =
         render_zero_arg_bootstrap_item ~label:"fairness op"
           ~rows:core_fairness_bootstrap_rows op args)
       items
-  else render_many_exn ~renderer items
+  else
+    invalid_arg
+      ("renderer " ^ renderer
+     ^ " is not available while compiling the Blorp bridge helper")
 
 let renderer_bridge_helper_env = "BLORP_COMPILER_RENDERER_HELPER"
 let renderer_bridge_source_env = "BLORP_COMPILER_BRIDGE_RENDERER_SOURCE"
@@ -654,10 +362,6 @@ let renderer_bridge_cache :
   ref None
 
 let render_command_cache : (string, string) Hashtbl.t = Hashtbl.create 512
-
-let renderer_template_infos_cache :
-    (string, renderer_template_info list) Hashtbl.t =
-  Hashtbl.create 16
 
 let bridge_temp_retry_limit = 32
 
@@ -1098,6 +802,7 @@ let compile_renderer_bridge_binary ~program ~source_path ~cache_root parts =
         let compile_code, compile_output, compile_stderr =
           run_process_capture program
             ~env:[ (renderer_bridge_helper_env, "1") ]
+            ~unset_env:[ compiler_bridge_bin_env ]
             [ "compile"; "--no-format"; "-o"; c_path; source_path ]
         in
         if compile_code <> 0 then begin
@@ -1206,30 +911,6 @@ let render_cache_key ~renderer ~op args =
   List.iter add_part args;
   Buffer.contents buf
 
-let renderer_template_infos_exn ~renderer =
-  if running_inside_renderer_bridge_helper () then
-    renderer_template_infos_for_helper_exn ~renderer
-  else
-    match Hashtbl.find_opt renderer_template_infos_cache renderer with
-    | Some infos -> infos
-    | None -> (
-        let response_json =
-          run_renderer_request_via_blorp
-            (renderer_templates_request_json ~renderer)
-        in
-        match
-          response_result response_json renderer_templates_response_field
-        with
-        | Ok infos ->
-            Hashtbl.replace renderer_template_infos_cache renderer infos;
-            infos
-        | Error (_, message) -> invalid_arg message)
-
-let renderer_template_arity_opt_exn ~renderer ~op =
-  renderer_template_infos_exn ~renderer
-  |> List.find_opt (fun info -> String.equal info.renderer_template_name op)
-  |> Option.map (fun info -> info.renderer_template_arity)
-
 let render_via_command_exn ~renderer ~op args =
   if running_inside_renderer_bridge_helper () then
     match render_many_for_renderer_helper_exn ~renderer [ (op, args) ] with
@@ -1244,12 +925,16 @@ let render_via_command_exn ~renderer ~op args =
     | None -> (
         let response_json =
           run_renderer_request_via_blorp
-            (render_request_json ~renderer ~op args)
+            (render_many_request_json ~renderer [ (op, args) ])
         in
-        match response_result response_json render_response_field with
-        | Ok text ->
+        match response_result response_json render_many_response_field with
+        | Ok [ (_, text) ] ->
             Hashtbl.replace render_command_cache cache_key text;
             text
+        | Ok _ ->
+            invalid_arg
+              ("invalid renderer response for single item " ^ renderer ^ ":"
+             ^ op)
         | Error (_, message) -> invalid_arg message)
 
 let render_many_via_command_exn ~renderer items =
@@ -1272,12 +957,13 @@ let emit_post_closure_c_artifact_exn ?(profile = false) core_json =
   | Ok artifact -> artifact
   | Error (_, message) -> invalid_arg message
 
-let emit_c_artifact_exn ?(profile = false) core_json =
+let run_core_pipeline_core_json_exn ~stage core_json =
   let response_json =
-    run_renderer_request_via_blorp (emit_c_request_json ~profile core_json)
+    run_renderer_request_via_blorp
+      (run_core_pipeline_request_json ~stage core_json)
   in
-  match response_result response_json c_artifact_response_field with
-  | Ok artifact -> artifact
+  match response_result response_json (json_response_field "core") with
+  | Ok transformed_core -> transformed_core
   | Error (_, message) -> invalid_arg message
 
 let render_core_stage_unknown_error original normalized =

@@ -141,7 +141,9 @@ scripts/blorp-compiler-bootstrap compile --no-format compiler/blorp/compiler_bri
 ```
 
 `BLORP_COMPILER_BRIDGE_BIN` remains the explicit escape hatch for testing or
-bisecting with another Blorp executable.
+bisecting with another Blorp executable. It selects the compiler used for the
+top-level bridge build; bridge builds clear that override for nested bridge
+requests so an override cannot recursively select itself.
 
 ## Drift Checks
 

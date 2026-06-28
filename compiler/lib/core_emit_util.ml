@@ -1,12 +1,6 @@
-(** Non-recursive helpers used by the [Core_emit] mutual-recursion
-    block. Extracted in Phase 5.1 step 1 to reduce [core_emit.ml]'s
-    size; every function here is a pure helper that neither takes
-    nor calls into the main [emit_expr]/[emit_stmt]/[emit_intrinsic]
-    chain.
-
-    The big rec-chain in [core_emit.ml] itself cannot be split trivially because
-    [emit_expr] and friends are a deep cycle; full extraction requires a
-    late-binding interface for the recursive emit helpers. *)
+(** Shared late-backend helpers used by the Blorp JSON projector and remaining
+    bridge preparation code. These helpers should keep representing explicit
+    Core/layout facts; do not add a new OCaml C-emission path here. *)
 
 open Core
 open Core_emit_context
@@ -606,6 +600,9 @@ let stack_option_payload_type_for_accessor (ctx : Core_emit_context.t)
 let boxed_struct_payload_value c_ty source =
   Printf.sprintf "(*(%s*)((char*)%s + sizeof(blorp_Object)))" c_ty source
 
+let render_tuple_field_element ~tuple ~field =
+  Printf.sprintf "((blorp_Tuple*)%s)->elem[%s]" tuple field
+
 let accessor_reads_stack_option_payload (ctx : Core_emit_context.t)
     (scrut_ty : Ast.type_expr) (acc : accessor) : bool =
   match acc with
@@ -724,8 +721,7 @@ let render_accessor (ctx : Core_emit_context.t) (scrut_name : string)
         in
         Printf.sprintf "%s->data.%s.field%d" cast_parent ctor idx
     | AccTupleField (parent, idx) ->
-        Core_emit_blorp_prepared_backend.render_tuple_field_element
-          ~tuple:(go parent) ~field:(string_of_int idx)
+        render_tuple_field_element ~tuple:(go parent) ~field:(string_of_int idx)
     | AccListElem (parent, idx) ->
         Printf.sprintf "blorp_list_get((blorp_List*)%s, %d)" (go parent) idx
     | AccListSpread (parent, idx) ->
@@ -832,8 +828,8 @@ let render_accessor_typed (ctx : Core_emit_context.t) (scrut_name : string)
                  payload"
               "invalid field accessor on nullable managed Option"
         | _ ->
-            Core_emit_blorp_prepared_backend.render_tuple_field_element
-              ~tuple:(go parent) ~field:(string_of_int idx))
+            render_tuple_field_element ~tuple:(go parent)
+              ~field:(string_of_int idx))
     | AccListElem (parent, idx) -> (
         match accessor_type ctx scrut_ty parent with
         | Some parent_ty when is_nullable_managed_option ctx parent_ty ->

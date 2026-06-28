@@ -1,9 +1,8 @@
-(** Emission context for Core → C.
+(** Shared context for late Core → C bridge helpers.
 
-    Deliberately separate from [Codegen_context.t] so that Core emission
-    is insulated from old-codegen assumptions. Only the state Core_emit
-    actually needs lives here: output buffer, indentation, a single
-    temp-name counter, and the string-literal deduplication table.
+    Deliberately separate from [Codegen_context.t] so the Blorp bridge
+    projection and remaining representation helpers are insulated from
+    old-codegen assumptions.
 
     During migration, the old [Codegen_context.t] remains for the legacy
     codegen path. The two contexts are independent. *)
@@ -62,14 +61,9 @@ type t = {
       [void*] even when the use site has a concrete instantiated type. *)
   trait_impl_def_ids : (string, int) Hashtbl.t;
       (** A4.2: trait-impl mangled name (e.g. [Hashable_hash_Widget])
-      → [cf_def_id] of the emitted method. Populated by [emit_impl]
-      when it walks [ci_methods]. Consumed by hardcoded trait-ptr
-      emission sites (the [blorp_set_new_custom] / [blorp_dict_new_custom]
-      fallbacks at [core_emit.ml:642]) that bypass the [CKUser]
-      resolve path. A4.3 may collapse this into a unified trait
-      method table; for now it's the minimal patch to keep
-      user-hashable / user-equatable set + dict creation working
-      after trait-impl method names gained a [__def_N_] prefix. *)
+      → [cf_def_id] of the emitted method. Retained while the Blorp bridge
+      still consumes the old helper context shape. A later cleanup can remove
+      this field with the unused helper state around it. *)
 }
 
 (** Create a fresh emission context with its own [Codegen_types.registry].
@@ -232,8 +226,7 @@ let emit_string_literal ctx s =
   emit ctx (binding.sl_helper ^ "()")
 
 (** Emit a blorp literal as a C expression. Byte-identical to the
-    legacy [Codegen_emit.gen_literal] — duplicated here to keep
-    Core_emit self-contained. *)
+    legacy [Codegen_emit.gen_literal]. *)
 let int64_c_literal n =
   if Int64.equal n Int64.min_int then "(-9223372036854775807L - 1L)"
   else Printf.sprintf "%LdL" n

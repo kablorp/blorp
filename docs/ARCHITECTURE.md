@@ -29,12 +29,12 @@ Source (.brp)
     v
 +------------+
 | Core IR    |  Lowering → observed transform stages → JSON handoff for
-| pipeline   |  supported Blorp tail, with OCaml fallback while migration continues
+| pipeline   |  the supported Blorp-owned backend tail
 +------------+
     |
     v
 +------------+
-| C Emission |  Blorp C artifact path for supported Core; OCaml fallback otherwise
+| C Emission |  Blorp C artifact path; unsupported Core is a compiler error
 +------------+
     |
     v
@@ -54,13 +54,21 @@ late representation choices explicit in Core before C artifact emission. The
 Core path is the compiler's codegen path.
 
 During the OCaml-to-Blorp port, the supported default backend route crosses the
-single JSON bridge after closure conversion and before resource/fairness/final
-preparation. On that route, `compiler/blorp/compiler_core_resource.brp`,
-`compiler_core_fairness.brp`, `compiler_core_prepare.brp`, and
-`compiler_core_emit.brp` own the contiguous tail through C artifact generation.
-The OCaml `core_resource.ml`, `core_fairness.ml`, `core_codegen_prepare.ml`, and
-`core_emit.ml` paths remain for explicit final-stage observation, invariant
-checking, profiling builds, unsupported Core shapes, and fallback emission.
+single JSON bridge after `Core_perceus`. On that route,
+`compiler/blorp/compiler_core_reuse.brp`,
+`compiler/blorp/compiler_core_closure.brp`,
+`compiler/blorp/compiler_core_resource.brp`,
+`compiler/blorp/compiler_core_fairness.brp`,
+`compiler/blorp/compiler_core_prepare.brp`, and
+`compiler/blorp/compiler_core_emit.brp` own the contiguous tail through C
+artifact generation. The OCaml `core_reuse.ml`, `core_closure.ml`,
+`core_resource.ml`, `core_fairness.ml`, and `core_codegen_prepare.ml` paths
+remain only for invariant checking and direct OCaml API callers that still ask
+for legacy all-stage `Core.core_program` callbacks. CLI `reuse`/`closure`/
+`final` dumps and stops observe the Blorp-owned tail as Core JSON through the
+bridge. Timing-only observation and earlier-stage dumps/stops also avoid
+materializing the duplicate OCaml tail. C artifact emission is owned by the
+Blorp backend bridge.
 
 ```
 Typed AST
@@ -160,25 +168,19 @@ Typed AST
 +--------------+  Koka-style precise RC: branch-aware, last-use semantics
     |
     v
-+------------+
-| Core_reuse |  Rewrite proven post-Perceus allocation reuse candidates
-+------------+  (core_reuse.ml)
++--------------------------+
+| JSON handoff (supported) |  Supported post-Perceus Core enters the
++--------------------------+  Blorp-owned compiler tail for normal emission
+    v
++------------------+
+| Blorp Core_reuse |  Rewrite proven post-Perceus allocation reuse candidates
++------------------+  (compiler_core_reuse.brp)
     |
     v
-+--------------------------+
-| JSON handoff (supported) |  Supported post-reuse/pre-closure Core enters
-+--------------------------+  Blorp first when closure conversion is unnecessary
-    |                       otherwise
-    v
-+--------------+
-| Core_closure |  Hoist lambdas and build closure values (core_closure.ml)
-+--------------+
++--------------------+
+| Blorp Core_closure |  Hoist lambdas and build closure values
++--------------------+  (compiler_core_closure.brp)
     |
-    v
-+--------------------------+
-| JSON handoff (supported) |  Supported post-closure/pre-resource Core enters
-+--------------------------+  the Blorp-owned tail; unsupported shapes stay on
-    |                       the OCaml compatibility path
     v
 +---------------------+
 | Blorp Core_resource |  Resource-scope break/continue cleanup exits
@@ -200,10 +202,20 @@ Typed AST
 +-------------------+  (compiler_core_emit.brp)
 ```
 
-OCaml compatibility/fallback route:
+Temporary OCaml final-tail invariant route:
 
 ```
-Core_closure
+Post-Perceus Core
+    |
+    v
++------------+
+| Core_reuse |  Rewrite proven post-Perceus allocation reuse candidates
++------------+  for observed Core snapshots (core_reuse.ml)
+    |
+    v
++--------------+
+| Core_closure |  Hoist lambdas and build closure values (core_closure.ml)
++--------------+
     |
     v
 +---------------+
@@ -227,16 +239,11 @@ Core_closure
     |
     v
 +-------+
-| Final |  Snapshot after final preparation; used by --dump-core and
-+-------+  final safety checks
+| Final |  Snapshot after final preparation; used by final safety checks
++-------+  until invariants move to Blorp or bridge JSON is decoded
     |
     v
-+-------------------+
-| C emission path   |  Generate C from the final Core IR
-+-------------------+
-    |
-    v
-C string
+Observed Core snapshot
 ```
 
 **Design principles:**
@@ -304,11 +311,8 @@ boxing, or ownership behavior from source spelling.
 | `core_reuse.ml` | Post-Perceus allocation reuse analysis and prepared-Core union-node reuse rewrites |
 | `core_closure.ml` | Closure conversion / lambda hoisting |
 | `core_perceus_check.ml` | RC balance simulator for testing |
-| `core_emit_blorp_c.ml` | Core JSON projection for the Blorp-owned tail C path, preferring post-reuse/pre-closure Core when closure conversion is unnecessary, then post-closure/pre-resource Core, and forcing final Core only for observation, invariants, unsupported subsets, or fallback |
-| `core_emit.ml` | OCaml Core → C fallback emission while Blorp backend coverage expands |
-| `core_emit_context.ml` | Emission state (buffers, lambda collection) |
-| `core_emit_intrinsic.ml`, `core_emit_list_intrinsic.ml` | Intrinsic and list-helper emission |
-| `core_emit_pattern.ml`, `core_emit_util.ml` | Pattern-emission and shared backend utilities |
+| `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
+| `core_emit_context.ml`, `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation helpers still used by the bridge projector |
 | `core_flatten.ml` | Module prefixing and import-table assembly |
 | `core_invariants.ml` | Stage-boundary invariant checks |
 | `core_pipeline.ml` | Pipeline orchestration, module assembly |
@@ -402,12 +406,9 @@ compiler/
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
 │   ├── core_layout_type.ml  # Shared layout metadata types
 │   ├── core_perceus_check.ml # RC balance simulator (testing)
-│   ├── core_emit.ml       # OCaml Core IR → C fallback emission
-│   ├── core_emit_context.ml # Core emission state
-│   ├── core_emit_intrinsic.ml # Intrinsic emission helpers
-│   ├── core_emit_list_intrinsic.ml # List intrinsic emission helpers
-│   ├── core_emit_pattern.ml # Pattern-match C emission helpers
-│   ├── core_emit_util.ml  # Shared emitter utilities
+│   ├── core_emit_blorp_c.ml # Core JSON projection and Blorp bridge client
+│   ├── core_emit_context.ml # Shared late-backend helper context
+│   ├── core_emit_util.ml  # Shared late-backend helper utilities
 │   ├── core_intrinsics.ml # IR body synthesis for builtins/intrinsics
 │   ├── core_intrinsic_registry.ml # Intrinsic manifest and contracts
 │   ├── core_invariants.ml # Stage-boundary invariant checks
@@ -800,7 +801,7 @@ Unified CLI with subcommands:
      explicitly in Core and lower it in a dedicated pass before shared
      optimizations.
 
-7. **Core emission** (`core_emit.ml`):
+7. **Core emission** (`compiler/blorp/compiler_core_emit.brp`):
    - Emit C for the new Core node, if one was introduced.
 
 ### Adding a New Builtin Function

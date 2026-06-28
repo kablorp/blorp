@@ -200,6 +200,8 @@ private TUPLE_EXPR_TAG: String = "tuple"
 
 private TUPLE_CONSTRUCT_EXPR_TAG: String = "tuple_construct"
 
+private LAMBDA_EXPR_TAG: String = "lambda"
+
 private CLOSURE_CREATE_EXPR_TAG: String = "closure_create"
 
 private LIST_CONSTRUCT_EXPR_TAG: String = "list_construct"
@@ -416,6 +418,8 @@ private FOR_TENSOR_EXPR_TAG: String = "for_tensor"
 
 private CONCURRENTLY_LOOP_EXPR_TAG: String = "concurrently_loop"
 
+private PRE_CLOSURE_CONCURRENTLY_LOOP_EXPR_TAG: String = "pre_closure_concurrently_loop"
+
 private CONCURRENTLY_LOOP_COLLECT_TAG: String = "collect"
 
 private CONCURRENTLY_LOOP_DISCARD_TAG: String = "discard"
@@ -431,6 +435,10 @@ private CONCURRENTLY_LOOP_COPY_ITEM_TAG: String = "copy"
 private CONCURRENTLY_LOOP_MOVE_RESOURCE_ITEM_TAG: String = "move_resource_item"
 
 private CONCURRENT_EXPR_TAG: String = "concurrent"
+
+private PRE_CLOSURE_CONCURRENT_EXPR_TAG: String = "pre_closure_concurrent"
+
+private PRE_CLOSURE_DETACH_EXPR_TAG: String = "pre_closure_detach"
 
 private SELECT_EXPR_TAG: String = "select"
 
@@ -908,6 +916,7 @@ union CoreExpr:
 	TupleFieldExpr(CoreExpr, Int, CoreType, CoreSourceLoc)
 	TupleExpr(List[CoreExpr], CoreType, CoreSourceLoc)
 	TupleConstructExpr(CoreTupleConstruct, CoreType, CoreSourceLoc)
+	LambdaExpr(List[CoreParam], CoreType, CoreExpr, Bool, CoreType, CoreSourceLoc)
 	ClosureCreateExpr(CoreClosureCreate, CoreType, CoreSourceLoc)
 	ListConstructExpr(CoreListConstruct, CoreType, CoreSourceLoc)
 	ListAllocExpr(CoreListAlloc, CoreType, CoreSourceLoc)
@@ -959,8 +968,11 @@ union CoreExpr:
 	ForStreamExpr(CoreForStream, CoreType, CoreSourceLoc)
 	ForResourceSourceExpr(CoreForResourceSource, CoreType, CoreSourceLoc)
 	ForTensorExpr(CoreForTensor, CoreType, CoreSourceLoc)
+	PreClosureConcurrentlyLoopExpr(CorePreClosureConcurrentlyLoop, CoreType, CoreSourceLoc)
 	ConcurrentlyLoopExpr(CoreConcurrentlyLoop, CoreType, CoreSourceLoc)
+	PreClosureConcurrentExpr(CorePreClosureConcurrentBlock, CoreType, CoreSourceLoc)
 	ConcurrentExpr(CoreConcurrentBlock, CoreType, CoreSourceLoc)
+	PreClosureDetachExpr(CorePreClosureDetach, CoreType, CoreSourceLoc)
 	SelectExpr(CoreSelect, CoreType, CoreSourceLoc)
 	RangeExpr(CoreExpr, CoreExpr, CoreType, CoreSourceLoc)
 	LiteralMatchExpr(CoreExpr, List[CoreLiteralMatchCase], CoreLiteralMatchFallback, CoreType, CoreSourceLoc)
@@ -1276,6 +1288,11 @@ record CoreTaskClosure {
 }
 
 
+record CorePreClosureDetach {
+	body: CoreExpr
+}
+
+
 record CoreDetach {
 	task: CoreTaskClosure
 }
@@ -1310,6 +1327,18 @@ record CoreConcurrentlyLoop {
 }
 
 
+record CorePreClosureConcurrentlyLoop {
+	variable: CoreVar,
+	item_type: CoreType,
+	item_mode: CoreConcurrentlyLoopItemMode,
+	iterable: CoreExpr,
+	body: CoreExpr,
+	timeout: Option[CoreExpr],
+	limit: CoreExpr,
+	output: CoreConcurrentlyLoopOutput
+}
+
+
 record CoreConcurrentBinding {
 	variable: CoreVar,
 	typ: CoreType,
@@ -1318,8 +1347,23 @@ record CoreConcurrentBinding {
 }
 
 
+record CorePreClosureConcurrentBinding {
+	variable: CoreVar,
+	typ: CoreType,
+	rhs: CoreExpr
+}
+
+
 record CoreConcurrentBlock {
 	bindings: List[CoreConcurrentBinding],
+	body: CoreExpr,
+	timeout: Option[CoreExpr],
+	max_threads: Option[Int]
+}
+
+
+record CorePreClosureConcurrentBlock {
+	bindings: List[CorePreClosureConcurrentBinding],
 	body: CoreExpr,
 	timeout: Option[CoreExpr],
 	max_threads: Option[Int]
@@ -5615,6 +5659,10 @@ private pure func core_detach_to_json(detached: CoreDetach) -> JsonValue:
 	JsonObject([("task", core_task_closure_to_json(detached.task))])
 
 
+private pure func core_pre_closure_detach_to_json(detached: CorePreClosureDetach) -> JsonValue:
+	JsonObject([("body", core_expr_to_json(detached.body))])
+
+
 private pure func decode_core_detach_json(
 	value: JsonValue,
 	path: String,
@@ -5626,6 +5674,19 @@ private pure func decode_core_detach_json(
 	)
 
 	Ok({task = task})
+
+
+private pure func decode_core_pre_closure_detach_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CorePreClosureDetach, CoreJsonError]:
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_expr_json(
+		body_json,
+		path_field(path, "body"),
+	)
+
+	Ok({body = body})
 
 
 private pure func core_concurrently_loop_output_to_json(
@@ -5706,6 +5767,21 @@ private pure func core_concurrently_loop_to_json(loop: CoreConcurrentlyLoop) -> 
 	])
 
 
+private pure func core_pre_closure_concurrently_loop_to_json(
+	loop: CorePreClosureConcurrentlyLoop,
+) -> JsonValue:
+	JsonObject([
+		("var", core_var_to_json(loop.variable)),
+		("item_type", core_type_to_json(loop.item_type)),
+		("item_mode", core_concurrently_loop_item_mode_to_json(loop.item_mode)),
+		("iterable", core_expr_to_json(loop.iterable)),
+		("body", core_expr_to_json(loop.body)),
+		("timeout", option_expr_to_json(loop.timeout)),
+		("limit", core_expr_to_json(loop.limit)),
+		("output", core_concurrently_loop_output_to_json(loop.output)),
+	])
+
+
 private pure func decode_core_concurrently_loop_json(
 	value: JsonValue,
 	path: String,
@@ -5765,12 +5841,75 @@ private pure func decode_core_concurrently_loop_json(
 	})
 
 
+private pure func decode_core_pre_closure_concurrently_loop_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CorePreClosureConcurrentlyLoop, CoreJsonError]:
+	var_json ?= object_field(value, path, "var")
+	variable ?= decode_core_var_json(
+		var_json,
+		path_field(path, "var"),
+	)
+	item_type_json ?= object_field(value, path, "item_type")
+	item_type ?= decode_core_type_json(
+		item_type_json,
+		path_field(path, "item_type"),
+	)
+	item_mode_json ?= object_field(value, path, "item_mode")
+	item_mode ?= decode_core_concurrently_loop_item_mode_json(
+		item_mode_json,
+		path_field(path, "item_mode"),
+	)
+	iterable_json ?= object_field(value, path, "iterable")
+	iterable ?= decode_core_expr_json(
+		iterable_json,
+		path_field(path, "iterable"),
+	)
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_expr_json(
+		body_json,
+		path_field(path, "body"),
+	)
+	timeout ?= decode_optional_expr(value, path, "timeout")
+	limit_json ?= object_field(value, path, "limit")
+	limit ?= decode_core_expr_json(
+		limit_json,
+		path_field(path, "limit"),
+	)
+	output_tag ?= string_field(value, path, "output")
+	output ?= decode_core_concurrently_loop_output_tag(
+		output_tag,
+		path_field(path, "output"),
+	)
+
+	Ok({
+		variable = variable,
+		item_type = item_type,
+		item_mode = item_mode,
+		iterable = iterable,
+		body = body,
+		timeout = timeout,
+		limit = limit,
+		output = output,
+	})
+
+
 private pure func core_concurrent_binding_to_json(binding: CoreConcurrentBinding) -> JsonValue:
 	JsonObject([
 		("var", core_var_to_json(binding.variable)),
 		("type", core_type_to_json(binding.typ)),
 		("rhs", core_expr_to_json(binding.rhs)),
 		("task", core_task_closure_to_json(binding.task)),
+	])
+
+
+private pure func core_pre_closure_concurrent_binding_to_json(
+	binding: CorePreClosureConcurrentBinding,
+) -> JsonValue:
+	JsonObject([
+		("var", core_var_to_json(binding.variable)),
+		("type", core_type_to_json(binding.typ)),
+		("rhs", core_expr_to_json(binding.rhs)),
 	])
 
 
@@ -5807,6 +5946,33 @@ private pure func decode_core_concurrent_binding_json(
 	})
 
 
+private pure func decode_core_pre_closure_concurrent_binding_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CorePreClosureConcurrentBinding, CoreJsonError]:
+	var_json ?= object_field(value, path, "var")
+	variable ?= decode_core_var_json(
+		var_json,
+		path_field(path, "var"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	rhs_json ?= object_field(value, path, "rhs")
+	rhs ?= decode_core_expr_json(
+		rhs_json,
+		path_field(path, "rhs"),
+	)
+
+	Ok({
+		variable = variable,
+		typ = typ,
+		rhs = rhs,
+	})
+
+
 private pure func core_concurrent_bindings_to_json(
 	bindings: List[CoreConcurrentBinding],
 ) -> JsonValue:
@@ -5814,6 +5980,17 @@ private pure func core_concurrent_bindings_to_json(
 
 	for binding in bindings:
 		values = values.append(core_concurrent_binding_to_json(binding))
+
+	JsonVector(values)
+
+
+private pure func core_pre_closure_concurrent_bindings_to_json(
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> JsonValue:
+	var values: List[JsonValue] = []
+
+	for binding in bindings:
+		values = values.append(core_pre_closure_concurrent_binding_to_json(binding))
 
 	JsonVector(values)
 
@@ -5854,9 +6031,56 @@ private pure func decode_core_concurrent_bindings(
 			Ok(result)
 
 
+private pure func decode_core_pre_closure_concurrent_bindings(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[List[CorePreClosureConcurrentBinding], CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: List[CorePreClosureConcurrentBinding] = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		match error:
+			Some(existing_error):
+				void
+			None:
+				match decode_core_pre_closure_concurrent_binding_json(
+					item,
+					path_index(
+						path_field(path, field_name),
+						index,
+					),
+				):
+					Ok(binding):
+						result = result.append(binding)
+					Err(err):
+						error = Some(err)
+
+		index += 1
+
+	match error:
+		Some(existing_error):
+			Err(existing_error)
+		None:
+			Ok(result)
+
+
 private pure func core_concurrent_block_to_json(block: CoreConcurrentBlock) -> JsonValue:
 	JsonObject([
 		("bindings", core_concurrent_bindings_to_json(block.bindings)),
+		("body", core_expr_to_json(block.body)),
+		("timeout", option_expr_to_json(block.timeout)),
+		("max_threads", option_int_to_json(block.max_threads)),
+	])
+
+
+private pure func core_pre_closure_concurrent_block_to_json(
+	block: CorePreClosureConcurrentBlock,
+) -> JsonValue:
+	JsonObject([
+		("bindings", core_pre_closure_concurrent_bindings_to_json(block.bindings)),
 		("body", core_expr_to_json(block.body)),
 		("timeout", option_expr_to_json(block.timeout)),
 		("max_threads", option_int_to_json(block.max_threads)),
@@ -5868,6 +6092,27 @@ private pure func decode_core_concurrent_block_json(
 	path: String,
 ) -> Result[CoreConcurrentBlock, CoreJsonError]:
 	bindings ?= decode_core_concurrent_bindings(value, path, "bindings")
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_expr_json(
+		body_json,
+		path_field(path, "body"),
+	)
+	timeout ?= decode_optional_expr(value, path, "timeout")
+	max_threads ?= decode_optional_int(value, path, "max_threads")
+
+	Ok({
+		bindings = bindings,
+		body = body,
+		timeout = timeout,
+		max_threads = max_threads,
+	})
+
+
+private pure func decode_core_pre_closure_concurrent_block_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CorePreClosureConcurrentBlock, CoreJsonError]:
+	bindings ?= decode_core_pre_closure_concurrent_bindings(value, path, "bindings")
 	body_json ?= object_field(value, path, "body")
 	body ?= decode_core_expr_json(
 		body_json,
@@ -7674,6 +7919,25 @@ private pure func core_expr_tuple_construct_to_json(
 	])
 
 
+private pure func core_expr_lambda_to_json(
+	params: List[CoreParam],
+	return_type: CoreType,
+	body: CoreExpr,
+	is_pure: Bool,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(LAMBDA_EXPR_TAG)),
+		("params", core_params_to_json(params)),
+		("return_type", core_type_to_json(return_type)),
+		("body", core_expr_to_json(body)),
+		("pure", JsonBool(is_pure)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_closure_create_to_json(
 	closure: CoreClosureCreate,
 	typ: CoreType,
@@ -8354,6 +8618,19 @@ private pure func core_expr_for_tensor_to_json(
 	])
 
 
+private pure func core_expr_pre_closure_concurrently_loop_to_json(
+	loop: CorePreClosureConcurrentlyLoop,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(PRE_CLOSURE_CONCURRENTLY_LOOP_EXPR_TAG)),
+		("pre_closure_concurrently_loop", core_pre_closure_concurrently_loop_to_json(loop)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_concurrently_loop_to_json(
 	loop: CoreConcurrentlyLoop,
 	typ: CoreType,
@@ -8367,6 +8644,19 @@ private pure func core_expr_concurrently_loop_to_json(
 	])
 
 
+private pure func core_expr_pre_closure_concurrent_to_json(
+	block: CorePreClosureConcurrentBlock,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(PRE_CLOSURE_CONCURRENT_EXPR_TAG)),
+		("pre_closure_concurrent", core_pre_closure_concurrent_block_to_json(block)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
 private pure func core_expr_concurrent_to_json(
 	block: CoreConcurrentBlock,
 	typ: CoreType,
@@ -8375,6 +8665,19 @@ private pure func core_expr_concurrent_to_json(
 	JsonObject([
 		(KIND_FIELD, JsonString(CONCURRENT_EXPR_TAG)),
 		("concurrent", core_concurrent_block_to_json(block)),
+		("type", core_type_to_json(typ)),
+		("loc", source_loc_to_json(loc)),
+	])
+
+
+private pure func core_expr_pre_closure_detach_to_json(
+	detached: CorePreClosureDetach,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> JsonValue:
+	JsonObject([
+		(KIND_FIELD, JsonString(PRE_CLOSURE_DETACH_EXPR_TAG)),
+		("pre_closure_detach", core_pre_closure_detach_to_json(detached)),
 		("type", core_type_to_json(typ)),
 		("loc", source_loc_to_json(loc)),
 	])
@@ -8538,6 +8841,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_tuple_to_json(items, typ, loc)
 		TupleConstructExpr(tuple_construct, typ, loc):
 			core_expr_tuple_construct_to_json(tuple_construct, typ, loc)
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			core_expr_lambda_to_json(params, return_type, body, is_pure, typ, loc)
 		ClosureCreateExpr(closure, typ, loc):
 			core_expr_closure_create_to_json(closure, typ, loc)
 		ListConstructExpr(construct, typ, loc):
@@ -8594,6 +8899,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_union_reuse_construct_to_json(construct, typ, loc)
 		DetachExpr(detached, typ, loc):
 			core_expr_detach_to_json(detached, typ, loc)
+		PreClosureDetachExpr(detached, typ, loc):
+			core_expr_pre_closure_detach_to_json(detached, typ, loc)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			core_expr_dup_to_json(variable, value_type, retain_policy, body, typ, loc)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
@@ -8640,8 +8947,12 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_for_resource_source_to_json(for_resource_source, typ, loc)
 		ForTensorExpr(for_tensor, typ, loc):
 			core_expr_for_tensor_to_json(for_tensor, typ, loc)
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			core_expr_pre_closure_concurrently_loop_to_json(loop, typ, loc)
 		ConcurrentlyLoopExpr(loop, typ, loc):
 			core_expr_concurrently_loop_to_json(loop, typ, loc)
+		PreClosureConcurrentExpr(block, typ, loc):
+			core_expr_pre_closure_concurrent_to_json(block, typ, loc)
 		ConcurrentExpr(block, typ, loc):
 			core_expr_concurrent_to_json(block, typ, loc)
 		SelectExpr(select_expr, typ, loc):
@@ -9096,6 +9407,35 @@ private pure func decode_core_expr_tuple_construct_from_json(
 		path_field(path, "loc"),
 	)
 	Ok(TupleConstructExpr(tuple_construct, typ, loc))
+
+
+private pure func decode_core_expr_lambda_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	params ?= decode_core_params(value, path, "params")
+	return_type_json ?= object_field(value, path, "return_type")
+	return_type ?= decode_core_type_json(
+		return_type_json,
+		path_field(path, "return_type"),
+	)
+	body_json ?= object_field(value, path, "body")
+	body ?= decode_core_expr_json(
+		body_json,
+		path_field(path, "body"),
+	)
+	is_pure ?= bool_field(value, path, "pure")
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(LambdaExpr(params, return_type, body, is_pure, typ, loc))
 
 
 private pure func decode_core_expr_closure_create_from_json(
@@ -10275,6 +10615,28 @@ private pure func decode_core_expr_concurrently_loop_from_json(
 	Ok(ConcurrentlyLoopExpr(loop, typ, loc))
 
 
+private pure func decode_core_expr_pre_closure_concurrently_loop_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	loop_json ?= object_field(value, path, "pre_closure_concurrently_loop")
+	loop ?= decode_core_pre_closure_concurrently_loop_json(
+		loop_json,
+		path_field(path, "pre_closure_concurrently_loop"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(PreClosureConcurrentlyLoopExpr(loop, typ, loc))
+
+
 private pure func decode_core_expr_concurrent_from_json(
 	value: JsonValue,
 	path: String,
@@ -10295,6 +10657,50 @@ private pure func decode_core_expr_concurrent_from_json(
 		path_field(path, "loc"),
 	)
 	Ok(ConcurrentExpr(block, typ, loc))
+
+
+private pure func decode_core_expr_pre_closure_concurrent_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	block_json ?= object_field(value, path, "pre_closure_concurrent")
+	block ?= decode_core_pre_closure_concurrent_block_json(
+		block_json,
+		path_field(path, "pre_closure_concurrent"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(PreClosureConcurrentExpr(block, typ, loc))
+
+
+private pure func decode_core_expr_pre_closure_detach_from_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreExpr, CoreJsonError]:
+	detach_json ?= object_field(value, path, "pre_closure_detach")
+	detached ?= decode_core_pre_closure_detach_json(
+		detach_json,
+		path_field(path, "pre_closure_detach"),
+	)
+	type_json ?= object_field(value, path, "type")
+	typ ?= decode_core_type_json(
+		type_json,
+		path_field(path, "type"),
+	)
+	loc_json ?= object_field(value, path, "loc")
+	loc ?= decode_source_loc_json(
+		loc_json,
+		path_field(path, "loc"),
+	)
+	Ok(PreClosureDetachExpr(detached, typ, loc))
 
 
 private pure func decode_core_expr_select_from_json(
@@ -10538,6 +10944,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_tuple_from_json(value, path)
 	else if tag == TUPLE_CONSTRUCT_EXPR_TAG:
 		decode_core_expr_tuple_construct_from_json(value, path)
+	else if tag == LAMBDA_EXPR_TAG:
+		decode_core_expr_lambda_from_json(value, path)
 	else if tag == CLOSURE_CREATE_EXPR_TAG:
 		decode_core_expr_closure_create_from_json(value, path)
 	else if tag == LIST_CONSTRUCT_EXPR_TAG:
@@ -10594,6 +11002,8 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_union_reuse_construct_from_json(value, path)
 	else if tag == DETACH_EXPR_TAG:
 		decode_core_expr_detach_from_json(value, path)
+	else if tag == PRE_CLOSURE_DETACH_EXPR_TAG:
+		decode_core_expr_pre_closure_detach_from_json(value, path)
 	else if tag == DUP_EXPR_TAG:
 		decode_core_expr_dup_from_json(value, path)
 	else if tag == DROP_EXPR_TAG:
@@ -10640,8 +11050,12 @@ pure func decode_core_expr_json(value: JsonValue, path: String) -> Result[CoreEx
 		decode_core_expr_for_resource_source_from_json(value, path)
 	else if tag == FOR_TENSOR_EXPR_TAG:
 		decode_core_expr_for_tensor_from_json(value, path)
+	else if tag == PRE_CLOSURE_CONCURRENTLY_LOOP_EXPR_TAG:
+		decode_core_expr_pre_closure_concurrently_loop_from_json(value, path)
 	else if tag == CONCURRENTLY_LOOP_EXPR_TAG:
 		decode_core_expr_concurrently_loop_from_json(value, path)
+	else if tag == PRE_CLOSURE_CONCURRENT_EXPR_TAG:
+		decode_core_expr_pre_closure_concurrent_from_json(value, path)
 	else if tag == CONCURRENT_EXPR_TAG:
 		decode_core_expr_concurrent_from_json(value, path)
 	else if tag == SELECT_EXPR_TAG:

@@ -1,9 +1,10 @@
--- Prepared union reuse for the Blorp-owned Core tail.
+-- Reuse analysis and rewrites for the Blorp-owned Core tail.
 --
--- This is a direct port of the prepared-union part of OCaml Core_reuse. It
--- rewrites a prepared match result that immediately drops its source into a
--- union reuse construct, but only when every managed source field has been
--- moved out and the new payload cannot alias the source.
+-- The normal post-Perceus pass consumes explicit drops around compatible fresh
+-- collection allocations or producer handoffs. The prepared-union pass rewrites
+-- a prepared match result that immediately drops its source into a union reuse
+-- construct, but only when every managed source field has been moved out and the
+-- new payload cannot alias the source.
 import:
 	compiler_core_json:
 		CoreAccessor(
@@ -23,6 +24,19 @@ import:
 			VariantFieldAccessor,
 		),
 		CoreBoxedStorageValue,
+		CoreCallKind(
+			BuiltinCall,
+			ClosureCall,
+			DictWithCapacityCall,
+			DirectRuntimeCall,
+			FallibleStreamTerminalCall,
+			ForeignCall,
+			IntrinsicCall,
+			ListToStringCall,
+			OperationResultCall,
+			TensorParallelCall,
+			UserCall,
+		),
 		CoreConstructorLengthMatch,
 		CoreConstructorLengthMatchBranch,
 		CoreConstructorLengthMatchCase,
@@ -40,6 +54,7 @@ import:
 			ConstructorMatchFallbackFail,
 		),
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl, EnumDecl),
+		CoreDictEntry,
 		CoreExpr(
 			AccessorLiteralMatchExpr,
 			AssignExpr,
@@ -68,6 +83,7 @@ import:
 			ForStringExpr,
 			ForTensorExpr,
 			IfExpr,
+			LambdaExpr,
 			DropExpr,
 			DupExpr,
 			LetExpr,
@@ -87,6 +103,9 @@ import:
 			RangeExpr,
 			RecordConstructExpr,
 			RecordExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
 			ResourceCleanupExitExpr,
 			ResourceScopeExpr,
 			SelectExpr,
@@ -120,6 +139,8 @@ import:
 		),
 		CoreFunction,
 		CoreGlobal,
+		CoreListHandoffMode(BorrowFreshHandoff, ConsumeReuseHandoff),
+		CoreLiteral(IntLiteral),
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
 			LiteralMatchFallbackBindings,
@@ -136,6 +157,7 @@ import:
 			NoReleasePolicy,
 			StackResultReleasePolicy,
 		),
+		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType(
 			BoxedResultType,
 			EnumType,
@@ -208,6 +230,8 @@ pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
 			False
 		TupleConstructExpr(construct, typ, loc):
 			False
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			False
 		ClosureCreateExpr(closure, typ, loc):
 			False
 		ListConstructExpr(construct, typ, loc):
@@ -262,6 +286,8 @@ pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
 			False
 		UnionReuseConstructExpr(construct, typ, loc):
 			False
+		PreClosureDetachExpr(detached, typ, loc):
+			False
 		DetachExpr(detached, typ, loc):
 			False
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
@@ -310,7 +336,11 @@ pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
 			False
 		ForTensorExpr(loop, typ, loc):
 			False
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			False
 		ConcurrentlyLoopExpr(loop, typ, loc):
+			False
+		PreClosureConcurrentExpr(block, typ, loc):
 			False
 		ConcurrentExpr(block, typ, loc):
 			False
@@ -328,6 +358,2409 @@ pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
 			False
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			False
+
+
+private pure func int_expr(value: Int, typ: CoreType) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), typ, SyntheticSourceLoc)
+
+
+private pure func var_expr(variable: CoreVar, typ: CoreType) -> CoreExpr:
+	VarExpr(variable, typ, SyntheticSourceLoc)
+
+
+private pure func void_expr() -> CoreExpr:
+	VoidExpr(VoidType, SyntheticSourceLoc)
+
+
+private pure func core_type_is_list(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == "List" and args.length() == 1
+		VoidType:
+			False
+		StackResultType(ok_type, err_type):
+			False
+		BoxedResultType(ok_type, err_type):
+			False
+		EnumType(name):
+			False
+		ValueRecordType(name):
+			False
+		HeapRecordType(name):
+			False
+		UnionType(name):
+			False
+		RangeType:
+			False
+		TensorType:
+			False
+		TupleType(items):
+			False
+
+
+private pure func core_type_is_dict(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == "Dict" and args.length() == 2
+		VoidType:
+			False
+		StackResultType(ok_type, err_type):
+			False
+		BoxedResultType(ok_type, err_type):
+			False
+		EnumType(name):
+			False
+		ValueRecordType(name):
+			False
+		HeapRecordType(name):
+			False
+		UnionType(name):
+			False
+		RangeType:
+			False
+		TensorType:
+			False
+		TupleType(items):
+			False
+
+
+private pure func core_type_is_set(typ: CoreType) -> Bool:
+	match typ:
+		NamedType(name, args):
+			name == "Set" and args.length() == 1
+		VoidType:
+			False
+		StackResultType(ok_type, err_type):
+			False
+		BoxedResultType(ok_type, err_type):
+			False
+		EnumType(name):
+			False
+		ValueRecordType(name):
+			False
+		HeapRecordType(name):
+			False
+		UnionType(name):
+			False
+		RangeType:
+			False
+		TensorType:
+			False
+		TupleType(items):
+			False
+
+
+private pure func core_type_lists_equal(left: List[CoreType], right: List[CoreType]) -> Bool:
+	match left:
+		[]:
+			match right:
+				[]:
+					True
+				[right_head, ...right_tail]:
+					False
+		[left_head, ...left_tail]:
+			match right:
+				[]:
+					False
+				[right_head, ...right_tail]:
+					(
+						core_type_equal(left_head, right_head)
+						and core_type_lists_equal(left_tail, right_tail)
+					)
+
+
+private pure func core_type_equal(left: CoreType, right: CoreType) -> Bool:
+	match left:
+		VoidType:
+			match right:
+				VoidType:
+					True
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(items):
+					False
+		NamedType(left_name, left_args):
+			match right:
+				VoidType:
+					False
+				NamedType(right_name, right_args):
+					left_name == right_name and core_type_lists_equal(left_args, right_args)
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(items):
+					False
+		StackResultType(left_ok, left_err):
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(right_ok, right_err):
+					core_type_equal(left_ok, right_ok) and core_type_equal(left_err, right_err)
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(items):
+					False
+		BoxedResultType(left_ok, left_err):
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(right_ok, right_err):
+					core_type_equal(left_ok, right_ok) and core_type_equal(left_err, right_err)
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(items):
+					False
+		EnumType(left_name):
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(right_name):
+					left_name == right_name
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(items):
+					False
+		ValueRecordType(left_name):
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(right_name):
+					left_name == right_name
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(items):
+					False
+		HeapRecordType(left_name):
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(right_name):
+					left_name == right_name
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(items):
+					False
+		UnionType(left_name):
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(right_name):
+					left_name == right_name
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(items):
+					False
+		RangeType:
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					True
+				TensorType:
+					False
+				TupleType(items):
+					False
+		TensorType:
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					True
+				TupleType(items):
+					False
+		TupleType(left_items):
+			match right:
+				VoidType:
+					False
+				NamedType(name, args):
+					False
+				StackResultType(ok_type, err_type):
+					False
+				BoxedResultType(ok_type, err_type):
+					False
+				EnumType(name):
+					False
+				ValueRecordType(name):
+					False
+				HeapRecordType(name):
+					False
+				UnionType(name):
+					False
+				RangeType:
+					False
+				TensorType:
+					False
+				TupleType(right_items):
+					core_type_lists_equal(left_items, right_items)
+
+
+private pure func reuse_type_compatible(dropped_type: CoreType, allocation_type: CoreType) -> Bool:
+	if core_type_is_list(dropped_type) and core_type_is_list(allocation_type):
+		core_type_equal(dropped_type, allocation_type)
+	else if core_type_is_dict(dropped_type) and core_type_is_dict(allocation_type):
+		core_type_equal(dropped_type, allocation_type)
+	else if core_type_is_set(dropped_type) and core_type_is_set(allocation_type):
+		core_type_equal(dropped_type, allocation_type)
+	else:
+		False
+
+
+private pure func boxed_value_touches_var(value: CoreBoxedStorageValue, target: CoreVar) -> Bool:
+	owner_touched(target, value.value)
+
+
+private pure func boxed_values_touch_var(
+	values: List[CoreBoxedStorageValue],
+	target: CoreVar,
+) -> Bool:
+	var touched: Bool = False
+
+	for value in values:
+		if boxed_value_touches_var(value, target):
+			touched = True
+
+	touched
+
+
+private pure func dict_entries_touch_var(entries: List[CoreDictEntry], target: CoreVar) -> Bool:
+	var touched: Bool = False
+
+	for entry in entries:
+		if (
+			boxed_value_touches_var(entry.key, target)
+			or boxed_value_touches_var(entry.value, target)
+		):
+			touched = True
+
+	touched
+
+
+private pure func record_fields_touch_var(
+	fields: List[CoreRecordFieldValue],
+	target: CoreVar,
+) -> Bool:
+	var touched: Bool = False
+
+	for field in fields:
+		if owner_touched(target, field.value):
+			touched = True
+
+	touched
+
+
+private pure func exprs_touch_var(exprs: List[CoreExpr], target: CoreVar) -> Bool:
+	var touched: Bool = False
+
+	for expr in exprs:
+		if owner_touched(target, expr):
+			touched = True
+
+	touched
+
+
+private pure func owner_touched(target: CoreVar, expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			core_var_equal(variable, target)
+		LiteralExpr(literal, typ, loc):
+			False
+		VoidExpr(typ, loc):
+			False
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		CallExpr(kind, callee, args, typ, loc):
+			owner_touched(target, callee) or exprs_touch_var(args, target)
+		BinaryExpr(op, left, right, typ, loc):
+			owner_touched(target, left) or owner_touched(target, right)
+		UnaryExpr(op, inner, typ, loc):
+			owner_touched(target, inner)
+		LogicalExpr(op, left, right, typ, loc):
+			owner_touched(target, left) or owner_touched(target, right)
+		AssignExpr(variable, rhs, typ, loc):
+			core_var_equal(variable, target) or owner_touched(target, rhs)
+		CastExpr(inner, typ, loc):
+			owner_touched(target, inner)
+		BoxExpr(box, typ, loc):
+			owner_touched(target, box.value)
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			owner_touched(target, inner)
+		FieldExpr(inner, field, typ, loc):
+			owner_touched(target, inner)
+		TupleFieldExpr(inner, index, typ, loc):
+			owner_touched(target, inner)
+		TupleExpr(items, typ, loc):
+			exprs_touch_var(items, target)
+		TupleConstructExpr(construct, typ, loc):
+			True
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			True
+		ClosureCreateExpr(closure, typ, loc):
+			False
+		ListConstructExpr(construct, typ, loc):
+			boxed_values_touch_var(construct.elements, target)
+		ListAllocExpr(alloc, typ, loc):
+			owner_touched(target, alloc.capacity)
+		ListGetExpr(get, typ, loc):
+			owner_touched(target, get.list) or owner_touched(target, get.index)
+		ListHandoffExpr(handoff, typ, loc):
+			(
+				owner_touched(target, handoff.source)
+				or owner_touched(target, handoff.capacity)
+				or owner_touched(target, handoff.body)
+			)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			(
+				owner_touched(target, set.list)
+				or owner_touched(target, set.index)
+				or boxed_value_touches_var(set.value, target)
+			)
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			(
+				owner_touched(target, set.result)
+				or owner_touched(target, set.out_index)
+				or owner_touched(target, set.source)
+				or owner_touched(target, set.source_index)
+			)
+		StringByteReadExpr(read, typ, loc):
+			owner_touched(target, read.source) or owner_touched(target, read.index)
+		StringByteWriteExpr(write, typ, loc):
+			(
+				owner_touched(target, write.target)
+				or owner_touched(target, write.index)
+				or owner_touched(target, write.byte)
+			)
+		StringByteCopyExpr(copy, typ, loc):
+			(
+				owner_touched(target, copy.dst)
+				or owner_touched(target, copy.dst_pos)
+				or owner_touched(target, copy.src)
+				or owner_touched(target, copy.src_pos)
+				or owner_touched(target, copy.len)
+			)
+		StringSetLenExpr(set_len, typ, loc):
+			owner_touched(target, set_len.target) or owner_touched(target, set_len.len)
+		TensorLiteralExpr(literal, typ, loc):
+			True
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			boxed_values_touch_var(literal.elements, target)
+		TensorPackedLiteralExpr(literal, typ, loc):
+			True
+		TensorRawFillExpr(fill, typ, loc):
+			True
+		TensorRawReadExpr(read, typ, loc):
+			True
+		TensorRawWriteExpr(write, typ, loc):
+			True
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			owner_touched(target, binding.source) or owner_touched(target, body)
+		DictConstructExpr(construct, typ, loc):
+			dict_entries_touch_var(construct.entries, target)
+		SetAllocExpr(alloc, typ, loc):
+			False
+		ListRetainExpr(retain, typ, loc):
+			owner_touched(target, retain.list) or boxed_value_touches_var(retain.value, target)
+		ListSetExpr(set, typ, loc):
+			(
+				owner_touched(target, set.list)
+				or owner_touched(target, set.index)
+				or boxed_value_touches_var(set.value, target)
+			)
+		ListSwapExpr(swap, typ, loc):
+			(
+				owner_touched(target, swap.list)
+				or owner_touched(target, swap.left_index)
+				or owner_touched(target, swap.right_index)
+			)
+		RecordExpr(fields, typ, loc):
+			record_fields_touch_var(fields, target)
+		RecordConstructExpr(type_name, fields, typ, loc):
+			record_fields_touch_var(fields, target)
+		UnionConstructExpr(construct, typ, loc):
+			boxed_values_touch_var(construct.args, target)
+		UnionReuseConstructExpr(construct, typ, loc):
+			(
+				owner_touched(target, construct.source)
+				or boxed_values_touch_var(construct.args, target)
+			)
+		PreClosureDetachExpr(detached, typ, loc):
+			True
+		DetachExpr(detached, typ, loc):
+			True
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			core_var_equal(variable, target) or owner_touched(target, body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			core_var_equal(variable, target) or owner_touched(target, body)
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			owner_touched(target, rhs) or owner_touched(target, body)
+		BorrowLetExpr(variable, value_type, rhs, body):
+			owner_touched(target, rhs) or owner_touched(target, body)
+		SeqExpr(first, second):
+			owner_touched(target, first) or owner_touched(target, second)
+		WhileExpr(cond, body, typ, loc):
+			True
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		ResourceScopeExpr(scope, typ, loc):
+			True
+		ResourceCleanupExitExpr(exit, typ, loc):
+			False
+		TailrecLoopExpr(params, return_type, body, loc):
+			True
+		TailrecRecurExpr(args, typ, loc):
+			exprs_touch_var(args, target)
+		TailrecListSpreadLoopExpr(loop, loc):
+			True
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			True
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			(
+				owner_touched(target, start)
+				or owner_touched(target, end)
+				or owner_touched(target, step)
+			)
+		ForChannelExpr(loop, typ, loc):
+			True
+		ForListExpr(loop, typ, loc):
+			True
+		ForStringExpr(loop, typ, loc):
+			True
+		ForDictExpr(loop, typ, loc):
+			True
+		ForSetExpr(loop, typ, loc):
+			True
+		ForStreamExpr(loop, typ, loc):
+			True
+		ForResourceSourceExpr(loop, typ, loc):
+			True
+		ForTensorExpr(loop, typ, loc):
+			True
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			True
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			True
+		PreClosureConcurrentExpr(block, typ, loc):
+			True
+		ConcurrentExpr(block, typ, loc):
+			True
+		SelectExpr(selection, typ, loc):
+			True
+		RangeExpr(start, end, typ, loc):
+			owner_touched(target, start) or owner_touched(target, end)
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			True
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			True
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			True
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			True
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				owner_touched(target, cond)
+				or owner_touched(target, then_expr)
+				or owner_touched(target, else_expr)
+			)
+
+
+private pure func contains_resource_scope(expr: CoreExpr) -> Bool:
+	match expr:
+		ResourceScopeExpr(scope, typ, loc):
+			True
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			contains_resource_scope(rhs) or contains_resource_scope(body)
+		BorrowLetExpr(variable, value_type, rhs, body):
+			contains_resource_scope(rhs) or contains_resource_scope(body)
+		SeqExpr(first, second):
+			contains_resource_scope(first) or contains_resource_scope(second)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			contains_resource_scope(body)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			contains_resource_scope(body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			(
+				contains_resource_scope(cond)
+				or contains_resource_scope(then_expr)
+				or contains_resource_scope(else_expr)
+			)
+		CallExpr(kind, callee, args, typ, loc):
+			contains_resource_scope(callee) or exprs_contain_resource_scope(args)
+		BinaryExpr(op, left, right, typ, loc):
+			contains_resource_scope(left) or contains_resource_scope(right)
+		UnaryExpr(op, inner, typ, loc):
+			contains_resource_scope(inner)
+		LogicalExpr(op, left, right, typ, loc):
+			contains_resource_scope(left) or contains_resource_scope(right)
+		AssignExpr(variable, rhs, typ, loc):
+			contains_resource_scope(rhs)
+		CastExpr(inner, typ, loc):
+			contains_resource_scope(inner)
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			contains_resource_scope(inner)
+		FieldExpr(inner, field, typ, loc):
+			contains_resource_scope(inner)
+		TupleFieldExpr(inner, index, typ, loc):
+			contains_resource_scope(inner)
+		TupleExpr(items, typ, loc):
+			exprs_contain_resource_scope(items)
+		ListAllocExpr(alloc, typ, loc):
+			contains_resource_scope(alloc.capacity)
+		ListHandoffExpr(handoff, typ, loc):
+			(
+				contains_resource_scope(handoff.source)
+				or contains_resource_scope(handoff.capacity)
+				or contains_resource_scope(handoff.body)
+			)
+		RangeExpr(start, end, typ, loc):
+			contains_resource_scope(start) or contains_resource_scope(end)
+		LiteralExpr(literal, typ, loc):
+			False
+		VarExpr(variable, typ, loc):
+			False
+		VoidExpr(typ, loc):
+			False
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		BoxExpr(box, typ, loc):
+			contains_resource_scope(box.value)
+		TupleConstructExpr(construct, typ, loc):
+			False
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			False
+		ClosureCreateExpr(closure, typ, loc):
+			False
+		ListConstructExpr(construct, typ, loc):
+			False
+		ListGetExpr(get, typ, loc):
+			contains_resource_scope(get.list) or contains_resource_scope(get.index)
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			contains_resource_scope(set.list) or contains_resource_scope(set.index)
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			contains_resource_scope(set.result) or contains_resource_scope(set.source)
+		StringByteReadExpr(read, typ, loc):
+			contains_resource_scope(read.source) or contains_resource_scope(read.index)
+		StringByteWriteExpr(write, typ, loc):
+			contains_resource_scope(write.target) or contains_resource_scope(write.index)
+		StringByteCopyExpr(copy, typ, loc):
+			contains_resource_scope(copy.dst) or contains_resource_scope(copy.src)
+		StringSetLenExpr(set_len, typ, loc):
+			contains_resource_scope(set_len.target) or contains_resource_scope(set_len.len)
+		TensorLiteralExpr(literal, typ, loc):
+			False
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			False
+		TensorPackedLiteralExpr(literal, typ, loc):
+			False
+		TensorRawFillExpr(fill, typ, loc):
+			False
+		TensorRawReadExpr(read, typ, loc):
+			False
+		TensorRawWriteExpr(write, typ, loc):
+			False
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			contains_resource_scope(binding.source) or contains_resource_scope(body)
+		DictConstructExpr(construct, typ, loc):
+			False
+		SetAllocExpr(alloc, typ, loc):
+			False
+		ListRetainExpr(retain, typ, loc):
+			contains_resource_scope(retain.list)
+		ListSetExpr(set, typ, loc):
+			contains_resource_scope(set.list) or contains_resource_scope(set.index)
+		ListSwapExpr(swap, typ, loc):
+			contains_resource_scope(swap.list)
+		RecordExpr(fields, typ, loc):
+			False
+		RecordConstructExpr(type_name, fields, typ, loc):
+			False
+		UnionConstructExpr(construct, typ, loc):
+			False
+		UnionReuseConstructExpr(construct, typ, loc):
+			contains_resource_scope(construct.source)
+		PreClosureDetachExpr(detached, typ, loc):
+			True
+		DetachExpr(detached, typ, loc):
+			True
+		WhileExpr(cond, body, typ, loc):
+			True
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		ResourceCleanupExitExpr(exit, typ, loc):
+			False
+		TailrecLoopExpr(params, return_type, body, loc):
+			True
+		TailrecRecurExpr(args, typ, loc):
+			exprs_contain_resource_scope(args)
+		TailrecListSpreadLoopExpr(loop, loc):
+			True
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			True
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			(
+				contains_resource_scope(start)
+				or contains_resource_scope(end)
+				or contains_resource_scope(step)
+			)
+		ForChannelExpr(loop, typ, loc):
+			True
+		ForListExpr(loop, typ, loc):
+			True
+		ForStringExpr(loop, typ, loc):
+			True
+		ForDictExpr(loop, typ, loc):
+			True
+		ForSetExpr(loop, typ, loc):
+			True
+		ForStreamExpr(loop, typ, loc):
+			True
+		ForResourceSourceExpr(loop, typ, loc):
+			True
+		ForTensorExpr(loop, typ, loc):
+			True
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			True
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			True
+		PreClosureConcurrentExpr(block, typ, loc):
+			True
+		ConcurrentExpr(block, typ, loc):
+			True
+		SelectExpr(selection, typ, loc):
+			True
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			True
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			True
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			True
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			True
+
+
+private pure func exprs_contain_resource_scope(exprs: List[CoreExpr]) -> Bool:
+	var found: Bool = False
+
+	for expr in exprs:
+		if contains_resource_scope(expr):
+			found = True
+
+	found
+
+
+private pure func collection_allocation_compatible(
+	dropped_type: CoreType,
+	allocation_type: CoreType,
+) -> Bool:
+	reuse_type_compatible(dropped_type, allocation_type)
+
+
+private pure func is_collection_allocation(expr: CoreExpr) -> Bool:
+	match expr:
+		ListAllocExpr(alloc, typ, loc):
+			core_type_is_list(typ)
+		SetAllocExpr(alloc, typ, loc):
+			core_type_is_set(typ)
+		DictConstructExpr(construct, typ, loc):
+			core_type_is_dict(typ) and construct.entries.length() == 0
+		CallExpr(kind, callee, args, typ, loc):
+			match kind:
+				IntrinsicCall(name):
+					name == "list_alloc" or name == "set_alloc" or name == "dict_alloc"
+				BuiltinCall(name):
+					(
+						name == "blorp_set_new"
+						or name == "blorp_set_new_string"
+						or name == "blorp_set_new_float"
+						or name == "blorp_set_new_custom"
+						or name == "blorp_dict_new"
+						or name == "blorp_dict_new_string"
+						or name == "blorp_dict_new_float"
+						or name == "blorp_dict_new_custom"
+						or name == "blorp_dict_with_capacity"
+						or name == "blorp_dict_with_capacity_string"
+						or name == "blorp_dict_with_capacity_float"
+						or name == "blorp_dict_with_capacity_custom"
+					)
+				UserCall(name, def_id, captured_def_ids):
+					False
+				ForeignCall(name, arg_passing):
+					False
+				DirectRuntimeCall(call):
+					False
+				OperationResultCall(call):
+					False
+				FallibleStreamTerminalCall(call):
+					False
+				TensorParallelCall(name, layout):
+					False
+				DictWithCapacityCall(constructor):
+					False
+				ListToStringCall(name):
+					False
+				ClosureCall:
+					False
+		LiteralExpr(literal, typ, loc):
+			False
+		VarExpr(variable, typ, loc):
+			False
+		VoidExpr(typ, loc):
+			False
+		CooperativeCheckpointExpr(typ, loc):
+			False
+		BinaryExpr(op, left, right, typ, loc):
+			False
+		UnaryExpr(op, inner, typ, loc):
+			False
+		LogicalExpr(op, left, right, typ, loc):
+			False
+		AssignExpr(variable, rhs, typ, loc):
+			False
+		CastExpr(inner, typ, loc):
+			False
+		BoxExpr(box, typ, loc):
+			False
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			False
+		FieldExpr(inner, field, typ, loc):
+			False
+		TupleFieldExpr(inner, index, typ, loc):
+			False
+		TupleExpr(items, typ, loc):
+			False
+		TupleConstructExpr(construct, typ, loc):
+			False
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			False
+		ClosureCreateExpr(closure, typ, loc):
+			False
+		ListConstructExpr(construct, typ, loc):
+			False
+		ListGetExpr(get, typ, loc):
+			False
+		ListHandoffExpr(handoff, typ, loc):
+			False
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			False
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			False
+		StringByteReadExpr(read, typ, loc):
+			False
+		StringByteWriteExpr(write, typ, loc):
+			False
+		StringByteCopyExpr(copy, typ, loc):
+			False
+		StringSetLenExpr(set_len, typ, loc):
+			False
+		TensorLiteralExpr(literal, typ, loc):
+			False
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			False
+		TensorPackedLiteralExpr(literal, typ, loc):
+			False
+		TensorRawFillExpr(fill, typ, loc):
+			False
+		TensorRawReadExpr(read, typ, loc):
+			False
+		TensorRawWriteExpr(write, typ, loc):
+			False
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			False
+		ListRetainExpr(retain, typ, loc):
+			False
+		ListSetExpr(set, typ, loc):
+			False
+		ListSwapExpr(swap, typ, loc):
+			False
+		RecordExpr(fields, typ, loc):
+			False
+		RecordConstructExpr(type_name, fields, typ, loc):
+			False
+		UnionConstructExpr(construct, typ, loc):
+			False
+		UnionReuseConstructExpr(construct, typ, loc):
+			False
+		PreClosureDetachExpr(detached, typ, loc):
+			False
+		DetachExpr(detached, typ, loc):
+			False
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			False
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			False
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			False
+		BorrowLetExpr(variable, value_type, rhs, body):
+			False
+		SeqExpr(first, second):
+			False
+		WhileExpr(cond, body, typ, loc):
+			False
+		BreakExpr(typ, loc):
+			False
+		ContinueExpr(typ, loc):
+			False
+		ResourceScopeExpr(scope, typ, loc):
+			False
+		ResourceCleanupExitExpr(exit, typ, loc):
+			False
+		TailrecLoopExpr(params, return_type, body, loc):
+			False
+		TailrecRecurExpr(args, typ, loc):
+			False
+		TailrecListSpreadLoopExpr(loop, loc):
+			False
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			False
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			False
+		ForChannelExpr(loop, typ, loc):
+			False
+		ForListExpr(loop, typ, loc):
+			False
+		ForStringExpr(loop, typ, loc):
+			False
+		ForDictExpr(loop, typ, loc):
+			False
+		ForSetExpr(loop, typ, loc):
+			False
+		ForStreamExpr(loop, typ, loc):
+			False
+		ForResourceSourceExpr(loop, typ, loc):
+			False
+		ForTensorExpr(loop, typ, loc):
+			False
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			False
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			False
+		PreClosureConcurrentExpr(block, typ, loc):
+			False
+		ConcurrentExpr(block, typ, loc):
+			False
+		SelectExpr(selection, typ, loc):
+			False
+		RangeExpr(start, end, typ, loc):
+			False
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			False
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			False
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			False
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			False
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			False
+
+
+private pure func reuse_boundary_call(
+	dropped_var: CoreVar,
+	dropped_type: CoreType,
+	allocation_type: CoreType,
+	capacity: CoreExpr,
+	reuse_name: String,
+) -> CoreExpr:
+	CallExpr(
+		IntrinsicCall(reuse_name),
+		void_expr(),
+		[var_expr(dropped_var, dropped_type), capacity],
+		allocation_type,
+		SyntheticSourceLoc,
+	)
+
+
+private pure func reuse_alloc_rhs(
+	dropped_var: CoreVar,
+	dropped_type: CoreType,
+	bind_rhs: CoreExpr,
+) -> Option[CoreExpr]:
+	match bind_rhs:
+		ListAllocExpr(alloc, allocation_type, loc):
+			if collection_allocation_compatible(dropped_type, allocation_type):
+				Some(
+					reuse_boundary_call(
+						dropped_var,
+						dropped_type,
+						allocation_type,
+						alloc.capacity,
+						"list_reuse_alloc",
+					),
+				)
+			else:
+				None
+		SetAllocExpr(alloc, allocation_type, loc):
+			if collection_allocation_compatible(dropped_type, allocation_type):
+				Some(
+					reuse_boundary_call(
+						dropped_var,
+						dropped_type,
+						allocation_type,
+						int_expr(
+							0,
+							NamedType("Int", []),
+						),
+						"set_reuse_alloc",
+					),
+				)
+			else:
+				None
+		DictConstructExpr(construct, allocation_type, loc):
+			if (
+				construct.entries.length() == 0
+				and collection_allocation_compatible(dropped_type, allocation_type)
+			):
+				Some(
+					reuse_boundary_call(
+						dropped_var,
+						dropped_type,
+						allocation_type,
+						int_expr(
+							0,
+							NamedType("Int", []),
+						),
+						"dict_reuse_alloc",
+					),
+				)
+			else:
+				None
+		CallExpr(kind, callee, args, allocation_type, loc):
+			None
+		LiteralExpr(literal, typ, loc):
+			None
+		VarExpr(variable, typ, loc):
+			None
+		VoidExpr(typ, loc):
+			None
+		CooperativeCheckpointExpr(typ, loc):
+			None
+		BinaryExpr(op, left, right, typ, loc):
+			None
+		UnaryExpr(op, inner, typ, loc):
+			None
+		LogicalExpr(op, left, right, typ, loc):
+			None
+		AssignExpr(variable, rhs, typ, loc):
+			None
+		CastExpr(inner, typ, loc):
+			None
+		BoxExpr(box, typ, loc):
+			None
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			None
+		FieldExpr(inner, field, typ, loc):
+			None
+		TupleFieldExpr(inner, index, typ, loc):
+			None
+		TupleExpr(items, typ, loc):
+			None
+		TupleConstructExpr(construct, typ, loc):
+			None
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			None
+		ClosureCreateExpr(closure, typ, loc):
+			None
+		ListConstructExpr(construct, typ, loc):
+			None
+		ListGetExpr(get, typ, loc):
+			None
+		ListHandoffExpr(handoff, typ, loc):
+			None
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			None
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			None
+		StringByteReadExpr(read, typ, loc):
+			None
+		StringByteWriteExpr(write, typ, loc):
+			None
+		StringByteCopyExpr(copy, typ, loc):
+			None
+		StringSetLenExpr(set_len, typ, loc):
+			None
+		TensorLiteralExpr(literal, typ, loc):
+			None
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			None
+		TensorPackedLiteralExpr(literal, typ, loc):
+			None
+		TensorRawFillExpr(fill, typ, loc):
+			None
+		TensorRawReadExpr(read, typ, loc):
+			None
+		TensorRawWriteExpr(write, typ, loc):
+			None
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			None
+		ListRetainExpr(retain, typ, loc):
+			None
+		ListSetExpr(set, typ, loc):
+			None
+		ListSwapExpr(swap, typ, loc):
+			None
+		RecordExpr(fields, typ, loc):
+			None
+		RecordConstructExpr(type_name, fields, typ, loc):
+			None
+		UnionConstructExpr(construct, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
+			None
+		PreClosureDetachExpr(detached, typ, loc):
+			None
+		DetachExpr(detached, typ, loc):
+			None
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			None
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			None
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			None
+		BorrowLetExpr(variable, value_type, rhs, body):
+			None
+		SeqExpr(first, second):
+			None
+		WhileExpr(cond, body, typ, loc):
+			None
+		BreakExpr(typ, loc):
+			None
+		ContinueExpr(typ, loc):
+			None
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		ResourceCleanupExitExpr(exit, typ, loc):
+			None
+		TailrecLoopExpr(params, return_type, body, loc):
+			None
+		TailrecRecurExpr(args, typ, loc):
+			None
+		TailrecListSpreadLoopExpr(loop, loc):
+			None
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			None
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			None
+		ForChannelExpr(loop, typ, loc):
+			None
+		ForListExpr(loop, typ, loc):
+			None
+		ForStringExpr(loop, typ, loc):
+			None
+		ForDictExpr(loop, typ, loc):
+			None
+		ForSetExpr(loop, typ, loc):
+			None
+		ForStreamExpr(loop, typ, loc):
+			None
+		ForResourceSourceExpr(loop, typ, loc):
+			None
+		ForTensorExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentExpr(block, typ, loc):
+			None
+		ConcurrentExpr(block, typ, loc):
+			None
+		SelectExpr(selection, typ, loc):
+			None
+		RangeExpr(start, end, typ, loc):
+			None
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			None
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			None
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			None
+
+
+private pure func consume_handoff_rhs(
+	dropped_var: CoreVar,
+	dropped_type: CoreType,
+	bind_rhs: CoreExpr,
+) -> Option[CoreExpr]:
+	match bind_rhs:
+		ListHandoffExpr(handoff, typ, loc):
+			if (
+				handoff.mode == BorrowFreshHandoff
+				and core_expr_is_var(handoff.source, dropped_var)
+				and reuse_type_compatible(dropped_type, handoff.source_type)
+				and reuse_type_compatible(dropped_type, handoff.result_type)
+				and not owner_touched(dropped_var, handoff.capacity)
+				and not owner_touched(dropped_var, handoff.body)
+			):
+				Some(ListHandoffExpr({ handoff | mode = ConsumeReuseHandoff }, typ, loc))
+			else:
+				None
+		LiteralExpr(literal, typ, loc):
+			None
+		VarExpr(variable, typ, loc):
+			None
+		VoidExpr(typ, loc):
+			None
+		CooperativeCheckpointExpr(typ, loc):
+			None
+		CallExpr(kind, callee, args, typ, loc):
+			None
+		BinaryExpr(op, left, right, typ, loc):
+			None
+		UnaryExpr(op, inner, typ, loc):
+			None
+		LogicalExpr(op, left, right, typ, loc):
+			None
+		AssignExpr(variable, rhs, typ, loc):
+			None
+		CastExpr(inner, typ, loc):
+			None
+		BoxExpr(box, typ, loc):
+			None
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			None
+		FieldExpr(inner, field, typ, loc):
+			None
+		TupleFieldExpr(inner, index, typ, loc):
+			None
+		TupleExpr(items, typ, loc):
+			None
+		TupleConstructExpr(construct, typ, loc):
+			None
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			None
+		ClosureCreateExpr(closure, typ, loc):
+			None
+		ListConstructExpr(construct, typ, loc):
+			None
+		ListAllocExpr(alloc, typ, loc):
+			None
+		ListGetExpr(get, typ, loc):
+			None
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			None
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			None
+		StringByteReadExpr(read, typ, loc):
+			None
+		StringByteWriteExpr(write, typ, loc):
+			None
+		StringByteCopyExpr(copy, typ, loc):
+			None
+		StringSetLenExpr(set_len, typ, loc):
+			None
+		TensorLiteralExpr(literal, typ, loc):
+			None
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			None
+		TensorPackedLiteralExpr(literal, typ, loc):
+			None
+		TensorRawFillExpr(fill, typ, loc):
+			None
+		TensorRawReadExpr(read, typ, loc):
+			None
+		TensorRawWriteExpr(write, typ, loc):
+			None
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			None
+		DictConstructExpr(construct, typ, loc):
+			None
+		SetAllocExpr(alloc, typ, loc):
+			None
+		ListRetainExpr(retain, typ, loc):
+			None
+		ListSetExpr(set, typ, loc):
+			None
+		ListSwapExpr(swap, typ, loc):
+			None
+		RecordExpr(fields, typ, loc):
+			None
+		RecordConstructExpr(type_name, fields, typ, loc):
+			None
+		UnionConstructExpr(construct, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
+			None
+		PreClosureDetachExpr(detached, typ, loc):
+			None
+		DetachExpr(detached, typ, loc):
+			None
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			None
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			None
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			None
+		BorrowLetExpr(variable, value_type, rhs, body):
+			None
+		SeqExpr(first, second):
+			None
+		WhileExpr(cond, body, typ, loc):
+			None
+		BreakExpr(typ, loc):
+			None
+		ContinueExpr(typ, loc):
+			None
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		ResourceCleanupExitExpr(exit, typ, loc):
+			None
+		TailrecLoopExpr(params, return_type, body, loc):
+			None
+		TailrecRecurExpr(args, typ, loc):
+			None
+		TailrecListSpreadLoopExpr(loop, loc):
+			None
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			None
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			None
+		ForChannelExpr(loop, typ, loc):
+			None
+		ForListExpr(loop, typ, loc):
+			None
+		ForStringExpr(loop, typ, loc):
+			None
+		ForDictExpr(loop, typ, loc):
+			None
+		ForSetExpr(loop, typ, loc):
+			None
+		ForStreamExpr(loop, typ, loc):
+			None
+		ForResourceSourceExpr(loop, typ, loc):
+			None
+		ForTensorExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentExpr(block, typ, loc):
+			None
+		ConcurrentExpr(block, typ, loc):
+			None
+		SelectExpr(selection, typ, loc):
+			None
+		RangeExpr(start, end, typ, loc):
+			None
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			None
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			None
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			None
+
+
+private pure func rewrite_drop_body(
+	dropped_var: CoreVar,
+	dropped_type: CoreType,
+	body: CoreExpr,
+) -> Option[CoreExpr]:
+	match body:
+		LetExpr(variable, is_mutable, value_type, rhs, rest):
+			if owner_touched(dropped_var, rhs) or contains_resource_scope(rhs):
+				None
+			else:
+				match reuse_alloc_rhs(dropped_var, dropped_type, rhs):
+					Some(rewritten_rhs):
+						if owner_touched(dropped_var, rest):
+							None
+						else:
+							Some(
+								LetExpr(
+									variable,
+									is_mutable,
+									value_type,
+									rewritten_rhs,
+									rewrite_post_perceus_expr(rest),
+								),
+							)
+					None:
+						if is_collection_allocation(rhs):
+							None
+						else:
+							match rewrite_drop_body(dropped_var, dropped_type, rest):
+								Some(rewritten_rest):
+									Some(
+										LetExpr(
+											variable,
+											is_mutable,
+											value_type,
+											rewrite_post_perceus_expr(rhs),
+											rewritten_rest,
+										),
+									)
+								None:
+									None
+		BorrowLetExpr(variable, value_type, rhs, rest):
+			if owner_touched(dropped_var, rhs) or contains_resource_scope(rhs):
+				None
+			else:
+				match rewrite_drop_body(dropped_var, dropped_type, rest):
+					Some(rewritten_rest):
+						Some(
+							BorrowLetExpr(
+								variable,
+								value_type,
+								rewrite_post_perceus_expr(rhs),
+								rewritten_rest,
+							),
+						)
+					None:
+						None
+		SeqExpr(first, second):
+			if owner_touched(dropped_var, first) or contains_resource_scope(first):
+				None
+			else if is_collection_allocation(first):
+				None
+			else:
+				match rewrite_drop_body(dropped_var, dropped_type, second):
+					Some(rewritten_second):
+						Some(SeqExpr(rewrite_post_perceus_expr(first), rewritten_second))
+					None:
+						None
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		LiteralExpr(literal, typ, loc):
+			None
+		VarExpr(variable, typ, loc):
+			None
+		VoidExpr(typ, loc):
+			None
+		CooperativeCheckpointExpr(typ, loc):
+			None
+		CallExpr(kind, callee, args, typ, loc):
+			None
+		BinaryExpr(op, left, right, typ, loc):
+			None
+		UnaryExpr(op, inner, typ, loc):
+			None
+		LogicalExpr(op, left, right, typ, loc):
+			None
+		AssignExpr(variable, rhs, typ, loc):
+			None
+		CastExpr(inner, typ, loc):
+			None
+		BoxExpr(box, typ, loc):
+			None
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			None
+		FieldExpr(inner, field, typ, loc):
+			None
+		TupleFieldExpr(inner, index, typ, loc):
+			None
+		TupleExpr(items, typ, loc):
+			None
+		TupleConstructExpr(construct, typ, loc):
+			None
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			None
+		ClosureCreateExpr(closure, typ, loc):
+			None
+		ListConstructExpr(construct, typ, loc):
+			None
+		ListAllocExpr(alloc, typ, loc):
+			None
+		ListGetExpr(get, typ, loc):
+			None
+		ListHandoffExpr(handoff, typ, loc):
+			None
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			None
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			None
+		StringByteReadExpr(read, typ, loc):
+			None
+		StringByteWriteExpr(write, typ, loc):
+			None
+		StringByteCopyExpr(copy, typ, loc):
+			None
+		StringSetLenExpr(set_len, typ, loc):
+			None
+		TensorLiteralExpr(literal, typ, loc):
+			None
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			None
+		TensorPackedLiteralExpr(literal, typ, loc):
+			None
+		TensorRawFillExpr(fill, typ, loc):
+			None
+		TensorRawReadExpr(read, typ, loc):
+			None
+		TensorRawWriteExpr(write, typ, loc):
+			None
+		TensorRawViewLetExpr(binding, tensor_body, typ, loc):
+			None
+		DictConstructExpr(construct, typ, loc):
+			None
+		SetAllocExpr(alloc, typ, loc):
+			None
+		ListRetainExpr(retain, typ, loc):
+			None
+		ListSetExpr(set, typ, loc):
+			None
+		ListSwapExpr(swap, typ, loc):
+			None
+		RecordExpr(fields, typ, loc):
+			None
+		RecordConstructExpr(type_name, fields, typ, loc):
+			None
+		UnionConstructExpr(construct, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
+			None
+		PreClosureDetachExpr(detached, typ, loc):
+			None
+		DetachExpr(detached, typ, loc):
+			None
+		DupExpr(variable, value_type, retain_policy, dup_body, typ, loc):
+			None
+		DropExpr(variable, value_type, release_policy, drop_body, typ, loc):
+			None
+		WhileExpr(cond, while_body, typ, loc):
+			None
+		BreakExpr(typ, loc):
+			None
+		ContinueExpr(typ, loc):
+			None
+		ResourceCleanupExitExpr(exit, typ, loc):
+			None
+		TailrecLoopExpr(params, return_type, tailrec_body, loc):
+			None
+		TailrecRecurExpr(args, typ, loc):
+			None
+		TailrecListSpreadLoopExpr(loop, loc):
+			None
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			None
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			None
+		ForChannelExpr(loop, typ, loc):
+			None
+		ForListExpr(loop, typ, loc):
+			None
+		ForStringExpr(loop, typ, loc):
+			None
+		ForDictExpr(loop, typ, loc):
+			None
+		ForSetExpr(loop, typ, loc):
+			None
+		ForStreamExpr(loop, typ, loc):
+			None
+		ForResourceSourceExpr(loop, typ, loc):
+			None
+		ForTensorExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentExpr(block, typ, loc):
+			None
+		ConcurrentExpr(block, typ, loc):
+			None
+		SelectExpr(selection, typ, loc):
+			None
+		RangeExpr(start, end, typ, loc):
+			None
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			None
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			None
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			None
+
+
+private pure func consume_handoff_in_linear_expr(
+	dropped_var: CoreVar,
+	dropped_type: CoreType,
+	expr: CoreExpr,
+) -> Option[CoreExpr]:
+	match expr:
+		LetExpr(variable, is_mutable, value_type, rhs, rest):
+			match consume_handoff_rhs(dropped_var, dropped_type, rhs):
+				Some(rewritten_rhs):
+					if owner_touched(dropped_var, rest):
+						match consume_handoff_in_linear_expr(dropped_var, dropped_type, rest):
+							Some(rewritten_rest):
+								Some(
+									LetExpr(
+										variable,
+										is_mutable,
+										value_type,
+										rewrite_post_perceus_expr(rhs),
+										rewritten_rest,
+									),
+								)
+							None:
+								None
+					else:
+						Some(
+							LetExpr(
+								variable,
+								is_mutable,
+								value_type,
+								rewritten_rhs,
+								rewrite_post_perceus_expr(rest),
+							),
+						)
+				None:
+					if owner_touched(dropped_var, rhs):
+						if owner_touched(dropped_var, rest):
+							None
+						else:
+							match consume_handoff_in_linear_expr(dropped_var, dropped_type, rhs):
+								Some(rewritten_rhs):
+									Some(
+										LetExpr(
+											variable,
+											is_mutable,
+											value_type,
+											rewritten_rhs,
+											rewrite_post_perceus_expr(rest),
+										),
+									)
+								None:
+									None
+					else if contains_resource_scope(rhs):
+						None
+					else:
+						match consume_handoff_in_linear_expr(dropped_var, dropped_type, rest):
+							Some(rewritten_rest):
+								Some(
+									LetExpr(
+										variable,
+										is_mutable,
+										value_type,
+										rewrite_post_perceus_expr(rhs),
+										rewritten_rest,
+									),
+								)
+							None:
+								None
+		BorrowLetExpr(variable, value_type, rhs, rest):
+			if owner_touched(dropped_var, rhs) or contains_resource_scope(rhs):
+				None
+			else:
+				match consume_handoff_in_linear_expr(dropped_var, dropped_type, rest):
+					Some(rewritten_rest):
+						Some(
+							BorrowLetExpr(
+								variable,
+								value_type,
+								rewrite_post_perceus_expr(rhs),
+								rewritten_rest,
+							),
+						)
+					None:
+						None
+		SeqExpr(first, second):
+			if owner_touched(dropped_var, first) or contains_resource_scope(first):
+				None
+			else:
+				match consume_handoff_in_linear_expr(dropped_var, dropped_type, second):
+					Some(rewritten_second):
+						Some(SeqExpr(rewrite_post_perceus_expr(first), rewritten_second))
+					None:
+						None
+		ResourceScopeExpr(scope, typ, loc):
+			None
+		LiteralExpr(literal, typ, loc):
+			None
+		VarExpr(variable, typ, loc):
+			None
+		VoidExpr(typ, loc):
+			None
+		CooperativeCheckpointExpr(typ, loc):
+			None
+		CallExpr(kind, callee, args, typ, loc):
+			None
+		BinaryExpr(op, left, right, typ, loc):
+			None
+		UnaryExpr(op, inner, typ, loc):
+			None
+		LogicalExpr(op, left, right, typ, loc):
+			None
+		AssignExpr(variable, rhs, typ, loc):
+			None
+		CastExpr(inner, typ, loc):
+			None
+		BoxExpr(box, typ, loc):
+			None
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			None
+		FieldExpr(inner, field, typ, loc):
+			None
+		TupleFieldExpr(inner, index, typ, loc):
+			None
+		TupleExpr(items, typ, loc):
+			None
+		TupleConstructExpr(construct, typ, loc):
+			None
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			None
+		ClosureCreateExpr(closure, typ, loc):
+			None
+		ListConstructExpr(construct, typ, loc):
+			None
+		ListAllocExpr(alloc, typ, loc):
+			None
+		ListGetExpr(get, typ, loc):
+			None
+		ListHandoffExpr(handoff, typ, loc):
+			None
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			None
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			None
+		StringByteReadExpr(read, typ, loc):
+			None
+		StringByteWriteExpr(write, typ, loc):
+			None
+		StringByteCopyExpr(copy, typ, loc):
+			None
+		StringSetLenExpr(set_len, typ, loc):
+			None
+		TensorLiteralExpr(literal, typ, loc):
+			None
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			None
+		TensorPackedLiteralExpr(literal, typ, loc):
+			None
+		TensorRawFillExpr(fill, typ, loc):
+			None
+		TensorRawReadExpr(read, typ, loc):
+			None
+		TensorRawWriteExpr(write, typ, loc):
+			None
+		TensorRawViewLetExpr(binding, tensor_body, typ, loc):
+			None
+		DictConstructExpr(construct, typ, loc):
+			None
+		SetAllocExpr(alloc, typ, loc):
+			None
+		ListRetainExpr(retain, typ, loc):
+			None
+		ListSetExpr(set, typ, loc):
+			None
+		ListSwapExpr(swap, typ, loc):
+			None
+		RecordExpr(fields, typ, loc):
+			None
+		RecordConstructExpr(type_name, fields, typ, loc):
+			None
+		UnionConstructExpr(construct, typ, loc):
+			None
+		UnionReuseConstructExpr(construct, typ, loc):
+			None
+		PreClosureDetachExpr(detached, typ, loc):
+			None
+		DetachExpr(detached, typ, loc):
+			None
+		DupExpr(variable, value_type, retain_policy, dup_body, typ, loc):
+			None
+		DropExpr(variable, value_type, release_policy, drop_body, typ, loc):
+			None
+		WhileExpr(cond, while_body, typ, loc):
+			None
+		BreakExpr(typ, loc):
+			None
+		ContinueExpr(typ, loc):
+			None
+		ResourceCleanupExitExpr(exit, typ, loc):
+			None
+		TailrecLoopExpr(params, return_type, tailrec_body, loc):
+			None
+		TailrecRecurExpr(args, typ, loc):
+			None
+		TailrecListSpreadLoopExpr(loop, loc):
+			None
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			None
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			None
+		ForChannelExpr(loop, typ, loc):
+			None
+		ForListExpr(loop, typ, loc):
+			None
+		ForStringExpr(loop, typ, loc):
+			None
+		ForDictExpr(loop, typ, loc):
+			None
+		ForSetExpr(loop, typ, loc):
+			None
+		ForStreamExpr(loop, typ, loc):
+			None
+		ForResourceSourceExpr(loop, typ, loc):
+			None
+		ForTensorExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentExpr(block, typ, loc):
+			None
+		ConcurrentExpr(block, typ, loc):
+			None
+		SelectExpr(selection, typ, loc):
+			None
+		RangeExpr(start, end, typ, loc):
+			None
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			None
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			None
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			None
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			None
+
+
+pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			match body:
+				DropExpr(dropped_var, dropped_type, release_policy, result, drop_type, drop_loc):
+					if core_expr_is_var(result, variable):
+						match consume_handoff_rhs(dropped_var, dropped_type, rhs):
+							Some(handoff):
+								rewrite_post_perceus_expr(handoff)
+							None:
+								match consume_handoff_in_linear_expr(
+									dropped_var,
+									dropped_type,
+									rhs,
+								):
+									Some(rewritten_rhs):
+										rewrite_post_perceus_expr(rewritten_rhs)
+									None:
+										LetExpr(
+											variable,
+											is_mutable,
+											value_type,
+											rewrite_post_perceus_expr(rhs),
+											rewrite_post_perceus_expr(body),
+										)
+					else:
+						LetExpr(
+							variable,
+							is_mutable,
+							value_type,
+							rewrite_post_perceus_expr(rhs),
+							rewrite_post_perceus_expr(body),
+						)
+				LiteralExpr(literal, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				VarExpr(body_var, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				VoidExpr(typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				CooperativeCheckpointExpr(typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				CallExpr(kind, callee, args, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				BinaryExpr(op, left, right, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				UnaryExpr(op, inner, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				LogicalExpr(op, left, right, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				AssignExpr(assigned_var, assigned_rhs, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				CastExpr(inner, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				BoxExpr(box, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				UnboxExpr(unbox_kind, inner, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				FieldExpr(inner, field, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				TupleFieldExpr(inner, index, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				TupleExpr(items, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TupleConstructExpr(construct, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ClosureCreateExpr(closure, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListConstructExpr(construct, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListAllocExpr(alloc, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListGetExpr(get, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListHandoffExpr(handoff, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListHandoffSetOwnedExpr(set, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListHandoffSetSourceSlotExpr(set, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				StringByteReadExpr(read, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				StringByteWriteExpr(write, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				StringByteCopyExpr(copy, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				StringSetLenExpr(set_len, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TensorLiteralExpr(literal, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TensorBoxedLiteralExpr(literal, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TensorPackedLiteralExpr(literal, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TensorRawFillExpr(fill, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TensorRawReadExpr(read, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TensorRawWriteExpr(write, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TensorRawViewLetExpr(binding, tensor_body, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				DictConstructExpr(construct, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				SetAllocExpr(alloc, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListRetainExpr(retain, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListSetExpr(set, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ListSwapExpr(swap, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				RecordExpr(fields, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				RecordConstructExpr(type_name, fields, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				UnionConstructExpr(construct, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				UnionReuseConstructExpr(construct, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				PreClosureDetachExpr(detached, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				DetachExpr(detached, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				DupExpr(dup_var, dup_type, retain_policy, dup_body, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				LetExpr(inner_var, inner_mutable, inner_type, inner_rhs, inner_body):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				BorrowLetExpr(inner_var, inner_type, inner_rhs, inner_body):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				SeqExpr(first, second):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+				WhileExpr(cond, while_body, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				BreakExpr(typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ContinueExpr(typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ResourceScopeExpr(scope, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ResourceCleanupExitExpr(exit, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TailrecLoopExpr(params, return_type, tailrec_body, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TailrecRecurExpr(args, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TailrecListSpreadLoopExpr(loop, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForRangeExpr(binder, start, end, step, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForChannelExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForListExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForStringExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForDictExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForSetExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForStreamExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForResourceSourceExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ForTensorExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ConcurrentlyLoopExpr(loop, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				PreClosureConcurrentExpr(block, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ConcurrentExpr(block, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				SelectExpr(selection, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				RangeExpr(start, end, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
+				IfExpr(cond, then_expr, else_expr, typ, loc):
+					LetExpr(
+						variable,
+						is_mutable,
+						value_type,
+						rewrite_post_perceus_expr(rhs),
+						rewrite_post_perceus_expr(body),
+					)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			match rewrite_drop_body(variable, value_type, body):
+				Some(rewritten):
+					rewritten
+				None:
+					DropExpr(
+						variable,
+						value_type,
+						release_policy,
+						rewrite_post_perceus_expr(body),
+						typ,
+						loc,
+					)
+		BorrowLetExpr(variable, value_type, rhs, body):
+			BorrowLetExpr(
+				variable,
+				value_type,
+				rewrite_post_perceus_expr(rhs),
+				rewrite_post_perceus_expr(body),
+			)
+		SeqExpr(first, second):
+			SeqExpr(rewrite_post_perceus_expr(first), rewrite_post_perceus_expr(second))
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			IfExpr(
+				rewrite_post_perceus_expr(cond),
+				rewrite_post_perceus_expr(then_expr),
+				rewrite_post_perceus_expr(else_expr),
+				typ,
+				loc,
+			)
+		LiteralExpr(literal, typ, loc):
+			expr
+		VarExpr(variable, typ, loc):
+			expr
+		VoidExpr(typ, loc):
+			expr
+		CooperativeCheckpointExpr(typ, loc):
+			expr
+		CallExpr(kind, callee, args, typ, loc):
+			expr
+		BinaryExpr(op, left, right, typ, loc):
+			expr
+		UnaryExpr(op, inner, typ, loc):
+			expr
+		LogicalExpr(op, left, right, typ, loc):
+			expr
+		AssignExpr(variable, rhs, typ, loc):
+			expr
+		CastExpr(inner, typ, loc):
+			expr
+		BoxExpr(box, typ, loc):
+			expr
+		UnboxExpr(unbox_kind, inner, typ, loc):
+			expr
+		FieldExpr(inner, field, typ, loc):
+			expr
+		TupleFieldExpr(inner, index, typ, loc):
+			expr
+		TupleExpr(items, typ, loc):
+			expr
+		TupleConstructExpr(construct, typ, loc):
+			expr
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			expr
+		ClosureCreateExpr(closure, typ, loc):
+			expr
+		ListConstructExpr(construct, typ, loc):
+			expr
+		ListAllocExpr(alloc, typ, loc):
+			expr
+		ListGetExpr(get, typ, loc):
+			expr
+		ListHandoffExpr(handoff, typ, loc):
+			expr
+		ListHandoffSetOwnedExpr(set, typ, loc):
+			expr
+		ListHandoffSetSourceSlotExpr(set, typ, loc):
+			expr
+		StringByteReadExpr(read, typ, loc):
+			expr
+		StringByteWriteExpr(write, typ, loc):
+			expr
+		StringByteCopyExpr(copy, typ, loc):
+			expr
+		StringSetLenExpr(set_len, typ, loc):
+			expr
+		TensorLiteralExpr(literal, typ, loc):
+			expr
+		TensorBoxedLiteralExpr(literal, typ, loc):
+			expr
+		TensorPackedLiteralExpr(literal, typ, loc):
+			expr
+		TensorRawFillExpr(fill, typ, loc):
+			expr
+		TensorRawReadExpr(read, typ, loc):
+			expr
+		TensorRawWriteExpr(write, typ, loc):
+			expr
+		TensorRawViewLetExpr(binding, body, typ, loc):
+			expr
+		DictConstructExpr(construct, typ, loc):
+			expr
+		SetAllocExpr(alloc, typ, loc):
+			expr
+		ListRetainExpr(retain, typ, loc):
+			expr
+		ListSetExpr(set, typ, loc):
+			expr
+		ListSwapExpr(swap, typ, loc):
+			expr
+		RecordExpr(fields, typ, loc):
+			expr
+		RecordConstructExpr(type_name, fields, typ, loc):
+			expr
+		UnionConstructExpr(construct, typ, loc):
+			expr
+		UnionReuseConstructExpr(construct, typ, loc):
+			expr
+		PreClosureDetachExpr(detached, typ, loc):
+			expr
+		DetachExpr(detached, typ, loc):
+			expr
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(variable, value_type, retain_policy, rewrite_post_perceus_expr(body), typ, loc)
+		WhileExpr(cond, body, typ, loc):
+			expr
+		BreakExpr(typ, loc):
+			expr
+		ContinueExpr(typ, loc):
+			expr
+		ResourceScopeExpr(scope, typ, loc):
+			expr
+		ResourceCleanupExitExpr(exit, typ, loc):
+			expr
+		TailrecLoopExpr(params, return_type, body, loc):
+			expr
+		TailrecRecurExpr(args, typ, loc):
+			expr
+		TailrecListSpreadLoopExpr(loop, loc):
+			expr
+		TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
+			expr
+		ForRangeExpr(binder, start, end, step, typ, loc):
+			expr
+		ForChannelExpr(loop, typ, loc):
+			expr
+		ForListExpr(loop, typ, loc):
+			expr
+		ForStringExpr(loop, typ, loc):
+			expr
+		ForDictExpr(loop, typ, loc):
+			expr
+		ForSetExpr(loop, typ, loc):
+			expr
+		ForStreamExpr(loop, typ, loc):
+			expr
+		ForResourceSourceExpr(loop, typ, loc):
+			expr
+		ForTensorExpr(loop, typ, loc):
+			expr
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			expr
+		ConcurrentlyLoopExpr(loop, typ, loc):
+			expr
+		PreClosureConcurrentExpr(block, typ, loc):
+			expr
+		ConcurrentExpr(block, typ, loc):
+			expr
+		SelectExpr(selection, typ, loc):
+			expr
+		RangeExpr(start, end, typ, loc):
+			expr
+		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
+			expr
+		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			expr
+		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
+			expr
+		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
+			expr
+
+
+pure func rewrite_post_perceus_function(func_info: CoreFunction) -> CoreFunction:
+	match func_info.body:
+		Some(body):
+			{ func_info | body = Some(rewrite_post_perceus_expr(body)) }
+		None:
+			func_info
+
+
+pure func rewrite_post_perceus_global(global: CoreGlobal) -> CoreGlobal:
+	{ global | init = rewrite_post_perceus_expr(global.init) }
+
+
+pure func rewrite_post_perceus_decl(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(func_info):
+			FunctionDecl(rewrite_post_perceus_function(func_info))
+		GlobalDecl(global):
+			GlobalDecl(rewrite_post_perceus_global(global))
+		UnionDecl(union_decl):
+			decl
+		EnumDecl(enum_decl):
+			decl
+		ValueRecordDecl(record_decl):
+			decl
+		HeapRecordDecl(record_decl):
+			decl
+
+
+pure func rewrite_post_perceus_program(program: CoreProgram) -> CoreProgram:
+	var decls: List[CoreDecl] = []
+
+	for decl in program.decls:
+		decls = decls.append(rewrite_post_perceus_decl(decl))
+
+	{ program | decls = decls }
 
 
 pure func union_reuse_constructor_name(type_name: String, constructor_c_name: String) -> String:
@@ -648,6 +3081,8 @@ pure func result_may_alias_source(
 			exprs_may_alias_source(source_name, aliases, items)
 		TupleConstructExpr(construct, typ, loc):
 			True
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			True
 		ClosureCreateExpr(closure, typ, loc):
 			True
 		ListConstructExpr(construct, typ, loc):
@@ -706,6 +3141,8 @@ pure func result_may_alias_source(
 				or boxed_values_may_alias_source(source_name, aliases, construct.args)
 			)
 		DetachExpr(detached, typ, loc):
+			True
+		PreClosureDetachExpr(detached, typ, loc):
 			True
 		LetExpr(variable, is_mutable, value_type, rhs, body):
 			if variable.name == source_name:
@@ -769,7 +3206,11 @@ pure func result_may_alias_source(
 			True
 		ForTensorExpr(loop, typ, loc):
 			True
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			True
 		ConcurrentlyLoopExpr(loop, typ, loc):
+			True
+		PreClosureConcurrentExpr(block, typ, loc):
 			True
 		ConcurrentExpr(block, typ, loc):
 			True
@@ -1101,6 +3542,8 @@ pure func rewrite_prepared_union_result(
 			None
 		TupleConstructExpr(construct, typ, loc):
 			None
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			None
 		ClosureCreateExpr(closure, typ, loc):
 			None
 		ListConstructExpr(construct, typ, loc):
@@ -1153,6 +3596,8 @@ pure func rewrite_prepared_union_result(
 			None
 		UnionReuseConstructExpr(construct, typ, loc):
 			None
+		PreClosureDetachExpr(detached, typ, loc):
+			None
 		DetachExpr(detached, typ, loc):
 			None
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
@@ -1195,7 +3640,11 @@ pure func rewrite_prepared_union_result(
 			None
 		ForTensorExpr(loop, typ, loc):
 			None
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			None
 		ConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentExpr(block, typ, loc):
 			None
 		ConcurrentExpr(block, typ, loc):
 			None
@@ -1773,6 +4222,8 @@ pure func rewrite_prepared_drop_result(
 				None
 			TupleConstructExpr(construct, typ, loc):
 				None
+			LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+				None
 			ClosureCreateExpr(closure, typ, loc):
 				None
 			ListConstructExpr(construct, typ, loc):
@@ -1827,6 +4278,8 @@ pure func rewrite_prepared_drop_result(
 				None
 			UnionReuseConstructExpr(construct, typ, loc):
 				None
+			PreClosureDetachExpr(detached, typ, loc):
+				None
 			DetachExpr(detached, typ, loc):
 				None
 			DupExpr(variable, value_type, retain_policy, body, typ, loc):
@@ -1875,7 +4328,11 @@ pure func rewrite_prepared_drop_result(
 				None
 			ForTensorExpr(loop, typ, loc):
 				None
+			PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+				None
 			ConcurrentlyLoopExpr(loop, typ, loc):
+				None
+			PreClosureConcurrentExpr(block, typ, loc):
 				None
 			ConcurrentExpr(block, typ, loc):
 				None
@@ -1918,6 +4375,14 @@ private pure func rewrite_prepared_let_drop(
 		VoidExpr(typ, loc):
 			None
 		CooperativeCheckpointExpr(typ, loc):
+			None
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			None
+		PreClosureDetachExpr(detached, typ, loc):
+			None
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			None
+		PreClosureConcurrentExpr(block, typ, loc):
 			None
 		CallExpr(kind, callee, args, typ, loc):
 			None
@@ -2153,6 +4618,8 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 			expr
 		TupleConstructExpr(construct, typ, loc):
 			expr
+		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
+			expr
 		ClosureCreateExpr(closure, typ, loc):
 			expr
 		ListConstructExpr(construct, typ, loc):
@@ -2207,6 +4674,8 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 			expr
 		UnionReuseConstructExpr(construct, typ, loc):
 			expr
+		PreClosureDetachExpr(detached, typ, loc):
+			expr
 		DetachExpr(detached, typ, loc):
 			expr
 		WhileExpr(cond, body, typ, loc):
@@ -2245,7 +4714,11 @@ pure func rewrite_prepared_expr(decls: List[CoreDecl], expr: CoreExpr) -> CoreEx
 			expr
 		ForTensorExpr(loop, typ, loc):
 			expr
+		PreClosureConcurrentlyLoopExpr(loop, typ, loc):
+			expr
 		ConcurrentlyLoopExpr(loop, typ, loc):
+			expr
+		PreClosureConcurrentExpr(block, typ, loc):
 			expr
 		ConcurrentExpr(block, typ, loc):
 			expr

@@ -212,9 +212,9 @@ let collect_env ~import_aliases ~module_imports (prog : core_program) : env =
     | CDImpl i ->
         (* Register impl methods with their mangled names (Trait_method_Type)
            so trait method calls resolve to CKUser. Skip generic impls — they
-           get monomorphized later and emit_impl also skips them. Mangling
+           get monomorphized later and backend emission skips them. Mangling
            must use the same concrete impl-key helper as
-           [Core_trait_resolve.collect_registry] and [Core_emit.emit_impl] so
+           [Core_trait_resolve.collect_registry] so
            the name the call-site rewrite produces matches the definition
            the emitter generates (otherwise tuple / future generic-impl
            cases silently produce link-time name mismatches).
