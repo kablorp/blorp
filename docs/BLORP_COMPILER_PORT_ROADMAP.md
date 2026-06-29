@@ -1,6 +1,6 @@
 # Blorp Compiler Port Roadmap
 
-Status checked against code on 2026-06-27.
+Status checked against code on 2026-06-28.
 
 This roadmap is for replacing the OCaml compiler implementation with Blorp
 source. The guiding strategy is direct porting first: copy the OCaml call graph,
@@ -141,7 +141,7 @@ The boundary should move left in this order:
 | Post-closure Core | resource, fairness, prepare, emit | Completed as the first Blorp tail |
 | Post-reuse / pre-closure Core | closure, resource, fairness, prepare, emit | Completed for default emission |
 | Post-Perceus Core | reuse, closure, final tail, emit | Current default emission boundary |
-| Post-consume-specialize Core | Perceus, reuse, closure, final tail, emit | After ownership tests are mirrored |
+| Post-consume-specialize Core | Perceus, reuse, closure, final tail, emit | Next production boundary after Perceus port |
 | Post-DCE / post-specialize Core | consume specialize onward | Late ownership checkpoint |
 | Lowered Core | all Core optimization/lowering passes after lowering | Middle-Core checkpoint |
 | Typed AST | Core lowering onward | Lowering checkpoint |
@@ -434,13 +434,30 @@ Direct OCaml slice to mirror:
 
 Implementation:
 
-- Port Perceus environment construction, call contracts, last-use/drop
-  insertion, and balancing helpers.
-- Port consume-specialization before Perceus in the same call order as
-  `core_pipeline.ml`.
+- Done: ported consume-specialization as `compiler_core_consume_specialize.brp`
+  with direct Blorp unit coverage and a `run_core_pipeline` bridge stage named
+  `consume_specialize`.
+- Done: started the Perceus foundation by porting ownership contract modes,
+  validation, and representative intrinsic/runtime contracts to
+  `compiler_core_ownership.brp`.
+- Done: started the direct Perceus pass port in
+  `compiler_core_perceus.brp` with managed-type environment construction,
+  managed-type classification, use counting, linearity checks, and simple
+  linear `let` balancing with `DupExpr`/`DropExpr`.
+- Done: added the first Perceus call-contract lookup layer in Blorp:
+  constructor contracts from Core union variants, result-mode classification,
+  built-in/intrinsic ownership-contract lookup, and borrowed fallback contracts
+  for foreign/closure calls.
+- Done: applied ownership call contracts to the Blorp linear managed-let
+  rewrite path, including borrowed-only post-body drops, consuming/COW-consuming
+  calls, alias-returning call results, and consume-then-borrow sequencing.
+- Continue porting branch/match ownership joins, loop/repeated-context consume
+  protection, borrowed-result retention, final last-use/drop insertion, and
+  checker support.
+- Keep consume-specialization before Perceus in the same call order as
+  `core_pipeline.ml` when the production boundary moves again.
 - Represent ownership actions and allocation/destructor families explicitly.
-- Add `run_core_pipeline` stages for `consume_specialize`, `perceus`, and
-  `ownership_to_emit`.
+- Add `run_core_pipeline` stages for `perceus` and `ownership_to_emit`.
 
 Deletion:
 
@@ -450,7 +467,23 @@ Deletion:
 
 Validation:
 
-- Port Perceus and consume-specialize tests.
+- Done: direct consume-specialize tests cover safe self-replacement cloning,
+  rejected aliasing results, and recursive constructor-field ownership.
+- Done: Blorp ownership tests cover contract validation, malformed alias
+  contracts, finalizer consumption, key collection intrinsics, and variadic
+  string concat contracts.
+- Done: Blorp Perceus tests cover managed-type classification, declaration-fed
+  environment construction, `count_uses`, linearity, and simple managed-let
+  Dup/Drop insertion.
+- Done: Blorp Perceus tests cover constructor contract registration, def-id
+  based constructor lookup, result modes, intrinsic/builtin contract lookup, and
+  borrowed foreign/closure fallback contracts.
+- Done: Blorp Perceus tests cover linear borrowed intrinsic drops, direct
+  COW-consuming intrinsic consumption, alias-returning intrinsic results, and
+  consume-then-borrow balancing.
+- Port the remaining OCaml Perceus tests around branch joins, match ownership,
+  loop/repeated-context consuming calls, borrowed-result retention, final drops,
+  and checker diagnostics.
 - Run the full leak gate and targeted concurrency cancellation/leak tests.
 - Compare Core dumps after Perceus and reuse for representative fixtures.
 
@@ -741,8 +774,9 @@ that scaffolding down.
    production emission is one Blorp artifact request.
 3. Port closure conversion directly and move the main boundary to
    post-reuse/pre-closure Core.
-4. Port reuse, then Perceus and consume-specialize, with leak tests and stage
-   parity after each move.
+4. Port Perceus next, then make consume-specialize plus Perceus the
+   authoritative ownership tail, with leak tests and stage parity before moving
+   the default boundary.
 5. Continue left through the middle-Core passes in the exact order used by
    `core_pipeline.ml`, deleting each OCaml module as soon as Blorp is
    authoritative.

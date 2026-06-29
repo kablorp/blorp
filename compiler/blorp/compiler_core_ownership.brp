@@ -1,0 +1,482 @@
+-- Core-level ownership contracts for calls.
+--
+-- This is the Blorp-side foundation for the Perceus port. Contracts describe
+-- which arguments remain caller-owned, which arguments transfer ownership, and
+-- how the returned value is owned.
+enum OwnershipArgMode:
+	BorrowArg
+	RetainArg
+	ConsumeArg
+	CowConsumeArg
+	TransferArg
+
+
+union OwnershipResultMode:
+	ReturnVoid
+	ReturnPrimitive
+	ReturnOwned
+	ReturnBorrowed
+	ReturnAliasOfArg(Int)
+
+
+record OwnershipCallContract {
+	args: List[OwnershipArgMode],
+	result: OwnershipResultMode
+}
+
+
+union OwnershipContractViolation:
+	AliasIndexOutOfRange(Int, Int)
+	AliasOfConsumedArg(Int, OwnershipArgMode)
+	BorrowedResultWithoutPreservedArg
+
+
+pure func arg_consumes_caller(mode: OwnershipArgMode) -> Bool:
+	match mode:
+		BorrowArg:
+			False
+		RetainArg:
+			False
+		ConsumeArg:
+			True
+		CowConsumeArg:
+			True
+		TransferArg:
+			True
+
+
+pure func arg_preserves_caller(mode: OwnershipArgMode) -> Bool:
+	not arg_consumes_caller(mode)
+
+
+pure func arg_allows_borrowed_result_alias(mode: OwnershipArgMode) -> Bool:
+	arg_preserves_caller(mode)
+
+
+pure func arg_mode_to_string(mode: OwnershipArgMode) -> String:
+	match mode:
+		BorrowArg:
+			"Borrow"
+		RetainArg:
+			"Retain"
+		ConsumeArg:
+			"Consume"
+		CowConsumeArg:
+			"CowConsume"
+		TransferArg:
+			"Transfer"
+
+
+pure func contract_violation_to_string(violation: OwnershipContractViolation) -> String:
+	match violation:
+		AliasIndexOutOfRange(index, arg_count):
+			"ReturnAliasOfArg ${index.to_string()} is outside the contract arity ${arg_count.to_string()}"
+		AliasOfConsumedArg(index, mode):
+			"ReturnAliasOfArg " + index.to_string() + " points at " + arg_mode_to_string(
+				mode,
+			) + ", which does not preserve caller ownership"
+		BorrowedResultWithoutPreservedArg:
+			"ReturnBorrowed has no Borrow/Retain argument to anchor its lifetime"
+
+
+private pure func mode_at(args: List[OwnershipArgMode], index: Int) -> Option[OwnershipArgMode]:
+	if index < 0:
+		None
+	else:
+		args.get(index)
+
+
+private pure func has_preserved_arg(args: List[OwnershipArgMode]) -> Bool:
+	var found: Bool = False
+
+	for mode in args:
+		if arg_allows_borrowed_result_alias(mode):
+			found = True
+		else:
+			void
+
+	found
+
+
+pure func validate_contract(contract: OwnershipCallContract) -> List[OwnershipContractViolation]:
+	match contract.result:
+		ReturnAliasOfArg(index):
+			match mode_at(contract.args, index):
+				Some(mode):
+					if arg_allows_borrowed_result_alias(mode):
+						[]
+					else:
+						[AliasOfConsumedArg(index, mode)]
+				None:
+					[AliasIndexOutOfRange(index, contract.args.length())]
+		ReturnBorrowed:
+			if has_preserved_arg(contract.args):
+				[]
+			else:
+				[BorrowedResultWithoutPreservedArg]
+		ReturnVoid:
+			[]
+		ReturnPrimitive:
+			[]
+		ReturnOwned:
+			[]
+
+
+pure func contract_is_well_formed(contract: OwnershipCallContract) -> Bool:
+	validate_contract(contract).length() == 0
+
+
+pure func make_contract(
+	args: List[OwnershipArgMode],
+	result: OwnershipResultMode,
+) -> Result[OwnershipCallContract, List[OwnershipContractViolation]]:
+	contract: OwnershipCallContract = {
+		args = args,
+		result = result
+	}
+	violations: List[OwnershipContractViolation] = validate_contract(contract)
+
+	if violations.length() == 0:
+		Ok(contract)
+	else:
+		Err(violations)
+
+
+private pure func borrow_all(arity: Int) -> List[OwnershipArgMode]:
+	var args: List[OwnershipArgMode] = []
+	var index: Int = 0
+
+	while index < arity:
+		args = args.append(BorrowArg)
+		index += 1
+
+	args
+
+
+private pure func fixed_contract(
+	arity: Int,
+	args: List[OwnershipArgMode],
+	result: OwnershipResultMode,
+) -> Option[OwnershipCallContract]:
+	if args.length() == arity:
+		match make_contract(args, result):
+			Ok(contract):
+				Some(contract)
+			Err(violations):
+				None
+	else:
+		None
+
+
+private pure func borrowed_contract(
+	arity: Int,
+	expected_arity: Int,
+	result: OwnershipResultMode,
+) -> Option[OwnershipCallContract]:
+	fixed_contract(arity, borrow_all(expected_arity), result)
+
+
+private pure func variadic_contract(
+	min_arity: Int,
+	arg_at: pure (Int) -> OwnershipArgMode,
+	result: OwnershipResultMode,
+	arity: Int,
+) -> Option[OwnershipCallContract]:
+	if arity < min_arity:
+		None
+	else:
+		var args: List[OwnershipArgMode] = []
+		var index: Int = 0
+
+		while index < arity:
+			args = args.append(arg_at(index))
+			index += 1
+
+		match make_contract(args, result):
+			Ok(contract):
+				Some(contract)
+			Err(violations):
+				None
+
+
+private pure func string_concat_many_arg(index: Int) -> OwnershipArgMode:
+	if index == 0:
+		BorrowArg
+	else:
+		ConsumeArg
+
+
+pure func intrinsic_contract(name: String, arity: Int) -> Option[OwnershipCallContract]:
+	match name:
+		"elem_release_fn":
+			fixed_contract(arity, [], ReturnPrimitive)
+		"list_len":
+			fixed_contract(arity, [BorrowArg], ReturnPrimitive)
+		"list_capacity":
+			fixed_contract(arity, [BorrowArg], ReturnPrimitive)
+		"list_get":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg],
+				ReturnAliasOfArg(0),
+			)
+		"list_get_unchecked":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg],
+				ReturnAliasOfArg(0),
+			)
+		"list_set":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, BorrowArg],
+				ReturnVoid,
+			)
+		"list_set_owned":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, TransferArg],
+				ReturnVoid,
+			)
+		"list_handoff_set_owned":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, TransferArg],
+				ReturnVoid,
+			)
+		"list_handoff_set_source_slot":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, BorrowArg, BorrowArg],
+				ReturnVoid,
+			)
+		"list_swap_slots":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, BorrowArg],
+				ReturnVoid,
+			)
+		"list_retain_for":
+			fixed_contract(
+				arity,
+				[BorrowArg, RetainArg],
+				ReturnVoid,
+			)
+		"list_alloc":
+			fixed_contract(arity, [BorrowArg], ReturnOwned)
+		"list_ensure_unique":
+			fixed_contract(arity, [CowConsumeArg], ReturnOwned)
+		"list_ensure_capacity":
+			fixed_contract(
+				arity,
+				[CowConsumeArg, BorrowArg],
+				ReturnOwned,
+			)
+		"list_reuse_alloc":
+			fixed_contract(
+				arity,
+				[CowConsumeArg, BorrowArg],
+				ReturnOwned,
+			)
+		"list_reverse_owned":
+			fixed_contract(arity, [CowConsumeArg], ReturnOwned)
+		"dict_retain_key_for":
+			fixed_contract(
+				arity,
+				[BorrowArg, RetainArg],
+				ReturnVoid,
+			)
+		"dict_retain_value_for":
+			fixed_contract(
+				arity,
+				[BorrowArg, RetainArg],
+				ReturnVoid,
+			)
+		"dict_release_value_for":
+			borrowed_contract(arity, 2, ReturnVoid)
+		"dict_set_key_at":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, TransferArg],
+				ReturnVoid,
+			)
+		"dict_set_value_at":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, TransferArg],
+				ReturnVoid,
+			)
+		"dict_reuse_alloc":
+			fixed_contract(
+				arity,
+				[CowConsumeArg, BorrowArg],
+				ReturnOwned,
+			)
+		"set_retain_key_for":
+			fixed_contract(
+				arity,
+				[BorrowArg, RetainArg],
+				ReturnVoid,
+			)
+		"set_alloc_entry":
+			fixed_contract(arity, [TransferArg], ReturnOwned)
+		"set_reuse_alloc":
+			fixed_contract(
+				arity,
+				[CowConsumeArg, BorrowArg],
+				ReturnOwned,
+			)
+		"string_len":
+			fixed_contract(arity, [BorrowArg], ReturnPrimitive)
+		"string_find_byte_from":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, BorrowArg],
+				ReturnPrimitive,
+			)
+		"string_copy_bytes":
+			fixed_contract(
+				arity,
+				[BorrowArg, BorrowArg, BorrowArg, BorrowArg, BorrowArg],
+				ReturnVoid,
+			)
+		"string_ensure_unique":
+			fixed_contract(arity, [CowConsumeArg], ReturnOwned)
+		"string_ensure_capacity":
+			fixed_contract(
+				arity,
+				[CowConsumeArg, BorrowArg],
+				ReturnOwned,
+			)
+		"math_sin":
+			borrowed_contract(arity, 1, ReturnPrimitive)
+		"math_pow":
+			borrowed_contract(arity, 2, ReturnPrimitive)
+		"math_fma":
+			borrowed_contract(arity, 3, ReturnPrimitive)
+		_:
+			None
+
+
+private pure func finalizer_contract(name: String, arity: Int) -> Option[OwnershipCallContract]:
+	match name:
+		"blorp_file_close_reader":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_file_close_writer":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_file_close_appender":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_file_close_read_writer":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_file_close_read_appender":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_tcp_close_listener":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_tcp_close_stream":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_tls_close_session":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_websocket_close_session":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_udp_close_socket":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		"blorp_dir_close":
+			fixed_contract(arity, [ConsumeArg], ReturnVoid)
+		_:
+			None
+
+
+pure func builtin_contract(name: String, arity: Int) -> Option[OwnershipCallContract]:
+	match finalizer_contract(name, arity):
+		Some(contract):
+			Some(contract)
+		None:
+			match name:
+				"blorp_list_new":
+					fixed_contract(arity, [BorrowArg], ReturnOwned)
+				"blorp_list_append":
+					fixed_contract(
+						arity,
+						[CowConsumeArg, RetainArg],
+						ReturnOwned,
+					)
+				"blorp_list_append_owned":
+					fixed_contract(
+						arity,
+						[CowConsumeArg, TransferArg],
+						ReturnOwned,
+					)
+				"blorp_channel_new":
+					fixed_contract(arity, [BorrowArg], ReturnOwned)
+				"blorp_channel_try_send_status":
+					fixed_contract(
+						arity,
+						[BorrowArg, RetainArg],
+						ReturnPrimitive,
+					)
+				"blorp_channel_send_timeout_status":
+					fixed_contract(
+						arity,
+						[BorrowArg, RetainArg, BorrowArg],
+						ReturnPrimitive,
+					)
+				"blorp_channel_try_send_attempt":
+					fixed_contract(
+						arity,
+						[BorrowArg, RetainArg],
+						ReturnOwned,
+					)
+				"blorp_channel_send_timeout_attempt":
+					fixed_contract(
+						arity,
+						[BorrowArg, RetainArg, BorrowArg],
+						ReturnOwned,
+					)
+				"blorp_channel_try_recv_attempt":
+					fixed_contract(arity, [BorrowArg], ReturnOwned)
+				"blorp_channel_recv_timeout_attempt":
+					fixed_contract(
+						arity,
+						[BorrowArg, BorrowArg],
+						ReturnOwned,
+					)
+				"blorp_tcp_ipv4_raw":
+					fixed_contract(
+						arity,
+						[BorrowArg, BorrowArg, BorrowArg, BorrowArg],
+						ReturnOwned,
+					)
+				"blorp_tcp_port_value_raw":
+					fixed_contract(arity, [BorrowArg], ReturnPrimitive)
+				"blorp_tls_native_available_raw":
+					fixed_contract(arity, [], ReturnPrimitive)
+				"blorp_websocket_native_available_raw":
+					fixed_contract(arity, [], ReturnPrimitive)
+				"blorp_sleep":
+					fixed_contract(arity, [BorrowArg], ReturnVoid)
+				"blorp_yield_now":
+					fixed_contract(arity, [], ReturnVoid)
+				"blorp_test_cancel_after_parked":
+					fixed_contract(arity, [BorrowArg], ReturnPrimitive)
+				"blorp_string_concat":
+					fixed_contract(
+						arity,
+						[BorrowArg, BorrowArg],
+						ReturnOwned,
+					)
+				"blorp_string_concat_consume":
+					fixed_contract(
+						arity,
+						[CowConsumeArg, ConsumeArg],
+						ReturnOwned,
+					)
+				"blorp_string_concat_many":
+					variadic_contract(1, string_concat_many_arg, ReturnOwned, arity)
+				"blorp_string_eq":
+					fixed_contract(
+						arity,
+						[BorrowArg, BorrowArg],
+						ReturnPrimitive,
+					)
+				_:
+					None

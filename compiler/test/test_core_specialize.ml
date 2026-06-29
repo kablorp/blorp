@@ -59,8 +59,8 @@ let call_intrinsic name args ret_ty =
   mk (CCall (CKIntrinsic name, mk CVoid ty_void, args)) ret_ty
 
 let specialize e =
-  let ctx = Blorp.Core_emit_context.create () in
-  Blorp.Core_specialize.specialize_expr ~reg:ctx.reg e
+  let reg = Blorp.Codegen_types.create_registry () in
+  Blorp.Core_specialize.specialize_expr ~reg e
 
 let specialize_with_reg reg e = Blorp.Core_specialize.specialize_expr ~reg e
 
@@ -968,12 +968,12 @@ let test_bool_tensor_to_string_uses_bool_runtime () =
   expect_builtin "bool tensor to_string" "blorp_vector_to_string_bool" e
 
 let test_enum_tensor_to_string_uses_enum_runtime () =
-  let ctx = Blorp.Core_emit_context.create () in
-  Blorp.Codegen_types.register_enum_type ctx.reg "Base" [];
+  let reg = Blorp.Codegen_types.create_registry () in
+  Blorp.Codegen_types.register_enum_type reg "Base" [];
   let v = cvar "v" (tensor (TyNamed ("Base", [])) [ 3 ]) in
   let e = call_builtin "blorp_to_string" [ v ] (TyNamed ("String", [])) in
-  expect_builtin_with_reg "enum tensor to_string" ctx.reg
-    "blorp_vector_to_string_Base" e
+  expect_builtin_with_reg "enum tensor to_string" reg "blorp_vector_to_string_Base"
+    e
 
 let test_sequential_list_folds_are_not_void_boxed_runtime_builtins () =
   let forbidden = [ "blorp_list_fold_left"; "blorp_list_fold_right" ] in

@@ -346,28 +346,21 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
   guard [] "Core_list_layout.width_for_enum_info";
   guard [] "Core_array_layout.tensor_storage_for_elem";
   guard
-    [
-      "compiler/lib/core_codegen_prepare.ml";
-      "compiler/lib/core_emit_layout.ml";
-      "compiler/lib/core_emit_layout.mli";
-      "compiler/lib/core_emit_util.ml";
-      "compiler/lib/core_emit_util.mli";
-      "compiler/lib/core_specialize.ml";
-    ]
+      [
+        "compiler/lib/core_codegen_prepare.ml";
+        "compiler/lib/core_emit_layout.ml";
+        "compiler/lib/core_emit_layout.mli";
+        "compiler/lib/core_specialize.ml";
+      ]
     "Core_layout_type.tensor_element_storage";
   guard
-    [
-      "compiler/lib/core_codegen_prepare.ml";
-      "compiler/lib/core_emit_layout.ml";
-      "compiler/lib/core_emit_util.ml";
-    ]
+      [
+        "compiler/lib/core_codegen_prepare.ml";
+        "compiler/lib/core_emit_layout.ml";
+      ]
     "Core_layout_type.tensor_storage_layout_of_type";
   guard
-    [
-      "compiler/lib/core_codegen_prepare.ml";
-      "compiler/lib/core_emit_layout.ml";
-      "compiler/lib/core_emit_util.ml";
-    ]
+    [ "compiler/lib/core_codegen_prepare.ml" ]
     "Core_layout_type.tensor_storage_layout_of_elem";
   guard [] "let tensor_for_in_raw_storage ";
   guard [] "let tensor_for_in_raw_storage_of_layout";
@@ -472,7 +465,6 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
   guard
     [
       "compiler/lib/core_codegen_prepare.ml";
-      "compiler/lib/core_emit_util.ml";
       "compiler/lib/core_reuse.ml";
       "compiler/lib/core_specialize.ml";
     ]

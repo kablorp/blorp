@@ -9,9 +9,8 @@
       value-record names, enum union names, managed user type names, and
       type-alias definitions
 
-    The registry is owned by [Core_emit_context] and created fresh per
-    compilation (and per pipeline invocation). No module-global mutable
-    state — callers always pass a registry explicitly.
+    The registry is created fresh per compilation (and per pipeline invocation).
+    No module-global mutable state — callers always pass a registry explicitly.
 
     Population order: the core pipeline registers aliases, value-record
     names, and enum types eagerly before monomorphization (see
