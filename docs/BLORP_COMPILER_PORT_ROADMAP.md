@@ -96,8 +96,10 @@ The Blorp bridge currently supports these actions in
 | Action | Current purpose | Desired long-term status |
 | --- | --- | --- |
 | `emit_post_closure_c` | Current production tail handoff | Move left as more stages port |
+| `prepare_and_emit_c` | Compatibility entrypoint for the pinned compiler bootstrap's older post-closure handoff | Delete after the pinned compiler advances past `dev-33e00c2b94df` |
 | `run_core_pipeline` | Core JSON -> Core JSON for one tail stage | Expand into the main stage parity mechanism |
 | `render_many` | Temporary non-emission table/diagnostic requests | Delete from production compile path |
+| `renderer_templates` | Compatibility metadata query for the pinned compiler bootstrap's renderer arity checks | Delete after the pinned compiler advances past `dev-33e00c2b94df` |
 | `lower_and_compile` | Declared, unsupported | Implement when Core lowering ports |
 | `typecheck_and_compile` | Declared, unsupported | Implement when typecheck ports |
 | `compile_source` | Declared, unsupported | Implement when parser/source loading ports |
@@ -266,7 +268,9 @@ Implementation:
 - Keep `compiler_core_pipeline.run_post_closure_tail` as the single Blorp-owned
   implementation of the post-closure tail used by both bridge testing and
   production C emission.
-- Keep `emit_post_closure_c` as the only C artifact bridge action. Do not
+- Keep `emit_post_closure_c` as the only production C artifact bridge action.
+  The `prepare_and_emit_c` bridge action remains only as a pinned-bootstrap
+  compatibility entrypoint for the older post-closure handoff. Do not
   reintroduce a prepared-Core `emit_c` bridge action; prepared emission remains
   an internal helper behind the Blorp-owned post-closure tail.
 - Done: expanded `run_core_pipeline` so the Blorp tail can return `reuse`,
@@ -692,6 +696,13 @@ Implementation:
 
 - Keep impure shell responsibilities explicit: args/env, file IO, subprocesses,
   editor protocol streams, artifact writing, and C compiler invocation.
+- Done: `compiler/blorp/compiler_cli_args.brp` owns pure CLI argument parsing as
+  data for the main command families. The OCaml CLI still executes those parsed
+  actions until the impure shell boundary moves.
+- Done: `compiler/blorp/compiler_cli.brp` adds the first Blorp outer-wrapper
+  model. It parses user argv and plans delegation by command shape as pure data.
+  It deliberately does not install a runnable replacement binary or expose a
+  user-facing legacy-executable option in this checkpoint.
 - Make each shell call the pure Blorp compiler library rather than embedding
   compiler semantics.
 - Treat formatter/LSP as consumers of the same compiler data model, not separate
