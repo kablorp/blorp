@@ -223,9 +223,6 @@ let () =
         (fun (name, cases) -> ("OperationResultMetadata." ^ name, cases))
         Test_operation_result_metadata.suite
     @ List.map
-        (fun (name, cases) -> ("CoreReuse." ^ name, cases))
-        Test_core_reuse.suite
-    @ List.map
         (fun (name, cases) -> ("CoreClosure." ^ name, cases))
         Test_core_closure.suite
     @ List.map

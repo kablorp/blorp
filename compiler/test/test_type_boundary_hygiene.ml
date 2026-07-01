@@ -457,15 +457,12 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
     "Core_type_layout.is_arc_boxed_storage_value_type";
   guard [] "Core_type_layout.destructor_policy_for_record";
   guard [] "Core_type_layout.destructor_policy_for_union";
-  guard [] "Core_erased_storage_layout.box_kind";
-  guard [] "Core_erased_storage_layout.unbox_kind";
   guard
     [ "compiler/lib/core_list_layout.ml" ]
     "Core_layout_type.classify_erased_storage";
   guard
     [
       "compiler/lib/core_codegen_prepare.ml";
-      "compiler/lib/core_reuse.ml";
       "compiler/lib/core_specialize.ml";
     ]
     "Core_layout_type.boxed_storage_requires_release_or_error";

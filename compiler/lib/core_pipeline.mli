@@ -8,7 +8,7 @@ exception Stopped_after of Core_stage.t
 (** Raised by an [on_stage_callback] to stop compilation after a stage. *)
 
 type on_stage_callback = Core_stage.t -> Core.core_program -> unit
-(** Callback fired after each observed Core pipeline stage. *)
+(** Callback fired after each OCaml-owned program-bearing Core pipeline stage. *)
 
 type on_stage_event = Core_stage.t -> unit
 (** Lightweight callback fired after each observed Core pipeline stage without
@@ -18,30 +18,20 @@ type on_stage_json_callback = Core_stage.t -> string -> unit
 (** Callback fired for Blorp-owned stages whose authoritative observation is
     bridge JSON rather than an OCaml [Core.core_program]. *)
 
-type program_observation =
-  | ObserveAllProgramStages
-  | ObservePreBackendProgramStages
-(** Scope for program-bearing [on_stage] callbacks. [ObserveAllProgramStages]
-    preserves the legacy callback contract by materializing the OCaml final-tail
-    snapshot. [ObservePreBackendProgramStages] only supplies OCaml Core programs
-    through the post-Perceus handoff boundary; Blorp-owned late stages can be
-    observed through [on_stage_json_callback]. *)
-
 val observed_stage_order : Core_stage.t list
-(** Stages observed by [on_stage_callback], including [Lower] and [Final]. *)
+(** Source stage order, including Blorp-owned stages that require JSON
+    observation rather than OCaml [Core.core_program] callbacks. *)
 
 val pre_backend_program_stage_order : Core_stage.t list
-(** Program-bearing stages available without materializing the old OCaml
-    final-tail snapshot. *)
+(** Program-bearing stages available as OCaml [Core.core_program] callbacks. *)
 
 val program_free_stage_event_order : Core_stage.t list
-(** Stages observed by event-only callbacks. This omits program-bearing
-    OCaml-only final-tail snapshots; the Blorp-owned backend tail is reported
-    as [Final]. *)
+(** Stages observed by event-only callbacks. The Blorp-owned backend tail is
+    reported as [Final] unless a caller explicitly requests tail JSON. *)
 
-val stage_requires_final_tail_program : Core_stage.t -> bool
-(** Whether observing this stage as a Core program requires materializing the
-    old OCaml final-tail snapshot. *)
+val stage_observed_via_blorp_tail_json : Core_stage.t -> bool
+(** Whether observing this stage requires the Blorp-owned tail JSON path rather
+    than an OCaml program callback. *)
 
 val make_stage_hook :
   check_invariants:bool -> user:on_stage_callback -> on_stage_callback
@@ -57,7 +47,6 @@ val compile_typed :
   ?on_stage_event:on_stage_event ->
   ?on_stage_json:on_stage_json_callback ->
   ?tail_observation_stages:Core_stage.t list ->
-  ?program_observation:program_observation ->
   ?check_invariants:bool ->
   Typed_ast.program ->
   string
@@ -72,7 +61,6 @@ val compile_typed_with_modules :
   ?on_stage_event:on_stage_event ->
   ?on_stage_json:on_stage_json_callback ->
   ?tail_observation_stages:Core_stage.t list ->
-  ?program_observation:program_observation ->
   ?check_invariants:bool ->
   Typed_ast.program ->
   string * string list * string list

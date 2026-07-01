@@ -6,7 +6,8 @@ TestSuite coverage under `compiler/blorp/tests`.
 
 As the compiler migration progresses, prefer contiguous Blorp-owned pipeline
 slices with one OCaml transfer point at the boundary. The current supported
-backend route owns a real Core tail: `compiler_core_resource.brp`,
+backend route owns a real Core tail: `compiler_core_reuse.brp`,
+`compiler_core_closure.brp`, `compiler_core_resource.brp`,
 `compiler_core_fairness.brp`, `compiler_core_prepare.brp`, then
 `compiler_core_emit.brp`.
 

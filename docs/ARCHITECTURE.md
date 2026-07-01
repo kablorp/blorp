@@ -61,14 +61,10 @@ single JSON bridge after `Core_perceus`. On that route,
 `compiler/blorp/compiler_core_fairness.brp`,
 `compiler/blorp/compiler_core_prepare.brp`, and
 `compiler/blorp/compiler_core_emit.brp` own the contiguous tail through C
-artifact generation. The OCaml `core_reuse.ml`, `core_closure.ml`,
-`core_resource.ml`, `core_fairness.ml`, and `core_codegen_prepare.ml` paths
-remain only for invariant checking and direct OCaml API callers that still ask
-for legacy all-stage `Core.core_program` callbacks. CLI `reuse`/`closure`/
-`final` dumps and stops observe the Blorp-owned tail as Core JSON through the
-bridge. Timing-only observation and earlier-stage dumps/stops also avoid
-materializing the duplicate OCaml tail. C artifact emission is owned by the
-Blorp backend bridge.
+artifact generation. CLI `reuse`/`closure`/`final` dumps and stops observe the
+Blorp-owned tail as Core JSON through the bridge; OCaml program callbacks stop
+at the post-Perceus handoff. C artifact emission is owned by the Blorp backend
+bridge.
 
 ```
 Typed AST
@@ -202,45 +198,20 @@ Typed AST
 +-------------------+  (compiler_core_emit.brp)
 ```
 
-Temporary OCaml final-tail invariant route:
+Blorp-owned final-tail route:
 
 ```
 Post-Perceus Core
     |
     v
-+------------+
-| Core_reuse |  Rewrite proven post-Perceus allocation reuse candidates
-+------------+  for observed Core snapshots (core_reuse.ml)
-    |
-    v
-+--------------+
-| Core_closure |  Hoist lambdas and build closure values (core_closure.ml)
-+--------------+
-    |
-    v
-+---------------+
-| Core_resource |  Rewrite resource-scope break/continue exits to explicit
-+---------------+  cleanup-exit Core (core_resource.ml)
-    |
-    v
-+---------------+
-| Core_fairness |  Insert compiler-owned cooperative checkpoints at loop
-+---------------+  boundaries (core_fairness.ml)
-    |
-    v
-+----------------------+
-| Core_codegen_prepare |  Make final storage/layout decisions explicit:
-+----------------------+  typed box/unbox, constructors, release policy
-    |
-    v
-+------------------------+
-| Core_reuse (prepared) |  Rewrite source-owned union-node reuse after
-+------------------------+  constructor and erased-storage shapes are explicit
++-------------------+
+| run_core_pipeline |  Bridge action used for requested reuse/closure/final
++-------------------+  Core JSON snapshots and CLI stop/dump behavior
     |
     v
 +-------+
-| Final |  Snapshot after final preparation; used by final safety checks
-+-------+  until invariants move to Blorp or bridge JSON is decoded
+| Final |  Snapshot after final preparation, emitted as Core JSON when asked
++-------+
     |
     v
 Observed Core snapshot
@@ -261,7 +232,7 @@ Observed Core snapshot
   After prefixing, no downstream pass needs module awareness.
 - **Explicit erased-storage boundaries** — intentionally dynamic runtime slots
   use `void*`, but the choice of how a typed value crosses that boundary is
-  centralized in `core_erased_storage_layout.ml`. `Core_codegen_prepare`
+  centralized in `core_layout_type.ml`. `Core_codegen_prepare`
   rewrites final Core to explicit `CBoxTyped` / `CUnboxTyped` nodes before
   emission, and final invariants reject unresolved fallback boxing.
 
@@ -299,18 +270,15 @@ boxing, or ownership behavior from source spelling.
 | `core_specialize.ml` | Type-dispatch builtins → CCast / concrete names |
 | `core_dce.ml` | Conservative Core declaration dead-code elimination before ownership insertion |
 | `core_consume_specialize.ml` | Pre-Perceus consuming-call clones for safe source-owned self-replacement |
-| `core_resource.ml` | OCaml compatibility path for explicit resource cleanup exits; supported Blorp backend route uses `compiler_core_resource.brp` |
-| `core_fairness.ml` | OCaml compatibility path for cooperative checkpoints; supported Blorp backend route uses `compiler_core_fairness.brp` |
-| `core_codegen_prepare.ml` | OCaml compatibility path for final Core preparation; supported Blorp backend route uses `compiler_core_prepare.brp` |
-| `core_erased_storage_layout.ml` | Late-Core classification for typed values crossing erased `void*` storage |
+| `core_codegen_prepare.ml` | OCaml helpers and focused tests for final Core preparation; supported Blorp backend route uses `compiler_core_prepare.brp` |
+| `core_layout_type.ml` | Shared layout metadata and erased-storage release policy classification |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
 | `core_perceus.ml` | Perceus RC insertion (CDup/CDrop) |
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
-| `core_reuse.ml` | Post-Perceus allocation reuse analysis and prepared-Core union-node reuse rewrites |
-| `core_closure.ml` | Closure conversion / lambda hoisting |
+| `core_closure.ml` | First-class function reference eta-adapter synthesis before the Blorp closure tail |
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
-| `core_emit_context.ml`, `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation helpers still used by the bridge projector |
+| `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation helpers still used by the bridge projector |
 | `core_flatten.ml` | Module prefixing and import-table assembly |
 | `core_invariants.ml` | Stage-boundary invariant checks |
 | `core_pipeline.ml` | Pipeline orchestration, module assembly |
@@ -392,19 +360,15 @@ compiler/
 │   ├── core_consume_specialize.ml # Source-owned consuming-call clones
 │   ├── core_perceus.ml    # Core IR Perceus RC insertion
 │   ├── core_ownership.ml  # Ownership contracts for calls/intrinsics
-│   ├── core_reuse.ml      # Post-Perceus allocation reuse rewrites
-│   ├── core_closure.ml    # Closure conversion / lambda hoisting
-│   ├── core_resource.ml   # OCaml compatibility cleanup-exit lowering
-│   ├── core_fairness.ml   # OCaml compatibility checkpoint insertion
-│   ├── core_codegen_prepare.ml # OCaml compatibility final Core preparation
+│   ├── core_closure.ml    # Function-reference eta adapters
+│   ├── core_codegen_prepare.ml # Final Core preparation helpers/tests
 │   ├── core_hash_container_layout.ml # Dict/set layout selection
-│   ├── core_erased_storage_layout.ml # Typed values crossing erased storage
+│   ├── core_layout_type.ml # Layout metadata and erased-storage policy
 │   ├── core_option_layout.ml # Option representation selection
 │   ├── core_result_layout.ml # Result representation selection
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
 │   ├── core_layout_type.ml  # Shared layout metadata types
 │   ├── core_emit_blorp_c.ml # Core JSON projection and Blorp bridge client
-│   ├── core_emit_context.ml # Shared late-backend helper context
 │   ├── core_emit_util.ml  # Shared late-backend helper utilities
 │   ├── core_intrinsics.ml # IR body synthesis for builtins/intrinsics
 │   ├── core_intrinsic_registry.ml # Intrinsic manifest and contracts
@@ -694,8 +658,9 @@ Shared utilities live in `compiler/lib/codegen/`:
 // C: double identity_Float(double x)
 ```
 
-**Closure conversion** (`core_closure.ml`): Lambdas are hoisted into helper
-functions and use the runtime closure ABI:
+**Closure conversion** (`compiler/blorp/compiler_core_closure.brp`): Lambdas are
+hoisted into helper functions in the Blorp-owned backend tail and use the runtime
+closure ABI:
 ```c
 typedef struct {
     blorp_Object header;

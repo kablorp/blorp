@@ -2,15 +2,13 @@
 
     This pass moves representation decisions that used to live in the
     legacy C emitter into explicit Core nodes. After this pass, collection
-    constructors, record constructors, union constructors, and boxed storage
+    constructors, record constructors, tensor literals, and boxed storage
     operations carry the layout/ownership facts the C emitter needs. *)
 
 open Core
 
 type env = {
   reg : Codegen_types.registry;
-  record_decls : (string, Ast.record_decl) Hashtbl.t;
-  variants_by_type : (string, (string, Ast.variant) Hashtbl.t) Hashtbl.t;
 }
 
 let phase = Core_error.Stage Core_stage.Final
@@ -101,9 +99,6 @@ let set_constructor_for_elem ~reg elem_ty =
 let zero_capacity loc =
   { desc = CLit (Ast.LitInt 0L); ty = Ast.TyNamed ("Int", []); loc }
 
-let is_erased_record_field ~reg ty =
-  Core_layout_type.record_field_uses_erased_storage ~reg ty
-
 let tensor_type_of_expr env (expr : core) =
   Core_tensor_type.of_core ~reg:env.reg expr
 
@@ -129,113 +124,16 @@ let type_name_or_error ~reg ty loc =
         "final Core preparation saw non-named constructed type `%s`"
         (Types.type_to_string ty)
 
-let lookup_variant env type_name ctor_name =
-  match Hashtbl.find_opt env.variants_by_type type_name with
-  | None -> None
-  | Some by_name -> Hashtbl.find_opt by_name ctor_name
-
-let register_type_decl env (td : Ast.type_decl) =
-  let by_name =
-    match Hashtbl.find_opt env.variants_by_type td.type_name with
-    | Some tbl -> tbl
-    | None ->
-        let tbl = Hashtbl.create 8 in
-        Hashtbl.add env.variants_by_type td.type_name tbl;
-        tbl
-  in
-  List.iter
-    (fun (v : Ast.variant) -> Hashtbl.replace by_name v.variant_name v)
-    td.type_variants
-
-let rec collect_decls env (decl : core_decl) =
-  match decl.cd_desc with
-  | CDRecord r -> Hashtbl.replace env.record_decls r.record_name r
-  | CDType t -> register_type_decl env t
-  | CDPrivate inner -> collect_decls env inner
-  | CDFunc _ | CDVar _ | CDImpl _ | CDTrait _ | CDImport _ | CDTypeAlias _ -> ()
-
-let record_subst ~reg (record_decl : Ast.record_decl option) expr_ty =
-  match (record_decl, canonical_type ~reg expr_ty) with
-  | Some r, Ast.TyNamed (_, args)
-    when List.length r.record_type_params = List.length args ->
-      List.combine (Ast.type_param_names r.record_type_params) args
-  | _ -> []
-
 let prepare_record_construct env (expr : core) fields =
   let type_name = type_name_or_error ~reg:env.reg expr.ty expr.loc in
-  let record_decl = Hashtbl.find_opt env.record_decls type_name in
-  let subst = record_subst ~reg:env.reg record_decl expr.ty in
-  let field_decl_type field_name =
-    match record_decl with
-    | None -> None
-    | Some r ->
-        List.find_opt
-          (fun (fd : Ast.field_decl) -> fd.field_name = field_name)
-          r.record_fields
-        |> Option.map (fun (fd : Ast.field_decl) -> fd.field_type)
-  in
-  let expected_field_ty field_name =
-    Option.map
-      (Codegen_types.apply_codegen_subst subst)
-      (field_decl_type field_name)
-  in
-  let field_value_for_emit field_name value =
-    match (expected_field_ty field_name, value.desc) with
-    | Some ty, CRecord [] -> { value with ty }
-    | _ -> value
-  in
-  let ordered_fields =
-    match record_decl with
-    | None -> fields
-    | Some r ->
-        List.map
-          (fun (fd : Ast.field_decl) ->
-            match List.assoc_opt fd.field_name fields with
-            | Some value -> (fd.field_name, value)
-            | None ->
-                Core_error.errorf phase expr.loc
-                  ~hint:
-                    "record literals should be validated during type checking \
-                     before final Core preparation"
-                  "record literal for %s is missing field %s" type_name
-                  fd.field_name)
-          r.record_fields
-  in
   let rc_fields =
-    List.map
-      (fun (field_name, value) ->
-        let value = field_value_for_emit field_name value in
-        match field_decl_type field_name with
-        | Some field_ty when is_erased_record_field ~reg:env.reg field_ty ->
-            RecordErasedField
-              (field_name, boxed_storage_value ~reg:env.reg value)
-        | _ -> RecordRawField (field_name, value))
-      ordered_fields
-  in
-  let erased_release_mask =
-    let has_erased_field =
-      List.exists
-        (function RecordErasedField _ -> true | RecordRawField _ -> false)
-        rc_fields
-    in
-    if not has_erased_field then None
-    else
-      let bits =
-        rc_fields
-        |> List.mapi (fun i field ->
-            match field with
-            | RecordErasedField (_, value) when value.bsv_needs_release ->
-                Some (1 lsl i)
-            | _ -> None)
-        |> List.filter_map (fun x -> x)
-      in
-      Some (List.fold_left ( lor ) 0 bits)
+    List.map (fun (field_name, value) -> RecordRawField (field_name, value)) fields
   in
   CRecordConstruct
     {
       rc_type_name = type_name;
       rc_fields;
-      rc_erased_release_mask = erased_release_mask;
+      rc_erased_release_mask = None;
     }
 
 let prepare_empty_record env (expr : core) =
@@ -339,14 +237,6 @@ let prepare_dict_construct env (expr : core) kvs =
         dict_value_needs_release ~reg:env.reg expr.ty expr.loc;
     }
 
-let union_construct_c_name variant ctor_name def_id =
-  match variant.Ast.variant_def_id with
-  | Some id -> Codegen_names.mangle_by_def_id id ctor_name
-  | None -> (
-      match def_id with
-      | Some id -> Codegen_names.mangle_by_def_id id ctor_name
-      | None -> ctor_name)
-
 let option_layout_or_error env expr =
   Core_layout_type.option_layout_or_error ~phase ~reg:env.reg expr.ty expr.loc
 
@@ -361,75 +251,6 @@ let union_representation env expr type_name =
       | Some layout -> ResultUnion layout
       | None -> GenericUnion)
   | _ -> GenericUnion
-
-let prepare_union_construct env expr type_name ctor_name def_id args variant =
-  let args =
-    try
-      List.map2
-        (fun field_ty arg ->
-          match arg.desc with
-          | CRecord [] -> { arg with ty = field_ty }
-          | _ -> arg)
-        variant.Ast.variant_fields args
-    with Invalid_argument _ -> args
-  in
-  let uc_args = List.map (boxed_storage_value ~reg:env.reg) args in
-  CUnionConstruct
-    {
-      uc_type_name = type_name;
-      uc_constructor_name = ctor_name;
-      uc_c_name = union_construct_c_name variant ctor_name def_id;
-      uc_tag = variant.variant_tag;
-      uc_representation = union_representation env expr type_name;
-      uc_args;
-      uc_release_mask = release_mask uc_args;
-    }
-
-let try_prepare_nullary_option_constructor_name env expr ctor_name def_id =
-  match canonical_type ~reg:env.reg expr.ty with
-  | Ast.TyNamed ("Option", _) -> (
-      match lookup_variant env "Option" ctor_name with
-      | Some variant when variant.variant_fields = [] ->
-          Some
-            (prepare_union_construct env expr "Option" ctor_name def_id []
-               variant)
-      | _ -> None)
-  | _ -> None
-
-let try_prepare_nullary_option_constructor env expr v =
-  try_prepare_nullary_option_constructor_name env expr v.vname v.vdef_id
-
-let try_prepare_union_call env expr kind args =
-  let expr_ty = canonical_type ~reg:env.reg expr.ty in
-  let from_builtin =
-    match (kind, expr_ty, args) with
-    | CKBuiltin "blorp_option_some", Ast.TyNamed ("Option", _), [ _ ] ->
-        Some ("Option", "Some", None)
-    | CKBuiltin "blorp_option_none", Ast.TyNamed ("Option", _), [] ->
-        Some ("Option", "None", None)
-    | CKBuiltin "blorp_result_ok", Ast.TyNamed ("Result", _), [ _ ] ->
-        Some ("Result", "Ok", None)
-    | CKBuiltin "blorp_result_err", Ast.TyNamed ("Result", _), [ _ ] ->
-        Some ("Result", "Err", None)
-    | _ -> None
-  in
-  let from_user =
-    match (kind, expr_ty) with
-    | CKUser (ctor_name, def_id), Ast.TyNamed (type_name, _) ->
-        Some (type_name, ctor_name, def_id)
-    | _ -> None
-  in
-  match
-    match from_builtin with Some data -> Some data | None -> from_user
-  with
-  | None -> None
-  | Some (type_name, ctor_name, def_id) -> (
-      match lookup_variant env type_name ctor_name with
-      | Some variant ->
-          Some
-            (prepare_union_construct env expr type_name ctor_name def_id args
-               variant)
-      | None -> None)
 
 let refresh_prepared_expr_type env (expr : core) (expected_ty : Ast.type_expr) =
   let expr = { expr with ty = expected_ty } in
@@ -573,20 +394,6 @@ let prepare_node env (expr : core) =
             ssl_len = len;
             ssl_proof = StringSetLenBoundsProven;
           }
-    | CVar v -> (
-        match try_prepare_nullary_option_constructor env expr v with
-        | Some desc -> desc
-        | None -> expr.desc)
-    | CField ({ ty = Ast.TyNamed ("Module", []); _ }, field_name) -> (
-        match
-          try_prepare_nullary_option_constructor_name env expr field_name None
-        with
-        | Some desc -> desc
-        | None -> expr.desc)
-    | CCall (kind, callee, args) -> (
-        match try_prepare_union_call env expr kind args with
-        | Some desc -> desc
-        | None -> CCall (kind, callee, args))
     | CUnbox (value, target_ty) ->
         CUnboxTyped
           {
@@ -1006,68 +813,8 @@ let prepare_expr_with_env env expr =
   |> Core.transform_bottom_up (prepare_node env)
   |> annotate_tensor_storage_provenance env Storage_env.empty
 
-let empty_env reg =
-  {
-    reg;
-    record_decls = Hashtbl.create 16;
-    variants_by_type = Hashtbl.create 16;
-  }
+let empty_env reg = { reg }
 
 let prepare_expr ~reg expr =
   let env = empty_env reg in
   prepare_expr_with_env env expr
-
-let rec prepare_decl env decl =
-  let desc =
-    match decl.cd_desc with
-    | CDFunc f ->
-        CDFunc
-          {
-            f with
-            cf_body =
-              Option.map
-                (fun body ->
-                  refresh_tail_expr_type env
-                    (prepare_expr_with_env env body)
-                    f.cf_return_ty)
-                f.cf_body;
-          }
-    | CDVar v ->
-        CDVar
-          {
-            v with
-            cv_init =
-              refresh_tail_expr_type env
-                (prepare_expr_with_env env v.cv_init)
-                v.cv_ty;
-          }
-    | CDImpl impl ->
-        CDImpl
-          {
-            impl with
-            ci_methods =
-              List.map
-                (fun f ->
-                  {
-                    f with
-                    cf_body =
-                      Option.map
-                        (fun body ->
-                          refresh_tail_expr_type env
-                            (prepare_expr_with_env env body)
-                            f.cf_return_ty)
-                        f.cf_body;
-                  })
-                impl.ci_methods;
-          }
-    | CDPrivate inner -> CDPrivate (prepare_decl env inner)
-    | (CDTrait _ | CDType _ | CDRecord _ | CDImport _ | CDTypeAlias _) as other
-      ->
-        other
-  in
-  { decl with cd_desc = desc }
-
-let prepare_program ~reg prog =
-  let env = empty_env reg in
-  List.iter (collect_decls env) prog;
-  List.map (prepare_decl env) prog

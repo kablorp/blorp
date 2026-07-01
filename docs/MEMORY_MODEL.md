@@ -428,12 +428,12 @@ closure or task body that directly returns a captured pointer-class value retain
 it before returning, so the returned owner does not depend on the closure
 environment staying alive.
 
-The `core_reuse` stage runs after Perceus and consumes proven post-drop facts.
-It rewrites narrow, compatible collection allocations through explicit runtime
-reuse boundaries such as `list_reuse_alloc`, `set_reuse_alloc`, and
-`dict_reuse_alloc`, plus explicit list producer handoff paths. Those boundaries
-clear/release old contents, preserve compatible collection metadata, and only
-reuse storage when the runtime owner is unique.
+The Blorp reuse stage runs after Perceus and consumes proven post-drop facts. It
+rewrites narrow, compatible collection allocations through explicit runtime reuse
+boundaries such as `list_reuse_alloc`, `set_reuse_alloc`, and `dict_reuse_alloc`,
+plus explicit list producer handoff paths. Those boundaries clear/release old
+contents, preserve compatible collection metadata, and only reuse storage when
+the runtime owner is unique.
 
 Some ownership edges are still intentionally conservative: closure call
 arguments, loop / try / detach liveness, and structured-concurrency task-result

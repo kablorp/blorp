@@ -248,10 +248,8 @@ Implementation order:
    report observed Core stages; use it before optimizing aggregate stages.
 2. Split the `Fusion` observed stage only if measurements show that string,
    collection, tensor, or tuple SROA work needs independent visibility.
-3. Keep non-observed safety/finalization passes (`Core_resource`,
-   `Core_fairness`, `Core_codegen_prepare`, prepared reuse) out of
-   `Core_stage` unless user-facing dump/stop/profile behavior genuinely needs
-   them.
+3. Keep Blorp-tail-internal safety/finalization passes out of `Core_stage`
+   unless user-facing dump/stop/profile behavior genuinely needs them.
 4. When adding new IR checks, prefer a named invariant in
    `core_invariants.ml` over local assertions in emit.
 
@@ -265,7 +263,7 @@ Current state:
 
 - Perceus inserts explicit `CDup` and `CDrop` ownership operations before
   reuse.
-- `Core_reuse` already upgrades explicit list producer handoffs from
+- The Blorp reuse pass already upgrades explicit list producer handoffs from
   `BorrowFresh` to `ConsumeReuse` when it can consume the matching
   post-Perceus drop.
 - `CListHandoff` carries the source/result variables, capacity, layout, result
@@ -349,8 +347,8 @@ Implementation order:
    helpers as each family becomes authoritative.
 3. Finish the supported final-preparation subset in Blorp, then shrink or
    delete matching `core_codegen_prepare.ml` logic.
-4. Make Blorp-owned resource/fairness passes observable enough to delete the
-   OCaml compatibility path when final-stage observation no longer requires it.
+4. Keep Blorp-owned resource/fairness passes observable through the bridge now
+   that the OCaml compatibility path has been deleted.
 5. Move the JSON boundary left through the ownership tail before starting broad
    parser/typechecker migration.
 

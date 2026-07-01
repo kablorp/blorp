@@ -99,15 +99,15 @@ let test_dump_after_captures_stage_output () =
   in
   let _c_code = Core_pipeline.compile_typed ~on_stage prog in
   let captured = List.rev !captures in
-  (* Every pipeline stage should fire exactly once. *)
+  (* Every OCaml-owned program stage should fire exactly once. *)
   let names = List.map fst captured in
   Alcotest.(check int)
-    "every stage fired"
-    (List.length Core_stage.all)
+    "every OCaml-owned program stage fired"
+    (List.length Core_pipeline.pre_backend_program_stage_order)
     (List.length names);
   Alcotest.(check (list string))
     "stages in order"
-    (List.map Core_stage.to_string Core_stage.all)
+    (List.map Core_stage.to_string Core_pipeline.pre_backend_program_stage_order)
     names;
   (* Each capture should mention `inc` (a user-defined function) *)
   List.iter
@@ -167,20 +167,6 @@ let test_blorp_tail_json_observation_records_stage_events () =
   Alcotest.(check (list string))
     "tail JSON stage events in order"
     (List.map Core_stage.to_string Core_stage.all)
-    (List.rev !stages |> List.map Core_stage.to_string)
-
-let test_pre_backend_program_observation_skips_final_tail_snapshots () =
-  let prog = lower_source small_source in
-  let stages = ref [] in
-  let _c_code =
-    Core_pipeline.compile_typed
-      ~program_observation:Core_pipeline.ObservePreBackendProgramStages
-      ~on_stage:(fun stage _program -> stages := stage :: !stages)
-      prog
-  in
-  Alcotest.(check (list string))
-    "program stages stop at perceus"
-    (List.map Core_stage.to_string Core_pipeline.pre_backend_program_stage_order)
     (List.rev !stages |> List.map Core_stage.to_string)
 
 let test_stop_after_short_circuits () =
@@ -323,27 +309,6 @@ let test_pipeline_stage_events_fire_without_program_callback () =
       Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
   | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
 
-let test_pipeline_pre_backend_program_observation_skips_final_tail_snapshots ()
-    =
-  let source = small_source in
-  Blorp.Modules.reset ();
-  Blorp.Modules.init_module_paths ".";
-  let core_stages = ref [] in
-  match
-    Pipeline.compile ~embed_runtime:false
-      ~program_observation:Core_pipeline.ObservePreBackendProgramStages
-      ~on_stage:(fun stage _program -> core_stages := stage :: !core_stages)
-      ~filename:"<test>" ~source ()
-  with
-  | Ok (Pipeline.Compiled _) ->
-      Alcotest.(check (list string))
-        "program stage order"
-        (List.map Core_stage.to_string Core_pipeline.pre_backend_program_stage_order)
-        (List.rev !core_stages |> List.map Core_stage.to_string)
-  | Ok (Pipeline.Stopped_at s) ->
-      Alcotest.failf "unexpected stop at %s" (Core_stage.to_string s)
-  | Error errs -> Alcotest.failf "compile failed: %d errors" (List.length errs)
-
 let test_normal_build_removes_debug_block () =
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
@@ -396,25 +361,27 @@ let test_pipeline_filter_map_collect_handoff_reuse () =
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
   let fusion_text = ref None in
-  let reuse_text = ref None in
   let on_stage stage program =
     let text = Core.pp_program_indented program in
     if stage = Core_stage.Fusion then fusion_text := Some text
-    else if stage = Core_stage.Reuse then reuse_text := Some text
   in
+  let reuse_json = ref None in
   match
-    Pipeline.compile ~embed_runtime:false ~on_stage ~filename:"<test>"
+    Pipeline.compile ~embed_runtime:false ~on_stage
+      ~on_stage_json:(fun stage json ->
+        if stage = Core_stage.Reuse then reuse_json := Some json)
+      ~tail_observation_stages:[ Core_stage.Reuse ] ~filename:"<test>"
       ~source:list_filter_map_collect_source ()
   with
   | Ok (Pipeline.Compiled r) ->
       let fusion = Option.value ~default:"" !fusion_text in
-      let reuse = Option.value ~default:"" !reuse_text in
+      let reuse = Option.value ~default:"" !reuse_json in
       Alcotest.(check bool)
         "fusion emits borrow-fresh handoff" true
         (Modules.contains fusion "list-handoff[borrow-fresh");
       Alcotest.(check bool)
         "reuse upgrades to consume-reuse handoff" true
-        (Modules.contains reuse "list-handoff[consume-reuse");
+        (Modules.contains reuse "\"mode\":\"consume_reuse\"");
       Alcotest.(check bool)
         "emitted C delegates runtime reuse decision" true
         (Modules.contains r.c_code "blorp_list_handoff_begin_reuse");
@@ -432,25 +399,27 @@ let test_pipeline_float_filter_map_collect_handoff_reuse () =
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
   let fusion_text = ref None in
-  let reuse_text = ref None in
   let on_stage stage program =
     let text = Core.pp_program_indented program in
     if stage = Core_stage.Fusion then fusion_text := Some text
-    else if stage = Core_stage.Reuse then reuse_text := Some text
   in
+  let reuse_json = ref None in
   match
-    Pipeline.compile ~embed_runtime:false ~on_stage ~filename:"<test>"
+    Pipeline.compile ~embed_runtime:false ~on_stage
+      ~on_stage_json:(fun stage json ->
+        if stage = Core_stage.Reuse then reuse_json := Some json)
+      ~tail_observation_stages:[ Core_stage.Reuse ] ~filename:"<test>"
       ~source:list_float_filter_map_collect_source ()
   with
   | Ok (Pipeline.Compiled r) ->
       let fusion = Option.value ~default:"" !fusion_text in
-      let reuse = Option.value ~default:"" !reuse_text in
+      let reuse = Option.value ~default:"" !reuse_json in
       Alcotest.(check bool)
         "fusion emits borrow-fresh handoff" true
         (Modules.contains fusion "list-handoff[borrow-fresh");
       Alcotest.(check bool)
         "reuse upgrades to consume-reuse handoff" true
-        (Modules.contains reuse "list-handoff[consume-reuse");
+        (Modules.contains reuse "\"mode\":\"consume_reuse\"");
       Alcotest.(check bool)
         "emitted C unboxes float list elements" true
         (Modules.contains r.c_code "blorp_unbox_float");
@@ -476,25 +445,27 @@ let test_pipeline_string_filter_map_collect_handoff_reuse () =
   Blorp.Modules.reset ();
   Blorp.Modules.init_module_paths ".";
   let fusion_text = ref None in
-  let reuse_text = ref None in
   let on_stage stage program =
     let text = Core.pp_program_indented program in
     if stage = Core_stage.Fusion then fusion_text := Some text
-    else if stage = Core_stage.Reuse then reuse_text := Some text
   in
+  let reuse_json = ref None in
   match
-    Pipeline.compile ~embed_runtime:false ~on_stage ~filename:"<test>"
+    Pipeline.compile ~embed_runtime:false ~on_stage
+      ~on_stage_json:(fun stage json ->
+        if stage = Core_stage.Reuse then reuse_json := Some json)
+      ~tail_observation_stages:[ Core_stage.Reuse ] ~filename:"<test>"
       ~source:list_string_filter_map_collect_source ()
   with
   | Ok (Pipeline.Compiled r) ->
       let fusion = Option.value ~default:"" !fusion_text in
-      let reuse = Option.value ~default:"" !reuse_text in
+      let reuse = Option.value ~default:"" !reuse_json in
       Alcotest.(check bool)
         "fusion emits borrow-fresh handoff" true
         (Modules.contains fusion "list-handoff[borrow-fresh");
       Alcotest.(check bool)
         "reuse upgrades to consume-reuse handoff" true
-        (Modules.contains reuse "list-handoff[consume-reuse");
+        (Modules.contains reuse "\"mode\":\"consume_reuse\"");
       Alcotest.(check bool)
         "source string element is not bound as owned local" false
         (Modules.contains fusion "let __pipe_elem_");
@@ -522,9 +493,6 @@ let suite =
           `Quick test_blorp_tail_json_observation_captures_late_stages;
         Alcotest.test_case "Blorp tail JSON observation records stage events"
           `Quick test_blorp_tail_json_observation_records_stage_events;
-        Alcotest.test_case "pre-backend program observation skips final tail"
-          `Quick
-          test_pre_backend_program_observation_skips_final_tail_snapshots;
         Alcotest.test_case "stop_after short circuits" `Quick
           test_stop_after_short_circuits;
         Alcotest.test_case "compile_with_modules uses same stage order" `Quick
@@ -540,9 +508,6 @@ let suite =
           test_pipeline_frontend_phases_fire_before_core;
         Alcotest.test_case "stage events fire without program callback" `Quick
           test_pipeline_stage_events_fire_without_program_callback;
-        Alcotest.test_case
-          "pipeline pre-backend program observation skips final tail" `Quick
-          test_pipeline_pre_backend_program_observation_skips_final_tail_snapshots;
         Alcotest.test_case "normal build removes debug block" `Quick
           test_normal_build_removes_debug_block;
         Alcotest.test_case "debug build keeps debug block" `Quick

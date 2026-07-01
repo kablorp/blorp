@@ -11,22 +11,11 @@ let ty_float = TyNamed ("Float", [])
 let ty_string = TyNamed ("String", [])
 let ty_void = TyNamed ("Void", [])
 let str_flags = { sf_multiline = false; sf_raw = false }
-let tparams names = List.map (fun name -> make_type_param name []) names
 let mk d t = { desc = d; ty = t; loc }
 let cvar n t = mk (CVar (Var.named n)) t
 let cint n = mk (CLit (LitInt (Int64.of_int n))) ty_int
 let cstr s = mk (CLit (LitString (s, str_flags))) ty_string
 let fn_ty params return is_pure = TyFunc { params; return; is_pure }
-
-let task_capture_kind_name = function
-  | TaskCopyCapture -> "copy"
-  | TaskMoveResourceItem -> "move_resource_item"
-  | TaskStructuredTaskBorrow -> "structured_task_borrow"
-
-let task_capture_summary capture =
-  ( capture.task_capture_name,
-    Blorp.Types.type_to_string capture.task_capture_ty,
-    task_capture_kind_name capture.task_capture_kind )
 
 let mk_func ?(is_pure = false) name params return body def_id : core_func =
   {
@@ -92,7 +81,8 @@ let test_returned_function_ref_becomes_closure_create () =
           mk_func "get_doubler" [] double_ty (Some (cvar "double" double_ty)) 2
         in
         let converted =
-          Blorp.Core_closure.convert_program [ decl double; decl get_doubler ]
+          Blorp.Core_closure.adapt_function_refs_program
+            [ decl double; decl get_doubler ]
         in
         let get_doubler' = require_func "get_doubler" converted in
         match get_doubler'.cf_body with
@@ -135,7 +125,8 @@ let test_let_body_function_ref_becomes_closure_create () =
         in
         let get_doubler = mk_func "get_doubler" [] double_ty (Some body) 2 in
         let converted =
-          Blorp.Core_closure.convert_program [ decl double; decl get_doubler ]
+          Blorp.Core_closure.adapt_function_refs_program
+            [ decl double; decl get_doubler ]
         in
         let get_doubler' = require_func "get_doubler" converted in
         match get_doubler'.cf_body with
@@ -277,66 +268,6 @@ let test_eta_adapter_retains_consumed_managed_arg () =
               (pp_to_string_indented body)
         | None -> Alcotest.fail "missing eta body"))
 
-let test_closure_conversion_does_not_insert_eta_rc_ops () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let consume_ty = fn_ty [ ty_string ] ty_string true in
-        let consume =
-          mk_func ~is_pure:true "consume"
-            [ ("s", ty_string) ]
-            ty_string
-            (Some (consume_string_arg "s"))
-            300
-        in
-        let get_consume =
-          mk_func "get_consume" [] consume_ty
-            (Some (cvar "consume" consume_ty))
-            301
-        in
-        let converted =
-          Blorp.Core_closure.convert_program [ decl consume; decl get_consume ]
-        in
-        let eta = require_func "_blorp_eta_0" converted in
-        match eta.cf_body with
-        | Some body ->
-            Alcotest.(check int)
-              "closure conversion should not insert CDup" 0
-              (count_dups_for "__eta_arg_0" body)
-        | None -> Alcotest.fail "missing eta body"))
-
-let test_closure_conversion_can_disable_function_ref_adapters () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let consume_ty = fn_ty [ ty_string ] ty_string true in
-        let consume =
-          mk_func ~is_pure:true "consume"
-            [ ("s", ty_string) ]
-            ty_string
-            (Some (consume_string_arg "s"))
-            310
-        in
-        let get_consume =
-          mk_func "get_consume" [] consume_ty
-            (Some (cvar "consume" consume_ty))
-            311
-        in
-        let converted =
-          Blorp.Core_closure.convert_program ~wrap_function_refs:false
-            [ decl consume; decl get_consume ]
-        in
-        Alcotest.(check bool)
-          "no post-Perceus eta adapter" false
-          (Option.is_some (find_func "_blorp_eta_0" converted));
-        let get_consume' = require_func "get_consume" converted in
-        match get_consume'.cf_body with
-        | Some { desc = CVar v; _ } ->
-            Alcotest.(check string)
-              "raw function ref preserved" "consume" v.vname
-        | Some body ->
-            Alcotest.failf "unexpected closure conversion body:\n%s"
-              (pp_to_string_indented body)
-        | None -> Alcotest.fail "missing get_consume body"))
-
 let test_module_fn_ref_retains_consumed_managed_arg () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -435,247 +366,6 @@ let test_eta_adapter_retains_builtin_consumed_managed_args () =
               (count_dups_for "__eta_arg_1" body)
         | None -> Alcotest.fail "missing eta body"))
 
-let test_concurrent_binding_gets_task_closure_metadata () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let result_string_ty =
-          TyNamed ("Result", [ ty_string; TyNamed ("ConcurrencyError", []) ])
-        in
-        let task_rhs = cvar "s" ty_string in
-        let conc =
-          mk
-            (CConcurrent
-               {
-                 conc_bindings =
-                   [
-                     {
-                       cb_var = Var.named "a";
-                       cb_ty = result_string_ty;
-                       cb_rhs = task_rhs;
-                       cb_task_scope = synthetic_concurrent_task_scope;
-                       cb_task = None;
-                     };
-                   ];
-                 conc_body = mk CVoid ty_void;
-                 conc_timeout = None;
-                 conc_max_threads = None;
-               })
-            ty_void
-        in
-        let run = mk_func "run" [ ("s", ty_string) ] ty_void (Some conc) 10 in
-        let converted = Blorp.Core_closure.convert_program [ decl run ] in
-        let run' = require_func "run" converted in
-        match run'.cf_body with
-        | Some { desc = CConcurrent { conc_bindings = [ binding ]; _ }; _ } -> (
-            match binding.cb_task with
-            | Some task ->
-                Alcotest.(check string)
-                  "task closure name" "_blorp_task_0" task.tc_func;
-                Alcotest.(check int)
-                  "one capture" 1
-                  (List.length task.tc_captures);
-                Alcotest.(check (list (triple string string string)))
-                  "capture metadata"
-                  [ ("s", "String", "copy") ]
-                  (List.map task_capture_summary task.tc_captures);
-                let task_func = require_func "_blorp_task_0" converted in
-                Alcotest.(check bool)
-                  "task closure hoisted" true
-                  (match task_func.cf_kind with
-                  | CFClosureBody ca -> ca.ca_task_abi
-                  | _ -> false)
-            | None -> Alcotest.fail "expected concurrent binding task metadata")
-        | Some _ -> Alcotest.fail "expected converted CConcurrent body"
-        | None -> Alcotest.fail "missing run body"))
-
-let test_detach_gets_task_closure_metadata () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let detach =
-          mk
-            (CDetach { detach_body = cvar "s" ty_string; detach_task = None })
-            ty_void
-        in
-        let run = mk_func "run" [ ("s", ty_string) ] ty_void (Some detach) 11 in
-        let converted = Blorp.Core_closure.convert_program [ decl run ] in
-        let run' = require_func "run" converted in
-        match run'.cf_body with
-        | Some { desc = CDetach { detach_task = Some task; _ }; _ } ->
-            Alcotest.(check string)
-              "task closure name" "_blorp_task_0" task.tc_func;
-            Alcotest.(check string)
-              "detached task returns void" "Void"
-              (Blorp.Types.type_to_string task.tc_return_ty);
-            Alcotest.(check (list (triple string string string)))
-              "capture metadata"
-              [ ("s", "String", "copy") ]
-              (List.map task_capture_summary task.tc_captures);
-            let task_func = require_func "_blorp_task_0" converted in
-            Alcotest.(check bool)
-              "task closure hoisted" true
-              (match task_func.cf_kind with
-              | CFClosureBody ca -> ca.ca_task_abi
-              | _ -> false)
-        | Some { desc = CDetach { detach_task = None; _ }; _ } ->
-            Alcotest.fail "expected detach task metadata"
-        | Some _ -> Alcotest.fail "expected converted CDetach body"
-        | None -> Alcotest.fail "missing run body"))
-
-let test_concurrently_loop_gets_task_closure_metadata () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let list_string_ty = TyNamed ("List", [ ty_string ]) in
-        let result_string_ty =
-          TyNamed ("Result", [ ty_string; TyNamed ("ConcurrencyError", []) ])
-        in
-        let result_list_ty = TyNamed ("List", [ result_string_ty ]) in
-        let cf =
-          mk
-            (CConcurrentlyLoop
-               {
-                 cf_var = Var.named "item";
-                 cf_iter = cvar "items" list_string_ty;
-                 cf_body = cvar "item" ty_string;
-                 cf_timeout = None;
-                 cf_width = ConcurrentlyLoopLimit (cint 2);
-                 cf_output = ConcurrentlyLoopCollect;
-                 cf_item_mode = ConcurrentlyLoopCopyItem;
-                 cf_task_scope = synthetic_concurrent_task_scope;
-                 cf_task = None;
-               })
-            result_list_ty
-        in
-        let run =
-          mk_func "run"
-            [ ("items", list_string_ty) ]
-            result_list_ty (Some cf) 12
-        in
-        let converted = Blorp.Core_closure.convert_program [ decl run ] in
-        let run' = require_func "run" converted in
-        match run'.cf_body with
-        | Some { desc = CConcurrentlyLoop { cf_task = Some task; _ }; _ } ->
-            Alcotest.(check string)
-              "task closure name" "_blorp_task_0" task.tc_func;
-            Alcotest.(check string)
-              "per-iteration task return" "String"
-              (Blorp.Types.type_to_string task.tc_return_ty);
-            Alcotest.(check (list (triple string string string)))
-              "capture metadata"
-              [ ("item", "String", "copy") ]
-              (List.map task_capture_summary task.tc_captures);
-            let task_func = require_func "_blorp_task_0" converted in
-            Alcotest.(check bool)
-              "task closure hoisted" true
-              (match task_func.cf_kind with
-              | CFClosureBody ca -> ca.ca_task_abi
-              | _ -> false)
-        | Some { desc = CConcurrentlyLoop { cf_task = None; _ }; _ } ->
-            Alcotest.fail "expected for ... concurrently task metadata"
-        | Some _ -> Alcotest.fail "expected converted CConcurrentlyLoop body"
-        | None -> Alcotest.fail "missing run body"))
-
-let test_resource_source_concurrently_loop_moves_item_capture () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let resource_ty = TyNamed ("TcpStream", []) in
-        let source_ty =
-          TyNamed ("ResourceSource", [ resource_ty; ty_string ])
-        in
-        let item = Var.named "__resource_1" in
-        let conn = Var.named "conn" in
-        let body =
-          mk
-            (CResourceScope
-               {
-                 rs_var = conn;
-                 rs_ty = resource_ty;
-                 rs_acquire = cvar "__resource_1" resource_ty;
-                 rs_body = mk CVoid ty_void;
-                 rs_cleanup = mk CVoid ty_void;
-               })
-            ty_void
-        in
-        let cf =
-          mk
-            (CConcurrentlyLoop
-               {
-                 cf_var = item;
-                 cf_iter = cvar "source" source_ty;
-                 cf_body = body;
-                 cf_timeout = None;
-                 cf_width = ConcurrentlyLoopLimit (cint 2);
-                 cf_output = ConcurrentlyLoopDiscard;
-                 cf_item_mode =
-                   ConcurrentlyLoopMoveResourceItem
-                     {
-                       clmi_resource_ty = resource_ty;
-                       clmi_error_ty = ty_string;
-                     };
-                 cf_task_scope = synthetic_concurrent_task_scope;
-                 cf_task = None;
-               })
-            ty_void
-        in
-        let run =
-          mk_func "run" [ ("source", source_ty) ] ty_void (Some cf) 13
-        in
-        let converted = Blorp.Core_closure.convert_program [ decl run ] in
-        let run' = require_func "run" converted in
-        match run'.cf_body with
-        | Some { desc = CConcurrentlyLoop { cf_task = Some task; _ }; _ } -> (
-            Alcotest.(check (list (triple string string string)))
-              "move capture metadata"
-              [ ("__resource_1", "TcpStream", "move_resource_item") ]
-              (List.map task_capture_summary task.tc_captures);
-            let task_func = require_func "_blorp_task_0" converted in
-            match task_func.cf_kind with
-            | CFClosureBody ca ->
-                Alcotest.(check (list string))
-                  "moved closure slots" [ "__resource_1" ] ca.ca_moved_captures
-            | _ -> Alcotest.fail "expected task closure body")
-        | Some { desc = CConcurrentlyLoop { cf_task = None; _ }; _ } ->
-            Alcotest.fail "expected for ... concurrently task metadata"
-        | Some _ -> Alcotest.fail "expected CConcurrentlyLoop"
-        | None -> Alcotest.fail "missing run body"))
-
-let test_resource_scope_binding_not_captured_by_nested_lambda () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let scope =
-          mk
-            (CResourceScope
-               {
-                 rs_var = Var.named "resource";
-                 rs_ty = ty_int;
-                 rs_acquire = cint 0;
-                 rs_body = cvar "resource" ty_int;
-                 rs_cleanup = mk CVoid ty_void;
-               })
-            ty_int
-        in
-        let lam_ty = fn_ty [] ty_int true in
-        let lam =
-          {
-            lam_params = [];
-            lam_return_ty = ty_int;
-            lam_body = scope;
-            lam_is_pure = true;
-          }
-        in
-        let make =
-          mk_func ~is_pure:true "make" [] lam_ty
-            (Some (mk (CLambda lam) lam_ty))
-            30
-        in
-        let converted = Blorp.Core_closure.convert_program [ decl make ] in
-        let closure_func = require_func "_blorp_clambda_0" converted in
-        match closure_func.cf_kind with
-        | CFClosureBody ca ->
-            Alcotest.(check int)
-              "resource scope binding is not captured" 0
-              (List.length ca.ca_captures)
-        | _ -> Alcotest.fail "expected hoisted closure body"))
-
 let test_resource_scope_binding_shadows_global_function_ref () =
   Blorp.Session.(
     with_current (create ()) (fun () ->
@@ -711,7 +401,7 @@ let test_resource_scope_binding_shadows_global_function_ref () =
         in
         let get = mk_func "get" [] resource_ty (Some scope) 32 in
         let converted =
-          Blorp.Core_closure.convert_program [ decl resource; decl get ]
+          Blorp.Core_closure.adapt_function_refs_program [ decl resource; decl get ]
         in
         let get' = require_func "get" converted in
         match get'.cf_body with
@@ -762,54 +452,36 @@ let test_lambda_capture_shadows_global_function_ref () =
         in
         let make = mk_func ~is_pure:true "make" [] greeting_ty (Some body) 34 in
         let converted =
-          Blorp.Core_closure.convert_program [ decl global_greeting; decl make ]
+          Blorp.Core_closure.adapt_function_refs_program
+            [ decl global_greeting; decl make ]
         in
-        let closure_func = require_func "_blorp_clambda_0" converted in
-        match closure_func.cf_kind with
-        | CFClosureBody ca ->
-            Alcotest.(check (list (pair string string)))
-              "local capture shadows same-named global"
-              [ ("greeting", "String") ]
-              (List.map
-                 (fun (name, ty) -> (name, Blorp.Types.type_to_string ty))
-                 ca.ca_captures)
-        | _ -> Alcotest.fail "expected hoisted closure body"))
-
-let test_generic_template_lambdas_are_not_hoisted () =
-  Blorp.Session.(
-    with_current (create ()) (fun () ->
-        let ty_t = TyVar "T" in
-        let lam_ty = fn_ty [ ty_t ] ty_t true in
-        let lam =
-          {
-            lam_params = [ (Var.named "x", ty_t) ];
-            lam_return_ty = ty_t;
-            lam_body = cvar "x" ty_t;
-            lam_is_pure = true;
-          }
-        in
-        let generic_template =
-          {
-            cf_name = "generic_template";
-            cf_module = None;
-            cf_type_params = tparams [ "T" ];
-            cf_params = [];
-            cf_return_ty = lam_ty;
-            cf_body = Some (mk (CLambda lam) lam_ty);
-            cf_is_pure = true;
-            cf_kind = CFUser;
-            cf_def_id = 20;
-          }
-        in
-        let converted =
-          Blorp.Core_closure.convert_program [ decl generic_template ]
-        in
-        Alcotest.(check bool)
-          "generic template pruned before closure conversion" true
-          (Option.is_none (find_func "generic_template" converted));
-        Alcotest.(check bool)
-          "generic lambda body not hoisted" true
-          (Option.is_none (find_func "_blorp_clambda_0" converted))))
+        let make' = require_func "make" converted in
+        match make'.cf_body with
+        | Some
+            {
+              desc =
+                CLet
+                  ( _,
+                    {
+                      desc = CLambda { lam_body = { desc = CVar v; _ }; _ };
+                      _;
+                    } );
+              _;
+            } ->
+            Alcotest.(check string)
+              "local lambda capture stays a local var" "greeting" v.vname
+        | Some
+            {
+              desc =
+                CLet
+                  ( _,
+                    { desc = CLambda { lam_body = { desc = CClosureCreate _; _ }; _ }; _ } );
+              _;
+            } ->
+            Alcotest.fail "lambda-local capture was wrapped as a global function"
+        | Some body ->
+            Alcotest.failf "expected lambda body:\n%s" (pp_to_string_indented body)
+        | None -> Alcotest.fail "missing make body"))
 
 let suite =
   [
@@ -826,35 +498,15 @@ let suite =
           test_passthrough_builtin_function_ref_becomes_closure_create;
         Alcotest.test_case "eta_adapter_retains_consumed_managed_arg" `Quick
           test_eta_adapter_retains_consumed_managed_arg;
-        Alcotest.test_case "closure_conversion_no_eta_rc_ops" `Quick
-          test_closure_conversion_does_not_insert_eta_rc_ops;
-        Alcotest.test_case "closure_conversion_can_disable_fn_ref_adapters"
-          `Quick test_closure_conversion_can_disable_function_ref_adapters;
         Alcotest.test_case "module_fn_ref_retains_consumed_managed_arg" `Quick
           test_module_fn_ref_retains_consumed_managed_arg;
         Alcotest.test_case "eta_adapter_does_not_retain_borrowed_managed_arg"
           `Quick test_eta_adapter_does_not_retain_borrowed_managed_arg;
         Alcotest.test_case "eta_adapter_retains_builtin_consumed_managed_args"
           `Quick test_eta_adapter_retains_builtin_consumed_managed_args;
-        Alcotest.test_case "resource_scope_binding_not_captured" `Quick
-          test_resource_scope_binding_not_captured_by_nested_lambda;
         Alcotest.test_case "resource_scope_shadows_global_function_ref" `Quick
           test_resource_scope_binding_shadows_global_function_ref;
         Alcotest.test_case "lambda_capture_shadows_global_function_ref" `Quick
           test_lambda_capture_shadows_global_function_ref;
-        Alcotest.test_case "generic_template_lambdas_are_not_hoisted" `Quick
-          test_generic_template_lambdas_are_not_hoisted;
-      ] );
-    ( "concurrency",
-      [
-        Alcotest.test_case "concurrent_binding_gets_task_closure_metadata"
-          `Quick test_concurrent_binding_gets_task_closure_metadata;
-        Alcotest.test_case "detach_gets_task_closure_metadata" `Quick
-          test_detach_gets_task_closure_metadata;
-        Alcotest.test_case "concurrently_loop_gets_task_closure_metadata" `Quick
-          test_concurrently_loop_gets_task_closure_metadata;
-        Alcotest.test_case
-          "resource_source_concurrently_loop_moves_item_capture" `Quick
-          test_resource_source_concurrently_loop_moves_item_capture;
       ] );
   ]
