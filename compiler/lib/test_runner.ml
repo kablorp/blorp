@@ -1794,7 +1794,7 @@ let classify_valid_test_file filename =
 
 (** Directories to skip when searching for test files *)
 let skip_directories =
-  [ "stages"; "test_compiler"; "should_fail"; "should_pass"; "traits" ]
+  [ "test_compiler"; "should_fail"; "should_pass" ]
 
 (** Find all .brp test files in a directory *)
 let sorted_directory_entries path =

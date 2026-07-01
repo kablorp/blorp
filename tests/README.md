@@ -90,9 +90,8 @@ tests/
 │   └── stream/            # Stream tests
 ├── test_pkg/              # Optional runtime tests for pkg/, created when pkg tests exist
 ├── test_cli.sh            # CLI smoke and exit-code checks used by scripts/test
-├── test_lsp.sh            # LSP protocol integration smoke run by test_cli.sh
-├── test_repl.sh, test_auto_format.sh, test_leak_report.sh
-│                           # Standalone smoke tests, not part of scripts/test
+├── test_leak_report.sh    # Leak-report diagnostic smoke used by scripts/test leak
+├── lsp/                   # Marker-based LSP integration fixtures
 └── test_compiler/         # Compiler behavior tests
     ├── parser/            # Parser/lexer tests
     │   ├── should_pass/   # Valid syntax that must parse
@@ -150,7 +149,7 @@ The test runner (`tests/test_compiler/run_compiler_tests.sh`) validates both dir
    - Standard library modules → `test_std/` mirroring `std/`; test files should start with `test_`
    - Optional packages/native bindings → `test_pkg/` mirroring `pkg/`; test files should start with `test_`
    - Runtime behavior → `test_blorp/` or `test_std/`; do not rely on a `TestSuite` inside `test_compiler/*/should_pass/`
-   - CLI/LSP behavior → `tests/test_cli.sh` and `tests/test_lsp.sh`
+   - CLI, REPL, and LSP smoke behavior → `tests/test_cli.sh`
    - LSP feature fixtures → `tests/lsp/fixtures/`, using `-- ^name`
      marker comments and a neighboring JSON spec
    - Standard library examples → doctests in `std/`
