@@ -444,7 +444,6 @@ Direct OCaml slice to mirror:
 
 - `compiler/lib/core_consume_specialize.ml`
 - `compiler/lib/core_perceus.ml`
-- `compiler/test/core_perceus_check.ml`
 - ownership-related invariant tests
 
 Implementation:
@@ -478,8 +477,8 @@ Deletion:
 
 - Delete consume-specialize and Perceus OCaml modules after production boundary
   moves before them.
-- Delete the OCaml Perceus checker helper and tests after Blorp tests cover the
-  same checks.
+- Done: deleted the OCaml-only Perceus checker helper and tests after Blorp
+  ownership/Perceus tests covered the active checker path.
 
 Validation:
 
