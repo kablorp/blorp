@@ -214,9 +214,6 @@ let () =
         (fun (name, cases) -> ("CoreResultLayout." ^ name, cases))
         Test_core_result_layout.suite
     @ List.map
-        (fun (name, cases) -> ("CoreErasureInventory." ^ name, cases))
-        Test_core_erasure_inventory.suite
-    @ List.map
         (fun (name, cases) -> ("CoreOwnership." ^ name, cases))
         Test_core_ownership.suite
     @ List.map
@@ -231,9 +228,6 @@ let () =
     @ List.map
         (fun (name, cases) -> ("CoreClosure." ^ name, cases))
         Test_core_closure.suite
-    @ List.map
-        (fun (name, cases) -> ("CorePerceusCheck." ^ name, cases))
-        Test_core_perceus_check.suite
     @ List.map
         (fun (name, cases) -> ("BuiltinConsistency." ^ name, cases))
         Test_builtin_consistency.suite

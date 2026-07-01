@@ -303,14 +303,12 @@ boxing, or ownership behavior from source spelling.
 | `core_fairness.ml` | OCaml compatibility path for cooperative checkpoints; supported Blorp backend route uses `compiler_core_fairness.brp` |
 | `core_codegen_prepare.ml` | OCaml compatibility path for final Core preparation; supported Blorp backend route uses `compiler_core_prepare.brp` |
 | `core_erased_storage_layout.ml` | Late-Core classification for typed values crossing erased `void*` storage |
-| `core_erasure_inventory.ml` | Observational inventory of typed values crossing erased storage boundaries |
 | `core_hash_container_layout.ml` | Dict/set constructor and storage layout selection |
 | `core_option_layout.ml`, `core_result_layout.ml` | Stack/nullable/boxed layout selection for option/result values |
 | `core_perceus.ml` | Perceus RC insertion (CDup/CDrop) |
 | `core_ownership.ml` | Ownership contracts for intrinsics, builtins, and synthesized helpers |
 | `core_reuse.ml` | Post-Perceus allocation reuse analysis and prepared-Core union-node reuse rewrites |
 | `core_closure.ml` | Closure conversion / lambda hoisting |
-| `core_perceus_check.ml` | RC balance simulator for testing |
 | `core_emit_blorp_c.ml` | Core JSON projection and bridge client for the Blorp-owned tail C path |
 | `core_emit_context.ml`, `core_emit_util.ml`, `core_emit_layout.ml` | Shared late-backend representation helpers still used by the bridge projector |
 | `core_flatten.ml` | Module prefixing and import-table assembly |
@@ -405,7 +403,6 @@ compiler/
 │   ├── core_result_layout.ml # Result representation selection
 │   ├── core_type_layout.ml  # Managed/unmanaged Core type classification
 │   ├── core_layout_type.ml  # Shared layout metadata types
-│   ├── core_perceus_check.ml # RC balance simulator (testing)
 │   ├── core_emit_blorp_c.ml # Core JSON projection and Blorp bridge client
 │   ├── core_emit_context.ml # Shared late-backend helper context
 │   ├── core_emit_util.ml  # Shared late-backend helper utilities

@@ -541,14 +541,6 @@ let test_late_layout_fallbacks_stay_in_inventoried_callers () =
     Alcotest.fail
       "Infer should consume debug heap classification facts from \
        Core_type_layout instead of duplicating is_heap value-record logic.";
-  let erasure_inventory =
-    find_project_file "compiler/lib/core_erasure_inventory.ml"
-    |> read_file |> strip_comments_and_strings
-  in
-  if contains_substring erasure_inventory "Core_option_layout." then
-    Alcotest.fail
-      "Core_erasure_inventory should consume Option erasure facts from \
-       Core_layout_type instead of matching Core_option_layout directly.";
   ()
 
 let test_type_param_bound_string_parsing_stays_inventoried () =
